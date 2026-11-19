@@ -2968,3 +2968,241 @@ fn ep2_a2_lockstep_parity_on_for_loops_multifield_enums_const_patterns_let_else_
         ]
     );
 }
+
+#[test]
+fn ep2_b3_lockstep_parity_on_for_mut_writeback_nonzero_min_old_block_mut_pure_spec_and_qualified_schedules()
+{
+    use anneal_difftest::{
+        EnvScheduledWriteStep, SpecContractOracleProbe, SpecExecPhase, SpecExternalCallee,
+        SpecParamBinding, SpecPostconditionVerdict, SpecViolationKind, WriteChainCoverageBound,
+    };
+
+    let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+    let nz_u32_layout =
+        LayoutSpec::Scalar(ScalarLayout::with_valid_range(4, false, 1, u32::MAX as u128));
+    let lanes_layout = LayoutSpec::Array {
+        elem: Box::new(u32_layout.clone()),
+        elem_stride: 4,
+        len: 3,
+    };
+    let state_layout = LayoutSpec::Struct {
+        name: "LaneState".to_string(),
+        total_size: 20,
+        fields: vec![
+            FieldLayout {
+                name: "lanes".to_string(),
+                offset: 0,
+                layout: lanes_layout,
+            },
+            FieldLayout {
+                name: "total".to_string(),
+                offset: 12,
+                layout: u32_layout.clone(),
+            },
+            FieldLayout {
+                name: "framed".to_string(),
+                offset: 16,
+                layout: u32_layout.clone(),
+            },
+        ],
+    };
+
+    // Exercises all 6 `ep2-B3` adversarial findings in lockstep with `rustc -D warnings`:
+    // 1. `for slot in &mut st.lanes { *slot += 2u32; }` and `for (a, b) in &mut pairs { *a += *b; }`
+    //    write back in-place array mutations (while `for &mut mut c in &mut st.lanes` copies without writeback),
+    // 2. `NonZeroU32::MIN` (`1`, NOT `0`!) via both `NzWord::MIN` and 4-segment
+    //    `core::num::NonZeroU32::MIN` in expressions AND `match` patterns,
+    // 3. `requires` scratch `&mut` mutation isolation (`scratch_bump(st) >= 5u32` does NOT mutate
+    //    Phase-2 `st.total`) + `old({ st.total += 3u32; (scratch_bump)(st) })` sequential scratch mutations,
+    // 4. Impure external call `ext_read()` inside `ensures` (`poison_spec == 1u32`) traps (`TRAP`)
+    //    in BOTH `verify_spec_postcondition_against_schedule` AND compiled `rustc` (`__AnnealPureSpecGuard`),
+    // 5. Module-qualified `EnvSchedule` keys (`"sensor_mod::ext_read"`) for queue, default,
+    //    return-size validation, and pre-stepped `callee_panic_on_call`,
+    // 6. `WriteChainCoverageBound` unwind cutoff halting after `PanicOnCall(0)`.
+    let probe = SpecContractOracleProbe::new(
+        "ep2_b3_mut_loop_nonzero_parity",
+        vec![
+            SpecParamBinding::mut_ref("st", "LaneState", state_layout)
+                .with_frame_preserved_fields(["framed"]),
+            SpecParamBinding::by_value("scale", "NzWord", nz_u32_layout),
+            SpecParamBinding::by_value("poison_spec", "u32", u32_layout.clone()),
+        ],
+        "u32",
+        u32_layout.clone(),
+        "if poison_spec == 77u32 {\n    \
+             st.framed += 1u32;\n\
+         }\n\
+         for &mut mut copied_lane in &mut st.lanes {\n    \
+             copied_lane += 100u32;\n    \
+             let _ = copied_lane;\n\
+         }\n\
+         for slot in &mut st.lanes {\n    \
+             *slot += 2u32;\n    \
+             if *slot > 900u32 { break; }\n\
+         }\n\
+         let mut pairs: [(u32, u32); 2] = [(1u32, 2u32), (3u32, 4u32)];\n\
+         for (a, b) in &mut pairs {\n    \
+             *a += *b;\n\
+         }\n\
+         let nz_tag: u32 = match scale {\n    \
+             core::num::NonZeroU32::MIN => NzWord::MIN.get() + core::num::NonZeroU32::MIN.get(),\n    \
+             _ => scale.get(),\n\
+         };\n\
+         let max_check: u32 = match st.total {\n    \
+             core::primitive::u32::MAX => 0u32,\n    \
+             _ => 1u32,\n\
+         };\n\
+         let ext_v: u32 = ext_read();\n\
+         st.total = st.total + st.lanes[0] + st.lanes[1] + st.lanes[2] + pairs[0].0 + pairs[1].0 + nz_tag + max_check + ext_v;\n\
+         st.total",
+    )
+    .with_type_defs(
+        "pub type NzWord = core::num::NonZeroU32;\n\
+         #[repr(C)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub struct LaneState { pub lanes: [u32; 3], pub total: u32, pub framed: u32 }\n\
+         pub fn scratch_bump(s: &mut LaneState) -> u32 {\n    \
+             s.total += 5u32;\n    \
+             s.total\n\
+         }",
+    )
+    .with_external_callee(SpecExternalCallee::new(
+        "ext_read",
+        std::iter::empty::<&str>(),
+        "u32",
+        u32_layout,
+    ))
+    .with_requires(
+        "requires_scratch_isolated",
+        "st.total <= 500u32 && scratch_bump(st) >= 5u32 \
+         && st.lanes[0] <= 100u32 && st.lanes[1] <= 100u32 && st.lanes[2] <= 100u32 \
+         && scale.get() <= 10u32",
+    )
+    .with_ensures(
+        "old_block_mut_and_pure_ensures_guard",
+        "old({ st.total += 3u32; (scratch_bump)(st) }) == old(st.total) + 8u32 \
+         && st.lanes[0] == old(st.lanes[0]) + 2u32 \
+         && st.lanes[1] == old(st.lanes[1]) + 2u32 \
+         && st.lanes[2] == old(st.lanes[2]) + 2u32 \
+         && (poison_spec != 1u32 || ext_read() > 0u32)",
+    )
+    .with_ensures(
+        "exact_post_sum",
+        "poison_spec == 2u32 || (scale.get() == 1u32 && result == old(st.total) + old(st.lanes[0]) + old(st.lanes[1]) + old(st.lanes[2]) + 6u32 + 10u32 + 2u32 + 1u32 + 4u32) \
+         || (scale.get() > 1u32 && result > old(st.total))",
+    );
+
+    let make_trial = |l0: u32, l1: u32, l2: u32, total: u32, scale: u32, poison_spec: u32| -> Vec<u8> {
+        let mut b = Vec::with_capacity(28);
+        b.extend_from_slice(&l0.to_le_bytes());
+        b.extend_from_slice(&l1.to_le_bytes());
+        b.extend_from_slice(&l2.to_le_bytes());
+        b.extend_from_slice(&total.to_le_bytes());
+        b.extend_from_slice(&55u32.to_le_bytes()); // framed = 55
+        b.extend_from_slice(&scale.to_le_bytes());
+        b.extend_from_slice(&poison_spec.to_le_bytes());
+        b
+    };
+
+    let mut qual_sched = EnvSchedule::new().with_callee_return_size("sensor_mod::ext_read", 4);
+    qual_sched.push_callee_response("sensor_mod::ext_read", 4u32.to_le_bytes().to_vec());
+    qual_sched.set_callee_default("sensor_mod::ext_read", 4u32.to_le_bytes().to_vec());
+
+    let mut qual_panic_sched = qual_sched.clone();
+    qual_panic_sched.set_callee_panic_on_call("sensor_mod::ext_read", 1);
+    let _ = qual_panic_sched.next_action("sensor_mod::ext_read", 0); // 1 call served -> next panics!
+
+    let trials = vec![
+        // Trial 0: `scale = 1` (`NonZeroU32::MIN`), `poison_spec = 0`, module-qualified schedule -> HOLD
+        (make_trial(1, 2, 3, 10, 1, 0), Some(qual_sched.clone())),
+        // Trial 1: `scale = 20` fails `requires` (`scale.get() <= 10`) -> FILTERED
+        (make_trial(1, 2, 3, 10, 20, 0), Some(qual_sched.clone())),
+        // Trial 2: `poison_spec = 1` calls external `ext_read()` inside `ensures` -> TRAP in both!
+        (make_trial(1, 2, 3, 10, 1, 1), Some(qual_sched.clone())),
+        // Trial 3: `poison_spec = 77` mutates framed `st.framed` -> FRAME:st.framed
+        (make_trial(1, 2, 3, 10, 3, 77), Some(qual_sched.clone())),
+        // Trial 4: pre-stepped module-qualified `callee_panic_on_call("sensor_mod::ext_read", 1)` -> TRAP
+        (make_trial(1, 2, 3, 10, 3, 0), Some(qual_panic_sched)),
+        // Trial 5: queued `9u32` breaks `exact_post_sum` (expects `+ 4u32` when `scale == 1 && poison_spec == 0`) -> VIOLATION:exact_post_sum
+        (
+            make_trial(1, 2, 3, 10, 1, 0),
+            Some({
+                let mut bad_q = EnvSchedule::new().with_callee_return_size("sensor_mod::ext_read", 4);
+                bad_q.push_callee_response("sensor_mod::ext_read", 9u32.to_le_bytes().to_vec());
+                bad_q
+            }),
+        ),
+    ];
+
+    let report = probe
+        .verify_spec_postcondition_batch(&trials)
+        .expect("verify ep2-B3 parity batch");
+    assert_eq!(report.verdicts[0], SpecPostconditionVerdict::VerifiedHold);
+    assert!(matches!(
+        &report.verdicts[1],
+        SpecPostconditionVerdict::VacuouslyFiltered { .. }
+    ));
+    assert!(matches!(
+        &report.verdicts[2],
+        SpecPostconditionVerdict::PanicOrTrap {
+            phase: SpecExecPhase::Ensures,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &report.verdicts[3],
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::FrameCondition { param, field },
+            ..
+        } if param == "st" && field == "framed"
+    ));
+    assert!(matches!(
+        &report.verdicts[4],
+        SpecPostconditionVerdict::PanicOrTrap {
+            phase: SpecExecPhase::Body,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &report.verdicts[5],
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::EnsuresClause { label, .. },
+            ..
+        } if label == "exact_post_sum"
+    ));
+
+    let exe_src = probe
+        .synthesize_rust_executable_harness_with_schedules(&trials)
+        .expect("synthesize ep2-B3 executable harness");
+    assert!(!contains_unsafe_token(&exe_src));
+    let native_lines = compile_and_run_spec_harness("ep2_b3_lockstep_parity", &exe_src);
+    assert_eq!(
+        native_lines,
+        vec![
+            "TRIAL:0:HOLD",
+            "TRIAL:1:FILTERED",
+            "TRIAL:2:TRAP",
+            "TRIAL:3:FRAME:st.framed",
+            "TRIAL:4:TRAP",
+            "TRIAL:5:VIOLATION:exact_post_sum",
+        ]
+    );
+
+    // Module-qualified `EnvSchedule` keys (`"sensor_mod::ext_read"`) resolve in
+    // `WriteChainCoverageBound::observe_env_schedule_with_layouts` when planned steps
+    // reference short `"ext_read"`:
+    let mut walk_bound = WriteChainCoverageBound::new(2, 2);
+    assert_eq!(
+        walk_bound.observe_env_schedule_with_layouts(
+            &qual_sched,
+            &probe.external_callee_layout_map(),
+            &[
+                EnvScheduledWriteStep::new("ext_read", "s0", std::iter::empty::<&str>()),
+                EnvScheduledWriteStep::new("ext_read", "s1", ["s0"]),
+            ],
+        ),
+        2
+    );
+    assert_eq!(walk_bound.broken_env_links(), 0);
+    assert!(walk_bound.is_depth_certified());
+}

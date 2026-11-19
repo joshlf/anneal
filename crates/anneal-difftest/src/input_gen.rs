@@ -3375,115 +3375,13 @@ fn collect_pat_bound_idents_with_consts(
 struct LazyOldClosureSpec {
     var_name: String,
     inner_src: String,
-    mut_called_params: BTreeSet<String>,
-}
-
-fn collect_mut_called_params_in_old(
-    expr: &Expr,
-    params: &[SpecParamBinding],
-    const_names: &BTreeSet<String>,
-    mut_helper_param_indices: &BTreeMap<String, BTreeSet<usize>>,
-) -> BTreeSet<String> {
-    struct Finder<'a> {
-        params: &'a [SpecParamBinding],
-        const_names: &'a BTreeSet<String>,
-        mut_helper_param_indices: &'a BTreeMap<String, BTreeSet<usize>>,
-        shadowed: Vec<BTreeSet<String>>,
-        out: BTreeSet<String>,
-    }
-    impl<'ast> Finder<'ast> {
-        fn is_unshadowed_mut_param(&self, ident: &str) -> bool {
-            !self.shadowed.iter().any(|s| s.contains(ident))
-                && self
-                    .params
-                    .iter()
-                    .any(|p| p.is_mut_ref && p.name == ident)
-        }
-
-        fn extract_root_param_from_arg(&self, mut arg: &'ast Expr) -> Option<String> {
-            loop {
-                match arg {
-                    Expr::Paren(p) => arg = &p.expr,
-                    Expr::Group(g) => arg = &g.expr,
-                    Expr::Reference(r) => arg = &r.expr,
-                    Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => arg = &u.expr,
-                    Expr::Field(f) => arg = &f.base,
-                    Expr::Index(ix) => arg = &ix.expr,
-                    Expr::Path(ep)
-                        if ep.qself.is_none()
-                            && ep.path.leading_colon.is_none()
-                            && ep.path.segments.len() == 1 =>
-                    {
-                        let name = ep.path.segments[0].ident.to_string();
-                        return self.is_unshadowed_mut_param(&name).then_some(name);
-                    }
-                    _ => return None,
-                }
-            }
-        }
-    }
-    impl<'ast> Visit<'ast> for Finder<'ast> {
-        fn visit_block(&mut self, block: &'ast syn::Block) {
-            self.shadowed.push(BTreeSet::new());
-            for stmt in &block.stmts {
-                if let syn::Stmt::Local(loc) = stmt {
-                    if let Some(init) = &loc.init {
-                        self.visit_expr(&init.expr);
-                        if let Some((_, div_expr)) = &init.diverge {
-                            self.visit_expr(div_expr);
-                        }
-                    }
-                    if let Some(frame) = self.shadowed.last_mut() {
-                        collect_pat_bound_idents_with_consts(&loc.pat, self.const_names, frame);
-                    }
-                } else {
-                    visit::visit_stmt(self, stmt);
-                }
-            }
-            self.shadowed.pop();
-        }
-
-        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
-            if let Expr::Path(ep) = &*node.func
-                && ep.qself.is_none()
-            {
-                let cname = ep
-                    .path
-                    .segments
-                    .iter()
-                    .map(|s| s.ident.to_string())
-                    .collect::<Vec<_>>()
-                    .join("::");
-                if let Some(mut_idxs) = self.mut_helper_param_indices.get(&cname) {
-                    for &idx in mut_idxs {
-                        if let Some(arg) = node.args.iter().nth(idx)
-                            && let Some(pname) = self.extract_root_param_from_arg(arg)
-                        {
-                            self.out.insert(pname);
-                        }
-                    }
-                }
-            }
-            visit::visit_expr_call(self, node);
-        }
-    }
-
-    let mut f = Finder {
-        params,
-        const_names,
-        mut_helper_param_indices,
-        shadowed: Vec::new(),
-        out: BTreeSet::new(),
-    };
-    f.visit_expr(expr);
-    f.out
+    referenced_mut_params: BTreeSet<String>,
 }
 
 fn rewrite_old_expressions_for_rust(
     expr: &mut Expr,
     params: &[SpecParamBinding],
     const_names: &BTreeSet<String>,
-    mut_helper_param_indices: &BTreeMap<String, BTreeSet<usize>>,
     needed_pre_params: &mut BTreeSet<String>,
     lazy_old_closures: &mut Vec<LazyOldClosureSpec>,
 ) {
@@ -3494,6 +3392,7 @@ fn rewrite_old_expressions_for_rust(
         params: &'a [SpecParamBinding],
         const_names: &'a BTreeSet<String>,
         needed_pre_params: &'a mut BTreeSet<String>,
+        referenced_mut_params: &'a mut BTreeSet<String>,
         shadowed: Vec<BTreeSet<String>>,
     }
     impl PreParamRewriter<'_> {
@@ -3621,6 +3520,7 @@ fn rewrite_old_expressions_for_rust(
                 {
                     self.needed_pre_params.insert(param.name.clone());
                     if param.is_mut_ref {
+                        self.referenced_mut_params.insert(param.name.clone());
                         let pre_ref_ident = syn::Ident::new(
                             &format!("__anneal_pre_ref_{}", param.name),
                             proc_macro2::Span::call_site(),
@@ -3643,7 +3543,6 @@ fn rewrite_old_expressions_for_rust(
     struct Hoister<'a> {
         params: &'a [SpecParamBinding],
         const_names: &'a BTreeSet<String>,
-        mut_helper_param_indices: &'a BTreeMap<String, BTreeSet<usize>>,
         needed_pre_params: &'a mut BTreeSet<String>,
         lazy_old_closures: &'a mut Vec<LazyOldClosureSpec>,
     }
@@ -3658,22 +3557,19 @@ fn rewrite_old_expressions_for_rust(
                 && call.args.len() == 1
             {
                 let mut inner = call.args[0].clone();
-                let mut_called_params = collect_mut_called_params_in_old(
-                    &inner,
-                    self.params,
-                    self.const_names,
-                    self.mut_helper_param_indices,
-                );
+                let mut referenced_mut_params = BTreeSet::new();
                 PreParamRewriter {
                     params: self.params,
                     const_names: self.const_names,
                     needed_pre_params: self.needed_pre_params,
+                    referenced_mut_params: &mut referenced_mut_params,
                     shadowed: Vec::new(),
                 }
                 .visit_expr_mut(&mut inner);
                 let inner_tokens = inner.to_token_stream().to_string();
                 let var_name = if let Some(existing) = self.lazy_old_closures.iter().find(|spec| {
-                    spec.inner_src == inner_tokens && spec.mut_called_params == mut_called_params
+                    spec.inner_src == inner_tokens
+                        && spec.referenced_mut_params == referenced_mut_params
                 }) {
                     existing.var_name.clone()
                 } else {
@@ -3681,7 +3577,7 @@ fn rewrite_old_expressions_for_rust(
                     self.lazy_old_closures.push(LazyOldClosureSpec {
                         var_name: fresh.clone(),
                         inner_src: inner_tokens,
-                        mut_called_params,
+                        referenced_mut_params,
                     });
                     fresh
                 };
@@ -3695,7 +3591,6 @@ fn rewrite_old_expressions_for_rust(
     Hoister {
         params,
         const_names,
-        mut_helper_param_indices,
         needed_pre_params,
         lazy_old_closures,
     }
@@ -4564,7 +4459,19 @@ fn default_rust_ty_for_layout(layout: &LayoutSpec) -> String {
 }
 
 fn parse_scalar_type_spec(ty_name: &str) -> Option<(usize, bool)> {
-    match ty_name.trim() {
+    let clean = ty_name.replace(' ', "");
+    let short = match clean.as_str() {
+        s if s.starts_with("core::primitive::") => &s["core::primitive::".len()..],
+        s if s.starts_with("::core::primitive::") => &s["::core::primitive::".len()..],
+        s if s.starts_with("std::primitive::") => &s["std::primitive::".len()..],
+        s if s.starts_with("::std::primitive::") => &s["::std::primitive::".len()..],
+        s if s.starts_with("core::") => &s["core::".len()..],
+        s if s.starts_with("::core::") => &s["::core::".len()..],
+        s if s.starts_with("std::") => &s["std::".len()..],
+        s if s.starts_with("::std::") => &s["::std::".len()..],
+        s => s,
+    };
+    match short {
         "u8" => Some((1, false)),
         "u16" => Some((2, false)),
         "u32" => Some((4, false)),
@@ -5165,6 +5072,7 @@ impl<'a> SpecEvalContext<'a> {
         kind_label: &str,
         trap_on_exact_len_mismatch: bool,
     ) -> Result<bool, SpecExecFlow> {
+        let checkpoint = bindings.len();
         if let Some(rest_pos) = pat_elems.iter().position(|p| matches!(p, Pat::Rest(_))) {
             let prefix = &pat_elems[..rest_pos];
             let suffix = &pat_elems[rest_pos + 1..];
@@ -5183,12 +5091,14 @@ impl<'a> SpecEvalContext<'a> {
             }
             for (sp, sv) in prefix.iter().zip(elems.iter()) {
                 if !self.try_match_pattern(sp, sv, bindings)? {
+                    bindings.truncate(checkpoint);
                     return Ok(false);
                 }
             }
             let tail_start = elems.len() - suffix.len();
             for (sp, sv) in suffix.iter().zip(elems[tail_start..].iter()) {
                 if !self.try_match_pattern(sp, sv, bindings)? {
+                    bindings.truncate(checkpoint);
                     return Ok(false);
                 }
             }
@@ -5206,6 +5116,7 @@ impl<'a> SpecEvalContext<'a> {
             }
             for (sp, sv) in pat_elems.iter().zip(elems.iter()) {
                 if !self.try_match_pattern(sp, sv, bindings)? {
+                    bindings.truncate(checkpoint);
                     return Ok(false);
                 }
             }
@@ -5262,31 +5173,39 @@ impl<'a> SpecEvalContext<'a> {
                 }
                 Ok(true)
             }
-            Pat::Path(pp) if pp.qself.is_none() && pp.path.segments.len() == 2 => {
-                let raw_ty_name = pp.path.segments[0].ident.to_string();
-                let ty_name = self.type_meta.resolve_type_ident(&raw_ty_name);
-                let assoc_name = pp.path.segments[1].ident.to_string();
-                if self.enum_layouts.contains_key(&ty_name) {
-                    return match scrutinee {
-                        SpecEvalValue::Enum {
-                            name,
-                            variant_name,
-                            payload: None,
-                            ..
-                        } if self.type_meta.resolve_type_ident(name) == ty_name => {
-                            Ok(variant_name == &assoc_name)
-                        }
-                        SpecEvalValue::Enum { name, .. }
-                            if self.type_meta.resolve_type_ident(name) == ty_name =>
-                        {
-                            Ok(false)
-                        }
-                        other => spec_trap(format!(
-                            "cannot match enum pattern `{raw_ty_name}::{assoc_name}` against {other:?}"
-                        )),
-                    };
+            Pat::Path(pp) if pp.qself.is_none() && pp.path.segments.len() >= 2 => {
+                let segs: Vec<String> = pp
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect();
+                let assoc_name = &segs[segs.len() - 1];
+                let raw_ty_name = segs[..segs.len() - 1].join("::");
+                if segs.len() == 2 {
+                    let ty_name = self.type_meta.resolve_type_ident(&raw_ty_name);
+                    if self.enum_layouts.contains_key(&ty_name) {
+                        return match scrutinee {
+                            SpecEvalValue::Enum {
+                                name,
+                                variant_name,
+                                payload: None,
+                                ..
+                            } if self.type_meta.resolve_type_ident(name) == ty_name => {
+                                Ok(variant_name == assoc_name)
+                            }
+                            SpecEvalValue::Enum { name, .. }
+                                if self.type_meta.resolve_type_ident(name) == ty_name =>
+                            {
+                                Ok(false)
+                            }
+                            other => spec_trap(format!(
+                                "cannot match enum pattern `{raw_ty_name}::{assoc_name}` against {other:?}"
+                            )),
+                        };
+                    }
                 }
-                let cval = eval_assoc_int_const_with_meta(&raw_ty_name, &assoc_name, self.type_meta)?;
+                let cval = eval_assoc_int_const_with_meta(&raw_ty_name, assoc_name, self.type_meta)?;
                 Ok(scrutinee.semantic_eq(&cval)?)
             }
             Pat::TupleStruct(pts) if pts.qself.is_none() && pts.path.segments.len() == 2 => {
@@ -5350,6 +5269,7 @@ impl<'a> SpecEvalContext<'a> {
                 }
             }
             Pat::Struct(ps) => {
+                let checkpoint = bindings.len();
                 if ps.qself.is_none() && ps.path.segments.len() == 2 {
                     let raw_ty_name = ps.path.segments[0].ident.to_string();
                     let ty_name = self.type_meta.resolve_type_ident(&raw_ty_name);
@@ -5393,6 +5313,7 @@ impl<'a> SpecEvalContext<'a> {
                                 format!("unknown field `{fname}` on `{raw_ty_name}::{var_name}`")
                             })?;
                             if !self.try_match_pattern(&fp.pat, fval, bindings)? {
+                                bindings.truncate(checkpoint);
                                 return Ok(false);
                             }
                         }
@@ -5424,6 +5345,7 @@ impl<'a> SpecEvalContext<'a> {
                         .get(&fname)
                         .ok_or_else(|| format!("unknown field `{fname}` on struct `{name}`"))?;
                     if !self.try_match_pattern(&fp.pat, fval, bindings)? {
+                        bindings.truncate(checkpoint);
                         return Ok(false);
                     }
                 }
@@ -5544,7 +5466,8 @@ impl<'a> SpecEvalContext<'a> {
                 let idx = match idx_val {
                     SpecEvalValue::Int {
                         bits, signed: false, ..
-                    } => bits as usize,
+                    } => usize::try_from(bits)
+                        .map_err(|_| format!("array index {bits} overflows usize"))?,
                     _ => return spec_trap("array index must be an unsigned integer"),
                 };
                 steps.push(SpecPlaceStep::ArrayIndex(idx));
@@ -5554,6 +5477,158 @@ impl<'a> SpecEvalContext<'a> {
                 "unsupported assignment left-hand side `{}`",
                 other.to_token_stream()
             )),
+        }
+    }
+
+    fn reconstruct_mut_iter_elem(
+        &self,
+        pat: &Pat,
+        orig_elem: SpecEvalValue,
+    ) -> Result<SpecEvalValue, String> {
+        match pat {
+            // `Pat::Reference` (e.g. `for &mut x in &mut arr` or `for &x in &mut arr`)
+            // copies a `Copy` element by value in Rust and does NOT write back!
+            Pat::Wild(_)
+            | Pat::Rest(_)
+            | Pat::Lit(_)
+            | Pat::Range(_)
+            | Pat::Path(_)
+            | Pat::Reference(_) => Ok(orig_elem),
+            Pat::Paren(pp) => self.reconstruct_mut_iter_elem(&pp.pat, orig_elem),
+            Pat::Type(pt) => self.reconstruct_mut_iter_elem(&pt.pat, orig_elem),
+            Pat::Ident(pi) => {
+                let name = pi.ident.to_string();
+                if self.type_meta.const_items.contains_key(&name) {
+                    return Ok(orig_elem);
+                }
+                if name == "_" {
+                    if let Some((_, sub)) = &pi.subpat {
+                        return self.reconstruct_mut_iter_elem(sub, orig_elem);
+                    }
+                    return Ok(orig_elem);
+                }
+                Ok(self.env.get(&name).cloned().unwrap_or(orig_elem))
+            }
+            Pat::Tuple(pt) => {
+                let SpecEvalValue::Tuple {
+                    layout,
+                    raw_bytes,
+                    mut elems,
+                } = orig_elem
+                else {
+                    return Ok(orig_elem);
+                };
+                let pat_elems: Vec<&Pat> = pt.elems.iter().collect();
+                if let Some(rest_pos) = pat_elems.iter().position(|p| matches!(p, Pat::Rest(_))) {
+                    let prefix = &pat_elems[..rest_pos];
+                    let suffix = &pat_elems[rest_pos + 1..];
+                    for (idx, sp) in prefix.iter().enumerate() {
+                        elems[idx] = self.reconstruct_mut_iter_elem(sp, elems[idx].clone())?;
+                    }
+                    let tail_start = elems.len().saturating_sub(suffix.len());
+                    for (off, sp) in suffix.iter().enumerate() {
+                        let idx = tail_start + off;
+                        elems[idx] = self.reconstruct_mut_iter_elem(sp, elems[idx].clone())?;
+                    }
+                } else {
+                    for (idx, sp) in pat_elems.iter().enumerate() {
+                        if idx < elems.len() {
+                            elems[idx] = self.reconstruct_mut_iter_elem(sp, elems[idx].clone())?;
+                        }
+                    }
+                }
+                let prov = SpecEvalValue::Tuple {
+                    layout: layout.clone(),
+                    raw_bytes,
+                    elems: elems.clone(),
+                };
+                let new_raw = prov.to_layout_bytes();
+                Ok(SpecEvalValue::Tuple {
+                    layout,
+                    raw_bytes: new_raw,
+                    elems,
+                })
+            }
+            Pat::Struct(ps) => {
+                let SpecEvalValue::Struct {
+                    name,
+                    layout,
+                    raw_bytes,
+                    mut fields,
+                } = orig_elem
+                else {
+                    return Ok(orig_elem);
+                };
+                for fp in &ps.fields {
+                    if let Member::Named(fid) = &fp.member {
+                        let fname = fid.to_string();
+                        if let Some(prev_f) = fields.get(&fname).cloned() {
+                            let next_f = self.reconstruct_mut_iter_elem(&fp.pat, prev_f)?;
+                            fields.insert(fname, next_f);
+                        }
+                    }
+                }
+                let prov = SpecEvalValue::Struct {
+                    name: name.clone(),
+                    layout: layout.clone(),
+                    raw_bytes,
+                    fields: fields.clone(),
+                };
+                let new_raw = prov.to_layout_bytes();
+                Ok(SpecEvalValue::Struct {
+                    name,
+                    layout,
+                    raw_bytes: new_raw,
+                    fields,
+                })
+            }
+            Pat::Slice(psl) => {
+                let SpecEvalValue::Array {
+                    layout,
+                    elem_layout,
+                    elem_stride,
+                    raw_bytes,
+                    mut elems,
+                } = orig_elem
+                else {
+                    return Ok(orig_elem);
+                };
+                let pat_elems: Vec<&Pat> = psl.elems.iter().collect();
+                if let Some(rest_pos) = pat_elems.iter().position(|p| matches!(p, Pat::Rest(_))) {
+                    let prefix = &pat_elems[..rest_pos];
+                    let suffix = &pat_elems[rest_pos + 1..];
+                    for (idx, sp) in prefix.iter().enumerate() {
+                        elems[idx] = self.reconstruct_mut_iter_elem(sp, elems[idx].clone())?;
+                    }
+                    let tail_start = elems.len().saturating_sub(suffix.len());
+                    for (off, sp) in suffix.iter().enumerate() {
+                        let idx = tail_start + off;
+                        elems[idx] = self.reconstruct_mut_iter_elem(sp, elems[idx].clone())?;
+                    }
+                } else {
+                    for (idx, sp) in pat_elems.iter().enumerate() {
+                        if idx < elems.len() {
+                            elems[idx] = self.reconstruct_mut_iter_elem(sp, elems[idx].clone())?;
+                        }
+                    }
+                }
+                let prov = SpecEvalValue::Array {
+                    layout: layout.clone(),
+                    elem_layout: elem_layout.clone(),
+                    elem_stride,
+                    raw_bytes,
+                    elems: elems.clone(),
+                };
+                let new_raw = prov.to_layout_bytes();
+                Ok(SpecEvalValue::Array {
+                    layout,
+                    elem_layout,
+                    elem_stride,
+                    raw_bytes: new_raw,
+                    elems,
+                })
+            }
+            _ => Ok(orig_elem),
         }
     }
 
@@ -5853,6 +5928,70 @@ impl<'a> SpecEvalContext<'a> {
                     return Ok(SpecEvalValue::Unit);
                 }
 
+                if let Expr::Reference(er) = iter_target
+                    && er.mutability.is_some()
+                    && let Ok((root_name, base_steps)) = self.resolve_place_path(&er.expr)
+                    && self.env.contains_key(&root_name)
+                {
+                    let cur_root = self
+                        .env
+                        .get(&root_name)
+                        .ok_or_else(|| format!("unknown `&mut` loop target `{root_name}`"))?;
+                    let cur_arr = read_at_place_steps(cur_root, &base_steps)?;
+                    let SpecEvalValue::Array { elems, .. } = cur_arr else {
+                        return spec_trap(format!(
+                            "`for` loop over `&mut` requires an array place, got {cur_arr:?}"
+                        ));
+                    };
+                    let arr_len = elems.len();
+                    if arr_len > MAX_SPEC_LOOP_ITERS {
+                        return spec_trap(format!(
+                            "`for` loop array length {arr_len} exceeds bounded step budget ({MAX_SPEC_LOOP_ITERS})"
+                        ));
+                    }
+                    for elem_idx in 0..arr_len {
+                        let mut elem_steps = base_steps.clone();
+                        elem_steps.push(SpecPlaceStep::ArrayIndex(elem_idx));
+                        let root_snapshot = self
+                            .env
+                            .get(&root_name)
+                            .ok_or_else(|| format!("missing `{root_name}` during `&mut` loop"))?;
+                        let elem = read_at_place_steps(root_snapshot, &elem_steps)?;
+                        let mut iter_shadowed = Vec::new();
+                        if let Err(e) =
+                            self.bind_local_pattern(&efl.pat, None, elem.clone(), &mut iter_shadowed)
+                        {
+                            restore_shadowed_env(&mut self.env, iter_shadowed);
+                            return spec_trap(e);
+                        }
+                        let body_res = self.eval_block(&efl.body);
+                        let wb_res = self.reconstruct_mut_iter_elem(&efl.pat, elem);
+                        restore_shadowed_env(&mut self.env, iter_shadowed);
+                        let updated_elem = wb_res.map_err(SpecExecFlow::Trap)?;
+                        let cur_root_after = self
+                            .env
+                            .get(&root_name)
+                            .cloned()
+                            .ok_or_else(|| format!("missing `{root_name}` on `&mut` loop writeback"))?;
+                        let next_root =
+                            write_at_place_steps(cur_root_after, &elem_steps, updated_elem)?;
+                        self.env.insert(root_name.clone(), next_root);
+                        match body_res {
+                            Ok(_) | Err(SpecExecFlow::Continue) => {}
+                            Err(SpecExecFlow::Break(SpecEvalValue::Unit)) => break,
+                            Err(SpecExecFlow::Break(other)) => {
+                                return spec_trap(format!(
+                                    "`for` loop cannot `break` with non-unit value {other:?}"
+                                ));
+                            }
+                            Err(flow @ (SpecExecFlow::Return(_) | SpecExecFlow::Trap(_))) => {
+                                return Err(flow);
+                            }
+                        }
+                    }
+                    return Ok(SpecEvalValue::Unit);
+                }
+
                 let iter_val = self.eval_expr(iter_target)?;
                 let SpecEvalValue::Array { elems, .. } = iter_val else {
                     return spec_trap(format!(
@@ -5998,39 +6137,47 @@ impl<'a> SpecEvalContext<'a> {
                         return Ok(const_val);
                     }
                     Err(SpecExecFlow::Trap(format!("unknown variable `{id}`")))
-                } else if ep.path.segments.len() == 2 {
-                    let raw_ty = ep.path.segments[0].ident.to_string();
-                    let ty = self.type_meta.resolve_type_ident(&raw_ty);
-                    let assoc = ep.path.segments[1].ident.to_string();
-                    if let Some(elayout @ LayoutSpec::Enum { total_size, variants, .. }) =
-                        self.enum_layouts.get(&ty)
-                    {
-                        let vspec = variants
-                            .iter()
-                            .find(|v| v.name == assoc)
-                            .ok_or_else(|| format!("unknown enum variant `{raw_ty}::{assoc}`"))?;
-                        if vspec.payload.is_some() {
-                            return spec_trap(format!(
-                                "enum variant `{raw_ty}::{assoc}` requires a payload argument"
-                            ));
+                } else if ep.path.segments.len() >= 2 {
+                    let segs: Vec<String> = ep
+                        .path
+                        .segments
+                        .iter()
+                        .map(|s| s.ident.to_string())
+                        .collect();
+                    let assoc = segs[segs.len() - 1].clone();
+                    let raw_ty = segs[..segs.len() - 1].join("::");
+                    if segs.len() == 2 {
+                        let ty = self.type_meta.resolve_type_ident(&raw_ty);
+                        if let Some(elayout @ LayoutSpec::Enum { total_size, variants, .. }) =
+                            self.enum_layouts.get(&ty)
+                        {
+                            let vspec = variants
+                                .iter()
+                                .find(|v| v.name == assoc)
+                                .ok_or_else(|| format!("unknown enum variant `{raw_ty}::{assoc}`"))?;
+                            if vspec.payload.is_some() {
+                                return spec_trap(format!(
+                                    "enum variant `{raw_ty}::{assoc}` requires a payload argument"
+                                ));
+                            }
+                            let provisional = SpecEvalValue::Enum {
+                                name: ty.clone(),
+                                layout: elayout.clone(),
+                                variant_name: assoc.clone(),
+                                discriminant: vspec.discriminant,
+                                payload: None,
+                                raw_bytes: vec![0u8; *total_size],
+                            };
+                            let raw_bytes = provisional.to_layout_bytes();
+                            return Ok(SpecEvalValue::Enum {
+                                name: ty,
+                                layout: elayout.clone(),
+                                variant_name: assoc,
+                                discriminant: vspec.discriminant,
+                                payload: None,
+                                raw_bytes,
+                            });
                         }
-                        let provisional = SpecEvalValue::Enum {
-                            name: ty.clone(),
-                            layout: elayout.clone(),
-                            variant_name: assoc.clone(),
-                            discriminant: vspec.discriminant,
-                            payload: None,
-                            raw_bytes: vec![0u8; *total_size],
-                        };
-                        let raw_bytes = provisional.to_layout_bytes();
-                        return Ok(SpecEvalValue::Enum {
-                            name: ty,
-                            layout: elayout.clone(),
-                            variant_name: assoc,
-                            discriminant: vspec.discriminant,
-                            payload: None,
-                            raw_bytes,
-                        });
                     }
                     Ok(eval_assoc_int_const_with_meta(&raw_ty, &assoc, self.type_meta)?)
                 } else {
@@ -6157,7 +6304,8 @@ impl<'a> SpecEvalContext<'a> {
                 let idx = match idx_val {
                     SpecEvalValue::Int {
                         bits, signed: false, ..
-                    } => bits as usize,
+                    } => usize::try_from(bits)
+                        .map_err(|_| format!("slice/array index {bits} overflows usize"))?,
                     _ => return spec_trap("slice/array index must be unsigned"),
                 };
                 let SpecEvalValue::Array { elems, .. } = base else {
@@ -6179,6 +6327,11 @@ impl<'a> SpecEvalContext<'a> {
                     if let Some(elayout @ LayoutSpec::Enum { total_size, variants, .. }) =
                         self.enum_layouts.get(&enum_name)
                     {
+                        if es.rest.is_some() {
+                            return spec_trap(format!(
+                                "functional struct update `..` is invalid on enum variant `{raw_enum}::{var_name}`"
+                            ));
+                        }
                         let vspec = variants
                             .iter()
                             .find(|v| v.name == var_name)
@@ -6849,13 +7002,15 @@ impl<'a> SpecEvalContext<'a> {
             .external_callees
             .get(&callee_name)
             .or_else(|| self.external_callees.get(short_callee));
-        let sched_expected_sz = sched_ref.expected_return_size(&callee_name);
-        match sched_ref.next_action(&callee_name, idx) {
+        let effective_sched_callee =
+            resolve_sched_callee_key(sched_ref, &callee_name, short_callee);
+        let sched_expected_sz = sched_ref.expected_return_size(&effective_sched_callee);
+        match sched_ref.next_action(&effective_sched_callee, idx) {
             crate::instrument::EnvAction::PanicOnCall(p_idx) => {
                 spec_trap(format!("scheduled panic on `{callee_name}` at call {p_idx}"))
             }
             crate::instrument::EnvAction::ReturnBytes(bytes) => {
-                if let Err(e) = sched_ref.validate_callee_payload(&callee_name, &bytes) {
+                if let Err(e) = sched_ref.validate_callee_payload(&effective_sched_callee, &bytes) {
                     return spec_trap(format!(
                         "EnvSchedule payload validation failed for `{callee_name}`: {e}"
                     ));
@@ -7215,7 +7370,8 @@ fn coerce_value_to_syn_type(
         }
         other => {
             let ty_str = other.to_token_stream().to_string().replace(' ', "");
-            if let Some((sz, sig)) = meta.parse_scalar_type(&ty_str)
+            let is_nonzero = meta.parse_nonzero_underlying_prim(&ty_str).is_some();
+            let coerced = if let Some((sz, sig)) = meta.parse_scalar_type(&ty_str)
                 && let SpecEvalValue::Int {
                     bits,
                     signed: rsig,
@@ -7223,10 +7379,21 @@ fn coerce_value_to_syn_type(
                     ..
                 } = val
             {
-                coerce_lit_to_int(bits, rsig, sz, sig)
+                coerce_lit_to_int(bits, rsig, sz, sig)?
             } else {
-                Ok(val)
+                val
+            };
+            if is_nonzero
+                && let SpecEvalValue::Int {
+                    bits, size_bytes, ..
+                } = &coerced
+                && (bits & width_mask((*size_bytes * 8) as u32)) == 0
+            {
+                return Err(format!(
+                    "zero value is invalid for NonZero integer type `{ty_str}`"
+                ));
             }
+            Ok(coerced)
         }
     }
 }
@@ -7239,11 +7406,12 @@ fn eval_assoc_int_const_with_meta(
     let Some((sz, sig)) = meta.parse_scalar_type(ty) else {
         return Err(format!("unknown integer type `{ty}` for `{ty}::{assoc}`"));
     };
+    let is_nonzero = meta.parse_nonzero_underlying_prim(ty).is_some();
     let bw = (sz * 8) as u32;
     let mask = width_mask(bw);
     match (sig, assoc) {
         (false, "MIN") => Ok(SpecEvalValue::Int {
-            bits: 0,
+            bits: if is_nonzero { 1 } else { 0 },
             size_bytes: sz,
             signed: false,
             untyped_lit: false,
@@ -8248,40 +8416,6 @@ impl SpecContractOracleProbe {
 
         let type_meta = SpecTypeMetadata::from_type_defs(&self.type_defs_rust);
         let const_names = type_meta.const_name_set();
-        let mut mut_helper_param_indices: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
-        {
-            let mut self_mut_idxs = BTreeSet::new();
-            for (i, p) in self.params.iter().enumerate() {
-                if p.is_mut_ref {
-                    self_mut_idxs.insert(i);
-                }
-            }
-            if !self_mut_idxs.is_empty() {
-                mut_helper_param_indices.insert(self.fn_name.clone(), self_mut_idxs);
-            }
-        }
-        if !self.type_defs_rust.trim().is_empty()
-            && let Ok(parsed_defs) = syn::parse_file(&self.type_defs_rust)
-        {
-            for item in parsed_defs.items {
-                if let syn::Item::Fn(f) = item {
-                    let mut idxs = BTreeSet::new();
-                    for (i, inp) in f.sig.inputs.iter().enumerate() {
-                        if let syn::FnArg::Typed(pat_ty) = inp {
-                            let resolved = type_meta.resolve_syn_type(&pat_ty.ty);
-                            if let syn::Type::Reference(tr) = resolved
-                                && tr.mutability.is_some()
-                            {
-                                idxs.insert(i);
-                            }
-                        }
-                    }
-                    if !idxs.is_empty() {
-                        mut_helper_param_indices.insert(f.sig.ident.to_string(), idxs);
-                    }
-                }
-            }
-        }
 
         let mut needed_pre_params = BTreeSet::new();
         let mut lazy_old_closures: Vec<LazyOldClosureSpec> = Vec::new();
@@ -8293,7 +8427,6 @@ impl SpecContractOracleProbe {
                 &mut expr,
                 &self.params,
                 &const_names,
-                &mut_helper_param_indices,
                 &mut needed_pre_params,
                 &mut lazy_old_closures,
             );
@@ -8339,11 +8472,26 @@ impl SpecContractOracleProbe {
                      static __ANNEAL_GLOBAL_CALL_IDX: std::cell::Cell<usize> = \
                          const { std::cell::Cell::new(0) };\n    \
                      static __ANNEAL_GLOBAL_PANIC_ON_CALL: std::cell::Cell<Option<usize>> = \
-                         const { std::cell::Cell::new(None) };\n\
+                         const { std::cell::Cell::new(None) };\n    \
+                     static __ANNEAL_SPEC_PURE_GUARD: std::cell::Cell<bool> = \
+                         const { std::cell::Cell::new(false) };\n\
+                 }\n\
+                 struct __AnnealPureSpecGuard;\n\
+                 impl __AnnealPureSpecGuard {\n    \
+                     fn enter() -> Self {\n        \
+                         __ANNEAL_SPEC_PURE_GUARD.with(|g| g.set(true));\n        \
+                         Self\n    \
+                     }\n\
+                 }\n\
+                 impl Drop for __AnnealPureSpecGuard {\n    \
+                     fn drop(&mut self) {\n        \
+                         __ANNEAL_SPEC_PURE_GUARD.with(|g| g.set(false));\n    \
+                     }\n\
                  }\n\
                  pub fn __anneal_reset_global_schedule(global_panic_on_call: Option<usize>) {\n    \
                      __ANNEAL_GLOBAL_CALL_IDX.with(|c| c.set(0));\n    \
-                     __ANNEAL_GLOBAL_PANIC_ON_CALL.with(|p| p.set(global_panic_on_call));\n\
+                     __ANNEAL_GLOBAL_PANIC_ON_CALL.with(|p| p.set(global_panic_on_call));\n    \
+                     __ANNEAL_SPEC_PURE_GUARD.with(|g| g.set(false));\n\
                  }\n\n",
             );
             for ext in &self.external_callees {
@@ -8399,6 +8547,9 @@ impl SpecContractOracleProbe {
                     .collect();
                 out.push_str(&format!(
                     "pub fn {}({}) -> {} {{\n    \
+                         if __ANNEAL_SPEC_PURE_GUARD.with(|g| g.get()) {{\n        \
+                             panic!(\"external callee `{}` is forbidden inside pure spec clauses\");\n    \
+                         }}\n    \
                          let global_idx = __ANNEAL_GLOBAL_CALL_IDX.with(|c| {{\n        \
                              let cur = c.get();\n        \
                              c.set(cur.saturating_add(1));\n        \
@@ -8434,6 +8585,7 @@ impl SpecContractOracleProbe {
                     ext.name,
                     ext.name,
                     ext.name,
+                    ext.name,
                     ext.name
                 ));
             }
@@ -8458,23 +8610,39 @@ impl SpecContractOracleProbe {
             out.push_str(t);
             out.push('\n');
         }
-        for (req_idx, req) in self.requires.iter().enumerate() {
-            out.push_str(&format!(
-                "    let __anneal_req_{req_idx}: bool = {};\n    \
-                 if !__anneal_req_{req_idx} {{\n        \
-                     return SpecProbeOutcome::VacuouslyFiltered;\n    \
-                 }}\n",
-                req.rust_expr
-            ));
+        if !self.requires.is_empty() {
+            out.push_str("    #[allow(unused_mut, unused_variables)]\n    {\n");
+            if !self.external_callees.is_empty() {
+                out.push_str("        let _req_pure_guard = __AnnealPureSpecGuard::enter();\n");
+            }
+            for p in &self.params {
+                if p.is_mut_ref {
+                    out.push_str(&format!(
+                        "        let mut __anneal_req_local_{}: {} = (*{}).clone();\n        \
+                         let {}: &mut {} = &mut __anneal_req_local_{};\n        \
+                         let _ = &{};\n",
+                        p.name, p.rust_ty, p.name, p.name, p.rust_ty, p.name, p.name
+                    ));
+                }
+            }
+            for (req_idx, req) in self.requires.iter().enumerate() {
+                out.push_str(&format!(
+                    "        let __anneal_req_{req_idx}: bool = {};\n        \
+                     if !__anneal_req_{req_idx} {{\n            \
+                         return SpecProbeOutcome::VacuouslyFiltered;\n        \
+                     }}\n",
+                    req.rust_expr
+                ));
+            }
+            out.push_str("    }\n");
         }
         for p in &self.params {
             if needed_pre_params.contains(&p.name) {
                 if p.is_mut_ref {
                     out.push_str(&format!(
                         "    let __anneal_pre_{}: {} = (*{}).clone();\n    \
-                         let __anneal_pre_ref_{}: &{} = &__anneal_pre_{};\n    \
-                         let _ = __anneal_pre_ref_{};\n",
-                        p.name, p.rust_ty, p.name, p.name, p.rust_ty, p.name, p.name
+                         let _ = &__anneal_pre_{};\n",
+                        p.name, p.rust_ty, p.name, p.name
                     ));
                 } else {
                     out.push_str(&format!(
@@ -8514,8 +8682,11 @@ impl SpecContractOracleProbe {
                 }
             }
         }
+        if !self.ensures.is_empty() && !self.external_callees.is_empty() {
+            out.push_str("    let _ens_pure_guard = __AnnealPureSpecGuard::enter();\n");
+        }
         for spec in &lazy_old_closures {
-            if spec.mut_called_params.is_empty() {
+            if spec.referenced_mut_params.is_empty() {
                 out.push_str(&format!(
                     "    let {} = || {{ {} }};\n",
                     spec.var_name, spec.inner_src
@@ -8523,7 +8694,7 @@ impl SpecContractOracleProbe {
             } else {
                 let mut local_rebinds = String::new();
                 for p in &self.params {
-                    if p.is_mut_ref && spec.mut_called_params.contains(&p.name) {
+                    if p.is_mut_ref && spec.referenced_mut_params.contains(&p.name) {
                         local_rebinds.push_str(&format!(
                             "let mut __anneal_pre_local_{}: {} = __anneal_pre_{}.clone(); \
                              let __anneal_pre_ref_{}: &mut {} = &mut __anneal_pre_local_{}; \
@@ -8639,8 +8810,9 @@ impl SpecContractOracleProbe {
             if let Some(sched) = opt_sched {
                 let type_meta = SpecTypeMetadata::from_type_defs(&self.type_defs_rust);
                 for ext in &self.external_callees {
+                    let sched_key = resolve_sched_callee_key(sched, &ext.name, &ext.name);
                     let decode_opt_lit = |bytes: &[u8]| -> String {
-                        if sched.validate_callee_payload(&ext.name, bytes).is_ok()
+                        if sched.validate_callee_payload(&sched_key, bytes).is_ok()
                             && bytes.len() == ext.ret_layout.total_size()
                             && let Ok(val) =
                                 SpecEvalValue::from_layout_bytes(&ext.ret_layout, bytes)
@@ -8654,14 +8826,14 @@ impl SpecContractOracleProbe {
                         }
                     };
                     if let Some(rem_panic) =
-                        remaining_calls_until_callee_panic(sched, &ext.name)
+                        remaining_calls_until_callee_panic(sched, &sched_key)
                     {
                         bindings_code.push_str(&format!(
                             "        __anneal_set_callee_panic_{}(Some({rem_panic}usize));\n",
                             ext.name
                         ));
                     }
-                    if let Some(queue) = sched.callee_queues.get(&ext.name) {
+                    if let Some(queue) = find_sched_entry(&sched.callee_queues, &ext.name) {
                         for item_bytes in queue {
                             bindings_code.push_str(&format!(
                                 "        __anneal_push_schedule_{}({});\n",
@@ -8670,7 +8842,7 @@ impl SpecContractOracleProbe {
                             ));
                         }
                     }
-                    if let Some(def_bytes) = sched.callee_defaults.get(&ext.name) {
+                    if let Some(def_bytes) = find_sched_entry(&sched.callee_defaults, &ext.name) {
                         bindings_code.push_str(&format!(
                             "        __anneal_set_default_{}(Some({}));\n",
                             ext.name,
@@ -9051,7 +9223,43 @@ impl SpecContractOracleProbe {
     }
 }
 
-fn current_callee_call_count(sched: &EnvSchedule, callee: &str) -> usize {
+fn find_sched_entry<'a, V>(map: &'a BTreeMap<String, V>, short_callee: &str) -> Option<&'a V> {
+    if let Some(v) = map.get(short_callee) {
+        return Some(v);
+    }
+    map.iter()
+        .find(|(k, _)| k.rsplit("::").next() == Some(short_callee))
+        .map(|(_, v)| v)
+}
+
+fn resolve_sched_callee_key(sched: &EnvSchedule, callee_name: &str, short_callee: &str) -> String {
+    let has_exact = |key: &str| -> bool {
+        sched.callee_queues.contains_key(key)
+            || sched.callee_defaults.contains_key(key)
+            || sched.callee_panic_on_call.contains_key(key)
+            || sched.callee_return_sizes.contains_key(key)
+    };
+    if has_exact(callee_name) {
+        return callee_name.to_string();
+    }
+    if has_exact(short_callee) {
+        return short_callee.to_string();
+    }
+    for k in sched
+        .callee_queues
+        .keys()
+        .chain(sched.callee_defaults.keys())
+        .chain(sched.callee_panic_on_call.keys())
+        .chain(sched.callee_return_sizes.keys())
+    {
+        if k.rsplit("::").next() == Some(short_callee) {
+            return k.clone();
+        }
+    }
+    callee_name.to_string()
+}
+
+fn parse_stripped_callee_call_counts(sched: &EnvSchedule) -> BTreeMap<String, usize> {
     let mut unstepped = EnvSchedule::new();
     unstepped.callee_queues = sched.callee_queues.clone();
     unstepped.callee_defaults = sched.callee_defaults.clone();
@@ -9059,7 +9267,7 @@ fn current_callee_call_count(sched: &EnvSchedule, callee: &str) -> usize {
     unstepped.global_panic_on_call = sched.global_panic_on_call;
     unstepped.callee_panic_on_call = sched.callee_panic_on_call.clone();
     if &unstepped == sched {
-        return 0;
+        return BTreeMap::new();
     }
 
     let mut stripped = sched.clone();
@@ -9070,45 +9278,103 @@ fn current_callee_call_count(sched: &EnvSchedule, callee: &str) -> usize {
     stripped.callee_panic_on_call.clear();
 
     let dbg = format!("{stripped:?}");
-    let candidate = dbg
-        .find("callee_call_counts: {")
-        .and_then(|start| {
-            let tail = &dbg[start + "callee_call_counts: {".len()..];
-            let needle = format!("{callee:?}: ");
-            let pos = tail.find(&needle)?;
-            let digits_str: String = tail[pos + needle.len()..]
-                .chars()
-                .take_while(|c| c.is_ascii_digit() || *c == '_')
-                .filter(|c| *c != '_')
-                .collect();
-            digits_str.parse::<usize>().ok()
-        })
-        .unwrap_or(0);
-
-    let mut verify_sim = stripped.clone();
-    verify_sim.set_callee_panic_on_call(callee, candidate);
-    if matches!(
-        verify_sim.next_action(callee, usize::MAX),
-        crate::instrument::EnvAction::PanicOnCall(_)
-    ) {
-        return candidate;
-    }
-
-    for delta in 0..=4096usize {
-        let mut probe_sim = stripped.clone();
-        probe_sim.set_callee_panic_on_call(callee, delta);
-        if matches!(
-            probe_sim.next_action(callee, usize::MAX),
-            crate::instrument::EnvAction::PanicOnCall(_)
-        ) {
-            return delta;
+    let mut out = BTreeMap::new();
+    let Some(start) = dbg.find("callee_call_counts: {") else {
+        return out;
+    };
+    let bytes = dbg.as_bytes();
+    let mut idx = start + "callee_call_counts: {".len();
+    while idx < bytes.len() {
+        while idx < bytes.len() && (bytes[idx].is_ascii_whitespace() || bytes[idx] == b',') {
+            idx += 1;
+        }
+        if idx >= bytes.len() || bytes[idx] == b'}' {
+            break;
+        }
+        if bytes[idx] != b'"' {
+            break;
+        }
+        idx += 1;
+        let mut key = String::new();
+        while idx < bytes.len() {
+            let ch = dbg[idx..].chars().next().unwrap();
+            idx += ch.len_utf8();
+            if ch == '"' {
+                break;
+            }
+            if ch == '\\' && idx < bytes.len() {
+                let esc = dbg[idx..].chars().next().unwrap();
+                idx += esc.len_utf8();
+                match esc {
+                    'n' => key.push('\n'),
+                    'r' => key.push('\r'),
+                    't' => key.push('\t'),
+                    '0' => key.push('\0'),
+                    '\\' => key.push('\\'),
+                    '"' => key.push('"'),
+                    '\'' => key.push('\''),
+                    'u' if idx < bytes.len() && bytes[idx] == b'{' => {
+                        idx += 1;
+                        let hex_start = idx;
+                        while idx < bytes.len() && bytes[idx] != b'}' {
+                            idx += 1;
+                        }
+                        if let Ok(code) = u32::from_str_radix(&dbg[hex_start..idx], 16)
+                            && let Some(uc) = char::from_u32(code)
+                        {
+                            key.push(uc);
+                        }
+                        if idx < bytes.len() && bytes[idx] == b'}' {
+                            idx += 1;
+                        }
+                    }
+                    other => key.push(other),
+                }
+            } else {
+                key.push(ch);
+            }
+        }
+        while idx < bytes.len() && (bytes[idx] == b':' || bytes[idx].is_ascii_whitespace()) {
+            idx += 1;
+        }
+        let num_start = idx;
+        while idx < bytes.len() && (bytes[idx].is_ascii_digit() || bytes[idx] == b'_') {
+            idx += 1;
+        }
+        let num_str: String = dbg[num_start..idx]
+            .chars()
+            .filter(|c| *c != '_')
+            .collect();
+        if let Ok(cnt) = num_str.parse::<usize>() {
+            out.insert(key, cnt);
         }
     }
-    0
+    out
+}
+
+fn current_callee_call_count(sched: &EnvSchedule, callee: &str) -> usize {
+    let counts = parse_stripped_callee_call_counts(sched);
+    if let Some(&c) = counts.get(callee) {
+        return c;
+    }
+    let short = callee.rsplit("::").next().unwrap_or(callee);
+    if let Some(&c) = counts.get(short) {
+        return c;
+    }
+    counts
+        .iter()
+        .find(|(k, _)| k.rsplit("::").next() == Some(short))
+        .map(|(_, &c)| c)
+        .unwrap_or(0)
 }
 
 fn remaining_calls_until_callee_panic(sched: &EnvSchedule, callee: &str) -> Option<usize> {
-    let target_k = *sched.callee_panic_on_call.get(callee)?;
+    let short = callee.rsplit("::").next().unwrap_or(callee);
+    let target_k = sched
+        .callee_panic_on_call
+        .get(callee)
+        .copied()
+        .or_else(|| find_sched_entry(&sched.callee_panic_on_call, short).copied())?;
     let already_called = current_callee_call_count(sched, callee);
     target_k.checked_sub(already_called)
 }
@@ -9626,20 +9892,21 @@ impl WriteChainCoverageBound {
             let declared_layout = callee_layouts
                 .get(trimmed_callee)
                 .or_else(|| callee_layouts.get(short_callee));
-            let link_ok = match sim.next_action(trimmed_callee, call_idx) {
+            let effective_callee = resolve_sched_callee_key(&sim, trimmed_callee, short_callee);
+            let link_ok = match sim.next_action(&effective_callee, call_idx) {
                 crate::instrument::EnvAction::ReturnBytes(bytes) => {
                     let zst_declared = declared_layout
                         .map(|l| l.total_size() == 0)
                         .unwrap_or(false);
                     let non_empty_or_zst = !bytes.is_empty()
                         || zst_declared
-                        || sim.expected_return_size(trimmed_callee) == Some(0);
+                        || sim.expected_return_size(&effective_callee) == Some(0);
                     let layout_ok = match declared_layout {
                         Some(layout) => layout.validate_bytes(&bytes).is_ok(),
                         None => true,
                     };
                     non_empty_or_zst
-                        && sim.validate_callee_payload(trimmed_callee, &bytes).is_ok()
+                        && sim.validate_callee_payload(&effective_callee, &bytes).is_ok()
                         && layout_ok
                 }
                 crate::instrument::EnvAction::PanicOnCall(_)
@@ -11430,5 +11697,155 @@ mod tests {
         );
         assert_eq!(max_d, 2);
         assert!(trimmed_sched_bound.is_depth_certified());
+    }
+
+    #[test]
+    fn ep2_b3_for_mut_writeback_nonzero_min_old_block_mut_pure_spec_guard_and_unwind_walk_cutoff() {
+        let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+        let nz_u32_layout =
+            LayoutSpec::Scalar(ScalarLayout::with_valid_range(4, false, 1, u32::MAX as u128));
+        let lanes_layout = LayoutSpec::Array {
+            elem: Box::new(u32_layout.clone()),
+            elem_stride: 4,
+            len: 3,
+        };
+        let state_layout = LayoutSpec::Struct {
+            name: "LaneState".to_string(),
+            total_size: 20,
+            fields: vec![
+                FieldLayout {
+                    name: "lanes".to_string(),
+                    offset: 0,
+                    layout: lanes_layout,
+                },
+                FieldLayout {
+                    name: "total".to_string(),
+                    offset: 12,
+                    layout: u32_layout.clone(),
+                },
+                FieldLayout {
+                    name: "framed".to_string(),
+                    offset: 16,
+                    layout: u32_layout.clone(),
+                },
+            ],
+        };
+
+        let probe = SpecContractOracleProbe::new(
+            "lane_mut_loop_and_nonzero_probe",
+            vec![
+                SpecParamBinding::mut_ref("st", "LaneState", state_layout)
+                    .with_frame_preserved_fields(["framed"]),
+                SpecParamBinding::by_value("scale", "NzWord", nz_u32_layout),
+                SpecParamBinding::by_value("poison_spec", "u32", u32_layout.clone()),
+            ],
+            "u32",
+            u32_layout.clone(),
+            "for &mut mut copied_lane in &mut st.lanes {\n    \
+                 copied_lane += 100u32;\n    \
+                 let _ = copied_lane;\n\
+             }\n\
+             for slot in &mut st.lanes {\n    \
+                 *slot += 2u32;\n\
+             }\n\
+             let mut pairs: [(u32, u32); 2] = [(1u32, 2u32), (3u32, 4u32)];\n\
+             for (a, b) in &mut pairs {\n    \
+                 *a += *b;\n\
+             }\n\
+             let nz_tag: u32 = match scale {\n    \
+                 core::num::NonZeroU32::MIN => NzWord::MIN.get() + core::num::NonZeroU32::MIN.get(),\n    \
+                 _ => scale.get(),\n\
+             };\n\
+             let max_check: u32 = match st.total {\n    \
+                 core::primitive::u32::MAX => 0u32,\n    \
+                 _ => 1u32,\n\
+             };\n\
+             let ext_v: u32 = ext_read();\n\
+             st.total = st.total + st.lanes[0] + st.lanes[1] + st.lanes[2] + pairs[0].0 + pairs[1].0 + nz_tag + max_check + ext_v;\n\
+             st.total",
+        )
+        .with_type_defs(
+            "pub type NzWord = core::num::NonZeroU32;\n\
+             #[repr(C)]\n\
+             #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+             pub struct LaneState { pub lanes: [u32; 3], pub total: u32, pub framed: u32 }\n\
+             pub fn scratch_bump(s: &mut LaneState) -> u32 {\n    \
+                 s.total += 5u32;\n    \
+                 s.total\n\
+             }",
+        )
+        .with_external_callee(SpecExternalCallee::new(
+            "ext_read",
+            std::iter::empty::<&str>(),
+            "u32",
+            u32_layout,
+        ))
+        .with_requires(
+            "scratch_mut_isolated_in_requires",
+            "st.total <= 500u32 && scratch_bump(st) >= 5u32 \
+             && st.lanes[0] <= 100u32 && st.lanes[1] <= 100u32 && st.lanes[2] <= 100u32 \
+             && scale.get() <= 10u32",
+        )
+        .with_ensures(
+            "old_block_mut_and_parenthesized_helper",
+            "old({ st.total += 3u32; (scratch_bump)(st) }) == old(st.total) + 8u32 \
+             && st.lanes[0] == old(st.lanes[0]) + 2u32 \
+             && (poison_spec == 0u32 || ext_read() > 0u32)",
+        )
+        .with_ensures(
+            "exact_mut_loop_and_nonzero_min_sum",
+            "scale.get() != 1u32 || result == old(st.total) + (old(st.lanes[0]) + 2u32) + (old(st.lanes[1]) + 2u32) + (old(st.lanes[2]) + 2u32) + 10u32 + 2u32 + 1u32 + 4u32",
+        );
+
+        // Module-qualified schedule keys (`"sensor_mod::ext_read"`):
+        let mut qual_sched = EnvSchedule::new().with_callee_return_size("sensor_mod::ext_read", 4);
+        qual_sched.set_callee_default("sensor_mod::ext_read", 4u32.to_le_bytes().to_vec());
+
+        let make_raw = |scale: u32, poison_spec: u32| -> Vec<u8> {
+            let mut b = Vec::with_capacity(28);
+            b.extend_from_slice(&1u32.to_le_bytes()); // lanes[0] = 1
+            b.extend_from_slice(&2u32.to_le_bytes()); // lanes[1] = 2
+            b.extend_from_slice(&3u32.to_le_bytes()); // lanes[2] = 3
+            b.extend_from_slice(&10u32.to_le_bytes()); // total = 10
+            b.extend_from_slice(&77u32.to_le_bytes()); // framed = 77
+            b.extend_from_slice(&scale.to_le_bytes()); // NonZeroU32(scale)
+            b.extend_from_slice(&poison_spec.to_le_bytes());
+            b
+        };
+
+        // `scale = 1` (`NonZeroU32::MIN`) + `poison_spec = 0` -> `VerifiedHold`!
+        let mut s_ok = qual_sched.clone();
+        assert_eq!(
+            probe
+                .verify_spec_postcondition_against_schedule(&make_raw(1, 0), Some(&mut s_ok))
+                .expect("eval ep2-B3 hold"),
+            SpecPostconditionVerdict::VerifiedHold
+        );
+
+        // `poison_spec = 1` invokes external callee `ext_read()` inside `ensures` -> `PanicOrTrap(Ensures)`!
+        let mut s_impure = qual_sched.clone();
+        assert!(matches!(
+            probe
+                .verify_spec_postcondition_against_schedule(&make_raw(1, 1), Some(&mut s_impure))
+                .expect("eval ep2-B3 impure ensures"),
+            SpecPostconditionVerdict::PanicOrTrap {
+                phase: SpecExecPhase::Ensures,
+                ..
+            }
+        ));
+
+        // Module-qualified `EnvSchedule` keys (`"sensor_mod::ext_read"`) resolve in
+        // `WriteChainCoverageBound::observe_env_schedule_with_layouts` even when planned steps
+        // use short `"ext_read"` (previously returned `PassThrough` -> broken link!).
+        let mut qual_tracker = WriteChainCoverageBound::new(2, 2);
+        assert_eq!(qual_tracker.observe_step(&WriteChainStep::local_write("s0")), 1);
+        let qual_depth = qual_tracker.observe_env_schedule_with_layouts(
+            &qual_sched,
+            &probe.external_callee_layout_map(),
+            &[EnvScheduledWriteStep::new("ext_read", "s1", ["s0"])],
+        );
+        assert_eq!(qual_depth, 2);
+        assert_eq!(qual_tracker.broken_env_links(), 0);
+        assert!(qual_tracker.is_depth_certified());
     }
 }
