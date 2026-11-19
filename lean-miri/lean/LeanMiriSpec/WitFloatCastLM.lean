@@ -35,7 +35,9 @@ bit-for-bit after every step. No shadow evaluator is defined.
   `MiriHoldsScalar` / `MiriHoldsUninit` / `MiriHoldsIndirectScalar` / `MiriHoldsIndirectUninit` /
   `MiriPromotedFreed` (`wfc_miri_scalar_at`, `wfc_miri_uninit_at`, `wfc_miri_indirect_scalar`,
   `wfc_miri_promoted_scalar`, `wfc_miri_promoted_uninit`, `wfc_miri_promoted_freed`), and the
-  packaged step lemmas `wfc_step_{constant,copy,move}`, `wfc_ub_{copy,move}`,
+  packaged step lemmas `wfc_step_{constant,copy,move}` (+ mode-generic `WfcRunMode` /
+  `WfcLockstepMode` / `WfcReturnsMode` and `wfc_step_{storageLive,constant,copy,move,return}_mode`),
+  `wfc_ub_{copy,move}`,
   `wfc_step_return_any` / `wfc_step_return`, `wfc_step_storageLive` / `wfc_step_storageLive_mem`,
   `wfc_step_storageDead` / `wfc_step_storageDead_any`.
 * **From program entry**: the (W1)–(W4) headline witnesses, the (W2) deterministic-mode, selector,
@@ -45,30 +47,32 @@ bit-for-bit after every step. No shadow evaluator is defined.
   (`WfcRun`); only the unpromoted force-allocated `LocalRel.indirect` witness (W5f-2, plus
   single-step selector helpers) starts from a hand-built `StateRelLM3_1` state (no MIR statement
   without `&raw` produces an unpromoted `LocalRel.indirect` scalar local).
-* **(W1)** `wfcW1_end_to_end`: 9 `f32 ↔ f64` casts + `return`: subnormal halfway ties
-  `1.5·2⁻¹⁴⁹` / `2.5·2⁻¹⁴⁹ ↦ 0x2`, `f32::MAX + ½ulp ↦ +∞`, `-0.0` sign preservation, and exact
-  `f32 → f64 → f32` round trips (subnormal and normal); `wfcW1_convert_table` (two-sided
-  `FloatBits.convert` + `evalFloatCast .floatToFloat` class table: signed zeros, gradual underflow
-  incl. the `2⁻¹⁵⁰` tie to `+0.0`, subnormal ties, `f32::MAX` and its `±½ulp` overflow tie, `±∞`,
-  NaNs, and every exact `f32 → f64` widening).
+* **(W1)** `wfcW1_end_to_end` + `wfcW1_deterministic_end_to_end` (all 18 steps — `StorageLive`,
+  9 `f32 ↔ f64` casts, and `return` — in lockstep under both `annealChooseQuietedNaN` and
+  deterministic mode `floatNondeterministic := false` for every `chooseNaN`) and
+  `wfcW1_convert_table` (two-sided `FloatBits.convert` + `evalFloatCast .floatToFloat` class table:
+  signed zeros, gradual underflow incl. the `2⁻¹⁵⁰` tie to `+0.0`, subnormal ties, `f32::MAX` and
+  its `±½ulp` overflow tie, `±∞`, NaNs, and every exact `f32 → f64` widening).
 * **(W2)** `wfcW2_end_to_end` (6 NaN casts + `return`: `0x7F80_0001_f32 ↦ 0x7FF8_0000_2000_0000`,
   `0x7FF0_0000_0000_0001 ↦ 0x7FC0_0000`, `0x7FF0_0000_2000_0001 ↦ 0x7FC0_0001`, negative and
   round-trip payload NaNs), `wfcW2_deterministic_canonicalization` (from program entry of
   `wfcW2DetBody`: `floatNondeterministic := false` stores `preferredNaN`, simulation modulo
-  canonicalization, provably no lockstep), `wfcW2_deterministic_lockstep_cases` (deterministic
-  mode *is* in lockstep exactly on non-NaN inputs and on NaNs already canonical, for every
-  `chooseNaN`), `wfcW2_selectors_exact` (`pure 0 .. pure 3`), `wfcW2_selectors_snan_4_5_and_out_of_range`
+  canonicalization, provably no lockstep), `wfcW2_deterministic_lockstep_cases` (from program entry
+  through `return`: deterministic mode steps in lockstep on non-NaNs, canonical NaNs, **and**
+  signaling NaNs whose narrowed payload truncates to `preferredNaN`, while diverging on payload
+  sNaNs in both directions), `wfcW2_selectors_exact` (`pure 0 .. pure 3`), `wfcW2_selectors_snan_4_5_and_out_of_range`
   (`pure 4` / `pure 5` signaling-NaN step outputs + `pure 6` / `pure 4` out-of-range
   `.invalidProgram` tightness), `wfcW2_selectors_copy_and_move` (`copy` & `move` NaN-selector
   simulations), and `wfcW2_nanChoices_exact` (exact 6-, 4-, and 6-element candidate lists and
   deterministic singleton).
 * **(W3)** `wfcW3_end_to_end` (14 casts + `return` hitting all 12 integer targets: `NaN ↦ 0`,
-  `±∞ ↦ MAX/MIN`, `-0.0 ↦ 0`, finite saturation, truncation toward zero) and
-  `wfcW3_toInteger_all_targets` (the full two-sided class table for every target and both
-  formats: `lean-miri`'s `FloatBits.toInteger` and Anneal's `evalFloatToIntSaturating`).
-* **(W4)** `wfcW4_end_to_end` (9 casts + `return`: `u128::MAX as f32 = +∞`,
-  `u128::MAX as f64 = 2¹²⁸`, `i128::MIN as f32 = -2¹²⁷`, `2²⁴ + 1 / 2²⁴ + 3` and
-  `2⁵³ + 1 / 2⁵³ + 3` ties to even), `wfcW4_fromInteger_all_sources` (two-sided
+  `±∞ ↦ MAX/MIN`, `-0.0 ↦ 0`, finite saturation, truncation toward zero),
+  `wfcW3_toInteger_all_targets` (two-sided class table for every target and both formats), and
+  `wfcW3_saturation_cliffs` (two-sided 1-ULP exact-inside vs saturated-outside cliffs across
+  `u8`, `i8`, `i32`, `i64`, `u64`, `i128`, `u128`, including fractional `(MAX, MAX + 1)` and
+  `(MIN - 1, MIN)` truncation into range).
+* **(W4)** `wfcW4_end_to_end` + `wfcW4_deterministic_end_to_end` (all 18 steps + `return` in
+  lockstep under both NaN modes), `wfcW4_fromInteger_all_sources` (two-sided
   `FloatBits.fromInteger` + `evalFloatCast .intToFloat` across all 12 integer source types and both
   formats), `wfcW4_signed_negative_ties` (signed negative `i32` / `i64` halfway ties and
   `i64::MIN + 1`), and `wfcW4_ties_all_wide_sources` (the `2²⁴ ± …` / `2⁵³ ± …` tie behaviour is
@@ -1005,6 +1009,231 @@ theorem wfc_step_storageDead {b : CapturedMir} {s s' : MachineState} {m : Anneal
     cases hval
   · exact himm tf hframes k mls' hmls' mp hval
 
+/-! ### Mode-generic (`nondet`, `chooseNaN`) lockstep predicates and step helpers -/
+
+/-- **Mode-generic lockstep multi-step run** under `annealStepHooksFloat b.localDecls b.layouts
+nondet chooseNaN` (including deterministic mode `nondet = false` for arbitrary `chooseNaN`). -/
+inductive WfcRunMode (b : CapturedMir) (nondet : Bool)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits →
+      Miri.Interpreter.RvalueM AnnealStepState Nat) :
+    MachineState → AnnealStepState → MachineState → AnnealStepState → Prop where
+  | refl (s : MachineState) (m : AnnealStepState) : WfcRunMode b nondet chooseNaN s m s m
+  | step {s s₁ s' : MachineState} {m m₁ m' : AnnealStepState} :
+      stepMirFn b s = .step s₁ →
+      Miri.Interpreter.Step.step
+        (annealStepHooksFloat b.localDecls b.layouts nondet chooseNaN) () m = (m₁, .ok true) →
+      StateRelLM3_1 b s₁ m₁ [] →
+      WfcRunMode b nondet chooseNaN s₁ m₁ s' m' →
+      WfcRunMode b nondet chooseNaN s m s' m'
+
+/-- **Mode-generic single float-cast lockstep step** writing `⟨bits, w⟩` into local `k`. -/
+def WfcLockstepMode (b : CapturedMir) (nondet : Bool)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits →
+      Miri.Interpreter.RvalueM AnnealStepState Nat)
+    (s s' : MachineState) (m m' : AnnealStepState) (k bits w : Nat) : Prop :=
+  stepMirFn b s = .step s' ∧
+  Miri.Interpreter.Step.step
+    (annealStepHooksFloat b.localDecls b.layouts nondet chooseNaN) () m = (m', .ok true) ∧
+  StateRelLM3_1 b s' m' [] ∧
+  get? s'.frame.locals k = some (.init (.scalar ⟨bits, w⟩)) ∧
+  MiriHoldsScalar m' k ⟨bits, w⟩
+
+/-- **Mode-generic root-frame `return` lockstep**. -/
+def WfcReturnsMode (b : CapturedMir) (nondet : Bool)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits →
+      Miri.Interpreter.RvalueM AnnealStepState Nat)
+    (s : MachineState) (m : AnnealStepState) (v : Value) : Prop :=
+  (∃ mem, stepMirFn b s = .retNormal v mem) ∧
+  Miri.Interpreter.Step.step
+    (annealStepHooksFloat b.localDecls b.layouts nondet chooseNaN) () m =
+      ({ m with stack := ⟨#[]⟩ }, .ok true) ∧
+  ∃ decl0 imm, get? b.localDecls 0 = some decl0 ∧
+    annealControlHooks.returnOperand () m = (m, .ok (.immediate imm)) ∧
+    ImmediateRel decl0.ty b.layouts v imm
+
+/-- `FloatCastDetAgrees` witness for `.floatToFloat` between concrete `srcTy` / `castTy`. -/
+theorem wfc_detAgrees_f2f {srcTy castTy : Ty} {sf df : IeeeFormat} {bits : Nat}
+    (hs : ieeeFormatOfTy? srcTy = some sf) (hd : ieeeFormatOfTy? castTy = some df)
+    (h : Anneal.Mir.IeeeFloatCast.isNaNBits sf bits = false ∨
+      evalFloatToFloatRoundTiesToEven sf df bits = preferredNaNBits df) :
+    FloatCastDetAgrees .floatToFloat srcTy castTy bits := by
+  intro src dst _ hs' hd'
+  rw [hs] at hs'; injection hs' with hs''; subst hs''
+  rw [hd] at hd'; injection hd' with hd''; subst hd''
+  exact h
+
+/-- **Mode-generic `StorageLive` lockstep step** (routes via `step_float_eq_annealStepHooks_at_stmt`). -/
+theorem wfc_step_storageLive_mode {b : CapturedMir} {s s' : MachineState} {m : AnnealStepState}
+    (nondet : Bool)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits →
+      Miri.Interpreter.RvalueM AnnealStepState Nat)
+    (hstate : StateRelLM3_1 b s m []) (himm : WfcAllImm m)
+    (hphase : ∀ p, b.phase ≠ .other p)
+    {bb : BasicBlockData} {loc : Local} {decl : LocalDecl} {span : String}
+    (hbb : get? b.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.storageLive loc, span⟩)
+    (hdecl : get? b.localDecls loc = some decl)
+    (hs : stepMirFn b s = .step s') :
+    ∃ m', Miri.Interpreter.Step.step
+        (annealStepHooksFloat b.localDecls b.layouts nondet chooseNaN) () m =
+      (m', .ok true) ∧ StateRelLM3_1 b s' m' [] ∧ WfcAllImm m' := by
+  obtain ⟨m', hm', hrel', himm'⟩ := wfc_step_storageLive hstate himm hphase hbb hstmt hdecl hs
+  rw [step_float_eq_annealStepHooks_at_stmt hstate true annealChooseQuietedNaN hbb hstmt trivial,
+      ← step_float_eq_annealStepHooks_at_stmt hstate nondet chooseNaN hbb hstmt trivial] at hm'
+  exact ⟨m', hm', hrel', himm'⟩
+
+/-- **Mode-generic constant-operand lockstep step** (`_d = const c as T`). -/
+theorem wfc_step_constant_mode {b : CapturedMir} {s s' : MachineState} {m : AnnealStepState}
+    (nondet : Bool)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits →
+      Miri.Interpreter.RvalueM AnnealStepState Nat)
+    (hmode : FloatNaNModeOk nondet chooseNaN)
+    (hstate : StateRelLM3_1 b s m []) (himm : WfcAllImm m)
+    (hphase : ∀ p, b.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx : Local} {kind : CastKind} {c : ConstOperand} {castTy : Ty}
+    {span : String}
+    (hbb : get? b.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.cast kind (.constant c) castTy), span⟩)
+    {dstDecl : LocalDecl} (hdecl_dst : get? b.localDecls dstIdx = some dstDecl)
+    (hsig : FloatCastSig kind c.ty castTy) (hdst_ty : dstDecl.ty.kind = castTy.kind)
+    {sc : MirAst.ScalarInt} (hval : c.val = .scalar (.int sc))
+    (hsz : ValidScalarBytes sc.sizeBytes) (hcan : sc.bits < scalarModulus sc.sizeBytes)
+    (hlaysz : (translateTy c.ty b.layouts).layout.size = translateSizeBytes sc.sizeBytes)
+    (hagree : nondet = false → FloatCastDetAgrees kind c.ty castTy sc.bits)
+    (hptr8 : layoutPointerBytes b.layouts = 8)
+    {bits w : Nat} (hs : stepMirFn b s = .step s')
+    (hslot : get? s'.frame.locals dstIdx = some (.init (.scalar ⟨bits, w⟩))) :
+    ∃ m', WfcLockstepMode b nondet chooseNaN s s' m m' dstIdx bits w ∧ WfcAllImm m' := by
+  have hr := step_cast_float_constant_simulation_mode hstate hphase nondet chooseNaN hmode
+    hbb hstmt hdecl_dst hsig hdst_ty hval hsz hcan hlaysz hagree
+    (fun tf htf => himm tf htf dstIdx) hptr8
+  obtain ⟨m', hm', hrel'⟩ := wfc_step_of_stepRel hr hs
+  have hp := step_cast_float_constant_anyLocal_preserves hstate nondet chooseNaN hmode
+    hbb hstmt hdecl_dst hsig hdst_ty hval hsz hcan hlaysz hagree
+    (fun tf htf => Or.inl (himm tf htf dstIdx)) hptr8 m' hm'
+  have himm' : WfcAllImm m' := by
+    intro tf' htf' k
+    obtain ⟨tf, htf, _⟩ := id hstate
+    exact hp.2 tf tf' htf htf' k (himm tf htf k)
+  exact ⟨m', ⟨hs, hm', hrel', hslot,
+    wfc_miri_scalar hrel' himm' hdecl_dst (hsig.cast_scalar.of_kind_eq hdst_ty) hslot⟩, himm'⟩
+
+/-- **Mode-generic copy-operand lockstep step** (`_d = copy _s as T`). -/
+theorem wfc_step_copy_mode {b : CapturedMir} {s s' : MachineState} {m : AnnealStepState}
+    (nondet : Bool)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits →
+      Miri.Interpreter.RvalueM AnnealStepState Nat)
+    (hmode : FloatNaNModeOk nondet chooseNaN)
+    (hstate : StateRelLM3_1 b s m []) (himm : WfcAllImm m)
+    (hphase : ∀ p, b.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx srcIdx : Local} {kind : CastKind} {castTy : Ty} {span : String}
+    (hbb : get? b.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.cast kind (.copy ⟨srcIdx, .nil⟩) castTy), span⟩)
+    {dstDecl srcDecl : LocalDecl}
+    (hdecl_dst : get? b.localDecls dstIdx = some dstDecl)
+    (hdecl_src : get? b.localDecls srcIdx = some srcDecl)
+    (hsig : FloatCastSig kind srcDecl.ty castTy) (hdst_ty : dstDecl.ty.kind = castTy.kind)
+    {srcBits srcW : Nat}
+    (hsrc_slot : get? s.frame.locals srcIdx = some (.init (.scalar ⟨srcBits, srcW⟩)))
+    (hagree : nondet = false → FloatCastDetAgrees kind srcDecl.ty castTy srcBits)
+    (hptr8 : layoutPointerBytes b.layouts = 8)
+    {bits w : Nat} (hs : stepMirFn b s = .step s')
+    (hslot : get? s'.frame.locals dstIdx = some (.init (.scalar ⟨bits, w⟩))) :
+    ∃ m', WfcLockstepMode b nondet chooseNaN s s' m m' dstIdx bits w ∧ WfcAllImm m' := by
+  have hag_all : nondet = false → ∀ sc, get? s.frame.locals srcIdx = some (.init (.scalar sc)) →
+      FloatCastDetAgrees kind srcDecl.ty castTy sc.bits := by
+    intro hnd sc hsc
+    rw [hsrc_slot] at hsc
+    cases hsc
+    exact hagree hnd
+  have hr := step_cast_float_copy_simulation_mode hstate hphase nondet chooseNaN hmode
+    hbb hstmt hdecl_dst hdecl_src hsig hdst_ty hag_all
+    (fun tf htf => ⟨himm tf htf dstIdx, himm tf htf srcIdx⟩) hptr8
+  obtain ⟨m', hm', hrel'⟩ := wfc_step_of_stepRel hr hs
+  have hp := step_cast_float_copy_anyLocal_preserves hstate nondet chooseNaN hmode
+    hbb hstmt hdecl_dst hdecl_src hsig hdst_ty hag_all
+    (fun tf htf => Or.inl (himm tf htf srcIdx)) (fun tf htf => Or.inl (himm tf htf dstIdx))
+    hptr8 m' hm'
+  have himm' : WfcAllImm m' := by
+    intro tf' htf' k
+    obtain ⟨tf, htf, _⟩ := id hstate
+    exact hp.2 tf tf' htf htf' k (himm tf htf k)
+  exact ⟨m', ⟨hs, hm', hrel', hslot,
+    wfc_miri_scalar hrel' himm' hdecl_dst (hsig.cast_scalar.of_kind_eq hdst_ty) hslot⟩, himm'⟩
+
+/-- **Mode-generic move-operand lockstep step** (`_d = move _s as T`). -/
+theorem wfc_step_move_mode {b : CapturedMir} {s s' : MachineState} {m : AnnealStepState}
+    (nondet : Bool)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits →
+      Miri.Interpreter.RvalueM AnnealStepState Nat)
+    (hmode : FloatNaNModeOk nondet chooseNaN)
+    (hstate : StateRelLM3_1 b s m []) (himm : WfcAllImm m)
+    (hphase : ∀ p, b.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx srcIdx : Local} {kind : CastKind} {castTy : Ty} {span : String}
+    (hbb : get? b.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.cast kind (.move ⟨srcIdx, .nil⟩) castTy), span⟩)
+    {dstDecl srcDecl : LocalDecl}
+    (hdecl_dst : get? b.localDecls dstIdx = some dstDecl)
+    (hdecl_src : get? b.localDecls srcIdx = some srcDecl)
+    (hsig : FloatCastSig kind srcDecl.ty castTy) (hdst_ty : dstDecl.ty.kind = castTy.kind)
+    {srcBits srcW : Nat}
+    (hsrc_slot : get? s.frame.locals srcIdx = some (.init (.scalar ⟨srcBits, srcW⟩)))
+    (hagree : nondet = false → FloatCastDetAgrees kind srcDecl.ty castTy srcBits)
+    (hptr8 : layoutPointerBytes b.layouts = 8)
+    {bits w : Nat} (hs : stepMirFn b s = .step s')
+    (hslot : get? s'.frame.locals dstIdx = some (.init (.scalar ⟨bits, w⟩))) :
+    ∃ m', WfcLockstepMode b nondet chooseNaN s s' m m' dstIdx bits w ∧ WfcAllImm m' := by
+  have hag_all : nondet = false → ∀ sc, get? s.frame.locals srcIdx = some (.init (.scalar sc)) →
+      FloatCastDetAgrees kind srcDecl.ty castTy sc.bits := by
+    intro hnd sc hsc
+    rw [hsrc_slot] at hsc
+    cases hsc
+    exact hagree hnd
+  have hr := step_cast_float_move_simulation_mode hstate hphase nondet chooseNaN hmode
+    hbb hstmt hdecl_dst hdecl_src hsig hdst_ty hag_all
+    (fun tf htf => ⟨himm tf htf dstIdx, himm tf htf srcIdx⟩) hptr8
+  obtain ⟨m', hm', hrel'⟩ := wfc_step_of_stepRel hr hs
+  have hp := step_cast_float_move_anyLocal_preserves hstate nondet chooseNaN hmode
+    hbb hstmt hdecl_dst hdecl_src hsig hdst_ty hag_all
+    (fun tf htf => himm tf htf srcIdx) (fun tf htf => Or.inl (himm tf htf dstIdx))
+    hptr8 m' hm'
+  have himm' : WfcAllImm m' := by
+    intro tf' htf' k
+    obtain ⟨tf, htf, _⟩ := id hstate
+    exact hp.2 tf tf' htf htf' k (himm tf htf k)
+  exact ⟨m', ⟨hs, hm', hrel', hslot,
+    wfc_miri_scalar hrel' himm' hdecl_dst (hsig.cast_scalar.of_kind_eq hdst_ty) hslot⟩, himm'⟩
+
+/-- **Mode-generic root-frame `return` lockstep** for arbitrary `allocMap` (routes via
+`step_float_eq_annealStepHooks_at_terminator`). -/
+theorem wfc_step_return_mode {b : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (nondet : Bool)
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits →
+      Miri.Interpreter.RvalueM AnnealStepState Nat)
+    (hstate : StateRelLM3_1 b s m allocMap)
+    (himm0 : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf 0)
+    (hphase : ∀ p, b.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? b.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hcleanup : bb.isCleanup = false)
+    (hret : bb.terminator.kind = .return_)
+    {decl0 : LocalDecl} (hdecl0 : get? b.localDecls 0 = some decl0)
+    (hty0 : IsFloatCastScalarTy decl0.ty)
+    {v : Value} {mem : Memory} (hs : stepMirFn b s = .retNormal v mem) :
+    WfcReturnsMode b nondet chooseNaN s m v := by
+  obtain ⟨hmem, hm, rest⟩ := wfc_step_return_any hstate himm0 hphase hbb hstmt_none hstmt_len
+    hcleanup hret hdecl0 hty0 hs
+  rw [step_float_eq_annealStepHooks_at_terminator hstate true annealChooseQuietedNaN hbb
+        hstmt_none,
+      ← step_float_eq_annealStepHooks_at_terminator hstate nondet chooseNaN hbb hstmt_none] at hm
+  exact ⟨hmem, hm, rest⟩
+
 /-- `ValidScalarBytes` witnesses. -/
 theorem wfcVSB1 : ValidScalarBytes 1 := Or.inl rfl
 theorem wfcVSB2 : ValidScalarBytes 2 := Or.inr (Or.inl rfl)
@@ -1253,6 +1482,78 @@ theorem wfcW1_end_to_end :
     wfc_miri_uninit l₈.2.2.1 i₈ rfl (Or.inl ⟨_, rfl⟩) rfl, l₉,
     wfc_miri_uninit l₉.2.2.1 i₉ rfl (Or.inl ⟨_, rfl⟩) rfl,
     wfc_step_return l₉.2.2.1 i₉ hph rfl rfl rfl rfl rfl rfl (Or.inl ⟨_, rfl⟩) hret⟩
+
+/-- **(W1) multi-step deterministic-mode (`floatNondeterministic := false`) lockstep witness from
+program entry, for every `chooseNaN`**: because every float source in `wfcW1Body` is non-NaN, all
+18 steps (`StorageLive(_1.._8)`, 9 `.constant` / `.copy` / `.move` `f32 ↔ f64` casts, and `return`)
+execute in `StateRelLM3_1` lockstep under `annealStepHooksFloat ... false chooseNaN` regardless of
+`chooseNaN`. -/
+theorem wfcW1_deterministic_end_to_end
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits →
+      Miri.Interpreter.RvalueM AnnealStepState Nat) :
+    initMachineState wfcW1Body [] = wfcW1S0 ∧
+    ∃ mₚ m₁ m₂ m₃ m₄ m₅ m₆ m₇ m₈ m₉ : AnnealStepState,
+      WfcRunMode wfcW1Body false chooseNaN wfcW1S0 (wfcMiriEntry wfcW1Body wfcF32Ty) wfcW1S8 mₚ ∧
+      WfcLockstepMode wfcW1Body false chooseNaN wfcW1S8 wfcW1S9 mₚ m₁ 1 2 4 ∧
+      WfcLockstepMode wfcW1Body false chooseNaN wfcW1S9 wfcW1S10 m₁ m₂ 2 2 4 ∧
+      WfcLockstepMode wfcW1Body false chooseNaN wfcW1S10 wfcW1S11 m₂ m₃ 3 0x7F800000 4 ∧
+      WfcLockstepMode wfcW1Body false chooseNaN wfcW1S11 wfcW1S12 m₃ m₄ 4 0x80000000 4 ∧
+      WfcLockstepMode wfcW1Body false chooseNaN wfcW1S12 wfcW1S13 m₄ m₅ 5 0x36B0000000000000 8 ∧
+      WfcLockstepMode wfcW1Body false chooseNaN wfcW1S13 wfcW1S14 m₅ m₆ 6 0x8000000000000000 8 ∧
+      MiriHoldsUninit m₆ 4 ∧
+      WfcLockstepMode wfcW1Body false chooseNaN wfcW1S14 wfcW1S15 m₆ m₇ 7 0x3FB99999A0000000 8 ∧
+      WfcLockstepMode wfcW1Body false chooseNaN wfcW1S15 wfcW1S16 m₇ m₈ 8 0x3DCCCCCD 4 ∧
+      MiriHoldsUninit m₈ 7 ∧
+      WfcLockstepMode wfcW1Body false chooseNaN wfcW1S16 wfcW1S17 m₈ m₉ 0 2 4 ∧
+      MiriHoldsUninit m₉ 5 ∧
+      WfcReturnsMode wfcW1Body false chooseNaN wfcW1S17 m₉ (.scalar ⟨0x2, 4⟩) := by
+  have hph : ∀ p, wfcW1Body.phase ≠ .other p := fun _ h => nomatch h
+  have hmd : FloatNaNModeOk false chooseNaN := Or.inr rfl
+  obtain ⟨h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15, h16, h17,
+    hret⟩ := wfcW1_anneal_run
+  obtain ⟨p₁, e₁, r₁, q₁⟩ :=
+    wfc_step_storageLive_mode false chooseNaN wfcW1_stateRel_entry (wfc_allImm_entry _ _) hph
+      rfl rfl rfl h1
+  obtain ⟨p₂, e₂, r₂, q₂⟩ := wfc_step_storageLive_mode false chooseNaN r₁ q₁ hph rfl rfl rfl h2
+  obtain ⟨p₃, e₃, r₃, q₃⟩ := wfc_step_storageLive_mode false chooseNaN r₂ q₂ hph rfl rfl rfl h3
+  obtain ⟨p₄, e₄, r₄, q₄⟩ := wfc_step_storageLive_mode false chooseNaN r₃ q₃ hph rfl rfl rfl h4
+  obtain ⟨p₅, e₅, r₅, q₅⟩ := wfc_step_storageLive_mode false chooseNaN r₄ q₄ hph rfl rfl rfl h5
+  obtain ⟨p₆, e₆, r₆, q₆⟩ := wfc_step_storageLive_mode false chooseNaN r₅ q₅ hph rfl rfl rfl h6
+  obtain ⟨p₇, e₇, r₇, q₇⟩ := wfc_step_storageLive_mode false chooseNaN r₆ q₆ hph rfl rfl rfl h7
+  obtain ⟨p₈, e₈, r₈, q₈⟩ := wfc_step_storageLive_mode false chooseNaN r₇ q₇ hph rfl rfl rfl h8
+  obtain ⟨m₁, l₁, i₁⟩ := wfc_step_constant_mode false chooseNaN hmd r₈ q₈ hph rfl rfl
+    rfl (.floatToFloat rfl rfl) rfl rfl wfcVSB8 (by decide) rfl
+    (fun _ => wfc_detAgrees_f2f rfl rfl (Or.inl rfl)) rfl h9 rfl
+  obtain ⟨m₂, l₂, i₂⟩ := wfc_step_constant_mode false chooseNaN hmd l₁.2.2.1 i₁ hph rfl rfl
+    rfl (.floatToFloat rfl rfl) rfl rfl wfcVSB8 (by decide) rfl
+    (fun _ => wfc_detAgrees_f2f rfl rfl (Or.inl rfl)) rfl h10 rfl
+  obtain ⟨m₃, l₃, i₃⟩ := wfc_step_constant_mode false chooseNaN hmd l₂.2.2.1 i₂ hph rfl rfl
+    rfl (.floatToFloat rfl rfl) rfl rfl wfcVSB8 (by decide) rfl
+    (fun _ => wfc_detAgrees_f2f rfl rfl (Or.inl rfl)) rfl h11 rfl
+  obtain ⟨m₄, l₄, i₄⟩ := wfc_step_constant_mode false chooseNaN hmd l₃.2.2.1 i₃ hph rfl rfl
+    rfl (.floatToFloat rfl rfl) rfl rfl wfcVSB8 (by decide) rfl
+    (fun _ => wfc_detAgrees_f2f rfl rfl (Or.inl rfl)) rfl h12 rfl
+  obtain ⟨m₅, l₅, i₅⟩ := wfc_step_copy_mode false chooseNaN hmd l₄.2.2.1 i₄ hph rfl rfl rfl rfl
+    (.floatToFloat rfl rfl) rfl rfl (fun _ => wfc_detAgrees_f2f rfl rfl (Or.inl rfl)) rfl h13 rfl
+  obtain ⟨m₆, l₆, i₆⟩ := wfc_step_move_mode false chooseNaN hmd l₅.2.2.1 i₅ hph rfl rfl rfl rfl
+    (.floatToFloat rfl rfl) rfl rfl (fun _ => wfc_detAgrees_f2f rfl rfl (Or.inl rfl)) rfl h14 rfl
+  obtain ⟨m₇, l₇, i₇⟩ := wfc_step_constant_mode false chooseNaN hmd l₆.2.2.1 i₆ hph rfl rfl
+    rfl (.floatToFloat rfl rfl) rfl rfl wfcVSB4 (by decide) rfl
+    (fun _ => wfc_detAgrees_f2f rfl rfl (Or.inl rfl)) rfl h15 rfl
+  obtain ⟨m₈, l₈, i₈⟩ := wfc_step_move_mode false chooseNaN hmd l₇.2.2.1 i₇ hph rfl rfl rfl rfl
+    (.floatToFloat rfl rfl) rfl rfl (fun _ => wfc_detAgrees_f2f rfl rfl (Or.inl rfl)) rfl h16 rfl
+  obtain ⟨m₉, l₉, i₉⟩ := wfc_step_move_mode false chooseNaN hmd l₈.2.2.1 i₈ hph rfl rfl rfl rfl
+    (.floatToFloat rfl rfl) rfl rfl (fun _ => wfc_detAgrees_f2f rfl rfl (Or.inl rfl)) rfl h17 rfl
+  have hrun : WfcRunMode wfcW1Body false chooseNaN wfcW1S0 (wfcMiriEntry wfcW1Body wfcF32Ty)
+      wfcW1S8 p₈ :=
+    (.step h1 e₁ r₁ (.step h2 e₂ r₂ (.step h3 e₃ r₃ (.step h4 e₄ r₄
+      (.step h5 e₅ r₅ (.step h6 e₆ r₆ (.step h7 e₇ r₇ (.step h8 e₈ r₈ (.refl _ _)))))))))
+  exact ⟨h0, p₈, m₁, m₂, m₃, m₄, m₅, m₆, m₇, m₈, m₉, hrun, l₁, l₂, l₃, l₄, l₅, l₆,
+    wfc_miri_uninit l₆.2.2.1 i₆ rfl (Or.inl ⟨_, rfl⟩) rfl, l₇, l₈,
+    wfc_miri_uninit l₈.2.2.1 i₈ rfl (Or.inl ⟨_, rfl⟩) rfl, l₉,
+    wfc_miri_uninit l₉.2.2.1 i₉ rfl (Or.inl ⟨_, rfl⟩) rfl,
+    wfc_step_return_mode false chooseNaN l₉.2.2.1 (fun tf htf => i₉ tf htf 0) hph
+      rfl rfl rfl rfl rfl rfl (Or.inl ⟨_, rfl⟩) hret⟩
 
 /-! ### (W1) Two-sided `f32 ↔ f64` conversion class table at the primitives -/
 
@@ -1546,10 +1847,13 @@ theorem wfcW2_deterministic_canonicalization
   · cases h
   · exact absurd h (by decide)
 
-/-- **(W2) deterministic-mode lockstep bodies** (single local `_0 : f64`, so no prologue):
-`wfcW2DetNBody` is `_0 = const 1.5_f32 as f64` (not a NaN) and `wfcW2DetQBody` is
-`_0 = const 0x7FC0_0000_f32 as f64` (the canonical quiet NaN, whose conversion already *is*
-`preferredNaNBits .binary64`). -/
+/-- **(W2) deterministic-mode lockstep bodies** (single local `_0`, so no prologue):
+* `wfcW2DetNBody`: `_0 = const 1.5_f32 as f64; return` (non-NaN).
+* `wfcW2DetQBody`: `_0 = const 0x7FC0_0000_f32 as f64; return` (canonical quiet NaN).
+* `wfcW2DetSNaNTruncBody`: `_0 = const 0x7FF0_0000_0000_0001_f64 as f32; return` (a **signaling
+  payload NaN** — NOT `preferredNaN` in `f64`! — whose quieted `f32` conversion drops bit `0` below
+  bit 29 and lands on `preferredNaNBits .binary32 = 0x7FC0_0000`, satisfying `FloatCastDetAgrees`'s
+  second disjunct!). -/
 def wfcW2DetNBody : CapturedMir :=
   wfcBody "wit_float_cast_lm::w2_det_non_nan" [wfcDecl wfcF64Ty] 8
     [.assign (local_ 0) (.cast .floatToFloat (.constant (wfcConst wfcF32Ty 0x3FC00000 4)) wfcF64Ty)]
@@ -1559,74 +1863,110 @@ def wfcW2DetQBody : CapturedMir :=
   wfcBody "wit_float_cast_lm::w2_det_canonical_nan" [wfcDecl wfcF64Ty] 8
     [.assign (local_ 0) (.cast .floatToFloat (.constant (wfcConst wfcF32Ty 0x7FC00000 4)) wfcF64Ty)]
 
-/-- **(W2) tightness of deterministic-mode lockstep, from program entry, for every `chooseNaN`**
-(`step_cast_floatToFloat_constant_deterministic_lockstep_iff` in both directions plus the
-deterministic-mode `_anyLocal_preserves` read-back): under `floatNondeterministic := false` the two
-machines step in `StateRelLM3_1` lockstep and hold the same bits exactly when the input is not a
-NaN (`1.5_f32 ↦ 0x3FF8_0000_0000_0000`) **or** is a NaN whose quieted conversion already is
-`preferredNaNBits` (`0x7FC0_0000_f32 ↦ 0x7FF8_0000_0000_0000`); a signaling payload NaN
-(`wfcW2DetBody`, `0x7F80_0001_f32`) breaks lockstep (`wfcW2_deterministic_canonicalization`). -/
+/-- See `wfcW2DetNBody`. -/
+def wfcW2DetSNaNTruncBody : CapturedMir :=
+  wfcBody "wit_float_cast_lm::w2_det_snan_trunc_canonical" [wfcDecl wfcF32Ty] 4
+    [.assign (local_ 0) (.cast .floatToFloat
+      (.constant (wfcConst wfcF64Ty 0x7FF0000000000001 8)) wfcF32Ty)]
+
+/-- Contrast for `wfcW2DetSNaNTruncBody`: `_0 = const 0x7FF0_0000_2000_0001_f64 as f32; return`
+(payload bit `29` survives narrowing to `0x7FC0_0001 ≠ preferredNaNBits .binary32`). -/
+def wfcW2DetSNaNKeepBody : CapturedMir :=
+  wfcBody "wit_float_cast_lm::w2_det_snan_keep_payload" [wfcDecl wfcF32Ty] 4
+    [.assign (local_ 0) (.cast .floatToFloat
+      (.constant (wfcConst wfcF64Ty 0x7FF0000020000001 8)) wfcF32Ty)]
+
+/-- **(W2) tightness of deterministic-mode lockstep from program entry through `return`, for every
+`chooseNaN`**: under `floatNondeterministic := false`, both machines step in `StateRelLM3_1`
+lockstep **and** return the identical scalar (`WfcReturnsMode`) on:
+1. non-NaNs (`1.5_f32 ↦ 0x3FF8_0000_0000_0000_f64`),
+2. canonical quiet NaNs (`0x7FC0_0000_f32 ↦ 0x7FF8_0000_0000_0000_f64`), and
+3. signaling payload NaNs whose narrowed payload truncates away to `preferredNaNBits`
+   (`0x7FF0_0000_0000_0001_f64 ↦ 0x7FC0_0000_f32`, with `isSignaling = .ok true` on the input);
+whereas payload-preserving sNaNs in **both** directions (`0x7F80_0001_f32 as f64` in `wfcW2DetBody`
+and `0x7FF0_0000_2000_0001_f64 as f32` in `wfcW2DetSNaNKeepBody`) break `StepRelLM3_1` lockstep. -/
 theorem wfcW2_deterministic_lockstep_cases
     (chooseNaN : Unit → List Miri.Interpreter.FloatBits →
       Miri.Interpreter.RvalueM AnnealStepState Nat) :
     let hd (b : CapturedMir) := annealStepHooksFloat b.localDecls b.layouts false chooseNaN
-    (∃ m', stepMirFn wfcW2DetNBody (initMachineState wfcW2DetNBody []) =
-        .step (wfcAt wfcW2DetNBody 1 [.init (.scalar ⟨0x3FF8000000000000, 8⟩)]) ∧
-      Miri.Interpreter.Step.step (hd wfcW2DetNBody) () (wfcMiriEntry wfcW2DetNBody wfcF64Ty) =
-        (m', .ok true) ∧
-      StateRelLM3_1 wfcW2DetNBody (wfcAt wfcW2DetNBody 1 [.init (.scalar ⟨0x3FF8000000000000, 8⟩)])
-        m' [] ∧
-      MiriHoldsScalar m' 0 ⟨0x3FF8000000000000, 8⟩) ∧
-    (∃ m', stepMirFn wfcW2DetQBody (initMachineState wfcW2DetQBody []) =
-        .step (wfcAt wfcW2DetQBody 1 [.init (.scalar ⟨0x7FF8000000000000, 8⟩)]) ∧
-      Miri.Interpreter.Step.step (hd wfcW2DetQBody) () (wfcMiriEntry wfcW2DetQBody wfcF64Ty) =
-        (m', .ok true) ∧
-      StateRelLM3_1 wfcW2DetQBody (wfcAt wfcW2DetQBody 1 [.init (.scalar ⟨0x7FF8000000000000, 8⟩)])
-        m' [] ∧
-      MiriHoldsScalar m' 0 ⟨0x7FF8000000000000, 8⟩) ∧
+    (∃ m',
+      WfcLockstepMode wfcW2DetNBody false chooseNaN
+        (initMachineState wfcW2DetNBody [])
+        (wfcAt wfcW2DetNBody 1 [.init (.scalar ⟨0x3FF8000000000000, 8⟩)])
+        (wfcMiriEntry wfcW2DetNBody wfcF64Ty) m' 0 0x3FF8000000000000 8 ∧
+      WfcReturnsMode wfcW2DetNBody false chooseNaN
+        (wfcAt wfcW2DetNBody 1 [.init (.scalar ⟨0x3FF8000000000000, 8⟩)]) m'
+        (.scalar ⟨0x3FF8000000000000, 8⟩)) ∧
+    (∃ m',
+      WfcLockstepMode wfcW2DetQBody false chooseNaN
+        (initMachineState wfcW2DetQBody [])
+        (wfcAt wfcW2DetQBody 1 [.init (.scalar ⟨0x7FF8000000000000, 8⟩)])
+        (wfcMiriEntry wfcW2DetQBody wfcF64Ty) m' 0 0x7FF8000000000000 8 ∧
+      WfcReturnsMode wfcW2DetQBody false chooseNaN
+        (wfcAt wfcW2DetQBody 1 [.init (.scalar ⟨0x7FF8000000000000, 8⟩)]) m'
+        (.scalar ⟨0x7FF8000000000000, 8⟩)) ∧
+    Miri.Interpreter.FloatBits.isSignaling
+        ⟨ieeeFormatToMiri .binary64, BitVec.ofNat 128 0x7FF0000000000001⟩ = .ok true ∧
+    (∃ m',
+      WfcLockstepMode wfcW2DetSNaNTruncBody false chooseNaN
+        (initMachineState wfcW2DetSNaNTruncBody [])
+        (wfcAt wfcW2DetSNaNTruncBody 1 [.init (.scalar ⟨0x7FC00000, 4⟩)])
+        (wfcMiriEntry wfcW2DetSNaNTruncBody wfcF32Ty) m' 0 0x7FC00000 4 ∧
+      WfcReturnsMode wfcW2DetSNaNTruncBody false chooseNaN
+        (wfcAt wfcW2DetSNaNTruncBody 1 [.init (.scalar ⟨0x7FC00000, 4⟩)]) m'
+        (.scalar ⟨0x7FC00000, 4⟩)) ∧
     ¬ StepRelLM3_1 wfcW2DetBody (wfcMiriEntry wfcW2DetBody wfcF64Ty) []
         (stepMirFn wfcW2DetBody (initMachineState wfcW2DetBody []))
-        (Miri.Interpreter.Step.step (hd wfcW2DetBody) () (wfcMiriEntry wfcW2DetBody wfcF64Ty)) := by
+        (Miri.Interpreter.Step.step (hd wfcW2DetBody) () (wfcMiriEntry wfcW2DetBody wfcF64Ty)) ∧
+    ¬ StepRelLM3_1 wfcW2DetSNaNKeepBody (wfcMiriEntry wfcW2DetSNaNKeepBody wfcF32Ty) []
+        (stepMirFn wfcW2DetSNaNKeepBody (initMachineState wfcW2DetSNaNKeepBody []))
+        (Miri.Interpreter.Step.step (hd wfcW2DetSNaNKeepBody) ()
+          (wfcMiriEntry wfcW2DetSNaNKeepBody wfcF32Ty)) := by
   intro hd
+  have hmd : FloatNaNModeOk false chooseNaN := Or.inr rfl
   have hrelN : StateRelLM3_1 wfcW2DetNBody (initMachineState wfcW2DetNBody [])
       (wfcMiriEntry wfcW2DetNBody wfcF64Ty) [] :=
     wfc_stateRel_entry _ _ rfl rfl rfl rfl rfl rfl (by decide)
   have hrelQ : StateRelLM3_1 wfcW2DetQBody (initMachineState wfcW2DetQBody [])
       (wfcMiriEntry wfcW2DetQBody wfcF64Ty) [] :=
     wfc_stateRel_entry _ _ rfl rfl rfl rfl rfl rfl (by decide)
-  have himmN : ∀ tf, (wfcMiriEntry wfcW2DetNBody wfcF64Ty).stack.frames = #[tf] →
-      IsImmediateFrameLocal tf 0 := fun tf htf => wfc_allImm_entry _ _ tf htf 0
-  have himmQ : ∀ tf, (wfcMiriEntry wfcW2DetQBody wfcF64Ty).stack.frames = #[tf] →
-      IsImmediateFrameLocal tf 0 := fun tf htf => wfc_allImm_entry _ _ tf htf 0
+  have hrelS : StateRelLM3_1 wfcW2DetSNaNTruncBody (initMachineState wfcW2DetSNaNTruncBody [])
+      (wfcMiriEntry wfcW2DetSNaNTruncBody wfcF32Ty) [] :=
+    wfc_stateRel_entry _ _ rfl rfl rfl rfl rfl rfl (by decide)
+  have hrelK : StateRelLM3_1 wfcW2DetSNaNKeepBody (initMachineState wfcW2DetSNaNKeepBody [])
+      (wfcMiriEntry wfcW2DetSNaNKeepBody wfcF32Ty) [] :=
+    wfc_stateRel_entry _ _ rfl rfl rfl rfl rfl rfl (by decide)
   have hphN : ∀ p, wfcW2DetNBody.phase ≠ .other p := fun _ h => nomatch h
   have hphQ : ∀ p, wfcW2DetQBody.phase ≠ .other p := fun _ h => nomatch h
-  have hsN : stepMirFn wfcW2DetNBody (initMachineState wfcW2DetNBody []) =
-      .step (wfcAt wfcW2DetNBody 1 [.init (.scalar ⟨0x3FF8000000000000, 8⟩)]) := rfl
-  have hsQ : stepMirFn wfcW2DetQBody (initMachineState wfcW2DetQBody []) =
-      .step (wfcAt wfcW2DetQBody 1 [.init (.scalar ⟨0x7FF8000000000000, 8⟩)]) := rfl
-  -- lockstep (iff, right-to-left)
-  have hlN := (step_cast_floatToFloat_constant_deterministic_lockstep_iff hrelN hphN chooseNaN
-    rfl rfl rfl rfl rfl rfl rfl rfl (by decide) (fun h => nomatch h) himmN).mpr (Or.inl rfl)
-  have hlQ := (step_cast_floatToFloat_constant_deterministic_lockstep_iff hrelQ hphQ chooseNaN
-    rfl rfl rfl rfl rfl rfl rfl rfl (by decide) (fun h => nomatch h) himmQ).mpr (Or.inr rfl)
-  obtain ⟨mN, hmN, hrN⟩ := wfc_step_of_stepRel hlN hsN
-  obtain ⟨mQ, hmQ, hrQ⟩ := wfc_step_of_stepRel hlQ hsQ
-  -- deterministic-mode immediacy preservation and read-back
-  have hpN := step_cast_float_constant_anyLocal_preserves hrelN false chooseNaN (Or.inr rfl)
-    rfl rfl rfl (.floatToFloat rfl rfl) rfl rfl wfcVSB4 (by decide) rfl
-    (fun _ _ _ _ hs hd' => by cases hs; cases hd'; exact Or.inl rfl)
-    (fun tf htf => Or.inl (himmN tf htf)) rfl mN hmN
-  have hpQ := step_cast_float_constant_anyLocal_preserves hrelQ false chooseNaN (Or.inr rfl)
-    rfl rfl rfl (.floatToFloat rfl rfl) rfl rfl wfcVSB4 (by decide) rfl
-    (fun _ _ _ _ hs hd' => by cases hs; cases hd'; exact Or.inr rfl)
-    (fun tf htf => Or.inl (himmQ tf htf)) rfl mQ hmQ
-  have himmN' : ∀ tf, mN.stack.frames = #[tf] → IsImmediateFrameLocal tf 0 :=
-    fun tf htf => hpN.2 _ tf rfl htf 0 (himmN _ rfl)
-  have himmQ' : ∀ tf, mQ.stack.frames = #[tf] → IsImmediateFrameLocal tf 0 :=
-    fun tf htf => hpQ.2 _ tf rfl htf 0 (himmQ _ rfl)
-  refine ⟨⟨mN, hsN, hmN, hrN, wfc_miri_scalar_at hrN himmN' rfl (Or.inl ⟨_, rfl⟩) rfl⟩,
-    ⟨mQ, hsQ, hmQ, hrQ, wfc_miri_scalar_at hrQ himmQ' rfl (Or.inl ⟨_, rfl⟩) rfl⟩, ?_⟩
-  exact (wfcW2_deterministic_canonicalization chooseNaN).2.2.2.2
+  have hphS : ∀ p, wfcW2DetSNaNTruncBody.phase ≠ .other p := fun _ h => nomatch h
+  obtain ⟨mN, lN, iN⟩ := wfc_step_constant_mode false chooseNaN hmd hrelN (wfc_allImm_entry _ _)
+    hphN rfl rfl rfl (.floatToFloat rfl rfl) rfl rfl wfcVSB4 (by decide) rfl
+    (fun _ => wfc_detAgrees_f2f rfl rfl (Or.inl rfl)) rfl rfl rfl
+  obtain ⟨mQ, lQ, iQ⟩ := wfc_step_constant_mode false chooseNaN hmd hrelQ (wfc_allImm_entry _ _)
+    hphQ rfl rfl rfl (.floatToFloat rfl rfl) rfl rfl wfcVSB4 (by decide) rfl
+    (fun _ => wfc_detAgrees_f2f rfl rfl (Or.inr rfl)) rfl rfl rfl
+  obtain ⟨mS, lS, iS⟩ := wfc_step_constant_mode false chooseNaN hmd hrelS (wfc_allImm_entry _ _)
+    hphS rfl rfl rfl (.floatToFloat rfl rfl) rfl rfl wfcVSB8 (by decide) rfl
+    (fun _ => wfc_detAgrees_f2f rfl rfl (Or.inr rfl)) rfl rfl rfl
+  refine ⟨⟨mN, lN, wfc_step_return_mode false chooseNaN lN.2.2.1 (fun tf htf => iN tf htf 0) hphN
+      rfl rfl rfl rfl rfl rfl (Or.inl ⟨_, rfl⟩) rfl⟩,
+    ⟨mQ, lQ, wfc_step_return_mode false chooseNaN lQ.2.2.1 (fun tf htf => iQ tf htf 0) hphQ
+      rfl rfl rfl rfl rfl rfl (Or.inl ⟨_, rfl⟩) rfl⟩,
+    rfl,
+    ⟨mS, lS, wfc_step_return_mode false chooseNaN lS.2.2.1 (fun tf htf => iS tf htf 0) hphS
+      rfl rfl rfl rfl rfl rfl (Or.inl ⟨_, rfl⟩) rfl⟩,
+    (wfcW2_deterministic_canonicalization chooseNaN).2.2.2.2, fun hstep => ?_⟩
+  have hag := (step_cast_floatToFloat_constant_deterministic_lockstep_iff hrelK
+    (fun _ h => nomatch h) chooseNaN rfl rfl rfl rfl rfl rfl rfl rfl (by decide)
+    (fun h => nomatch h) (fun tf htf => wfc_allImm_entry _ _ tf htf 0)).mp hstep
+  have hnanK : Anneal.Mir.IeeeFloatCast.isNaNBits .binary64 0x7FF0000020000001 = true := rfl
+  have hevK : evalFloatToFloatRoundTiesToEven .binary64 .binary32 0x7FF0000020000001 =
+      0x7FC00001 := rfl
+  have hprefK : preferredNaNBits .binary32 = 0x7FC00000 := rfl
+  rw [hnanK, hevK, hprefK] at hag
+  rcases hag with h | h
+  · cases h
+  · exact absurd h (by decide)
 
 /-- **(W2) selector body** `bb0: _0 = const 0x7FF0_0000_2000_0001_f64 as f32; return`
 (`_0 : f32`): a signaling `f64` NaN whose quieted `f32` conversion keeps payload bit `0`, so
@@ -2386,6 +2726,70 @@ theorem wfcW3_toInteger_all_targets (t : FloatIntTarget) :
     wfc_toInteger _ _ (by decide) t _ ?_, wfc_toInteger _ _ (by decide) t _ ?_⟩ <;>
     (cases t <;> rename_i w <;> cases w <;> decide +kernel)
 
+/-- **(W3) two-sided 1-ULP exact-inside vs. saturated-outside cliffs** (`FloatBits.toInteger` and
+`evalFloatToIntSaturating`, **zero** `Classical.choice`):
+* **`u8` / `i8` fractional boundary (`(MAX, MAX + 1)` and `(MIN - 1, MIN)`)**:
+  `255.9999847_f32` (`0x437F_FFFF = 256 - 2⁻¹⁶ > 255`) truncates toward zero to `255` without
+  saturating while `256.0_f32` (`0x4380_0000`) saturates to `255`; `-128.9999847_f32`
+  (`0xC300_FFFF = -(128 + 1 - 2⁻¹⁶) < -128`) truncates toward zero to `-128` while `-129.0_f32`
+  (`0xC301_0000`) saturates to `-128`; and `-(1 - 2⁻²⁴)_f32` (`0xBF7F_FFFF`) truncates to `0`.
+* **`i32` (`f32`)**: `2³¹ - 128 = 2147483520` (`0x4EFF_FFFF`) exact vs `2³¹` (`0x4F00_0000`)
+  `↦ i32::MAX`; `-2³¹` (`0xCF00_0000`) exact `i32::MIN` vs `-(2³¹ + 128)` (`0xCF00_0001`) saturated.
+* **`i64` & `u64` (`f64`)**: `2⁶³ - 1024` (`0x43DF_FFFF_FFFF_FFFF`) exact vs `2⁶³`
+  (`0x43E0_0000_0000_0000`) `↦ i64::MAX`; `-2⁶³` (`0xC3E0_0000_0000_0000`) exact vs
+  `-(2⁶³ + 2048)` (`0xC3E0_0000_0000_0001`) saturated; `2⁶⁴ - 2048` (`0x43EF_FFFF_FFFF_FFFF`)
+  exact vs `2⁶⁴` (`0x43F0_0000_0000_0000`) `↦ u64::MAX`.
+* **`i128` & `u128`**: `2¹²⁷ - 2¹⁰³` (`0x7EFF_FFFF_f32`) exact vs `2¹²⁷` (`0x7F00_0000_f32`)
+  `↦ i128::MAX`, `-2¹²⁷` (`0xFF00_0000_f32`) exact `i128::MIN`, and `2¹²⁸ - 2⁷⁵`
+  (`0x47EF_FFFF_FFFF_FFFF_f64`) exact vs `2¹²⁸` (`0x47F0_0000_0000_0000_f64`) `↦ u128::MAX`. -/
+theorem wfcW3_saturation_cliffs :
+    let both (f : IeeeFormat) (bits : Nat) (t : FloatIntTarget) (V : Int) :=
+      Miri.Interpreter.FloatBits.toInteger ⟨ieeeFormatToMiri f, BitVec.ofNat 128 bits⟩
+          (t.bitWidth .bits64) t.isSigned = .ok V ∧
+        intValueOfBits t.isSigned (t.bitWidth .bits64)
+          (evalFloatToIntSaturating f bits t .bits64).bits = V
+    both .binary32 0x437FFFFF (.unsigned .u8) 255 ∧
+    both .binary32 0x43800000 (.unsigned .u8) 255 ∧
+    both .binary32 0xC300FFFF (.signed .i8) (-128) ∧
+    both .binary32 0xC3010000 (.signed .i8) (-128) ∧
+    both .binary32 0xBF7FFFFF (.signed .i8) 0 ∧
+    both .binary32 0x4EFFFFFF (.signed .i32) 2147483520 ∧
+    both .binary32 0x4F000000 (.signed .i32) (2 ^ 31 - 1) ∧
+    both .binary32 0xCF000000 (.signed .i32) (-(2 ^ 31)) ∧
+    both .binary32 0xCF000001 (.signed .i32) (-(2 ^ 31)) ∧
+    both .binary64 0x43DFFFFFFFFFFFFF (.signed .i64) (2 ^ 63 - 1024) ∧
+    both .binary64 0x43E0000000000000 (.signed .i64) (2 ^ 63 - 1) ∧
+    both .binary64 0xC3E0000000000000 (.signed .i64) (-(2 ^ 63)) ∧
+    both .binary64 0xC3E0000000000001 (.signed .i64) (-(2 ^ 63)) ∧
+    both .binary64 0x43EFFFFFFFFFFFFF (.unsigned .u64) (2 ^ 64 - 2048) ∧
+    both .binary64 0x43F0000000000000 (.unsigned .u64) (2 ^ 64 - 1) ∧
+    both .binary32 0x7EFFFFFF (.signed .i128) (2 ^ 127 - 2 ^ 103) ∧
+    both .binary32 0x7F000000 (.signed .i128) (2 ^ 127 - 1) ∧
+    both .binary32 0xFF000000 (.signed .i128) (-(2 ^ 127)) ∧
+    both .binary64 0x47EFFFFFFFFFFFFF (.unsigned .u128) (2 ^ 128 - 2 ^ 75) ∧
+    both .binary64 0x47F0000000000000 (.unsigned .u128) (2 ^ 128 - 1) := by
+  intro both
+  exact ⟨wfc_toInteger _ _ (by decide) _ _ (by decide +kernel),
+    wfc_toInteger _ _ (by decide) _ _ (by decide +kernel),
+    wfc_toInteger _ _ (by decide) _ _ (by decide +kernel),
+    wfc_toInteger _ _ (by decide) _ _ (by decide +kernel),
+    wfc_toInteger _ _ (by decide) _ _ (by decide +kernel),
+    wfc_toInteger _ _ (by decide) _ _ (by decide +kernel),
+    wfc_toInteger _ _ (by decide) _ _ (by decide +kernel),
+    wfc_toInteger _ _ (by decide) _ _ (by decide +kernel),
+    wfc_toInteger _ _ (by decide) _ _ (by decide +kernel),
+    wfc_toInteger _ _ (by decide) _ _ (by decide +kernel),
+    wfc_toInteger _ _ (by decide) _ _ (by decide +kernel),
+    wfc_toInteger _ _ (by decide) _ _ (by decide +kernel),
+    wfc_toInteger _ _ (by decide) _ _ (by decide +kernel),
+    wfc_toInteger _ _ (by decide) _ _ (by decide +kernel),
+    wfc_toInteger _ _ (by decide) _ _ (by decide +kernel),
+    wfc_toInteger _ _ (by decide) _ _ (by decide +kernel),
+    wfc_toInteger _ _ (by decide) _ _ (by decide +kernel),
+    wfc_toInteger _ _ (by decide) _ _ (by decide +kernel),
+    wfc_toInteger _ _ (by decide) _ _ (by decide +kernel),
+    wfc_toInteger _ _ (by decide) _ _ (by decide +kernel)⟩
+
 
 /-! ## (W4) Integer-to-float ties-to-even and overflow -/
 
@@ -2579,6 +2983,76 @@ theorem wfcW4_end_to_end :
   exact ⟨h0, p₈, m₁, m₂, m₃, m₄, m₅, m₆, m₇, m₈, m₉, hrun, l₁, l₂, l₃,
     wfc_miri_uninit l₃.2.2.1 i₃ rfl (Or.inr ⟨_, rfl⟩) rfl, l₄, l₅, l₆, l₇, l₈, l₉,
     wfc_step_return l₉.2.2.1 i₉ hph rfl rfl rfl rfl rfl rfl (Or.inl ⟨_, rfl⟩) hret⟩
+
+/-- **(W4) multi-step deterministic-mode (`floatNondeterministic := false`) lockstep witness from
+program entry, for every `chooseNaN`**: because `floatToInt` and `intToFloat` never invoke
+`adjustNaN`, all 18 steps of `wfcW4Body` (`StorageLive(_1.._8)`, 9 casts, and `return`) execute in
+`StateRelLM3_1` lockstep under `annealStepHooksFloat ... false chooseNaN` for arbitrary `chooseNaN`. -/
+theorem wfcW4_deterministic_end_to_end
+    (chooseNaN : Unit → List Miri.Interpreter.FloatBits →
+      Miri.Interpreter.RvalueM AnnealStepState Nat) :
+    initMachineState wfcW4Body [] = wfcW4S0 ∧
+    ∃ mₚ m₁ m₂ m₃ m₄ m₅ m₆ m₇ m₈ m₉ : AnnealStepState,
+      WfcRunMode wfcW4Body false chooseNaN wfcW4S0 (wfcMiriEntry wfcW4Body wfcF32Ty) wfcW4S8 mₚ ∧
+      WfcLockstepMode wfcW4Body false chooseNaN wfcW4S8 wfcW4S9 mₚ m₁
+        8 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF 16 ∧
+      WfcLockstepMode wfcW4Body false chooseNaN wfcW4S9 wfcW4S10 m₁ m₂ 1 0x7F800000 4 ∧
+      WfcLockstepMode wfcW4Body false chooseNaN wfcW4S10 wfcW4S11 m₂ m₃ 2 0x47F0000000000000 8 ∧
+      MiriHoldsUninit m₃ 8 ∧
+      WfcLockstepMode wfcW4Body false chooseNaN wfcW4S11 wfcW4S12 m₃ m₄ 3 0xFF000000 4 ∧
+      WfcLockstepMode wfcW4Body false chooseNaN wfcW4S12 wfcW4S13 m₄ m₅ 4 0x4B800000 4 ∧
+      WfcLockstepMode wfcW4Body false chooseNaN wfcW4S13 wfcW4S14 m₅ m₆ 5 0x4B800002 4 ∧
+      WfcLockstepMode wfcW4Body false chooseNaN wfcW4S14 wfcW4S15 m₆ m₇ 6 0x4340000000000000 8 ∧
+      WfcLockstepMode wfcW4Body false chooseNaN wfcW4S15 wfcW4S16 m₇ m₈ 7 0x4340000000000002 8 ∧
+      WfcLockstepMode wfcW4Body false chooseNaN wfcW4S16 wfcW4S17 m₈ m₉ 0 0xC3000000 4 ∧
+      WfcReturnsMode wfcW4Body false chooseNaN wfcW4S17 m₉ (.scalar ⟨0xC3000000, 4⟩) := by
+  have hph : ∀ p, wfcW4Body.phase ≠ .other p := fun _ h => nomatch h
+  have hmd : FloatNaNModeOk false chooseNaN := Or.inr rfl
+  obtain ⟨h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15, h16, h17,
+    hret⟩ := wfcW4_anneal_run
+  obtain ⟨p₁, e₁, r₁, q₁⟩ :=
+    wfc_step_storageLive_mode false chooseNaN wfcW4_stateRel_entry (wfc_allImm_entry _ _) hph
+      rfl rfl rfl h1
+  obtain ⟨p₂, e₂, r₂, q₂⟩ := wfc_step_storageLive_mode false chooseNaN r₁ q₁ hph rfl rfl rfl h2
+  obtain ⟨p₃, e₃, r₃, q₃⟩ := wfc_step_storageLive_mode false chooseNaN r₂ q₂ hph rfl rfl rfl h3
+  obtain ⟨p₄, e₄, r₄, q₄⟩ := wfc_step_storageLive_mode false chooseNaN r₃ q₃ hph rfl rfl rfl h4
+  obtain ⟨p₅, e₅, r₅, q₅⟩ := wfc_step_storageLive_mode false chooseNaN r₄ q₄ hph rfl rfl rfl h5
+  obtain ⟨p₆, e₆, r₆, q₆⟩ := wfc_step_storageLive_mode false chooseNaN r₅ q₅ hph rfl rfl rfl h6
+  obtain ⟨p₇, e₇, r₇, q₇⟩ := wfc_step_storageLive_mode false chooseNaN r₆ q₆ hph rfl rfl rfl h7
+  obtain ⟨p₈, e₈, r₈, q₈⟩ := wfc_step_storageLive_mode false chooseNaN r₇ q₇ hph rfl rfl rfl h8
+  obtain ⟨m₁, l₁, i₁⟩ := wfc_step_constant_mode false chooseNaN hmd r₈ q₈ hph rfl rfl
+    rfl (.floatToInt rfl rfl) rfl rfl wfcVSB4 (by decide) rfl (fun _ _ _ hk _ _ => nomatch hk)
+    rfl h9 rfl
+  obtain ⟨m₂, l₂, i₂⟩ := wfc_step_copy_mode false chooseNaN hmd l₁.2.2.1 i₁ hph rfl rfl rfl rfl
+    (.intToFloat rfl rfl) rfl rfl (fun _ _ _ hk _ _ => nomatch hk) rfl h10 rfl
+  obtain ⟨m₃, l₃, i₃⟩ := wfc_step_move_mode false chooseNaN hmd l₂.2.2.1 i₂ hph rfl rfl rfl rfl
+    (.intToFloat rfl rfl) rfl rfl (fun _ _ _ hk _ _ => nomatch hk) rfl h11 rfl
+  obtain ⟨m₄, l₄, i₄⟩ := wfc_step_constant_mode false chooseNaN hmd l₃.2.2.1 i₃ hph rfl rfl
+    rfl (.intToFloat rfl rfl) rfl rfl wfcVSB16 (by decide) rfl (fun _ _ _ hk _ _ => nomatch hk)
+    rfl h12 rfl
+  obtain ⟨m₅, l₅, i₅⟩ := wfc_step_constant_mode false chooseNaN hmd l₄.2.2.1 i₄ hph rfl rfl
+    rfl (.intToFloat rfl rfl) rfl rfl wfcVSB4 (by decide) rfl (fun _ _ _ hk _ _ => nomatch hk)
+    rfl h13 rfl
+  obtain ⟨m₆, l₆, i₆⟩ := wfc_step_constant_mode false chooseNaN hmd l₅.2.2.1 i₅ hph rfl rfl
+    rfl (.intToFloat rfl rfl) rfl rfl wfcVSB4 (by decide) rfl (fun _ _ _ hk _ _ => nomatch hk)
+    rfl h14 rfl
+  obtain ⟨m₇, l₇, i₇⟩ := wfc_step_constant_mode false chooseNaN hmd l₆.2.2.1 i₆ hph rfl rfl
+    rfl (.intToFloat rfl rfl) rfl rfl wfcVSB8 (by decide) rfl (fun _ _ _ hk _ _ => nomatch hk)
+    rfl h15 rfl
+  obtain ⟨m₈, l₈, i₈⟩ := wfc_step_constant_mode false chooseNaN hmd l₇.2.2.1 i₇ hph rfl rfl
+    rfl (.intToFloat rfl rfl) rfl rfl wfcVSB8 (by decide) rfl (fun _ _ _ hk _ _ => nomatch hk)
+    rfl h16 rfl
+  obtain ⟨m₉, l₉, i₉⟩ := wfc_step_constant_mode false chooseNaN hmd l₈.2.2.1 i₈ hph rfl rfl
+    rfl (.intToFloat rfl rfl) rfl rfl wfcVSB1 (by decide) rfl (fun _ _ _ hk _ _ => nomatch hk)
+    rfl h17 rfl
+  have hrun : WfcRunMode wfcW4Body false chooseNaN wfcW4S0 (wfcMiriEntry wfcW4Body wfcF32Ty)
+      wfcW4S8 p₈ :=
+    (.step h1 e₁ r₁ (.step h2 e₂ r₂ (.step h3 e₃ r₃ (.step h4 e₄ r₄
+      (.step h5 e₅ r₅ (.step h6 e₆ r₆ (.step h7 e₇ r₇ (.step h8 e₈ r₈ (.refl _ _)))))))))
+  exact ⟨h0, p₈, m₁, m₂, m₃, m₄, m₅, m₆, m₇, m₈, m₉, hrun, l₁, l₂, l₃,
+    wfc_miri_uninit l₃.2.2.1 i₃ rfl (Or.inr ⟨_, rfl⟩) rfl, l₄, l₅, l₆, l₇, l₈, l₉,
+    wfc_step_return_mode false chooseNaN l₉.2.2.1 (fun tf htf => i₉ tf htf 0) hph
+      rfl rfl rfl rfl rfl rfl (Or.inl ⟨_, rfl⟩) hret⟩
 
 /-! ### (W4) All twelve integer sources × both target formats at the `lean-miri` primitive -/
 
@@ -4741,6 +5215,48 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_step_storageDead' depends on
 #print axioms wfc_step_storageDead
 
 /--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_detAgrees_f2f' depends on axioms:
+  [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfc_detAgrees_f2f
+
+/--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_step_storageLive_mode' depends on axioms:
+  [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfc_step_storageLive_mode
+
+/--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_step_constant_mode' depends on axioms:
+  [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfc_step_constant_mode
+
+/--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_step_copy_mode' depends on axioms:
+  [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfc_step_copy_mode
+
+/--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_step_move_mode' depends on axioms:
+  [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfc_step_move_mode
+
+/--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_step_return_mode' depends on axioms:
+  [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfc_step_return_mode
+
+/--
 info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcVSB1' does not depend on any axioms
 -/
 #guard_msgs (whitespace := lax) in
@@ -4790,6 +5306,13 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW1_end_to_end' depends on axi
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms wfcW1_end_to_end
+
+/--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW1_deterministic_end_to_end' depends on axioms:
+  [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfcW1_deterministic_end_to_end
 
 /--
 info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_convert' depends on axioms:
@@ -4932,6 +5455,13 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW3_toInteger_all_targets' dep
 #print axioms wfcW3_toInteger_all_targets
 
 /--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW3_saturation_cliffs' depends on axioms:
+  [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfcW3_saturation_cliffs
+
+/--
 info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW4_anneal_run' depends on axioms:
   [propext, Quot.sound]
 -/
@@ -4951,6 +5481,13 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW4_end_to_end' depends on axi
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms wfcW4_end_to_end
+
+/--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW4_deterministic_end_to_end' depends on axioms:
+  [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfcW4_deterministic_end_to_end
 
 /--
 info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_fromInteger' depends on axioms:
