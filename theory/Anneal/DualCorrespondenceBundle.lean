@@ -319,6 +319,44 @@ theorem not_codecLaws_mirFail_corrFaultKind
       | exact ne₂ (c.encode_injective (h₁.trans h₃.symm))
       | exact ne₃ (c.encode_injective (h₂.trans h₃.symm))
 
+/--
+Lawful codec in the opposite orientation (`MirFailE.I → CorrFaultKind`) once
+fuel exhaustion (`FailureKind.outOfFuel`) is excluded from the domain: the two
+non-fuel trusted fault requests are in constructive bijection with
+`CorrFaultKind` (`CodecLaws.ofEquiv`).
+-/
+def mirFailNonFuelCodec :
+    CodecLaws { r : MirFailE.I // r ≠ FailReq.fail FailureKind.outOfFuel }
+      CorrFaultKind :=
+  CodecLaws.ofEquiv
+    (fun ⟨r, hr⟩ =>
+      match r with
+      | FailReq.fail .ub => .undefined
+      | FailReq.fail .unsupported => .unsupported
+      | FailReq.fail .outOfFuel => False.elim (hr rfl))
+    (fun k =>
+      match k with
+      | .undefined => ⟨FailReq.fail .ub, fun h => by cases h⟩
+      | .unsupported => ⟨FailReq.fail .unsupported, fun h => by cases h⟩)
+    (fun ⟨r, hr⟩ => by
+      cases r with
+      | fail fk =>
+        cases fk with
+        | ub => rfl
+        | unsupported => rfl
+        | outOfFuel => exact False.elim (hr rfl))
+    (fun k => by cases k <;> rfl)
+
+/-- `mirFailNonFuelCodec` decodes `.undefined` to `.fail .ub`. -/
+theorem mirFailNonFuelCodec_decode_undefined :
+    (mirFailNonFuelCodec.decode .undefined).map Subtype.val =
+      some (FailReq.fail FailureKind.ub) := rfl
+
+/-- `mirFailNonFuelCodec` decodes `.unsupported` to `.fail .unsupported`. -/
+theorem mirFailNonFuelCodec_decode_unsupported :
+    (mirFailNonFuelCodec.decode .unsupported).map Subtype.val =
+      some (FailReq.fail FailureKind.unsupported) := rfl
+
 /-! ## 2. Four-way choice-coupled outcome partition -/
 
 /--
@@ -429,6 +467,18 @@ theorem ofMirExecState_faulted_unsupported :
 /-- Fuel exhaustion is not an outcome. -/
 theorem ofMirExecState_faulted_outOfFuel :
     ofMirExecState (.faulted .outOfFuel) = none := rfl
+
+/-- A normal halted state has a normal outcome. -/
+theorem ofMirExecState_halted_normal (r : MirReturn) :
+    ofMirExecState (.halted (.normal r)) = some (.normal r) := rfl
+
+/-- A panicking halted state has an unwind outcome. -/
+theorem ofMirExecState_halted_panic :
+    ofMirExecState (.halted .panic) = some (.unwind ()) := rfl
+
+/-- An aborting halted state is classified `unsupported`. -/
+theorem ofMirExecState_halted_abort :
+    ofMirExecState (.halted .abort) = some (.fault .unsupported) := rfl
 
 /--
 A faulted state has outcome `.fault k` exactly when its `FailureKind` is the
@@ -1022,6 +1072,19 @@ theorem exactBehaviorEq_of_reverseTotal? (S : ModeStepSim R)
   S.exactBehaviorEq_of_reverseTotal h.down hg
 
 /--
+Exact behavioral equality directly from `S.reverse_total?.isSome = true`,
+without first unpacking the `PLift` witness.
+-/
+theorem exactBehaviorEq_of_reverseTotal_isSome (S : ModeStepSim R)
+    (hrev : S.reverse_total?.isSome = true) {m : Mode} {p : Prog} {q : Query}
+    (hg : R.SupportGate m p q) : ExactBehaviorEq R m p q := by
+  cases h : S.reverse_total? with
+  | none =>
+    rw [h] at hrev
+    cases hrev
+  | some pf => exact S.exactBehaviorEq_of_reverseTotal pf.down hg
+
+/--
 Vertical composition of step simulations through a middle model. `hmid`
 states that the reference model of `R₁` and the Anneal model of `R₂` are the
 same middle model.
@@ -1252,28 +1315,36 @@ theorem antecedent_inhabited (w : PositiveWitness R) :
     ∃ m p q, R.SupportGate m p q ∧ R.WellFormedAnneal m p q :=
   ⟨w.m, w.p, w.q, w.gate, w.wf⟩
 
-/-- Transport a positive witness along a mode reindexing with a section. -/
-def liftMode {Mode' : Type uM'} (w : PositiveWitness R) (f : Mode' → Mode)
-    (g : Mode → Mode') (hfg : ∀ m, f (g m) = m) :
-    PositiveWitness (R.liftMode f) where
-  m := g w.m
+/--
+Transport a positive witness along a mode reindexing `f` using a single
+preimage `m'` of `w.m` (no global section required).
+-/
+def liftModeAt {Mode' : Type uM'} (w : PositiveWitness R) (f : Mode' → Mode)
+    (m' : Mode') (hm : f m' = w.m) : PositiveWitness (R.liftMode f) where
+  m := m'
   p := w.p
   q := w.q
   c := w.c
   gate := by
-    show R.SupportGate (f (g w.m)) w.p w.q
-    rw [hfg]
+    show R.SupportGate (f m') w.p w.q
+    rw [hm]
     exact w.gate
   wf := by
-    show R.WellFormedAnneal (f (g w.m)) w.p w.q
-    rw [hfg]
+    show R.WellFormedAnneal (f m') w.p w.q
+    rw [hm]
     exact w.wf
   agree := by
     show ∃ (retA : RetA) (retR : RetR),
-      R.ExecA (f (g w.m)) w.p w.q w.c (.normal retA) ∧
-        R.ExecR (f (g w.m)) w.p w.q w.c (.normal retR) ∧ R.RetRel retA retR
-    rw [hfg]
+      R.ExecA (f m') w.p w.q w.c (.normal retA) ∧
+        R.ExecR (f m') w.p w.q w.c (.normal retR) ∧ R.RetRel retA retR
+    rw [hm]
     exact w.agree
+
+/-- Transport a positive witness along a mode reindexing with a section. -/
+def liftMode {Mode' : Type uM'} (w : PositiveWitness R) (f : Mode' → Mode)
+    (g : Mode → Mode') (hfg : ∀ m, f (g m) = m) :
+    PositiveWitness (R.liftMode f) :=
+  w.liftModeAt f (g w.m) (hfg w.m)
 
 /--
 Transport a positive witness of `R₂` to the vertical composition `R₁.comp R₂`
@@ -1316,27 +1387,35 @@ theorem not_wellFormed (w : FaultEquivWitness R) :
     ¬ R.WellFormedAnneal w.m w.p w.q ∧ ¬ R.WellFormedRef w.m w.p w.q :=
   ⟨fun h => h w.c w.kind w.execA, fun h => h w.c w.kind w.execR⟩
 
-/-- Transport a fault witness along a mode reindexing with a section. -/
-def liftMode {Mode' : Type uM'} (w : FaultEquivWitness R) (f : Mode' → Mode)
-    (g : Mode → Mode') (hfg : ∀ m, f (g m) = m) :
-    FaultEquivWitness (R.liftMode f) where
-  m := g w.m
+/--
+Transport a fault witness along a mode reindexing `f` using a single preimage
+`m'` of `w.m` (no global section required).
+-/
+def liftModeAt {Mode' : Type uM'} (w : FaultEquivWitness R) (f : Mode' → Mode)
+    (m' : Mode') (hm : f m' = w.m) : FaultEquivWitness (R.liftMode f) where
+  m := m'
   p := w.p
   q := w.q
   c := w.c
   kind := w.kind
   gate := by
-    show R.SupportGate (f (g w.m)) w.p w.q
-    rw [hfg]
+    show R.SupportGate (f m') w.p w.q
+    rw [hm]
     exact w.gate
   execA := by
-    show R.ExecA (f (g w.m)) w.p w.q w.c (.fault w.kind)
-    rw [hfg]
+    show R.ExecA (f m') w.p w.q w.c (.fault w.kind)
+    rw [hm]
     exact w.execA
   execR := by
-    show R.ExecR (f (g w.m)) w.p w.q w.c (.fault w.kind)
-    rw [hfg]
+    show R.ExecR (f m') w.p w.q w.c (.fault w.kind)
+    rw [hm]
     exact w.execR
+
+/-- Transport a fault witness along a mode reindexing with a section. -/
+def liftMode {Mode' : Type uM'} (w : FaultEquivWitness R) (f : Mode' → Mode)
+    (g : Mode → Mode') (hfg : ∀ m, f (g m) = m) :
+    FaultEquivWitness (R.liftMode f) :=
+  w.liftModeAt f (g w.m) (hfg w.m)
 
 /--
 Transport a fault witness of `R₂` to the vertical composition `R₁.comp R₂`
@@ -1389,32 +1468,123 @@ theorem not_mode_invariant (w : ModeSensitivityWitness R) :
     obtain ⟨c', hR'⟩ := h w.m₁ w.m₂ w.p w.q w.c outR hR
     exact hnR c' hR'
 
-/-- Transport a mode-sensitivity witness along a mode reindexing with a
-section. -/
-def liftMode {Mode' : Type uM'} (w : ModeSensitivityWitness R)
-    (f : Mode' → Mode) (g : Mode → Mode') (hfg : ∀ m, f (g m) = m) :
-    ModeSensitivityWitness (R.liftMode f) where
-  m₁ := g w.m₁
-  m₂ := g w.m₂
+/--
+Transport a mode-sensitivity witness along a mode reindexing `f` using
+preimages `m₁'` and `m₂'` of `w.m₁` and `w.m₂` (no global section required).
+-/
+def liftModeAt {Mode' : Type uM'} (w : ModeSensitivityWitness R)
+    (f : Mode' → Mode) (m₁' m₂' : Mode') (h₁ : f m₁' = w.m₁)
+    (h₂ : f m₂' = w.m₂) : ModeSensitivityWitness (R.liftMode f) where
+  m₁ := m₁'
+  m₂ := m₂'
   p := w.p
   q := w.q
   c := w.c
   gate₁ := by
-    show R.SupportGate (f (g w.m₁)) w.p w.q
-    rw [hfg]
+    show R.SupportGate (f m₁') w.p w.q
+    rw [h₁]
     exact w.gate₁
   gate₂ := by
-    show R.SupportGate (f (g w.m₂)) w.p w.q
-    rw [hfg]
+    show R.SupportGate (f m₂') w.p w.q
+    rw [h₂]
     exact w.gate₂
   flips := by
     show ∃ (outA : ExecOutcome4 RetA UnwA) (outR : ExecOutcome4 RetR UnwR),
-      R.ExecA (f (g w.m₁)) w.p w.q w.c outA ∧
-        R.ExecR (f (g w.m₁)) w.p w.q w.c outR ∧ R.Coupled outA outR ∧
-        (∀ c', ¬ R.ExecA (f (g w.m₂)) w.p w.q c' outA) ∧
-        (∀ c', ¬ R.ExecR (f (g w.m₂)) w.p w.q c' outR)
-    rw [hfg, hfg]
+      R.ExecA (f m₁') w.p w.q w.c outA ∧
+        R.ExecR (f m₁') w.p w.q w.c outR ∧ R.Coupled outA outR ∧
+        (∀ c', ¬ R.ExecA (f m₂') w.p w.q c' outA) ∧
+        (∀ c', ¬ R.ExecR (f m₂') w.p w.q c' outR)
+    rw [h₁, h₂]
     exact w.flips
+
+/-- Transport a mode-sensitivity witness along a mode reindexing with a
+section. -/
+def liftMode {Mode' : Type uM'} (w : ModeSensitivityWitness R)
+    (f : Mode' → Mode) (g : Mode → Mode') (hfg : ∀ m, f (g m) = m) :
+    ModeSensitivityWitness (R.liftMode f) :=
+  w.liftModeAt f (g w.m₁) (g w.m₂) (hfg w.m₁) (hfg w.m₂)
+
+/--
+Unconditionally transport a fault-flipping mode-sensitivity witness of `R₂`
+across a front simulation `S₁`: Case 1 and reverse fault totality preserve
+fault reachability and unreachability without requiring full `ReverseTotal`.
+-/
+def compFrontOfFault {RetB : Type uRB} {UnwB : Type uUB}
+    {R₁ : ModeParamStepRel Mode Prog Query Choice RetA RetB UnwA UnwB}
+    {R₂ : ModeParamStepRel Mode Prog Query Choice RetB RetR UnwB UnwR}
+    (w : ModeSensitivityWitness R₂) (S₁ : ModeStepSim R₁)
+    (hmid : ∀ m p q c out, R₁.ExecR m p q c out ↔ R₂.ExecA m p q c out)
+    (hgate : ∀ m p q, R₂.SupportGate m p q → R₁.SupportGate m p q)
+    (hfault : ∃ k : CorrFaultKind,
+      R₂.ExecA w.m₁ w.p w.q w.c (.fault k) ∧
+      R₂.ExecR w.m₁ w.p w.q w.c (.fault k) ∧
+      (∀ c', ¬ R₂.ExecA w.m₂ w.p w.q c' (.fault k)) ∧
+      (∀ c', ¬ R₂.ExecR w.m₂ w.p w.q c' (.fault k))) :
+    ModeSensitivityWitness (R₁.comp R₂) where
+  m₁ := w.m₁
+  m₂ := w.m₂
+  p := w.p
+  q := w.q
+  c := w.c
+  gate₁ := ⟨hgate _ _ _ w.gate₁, w.gate₁⟩
+  gate₂ := ⟨hgate _ _ _ w.gate₂, w.gate₂⟩
+  flips := by
+    obtain ⟨k, hA₁, hR₁, hnA₂, hnR₂⟩ := hfault
+    refine ⟨.fault k, .fault k,
+      (S₁.fault_iff_at_choice (hgate _ _ _ w.gate₁) w.c k).mpr
+        ((hmid _ _ _ w.c (.fault k)).mpr hA₁),
+      hR₁, ChoiceCoupledOutcomeRel.ofFault k, ?_, hnR₂⟩
+    intro c' hA₂
+    exact hnA₂ c' ((hmid _ _ _ c' (.fault k)).mp
+      (S₁.reverse_fault_total _ _ _ c' k (hgate _ _ _ w.gate₂) hA₂))
+
+/--
+Transport any mode-sensitivity witness of `R₂` (covering all four outcome
+classes) across a front simulation `S₁` that has `ReverseTotal` and functional
+payload relations (for example induced by a `CodecLaws`).
+-/
+def compFrontOfReverseTotal {RetB : Type uRB} {UnwB : Type uUB}
+    {R₁ : ModeParamStepRel Mode Prog Query Choice RetA RetB UnwA UnwB}
+    {R₂ : ModeParamStepRel Mode Prog Query Choice RetB RetR UnwB UnwR}
+    (w : ModeSensitivityWitness R₂) (S₁ : ModeStepSim R₁)
+    (hrev₁ : R₁.ReverseTotal)
+    (hmid : ∀ m p q c out, R₁.ExecR m p q c out ↔ R₂.ExecA m p q c out)
+    (hgate : ∀ m p q, R₂.SupportGate m p q → R₁.SupportGate m p q)
+    (hRetFun : ∀ a b₁ b₂, R₁.RetRel a b₁ → R₁.RetRel a b₂ → b₁ = b₂)
+    (hUnwFun : ∀ a u₁ u₂, R₁.UnwRel a u₁ → R₁.UnwRel a u₂ → u₁ = u₂) :
+    ModeSensitivityWitness (R₁.comp R₂) where
+  m₁ := w.m₁
+  m₂ := w.m₂
+  p := w.p
+  q := w.q
+  c := w.c
+  gate₁ := ⟨hgate _ _ _ w.gate₁, w.gate₁⟩
+  gate₂ := ⟨hgate _ _ _ w.gate₂, w.gate₂⟩
+  flips := by
+    obtain ⟨outB, outR, hB₁, hR₁, hBR, hnB₂, hnR₂⟩ := w.flips
+    obtain ⟨outA, hA₁, hAB⟩ :=
+      S₁.forward_total _ _ _ w.c outB (hgate _ _ _ w.gate₁)
+        ((hmid _ _ _ w.c outB).mpr hB₁)
+    refine ⟨outA, outR, hA₁, hR₁, hAB.trans hBR, ?_, hnR₂⟩
+    intro c' hA₂
+    obtain ⟨outB', hB₂', hAB'⟩ :=
+      hrev₁ _ _ _ c' outA (hgate _ _ _ w.gate₂) hA₂
+    have heq : outB' = outB := by
+      cases outA with
+      | normal a =>
+        obtain ⟨b, hb, hab⟩ := hAB.normal_anneal_to_ref a rfl
+        obtain ⟨b', hb', hab'⟩ := hAB'.normal_anneal_to_ref a rfl
+        rw [hb, hb', hRetFun a b' b hab' hab]
+      | unwind a =>
+        obtain ⟨u, hu, hau⟩ := hAB.unwind_anneal_to_ref a rfl
+        obtain ⟨u', hu', hau'⟩ := hAB'.unwind_anneal_to_ref a rfl
+        rw [hu, hu', hUnwFun a u' u hau' hau]
+      | fault k =>
+        rw [(hAB.fault_iff k).mp rfl, (hAB'.fault_iff k).mp rfl]
+      | diverge =>
+        rw [hAB.diverge_anneal_to_ref rfl, hAB'.diverge_anneal_to_ref rfl]
+    rw [heq] at hB₂'
+    exact hnB₂ c' ((hmid _ _ _ c' outB).mp hB₂')
 
 end ModeSensitivityWitness
 
@@ -1536,12 +1706,15 @@ theorem not_input_invariant (w : FlipDirectionWitness R) :
   ⟨fun h => w.verdict_flips.1.2 (h _ _ _ _ w.wfOkA),
    fun h => w.verdict_flips.2.2 (h _ _ _ _ w.wfOkR)⟩
 
-/-- Transport a flip-direction witness along a mode reindexing with a
-section. -/
-def liftMode {Mode' : Type uM'} (w : FlipDirectionWitness R) (f : Mode' → Mode)
-    (g : Mode → Mode') (hfg : ∀ m, f (g m) = m) :
+/--
+Transport a flip-direction witness along a mode reindexing `f` using a single
+preimage `m'` of `w.m` (no global section required).
+-/
+def liftModeAt {Mode' : Type uM'} (w : FlipDirectionWitness R)
+    (f : Mode' → Mode) (m' : Mode') (hm : f m' = w.m)
+    (mode? : Option (ModeSensitivityWitness (R.liftMode f)) := none) :
     FlipDirectionWitness (R.liftMode f) where
-  m := g w.m
+  m := m'
   pOk := w.pOk
   qOk := w.qOk
   cOk := w.cOk
@@ -1549,17 +1722,25 @@ def liftMode {Mode' : Type uM'} (w : FlipDirectionWitness R) (f : Mode' → Mode
   qFault := w.qFault
   cFault := w.cFault
   kind := w.kind
-  gateOk := (w.toPositive.liftMode f g hfg).gate
-  gateFault := (w.toFault.liftMode f g hfg).gate
-  okAgree := (w.toPositive.liftMode f g hfg).agree
-  wfOkA := (w.toPositive.liftMode f g hfg).wf
+  gateOk := (w.toPositive.liftModeAt f m' hm).gate
+  gateFault := (w.toFault.liftModeAt f m' hm).gate
+  okAgree := (w.toPositive.liftModeAt f m' hm).agree
+  wfOkA := (w.toPositive.liftModeAt f m' hm).wf
   wfOkR := by
-    show R.WellFormedRef (f (g w.m)) w.pOk w.qOk
-    rw [hfg]
+    show R.WellFormedRef (f m') w.pOk w.qOk
+    rw [hm]
     exact w.wfOkR
-  faultA := (w.toFault.liftMode f g hfg).execA
-  faultR := (w.toFault.liftMode f g hfg).execR
-  modeSensitivity? := w.modeSensitivity?.map fun ms => ms.liftMode f g hfg
+  faultA := (w.toFault.liftModeAt f m' hm).execA
+  faultR := (w.toFault.liftModeAt f m' hm).execR
+  modeSensitivity? := mode?
+
+/-- Transport a flip-direction witness along a mode reindexing with a
+section. -/
+def liftMode {Mode' : Type uM'} (w : FlipDirectionWitness R) (f : Mode' → Mode)
+    (g : Mode → Mode') (hfg : ∀ m, f (g m) = m) :
+    FlipDirectionWitness (R.liftMode f) :=
+  w.liftModeAt f (g w.m) (hfg w.m)
+    (w.modeSensitivity?.map fun ms => ms.liftMode f g hfg)
 
 /--
 Transport a flip-direction witness of `R₂` to the vertical composition
@@ -1693,6 +1874,25 @@ def ofAnnealEval (toAnneal : Mode → ModeA) (gate : Mode → Prog → Query →
   RetRel := RetRel
   UnwRel := UnwRel
 
+/--
+Choice-gated variant of `ofAnnealEval`: the deterministic Anneal evaluator
+emits an execution only along choices admitted by `validChoice`, avoiding
+vacuous fault-reflection obligations on invalid reference choices.
+-/
+def ofAnnealEvalGated (toAnneal : Mode → ModeA)
+    (gate : Mode → Prog → Query → Prop)
+    (validChoice : Mode → Prog → Query → Choice → Prop)
+    (evalA : ModeA → Prog → Query → ExecOutcome4 RetA UnwA)
+    (ExecR : Mode → Prog → Query → Choice → ExecOutcome4 RetR UnwR → Prop)
+    (RetRel : RetA → RetR → Prop) (UnwRel : UnwA → UnwR → Prop) :
+    ModeParamStepRel Mode Prog Query Choice RetA RetR UnwA UnwR where
+  SupportGate := gate
+  ExecA := fun m p q c out =>
+    validChoice m p q c ∧ evalA (toAnneal m) p q = out
+  ExecR := ExecR
+  RetRel := RetRel
+  UnwRel := UnwRel
+
 end ModeParamStepRel
 
 namespace ModeStepSim
@@ -1725,6 +1925,34 @@ def fromAnnealEval (toAnneal : Mode → ModeA)
   forward_total := fun m p q c outR hg hR =>
     ⟨evalA (toAnneal m) p q, rfl, fwd m p q c outR hg hR⟩
   reverse_fault_total := fun m p q c k hg hA => rev m p q c k hg hA
+  reverse_total? := revTotal?
+
+/--
+Choice-gated version of `fromAnnealEval`: fault reflection is required only on
+choices satisfying `validChoice`, and forward totality certifies that every
+reference execution uses a valid choice.
+-/
+def fromAnnealEvalGated (toAnneal : Mode → ModeA)
+    (gate : Mode → Prog → Query → Prop)
+    (validChoice : Mode → Prog → Query → Choice → Prop)
+    (evalA : ModeA → Prog → Query → ExecOutcome4 RetA UnwA)
+    (ExecR : Mode → Prog → Query → Choice → ExecOutcome4 RetR UnwR → Prop)
+    (RetRel : RetA → RetR → Prop) (UnwRel : UnwA → UnwR → Prop)
+    (fwd : ∀ m p q c out, gate m p q → ExecR m p q c out →
+      validChoice m p q c ∧
+      ChoiceCoupledOutcomeRel RetRel UnwRel (evalA (toAnneal m) p q) out)
+    (rev : ∀ m p q c k, gate m p q → validChoice m p q c →
+      evalA (toAnneal m) p q = .fault k → ExecR m p q c (.fault k))
+    (revTotal? : Option (PLift
+      (ModeParamStepRel.ofAnnealEvalGated toAnneal gate validChoice evalA ExecR
+        RetRel UnwRel).ReverseTotal) := none) :
+    ModeStepSim
+      (ModeParamStepRel.ofAnnealEvalGated toAnneal gate validChoice evalA ExecR
+        RetRel UnwRel) where
+  forward_total := fun m p q c outR hg hR =>
+    let ⟨hvc, hc⟩ := fwd m p q c outR hg hR
+    ⟨evalA (toAnneal m) p q, ⟨hvc, rfl⟩, hc⟩
+  reverse_fault_total := fun m p q c k hg hA => rev m p q c k hg hA.1 hA.2
   reverse_total? := revTotal?
 
 end ModeStepSim
@@ -1953,6 +2181,155 @@ theorem threeWayNormalAgreement_rep
   refine ⟨hMRrep.trans hLMrep.symm, a, ?_, eA⟩
   rw [hMRrep]
   exact B.codec.decode_encode a
+
+/--
+Under the hypotheses of `threeWayNormalAgreement`, both authorities' shared
+representations are canonical (`B.codec.ValidRep`).
+-/
+theorem threeWayNormalAgreement_validRep
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM)
+    {mMR : ModeMR} {mLM : ModeLM} (hmode : B.toAnnealMR mMR = B.toAnnealLM mLM)
+    {p : Prog} {q : Query} (hgMR : B.mrRel.SupportGate mMR p q)
+    (hgLM : B.lmRel.SupportGate mLM p q)
+    (hdet : ∀ out out', B.ExecAnneal (B.toAnnealMR mMR) p q out →
+      B.ExecAnneal (B.toAnnealMR mMR) p q out' → out = out')
+    {cMR : ChoiceMR} {rMR : RetMR}
+    (hMR : B.mrRel.ExecR mMR p q cMR (.normal rMR))
+    {cLM : ChoiceLM} {rLM : RetLM}
+    (hLM : B.lmRel.ExecR mLM p q cLM (.normal rLM)) :
+    B.codec.ValidRep (B.repMR rMR) ∧ B.codec.ValidRep (B.repLM rLM) := by
+  obtain ⟨a, _, _, _, hMRrep, hLMrep⟩ :=
+    B.threeWayNormalAgreement hmode hgMR hgLM hdet hMR hLM
+  rw [hMRrep, hLMrep]
+  exact ⟨B.codec.encode_valid a, B.codec.encode_valid a⟩
+
+/-- Both authorities' `CorrespondenceClaim`s follow directly from a bundle. -/
+theorem correspondenceClaims
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM) :
+    CorrespondenceClaim B.mrRel ∧ CorrespondenceClaim B.lmRel :=
+  ⟨B.mrSim.correspondenceClaim, B.lmSim.correspondenceClaim⟩
+
+/-- Both authorities' `FaultEquivClaim`s follow directly from a bundle. -/
+theorem faultEquivClaims
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM) :
+    FaultEquivClaim B.mrRel ∧ FaultEquivClaim B.lmRel :=
+  ⟨B.mrSim.faultEquivClaim, B.lmSim.faultEquivClaim⟩
+
+/--
+**Cross-authority well-formedness equivalence.** At matched Anneal modes inside
+both support gates, well-formedness of `MiniRust`, well-formedness of
+`LeanMiri`, and fault-freedom of the single Anneal model are pairwise
+equivalent.
+-/
+theorem crossAuthorityWellFormedEquiv
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM)
+    {mMR : ModeMR} {mLM : ModeLM} (hmode : B.toAnnealMR mMR = B.toAnnealLM mLM)
+    {p : Prog} {q : Query} (hgMR : B.mrRel.SupportGate mMR p q)
+    (hgLM : B.lmRel.SupportGate mLM p q) :
+    (B.mrRel.WellFormedRef mMR p q ↔
+      ∀ k, ¬ B.ExecAnneal (B.toAnnealMR mMR) p q (.fault k)) ∧
+    (B.lmRel.WellFormedRef mLM p q ↔
+      ∀ k, ¬ B.ExecAnneal (B.toAnnealLM mLM) p q (.fault k)) ∧
+    (B.mrRel.WellFormedRef mMR p q ↔ B.lmRel.WellFormedRef mLM p q) := by
+  have hMR : B.mrRel.WellFormedRef mMR p q ↔
+      ∀ k, ¬ B.ExecAnneal (B.toAnnealMR mMR) p q (.fault k) := by
+    constructor
+    · intro hwf k hA
+      obtain ⟨c, hA'⟩ := (B.anneal_exec_coherent.1 mMR p q (.fault k)).mpr hA
+      exact hwf c k (B.mrSim.reverse_fault_total mMR p q c k hgMR hA')
+    · intro hwf c k hR
+      have hA := (B.mrSim.faultEquivClaim mMR p q k hgMR).mpr ⟨c, hR⟩
+      exact hwf k ((B.anneal_exec_coherent.1 mMR p q (.fault k)).mp hA)
+  have hLM : B.lmRel.WellFormedRef mLM p q ↔
+      ∀ k, ¬ B.ExecAnneal (B.toAnnealLM mLM) p q (.fault k) := by
+    constructor
+    · intro hwf k hA
+      obtain ⟨c, hA'⟩ := (B.anneal_exec_coherent.2 mLM p q (.fault k)).mpr hA
+      exact hwf c k (B.lmSim.reverse_fault_total mLM p q c k hgLM hA')
+    · intro hwf c k hR
+      have hA := (B.lmSim.faultEquivClaim mLM p q k hgLM).mpr ⟨c, hR⟩
+      exact hwf k ((B.anneal_exec_coherent.2 mLM p q (.fault k)).mp hA)
+  have hBoth : B.mrRel.WellFormedRef mMR p q ↔ B.lmRel.WellFormedRef mLM p q :=
+    by
+    rw [hMR, hLM, hmode]
+  exact ⟨hMR, hLM, hBoth⟩
+
+/--
+Project the flip-direction guards to the single Anneal model: on each
+authority's flip witness pair, `ExecAnneal` is well-formed and returns normally
+on the positive input and faults on the negative input, and neither authority
+nor Anneal has a constant outcome class inside the gate.
+-/
+theorem projectFlip
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM) :
+    ((∃ a, B.ExecAnneal (B.toAnnealMR B.mrFlip.m) B.mrFlip.pOk B.mrFlip.qOk
+          (.normal a)) ∧
+      (∀ k, ¬ B.ExecAnneal (B.toAnnealMR B.mrFlip.m) B.mrFlip.pOk B.mrFlip.qOk
+          (.fault k)) ∧
+      B.ExecAnneal (B.toAnnealMR B.mrFlip.m) B.mrFlip.pFault B.mrFlip.qFault
+        (.fault B.mrFlip.kind)) ∧
+    ((∃ a, B.ExecAnneal (B.toAnnealLM B.lmFlip.m) B.lmFlip.pOk B.lmFlip.qOk
+          (.normal a)) ∧
+      (∀ k, ¬ B.ExecAnneal (B.toAnnealLM B.lmFlip.m) B.lmFlip.pOk B.lmFlip.qOk
+          (.fault k)) ∧
+      B.ExecAnneal (B.toAnnealLM B.lmFlip.m) B.lmFlip.pFault B.lmFlip.qFault
+        (.fault B.lmFlip.kind)) := by
+  constructor
+  · obtain ⟨a, _, hA, _, _⟩ := B.mrFlip.okAgree
+    refine ⟨⟨a, (B.anneal_exec_coherent.1 _ _ _ _).mp ⟨_, hA⟩⟩, ?_,
+      (B.anneal_exec_coherent.1 _ _ _ _).mp ⟨_, B.mrFlip.faultA⟩⟩
+    intro k hk
+    obtain ⟨c, hc⟩ := (B.anneal_exec_coherent.1 _ _ _ _).mpr hk
+    exact B.mrFlip.wfOkA c k hc
+  · obtain ⟨a, _, hA, _, _⟩ := B.lmFlip.okAgree
+    refine ⟨⟨a, (B.anneal_exec_coherent.2 _ _ _ _).mp ⟨_, hA⟩⟩, ?_,
+      (B.anneal_exec_coherent.2 _ _ _ _).mp ⟨_, B.lmFlip.faultA⟩⟩
+    intro k hk
+    obtain ⟨c, hc⟩ := (B.anneal_exec_coherent.2 _ _ _ _).mpr hk
+    exact B.lmFlip.wfOkA c k hc
+
+/--
+Restrict/reindex a bundle's authority modes along maps `fMR` and `fLM` that
+need not be surjective: only preimages of the witness modes are required.
+-/
+def restrictMode {ModeMR' : Type uMM'} {ModeLM' : Type uML'}
+    (B : DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR
+      ChoiceMR RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM)
+    (fMR : ModeMR' → ModeMR) (fLM : ModeLM' → ModeLM)
+    (mMRPos mMRFlt mMRFlip : ModeMR') (hMRPos : fMR mMRPos = B.mrPositive.m)
+    (hMRFlt : fMR mMRFlt = B.mrFault.m) (hMRFlip : fMR mMRFlip = B.mrFlip.m)
+    (mLMPos mLMFlt mLMFlip : ModeLM') (hLMPos : fLM mLMPos = B.lmPositive.m)
+    (hLMFlt : fLM mLMFlt = B.lmFault.m) (hLMFlip : fLM mLMFlip = B.lmFlip.m)
+    (mrMode? : Option (ModeSensitivityWitness (B.mrRel.liftMode fMR)) := none)
+    (lmMode? : Option (ModeSensitivityWitness (B.lmRel.liftMode fLM)) := none) :
+    DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR' ChoiceMR
+      RetMR UnwMR ModeLM' ChoiceLM RetLM UnwLM where
+  codec := B.codec
+  repMR := B.repMR
+  repLM := B.repLM
+  mrRel := B.mrRel.liftMode fMR
+  lmRel := B.lmRel.liftMode fLM
+  mrSim := B.mrSim.liftMode fMR
+  lmSim := B.lmSim.liftMode fLM
+  mr_ret_codec := B.mr_ret_codec
+  lm_ret_codec := B.lm_ret_codec
+  toAnnealMR := fun m => B.toAnnealMR (fMR m)
+  toAnnealLM := fun m => B.toAnnealLM (fLM m)
+  ExecAnneal := B.ExecAnneal
+  anneal_exec_coherent :=
+    ⟨fun m p q out => B.anneal_exec_coherent.1 (fMR m) p q out,
+     fun m p q out => B.anneal_exec_coherent.2 (fLM m) p q out⟩
+  mrPositive := B.mrPositive.liftModeAt fMR mMRPos hMRPos
+  lmPositive := B.lmPositive.liftModeAt fLM mLMPos hLMPos
+  mrFault := B.mrFault.liftModeAt fMR mMRFlt hMRFlt
+  lmFault := B.lmFault.liftModeAt fLM mLMFlt hLMFlt
+  mrFlip := B.mrFlip.liftModeAt fMR mMRFlip hMRFlip mrMode?
+  lmFlip := B.lmFlip.liftModeAt fLM mLMFlip hLMFlip lmMode?
 
 /--
 Reindex the authority modes of a bundle along `fMR` / `fLM`. The sections
@@ -2276,6 +2653,67 @@ def fromDetEquiv (codec : CodecLaws RetA Rep) (repMR : RetMR → Rep)
         rw [← hA']
         exact hLM m p q c hg⟩⟩)
 
+/--
+Relational evaluation-equivalence constructor for nondeterministic Anneal
+models: unlike `fromEquiv` (which assumes a deterministic, choice-independent
+`evalA`), `ExecAnneal` and the choice-coupled Anneal executions `ExecAMR` /
+`ExecALM` are arbitrary relations, supporting nondeterministic modes such as
+NaN payload draws or allocator address draws.
+-/
+def fromRelEquiv (codec : CodecLaws RetA Rep) (repMR : RetMR → Rep)
+    (repLM : RetLM → Rep)
+    (ExecAnneal : ModeA → Prog → Query → ExecOutcome4 RetA UnwA → Prop)
+    (toAnnealMR : ModeMR → ModeA) (toAnnealLM : ModeLM → ModeA)
+    (mrRel : ModeParamStepRel ModeMR Prog Query ChoiceMR RetA RetMR UnwA UnwMR)
+    (lmRel : ModeParamStepRel ModeLM Prog Query ChoiceLM RetA RetLM UnwA UnwLM)
+    (hRetMR : ∀ a r, mrRel.RetRel a r → repMR r = codec.encode a)
+    (hRetLM : ∀ a r, lmRel.RetRel a r → repLM r = codec.encode a)
+    (hCohMR : ∀ m p q out,
+      (∃ c, mrRel.ExecA m p q c out) ↔ ExecAnneal (toAnnealMR m) p q out)
+    (hCohLM : ∀ m p q out,
+      (∃ c, lmRel.ExecA m p q c out) ↔ ExecAnneal (toAnnealLM m) p q out)
+    (fwdMR : mrRel.ForwardTotal) (revMR : mrRel.ReverseFaultTotal)
+    (fwdLM : lmRel.ForwardTotal) (revLM : lmRel.ReverseFaultTotal)
+    (mrPositive : PositiveWitness mrRel) (lmPositive : PositiveWitness lmRel)
+    (mrFault : FaultEquivWitness mrRel) (lmFault : FaultEquivWitness lmRel)
+    (hmMR : mrFault.m = mrPositive.m) (hmLM : lmFault.m = lmPositive.m)
+    (mrMode? : Option (ModeSensitivityWitness mrRel) := none)
+    (lmMode? : Option (ModeSensitivityWitness lmRel) := none)
+    (mrRevTotal? : Option (PLift mrRel.ReverseTotal) := none)
+    (lmRevTotal? : Option (PLift lmRel.ReverseTotal) := none) :
+    DualCorrespondenceBundle ModeA Prog Query RetA UnwA Rep ModeMR ChoiceMR
+      RetMR UnwMR ModeLM ChoiceLM RetLM UnwLM :=
+  let mrSim : ModeStepSim mrRel :=
+    { forward_total := fwdMR
+      reverse_fault_total := revMR
+      reverse_total? := mrRevTotal? }
+  let lmSim : ModeStepSim lmRel :=
+    { forward_total := fwdLM
+      reverse_fault_total := revLM
+      reverse_total? := lmRevTotal? }
+  { codec := codec
+    repMR := repMR
+    repLM := repLM
+    mrRel := mrRel
+    lmRel := lmRel
+    mrSim := mrSim
+    lmSim := lmSim
+    mr_ret_codec := hRetMR
+    lm_ret_codec := hRetLM
+    toAnnealMR := toAnnealMR
+    toAnnealLM := toAnnealLM
+    ExecAnneal := ExecAnneal
+    anneal_exec_coherent := ⟨hCohMR, hCohLM⟩
+    mrPositive := mrPositive
+    lmPositive := lmPositive
+    mrFault := mrFault
+    lmFault := lmFault
+    mrFlip :=
+      FlipDirectionWitness.ofFaultAndMode mrSim mrPositive mrFault hmMR mrMode?
+    lmFlip :=
+      FlipDirectionWitness.ofFaultAndMode lmSim lmPositive lmFault hmLM
+        lmMode? }
+
 end DualCorrespondenceBundle
 
 /-! ## 6. Worked instance: mode-sensitive checked division
@@ -2352,6 +2790,196 @@ theorem divBundle_fault_iff (m : Bool) (n : Nat) :
     (∃ c, divBundle.mrRel.ExecR m () (n, 0) c (.fault .undefined)) ↔
       (∃ c, divBundle.lmRel.ExecR m () (n, 0) c (.fault .undefined)) :=
   divBundle.crossAuthorityFaultEquiv rfl True.intro True.intro .undefined
+
+/-! ### Nondeterministic NaN-payload instance (`fromRelEquiv`)
+
+Exercises relational (nondeterministic) Anneal executions, a non-identity
+`CodecLaws` with a non-trivial `ValidRep`, distinct authority mode and return
+types (`ModeMR := Unit × Bool`, `ModeLM := Bool × Unit`, `RetMR := Nat × Bool`,
+`RetLM := Option Nat`), choice coupling over `Bool`, and a normal-outcome
+mode-sensitivity witness separating deterministic (`false`) from
+nondeterministic (`true`) NaN payload selection.
+-/
+
+/-- Canonical representation codec `(n, true)` for `Nat` into `Nat × Bool`. -/
+def nanRepCodec : CodecLaws Nat (Nat × Bool) where
+  encode := fun n => (n, true)
+  decode := fun p => if p.2 then some p.1 else none
+  ValidRep := fun p => p.2 = true
+  decode_encode := fun _ => rfl
+  encode_valid := fun _ => rfl
+  encode_decode_of_valid := fun p a hv hd => by
+    cases p with
+    | mk n b =>
+      have hb : b = true := hv
+      rw [hb] at hd ⊢
+      have ha : n = a := Option.some.inj hd
+      rw [ha]
+
+/-- Choice-indexed relational NaN execution: `q = 0` is UB; `q = 1` returns
+canonical payload `0` when `c = false` and alternate payload `1` when
+`nondet = true` and `c = true`; `q = n + 2` returns `n + 2` when `c = false`. -/
+def nanExecChoice (nondet : Bool) (_p : Unit) (q : Nat) (c : Bool)
+    (out : ExecOutcome4 Nat Unit) : Prop :=
+  match q with
+  | 0 => c = false ∧ out = .fault .undefined
+  | 1 =>
+    (c = false ∧ out = .normal 0) ∨
+      (nondet = true ∧ c = true ∧ out = .normal 1)
+  | n + 2 => c = false ∧ out = .normal (n + 2)
+
+/-- Aggregate nondeterministic Anneal executions of the NaN model. -/
+def nanExecAnneal (nondet : Bool) (p : Unit) (q : Nat)
+    (out : ExecOutcome4 Nat Unit) : Prop :=
+  ∃ c : Bool, nanExecChoice nondet p q c out
+
+/-- `MiniRust`-side step relation with `ModeMR := Unit × Bool` and
+`RetMR := Nat × Bool`. -/
+def nanMrRel :
+    ModeParamStepRel (Unit × Bool) Unit Nat Bool Nat (Nat × Bool) Unit Unit
+    where
+  SupportGate := fun _ _ _ => True
+  ExecA := fun m p q c out => nanExecChoice m.2 p q c out
+  ExecR := fun m p q c out =>
+    match out with
+    | .normal r => r.2 = true ∧ nanExecChoice m.2 p q c (.normal r.1)
+    | .unwind u => nanExecChoice m.2 p q c (.unwind u)
+    | .fault k => nanExecChoice m.2 p q c (.fault k)
+    | .diverge => nanExecChoice m.2 p q c .diverge
+  RetRel := fun a r => r = (a, true)
+  UnwRel := fun _ _ => True
+
+/-- `LeanMiri`-side step relation with `ModeLM := Bool × Unit` and
+`RetLM := Option Nat`. -/
+def nanLmRel :
+    ModeParamStepRel (Bool × Unit) Unit Nat Bool Nat (Option Nat) Unit Unit
+    where
+  SupportGate := fun _ _ _ => True
+  ExecA := fun m p q c out => nanExecChoice m.1 p q c out
+  ExecR := fun m p q c out =>
+    match out with
+    | .normal (some n) => nanExecChoice m.1 p q c (.normal n)
+    | .normal none => False
+    | .unwind u => nanExecChoice m.1 p q c (.unwind u)
+    | .fault k => nanExecChoice m.1 p q c (.fault k)
+    | .diverge => nanExecChoice m.1 p q c .diverge
+  RetRel := fun a r => r = some a
+  UnwRel := fun _ _ => True
+
+/-- `MiniRust` forward totality for `nanMrRel`. -/
+theorem nanMrRel_forward : nanMrRel.ForwardTotal := by
+  intro m p q c outR _ hR
+  cases outR with
+  | normal r =>
+    cases r with
+    | mk n b =>
+      obtain ⟨hb, hch⟩ := hR
+      have hb' : b = true := hb
+      rw [hb']
+      exact ⟨.normal n, hch, ChoiceCoupledOutcomeRel.ofNormal rfl⟩
+  | unwind u =>
+    exact ⟨.unwind u, hR, ChoiceCoupledOutcomeRel.ofUnwind True.intro⟩
+  | fault k => exact ⟨.fault k, hR, ChoiceCoupledOutcomeRel.ofFault k⟩
+  | diverge => exact ⟨.diverge, hR, ChoiceCoupledOutcomeRel.ofDiverge⟩
+
+/-- `LeanMiri` forward totality for `nanLmRel`. -/
+theorem nanLmRel_forward : nanLmRel.ForwardTotal := by
+  intro m p q c outR _ hR
+  cases outR with
+  | normal r =>
+    cases r with
+    | none => exact False.elim hR
+    | some n => exact ⟨.normal n, hR, ChoiceCoupledOutcomeRel.ofNormal rfl⟩
+  | unwind u =>
+    exact ⟨.unwind u, hR, ChoiceCoupledOutcomeRel.ofUnwind True.intro⟩
+  | fault k => exact ⟨.fault k, hR, ChoiceCoupledOutcomeRel.ofFault k⟩
+  | diverge => exact ⟨.diverge, hR, ChoiceCoupledOutcomeRel.ofDiverge⟩
+
+/-- `MiniRust` reverse totality for `nanMrRel`. -/
+theorem nanMrRel_reverse : nanMrRel.ReverseTotal := by
+  intro m p q c outA _ hA
+  cases outA with
+  | normal a =>
+    exact ⟨.normal (a, true), ⟨rfl, hA⟩, ChoiceCoupledOutcomeRel.ofNormal rfl⟩
+  | unwind u =>
+    exact ⟨.unwind u, hA, ChoiceCoupledOutcomeRel.ofUnwind True.intro⟩
+  | fault k => exact ⟨.fault k, hA, ChoiceCoupledOutcomeRel.ofFault k⟩
+  | diverge => exact ⟨.diverge, hA, ChoiceCoupledOutcomeRel.ofDiverge⟩
+
+/-- `LeanMiri` reverse totality for `nanLmRel`. -/
+theorem nanLmRel_reverse : nanLmRel.ReverseTotal := by
+  intro m p q c outA _ hA
+  cases outA with
+  | normal a =>
+    exact ⟨.normal (some a), hA, ChoiceCoupledOutcomeRel.ofNormal rfl⟩
+  | unwind u =>
+    exact ⟨.unwind u, hA, ChoiceCoupledOutcomeRel.ofUnwind True.intro⟩
+  | fault k => exact ⟨.fault k, hA, ChoiceCoupledOutcomeRel.ofFault k⟩
+  | diverge => exact ⟨.diverge, hA, ChoiceCoupledOutcomeRel.ofDiverge⟩
+
+/-- Nondeterministic dual-authority NaN bundle built via `fromRelEquiv`. -/
+def nanBundle :
+    DualCorrespondenceBundle Bool Unit Nat Nat Unit (Nat × Bool) (Unit × Bool)
+      Bool (Nat × Bool) Unit (Bool × Unit) Bool (Option Nat) Unit :=
+  DualCorrespondenceBundle.fromRelEquiv nanRepCodec (fun r => r)
+    (fun r => match r with | some n => (n, true) | none => (0, false))
+    nanExecAnneal (fun m => m.2) (fun m => m.1) nanMrRel nanLmRel
+    (fun _ _ h => h)
+    (fun _ _ h => by rw [h]; rfl)
+    (fun _ _ _ _ => Iff.rfl)
+    (fun _ _ _ _ => Iff.rfl)
+    nanMrRel_forward (fun _ _ _ _ _ _ hA => hA)
+    nanLmRel_forward (fun _ _ _ _ _ _ hA => hA)
+    (PositiveWitness.ofReturns ((), true) () 2 false 2 (2, true) True.intro
+      (fun _ _ h => by cases h.2) ⟨rfl, rfl⟩ ⟨rfl, rfl, rfl⟩ rfl)
+    (PositiveWitness.ofReturns (true, ()) () 2 false 2 (some 2) True.intro
+      (fun _ _ h => by cases h.2) ⟨rfl, rfl⟩ ⟨rfl, rfl⟩ rfl)
+    { m := ((), true), p := (), q := 0, c := false, kind := .undefined
+      gate := True.intro, execA := ⟨rfl, rfl⟩, execR := ⟨rfl, rfl⟩ }
+    { m := (true, ()), p := (), q := 0, c := false, kind := .undefined
+      gate := True.intro, execA := ⟨rfl, rfl⟩, execR := ⟨rfl, rfl⟩ }
+    rfl rfl
+    (some
+      { m₁ := ((), true), m₂ := ((), false), p := (), q := 1, c := true
+        gate₁ := True.intro, gate₂ := True.intro
+        flips :=
+          ⟨.normal 1, .normal (1, true), Or.inr ⟨rfl, rfl, rfl⟩,
+            ⟨rfl, Or.inr ⟨rfl, rfl, rfl⟩⟩, ChoiceCoupledOutcomeRel.ofNormal rfl,
+            (fun _ h => by
+              cases h with
+              | inl h0 => cases h0.2
+              | inr h1 => cases h1.1),
+            (fun _ h => by
+              cases h.2 with
+              | inl h0 => cases h0.2
+              | inr h1 => cases h1.1)⟩ })
+    (some
+      { m₁ := (true, ()), m₂ := (false, ()), p := (), q := 1, c := true
+        gate₁ := True.intro, gate₂ := True.intro
+        flips :=
+          ⟨.normal 1, .normal (some 1), Or.inr ⟨rfl, rfl, rfl⟩,
+            Or.inr ⟨rfl, rfl, rfl⟩, ChoiceCoupledOutcomeRel.ofNormal rfl,
+            (fun _ h => by
+              cases h with
+              | inl h0 => cases h0.2
+              | inr h1 => cases h1.1),
+            (fun _ h => by
+              cases h with
+              | inl h0 => cases h0.2
+              | inr h1 => cases h1.1)⟩ })
+    (some ⟨nanMrRel_reverse⟩) (some ⟨nanLmRel_reverse⟩)
+
+/-- `nanBundle` is genuinely nondeterministic at `q = 1` in nondet mode. -/
+theorem nanBundle_nondet :
+    nanBundle.ExecAnneal true () 1 (.normal 0) ∧
+      nanBundle.ExecAnneal true () 1 (.normal 1) :=
+  ⟨⟨false, Or.inl ⟨rfl, rfl⟩⟩, ⟨true, Or.inr ⟨rfl, rfl, rfl⟩⟩⟩
+
+/-- `nanBundle` satisfies cross-authority well-formedness equivalence. -/
+theorem nanBundle_crossAuthorityWellFormed (m : Bool) (q : Nat) :
+    nanBundle.mrRel.WellFormedRef ((), m) () q ↔
+      nanBundle.lmRel.WellFormedRef (m, ()) () q :=
+  (nanBundle.crossAuthorityWellFormedEquiv rfl True.intro True.intro).2.2
 
 end Example
 
