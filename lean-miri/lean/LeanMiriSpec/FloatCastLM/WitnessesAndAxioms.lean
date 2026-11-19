@@ -8,14 +8,16 @@ This file may not be copied, modified, or distributed except according to
 those terms.
 -/
 
+import LeanMiriSpec.Correspondence.WitLM1_2
+import LeanMiriSpec.FloatCastLM.RealStepIndirect
 import LeanMiriSpec.FloatCastLM.DetModeAndBoundaries
 
 /-!
 # Float-cast witnesses and axiom guards (`LeanMiriSpec.FloatCastLM.WitnessesAndAxioms`)
 
-Final layer (Parts 10 and 11 and the axiom guards) of the IEEE-754 float-cast correspondence;
-see the umbrella module `LeanMiriSpec.FloatCastLM` for the architectural overview and the
-submodule map.
+Final layer (Parts 10 and 11 and the axiom guards, joining `RealStepIndirect` and
+`DetModeAndBoundaries`) of the IEEE-754 float-cast correspondence; see the umbrella module
+`LeanMiriSpec.FloatCastLM` for the architectural overview and the submodule map.
 
 * **Part 10. Concrete edge-case witnesses**: subnormal / tie / overflow, `isize` / `usize`, and
   4-vs-6 signaling-NaN candidate witnesses (`miri_u128_max_to_f32_inf`, ...,
@@ -26,9 +28,8 @@ submodule map.
   `floatWit_indirect_dst_step`, `floatWit_indirect_src_step`,
   `floatWit_nanChoice_pure4_out_of_range`).
 * **Axiom guards**: the `#guard_msgs (whitespace := lax) in #print axioms` guards for every
-  public theorem of `LeanMiriSpec.FloatCastLM` (all submodules; "this file" in the guard-section
-  prose refers to that whole development), pinned to the standard axioms `propext`,
-  `Classical.choice`, and `Quot.sound`.
+  public theorem of `LeanMiriSpec.FloatCastLM` across all submodules, pinned to the standard axioms
+  `propext`, `Classical.choice`, and `Quot.sound`.
 -/
 
 namespace LeanMiriSpec.Correspondence
@@ -2060,7 +2061,7 @@ info: 'LeanMiriSpec.Correspondence.step_cast_f16_f128_move_target_boundary' depe
 #print axioms step_cast_f16_f128_move_target_boundary
 
 /-! Axiom guards for the remaining public theorems (helpers, `_mode` variants, and witnesses): together
-with the guards above, every public theorem of this file is pinned to the standard axioms. -/
+with the guards above, every public theorem of `LeanMiriSpec.FloatCastLM` is pinned to the standard axioms. -/
 
 /--
 info: 'LeanMiriSpec.Correspondence.floatOps_engine_ok' depends on axioms: [propext]

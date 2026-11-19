@@ -13,8 +13,9 @@ import LeanMiriSpec.FloatCastLM.RealStepDirect
 /-!
 # Memory-backed real-step float-cast simulation (`LeanMiriSpec.FloatCastLM.RealStepIndirect`)
 
-Third layer (Part 8b) of the IEEE-754 float-cast correspondence; see the umbrella module
-`LeanMiriSpec.FloatCastLM` for the architectural overview and the submodule map.
+Third layer (Part 8b, parallel sibling of `DetModeAndBoundaries` over `RealStepDirect`) of the
+IEEE-754 float-cast correspondence; see the umbrella module `LeanMiriSpec.FloatCastLM` for the
+architectural overview and the submodule map.
 
 Real-step simulation for memory-backed locals:
 
@@ -221,12 +222,6 @@ theorem finish_write_anyLocal_from_mid_hooks
         hrel' hsz' hbool_val hchar_val halign_alloc' hshape_alloc' hinit_alloc' hread_alloc'
       rw [hb_eq, hsi_eq] at hstep_rel
       exact hstep_rel
-
-theorem IsFloatCastScalarTy.of_kind_eq {ty₁ ty₂ : Ty} (h : IsFloatCastScalarTy ty₂)
-    (hk : ty₁.kind = ty₂.kind) : IsFloatCastScalarTy ty₁ := by
-  rcases h with ⟨f, hf⟩ | ⟨t, ht⟩
-  · exact Or.inl ⟨f, by unfold ieeeFormatOfTy? at hf ⊢; rw [hk]; exact hf⟩
-  · exact Or.inr ⟨t, by unfold floatIntTargetOfTy? at ht ⊢; rw [hk]; exact ht⟩
 
 /-- Compositional frame-immediacy & `nextAllocId` preservation across a Miri step:
 whenever the step succeeds with `(m', .ok true)`, `nextAllocId` is unchanged (float casts

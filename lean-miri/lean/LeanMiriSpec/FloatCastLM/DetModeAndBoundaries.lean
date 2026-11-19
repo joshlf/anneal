@@ -8,13 +8,14 @@ This file may not be copied, modified, or distributed except according to
 those terms.
 -/
 
-import LeanMiriSpec.FloatCastLM.RealStepIndirect
+import LeanMiriSpec.FloatCastLM.RealStepDirect
 
 /-!
 # Deterministic NaN mode and boundaries (`LeanMiriSpec.FloatCastLM.DetModeAndBoundaries`)
 
-Fourth layer (Parts 8c, 8d, and 9) of the IEEE-754 float-cast correspondence; see the umbrella
-module `LeanMiriSpec.FloatCastLM` for the architectural overview and the submodule map.
+Third layer (Parts 8c, 8d, and 9, parallel sibling of `RealStepIndirect` over `RealStepDirect`) of
+the IEEE-754 float-cast correspondence; see the umbrella module `LeanMiriSpec.FloatCastLM` for the
+architectural overview and the submodule map.
 
 * **Part 8c. Deterministic NaN mode and NaN-choice refinement**:
   `step_cast_floatToFloat_{constant,copy,move}_deterministic_spec`,

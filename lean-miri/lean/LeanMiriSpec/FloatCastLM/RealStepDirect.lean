@@ -8,6 +8,7 @@ This file may not be copied, modified, or distributed except according to
 those terms.
 -/
 
+import LeanMiriSpec.Correspondence.SimLM3_1
 import LeanMiriSpec.FloatCastLM.CodecAndCast
 
 /-!

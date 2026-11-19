@@ -9,8 +9,8 @@ those terms.
 -/
 
 import Anneal.Mir.IeeeFloatCast
-import LeanMiriSpec.Correspondence.SimLM3_1
-import LeanMiriSpec.Correspondence.WitLM1_2
+import LeanMiriSpec.Correspondence.SimLM1_2
+import LeanMiriSpec.Correspondence.PtrLM3_1
 import Miri.Interpreter.Float
 import Miri.Interpreter.FloatOps
 import Miri.Interpreter.Cast
@@ -2861,6 +2861,12 @@ theorem IsFloatCastScalarTy.translateTy_eq {ty₁ ty₂ : Ty} (h : IsFloatCastSc
   · have ht₁ : floatIntTargetOfTy? ty₁ = some t := by
       unfold floatIntTargetOfTy? at ht ⊢; rw [hk]; exact ht
     rw [translateTy_of_floatIntTargetOfTy? ht layouts, translateTy_of_floatIntTargetOfTy? ht₁ layouts]
+
+theorem IsFloatCastScalarTy.of_kind_eq {ty₁ ty₂ : Ty} (h : IsFloatCastScalarTy ty₂)
+    (hk : ty₁.kind = ty₂.kind) : IsFloatCastScalarTy ty₁ := by
+  rcases h with ⟨f, hf⟩ | ⟨t, ht⟩
+  · exact Or.inl ⟨f, by unfold ieeeFormatOfTy? at hf ⊢; rw [hk]; exact hf⟩
+  · exact Or.inr ⟨t, by unfold floatIntTargetOfTy? at ht ⊢; rw [hk]; exact ht⟩
 
 theorem IsFloatCastScalarTy.not_bool_char {ty : Ty} (h : IsFloatCastScalarTy ty) :
     ty.kind ≠ .bool ∧ ty.kind ≠ .char := by

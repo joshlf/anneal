@@ -140,22 +140,27 @@ Every public theorem of this development carries a
 ## Submodule map
 
 This module is an umbrella: it declares nothing itself and re-exports the development, which is
-split into a linear chain of submodules (each importing the previous one) so that no single
-translation unit elaborates the whole development and per-file elaboration memory stays bounded.
-Every declaration lives in `namespace LeanMiriSpec.Correspondence`, so declaration names do not
-depend on the submodule layout, and `import LeanMiriSpec.FloatCastLM` provides all of them.
+split into a 4-layer acyclic diamond DAG of submodules with minimal per-layer imports
+(`SimLM3_1` is deferred to `RealStepDirect`, `WitLM1_2` to `WitnessesAndAxioms`, and
+`RealStepIndirect` and `DetModeAndBoundaries` are independent siblings over `RealStepDirect`) so
+that no single translation unit elaborates the whole development and per-file elaboration memory
+stays bounded. Every declaration lives in `namespace LeanMiriSpec.Correspondence`, so declaration
+names do not depend on the submodule layout, and `import LeanMiriSpec.FloatCastLM` provides all of
+them.
 
-1. `LeanMiriSpec.FloatCastLM.CodecAndCast` (Parts 0–7): vendored private-helper bridges,
+1. `LeanMiriSpec.FloatCastLM.CodecAndCast` (Parts 0–7; imports `SimLM1_2`, `PtrLM3_1`,
+   `IeeeFloatCast`, `Miri.Interpreter.{Float,FloatOps,Cast,Step}`): vendored private-helper bridges,
    formats and decoding, rounding and primitive casts, NaN classification and NaN choices, the
    float-cast hook overlay, `Cast.cast` simulation, the rvalue / step overlay with conservative
    extension, and the unified float-cast signature and results.
-2. `LeanMiriSpec.FloatCastLM.RealStepDirect` (Part 8): immediate-local real-step simulation in
-   `StateRelLM3_1` / `StepRelLM3_1`.
-3. `LeanMiriSpec.FloatCastLM.RealStepIndirect` (Part 8b): promoted (`allocMap`) and
-   stack-allocated (`LocalRel.indirect`) real-step simulation.
-4. `LeanMiriSpec.FloatCastLM.DetModeAndBoundaries` (Parts 8c, 8d, 9): deterministic NaN mode,
-   NaN-choice refinement, tightness of `FloatCastDetAgrees`, and the `bool` / `char` and
-   `f16` / `f128` boundaries.
-5. `LeanMiriSpec.FloatCastLM.WitnessesAndAxioms` (Parts 10, 11, axiom guards): concrete
-   edge-case witnesses, real-step non-vacuity witnesses, and all `#print axioms` guards.
+2. `LeanMiriSpec.FloatCastLM.RealStepDirect` (Part 8; imports `CodecAndCast`, `SimLM3_1`):
+   immediate-local real-step simulation in `StateRelLM3_1` / `StepRelLM3_1`.
+3. `LeanMiriSpec.FloatCastLM.RealStepIndirect` (Part 8b; imports `RealStepDirect`): promoted
+   (`allocMap`) and stack-allocated (`LocalRel.indirect`) real-step simulation.
+4. `LeanMiriSpec.FloatCastLM.DetModeAndBoundaries` (Parts 8c, 8d, 9; imports `RealStepDirect`):
+   deterministic NaN mode, NaN-choice refinement, tightness of `FloatCastDetAgrees`, and the
+   `bool` / `char` and `f16` / `f128` boundaries.
+5. `LeanMiriSpec.FloatCastLM.WitnessesAndAxioms` (Parts 10, 11, axiom guards; imports
+   `RealStepIndirect`, `DetModeAndBoundaries`, `WitLM1_2`): concrete edge-case witnesses,
+   real-step non-vacuity witnesses, and all `#print axioms` guards.
 -/
