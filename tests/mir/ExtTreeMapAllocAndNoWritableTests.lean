@@ -807,7 +807,7 @@ theorem canary_part2A_twoPass_vs_upstream_and_uninit_frozen :
   have hnodeProt := stepNodeOnRangeWrite_foreign_protected_conflict
     [7] 0 4
     { tag := 5, parentTag := some 1, perm := .unique, rangeOffset := 0, rangeLen := 4, protector := some 7 }
-    rfl rfl rfl (Or.inr (Or.inr (Or.inr (Or.inl rfl))))
+    rfl rfl rfl (Or.inr (Or.inr (Or.inl rfl)))
   have hdis := execFnEntryMutRetag_disabledGrandparent_diverges_from_upstream
   have hfrz := execFnEntryMutRetag_frozenParent_protectedChild_diverges_from_upstream
   exact ⟨hzst.1, hno, htwo, huninit.1, huninit.2.1, hlat, hpar, hnodeProt, ⟨_, hdis⟩, ⟨_, hfrz⟩⟩
@@ -1678,6 +1678,326 @@ theorem canary_part3C_widePtrLayout_malformedAlign_unsizedNestedRef_and_staticBy
   exact ⟨hwp.1, hwp.2.2.2.1, hwp.2.2.2.2.2.2.2, huns.1, huns.2, ⟨hfc1, hfc2, hfc3⟩,
     ⟨hst.2.2.1, hst.2.2.2.1, hst.2.2.2.2⟩⟩
 
+/-! ## Section 3D: Model 4 / Model 5 Retag Canaries and Nested Wide-Pointer Canaries -/
+
+private theorem ok_of_isOk {ε α : Type} {x : Except ε α} (h : x.isOk = true) : ∃ r, x = .ok r := by
+  cases x with
+  | ok r => exact ⟨r, rfl⟩
+  | error e => cases h
+
+private def isReservedIMInvariantFailure {α : Type} : Except RetagStepErr α → Bool
+  | .error (.protectedReservedIMInvariant _) => true
+  | _ => false
+
+private def disabledSubtreeWorld : FnEntryBorrowWorld where
+  nodes := [
+    ⟨0, none, .unique, 0, 4, none, true⟩,
+    ⟨1, some 0, .unique, 0, 4, none, true⟩,
+    ⟨2, some 0, .disabled, 0, 4, none, true⟩,
+    ⟨3, some 2, .cell, 0, 4, none, true⟩,
+    ⟨4, some 3, .unique, 0, 4, some 7, true⟩
+  ]
+  activeProtectors := [7]
+  nextTag := 5
+  nextProtector := 10
+
+private def frozenSubtreeWorld : FnEntryBorrowWorld where
+  nodes := [
+    ⟨0, none, .unique, 0, 4, none, true⟩,
+    ⟨1, some 0, .unique, 0, 4, none, true⟩,
+    ⟨2, some 0, .frozen, 0, 4, none, true⟩,
+    ⟨3, some 2, .unique, 0, 4, some 7, true⟩
+  ]
+  activeProtectors := [7]
+  nextTag := 4
+  nextProtector := 10
+
+private def protectedReservedIMWorld : FnEntryBorrowWorld where
+  nodes := [
+    ⟨0, none, .unique, 0, 4, none, true⟩,
+    ⟨1, some 0, .unique, 0, 4, none, true⟩,
+    ⟨2, some 0, .reservedIM, 0, 4, some 7, true⟩
+  ]
+  activeProtectors := [7]
+  nextTag := 3
+  nextProtector := 10
+
+theorem canary_part2A_upstream_childPerms_and_sharedScope :
+    (MiriRetagPolicyMirror.create ⟨true, true, false⟩ .mutable .fnEntry ⟨true, false⟩).map
+        (fun p => (p.freezePermission, p.nonfreezePermission, p.outsidePermission, p.protector)) =
+      some (.unique, .unique, .reservedFrz false, some .strongProtector) ∧
+    (MiriRetagPolicyMirror.create ⟨true, true, true⟩ .box .fnEntry ⟨true, true⟩).map
+        (fun p => (p.freezePermission, p.nonfreezePermission, p.outsidePermission, p.protector)) =
+      some (.reservedFrz false, .reservedFrz false, .reservedFrz false, some .weakProtector) ∧
+    selectFnEntryPolicy ⟨true, true, false⟩ .shared ⟨true, false⟩ = .rustcNoWritable ∧
+    (MiriRetagPolicyMirror.create ⟨true, true, false⟩ .shared .fnEntry ⟨true, false⟩).map
+        (fun p => (p.freezePermission, p.nonfreezePermission, p.outsidePermission, p.protector)) =
+      some (.frozen, .cell, .cell, some .strongProtector) := by
+  have h1 := fnEntry_mutOrBox_childPerms_eq_upstream_create ⟨true, true, false⟩ .mutable ⟨true, false⟩
+    (by decide)
+  have h2 := fnEntry_mutOrBox_childPerms_eq_upstream_create ⟨true, true, true⟩ .box ⟨true, true⟩
+    (by decide)
+  have h3 := fnEntry_shared_childPerms_outside_mut_models ⟨true, true, false⟩ ⟨true, false⟩
+  exact ⟨h1, h2, h3.1, h3.2⟩
+
+theorem canary_part2A_pruned_inversion_frozen_refinement_and_reservedIM :
+    (∃ w' c, execFnEntryMutRetagPrunedSourceOrder frozenSubtreeWorld 1 0 4 .rustcNoWritable false =
+        .ok (w', c) ∧
+      ∃ n' ∈ w'.nodes, n' = ⟨2, some 0, .frozen, 0, 4, none, true⟩) ∧
+    (∃ w' c, execFnEntryMutRetagPrunedSourceOrder disabledSubtreeWorld 1 0 4 .writableChildWrite false =
+        .ok (w', c) ∧
+      c = 5 ∧ w'.activeProtectors = [10, 7] ∧ w'.nextTag = 6 ∧
+      ∃ nodes', w'.nodes = ⟨5, some 1, .unique, 0, 4, some 10, true⟩ :: nodes') ∧
+    (∃ w4, execFnEntryMutRetagPrunedSourceOrder multiLevelBorrowWorld 2 0 4 .writableChildWrite false =
+        .ok (w4, 10) ∧
+      w4.nodes.length = 5 ∧ w4.nextProtector = 101) ∧
+    isReservedIMInvariantFailure
+      (execFnEntryMutRetagPrunedSourceOrder frozenSubtreeWorld 1 0 4 .writableChildWrite false) = false ∧
+    execFnEntryMutRetagPrunedSourceOrder protectedReservedIMWorld 1 0 4 .rustcNoWritable false =
+      .error (.protectedReservedIMInvariant 2) := by
+  refine ⟨?_, ?_, ?_, ?_, rfl⟩
+  · obtain ⟨⟨w', c⟩, hok⟩ := ok_of_isOk
+      (rfl : (execFnEntryMutRetagPrunedSourceOrder frozenSubtreeWorld 1 0 4 .rustcNoWritable false).isOk = true)
+    obtain ⟨n', hn', _, _, _, hsame⟩ :=
+      prunedSourceOrder_rustcNoWritable_preserves_all_frozen_nodes frozenSubtreeWorld w' 1 0 4 c false hok
+        ⟨2, some 0, .frozen, 0, 4, none, true⟩ (by decide) rfl
+    exact ⟨w', c, hok, n', hn', hsame rfl⟩
+  · obtain ⟨⟨w', c⟩, hok⟩ := ok_of_isOk
+      (rfl : (execFnEntryMutRetagPrunedSourceOrder disabledSubtreeWorld 1 0 4 .writableChildWrite false).isOk = true)
+    obtain ⟨_, _, hc, hprot, hnt, _, nodes', hnodes, _⟩ :=
+      execFnEntryMutRetagPrunedSourceOrder_writableChildWrite_ok_inv disabledSubtreeWorld w' 1 0 4 c false
+        (by decide) hok
+    exact ⟨w', c, hok, hc, hprot, hnt, nodes', hnodes⟩
+  · obtain ⟨⟨w3, c3⟩, h3⟩ := ok_of_isOk
+      (rfl : (execFnEntryMutRetagSourceOrder multiLevelBorrowWorld 2 0 4 .writableChildWrite false).isOk = true)
+    obtain ⟨w4, h4, _, _, _, _, _⟩ :=
+      execFnEntryMutRetagSourceOrder_ok_imp_prunedSourceOrder_ok multiLevelBorrowWorld w3 2 0 4 c3
+        .writableChildWrite false h3
+    obtain ⟨_, _, hc, _, _, hnp, nodes', hnodes, hrel⟩ :=
+      execFnEntryMutRetagPrunedSourceOrder_writableChildWrite_ok_inv multiLevelBorrowWorld w4 2 0 4 c3 false
+        (by decide) h4
+    subst hc
+    refine ⟨w4, h4, ?_, hnp⟩
+    rw [hnodes, List.length_cons, ListRel.length_eq hrel]
+    rfl
+  · have hwf : NoProtectedReservedIM frozenSubtreeWorld := by
+      intro n hn hperm
+      simp only [frozenSubtreeWorld, List.mem_cons, List.not_mem_nil, or_false] at hn
+      rcases hn with rfl | rfl | rfl | rfl <;> cases hperm
+    have hne := prunedSourceOrder_never_reservedIMInvariant_of_noProtectedReservedIM frozenSubtreeWorld hwf
+      1 0 4 .writableChildWrite false
+    cases hr : execFnEntryMutRetagPrunedSourceOrder frozenSubtreeWorld 1 0 4 .writableChildWrite false with
+    | ok r => rfl
+    | error e =>
+      cases e with
+      | protectedReservedIMInvariant t => exact absurd hr (hne t)
+      | _ => rfl
+
+private def twoProtectedSiblingsWorld : FnEntryBorrowWorld where
+  nodes := [
+    ⟨0, none, .unique, 0, 4, none, true⟩,
+    ⟨1, some 0, .unique, 0, 4, none, true⟩,
+    ⟨2, some 0, .unique, 0, 4, some 7, true⟩,
+    ⟨3, some 0, .unique, 0, 4, some 8, true⟩
+  ]
+  activeProtectors := [7, 8]
+  nextTag := 4
+  nextProtector := 10
+
+theorem canary_part2A_traversalOrder_foreign_error_attribution :
+    (foreignVisitScheduleNodes (childTagsInListOrder twoProtectedSiblingsWorld.nodes)
+        twoProtectedSiblingsWorld 1 true 0 4).map (·.tag) = [3, 2] ∧
+    execFnEntryMutRetagPrunedSourceOrder twoProtectedSiblingsWorld 1 0 4 .writableChildWrite =
+      .error (.protectedForeignConflict 2) ∧
+    execFnEntryMutRetagTraversalOrder (childTagsInListOrder twoProtectedSiblingsWorld.nodes)
+        twoProtectedSiblingsWorld 1 0 4 .writableChildWrite = .error (.protectedForeignConflict 3) ∧
+    execFnEntryMutRetagTraversalOrder (childTagsInListOrder twoProtectedSiblingsWorld.nodes)
+        twoProtectedSiblingsWorld 1 0 4 .rustcNoWritable = .error (.protectedForeignConflict 3) ∧
+    (∃ n ∈ foreignVisitScheduleNodes (childTagsInListOrder twoProtectedSiblingsWorld.nodes)
+        twoProtectedSiblingsWorld 1 true 0 4,
+      n.isProtected twoProtectedSiblingsWorld.activeProtectors = true ∧ n.tag = 3) ∧
+    (∃ r, execFnEntryMutRetagTraversalOrder (childTagsInListOrder disabledSubtreeWorld.nodes)
+        disabledSubtreeWorld 1 0 4 .writableChildWrite false = .ok r ∧ r.2 = 5) := by
+  have hsep := execFnEntryMutRetagTraversalOrder_foreignErrorTag_separation
+  refine ⟨hsep.1, hsep.2.1, hsep.2.2.1, hsep.2.2.2.2, ?_, ?_⟩
+  · rcases execFnEntryMutRetagTraversalOrder_error_cases
+        (childTagsInListOrder twoProtectedSiblingsWorld.nodes) twoProtectedSiblingsWorld 1 0 4
+        .writableChildWrite false _ hsep.2.2.1 with h4 | ⟨_, n, hn, hprot, he⟩
+    · have h2 : execFnEntryMutRetagPrunedSourceOrder twoProtectedSiblingsWorld 1 0 4 .writableChildWrite false =
+          .error (.protectedForeignConflict 2) := hsep.2.1
+      rw [h2] at h4
+      simp at h4
+    · rcases he with he | he
+      · injection he with ht
+        exact ⟨n, hn, hprot, ht.symm⟩
+      · cases he
+  · obtain ⟨⟨w', c⟩, hok⟩ := ok_of_isOk
+      (rfl : (execFnEntryMutRetagPrunedSourceOrder disabledSubtreeWorld 1 0 4 .writableChildWrite false).isOk = true)
+    have h5 := (execFnEntryMutRetagTraversalOrder_ok_iff_prunedSourceOrder_ok
+      (childTagsInListOrder disabledSubtreeWorld.nodes) disabledSubtreeWorld 1 0 4 .writableChildWrite false
+      (w', c)).2 hok
+    obtain ⟨_, _, hc, _⟩ :=
+      execFnEntryMutRetagPrunedSourceOrder_writableChildWrite_ok_inv disabledSubtreeWorld w' 1 0 4 c false
+        (by decide) hok
+    exact ⟨(w', c), h5, hc⟩
+
+theorem canary_part3_isizeMax_access_gate_and_vtable_layout_consistency :
+    KeyedAllocWorld.empty.checkPtrAccess none 9223372036854775808 = false ∧
+    (KeyedAllocWorld.empty.insertLive id10 ⟨18446744073709551615, 0, .heap, .mut, []⟩).checkPtrAccess
+      (some (id10, 0)) 9223372036854775807 = true ∧
+    (KeyedAllocWorld.empty.insertLive id10 ⟨18446744073709551615, 0, .heap, .mut, []⟩).checkPtrAccess
+      (some (id10, 0)) 9223372036854775808 = false ∧
+    (∃ lay, computeTyLayout (.uint 4) = .ok lay ∧ lay.sizeBytes = 4 ∧ lay.alignBytes = 4) ∧
+    (buildPrincipalLessVTable (.uint 8) 504 none 0 0 [.send]).layoutConsistent = false ∧
+    validateWideDynSafePtrDeep KeyedAllocWorld.empty VTableRegistry.empty
+      (fun _ => ⟨none, AutoTraitSet.empty, []⟩) (fun _ => none) .null .null
+      ⟨none, AutoTraitSet.empty, []⟩ true true = .error .invalidVTableNull := by
+  have hgate := checkPtrAccess_size_exceeding_isizeMax_rejected KeyedAllocWorld.empty none
+    9223372036854775808 (by decide)
+  have hlive : (KeyedAllocWorld.empty.insertLive id10 ⟨18446744073709551615, 0, .heap, .mut, []⟩).findLive?
+      id10 = some ⟨18446744073709551615, 0, .heap, .mut, []⟩ := by
+    simp [KeyedAllocWorld.insertLive, KeyedAllocWorld.findLive?, ExtTreeMap0.get?_insert_self]
+  have hbound := checkPtrAccess_isizeMax_boundary
+    (KeyedAllocWorld.empty.insertLive id10 ⟨18446744073709551615, 0, .heap, .mut, []⟩) id10
+    ⟨18446744073709551615, 0, .heap, .mut, []⟩ hlive rfl
+  obtain ⟨lay, hl, _, hs, ha, _, _⟩ := VTableData.layoutConsistent_spec
+    (buildPrincipalLessVTable (.uint 4) 502 none 4 2 [.send]) rfl
+  have hdeep := (validateWideDynSafePtrDeep_nonrecursive_eq_root KeyedAllocWorld.empty VTableRegistry.empty
+    (fun _ => ⟨none, AutoTraitSet.empty, []⟩) (fun _ => none) .null .null
+    ⟨none, AutoTraitSet.empty, []⟩ true true 64 rfl).trans
+    (wideDyn_doubleNull_separation KeyedAllocWorld.empty VTableRegistry.empty
+      ⟨none, AutoTraitSet.empty, []⟩ true false)
+  exact ⟨hgate, hbound.1, hbound.2, ⟨lay, hl, hs.symm, ha.symm⟩, rfl, hdeep⟩
+
+theorem canary_part3C_nested_wide_pointer_validation :
+    checkNestedWideSafeRefChildSession (fun _ _ => .ok (0, 1)) (.slice (.uint 4))
+      [(16, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0, none),
+       (2, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0, none)] = .ok () ∧
+    checkNestedWideSafeRefChildSession (fun _ _ => .ok (0, 1)) (.slice (.uint 4))
+      [(16, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0, none),
+       (0, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0x40, none)] =
+      .error .nestedSliceTooBig ∧
+    checkNestedWideSafeRefChildSession (fun _ _ => .error .nestedInvalidVTable) (.dynamic "Send")
+      (List.replicate 16 (0, none)) = .error .nestedInvalidVTable ∧
+    checkNestedWideSafeRefChildSession (fun _ _ => .ok (4, 4)) (.dynamic "Send")
+      [(66, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0, none),
+       (0, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0, none)] =
+      .error (.nestedUnalignedSafeRef 4 66) ∧
+    visitConcreteValue 1 (encodeLeUInt64Bytes 0 ++ encodeLeUInt64Bytes 0) 0 (.rawPtr false (.dynamic "Send"))
+      (fun _ _ => .error .nestedInvalidVTable) = .error .nestedInvalidVTable ∧
+    visitConcreteValue 1 (encodeLeUInt64Bytes 0 ++ encodeLeUInt64Bytes 0) 0 (.rawPtr false (.dynamic "Send"))
+      (fun _ _ => .ok (4, 4)) = .ok () ∧
+    visitConcreteValue 1 (encodeLeUInt64Bytes 16) 0 (.ref false (.slice (.uint 4))) =
+      .error .outOfBoundsPointeeRead ∧
+    visitConcreteValue 4 (encodeLeUInt64Bytes 16 ++ encodeLeUInt64Bytes 2) 0
+      (.ref false (.slice (.uint 4))) = .ok () ∧
+    visitConcreteValue 4 (encodeLeUInt64Bytes 16 ++ List.replicate 8 MemByte.uninit) 0
+      (.ref false (.slice (.uint 4))) = .error .uninitPointeeByte ∧
+    visitConcreteValue 4 (encodeLeUInt64Bytes 16 ++ encodeLeUInt64Bytes 32) 0
+      (.ref false (.dynamic "Send")) = .error .nestedDynVTableUnresolved ∧
+    dynSizeAlign (.sliceLen 3) (.tuple [.uint 1, .slice (.uint 4)]) = .ok (16, 4) ∧
+    dynSizeAlign (.vtable 4 4) (.tuple [.uint 1, .dynamic "Send"]) = .ok (8, 4) ∧
+    worldNestedDynOracle KeyedAllocWorld.empty VTableRegistry.empty
+      (fun _ => ⟨none, AutoTraitSet.empty, []⟩) (fun _ => none) "Send" (List.replicate 8 (0, none)) =
+      .error .nestedInvalidVTable ∧
+    decodeVTableWord (fun _ => none) (List.replicate 8 (0, none)) = .null := by
+  have hslice1 := (checkNestedWideSafeRefChildSession_slice (fun _ _ => .ok (0, 1)) (.uint 4)
+    ⟨4, 4, true, true, none⟩
+    [(16, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0, none),
+     (2, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0, none)] rfl rfl).trans rfl
+  have hslice2 := (checkNestedWideSafeRefChildSession_slice (fun _ _ => .ok (0, 1)) (.uint 4)
+    ⟨4, 4, true, true, none⟩
+    [(16, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0, none),
+     (0, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0x40, none)] rfl rfl).trans rfl
+  have hdyn1 := (checkNestedWideSafeRefChildSession_dyn (fun _ _ => .error .nestedInvalidVTable) "Send"
+    (List.replicate 16 (0, none))).trans rfl
+  have hdyn2 := (checkNestedWideSafeRefChildSession_dyn (fun _ _ => .ok (4, 4)) "Send"
+    [(66, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0, none),
+     (0, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0, none), (0, none)]).trans rfl
+  have hraw1 := (visitConcreteValue_nestedRawWideDyn 0 (encodeLeUInt64Bytes 0 ++ encodeLeUInt64Bytes 0) 0
+    false "Send" (fun _ _ => .error .nestedInvalidVTable)).trans rfl
+  have hraw2 := (visitConcreteValue_nestedRawWideDyn 0 (encodeLeUInt64Bytes 0 ++ encodeLeUInt64Bytes 0) 0
+    false "Send" (fun _ _ => .ok (4, 4))).trans rfl
+  have hfull := (visitConcreteValue_nestedWideRef_reads_full_pointer 0 (encodeLeUInt64Bytes 16) 0 false
+    (.slice (.uint 4)) NestedDynMetaOracle.failClosed (Or.inl rfl)).trans rfl
+  have hcases := visitConcreteValue_nestedWidePointer_cases
+  have hdst := dynSizeAlign_customDst_cases
+  have horacle := (worldNestedDynOracle_spec KeyedAllocWorld.empty VTableRegistry.empty
+    (fun _ => ⟨none, AutoTraitSet.empty, []⟩) (fun _ => none) "Send" (List.replicate 8 (0, none))).2
+    .invalidVTableNull rfl
+  have hdecode := decodeVTableWord_cases
+  exact ⟨hslice1, hslice2, hdyn1, hdyn2, hraw1, hraw2, hfull, hcases.1, hcases.2.2.2.2.1,
+    hcases.2.2.2.2.2.2.2.2.2.2.1, hdst.1, hdst.2.1, horacle, hdecode.1⟩
+
+theorem canary_part3C_deep_validator_nested_dyn_and_layout_mismatch :
+    let spec : DynExistentialSpec := ⟨none, AutoTraitSet.ofList [.send], []⟩
+    let rt : String → DynExistentialSpec := fun _ => spec
+    let idVtOuter : MiriAllocId := ⟨1, by decide⟩
+    let idVtInner : MiriAllocId := ⟨2, by decide⟩
+    let idVtRaw : MiriAllocId := ⟨3, by decide⟩
+    let idVtBad : MiriAllocId := ⟨4, by decide⟩
+    let idLive : MiriAllocId := ⟨10, by decide⟩
+    let vtOuter := buildPrincipalLessVTable (.ref false (.dynamic "Send")) 501 none 16 3 [.send]
+    let vtInner := buildPrincipalLessVTable (.uint 4) 502 none 4 2 [.send]
+    let vtRaw := buildPrincipalLessVTable (.rawPtr false (.dynamic "Send")) 503 none 16 3 [.send]
+    let vtBad := buildPrincipalLessVTable (.uint 8) 504 none 0 0 [.send]
+    let reg : VTableRegistry :=
+      { keyToAlloc := ExtTreeMap0.empty
+        allocToData := (((ExtTreeMap0.empty.insert idVtOuter vtOuter).insert idVtInner vtInner).insert idVtRaw vtRaw).insert idVtBad vtBad }
+    let wBase : KeyedAllocWorld :=
+      (((KeyedAllocWorld.empty.registerGlobal idVtOuter ⟨.vtable, 24, 3, .not, []⟩).registerGlobal idVtInner ⟨.vtable, 24, 3, .not, []⟩).registerGlobal idVtRaw ⟨.vtable, 24, 3, .not, []⟩).registerGlobal idVtBad ⟨.vtable, 24, 3, .not, []⟩
+    let vb : MiriAllocId → Option UInt64 := fun q => if q = idVtInner then some 4096 else none
+    let wGood := wBase.insertLive idLive
+      ⟨16, 3, .stack, .mut, encodeLeUInt64Bytes 64 ++ encodeLeUInt64Bytes 4096 (some idVtInner)⟩
+    let wNullVt := wBase.insertLive idLive
+      ⟨16, 3, .stack, .mut, encodeLeUInt64Bytes 64 ++ encodeLeUInt64Bytes 0⟩
+    let wU64 := wBase.insertLive idLive ⟨8, 3, .stack, .mut, encodeLeUInt64Bytes 7⟩
+    validateWideDynSafePtrWithBytes wGood reg (.provenanced idVtOuter 0) (.provenanced idLive 0 16) spec false true =
+      .error (.pointeeErr .nestedDynVTableUnresolved) ∧
+    validateWideDynSafePtrDeep wGood reg rt vb (.provenanced idVtOuter 0) (.provenanced idLive 0 16) spec false true =
+      .ok vtOuter ∧
+    validateWideDynSafePtrDeep wNullVt reg rt vb (.provenanced idVtOuter 0) (.provenanced idLive 0 16) spec false true =
+      .error (.pointeeErr .nestedInvalidVTable) ∧
+    validateWideDynSafePtrDeep wNullVt reg rt vb (.provenanced idVtRaw 0) (.provenanced idLive 0 16) spec false true =
+      .error (.pointeeErr .nestedInvalidVTable) ∧
+    validateWideDynSafePtrWithBytes wU64 reg (.provenanced idVtBad 0) (.provenanced idLive 4 16) spec false true =
+      .error (.pointeeErr .outOfBoundsPointeeRead) ∧
+    validateWideDynSafePtrDeep wU64 reg rt vb (.provenanced idVtBad 0) (.provenanced idLive 4 16) spec false true =
+      .error (.pointeeErr .vtableLayoutMismatch) := by
+  have h := wideDynDeep_nestedDyn_rawDyn_and_layoutMismatch
+  exact ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2⟩
+
+theorem canary_part3C_deep_validator_rejects_inconsistent_vtable_layout :
+    let spec : DynExistentialSpec := ⟨none, AutoTraitSet.ofList [.send], []⟩
+    let vtBad := buildPrincipalLessVTable (.uint 8) 504 none 0 0 [.send]
+    let reg : VTableRegistry :=
+      { keyToAlloc := ExtTreeMap0.empty, allocToData := ExtTreeMap0.empty.insert id1 vtBad }
+    let w : KeyedAllocWorld :=
+      (KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not, []⟩).insertLive id10 entryU64
+    validateWideDynSafePtr w reg (.provenanced id1 0) (.provenanced id10 0 16) spec false false = .ok vtBad ∧
+    validateWideDynSafePtrDeep w reg (fun _ => spec) (fun _ => none) (.provenanced id1 0)
+      (.provenanced id10 0 16) spec false true = .error (.pointeeErr .vtableLayoutMismatch) := by
+  dsimp only
+  let spec : DynExistentialSpec := ⟨none, AutoTraitSet.ofList [.send], []⟩
+  let vtBad := buildPrincipalLessVTable (.uint 8) 504 none 0 0 [.send]
+  let reg : VTableRegistry :=
+    { keyToAlloc := ExtTreeMap0.empty, allocToData := ExtTreeMap0.empty.insert id1 vtBad }
+  let w : KeyedAllocWorld :=
+    (KeyedAllocWorld.empty.registerGlobal id1 ⟨.vtable, 24, 3, .not, []⟩).insertLive id10 entryU64
+  have hvt : validateVTableHalf w reg (.provenanced id1 0) spec = .ok vtBad := by
+    have hmatch : vtableMatchesExpectedSpec vtBad.spec spec = true := rfl
+    have hg : w.findGlobal? id1 = some ⟨.vtable, 24, 3, .not, []⟩ := by
+      simp [w, KeyedAllocWorld.findGlobal?, KeyedAllocWorld.insertLive, KeyedAllocWorld.registerGlobal,
+        ExtTreeMap0.get?_insert_self]
+    have hd : reg.allocToData.get? id1 = some vtBad := by
+      simp [reg, ExtTreeMap0.get?_insert_self]
+    simp [validateVTableHalf, hg, hd, hmatch]
+  have hroot := (wideDyn_zstConcrete_never_dangles w reg (.provenanced id1 0) spec vtBad id10 0 16
+    hvt rfl rfl (by decide)).1
+  have hdeep := validateWideDynSafePtrDeep_layoutMismatch_rejected w reg (fun _ => spec) (fun _ => none)
+    (.provenanced id1 0) (.provenanced id10 0 16) spec 64 vtBad hroot rfl
+  exact ⟨hroot, hdeep⟩
+
 /-! ## Section 4: Fast `M = 16` Closed Workload Canary -/
 
 private def mkSmallAllocId (n : Nat) (h : n < 1000) : MiriAllocId :=
@@ -1974,6 +2294,104 @@ info: 'Anneal.ExtTreeMapAllocAndNoWritable.wideDyn_recursive_staticGlobal_bytes_
 -/
 #guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.wideDyn_recursive_staticGlobal_bytes_validated
 
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.fnEntry_mutOrBox_childPerms_eq_upstream_create' does not depend on any axioms
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.fnEntry_mutOrBox_childPerms_eq_upstream_create
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.fnEntry_shared_childPerms_outside_mut_models' does not depend on any axioms
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.fnEntry_shared_childPerms_outside_mut_models
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.prunedSourceOrder_rustcNoWritable_preserves_all_frozen_nodes' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.prunedSourceOrder_rustcNoWritable_preserves_all_frozen_nodes
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.execFnEntryMutRetagSourceOrder_ok_imp_prunedSourceOrder_ok' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execFnEntryMutRetagSourceOrder_ok_imp_prunedSourceOrder_ok
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.execFnEntryMutRetagPrunedSourceOrder_error_provenance' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execFnEntryMutRetagPrunedSourceOrder_error_provenance
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.prunedSourceOrder_never_reservedIMInvariant_of_noProtectedReservedIM' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.prunedSourceOrder_never_reservedIMInvariant_of_noProtectedReservedIM
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.execFnEntryMutRetagTraversalOrder_ok_iff_prunedSourceOrder_ok' depends on axioms: [propext]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execFnEntryMutRetagTraversalOrder_ok_iff_prunedSourceOrder_ok
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.execFnEntryMutRetagTraversalOrder_error_cases' depends on axioms: [propext]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execFnEntryMutRetagTraversalOrder_error_cases
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.execFnEntryMutRetagTraversalOrder_foreignErrorTag_separation' depends on axioms: [propext]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execFnEntryMutRetagTraversalOrder_foreignErrorTag_separation
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.checkPtrAccess_size_exceeding_isizeMax_rejected' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.checkPtrAccess_size_exceeding_isizeMax_rejected
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.VTableData.layoutConsistent_spec' depends on axioms: [propext]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.VTableData.layoutConsistent_spec
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.validateWideDynSafePtrDeep_layoutMismatch_rejected' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.validateWideDynSafePtrDeep_layoutMismatch_rejected
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.checkNestedWideSafeRefChildSession_slice' depends on axioms: [propext]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.checkNestedWideSafeRefChildSession_slice
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.checkNestedWideSafeRefChildSession_dyn' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.checkNestedWideSafeRefChildSession_dyn
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.visitConcreteValue_nestedRawWideDyn' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.visitConcreteValue_nestedRawWideDyn
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.visitConcreteValue_nestedWidePointer_cases' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.visitConcreteValue_nestedWidePointer_cases
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.worldNestedDynOracle_spec' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.worldNestedDynOracle_spec
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.wideDynDeep_nestedDyn_rawDyn_and_layoutMismatch' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.wideDynDeep_nestedDyn_rawDyn_and_layoutMismatch
+
 /-! ## Section 6: Meta-Level `run_cmd` Audit & Rolled-Back Self-Tests -/
 
 section MetaAudit
@@ -2194,6 +2612,70 @@ private def hasTheoryThmPlaceholderBinding (env : Environment) (theoryModIdx? : 
     (e : Expr) : Bool :=
   hasPlaceholderBindingWith (exprMentionsAuditedThm env theoryModIdx?) e
 
+/-- Detect constructor-projection laundering: a projection (`Expr.proj` or a projection function such
+as `And.right`) applied directly to a constructor application of a `Prop`-valued structure whose
+DISCARDED field satisfies `mentions` (e.g. `(⟨theoryThm, trivial⟩ : _ ∧ _).2`). Such a term mentions the
+theorem in a live position while throwing its content away, defeating dead-binding detection.
+DAG-aware. -/
+private partial def hasDiscardedCtorFieldWith (env : Environment) (mentions : Expr → Bool) (e : Expr) : Bool :=
+  ((go e).run {}).1
+where
+  discarded (ctorApp : Expr) (keep : Nat) : Bool :=
+    match ctorApp.getAppFn with
+    | .const c _ =>
+      match env.find? c with
+      | some (.ctorInfo v) =>
+        -- Only `Prop`-valued structures (`And`, `Iff`, theory invariants): projecting a DATA field out of
+        -- a record literal is ordinary computation, not proof laundering.
+        let isPropStruct :=
+          match env.find? v.induct with
+          | some (.inductInfo iv) => iv.type.getForallBody.isProp
+          | _ => false
+        let args := ctorApp.getAppArgs
+        isPropStruct &&
+          (List.range v.numFields).any fun j =>
+            j != keep &&
+              (match args[v.numParams + j]? with
+               | some a => mentions a
+               | none => false)
+      | _ => false
+    | _ => false
+  go (e : Expr) : StateM (Std.HashSet Expr) Bool := do
+    if (← get).contains e then return false
+    modify fun vis => vis.insert e
+    match e with
+    | .proj _ idx s =>
+      if discarded s idx then return true
+      go s
+    | .app fn arg =>
+      let head := e.getAppFn
+      let args := e.getAppArgs
+      let laundered : Bool :=
+        match head with
+        | .const c _ =>
+          match env.getProjectionFnInfo? c with
+          | some info =>
+            match args[info.numParams]? with
+            | some structArg => discarded structArg info.i
+            | none => false
+          | none => false
+        | _ => false
+      if laundered then return true
+      if ← go fn then return true
+      go arg
+    | .lam _ d b _ =>
+      if ← go d then return true
+      go b
+    | .forallE _ d b _ =>
+      if ← go d then return true
+      go b
+    | .letE _ t v b _ =>
+      if ← go t then return true
+      if ← go v then return true
+      go b
+    | .mdata _ inner => go inner
+    | _ => return false
+
 /-- Strip `let`/`letFun` wrappers from a `Prop` expression for tautology inspection. -/
 private partial def stripLetBindings (e : Expr) : Expr :=
   match e with
@@ -2209,7 +2691,8 @@ private partial def stripLetBindings (e : Expr) : Expr :=
     else e
 
 /-- Check whether a `Prop` expression contains a tautological conjunct (`a = a`, `a ↔ a`, `True`,
-`False → P`, `P ∨ True`, `a ≤ a`, `(x == x) = true`). -/
+`False → P`, `P ∨ True`, `a ≤ a`, `a ≥ a`, `HEq a a`, `¬ False`, `(x == x) = true`), also underneath
+existential binders (`∃ x, True`, `∃ x, x = x`, `∃ x, P x ∧ x = x`). -/
 private partial def hasTautologicalConjunct (e : Expr) : Bool :=
   let e' := stripLetBindings e
   let head := e'.getAppFn
@@ -2232,6 +2715,16 @@ private partial def hasTautologicalConjunct (e : Expr) : Bool :=
     stripLetBindings args[0]! == stripLetBindings args[1]!
   else if head.isConstOf ``LE.le && args.size == 4 then
     stripLetBindings args[2]! == stripLetBindings args[3]!
+  else if head.isConstOf ``GE.ge && args.size == 4 then
+    stripLetBindings args[2]! == stripLetBindings args[3]!
+  else if head.isConstOf ``HEq && args.size == 4 then
+    stripLetBindings args[1]! == stripLetBindings args[3]!
+  else if head.isConstOf ``Not && args.size == 1 then
+    (stripLetBindings args[0]!).getAppFn.isConstOf ``False
+  else if head.isConstOf ``Exists && args.size == 2 then
+    match stripLetBindings args[1]! with
+    | .lam _ _ body _ => hasTautologicalConjunct body
+    | _ => false
   else
     match e' with
     | .forallE _ d _ _ => (stripLetBindings d).getAppFn.isConstOf ``False
@@ -2267,6 +2760,7 @@ run_cmd do
   let mut closedCanaries : List Name := []
   let mut unsafeDecls : List Name := []
   let mut placeholderDecls : List Name := []
+  let mut launderedDecls : List Name := []
   let mut tautologyCanaries : List Name := []
   let mut conditionalCanaries : List Name := []
 
@@ -2285,6 +2779,8 @@ run_cmd do
         if let some val := ci.value? (allowOpaque := true) then
           if hasTheoryThmPlaceholderBinding env theoryModIdx? val then
             placeholderDecls := nm :: placeholderDecls
+          if hasDiscardedCtorFieldWith env (exprMentionsAuditedThm env theoryModIdx?) val then
+            launderedDecls := nm :: launderedDecls
 
   for (nm, ci) in env.constants.map₂.toList do
     -- Skip the meta-audit helpers themselves (MetaAudit uses `Lean.Elab` / `NameSet`, not object-level proofs)
@@ -2299,7 +2795,7 @@ run_cmd do
         s == "collectPrunedReachableClosure" || s == "exprMentionsAudited" ||
         s == "exprMentionsAuditedThm" || s == "hasPlaceholderBindingWith" ||
         s == "hasPlaceholderBinding" || s == "hasTheoryThmPlaceholderBinding" ||
-        s == "stripLetBindings" ||
+        s == "hasDiscardedCtorFieldWith" || s == "stripLetBindings" ||
         s == "hasTautologicalConjunct" || s == "checkDeclAxioms" ||
         s == "isConditionalPublicTestThm"
       | _ => false
@@ -2307,6 +2803,7 @@ run_cmd do
         s == "collectTransitiveClosure" || s == "collectPrunedExprConsts" ||
         s == "collectPrunedReachableClosure" || s == "hasPlaceholderBindingWith" ||
         s == "hasPlaceholderBinding" || s == "hasTheoryThmPlaceholderBinding" ||
+        s == "hasDiscardedCtorFieldWith" ||
         s == "stripLetBindings" || s == "hasTautologicalConjunct" ||
         s == "isCompilerGeneratedAuxThm" || s == "nameHasComponent" ||
         s == "isNonEmptyDigits" || s == "isDigitUnderscoreSuffix" || s == "hasNumericPrefix") then
@@ -2327,6 +2824,8 @@ run_cmd do
       if let some val := ci.value? (allowOpaque := true) then
         if hasPlaceholderBinding env theoryModIdx? val then
           placeholderDecls := nm :: placeholderDecls
+        if hasDiscardedCtorFieldWith env (exprMentionsAuditedThm env theoryModIdx?) val then
+          launderedDecls := nm :: launderedDecls
 
   -- Single-pass unpruned union axiom check (O(|reachable|)); per-decl blame only if a bad axiom is present
   let unionClosure := collectTransitiveClosure env auditedRoots
@@ -2354,6 +2853,8 @@ run_cmd do
     failures := m!"unexpected axioms (allowed: {allowedAxioms}): {badAxioms}" :: failures
   if !placeholderDecls.isEmpty then
     failures := m!"dead placeholder bindings found: {placeholderDecls}" :: failures
+  if !launderedDecls.isEmpty then
+    failures := m!"theory theorems discarded through constructor projections: {launderedDecls}" :: failures
   if !tautologyCanaries.isEmpty then
     failures := m!"tautological conjuncts in canaries: {tautologyCanaries}" :: failures
   if !conditionalCanaries.isEmpty then
@@ -2363,7 +2864,7 @@ run_cmd do
   if !failures.isEmpty then
     throwError m!"AUDIT FAILURE:\n{MessageData.joinSep failures.reverse "\n"}"
 
-  -- 12 Rolled-Back Self-Tests proving the audit detects every defect class with zero false positives
+  -- 17 Rolled-Back Self-Tests proving the audit detects every defect class with zero false positives
   -- Self-test 1: Classical.choice detection
   let st1 := (checkDeclAxioms env ``Classical.choice).contains ``Classical.choice
   unless st1 do throwError "SELF-TEST 1 FAILED: Classical.choice not caught"
@@ -2497,7 +2998,40 @@ run_cmd do
       (Expr.letE `unused (mkConst ``True) (mkConst ``MiriAllocId.ofUInt64_zero) (Expr.bvar 1) false) .default)
   unless st15 do throwError "SELF-TEST 15 FAILED: dead theorem placeholder inside lambda body not caught"
 
-  logInfo m!"audit passed: {totalDecls} declarations ({theoryPubThms.length} theory public theorems, {closedCanaries.length} closed test canaries, 0 unsafe, 0 Classical.choice, 0 Lean.ofReduceBool, 0 sorryAx, 0 unexpected axioms, 0 placeholder uses, 0 tautological conjuncts, 0 conditional test theorems, 100% pruned theorem reachability; 15/15 rolled-back self-tests passed)"
+  -- Self-test 16: constructor-projection laundering of a theory theorem is caught in BOTH forms
+  -- (`And.right ⟨thm, trivial⟩` and `Expr.proj`), while keeping the theorem's own field is not flagged
+  let tTrue := mkConst ``True
+  let andIntroThmFirst := mkApp4 (mkConst ``And.intro) tTrue tTrue
+    (mkConst ``MiriAllocId.ofUInt64_zero) (mkConst ``True.intro)
+  let launderApp := mkApp3 (mkConst ``And.right) tTrue tTrue andIntroThmFirst
+  let launderProj := Expr.proj ``And 1 andIntroThmFirst
+  let keepThm := mkApp3 (mkConst ``And.left) tTrue tTrue andIntroThmFirst
+  let mentionsThm := exprMentionsAuditedThm env theoryModIdx?
+  unless hasDiscardedCtorFieldWith env mentionsThm launderApp &&
+      hasDiscardedCtorFieldWith env mentionsThm launderProj &&
+      !hasDiscardedCtorFieldWith env mentionsThm keepThm do
+    throwError "SELF-TEST 16 FAILED: constructor-projection laundering not caught / falsely flagged"
+
+  -- Self-test 17: extended tautology shapes (`3 ≥ 3`, `¬ False`, `HEq 2 2`, `∃ x, True`, `∃ x, x = x`)
+  -- and a non-tautological existential false-positive guard (`∃ x, x = 2`)
+  let natTy := mkConst ``Nat
+  let tautGe := mkApp4 (mkConst ``GE.ge [Level.zero]) natTy (mkConst ``instLENat) (mkNatLit 3) (mkNatLit 3)
+  let tautNotFalse := mkApp (mkConst ``Not) (mkConst ``False)
+  let tautHEq := mkApp4 (mkConst ``HEq [Level.succ Level.zero]) natTy (mkNatLit 2) natTy (mkNatLit 2)
+  let tautExTrue := mkApp2 (mkConst ``Exists [Level.succ Level.zero]) natTy
+    (Expr.lam `x natTy (mkConst ``True) .default)
+  let tautExRefl := mkApp2 (mkConst ``Exists [Level.succ Level.zero]) natTy
+    (Expr.lam `x natTy
+      (mkApp3 (mkConst ``Eq [Level.succ Level.zero]) natTy (Expr.bvar 0) (Expr.bvar 0)) .default)
+  let nonTautEx := mkApp2 (mkConst ``Exists [Level.succ Level.zero]) natTy
+    (Expr.lam `x natTy
+      (mkApp3 (mkConst ``Eq [Level.succ Level.zero]) natTy (Expr.bvar 0) (mkNatLit 2)) .default)
+  unless hasTautologicalConjunct tautGe && hasTautologicalConjunct tautNotFalse &&
+      hasTautologicalConjunct tautHEq && hasTautologicalConjunct tautExTrue &&
+      hasTautologicalConjunct tautExRefl && !hasTautologicalConjunct nonTautEx do
+    throwError "SELF-TEST 17 FAILED: extended tautology detector missed a case / false positive"
+
+  logInfo m!"audit passed: {totalDecls} declarations ({theoryPubThms.length} theory public theorems, {closedCanaries.length} closed test canaries, 0 unsafe, 0 Classical.choice, 0 Lean.ofReduceBool, 0 sorryAx, 0 unexpected axioms, 0 placeholder uses, 0 constructor-projection launderings, 0 tautological conjuncts, 0 conditional test theorems, 100% pruned theorem reachability; 17/17 rolled-back self-tests passed)"
 
 end MetaAudit
 
