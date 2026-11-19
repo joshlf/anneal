@@ -28,7 +28,8 @@ base edit:
    final `(target_base, head)`, every open trust question is resolved by
    evidence or explicit human maintainer disposition, no confirmed in-scope
    defect remains unresolved, the PR description opens with an accurate `Human
-   review surface` block, and the Review Receipt is posted in a PR comment.
+   review surface` block, and the PR author or acting agent has posted a Review
+   Receipt comment covering the exact final `head` SHA.
 2. **Gate 2 — Genuine Codex approval:** An authentic
    `chatgpt-codex-connector[bot]` review summary covers the current PR head and
    comparison base on GitHub with no unresolved Codex findings. Resolving
@@ -60,22 +61,21 @@ base edit:
    `merge_base == target_base` before merging or entering GitHub's merge queue
    (`merge_group`).
 5. **Gate 5 — Human approval:** An independent human maintainer account (never
-   a bot or acting agent) has reacted with 👍 on the PR description, confirming
+   a bot or acting agent) has approved the pull request on GitHub, confirming
    every item listed in the `Human review surface` block (defined in
    [`AGENTS.md`](../AGENTS.md#code-review-rules), including stated specs and
    every definition their meaning transitively depends on, plus any editor or
-   agent config or intentional policy relaxation). A 👍 holds unless a
-   subsequent push changes this PR's own Human review surface (including any
-   helper, predicate, constant, type, or trait impl a stated spec transitively
-   depends on; verified via `git range-diff`: a pure rebase with zero edits to
-   those surfaces does not invalidate 👍) **or** a subsequent edit modifies the
-   PR description's `Human review surface` block or relevant commit bodies.
-   Verify that the 👍 reaction's timestamp is newer than both the last push
-   affecting those surfaces and the last edit to the `Human review surface`
-   block (via GitHub's PR description edit history); any later edit requires
-   fresh human maintainer confirmation. Because agents may act under
-   credentials matching a human account, agents must never add, toggle, or
-   remove approval reactions (👍), self-approve pull requests, or author, edit,
+   agent config or intentional policy relaxation). An approval holds across a
+   pure rebase only if no subsequent push changes this PR's own Human review
+   surface, no rebased-over commit modifies a definition in a stated spec's
+   transitive dependency closure (verified via `git range-diff` and inspecting
+   touched dependencies), and no subsequent edit modifies the PR description's
+   `Human review surface` block or relevant commit bodies. Verify that the
+   approval's timestamp is newer than both the last push affecting those
+   surfaces and the last edit to the `Human review surface` block (via GitHub's
+   PR description edit history); any later change requires fresh human
+   maintainer approval. Because agents may act under credentials matching a
+   human account, agents must never self-approve pull requests or author, edit,
    or simulate maintainer dispositions.
 
 ## Hosted reviewers and skill boundaries
