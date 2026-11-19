@@ -5738,6 +5738,7 @@ open MiniRustSpec.Correspondence in
   minirust_unwind_concrete_witnesses
   minirust_setDiscriminant_supported
   minirust_setDiscriminant_tagger_order
+  minirust_setDiscriminant_accesses_law
   minirust_resumeUnwind_teardown_error
   minirust_unwind_setDiscriminant_step_witness
   minirust_nested_unwind_step_witness

@@ -3821,9 +3821,12 @@ The `FnMut` accessor reads and writes `self`, so the machine is the state
 that `encodeDiscriminant` threads through it: every tag is checked against
 and stored into the memory left by the tags before it, in the iteration
 order of `tagger`. Each store covers exactly the bytes of one tag at its
-offset from the start of the place, so the bytes of the variant's fields are
-never written. A `tagger` without entries (the untagged variant of a niche
-layout) therefore leaves the machine as `eval_place` returned it. -/
+offset from the start of the place, and nothing else is written. That those
+bytes are not bytes of the variant's fields is a well-formedness condition
+on the enum type; upstream relies on it and does not check it here, and
+neither does this definition. A `tagger` without entries (the untagged
+variant of a niche layout) leaves the machine as `eval_place` returned
+it. -/
 def evalSetDiscriminant (m : Mach) (destination : PlaceExpr) (value : Int) : Interp Mach := do
   let ((place, ty), m) ← evalPlace m destination
   match ty with
@@ -5670,7 +5673,7 @@ The frame is popped and torn down exactly as in `evalReturn` (`deallocAll`),
 but no return value is loaded or stored, and the jump targets the caller's
 `unwind_block` instead of its `next_block`. The payload stack of the thread
 is left alone: the payload pushed by `Terminator::StartUnwind` stays on it
-until a `Terminator::StopUnwind` in some caller pops it. As in `evalReturn`,
+until a `Terminator::StopUnwind` pops it. As in `evalReturn`,
 `end_call` is the default trait method (`ret(())`) for `BasicMemory`, so it
 is the identity here. -/
 def evalResumeUnwind (m : Mach) : Interp Mach := do

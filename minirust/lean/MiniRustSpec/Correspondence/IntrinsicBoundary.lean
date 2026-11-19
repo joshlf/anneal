@@ -3513,6 +3513,199 @@ theorem minirust_setDiscriminant_tagger_order :
       .error (.ub "Tree Borrows: local write of Frozen reference")) :=
   ⟨⟨_, rfl, rfl, rfl⟩, ⟨_, rfl, rfl, rfl⟩, ⟨rfl, rfl⟩⟩
 
+/-- The `Store` access that `SetDiscriminant` records for one tagger entry of
+a place whose pointer has address `base`: it starts at the entry's offset from
+`base` and is as long as the entry's integer type. -/
+private def sdTagAccess (base : Int) (e : Gen.Offset × (Gen.IntType × Int)) : Gen.Access :=
+  ⟨.Store, .None, base + (e.1.bytes : Int), ⟨e.2.1.size.bytes⟩⟩
+
+/-- `Type.encodeInt` at `ity` yields exactly `ity.size.bytes` bytes. -/
+private theorem encodeInt_length {ity : Gen.IntType} {v : Val} {bytes : List Byte}
+    (h : Interp.Type.encodeInt ity v = .ok bytes) : bytes.length = ity.size.bytes := by
+  obtain ⟨signed, size⟩ := ity
+  cases v with
+  | Int i =>
+    simp only [Interp.Type.encodeInt] at h
+    cases henc : Interp.Endianness.encode Interp.x86_64.ENDIANNESS signed size i with
+    | none => simp [henc, specPanic] at h
+    | some data =>
+      simp only [henc, pure_ok, Except.ok.injEq] at h
+      subst h
+      simp only [Interp.Endianness.encode] at henc
+      split at henc
+      · simp only [Option.some.injEq] at henc
+        subst henc
+        simp [Interp.x86_64.ENDIANNESS, leBytes_length]
+      · cases henc
+  | _ => simp [Interp.Type.encodeInt, specPanic] at h
+
+/-- Polymorphic `Type.encodeIntM` at `ity` yields exactly `ity.size.bytes`
+bytes. -/
+private theorem encodeIntM_length {M : Type} [Gen.Memory M] {ity : Gen.IntType}
+    {v : Gen.Value M} {bytes : List (Gen.AbstractByte (Gen.Memory.Provenance M))}
+    (h : Interp.Type.encodeIntM (M := M) ity v = .ok bytes) :
+    bytes.length = ity.size.bytes := by
+  obtain ⟨signed, size⟩ := ity
+  cases v with
+  | Int i =>
+    simp only [Interp.Type.encodeIntM] at h
+    cases henc : Interp.Endianness.encode Interp.x86_64.ENDIANNESS signed size i with
+    | none => simp [henc, specPanic] at h
+    | some data =>
+      simp only [henc, pure_ok, Except.ok.injEq] at h
+      subst h
+      simp only [Interp.Endianness.encode] at henc
+      split at henc
+      · simp only [Option.some.injEq] at henc
+        subst henc
+        simp [Interp.x86_64.ENDIANNESS, leBytes_length]
+      · cases henc
+  | _ => simp [Interp.Type.encodeIntM, specPanic] at h
+
+/-- When every accessor call changes only `mem` and appends one `Store` of the
+written bytes at its offset from `base`, `encodeDiscriminant` changes only
+`mem` and appends one such `Store` per tagger entry, in entry order. -/
+private theorem encodeDiscriminant_accesses
+    {acc : Mach → Gen.Offset → List Byte → Interp Mach} (base : Int)
+    (hacc : ∀ s offset bytes s', acc s offset bytes = .ok s' →
+      (∃ cm, s' = { s with mem := cm }) ∧
+      s'.mem.accesses = s.mem.accesses ++
+        [⟨.Store, .None, base + (offset.bytes : Int), ⟨bytes.length⟩⟩])
+    (tagger : Map Gen.Offset (Gen.IntType × Int)) {s s' : Mach}
+    (h : Interp.encodeDiscriminant acc tagger s = .ok s') :
+    (∃ cm, s' = { s with mem := cm }) ∧
+    s'.mem.accesses = s.mem.accesses ++ tagger.entries.map (sdTagAccess base) := by
+  unfold Interp.encodeDiscriminant at h
+  generalize tagger.entries = entries at h ⊢
+  induction entries generalizing s with
+  | nil =>
+    cases h
+    exact ⟨⟨_, rfl⟩, by simp⟩
+  | cons e es ih =>
+    obtain ⟨offset, valueType, value⟩ := e
+    rw [List.foldlM_cons] at h
+    obtain ⟨s1, h1, h⟩ := interpBind_ok h
+    obtain ⟨bytes, henc, h1⟩ := interpBind_ok h1
+    obtain ⟨⟨cm1, rfl⟩, hacc1⟩ := hacc _ _ _ _ h1
+    obtain ⟨⟨cm2, rfl⟩, hacc2⟩ := ih h
+    refine ⟨⟨cm2, rfl⟩, ?_⟩
+    rw [hacc2, hacc1, encodeInt_length henc]
+    simp [sdTagAccess]
+
+/-- Polymorphic counterpart of `encodeDiscriminant_accesses`. -/
+private theorem encodeDiscriminantM_accesses {M : Type} [Gen.Memory M]
+    {acc : Gen.Machine M → Gen.Offset → List (Gen.AbstractByte (Gen.Memory.Provenance M)) →
+      Interp (Gen.Machine M)} (base : Int)
+    (hacc : ∀ s offset bytes s', acc s offset bytes = .ok s' →
+      (∃ cm, s' = { s with mem := cm }) ∧
+      s'.mem.accesses = s.mem.accesses ++
+        [⟨.Store, .None, base + (offset.bytes : Int), ⟨bytes.length⟩⟩])
+    (tagger : Map Gen.Offset (Gen.IntType × Int)) {s s' : Gen.Machine M}
+    (h : Interp.encodeDiscriminantM (M := M) acc tagger s = .ok s') :
+    (∃ cm, s' = { s with mem := cm }) ∧
+    s'.mem.accesses = s.mem.accesses ++ tagger.entries.map (sdTagAccess base) := by
+  unfold Interp.encodeDiscriminantM at h
+  generalize tagger.entries = entries at h ⊢
+  induction entries generalizing s with
+  | nil =>
+    cases h
+    exact ⟨⟨_, rfl⟩, by simp⟩
+  | cons e es ih =>
+    obtain ⟨offset, valueType, value⟩ := e
+    rw [List.foldlM_cons] at h
+    obtain ⟨s1, h1, h⟩ := interpBind_ok h
+    obtain ⟨bytes, henc, h1⟩ := interpBind_ok h1
+    obtain ⟨⟨cm1, rfl⟩, hacc1⟩ := hacc _ _ _ _ h1
+    obtain ⟨⟨cm2, rfl⟩, hacc2⟩ := ih h
+    refine ⟨⟨cm2, rfl⟩, ?_⟩
+    rw [hacc2, hacc1, encodeIntM_length henc]
+    simp [sdTagAccess]
+
+/-- **`Statement::SetDiscriminant` stores exactly the tags, in entry order
+(`minirust_setDiscriminant_accesses_law`)**: the concrete witnesses show on
+particular enums that only tag bytes are written. This is the general
+statement, for every machine, place, and enum type, on `Mach` and on
+polymorphic `Machine M` (`MachTB`): whenever `SetDiscriminant` succeeds on an
+aligned enum place with variant `value`,
+- the machine differs from the one `eval_place` returned only in `mem`, and
+- the access log grows by exactly one non-atomic `Store` per entry of the
+  variant's `tagger`, in the order of `tagger.entries`, each starting at the
+  entry's offset from the place and as long as the entry's integer type.
+
+So `SetDiscriminant` issues no load and no store outside the tag ranges, and
+never touches threads, frames, or the payload stack. The law is about which
+stores are issued. That a tag range is disjoint from the bytes of the
+variant's fields is a well-formedness property of the enum type, which
+`SetDiscriminant` does not check: the stores listed here are issued whether
+or not a tag range overlaps a field. -/
+theorem minirust_setDiscriminant_accesses_law :
+    (∀ (m m1 m' : Mach) (dst : Gen.PlaceExpr) (value : Int) (place : Gen.Place BM)
+        (vs : Map Int Gen.Variant) (dt : Gen.IntType) (d : Gen.Discriminator)
+        (sz : LibSpecr.Size) (al : LibSpecr.Align) (variant : Gen.Variant),
+      Interp.evalPlace m dst = .ok ((place, .Enum vs dt d sz al), m1) →
+      place.aligned = true → mapGet vs value = some variant →
+      Interp.evalStatement m (.SetDiscriminant dst value) = .ok m' →
+      (∃ cm, m' = { m1 with mem := cm }) ∧
+      m'.mem.accesses = m1.mem.accesses ++
+        variant.tagger.entries.map (sdTagAccess place.ptr.thin_pointer.addr)) ∧
+    (∀ {M : Type} [Gen.Memory M] [Interp.MemoryOps M] (m m1 m' : Gen.Machine M)
+        (dst : Gen.PlaceExpr) (value : Int) (place : Gen.Place M)
+        (vs : Map Int Gen.Variant) (dt : Gen.IntType) (d : Gen.Discriminator)
+        (sz : LibSpecr.Size) (al : LibSpecr.Align) (variant : Gen.Variant),
+      Interp.evalPlaceM m dst = .ok ((place, .Enum vs dt d sz al), m1) →
+      place.aligned = true → mapGet vs value = some variant →
+      Interp.evalStatementM m (.SetDiscriminant dst value) = .ok m' →
+      (∃ cm, m' = { m1 with mem := cm }) ∧
+      m'.mem.accesses = m1.mem.accesses ++
+        variant.tagger.entries.map (sdTagAccess place.ptr.thin_pointer.addr)) := by
+  refine ⟨?_, ?_⟩
+  · intro m m1 m' dst value place vs dt d sz al variant hp ha hsome h
+    simp only [Interp.evalStatement, Interp.evalSetDiscriminant, hp, ok_bind, ha,
+      Bool.not_true, Bool.false_eq_true, ↓reduceIte, hsome] at h
+    refine encodeDiscriminant_accesses place.ptr.thin_pointer.addr
+      (fun s offset bytes s' hs => ?_) variant.tagger h
+    obtain ⟨ptr, hptr, hs⟩ := interpBind_ok hs
+    obtain ⟨cm, hst, hs⟩ := interpBind_ok hs
+    cases hs
+    have haddr : ptr.addr = place.ptr.thin_pointer.addr + (offset.bytes : Int) := by
+      unfold Interp.ptrOffsetInbounds at hptr
+      obtain ⟨_, _, hptr⟩ := interpBind_ok hptr
+      split at hptr
+      · cases hptr
+      · split at hptr
+        · cases hptr
+        · cases hptr
+          rfl
+    have hlog : cm.accesses = s.mem.accesses ++ [⟨.Store, .None, ptr.addr, ⟨bytes.length⟩⟩] := by
+      unfold Interp.CM.store at hst
+      obtain ⟨_, _, hst⟩ := interpBind_ok hst
+      cases hst
+      rfl
+    exact ⟨⟨cm, rfl⟩, by rw [hlog, haddr]⟩
+  · intro M _ _ m m1 m' dst value place vs dt d sz al variant hp ha hsome h
+    simp only [Interp.evalStatementM, Interp.evalSetDiscriminantM, hp, ok_bind, ha,
+      Bool.not_true, Bool.false_eq_true, ↓reduceIte, hsome] at h
+    refine encodeDiscriminantM_accesses place.ptr.thin_pointer.addr
+      (fun s offset bytes s' hs => ?_) variant.tagger h
+    obtain ⟨ptr, hptr, hs⟩ := interpBind_ok hs
+    obtain ⟨cm, hst, hs⟩ := interpBind_ok hs
+    cases hs
+    have haddr : ptr.addr = place.ptr.thin_pointer.addr + (offset.bytes : Int) := by
+      unfold Interp.ptrOffsetInboundsM at hptr
+      obtain ⟨_, _, hptr⟩ := interpBind_ok hptr
+      split at hptr
+      · cases hptr
+      · split at hptr
+        · cases hptr
+        · cases hptr
+          rfl
+    have hlog : cm.accesses = s.mem.accesses ++ [⟨.Store, .None, ptr.addr, ⟨bytes.length⟩⟩] := by
+      unfold Interp.ConcurrentMemory.store at hst
+      obtain ⟨_, _, hst⟩ := interpBind_ok hst
+      cases hst
+      rfl
+    exact ⟨⟨cm, rfl⟩, by rw [hlog, haddr]⟩
+
 /-- **`ResumeUnwind` propagates a failing frame teardown
 (`minirust_resumeUnwind_teardown_error`)**: this closes the case analysis of
 `minirust_unwind_terminators_supported`, whose `ResumeUnwind` clauses assume
@@ -4208,8 +4401,8 @@ thread (`minirust_unwind_provenance_multithread_step_witness`)**:
      dereferences the caught pointer to load `0xBEEF` (`[0xEF, 0xBE]`) into
      `_0`, proving provenance survived the full unwind cycle (a provenance-free
      pointer would raise UB on dereference);
-   - thread `0` stays completely untouched (same state, stack, and payload list)
-     and step `7` hits `Unreachable`.
+   - thread `0` keeps its state, its payload list, and its stack depth (the
+     three things checked here), and step `7` hits `Unreachable`.
 2. Non-main thread `BottomOfStack` contrast (`active_thread = 1`): on both
    `Mach` and `MachTB`, `Terminator.Return` at `BottomOfStack` terminates
    thread `1` normally, whereas `Terminator.ResumeUnwind` on the exact same
