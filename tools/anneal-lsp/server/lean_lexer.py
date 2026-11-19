@@ -727,9 +727,8 @@ _NON_CMD_BEFORE_WORDS = frozenset(
     (
         "let", "have", "show", "exact", "apply", "refine", "return", "fun", "λ",
         "match", "if", "then", "else", "do", "by", "from", "with", "case", "cases",
-        "induction", "rcases", "obtain", "intro", "intros", "rw", "erw", "rewrite",
-        "simp", "dsimp", "simpa", "unfold", "change", "suffices", "where", "for",
-        "while", "unless",
+        "induction", "rcases", "obtain", "intro", "rw", "erw", "rewrite",
+        "unfold", "change", "suffices", "for", "while", "unless",
     )
 )  # fmt: skip
 _SCOPE_BLOCK_WINDOW = 8192
@@ -738,9 +737,9 @@ _SCOPE_RES = None  # compiled by `_scope_res` on first use
 
 
 def _scope_res():
-    """Compiled regex bundle `(name_re, part_re, bracket_re, line_re, cont_re, cmd_re,
-    strict_cmd_re, in_prefix_re, in_tok_re)` for `NamespaceTracker`, compiled once on
-    first use."""
+    """Compiled regex bundle `(name_re, part_re, bracket_re, quot_re, line_re, cont_re,
+    cmd_re, strict_cmd_re, in_prefix_re, in_tok_re)` for `NamespaceTracker`, compiled once
+    on first use."""
     global _SCOPE_RES
     if _SCOPE_RES is None:
         import re  # deferred: importing this module must stay cheap
@@ -749,13 +748,14 @@ def _scope_res():
         # (`λ`, `Π`, `Σ`), and Lean subscript letters/digits (`₀`..`ₜ`, `ᵢ`..`ᵪ`, `ⱼ`).
         id_start = r"[^\W\d\u03bb\u03a0\u03a3\u2080-\u209c\u1d62-\u1d6a\u2c7c]"
         part = rf"(?:{id_start}[\w'!?]*|«[^»\n]+»)"
-        name_re = re.compile(part + r"(?:\." + part + r")*")
-        part_re = re.compile(part)
-        bracket_re = re.compile(
+        gui_or_char = (
             r"«[^»\n]*»"
             r"|(?<![\w'!?\u00bb])'(?:\\(?:x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|.)|[^'\\\n])'"
-            r"|[\[\](){}]"
         )
+        name_re = re.compile(part + r"(?:\." + part + r")*")
+        part_re = re.compile(part)
+        bracket_re = re.compile(gui_or_char + r"|[\[\](){}⟨⟩]")
+        quot_re = re.compile(gui_or_char + r"|`[\(\[\{]|[\[\](){}⟨⟩]")
         line_re = re.compile(r"\n([ \t]*)(?=\S)")
         cont_re = re.compile(
             r"[ \t]*(?:\||where\b|termination_by\b|decreasing_by\b|deriving\b(?![ \t]+instance\b))"
@@ -783,14 +783,13 @@ def _scope_res():
             r"(?![\w'!?.])"
         )
         in_tok_re = re.compile(
-            r"«[^»\n]*»"
-            r"|(?<![\w'!?\u00bb])'(?:\\(?:x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|.)|[^'\\\n])'"
-            r"|[(){}\[\]\n;]|:=|(?<![\w'!?.\u00bb])in(?![\w'!?.\u00bb])"
+            gui_or_char + r"|[(){}\[\]⟨⟩\n;]|:=|(?<![\w'!?.\u00bb])in(?![\w'!?.\u00bb])"
         )
         _SCOPE_RES = (
             name_re,
             part_re,
             bracket_re,
+            quot_re,
             line_re,
             cont_re,
             cmd_re,
@@ -817,10 +816,8 @@ def _merge_spans(raw: list[tuple[int, int]]) -> list[tuple[int, int]]:
 
 
 def _closed_bracket_spans(stripped: str, bracket_re) -> list[tuple[int, int]]:
-    """Merged `(open_pos, close_pos)` intervals of balanced `()`, `[]`, `{}` groups in
-    `stripped`. Scope keywords inside a closed bracket group (such as syntax quotations
-    `` `(command| namespace Foo ... end Foo) `` or binder lists `(section : Nat)`) are data,
-    whereas an unclosed bracket in an incomplete proof never suppresses later commands."""
+    """Merged `(open_pos, close_pos)` intervals of balanced `()`, `[]`, `{}`, `⟨⟩` groups in
+    `stripped`."""
     stack: list[tuple[str, int]] = []
     raw: list[tuple[int, int]] = []
     for m in bracket_re.finditer(stripped):
@@ -838,36 +835,28 @@ def _closed_bracket_spans(stripped: str, bracket_re) -> list[tuple[int, int]]:
     return _merge_spans(raw)
 
 
-def _quotation_spans(stripped: str, bracket_re) -> list[tuple[int, int]]:
-    """Merged `(open_pos, close_pos)` spans of Lean syntax quotations (`` `(...) ``,
-    `` `[...] ``, `` `{...} ``)."""
+def _quotation_spans(stripped: str, quot_re) -> list[tuple[int, int]]:
+    """Single-pass `O(N)` merged `(open_pos, close_pos)` spans of Lean syntax quotations
+    (`` `(...) ``, `` `[...] ``, `` `{...} ``). An unclosed or mismatched earlier quotation
+    never aborts scanning subsequent quotations in the file."""
+    stack: list[tuple[str, int, bool]] = []
     spans: list[tuple[int, int]] = []
-    find = stripped.find
-    for opener, closer_ch in (("`(", ")"), ("`[", "]"), ("`{", "}")):
-        q = find(opener)
-        while q != -1:
-            open_pos = q + 1
-            stack = [closer_ch]
-            for m in bracket_re.finditer(stripped, open_pos + 1):
-                tok = m.group()
-                if len(tok) != 1:
-                    continue
-                c = _CLOSER_OF.get(tok)
-                if c is not None:
-                    stack.append(c)
-                elif tok == stack[-1]:
-                    stack.pop()
-                    if not stack:
-                        spans.append((open_pos, m.start()))
-                        q = find(opener, m.end())
-                        break
-                else:
-                    q = find(opener, m.end())
-                    break
-            else:
-                q = -1
-            if q != -1 and q <= open_pos:
-                q = find(opener, open_pos + 1)
+    for m in quot_re.finditer(stripped):
+        tok = m.group()
+        if len(tok) == 2 and tok[0] == "`":
+            stack.append((_CLOSER_OF[tok[1]], m.start() + 1, True))
+            continue
+        if len(tok) != 1:
+            continue
+        c = _CLOSER_OF.get(tok)
+        if c is not None:
+            stack.append((c, m.start(), False))
+        elif stack and stack[-1][0] == tok:
+            _, open_pos, is_quot = stack.pop()
+            if is_quot:
+                spans.append((open_pos, m.start()))
+        else:
+            stack.clear()
     return _merge_spans(spans)
 
 
@@ -880,10 +869,10 @@ def _inside_spans(spans: list[tuple[int, int]], pos: int) -> bool:
 
 def _is_non_command_scope_token(stripped: str, pos: int, kw: str, line_start: int, n: int) -> bool:
     """True when a standalone `namespace`/`section`/`mutual`/`end` token at `pos` is in
-    expression/field/tactic position rather than a top-level scope command."""
+    expression/field/tactic position on the same line rather than a scope command."""
     after = pos + len(kw)
     k = after
-    while k < n and stripped[k] in _WHITESPACE:
+    while k < n and stripped[k] in " \t\r":
         k += 1
     if k < n and stripped[k] in _NON_CMD_AFTER_CHARS:
         return True
@@ -934,7 +923,7 @@ def _enclosing_col0_block(stripped: str, pos: int, line_start: int, cmd_re, n: i
     return blk_start, blk_end
 
 
-def _scope_keyword_hits(stripped: str, bracket_re, cmd_re) -> list[tuple[int, str]]:
+def _scope_keyword_hits(stripped: str, bracket_re, quot_re, cmd_re) -> list[tuple[int, str]]:
     """Offsets of standalone top-level `namespace`, `section`, `mutual` and `end` tokens,
     sorted by offset."""
     n = len(stripped)
@@ -963,7 +952,7 @@ def _scope_keyword_hits(stripped: str, bracket_re, cmd_re) -> list[tuple[int, st
         return hits
     hits.sort()
     quot_spans = (
-        _quotation_spans(stripped, bracket_re)
+        _quotation_spans(stripped, quot_re)
         if ("`(" in stripped or "`[" in stripped or "`{" in stripped)
         else []
     )
@@ -979,7 +968,7 @@ def _scope_keyword_hits(stripped: str, bracket_re, cmd_re) -> list[tuple[int, st
         if _is_non_command_scope_token(stripped, p, kw, line_start, n):
             continue
         prefix = stripped[line_start:p]
-        if any(c in prefix for c in "([{"):
+        if any(c in prefix for c in "([{⟨"):
             if line_start != cached_line_start:
                 line_end = stripped.find("\n", p)
                 if line_end == -1:
@@ -994,7 +983,7 @@ def _scope_keyword_hits(stripped: str, bracket_re, cmd_re) -> list[tuple[int, st
         if p > line_start:
             blk_bounds = _enclosing_col0_block(stripped, p, line_start, cmd_re, n)
             blk_start, blk_end = blk_bounds
-            if blk_start < line_start and any(c in stripped[blk_start:line_start] for c in "([{"):
+            if blk_start < line_start and any(c in stripped[blk_start:line_start] for c in "([{⟨"):
                 if blk_bounds != cached_blk_bounds:
                     cached_blk_bounds = blk_bounds
                     cached_blk_spans = [
@@ -1055,7 +1044,9 @@ def _find_in_governed_end(stripped: str, in_end: int, cmd_indent: int) -> tuple[
     `end_offset` is the offset where the governed command ends (`in_end` when `in` is
     dangling before `end` or EOF).
     """
-    _, _, _, line_re, cont_re, cmd_re, strict_cmd_re, in_prefix_re, in_tok_re = _scope_res()
+    _, _, bracket_re, _, line_re, cont_re, cmd_re, strict_cmd_re, in_prefix_re, in_tok_re = (
+        _scope_res()
+    )
     n = len(stripped)
 
     def is_cmd_start(cand: int) -> bool:
@@ -1085,11 +1076,11 @@ def _find_in_governed_end(stripped: str, in_end: int, cmd_indent: int) -> tuple[
         chained_in = -1
         for tm in in_tok_re.finditer(stripped, pm.end()):
             tok = tm.group()
-            if len(tok) > 2:
+            if len(tok) > 2 or tok[0] in ("«", "'"):
                 continue
-            if tok in "({[":
+            if tok in "({[⟨":
                 depth += 1
-            elif tok in ")}]":
+            elif tok in ")}]⟩":
                 if depth > 0:
                     depth -= 1
             elif depth > 0:
@@ -1124,21 +1115,21 @@ def _find_in_governed_end(stripped: str, in_end: int, cmd_indent: int) -> tuple[
         line_end = n
     depth = 0
     body_eq_end = -1
-    in_by_tactic = False
+    in_block_body = False
     after_head = cmd_re.match(stripped, p)
     scan_from = after_head.end() if after_head is not None else p
     for tm in in_tok_re.finditer(stripped, scan_from, line_end):
         tok = tm.group()
-        if len(tok) > 2:
+        if len(tok) > 2 or tok[0] in ("«", "'"):
             continue
-        if tok in "({[":
+        if tok in "({[⟨":
             depth += 1
-        elif tok in ")}]":
+        elif tok in ")}]⟩":
             if depth > 0:
                 depth -= 1
         elif depth == 0:
             if tok == ";":
-                if not in_by_tactic:
+                if body_eq_end == -1:
                     return tm.start(), False
                 after_semi = tm.end()
                 while after_semi < line_end and stripped[after_semi] in " \t":
@@ -1150,15 +1141,19 @@ def _find_in_governed_end(stripped: str, in_end: int, cmd_indent: int) -> tuple[
                 after_eq = body_eq_end
                 while after_eq < line_end and stripped[after_eq] in " \t":
                     after_eq += 1
-                if stripped.startswith("by", after_eq) and (
-                    after_eq + 2 >= line_end
-                    or not (is_ident_char(stripped[after_eq + 2]) or stripped[after_eq + 2] == ".")
-                ):
-                    in_by_tactic = True
+                for blk_kw in ("by", "do"):
+                    if stripped.startswith(blk_kw, after_eq) and (
+                        after_eq + 2 >= line_end
+                        or not (
+                            is_ident_char(stripped[after_eq + 2]) or stripped[after_eq + 2] == "."
+                        )
+                    ):
+                        in_block_body = True
+                        break
     if body_eq_end != -1:
         # Look for an inline command keyword after `:= <atom>` at bracket depth 0 on the same
-        # line. Inside `:= by ...`, tactic-mode prefixes (`open`, `set_option`, ...) belong
-        # to the proof block rather than starting a sibling top-level command.
+        # line. Inside `:= by ...` or `:= do ...`, tactic/do prefixes (`open`, `set_option`, ...)
+        # belong to the body rather than starting a sibling top-level command.
         body_pos = body_eq_end
         while body_pos < line_end and stripped[body_pos] in " \t":
             body_pos += 1
@@ -1171,23 +1166,26 @@ def _find_in_governed_end(stripped: str, in_end: int, cmd_indent: int) -> tuple[
                     saw_atom = True
                 body_pos += 1
                 continue
-            if ch == "«":
-                g_end = stripped.find("»", body_pos + 1, line_end)
-                body_pos = g_end + 1 if g_end != -1 else body_pos + 1
+            if ch in ("«", "'"):
+                bm = bracket_re.match(stripped, body_pos, line_end)
+                if bm is not None and len(bm.group()) > 1:
+                    body_pos = bm.end()
+                    continue
+                body_pos += 1
                 continue
-            if ch in "({[":
+            if ch in "({[⟨":
                 b_depth += 1
                 body_pos += 1
                 continue
-            if ch in ")}]":
+            if ch in ")}]⟩":
                 if b_depth > 0:
                     b_depth -= 1
                 body_pos += 1
                 continue
             if b_depth == 0 and saw_atom:
-                if is_strict_top_cmd(body_pos) if in_by_tactic else is_cmd_start(body_pos):
+                if is_strict_top_cmd(body_pos) if in_block_body else is_cmd_start(body_pos):
                     return body_pos, False
-            while body_pos < line_end and stripped[body_pos] not in " \t(){}[]«":
+            while body_pos < line_end and stripped[body_pos] not in " \t(){}[]⟨⟩«'":
                 body_pos += 1
 
     # Multi-line scan: any non-continuation command starting at `indent <= cmd_indent` ends
@@ -1282,7 +1280,7 @@ class NamespaceTracker:
         if stripped is None or len(stripped) != len(text):
             stripped = strip_comments_and_strings_preserving_offsets(text)
         n = len(stripped)
-        name_re, part_re, bracket_re, _, _, cmd_re, *_ = _scope_res()
+        name_re, part_re, bracket_re, quot_re, _, _, cmd_re, *_ = _scope_res()
         line_of = LineCounter(stripped)
         offsets: list[int] = []
         namespaces: list[tuple[str, ...]] = []
@@ -1342,7 +1340,7 @@ class NamespaceTracker:
                 return -1
             return k + 2
 
-        for pos, kw in _scope_keyword_hits(stripped, bracket_re, cmd_re):
+        for pos, kw in _scope_keyword_hits(stripped, bracket_re, quot_re, cmd_re):
             if pos < consumed:
                 continue
             flush_pending_up_to(pos)

@@ -5917,5 +5917,117 @@ class TestEpisode2ProjectionAndRewriteOrderHazards(unittest.TestCase):
             self.assertEqual(def_second, [])
             self.assertEqual(spy.call_count, 1)
 
+    def test_a1_namespace_quotation_target_dataflow_and_try_regressions(self) -> None:
+        import lean_lexer
+
+        # 1. Single-line zero-arg tactics/clauses (`by simp end A`, `by intros end B`,
+        # `structure Empty where end C`) must close their namespaces cleanly.
+        same_line_closers = (
+            "namespace A theorem t1 : True := by simp end A\n"
+            "def outA := 0\n"
+            "namespace B theorem t2 : True → True := by intros; assumption end B\n"
+            "namespace B2 theorem t3 : True := by intros end B2\n"
+            "def outB := 0\n"
+            "namespace C structure Empty where end C\n"
+            "def outC := 0\n"
+        )
+        tr_sc = lean_lexer.track_namespaces(same_line_closers)
+        self.assertEqual(tr_sc.violations, ())
+        for marker in ("def outA", "def outB", "def outC"):
+            self.assertEqual(tr_sc.namespace_at(same_line_closers.index(marker)), (), marker)
+
+        # 2. Unclosed syntax quotation earlier in the file must not disable scanning later
+        # multi-line syntax quotations, and 1,000 unclosed `` `( `` stays linear (< 5 ms).
+        unclosed_quot_then_valid = (
+            "def broken := `(foo\n"
+            "def q := `(command|\n"
+            "def firstCmd := 0\n"
+            "namespace Fake\n"
+            "def insideFake := 1\n"
+            "end Fake\n"
+            ")\n"
+            "def afterQuot := 2\n"
+        )
+        tr_uq = lean_lexer.track_namespaces(unclosed_quot_then_valid)
+        self.assertEqual(tr_uq.violations, ())
+        self.assertEqual(tr_uq.namespace_at(unclosed_quot_then_valid.index("def insideFake")), ())
+        self.assertEqual(tr_uq.namespace_at(unclosed_quot_then_valid.index("def afterQuot")), ())
+
+        quot_stress = ("def u := `(unclosed\n" * 600) + "namespace Real\ndef ok := 1\nend Real\n"
+        quot_ms = best_of_ms(lambda: lean_lexer.track_namespaces(quot_stress), budget_ms=5.0)
+        self.assertLess(quot_ms, 5.0, f"Unclosed quotation scan took {quot_ms:.2f} ms")
+
+        # 3. `namespace ... in` with char literals `'('`, `do ...; ...`, and `⟨by ...; ..., ...⟩`.
+        ns_in_edge = (
+            "namespace A in def openParen : Char := '(' def outsideParen : Nat := 2\n"
+            "namespace B in def m : Id Nat := do let x := 1; pure x\n"
+            "def outsideDo := 0\n"
+            "namespace C in theorem conj : True ∧ True := ⟨by simp; trivial, trivial⟩\n"
+            "def outsideConj := 0\n"
+        )
+        tr_in2 = lean_lexer.track_namespaces(ns_in_edge)
+        self.assertEqual(tr_in2.violations, ())
+        self.assertEqual(tr_in2.namespace_at(ns_in_edge.index("openParen")), ("A",))
+        self.assertEqual(tr_in2.namespace_at(ns_in_edge.index("def outsideParen")), ())
+        self.assertEqual(tr_in2.namespace_at(ns_in_edge.index("pure x")), ("B",))
+        self.assertEqual(tr_in2.namespace_at(ns_in_edge.index("def outsideDo")), ())
+        self.assertEqual(tr_in2.namespace_at(ns_in_edge.rindex("trivial")), ("C",))
+        self.assertEqual(tr_in2.namespace_at(ns_in_edge.index("def outsideConj")), ())
+
+        # 4. Advisory target-location dataflow, `{ simp }` / ASCII bullets (`-`, `+`, `*`),
+        # guillemet `dsimp only` decoy, `rw +opt` / `-opt`, and `first | try ... | rw ...`.
+        R_PROJ = proof_health.RULE_SIMP_DEEP_PROJECTION_CHAIN
+        S_STMT = proof_health.SUBRULE_SIMP_AFTER_PROJECTION_STATEMENT
+        R_TRY = proof_health.RULE_TRY_RW_HYP_BEFORE_TARGET
+
+        a1_pos = (
+            "theorem p : P := by\n"
+            "  change (advanceStmt s l m).memory.locals = l at h1\n"
+            "  dsimp only [advanceStmt]\n"
+            "  simp at h1\n"
+            "  have h2 : (advanceStmt s l m).memory.locals = l := h0\n"
+            "  dsimp only [advanceStmt]\n"
+            "  simp at h2\n"
+            "  change (advanceStmt s l m).memory.locals = l\n"
+            "  simp only [foo] at hOther\n"
+            "  simp\n"
+            "  change (advanceStmt s l m).memory.locals = l\n"
+            "  dsimp only [«a, advanceStmt: b»]\n"
+            "  simp\n"
+            "  suffices (advanceStmt s l m).memory.locals = l by\n"
+            "    { simp [advanceStmt] }\n"
+            "  have h3 : (advanceStmt s l m).frame.stmtIdx = 0 := by\n"
+            "    - simp [advanceStmt]\n"
+            "  - try rw [h] at hEval ⊢\n"
+            "  + try erw +occs [h] at hEval ⊢\n"
+            "  * try rewrite -zeta [h] at hEval |-\n"
+        )
+        self.assertEqual(
+            [(f.line, f.rule, f.subrule) for f in proof_health.scan_projection_and_rewrite_order_hazards(a1_pos)],
+            [
+                (4, R_PROJ, S_STMT),
+                (7, R_PROJ, S_STMT),
+                (10, R_PROJ, S_STMT),
+                (13, R_PROJ, S_STMT),
+                (15, R_PROJ, S_STMT),
+                (17, R_PROJ, S_STMT),
+                (18, R_TRY, ""),
+                (19, R_TRY, ""),
+                (20, R_TRY, ""),
+            ],
+        )
+
+        a1_neg = (
+            "theorem clean : P := by\n"
+            "  change (advanceStmt s l m).memory.locals = l\n"
+            "  simp only [foo] at hOther\n"
+            "  have h1 : (advanceStmt s l m).memory.locals = l := h0\n"
+            "  simp only [foo]\n"
+            "  first | try simp | rw [h] at hEval ⊢\n"
+            "  (try simp [h]); rw [h] at hEval ⊢\n"
+        )
+        self.assertEqual(proof_health.scan_projection_and_rewrite_order_hazards(a1_neg), [])
+
+
 if __name__ == "__main__":
     unittest.main()

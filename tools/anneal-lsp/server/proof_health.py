@@ -2157,9 +2157,10 @@ def scan_lean_text(
                 while len(_SCAN_RESULT_CACHE) > _SCAN_RESULT_CACHE_MAX:
                     del _SCAN_RESULT_CACHE[next(iter(_SCAN_RESULT_CACHE))]
                 if base_prev is not None and base_prev[0] == text:
-                    if len(_LAST_LEAN_SCAN) >= 16:
+                    true_scan_key = (cache_key[3], cache_key[4], cache_key[5], True)
+                    if true_scan_key not in _LAST_LEAN_SCAN and len(_LAST_LEAN_SCAN) >= 16:
                         _LAST_LEAN_SCAN.clear()
-                    _LAST_LEAN_SCAN[(cache_key[3], cache_key[4], cache_key[5], True)] = (
+                    _LAST_LEAN_SCAN[true_scan_key] = (
                         *base_prev[:6],
                         merged_tup,
                     )
@@ -2181,9 +2182,10 @@ def scan_lean_text(
                     del _SCAN_RESULT_CACHE[next(iter(_SCAN_RESULT_CACHE))]
                 adv_prev = _LAST_LEAN_SCAN.get((cache_key[3], cache_key[4], cache_key[5], True))
                 if adv_prev is not None and adv_prev[0] == text:
-                    if len(_LAST_LEAN_SCAN) >= 16:
+                    false_scan_key = (cache_key[3], cache_key[4], cache_key[5], False)
+                    if false_scan_key not in _LAST_LEAN_SCAN and len(_LAST_LEAN_SCAN) >= 16:
                         _LAST_LEAN_SCAN.clear()
-                    _LAST_LEAN_SCAN[(cache_key[3], cache_key[4], cache_key[5], False)] = (
+                    _LAST_LEAN_SCAN[false_scan_key] = (
                         *adv_prev[:6],
                         filtered_tup,
                     )
@@ -2651,10 +2653,12 @@ _ADV_WS = " \t\r\n"
 _ADV_STATEMENT_STOPS = frozenset((":=", "by", "from", "at", ";", "<;>"))
 _ADV_STEP_STOPS = frozenset((";", "<;>"))
 _ADV_USING_STOPS = frozenset((";", "<;>", ","))
+_ADV_TRY_STOPS = frozenset(("|",))
 _ADV_NO_STOPS: frozenset[str] = frozenset()
 _ADV_TURNSTILES = ("⊢", "|-")
 _ADV_LOC_STOP_WORDS: frozenset[str] = _UNFOLD_STOP_WORDS | frozenset(
     (
+        "λ",
         "try",
         "erw",
         "rewrite",
@@ -2728,7 +2732,7 @@ class _AdvisoryRegexes:
         # semicolons inside `«a]b»` or `']'` never desync tactic/bracket boundaries.
         self.step_token = re.compile(
             _ADV_GUI_OR_CHAR
-            + r"|[()\[\]{}⟨⟩;,\n]|:=|<;>|"
+            + r"|[()\[\]{}⟨⟩;,\n]|:=|<;>|\|(?!-)|"
             + r"(?<![\w'!?.\u00ab])(?:by|from|at)(?![\w'!?.\u00bb])"
         )
         self.bracket = re.compile(_ADV_GUI_OR_CHAR + r"|[()\[\]{}⟨⟩]")
@@ -2736,7 +2740,11 @@ class _AdvisoryRegexes:
         self.projection = re.compile(r"\.(?:[^\W\d][\w'!?]*|\d+|«[^»\n]+»)")
         # Unfolded `advanceStmt` symbol (optionally qualified or `.eq_def` / `.eq_unfold` / `.eq_N`).
         self.advance_stmt_sym = re.compile(
-            _IDENT_BEFORE + _QUAL_PREFIX + r"advanceStmt" + _UNFOLD_EQ_SUFFIX + _IDENT_AFTER
+            r"(?<![\w'!?.\u00ab])"
+            + _QUAL_PREFIX
+            + r"advanceStmt"
+            + _UNFOLD_EQ_SUFFIX
+            + r"(?![\w'!?.\u00bb])"
         )
         # `(config := ...)`, `(disch := ...)`, `(occs := ...)`: a named argument group.
         self.config_item = re.compile(r"\(\s*[^\W\d][\w'!?]*\s*:=")
@@ -2752,8 +2760,9 @@ class _AdvisoryRegexes:
         # From just past a line end: blank lines, then (group 1) the indentation of the
         # next non-blank line. Always matches; it ends at that line's first character.
         self.next_line = re.compile(r"(?:[ \t\r]*\n)*([ \t\r]*)")
-        # The rest of a line that holds no `;` and only flat, balanced bracket groups.
-        atom = _ADV_GUI_OR_CHAR + r"|[^\n;()\[\]{}]"
+        # The rest of a line that holds no `;` or `|` (except `|-` turnstile) and only flat,
+        # balanced bracket groups.
+        atom = _ADV_GUI_OR_CHAR + r"|[^\n;|()\[\]{}]|\|(?=-)"
         self.flat_line = re.compile(
             rf"(?:{atom}|\[(?:{atom})*\]|\((?:{atom})*\)|\{{(?:{atom})*\}})*(?=\n|\Z)"
         )
@@ -2907,10 +2916,14 @@ def _adv_scan_at_locations(
 def _bracket_unfolds_advance_stmt(bracket_text: str) -> bool:
     """True when `dsimp only [<bracket_text>]` actually unfolds `advanceStmt` (or a
     qualified / `.eq_def` form), excluding erasures `-advanceStmt`, reverse rewrites
-    `← advanceStmt`, unrelated `advanceStmt_*` lemmas, or argument occurrences."""
+    `← advanceStmt`, unrelated `advanceStmt_*` lemmas, guillemet names, or argument
+    occurrences."""
     if "advanceStmt" not in bracket_text:
         return False
+    has_gui = "«" in bracket_text
     for m in _advisory_regexes().advance_stmt_sym.finditer(bracket_text):
+        if has_gui and lean_lexer._inside_guillemets(bracket_text, m.start()):
+            continue
         if _is_simp_unfold_entry(bracket_text, m.start(), m.end()):
             return True
     return False
@@ -2918,16 +2931,15 @@ def _bracket_unfolds_advance_stmt(bracket_text: str) -> bool:
 
 def _parse_simp_call(
     stripped: str, s_idx: int, n: int, has_guillemets: bool = False
-) -> tuple[str, bool, int, bool, str] | None:
-    """`(tactic_kind, is_dsimp, end, has_only, bracket_text)` of the simp-family call whose
-    `simp` is at `s_idx` (`dsimp`, `simp`, `simp?`, `simp!`, `simpa`, `simp_all`,
+) -> tuple[str, bool, int, bool, str, tuple[str, ...] | None] | None:
+    """`(tactic_kind, is_dsimp, end, has_only, bracket_text, at_locs)` of the simp-family
+    call whose `simp` is at `s_idx` (`dsimp`, `simp`, `simp?`, `simp!`, `simpa`, `simp_all`,
     `simp_arith`, `simp_rw`, ...), or `None` when `simp` is only part of a longer name
     (`foo.simp`, `simp_wf`, `my_simp`, `«simp»`).
 
-    `stripped[s_idx:end]` is everything the call hands to `simp`: named argument groups
-    (`(config := ...)`, `(disch := ...)`), `+opt` / `-opt`, `only`, the `[...]` lemma list
-    and, for `simpa`, the optional `at <locs>` and `using` term. A call without any of these
-    ends at its keyword.
+    `stripped[s_idx:end]` covers named argument groups (`(config := ...)`, `(disch := ...)`),
+    `+opt` / `-opt`, `only`, the `[...]` lemma list, optional `at <locs>`, and (for `simpa`)
+    the `using` term.
     """
     if has_guillemets and lean_lexer._inside_guillemets(stripped, s_idx):
         return None
@@ -2969,7 +2981,7 @@ def _parse_simp_call(
             if close != -1:
                 bracket_text = stripped[k + 1 : close]
                 end = close + 1
-            break  # the lemma list is the last argument before `using` / `at`
+            break  # the lemma list is the last argument before `at` / `using`
         if ch == "(":
             if res.config_item.match(stripped, k) is None:
                 break  # a parenthesised tactic or term, not an argument of this call
@@ -2987,15 +2999,20 @@ def _parse_simp_call(
             end = k
         else:
             break
+    step_col = _adv_step_col(stripped, s_idx)
+    at_locs: tuple[str, ...] | None = None
+    k = _adv_skip_ws(stripped, end, n)
+    if _adv_word_at(stripped, k, "at", n):
+        scanned_locs, k_after_at = _adv_scan_at_locations(
+            stripped, k + 2, n, step_col, stop_before_using=(variant == "a")
+        )
+        at_locs = tuple(scanned_locs)
+        end = k_after_at
     if variant == "a":
-        step_col = _adv_step_col(stripped, s_idx)
         k = _adv_skip_ws(stripped, end, n)
-        if _adv_word_at(stripped, k, "at", n):
-            _, k = _adv_scan_at_locations(stripped, k + 2, n, step_col, stop_before_using=True)
-            k = _adv_skip_ws(stripped, k, n)
         if _adv_word_at(stripped, k, "using", n):
             end = _adv_scan_to(stripped, k + 5, n, step_col + 1, _ADV_USING_STOPS)[0]
-    return tactic_kind, is_dsimp, end, has_only, bracket_text
+    return tactic_kind, is_dsimp, end, has_only, bracket_text, at_locs
 
 
 def _advance_stmt_projection_chains(
@@ -3093,27 +3110,48 @@ def _enclosing_simp_call(
     return None
 
 
+def _call_mentions_ident(call_slice: str, ident: str) -> bool:
+    if not ident:
+        return False
+    if ident[0] == "«":
+        return ident in call_slice
+    klen = len(ident)
+    n_sl = len(call_slice)
+    has_gui = "«" in call_slice
+    pos = call_slice.find(ident)
+    while pos != -1:
+        end = pos + klen
+        before_ok = pos == 0 or not (_is_ident_char(call_slice[pos - 1]) or call_slice[pos - 1] in ".«")
+        after_ok = end >= n_sl or not (_is_ident_char(call_slice[end]) or call_slice[end] in ".»")
+        if before_ok and after_ok and not (has_gui and lean_lexer._inside_guillemets(call_slice, pos)):
+            return True
+        pos = call_slice.find(ident, end)
+    return False
+
+
 def _simp_step_at(
     stripped: str,
     p: int,
     n: int,
     has_guillemets: bool = False,
     *,
-    goal_only: bool = False,
+    targets: frozenset[str] | None = None,
 ) -> tuple[str, int] | None:
-    """`(tactic_kind, offset)` when the tactic step starting at `p` is a simp-family call
-    other than `dsimp` (or follows a `dsimp only [...]` step that did not unfold
-    `advanceStmt`, or for a goal-only statement a `dsimp ... at <hyps>` that did not touch
-    the goal), looking through focusing bullets, parentheses and the combinators `try` /
-    `all_goals` / `any_goals` / `repeat` / `focus`."""
+    """`(tactic_kind, offset)` when the tactic sequence starting at `p` reaches a non-`dsimp`
+    simp-family call touching `targets` before `advanceStmt` is collapsed on `targets` by
+    `dsimp`, looking through focusing bullets (`·`, `.`, `-`, `+`, `*`), `{...}` / `(...)`
+    blocks, and the combinators `try` / `all_goals` / `any_goals` / `repeat` / `focus`."""
     step_prefix = _advisory_regexes().step_prefix
+    rem_targets = targets
     for _ in range(8):
+        if rem_targets is not None and not rem_targets:
+            return None
         step_col = _adv_col(stripped, p) if 0 <= p < n else 0
         for _ in range(8):
             if p < 0 or p >= n:
                 return None
             ch = stripped[p]
-            if ch in "·(" or (ch == "." and p + 1 < n and stripped[p + 1] in " \t"):
+            if ch in "·({" or (ch in ".-+*" and p + 1 < n and stripped[p + 1] in " \t"):
                 p = _adv_skip_ws(stripped, p + 1, n)
                 continue
             m = step_prefix.match(stripped, p)
@@ -3128,23 +3166,33 @@ def _simp_step_at(
         call = _parse_simp_call(stripped, s, n, has_guillemets)
         if call is None:
             return None
-        tactic_kind, is_dsimp, call_end, has_only, bracket_text = call
+        tactic_kind, is_dsimp, call_end, has_only, bracket_text, at_locs = call
+        has_star = at_locs is not None and "*" in at_locs
+        loc_set = (
+            frozenset(("⊢",))
+            if not at_locs
+            else frozenset("⊢" if l in _ADV_TURNSTILES else l for l in at_locs)
+        )
         if not is_dsimp:
-            return tactic_kind, s
-        # `dsimp` silences the hazard only if it collapses `advanceStmt` on the affected
-        # target: `dsimp only [...]` without an unfolded `advanceStmt` entry, or (for a
-        # goal-only statement) `dsimp ... at <hyps>` without `⊢` / `|-` / `*`, leaves the
-        # projection chain uncollapsed for the immediately following `simp`.
-        unfolds_adv = (not has_only) or _bracket_unfolds_advance_stmt(bracket_text)
-        touches_target = True
-        if unfolds_adv and goal_only:
-            at_k = _adv_skip_ws(stripped, call_end, n)
-            if _adv_word_at(stripped, at_k, "at", n):
-                d_locs, _ = _adv_scan_at_locations(stripped, at_k + 2, n, step_col)
-                if d_locs and not any(loc in _ADV_TURNSTILES or loc == "*" for loc in d_locs):
-                    touches_target = False
-        if unfolds_adv and touches_target:
-            return None
+            if rem_targets is None or has_star or tactic_kind.startswith("simp_all"):
+                return tactic_kind, s
+            if rem_targets & loc_set:
+                return tactic_kind, s
+            call_slice = stripped[s:call_end]
+            for hyp in rem_targets:
+                if hyp != "⊢" and (
+                    _call_mentions_ident(call_slice, hyp)
+                    or (hyp == "this" and tactic_kind.startswith("simpa") and "using" not in call_slice)
+                ):
+                    return tactic_kind, s
+        else:
+            unfolds_adv = (not has_only) or _bracket_unfolds_advance_stmt(bracket_text)
+            if unfolds_adv:
+                if rem_targets is None or has_star:
+                    return None
+                rem_targets = rem_targets - loc_set
+                if not rem_targets:
+                    return None
         _, tok, nxt = _adv_scan_to(stripped, call_end, n, step_col + 1, _ADV_STEP_STOPS)
         if tok in (";", "<;>"):
             p = _adv_skip_ws(stripped, nxt, n)
@@ -3155,19 +3203,31 @@ def _simp_step_at(
     return None
 
 
+def _extract_statement_bound_hyp(stripped: str, kw_end: int, stmt_end: int) -> str | None:
+    """Identifier bound by `have [h] : ...` / `suffices [h] : ...`, or `None` when destructured."""
+    q = _adv_skip_ws(stripped, kw_end, stmt_end)
+    if q >= stmt_end:
+        return None
+    if stripped[q] == ":" and stripped[q : q + 2] != ":=":
+        return "this"
+    m = _advisory_regexes().location.match(stripped, q)
+    if m is None:
+        return None
+    ident = m.group(1)
+    if ident in _ADV_TURNSTILES or ident == "*" or ident in _ADV_LOC_STOP_WORDS:
+        return None
+    after = _adv_skip_ws(stripped, m.end(), stmt_end + 2)
+    if after < len(stripped) and stripped[after] == ":" and stripped[after : after + 2] != ":=":
+        return ident
+    return None
+
+
 def _simp_after_statement(
     stripped: str, a: int, b: int, n: int, has_guillemets: bool = False
 ) -> tuple[str, int, str, int] | None:
     """`(statement_keyword, keyword_offset, tactic_kind, simp_offset)` when `stripped[a:b]`
-    lies in the statement of a `change` / `show` / `have` / `suffices` and the first tactic
-    step after that statement is a simp-family call other than `dsimp`.
-
-    The statement runs from the keyword to `:=`, `by`, `from`, `at`, `;`, `<;>` or the end
-    of its step. The first step after it is the first tactic of the statement's own proof
-    block when it has one (`:= by simp ...`, `by simp ...`, `from by simp ...`); otherwise
-    the next sibling step: after `;` / `<;>`, or on the next line at the keyword's column
-    (after the term of a `:=` / `from` proof, when there is one).
-    """
+    lies in the statement of a `change` / `show` / `have` / `suffices` and the following
+    tactic sequence simplifies the affected target before `advanceStmt` is collapsed."""
     lo = a - _ADV_STATEMENT_WINDOW if a > _ADV_STATEMENT_WINDOW else 0
     rfind = stripped.rfind
     nearest = [(rfind(kw, lo, a), kw) for kw in _ADV_STATEMENT_KEYWORDS]
@@ -3192,26 +3252,41 @@ def _simp_after_statement(
         end, tok, nxt = _adv_scan_to(stripped, kw_end, n, col + 1, _ADV_STATEMENT_STOPS)
         if end < b:
             continue  # this statement ends before the chain does: try an enclosing one
-        statement_has_at = tok == "at"
+        targets: frozenset[str] | None = None
+        if statement_kw in ("change", "show"):
+            targets = frozenset(("⊢",))
         p = -1
+        entered_own_by = False
         if tok in (":=", "from", "by"):
             p = _adv_skip_ws(stripped, nxt, n)
-            if tok != "by":
-                if _adv_word_at(stripped, p, "by", n):
-                    p = _adv_skip_ws(stripped, p + 2, n)
-                else:
-                    tok, nxt = _adv_scan_to(stripped, p, n, col + 1, _ADV_STEP_STOPS)[1:]
-                    p = -1
+            if tok == "by":
+                entered_own_by = True
+            elif _adv_word_at(stripped, p, "by", n):
+                p = _adv_skip_ws(stripped, p + 2, n)
+                entered_own_by = True
+            else:
+                tok, nxt = _adv_scan_to(stripped, p, n, col + 1, _ADV_STEP_STOPS)[1:]
+                p = -1
         elif tok == "at":
-            tok, nxt = _adv_scan_to(stripped, nxt, n, col + 1, _ADV_STEP_STOPS)[1:]
+            c_locs, after_at = _adv_scan_at_locations(stripped, nxt, n, col)
+            if c_locs and "*" not in c_locs:
+                targets = frozenset("⊢" if l in _ADV_TURNSTILES else l for l in c_locs)
+            else:
+                targets = None
+            tok, nxt = _adv_scan_to(stripped, after_at, n, col + 1, _ADV_STEP_STOPS)[1:]
+        if statement_kw == "have":
+            if entered_own_by:
+                targets = frozenset(("⊢",))
+            else:
+                hyp = _extract_statement_bound_hyp(stripped, kw_end, end)
+                targets = frozenset((hyp,)) if hyp is not None else None
         if p == -1:
             if tok in (";", "<;>"):
                 p = _adv_skip_ws(stripped, nxt, n)
             elif tok == "\n" and _adv_col(stripped, nxt) == col:
                 p = nxt
-        goal_only = statement_kw in ("change", "show") and not statement_has_at
         step = (
-            _simp_step_at(stripped, p, n, has_guillemets, goal_only=goal_only)
+            _simp_step_at(stripped, p, n, has_guillemets, targets=targets)
             if p != -1
             else None
         )
@@ -3224,7 +3299,7 @@ def _simp_after_statement(
 def _is_non_tactic_try(stripped: str, t: int) -> bool:
     """True when `try` at `t` sits immediately after a term-position operator or keyword
     on the same line (e.g. `have _ := try (by ...)`), so it is a term rather than the
-    `try` tactic."""
+    `try` tactic. Line-leading `-`, `+`, `*` are focusing bullets, not binary operators."""
     line_start = stripped.rfind("\n", 0, t) + 1
     b = t - 1
     while b >= line_start and stripped[b] in " \t":
@@ -3233,6 +3308,8 @@ def _is_non_tactic_try(stripped: str, t: int) -> bool:
         return False
     ch = stripped[b]
     if ch in _ADV_NON_TACTIC_BEFORE_TRY_CHARS:
+        if ch in "-+*" and all(c in " \t" for c in stripped[line_start:b]):
+            return False
         return True
     if _is_ident_char(ch) or ch == "λ":
         w_start = b
@@ -3272,13 +3349,22 @@ def _try_rewrite_hyp_before_target(
         if has_guillemets and lean_lexer._inside_guillemets(stripped, h_pos):
             return
         k = _adv_skip_ws(stripped, head.end(), n)
-        while k < n and stripped[k] == "(":
-            if config_item.match(stripped, k) is None:
-                return
-            close = _adv_match_close(stripped, k, n)
-            if close == -1:
-                return
-            k = _adv_skip_ws(stripped, close + 1, n)
+        while k < n:
+            ch = stripped[k]
+            if ch == "(":
+                if config_item.match(stripped, k) is None:
+                    return
+                close = _adv_match_close(stripped, k, n)
+                if close == -1:
+                    return
+                k = _adv_skip_ws(stripped, close + 1, n)
+            elif ch in "+-" and k + 1 < n and (stripped[k + 1].isalpha() or stripped[k + 1] == "_"):
+                k += 2
+                while k < n and (_is_ident_char(stripped[k]) or stripped[k] == "."):
+                    k += 1
+                k = _adv_skip_ws(stripped, k, n)
+            else:
+                break
         if k >= n or stripped[k] != "[":
             return
         close = _adv_match_close(stripped, k, n)
@@ -3327,13 +3413,18 @@ def _try_rewrite_hyp_before_target(
                 flat = flat_line.match(stripped, first)
                 if flat is not None:
                     flat_end = flat.end()
+                    if flat_end < n and stripped[flat_end] == "|":
+                        if find("w", first, flat_end) != -1:
+                            for head in rw_head.finditer(stripped, first, flat_end):
+                                consider(head)
+                        continue
                     line = next_line.match(stripped, flat_end + 1) if flat_end < n else None
                     if line is None or line.end() >= n or line.end() - line.start(1) < min_indent:
                         if find("w", first, flat_end) != -1:
                             for head in rw_head.finditer(stripped, first, flat_end):
                                 consider(head)
                         continue
-            scope_end = _adv_scan_to(stripped, first, n, min_indent, _ADV_NO_STOPS)[0]
+            scope_end = _adv_scan_to(stripped, first, n, min_indent, _ADV_TRY_STOPS)[0]
         if find("w", first, scope_end) != -1:
             for head in rw_head.finditer(stripped, first, scope_end):
                 consider(head)
