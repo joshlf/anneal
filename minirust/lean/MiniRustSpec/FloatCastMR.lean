@@ -3683,8 +3683,16 @@ theorem fc_f16_f128_from_bits
     exact fc_evalRvalue_transmute_via_le hop hty (fc_tyByteSize_u128 decls)
       (fc_tyByteSize_f128 decls) rfl hdec
 
-/-! ## 15. Symbolic `TreeBorrowsMemory` + `BasicMemory` `Transmute` machine runs, `[u8; 4]`
-machine carriers, and unsigned / rounding float-cast bridges (`[adv shard-b B2]`) -/
+/-! ## 15. `Transmute` carrier machine runs (`BasicMemory` + `TreeBorrowsMemory`), `[u8; 4]`
+machine carriers, and unsigned / rounding float-cast bridges (`[adv shard-b B2]`)
+
+Scope (`[adv shard-b A2]`): the `Interp.steps` / `Interp.stepsTB` runs of the `CastKind.transmute`
+carriers below are kernel-computed on concrete bit patterns; the *symbolic* machine runs are the
+`BasicMemory` runs of the fragment `IntToInt` carriers (`fc_sym_mr_carrier_steps`,
+`fc_sym_mr_carrier64_steps`, via `mirCall_ret`), which `fc_mrM_transmute_eq_intToInt` shows
+compute exactly what the transmute carriers' cast operator computes, for every bit pattern and
+every memory model. `TreeBorrowsMemory` is symbolic at the operator level (`transmuteM`,
+`evalCastOpM`), not at the machine level. -/
 
 /-- `fn carrier64(x: u64) -> i64 { transmute(x) }`: the 64-bit `CastKind.transmute` bit carrier,
 accepted by `translateFn`. -/
@@ -4052,6 +4060,89 @@ theorem fc_sym_e2e_u64_as_f64_bits :
   exact ⟨⟨mem, runA_sound _ _ _ _ _ hrun⟩, runA_noUB _ _ _ _ _ hrun,
     fc_sym_retAfter8_carrierCast64 _ hlt,
     (fc_mrM_transmute_int_bytes8 (M := TBM) .Unsigned _ hlt none).1⟩
+
+/-! ## 16. Transmute and `IntToInt` carriers agree at MiniRust's cast operator (`[adv shard-b A2]`)
+
+`minimize` translates the transmute carrier `transmute::<uN, iN>(x)` to
+`UnOp::Cast(CastOp::Transmute(iN))` and the fragment carrier `x as iN` to
+`UnOp::Cast(CastOp::IntToInt(iN))`. For every bit pattern and every memory model `M` (in
+particular `BasicMemory` and `TreeBorrowsMemory`), MiniRust's `eval_cast_op` returns the same value
+and type for both, so the symbolic machine runs of the `IntToInt` carriers
+(`fc_sym_mr_carrier_steps`, `fc_sym_mr_carrier64_steps`) describe the transmute carriers' cast
+step exactly. -/
+
+/-- **Polymorphic operator-level equivalence of the two carriers**: for every memory model `M`,
+every signedness pair, every MiniRust integer width `n` (`GoodSize`), and every in-range bit
+pattern, `CastOp::Transmute` and `CastOp::IntToInt` between equal-width integer types both map
+`intFromBits bits` at the old type to `intFromBits bits` at the new type. -/
+theorem fc_mrM_transmute_eq_intToInt {M : Type} [Gen.Memory M] [MemoryOps M]
+    (s₁ s₂ : Signedness) (n bits : Nat) (hgood : GoodSize n) (hbits : bits < 2 ^ (8 * n))
+    (m : Option (Gen.Machine M)) :
+    evalCastOpM (M := M) (.Transmute (.Int ⟨s₂, ⟨n⟩⟩))
+        (.Int (intFromBits bits ⟨s₁, ⟨n⟩⟩), .Int ⟨s₁, ⟨n⟩⟩) m =
+      .ok (.Int (intFromBits bits ⟨s₂, ⟨n⟩⟩), .Int ⟨s₂, ⟨n⟩⟩) ∧
+    evalCastOpM (M := M) (.IntToInt ⟨s₂, ⟨n⟩⟩)
+        (.Int (intFromBits bits ⟨s₁, ⟨n⟩⟩), .Int ⟨s₁, ⟨n⟩⟩) m =
+      .ok (.Int (intFromBits bits ⟨s₂, ⟨n⟩⟩), .Int ⟨s₂, ⟨n⟩⟩) := by
+  have htr := fc_mrM_transmute_int (M := M) s₁ s₂ n bits hgood hbits m
+  have hbib : IntType.bring_in_bounds ⟨s₂, ⟨n⟩⟩ (intFromBits bits ⟨s₁, ⟨n⟩⟩) =
+      intFromBits bits ⟨s₂, ⟨n⟩⟩ := by
+    rw [bringInBounds_eq_intFromBits ⟨s₂, ⟨n⟩⟩ hgood]
+    have hmod := intFromBits_emod bits ⟨s₁, ⟨n⟩⟩ hbits
+    simp only at hmod ⊢
+    rw [hmod]
+    rfl
+  constructor
+  · simp only [evalCastOpM, layout_eq ⟨s₁, ⟨n⟩⟩ hgood, layout_eq ⟨s₂, ⟨n⟩⟩ hgood, bind,
+      Except.bind, expect_size_sized, ne_eq, not_true_eq_false, ↓reduceIte, htr, pure,
+      Except.pure]
+  · simp only [evalCastOpM, hbib, pure, Except.pure]
+
+/-- The 32- and 64-bit carrier instances over `BasicMemory` and `TreeBorrowsMemory`. -/
+theorem fc_carrier_ops_agree (bits : Nat) :
+    (bits < 2 ^ 32 →
+      evalCastOpM (M := BM) (.Transmute (.Int fcI32It)) (.Int (intFromBits bits fcU32It),
+          .Int fcU32It) none =
+        evalCastOpM (M := BM) (.IntToInt fcI32It) (.Int (intFromBits bits fcU32It), .Int fcU32It)
+          none ∧
+      evalCastOpM (M := TBM) (.Transmute (.Int fcI32It)) (.Int (intFromBits bits fcU32It),
+          .Int fcU32It) none =
+        evalCastOpM (M := TBM) (.IntToInt fcI32It) (.Int (intFromBits bits fcU32It), .Int fcU32It)
+          none) ∧
+    (bits < 2 ^ 64 →
+      evalCastOpM (M := BM) (.Transmute (.Int fcI64It)) (.Int (intFromBits bits fcU64It),
+          .Int fcU64It) none =
+        evalCastOpM (M := BM) (.IntToInt fcI64It) (.Int (intFromBits bits fcU64It), .Int fcU64It)
+          none ∧
+      evalCastOpM (M := TBM) (.Transmute (.Int fcI64It)) (.Int (intFromBits bits fcU64It),
+          .Int fcU64It) none =
+        evalCastOpM (M := TBM) (.IntToInt fcI64It) (.Int (intFromBits bits fcU64It), .Int fcU64It)
+          none) := by
+  refine ⟨fun h => ⟨?_, ?_⟩, fun h => ⟨?_, ?_⟩⟩
+  · obtain ⟨h1, h2⟩ := fc_mrM_transmute_eq_intToInt (M := BM) .Unsigned .Signed 4 bits fc_goodSize_4 h none
+    exact h1.trans h2.symm
+  · obtain ⟨h1, h2⟩ := fc_mrM_transmute_eq_intToInt (M := TBM) .Unsigned .Signed 4 bits fc_goodSize_4 h none
+    exact h1.trans h2.symm
+  · obtain ⟨h1, h2⟩ := fc_mrM_transmute_eq_intToInt (M := BM) .Unsigned .Signed 8 bits fc_goodSize_8 h none
+    exact h1.trans h2.symm
+  · obtain ⟨h1, h2⟩ := fc_mrM_transmute_eq_intToInt (M := TBM) .Unsigned .Signed 8 bits fc_goodSize_8 h none
+    exact h1.trans h2.symm
+
+/-- The translated carriers differ only in that cast operator: `minimize` maps the transmute
+carrier's statement to `Cast(Transmute(i32))` and the fragment carrier's to `Cast(IntToInt(i32))`,
+both of `Load(_1)` into `_0`. -/
+theorem fc_carrier_translations :
+    translateStatement fcCarrierBody.localDecls
+        (mkStmt (.assign (local_ 0) (.cast .transmute (.copy (local_ 1)) fcI32Ty)))
+        fcCarrierBody.layouts =
+      some (.Assign (.Local (localName 0))
+        (.UnOp (.Cast (.Transmute (.Int fcI32It))) (.Load (.Local (localName 1))))) ∧
+    translateStatement fcCarrierCastBody.localDecls
+        (mkStmt (.assign (local_ 0) (.cast .intToInt (.copy (local_ 1)) i32Ty)))
+        fcCarrierCastBody.layouts =
+      some (.Assign (.Local (localName 0))
+        (.UnOp (.Cast (.IntToInt fcI32It)) (.Load (.Local (localName 1))))) :=
+  ⟨rfl, rfl⟩
 
 /-! ## Axiom guards
 
@@ -5448,6 +5539,24 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_u64_as_f64_bits' depen
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_u64_as_f64_bits
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_transmute_eq_intToInt' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mrM_transmute_eq_intToInt
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_carrier_ops_agree' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_carrier_ops_agree
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_carrier_translations' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_carrier_translations
 
 end AxiomGuards
 
