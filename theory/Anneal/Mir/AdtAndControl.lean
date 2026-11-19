@@ -131,10 +131,11 @@ and relates it to `Trusted.Rustc.V2026_06_01.MirSemantics`:
      `evalDeinitPlaceTyped_uninit_eq`) and otherwise coinciding with `evalDeinitPlace`
      (`evalDeinitPlaceTyped_sound`, `evalDeinitPlaceTyped_no_union`, plus index-local validation
      `evalDeinitPlace_indexLocalsOk` / `evalDeinitPlace_bad_index_none`).
-   - Step refinement against Trusted's `evalStmt` on `.deinit` under the `SlotBelow` frame
-     relation (Anneal knows less than Trusted; every Anneal read is a Trusted read:
-     `readPlaceState_below_refines`), and the documented divergence on projected `Deinit`
-     below an uninitialized local (`evalStmt_deinit_projected_uninit_root_divergence`).
+   - Step refinement and two-sided operational equivalence against Trusted's `evalStmt` on
+     `.deinit` under the `SlotBelow` frame relation (`readPlaceState_below_refines`), covering
+     both uninitialized roots (`evalStmt_deinit_projected_uninit_root_agrees`,
+     `evalStmt_deinit_projected_uninit_iff`) and initialized non-union aggregate roots
+     (`evalStmt_deinit_projected_init_refines`, `evalStmt_deinit_projected_init_iff`).
    - `evalRetagPlace` (`retag_place`: the value-dependent part of `prepare_place_access` — no
      `Deref` (`evalRetagPlace_deref_false`), the index pre-read (`evalRetagPlace_bad_index_false`),
      and `check_slot_projection` (`evalRetagPlace_inactive_variant_false`) — raw retags and recursive reference checks with the `A3`
@@ -211,10 +212,12 @@ and relates it to `Trusted.Rustc.V2026_06_01.MirSemantics`:
      of a dead local faults in both semantics (`evalLoweredTerminator_drop_dead_agrees_trusted`),
      a successful `Drop` names a local Trusted also holds live
      (`evalLoweredTerminator_drop_trusted_live`), a successful projected `Drop` of an initialized
-     local refines Trusted without any read premise
-     (`evalLoweredTerminator_drop_projected_init_refines`), and a projected `Drop` below an
-     uninitialized local is a documented divergence
-     (`evalLoweredTerminator_drop_projected_uninit_divergence`).
+     local refines and agrees two-sidedly with Trusted
+     (`evalLoweredTerminator_drop_projected_init_refines`,
+     `evalLoweredTerminator_drop_projected_init_iff`), and a projected `Drop` below an
+     uninitialized local agrees two-sidedly with Trusted
+     (`evalLoweredTerminator_drop_projected_uninit_agrees`,
+     `evalLoweredTerminator_drop_projected_uninit_iff`).
 
 4. **Section 4 — Synthetic sub-place pointers, `ProjectionElem.deref` places, and sub-place
    `CopyNonOverlapping`** (`ws-mir-lower-deref-subplace-and-minirust-adt-deinit` Episode 1,
@@ -2358,7 +2361,8 @@ theorem evalAdtDiscriminant_init_agrees_trusted (spec : AdtDiscrSpec) (wf : Valu
     (hEnum : spec.isEnum = true) {v : Nat} {fields : List Value} {d : Nat}
     (h : evalAdtDiscriminant spec wf (.init (.aggregate v fields)) = some d)
     (locals' : List LocalSlot) (mem : Memory) (place : Place) (localDecls : List LocalDecl)
-    (layouts : LayoutTable) (hTy : placeTy localDecls layouts place = none) :
+    (layouts : LayoutTable) (hTy : placeTy localDecls layouts place = none)
+    (hInit : valueListContainsUninit fields = false := by rfl) :
     evalPlaceDiscriminant (.aggregate v fields) locals' mem place localDecls layouts =
         .ok (.scalar ⟨v, 8⟩) locals' mem ∧
       spec.discriminants[v]? = some d ∧
@@ -2375,7 +2379,7 @@ theorem evalAdtDiscriminant_init_agrees_trusted (spec : AdtDiscrSpec) (wf : Valu
         exact hD
       · nomatch h
   have hTyRes := placeTy_eq_none_imp_placeTyResolved_eq_none localDecls layouts place hTy
-  refine ⟨by simp [evalPlaceDiscriminant, hTyRes], hD, fun hSeq => ?_⟩
+  refine ⟨by simp [evalPlaceDiscriminant, hInit, hTyRes], hD, fun hSeq => ?_⟩
   have hLt : v < spec.discriminants.length := (List.getElem?_eq_some_iff.mp hD).1
   rw [hSeq, List.getElem?_range (by simpa using hLt)] at hD
   simpa using hD.symm
@@ -4285,76 +4289,360 @@ theorem FieldListBelow.set_both : ∀ {fs : List FieldSlot} {tfs : List Value} (
   | [], _ :: _, _, _, _, hB, _ => by simp [FieldListBelow] at hB
   | _ :: _, [], _, _, _, hB, _ => by simp [FieldListBelow] at hB
 
-/-- Anneal's `deinitTailOk` implies Trusted's `deinitTailOk` under `SameScalarLocals`. -/
-theorem deinitTailOk_implies_trusted {dlocals locals : List LocalSlot}
+/-- Type-and-bounds certificate witnessing that a projection chain `p` from container type `curTy`
+has resolved aggregate arities and array bounds matching Anneal's untyped `deinitTailOk`. -/
+def WellTypedDeinitProj (dlocals : List LocalSlot) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) : Ty → List ProjectionElem → Prop
+  | _, [] => True
+  | curTy, .field idx fieldTy :: rest =>
+    let rTy := resolveTyWithLocalDecls localDecls layouts curTy
+    ∃ sh, uninitContainerFieldShell? localDecls layouts rTy idx = .some sh ∧
+      WellTypedDeinitProj dlocals localDecls layouts
+        (resolveFieldStepTy localDecls layouts rTy idx fieldTy) rest
+  | curTy, .downcast _ variantIdx :: .field idx fieldTy :: rest =>
+    let rTy := resolveTyWithLocalDecls localDecls layouts curTy
+    ∃ arity, enumVariantPayloadArity? localDecls layouts rTy variantIdx = .some arity ∧
+      idx < arity ∧
+      WellTypedDeinitProj dlocals localDecls layouts
+        (resolveTyWithLocalDecls localDecls layouts fieldTy) rest
+  | curTy, .index i :: rest =>
+    let rTy := resolveTyWithLocalDecls localDecls layouts curTy
+    ∃ elemKind arrayLen, rTy.kind = .array elemKind arrayLen ∧
+      (∀ sc, get? dlocals i = .some (.init (.scalar sc)) → sc.bits < arrayLen) ∧
+      WellTypedDeinitProj dlocals localDecls layouts
+        (resolveArrayStepTy localDecls layouts rTy elemKind) rest
+  | curTy, .constantIndex _ minLen _ :: rest =>
+    let rTy := resolveTyWithLocalDecls localDecls layouts curTy
+    ∃ elemKind arrayLen, rTy.kind = .array elemKind arrayLen ∧ minLen ≤ arrayLen ∧
+      WellTypedDeinitProj dlocals localDecls layouts
+        (resolveArrayStepTy localDecls layouts rTy elemKind) rest
+  | curTy, .subslice from_ to_ fromEnd :: rest =>
+    let rTy := resolveTyWithLocalDecls localDecls layouts curTy
+    ∃ elemKind arrayLen, rTy.kind = .array elemKind arrayLen ∧
+      (if fromEnd then from_ + to_ ≤ arrayLen else to_ ≤ arrayLen) ∧
+      WellTypedDeinitProj dlocals localDecls layouts
+        { kind := .array elemKind
+            (if fromEnd then Nat.sub arrayLen (Nat.add from_ to_) else Nat.sub to_ from_),
+          layoutIdx := 0 } rest
+  | _, .deref :: _ => True
+  | _, .downcast _ _ :: [] => True
+  | _, .downcast _ _ :: .deref :: _ => True
+  | _, _ => False
+
+/-- Trusted's `deinitTailOk` fails closed (`false`) on every non-empty projection when the root
+local's declared type is missing (`curTyOpt = .none`). -/
+theorem deinitTailOk_trusted_none_curTy_false (locals : List LocalSlot)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    ∀ (p : List ProjectionElem), p ≠ [] →
+      Trusted.Rustc.V2026_06_01.MirSemantics.deinitTailOk locals localDecls layouts .none p = false
+  | [], h => absurd rfl h
+  | a :: rest, _ => by
+    cases a with
+    | downcast _ _ =>
+      cases rest with
+      | nil => rfl
+      | cons b _ => cases b <;> rfl
+    | index i =>
+      unfold Trusted.Rustc.V2026_06_01.MirSemantics.deinitTailOk
+      cases get? locals i with
+      | none => rfl
+      | some s =>
+        cases s with
+        | init v => cases v <;> rfl
+        | _ => rfl
+    | _ => rfl
+
+/-- **Two-Sided Typed `deinitTailOk` Equivalence (`deinitTailOk_typed_eq_trusted`)**:
+On any well-typed projection chain (`WellTypedDeinitProj dlocals localDecls layouts curTy p`)
+under `SameScalarLocals dlocals locals`, Anneal's `deinitTailOk` and Trusted's typed `deinitTailOk`
+return the **exact same `Bool` (`=`)** — agreeing on both valid (`true`) and invalid (`false`)
+tails! -/
+theorem deinitTailOk_typed_eq_trusted {dlocals locals : List LocalSlot}
+    {localDecls : List LocalDecl} {layouts : LayoutTable}
     (hSame : SameScalarLocals dlocals locals) :
-    ∀ (p : List ProjectionElem),
-      deinitTailOk dlocals p = true →
-      Trusted.Rustc.V2026_06_01.MirSemantics.deinitTailOk locals p = true := by
+    ∀ (p : List ProjectionElem) (curTy : Ty),
+      WellTypedDeinitProj dlocals localDecls layouts curTy p →
+      deinitTailOk dlocals p =
+        Trusted.Rustc.V2026_06_01.MirSemantics.deinitTailOk
+          locals localDecls layouts (.some curTy) p := by
   have hAux : ∀ (n : Nat) (p : List ProjectionElem), p.length ≤ n →
-      deinitTailOk dlocals p = true →
-      Trusted.Rustc.V2026_06_01.MirSemantics.deinitTailOk locals p = true := by
+      ∀ (curTy : Ty), WellTypedDeinitProj dlocals localDecls layouts curTy p →
+        deinitTailOk dlocals p =
+          Trusted.Rustc.V2026_06_01.MirSemantics.deinitTailOk
+            locals localDecls layouts (.some curTy) p := by
     intro n
     induction n with
     | zero =>
-      intro p hLen _
+      intro p hLen _ _
       have hp : p = [] := List.eq_nil_of_length_eq_zero (Nat.le_zero.mp hLen)
       subst hp; rfl
     | succ n ih =>
-      intro p hLen h
+      intro p hLen curTy hWT
       rcases p with _ | ⟨a, rest⟩
       · rfl
       · simp only [List.length_cons] at hLen
         cases a with
         | field idx ty =>
-          exact ih rest (by omega) h
+          obtain ⟨sh, hSh, hRestWT⟩ := hWT
+          unfold deinitTailOk Trusted.Rustc.V2026_06_01.MirSemantics.deinitTailOk
+          dsimp only
+          rw [hSh]
+          exact ih rest (by omega) _ hRestWT
         | downcast nm v =>
           rcases rest with _ | ⟨b, tail⟩
-          · nomatch h
+          · rfl
           · cases b with
             | field idx ty =>
-              exact ih tail (by simp at hLen; omega) h
-            | _ => nomatch h
+              obtain ⟨arity, hAr, hLt, hTailWT⟩ := hWT
+              unfold deinitTailOk Trusted.Rustc.V2026_06_01.MirSemantics.deinitTailOk
+              dsimp only
+              rw [hAr]
+              dsimp only
+              rw [Nat.blt_eq.mpr hLt]
+              exact ih tail (by simp at hLen; omega) _ hTailWT
+            | deref => rfl
+            | _ => nomatch hWT
         | index i =>
-          unfold deinitTailOk at h
-          unfold Trusted.Rustc.V2026_06_01.MirSemantics.deinitTailOk
-          cases hGet : get? dlocals i with
-          | none => rw [hGet] at h; nomatch h
-          | some slot =>
-            rw [hGet] at h
-            cases slot with
-            | dead | uninit => nomatch h
-            | init v =>
-              cases v with
+          obtain ⟨elemKind, arrayLen, hArrK, hScLt, hRestWT⟩ := hWT
+          unfold deinitTailOk Trusted.Rustc.V2026_06_01.MirSemantics.deinitTailOk
+          cases hGetD : get? dlocals i with
+          | none =>
+            cases hGetL : get? locals i with
+            | none => rfl
+            | some slotL =>
+              cases slotL with
+              | dead | uninit => rfl
+              | init vL =>
+                cases vL with
+                | scalar sc =>
+                  have := (hSame i sc).mpr hGetL
+                  rw [hGetD] at this; nomatch this
+                | _ => rfl
+          | some slotD =>
+            cases slotD with
+            | dead | uninit =>
+              cases hGetL : get? locals i with
+              | none => rfl
+              | some slotL =>
+                cases slotL with
+                | dead | uninit => rfl
+                | init vL =>
+                  cases vL with
+                  | scalar sc =>
+                    have := (hSame i sc).mpr hGetL
+                    rw [hGetD] at this; nomatch this
+                  | _ => rfl
+            | init vD =>
+              cases vD with
               | scalar sc =>
-                rw [(hSame i sc).mp hGet]
-                exact ih rest (by omega) h
-              | _ => nomatch h
+                have hGetL := (hSame i sc).mp hGetD
+                rw [hGetL]
+                dsimp only
+                rw [hArrK]
+                dsimp only
+                rw [Nat.blt_eq.mpr (hScLt sc hGetD)]
+                exact ih rest (by omega) _ hRestWT
+              | _ =>
+                cases hGetL : get? locals i with
+                | none => rfl
+                | some slotL =>
+                  cases slotL with
+                  | dead | uninit => rfl
+                  | init vL =>
+                    cases vL with
+                    | scalar sc =>
+                      have := (hSame i sc).mpr hGetL
+                      rw [hGetD] at this; nomatch this
+                    | _ => rfl
         | constantIndex offset minLen fromEnd =>
-          unfold deinitTailOk at h
-          unfold Trusted.Rustc.V2026_06_01.MirSemantics.deinitTailOk
-          simp only [Bool.and_eq_true] at h ⊢
-          refine ⟨?_, ih rest (by omega) h.2⟩
+          obtain ⟨elemKind, arrayLen, hArrK, hMinLe, hRestWT⟩ := hWT
+          unfold deinitTailOk Trusted.Rustc.V2026_06_01.MirSemantics.deinitTailOk
+          dsimp only
+          rw [hArrK]
+          dsimp only
+          rw [Nat.ble_eq.mpr hMinLe]
           cases fromEnd with
           | false =>
-            simp only [Bool.false_eq_true, ↓reduceIte, decide_eq_true_eq] at h
-            exact Nat.blt_eq.mpr h.1
+            dsimp only [Bool.false_eq_true, ↓reduceIte]
+            by_cases hOff : offset < minLen
+            · simp only [decide_eq_true hOff, Nat.blt_eq.mpr hOff, Bool.true_and]
+              exact ih rest (by omega) _ hRestWT
+            · have hBltF : Nat.blt offset minLen = false :=
+                Bool.eq_false_iff.mpr (fun hT => hOff (Nat.blt_eq.mp hT))
+              simp [hOff, hBltF]
           | true =>
-            simp only [↓reduceIte, decide_eq_true_eq] at h
-            rw [Bool.and_eq_true]
-            exact ⟨Nat.ble_eq.mpr h.1.1, Nat.ble_eq.mpr h.1.2⟩
+            dsimp only [↓reduceIte]
+            by_cases hOff : 1 ≤ offset ∧ offset ≤ minLen
+            · have hAndT : Bool.and (Nat.ble 1 offset) (Nat.ble offset minLen) = true := by
+                rw [Bool.and_eq_true]; exact ⟨Nat.ble_eq.mpr hOff.1, Nat.ble_eq.mpr hOff.2⟩
+              simp only [decide_eq_true hOff, hAndT, Bool.true_and]
+              exact ih rest (by omega) _ hRestWT
+            · have hAndF : Bool.and (Nat.ble 1 offset) (Nat.ble offset minLen) = false :=
+                Bool.eq_false_iff.mpr (fun hT => by
+                  rw [Bool.and_eq_true] at hT
+                  exact hOff ⟨Nat.ble_eq.mp hT.1, Nat.ble_eq.mp hT.2⟩)
+              simp [hOff, hAndF]
         | subslice from_ to_ fromEnd =>
-          unfold deinitTailOk at h
-          unfold Trusted.Rustc.V2026_06_01.MirSemantics.deinitTailOk
-          simp only [Bool.and_eq_true] at h ⊢
-          refine ⟨?_, ih rest (by omega) h.2⟩
+          obtain ⟨elemKind, arrayLen, hArrK, hSubLe, hRestWT⟩ := hWT
+          unfold deinitTailOk Trusted.Rustc.V2026_06_01.MirSemantics.deinitTailOk
+          dsimp only
+          rw [hArrK]
+          dsimp only
           cases fromEnd with
-          | true => rfl
+          | true =>
+            simp only [↓reduceIte] at hSubLe hRestWT
+            simp only [Bool.true_or, Bool.true_and]
+            rw [show Nat.add from_ to_ = from_ + to_ from rfl, Nat.ble_eq.mpr hSubLe]
+            exact ih rest (by omega) _ hRestWT
           | false =>
-            simp only [Bool.false_or, decide_eq_true_eq] at h
-            exact Nat.ble_eq.mpr h.1
-        | deref | opaqueCast _ | unwrapUnsafeBinder _ => nomatch h
-  exact fun p h => hAux p.length p (Nat.le_refl _) h
+            simp only [Bool.false_eq_true, ↓reduceIte] at hSubLe hRestWT
+            simp only [Bool.false_or]
+            by_cases hFromLe : from_ ≤ to_
+            · have hAndT : Bool.and (Nat.ble from_ to_) (Nat.ble to_ arrayLen) = true := by
+                rw [Bool.and_eq_true]; exact ⟨Nat.ble_eq.mpr hFromLe, Nat.ble_eq.mpr hSubLe⟩
+              simp only [decide_eq_true hFromLe, hAndT, Bool.true_and]
+              exact ih rest (by omega) _ hRestWT
+            · have hAndF : Bool.and (Nat.ble from_ to_) (Nat.ble to_ arrayLen) = false :=
+                Bool.eq_false_iff.mpr (fun hT => by
+                  rw [Bool.and_eq_true] at hT
+                  exact hFromLe (Nat.ble_eq.mp hT.1))
+              simp [hFromLe, hAndF]
+        | deref => rfl
+        | opaqueCast _ | unwrapUnsafeBinder _ => nomatch hWT
+  exact fun p curTy hWT => hAux p.length p (Nat.le_refl _) curTy hWT
+
+/-- Anneal's `deinitTailOk` implies Trusted's typed `deinitTailOk` on any `WellTypedDeinitProj`
+under `SameScalarLocals`. -/
+theorem deinitTailOk_implies_trusted {dlocals locals : List LocalSlot}
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {curTy : Ty}
+    (hSame : SameScalarLocals dlocals locals) :
+    ∀ (p : List ProjectionElem),
+      WellTypedDeinitProj dlocals localDecls layouts curTy p →
+      deinitTailOk dlocals p = true →
+      Trusted.Rustc.V2026_06_01.MirSemantics.deinitTailOk
+        locals localDecls layouts (.some curTy) p = true := by
+  intro p hWT h
+  rwa [← deinitTailOk_typed_eq_trusted hSame p curTy hWT]
+
+private def deinitStepField0TyOpt (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (idx : FieldIdx) (fty : Ty) : Option Ty → Option Ty
+  | .some curTy =>
+    .some (resolveFieldStepTy localDecls layouts
+      (resolveTyWithLocalDecls localDecls layouts curTy) idx fty)
+  | .none => .none
+
+private def deinitStepResolveTyOpt (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (ty : Ty) : Option Ty → Option Ty
+  | .some _ => .some (resolveTyWithLocalDecls localDecls layouts ty)
+  | .none => .none
+
+private theorem deinitProjectedValue_agg0_field (locals : List LocalSlot) (fields : List Value)
+    (idx : FieldIdx) (fty : Ty) (rest : List ProjectionElem)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (curTyOpt : Option Ty) :
+    deinitProjectedValue locals (.aggregate 0 fields) (.field idx fty :: rest)
+      localDecls layouts curTyOpt =
+    match get? fields idx with
+    | .some oldFieldVal =>
+      match deinitProjectedValue locals oldFieldVal rest localDecls layouts
+          (deinitStepField0TyOpt localDecls layouts idx fty curTyOpt) with
+      | .ok updatedFieldVal =>
+        match set? fields idx updatedFieldVal with
+        | .some fields' => .ok (.aggregate 0 fields')
+        | .none => .ub
+      | .ub => .ub
+      | .unsupported => .unsupported
+    | .none =>
+      match projListHasDeref rest with
+      | true => .unsupported
+      | false => .ub := by
+  cases curTyOpt <;> rfl
+
+private theorem deinitProjectedValue_agg_downcast_field (locals : List LocalSlot)
+    (actualVariant : VariantIdx) (fields : List Value) (nm : Option String) (dv : VariantIdx)
+    (idx : FieldIdx) (fty : Ty) (rest : List ProjectionElem)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (curTyOpt : Option Ty) :
+    deinitProjectedValue locals (.aggregate actualVariant fields)
+      (.downcast nm dv :: .field idx fty :: rest) localDecls layouts curTyOpt =
+    match Nat.beq actualVariant dv with
+    | true =>
+      match get? fields idx with
+      | .some oldFieldVal =>
+        match deinitProjectedValue locals oldFieldVal rest localDecls layouts
+            (deinitStepResolveTyOpt localDecls layouts fty curTyOpt) with
+        | .ok updatedFieldVal =>
+          match set? fields idx updatedFieldVal with
+          | .some fields' => .ok (.aggregate actualVariant fields')
+          | .none => .ub
+        | .ub => .ub
+        | .unsupported => .unsupported
+      | .none =>
+        match projListHasDeref rest with
+        | true => .unsupported
+        | false => .ub
+    | false =>
+      match projListHasDeref rest with
+      | true => .unsupported
+      | false => .ub := by
+  rcases actualVariant with _ | _ <;> cases curTyOpt <;> rfl
+
+private theorem deinitProjectedValue_agg_opaqueCast (locals : List LocalSlot)
+    (var : VariantIdx) (vals : List Value) (castTy : Ty) (rest : List ProjectionElem)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (curTyOpt : Option Ty) :
+    deinitProjectedValue locals (.aggregate var vals) (.opaqueCast castTy :: rest)
+      localDecls layouts curTyOpt =
+    deinitProjectedValue locals (.aggregate var vals) rest localDecls layouts
+      (deinitStepResolveTyOpt localDecls layouts castTy curTyOpt) := by
+  rcases var with _ | _ <;> cases curTyOpt <;> rfl
+
+private theorem deinitProjectedValue_agg_unwrapUnsafeBinder (locals : List LocalSlot)
+    (var : VariantIdx) (vals : List Value) (innerTy : Ty) (rest : List ProjectionElem)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (curTyOpt : Option Ty) :
+    deinitProjectedValue locals (.aggregate var vals) (.unwrapUnsafeBinder innerTy :: rest)
+      localDecls layouts curTyOpt =
+    deinitProjectedValue locals (.aggregate var vals) rest localDecls layouts
+      (deinitStepResolveTyOpt localDecls layouts innerTy curTyOpt) := by
+  rcases var with _ | _ <;> cases curTyOpt <;> rfl
+
+/-- Whenever `deinitFieldSlot` succeeds on an initialized value `.init v`, Trusted's
+`deinitProjectedValue` never reaches an `.uninit` sub-value with a non-empty tail, so its result is
+independent of `(localDecls, layouts, curTyOpt)`. -/
+theorem deinitProjectedValue_eq_untyped_of_deinitFieldSlot_init
+    (ts : Bool) (dlocals : List LocalSlot) (slot : FieldSlot) (p : List ProjectionElem)
+    (slot' : FieldSlot) (h : deinitFieldSlot ts dlocals slot p = some slot') :
+    ∀ (v : Value), slot = .init v →
+      ∀ (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+        (curTyOpt : Option Ty),
+        deinitProjectedValue locals v p localDecls layouts curTyOpt =
+          deinitProjectedValue locals v p := by
+  fun_induction deinitFieldSlot ts dlocals slot p generalizing slot' with
+  | case1 => intro _ _ _ _ _ _; rfl
+  | case2 => intro v hv; cases hv
+  | case3 => intro v hv; cases hv
+  | case4 var vals idx ty rest ih =>
+    intro v hv locals localDecls layouts curTyOpt
+    cases hv
+    obtain ⟨hV, c, c', hc, hcc, _⟩ := deinitShellStep_eq_some h
+    have hV0 : var = 0 := hV; subst hV0
+    obtain ⟨cv, hcv, rfl⟩ := getElem?_map_init (vals := vals) hc
+    rw [deinitProjectedValue_agg0_field, deinitProjectedValue_agg0_field]
+    rw [get?_eq_getElem?, hcv]
+    dsimp only
+    rw [ih (.init cv) c' hcc cv rfl, ih (.init cv) c' hcc cv rfl]; rfl
+  | case5 var vals n v idx ty rest ih =>
+    intro val hv locals localDecls layouts curTyOpt
+    cases hv
+    obtain ⟨hV, c, c', hc, hcc, _⟩ := deinitShellStep_eq_some h
+    have hV' : var = v := hV; subst hV'
+    obtain ⟨cv, hcv, rfl⟩ := getElem?_map_init (vals := vals) hc
+    rw [deinitProjectedValue_agg_downcast_field, deinitProjectedValue_agg_downcast_field]
+    rw [Nat.beq_refl]
+    dsimp only
+    rw [get?_eq_getElem?, hcv]
+    dsimp only
+    rw [ih (.init cv) c' hcc cv rfl, ih (.init cv) c' hcc cv rfl]; rfl
+  | case6 => intro v hv; cases hv
+  | case7 => intro v hv; cases hv
+  | case8 => nomatch h
 
 /-- `deinitFieldSlot` on an initialized value produces a `FieldSlotBelow`-related TCB value
 via `deinitProjectedValue`. -/
@@ -4418,16 +4706,17 @@ theorem deinitFieldSlot_init_deinitProjectedValue (ts : Bool) (dlocals : List Lo
 theorem deinitFieldSlot_below_deinitProjectedValue (ts : Bool) (dlocals : List LocalSlot)
     (slot : FieldSlot) (p : List ProjectionElem) (slot' : FieldSlot)
     (h : deinitFieldSlot ts dlocals slot p = some slot') :
-    ∀ (locals : List LocalSlot) (t t' : Value),
+    ∀ (locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+      (curTyOpt : Option Ty) (t t' : Value),
       FieldSlotBelow slot t →
-      deinitProjectedValue locals t p = .ok t' →
+      deinitProjectedValue locals t p localDecls layouts curTyOpt = .ok t' →
       FieldSlotBelow slot' t' := by
   fun_induction deinitFieldSlot ts dlocals slot p generalizing slot' with
-  | case1 => intro _ _ _ _ _; cases h; trivial
-  | case2 => intro _ _ _ _ _; cases h; trivial
+  | case1 => intro _ _ _ _ _ _ _ _; cases h; trivial
+  | case2 => intro _ _ _ _ _ _ _ _; cases h; trivial
   | case3 => nomatch h
   | case4 var vals idx ty rest ih =>
-    intro locals t t' hB hTD
+    intro locals localDecls layouts curTyOpt t t' hB hTD
     have ht : t = .aggregate var vals := hB.symm
     subst ht
     obtain ⟨hV, c, c', hc, hcc, rfl⟩ := deinitShellStep_eq_some h
@@ -4437,7 +4726,7 @@ theorem deinitFieldSlot_below_deinitProjectedValue (ts : Bool) (dlocals : List L
     simp only [deinitProjectedValue] at hTD
     rw [get?_eq_getElem?, hcv] at hTD
     dsimp only at hTD
-    cases hSub : deinitProjectedValue locals cv rest with
+    cases hSub : deinitProjectedValue locals cv rest localDecls layouts _ with
     | ub => rw [hSub] at hTD; nomatch hTD
     | unsupported => rw [hSub] at hTD; nomatch hTD
     | ok cv' =>
@@ -4449,21 +4738,20 @@ theorem deinitFieldSlot_below_deinitProjectedValue (ts : Bool) (dlocals : List L
       subst hT'
       exact normalizeShell_below rfl
         (FieldListBelow.set_both idx (fieldListBelow_map_init vals)
-          (ih (.init cv) c' hcc locals cv cv' rfl hSub))
+          (ih (.init cv) c' hcc locals localDecls layouts _ cv cv' rfl hSub))
   | case5 var vals n v idx ty rest ih =>
-    intro locals t t' hB hTD
+    intro locals localDecls layouts curTyOpt t t' hB hTD
     have ht : t = .aggregate var vals := hB.symm
     subst ht
     obtain ⟨hV, c, c', hc, hcc, rfl⟩ := deinitShellStep_eq_some h
     have hV' : var = v := hV
     subst hV'
     obtain ⟨cv, hcv, rfl⟩ := getElem?_map_init (vals := vals) hc
-    simp only [deinitProjectedValue] at hTD
-    rw [Nat.beq_refl] at hTD
+    rw [deinitProjectedValue_agg_downcast_field, Nat.beq_refl] at hTD
     dsimp only at hTD
     rw [get?_eq_getElem?, hcv] at hTD
     dsimp only at hTD
-    cases hSub : deinitProjectedValue locals cv rest with
+    cases hSub : deinitProjectedValue locals cv rest localDecls layouts _ with
     | ub => rw [hSub] at hTD; nomatch hTD
     | unsupported => rw [hSub] at hTD; nomatch hTD
     | ok cv' =>
@@ -4475,9 +4763,9 @@ theorem deinitFieldSlot_below_deinitProjectedValue (ts : Bool) (dlocals : List L
       subst hT'
       exact normalizeShell_below rfl
         (FieldListBelow.set_both idx (fieldListBelow_map_init vals)
-          (ih (.init cv) c' hcc locals cv cv' rfl hSub))
+          (ih (.init cv) c' hcc locals localDecls layouts _ cv cv' rfl hSub))
   | case6 var adt disc fs idx ty rest ih =>
-    intro locals t t' hB hTD
+    intro locals localDecls layouts curTyOpt t t' hB hTD
     cases t with
     | aggregate tv tfs =>
       obtain ⟨hV, hBs⟩ := hB
@@ -4485,10 +4773,10 @@ theorem deinitFieldSlot_below_deinitProjectedValue (ts : Bool) (dlocals : List L
       have hTv0 : tv = 0 := hV.symm.trans hSV
       subst hTv0
       obtain ⟨tc, htc, hCB⟩ := FieldListBelow.getElem? hBs hc
-      simp only [deinitProjectedValue] at hTD
+      rw [deinitProjectedValue_agg0_field] at hTD
       rw [get?_eq_getElem?, htc] at hTD
       dsimp only at hTD
-      cases hSub : deinitProjectedValue locals tc rest with
+      cases hSub : deinitProjectedValue locals tc rest localDecls layouts _ with
       | ub => rw [hSub] at hTD; nomatch hTD
       | unsupported => rw [hSub] at hTD; nomatch hTD
       | ok tc' =>
@@ -4499,10 +4787,11 @@ theorem deinitFieldSlot_below_deinitProjectedValue (ts : Bool) (dlocals : List L
         injection hTD with hT'
         subst hT'
         exact normalizeShell_below hV
-          (FieldListBelow.set_both idx hBs (ih c c' hcc locals tc tc' hCB hSub))
+          (FieldListBelow.set_both idx hBs
+            (ih c c' hcc locals localDecls layouts _ tc tc' hCB hSub))
     | _ => exact absurd hB id
   | case7 var adt disc fs n v idx ty rest ih =>
-    intro locals t t' hB hTD
+    intro locals localDecls layouts curTyOpt t t' hB hTD
     cases t with
     | aggregate tv tfs =>
       obtain ⟨hV, hBs⟩ := hB
@@ -4510,12 +4799,11 @@ theorem deinitFieldSlot_below_deinitProjectedValue (ts : Bool) (dlocals : List L
       have hTvV : tv = v := hV.symm.trans hSV
       subst hTvV
       obtain ⟨tc, htc, hCB⟩ := FieldListBelow.getElem? hBs hc
-      simp only [deinitProjectedValue] at hTD
-      rw [Nat.beq_refl] at hTD
+      rw [deinitProjectedValue_agg_downcast_field, Nat.beq_refl] at hTD
       dsimp only at hTD
       rw [get?_eq_getElem?, htc] at hTD
       dsimp only at hTD
-      cases hSub : deinitProjectedValue locals tc rest with
+      cases hSub : deinitProjectedValue locals tc rest localDecls layouts _ with
       | ub => rw [hSub] at hTD; nomatch hTD
       | unsupported => rw [hSub] at hTD; nomatch hTD
       | ok tc' =>
@@ -4526,7 +4814,8 @@ theorem deinitFieldSlot_below_deinitProjectedValue (ts : Bool) (dlocals : List L
         injection hTD with hT'
         subst hT'
         exact normalizeShell_below hV
-          (FieldListBelow.set_both idx hBs (ih c c' hcc locals tc tc' hCB hSub))
+          (FieldListBelow.set_both idx hBs
+            (ih c c' hcc locals localDecls layouts _ tc tc' hCB hSub))
     | _ => exact absurd hB id
   | case8 => nomatch h
 
@@ -4599,38 +4888,45 @@ theorem readProjectedValue_of_deinitFieldSlot_ub (ts : Bool) (dlocals : List Loc
   | case7 => intro _ _ _ hv; cases hv
   | case8 => nomatch h
 
-private theorem deinitProjectedValue_aggregate_shape_aux (locals : List LocalSlot) :
+private theorem deinitProjectedValue_aggregate_shape_aux (locals : List LocalSlot)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
     ∀ (n : Nat) (p : List ProjectionElem), p.length ≤ n →
-      ∀ {var : Nat} {vals : List Value} {rootVal' : Value},
-        deinitProjectedValue locals (.aggregate var vals) p = .ok rootVal' →
+      ∀ {var : Nat} {vals : List Value} {curTyOpt : Option Ty} {rootVal' : Value},
+        deinitProjectedValue locals (.aggregate var vals) p localDecls layouts curTyOpt =
+          .ok rootVal' →
         rootVal' = .uninit ∨ ∃ var' vals', rootVal' = .aggregate var' vals' := by
   intro n
   induction n with
   | zero =>
-    intro p hLen var vals rootVal' h
+    intro p hLen var vals curTyOpt rootVal' h
     have hp : p = [] := List.eq_nil_of_length_eq_zero (Nat.le_zero.mp hLen)
     subst hp
     simp only [deinitProjectedValue] at h
     injection h with hEq
     exact Or.inl hEq.symm
   | succ n ih =>
-    intro p hLen var vals rootVal' h
+    intro p hLen var vals curTyOpt rootVal' h
     rcases p with _ | ⟨a, rest⟩
-    · simp only [deinitProjectedValue] at h
-      injection h with hEq
-      exact Or.inl hEq.symm
+    · rcases var with _ | _ <;> (
+        unfold deinitProjectedValue at h
+        injection h with hEq
+        exact Or.inl hEq.symm)
     · simp only [List.length_cons] at hLen
       cases a with
       | field idx ty =>
         cases var with
-        | succ _ => simp only [deinitProjectedValue] at h; nomatch h
+        | succ _ =>
+          unfold deinitProjectedValue at h
+          cases hPD : projListHasDeref rest <;> (rw [hPD] at h; nomatch h)
         | zero =>
-          simp only [deinitProjectedValue] at h
+          rw [deinitProjectedValue_agg0_field] at h
           cases hF : get? vals idx with
-          | none => rw [hF] at h; nomatch h
+          | none =>
+            rw [hF] at h; dsimp only at h
+            cases hPD : projListHasDeref rest <;> (rw [hPD] at h; nomatch h)
           | some fv =>
             rw [hF] at h; dsimp only at h
-            cases hD : deinitProjectedValue locals fv rest with
+            cases hD : deinitProjectedValue locals fv rest localDecls layouts _ with
             | ub | unsupported => rw [hD] at h; nomatch h
             | ok fv' =>
               rw [hD] at h; dsimp only at h
@@ -4641,20 +4937,23 @@ private theorem deinitProjectedValue_aggregate_shape_aux (locals : List LocalSlo
                 exact Or.inr ⟨0, vals', hEq.symm⟩
       | downcast nm v =>
         rcases rest with _ | ⟨b, tail⟩
-        · simp only [deinitProjectedValue] at h
-          nomatch h
+        · rcases var with _ | _ <;> (unfold deinitProjectedValue at h; nomatch h)
         · cases b with
           | field idx ty =>
-            simp only [deinitProjectedValue] at h
+            rw [deinitProjectedValue_agg_downcast_field] at h
             cases hB : Nat.beq var v with
-            | false => rw [hB] at h; nomatch h
+            | false =>
+              rw [hB] at h; dsimp only at h
+              cases hPD : projListHasDeref tail <;> (rw [hPD] at h; nomatch h)
             | true =>
               rw [hB] at h; dsimp only at h
               cases hF : get? vals idx with
-              | none => rw [hF] at h; nomatch h
+              | none =>
+                rw [hF] at h; dsimp only at h
+                cases hPD : projListHasDeref tail <;> (rw [hPD] at h; nomatch h)
               | some fv =>
                 rw [hF] at h; dsimp only at h
-                cases hD : deinitProjectedValue locals fv tail with
+                cases hD : deinitProjectedValue locals fv tail localDecls layouts _ with
                 | ub | unsupported => rw [hD] at h; nomatch h
                 | ok fv' =>
                   rw [hD] at h; dsimp only at h
@@ -4663,15 +4962,31 @@ private theorem deinitProjectedValue_aggregate_shape_aux (locals : List LocalSlo
                   | some vals' =>
                     rw [hS] at h; injection h with hEq
                     exact Or.inr ⟨var, vals', hEq.symm⟩
-          | _ =>
-            simp only [deinitProjectedValue] at h
-            try (split at h <;> nomatch h)
-            try nomatch h
+          | deref =>
+            rcases var with _ | _ <;> (unfold deinitProjectedValue at h; nomatch h)
+          | downcast _ _ | index _ | constantIndex _ _ _ | subslice _ _ _
+          | opaqueCast _ | unwrapUnsafeBinder _ =>
+            have hDPV :
+                ∀ (e : ProjectionElem), (∀ i t, e ≠ .field i t) →
+                  deinitProjectedValue locals (.aggregate var vals)
+                    (.downcast nm v :: e :: tail) localDecls layouts curTyOpt =
+                  match projListHasDeref (e :: tail) with
+                  | true => .unsupported
+                  | false => .ub := by
+              intro e hNF
+              cases e with
+              | field i t => exact absurd rfl (hNF i t)
+              | _ => rcases var with _ | _ <;> rfl
+            rw [hDPV _ (by intros _ _ hEq; nomatch hEq)] at h
+            cases hPD : projListHasDeref _ <;> (rw [hPD] at h; nomatch h)
       | index idxLocal =>
         rcases var with _ | _
-        · simp only [deinitProjectedValue] at h
+        · unfold deinitProjectedValue at h
+          dsimp only at h
           cases hG : get? locals idxLocal with
-          | none => rw [hG] at h; nomatch h
+          | none =>
+            rw [hG] at h; dsimp only at h
+            cases hPD : projListHasDeref rest <;> (rw [hPD] at h; nomatch h)
           | some s =>
             rw [hG] at h
             cases s with
@@ -4680,10 +4995,12 @@ private theorem deinitProjectedValue_aggregate_shape_aux (locals : List LocalSlo
               | scalar sc =>
                 dsimp only at h
                 cases hF : get? vals sc.bits with
-                | none => rw [hF] at h; nomatch h
+                | none =>
+                  rw [hF] at h; dsimp only at h
+                  cases hPD : projListHasDeref rest <;> (rw [hPD] at h; nomatch h)
                 | some fv =>
                   rw [hF] at h; dsimp only at h
-                  cases hD : deinitProjectedValue locals fv rest with
+                  cases hD : deinitProjectedValue locals fv rest localDecls layouts _ with
                   | ub | unsupported => rw [hD] at h; nomatch h
                   | ok fv' =>
                     rw [hD] at h; dsimp only at h
@@ -4692,13 +5009,19 @@ private theorem deinitProjectedValue_aggregate_shape_aux (locals : List LocalSlo
                     | some vals' =>
                       rw [hS] at h; injection h with hEq
                       exact Or.inr ⟨0, vals', hEq.symm⟩
-              | _ => nomatch h
-            | _ => nomatch h
-        · simp only [deinitProjectedValue] at h
-          split at h <;> nomatch h
+              | uninit | ptr _ _ | aggregate _ _ | unit =>
+                dsimp only at h
+                cases hPD : projListHasDeref rest <;> (rw [hPD] at h; nomatch h)
+            | dead | uninit =>
+              dsimp only at h
+              cases hPD : projListHasDeref rest <;> (rw [hPD] at h; nomatch h)
+        · unfold deinitProjectedValue at h
+          cases hPD : projListHasDeref rest <;> (rw [hPD] at h; nomatch h)
       | constantIndex offset minLen fromEnd =>
         rcases var with _ | _
-        · cases fromEnd <;> simp only [deinitProjectedValue] at h <;> split at h
+        · unfold deinitProjectedValue at h
+          dsimp only at h
+          split at h
           · split at h
             · split at h
               · split at h
@@ -4706,22 +5029,14 @@ private theorem deinitProjectedValue_aggregate_shape_aux (locals : List LocalSlo
                 · nomatch h
               · nomatch h
               · nomatch h
-            · nomatch h
-          · nomatch h
-          · split at h
-            · split at h
-              · split at h
-                · injection h with hEq; exact Or.inr ⟨0, _, hEq.symm⟩
-                · nomatch h
-              · nomatch h
-              · nomatch h
-            · nomatch h
-          · nomatch h
-        · simp only [deinitProjectedValue] at h
-          split at h <;> nomatch h
+            · cases hPD : projListHasDeref rest <;> (rw [hPD] at h; nomatch h)
+          · cases hPD : projListHasDeref rest <;> (rw [hPD] at h; nomatch h)
+        · unfold deinitProjectedValue at h
+          cases hPD : projListHasDeref rest <;> (rw [hPD] at h; nomatch h)
       | subslice fromIdx toIdx fromEnd =>
         rcases var with _ | _
-        · simp only [deinitProjectedValue] at h
+        · unfold deinitProjectedValue at h
+          dsimp only at h
           split at h
           · split at h
             · split at h
@@ -4730,33 +5045,520 @@ private theorem deinitProjectedValue_aggregate_shape_aux (locals : List LocalSlo
             · nomatch h
             · nomatch h
             · nomatch h
-          · nomatch h
-        · simp only [deinitProjectedValue] at h
-          split at h <;> nomatch h
-      | deref => simp only [deinitProjectedValue] at h; nomatch h
-      | opaqueCast _ =>
-        simp only [deinitProjectedValue] at h
+          · cases hPD : projListHasDeref rest <;> (rw [hPD] at h; nomatch h)
+        · unfold deinitProjectedValue at h
+          cases hPD : projListHasDeref rest <;> (rw [hPD] at h; nomatch h)
+      | deref => rcases var with _ | _ <;> (unfold deinitProjectedValue at h; nomatch h)
+      | opaqueCast castTy =>
+        rw [deinitProjectedValue_agg_opaqueCast] at h
         exact ih rest (by omega) h
-      | unwrapUnsafeBinder _ =>
-        simp only [deinitProjectedValue] at h
+      | unwrapUnsafeBinder innerTy =>
+        rw [deinitProjectedValue_agg_unwrapUnsafeBinder] at h
         exact ih rest (by omega) h
 
 /-- `deinitProjectedValue` on an aggregate preserves the aggregate constructor (or produces `.uninit`). -/
-theorem deinitProjectedValue_aggregate_shape {locals : List LocalSlot} {var : Nat}
-    {vals : List Value} {p : List ProjectionElem} {rootVal' : Value}
-    (h : deinitProjectedValue locals (.aggregate var vals) p = .ok rootVal') :
+theorem deinitProjectedValue_aggregate_shape {locals : List LocalSlot}
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {curTyOpt : Option Ty}
+    {var : Nat} {vals : List Value} {p : List ProjectionElem} {rootVal' : Value}
+    (h : deinitProjectedValue locals (.aggregate var vals) p localDecls layouts curTyOpt =
+      .ok rootVal') :
     rootVal' = .uninit ∨ ∃ var' vals', rootVal' = .aggregate var' vals' :=
-  deinitProjectedValue_aggregate_shape_aux locals p.length p (Nat.le_refl _) h
+  deinitProjectedValue_aggregate_shape_aux locals localDecls layouts p.length p (Nat.le_refl _) h
+
+/-- `projListHasDeref` (`Places.lean`) and `projectionHasDeref` (`Statements.lean`) are identical. -/
+theorem projListHasDeref_eq_projectionHasDeref :
+    ∀ (p : List ProjectionElem), projListHasDeref p = projectionHasDeref p
+  | [] => rfl
+  | .deref :: _ => rfl
+  | .field _ _ :: rest => projListHasDeref_eq_projectionHasDeref rest
+  | .downcast _ _ :: rest => projListHasDeref_eq_projectionHasDeref rest
+  | .index _ :: rest => projListHasDeref_eq_projectionHasDeref rest
+  | .constantIndex _ _ _ :: rest => projListHasDeref_eq_projectionHasDeref rest
+  | .subslice _ _ _ :: rest => projListHasDeref_eq_projectionHasDeref rest
+  | .opaqueCast _ :: rest => projListHasDeref_eq_projectionHasDeref rest
+  | .unwrapUnsafeBinder _ :: rest => projListHasDeref_eq_projectionHasDeref rest
+
+/-- Projection-chain invariant for two-sided `.init`-root `Deinit`/`Drop` operational equivalence:
+every step is a `.field` or `.downcast` (including out-of-bounds fields, inactive enum variants, and
+dangling downcasts so fault equivalence is proved alongside step equivalence), initialized sub-values
+reached strictly before the end of `p` are free of `Value.uninit`, and bare `.field` steps do not
+land on transparent-unwrapped non-aggregate newtypes (`.scalar`/`.ptr`/`.unit` at index `0`) or
+non-zero enum variants without an explicit `.downcast`. -/
+def DeinitInitChainOk : Value → List ProjectionElem → Prop
+  | _, [] => True
+  | .uninit, _ :: _ => False
+  | .scalar _, .field 0 _ :: _ => False
+  | .ptr _ _, .field 0 _ :: _ => False
+  | .unit, .field 0 _ :: _ => False
+  | .aggregate (_ + 1) _, .field _ _ :: _ => False
+  | .aggregate 0 fields, .field idx _ :: rest =>
+    ∀ fv, get? fields idx = some fv → DeinitInitChainOk fv rest
+  | _, .field _ _ :: _ => True
+  | .aggregate actualVariant fields, .downcast _ variantIdx :: .field idx _ :: rest =>
+    actualVariant = variantIdx → ∀ fv, get? fields idx = some fv → DeinitInitChainOk fv rest
+  | _, .downcast _ _ :: _ => True
+  | _, _ :: _ => False
+
+private theorem deinitFieldSlot_init_exact_iff_trusted_aux (ts : Bool)
+    (dlocals locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    ∀ (n : Nat) (p : List ProjectionElem), p.length ≤ n →
+      ∀ (v : Value) (curTyOpt : Option Ty),
+        DeinitInitChainOk v p →
+        projectionHasDeref p = false →
+        (∀ slot', deinitFieldSlot ts dlocals (.init v) p = some slot' →
+          ∃ v', deinitProjectedValue locals v p localDecls layouts curTyOpt = .ok v' ∧
+            (p ≠ [] → (ts = true ∨ noDowncast p = true) →
+              (fieldSlotToLocalSlotState slot').toTrustedSlotExact = .init v') ∧
+            ((ts = true ∨ noDowncast p = true) → fieldSlotToValue slot' = v')) ∧
+        (∀ v', deinitProjectedValue locals v p localDecls layouts curTyOpt = .ok v' →
+          ∃ slot', deinitFieldSlot ts dlocals (.init v) p = some slot') ∧
+        (deinitFieldSlot ts dlocals (.init v) p = none ↔
+          deinitProjectedValue locals v p localDecls layouts curTyOpt = .ub) := by
+  intro n
+  induction n with
+  | zero =>
+    intro p hLen v curTyOpt _ _
+    have hp : p = [] := List.eq_nil_of_length_eq_zero (Nat.le_zero.mp hLen)
+    subst hp
+    refine And.intro ?_ (And.intro ?_ ?_)
+    · intro slot' hD
+      simp only [deinitFieldSlot, Option.some.injEq] at hD
+      subst hD
+      exact ⟨.uninit, rfl, fun hNe => absurd rfl hNe, fun _ => rfl⟩
+    · intro _ _; exact ⟨.uninit, rfl⟩
+    · unfold deinitFieldSlot deinitProjectedValue
+      exact Iff.intro (fun h => nomatch h) (fun h => nomatch h)
+  | succ n ih =>
+    intro p hLen v curTyOpt hChain hND
+    rcases p with _ | ⟨a, rest⟩
+    · refine And.intro ?_ (And.intro ?_ ?_)
+      · intro slot' hD
+        simp only [deinitFieldSlot, Option.some.injEq] at hD
+        subst hD
+        exact ⟨.uninit, rfl, fun hNe => absurd rfl hNe, fun _ => rfl⟩
+      · intro _ _; exact ⟨.uninit, rfl⟩
+      · unfold deinitFieldSlot deinitProjectedValue
+        exact Iff.intro (fun h => nomatch h) (fun h => nomatch h)
+    · simp only [List.length_cons] at hLen
+      cases a with
+      | field idx fty =>
+        have hNDRest : projectionHasDeref rest = false := hND
+        have hPDRest : projListHasDeref rest = false :=
+          (projListHasDeref_eq_projectionHasDeref rest).trans hNDRest
+        cases v with
+        | uninit => nomatch hChain
+        | scalar sc =>
+          cases idx with
+          | zero => nomatch hChain
+          | succ k =>
+            refine And.intro (fun _ h => nomatch h) (And.intro ?_ ?_)
+            · intro _ h; unfold deinitProjectedValue at h; rw [hPDRest] at h; nomatch h
+            · unfold deinitFieldSlot deinitProjectedValue; rw [hPDRest]
+              exact Iff.intro (fun _ => rfl) (fun _ => rfl)
+        | ptr p0 sz =>
+          cases idx with
+          | zero => nomatch hChain
+          | succ k =>
+            refine And.intro (fun _ h => nomatch h) (And.intro ?_ ?_)
+            · intro _ h; unfold deinitProjectedValue at h; rw [hPDRest] at h; nomatch h
+            · unfold deinitFieldSlot deinitProjectedValue; rw [hPDRest]
+              exact Iff.intro (fun _ => rfl) (fun _ => rfl)
+        | unit =>
+          cases idx with
+          | zero => nomatch hChain
+          | succ k =>
+            refine And.intro (fun _ h => nomatch h) (And.intro ?_ ?_)
+            · intro _ h; unfold deinitProjectedValue at h; rw [hPDRest] at h; nomatch h
+            · unfold deinitFieldSlot deinitProjectedValue; rw [hPDRest]
+              exact Iff.intro (fun _ => rfl) (fun _ => rfl)
+        | aggregate var fields =>
+          cases var with
+          | succ k => nomatch hChain
+          | zero =>
+            cases hF : get? fields idx with
+            | none =>
+              have hF' : fields[idx]? = none := by simpa [get?_eq_getElem?] using hF
+              have hMapNone : (fields.map FieldSlot.init)[idx]? = none := by
+                simp [List.getElem?_map, hF']
+              have hDNone :
+                  deinitFieldSlot ts dlocals (.init (.aggregate 0 fields))
+                    (.field idx fty :: rest) = none := by
+                simp [deinitFieldSlot, deinitShellStep, explodeAggregate, shellVariant, hMapNone]
+              have hTUb :
+                  deinitProjectedValue locals (.aggregate 0 fields) (.field idx fty :: rest)
+                    localDecls layouts curTyOpt = .ub := by
+                rw [deinitProjectedValue_agg0_field, hF]; dsimp only; rw [hPDRest]
+              exact And.intro (fun _ h => by rw [hDNone] at h; nomatch h)
+                (And.intro (fun _ h => by rw [hTUb] at h; nomatch h)
+                  (by rw [hDNone, hTUb]; exact Iff.intro (fun _ => rfl) (fun _ => rfl)))
+            | some fv =>
+              have hF' : fields[idx]? = some fv := by simpa [get?_eq_getElem?] using hF
+              have hLt : idx < fields.length := (List.getElem?_eq_some_iff.mp hF').1
+              have hMapSome : (fields.map FieldSlot.init)[idx]? = some (.init fv) := by
+                simp [List.getElem?_map, hF']
+              obtain ⟨ihFwd, ihBwd, ihUb⟩ :=
+                ih rest (by omega) fv
+                  (deinitStepField0TyOpt localDecls layouts idx fty curTyOpt)
+                  (hChain fv hF) hNDRest
+              refine And.intro ?_ (And.intro ?_ ?_)
+              · intro slot' hD
+                obtain ⟨_, c, c', hc, hcc, rfl⟩ := deinitShellStep_eq_some hD
+                have hCInit : c = .init fv := by
+                  simp only [explodeAggregate] at hc
+                  rw [hMapSome] at hc
+                  exact (Option.some.inj hc).symm
+                subst hCInit
+                obtain ⟨fv', hSubOk, _, hSubVal⟩ := ihFwd c' hcc
+                have hSet : set? fields idx fv' = .some (fields.set idx fv') :=
+                  set?_eq_some_iff.mpr ⟨hLt, rfl⟩
+                have hU := deinitFieldSlot_uninitAt _ _ _ _ _ hcc
+                have hN := stepped_tryIntoValue?_none (sh := explodeAggregate 0 fields)
+                  (disc' := (explodeAggregate 0 fields).discriminantSet &&
+                    ((none : Option Nat).isNone || ts))
+                  hMapSome hU
+                have hNorm :
+                    normalizeShell
+                      { explodeAggregate 0 fields with
+                        discriminantSet := (explodeAggregate 0 fields).discriminantSet &&
+                          ((none : Option Nat).isNone || ts)
+                        fields := (explodeAggregate 0 fields).fields.set idx c' } =
+                      .nested 0 true true ((fields.map FieldSlot.init).set idx c') := by
+                  rw [normalizeShell_eq_of_tagged hN rfl (by simp [explodeAggregate])]
+                  rfl
+                refine ⟨.aggregate 0 (fields.set idx fv'), ?_, ?_, ?_⟩
+                · rw [deinitProjectedValue_agg0_field, hF]
+                  dsimp only
+                  rw [hSubOk]
+                  dsimp only
+                  rw [hSet]
+                · intro _ hTag
+                  have hTagSub : ts = true ∨ noDowncast rest = true := hTag
+                  have hValEq := hSubVal hTagSub
+                  have hN' :
+                      (PartialAggregate.mk 0 true true
+                        ((fields.map FieldSlot.init).set idx c')).tryIntoValue? = none := by
+                    simpa [explodeAggregate] using hN
+                  rw [hNorm]
+                  unfold fieldSlotToLocalSlotState
+                  dsimp only
+                  rw [hN']
+                  simp [LocalSlotState.toTrustedSlotExact, PartialAggregate.toTrustedValue,
+                    PartialAggregate.activeVariant, fieldSlotsToValues_set,
+                    fieldSlotsToValues_map_init, hValEq]
+                · intro hTag
+                  have hValEq := hSubVal hTag
+                  rw [hNorm]
+                  simp [fieldSlotToValue, fieldSlotsToValues_set, fieldSlotsToValues_map_init,
+                    hValEq]
+              · intro rootVal' hTOk
+                rw [deinitProjectedValue_agg0_field, hF] at hTOk
+                dsimp only at hTOk
+                cases hSubT :
+                    deinitProjectedValue locals fv rest localDecls layouts
+                      (deinitStepField0TyOpt localDecls layouts idx fty curTyOpt) with
+                | ub | unsupported =>
+                  rw [hSubT] at hTOk; nomatch hTOk
+                | ok fv' =>
+                  obtain ⟨c', hcc⟩ := ihBwd fv' hSubT
+                  simp [deinitFieldSlot, deinitShellStep, explodeAggregate, shellVariant,
+                    hMapSome, hcc]
+              · cases hSubD : deinitFieldSlot ts dlocals (.init fv) rest with
+                | none =>
+                  have hSubUb := ihUb.mp hSubD
+                  have hLHS :
+                      deinitFieldSlot ts dlocals (.init (.aggregate 0 fields))
+                        (.field idx fty :: rest) = none := by
+                    simp [deinitFieldSlot, deinitShellStep, explodeAggregate, shellVariant,
+                      hMapSome, hSubD]
+                  have hRHS :
+                      deinitProjectedValue locals (.aggregate 0 fields) (.field idx fty :: rest)
+                        localDecls layouts curTyOpt = .ub := by
+                    rw [deinitProjectedValue_agg0_field, hF]; dsimp only; rw [hSubUb]
+                  rw [hLHS, hRHS]
+                  exact Iff.intro (fun _ => rfl) (fun _ => rfl)
+                | some c' =>
+                  obtain ⟨fv', hSubOk, _⟩ := ihFwd c' hSubD
+                  have hSet : set? fields idx fv' = .some (fields.set idx fv') :=
+                    set?_eq_some_iff.mpr ⟨hLt, rfl⟩
+                  have hLHS :
+                      deinitFieldSlot ts dlocals (.init (.aggregate 0 fields))
+                        (.field idx fty :: rest) ≠ none := by
+                    simp [deinitFieldSlot, deinitShellStep, explodeAggregate, shellVariant,
+                      hMapSome, hSubD]
+                  have hRHS :
+                      deinitProjectedValue locals (.aggregate 0 fields) (.field idx fty :: rest)
+                        localDecls layouts curTyOpt = .ok (.aggregate 0 (fields.set idx fv')) := by
+                    rw [deinitProjectedValue_agg0_field, hF]; dsimp only
+                    rw [hSubOk]; dsimp only; rw [hSet]
+                  exact Iff.intro (fun h => absurd h hLHS) (fun h => by rw [hRHS] at h; nomatch h)
+      | downcast nm vIdx =>
+        have hNDRest : projectionHasDeref rest = false := hND
+        have hPDRest : projListHasDeref rest = false :=
+          (projListHasDeref_eq_projectionHasDeref rest).trans hNDRest
+        rcases rest with _ | ⟨b, tail⟩
+        · cases v with
+          | uninit => nomatch hChain
+          | scalar _ | ptr _ _ | unit =>
+            exact And.intro (fun _ h => nomatch h)
+              (And.intro
+                (fun _ h => by unfold deinitProjectedValue at h; nomatch h)
+                (by
+                  unfold deinitFieldSlot deinitProjectedValue
+                  exact Iff.intro (fun _ => rfl) (fun _ => rfl)))
+          | aggregate var _ =>
+            exact And.intro (fun _ h => nomatch h)
+              (And.intro
+                (fun _ h => by rcases var with _ | _ <;> (unfold deinitProjectedValue at h; nomatch h))
+                (by
+                  rcases var with _ | _ <;> (
+                    unfold deinitFieldSlot deinitProjectedValue
+                    exact Iff.intro (fun _ => rfl) (fun _ => rfl))))
+        · cases b with
+          | deref => nomatch hNDRest
+          | field idx fty =>
+            have hNDTail : projectionHasDeref tail = false := hNDRest
+            have hPDTail : projListHasDeref tail = false :=
+              (projListHasDeref_eq_projectionHasDeref tail).trans hNDTail
+            cases v with
+            | uninit => nomatch hChain
+            | scalar _ | ptr _ _ | unit =>
+              exact And.intro (fun _ h => nomatch h)
+                (And.intro
+                  (fun _ h => by
+                    unfold deinitProjectedValue at h
+                    rw [show projListHasDeref (.field idx fty :: tail) = projListHasDeref tail from rfl,
+                      hPDTail] at h
+                    nomatch h)
+                  (by
+                    unfold deinitFieldSlot deinitProjectedValue
+                    rw [show projListHasDeref (.field idx fty :: tail) = projListHasDeref tail from rfl,
+                      hPDTail]
+                    exact Iff.intro (fun _ => rfl) (fun _ => rfl)))
+            | aggregate actualVariant fields =>
+              rcases beq_cases actualVariant vIdx with ⟨hBeq, rfl⟩ | ⟨hBeq, hNe⟩
+              · cases hF : get? fields idx with
+                | none =>
+                  have hF' : fields[idx]? = none := by simpa [get?_eq_getElem?] using hF
+                  have hMapNone : (fields.map FieldSlot.init)[idx]? = none := by
+                    simp [List.getElem?_map, hF']
+                  have hDNone :
+                      deinitFieldSlot ts dlocals (.init (.aggregate actualVariant fields))
+                        (.downcast nm actualVariant :: .field idx fty :: tail) = none := by
+                    simp [deinitFieldSlot, deinitShellStep, explodeAggregate, shellVariant,
+                      hMapNone]
+                  have hTUb :
+                      deinitProjectedValue locals (.aggregate actualVariant fields)
+                        (.downcast nm actualVariant :: .field idx fty :: tail)
+                        localDecls layouts curTyOpt = .ub := by
+                    rw [deinitProjectedValue_agg_downcast_field, Nat.beq_refl]
+                    dsimp only; rw [hF]; dsimp only; rw [hPDTail]
+                  exact And.intro (fun _ h => by rw [hDNone] at h; nomatch h)
+                    (And.intro (fun _ h => by rw [hTUb] at h; nomatch h)
+                      (by rw [hDNone, hTUb]; exact Iff.intro (fun _ => rfl) (fun _ => rfl)))
+                | some fv =>
+                  have hF' : fields[idx]? = some fv := by simpa [get?_eq_getElem?] using hF
+                  have hLt : idx < fields.length := (List.getElem?_eq_some_iff.mp hF').1
+                  have hMapSome : (fields.map FieldSlot.init)[idx]? = some (.init fv) := by
+                    simp [List.getElem?_map, hF']
+                  have hChainSub : DeinitInitChainOk fv tail := by
+                    rcases actualVariant with _ | _ <;> exact hChain rfl fv hF
+                  obtain ⟨ihFwd, ihBwd, ihUb⟩ :=
+                    ih tail (by simp at hLen; omega) fv
+                      (deinitStepResolveTyOpt localDecls layouts fty curTyOpt)
+                      hChainSub hNDTail
+                  refine And.intro ?_ (And.intro ?_ ?_)
+                  · intro slot' hD
+                    obtain ⟨_, c, c', hc, hcc, rfl⟩ := deinitShellStep_eq_some hD
+                    have hCInit : c = .init fv := by
+                      simp only [explodeAggregate] at hc
+                      rw [hMapSome] at hc
+                      exact (Option.some.inj hc).symm
+                    subst hCInit
+                    obtain ⟨fv', hSubOk, _, hSubVal⟩ := ihFwd c' hcc
+                    have hSet : set? fields idx fv' = .some (fields.set idx fv') :=
+                      set?_eq_some_iff.mpr ⟨hLt, rfl⟩
+                    have hU := deinitFieldSlot_uninitAt _ _ _ _ _ hcc
+                    refine ⟨.aggregate actualVariant (fields.set idx fv'), ?_, ?_, ?_⟩
+                    · rw [deinitProjectedValue_agg_downcast_field, Nat.beq_refl]
+                      dsimp only
+                      rw [hF]
+                      dsimp only
+                      rw [hSubOk]
+                      dsimp only
+                      rw [hSet]
+                    · intro _ hTag
+                      have hTs : ts = true := by
+                        rcases hTag with hT | hT
+                        · exact hT
+                        · simp [noDowncast] at hT
+                      have hValEq := hSubVal (Or.inl hTs)
+                      have hN := stepped_tryIntoValue?_none
+                        (sh := explodeAggregate actualVariant fields)
+                        (disc' := (explodeAggregate actualVariant fields).discriminantSet &&
+                          ((some actualVariant).isNone || ts))
+                        hMapSome hU
+                      have hNorm :
+                          normalizeShell
+                            { explodeAggregate actualVariant fields with
+                              discriminantSet :=
+                                (explodeAggregate actualVariant fields).discriminantSet &&
+                                  ((some actualVariant).isNone || ts)
+                              fields :=
+                                (explodeAggregate actualVariant fields).fields.set idx c' } =
+                            .nested actualVariant true true
+                              ((fields.map FieldSlot.init).set idx c') := by
+                        rw [normalizeShell_eq_of_tagged hN rfl (by simp [explodeAggregate, hTs])]
+                        simp [PartialAggregate.toFieldSlot, explodeAggregate, hTs]
+                      have hN' :
+                          (PartialAggregate.mk actualVariant true true
+                            ((fields.map FieldSlot.init).set idx c')).tryIntoValue? = none := by
+                        simpa [explodeAggregate, hTs] using hN
+                      rw [hNorm]
+                      unfold fieldSlotToLocalSlotState
+                      dsimp only
+                      rw [hN']
+                      simp [LocalSlotState.toTrustedSlotExact, PartialAggregate.toTrustedValue,
+                        PartialAggregate.activeVariant, fieldSlotsToValues_set,
+                        fieldSlotsToValues_map_init, hValEq]
+                    · intro hTag
+                      have hTs : ts = true := by
+                        rcases hTag with hT | hT
+                        · exact hT
+                        · simp [noDowncast] at hT
+                      have hValEq := hSubVal (Or.inl hTs)
+                      have hN := stepped_tryIntoValue?_none
+                        (sh := explodeAggregate actualVariant fields)
+                        (disc' := (explodeAggregate actualVariant fields).discriminantSet &&
+                          ((some actualVariant).isNone || ts))
+                        hMapSome hU
+                      rw [normalizeShell_eq_of_tagged hN rfl (by simp [explodeAggregate, hTs])]
+                      simp [explodeAggregate, fieldSlotToValue,
+                        fieldSlotsToValues_set, fieldSlotsToValues_map_init, hValEq]
+                  · intro rootVal' hTOk
+                    rw [deinitProjectedValue_agg_downcast_field, Nat.beq_refl] at hTOk
+                    dsimp only at hTOk
+                    rw [hF] at hTOk
+                    dsimp only at hTOk
+                    cases hSubT :
+                        deinitProjectedValue locals fv tail localDecls layouts
+                          (deinitStepResolveTyOpt localDecls layouts fty curTyOpt) with
+                    | ub | unsupported =>
+                      rw [hSubT] at hTOk; nomatch hTOk
+                    | ok fv' =>
+                      obtain ⟨c', hcc⟩ := ihBwd fv' hSubT
+                      simp [deinitFieldSlot, deinitShellStep, explodeAggregate, shellVariant,
+                        hMapSome, hcc]
+                  · cases hSubD : deinitFieldSlot ts dlocals (.init fv) tail with
+                    | none =>
+                      have hSubUb := ihUb.mp hSubD
+                      have hLHS :
+                          deinitFieldSlot ts dlocals (.init (.aggregate actualVariant fields))
+                            (.downcast nm actualVariant :: .field idx fty :: tail) = none := by
+                        simp [deinitFieldSlot, deinitShellStep, explodeAggregate, shellVariant,
+                          hMapSome, hSubD]
+                      have hRHS :
+                          deinitProjectedValue locals (.aggregate actualVariant fields)
+                            (.downcast nm actualVariant :: .field idx fty :: tail)
+                            localDecls layouts curTyOpt = .ub := by
+                        rw [deinitProjectedValue_agg_downcast_field, Nat.beq_refl]
+                        dsimp only; rw [hF]; dsimp only; rw [hSubUb]
+                      rw [hLHS, hRHS]
+                      exact Iff.intro (fun _ => rfl) (fun _ => rfl)
+                    | some c' =>
+                      obtain ⟨fv', hSubOk, _⟩ := ihFwd c' hSubD
+                      have hSet : set? fields idx fv' = .some (fields.set idx fv') :=
+                        set?_eq_some_iff.mpr ⟨hLt, rfl⟩
+                      have hLHS :
+                          deinitFieldSlot ts dlocals (.init (.aggregate actualVariant fields))
+                            (.downcast nm actualVariant :: .field idx fty :: tail) ≠ none := by
+                        simp [deinitFieldSlot, deinitShellStep, explodeAggregate, shellVariant,
+                          hMapSome, hSubD]
+                      have hRHS :
+                          deinitProjectedValue locals (.aggregate actualVariant fields)
+                            (.downcast nm actualVariant :: .field idx fty :: tail)
+                            localDecls layouts curTyOpt =
+                            .ok (.aggregate actualVariant (fields.set idx fv')) := by
+                        rw [deinitProjectedValue_agg_downcast_field, Nat.beq_refl]
+                        dsimp only; rw [hF]; dsimp only
+                        rw [hSubOk]; dsimp only; rw [hSet]
+                      exact Iff.intro (fun h => absurd h hLHS)
+                        (fun h => by rw [hRHS] at h; nomatch h)
+              · have hDNone :
+                    deinitFieldSlot ts dlocals (.init (.aggregate actualVariant fields))
+                      (.downcast nm vIdx :: .field idx fty :: tail) = none := by
+                  simp [deinitFieldSlot, deinitShellStep, explodeAggregate, shellVariant, hNe]
+                have hTUb :
+                    deinitProjectedValue locals (.aggregate actualVariant fields)
+                      (.downcast nm vIdx :: .field idx fty :: tail)
+                      localDecls layouts curTyOpt = .ub := by
+                  rw [deinitProjectedValue_agg_downcast_field, hBeq]; dsimp only; rw [hPDTail]
+                exact And.intro (fun _ h => by rw [hDNone] at h; nomatch h)
+                  (And.intro (fun _ h => by rw [hTUb] at h; nomatch h)
+                    (by rw [hDNone, hTUb]; exact Iff.intro (fun _ => rfl) (fun _ => rfl)))
+          | downcast _ _ | index _ | constantIndex _ _ _ | subslice _ _ _
+          | opaqueCast _ | unwrapUnsafeBinder _ =>
+            cases v with
+            | uninit => nomatch hChain
+            | scalar _ | ptr _ _ | unit =>
+              exact And.intro (fun _ h => nomatch h)
+                (And.intro
+                  (fun _ h => by unfold deinitProjectedValue at h; rw [hPDRest] at h; nomatch h)
+                  (by
+                    unfold deinitFieldSlot deinitProjectedValue; rw [hPDRest]
+                    exact Iff.intro (fun _ => rfl) (fun _ => rfl)))
+            | aggregate var _ =>
+              exact And.intro (fun _ h => nomatch h)
+                (And.intro
+                  (fun _ h => by
+                    rcases var with _ | _ <;>
+                      (unfold deinitProjectedValue at h; rw [hPDRest] at h; nomatch h))
+                  (by
+                    rcases var with _ | _ <;> (
+                      unfold deinitFieldSlot deinitProjectedValue; rw [hPDRest]
+                      exact Iff.intro (fun _ => rfl) (fun _ => rfl))))
+      | index _ | constantIndex _ _ _ | subslice _ _ _
+      | deref | opaqueCast _ | unwrapUnsafeBinder _ =>
+        rcases v with _ | _ | _ | ⟨_ | _, _⟩ | _ <;> nomatch hChain
+
+/-- **Two-Sided Initialized-Slot `deinitFieldSlot` ↔ `deinitProjectedValue` Equivalence**:
+Under `DeinitInitChainOk v p` and `projectionHasDeref p = false`, Anneal's `deinitFieldSlot` and
+Trusted's `deinitProjectedValue` succeed on the exact same paths, fault (`none` ↔ `.ub`) on the
+exact same paths, and produce the **exact same** post-deinit `LocalSlot` under
+`LocalSlotState.toTrustedSlotExact` whenever the tag survives (`ts = true ∨ noDowncast p = true`). -/
+theorem deinitFieldSlot_init_exact_iff_trusted (ts : Bool)
+    (dlocals locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (v : Value) (p : List ProjectionElem) (curTyOpt : Option Ty)
+    (hChain : DeinitInitChainOk v p) (hND : projectionHasDeref p = false) :
+    (∀ slot', deinitFieldSlot ts dlocals (.init v) p = some slot' →
+      ∃ v', deinitProjectedValue locals v p localDecls layouts curTyOpt = .ok v' ∧
+        (p ≠ [] → (ts = true ∨ noDowncast p = true) →
+          (fieldSlotToLocalSlotState slot').toTrustedSlotExact = .init v') ∧
+        ((ts = true ∨ noDowncast p = true) → fieldSlotToValue slot' = v')) ∧
+    (∀ v', deinitProjectedValue locals v p localDecls layouts curTyOpt = .ok v' →
+      ∃ slot', deinitFieldSlot ts dlocals (.init v) p = some slot') ∧
+    (deinitFieldSlot ts dlocals (.init v) p = none ↔
+      deinitProjectedValue locals v p localDecls layouts curTyOpt = .ub) :=
+  deinitFieldSlot_init_exact_iff_trusted_aux ts dlocals locals localDecls layouts
+    p.length p (Nat.le_refl _) v curTyOpt hChain hND
 
 /-- **Bare-local `Deinit` step refinement**: on below-related frames, Anneal's `Deinit` of a bare
-local agrees with Trusted's `evalStmt`, which steps (never faults) to the frame with the local
-uninitialized, and the frames stay related. -/
+local agrees with Trusted's `evalStmt`, which invalidates conflicting borrows on `place.local_`,
+steps (never faults when `hasProtectedWriteConflict = false`) to the frame with the local
+uninitialized, and keeps the frames related. -/
 theorem evalStmt_deinit_root_refines {ts : Bool} {slots slots' : List LocalSlotState}
     {place : Place} {s : MachineState} {span : String} {localDecls : List LocalDecl}
     {layouts : LayoutTable} (hRel : SlotsRefine SlotBelow slots s.frame.locals)
-    (hRoot : place.projection = []) (h : evalDeinitPlace ts slots place = some slots') :
+    (hRoot : place.projection = []) (h : evalDeinitPlace ts slots place = some slots')
+    (hNoProt :
+      ∀ p ps, s.memory.activeProtectors = p :: ps →
+        hasProtectedWriteConflict s.memory.borrows (p :: ps) place.local_ .none .nil 0 0
+          (length s.memory.callStack) = false := by
+      intros; rfl) :
+    let borrows' :=
+      invalidateConflictingBorrows s.memory.borrows place.local_ .none (length s.memory.callStack)
     evalStmt s ⟨.deinit place, span⟩ localDecls layouts =
-        .step (advanceStmt s (s.frame.locals.set place.local_ .uninit)) ∧
+        .step (advanceStmt s (s.frame.locals.set place.local_ .uninit)
+          { s.memory with borrows := borrows' }) ∧
       SlotsRefine SlotBelow slots' (s.frame.locals.set place.local_ .uninit) := by
   obtain ⟨st, hSt, hLive, slot', hD, rfl⟩ := evalDeinitPlace_eq_some h
   rw [hRoot, deinitFieldSlot_nil] at hD
@@ -4773,26 +5575,45 @@ theorem evalStmt_deinit_root_refines {ts : Bool} {slots slots' : List LocalSlotS
       intro hTd
       subst hTd
       cases st <;> simp_all [SlotBelow]
+    have hSetT : set? s.frame.locals place.local_ .uninit =
+        .some (s.frame.locals.set place.local_ .uninit) :=
+      set?_eq_some_iff.mpr ⟨hLtT, rfl⟩
     refine ⟨?_, SlotsRefine.set (show SlotBelow .uninit .uninit from trivial) _ hRel⟩
     simp only [evalStmt, hRoot, get?_eq_getElem?, hT]
     cases t with
     | dead => exact absurd rfl hTnd
-    | uninit => simp only [set?_eq_some_iff.mpr ⟨hLtT, rfl⟩]
-    | init w => simp only [set?_eq_some_iff.mpr ⟨hLtT, rfl⟩]
+    | uninit | init _ =>
+      rw [hSetT]
+      dsimp only
+      cases hProt : s.memory.activeProtectors with
+      | nil => rfl
+      | cons p0 ps0 => dsimp only; rw [hNoProt p0 ps0 hProt]
 
 /-- **Projected `Deinit` step refinement**: on below-related frames, whenever Anneal's projected
 `Deinit` succeeds and Trusted's `deinitProjectedForLocal` updates `rootVal` to `rootVal'`,
-Trusted's `evalStmt` steps to `advanceStmt s (s.frame.locals.set place.local_ (.init rootVal'))`
-and the updated frames stay related by `SlotsRefine SlotBelow`. -/
+Trusted's `evalStmt` invalidates conflicting borrows at `place` and steps to
+`advanceStmt s (s.frame.locals.set place.local_ (.init rootVal')) { s.memory with borrows := ... }`,
+keeping the updated frames related by `SlotsRefine SlotBelow`. -/
 theorem evalStmt_deinit_projected_refines {ts : Bool} {slots slots' : List LocalSlotState}
     {place : Place} {s : MachineState} {span : String} {localDecls : List LocalDecl}
     {layouts : LayoutTable} (hRel : SlotsRefine SlotBelow slots s.frame.locals)
     (hProj : place.projection ≠ []) (h : evalDeinitPlace ts slots place = some slots')
     {rootVal rootVal' : Value} (hTRoot : s.frame.locals[place.local_]? = some (.init rootVal))
     (hTDeinit : deinitProjectedForLocal s.frame.locals localDecls layouts place.local_ rootVal
-      place.projection = .ok rootVal') :
+      place.projection = .ok rootVal')
+    (hNoProt :
+      ∀ p ps, s.memory.activeProtectors = p :: ps →
+        hasProtectedWriteConflict s.memory.borrows (p :: ps) place.local_ .none
+          (resolveBorrowWriteLocalProj localDecls layouts s.frame.locals place.local_
+            place.projection) 0 0 (length s.memory.callStack) = false := by
+      intros; rfl) :
+    let borrows' :=
+      invalidateConflictingBorrowsAtProj s.memory.borrows place.local_ .none
+        (resolveBorrowWriteLocalProj localDecls layouts s.frame.locals place.local_
+          place.projection) 0 0 (length s.memory.callStack)
     evalStmt s ⟨.deinit place, span⟩ localDecls layouts =
-        .step (advanceStmt s (s.frame.locals.set place.local_ (.init rootVal'))) ∧
+        .step (advanceStmt s (s.frame.locals.set place.local_ (.init rootVal'))
+          { s.memory with borrows := borrows' }) ∧
       SlotsRefine SlotBelow slots' (s.frame.locals.set place.local_ (.init rootVal')) := by
   obtain ⟨a, rest, hP⟩ : ∃ a rest, place.projection = a :: rest := by
     cases hp : place.projection with
@@ -4805,8 +5626,13 @@ theorem evalStmt_deinit_projected_refines {ts : Bool} {slots slots' : List Local
       .some (s.frame.locals.set place.local_ (.init rootVal')) :=
     set?_eq_some_iff.mpr ⟨hLtT, rfl⟩
   refine ⟨?_, ?_⟩
-  · rw [hP] at hTDeinit
-    simp only [evalStmt, hP, get?_eq_getElem?, hTRoot, hTDeinit, hSetT]
+  · rcases place with ⟨loc, proj⟩
+    dsimp only at hP hTRoot hTDeinit hNoProt hSetT ⊢
+    subst hP
+    simp only [evalStmt, get?_eq_getElem?, hTRoot, hTDeinit, hSetT]
+    cases hProt : s.memory.activeProtectors with
+    | nil => rfl
+    | cons p0 ps0 => dsimp only; rw [hNoProt p0 ps0 hProt]
   · rcases SlotsRefine.get?_rel place.local_ hRel with ⟨hA, _⟩ | ⟨a', t, hA, hT, hAT⟩
     · simp only [get?_eq_getElem?] at hA
       rw [hA] at hSt
@@ -4816,8 +5642,14 @@ theorem evalStmt_deinit_projected_refines {ts : Bool} {slots slots' : List Local
       cases hSt
       rw [hTRoot] at hT
       cases hT
-      have hTD : deinitProjectedValue s.frame.locals rootVal place.projection = .ok rootVal' := by
+      have hPD : projListHasDeref place.projection = false :=
+        (projListHasDeref_eq_projectionHasDeref place.projection).trans (deinitFieldSlot_noDeref hD)
+      have hTD :
+          deinitProjectedValue s.frame.locals rootVal place.projection localDecls layouts
+            (placeTy localDecls layouts ⟨place.local_, .nil⟩) = .ok rootVal' := by
         unfold deinitProjectedForLocal at hTDeinit
+        rw [hPD] at hTDeinit
+        dsimp only at hTDeinit
         cases hUnion : placeTouchesUnion localDecls layouts place with
         | true => rw [hUnion] at hTDeinit; nomatch hTDeinit
         | false => rw [hUnion] at hTDeinit; exact hTDeinit
@@ -4827,8 +5659,9 @@ theorem evalStmt_deinit_projected_refines {ts : Bool} {slots slots' : List Local
         | uninit => trivial
         | init v => exact hAT
         | partialShell sh => exact hAT
-      have hB := deinitFieldSlot_below_deinitProjectedValue _ _ _ _ _ hD s.frame.locals rootVal
-        rootVal' hB0 hTD
+      have hB := deinitFieldSlot_below_deinitProjectedValue _ _ _ _ _ hD s.frame.locals
+        localDecls layouts (placeTy localDecls layouts ⟨place.local_, .nil⟩) rootVal rootVal'
+        hB0 hTD
       have hShape : rootVal' = .uninit ∨ ∃ var' vals', rootVal' = .aggregate var' vals' := by
         cases st with
         | dead => exact absurd rfl hLive
@@ -4836,12 +5669,14 @@ theorem evalStmt_deinit_projected_refines {ts : Bool} {slots slots' : List Local
           cases rootVal with
           | uninit => exact Or.inl (by
               rw [hP] at hTD
-              simp only [deinitProjectedValue] at hTD
-              cases hTailOk : Trusted.Rustc.V2026_06_01.MirSemantics.deinitTailOk s.frame.locals (a :: rest) with
+              unfold deinitProjectedValue at hTD
+              cases hTailOk :
+                  Trusted.Rustc.V2026_06_01.MirSemantics.deinitTailOk s.frame.locals localDecls
+                    layouts (placeTy localDecls layouts ⟨place.local_, .nil⟩) (a :: rest) with
               | true => rw [hTailOk] at hTD; injection hTD with hEq; exact hEq.symm
               | false =>
                 rw [hTailOk] at hTD; dsimp only at hTD
-                cases hPD : projListHasDeref (a :: rest) <;> (rw [hPD] at hTD; nomatch hTD))
+                cases hPD' : projListHasDeref (a :: rest) <;> (rw [hPD'] at hTD; nomatch hTD))
           | aggregate var vals => exact deinitProjectedValue_aggregate_shape hTD
           | _ => exact absurd hAT id
         | init v =>
@@ -4868,9 +5703,10 @@ theorem evalStmt_deinit_projected_refines {ts : Bool} {slots slots' : List Local
 /-- **Projected `Deinit` of an initialized local refines Trusted with two-sided post-deinit
 uninit equivalence (`evalStmt_deinit_projected_init_refines`)**: when the Anneal root is
 initialized and the place does not project through a union (`placeTouchesUnion = false`),
-Anneal's `evalDeinitPlace` produces a `SlotBelow`-related frame, Trusted's `evalStmt` updates
-`place.local_` to `.init rootVal'` with `Value.uninit` at `place.projection`, and reading `place`
-afterwards faults with `.ub` in **both** Anneal and Trusted! -/
+Anneal's `evalDeinitPlace` produces a `SlotBelow`-related frame, Trusted's `evalStmt` invalidates
+conflicting borrows and updates `place.local_` to `.init rootVal'` with `Value.uninit` at
+`place.projection`, and reading `place` afterwards faults with `.ub` in **both** Anneal and
+Trusted! -/
 theorem evalStmt_deinit_projected_init_refines {ts : Bool} {slots slots' : List LocalSlotState}
     {place : Place} {s : MachineState} {span : String} {localDecls : List LocalDecl}
     {layouts : LayoutTable} (hRel : SlotsRefine SlotBelow slots s.frame.locals)
@@ -4878,12 +5714,23 @@ theorem evalStmt_deinit_projected_init_refines {ts : Bool} {slots slots' : List 
     (hRoot : slots[place.local_]? = some (.init rootVal))
     (h : evalDeinitPlace ts slots place = some slots')
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
-      simp [placeTouchesUnion_nil_decls, placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_decls, placeTouchesUnion_nil_proj])
+    (hNoProt :
+      ∀ p ps, s.memory.activeProtectors = p :: ps →
+        hasProtectedWriteConflict s.memory.borrows (p :: ps) place.local_ .none
+          (resolveBorrowWriteLocalProj localDecls layouts s.frame.locals place.local_
+            place.projection) 0 0 (length s.memory.callStack) = false := by
+      intros; rfl) :
+    let borrows' :=
+      invalidateConflictingBorrowsAtProj s.memory.borrows place.local_ .none
+        (resolveBorrowWriteLocalProj localDecls layouts s.frame.locals place.local_
+          place.projection) 0 0 (length s.memory.callStack)
     ∃ rootVal',
       deinitProjectedForLocal s.frame.locals localDecls layouts place.local_ rootVal
         place.projection = .ok rootVal' ∧
       evalStmt s ⟨.deinit place, span⟩ localDecls layouts =
-        .step (advanceStmt s (s.frame.locals.set place.local_ (.init rootVal'))) ∧
+        .step (advanceStmt s (s.frame.locals.set place.local_ (.init rootVal'))
+          { s.memory with borrows := borrows' }) ∧
       SlotsRefine SlotBelow slots' (s.frame.locals.set place.local_ (.init rootVal')) ∧
       readPlaceState slots' place = .ub ∧
       readProjectedValue (s.frame.locals.set place.local_ (.init rootVal')) rootVal'
@@ -4902,69 +5749,22 @@ theorem evalStmt_deinit_projected_init_refines {ts : Bool} {slots slots' : List 
     | init w =>
       have hw : rootVal = w := hAT
       subst hw
+      have hND : projectionHasDeref place.projection = false := deinitFieldSlot_noDeref hD
+      have hPD : projListHasDeref place.projection = false :=
+        (projListHasDeref_eq_projectionHasDeref place.projection).trans hND
       obtain ⟨rootVal', hTD, _⟩ :=
         deinitFieldSlot_init_deinitProjectedValue _ _ _ _ _ hD rootVal rfl s.frame.locals
+      have hEqUntyped := deinitProjectedValue_eq_untyped_of_deinitFieldSlot_init
+        _ _ _ _ _ hD rootVal rfl s.frame.locals localDecls layouts
+        (placeTy localDecls layouts ⟨place.local_, .nil⟩)
       have hTDF : deinitProjectedForLocal s.frame.locals localDecls layouts place.local_ rootVal
           place.projection = .ok rootVal' := by
         unfold deinitProjectedForLocal
-        rw [hNoUnion]
+        rw [hPD, hNoUnion]
+        dsimp only
+        rw [hEqUntyped]
         exact hTD
-      obtain ⟨hStep, hRel'⟩ := evalStmt_deinit_projected_refines hRel hProj h hT hTDF
-      have hND : projectionHasDeref place.projection = false := by
-        have hNDAux : ∀ (s0 : FieldSlot) (p0 : List ProjectionElem) (s0' : FieldSlot),
-            deinitFieldSlot ts (slotsToTrustedLocals slots) s0 p0 = some s0' →
-            projectionHasDeref p0 = false := by
-          intro s0 p0 s0' h0
-          fun_induction deinitFieldSlot ts (slotsToTrustedLocals slots) s0 p0 generalizing s0' with
-          | case1 => rfl
-          | case2 p rest hTailOk =>
-            have hT0 : ∀ (n : Nat) (q : List ProjectionElem), q.length ≤ n →
-                deinitTailOk (slotsToTrustedLocals slots) q = true →
-                projectionHasDeref q = false := by
-              intro n; induction n with
-              | zero =>
-                intro q hL _
-                have hq : q = [] := List.eq_nil_of_length_eq_zero (Nat.le_zero.mp hL)
-                subst hq
-                rfl
-              | succ n ih =>
-                intro q hL hq; rcases q with _ | ⟨x, xs⟩
-                · rfl
-                · simp only [List.length_cons] at hL
-                  cases x with
-                  | field _ _ => exact ih xs (by omega) hq
-                  | downcast _ _ =>
-                    rcases xs with _ | ⟨y, ys⟩
-                    · nomatch hq
-                    · cases y with
-                      | field _ _ => exact ih ys (by simp at hL; omega) hq
-                      | _ => nomatch hq
-                  | index i =>
-                    unfold deinitTailOk at hq
-                    split at hq
-                    · exact ih xs (by omega) hq
-                    · nomatch hq
-                  | constantIndex _ _ _ | subslice _ _ _ =>
-                    unfold deinitTailOk at hq
-                    simp only [Bool.and_eq_true] at hq
-                    exact ih xs (by omega) hq.2
-                  | _ => nomatch hq
-            exact hT0 (p :: rest).length (p :: rest) (Nat.le_refl _) hTailOk
-          | case3 => nomatch h0
-          | case4 var vals idx ty rest ih =>
-            obtain ⟨_, c, c', _, hcc, _⟩ := deinitShellStep_eq_some h0
-            exact ih c c' hcc
-          | case5 var vals n v idx ty rest ih =>
-            obtain ⟨_, c, c', _, hcc, _⟩ := deinitShellStep_eq_some h0
-            exact ih c c' hcc
-          | case6 var adt disc fs idx ty rest ih =>
-            obtain ⟨_, c, c', _, hcc, _⟩ := deinitShellStep_eq_some h0
-            exact ih c c' hcc
-          | case7 var adt disc fs n v idx ty rest ih =>
-            obtain ⟨_, c, c', _, hcc, _⟩ := deinitShellStep_eq_some h0
-            exact ih c c' hcc
-          | case8 => nomatch h0
-        exact hNDAux _ _ _ hD
+      obtain ⟨hStep, hRel'⟩ := evalStmt_deinit_projected_refines hRel hProj h hT hTDF hNoProt
       have hReadA : readPlaceState slots' place = .ub := by
         simpa [hND] using evalDeinitPlace_read_extension_ub h [] (by simpa using hND)
       have hReadT : readProjectedValue (s.frame.locals.set place.local_ (.init rootVal')) rootVal'
@@ -4972,8 +5772,6 @@ theorem evalStmt_deinit_projected_init_refines {ts : Bool} {slots slots' : List 
         readProjectedValue_of_deinitFieldSlot_ub _ _ _ _ _ hD
           (s.frame.locals.set place.local_ (.init rootVal')) rootVal rootVal' rfl
           (by
-            -- `deinitFieldSlot` on `.init` has no `.index` step, so `deinitProjectedValue` is
-            -- independent of `locals`:
             have hIndep : ∀ (s0 : FieldSlot) (p0 : List ProjectionElem) (s0' : FieldSlot),
                 deinitFieldSlot ts (slotsToTrustedLocals slots) s0 p0 = some s0' →
                 ∀ (v0 : Value), s0 = .init v0 →
@@ -5012,36 +5810,230 @@ theorem evalStmt_deinit_projected_init_refines {ts : Bool} {slots slots' : List 
       exact ⟨rootVal', hTDF, hStep, hRel', hReadA, hReadT⟩
     | _ => exact absurd hAT id
 
-/-- **Two-sided agreement on projected `Deinit` below an uninitialized root local
+/-- **Two-Sided Initialized-Root Projected `Deinit` Operational Equivalence
+(`evalStmt_deinit_projected_init_iff`)**: on an initialized non-union aggregate root
+(`DeinitInitChainOk rootVal place.projection`, `projectionHasDeref = false`, `placeTouchesUnion = false`),
+Anneal's `evalDeinitPlace` and Trusted's `evalStmt` succeed iff the other succeeds, fault (`none` ↔
+`.fail .ub`) iff the other faults, and when `ts = true ∨ noDowncast place.projection = true` produce
+the **exact same** post-deinit `LocalSlot` frame under `LocalSlotState.toTrustedSlotExact` (`=`). -/
+theorem evalStmt_deinit_projected_init_iff {ts : Bool}
+    {slots : List LocalSlotState} {place : Place} {s : MachineState} {span : String}
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {rootVal : Value}
+    (hProj : place.projection ≠ [])
+    (hND : projectionHasDeref place.projection = false)
+    (hNoUnion : placeTouchesUnion localDecls layouts place = false)
+    (hA : slots[place.local_]? = some (.init rootVal))
+    (hT : s.frame.locals[place.local_]? = some (.init rootVal))
+    (hChain : DeinitInitChainOk rootVal place.projection)
+    (hNoProt :
+      ∀ p ps, s.memory.activeProtectors = p :: ps →
+        hasProtectedWriteConflict s.memory.borrows (p :: ps) place.local_ .none
+          (resolveBorrowWriteLocalProj localDecls layouts s.frame.locals place.local_
+            place.projection) 0 0 (length s.memory.callStack) = false := by
+      intros; rfl) :
+    let borrows' :=
+      invalidateConflictingBorrowsAtProj s.memory.borrows place.local_ .none
+        (resolveBorrowWriteLocalProj localDecls layouts s.frame.locals place.local_
+          place.projection) 0 0 (length s.memory.callStack)
+    ((∃ slots', evalDeinitPlace ts slots place = some slots') ↔
+        (∃ s', evalStmt s ⟨.deinit place, span⟩ localDecls layouts = .step s')) ∧
+      (evalDeinitPlace ts slots place = none ↔
+        evalStmt s ⟨.deinit place, span⟩ localDecls layouts = .fail .ub) ∧
+      (∀ slots', evalDeinitPlace ts slots place = some slots' →
+        (ts = true ∨ noDowncast place.projection = true) →
+        ∃ rootVal',
+          evalStmt s ⟨.deinit place, span⟩ localDecls layouts =
+            .step (advanceStmt s (s.frame.locals.set place.local_ (.init rootVal'))
+              { s.memory with borrows := borrows' }) ∧
+          slots'.map LocalSlotState.toTrustedSlotExact =
+            (slots.map LocalSlotState.toTrustedSlotExact).set place.local_ (.init rootVal')) := by
+  obtain ⟨a, rest, hP⟩ : ∃ a rest, place.projection = a :: rest := by
+    cases hp : place.projection with
+    | nil => exact absurd hp hProj
+    | cons a rest => exact ⟨a, rest, rfl⟩
+  have hLtT : place.local_ < s.frame.locals.length := (List.getElem?_eq_some_iff.mp hT).1
+  obtain ⟨hFwd, hBwd, hUbIff⟩ := deinitFieldSlot_init_exact_iff_trusted ts
+    (slotsToTrustedLocals slots) s.frame.locals localDecls layouts rootVal place.projection
+    (placeTy localDecls layouts ⟨place.local_, .nil⟩) hChain hND
+  have hEvalD : evalDeinitPlace ts slots place =
+      match deinitFieldSlot ts (slotsToTrustedLocals slots) (.init rootVal) place.projection with
+      | none => none
+      | some slot' => some (slots.set place.local_ (fieldSlotToLocalSlotState slot')) := by
+    unfold evalDeinitPlace
+    rw [hA, hP]
+    rfl
+  have hEvalT : evalStmt s ⟨.deinit place, span⟩ localDecls layouts =
+      match deinitProjectedValue s.frame.locals rootVal place.projection localDecls layouts
+          (placeTy localDecls layouts ⟨place.local_, .nil⟩) with
+      | .ok rootVal' =>
+        .step (advanceStmt s (s.frame.locals.set place.local_ (.init rootVal'))
+          { s.memory with
+            borrows := invalidateConflictingBorrowsAtProj s.memory.borrows place.local_ .none
+              (resolveBorrowWriteLocalProj localDecls layouts s.frame.locals place.local_
+                place.projection) 0 0 (length s.memory.callStack) })
+      | .ub => .fail .ub
+      | .unsupported => .unsupported := by
+    rcases place with ⟨loc, proj⟩
+    dsimp only at hP hND hNoUnion hT hLtT hNoProt ⊢
+    subst hP
+    have hPD : projListHasDeref (a :: rest) = false :=
+      (projListHasDeref_eq_projectionHasDeref (a :: rest)).trans hND
+    simp only [evalStmt, get?_eq_getElem?, hT, deinitProjectedForLocal, hPD, hNoUnion]
+    cases deinitProjectedValue s.frame.locals rootVal (a :: rest) localDecls layouts
+        (placeTy localDecls layouts ⟨loc, .nil⟩) with
+    | ub => rfl
+    | unsupported => rfl
+    | ok rootVal' =>
+      dsimp only
+      rw [set?_eq_some_iff.mpr ⟨hLtT, rfl⟩]
+      dsimp only
+      cases hProt : s.memory.activeProtectors with
+      | nil => rfl
+      | cons p0 ps0 => dsimp only; rw [hNoProt p0 ps0 hProt]
+  dsimp only
+  rw [hEvalD, hEvalT]
+  cases hDF : deinitFieldSlot ts (slotsToTrustedLocals slots) (.init rootVal) place.projection with
+  | none =>
+    rw [hUbIff.mp hDF]
+    exact And.intro (Iff.intro (fun ⟨_, h⟩ => nomatch h) (fun ⟨_, h⟩ => nomatch h))
+      (And.intro (Iff.intro (fun _ => rfl) (fun _ => rfl))
+        (fun _ h => nomatch h))
+  | some slot' =>
+    obtain ⟨rootVal', hTOk, hSlotEx, _⟩ := hFwd slot' hDF
+    rw [hTOk]
+    refine And.intro (Iff.intro (fun _ => ⟨_, rfl⟩) (fun _ => ⟨_, rfl⟩))
+      (And.intro (Iff.intro (fun h => nomatch h) (fun h => nomatch h)) ?_)
+    intro slots' hEq hTag
+    injection hEq with hSlots'
+    subst hSlots'
+    exact ⟨rootVal', rfl, by rw [List.map_set, hSlotEx hProj hTag]⟩
+
+/-- **Agreement on projected `Deinit` below an uninitialized root local
 (`evalStmt_deinit_projected_uninit_root_agrees`)**: when `place.local_` is live `.uninit` in both
-Anneal and Trusted (related by `SlotsRefine SlotBelow` or `SameScalarLocals`), both `evalDeinitPlace`
-and Trusted's `evalStmt` validate `deinitTailOk` on `place.projection` and step as a no-op keeping
-the `.uninit` root local unchanged (retiring `evalStmt_deinit_projected_uninit_root_divergence`). -/
+Anneal and Trusted (related by `SlotsRefine SlotBelow`) on a well-typed projection chain
+(`WellTypedDeinitProj`), both `evalDeinitPlace` and Trusted's `evalStmt` validate `deinitTailOk`
+and step as a no-op on the local slot while invalidating conflicting borrows. -/
 theorem evalStmt_deinit_projected_uninit_root_agrees {ts : Bool}
     {slots : List LocalSlotState} {place : Place} {s : MachineState} {span : String}
-    {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {curTy : Ty}
     (hRel : SlotsRefine SlotBelow slots s.frame.locals)
     (hProj : place.projection ≠ [])
     (hA : slots[place.local_]? = some .uninit)
     (hTail : deinitTailOk (slotsToTrustedLocals slots) place.projection = true)
-    (hT : s.frame.locals[place.local_]? = some .uninit) :
+    (hT : s.frame.locals[place.local_]? = some .uninit)
+    (hTy : placeTy localDecls layouts ⟨place.local_, .nil⟩ = .some curTy)
+    (hWT : WellTypedDeinitProj (slotsToTrustedLocals slots) localDecls layouts curTy
+      place.projection)
+    (hNoProt :
+      ∀ p ps, s.memory.activeProtectors = p :: ps →
+        hasProtectedWriteConflict s.memory.borrows (p :: ps) place.local_ .none
+          (resolveBorrowWriteLocalProj localDecls layouts s.frame.locals place.local_
+            place.projection) 0 0 (length s.memory.callStack) = false := by
+      intros; rfl) :
+    let borrows' :=
+      invalidateConflictingBorrowsAtProj s.memory.borrows place.local_ .none
+        (resolveBorrowWriteLocalProj localDecls layouts s.frame.locals place.local_
+          place.projection) 0 0 (length s.memory.callStack)
     evalDeinitPlace ts slots place = some slots ∧
-      evalStmt s ⟨.deinit place, span⟩ localDecls layouts = .step (advanceStmt s s.frame.locals) := by
+      evalStmt s ⟨.deinit place, span⟩ localDecls layouts =
+        .step (advanceStmt s s.frame.locals { s.memory with borrows := borrows' }) := by
   obtain ⟨a, rest, hP⟩ : ∃ a rest, place.projection = a :: rest := by
     cases hp : place.projection with
     | nil => exact absurd hp hProj
     | cons a rest => exact ⟨a, rest, rfl⟩
   have hLt : place.local_ < slots.length := (List.getElem?_eq_some_iff.mp hA).1
   have hSame := sameScalarLocals_of_slotBelow hRel
-  have hTailT := deinitTailOk_implies_trusted hSame place.projection hTail
+  have hTailT := deinitTailOk_implies_trusted hSame place.projection hWT hTail
   refine ⟨?_, ?_⟩
   · rw [hP] at hTail
     simp only [evalDeinitPlace, hA, hP, slotStateToFieldSlot, deinitFieldSlot, hTail, ↓reduceIte,
       fieldSlotToLocalSlotState]
     have hEq : slots[place.local_] = .uninit := (List.getElem?_eq_some_iff.mp hA).2
     rw [← hEq, List.set_getElem_self hLt]
-  · rw [hP] at hTailT
-    simp only [evalStmt, hP, get?_eq_getElem?, hT, hTailT]
+  · rcases place with ⟨loc, proj⟩
+    dsimp only at hP hT hTy hTailT hNoProt ⊢
+    subst hP
+    simp only [evalStmt, get?_eq_getElem?, hT, hTy, hTailT]
+    cases hProt : s.memory.activeProtectors with
+    | nil => rfl
+    | cons p0 ps0 => dsimp only; rw [hNoProt p0 ps0 hProt]
+
+/-- **Two-Sided Uninitialized-Root Projected `Deinit` Operational Equivalence
+(`evalStmt_deinit_projected_uninit_iff`)**: on a live `.uninit` root local under `SameScalarLocals`
+and `WellTypedDeinitProj` (`projectionHasDeref = false`), Anneal's `evalDeinitPlace` and Trusted's
+`evalStmt` both step (keeping the `.uninit` local unchanged) when `deinitTailOk = true` and both
+fault (`none` ↔ `.fail .ub`) when `deinitTailOk = false`. -/
+theorem evalStmt_deinit_projected_uninit_iff {ts : Bool}
+    {slots : List LocalSlotState} {place : Place} {s : MachineState} {span : String}
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {curTy : Ty}
+    (hSame : SameScalarLocals (slotsToTrustedLocals slots) s.frame.locals)
+    (hProj : place.projection ≠ [])
+    (hND : projectionHasDeref place.projection = false)
+    (hA : slots[place.local_]? = some .uninit)
+    (hT : s.frame.locals[place.local_]? = some .uninit)
+    (hTy : placeTy localDecls layouts ⟨place.local_, .nil⟩ = .some curTy)
+    (hWT : WellTypedDeinitProj (slotsToTrustedLocals slots) localDecls layouts curTy
+      place.projection)
+    (hNoProt :
+      ∀ p ps, s.memory.activeProtectors = p :: ps →
+        hasProtectedWriteConflict s.memory.borrows (p :: ps) place.local_ .none
+          (resolveBorrowWriteLocalProj localDecls layouts s.frame.locals place.local_
+            place.projection) 0 0 (length s.memory.callStack) = false := by
+      intros; rfl) :
+    let borrows' :=
+      invalidateConflictingBorrowsAtProj s.memory.borrows place.local_ .none
+        (resolveBorrowWriteLocalProj localDecls layouts s.frame.locals place.local_
+          place.projection) 0 0 (length s.memory.callStack)
+    (evalDeinitPlace ts slots place = some slots ↔
+        evalStmt s ⟨.deinit place, span⟩ localDecls layouts =
+          .step (advanceStmt s s.frame.locals { s.memory with borrows := borrows' })) ∧
+      ((∃ slots', evalDeinitPlace ts slots place = some slots') ↔
+        (∃ s', evalStmt s ⟨.deinit place, span⟩ localDecls layouts = .step s')) ∧
+      (evalDeinitPlace ts slots place = none ↔
+        evalStmt s ⟨.deinit place, span⟩ localDecls layouts = .fail .ub) := by
+  obtain ⟨a, rest, hP⟩ : ∃ a rest, place.projection = a :: rest := by
+    cases hp : place.projection with
+    | nil => exact absurd hp hProj
+    | cons a rest => exact ⟨a, rest, rfl⟩
+  have hLt : place.local_ < slots.length := (List.getElem?_eq_some_iff.mp hA).1
+  have hEqSlot : slots[place.local_] = .uninit := (List.getElem?_eq_some_iff.mp hA).2
+  have hTailEq := deinitTailOk_typed_eq_trusted hSame place.projection curTy hWT
+  rcases place with ⟨loc, proj⟩
+  dsimp only at hP hND hA hT hTy hLt hEqSlot hTailEq hNoProt ⊢
+  subst hP
+  cases hTail : deinitTailOk (slotsToTrustedLocals slots) (a :: rest) with
+  | true =>
+    have hTailT : Trusted.Rustc.V2026_06_01.MirSemantics.deinitTailOk s.frame.locals localDecls
+        layouts (.some curTy) (a :: rest) = true := hTailEq.symm.trans hTail
+    have hAOk : evalDeinitPlace ts slots ⟨loc, a :: rest⟩ = some slots := by
+      simp only [evalDeinitPlace, hA, slotStateToFieldSlot, deinitFieldSlot, hTail, ↓reduceIte,
+        fieldSlotToLocalSlotState]
+      rw [← hEqSlot, List.set_getElem_self hLt]
+    have hTOk : evalStmt s ⟨.deinit ⟨loc, a :: rest⟩, span⟩ localDecls layouts =
+        .step (advanceStmt s s.frame.locals
+          { s.memory with
+            borrows := invalidateConflictingBorrowsAtProj s.memory.borrows loc .none
+              (resolveBorrowWriteLocalProj localDecls layouts s.frame.locals loc (a :: rest)) 0 0
+              (length s.memory.callStack) }) := by
+      simp only [evalStmt, get?_eq_getElem?, hT, hTy, hTailT]
+      cases hProt : s.memory.activeProtectors with
+      | nil => rfl
+      | cons p0 ps0 => dsimp only; rw [hNoProt p0 ps0 hProt]
+    rw [hAOk, hTOk]
+    exact And.intro (Iff.intro (fun _ => rfl) (fun _ => rfl))
+      (And.intro (Iff.intro (fun _ => ⟨_, rfl⟩) (fun _ => ⟨_, rfl⟩))
+        (Iff.intro (fun h => nomatch h) (fun h => nomatch h)))
+  | false =>
+    have hTailT : Trusted.Rustc.V2026_06_01.MirSemantics.deinitTailOk s.frame.locals localDecls
+        layouts (.some curTy) (a :: rest) = false := hTailEq.symm.trans hTail
+    have hANone : evalDeinitPlace ts slots ⟨loc, a :: rest⟩ = none := by
+      simp [evalDeinitPlace, hA, slotStateToFieldSlot, deinitFieldSlot, hTail]
+    have hTUb : evalStmt s ⟨.deinit ⟨loc, a :: rest⟩, span⟩ localDecls layouts = .fail .ub := by
+      simp [evalStmt, get?_eq_getElem?, hT, hTy, hTailT, hND]
+    rw [hANone, hTUb]
+    exact And.intro (Iff.intro (fun h => nomatch h) (fun h => nomatch h))
+      (And.intro (Iff.intro (fun ⟨_, h⟩ => nomatch h) (fun ⟨_, h⟩ => nomatch h))
+        (Iff.intro (fun _ => rfl) (fun _ => rfl)))
 
 /-! ### Section 2e: Byte-level `Uninit` refinement (closing `Translate.lean:3742`) -/
 
@@ -12786,8 +13778,11 @@ theorem evalAdtDiscriminant_refines_evalRvalue {slots : List LocalSlotState}
     evalRvalue locals (.discriminant place) mem localDecls layouts =
         .ok (.scalar ⟨v, 8⟩) locals mem ∧
       spec.discriminants[v]? = some d := by
+  have hInit : valueListContainsUninit fields = false :=
+    valueContainsUninit_eq_false_of_readPlaceState hRead
   obtain ⟨hT, hD, _⟩ :=
     evalAdtDiscriminant_init_agrees_trusted spec wf hEnum h locals mem place localDecls layouts hTy
+      hInit
   obtain ⟨rootVal, hRoot, hProj⟩ := readPlaceState_below_refines hRel hRead
   refine ⟨?_, hD⟩
   unfold evalRvalue
@@ -14319,6 +15314,16 @@ theorem StateCorr.jump {env : CfgEnv} {bb : Nat} {slots slots' : List LocalSlotS
     {s : MachineState} (hCorr : StateCorr env bb slots s) (t : Nat) (locals' : List LocalSlot)
     (hRel : SlotsRefine SlotBelow slots' locals') :
     StateCorr env t slots' { s with frame := { blockIdx := t, stmtIdx := 0, locals := locals' } } :=
+  ⟨rfl, rfl, hRel, hCorr.callee, hCorr.stack, hCorr.globals, hCorr.noIntrinsicCallee,
+    hCorr.memIntrinsicNone⟩
+
+theorem StateCorr.jumpBorrows {env : CfgEnv} {bb : Nat} {slots slots' : List LocalSlotState}
+    {s : MachineState} (hCorr : StateCorr env bb slots s) (t : Nat) (locals' : List LocalSlot)
+    (borrows' : List BorrowEntry) (hRel : SlotsRefine SlotBelow slots' locals') :
+    StateCorr env t slots'
+      { s with
+        frame := { blockIdx := t, stmtIdx := 0, locals := locals' }
+        memory := { s.memory with borrows := borrows' } } :=
   ⟨rfl, rfl, hRel, hCorr.callee, hCorr.stack, hCorr.globals, hCorr.noIntrinsicCallee,
     hCorr.memIntrinsicNone⟩
 
@@ -16624,19 +17629,29 @@ theorem evalLoweredTerminator_drop_trusted_live {env : CfgEnv} {body : LBody} {b
     | _ => simp [SlotBelow] at hAT
 
 /-- **Documented divergence of `Drop`**: Anneal's `Drop` (no drop glue) keeps the dropped bare
-local's value, while Trusted's `evalTerminator` marks it uninitialized; a later read of the local
-is defined in Anneal (and in Miri, for types without drop glue) but not in Trusted. Hence
-`Drop` is excluded from `LTerminator.Refinable`. -/
+local's value, while Trusted's `evalTerminator` marks it uninitialized and invalidates conflicting
+borrows; a later read of the local is defined in Anneal (and in Miri, for types without drop glue)
+but not in Trusted. Hence `Drop` is excluded from `LTerminator.Refinable`. -/
 theorem evalLoweredTerminator_drop_bare_divergence {env : CfgEnv} {body : LBody} {bb : Nat}
     {slots : List LocalSlotState} {unwinding : Option Nat} {b : LBlock} {loc : Local}
     {target : Nat} {u : UnwindAction} (hb : body.blocks[bb]? = some b)
     (hT : b.terminator = .drop ⟨loc, []⟩ target u) {step : CfgStep}
     (h : evalLoweredTerminator env body bb slots unwinding = some step)
     (s : MachineState) (span : String) (cmOpt : Option CapturedMir) {slot : LocalSlot}
-    (hSlot : s.frame.locals[loc]? = some slot) (hLive : slot ≠ .dead) :
+    (hSlot : s.frame.locals[loc]? = some slot) (hLive : slot ≠ .dead)
+    (hNoProt :
+      ∀ p ps, s.memory.activeProtectors = p :: ps →
+        hasProtectedWriteConflict s.memory.borrows (p :: ps) loc .none .nil 0 0
+          (length s.memory.callStack) = false := by
+      intros; rfl) :
+    let borrows' :=
+      invalidateConflictingBorrows s.memory.borrows loc .none (length s.memory.callStack)
     step = .goto target slots unwinding ∧
       evalTerminator s ⟨.drop ⟨loc, []⟩ target u, span⟩ cmOpt =
-        .step { s with frame := ⟨target, 0, s.frame.locals.set loc LocalSlot.uninit⟩ } := by
+        .step
+          { s with
+            frame := ⟨target, 0, s.frame.locals.set loc LocalSlot.uninit⟩
+            memory := { s.memory with borrows := borrows' } } := by
   refine ⟨?_, ?_⟩
   · unfold evalLoweredTerminator at h
     rw [hb] at h
@@ -16647,18 +17662,32 @@ theorem evalLoweredTerminator_drop_bare_divergence {env : CfgEnv} {body : LBody}
       · exact cfgGoto_eq_some h
       · nomatch h
   · have hLt : loc < s.frame.locals.length := (List.getElem?_eq_some_iff.mp hSlot).1
+    have hSet : set? s.frame.locals loc .uninit = some (s.frame.locals.set loc .uninit) :=
+      set?_eq_some_iff.mpr ⟨hLt, rfl⟩
     simp only [evalTerminator, get?_eq_getElem?, hSlot]
     cases slot with
     | dead => exact absurd rfl hLive
-    | _ => simp only [set?_eq_some_iff.mpr ⟨hLt, rfl⟩]
+    | uninit | init _ =>
+      rw [hSet]
+      dsimp only
+      cases hProt : s.memory.activeProtectors with
+      | nil => rfl
+      | cons p0 ps0 => dsimp only; rw [hNoProt p0 ps0 hProt]
+
+/-- Extract `layouts` from an optional active `CapturedMir` body, defaulting to `emptyLayoutTable`
+when `cmOpt = none`. -/
+@[simp, reducible]
+def bodyLayoutsOf : Option CapturedMir → LayoutTable
+  | some cm => cm.layouts
+  | none => emptyLayoutTable
 
 /-- **Projected `Drop` step & sub-place deinitialization agreement
 (`evalLoweredTerminator_drop_projected_refines`)**: on a live initialized root local `rootVal`
 where Trusted's `deinitProjectedForLocal` updates `rootVal` to `rootVal'`, Anneal's no-glue
 `evalLoweredTerminator` jumps to `target` while Trusted's `evalTerminator` deinitializes `place` to
-`Value.uninit` (`s.frame.locals.set place.local_ (.init rootVal')`) and jumps to `target`; moreover,
-whenever `evalDeinitPlace ts slots place = some slots'`, the deinitialized Anneal frame `slots'`
-and Trusted's target state satisfy `StateCorr`. -/
+`Value.uninit` (`s.frame.locals.set place.local_ (.init rootVal')`), invalidates conflicting
+borrows, and jumps to `target`; moreover, whenever `evalDeinitPlace ts slots place = some slots'`,
+the deinitialized Anneal frame `slots'` and Trusted's target state satisfy `StateCorr`. -/
 theorem evalLoweredTerminator_drop_projected_refines {env : CfgEnv} {body : LBody} {bb : Nat}
     {slots : List LocalSlotState} {unwinding : Option Nat} {s : MachineState} {b : LBlock}
     {place : Place} {target : Nat} {u : UnwindAction} {step : CfgStep}
@@ -16668,15 +17697,30 @@ theorem evalLoweredTerminator_drop_projected_refines {env : CfgEnv} {body : LBod
     (cmOpt : Option CapturedMir) {rootVal rootVal' : Value}
     (hTRoot : s.frame.locals[place.local_]? = some (.init rootVal))
     (hTDeinit : deinitProjectedForLocal s.frame.locals (bodyLocalDeclsOf cmOpt)
-      (match cmOpt with | some cm => cm.layouts | none => emptyLayoutTable)
-      place.local_ rootVal place.projection = .ok rootVal') :
+      (bodyLayoutsOf cmOpt) place.local_ rootVal place.projection = .ok rootVal')
+    (hNoProt :
+      ∀ p ps, s.memory.activeProtectors = p :: ps →
+        hasProtectedWriteConflict s.memory.borrows (p :: ps) place.local_ .none
+          (resolveBorrowWriteLocalProj (bodyLocalDeclsOf cmOpt) (bodyLayoutsOf cmOpt)
+            s.frame.locals place.local_ place.projection) 0 0
+          (length s.memory.callStack) = false := by
+      intros; rfl) :
+    let borrows' :=
+      invalidateConflictingBorrowsAtProj s.memory.borrows place.local_ .none
+        (resolveBorrowWriteLocalProj (bodyLocalDeclsOf cmOpt) (bodyLayoutsOf cmOpt)
+          s.frame.locals place.local_ place.projection) 0 0 (length s.memory.callStack)
     step = .goto target slots unwinding ∧
       evalTerminator s ⟨.drop place target u, span⟩ cmOpt =
-        .step { s with frame := ⟨target, 0, s.frame.locals.set place.local_ (.init rootVal')⟩ } ∧
+        .step
+          { s with
+            frame := ⟨target, 0, s.frame.locals.set place.local_ (.init rootVal')⟩
+            memory := { s.memory with borrows := borrows' } } ∧
       ∀ {ts : Bool} {slots' : List LocalSlotState},
         evalDeinitPlace ts slots place = some slots' →
         StateCorr env target slots'
-          { s with frame := ⟨target, 0, s.frame.locals.set place.local_ (.init rootVal')⟩ } := by
+          { s with
+            frame := ⟨target, 0, s.frame.locals.set place.local_ (.init rootVal')⟩
+            memory := { s.memory with borrows := borrows' } } := by
   refine ⟨?_, ?_, fun hD => ?_⟩
   · unfold evalLoweredTerminator at h
     rw [hb] at h
@@ -16694,14 +17738,21 @@ theorem evalLoweredTerminator_drop_projected_refines {env : CfgEnv} {body : LBod
     have hSet : set? s.frame.locals place.local_ (.init rootVal') =
         some (s.frame.locals.set place.local_ (.init rootVal')) :=
       set?_eq_some_iff.mpr ⟨hLt, rfl⟩
+    rcases place with ⟨loc, proj⟩
+    dsimp only at hP hTRoot hTDeinit hNoProt hSet ⊢
+    subst hP
     unfold evalTerminator
     dsimp only
-    rw [hP] at hTDeinit ⊢
-    dsimp only
     rw [get?_eq_getElem?, hTRoot]
-    cases cmOpt <;> simp only [hTDeinit, hSet]
-  · exact hCorr.jump target _
-      ((evalStmt_deinit_projected_refines (span := span) hCorr.slots hProj hD hTRoot hTDeinit).2)
+    cases cmOpt <;> (
+      dsimp only [bodyLayoutsOf] at hTDeinit hNoProt ⊢
+      simp only [hTDeinit, hSet]
+      cases hProt : s.memory.activeProtectors with
+      | nil => rfl
+      | cons p0 ps0 => dsimp only; rw [hNoProt p0 ps0 hProt])
+  · exact hCorr.jumpBorrows target _ _
+      ((evalStmt_deinit_projected_refines (span := span) hCorr.slots hProj hD hTRoot hTDeinit
+        hNoProt).2)
 
 /-- `check_slot_projection` accepts every path below an uninitialized local. -/
 theorem checkPlaceSlotOk_uninit {slots : List LocalSlotState} {place : Place}
@@ -16769,8 +17820,9 @@ theorem evalLoweredTerminator_drop_deref_none {env : CfgEnv} {body : LBody} {bb 
 equivalence (`evalLoweredTerminator_drop_projected_init_refines`)**: when `place.local_` is
 initialized and `evalDeinitPlace ts slots place = some slots'` (with `placeTouchesUnion = false`),
 Anneal's `evalLoweredTerminator` jumps to `target`, Trusted's `evalTerminator` deinitializes `place`
-to `Value.uninit` (`rootVal'`) and jumps to `target`, `StateCorr` holds on `(slots', rootVal')`, and
-reading `place` afterwards faults with `.ub` in **both** `slots'` and Trusted's post-drop frame! -/
+to `Value.uninit` (`rootVal'`), invalidates conflicting borrows, and jumps to `target`, `StateCorr`
+holds on `(slots', rootVal')`, and reading `place` afterwards faults with `.ub` in **both** `slots'`
+and Trusted's post-drop frame! -/
 theorem evalLoweredTerminator_drop_projected_init_refines {env : CfgEnv} {body : LBody}
     {bb : Nat} {ts : Bool} {slots slots' : List LocalSlotState} {unwinding : Option Nat}
     {s : MachineState} {b : LBlock} {place : Place} {target : Nat} {u : UnwindAction}
@@ -16780,24 +17832,38 @@ theorem evalLoweredTerminator_drop_projected_init_refines {env : CfgEnv} {body :
     (hDeinit : evalDeinitPlace ts slots place = some slots')
     (h : evalLoweredTerminator env body bb slots unwinding = some step) (span : String)
     (cmOpt : Option CapturedMir)
-    (hNoUnion : placeTouchesUnion (bodyLocalDeclsOf cmOpt)
-      (match cmOpt with | some cm => cm.layouts | none => emptyLayoutTable) place = false := by
-      simp [bodyLocalDeclsOf, placeTouchesUnion_nil_decls, placeTouchesUnion_nil_proj]) :
+    (hNoUnion : placeTouchesUnion (bodyLocalDeclsOf cmOpt) (bodyLayoutsOf cmOpt) place = false := by
+      simp [bodyLocalDeclsOf, placeTouchesUnion_nil_decls, placeTouchesUnion_nil_proj])
+    (hNoProt :
+      ∀ p ps, s.memory.activeProtectors = p :: ps →
+        hasProtectedWriteConflict s.memory.borrows (p :: ps) place.local_ .none
+          (resolveBorrowWriteLocalProj (bodyLocalDeclsOf cmOpt) (bodyLayoutsOf cmOpt)
+            s.frame.locals place.local_ place.projection) 0 0
+          (length s.memory.callStack) = false := by
+      intros; rfl) :
+    let borrows' :=
+      invalidateConflictingBorrowsAtProj s.memory.borrows place.local_ .none
+        (resolveBorrowWriteLocalProj (bodyLocalDeclsOf cmOpt) (bodyLayoutsOf cmOpt)
+          s.frame.locals place.local_ place.projection) 0 0 (length s.memory.callStack)
     ∃ rootVal',
-      deinitProjectedForLocal s.frame.locals (bodyLocalDeclsOf cmOpt)
-        (match cmOpt with | some cm => cm.layouts | none => emptyLayoutTable)
+      deinitProjectedForLocal s.frame.locals (bodyLocalDeclsOf cmOpt) (bodyLayoutsOf cmOpt)
         place.local_ rootVal place.projection = .ok rootVal' ∧
       step = .goto target slots unwinding ∧
       evalTerminator s ⟨.drop place target u, span⟩ cmOpt =
-        .step { s with frame := ⟨target, 0, s.frame.locals.set place.local_ (.init rootVal')⟩ } ∧
+        .step
+          { s with
+            frame := ⟨target, 0, s.frame.locals.set place.local_ (.init rootVal')⟩
+            memory := { s.memory with borrows := borrows' } } ∧
       StateCorr env target slots'
-        { s with frame := ⟨target, 0, s.frame.locals.set place.local_ (.init rootVal')⟩ } ∧
+        { s with
+          frame := ⟨target, 0, s.frame.locals.set place.local_ (.init rootVal')⟩
+          memory := { s.memory with borrows := borrows' } } ∧
       readPlaceState slots' place = .ub ∧
       readProjectedValue (s.frame.locals.set place.local_ (.init rootVal')) rootVal'
         place.projection = .ub := by
   obtain ⟨rootVal', hTDF, _, _, hReadA, hReadT⟩ :=
     evalStmt_deinit_projected_init_refines (s := s) (span := span) hCorr.slots hProj hRoot hDeinit
-      hNoUnion
+      hNoUnion hNoProt
   have hTRoot : s.frame.locals[place.local_]? = some (.init rootVal) := by
     rcases SlotsRefine.get?_rel place.local_ hCorr.slots with ⟨hA, _⟩ | ⟨a', t, hA, hTl, hAT⟩
     · simp only [get?_eq_getElem?] at hA; rw [hA] at hRoot; nomatch hRoot
@@ -16807,38 +17873,468 @@ theorem evalLoweredTerminator_drop_projected_init_refines {env : CfgEnv} {body :
       | init w => have hw : rootVal = w := hAT; subst hw; exact hTl
       | _ => simp [SlotBelow] at hAT
   obtain ⟨hStepA, hStepT, hCorr'⟩ :=
-    evalLoweredTerminator_drop_projected_refines hCorr hb hT hProj h span cmOpt hTRoot hTDF
+    evalLoweredTerminator_drop_projected_refines hCorr hb hT hProj h span cmOpt hTRoot hTDF hNoProt
   exact ⟨rootVal', hTDF, hStepA, hStepT, hCorr' hDeinit, hReadA, hReadT⟩
 
-/-- **Two-sided agreement of projected `Drop` below an uninitialized local
+private theorem checkSlotProjectionOk_init_eq_isSome_deinitFieldSlot_aux (ts : Bool)
+    (dlocals : List LocalSlot) :
+    ∀ (n : Nat) (p : List ProjectionElem), p.length ≤ n →
+      ∀ (v : Value),
+        valueContainsUninit v = false →
+        DeinitInitChainOk v p →
+        projectionHasDeref p = false →
+        checkSlotProjectionOk dlocals (.init v) p = (deinitFieldSlot ts dlocals (.init v) p).isSome := by
+  intro n
+  induction n with
+  | zero =>
+    intro p hLen v hUninit _ _
+    have hp : p = [] := List.eq_nil_of_length_eq_zero (Nat.le_zero.mp hLen)
+    subst hp
+    simp [checkSlotProjectionOk, evalValueProjRead, hUninit, deinitFieldSlot]
+  | succ n ih =>
+    intro p hLen v hUninit hChain hND
+    rcases p with _ | ⟨a, rest⟩
+    · simp [checkSlotProjectionOk, evalValueProjRead, hUninit, deinitFieldSlot]
+    · simp only [List.length_cons] at hLen
+      cases a with
+      | field idx fty =>
+        have hNDRest : projectionHasDeref rest = false := hND
+        cases v with
+        | uninit => nomatch hChain
+        | scalar _ | ptr _ _ | unit =>
+          cases idx with
+          | zero => nomatch hChain
+          | succ _ => simp [checkSlotProjectionOk, evalValueProjRead, deinitFieldSlot]
+        | aggregate var fields =>
+          cases var with
+          | succ _ => nomatch hChain
+          | zero =>
+            cases hF : get? fields idx with
+            | none =>
+              have hF' : fields[idx]? = none := by simpa [get?_eq_getElem?] using hF
+              have hMapNone : (fields.map FieldSlot.init)[idx]? = none := by
+                simp [List.getElem?_map, hF']
+              simp [checkSlotProjectionOk, evalValueProjRead, hF', deinitFieldSlot, deinitShellStep,
+                explodeAggregate, shellVariant, hMapNone]
+            | some fv =>
+              have hF' : fields[idx]? = some fv := by simpa [get?_eq_getElem?] using hF
+              have hMapSome : (fields.map FieldSlot.init)[idx]? = some (.init fv) := by
+                simp [List.getElem?_map, hF']
+              have hFvUninit : valueContainsUninit fv = false :=
+                valueContainsUninit_of_getElem?_false hUninit hF'
+              have hSub := ih rest (by omega) fv hFvUninit (hChain fv hF) hNDRest
+              have hCS : checkSlotProjectionOk dlocals (.init (.aggregate 0 fields))
+                  (.field idx fty :: rest) = checkSlotProjectionOk dlocals (.init fv) rest := by
+                simp [checkSlotProjectionOk, evalValueProjRead, hF']
+              rw [hCS, hSub]
+              cases hSubD : deinitFieldSlot ts dlocals (.init fv) rest <;>
+                simp [deinitFieldSlot, deinitShellStep, explodeAggregate, shellVariant, hMapSome,
+                  hSubD]
+      | downcast nm vIdx =>
+        have hNDRest : projectionHasDeref rest = false := hND
+        rcases rest with _ | ⟨b, tail⟩
+        · cases v <;> simp [checkSlotProjectionOk, evalValueProjRead, isFieldHead, deinitFieldSlot]
+        · cases b with
+          | deref => nomatch hNDRest
+          | field idx fty =>
+            have hNDTail : projectionHasDeref tail = false := hNDRest
+            cases v with
+            | uninit => nomatch hChain
+            | scalar _ | ptr _ _ | unit =>
+              simp [checkSlotProjectionOk, evalValueProjRead, deinitFieldSlot]
+            | aggregate actualVariant fields =>
+              rcases beq_cases actualVariant vIdx with ⟨hBeq, rfl⟩ | ⟨hBeq, hNe⟩
+              · cases hF : get? fields idx with
+                | none =>
+                  have hF' : fields[idx]? = none := by simpa [get?_eq_getElem?] using hF
+                  have hMapNone : (fields.map FieldSlot.init)[idx]? = none := by
+                    simp [List.getElem?_map, hF']
+                  simp [checkSlotProjectionOk, evalValueProjRead, isFieldHead, Nat.beq_refl, hF',
+                    deinitFieldSlot, deinitShellStep, explodeAggregate, shellVariant, hMapNone]
+                | some fv =>
+                  have hF' : fields[idx]? = some fv := by simpa [get?_eq_getElem?] using hF
+                  have hMapSome : (fields.map FieldSlot.init)[idx]? = some (.init fv) := by
+                    simp [List.getElem?_map, hF']
+                  have hFvUninit : valueContainsUninit fv = false :=
+                    valueContainsUninit_of_getElem?_false hUninit hF'
+                  have hChainSub : DeinitInitChainOk fv tail := by
+                    rcases actualVariant with _ | _ <;> exact hChain rfl fv hF
+                  have hSub := ih tail (by simp at hLen; omega) fv hFvUninit hChainSub
+                    hNDTail
+                  have hCS : checkSlotProjectionOk dlocals
+                      (.init (.aggregate actualVariant fields))
+                      (.downcast nm actualVariant :: .field idx fty :: tail) =
+                      checkSlotProjectionOk dlocals (.init fv) tail := by
+                    simp [checkSlotProjectionOk, evalValueProjRead, isFieldHead, Nat.beq_refl, hF']
+                  rw [hCS, hSub]
+                  cases hSubD : deinitFieldSlot ts dlocals (.init fv) tail <;>
+                    simp [deinitFieldSlot, deinitShellStep, explodeAggregate, shellVariant,
+                      hMapSome, hSubD]
+              · simp [checkSlotProjectionOk, evalValueProjRead, isFieldHead, hBeq, deinitFieldSlot,
+                  deinitShellStep, explodeAggregate, shellVariant, hNe]
+          | downcast _ _ | index _ | constantIndex _ _ _ | subslice _ _ _
+          | opaqueCast _ | unwrapUnsafeBinder _ =>
+            cases v <;> simp [checkSlotProjectionOk, evalValueProjRead, isFieldHead, deinitFieldSlot]
+      | index _ | constantIndex _ _ _ | subslice _ _ _
+      | deref | opaqueCast _ | unwrapUnsafeBinder _ =>
+        rcases v with _ | _ | _ | ⟨_ | _, _⟩ | _ <;> nomatch hChain
+
+/-- **Two-Sided Initialized-Root Projected `Drop` Operational Equivalence
+(`evalLoweredTerminator_drop_projected_init_iff`)**: on a well-formed block ending in
+`.drop place target u` (`place.projection ≠ []`, `projectionHasDeref = false`, `placeTouchesUnion = false`)
+with an initialized aggregate root `rootVal` (`valueContainsUninit rootVal = false`,
+`DeinitInitChainOk rootVal place.projection`), Anneal's `evalLoweredTerminator` and Trusted's
+`evalTerminator` step iff the other steps, fault (`none` ↔ `.fail .ub`) iff the other faults, and
+when `ts = true ∨ noDowncast place.projection = true` produce the **exact same** post-drop
+deinitialized local frame under `evalDeinitPlace` and `LocalSlotState.toTrustedSlotExact` (`=`). -/
+theorem evalLoweredTerminator_drop_projected_init_iff {env : CfgEnv} {body : LBody}
+    {bb : Nat} {ts : Bool} {slots : List LocalSlotState} {unwinding : Option Nat}
+    {s : MachineState} {b : LBlock} {place : Place} {target : Nat} {u : UnwindAction}
+    {rootVal : Value} (hb : body.blocks[bb]? = some b)
+    (hClean : b.isCleanup = unwinding.isSome)
+    (hT : b.terminator = .drop place target u)
+    (hUnwOk : unwindActionOk body b.isCleanup u = true)
+    (hGoto : cfgGoto body target slots unwinding = some (.goto target slots unwinding))
+    (hProj : place.projection ≠ [])
+    (hND : projectionHasDeref place.projection = false)
+    (hA : slots[place.local_]? = some (.init rootVal))
+    (hT_root : s.frame.locals[place.local_]? = some (.init rootVal))
+    (hValInit : valueContainsUninit rootVal = false)
+    (hChain : DeinitInitChainOk rootVal place.projection)
+    (span : String) (cmOpt : Option CapturedMir)
+    (hNoUnion : placeTouchesUnion (bodyLocalDeclsOf cmOpt) (bodyLayoutsOf cmOpt) place = false := by
+      simp [bodyLocalDeclsOf, placeTouchesUnion_nil_decls, placeTouchesUnion_nil_proj])
+    (hEnvOk : slotPlaceProjectionOk slots place = true → env.placeAccessOk slots place = true := by
+      intro h; first | rfl | exact h)
+    (hNoProt :
+      ∀ p ps, s.memory.activeProtectors = p :: ps →
+        hasProtectedWriteConflict s.memory.borrows (p :: ps) place.local_ .none
+          (resolveBorrowWriteLocalProj (bodyLocalDeclsOf cmOpt) (bodyLayoutsOf cmOpt)
+            s.frame.locals place.local_ place.projection) 0 0
+          (length s.memory.callStack) = false := by
+      intros; rfl) :
+    let borrows' :=
+      invalidateConflictingBorrowsAtProj s.memory.borrows place.local_ .none
+        (resolveBorrowWriteLocalProj (bodyLocalDeclsOf cmOpt) (bodyLayoutsOf cmOpt)
+          s.frame.locals place.local_ place.projection) 0 0 (length s.memory.callStack)
+    (evalLoweredTerminator env body bb slots unwinding = some (.goto target slots unwinding) ↔
+        ∃ rootVal',
+          evalTerminator s ⟨.drop place target u, span⟩ cmOpt =
+            .step
+              { s with
+                frame := ⟨target, 0, s.frame.locals.set place.local_ (.init rootVal')⟩
+                memory := { s.memory with borrows := borrows' } }) ∧
+      (evalLoweredTerminator env body bb slots unwinding = none ↔
+        evalTerminator s ⟨.drop place target u, span⟩ cmOpt = .fail .ub) ∧
+      (∀ step, evalLoweredTerminator env body bb slots unwinding = some step →
+        (ts = true ∨ noDowncast place.projection = true) →
+        ∃ slots' rootVal',
+          step = .goto target slots unwinding ∧
+          evalDeinitPlace ts slots place = some slots' ∧
+          evalTerminator s ⟨.drop place target u, span⟩ cmOpt =
+            .step
+              { s with
+                frame := ⟨target, 0, s.frame.locals.set place.local_ (.init rootVal')⟩
+                memory := { s.memory with borrows := borrows' } } ∧
+          slots'.map LocalSlotState.toTrustedSlotExact =
+            (slots.map LocalSlotState.toTrustedSlotExact).set place.local_ (.init rootVal')) := by
+  obtain ⟨a, rest, hP⟩ : ∃ a rest, place.projection = a :: rest := by
+    cases hp : place.projection with
+    | nil => exact absurd hp hProj
+    | cons a rest => exact ⟨a, rest, rfl⟩
+  have hLtT : place.local_ < s.frame.locals.length := (List.getElem?_eq_some_iff.mp hT_root).1
+  obtain ⟨hFwd, _, hUbIff⟩ := deinitFieldSlot_init_exact_iff_trusted ts
+    (slotsToTrustedLocals slots) s.frame.locals (bodyLocalDeclsOf cmOpt) (bodyLayoutsOf cmOpt)
+    rootVal place.projection
+    (placeTy (bodyLocalDeclsOf cmOpt) (bodyLayoutsOf cmOpt) ⟨place.local_, .nil⟩) hChain hND
+  have hChkEq := checkSlotProjectionOk_init_eq_isSome_deinitFieldSlot_aux ts
+    (slotsToTrustedLocals slots) place.projection.length place.projection (Nat.le_refl _)
+    rootVal hValInit hChain hND
+  have hEvalTerm : evalTerminator s ⟨.drop place target u, span⟩ cmOpt =
+      match deinitProjectedValue s.frame.locals rootVal place.projection (bodyLocalDeclsOf cmOpt)
+          (bodyLayoutsOf cmOpt)
+          (placeTy (bodyLocalDeclsOf cmOpt) (bodyLayoutsOf cmOpt) ⟨place.local_, .nil⟩) with
+      | .ok rootVal' =>
+        .step
+          { s with
+            frame := ⟨target, 0, s.frame.locals.set place.local_ (.init rootVal')⟩
+            memory :=
+              { s.memory with
+                borrows := invalidateConflictingBorrowsAtProj s.memory.borrows place.local_ .none
+                  (resolveBorrowWriteLocalProj (bodyLocalDeclsOf cmOpt) (bodyLayoutsOf cmOpt)
+                    s.frame.locals place.local_ place.projection) 0 0 (length s.memory.callStack) } }
+      | .ub => .fail .ub
+      | .unsupported => .unsupported := by
+    rcases place with ⟨loc, proj⟩
+    dsimp only at hP hND hT_root hLtT hNoUnion hNoProt ⊢
+    subst hP
+    have hPD : projListHasDeref (a :: rest) = false :=
+      (projListHasDeref_eq_projectionHasDeref (a :: rest)).trans hND
+    unfold evalTerminator
+    dsimp only
+    rw [get?_eq_getElem?, hT_root]
+    dsimp only [deinitProjectedForLocal]
+    rw [hPD]
+    dsimp only
+    cases cmOpt <;> (
+      dsimp only [bodyLocalDeclsOf, bodyLayoutsOf] at hNoUnion hNoProt ⊢
+      rw [hNoUnion]
+      dsimp only
+      cases deinitProjectedValue s.frame.locals rootVal (a :: rest) _ _ _ with
+      | ub => rfl
+      | unsupported => rfl
+      | ok rootVal' =>
+        dsimp only
+        rw [set?_eq_some_iff.mpr ⟨hLtT, rfl⟩]
+        dsimp only
+        cases hProt : s.memory.activeProtectors with
+        | nil => rfl
+        | cons p0 ps0 => dsimp only; rw [hNoProt p0 ps0 hProt])
+  dsimp only
+  rw [hEvalTerm]
+  cases hDF : deinitFieldSlot ts (slotsToTrustedLocals slots) (.init rootVal) place.projection with
+  | none =>
+    rw [hUbIff.mp hDF]
+    have hChkFalse : checkPlaceSlotOk slots place = false := by
+      unfold checkPlaceSlotOk
+      rw [hA]
+      dsimp only [slotStateToFieldSlot]
+      rw [hChkEq, hDF]
+      rfl
+    have hRTFalse : placeRuntimeAccessOk slots place = false := by
+      cases hRT : placeRuntimeAccessOk slots place with
+      | false => rfl
+      | true =>
+        have hC := (placeRuntimeAccessOk_iff.mp hRT).2.2
+        rw [hChkFalse] at hC; nomatch hC
+    have hLTNone : evalLoweredTerminator env body bb slots unwinding = none := by
+      simp [evalLoweredTerminator, hb, hClean, hT, hRTFalse]
+    rw [hLTNone]
+    exact And.intro (Iff.intro (fun h => nomatch h) (fun ⟨_, h⟩ => nomatch h))
+      (And.intro (Iff.intro (fun _ => rfl) (fun _ => rfl))
+        (fun _ h => nomatch h))
+  | some slot' =>
+    obtain ⟨rootVal', hTOk, hSlotEx, _⟩ := hFwd slot' hDF
+    rw [hTOk]
+    have hDeinitSome :
+        evalDeinitPlace ts slots place =
+          some (slots.set place.local_ (fieldSlotToLocalSlotState slot')) := by
+      unfold evalDeinitPlace
+      rw [hA, hP]
+      rw [hP] at hDF
+      simp [slotStateToFieldSlot, hDF]
+    have hSlotOk : slotPlaceProjectionOk slots place = true :=
+      slotPlaceProjectionOk_of_evalDeinitPlace hDeinitSome
+    have hEnvTrue : env.placeAccessOk slots place = true := hEnvOk hSlotOk
+    have hChkTrue : checkPlaceSlotOk slots place = true := by
+      unfold checkPlaceSlotOk
+      rw [hA]
+      dsimp only [slotStateToFieldSlot]
+      rw [hChkEq, hDF]
+      rfl
+    have hFrameTrue : placeFrameAccessOk slots place = true :=
+      placeFrameAccessOk_of_evalDeinitPlace hDeinitSome
+    have hRTTrue : placeRuntimeAccessOk slots place = true :=
+      placeRuntimeAccessOk_iff.mpr ⟨hND, hFrameTrue, hChkTrue⟩
+    have hUnwOk' : unwindActionOk body unwinding.isSome u = true := hClean ▸ hUnwOk
+    have hLTSome :
+        evalLoweredTerminator env body bb slots unwinding = some (.goto target slots unwinding) := by
+      simp [evalLoweredTerminator, hb, hClean, hT, hRTTrue, hEnvTrue, hUnwOk', hGoto]
+    rw [hLTSome]
+    dsimp only
+    refine And.intro (Iff.intro (fun _ => ⟨rootVal', rfl⟩) (fun _ => rfl))
+      (And.intro (Iff.intro (fun h => nomatch h) (fun h => nomatch h)) ?_)
+    intro step hEq hTag
+    injection hEq with hStepEq
+    subst hStepEq
+    exact ⟨slots.set place.local_ (fieldSlotToLocalSlotState slot'), rootVal', rfl, hDeinitSome,
+      rfl, by rw [List.map_set, hSlotEx hProj hTag]⟩
+
+/-- **Agreement of projected `Drop` below an uninitialized local
 (`evalLoweredTerminator_drop_projected_uninit_agrees`)**: when `place.local_` is live `.uninit`
-in both Anneal and Trusted and the projection tail satisfies `deinitTailOk`, both Anneal's
-`evalLoweredTerminator` and Trusted's `evalTerminator` jump to `target` with the frame unchanged,
-preserving `StateCorr` (retiring `evalLoweredTerminator_drop_projected_uninit_divergence`). -/
+in both Anneal and Trusted on a well-typed projection chain (`WellTypedDeinitProj`) and the
+projection tail satisfies `deinitTailOk`, both Anneal's `evalLoweredTerminator` and Trusted's
+`evalTerminator` jump to `target` with the local slot unchanged while Trusted invalidates
+conflicting borrows, preserving `StateCorr`. -/
 theorem evalLoweredTerminator_drop_projected_uninit_agrees {env : CfgEnv} {body : LBody}
     {bb : Nat} {slots : List LocalSlotState} {unwinding : Option Nat} {s : MachineState}
     {b : LBlock} {place : Place} {target : Nat} {u : UnwindAction} {step : CfgStep}
-    (hCorr : StateCorr env bb slots s)
+    {curTy : Ty} (hCorr : StateCorr env bb slots s)
     (hb : body.blocks[bb]? = some b) (hT : b.terminator = .drop place target u)
     (hProj : place.projection ≠ []) (hRoot : slots[place.local_]? = some .uninit)
     (hTail : deinitTailOk (slotsToTrustedLocals slots) place.projection = true)
     (h : evalLoweredTerminator env body bb slots unwinding = some step)
     (hTU : s.frame.locals[place.local_]? = some .uninit) (span : String)
-    (cmOpt : Option CapturedMir) :
+    (cmOpt : Option CapturedMir)
+    (hTy : placeTy (bodyLocalDeclsOf cmOpt) (bodyLayoutsOf cmOpt) ⟨place.local_, .nil⟩ = .some curTy)
+    (hWT : WellTypedDeinitProj (slotsToTrustedLocals slots) (bodyLocalDeclsOf cmOpt)
+      (bodyLayoutsOf cmOpt) curTy place.projection)
+    (hNoProt :
+      ∀ p ps, s.memory.activeProtectors = p :: ps →
+        hasProtectedWriteConflict s.memory.borrows (p :: ps) place.local_ .none
+          (resolveBorrowWriteLocalProj (bodyLocalDeclsOf cmOpt) (bodyLayoutsOf cmOpt)
+            s.frame.locals place.local_ place.projection) 0 0
+          (length s.memory.callStack) = false := by
+      intros; rfl) :
+    let borrows' :=
+      invalidateConflictingBorrowsAtProj s.memory.borrows place.local_ .none
+        (resolveBorrowWriteLocalProj (bodyLocalDeclsOf cmOpt) (bodyLayoutsOf cmOpt)
+          s.frame.locals place.local_ place.projection) 0 0 (length s.memory.callStack)
     checkPlaceSlotOk slots place = true ∧ step = .goto target slots unwinding ∧
       evalTerminator s ⟨.drop place target u, span⟩ cmOpt =
-        MirStepNode.step { s with frame := ⟨target, 0, s.frame.locals⟩ } ∧
-      StateCorr env target slots { s with frame := ⟨target, 0, s.frame.locals⟩ } := by
+        MirStepNode.step
+          { s with
+            frame := ⟨target, 0, s.frame.locals⟩
+            memory := { s.memory with borrows := borrows' } } ∧
+      StateCorr env target slots
+        { s with
+          frame := ⟨target, 0, s.frame.locals⟩
+          memory := { s.memory with borrows := borrows' } } := by
   refine ⟨checkPlaceSlotOk_uninit hRoot, (evalLoweredTerminator_drop_sound hb hT h).1, ?_,
-    hCorr.jump target s.frame.locals hCorr.slots⟩
+    hCorr.jumpBorrows target s.frame.locals _ hCorr.slots⟩
   obtain ⟨a, rest, hP⟩ : ∃ a rest, place.projection = a :: rest := by
     cases hp : place.projection with
     | nil => exact absurd hp hProj
     | cons a rest => exact ⟨a, rest, rfl⟩
   have hSame := sameScalarLocals_of_slotBelow hCorr.slots
-  have hTailT := deinitTailOk_implies_trusted hSame place.projection hTail
-  rw [hP] at hTailT
-  simp only [evalTerminator, get?_eq_getElem?, hTU, hP, hTailT]
+  have hTailT := deinitTailOk_implies_trusted hSame place.projection hWT hTail
+  rcases place with ⟨loc, proj⟩
+  dsimp only at hP hTU hTy hTailT hNoProt ⊢
+  subst hP
+  unfold evalTerminator
+  dsimp only
+  rw [get?_eq_getElem?, hTU]
+  dsimp only
+  cases cmOpt <;> (
+    dsimp only [bodyLocalDeclsOf, bodyLayoutsOf] at hTy hTailT hNoProt ⊢
+    rw [hTy, hTailT]
+    dsimp only
+    cases hProt : s.memory.activeProtectors with
+    | nil => rfl
+    | cons p0 ps0 => dsimp only; rw [hNoProt p0 ps0 hProt])
+
+/-- **Two-Sided Uninitialized-Root Projected `Drop` Operational Equivalence
+(`evalLoweredTerminator_drop_projected_uninit_iff`)**: on a well-formed block ending in
+`.drop place target u` (`place.projection ≠ []`, `projectionHasDeref = false`) with `place.local_`
+live `.uninit` in both Anneal and Trusted (`SameScalarLocals`, `WellTypedDeinitProj`, and
+`env.placeAccessOk` checking `deinitTailOk`), Anneal's `evalLoweredTerminator` and Trusted's
+`evalTerminator` both step (jumping to `target` with the `.uninit` local unchanged) when
+`deinitTailOk = true` and both fault (`none` ↔ `.fail .ub`) when `deinitTailOk = false`. -/
+theorem evalLoweredTerminator_drop_projected_uninit_iff {env : CfgEnv} {body : LBody}
+    {bb : Nat} {slots : List LocalSlotState} {unwinding : Option Nat} {s : MachineState}
+    {b : LBlock} {place : Place} {target : Nat} {u : UnwindAction} {curTy : Ty}
+    (hSame : SameScalarLocals (slotsToTrustedLocals slots) s.frame.locals)
+    (hb : body.blocks[bb]? = some b)
+    (hClean : b.isCleanup = unwinding.isSome)
+    (hT : b.terminator = .drop place target u)
+    (hUnwOk : unwindActionOk body b.isCleanup u = true)
+    (hGoto : cfgGoto body target slots unwinding = some (.goto target slots unwinding))
+    (hProj : place.projection ≠ [])
+    (hND : projectionHasDeref place.projection = false)
+    (hRoot : slots[place.local_]? = some .uninit)
+    (hTU : s.frame.locals[place.local_]? = some .uninit)
+    (span : String) (cmOpt : Option CapturedMir)
+    (hTy : placeTy (bodyLocalDeclsOf cmOpt) (bodyLayoutsOf cmOpt) ⟨place.local_, .nil⟩ = .some curTy)
+    (hWT : WellTypedDeinitProj (slotsToTrustedLocals slots) (bodyLocalDeclsOf cmOpt)
+      (bodyLayoutsOf cmOpt) curTy place.projection)
+    (hEnvTail :
+      env.placeAccessOk slots place =
+        deinitTailOk (slotsToTrustedLocals slots) place.projection := by rfl)
+    (hNoProt :
+      ∀ p ps, s.memory.activeProtectors = p :: ps →
+        hasProtectedWriteConflict s.memory.borrows (p :: ps) place.local_ .none
+          (resolveBorrowWriteLocalProj (bodyLocalDeclsOf cmOpt) (bodyLayoutsOf cmOpt)
+            s.frame.locals place.local_ place.projection) 0 0
+          (length s.memory.callStack) = false := by
+      intros; rfl) :
+    let borrows' :=
+      invalidateConflictingBorrowsAtProj s.memory.borrows place.local_ .none
+        (resolveBorrowWriteLocalProj (bodyLocalDeclsOf cmOpt) (bodyLayoutsOf cmOpt)
+          s.frame.locals place.local_ place.projection) 0 0 (length s.memory.callStack)
+    (evalLoweredTerminator env body bb slots unwinding = some (.goto target slots unwinding) ↔
+        evalTerminator s ⟨.drop place target u, span⟩ cmOpt =
+          MirStepNode.step
+            { s with
+              frame := ⟨target, 0, s.frame.locals⟩
+              memory := { s.memory with borrows := borrows' } }) ∧
+      ((∃ step, evalLoweredTerminator env body bb slots unwinding = some step) ↔
+        (∃ s', evalTerminator s ⟨.drop place target u, span⟩ cmOpt = MirStepNode.step s')) ∧
+      (evalLoweredTerminator env body bb slots unwinding = none ↔
+        evalTerminator s ⟨.drop place target u, span⟩ cmOpt = MirStepNode.fail .ub) := by
+  obtain ⟨a, rest, hP⟩ : ∃ a rest, place.projection = a :: rest := by
+    cases hp : place.projection with
+    | nil => exact absurd hp hProj
+    | cons a rest => exact ⟨a, rest, rfl⟩
+  have hTailEq := deinitTailOk_typed_eq_trusted hSame place.projection curTy hWT
+  cases hTail : deinitTailOk (slotsToTrustedLocals slots) place.projection with
+  | true =>
+    have hTailT := hTailEq.symm.trans hTail
+    have hDeinitSome : evalDeinitPlace true slots place = some slots := by
+      have hLt : place.local_ < slots.length := (List.getElem?_eq_some_iff.mp hRoot).1
+      have hEq : slots[place.local_] = .uninit := (List.getElem?_eq_some_iff.mp hRoot).2
+      rw [hP] at hTail
+      simp only [evalDeinitPlace, hRoot, hP, slotStateToFieldSlot, deinitFieldSlot, hTail,
+        ↓reduceIte, fieldSlotToLocalSlotState]
+      rw [← hEq, List.set_getElem_self hLt]
+    have hFrameTrue : placeFrameAccessOk slots place = true :=
+      placeFrameAccessOk_of_evalDeinitPlace hDeinitSome
+    have hRTTrue : placeRuntimeAccessOk slots place = true :=
+      placeRuntimeAccessOk_iff.mpr ⟨hND, hFrameTrue, checkPlaceSlotOk_uninit hRoot⟩
+    have hEnvTrue : env.placeAccessOk slots place = true := hEnvTail.trans hTail
+    have hUnwOk' : unwindActionOk body unwinding.isSome u = true := hClean ▸ hUnwOk
+    have hLTSome :
+        evalLoweredTerminator env body bb slots unwinding = some (.goto target slots unwinding) := by
+      simp [evalLoweredTerminator, hb, hClean, hT, hRTTrue, hEnvTrue, hUnwOk', hGoto]
+    have hTStep : evalTerminator s ⟨.drop place target u, span⟩ cmOpt =
+        MirStepNode.step
+          { s with
+            frame := ⟨target, 0, s.frame.locals⟩
+            memory :=
+              { s.memory with
+                borrows := invalidateConflictingBorrowsAtProj s.memory.borrows place.local_ .none
+                  (resolveBorrowWriteLocalProj (bodyLocalDeclsOf cmOpt) (bodyLayoutsOf cmOpt)
+                    s.frame.locals place.local_ place.projection) 0 0
+                  (length s.memory.callStack) } } := by
+      rcases place with ⟨loc, proj⟩
+      dsimp only at hP hTU hTy hTailT hNoProt ⊢
+      subst hP
+      unfold evalTerminator
+      dsimp only
+      rw [get?_eq_getElem?, hTU]
+      dsimp only
+      cases cmOpt <;> (
+        dsimp only [bodyLocalDeclsOf, bodyLayoutsOf] at hTy hTailT hNoProt ⊢
+        rw [hTy, hTailT]
+        dsimp only
+        cases hProt : s.memory.activeProtectors with
+        | nil => rfl
+        | cons p0 ps0 => dsimp only; rw [hNoProt p0 ps0 hProt])
+    dsimp only
+    rw [hLTSome, hTStep]
+    exact And.intro (Iff.intro (fun _ => rfl) (fun _ => rfl))
+      (And.intro (Iff.intro (fun _ => ⟨_, rfl⟩) (fun _ => ⟨_, rfl⟩))
+        (Iff.intro (fun h => nomatch h) (fun h => nomatch h)))
+  | false =>
+    have hTailT := hTailEq.symm.trans hTail
+    have hEnvFalse : env.placeAccessOk slots place = false := hEnvTail.trans hTail
+    have hLTNone : evalLoweredTerminator env body bb slots unwinding = none := by
+      simp [evalLoweredTerminator, hb, hClean, hT, hEnvFalse]
+    have hTUb : evalTerminator s ⟨.drop place target u, span⟩ cmOpt = MirStepNode.fail .ub := by
+      rcases place with ⟨loc, proj⟩
+      dsimp only at hP hND hTU hTy hTailT ⊢
+      subst hP
+      unfold evalTerminator
+      dsimp only
+      rw [get?_eq_getElem?, hTU]
+      dsimp only
+      cases cmOpt <;> (
+        dsimp only [bodyLocalDeclsOf, bodyLayoutsOf] at hTy hTailT ⊢
+        rw [hTy, hTailT, hND])
+    dsimp only
+    rw [hLTNone, hTUb]
+    exact And.intro (Iff.intro (fun h => nomatch h) (fun h => nomatch h))
+      (And.intro (Iff.intro (fun ⟨_, h⟩ => nomatch h) (fun ⟨_, h⟩ => nomatch h))
+        (Iff.intro (fun _ => rfl) (fun _ => rfl)))
 
 /-- Every `cfgGoto` jump targets an existing block whose `isCleanup` flag matches
 `unwinding.isSome`. -/
@@ -17058,6 +18554,7 @@ structure BodyCorrWithStmts (env : CfgEnv) (body : LBody) (cm : CapturedMir) : P
         cm.basicBlocks[i]? = some ⟨tStmts, ⟨b.terminator.toTrusted, span⟩, b.isCleanup⟩ ∧
         ∀ (slots slots1 : List LocalSlotState) (s : MachineState),
           StateCorr env i slots s →
+          s.memory.borrows = [] →
           env.evalStmts b.statements slots = some slots1 →
           ∃ (locals1 : List LocalSlot),
             TrustedRun cm s { s with frame := ⟨i, tStmts.length, locals1⟩ } ∧
@@ -17380,7 +18877,7 @@ theorem runLoweredCfgSteps_with_stmts_refines_trusted {env : CfgEnv} {body : LBo
         rw [hSt] at h
         simp only at h
         obtain ⟨hTermRef, tStmts, span, hcm, hStmtsRun⟩ := hBody.block bb block hb
-        obtain ⟨locals1, hRunStmts, hRel1⟩ := hStmtsRun slots slots1 s hCorr hSt
+        obtain ⟨locals1, hRunStmts, hRel1⟩ := hStmtsRun slots slots1 s hCorr hBorrows hSt
         cases hT : evalLoweredTerminator env body bb slots1 unwinding with
         | none => rw [hT] at h; nomatch h
         | some step =>
@@ -17438,7 +18935,7 @@ theorem BodyCorr.toBodyCorrWithStmts {env : CfgEnv} {body : LBody} {cm : Capture
   layouts := hBody.layouts
   block i b hb := by
     obtain ⟨hNil, hRef, span, hcm⟩ := hBody.block i b hb
-    refine ⟨hRef, [], span, hcm, fun slots slots1 s hCorr hEval => ?_⟩
+    refine ⟨hRef, [], span, hcm, fun slots slots1 s hCorr _ hEval => ?_⟩
     rw [hNil, hStmts] at hEval
     injection hEval with hEq
     subst hEq
@@ -17464,17 +18961,25 @@ theorem stepMirFn_deinit_root_trustedRun {env : CfgEnv} {cm : CapturedMir} {bb :
     (hCorr : StateCorr env bb slots s)
     (hcm : cm.basicBlocks[bb]? = some ⟨[⟨.deinit place, span⟩], term, isCleanup⟩)
     (hRoot : place.projection = [])
-    (hDeinit : evalDeinitPlace ts slots place = some slots1) :
+    (hDeinit : evalDeinitPlace ts slots place = some slots1)
+    (hBorrows : s.memory.borrows = [] := by rfl) :
     TrustedRun cm s { s with frame := ⟨bb, 1, s.frame.locals.set place.local_ .uninit⟩ } ∧
       SlotsRefine SlotBelow slots1 (s.frame.locals.set place.local_ .uninit) := by
+  have hNoProt : ∀ p ps, s.memory.activeProtectors = p :: ps →
+      hasProtectedWriteConflict s.memory.borrows (p :: ps) place.local_ .none .nil 0 0
+        (length s.memory.callStack) = false := by
+    intro _ _ _; rw [hBorrows]; rfl
   obtain ⟨hStmt, hRel1⟩ := evalStmt_deinit_root_refines (s := s) (span := span)
-    (localDecls := cm.localDecls) (layouts := cm.layouts) hCorr.slots hRoot hDeinit
+    (localDecls := cm.localDecls) (layouts := cm.layouts) hCorr.slots hRoot hDeinit hNoProt
+  have hMemId : { s.memory with borrows := [] } = s.memory := by
+    rcases hm : s.memory with ⟨_, _, borrows, _, _, _, _, _, _, _, _, _, _⟩
+    rw [hm] at hBorrows; dsimp only at hBorrows; subst hBorrows; rfl
   refine ⟨.step (Or.inl ?_) (.refl _), hRel1⟩
   unfold stepMirFn
   simp only [hCorr.callee, Option.getD_none, get?_eq_getElem?, hCorr.block, hcm, hCorr.stmt,
     List.getElem?_cons_zero]
   rw [hStmt]
-  simp only [advanceStmt, hCorr.block, hCorr.stmt]
+  simp only [advanceStmt, hCorr.block, hCorr.stmt, hBorrows, invalidateConflictingBorrows, hMemId]
 
 /-- Executing a single projected `Deinit` statement at the start of basic block `bb` produces a
 one-step `TrustedRun` to `stmtIdx = 1` while preserving `SlotsRefine SlotBelow` (discharging
@@ -17489,17 +18994,28 @@ theorem stepMirFn_deinit_projected_trustedRun {env : CfgEnv} {cm : CapturedMir} 
     (hDeinit : evalDeinitPlace ts slots place = some slots1)
     (hTRoot : s.frame.locals[place.local_]? = some (.init rootVal))
     (hTDeinit : deinitProjectedForLocal s.frame.locals cm.localDecls cm.layouts place.local_
-      rootVal place.projection = .ok rootVal') :
+      rootVal place.projection = .ok rootVal')
+    (hBorrows : s.memory.borrows = [] := by rfl) :
     TrustedRun cm s { s with frame := ⟨bb, 1, s.frame.locals.set place.local_ (.init rootVal')⟩ } ∧
       SlotsRefine SlotBelow slots1 (s.frame.locals.set place.local_ (.init rootVal')) := by
+  have hNoProt : ∀ p ps, s.memory.activeProtectors = p :: ps →
+      hasProtectedWriteConflict s.memory.borrows (p :: ps) place.local_ .none
+        (resolveBorrowWriteLocalProj cm.localDecls cm.layouts s.frame.locals place.local_
+          place.projection) 0 0 (length s.memory.callStack) = false := by
+    intro _ _ _; rw [hBorrows]; rfl
   obtain ⟨hStmt, hRel1⟩ := evalStmt_deinit_projected_refines (s := s) (span := span)
     (localDecls := cm.localDecls) (layouts := cm.layouts) hCorr.slots hProj hDeinit hTRoot hTDeinit
+    hNoProt
+  have hMemId : { s.memory with borrows := [] } = s.memory := by
+    rcases hm : s.memory with ⟨_, _, borrows, _, _, _, _, _, _, _, _, _, _⟩
+    rw [hm] at hBorrows; dsimp only at hBorrows; subst hBorrows; rfl
   refine ⟨.step (Or.inl ?_) (.refl _), hRel1⟩
   unfold stepMirFn
   simp only [hCorr.callee, Option.getD_none, get?_eq_getElem?, hCorr.block, hcm, hCorr.stmt,
     List.getElem?_cons_zero]
   rw [hStmt]
-  simp only [advanceStmt, hCorr.block, hCorr.stmt]
+  simp only [advanceStmt, hCorr.block, hCorr.stmt, hBorrows, invalidateConflictingBorrowsAtProj,
+    hMemId]
 
 /-! ## Section 4: Synthetic Sub-Place Pointers, `Deref` Places, and Sub-Place `CopyNonOverlapping`
 -/
@@ -25226,6 +26742,7 @@ structure MultiBodyCorr (table : LCallTable) (rootCm : CapturedMir)
           s.frame.stmtIdx = 0 →
           s.memory.activeCallee.getD rootCm = cm →
           s.memory.globals = sharedGlobals →
+          s.memory.borrows = [] →
           SlotsRefine SlotBelow slots s.frame.locals →
           env.evalStmts b.statements slots = some slots1 →
           ∃ (locals1 : List LocalSlot),
@@ -25553,8 +27070,11 @@ private theorem writeReturnDestination_proj_of_noUnion_nil_borrows
   have hPop : fieldShellChainPopulated rootVal (pHead :: pTail) = true :=
     fieldShellChainPopulated_of_evalValueProjWrite_ok locals (pHead :: pTail) rootVal rv
       rootVal' hEvW
-  have hShell : ensureNestedFieldShells rootVal (pHead :: pTail) = rootVal :=
-    ensureNestedFieldShells_eq_self_of_populated (pHead :: pTail) rootVal hPop
+  have hShell :
+      ensureNestedFieldShells rootVal (pHead :: pTail) localDecls layouts
+        (placeTy localDecls layouts ⟨loc, .nil⟩) = .some rootVal :=
+    ensureNestedFieldShells_eq_self_of_populated (pHead :: pTail) rootVal localDecls layouts
+      (placeTy localDecls layouts ⟨loc, .nil⟩) hPop
   have hWP : writeProjectedValue locals rootVal (pHead :: pTail) rv = .ok rootVal' :=
     evalValueProjWrite_refines_writeProjectedValue (pHead :: pTail) locals rootVal rv
       rootVal' hEvW
@@ -25570,7 +27090,9 @@ private theorem writeReturnDestination_proj_of_noUnion_nil_borrows
     dsimp only
     rw [hGetT, hBorrows]
     dsimp only [hasProtectedWriteConflict, invalidateConflictingBorrowsAtProj]
-    rw [hMemId, hShell, hWriteL]
+    rw [hMemId, hShell]
+    dsimp only
+    rw [hWriteL]
     dsimp only
     rw [hSet]
 
@@ -25978,7 +27500,7 @@ theorem stepLoweredWithCallTable_refines_trusted
         dsimp only at h
         obtain ⟨hRef, tStmts, span, hcm, hRunStmts⟩ := hCorr.body.block st.bb block hb
         obtain ⟨locals1, hRun1, hRel1⟩ := hRunStmts st.slots slots1 s hCorr.block hCorr.stmt
-          hCorr.active hCorr.globals hCorr.slots hStmts
+          hCorr.active hCorr.globals hCorr.borrows hCorr.slots hStmts
         let sEnd : MachineState := { s with frame := ⟨st.bb, tStmts.length, locals1⟩ }
         have hStepEnd :
             stepMirFn rootCm sEnd =
@@ -27340,7 +28862,7 @@ private theorem witnessLeaf_multiBodyCorr (rootCm : CapturedMir) (maxDepth : Nat
       simp only [witnessLeafBody, List.getElem?_cons_zero, List.getElem?_cons_succ,
         Option.some.injEq] at hb
       subst hb
-      refine ⟨?_, [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+      refine ⟨?_, [], "", rfl, fun slots slots1 s hB hS _ _ _ hRel hEv => ?_⟩
       · first
         | trivial
         | dsimp only [LTerminator.MultiRefinable]
@@ -27371,7 +28893,7 @@ private theorem witnessMid_multiBodyCorr (rootCm : CapturedMir) (maxDepth : Nat)
       simp only [witnessMidBody, List.getElem?_cons_zero, List.getElem?_cons_succ,
         Option.some.injEq] at hb
       subst hb
-      refine ⟨?_, [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+      refine ⟨?_, [], "", rfl, fun slots slots1 s hB hS _ _ _ hRel hEv => ?_⟩
       · first
         | trivial
         | dsimp only [LTerminator.MultiRefinable]
@@ -27407,7 +28929,7 @@ private theorem witnessRoot_multiBodyCorr (maxDepth : Nat) :
       simp only [witnessRootBody, List.getElem?_cons_zero, List.getElem?_cons_succ,
         Option.some.injEq] at hb
       subst hb
-      refine ⟨?_, [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+      refine ⟨?_, [], "", rfl, fun slots slots1 s hB hS _ _ _ hRel hEv => ?_⟩
       · first
         | trivial
         | dsimp only [LTerminator.MultiRefinable]
@@ -27435,7 +28957,7 @@ private theorem witnessPanicCallee_multiBodyCorr (rootCm : CapturedMir) (maxDept
     | 0 =>
       simp only [witnessPanicCalleeBody, List.getElem?_cons_zero, Option.some.injEq] at hb
       subst hb
-      refine ⟨?_, [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+      refine ⟨?_, [], "", rfl, fun slots slots1 s hB hS _ _ _ hRel hEv => ?_⟩
       · dsimp only [LTerminator.MultiRefinable]
         exact ⟨(fun _ hm => nomatch hm), rfl, ⟨_, _, _, rfl,
           Or.inr ⟨rfl, .panicUnwind, rfl,
@@ -27461,7 +28983,7 @@ private theorem witnessCatchRoot_multiBodyCorr (maxDepth : Nat) :
       simp only [witnessCatchRootBody, List.getElem?_cons_zero, List.getElem?_cons_succ,
         Option.some.injEq] at hb
       subst hb
-      refine ⟨?_, [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+      refine ⟨?_, [], "", rfl, fun slots slots1 s hB hS _ _ _ hRel hEv => ?_⟩
       · first
         | trivial
         | dsimp only [LTerminator.MultiRefinable]
@@ -30148,12 +31670,15 @@ def witnessProjStmtCallCm : CapturedMir :=
 
 private theorem deinitProjectedValue_field_succ_of_evalDeinitPlace {slots slots1 : List LocalSlotState}
     {locals : List LocalSlot} {loc n : Nat} {ty : Ty} {rootVal tv : Value}
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {curTyOpt : Option Ty}
     (hRel : SlotsRefine SlotBelow slots locals)
     (hRoot : locals[loc]? = some (.init rootVal))
     (hRd : readPlaceState slots ⟨loc, [.field (n + 1) ty]⟩ = .ok tv)
     (hRead : readProjectedValue locals rootVal [.field (n + 1) ty] = .ok tv)
     (hEv : evalDeinitPlace false slots ⟨loc, [.field (n + 1) ty]⟩ = some slots1) :
-    ∃ rootVal', deinitProjectedValue locals rootVal [.field (n + 1) ty] = .ok rootVal' := by
+    ∃ rootVal',
+      deinitProjectedValue locals rootVal [.field (n + 1) ty] localDecls layouts curTyOpt =
+        .ok rootVal' := by
   obtain ⟨st, hSt, _, slot', hD, _⟩ := evalDeinitPlace_eq_some hEv
   rcases SlotsRefine.get?_rel loc hRel with ⟨hA, _⟩ | ⟨a', t, hA, hT, hAT⟩
   · simp only [get?_eq_getElem?] at hA; rw [hA] at hSt; nomatch hSt
@@ -30201,7 +31726,8 @@ theorem witnessProjStmtCall_bodyCorr :
       subst hb
       refine ⟨LTerminator.refinable_call_of_lowerIntrinsicKind rfl
         (ep2b1_consts_nonDeref _ rfl) rfl,
-        [⟨.deinit ⟨1, [.field 1 ep2TyU32]⟩, ""⟩], "", rfl, fun slots slots1 s hCorr hEv => ?_⟩
+        [⟨.deinit ⟨1, [.field 1 ep2TyU32]⟩, ""⟩], "", rfl,
+        fun slots slots1 s hCorr hBorrows hEv => ?_⟩
       simp only [witnessProjStmtCallEnv, evalSingleReadableProjDeinitStmts] at hEv
       cases hRd : readPlaceState slots ⟨1, [.field 1 ep2TyU32]⟩ with
       | ub => rw [hRd] at hEv; nomatch hEv
@@ -30217,14 +31743,14 @@ theorem witnessProjStmtCall_bodyCorr :
         have htDeinit : deinitProjectedForLocal s.frame.locals witnessProjStmtCallCm.localDecls
             witnessProjStmtCallCm.layouts 1 rootVal [.field 1 ep2TyU32] = .ok rootVal' := htDeinitV
         have hStep := stepMirFn_deinit_projected_trustedRun (cm := witnessProjStmtCallCm)
-          (fun _ h => nomatch h) hCorr rfl (by decide) hEv htRoot' htDeinit
+          (fun _ h => nomatch h) hCorr rfl (by decide) hEv htRoot' htDeinit hBorrows
         exact ⟨s.frame.locals.set 1 (.init rootVal'), hStep.1, hStep.2⟩
     | 1 =>
       simp only [witnessProjStmtCallBody, List.getElem?_cons_succ, List.getElem?_cons_zero,
         Option.some.injEq] at hb
       subst hb
       refine ⟨LTerminator.refinable_call_of_lowerIntrinsicKind rfl
-        (ep2b1_consts_nonDeref _ rfl) rfl, [], "", rfl, fun slots slots1 s hCorr hEv => ?_⟩
+        (ep2b1_consts_nonDeref _ rfl) rfl, [], "", rfl, fun slots slots1 s hCorr _ hEv => ?_⟩
       injection hEv with hEq; subst hEq
       refine ⟨s.frame.locals, ?_, hCorr.slots⟩
       rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩
@@ -30235,7 +31761,7 @@ theorem witnessProjStmtCall_bodyCorr :
         Option.some.injEq] at hb
       subst hb
       refine ⟨LTerminator.refinable_call_of_lowerIntrinsicKind rfl
-        (ep2a1_ops_nonDeref _ rfl) rfl, [], "", rfl, fun slots slots1 s hCorr hEv => ?_⟩
+        (ep2a1_ops_nonDeref _ rfl) rfl, [], "", rfl, fun slots slots1 s hCorr _ hEv => ?_⟩
       injection hEv with hEq; subst hEq
       refine ⟨s.frame.locals, ?_, hCorr.slots⟩
       rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩
@@ -30245,7 +31771,7 @@ theorem witnessProjStmtCall_bodyCorr :
       simp only [witnessProjStmtCallBody, List.getElem?_cons_succ, List.getElem?_cons_zero,
         Option.some.injEq] at hb
       subst hb
-      refine ⟨trivial, [], "", rfl, fun slots slots1 s hCorr hEv => ?_⟩
+      refine ⟨trivial, [], "", rfl, fun slots slots1 s hCorr _ hEv => ?_⟩
       injection hEv with hEq; subst hEq
       refine ⟨s.frame.locals, ?_, hCorr.slots⟩
       rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩
@@ -30288,7 +31814,7 @@ private theorem witnessProjCallerRoot_multiBodyCorr (maxDepth : Nat) :
     | 0 =>
       simp only [witnessProjCallerRootBody, List.getElem?_cons_zero, Option.some.injEq] at hb
       subst hb
-      refine ⟨?_, [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+      refine ⟨?_, [], "", rfl, fun slots slots1 s hB hS _ _ _ hRel hEv => ?_⟩
       · exact ⟨ep2b1_consts_nonDeref _ rfl, rfl, ⟨_, _, _, rfl, Or.inl rfl⟩⟩
       · injection hEv with hEq; subst hEq
         refine ⟨s.frame.locals, witnessNoStatementsTrustedRun ?_, hRel⟩
@@ -30298,7 +31824,7 @@ private theorem witnessProjCallerRoot_multiBodyCorr (maxDepth : Nat) :
         Option.some.injEq] at hb
       subst hb
       refine ⟨LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl
-        (ep2a1_ops_nonDeref _ rfl) rfl, [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+        (ep2a1_ops_nonDeref _ rfl) rfl, [], "", rfl, fun slots slots1 s hB hS _ _ _ hRel hEv => ?_⟩
       injection hEv with hEq; subst hEq
       refine ⟨s.frame.locals, witnessNoStatementsTrustedRun ?_, hRel⟩
       rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩; subst hB hS; rfl
@@ -30306,7 +31832,7 @@ private theorem witnessProjCallerRoot_multiBodyCorr (maxDepth : Nat) :
       simp only [witnessProjCallerRootBody, List.getElem?_cons_succ, List.getElem?_cons_zero,
         Option.some.injEq] at hb
       subst hb
-      refine ⟨trivial, [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+      refine ⟨trivial, [], "", rfl, fun slots slots1 s hB hS _ _ _ hRel hEv => ?_⟩
       injection hEv with hEq; subst hEq
       refine ⟨s.frame.locals, witnessNoStatementsTrustedRun ?_, hRel⟩
       rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩; subst hB hS; rfl
@@ -30741,7 +32267,7 @@ private theorem ep2b2_multiBodyCorr {table : LCallTable} {rootCm : CapturedMir}
   block i b hb := by
     have hMem : b ∈ body.blocks := List.mem_of_getElem? hb
     obtain ⟨hNil, hRef⟩ := hBlocks b hMem
-    refine ⟨hRef, [], "", ?_, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+    refine ⟨hRef, [], "", ?_, fun slots slots1 s hB hS _ _ _ hRel hEv => ?_⟩
     · simp [ep2MakeCaptured, ep2LToCapturedBlocks, List.getElem?_map, hb, hNil]
     · rw [hNil] at hEv
       simp only [ep2MakeEnv, List.isEmpty_nil, ↓reduceIte, Option.some.injEq] at hEv
@@ -31418,11 +32944,19 @@ theorem stepMirFn_multi_deinit_projected_trustedRun {rootCm cm : CapturedMir} {b
     (hDeinit : evalDeinitPlace ts slots place = some slots1)
     (hTRoot : s.frame.locals[place.local_]? = some (.init rootVal))
     (hTDeinit : deinitProjectedForLocal s.frame.locals cm.localDecls cm.layouts place.local_
-      rootVal place.projection = .ok rootVal') :
+      rootVal place.projection = .ok rootVal')
+    (hBorrows : s.memory.borrows = [] := by rfl) :
     TrustedRun rootCm s { s with frame := ⟨bb, 1, s.frame.locals.set place.local_ (.init rootVal')⟩ } ∧
       SlotsRefine SlotBelow slots1 (s.frame.locals.set place.local_ (.init rootVal')) := by
+  have hNoProt : ∀ p ps, s.memory.activeProtectors = p :: ps →
+      hasProtectedWriteConflict s.memory.borrows (p :: ps) place.local_ .none
+        (resolveBorrowWriteLocalProj cm.localDecls cm.layouts s.frame.locals place.local_
+          place.projection) 0 0 (length s.memory.callStack) = false := by
+    intro _ _ _; rw [hBorrows]; rfl
   obtain ⟨hStmt, hRel1⟩ := evalStmt_deinit_projected_refines (s := s) (span := span)
     (localDecls := cm.localDecls) (layouts := cm.layouts) hSlots hProj hDeinit hTRoot hTDeinit
+    hNoProt
+  have hMemId := Memory.with_borrows_nil_eq_self s.memory hBorrows
   refine ⟨.step (Or.inl ?_) (.refl _), hRel1⟩
   unfold stepMirFn
   dsimp only
@@ -31432,7 +32966,7 @@ theorem stepMirFn_multi_deinit_projected_trustedRun {rootCm cm : CapturedMir} {b
     exact absurd hP (hPhase tag)
   · simp only [get?_eq_getElem?, hBlock, hcm, hStmt0, List.getElem?_cons_zero]
     rw [hStmt]
-    simp only [advanceStmt, hBlock, hStmt0]
+    simp only [advanceStmt, hBlock, hStmt0, hBorrows, invalidateConflictingBorrowsAtProj, hMemId]
 
 /-! #### Witness Suite 10 (`[adv ep2-A2]`): Diverging Projected Call + `Operand.move` + Cleanup-Block Linked Call, `tupleArityOf` Coexistence + `restoreCallerProtectors`, and Cross-Frame Pointer Isolation -/
 
@@ -31655,7 +33189,7 @@ private theorem witnessDivProjCleanup_multiBodyCorr :
       subst hb
       refine ⟨⟨ep2a1_ops_nonDeref _ rfl, rfl, "witness::panic_take_u32", [], 0, rfl, Or.inl rfl⟩,
         [⟨.deinit ⟨1, [.field 1 ep2TyU32]⟩, ""⟩], "", rfl,
-        fun slots slots1 s hB hS hAct _ hRel hEv => ?_⟩
+        fun slots slots1 s hB hS hAct _ hBorrows hRel hEv => ?_⟩
       simp only [witnessDivProjCleanupEnv, evalSingleReadableProjDeinitStmts] at hEv
       cases hRd : readPlaceState slots ⟨1, [.field 1 ep2TyU32]⟩ with
       | ub => rw [hRd] at hEv; nomatch hEv
@@ -31672,14 +33206,14 @@ private theorem witnessDivProjCleanup_multiBodyCorr :
             witnessDivProjCleanupCm.layouts 1 rootVal [.field 1 ep2TyU32] = .ok rootVal' := htDeinitV
         have hStep := stepMirFn_multi_deinit_projected_trustedRun
           (rootCm := witnessDivProjCleanupCm) (cm := witnessDivProjCleanupCm)
-          (fun _ h => nomatch h) hB hS hAct hRel rfl (by decide) hEv htRoot' htDeinit
+          (fun _ h => nomatch h) hB hS hAct hRel rfl (by decide) hEv htRoot' htDeinit hBorrows
         exact ⟨s.frame.locals.set 1 (.init rootVal'), hStep.1, hStep.2⟩
     | 1 =>
       simp only [witnessDivProjCleanupRootBody, List.getElem?_cons_succ, List.getElem?_cons_zero,
         Option.some.injEq] at hb
       subst hb
       refine ⟨⟨ep2a1_ops_nonDeref _ rfl, rfl, "witness::cleanup_inc", [], 0, rfl, Or.inl rfl⟩,
-        [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+        [], "", rfl, fun slots slots1 s hB hS _ _ _ hRel hEv => ?_⟩
       injection hEv with hEq; subst hEq
       refine ⟨s.frame.locals, ?_, hRel⟩
       rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩
@@ -31688,7 +33222,7 @@ private theorem witnessDivProjCleanup_multiBodyCorr :
       simp only [witnessDivProjCleanupRootBody, List.getElem?_cons_succ, List.getElem?_cons_zero,
         Option.some.injEq] at hb
       subst hb
-      refine ⟨trivial, [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+      refine ⟨trivial, [], "", rfl, fun slots slots1 s hB hS _ _ _ hRel hEv => ?_⟩
       injection hEv with hEq; subst hEq
       refine ⟨s.frame.locals, ?_, hRel⟩
       rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩
@@ -31732,7 +33266,7 @@ private theorem witnessTupleArityProj2Deep_multiBodyCorr :
       simp only [witnessTupleArityProj2DeepBody, List.getElem?_cons_zero, Option.some.injEq] at hb
       subst hb
       refine ⟨⟨ep2a1_ops_nonDeref _ rfl, rfl, "witness::mid", [], 0, rfl, Or.inl rfl⟩,
-        [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+        [], "", rfl, fun slots slots1 s hB hS _ _ _ hRel hEv => ?_⟩
       injection hEv with hEq; subst hEq
       refine ⟨s.frame.locals, ?_, hRel⟩
       rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩; simp only at hB hS; subst hB hS; exact .refl _
@@ -31741,7 +33275,7 @@ private theorem witnessTupleArityProj2Deep_multiBodyCorr :
         Option.some.injEq] at hb
       subst hb
       refine ⟨LTerminator.multiRefinable_call_of_lowerIntrinsicKind rfl rfl (ep2a1_ops_nonDeref _ rfl) rfl,
-        [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+        [], "", rfl, fun slots slots1 s hB hS _ _ _ hRel hEv => ?_⟩
       injection hEv with hEq; subst hEq
       refine ⟨s.frame.locals, ?_, hRel⟩
       rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩; simp only at hB hS; subst hB hS; exact .refl _
@@ -31749,7 +33283,7 @@ private theorem witnessTupleArityProj2Deep_multiBodyCorr :
       simp only [witnessTupleArityProj2DeepBody, List.getElem?_cons_succ, List.getElem?_cons_zero,
         Option.some.injEq] at hb
       subst hb
-      refine ⟨trivial, [], "", rfl, fun slots slots1 s hB hS _ _ hRel hEv => ?_⟩
+      refine ⟨trivial, [], "", rfl, fun slots slots1 s hB hS _ _ _ hRel hEv => ?_⟩
       injection hEv with hEq; subst hEq
       refine ⟨s.frame.locals, ?_, hRel⟩
       rcases s with ⟨⟨bIdx, sIdx, locs⟩, mem⟩; simp only at hB hS; subst hB hS; exact .refl _
