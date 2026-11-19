@@ -26,7 +26,17 @@ machine state:
    tagOf v mv` relates a symbolic value to the trusted runtime value of the
    run selected by its oracles (a `choice (symBool b) vt vf` is refined by the
    taken arm), with naturals refined by fixed-width scalars and borrow handles
-   by pointers whose provenance tag is `tagOf lid`.
+   by pointers whose provenance tag is `tagOf lid`. `stdValAlg.branchSplit`
+   splits exactly the `.choice` nodes (`stdBranchSplit_eq_some_iff`), and
+   refinement passes through it in both directions
+   (`StdValRefines.of_branchSplit`, `StdValRefines.branchSplit_inv`).
+   `stdValAlg.sameCond` decides equality of symbolic conditions
+   (`stdValAlg_sameCond_symBool_iff`) and `stdValAlg.sameAggregateShape`
+   accepts same-shape pairs (`stdValAlg_sameAggregateShape_pair`); since their
+   `ValAlgebra` laws make the compared values equal, refinement transports
+   along them (`StdValRefines.of_sameCond`,
+   `StdValRefines.of_sameAggregateShape_ext`), and `StdValRefines.pair_inv`
+   inverts refinement of a pair.
 2. **Lawful field lenses over trusted aggregates (`valuePathLens`).**
    `valueFieldLens f` reads field `f` of a `Value.aggregate` and writes it with
    `MirLiftCore.setSpineChecked?` (equal to the trusted `Sequence.set?`);
@@ -53,7 +63,47 @@ machine state:
    header) into the same conclusion, with no `CfgCertificate`;
    `mir_cfgCertificate_sound` is its certificate-driven corollary, and
    `CfgCertificate.whileLoop` packages `cfg_certificate_while_sound` as a
-   3-block loop certificate with a back-edge.
+   3-block loop certificate with a back-edge, while `CfgCertificate.diamond`
+   packages `cfg_certificate_diamond_sound` as a 4-block diamond certificate
+   supporting both concrete and symbolic (`.convergedJump 1`) branch conditions.
+   `mirCfgStateRel` asks only for a sub-identity pending wrapper (`SubIdWrap`)
+   and ignores the pending `.convergedJump` delay, so `stepBasicBlock`'s
+   join-convergent symbolic diamonds (a `.convergedJump armSteps` whose wrapper
+   is the `handleFreeOutOpt` guard) simulate through
+   `mirCfg_forwardSim_of_waitFree` / `mirCfg_segmentSim_of_waitFree` (and the
+   wrapper-agnostic `mirCfg_forwardSim_of_emitsSubIdWraps` /
+   `mirCfg_segmentSim_of_emitsSubIdWraps` over `mirCfgBlockRel`) with
+   obligations only at block transitions (delay ticks stutter, and halts carry
+   the raw block return); `mir_cfgCertificate_sound_of_invClosedNoFork` needs
+   only a closed, fork-free invariant. Shared parametric block-terminator and
+   diamond-plan lemmas (`evalFnValue_seq_branch_seq_ok_inv`,
+   `evalFnValue_seq_branch_seq_header_inv`,
+   `stepBasicBlock_of_branch_true`, `stepBasicBlock_of_branch_false`,
+   `stepBasicBlock_of_branch_symbolic`, `stepBasicBlock_of_branch_term`,
+   `stepBasicBlock_of_goto_continuing`, `stepBasicBlock_of_goto_term`,
+   `stepBasicBlock_of_ret_continuing`, `stepBasicBlock_of_ret_term`) factor the
+   header, arm, and join reasoning that the two fixed-shape diamond
+   certificates share (a new shape still needs its own certificate):
+   `mir_diamond_cfgCertificate_sound` instantiates them
+   for the 4-block symmetric `CfgCertificate.diamond` (`0 → (1 | 2) → 3`,
+   concrete or symbolic `.convergedJump 1` condition) from `HoldsFnSpec` of its
+   plan alone, and `mir_asymDiamond_cfgCertificate_sound` instantiates them for
+   the 5-block asymmetric `CfgCertificate.asymDiamond` (`0 → (1 → 2 | 3) → 4`,
+   concrete or symbolic `.convergedJump 2` condition) at fuel `4`;
+   and `mir_whileLoop_cfgCertificate_of_cutpoint` (together with its
+   wrapper-agnostic `mirCfgBlockRel` form
+   `mir_whileLoop_cfgCertificate_of_cutpoint_blockRel` and backwards-compatible
+   unit-decrement convenience wrappers `holdsFnSpec_whileLoop_of_unitCutpoint` /
+   `mir_whileLoop_cfgCertificate_of_unitCutpoint`) certifies
+   `CfgCertificate.whileLoop` from a strong-descent loop cutpoint
+   (`rank s' < rank s`, via `holdsFnSpec_whileLoop_of_cutpoint`,
+   `whileCutpoint_localBlockVC`, and `whileCutpoint_noFork`).
+   Limitation: a wrapper that merges a pending early return (the `wrapOut` of
+   a `.guardedContinuing` body or join, i.e. a `return` inside a symbolic
+   branch) changes the returned value, so it is not `SubIdWrap` and
+   `mirCfgStateRel` does not follow it; `CfgCertificate.diamond` accordingly
+   requires arms that only fall through, and the block machine still faults
+   on a non-convergent `.branchJump` fork.
 5. **Byte-window `SpatialCodec`s (`MirTypedByteCodec`).** A fixed-width
    `SepLogicLenses.ByteLensCodec α n` that agrees with the trusted operational
    byte codec `encodeValueToBytes` / `decodeValueFromBytes` at MIR type `ty`
@@ -109,9 +159,21 @@ machine state:
    (`freeze_fail_of_window_not_init`) nor be unpinned from a block mirroring its
    window (`unpin_fail_of_window_not_init`); `u8U32Padded_freeze_refused` and
    `u8U32Padded_unpin_blocked` instantiate both for padded `(u8, u32)`.
+9. **Wide-slice DST refinement (`stdWideSliceVal`, `UnsizedSliceDstAt`) and
+   spatial-pin framing (`WideSliceDstBridge`).** `stdWideSliceVal lid len`
+   models a wide `[T]` / `str` pointer symbolically as `.pair (.refVal lid [])
+   (.nat len)`, refined via `StdValRefines.wideSlice` when `wide.1.allocId =
+   tagOf lid` and `wide.1.offsetBytes = 0`. Statement- and call-level step
+   lifters preserve `spatialPinnedBlockHolds`, `spatialBindingsHold`,
+   `mirStateRel`, `mirCfgStateRel`, and `MirWpConverges` without unpinning
+   across `UnOp.ptrMetadata`, `AggregateKind.rawPtr` (`from_raw_parts`),
+   `CastKind.ptrToPtr` (`to_raw_parts` data pointer on global-backed wide
+   pointers, and wide-to-wide casts), and `core::intrinsics::size_of_val` /
+   `align_of_val`.
 
 End-to-end regressions over concrete `CapturedMir` bodies live in
-`tests/mir/PureLiftV2026BridgeTests.lean`.
+`tests/mir/PureLiftV2026BridgeTests.lean` and
+`tests/mir/UnsizedDstMetadataLensTests.lean`.
 -/
 
 namespace Anneal.PureLift.V2026_06_01Bridge
@@ -202,6 +264,130 @@ theorem StdValRefines.zip_symBool {tagOf : LoanId → Nat} {b : Bool}
   cases b with
   | true => exact .choiceTrue h
   | false => exact .choiceFalse h
+
+/-- `stdValAlg.branchSplit v` returns `some (c, vt, vf)` iff `v` is the symbolic
+choice node `.choice c vt vf`. -/
+theorem stdBranchSplit_eq_some_iff (v c vt vf : StdVal) :
+    stdValAlg.branchSplit v = some (c, vt, vf) ↔ v = .choice c vt vf := by
+  constructor
+  · intro h
+    rcases v with ⟨_, tree⟩
+    cases tree with
+    | choice fc ft ff tc tvt tvf =>
+      injection h with hTuple
+      injection hTuple with hc hRest
+      injection hRest with hvt hvf
+      subst hc
+      subst hvt
+      subst hvf
+      rfl
+    | _ => exact nomatch h
+  · intro h
+    subst h
+    rfl
+
+/-- If `stdValAlg.branchSplit v` splits `v` at `.symBool b` into `(vt, vf)`,
+then any runtime value refining `if b then vt else vf` refines `v`. -/
+theorem StdValRefines.of_branchSplit {tagOf : LoanId → Nat} {v vt vf : StdVal}
+    {b : Bool} {mv : Value}
+    (hSplit : stdValAlg.branchSplit v = some (.symBool b, vt, vf))
+    (hArm : StdValRefines tagOf (if b then vt else vf) mv) :
+    StdValRefines tagOf v mv := by
+  rw [(stdBranchSplit_eq_some_iff v (.symBool b) vt vf).mp hSplit]
+  exact StdValRefines.zip_symBool hArm
+
+/-- Inversion of `StdValRefines` through `stdValAlg.branchSplit`: any refined
+value that splits via `branchSplit` has a `.symBool b` guard and refines the
+selected arm `if b then vt else vf`. -/
+theorem StdValRefines.branchSplit_inv {tagOf : LoanId → Nat}
+    {v c vt vf : StdVal} {mv : Value}
+    (hSplit : stdValAlg.branchSplit v = some (c, vt, vf))
+    (hRef : StdValRefines tagOf v mv) :
+    Exists fun b : Bool =>
+      c = .symBool b ∧ StdValRefines tagOf (if b then vt else vf) mv := by
+  cases hRef with
+  | choiceTrue hArm =>
+    injection hSplit with hTuple
+    injection hTuple with hc hRest
+    injection hRest with hvt hvf
+    subst hc
+    subst hvt
+    subst hvf
+    exact ⟨true, rfl, hArm⟩
+  | choiceFalse hArm =>
+    injection hSplit with hTuple
+    injection hTuple with hc hRest
+    injection hRest with hvt hvf
+    subst hc
+    subst hvt
+    subst hvf
+    exact ⟨false, rfl, hArm⟩
+  | unit => exact nomatch hSplit
+  | unitAgg => exact nomatch hSplit
+  | nat _ => exact nomatch hSplit
+  | bool _ => exact nomatch hSplit
+  | symBool _ => exact nomatch hSplit
+  | pair _ _ => exact nomatch hSplit
+  | ref _ _ _ => exact nomatch hSplit
+
+/-- Inversion for `StdValRefines` on a `.choice c vt vf` node: `c` is some
+symbolic boolean `.symBool b` and `mv` refines the arm `if b then vt else vf`. -/
+theorem StdValRefines.choice_inv {tagOf : LoanId → Nat} {c vt vf : StdVal}
+    {mv : Value} (h : StdValRefines tagOf (.choice c vt vf) mv) :
+    Exists fun b : Bool =>
+      c = .symBool b ∧ StdValRefines tagOf (if b then vt else vf) mv :=
+  h.branchSplit_inv rfl
+
+/-- `stdValAlg.sameCond` on symbolic booleans is exact boolean equality. -/
+theorem stdValAlg_sameCond_symBool_iff (b1 b2 : Bool) :
+    stdValAlg.sameCond (.symBool b1) (.symBool b2) = true ↔ b1 = b2 := by
+  cases b1 <;> cases b2 <;> decide
+
+/-- Binary pairs always share aggregate shape in `stdValAlg`. -/
+theorem stdValAlg_sameAggregateShape_pair (a1 b1 a2 b2 : StdVal) :
+    stdValAlg.sameAggregateShape (.pair a1 b1) (.pair a2 b2) = true := rfl
+
+/-- If `stdValAlg.sameCond c1 c2 = true`, then `.choice c1 vt vf` and
+`.choice c2 vt vf` refine the exact same runtime values (`stdValAlg.sameCond_eq`). -/
+theorem StdValRefines.of_sameCond {tagOf : LoanId → Nat} {c1 c2 vt vf : StdVal}
+    {mv : Value} (hSame : stdValAlg.sameCond c1 c2 = true)
+    (hRef : StdValRefines tagOf (.choice c1 vt vf) mv) :
+    StdValRefines tagOf (.choice c2 vt vf) mv :=
+  stdValAlg.sameCond_eq c1 c2 hSame ▸ hRef
+
+/-- By `stdValAlg.sameAggregateShape_ext`, two `StdVal` aggregates with the
+same shape and identical field projections refine the exact same runtime
+values. -/
+theorem StdValRefines.of_sameAggregateShape_ext {tagOf : LoanId → Nat}
+    {v1 v2 : StdVal} {mv : Value}
+    (hShape : stdValAlg.sameAggregateShape v1 v2 = true)
+    (hFields : ∀ i, stdValAlg.getField i v1 = stdValAlg.getField i v2)
+    (hRef : StdValRefines tagOf v1 mv) :
+    StdValRefines tagOf v2 mv :=
+  stdValAlg.sameAggregateShape_ext v1 v2 hShape hFields ▸ hRef
+
+/-- Extract `(a, b)` from a `StdVal.pair a b`. -/
+def stdPairVal? (v : StdVal) : Option (StdVal × StdVal) :=
+  match v with
+  | ⟨_, .pairBranch fa fb ta tb⟩ => some (⟨fa, ta⟩, ⟨fb, tb⟩)
+  | _ => none
+
+/-- Inversion for `StdValRefines` on a `.pair a b` value: the runtime value is
+a 2-field tuple aggregate `.aggregate 0 [ma, mb]` whose elements refine `a`
+and `b`. -/
+theorem StdValRefines.pair_inv {tagOf : LoanId → Nat} {v a b : StdVal} {mv : Value}
+    (h : StdValRefines tagOf v mv) (hp : stdPairVal? v = some (a, b)) :
+    Exists fun ma => Exists fun mb =>
+      mv = .aggregate 0 [ma, mb] ∧
+      StdValRefines tagOf a ma ∧ StdValRefines tagOf b mb := by
+  cases h with
+  | pair ha hb =>
+    injection hp with hp
+    injection hp with haEq hbEq
+    subst haEq
+    subst hbEq
+    exact ⟨_, _, rfl, ha, hb⟩
+  | _ => exact nomatch hp
 
 /-- A natural is refined only by a scalar holding exactly that natural. -/
 theorem StdValRefines.nat_inv {tagOf : LoanId → Nat} {v : StdVal} {mv : Value}
@@ -1925,20 +2111,35 @@ theorem mirStateRel_swap (tagOf : LoanId → Nat)
 
 /-- Block-level state relation between an embedded `PureLift` CFG machine state
 `s : BlockMachineState (SymState StdVal) (FuncOut StdVal)` and a live `V2026_06_01`
-`MachineState`: `s.wrap` is the identity wrapper, `ms` sits at the header of
-`mirBb s.bb` (`stmtIdx = 0`), `mirStateRel tagOf (bindingsAt s.bb) s.st ms`
-holds, and `extra s.bb s.st ms` holds. -/
+`MachineState`: `s.wrap` is a sub-identity wrapper (`SubIdWrap s.wrap`, satisfied
+by `some` and preserved across `.convergedJump` continuing-join guards
+`handleFreeOutOpt stdValAlg`), `ms` sits at the header of `mirBb s.bb`
+(`stmtIdx = 0`), `mirStateRel tagOf (bindingsAt s.bb) s.st ms` holds, and
+`extra s.bb s.st ms` holds (independently of `s.wait`, so `.convergedJump`
+`armSteps` delay ticks stutter automatically). -/
 def mirCfgStateRel (tagOf : LoanId → Nat)
     (bindingsAt : Nat → List (LoanId × Local × SubPath))
     (mirBb : Nat → BasicBlockIdx)
     (extra : Nat → SymState StdVal → MachineState → Prop := fun _ _ _ => True)
     (s : BlockMachineState (SymState StdVal) (FuncOut StdVal))
     (ms : MachineState) : Prop :=
-  (∀ o, s.wrap o = o) ∧
+  SubIdWrap s.wrap ∧
   ms.frame.blockIdx = mirBb s.bb ∧
   ms.frame.stmtIdx = 0 ∧
   mirStateRel tagOf (bindingsAt s.bb) s.st ms ∧
   extra s.bb s.st ms
+
+/-- `mirCfgStateRel` ignores `s.wait`, so any pending `.convergedJump` delay
+tick preserves it identically. -/
+theorem mirCfgStateRel_wait_step (tagOf : LoanId → Nat)
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (wrap : FuncOut StdVal → Option (FuncOut StdVal))
+    (bb : Nat) (st : SymState StdVal) (w : Nat) (ms : MachineState)
+    (h : mirCfgStateRel tagOf bindingsAt mirBb extra ⟨wrap, bb, st, w + 1⟩ ms) :
+    mirCfgStateRel tagOf bindingsAt mirBb extra ⟨wrap, bb, st, w⟩ ms :=
+  h
 
 /-- Outcome-level return relation matching `LiftedMirPost`: a normal return
 whose value refines `out.ret` and whose final memory realizes `out.mutFinals` at
@@ -1949,6 +2150,237 @@ def MirOutcomeRel (tagOf : LoanId → Nat)
   Exists fun mv => Exists fun mem =>
     o = .normal (mv, mem) ∧ StdValRefines tagOf out.ret mv ∧
     spatialFinalBindingsHold (mirSpatialModel tagOf) rootAddrs out (callerExitState mem)
+
+/-- **Wait-free and wrapper-unwrapped `ForwardSim` constructor for
+`mirCfgStateRel`**:
+1. All `.convergedJump` `armSteps` delay ticks (`s.wait = w + 1`) are discharged
+   automatically by stuttering (`mirCfgStateRel_wait_step`).
+2. On `.ret v`, `SubIdWrap wrap` from `mirCfgStateRel` automatically identifies
+   any accepted `wrap v = some v'` with `v`, so the caller only proves
+   `PureMirExec.WpConverges (PureMirExec.mirStep body) ms (MirOutcomeRel tagOf rootAddrs v)`. -/
+theorem mirCfg_forwardSim_of_waitFree (tagOf : LoanId → Nat)
+    (body : CapturedMir) (blocks : List (BasicBlock StdVal))
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (rootAddrs : List (LoanId × Local × SubPath) := [])
+    (hZero : ∀ wrap bb st ms,
+      mirCfgStateRel tagOf bindingsAt mirBb extra ⟨wrap, bb, st, 0⟩ ms →
+      match stepBasicBlock stdValAlg blocks bb st with
+      | .jump nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgStateRel tagOf bindingsAt mirBb extra ⟨wrap, nextBb, st', 0⟩)
+      | .jumpWrapped wrapRet nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgStateRel tagOf bindingsAt mirBb extra
+            ⟨composeWrap wrap wrapRet, nextBb, st', 0⟩)
+      | .convergedJump armSteps wrapRet nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgStateRel tagOf bindingsAt mirBb extra
+            ⟨composeWrap wrap wrapRet, nextBb, st', armSteps⟩)
+      | .ret v =>
+        PureMirExec.WpConverges (PureMirExec.mirStep body) ms
+          (MirOutcomeRel tagOf rootAddrs v)
+      | .branchJump _ _ _ _ => True
+      | .fault => True) :
+    ForwardSim (blockCfgStep (stepBasicBlock stdValAlg blocks))
+      (PureMirExec.mirStep body)
+      (mirCfgStateRel tagOf bindingsAt mirBb extra)
+      (MirOutcomeRel tagOf rootAddrs) := by
+  refine forwardSim_of_waitFree (stepBasicBlock stdValAlg blocks)
+    (PureMirExec.mirStep body)
+    (mirCfgStateRel tagOf bindingsAt mirBb extra)
+    (MirOutcomeRel tagOf rootAddrs)
+    (mirCfgStateRel_wait_step tagOf bindingsAt mirBb extra) ?_
+  intro wrap bb st ms hR
+  have hZ := hZero wrap bb st ms hR
+  cases hst : stepBasicBlock stdValAlg blocks bb st with
+  | jump nextBb st' =>
+    rw [hst] at hZ
+    exact hZ
+  | jumpWrapped wrapRet nextBb st' =>
+    rw [hst] at hZ
+    exact hZ
+  | convergedJump armSteps wrapRet nextBb st' =>
+    rw [hst] at hZ
+    exact hZ
+  | branchJump _ _ _ _ => trivial
+  | fault => trivial
+  | ret v =>
+    rw [hst] at hZ
+    dsimp only
+    cases hw : wrap v with
+    | none => trivial
+    | some v' =>
+      rw [hR.1 v v' hw]
+      exact hZ
+
+/-- **Wait-free `SegmentSim` constructor for `mirCfgStateRel`**: discharges all
+`.convergedJump` `armSteps` delay ticks by stuttering and imposes obligations
+only on `wait = 0` `.jump`, `.jumpWrapped`, and `.convergedJump` transitions. -/
+theorem mirCfg_segmentSim_of_waitFree (tagOf : LoanId → Nat)
+    (body : CapturedMir) (blocks : List (BasicBlock StdVal))
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (hZero : ∀ wrap bb st ms,
+      mirCfgStateRel tagOf bindingsAt mirBb extra ⟨wrap, bb, st, 0⟩ ms →
+      match stepBasicBlock stdValAlg blocks bb st with
+      | .jump nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgStateRel tagOf bindingsAt mirBb extra ⟨wrap, nextBb, st', 0⟩)
+      | .jumpWrapped wrapRet nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgStateRel tagOf bindingsAt mirBb extra
+            ⟨composeWrap wrap wrapRet, nextBb, st', 0⟩)
+      | .convergedJump armSteps wrapRet nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgStateRel tagOf bindingsAt mirBb extra
+            ⟨composeWrap wrap wrapRet, nextBb, st', armSteps⟩)
+      | .ret _ => True
+      | .branchJump _ _ _ _ => True
+      | .fault => True) :
+    SegmentSim (blockCfgStep (stepBasicBlock stdValAlg blocks))
+      (PureMirExec.mirStep body)
+      (mirCfgStateRel tagOf bindingsAt mirBb extra) := by
+  refine segmentSim_of_waitFree (stepBasicBlock stdValAlg blocks)
+    (PureMirExec.mirStep body)
+    (mirCfgStateRel tagOf bindingsAt mirBb extra)
+    (mirCfgStateRel_wait_step tagOf bindingsAt mirBb extra) ?_
+  intro wrap bb st ms hR
+  have hZ := hZero wrap bb st ms hR
+  cases hst : stepBasicBlock stdValAlg blocks bb st with
+  | jump nextBb st' =>
+    rw [hst] at hZ
+    exact hZ
+  | jumpWrapped wrapRet nextBb st' =>
+    rw [hst] at hZ
+    exact hZ
+  | convergedJump armSteps wrapRet nextBb st' =>
+    rw [hst] at hZ
+    exact hZ
+  | branchJump _ _ _ _ => trivial
+  | fault => trivial
+  | ret _ => trivial
+
+/-- `mirCfgStateRel` without its wrapper component: the live machine sits at
+statement `0` of `mirBb bb`, realizes `st` (`mirStateRel`), and satisfies
+`extra`. -/
+def mirCfgBlockRel (tagOf : LoanId → Nat)
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (bb : Nat) (st : SymState StdVal) (ms : MachineState) : Prop :=
+  ms.frame.blockIdx = mirBb bb ∧
+  ms.frame.stmtIdx = 0 ∧
+  mirStateRel tagOf (bindingsAt bb) st ms ∧
+  extra bb st ms
+
+/-- **Wrapper-agnostic wait-free `ForwardSim` for `mirCfgStateRel`**: when the
+CFG emits only sub-identity wrappers from the `extra`-related states
+(`EmitsSubIdWraps`, as for `stepBasicBlock`'s `.continuing` joins guarded by
+`handleFreeOutOpt`), the per-block obligations mention neither the pending
+wrapper nor the `.convergedJump` delay: `SubIdWrap` of every composed wrapper is
+discharged by `subIdWrap_composeWrap`, delay ticks stutter, and halts are
+obligations on the raw block return. -/
+theorem mirCfg_forwardSim_of_emitsSubIdWraps (tagOf : LoanId → Nat)
+    (body : CapturedMir) (blocks : List (BasicBlock StdVal))
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (rootAddrs : List (LoanId × Local × SubPath) := [])
+    (hEmit : EmitsSubIdWraps (stepBasicBlock stdValAlg blocks)
+      (fun bb st => Exists fun ms => extra bb st ms))
+    (hZero : ∀ bb st ms, mirCfgBlockRel tagOf bindingsAt mirBb extra bb st ms →
+      match stepBasicBlock stdValAlg blocks bb st with
+      | .jump nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .jumpWrapped _ nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .convergedJump _ _ nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .ret v =>
+        PureMirExec.WpConverges (PureMirExec.mirStep body) ms
+          (MirOutcomeRel tagOf rootAddrs v)
+      | .branchJump _ _ _ _ => True
+      | .fault => True) :
+    ForwardSim (blockCfgStep (stepBasicBlock stdValAlg blocks))
+      (PureMirExec.mirStep body)
+      (mirCfgStateRel tagOf bindingsAt mirBb extra)
+      (MirOutcomeRel tagOf rootAddrs) := by
+  refine mirCfg_forwardSim_of_waitFree tagOf body blocks bindingsAt mirBb extra
+    rootAddrs ?_
+  intro wrap bb st ms hR
+  have hW : SubIdWrap wrap := hR.1
+  have hE := hEmit bb st ⟨ms, hR.2.2.2.2⟩
+  have hZ := hZero bb st ms hR.2
+  cases hst : stepBasicBlock stdValAlg blocks bb st with
+  | jump nextBb st' =>
+    rw [hst] at hZ
+    exact hZ.mono (fun _ h => ⟨hW, h⟩)
+  | jumpWrapped wrapRet nextBb st' =>
+    rw [hst] at hZ hE
+    exact hZ.mono (fun _ h => ⟨subIdWrap_composeWrap hW hE, h⟩)
+  | convergedJump armSteps wrapRet nextBb st' =>
+    rw [hst] at hZ hE
+    exact hZ.mono (fun _ h => ⟨subIdWrap_composeWrap hW hE, h⟩)
+  | ret v =>
+    rw [hst] at hZ
+    exact hZ
+  | branchJump _ _ _ _ => trivial
+  | fault => trivial
+
+/-- **Wrapper-agnostic wait-free `SegmentSim` for `mirCfgStateRel`**: when the
+CFG emits only sub-identity wrappers from the `extra`-related states
+(`EmitsSubIdWraps`), per-block segment simulation obligations mention neither
+the pending wrapper nor the `.convergedJump` delay (`mirCfgBlockRel`), and
+`.ret`, `.branchJump`, and `.fault` impose no obligation. -/
+theorem mirCfg_segmentSim_of_emitsSubIdWraps (tagOf : LoanId → Nat)
+    (body : CapturedMir) (blocks : List (BasicBlock StdVal))
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (hEmit : EmitsSubIdWraps (stepBasicBlock stdValAlg blocks)
+      (fun bb st => Exists fun ms => extra bb st ms))
+    (hZero : ∀ bb st ms, mirCfgBlockRel tagOf bindingsAt mirBb extra bb st ms →
+      match stepBasicBlock stdValAlg blocks bb st with
+      | .jump nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .jumpWrapped _ nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .convergedJump _ _ nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .ret _ => True
+      | .branchJump _ _ _ _ => True
+      | .fault => True) :
+    SegmentSim (blockCfgStep (stepBasicBlock stdValAlg blocks))
+      (PureMirExec.mirStep body)
+      (mirCfgStateRel tagOf bindingsAt mirBb extra) := by
+  refine mirCfg_segmentSim_of_waitFree tagOf body blocks bindingsAt mirBb
+    extra ?_
+  intro wrap bb st ms hR
+  have hW : SubIdWrap wrap := hR.1
+  have hE := hEmit bb st ⟨ms, hR.2.2.2.2⟩
+  have hZ := hZero bb st ms hR.2
+  cases hst : stepBasicBlock stdValAlg blocks bb st with
+  | jump nextBb st' =>
+    rw [hst] at hZ
+    exact hZ.mono (fun _ h => ⟨hW, h⟩)
+  | jumpWrapped wrapRet nextBb st' =>
+    rw [hst] at hZ hE
+    exact hZ.mono (fun _ h => ⟨subIdWrap_composeWrap hW hE, h⟩)
+  | convergedJump armSteps wrapRet nextBb st' =>
+    rw [hst] at hZ hE
+    exact hZ.mono (fun _ h => ⟨subIdWrap_composeWrap hW hE, h⟩)
+  | ret _ => trivial
+  | branchJump _ _ _ _ => trivial
+  | fault => trivial
 
 /-- **Certificate-free block-level adequacy over live `V2026_06_01` MIR
 (`mir_blockCfg_sound`)**: a forward simulation from the embedded `PureLift`
@@ -1980,6 +2412,35 @@ theorem mir_blockCfg_sound (tagOf : LoanId → Nat) (body : CapturedMir)
         ⟨out, mv, mem, ho, hRef, hFin, hPost⟩)
       (wpConverges_of_forwardSim hSim hWp m0 hR0))
 
+/-- **`InvClosedNoFork` form of `mir_cfgCertificate_sound`**: requires only
+`InvClosedNoFork (stepBasicBlock stdValAlg cert.blocks) BlockInv` (no `PostRet`
+or fault-freedom on unreachable blocks). -/
+theorem mir_cfgCertificate_sound_of_invClosedNoFork (tagOf : LoanId → Nat)
+    (body : CapturedMir) (cert : CfgCertificate stdValAlg)
+    (params : List (ParamInput StdVal)) (st0 : SymState StdVal)
+    (post : FuncOut StdVal → Prop)
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (rootAddrs : List (LoanId × Local × SubPath) := [])
+    (hInit : initFnState stdValAlg params = .ok st0)
+    (hSpec : HoldsFnSpec (evalFnValue stdValAlg params cert.plan cert.retExpr) post)
+    (BlockInv : Nat → SymState StdVal → Prop)
+    (hClosed : InvClosedNoFork (stepBasicBlock stdValAlg cert.blocks) BlockInv)
+    (hInv0 : BlockInv cert.entryBb st0)
+    (hSim : ForwardSim (blockCfgStep (stepBasicBlock stdValAlg cert.blocks))
+      (PureMirExec.mirStep body)
+      (mirCfgStateRel tagOf bindingsAt mirBb extra)
+      (MirOutcomeRel tagOf rootAddrs))
+    {m0 : MachineState}
+    (hR0 : mirCfgStateRel tagOf bindingsAt mirBb extra ⟨some, cert.entryBb, st0, 0⟩ m0) :
+    Anneal.MirFuelFree.MirWpConverges body m0
+      (fun o => LiftedMirPost tagOf post o rootAddrs) :=
+  mir_blockCfg_sound tagOf body cert.blocks post bindingsAt mirBb extra rootAddrs hSim
+    (wpConverges_of_cfgCertificate_of_invClosedNoFork stdValAlg cert params st0
+      post hInit hSpec BlockInv hClosed hInv0)
+    hR0
+
 /-- **Compositional `CfgCertificate` adequacy over live `V2026_06_01` MIR
 (`mir_cfgCertificate_sound`)**: connects `MirLiftCoreInterop.wpConverges_of_cfgCertificate`
 and `wpConverges_of_forwardSim` to `mirCfgStateRel` and `LiftedMirPost`. -/
@@ -2005,13 +2466,14 @@ theorem mir_cfgCertificate_sound (tagOf : LoanId → Nat) (body : CapturedMir)
       (mirCfgStateRel tagOf bindingsAt mirBb extra)
       (MirOutcomeRel tagOf rootAddrs))
     {m0 : MachineState}
-    (hR0 : mirCfgStateRel tagOf bindingsAt mirBb extra ⟨fun o => o, cert.entryBb, st0⟩ m0) :
+    (hR0 : mirCfgStateRel tagOf bindingsAt mirBb extra ⟨some, cert.entryBb, st0, 0⟩ m0) :
     Anneal.MirFuelFree.MirWpConverges body m0
       (fun o => LiftedMirPost tagOf post o rootAddrs) :=
-  mir_blockCfg_sound tagOf body cert.blocks post bindingsAt mirBb extra rootAddrs hSim
-    (wpConverges_of_cfgCertificate stdValAlg cert params st0 post hInit hSpec
-      BlockInv PostRet hLocal hNoFork hInv0)
-    hR0
+  mir_cfgCertificate_sound_of_invClosedNoFork tagOf body cert params st0 post
+    bindingsAt mirBb extra rootAddrs hInit hSpec BlockInv
+    (invClosedNoFork_of_localBlockVC (stepBasicBlock stdValAlg cert.blocks)
+      BlockInv PostRet hLocal hNoFork)
+    hInv0 hSim hR0
 
 /-- If `body` produces only `.continuing` flows, then `runWhileFlowSteps`
 produces only `.continuing` flows for any fuel bound `k`. -/
@@ -2062,6 +2524,11 @@ theorem runWhileFlowSteps_continuing {Val : Type} (alg : ValAlgebra Val)
             rw [hEv] at h
             exact runWhileFlowSteps_continuing alg cond body hBody k s' f h
 
+-- `evalPlan_skip`, `evalPlan_skip_continuing`, and `evalPlan_branch_continuing`
+-- live in `MirLiftCoreInterop` (opened above). Do not redeclare them here: the
+-- bridge tests open both namespaces, so a second copy makes every unqualified
+-- use there an "Ambiguous term" error.
+
 theorem evalPlan_act {Val : Type} (alg : ValAlgebra Val) (a : PrimAction Val)
     (s : SymState Val) :
     evalPlan alg (.act a) s =
@@ -2091,6 +2558,59 @@ theorem evalPlan_seq_continuing {Val : Type} (alg : ValAlgebra Val) {p1 p2 : Flo
     subst hf1
     rw [hp1] at h
     exact h2 s1 f h
+
+theorem evalPlan_whileLoop_continuing {Val : Type} (alg : ValAlgebra Val)
+    (fuel : Nat) (cond : RvalOp Val) {body : FlowPlan Val}
+    (hWfB : WfPlan alg body)
+    (hBody : ∀ s f, evalPlan alg body s = .ok f → Exists fun s' => f = .continuing s') :
+    ∀ s f, evalPlan alg (.whileLoop fuel cond body) s = .ok f →
+      Exists fun s' => f = .continuing s' := by
+  intro s f h
+  rw [evalPlan_whileLoop alg fuel cond body s hWfB] at h
+  exact runWhileFlowSteps_continuing alg cond body hBody fuel s f h
+
+/-- Any 3-block while-loop CFG whose body produces only `.continuing` flows
+never emits `.jumpWrapped` or `.convergedJump` transitions, so it satisfies
+`EmitsSubIdWraps` for every invariant `Inv`. -/
+theorem whileLoopBlocks_emitsSubIdWraps {Val : Type} (alg : ValAlgebra Val)
+    (cond : RvalOp Val) (body : FlowPlan Val) (retExpr : RvalOp Val)
+    (hBody : ∀ s f, evalPlan alg body s = .ok f → Exists fun s' => f = .continuing s')
+    (Inv : Nat → SymState Val → Prop) :
+    EmitsSubIdWraps (stepBasicBlock alg (whileLoopBlocks cond body retExpr)) Inv := by
+  intro bb st _
+  match bb with
+  | 0 =>
+    dsimp only [stepBasicBlock, whileLoopBlocks, listGetOpt, evalPlan,
+      evalPlanOps, stepPlanOp, FlowPlan.skip, List.foldr]
+    cases evalRval alg cond st with
+    | none => exact trivial
+    | some cv =>
+      dsimp only
+      cases alg.asBool cv with
+      | some b => cases b <;> exact trivial
+      | none => exact trivial
+  | 1 =>
+    dsimp only [stepBasicBlock, whileLoopBlocks, listGetOpt, List.foldr]
+    cases hB : evalPlan alg body st with
+    | fail => exact trivial
+    | ok f =>
+      obtain ⟨s', hf⟩ := hBody st f hB
+      subst hf
+      exact trivial
+  | 2 =>
+    dsimp only [stepBasicBlock, whileLoopBlocks, listGetOpt, evalPlan,
+      evalPlanOps, stepPlanOp, FlowPlan.skip, List.foldr]
+    cases stateCleanAtReturn st with
+    | false => exact trivial
+    | true =>
+      dsimp
+      cases evalRval alg retExpr st with
+      | none => exact trivial
+      | some rv =>
+        dsimp
+        cases handleFreeOut alg ⟨rv, collectRootMutVals st.loans⟩ <;>
+          exact trivial
+  | _ + 3 => exact trivial
 
 /-- **3-block while-loop `CfgCertificate` constructor (`CfgCertificate.whileLoop`)**:
 packages `[⟨.skip, .branch cond 1 2⟩, ⟨body, .goto 0⟩, ⟨.skip, .ret retExpr⟩]` at
@@ -2140,6 +2660,2282 @@ def CfgCertificate.whileLoop {Val : Type} (alg : ValAlgebra Val)
             subst hOut
             exact cfg_certificate_while_sound alg cond body retExpr loopFuel
               st0 sFinal retVal hRun hClean hRet hFree
+
+/-- **Strong-descent cutpoint soundness for `FlowPlan.whileLoop` function
+evaluation (`rank s' < rank s`)**: if `Inv` is a cutpoint invariant of `while
+cond { body }` whose taken iterations strictly decrease `rank` (`rank s' <
+rank s`, allowing multi-step drops `Δrank ≥ 2`) and whose exit state is clean,
+handle-free, and satisfies `post`, then `evalFnValue alg params (.whileLoop
+loopFuel cond body) retExpr` satisfies `HoldsFnSpec ... post` for every
+`loopFuel ≥ rank st0`. -/
+theorem holdsFnSpec_whileLoop_of_cutpoint {Val : Type} (alg : ValAlgebra Val)
+    (loopFuel : Nat) (cond : RvalOp Val) (body : FlowPlan Val)
+    (retExpr : RvalOp Val) (hWfB : WfPlan alg body)
+    (Inv : SymState Val → Prop) (rank : SymState Val → Nat)
+    (hStep : ∀ s, Inv s →
+      Exists fun cv => evalRval alg cond s = some cv ∧
+        (alg.asBool cv = some false ∨
+         (alg.asBool cv = some true ∧
+          Exists fun s' =>
+            evalPlan alg body s = .ok (.continuing s') ∧
+            Inv s' ∧ rank s' < rank s)))
+    (post : FuncOut Val → Prop)
+    (hExit : ∀ s, Inv s →
+      (Exists fun cv => evalRval alg cond s = some cv ∧ alg.asBool cv = some false) →
+      stateCleanAtReturn s = true ∧
+        Exists fun rv => evalRval alg retExpr s = some rv ∧
+          handleFreeOut alg ⟨rv, collectRootMutVals s.loans⟩ = true ∧
+          post ⟨rv, collectRootMutVals s.loans⟩)
+    (params : List (ParamInput Val)) (st0 : SymState Val)
+    (hInit : initFnState alg params = .ok st0)
+    (hInv0 : Inv st0) (hRankLe : rank st0 ≤ loopFuel) :
+    HoldsFnSpec (evalFnValue alg params (.whileLoop loopFuel cond body) retExpr)
+      post := by
+  obtain ⟨sFinal, hRun, hInvF, hCondF⟩ :=
+    runWhileFlowSteps_cutpoint_sound alg cond (evalPlan alg body) Inv rank hStep
+      loopFuel st0 hInv0 hRankLe
+  obtain ⟨hClean, rv, hRet, hFree, hPost⟩ := hExit sFinal hInvF hCondF
+  unfold evalFnValue
+  rw [hInit]
+  dsimp only
+  rw [evalPlan_whileLoop alg loopFuel cond body st0 hWfB, hRun]
+  dsimp only
+  rw [hClean]
+  dsimp
+  rw [hRet]
+  dsimp
+  rw [hFree]
+  exact hPost
+
+/-- Canonical 3-block invariant of `whileLoopBlocks cond body retExpr`
+induced by a header cutpoint invariant `Inv : SymState Val → Prop`. -/
+def whileCutpointBlockInv {Val : Type} (alg : ValAlgebra Val)
+    (cond : RvalOp Val) (Inv : SymState Val → Prop)
+    (bb : Nat) (st : SymState Val) : Prop :=
+  match bb with
+  | 0 => Inv st
+  | 1 =>
+    Inv st ∧
+    Exists fun cv => evalRval alg cond st = some cv ∧ alg.asBool cv = some true
+  | 2 =>
+    Inv st ∧
+    Exists fun cv => evalRval alg cond st = some cv ∧ alg.asBool cv = some false
+  | _ => False
+
+/-- **Any strong-descent cutpoint (`rank s' < rank s`) automatically satisfies
+`LocalBlockVC` on `whileLoopBlocks cond body retExpr`** under
+`whileCutpointBlockInv alg cond Inv`. -/
+theorem whileCutpoint_localBlockVC {Val : Type} (alg : ValAlgebra Val)
+    (cond : RvalOp Val) (body : FlowPlan Val) (retExpr : RvalOp Val)
+    (Inv : SymState Val → Prop) (rank : SymState Val → Nat)
+    (hStep : ∀ s, Inv s →
+      Exists fun cv => evalRval alg cond s = some cv ∧
+        (alg.asBool cv = some false ∨
+         (alg.asBool cv = some true ∧
+          Exists fun s' =>
+            evalPlan alg body s = .ok (.continuing s') ∧
+            Inv s' ∧ rank s' < rank s)))
+    (post : FuncOut Val → Prop)
+    (hExit : ∀ s, Inv s →
+      (Exists fun cv => evalRval alg cond s = some cv ∧ alg.asBool cv = some false) →
+      stateCleanAtReturn s = true ∧
+        Exists fun rv => evalRval alg retExpr s = some rv ∧
+          handleFreeOut alg ⟨rv, collectRootMutVals s.loans⟩ = true ∧
+          post ⟨rv, collectRootMutVals s.loans⟩) :
+    LocalBlockVC (stepBasicBlock alg (whileLoopBlocks cond body retExpr))
+      (whileCutpointBlockInv alg cond Inv) post := by
+  intro bb st hInv
+  match bb with
+  | 0 =>
+    obtain ⟨cv, hcv, hCase⟩ := hStep st hInv
+    dsimp only [stepBasicBlock, whileLoopBlocks, listGetOpt, evalPlan,
+      evalPlanOps, stepPlanOp, FlowPlan.skip, List.foldr]
+    rw [hcv]
+    dsimp only
+    rcases hCase with hbF | ⟨hbT, _⟩
+    · rw [hbF]
+      exact ⟨hInv, cv, hcv, hbF⟩
+    · rw [hbT]
+      exact ⟨hInv, cv, hcv, hbT⟩
+  | 1 =>
+    obtain ⟨hInv0, cv0, hcv0, hb0⟩ := hInv
+    obtain ⟨cv, hcv, hCase⟩ := hStep st hInv0
+    rw [hcv0] at hcv
+    injection hcv with hEq
+    subst hEq
+    rcases hCase with hbF | ⟨_, s', hBody, hInv', _⟩
+    · rw [hb0] at hbF
+      exact nomatch hbF
+    · dsimp only [stepBasicBlock, whileLoopBlocks, listGetOpt, List.foldr]
+      rw [hBody]
+      exact hInv'
+  | 2 =>
+    obtain ⟨hInv0, hCondF⟩ := hInv
+    obtain ⟨hClean, rv, hRet, hFree, hPost⟩ := hExit st hInv0 hCondF
+    dsimp only [stepBasicBlock, whileLoopBlocks, listGetOpt, evalPlan,
+      evalPlanOps, stepPlanOp, FlowPlan.skip, List.foldr]
+    rw [hClean]
+    dsimp
+    rw [hRet]
+    dsimp
+    rw [hFree]
+    exact hPost
+  | _ + 3 => exact nomatch hInv
+
+/-- **Any strong-descent cutpoint (`rank s' < rank s`) is fork-free on
+`whileLoopBlocks cond body retExpr`** under `whileCutpointBlockInv alg cond Inv`. -/
+theorem whileCutpoint_noFork {Val : Type} (alg : ValAlgebra Val)
+    (cond : RvalOp Val) (body : FlowPlan Val) (retExpr : RvalOp Val)
+    (Inv : SymState Val → Prop) (rank : SymState Val → Nat)
+    (hStep : ∀ s, Inv s →
+      Exists fun cv => evalRval alg cond s = some cv ∧
+        (alg.asBool cv = some false ∨
+         (alg.asBool cv = some true ∧
+          Exists fun s' =>
+            evalPlan alg body s = .ok (.continuing s') ∧
+            Inv s' ∧ rank s' < rank s))) :
+    ∀ bb st, whileCutpointBlockInv alg cond Inv bb st →
+      ∀ mergeRet thenBb elseBb st',
+        stepBasicBlock alg (whileLoopBlocks cond body retExpr) bb st ≠
+          .branchJump mergeRet thenBb elseBb st' := by
+  intro bb st hInv mergeRet thenBb elseBb st' hFork
+  match bb with
+  | 0 =>
+    obtain ⟨cv, hcv, hCase⟩ := hStep st hInv
+    dsimp only [stepBasicBlock, whileLoopBlocks, listGetOpt, evalPlan,
+      evalPlanOps, stepPlanOp, FlowPlan.skip, List.foldr] at hFork
+    rw [hcv] at hFork
+    dsimp only at hFork
+    rcases hCase with hbF | ⟨hbT, _⟩
+    · rw [hbF] at hFork
+      exact nomatch hFork
+    · rw [hbT] at hFork
+      exact nomatch hFork
+  | 1 =>
+    obtain ⟨hInv0, cv0, hcv0, hb0⟩ := hInv
+    obtain ⟨cv, hcv, hCase⟩ := hStep st hInv0
+    rw [hcv0] at hcv
+    injection hcv with hEq
+    subst hEq
+    rcases hCase with hbF | ⟨_, s', hBody, _⟩
+    · rw [hb0] at hbF
+      exact nomatch hbF
+    · dsimp only [stepBasicBlock, whileLoopBlocks, listGetOpt, List.foldr] at hFork
+      rw [hBody] at hFork
+      exact nomatch hFork
+  | 2 =>
+    revert hFork
+    dsimp [stepBasicBlock, whileLoopBlocks, listGetOpt, evalPlan,
+      evalPlanOps, stepPlanOp, FlowPlan.skip, List.foldr]
+    cases stateCleanAtReturn st with
+    | false =>
+      intro hFork
+      exact nomatch hFork
+    | true =>
+      cases evalRval alg retExpr st with
+      | none =>
+        intro hFork
+        exact nomatch hFork
+      | some rv =>
+        dsimp
+        cases handleFreeOut alg ⟨rv, collectRootMutVals st.loans⟩ with
+        | false =>
+          intro hFork
+          exact nomatch hFork
+        | true =>
+          intro hFork
+          exact nomatch hFork
+  | _ + 3 => exact nomatch hInv
+
+/-- **End-to-end live `V2026_06_01` MIR adequacy for a `CfgCertificate.whileLoop`
+verified by a strong-descent cutpoint (`rank s' < rank s`)**: packages
+`holdsFnSpec_whileLoop_of_cutpoint`, `whileCutpoint_localBlockVC`,
+`whileCutpoint_noFork`, and `mir_cfgCertificate_sound` so the caller supplies
+only the header cutpoint `(Inv, rank, hStep, hExit)` and the per-block live MIR
+simulation `hSim`. -/
+theorem mir_whileLoop_cfgCertificate_of_cutpoint (tagOf : LoanId → Nat)
+    (body : CapturedMir) (loopFuel : Nat) (cond : RvalOp StdVal)
+    (loopBody : FlowPlan StdVal) (retExpr : RvalOp StdVal)
+    (hWfB : WfPlan stdValAlg loopBody)
+    (hBodyCont : ∀ s f,
+      evalPlan stdValAlg loopBody s = .ok f → Exists fun s' => f = .continuing s')
+    (params : List (ParamInput StdVal)) (st0 : SymState StdVal)
+    (post : FuncOut StdVal → Prop)
+    (Inv : SymState StdVal → Prop) (rank : SymState StdVal → Nat)
+    (hStep : ∀ s, Inv s →
+      Exists fun cv => evalRval stdValAlg cond s = some cv ∧
+        (stdValAlg.asBool cv = some false ∨
+         (stdValAlg.asBool cv = some true ∧
+          Exists fun s' =>
+            evalPlan stdValAlg loopBody s = .ok (.continuing s') ∧
+            Inv s' ∧ rank s' < rank s)))
+    (hExit : ∀ s, Inv s →
+      (Exists fun cv => evalRval stdValAlg cond s = some cv ∧
+        stdValAlg.asBool cv = some false) →
+      stateCleanAtReturn s = true ∧
+        Exists fun rv => evalRval stdValAlg retExpr s = some rv ∧
+          handleFreeOut stdValAlg ⟨rv, collectRootMutVals s.loans⟩ = true ∧
+          post ⟨rv, collectRootMutVals s.loans⟩)
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (rootAddrs : List (LoanId × Local × SubPath) := [])
+    (hInit : initFnState stdValAlg params = .ok st0)
+    (hInv0 : Inv st0) (hRankLe : rank st0 ≤ loopFuel)
+    (hSim : ForwardSim
+      (blockCfgStep
+        (stepBasicBlock stdValAlg
+          (CfgCertificate.whileLoop stdValAlg loopFuel cond loopBody retExpr
+            hWfB hBodyCont).blocks))
+      (PureMirExec.mirStep body)
+      (mirCfgStateRel tagOf bindingsAt mirBb extra)
+      (MirOutcomeRel tagOf rootAddrs))
+    {m0 : MachineState}
+    (hR0 : mirCfgStateRel tagOf bindingsAt mirBb extra ⟨some, 0, st0, 0⟩ m0) :
+    Anneal.MirFuelFree.MirWpConverges body m0
+      (fun o => LiftedMirPost tagOf post o rootAddrs) :=
+  mir_cfgCertificate_sound tagOf body
+    (CfgCertificate.whileLoop stdValAlg loopFuel cond loopBody retExpr hWfB
+      hBodyCont)
+    params st0 post bindingsAt mirBb extra rootAddrs hInit
+    (holdsFnSpec_whileLoop_of_cutpoint stdValAlg loopFuel cond loopBody retExpr
+      hWfB Inv rank hStep post hExit params st0 hInit hInv0 hRankLe)
+    (whileCutpointBlockInv stdValAlg cond Inv) post
+    (whileCutpoint_localBlockVC stdValAlg cond loopBody retExpr Inv rank hStep
+      post hExit)
+    (whileCutpoint_noFork stdValAlg cond loopBody retExpr Inv rank hStep)
+    hInv0 hSim hR0
+
+/-- **Wrapper-agnostic `mirCfgBlockRel` form of
+`mir_whileLoop_cfgCertificate_of_cutpoint`**: discharges
+`mirCfg_forwardSim_of_emitsSubIdWraps` and `whileLoopBlocks_emitsSubIdWraps`
+internally from `hBodyCont`, so the caller supplies only the strong-descent
+header cutpoint `(Inv, rank, hStep, hExit)` and the wrapper-free per-block
+`mirCfgBlockRel` step obligations `hZero` and entry relation `hR0`. -/
+theorem mir_whileLoop_cfgCertificate_of_cutpoint_blockRel (tagOf : LoanId → Nat)
+    (body : CapturedMir) (loopFuel : Nat) (cond : RvalOp StdVal)
+    (loopBody : FlowPlan StdVal) (retExpr : RvalOp StdVal)
+    (hWfB : WfPlan stdValAlg loopBody)
+    (hBodyCont : ∀ s f,
+      evalPlan stdValAlg loopBody s = .ok f → Exists fun s' => f = .continuing s')
+    (params : List (ParamInput StdVal)) (st0 : SymState StdVal)
+    (post : FuncOut StdVal → Prop)
+    (Inv : SymState StdVal → Prop) (rank : SymState StdVal → Nat)
+    (hStep : ∀ s, Inv s →
+      Exists fun cv => evalRval stdValAlg cond s = some cv ∧
+        (stdValAlg.asBool cv = some false ∨
+         (stdValAlg.asBool cv = some true ∧
+          Exists fun s' =>
+            evalPlan stdValAlg loopBody s = .ok (.continuing s') ∧
+            Inv s' ∧ rank s' < rank s)))
+    (hExit : ∀ s, Inv s →
+      (Exists fun cv => evalRval stdValAlg cond s = some cv ∧
+        stdValAlg.asBool cv = some false) →
+      stateCleanAtReturn s = true ∧
+        Exists fun rv => evalRval stdValAlg retExpr s = some rv ∧
+          handleFreeOut stdValAlg ⟨rv, collectRootMutVals s.loans⟩ = true ∧
+          post ⟨rv, collectRootMutVals s.loans⟩)
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (rootAddrs : List (LoanId × Local × SubPath) := [])
+    (hInit : initFnState stdValAlg params = .ok st0)
+    (hInv0 : Inv st0) (hRankLe : rank st0 ≤ loopFuel)
+    (hZero : ∀ bb st ms,
+      mirCfgBlockRel tagOf bindingsAt mirBb extra bb st ms →
+      match
+        stepBasicBlock stdValAlg
+          (whileLoopBlocks cond loopBody retExpr) bb st
+      with
+      | .jump nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .jumpWrapped _ nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .convergedJump _ _ nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .ret v =>
+        PureMirExec.WpConverges (PureMirExec.mirStep body) ms
+          (MirOutcomeRel tagOf rootAddrs v)
+      | .branchJump _ _ _ _ => True
+      | .fault => True)
+    {m0 : MachineState}
+    (hR0 : mirCfgBlockRel tagOf bindingsAt mirBb extra 0 st0 m0) :
+    Anneal.MirFuelFree.MirWpConverges body m0
+      (fun o => LiftedMirPost tagOf post o rootAddrs) :=
+  mir_whileLoop_cfgCertificate_of_cutpoint tagOf body loopFuel cond loopBody
+    retExpr hWfB hBodyCont params st0 post Inv rank hStep hExit bindingsAt
+    mirBb extra rootAddrs hInit hInv0 hRankLe
+    (mirCfg_forwardSim_of_emitsSubIdWraps tagOf body
+      (whileLoopBlocks cond loopBody retExpr) bindingsAt mirBb extra rootAddrs
+      (whileLoopBlocks_emitsSubIdWraps stdValAlg cond loopBody retExpr
+        hBodyCont _)
+      hZero)
+    ⟨subIdWrap_some, hR0⟩
+
+/-- Every unit-decrement loop cutpoint (`rank s = rank s' + 1`) is a
+strong-descent loop cutpoint (`rank s' < rank s`). -/
+theorem whileUnitCutpoint_implies_strongCutpoint {Val : Type}
+    (alg : ValAlgebra Val) (cond : RvalOp Val) (body : FlowPlan Val)
+    (Inv : SymState Val → Prop) (rank : SymState Val → Nat)
+    (hStep : ∀ s, Inv s →
+      Exists fun cv => evalRval alg cond s = some cv ∧
+        (alg.asBool cv = some false ∨
+         (alg.asBool cv = some true ∧
+          Exists fun s' =>
+            evalPlan alg body s = .ok (.continuing s') ∧
+            Inv s' ∧ rank s = rank s' + 1))) :
+    ∀ s, Inv s →
+      Exists fun cv => evalRval alg cond s = some cv ∧
+        (alg.asBool cv = some false ∨
+         (alg.asBool cv = some true ∧
+          Exists fun s' =>
+            evalPlan alg body s = .ok (.continuing s') ∧
+            Inv s' ∧ rank s' < rank s)) := by
+  intro s hs
+  obtain ⟨cv, hcv, hCase⟩ := hStep s hs
+  refine ⟨cv, hcv, ?_⟩
+  rcases hCase with hbF | ⟨hbT, s', hBody, hInv', hRank⟩
+  · exact Or.inl hbF
+  · exact Or.inr ⟨hbT, s', hBody, hInv', hRank ▸ Nat.lt_succ_self (rank s')⟩
+
+/-- Backwards-compatible unit-decrement convenience wrapper for
+`holdsFnSpec_whileLoop_of_cutpoint` (`rank s = rank s' + 1`). -/
+theorem holdsFnSpec_whileLoop_of_unitCutpoint {Val : Type}
+    (alg : ValAlgebra Val) (loopFuel : Nat) (cond : RvalOp Val)
+    (body : FlowPlan Val) (retExpr : RvalOp Val) (hWfB : WfPlan alg body)
+    (Inv : SymState Val → Prop) (rank : SymState Val → Nat)
+    (hStep : ∀ s, Inv s →
+      Exists fun cv => evalRval alg cond s = some cv ∧
+        (alg.asBool cv = some false ∨
+         (alg.asBool cv = some true ∧
+          Exists fun s' =>
+            evalPlan alg body s = .ok (.continuing s') ∧
+            Inv s' ∧ rank s = rank s' + 1)))
+    (post : FuncOut Val → Prop)
+    (hExit : ∀ s, Inv s →
+      (Exists fun cv => evalRval alg cond s = some cv ∧ alg.asBool cv = some false) →
+      stateCleanAtReturn s = true ∧
+        Exists fun rv => evalRval alg retExpr s = some rv ∧
+          handleFreeOut alg ⟨rv, collectRootMutVals s.loans⟩ = true ∧
+          post ⟨rv, collectRootMutVals s.loans⟩)
+    (params : List (ParamInput Val)) (st0 : SymState Val)
+    (hInit : initFnState alg params = .ok st0)
+    (hInv0 : Inv st0) (hRankLe : rank st0 ≤ loopFuel) :
+    HoldsFnSpec (evalFnValue alg params (.whileLoop loopFuel cond body) retExpr)
+      post :=
+  holdsFnSpec_whileLoop_of_cutpoint alg loopFuel cond body retExpr hWfB Inv rank
+    (whileUnitCutpoint_implies_strongCutpoint alg cond body Inv rank hStep)
+    post hExit params st0 hInit hInv0 hRankLe
+
+/-- Backwards-compatible unit-decrement convenience wrapper for
+`mir_whileLoop_cfgCertificate_of_cutpoint_blockRel` (`rank s = rank s' + 1`). -/
+theorem mir_whileLoop_cfgCertificate_of_unitCutpoint (tagOf : LoanId → Nat)
+    (body : CapturedMir) (loopFuel : Nat) (cond : RvalOp StdVal)
+    (loopBody : FlowPlan StdVal) (retExpr : RvalOp StdVal)
+    (hWfB : WfPlan stdValAlg loopBody)
+    (hBodyCont : ∀ s f,
+      evalPlan stdValAlg loopBody s = .ok f → Exists fun s' => f = .continuing s')
+    (params : List (ParamInput StdVal)) (st0 : SymState StdVal)
+    (post : FuncOut StdVal → Prop)
+    (Inv : SymState StdVal → Prop) (rank : SymState StdVal → Nat)
+    (hStep : ∀ s, Inv s →
+      Exists fun cv => evalRval stdValAlg cond s = some cv ∧
+        (stdValAlg.asBool cv = some false ∨
+         (stdValAlg.asBool cv = some true ∧
+          Exists fun s' =>
+            evalPlan stdValAlg loopBody s = .ok (.continuing s') ∧
+            Inv s' ∧ rank s = rank s' + 1)))
+    (hExit : ∀ s, Inv s →
+      (Exists fun cv => evalRval stdValAlg cond s = some cv ∧
+        stdValAlg.asBool cv = some false) →
+      stateCleanAtReturn s = true ∧
+        Exists fun rv => evalRval stdValAlg retExpr s = some rv ∧
+          handleFreeOut stdValAlg ⟨rv, collectRootMutVals s.loans⟩ = true ∧
+          post ⟨rv, collectRootMutVals s.loans⟩)
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (rootAddrs : List (LoanId × Local × SubPath) := [])
+    (hInit : initFnState stdValAlg params = .ok st0)
+    (hInv0 : Inv st0) (hRankLe : rank st0 ≤ loopFuel)
+    (hZero : ∀ bb st ms,
+      mirCfgBlockRel tagOf bindingsAt mirBb extra bb st ms →
+      match
+        stepBasicBlock stdValAlg
+          (whileLoopBlocks cond loopBody retExpr) bb st
+      with
+      | .jump nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .jumpWrapped _ nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .convergedJump _ _ nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .ret v =>
+        PureMirExec.WpConverges (PureMirExec.mirStep body) ms
+          (MirOutcomeRel tagOf rootAddrs v)
+      | .branchJump _ _ _ _ => True
+      | .fault => True)
+    {m0 : MachineState}
+    (hR0 : mirCfgBlockRel tagOf bindingsAt mirBb extra 0 st0 m0) :
+    Anneal.MirFuelFree.MirWpConverges body m0
+      (fun o => LiftedMirPost tagOf post o rootAddrs) :=
+  mir_whileLoop_cfgCertificate_of_cutpoint_blockRel tagOf body loopFuel cond
+    loopBody retExpr hWfB hBodyCont params st0 post Inv rank
+    (whileUnitCutpoint_implies_strongCutpoint stdValAlg cond loopBody Inv rank
+      hStep)
+    hExit bindingsAt mirBb extra rootAddrs hInit hInv0 hRankLe hZero hR0
+
+/-- Any basic block with a `.goto nextBb` terminator whose body evaluates to
+`.ok (.continuing st')` steps to `.jump nextBb st'`. -/
+theorem stepBasicBlock_of_goto_continuing {Val : Type} (alg : ValAlgebra Val)
+    (blocks : List (BasicBlock Val)) (bb nextBb : BlockId) (body : FlowPlan Val)
+    (st st' : SymState Val)
+    (hBb : listGetOpt bb blocks = some ⟨body, .goto nextBb⟩)
+    (hEv : evalPlan alg body st = .ok (.continuing st')) :
+    stepBasicBlock alg blocks bb st = .jump nextBb st' := by
+  unfold stepBasicBlock
+  rw [hBb]
+  dsimp only
+  rw [hEv]
+
+/-- Any basic block with a `.goto nextBb` terminator whose body produces only
+`.continuing` flows steps only to `.fault` or `.jump nextBb st'` (never
+`.jumpWrapped`, `.convergedJump`, `.branchJump`, or `.ret`). -/
+theorem stepBasicBlock_of_goto_term {Val : Type} (alg : ValAlgebra Val)
+    (blocks : List (BasicBlock Val)) (bb nextBb : BlockId) (body : FlowPlan Val)
+    (st : SymState Val)
+    (hBb : listGetOpt bb blocks = some ⟨body, .goto nextBb⟩)
+    (hCont : ∀ s f, evalPlan alg body s = .ok f → Exists fun s' => f = .continuing s') :
+    stepBasicBlock alg blocks bb st = .fault ∨
+    Exists fun st' => stepBasicBlock alg blocks bb st = .jump nextBb st' := by
+  unfold stepBasicBlock
+  rw [hBb]
+  dsimp only
+  cases hEv : evalPlan alg body st with
+  | fail => exact Or.inl rfl
+  | ok f =>
+    obtain ⟨st', hf⟩ := hCont st f hEv
+    subst hf
+    exact Or.inr ⟨st', rfl⟩
+
+/-- Any basic block with a `.ret retExpr` terminator whose body evaluates to
+`.ok (.continuing stFinal)` with a clean, handle-free return value steps to
+`.ret ⟨rv, collectRootMutVals stFinal.loans⟩`. -/
+theorem stepBasicBlock_of_ret_continuing {Val : Type} (alg : ValAlgebra Val)
+    (blocks : List (BasicBlock Val)) (bb : BlockId) (post : FlowPlan Val)
+    (retExpr : RvalOp Val) (stJ stFinal : SymState Val) (rv : Val)
+    (hBb : listGetOpt bb blocks = some ⟨post, .ret retExpr⟩)
+    (hP : evalPlan alg post stJ = .ok (.continuing stFinal))
+    (hClean : stateCleanAtReturn stFinal = true)
+    (hRet : evalRval alg retExpr stFinal = some rv)
+    (hFree : handleFreeOut alg ⟨rv, collectRootMutVals stFinal.loans⟩ = true) :
+    stepBasicBlock alg blocks bb stJ =
+      .ret ⟨rv, collectRootMutVals stFinal.loans⟩ := by
+  unfold stepBasicBlock
+  rw [hBb]
+  dsimp only
+  rw [hP]
+  dsimp only
+  rw [hClean]
+  dsimp
+  rw [hRet]
+  dsimp
+  rw [hFree]
+  rfl
+
+/-- Any basic block with a `.branch cond thenBb elseBb` terminator whose body
+evaluates to `.ok (.continuing st1)` and whose condition evaluates to a concrete
+`true` steps to `.jump thenBb st1`. -/
+theorem stepBasicBlock_of_branch_true {Val : Type} (alg : ValAlgebra Val)
+    (blocks : List (BasicBlock Val)) (bb thenBb elseBb : BlockId)
+    (pre : FlowPlan Val) (cond : RvalOp Val) (st0 st1 : SymState Val) (cv : Val)
+    (hBb : listGetOpt bb blocks = some ⟨pre, .branch cond thenBb elseBb⟩)
+    (hPre : evalPlan alg pre st0 = .ok (.continuing st1))
+    (hCond : evalRval alg cond st1 = some cv)
+    (hBool : alg.asBool cv = some true) :
+    stepBasicBlock alg blocks bb st0 = .jump thenBb st1 := by
+  unfold stepBasicBlock
+  rw [hBb]
+  dsimp only
+  rw [hPre]
+  dsimp only
+  rw [hCond]
+  dsimp only
+  rw [hBool]
+
+/-- Any basic block with a `.branch cond thenBb elseBb` terminator whose body
+evaluates to `.ok (.continuing st1)` and whose condition evaluates to a concrete
+`false` steps to `.jump elseBb st1`. -/
+theorem stepBasicBlock_of_branch_false {Val : Type} (alg : ValAlgebra Val)
+    (blocks : List (BasicBlock Val)) (bb thenBb elseBb : BlockId)
+    (pre : FlowPlan Val) (cond : RvalOp Val) (st0 st1 : SymState Val) (cv : Val)
+    (hBb : listGetOpt bb blocks = some ⟨pre, .branch cond thenBb elseBb⟩)
+    (hPre : evalPlan alg pre st0 = .ok (.continuing st1))
+    (hCond : evalRval alg cond st1 = some cv)
+    (hBool : alg.asBool cv = some false) :
+    stepBasicBlock alg blocks bb st0 = .jump elseBb st1 := by
+  unfold stepBasicBlock
+  rw [hBb]
+  dsimp only
+  rw [hPre]
+  dsimp only
+  rw [hCond]
+  dsimp only
+  rw [hBool]
+
+/-- **General symbolic `.convergedJump` step for any reconvergent `.branch`
+basic block**: if block `bb` has terminator `.branch cond thenBb elseBb` with
+`(thenBb == elseBb) = false` and convergence block `joinBb`, its body evaluates
+to `.ok (.continuing st1)`, `cond` evaluates to a symbolic value `cv`
+(`alg.asBool cv = none`), both arms evaluate up to `joinBb` in `kT` and `kF`
+continuing steps (`evalArmToJoin`), and their states join to `stJ`, then
+`stepBasicBlock` emits `.convergedJump (Nat.max kT kF) (handleFreeOutOpt alg)
+joinBb stJ`. -/
+theorem stepBasicBlock_of_branch_symbolic {Val : Type} (alg : ValAlgebra Val)
+    (blocks : List (BasicBlock Val)) (bb thenBb elseBb joinBb kT kF : Nat)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (st0 st1 stT stF stJ : SymState Val) (cv : Val)
+    (hBb : listGetOpt bb blocks = some ⟨pre, .branch cond thenBb elseBb⟩)
+    (hNe : (thenBb == elseBb) = false)
+    (hConv :
+      findConvergenceBlock blocks (blocks.length + 1) thenBb elseBb [bb] =
+        some joinBb)
+    (hPre : evalPlan alg pre st0 = .ok (.continuing st1))
+    (hCond : evalRval alg cond st1 = some cv)
+    (hBool : alg.asBool cv = none)
+    (hArmT :
+      evalArmToJoin alg blocks (blocks.length + 1) joinBb thenBb st1 =
+        .ok (kT, .continuing stT))
+    (hArmF :
+      evalArmToJoin alg blocks (blocks.length + 1) joinBb elseBb st1 =
+        .ok (kF, .continuing stF))
+    (hJ : joinSymState alg cv stT stF = some stJ) :
+    stepBasicBlock alg blocks bb st0 =
+      .convergedJump (Nat.max kT kF) (fun out => handleFreeOutOpt alg out)
+        joinBb stJ := by
+  unfold stepBasicBlock
+  rw [hBb]
+  dsimp only
+  rw [hPre]
+  dsimp only
+  rw [hCond]
+  dsimp only
+  rw [hBool]
+  dsimp only
+  rw [hNe, hConv]
+  dsimp only
+  rw [hArmT, hArmF]
+  dsimp only [joinExecFlow]
+  rw [hJ]
+  rfl
+
+/-- **General outcome classification for any reconvergent `.branch` basic
+block**: if `pre` produces only `.continuing` flows and both arms up to `joinBb`
+either fail or produce `.continuing` flows, then `stepBasicBlock` at `bb` steps
+only to `.fault`, `.jump thenBb`, `.jump elseBb`, `.convergedJump _
+(handleFreeOutOpt alg) joinBb`, or `.branchJump` (never `.jumpWrapped`). -/
+theorem stepBasicBlock_of_branch_term {Val : Type}
+    (alg : ValAlgebra Val) (blocks : List (BasicBlock Val))
+    (armFuel bb thenBb elseBb joinBb : Nat) (pre : FlowPlan Val) (cond : RvalOp Val)
+    (st : SymState Val)
+    (hFuel : blocks.length + 1 = armFuel)
+    (hBb : listGetOpt bb blocks = some ⟨pre, .branch cond thenBb elseBb⟩)
+    (hNe : (thenBb == elseBb) = false)
+    (hConv : findConvergenceBlock blocks armFuel thenBb elseBb [bb] = some joinBb)
+    (hPre : ∀ s f, evalPlan alg pre s = .ok f → Exists fun s' => f = .continuing s')
+    (hArmT : ∀ s,
+      evalArmToJoin alg blocks armFuel joinBb thenBb s = .fail ∨
+      Exists fun kT => Exists fun stT =>
+        evalArmToJoin alg blocks armFuel joinBb thenBb s =
+          .ok (kT, .continuing stT))
+    (hArmF : ∀ s,
+      evalArmToJoin alg blocks armFuel joinBb elseBb s = .fail ∨
+      Exists fun kF => Exists fun stF =>
+        evalArmToJoin alg blocks armFuel joinBb elseBb s =
+          .ok (kF, .continuing stF)) :
+    stepBasicBlock alg blocks bb st = .fault ∨
+    (Exists fun st1 => stepBasicBlock alg blocks bb st = .jump thenBb st1) ∨
+    (Exists fun st1 => stepBasicBlock alg blocks bb st = .jump elseBb st1) ∨
+    (Exists fun k => Exists fun stJ =>
+      stepBasicBlock alg blocks bb st =
+        .convergedJump k (fun out => handleFreeOutOpt alg out) joinBb stJ) ∨
+    (Exists fun cv => Exists fun st1 =>
+      stepBasicBlock alg blocks bb st =
+        .branchJump
+          (fun tOut fOut => handleFreeOutOpt alg (mergeFuncOut alg cv tOut fOut))
+          thenBb elseBb st1) := by
+  unfold stepBasicBlock
+  rw [hBb, hFuel]
+  dsimp only
+  cases hEvP : evalPlan alg pre st with
+  | fail => exact Or.inl rfl
+  | ok fP =>
+    obtain ⟨st1, hfP⟩ := hPre st fP hEvP
+    subst hfP
+    dsimp only
+    cases hCond : evalRval alg cond st1 with
+    | none => exact Or.inl rfl
+    | some cv =>
+      dsimp only
+      cases hBool : alg.asBool cv with
+      | some b =>
+        cases b with
+        | true => exact Or.inr (Or.inl ⟨st1, rfl⟩)
+        | false => exact Or.inr (Or.inr (Or.inl ⟨st1, rfl⟩))
+      | none =>
+        dsimp only
+        rw [hNe, hConv]
+        dsimp only
+        rcases hArmT st1 with hTFail | ⟨kT, stT, hTOk⟩
+        · rw [hTFail]
+          exact Or.inr (Or.inr (Or.inr (Or.inr ⟨cv, st1, rfl⟩)))
+        · rw [hTOk]
+          rcases hArmF st1 with hFFail | ⟨kF, stF, hFOk⟩
+          · rw [hFFail]
+            exact Or.inr (Or.inr (Or.inr (Or.inr ⟨cv, st1, rfl⟩)))
+          · rw [hFOk]
+            dsimp only [joinExecFlow]
+            cases joinSymState alg cv stT stF with
+            | none =>
+              exact Or.inr (Or.inr (Or.inr (Or.inr ⟨cv, st1, rfl⟩)))
+            | some stJ =>
+              exact Or.inr (Or.inr (Or.inr (Or.inl ⟨Nat.max kT kF, stJ, rfl⟩)))
+
+/-- Inversion for `evalPlan` on `.seq p1 p2` when `p1` produces only
+`.continuing` flows. -/
+theorem evalPlan_seq_continuing_inv {Val : Type} (alg : ValAlgebra Val)
+    {p1 p2 : FlowPlan Val} {s0 s2 : SymState Val}
+    (hWf1 : WfPlan alg p1) (hWf2 : WfPlan alg p2)
+    (h1 : ∀ s f, evalPlan alg p1 s = .ok f → Exists fun s' => f = .continuing s')
+    (hEv : evalPlan alg (.seq p1 p2) s0 = .ok (.continuing s2)) :
+    Exists fun s1 =>
+      evalPlan alg p1 s0 = .ok (.continuing s1) ∧
+      evalPlan alg p2 s1 = .ok (.continuing s2) := by
+  rw [evalPlan_seq alg p1 p2 s0 hWf1 hWf2] at hEv
+  cases hEv1 : evalPlan alg p1 s0 with
+  | fail => rw [hEv1] at hEv; exact nomatch hEv
+  | ok f1 =>
+    obtain ⟨s1, hf1⟩ := h1 s0 f1 hEv1
+    subst hf1
+    rw [hEv1] at hEv
+    exact ⟨s1, rfl, hEv⟩
+
+/-- **General inversion for any diamond structured plan
+`.seq pre (.seq (.branch cond onTrue onFalse) post)`**: whenever `evalFnValue`
+succeeds from `initFnState alg params = .ok st0` and `pre`, `onTrue`, `onFalse`,
+`post` produce only `.continuing` flows, `pre` steps `st0` to some `st1`, `cond`
+evaluates to some `cv`, and one of the three branch cases holds (`some true`,
+`some false`, or `none` with `joinSymState`). Shared by both
+`CfgCertificate.diamond` and `CfgCertificate.asymDiamond` (and any multi-block
+arm diamond). -/
+theorem evalFnValue_seq_branch_seq_ok_inv {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (hWfPre : WfPlan alg pre) (hWfTrue : WfPlan alg onTrue)
+    (hWfFalse : WfPlan alg onFalse) (hWfPost : WfPlan alg post)
+    (hPre : ∀ s f, evalPlan alg pre s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue : ∀ s f, evalPlan alg onTrue s = .ok f → Exists fun s' => f = .continuing s')
+    (hFalse : ∀ s f, evalPlan alg onFalse s = .ok f → Exists fun s' => f = .continuing s')
+    (hPost : ∀ s f, evalPlan alg post s = .ok f → Exists fun s' => f = .continuing s')
+    (params : List (ParamInput Val)) (st0 : SymState Val) (out : FuncOut Val)
+    (hInit : initFnState alg params = .ok st0)
+    (hEval :
+      evalFnValue alg params
+        (.seq pre (.seq (.branch cond onTrue onFalse) post))
+        retExpr = .ok out) :
+    Exists fun st1 => Exists fun cv =>
+      evalPlan alg pre st0 = .ok (.continuing st1) ∧
+      evalRval alg cond st1 = some cv ∧
+      ((alg.asBool cv = some true ∧
+        Exists fun stT => Exists fun stFinal => Exists fun rv =>
+          evalPlan alg onTrue st1 = .ok (.continuing stT) ∧
+          evalPlan alg post stT = .ok (.continuing stFinal) ∧
+          stateCleanAtReturn stFinal = true ∧
+          evalRval alg retExpr stFinal = some rv ∧
+          handleFreeOut alg ⟨rv, collectRootMutVals stFinal.loans⟩ = true ∧
+          out = ⟨rv, collectRootMutVals stFinal.loans⟩) ∨
+       (alg.asBool cv = some false ∧
+        Exists fun stF => Exists fun stFinal => Exists fun rv =>
+          evalPlan alg onFalse st1 = .ok (.continuing stF) ∧
+          evalPlan alg post stF = .ok (.continuing stFinal) ∧
+          stateCleanAtReturn stFinal = true ∧
+          evalRval alg retExpr stFinal = some rv ∧
+          handleFreeOut alg ⟨rv, collectRootMutVals stFinal.loans⟩ = true ∧
+          out = ⟨rv, collectRootMutVals stFinal.loans⟩) ∨
+       (alg.asBool cv = none ∧
+        Exists fun stT => Exists fun stF => Exists fun stJ =>
+        Exists fun stFinal => Exists fun rv =>
+          evalPlan alg onTrue st1 = .ok (.continuing stT) ∧
+          evalPlan alg onFalse st1 = .ok (.continuing stF) ∧
+          joinSymState alg cv stT stF = some stJ ∧
+          evalPlan alg post stJ = .ok (.continuing stFinal) ∧
+          stateCleanAtReturn stFinal = true ∧
+          evalRval alg retExpr stFinal = some rv ∧
+          handleFreeOut alg ⟨rv, collectRootMutVals stFinal.loans⟩ = true ∧
+          out = ⟨rv, collectRootMutVals stFinal.loans⟩)) := by
+  have hWfBr := wfPlan_branch alg cond hWfTrue hWfFalse
+  have hWfBrPost := wfPlan_seq alg hWfBr hWfPost
+  have hFinish : ∀ (stArm : SymState Val),
+      (match evalPlan alg post stArm with
+       | .fail => EvalOutcome.fail
+       | .ok (.returned o vc _) =>
+         if !vc || !handleFreeOut alg o then .fail else .ok o
+       | .ok (.continuing stF) =>
+         if !stateCleanAtReturn stF then .fail
+         else
+           match evalRval alg retExpr stF with
+           | some rv =>
+             let o : FuncOut Val := ⟨rv, collectRootMutVals stF.loans⟩
+             if !handleFreeOut alg o then .fail else .ok o
+           | none => .fail
+       | .ok (.guardedContinuing w stF vc _) =>
+         if !vc || !stateCleanAtReturn stF then .fail
+         else
+           match evalRval alg retExpr stF with
+           | some rv =>
+             let o := w ⟨rv, collectRootMutVals stF.loans⟩
+             if !handleFreeOut alg o then .fail else .ok o
+           | none => .fail) = .ok out →
+      Exists fun stFinal => Exists fun rv =>
+        evalPlan alg post stArm = .ok (.continuing stFinal) ∧
+        stateCleanAtReturn stFinal = true ∧
+        evalRval alg retExpr stFinal = some rv ∧
+        handleFreeOut alg ⟨rv, collectRootMutVals stFinal.loans⟩ = true ∧
+        out = ⟨rv, collectRootMutVals stFinal.loans⟩ := by
+    intro stArm hPostEval
+    cases hEvP : evalPlan alg post stArm with
+    | fail => rw [hEvP] at hPostEval; exact nomatch hPostEval
+    | ok fP =>
+      obtain ⟨stFinal, hfP⟩ := hPost stArm fP hEvP
+      subst hfP
+      rw [hEvP] at hPostEval
+      dsimp only at hPostEval
+      cases hClean : stateCleanAtReturn stFinal with
+      | false => rw [hClean] at hPostEval; exact nomatch hPostEval
+      | true =>
+        rw [hClean] at hPostEval
+        cases hRet : evalRval alg retExpr stFinal with
+        | none => rw [hRet] at hPostEval; exact nomatch hPostEval
+        | some rv =>
+          rw [hRet] at hPostEval
+          dsimp only at hPostEval
+          cases hFree :
+              handleFreeOut alg ⟨rv, collectRootMutVals stFinal.loans⟩ with
+          | false => rw [hFree] at hPostEval; exact nomatch hPostEval
+          | true =>
+            rw [hFree] at hPostEval
+            injection hPostEval with hOut
+            exact ⟨stFinal, rv, rfl, hClean, hRet, hFree, hOut.symm⟩
+  unfold evalFnValue at hEval
+  rw [hInit] at hEval
+  dsimp only at hEval
+  rw [evalPlan_seq alg pre (.seq (.branch cond onTrue onFalse) post) st0
+        hWfPre hWfBrPost] at hEval
+  cases hEvPre : evalPlan alg pre st0 with
+  | fail => rw [hEvPre] at hEval; exact nomatch hEval
+  | ok fPre =>
+    obtain ⟨st1, hfPre⟩ := hPre st0 fPre hEvPre
+    subst hfPre
+    rw [hEvPre] at hEval
+    dsimp only at hEval
+    rw [evalPlan_seq alg (.branch cond onTrue onFalse) post st1 hWfBr hWfPost,
+        evalPlan_branch alg cond onTrue onFalse st1 hWfTrue hWfFalse] at hEval
+    cases hCond : evalRval alg cond st1 with
+    | none => rw [hCond] at hEval; exact nomatch hEval
+    | some cv =>
+      rw [hCond] at hEval
+      dsimp only at hEval
+      refine ⟨st1, cv, rfl, hCond, ?_⟩
+      cases hBool : alg.asBool cv with
+      | some b =>
+        rw [hBool] at hEval
+        cases b with
+        | true =>
+          dsimp only at hEval
+          cases hEvT : evalPlan alg onTrue st1 with
+          | fail => rw [hEvT] at hEval; exact nomatch hEval
+          | ok fT =>
+            obtain ⟨stT, hfT⟩ := hTrue st1 fT hEvT
+            subst hfT
+            rw [hEvT] at hEval
+            obtain ⟨stFinal, rv, hEvP, hClean, hRet, hFree, hOut⟩ :=
+              hFinish stT hEval
+            exact Or.inl ⟨rfl, stT, stFinal, rv, rfl, hEvP, hClean, hRet,
+              hFree, hOut⟩
+        | false =>
+          dsimp only at hEval
+          cases hEvF : evalPlan alg onFalse st1 with
+          | fail => rw [hEvF] at hEval; exact nomatch hEval
+          | ok fF =>
+            obtain ⟨stF, hfF⟩ := hFalse st1 fF hEvF
+            subst hfF
+            rw [hEvF] at hEval
+            obtain ⟨stFinal, rv, hEvP, hClean, hRet, hFree, hOut⟩ :=
+              hFinish stF hEval
+            exact Or.inr (Or.inl ⟨rfl, stF, stFinal, rv, rfl, hEvP, hClean,
+              hRet, hFree, hOut⟩)
+      | none =>
+        rw [hBool] at hEval
+        dsimp only at hEval
+        cases hEvT : evalPlan alg onTrue st1 with
+        | fail => rw [hEvT] at hEval; exact nomatch hEval
+        | ok fT =>
+          obtain ⟨stT, hfT⟩ := hTrue st1 fT hEvT
+          subst hfT
+          cases hEvF : evalPlan alg onFalse st1 with
+          | fail => rw [hEvT, hEvF] at hEval; exact nomatch hEval
+          | ok fF =>
+            obtain ⟨stF, hfF⟩ := hFalse st1 fF hEvF
+            subst hfF
+            rw [hEvT, hEvF] at hEval
+            dsimp only [joinExecFlow] at hEval
+            cases hJ : joinSymState alg cv stT stF with
+            | none => rw [hJ] at hEval; exact nomatch hEval
+            | some stJ =>
+              rw [hJ] at hEval
+              obtain ⟨stFinal, rv, hEvP, hClean, hRet, hFree, hOut⟩ :=
+                hFinish stJ hEval
+              exact Or.inr (Or.inr ⟨rfl, stT, stF, stJ, stFinal, rv, rfl, rfl,
+                hJ, hEvP, hClean, hRet, hFree, hOut⟩)
+
+/-- Any basic block with a `.ret retExpr` terminator can only step to `.fault`
+or `.ret out` (never `.jump`, `.jumpWrapped`, `.convergedJump`, or `.branchJump`),
+regardless of its `body : FlowPlan Val`. -/
+theorem stepBasicBlock_of_ret_term {Val : Type} (alg : ValAlgebra Val)
+    (blocks : List (BasicBlock Val)) (bb : BlockId) (body : FlowPlan Val)
+    (retExpr : RvalOp Val) (st : SymState Val)
+    (hBb : listGetOpt bb blocks = some ⟨body, .ret retExpr⟩) :
+    stepBasicBlock alg blocks bb st = .fault ∨
+    Exists fun out => stepBasicBlock alg blocks bb st = .ret out := by
+  unfold stepBasicBlock
+  rw [hBb]
+  dsimp only
+  cases evalPlan alg body st with
+  | fail => exact Or.inl rfl
+  | ok flow =>
+    cases flow with
+    | returned out valClean _ =>
+      dsimp only
+      cases (!valClean || !handleFreeOut alg out) with
+      | true => exact Or.inl rfl
+      | false => exact Or.inr ⟨out, rfl⟩
+    | guardedContinuing wrapOut st' valClean _ =>
+      cases valClean with
+      | false => exact Or.inl rfl
+      | true =>
+        dsimp only
+        cases stateCleanAtReturn st' with
+        | false => exact Or.inl rfl
+        | true =>
+          dsimp
+          cases evalRval alg retExpr st' with
+          | none => exact Or.inl rfl
+          | some rv =>
+            dsimp
+            cases handleFreeOut alg (wrapOut ⟨rv, collectRootMutVals st'.loans⟩) with
+            | false => exact Or.inl rfl
+            | true => exact Or.inr ⟨_, rfl⟩
+    | continuing st' =>
+      dsimp only
+      cases stateCleanAtReturn st' with
+      | false => exact Or.inl rfl
+      | true =>
+        dsimp
+        cases evalRval alg retExpr st' with
+        | none => exact Or.inl rfl
+        | some rv =>
+          dsimp
+          cases handleFreeOut alg ⟨rv, collectRootMutVals st'.loans⟩ with
+          | false => exact Or.inl rfl
+          | true => exact Or.inr ⟨_, rfl⟩
+
+/-- 4-block diamond CFG: header block `0` runs `pre` and branches on `cond` to
+arm block `1` (`onTrue; goto 3`) or arm block `2` (`onFalse; goto 3`), which
+reconverge at join block `3` (`post; ret retExpr`). -/
+def diamondCfgBlocks {Val : Type} (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val) :
+    List (BasicBlock Val) :=
+  [⟨pre, .branch cond 1 2⟩,
+   ⟨onTrue, .goto 3⟩,
+   ⟨onFalse, .goto 3⟩,
+   ⟨post, .ret retExpr⟩]
+
+theorem findConvergenceBlock_diamondCfgBlocks {Val : Type}
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val) :
+    findConvergenceBlock
+      (diamondCfgBlocks pre cond onTrue onFalse post retExpr) 5 1 2 [0] =
+      some 3 := rfl
+
+theorem listGetOpt_zero_diamondCfgBlocks {Val : Type}
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val) :
+    listGetOpt 0 (diamondCfgBlocks pre cond onTrue onFalse post retExpr) =
+      some ⟨pre, .branch cond 1 2⟩ := rfl
+
+theorem listGetOpt_one_diamondCfgBlocks {Val : Type}
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val) :
+    listGetOpt 1 (diamondCfgBlocks pre cond onTrue onFalse post retExpr) =
+      some ⟨onTrue, .goto 3⟩ := rfl
+
+theorem listGetOpt_two_diamondCfgBlocks {Val : Type}
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val) :
+    listGetOpt 2 (diamondCfgBlocks pre cond onTrue onFalse post retExpr) =
+      some ⟨onFalse, .goto 3⟩ := rfl
+
+theorem length_diamondCfgBlocks {Val : Type}
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val) :
+    (diamondCfgBlocks pre cond onTrue onFalse post retExpr).length = 4 := rfl
+
+/-- Evaluating a 1-block arm `cur` whose terminator is `.goto stopBb` at fuel
+`k + 2` (with `k` symbolic so `Nat.recCompiled` unfolds only 2 levels). -/
+theorem evalArmToJoin_goto_stop {Val : Type} (alg : ValAlgebra Val)
+    (blocks : List (BasicBlock Val)) (k : Nat) (stopBb cur : BlockId)
+    (body : FlowPlan Val) (st : SymState Val)
+    (hNe : (cur == stopBb) = false)
+    (hBb : listGetOpt cur blocks = some ⟨body, .goto stopBb⟩) :
+    evalArmToJoin alg blocks (k + 2) stopBb cur st =
+      (match evalPlan alg body st with
+       | .fail => .fail
+       | .ok (.returned out valClean mutRet) =>
+         if !valClean || !handleFreeOut alg out then .fail
+         else .ok (1, .returned out true mutRet)
+       | .ok (.guardedContinuing wrapOut st' valClean wrapMut) =>
+         if !valClean then .fail
+         else .ok (1, .guardedContinuing wrapOut st' true wrapMut)
+       | .ok (.continuing st') => .ok (1, .continuing st')) := by
+  have hRefl : (stopBb == stopBb) = true := decide_eq_true rfl
+  unfold evalArmToJoin
+  change
+    (if (cur == stopBb) = true then EvalOutcome.ok (0, ExecFlow.continuing st)
+     else
+       match listGetOpt cur blocks with
+       | none => EvalOutcome.fail
+       | some bb => _) = _
+  rw [hNe]
+  dsimp only
+  rw [hBb]
+  dsimp only
+  cases evalPlan alg body st with
+  | fail => rfl
+  | ok flow =>
+    cases flow with
+    | returned out valClean mutRet => rfl
+    | guardedContinuing wrapOut st' valClean wrapMut =>
+      cases valClean with
+      | false => rfl
+      | true =>
+        dsimp only [Nat.recCompiled]
+        rw [hRefl]
+        rfl
+    | continuing st' =>
+      dsimp only [Nat.recCompiled]
+      rw [hRefl]
+      rfl
+
+/-- Evaluating a 2-block arm `cur1 -[.goto cur2]-> cur2 -[.goto stopBb]-> stopBb`
+at fuel `k + 3` (with `k` symbolic so `Nat.recCompiled` unfolds only 3 levels)
+when both `body1` and `body2` fall through as `.continuing`. -/
+theorem evalArmToJoin_goto_goto_stop {Val : Type} (alg : ValAlgebra Val)
+    (blocks : List (BasicBlock Val)) (k : Nat)
+    (stopBb cur1 cur2 : BlockId) (body1 body2 : FlowPlan Val)
+    (st1 st2 stT : SymState Val)
+    (hNe1 : (cur1 == stopBb) = false)
+    (hBb1 : listGetOpt cur1 blocks = some ⟨body1, .goto cur2⟩)
+    (hEv1 : evalPlan alg body1 st1 = .ok (.continuing st2))
+    (hNe2 : (cur2 == stopBb) = false)
+    (hBb2 : listGetOpt cur2 blocks = some ⟨body2, .goto stopBb⟩)
+    (hEv2 : evalPlan alg body2 st2 = .ok (.continuing stT)) :
+    evalArmToJoin alg blocks (k + 3) stopBb cur1 st1 =
+      .ok (2, .continuing stT) := by
+  have hRefl : (stopBb == stopBb) = true := decide_eq_true rfl
+  unfold evalArmToJoin
+  change
+    (if (cur1 == stopBb) = true then EvalOutcome.ok (0, ExecFlow.continuing st1)
+     else
+       match listGetOpt cur1 blocks with
+       | none => EvalOutcome.fail
+       | some bb => _) = _
+  rw [hNe1]
+  dsimp only
+  rw [hBb1]
+  dsimp only
+  rw [hEv1]
+  dsimp only [Nat.recCompiled]
+  rw [hNe2, hBb2]
+  dsimp only
+  rw [hEv2]
+  dsimp only [Nat.recCompiled]
+  rw [hRefl]
+  rfl
+
+theorem evalArmToJoin_goto_fail_first {Val : Type} (alg : ValAlgebra Val)
+    (blocks : List (BasicBlock Val)) (k : Nat)
+    (stopBb cur1 cur2 : BlockId) (body1 : FlowPlan Val) (st1 : SymState Val)
+    (hNe1 : (cur1 == stopBb) = false)
+    (hBb1 : listGetOpt cur1 blocks = some ⟨body1, .goto cur2⟩)
+    (hEv1 : evalPlan alg body1 st1 = .fail) :
+    evalArmToJoin alg blocks (k + 1) stopBb cur1 st1 = .fail := by
+  unfold evalArmToJoin
+  change
+    (if (cur1 == stopBb) = true then EvalOutcome.ok (0, ExecFlow.continuing st1)
+     else
+       match listGetOpt cur1 blocks with
+       | none => EvalOutcome.fail
+       | some bb => _) = _
+  rw [hNe1]
+  dsimp only
+  rw [hBb1]
+  dsimp only
+  rw [hEv1]
+  rfl
+
+theorem evalArmToJoin_goto_fail_second {Val : Type} (alg : ValAlgebra Val)
+    (blocks : List (BasicBlock Val)) (k : Nat)
+    (stopBb cur1 cur2 : BlockId) (body1 body2 : FlowPlan Val)
+    (st1 st2 : SymState Val)
+    (hNe1 : (cur1 == stopBb) = false)
+    (hBb1 : listGetOpt cur1 blocks = some ⟨body1, .goto cur2⟩)
+    (hEv1 : evalPlan alg body1 st1 = .ok (.continuing st2))
+    (hNe2 : (cur2 == stopBb) = false)
+    (hBb2 : listGetOpt cur2 blocks = some ⟨body2, .goto stopBb⟩)
+    (hEv2 : evalPlan alg body2 st2 = .fail) :
+    evalArmToJoin alg blocks (k + 2) stopBb cur1 st1 = .fail := by
+  unfold evalArmToJoin
+  change
+    (if (cur1 == stopBb) = true then EvalOutcome.ok (0, ExecFlow.continuing st1)
+     else
+       match listGetOpt cur1 blocks with
+       | none => EvalOutcome.fail
+       | some bb => _) = _
+  rw [hNe1]
+  dsimp only
+  rw [hBb1]
+  dsimp only
+  rw [hEv1]
+  dsimp only [Nat.recCompiled]
+  rw [hNe2, hBb2]
+  dsimp only
+  rw [hEv2]
+  rfl
+
+theorem evalArmToJoin_diamondCfgBlocks_true {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (st1 stT : SymState Val)
+    (hT : evalPlan alg onTrue st1 = .ok (.continuing stT)) :
+    evalArmToJoin alg (diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+      5 3 1 st1 = .ok (1, .continuing stT) := by
+  rw [evalArmToJoin_goto_stop alg _ 3 3 1 onTrue st1 rfl
+        (listGetOpt_one_diamondCfgBlocks pre cond onTrue onFalse post retExpr),
+      hT]
+
+theorem evalArmToJoin_diamondCfgBlocks_false {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (st1 stF : SymState Val)
+    (hF : evalPlan alg onFalse st1 = .ok (.continuing stF)) :
+    evalArmToJoin alg (diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+      5 3 2 st1 = .ok (1, .continuing stF) := by
+  rw [evalArmToJoin_goto_stop alg _ 3 3 2 onFalse st1 rfl
+        (listGetOpt_two_diamondCfgBlocks pre cond onTrue onFalse post retExpr),
+      hF]
+
+theorem stepBasicBlock_diamondCfg_header_true {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (st0 st1 : SymState Val) (cv : Val)
+    (hPre : evalPlan alg pre st0 = .ok (.continuing st1))
+    (hCond : evalRval alg cond st1 = some cv)
+    (hBool : alg.asBool cv = some true) :
+    stepBasicBlock alg (diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+      0 st0 = .jump 1 st1 :=
+  stepBasicBlock_of_branch_true alg _ 0 1 2 pre cond st0 st1 cv
+    (listGetOpt_zero_diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+    hPre hCond hBool
+
+theorem stepBasicBlock_diamondCfg_header_false {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (st0 st1 : SymState Val) (cv : Val)
+    (hPre : evalPlan alg pre st0 = .ok (.continuing st1))
+    (hCond : evalRval alg cond st1 = some cv)
+    (hBool : alg.asBool cv = some false) :
+    stepBasicBlock alg (diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+      0 st0 = .jump 2 st1 :=
+  stepBasicBlock_of_branch_false alg _ 0 1 2 pre cond st0 st1 cv
+    (listGetOpt_zero_diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+    hPre hCond hBool
+
+theorem stepBasicBlock_diamondCfg_header_symbolic {Val : Type}
+    (alg : ValAlgebra Val) (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (st0 st1 stT stF stJ : SymState Val) (cv : Val)
+    (hPre : evalPlan alg pre st0 = .ok (.continuing st1))
+    (hCond : evalRval alg cond st1 = some cv)
+    (hBool : alg.asBool cv = none)
+    (hT : evalPlan alg onTrue st1 = .ok (.continuing stT))
+    (hF : evalPlan alg onFalse st1 = .ok (.continuing stF))
+    (hJ : joinSymState alg cv stT stF = some stJ) :
+    stepBasicBlock alg (diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+      0 st0 =
+      .convergedJump 1 (fun out => handleFreeOutOpt alg out) 3 stJ :=
+  stepBasicBlock_of_branch_symbolic alg _ 0 1 2 3 1 1 pre cond st0 st1 stT stF
+    stJ cv
+    (listGetOpt_zero_diamondCfgBlocks pre cond onTrue onFalse post retExpr) rfl
+    (findConvergenceBlock_diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+    hPre hCond hBool
+    (evalArmToJoin_diamondCfgBlocks_true alg pre cond onTrue onFalse post
+      retExpr st1 stT hT)
+    (evalArmToJoin_diamondCfgBlocks_false alg pre cond onTrue onFalse post
+      retExpr st1 stF hF)
+    hJ
+
+theorem stepBasicBlock_diamondCfg_arm_true {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (st1 stT : SymState Val)
+    (hT : evalPlan alg onTrue st1 = .ok (.continuing stT)) :
+    stepBasicBlock alg (diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+      1 st1 = .jump 3 stT :=
+  stepBasicBlock_of_goto_continuing alg _ 1 3 onTrue st1 stT
+    (listGetOpt_one_diamondCfgBlocks pre cond onTrue onFalse post retExpr) hT
+
+theorem stepBasicBlock_diamondCfg_arm_false {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (st1 stF : SymState Val)
+    (hF : evalPlan alg onFalse st1 = .ok (.continuing stF)) :
+    stepBasicBlock alg (diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+      2 st1 = .jump 3 stF :=
+  stepBasicBlock_of_goto_continuing alg _ 2 3 onFalse st1 stF
+    (listGetOpt_two_diamondCfgBlocks pre cond onTrue onFalse post retExpr) hF
+
+theorem stepBasicBlock_diamondCfg_join {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (stJ stFinal : SymState Val) (rv : Val)
+    (hP : evalPlan alg post stJ = .ok (.continuing stFinal))
+    (hClean : stateCleanAtReturn stFinal = true)
+    (hRet : evalRval alg retExpr stFinal = some rv)
+    (hFree : handleFreeOut alg ⟨rv, collectRootMutVals stFinal.loans⟩ = true) :
+    stepBasicBlock alg (diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+      3 stJ = .ret ⟨rv, collectRootMutVals stFinal.loans⟩ :=
+  stepBasicBlock_of_ret_continuing alg _ 3 post retExpr stJ stFinal rv rfl hP
+    hClean hRet hFree
+
+/-- Any 4-block diamond CFG whose header and arm plans (`pre`, `onTrue`,
+`onFalse`) produce only `.continuing` flows emits only sub-identity wrappers
+(`handleFreeOutOpt alg` on symbolic `.convergedJump` transitions at block `0`,
+and no wrappers elsewhere; block `3` has a `.ret` terminator so `post` needs no
+restriction), and therefore satisfies `EmitsSubIdWraps` for every invariant
+`Inv`. -/
+theorem diamondCfgBlocks_emitsSubIdWraps {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (hPre : ∀ s f, evalPlan alg pre s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue : ∀ s f, evalPlan alg onTrue s = .ok f → Exists fun s' => f = .continuing s')
+    (hFalse : ∀ s f, evalPlan alg onFalse s = .ok f → Exists fun s' => f = .continuing s')
+    (Inv : Nat → SymState Val → Prop) :
+    EmitsSubIdWraps
+      (stepBasicBlock alg (diamondCfgBlocks pre cond onTrue onFalse post retExpr))
+      Inv := by
+  intro bb st _
+  match bb with
+  | 0 =>
+    rcases stepBasicBlock_of_branch_term alg _ 5 0 1 2 3 pre cond st rfl
+        (listGetOpt_zero_diamondCfgBlocks pre cond onTrue onFalse post retExpr) rfl
+        (findConvergenceBlock_diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+        hPre
+        (fun s => by
+          cases hEvT : evalPlan alg onTrue s with
+          | fail =>
+            left
+            rw [evalArmToJoin_goto_stop alg _ 3 3 1 onTrue s rfl
+                  (listGetOpt_one_diamondCfgBlocks pre cond onTrue onFalse post retExpr),
+                hEvT]
+          | ok fT =>
+            obtain ⟨stT, hfT⟩ := hTrue s fT hEvT
+            subst hfT
+            exact Or.inr ⟨1, stT, evalArmToJoin_diamondCfgBlocks_true alg pre cond
+              onTrue onFalse post retExpr s stT hEvT⟩)
+        (fun s => by
+          cases hEvF : evalPlan alg onFalse s with
+          | fail =>
+            left
+            rw [evalArmToJoin_goto_stop alg _ 3 3 2 onFalse s rfl
+                  (listGetOpt_two_diamondCfgBlocks pre cond onTrue onFalse post retExpr),
+                hEvF]
+          | ok fF =>
+            obtain ⟨stF, hfF⟩ := hFalse s fF hEvF
+            subst hfF
+            exact Or.inr ⟨1, stF, evalArmToJoin_diamondCfgBlocks_false alg pre cond
+              onTrue onFalse post retExpr s stF hEvF⟩) with
+      h | ⟨_, h⟩ | ⟨_, h⟩ | ⟨_, _, h⟩ | ⟨_, _, h⟩
+    · rw [h]; exact trivial
+    · rw [h]; exact trivial
+    · rw [h]; exact trivial
+    · rw [h]; exact subIdWrap_handleFreeOutOpt alg
+    · rw [h]; exact trivial
+  | 1 =>
+    rcases stepBasicBlock_of_goto_term alg _ 1 3 onTrue st
+        (listGetOpt_one_diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+        hTrue with h | ⟨_, h⟩ <;>
+      (rw [h]; exact trivial)
+  | 2 =>
+    rcases stepBasicBlock_of_goto_term alg _ 2 3 onFalse st
+        (listGetOpt_two_diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+        hFalse with h | ⟨_, h⟩ <;>
+      (rw [h]; exact trivial)
+  | 3 =>
+    rcases stepBasicBlock_of_ret_term alg
+        (diamondCfgBlocks pre cond onTrue onFalse post retExpr) 3 post retExpr st
+        rfl with h | ⟨_, h⟩ <;>
+      (rw [h]; exact trivial)
+  | _ + 4 => exact trivial
+
+/-- **4-block diamond CFG equivalence (`cfg_certificate_diamond_sound`)**:
+executing `diamondCfgBlocks pre cond onTrue onFalse post retExpr` for `3` steps
+via `runBlockCfg` produces `.ret out` whenever
+`evalFnValue alg params (.seq pre (.seq (.branch cond onTrue onFalse) post)) retExpr = .ok out`,
+both when `cond` is a concrete boolean (`alg.asBool cv = some b`, taking the
+3-block path `0 -> 1/2 -> 3`) and when `cond` is symbolic (`alg.asBool cv = none`,
+emitting `.convergedJump 1 (handleFreeOutOpt alg) 3 stJoined` at block `0`,
+consuming `1` delay tick for the arm step, and returning at block `3`). -/
+theorem cfg_certificate_diamond_sound {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (hWfPre : WfPlan alg pre) (hWfTrue : WfPlan alg onTrue)
+    (hWfFalse : WfPlan alg onFalse) (hWfPost : WfPlan alg post)
+    (hPre : ∀ s f, evalPlan alg pre s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue : ∀ s f, evalPlan alg onTrue s = .ok f → Exists fun s' => f = .continuing s')
+    (hFalse : ∀ s f, evalPlan alg onFalse s = .ok f → Exists fun s' => f = .continuing s')
+    (hPost : ∀ s f, evalPlan alg post s = .ok f → Exists fun s' => f = .continuing s')
+    (params : List (ParamInput Val)) (st0 : SymState Val) (out : FuncOut Val)
+    (hInit : initFnState alg params = .ok st0)
+    (hEval :
+      evalFnValue alg params
+        (.seq pre (.seq (.branch cond onTrue onFalse) post))
+        retExpr = .ok out) :
+    runBlockCfg
+      (stepBasicBlock alg
+        (diamondCfgBlocks pre cond onTrue onFalse post retExpr))
+      0 st0 3 = .ret out := by
+  obtain ⟨st1, cv, hEvPre, hCond, hBranch⟩ :=
+    evalFnValue_seq_branch_seq_ok_inv alg pre cond onTrue onFalse post retExpr
+      hWfPre hWfTrue hWfFalse hWfPost hPre hTrue hFalse hPost params st0 out
+      hInit hEval
+  rcases hBranch with
+    ⟨hBool, stT, stFinal, rv, hEvT, hEvP, hClean, hRet, hFree, rfl⟩ |
+    ⟨hBool, stF, stFinal, rv, hEvF, hEvP, hClean, hRet, hFree, rfl⟩ |
+    ⟨hBool, stT, stF, stJ, stFinal, rv, hEvT, hEvF, hJ, hEvP, hClean, hRet,
+     hFree, rfl⟩
+  · rw [runBlockCfg_succ,
+        stepBasicBlock_diamondCfg_header_true alg pre cond onTrue onFalse post
+          retExpr st0 st1 cv hEvPre hCond hBool]
+    dsimp only
+    rw [runBlockCfg_succ,
+        stepBasicBlock_diamondCfg_arm_true alg pre cond onTrue onFalse post
+          retExpr st1 stT hEvT]
+    dsimp only
+    rw [runBlockCfg_succ,
+        stepBasicBlock_diamondCfg_join alg pre cond onTrue onFalse post retExpr
+          stT stFinal rv hEvP hClean hRet hFree]
+  · rw [runBlockCfg_succ,
+        stepBasicBlock_diamondCfg_header_false alg pre cond onTrue onFalse post
+          retExpr st0 st1 cv hEvPre hCond hBool]
+    dsimp only
+    rw [runBlockCfg_succ,
+        stepBasicBlock_diamondCfg_arm_false alg pre cond onTrue onFalse post
+          retExpr st1 stF hEvF]
+    dsimp only
+    rw [runBlockCfg_succ,
+        stepBasicBlock_diamondCfg_join alg pre cond onTrue onFalse post retExpr
+          stF stFinal rv hEvP hClean hRet hFree]
+  · rw [runBlockCfg_succ,
+        stepBasicBlock_diamondCfg_header_symbolic alg pre cond onTrue onFalse
+          post retExpr st0 st1 stT stF stJ cv hEvPre hCond hBool hEvT hEvF hJ]
+    dsimp only
+    rw [runBlockCfgLoop_succ_wait]
+    have hStepJoin :
+        runBlockCfgLoop
+          (stepBasicBlock alg
+            (diamondCfgBlocks pre cond onTrue onFalse post retExpr))
+          1 0 3 stJ =
+        .ret ⟨rv, collectRootMutVals stFinal.loans⟩ := by
+      change
+        runBlockCfg
+          (stepBasicBlock alg
+            (diamondCfgBlocks pre cond onTrue onFalse post retExpr))
+          3 stJ 1 =
+        .ret ⟨rv, collectRootMutVals stFinal.loans⟩
+      rw [runBlockCfg_succ,
+          stepBasicBlock_diamondCfg_join alg pre cond onTrue onFalse post
+            retExpr stJ stFinal rv hEvP hClean hRet hFree]
+    rw [hStepJoin]
+    dsimp only [handleFreeOutOpt]
+    rw [hFree]
+    rfl
+
+/-- **4-block diamond `CfgCertificate` constructor (`CfgCertificate.diamond`)**:
+packages `diamondCfgBlocks pre cond onTrue onFalse post retExpr` at fuel `3`
+with plan `.seq pre (.seq (.branch cond onTrue onFalse) post)` via
+`cfg_certificate_diamond_sound`, supporting both concrete branch conditions and
+symbolic `.convergedJump 1` branch conditions. -/
+def CfgCertificate.diamond {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (hWfPre : WfPlan alg pre) (hWfTrue : WfPlan alg onTrue)
+    (hWfFalse : WfPlan alg onFalse) (hWfPost : WfPlan alg post)
+    (hPre : ∀ s f, evalPlan alg pre s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue : ∀ s f, evalPlan alg onTrue s = .ok f → Exists fun s' => f = .continuing s')
+    (hFalse : ∀ s f, evalPlan alg onFalse s = .ok f → Exists fun s' => f = .continuing s')
+    (hPost : ∀ s f, evalPlan alg post s = .ok f → Exists fun s' => f = .continuing s') :
+    CfgCertificate alg where
+  blocks := diamondCfgBlocks pre cond onTrue onFalse post retExpr
+  entryBb := 0
+  fuel := 3
+  plan := .seq pre (.seq (.branch cond onTrue onFalse) post)
+  retExpr := retExpr
+  sound :=
+    cfg_certificate_diamond_sound alg pre cond onTrue onFalse post retExpr
+      hWfPre hWfTrue hWfFalse hWfPost hPre hTrue hFalse hPost
+
+/-- Canonical 2-point invariant `(bb = 0 ∧ st = st0) ∨ (bb = 3 ∧ st = stJ)` for
+a symbolic `.convergedJump` run of a diamond CFG from entry `(0, st0)` to join
+`(3, stJ)`, for callers that have computed both block steps (the
+`LocalBlockVC` route of `mir_cfgCertificate_sound`; `diamondCfgInv` needs no
+precomputed steps). -/
+def diamondSymBlockInv {Val : Type} (st0 stJ : SymState Val)
+    (bb : Nat) (st : SymState Val) : Prop :=
+  (bb = 0 ∧ st = st0) ∨ (bb = 3 ∧ st = stJ)
+
+/-- Whenever block `0` emits `.convergedJump armSteps wrapRet 3 stJ` from `st0`,
+block `3` emits `.ret out` from `stJ`, and the pending wrapper accepts `out`
+unchanged, `diamondSymBlockInv st0 stJ` satisfies `LocalBlockVC` with
+`PostRet := (· = out)` (its fork-freedom is `diamondSymBlockInv_noFork`). -/
+theorem diamondSymBlockInv_localBlockVC {Val : Type} (alg : ValAlgebra Val)
+    (blocks : List (BasicBlock Val)) (st0 stJ : SymState Val)
+    (armSteps : Nat) (wrapRet : FuncOut Val → Option (FuncOut Val))
+    (out : FuncOut Val)
+    (hStep0 : stepBasicBlock alg blocks 0 st0 =
+      .convergedJump armSteps wrapRet 3 stJ)
+    (hStep3 : stepBasicBlock alg blocks 3 stJ = .ret out)
+    (hWrap : wrapRet out = some out) :
+    LocalBlockVC (stepBasicBlock alg blocks) (diamondSymBlockInv st0 stJ)
+      (· = out) := by
+  intro bb st hInv
+  rcases hInv with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩
+  · rw [hStep0]
+    refine ⟨Or.inr ⟨rfl, rfl⟩, ?_⟩
+    intro v hv
+    subst hv
+    rw [hWrap]
+  · rw [hStep3]
+
+theorem diamondSymBlockInv_noFork {Val : Type} (alg : ValAlgebra Val)
+    (blocks : List (BasicBlock Val)) (st0 stJ : SymState Val)
+    (armSteps : Nat) (wrapRet : FuncOut Val → Option (FuncOut Val))
+    (out : FuncOut Val)
+    (hStep0 : stepBasicBlock alg blocks 0 st0 =
+      .convergedJump armSteps wrapRet 3 stJ)
+    (hStep3 : stepBasicBlock alg blocks 3 stJ = .ret out) :
+    ∀ bb st, diamondSymBlockInv st0 stJ bb st →
+      ∀ mergeRet thenBb elseBb st',
+        stepBasicBlock alg blocks bb st ≠
+          .branchJump mergeRet thenBb elseBb st' := by
+  intro bb st hInv _ _ _ _ hFork
+  rcases hInv with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩
+  · rw [hStep0] at hFork
+    exact nomatch hFork
+  · rw [hStep3] at hFork
+    exact nomatch hFork
+
+/-- Block invariant of every `diamondCfgBlocks` run from entry state `st0`: the
+header in `st0`, or any state at an arm or at the join. Unlike
+`diamondSymBlockInv`, it needs no precomputed block steps, and it covers concrete
+(`0 → 1/2 → 3`) as well as symbolic (`.convergedJump`) branch conditions. -/
+def diamondCfgInv {Val : Type} (st0 : SymState Val) (bb : Nat) (st : SymState Val) :
+    Prop :=
+  (bb = 0 ∧ st = st0) ∨ bb = 1 ∨ bb = 2 ∨ bb = 3
+
+/-- **General header-only inversion for any diamond structured plan
+`.seq pre (.seq (.branch cond onTrue onFalse) post)`**: requires no `.continuing`
+hypothesis on `post`, and extracts the header and arm evaluations needed by
+`stepBasicBlock` at block `0`. -/
+theorem evalFnValue_seq_branch_seq_header_inv {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (hWfPre : WfPlan alg pre) (hWfTrue : WfPlan alg onTrue)
+    (hWfFalse : WfPlan alg onFalse) (hWfPost : WfPlan alg post)
+    (hPre : ∀ s f, evalPlan alg pre s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue : ∀ s f, evalPlan alg onTrue s = .ok f → Exists fun s' => f = .continuing s')
+    (hFalse : ∀ s f, evalPlan alg onFalse s = .ok f → Exists fun s' => f = .continuing s')
+    (params : List (ParamInput Val)) (st0 : SymState Val) (out : FuncOut Val)
+    (hInit : initFnState alg params = .ok st0)
+    (hEval :
+      evalFnValue alg params
+        (.seq pre (.seq (.branch cond onTrue onFalse) post))
+        retExpr = .ok out) :
+    Exists fun st1 => Exists fun cv =>
+      evalPlan alg pre st0 = .ok (.continuing st1) ∧
+      evalRval alg cond st1 = some cv ∧
+      (alg.asBool cv = some true ∨
+       alg.asBool cv = some false ∨
+       (alg.asBool cv = none ∧
+        Exists fun stT => Exists fun stF => Exists fun stJ =>
+          evalPlan alg onTrue st1 = .ok (.continuing stT) ∧
+          evalPlan alg onFalse st1 = .ok (.continuing stF) ∧
+          joinSymState alg cv stT stF = some stJ)) := by
+  have hWfBr := wfPlan_branch alg cond hWfTrue hWfFalse
+  have hWfBrPost := wfPlan_seq alg hWfBr hWfPost
+  unfold evalFnValue at hEval
+  rw [hInit] at hEval
+  dsimp only at hEval
+  rw [evalPlan_seq alg pre (.seq (.branch cond onTrue onFalse) post) st0
+        hWfPre hWfBrPost] at hEval
+  cases hEvPre : evalPlan alg pre st0 with
+  | fail => rw [hEvPre] at hEval; exact nomatch hEval
+  | ok fPre =>
+    obtain ⟨st1, hfPre⟩ := hPre st0 fPre hEvPre
+    subst hfPre
+    rw [hEvPre] at hEval
+    dsimp only at hEval
+    rw [evalPlan_seq alg (.branch cond onTrue onFalse) post st1 hWfBr hWfPost,
+        evalPlan_branch alg cond onTrue onFalse st1 hWfTrue hWfFalse] at hEval
+    cases hCond : evalRval alg cond st1 with
+    | none => rw [hCond] at hEval; exact nomatch hEval
+    | some cv =>
+      rw [hCond] at hEval
+      dsimp only at hEval
+      refine ⟨st1, cv, rfl, hCond, ?_⟩
+      cases hBool : alg.asBool cv with
+      | some b =>
+        cases b with
+        | true => exact Or.inl rfl
+        | false => exact Or.inr (Or.inl rfl)
+      | none =>
+        rw [hBool] at hEval
+        dsimp only at hEval
+        cases hEvT : evalPlan alg onTrue st1 with
+        | fail => rw [hEvT] at hEval; exact nomatch hEval
+        | ok fT =>
+          obtain ⟨stT, hfT⟩ := hTrue st1 fT hEvT
+          subst hfT
+          cases hEvF : evalPlan alg onFalse st1 with
+          | fail => rw [hEvT, hEvF] at hEval; exact nomatch hEval
+          | ok fF =>
+            obtain ⟨stF, hfF⟩ := hFalse st1 fF hEvF
+            subst hfF
+            rw [hEvT, hEvF] at hEval
+            dsimp only [joinExecFlow] at hEval
+            cases hJ : joinSymState alg cv stT stF with
+            | none => rw [hJ] at hEval; exact nomatch hEval
+            | some stJ =>
+              exact Or.inr (Or.inr ⟨rfl, stT, stF, stJ, rfl, rfl, hJ⟩)
+
+/-- **Header inversion for `CfgCertificate.diamond`**: if the structured plan
+`.seq pre (.seq (.branch cond onTrue onFalse) post)` evaluates (`evalFnValue …
+= .ok out`) from `initFnState params = .ok st0`, then block `0` of
+`diamondCfgBlocks` takes the concrete `true` arm (`.jump 1`), the concrete
+`false` arm (`.jump 2`), or (symbolic condition) joins both arms into
+`.convergedJump 1 (handleFreeOutOpt alg) 3 stJ`; in particular it never forks
+(`.branchJump`). -/
+theorem stepBasicBlock_diamondCfg_header_of_eval {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (hWfPre : WfPlan alg pre) (hWfTrue : WfPlan alg onTrue)
+    (hWfFalse : WfPlan alg onFalse) (hWfPost : WfPlan alg post)
+    (hPre : ∀ s f, evalPlan alg pre s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue : ∀ s f, evalPlan alg onTrue s = .ok f → Exists fun s' => f = .continuing s')
+    (hFalse : ∀ s f, evalPlan alg onFalse s = .ok f → Exists fun s' => f = .continuing s')
+    (params : List (ParamInput Val)) (st0 : SymState Val) (out : FuncOut Val)
+    (hInit : initFnState alg params = .ok st0)
+    (hEval :
+      evalFnValue alg params
+        (.seq pre (.seq (.branch cond onTrue onFalse) post))
+        retExpr = .ok out) :
+    (Exists fun st1 =>
+      stepBasicBlock alg (diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+        0 st0 = .jump 1 st1) ∨
+    (Exists fun st1 =>
+      stepBasicBlock alg (diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+        0 st0 = .jump 2 st1) ∨
+    (Exists fun stJ =>
+      stepBasicBlock alg (diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+        0 st0 = .convergedJump 1 (fun out => handleFreeOutOpt alg out) 3 stJ) := by
+  obtain ⟨st1, cv, hEvPre, hCond, hBranch⟩ :=
+    evalFnValue_seq_branch_seq_header_inv alg pre cond onTrue onFalse post
+      retExpr hWfPre hWfTrue hWfFalse hWfPost hPre hTrue hFalse params st0 out
+      hInit hEval
+  rcases hBranch with hBool | hBool | ⟨hBool, stT, stF, stJ, hEvT, hEvF, hJ⟩
+  · exact Or.inl ⟨st1, stepBasicBlock_diamondCfg_header_true alg pre cond
+      onTrue onFalse post retExpr st0 st1 cv hEvPre hCond hBool⟩
+  · exact Or.inr (Or.inl ⟨st1, stepBasicBlock_diamondCfg_header_false alg pre
+      cond onTrue onFalse post retExpr st0 st1 cv hEvPre hCond hBool⟩)
+  · exact Or.inr (Or.inr ⟨stJ, stepBasicBlock_diamondCfg_header_symbolic alg pre
+      cond onTrue onFalse post retExpr st0 st1 stT stF stJ cv hEvPre hCond
+      hBool hEvT hEvF hJ⟩)
+
+/-- `diamondCfgInv st0` is closed and fork-free (`InvClosedNoFork`) on
+`diamondCfgBlocks` whenever the structured plan evaluates from
+`initFnState params = .ok st0`: block `0` jumps or `.convergedJump`s into an arm
+or the join (`stepBasicBlock_diamondCfg_header_of_eval`), the arms (which produce
+only `.continuing` flows) jump to the join or fault, and the join returns or
+faults. -/
+theorem diamondCfgInv_invClosedNoFork {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (hWfPre : WfPlan alg pre) (hWfTrue : WfPlan alg onTrue)
+    (hWfFalse : WfPlan alg onFalse) (hWfPost : WfPlan alg post)
+    (hPre : ∀ s f, evalPlan alg pre s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue : ∀ s f, evalPlan alg onTrue s = .ok f → Exists fun s' => f = .continuing s')
+    (hFalse : ∀ s f, evalPlan alg onFalse s = .ok f → Exists fun s' => f = .continuing s')
+    (params : List (ParamInput Val)) (st0 : SymState Val) (out : FuncOut Val)
+    (hInit : initFnState alg params = .ok st0)
+    (hEval :
+      evalFnValue alg params
+        (.seq pre (.seq (.branch cond onTrue onFalse) post))
+        retExpr = .ok out) :
+    InvClosedNoFork
+      (stepBasicBlock alg (diamondCfgBlocks pre cond onTrue onFalse post retExpr))
+      (diamondCfgInv st0) := by
+  intro bb st hInv
+  rcases hInv with ⟨hBb, hSt⟩ | hBb | hBb | hBb
+  · subst hBb
+    subst hSt
+    rcases stepBasicBlock_diamondCfg_header_of_eval alg pre cond onTrue onFalse post
+        retExpr hWfPre hWfTrue hWfFalse hWfPost hPre hTrue hFalse params _ out hInit
+        hEval with ⟨st1, h⟩ | ⟨st1, h⟩ | ⟨stJ, h⟩
+    · rw [h]
+      exact Or.inr (Or.inl rfl)
+    · rw [h]
+      exact Or.inr (Or.inr (Or.inl rfl))
+    · rw [h]
+      exact Or.inr (Or.inr (Or.inr rfl))
+  · subst hBb
+    rcases stepBasicBlock_of_goto_term alg _ 1 3 onTrue st
+        (listGetOpt_one_diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+        hTrue with h | ⟨_, h⟩
+    · rw [h]; exact trivial
+    · rw [h]; exact Or.inr (Or.inr (Or.inr rfl))
+  · subst hBb
+    rcases stepBasicBlock_of_goto_term alg _ 2 3 onFalse st
+        (listGetOpt_two_diamondCfgBlocks pre cond onTrue onFalse post retExpr)
+        hFalse with h | ⟨_, h⟩
+    · rw [h]; exact trivial
+    · rw [h]; exact Or.inr (Or.inr (Or.inr rfl))
+  · subst hBb
+    rcases stepBasicBlock_of_ret_term alg
+        (diamondCfgBlocks pre cond onTrue onFalse post retExpr) 3 post retExpr st
+        rfl with h | ⟨_, h⟩ <;>
+      (rw [h]; exact trivial)
+
+/-- **End-to-end live `V2026_06_01` MIR adequacy for every diamond certified by
+`CfgCertificate.diamond` (`mir_diamond_cfgCertificate_sound`)**: whether the
+branch condition is concrete (path `0 → 1/2 → 3`) or symbolic (`.convergedJump
+1` with the `handleFreeOutOpt` guard and one delay tick), `HoldsFnSpec` of the
+structured plan, the wrapper-free per-block `mirCfgBlockRel` obligations, and the
+entry relation give fuel-free `MirWpConverges` of the live body. No block step
+has to be precomputed: the certificate (`cfg_certificate_diamond_sound`) supplies
+the return, `diamondCfgInv_invClosedNoFork` the fork-free invariant,
+`diamondCfgBlocks_emitsSubIdWraps` the wrapper discipline, and
+`mir_cfgCertificate_sound_of_invClosedNoFork` the transport. -/
+theorem mir_diamond_cfgCertificate_sound (tagOf : LoanId → Nat)
+    (body : CapturedMir) (pre : FlowPlan StdVal) (cond : RvalOp StdVal)
+    (onTrue onFalse postPlan : FlowPlan StdVal) (retExpr : RvalOp StdVal)
+    (hWfPre : WfPlan stdValAlg pre) (hWfTrue : WfPlan stdValAlg onTrue)
+    (hWfFalse : WfPlan stdValAlg onFalse) (hWfPost : WfPlan stdValAlg postPlan)
+    (hPre : ∀ s f, evalPlan stdValAlg pre s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue : ∀ s f, evalPlan stdValAlg onTrue s = .ok f → Exists fun s' => f = .continuing s')
+    (hFalse : ∀ s f, evalPlan stdValAlg onFalse s = .ok f → Exists fun s' => f = .continuing s')
+    (hPost : ∀ s f, evalPlan stdValAlg postPlan s = .ok f → Exists fun s' => f = .continuing s')
+    (params : List (ParamInput StdVal)) (st0 : SymState StdVal)
+    (post : FuncOut StdVal → Prop)
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (rootAddrs : List (LoanId × Local × SubPath) := [])
+    (hInit : initFnState stdValAlg params = .ok st0)
+    (hSpec :
+      HoldsFnSpec
+        (evalFnValue stdValAlg params
+          (.seq pre (.seq (.branch cond onTrue onFalse) postPlan)) retExpr)
+        post)
+    (hZero : ∀ bb st ms,
+      mirCfgBlockRel tagOf bindingsAt mirBb extra bb st ms →
+      match
+        stepBasicBlock stdValAlg
+          (diamondCfgBlocks pre cond onTrue onFalse postPlan retExpr) bb st
+      with
+      | .jump nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .jumpWrapped _ nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .convergedJump _ _ nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .ret v =>
+        PureMirExec.WpConverges (PureMirExec.mirStep body) ms
+          (MirOutcomeRel tagOf rootAddrs v)
+      | .branchJump _ _ _ _ => True
+      | .fault => True)
+    {m0 : MachineState}
+    (hR0 : mirCfgBlockRel tagOf bindingsAt mirBb extra 0 st0 m0) :
+    Anneal.MirFuelFree.MirWpConverges body m0
+      (fun o => LiftedMirPost tagOf post o rootAddrs) := by
+  cases hEval : evalFnValue stdValAlg params
+      (.seq pre (.seq (.branch cond onTrue onFalse) postPlan)) retExpr with
+  | fail =>
+    rw [hEval] at hSpec
+    exact absurd hSpec (holdsFnSpec_not_fail post)
+  | ok out =>
+    exact mir_cfgCertificate_sound_of_invClosedNoFork tagOf body
+      (CfgCertificate.diamond stdValAlg pre cond onTrue onFalse postPlan retExpr
+        hWfPre hWfTrue hWfFalse hWfPost hPre hTrue hFalse hPost)
+      params st0 post bindingsAt mirBb extra rootAddrs hInit hSpec
+      (diamondCfgInv st0)
+      (diamondCfgInv_invClosedNoFork stdValAlg pre cond onTrue onFalse postPlan
+        retExpr hWfPre hWfTrue hWfFalse hWfPost hPre hTrue hFalse params st0
+        out hInit hEval)
+      (Or.inl ⟨rfl, rfl⟩)
+      (mirCfg_forwardSim_of_emitsSubIdWraps tagOf body
+        (diamondCfgBlocks pre cond onTrue onFalse postPlan retExpr)
+        bindingsAt mirBb extra rootAddrs
+        (diamondCfgBlocks_emitsSubIdWraps stdValAlg pre cond onTrue onFalse
+          postPlan retExpr hPre hTrue hFalse _)
+        hZero)
+      ⟨subIdWrap_some, hR0⟩
+
+/-- 5-block asymmetric diamond CFG: header block `0` runs `pre` and branches on
+`cond` to a 2-block `true` arm (`1: onTrue1; goto 2` then `2: onTrue2; goto 4`)
+or a 1-block `false` arm (`3: onFalse; goto 4`), which reconverge at join block
+`4` (`post; ret retExpr`). On a symbolic condition, block `0` emits
+`.convergedJump 2 (handleFreeOutOpt alg) 4 stJ` (`armSteps = Nat.max 2 1 = 2`). -/
+def asymDiamondCfgBlocks {Val : Type} (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue1 onTrue2 onFalse post : FlowPlan Val) (retExpr : RvalOp Val) :
+    List (BasicBlock Val) :=
+  [⟨pre, .branch cond 1 3⟩,
+   ⟨onTrue1, .goto 2⟩,
+   ⟨onTrue2, .goto 4⟩,
+   ⟨onFalse, .goto 4⟩,
+   ⟨post, .ret retExpr⟩]
+
+theorem findConvergenceBlock_asymDiamondCfgBlocks {Val : Type}
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue1 onTrue2 onFalse post : FlowPlan Val) (retExpr : RvalOp Val) :
+    findConvergenceBlock
+      (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr)
+      6 1 3 [0] = some 4 := rfl
+
+theorem listGetOpt_zero_asymDiamondCfgBlocks {Val : Type}
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue1 onTrue2 onFalse post : FlowPlan Val) (retExpr : RvalOp Val) :
+    listGetOpt 0
+      (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr) =
+      some ⟨pre, .branch cond 1 3⟩ := rfl
+
+theorem listGetOpt_one_asymDiamondCfgBlocks {Val : Type}
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue1 onTrue2 onFalse post : FlowPlan Val) (retExpr : RvalOp Val) :
+    listGetOpt 1
+      (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr) =
+      some ⟨onTrue1, .goto 2⟩ := rfl
+
+theorem listGetOpt_two_asymDiamondCfgBlocks {Val : Type}
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue1 onTrue2 onFalse post : FlowPlan Val) (retExpr : RvalOp Val) :
+    listGetOpt 2
+      (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr) =
+      some ⟨onTrue2, .goto 4⟩ := rfl
+
+theorem listGetOpt_three_asymDiamondCfgBlocks {Val : Type}
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue1 onTrue2 onFalse post : FlowPlan Val) (retExpr : RvalOp Val) :
+    listGetOpt 3
+      (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr) =
+      some ⟨onFalse, .goto 4⟩ := rfl
+
+theorem length_asymDiamondCfgBlocks {Val : Type}
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue1 onTrue2 onFalse post : FlowPlan Val) (retExpr : RvalOp Val) :
+    (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr).length =
+      5 := rfl
+
+theorem evalArmToJoin_asymDiamondCfgBlocks_true {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue1 onTrue2 onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (st1 st2 stT : SymState Val)
+    (hT1 : evalPlan alg onTrue1 st1 = .ok (.continuing st2))
+    (hT2 : evalPlan alg onTrue2 st2 = .ok (.continuing stT)) :
+    evalArmToJoin alg
+      (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr)
+      6 4 1 st1 = .ok (2, .continuing stT) :=
+  evalArmToJoin_goto_goto_stop alg _ 3 4 1 2 onTrue1 onTrue2 st1 st2 stT rfl
+    (listGetOpt_one_asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post
+      retExpr)
+    hT1 rfl
+    (listGetOpt_two_asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post
+      retExpr)
+    hT2
+
+theorem evalArmToJoin_asymDiamondCfgBlocks_false {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue1 onTrue2 onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (st1 stF : SymState Val)
+    (hF : evalPlan alg onFalse st1 = .ok (.continuing stF)) :
+    evalArmToJoin alg
+      (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr)
+      6 4 3 st1 = .ok (1, .continuing stF) := by
+  rw [evalArmToJoin_goto_stop alg _ 4 4 3 onFalse st1 rfl
+        (listGetOpt_three_asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse
+          post retExpr),
+      hF]
+
+theorem stepBasicBlock_asymDiamondCfg_header_true {Val : Type}
+    (alg : ValAlgebra Val) (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue1 onTrue2 onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (st0 st1 : SymState Val) (cv : Val)
+    (hPre : evalPlan alg pre st0 = .ok (.continuing st1))
+    (hCond : evalRval alg cond st1 = some cv)
+    (hBool : alg.asBool cv = some true) :
+    stepBasicBlock alg
+      (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr)
+      0 st0 = .jump 1 st1 :=
+  stepBasicBlock_of_branch_true alg _ 0 1 3 pre cond st0 st1 cv
+    (listGetOpt_zero_asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post
+      retExpr)
+    hPre hCond hBool
+
+theorem stepBasicBlock_asymDiamondCfg_header_false {Val : Type}
+    (alg : ValAlgebra Val) (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue1 onTrue2 onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (st0 st1 : SymState Val) (cv : Val)
+    (hPre : evalPlan alg pre st0 = .ok (.continuing st1))
+    (hCond : evalRval alg cond st1 = some cv)
+    (hBool : alg.asBool cv = some false) :
+    stepBasicBlock alg
+      (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr)
+      0 st0 = .jump 3 st1 :=
+  stepBasicBlock_of_branch_false alg _ 0 1 3 pre cond st0 st1 cv
+    (listGetOpt_zero_asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post
+      retExpr)
+    hPre hCond hBool
+
+theorem stepBasicBlock_asymDiamondCfg_header_symbolic {Val : Type}
+    (alg : ValAlgebra Val) (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue1 onTrue2 onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (st0 st1 st2 stT stF stJ : SymState Val) (cv : Val)
+    (hPre : evalPlan alg pre st0 = .ok (.continuing st1))
+    (hCond : evalRval alg cond st1 = some cv)
+    (hBool : alg.asBool cv = none)
+    (hT1 : evalPlan alg onTrue1 st1 = .ok (.continuing st2))
+    (hT2 : evalPlan alg onTrue2 st2 = .ok (.continuing stT))
+    (hF : evalPlan alg onFalse st1 = .ok (.continuing stF))
+    (hJ : joinSymState alg cv stT stF = some stJ) :
+    stepBasicBlock alg
+      (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr)
+      0 st0 =
+      .convergedJump 2 (fun out => handleFreeOutOpt alg out) 4 stJ :=
+  stepBasicBlock_of_branch_symbolic alg _ 0 1 3 4 2 1 pre cond st0 st1 stT stF
+    stJ cv
+    (listGetOpt_zero_asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post
+      retExpr)
+    rfl
+    (findConvergenceBlock_asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse
+      post retExpr)
+    hPre hCond hBool
+    (evalArmToJoin_asymDiamondCfgBlocks_true alg pre cond onTrue1 onTrue2
+      onFalse post retExpr st1 st2 stT hT1 hT2)
+    (evalArmToJoin_asymDiamondCfgBlocks_false alg pre cond onTrue1 onTrue2
+      onFalse post retExpr st1 stF hF)
+    hJ
+
+theorem stepBasicBlock_asymDiamondCfg_arm_true1 {Val : Type}
+    (alg : ValAlgebra Val) (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue1 onTrue2 onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (st1 st2 : SymState Val)
+    (hT1 : evalPlan alg onTrue1 st1 = .ok (.continuing st2)) :
+    stepBasicBlock alg
+      (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr)
+      1 st1 = .jump 2 st2 :=
+  stepBasicBlock_of_goto_continuing alg _ 1 2 onTrue1 st1 st2
+    (listGetOpt_one_asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post
+      retExpr)
+    hT1
+
+theorem stepBasicBlock_asymDiamondCfg_arm_true2 {Val : Type}
+    (alg : ValAlgebra Val) (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue1 onTrue2 onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (st2 stT : SymState Val)
+    (hT2 : evalPlan alg onTrue2 st2 = .ok (.continuing stT)) :
+    stepBasicBlock alg
+      (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr)
+      2 st2 = .jump 4 stT :=
+  stepBasicBlock_of_goto_continuing alg _ 2 4 onTrue2 st2 stT
+    (listGetOpt_two_asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post
+      retExpr)
+    hT2
+
+theorem stepBasicBlock_asymDiamondCfg_arm_false {Val : Type}
+    (alg : ValAlgebra Val) (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue1 onTrue2 onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (st1 stF : SymState Val)
+    (hF : evalPlan alg onFalse st1 = .ok (.continuing stF)) :
+    stepBasicBlock alg
+      (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr)
+      3 st1 = .jump 4 stF :=
+  stepBasicBlock_of_goto_continuing alg _ 3 4 onFalse st1 stF
+    (listGetOpt_three_asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post
+      retExpr)
+    hF
+
+theorem stepBasicBlock_asymDiamondCfg_join {Val : Type}
+    (alg : ValAlgebra Val) (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue1 onTrue2 onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (stJ stFinal : SymState Val) (rv : Val)
+    (hP : evalPlan alg post stJ = .ok (.continuing stFinal))
+    (hClean : stateCleanAtReturn stFinal = true)
+    (hRet : evalRval alg retExpr stFinal = some rv)
+    (hFree : handleFreeOut alg ⟨rv, collectRootMutVals stFinal.loans⟩ = true) :
+    stepBasicBlock alg
+      (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr)
+      4 stJ = .ret ⟨rv, collectRootMutVals stFinal.loans⟩ :=
+  stepBasicBlock_of_ret_continuing alg _ 4 post retExpr stJ stFinal rv rfl hP
+    hClean hRet hFree
+
+/-- Any 5-block asymmetric diamond CFG whose header and arm plans (`pre`,
+`onTrue1`, `onTrue2`, `onFalse`) produce only `.continuing` flows emits only
+sub-identity wrappers (`handleFreeOutOpt alg` on symbolic `.convergedJump 2`
+transitions at block `0`, and no wrappers elsewhere), so it satisfies
+`EmitsSubIdWraps` for every invariant `Inv`. -/
+theorem asymDiamondCfgBlocks_emitsSubIdWraps {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue1 onTrue2 onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (hPre : ∀ s f, evalPlan alg pre s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue1 : ∀ s f, evalPlan alg onTrue1 s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue2 : ∀ s f, evalPlan alg onTrue2 s = .ok f → Exists fun s' => f = .continuing s')
+    (hFalse : ∀ s f, evalPlan alg onFalse s = .ok f → Exists fun s' => f = .continuing s')
+    (Inv : Nat → SymState Val → Prop) :
+    EmitsSubIdWraps
+      (stepBasicBlock alg
+        (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr))
+      Inv := by
+  intro bb st _
+  match bb with
+  | 0 =>
+    rcases stepBasicBlock_of_branch_term alg _ 6 0 1 3 4 pre cond st rfl
+        (listGetOpt_zero_asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse
+          post retExpr)
+        rfl
+        (findConvergenceBlock_asymDiamondCfgBlocks pre cond onTrue1 onTrue2
+          onFalse post retExpr)
+        hPre
+        (fun s => by
+          cases hEvT1 : evalPlan alg onTrue1 s with
+          | fail =>
+            exact Or.inl (evalArmToJoin_goto_fail_first alg _ 5 4 1 2 onTrue1 s rfl
+              (listGetOpt_one_asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse
+                post retExpr)
+              hEvT1)
+          | ok fT1 =>
+            obtain ⟨st2, hfT1⟩ := hTrue1 s fT1 hEvT1
+            subst hfT1
+            cases hEvT2 : evalPlan alg onTrue2 st2 with
+            | fail =>
+              exact Or.inl (evalArmToJoin_goto_fail_second alg _ 4 4 1 2 onTrue1
+                onTrue2 s st2 rfl
+                (listGetOpt_one_asymDiamondCfgBlocks pre cond onTrue1 onTrue2
+                  onFalse post retExpr)
+                hEvT1 rfl
+                (listGetOpt_two_asymDiamondCfgBlocks pre cond onTrue1 onTrue2
+                  onFalse post retExpr)
+                hEvT2)
+            | ok fT2 =>
+              obtain ⟨stT, hfT2⟩ := hTrue2 st2 fT2 hEvT2
+              subst hfT2
+              exact Or.inr ⟨2, stT, evalArmToJoin_asymDiamondCfgBlocks_true alg pre
+                cond onTrue1 onTrue2 onFalse post retExpr s st2 stT hEvT1 hEvT2⟩)
+        (fun s => by
+          cases hEvF : evalPlan alg onFalse s with
+          | fail =>
+            left
+            rw [evalArmToJoin_goto_stop alg _ 4 4 3 onFalse s rfl
+                  (listGetOpt_three_asymDiamondCfgBlocks pre cond onTrue1 onTrue2
+                    onFalse post retExpr),
+                hEvF]
+          | ok fF =>
+            obtain ⟨stF, hfF⟩ := hFalse s fF hEvF
+            subst hfF
+            exact Or.inr ⟨1, stF, evalArmToJoin_asymDiamondCfgBlocks_false alg pre
+              cond onTrue1 onTrue2 onFalse post retExpr s stF hEvF⟩) with
+      h | ⟨_, h⟩ | ⟨_, h⟩ | ⟨_, _, h⟩ | ⟨_, _, h⟩
+    · rw [h]; exact trivial
+    · rw [h]; exact trivial
+    · rw [h]; exact trivial
+    · rw [h]; exact subIdWrap_handleFreeOutOpt alg
+    · rw [h]; exact trivial
+  | 1 =>
+    rcases stepBasicBlock_of_goto_term alg _ 1 2 onTrue1 st
+        (listGetOpt_one_asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post
+          retExpr)
+        hTrue1 with h | ⟨_, h⟩ <;>
+      (rw [h]; exact trivial)
+  | 2 =>
+    rcases stepBasicBlock_of_goto_term alg _ 2 4 onTrue2 st
+        (listGetOpt_two_asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post
+          retExpr)
+        hTrue2 with h | ⟨_, h⟩ <;>
+      (rw [h]; exact trivial)
+  | 3 =>
+    rcases stepBasicBlock_of_goto_term alg _ 3 4 onFalse st
+        (listGetOpt_three_asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse
+          post retExpr)
+        hFalse with h | ⟨_, h⟩ <;>
+      (rw [h]; exact trivial)
+  | 4 =>
+    rcases stepBasicBlock_of_ret_term alg
+        (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr) 4
+        post retExpr st rfl with h | ⟨_, h⟩ <;>
+      (rw [h]; exact trivial)
+  | _ + 5 => exact trivial
+
+/-- **5-block asymmetric diamond CFG equivalence (`cfg_certificate_asymDiamond_sound`)**:
+executing `asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr`
+for `4` steps via `runBlockCfg` produces `.ret out` whenever
+`evalFnValue alg params (.seq pre (.seq (.branch cond (.seq onTrue1 onTrue2) onFalse) post)) retExpr = .ok out`,
+across all three branch modes:
+- concrete `true` (`alg.asBool cv = some true`, 4-step path `0 -> 1 -> 2 -> 4`),
+- concrete `false` (`alg.asBool cv = some false`, 3-step path `0 -> 3 -> 4`), and
+- symbolic (`alg.asBool cv = none`, emitting `.convergedJump 2 (handleFreeOutOpt alg) 4 stJ`
+  at block `0`, consuming `2` delay ticks for the 2-block arm, and returning at
+  block `4`). -/
+theorem cfg_certificate_asymDiamond_sound {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue1 onTrue2 onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (hWfPre : WfPlan alg pre) (hWfTrue1 : WfPlan alg onTrue1)
+    (hWfTrue2 : WfPlan alg onTrue2) (hWfFalse : WfPlan alg onFalse)
+    (hWfPost : WfPlan alg post)
+    (hPre : ∀ s f, evalPlan alg pre s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue1 : ∀ s f, evalPlan alg onTrue1 s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue2 : ∀ s f, evalPlan alg onTrue2 s = .ok f → Exists fun s' => f = .continuing s')
+    (hFalse : ∀ s f, evalPlan alg onFalse s = .ok f → Exists fun s' => f = .continuing s')
+    (hPost : ∀ s f, evalPlan alg post s = .ok f → Exists fun s' => f = .continuing s')
+    (params : List (ParamInput Val)) (st0 : SymState Val) (out : FuncOut Val)
+    (hInit : initFnState alg params = .ok st0)
+    (hEval :
+      evalFnValue alg params
+        (.seq pre (.seq (.branch cond (.seq onTrue1 onTrue2) onFalse) post))
+        retExpr = .ok out) :
+    runBlockCfg
+      (stepBasicBlock alg
+        (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr))
+      0 st0 4 = .ret out := by
+  obtain ⟨st1, cv, hEvPre, hCond, hBranch⟩ :=
+    evalFnValue_seq_branch_seq_ok_inv alg pre cond (.seq onTrue1 onTrue2)
+      onFalse post retExpr hWfPre (wfPlan_seq alg hWfTrue1 hWfTrue2) hWfFalse
+      hWfPost hPre
+      (evalPlan_seq_continuing alg hWfTrue1 hWfTrue2 hTrue1 hTrue2) hFalse
+      hPost params st0 out hInit hEval
+  rcases hBranch with
+    ⟨hBool, stT, stFinal, rv, hEvT, hEvP, hClean, hRet, hFree, rfl⟩ |
+    ⟨hBool, stF, stFinal, rv, hEvF, hEvP, hClean, hRet, hFree, rfl⟩ |
+    ⟨hBool, stT, stF, stJ, stFinal, rv, hEvT, hEvF, hJ, hEvP, hClean, hRet,
+     hFree, rfl⟩
+  · obtain ⟨st2, hEvT1, hEvT2⟩ :=
+      evalPlan_seq_continuing_inv alg hWfTrue1 hWfTrue2 hTrue1 hEvT
+    rw [runBlockCfg_succ,
+        stepBasicBlock_asymDiamondCfg_header_true alg pre cond onTrue1 onTrue2
+          onFalse post retExpr st0 st1 cv hEvPre hCond hBool]
+    dsimp only
+    rw [runBlockCfg_succ,
+        stepBasicBlock_asymDiamondCfg_arm_true1 alg pre cond onTrue1 onTrue2
+          onFalse post retExpr st1 st2 hEvT1]
+    dsimp only
+    rw [runBlockCfg_succ,
+        stepBasicBlock_asymDiamondCfg_arm_true2 alg pre cond onTrue1 onTrue2
+          onFalse post retExpr st2 stT hEvT2]
+    dsimp only
+    rw [runBlockCfg_succ,
+        stepBasicBlock_asymDiamondCfg_join alg pre cond onTrue1 onTrue2 onFalse
+          post retExpr stT stFinal rv hEvP hClean hRet hFree]
+  · rw [runBlockCfg_succ,
+        stepBasicBlock_asymDiamondCfg_header_false alg pre cond onTrue1 onTrue2
+          onFalse post retExpr st0 st1 cv hEvPre hCond hBool]
+    dsimp only
+    rw [runBlockCfg_succ,
+        stepBasicBlock_asymDiamondCfg_arm_false alg pre cond onTrue1 onTrue2
+          onFalse post retExpr st1 stF hEvF]
+    dsimp only
+    rw [runBlockCfg_succ,
+        stepBasicBlock_asymDiamondCfg_join alg pre cond onTrue1 onTrue2 onFalse
+          post retExpr stF stFinal rv hEvP hClean hRet hFree]
+  · obtain ⟨st2, hEvT1, hEvT2⟩ :=
+      evalPlan_seq_continuing_inv alg hWfTrue1 hWfTrue2 hTrue1 hEvT
+    rw [runBlockCfg_succ,
+        stepBasicBlock_asymDiamondCfg_header_symbolic alg pre cond onTrue1
+          onTrue2 onFalse post retExpr st0 st1 st2 stT stF stJ cv hEvPre hCond
+          hBool hEvT1 hEvT2 hEvF hJ]
+    dsimp only
+    rw [runBlockCfgLoop_succ_wait, runBlockCfgLoop_succ_wait]
+    have hStepJoin :
+        runBlockCfgLoop
+          (stepBasicBlock alg
+            (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post
+              retExpr))
+          1 0 4 stJ =
+        .ret ⟨rv, collectRootMutVals stFinal.loans⟩ := by
+      change
+        runBlockCfg
+          (stepBasicBlock alg
+            (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post
+              retExpr))
+          4 stJ 1 =
+        .ret ⟨rv, collectRootMutVals stFinal.loans⟩
+      rw [runBlockCfg_succ,
+          stepBasicBlock_asymDiamondCfg_join alg pre cond onTrue1 onTrue2
+            onFalse post retExpr stJ stFinal rv hEvP hClean hRet hFree]
+    rw [hStepJoin]
+    dsimp only [handleFreeOutOpt]
+    rw [hFree]
+    rfl
+
+/-- **5-block asymmetric diamond `CfgCertificate` constructor
+(`CfgCertificate.asymDiamond`)**: packages `asymDiamondCfgBlocks pre cond
+onTrue1 onTrue2 onFalse post retExpr` at fuel `4` with plan
+`.seq pre (.seq (.branch cond (.seq onTrue1 onTrue2) onFalse) post)` via
+`cfg_certificate_asymDiamond_sound`, supporting both concrete branch conditions
+and symbolic `.convergedJump 2` branch conditions. -/
+def CfgCertificate.asymDiamond {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue1 onTrue2 onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (hWfPre : WfPlan alg pre) (hWfTrue1 : WfPlan alg onTrue1)
+    (hWfTrue2 : WfPlan alg onTrue2) (hWfFalse : WfPlan alg onFalse)
+    (hWfPost : WfPlan alg post)
+    (hPre : ∀ s f, evalPlan alg pre s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue1 : ∀ s f, evalPlan alg onTrue1 s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue2 : ∀ s f, evalPlan alg onTrue2 s = .ok f → Exists fun s' => f = .continuing s')
+    (hFalse : ∀ s f, evalPlan alg onFalse s = .ok f → Exists fun s' => f = .continuing s')
+    (hPost : ∀ s f, evalPlan alg post s = .ok f → Exists fun s' => f = .continuing s') :
+    CfgCertificate alg where
+  blocks := asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr
+  entryBb := 0
+  fuel := 4
+  plan := .seq pre (.seq (.branch cond (.seq onTrue1 onTrue2) onFalse) post)
+  retExpr := retExpr
+  sound :=
+    cfg_certificate_asymDiamond_sound alg pre cond onTrue1 onTrue2 onFalse post
+      retExpr hWfPre hWfTrue1 hWfTrue2 hWfFalse hWfPost hPre hTrue1 hTrue2
+      hFalse hPost
+
+/-- Block invariant of every `asymDiamondCfgBlocks` run from entry state `st0`:
+the header in `st0`, or any state at an arm (`bb = 1, 2, 3`) or at the join
+(`bb = 4`). -/
+def asymDiamondCfgInv {Val : Type} (st0 : SymState Val) (bb : Nat)
+    (st : SymState Val) : Prop :=
+  (bb = 0 ∧ st = st0) ∨ bb = 1 ∨ bb = 2 ∨ bb = 3 ∨ bb = 4
+
+theorem stepBasicBlock_asymDiamondCfg_header_of_eval {Val : Type}
+    (alg : ValAlgebra Val) (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue1 onTrue2 onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (hWfPre : WfPlan alg pre) (hWfTrue1 : WfPlan alg onTrue1)
+    (hWfTrue2 : WfPlan alg onTrue2) (hWfFalse : WfPlan alg onFalse)
+    (hWfPost : WfPlan alg post)
+    (hPre : ∀ s f, evalPlan alg pre s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue1 : ∀ s f, evalPlan alg onTrue1 s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue2 : ∀ s f, evalPlan alg onTrue2 s = .ok f → Exists fun s' => f = .continuing s')
+    (hFalse : ∀ s f, evalPlan alg onFalse s = .ok f → Exists fun s' => f = .continuing s')
+    (params : List (ParamInput Val)) (st0 : SymState Val) (out : FuncOut Val)
+    (hInit : initFnState alg params = .ok st0)
+    (hEval :
+      evalFnValue alg params
+        (.seq pre (.seq (.branch cond (.seq onTrue1 onTrue2) onFalse) post))
+        retExpr = .ok out) :
+    (Exists fun st1 =>
+      stepBasicBlock alg
+        (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr)
+        0 st0 = .jump 1 st1) ∨
+    (Exists fun st1 =>
+      stepBasicBlock alg
+        (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr)
+        0 st0 = .jump 3 st1) ∨
+    (Exists fun stJ =>
+      stepBasicBlock alg
+        (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr)
+        0 st0 =
+        .convergedJump 2 (fun out => handleFreeOutOpt alg out) 4 stJ) := by
+  obtain ⟨st1, cv, hEvPre, hCond, hBranch⟩ :=
+    evalFnValue_seq_branch_seq_header_inv alg pre cond (.seq onTrue1 onTrue2)
+      onFalse post retExpr hWfPre (wfPlan_seq alg hWfTrue1 hWfTrue2) hWfFalse
+      hWfPost hPre
+      (evalPlan_seq_continuing alg hWfTrue1 hWfTrue2 hTrue1 hTrue2) hFalse
+      params st0 out hInit hEval
+  rcases hBranch with hBool | hBool | ⟨hBool, stT, stF, stJ, hEvT, hEvF, hJ⟩
+  · exact Or.inl ⟨st1, stepBasicBlock_asymDiamondCfg_header_true alg pre cond
+      onTrue1 onTrue2 onFalse post retExpr st0 st1 cv hEvPre hCond hBool⟩
+  · exact Or.inr (Or.inl ⟨st1, stepBasicBlock_asymDiamondCfg_header_false alg
+      pre cond onTrue1 onTrue2 onFalse post retExpr st0 st1 cv hEvPre hCond
+      hBool⟩)
+  · obtain ⟨st2, hEvT1, hEvT2⟩ :=
+      evalPlan_seq_continuing_inv alg hWfTrue1 hWfTrue2 hTrue1 hEvT
+    exact Or.inr (Or.inr ⟨stJ, stepBasicBlock_asymDiamondCfg_header_symbolic
+      alg pre cond onTrue1 onTrue2 onFalse post retExpr st0 st1 st2 stT stF stJ
+      cv hEvPre hCond hBool hEvT1 hEvT2 hEvF hJ⟩)
+
+theorem asymDiamondCfgInv_invClosedNoFork {Val : Type} (alg : ValAlgebra Val)
+    (pre : FlowPlan Val) (cond : RvalOp Val)
+    (onTrue1 onTrue2 onFalse post : FlowPlan Val) (retExpr : RvalOp Val)
+    (hWfPre : WfPlan alg pre) (hWfTrue1 : WfPlan alg onTrue1)
+    (hWfTrue2 : WfPlan alg onTrue2) (hWfFalse : WfPlan alg onFalse)
+    (hWfPost : WfPlan alg post)
+    (hPre : ∀ s f, evalPlan alg pre s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue1 : ∀ s f, evalPlan alg onTrue1 s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue2 : ∀ s f, evalPlan alg onTrue2 s = .ok f → Exists fun s' => f = .continuing s')
+    (hFalse : ∀ s f, evalPlan alg onFalse s = .ok f → Exists fun s' => f = .continuing s')
+    (params : List (ParamInput Val)) (st0 : SymState Val) (out : FuncOut Val)
+    (hInit : initFnState alg params = .ok st0)
+    (hEval :
+      evalFnValue alg params
+        (.seq pre (.seq (.branch cond (.seq onTrue1 onTrue2) onFalse) post))
+        retExpr = .ok out) :
+    InvClosedNoFork
+      (stepBasicBlock alg
+        (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr))
+      (asymDiamondCfgInv st0) := by
+  intro bb st hInv
+  rcases hInv with ⟨hBb, hSt⟩ | hBb | hBb | hBb | hBb
+  · subst hBb
+    subst hSt
+    rcases stepBasicBlock_asymDiamondCfg_header_of_eval alg pre cond onTrue1
+        onTrue2 onFalse post retExpr hWfPre hWfTrue1 hWfTrue2 hWfFalse hWfPost
+        hPre hTrue1 hTrue2 hFalse params _ out hInit hEval with
+      ⟨st1, h⟩ | ⟨st1, h⟩ | ⟨stJ, h⟩
+    · rw [h]
+      exact Or.inr (Or.inl rfl)
+    · rw [h]
+      exact Or.inr (Or.inr (Or.inr (Or.inl rfl)))
+    · rw [h]
+      exact Or.inr (Or.inr (Or.inr (Or.inr rfl)))
+  · subst hBb
+    rcases stepBasicBlock_of_goto_term alg _ 1 2 onTrue1 st
+        (listGetOpt_one_asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post
+          retExpr)
+        hTrue1 with h | ⟨_, h⟩
+    · rw [h]; exact trivial
+    · rw [h]; exact Or.inr (Or.inr (Or.inl rfl))
+  · subst hBb
+    rcases stepBasicBlock_of_goto_term alg _ 2 4 onTrue2 st
+        (listGetOpt_two_asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post
+          retExpr)
+        hTrue2 with h | ⟨_, h⟩
+    · rw [h]; exact trivial
+    · rw [h]; exact Or.inr (Or.inr (Or.inr (Or.inr rfl)))
+  · subst hBb
+    rcases stepBasicBlock_of_goto_term alg _ 3 4 onFalse st
+        (listGetOpt_three_asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse
+          post retExpr)
+        hFalse with h | ⟨_, h⟩
+    · rw [h]; exact trivial
+    · rw [h]; exact Or.inr (Or.inr (Or.inr (Or.inr rfl)))
+  · subst hBb
+    rcases stepBasicBlock_of_ret_term alg
+        (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse post retExpr) 4
+        post retExpr st rfl with h | ⟨_, h⟩ <;>
+      (rw [h]; exact trivial)
+
+/-- **End-to-end live `V2026_06_01` MIR adequacy for every 5-block asymmetric
+diamond certified by `CfgCertificate.asymDiamond`
+(`mir_asymDiamond_cfgCertificate_sound`)**: whether the branch condition is
+concrete (`0 → 1 → 2 → 4` or `0 → 3 → 4`) or symbolic (`.convergedJump 2` with
+`handleFreeOutOpt` guard and two delay ticks), `HoldsFnSpec` of the structured
+plan, the wrapper-free per-block `mirCfgBlockRel` obligations, and the entry
+relation give fuel-free `MirWpConverges` of the live body. -/
+theorem mir_asymDiamond_cfgCertificate_sound (tagOf : LoanId → Nat)
+    (body : CapturedMir) (pre : FlowPlan StdVal) (cond : RvalOp StdVal)
+    (onTrue1 onTrue2 onFalse postPlan : FlowPlan StdVal)
+    (retExpr : RvalOp StdVal)
+    (hWfPre : WfPlan stdValAlg pre) (hWfTrue1 : WfPlan stdValAlg onTrue1)
+    (hWfTrue2 : WfPlan stdValAlg onTrue2) (hWfFalse : WfPlan stdValAlg onFalse)
+    (hWfPost : WfPlan stdValAlg postPlan)
+    (hPre : ∀ s f, evalPlan stdValAlg pre s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue1 : ∀ s f, evalPlan stdValAlg onTrue1 s = .ok f → Exists fun s' => f = .continuing s')
+    (hTrue2 : ∀ s f, evalPlan stdValAlg onTrue2 s = .ok f → Exists fun s' => f = .continuing s')
+    (hFalse : ∀ s f, evalPlan stdValAlg onFalse s = .ok f → Exists fun s' => f = .continuing s')
+    (hPost : ∀ s f, evalPlan stdValAlg postPlan s = .ok f → Exists fun s' => f = .continuing s')
+    (params : List (ParamInput StdVal)) (st0 : SymState StdVal)
+    (post : FuncOut StdVal → Prop)
+    (bindingsAt : Nat → List (LoanId × Local × SubPath))
+    (mirBb : Nat → BasicBlockIdx)
+    (extra : Nat → SymState StdVal → MachineState → Prop)
+    (rootAddrs : List (LoanId × Local × SubPath) := [])
+    (hInit : initFnState stdValAlg params = .ok st0)
+    (hSpec :
+      HoldsFnSpec
+        (evalFnValue stdValAlg params
+          (.seq pre (.seq (.branch cond (.seq onTrue1 onTrue2) onFalse) postPlan))
+          retExpr)
+        post)
+    (hZero : ∀ bb st ms,
+      mirCfgBlockRel tagOf bindingsAt mirBb extra bb st ms →
+      match
+        stepBasicBlock stdValAlg
+          (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse postPlan
+            retExpr)
+          bb st
+      with
+      | .jump nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .jumpWrapped _ nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .convergedJump _ _ nextBb st' =>
+        PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+          (mirCfgBlockRel tagOf bindingsAt mirBb extra nextBb st')
+      | .ret v =>
+        PureMirExec.WpConverges (PureMirExec.mirStep body) ms
+          (MirOutcomeRel tagOf rootAddrs v)
+      | .branchJump _ _ _ _ => True
+      | .fault => True)
+    {m0 : MachineState}
+    (hR0 : mirCfgBlockRel tagOf bindingsAt mirBb extra 0 st0 m0) :
+    Anneal.MirFuelFree.MirWpConverges body m0
+      (fun o => LiftedMirPost tagOf post o rootAddrs) := by
+  cases hEval : evalFnValue stdValAlg params
+      (.seq pre (.seq (.branch cond (.seq onTrue1 onTrue2) onFalse) postPlan))
+      retExpr with
+  | fail =>
+    rw [hEval] at hSpec
+    exact absurd hSpec (holdsFnSpec_not_fail post)
+  | ok out =>
+    exact mir_cfgCertificate_sound_of_invClosedNoFork tagOf body
+      (CfgCertificate.asymDiamond stdValAlg pre cond onTrue1 onTrue2 onFalse
+        postPlan retExpr hWfPre hWfTrue1 hWfTrue2 hWfFalse hWfPost hPre hTrue1
+        hTrue2 hFalse hPost)
+      params st0 post bindingsAt mirBb extra rootAddrs hInit hSpec
+      (asymDiamondCfgInv st0)
+      (asymDiamondCfgInv_invClosedNoFork stdValAlg pre cond onTrue1 onTrue2
+        onFalse postPlan retExpr hWfPre hWfTrue1 hWfTrue2 hWfFalse hWfPost hPre
+        hTrue1 hTrue2 hFalse params st0 out hInit hEval)
+      (Or.inl ⟨rfl, rfl⟩)
+      (mirCfg_forwardSim_of_emitsSubIdWraps tagOf body
+        (asymDiamondCfgBlocks pre cond onTrue1 onTrue2 onFalse postPlan retExpr)
+        bindingsAt mirBb extra rootAddrs
+        (asymDiamondCfgBlocks_emitsSubIdWraps stdValAlg pre cond onTrue1 onTrue2
+          onFalse postPlan retExpr hPre hTrue1 hTrue2 hFalse _)
+        hZero)
+      ⟨subIdWrap_some, hR0⟩
 
 /-- A successful `reabsorbFromSpatialInState` found its pinned block free of
 `.uninit` cells: `SpatialPin` never decodes a partially initialized block. -/
@@ -4223,5 +7019,1482 @@ theorem u8U32Padded_freeze_refused {layouts : LayoutTable} {idx : Nat}
   freeze_fail_of_window_not_init (u8U32PaddedMirCodec layouts idx l mem hLookup hSize hFields)
     40 u8U32Embed u8U32Embed? u8U32Embed_embed? alg lid hLoan hPlace
     (fun _ hWin => placeByteWindow?_u8U32Padded_not_init hLookup hSize hFields hWin)
+
+/-! ## 9. Wide-Slice DST Refinement (`stdWideSliceVal`, `UnsizedSliceDstAt`) & Spatial-Pin Framing -/
+
+section WideSliceDstBridge
+
+open Anneal.SepLogicLenses
+open Anneal.MirLiftCore
+
+/-- Symbolic `PureLift` representation of a wide `[T]` or `str` pointer:
+`StdVal.pair (.refVal lid []) (.nat len)` pairing the borrow handle `.refVal lid []`
+(field `0`) with the element length `.nat len` (field `1`). -/
+@[reducible]
+def stdWideSliceVal (lid : LoanId) (len : Nat) : StdVal :=
+  .pair (.refVal lid []) (.nat len)
+
+@[simp]
+theorem stdWideSliceVal_getField_zero (lid : LoanId) (len : Nat) :
+    stdValAlg.getField 0 (stdWideSliceVal lid len) = some (.refVal lid []) := rfl
+
+@[simp]
+theorem stdWideSliceVal_getField_one (lid : LoanId) (len : Nat) :
+    stdValAlg.getField 1 (stdWideSliceVal lid len) = some (.nat len) := rfl
+
+/-- **`StdValRefines.wideSlice`**: `stdWideSliceVal lid wide.2` is refined by the runtime
+wide pointer `WidePtrVal.toValue ptrBytes wide` whenever `wide.1.allocId = tagOf lid`,
+`wide.1.offsetBytes = 0`, and `wide.2 < 256 ^ ptrBytes`. -/
+theorem StdValRefines.wideSlice (tagOf : LoanId → Nat) (lid : LoanId)
+    (ptrBytes : Nat) (wide : WidePtrVal)
+    (hAlloc : wide.1.allocId = tagOf lid) (hOff : wide.1.offsetBytes = 0)
+    (hLen : wide.2 < 256 ^ ptrBytes) :
+    StdValRefines tagOf (stdWideSliceVal lid wide.2) (WidePtrVal.toValue ptrBytes wide) :=
+  .pair (.ref rfl hAlloc hOff) (.nat hLen)
+
+/-- 64-bit specialization (`ptrBytes = 8`) of `StdValRefines.wideSlice`. -/
+theorem StdValRefines.wideSlice8 (tagOf : LoanId → Nat) (lid : LoanId) (wide : WidePtrVal)
+    (hAlloc : wide.1.allocId = tagOf lid) (hOff : wide.1.offsetBytes = 0)
+    (hLen : wide.2 < 256 ^ 8) :
+    StdValRefines tagOf (stdWideSliceVal lid wide.2) (WidePtrVal.toValue 8 wide) :=
+  StdValRefines.wideSlice tagOf lid 8 wide hAlloc hOff hLen
+
+/-- Component-wise refinement of `.1` (`WidePtrVal.dataVal`) and `.2` (`WidePtrVal.metaVal`). -/
+theorem StdValRefines.wideSlice_data_and_meta (tagOf : LoanId → Nat) (lid : LoanId)
+    (ptrBytes : Nat) (wide : WidePtrVal)
+    (hAlloc : wide.1.allocId = tagOf lid) (hOff : wide.1.offsetBytes = 0)
+    (hLen : wide.2 < 256 ^ ptrBytes) :
+    StdValRefines tagOf (.refVal lid []) (WidePtrVal.dataVal ptrBytes wide) ∧
+      StdValRefines tagOf (.nat wide.2) (WidePtrVal.metaVal ptrBytes wide) :=
+  ⟨.ref rfl hAlloc hOff, .nat hLen⟩
+
+/-- **`StdValRefines.wideSlice_inv`**: inversion of `StdValRefines` on `stdWideSliceVal lid len`. -/
+theorem StdValRefines.wideSlice_inv {tagOf : LoanId → Nat} {lid : LoanId} {len : Nat}
+    {mv : Value} (h : StdValRefines tagOf (stdWideSliceVal lid len) mv) :
+    Exists fun p => Exists fun ptrSz => Exists fun metaSz =>
+      mv = .aggregate 0 [.ptr p ptrSz, .scalar ⟨len, metaSz⟩] ∧
+      p.allocId = tagOf lid ∧ p.offsetBytes = 0 ∧ len < 256 ^ metaSz := by
+  obtain ⟨ma, mb, hmv, hRef, hNat⟩ := h.pair_inv (a := .refVal lid []) (b := .nat len) rfl
+  obtain ⟨_, p, ptrSz, hma, hAlloc, hOff⟩ := hRef.ref_inv (lid := lid) (path := []) rfl
+  obtain ⟨metaSz, hmb, hLt⟩ := hNat.nat_inv (n := len) rfl
+  subst hmv hma hmb
+  exact ⟨p, ptrSz, metaSz, rfl, hAlloc, hOff, hLt⟩
+
+/-- **`StdValRefines.wideSlice_toValue_inv`**: inversion of `StdValRefines` on
+`WidePtrVal.toValue ptrBytes wide`. -/
+theorem StdValRefines.wideSlice_toValue_inv {tagOf : LoanId → Nat} {lid : LoanId}
+    {len ptrBytes : Nat} {wide : WidePtrVal}
+    (h : StdValRefines tagOf (stdWideSliceVal lid len) (WidePtrVal.toValue ptrBytes wide)) :
+    wide.1.allocId = tagOf lid ∧ wide.1.offsetBytes = 0 ∧ wide.2 = len ∧ len < 256 ^ ptrBytes := by
+  obtain ⟨p, ptrSz, metaSz, hEq, hAlloc, hOff, hLt⟩ := h.wideSlice_inv
+  simp only [WidePtrVal.toValue, Value.aggregate.injEq, List.cons.injEq, Value.ptr.injEq,
+    Value.scalar.injEq, ScalarInt.mk.injEq, and_true] at hEq
+  obtain ⟨_, ⟨hp, _⟩, ⟨hLenEq, hMetaSz⟩⟩ := hEq
+  rw [hp, hAlloc, hOff, hLenEq, hMetaSz]
+  exact ⟨rfl, rfl, rfl, hLt⟩
+
+/-- **`StdValRefines.of_unsizedSliceDstAt`**: an `UnsizedSliceDstAt` view whose pointer tag is
+`tagOf lid` at byte offset `0` refines `stdWideSliceVal lid elems.length`. -/
+theorem StdValRefines.of_unsizedSliceDstAt {α : Type} {n : Nat} {c : ByteLensCodec α n}
+    (tagOf : LoanId → Nat) (lid : LoanId) {ptrBytes : Nat} {dstTy : RigidTy}
+    {mem : Memory} {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
+    (hDst : UnsizedSliceDstAt c ptrBytes dstTy mem wide fatVal elems bytes)
+    (hAlloc : wide.1.allocId = tagOf lid) (hOff : wide.1.offsetBytes = 0)
+    (hLen : elems.length < 256 ^ ptrBytes) :
+    StdValRefines tagOf (stdWideSliceVal lid elems.length) fatVal := by
+  rw [hDst.fat_eq, hDst.length_eq]
+  exact StdValRefines.wideSlice tagOf lid ptrBytes wide hAlloc hOff
+    (by rw [← hDst.length_eq]; exact hLen)
+
+/-- **`StdValRefines.wideSlice_ptrMetadata_refines`**: evaluating
+`Rvalue.unaryOp .ptrMetadata` on an `UnsizedSliceDstAt` view `fatVal` with
+`elems.length < 256 ^ (layoutPointerBytes layouts)` produces
+`.scalar ⟨elems.length, layoutPointerBytes layouts⟩` refining `.nat elems.length`. -/
+theorem StdValRefines.wideSlice_ptrMetadata_refines {α : Type} {n : Nat} {c : ByteLensCodec α n}
+    (tagOf : LoanId → Nat) {dstTy : RigidTy} {mem : Memory}
+    {wide : WidePtrVal} {fatVal : Value} {elems : List α} {bytes : ByteMem}
+    (locals locals' : List LocalSlot) (op : Operand) (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (hDst : UnsizedSliceDstAt c (layoutPointerBytes layouts) dstTy mem wide fatVal elems bytes)
+    (hLen : elems.length < 256 ^ (layoutPointerBytes layouts))
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok fatVal locals') :
+    evalRvalue locals (.unaryOp .ptrMetadata op) mem localDecls layouts =
+        .ok (.scalar ⟨elems.length, layoutPointerBytes layouts⟩) locals' mem ∧
+      StdValRefines tagOf (.nat elems.length)
+        (.scalar ⟨elems.length, layoutPointerBytes layouts⟩) :=
+  ⟨(hDst.evalRvalue_ptrMetadata locals locals' op localDecls layouts hOp).1, .nat hLen⟩
+
+/-- **`StdValRefines.wideSlice_from_raw_parts_roundtrip`**: projecting `.field 0`
+and `.field 1` from a decomposed 2-field `(data, meta)` aggregate local `loc`
+holding `fatVal` and reassembling via `AggregateKind.rawPtr` preserves both
+`StdValRefines tagOf (stdWideSliceVal lid elems.length)` and `UnsizedSliceDstAt`.
+(Rustc lowers `<*const [T]>::to_raw_parts` to `CastKind.ptrToPtr` +
+`UnOp.ptrMetadata`; see `mirStep_assign_cast_ptrToPtr_wide_to_thin_preserves_spatialPin`.) -/
+theorem StdValRefines.wideSlice_from_raw_parts_roundtrip {α : Type} {n : Nat}
+    {c : ByteLensCodec α n} (tagOf : LoanId → Nat) (lid : LoanId)
+    {dstTy : RigidTy} {mem : Memory} {wide : WidePtrVal} {fatVal : Value}
+    {elems : List α} {bytes : ByteMem}
+    (locals : List LocalSlot) (loc : Local) (lIdx : LayoutIdx) (dataTy metaTy : Ty)
+    (mutability : Mutability) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hDst : UnsizedSliceDstAt c (layoutPointerBytes layouts) dstTy mem wide fatVal elems bytes)
+    (hRef : StdValRefines tagOf (stdWideSliceVal lid elems.length) fatVal)
+    (hSlot : Trusted.Sequence.get? locals loc = some (.init fatVal))
+    (hNoUnion0 : placeTouchesUnion localDecls layouts
+      { local_ := loc, projection := [.field 0 dataTy] } = false)
+    (hNoUnion1 : placeTouchesUnion localDecls layouts
+      { local_ := loc, projection := [.field 1 metaTy] } = false) :
+    evalRvalue locals
+        (.aggregate (.rawPtr { kind := dstTy, layoutIdx := lIdx } mutability)
+          [.copy { local_ := loc, projection := [.field 0 dataTy] },
+           .copy { local_ := loc, projection := [.field 1 metaTy] }])
+        mem localDecls layouts = .ok fatVal locals mem ∧
+      StdValRefines tagOf (stdWideSliceVal lid elems.length) fatVal ∧
+      UnsizedSliceDstAt c (layoutPointerBytes layouts) dstTy mem wide fatVal elems bytes := by
+  obtain ⟨hEv, hDst'⟩ := hDst.evalRvalue_aggregate_rawPtr_roundtrip locals loc lIdx dataTy metaTy
+    mutability localDecls layouts hSlot hNoUnion0 hNoUnion1
+  exact ⟨hEv, hRef, hDst'⟩
+
+/-! ### Spatial-Pin & Loan-Binding Preservation Across Live Metadata & Layout Queries -/
+
+/-- `findBorrowEntry?` is preserved across `invalidateConflictingBorrows` for any entry whose
+`targetLocal ≠ dstLoc`. -/
+theorem findBorrowEntry?_invalidateConflictingBorrows_of_ne {borrows : List BorrowEntry}
+    {tag : Nat} {e : BorrowEntry} {dstLoc : Local}
+    (writerTag : Option Nat) (targetFrameDepth : Nat)
+    (hFind : findBorrowEntry? tag borrows = some e) (hNe : e.targetLocal ≠ dstLoc) :
+    findBorrowEntry? tag (invalidateConflictingBorrows borrows dstLoc writerTag targetFrameDepth) =
+      some e := by
+  rw [findBorrowEntry?_eq_lookupBorrow] at hFind ⊢
+  exact lookupBorrow_invalidateConflictingBorrows_of_ne writerTag targetFrameDepth hFind hNe
+
+/-- `findBorrowEntry?` is preserved across `invalidateDirectDestWriteBorrows` on
+`{ local_ := dstLoc, projection := [] }` for any entry whose `targetLocal ≠ dstLoc`. -/
+theorem findBorrowEntry?_invalidateDirectDestWriteBorrows_of_ne (mem : Memory)
+    (locals : List LocalSlot) {tag : Nat} {e : BorrowEntry} {dstLoc : Local}
+    (hFind : findBorrowEntry? tag mem.borrows = some e) (hNe : e.targetLocal ≠ dstLoc) :
+    findBorrowEntry? tag
+      (invalidateDirectDestWriteBorrows mem locals { local_ := dstLoc, projection := [] }).borrows =
+      some e := by
+  rw [findBorrowEntry?_eq_lookupBorrow] at hFind ⊢
+  exact lookupBorrow_invalidateDirectDestWriteBorrows_of_ne mem locals hFind hNe
+
+/-- `BorrowAt` at local `l` is preserved across `invalidateConflictingBorrows` on `dstLoc ≠ l`. -/
+theorem BorrowAt.of_invalidateConflictingBorrows_ne {ms : MachineState} {tag : Nat}
+    {l dstLoc : Local} {path : SubPath} {ok : TreeBorrowPerm → Bool}
+    (frame' : StackFrame) (mem' : Memory) (writerTag : Option Nat) (targetFrameDepth : Nat)
+    (h : BorrowAt ms tag l path ok) (hNe : l ≠ dstLoc)
+    (hBorrows : mem'.borrows =
+      invalidateConflictingBorrows ms.memory.borrows dstLoc writerTag targetFrameDepth) :
+    BorrowAt { frame := frame', memory := mem' } tag l path ok := by
+  obtain ⟨e, hFind, hTarget, hPath, hOk⟩ := h
+  have hNeE : e.targetLocal ≠ dstLoc := by rw [hTarget]; exact hNe
+  refine ⟨e, ?_, hTarget, hPath, hOk⟩
+  dsimp only
+  rw [hBorrows]
+  exact findBorrowEntry?_invalidateConflictingBorrows_of_ne writerTag targetFrameDepth hFind hNeE
+
+/-- `BorrowAt` at local `l` is preserved across `invalidateDirectDestWriteBorrows` on
+`{ local_ := dstLoc, projection := [] }` when `l ≠ dstLoc`. -/
+theorem BorrowAt.of_invalidateDirectDestWriteBorrows_ne {ms : MachineState} {tag : Nat}
+    {l dstLoc : Local} {path : SubPath} {ok : TreeBorrowPerm → Bool}
+    (frame' : StackFrame) (locals' : List LocalSlot)
+    (h : BorrowAt ms tag l path ok) (hNe : l ≠ dstLoc) :
+    BorrowAt
+      { frame := frame'
+        memory :=
+          invalidateDirectDestWriteBorrows ms.memory locals' { local_ := dstLoc, projection := [] } }
+      tag l path ok := by
+  obtain ⟨e, hFind, hTarget, hPath, hOk⟩ := h
+  have hNeE : e.targetLocal ≠ dstLoc := by rw [hTarget]; exact hNe
+  exact ⟨e, findBorrowEntry?_invalidateDirectDestWriteBorrows_of_ne ms.memory locals' hFind hNeE,
+    hTarget, hPath, hOk⟩
+
+private theorem ite_some_none_eq_some {α : Type} {c : Prop} [inst : Decidable c] {x y : α}
+    (h : @ite _ c inst (some x) none = some y) : x = y := by
+  cases inst with
+  | isFalse _ => cases h
+  | isTrue _ => injection h
+
+private theorem getElem?_eq_of_set?_ne {α : Type} :
+    ∀ {xs ys : List α} {dstLoc l : Nat} {v : α},
+      Trusted.Sequence.set? xs dstLoc v = some ys → l ≠ dstLoc → ys[l]? = xs[l]?
+  | xs, ys, dstLoc, l, v, hSet, hNe => by
+    have hYs : xs.set dstLoc v = ys := ite_some_none_eq_some hSet
+    rw [← hYs]
+    exact List.getElem?_set_ne hNe.symm
+
+/-- Updating `dstLoc` via `set?` leaves `lookupLocalSlot?` at every other local `l ≠ dstLoc`
+unchanged whenever `callerLocals` is preserved. -/
+theorem lookupLocalSlot?_of_set?_ne {ms ms' : MachineState} {locals₁ : List LocalSlot}
+    {dstLoc l : Local} {slot : LocalSlot}
+    (hLocs1 : locals₁[l]? = ms.frame.locals[l]?)
+    (hSet : Trusted.Sequence.set? locals₁ dstLoc slot = some ms'.frame.locals)
+    (hCaller : ms'.memory.callerLocals = ms.memory.callerLocals)
+    (hNe : l ≠ dstLoc) :
+    lookupLocalSlot? ms' l = lookupLocalSlot? ms l := by
+  unfold lookupLocalSlot?
+  rw [getElem?_eq_of_set?_ne hSet hNe, hLocs1, hCaller]
+
+/-- `placeValue?` is preserved when `lookupLocalSlot?` is preserved. -/
+theorem placeValue?_of_lookupLocalSlot?_eq {ms ms' : MachineState} {l : Local} (path : SubPath)
+    (hSlot : lookupLocalSlot? ms' l = lookupLocalSlot? ms l) :
+    placeValue? ms' l path = placeValue? ms l path := by
+  unfold placeValue?
+  rw [hSlot]
+
+/-- `placeByteWindow?` is preserved when `lookupLocalSlot?` is preserved. -/
+theorem placeByteWindow?_of_lookupLocalSlot?_eq (layouts : LayoutTable) (ty : Ty)
+    {ms ms' : MachineState} {l : Local} (path : SubPath)
+    (hSlot : lookupLocalSlot? ms' l = lookupLocalSlot? ms l) :
+    placeByteWindow? layouts ty ms' l path = placeByteWindow? layouts ty ms l path := by
+  unfold placeByteWindow?
+  rw [hSlot]
+
+/-- `ownSubPlace` of `mirSpatialModel` at `(l, path)` is preserved across any write to a
+disjoint local `dstLoc ≠ l` that updates borrows via `invalidateConflictingBorrows`. -/
+theorem mirSpatialModel_ownSubPlace_of_invalidateConflictingBorrows_ne (tagOf : LoanId → Nat)
+    {ms ms' : MachineState} {l dstLoc : Local} {path : SubPath} {owner : LoanId}
+    {perm : PermTree} {v : StdVal} (writerTag : Option Nat) (targetFrameDepth : Nat)
+    (hNe : l ≠ dstLoc)
+    (hPlace : placeValue? ms' l path = placeValue? ms l path)
+    (hBorrows : ms'.memory.borrows =
+      invalidateConflictingBorrows ms.memory.borrows dstLoc writerTag targetFrameDepth)
+    (h : (mirSpatialModel tagOf).ownSubPlace ms l path owner perm v) :
+    (mirSpatialModel tagOf).ownSubPlace ms' l path owner perm v := by
+  have hAt : ∀ tag ok, BorrowAt ms tag l path ok → BorrowAt ms' tag l path ok := by
+    intro tag ok hB
+    rcases ms' with ⟨f', m'⟩
+    exact hB.of_invalidateConflictingBorrows_ne f' m' writerTag targetFrameDepth hNe hBorrows
+  obtain ⟨hVal, hPerm⟩ := h
+  refine ⟨by rw [hPlace]; exact hVal, ?_⟩
+  cases hG : getPathPerm [] perm with
+  | unborrowed =>
+    rw [hG] at hPerm
+    exact hAt _ _ hPerm
+  | mutLocked lid =>
+    rw [hG] at hPerm
+    exact hAt _ _ hPerm
+  | mutJoined mLids sLids =>
+    rw [hG] at hPerm
+    rcases hPerm with ⟨lid, hEl, hB⟩ | ⟨lid, hEl, hB⟩
+    · exact Or.inl ⟨lid, hEl, hAt _ _ hB⟩
+    · exact Or.inr ⟨lid, hEl, hAt _ _ hB⟩
+  | shared lids =>
+    rw [hG] at hPerm
+    exact fun lid hEl => hAt _ _ (hPerm lid hEl)
+  | split _ =>
+    rw [hG] at hPerm
+    exact hAt _ _ hPerm
+
+/-- `ownSubPlace` of `mirSpatialModel` at `(l, path)` is preserved across any write to a
+disjoint local `dstLoc ≠ l` that updates memory via `invalidateDirectDestWriteBorrows`. -/
+theorem mirSpatialModel_ownSubPlace_of_invalidateDirectDestWriteBorrows_ne (tagOf : LoanId → Nat)
+    {ms ms' : MachineState} {locals' : List LocalSlot} {l dstLoc : Local} {path : SubPath}
+    {owner : LoanId} {perm : PermTree} {v : StdVal}
+    (hNe : l ≠ dstLoc)
+    (hPlace : placeValue? ms' l path = placeValue? ms l path)
+    (hMem : ms'.memory =
+      invalidateDirectDestWriteBorrows ms.memory locals' { local_ := dstLoc, projection := [] })
+    (h : (mirSpatialModel tagOf).ownSubPlace ms l path owner perm v) :
+    (mirSpatialModel tagOf).ownSubPlace ms' l path owner perm v := by
+  have hAt : ∀ tag ok, BorrowAt ms tag l path ok → BorrowAt ms' tag l path ok := by
+    intro tag ok hB
+    rcases ms' with ⟨f', m'⟩
+    dsimp only at hMem
+    subst hMem
+    exact hB.of_invalidateDirectDestWriteBorrows_ne f' locals' hNe
+  obtain ⟨hVal, hPerm⟩ := h
+  refine ⟨by rw [hPlace]; exact hVal, ?_⟩
+  cases hG : getPathPerm [] perm with
+  | unborrowed =>
+    rw [hG] at hPerm
+    exact hAt _ _ hPerm
+  | mutLocked lid =>
+    rw [hG] at hPerm
+    exact hAt _ _ hPerm
+  | mutJoined mLids sLids =>
+    rw [hG] at hPerm
+    rcases hPerm with ⟨lid, hEl, hB⟩ | ⟨lid, hEl, hB⟩
+    · exact Or.inl ⟨lid, hEl, hAt _ _ hB⟩
+    · exact Or.inr ⟨lid, hEl, hAt _ _ hB⟩
+  | shared lids =>
+    rw [hG] at hPerm
+    exact fun lid hEl => hAt _ _ (hPerm lid hEl)
+  | split _ =>
+    rw [hG] at hPerm
+    exact hAt _ _ hPerm
+
+/-- **`spatialPinnedBlockHolds_of_invalidateConflictingBorrows_ne`**: `spatialPinnedBlockHolds`
+at `(l, path)` is preserved across any statement writing to a disjoint local `dstLoc ≠ l`
+without unpinning the spatial borrow. -/
+theorem spatialPinnedBlockHolds_of_invalidateConflictingBorrows_ne
+    {tagOf : LoanId → Nat} {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath} {st st' : SymState StdVal} {ms ms' : MachineState}
+    (writerTag : Option Nat) (targetFrameDepth : Nat)
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hLoans : findLoan lid st'.loans = findLoan lid st.loans)
+    (hSpatial : st'.spatial = st.spatial)
+    (hNe : l ≠ dstLoc)
+    (hSlot : lookupLocalSlot? ms' l = lookupLocalSlot? ms l)
+    (hBorrows : ms'.memory.borrows =
+      invalidateConflictingBorrows ms.memory.borrows dstLoc writerTag targetFrameDepth) :
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st' ms' := by
+  obtain ⟨e, blk, rest, bs, hFind, hPhase, hBlk, hOrig, hPerm, hTag, hSplits, hBytes, hWin,
+    hBorrow⟩ := hPin
+  rcases ms' with ⟨f', m'⟩
+  refine ⟨e, blk, rest, bs, by rw [hLoans]; exact hFind, hPhase,
+    by rw [hSpatial]; exact hBlk, hOrig, hPerm, hTag, hSplits, hBytes,
+    by rw [placeByteWindow?_of_lookupLocalSlot?_eq layouts ty path hSlot]; exact hWin,
+    hBorrow.of_invalidateConflictingBorrows_ne f' m' writerTag targetFrameDepth hNe hBorrows⟩
+
+/-- **`spatialPinnedBlockHolds_of_invalidateDirectDestWriteBorrows_ne`**: `spatialPinnedBlockHolds`
+at `(l, path)` is preserved across any intrinsic call writing its return value to a disjoint
+local `dstLoc ≠ l` without unpinning the spatial borrow. -/
+theorem spatialPinnedBlockHolds_of_invalidateDirectDestWriteBorrows_ne
+    {tagOf : LoanId → Nat} {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath} {st st' : SymState StdVal} {ms ms' : MachineState}
+    (locals' : List LocalSlot)
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hLoans : findLoan lid st'.loans = findLoan lid st.loans)
+    (hSpatial : st'.spatial = st.spatial)
+    (hNe : l ≠ dstLoc)
+    (hSlot : lookupLocalSlot? ms' l = lookupLocalSlot? ms l)
+    (hMem : ms'.memory =
+      invalidateDirectDestWriteBorrows ms.memory locals' { local_ := dstLoc, projection := [] }) :
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st' ms' := by
+  obtain ⟨e, blk, rest, bs, hFind, hPhase, hBlk, hOrig, hPerm, hTag, hSplits, hBytes, hWin,
+    hBorrow⟩ := hPin
+  rcases ms' with ⟨f', m'⟩
+  have hWin' : placeByteWindow? layouts ty { frame := f', memory := m' } l path = some bs := by
+    rw [placeByteWindow?_of_lookupLocalSlot?_eq layouts ty path hSlot]
+    exact hWin
+  dsimp only at hMem
+  subst hMem
+  exact ⟨e, blk, rest, bs, by rw [hLoans]; exact hFind, hPhase,
+    by rw [hSpatial]; exact hBlk, hOrig, hPerm, hTag, hSplits, hBytes, hWin',
+    hBorrow.of_invalidateDirectDestWriteBorrows_ne f' locals' hNe⟩
+
+/-- **`spatialBindingsHold_of_invalidateConflictingBorrows_ne`**: `spatialBindingsHold` is
+preserved across any statement writing to a local `dstLoc` disjoint from all bound places
+(`∀ b ∈ bindings, b.2.1 ≠ dstLoc`). -/
+theorem spatialBindingsHold_of_invalidateConflictingBorrows_ne (tagOf : LoanId → Nat)
+    {st st' : SymState StdVal} {ms ms' : MachineState} {dstLoc : Local}
+    (writerTag : Option Nat) (targetFrameDepth : Nat)
+    (hBorrows : ms'.memory.borrows =
+      invalidateConflictingBorrows ms.memory.borrows dstLoc writerTag targetFrameDepth) :
+    ∀ bindings : List (LoanId × Local × SubPath),
+      (∀ b, b ∈ bindings → findLoan b.1 st'.loans = findLoan b.1 st.loans) →
+      (∀ b, b ∈ bindings → b.2.1 ≠ dstLoc) →
+      (∀ b, b ∈ bindings → placeValue? ms' b.2.1 b.2.2 = placeValue? ms b.2.1 b.2.2) →
+      spatialBindingsHold (mirSpatialModel tagOf) bindings st ms →
+      spatialBindingsHold (mirSpatialModel tagOf) bindings st' ms'
+  | [], _, _, _, h => h
+  | (lid, l, path) :: bs, hL, hNe, hP, h => by
+    obtain ⟨hDisj, hFold⟩ := h
+    have hDisjTail : spatialBindingsDisjoint (mirSpatialModel tagOf) bs := by
+      have h' := hDisj
+      unfold spatialBindingsDisjoint at h'
+      rw [listFold_cons] at h'
+      exact h'.2
+    rw [listFold_cons] at hFold
+    obtain ⟨hHead, hTail⟩ := hFold
+    have ih := spatialBindingsHold_of_invalidateConflictingBorrows_ne tagOf writerTag
+      targetFrameDepth hBorrows bs
+      (fun b hb => hL b (List.mem_cons_of_mem _ hb))
+      (fun b hb => hNe b (List.mem_cons_of_mem _ hb))
+      (fun b hb => hP b (List.mem_cons_of_mem _ hb))
+      ⟨hDisjTail, hTail⟩
+    refine ⟨hDisj, ?_⟩
+    rw [listFold_cons]
+    refine ⟨?_, ih.2⟩
+    have hLid : findLoan lid st'.loans = findLoan lid st.loans :=
+      hL (lid, l, path) (List.mem_cons_self ..)
+    have hNeHead : l ≠ dstLoc :=
+      hNe (lid, l, path) (List.mem_cons_self ..)
+    have hPl : placeValue? ms' l path = placeValue? ms l path :=
+      hP (lid, l, path) (List.mem_cons_self ..)
+    rw [hLid]
+    cases hF : findLoan lid st.loans with
+    | none => rw [hF] at hHead; exact hHead
+    | some e =>
+      rw [hF] at hHead
+      exact ⟨hHead.1,
+        mirSpatialModel_ownSubPlace_of_invalidateConflictingBorrows_ne tagOf writerTag
+          targetFrameDepth hNeHead hPl hBorrows hHead.2⟩
+
+/-- **`spatialBindingsHold_of_invalidateDirectDestWriteBorrows_ne`**: `spatialBindingsHold` is
+preserved across any intrinsic call writing to a local `dstLoc` disjoint from all bound places
+(`∀ b ∈ bindings, b.2.1 ≠ dstLoc`). -/
+theorem spatialBindingsHold_of_invalidateDirectDestWriteBorrows_ne (tagOf : LoanId → Nat)
+    {st st' : SymState StdVal} {ms ms' : MachineState} (locals' : List LocalSlot)
+    {dstLoc : Local}
+    (hMem : ms'.memory =
+      invalidateDirectDestWriteBorrows ms.memory locals' { local_ := dstLoc, projection := [] }) :
+    ∀ bindings : List (LoanId × Local × SubPath),
+      (∀ b, b ∈ bindings → findLoan b.1 st'.loans = findLoan b.1 st.loans) →
+      (∀ b, b ∈ bindings → b.2.1 ≠ dstLoc) →
+      (∀ b, b ∈ bindings → placeValue? ms' b.2.1 b.2.2 = placeValue? ms b.2.1 b.2.2) →
+      spatialBindingsHold (mirSpatialModel tagOf) bindings st ms →
+      spatialBindingsHold (mirSpatialModel tagOf) bindings st' ms'
+  | [], _, _, _, h => h
+  | (lid, l, path) :: bs, hL, hNe, hP, h => by
+    obtain ⟨hDisj, hFold⟩ := h
+    have hDisjTail : spatialBindingsDisjoint (mirSpatialModel tagOf) bs := by
+      have h' := hDisj
+      unfold spatialBindingsDisjoint at h'
+      rw [listFold_cons] at h'
+      exact h'.2
+    rw [listFold_cons] at hFold
+    obtain ⟨hHead, hTail⟩ := hFold
+    have ih := spatialBindingsHold_of_invalidateDirectDestWriteBorrows_ne tagOf locals' hMem bs
+      (fun b hb => hL b (List.mem_cons_of_mem _ hb))
+      (fun b hb => hNe b (List.mem_cons_of_mem _ hb))
+      (fun b hb => hP b (List.mem_cons_of_mem _ hb))
+      ⟨hDisjTail, hTail⟩
+    refine ⟨hDisj, ?_⟩
+    rw [listFold_cons]
+    refine ⟨?_, ih.2⟩
+    have hLid : findLoan lid st'.loans = findLoan lid st.loans :=
+      hL (lid, l, path) (List.mem_cons_self ..)
+    have hNeHead : l ≠ dstLoc :=
+      hNe (lid, l, path) (List.mem_cons_self ..)
+    have hPl : placeValue? ms' l path = placeValue? ms l path :=
+      hP (lid, l, path) (List.mem_cons_self ..)
+    rw [hLid]
+    cases hF : findLoan lid st.loans with
+    | none => rw [hF] at hHead; exact hHead
+    | some e =>
+      rw [hF] at hHead
+      exact ⟨hHead.1,
+        mirSpatialModel_ownSubPlace_of_invalidateDirectDestWriteBorrows_ne tagOf hNeHead
+          hPl hMem hHead.2⟩
+
+/-- **`spatialPin_and_bindings_of_assign_write`**: generic frame rule for any statement that writes
+only the unprojected local `dstLoc`: after operand evaluation `ms.frame.locals ↦ locals₁` that
+leaves the pinned and bound locals' slots unchanged (`copy` operands, or `move` out of other
+locals), a `set?` of `dstLoc`, preserved `callerLocals`, and `invalidateConflictingBorrows` at
+`dstLoc`, both `spatialPinnedBlockHolds` and `spatialBindingsHold` survive without unpinning. -/
+theorem spatialPin_and_bindings_of_assign_write (tagOf : LoanId → Nat) {layouts : LayoutTable}
+    {ty : Ty} {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath} {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {ms ms' : MachineState} {locals₁ : List LocalSlot} {v : LocalSlot}
+    (writerTag : Option Nat) (targetFrameDepth : Nat)
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc) (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hPinLoc : locals₁[l]? = ms.frame.locals[l]?)
+    (hBindLoc : ∀ b, b ∈ bindings → locals₁[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hSet : Trusted.Sequence.set? locals₁ dstLoc v = some ms'.frame.locals)
+    (hCaller : ms'.memory.callerLocals = ms.memory.callerLocals)
+    (hBorrows : ms'.memory.borrows =
+      invalidateConflictingBorrows ms.memory.borrows dstLoc writerTag targetFrameDepth) :
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+      spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' :=
+  ⟨spatialPinnedBlockHolds_of_invalidateConflictingBorrows_ne writerTag targetFrameDepth hPin rfl
+      rfl hNePin (lookupLocalSlot?_of_set?_ne hPinLoc hSet hCaller hNePin) hBorrows,
+    spatialBindingsHold_of_invalidateConflictingBorrows_ne tagOf writerTag targetFrameDepth
+      hBorrows bindings (fun _ _ => rfl) hNeBind
+      (fun b hb => placeValue?_of_lookupLocalSlot?_eq b.2.2
+        (lookupLocalSlot?_of_set?_ne (hBindLoc b hb) hSet hCaller (hNeBind b hb)))
+      hBind⟩
+
+/-- **`spatialPin_and_bindings_of_intrinsic_write`**: generic frame rule for an intrinsic call
+whose return value is written to `{ local_ := dstLoc, projection := [] }`
+(`writeIntrinsicReturn`, memory `invalidateDirectDestWriteBorrows`), after argument evaluation
+`ms.frame.locals ↦ locals'` that leaves the pinned and bound locals' slots unchanged (`copy`
+arguments, or `move` out of other locals): `spatialPinnedBlockHolds` and `spatialBindingsHold`
+survive without unpinning. -/
+theorem spatialPin_and_bindings_of_intrinsic_write (tagOf : LoanId → Nat) {layouts : LayoutTable}
+    {ty : Ty} {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath} {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {ms ms' : MachineState} {locals' : List LocalSlot} {v : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc) (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hPinLoc : locals'[l]? = ms.frame.locals[l]?)
+    (hBindLoc : ∀ b, b ∈ bindings → locals'[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hSet : Trusted.Sequence.set? locals' dstLoc v = some ms'.frame.locals)
+    (hMem : ms'.memory =
+      invalidateDirectDestWriteBorrows ms.memory locals' { local_ := dstLoc, projection := [] }) :
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+      spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' := by
+  have hCaller : ms'.memory.callerLocals = ms.memory.callerLocals := by
+    rw [hMem, invalidateDirectDestWriteBorrows_callerLocals]
+  exact ⟨spatialPinnedBlockHolds_of_invalidateDirectDestWriteBorrows_ne locals' hPin rfl rfl
+      hNePin (lookupLocalSlot?_of_set?_ne hPinLoc hSet hCaller hNePin) hMem,
+    spatialBindingsHold_of_invalidateDirectDestWriteBorrows_ne tagOf locals' hMem bindings
+      (fun _ _ => rfl) hNeBind
+      (fun b hb => placeValue?_of_lookupLocalSlot?_eq b.2.2
+        (lookupLocalSlot?_of_set?_ne (hBindLoc b hb) hSet hCaller (hNeBind b hb)))
+      hBind⟩
+
+/-- **`mirStep_assign_ptrMetadata_preserves_spatialPin`**: executing `dstLoc = PtrMetadata(op)`
+on any pointer whose metadata is characterized by `PtrMetadataOf` (wide `[T]` / `str` pointers
+yielding `.scalar ⟨len, ptrBytes⟩`, thin pointers yielding `.unit`) into a local `dstLoc`
+disjoint from `l` and `bindings` steps `PureMirExec.mirStep` and preserves
+`spatialPinnedBlockHolds` and `spatialBindingsHold` without unpinning, for `copy` or `move`
+operands that leave the pinned and bound locals untouched and under the trusted protector side
+condition; the final conjunct transports fuel-free `MirWpConverges` across the step (as for every
+`*_preserves_spatialPin` lemma below). -/
+theorem mirStep_assign_ptrMetadata_preserves_spatialPin
+    (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath}
+    {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {body cur : CapturedMir} {ms : MachineState}
+    {blk : BasicBlockData} {op : Operand} {span : String}
+    {ptrVal metaVal : Value} {locals₁ locals₂ : List LocalSlot} {slot : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc)
+    (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hCur : ms.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : Trusted.Sequence.get? cur.basicBlocks ms.frame.blockIdx = some blk)
+    (hStmt : Trusted.Sequence.get? blk.statements ms.frame.stmtIdx =
+      some { kind := .assign { local_ := dstLoc, projection := [] } (.unaryOp .ptrMetadata op),
+             span := span })
+    (hMeta : PtrMetadataOf (layoutPointerBytes cur.layouts) ptrVal metaVal)
+    (hOp : evalOperand ms.frame.locals op ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack = .ok ptrVal locals₁)
+    (hPinLoc : locals₁[l]? = ms.frame.locals[l]?)
+    (hBindLoc : ∀ b, b ∈ bindings → locals₁[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hProt : hasProtectedWriteConflict ms.memory.borrows ms.memory.activeProtectors dstLoc .none
+      .nil 0 0 (Trusted.Sequence.length ms.memory.callStack) = false)
+    (hSlot : Trusted.Sequence.get? locals₁ dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : Trusted.Sequence.set? locals₁ dstLoc (.init metaVal) = some locals₂) :
+    let ms' : MachineState :=
+      { frame := { blockIdx := ms.frame.blockIdx, stmtIdx := ms.frame.stmtIdx + 1, locals := locals₂ }
+        memory := { ms.memory with
+          borrows := invalidateConflictingBorrows ms.memory.borrows dstLoc .none
+            (Trusted.Sequence.length ms.memory.callStack) } }
+    PureMirExec.mirStep body ms = .cont ms' ∧
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
+  intro ms'
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_assign_local hCur hPhase hBb hStmt
+    (hMeta.evalRvalue_ptrMetadata hOp) hProt hSlot hLive hSet
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_assign_write tagOf (ms' := ms') .none
+    (Trusted.Sequence.length ms.memory.callStack) hPin hBind hNePin hNeBind hPinLoc hBindLoc hSet
+    rfl rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
+
+/-- **`mirStep_assign_aggregate_rawPtr_preserves_spatialPin`**: executing
+`dstLoc = AggregateKind.rawPtr pointeeTy mutability [dataOp, metaOp]` (`ptr::from_raw_parts`)
+into a local `dstLoc` disjoint from `l` and `bindings` steps `PureMirExec.mirStep` and preserves
+`spatialPinnedBlockHolds` and `spatialBindingsHold` without unpinning, for `copy` or `move`
+operands that leave the pinned and bound locals untouched. -/
+theorem mirStep_assign_aggregate_rawPtr_preserves_spatialPin
+    (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath}
+    {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {body cur : CapturedMir} {ms : MachineState}
+    {blk : BasicBlockData} {pointeeTy : Ty} {mutability : Mutability}
+    {dataOp metaOp : Operand} {span : String}
+    {p : ProvenancePtr} {len : Nat} {locals₁ locals₂ locals₃ : List LocalSlot} {slot : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc)
+    (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hCur : ms.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : Trusted.Sequence.get? cur.basicBlocks ms.frame.blockIdx = some blk)
+    (hStmt : Trusted.Sequence.get? blk.statements ms.frame.stmtIdx =
+      some { kind := .assign { local_ := dstLoc, projection := [] }
+               (.aggregate (.rawPtr pointeeTy mutability) [dataOp, metaOp]),
+             span := span })
+    (hWide : wideAggregatePointeeIsDyn? pointeeTy = some false)
+    (hData : evalOperand ms.frame.locals dataOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack =
+        .ok (.ptr p (layoutPointerBytes cur.layouts)) locals₁)
+    (hMetaOp : evalOperand locals₁ metaOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack =
+        .ok (.scalar ⟨len, layoutPointerBytes cur.layouts⟩) locals₂)
+    (hPinLoc : locals₂[l]? = ms.frame.locals[l]?)
+    (hBindLoc : ∀ b, b ∈ bindings → locals₂[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hProt : hasProtectedWriteConflict ms.memory.borrows ms.memory.activeProtectors dstLoc .none
+      .nil 0 0 (Trusted.Sequence.length ms.memory.callStack) = false)
+    (hSlot : Trusted.Sequence.get? locals₂ dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : Trusted.Sequence.set? locals₂ dstLoc
+      (.init (.aggregate 0 [.ptr p (layoutPointerBytes cur.layouts),
+        .scalar ⟨len, layoutPointerBytes cur.layouts⟩])) = some locals₃) :
+    let ms' : MachineState :=
+      { frame := { blockIdx := ms.frame.blockIdx, stmtIdx := ms.frame.stmtIdx + 1, locals := locals₃ }
+        memory := { ms.memory with
+          borrows := invalidateConflictingBorrows ms.memory.borrows dstLoc .none
+            (Trusted.Sequence.length ms.memory.callStack) } }
+    PureMirExec.mirStep body ms = .cont ms' ∧
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
+  intro ms'
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_assign_aggregate_rawPtr_wide hCur hPhase hBb hStmt hWide
+    hData hMetaOp hProt hSlot hLive hSet
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_assign_write tagOf (ms' := ms') .none
+    (Trusted.Sequence.length ms.memory.callStack) hPin hBind hNePin hNeBind hPinLoc hBindLoc hSet
+    rfl rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
+
+/-- **`mirStep_assign_layout_tuple_preserves_spatialPin`**: executing
+`dstLoc = (sizeOp, alignOp)` (`Layout::for_value(_raw)` tuple assembly) into a local `dstLoc`
+disjoint from `l` and `bindings` steps `PureMirExec.mirStep` and preserves
+`spatialPinnedBlockHolds` and `spatialBindingsHold` without unpinning. -/
+theorem mirStep_assign_layout_tuple_preserves_spatialPin
+    (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath}
+    {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {body cur : CapturedMir} {ms : MachineState}
+    {blk : BasicBlockData} {sizeOp alignOp : Operand} {span : String}
+    {vSize vAlign : Value} {locals₁ locals₂ locals₃ : List LocalSlot} {slot : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc)
+    (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hCur : ms.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : Trusted.Sequence.get? cur.basicBlocks ms.frame.blockIdx = some blk)
+    (hStmt : Trusted.Sequence.get? blk.statements ms.frame.stmtIdx =
+      some { kind := .assign { local_ := dstLoc, projection := [] }
+               (.aggregate .tuple [sizeOp, alignOp]),
+             span := span })
+    (hSize : evalOperand ms.frame.locals sizeOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack = .ok vSize locals₁)
+    (hAlign : evalOperand locals₁ alignOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack = .ok vAlign locals₂)
+    (hPinLoc : locals₂[l]? = ms.frame.locals[l]?)
+    (hBindLoc : ∀ b, b ∈ bindings → locals₂[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hProt : hasProtectedWriteConflict ms.memory.borrows ms.memory.activeProtectors dstLoc .none
+      .nil 0 0 (Trusted.Sequence.length ms.memory.callStack) = false)
+    (hSlot : Trusted.Sequence.get? locals₂ dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : Trusted.Sequence.set? locals₂ dstLoc (.init (.aggregate 0 [vSize, vAlign])) =
+      some locals₃) :
+    let ms' : MachineState :=
+      { frame := { blockIdx := ms.frame.blockIdx, stmtIdx := ms.frame.stmtIdx + 1, locals := locals₃ }
+        memory := { ms.memory with
+          borrows := invalidateConflictingBorrows ms.memory.borrows dstLoc .none
+            (Trusted.Sequence.length ms.memory.callStack) } }
+    PureMirExec.mirStep body ms = .cont ms' ∧
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
+  intro ms'
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_assign_layout_tuple hCur hPhase hBb hStmt hSize hAlign hProt
+    hSlot hLive hSet
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_assign_write tagOf (ms' := ms') .none
+    (Trusted.Sequence.length ms.memory.callStack) hPin hBind hNePin hNeBind hPinLoc hBindLoc hSet
+    rfl rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
+
+/-- **`mirStep_call_sizeOfVal_slice_preserves_spatialPin`**: calling
+`core::intrinsics::size_of_val` on `.slice elemTy` into a destination local `dstLoc` disjoint
+from `l` and `bindings` steps `PureMirExec.mirStep` and preserves `spatialPinnedBlockHolds` and
+`spatialBindingsHold` without unpinning, for `copy` or `move` arguments that leave the pinned and
+bound locals untouched. -/
+theorem mirStep_call_sizeOfVal_slice_preserves_spatialPin
+    (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath}
+    {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {body cur : CapturedMir} {ms : MachineState}
+    {blk : BasicBlockData} {func ptrOp : Operand}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {span : String}
+    {typeArgs : List RigidTy} {elemTy : RigidTy} {elemSz : Nat}
+    {p : ProvenancePtr} {len : Nat} {locals' updatedLocals : List LocalSlot} {slot : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc)
+    (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hCur : ms.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : Trusted.Sequence.get? cur.basicBlocks ms.frame.blockIdx = some blk)
+    (hEnd : ms.frame.stmtIdx = Trusted.Sequence.length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
+        span := span })
+    (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
+    (hArg : evalOperand ms.frame.locals ptrOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals .nil ms.memory.callStack =
+        .ok (.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]) locals')
+    (hPinLoc : locals'[l]? = ms.frame.locals[l]?)
+    (hBindLoc : ∀ b, b ∈ bindings → locals'[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hNoOverride : lookupCallee ms.memory.callees cur.layouts "core::intrinsics::size_of_val"
+      typeArgs ms.memory.traitImpls = none)
+    (hPt : resolveIntrinsicPointeeTy?
+      { defPath := "core::intrinsics::size_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] = some (.slice elemTy))
+    (hSz : intrinsicRigidTyByteSize cur.localDecls cur.layouts elemTy = some elemSz)
+    (hLt : len * elemSz < signedHalfModulus 8)
+    (hSlot : Trusted.Sequence.get? locals' dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : Trusted.Sequence.set? locals' dstLoc (.init (.scalar ⟨len * elemSz, 8⟩)) =
+      some updatedLocals) :
+    let ms' : MachineState :=
+      { frame := { ms.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
+        memory := invalidateDirectDestWriteBorrows ms.memory locals'
+          { local_ := dstLoc, projection := [] } }
+    PureMirExec.mirStep body ms = .cont ms' ∧
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
+  intro ms'
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_call_sizeOfVal_slice hCur hPhase hBb hEnd hTerm hCallee
+    hArg hNoOverride hPt hSz hLt hSlot hLive hSet
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_intrinsic_write tagOf (ms' := ms') hPin
+    hBind hNePin
+    hNeBind hPinLoc hBindLoc hSet rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
+
+/-- **`mirStep_call_sizeOfVal_str_preserves_spatialPin`**: calling
+`core::intrinsics::size_of_val` on `str` into a destination local `dstLoc` disjoint from `l` and
+`bindings` steps `PureMirExec.mirStep` and preserves `spatialPinnedBlockHolds` and
+`spatialBindingsHold` without unpinning. -/
+theorem mirStep_call_sizeOfVal_str_preserves_spatialPin
+    (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath}
+    {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {body cur : CapturedMir} {ms : MachineState}
+    {blk : BasicBlockData} {func ptrOp : Operand}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {span : String}
+    {typeArgs : List RigidTy}
+    {p : ProvenancePtr} {len : Nat} {locals' updatedLocals : List LocalSlot} {slot : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc)
+    (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hCur : ms.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : Trusted.Sequence.get? cur.basicBlocks ms.frame.blockIdx = some blk)
+    (hEnd : ms.frame.stmtIdx = Trusted.Sequence.length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
+        span := span })
+    (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
+    (hArg : evalOperand ms.frame.locals ptrOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals .nil ms.memory.callStack =
+        .ok (.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]) locals')
+    (hPinLoc : locals'[l]? = ms.frame.locals[l]?)
+    (hBindLoc : ∀ b, b ∈ bindings → locals'[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hNoOverride : lookupCallee ms.memory.callees cur.layouts "core::intrinsics::size_of_val"
+      typeArgs ms.memory.traitImpls = none)
+    (hPt : resolveIntrinsicPointeeTy?
+      { defPath := "core::intrinsics::size_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] = some .str)
+    (hLt : len < signedHalfModulus 8)
+    (hSlot : Trusted.Sequence.get? locals' dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : Trusted.Sequence.set? locals' dstLoc (.init (.scalar ⟨len, 8⟩)) =
+      some updatedLocals) :
+    let ms' : MachineState :=
+      { frame := { ms.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
+        memory := invalidateDirectDestWriteBorrows ms.memory locals'
+          { local_ := dstLoc, projection := [] } }
+    PureMirExec.mirStep body ms = .cont ms' ∧
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
+  intro ms'
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_call_sizeOfVal_str hCur hPhase hBb hEnd hTerm hCallee
+    hArg hNoOverride hPt hLt hSlot hLive hSet
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_intrinsic_write tagOf (ms' := ms') hPin
+    hBind hNePin
+    hNeBind hPinLoc hBindLoc hSet rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
+
+/-- **`mirStep_call_alignOfVal_slice_preserves_spatialPin`**: calling
+`core::intrinsics::align_of_val` on `.slice elemTy` into a destination local `dstLoc` disjoint
+from `l` and `bindings` steps `PureMirExec.mirStep` and preserves `spatialPinnedBlockHolds` and
+`spatialBindingsHold` without unpinning. -/
+theorem mirStep_call_alignOfVal_slice_preserves_spatialPin
+    (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath}
+    {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {body cur : CapturedMir} {ms : MachineState}
+    {blk : BasicBlockData} {func ptrOp : Operand}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {span : String}
+    {typeArgs : List RigidTy} {elemTy : RigidTy} {elemSz alignBytes : Nat}
+    {p : ProvenancePtr} {len : Nat} {locals' updatedLocals : List LocalSlot} {slot : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc)
+    (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hCur : ms.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : Trusted.Sequence.get? cur.basicBlocks ms.frame.blockIdx = some blk)
+    (hEnd : ms.frame.stmtIdx = Trusted.Sequence.length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
+        span := span })
+    (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
+    (hArg : evalOperand ms.frame.locals ptrOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals .nil ms.memory.callStack =
+        .ok (.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]) locals')
+    (hPinLoc : locals'[l]? = ms.frame.locals[l]?)
+    (hBindLoc : ∀ b, b ∈ bindings → locals'[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hNoOverride : lookupCallee ms.memory.callees cur.layouts "core::intrinsics::align_of_val"
+      typeArgs ms.memory.traitImpls = none)
+    (hPt : resolveIntrinsicPointeeTy?
+      { defPath := "core::intrinsics::align_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] = some (.slice elemTy))
+    (hSz : intrinsicRigidTyByteSize cur.localDecls cur.layouts elemTy = some elemSz)
+    (hAlign : intrinsicRigidTyAlign cur.localDecls cur.layouts elemTy = some alignBytes)
+    (hLt : len * elemSz < signedHalfModulus 8)
+    (hSlot : Trusted.Sequence.get? locals' dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : Trusted.Sequence.set? locals' dstLoc (.init (.scalar ⟨alignBytes, 8⟩)) =
+      some updatedLocals) :
+    let ms' : MachineState :=
+      { frame := { ms.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
+        memory := invalidateDirectDestWriteBorrows ms.memory locals'
+          { local_ := dstLoc, projection := [] } }
+    PureMirExec.mirStep body ms = .cont ms' ∧
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
+  intro ms'
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_call_alignOfVal_slice hCur hPhase hBb hEnd hTerm hCallee
+    hArg hNoOverride hPt hSz hAlign hLt hSlot hLive hSet
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_intrinsic_write tagOf (ms' := ms') hPin
+    hBind hNePin
+    hNeBind hPinLoc hBindLoc hSet rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
+
+/-- **`mirStep_call_alignOfVal_str_preserves_spatialPin`**: calling
+`core::intrinsics::align_of_val` on `str` into a destination local `dstLoc` disjoint from `l`
+and `bindings` steps `PureMirExec.mirStep` and preserves `spatialPinnedBlockHolds` and
+`spatialBindingsHold` without unpinning. -/
+theorem mirStep_call_alignOfVal_str_preserves_spatialPin
+    (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath}
+    {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {body cur : CapturedMir} {ms : MachineState}
+    {blk : BasicBlockData} {func ptrOp : Operand}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {span : String}
+    {typeArgs : List RigidTy}
+    {p : ProvenancePtr} {len : Nat} {locals' updatedLocals : List LocalSlot} {slot : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc)
+    (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hCur : ms.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : Trusted.Sequence.get? cur.basicBlocks ms.frame.blockIdx = some blk)
+    (hEnd : ms.frame.stmtIdx = Trusted.Sequence.length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
+        span := span })
+    (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
+    (hArg : evalOperand ms.frame.locals ptrOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals .nil ms.memory.callStack =
+        .ok (.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]) locals')
+    (hPinLoc : locals'[l]? = ms.frame.locals[l]?)
+    (hBindLoc : ∀ b, b ∈ bindings → locals'[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hNoOverride : lookupCallee ms.memory.callees cur.layouts "core::intrinsics::align_of_val"
+      typeArgs ms.memory.traitImpls = none)
+    (hPt : resolveIntrinsicPointeeTy?
+      { defPath := "core::intrinsics::align_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] = some .str)
+    (hLt : len < signedHalfModulus 8)
+    (hSlot : Trusted.Sequence.get? locals' dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : Trusted.Sequence.set? locals' dstLoc (.init (.scalar ⟨1, 8⟩)) =
+      some updatedLocals) :
+    let ms' : MachineState :=
+      { frame := { ms.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
+        memory := invalidateDirectDestWriteBorrows ms.memory locals'
+          { local_ := dstLoc, projection := [] } }
+    PureMirExec.mirStep body ms = .cont ms' ∧
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
+  intro ms'
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_call_alignOfVal_str hCur hPhase hBb hEnd hTerm hCallee
+    hArg hNoOverride hPt hLt hSlot hLive hSet
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_intrinsic_write tagOf (ms' := ms') hPin
+    hBind hNePin
+    hNeBind hPinLoc hBindLoc hSet rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
+
+/-- **`mirLocalsRel_of_set?_preserved`**: `mirLocalsRel` is preserved across any write
+`Trusted.Sequence.set? locals_in dstLoc v = some ms'.frame.locals` whenever every unborrowed
+`PureLift` local `i` (`MIR` slot `_(i + 1)`) is distinct from `dstLoc` and unchanged in `locals_in`
+(e.g. when `dstLoc` and any `move` operands are fresh temporaries outside `st.locals`, or when
+all `PureLift` locals in `st.locals` are borrowed). -/
+theorem mirLocalsRel_of_set?_preserved (tagOf : LoanId → Nat)
+    {st : SymState StdVal} {ms ms' : MachineState} {locals_in : List LocalSlot}
+    {dstLoc : Local} {v : LocalSlot}
+    (hLoc : mirLocalsRel tagOf st ms)
+    (hSet : Trusted.Sequence.set? locals_in dstLoc v = some ms'.frame.locals)
+    (hUnb : ∀ (i : Nat) (c : PlaceCell StdVal),
+      st.locals[i]? = some c → getPathPerm [] c.perm = .unborrowed →
+      i + 1 ≠ dstLoc ∧ locals_in[i + 1]? = ms.frame.locals[i + 1]?) :
+    mirLocalsRel tagOf st ms' := by
+  intro i c hc hU
+  obtain ⟨mv, hSlot, hRef⟩ := hLoc i c hc hU
+  obtain ⟨hNe, hIn⟩ := hUnb i c hc hU
+  exact ⟨mv, (getElem?_eq_of_set?_ne hSet hNe).trans (hIn.trans hSlot), hRef⟩
+
+/-- **`mirStateRel_and_spatialPin_of_assign_write`**: full `mirStateRel tagOf bindings st`
+(`spatialBindingsHold` + `mirLocalsRel`) and `spatialPinnedBlockHolds` are jointly preserved
+across any assignment writing to a local `dstLoc` disjoint from `l`, `bindings`, and unborrowed
+`PureLift` locals without unpinning. -/
+theorem mirStateRel_and_spatialPin_of_assign_write (tagOf : LoanId → Nat)
+    {layouts : LayoutTable} {ty : Ty} {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath} {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {ms ms' : MachineState} {locals₁ : List LocalSlot} {v : LocalSlot}
+    (writerTag : Option Nat) (targetFrameDepth : Nat)
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hRel : mirStateRel tagOf bindings st ms)
+    (hNePin : l ≠ dstLoc) (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hPinLoc : locals₁[l]? = ms.frame.locals[l]?)
+    (hBindLoc : ∀ b, b ∈ bindings → locals₁[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hUnb : ∀ (i : Nat) (c : PlaceCell StdVal),
+      st.locals[i]? = some c → getPathPerm [] c.perm = .unborrowed →
+      i + 1 ≠ dstLoc ∧ locals₁[i + 1]? = ms.frame.locals[i + 1]?)
+    (hSet : Trusted.Sequence.set? locals₁ dstLoc v = some ms'.frame.locals)
+    (hCaller : ms'.memory.callerLocals = ms.memory.callerLocals)
+    (hBorrows : ms'.memory.borrows =
+      invalidateConflictingBorrows ms.memory.borrows dstLoc writerTag targetFrameDepth) :
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+      mirStateRel tagOf bindings st ms' := by
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_assign_write tagOf writerTag
+    targetFrameDepth hPin hRel.1 hNePin hNeBind hPinLoc hBindLoc hSet hCaller hBorrows
+  exact ⟨hPin', hBind', mirLocalsRel_of_set?_preserved tagOf hRel.2 hSet hUnb⟩
+
+/-- **`mirStateRel_and_spatialPin_of_intrinsic_write`**: full `mirStateRel tagOf bindings st`
+(`spatialBindingsHold` + `mirLocalsRel`) and `spatialPinnedBlockHolds` are jointly preserved
+across any intrinsic call writing its return value to `{ local_ := dstLoc, projection := [] }`
+disjoint from `l`, `bindings`, and unborrowed `PureLift` locals without unpinning. -/
+theorem mirStateRel_and_spatialPin_of_intrinsic_write (tagOf : LoanId → Nat)
+    {layouts : LayoutTable} {ty : Ty} {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath} {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {ms ms' : MachineState} {locals' : List LocalSlot} {v : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hRel : mirStateRel tagOf bindings st ms)
+    (hNePin : l ≠ dstLoc) (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hPinLoc : locals'[l]? = ms.frame.locals[l]?)
+    (hBindLoc : ∀ b, b ∈ bindings → locals'[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hUnb : ∀ (i : Nat) (c : PlaceCell StdVal),
+      st.locals[i]? = some c → getPathPerm [] c.perm = .unborrowed →
+      i + 1 ≠ dstLoc ∧ locals'[i + 1]? = ms.frame.locals[i + 1]?)
+    (hSet : Trusted.Sequence.set? locals' dstLoc v = some ms'.frame.locals)
+    (hMem : ms'.memory =
+      invalidateDirectDestWriteBorrows ms.memory locals' { local_ := dstLoc, projection := [] }) :
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+      mirStateRel tagOf bindings st ms' := by
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_intrinsic_write tagOf hPin hRel.1 hNePin
+    hNeBind hPinLoc hBindLoc hSet hMem
+  exact ⟨hPin', hBind', mirLocalsRel_of_set?_preserved tagOf hRel.2 hSet hUnb⟩
+
+/-- **`BlockCfg` compatibility for dynamic-layout intrinsic calls**: an intrinsic call terminator
+(`size_of_val` / `align_of_val` / ...) executed from block entry `bb` that writes its return value
+to a local `dstLoc` disjoint from the loan bindings and the unborrowed `PureLift` locals, and
+jumps to `mirBb nextBb`, realizes the `PureLift` block transition `.jump nextBb st` with an
+unchanged symbolic state: `mirCfgStateRel` is re-established at block entry `nextBb` in one
+`mirStep`, which is exactly the per-block segment obligation consumed by
+`mirCfg_forwardSim_of_waitFree`. -/
+theorem mirCfgStateRel_stepsTo_of_intrinsic_write (tagOf : LoanId → Nat) {body : CapturedMir}
+    {bindingsAt : Nat → List (LoanId × Local × SubPath)} {mirBb : Nat → BasicBlockIdx}
+    {extra : Nat → SymState StdVal → MachineState → Prop}
+    {wrap : FuncOut StdVal → Option (FuncOut StdVal)} {bb nextBb : Nat} {st : SymState StdVal}
+    {ms : MachineState} {locals' updatedLocals : List LocalSlot} {dstLoc : Local} {v : LocalSlot}
+    (hRel : mirCfgStateRel tagOf bindingsAt mirBb extra ⟨wrap, bb, st, 0⟩ ms)
+    (hMir : PureMirExec.mirStep body ms = .cont
+      { frame := { ms.frame with blockIdx := mirBb nextBb, stmtIdx := 0, locals := updatedLocals }
+        memory :=
+          invalidateDirectDestWriteBorrows ms.memory locals' { local_ := dstLoc, projection := [] } })
+    (hBindNext : bindingsAt nextBb = bindingsAt bb)
+    (hNeBind : ∀ b, b ∈ bindingsAt bb → b.2.1 ≠ dstLoc)
+    (hBindLoc : ∀ b, b ∈ bindingsAt bb → locals'[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hUnb : ∀ (i : Nat) (c : PlaceCell StdVal),
+      st.locals[i]? = some c → getPathPerm [] c.perm = .unborrowed →
+      i + 1 ≠ dstLoc ∧ locals'[i + 1]? = ms.frame.locals[i + 1]?)
+    (hSet : Trusted.Sequence.set? locals' dstLoc v = some updatedLocals)
+    (hExtra : extra nextBb st
+      { frame := { ms.frame with blockIdx := mirBb nextBb, stmtIdx := 0, locals := updatedLocals }
+        memory :=
+          invalidateDirectDestWriteBorrows ms.memory locals' { local_ := dstLoc, projection := [] } }) :
+    PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+      (mirCfgStateRel tagOf bindingsAt mirBb extra ⟨wrap, nextBb, st, 0⟩) := by
+  unfold mirCfgStateRel mirStateRel at hRel
+  obtain ⟨hWrap, _, _, ⟨hBind, hLoc⟩, _⟩ := hRel
+  have hCaller : (invalidateDirectDestWriteBorrows ms.memory locals'
+      { local_ := dstLoc, projection := [] }).callerLocals = ms.memory.callerLocals :=
+    invalidateDirectDestWriteBorrows_callerLocals ms.memory locals' _
+  refine .step hMir (.refl ?_)
+  unfold mirCfgStateRel mirStateRel
+  refine ⟨hWrap, rfl, rfl, ⟨?_, ?_⟩, hExtra⟩
+  · show spatialBindingsHold (mirSpatialModel tagOf) (bindingsAt nextBb) st _
+    rw [hBindNext]
+    exact spatialBindingsHold_of_invalidateDirectDestWriteBorrows_ne tagOf locals' rfl
+      (bindingsAt bb) (fun _ _ => rfl) hNeBind
+      (fun b hb => placeValue?_of_lookupLocalSlot?_eq b.2.2
+        (lookupLocalSlot?_of_set?_ne (hBindLoc b hb) hSet hCaller (hNeBind b hb)))
+      hBind
+  · exact mirLocalsRel_of_set?_preserved tagOf hLoc hSet hUnb
+
+/-- **Multi-statement `BlockCfg` segment rule (`mirCfgStateRel_stepsTo_of_steps`)**: when a MIR
+basic block executes a sequence of silent `mirStep` transitions (such as `PtrMetadata` and
+`AggregateKind.rawPtr` statements followed by a `size_of_val` / `align_of_val` call terminator)
+from block entry `bb` to `ms'` at block entry `mirBb nextBb` (`stmtIdx = 0`) while preserving
+`mirStateRel` and establishing `extra nextBb st ms'` (e.g., `spatialPinnedBlockHolds` and
+`UnsizedSliceDstAt`), `mirCfgStateRel` is re-established at `⟨wrap, nextBb, st, 0⟩`. -/
+theorem mirCfgStateRel_stepsTo_of_steps (tagOf : LoanId → Nat) {body : CapturedMir}
+    {bindingsAt : Nat → List (LoanId × Local × SubPath)} {mirBb : Nat → BasicBlockIdx}
+    {extra : Nat → SymState StdVal → MachineState → Prop}
+    {wrap : FuncOut StdVal → Option (FuncOut StdVal)} {bb nextBb : Nat} {st : SymState StdVal}
+    {ms ms' : MachineState}
+    (hRel0 : mirCfgStateRel tagOf bindingsAt mirBb extra ⟨wrap, bb, st, 0⟩ ms)
+    (hSteps : PureMirExec.StepsTo (PureMirExec.mirStep body) ms (fun s => s = ms'))
+    (hBb' : ms'.frame.blockIdx = mirBb nextBb)
+    (hStmt' : ms'.frame.stmtIdx = 0)
+    (hRel' : mirStateRel tagOf (bindingsAt nextBb) st ms')
+    (hExtra' : extra nextBb st ms') :
+    PureMirExec.StepsTo (PureMirExec.mirStep body) ms
+      (mirCfgStateRel tagOf bindingsAt mirBb extra ⟨wrap, nextBb, st, 0⟩) := by
+  have hWrap : SubIdWrap wrap := hRel0.1
+  exact PureMirExec.StepsTo.mono (fun s hs => by
+    subst hs
+    exact ⟨hWrap, hBb', hStmt', hRel', hExtra'⟩) hSteps
+
+/-- **`mirStep_assign_aggregate_rawPtr_thin_preserves_spatialPin`**: executing
+`dstLoc = AggregateKind.rawPtr pointeeTy mutability [dataOp, unitOp]` (`ptr::from_raw_parts` on a
+sized pointee) into a local `dstLoc` disjoint from `l` and `bindings` steps `PureMirExec.mirStep`,
+preserves `spatialPinnedBlockHolds` and `spatialBindingsHold` without unpinning, and transports
+`MirWpConverges`. -/
+theorem mirStep_assign_aggregate_rawPtr_thin_preserves_spatialPin
+    (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath}
+    {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {body cur : CapturedMir} {ms : MachineState}
+    {blk : BasicBlockData} {pointeeTy : Ty} {mutability : Mutability}
+    {dataOp unitOp : Operand} {span : String}
+    {p : ProvenancePtr} {locals₁ locals₂ locals₃ : List LocalSlot} {slot : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc)
+    (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hCur : ms.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : Trusted.Sequence.get? cur.basicBlocks ms.frame.blockIdx = some blk)
+    (hStmt : Trusted.Sequence.get? blk.statements ms.frame.stmtIdx =
+      some { kind := .assign { local_ := dstLoc, projection := [] }
+               (.aggregate (.rawPtr pointeeTy mutability) [dataOp, unitOp]),
+             span := span })
+    (hSized : isUnsizedRawPtrPointee pointeeTy = false)
+    (hData : evalOperand ms.frame.locals dataOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack =
+        .ok (.ptr p (layoutPointerBytes cur.layouts)) locals₁)
+    (hUnitOp : evalOperand locals₁ unitOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack = .ok .unit locals₂)
+    (hPinLoc : locals₂[l]? = ms.frame.locals[l]?)
+    (hBindLoc : ∀ b, b ∈ bindings → locals₂[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hProt : hasProtectedWriteConflict ms.memory.borrows ms.memory.activeProtectors dstLoc .none
+      .nil 0 0 (Trusted.Sequence.length ms.memory.callStack) = false)
+    (hSlot : Trusted.Sequence.get? locals₂ dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : Trusted.Sequence.set? locals₂ dstLoc (.init (.ptr p (layoutPointerBytes cur.layouts))) =
+      some locals₃) :
+    let ms' : MachineState :=
+      { frame := { blockIdx := ms.frame.blockIdx, stmtIdx := ms.frame.stmtIdx + 1, locals := locals₃ }
+        memory := { ms.memory with
+          borrows := invalidateConflictingBorrows ms.memory.borrows dstLoc .none
+            (Trusted.Sequence.length ms.memory.callStack) } }
+    PureMirExec.mirStep body ms = .cont ms' ∧
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
+  intro ms'
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_assign_aggregate_rawPtr_thin hCur hPhase hBb hStmt hSized
+    hData hUnitOp hProt hSlot hLive hSet
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_assign_write tagOf (ms' := ms') .none
+    (Trusted.Sequence.length ms.memory.callStack) hPin hBind hNePin hNeBind hPinLoc hBindLoc hSet
+    rfl rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
+
+/-- **`mirStep_call_sizeOfVal_sized_preserves_spatialPin`**: calling
+`core::intrinsics::size_of_val` on a sized `pointeeTy` into a destination local `dstLoc` disjoint
+from `l` and `bindings` steps `PureMirExec.mirStep`, preserves `spatialPinnedBlockHolds` and
+`spatialBindingsHold` without unpinning, and transports `MirWpConverges`. -/
+theorem mirStep_call_sizeOfVal_sized_preserves_spatialPin
+    (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath}
+    {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {body cur : CapturedMir} {ms : MachineState}
+    {blk : BasicBlockData} {func ptrOp : Operand}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {span : String}
+    {typeArgs : List RigidTy} {pointeeTy : RigidTy} {sz : Nat}
+    {p : ProvenancePtr} {locals' updatedLocals : List LocalSlot} {slot : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc)
+    (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hCur : ms.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : Trusted.Sequence.get? cur.basicBlocks ms.frame.blockIdx = some blk)
+    (hEnd : ms.frame.stmtIdx = Trusted.Sequence.length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
+        span := span })
+    (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
+    (hArg : evalOperand ms.frame.locals ptrOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals .nil ms.memory.callStack = .ok (.ptr p 8) locals')
+    (hPinLoc : locals'[l]? = ms.frame.locals[l]?)
+    (hBindLoc : ∀ b, b ∈ bindings → locals'[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hNoOverride : lookupCallee ms.memory.callees cur.layouts "core::intrinsics::size_of_val"
+      typeArgs ms.memory.traitImpls = none)
+    (hPt : resolveIntrinsicPointeeTy?
+      { defPath := "core::intrinsics::size_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] = some pointeeTy)
+    (hSized : isUnsizedRawPtrPointee { kind := pointeeTy, layoutIdx := 0 } = false)
+    (hNoExt : intrinsicTailIsExtern 8 pointeeTy = false)
+    (hSz : intrinsicRigidTyByteSize cur.localDecls cur.layouts pointeeTy = some sz)
+    (hLt : sz < signedHalfModulus 8)
+    (hSlot : Trusted.Sequence.get? locals' dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : Trusted.Sequence.set? locals' dstLoc (.init (.scalar ⟨sz, 8⟩)) = some updatedLocals) :
+    let ms' : MachineState :=
+      { frame := { ms.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
+        memory := invalidateDirectDestWriteBorrows ms.memory locals'
+          { local_ := dstLoc, projection := [] } }
+    PureMirExec.mirStep body ms = .cont ms' ∧
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
+  intro ms'
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_call_sizeOfVal_sized hCur hPhase hBb hEnd hTerm hCallee
+    hArg hNoOverride hPt hSized hNoExt hSz hLt hSlot hLive hSet
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_intrinsic_write tagOf (ms' := ms') hPin
+    hBind hNePin hNeBind hPinLoc hBindLoc hSet rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
+
+/-- **`mirStep_call_alignOfVal_sized_preserves_spatialPin`**: calling
+`core::intrinsics::align_of_val` on a sized `pointeeTy` into a destination local `dstLoc` disjoint
+from `l` and `bindings` steps `PureMirExec.mirStep`, preserves `spatialPinnedBlockHolds` and
+`spatialBindingsHold` without unpinning, and transports `MirWpConverges`. -/
+theorem mirStep_call_alignOfVal_sized_preserves_spatialPin
+    (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath}
+    {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {body cur : CapturedMir} {ms : MachineState}
+    {blk : BasicBlockData} {func ptrOp : Operand}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {span : String}
+    {typeArgs : List RigidTy} {pointeeTy : RigidTy} {alignBytes : Nat}
+    {p : ProvenancePtr} {locals' updatedLocals : List LocalSlot} {slot : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc)
+    (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hCur : ms.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : Trusted.Sequence.get? cur.basicBlocks ms.frame.blockIdx = some blk)
+    (hEnd : ms.frame.stmtIdx = Trusted.Sequence.length blk.statements)
+    (hTerm : blk.terminator =
+      { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
+        span := span })
+    (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
+    (hArg : evalOperand ms.frame.locals ptrOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals .nil ms.memory.callStack = .ok (.ptr p 8) locals')
+    (hPinLoc : locals'[l]? = ms.frame.locals[l]?)
+    (hBindLoc : ∀ b, b ∈ bindings → locals'[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hNoOverride : lookupCallee ms.memory.callees cur.layouts "core::intrinsics::align_of_val"
+      typeArgs ms.memory.traitImpls = none)
+    (hPt : resolveIntrinsicPointeeTy?
+      { defPath := "core::intrinsics::align_of_val", typeArgs := typeArgs, fnSig := none,
+        isIndirect := false }
+      cur.localDecls cur.layouts [ptrOp] = some pointeeTy)
+    (hSized : isUnsizedRawPtrPointee { kind := pointeeTy, layoutIdx := 0 } = false)
+    (hNoExt : intrinsicTailIsExtern 8 pointeeTy = false)
+    (hAlign : intrinsicRigidTyAlign cur.localDecls cur.layouts pointeeTy = some alignBytes)
+    (hSlot : Trusted.Sequence.get? locals' dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : Trusted.Sequence.set? locals' dstLoc (.init (.scalar ⟨alignBytes, 8⟩)) =
+      some updatedLocals) :
+    let ms' : MachineState :=
+      { frame := { ms.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
+        memory := invalidateDirectDestWriteBorrows ms.memory locals'
+          { local_ := dstLoc, projection := [] } }
+    PureMirExec.mirStep body ms = .cont ms' ∧
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
+  intro ms'
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_call_alignOfVal_sized hCur hPhase hBb hEnd hTerm hCallee
+    hArg hNoOverride hPt hSized hNoExt hAlign hSlot hLive hSet
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_intrinsic_write tagOf (ms' := ms') hPin
+    hBind hNePin hNeBind hPinLoc hBindLoc hSet rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
+
+/-- **`mirStep_assign_aggregate_rawPtr_wide_scalarAddr_preserves_spatialPin`**: executing
+`dstLoc = AggregateKind.rawPtr pointeeTy mutability [dataOp, metaOp]` from a provenance-free
+integer address `.scalar ⟨addr, ptrBytes⟩` and length `.scalar ⟨len, ptrBytes⟩`
+(`ptr::slice_from_raw_parts(NonNull::dangling().as_ptr(), len)`, `addr, len < scalarModulus ptrBytes`)
+into a local `dstLoc` disjoint from `l` and `bindings` steps `PureMirExec.mirStep`, preserves
+`spatialPinnedBlockHolds` and `spatialBindingsHold` without unpinning, and transports
+`MirWpConverges`. -/
+theorem mirStep_assign_aggregate_rawPtr_wide_scalarAddr_preserves_spatialPin
+    (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath}
+    {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {body cur : CapturedMir} {ms : MachineState}
+    {blk : BasicBlockData} {pointeeTy : Ty} {mutability : Mutability}
+    {dataOp metaOp : Operand} {span : String}
+    {addr len : Nat} {locals₁ locals₂ locals₃ : List LocalSlot} {slot : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc)
+    (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hCur : ms.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : Trusted.Sequence.get? cur.basicBlocks ms.frame.blockIdx = some blk)
+    (hStmt : Trusted.Sequence.get? blk.statements ms.frame.stmtIdx =
+      some { kind := .assign { local_ := dstLoc, projection := [] }
+               (.aggregate (.rawPtr pointeeTy mutability) [dataOp, metaOp]),
+             span := span })
+    (hWide : wideAggregatePointeeIsDyn? pointeeTy = some false)
+    (hAddr : addr < scalarModulus (layoutPointerBytes cur.layouts))
+    (hLen : len < scalarModulus (layoutPointerBytes cur.layouts))
+    (hData : evalOperand ms.frame.locals dataOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack =
+        .ok (.scalar ⟨addr, layoutPointerBytes cur.layouts⟩) locals₁)
+    (hMetaOp : evalOperand locals₁ metaOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack =
+        .ok (.scalar ⟨len, layoutPointerBytes cur.layouts⟩) locals₂)
+    (hPinLoc : locals₂[l]? = ms.frame.locals[l]?)
+    (hBindLoc : ∀ b, b ∈ bindings → locals₂[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hProt : hasProtectedWriteConflict ms.memory.borrows ms.memory.activeProtectors dstLoc .none
+      .nil 0 0 (Trusted.Sequence.length ms.memory.callStack) = false)
+    (hSlot : Trusted.Sequence.get? locals₂ dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : Trusted.Sequence.set? locals₂ dstLoc
+      (.init (.aggregate 0 [.scalar ⟨addr, layoutPointerBytes cur.layouts⟩,
+        .scalar ⟨len, layoutPointerBytes cur.layouts⟩])) = some locals₃) :
+    let ms' : MachineState :=
+      { frame := { blockIdx := ms.frame.blockIdx, stmtIdx := ms.frame.stmtIdx + 1, locals := locals₃ }
+        memory := { ms.memory with
+          borrows := invalidateConflictingBorrows ms.memory.borrows dstLoc .none
+            (Trusted.Sequence.length ms.memory.callStack) } }
+    PureMirExec.mirStep body ms = .cont ms' ∧
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
+  intro ms'
+  have hRv := evalRvalue_aggregate_rawPtr_wide_scalarAddr_of_lt ms.frame.locals locals₁ locals₂
+    pointeeTy mutability dataOp metaOp ms.memory cur.localDecls cur.layouts addr len hWide hAddr
+    hLen hData hMetaOp
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_assign_local hCur hPhase hBb hStmt hRv hProt hSlot hLive
+    hSet
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_assign_write tagOf (ms' := ms') .none
+    (Trusted.Sequence.length ms.memory.callStack) hPin hBind hNePin hNeBind hPinLoc hBindLoc hSet
+    rfl rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
+
+/-- **`mirStep_assign_ptrMetadata_wide_scalarAddr_preserves_spatialPin`**: executing
+`dstLoc = PtrMetadata(op)` on a provenance-free wide pointer
+`.aggregate 0 [.scalar ⟨addr, ptrBytes⟩, .scalar ⟨len, ptrBytes⟩]`
+(`len < scalarModulus ptrBytes`) into a local `dstLoc` disjoint from `l` and `bindings` steps
+`PureMirExec.mirStep`, preserves `spatialPinnedBlockHolds` and `spatialBindingsHold` without
+unpinning, and transports `MirWpConverges`. -/
+theorem mirStep_assign_ptrMetadata_wide_scalarAddr_preserves_spatialPin
+    (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath}
+    {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {body cur : CapturedMir} {ms : MachineState}
+    {blk : BasicBlockData} {op : Operand} {span : String}
+    {addr len : Nat} {locals₁ locals₂ : List LocalSlot} {slot : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc)
+    (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hCur : ms.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : Trusted.Sequence.get? cur.basicBlocks ms.frame.blockIdx = some blk)
+    (hStmt : Trusted.Sequence.get? blk.statements ms.frame.stmtIdx =
+      some { kind := .assign { local_ := dstLoc, projection := [] } (.unaryOp .ptrMetadata op),
+             span := span })
+    (hTy : isNonWidePtrAggregateTy (operandTy cur.localDecls cur.layouts op) = false)
+    (hLen : len < scalarModulus (layoutPointerBytes cur.layouts))
+    (hOp : evalOperand ms.frame.locals op ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack =
+        .ok (.aggregate 0 [.scalar ⟨addr, layoutPointerBytes cur.layouts⟩,
+          .scalar ⟨len, layoutPointerBytes cur.layouts⟩]) locals₁)
+    (hPinLoc : locals₁[l]? = ms.frame.locals[l]?)
+    (hBindLoc : ∀ b, b ∈ bindings → locals₁[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hProt : hasProtectedWriteConflict ms.memory.borrows ms.memory.activeProtectors dstLoc .none
+      .nil 0 0 (Trusted.Sequence.length ms.memory.callStack) = false)
+    (hSlot : Trusted.Sequence.get? locals₁ dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : Trusted.Sequence.set? locals₁ dstLoc
+      (.init (.scalar ⟨len, layoutPointerBytes cur.layouts⟩)) = some locals₂) :
+    let ms' : MachineState :=
+      { frame := { blockIdx := ms.frame.blockIdx, stmtIdx := ms.frame.stmtIdx + 1, locals := locals₂ }
+        memory := { ms.memory with
+          borrows := invalidateConflictingBorrows ms.memory.borrows dstLoc .none
+            (Trusted.Sequence.length ms.memory.callStack) } }
+    PureMirExec.mirStep body ms = .cont ms' ∧
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
+  intro ms'
+  have hRv := evalRvalue_unaryOp_ptrMetadata_wide_scalarAddr_of_lt ms.frame.locals locals₁ op
+    ms.memory cur.localDecls cur.layouts addr len hTy hLen hOp
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_assign_local hCur hPhase hBb hStmt hRv hProt hSlot hLive
+    hSet
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_assign_write tagOf (ms' := ms') .none
+    (Trusted.Sequence.length ms.memory.callStack) hPin hBind hNePin hNeBind hPinLoc hBindLoc hSet
+    rfl rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
+
+/-- **`mirStep_assign_cast_ptrToPtr_wide_to_thin_preserves_spatialPin`**:
+executing `dstLoc = op as targetTy` (`CastKind.ptrToPtr` from a global-backed
+wide pointer with `lookupBorrow ms.memory.borrows p.tag = none` to a thin raw
+pointer `isThinRawPtrTy targetTy = true`, i.e. the data half of rustc's
+`to_raw_parts` lowering) into a local `dstLoc` disjoint from `l` and `bindings`
+steps `PureMirExec.mirStep`, preserves `spatialPinnedBlockHolds` and
+`spatialBindingsHold` without unpinning, and transports `MirWpConverges`.
+(Global-backed and `alreadySubslice = true` borrow-backed `PtrToPtr` preserve
+`mem.borrows`/`nextTag` and `StdValRefines`, whereas whole-place
+`alreadySubslice = false` borrow-backed `PtrToPtr` allocates fresh narrowed tag
+`mem.nextTag` at `offsetBytes = 0`.) -/
+theorem mirStep_assign_cast_ptrToPtr_wide_to_thin_preserves_spatialPin
+    (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath}
+    {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {body cur : CapturedMir} {ms : MachineState}
+    {blk : BasicBlockData} {op : Operand} {targetTy : Ty} {span : String}
+    {p : ProvenancePtr} {len : Nat} {locals₁ locals₂ : List LocalSlot} {slot : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc)
+    (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hCur : ms.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : Trusted.Sequence.get? cur.basicBlocks ms.frame.blockIdx = some blk)
+    (hStmt : Trusted.Sequence.get? blk.statements ms.frame.stmtIdx =
+      some { kind := .assign { local_ := dstLoc, projection := [] } (.cast .ptrToPtr op targetTy),
+             span := span })
+    (hThin : isThinRawPtrTy targetTy = true)
+    (hNoBorrow : lookupBorrow ms.memory.borrows p.tag = none)
+    (hOp : evalOperand ms.frame.locals op ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack =
+        .ok (.aggregate 0 [.ptr p (layoutPointerBytes cur.layouts),
+          .scalar ⟨len, layoutPointerBytes cur.layouts⟩]) locals₁)
+    (hPinLoc : locals₁[l]? = ms.frame.locals[l]?)
+    (hBindLoc : ∀ b, b ∈ bindings → locals₁[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hProt : hasProtectedWriteConflict ms.memory.borrows ms.memory.activeProtectors dstLoc .none
+      .nil 0 0 (Trusted.Sequence.length ms.memory.callStack) = false)
+    (hSlot : Trusted.Sequence.get? locals₁ dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : Trusted.Sequence.set? locals₁ dstLoc
+      (.init (.ptr p (layoutPointerBytes cur.layouts))) = some locals₂) :
+    let ms' : MachineState :=
+      { frame := { blockIdx := ms.frame.blockIdx, stmtIdx := ms.frame.stmtIdx + 1, locals := locals₂ }
+        memory := { ms.memory with
+          borrows := invalidateConflictingBorrows ms.memory.borrows dstLoc .none
+            (Trusted.Sequence.length ms.memory.callStack) } }
+    PureMirExec.mirStep body ms = .cont ms' ∧
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
+  intro ms'
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_assign_cast_ptrToPtr_wide_to_thin hCur hPhase hBb hStmt
+    hThin hNoBorrow hOp hProt hSlot hLive hSet
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_assign_write tagOf (ms' := ms') .none
+    (Trusted.Sequence.length ms.memory.callStack) hPin hBind hNePin hNeBind hPinLoc hBindLoc hSet
+    rfl rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
+
+/-- **`mirStep_assign_cast_ptrToPtr_wide_to_wide_preserves_spatialPin`**: executing
+`dstLoc = op as targetTy` (`CastKind.ptrToPtr` between non-`dyn` wide raw pointer types, whether
+global-backed or borrow-backed) into a local `dstLoc` disjoint from `l` and `bindings` steps
+`PureMirExec.mirStep`, preserves `spatialPinnedBlockHolds` and `spatialBindingsHold` without
+unpinning, and transports `MirWpConverges`. -/
+theorem mirStep_assign_cast_ptrToPtr_wide_to_wide_preserves_spatialPin
+    (tagOf : LoanId → Nat) {layouts : LayoutTable} {ty : Ty}
+    {lid : LoanId} {bid : BlockId} {codec : SpatialCodec StdVal}
+    {l dstLoc : Local} {path : SubPath}
+    {bindings : List (LoanId × Local × SubPath)}
+    {st : SymState StdVal} {body cur : CapturedMir} {ms : MachineState}
+    {blk : BasicBlockData} {op : Operand} {targetTy : Ty} {span : String}
+    {p : ProvenancePtr} {len : Nat} {locals₁ locals₂ : List LocalSlot} {slot : LocalSlot}
+    (hPin : spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms)
+    (hBind : spatialBindingsHold (mirSpatialModel tagOf) bindings st ms)
+    (hNePin : l ≠ dstLoc)
+    (hNeBind : ∀ b, b ∈ bindings → b.2.1 ≠ dstLoc)
+    (hCur : ms.memory.activeCallee.getD body = cur)
+    (hPhase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
+    (hBb : Trusted.Sequence.get? cur.basicBlocks ms.frame.blockIdx = some blk)
+    (hStmt : Trusted.Sequence.get? blk.statements ms.frame.stmtIdx =
+      some { kind := .assign { local_ := dstLoc, projection := [] } (.cast .ptrToPtr op targetTy),
+             span := span })
+    (hNotThin : isThinRawPtrTy targetTy = false)
+    (hWide : wideRawPtrIsDyn? targetTy = some false)
+    (hOp : evalOperand ms.frame.locals op ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack =
+        .ok (.aggregate 0 [.ptr p (layoutPointerBytes cur.layouts),
+          .scalar ⟨len, layoutPointerBytes cur.layouts⟩]) locals₁)
+    (hPinLoc : locals₁[l]? = ms.frame.locals[l]?)
+    (hBindLoc : ∀ b, b ∈ bindings → locals₁[b.2.1]? = ms.frame.locals[b.2.1]?)
+    (hProt : hasProtectedWriteConflict ms.memory.borrows ms.memory.activeProtectors dstLoc .none
+      .nil 0 0 (Trusted.Sequence.length ms.memory.callStack) = false)
+    (hSlot : Trusted.Sequence.get? locals₁ dstLoc = some slot)
+    (hLive : slotLive slot = true)
+    (hSet : Trusted.Sequence.set? locals₁ dstLoc
+      (.init (.aggregate 0 [.ptr p (layoutPointerBytes cur.layouts),
+        .scalar ⟨len, layoutPointerBytes cur.layouts⟩])) = some locals₂) :
+    let ms' : MachineState :=
+      { frame := { blockIdx := ms.frame.blockIdx, stmtIdx := ms.frame.stmtIdx + 1, locals := locals₂ }
+        memory := { ms.memory with
+          borrows := invalidateConflictingBorrows ms.memory.borrows dstLoc .none
+            (Trusted.Sequence.length ms.memory.callStack) } }
+    PureMirExec.mirStep body ms = .cont ms' ∧
+    spatialPinnedBlockHolds tagOf layouts ty lid bid codec l path st ms' ∧
+    spatialBindingsHold (mirSpatialModel tagOf) bindings st ms' ∧
+    (∀ post, Anneal.MirFuelFree.MirWpConverges body ms' post →
+      Anneal.MirFuelFree.MirWpConverges body ms post) := by
+  intro ms'
+  obtain ⟨hStepFn, hMir, _, _⟩ := mirStep_assign_cast_ptrToPtr_wide_to_wide hCur hPhase hBb hStmt
+    hNotThin hWide hOp hProt hSlot hLive hSet
+  obtain ⟨hPin', hBind'⟩ := spatialPin_and_bindings_of_assign_write tagOf (ms' := ms') .none
+    (Trusted.Sequence.length ms.memory.callStack) hPin hBind hNePin hNeBind hPinLoc hBindLoc hSet
+    rfl rfl
+  exact ⟨hMir, hPin', hBind', (mirWpConverges_of_stepMirFn_step hStepFn).1⟩
+
+end WideSliceDstBridge
 
 end Anneal.PureLift.V2026_06_01Bridge

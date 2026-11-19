@@ -26,7 +26,39 @@ Borrows table, and relates it to a symbolic `PureLift` evaluation through
    into `bb1`/`bb2` and `bb3` under `mirCfgStateRel` (the joined loan realized
    on the live machine at `bb3`), and `mir_blockCfg_sound` concludes. Test 2c
    runs a 3-block `while` loop with a back-edge through
-   `CfgCertificate.whileLoop` and `mir_cfgCertificate_sound`.
+   `CfgCertificate.whileLoop` and `mir_cfgCertificate_sound`. Test 2b-sym
+   replays the diamond from one symbolic entry state, where `stepBasicBlock`
+   joins both arms into a single `.convergedJump 1` (one delay tick, pending
+   `handleFreeOutOpt` guard) that `mirCfg_forwardSim_of_waitFree` and
+   `mirCfg_forwardSim_of_emitsSubIdWraps` match with one header-targeted live
+   run. Test 2b-cert certifies the same live body through `CfgCertificate.diamond`
+   from the plan's `HoldsFnSpec` alone (`mir_diamond_cfgCertificate_sound`), for
+   the symbolic oracle (`.convergedJump`) and the concrete one (path
+   `0 → 1/2 → 3`), and through the `LocalBlockVC` route of
+   `mir_cfgCertificate_sound` with the exact 2-point invariant; its fuel `3` is
+   exact on both modes. Test 2b-asym
+   replays an asymmetric 5-block diamond (`bb1 -> bb2` vs. `bb3`, `armSteps =
+   Nat.max 2 1 = 2` with `.outOfFuel` at fuel `3` and convergence at fuel `4`),
+   through `mir_blockCfg_sound`, through `CfgCertificate.asymDiamond` /
+   `mir_asymDiamond_cfgCertificate_sound` for the symbolic oracle and for both
+   concrete oracles (the 4-step `true` arm `0 → 1 → 2 → 4` simulated block for
+   block at the certificate's exact fuel `4`), and as a segment
+   (`mirCfg_segmentSim_of_emitsSubIdWraps`) landing exactly on the live join
+   state, while the rejection canaries check that a rejecting wrapper, a
+   block-level leaked handle (`diamondLeakRetBlocks`), or a guarded
+   early-return leaked handle rejected by `.convergedJump`'s wrapper
+   (`diamondGuardedLeakBlocks`) faults in both `stepBasicBlock` and
+   `evalFnValue`. Test 2d certifies loops from strong-descent cutpoints
+   (`rank s' < rank s`) with `mir_whileLoop_cfgCertificate_of_cutpoint` and
+   `mir_whileLoop_cfgCertificate_of_cutpoint_blockRel` (and from a
+   unit-decrement cutpoint `rank s = rank s' + 1` with
+   `mir_whileLoop_cfgCertificate_of_unitCutpoint` and
+   `holdsFnSpec_whileLoop_of_unitCutpoint`),
+   including the stride-3 `while i < 5` loop whose live header computes
+   `Lt(i, 5)` and whose rank drops `5 → 2 → 0` (diverging at CFG fuel `5`,
+   returning at exact CFG fuel `6`, and certified by `CfgCertificate.whileLoop`
+   at `loopFuel = 5`, `fuel = 12`), together with `StdValRefines.of_sameCond`,
+   `StdValRefines.of_sameAggregateShape_ext`, and `StdValRefines.pair_inv`.
 3. **Hybrid `SpatialPin` freeze → `zerocopy` byte write → unpin**: the frozen
    block is the place's trusted byte window (`TypedAt`), the spatial mutation
    writes exactly the bytes produced by the live raw-pointer `*mut u8` store,
@@ -264,18 +296,16 @@ theorem sibling_cfgCertificate_sound :
     (fun _ _ ⟨hBb, hSt⟩ => by subst hBb; subst hSt; exact trivial)
     (fun _ _ ⟨hBb, hSt⟩ _ _ _ _ h => by subst hBb; subst hSt; exact nomatch h)
     ⟨rfl, rfl⟩
-    (fun s ms ⟨hW, _, _, _, hBb, hSt, hMs⟩ => by
-      cases s with
-      | mk w bb st =>
-        dsimp only at hW hBb hSt hMs
-        have hwEq : w = (fun o => o) := funext hW
-        subst hwEq
+    (mirCfg_forwardSim_of_waitFree tagOfLoan siblingBody siblingCert.blocks
+      (fun _ => []) (fun _ => 0)
+      (fun bb st ms => bb = 0 ∧ st = siblingSt0 ∧ ms = siblingMs0) []
+      (fun _ _ _ _ ⟨_, _, _, _, hBb, hSt, hMs⟩ => by
         subst hBb
         subst hSt
         subst hMs
         exact ⟨16, _, rfl, _, _, rfl,
-          .pair (.nat (by decide)) (.nat (by decide)), rfl⟩)
-    ⟨fun _ => rfl, rfl, rfl, sibling_entry_rel, rfl, rfl, rfl⟩
+          .pair (.nat (by decide)) (.nat (by decide)), rfl⟩))
+    ⟨subIdWrap_some, rfl, rfl, sibling_entry_rel, rfl, rfl, rfl⟩
 
 /-- Symbolic-input `PureLift` state after the two sibling reborrows. -/
 def siblingSymStSplit (a b : Nat) : SymState StdVal :=
@@ -797,7 +827,7 @@ def dbOut (c : Bool) : FuncOut StdVal :=
 
 theorem db_cfg_wpConverges (c : Bool) :
     Anneal.PureMirExec.WpConverges (blockCfgStep (stepBasicBlock stdValAlg diamondBlocks))
-      ⟨fun o => o, 0, dbSt0 c⟩ (· = dbOut c) := by
+      ⟨some, 0, dbSt0 c, 0⟩ (· = dbOut c) := by
   cases c <;> exact ⟨5, _, rfl, rfl⟩
 
 theorem db_rel_arm (c : Bool) :
@@ -828,39 +858,36 @@ theorem db_forwardSim (c : Bool) :
       (Anneal.PureMirExec.mirStep diamondBody)
       (mirCfgStateRel tagOfLoan (dbBindingsAt c) id (dbExtra c))
       (MirOutcomeRel tagOfLoan []) := by
-  intro s ms hR
-  obtain ⟨hW, _, _, _, hExtra⟩ := hR
-  cases s with
-  | mk w bb st =>
-    have hwEq : w = (fun o => o) := funext hW
-    subst hwEq
-    rcases hExtra with ⟨hBb, hSt, hMs⟩ | ⟨hBb, hSt, hMs⟩ | ⟨hBb, hSt, hMs⟩
-    · subst hBb; subst hSt; subst hMs
-      cases c
-      · exact stepsTo_of_runMirToBlock_reached (rfl :
-          Anneal.PureMirExec.runMirToBlock diamondBody 2 (diamondMs0 false) =
-            .reached (dbMsArm false))
-          ⟨fun _ => rfl, rfl, rfl, db_rel_arm false, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
-      · exact stepsTo_of_runMirToBlock_reached (rfl :
-          Anneal.PureMirExec.runMirToBlock diamondBody 1 (diamondMs0 true) =
-            .reached (dbMsArm true))
-          ⟨fun _ => rfl, rfl, rfl, db_rel_arm true, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
-    · subst hSt; subst hMs
-      cases c
-      · subst hBb
-        exact stepsTo_of_runMirToBlock_reached (rfl :
-          Anneal.PureMirExec.runMirToBlock diamondBody 3 (dbMsArm false) =
-            .reached (diamondMsJoin false))
-          ⟨fun _ => rfl, rfl, rfl, db_rel_join false, Or.inr (Or.inr ⟨rfl, rfl, rfl⟩)⟩
-      · subst hBb
-        exact stepsTo_of_runMirToBlock_reached (rfl :
-          Anneal.PureMirExec.runMirToBlock diamondBody 3 (dbMsArm true) =
-            .reached (diamondMsJoin true))
-          ⟨fun _ => rfl, rfl, rfl, db_rel_join true, Or.inr (Or.inr ⟨rfl, rfl, rfl⟩)⟩
-    · subst hBb; subst hSt; subst hMs
-      cases c
-      · exact ⟨16, _, rfl, _, _, rfl, .pair (.nat (by decide)) (.nat (by decide)), rfl⟩
-      · exact ⟨16, _, rfl, _, _, rfl, .pair (.nat (by decide)) (.nat (by decide)), rfl⟩
+  refine mirCfg_forwardSim_of_waitFree tagOfLoan diamondBody diamondBlocks
+    (dbBindingsAt c) id (dbExtra c) [] ?_
+  intro w bb st ms ⟨hW, _, _, _, hExtra⟩
+  rcases hExtra with ⟨hBb, hSt, hMs⟩ | ⟨hBb, hSt, hMs⟩ | ⟨hBb, hSt, hMs⟩
+  · subst hBb; subst hSt; subst hMs
+    cases c
+    · exact stepsTo_of_runMirToBlock_reached (rfl :
+        Anneal.PureMirExec.runMirToBlock diamondBody 2 (diamondMs0 false) =
+          .reached (dbMsArm false))
+        ⟨hW, rfl, rfl, db_rel_arm false, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
+    · exact stepsTo_of_runMirToBlock_reached (rfl :
+        Anneal.PureMirExec.runMirToBlock diamondBody 1 (diamondMs0 true) =
+          .reached (dbMsArm true))
+        ⟨hW, rfl, rfl, db_rel_arm true, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
+  · subst hSt; subst hMs
+    cases c
+    · subst hBb
+      exact stepsTo_of_runMirToBlock_reached (rfl :
+        Anneal.PureMirExec.runMirToBlock diamondBody 3 (dbMsArm false) =
+          .reached (diamondMsJoin false))
+        ⟨hW, rfl, rfl, db_rel_join false, Or.inr (Or.inr ⟨rfl, rfl, rfl⟩)⟩
+    · subst hBb
+      exact stepsTo_of_runMirToBlock_reached (rfl :
+        Anneal.PureMirExec.runMirToBlock diamondBody 3 (dbMsArm true) =
+          .reached (diamondMsJoin true))
+        ⟨hW, rfl, rfl, db_rel_join true, Or.inr (Or.inr ⟨rfl, rfl, rfl⟩)⟩
+  · subst hBb; subst hSt; subst hMs
+    cases c
+    · exact ⟨16, _, rfl, _, _, rfl, .pair (.nat (by decide)) (.nat (by decide)), rfl⟩
+    · exact ⟨16, _, rfl, _, _, rfl, .pair (.nat (by decide)) (.nat (by decide)), rfl⟩
 
 /-- **Test 2b (block-level adequacy)**: for each oracle, the `PureLift` block
 CFG of the diamond simulates `diamondBody` block for block, realizing the
@@ -871,7 +898,7 @@ theorem db_sound (c : Bool) :
       (fun o => LiftedMirPost tagOfLoan (· = dbOut c) o []) :=
   mir_blockCfg_sound tagOfLoan diamondBody diamondBlocks (· = dbOut c)
     (dbBindingsAt c) id (dbExtra c) [] (db_forwardSim c) (db_cfg_wpConverges c)
-    ⟨fun _ => rfl, rfl, rfl, ⟨⟨trivial, trivial⟩,
+    ⟨subIdWrap_some, rfl, rfl, ⟨⟨trivial, trivial⟩,
       mirLocalsRel_of_localsRefine
         ⟨fun _ => ⟨_, rfl, .bool c⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
          fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩,
@@ -907,15 +934,15 @@ def lbBodyPlan : FlowPlan StdVal :=
       (.seq (.act (.endLoan 0))
         (.act (.assign (.localSub 0 []) (.constVal (.bool false))))))
 
-theorem lbBodyPlan_wf : WfPlan stdValAlg lbBodyPlan := fun _ => rfl
+theorem lbBodyPlan_wf : WfPlan stdValAlg lbBodyPlan := fun _ _ => rfl
 
 theorem lbBodyPlan_continuing :
     ∀ s f, evalPlan stdValAlg lbBodyPlan s = .ok f → Exists fun s' => f = .continuing s' :=
-  evalPlan_seq_continuing stdValAlg (fun _ => rfl) (fun _ => rfl)
+  evalPlan_seq_continuing stdValAlg (fun _ _ => rfl) (fun _ _ => rfl)
     (evalPlan_act_continuing stdValAlg _)
-    (evalPlan_seq_continuing stdValAlg (fun _ => rfl) (fun _ => rfl)
+    (evalPlan_seq_continuing stdValAlg (fun _ _ => rfl) (fun _ _ => rfl)
       (evalPlan_act_continuing stdValAlg _)
-      (evalPlan_seq_continuing stdValAlg (fun _ => rfl) (fun _ => rfl)
+      (evalPlan_seq_continuing stdValAlg (fun _ _ => rfl) (fun _ _ => rfl)
         (evalPlan_act_continuing stdValAlg _) (evalPlan_act_continuing stdValAlg _)))
 
 def loopBorrowCert : CfgCertificate stdValAlg :=
@@ -987,7 +1014,7 @@ theorem loopBorrow_cfgCertificate_sound :
   refine mir_cfgCertificate_sound tagOfLoan loopBorrowBody loopBorrowCert
     [⟨.byVal, .bool true⟩, ⟨.byVal, .nat 7⟩] lbSt0 (fun out => out.ret = .nat 42)
     (fun _ => []) id lbExtra [] rfl rfl lbBlockInv (fun out => out = ⟨.nat 42, []⟩)
-    ?_ ?_ (Or.inl ⟨rfl, rfl⟩) ?_ ⟨fun _ => rfl, rfl, rfl, hRel0, Or.inl ⟨rfl, rfl, rfl⟩⟩
+    ?_ ?_ (Or.inl ⟨rfl, rfl⟩) ?_ ⟨subIdWrap_some, rfl, rfl, hRel0, Or.inl ⟨rfl, rfl, rfl⟩⟩
   · intro bb st hInv
     rcases hInv with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩
     · exact Or.inr (Or.inl ⟨rfl, rfl⟩)
@@ -996,22 +1023,1515 @@ theorem loopBorrow_cfgCertificate_sound :
     · exact rfl
   · intro bb st hInv _ _ _ _ h
     rcases hInv with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ <;> exact nomatch h
-  · intro s ms ⟨hW, _, _, _, hEx⟩
-    cases s with
-    | mk w bb st =>
-      have hwEq : w = (fun o => o) := funext hW
-      subst hwEq
-      rcases hEx with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
-      · exact stepsTo_of_runMirToBlock_reached
-          (rfl : Anneal.PureMirExec.runMirToBlock loopBorrowBody 1 lbMs0 = .reached lbMsBody)
-          ⟨fun _ => rfl, rfl, rfl, hRelBody, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
-      · exact stepsTo_of_runMirToBlock_reached
-          (rfl : Anneal.PureMirExec.runMirToBlock loopBorrowBody 0 lbMsBody = .reached lbMsAfterIter)
-          ⟨fun _ => rfl, rfl, rfl, hRelAfter, Or.inr (Or.inr (Or.inl ⟨rfl, rfl, rfl⟩))⟩
-      · exact stepsTo_of_runMirToBlock_reached
-          (rfl : Anneal.PureMirExec.runMirToBlock loopBorrowBody 2 lbMsAfterIter = .reached lbMsExit)
-          ⟨fun _ => rfl, rfl, rfl, hRelExit, Or.inr (Or.inr (Or.inr ⟨rfl, rfl, rfl⟩))⟩
-      · exact ⟨8, _, rfl, _, _, rfl, .nat (by decide), rfl⟩
+  · refine mirCfg_forwardSim_of_waitFree tagOfLoan loopBorrowBody loopBorrowCert.blocks
+      (fun _ => []) id lbExtra [] ?_
+    intro w bb st ms ⟨hW, _, _, _, hEx⟩
+    rcases hEx with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
+    · exact stepsTo_of_runMirToBlock_reached
+        (rfl : Anneal.PureMirExec.runMirToBlock loopBorrowBody 1 lbMs0 = .reached lbMsBody)
+        ⟨hW, rfl, rfl, hRelBody, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
+    · exact stepsTo_of_runMirToBlock_reached
+        (rfl : Anneal.PureMirExec.runMirToBlock loopBorrowBody 0 lbMsBody = .reached lbMsAfterIter)
+        ⟨hW, rfl, rfl, hRelAfter, Or.inr (Or.inr (Or.inl ⟨rfl, rfl, rfl⟩))⟩
+    · exact stepsTo_of_runMirToBlock_reached
+        (rfl : Anneal.PureMirExec.runMirToBlock loopBorrowBody 2 lbMsAfterIter = .reached lbMsExit)
+        ⟨hW, rfl, rfl, hRelExit, Or.inr (Or.inr (Or.inr ⟨rfl, rfl, rfl⟩))⟩
+    · exact ⟨8, _, rfl, _, _, rfl, .nat (by decide), rfl⟩
+
+/-! ### Test 2b-sym: Symbolic Diamond via `.convergedJump` (`armSteps = 1`) and `Option Ret` Acceptance vs. Rejection -/
+
+/-- Symbolic output of `diamondBlocks` when entered at `bb0` with symbolic
+`_0 = .symBool c`. -/
+def diamondSymOut (c : Bool) : FuncOut StdVal :=
+  ⟨.pair (zipStdVal (.symBool c) (.nat 50) (.nat 3))
+    (zipStdVal (.symBool c) (.nat 4) (.nat 50)), []⟩
+
+/-- **`.convergedJump` on `diamondBlocks` (`armSteps = 1 > 0`)**: on the
+symbolic entry state `diamondSt0 c` (`_0 = .symBool c`), block `0` of
+`diamondBlocks` evaluates both arm `1` (`&mut p.0`) and arm `2` (`&mut p.1`),
+joins them at `bb3` into `diamondStJoin c` (`BackTarget.choice`), and emits
+`.convergedJump 1 (handleFreeOutOpt stdValAlg) 3 (diamondStJoin c)`. -/
+theorem diamondBlocks_convergedJump (c : Bool) :
+    stepBasicBlock stdValAlg diamondBlocks 0 (diamondSt0 c) =
+      .convergedJump 1 (handleFreeOutOpt stdValAlg) 3 (diamondStJoin c) := by
+  cases c <;> rfl
+
+/-- Exact `armSteps = 1` fuel accounting on `diamondBlocks` from symbolic
+`diamondSt0 c`: fuel `2` (`1` step for `.convergedJump` + `1` delay tick) runs
+out of fuel before `bb3` executes, while fuel `3` halts with `diamondSymOut c`. -/
+theorem dbSym_cfg_wpConverges (c : Bool) :
+    Anneal.PureMirExec.evalFuel
+      (blockCfgStep (stepBasicBlock stdValAlg diamondBlocks)) 2
+      ⟨some, 0, diamondSt0 c, 0⟩ = .outOfFuel ∧
+    Anneal.PureMirExec.WpConverges
+      (blockCfgStep (stepBasicBlock stdValAlg diamondBlocks))
+      ⟨some, 0, diamondSt0 c, 0⟩ (· = diamondSymOut c) := by
+  cases c <;> exact ⟨rfl, 3, _, rfl, rfl⟩
+
+def dbSymExtra (c : Bool) (bb : Nat) (st : SymState StdVal)
+    (ms : MachineState) : Prop :=
+  (bb = 0 ∧ st = diamondSt0 c ∧ ms = diamondMs0 c) ∨
+  (bb = 3 ∧ st = diamondStJoin c ∧ ms = diamondMsJoin c)
+
+/-- **Wait-free forward simulation of the `.convergedJump` diamond**: at `bb0`,
+the `.convergedJump 1 (handleFreeOutOpt stdValAlg) 3 (diamondStJoin c)` step is
+matched by `diamond_runMirToBlock c` (`runMirToBlock diamondBody 3`) into
+`diamondMsJoin c` with pending wrapper `composeWrap w (handleFreeOutOpt stdValAlg)`
+and `wait = 1`; `mirCfg_forwardSim_of_waitFree` stutters through the `wait = 1 →
+0` delay tick automatically and unwraps the sub-identity guard at `bb3`. -/
+theorem dbSym_forwardSim (c : Bool) :
+    ForwardSim (blockCfgStep (stepBasicBlock stdValAlg diamondBlocks))
+      (Anneal.PureMirExec.mirStep diamondBody)
+      (mirCfgStateRel tagOfLoan (dbBindingsAt c) id (dbSymExtra c))
+      (MirOutcomeRel tagOfLoan []) := by
+  refine mirCfg_forwardSim_of_waitFree tagOfLoan diamondBody diamondBlocks
+    (dbBindingsAt c) id (dbSymExtra c) [] ?_
+  intro w bb st ms ⟨hW, _, _, _, hExtra⟩
+  rcases hExtra with ⟨hBb, hSt, hMs⟩ | ⟨hBb, hSt, hMs⟩
+  · subst hBb; subst hSt; subst hMs
+    cases c <;>
+      exact stepsTo_of_runMirToBlock_reached (diamond_runMirToBlock _)
+        ⟨subIdWrap_composeWrap hW (subIdWrap_handleFreeOutOpt stdValAlg),
+         rfl, rfl, diamond_join_rel _, Or.inr ⟨rfl, rfl, rfl⟩⟩
+  · subst hBb; subst hSt; subst hMs
+    cases c
+    · exact ⟨16, _, rfl, _, _, rfl, diamond_ret_refines false, rfl⟩
+    · exact ⟨16, _, rfl, _, _, rfl, diamond_ret_refines true, rfl⟩
+
+/-- **Test 2b-sym (live `V2026_06_01` adequacy of `.convergedJump` with
+`armSteps = 1`)**: `mir_blockCfg_sound` transports `dbSym_cfg_wpConverges`
+across `dbSym_forwardSim` (`SubIdWrap`-preserving `.convergedJump 1`) to prove
+`MirWpConverges` of `diamondBody` for every oracle `c : Bool`. -/
+theorem dbSym_sound (c : Bool) :
+    Anneal.MirFuelFree.MirWpConverges diamondBody (diamondMs0 c)
+      (fun o => LiftedMirPost tagOfLoan (· = diamondSymOut c) o []) :=
+  mir_blockCfg_sound tagOfLoan diamondBody diamondBlocks (· = diamondSymOut c)
+    (dbBindingsAt c) id (dbSymExtra c) []
+    (dbSym_forwardSim c) (dbSym_cfg_wpConverges c).2
+    ⟨subIdWrap_some, rfl, rfl, diamond_entry_rel c, Or.inl ⟨rfl, rfl, rfl⟩⟩
+
+/-- `diamondBlocks` emits only sub-identity wrappers from the `dbSymExtra`
+states: block `0` emits the `handleFreeOutOpt`-guarded `.convergedJump`, and
+block `3` returns. -/
+theorem dbSym_emitsSubIdWraps (c : Bool) :
+    EmitsSubIdWraps (stepBasicBlock stdValAlg diamondBlocks)
+      (fun bb st => Exists fun ms => dbSymExtra c bb st ms) := by
+  intro bb st ⟨_, hEx⟩
+  rcases hEx with ⟨hBb, hSt, _⟩ | ⟨hBb, hSt, _⟩
+  · subst hBb
+    subst hSt
+    rw [diamondBlocks_convergedJump]
+    exact subIdWrap_handleFreeOutOpt stdValAlg
+  · subst hBb
+    subst hSt
+    cases c <;> exact trivial
+
+/-- **Non-vacuity of `mirCfg_forwardSim_of_emitsSubIdWraps`**: the symbolic
+`.convergedJump` diamond simulates `diamondBody` with per-block obligations that
+mention neither the pending wrapper nor the delay (`mirCfgBlockRel`), and
+`mir_blockCfg_sound` again yields live `MirWpConverges` for every oracle. -/
+theorem dbSym_sound_of_emitsSubIdWraps (c : Bool) :
+    Anneal.MirFuelFree.MirWpConverges diamondBody (diamondMs0 c)
+      (fun o => LiftedMirPost tagOfLoan (· = diamondSymOut c) o []) :=
+  mir_blockCfg_sound tagOfLoan diamondBody diamondBlocks (· = diamondSymOut c)
+    (dbBindingsAt c) id (dbSymExtra c) []
+    (mirCfg_forwardSim_of_emitsSubIdWraps tagOfLoan diamondBody diamondBlocks
+      (dbBindingsAt c) id (dbSymExtra c) [] (dbSym_emitsSubIdWraps c)
+      (fun bb st ms ⟨_, _, _, hExtra⟩ => by
+        rcases hExtra with ⟨hBb, hSt, hMs⟩ | ⟨hBb, hSt, hMs⟩
+        · subst hBb; subst hSt; subst hMs
+          cases c <;>
+            exact stepsTo_of_runMirToBlock_reached (diamond_runMirToBlock _)
+              ⟨rfl, rfl, diamond_join_rel _, Or.inr ⟨rfl, rfl, rfl⟩⟩
+        · subst hBb; subst hSt; subst hMs
+          cases c
+          · exact ⟨16, _, rfl, _, _, rfl, diamond_ret_refines false, rfl⟩
+          · exact ⟨16, _, rfl, _, _, rfl, diamond_ret_refines true, rfl⟩))
+    (dbSym_cfg_wpConverges c).2
+    ⟨subIdWrap_some, rfl, rfl, diamond_entry_rel c, Or.inl ⟨rfl, rfl, rfl⟩⟩
+
+def diamondPrePlan : FlowPlan StdVal :=
+  .act (.assign (.localSub 3 []) (.binary stdMkPair (.localSub 1 []) (.localSub 2 [])))
+
+def diamondArmTruePlan : FlowPlan StdVal :=
+  .act (.borrow 4 .mutBorrow (.localSub 3 [0]))
+
+def diamondArmFalsePlan : FlowPlan StdVal :=
+  .act (.borrow 4 .mutBorrow (.localSub 3 [1]))
+
+def diamondPostPlan : FlowPlan StdVal :=
+  .seq (.act (.assign (.derefSub 4 []) (.constVal (.nat 50)))) (.act (.endLoan 0))
+
+theorem diamondPostPlan_wf : WfPlan stdValAlg diamondPostPlan := fun _ _ => rfl
+
+theorem diamondPostPlan_continuing :
+    ∀ s f, evalPlan stdValAlg diamondPostPlan s = .ok f →
+      Exists fun s' => f = .continuing s' :=
+  evalPlan_seq_continuing stdValAlg (fun _ _ => rfl) (fun _ _ => rfl)
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+
+/-- 4-block diamond `CfgCertificate` for `diamondBlocks`, constructed via
+`CfgCertificate.diamond` at fuel `3`. -/
+def diamondCert : CfgCertificate stdValAlg :=
+  CfgCertificate.diamond stdValAlg diamondPrePlan (.use (.localSub 0 []))
+    diamondArmTruePlan diamondArmFalsePlan diamondPostPlan
+    (.use (.localSub 3 []))
+    (fun _ _ => rfl) (fun _ _ => rfl) (fun _ _ => rfl) diamondPostPlan_wf
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    diamondPostPlan_continuing
+
+theorem diamondCert_blocks_eq : diamondCert.blocks = diamondBlocks := rfl
+
+/-- Unqualified composition of `evalPlan_skip_continuing` and
+`evalPlan_branch_continuing` (from `MirLiftCoreInterop`) with
+`evalPlan_act_continuing` and `evalPlan_seq_continuing` (from
+`V2026_06_01Bridge`), proving that both `diamondCert.plan` and a branch with a
+`.skip` arm produce only `.continuing` flows (regression canary against
+ambiguous duplicate declarations across namespaces). -/
+theorem diamondFullPlan_and_skip_branch_continuing :
+    (∀ s f, evalPlan stdValAlg diamondCert.plan s = .ok f →
+      Exists fun s' => f = .continuing s') ∧
+    (∀ s f,
+      evalPlan stdValAlg
+        (.branch (.use (.localSub 0 [])) diamondArmTruePlan .skip) s = .ok f →
+      Exists fun s' => f = .continuing s') :=
+  ⟨evalPlan_seq_continuing stdValAlg (fun _ _ => rfl)
+     (wfPlan_seq stdValAlg
+       (wfPlan_branch stdValAlg (.use (.localSub 0 []))
+         (fun _ _ => rfl) (fun _ _ => rfl))
+       diamondPostPlan_wf)
+     (evalPlan_act_continuing stdValAlg _)
+     (evalPlan_seq_continuing stdValAlg
+       (wfPlan_branch stdValAlg (.use (.localSub 0 []))
+         (fun _ _ => rfl) (fun _ _ => rfl))
+       diamondPostPlan_wf
+       (evalPlan_branch_continuing stdValAlg (.use (.localSub 0 []))
+         (fun _ _ => rfl) (fun _ _ => rfl)
+         (evalPlan_act_continuing stdValAlg _)
+         (evalPlan_act_continuing stdValAlg _))
+       diamondPostPlan_continuing),
+   evalPlan_branch_continuing stdValAlg (.use (.localSub 0 []))
+     (fun _ _ => rfl) (wfPlan_skip stdValAlg)
+     (evalPlan_act_continuing stdValAlg _)
+     (evalPlan_skip_continuing stdValAlg)⟩
+
+/-- **Test 2b-cert (`CfgCertificate.diamond` / `mir_diamond_cfgCertificate_sound`
+over a symbolic `.convergedJump 1` diamond)**: certifies `diamondBody` from
+symbolic `diamondSt0 c` (`_0 = .symBool c`) through `CfgCertificate.diamond` and
+`mir_cfgCertificate_sound_of_invClosedNoFork`, where block `0` genuinely emits
+`.convergedJump 1 (handleFreeOutOpt stdValAlg) 3 (diamondStJoin c)`
+(`diamondBlocks_convergedJump`). Only `HoldsFnSpec` of the structured plan and
+the per-block live obligations are supplied: no block step is precomputed. -/
+theorem diamond_cfgCertificate_sound (c : Bool) :
+    Anneal.MirFuelFree.MirWpConverges diamondBody (diamondMs0 c)
+      (fun o => LiftedMirPost tagOfLoan (· = diamondSymOut c) o []) :=
+  mir_diamond_cfgCertificate_sound tagOfLoan diamondBody
+    diamondPrePlan (.use (.localSub 0 []))
+    diamondArmTruePlan diamondArmFalsePlan diamondPostPlan
+    (.use (.localSub 3 []))
+    (fun _ _ => rfl) (fun _ _ => rfl) (fun _ _ => rfl) diamondPostPlan_wf
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    diamondPostPlan_continuing
+    (diamondParams c) (diamondSt0 c) (· = diamondSymOut c)
+    (dbBindingsAt c) id (dbSymExtra c) []
+    (diamond_init c) (by cases c <;> exact rfl)
+    (fun bb st ms ⟨_, _, _, hExtra⟩ => by
+      rcases hExtra with ⟨hBb, hSt, hMs⟩ | ⟨hBb, hSt, hMs⟩
+      · subst hBb; subst hSt; subst hMs
+        cases c <;>
+          exact stepsTo_of_runMirToBlock_reached (diamond_runMirToBlock _)
+            ⟨rfl, rfl, diamond_join_rel _, Or.inr ⟨rfl, rfl, rfl⟩⟩
+      · subst hBb; subst hSt; subst hMs
+        cases c
+        · exact ⟨16, _, rfl, _, _, rfl, diamond_ret_refines false, rfl⟩
+        · exact ⟨16, _, rfl, _, _, rfl, diamond_ret_refines true, rfl⟩)
+    ⟨rfl, rfl, diamond_entry_rel c, Or.inl ⟨rfl, rfl, rfl⟩⟩
+
+/-- **`LocalBlockVC` route of `mir_cfgCertificate_sound` through a
+`.convergedJump`**: with both block steps of the symbolic diamond computed
+(`diamondBlocks_convergedJump`, and `bb3` returning `diamondSymOut c`), the exact
+2-point invariant `diamondSymBlockInv` satisfies `LocalBlockVC` with `PostRet :=
+(· = diamondSymOut c)` (the pending `handleFreeOutOpt` guard must, and does,
+accept the handle-free return unchanged) and never forks, so
+`mir_cfgCertificate_sound` transports `diamondCert` to live `MirWpConverges`
+along `dbSym_forwardSim`. -/
+theorem diamond_cfgCertificate_sound_localBlockVC (c : Bool) :
+    Anneal.MirFuelFree.MirWpConverges diamondBody (diamondMs0 c)
+      (fun o => LiftedMirPost tagOfLoan (· = diamondSymOut c) o []) := by
+  have hStep3 :
+      stepBasicBlock stdValAlg diamondCert.blocks 3 (diamondStJoin c) =
+        .ret (diamondSymOut c) := by
+    cases c <;> rfl
+  have hWrap :
+      handleFreeOutOpt stdValAlg (diamondSymOut c) = some (diamondSymOut c) := by
+    cases c <;> rfl
+  exact mir_cfgCertificate_sound tagOfLoan diamondBody diamondCert
+    (diamondParams c) (diamondSt0 c) (· = diamondSymOut c)
+    (dbBindingsAt c) id (dbSymExtra c) [] (diamond_init c)
+    (by cases c <;> exact rfl)
+    (diamondSymBlockInv (diamondSt0 c) (diamondStJoin c)) (· = diamondSymOut c)
+    (diamondSymBlockInv_localBlockVC stdValAlg diamondCert.blocks _ _ 1
+      (handleFreeOutOpt stdValAlg) _ (diamondBlocks_convergedJump c) hStep3 hWrap)
+    (diamondSymBlockInv_noFork stdValAlg diamondCert.blocks _ _ 1
+      (handleFreeOutOpt stdValAlg) _ (diamondBlocks_convergedJump c) hStep3)
+    (Or.inl ⟨rfl, rfl⟩) (dbSym_forwardSim c)
+    ⟨subIdWrap_some, rfl, rfl, diamond_entry_rel c, Or.inl ⟨rfl, rfl, rfl⟩⟩
+
+/-- Concrete-oracle parameters of `diamond` (`c : bool` passed as `.bool c`). -/
+def dbParams (c : Bool) : List (ParamInput StdVal) :=
+  [⟨.byVal, .bool c⟩, ⟨.byVal, .nat 3⟩, ⟨.byVal, .nat 4⟩]
+
+/-- **Test 2b-cert (concrete condition)**: the same `CfgCertificate.diamond`
+certifies the concrete diamond (`_0 = .bool c`, path `0 → 1/2 → 3`, no
+`.convergedJump`) through the same `mir_diamond_cfgCertificate_sound`, with the
+3-point live block relation of Test 2b (`dbExtra`). -/
+theorem db_cfgCertificate_sound (c : Bool) :
+    Anneal.MirFuelFree.MirWpConverges diamondBody (diamondMs0 c)
+      (fun o => LiftedMirPost tagOfLoan (· = dbOut c) o []) :=
+  mir_diamond_cfgCertificate_sound tagOfLoan diamondBody
+    diamondPrePlan (.use (.localSub 0 []))
+    diamondArmTruePlan diamondArmFalsePlan diamondPostPlan
+    (.use (.localSub 3 []))
+    (fun _ _ => rfl) (fun _ _ => rfl) (fun _ _ => rfl) diamondPostPlan_wf
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    diamondPostPlan_continuing
+    (dbParams c) (dbSt0 c) (· = dbOut c)
+    (dbBindingsAt c) id (dbExtra c) []
+    rfl (by cases c <;> exact rfl)
+    (fun bb st ms ⟨_, _, _, hExtra⟩ => by
+      rcases hExtra with ⟨hBb, hSt, hMs⟩ | ⟨hBb, hSt, hMs⟩ | ⟨hBb, hSt, hMs⟩
+      · subst hBb; subst hSt; subst hMs
+        cases c
+        · exact stepsTo_of_runMirToBlock_reached (rfl :
+            Anneal.PureMirExec.runMirToBlock diamondBody 2 (diamondMs0 false) =
+              .reached (dbMsArm false))
+            ⟨rfl, rfl, db_rel_arm false, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
+        · exact stepsTo_of_runMirToBlock_reached (rfl :
+            Anneal.PureMirExec.runMirToBlock diamondBody 1 (diamondMs0 true) =
+              .reached (dbMsArm true))
+            ⟨rfl, rfl, db_rel_arm true, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
+      · subst hSt; subst hMs
+        cases c
+        · subst hBb
+          exact stepsTo_of_runMirToBlock_reached (rfl :
+            Anneal.PureMirExec.runMirToBlock diamondBody 3 (dbMsArm false) =
+              .reached (diamondMsJoin false))
+            ⟨rfl, rfl, db_rel_join false, Or.inr (Or.inr ⟨rfl, rfl, rfl⟩)⟩
+        · subst hBb
+          exact stepsTo_of_runMirToBlock_reached (rfl :
+            Anneal.PureMirExec.runMirToBlock diamondBody 3 (dbMsArm true) =
+              .reached (diamondMsJoin true))
+            ⟨rfl, rfl, db_rel_join true, Or.inr (Or.inr ⟨rfl, rfl, rfl⟩)⟩
+      · subst hBb; subst hSt; subst hMs
+        cases c
+        · exact ⟨16, _, rfl, _, _, rfl, .pair (.nat (by decide)) (.nat (by decide)), rfl⟩
+        · exact ⟨16, _, rfl, _, _, rfl, .pair (.nat (by decide)) (.nat (by decide)), rfl⟩)
+    ⟨rfl, rfl, ⟨⟨trivial, trivial⟩,
+      mirLocalsRel_of_localsRefine
+        ⟨fun _ => ⟨_, rfl, .bool c⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+         fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩,
+     Or.inl ⟨rfl, rfl, rfl⟩⟩
+
+/-- **`CfgCertificate.diamond`'s fuel `3` is exact**: the concrete path
+(`0 → 1/2 → 3`) and the symbolic run (`.convergedJump 1`: one step and one delay
+tick, then `bb3`) both diverge at fuel `2` and return at the certificate's fuel
+`3`, the latter from the certificate's own `sound` field applied to the plan's
+evaluation (concrete `dbParams c` and symbolic `diamondParams c`). -/
+theorem diamondCert_fuel_exact (c : Bool) :
+    runBlockCfg (stepBasicBlock stdValAlg diamondCert.blocks) 0 (dbSt0 c) 2 =
+      .diverged ∧
+    runBlockCfg (stepBasicBlock stdValAlg diamondCert.blocks) 0 (dbSt0 c)
+      diamondCert.fuel = .ret (dbOut c) ∧
+    runBlockCfg (stepBasicBlock stdValAlg diamondCert.blocks) 0 (diamondSt0 c) 2 =
+      .diverged ∧
+    runBlockCfg (stepBasicBlock stdValAlg diamondCert.blocks) 0 (diamondSt0 c)
+      diamondCert.fuel = .ret (diamondSymOut c) :=
+  ⟨by cases c <;> rfl,
+   diamondCert.sound (dbParams c) (dbSt0 c) (dbOut c) rfl (by cases c <;> rfl),
+   by cases c <;> rfl,
+   diamondCert.sound (diamondParams c) (diamondSt0 c) (diamondSymOut c)
+     (diamond_init c) (by cases c <;> rfl)⟩
+
+/-- Wrapper-level unit test for `handleFreeOutOpt stdValAlg` inside
+`runBlockCfg`: block `0` emits `.convergedJump 1 (handleFreeOutOpt stdValAlg) 3
+(diamondStJoin c)` and block `3` returns `⟨.refVal 0 [], []⟩`. -/
+def diamondLeakStep (c : Bool) (bb : Nat) (_st : SymState StdVal) :
+    BlockStepResult (SymState StdVal) (FuncOut StdVal) :=
+  match bb with
+  | 0 => .convergedJump 1 (handleFreeOutOpt stdValAlg) 3 (diamondStJoin c)
+  | 3 => .ret ⟨.refVal 0 [], []⟩
+  | _ => .fault
+
+/-- Real `List (BasicBlock StdVal)` variant of `diamondBlocks` whose join block
+`bb3` ends loan `0` (`stateCleanAtReturn = true`) and attempts to return the
+stale borrow handle `_4 = .refVal 0 []` under `.convergedJump 1`. -/
+def diamondLeakRetBlocks : List (BasicBlock StdVal) :=
+  [⟨.act (.assign (.localSub 3 []) (.binary stdMkPair (.localSub 1 []) (.localSub 2 []))),
+     .branch (.use (.localSub 0 [])) 1 2⟩,
+   ⟨.act (.borrow 4 .mutBorrow (.localSub 3 [0])), .goto 3⟩,
+   ⟨.act (.borrow 4 .mutBorrow (.localSub 3 [1])), .goto 3⟩,
+   ⟨.seq (.act (.assign (.derefSub 4 []) (.constVal (.nat 50)))) (.act (.endLoan 0)),
+     .ret (.use (.localSub 4 []))⟩]
+
+/-- Real `List (BasicBlock StdVal)` variant of `diamondBlocks` where arm `1`
+(`bb1`) contains a symbolic guarded early return `.earlyReturn [0] []
+(.use (.localSub 4 []))` of the stale borrow handle `_4 = .refVal 0 []` on one
+sub-path while continuing on the other, and `bb3` returns the clean handle-free
+pair `.use (.localSub 3 [])`. Here `stepBasicBlock` at `bb3` succeeds with
+`.ret (diamondSymOut c)`, and `.convergedJump 1`'s own `wrapJoined` rejects that
+return (`none`) because merging the guarded early return introduces `.refVal 0 []`! -/
+def diamondGuardedLeakBlocks : List (BasicBlock StdVal) :=
+  [⟨.act (.assign (.localSub 3 []) (.binary stdMkPair (.localSub 1 []) (.localSub 2 []))),
+     .branch (.use (.localSub 0 [])) 1 2⟩,
+   ⟨.seq (.act (.borrow 4 .mutBorrow (.localSub 3 [0])))
+      (.branch (.use (.localSub 0 []))
+        (.earlyReturn [0] [] (.use (.localSub 4 [])))
+        .skip),
+    .goto 3⟩,
+   ⟨.act (.borrow 4 .mutBorrow (.localSub 3 [1])), .goto 3⟩,
+   ⟨.seq (.act (.assign (.derefSub 4 []) (.constVal (.nat 50)))) (.act (.endLoan 0)),
+     .ret (.use (.localSub 3 []))⟩]
+
+/-- Structured `FlowPlan` corresponding to `diamondGuardedLeakBlocks`: arm `1`
+contains a guarded `.earlyReturn [0] [] (.use (.localSub 4 []))` of the stale
+borrow handle `_4 = .refVal 0 []`. -/
+def diamondGuardedLeakPlan : FlowPlan StdVal :=
+  .seq diamondPrePlan
+    (.seq
+      (.branch (.use (.localSub 0 []))
+        (.seq diamondArmTruePlan
+          (.branch (.use (.localSub 0 []))
+            (.earlyReturn [0] [] (.use (.localSub 4 [])))
+            .skip))
+        diamondArmFalsePlan)
+      diamondPostPlan)
+
+/-- **Live `stepBasicBlock` and `evalFnValue` handle-leak rejection under
+`.convergedJump`**:
+1. On `diamondLeakRetBlocks`, `bb0` emits `.convergedJump 1 (handleFreeOutOpt stdValAlg) 3 (diamondStJoin c)`,
+   and `bb3` faults in `stepBasicBlock` when returning `_4 = .refVal 0 []`, so
+   `runBlockCfg`, `blockCfgStep`, and the structured plan evaluation
+   `evalFnValue stdValAlg (diamondParams c) diamondCert.plan (.use (.localSub 4 []))`
+   all fault / fail (`¬ HoldsFnSpec`).
+2. On `diamondGuardedLeakBlocks`, `bb0` emits `.convergedJump 1 wrapJoined 3 (diamondStJoin c)`
+   (via `finishConvergedBranch`'s `.guardedContinuing` branch), `bb3` succeeds in
+   `stepBasicBlock` with `.ret (diamondSymOut c)`, and `wrapJoined (diamondSymOut c) = none`
+   rejects the merged output, so `runBlockCfg`, `blockCfgStep`, and the
+   structured plan evaluation `evalFnValue stdValAlg (diamondParams c) diamondGuardedLeakPlan (.use (.localSub 3 []))`
+   all fault / fail (`¬ HoldsFnSpec`) and converge to no postcondition `P`. -/
+theorem diamondLeakBlocks_stepBasicBlock_fault_canaries
+    (c : Bool) (P : FuncOut StdVal → Prop) :
+    evalFnValue stdValAlg (diamondParams c) diamondCert.plan
+      (.use (.localSub 4 [])) = .fail ∧
+    ¬ HoldsFnSpec
+      (evalFnValue stdValAlg (diamondParams c) diamondCert.plan
+        (.use (.localSub 4 []))) P ∧
+    stepBasicBlock stdValAlg diamondLeakRetBlocks 0 (diamondSt0 c) =
+      .convergedJump 1 (handleFreeOutOpt stdValAlg) 3 (diamondStJoin c) ∧
+    stepBasicBlock stdValAlg diamondLeakRetBlocks 3 (diamondStJoin c) = .fault ∧
+    runBlockCfg (stepBasicBlock stdValAlg diamondLeakRetBlocks) 0
+      (diamondSt0 c) 3 = .fault ∧
+    Anneal.PureMirExec.evalFuel
+      (blockCfgStep (stepBasicBlock stdValAlg diamondLeakRetBlocks)) 3
+      ⟨some, 0, diamondSt0 c, 0⟩ = .faulted ∧
+    ¬ Anneal.PureMirExec.WpConverges
+      (blockCfgStep (stepBasicBlock stdValAlg diamondLeakRetBlocks))
+      ⟨some, 0, diamondSt0 c, 0⟩ P ∧
+    evalFnValue stdValAlg (diamondParams c) diamondGuardedLeakPlan
+      (.use (.localSub 3 [])) = .fail ∧
+    ¬ HoldsFnSpec
+      (evalFnValue stdValAlg (diamondParams c) diamondGuardedLeakPlan
+        (.use (.localSub 3 []))) P ∧
+    stepBasicBlock stdValAlg diamondGuardedLeakBlocks 3 (diamondStJoin c) =
+      .ret (diamondSymOut c) ∧
+    (Exists fun wrapJoined =>
+      stepBasicBlock stdValAlg diamondGuardedLeakBlocks 0 (diamondSt0 c) =
+        .convergedJump 1 wrapJoined 3 (diamondStJoin c) ∧
+      wrapJoined (diamondSymOut c) = none) ∧
+    runBlockCfg (stepBasicBlock stdValAlg diamondGuardedLeakBlocks) 0
+      (diamondSt0 c) 3 = .fault ∧
+    Anneal.PureMirExec.evalFuel
+      (blockCfgStep (stepBasicBlock stdValAlg diamondGuardedLeakBlocks)) 3
+      ⟨some, 0, diamondSt0 c, 0⟩ = .faulted ∧
+    ¬ Anneal.PureMirExec.WpConverges
+      (blockCfgStep (stepBasicBlock stdValAlg diamondGuardedLeakBlocks))
+      ⟨some, 0, diamondSt0 c, 0⟩ P := by
+  have hPlanFailRet :
+      evalFnValue stdValAlg (diamondParams c) diamondCert.plan
+        (.use (.localSub 4 [])) = .fail := by
+    cases c <;> rfl
+  have hPlanFailGuarded :
+      evalFnValue stdValAlg (diamondParams c) diamondGuardedLeakPlan
+        (.use (.localSub 3 [])) = .fail := by
+    cases c <;> rfl
+  have hFaultRet :
+      runBlockCfg (stepBasicBlock stdValAlg diamondLeakRetBlocks) 0
+        (diamondSt0 c) 3 = .fault := by
+    cases c <;> rfl
+  have hFaultGuarded :
+      runBlockCfg (stepBasicBlock stdValAlg diamondGuardedLeakBlocks) 0
+        (diamondSt0 c) 3 = .fault := by
+    cases c <;> rfl
+  refine ⟨hPlanFailRet,
+    by rw [hPlanFailRet]; exact holdsFnSpec_not_fail P,
+    by cases c <;> rfl,
+    by cases c <;> rfl,
+    hFaultRet,
+    by cases c <;> rfl,
+    not_wpConverges_blockCfgStep_of_runBlockCfg_fault
+      (stepBasicBlock stdValAlg diamondLeakRetBlocks) hFaultRet P,
+    hPlanFailGuarded,
+    by rw [hPlanFailGuarded]; exact holdsFnSpec_not_fail P,
+    by cases c <;> rfl,
+    by cases c <;> exact ⟨_, rfl, rfl⟩,
+    hFaultGuarded,
+    by cases c <;> rfl,
+    not_wpConverges_blockCfgStep_of_runBlockCfg_fault
+      (stepBasicBlock stdValAlg diamondGuardedLeakBlocks) hFaultGuarded P⟩
+
+/-- **Non-vacuity of `Option Ret` wrapper rejection on `.convergedJump` and
+`stdValAlg` `branchSplit` / `sameCond` / `sameAggregateShape` bridge laws**:
+1. When a partial post-return wrapper rejects `diamondSymOut c` (`none`),
+   `blockCfgStep (stepBasicBlock stdValAlg diamondBlocks)` faults at fuel `3`
+   and converges to no postcondition `P`.
+2. When the join block returns a leaked borrow handle `⟨.refVal 0 [], []⟩` under
+   `.convergedJump`'s `handleFreeOutOpt stdValAlg` wrapper, `handleFreeOutOpt`
+   returns `none`, `runBlockCfg` faults at fuel `3`, and `blockCfgStep`
+   converges to no postcondition `P`.
+3. `stdValAlg.branchSplit` splits the symbolic choice fields of `diamondSymOut c`,
+   and `StdValRefines.of_branchSplit`, `StdValRefines.branchSplit_inv`,
+   `stdValAlg_sameCond_symBool_iff`, and `stdValAlg_sameAggregateShape_pair`
+   hold on the live diamond values. -/
+theorem dbSym_convergedJump_rejection_and_valAlgebra_canaries
+    (c : Bool) (P : FuncOut StdVal → Prop) :
+    let rejectWrap : FuncOut StdVal → Option (FuncOut StdVal) :=
+      fun out =>
+        if stdValEq out.ret (.pair (.nat 0) (.nat 0)) then some out else none
+    Anneal.PureMirExec.evalFuel
+      (blockCfgStep (stepBasicBlock stdValAlg diamondBlocks)) 3
+      ⟨rejectWrap, 0, diamondSt0 c, 0⟩ = .faulted ∧
+    ¬ Anneal.PureMirExec.WpConverges
+      (blockCfgStep (stepBasicBlock stdValAlg diamondBlocks))
+      ⟨rejectWrap, 0, diamondSt0 c, 0⟩ P ∧
+    handleFreeOutOpt stdValAlg ⟨.refVal 0 [], []⟩ = none ∧
+    runBlockCfg (diamondLeakStep c) 0 (diamondSt0 c) 3 = .fault ∧
+    ¬ Anneal.PureMirExec.WpConverges
+      (blockCfgStep (diamondLeakStep c))
+      ⟨some, 0, diamondSt0 c, 0⟩ P ∧
+    stdValAlg.branchSplit (zipStdVal (.symBool c) (.nat 50) (.nat 3)) =
+      some (.symBool c, .nat 50, .nat 3) ∧
+    StdValRefines tagOfLoan (zipStdVal (.symBool c) (.nat 50) (.nat 3))
+      (.scalar ⟨if c then 50 else 3, 4⟩) ∧
+    (Exists fun b : Bool =>
+      StdVal.symBool c = .symBool b ∧
+      StdValRefines tagOfLoan
+        (if b then .nat 50 else .nat 3)
+        (.scalar ⟨if c then 50 else 3, 4⟩)) ∧
+    (stdValAlg.sameCond (.symBool c) (.symBool (!c)) = false) ∧
+    stdValAlg.sameAggregateShape (diamondSymOut c).ret (dbOut c).ret = true := by
+  intro rejectWrap
+  have hFault1 :
+      Anneal.PureMirExec.evalFuel
+        (blockCfgStep (stepBasicBlock stdValAlg diamondBlocks)) 3
+        ⟨rejectWrap, 0, diamondSt0 c, 0⟩ = .faulted := by
+    cases c <;> rfl
+  have hFault2 :
+      runBlockCfg (diamondLeakStep c) 0 (diamondSt0 c) 3 = .fault := by
+    cases c <;> rfl
+  have hRefField :
+      StdValRefines tagOfLoan (zipStdVal (.symBool c) (.nat 50) (.nat 3))
+        (.scalar ⟨if c then 50 else 3, 4⟩) :=
+    StdValRefines.of_branchSplit (v := zipStdVal (.symBool c) (.nat 50) (.nat 3))
+      (vt := .nat 50) (vf := .nat 3) (b := c) rfl
+      (by cases c <;> exact .nat (by decide))
+  refine ⟨hFault1,
+    Anneal.PureMirExec.not_wpConverges_of_faulted hFault1,
+    rfl, hFault2,
+    not_wpConverges_blockCfgStep_of_runBlockCfg_fault (diamondLeakStep c) hFault2 P,
+    rfl, hRefField,
+    hRefField.branchSplit_inv rfl,
+    by cases c <;> rfl,
+    by cases c <;> exact stdValAlg_sameAggregateShape_pair _ _ _ _⟩
+
+/-! ### Test 2b-asym: Asymmetric 5-Block Diamond via `.convergedJump` (`armSteps = Nat.max 2 1 = 2`) -/
+
+/-- 5-block asymmetric diamond `CapturedMir`:
+`fn asym_diamond(c: bool, mut x: u32, y: u32) -> (u32, u32)`:
+- `bb0`: builds `_4 = (_2, _3)` and branches on `_1` to `bb1` (`true`) or `bb3` (`false`).
+- `bb1 -> bb2 -> bb4` (`true` arm, `2` blocks): `bb1` borrows `_5 = &mut (_4.0)` and jumps to `bb2`;
+  `bb2` updates `_2 = 20` and jumps to `bb4`.
+- `bb3 -> bb4` (`false` arm, `1` block): `bb3` borrows `_5 = &mut (_4.1)` and jumps to `bb4`.
+- `bb4` (join block): writes `(*_5) = copy _2`, ends the borrow, and returns `_4`. -/
+def asymDiamondBody : CapturedMir :=
+  mkBody 3
+    [decl .mut pairTy, decl .not boolTy, decl .mut u32Ty, decl .not u32Ty,
+     decl .mut pairTy, decl .not refU32Ty]
+    [mkBb
+       [mkSt (.storageLive 4),
+        mkSt (.assign (pl 4) (.aggregate .tuple [.copy (pl 2), .copy (pl 3)])),
+        mkSt (.storageLive 5)]
+       (.switchInt (.copy (pl 1)) { branches := [(0, 3)], otherwise := 1 }),
+     mkBb [mkSt (.assign (pl 5) (.ref (.mut false) (pl 4 [.field 0 u32Ty])))] (.goto 2),
+     mkBb [mkSt (.assign (pl 2) (.use (u32C 20)))] (.goto 4),
+     mkBb [mkSt (.assign (pl 5) (.ref (.mut false) (pl 4 [.field 1 u32Ty])))] (.goto 4),
+     mkBb
+       [mkSt (.assign (pl 5 [.deref]) (.use (.copy (pl 2)))),
+        mkSt (.storageDead 5),
+        mkSt (.assign (pl 0) (.use (.copy (pl 4)))),
+        mkSt (.storageDead 4)]
+       .return_]
+
+/-- 5-block `PureLift` CFG matching `asymDiamondBody`: the `true` arm traverses
+`2` blocks (`1 -> 2 -> 4`) while the `false` arm traverses `1` block (`3 -> 4`),
+so `stepBasicBlock` charges `armSteps = Nat.max 2 1 = 2` delay ticks on
+`.convergedJump`. -/
+def asymDiamondBlocks : List (BasicBlock StdVal) :=
+  [⟨.act (.assign (.localSub 3 []) (.binary stdMkPair (.localSub 1 []) (.localSub 2 []))),
+     .branch (.use (.localSub 0 [])) 1 3⟩,
+   ⟨.act (.borrow 4 .mutBorrow (.localSub 3 [0])), .goto 2⟩,
+   ⟨.act (.assign (.localSub 1 []) (.constVal (.nat 20))), .goto 4⟩,
+   ⟨.act (.borrow 4 .mutBorrow (.localSub 3 [1])), .goto 4⟩,
+   ⟨.seq (.act (.assign (.derefSub 4 []) (.use (.localSub 1 [])))) (.act (.endLoan 0)),
+     .ret (.use (.localSub 3 []))⟩]
+
+/-- Joined symbolic state at `bb4` of `asymDiamondBlocks`: local `1` (`x`) holds
+`.choice (.symBool c) (.nat 20) (.nat 3)` from the 2-block `true` arm (`bb2`) vs.
+the 1-block `false` arm (`bb3`), and loan `0` has `BackTarget.choice`. -/
+def asymDiamondStJoin (c : Bool) : SymState StdVal :=
+  ⟨[⟨.choice (.symBool c) (.symBool c) (.symBool c), .unborrowed⟩,
+    ⟨.choice (.symBool c) (.nat 20) (.nat 3), .unborrowed⟩,
+    ⟨.choice (.symBool c) (.nat 4) (.nat 4), .unborrowed⟩,
+    ⟨.pair (.choice (.symBool c) (.nat 3) (.nat 3)) (.choice (.symBool c) (.nat 4) (.nat 4)),
+      .split [([0], .mutLocked 0), ([1], .mutLocked 0)]⟩,
+    ⟨.refVal 0 [], .unborrowed⟩],
+   [⟨0, .activeMut, ⟨.choice (.symBool c) (.nat 3) (.nat 4), .unborrowed⟩,
+     BackTarget.choice (.symBool c) (.direct (.localReg 3) [0]) (.direct (.localReg 3) [1])⟩],
+   [], [], [], 0⟩
+
+def asymDiamondSymOut (c : Bool) : FuncOut StdVal :=
+  ⟨.pair (zipStdVal (.symBool c) (.nat 20) (.nat 3))
+    (zipStdVal (.symBool c) (.nat 4) (.nat 3)), []⟩
+
+/-- **Asymmetric `.convergedJump` (`armSteps = Nat.max 2 1 = 2`)**: on symbolic
+`diamondSt0 c`, block `0` of `asymDiamondBlocks` evaluates the 2-block `true`
+arm (`bb1 -> bb2`) and the 1-block `false` arm (`bb3`), joins them at `bb4`, and
+emits `.convergedJump 2 (handleFreeOutOpt stdValAlg) 4 (asymDiamondStJoin c)`. -/
+theorem asymDiamondBlocks_convergedJump (c : Bool) :
+    stepBasicBlock stdValAlg asymDiamondBlocks 0 (diamondSt0 c) =
+      .convergedJump 2 (handleFreeOutOpt stdValAlg) 4 (asymDiamondStJoin c) := by
+  cases c <;> rfl
+
+/-- **Exact `armSteps = 2` fuel boundary on `asymDiamondBlocks`**: fuel `3`
+(`1` step for `.convergedJump` + `2` delay ticks for the 2-block `true` arm)
+is still `.outOfFuel` before `bb4` executes, whereas fuel `4` halts with
+`asymDiamondSymOut c`. -/
+theorem asymDiamond_cfg_wpConverges (c : Bool) :
+    Anneal.PureMirExec.evalFuel
+      (blockCfgStep (stepBasicBlock stdValAlg asymDiamondBlocks)) 3
+      ⟨some, 0, diamondSt0 c, 0⟩ = .outOfFuel ∧
+    Anneal.PureMirExec.evalFuel
+      (blockCfgStep (stepBasicBlock stdValAlg asymDiamondBlocks)) 4
+      ⟨some, 0, diamondSt0 c, 0⟩ = .halted (asymDiamondSymOut c) ∧
+    Anneal.PureMirExec.WpConverges
+      (blockCfgStep (stepBasicBlock stdValAlg asymDiamondBlocks))
+      ⟨some, 0, diamondSt0 c, 0⟩ (· = asymDiamondSymOut c) := by
+  cases c <;> exact ⟨rfl, rfl, 4, _, rfl, rfl⟩
+
+def asymDiamondMs0 (c : Bool) : MachineState :=
+  initMachineState asymDiamondBody [.scalar ⟨if c then 1 else 0, 1⟩, .scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩]
+
+def asymDiamondMsJoin (c : Bool) : MachineState :=
+  { frame :=
+      { blockIdx := 4, stmtIdx := 0,
+        locals :=
+          [.uninit, .init (.scalar ⟨if c then 1 else 0, 1⟩),
+           .init (.scalar ⟨if c then 20 else 3, 4⟩), .init (.scalar ⟨4, 4⟩),
+           .init (.aggregate 0 [.scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩]),
+           .init (.ptr ⟨1, 0⟩ 8)] }
+    memory :=
+      { (asymDiamondMs0 c).memory with
+        borrows :=
+          [{ tag := 1, targetLocal := 4,
+             targetProjection := [.field (if c then 0 else 1) u32Ty],
+             perm := .reservedFrz false }]
+        nextTag := 2 } }
+
+theorem asymDiamond_runMirToBlock (c : Bool) :
+    Anneal.PureMirExec.runMirToBlock asymDiamondBody 4 (asymDiamondMs0 c) =
+      .reached (asymDiamondMsJoin c) := by
+  cases c <;> rfl
+
+theorem asymDiamond_join_rel (c : Bool) :
+    mirStateRel tagOfLoan [(0, 4, if c then [0] else [1])]
+      (asymDiamondStJoin c) (asymDiamondMsJoin c) := by
+  cases c
+  · exact ⟨⟨⟨trivial, trivial⟩,
+      ⟨⟨rfl, ⟨_, rfl, .choiceFalse (.nat (by decide))⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩,
+     mirLocalsRel_of_localsRefine
+      ⟨fun _ => ⟨_, rfl, .choiceFalse (.symBool false)⟩,
+       fun _ => ⟨_, rfl, .choiceFalse (.nat (by decide))⟩,
+       fun _ => ⟨_, rfl, .choiceFalse (.nat (by decide))⟩, (fun h => nomatch h),
+       fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩⟩
+  · exact ⟨⟨⟨trivial, trivial⟩,
+      ⟨⟨rfl, ⟨_, rfl, .choiceTrue (.nat (by decide))⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩,
+     mirLocalsRel_of_localsRefine
+      ⟨fun _ => ⟨_, rfl, .choiceTrue (.symBool true)⟩,
+       fun _ => ⟨_, rfl, .choiceTrue (.nat (by decide))⟩,
+       fun _ => ⟨_, rfl, .choiceTrue (.nat (by decide))⟩, (fun h => nomatch h),
+       fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩⟩
+
+def asymDiamondMirRet (c : Bool) : Value :=
+  if c then .aggregate 0 [.scalar ⟨20, 4⟩, .scalar ⟨4, 4⟩]
+  else .aggregate 0 [.scalar ⟨3, 4⟩, .scalar ⟨3, 4⟩]
+
+theorem asymDiamond_ret_refines (c : Bool) :
+    StdValRefines tagOfLoan (asymDiamondSymOut c).ret (asymDiamondMirRet c) := by
+  cases c
+  · exact .pair (.choiceFalse (.nat (by decide)))
+      (.choiceFalse (.nat (by decide)))
+  · exact .pair (.choiceTrue (.nat (by decide)))
+      (.choiceTrue (.nat (by decide)))
+
+def asymDbBindingsAt (c : Bool) (bb : Nat) : List (LoanId × Local × SubPath) :=
+  if bb = 4 then [(0, 4, if c then [0] else [1])] else []
+
+def asymDbSymExtra (c : Bool) (bb : Nat) (st : SymState StdVal)
+    (ms : MachineState) : Prop :=
+  (bb = 0 ∧ st = diamondSt0 c ∧ ms = asymDiamondMs0 c) ∨
+  (bb = 4 ∧ st = asymDiamondStJoin c ∧ ms = asymDiamondMsJoin c)
+
+theorem asymDiamond_emitsSubIdWraps (c : Bool) :
+    EmitsSubIdWraps (stepBasicBlock stdValAlg asymDiamondBlocks)
+      (fun bb st => Exists fun ms => asymDbSymExtra c bb st ms) := by
+  intro bb st ⟨_, hEx⟩
+  rcases hEx with ⟨hBb, hSt, _⟩ | ⟨hBb, hSt, _⟩
+  · subst hBb; subst hSt
+    rw [asymDiamondBlocks_convergedJump]
+    exact subIdWrap_handleFreeOutOpt stdValAlg
+  · subst hBb; subst hSt
+    cases c <;> exact trivial
+
+/-- **Test 2b-asym (live `V2026_06_01` adequacy of an asymmetric `.convergedJump 2`
+diamond)**: `mirCfg_forwardSim_of_emitsSubIdWraps` stutters through both
+`wait = 2 → 1 → 0` delay ticks of the 2-block `true` arm (`bb1 -> bb2`) vs.
+1-block `false` arm (`bb3`), and `mir_blockCfg_sound` yields live
+`MirWpConverges asymDiamondBody (asymDiamondMs0 c)` for both oracles. -/
+theorem asymDiamond_sound (c : Bool) :
+    Anneal.MirFuelFree.MirWpConverges asymDiamondBody (asymDiamondMs0 c)
+      (fun o => LiftedMirPost tagOfLoan (· = asymDiamondSymOut c) o []) :=
+  mir_blockCfg_sound tagOfLoan asymDiamondBody asymDiamondBlocks
+    (· = asymDiamondSymOut c)
+    (asymDbBindingsAt c) id (asymDbSymExtra c) []
+    (mirCfg_forwardSim_of_emitsSubIdWraps tagOfLoan asymDiamondBody
+      asymDiamondBlocks (asymDbBindingsAt c) id (asymDbSymExtra c) []
+      (asymDiamond_emitsSubIdWraps c)
+      (fun bb st ms ⟨_, _, _, hExtra⟩ => by
+        rcases hExtra with ⟨hBb, hSt, hMs⟩ | ⟨hBb, hSt, hMs⟩
+        · subst hBb; subst hSt; subst hMs
+          cases c <;>
+            exact stepsTo_of_runMirToBlock_reached (asymDiamond_runMirToBlock _)
+              ⟨rfl, rfl, asymDiamond_join_rel _, Or.inr ⟨rfl, rfl, rfl⟩⟩
+        · subst hBb; subst hSt; subst hMs
+          cases c
+          · exact ⟨16, _, rfl, _, _, rfl, asymDiamond_ret_refines false, rfl⟩
+          · exact ⟨16, _, rfl, _, _, rfl, asymDiamond_ret_refines true, rfl⟩))
+    (asymDiamond_cfg_wpConverges c).2.2
+    ⟨subIdWrap_some, rfl, rfl,
+     ⟨⟨trivial, trivial⟩,
+      mirLocalsRel_of_localsRefine
+        ⟨fun _ => ⟨_, rfl, .symBool c⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+         fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩,
+     Or.inl ⟨rfl, rfl, rfl⟩⟩
+
+/-- `runBlockCfgToBlock` reaches the asymmetric join `bb4` only after the
+`.convergedJump 2` step and both delay ticks (`wait = 2 → 1 → 0`), with the
+`handleFreeOutOpt` guard pending. -/
+theorem asymDiamond_runBlockCfgToBlock (c : Bool) :
+    runBlockCfgToBlock (stepBasicBlock stdValAlg asymDiamondBlocks) 4 8
+      ⟨some, 0, diamondSt0 c, 0⟩ =
+      .reached ⟨composeWrap some (handleFreeOutOpt stdValAlg), 4,
+        asymDiamondStJoin c, 0⟩ := by
+  cases c <;> rfl
+
+/-- **Segment form of Test 2b-asym (`mirCfg_segmentSim_of_emitsSubIdWraps`)**:
+the wrapper-agnostic segment simulation carries the PureLift segment
+`bb0 → bb4` (one `.convergedJump 2` and two stuttering delay ticks) to a live
+MIR segment that lands exactly on the MIR join state `asymDiamondMsJoin c`. -/
+theorem asymDiamond_segmentSim_to_join (c : Bool) :
+    Anneal.PureMirExec.StepsTo (Anneal.PureMirExec.mirStep asymDiamondBody)
+      (asymDiamondMs0 c) (· = asymDiamondMsJoin c) := by
+  have hSeg := stepsTo_of_segmentSim
+    (mirCfg_segmentSim_of_emitsSubIdWraps tagOfLoan asymDiamondBody
+      asymDiamondBlocks (asymDbBindingsAt c) id (asymDbSymExtra c)
+      (asymDiamond_emitsSubIdWraps c)
+      (fun bb st ms ⟨_, _, _, hExtra⟩ => by
+        rcases hExtra with ⟨hBb, hSt, hMs⟩ | ⟨hBb, hSt, hMs⟩
+        · subst hBb; subst hSt; subst hMs
+          cases c <;>
+            exact stepsTo_of_runMirToBlock_reached (asymDiamond_runMirToBlock _)
+              ⟨rfl, rfl, asymDiamond_join_rel _, Or.inr ⟨rfl, rfl, rfl⟩⟩
+        · subst hBb; subst hSt; subst hMs
+          cases c <;> exact trivial))
+    (stepsTo_of_runBlockCfgToBlock_reached (asymDiamond_runBlockCfgToBlock c))
+    (asymDiamondMs0 c)
+    ⟨subIdWrap_some, rfl, rfl,
+     ⟨⟨trivial, trivial⟩,
+      mirLocalsRel_of_localsRefine
+        ⟨fun _ => ⟨_, rfl, .symBool c⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+         fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩,
+     Or.inl ⟨rfl, rfl, rfl⟩⟩
+  refine hSeg.mono ?_
+  intro ms ⟨s, hs, _, _, _, _, hExtra⟩
+  subst hs
+  rcases hExtra with ⟨h, _, _⟩ | ⟨_, _, hMs⟩
+  · exact (Nat.succ_ne_zero 3 h).elim
+  · exact hMs
+
+def asymDiamondArmTrue2Plan : FlowPlan StdVal :=
+  .act (.assign (.localSub 1 []) (.constVal (.nat 20)))
+
+def asymDiamondPostPlan : FlowPlan StdVal :=
+  .seq (.act (.assign (.derefSub 4 []) (.use (.localSub 1 [])))) (.act (.endLoan 0))
+
+theorem asymDiamondPostPlan_wf : WfPlan stdValAlg asymDiamondPostPlan :=
+  fun _ _ => rfl
+
+theorem asymDiamondPostPlan_continuing :
+    ∀ s f, evalPlan stdValAlg asymDiamondPostPlan s = .ok f →
+      Exists fun s' => f = .continuing s' :=
+  evalPlan_seq_continuing stdValAlg (fun _ _ => rfl) (fun _ _ => rfl)
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+
+/-- 5-block asymmetric diamond `CfgCertificate` for `asymDiamondBlocks`,
+constructed via `CfgCertificate.asymDiamond` at fuel `4`. -/
+def asymDiamondCert : CfgCertificate stdValAlg :=
+  CfgCertificate.asymDiamond stdValAlg diamondPrePlan (.use (.localSub 0 []))
+    diamondArmTruePlan asymDiamondArmTrue2Plan diamondArmFalsePlan
+    asymDiamondPostPlan (.use (.localSub 3 []))
+    (fun _ _ => rfl) (fun _ _ => rfl) (fun _ _ => rfl) (fun _ _ => rfl)
+    asymDiamondPostPlan_wf
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    asymDiamondPostPlan_continuing
+
+theorem asymDiamondCert_blocks_eq :
+    asymDiamondCert.blocks = asymDiamondBlocks := rfl
+
+/-- **Test 2b-asym-cert (`CfgCertificate.asymDiamond` /
+`mir_asymDiamond_cfgCertificate_sound` over a symbolic `.convergedJump 2`
+asymmetric diamond)**: certifies `asymDiamondBody` from symbolic `diamondSt0 c`
+(`_0 = .symBool c`) through `CfgCertificate.asymDiamond` and
+`mir_asymDiamond_cfgCertificate_sound` from `HoldsFnSpec` of its structured plan
+alone, where block `0` emits `.convergedJump 2 (handleFreeOutOpt stdValAlg) 4
+(asymDiamondStJoin c)`. -/
+theorem asymDiamond_cfgCertificate_sound (c : Bool) :
+    Anneal.MirFuelFree.MirWpConverges asymDiamondBody (asymDiamondMs0 c)
+      (fun o => LiftedMirPost tagOfLoan (· = asymDiamondSymOut c) o []) :=
+  mir_asymDiamond_cfgCertificate_sound tagOfLoan asymDiamondBody
+    diamondPrePlan (.use (.localSub 0 []))
+    diamondArmTruePlan asymDiamondArmTrue2Plan diamondArmFalsePlan
+    asymDiamondPostPlan (.use (.localSub 3 []))
+    (fun _ _ => rfl) (fun _ _ => rfl) (fun _ _ => rfl) (fun _ _ => rfl)
+    asymDiamondPostPlan_wf
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    asymDiamondPostPlan_continuing
+    (diamondParams c) (diamondSt0 c) (· = asymDiamondSymOut c)
+    (asymDbBindingsAt c) id (asymDbSymExtra c) []
+    (diamond_init c) (by cases c <;> exact rfl)
+    (fun bb st ms ⟨_, _, _, hExtra⟩ => by
+      rcases hExtra with ⟨hBb, hSt, hMs⟩ | ⟨hBb, hSt, hMs⟩
+      · subst hBb; subst hSt; subst hMs
+        cases c <;>
+          exact stepsTo_of_runMirToBlock_reached (asymDiamond_runMirToBlock _)
+            ⟨rfl, rfl, asymDiamond_join_rel _, Or.inr ⟨rfl, rfl, rfl⟩⟩
+      · subst hBb; subst hSt; subst hMs
+        cases c
+        · exact ⟨16, _, rfl, _, _, rfl, asymDiamond_ret_refines false, rfl⟩
+        · exact ⟨16, _, rfl, _, _, rfl, asymDiamond_ret_refines true, rfl⟩)
+    ⟨rfl, rfl,
+     ⟨⟨trivial, trivial⟩,
+      mirLocalsRel_of_localsRefine
+        ⟨fun _ => ⟨_, rfl, .symBool c⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+         fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩,
+     Or.inl ⟨rfl, rfl, rfl⟩⟩
+
+/-! #### Test 2b-asym-cert (concrete condition): the 4-step arm at the certificate's exact fuel -/
+
+/-- Concrete result of `asym_diamond` for oracle `c`: `(20, 4)` when `c` (the
+`true` arm sets `x = 20`, then writes it through `&mut p.0`), else `(3, 3)`. -/
+def asymConcOut (c : Bool) : FuncOut StdVal :=
+  ⟨if c then .pair (.nat 20) (.nat 4) else .pair (.nat 3) (.nat 3), []⟩
+
+/-- **`CfgCertificate.asymDiamond`'s fuel `4` is exact on both of its longest
+paths, and fuel `3` is exact on its short path**: the concrete `true` path
+(`0 → 1 → 2 → 4`, four block steps) and the symbolic run (`.convergedJump 2`:
+one step and two delay ticks, then `bb4`) both diverge at fuel `3` and return at
+the certificate's fuel `4`, while the concrete `false` path (`0 → 3 → 4`, three
+block steps) diverges at fuel `2` and returns at fuel `3`. The fuel-`4` returns
+come from the certificate's own `sound` field applied to the plan's evaluation
+(concrete `dbParams c` and symbolic `diamondParams c`). -/
+theorem asymDiamondCert_fuel_exact (c : Bool) :
+    runBlockCfg (stepBasicBlock stdValAlg asymDiamondCert.blocks) 0 (dbSt0 true) 3 =
+      .diverged ∧
+    runBlockCfg (stepBasicBlock stdValAlg asymDiamondCert.blocks) 0 (dbSt0 c)
+      asymDiamondCert.fuel = .ret (asymConcOut c) ∧
+    runBlockCfg (stepBasicBlock stdValAlg asymDiamondCert.blocks) 0 (dbSt0 false) 2 =
+      .diverged ∧
+    runBlockCfg (stepBasicBlock stdValAlg asymDiamondCert.blocks) 0 (dbSt0 false) 3 =
+      .ret (asymConcOut false) ∧
+    runBlockCfg (stepBasicBlock stdValAlg asymDiamondCert.blocks) 0 (diamondSt0 c) 3 =
+      .diverged ∧
+    runBlockCfg (stepBasicBlock stdValAlg asymDiamondCert.blocks) 0 (diamondSt0 c)
+      asymDiamondCert.fuel = .ret (asymDiamondSymOut c) :=
+  ⟨rfl,
+   asymDiamondCert.sound (dbParams c) (dbSt0 c) (asymConcOut c) rfl
+     (by cases c <;> rfl),
+   rfl,
+   rfl,
+   by cases c <;> rfl,
+   asymDiamondCert.sound (diamondParams c) (diamondSt0 c) (asymDiamondSymOut c)
+     (diamond_init c) (by cases c <;> rfl)⟩
+
+/-- Live state at the header of the taken arm of `asymDiamondBody` (`bb1` if
+`c`, else `bb3`), after `bb0` built `_4 = (_2, _3)`. -/
+def asymConcMsArm (c : Bool) : MachineState :=
+  { frame :=
+      { blockIdx := if c then 1 else 3, stmtIdx := 0,
+        locals :=
+          [.uninit, .init (.scalar ⟨if c then 1 else 0, 1⟩), .init (.scalar ⟨3, 4⟩),
+           .init (.scalar ⟨4, 4⟩), .init (.aggregate 0 [.scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩]),
+           .uninit] }
+    memory := (asymDiamondMs0 c).memory }
+
+/-- Live state at the header of `bb2` on the `true` arm: `_5 = &mut _4.0`
+through the `reserved` tag `1`, `x` still `3`. -/
+def asymConcMsMid : MachineState :=
+  { frame :=
+      { blockIdx := 2, stmtIdx := 0,
+        locals :=
+          [.uninit, .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨3, 4⟩), .init (.scalar ⟨4, 4⟩),
+           .init (.aggregate 0 [.scalar ⟨3, 4⟩, .scalar ⟨4, 4⟩]), .init (.ptr ⟨1, 0⟩ 8)] }
+    memory :=
+      { (asymDiamondMs0 true).memory with
+        borrows :=
+          [{ tag := 1, targetLocal := 4, targetProjection := [.field 0 u32Ty],
+             perm := .reservedFrz false }]
+        nextTag := 2 } }
+
+/-- `PureLift` state at the join `bb4` on the concrete `true` path: the loan of
+`p.0` from `bb1` is still active and `x = 20` (set in `bb2`). -/
+def asymConcStJoinT : SymState StdVal :=
+  ⟨[⟨.bool true, .unborrowed⟩, ⟨.nat 20, .unborrowed⟩, ⟨.nat 4, .unborrowed⟩,
+    ⟨.pair (.nat 3) (.nat 4), .split [([0], .mutLocked 0)]⟩,
+    ⟨.refVal 0 [], .unborrowed⟩],
+   [⟨0, .activeMut, ⟨.nat 3, .unborrowed⟩, .direct (.localReg 3) [0]⟩],
+   [], [], [], 0⟩
+
+/-- `PureLift` state at the join `bb4` for the concrete oracle `c`. -/
+def asymConcStJoin (c : Bool) : SymState StdVal :=
+  if c then asymConcStJoinT else dbSt3 false
+
+theorem asymConc_rel_arm (c : Bool) :
+    mirStateRel tagOfLoan [] (dbSt1 c) (asymConcMsArm c) := by
+  cases c <;>
+  exact ⟨⟨trivial, trivial⟩,
+    mirLocalsRel_of_localsRefine
+      ⟨fun _ => ⟨_, rfl, .bool _⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+       fun _ => ⟨_, rfl, .nat (by decide)⟩,
+       fun _ => ⟨_, rfl, .pair (.nat (by decide)) (.nat (by decide))⟩, trivial⟩⟩
+
+theorem asymConc_rel_mid :
+    mirStateRel tagOfLoan [(0, 4, [0])] (dbSt3 true) asymConcMsMid :=
+  ⟨⟨⟨trivial, trivial⟩,
+      ⟨⟨rfl, ⟨_, rfl, .nat (by decide)⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩,
+    mirLocalsRel_of_localsRefine
+      ⟨fun _ => ⟨_, rfl, .bool _⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+       fun _ => ⟨_, rfl, .nat (by decide)⟩, (fun h => nomatch h),
+       fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩⟩
+
+theorem asymConc_rel_join (c : Bool) :
+    mirStateRel tagOfLoan [(0, 4, if c then [0] else [1])] (asymConcStJoin c)
+      (asymDiamondMsJoin c) := by
+  cases c <;>
+  exact ⟨⟨⟨trivial, trivial⟩,
+      ⟨⟨rfl, ⟨_, rfl, .nat (by decide)⟩, ⟨_, rfl, rfl, rfl, rfl⟩⟩, trivial⟩⟩,
+    mirLocalsRel_of_localsRefine
+      ⟨fun _ => ⟨_, rfl, .bool _⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+       fun _ => ⟨_, rfl, .nat (by decide)⟩, (fun h => nomatch h),
+       fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩⟩
+
+def asymConcBindingsAt (c : Bool) (bb : Nat) : List (LoanId × Local × SubPath) :=
+  if bb = 2 ∨ bb = 4 then [(0, 4, if c then [0] else [1])] else []
+
+/-- Block-entry relation of the concrete asymmetric diamond: one live header
+state per visited block (`bb0`, the taken arm's first block, `bb2` on the
+2-block `true` arm only, and the join `bb4`). -/
+def asymConcExtra (c : Bool) (bb : Nat) (st : SymState StdVal) (ms : MachineState) :
+    Prop :=
+  (bb = 0 ∧ st = dbSt0 c ∧ ms = asymDiamondMs0 c) ∨
+  (bb = (if c then 1 else 3) ∧ st = dbSt1 c ∧ ms = asymConcMsArm c) ∨
+  (c = true ∧ bb = 2 ∧ st = dbSt3 true ∧ ms = asymConcMsMid) ∨
+  (bb = 4 ∧ st = asymConcStJoin c ∧ ms = asymDiamondMsJoin c)
+
+/-- **Test 2b-asym-cert (concrete condition)**: `CfgCertificate.asymDiamond`
+certifies the concrete asymmetric diamond (`_0 = .bool c`) through
+`mir_asymDiamond_cfgCertificate_sound`, simulating the 2-block `true` arm block
+for block (`bb0 → bb1 → bb2 → bb4`, four steps at the certificate's exact fuel)
+and the 1-block `false` arm (`bb0 → bb3 → bb4`) on the live machine, so the
+concrete paths of `cfg_certificate_asymDiamond_sound` and
+`asymDiamondCfgInv_invClosedNoFork` are exercised end to end. -/
+theorem asymDiamond_cfgCertificate_sound_concrete (c : Bool) :
+    Anneal.MirFuelFree.MirWpConverges asymDiamondBody (asymDiamondMs0 c)
+      (fun o => LiftedMirPost tagOfLoan (· = asymConcOut c) o []) :=
+  mir_asymDiamond_cfgCertificate_sound tagOfLoan asymDiamondBody
+    diamondPrePlan (.use (.localSub 0 []))
+    diamondArmTruePlan asymDiamondArmTrue2Plan diamondArmFalsePlan
+    asymDiamondPostPlan (.use (.localSub 3 []))
+    (fun _ _ => rfl) (fun _ _ => rfl) (fun _ _ => rfl) (fun _ _ => rfl)
+    asymDiamondPostPlan_wf
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+    asymDiamondPostPlan_continuing
+    (dbParams c) (dbSt0 c) (· = asymConcOut c)
+    (asymConcBindingsAt c) id (asymConcExtra c) []
+    rfl (by cases c <;> exact rfl)
+    (fun bb st ms ⟨_, _, _, hExtra⟩ => by
+      rcases hExtra with ⟨hBb, hSt, hMs⟩ | ⟨hBb, hSt, hMs⟩ | ⟨hC, hBb, hSt, hMs⟩ |
+          ⟨hBb, hSt, hMs⟩
+      · subst hBb; subst hSt; subst hMs
+        cases c
+        · exact stepsTo_of_runMirToBlock_reached (rfl :
+            Anneal.PureMirExec.runMirToBlock asymDiamondBody 3 (asymDiamondMs0 false) =
+              .reached (asymConcMsArm false))
+            ⟨rfl, rfl, asymConc_rel_arm false, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
+        · exact stepsTo_of_runMirToBlock_reached (rfl :
+            Anneal.PureMirExec.runMirToBlock asymDiamondBody 1 (asymDiamondMs0 true) =
+              .reached (asymConcMsArm true))
+            ⟨rfl, rfl, asymConc_rel_arm true, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
+      · subst hSt; subst hMs
+        cases c
+        · subst hBb
+          exact stepsTo_of_runMirToBlock_reached (rfl :
+            Anneal.PureMirExec.runMirToBlock asymDiamondBody 4 (asymConcMsArm false) =
+              .reached (asymDiamondMsJoin false))
+            ⟨rfl, rfl, asymConc_rel_join false, Or.inr (Or.inr (Or.inr ⟨rfl, rfl, rfl⟩))⟩
+        · subst hBb
+          exact stepsTo_of_runMirToBlock_reached (rfl :
+            Anneal.PureMirExec.runMirToBlock asymDiamondBody 2 (asymConcMsArm true) =
+              .reached asymConcMsMid)
+            ⟨rfl, rfl, asymConc_rel_mid, Or.inr (Or.inr (Or.inl ⟨rfl, rfl, rfl, rfl⟩))⟩
+      · subst hC; subst hBb; subst hSt; subst hMs
+        exact stepsTo_of_runMirToBlock_reached (rfl :
+          Anneal.PureMirExec.runMirToBlock asymDiamondBody 4 asymConcMsMid =
+            .reached (asymDiamondMsJoin true))
+          ⟨rfl, rfl, asymConc_rel_join true, Or.inr (Or.inr (Or.inr ⟨rfl, rfl, rfl⟩))⟩
+      · subst hBb; subst hSt; subst hMs
+        cases c
+        · exact ⟨16, _, rfl, _, _, rfl, .pair (.nat (by decide)) (.nat (by decide)), rfl⟩
+        · exact ⟨16, _, rfl, _, _, rfl, .pair (.nat (by decide)) (.nat (by decide)), rfl⟩)
+    ⟨rfl, rfl,
+     ⟨⟨trivial, trivial⟩,
+      mirLocalsRel_of_localsRefine
+        ⟨fun _ => ⟨_, rfl, .bool c⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+         fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩,
+     Or.inl ⟨rfl, rfl, rfl⟩⟩
+
+/-! ### Test 2d: Multi-Step Strong-Descent (`rank s' < rank s`, `Δrank ≥ 2`) Loop Cutpoints over Live `V2026_06_01` MIR -/
+
+/-- Strong-descent ranking function on `loopBorrowBody` (`Test 2c`): an
+indicator of the loop flag (`3` while `_1 = true`, else `0`), so its single
+iteration drops it by `3`. The loop runs once, so this only checks that the
+cutpoint rule accepts a non-unit drop; the variable-stride, multi-iteration
+canary with a natural rank is `strideLoop_strongDescent_cutpoint_sound`. -/
+def lbStrongRank (s : SymState StdVal) : Nat :=
+  match s.locals with
+  | ⟨⟨_, .bool true⟩, _⟩ :: _ => 3
+  | _ => 0
+
+def lbCutInv (s : SymState StdVal) : Prop :=
+  s = lbSt0 ∨ s = lbStAfterIter
+
+theorem lbStrongRank_drops_by_3 :
+    lbStrongRank lbSt0 = 3 ∧
+    lbStrongRank lbStAfterIter = 0 ∧
+    lbStrongRank lbStAfterIter < lbStrongRank lbSt0 ∧
+    ¬ (lbStrongRank lbSt0 = lbStrongRank lbStAfterIter + 1) := by
+  decide
+
+theorem lbCutpoint_step : ∀ s, lbCutInv s →
+    Exists fun cv => evalRval stdValAlg (.use (.localSub 0 [])) s = some cv ∧
+      (stdValAlg.asBool cv = some false ∨
+       (stdValAlg.asBool cv = some true ∧
+        Exists fun s' =>
+          evalPlan stdValAlg lbBodyPlan s = .ok (.continuing s') ∧
+          lbCutInv s' ∧ lbStrongRank s' < lbStrongRank s)) := by
+  intro s hs
+  rcases hs with rfl | rfl
+  · exact ⟨.bool true, rfl, Or.inr ⟨rfl, lbStAfterIter, rfl, Or.inr rfl, by decide⟩⟩
+  · exact ⟨.bool false, rfl, Or.inl rfl⟩
+
+theorem lbCutpoint_exit : ∀ s, lbCutInv s →
+    (Exists fun cv => evalRval stdValAlg (.use (.localSub 0 [])) s = some cv ∧
+      stdValAlg.asBool cv = some false) →
+    stateCleanAtReturn s = true ∧
+      Exists fun rv => evalRval stdValAlg (.use (.localSub 1 [])) s = some rv ∧
+        handleFreeOut stdValAlg ⟨rv, collectRootMutVals s.loans⟩ = true ∧
+        (⟨rv, collectRootMutVals s.loans⟩ : FuncOut StdVal).ret = .nat 42 := by
+  intro s hs ⟨cv, hcv, hb⟩
+  rcases hs with rfl | rfl
+  · injection hcv with hcv
+    subst hcv
+    exact nomatch hb
+  · exact ⟨rfl, .nat 42, rfl, rfl, rfl⟩
+
+/-- **Test 2d-1 (`loopBorrowBody` certified via strong-descent cutpoint
+`mir_whileLoop_cfgCertificate_of_cutpoint`)**: `lbStrongRank` drops `3 → 0`
+(`Δrank = 3 ≥ 2`), and `mir_whileLoop_cfgCertificate_of_cutpoint` automatically
+derives `HoldsFnSpec`, `LocalBlockVC`, and `hNoFork` from `(lbCutInv,
+lbStrongRank, lbCutpoint_step, lbCutpoint_exit)`. -/
+theorem loopBorrow_strongDescent_cutpoint_sound :
+    Anneal.MirFuelFree.MirWpConverges loopBorrowBody lbMs0
+      (LiftedMirPost tagOfLoan (fun out => out.ret = .nat 42)) := by
+  have hRel0 : mirStateRel tagOfLoan [] lbSt0 lbMs0 :=
+    ⟨⟨trivial, trivial⟩,
+     mirLocalsRel_of_localsRefine
+       ⟨fun _ => ⟨_, rfl, .bool true⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩
+  have hRelBody : mirStateRel tagOfLoan [] lbSt0 lbMsBody :=
+    ⟨⟨trivial, trivial⟩,
+     mirLocalsRel_of_localsRefine
+       ⟨fun _ => ⟨_, rfl, .bool true⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩
+  have hRelAfter : mirStateRel tagOfLoan [] lbStAfterIter lbMsAfterIter :=
+    ⟨⟨trivial, trivial⟩,
+     mirLocalsRel_of_localsRefine
+       ⟨fun _ => ⟨_, rfl, .bool false⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+        fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩⟩
+  have hRelExit : mirStateRel tagOfLoan [] lbStAfterIter lbMsExit :=
+    ⟨⟨trivial, trivial⟩,
+     mirLocalsRel_of_localsRefine
+       ⟨fun _ => ⟨_, rfl, .bool false⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+        fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩⟩
+  refine mir_whileLoop_cfgCertificate_of_cutpoint tagOfLoan loopBorrowBody 3
+    (.use (.localSub 0 [])) lbBodyPlan (.use (.localSub 1 []))
+    lbBodyPlan_wf lbBodyPlan_continuing
+    [⟨.byVal, .bool true⟩, ⟨.byVal, .nat 7⟩] lbSt0 (fun out => out.ret = .nat 42)
+    lbCutInv lbStrongRank lbCutpoint_step lbCutpoint_exit
+    (fun _ => []) id lbExtra [] rfl (Or.inl rfl) (Nat.le_refl 3) ?_
+    ⟨subIdWrap_some, rfl, rfl, hRel0, Or.inl ⟨rfl, rfl, rfl⟩⟩
+  refine mirCfg_forwardSim_of_waitFree tagOfLoan loopBorrowBody
+    (CfgCertificate.whileLoop stdValAlg 3 (.use (.localSub 0 [])) lbBodyPlan
+      (.use (.localSub 1 [])) lbBodyPlan_wf lbBodyPlan_continuing).blocks
+    (fun _ => []) id lbExtra [] ?_
+  intro w bb st ms ⟨hW, _, _, _, hEx⟩
+  rcases hEx with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
+  · exact stepsTo_of_runMirToBlock_reached
+      (rfl : Anneal.PureMirExec.runMirToBlock loopBorrowBody 1 lbMs0 = .reached lbMsBody)
+      ⟨hW, rfl, rfl, hRelBody, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
+  · exact stepsTo_of_runMirToBlock_reached
+      (rfl : Anneal.PureMirExec.runMirToBlock loopBorrowBody 0 lbMsBody = .reached lbMsAfterIter)
+      ⟨hW, rfl, rfl, hRelAfter, Or.inr (Or.inr (Or.inl ⟨rfl, rfl, rfl⟩))⟩
+  · exact stepsTo_of_runMirToBlock_reached
+      (rfl : Anneal.PureMirExec.runMirToBlock loopBorrowBody 2 lbMsAfterIter = .reached lbMsExit)
+      ⟨hW, rfl, rfl, hRelExit, Or.inr (Or.inr (Or.inr ⟨rfl, rfl, rfl⟩))⟩
+  · exact ⟨8, _, rfl, _, _, rfl, .nat (by decide), rfl⟩
+
+/-- 2-iteration stride-3 live `V2026_06_01` `CapturedMir` loop:
+`fn stride_loop(mut i: u32, mut x: u32) -> u32 { while i < 5 { x += 10; i += 3; } x }`
+starting at `i = 0, x = 7` (`i = 0 → 3 → 6`, `x = 7 → 17 → 27`). The header is
+the rustc shape of `while i < 5`: it evaluates the comparison into the `bool`
+temporary `_3` (`StorageLive(_3); _3 = Lt(copy _1, const 5_u32)`) and switches
+on it (`switchInt(copy _3) -> [0: bb2, otherwise: bb1]`), and both successors
+start with `StorageDead(_3)`, so the live header genuinely computes `i < 5` for
+every `i` rather than enumerating the reachable values
+(`strideLoop_header_computes_lt`). -/
+def strideLoopBody : CapturedMir :=
+  mkBody 2
+    [decl .mut u32Ty, decl .mut u32Ty, decl .mut u32Ty, decl .mut boolTy]
+    [mkBb
+       [mkSt (.storageLive 3),
+        mkSt (.assign (pl 3) (.binaryOp .lt (.copy (pl 1)) (u32C 5)))]
+       (.switchInt (.copy (pl 3)) ⟨[(0, 2)], 1⟩),
+     mkBb
+       [mkSt (.storageDead 3),
+        mkSt (.assign (pl 2) (.binaryOp .add (.copy (pl 2)) (u32C 10))),
+        mkSt (.assign (pl 1) (.binaryOp .add (.copy (pl 1)) (u32C 3)))]
+       (.goto 0),
+     mkBb
+       [mkSt (.storageDead 3),
+        mkSt (.assign (pl 0) (.use (.copy (pl 2))))]
+       .return_]
+
+def strideAdd10 (v : StdVal) : Option StdVal :=
+  match v with
+  | ⟨_, .nat n⟩ => some (.nat (n + 10))
+  | _ => none
+
+def strideLt5 (v : StdVal) : Option StdVal :=
+  match v with
+  | ⟨_, .nat n⟩ => some (.bool (Nat.blt n 5))
+  | _ => none
+
+def strideCond : RvalOp StdVal :=
+  .unary strideLt5 (.localSub 0 [])
+
+def stridePlanBody : FlowPlan StdVal :=
+  .seq (.act (.assign (.localSub 1 []) (.unary strideAdd10 (.localSub 1 []))))
+    (.act (.assign (.localSub 0 []) (.unary stdAdd3 (.localSub 0 []))))
+
+theorem stridePlanBody_wf : WfPlan stdValAlg stridePlanBody := fun _ _ => rfl
+
+theorem stridePlanBody_continuing :
+    ∀ s f, evalPlan stdValAlg stridePlanBody s = .ok f →
+      Exists fun s' => f = .continuing s' :=
+  evalPlan_seq_continuing stdValAlg (fun _ _ => rfl) (fun _ _ => rfl)
+    (evalPlan_act_continuing stdValAlg _)
+    (evalPlan_act_continuing stdValAlg _)
+
+def strideSt0 : SymState StdVal :=
+  ⟨[⟨.nat 0, .unborrowed⟩, ⟨.nat 7, .unborrowed⟩], [], [], [], [], 0⟩
+
+def strideSt1 : SymState StdVal :=
+  ⟨[⟨.nat 3, .unborrowed⟩, ⟨.nat 17, .unborrowed⟩], [], [], [], [], 0⟩
+
+def strideSt2 : SymState StdVal :=
+  ⟨[⟨.nat 6, .unborrowed⟩, ⟨.nat 27, .unborrowed⟩], [], [], [], [], 0⟩
+
+/-- Natural remaining-distance ranking measure `5 - i`: drops `5 → 2 → 0`
+across the two stride-3 iterations (`Δrank = 3` on iteration 1 and `Δrank = 2`
+on iteration 2, refuting unit decrement on both iterations). -/
+def strideLoopRank (s : SymState StdVal) : Nat :=
+  match s.locals with
+  | c :: _ =>
+    match stdNatVal? c.val with
+    | some i => 5 - i
+    | none => 0
+  | [] => 0
+
+theorem strideLoopRank_multi_step_descent :
+    strideLoopRank strideSt0 = 5 ∧
+    strideLoopRank strideSt1 = 2 ∧
+    strideLoopRank strideSt2 = 0 ∧
+    ¬ (strideLoopRank strideSt0 = strideLoopRank strideSt1 + 1) ∧
+    ¬ (strideLoopRank strideSt1 = strideLoopRank strideSt2 + 1) := by
+  decide
+
+def strideCutInv (s : SymState StdVal) : Prop :=
+  s = strideSt0 ∨ s = strideSt1 ∨ s = strideSt2
+
+theorem strideCutpoint_step : ∀ s, strideCutInv s →
+    Exists fun cv => evalRval stdValAlg strideCond s = some cv ∧
+      (stdValAlg.asBool cv = some false ∨
+       (stdValAlg.asBool cv = some true ∧
+        Exists fun s' =>
+          evalPlan stdValAlg stridePlanBody s = .ok (.continuing s') ∧
+          strideCutInv s' ∧ strideLoopRank s' < strideLoopRank s)) := by
+  intro s hs
+  rcases hs with rfl | rfl | rfl
+  · exact ⟨.bool true, rfl,
+      Or.inr ⟨rfl, strideSt1, rfl, Or.inr (Or.inl rfl), by decide⟩⟩
+  · exact ⟨.bool true, rfl,
+      Or.inr ⟨rfl, strideSt2, rfl, Or.inr (Or.inr rfl), by decide⟩⟩
+  · exact ⟨.bool false, rfl, Or.inl rfl⟩
+
+theorem strideCutpoint_exit : ∀ s, strideCutInv s →
+    (Exists fun cv => evalRval stdValAlg strideCond s = some cv ∧
+      stdValAlg.asBool cv = some false) →
+    stateCleanAtReturn s = true ∧
+      Exists fun rv => evalRval stdValAlg (.use (.localSub 1 [])) s = some rv ∧
+        handleFreeOut stdValAlg ⟨rv, collectRootMutVals s.loans⟩ = true ∧
+        (⟨rv, collectRootMutVals s.loans⟩ : FuncOut StdVal).ret = .nat 27 := by
+  intro s hs ⟨cv, hcv, hb⟩
+  rcases hs with rfl | rfl | rfl
+  · injection hcv with hcv
+    subst hcv
+    exact nomatch hb
+  · injection hcv with hcv
+    subst hcv
+    exact nomatch hb
+  · exact ⟨rfl, .nat 27, rfl, rfl, rfl⟩
+
+def strideMs0 : MachineState :=
+  initMachineState strideLoopBody [.scalar ⟨0, 4⟩, .scalar ⟨7, 4⟩]
+
+/-- Live `strideLoopBody` state at the header of block `bb` with `i`, `x`, and
+the comparison temporary `_3` in slot `t`. -/
+def strideMsAt (bb i x : Nat) (t : LocalSlot) : MachineState :=
+  { strideMs0 with
+    frame :=
+      { blockIdx := bb, stmtIdx := 0,
+        locals := [.uninit, .init (.scalar ⟨i, 4⟩), .init (.scalar ⟨x, 4⟩), t] } }
+
+/-- `_3 = Lt(copy _1, const 5_u32)` as a live `bool` scalar. -/
+def strideLtSlot (b : Bool) : LocalSlot :=
+  .init (.scalar ⟨if b then 1 else 0, 1⟩)
+
+def strideMsBody0 : MachineState := strideMsAt 1 0 7 (strideLtSlot true)
+
+def strideMs1 : MachineState := strideMsAt 0 3 17 .dead
+
+def strideMsBody1 : MachineState := strideMsAt 1 3 17 (strideLtSlot true)
+
+def strideMs2 : MachineState := strideMsAt 0 6 27 .dead
+
+def strideMsExit : MachineState := strideMsAt 2 6 27 (strideLtSlot false)
+
+/-- **The live header computes `i < 5`, not a table of reachable values**: from
+the header with any of `i = 2, 4` (never reached from `i = 0` by stride 3) the
+live MIR still enters the body, and from `i = 5` (the boundary) it exits, with
+`_3` holding `Lt(i, 5)`; the initial state has `_3` dead. -/
+theorem strideLoop_header_computes_lt :
+    strideMs0.frame.locals =
+      [.uninit, .init (.scalar ⟨0, 4⟩), .init (.scalar ⟨7, 4⟩), .dead] ∧
+    Anneal.PureMirExec.runMirToBlock strideLoopBody 1 (strideMsAt 0 2 0 .dead) =
+      .reached (strideMsAt 1 2 0 (strideLtSlot true)) ∧
+    Anneal.PureMirExec.runMirToBlock strideLoopBody 1 (strideMsAt 0 4 0 .dead) =
+      .reached (strideMsAt 1 4 0 (strideLtSlot true)) ∧
+    Anneal.PureMirExec.runMirToBlock strideLoopBody 2 (strideMsAt 0 5 0 .dead) =
+      .reached (strideMsAt 2 5 0 (strideLtSlot false)) :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+def strideExtra (bb : Nat) (st : SymState StdVal) (ms : MachineState) : Prop :=
+  (bb = 0 ∧ st = strideSt0 ∧ ms = strideMs0) ∨
+  (bb = 1 ∧ st = strideSt0 ∧ ms = strideMsBody0) ∨
+  (bb = 0 ∧ st = strideSt1 ∧ ms = strideMs1) ∨
+  (bb = 1 ∧ st = strideSt1 ∧ ms = strideMsBody1) ∨
+  (bb = 0 ∧ st = strideSt2 ∧ ms = strideMs2) ∨
+  (bb = 2 ∧ st = strideSt2 ∧ ms = strideMsExit)
+
+/-- **Test 2d-2 (2-iteration stride-3 strong-descent cutpoint over live
+`V2026_06_01` MIR)**: `strideLoopRank` (`5 - i`) drops `5 → 2 → 0` (`Δrank = 3`
+then `Δrank = 2`), and `mir_whileLoop_cfgCertificate_of_cutpoint_blockRel`
+certifies `strideLoopBody` end-to-end to `MirWpConverges` returning `27` from
+the wrapper-free `mirCfgBlockRel` obligations directly. -/
+theorem strideLoop_strongDescent_cutpoint_sound :
+    Anneal.MirFuelFree.MirWpConverges strideLoopBody strideMs0
+      (LiftedMirPost tagOfLoan (fun out => out.ret = .nat 27)) := by
+  have hRel0 : mirStateRel tagOfLoan [] strideSt0 strideMs0 :=
+    ⟨⟨trivial, trivial⟩,
+     mirLocalsRel_of_localsRefine
+       ⟨fun _ => ⟨_, rfl, .nat (by decide)⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩
+  have hRelB0 : mirStateRel tagOfLoan [] strideSt0 strideMsBody0 :=
+    ⟨⟨trivial, trivial⟩,
+     mirLocalsRel_of_localsRefine
+       ⟨fun _ => ⟨_, rfl, .nat (by decide)⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩
+  have hRel1 : mirStateRel tagOfLoan [] strideSt1 strideMs1 :=
+    ⟨⟨trivial, trivial⟩,
+     mirLocalsRel_of_localsRefine
+       ⟨fun _ => ⟨_, rfl, .nat (by decide)⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩
+  have hRelB1 : mirStateRel tagOfLoan [] strideSt1 strideMsBody1 :=
+    ⟨⟨trivial, trivial⟩,
+     mirLocalsRel_of_localsRefine
+       ⟨fun _ => ⟨_, rfl, .nat (by decide)⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩
+  have hRel2 : mirStateRel tagOfLoan [] strideSt2 strideMs2 :=
+    ⟨⟨trivial, trivial⟩,
+     mirLocalsRel_of_localsRefine
+       ⟨fun _ => ⟨_, rfl, .nat (by decide)⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩
+  have hRelEx : mirStateRel tagOfLoan [] strideSt2 strideMsExit :=
+    ⟨⟨trivial, trivial⟩,
+     mirLocalsRel_of_localsRefine
+       ⟨fun _ => ⟨_, rfl, .nat (by decide)⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩
+  refine mir_whileLoop_cfgCertificate_of_cutpoint_blockRel tagOfLoan
+    strideLoopBody 5 strideCond stridePlanBody (.use (.localSub 1 []))
+    stridePlanBody_wf stridePlanBody_continuing
+    [⟨.byVal, .nat 0⟩, ⟨.byVal, .nat 7⟩] strideSt0 (fun out => out.ret = .nat 27)
+    strideCutInv strideLoopRank strideCutpoint_step strideCutpoint_exit
+    (fun _ => []) id strideExtra [] rfl (Or.inl rfl) (Nat.le_refl 5) ?_
+    ⟨rfl, rfl, hRel0, Or.inl ⟨rfl, rfl, rfl⟩⟩
+  intro bb st ms ⟨_, _, _, hEx⟩
+  rcases hEx with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ |
+      ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
+  · exact stepsTo_of_runMirToBlock_reached
+      (rfl : Anneal.PureMirExec.runMirToBlock strideLoopBody 1 strideMs0 = .reached strideMsBody0)
+      ⟨rfl, rfl, hRelB0, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
+  · exact stepsTo_of_runMirToBlock_reached
+      (rfl : Anneal.PureMirExec.runMirToBlock strideLoopBody 0 strideMsBody0 = .reached strideMs1)
+      ⟨rfl, rfl, hRel1, Or.inr (Or.inr (Or.inl ⟨rfl, rfl, rfl⟩))⟩
+  · exact stepsTo_of_runMirToBlock_reached
+      (rfl : Anneal.PureMirExec.runMirToBlock strideLoopBody 1 strideMs1 = .reached strideMsBody1)
+      ⟨rfl, rfl, hRelB1, Or.inr (Or.inr (Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)))⟩
+  · exact stepsTo_of_runMirToBlock_reached
+      (rfl : Anneal.PureMirExec.runMirToBlock strideLoopBody 0 strideMsBody1 = .reached strideMs2)
+      ⟨rfl, rfl, hRel2, Or.inr (Or.inr (Or.inr (Or.inr (Or.inl ⟨rfl, rfl, rfl⟩))))⟩
+  · exact stepsTo_of_runMirToBlock_reached
+      (rfl : Anneal.PureMirExec.runMirToBlock strideLoopBody 2 strideMs2 = .reached strideMsExit)
+      ⟨rfl, rfl, hRelEx, Or.inr (Or.inr (Or.inr (Or.inr (Or.inr ⟨rfl, rfl, rfl⟩))))⟩
+  · exact ⟨8, _, rfl, _, _, rfl, .nat (by decide), rfl⟩
+
+/-- The structured stride loop plan runs both iterations and falls through in
+`strideSt2`, and `evalPlan_whileLoop_continuing` (from
+`stridePlanBody_continuing`) shows that it can only ever fall through, which is
+the `.continuing`-only premise that loop-bodied certificate arms need. -/
+theorem strideLoop_plan_continuing :
+    evalPlan stdValAlg (.whileLoop 5 strideCond stridePlanBody) strideSt0 =
+      .ok (.continuing strideSt2) ∧
+    ∀ s f, evalPlan stdValAlg (.whileLoop 5 strideCond stridePlanBody) s = .ok f →
+      Exists fun s' => f = .continuing s' :=
+  ⟨rfl, evalPlan_whileLoop_continuing stdValAlg 5 strideCond stridePlanBody_wf
+    stridePlanBody_continuing⟩
+
+/-- **Exact CFG step count vs. rank-bounded `CfgCertificate.whileLoop` fuel on
+`strideLoopBody`**: the 2-iteration stride-3 loop takes `2 * 2 + 2 = 6` block
+transitions (`0 → 1 → 0 → 1 → 0 → 2`), so `runBlockCfg` diverges at fuel `5` and
+returns `.ret ⟨.nat 27, []⟩` at fuel `6`, while `CfgCertificate.whileLoop` with
+`loopFuel = strideLoopRank strideSt0 = 5 > 2` certifies the same return at
+`fuel = 2 * 5 + 2 = 12` (`loopFuel` only needs to bound `rank st0`, not equal
+the iteration count). -/
+theorem strideLoop_whileCfg_fuel_and_cert_sound :
+    let cert :=
+      CfgCertificate.whileLoop stdValAlg 5 strideCond stridePlanBody
+        (.use (.localSub 1 [])) stridePlanBody_wf stridePlanBody_continuing
+    runBlockCfg (stepBasicBlock stdValAlg cert.blocks) 0 strideSt0 5 =
+      .diverged ∧
+    runBlockCfg (stepBasicBlock stdValAlg cert.blocks) 0 strideSt0 6 =
+      .ret ⟨.nat 27, []⟩ ∧
+    cert.fuel = 12 ∧
+    runBlockCfg (stepBasicBlock stdValAlg cert.blocks) 0 strideSt0 cert.fuel =
+      .ret ⟨.nat 27, []⟩ := by
+  intro cert
+  exact ⟨rfl, rfl, rfl,
+    cert.sound [⟨.byVal, .nat 0⟩, ⟨.byVal, .nat 7⟩] strideSt0 ⟨.nat 27, []⟩
+      rfl rfl⟩
+
+/-- Natural unit-decrement ranking function on `loopBorrowBody` (`1` while
+`_1 = true`, `0` when `_1 = false`, so `lbUnitRank lbSt0 = lbUnitRank
+lbStAfterIter + 1`). -/
+def lbUnitRank (s : SymState StdVal) : Nat :=
+  match s.locals with
+  | ⟨⟨_, .bool true⟩, _⟩ :: _ => 1
+  | _ => 0
+
+theorem lbUnitCutpoint_step : ∀ s, lbCutInv s →
+    Exists fun cv => evalRval stdValAlg (.use (.localSub 0 [])) s = some cv ∧
+      (stdValAlg.asBool cv = some false ∨
+       (stdValAlg.asBool cv = some true ∧
+        Exists fun s' =>
+          evalPlan stdValAlg lbBodyPlan s = .ok (.continuing s') ∧
+          lbCutInv s' ∧ lbUnitRank s = lbUnitRank s' + 1)) := by
+  intro s hs
+  rcases hs with rfl | rfl
+  · exact ⟨.bool true, rfl, Or.inr ⟨rfl, lbStAfterIter, rfl, Or.inr rfl, rfl⟩⟩
+  · exact ⟨.bool false, rfl, Or.inl rfl⟩
+
+/-- **Test 2d-3 (unit-decrement convenience wrappers
+`holdsFnSpec_whileLoop_of_unitCutpoint` and
+`mir_whileLoop_cfgCertificate_of_unitCutpoint`)**: certifies `loopBorrowBody`
+with its natural unit rank `lbUnitRank` (`1 → 0`) through the unit-decrement
+convenience wrappers. -/
+theorem loopBorrow_unitCutpoint_sound :
+    HoldsFnSpec
+      (evalFnValue stdValAlg [⟨.byVal, .bool true⟩, ⟨.byVal, .nat 7⟩]
+        (.whileLoop 1 (.use (.localSub 0 [])) lbBodyPlan)
+        (.use (.localSub 1 [])))
+      (fun out => out.ret = .nat 42) ∧
+    Anneal.MirFuelFree.MirWpConverges loopBorrowBody lbMs0
+      (LiftedMirPost tagOfLoan (fun out => out.ret = .nat 42)) := by
+  have hRel0 : mirStateRel tagOfLoan [] lbSt0 lbMs0 :=
+    ⟨⟨trivial, trivial⟩,
+     mirLocalsRel_of_localsRefine
+       ⟨fun _ => ⟨_, rfl, .bool true⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩
+  have hRelBody : mirStateRel tagOfLoan [] lbSt0 lbMsBody :=
+    ⟨⟨trivial, trivial⟩,
+     mirLocalsRel_of_localsRefine
+       ⟨fun _ => ⟨_, rfl, .bool true⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩, trivial⟩⟩
+  have hRelAfter : mirStateRel tagOfLoan [] lbStAfterIter lbMsAfterIter :=
+    ⟨⟨trivial, trivial⟩,
+     mirLocalsRel_of_localsRefine
+       ⟨fun _ => ⟨_, rfl, .bool false⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+        fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩⟩
+  have hRelExit : mirStateRel tagOfLoan [] lbStAfterIter lbMsExit :=
+    ⟨⟨trivial, trivial⟩,
+     mirLocalsRel_of_localsRefine
+       ⟨fun _ => ⟨_, rfl, .bool false⟩, fun _ => ⟨_, rfl, .nat (by decide)⟩,
+        fun _ => ⟨_, rfl, .ref rfl rfl rfl⟩, trivial⟩⟩
+  refine ⟨holdsFnSpec_whileLoop_of_unitCutpoint stdValAlg 1
+      (.use (.localSub 0 [])) lbBodyPlan (.use (.localSub 1 [])) lbBodyPlan_wf
+      lbCutInv lbUnitRank lbUnitCutpoint_step (fun out => out.ret = .nat 42)
+      lbCutpoint_exit [⟨.byVal, .bool true⟩, ⟨.byVal, .nat 7⟩] lbSt0 rfl
+      (Or.inl rfl) (Nat.le_refl 1),
+    mir_whileLoop_cfgCertificate_of_unitCutpoint tagOfLoan loopBorrowBody 1
+      (.use (.localSub 0 [])) lbBodyPlan (.use (.localSub 1 []))
+      lbBodyPlan_wf lbBodyPlan_continuing
+      [⟨.byVal, .bool true⟩, ⟨.byVal, .nat 7⟩] lbSt0
+      (fun out => out.ret = .nat 42)
+      lbCutInv lbUnitRank lbUnitCutpoint_step lbCutpoint_exit
+      (fun _ => []) id lbExtra [] rfl (Or.inl rfl) (Nat.le_refl 1) ?_
+      ⟨rfl, rfl, hRel0, Or.inl ⟨rfl, rfl, rfl⟩⟩⟩
+  intro bb st ms ⟨_, _, _, hEx⟩
+  rcases hEx with ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩
+  · exact stepsTo_of_runMirToBlock_reached
+      (rfl : Anneal.PureMirExec.runMirToBlock loopBorrowBody 1 lbMs0 = .reached lbMsBody)
+      ⟨rfl, rfl, hRelBody, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
+  · exact stepsTo_of_runMirToBlock_reached
+      (rfl : Anneal.PureMirExec.runMirToBlock loopBorrowBody 0 lbMsBody = .reached lbMsAfterIter)
+      ⟨rfl, rfl, hRelAfter, Or.inr (Or.inr (Or.inl ⟨rfl, rfl, rfl⟩))⟩
+  · exact stepsTo_of_runMirToBlock_reached
+      (rfl : Anneal.PureMirExec.runMirToBlock loopBorrowBody 2 lbMsAfterIter = .reached lbMsExit)
+      ⟨rfl, rfl, hRelExit, Or.inr (Or.inr (Or.inr ⟨rfl, rfl, rfl⟩))⟩
+  · exact ⟨8, _, rfl, _, _, rfl, .nat (by decide), rfl⟩
+
+/-- **Non-vacuity of `StdValRefines.of_sameCond`,
+`StdValRefines.of_sameAggregateShape_ext`, and `StdValRefines.pair_inv`**:
+exercises the `StdValRefines` bridges for `stdValAlg.sameCond` and
+`stdValAlg.sameAggregateShape`. Both transports cross terms that are equal only
+propositionally (not by `rfl` for a free `c : Bool`): `of_sameCond` transports
+from `symBool c` to `symBool (!!c)` (`Bool.not_not`), and
+`of_sameAggregateShape_ext` transports from `.pair (.nat 10) (.nat 4)` to
+`.pair (.nat (if c then 10 else 10)) (.nat 4)` via field-wise agreement
+(`cases c <;> rfl`), while `sameCond` and `sameAggregateShape` still separate
+distinct conditions and non-pair leaves. -/
+theorem stdValRefines_sameCond_and_sameAggregateShape_canaries (c : Bool) :
+    StdValRefines tagOfLoan (.choice (.symBool c) (.nat 10) (.nat 3))
+      (.scalar ⟨if c then 10 else 3, 4⟩) ∧
+    StdValRefines tagOfLoan (.choice (.symBool (!!c)) (.nat 10) (.nat 3))
+      (.scalar ⟨if c then 10 else 3, 4⟩) ∧
+    stdValAlg.sameCond (.symBool c) (.symBool (!c)) = false ∧
+    StdValRefines tagOfLoan (.pair (.nat 10) (.nat 4))
+      (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨4, 4⟩]) ∧
+    StdValRefines tagOfLoan
+      (.pair (.nat (if c then 10 else 10)) (.nat 4))
+      (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨4, 4⟩]) ∧
+    stdValAlg.sameAggregateShape (.pair (.nat 10) (.nat 4)) (.nat 10) = false ∧
+    Exists fun ma => Exists fun mb =>
+      Value.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨4, 4⟩] =
+        .aggregate 0 [ma, mb] ∧
+      StdValRefines tagOfLoan (.nat 10) ma ∧
+      StdValRefines tagOfLoan (.nat 4) mb := by
+  have hPair :
+      StdValRefines tagOfLoan (.pair (.nat 10) (.nat 4))
+        (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨4, 4⟩]) :=
+    .pair (.nat (by decide)) (.nat (by decide))
+  have hChoice :
+      StdValRefines tagOfLoan (.choice (.symBool c) (.nat 10) (.nat 3))
+        (.scalar ⟨if c then 10 else 3, 4⟩) := by
+    cases c
+    · exact .choiceFalse (.nat (by decide))
+    · exact .choiceTrue (.nat (by decide))
+  refine ⟨hChoice,
+    StdValRefines.of_sameCond (c1 := .symBool c) (c2 := .symBool (!!c))
+      ((stdValAlg_sameCond_symBool_iff c (!!c)).mpr (Bool.not_not c).symm)
+      hChoice,
+    by cases c <;> rfl,
+    hPair,
+    StdValRefines.of_sameAggregateShape_ext
+      (stdValAlg_sameAggregateShape_pair (.nat 10) (.nat 4)
+        (.nat (if c then 10 else 10)) (.nat 4))
+      (fun _ => by cases c <;> rfl) hPair,
+    rfl,
+    hPair.pair_inv rfl⟩
 
 /-! ## Test 3: Hybrid `SpatialPin` Freeze → `zerocopy` Byte Write → Unpin -/
 

@@ -57,6 +57,7 @@ import LeanMiriSpec.Correspondence.SimLM4_2
 import LeanMiriSpec.Correspondence.WitLM4_2
 import LeanMiriSpec.Correspondence.Safety
 import LeanMiriSpec.Correspondence.MiriDiffWitnesses
+import LeanMiriSpec.Correspondence.WideSliceDstLM
 import LeanMiriSpec.Correspondence.MoveDeinitEquiv
 import LeanMiriSpec.Audit
 
@@ -448,6 +449,27 @@ import LeanMiriSpec.Audit
   boundary of `write_bytes` and `rotate_left`: `w6_write_bytes_extCall_boundary`,
   `w6_write_bytes_read_extCall_divergence`, `w6_write_bytes_oob_extCall_divergence`,
   `w6_rotate_left_extCall_boundary`) (`LM-4.3`).
+* `LeanMiriSpec.Correspondence.WideSliceDstLM`: wide-slice DST correspondence
+  (`*const [T]`, `*mut [T]`, `&[T]`, `&mut [T]`, `*const str`, `*mut str`, `&str`,
+  `&mut str` over fail-closed exact-layout `encodeSliceElemTyId?` elements),
+  conservative hook overlays (`annealDynamicLayoutHooksWideSlice`,
+  `annealPlaceProjectionHooksWideSlice`, `annealScalarOpsHooksWideSlice`,
+  `annealCastHooksWideSlice`, `annealAggregateHooksWideSlice`,
+  `annealIntrinsicHooksWideSlice`, `annealCallHooksWideSlice`,
+  `annealStepHooksWideSlice`), lockstep simulation for `AggregateKind.RawPtr`,
+  `UnaryOp.PtrMetadata` on raw wide pointers (`isWideRawPtrTyId`) and valid safe
+  wide references, `CastKind.PtrToPtr` (wide-to-thin, wide-to-wide, and
+  `to_raw_parts` → `from_raw_parts` round-trip), `PlaceElem.Deref` +
+  `Index`/`ConstantIndex`/`Subslice` (`fromEnd = false`/`true`), `&*p` / `&mut *p`
+  / `&raw const (*p)` / `&raw mut (*p)` reborrows and safe wide-reference validity,
+  `Rvalue.len (*p)`, `core::intrinsics::{size_of_val, align_of_val}` (with exact
+  `isize::MAX = 2^63 - 1` `InvalidMeta(SliceTooBig)` UB boundary), whole-step
+  `Step.step` witnesses, and all 7 kernel-checked `Miri`/Anneal semantic
+  divergences (`DIV-STAGE1-SCALAR-ADDR-WIDE-SLICE-SIZE-ALIGN`,
+  `DIV-LM-PTR-METADATA-INVALID-SAFE-REF`, `DIV-LM-SHARED-REBORROW-FRESH-TAG`,
+  `DIV-LM-PLACE-LEN-BORROW-BOUNDS`, `DIV-LM-RAW-SLICE-PARTIAL-OOB-LEN-INDEX`,
+  `DIV-LM-ZERO-BYTE-DANGLING-REBORROW`, and
+  `DIV-LM-CONSTANT-INDEX-NAT-SUB-SATURATION`).
 * `LeanMiriSpec.Correspondence.MoveDeinitEquiv`: consumer-side runtime move
   deinitialization: the patched `lean-miri` interpreter (`deinitMovedPlace`) is the
   unpatched source when the flag is off; with the flag on, moved sources are

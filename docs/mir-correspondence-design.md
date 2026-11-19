@@ -94,9 +94,10 @@ trusted/correspondence/Trusted/ Correspondence TCB specification (Pass 2)
                                 (-- anneal-trust-tier: candidate:mir_semantics)
 
 correspondence/Anneal/          Untrusted correspondence proof (Pass 2)
-  MirCorrespondenceProof.lean   Bijective SimulationInv, step proofs, codec
-                                constructor-preservation theorems, and M_ref
-                                correspondence canaries (D6-D9)
+  MirCorrespondenceBase.lean    Codec round-trip, canonicality, SimulationInv,
+                                and Miri scalar/discriminant bridge lemmas
+  MirCorrespondenceProof.lean   Per-step simulation, correspondence theorems,
+                                and M_ref correspondence canaries (D6-D13)
 
 trusted/audit/                  Two-pass source + binary .olean auditor
   src/lib.rs                    Pass 1 (51-module core lock) + Pass 2
@@ -115,8 +116,24 @@ and `theory/` into `share/anneal/` inside `anneal-exocrate.tar.zst`, and
 locked `Init.*` modules in `trusted/lean/foundation-lock.json`. By contrast,
 `vendor/lean-miri/Miri/` (608 files total; 160 `Miri.*` modules in the
 transitive import closure of `Miri.Interpreter.ExecutionMachine`) uses standard
-Lean 4 module headers without `prelude`, transitively importing `Init.*` and
-`Std.*` modules from the Lean 4.34.1 toolchain sysroot.
+Lean 4 module headers without `prelude`, transitively importing `Init.*`,
+`Std.*`, and `Lean.*` modules from the Lean 4.34.1 toolchain sysroot (whose
+`.olean`, `.olean.server`, and `.olean.private` artifacts are authenticated in
+memory by `AdmittedToolchain::ensure_sysroot_foundation` against
+`LOCKED_SYSROOT_FOUNDATION_MANIFEST_SHA256` in `trusted/audit/src/lib.rs`).
+
+Although `Trusted/MirSemantics.lean` resides in `trusted/lean/` so that
+`Trusted.CrateTheorem` and `Anneal.MirWp` can state per-crate obligations in
+Pass 1 without importing `vendor/lean-miri/`, only its outer theorem-stating
+boundary (`Query`, `TerminalOut`, `WellFormed`, `ReachesResult`,
+`SatisfiesPost`, `Behavior`, `WpSoundnessClaim`, and `WpFaultSoundnessClaim`)
+is a human-audited specification surface. Its internal operational execution
+rules (`initState` and `evalStep` of $M_{\text{anneal}}$) are kernel-certified
+against $M_{\text{ref}}$ (`vendor/lean-miri/`) in Pass 2 by
+`CorrespondenceClaim` and `FaultEquivalenceClaim` (`correspondence/`), keeping
+evolving execution rules out of the human-audited semantic TCB in accordance
+with [`docs/architecture.md`](architecture.md) and
+[`docs/mir-correspondence-strategy.md`](mir-correspondence-strategy.md).
 
 Placing `Trusted.Correspondence` and `Anneal.MirCorrespondenceProof` in
 `trusted/correspondence/` and `correspondence/` preserves both invariants:
@@ -125,19 +142,34 @@ Placing `Trusted.Correspondence` and `Anneal.MirCorrespondenceProof` in
    `Trusted.MirAst`, `Trusted.MirSemantics`, and `Anneal.MirWp` against the
    unmodified 51-module `trusted/lean/foundation-lock.json` and unmodified
    `allowedTrustedSyntaxKinds` / `allowedTheorySyntaxKinds` allowlists in
-   `TrustedBoundary.lean`. Only `trusted/lean/` and `theory/` ship in
-   `omnibus-archive`, keeping downstream per-crate verification completely
-   independent of `vendor/lean-miri/`.
+   `TrustedBoundary.lean`. Whenever `Anneal.PureLift`, `Trusted.MirAst`,
+   `Trusted.MirSemantics`, or `Anneal.MirWp` is present (or `require_mir_wp` is
+   enabled), `TrustedBoundary.lean` (`verifyMirWpCoreTheorems`) requires
+   `Trusted.MirAst` and `Trusted.MirSemantics` in `trusted/` and `Anneal.MirWp`
+   in `theory/`, and verifies that `wellFormed_and_spec_of_wp`,
+   `reaches_fault_and_exclusive_of_wpFault`, and all 19 Pass 1 canary theorems
+   in `Anneal.MirWp` prove the exact trusted `*Claim` propositions (referencing
+   the trusted `prog*` fixtures) defined in `Trusted.MirSemantics`. Only
+   `trusted/lean/` and `theory/` ship in `omnibus-archive`, keeping downstream
+   per-crate verification completely independent of `vendor/lean-miri/`.
 2. **Pass 2 (`Checker::run_correspondence` on `vendor/lean-miri/`,
    `trusted/correspondence/`, and `correspondence/`):** Runs in repository CI
    (`--require-correspondence`) to audit the correspondence claim against
    `vendor/lean-miri/`:
-   - **Fail-closed `UPSTREAM_PIN.json` check:** Verifies that all 608 `.lean`
-     files in `vendor/lean-miri/` are regular files (no symlinks or pre-existing
-     `.olean`/`.ilean`/`.ir` files) matching their pinned SHA-256 digests: 598
-     files match unmodified upstream `proofs-rs/lean-miri` at
-     `c92d1d9754c9dd585b6b9d6949ae67e5e4665d6a`, and the 10 patched files match
-     their pinned `patched_sha256` digests in `UPSTREAM_PIN.json`.
+   - **Fail-closed `UPSTREAM_PIN.json` check pinned from `trusted/`:** Before
+     reading `vendor/lean-miri/UPSTREAM_PIN.json`, `trusted/audit/src/lib.rs`
+     verifies that the manifest's own SHA-256 digest matches the TCB constant
+     `LOCKED_UPSTREAM_PIN_SHA256`, that its `upstream_commit` equals
+     `LOCKED_MIRI_COMMIT`, and that its patched-file map matches the closed TCB
+     allowlist `LOCKED_PATCHED_MIRI_FILES` inside `trusted/audit/`, so an
+     untrusted change outside `trusted/` cannot alter `UPSTREAM_PIN.json` to
+     admit modified `vendor/lean-miri/` sources or `.olean`s. It then verifies
+     that all 608 `.lean` files in `vendor/lean-miri/` are regular files (no
+     symlinks or pre-existing `.olean`/`.ilean`/`.ir` files) matching their
+     pinned SHA-256 digests: 598 files match unmodified upstream
+     `proofs-rs/lean-miri` at `c92d1d9754c9dd585b6b9d6949ae67e5e4665d6a`, and
+     the 10 patched files match their pinned `patched_sha256` digests in
+     `UPSTREAM_PIN.json`.
    - **160-module `ExecutionMachine` slice build and cache:** Compiles (or links
      from `--miri-cache-dir` after verifying each module's pinned `olean_sha256`
      in `UPSTREAM_PIN.json`) the 160 `Miri.*` modules in the transitive import
@@ -162,11 +194,15 @@ Placing `Trusted.Correspondence` and `Anneal.MirCorrespondenceProof` in
      `.vendorMiri` constant is `.opaqueInfo` (guaranteeing that none of the 24
      `partial def` JSON parser helpers in `Miri.Input.*` is reachable), that
      the only reachable axioms belong to `{propext, Classical.choice,
-     Quot.sound}`, that `correspondence_claim_holds` and
-     `fault_equivalence_claim_holds` prove the exact `Prop` constants defined in
-     `Trusted.Correspondence`, and that `toKernelEnv.replay` replays every
-     reachable `.vendorMiri` constant alongside `Trusted.Correspondence` and
-     `Anneal.MirCorrespondenceProof` from scratch.
+     Quot.sound}`, that `correspondence_claim_holds`,
+     `fault_equivalence_claim_holds`, `miri_move_deinit_wiring_claim_holds`, and
+     all Pass 2 codec, simulation, and canary theorems in
+     `Anneal.MirCorrespondenceProof` prove the exact `Prop` constants (and
+     trusted `prog*` fixtures) defined in `Trusted.Correspondence` and
+     `Trusted.MirSemantics`, that the 160 `.vendorMiri` `.olean` modules match
+     their locked SHA-256 digests in `UPSTREAM_PIN.json`, and that
+     `toKernelEnv.replay` replays every constant in `Trusted.Correspondence` and
+     `Anneal.MirCorrespondenceProof` on top of the verified base environment.
 
 ### 1.2 Compliance with `TrustedBoundary.lean` and `TrustTier` Discipline
 
@@ -194,7 +230,8 @@ allowlists:
   so Lean 4.34.1 elaborates the identical pure kernel `.defnInfo` without
   emitting partial `._unsafe_rec` compiler helpers. Beyond locked modules and
   the `Trusted.*` modules they build on, only `Trusted/Correspondence.lean`
-  imports anything else: `Miri.Interpreter.ExecutionMachine` from
+  imports anything else: `Miri.Interpreter.ExecutionMachine` and its
+  sub-modules (`LocalAccess`, `Place`, `Rvalue`, `Step`, `ControlFlow`) from
   `vendor/lean-miri/`, which places the vendored tree inside the
   correspondence TCB (Section 1.3).
 - **Allowlisted tactics in `theory/` and `correspondence/`:**
@@ -238,16 +275,18 @@ together with every later change to those definitions:
 | :--- | :--- |
 | `Trusted.MirAst` | `Program` (`pointerWidthBits`, `mirProfileVersion`) and AST types |
 | `Trusted.MirSemantics` | `Val`, `Query`, `Out`, `TerminalOut`, `StepResult` |
-| | `Reaches`, `ReachesResult`, `ReachesN` |
+| | `Reaches`, `ReachesResult` |
 | | `WellFormed`, `Behavior`, `Diverges`, `SatisfiesPost` |
-| `Trusted.Correspondence` | Codec, reference machine, and top-level claims |
+| | `WpSoundnessClaim`, `WpFaultSoundnessClaim`, `prog*`, `Canary*Claim` |
+| `Trusted.Correspondence` | Codec, reference machine, top-level claims, and `CanaryD*Claim` |
 | `vendor/lean-miri/` | Pinned `ExecutionMachine` slice and 10-file patch |
 
 - **`Trusted.MirAst` and `Trusted.MirSemantics` (`trusted/lean/`):** These
   modules define the programs, inputs, and observable outcomes that the claims
-  quantify over, and the trace predicates (built from `Step` and
-  `ValidChoice`) that turn `initState` and `evalStep` into the claims'
-  hypotheses and conclusions. `SatisfiesPost` is the contract that
+  quantify over, the trace predicates (built from `Step` and `ValidChoice`)
+  that turn `initState` and `evalStep` into the claims' hypotheses and
+  conclusions, and the concrete `prog*` fixtures and `*Claim`
+  propositions enforced on `Anneal.MirWp`. `SatisfiesPost` is the contract that
   per-function specifications discharge through `Anneal.MirWp`. The
   correspondence theorems cross-check the execution rules inside `initState`
   and `evalStep` against $M_{\text{ref}}$, but they assume, rather than check,
@@ -255,22 +294,28 @@ together with every later change to those definitions:
 - **`Trusted.Correspondence` (`trusted/correspondence/`):** This module defines
   the codec (`RefProg`, `encodeProg`, and `decodeProg`); the reference machine
   that the claims observe (`initRefState`, `callerSentinelFrame`,
-  `evalRefStep`, `ValidRefChoice`, `RefStep`, `RefReaches`, `RefReachesN`, and
-  the operator tables `toMiriBinOp` and `toMiriUnOp`); the reference
-  predicates (`RefReachesOutcome`, `RefWellFormed`, `RefBehavior`,
-  `RefDiverges`, and `faultToRefOutcome`); and the claims themselves
-  (`CorrespondenceClaim`, `FaultEquivalenceClaim`, and
-  `MiriMoveDeinitWiringClaim`).
+  `evalRefStep`, `ValidRefChoice`, `RefStep`, `RefReaches`, and the operator
+  tables `toMiriBinOp` and `toMiriUnOp`); the reference predicates
+  (`RefReachesOutcome`, `RefWellFormed`, `RefBehavior`, `RefDiverges`, and
+  `faultToRefOutcome`); and the claims and canary propositions themselves
+  (`CorrespondenceClaim`, `FaultEquivalenceClaim`, `MiriMoveDeinitWiringClaim`,
+  and `CanaryD6*Claim`–`CanaryD13*Claim`).
 - **`vendor/lean-miri/`:** `Trusted.Correspondence` drives `evalRefStep`
-  directly through `Miri.Interpreter.ExecutionMachine.step` (together with
-  `Miri.Interpreter.IntegerOps.binary` and `Miri.Memory.ScalarInt.tryFromUInt`),
-  so those definitions control the meaning of the reference machine. The
-  vendored tree is therefore part of the pinned, human-audited correspondence
-  TCB, not merely an input checked for forbidden axioms. `UPSTREAM_PIN.json`
-  pins every file to its audited digest, any change to a pinned digest
-  (including a new patch) requires the same human audit as a change to
-  `trusted/`, and `verifyAndCollectCorrLocals` keeps vendored declarations out
-  of the `Trusted` and `Anneal` namespaces.
+  through `lean-miri`'s interpreter modules (`Miri.Interpreter.evalOperand`,
+  `Miri.Interpreter.evalRvalueIntoPlace`, `Miri.Interpreter.Step.evalStatement`,
+  `Miri.Interpreter.Frame.storageLive`, `Miri.Interpreter.Frame.storageDead`,
+  `Miri.Interpreter.ControlFlow.evalTerminator`,
+  `Miri.Interpreter.ControlFlow.goToBlock`,
+  `Miri.Interpreter.ControlFlow.returnFromCurrentFrame`,
+  `Miri.Interpreter.IntegerOps.binary`, `Miri.Interpreter.IntegerOps.unary`,
+  `Miri.Memory.ScalarInt`, and `Miri.Interpreter.ExecutionMachine` via
+  `MiriMoveDeinitWiringClaim` in Section 5.2), so those definitions control the
+  meaning of the reference machine. The vendored tree is therefore part of the
+  pinned, human-audited correspondence TCB, not merely an input checked for
+  forbidden axioms. `UPSTREAM_PIN.json` pins every file to its audited digest,
+  any change to a pinned digest (including a new patch) requires the same human
+  audit as a change to `trusted/`, and `verifyCorrCone` keeps vendored
+  declarations out of the `Trusted` and `Anneal` namespaces.
 
 ---
 
@@ -278,35 +323,37 @@ together with every later change to those definitions:
 
 ### 2.1 Vendored `lean-miri` Core
 
-Anneal uses `lean-miri` (`Miri.Interpreter.ExecutionMachine.step`, pinned at
-upstream `proofs-rs/lean-miri` commit
+Anneal uses `lean-miri` (pinned at upstream `proofs-rs/lean-miri` commit
 `c92d1d9754c9dd585b6b9d6949ae67e5e4665d6a`, which targets `miri` commit
 `7fa591d7d4dd9af8154becbc8332f8096f8323b1` and `rustc` commit
 `8144389c895da997dbdecaa635e41d6a50be6ffd` and compiles cleanly on
 `leanprover/lean4:v4.34.1`) as $M_{\text{ref}}$. Because `anneal-rustc-capture`
 extracts Stage 2 `Runtime(PostCleanup)` MIR from Anneal's pinned `rustc`
-toolchain (`f8a08b688be27d3fe6cefd2ebce2bfce3fb22296`), the correspondence TCB
+toolchain (`f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1`), the correspondence TCB
 audits that every enabled Stage 2 MIR construct in `Trusted.MirAst` has
 identical post-cleanup operational rules across both `rustc` revisions, and
 stamps captured programs with an explicit semantic profile version
 (`mirProfileVersion : Nat := 1`; Section 3.1) that both `initState` and
-`initRefState` verify fail-closed. `lean-miri` is a mechanized
-Lean 4 interpreter modeled line-by-line on `rustc_const_eval::interpret`. Each
-invocation of `ExecutionMachine.step` takes a fuel parameter (`maxSubsteps :=
-16` for internal sub-loops), a nondeterminism oracle (`choice : Choice`), and an
-`ExecutionState`, and returns one of five outcomes:
+`initRefState` verify fail-closed. `lean-miri` is a mechanized Lean 4
+interpreter modeled line-by-line on `rustc_const_eval::interpret`. Each
+invocation of `evalRefStep` in `Trusted.Correspondence` executes one MIR
+statement or terminator in a single deterministic step without an internal
+substep fuel cutoff (and `ExecutionMachine.step` in `vendor/lean-miri` is
+parameterized over `limits : ExecutionMachine.Limits`, which is universally
+quantified in `MiriMoveDeinitWiringClaim`), taking a nondeterminism oracle
+(`choice : Choice`) and a reference state and returning one of five outcomes:
 
 - `.running nextState`: the statement or terminator stepped normally.
-- `.returned`: the root frame executed `TerminatorKind.Return` and popped into
-  the caller sentinel frame.
-- `.exhausted .stepLimit`: the execution reached its configured step budget
-  (`stepsExecuted ≥ limits.maxSteps`).
-- `.ub err`: the execution triggered modeled Rust Undefined Behavior (such as
+- `.returned out`: the root frame executed `TerminatorKind.Return` and popped
+  into the caller sentinel frame.
+- `.exhaustedStepLimit`: the execution reached its configured step budget
+  (`stepsExecuted ≥ maxSteps`).
+- `.ub`: the execution triggered modeled Rust Undefined Behavior (such as
   reading uninitialized data, dividing by zero, overflowing an unchecked
   arithmetic operator, or accessing a dead local).
-- `.blocked reason`: the execution encountered an unmodeled feature, missing
-  hook, or malformed MIR invariant (such as an out-of-bounds basic-block index
-  or an unsupported statement, rvalue, or terminator).
+- `.blocked`: the execution encountered an unmodeled feature, missing hook, or
+  malformed MIR invariant (such as an out-of-bounds basic-block index or an
+  unsupported statement, rvalue, or terminator).
 
 ### 2.2 Single-Source Type and Layout Hooks (`MiriRefMachine`)
 
@@ -364,9 +411,10 @@ def callerSentinelFrame (retTy : MirTy) : RefFrameState
 ```
 
 `callerSentinelFrame retTy` never executes. Its only local is the caller's
-live destination slot (`local 0`) of type `retTy`, and it has no return
-continuation (`returnContinuation := false`). `initRefState` builds every
-initial reference state with the two-frame stack
+live destination slot (`local 0`) of type `retTy`, and it marks the suspended
+caller frame (`returnContinuation := true`), whereas the active entry frame has
+no further return continuation (`returnContinuation := false`). `initRefState`
+builds every initial reference state with the two-frame stack
 `frames := [callerSentinelFrame retTy, rframe]`, where `retTy` is the entry
 body's return-place type (`localTys[0]`) and `rframe` begins executing
 `rp.bodies[rp.entryDefId]` at block `0`, statement `0`.
@@ -453,27 +501,63 @@ In `lean-miri`, `OperandMachine.evalOperand` evaluates a `Place` via
     `.immediate value` branch, it deinitializes `⟨mplace, source.layout⟩`
     via `h.writeMemoryNoValidate choice .uninit` *before* writing
     `value.value` to `dest` (preserving indirect self-moves
-    `*_1 = move *_1`); in the `.place
-    memory` branch (padded or memory-backed structs/arrays), it runs
-    `copy.memoryCopy` (which already enforces `nonoverlapping = true`) and then
-    deinitializes `⟨memory.mplace, source.layout⟩` via
-    `h.writeMemoryNoValidate choice .uninit`, before `copyRuntimePlace` runs
-    destination validity checks (`h.validate choice dest`).
+    `*_1 = move *_1`); in the `.place memory` branch (padded or memory-backed
+    structs/arrays), it runs `copy.memoryCopy` (which enforces
+    `nonoverlapping = true`, rejecting non-ZST overlapping `Assign` places as
+    `overlapping copy_nonoverlapping` UB per Rust MIR's disjoint-`Assign` rule)
+    and then, when `shouldDeinit` is `true`, deinitializes
+    `⟨memory.mplace, source.layout⟩` via `h.writeMemoryNoValidate choice
+    .uninit` (which is a no-op on zero-sized places because their byte length is
+    `0`), before `copyRuntimePlace` runs destination validity checks
+    (`h.validate choice dest`). On the zero-length `Repeat` (`[move x; 0]`) path
+    where `writeRepeat` skips `copyOp`, `ExecutionMachine.rvalueHooks`
+    explicitly consumes `takePendingMoveDeinit` and deinitializes `source`'s
+    `mplace` after `getPlaceAllocMut` validates the destination.
   - Inside `Cast.cast` (`Rvalue.Cast`), `Cast.cast` atomically takes
     `shouldDeinit ← h.takePendingMoveDeinit` at entry before any intermediate
     helper read (`checkFunctionPointer`, `BoxDerefTransmute`, or per-field
     `copyNoValidate` inside `unsizeInto`) can consume the flag, then
     deinitializes the complete source operand via `h.deinitSource choice source`
     once the cast or unsizing copy completes.
-  - Inside `Call.evalFnCallArgumentAt`, `Call.passArgument`, and
-    `Call.allocateVarargs` (`TerminatorKind.Call` and `TailCall`), moving an
+  - Inside `Call.evalCalleeAndArgs`, `Call.evalFnCallArgumentAt`,
+    `Call.passArgument`, `Call.allocateVarargs`,
+    `Call.materializeAndDeinitArgs`, `Call.initFnCallStep`, `Call.initFnCall`,
+    and `Call.initFnTailCall` (`TerminatorKind.Call` and `TailCall`), moving an
     unprojected `.immediate` argument deinitializes
-    `frame.locals[place.localId]` when `h.deinitMovedPlace` is `true`, and
-    moving an `.InPlace` argument deinitializes the source `MPlaceTy` via
-    `h.deinitInPlaceArgument` after copying into the callee destination.
-  - Finally, `ExecutionMachine.step` clears `pendingMoveDeinit := false` at the
-    end of every statement or terminator step so no unconsumed flag can leak
-    into a subsequent step.
+    `frame.locals[place.localId]` (preserving valid ZST immediates when
+    `layout.isZst`) when `h.deinitMovedPlace` is `true`. In
+    `evalCalleeAndArgs`, whenever `hasMove` is `true` (`isMoveFunc || args.any
+    ...`) and `func` evaluates to an indirect `.indirect mplace`,
+    `evalCalleeAndArgs` snapshots `func` into a temporary stack allocation
+    (`tmpFunc` via `h.copyToMemory`, preserving Tree Borrows, race, alignment,
+    and initialization checks) before argument evaluation can deinitialize an
+    alias of `func`, and deinitializes `⟨mplace, func.layout⟩` via
+    `h.deinitInPlaceArgument` only when `isMoveFunc` is `true` (while
+    `ExecutionCalls.make` clears `pendingMoveDeinit := false` and
+    `pendingMoveDeinits := #[]` after `evalOperand` / `evalOperandAt`). When a
+    `.Move` argument resolves to an `.InPlace` memory place during
+    `evalCalleeAndArgs`, `evalFnCallArgumentAt` snapshots the argument into a
+    temporary stack allocation (`tempAllocs`) and marks the source `MPlaceTy`'s
+    raw bytes `.uninit` (`h.markInPlaceMovedUninit`) immediately during argument
+    evaluation so any later operand evaluation that reads the moved place sees
+    `.uninit` and reports UB; indirect `.Copy` arguments in calls with `hasMove
+    = true` are likewise snapshotted into `tempAllocs` via `h.copyToMemory`
+    (preserving canonical read access checks). Inside `passArgument`,
+    `allocateVarargs`, and `materializeAndDeinitArgs`, `.InPlace` arguments
+    restore `srcPlace`'s raw bytes from the snapshot
+    (`h.restoreInPlaceMovedBytes`), copy from `srcPlace` via
+    `h.copyAllowTransmute` / `h.copyToMemory` (so the copy runs with full Tree
+    Borrows, data-race, alignment, and validity checks on `srcPlace`), and
+    deinitialize `srcPlace` via `h.deinitInPlaceArgument` (followed by
+    `h.protectArgument` in `passArgument`). On non-copying call paths
+    (`findMirOrEvalFn = none`, empty `isRustCall` tuple, and `.Virtual` receiver
+    dispatch), `deinitInPlaceArg` restores the source `MPlaceTy`'s raw bytes
+    from the snapshot and invokes `h.deinitInPlaceArgument`
+    (`writeMemoryNoValidate .uninit`) before temporary stack allocations are
+    deallocated via `deallocateStack`.
+  - Finally, `ExecutionMachine.step` clears `pendingMoveDeinit := false` and
+    `pendingMoveDeinits := #[]` before and after every statement or terminator
+    step so no unconsumed flag can leak into a subsequent step.
 
 ---
 
@@ -512,10 +596,14 @@ via pure pattern-matching functions (`IntWidth.beq`, `Mutability.beq`,
 
 Similarly, constant literals (`ConstLit`) represent only modeled constant shapes
 (`.scalar (bits : BitVec 128)` and `.zeroSized`). When `anneal-rustc-capture`
-encounters an unmodeled constant, statement, rvalue, or terminator, it lowers
-the enclosing construct to `StatementKind.unsupported`, `Rvalue.unsupported`, or
-`TerminatorKind.unsupported` so that unsupported features are rejected at clear
-statement or expression boundaries rather than inside leaf literals.
+encounters any unmodeled constant, statement, rvalue, terminator, or type in
+Stage 2 `Runtime(PostCleanup)` MIR, it fails closed with a hard capture error
+and never rewrites unsupported MIR into generic `.unsupported` nodes. The
+`.unsupported` constructors (`MirTy.unsupported`, `StatementKind.unsupported`,
+`Rvalue.unsupported`, and `TerminatorKind.unsupported`) exist solely in
+`Trusted.MirAst` as explicit AST sentinels for testing and verifying fail-closed
+`.unsupported` / `.blocked` fault handling in `CorrespondenceClaim`,
+`FaultEquivalenceClaim`, and negative canaries (`CanaryD5`).
 
 `Program` collects the function bodies and records both the pointer width of
 the captured target and the Stage 2 MIR semantic profile version:
@@ -544,7 +632,7 @@ manifest rather than rely on the defaults:
   a 32-bit target.
 - **Semantic revision and profile gating (`mirProfileVersion = 1`):** Because
   `anneal-rustc-capture` runs on Anneal's pinned `rustc` toolchain
-  (`f8a08b688be27d3fe6cefd2ebce2bfce3fb22296`) while `vendor/lean-miri/` tracks
+  (`f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1`) while `vendor/lean-miri/` tracks
   upstream `miri`/`rustc` (`8144389c895da997dbdecaa635e41d6a50be6ffd`), the
   correspondence TCB audit verifies that every enabled Stage 2
   `Runtime(PostCleanup)` MIR construct has identical operational rules across
@@ -609,19 +697,31 @@ about the codec defined in `Trusted.Correspondence`:
    source statement is `StatementKind.nop` (`encodeStmt ts s = .nop ↔ s =
    .nop`), ensuring that `encodeProg` never silences an active or unsupported
    MIR statement by turning it into a no-op.
-4. **Constructor preservation (`encodeRvalue_binaryOp_iff`,
-   `encodeRvalue_unaryOp_iff`, and `encodeStmt_assign_iff`):**
-   `encodeRvalue` produces `RefRvalue.binaryOp op _ _` exactly when the source
-   rvalue is `Rvalue.binaryOp op _ _` with the same operator `op`, and likewise
-   for `unaryOp`; `encodeStmt` produces `RefStatementKind.assign` exactly when
-   the source statement is `StatementKind.assign`.
+4. **Structural constructor and field preservation (`encodePlace_eq`,
+   `encodeOperand_eq`, `encodeRvalue_binaryOp_iff`, `encodeRvalue_unaryOp_iff`,
+   `encodeRvalue_use_iff`, `encodeStmt_assign_iff`,
+   `encodeStmt_storageLive_iff`, `encodeStmt_storageDead_iff`, and
+   `encodeTerminator_eq`):**
+   Every encoder step in the one-to-one adapter preserves both its constructor
+   tag and all encoded subfields in order: `encodePlace` preserves `localId` and
+   `projection`; `encodeOperand` preserves `.copy place`, `.move place`, and
+   `.constant (lookupTyId ts c.ty, c.lit)`; `encodeRvalue` produces
+   `RefRvalue.binaryOp op (encodeOperand ts lhs) (encodeOperand ts rhs)` if and
+   only if the source rvalue is `Rvalue.binaryOp op lhs rhs` with the exact same
+   operator `op` and ordered operands `(lhs, rhs)` (and likewise for
+   `RefRvalue.unaryOp op (encodeOperand ts opnd)` and `RefRvalue.use
+   (encodeOperand ts opnd)`); `encodeStmt` preserves `.assign (encodePlace ts
+   dst) (encodeRvalue ts rv)`, `.storageLive l`, `.storageDead l`, `.nop`, and
+   `.unsupported`; and `encodeTerminator` preserves `.goto target`,
+   `.switchInt (encodeOperand ts discr) targets`, `.return`, `.unreachable`, and
+   `.unsupported` with their exact target blocks and branch lists.
 
 Guarantees 1–3 alone would not rule out semantic permutation: an encoder that
-exchanged `.add` and `.addUnchecked`, paired with a decoder that exchanged them
-back, would still satisfy all three. Guarantee 4 rules out such permutations
-for every operator at once, because `RefRvalue.binaryOp` and
-`RefRvalue.unaryOp` carry `Trusted.MirAst`'s own `BinOp` and `UnOp` values and
-the theorems force the encoder to copy them unchanged.
+exchanged `.add` and `.addUnchecked`, reversed `(lhs, rhs)` on `.sub`/`.div`, or
+exchanged `.storageLive` and `.storageDead`, paired with a decoder that reversed
+the permutation, would still satisfy round-trip (`decodeProg (encodeProg p) =
+some p`). Guarantee 4 rules out both constructor and field permutations across
+the entire 1-to-1 AST adapter.
 
 Two further checks pin the meaning of the shared operators. Inside
 `Trusted.Correspondence`, the reference machine maps each `BinOp` and `UnOp` to
@@ -672,16 +772,31 @@ inductive TerminalOut where
   | unwound (callerMem : CallerMemory := ⟨[]⟩)
 ```
 
-Sharing `Query` and `TerminalOut` across both $M_{\text{anneal}}$ and
-$M_{\text{ref}}$ eliminates any output projection function $\pi :
-\text{Out}_{\text{anneal}} \to \text{Out}_{\text{ref}}$ from the correspondence
-theorem statement, preventing a constant or lossy projection from hiding
-disagreements in return values or memory state.
+In Day 1 / Phase 1, unwinding is outside the supported domain (`unwindEnabled =
+false`), so every unwinding transition maps to `FaultKind.unsupported` /
+`.blocked` and `TerminalOut.unwound` is never produced by either machine; when a
+future phase enables unwinding (`unwindEnabled = true`), `TerminalOut.unwound`
+must also carry the canonical unwind payload alongside `callerMem` so
+corresponding unwind outcomes preserve both the payload and caller-visible
+memory.
 
-Sharing `Query` likewise eliminates any input conversion. `initState` and
-`initRefState` both build their initial states from the same `q : Query`, and
-the claims quantify over every `q`, so no conversion function or extra
-precondition can filter out or sanitize the inputs that trigger UB.
+Sharing `Query` and `TerminalOut` across both $M_{\text{anneal}}$ and
+$M_{\text{ref}}$ eliminates any external input conversion or output projection
+function $\pi : \text{Out}_{\text{anneal}} \to \text{Out}_{\text{ref}}$ from the
+correspondence theorem statement, preventing a constant or lossy projection from
+hiding disagreements in return values or memory state. Inside
+`Trusted.Correspondence`, `initRefState` and `evalRefStep` bridge boundary
+`Val`s (`Val.scalar ⟨w, s, bits⟩`, `Val.bool b`, `Val.unit`) to and from
+`lean-miri`'s `Miri.Memory.ScalarInt` representation via `checkRefVal`,
+`toMiriScalar` (`ScalarInt.tryFromUInt bits (toMiriSize w)`, rejecting any
+out-of-width bit pattern rather than truncating), and `fromMiriScalar` (reading
+`sc.data` at static type `.int w s` or `sc.tryToBool` at `.bool`).
+`Anneal.MirCorrespondenceProof` proves unconditional field-preservation and
+agreement lemmas for these boundary adapters (`checkRefVal_eq : checkRefVal v
+ty = checkVal v ty`, `checkRefArgsMatch_eq : checkRefArgsMatch vs tys =
+checkArgsMatch vs tys`, and `match_tryFromUInt_eq`, guaranteeing that a
+validated `ScalarInt` preserves `sc.data = bits` and `sc.size = toMiriSize w`
+with zero truncation or signedness mutation).
 
 ### 4.2 Factored Entry Initialization and Small-Step State Machine
 
@@ -760,11 +875,6 @@ inductive Reaches (p : Program) : State → State → Prop where
   | tail : Reaches p s₁ s₂ → Step p s₂ (.step s₃) →
       Reaches p s₁ s₃
 
-inductive ReachesN (p : Program) : Nat → State → State → Prop where
-  | refl (s : State) : ReachesN p 0 s s
-  | tail : ReachesN p n s₁ s₂ → Step p s₂ (.step s₃) →
-      ReachesN p (n + 1) s₁ s₃
-
 def ReachesResult (p : Program) (q : Query)
     (res : StepResult State TerminalOut) : Prop :=
   match initState p q with
@@ -782,7 +892,8 @@ def Behavior (p : Program) (q : Query) (out : TerminalOut) : Prop :=
 
 def Diverges (p : Program) (q : Query) : Prop :=
   ∃ s₀ : State, initState p q = .ok s₀ ∧
-    ∀ n : Nat, ∃ s : State, ReachesN p n s₀ s
+    ∃ trace : Nat → State,
+      trace 0 = s₀ ∧ ∀ n : Nat, Step p (trace n) (.step (trace (n + 1)))
 
 def SatisfiesPost (p : Program) (q : Query)
     (post : TerminalOut → Prop) : Prop :=
@@ -795,13 +906,15 @@ reachable state has at least one admissible choice
 `WellFormed` hold on a stuck machine) and that no reachable transition faults
 with either `.undefined` or `.unsupported`.
 
-`ReachesN p n s₁ s₂` is the step-indexed form of `Reaches`: `s₂` is
-reachable from `s₁` in exactly `n` non-terminal steps. `Diverges p q` states
-that entry succeeds and that, for every `n`, some execution runs `n` steps
-without terminating or faulting. On Day 1, `ValidChoice` admits exactly one
-choice per state (`c = 0`), so `Diverges p q` holds exactly when the unique
-execution from `initState p q` is infinite. Termination versus divergence is
-observable behavior under
+`Diverges p q` states that entry succeeds (`initState p q = .ok s₀`) and that
+there exists a single coherent infinite execution trace `trace : Nat → State`
+starting at `trace 0 = s₀` in which every state `trace n` steps to
+`trace (n + 1)`. Defining divergence via a single state stream `trace : Nat →
+State` (rather than `∀ n, ∃ s, ReachesN p n s₀ s`) ensures that even when
+`ValidChoice` admits infinitely many nondeterministic branches (such as
+allocator address choices), an infinitely branching tree of finite-only paths is
+not misclassified as divergent. Termination versus divergence is observable
+behavior under
 [`docs/mir-correspondence-strategy.md`](mir-correspondence-strategy.md), and
 Section 5.2 relates `Diverges` to its reference counterpart in both
 directions. `SatisfiesPost` is a partial-correctness contract: it constrains
@@ -889,16 +1002,20 @@ aligns its operational checks with `lean-miri`'s evaluation order:
 
 ### 5.1 Step-Budget Quantification (`maxSteps`)
 
-In `lean-miri`, `ExecutionMachine.step` checks `state.stepsExecuted <
-limits.maxSteps` at the start of every step: if the budget is reached, it
-returns `.exhausted .stepLimit`, and otherwise it executes one step and
-increments `stepsExecuted := state.stepsExecuted + 1`.
+In `lean-miri`, `ExecutionMachine.step` executes a single interpreter step (via
+`Step.step (stepHooks cfg limits) c`, clearing `pendingMoveDeinit` and
+`pendingMoveDeinits` before and after the step), while `ExecutionMachine.run`
+enforces the outer step budget `limits.maxSteps`. In `Trusted.Correspondence`,
+`evalRefStep` mirrors that step-budget check around `ExecutionMachine.step`: at
+the start of each step it checks `rs.stepsExecuted < rs.maxSteps`, returning
+`.exhaustedStepLimit` if the budget is reached and otherwise calling
+`ExecutionMachine.step` and incrementing `stepsExecuted := rs.stepsExecuted +
+1`.
 
-To keep `Trusted.Correspondence` maximally auditable without modifying
-intermediate `lean-miri` states between steps, `initRefState` takes `maxSteps :
-Nat` as an explicit parameter (`stepsExecuted := 0, maxSteps := maxSteps`), and
-`RefReaches` and its step-indexed form `RefReachesN` chain `RefStep`
-transitions completely unmodified:
+To keep `Trusted.Correspondence` maximally auditable without resetting step
+counters between transitions, `initRefState` takes `maxSteps : Nat` as an
+explicit parameter (`stepsExecuted := 0, maxSteps := maxSteps`), and
+`RefReaches` chains `RefStep` transitions completely unmodified:
 
 ```lean
 inductive RefReaches (rp : RefProg) : RefState → RefState → Prop where
@@ -906,13 +1023,6 @@ inductive RefReaches (rp : RefProg) : RefState → RefState → Prop where
   | tail : RefReaches rp rs₁ rs₂ →
       RefStep rp rs₂ (.running rs₃) →
       RefReaches rp rs₁ rs₃
-
-inductive RefReachesN (rp : RefProg) :
-    Nat → RefState → RefState → Prop where
-  | refl (rs : RefState) : RefReachesN rp 0 rs rs
-  | tail : RefReachesN rp n rs₁ rs₂ →
-      RefStep rp rs₂ (.running rs₃) →
-      RefReachesN rp (n + 1) rs₁ rs₃
 
 def RefReachesOutcome (rp : RefProg) (q : Query) (maxSteps : Nat)
     (out : RefOutcome) : Prop :=
@@ -937,8 +1047,15 @@ def RefBehavior (rp : RefProg) (q : Query) (out : TerminalOut) : Prop :=
   ∃ maxSteps : Nat, RefReachesOutcome rp q maxSteps (.returned out)
 
 def RefDiverges (rp : RefProg) (q : Query) : Prop :=
-  ∀ n : Nat, ∃ maxSteps : Nat, ∃ rs₀ rs : RefState,
-    initRefState rp q maxSteps = .ok rs₀ ∧ RefReachesN rp n rs₀ rs
+  ∃ rs₀ : RefState, initRefState rp q 0 = .ok rs₀ ∧
+    ∃ trace : Nat → RefState,
+      trace 0 = rs₀ ∧
+      ∀ n : Nat,
+        RefStep rp
+          { trace n with stepsExecuted := n, maxSteps := n + 1 }
+          (.running
+            { trace (n + 1) with
+              stepsExecuted := n + 1, maxSteps := n + 1 })
 ```
 
 - In `RefWellFormed rp q`, quantifying universally over `∀ maxSteps : Nat`
@@ -949,16 +1066,19 @@ def RefDiverges (rp : RefProg) (q : Query) : Prop :=
   asserts that there exists a finite step budget large enough (specifically
   `maxSteps := n + 1` for an $n$-step trace in $M_{\text{anneal}}$) for
   `lean-miri` to run from `stepsExecuted = 0` to `.returned out`.
-- In `RefDiverges rp q`, the existential budget sits inside `∀ n : Nat`: for
-  every `n`, some budget (any `maxSteps ≥ n`) lets `lean-miri` run `n` steps
-  from `stepsExecuted = 0` without returning or faulting. Because
-  `evalRefStep` returns `.exhaustedStepLimit` once `stepsExecuted` reaches
-  `maxSteps`, no single fixed budget could witness an infinite execution.
+- In `RefDiverges rp q`, a single coherent infinite state stream `trace : Nat →
+  RefState` starts at `trace 0 = rs₀` (`initRefState rp q 0 = .ok rs₀`), and at
+  every step `n`, `trace n` (with step budget `maxSteps := n + 1` so the step
+  limit does not fire at step `n`) transitions via `RefStep` to `trace (n + 1)`.
+  Quantifying `∃ trace : Nat → RefState` outside `∀ n : Nat` forces a single
+  connected infinite execution path rather than allowing different finite
+  branches at different horizons `n`.
 
-### 5.2 Correspondence and Bidirectional Fault-Equivalence Theorems
+### 5.2 Correspondence, Fault-Equivalence, and Move-Deinit Wiring Theorems
 
-`Trusted.Correspondence` states two top-level claims: correspondence for
-well-formed programs and unconditional, bidirectional fault equivalence.
+`Trusted.Correspondence` states three top-level claims: correspondence for
+well-formed programs, unconditional bidirectional fault equivalence, and the
+vendored `ExecutionMachine` move-deinitialization wiring contract:
 
 ```lean
 def CorrespondenceClaim : Prop :=
@@ -974,16 +1094,136 @@ def FaultEquivalenceClaim : Prop :=
     ReachesResult p q (.fault k) ↔
       ∃ maxSteps : Nat,
         RefReachesOutcome (encodeProg p) q maxSteps (faultToRefOutcome k)
+
+def MiriMoveDeinitWiringClaim : Prop :=
+  (∀ {K U C O X Host : Type} [DecidableEq K]
+      (cfg : Miri.Interpreter.ExecutionMachine.Config K U C O X Host)
+      (limits : Miri.Interpreter.ExecutionMachine.Limits)
+      (c : C)
+      (state : Miri.Interpreter.MachineHooks.State K U),
+    Miri.Interpreter.ExecutionMachine.step cfg limits c state =
+      let (state', out) := Miri.Interpreter.Step.step
+        (Miri.Interpreter.ExecutionMachine.stepHooks cfg limits) c
+        { state with
+          machine := {
+            state.machine with
+            pendingMoveDeinit := false
+            pendingMoveDeinits := Array.empty
+          } }
+      ( { state' with
+          machine := {
+            state'.machine with
+            pendingMoveDeinit := false
+            pendingMoveDeinits := Array.empty
+          } },
+        out )) ∧
+  (∀ {K U C O X Host : Type} [DecidableEq K]
+      (cfg : Miri.Interpreter.ExecutionMachine.Config K U C O X Host)
+      (limits : Miri.Interpreter.ExecutionMachine.Limits),
+    cfg.deinitMovedPlace = true →
+    (Miri.Interpreter.ExecutionMachine.withValidation
+        cfg limits).access.deinitMovedPlace = true ∧
+    (Miri.Interpreter.ExecutionMachine.operandHooks
+        cfg).deinitMovedPlace = true) ∧
+  (∀ {Prov Extra State : Type}
+      (hooks : Miri.Interpreter.LocalAccessHooks Prov Extra State)
+      (frame : Miri.Interpreter.Frame Prov Miri.Interpreter.LocalLayout Extra)
+      (state : State)
+      (localId : Miri.MIR.LocalId)
+      (known : Option Miri.Interpreter.LocalLayout),
+    hooks.deinitMovedPlace = false →
+    Miri.Interpreter.evalOperand hooks frame state
+        (.Move ⟨localId, Array.empty⟩) known =
+      Miri.Interpreter.evalPlaceToOp hooks frame state
+        ⟨localId, Array.empty⟩ known) ∧
+  (∀ {Prov Extra State : Type}
+      (hooks : Miri.Interpreter.LocalAccessHooks Prov Extra State)
+      (frame frame₁ frame₂ :
+        Miri.Interpreter.Frame Prov Miri.Interpreter.LocalLayout Extra)
+      (state state₁ : State)
+      (localId : Miri.MIR.LocalId)
+      (known : Option Miri.Interpreter.LocalLayout)
+      (imm : Miri.Interpreter.Immediate Prov)
+      (layout : Miri.Interpreter.LocalLayout),
+    hooks.deinitMovedPlace = true →
+    Miri.Interpreter.evalPlaceToOp hooks frame state
+        ⟨localId, Array.empty⟩ known =
+      ⟨frame₁, state₁, .ok ⟨.immediate imm, layout⟩⟩ →
+    frame₁.replaceLocalValue localId
+        (.live (if layout.layout.isZst then .immediate imm
+          else .immediate .uninit)) =
+      .ok frame₂ →
+    Miri.Interpreter.evalOperand hooks frame state
+        (.Move ⟨localId, Array.empty⟩) known =
+      ⟨frame₂, state₁, .ok ⟨.immediate imm, layout⟩⟩) ∧
+  (∀ {K U : Type}
+      (m : Miri.Interpreter.MachineHooks.MachineState K U)
+      (mplace : Miri.Interpreter.MemPlace Miri.Memory.Provenance)
+      (isMove : Bool),
+    (Miri.Interpreter.MachineHooks.takeLastPendingMoveDeinit
+      (Miri.Interpreter.MachineHooks.recordPendingMoveDeinit m mplace
+        isMove)).2 = isMove) ∧
+  (∀ {P S C E Other Extern FnABI ArgABI : Type}
+      (h : Miri.Interpreter.CallHooks P S C E Other Extern FnABI ArgABI)
+      (choice : C)
+      (place : Miri.Interpreter.MPlaceTy P)
+      (snap : Miri.Interpreter.OpTy P),
+    Miri.Interpreter.FnArg.copyFnArg (.InPlace place (some snap)) = snap ∧
+    Miri.Interpreter.Call.deinitInPlaceArg h choice place (some snap) =
+      Bind.bind (h.restoreInPlaceMovedBytes choice snap place)
+        (fun _ => h.deinitInPlaceArgument choice place))
 ```
 
 where `faultToRefOutcome .undefined = .ub` and
 `faultToRefOutcome .unsupported = .blocked`. `Anneal.MirCorrespondenceProof`
-proves both with zero `sorry`. Its theorems `anneal_corresponds_to_miri p q`
-and `reachesResult_fault_iff_refReachesOutcome p q k` state the claim bodies,
-including the bidirectional behavior and divergence clauses, for fixed
-arguments, and `correspondence_claim_holds : CorrespondenceClaim` and
-`fault_equivalence_claim_holds : FaultEquivalenceClaim` generalize them over
-all arguments.
+proves all three with zero `sorry`. Its theorems `anneal_corresponds_to_miri p
+q` and `reachesResult_fault_iff_refReachesOutcome p q k` state the
+correspondence and fault-equivalence bodies, including the bidirectional
+behavior and divergence clauses, for fixed arguments, and
+`correspondence_claim_holds : CorrespondenceClaim`,
+`fault_equivalence_claim_holds : FaultEquivalenceClaim`, and
+`miri_move_deinit_wiring_claim_holds : MiriMoveDeinitWiringClaim` generalize
+them over all arguments.
+
+On Day 1, both $M_{\text{anneal}}$ and $M_{\text{ref}}$ are deterministic
+(`ValidChoice _ _ c := c = 0` and `ValidRefChoice _ _ c := c = 0`), so there is
+at most one execution path from `(p, q)` and existential quantification in
+`CorrespondenceClaim` and `FaultEquivalenceClaim` is identical to per-execution
+coupling. When Phase 2 introduces nondeterministic choices (such as base-address
+allocation draws `c : Choice` along a choice trace `choices : List Choice`),
+comparing aggregate behavior sets, existential divergence predicates, or
+existential fault sets across unrelated branches would allow one machine to
+return (or reach `.undefined`/`.ub`) on branch $c_1$ and diverge (or reach
+`.unsupported`/`.blocked` or a different return value) on branch $c_2$ while the
+other machine permutes those outcomes across $c_1$ and $c_2$. Phase 2 therefore
+indexes finite terminating and faulting executions along a shared finite choice
+trace `choices : List Choice`, and diverging executions along a shared infinite
+choice stream `choiceStream : Nat → Choice` (or a total, surjective,
+outcome-preserving choice-trace relation when $M_{\text{anneal}}$
+over-approximates):
+
+```lean
+def CorrespondenceAtChoicesClaim : Prop :=
+  ∀ (p : Program) (q : Query),
+    WellFormed p q →
+      RefWellFormed (encodeProg p) q ∧
+      (∀ (choices : List Choice) (out : TerminalOut),
+        BehaviorAtChoices p q choices out ↔
+          RefBehaviorAtChoices (encodeProg p) q choices out) ∧
+      (∀ (choiceStream : Nat → Choice),
+        DivergesAtChoices p q choiceStream ↔
+          RefDivergesAtChoices (encodeProg p) q choiceStream)
+
+def FaultEquivalenceAtChoicesClaim : Prop :=
+  ∀ (p : Program) (q : Query) (choices : List Choice) (k : FaultKind),
+    ReachesResultAtChoices p q choices (.fault k) ↔
+      ∃ maxSteps : Nat,
+        RefReachesOutcomeAtChoices (encodeProg p) q choices maxSteps
+          (faultToRefOutcome k)
+```
+
+so that every nondeterministic execution branch is coupled across normal
+returns, unwinds, divergence, and fault classifications in both models.
 
 Each conjunct of `CorrespondenceClaim` closes a distinct gap:
 
@@ -1027,29 +1267,31 @@ def FrameSimInv (p : Program) (f : FrameState) (rf : RefFrameState) : Prop :=
     f.locals.length = body.locals.length ∧
     rf = liftFrame body.locals f
 
+def entryRetTy? (p : Program) : Option MirTy :=
+  match MirSemantics.getElem? p.bodies p.entryDefId with
+  | some body => MirSemantics.getElem? body.locals 0
+  | none => none
+
 def SimulationInv (p : Program) (s : State) (rs : RefState) : Prop :=
-  ∃ f : FrameState, ∃ rf : RefFrameState,
-  ∃ entry : Body, ∃ retTy : MirTy,
-    MirSemantics.getElem? p.bodies p.entryDefId = some entry ∧
-    MirSemantics.getElem? entry.locals 0 = some retTy ∧
+  ∃ f : FrameState, ∃ rf : RefFrameState, ∃ retTy : MirTy,
     s.frames = [f] ∧
-    rs = { frames := [callerSentinelFrame retTy, rf]
-           callerMem := s.callerMem
-           stepsExecuted := rs.stepsExecuted
-           maxSteps := rs.maxSteps } ∧
+    rs.frames = [callerSentinelFrame retTy, rf] ∧
+    rs.callerMem = s.callerMem ∧
+    entryRetTy? p = some retTy ∧
     FrameSimInv p f rf
 ```
 
-`SimulationInv` constrains `rs` directly as a record literal over all of its
-fields (`frames`, `callerMem`, `stepsExecuted`, and `maxSteps`) and embeds each
-`RefState` into `vendor/lean-miri`'s `ExecutionState` with
-`pendingMoveDeinit := false`, canonical empty Day 1 memory allocations, and
-deterministic frame metadata (`returnPlace := ⟨0, #[]⟩`, `unwindAction :=
-.Unreachable`). Because `ExecutionMachine.step` clears `pendingMoveDeinit :=
-false` at the completion of every step, no leftover `pendingMoveDeinit = true`
-flag or hidden machine state can persist between steps. Pinning `retTy` to the
-entry body's return-place type makes the sentinel frame a function of `p` alone
-and keeps `SimulationInv` a total bijection at fixed step counters:
+`SimulationInv` constrains every semantic field of `s` and `rs` (`frames` and
+`callerMem`, up to the explicit step counters `rs.stepsExecuted` and
+`rs.maxSteps`) and embeds each `RefState` into `vendor/lean-miri`'s
+`ExecutionState` with `pendingMoveDeinits := []`, canonical empty Day 1 memory
+allocations, and deterministic frame metadata (`returnPlace := ⟨0, #[]⟩`,
+`unwindAction := .Unreachable`). Because `ExecutionMachine.step` clears
+`pendingMoveDeinits := []` at the completion of every step, no leftover
+pending-deinitialization entry or hidden machine state can persist between
+steps. Pinning `retTy` to the entry body's return-place type makes the sentinel
+frame a function of `p` alone and keeps `SimulationInv` a total bijection at
+fixed step counters:
 
 ```lean
 theorem state_unique_of_simulationInv
@@ -1088,15 +1330,45 @@ Instantiating `wpOutcomeState` with `onFault := fun _ => False` yields `wpProg`
 `∃ out, Behavior p q out ∧ post out` via `wellFormed_and_spec_of_wp`), and
 instantiating it with `onDone := fun _ => False` and
 `onFault := (· = expected)` yields `wpFaultProg` (for proving negative fault
-canaries via `reaches_fault_and_exclusive_of_wpFault`).
+canaries via `reaches_fault_and_exclusive_of_wpFault`). Both core soundness
+theorems discharge exact parameterized propositions defined in
+`Trusted.MirSemantics`:
+
+```lean
+def WpSoundnessClaim
+    (wp : Program → Query → Nat → (TerminalOut → Prop) → Prop) : Prop :=
+  ∀ (p : Program) (q : Query) (fuel : Nat) (post : TerminalOut → Prop),
+    wp p q fuel post →
+      SatisfiesPost p q post ∧ ∃ out : TerminalOut, Behavior p q out ∧ post out
+
+def WpFaultSoundnessClaim
+    (wpFault : Program → Query → Nat → FaultKind → Prop) : Prop :=
+  ∀ (p : Program) (q : Query) (fuel : Nat) (expected : FaultKind),
+    wpFault p q fuel expected →
+      ReachesResult p q (.fault expected) ∧
+      (∀ k : FaultKind, k ≠ expected →
+        ¬ ReachesResult p q (.fault k)) ∧
+      (∀ out : TerminalOut, ¬ ReachesResult p q (.done out)) ∧
+      ¬ WellFormed p q
+```
 
 `Anneal.MirWp` (Pass 1) and `Anneal.MirCorrespondenceProof` (Pass 2) include
 kernel-checked non-vacuity and parameter-boundary canary theorems that exercise
 all three outcome poles, every supported Day 1 MIR statement, rvalue,
 terminator, unary and binary operator, all six integer widths (`i8`, `i16`,
 `i32`, `i64`, `i128`, `isize`) in signed and unsigned modes, and runtime move
-semantics across both $M_{\text{anneal}}$ and $M_{\text{ref}}$ (enforced via
-exact claim-type equality in `TrustedBoundary.lean`).
+semantics across both $M_{\text{anneal}}$ and $M_{\text{ref}}$. All concrete
+canary `Program` fixtures (`prog*`) and their `*Claim : Prop`
+definitions live in the human-audited trusted gating modules
+(`Trusted.MirSemantics` in `trusted/lean/` and `Trusted.Correspondence` in
+`trusted/correspondence/`), whose transitive constant cones are forbidden by
+`TrustedBoundary.lean` from referencing any `Anneal.*` declaration, and
+`TrustedBoundary.lean` (`verifyMirWpCoreTheorems` and
+`verifyCorrespondenceClaims`) verifies that each exported theorem in
+`Anneal.MirWp` and `Anneal.MirCorrespondenceProof` has a type syntactically
+equal to the corresponding `Trusted.*Claim` constant, so an untrusted edit to
+`theory/` or `correspondence/` cannot weaken any canary program or expected
+outcome.
 
 The Pass 1 canaries in `Anneal.MirWp` check $M_{\text{anneal}}$ directly:
 
@@ -1140,17 +1412,31 @@ The Pass 1 canaries in `Anneal.MirWp` check $M_{\text{anneal}}$ directly:
   `BinOp.shlUnchecked` with shift amount equal to the bit width (`32` on `u32`)
   and `BinOp.shrUnchecked` with a negative signed shift amount (`-1i8`) each
   reach `.fault .undefined` (not `.unsupported`).
-- **`canary_negative_ub_storage_dead_read_anneal` and
-  `canary_negative_ub_storage_dead_return_place_anneal`:** Reading a local after
-  `StatementKind.storageDead` or executing `StatementKind.storageDead 0` on `_0`
-  reaches `.fault .undefined` (not `.unsupported`).
+- **`canary_negative_ub_storage_dead_read_anneal`:** Reading an in-bounds local
+  after `StatementKind.storageDead` reaches `.fault .undefined` (not
+  `.unsupported`).
 - **`canary_negative_ub_unreachable_anneal`:** Executing
   `TerminatorKind.unreachable` reaches `.fault .undefined` (not
   `.unsupported`).
-- **`canary_negative_unsupported_anneal` and
-  `canary_negative_unsupported_unsigned_neg_anneal`:**
-  `StatementKind.unsupported` and `UnOp.neg` on an unsigned integer (`u32`)
-  reach `.fault .unsupported` (not `.undefined`) and are not `WellFormed`.
+- **`canary_negative_unsupported_anneal`,
+  `canary_negative_unsupported_unsigned_neg_anneal`, and
+  `canary_negative_ub_storage_dead_return_place_anneal`:**
+  `StatementKind.unsupported`, `UnOp.neg` on an unsigned integer (`u32`), and
+  `StatementKind.storageDead 0` on return place `_0` (matching
+  `StackError.storageDeadReturnPlace`) reach `.fault .unsupported` (not
+  `.undefined`) and are not `WellFormed`.
+- **`canary_positive_enum_explicit_repr_anneal`,
+  `canary_positive_zst_single_enum_anneal`, and
+  `canary_negative_ub_enum_invalid_tag_and_uninit_anneal`:**
+  Exercise fieldless enum encoded-tag constant decoding (`#[repr(u8)]` and
+  signed `i8` -> `isize`), explicit-width `Rvalue.discriminant`, inhabited
+  1-variant zero-sized enums (`EnumTagRepr.zeroSized`, `ConstLit.zeroSized`),
+  invalid scalar enum tag UB, and uninitialized enum discriminant read UB.
+- **`canary_crate_and_body_verified_anneal`:**
+  Exercises `CrateTheorem`, `UnitTheorem`, `BodyVerified` (including
+  `p.bodies[defId]` lookup binding, `isUnsafe` contract gating, and
+  uninhabited `MirTy.never` parameter `BodyStaticAdmitted` non-vacuity), and
+  empty-`bodies` / out-of-bounds `entryDefId` / duplicate-`identity` rejection.
 
 The Pass 2 canaries in `Anneal.MirCorrespondenceProof` check both models:
 
@@ -1166,6 +1452,17 @@ The Pass 2 canaries in `Anneal.MirCorrespondenceProof` check both models:
   (`42u32`) is `WellFormed` and `RefWellFormed` and returns `42u32` in both.
 - **`canary_D9_move_unit_zst_ok`:** `_2 = move _1; _0 = copy _1; return`
   (`_1 : ()`) is `WellFormed` and `RefWellFormed` and returns `()` in both.
+- **`canary_D10_add_unchecked_overflow_ub`:** on `(u32::MAX, 1)`,
+  `_0 = AddUnchecked(_1, _2)` reaches `.fault .undefined` in $M_{\text{anneal}}$
+  and `.ub` in $M_{\text{ref}}$, while wrapping `_0 = Add(_1, _2)` returns `0`
+  in both.
+- **`canary_D11_enum_discriminant_and_const_ok`,
+  `canary_D12_zst_enum_move_and_discr_ok`, and
+  `canary_D13_enum_invalid_tag_and_uninit_ub`:**
+  Verify agreement between $M_{\text{anneal}}$ and $M_{\text{ref}}$
+  (`Miri.Interpreter.Discriminant`) across explicit-repr and signed-tag
+  fieldless enums, 1-variant zero-sized enums, invalid scalar enum tags, and
+  uninitialized enum discriminant reads.
 
 ---
 
@@ -1371,9 +1668,9 @@ We considered mirroring `lean-miri`'s `TyId := Nat` index table inside
 nominal `TyId` table inside $M_{\text{anneal}}$ introduces two classes of
 representation artifacts:
 
-1. Programs can contain out-of-bounds `TyId`s (`tyId ≥ p.types.length`),
-   forcing every type lookup in `Trusted.MirSemantics` and `Anneal.MirWp` to
-   handle missing-type faults.
+1. Programs can contain out-of-bounds `TyId`s (`tyId ≥ p.types.length`), forcing
+   every type lookup in `Trusted.MirSemantics` and `Anneal.MirWp` to handle
+   missing-type faults.
 2. A program's `types` table can list the same structural `MirTy` (such as
    `u32`) at two distinct indices (`TyId 0` and `TyId 1`). In `lean-miri`,
    `assertSameType` and `assertRvalueLayout` compare nominal `TyId`s
@@ -1419,11 +1716,11 @@ unprovable.
 We also considered initializing `limits.maxSteps := 1` and resetting
 `stepsExecuted := 0` before each single-step call inside `RefStep`. While
 mathematically equivalent to quantifying over `maxSteps : Nat`, resetting
-`stepsExecuted` inside `RefStep` mutates the `ExecutionState` returned by
-`ExecutionMachine.step` between steps. Quantifying over `maxSteps : Nat` in
+`stepsExecuted` inside `RefStep` mutates the `RefState` returned by
+`evalRefStep` between steps. Quantifying over `maxSteps : Nat` in
 `RefWellFormed` (`∀ maxSteps`) and `RefBehavior` (`∃ maxSteps`) allows
-`RefReaches` to chain the exact states returned by `ExecutionMachine.step`
-without modification.
+`RefReaches` to chain the exact states returned by `evalRefStep` without
+modification.
 
 ### A.4 Local Initialization and Evaluation-Order Alternatives
 

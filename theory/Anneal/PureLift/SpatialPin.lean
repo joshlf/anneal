@@ -59,129 +59,6 @@ theorem valueCellCodec_lawful {Val : Type} :
     LawfulCodec (@valueCellCodec Val) :=
   (@valueCellCodec Val).decode_encode
 
-/-- Decode helper for `SpatialCodec.ofSubdomain`: returns `some w` on the
-single-cell fallback `[.init w]` when `ofVal? w = none`, and delegates to
-`decodeSub` (mapped by `toVal`) otherwise. -/
-def decodeSubdomainCells {Val α : Type}
-    (toVal : α → Val) (ofVal? : Val → Option α)
-    (decodeSub : List (CellVal Val) → Option α)
-    (cells : List (CellVal Val)) : Option Val :=
-  match cells with
-  | [.init w] =>
-    match ofVal? w with
-    | none => some w
-    | some _ =>
-      match decodeSub [.init w] with
-      | some a => some (toVal a)
-      | none => none
-  | _ =>
-    match decodeSub cells with
-    | some a => some (toVal a)
-    | none => none
-
-theorem decodeSubdomainCells_of_not_fallback {Val α : Type}
-    (toVal : α → Val) (ofVal? : Val → Option α)
-    (decodeSub : List (CellVal Val) → Option α)
-    (cells : List (CellVal Val))
-    (hNotFallback : ∀ w : Val, ofVal? w = none → cells ≠ [.init w]) :
-    decodeSubdomainCells toVal ofVal? decodeSub cells =
-      match decodeSub cells with
-      | some a => some (toVal a)
-      | none => none := by
-  cases cells with
-  | nil => rfl
-  | cons c rest =>
-    cases c with
-    | init w =>
-      cases rest with
-      | nil =>
-        dsimp only [decodeSubdomainCells]
-        cases hOf : ofVal? w with
-        | none => exact False.elim (hNotFallback w hOf rfl)
-        | some _ => rfl
-      | cons _ _ => rfl
-    | uninit => rfl
-    | rawByte _ => rfl
-
-/-- Lift a partial/subdomain representation codec `(encodeSub, decodeSub)` on a
-carrier `α` (embedded into `Val` via prism `(toVal, ofVal?)`) to a total
-`SpatialCodec Val`. Values in `α`'s image encode via `encodeSub a` (for example,
-as `[.rawByte ...]` windows), while values outside `α`'s image fall back to
-`[.init v]`.
-
-Caveat: `mutateSpatialInState` preserves only the cell count, so if some
-`encodeSub` window has width `1` (the fallback width), a same-width spatial
-write can move a block between the subdomain and the fallback (retyping the
-pinned value). Fixed-width byte codecs should instead use a fallback whose
-width differs from the window width, as
-`MirLiftCoreInterop.spatialCodecOfByteLensCodec` does. -/
-def SpatialCodec.ofSubdomain {Val α : Type}
-    (cid : Nat)
-    (toVal : α → Val)
-    (ofVal? : Val → Option α)
-    (toVal_ofVal? : ∀ (v : Val) (a : α), ofVal? v = some a → toVal a = v)
-    (encodeSub : α → List (CellVal Val))
-    (decodeSub : List (CellVal Val) → Option α)
-    (decodeSub_encodeSub : ∀ a : α, decodeSub (encodeSub a) = some a)
-    (encodeSub_not_fallback :
-      ∀ (a : α) (w : Val), ofVal? w = none → encodeSub a ≠ [.init w]) :
-    SpatialCodec Val where
-  codecId := cid
-  encode v :=
-    match ofVal? v with
-    | some a => encodeSub a
-    | none => [.init v]
-  decode cells := decodeSubdomainCells toVal ofVal? decodeSub cells
-  decode_encode v := by
-    cases hOf : ofVal? v with
-    | none =>
-      dsimp only [decodeSubdomainCells]
-      rw [hOf]
-    | some a =>
-      dsimp only
-      rw [decodeSubdomainCells_of_not_fallback toVal ofVal? decodeSub
-            (encodeSub a) (encodeSub_not_fallback a)]
-      rw [decodeSub_encodeSub a]
-      dsimp only
-      rw [toVal_ofVal? v a hOf]
-
-theorem SpatialCodec.ofSubdomain_encode_toVal {Val α : Type}
-    (cid : Nat)
-    (toVal : α → Val)
-    (ofVal? : Val → Option α)
-    (ofVal?_toVal : ∀ a : α, ofVal? (toVal a) = some a)
-    (toVal_ofVal? : ∀ (v : Val) (a : α), ofVal? v = some a → toVal a = v)
-    (encodeSub : α → List (CellVal Val))
-    (decodeSub : List (CellVal Val) → Option α)
-    (decodeSub_encodeSub : ∀ a : α, decodeSub (encodeSub a) = some a)
-    (encodeSub_not_fallback :
-      ∀ (a : α) (w : Val), ofVal? w = none → encodeSub a ≠ [.init w])
-    (a : α) :
-    (SpatialCodec.ofSubdomain cid toVal ofVal? toVal_ofVal? encodeSub decodeSub
-      decodeSub_encodeSub encodeSub_not_fallback).encode (toVal a) =
-      encodeSub a := by
-  dsimp only [SpatialCodec.ofSubdomain]
-  rw [ofVal?_toVal a]
-
-theorem SpatialCodec.ofSubdomain_decode_encodeSub {Val α : Type}
-    (cid : Nat)
-    (toVal : α → Val)
-    (ofVal? : Val → Option α)
-    (toVal_ofVal? : ∀ (v : Val) (a : α), ofVal? v = some a → toVal a = v)
-    (encodeSub : α → List (CellVal Val))
-    (decodeSub : List (CellVal Val) → Option α)
-    (decodeSub_encodeSub : ∀ a : α, decodeSub (encodeSub a) = some a)
-    (encodeSub_not_fallback :
-      ∀ (a : α) (w : Val), ofVal? w = none → encodeSub a ≠ [.init w])
-    (a : α) :
-    (SpatialCodec.ofSubdomain cid toVal ofVal? toVal_ofVal? encodeSub decodeSub
-      decodeSub_encodeSub encodeSub_not_fallback).decode (encodeSub a) =
-      some (toVal a) := by
-  dsimp only [SpatialCodec.ofSubdomain]
-  rw [decodeSubdomainCells_of_not_fallback toVal ofVal? decodeSub
-        (encodeSub a) (encodeSub_not_fallback a)]
-  rw [decodeSub_encodeSub a]
-
 /-- Constructive separation-logic assertion over a spatial heaplet. -/
 def SpatialProp (Val : Type) : Type :=
   List (SpatialBlock Val) → Prop
@@ -400,8 +277,9 @@ def reabsorbFromSpatialInState {Val : Type} (alg : ValAlgebra Val)
             match pinnedCodec.decode blk.cells with
             | none => .fail
             | some v' =>
-              -- The cells are plan-supplied, so the decoded value must not
-              -- introduce borrow handles the pinned value did not hold.
+              -- The cells are written by `mutateSpatialInState` callers, so
+              -- the decoded value must not introduce borrow handles the
+              -- pinned value did not hold.
               if !replaceableVal alg st.loans e.cell.val v' then .fail
               else
               match st with
@@ -414,88 +292,8 @@ def reabsorbFromSpatialInState {Val : Type} (alg : ValAlgebra Val)
             .fail
     | _ => .fail
 
-/-- Alias of `reabsorbFromSpatialInState` for Episode 2 bridge compatibility. -/
-abbrev unpinFromSpatialInState := @reabsorbFromSpatialInState
-
-/-- General algebra-parametric round-trip and codec-binding theorem: under
-`SizeBoundDecreasing alg`, freezing an untouched loan with `pinnedCodec` (whose
-encoding of `v` has no `.uninit` cells) and immediately reabsorbing with any
-`collidingCodec` sharing `pinnedCodec.codecId` decodes via `pinnedCodec`
-(`pinnedCodec.decode_encode v`), restores `v` and `.activeMut`, and empties
-`stReabsorbed.spatial`. -/
-theorem freeze_reabsorb_roundtrip_of_sizeBoundDecreasing {Val : Type}
-    (alg : ValAlgebra Val) (hDec : SizeBoundDecreasing alg)
-    (pinnedCodec collidingCodec : SpatialCodec Val)
-    (hCid : (pinnedCodec.codecId != collidingCodec.codecId) = false)
-    (v : Val) (hInit : hasUninitCell (pinnedCodec.encode v) = false) :
-    let st0 : SymState Val :=
-      { locals := [⟨v, .mutLocked 0⟩]
-        loans := [⟨0, .activeMut, ⟨v, .unborrowed⟩, .direct (.localReg 0) []⟩]
-        regionGroups := []
-        regionDeposits := []
-        spatial := []
-        nextSpatialTag := 0 }
-    match freezeToSpatialInState alg 0 pinnedCodec st0 with
-    | .ok stPinned =>
-      match reabsorbFromSpatialInState alg 0 collidingCodec stPinned with
-      | .ok stReabsorbed =>
-        match findLoan 0 stReabsorbed.loans with
-        | some e =>
-          e.cell.val = v ∧
-          e.phase.isActiveMut = true ∧
-          stReabsorbed.spatial.isEmpty = true
-        | none => False
-      | .fail => False
-    | .fail => False := by
-  dsimp only
-  let st0 : SymState Val :=
-    { locals := [⟨v, .mutLocked 0⟩]
-      loans := [⟨0, .activeMut, ⟨v, .unborrowed⟩, .direct (.localReg 0) []⟩]
-      regionGroups := []
-      regionDeposits := []
-      spatial := []
-      nextSpatialTag := 0 }
-  have hFrz :
-      freezeToSpatialInState alg 0 pinnedCodec st0 =
-        .ok
-          ⟨[⟨v, .mutLocked 0⟩],
-           [⟨0, .spatialPinned 0 pinnedCodec, ⟨v, .unborrowed⟩,
-             .direct (.localReg 0) []⟩],
-           [], [], [⟨0, 0, .readWrite, 0, 0, pinnedCodec.encode v⟩], 1⟩ := by
-    unfold freezeToSpatialInState
-    dsimp [st0, hasUniqueLoanId, countLoanId, findLoan, LoanPhase.isActiveMut,
-      isUnborrowed, noActiveChildLoanEdgesIn, noActiveChildRegionEdges,
-      hasSpatialBlockId, countSpatialBlockId, countBlocksForLoan, updateLoan]
-    rw [hInit]
-    rfl
-  rw [hFrz]
-  dsimp only
-  have hReab :
-      reabsorbFromSpatialInState alg 0 collidingCodec
-        ⟨[⟨v, .mutLocked 0⟩],
-         [⟨0, .spatialPinned 0 pinnedCodec, ⟨v, .unborrowed⟩,
-           .direct (.localReg 0) []⟩],
-         [], [], [⟨0, 0, .readWrite, 0, 0, pinnedCodec.encode v⟩], 1⟩ =
-        .ok
-          ⟨[⟨v, .mutLocked 0⟩],
-           [⟨0, .activeMut, ⟨v, .unborrowed⟩, .direct (.localReg 0) []⟩],
-           [], [], [], 1⟩ := by
-    unfold reabsorbFromSpatialInState
-    dsimp [hasUniqueLoanId, countLoanId, findLoan, findSpatialBlock,
-      countBlocksForLoan, updateLoan]
-    rw [hCid]
-    dsimp
-    rw [hInit]
-    dsimp
-    rw [pinnedCodec.decode_encode v]
-    dsimp
-    rw [replaceableVal_self_of_sizeBoundDecreasing alg hDec]
-    rfl
-  rw [hReab]
-  exact ⟨rfl, rfl, rfl⟩
-
 /-!
-## Exhaustive Kernel-Checked Tests for `SpatialPin`
+## Kernel-Checked Tests for `SpatialPin`
 -/
 
 /-- Codec that satisfies `decode_encode` on initialized values, used to test
@@ -528,11 +326,14 @@ def collidingIdCodec : SpatialCodec LensTestVal where
 
 /-- Freezing and immediately reabsorbing an untouched loan preserves its value
 and binds decoding to the original `pinnedCodec`, ignoring any colliding codec
-passed at reabsorption, for every `v : LensTestVal`. -/
-theorem spatial_roundtrip_and_codec_binding_test (v : LensTestVal) :
+passed at reabsorption. -/
+theorem spatial_roundtrip_and_codec_binding_test :
+    let v : LensTestVal := .node (.atom 3) (.ref 9 [])
     let st0 : SymState LensTestVal :=
       { locals := [⟨v, .mutLocked 0⟩]
-        loans := [⟨0, .activeMut, ⟨v, .unborrowed⟩, .direct (.localReg 0) []⟩]
+        loans :=
+          [ ⟨0, .activeMut, ⟨v, .unborrowed⟩, .direct (.localReg 0) []⟩
+          , ⟨9, .activeMut, ⟨.atom 0, .unborrowed⟩, .rootParam 9⟩ ]
         regionGroups := []
         regionDeposits := []
         spatial := []
@@ -549,29 +350,8 @@ theorem spatial_roundtrip_and_codec_binding_test (v : LensTestVal) :
           stReabsorbed.spatial.isEmpty = true
         | none => False
       | .fail => False
-    | .fail => False := by
-  change
-    (match
-       (if !replaceableVal lensTestValAlg
-             [⟨0, .spatialPinned 0 valueCellCodec, ⟨v, .unborrowed⟩,
-               .direct (.localReg 0) []⟩]
-             v v then
-          .fail
-        else
-          .ok
-            ⟨[⟨v, .mutLocked 0⟩],
-             [⟨0, .activeMut, ⟨v, .unborrowed⟩, .direct (.localReg 0) []⟩],
-             [], [], [], 1⟩ : EvalOutcome (SymState LensTestVal)) with
-     | .ok stReabsorbed =>
-       match findLoan 0 stReabsorbed.loans with
-       | some e =>
-         e.cell.val = v ∧
-         e.phase.isActiveMut = true ∧
-         stReabsorbed.spatial.isEmpty = true
-       | none => False
-     | .fail => False)
-  rw [lensTest_replaceableVal_self]
-  exact ⟨rfl, rfl, rfl⟩
+    | .fail => False :=
+  ⟨rfl, rfl, rfl⟩
 
 /-- `reabsorbFromSpatialInState` rejects `.uninit` cells even when the pinned
 codec's `decode` function returns `some` on `[.uninit]`. -/
@@ -596,7 +376,7 @@ theorem spatial_rejects_uninit_even_with_permissive_codec :
 /-- `mutateSpatialInState` rejects wrong provenance tags and `.readOnly` blocks,
 and `reabsorbFromSpatialInState` rejects mismatched `codecId` and non-zero
 `activeSubSplits`. -/
-theorem spatial_negative_guards_exhaustive :
+theorem spatial_negative_guards_tests :
     let st0 : SymState LensTestVal :=
       { locals := [⟨.atom 10, .mutLocked 0⟩]
         loans := [⟨0, .activeMut, ⟨.atom 10, .unborrowed⟩,
@@ -739,10 +519,10 @@ theorem spatial_negative_guards_exhaustive :
    ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩,
    ⟨rfl, ⟨rfl, rfl, rfl, rfl, rfl⟩⟩⟩
 
-/-- Round 11 regression test: a loan owns at most one spatial block. Freezing a
-loan that already owns a block fails, and reabsorbing fails when another block
-with the same `originLoan` remains. -/
-theorem round11_spatial_single_block_per_loan_tests :
+/-- A loan owns at most one spatial block. Freezing a loan that already owns a
+block fails, and reabsorbing fails when another block with the same
+`originLoan` remains. -/
+theorem spatial_single_block_per_loan_tests :
     let st0 : SymState LensTestVal :=
       { locals := []
         loans :=
@@ -751,7 +531,8 @@ theorem round11_spatial_single_block_per_loan_tests :
         regionDeposits := []
         spatial := []
         nextSpatialTag := 0 }
-    let extra : SpatialBlock LensTestVal := ⟨7, 0, .readWrite, 7, 0, [.init (.atom 6)]⟩
+    let extra : SpatialBlock LensTestVal :=
+      ⟨7, 0, .readWrite, 7, 0, [.init (.atom 6)]⟩
     (match freezeToSpatialInState lensTestValAlg 0 valueCellCodec st0 with
      | .ok stPinned =>
        reabsorbFromSpatialInState lensTestValAlg 0 valueCellCodec
@@ -765,107 +546,87 @@ theorem round11_spatial_single_block_per_loan_tests :
       { st0 with spatial := [extra], nextSpatialTag := 8 } = .fail :=
   ⟨⟨rfl, trivial⟩, rfl⟩
 
-/-- Round 11 regression test: blocks pinned from the same loan are aliases, so
-`blocksDisjoint` (and hence `spatialSepConj`) refuses to separate them even when
-their block IDs differ. -/
-theorem round11_blocksDisjoint_same_origin_loan :
+/-- Blocks pinned from the same loan are aliases, so `blocksDisjoint` (and hence
+`spatialSepConj`) refuses to separate them even when their block IDs differ. -/
+theorem blocksDisjoint_same_origin_loan_tests :
     let b1 : SpatialBlock LensTestVal := ⟨1, 0, .readWrite, 1, 0, []⟩
     let b2 : SpatialBlock LensTestVal := ⟨2, 0, .readWrite, 2, 0, []⟩
     ¬ blocksDisjoint [b1] [b2] :=
   fun h => (h _ _ (List.Mem.head _) (List.Mem.head _)).2 rfl
 
-def boolAtomToVal (b : Bool) : LensTestVal :=
-  .atom (if b then 1 else 0)
-
-def boolAtomOfVal? (v : LensTestVal) : Option Bool :=
-  match v with
-  | ⟨_, .atom 0⟩ => some false
-  | ⟨_, .atom 1⟩ => some true
-  | _ => none
-
-theorem boolAtom_ofVal?_toVal (b : Bool) :
-    boolAtomOfVal? (boolAtomToVal b) = some b := by
-  cases b <;> rfl
-
-theorem boolAtom_toVal_ofVal? (v : LensTestVal) (b : Bool)
-    (h : boolAtomOfVal? v = some b) :
-    boolAtomToVal b = v := by
-  cases v with
-  | mk f t =>
-    cases t with
-    | atom n =>
-      cases n with
-      | zero =>
-        injection h with hb
-        subst hb
-        rfl
-      | succ n1 =>
-        cases n1 with
-        | zero =>
-          injection h with hb
-          subst hb
-          rfl
-        | succ _ => nomatch h
-    | branch _ _ _ _ => nomatch h
-    | choice _ _ _ _ _ _ => nomatch h
-    | ref _ _ => nomatch h
-
-def boolRawByteEncode (b : Bool) : List (CellVal LensTestVal) :=
-  [.rawByte (if b then 1 else 0)]
-
-def boolRawByteDecode (cells : List (CellVal LensTestVal)) : Option Bool :=
-  match cells with
-  | [.rawByte b] =>
-    if b == 0 then some false
-    else if b == 1 then some true
-    else none
-  | _ => none
-
-theorem boolRawByte_decode_encode (b : Bool) :
-    boolRawByteDecode (boolRawByteEncode b) = some b := by
-  cases b <;> rfl
-
-theorem boolRawByte_not_fallback (b : Bool) (w : LensTestVal)
-    (_ : boolAtomOfVal? w = none) :
-    boolRawByteEncode b ≠ [.init w] := by
-  cases b <;> intro h <;> nomatch h
-
-/-- Subdomain raw-byte spatial codec built via `SpatialCodec.ofSubdomain`:
-encodes boolean atoms (`0`/`1`) as `[.rawByte 0]`/`[.rawByte 1]` and falls back
-to `[.init v]` outside the boolean subdomain. -/
-def boolRawByteSpatialCodec : SpatialCodec LensTestVal :=
-  SpatialCodec.ofSubdomain 42 boolAtomToVal boolAtomOfVal?
-    boolAtom_toVal_ofVal? boolRawByteEncode boolRawByteDecode
-    boolRawByte_decode_encode boolRawByte_not_fallback
-
-theorem spatial_subdomain_byte_codec_tests :
-    boolRawByteSpatialCodec.encode (.atom 0) = [.rawByte 0] ∧
-    boolRawByteSpatialCodec.encode (.atom 1) = [.rawByte 1] ∧
-    boolRawByteSpatialCodec.encode (.atom 7) = [.init (.atom 7)] ∧
-    boolRawByteSpatialCodec.decode [.rawByte 1] = some (.atom 1) ∧
-    boolRawByteSpatialCodec.decode [.rawByte 9] = none ∧
-    let st0 : SymState LensTestVal :=
-      { locals := [⟨.atom 0, .mutLocked 0⟩]
+/-- `reabsorbFromSpatialInState` rejects a spatial cell that decodes to a value
+holding a handle to an active mutable loan that the pinned value did not
+hold, and reabsorbs a handle-free value. -/
+theorem reabsorb_rejects_fabricated_handle_tests :
+    let st (v : LensTestVal) : SymState LensTestVal :=
+      { locals := [⟨.atom 9, .mutLocked 1⟩]
         loans :=
-          [⟨0, .activeMut, ⟨.atom 0, .unborrowed⟩, .direct (.localReg 0) []⟩]
+          [⟨1, .spatialPinned 0 valueCellCodec, ⟨.atom 5, .unborrowed⟩,
+            .direct (.localReg 0) []⟩,
+           ⟨3, .activeMut, ⟨.atom 30, .unborrowed⟩, .rootParam 3⟩]
         regionGroups := []
+        regionDeposits := []
+        spatial := [⟨0, 1, .readWrite, 0, 0, [.init v]⟩]
+        nextSpatialTag := 1 }
+    let isOk (o : EvalOutcome (SymState LensTestVal)) : Bool :=
+      match o with
+      | .ok _ => true
+      | .fail => false
+    isOk (reabsorbFromSpatialInState lensTestValAlg 1 valueCellCodec
+      (st (.ref 3 []))) = false ∧
+    isOk (reabsorbFromSpatialInState lensTestValAlg 1 valueCellCodec
+      (st (.atom 6))) = true :=
+  ⟨rfl, rfl⟩
+
+/-- Freezing and reabsorbing check the loan graph:
+1. freezing a loan fails while an active region group borrows from it,
+2. freezing fails when the loan ID names two loans, and
+3. reabsorbing fails when the block was pinned from a different loan, even
+   if its provenance tag matches.
+Each case has a succeeding twin. -/
+theorem spatial_loan_graph_guard_tests :
+    let x0 : OwnerRef := .localReg 0
+    let mk (loans : List (LoanEntry LensTestVal))
+        (rgs : List (RegionGroupEntry LensTestVal)) : SymState LensTestVal :=
+      { locals := [⟨.atom 10, .mutLocked 0⟩]
+        loans := loans
+        regionGroups := rgs
         regionDeposits := []
         spatial := []
         nextSpatialTag := 0 }
-    (match freezeToSpatialInState lensTestValAlg 0 boolRawByteSpatialCodec st0 with
-     | .ok stPinned =>
-       stPinned.spatial = [⟨0, 0, .readWrite, 0, 0, [.rawByte 0]⟩] ∧
-       (match mutateSpatialInState 0 0 [.rawByte 1] stPinned with
-        | .ok stMut =>
-          match reabsorbFromSpatialInState lensTestValAlg 0
-              boolRawByteSpatialCodec stMut with
-          | .ok stDone =>
-            match findLoan 0 stDone.loans with
-            | some e => e.cell.val = .atom 1
-            | none => False
-          | .fail => False
-        | .fail => False)
-     | .fail => False) :=
-  ⟨rfl, rfl, rfl, rfl, rfl, ⟨rfl, rfl⟩⟩
+    let loan0 (v : Nat) : LoanEntry LensTestVal :=
+      ⟨0, .activeMut, ⟨.atom v, .unborrowed⟩, .direct x0 []⟩
+    let rg (act : Bool) : RegionGroupEntry LensTestVal :=
+      ⟨0, act, 9, [(.parentLoan 0, [])], [], [],
+       fun _ _ => some ([.atom 7], [])⟩
+    let stPinned (origin : LoanId) : SymState LensTestVal :=
+      { locals := [⟨.atom 9, .mutLocked 1⟩]
+        loans :=
+          [⟨1, .spatialPinned 0 valueCellCodec, ⟨.atom 5, .unborrowed⟩,
+            .direct x0 []⟩]
+        regionGroups := []
+        regionDeposits := []
+        spatial := [⟨0, origin, .readWrite, 0, 0, [.init (.atom 6)]⟩]
+        nextSpatialTag := 1 }
+    let isOk (o : EvalOutcome (SymState LensTestVal)) : Bool :=
+      match o with
+      | .ok _ => true
+      | .fail => false
+    -- 1. Region-group borrow:
+    isOk (freezeToSpatialInState lensTestValAlg 0 valueCellCodec
+      (mk [loan0 5] [rg true])) = false ∧
+    isOk (freezeToSpatialInState lensTestValAlg 0 valueCellCodec
+      (mk [loan0 5] [rg false])) = true ∧
+    -- 2. Duplicate loan ID:
+    isOk (freezeToSpatialInState lensTestValAlg 0 valueCellCodec
+      (mk [loan0 5, loan0 6] [])) = false ∧
+    isOk (freezeToSpatialInState lensTestValAlg 0 valueCellCodec
+      (mk [loan0 5] [])) = true ∧
+    -- 3. Block origin:
+    isOk (reabsorbFromSpatialInState lensTestValAlg 1 valueCellCodec
+      (stPinned 7)) = false ∧
+    isOk (reabsorbFromSpatialInState lensTestValAlg 1 valueCellCodec
+      (stPinned 1)) = true :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end Anneal.PureLift

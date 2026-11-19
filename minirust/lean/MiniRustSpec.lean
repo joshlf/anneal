@@ -28,6 +28,7 @@ import MiniRustSpec.Correspondence.TbWitness
 import MiniRustSpec.Correspondence.Provenance
 import MiniRustSpec.Correspondence.ProvenanceWitness
 import MiniRustSpec.Correspondence.IntrinsicFallback
+import MiniRustSpec.Correspondence.WideSliceDst
 import MiniRustSpec.Correspondence.IntrinsicBoundary
 import MiniRustSpec.Audit
 
@@ -59,8 +60,9 @@ import MiniRustSpec.Audit
   the multi-function relation (`Terminator::Call`, call stacks, and the
   `Assume` intrinsic) is proven in `Correspondence.Simulation` and
   `Correspondence.Run`, with witnesses for intrinsic calls that resolve to MIR
-  fallback bodies (`Correspondence.IntrinsicFallback`) and boundary witnesses
-  for the intrinsic constructs outside the fragment
+  fallback bodies (`Correspondence.IntrinsicFallback`), wide-slice and unsized
+  DST pointer-metadata correspondence (`Correspondence.WideSliceDst`), and
+  boundary witnesses for the intrinsic constructs outside the fragment
   (`Correspondence.IntrinsicBoundary`).
 * `MiniRustSpec.Audit`: fails the build unless the main theorems use only the
   standard axioms.

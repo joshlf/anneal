@@ -81,6 +81,9 @@ For related context, see:
   meta-principles, correctness promise, and threat model.
 - [`docs/design.md`](design.md) for Anneal's end-to-end user workflow,
   library-centric verification model, and incremental adoption.
+- [`docs/mir-correspondence-strategy.md`](mir-correspondence-strategy.md) for
+  how $M_{\text{anneal}}$ is developed against $M_{\text{ref}}$ under a locked
+  CI correspondence theorem.
 - [`docs/trust-model.md`](trust-model.md) for how `trusted/` and
   `trusted/audit/` enforce the boundary between `trusted/` and `theory/`.
 
@@ -453,6 +456,40 @@ checkers, and symbolic execution lemmas that prove
   temporaries on both branches canonicalize to `MirVal.uninit`, allowing
   `execNormal_join` to merge the branches and verify the suffix from the join
   block once.
+
+#### Why $M_{\text{anneal}}$ and lowering in `theory/` do not expand the TCB
+
+In a verified compiler (such as CompCert), a lowering pass translates a source
+program $S$ into a target program $T$ that will actually run on hardware; the
+compiler must prove that every behavior of $T$ is allowed by $S$.
+
+In a verification framework, the roles are reversed:
+
+- The captured MIR program $C$, evaluated under the reference semantics
+  $M_{\text{ref}}$ via $\tau_{\text{prog}}(C)$, is the ground-truth program
+  whose safety `Trusted.CrateTheorem` requires.
+- Anneal's verification MIR semantics $M_{\text{anneal}}$ (executing the same
+  unnormalized captured MIR program $C$) and the lowered program $A$ in
+  `theory/` are verification abstractions used to simplify reasoning.
+- To discharge a claim about the concrete captured program $C$ in
+  $M_{\text{ref}}$ by proving that claim on $A$, the lowering pass establishes a
+  **backward simulation** linking $A$ to $M_{\text{anneal}}$ and composes it
+  with the **correspondence theorem**
+  ([`docs/mir-correspondence-strategy.md`](mir-correspondence-strategy.md),
+  linking $M_{\text{anneal}}$ on $C$ to $M_{\text{ref}}$ on
+  $\tau_{\text{prog}}(C)$): every execution trace of $M_{\text{ref}}$ on
+  $\tau_{\text{prog}}(C)$ is matched by $M_{\text{anneal}}$ on $C$ and in turn
+  by $A$, and freedom from `UB` and `unsupported` in $A$ implies freedom from
+  `UB` and `unsupported` in $M_{\text{ref}}$.
+
+Because the Lean 4 kernel checks (1) the proof that the specification holds for
+the lowered program $A$, (2) the backward simulation linking $A$ to
+$M_{\text{anneal}}$, and (3) the correspondence theorem linking
+$M_{\text{anneal}}$ to $M_{\text{ref}}$, both $M_{\text{anneal}}$'s execution
+rules and the lowering passes are self-certifying. See
+[`docs/trust-model.md`](trust-model.md) for how Anneal's CI auditor ensures
+that `theory/` and `correspondence/` are pure and axiom-free so they cannot
+bypass the Lean kernel.
 
 ## Repository layout
 

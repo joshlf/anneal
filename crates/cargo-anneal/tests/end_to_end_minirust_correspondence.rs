@@ -460,7 +460,6 @@ fn file_issue_dry_run_never_spawns_process_and_execute_requires_explicit_flag() 
     // 5. Verify explicit `--execute` against the local hermetic spy script (zero network access).
     let mut exec_opts = dry_opts;
     exec_opts.execute = true;
-    exec_opts.ldap = Some("markdittmer".to_string());
     let exec_outcome =
         file_github_issue(&registry, &exec_opts).expect("explicit --execute with local spy script");
     assert!(

@@ -109,16 +109,22 @@ implementing the bulk of MIR:
 
 Two features of this statement carry its soundness.
 
-First, both models execute the same input. The theorem quantifies universally
-over input queries $q$ (function arguments and initial caller-visible memory)
-in a representation that both models share, and each model constructs its
-initial state directly from $q$ (in Anneal's design, `initState` for
-$M_{\text{anneal}}$ and `initRefState` for $M_{\text{ref}}$). If the models
-represented inputs differently, the theorem would instead have to quantify over
-a total, structure-preserving relation between the two input representations.
-A conversion function or an unverified precondition on $q$ could otherwise
-filter out or sanitize exactly the inputs that trigger UB, leaving every
-remaining reference execution trivially safe.
+First, both models execute the same program environment and input. Each program
+$p$ carries its captured target environment (`CaptureManifest` in
+[`docs/architecture.md`](architecture.md): compiler version, target layout such
+as pointer width, endianness, type sizes, alignments, and field offsets, and the
+active semantic profile), which both models enforce and which any program
+translation preserves identically. The theorem quantifies universally over all
+programs $p$ (including that environment) and all input queries $q$ (function
+arguments and initial caller-visible memory) in a representation that both
+models share, and each model constructs its initial state directly from $(p, q)$
+(in Anneal's design, `initState` for $M_{\text{anneal}}$ and `initRefState` for
+$M_{\text{ref}}$). If the models represented target environments or inputs
+differently, the theorem would instead have to quantify over a total,
+structure-preserving relation between the two representations. A conversion
+function or an unverified precondition on $p$ or $q$ could otherwise filter out
+or sanitize exactly the target layouts, profiles, or inputs that trigger UB,
+leaving every remaining reference execution trivially safe.
 
 Second, behavioral inclusion runs from $M_{\text{ref}}$ into
 $M_{\text{anneal}}$. Writing $\mathsf{Behavior}(p, q)$ for the set of
@@ -308,8 +314,14 @@ If $\tau_{\text{prog}}$ is buggy, the correspondence theorem can become useless:
 - **Partiality fail-open:** If $\tau_{\text{prog}}(p)$ is partial (returning
   `Option Prog_ref`) and the theorem is conditioned on
   $\tau_{\text{prog}}(p) = \mathsf{some}\;p_{\text{ref}}$, then returning `none`
-  on difficult constructs makes the theorem hold vacuously. Any program that is
-  $\mathsf{WellFormed}_{\text{anneal}}$ must be guaranteed to translate.
+  on difficult constructs makes the theorem hold vacuously. Even guaranteeing
+  translation only for $\mathsf{WellFormed}_{\text{anneal}}$ programs is
+  insufficient, because fault correspondence (Section 4.6) must also compare
+  faulting programs that reach `undefined` or `unsupported` (for which
+  $\mathsf{WellFormed}_{\text{anneal}}$ is false). Accordingly,
+  $\tau_{\text{prog}}$ must be total over the entire theorem-domain syntax (or
+  successful translation must be proven unconditionally for every program $p$ in
+  both the semantic and fault-correspondence theorems).
 - **Collapsing or constant translation:** If $\tau_{\text{prog}}$ maps multiple
   programs to a trivial no-op program while a corresponding output map hides the
   difference, the theorem proves nothing about the original program.
@@ -327,22 +339,37 @@ the reference's `.addUnchecked` and `.addUnchecked` to `.add`, and the decoder
 swaps them back, every program decodes exactly, yet the theorem now describes a
 different reference program.
 
-Anneal therefore keeps semantic content out of $\tau_{\text{prog}}$. In
-Anneal's three-stage pipeline ([`docs/architecture.md`](architecture.md)),
-$M_{\text{anneal}}$ is the Stage 2 captured MIR operational semantics in
-`trusted/lean/` over which `Trusted.CrateTheorem` is stated, whereas Stage 3's
-normalized `StableAst` and weakest-precondition calculi in `theory/` sit above
-Stage 2 and are linked to $M_{\text{anneal}}$ by kernel-checked `Abstracts`
-backward simulations inside `theory/`. Because $\tau_{\text{prog}}$ translates
-between two unnormalized Stage 2 MIR representations, the two models share
-operator constructors directly and mirror each statement and terminator
-constructor one-to-one, which confines $\tau_{\text{prog}}$ to bookkeeping such
-as type-table indexing without giving up Stage 3 normalization. Kernel-checked
-constructor-preservation theorems lock each semantic constructor through the
-translation, and end-to-end semantic canaries pin the meaning of the shared
-constructors: for example, an unchecked addition that overflows must exhibit
-UB, whereas a wrapping addition of the same operands must not. The remaining
-translation is still kept minimal and audited as part of the TCB.
+Anneal therefore keeps semantic content out of $\tau_{\text{prog}}$ and keeps
+the evolving execution rules of $M_{\text{anneal}}$ out of the human-audited
+TCB. In Anneal's three-stage pipeline
+([`docs/architecture.md`](architecture.md)), Stage 1 emits the shared
+unnormalized captured-MIR AST (`Trusted/Rust/Ast/`), which serves directly as
+the input syntax to both $M_{\text{anneal}}$ and Stage 3's lowering passes. Only
+the small theorem-stating boundary (that shared captured-MIR AST and
+`CaptureManifest` environment, input `Query`, observable `TerminalOut`, and
+trace predicates), the reference model $M_{\text{ref}}$, and
+$\tau_{\text{prog}}$ belong to the human-audited TCB, while
+`Trusted.CrateTheorem` is discharged against the audited reference semantics by
+composing Stage 3's kernel-checked `Abstracts` backward simulation (from
+normalized `StableAst` to $M_{\text{anneal}}$) with the kernel-checked
+correspondence theorem (from $M_{\text{anneal}}$ to $M_{\text{ref}}$ via
+$\tau_{\text{prog}}$). Adding or
+refactoring an execution rule in $M_{\text{anneal}}$ (`initState` and
+`evalStep`) is therefore certified by the Lean 4 kernel against $M_{\text{ref}}$
+rather than expanding the human-audited TCB. Because AST normalization happens
+in Stage 3 (`Theory/Rust/Passes/` $\to$ `StableAst`) above $M_{\text{anneal}}$,
+$\tau_{\text{prog}}$ translates between Stage 2's unnormalized captured-MIR AST
+and $M_{\text{ref}}$'s unnormalized syntax type: the two representations share
+operator constructors directly, carry the same target layout and semantic
+profile, and mirror each statement and terminator constructor one-to-one, which
+confines $\tau_{\text{prog}}$ to structural bookkeeping such as type-table
+indexing without giving up Stage 3 normalization. Kernel-checked
+constructor-preservation theorems lock each semantic constructor and
+target-environment field through the translation, and end-to-end semantic
+canaries pin the meaning of the shared constructors: for example, an unchecked
+addition that overflows must exhibit UB, whereas a wrapping addition of the same
+operands must not. The remaining translation is still kept minimal and audited
+as part of the TCB.
 
 ### 4.4 Behavior representation and projection ($\pi$)
 
@@ -376,8 +403,22 @@ A flawed $\pi$ function can silently hollow out the theorem in several ways:
 The clean separation is to keep internal machine states private to the
 simulation proof while making the **observable behavior representation**
 (covering termination vs. unwinding vs. divergence, return values, and
-caller-visible memory effects) shared directly—or related by a simple,
-structure-preserving bijection accompanied by concrete input-output tests.
+caller-visible memory effects) share the exact same type and leaf representation
+between $M_{\text{anneal}}$ and $M_{\text{ref}}$ so that $\pi$ is the identity
+on observable leaves. In this closed-program model (`Query` $\to$ `TerminalOut`),
+constructs that produce intermediate externally observable effects before
+terminating or during a diverging run—such as I/O, volatile or MMIO accesses,
+inline assembly, concurrency or atomic synchronization, and foreign/external
+calls—remain outside the supported domain and evaluate to `unsupported`
+(`Fault.unsupported`); admitting any such construct in a future phase requires
+extending `Behavior` and the choice-coupled simulation relation with a shared
+labeled event/prefix trace so neither terminating nor diverging executions can
+disagree on effect ordering. If any projection $\pi$ is used around composite or
+memory wrappers, it must be accompanied by a kernel-checked theorem proving
+universally (for all values, not merely a finite test suite) that $\pi$
+preserves scalar bits, boolean flags, field identity, provenance tags, and
+caller-visible memory contents; concrete input-output tests serve only as
+supplementary non-vacuity canaries and cannot establish a trusted boundary map.
 
 ### 4.5 All-prefix safety, productivity, and nondeterminism
 
@@ -430,9 +471,12 @@ misclassification, incremental additions to $M_{\text{anneal}}$ must be paired
 with concrete canary tests in CI:
 
 - **Positive execution canaries:** Concrete programs exercising each supported
-  MIR construct and proving that $M_{\text{anneal}}$ evaluates them to the
-  expected `ok` outcome (witnessing that $\mathsf{WellFormed}_{\text{anneal}}$
-  is inhabited and non-vacuous for that feature).
+  MIR construct and proving both that every execution from the canary query is
+  fault-free ($\mathsf{WellFormed}_{\text{anneal}}(p, \mathit{env}, q)$ holds
+  universally across all reachable prefixes) and that $M_{\text{anneal}}$
+  evaluates them to the expected `ok` outcome (witnessing that
+  $\mathsf{WellFormed}_{\text{anneal}}$ is inhabited and non-vacuous for that
+  feature).
 - **Negative `undefined` canaries:** Concrete programs exercising each modeled
   UB condition and proving that $M_{\text{anneal}}$ evaluates them to
   `undefined` (not `ok` and not `unsupported`).
@@ -454,26 +498,67 @@ $M_{\text{anneal}}$ has not yet enabled (or that $M_{\text{anneal}}$
 conservatively rejects under Section 4.1), $M_{\text{ref}}$'s correspondence
 wrapper applies an explicit, human-audited support gate that reports
 `unsupported` outside the currently claimed support domain and delegates every
-construct inside that domain to the reference interpreter. Along corresponding
-executions (indexed by any shared nondeterministic choice trace $\sigma$), each
-model must reach the same fault classification
-$k \in \{\mathsf{undefined}, \mathsf{unsupported}\}$. When both models are
-deterministic on the supported domain, this per-execution fault correspondence
+construct inside that domain to the reference interpreter. The execution
+correspondence relation between $M_{\text{anneal}}$ and $M_{\text{ref}}$ must
+be induced by a stepwise simulation coupled to a faithful choice-event relation
+that preserves every shared external nondeterministic choice (such as allocator
+addresses, provenance decisions, or scheduler choices) at each choice point—so
+paired executions can never permute distinct external choice branches—while
+remaining total in both directions across valid choice traces (many-to-one from
+$M_{\text{anneal}}$ to $M_{\text{ref}}$ when $M_{\text{anneal}}$
+over-approximates a step with additional internal abstract choice branches, and
+bijective when both models have identical nondeterminism). Because
+$M_{\text{ref}}$'s staged support gate already rejects conservative
+`unsupported` cases alongside $M_{\text{anneal}}$, every valid execution of
+$M_{\text{anneal}}$ from $(p, q)$ must have a choice-coupled corresponding
+valid execution of $M_{\text{ref}}$ from $(\tau_{\text{prog}}(p), q)$, and
+conversely every valid execution of $M_{\text{ref}}$ from
+$(\tau_{\text{prog}}(p), q)$ must have a choice-coupled corresponding valid
+execution of $M_{\text{anneal}}$ from $(p, q)$, partitioning outcomes into four
+mutually exclusive cases:
+
+1. **Faulting executions:** Whenever either execution faults with classification
+   $k \in \{\mathsf{undefined}, \mathsf{unsupported}\}$, its corresponding
+   execution also faults with the exact same classification $k$.
+2. **Normally terminating executions:** Whenever either execution terminates
+   normally (returns from the entry frame) in state $s'$, its corresponding
+   execution also terminates normally in a state $t'$ related to $s'$ under
+   $\sim_{\text{out}}$ (preserving the return value and caller-visible memory
+   effects).
+3. **Unwinding executions:** Whenever either execution terminates by unwinding
+   out of the entry frame in state $s'$, its corresponding execution also
+   terminates by unwinding in a state $t'$ related to $s'$ under
+   $\sim_{\text{out}}$ (preserving the unwind payload, drop and cleanup
+   effects, and caller-visible memory effects). Constructs capable of abnormal
+   process termination without returning from or unwinding out of the entry
+   frame (such as `UnwindAction::Terminate`, aborting panics, or abort
+   intrinsics) remain `unsupported` (`Fault.unsupported`, covered by case 1)
+   unless an explicit `aborted` outcome is added to `TerminalOut`.
+4. **Diverging executions:** Whenever either execution diverges—meaning that it
+   produces an infinite productive step trace $s_0 \to s_1 \to s_2 \to \cdots$
+   without terminating, unwinding, or faulting (proven coinductively or over
+   infinite step sequences, allowing finite stuttering between corresponding
+   steps when step granularities differ, rather than treating finite fuel
+   exhaustion as divergence)—its corresponding execution also diverges, never
+   conflating divergence with normal return, unwinding, or faulting.
+
+When both models are deterministic on the supported domain, condition (1)
 reduces to bidirectional fault-reachability equivalence for every program $p$
 and input query $q$:
 
 $$
 \mathsf{Reaches}_{\text{anneal}}(p, q, \mathsf{fault}\;k) \iff
-\mathsf{Reaches}_{\text{ref}}(p, q, \mathsf{fault}\;k)
+\mathsf{Reaches}_{\text{ref}}(\tau_{\text{prog}}(p), q, \mathsf{fault}\;k)
 \quad \text{for } k \in \{\mathsf{undefined}, \mathsf{unsupported}\}
 $$
 
-When a model permits nondeterministic choices, comparing fault outcomes along
-corresponding executions (rather than merely existential reachability over $p$
-and $q$) ensures that $M_{\text{anneal}}$ cannot report `unsupported` on one
-branch merely because a different nondeterministic branch of the same input
-triggers `unsupported`, and cannot swap `undefined` and `unsupported` on any
-execution.
+When a model permits nondeterministic choices, requiring a total, bidirectional
+correspondence across all valid executions (rather than merely existential
+reachability over $p$ and $q$ or a partial relation that omits faulting
+branches) ensures that neither model can leave a faulting branch unpaired, that
+$M_{\text{anneal}}$ cannot report `unsupported` on one branch merely because a
+different nondeterministic branch of the same input triggers `unsupported`, and
+that neither model can swap `undefined` and `unsupported` on any execution.
 
 Because fault equivalence quantifies over all inputs and corresponding
 executions inside the gated reference domain, it forbids $M_{\text{anneal}}$
