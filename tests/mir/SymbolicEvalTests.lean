@@ -3986,6 +3986,7 @@ def v26FfiReadRegClaim : Claim where
 theorem v26FfiReadRegPinnedAuto_verified : VerificationResult v26FfiReadRegClaim :=
   dischargeRustPinnedContractAuto
     v26FfiReadRegClaim 64 64 (.some v26FfiReadRegReqMir) (.some v26FfiReadRegEnsMir)
+    (h_check := by decide +kernel)
 
 theorem v26FfiReadRegEqU32_verified : VerificationResult v26FfiReadRegClaim :=
   dischargeRustEqU32FuelFree
@@ -4004,6 +4005,7 @@ def v26FfiReadRegTotalClaim : TotalClaim where
 theorem v26FfiReadRegTotalPinnedAuto_verified : TotalVerificationResult v26FfiReadRegTotalClaim :=
   dischargeRustTotalPinnedContractAuto
     v26FfiReadRegTotalClaim 64 64 (.some v26FfiReadRegReqMir) (.some v26FfiReadRegEnsMir)
+    (h_check := by decide +kernel)
 
 /-- Soundness canary (Pitfall A): without `argsMatchCalleeParamTys` / `argsMatchSignature`,
 an untyped aggregate `[.aggregate 0 [.scalar ⟨10, 4⟩]]` satisfies the closure-deref `requires`
@@ -4046,6 +4048,7 @@ theorem v26ClampAddOneSymRange_verified : VerificationResult v26ClampAddOneClaim
 theorem v26ClampAddOneBoundedRange_verified : VerificationResult v26ClampAddOneClaim :=
   dischargeRustBoundedRange1Auto
     v26ClampAddOneClaim 64 64 v26ClampAddOneReqMir (.some v26ClampAddOneEnsMir)
+    (h_check := by decide +kernel)
 
 def v26ClampAddOneTotalClaim : TotalClaim where
   body := v26ClampAddOneMir
@@ -4061,6 +4064,7 @@ theorem v26ClampAddOneTotalBoundedRange_verified :
     TotalVerificationResult v26ClampAddOneTotalClaim :=
   dischargeRustTotalBoundedRange1Auto
     v26ClampAddOneTotalClaim 64 64 v26ClampAddOneReqMir (.some v26ClampAddOneEnsMir)
+    (h_check := by decide +kernel)
 
 def v26ZeroArgConstMir : CapturedMir :=
   mkMirBody "sym_test::zero_arg_const" 0
@@ -4252,7 +4256,8 @@ theorem v26FfiReadRegReversedPinnedAuto_verified :
     VerificationResult v26FfiReadRegReversedClaim :=
   ⟨rfl, rfl, rfl,
     dischargeRustPinnedContractAuto
-      v26FfiReadRegReversedClaim 64 64 (.some v26FfiReadRegReversedReqMir) (.some v26FfiReadRegEnsMir)⟩
+      v26FfiReadRegReversedClaim 64 64 (.some v26FfiReadRegReversedReqMir) (.some v26FfiReadRegEnsMir)
+      (h_check := by decide +kernel)⟩
 
 theorem v26FfiReadRegReversedEqU32_verified : VerificationResult v26FfiReadRegReversedClaim :=
   dischargeRustEqU32FuelFree
@@ -4317,6 +4322,7 @@ theorem v26FfiReadRegIntermMoveTotal_verified :
     TotalVerificationResult v26FfiReadRegIntermMoveTotalClaim :=
   dischargeRustTotalPinnedContractAuto
     v26FfiReadRegIntermMoveTotalClaim 64 64 (.some v26FfiReadRegIntermMoveReqMir) (.some v26FfiReadRegEnsMir)
+    (h_check := by decide +kernel)
 
 /-- Two-parameter `u32` closure-deref short-circuit `requires` (`a == 10 && 20 == b`)
 and `ensures` (`30 == result`), discharged via both `dischargeRustPinnedContractAuto`
@@ -4457,7 +4463,8 @@ theorem v26AddTwoRegsPinnedAuto_verified :
     VerificationResult v26AddTwoRegsClaim :=
   ⟨rfl,
     dischargeRustPinnedContractAuto
-      v26AddTwoRegsClaim 64 64 (.some v26AddTwoRegsReqMir) (.some v26AddTwoRegsEnsMir)⟩
+      v26AddTwoRegsClaim 64 64 (.some v26AddTwoRegsReqMir) (.some v26AddTwoRegsEnsMir)
+      (h_check := by decide +kernel)⟩
 
 theorem v26AddTwoRegsEq2U32_verified : VerificationResult v26AddTwoRegsClaim :=
   dischargeRustEq2U32FuelFree

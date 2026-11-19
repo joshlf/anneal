@@ -1831,6 +1831,10 @@ theorem adt_control_residual_audit_closure : True :=
   let _ := @Anneal.Mir.AdtAndControl.MirValueCodec.adtDecodeFallbackSound_of_validStructLayoutWorld_span_surjective
   let _ := @Anneal.Mir.AdtAndControl.MirValueCodec.adtOfValidStructLayoutWorld_span_surjective_bitValidity
   let _ := @Anneal.Mir.AdtAndControl.MirValueCodec.adtOfValidStructLayoutWorld_fieldLayouts_bitValidity
+  -- `[adv ep2-A2]` partial-shell projected `Deinit` two-sided equivalence across `.uninit` intermediates.
+  let _ := @Anneal.Mir.AdtAndControl.deinitFieldSlot_partialShell_iff_trusted
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_deinit_projected_partialShell_iff
+  let _ := @Anneal.Mir.AdtAndControl.evalStmt_deinit_projected_partialShell_uninit_intermediate_witness
   trivial
 
 end MiniRustSpec.Correspondence.DeinitBridge

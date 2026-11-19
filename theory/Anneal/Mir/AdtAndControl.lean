@@ -5083,7 +5083,20 @@ every step is a `.field` or `.downcast` (including out-of-bounds fields, inactiv
 dangling downcasts so fault equivalence is proved alongside step equivalence), initialized sub-values
 reached strictly before the end of `p` are free of `Value.uninit`, and bare `.field` steps do not
 land on transparent-unwrapped non-aggregate newtypes (`.scalar`/`.ptr`/`.unit` at index `0`) or
-non-zero enum variants without an explicit `.downcast`. -/
+non-zero enum variants without an explicit `.downcast`.
+
+Scope notes:
+1. Paths traversing an `.uninit` intermediate inside `LocalSlotState.init rootVal` are excluded here
+   because `LocalSlotState.init` models fully initialized values (`explodeAggregate` wraps each child
+   `fv` as `FieldSlot.init fv`); partially initialized aggregates with uninitialized sub-places live
+   in `LocalSlotState.partialShell`, whose two-sided equivalence across `FieldSlot.uninit` ↔
+   `Value.uninit` intermediates (including array/slice tails below `.uninit`) is proved in
+   `DeinitShellChainOk`, `deinitFieldSlot_partialShell_iff_trusted`, and
+   `evalStmt_deinit_projected_partialShell_iff`.
+2. `.index`, `.constantIndex`, and `.subslice` steps on initialized aggregates are excluded because
+   Anneal's `deinitFieldSlot` (`AdtAndControl.lean`) rejects array/slice projections on `.init` and
+   `.nested` aggregates with `none`, whereas `Trusted.MirSemantics.deinitProjectedValue` supports
+   in-bounds `.index`, `.constantIndex`, and `.subslice` deinitialization on `.aggregate 0 elems`. -/
 def DeinitInitChainOk : Value → List ProjectionElem → Prop
   | _, [] => True
   | .uninit, _ :: _ => False
@@ -5521,10 +5534,13 @@ private theorem deinitFieldSlot_init_exact_iff_trusted_aux (ts : Bool)
         rcases v with _ | _ | _ | ⟨_ | _, _⟩ | _ <;> nomatch hChain
 
 /-- **Two-Sided Initialized-Slot `deinitFieldSlot` ↔ `deinitProjectedValue` Equivalence**:
-Under `DeinitInitChainOk v p` and `projectionHasDeref p = false`, Anneal's `deinitFieldSlot` and
-Trusted's `deinitProjectedValue` succeed on the exact same paths, fault (`none` ↔ `.ub`) on the
-exact same paths, and produce the **exact same** post-deinit `LocalSlot` under
-`LocalSlotState.toTrustedSlotExact` whenever the tag survives (`ts = true ∨ noDowncast p = true`). -/
+Under `DeinitInitChainOk v p` (`.field`/`.downcast` projections on a fully initialized `LocalSlotState.init`
+aggregate without intermediate `Value.uninit` or array/slice indexing; see `DeinitShellChainOk` and
+`deinitFieldSlot_partialShell_iff_trusted` for `.uninit` intermediates inside `partialShell`) and
+`projectionHasDeref p = false`, Anneal's `deinitFieldSlot` and Trusted's `deinitProjectedValue`
+succeed on the exact same paths, fault (`none` ↔ `.ub`) on the exact same paths, and produce the
+**exact same** post-deinit `LocalSlot` under `LocalSlotState.toTrustedSlotExact` whenever the tag
+survives (`ts = true ∨ noDowncast p = true`). -/
 theorem deinitFieldSlot_init_exact_iff_trusted (ts : Bool)
     (dlocals locals : List LocalSlot) (localDecls : List LocalDecl) (layouts : LayoutTable)
     (v : Value) (p : List ProjectionElem) (curTyOpt : Option Ty)
@@ -5811,8 +5827,11 @@ theorem evalStmt_deinit_projected_init_refines {ts : Bool} {slots slots' : List 
     | _ => exact absurd hAT id
 
 /-- **Two-Sided Initialized-Root Projected `Deinit` Operational Equivalence
-(`evalStmt_deinit_projected_init_iff`)**: on an initialized non-union aggregate root
-(`DeinitInitChainOk rootVal place.projection`, `projectionHasDeref = false`, `placeTouchesUnion = false`),
+(`evalStmt_deinit_projected_init_iff`)**: on a fully initialized non-union aggregate root
+(`DeinitInitChainOk rootVal place.projection`, `projectionHasDeref = false`, `placeTouchesUnion = false`;
+excludes `.index`/`.constantIndex`/`.subslice` on `.init` aggregates, which `deinitFieldSlot` does not
+model, and excludes intermediate `Value.uninit` inside `LocalSlotState.init`, which Anneal represents
+via `LocalSlotState.partialShell` — see `evalStmt_deinit_projected_partialShell_iff`),
 Anneal's `evalDeinitPlace` and Trusted's `evalStmt` succeed iff the other succeeds, fault (`none` ↔
 `.fail .ub`) iff the other faults, and when `ts = true ∨ noDowncast place.projection = true` produce
 the **exact same** post-deinit `LocalSlot` frame under `LocalSlotState.toTrustedSlotExact` (`=`). -/
@@ -5907,6 +5926,479 @@ theorem evalStmt_deinit_projected_init_iff {ts : Bool}
     injection hEq with hSlots'
     subst hSlots'
     exact ⟨rootVal', rfl, by rw [List.map_set, hSlotEx hProj hTag]⟩
+
+/-- Projection-chain invariant extending `DeinitInitChainOk` to `FieldSlot` / `PartialAggregate`
+shells (`LocalSlotState.partialShell`), covering paths that traverse `.uninit` intermediates
+(`FieldSlot.uninit` ↔ `Value.uninit`, including `.field`, `.downcast :: .field`, `.index`,
+`.constantIndex`, and `.subslice` tails below `FieldSlot.uninit` under `WellTypedDeinitProj`) as
+well as nested shells and initialized sub-aggregates. -/
+def DeinitShellChainOk (dlocals : List LocalSlot) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) : FieldSlot → Option Ty → List ProjectionElem → Prop
+  | _, _, [] => True
+  | .uninit, .some curTy, a :: rest =>
+    WellTypedDeinitProj dlocals localDecls layouts curTy (a :: rest)
+  | .uninit, .none, _ :: _ => False
+  | .init v, _, p => DeinitInitChainOk v p
+  | .nested var isAdt disc fs, curTyOpt, .field idx fieldTy :: rest =>
+    shellVariant ⟨var, isAdt, disc, fs⟩ = 0 →
+      ∀ c, get? fs idx = some c →
+        DeinitShellChainOk dlocals localDecls layouts c
+          (deinitStepField0TyOpt localDecls layouts idx fieldTy curTyOpt) rest
+  | .nested var isAdt disc fs, curTyOpt, .downcast _ variantIdx :: .field idx fieldTy :: rest =>
+    shellVariant ⟨var, isAdt, disc, fs⟩ = variantIdx →
+      ∀ c, get? fs idx = some c →
+        DeinitShellChainOk dlocals localDecls layouts c
+          (deinitStepResolveTyOpt localDecls layouts fieldTy curTyOpt) rest
+  | .nested _ _ _ _, _, .downcast _ _ :: _ => True
+  | .nested _ _ _ _, _, _ :: _ => False
+
+private theorem fieldSlotToValue_nested
+    (var : VariantIdx) (isAdt disc : Bool) (fs : List FieldSlot) :
+    fieldSlotToValue (.nested var isAdt disc fs) =
+      .aggregate (shellVariant ⟨var, isAdt, disc, fs⟩) (fieldSlotsToValues fs) := by
+  cases isAdt <;> rfl
+
+private theorem deinitFieldSlot_partialShell_iff_trusted_aux (ts : Bool)
+    {dlocals locals : List LocalSlot} (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hSame : SameScalarLocals dlocals locals) :
+    ∀ (n : Nat) (p : List ProjectionElem), p.length ≤ n →
+      ∀ (slot : FieldSlot) (curTyOpt : Option Ty),
+        DeinitShellChainOk dlocals localDecls layouts slot curTyOpt p →
+        projectionHasDeref p = false →
+        ((∃ slot', deinitFieldSlot ts dlocals slot p = some slot') ↔
+          (∃ v', deinitProjectedValue locals (fieldSlotToValue slot) p localDecls layouts
+            curTyOpt = .ok v')) ∧
+        (deinitFieldSlot ts dlocals slot p = none ↔
+          deinitProjectedValue locals (fieldSlotToValue slot) p localDecls layouts
+            curTyOpt = .ub) := by
+  intro n
+  induction n with
+  | zero =>
+    intro p hLen slot curTyOpt _ _
+    have hp : p = [] := List.eq_nil_of_length_eq_zero (Nat.le_zero.mp hLen)
+    subst hp
+    have hTOk : deinitProjectedValue locals (fieldSlotToValue slot) [] localDecls layouts
+        curTyOpt = .ok .uninit := by
+      cases fieldSlotToValue slot <;> rfl
+    rw [hTOk]
+    exact And.intro (Iff.intro (fun _ => ⟨.uninit, rfl⟩) (fun _ => ⟨.uninit, rfl⟩))
+      (Iff.intro (fun h => nomatch h) (fun h => nomatch h))
+  | succ n ih =>
+    intro p hLen slot curTyOpt hChain hND
+    rcases p with _ | ⟨a, rest⟩
+    · have hTOk : deinitProjectedValue locals (fieldSlotToValue slot) [] localDecls layouts
+          curTyOpt = .ok .uninit := by
+        cases fieldSlotToValue slot <;> rfl
+      rw [hTOk]
+      exact And.intro (Iff.intro (fun _ => ⟨.uninit, rfl⟩) (fun _ => ⟨.uninit, rfl⟩))
+        (Iff.intro (fun h => nomatch h) (fun h => nomatch h))
+    · cases slot with
+      | uninit =>
+        cases curTyOpt with
+        | none => nomatch hChain
+        | some curTy =>
+          have hTailEq := deinitTailOk_typed_eq_trusted hSame (a :: rest) curTy hChain
+          have hPD : projListHasDeref (a :: rest) = false :=
+            (projListHasDeref_eq_projectionHasDeref (a :: rest)).trans hND
+          cases hTail : deinitTailOk dlocals (a :: rest) with
+          | true =>
+            have hTailT : Trusted.Rustc.V2026_06_01.MirSemantics.deinitTailOk locals localDecls
+                layouts (.some curTy) (a :: rest) = true := hTailEq.symm.trans hTail
+            have hAOk : deinitFieldSlot ts dlocals .uninit (a :: rest) = some .uninit := by
+              simp [deinitFieldSlot, hTail]
+            have hTOk : deinitProjectedValue locals (fieldSlotToValue .uninit) (a :: rest)
+                localDecls layouts (.some curTy) = .ok .uninit := by
+              dsimp only [fieldSlotToValue]
+              unfold deinitProjectedValue
+              rw [hTailT]
+            rw [hAOk, hTOk]
+            exact And.intro (Iff.intro (fun _ => ⟨.uninit, rfl⟩) (fun _ => ⟨.uninit, rfl⟩))
+              (Iff.intro (fun h => nomatch h) (fun h => nomatch h))
+          | false =>
+            have hTailT : Trusted.Rustc.V2026_06_01.MirSemantics.deinitTailOk locals localDecls
+                layouts (.some curTy) (a :: rest) = false := hTailEq.symm.trans hTail
+            have hANone : deinitFieldSlot ts dlocals .uninit (a :: rest) = none := by
+              simp [deinitFieldSlot, hTail]
+            have hTUb : deinitProjectedValue locals (fieldSlotToValue .uninit) (a :: rest)
+                localDecls layouts (.some curTy) = .ub := by
+              dsimp only [fieldSlotToValue]
+              unfold deinitProjectedValue
+              rw [hTailT]
+              dsimp only
+              rw [hPD]
+            rw [hANone, hTUb]
+            exact And.intro (Iff.intro (fun ⟨_, h⟩ => nomatch h) (fun ⟨_, h⟩ => nomatch h))
+              (Iff.intro (fun _ => rfl) (fun _ => rfl))
+      | init v =>
+        obtain ⟨hFwd, hBwd, hUbIff⟩ := deinitFieldSlot_init_exact_iff_trusted ts dlocals locals
+          localDecls layouts v (a :: rest) curTyOpt hChain hND
+        dsimp only [fieldSlotToValue]
+        exact And.intro
+          (Iff.intro
+            (fun ⟨s', hs'⟩ => let ⟨v', hv', _, _⟩ := hFwd s' hs'; ⟨v', hv'⟩)
+            (fun ⟨v', hv'⟩ => hBwd v' hv'))
+          hUbIff
+      | nested var isAdt disc fs =>
+        cases a with
+        | field idx fieldTy =>
+          have hNDRest : projectionHasDeref rest = false := hND
+          have hPDRest : projListHasDeref rest = false :=
+            (projListHasDeref_eq_projectionHasDeref rest).trans hNDRest
+          cases hAct : shellVariant ⟨var, isAdt, disc, fs⟩ with
+          | succ k =>
+            have hANone : deinitFieldSlot ts dlocals (.nested var isAdt disc fs)
+                (.field idx fieldTy :: rest) = none := by
+              simp [deinitFieldSlot, deinitShellStep, hAct]
+            have hTUb : deinitProjectedValue locals
+                (fieldSlotToValue (.nested var isAdt disc fs))
+                (.field idx fieldTy :: rest) localDecls layouts curTyOpt = .ub := by
+              rw [fieldSlotToValue_nested, hAct]
+              unfold deinitProjectedValue
+              rw [hPDRest]
+            rw [hANone, hTUb]
+            exact And.intro (Iff.intro (fun ⟨_, h⟩ => nomatch h) (fun ⟨_, h⟩ => nomatch h))
+              (Iff.intro (fun _ => rfl) (fun _ => rfl))
+          | zero =>
+            cases hGet : fs[idx]? with
+            | none =>
+              have hGetValNone : get? (fieldSlotsToValues fs) idx = none := by
+                rw [get?_fieldSlotsToValues, get?_eq_getElem?, hGet]; rfl
+              have hANone : deinitFieldSlot ts dlocals (.nested var isAdt disc fs)
+                  (.field idx fieldTy :: rest) = none := by
+                simp [deinitFieldSlot, deinitShellStep, hAct, hGet]
+              have hTUb : deinitProjectedValue locals
+                  (fieldSlotToValue (.nested var isAdt disc fs))
+                  (.field idx fieldTy :: rest) localDecls layouts curTyOpt = .ub := by
+                rw [fieldSlotToValue_nested, hAct, deinitProjectedValue_agg0_field, hGetValNone]
+                dsimp only
+                rw [hPDRest]
+              rw [hANone, hTUb]
+              exact And.intro (Iff.intro (fun ⟨_, h⟩ => nomatch h) (fun ⟨_, h⟩ => nomatch h))
+                (Iff.intro (fun _ => rfl) (fun _ => rfl))
+            | some c =>
+              have hGetC : get? fs idx = some c := by rw [get?_eq_getElem?]; exact hGet
+              have hGetVal : get? (fieldSlotsToValues fs) idx = some (fieldSlotToValue c) := by
+                rw [get?_fieldSlotsToValues, hGetC]; rfl
+              have hLtVal : idx < (fieldSlotsToValues fs).length := by
+                rw [length_fieldSlotsToValues]
+                exact (List.getElem?_eq_some_iff.mp hGet).1
+              obtain ⟨ihOk, ihUb⟩ := ih rest (by simp at hLen; omega) c
+                (deinitStepField0TyOpt localDecls layouts idx fieldTy curTyOpt)
+                (hChain hAct c hGetC) hNDRest
+              cases hSub : deinitFieldSlot ts dlocals c rest with
+              | none =>
+                have hSubUb := ihUb.mp hSub
+                have hANone : deinitFieldSlot ts dlocals (.nested var isAdt disc fs)
+                    (.field idx fieldTy :: rest) = none := by
+                  simp [deinitFieldSlot, deinitShellStep, hAct, hGet, hSub]
+                have hTUb : deinitProjectedValue locals
+                    (fieldSlotToValue (.nested var isAdt disc fs))
+                    (.field idx fieldTy :: rest) localDecls layouts curTyOpt = .ub := by
+                  rw [fieldSlotToValue_nested, hAct, deinitProjectedValue_agg0_field, hGetVal]
+                  dsimp only
+                  rw [hSubUb]
+                rw [hANone, hTUb]
+                exact And.intro (Iff.intro (fun ⟨_, h⟩ => nomatch h) (fun ⟨_, h⟩ => nomatch h))
+                  (Iff.intro (fun _ => rfl) (fun _ => rfl))
+              | some c' =>
+                obtain ⟨fv', hSubOk⟩ := ihOk.mp ⟨c', hSub⟩
+                have hSet : set? (fieldSlotsToValues fs) idx fv' =
+                    .some ((fieldSlotsToValues fs).set idx fv') :=
+                  set?_eq_some_iff.mpr ⟨hLtVal, rfl⟩
+                have hAOk : ∃ sOut, deinitFieldSlot ts dlocals (.nested var isAdt disc fs)
+                    (.field idx fieldTy :: rest) = some sOut :=
+                  ⟨_, by simp [deinitFieldSlot, deinitShellStep, hAct, hGet, hSub]; rfl⟩
+                have hTOk : deinitProjectedValue locals
+                    (fieldSlotToValue (.nested var isAdt disc fs))
+                    (.field idx fieldTy :: rest) localDecls layouts curTyOpt =
+                    .ok (.aggregate 0 ((fieldSlotsToValues fs).set idx fv')) := by
+                  rw [fieldSlotToValue_nested, hAct, deinitProjectedValue_agg0_field, hGetVal]
+                  dsimp only
+                  rw [hSubOk]
+                  dsimp only
+                  rw [hSet]
+                obtain ⟨sOut, hAOkEq⟩ := hAOk
+                rw [hAOkEq, hTOk]
+                exact And.intro (Iff.intro (fun _ => ⟨_, rfl⟩) (fun _ => ⟨_, rfl⟩))
+                  (Iff.intro (fun h => nomatch h) (fun h => nomatch h))
+        | downcast nm dv =>
+          have hNDRest : projectionHasDeref rest = false := hND
+          have hPDRest : projListHasDeref rest = false :=
+            (projListHasDeref_eq_projectionHasDeref rest).trans hNDRest
+          cases rest with
+          | nil =>
+            have hANone : deinitFieldSlot ts dlocals (.nested var isAdt disc fs)
+                [.downcast nm dv] = none := rfl
+            have hTUb : deinitProjectedValue locals
+                (fieldSlotToValue (.nested var isAdt disc fs))
+                [.downcast nm dv] localDecls layouts curTyOpt = .ub := by
+              rw [fieldSlotToValue_nested]
+              rcases hAct : shellVariant ⟨var, isAdt, disc, fs⟩ with _ | _ <;> rfl
+            rw [hANone, hTUb]
+            exact And.intro (Iff.intro (fun ⟨_, h⟩ => nomatch h) (fun ⟨_, h⟩ => nomatch h))
+              (Iff.intro (fun _ => rfl) (fun _ => rfl))
+          | cons b tail =>
+            cases hb : b with
+            | field idx fieldTy =>
+              have hNDTail : projectionHasDeref tail = false := by
+                rw [hb] at hNDRest; exact hNDRest
+              have hPDTail : projListHasDeref tail = false :=
+                (projListHasDeref_eq_projectionHasDeref tail).trans hNDTail
+              rcases beq_cases (shellVariant ⟨var, isAdt, disc, fs⟩) dv with ⟨_, hEq⟩ | ⟨hBeq, hNe⟩
+              · subst dv
+                cases hGet : fs[idx]? with
+                | none =>
+                  have hGetValNone : get? (fieldSlotsToValues fs) idx = none := by
+                    rw [get?_fieldSlotsToValues, get?_eq_getElem?, hGet]; rfl
+                  have hANone : deinitFieldSlot ts dlocals (.nested var isAdt disc fs)
+                      (.downcast nm (shellVariant ⟨var, isAdt, disc, fs⟩) ::
+                        .field idx fieldTy :: tail) = none := by
+                    simp [deinitFieldSlot, deinitShellStep, hGet]
+                  have hTUb : deinitProjectedValue locals
+                      (fieldSlotToValue (.nested var isAdt disc fs))
+                      (.downcast nm (shellVariant ⟨var, isAdt, disc, fs⟩) ::
+                        .field idx fieldTy :: tail)
+                      localDecls layouts curTyOpt = .ub := by
+                    rw [fieldSlotToValue_nested, deinitProjectedValue_agg_downcast_field, Nat.beq_refl]
+                    dsimp only
+                    rw [hGetValNone]
+                    dsimp only
+                    rw [hPDTail]
+                  rw [hANone, hTUb]
+                  exact And.intro (Iff.intro (fun ⟨_, h⟩ => nomatch h) (fun ⟨_, h⟩ => nomatch h))
+                    (Iff.intro (fun _ => rfl) (fun _ => rfl))
+                | some c =>
+                  have hGetC : get? fs idx = some c := by rw [get?_eq_getElem?]; exact hGet
+                  have hGetVal : get? (fieldSlotsToValues fs) idx = some (fieldSlotToValue c) := by
+                    rw [get?_fieldSlotsToValues, hGetC]; rfl
+                  have hLtVal : idx < (fieldSlotsToValues fs).length := by
+                    rw [length_fieldSlotsToValues]
+                    exact (List.getElem?_eq_some_iff.mp hGet).1
+                  have hChainSub : DeinitShellChainOk dlocals localDecls layouts c
+                      (deinitStepResolveTyOpt localDecls layouts fieldTy curTyOpt) tail := by
+                    rw [hb] at hChain
+                    exact hChain rfl c hGetC
+                  obtain ⟨ihOk, ihUb⟩ := ih tail (by simp at hLen; omega) c
+                    (deinitStepResolveTyOpt localDecls layouts fieldTy curTyOpt)
+                    hChainSub hNDTail
+                  cases hSub : deinitFieldSlot ts dlocals c tail with
+                  | none =>
+                    have hSubUb := ihUb.mp hSub
+                    have hANone : deinitFieldSlot ts dlocals (.nested var isAdt disc fs)
+                        (.downcast nm (shellVariant ⟨var, isAdt, disc, fs⟩) ::
+                          .field idx fieldTy :: tail) = none := by
+                      simp [deinitFieldSlot, deinitShellStep, hGet, hSub]
+                    have hTUb : deinitProjectedValue locals
+                        (fieldSlotToValue (.nested var isAdt disc fs))
+                        (.downcast nm (shellVariant ⟨var, isAdt, disc, fs⟩) ::
+                          .field idx fieldTy :: tail)
+                        localDecls layouts curTyOpt = .ub := by
+                      rw [fieldSlotToValue_nested, deinitProjectedValue_agg_downcast_field, Nat.beq_refl]
+                      dsimp only
+                      rw [hGetVal]
+                      dsimp only
+                      rw [hSubUb]
+                    rw [hANone, hTUb]
+                    exact And.intro (Iff.intro (fun ⟨_, h⟩ => nomatch h) (fun ⟨_, h⟩ => nomatch h))
+                      (Iff.intro (fun _ => rfl) (fun _ => rfl))
+                  | some c' =>
+                    obtain ⟨fv', hSubOk⟩ := ihOk.mp ⟨c', hSub⟩
+                    have hSet : set? (fieldSlotsToValues fs) idx fv' =
+                        .some ((fieldSlotsToValues fs).set idx fv') :=
+                      set?_eq_some_iff.mpr ⟨hLtVal, rfl⟩
+                    have hAOk : ∃ sOut, deinitFieldSlot ts dlocals (.nested var isAdt disc fs)
+                        (.downcast nm (shellVariant ⟨var, isAdt, disc, fs⟩) ::
+                          .field idx fieldTy :: tail) = some sOut :=
+                      ⟨_, by simp [deinitFieldSlot, deinitShellStep, hGet, hSub]; rfl⟩
+                    have hTOk : deinitProjectedValue locals
+                        (fieldSlotToValue (.nested var isAdt disc fs))
+                        (.downcast nm (shellVariant ⟨var, isAdt, disc, fs⟩) ::
+                          .field idx fieldTy :: tail)
+                        localDecls layouts curTyOpt =
+                        .ok (.aggregate (shellVariant ⟨var, isAdt, disc, fs⟩)
+                          ((fieldSlotsToValues fs).set idx fv')) := by
+                      rw [fieldSlotToValue_nested, deinitProjectedValue_agg_downcast_field, Nat.beq_refl]
+                      dsimp only
+                      rw [hGetVal]
+                      dsimp only
+                      rw [hSubOk]
+                      dsimp only
+                      rw [hSet]
+                    obtain ⟨sOut, hAOkEq⟩ := hAOk
+                    rw [hAOkEq, hTOk]
+                    exact And.intro (Iff.intro (fun _ => ⟨_, rfl⟩) (fun _ => ⟨_, rfl⟩))
+                      (Iff.intro (fun h => nomatch h) (fun h => nomatch h))
+              · have hANone : deinitFieldSlot ts dlocals (.nested var isAdt disc fs)
+                    (.downcast nm dv :: .field idx fieldTy :: tail) = none := by
+                  simp [deinitFieldSlot, deinitShellStep, hNe]
+                have hTUb : deinitProjectedValue locals
+                    (fieldSlotToValue (.nested var isAdt disc fs))
+                    (.downcast nm dv :: .field idx fieldTy :: tail)
+                    localDecls layouts curTyOpt = .ub := by
+                  rw [fieldSlotToValue_nested, deinitProjectedValue_agg_downcast_field, hBeq]
+                  dsimp only
+                  rw [hPDTail]
+                rw [hANone, hTUb]
+                exact And.intro (Iff.intro (fun ⟨_, h⟩ => nomatch h) (fun ⟨_, h⟩ => nomatch h))
+                  (Iff.intro (fun _ => rfl) (fun _ => rfl))
+            | deref => rw [hb] at hNDRest; nomatch hNDRest
+            | downcast _ _ | index _ | constantIndex _ _ _ | subslice _ _ _
+            | opaqueCast _ | unwrapUnsafeBinder _ =>
+              have hPDRest' : projListHasDeref (b :: tail) = false := hPDRest
+              rw [hb] at hPDRest'
+              exact And.intro
+                (Iff.intro (fun ⟨_, h⟩ => nomatch h)
+                  (fun ⟨_, h⟩ => by
+                    rw [fieldSlotToValue_nested] at h
+                    rcases hAct : shellVariant ⟨var, isAdt, disc, fs⟩ with _ | _ <;> (
+                      rw [hAct] at h; unfold deinitProjectedValue at h; rw [hPDRest'] at h; nomatch h)))
+                (Iff.intro
+                  (fun _ => by
+                    rw [fieldSlotToValue_nested]
+                    rcases hAct : shellVariant ⟨var, isAdt, disc, fs⟩ with _ | _ <;> (
+                      unfold deinitProjectedValue; rw [hPDRest']))
+                  (fun _ => rfl))
+        | deref | index _ | constantIndex _ _ _ | subslice _ _ _
+        | opaqueCast _ | unwrapUnsafeBinder _ =>
+          nomatch hChain
+
+/-- **Two-Sided Partial-Shell `deinitFieldSlot` ↔ `deinitProjectedValue` Equivalence
+(`deinitFieldSlot_partialShell_iff_trusted`)**: under `SameScalarLocals dlocals locals`,
+`DeinitShellChainOk dlocals localDecls layouts slot curTyOpt p`, and `projectionHasDeref p = false`,
+Anneal's `deinitFieldSlot` and Trusted's `deinitProjectedValue` agree two-sidedly on both step
+success (`some` ↔ `.ok`) and undefined-behavior faults (`none` ↔ `.ub`), including paths that
+project through `.uninit` intermediates (`FieldSlot.uninit` ↔ `Value.uninit`). -/
+theorem deinitFieldSlot_partialShell_iff_trusted (ts : Bool)
+    {dlocals locals : List LocalSlot} (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (hSame : SameScalarLocals dlocals locals)
+    (slot : FieldSlot) (curTyOpt : Option Ty) (p : List ProjectionElem)
+    (hChain : DeinitShellChainOk dlocals localDecls layouts slot curTyOpt p)
+    (hND : projectionHasDeref p = false) :
+    ((∃ slot', deinitFieldSlot ts dlocals slot p = some slot') ↔
+      (∃ v', deinitProjectedValue locals (fieldSlotToValue slot) p localDecls layouts
+        curTyOpt = .ok v')) ∧
+    (deinitFieldSlot ts dlocals slot p = none ↔
+      deinitProjectedValue locals (fieldSlotToValue slot) p localDecls layouts
+        curTyOpt = .ub) :=
+  deinitFieldSlot_partialShell_iff_trusted_aux ts localDecls layouts hSame
+    p.length p (Nat.le_refl _) slot curTyOpt hChain hND
+
+/-- **Two-Sided Partial-Shell Root Projected `Deinit` Operational Equivalence
+(`evalStmt_deinit_projected_partialShell_iff`)**: when `place.local_` holds a `PartialAggregate`
+shell (`slots[place.local_]? = some (.partialShell shell)`, `s.frame.locals[place.local_]? =
+some (.init shell.toTrustedValue)`) satisfying `DeinitShellChainOk`, Anneal's `evalDeinitPlace`
+and Trusted's `evalStmt` succeed iff the other succeeds and fault (`none` ↔ `.fail .ub`) iff the
+other faults — including projections through `.uninit` intermediates (`FieldSlot.uninit` ↔
+`Value.uninit`) and array/slice tails below `.uninit` intermediates. -/
+theorem evalStmt_deinit_projected_partialShell_iff {ts : Bool}
+    {slots : List LocalSlotState} {place : Place} {s : MachineState} {span : String}
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {shell : PartialAggregate}
+    (hSame : SameScalarLocals (slotsToTrustedLocals slots) s.frame.locals)
+    (hProj : place.projection ≠ [])
+    (hND : projectionHasDeref place.projection = false)
+    (hNoUnion : placeTouchesUnion localDecls layouts place = false)
+    (hA : slots[place.local_]? = some (.partialShell shell))
+    (hT : s.frame.locals[place.local_]? = some (.init shell.toTrustedValue))
+    (hChain : DeinitShellChainOk (slotsToTrustedLocals slots) localDecls layouts
+      shell.toFieldSlot (placeTy localDecls layouts ⟨place.local_, .nil⟩) place.projection)
+    (hNoProt :
+      ∀ p ps, s.memory.activeProtectors = p :: ps →
+        hasProtectedWriteConflict s.memory.borrows (p :: ps) place.local_ .none
+          (resolveBorrowWriteLocalProj localDecls layouts s.frame.locals place.local_
+            place.projection) 0 0 (length s.memory.callStack) = false := by
+      intros; rfl) :
+    ((∃ slots', evalDeinitPlace ts slots place = some slots') ↔
+        (∃ s', evalStmt s ⟨.deinit place, span⟩ localDecls layouts = .step s')) ∧
+      (evalDeinitPlace ts slots place = none ↔
+        evalStmt s ⟨.deinit place, span⟩ localDecls layouts = .fail .ub) := by
+  obtain ⟨a, rest, hP⟩ : ∃ a rest, place.projection = a :: rest := by
+    cases hp : place.projection with
+    | nil => exact absurd hp hProj
+    | cons a rest => exact ⟨a, rest, rfl⟩
+  have hLtT : place.local_ < s.frame.locals.length := (List.getElem?_eq_some_iff.mp hT).1
+  have hValEq : fieldSlotToValue shell.toFieldSlot = shell.toTrustedValue := by
+    rcases shell with ⟨var, isAdt, disc, fs⟩
+    rfl
+  obtain ⟨hOkIff, hUbIff⟩ := deinitFieldSlot_partialShell_iff_trusted ts localDecls layouts hSame
+    shell.toFieldSlot (placeTy localDecls layouts ⟨place.local_, .nil⟩) place.projection hChain hND
+  rw [hValEq] at hOkIff hUbIff
+  have hEvalD : evalDeinitPlace ts slots place =
+      match deinitFieldSlot ts (slotsToTrustedLocals slots) shell.toFieldSlot place.projection with
+      | none => none
+      | some slot' => some (slots.set place.local_ (fieldSlotToLocalSlotState slot')) := by
+    unfold evalDeinitPlace
+    rw [hA, hP]
+    rfl
+  have hEvalT : evalStmt s ⟨.deinit place, span⟩ localDecls layouts =
+      match deinitProjectedValue s.frame.locals shell.toTrustedValue place.projection localDecls
+          layouts (placeTy localDecls layouts ⟨place.local_, .nil⟩) with
+      | .ok rootVal' =>
+        .step (advanceStmt s (s.frame.locals.set place.local_ (.init rootVal'))
+          { s.memory with
+            borrows := invalidateConflictingBorrowsAtProj s.memory.borrows place.local_ .none
+              (resolveBorrowWriteLocalProj localDecls layouts s.frame.locals place.local_
+                place.projection) 0 0 (length s.memory.callStack) })
+      | .ub => .fail .ub
+      | .unsupported => .unsupported := by
+    rcases place with ⟨loc, proj⟩
+    dsimp only at hP hND hNoUnion hT hLtT hNoProt ⊢
+    subst hP
+    have hPD : projListHasDeref (a :: rest) = false :=
+      (projListHasDeref_eq_projectionHasDeref (a :: rest)).trans hND
+    simp only [evalStmt, get?_eq_getElem?, hT, deinitProjectedForLocal, hPD, hNoUnion]
+    cases deinitProjectedValue s.frame.locals shell.toTrustedValue (a :: rest) localDecls layouts
+        (placeTy localDecls layouts ⟨loc, .nil⟩) with
+    | ub => rfl
+    | unsupported => rfl
+    | ok rootVal' =>
+      dsimp only
+      rw [set?_eq_some_iff.mpr ⟨hLtT, rfl⟩]
+      dsimp only
+      cases hProt : s.memory.activeProtectors with
+      | nil => rfl
+      | cons p0 ps0 => dsimp only; rw [hNoProt p0 ps0 hProt]
+  rw [hEvalD, hEvalT]
+  cases hDF : deinitFieldSlot ts (slotsToTrustedLocals slots) shell.toFieldSlot place.projection with
+  | none =>
+    rw [hUbIff.mp hDF]
+    exact And.intro (Iff.intro (fun ⟨_, h⟩ => nomatch h) (fun ⟨_, h⟩ => nomatch h))
+      (Iff.intro (fun _ => rfl) (fun _ => rfl))
+  | some slot' =>
+    obtain ⟨rootVal', hTOk⟩ := hOkIff.mp ⟨slot', hDF⟩
+    rw [hTOk]
+    exact And.intro (Iff.intro (fun _ => ⟨_, rfl⟩) (fun _ => ⟨_, rfl⟩))
+      (Iff.intro (fun h => nomatch h) (fun h => nomatch h))
+
+/-- Concrete regression witness (`evalStmt_deinit_projected_partialShell_uninit_intermediate_witness`):
+on `_1 : ((u32, u32), [u32; 2])` in `LocalSlotState.partialShell` where `_1.0` and `_1.1` are
+`.uninit` while a sibling or outer shell exists (`[.uninit, .uninit, .init (.scalar ⟨7, 4⟩)]`),
+deinitializing `_1.0.1` (`[.field 0 _, .field 1 _]`) and `_1.1[0 of 2]`
+(`[.field 1 _, .constantIndex 0 2 false]`) through `.uninit` intermediates succeeds in both
+Anneal and Trusted, while an out-of-bounds `.field 2` below `_1.0` faults in both! -/
+theorem evalStmt_deinit_projected_partialShell_uninit_intermediate_witness :
+    let u32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+    let pairTy : Ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 0 }
+    let arr2Ty : Ty := { kind := .array (.uint .u32) 2, layoutIdx := 0 }
+    let outerTy : Ty := { kind := .tuple [pairTy.kind, arr2Ty.kind, .uint .u32], layoutIdx := 0 }
+    let decls : List LocalDecl :=
+      [ { mutability := .mut, ty := u32Ty, debugName := .none }
+      , { mutability := .mut, ty := outerTy, debugName := .none } ]
+    let shell : PartialAggregate :=
+      { variantIdx := 0, isAdt := false, discriminantSet := false
+        fields := [.uninit, .uninit, .init (.scalar ⟨7, 4⟩)] }
+    let slots : List LocalSlotState := [.uninit, .partialShell shell]
+    let s : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .init shell.toTrustedValue] }
+        memory := emptyMemory }
+    evalDeinitPlace true slots ⟨1, [.field 0 pairTy, .field 1 u32Ty]⟩ = some slots ∧
+    evalStmt s ⟨.deinit ⟨1, [.field 0 pairTy, .field 1 u32Ty]⟩, "d1"⟩ decls emptyLayoutTable =
+      .step (advanceStmt s s.frame.locals emptyMemory) ∧
+    evalDeinitPlace true slots ⟨1, [.field 1 arr2Ty, .constantIndex 0 2 false]⟩ = some slots ∧
+    evalStmt s ⟨.deinit ⟨1, [.field 1 arr2Ty, .constantIndex 0 2 false]⟩, "d2"⟩ decls emptyLayoutTable =
+      .step (advanceStmt s s.frame.locals emptyMemory) ∧
+    evalStmt s ⟨.deinit ⟨1, [.field 0 pairTy, .field 2 u32Ty]⟩, "d3"⟩ decls emptyLayoutTable =
+      .fail .ub := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl⟩
 
 /-- **Agreement on projected `Deinit` below an uninitialized root local
 (`evalStmt_deinit_projected_uninit_root_agrees`)**: when `place.local_` is live `.uninit` in both
@@ -17982,11 +18474,13 @@ private theorem checkSlotProjectionOk_init_eq_isSome_deinitFieldSlot_aux (ts : B
 /-- **Two-Sided Initialized-Root Projected `Drop` Operational Equivalence
 (`evalLoweredTerminator_drop_projected_init_iff`)**: on a well-formed block ending in
 `.drop place target u` (`place.projection ≠ []`, `projectionHasDeref = false`, `placeTouchesUnion = false`)
-with an initialized aggregate root `rootVal` (`valueContainsUninit rootVal = false`,
-`DeinitInitChainOk rootVal place.projection`), Anneal's `evalLoweredTerminator` and Trusted's
-`evalTerminator` step iff the other steps, fault (`none` ↔ `.fail .ub`) iff the other faults, and
-when `ts = true ∨ noDowncast place.projection = true` produce the **exact same** post-drop
-deinitialized local frame under `evalDeinitPlace` and `LocalSlotState.toTrustedSlotExact` (`=`). -/
+with a fully initialized aggregate root `rootVal` (`valueContainsUninit rootVal = false`,
+`DeinitInitChainOk rootVal place.projection`, restricting to `.field`/`.downcast` projections without
+intermediate `Value.uninit` or array/slice indexing as documented on `DeinitInitChainOk`), Anneal's
+`evalLoweredTerminator` and Trusted's `evalTerminator` step iff the other steps, fault (`none` ↔
+`.fail .ub`) iff the other faults, and when `ts = true ∨ noDowncast place.projection = true` produce
+the **exact same** post-drop deinitialized local frame under `evalDeinitPlace` and
+`LocalSlotState.toTrustedSlotExact` (`=`). -/
 theorem evalLoweredTerminator_drop_projected_init_iff {env : CfgEnv} {body : LBody}
     {bb : Nat} {ts : Bool} {slots : List LocalSlotState} {unwinding : Option Nat}
     {s : MachineState} {b : LBlock} {place : Place} {target : Nat} {u : UnwindAction}

@@ -717,13 +717,131 @@ theorem evalScalarBinOp_eq_withMem
   | true => rfl
   | false =>
     dsimp only
-    cases op <;> dsimp only
-    all_goals
-      repeat' (first
-        | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok
-        | exact evalSignedDiv_eq_withMem ..
-        | exact evalSignedRem_eq_withMem ..
-        | split)
+    cases op with
+    | shl | shr =>
+      dsimp only
+      cases Nat.beq rhs.sizeBytes 0 <;> rfl
+    | shlUnchecked | shrUnchecked =>
+      dsimp only
+      cases Nat.beq rhs.sizeBytes 0 with
+      | true => rfl
+      | false =>
+        dsimp only
+        cases Nat.ble (Nat.mul lhs.sizeBytes 8) rhs.bits <;> rfl
+    | add | addWithOverflow | mul | mulWithOverflow
+    | bitAnd | bitOr | bitXor | eq | ne | lt | le | gt | ge | offset =>
+      dsimp only
+      cases Nat.beq lhs.sizeBytes rhs.sizeBytes <;> rfl
+    | addUnchecked =>
+      dsimp only
+      cases Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rfl
+      | true =>
+        dsimp only
+        cases isSigned with
+        | false =>
+          dsimp only
+          cases Nat.ble (scalarModulus lhs.sizeBytes) (Nat.add lhs.bits rhs.bits) <;> rfl
+        | true =>
+          dsimp only
+          cases signedOverflowAdd lhs.bits rhs.bits lhs.sizeBytes <;> rfl
+    | sub =>
+      dsimp only
+      cases Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rfl
+      | true =>
+        dsimp only
+        cases Nat.ble rhs.bits lhs.bits <;> rfl
+    | subUnchecked =>
+      dsimp only
+      cases Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rfl
+      | true =>
+        dsimp only
+        cases isSigned with
+        | false =>
+          dsimp only
+          cases Nat.ble rhs.bits lhs.bits with
+          | false => rfl
+          | true =>
+            dsimp only
+            cases Nat.ble (scalarModulus lhs.sizeBytes) (Nat.sub lhs.bits rhs.bits) <;> rfl
+        | true =>
+          dsimp only
+          cases signedOverflowSub lhs.bits rhs.bits lhs.sizeBytes <;> rfl
+    | subWithOverflow =>
+      dsimp only
+      cases Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rfl
+      | true =>
+        dsimp only
+        cases isSigned with
+        | false =>
+          dsimp only
+          cases Nat.ble rhs.bits lhs.bits <;> rfl
+        | true => rfl
+    | mulUnchecked =>
+      dsimp only
+      cases Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rfl
+      | true =>
+        dsimp only
+        cases isSigned with
+        | false =>
+          dsimp only
+          cases Nat.ble (scalarModulus lhs.sizeBytes) (Nat.mul lhs.bits rhs.bits) <;> rfl
+        | true =>
+          dsimp only
+          cases signedOverflowMul lhs.bits rhs.bits lhs.sizeBytes <;> rfl
+    | div =>
+      dsimp only
+      cases Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rfl
+      | true =>
+        dsimp only
+        cases Nat.beq rhs.bits 0 with
+        | true => rfl
+        | false =>
+          dsimp only
+          cases isSigned with
+          | false => rfl
+          | true => exact evalSignedDiv_eq_withMem ..
+    | rem =>
+      dsimp only
+      cases Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rfl
+      | true =>
+        dsimp only
+        cases Nat.beq rhs.bits 0 with
+        | true => rfl
+        | false =>
+          dsimp only
+          cases isSigned with
+          | false => rfl
+          | true => exact evalSignedRem_eq_withMem ..
+    | cmp =>
+      dsimp only
+      cases Nat.beq lhs.sizeBytes rhs.sizeBytes with
+      | false => rfl
+      | true =>
+        dsimp only
+        cases isSigned with
+        | false =>
+          dsimp only
+          cases Nat.beq lhs.bits rhs.bits with
+          | true => rfl
+          | false =>
+            dsimp only
+            cases Nat.ble lhs.bits rhs.bits <;> rfl
+        | true =>
+          dsimp only
+          cases Nat.beq (wrapScalarBits lhs.bits (scalarModulus lhs.sizeBytes))
+              (wrapScalarBits rhs.bits (scalarModulus lhs.sizeBytes)) with
+          | true => rfl
+          | false =>
+            dsimp only
+            cases signedLt (wrapScalarBits lhs.bits (scalarModulus lhs.sizeBytes))
+                (wrapScalarBits rhs.bits (scalarModulus lhs.sizeBytes)) lhs.sizeBytes <;> rfl
 
 theorem evalUnaryNot_eq_withMem
     (sc : ScalarInt) (optTy : Option Ty) (locals : List LocalSlot)
@@ -3041,8 +3159,10 @@ theorem mirNoCallWpConverges_of_pureExec
             | inl _ => exact ih (k PUnit.unit) h_st
             | inr _ =>
               exfalso
+              have h_ac : ({ s with memory := emptyMemory } : MachineState).memory.activeCallee = none := rfl
               unfold stepMirFn at h_step
-              dsimp only [emptyMemory, Option.getD] at h_step
+              rw [h_ac] at h_step
+              dsimp only [Option.getD] at h_step
               cases h_ph : body.phase with
               | other _ =>
                 rw [h_ph] at h_step
@@ -3062,29 +3182,195 @@ theorem mirNoCallWpConverges_of_pureExec
                   cases h_stmt : get? bb.statements (s.frame.stmtIdx : Nat) with
                   | some stmt =>
                     rw [h_stmt] at h_step
+                    dsimp only at h_step
                     have h_s := list_all_of_get? h_stmts h_stmt
                     rcases stmt with ⟨skind, sspan⟩
-                    cases skind
-                    case intrinsic i =>
-                      cases i <;> try exact False.elim (Bool.false_ne_true h_s)
-                      all_goals
-                        dsimp only [evalStmt, evalSetDiscriminantDerefWrite, evalForeignFrameDerefWrite, evalSetDiscriminantLocal] at h_step
-                        repeat' (first | cases h_step | split at h_step)
-                    all_goals
-                      try exact False.elim (Bool.false_ne_true h_s)
-                    all_goals
-                      dsimp only [evalStmt, evalSetDiscriminantDerefWrite, evalForeignFrameDerefWrite, evalSetDiscriminantLocal] at h_step
+                    cases skind with
+                    | nop | coverage | constEvalCounter =>
+                      dsimp only [evalStmt] at h_step; cases h_step
+                    | backwardIncompatibleDropHint _ | retag _ _ =>
+                      exact False.elim (Bool.false_ne_true h_s)
+                    | storageLive loc =>
+                      dsimp only [evalStmt, emptyMemory] at h_step
+                      cases h1 : get? s.frame.locals loc <;> rw [h1] at h_step
+                      · cases h_step
+                      · rename_i sl; cases sl <;> dsimp only at h_step <;>
+                          (try cases h_step) <;>
+                          (cases h2 : set? s.frame.locals loc .uninit <;> rw [h2] at h_step <;> cases h_step)
+                    | storageDead loc =>
+                      dsimp only [evalStmt, emptyMemory] at h_step
+                      cases h1 : get? s.frame.locals loc <;> rw [h1] at h_step
+                      · cases h_step
+                      · rename_i sl; cases sl <;> dsimp only at h_step <;>
+                          (try cases h_step) <;>
+                          (cases h2 : set? s.frame.locals loc .dead <;> rw [h2] at h_step <;> cases h_step)
+                    | placeMention p =>
+                      dsimp only [evalStmt] at h_step
                       repeat' (first | cases h_step | split at h_step)
+                    | deinit p =>
+                      rw [evalStmt_deinit_borrows_nil (s := { s with memory := emptyMemory }) rfl] at h_step
+                      unfold evalDeinitBorrowsNil at h_step
+                      rcases p with ⟨loc, _ | ⟨phd, ptl⟩⟩
+                      · dsimp only at h_step
+                        cases h1 : get? s.frame.locals loc with
+                        | none => rw [h1] at h_step; cases h_step
+                        | some sl =>
+                          rw [h1] at h_step
+                          cases sl with
+                          | dead => cases h_step
+                          | uninit | init _ =>
+                            dsimp only at h_step
+                            cases h2 : set? s.frame.locals loc .uninit <;> rw [h2] at h_step <;> cases h_step
+                      · dsimp only at h_step
+                        cases h1 : get? s.frame.locals loc with
+                        | none => rw [h1] at h_step; cases h_step
+                        | some sl =>
+                          rw [h1] at h_step
+                          cases sl with
+                          | dead => cases h_step
+                          | uninit =>
+                            dsimp only at h_step
+                            cases h2 : deinitTailOk s.frame.locals body.localDecls body.layouts
+                                (placeTy body.localDecls body.layouts { local_ := loc, projection := .nil })
+                                (phd :: ptl) <;> rw [h2] at h_step
+                            · dsimp only at h_step
+                              cases h3 : projectionHasDeref (phd :: ptl) <;> rw [h3] at h_step <;> cases h_step
+                            · cases h_step
+                          | init rv =>
+                            dsimp only at h_step
+                            cases h2 : deinitProjectedForLocal s.frame.locals body.localDecls body.layouts loc rv (phd :: ptl) <;>
+                                rw [h2] at h_step
+                            · dsimp only at h_step
+                              cases h3 : set? s.frame.locals loc _ <;> rw [h3] at h_step <;> cases h_step
+                            · cases h_step
+                            · cases h_step
+                    | intrinsic i =>
+                      cases i with
+                      | copyNonOverlapping _ _ _ => exact False.elim (Bool.false_ne_true h_s)
+                      | assume op =>
+                        dsimp only [evalStmt] at h_step
+                        cases h1 : evalOperand s.frame.locals op _ _ _ _ _ _ <;> rw [h1] at h_step
+                        · rename_i v _; cases v <;> try dsimp only at h_step
+                          · cases h_step
+                          · rename_i sc
+                            cases h2 : Bool.and (Nat.beq sc.sizeBytes 1) (Nat.beq sc.bits 1) <;>
+                              rw [h2] at h_step <;> cases h_step
+                          · cases h_step
+                          · cases h_step
+                          · cases h_step
+                        · cases h_step
+                        · cases h_step
+                    | setDiscriminant p vi =>
+                      simp only [isPureStatement] at h_s
+                      rcases p with ⟨loc, _ | ⟨phd, ptl⟩⟩
+                      · dsimp only [evalStmt, evalSetDiscriminantLocal, emptyMemory] at h_step
+                        cases h1 : get? s.frame.locals loc with
+                        | none => rw [h1] at h_step; cases h_step
+                        | some sl =>
+                          rw [h1] at h_step
+                          cases sl with
+                          | dead => cases h_step
+                          | uninit =>
+                            dsimp only at h_step
+                            cases h2 : setDiscriminantUninitDeclOk body.localDecls loc <;> rw [h2] at h_step
+                            · cases h_step
+                            · dsimp only at h_step
+                              cases h3 : setDiscriminantUninitPayload? body.localDecls body.layouts loc vi <;>
+                                  rw [h3] at h_step
+                              · cases h_step
+                              · dsimp only at h_step
+                                cases h4 : set? s.frame.locals loc _ <;> rw [h4] at h_step <;> cases h_step
+                          | init rv =>
+                            cases rv with
+                            | aggregate _ fields =>
+                              dsimp only at h_step
+                              cases h2 : padSetDiscriminantInitFields? body.localDecls body.layouts ⟨loc, .nil⟩ vi fields <;>
+                                  rw [h2] at h_step
+                              · cases h_step
+                              · dsimp only at h_step
+                                cases h3 : set? s.frame.locals loc _ <;> rw [h3] at h_step <;> cases h_step
+                            | _ => cases h_step
+                      · simp only [isPurePlace, List.all_cons, Bool.and_eq_true] at h_s
+                        have h_nd := ne_deref_of_isPureProjElem h_s.1
+                        rw [evalStmt_setDiscriminant_nonDeref _ _ _ _ _ _ _ _ h_nd] at h_step
+                        dsimp only [emptyMemory] at h_step
+                        cases h1 : evalOperand s.frame.locals _ _ _ _ _ _ _ <;> rw [h1] at h_step
+                        · rename_i rv _
+                          cases rv with
+                          | aggregate _ fields =>
+                            dsimp only at h_step
+                            cases h2 : padSetDiscriminantInitFields? body.localDecls body.layouts _ vi fields <;>
+                                rw [h2] at h_step
+                            · cases h_step
+                            · dsimp only at h_step
+                              cases h3 : writePlaceValue _ _ _ _ _ _ _ <;> rw [h3] at h_step <;> cases h_step
+                          | _ => cases h_step
+                        · cases h_step
+                        · cases h_step
+                    | assign dst rv =>
+                      simp only [isPureStatement, Bool.and_eq_true] at h_s
+                      rw [evalStmt_assign_eq] at h_step
+                      cases h1 : evalRvalue s.frame.locals rv emptyMemory body.localDecls body.layouts <;>
+                          rw [h1] at h_step
+                      · dsimp only at h_step
+                        rcases dst with ⟨dLoc, _ | ⟨dhd, dtl⟩⟩
+                        · unfold evalAssignDst at h_step; dsimp only at h_step
+                          repeat' (first | cases h_step | split at h_step)
+                        · have h_dst := h_s.1
+                          simp only [isPurePlace, List.all_cons, Bool.and_eq_true] at h_dst
+                          have h_nd := ne_deref_of_isPureProjElem h_dst.1
+                          rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd] at h_step
+                          unfold evalAssignNonDeref at h_step; dsimp only at h_step
+                          repeat' (first | cases h_step | split at h_step)
+                      · cases h_step
+                      · cases h_step
                   | none =>
                     rw [h_stmt] at h_step
                     dsimp only at h_step
                     split at h_step
                     · rcases bb with ⟨_, ⟨tkind, tspan⟩, _⟩
-                      cases tkind <;>
-                        try exact False.elim (Bool.false_ne_true h_term)
-                      all_goals
-                        dsimp only [evalTerminator] at h_step
-                        repeat' (first | cases h_step | split at h_step)
+                      cases tkind with
+                      | drop p target _ =>
+                        rw [evalTerminator_drop_borrows_nil (s := { s with memory := emptyMemory }) rfl] at h_step
+                        unfold evalDropBorrowsNil at h_step
+                        dsimp only at h_step
+                        cases h1 : get? s.frame.locals p.local_ with
+                        | none => rw [h1] at h_step; cases h_step
+                        | some sl =>
+                          rw [h1] at h_step
+                          cases sl with
+                          | dead => cases h_step
+                          | uninit =>
+                            dsimp only at h_step
+                            cases h2 : p.projection with
+                            | nil =>
+                              rw [h2] at h_step; dsimp only at h_step
+                              cases h3 : set? s.frame.locals p.local_ .uninit <;> rw [h3] at h_step <;> cases h_step
+                            | cons phd ptl =>
+                              rw [h2] at h_step; dsimp only at h_step
+                              cases h3 : deinitTailOk s.frame.locals _ _ _ (phd :: ptl) <;> rw [h3] at h_step
+                              · dsimp only at h_step
+                                cases h4 : projectionHasDeref (phd :: ptl) <;> rw [h4] at h_step <;> cases h_step
+                              · cases h_step
+                          | init rv =>
+                            dsimp only at h_step
+                            cases h2 : p.projection with
+                            | nil =>
+                              rw [h2] at h_step; dsimp only at h_step
+                              cases h3 : set? s.frame.locals p.local_ .uninit <;> rw [h3] at h_step <;> cases h_step
+                            | cons phd ptl =>
+                              rw [h2] at h_step; dsimp only at h_step
+                              cases h3 : deinitProjectedForLocal s.frame.locals _ _ p.local_ rv (phd :: ptl) <;>
+                                  rw [h3] at h_step
+                              · dsimp only at h_step
+                                cases h4 : set? s.frame.locals p.local_ _ <;> rw [h4] at h_step <;> cases h_step
+                              · cases h_step
+                              · cases h_step
+                      | _ =>
+                        first
+                        | exact False.elim (Bool.false_ne_true h_term)
+                        | (dsimp only [evalTerminator] at h_step
+                           repeat' (first | cases h_step | split at h_step))
                     · cases h_step
   exact ⟨fuel, wpMirExecNoCallSym_withMem_of_emptyMemory
     (.running ((initPureState body args).toMachineState emptyMemory))
@@ -4446,18 +4732,9 @@ theorem evalScalarBinOp_pushBaseStack
         (Memory.pushBaseStack calleeBody baseStack mem) isSigned =
       RvalueEvalResult.pushBaseStack calleeBody baseStack
         (evalScalarBinOp op lhs rhs locals mem isSigned) := by
-  unfold evalScalarBinOp
-  cases Nat.beq lhs.sizeBytes 0 with
-  | true => rfl
-  | false =>
-    dsimp only
-    cases op <;> dsimp only
-    all_goals
-      repeat' (first
-        | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl
-        | exact evalSignedDiv_pushBaseStack ..
-        | exact evalSignedRem_pushBaseStack ..
-        | split)
+  rw [evalScalarBinOp_eq_withMem _ _ _ _ (Memory.pushBaseStack calleeBody baseStack mem),
+      evalScalarBinOp_eq_withMem _ _ _ _ mem]
+  cases evalScalarBinOp op lhs rhs locals emptyMemory isSigned <;> rfl
 
 theorem evalUnaryNot_pushBaseStack
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
@@ -4467,8 +4744,9 @@ theorem evalUnaryNot_pushBaseStack
         (Memory.pushBaseStack calleeBody baseStack mem) =
       RvalueEvalResult.pushBaseStack calleeBody baseStack
         (evalUnaryNot sc optTy locals mem) := by
-  unfold evalUnaryNot
-  repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
+  rw [evalUnaryNot_eq_withMem _ _ _ (Memory.pushBaseStack calleeBody baseStack mem),
+      evalUnaryNot_eq_withMem _ _ _ mem]
+  cases evalUnaryNot sc optTy locals emptyMemory <;> rfl
 
 theorem evalRvalueRefDeref_pushBaseStack
     (calleeBody : CapturedMir)
@@ -4494,13 +4772,36 @@ theorem evalRvalueRawPtr_pushBaseStack
         (Memory.pushBaseStack calleeBody [] mem) localDecls layouts =
       RvalueEvalResult.pushBaseStack calleeBody []
         (evalRvalueRawPtr locals mutability place mem localDecls layouts) := by
-  dsimp only [evalRvalueRawPtr, Memory.pushBaseStack]
-  repeat' (first
-    | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl
-    | exact evalSliceFatPtrDerefBorrow_pushBaseStack calleeBody ..
-    | exact evalGlobalThinPtrDerefBorrow_pushBaseStack calleeBody [] ..
-    | exact evalScalarSliceFatPtrDerefRaw_pushBaseStack calleeBody [] ..
-    | split)
+  rcases place with ⟨pLoc, _ | ⟨phd, restProj⟩⟩
+  · dsimp only [evalRvalueRawPtr, Memory.pushBaseStack]
+    cases get? locals pLoc with
+    | none => rfl
+    | some sl => cases sl <;> rfl
+  · cases phd with
+    | deref =>
+      dsimp only [evalRvalueRawPtr, Memory.pushBaseStack]
+      repeat' (first
+        | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl
+        | exact evalSliceFatPtrDerefBorrow_pushBaseStack calleeBody ..
+        | exact evalGlobalThinPtrDerefBorrow_pushBaseStack calleeBody [] ..
+        | exact evalScalarSliceFatPtrDerefRaw_pushBaseStack calleeBody [] ..
+        | split)
+    | _ =>
+      dsimp only [evalRvalueRawPtr, Memory.pushBaseStack]
+      cases get? locals pLoc with
+      | none => rfl
+      | some sl =>
+        cases sl with
+        | dead => rfl
+        | uninit | init _ =>
+          dsimp only
+          cases resolveBorrowProjectionElems locals _ with
+          | none => rfl
+          | some rp =>
+            dsimp only
+            cases projHasSubslice rp with
+            | false => rfl
+            | true => dsimp only; cases validateNonDerefSubslices locals localDecls layouts pLoc _ rp <;> rfl
 
 theorem evalCastPtrToPtr_pushBaseStack
     (calleeBody : CapturedMir)
@@ -5244,16 +5545,26 @@ theorem evalCopyNonOverlappingWithCount_eq
   cases Nat.beq countBits 0 with
   | true => rfl
   | false =>
+    dsimp only
     cases srcVal with
     | ptr srcPtr _ =>
       cases dstVal with
       | ptr dstPtr _ =>
+        dsimp only
         cases lookupBorrow s.memory.borrows srcPtr.tag with
         | none => rfl
         | some srcEntry =>
           cases lookupBorrow s.memory.borrows dstPtr.tag with
           | none => rfl
           | some dstEntry =>
+            dsimp only
+            have h_ok :
+                _root_.Trusted.Rustc.V2026_06_01.MirSemantics.evalCopyNonOverlappingPermOk
+                  s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃ =
+                evalCopyNonOverlappingPermOk
+                  s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃ :=
+              rfl
+            rw [h_ok]
             cases srcEntry.perm <;> cases dstEntry.perm <;> rfl
       | _ => rfl
     | _ => rfl
@@ -6359,11 +6670,31 @@ theorem evalStmt_isStmtNode
     (s : MachineState) (stmt : Statement)
     (localDecls : List LocalDecl) (layouts : LayoutTable) :
     IsStmtNode (evalStmt s stmt localDecls layouts) := by
+  have h_ff : ∀ l₁ m₁ dst rp v,
+      IsStmtNode (evalForeignFrameDerefWrite s l₁ m₁ dst rp v localDecls layouts) := by
+    intro l₁ m₁ dst rp v
+    unfold evalForeignFrameDerefWrite
+    cases foreignFrameDerefWrite l₁ m₁ dst rp v localDecls layouts with
+    | ok _ _ => exact Or.inl ⟨_, rfl⟩
+    | ub => exact Or.inr (Or.inl ⟨_, rfl⟩)
+    | unsupported => exact Or.inr (Or.inr rfl)
   rcases stmt with ⟨kind, sp⟩
   cases kind with
   | nop | coverage | constEvalCounter | backwardIncompatibleDropHint _ =>
     exact Or.inl ⟨_, rfl⟩
-  | placeMention _ | storageLive _ | storageDead _ =>
+  | placeMention p =>
+    unfold evalStmt; dsimp only
+    cases get? s.frame.locals p.local_ with
+    | none => exact Or.inr (Or.inl ⟨_, rfl⟩)
+    | some sl =>
+      cases sl with
+      | dead => exact Or.inr (Or.inl ⟨_, rfl⟩)
+      | uninit | init _ =>
+        dsimp only
+        cases placeMentionOperandsInit s.frame.locals _ p.projection with
+        | true => exact Or.inl ⟨_, rfl⟩
+        | false => exact Or.inr (Or.inl ⟨_, rfl⟩)
+  | storageLive _ | storageDead _ =>
     unfold evalStmt; dsimp only
     repeat' (first
       | exact Or.inl ⟨_, rfl⟩
@@ -6378,13 +6709,20 @@ theorem evalStmt_isStmtNode
     exact evalStmt_setDiscriminant_isStmtNode s p vi sp localDecls layouts
   | intrinsic intr =>
     cases intr with
-    | assume _ =>
+    | assume op =>
       unfold evalStmt; dsimp only
-      repeat' (first
-        | exact Or.inl ⟨_, rfl⟩
-        | exact Or.inr (Or.inl ⟨_, rfl⟩)
-        | exact Or.inr (Or.inr rfl)
-        | split)
+      cases evalOperand s.frame.locals op s.memory.borrows s.memory.globals layouts
+          s.memory.callerLocals localDecls s.memory.callStack with
+      | ub => exact Or.inr (Or.inl ⟨_, rfl⟩)
+      | unsupported => exact Or.inr (Or.inr rfl)
+      | ok v _ =>
+        cases v with
+        | scalar sc =>
+          dsimp only
+          cases Bool.and (Nat.beq sc.sizeBytes 1) (Nat.beq sc.bits 1) with
+          | true => exact Or.inl ⟨_, rfl⟩
+          | false => exact Or.inr (Or.inl ⟨_, rfl⟩)
+        | _ => exact Or.inr (Or.inl ⟨_, rfl⟩)
     | copyNonOverlapping src dst count =>
       exact evalCopyNonOverlapping_isStmtNode s src dst count localDecls layouts
   | assign dst rv =>
@@ -6398,20 +6736,56 @@ theorem evalStmt_isStmtNode
       cases dstProj with
       | nil =>
         unfold evalAssignDst; dsimp only
-        repeat' (first
-          | exact Or.inl ⟨_, rfl⟩
-          | exact Or.inr (Or.inl ⟨_, rfl⟩)
-          | exact Or.inr (Or.inr rfl)
-          | split)
+        cases get? locals₁ dstLoc with
+        | none => exact Or.inr (Or.inl ⟨_, rfl⟩)
+        | some sl =>
+          cases sl with
+          | dead => exact Or.inr (Or.inl ⟨_, rfl⟩)
+          | uninit | init _ =>
+            dsimp only
+            cases set? locals₁ dstLoc (.init val) with
+            | none => exact Or.inr (Or.inl ⟨_, rfl⟩)
+            | some _ =>
+              cases mem₁.activeProtectors with
+              | nil => exact Or.inl ⟨_, rfl⟩
+              | cons ph pt =>
+                dsimp only
+                cases hasProtectedWriteConflict mem₁.borrows (ph :: pt) dstLoc .none .nil 0 0
+                    (length mem₁.callStack) with
+                | true => exact Or.inr (Or.inl ⟨_, rfl⟩)
+                | false => exact Or.inl ⟨_, rfl⟩
       | cons hd tl =>
         by_cases h_d : hd = .deref
         · subst h_d
-          unfold evalAssignDst evalForeignFrameDerefWrite; dsimp only
-          repeat' (first
-            | exact Or.inl ⟨_, rfl⟩
-            | exact Or.inr (Or.inl ⟨_, rfl⟩)
-            | exact Or.inr (Or.inr rfl)
-            | split)
+          unfold evalAssignDst; dsimp only
+          cases evalPlaceWrite locals₁ mem₁.borrows ⟨dstLoc, .deref :: tl⟩ val
+              mem₁.activeProtectors localDecls layouts mem₁.callStack with
+          | unsupported => exact Or.inr (Or.inr rfl)
+          | ok _ =>
+            dsimp only
+            cases derefWriteTreeUB locals₁ mem₁.borrows ⟨dstLoc, .deref :: tl⟩ ||
+                derefWriteUnionProtectorUB localDecls layouts locals₁ mem₁.borrows
+                  mem₁.activeProtectors ⟨dstLoc, .deref :: tl⟩ tl mem₁.callStack with
+            | true => exact Or.inr (Or.inl ⟨_, rfl⟩)
+            | false => exact Or.inl ⟨_, rfl⟩
+          | ub =>
+            dsimp only
+            cases mem₁.callStack with
+            | cons _ _ => exact h_ff ..
+            | nil =>
+              cases mem₁.callerLocals with
+              | nil => exact Or.inr (Or.inl ⟨_, rfl⟩)
+              | cons _ _ =>
+                dsimp only
+                cases evalCallerPlaceWrite locals₁ _ mem₁.borrows ⟨dstLoc, .deref :: tl⟩ val
+                    mem₁.activeProtectors with
+                | ub => exact Or.inr (Or.inl ⟨_, rfl⟩)
+                | unsupported => exact Or.inr (Or.inr rfl)
+                | ok _ =>
+                  dsimp only
+                  cases derefWriteTreeUB locals₁ mem₁.borrows ⟨dstLoc, .deref :: tl⟩ with
+                  | true => exact Or.inr (Or.inl ⟨_, rfl⟩)
+                  | false => exact Or.inl ⟨_, rfl⟩
         · rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_d]
           unfold evalAssignNonDeref; dsimp only
           repeat' (first
@@ -7285,14 +7659,36 @@ private theorem writePlaceValue_deref_nil_borrows
     (cs : List SavedCallerFrame) :
     writePlaceValue locals [] ⟨loc, .deref :: tl⟩ val ld ly cs = .ub := by
   unfold writePlaceValue
+  dsimp only [lookupBorrow]
   cases get? locals loc with
   | none => rfl
   | some sl =>
     cases sl with
     | uninit | dead => rfl
     | init v =>
-      rcases v with _ | _ | ⟨_, _⟩ | ⟨_ | _, _ | ⟨_ | _, _ | ⟨_ | _, _ | _⟩⟩⟩ <;>
-        (dsimp only; repeat' (first | rfl | split))
+      cases v with
+      | unit | scalar _ | ptr _ _ | uninit => rfl
+      | aggregate var fields =>
+        cases var with
+        | succ _ => rfl
+        | zero =>
+          cases fields with
+          | nil => rfl
+          | cons f1 tl1 =>
+            cases f1 with
+            | unit | scalar _ | aggregate _ _ | uninit => rfl
+            | ptr ptrVal ptrSz =>
+              cases tl1 with
+              | nil => rfl
+              | cons f2 tl2 =>
+                cases f2 with
+                | unit | ptr _ _ | aggregate _ _ | uninit => rfl
+                | scalar lenSc =>
+                  cases tl2 with
+                  | cons _ _ => rfl
+                  | nil =>
+                    simp only [Nat.zero_eq]
+                    split <;> rfl
 
 theorem evalPlaceWrite_deref_nil_borrows
     (locals : List LocalSlot) (loc : Local) (tl : List ProjectionElem)
@@ -7303,9 +7699,15 @@ theorem evalPlaceWrite_deref_nil_borrows
   have hw := writePlaceValue_deref_nil_borrows locals loc tl val ld ly cs
   cases ap with
   | nil => exact hw
-  | cons _ _ =>
-    dsimp only
-    repeat' (first | exact hw | rfl | split)
+  | cons ph pt =>
+    dsimp only [lookupBorrow]
+    cases get? locals loc with
+    | none => exact hw
+    | some sl =>
+      cases sl with
+      | uninit | dead => exact hw
+      | init pv =>
+        cases h2 : extractDerefPtrVal? pv <;> (simp only [h2]; exact hw)
 
 theorem writePlaceValue_nil_borrows_callStack
     (locals : List LocalSlot) (dst : Place) (val : Value)
@@ -7969,7 +8371,7 @@ theorem evalDirectRustIntrinsic?_pushBaseStack_of_noCallWP
                 cases isDirectExactDivTarget rtTarget with
                 | true =>
                   dsimp only
-                  rcases unpackedArgs with _ | ⟨_ | lhs | _ | _, _ | ⟨_ | rhs | _ | _, _ | _⟩⟩ <;>
+                  rcases unpackedArgs with _ | ⟨_ | lhs | _ | _ | _, _ | ⟨_ | rhs | _ | _ | _, _ | _⟩⟩ <;>
                     try (intro h_st; exact False.elim h_st)
                   dsimp only
                   cases
@@ -7993,15 +8395,19 @@ theorem evalDirectRustIntrinsic?_pushBaseStack_of_noCallWP
                   dsimp only
                   cases classifyRustIntrinsic? rtTarget.defPath with
                   | some rtKind =>
+                    have h_ns := fun (k : RustIntrinsicKind) =>
+                      evalNonSelectIntrinsicCall_pushBaseStack_of_noCallWP
+                        calleeBody baseStack k ms
+                        (withConstEvalSelectIntrinsicTypeArgs rtTarget
+                          (selectTupleTyOpt target.typeArgs) (isPtrPointeeIntrinsicKind k))
+                        curBody.localDecls curBody.layouts
+                        (constEvalSelectTupleArgOps (selectTupleTyOpt target.typeArgs))
+                        unpackedArgs locals' destination targetBb (Q := Q) (P := P)
                     cases rtKind <;>
                       first
                       | (intro h_st; exact False.elim h_st)
-                      | (dsimp only
-                         intro h_st
-                         rcases evalNonSelectIntrinsicCall_pushBaseStack_of_noCallWP
-                             calleeBody baseStack _ ms _ curBody.localDecls
-                             curBody.layouts _ unpackedArgs locals' destination targetBb h_st h_bor with
-                           ⟨nextSt, h1, h2⟩
+                      | (intro h_st
+                         rcases h_ns _ h_st h_bor with ⟨nextSt, h1, h2⟩
                          exact ⟨nextSt, h1, congrArg some h2⟩)
                   | none =>
                     dsimp only
@@ -8105,8 +8511,29 @@ theorem evalPlaceRead_nil_borrows_callStack
         cases sl with
         | uninit | dead => rfl
         | init v =>
-          rcases v with _ | _ | ⟨_, _⟩ | ⟨_ | _, _ | ⟨_ | _, _ | ⟨_ | _, _ | _⟩⟩⟩ <;>
-            first | rfl | exact evalSliceFatPtrDerefRead_nil_borrows_callStack ..
+          cases v with
+          | unit | scalar _ | ptr _ _ | uninit => rfl
+          | aggregate var fields =>
+            cases var with
+            | succ _ => rfl
+            | zero =>
+              cases fields with
+              | nil => rfl
+              | cons f1 tl1 =>
+                cases f1 with
+                | unit | scalar _ | aggregate _ _ | uninit => rfl
+                | ptr ptrVal ptrSz =>
+                  cases tl1 with
+                  | nil => rfl
+                  | cons f2 tl2 =>
+                    cases f2 with
+                    | unit | ptr _ _ | aggregate _ _ | uninit => rfl
+                    | scalar lenSc =>
+                      cases tl2 with
+                      | cons _ _ => rfl
+                      | nil =>
+                        simp only [Nat.zero_eq]
+                        exact evalSliceFatPtrDerefRead_nil_borrows_callStack ..
     | _ => rfl
 
 theorem evalOperand_nil_borrows_callStack
@@ -8132,8 +8559,30 @@ theorem evalOperand_nil_borrows_callStack
           cases sl with
           | uninit | dead => rfl
           | init v =>
-            rcases v with _ | _ | ⟨_, _⟩ | ⟨_ | _, _ | ⟨_ | _, _ | ⟨_ | _, _ | _⟩⟩⟩ <;>
-              first | rfl | exact evalSliceFatPtrDerefRead_nil_borrows_callStack ..
+            cases v with
+            | unit | scalar _ | ptr _ _ | uninit => rfl
+            | aggregate var fields =>
+              cases var with
+              | succ _ => rfl
+              | zero =>
+                cases fields with
+                | nil => rfl
+                | cons f1 tl1 =>
+                  cases f1 with
+                  | unit | scalar _ | aggregate _ _ | uninit => rfl
+                  | ptr ptrVal ptrSz =>
+                    cases tl1 with
+                    | nil => rfl
+                    | cons f2 tl2 =>
+                      cases f2 with
+                      | unit | ptr _ _ | aggregate _ _ | uninit => rfl
+                      | scalar lenSc =>
+                        cases tl2 with
+                        | cons _ _ => rfl
+                        | nil =>
+                          simp only [Nat.zero_eq]
+                          cases localDecls <;>
+                            exact evalSliceFatPtrDerefRead_nil_borrows_callStack ..
       | _ => rfl
 
 theorem evalOperands_nil_borrows_callStack
@@ -8162,20 +8611,48 @@ theorem evalCallerPlaceWrite_deref_nil_borrows
     evalCallerPlaceWrite fl cl [] ⟨loc, .deref :: tl⟩ val ap ld ly cs = .ub := by
   have hw : writeCallerPlaceValue fl cl [] ⟨loc, .deref :: tl⟩ val ld ly cs = .ub := by
     unfold writeCallerPlaceValue
+    dsimp only [lookupBorrow]
     cases get? fl loc with
     | none => rfl
     | some sl =>
       cases sl with
       | uninit | dead => rfl
       | init v =>
-        rcases v with _ | _ | ⟨_, _⟩ | ⟨_ | _, _ | ⟨_ | _, _ | ⟨_ | _, _ | _⟩⟩⟩ <;>
-          (dsimp only; repeat' (first | rfl | split))
+        cases v with
+        | unit | scalar _ | ptr _ _ | uninit => rfl
+        | aggregate var fields =>
+          cases var with
+          | succ _ => rfl
+          | zero =>
+            cases fields with
+            | nil => rfl
+            | cons f1 tl1 =>
+              cases f1 with
+              | unit | scalar _ | aggregate _ _ | uninit => rfl
+              | ptr ptrVal ptrSz =>
+                cases tl1 with
+                | nil => rfl
+                | cons f2 tl2 =>
+                  cases f2 with
+                  | unit | ptr _ _ | aggregate _ _ | uninit => rfl
+                  | scalar lenSc =>
+                    cases tl2 with
+                    | cons _ _ => rfl
+                    | nil =>
+                      simp only [Nat.zero_eq]
+                      split <;> rfl
   unfold evalCallerPlaceWrite
   cases ap with
   | nil => exact hw
-  | cons _ _ =>
-    dsimp only
-    repeat' (first | exact hw | rfl | split)
+  | cons ph pt =>
+    dsimp only [lookupBorrow]
+    cases get? fl loc with
+    | none => exact hw
+    | some sl =>
+      cases sl with
+      | uninit | dead => exact hw
+      | init pv =>
+        cases h2 : extractDerefPtrVal? pv <;> (simp only [h2]; exact hw)
 
 theorem resolveCallTarget_borrows_nil_pushBaseStack
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
@@ -8327,7 +8804,16 @@ private theorem evalSliceFatPtrDerefBorrow_ne_nil
     {l mem pp ps ls rp pm im pt ly cp ld fp ca} (h : mem.borrows ≠ []) :
     rvalOkBorrowsNeNil (evalSliceFatPtrDerefBorrow l mem pp ps ls rp pm im pt ly cp ld fp ca) := by
   unfold evalSliceFatPtrDerefBorrow; dsimp only
-  repeat' (first | exact rok_ub | exact rok_unsup | exact rok_ok h | exact rok_ok_cons | split)
+  cases Bool.and (Nat.beq ps (layoutPointerBytes ly)) (Nat.beq ls.sizeBytes (layoutPointerBytes ly)) with
+  | false => exact rok_ub
+  | true =>
+    dsimp only
+    cases resolveBorrowProjectionElems l (stripTransparentProjections rp) with
+    | none => exact rok_ub
+    | some _ =>
+      dsimp only
+      cases lookupBorrow mem.borrows pp.tag <;>
+        repeat' (first | exact rok_ub | exact rok_unsup | exact rok_ok h | exact rok_ok_cons | split)
 
 private theorem evalGlobalThinPtrDerefBorrow_ne_nil
     {l mem al pp ps rp im pt ly ld rm fp} (h : mem.borrows ≠ []) :
@@ -8391,22 +8877,11 @@ private theorem evalByteCast_ne_nil {locals op ty mem ld ly} (h : mem.borrows �
 
 private theorem evalScalarBinOp_ne_nil {op lhs rhs l mem sgn} (h : mem.borrows ≠ []) :
     rvalOkBorrowsNeNil (evalScalarBinOp op lhs rhs l mem sgn) := by
-  have h_sdiv (a b sz l0) : rvalOkBorrowsNeNil (evalSignedDiv a b sz l0 mem) := by
-    unfold evalSignedDiv; dsimp only; split <;> first | exact rok_ub | exact rok_ok h
-  have h_srem (a b sz l0) : rvalOkBorrowsNeNil (evalSignedRem a b sz l0 mem) := by
-    unfold evalSignedRem; dsimp only; split <;> first | exact rok_ub | exact rok_ok h
-  unfold evalScalarBinOp
-  cases Nat.beq lhs.sizeBytes 0 with
-  | true => dsimp only; exact rok_unsup
-  | false =>
-    dsimp only; cases op <;> dsimp only
-    all_goals repeat' (first
-      | exact rok_ub
-      | exact rok_unsup
-      | exact rok_ok h
-      | exact h_sdiv _ _ _ _
-      | exact h_srem _ _ _ _
-      | split)
+  rw [evalScalarBinOp_eq_withMem]
+  cases evalScalarBinOp op lhs rhs l emptyMemory sgn with
+  | ub => exact rok_ub
+  | unsupported => exact rok_unsup
+  | ok _ _ _ => exact rok_ok h
 
 private theorem evalRvalueRefDeref_ne_nil {locals bk place rp pm mem ld ly} (h : mem.borrows ≠ []) :
     rvalOkBorrowsNeNil (evalRvalueRefDeref locals bk place rp pm mem ld ly) := by
@@ -8423,16 +8898,46 @@ private theorem evalRvalueRefDeref_ne_nil {locals bk place rp pm mem ld ly} (h :
 
 private theorem evalRvalueRawPtr_ne_nil {locals mutab place mem ld ly} (h : mem.borrows ≠ []) :
     rvalOkBorrowsNeNil (evalRvalueRawPtr locals mutab place mem ld ly) := by
-  dsimp only [evalRvalueRawPtr]
-  repeat' (first
-    | exact rok_ub
-    | exact rok_unsup
-    | exact rok_ok h
-    | exact rok_ok_cons
-    | exact evalSliceFatPtrDerefBorrow_ne_nil h
-    | exact evalGlobalThinPtrDerefBorrow_ne_nil h
-    | exact evalScalarSliceFatPtrDerefRaw_ne_nil h
-    | split)
+  rcases place with ⟨pLoc, _ | ⟨phd, restProj⟩⟩
+  · dsimp only [evalRvalueRawPtr]
+    cases get? locals pLoc with
+    | none => exact rok_ub
+    | some sl =>
+      cases sl with
+      | dead => exact rok_ub
+      | uninit | init _ => exact rok_ok_cons
+  · cases phd with
+    | deref =>
+      dsimp only [evalRvalueRawPtr]
+      repeat' (first
+        | exact rok_ub
+        | exact rok_unsup
+        | exact rok_ok h
+        | exact rok_ok_cons
+        | exact evalSliceFatPtrDerefBorrow_ne_nil h
+        | exact evalGlobalThinPtrDerefBorrow_ne_nil h
+        | exact evalScalarSliceFatPtrDerefRaw_ne_nil h
+        | split)
+    | _ =>
+      dsimp only [evalRvalueRawPtr]
+      cases get? locals pLoc with
+      | none => exact rok_ub
+      | some sl =>
+        cases sl with
+        | dead => exact rok_ub
+        | uninit | init _ =>
+          dsimp only
+          cases resolveBorrowProjectionElems locals _ with
+          | none => exact rok_ub
+          | some rp =>
+            dsimp only
+            cases projHasSubslice rp with
+            | false => exact rok_ok_cons
+            | true =>
+              dsimp only
+              cases validateNonDerefSubslices locals ld ly pLoc _ rp with
+              | true => exact rok_ok_cons
+              | false => exact rok_ub
 
 private theorem evalPtrOffsetBinOp_ne_nil {l mem ld ly lhsOp pv sz rs} (h : mem.borrows ≠ []) :
     rvalOkBorrowsNeNil (evalPtrOffsetBinOp l mem ld ly lhsOp pv sz rs) := by
@@ -8538,7 +9043,8 @@ theorem evalRvalue_ok_borrows_ne_nil
   | rawPtr mutab place => exact evalRvalueRawPtr_ne_nil h
   | len place =>
     dsimp only [evalRvalue, evalPlaceLen]
-    repeat' (first | exact rok_ub | exact rok_unsup | exact rok_ok h | split)
+    cases splitLastDeref? place.projection <;>
+      repeat' (first | exact rok_ub | exact rok_unsup | exact rok_ok h | split)
   | cast ck op ty =>
     cases ck with
     | pointerCoercion cs => exact evalReifyFnPointer_ne_nil h
@@ -8566,8 +9072,20 @@ theorem evalRvalue_ok_borrows_ne_nil
   | unaryOp uop op =>
     cases uop with
     | not =>
-      dsimp only [evalRvalue, evalUnaryNot]
-      repeat' (first | exact rok_ub | exact rok_unsup | exact rok_ok h | split)
+      dsimp only [evalRvalue]
+      cases evalOperand locals op mem.borrows mem.globals ly mem.callerLocals ld mem.callStack with
+      | ub => exact rok_ub
+      | unsupported => exact rok_unsup
+      | ok v l' =>
+        cases v with
+        | scalar sc =>
+          dsimp only
+          rw [evalUnaryNot_eq_withMem]
+          cases evalUnaryNot sc (operandTy ld ly op) l' emptyMemory with
+          | ub => exact rok_ub
+          | unsupported => exact rok_unsup
+          | ok _ _ _ => exact rok_ok h
+        | _ => exact rok_unsup
     | neg =>
       dsimp only [evalRvalue]
       repeat' (first | exact rok_ub | exact rok_unsup | exact rok_ok h | split)
@@ -8975,6 +9493,34 @@ private theorem evalTerminator_drop_borrows_ne_nil
               | true => exact sn_fail
               | false => exact sn_step (invalidateConflictingBorrowsAtProj_ne_nil h)
 
+private theorem evalAssignDst_borrows_ne_nil
+    {s : MachineState} {dst : Place} {val : Value}
+    {l1 : List LocalSlot} {m1 : Memory}
+    {ld : List LocalDecl} {ly : LayoutTable}
+    (hm1 : m1.borrows ≠ []) :
+    stmtStepBorrowsNeNil (evalAssignDst s dst val l1 m1 ld ly) := by
+  rcases dst with ⟨dLoc, dProj⟩
+  cases dProj with
+  | nil =>
+    unfold evalAssignDst; try dsimp only
+    repeat' (first | exact sn_fail | exact sn_step (invalidateConflictingBorrows_ne_nil hm1) | split)
+  | cons hd tl =>
+    by_cases h_d : hd = .deref
+    · subst h_d
+      unfold evalAssignDst; try dsimp only
+      repeat' (first
+        | exact sn_fail | exact sn_unsup
+        | exact sn_step (invalidateDerefWriteBorrowsWithLayouts_ne_nil hm1)
+        | exact sn_step (invalidateDerefWriteBorrows_ne_nil hm1)
+        | exact evalForeignFrameDerefWrite_ne_nil hm1
+        | split)
+    · rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_d]
+      unfold evalAssignNonDeref; try dsimp only
+      repeat' (first
+        | exact sn_fail | exact sn_unsup
+        | exact sn_step (invalidateConflictingBorrowsAtProj_ne_nil hm1)
+        | split)
+
 theorem evalStmt_borrows_ne_nil
     {s : MachineState} {stmt : Statement} {ld : List LocalDecl} {ly : LayoutTable}
     (h : s.memory.borrows ≠ []) :
@@ -9045,31 +9591,7 @@ theorem evalStmt_borrows_ne_nil
     | ub => exact sn_fail
     | unsupported => exact sn_unsup
     | ok val l1 m1 =>
-      have hm1 : m1.borrows ≠ [] := evalRvalue_ok_borrows_ne_nil h val l1 m1 h_rv
-      dsimp only
-      rcases dst with ⟨dLoc, dProj⟩
-      cases dProj with
-      | nil =>
-        unfold evalAssignDst; dsimp only
-        repeat' (first | exact sn_fail | exact sn_step (invalidateConflictingBorrows_ne_nil hm1) | split)
-      | cons hd tl =>
-        by_cases h_d : hd = .deref
-        · subst h_d
-          unfold evalAssignDst; dsimp only
-          repeat' (first
-            | exact sn_fail
-            | exact sn_unsup
-            | exact sn_step (invalidateDerefWriteBorrowsWithLayouts_ne_nil hm1)
-            | exact sn_step (invalidateDerefWriteBorrows_ne_nil hm1)
-            | exact evalForeignFrameDerefWrite_ne_nil hm1
-            | split)
-        · rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_d]
-          unfold evalAssignNonDeref; try dsimp only
-          repeat' (first
-            | exact sn_fail
-            | exact sn_unsup
-            | exact sn_step (invalidateConflictingBorrowsAtProj_ne_nil hm1)
-            | split)
+      exact evalAssignDst_borrows_ne_nil (evalRvalue_ok_borrows_ne_nil h val l1 m1 h_rv)
 
 theorem unwindFromCallStack_borrows_ne_nil
     {stk : List SavedCallerFrame} {m : Memory} {ns : MachineState}
@@ -9446,17 +9968,47 @@ private theorem evalRvalue_rawPtr_cons_nil_rnp
   have h_sc := fun as ls rp pt =>
     evalScalarSliceFatPtrDerefRaw_pushBaseStack calleeBody (bHd :: bTl) locals m0 as ls rp pt localDecls layouts
   dsimp only [m0, Memory.pushBaseStack] at h_glob h_sc
-  dsimp only [m0, evalRvalue, evalRvalueRawPtr, Memory.pushBaseStack, lookupBorrow]
-  try simp only [evalOperand_nil_borrows_callStack]
-  try simp only [evalPlaceRead_nil_borrows_callStack]
-  try simp only [checkSafeRefDerefOk_nil_borrows]
-  repeat' (first
-    | contradiction
-    | exact rnp_ub | exact rnp_unsup | exact rnp_ok rfl | exact rnp_mint
-    | exact rnp_of_eq (h_glob ..)
-    | exact rnp_of_eq (h_sc ..)
-    | exact evalSliceFatPtrDerefBorrow_cons_nil_rnp
-    | split)
+  rcases place with ⟨pLoc, _ | ⟨phd, restProj⟩⟩
+  · dsimp only [m0, evalRvalue, evalRvalueRawPtr, Memory.pushBaseStack]
+    cases get? locals pLoc with
+    | none => exact rnp_ub
+    | some sl =>
+      cases sl with
+      | dead => exact rnp_ub
+      | uninit | init _ => exact rnp_mint
+  · cases phd with
+    | deref =>
+      dsimp only [m0, evalRvalue, evalRvalueRawPtr, Memory.pushBaseStack, lookupBorrow]
+      try simp only [evalOperand_nil_borrows_callStack]
+      try simp only [evalPlaceRead_nil_borrows_callStack]
+      try simp only [checkSafeRefDerefOk_nil_borrows]
+      repeat' (first
+        | contradiction
+        | exact rnp_ub | exact rnp_unsup | exact rnp_ok rfl | exact rnp_mint
+        | exact rnp_of_eq (h_glob ..)
+        | exact rnp_of_eq (h_sc ..)
+        | exact evalSliceFatPtrDerefBorrow_cons_nil_rnp
+        | split)
+    | _ =>
+      dsimp only [m0, evalRvalue, evalRvalueRawPtr, Memory.pushBaseStack]
+      cases get? locals pLoc with
+      | none => exact rnp_ub
+      | some sl =>
+        cases sl with
+        | dead => exact rnp_ub
+        | uninit | init _ =>
+          dsimp only
+          cases resolveBorrowProjectionElems locals _ with
+          | none => exact rnp_ub
+          | some rp =>
+            dsimp only
+            cases projHasSubslice rp with
+            | false => exact rnp_mint
+            | true =>
+              dsimp only
+              cases validateNonDerefSubslices locals localDecls layouts pLoc _ rp with
+              | true => exact rnp_mint
+              | false => exact rnp_ub
 
 private theorem evalRvalue_binaryOp_cons_nil_rnp
     (calleeBody : CapturedMir) (bHd : SavedCallerFrame) (bTl : List SavedCallerFrame)
@@ -9603,7 +10155,8 @@ theorem evalRvalue_borrows_nil_pushBaseStack
     | len place =>
       dsimp only [m0, evalRvalue, evalPlaceLen, Memory.pushBaseStack, lookupBorrow]
       try simp only [evalPlaceRead_nil_borrows_callStack]
-      repeat' (first | contradiction | exact rnp_ub | exact rnp_unsup | exact rnp_ok rfl | split)
+      cases splitLastDeref? place.projection <;>
+        repeat' (first | contradiction | exact rnp_ub | exact rnp_unsup | exact rnp_ok rfl | split)
     | cast ck op targetTy =>
       cases ck with
       | pointerCoercion ckStr =>
@@ -9687,9 +10240,18 @@ theorem evalRvalue_borrows_nil_pushBaseStack
     | unaryOp uop op =>
       cases uop with
       | not =>
-        dsimp only [m0, evalRvalue, evalUnaryNot, Memory.pushBaseStack]
-        try simp only [evalOperand_nil_borrows_callStack]
-        repeat' (first | exact rnp_ub | exact rnp_unsup | exact rnp_ok rfl | split)
+        dsimp only [m0, evalRvalue, Memory.pushBaseStack]
+        simp only [evalOperand_nil_borrows_callStack]
+        cases h_op : evalOperand locals op [] gl layouts cl localDecls [] with
+        | ub => exact rnp_ub
+        | unsupported => exact rnp_unsup
+        | ok v locals' =>
+          cases v with
+          | scalar sc =>
+            simp only
+            exact rnp_of_eq (evalUnaryNot_pushBaseStack calleeBody (bHd :: bTl) sc
+              (operandTy localDecls layouts op) locals' m0)
+          | _ => simp only; exact rnp_unsup
       | neg =>
         dsimp only [m0, evalRvalue, Memory.pushBaseStack]
         try simp only [evalOperand_nil_borrows_callStack]
@@ -9787,34 +10349,6 @@ theorem evalRvalue_borrows_nil_pushBaseStack
           rw [evalWrapUnsafeBinder_ok_of_use hUp, h_ok _]
           rfl
 
-private theorem evalAssignDst_borrows_ne_nil
-    {s : MachineState} {dst : Place} {val : Value}
-    {l1 : List LocalSlot} {m1 : Memory}
-    {ld : List LocalDecl} {ly : LayoutTable}
-    (hm1 : m1.borrows ≠ []) :
-    stmtStepBorrowsNeNil (evalAssignDst s dst val l1 m1 ld ly) := by
-  rcases dst with ⟨dLoc, dProj⟩
-  cases dProj with
-  | nil =>
-    unfold evalAssignDst; try dsimp only
-    repeat' (first | exact sn_fail | exact sn_step (invalidateConflictingBorrows_ne_nil hm1) | split)
-  | cons hd tl =>
-    by_cases h_d : hd = .deref
-    · subst h_d
-      unfold evalAssignDst; try dsimp only
-      repeat' (first
-        | exact sn_fail | exact sn_unsup
-        | exact sn_step (invalidateDerefWriteBorrowsWithLayouts_ne_nil hm1)
-        | exact sn_step (invalidateDerefWriteBorrows_ne_nil hm1)
-        | exact evalForeignFrameDerefWrite_ne_nil hm1
-        | split)
-    · rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_d]
-      unfold evalAssignNonDeref; try dsimp only
-      repeat' (first
-        | exact sn_fail | exact sn_unsup
-        | exact sn_step (invalidateConflictingBorrowsAtProj_ne_nil hm1)
-        | split)
-
 private theorem evalStmt_retag_cons_nil_pushBaseStack
     (calleeBody : CapturedMir) (bHd : SavedCallerFrame) (bTl : List SavedCallerFrame)
     (sFr : StackFrame) (nA gl nT cal tr cs ac ap nP cl fp ex)
@@ -9865,9 +10399,14 @@ theorem evalStmt_borrows_nil_pushBaseStack
     | placeMention p =>
       unfold evalStmt
       dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
-      try simp only [evalPlaceRead_nil_borrows_callStack]
-      try simp only [evalOperand_nil_borrows_callStack]
-      repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
+      cases get? sFr.locals p.local_ with
+      | none => rfl
+      | some sl =>
+        cases sl with
+        | dead => rfl
+        | uninit | init _ =>
+          dsimp only
+          cases placeMentionOperandsInit sFr.locals _ p.projection <;> rfl
     | deinit p =>
       rw [evalStmt_deinit_borrows_nil (h_bor := rfl),
           evalStmt_deinit_borrows_nil (h_bor := rfl)]
@@ -10362,7 +10901,7 @@ private theorem evalDirectRustIntrinsic?_borrows_ne_nil_of_noCallWP
                 cases isDirectExactDivTarget rtTarget with
                 | true =>
                   dsimp only
-                  rcases unpackedArgs with _ | ⟨_ | lhs | _ | _, _ | ⟨_ | rhs | _ | _, _ | _⟩⟩ <;>
+                  rcases unpackedArgs with _ | ⟨_ | lhs | _ | _ | _, _ | ⟨_ | rhs | _ | _ | _, _ | _⟩⟩ <;>
                     try (intro h_st; exact False.elim h_st)
                   dsimp only
                   cases resolveIntrinsicIsSigned
@@ -10383,12 +10922,18 @@ private theorem evalDirectRustIntrinsic?_borrows_ne_nil_of_noCallWP
                   dsimp only
                   cases classifyRustIntrinsic? rtTarget.defPath with
                   | some rtKind =>
+                    have h_ns := fun (k : RustIntrinsicKind) =>
+                      evalNonSelectIntrinsicCall_borrows_ne_nil_of_noCallWP
+                        k ms
+                        (withConstEvalSelectIntrinsicTypeArgs rtTarget
+                          (selectTupleTyOpt target.typeArgs) (isPtrPointeeIntrinsicKind k))
+                        curBody.localDecls curBody.layouts
+                        (constEvalSelectTupleArgOps (selectTupleTyOpt target.typeArgs))
+                        unpackedArgs locals' destination targetBb (Q := Q) (P := P) h_ne
                     cases rtKind <;>
                       first
                       | (intro h_st; exact False.elim h_st)
-                      | (dsimp only; intro h_st
-                         exact evalNonSelectIntrinsicCall_borrows_ne_nil_of_noCallWP
-                           _ ms _ curBody.localDecls curBody.layouts _ unpackedArgs locals' destination targetBb h_ne h_st)
+                      | exact h_ns _
                   | none =>
                     dsimp only
                     cases isUnreachableCallTarget rtTarget.defPath with
@@ -11783,7 +12328,7 @@ theorem extCallAbortsProp_evalDirectRustIntrinsic?
                 cases isDirectExactDivTarget rtTarget with
                 | true =>
                   dsimp only
-                  rcases unpackedArgs with _ | ⟨_ | lhs | _ | _, _ | ⟨_ | rhs | _ | _, _ | _⟩⟩ <;>
+                  rcases unpackedArgs with _ | ⟨_ | lhs | _ | _ | _, _ | ⟨_ | rhs | _ | _ | _, _ | _⟩⟩ <;>
                     try trivial
                   dsimp only
                   cases resolveIntrinsicIsSigned
@@ -11799,11 +12344,17 @@ theorem extCallAbortsProp_evalDirectRustIntrinsic?
                   dsimp only
                   cases classifyRustIntrinsic? rtTarget.defPath with
                   | some rtKind =>
+                    have h_ns := fun (k : RustIntrinsicKind) =>
+                      extCallAbortsProp_evalNonSelectIntrinsicCall k s
+                        (withConstEvalSelectIntrinsicTypeArgs rtTarget
+                          (selectTupleTyOpt target.typeArgs) (isPtrPointeeIntrinsicKind k))
+                        bodyLocalDecls bodyLayouts
+                        (constEvalSelectTupleArgOps (selectTupleTyOpt target.typeArgs))
+                        unpackedArgs locals' destination targetBb
                     cases rtKind <;>
                       first
                       | trivial
-                      | exact extCallAbortsProp_evalNonSelectIntrinsicCall _ s _
-                          bodyLocalDecls bodyLayouts _ unpackedArgs locals' destination targetBb
+                      | exact h_ns _
                   | none =>
                     dsimp only
                     cases isUnreachableCallTarget rtTarget.defPath with
