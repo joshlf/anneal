@@ -99,6 +99,21 @@ represent: IEEE-754 bit patterns carried by `u32` / `i32` / `[u8; 4]`
    `TreeBorrowsMemory`) and Anneal (`ptr → [u8; 8]/i64` UB, `ptr → *const u8`
    provenance-preserving `decodePtrBytesNoForge`, `f64 → *const u8` no-forge
    scalar vs. `f64 → &u8` UB, and numeric float-cast `.unsupported`).
+8. **Symbolic MiniRust machine executions and the remaining carrier bridges (§14).**
+   The library's whole-execution simulation theorem `mirCall_ret` lifts Anneal's
+   symbolic runs of the fragment carriers `x as i32` (`u32 → i32`) and
+   `x as i64` (`u64 → i64`, under the 8-byte return place of `fcCtx8`) to
+   MiniRust `Interp.steps` (`BasicMemory`) executions for *every* bit pattern
+   (`fc_sym_mr_carrier_steps`, `fc_sym_mr_carrier64_steps`), ending with Anneal's
+   little-endian bytes in the caller's return place; composed with the symbolic
+   Anneal float pipelines (`fc_sym_e2e_from_bits_as_i32_machine`,
+   `fc_sym_e2e_widen_bits_machine`). Symbolic multi-step bridges for
+   `f64::from_bits(x) as i64`, narrowing `(f64::from_bits(x) as f32).to_bits()`, and
+   exact `(x as f64).to_bits()` (the carrier decodes to exactly `x`), and the
+   reverse `f16` / `f128` transmute directions complete the carrier matrix.
+   (`TreeBorrowsMemory` machine runs remain concrete: the library has no
+   `Interp.stepsTB` simulation theorem; `transmuteM` over `TreeBorrowsMemory` is
+   symbolic throughout.)
 
 Every public theorem is guarded by `#print axioms` at the end of the file.
 -/
@@ -3211,13 +3226,460 @@ theorem fc_anneal_ptr_transmute_and_cast_boundary
     unfold evalFloatCastRvalue; rw [hOpPtr, hTyPtr]; rfl
 
 
+/-! ## 14. Symbolic MiniRust machine executions and 64-bit / narrowing / exact `int → float`
+bit-carrier bridges (`[adv shard-b A1]`)
+
+`fc_carrier_runs` exercises MiniRust's `Interp.steps` / `Interp.stepsTB` only on three concrete
+32-bit carriers. Here the library's whole-execution simulation theorem `mirCall_ret`
+(`Correspondence/Run.lean`) lifts Anneal's *symbolic* run of the fragment carrier
+`fn(x: u32) -> i32 { x as i32 }` (an equal-width `IntToInt` cast moves the bits exactly as the
+transmute does; `minimize`'s translation of an integer-to-integer transmute is outside
+`inFragment`) to a MiniRust `BasicMemory` execution for *every* 32-bit pattern, ending with
+Anneal's little-endian bytes in the caller's return place. -/
+
+/-- `fn carrier_cast(x: u32) -> i32 { x as i32 }`: the fragment form of the `u32 → i32` bit
+carrier (`_0 = copy _1 as i32 (IntToInt)`). -/
+def fcCarrierCastBody : CapturedMir :=
+  ptrBody "float_cast::carrier_cast_u32_i32" [i32Decl, u32Decl]
+    [.assign (local_ 0) (.cast .intToInt (.copy (local_ 1)) i32Ty)]
+
+theorem fc_carrierCast_inFragment : inFragment fcCarrierCastBody = true := by decide +kernel
+
+theorem fc_carrierCast_ctxOk : CtxOk fcCarrierCastBody ctx0 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d _ hd
+    match i, hd with
+    | 0, hd => simp only [fcCarrierCastBody, ptrBody] at hd; cases hd; decide
+    | 1, hd => simp only [fcCarrierCastBody, ptrBody] at hd; cases hd; decide
+    | _ + 2, hd => simp [fcCarrierCastBody, ptrBody] at hd
+  ret := by
+    intro d hd
+    simp only [fcCarrierCastBody, ptrBody] at hd
+    cases hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+theorem fc_carrierCast_argsOk (bits : Nat) (h : bits < 2 ^ 32) :
+    argsOk fcCarrierCastBody [.scalar ⟨bits, 4⟩] = true := by
+  have h' : bits < 2 ^ (8 * 4) := h
+  simp [argsOk, argsOkAux, declArgOk, fcCarrierCastBody, ptrBody, u32Decl, u32Ty, argOk, tyOf,
+    translateTy, scalarTypeOf, isBoolTy, isOrderingTy, intBoolTupleOf, intTypeOf, intTyBytes,
+    tyBytes, validBits, h']
+
+theorem fc_wrapScalarBits_of_lt {val modulus : Nat} (h : val < modulus) :
+    wrapScalarBits val modulus = val := by
+  unfold wrapScalarBits
+  have : Nat.ble modulus val = false := by
+    cases hb : Nat.ble modulus val with
+    | false => rfl
+    | true => exact absurd (Nat.le_of_ble_eq_true hb) (Nat.not_le.mpr h)
+  rw [this]
+
+/-- Kernel-computed symbolic Anneal run of the fragment carrier. -/
+theorem fc_run_carrierCast_raw (bits : Nat) : ∃ mem, runA fcCarrierCastBody 10
+    (initMachineState fcCarrierCastBody [.scalar ⟨bits, 4⟩]) =
+      some ([], .normal (.scalar ⟨wrapScalarBits bits (scalarModulus 4), 4⟩, mem)) := ⟨_, rfl⟩
+
+/-- Anneal: the carrier returns its argument's bits unchanged, for every 32-bit pattern. -/
+theorem fc_sym_carrierCast_anneal (bits : Nat) (h : bits < 2 ^ 32) :
+    ∃ mem, ReachesRet (mirCallTree fcCarrierCastBody [.scalar ⟨bits, 4⟩]) []
+      (.normal (.scalar ⟨bits, 4⟩, mem)) := by
+  obtain ⟨mem, hrun⟩ := fc_run_carrierCast_raw bits
+  rw [fc_wrapScalarBits_of_lt (show bits < scalarModulus 4 from h)] at hrun
+  exact ⟨mem, runA_sound _ _ _ _ _ hrun⟩
+
+/-- **Symbolic MiniRust `Interp.steps` (`BasicMemory`) execution of the bit carrier**: for
+*every* 32-bit pattern `bits`, the MiniRust machine running `minimize`'s translation of the
+carrier from its start reaches, after finitely many `Machine::step`s, the state in which the callee
+has returned (only the caller's frame is left) and the caller's return place holds exactly
+Anneal's little-endian encoding of `bits` (`fcByteToMR` image). -/
+theorem fc_sym_mr_carrier_steps (bits : Nat) (h : bits < 2 ^ 32) :
+    ∃ (m : Mach) (n : Nat) (m' : Mach),
+      startMachine fcCarrierCastBody [.scalar ⟨bits, 4⟩] = some m ∧
+      Interp.steps n m = .ok m' ∧
+      m'.threads = [thread1 ctx0 [{ ctx0.caller with next_block := ctx0.nextBlock, next_stmt := 0 }]] ∧
+      m'.mem.memory.allocations[0]? =
+        some { retAlloc with data := (encodeLittleEndianBytes bits 4 none).map fcByteToMR } := by
+  obtain ⟨f, hf⟩ : ∃ f, translateFn fcCarrierCastBody = some f := ⟨_, rfl⟩
+  obtain ⟨mem, hret⟩ := fc_sym_carrierCast_anneal bits h
+  let m := machine fcCarrierCastBody f
+    (initMachineState fcCarrierCastBody [.scalar ⟨bits, 4⟩]).frame.locals f.start
+  have hm : startMachine fcCarrierCastBody [.scalar ⟨bits, 4⟩] = some m := by
+    simp [startMachine, hf, m]
+  obtain ⟨n, s', m', hsteps, hrel⟩ := mirCall_ret fc_carrierCast_inFragment hf ctx0
+    fc_carrierCast_ctxOk [.scalar ⟨bits, 4⟩] (fc_carrierCast_argsOk bits h) m rfl rfl rfl hret
+  obtain ⟨r, a, d, R, hd, _, hprov, ha, hthreads, hallocs, _⟩ := hrel
+  simp only [fcCarrierCastBody, ptrBody, List.getElem?_cons_zero, Option.some.injEq] at hd
+  have hr : r = 0 := by
+    simp only [ctx0, retPtr, Option.some.injEq, Prod.mk.injEq, and_true] at hprov
+    have h0 : (r : Int) = 0 := (congrArg Gen.AllocId._0 hprov).symm
+    omega
+  subst hr hd
+  simp only [ctx0, List.getElem?_cons_zero, Option.some.injEq] at ha
+  subst ha
+  refine ⟨m, n, m', hm, hsteps, hthreads, ?_⟩
+  rw [hallocs, fc_map_encodeLittleEndianBytes .Signed none 4 bits]
+  rfl
+
+/-- **Symbolic end-to-end bridge through the MiniRust machine**: for every 32-bit pattern `x`,
+Anneal's multi-step run of `f32::from_bits(x) as i32` returns a carrier `r`; MiniRust's
+`BasicMemory` machine running the translated carrier on `r` returns exactly Anneal's bytes of `r`,
+which MiniRust decodes at `i32` to the saturated truncation `floatToIntValue (decodeBits x)`. -/
+theorem fc_sym_e2e_from_bits_as_i32_machine (bits : Nat) (h : bits < 2 ^ 32) :
+    (∃ mem, ReachesRet (mirCallTree fcFromBitsAsI32Body [.scalar ⟨bits, 4⟩]) []
+      (.normal (.scalar (evalFloatToIntSaturating .binary32 bits (.signed .i32) .bits64), mem))) ∧
+    (∃ (m : Mach) (n : Nat) (m' : Mach),
+      startMachine fcCarrierCastBody
+          [.scalar ⟨(evalFloatToIntSaturating .binary32 bits (.signed .i32) .bits64).bits, 4⟩] =
+        some m ∧
+      Interp.steps n m = .ok m' ∧
+      m'.mem.memory.allocations[0]? =
+        some { retAlloc with
+          data := List.map fcByteToMR (encodeLittleEndianBytes
+            (evalFloatToIntSaturating .binary32 bits (.signed .i32) .bits64).bits 4 none) }) ∧
+    Type.decode (.Int fcI32It)
+        ((encodeLittleEndianBytes (evalFloatToIntSaturating .binary32 bits (.signed .i32)
+          .bits64).bits 4 none).map fcByteToMR) =
+      .ok (some (.Int (floatToIntValue (decodeBits .binary32 bits) (-2147483648) 2147483647))) := by
+  obtain ⟨_, hlt, _, _, hdec⟩ :=
+    fc_bridge_floatToInt .binary32 bits (.signed .i32) 4 rfl fc_goodSize_4
+  obtain ⟨m, n, m', hm, hs, _, ha⟩ := fc_sym_mr_carrier_steps _ hlt
+  exact ⟨(fc_sym_from_bits_as_i32 bits h).1, ⟨m, n, m', hm, hs, ha⟩, hdec⟩
+
+/-! ### 14.0 The 64-bit carrier under an 8-byte return place
+
+`ctx0`'s return place is 4 bytes, so the `u64 → i64` carrier runs under `fcCtx8`, which differs
+from `ctx0` only by an 8-byte, 8-aligned return place and a caller whose `_0` is a `u64`. -/
+
+/-- `u64` / `i64` with layout index `0` (layout-free fragment types). -/
+def fcU64Ty0 : Ty := { kind := .uint .u64, layoutIdx := 0 }
+def fcI64Ty0 : Ty := { kind := .int .i64, layoutIdx := 0 }
+
+/-- The caller's 8-byte return place: allocation `0` at address `64`. -/
+def fcRetAlloc8 : Gen.Allocation :=
+  { data := List.replicate 8 .Uninit, addr := 64, align := ⟨8⟩, kind := .Stack, live := true,
+    extra := () }
+
+def fcCallerFn8 : Gen.Function where
+  locals := ⟨[(localName 0, .Int fcU64It)]⟩
+  args := []
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[]⟩
+  start := bbName 0
+  implicit_writes := true
+
+def fcCallerFrame8 : Frame :=
+  { func := fcCallerFn8, locals := ⟨[(localName 0, retPtr)]⟩, stack_pop_action := .BottomOfStack,
+    next_block := bbName 0, next_stmt := 0, extra := () }
+
+/-- `ctx0` with an 8-byte return place. -/
+def fcCtx8 : Ctx :=
+  { caller := fcCallerFrame8, payloads := [], base := [fcRetAlloc8], addrs := [128, 256],
+    nextBlock := bbName 7, unwindBlock := none, retPtr := retPtr }
+
+/-- `fn carrier_cast64(x: u64) -> i64 { x as i64 }`: the fragment form of the `u64 → i64` bit
+carrier. -/
+def fcCarrierCast64Body : CapturedMir :=
+  ptrBody "float_cast::carrier_cast_u64_i64" [fcDecl fcI64Ty0, fcDecl fcU64Ty0]
+    [.assign (local_ 0) (.cast .intToInt (.copy (local_ 1)) fcI64Ty0)]
+
+theorem fc_carrierCast64_inFragment : inFragment fcCarrierCast64Body = true := by decide +kernel
+
+theorem fc_carrierCast64_ctxOk : CtxOk fcCarrierCast64Body fcCtx8 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d _ hd
+    match i, hd with
+    | 0, hd => simp only [fcCarrierCast64Body, ptrBody] at hd; cases hd; decide
+    | 1, hd => simp only [fcCarrierCast64Body, ptrBody] at hd; cases hd; decide
+    | _ + 2, hd => simp [fcCarrierCast64Body, ptrBody] at hd
+  ret := by
+    intro d hd
+    simp only [fcCarrierCast64Body, ptrBody] at hd
+    cases hd
+    exact ⟨0, fcRetAlloc8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+theorem fc_carrierCast64_argsOk (bits : Nat) (h : bits < 2 ^ 64) :
+    argsOk fcCarrierCast64Body [.scalar ⟨bits, 8⟩] = true := by
+  have h' : bits < 2 ^ (8 * 8) := h
+  simp [argsOk, argsOkAux, declArgOk, fcCarrierCast64Body, ptrBody, fcDecl, fcU64Ty0, argOk,
+    tyOf, translateTy, scalarTypeOf, isBoolTy, isOrderingTy, intBoolTupleOf, intTypeOf,
+    intTyBytes, tyBytes, validBits, h']
+
+theorem fc_run_carrierCast64_raw (bits : Nat) : ∃ mem, runA fcCarrierCast64Body 10
+    (initMachineState fcCarrierCast64Body [.scalar ⟨bits, 8⟩]) =
+      some ([], .normal (.scalar ⟨wrapScalarBits bits (scalarModulus 8), 8⟩, mem)) := ⟨_, rfl⟩
+
+theorem fc_sym_carrierCast64_anneal (bits : Nat) (h : bits < 2 ^ 64) :
+    ∃ mem, ReachesRet (mirCallTree fcCarrierCast64Body [.scalar ⟨bits, 8⟩]) []
+      (.normal (.scalar ⟨bits, 8⟩, mem)) := by
+  obtain ⟨mem, hrun⟩ := fc_run_carrierCast64_raw bits
+  rw [fc_wrapScalarBits_of_lt (show bits < scalarModulus 8 from h)] at hrun
+  exact ⟨mem, runA_sound _ _ _ _ _ hrun⟩
+
+/-- **Symbolic MiniRust `Interp.steps` (`BasicMemory`) execution of the 64-bit bit carrier**: for
+*every* 64-bit pattern `bits`, the MiniRust machine running the translated `u64 → i64` carrier
+from its start (under `fcCtx8`) returns to the caller with exactly Anneal's little-endian encoding
+of `bits` in the 8-byte return place. -/
+theorem fc_sym_mr_carrier64_steps (bits : Nat) (h : bits < 2 ^ 64) :
+    ∃ (f : Gen.Function) (n : Nat) (m' : Mach),
+      translateFn fcCarrierCast64Body = some f ∧
+      Interp.steps n (machineWithCtx fcCtx8 fcCarrierCast64Body f
+        (initMachineState fcCarrierCast64Body [.scalar ⟨bits, 8⟩]).frame.locals f.start) =
+        .ok m' ∧
+      m'.threads =
+        [thread1 fcCtx8 [{ fcCtx8.caller with next_block := fcCtx8.nextBlock, next_stmt := 0 }]] ∧
+      m'.mem.memory.allocations[0]? =
+        some { fcRetAlloc8 with data := (encodeLittleEndianBytes bits 8 none).map fcByteToMR } := by
+  obtain ⟨f, hf⟩ : ∃ f, translateFn fcCarrierCast64Body = some f := ⟨_, rfl⟩
+  obtain ⟨mem, hret⟩ := fc_sym_carrierCast64_anneal bits h
+  obtain ⟨n, s', m', hsteps, hrel⟩ := mirCall_ret fc_carrierCast64_inFragment hf fcCtx8
+    fc_carrierCast64_ctxOk [.scalar ⟨bits, 8⟩] (fc_carrierCast64_argsOk bits h)
+    (machineWithCtx fcCtx8 fcCarrierCast64Body f
+      (initMachineState fcCarrierCast64Body [.scalar ⟨bits, 8⟩]).frame.locals f.start)
+    rfl rfl rfl hret
+  obtain ⟨r, a, d, R, hd, _, hprov, ha, hthreads, hallocs, _⟩ := hrel
+  simp only [fcCarrierCast64Body, ptrBody, List.getElem?_cons_zero, Option.some.injEq] at hd
+  have hr : r = 0 := by
+    simp only [fcCtx8, retPtr, Option.some.injEq, Prod.mk.injEq, and_true] at hprov
+    have h0 : (r : Int) = 0 := (congrArg Gen.AllocId._0 hprov).symm
+    omega
+  subst hr hd
+  simp only [fcCtx8, List.getElem?_cons_zero, Option.some.injEq] at ha
+  subst ha
+  refine ⟨f, n, m', hf, hsteps, hthreads, ?_⟩
+  rw [hallocs, fc_map_encodeLittleEndianBytes .Signed none 8 bits]
+  rfl
+
+/-- **Symbolic end-to-end `f64` bridge through the MiniRust machine**: for every 32-bit pattern
+`x`, Anneal's run of `(f32::from_bits(x) as f64).to_bits()` returns the `u64` carrier
+`r = evalFloatToFloatRoundTiesToEven .binary32 .binary64 x`, and MiniRust's `BasicMemory` machine
+running the translated 64-bit carrier on `r` returns exactly Anneal's bytes of `r`. -/
+theorem fc_sym_e2e_widen_bits_machine (bits : Nat) (h : bits < 2 ^ 32) :
+    (∃ mem, ReachesRet (mirCallTree fcWidenBitsBody [.scalar ⟨bits, 4⟩]) []
+      (.normal (.scalar ⟨evalFloatToFloatRoundTiesToEven .binary32 .binary64 bits, 8⟩, mem))) ∧
+    ∃ (f : Gen.Function) (n : Nat) (m' : Mach),
+      translateFn fcCarrierCast64Body = some f ∧
+      Interp.steps n (machineWithCtx fcCtx8 fcCarrierCast64Body f
+        (initMachineState fcCarrierCast64Body
+          [.scalar ⟨evalFloatToFloatRoundTiesToEven .binary32 .binary64 bits, 8⟩]).frame.locals
+        f.start) = .ok m' ∧
+      m'.mem.memory.allocations[0]? =
+        some { fcRetAlloc8 with
+          data := List.map fcByteToMR (encodeLittleEndianBytes
+            (evalFloatToFloatRoundTiesToEven .binary32 .binary64 bits) 8 none) } := by
+  have hlt : evalFloatToFloatRoundTiesToEven .binary32 .binary64 bits < 2 ^ 64 :=
+    Anneal.Mir.IeeeFloatCast.evalFloatToFloatRoundTiesToEven_lt _ _ _
+  obtain ⟨f, n, m', hf, hs, _, ha⟩ := fc_sym_mr_carrier64_steps _ hlt
+  exact ⟨(fc_sym_widen_bits bits h).1, f, n, m', hf, hs, ha⟩
+
+/-! ### 14.1 `f64` carriers: `f64::from_bits(x) as i64` and narrowing `f64 → f32` -/
+
+/-- `fn f64_from_bits_as_i64(x: u64) -> i64 { f64::from_bits(x) as i64 }`. -/
+def fcF64FromBitsAsI64Body : CapturedMir :=
+  fcBody "float_cast::f64_from_bits_as_i64" [fcDecl fcI64Ty, fcDecl fcU64Ty, fcDecl fcF64Ty]
+    [.storageLive 2,
+     .assign (local_ 2) (.cast .transmute (.copy (local_ 1)) fcF64Ty),
+     .assign (local_ 0) (.cast .floatToInt (.copy (local_ 2)) fcI64Ty),
+     .storageDead 2]
+
+/-- `fn narrow_bits(x: u64) -> u32 { (f64::from_bits(x) as f32).to_bits() }`. -/
+def fcNarrowBitsBody : CapturedMir :=
+  fcBody "float_cast::narrow_bits" [fcDecl fcU32Ty, fcDecl fcU64Ty, fcDecl fcF64Ty, fcDecl fcF32Ty]
+    [.storageLive 2, .storageLive 3,
+     .assign (local_ 2) (.cast .transmute (.copy (local_ 1)) fcF64Ty),
+     .assign (local_ 3) (.cast .floatToFloat (.copy (local_ 2)) fcF32Ty),
+     .assign (local_ 0) (.cast .transmute (.copy (local_ 3)) fcU32Ty),
+     .storageDead 3, .storageDead 2]
+
+theorem fc_run_f64_from_bits_as_i64_raw (bits : Nat) : ∃ mem, runA fcF64FromBitsAsI64Body 10
+    (initMachineState fcF64FromBitsAsI64Body [.scalar ⟨bits, 8⟩]) =
+      some ([], .normal (.scalar (evalFloatToIntSaturating .binary64 (fcLeRound 8 bits)
+        (.signed .i64) .bits64), mem)) := ⟨_, rfl⟩
+
+theorem fc_run_narrow_bits_raw (bits : Nat) : ∃ mem, runA fcNarrowBitsBody 12
+    (initMachineState fcNarrowBitsBody [.scalar ⟨bits, 8⟩]) =
+      some ([], .normal (.scalar ⟨fcLeRound 4 (evalFloatToFloatRoundTiesToEven .binary64 .binary32
+        (fcLeRound 8 bits)), 4⟩, mem)) := ⟨_, rfl⟩
+
+/-- **Symbolic 64-bit end-to-end bridge (`FloatToInt` on `f64`)**: for every 64-bit pattern `x`,
+Anneal's multi-step run of `f64::from_bits(x) as i64` returns, free of UB, the `i64` carrier `r`
+of `evalFloatToIntSaturating .binary64 x`, whose bytes MiniRust decodes at `i64` to the saturated
+truncation `floatToIntValue (decodeBits .binary64 x)`, and which MiniRust's `transmuteM` moves from
+the `u64` carrier to `i64` with that same value over both `BasicMemory` and `TreeBorrowsMemory`. -/
+theorem fc_sym_e2e_f64_from_bits_as_i64 (bits : Nat) (h : bits < 2 ^ 64) :
+    (∃ mem, ReachesRet (mirCallTree fcF64FromBitsAsI64Body [.scalar ⟨bits, 8⟩]) []
+      (.normal (.scalar (evalFloatToIntSaturating .binary64 bits (.signed .i64) .bits64), mem))) ∧
+    MirNoUBTree (mirCallTree fcF64FromBitsAsI64Body [.scalar ⟨bits, 8⟩]) ∧
+    Type.decode (.Int fcI64It)
+        ((encodeLittleEndianBytes (evalFloatToIntSaturating .binary64 bits (.signed .i64)
+          .bits64).bits 8 none).map fcByteToMR) =
+      .ok (some (.Int (floatToIntValue (decodeBits .binary64 bits) (-9223372036854775808)
+        9223372036854775807))) ∧
+    transmuteM (M := BM)
+        (.Int (intFromBits (evalFloatToIntSaturating .binary64 bits (.signed .i64) .bits64).bits
+          fcU64It)) (.Int fcU64It) (.Int fcI64It) =
+      .ok (.Int (floatToIntValue (decodeBits .binary64 bits) (-9223372036854775808)
+        9223372036854775807)) ∧
+    transmuteM (M := TBM)
+        (.Int (intFromBits (evalFloatToIntSaturating .binary64 bits (.signed .i64) .bits64).bits
+          fcU64It)) (.Int fcU64It) (.Int fcI64It) =
+      .ok (.Int (floatToIntValue (decodeBits .binary64 bits) (-9223372036854775808)
+        9223372036854775807)) := by
+  obtain ⟨mem, hrun⟩ := fc_run_f64_from_bits_as_i64_raw bits
+  rw [fcLeRound_eq8 bits h] at hrun
+  obtain ⟨_, hlt, hint, _, hdec⟩ :=
+    fc_bridge_floatToInt .binary64 bits (.signed .i64) 8 rfl fc_goodSize_8
+  refine ⟨⟨mem, runA_sound _ _ _ _ _ hrun⟩, runA_noUB _ _ _ _ _ hrun, hdec, ?_, ?_⟩
+  · exact (fc_mrBM_transmute_int .Unsigned .Signed 8 _ fc_goodSize_8 hlt none).trans
+      (congrArg (fun z : Int => (Except.ok (Gen.Value.Int z) : Interp Val)) hint)
+  · exact (fc_mrTB_transmute_int .Unsigned .Signed 8 _ fc_goodSize_8 hlt none).trans
+      (congrArg (fun z : Int => (Except.ok (Gen.Value.Int z) : Interp (Gen.Value TBM))) hint)
+
+/-- **Symbolic narrowing bridge (`FloatToFloat`, `f64 → f32`)**: for every 64-bit pattern `x`,
+Anneal's multi-step run of `(f64::from_bits(x) as f32).to_bits()` returns, free of UB, the `u32`
+carrier `evalFloatToFloatRoundTiesToEven .binary64 .binary32 x`, whose MiniRust `Type.encode` is
+exactly Anneal's bytes and which `transmuteM` moves to `i32` unchanged over both memory models. -/
+theorem fc_sym_e2e_narrow_bits (bits : Nat) (h : bits < 2 ^ 64) :
+    (∃ mem, ReachesRet (mirCallTree fcNarrowBitsBody [.scalar ⟨bits, 8⟩]) []
+      (.normal (.scalar ⟨evalFloatToFloatRoundTiesToEven .binary64 .binary32 bits, 4⟩, mem))) ∧
+    MirNoUBTree (mirCallTree fcNarrowBitsBody [.scalar ⟨bits, 8⟩]) ∧
+    Type.encode (.Int fcU32It)
+        (.Int (intFromBits (evalFloatToFloatRoundTiesToEven .binary64 .binary32 bits) fcU32It)) =
+      .ok ((encodeLittleEndianBytes (evalFloatToFloatRoundTiesToEven .binary64 .binary32 bits) 4
+        none).map fcByteToMR) ∧
+    transmuteM (M := BM)
+        (.Int (intFromBits (evalFloatToFloatRoundTiesToEven .binary64 .binary32 bits) fcU32It))
+        (.Int fcU32It) (.Int fcI32It) =
+      .ok (.Int (intFromBits (evalFloatToFloatRoundTiesToEven .binary64 .binary32 bits) fcI32It)) ∧
+    transmuteM (M := TBM)
+        (.Int (intFromBits (evalFloatToFloatRoundTiesToEven .binary64 .binary32 bits) fcU32It))
+        (.Int fcU32It) (.Int fcI32It) =
+      .ok (.Int (intFromBits (evalFloatToFloatRoundTiesToEven .binary64 .binary32 bits) fcI32It)) := by
+  have hlt : evalFloatToFloatRoundTiesToEven .binary64 .binary32 bits < 2 ^ (8 * 4) :=
+    Anneal.Mir.IeeeFloatCast.evalFloatToFloatRoundTiesToEven_lt _ _ _
+  obtain ⟨mem, hrun⟩ := fc_run_narrow_bits_raw bits
+  rw [fcLeRound_eq8 bits h, fcLeRound_eq4 _ hlt] at hrun
+  exact ⟨⟨mem, runA_sound _ _ _ _ _ hrun⟩, runA_noUB _ _ _ _ _ hrun,
+    fc_mr_encode_eq_anneal .Unsigned 4 _ fc_goodSize_4 hlt,
+    fc_mrBM_transmute_int .Unsigned .Signed 4 _ fc_goodSize_4 hlt none,
+    fc_mrTB_transmute_int .Unsigned .Signed 4 _ fc_goodSize_4 hlt none⟩
+
+/-- **Symbolic exact `int → float` bridge**: for every 32-bit pattern `x`, Anneal's multi-step
+run of `(x as f64).to_bits()` (on `x : i32`) returns, free of UB, the `u64` carrier
+`r = evalIntToFloatRoundTiesToEven true 32 x .binary64`, which decodes as a binary64 float to
+*exactly* the integer `intValueOfBits true 32 x` (every `i32` is representable in `f64`); MiniRust's
+`Type.encode` of `r` at `u64` is exactly Anneal's bytes, and `transmuteM` moves `r` from `u64` to
+`i64` unchanged over both `BasicMemory` and `TreeBorrowsMemory`. -/
+theorem fc_sym_e2e_int_as_f64_bits (bits : Nat) :
+    (∃ mem, ReachesRet (mirCallTree fcIntAsF64BitsBody [.scalar ⟨bits, 4⟩]) []
+      (.normal (.scalar ⟨evalIntToFloatRoundTiesToEven true 32 bits .binary64, 8⟩, mem))) ∧
+    MirNoUBTree (mirCallTree fcIntAsF64BitsBody [.scalar ⟨bits, 4⟩]) ∧
+    Anneal.Mir.IeeeFloatCast.floatKindDenotesInt
+      (decodeBits .binary64 (evalIntToFloatRoundTiesToEven true 32 bits .binary64))
+      (intValueOfBits true 32 bits) ∧
+    Type.encode (.Int fcU64It)
+        (.Int (intFromBits (evalIntToFloatRoundTiesToEven true 32 bits .binary64) fcU64It)) =
+      .ok ((encodeLittleEndianBytes (evalIntToFloatRoundTiesToEven true 32 bits .binary64) 8
+        none).map fcByteToMR) ∧
+    transmuteM (M := BM)
+        (.Int (intFromBits (evalIntToFloatRoundTiesToEven true 32 bits .binary64) fcU64It))
+        (.Int fcU64It) (.Int fcI64It) =
+      .ok (.Int (intFromBits (evalIntToFloatRoundTiesToEven true 32 bits .binary64) fcI64It)) ∧
+    transmuteM (M := TBM)
+        (.Int (intFromBits (evalIntToFloatRoundTiesToEven true 32 bits .binary64) fcU64It))
+        (.Int fcU64It) (.Int fcI64It) =
+      .ok (.Int (intFromBits (evalIntToFloatRoundTiesToEven true 32 bits .binary64) fcI64It)) := by
+  have hlt : evalIntToFloatRoundTiesToEven true 32 bits .binary64 < 2 ^ (8 * 8) :=
+    Anneal.Mir.IeeeFloatCast.evalIntToFloatRoundTiesToEven_lt _ _ _ _
+  obtain ⟨hrun, hnoub⟩ := fc_sym_int_as_f64_bits bits
+  exact ⟨hrun, hnoub, Anneal.Mir.IeeeFloatCast.evalIntToFloatRoundTiesToEven_sound.2.1 true bits,
+    fc_mr_encode_eq_anneal .Unsigned 8 _ fc_goodSize_8 hlt,
+    fc_mrBM_transmute_int .Unsigned .Signed 8 _ fc_goodSize_8 hlt none,
+    fc_mrTB_transmute_int .Unsigned .Signed 8 _ fc_goodSize_8 hlt none⟩
+
+/-! ### 14.2 `f16` / `f128` transmutes in the reverse direction
+
+`fc_f16_f128_transmute_vs_float_cast` states the `f16 ↔ u16` / `f128 ↔ u128` dichotomy but proves
+only the `f16 → u16` and `f128 → u128` directions; the reverse directions (`f16::from_bits`,
+`f128::from_bits`) are below, so both directions preserve every bit pattern while the numeric casts
+fail closed. -/
+
+theorem fc_tyByteSize_f16 (decls : List LocalDecl) :
+    tyByteSize decls fcLayouts (resolveTyWithLocalDecls decls fcLayouts fcF16Ty) = some 2 := rfl
+theorem fc_tyByteSize_f128 (decls : List LocalDecl) :
+    tyByteSize decls fcLayouts (resolveTyWithLocalDecls decls fcLayouts fcF128Ty) = some 16 := rfl
+theorem fc_tyByteSize_u16 (decls : List LocalDecl) :
+    tyByteSize decls fcLayouts (resolveTyWithLocalDecls decls fcLayouts fcU16Ty) = some 2 := rfl
+theorem fc_tyByteSize_u128 (decls : List LocalDecl) :
+    tyByteSize decls fcLayouts (resolveTyWithLocalDecls decls fcLayouts fcU128Ty) = some 16 := rfl
+
+/-- `f16` / `f128` decode exactly like `u16` / `u128` (`normalizeCodecTy`). -/
+theorem fc_decodeTyped_f16_f128_eq (bs : List MirSemantics.AbstractByte) :
+    decodeTypedValueFromBytes defaultCodecFuel fcLayouts fcF16Ty bs =
+        decodeTypedValueFromBytes defaultCodecFuel fcLayouts fcU16Ty bs ∧
+      decodeTypedValueFromBytes defaultCodecFuel fcLayouts fcF128Ty bs =
+        decodeTypedValueFromBytes defaultCodecFuel fcLayouts fcU128Ty bs := ⟨rfl, rfl⟩
+
+/-- **`f16::from_bits` / `f128::from_bits` in Anneal**: transmuting a `u16` (`u128`) holding
+`bits` to `f16` (`f128`) yields exactly `bits`, for every 16-bit (128-bit) pattern, even though no
+numeric `f16` / `f128` cast is modeled. -/
+theorem fc_f16_f128_from_bits
+    {locals locals' : List LocalSlot} {op : Operand} {mem : Memory} {decls : List LocalDecl} :
+    (∀ {bits : Nat}, bits < 2 ^ 16 →
+      evalOperand locals op mem.borrows mem.globals fcLayouts mem.callerLocals decls
+          mem.callStack = .ok (.scalar ⟨bits, 2⟩) locals' →
+      operandTy decls fcLayouts op = some fcU16Ty →
+      evalRvalue locals (.cast .transmute op fcF16Ty) mem decls fcLayouts =
+        .ok (.scalar ⟨bits, 2⟩) locals' mem) ∧
+    (∀ {bits : Nat}, bits < 2 ^ 128 →
+      evalOperand locals op mem.borrows mem.globals fcLayouts mem.callerLocals decls
+          mem.callStack = .ok (.scalar ⟨bits, 16⟩) locals' →
+      operandTy decls fcLayouts op = some fcU128Ty →
+      evalRvalue locals (.cast .transmute op fcF128Ty) mem decls fcLayouts =
+        .ok (.scalar ⟨bits, 16⟩) locals' mem) := by
+  refine ⟨fun {bits} h16 hop hty => ?_, fun {bits} h128 hop hty => ?_⟩
+  · have hdec : decodeTypedValueFromBytes defaultCodecFuel fcLayouts
+        (resolveTyWithLocalDecls decls fcLayouts fcF16Ty)
+        (encodeLittleEndianBytes bits 2 none) = some (.scalar ⟨bits, 2⟩) := by
+      change (match abstractBytesHaveProv (encodeLittleEndianBytes bits 2 none) with
+        | true => none
+        | false =>
+          match Nat.beq (Trusted.Sequence.length (encodeLittleEndianBytes bits 2 none)) 2 with
+          | false => none
+          | true =>
+            match decodeScalarBytes (encodeLittleEndianBytes bits 2 none) false with
+            | some (sv, _) => some (Value.scalar sv)
+            | none => none) = _
+      rw [fc_abstractBytesHaveProv_encode_none, fc_seqLength_encodeLittleEndianBytes,
+        fc_decodeScalarBytes_encode none false 1 bits (by simpa using h16)]
+    exact fc_evalRvalue_transmute_via_le hop hty (fc_tyByteSize_u16 decls) (fc_tyByteSize_f16 decls)
+      rfl hdec
+  · have hdec : decodeTypedValueFromBytes defaultCodecFuel fcLayouts
+        (resolveTyWithLocalDecls decls fcLayouts fcF128Ty)
+        (encodeLittleEndianBytes bits 16 none) = some (.scalar ⟨bits, 16⟩) := by
+      change (match abstractBytesHaveProv (encodeLittleEndianBytes bits 16 none) with
+        | true => none
+        | false =>
+          match Nat.beq (Trusted.Sequence.length (encodeLittleEndianBytes bits 16 none)) 16 with
+          | false => none
+          | true =>
+            match decodeScalarBytes (encodeLittleEndianBytes bits 16 none) false with
+            | some (sv, _) => some (Value.scalar sv)
+            | none => none) = _
+      rw [fc_abstractBytesHaveProv_encode_none, fc_seqLength_encodeLittleEndianBytes,
+        fc_decodeScalarBytes_encode none false 15 bits (by simpa using h128)]
+    exact fc_evalRvalue_transmute_via_le hop hty (fc_tyByteSize_u128 decls)
+      (fc_tyByteSize_f128 decls) rfl hdec
+
 /-! ## Axiom guards
 
 Every public theorem of this module depends at most on `propext`, `Classical.choice`, and
 `Quot.sound` (no `sorryAx`, no `Lean.ofReduceBool`); the Anneal-side transmute, decoding, and
-symbolic-run theorems avoid `Classical.choice`, which enters only through the MiniRust-side
+symbolic-run theorems avoid `Classical.choice`, which enters only through MiniRust-side
 library lemmas (`decode_int_scalarBytes`, `canRepresent_intFromBits`, `decode_leBytes`,
-`decodePtr_ptrBytes`). -/
+`decodePtr_ptrBytes`, and the simulation theorem `mirCall_ret`). -/
 
 section AxiomGuards
 
@@ -4372,6 +4834,162 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_anneal_ptr_transmute_and_cast_
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_anneal_ptr_transmute_and_cast_boundary
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_carrierCast_inFragment' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_carrierCast_inFragment
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_carrierCast_ctxOk' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_carrierCast_ctxOk
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_carrierCast_argsOk' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_carrierCast_argsOk
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_wrapScalarBits_of_lt' does not depend on any axioms
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_wrapScalarBits_of_lt
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_carrierCast_raw' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_run_carrierCast_raw
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_carrierCast_anneal' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_sym_carrierCast_anneal
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_mr_carrier_steps' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_sym_mr_carrier_steps
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_from_bits_as_i32_machine' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_from_bits_as_i32_machine
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_carrierCast64_inFragment' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_carrierCast64_inFragment
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_carrierCast64_ctxOk' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_carrierCast64_ctxOk
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_carrierCast64_argsOk' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_carrierCast64_argsOk
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_carrierCast64_raw' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_run_carrierCast64_raw
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_carrierCast64_anneal' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_sym_carrierCast64_anneal
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_mr_carrier64_steps' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_sym_mr_carrier64_steps
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_widen_bits_machine' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_widen_bits_machine
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_f64_from_bits_as_i64_raw' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_run_f64_from_bits_as_i64_raw
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_run_narrow_bits_raw' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_run_narrow_bits_raw
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_f64_from_bits_as_i64' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_f64_from_bits_as_i64
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_narrow_bits' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_narrow_bits
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_int_as_f64_bits' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_int_as_f64_bits
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_tyByteSize_f16' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_tyByteSize_f16
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_tyByteSize_f128' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_tyByteSize_f128
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_tyByteSize_u16' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_tyByteSize_u16
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_tyByteSize_u128' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_tyByteSize_u128
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_decodeTyped_f16_f128_eq' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_decodeTyped_f16_f128_eq
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_f16_f128_from_bits' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_f16_f128_from_bits
 
 end AxiomGuards
 
