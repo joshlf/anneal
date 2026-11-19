@@ -69,6 +69,41 @@ fn compiler_tables_agree_and_every_dialect_has_its_lean_model_and_gates() {
         driver, verifier,
         "capture driver and verifier tables differ"
     );
+    let targets = |relative: &str| -> Vec<String> {
+        let text = read(relative);
+        let start = text
+            .find("SUPPORTED_TARGETS: &[&str] = &[")
+            .unwrap_or_else(|| panic!("{relative} has no SUPPORTED_TARGETS table"));
+        let end = start + text[start..].find("\n];").expect("end of target table");
+        text[start..end]
+            .lines()
+            .skip(1)
+            .map(|line| {
+                line.trim()
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.strip_suffix("\","))
+                    .unwrap_or_else(|| panic!("{relative}: malformed target entry {line:?}"))
+                    .to_owned()
+            })
+            .collect()
+    };
+    let driver_targets = targets("trusted/rustc-capture/src/compilers.rs");
+    let verifier_targets = targets("trusted/cargo-anneal/src/compilers.rs");
+    assert_eq!(
+        driver_targets,
+        vec![
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "riscv64gc-unknown-linux-gnu",
+            "x86_64-unknown-fuchsia",
+            "aarch64-unknown-fuchsia",
+            "riscv64gc-unknown-fuchsia",
+        ]
+    );
+    assert_eq!(
+        driver_targets, verifier_targets,
+        "capture driver and verifier target allowlists differ"
+    );
 
     let semantics = read("trusted/lean/Trusted/MirSemantics.lean");
     let bundle = read("trusted/cargo-anneal/examples/regenerate_bundle.rs");

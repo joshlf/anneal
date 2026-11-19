@@ -10,6 +10,7 @@
 
 #![cfg(unix)]
 
+#[allow(dead_code)]
 mod support;
 
 use std::fs;

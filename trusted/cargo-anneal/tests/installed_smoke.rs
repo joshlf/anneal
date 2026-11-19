@@ -24,6 +24,7 @@
 //! `python3 reproduce.py` in a retained command directory to repeat its argv,
 //! environment, and working directory with the recorded toolchain artifacts.
 
+#[cfg(feature = "setup")]
 #[allow(dead_code)]
 #[path = "../src/setup.rs"]
 mod setup;
@@ -46,7 +47,7 @@ const CASES: &[&str] = &[
     "bundled-cargo-check",
     "cargo-arguments",
     "cargo-help",
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "setup", target_os = "linux"))]
     "cargo-setup-invalid-archive",
     "cargo-version",
     "driver-callback",
@@ -167,6 +168,7 @@ fn installation(run: &RunDirectory) -> TestResult<PathBuf> {
             )?;
             Ok(root)
         }
+        #[cfg(feature = "setup")]
         (Some(_), None) => {
             let archive = required_path("ANNEAL_TEST_ARCHIVE")?;
             let mut startup = run.case("installation")?;
@@ -207,12 +209,17 @@ fn installation(run: &RunDirectory) -> TestResult<PathBuf> {
             )?;
             Ok(root)
         }
+        #[cfg(not(feature = "setup"))]
+        (Some(_), None) => Err(
+            "ANNEAL_TEST_ARCHIVE requires the setup feature; pass ANNEAL_TEST_INSTALL_ROOT".into(),
+        ),
     }
 }
 
 // Installation runs in a child so archive extraction also has a process
 // deadline. Location::Custom prevents an older user-global installation from
 // satisfying a test of a newly supplied archive.
+#[cfg(feature = "setup")]
 #[test]
 #[ignore = "internal archive-install subprocess"]
 fn install_archive_worker() {
@@ -231,10 +238,18 @@ fn cargo_case(name: &str, case: &mut CaseDirectory) -> TestResult {
     version(case, &cargo, "cargo-anneal")?;
     match name {
         "cargo-help" => {
-            for arguments in [&["--help"][..], &["anneal", "--help"], &["setup", "--help"]] {
+            #[cfg(feature = "setup")]
+            let help_cases: &[&[&str]] =
+                &[&["--help"], &["anneal", "--help"], &["setup", "--help"]];
+            #[cfg(not(feature = "setup"))]
+            let help_cases: &[&[&str]] = &[&["--help"], &["anneal", "--help"]];
+            for arguments in help_cases {
                 let out = case.run(&Invocation::new(&cargo, arguments))?;
                 out.expect_code(0)?;
+                #[cfg(feature = "setup")]
                 require_text(&out.stdout, "setup", &out)?;
+                #[cfg(not(feature = "setup"))]
+                require_text(&out.stdout, "verify", &out)?;
             }
             Ok(())
         }
@@ -251,13 +266,13 @@ fn cargo_case(name: &str, case: &mut CaseDirectory) -> TestResult {
             out.expect_code(2)?;
             require_text(&out.stderr, "unknown-scaffold-command", &out)
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(feature = "setup", target_os = "linux"))]
         "cargo-setup-invalid-archive" => cargo_setup_failure(case, &cargo),
         _ => Err(format!("unknown cargo case {name}")),
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "setup", target_os = "linux"))]
 fn cargo_setup_failure(case: &mut CaseDirectory, cargo: &Path) -> TestResult {
     case.write("invalid.tar.zst", b"invalid local toolchain archive")?;
     let cache = case.path().join("cache");

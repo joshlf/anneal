@@ -21,16 +21,8 @@ pub type Result<T> = std::result::Result<T, String>;
 
 fn int_ty_spec(t: ty::Ty<'_>) -> Result<(u32, bool, bool)> {
     let (bits, signed, is_size) = match *t.kind() {
-        ty::Uint(u) => (
-            u.bit_width().unwrap_or(64),
-            false,
-            u.bit_width().is_none(),
-        ),
-        ty::Int(i) => (
-            i.bit_width().unwrap_or(64),
-            true,
-            i.bit_width().is_none(),
-        ),
+        ty::Uint(u) => (u.bit_width().unwrap_or(64), false, u.bit_width().is_none()),
+        ty::Int(i) => (i.bit_width().unwrap_or(64), true, i.bit_width().is_none()),
         _ => return Err(format!("expected integer discriminant type, got {t:?}")),
     };
     if bits > 64 {
@@ -48,7 +40,9 @@ fn enum_tag_repr<'tcx>(
         .layout_of(TypingEnv::fully_monomorphized().as_query_input(t))
         .map_err(|err| format!("failed to compute enum layout for {t:?}: {err}"))?;
     match &layout.variants {
-        Variants::Empty => Err(format!("uninhabited zero-variant enums are unsupported: {t:?}")),
+        Variants::Empty => Err(format!(
+            "uninhabited zero-variant enums are unsupported: {t:?}"
+        )),
         Variants::Single { index } => {
             if index.as_usize() == 0 && layout.size.bytes() == 0 && variant_count == 1 {
                 Ok(ir::EnumTagRepr::ZeroSized)
@@ -106,19 +100,13 @@ pub fn ty<'tcx>(tcx: TyCtxt<'tcx>, t: ty::Ty<'tcx>) -> Result<ir::Ty> {
         ty::Bool => return Ok(ir::Ty::Bool),
         ty::Never => return Ok(ir::Ty::Never),
         ty::Tuple(elements) if elements.is_empty() => return Ok(ir::Ty::Unit),
-        ty::Uint(u) => (
-            u.bit_width().unwrap_or(64),
-            false,
-            u.bit_width().is_none(),
-        ),
-        ty::Int(i) => (
-            i.bit_width().unwrap_or(64),
-            true,
-            i.bit_width().is_none(),
-        ),
-        ty::Adt(adt, args) if adt.did().is_local() && adt.is_enum() && args.is_empty() => {
+        ty::Uint(u) => (u.bit_width().unwrap_or(64), false, u.bit_width().is_none()),
+        ty::Int(i) => (i.bit_width().unwrap_or(64), true, i.bit_width().is_none()),
+        ty::Adt(adt, args) if adt.is_enum() && args.is_empty() => {
             if adt.variants().is_empty() {
-                return Err(format!("uninhabited zero-variant enums are unsupported: {t:?}"));
+                return Err(format!(
+                    "uninhabited zero-variant enums are unsupported: {t:?}"
+                ));
             }
             if adt
                 .variants()
@@ -127,8 +115,7 @@ pub fn ty<'tcx>(tcx: TyCtxt<'tcx>, t: ty::Ty<'tcx>) -> Result<ir::Ty> {
             {
                 return Err(format!("enum payloads are unsupported: {t:?}"));
             }
-            let (discr_bits, discr_signed, discr_is_size) =
-                int_ty_spec(t.discriminant_ty(tcx))?;
+            let (discr_bits, discr_signed, discr_is_size) = int_ty_spec(t.discriminant_ty(tcx))?;
             let tag_repr = enum_tag_repr(tcx, t, adt.variants().len())?;
             // `discriminants` computes explicit and implicit discriminants;
             // it is not safe to substitute the enumeration index here.
@@ -144,8 +131,20 @@ pub fn ty<'tcx>(tcx: TyCtxt<'tcx>, t: ty::Ty<'tcx>) -> Result<ir::Ty> {
                         .map_err(|_| "enum discriminant exceeds 64 bits".to_string())
                 })
                 .collect::<Result<Vec<_>>>()?;
+            // Pack `(CrateNum, DefIndex)` into 64 bits matching `rustc`'s own
+            // `DefId` layout. Because `LOCAL_CRATE` is `CrateNum::ZERO`,
+            // `"Item definitions in the currently-compiled crate would have the
+            // `CrateNum` `LOCAL_CRATE` in their `DefId`"`, local enums keep
+            // `index` unchanged while enums imported from authenticated
+            // `--extern` crates remain distinct across crate boundaries.
+            // https://github.com/rust-lang/rust/blob/7189d39d9ce936881b8132c6addeaf3e295cd455/compiler/rustc_span/src/def_id.rs#L33-L35
+            // https://github.com/rust-lang/rust/blob/7189d39d9ce936881b8132c6addeaf3e295cd455/compiler/rustc_span/src/def_id.rs#L239-L250
+            // https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_span/src/def_id.rs#L26-L28
+            // https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_span/src/def_id.rs#L242-L253
+            let did = adt.did();
+            let id = (u64::from(did.krate.as_u32()) << 32) | u64::from(did.index.as_u32());
             let ety = ir::EnumTy {
-                id: adt.did().index.as_u32(),
+                id,
                 discr_bits,
                 discr_signed,
                 discr_is_size,
@@ -288,12 +287,7 @@ fn mask_for_bits(bits: u32) -> u128 {
     }
 }
 
-fn tag_bits_to_discr_bits(
-    tag_bits: u32,
-    tag_signed: bool,
-    discr_bits: u32,
-    raw_tag: u128,
-) -> u128 {
+fn tag_bits_to_discr_bits(tag_bits: u32, tag_signed: bool, discr_bits: u32, raw_tag: u128) -> u128 {
     let masked_tag = raw_tag & mask_for_bits(tag_bits);
     let extended = if tag_signed {
         let shift = 128 - tag_bits;
@@ -323,8 +317,7 @@ pub(crate) fn validate_enum_ty(ety: &ir::EnumTy) -> Result<()> {
             return Err("enum discriminant exceeds its discriminant width".into());
         }
     }
-    let unique: std::collections::BTreeSet<u64> =
-        ety.discriminants.iter().copied().collect();
+    let unique: std::collections::BTreeSet<u64> = ety.discriminants.iter().copied().collect();
     if unique.len() != ety.discriminants.len() {
         return Err("duplicate enum discriminants are unsupported".into());
     }
@@ -347,12 +340,8 @@ pub(crate) fn validate_enum_ty(ety: &ir::EnumTy) -> Result<()> {
             let tag_mask = mask_for_bits(tag_bits);
             for &d in &ety.discriminants {
                 let d128 = u128::from(d);
-                let recovered = tag_bits_to_discr_bits(
-                    tag_bits,
-                    tag_signed,
-                    ety.discr_bits,
-                    d128 & tag_mask,
-                );
+                let recovered =
+                    tag_bits_to_discr_bits(tag_bits, tag_signed, ety.discr_bits, d128 & tag_mask);
                 if recovered != d128 {
                     return Err(
                         "enum discriminant does not round-trip through its tag representation"

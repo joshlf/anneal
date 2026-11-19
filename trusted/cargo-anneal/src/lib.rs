@@ -1437,6 +1437,7 @@ fn scan_lean_tree_opts(
 
 /// Pinned SHA-256 digests of the official Lean 4.34.1 `bin/lean` binaries from
 /// `trusted/lean/foundation-lock.json`.
+#[cfg(feature = "setup")]
 const LOCKED_LEAN_SHA256: [&str; 4] = [
     "79fb1d26fa5a39385d59fdc48a711a14b0710ca6480271acce99b4d177cea085",
     "1b370cfcbf44e80d1b004ab1b1ab9a4c73951f9f7c242140bcff9bc577576554",
@@ -1447,6 +1448,7 @@ const LOCKED_LEAN_SHA256: [&str; 4] = [
 /// Resolve the default pinned Lean 4.34.1 binary path when none is explicitly
 /// provided, selecting a candidate binary whose SHA-256 matches
 /// `LOCKED_LEAN_SHA256`.
+#[cfg(feature = "setup")]
 pub fn default_lean_path() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/root"));
     let mut candidate_paths = Vec::new();
@@ -1732,31 +1734,51 @@ fn is_retained_environment_key(key: &str) -> bool {
     matches!(key, "HOME" | "TMPDIR" | "LANG" | "LC_ALL")
 }
 
+fn retained_ambient_environment(override_tmpdir: bool) -> io::Result<Vec<(String, String)>> {
+    // Unforwarded host settings have no bearing on the Lean child, so they
+    // impose no UTF-8 requirement. Validate retained values without lossy
+    // conversion before admitting them to the child environment.
+    env::vars_os()
+        .filter_map(|(key, value)| {
+            let key = key.to_str()?;
+            if override_tmpdir && key == "TMPDIR" {
+                return None;
+            }
+            is_retained_environment_key(key).then(|| (key.to_owned(), value))
+        })
+        .map(|(key, value)| {
+            let value = value.into_string().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("environment variable {key} is not valid UTF-8"),
+                )
+            })?;
+            Ok((key, value))
+        })
+        .collect()
+}
+
 impl Checker {
     /// Create a new [`Checker`] with a fresh private staging directory.
     ///
     /// Discard unlisted environment entries before decoding their values. A
     /// retained value that is not valid UTF-8 returns an `InvalidInput` error.
     pub fn new(checkout: &Path, lean: Option<&Path>) -> io::Result<Self> {
-        // Unforwarded host settings have no bearing on the Lean child, so
-        // they impose no UTF-8 requirement. Validate retained values without
-        // lossy conversion before admitting them to the child environment.
-        let environment = env::vars_os()
-            .filter_map(|(key, value)| {
-                let key = key.to_str()?;
-                is_retained_environment_key(key).then(|| (key.to_owned(), value))
-            })
-            .map(|(key, value)| {
-                let value = value.into_string().map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("environment variable {key} is not valid UTF-8"),
-                    )
-                })?;
-                Ok((key, value))
-            })
-            .collect::<io::Result<Vec<_>>>()?;
+        let environment = retained_ambient_environment(false)?;
         let mut checker = Self::new_with_env(checkout, lean, environment)?;
+        if let Some(cache_dir) = env::var_os("ANNEAL_MIRI_CACHE_DIR")
+            && !cache_dir.is_empty()
+        {
+            checker.miri_cache_dir = Some(PathBuf::from(cache_dir));
+        }
+        Ok(checker)
+    }
+
+    /// Create a new [`Checker`] whose staging directory and child `TMPDIR`
+    /// reside inside `temp_root` rather than the ambient `TMPDIR`.
+    pub fn new_in(checkout: &Path, lean: Option<&Path>, temp_root: &Path) -> io::Result<Self> {
+        let environment = retained_ambient_environment(true)?;
+        let mut checker = Self::new_in_with_env(checkout, lean, Some(temp_root), environment)?;
         if let Some(cache_dir) = env::var_os("ANNEAL_MIRI_CACHE_DIR")
             && !cache_dir.is_empty()
         {
@@ -1776,11 +1798,33 @@ impl Checker {
     where
         I: IntoIterator<Item = (String, String)>,
     {
+        Self::new_in_with_env(checkout, lean, None, ambient_env)
+    }
+
+    /// Create a new [`Checker`] using a closed environment allowlist and an
+    /// optional explicit `temp_root` directory for staging and child `TMPDIR`.
+    pub fn new_in_with_env<I>(
+        checkout: &Path,
+        lean: Option<&Path>,
+        temp_root: Option<&Path>,
+        ambient_env: I,
+    ) -> io::Result<Self>
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
         let checkout = fs::canonicalize(checkout)?;
         let source = checkout.join("trusted/lean");
         let lean_raw = match lean {
             Some(p) => p.to_path_buf(),
+            #[cfg(feature = "setup")]
             None => default_lean_path(),
+            #[cfg(not(feature = "setup"))]
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "an explicit Lean binary path (--lean) is required when cargo-anneal is built without the setup feature",
+                ));
+            }
         };
         let lean = if lean_raw.is_absolute() {
             lean_raw
@@ -1793,13 +1837,28 @@ impl Checker {
         // Set permissions at creation, before any inputs reach the directory.
         #[cfg(unix)]
         stage_builder.permissions(fs::Permissions::from_mode(0o700));
-        let stage_dir = stage_builder.tempdir()?;
+        let (stage_dir, pinned_tmpdir) = match temp_root {
+            Some(root) => {
+                let root = fs::canonicalize(root)?;
+                let Some(root_utf8) = root.to_str().map(str::to_owned) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "temporary directory root path must be valid UTF-8",
+                    ));
+                };
+                (stage_builder.tempdir_in(&root)?, Some(root_utf8))
+            }
+            None => (stage_builder.tempdir()?, None),
+        };
         let stage = stage_dir.path().to_path_buf();
 
         let mut environment: BTreeMap<String, String> = ambient_env
             .into_iter()
             .filter(|(k, _)| is_retained_environment_key(k))
             .collect();
+        if let Some(tmpdir) = pinned_tmpdir {
+            environment.insert("TMPDIR".to_string(), tmpdir);
+        }
         environment.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
 
         Ok(Self {
@@ -2575,11 +2634,7 @@ impl Checker {
         if !self.admitted()?.theory_modules.is_empty()
             && !self.admitted()?.theory_modules.contains_key("Anneal")
         {
-            return Err(Failure::new(
-                1,
-                "snapshot",
-                "missing Anneal.lean umbrella",
-            ));
+            return Err(Failure::new(1, "snapshot", "missing Anneal.lean umbrella"));
         }
         let preflight = self.preflight_repo_modules()?;
 
@@ -3907,6 +3962,53 @@ mod process_tests {
             ])
         );
         assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn new_in_with_env_stages_inside_temp_root_and_overrides_tmpdir() {
+        let checkout = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let canonical_scratch = fs::canonicalize(scratch.path()).unwrap();
+        let checker = Checker::new_in_with_env(
+            checkout.path(),
+            Some(Path::new("/usr/bin/env")),
+            Some(scratch.path()),
+            [
+                ("HOME".to_string(), "/selected/home".to_string()),
+                ("TMPDIR".to_string(), "/nonexistent_ro_tmp".to_string()),
+            ],
+        )
+        .unwrap();
+        assert!(
+            checker.stage.starts_with(&canonical_scratch),
+            "stage {} is not beneath {}",
+            checker.stage.display(),
+            canonical_scratch.display()
+        );
+        let output = checker.launch_lean(&[]).unwrap();
+        assert!(output.status.success());
+        let environment = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            environment
+                .lines()
+                .any(|line| line == format!("TMPDIR={}", canonical_scratch.display())),
+            "unexpected child environment:\n{environment}"
+        );
+    }
+
+    #[cfg(not(feature = "setup"))]
+    #[test]
+    fn checker_requires_explicit_lean_without_setup_feature() {
+        let checkout = tempfile::tempdir().unwrap();
+        let err = match Checker::new_with_env(checkout.path(), None, []) {
+            Ok(_) => panic!("Checker::new_with_env must fail without --lean"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("--lean"),
+            "unexpected error: {err}"
+        );
     }
 
     #[cfg(unix)]

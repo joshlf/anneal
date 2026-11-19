@@ -48,14 +48,53 @@ pub struct VerifyArgs {
     /// Select a function by its compiler path; omit to require the whole crate.
     #[arg(long, requires = "manifest_path")]
     select: Vec<String>,
-    /// Pinned capture driver; defaults to the installed bundle, then a sibling.
-    #[arg(long)]
+    #[cfg_attr(
+        feature = "setup",
+        arg(
+            long,
+            help = "Pinned capture driver; defaults to the installed bundle, then a sibling."
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "setup"),
+        arg(
+            long,
+            required = true,
+            help = "Pinned capture driver executable (required in hermetic builds)."
+        )
+    )]
     capture: Option<PathBuf>,
-    /// Pinned Lean executable; authenticated by the foundation lock.
-    #[arg(long)]
+    #[cfg_attr(
+        feature = "setup",
+        arg(
+            long,
+            help = "Pinned Lean executable; authenticated by the foundation lock."
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "setup"),
+        arg(
+            long,
+            required = true,
+            help = "Pinned Lean executable; authenticated by the foundation lock (required in hermetic builds)."
+        )
+    )]
     lean: Option<PathBuf>,
-    /// Pinned compiler sysroot, for a separately installed capture driver.
-    #[arg(long)]
+    #[cfg_attr(
+        feature = "setup",
+        arg(
+            long,
+            help = "Pinned compiler sysroot, for a separately installed capture driver."
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "setup"),
+        arg(
+            long,
+            required_unless_present = "rustc",
+            help = "Pinned compiler sysroot (required in hermetic builds unless --rustc is passed)."
+        )
+    )]
     sysroot: Option<PathBuf>,
     /// Compiler executable that must report `--rustc-version`; the capture
     /// driver checks it against its linked compiler too. Without `--sysroot`,
@@ -66,6 +105,10 @@ pub struct VerifyArgs {
     /// V2026_10_22_R7189d39d9, or the full 40-hex commit.
     #[arg(long, value_name = "ID", requires = "rustc")]
     rustc_version: Option<String>,
+    /// Writable directory for private verification staging and child TMPDIR;
+    /// defaults to the system temporary directory.
+    #[arg(long, value_name = "PATH")]
+    work_dir: Option<PathBuf>,
     /// New UTF-8 directory path for retained capture, sources and audit
     /// evidence.
     #[arg(long)]
@@ -81,6 +124,13 @@ struct Request {
     proof: Proof,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternCrate {
+    crate_name: String,
+    path: PathBuf,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Compilation {
@@ -94,19 +144,27 @@ struct Compilation {
     #[serde(default)]
     cfg: Vec<String>,
     source_files: Vec<PathBuf>,
+    /// Direct external crate artifacts (`.rmeta` or `.rlib`), with clean
+    /// relative paths resolved beneath the `request.json` directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    externs: Vec<ExternCrate>,
+    /// Clean relative transitive dependency directories resolved beneath the
+    /// `request.json` directory; every `.rmeta`, `.rlib`, and `.so` inside is
+    /// staged and SHA-256-bound.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    dependency_dirs: Vec<PathBuf>,
 }
 
 fn edition() -> String {
     "2024".to_owned()
 }
 
-// This target belongs to the verification profile. Archive variants select
-// executables for the host running Anneal; adding a host must not expand the
-// semantic domain. Capture admits only this triple before compiler setup in
-// `trusted/rustc-capture/src/main.rs` (`run`).
-// A compatible custom sysroot can provide this target's libraries on another
-// host. Keep library availability under the compiler's authority so neither a
-// host ban nor a guessed standard-library inventory rejects that configuration.
+// Default target when `compilation.target` is omitted from `request.json` or
+// synthesized via `--manifest-path`. Both `verify::run` and
+// `trusted/rustc-capture/src/main.rs` (`run`) enforce the closed
+// 64-bit little-endian target allowlist (`compilers::SUPPORTED_TARGETS`), and
+// `capture.rs` additionally asserts `pointer_size == 64` and `Endian::Little`
+// against `tcx.data_layout()`.
 fn target() -> String {
     "x86_64-unknown-linux-gnu".to_owned()
 }
@@ -165,6 +223,20 @@ struct SourceIdentity {
     sha256: String,
 }
 
+#[derive(Clone, Serialize)]
+struct ExternCrateIdentity {
+    crate_name: String,
+    relative_path: PathBuf,
+    sha256: String,
+}
+
+#[derive(Clone, Serialize)]
+struct DependencyArtifactIdentity {
+    relative_path: PathBuf,
+    sha256: String,
+}
+
+#[derive(Debug)]
 struct Error {
     status: &'static str,
     phase: &'static str,
@@ -251,7 +323,7 @@ struct DeclaredCompiler {
 /// runs with a cleared environment, like capture, so ambient variables such
 /// as `RUSTC_OVERRIDE_VERSION_STRING` or `LD_LIBRARY_PATH` cannot change the
 /// report.
-fn declared_compiler(given: &Path, id: &str) -> Result<DeclaredCompiler> {
+fn declared_compiler(given: &Path, id: &str, tmpdir: &Path) -> Result<DeclaredCompiler> {
     let expected = compilers::resolve(id).ok_or_else(|| {
         error(
             "unsupported",
@@ -287,6 +359,7 @@ fn declared_compiler(given: &Path, id: &str) -> Result<DeclaredCompiler> {
     let output = Command::new(&rustc)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", tmpdir)
         .args(["--version", "--verbose"])
         .output()
         .map_err(|e| io("compiler", e))?;
@@ -364,8 +437,7 @@ fn declared_compiler(given: &Path, id: &str) -> Result<DeclaredCompiler> {
 fn distribution_sysroot(given: &Path, canonical_rustc: &Path) -> Result<PathBuf> {
     let valid_root = |root: &Path| {
         root.join("lib/rustlib").is_dir()
-            && fs::canonicalize(root.join("bin/rustc"))
-                .is_ok_and(|path| path == canonical_rustc)
+            && fs::canonicalize(root.join("bin/rustc")).is_ok_and(|path| path == canonical_rustc)
     };
     if let Some(root) = canonical_rustc
         .parent()
@@ -508,10 +580,7 @@ fn source_imports_pure_lift(bytes: &[u8]) -> bool {
                 i += 1;
             }
             stripped.push('\n');
-        } else if i + 2 < raw.len()
-            && raw[i] == b'\''
-            && raw[i + 1] == b'"'
-            && raw[i + 2] == b'\''
+        } else if i + 2 < raw.len() && raw[i] == b'\'' && raw[i + 1] == b'"' && raw[i + 2] == b'\''
         {
             stripped.push(' ');
             i += 3;
@@ -553,13 +622,8 @@ fn source_imports_pure_lift(bytes: &[u8]) -> bool {
                 let Some(module) = tokens.next() else {
                     break;
                 };
-                let normalized: String = module
-                    .chars()
-                    .filter(|&c| c != '«' && c != '»')
-                    .collect();
-                if normalized == "Anneal.PureLift"
-                    || normalized.starts_with("Anneal.PureLift.")
-                {
+                let normalized: String = module.chars().filter(|&c| c != '«' && c != '»').collect();
+                if normalized == "Anneal.PureLift" || normalized.starts_with("Anneal.PureLift.") {
                     return true;
                 }
             }
@@ -613,6 +677,105 @@ fn declared_file(root: &Path, relative: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Require a declared regular directory beneath an already canonical root,
+/// rejecting `..`, absolute paths, and symlinks along every relative segment.
+fn declared_dir(root: &Path, relative: &Path) -> Result<PathBuf> {
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(error(
+            "unsupported",
+            "inputs",
+            "dependency_dirs paths must be clean relative paths",
+        ));
+    }
+    let path = root.join(relative);
+    let meta = fs::symlink_metadata(&path).map_err(|e| io("inputs", e))?;
+    if !meta.is_dir()
+        || meta.file_type().is_symlink()
+        || fs::canonicalize(&path).map_err(|e| io("inputs", e))? != path
+    {
+        return Err(error(
+            "unsupported",
+            "inputs",
+            format!("not a declared regular directory: {}", path.display()),
+        ));
+    }
+    Ok(path)
+}
+
+type ScannedDepArtifacts = BTreeMap<String, (PathBuf, Vec<u8>, String)>;
+
+/// Scan a canonical `dependency_dirs` directory for crate metadata and library
+/// artifacts (`.rmeta`, `.rlib`, `.so`), rejecting symlinks and unsupported
+/// dynamic library formats (`.dylib`, `.dll`) and returning a deterministic
+/// map from UTF-8 filename to `(canonical_path, bytes, sha256)`.
+fn scan_dependency_dir(dir: &Path, phase: &'static str) -> Result<ScannedDepArtifacts> {
+    let err_status = if phase == "binding" {
+        "tool_failed"
+    } else {
+        "unsupported"
+    };
+    let mut found = BTreeMap::new();
+    for entry in fs::read_dir(dir).map_err(|e| io(phase, e))? {
+        let entry = entry.map_err(|e| io(phase, e))?;
+        let entry_path = entry.path();
+        let meta = fs::symlink_metadata(&entry_path).map_err(|e| io(phase, e))?;
+        if meta.file_type().is_symlink() {
+            return Err(error(
+                err_status,
+                phase,
+                format!(
+                    "symlink forbidden in dependency directory {}: {}",
+                    dir.display(),
+                    entry_path.display()
+                ),
+            ));
+        }
+        let ext = entry_path.extension().and_then(|e| e.to_str());
+        if matches!(ext, Some("dylib" | "dll")) {
+            return Err(error(
+                err_status,
+                phase,
+                format!(
+                    "unsupported dynamic library artifact in {}: {}",
+                    dir.display(),
+                    entry_path.display()
+                ),
+            ));
+        }
+        if matches!(ext, Some("rmeta" | "rlib" | "so")) {
+            if !meta.is_file() {
+                return Err(error(
+                    err_status,
+                    phase,
+                    format!(
+                        "expected regular crate artifact file in {}: {}",
+                        dir.display(),
+                        entry_path.display()
+                    ),
+                ));
+            }
+            let Some(name_utf8) = entry.file_name().to_str().map(str::to_owned) else {
+                return Err(error(
+                    "tool_failed",
+                    phase,
+                    format!(
+                        "non-UTF-8 crate artifact filename: {}",
+                        entry_path.display()
+                    ),
+                ));
+            };
+            let bytes = fs::read(&entry_path).map_err(|e| io(phase, e))?;
+            let sha256 = digest(&bytes);
+            found.insert(name_utf8, (entry_path, bytes, sha256));
+        }
+    }
+    Ok(found)
+}
+
 fn root(base: &Path, path: &Path) -> Result<PathBuf> {
     fs::canonicalize(base.join(path)).map_err(|e| io("inputs", e))
 }
@@ -649,21 +812,32 @@ fn reject_compiler_overrides(dir: &Path) -> Result<()> {
 // Cargo is an input-discovery shortcut, not a second verification profile.
 // Reject configurations this adapter cannot reproduce before building the
 // same explicit request consumed by the build-neutral path.
-fn cargo_request(args: &VerifyArgs, manifest: &Path) -> Result<(Request, PathBuf)> {
+fn cargo_request(
+    args: &VerifyArgs,
+    manifest: &Path,
+    work_tmp: &Path,
+) -> Result<(Request, PathBuf)> {
     let manifest = fs::canonicalize(manifest).map_err(|e| io("cargo", e))?;
     let source_root = manifest
         .parent()
-        .ok_or_else(|| error("unsupported", "cargo", "manifest path has no parent directory"))?
+        .ok_or_else(|| {
+            error(
+                "unsupported",
+                "cargo",
+                "manifest path has no parent directory",
+            )
+        })?
         .to_path_buf();
     reject_compiler_overrides(&source_root)?;
-    let probe_cwd = tempfile::tempdir().map_err(|e| io("cargo", e))?;
+    let probe_cwd = tempfile::tempdir_in(work_tmp).map_err(|e| io("cargo", e))?;
     let mut cargo = Command::new("cargo");
     cargo.current_dir(probe_cwd.path()).env_clear();
-    for key in ["PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME", "TMPDIR"] {
+    for key in ["PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME"] {
         if let Some(value) = std::env::var_os(key) {
             cargo.env(key, value);
         }
     }
+    cargo.env("TMPDIR", work_tmp);
     let output = cargo
         .args([
             "metadata",
@@ -795,9 +969,7 @@ fn cargo_request(args: &VerifyArgs, manifest: &Path) -> Result<(Request, PathBuf
     for entry in walkdir::WalkDir::new(&proof_root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| {
-            e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.')
-        })
+        .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'))
     {
         let entry = entry.map_err(|e| error("tool_failed", "proof", e))?;
         if entry.file_type().is_file() && entry.path().extension().is_some_and(|e| e == "lean") {
@@ -840,6 +1012,8 @@ fn cargo_request(args: &VerifyArgs, manifest: &Path) -> Result<(Request, PathBuf
                 target: target(),
                 cfg: Vec::new(),
                 source_files,
+                externs: Vec::new(),
+                dependency_dirs: Vec::new(),
             },
             scope,
             proof: Proof {
@@ -855,7 +1029,7 @@ fn cargo_request(args: &VerifyArgs, manifest: &Path) -> Result<(Request, PathBuf
     ))
 }
 
-fn load_request(args: &VerifyArgs) -> Result<(Request, PathBuf)> {
+fn load_request(args: &VerifyArgs, work_tmp: &Path) -> Result<(Request, PathBuf)> {
     if let Some(path) = &args.request {
         let path = fs::canonicalize(path).map_err(|e| io("request", e))?;
         let bytes = fs::read(&path).map_err(|e| io("request", e))?;
@@ -863,13 +1037,25 @@ fn load_request(args: &VerifyArgs) -> Result<(Request, PathBuf)> {
             serde_json::from_slice(&bytes).map_err(|e| error("unsupported", "request", e))?;
         Ok((request, path.parent().unwrap().to_path_buf()))
     } else {
-        cargo_request(args, args.manifest_path.as_ref().unwrap())
+        cargo_request(args, args.manifest_path.as_ref().unwrap(), work_tmp)
     }
 }
 
 fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     let start = Instant::now();
-    let (mut request, base) = load_request(args)?;
+    let work_tmp = work.join("tmp");
+    {
+        let mut dir_builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            dir_builder.mode(0o700);
+        }
+        dir_builder
+            .create(&work_tmp)
+            .map_err(|e| io("staging", e))?;
+    }
+    let (mut request, base) = load_request(args, &work_tmp)?;
     if request.schema_version != 1 || request.compilation.source_files.is_empty() {
         return Err(error(
             "unsupported",
@@ -877,6 +1063,44 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
             "unsupported or empty compilation request",
         ));
     }
+    if !compilers::is_supported_target(&request.compilation.target) {
+        return Err(error(
+            "unsupported",
+            "request",
+            format!(
+                "unsupported target triple {:?}; supported targets: {}",
+                request.compilation.target,
+                compilers::SUPPORTED_TARGETS.join(", ")
+            ),
+        ));
+    }
+    for ext in &request.compilation.externs {
+        if !compilers::is_ascii_crate_ident(&ext.crate_name) {
+            return Err(error(
+                "unsupported",
+                "request",
+                format!(
+                    "invalid extern crate identifier {:?}; expected [a-zA-Z_][a-zA-Z0-9_]*",
+                    ext.crate_name
+                ),
+            ));
+        }
+    }
+    request
+        .compilation
+        .externs
+        .sort_by(|a, b| a.crate_name.cmp(&b.crate_name));
+    for pair in request.compilation.externs.windows(2) {
+        if pair[0].crate_name == pair[1].crate_name {
+            return Err(error(
+                "unsupported",
+                "request",
+                format!("duplicate extern crate name {:?}", pair[0].crate_name),
+            ));
+        }
+    }
+    request.compilation.dependency_dirs.sort();
+    request.compilation.dependency_dirs.dedup();
     request.compilation.cfg.sort();
     request.compilation.cfg.dedup();
     if let Scope::SelectedUnit { roots } = &mut request.scope {
@@ -906,9 +1130,9 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
         Some(_) => return Err(error("unsupported", "request", "invalid theorem module")),
         None => module_of(&request.proof.theorem)?,
     };
-    // Selection roots and cfg entries have set semantics here. Hash their
-    // normalized form so spelling order and duplicates cannot give the same
-    // configured subject different request identities.
+    // Selection roots, cfg entries, externs, and dependency_dirs are normalized
+    // above so spelling order cannot give the same configured subject different
+    // request identities.
     let request_bytes = encoded(&request)?;
     let request_sha256 = digest(&request_bytes);
     write(&work.join("request.json"), &request_bytes)?;
@@ -943,12 +1167,120 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
             "crate_root is not a declared source",
         ));
     }
+
+    // Stage and SHA-256-authenticate external `.rmeta`/`.rlib` crate inputs and
+    // transitive `-L dependency=` directories beneath a private `deps` tree.
+    let base_canon = fs::canonicalize(&base).map_err(|e| io("inputs", e))?;
+    let deps_stage = work.join("deps");
+    let mut declared_externs = Vec::new();
+    let mut expected_staged_externs = Vec::new();
+    let mut staged_extern_args: Vec<(String, String)> = Vec::new();
+    let mut expected_staged_dep_dirs: Vec<String> = Vec::new();
+    let mut declared_dep_artifacts = Vec::new();
+    let mut expected_staged_dep_artifacts: Vec<(String, Value)> = Vec::new();
+    let mut staged_artifact_map: BTreeMap<PathBuf, (PathBuf, String)> = BTreeMap::new();
+    let mut watched_dep_dirs: Vec<(PathBuf, BTreeMap<String, String>)> = Vec::new();
+
+    for ext in &request.compilation.externs {
+        if !matches!(
+            ext.path.extension().and_then(|e| e.to_str()),
+            Some("rmeta" | "rlib")
+        ) {
+            return Err(error(
+                "unsupported",
+                "inputs",
+                format!(
+                    "extern crate {} path must end in .rmeta or .rlib: {}",
+                    ext.crate_name,
+                    ext.path.display()
+                ),
+            ));
+        }
+        let original = declared_file(&base_canon, &ext.path)?;
+        let bytes = fs::read(&original).map_err(|e| io("inputs", e))?;
+        let sha256 = digest(&bytes);
+        let staged = deps_stage.join(&ext.path);
+        write(&staged, &bytes)?;
+        let staged = fs::canonicalize(&staged).map_err(|e| io("staging", e))?;
+        let Some(staged_utf8) = staged.to_str().map(str::to_owned) else {
+            return Err(error(
+                "tool_failed",
+                "staging",
+                "staged extern crate path must be UTF-8",
+            ));
+        };
+        originals.push((original, sha256.clone()));
+        declared_externs.push(ExternCrateIdentity {
+            crate_name: ext.crate_name.clone(),
+            relative_path: ext.path.clone(),
+            sha256: sha256.clone(),
+        });
+        expected_staged_externs.push(json!({
+            "crate_name": ext.crate_name,
+            "path": staged_utf8,
+            "sha256": sha256,
+        }));
+        staged_extern_args.push((ext.crate_name.clone(), staged_utf8));
+        staged_artifact_map.insert(staged, (ext.path.clone(), sha256));
+    }
+
+    for rel_dir in &request.compilation.dependency_dirs {
+        let original_dir = declared_dir(&base_canon, rel_dir)?;
+        let scanned = scan_dependency_dir(&original_dir, "inputs")?;
+        let staged_dir = deps_stage.join(rel_dir);
+        fs::create_dir_all(&staged_dir).map_err(|e| io("staging", e))?;
+        let staged_dir = fs::canonicalize(&staged_dir).map_err(|e| io("staging", e))?;
+        let Some(staged_dir_utf8) = staged_dir.to_str().map(str::to_owned) else {
+            return Err(error(
+                "tool_failed",
+                "staging",
+                "staged dependency directory path must be UTF-8",
+            ));
+        };
+        expected_staged_dep_dirs.push(staged_dir_utf8);
+        let mut expected_dir_digests = BTreeMap::new();
+        for (file_name, (orig_file, bytes, sha256)) in scanned {
+            expected_dir_digests.insert(file_name.clone(), sha256.clone());
+            let rel_file = rel_dir.join(&file_name);
+            let staged_file = staged_dir.join(&file_name);
+            write(&staged_file, &bytes)?;
+            let staged_file = fs::canonicalize(&staged_file).map_err(|e| io("staging", e))?;
+            let Some(staged_file_utf8) = staged_file.to_str().map(str::to_owned) else {
+                return Err(error(
+                    "tool_failed",
+                    "staging",
+                    "staged dependency artifact path must be UTF-8",
+                ));
+            };
+            originals.push((orig_file, sha256.clone()));
+            declared_dep_artifacts.push(DependencyArtifactIdentity {
+                relative_path: rel_file.clone(),
+                sha256: sha256.clone(),
+            });
+            expected_staged_dep_artifacts.push((
+                staged_file_utf8.clone(),
+                json!({
+                    "path": staged_file_utf8,
+                    "sha256": sha256,
+                }),
+            ));
+            staged_artifact_map.insert(staged_file, (rel_file, sha256));
+        }
+        watched_dep_dirs.push((original_dir, expected_dir_digests));
+    }
+    expected_staged_dep_dirs.sort();
+    expected_staged_dep_dirs.dedup();
+    expected_staged_dep_artifacts.sort_by(|a, b| a.0.cmp(&b.0));
+    expected_staged_dep_artifacts.dedup_by(|a, b| a.0 == b.0);
+    let expected_staged_dep_artifacts_json: Vec<Value> = expected_staged_dep_artifacts
+        .into_iter()
+        .map(|(_, val)| val)
+        .collect();
+
     // The invocation owns tool selection; target requests cannot name a
     // compiler executable. Adapter correctness is a stated TCB assumption.
     // Its digest identifies the selected build and detects later changes.
-    // Prefer the installed bundle so its capture adapter and default Rust
-    // sysroot stay paired. Development tools remain explicit operator choices;
-    // a sibling is the fallback only when no installed bundle is resolved.
+    #[cfg(feature = "setup")]
     let installed = crate::setup::installed();
     if let Some(given_capture) = &args.capture
         && given_capture.to_str().is_none()
@@ -959,6 +1291,7 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
             "--capture path must be UTF-8",
         ));
     }
+    #[cfg(feature = "setup")]
     let capture = args
         .capture
         .clone()
@@ -972,6 +1305,14 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
                 .unwrap_or_default()
                 .with_file_name("anneal-rustc-capture")
         });
+    #[cfg(not(feature = "setup"))]
+    let capture = args.capture.clone().ok_or_else(|| {
+        error(
+            "tool_failed",
+            "capture-tool",
+            "--capture is required when built without the setup feature",
+        )
+    })?;
     let capture = fs::canonicalize(capture).map_err(|e| io("capture-tool", e))?;
     if capture.to_str().is_none() {
         return Err(error(
@@ -986,7 +1327,7 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     // its dialect before invoking capture. clap accepts both options together.
     let declared = match (&args.rustc, &args.rustc_version) {
         (Some(rustc), Some(id)) => {
-            let declared = declared_compiler(rustc, id)?;
+            let declared = declared_compiler(rustc, id, &work_tmp)?;
             require_dialect_syntax(BUNDLE, declared.expected.mir_dialect)?;
             Some(declared)
         }
@@ -996,12 +1337,13 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     // Capture reserves and publishes a new output directory itself; precreating
     // it here would violate its create-only publication contract.
     // Do not let a target crate's ambient compiler wrappers or search paths
-    // enter the capture process. The only added library path below comes
-    // from the operator-selected compiler installation.
+    // enter the capture process. Forward `TMPDIR` inside `work` so `rustc` and
+    // LLVM temporary files never touch host `/tmp` in RBE or `nsjail`.
     let mut command = Command::new(&capture);
     command
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", &work_tmp)
         .args(["capture", "--crate-root"])
         .arg(rust_stage.join(&request.compilation.crate_root))
         .args([
@@ -1026,10 +1368,23 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     }
     // An explicit sysroot wins. A declared compiler otherwise brings its own
     // distribution's libraries, which an installed bundle need not match.
+    #[cfg(feature = "setup")]
     let selected_sysroot = match (&args.sysroot, &declared) {
         (Some(sysroot), _) => Some(sysroot.clone()),
         (None, Some(declared)) => Some(distribution_sysroot(&declared.given, &declared.rustc)?),
         (None, None) => installed.as_ref().map(|root| root.join("rust")),
+    };
+    #[cfg(not(feature = "setup"))]
+    let selected_sysroot = match (&args.sysroot, &declared) {
+        (Some(sysroot), _) => Some(sysroot.clone()),
+        (None, Some(declared)) => Some(distribution_sysroot(&declared.given, &declared.rustc)?),
+        (None, None) => {
+            return Err(error(
+                "tool_failed",
+                "sysroot",
+                "--sysroot (or --rustc) is required when built without the setup feature",
+            ));
+        }
     };
     let selected_sysroot_utf8 = if let Some(sysroot) = &selected_sysroot {
         let sysroot = fs::canonicalize(sysroot).map_err(|e| io("sysroot", e))?;
@@ -1065,13 +1420,19 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
             }
         }
     }
-    // Preserve each cfg as option data through capture's parser. Capture must
-    // use the joined form again when rebuilding compiler argv: the pinned
-    // response-file expansion gate is "arg.strip_prefix('@')", before --cfg
-    // parsing. Extracting the String must not restore a standalone @file arg.
+    // Preserve each cfg and extern option as joined option data through
+    // capture's parser. Capture uses the joined form again when rebuilding
+    // compiler argv: the pinned response-file expansion gate is
+    // "arg.strip_prefix('@')", before option parsing.
     // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_driver_impl/src/args.rs#L14-L32
     for cfg in &request.compilation.cfg {
         command.arg(format!("--cfg={cfg}"));
+    }
+    for (crate_name, staged_path) in &staged_extern_args {
+        command.arg(format!("--extern={crate_name}={staged_path}"));
+    }
+    for staged_dir in &expected_staged_dep_dirs {
+        command.arg(format!("-Ldependency={staged_dir}"));
     }
     for source in &sources {
         command
@@ -1149,20 +1510,34 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     let captured_text =
         std::str::from_utf8(&captured_bytes).map_err(|e| error("tool_failed", "capture", e))?;
     require_captured_syntax(captured_text, mir_dialect)?;
-    // Authenticate configuration and scope before compiling any authored
-    // Lean. A valid theorem about another target or a narrower selection
-    // cannot satisfy this request.
+    // Authenticate configuration (including 64-bit little-endian target layout
+    // and staged crate inputs) and scope before compiling any authored Lean.
     let (scope_kind, program_scope, requested_roots) = match &request.scope {
         Scope::Crate => ("crate", "crate", Vec::new()),
         Scope::SelectedUnit { roots } => ("selected_unit", "unit", roots.clone()),
     };
+    let config = &manifest["configuration"];
+    let matches_optional_array = |field: &str, expected: &[Value]| {
+        if expected.is_empty() {
+            config.get(field).is_none_or(|v| v == &json!([]))
+        } else {
+            config.get(field) == Some(&Value::Array(expected.to_vec()))
+        }
+    };
+    let expected_dep_dirs_json: Vec<Value> =
+        expected_staged_dep_dirs.iter().map(|s| json!(s)).collect();
     if manifest["scope"]["kind"] != scope_kind
         || manifest["scope"]["roots"] != json!(requested_roots)
         || manifest["program"]["scope"] != program_scope
-        || manifest["configuration"]["crate_name"] != request.compilation.crate_name
-        || manifest["configuration"]["target"] != request.compilation.target
-        || manifest["configuration"]["edition"] != request.compilation.edition
-        || manifest["configuration"]["cfg"] != json!(request.compilation.cfg)
+        || config["crate_name"] != request.compilation.crate_name
+        || config["target"] != request.compilation.target
+        || config["pointer_bits"] != 64
+        || config["endian"] != "little"
+        || config["edition"] != request.compilation.edition
+        || config["cfg"] != json!(request.compilation.cfg)
+        || !matches_optional_array("externs", &expected_staged_externs)
+        || !matches_optional_array("dependency_dirs", &expected_dep_dirs_json)
+        || !matches_optional_array("dependency_artifacts", &expected_staged_dep_artifacts_json)
     {
         return Err(error(
             "tool_failed",
@@ -1170,9 +1545,7 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
             "capture differs from the requested compilation or scope",
         ));
     }
-    // Every observed compiler read must match a staged, declared input.
-    // Unused declared files remain in the receipt identity; they need not
-    // become compiler reads merely because the request staged them.
+    // Every observed compiler source read must match a staged, declared input.
     let source_by_path: BTreeMap<_, _> = sources
         .iter()
         .map(|s| (rust_stage.join(&s.relative_path), &s.sha256))
@@ -1199,6 +1572,58 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
                 "compiler read different source bytes",
             ));
         }
+    }
+    // Every observed external crate artifact loaded during capture must match a
+    // staged, SHA-256-authenticated artifact from `externs` or
+    // `dependency_dirs`.
+    let mut loaded_externs = Vec::new();
+    let observed_extern_entries = match manifest.get("externs") {
+        None => &[][..],
+        Some(val) => val
+            .as_array()
+            .ok_or_else(|| {
+                error(
+                    "tool_failed",
+                    "capture",
+                    "malformed observed externs inventory",
+                )
+            })?
+            .as_slice(),
+    };
+    for ext_val in observed_extern_entries {
+        let Some(crate_name) = ext_val["crate_name"]
+            .as_str()
+            .filter(|name| compilers::is_ascii_crate_ident(name))
+        else {
+            return Err(error(
+                "tool_failed",
+                "capture",
+                "capture reported invalid observed extern crate name",
+            ));
+        };
+        let path = PathBuf::from(ext_val["path"].as_str().unwrap_or_default());
+        let Some((rel_path, expected_sha)) = staged_artifact_map.get(&path) else {
+            return Err(error(
+                "tool_failed",
+                "capture",
+                format!(
+                    "compiler loaded an undeclared external crate artifact: {}",
+                    path.display()
+                ),
+            ));
+        };
+        if ext_val["sha256"].as_str() != Some(expected_sha.as_str()) {
+            return Err(error(
+                "tool_failed",
+                "capture",
+                format!("compiler loaded different external crate bytes for {crate_name}"),
+            ));
+        }
+        loaded_externs.push(ExternCrateIdentity {
+            crate_name: crate_name.to_owned(),
+            relative_path: rel_path.clone(),
+            sha256: expected_sha.clone(),
+        });
     }
     let capture_sha256 = digest(&capture_bytes);
 
@@ -1364,7 +1789,8 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     // the exact closed root and enforce origin roles before a receipt can
     // report verification success. Operational failures stay distinct from
     // a successfully executed checker rejecting a proof.
-    let mut checker = Checker::new(&bundle, args.lean.as_deref()).map_err(|e| io("audit", e))?;
+    let mut checker =
+        Checker::new_in(&bundle, args.lean.as_deref(), &work_tmp).map_err(|e| io("audit", e))?;
     let audit = checker.run_target(&audit_request).map_err(|e| {
         error(
             if e.code == 1 {
@@ -1380,11 +1806,27 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     // Snapshot identity is checked again at the accepting boundary. Logical
     // type equality cannot authenticate unused source or configuration hashes.
     for (path, expected) in &originals {
+        cargo_anneal::regular(path, "binding")
+            .map_err(|e| error("tool_failed", "binding", e.message))?;
         if digest(&fs::read(path).map_err(|e| io("binding", e))?) != *expected {
             return Err(error(
                 "tool_failed",
                 "binding",
                 "an input changed during verification",
+            ));
+        }
+    }
+    for (original_dir, expected_entries) in &watched_dep_dirs {
+        let rescanned = scan_dependency_dir(original_dir, "binding")?;
+        let current_entries: BTreeMap<String, String> = rescanned
+            .into_iter()
+            .map(|(name, (_, _, sha))| (name, sha))
+            .collect();
+        if &current_entries != expected_entries {
+            return Err(error(
+                "tool_failed",
+                "binding",
+                "a dependency directory changed during verification",
             ));
         }
     }
@@ -1421,6 +1863,8 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
         "specification_manifest_sha256": specification_manifest_sha256,
         "scope": request.scope, "selected": manifest["selected"],
         "census": manifest["census"], "sources": sources,
+        "externs": declared_externs, "loaded_externs": loaded_externs,
+        "dependency_artifacts": declared_dep_artifacts,
         "configuration": manifest["configuration"], "audit": audit,
         "timing_ms": {"capture": capture_ms, "proof_and_audit": proof_ms, "total": start.elapsed().as_millis()},
         "assumptions": ["faithful pinned compiler capture", "experimental pointer-free MIR semantics", "Lean kernel and admitted foundation", "intact compiler and verification environment"],
@@ -1430,12 +1874,23 @@ fn run(args: &VerifyArgs, work: &Path) -> Result<Value> {
     Ok(result)
 }
 
-fn verification_stage() -> std::io::Result<tempfile::TempDir> {
+fn verification_stage(work_dir: Option<&Path>) -> std::io::Result<tempfile::TempDir> {
     // Capture canonicalizes source paths before recording its read inventory.
     // Create the stage below a canonical parent so compiler arguments and our
-    // inventory keys use that same namespace, even when TMPDIR is a symlink.
-    // TempDir owns the resulting physical path and still handles its cleanup.
-    let parent = fs::canonicalize(std::env::temp_dir())?;
+    // inventory keys use that same namespace, even when TMPDIR or --work-dir
+    // is a symlink. TempDir owns the resulting physical path and handles its
+    // cleanup.
+    let base_tmp = match work_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => std::env::temp_dir(),
+    };
+    let parent = fs::canonicalize(base_tmp)?;
+    if parent.to_str().is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "canonical temporary directory path must be UTF-8",
+        ));
+    }
     let mut builder = tempfile::Builder::new();
     builder.prefix("anneal-verification-");
     // Snapshots contain source and diagnostics that other local users should
@@ -1468,7 +1923,17 @@ pub fn main(args: VerifyArgs) -> ExitCode {
         },
         None => None,
     };
-    let stage = match verification_stage() {
+    if let Some(work_dir) = args.work_dir.as_deref()
+        && work_dir.to_str().is_none()
+    {
+        println!(
+            "{}",
+            json!({"schema_version":1,"status":"tool_failed","phase":"staging",
+                "detail":"--work-dir path must be UTF-8"})
+        );
+        return ExitCode::from(2);
+    }
+    let stage = match verification_stage(args.work_dir.as_deref()) {
         Ok(stage) => stage,
         Err(failure) => {
             println!(
@@ -1566,9 +2031,12 @@ fn retain(source: &Path, destination: &Path) -> Result<()> {
 }
 
 fn copy_artifacts(source: &Path, destination: &Path) -> Result<()> {
+    let scratch_tmp = source.join("tmp");
     for entry in walkdir::WalkDir::new(source)
         .min_depth(1)
         .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| entry.path() != scratch_tmp)
     {
         let entry = entry.map_err(|e| error("tool_failed", "retention", e))?;
         let relative = entry.path().strip_prefix(source).unwrap();
@@ -1600,7 +2068,7 @@ mod tests {
 
         const CHILD: &str = "ANNEAL_VERIFICATION_DIRECTORY_PERMISSION_CHILD";
         if std::env::var_os(CHILD).is_some() {
-            let stage = verification_stage().unwrap();
+            let stage = verification_stage(None).unwrap();
             fs::write(stage.path().join("input.rs"), b"private source bytes").unwrap();
             let parent = tempfile::tempdir().unwrap();
             let destination = parent.path().join("artifacts");
@@ -1821,8 +2289,20 @@ mod tests {
                 missing_sysroot,
                 empty_sysroot,
                 fields(commit, "2026-01-01", &upstream_ver, dialect, dialect),
-                fields(commit, date, "1.80.0 (000000000 2025-01-01)", dialect, dialect),
-                fields(&commit.to_uppercase(), date, &upstream_ver, dialect, dialect),
+                fields(
+                    commit,
+                    date,
+                    "1.80.0 (000000000 2025-01-01)",
+                    dialect,
+                    dialect,
+                ),
+                fields(
+                    &commit.to_uppercase(),
+                    date,
+                    &upstream_ver,
+                    dialect,
+                    dialect,
+                ),
                 fields(&commit[..9], date, &upstream_ver, dialect, dialect),
             ] {
                 assert_eq!(authenticated_compiler(&invalid), None, "{invalid}");
@@ -1831,14 +2311,24 @@ mod tests {
                 if other == compiler {
                     continue;
                 }
-                let other_ver = format!("1.98.0-nightly ({} {})", &other.commit[..9], other.commit_date);
+                let other_ver = format!(
+                    "1.98.0-nightly ({} {})",
+                    &other.commit[..9],
+                    other.commit_date
+                );
                 // Either dialect field, or both, naming another compiler's
                 // dialect must reject; so must another compiler's date or
                 // version string.
                 for invalid in [
                     fields(commit, date, &upstream_ver, other.mir_dialect, dialect),
                     fields(commit, date, &upstream_ver, dialect, other.mir_dialect),
-                    fields(commit, date, &upstream_ver, other.mir_dialect, other.mir_dialect),
+                    fields(
+                        commit,
+                        date,
+                        &upstream_ver,
+                        other.mir_dialect,
+                        other.mir_dialect,
+                    ),
                     fields(commit, other.commit_date, &upstream_ver, dialect, dialect),
                     fields(commit, date, &other_ver, dialect, dialect),
                 ] {
@@ -2074,5 +2564,57 @@ mod tests {
                 "falsely detected PureLift import in {not_imported:?}"
             );
         }
+    }
+
+    #[test]
+    fn declared_dirs_and_dependency_scans_reject_escape_symlinks_and_dylibs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        fs::create_dir(root.join("deps")).unwrap();
+        fs::write(root.join("deps/liba.rmeta"), b"rmeta-bytes").unwrap();
+        fs::write(root.join("deps/libb.rlib"), b"rlib-bytes").unwrap();
+        fs::write(root.join("deps/liba.d"), b"ignored-depfile").unwrap();
+
+        let dep_dir = declared_dir(&root, Path::new("deps")).unwrap();
+        assert!(declared_dir(&root, Path::new("")).is_err());
+        assert!(declared_dir(&root, Path::new(".")).is_err());
+        assert!(declared_dir(&root, Path::new("../deps")).is_err());
+        assert!(declared_dir(&root, Path::new("/deps")).is_err());
+
+        let scanned = scan_dependency_dir(&dep_dir, "inputs").unwrap();
+        assert_eq!(scanned.len(), 2);
+        assert_eq!(scanned["liba.rmeta"].2, digest(b"rmeta-bytes"));
+        assert_eq!(scanned["libb.rlib"].2, digest(b"rlib-bytes"));
+
+        fs::write(root.join("deps/libmac.dylib"), b"dylib").unwrap();
+        assert!(scan_dependency_dir(&dep_dir, "inputs").is_err());
+        fs::remove_file(root.join("deps/libmac.dylib")).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink("deps", root.join("deps-link")).unwrap();
+            assert!(declared_dir(&root, Path::new("deps-link")).is_err());
+            symlink("liba.rmeta", root.join("deps/link.rmeta")).unwrap();
+            assert!(scan_dependency_dir(&dep_dir, "inputs").is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_work_dir_stages_under_work_dir_and_retention_skips_tmp() {
+        let root = tempfile::tempdir().unwrap();
+        let work_root = root.path().join("ninja-scratch");
+        fs::create_dir(&work_root).unwrap();
+        let stage = verification_stage(Some(&work_root)).unwrap();
+        let canonical_work = fs::canonicalize(&work_root).unwrap();
+        assert!(stage.path().starts_with(&canonical_work));
+
+        fs::create_dir(stage.path().join("tmp")).unwrap();
+        fs::write(stage.path().join("tmp/ephemeral.tmp"), b"scratch").unwrap();
+        fs::write(stage.path().join("result.json"), b"{}").unwrap();
+        let exported = root.path().join("exported");
+        retain(stage.path(), &exported).unwrap();
+        assert!(exported.join("result.json").is_file());
+        assert!(!exported.join("tmp").exists());
     }
 }

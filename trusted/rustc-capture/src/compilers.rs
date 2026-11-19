@@ -59,6 +59,50 @@ pub const SUPPORTED_COMPILERS: &[SupportedCompiler] = &[
     },
 ];
 
+/// Every target triple whose 64-bit little-endian compilation profile this
+/// driver and `Trusted.MirSemantics` admit.
+///
+/// Kept in sync with `trusted/cargo-anneal/src/compilers.rs` (checked in CI by
+/// `trusted/audit/tests/compiler_tables.rs`). Capture additionally verifies
+/// `tcx.data_layout.pointer_size().bits() == 64` and
+/// `tcx.data_layout.endian == Endian::Little` inside the compiler session so
+/// target layout is checked fail-closed against the compiler's own target spec.
+#[allow(dead_code)]
+pub const SUPPORTED_TARGETS: &[&str] = &[
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "riscv64gc-unknown-linux-gnu",
+    "x86_64-unknown-fuchsia",
+    "aarch64-unknown-fuchsia",
+    "riscv64gc-unknown-fuchsia",
+];
+
+/// Whether `target` belongs to [`SUPPORTED_TARGETS`].
+#[allow(dead_code)]
+pub fn is_supported_target(target: &str) -> bool {
+    SUPPORTED_TARGETS.contains(&target)
+}
+
+/// Whether `name` is a strict ASCII Rust crate identifier
+/// (`[a-zA-Z_][a-zA-Z0-9_]*`, excluding bare `_`).
+///
+/// Rejecting leading `-`, `@`, `:`, `=`, and non-ASCII characters prevents
+/// `--extern` crate names from injecting compiler flags, `@file` response-file
+/// expansions, or unstable `--extern opts:name=path` modifiers.
+/// https://github.com/rust-lang/rust/blob/7189d39d9ce936881b8132c6addeaf3e295cd455/compiler/rustc_session/src/config.rs#L2600-L2695
+/// https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_session/src/config.rs#L2287-L2382
+#[allow(dead_code)]
+pub fn is_ascii_crate_ident(name: &str) -> bool {
+    if name.is_empty() || name == "_" {
+        return false;
+    }
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 /// The `rustc --version --verbose` fields that identify a compiler build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompilerIdentity<'a> {
@@ -294,5 +338,59 @@ mod tests {
             .supported()
             .unwrap_err();
         assert!(error.contains("has commit-date 2026-05-31"), "{error}");
+    }
+
+    #[test]
+    fn target_allowlist_admits_only_64_bit_little_endian_linux_and_fuchsia_triples() {
+        for allowed in [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "riscv64gc-unknown-linux-gnu",
+            "x86_64-unknown-fuchsia",
+            "aarch64-unknown-fuchsia",
+            "riscv64gc-unknown-fuchsia",
+        ] {
+            assert!(is_supported_target(allowed), "{allowed}");
+        }
+        for rejected in [
+            "",
+            "i686-unknown-linux-gnu",
+            "armv7-unknown-linux-gnueabihf",
+            "powerpc64-unknown-linux-gnu",
+            "s390x-unknown-linux-gnu",
+            "sparc64-unknown-linux-gnu",
+            "wasm32-unknown-unknown",
+            "x86_64-apple-darwin",
+            "aarch64-apple-darwin",
+            "x86_64-pc-windows-msvc",
+            "x86_64-unknown-fuchsia.json",
+        ] {
+            assert!(!is_supported_target(rejected), "{rejected}");
+        }
+    }
+
+    #[test]
+    fn crate_identifiers_reject_flags_response_files_and_modifiers() {
+        for valid in ["dep_types", "a", "_internal", "crate_2", "Z9_a"] {
+            assert!(is_ascii_crate_ident(valid), "{valid}");
+        }
+        for invalid in [
+            "",
+            "_",
+            "--bad",
+            "-L",
+            "@rsp",
+            "@/tmp/flags",
+            "0leading_digit",
+            "hyphen-ated",
+            "priv:dep",
+            "noprelude:dep",
+            "dep=other.rmeta",
+            "dep/path",
+            "dep types",
+            "café",
+        ] {
+            assert!(!is_ascii_crate_ident(invalid), "{invalid}");
+        }
     }
 }

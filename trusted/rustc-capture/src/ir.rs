@@ -45,7 +45,7 @@ pub enum EnumTagRepr {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct EnumTy {
-    pub id: u32,
+    pub id: u64,
     pub discr_bits: u32,
     pub discr_signed: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -205,6 +205,19 @@ pub struct Compiler {
     pub sysroot: PathBuf,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ExternFile {
+    pub crate_name: String,
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DependencyArtifact {
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Configuration {
     pub crate_root: PathBuf,
@@ -218,6 +231,12 @@ pub struct Configuration {
     pub pointer_bits: u64,
     pub endian: &'static str,
     pub declared_source_files: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub externs: Vec<ExternFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependency_dirs: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependency_artifacts: Vec<DependencyArtifact>,
 }
 
 #[derive(Debug, Serialize)]
@@ -272,6 +291,7 @@ pub struct Manifest {
     pub configuration: Configuration,
     pub scope: Scope,
     pub source_files: Vec<SourceFile>,
+    pub externs: Vec<ExternFile>,
     pub census: Vec<CensusItem>,
     pub selected: Vec<SelectedBody>,
     pub unsupported: Vec<Unsupported>,

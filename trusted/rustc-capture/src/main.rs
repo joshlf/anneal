@@ -43,13 +43,16 @@ compile_error!(
     "build.rs selected no MIR dialect classified by this crate's anneal_mir_dialect gates"
 );
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use clap::{ArgGroup, Parser};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Parser)]
 #[command(name = "anneal-rustc-capture capture", version, about = "Capture pinned Runtime(PostCleanup) MIR", group(
@@ -88,6 +91,21 @@ pub struct Args {
     /// ambient module or include-file reads.
     #[arg(long, required = true, action = clap::ArgAction::Append)]
     source_file: Vec<PathBuf>,
+    /// Bind an ASCII crate identifier to a `.rmeta` or `.rlib` file
+    /// (`<crate_name>=<path>`).
+    #[arg(long = "extern", value_name = "NAME=PATH", action = clap::ArgAction::Append)]
+    externs: Vec<String>,
+    /// Add a dependency search directory (`dependency=<dir>`) whose crate
+    /// artifacts are hashed into the capture configuration.
+    #[arg(short = 'L', value_name = "dependency=DIR", action = clap::ArgAction::Append)]
+    search_paths: Vec<String>,
+}
+
+pub(crate) struct PreparedExterns {
+    pub(crate) externs: Vec<ir::ExternFile>,
+    pub(crate) dependency_dirs: Vec<PathBuf>,
+    pub(crate) dependency_artifacts: Vec<ir::DependencyArtifact>,
+    pub(crate) allowed_artifacts: BTreeMap<PathBuf, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -176,17 +194,20 @@ fn check_compiler(rustc: &Path) -> Result<(), Failure> {
             &linked.commit[..9]
         )));
     }
-    let output = Command::new(rustc)
+    let mut probe = Command::new(rustc);
+    probe
         .args(["--version", "--verbose"])
         .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .output()
-        .map_err(|error| {
-            Failure::tool(format!(
-                "cannot run {} --version --verbose: {error}",
-                rustc.display()
-            ))
-        })?;
+        .env("PATH", "/usr/bin:/bin");
+    if let Some(tmpdir) = env::var_os("TMPDIR") {
+        probe.env("TMPDIR", tmpdir);
+    }
+    let output = probe.output().map_err(|error| {
+        Failure::tool(format!(
+            "cannot run {} --version --verbose: {error}",
+            rustc.display()
+        ))
+    })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();
@@ -229,11 +250,186 @@ fn check_compiler(rustc: &Path) -> Result<(), Failure> {
     Ok(())
 }
 
+fn prepare_externs(args: &Args) -> Result<PreparedExterns, Failure> {
+    let mut externs = Vec::new();
+    let mut seen_names = BTreeSet::new();
+    let mut allowed_artifacts = BTreeMap::new();
+    for spec in &args.externs {
+        let Some((name, raw_path)) = spec.split_once('=') else {
+            return Err(Failure::unsupported(format!(
+                "--extern {spec:?} must have the form <crate_name>=<path>"
+            )));
+        };
+        if !compilers::is_ascii_crate_ident(name) {
+            return Err(Failure::unsupported(format!(
+                "invalid --extern crate name {name:?}; expected an ASCII Rust crate identifier"
+            )));
+        }
+        if !seen_names.insert(name.to_owned()) {
+            return Err(Failure::unsupported(format!(
+                "duplicate --extern crate name {name:?}"
+            )));
+        }
+        if raw_path.is_empty() {
+            return Err(Failure::unsupported(format!(
+                "--extern {name} path must not be empty"
+            )));
+        }
+        let given = Path::new(raw_path);
+        if !matches!(
+            given.extension().and_then(|ext| ext.to_str()),
+            Some("rmeta" | "rlib")
+        ) {
+            return Err(Failure::unsupported(format!(
+                "--extern {name} path must end in .rmeta or .rlib: {raw_path:?}"
+            )));
+        }
+        let given_meta = fs::symlink_metadata(given).map_err(Failure::io)?;
+        if given_meta.file_type().is_symlink() || !given_meta.is_file() {
+            return Err(Failure::unsupported(format!(
+                "--extern {name} must be a regular file (not a symlink): {}",
+                given.display()
+            )));
+        }
+        let canon = fs::canonicalize(given).map_err(Failure::io)?;
+        if canon.to_str().is_none() {
+            return Err(Failure::unsupported(format!(
+                "--extern {name} target path must be UTF-8: {canon:?}"
+            )));
+        }
+        if !matches!(
+            canon.extension().and_then(|ext| ext.to_str()),
+            Some("rmeta" | "rlib")
+        ) {
+            return Err(Failure::unsupported(format!(
+                "--extern {name} target path must end in .rmeta or .rlib: {}",
+                canon.display()
+            )));
+        }
+        let meta = fs::symlink_metadata(&canon).map_err(Failure::io)?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return Err(Failure::unsupported(format!(
+                "--extern {name} target is not a regular file: {}",
+                canon.display()
+            )));
+        }
+        let bytes = fs::read(&canon).map_err(Failure::io)?;
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        if let Some(prev) = allowed_artifacts.insert(canon.clone(), sha256.clone())
+            && prev != sha256
+        {
+            return Err(Failure::unsupported(format!(
+                "external crate input changed while staging: {}",
+                canon.display()
+            )));
+        }
+        externs.push(ir::ExternFile {
+            crate_name: name.to_owned(),
+            path: canon,
+            sha256,
+        });
+    }
+    externs.sort_by(|a, b| a.crate_name.cmp(&b.crate_name));
+
+    let mut dependency_dirs = Vec::new();
+    let mut seen_dirs = BTreeSet::new();
+    let mut dep_artifact_map = BTreeMap::new();
+    for raw_search in &args.search_paths {
+        let Some(raw_dir) = raw_search.strip_prefix("dependency=") else {
+            return Err(Failure::unsupported(format!(
+                "unsupported -L search path {raw_search:?}; only dependency=<dir> is supported"
+            )));
+        };
+        if raw_dir.is_empty() {
+            return Err(Failure::unsupported(
+                "-L dependency=<dir> directory path must not be empty",
+            ));
+        }
+        let given_dir = Path::new(raw_dir);
+        let given_dir_meta = fs::symlink_metadata(given_dir).map_err(Failure::io)?;
+        if given_dir_meta.file_type().is_symlink() || !given_dir_meta.is_dir() {
+            return Err(Failure::unsupported(format!(
+                "-L dependency path must be a regular directory (not a symlink): {}",
+                given_dir.display()
+            )));
+        }
+        let canon_dir = fs::canonicalize(given_dir).map_err(Failure::io)?;
+        if canon_dir.to_str().is_none() {
+            return Err(Failure::unsupported(format!(
+                "-L dependency directory path must be UTF-8: {canon_dir:?}"
+            )));
+        }
+        let dir_meta = fs::symlink_metadata(&canon_dir).map_err(Failure::io)?;
+        if dir_meta.file_type().is_symlink() || !dir_meta.is_dir() {
+            return Err(Failure::unsupported(format!(
+                "-L dependency path is not a directory: {}",
+                canon_dir.display()
+            )));
+        }
+        if !seen_dirs.insert(canon_dir.clone()) {
+            continue;
+        }
+        dependency_dirs.push(canon_dir.clone());
+        for entry in fs::read_dir(&canon_dir).map_err(Failure::io)? {
+            let entry = entry.map_err(Failure::io)?;
+            let path = entry.path();
+            let ft = entry.file_type().map_err(Failure::io)?;
+            if ft.is_symlink() {
+                return Err(Failure::unsupported(format!(
+                    "symlink forbidden in -L dependency directory: {}",
+                    path.display()
+                )));
+            }
+            let ext = path.extension().and_then(|e| e.to_str());
+            if matches!(ext, Some("dylib" | "dll")) {
+                return Err(Failure::unsupported(format!(
+                    "unsupported dynamic library in -L dependency directory: {}",
+                    path.display()
+                )));
+            }
+            if !matches!(ext, Some("rmeta" | "rlib" | "so")) {
+                continue;
+            }
+            if !ft.is_file() || fs::canonicalize(&path).map_err(Failure::io)? != path {
+                return Err(Failure::unsupported(format!(
+                    "non-regular crate artifact in -L dependency directory: {}",
+                    path.display()
+                )));
+            }
+            if path.to_str().is_none() {
+                return Err(Failure::unsupported(format!(
+                    "crate artifact path in -L dependency directory must be UTF-8: {path:?}"
+                )));
+            }
+            let bytes = fs::read(&path).map_err(Failure::io)?;
+            let sha256 = format!("{:x}", Sha256::digest(&bytes));
+            if let Some(prev) = allowed_artifacts.insert(path.clone(), sha256.clone())
+                && prev != sha256
+            {
+                return Err(Failure::unsupported(format!(
+                    "dependency artifact changed while staging: {}",
+                    path.display()
+                )));
+            }
+            dep_artifact_map.insert(path.clone(), ir::DependencyArtifact { path, sha256 });
+        }
+    }
+    let dependency_artifacts = dep_artifact_map.into_values().collect();
+    Ok(PreparedExterns {
+        externs,
+        dependency_dirs,
+        dependency_artifacts,
+        allowed_artifacts,
+    })
+}
+
 fn run(mut args: Args) -> Result<serde_json::Value, Failure> {
-    if args.target != "x86_64-unknown-linux-gnu" {
-        return Err(Failure::unsupported(
-            "the initial adapter supports only x86_64-unknown-linux-gnu",
-        ));
+    if !compilers::is_supported_target(&args.target) {
+        return Err(Failure::unsupported(format!(
+            "unsupported target {:?}; supported 64-bit little-endian targets are: {}",
+            args.target,
+            compilers::SUPPORTED_TARGETS.join(", ")
+        )));
     }
     // Declarations, selectors, and cfgs are sets. A declared alias selects its
     // canonical filename; it does not expose other ambient aliases to rustc.
@@ -250,6 +446,7 @@ fn run(mut args: Args) -> Result<serde_json::Value, Failure> {
     args.select.dedup();
     args.cfg.sort();
     args.cfg.dedup();
+    let prepared_externs = prepare_externs(&args)?;
     if let Some(sysroot) = &mut args.sysroot {
         if sysroot.to_str().is_none() {
             return Err(Failure::tool(format!(
@@ -297,7 +494,7 @@ fn run(mut args: Args) -> Result<serde_json::Value, Failure> {
     // completed directory rename permits a captured status below.
     let publication = publication::Publication::new(&args.out_dir).map_err(Failure::io)?;
     args.out_dir = publication.compiler_dir();
-    let manifest = capture::run(&args)?;
+    let manifest = capture::run(&args, &prepared_externs)?;
     let json =
         serde_json::to_vec_pretty(&manifest).map_err(|error| Failure::tool(error.to_string()))?;
     let lean = lean::render(&manifest.program);
@@ -310,6 +507,7 @@ fn run(mut args: Args) -> Result<serde_json::Value, Failure> {
         "status": "captured", "capture": json_path, "lean": lean_path,
         "selected_count": manifest.selected.len(), "census_count": manifest.census.len(),
         "source_count": manifest.source_files.len(),
+        "extern_count": manifest.externs.len(),
     }))
 }
 

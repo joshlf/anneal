@@ -50,6 +50,44 @@ pub(crate) const SUPPORTED_COMPILERS: &[SupportedCompiler] = &[
     },
 ];
 
+/// Every target triple whose 64-bit little-endian compilation profile
+/// `cargo anneal verify` and `Trusted.MirSemantics` admit.
+///
+/// Mirrors `trusted/rustc-capture/src/compilers.rs` (checked by
+/// `trusted/audit/tests/compiler_tables.rs`).
+pub(crate) const SUPPORTED_TARGETS: &[&str] = &[
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "riscv64gc-unknown-linux-gnu",
+    "x86_64-unknown-fuchsia",
+    "aarch64-unknown-fuchsia",
+    "riscv64gc-unknown-fuchsia",
+];
+
+/// Whether `target` belongs to [`SUPPORTED_TARGETS`].
+pub(crate) fn is_supported_target(target: &str) -> bool {
+    SUPPORTED_TARGETS.contains(&target)
+}
+
+/// Whether `name` is a strict ASCII Rust crate identifier
+/// (`[a-zA-Z_][a-zA-Z0-9_]*`, excluding bare `_`).
+///
+/// Rejecting leading `-`, `@`, `:`, `=`, and non-ASCII characters prevents
+/// `--extern` crate names from injecting compiler flags, `@file` response-file
+/// expansions, or unstable `--extern opts:name=path` modifiers.
+/// https://github.com/rust-lang/rust/blob/7189d39d9ce936881b8132c6addeaf3e295cd455/compiler/rustc_session/src/config.rs#L2600-L2695
+/// https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_session/src/config.rs#L2287-L2382
+pub(crate) fn is_ascii_crate_ident(name: &str) -> bool {
+    if name.is_empty() || name == "_" {
+        return false;
+    }
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 /// Resolve a `--rustc-version` value: a MIR dialect name such as
 /// `V2026_10_22_R7189d39d9`, or the compiler's full 40-hex commit. Only exact
 /// spellings match; an abbreviated commit does not identify a compiler.
@@ -253,5 +291,34 @@ mod tests {
                 .unwrap()
                 .is(by_commit(commit).unwrap())
         );
+    }
+
+    #[test]
+    fn target_allowlist_and_crate_ident_rules_hold() {
+        for allowed in [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "riscv64gc-unknown-linux-gnu",
+            "x86_64-unknown-fuchsia",
+            "aarch64-unknown-fuchsia",
+            "riscv64gc-unknown-fuchsia",
+        ] {
+            assert!(is_supported_target(allowed), "{allowed}");
+        }
+        for rejected in [
+            "",
+            "i686-unknown-linux-gnu",
+            "s390x-unknown-linux-gnu",
+            "wasm32-unknown-unknown",
+            "x86_64-apple-darwin",
+        ] {
+            assert!(!is_supported_target(rejected), "{rejected}");
+        }
+        for valid in ["dep_types", "_dep", "x1"] {
+            assert!(is_ascii_crate_ident(valid), "{valid}");
+        }
+        for invalid in ["", "_", "--bad", "-v", "@rsp", "priv:dep", "my-crate", "9x"] {
+            assert!(!is_ascii_crate_ident(invalid), "{invalid}");
+        }
     }
 }

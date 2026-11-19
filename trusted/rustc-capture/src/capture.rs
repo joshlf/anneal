@@ -28,7 +28,7 @@ use rustc_span::def_id::LocalDefId;
 use rustc_span::source_map::{FileLoader, RealFileLoader};
 use sha2::{Digest, Sha256};
 
-use crate::{Args, Failure, extract, ir};
+use crate::{Args, Failure, PreparedExterns, extract, ir};
 
 // rustc query providers are function pointers, so the hook cannot borrow a
 // callback instance. These cells hold one process's session authority and owned
@@ -317,6 +317,7 @@ fn whole_crate_item(tcx: TyCtxt<'_>, def: LocalDefId, has_body: bool) -> extract
 
 struct Callbacks<'a> {
     args: &'a Args,
+    externs: &'a PreparedExterns,
     reads: Arc<Mutex<Reads>>,
     result: Option<Result<ir::Manifest, Failure>>,
 }
@@ -332,7 +333,7 @@ impl rustc_driver::Callbacks for Callbacks<'_> {
     }
 
     fn after_analysis<'tcx>(&mut self, _: &interface::Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-        self.result = Some(collect(tcx, self.args, &self.reads));
+        self.result = Some(collect(tcx, self.args, self.externs, &self.reads));
         // Continue through metadata/object emission and rustc's final check.
         // A candidate manifest is published only after the session returns
         // successfully, so errors after this callback still prohibit capture.
@@ -346,9 +347,7 @@ fn validate_ty(ty: &ir::Ty) -> Result<(), Failure> {
     match ty {
         ir::Ty::Bool | ir::Ty::Unit | ir::Ty::Never => Ok(()),
         ir::Ty::Int { bits, is_size, .. } => {
-            if (*is_size && *bits == 64)
-                || (!*is_size && matches!(*bits, 8 | 16 | 32 | 64))
-            {
+            if (*is_size && *bits == 64) || (!*is_size && matches!(*bits, 8 | 16 | 32 | 64)) {
                 Ok(())
             } else {
                 Err(Failure::unsupported(format!(
@@ -416,8 +415,7 @@ fn validate_program(program: &ir::Program) -> Result<(), Failure> {
                     }
                 }
             }
-            if let ir::Terminator::SwitchInt { operand, .. } = &block.terminator
-            {
+            if let ir::Terminator::SwitchInt { operand, .. } = &block.terminator {
                 validate_operand(operand)?;
             }
         }
@@ -445,6 +443,7 @@ fn reserve_identity(identities: &mut BTreeSet<String>, identity: &str) -> Result
 fn collect(
     tcx: TyCtxt<'_>,
     args: &Args,
+    externs: &PreparedExterns,
     reads: &Arc<Mutex<Reads>>,
 ) -> Result<ir::Manifest, Failure> {
     if tcx.dcx().has_errors().is_some() {
@@ -627,14 +626,85 @@ fn collect(
         let path = Path::new(file.as_str())
             .canonicalize()
             .map_err(Failure::io)?;
-        if !reads.files.contains_key(&path) {
+        if !reads.files.contains_key(&path) && !externs.allowed_artifacts.contains_key(&path) {
             return Err(Failure::unsupported(format!(
                 "dependency input bypassed read recording: {}",
                 path.display()
             )));
         }
     }
+    // `rustc_metadata` maps `.rmeta` and `.rlib` files directly via
+    // `std::fs::File::open` and `Mmap::map` ("mmap the file, because only a
+    // small fraction of it is read"), bypassing `FileLoader` and
+    // `file_depinfo`.
+    // Every loaded crate reports its filesystem paths in `CrateSource` ("Where
+    // a crate came from on the local filesystem. One of these three options
+    // must be non-None", plus `sdylib_interface`). Authenticate all four path
+    // slots across `tcx.crates(())` against either the declared `--extern` /
+    // `-L dependency=` SHA-256 inventory or the canonical `--sysroot`.
+    // https://github.com/rust-lang/rust/blob/7189d39d9ce936881b8132c6addeaf3e295cd455/compiler/rustc_crate_store/src/cstore.rs#L21-L29
+    // https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_session/src/cstore.rs#L20-L28
+    // https://github.com/rust-lang/rust/blob/7189d39d9ce936881b8132c6addeaf3e295cd455/compiler/rustc_metadata/src/locator.rs#L936-L947
+    // https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_metadata/src/locator.rs#L934-L945
+    let canonical_sysroot = sysroot.canonicalize().map_err(Failure::io)?;
+    let mut observed_externs = BTreeMap::<(String, PathBuf), ir::ExternFile>::new();
+    for &cnum in tcx.crates(()) {
+        let crate_name = tcx.crate_name(cnum).as_str().to_owned();
+        let source = tcx.used_crate_source(cnum);
+        let mut any_source_path = false;
+        for candidate in [
+            &source.rmeta,
+            &source.rlib,
+            &source.dylib,
+            &source.sdylib_interface,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            any_source_path = true;
+            let path = candidate.canonicalize().map_err(Failure::io)?;
+            if let Some(expected_sha256) = externs.allowed_artifacts.get(&path) {
+                let meta = std::fs::symlink_metadata(&path).map_err(Failure::io)?;
+                if !meta.is_file() {
+                    return Err(Failure::unsupported(format!(
+                        "external crate input is no longer a regular file: {}",
+                        path.display()
+                    )));
+                }
+                let bytes = std::fs::read(&path).map_err(Failure::io)?;
+                let actual_sha256 = format!("{:x}", Sha256::digest(&bytes));
+                if &actual_sha256 != expected_sha256 {
+                    return Err(Failure::unsupported(format!(
+                        "external crate input changed during compilation: {}",
+                        path.display()
+                    )));
+                }
+                observed_externs.insert(
+                    (crate_name.clone(), path.clone()),
+                    ir::ExternFile {
+                        crate_name: crate_name.clone(),
+                        path,
+                        sha256: actual_sha256,
+                    },
+                );
+            } else if path.starts_with(&canonical_sysroot) && path.is_file() {
+                // Standard-library crates inside the selected sysroot belong to
+                // the compiler distribution authenticated by the host.
+            } else {
+                return Err(Failure::unsupported(format!(
+                    "compiler loaded an undeclared external crate ({crate_name}): {}",
+                    path.display()
+                )));
+            }
+        }
+        if !any_source_path {
+            return Err(Failure::unsupported(format!(
+                "loaded crate {crate_name} reported no filesystem source"
+            )));
+        }
+    }
     check_current_inputs(&reads)?;
+    check_current_externs(externs)?;
     let program = ir::Program {
         scope: if args.scope.is_some() {
             ir::VerificationScope::Crate
@@ -671,6 +741,9 @@ fn collect(
             pointer_bits: 64,
             endian: "little",
             declared_source_files: args.source_file.clone(),
+            externs: externs.externs.clone(),
+            dependency_dirs: externs.dependency_dirs.clone(),
+            dependency_artifacts: externs.dependency_artifacts.clone(),
         },
         scope: if args.scope.is_some() {
             ir::Scope::Crate { roots }
@@ -678,6 +751,7 @@ fn collect(
             ir::Scope::SelectedUnit { roots }
         },
         source_files: reads.files.values().cloned().collect(),
+        externs: observed_externs.into_values().collect(),
         census,
         selected,
         unsupported,
@@ -700,7 +774,27 @@ fn check_current_inputs(reads: &Reads) -> Result<(), Failure> {
     Ok(())
 }
 
-pub fn run(args: &Args) -> Result<ir::Manifest, Failure> {
+fn check_current_externs(externs: &PreparedExterns) -> Result<(), Failure> {
+    for (path, expected_sha256) in &externs.allowed_artifacts {
+        let meta = std::fs::symlink_metadata(path).map_err(Failure::io)?;
+        if !meta.is_file() {
+            return Err(Failure::unsupported(format!(
+                "external crate input is no longer a regular file: {}",
+                path.display()
+            )));
+        }
+        let current = std::fs::read(path).map_err(Failure::io)?;
+        if &format!("{:x}", Sha256::digest(&current)) != expected_sha256 {
+            return Err(Failure::unsupported(format!(
+                "external crate input changed during compilation: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub fn run(args: &Args, externs: &PreparedExterns) -> Result<ir::Manifest, Failure> {
     SELECTION
         .set(Selection {
             whole_crate: args.scope.is_some(),
@@ -742,19 +836,29 @@ pub fn run(args: &Args) -> Result<ir::Manifest, Failure> {
     }
     // The pinned driver expands argument files before parsing compiler options:
     // "Replaces any `@file` arguments with the contents of `file`, with each
-    // line of `file` as a separate argument." Keep cfg text attached to its
-    // option so a leading @ stays literal instead of reading unauthenticated
-    // bytes or introducing compiler flags. Expander::arg checks the argv prefix;
-    // rustc itself remains responsible for parsing the complete cfg grammar.
+    // line of `file` as a separate argument." Keep cfg, extern, and search-path
+    // text attached to their options so a leading @ stays literal instead of
+    // reading unauthenticated bytes or introducing compiler flags.
     // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_driver_impl/src/lib.rs#L171-L187
     // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_driver_impl/src/args.rs#L14-L32
     // https://github.com/rust-lang/rust/blob/f8a08b688cbe60acc386ed1fbd1b7cbaaf5576b1/compiler/rustc_driver_impl/src/args.rs#L94-L108
     for cfg in &args.cfg {
         compiler_args.push(format!("--cfg={cfg}"));
     }
+    for ext in &externs.externs {
+        compiler_args.push(format!(
+            "--extern={}={}",
+            ext.crate_name,
+            compiler_path(&ext.path)?
+        ));
+    }
+    for dir in &externs.dependency_dirs {
+        compiler_args.push(format!("-Ldependency={}", compiler_path(dir)?));
+    }
     let reads = Arc::new(Mutex::new(Reads::default()));
     let mut callbacks = Callbacks {
         args,
+        externs,
         reads: reads.clone(),
         result: None,
     };
@@ -795,6 +899,7 @@ pub fn run(args: &Args) -> Result<ir::Manifest, Failure> {
         ));
     }
     check_current_inputs(&reads)?;
+    check_current_externs(externs)?;
     Ok(manifest)
 }
 

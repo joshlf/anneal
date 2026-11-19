@@ -67,7 +67,11 @@ impl Tools {
                 let sibling = cli.with_file_name("anneal-rustc-capture");
                 sibling.is_file().then_some(sibling)
             })
-            .or_else(|| install_root.as_ref().map(|r| r.join("bin/anneal-rustc-capture")))
+            .or_else(|| {
+                install_root
+                    .as_ref()
+                    .map(|r| r.join("bin/anneal-rustc-capture"))
+            })
             .unwrap_or_else(|| cli.with_file_name("anneal-rustc-capture"));
         let capture = required_file(
             capture,
@@ -77,7 +81,7 @@ impl Tools {
         let lean = override_path("ANNEAL_LEAN")
             .or_else(|| override_path("ANNEAL_MVP_LEAN"))
             .or_else(|| install_root.as_ref().map(|r| r.join("lean/bin/lean")))
-            .unwrap_or_else(cargo_anneal::default_lean_path);
+            .unwrap_or_else(fallback_lean_path);
         let lean = required_file(lean, "the pinned Lean executable", "ANNEAL_LEAN");
         let sysroot = override_path("ANNEAL_SYSROOT")
             .or_else(|| override_path("ANNEAL_MVP_SYSROOT"))
@@ -143,8 +147,23 @@ impl Tools {
     }
 }
 
+#[cfg(feature = "setup")]
+fn fallback_lean_path() -> PathBuf {
+    cargo_anneal::default_lean_path()
+}
+
+#[cfg(not(feature = "setup"))]
+fn fallback_lean_path() -> PathBuf {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/root"));
+    home.join(".elan/toolchains/leanprover--lean4---v4.34.1/bin/lean")
+}
+
 fn override_path(var: &str) -> Option<PathBuf> {
-    env::var_os(var).filter(|v| !v.is_empty()).map(PathBuf::from)
+    env::var_os(var)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 fn required_file(path: PathBuf, label: &str, var: &str) -> PathBuf {
@@ -223,11 +242,7 @@ fn parse_stage_args(args: &[&str], ctx: &str) -> Result<FailureStage, String> {
         )),
         ["proof", scope] => {
             let scope = scope.trim();
-            if scope.is_empty()
-                || !scope
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
+            if scope.is_empty() || !scope.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 return Err(format!("{ctx}: invalid proof scope {scope:?}"));
             }
             Ok(FailureStage::Proof {
@@ -258,11 +273,7 @@ fn parse_fixture_file(
                     )
                 })?
                 .trim();
-            if name.is_empty()
-                || !name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 return Err(format!(
                     "{}:{}: invalid case name {name:?}",
                     file_path.display(),
@@ -288,7 +299,11 @@ fn parse_fixture_file(
 
         for (offset, &line) in lines[start..end].iter().enumerate() {
             let line_idx = start + offset;
-            let loc = format!("{}:{}: ({suite}::{name})", file_path.display(), line_idx + 1);
+            let loc = format!(
+                "{}:{}: ({suite}::{name})",
+                file_path.display(),
+                line_idx + 1
+            );
             let trimmed = line.trim();
             if let Some(directive) = trimmed.strip_prefix("//@") {
                 let directive = directive.trim();
@@ -472,8 +487,10 @@ fn check_mir_assertions(case: &FixtureCase, mir_lean: Option<&str>) -> Result<()
         return Ok(());
     }
     let Some(mir) = mir_lean else {
-        return Err("expected Captured.lean to be emitted for MIR assertions, but none was found"
-            .to_owned());
+        return Err(
+            "expected Captured.lean to be emitted for MIR assertions, but none was found"
+                .to_owned(),
+        );
     };
     for needle in &case.mir_contains {
         let normalized = normalize_mir_dialect_needle(needle, mir);
@@ -509,7 +526,10 @@ fn evaluate_case(
         }
         (PrimaryExpectation::Pass, Err(err)) => {
             // Polarity-safe: never auto-flip `//@ pass` to `//@ fail(...)`.
-            CaseOutcome::Failed(format!("expected `//@ pass`, got failure:\n{}", err.message))
+            CaseOutcome::Failed(format!(
+                "expected `//@ pass`, got failure:\n{}",
+                err.message
+            ))
         }
         (PrimaryExpectation::Fail { .. }, Ok(report)) => {
             // Polarity-safe: never auto-flip `//@ fail(...)` to `//@ pass`.
@@ -946,11 +966,7 @@ fn find_top_level_fn_header(trimmed: &str) -> Option<usize> {
     None
 }
 
-fn parse_one_fn(
-    fn_chunk: &str,
-    requires: &[String],
-    specs: &[String],
-) -> Result<ParsedFn, String> {
+fn parse_one_fn(fn_chunk: &str, requires: &[String], specs: &[String]) -> Result<ParsedFn, String> {
     let is_unsafe = fn_chunk.starts_with("pub unsafe fn ") || fn_chunk.starts_with("unsafe fn ");
     let after_fn = fn_chunk
         .split_once("fn ")
@@ -1226,7 +1242,10 @@ end Proof"#,
         let start_line = proof_lines.len() + 1;
         let pat = classify_body(f);
         let mut block = String::new();
-        let _ = writeln!(block, "noncomputable def b{i} : Body := program.bodies[{i}]");
+        let _ = writeln!(
+            block,
+            "noncomputable def b{i} : Body := program.bodies[{i}]"
+        );
 
         match pat {
             BodyPattern::DirectId => {
@@ -1603,7 +1622,9 @@ theorem b{i}_safe {{selected : Body}} (found : Trusted.MirSemantics.getElem? pro
     };
     push_block(
         &mut proof_lines,
-        &format!("theorem verify : Expected.claim :=\n  ⟨rfl, rfl, rfl, rfl, rfl, rfl, all_bodies_safe, {prop_term}⟩\nend Proof"),
+        &format!(
+            "theorem verify : Expected.claim :=\n  ⟨rfl, rfl, rfl, rfl, rfl, rfl, all_bodies_safe, {prop_term}⟩\nend Proof"
+        ),
     );
 
     let mut proof_lean = proof_lines.join("\n");
@@ -1686,10 +1707,7 @@ fn parse_capture_detail(detail: &str) -> String {
     detail.to_owned()
 }
 
-fn parse_proof_failure(
-    detail: &str,
-    fn_ranges: &[(usize, usize, String)],
-) -> (String, String) {
+fn parse_proof_failure(detail: &str, fn_ranges: &[(usize, usize, String)]) -> (String, String) {
     let mut best_scope = "crate".to_owned();
     let mut messages = Vec::new();
     for line in detail.lines() {
@@ -1721,7 +1739,11 @@ fn parse_proof_failure(
     (best_scope, diag)
 }
 
-fn verify_sandbox(tools: &Tools, sandbox: &SandboxCrate, rust_source: &str) -> Result<VerifyReport, VerifyError> {
+fn verify_sandbox(
+    tools: &Tools,
+    sandbox: &SandboxCrate,
+    rust_source: &str,
+) -> Result<VerifyReport, VerifyError> {
     let synth = match synthesize_proof_package(rust_source) {
         Ok(s) => s,
         Err(spec_err) => {
@@ -1792,7 +1814,10 @@ fn verify_sandbox(tools: &Tools, sandbox: &SandboxCrate, rust_source: &str) -> R
                 diagnostic,
             })
         }
-        ("unsupported" | "compiler_failed", "capture" | "cargo" | "inputs" | "request" | "proof") => {
+        (
+            "unsupported" | "compiler_failed",
+            "capture" | "cargo" | "inputs" | "request" | "proof",
+        ) => {
             let diagnostic = parse_capture_detail(detail);
             Some(StageFailure {
                 stage: FailureStage::Capture,
@@ -1853,7 +1878,9 @@ fn verifies_fixture_corpus() {
         fixtures_dir.display()
     );
 
-    let filter = env::var("ANNEAL_TEST_FILTER").ok().filter(|s| !s.is_empty());
+    let filter = env::var("ANNEAL_TEST_FILTER")
+        .ok()
+        .filter(|s| !s.is_empty());
     let bless = env::var("ANNEAL_BLESS").ok().as_deref() == Some("1");
 
     let mut all_cases = Vec::new();
@@ -2054,7 +2081,10 @@ pub fn id(x: usize) -> usize {
         other => panic!("expected Blessed for resolved_known_bug, got {other:?}"),
     }
     assert!(
-        matches!(evaluate_case(&cases[2], &proof_err, true), CaseOutcome::Failed(_)),
+        matches!(
+            evaluate_case(&cases[2], &proof_err, true),
+            CaseOutcome::Failed(_)
+        ),
         "expected broken `//@ pass` case to fail even when bless=true"
     );
 
@@ -2091,7 +2121,11 @@ fn ignores_tampered_or_spoofed_files_in_dot_anneal_and_proof_olean() {
         b"prelude\ntheorem verify : True := trivial\n",
     )
     .unwrap();
-    fs::write(sandbox.proof_dir.join("Proof.olean"), b"spoofed precompiled olean").unwrap();
+    fs::write(
+        sandbox.proof_dir.join("Proof.olean"),
+        b"spoofed precompiled olean",
+    )
+    .unwrap();
 
     let err = verify_sandbox(&tools, &sandbox, bad_src).unwrap_err();
     assert_eq!(
@@ -2117,7 +2151,8 @@ fn rejects_symlinked_sources_and_disallowed_manifest_targets() {
         symlink(&real_lib, sandbox.crate_dir.join("src/lib.rs")).unwrap();
         let err = verify_sandbox(&tools, &sandbox, ok_src).unwrap_err();
         assert!(
-            err.message.contains("unsupported or empty compilation request"),
+            err.message
+                .contains("unsupported or empty compilation request"),
             "expected symlinked src/lib.rs manifest rejection, got: {err}"
         );
 
@@ -2145,7 +2180,12 @@ fn rejects_symlinked_sources_and_disallowed_manifest_targets() {
             }
         });
         fs::write(&req_path, serde_json::to_vec_pretty(&req).unwrap()).unwrap();
-        let out = tools.command().arg("--request").arg(&req_path).output().unwrap();
+        let out = tools
+            .command()
+            .arg("--request")
+            .arg(&req_path)
+            .output()
+            .unwrap();
         assert!(!out.status.success());
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
@@ -2184,8 +2224,9 @@ fn rejects_symlinked_sources_and_disallowed_manifest_targets() {
         fs::write(sandbox.crate_dir.join("build.rs"), "fn main() {}\n").unwrap();
         let err = verify_sandbox(&tools, &sandbox, ok_src).unwrap_err();
         assert!(
-            err.message
-                .contains("build scripts and procedural macros need an explicit configured compilation"),
+            err.message.contains(
+                "build scripts and procedural macros need an explicit configured compilation"
+            ),
             "expected build.rs rejection, got: {err}"
         );
     }
@@ -2197,7 +2238,8 @@ fn rejects_symlinked_sources_and_disallowed_manifest_targets() {
         fs::write(sandbox.crate_dir.join("src/main.rs"), "fn main() {}\n").unwrap();
         let err = verify_sandbox(&tools, &sandbox, ok_src).unwrap_err();
         assert!(
-            err.message.contains("Cargo shortcut requires a library target"),
+            err.message
+                .contains("Cargo shortcut requires a library target"),
             "expected binary-only rejection, got: {err}"
         );
     }
@@ -2239,7 +2281,8 @@ fn rejects_symlinked_sources_and_disallowed_manifest_targets() {
         .unwrap();
         let err = verify_sandbox(&tools, &sandbox, ok_src).unwrap_err();
         assert!(
-            err.message.contains("Cargo shortcut requires a dependency-free library"),
+            err.message
+                .contains("Cargo shortcut requires a dependency-free library"),
             "expected Cargo dependencies rejection, got: {err}"
         );
     }
@@ -2288,7 +2331,11 @@ fn rejects_compiler_overrides_in_source_root() {
         if let Some(parent) = override_path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
-        fs::write(&override_path, "[build]\nrustflags = [\"--cfg\", \"evil\"]\n").unwrap();
+        fs::write(
+            &override_path,
+            "[build]\nrustflags = [\"--cfg\", \"evil\"]\n",
+        )
+        .unwrap();
         let err = verify_sandbox(&tools, &sandbox, ok_src).unwrap_err();
         assert!(
             err.message
@@ -2392,7 +2439,9 @@ pub fn id(x: usize) -> usize {
         cases[0].source
     );
     assert!(
-        cases[0].source.contains("/// anneal:spec ensures(ret == x)"),
+        cases[0]
+            .source
+            .contains("/// anneal:spec ensures(ret == x)"),
         "expected `/// anneal:spec` doc comment to be preserved, got:\n{}",
         cases[0].source
     );
@@ -2757,7 +2806,9 @@ fn rejects_tampered_capture_compiler_fields() {
         // Even with the dialect and `compiler.rustc` intact, `compiler.sysroot`
         // must match the canonical sysroot selected for capture.
         (
-            format!("-e 's/\"sysroot\": \"{escaped_sysroot}\"/\"sysroot\": \"\\/other\\/sysroot\"/'"),
+            format!(
+                "-e 's/\"sysroot\": \"{escaped_sysroot}\"/\"sysroot\": \"\\/other\\/sysroot\"/'"
+            ),
             true,
             dialect,
             "capture reports sysroot \"/other/sysroot\"".to_owned(),

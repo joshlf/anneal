@@ -61,7 +61,7 @@ impl Tools {
                     .map(|root| root.join("lean/bin/lean"))
                     .filter(|path| path.is_file())
             })
-            .unwrap_or_else(cargo_anneal::default_lean_path);
+            .unwrap_or_else(fallback_lean_path);
         let lean = required_file(lean, "the pinned Lean executable", "ANNEAL_MVP_LEAN");
         let sysroot = override_path("ANNEAL_MVP_SYSROOT")
             .or_else(|| override_path("ANNEAL_SYSROOT"))
@@ -134,6 +134,19 @@ impl Tools {
 
 fn override_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
+}
+
+#[cfg(feature = "setup")]
+fn fallback_lean_path() -> PathBuf {
+    cargo_anneal::default_lean_path()
+}
+
+#[cfg(not(feature = "setup"))]
+fn fallback_lean_path() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/root"));
+    home.join(".elan/toolchains/leanprover--lean4---v4.34.1/bin/lean")
 }
 
 fn required_file(path: PathBuf, description: &str, variable: &str) -> PathBuf {
@@ -743,4 +756,635 @@ fn declared_cfg_cannot_expand_compiler_response_files() {
     let receipt = fixture.run(&tools, "cfg-literal-values", &request);
     receipt.expect(0, "crate_verified", None);
     assert_eq!(receipt.value["configuration"]["cfg"], cfg);
+}
+
+#[cfg(unix)]
+#[test]
+fn verifies_multi_crate_externs_and_dependency_dirs_and_rejects_tampering() {
+    use sha2::{Digest, Sha256};
+    use std::io::Write as _;
+    use std::os::unix::fs::symlink;
+
+    let tools = Tools::discover();
+    let fixture = Fixture::new();
+    let rustc = tools.sysroot.join("bin/rustc");
+    let deps_dir = fixture.path("deps");
+    let rlibs_dir = fixture.path("rlibs");
+    fs::create_dir(&deps_dir).unwrap();
+    fs::create_dir(&rlibs_dir).unwrap();
+
+    // Compile transitive crate `leaf_types` into `deps/libleaf_types.rmeta`.
+    let leaf_src = fixture.path("leaf_types.rs");
+    fs::write(&leaf_src, b"pub enum LeafBit { Zero = 0, One = 1 }\n").unwrap();
+    let leaf_rmeta = deps_dir.join("libleaf_types.rmeta");
+    assert!(
+        Command::new(&rustc)
+            .env("LD_LIBRARY_PATH", tools.sysroot.join("lib"))
+            .args([
+                "--edition=2024",
+                "--crate-name=leaf_types",
+                "--crate-type=lib",
+                "--target=x86_64-unknown-linux-gnu",
+                "--emit=metadata",
+                "-o",
+            ])
+            .arg(&leaf_rmeta)
+            .arg(&leaf_src)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // Compile `dep_types` (re-exporting `LeafBit` and defining `Mode`) as both
+    // `.rmeta` and `.rlib`.
+    let dep_src = fixture.path("dep_types.rs");
+    fs::write(
+        &dep_src,
+        b"pub use leaf_types::LeafBit;\n\
+          pub enum Mode { Little = 0, Big = 1 }\n",
+    )
+    .unwrap();
+    let dep_rmeta = deps_dir.join("libdep_types.rmeta");
+    let dep_rlib = rlibs_dir.join("libdep_types.rlib");
+    for (emit, out_path) in [("metadata", &dep_rmeta), ("link", &dep_rlib)] {
+        assert!(
+            Command::new(&rustc)
+                .env("LD_LIBRARY_PATH", tools.sysroot.join("lib"))
+                .args([
+                    "--edition=2024",
+                    "--crate-name=dep_types",
+                    "--crate-type=rlib",
+                    "--target=x86_64-unknown-linux-gnu",
+                    &format!("--emit={emit}"),
+                    "-o",
+                ])
+                .arg(out_path)
+                .arg(format!("--extern=leaf_types={}", leaf_rmeta.display()))
+                .arg(&dep_src)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    fixture.write(
+        "rust/lib.rs",
+        "use dep_types::{LeafBit, Mode};\n\
+         pub fn classify(mode: Mode, bit: LeafBit) -> u64 {\n\
+             match mode {\n\
+                 Mode::Little => match bit {\n\
+                     LeafBit::Zero => 0x0f,\n\
+                     LeafBit::One => 0xff,\n\
+                 },\n\
+                 Mode::Big => 0,\n\
+             }\n\
+         }\n",
+    );
+    fixture.write(
+        "lean/Spec.lean",
+        lean_source(
+            "import Trusted.MirSemantics",
+            r#"namespace Spec
+open Trusted.MirModel Trusted.MirSemantics
+
+def u64Val (n : Nat) : Val :=
+  .scalar ⟨.i64, false, BitVec.ofNat 128 n⟩
+
+def callArgs (body : Body) (m b : Nat) : List Val :=
+  match body.locals with
+  | _ :: .enum mTy :: .enum bTy :: _ => [.enumVal mTy m, .enumVal bTy b]
+  | _ => []
+
+noncomputable def ReturnsU64 (p : Program) (args : List Val) (n : Nat) : Prop :=
+  Behavior (entryProgForBody p 0) { args := args } (.returned ⟨u64Val n, ⟨[]⟩⟩)
+
+noncomputable def specs : Specs :=
+  ⟨fun _ _ => False, fun program => ∃ body, program.bodies = [body] ∧
+    ReturnsU64 program (callArgs body 0 0) 0x0f ∧
+    ReturnsU64 program (callArgs body 0 1) 0xff ∧
+    ReturnsU64 program (callArgs body 1 0) 0 ∧
+    ReturnsU64 program (callArgs body 1 1) 0⟩
+
+end Spec"#,
+        ),
+    );
+    fixture.write(
+        "lean/Proof.lean",
+        lean_source(
+            "import Expected\nimport Anneal.MirWp",
+            r#"namespace Proof
+open Trusted.MirModel Trusted.MirSemantics Anneal.MirWp Spec
+
+noncomputable def program : Program :=
+  interpretV2026_10_22_R7189d39d9 Captured.program
+
+noncomputable def body : Body := program.bodies[0]
+
+noncomputable def mTy : EnumTy :=
+  match body.locals with
+  | _ :: .enum t :: _ => t
+  | _ => ⟨0, .isize, true, .zeroSized, []⟩
+
+noncomputable def bTy : EnumTy :=
+  match body.locals with
+  | _ :: _ :: .enum t :: _ => t
+  | _ => ⟨0, .isize, true, .zeroSized, []⟩
+
+theorem natListBeq_eq {xs ys : List Nat} (h : natListBeq xs ys = true) : xs = ys := by
+  induction xs generalizing ys with
+  | nil =>
+    cases ys with
+    | nil => rfl
+    | cons _ _ => cases h
+  | cons x xs ih =>
+    cases ys with
+    | nil => cases h
+    | cons y ys =>
+      change (Nat.beq x y && natListBeq xs ys) = true at h
+      have h1 : Nat.beq x y = true := by
+        cases h_xy : Nat.beq x y
+        · rw [h_xy] at h; cases h
+        · rfl
+      have h2 : natListBeq xs ys = true := by
+        rw [h1] at h; exact h
+      rw [Nat.eq_of_beq_eq_true h1, ih h2]
+
+theorem intWidth_beq_eq {w1 w2 : IntWidth} (h : IntWidth.beq w1 w2 = true) : w1 = w2 := by
+  cases w1 <;> cases w2 <;> first | rfl | cases h
+
+theorem enumTagRepr_beq_eq {r1 r2 : EnumTagRepr}
+    (h : EnumTagRepr.beq r1 r2 = true) : r1 = r2 := by
+  cases r1 with
+  | zeroSized =>
+    cases r2 with
+    | zeroSized => rfl
+    | scalar _ _ => cases h
+  | scalar w1 s1 =>
+    cases r2 with
+    | zeroSized => cases h
+    | scalar w2 s2 =>
+      cases w1 <;> cases w2 <;> cases s1 <;> cases s2 <;> first | rfl | cases h
+
+theorem enumTy_beq_eq {e1 e2 : EnumTy} (h : EnumTy.beq e1 e2 = true) : e1 = e2 := by
+  cases e1 with
+  | mk id1 dw1 ds1 tr1 discs1 =>
+    cases e2 with
+    | mk id2 dw2 ds2 tr2 discs2 =>
+      unfold EnumTy.beq at h
+      dsimp only at h
+      cases h1 : Nat.beq id1 id2 <;>
+        cases h2 : IntWidth.beq dw1 dw2 <;>
+        cases h3 : (ds1 == ds2) <;>
+        cases h4 : EnumTagRepr.beq tr1 tr2 <;>
+        cases h5 : natListBeq discs1 discs2 <;>
+        rw [h1, h2, h3, h4, h5] at h <;>
+        try cases h
+      rw [Nat.eq_of_beq_eq_true h1, intWidth_beq_eq h2, eq_of_beq h3,
+        enumTagRepr_beq_eq h4, natListBeq_eq h5]
+
+theorem checkVal_enum2 {ety : EnumTy} (h_ds : ety.discriminants = [0, 1]) {v : Val}
+    (h : checkVal v (.enum ety) = true) : v = .enumVal ety 0 ∨ v = .enumVal ety 1 := by
+  cases v with
+  | enumVal ety' var =>
+    cases h_adm : (enumAdmitted ety' && Nat.blt var ety'.discriminants.length) with
+    | false => simp [checkVal, Val.ty?, h_adm] at h
+    | true =>
+      have h_ty : MirTy.beq (.enum ety') (.enum ety) = true := by
+        unfold checkVal Val.ty? at h
+        dsimp only at h
+        rw [h_adm] at h
+        exact h
+      unfold MirTy.beq at h_ty
+      dsimp only at h_ty
+      have h_eq := enumTy_beq_eq h_ty
+      subst h_eq
+      have h_blt : Nat.blt var 2 = true := by
+        rw [h_ds] at h_adm
+        cases h_e : enumAdmitted ety' <;> rw [h_e] at h_adm
+        · cases h_adm
+        · exact h_adm
+      have h_lt : var < 2 := Nat.le_of_ble_eq_true h_blt
+      cases var with
+      | zero => exact Or.inl rfl
+      | succ n =>
+        cases n with
+        | zero => exact Or.inr rfl
+        | succ k =>
+          exact False.elim (Nat.not_lt_zero k
+            (Nat.lt_of_succ_lt_succ (Nat.lt_of_succ_lt_succ h_lt)))
+  | scalar sv => cases h_wf : sv.wf <;> simp [checkVal, Val.ty?, h_wf, MirTy.beq] at h
+  | bool _ | ptr _ | unit | tuple _ | bytes _ => cases h
+
+theorem run00 : run body 8 (initial body (callArgs body 0 0)) = some (u64Val 0x0f) := rfl
+theorem run01 : run body 8 (initial body (callArgs body 0 1)) = some (u64Val 0xff) := rfl
+theorem run10 : run body 8 (initial body (callArgs body 1 0)) = some (u64Val 0) := rfl
+theorem run11 : run body 8 (initial body (callArgs body 1 1)) = some (u64Val 0) := rfl
+
+theorem paramTys_eq :
+    (body.locals.drop 1).take body.argumentCount = [.enum mTy, .enum bTy] := rfl
+
+theorem callArgs_eq (m b : Nat) :
+    callArgs body m b = [.enumVal mTy m, .enumVal bTy b] := rfl
+
+theorem verify : Expected.claim := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, ?_, ?_⟩
+  · intro id selected found
+    cases id with
+    | zero =>
+      have same : body = selected := Option.some.inj found
+      subst selected
+      refine bodyVerified_of_safe found rfl (fun args valid _ => ?_)
+      unfold ValidEntryArgs at valid
+      rw [paramTys_eq] at valid
+      cases args with
+      | nil => cases valid
+      | cons a0 rest0 =>
+        cases rest0 with
+        | nil => simp [checkArgsMatch] at valid
+        | cons a1 rest1 =>
+          cases rest1 with
+          | cons _ _ => simp [checkArgsMatch] at valid
+          | nil =>
+            simp only [checkArgsMatch, Bool.and_eq_true] at valid
+            match checkVal_enum2 (ety := mTy) rfl valid.1,
+                  checkVal_enum2 (ety := bTy) rfl valid.2.1 with
+            | .inl ha0, .inl ha1 =>
+              rw [ha0, ha1, ← callArgs_eq 0 0]; exact (run_initial_success run00).1
+            | .inl ha0, .inr ha1 =>
+              rw [ha0, ha1, ← callArgs_eq 0 1]; exact (run_initial_success run01).1
+            | .inr ha0, .inl ha1 =>
+              rw [ha0, ha1, ← callArgs_eq 1 0]; exact (run_initial_success run10).1
+            | .inr ha0, .inr ha1 =>
+              rw [ha0, ha1, ← callArgs_eq 1 1]; exact (run_initial_success run11).1
+    | succ _ => cases found
+  · exact ⟨body, rfl,
+      behavior_of_returns rfl rfl rfl (run_initial_success run00).2,
+      behavior_of_returns rfl rfl rfl (run_initial_success run01).2,
+      behavior_of_returns rfl rfl rfl (run_initial_success run10).2,
+      behavior_of_returns rfl rfl rfl (run_initial_success run11).2⟩
+
+end Proof"#,
+        ),
+    );
+
+    let dep_rmeta_sha = format!("{:x}", Sha256::digest(fs::read(&dep_rmeta).unwrap()));
+    let dep_rlib_sha = format!("{:x}", Sha256::digest(fs::read(&dep_rlib).unwrap()));
+    let leaf_rmeta_sha = format!("{:x}", Sha256::digest(fs::read(&leaf_rmeta).unwrap()));
+
+    // Positive verification with `.rmeta` + `dependency_dirs` and with `.rlib`.
+    for (case_name, rel_ext_path, expected_ext_sha) in [
+        (
+            "multi-crate-rmeta",
+            "deps/libdep_types.rmeta",
+            &dep_rmeta_sha,
+        ),
+        ("multi-crate-rlib", "rlibs/libdep_types.rlib", &dep_rlib_sha),
+    ] {
+        let mut req = fixture.request.clone();
+        req["compilation"]["externs"] = json!([
+            {"crate_name": "dep_types", "path": rel_ext_path}
+        ]);
+        req["compilation"]["dependency_dirs"] = json!(["deps"]);
+        let receipt = fixture.run(&tools, case_name, &req);
+        receipt.expect(0, "crate_verified", None);
+        assert_eq!(receipt.value["audit"]["exactType"], true);
+        assert_eq!(receipt.value["audit"]["replay"], true);
+        assert_eq!(
+            receipt.value["externs"],
+            json!([{
+                "crate_name": "dep_types",
+                "relative_path": rel_ext_path,
+                "sha256": expected_ext_sha,
+            }])
+        );
+        let loaded = receipt.value["loaded_externs"].as_array().unwrap();
+        assert!(
+            loaded
+                .iter()
+                .any(|e| e["crate_name"] == "dep_types" && e["sha256"] == *expected_ext_sha),
+            "{loaded:?}"
+        );
+        assert!(
+            loaded
+                .iter()
+                .any(|e| e["crate_name"] == "leaf_types" && e["sha256"] == leaf_rmeta_sha),
+            "{loaded:?}"
+        );
+    }
+
+    let mut base_req = fixture.request.clone();
+    base_req["compilation"]["externs"] = json!([
+        {"crate_name": "dep_types", "path": "deps/libdep_types.rmeta"}
+    ]);
+    base_req["compilation"]["dependency_dirs"] = json!(["deps"]);
+
+    // Negative 1: invalid `--extern` crate names fail closed at `request`.
+    for (idx, bad_name) in ["--bad", "@rsp", "priv:dep", "my-crate", "_"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut bad_req = base_req.clone();
+        bad_req["compilation"]["externs"] = json!([
+            {"crate_name": bad_name, "path": "deps/libdep_types.rmeta"}
+        ]);
+        fixture
+            .run(&tools, &format!("bad-extern-name-{idx}"), &bad_req)
+            .expect(1, "unsupported", Some("request"));
+    }
+
+    // Negative 2: symlinked `.rmeta` or `..` path fails closed at `inputs`.
+    let sym_rmeta = deps_dir.join("sym_dep.rmeta");
+    symlink(&dep_rmeta, &sym_rmeta).unwrap();
+    let mut sym_req = base_req.clone();
+    sym_req["compilation"]["externs"] = json!([
+        {"crate_name": "dep_types", "path": "deps/sym_dep.rmeta"}
+    ]);
+    fixture
+        .run(&tools, "symlink-extern", &sym_req)
+        .expect(1, "unsupported", Some("inputs"));
+    fs::remove_file(&sym_rmeta).unwrap();
+
+    let mut escape_req = base_req.clone();
+    escape_req["compilation"]["externs"] = json!([
+        {"crate_name": "dep_types", "path": "../libdep_types.rmeta"}
+    ]);
+    fixture
+        .run(&tools, "escape-extern", &escape_req)
+        .expect(1, "unsupported", Some("inputs"));
+
+    // Negative 3a: pre-run `.rmeta` header corruption fails at `capture`.
+    let orig_dep_bytes = fs::read(&dep_rmeta).unwrap();
+    let mut corrupted = orig_dep_bytes.clone();
+    for byte in corrupted.iter_mut().take(8) {
+        *byte ^= 0xff;
+    }
+    fs::write(&dep_rmeta, &corrupted).unwrap();
+    fixture
+        .run(&tools, "corrupted-rmeta", &base_req)
+        .expect(2, "compiler_failed", Some("capture"));
+    fs::write(&dep_rmeta, &orig_dep_bytes).unwrap();
+
+    // Negative 3b: semantic `.rmeta` mutation (swapping `Mode` discriminants
+    // without updating the proof) changes `externs[0].sha256` and fails proof!
+    let mutated_dep_src = fixture.path("dep_types_mutated.rs");
+    fs::write(
+        &mutated_dep_src,
+        b"pub use leaf_types::LeafBit;\n\
+          pub enum Mode { Little = 1, Big = 0 }\n",
+    )
+    .unwrap();
+    assert!(
+        Command::new(&rustc)
+            .env("LD_LIBRARY_PATH", tools.sysroot.join("lib"))
+            .args([
+                "--edition=2024",
+                "--crate-name=dep_types",
+                "--crate-type=rlib",
+                "--target=x86_64-unknown-linux-gnu",
+                "--emit=metadata",
+                "-o",
+            ])
+            .arg(&dep_rmeta)
+            .arg(format!("--extern=leaf_types={}", leaf_rmeta.display()))
+            .arg(&mutated_dep_src)
+            .status()
+            .unwrap()
+            .success()
+    );
+    fixture
+        .run(&tools, "swapped-discriminant-rmeta", &base_req)
+        .expect(1, "proof_failed", Some("audit"));
+    fs::write(&dep_rmeta, &orig_dep_bytes).unwrap();
+
+    // Negative 4: mid-run `.rmeta` tamper (mutating `dep_rmeta` after capture)
+    // is caught by the post-audit `binding` SHA-256 check!
+    let wrapper = fixture.path("tamper-capture-wrapper.sh");
+    let script = format!(
+        "#!/bin/sh\n'{}' \"$@\"\nrc=$?\nprintf 'tampered' >> '{}'\nexit $rc\n",
+        tools.capture.display(),
+        dep_rmeta.display()
+    );
+    let mut installer = Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "install"])
+        .arg(&wrapper)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    installer
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    assert!(installer.wait().unwrap().success());
+
+    let req_path = fixture.path("mid-run-tamper.json");
+    fs::write(&req_path, serde_json::to_vec_pretty(&base_req).unwrap()).unwrap();
+    fixture
+        .execute(
+            "mid-run-rmeta-tamper",
+            Command::new(&tools.cli)
+                .arg("verify")
+                .arg("--request")
+                .arg(&req_path)
+                .arg("--capture")
+                .arg(&wrapper)
+                .arg("--lean")
+                .arg(&tools.lean)
+                .arg("--sysroot")
+                .arg(&tools.sysroot),
+        )
+        .expect(2, "tool_failed", Some("binding"));
+    fs::write(&dep_rmeta, &orig_dep_bytes).unwrap();
+
+    // Negative 5: dropping a new `.rmeta` into `deps/` during verification is
+    // caught by `watched_dep_dirs` re-scanning at `binding`.
+    let rogue_rmeta = deps_dir.join("librogue.rmeta");
+    let inject_wrapper = fixture.path("inject-dep-wrapper.sh");
+    let inject_script = format!(
+        "#!/bin/sh\n'{}' \"$@\"\nrc=$?\nprintf 'rogue' > '{}'\nexit $rc\n",
+        tools.capture.display(),
+        rogue_rmeta.display()
+    );
+    let mut installer = Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "install"])
+        .arg(&inject_wrapper)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    installer
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(inject_script.as_bytes())
+        .unwrap();
+    assert!(installer.wait().unwrap().success());
+
+    fixture
+        .execute(
+            "mid-run-dep-dir-inject",
+            Command::new(&tools.cli)
+                .arg("verify")
+                .arg("--request")
+                .arg(&req_path)
+                .arg("--capture")
+                .arg(&inject_wrapper)
+                .arg("--lean")
+                .arg(&tools.lean)
+                .arg("--sysroot")
+                .arg(&tools.sysroot),
+        )
+        .expect(2, "tool_failed", Some("binding"));
+    let _ = fs::remove_file(&rogue_rmeta);
+}
+
+#[cfg(unix)]
+#[test]
+fn verifies_with_work_dir_under_nonexistent_and_readonly_tmpdir() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tools = Tools::discover();
+    let fixture = Fixture::new();
+    let writable_work = fixture.path("ninja-action-scratch");
+    fs::create_dir(&writable_work).unwrap();
+    let ro_tmp = fixture.path("readonly-tmp");
+    fs::create_dir(&ro_tmp).unwrap();
+    fs::set_permissions(&ro_tmp, fs::Permissions::from_mode(0o500)).unwrap();
+    let nonexistent_tmp = fixture.path("nonexistent_ro_tmp");
+
+    let req_path = fixture.path("hermetic-work-dir.json");
+    fs::write(
+        &req_path,
+        serde_json::to_vec_pretty(&fixture.request).unwrap(),
+    )
+    .unwrap();
+
+    for (idx, bad_tmp) in [&nonexistent_tmp, &ro_tmp].into_iter().enumerate() {
+        let artifacts_dir = fixture.path(&format!("work-dir-artifacts-{idx}"));
+        let receipt = fixture.execute(
+            &format!("work-dir-request-{idx}"),
+            tools
+                .command()
+                .env("TMPDIR", bad_tmp)
+                .arg("--request")
+                .arg(&req_path)
+                .arg("--work-dir")
+                .arg(&writable_work)
+                .arg("--artifacts")
+                .arg(&artifacts_dir),
+        );
+        receipt.expect(0, "crate_verified", None);
+        assert!(!nonexistent_tmp.exists());
+        assert_eq!(fs::read_dir(&ro_tmp).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&writable_work).unwrap().count(), 0);
+        assert!(artifacts_dir.join("result.json").is_file());
+        assert!(!artifacts_dir.join("tmp").exists());
+    }
+
+    // Exercise `--manifest-path` (`cargo metadata` + `capture` + `Checker`)
+    // under `TMPDIR=/nonexistent_ro_tmp` with `--work-dir`.
+    let manifest = fixture.path("rust/Cargo.toml");
+    fixture.write(
+        "rust/Cargo.toml",
+        "[package]\nname = \"scalar\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[lib]\npath = \"lib.rs\"\n",
+    );
+    let shortcut_receipt = fixture.execute(
+        "work-dir-cargo-shortcut",
+        tools
+            .command()
+            .env("TMPDIR", &nonexistent_tmp)
+            .arg("--manifest-path")
+            .arg(&manifest)
+            .arg("--proof-dir")
+            .arg(fixture.path("lean"))
+            .arg("--work-dir")
+            .arg(&writable_work),
+    );
+    shortcut_receipt.expect(0, "crate_verified", None);
+    assert!(!nonexistent_tmp.exists());
+    assert_eq!(fs::read_dir(&writable_work).unwrap().count(), 0);
+    fs::set_permissions(&ro_tmp, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn verifies_all_six_64_bit_little_endian_targets_and_rejects_others() {
+    let tools = Tools::discover();
+    let fixture = Fixture::new();
+    let rustc = tools.sysroot.join("bin/rustc");
+    let deps_dir = fixture.path("deps");
+    fs::create_dir(&deps_dir).unwrap();
+    let mini_core_src = fixture.path("mini_core.rs");
+    fs::write(
+        &mini_core_src,
+        "#![allow(internal_features)]\n#![feature(no_core, lang_items)]\n#![no_core]\n\
+         #[lang = \"pointee_sized\"]\npub trait PointeeSized {}\n\
+         #[lang = \"meta_sized\"]\npub trait MetaSized: PointeeSized {}\n\
+         #[lang = \"sized\"]\npub trait Sized: MetaSized {}\n\
+         #[lang = \"copy\"]\npub trait Copy: Sized {}\n",
+    )
+    .unwrap();
+    fixture.write(
+        "rust/lib.rs",
+        "#![feature(no_core)]\n#![no_core]\nextern crate mini_core;\n\
+         pub fn zero() -> u64 { 0 }\n",
+    );
+
+    for (idx, triple) in [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "riscv64gc-unknown-linux-gnu",
+        "x86_64-unknown-fuchsia",
+        "aarch64-unknown-fuchsia",
+        "riscv64gc-unknown-fuchsia",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rel_rmeta = format!("deps/libmini_core_{idx}.rmeta");
+        let out_rmeta = fixture.path(&rel_rmeta);
+        assert!(
+            Command::new(&rustc)
+                .env("LD_LIBRARY_PATH", tools.sysroot.join("lib"))
+                .args([
+                    "--edition=2024",
+                    "--crate-name=mini_core",
+                    "--crate-type=lib",
+                    &format!("--target={triple}"),
+                    "--emit=metadata",
+                    "-o",
+                ])
+                .arg(&out_rmeta)
+                .arg(&mini_core_src)
+                .status()
+                .unwrap()
+                .success(),
+            "failed to compile mini_core for {triple}"
+        );
+        let mut req = fixture.request.clone();
+        req["compilation"]["target"] = json!(triple);
+        req["compilation"]["externs"] = json!([
+            {"crate_name": "mini_core", "path": rel_rmeta}
+        ]);
+        let receipt = fixture.run(&tools, &format!("target-ok-{idx}"), &req);
+        receipt.expect(0, "crate_verified", None);
+        assert_eq!(receipt.value["configuration"]["target"], triple);
+        assert_eq!(receipt.value["configuration"]["pointer_bits"], 64);
+        assert_eq!(receipt.value["configuration"]["endian"], "little");
+    }
+
+    for (idx, bad_triple) in [
+        "i686-unknown-linux-gnu",
+        "s390x-unknown-linux-gnu",
+        "wasm32-unknown-unknown",
+        "x86_64-apple-darwin",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut req = fixture.request.clone();
+        req["compilation"]["target"] = json!(bad_triple);
+        fixture
+            .run(&tools, &format!("target-bad-{idx}"), &req)
+            .expect(1, "unsupported", Some("request"));
+    }
 }

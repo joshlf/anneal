@@ -1001,8 +1001,7 @@ fn negative_isize_enum_discriminants_are_captured_as_64_bit_twos_complement() {
         .expect("capture signed repr(isize) enum");
     assert!(output.status.success(), "{output:?}");
     let manifest = fixture.manifest();
-    let discriminants = manifest["program"]["bodies"][0]["local_tys"][1]
-        ["discriminants"]
+    let discriminants = manifest["program"]["bodies"][0]["local_tys"][1]["discriminants"]
         .as_array()
         .expect("enum discriminants");
     let values: Vec<u64> = discriminants
@@ -1010,8 +1009,8 @@ fn negative_isize_enum_discriminants_are_captured_as_64_bit_twos_complement() {
         .map(|v| v.as_u64().expect("u64 discriminant"))
         .collect();
     assert_eq!(values, vec![u64::MAX, 0, 1]);
-    let lean = std::fs::read_to_string(fixture.output.join("Captured.lean"))
-        .expect("read Captured.lean");
+    let lean =
+        std::fs::read_to_string(fixture.output.join("Captured.lean")).expect("read Captured.lean");
     assert!(
         lean.contains("[18446744073709551615, 0, 1]"),
         "expected 64-bit two's-complement discriminant list in Captured.lean:\n{lean}"
@@ -1303,9 +1302,21 @@ fn rustc_that_is_not_the_linked_build_is_refused_before_compilation() {
         .join(std::ffi::OsString::from_vec(vec![b's', b'l', 0xff]));
     std::os::unix::fs::symlink(sysroot(), &non_utf8_to_utf8_sysroot).unwrap();
     for (bad_sysroot, with_rustc, diagnostic) in [
-        (&non_utf8_to_utf8_sysroot, false, "--sysroot path must be UTF-8"),
-        (&non_utf8_to_utf8_sysroot, true, "--sysroot path must be UTF-8"),
-        (&utf8_to_non_utf8_sysroot, true, "sysroot path must be UTF-8"),
+        (
+            &non_utf8_to_utf8_sysroot,
+            false,
+            "--sysroot path must be UTF-8",
+        ),
+        (
+            &non_utf8_to_utf8_sysroot,
+            true,
+            "--sysroot path must be UTF-8",
+        ),
+        (
+            &utf8_to_non_utf8_sysroot,
+            true,
+            "sysroot path must be UTF-8",
+        ),
     ] {
         let mut command = Command::new(env!("CARGO_BIN_EXE_anneal-rustc-capture"));
         command
@@ -1331,4 +1342,240 @@ fn rustc_that_is_not_the_linked_build_is_refused_before_compilation() {
         assert!(stdout(&output).contains(diagnostic), "{output:?}");
         assert!(!fixture.output.exists(), "{output:?}");
     }
+}
+
+#[test]
+fn captures_all_six_64_bit_little_endian_targets_and_rejects_others() {
+    let no_core_src = br#"#![allow(internal_features)]
+#![feature(no_core, lang_items)]
+#![no_core]
+#[lang = "pointee_sized"]
+pub trait PointeeSized {}
+#[lang = "meta_sized"]
+pub trait MetaSized: PointeeSized {}
+#[lang = "sized"]
+pub trait Sized: MetaSized {}
+#[lang = "copy"]
+pub trait Copy: Sized {}
+pub fn selected(x: u64) -> u64 { x }
+"#;
+    for triple in [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "riscv64gc-unknown-linux-gnu",
+        "x86_64-unknown-fuchsia",
+        "aarch64-unknown-fuchsia",
+        "riscv64gc-unknown-fuchsia",
+    ] {
+        let fixture = Capture::new(no_core_src);
+        let output = Command::new(env!("CARGO_BIN_EXE_anneal-rustc-capture"))
+            .current_dir(fixture.directory.path())
+            .arg("capture")
+            .arg("--crate-root")
+            .arg(&fixture.source)
+            .arg("--crate-name=session")
+            .arg(format!("--target={triple}"))
+            .arg("--out-dir")
+            .arg(&fixture.output)
+            .arg("--sysroot")
+            .arg(sysroot())
+            .arg("--source-file")
+            .arg(&fixture.source)
+            .arg("--select=selected")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "target {triple} failed:\nstdout:\n{}\nstderr:\n{}",
+            stdout(&output),
+            stderr(&output)
+        );
+        let manifest = fixture.manifest();
+        assert_eq!(manifest["configuration"]["target"], triple);
+        assert_eq!(manifest["configuration"]["pointer_bits"], 64);
+        assert_eq!(manifest["configuration"]["endian"], "little");
+    }
+
+    for unsupported in [
+        "i686-unknown-linux-gnu",
+        "s390x-unknown-linux-gnu",
+        "wasm32-unknown-unknown",
+        "x86_64-apple-darwin",
+        "armv7-unknown-linux-gnueabihf",
+    ] {
+        let fixture = Capture::new(no_core_src);
+        let output = Command::new(env!("CARGO_BIN_EXE_anneal-rustc-capture"))
+            .current_dir(fixture.directory.path())
+            .arg("capture")
+            .arg("--crate-root")
+            .arg(&fixture.source)
+            .arg("--crate-name=session")
+            .arg(format!("--target={unsupported}"))
+            .arg("--out-dir")
+            .arg(&fixture.output)
+            .arg("--sysroot")
+            .arg(sysroot())
+            .arg("--source-file")
+            .arg(&fixture.source)
+            .arg("--select=selected")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{unsupported}: {output:?}");
+        assert_eq!(status(&output)["status"], "unsupported", "{output:?}");
+        assert!(!fixture.output.exists(), "{unsupported}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn authenticates_extern_crates_and_dependency_dirs_and_rejects_tampering() {
+    let sysroot_path = PathBuf::from(sysroot());
+    let rustc = sysroot_path.join("bin/rustc");
+    let workspace = tempfile::tempdir().unwrap();
+    let deps_dir = workspace.path().join("deps");
+    std::fs::create_dir(&deps_dir).unwrap();
+
+    let leaf_rs = workspace.path().join("leaf_types.rs");
+    std::fs::write(&leaf_rs, b"pub enum LeafBit { Zero = 0, One = 1 }\n").unwrap();
+    let leaf_rmeta = deps_dir.join("libleaf_types.rmeta");
+    let st = Command::new(&rustc)
+        .env("LD_LIBRARY_PATH", sysroot_path.join("lib"))
+        .args([
+            "--edition=2024",
+            "--crate-name=leaf_types",
+            "--crate-type=lib",
+            "--target=x86_64-unknown-linux-gnu",
+            "--emit=metadata",
+            "-o",
+        ])
+        .arg(&leaf_rmeta)
+        .arg(&leaf_rs)
+        .status()
+        .unwrap();
+    assert!(st.success());
+
+    let dep_rs = workspace.path().join("dep_types.rs");
+    std::fs::write(
+        &dep_rs,
+        b"pub use leaf_types::LeafBit;\npub enum Mode { Little = 0, Big = 1 }\n",
+    )
+    .unwrap();
+    let dep_rmeta = deps_dir.join("libdep_types.rmeta");
+    let st = Command::new(&rustc)
+        .env("LD_LIBRARY_PATH", sysroot_path.join("lib"))
+        .args([
+            "--edition=2024",
+            "--crate-name=dep_types",
+            "--crate-type=lib",
+            "--target=x86_64-unknown-linux-gnu",
+            "--emit=metadata",
+            "-o",
+        ])
+        .arg(&dep_rmeta)
+        .arg(format!("--extern=leaf_types={}", leaf_rmeta.display()))
+        .arg(&dep_rs)
+        .status()
+        .unwrap();
+    assert!(st.success());
+
+    let subject_src = br#"
+use dep_types::{LeafBit, Mode};
+pub enum LocalMode { A = 0, B = 1 }
+pub fn selected(m: Mode, b: LeafBit, l: LocalMode) -> u64 {
+    match m {
+        Mode::Little => match b {
+            LeafBit::Zero => match l {
+                LocalMode::A => 0xff,
+                LocalMode::B => 1,
+            },
+            LeafBit::One => 2,
+        },
+        Mode::Big => 3,
+    }
+}
+"#;
+    let fixture = Capture::new(subject_src);
+    let output = fixture
+        .selected_command()
+        .arg(format!("--extern=dep_types={}", dep_rmeta.display()))
+        .arg(format!("-Ldependency={}", deps_dir.display()))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let manifest = fixture.manifest();
+    let expected_dep_sha = format!("{:x}", Sha256::digest(std::fs::read(&dep_rmeta).unwrap()));
+    let expected_leaf_sha = format!("{:x}", Sha256::digest(std::fs::read(&leaf_rmeta).unwrap()));
+    let observed = manifest["externs"].as_array().unwrap();
+    assert!(
+        observed
+            .iter()
+            .any(|e| e["crate_name"] == "dep_types" && e["sha256"] == expected_dep_sha),
+        "{observed:?}"
+    );
+    assert!(
+        observed
+            .iter()
+            .any(|e| e["crate_name"] == "leaf_types" && e["sha256"] == expected_leaf_sha),
+        "{observed:?}"
+    );
+    // External fieldless enums carry a non-zero upper 32-bit CrateNum,
+    // never colliding with `LOCAL_CRATE` (`0`) enum IDs.
+    let local_tys = manifest["program"]["bodies"][0]["local_tys"]
+        .as_array()
+        .unwrap();
+    let arg_enum_ids: Vec<u64> = local_tys[1..=3]
+        .iter()
+        .map(|t| t["id"].as_u64().expect("enum id"))
+        .collect();
+    assert!(arg_enum_ids[0] >= (1u64 << 32), "{arg_enum_ids:?}");
+    assert!(arg_enum_ids[1] >= (1u64 << 32), "{arg_enum_ids:?}");
+    assert_ne!(arg_enum_ids[0], arg_enum_ids[1], "{arg_enum_ids:?}");
+    assert!(arg_enum_ids[2] < (1u64 << 32), "{arg_enum_ids:?}");
+
+    // Invalid `--extern` crate identifiers fail closed.
+    for bad_spec in [
+        format!("--bad={}", dep_rmeta.display()),
+        format!("@rsp={}", dep_rmeta.display()),
+        format!("priv:dep={}", dep_rmeta.display()),
+        format!("my-crate={}", dep_rmeta.display()),
+        "missing_equals".to_string(),
+    ] {
+        let bad_fix = Capture::new(b"pub fn selected() {}\n");
+        let out = bad_fix
+            .selected_command()
+            .arg(format!("--extern={bad_spec}"))
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{bad_spec}");
+        assert_eq!(status(&out)["status"], "unsupported", "{bad_spec}: {out:?}");
+        assert!(!bad_fix.output.exists());
+    }
+
+    // Without `-Ldependency=deps`, transitive `leaf_types` fails closed.
+    let missing_dep_dir = Capture::new(subject_src);
+    let out = missing_dep_dir
+        .selected_command()
+        .arg(format!("--extern=dep_types={}", dep_rmeta.display()))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    missing_dep_dir.assert_no_capture_artifacts();
+
+    // Symlinked .rmeta is rejected fail-closed.
+    let sym_rmeta = workspace.path().join("sym.rmeta");
+    std::os::unix::fs::symlink(&dep_rmeta, &sym_rmeta).unwrap();
+    let sym_fix = Capture::new(subject_src);
+    let out = sym_fix
+        .selected_command()
+        .arg(format!("--extern=dep_types={}", sym_rmeta.display()))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(status(&out)["status"], "unsupported");
+    assert!(!sym_fix.output.exists());
 }

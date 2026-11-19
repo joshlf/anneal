@@ -68,25 +68,42 @@ fn assert_result(output: &Output, code: i32, stdout: &str, stderr: &str) {
 #[test]
 fn help_and_version_work_through_direct_and_cargo_invocation() {
     let project = tempfile::tempdir().expect("create external working directory");
+    #[cfg(feature = "setup")]
+    let help_invocations: &[&[&str]] = &[
+        &[],
+        &["help"],
+        &["-h"],
+        &["--help"],
+        &["setup", "-h"],
+        &["setup", "--help"],
+        &["help", "setup"],
+        &["verify", "-h"],
+        &["verify", "--help"],
+        &["help", "verify"],
+    ];
+    #[cfg(not(feature = "setup"))]
+    let help_invocations: &[&[&str]] = &[
+        &[],
+        &["help"],
+        &["-h"],
+        &["--help"],
+        &["verify", "-h"],
+        &["verify", "--help"],
+        &["help", "verify"],
+    ];
     for route in [Route::Direct, Route::Cargo] {
-        for args in [
-            &[][..],
-            &["help"],
-            &["-h"],
-            &["--help"],
-            &["setup", "-h"],
-            &["setup", "--help"],
-            &["help", "setup"],
-            &["verify", "-h"],
-            &["verify", "--help"],
-            &["help", "verify"],
-        ] {
+        for args in help_invocations {
             let output = command(route, project.path())
-                .args(args)
+                .args(*args)
                 .output()
                 .unwrap_or_else(|error| panic!("launch {route:?}: {error}"));
             assert_result(&output, 0, "Usage:", "");
             assert!(output.stderr.is_empty(), "{output:?}");
+            #[cfg(not(feature = "setup"))]
+            if args.is_empty() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(!stdout.contains("setup"), "{stdout}");
+            }
         }
         for arg in ["-V", "--version"] {
             let output = command(route, project.path())
@@ -107,25 +124,54 @@ fn help_and_version_work_through_direct_and_cargo_invocation() {
 #[test]
 fn malformed_arguments_fail_through_direct_and_cargo_invocation() {
     let project = tempfile::tempdir().expect("create external working directory");
+    #[cfg(feature = "setup")]
+    let bad_invocations: &[&[&str]] = &[
+        &["unknown"],
+        &["--unknown"],
+        &["setup", "--unknown"],
+        &["setup", "--local-archive"],
+        &["verify"],
+        &["verify", "--request"],
+        &["verify", "--request", "request.json", "--unknown"],
+        &[
+            "verify",
+            "--request",
+            "request.json",
+            "--manifest-path",
+            "Cargo.toml",
+        ],
+    ];
+    #[cfg(not(feature = "setup"))]
+    let bad_invocations: &[&[&str]] = &[
+        &["unknown"],
+        &["--unknown"],
+        &["setup"],
+        &["verify"],
+        &["verify", "--request"],
+        &["verify", "--request", "request.json"],
+        &[
+            "verify",
+            "--request",
+            "request.json",
+            "--capture",
+            "capture",
+            "--sysroot",
+            "sysroot",
+        ],
+        &[
+            "verify",
+            "--request",
+            "request.json",
+            "--capture",
+            "capture",
+            "--lean",
+            "lean",
+        ],
+    ];
     for route in [Route::Direct, Route::Cargo] {
-        for args in [
-            &["unknown"][..],
-            &["--unknown"],
-            &["setup", "--unknown"],
-            &["setup", "--local-archive"],
-            &["verify"],
-            &["verify", "--request"],
-            &["verify", "--request", "request.json", "--unknown"],
-            &[
-                "verify",
-                "--request",
-                "request.json",
-                "--manifest-path",
-                "Cargo.toml",
-            ],
-        ] {
+        for args in bad_invocations {
             let output = command(route, project.path())
-                .args(args)
+                .args(*args)
                 .output()
                 .unwrap_or_else(|error| panic!("launch {route:?}: {error}"));
             assert_result(&output, 2, "", "error:");
@@ -134,12 +180,27 @@ fn malformed_arguments_fail_through_direct_and_cargo_invocation() {
     }
 }
 
-#[cfg(target_os = "linux")]
+fn add_hermetic_tool_stubs(cmd: &mut Command, with_capture: bool, with_sysroot: bool) {
+    #[cfg(feature = "setup")]
+    let _ = (cmd, with_capture, with_sysroot);
+    #[cfg(not(feature = "setup"))]
+    {
+        if with_capture {
+            cmd.args(["--capture", "stub-capture"]);
+        }
+        cmd.args(["--lean", "stub-lean"]);
+        if with_sysroot {
+            cmd.args(["--sysroot", "stub-sysroot"]);
+        }
+    }
+}
+
+#[cfg(all(feature = "setup", target_os = "linux"))]
 fn local_archive(path: &Path) {
     archive_entries(path, &[("marker.txt", b"current-run CLI archive", 0o644)]);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "setup", target_os = "linux"))]
 fn archive_entries(path: &Path, entries: &[(&str, &[u8], u32)]) {
     let file = std::fs::File::create(path).expect("create archive");
     let encoder = zstd::Encoder::new(file, 1).expect("create compressor");
@@ -160,7 +221,7 @@ fn archive_entries(path: &Path, entries: &[(&str, &[u8], u32)]) {
         .expect("finish compressed archive");
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "setup", target_os = "linux"))]
 #[test]
 fn setup_uses_fresh_child_cache_for_each_invocation() {
     let project = tempfile::tempdir().expect("create external working directory");
@@ -243,14 +304,14 @@ fn rejects_non_utf8_artifact_paths_before_staging_or_retention() {
         fs::create_dir(&existing).unwrap();
         fs::write(existing.join("keep"), b"caller evidence").unwrap();
         for destination in [&absent, &existing] {
-            let output = command(route, project.path())
-                .arg("verify")
+            let mut cmd = command(route, project.path());
+            cmd.arg("verify")
                 .arg("--request")
                 .arg(&request)
                 .arg("--artifacts")
-                .arg(destination)
-                .output()
-                .unwrap();
+                .arg(destination);
+            add_hermetic_tool_stubs(&mut cmd, true, true);
+            let output = cmd.output().unwrap();
             assert_result(&output, 2, "", "");
             assert!(output.stderr.is_empty(), "{output:?}");
             let receipt: serde_json::Value = serde_json::from_slice(&output.stdout)
@@ -268,15 +329,15 @@ fn rejects_non_utf8_artifact_paths_before_staging_or_retention() {
         // A missing temp parent would fail stage creation. The encoding check
         // must run first, without reading a request or creating either path.
         let missing_tmp = project.path().join(format!("{route:?}-missing-temp"));
-        let output = command(route, project.path())
-            .env("TMPDIR", &missing_tmp)
+        let mut cmd = command(route, project.path());
+        cmd.env("TMPDIR", &missing_tmp)
             .arg("verify")
             .arg("--request")
             .arg(project.path().join("missing-request"))
             .arg("--artifacts")
-            .arg(&absent)
-            .output()
-            .unwrap();
+            .arg(&absent);
+        add_hermetic_tool_stubs(&mut cmd, true, true);
+        let output = cmd.output().unwrap();
         assert_result(&output, 2, "", "");
         let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(receipt["schema_version"], 1);
@@ -288,14 +349,14 @@ fn rejects_non_utf8_artifact_paths_before_staging_or_retention() {
         // UTF-8 paths retain the normal rejected-request evidence and receipt.
         // This control needs no compiler or Lean process.
         let ordinary = project.path().join(format!("{route:?}-ordinary-evidence"));
-        let output = command(route, project.path())
-            .arg("verify")
+        let mut cmd = command(route, project.path());
+        cmd.arg("verify")
             .arg("--request")
             .arg(&request)
             .arg("--artifacts")
-            .arg(&ordinary)
-            .output()
-            .unwrap();
+            .arg(&ordinary);
+        add_hermetic_tool_stubs(&mut cmd, true, true);
+        let output = cmd.output().unwrap();
         assert_result(&output, 1, "", "");
         assert!(output.stderr.is_empty(), "{output:?}");
         let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -321,6 +382,7 @@ fn early_verification_failures_have_versioned_receipts() {
         for phase in ["staging", "retention"] {
             let mut child = command(route, project.path());
             child.arg("verify").arg("--request").arg(&request);
+            add_hermetic_tool_stubs(&mut child, true, true);
             if phase == "staging" {
                 child.env("TMPDIR", project.path().join("missing-temp"));
             } else {
@@ -339,7 +401,7 @@ fn early_verification_failures_have_versioned_receipts() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "setup", target_os = "linux"))]
 #[test]
 fn capture_discovery_prefers_explicit_then_installed_then_sibling() {
     use std::fs;
@@ -491,6 +553,7 @@ fn cargo_shortcut_declares_only_its_documented_source_namespace() {
         .arg(project.path().join("missing-capture"))
         .arg("--artifacts")
         .arg(&evidence);
+    add_hermetic_tool_stubs(&mut child, false, true);
     let output = child.output().unwrap();
     assert_result(&output, 2, "", "");
     let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -608,8 +671,10 @@ fn rustc_and_rustc_version_must_be_passed_together() {
                 "--rustc <PATH>",
             ),
         ] {
-            let output = command(route, project.path())
-                .args(args)
+            let mut cmd = command(route, project.path());
+            cmd.args(args);
+            add_hermetic_tool_stubs(&mut cmd, true, false);
+            let output = cmd
                 .output()
                 .unwrap_or_else(|error| panic!("launch {route:?}: {error}"));
             assert_result(&output, 2, "", missing);
@@ -745,8 +810,8 @@ fn declared_compiler_must_be_supported_and_reported_by_rustc() {
         ),
     ]);
     for (rustc, id, status, diagnostic) in cases {
-        let output = Command::new(env!("CARGO_BIN_EXE_cargo-anneal"))
-            .current_dir(project.path())
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cargo-anneal"));
+        cmd.current_dir(project.path())
             .env("XDG_CACHE_HOME", project.path().join("empty-cache"))
             .arg("verify")
             .arg("--request")
@@ -755,9 +820,9 @@ fn declared_compiler_must_be_supported_and_reported_by_rustc() {
             .arg(&capture)
             .arg("--rustc")
             .arg(&rustc)
-            .args(["--rustc-version", id])
-            .output()
-            .unwrap();
+            .args(["--rustc-version", id]);
+        add_hermetic_tool_stubs(&mut cmd, false, false);
+        let output = cmd.output().unwrap();
         let code = if status == "unsupported" { 1 } else { 2 };
         assert_result(&output, code, diagnostic, "");
         let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -786,8 +851,8 @@ fn declared_compiler_must_be_supported_and_reported_by_rustc() {
             "--sysroot target path must be UTF-8",
         ),
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_cargo-anneal"))
-            .current_dir(project.path())
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cargo-anneal"));
+        cmd.current_dir(project.path())
             .env("XDG_CACHE_HOME", project.path().join("empty-cache"))
             .arg("verify")
             .arg("--request")
@@ -798,9 +863,9 @@ fn declared_compiler_must_be_supported_and_reported_by_rustc() {
             .arg(&fuchsia)
             .args(["--rustc-version", "V2026_10_22_R7189d39d9"])
             .arg("--sysroot")
-            .arg(bad_sysroot)
-            .output()
-            .unwrap();
+            .arg(bad_sysroot);
+        add_hermetic_tool_stubs(&mut cmd, false, false);
+        let output = cmd.output().unwrap();
         assert_result(&output, 2, diagnostic, "");
         let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(receipt["status"], "tool_failed", "{receipt}");
@@ -819,8 +884,8 @@ fn declared_compiler_must_be_supported_and_reported_by_rustc() {
             "capture executable path must be UTF-8",
         ),
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_cargo-anneal"))
-            .current_dir(project.path())
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cargo-anneal"));
+        cmd.current_dir(project.path())
             .env("XDG_CACHE_HOME", project.path().join("empty-cache"))
             .arg("verify")
             .arg("--request")
@@ -829,9 +894,9 @@ fn declared_compiler_must_be_supported_and_reported_by_rustc() {
             .arg(bad_capture)
             .arg("--rustc")
             .arg(&fuchsia)
-            .args(["--rustc-version", "V2026_10_22_R7189d39d9"])
-            .output()
-            .unwrap();
+            .args(["--rustc-version", "V2026_10_22_R7189d39d9"]);
+        add_hermetic_tool_stubs(&mut cmd, false, false);
+        let output = cmd.output().unwrap();
         assert_result(&output, 2, diagnostic, "");
         let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(receipt["status"], "tool_failed", "{receipt}");
@@ -885,7 +950,13 @@ fn declared_fuchsia_compiler_reaches_capture_with_its_distribution() {
     let joined_rustc = joined_dist.join("bin/rustc");
     std::os::unix::fs::symlink(&store_rustc, &joined_rustc).unwrap();
     for (given_rustc, canon_rustc, expected_dist, id, sysroot) in [
-        (&alias, &rustc, &distribution, "V2026_10_22_R7189d39d9", None),
+        (
+            &alias,
+            &rustc,
+            &distribution,
+            "V2026_10_22_R7189d39d9",
+            None,
+        ),
         (&alias, &rustc, &distribution, COMMIT_7189, None),
         (
             &alias,
@@ -915,6 +986,7 @@ fn declared_fuchsia_compiler_reaches_capture_with_its_distribution() {
             .arg("--rustc")
             .arg(given_rustc)
             .args(["--rustc-version", id]);
+        add_hermetic_tool_stubs(&mut child, false, false);
         if let Some(sysroot) = sysroot {
             child.arg("--sysroot").arg(sysroot);
         }
@@ -942,4 +1014,66 @@ fn declared_fuchsia_compiler_reaches_capture_with_its_distribution() {
             "{arguments:?}"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_non_utf8_and_missing_work_dir_and_bypasses_missing_tmpdir() {
+    use std::ffi::OsString;
+    use std::fs;
+    use std::os::unix::ffi::OsStringExt;
+
+    let project = tempfile::tempdir().unwrap();
+    let request = project.path().join("request.json");
+    fs::write(&request, b"not JSON\n").unwrap();
+
+    let non_utf8_work = project
+        .path()
+        .join(OsString::from_vec(vec![b'w', b'k', 0xff]));
+    fs::create_dir(&non_utf8_work).unwrap();
+    let link_to_non_utf8 = project.path().join("work-link");
+    std::os::unix::fs::symlink(&non_utf8_work, &link_to_non_utf8).unwrap();
+    let missing_work = project.path().join("missing-work");
+
+    for (bad_work, expected_detail) in [
+        (&non_utf8_work, "--work-dir path must be UTF-8"),
+        (
+            &link_to_non_utf8,
+            "canonical temporary directory path must be UTF-8",
+        ),
+        (&missing_work, "No such file or directory"),
+    ] {
+        let mut cmd = command(Route::Direct, project.path());
+        cmd.arg("verify")
+            .arg("--request")
+            .arg(&request)
+            .arg("--work-dir")
+            .arg(bad_work);
+        add_hermetic_tool_stubs(&mut cmd, true, true);
+        let output = cmd.output().unwrap();
+        assert_result(&output, 2, expected_detail, "");
+        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(receipt["status"], "tool_failed", "{receipt}");
+        assert_eq!(receipt["phase"], "staging", "{receipt}");
+    }
+
+    // With a valid --work-dir, an absent TMPDIR is ignored during staging.
+    let valid_work = project.path().join("valid-work");
+    fs::create_dir(&valid_work).unwrap();
+    let missing_tmp = project.path().join("nonexistent_ro_tmp");
+    let mut cmd = command(Route::Direct, project.path());
+    cmd.env("TMPDIR", &missing_tmp)
+        .arg("verify")
+        .arg("--request")
+        .arg(&request)
+        .arg("--work-dir")
+        .arg(&valid_work);
+    add_hermetic_tool_stubs(&mut cmd, true, true);
+    let output = cmd.output().unwrap();
+    assert_result(&output, 1, "", "");
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["status"], "unsupported", "{receipt}");
+    assert_eq!(receipt["phase"], "request", "{receipt}");
+    assert!(!missing_tmp.exists());
+    assert_eq!(fs::read_dir(&valid_work).unwrap().count(), 0);
 }

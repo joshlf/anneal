@@ -9,11 +9,13 @@
 //! CLI entrypoint for `cargo-anneal`.
 
 mod compilers;
+#[cfg(feature = "setup")]
 mod setup;
 mod verify;
 
 use std::env;
 use std::ffi::OsString;
+#[cfg(feature = "setup")]
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -36,6 +38,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Install the pinned Anneal toolchain archive.
+    #[cfg(feature = "setup")]
     Setup {
         /// Install a local archive instead of downloading the pinned archive.
         #[arg(long, value_name = "path")]
@@ -55,6 +58,7 @@ enum Action {
 #[derive(Debug)]
 enum Failure {
     Arguments(clap::Error),
+    #[cfg(feature = "setup")]
     Operation(String),
 }
 
@@ -67,6 +71,7 @@ fn parse(mut args: Vec<OsString>) -> Result<Cli, clap::Error> {
     Cli::try_parse_from(args)
 }
 
+#[cfg(feature = "setup")]
 fn dispatch(
     cli: Cli,
     install: impl FnOnce(Option<PathBuf>) -> Result<PathBuf, String>,
@@ -84,6 +89,15 @@ fn dispatch(
     }
 }
 
+#[cfg(not(feature = "setup"))]
+fn dispatch(cli: Cli) -> Action {
+    match cli.command {
+        None => Action::Print(format!("{}\n", Cli::command().render_help())),
+        Some(Command::Verify(args)) => Action::Verify(args),
+    }
+}
+
+#[cfg(feature = "setup")]
 fn run(
     args: Vec<OsString>,
     install: impl FnOnce(Option<PathBuf>) -> Result<PathBuf, String>,
@@ -103,8 +117,30 @@ fn run(
     dispatch(cli, install).map_err(Failure::Operation)
 }
 
+#[cfg(not(feature = "setup"))]
+fn run(args: Vec<OsString>) -> Result<Action, Failure> {
+    let cli = match parse(args) {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
+            return Ok(Action::Print(error.to_string()));
+        }
+        Err(error) => return Err(Failure::Arguments(error)),
+    };
+    Ok(dispatch(cli))
+}
+
 fn main() -> ExitCode {
-    match run(env::args_os().collect(), setup::install) {
+    #[cfg(feature = "setup")]
+    let outcome = run(env::args_os().collect(), setup::install);
+    #[cfg(not(feature = "setup"))]
+    let outcome = run(env::args_os().collect());
+
+    match outcome {
         Ok(Action::Print(output)) => {
             print!("{output}");
             ExitCode::SUCCESS
@@ -114,6 +150,7 @@ fn main() -> ExitCode {
             eprint!("{error}");
             ExitCode::from(2)
         }
+        #[cfg(feature = "setup")]
         Err(Failure::Operation(error)) => {
             eprintln!("error: {error}");
             ExitCode::from(1)
@@ -129,6 +166,7 @@ mod tests {
         values.iter().map(OsString::from).collect()
     }
 
+    #[cfg(feature = "setup")]
     fn must_not_install(_: Option<PathBuf>) -> Result<PathBuf, String> {
         panic!("argument handling must not install a toolchain")
     }
@@ -140,6 +178,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "setup")]
     #[test]
     fn help_and_version_do_not_install() {
         for prefix in [&["cargo-anneal"][..], &["cargo-anneal", "anneal"]] {
@@ -178,6 +217,39 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "setup"))]
+    #[test]
+    fn help_and_version_omit_setup_subcommand() {
+        for prefix in [&["cargo-anneal"][..], &["cargo-anneal", "anneal"]] {
+            for suffix in [
+                &[][..],
+                &["help"],
+                &["-h"],
+                &["--help"],
+                &["verify", "-h"],
+                &["verify", "--help"],
+                &["help", "verify"],
+            ] {
+                let output =
+                    output(run(args(&[prefix, suffix].concat())).expect("help must succeed"));
+                assert!(output.contains("Usage:"), "{output}");
+                if suffix.is_empty() {
+                    assert!(!output.contains("setup"), "{output}");
+                    assert!(output.contains("verify"), "{output}");
+                }
+            }
+            for suffix in ["-V", "--version"] {
+                let output =
+                    output(run(args(&[prefix, &[suffix]].concat())).expect("version must succeed"));
+                assert_eq!(
+                    output,
+                    format!("cargo-anneal {}\n", env!("CARGO_PKG_VERSION"))
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "setup")]
     #[test]
     fn malformed_arguments_are_argument_failures() {
         for suffix in [
@@ -211,6 +283,69 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "setup"))]
+    #[test]
+    fn setup_and_missing_hermetic_tool_flags_are_argument_failures() {
+        for (suffix, expected_substr) in [
+            (&["setup"][..], "unrecognized subcommand 'setup'"),
+            (
+                &["verify", "--request", "request.json"],
+                "--capture <CAPTURE>",
+            ),
+            (
+                &[
+                    "verify",
+                    "--request",
+                    "request.json",
+                    "--capture",
+                    "capture",
+                    "--sysroot",
+                    "sysroot",
+                ],
+                "--lean <LEAN>",
+            ),
+            (
+                &[
+                    "verify",
+                    "--request",
+                    "request.json",
+                    "--capture",
+                    "capture",
+                    "--lean",
+                    "lean",
+                ],
+                "--sysroot <SYSROOT>",
+            ),
+            (
+                &[
+                    "verify",
+                    "--request",
+                    "request.json",
+                    "--manifest-path",
+                    "Cargo.toml",
+                    "--capture",
+                    "capture",
+                    "--lean",
+                    "lean",
+                    "--sysroot",
+                    "sysroot",
+                ],
+                "cannot be used with",
+            ),
+        ] {
+            let Failure::Arguments(error) = run(args(&[&["cargo-anneal"], suffix].concat()))
+                .err()
+                .expect("malformed or incomplete arguments must fail");
+            assert_eq!(error.exit_code(), 2);
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(expected_substr),
+                "expected {expected_substr:?} in:\n{rendered}"
+            );
+        }
+    }
+
+    #[cfg(feature = "setup")]
     #[test]
     fn setup_dispatch_preserves_archive_and_operation_result() {
         for archive in [None, Some(PathBuf::from("local archive.tar.zst"))] {
@@ -241,6 +376,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "setup")]
     #[test]
     fn verify_dispatch_preserves_both_invocation_routes() {
         for prefix in [&["cargo-anneal"][..], &["cargo-anneal", "anneal"]] {
@@ -263,7 +399,44 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(not(feature = "setup"))]
+    #[test]
+    fn verify_dispatch_accepts_explicit_hermetic_tool_flags() {
+        for prefix in [&["cargo-anneal"][..], &["cargo-anneal", "anneal"]] {
+            for suffix in [
+                &[
+                    "verify",
+                    "--request",
+                    "request.json",
+                    "--capture",
+                    "capture",
+                    "--lean",
+                    "lean",
+                    "--sysroot",
+                    "sysroot",
+                ][..],
+                &[
+                    "verify",
+                    "--request",
+                    "request.json",
+                    "--capture",
+                    "capture",
+                    "--lean",
+                    "lean",
+                    "--rustc",
+                    "rustc",
+                    "--rustc-version",
+                    "V2026_05_31_R14210df0e",
+                ],
+            ] {
+                let action = run(args(&[prefix, suffix].concat()))
+                    .expect("hermetic verify arguments must parse and dispatch");
+                assert!(matches!(action, Action::Verify(_)));
+            }
+        }
+    }
+
+    #[cfg(all(feature = "setup", unix))]
     #[test]
     fn archive_paths_do_not_require_utf8() {
         use std::os::unix::ffi::OsStringExt as _;
