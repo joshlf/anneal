@@ -210,7 +210,7 @@ traversal (`inspectSyntax` and `inspectNodeKind`) against a closed, role-aware
   closed allowlist of pure proof tactics (`allowedTheoryTacticKinds`) while
   rejecting trust-tier directives and any unallowlisted syntax node, command,
   modifier, attribute, or tactic configuration (excluding `unsafe`, `partial`,
-  `noncomputable`, `meta`, `axiom`, `macro`, `syntax`, `elab`, `sorry`,
+  `noncomputable section`, `meta`, `axiom`, `macro`, `syntax`, `elab`, `sorry`,
   `native_decide`, `decide!`, `bv_decide`, `rfl'`, `grind`, tactic `configItem`
   flags such as `+native` and `+kernel`, `by_elab`, `run_tac`, `#eval`,
   `include_str`, `set_option`, `@[implemented_by]`, `@[extern]`, `@[csimp]`,
