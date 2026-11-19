@@ -2701,3 +2701,270 @@ fn ep2_b2_lockstep_parity_on_old_match_shadowing_neg_patterns_enums_aliases_recu
         ]
     );
 }
+
+#[test]
+fn ep2_a2_lockstep_parity_on_for_loops_multifield_enums_const_patterns_let_else_nonzero_and_o1_panic()
+{
+    use anneal_difftest::{
+        EnumVariantLayout, SpecContractOracleProbe, SpecExternalCallee, SpecParamBinding,
+        SpecPostconditionVerdict, SpecViolationKind,
+    };
+
+    let i32_layout = LayoutSpec::Scalar(ScalarLayout::i32());
+    let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+    let nz_u32_layout =
+        LayoutSpec::Scalar(ScalarLayout::with_valid_range(4, false, 1, u32::MAX as u128));
+
+    let both_payload = LayoutSpec::Tuple {
+        total_size: 8,
+        elements: vec![(0, u32_layout.clone()), (4, u32_layout.clone())],
+    };
+    let move_payload = LayoutSpec::Struct {
+        name: "Move".to_string(),
+        total_size: 8,
+        fields: vec![
+            FieldLayout {
+                name: "dx".to_string(),
+                offset: 0,
+                layout: i32_layout.clone(),
+            },
+            FieldLayout {
+                name: "dy".to_string(),
+                offset: 4,
+                layout: i32_layout.clone(),
+            },
+        ],
+    };
+    let action_layout = LayoutSpec::Enum {
+        name: "TaggedAction".to_string(),
+        total_size: 12,
+        tag_offset: 0,
+        tag_size: 1,
+        variants: vec![
+            EnumVariantLayout {
+                name: "Idle".to_string(),
+                discriminant: 0,
+                payload_offset: 4,
+                payload: None,
+            },
+            EnumVariantLayout {
+                name: "Both".to_string(),
+                discriminant: 1,
+                payload_offset: 4,
+                payload: Some(Box::new(both_payload)),
+            },
+            EnumVariantLayout {
+                name: "Move".to_string(),
+                discriminant: 2,
+                payload_offset: 4,
+                payload: Some(Box::new(move_payload)),
+            },
+        ],
+    };
+    let state_layout = LayoutSpec::Struct {
+        name: "ActionState".to_string(),
+        total_size: 16,
+        fields: vec![
+            FieldLayout {
+                name: "act".to_string(),
+                offset: 0,
+                layout: action_layout.clone(),
+            },
+            FieldLayout {
+                name: "total".to_string(),
+                offset: 12,
+                layout: u32_layout.clone(),
+            },
+        ],
+    };
+
+    // Exercises all 7 `ep2-A2` findings end-to-end against `rustc -D warnings`:
+    // 1. `for` loops over half-open/closed ranges and `[T; N]` arrays (`for &item in &arr`),
+    // 2. Multi-field tuple-variant (`TaggedAction::Both(a, b)`) and struct-variant
+    //    (`TaggedAction::Move { dx, dy }`) literal synthesis (`rustc` E0061 fix) + evaluation,
+    // 3. Top-level `const MAGIC_KEY: Word = 42` in expressions AND `match` patterns
+    //    (proving `key != 42` does NOT silently bind `MAGIC_KEY` as a wildcard variable!)
+    //    + `type` aliases (`ActionAlias`, `StateAlias`) + `core::num::NonZeroU32` (`.get()`),
+    // 4. `let ... else` diverging statements in both body and `old(...)` + `[first, .., last]`
+    //    and `(lo, .., hi)` rest destructuring in `let` bindings,
+    // 5. `old(scratch_bump(st))` invoking an `&mut StateAlias` helper on an isolated scratch
+    //    clone without mutating `old(st.total)` or failing `rustc` borrow/type checking,
+    // 6. O(1) `remaining_calls_until_callee_panic` on `callee_panic_on_call = usize::MAX`
+    //    after `300` pre-steps (completing instantaneously with 1-for-1 native parity).
+    let probe = SpecContractOracleProbe::new(
+        "action_parity_probe",
+        vec![
+            SpecParamBinding::mut_ref("st", "StateAlias", state_layout)
+                .with_frame_preserved_fields(["act"]),
+            SpecParamBinding::by_value("key", "Word", u32_layout.clone()),
+            SpecParamBinding::by_value("scale", "core::num::NonZeroU32", nz_u32_layout),
+            SpecParamBinding::by_value("fallback", "i32", i32_layout),
+        ],
+        "Word",
+        u32_layout,
+        "if key == 999u32 {\n    \
+             st.act = ActionAlias::Move { dx: 1i32, dy: 2i32 };\n\
+         }\n\
+         let key_tag: Word = match key {\n    \
+             MAGIC_KEY => 40u32,\n    \
+             _ => 2u32,\n\
+         };\n\
+         let payload_sum: Word = match st.act {\n    \
+             ActionAlias::Both(a, b) => a + b,\n    \
+             ActionAlias::Move { dx, dy } => (dx.wrapping_abs() as u32) + (dy.wrapping_abs() as u32),\n    \
+             ActionAlias::Idle => {\n        \
+                 let ActionAlias::Both(v, ..) = st.act else {\n            \
+                     return st.total + (fallback as Word);\n        \
+                 };\n        \
+                 v\n    \
+             }\n\
+         };\n\
+         let mut acc: Word = 0u32;\n\
+         for step_i in 0u32..=2u32 {\n    \
+             acc += step_i;\n\
+         }\n\
+         let weights: [Word; 4] = [1, 2, 3, 4];\n\
+         let [w_first, .., w_last]: [Word; 4] = weights;\n\
+         let (tup_a, .., tup_b) = (w_first, 77u32, w_last);\n\
+         for &w in &weights {\n    \
+             acc += w;\n\
+         }\n\
+         let ext_ev: ActionAlias = ext_next_action(key);\n\
+         let ext_delta: Word = match ext_ev {\n    \
+             ActionAlias::Both(p, q) => p + q,\n    \
+             ActionAlias::Move { dx, dy } => (dx.saturating_abs() as u32) + (dy.saturating_abs() as u32),\n    \
+             ActionAlias::Idle => 0u32,\n\
+         };\n\
+         st.total = st.total + key_tag + payload_sum + acc + tup_a + tup_b + scale.get() + ext_delta;\n\
+         st.total",
+    )
+    .with_type_defs(
+        "pub type Word = u32;\n\
+         pub const MAGIC_KEY: Word = 42;\n\
+         #[repr(C, u8)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub enum TaggedAction {\n    \
+             Idle = 0,\n    \
+             Both(Word, Word) = 1,\n    \
+             Move { dx: i32, dy: i32 } = 2,\n\
+         }\n\
+         pub type ActionAlias = TaggedAction;\n\
+         #[repr(C)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub struct ActionState { pub act: TaggedAction, pub total: Word }\n\
+         pub type StateAlias = ActionState;\n\
+         pub fn scratch_bump(s: &mut StateAlias) -> Word {\n    \
+             s.total += 5u32;\n    \
+             s.total\n\
+         }",
+    )
+    .with_external_callee(SpecExternalCallee::new(
+        "ext_next_action",
+        ["Word"],
+        "ActionAlias",
+        action_layout,
+    ))
+    .with_requires(
+        "valid_domain",
+        "scale.get() <= 8u32 && fallback >= 0i32 && fallback <= 50i32",
+    )
+    .with_ensures(
+        "old_mut_scratch_and_const_discrimination",
+        "old(scratch_bump(st)) == old(st.total).wrapping_add(5u32) \
+         && old((|| { let ActionAlias::Both(v, _) = st.act else { return (fallback as u32) <= 50u32; }; v <= u32::MAX })()) \
+         && (key == MAGIC_KEY || key != 42u32)",
+    )
+    .with_ensures("strict_progress", "result > old(st.total)");
+
+    let make_trial =
+        |disc: u8, p0: i32, p1: i32, total: u32, key: u32, nz: u32, fallback: i32| -> Vec<u8> {
+            let mut b = vec![0xAAu8; 28];
+            b[0] = disc;
+            b[4..8].copy_from_slice(&p0.to_le_bytes());
+            b[8..12].copy_from_slice(&p1.to_le_bytes());
+            b[12..16].copy_from_slice(&total.to_le_bytes());
+            b[16..20].copy_from_slice(&key.to_le_bytes());
+            b[20..24].copy_from_slice(&nz.to_le_bytes());
+            b[24..28].copy_from_slice(&fallback.to_le_bytes());
+            b
+        };
+
+    let mut both_sched_bytes = vec![0xBBu8; 12];
+    both_sched_bytes[0] = 1u8; // Both(3, 4)
+    both_sched_bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
+    both_sched_bytes[8..12].copy_from_slice(&4u32.to_le_bytes());
+
+    let mut move_sched_bytes = vec![0xCCu8; 12];
+    move_sched_bytes[0] = 2u8; // Move { dx: -3, dy: 6 }
+    move_sched_bytes[4..8].copy_from_slice(&(-3i32).to_le_bytes());
+    move_sched_bytes[8..12].copy_from_slice(&6i32.to_le_bytes());
+
+    let mut sched_o1_max = EnvSchedule::new().with_callee_return_size("ext_next_action", 12);
+    sched_o1_max.push_callee_response("ext_next_action", move_sched_bytes);
+    sched_o1_max.set_callee_default("ext_next_action", both_sched_bytes.clone());
+    sched_o1_max.set_callee_panic_on_call("ext_next_action", usize::MAX);
+    for g in 0..300usize {
+        let _ = sched_o1_max.next_action("ext_next_action", g);
+    }
+
+    let mut base_sched = EnvSchedule::new().with_callee_return_size("ext_next_action", 12);
+    let mut move_q_bytes = vec![0xDDu8; 12];
+    move_q_bytes[0] = 2u8; // Move { dx: -4, dy: 5 } -> exercises struct-variant literal synthesis in schedule queue!
+    move_q_bytes[4..8].copy_from_slice(&(-4i32).to_le_bytes());
+    move_q_bytes[8..12].copy_from_slice(&5i32.to_le_bytes());
+    base_sched.push_callee_response("ext_next_action", move_q_bytes);
+    base_sched.set_callee_default("ext_next_action", both_sched_bytes);
+
+    let trials = vec![
+        // Trial 0: `Both(4, 6)` + `key = 7` (!= MAGIC_KEY) + O(1) `usize::MAX` panic after 300 pre-steps -> HOLD
+        (make_trial(1, 4, 6, 10, 7, 2, 5), Some(sched_o1_max)),
+        // Trial 1: `Move { dx: -2, dy: 8 }` + `key = 42` (== MAGIC_KEY) + queued `Move` struct-variant -> HOLD
+        (make_trial(2, -2, 8, 20, 42, 3, 11), Some(base_sched.clone())),
+        // Trial 2: `Idle` hits `let ... else { return st.total + 0; }` -> violates `strict_progress`!
+        (make_trial(0, 0, 0, 15, 7, 1, 0), Some(base_sched.clone())),
+        // Trial 3: `key == 999` mutates framed `st.act` -> FRAME:st.act
+        (make_trial(0, 0, 0, 15, 999, 1, 5), Some(base_sched.clone())),
+        // Trial 4: `total = u32::MAX - 1` overflows checked `+` in body -> TRAP
+        (make_trial(1, 5, 5, u32::MAX - 1, 42, 4, 1), Some(base_sched)),
+    ];
+
+    let report = probe
+        .verify_spec_postcondition_batch(&trials)
+        .expect("verify ep2-A2 parity batch");
+    assert_eq!(report.verdicts[0], SpecPostconditionVerdict::VerifiedHold);
+    assert_eq!(report.verdicts[1], SpecPostconditionVerdict::VerifiedHold);
+    assert!(matches!(
+        &report.verdicts[2],
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::EnsuresClause { label, .. },
+            ..
+        } if label == "strict_progress"
+    ));
+    assert!(matches!(
+        &report.verdicts[3],
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::FrameCondition { param, field },
+            ..
+        } if param == "st" && field == "act"
+    ));
+    assert!(matches!(
+        &report.verdicts[4],
+        SpecPostconditionVerdict::PanicOrTrap { .. }
+    ));
+
+    let exe_src = probe
+        .synthesize_rust_executable_harness_with_schedules(&trials)
+        .expect("synthesize ep2-A2 executable harness");
+    assert!(!contains_unsafe_token(&exe_src));
+    let native_lines = compile_and_run_spec_harness("ep2_a2_lockstep_parity", &exe_src);
+    assert_eq!(
+        native_lines,
+        vec![
+            "TRIAL:0:HOLD",
+            "TRIAL:1:HOLD",
+            "TRIAL:2:VIOLATION:strict_progress",
+            "TRIAL:3:FRAME:st.act",
+            "TRIAL:4:TRAP",
+        ]
+    );
+}
