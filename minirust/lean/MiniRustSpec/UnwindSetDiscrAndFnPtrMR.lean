@@ -747,6 +747,222 @@ theorem transmuteM_int_sameSize {M : Type} [Gen.Memory M] [MemoryOps M]
     pure, Except.pure, bind, Except.bind]
   rfl
 
+/-- MiniRust transparent single-field wrapper `#[repr(transparent)] struct
+Binder(T)`: offset-0 field 0 with identical size and alignment to `inner`. -/
+@[reducible] def mrBinderWrapperTy (inner : Gen.Type)
+    (sz : LibSpecr.Size) (al : LibSpecr.Align) : Gen.Type :=
+  .Tuple [(⟨0⟩, inner)] ⟨sz, al, none⟩ none
+
+/-- `Classical.choice`-free polymorphic wide-slice raw pointer (`*const [T]` /
+`*mut [T]`) encoder across EVERY `Memory M` (`Mach` and `MachTB`). -/
+theorem encodeUsizeIntM_of_encode {M : Type} [Gen.Memory M]
+    (len : Int) (data : List UInt8)
+    (henc : Endianness.encode x86_64.ENDIANNESS .Unsigned x86_64.PTR_SIZE len = some data) :
+    Type.encodeIntM (M := M) IntType.usize_ty (.Int len) =
+      .ok (data.map (fun b => .Init b none)) := by
+  unfold Type.encodeIntM
+  dsimp only [IntType.usize_ty]
+  rw [henc]
+  rfl
+
+theorem encodeWideSliceRawPtrM_of_encode {M : Type} [Gen.Memory M]
+    (addr len : Int) (prov : Option (Gen.Memory.Provenance M))
+    (thinBs metaBs : List (AbstractByte (Gen.Memory.Provenance M)))
+    (hPtrEnc : encodePtrM (M := M) { addr := addr, provenance := prov } = .ok thinBs)
+    (hMetaEnc : Type.encodeIntM (M := M) IntType.usize_ty (.Int len) = .ok metaBs) :
+    Type.encodeM (M := M) wideSlicePtrMrTy
+        (mrWidePtrValM { addr := addr, provenance := prov } len) =
+      .ok (thinBs ++ metaBs) := by
+  change encodeWidePtrM (M := M) .ElementCount
+      (ThinPointer.widen { addr := addr, provenance := prov } (some (.ElementCount len))) =
+    .ok (thinBs ++ metaBs)
+  unfold encodeWidePtrM PointerMetaKind.encode_as_valueM ThinPointer.widen
+  dsimp only [pure, Except.pure, bind, Except.bind]
+  rw [hPtrEnc, hMetaEnc]
+
+theorem encodeWideSliceRawPtrM_eq {M : Type} [Gen.Memory M]
+    (addr len : Nat) (hAddr : addr < 2 ^ 64) (hLen : len < 2 ^ 64)
+    (prov : Option (Gen.Memory.Provenance M)) :
+    Type.encodeM (M := M) wideSlicePtrMrTy
+        (mrWidePtrValM { addr := addr, provenance := prov } (len : Int)) =
+      .ok (encodePtrBytesM (M := M) prov 0 (leBytes addr 8) ++
+        (leBytes len 8).map (fun b => .Init b none)) :=
+  encodeWideSliceRawPtrM_of_encode (addr : Int) (len : Int) prov _ _
+    (encodePtrM_eq addr hAddr prov)
+    (encodeUsizeIntM_of_encode (len : Int) (leBytes len 8) (encode_usize_cf len hLen))
+
+/-- `Classical.choice`-free polymorphic wide-slice raw pointer decoder across
+EVERY `Memory M` (`Mach` and `MachTB`). -/
+theorem decodeWideSliceRawPtrM_eq {M : Type} [Gen.Memory M] [MemoryOps M]
+    (addr len : Nat) (hAddr : addr < 2 ^ 64) (hLen : len < 2 ^ 64)
+    (prov : Option (Gen.Memory.Provenance M)) :
+    Type.decodeM (M := M) wideSlicePtrMrTy
+        (encodePtrBytesM (M := M) prov 0 (leBytes addr 8) ++
+          (leBytes len 8).map (fun b => .Init b none)) =
+      .ok (some (mrWidePtrValM { addr := addr, provenance := prov } (len : Int))) := by
+  let thinBs := encodePtrBytesM (M := M) prov 0 (leBytes addr 8)
+  let metaBs : List (AbstractByte (Gen.Memory.Provenance M)) :=
+    (leBytes len 8).map (fun b => .Init b none)
+  have hLenThin : thinBs.length = 8 := by
+    dsimp only [thinBs]; rw [encodePtrBytesM_length, leBytes_length]
+  have hLenMeta : metaBs.length = 8 := by
+    dsimp only [metaBs]; rw [List.length_map, leBytes_length]
+  have hLenAll : (thinBs ++ metaBs).length = 2 * x86_64.PTR_SIZE.bytes := by
+    rw [List.length_append, hLenThin, hLenMeta]; rfl
+  have hTake : (thinBs ++ metaBs).take x86_64.PTR_SIZE.bytes = thinBs := by
+    change (thinBs ++ metaBs).take 8 = thinBs
+    rw [← hLenThin, List.take_left]
+  have hDrop : (thinBs ++ metaBs).drop x86_64.PTR_SIZE.bytes = metaBs := by
+    change (thinBs ++ metaBs).drop 8 = metaBs
+    rw [← hLenThin, List.drop_left]
+  have hLenBits : len < 2 ^ (8 * IntType.usize_ty.size.bytes) := by
+    rw [show 8 * IntType.usize_ty.size.bytes = 64 from rfl]; exact hLen
+  have hMetaDec : Type.decodeIntM (M := M) IntType.usize_ty metaBs =
+      .ok (some (.Int (len : Int))) :=
+    decodeIntM_leBytes (M := M) IntType.usize_ty (by decide) len hLenBits
+  simp only [wideSlicePtrMrTy, Type.decodeM, PtrType.as_wide_pair, PtrType.meta_kind]
+  unfold decodeWidePtrM
+  rw [ite_eq_right_iff.mpr (fun hn => absurd hLenAll hn), hTake, hDrop]
+  rw [decodePtrM_encodePtrBytesM addr hAddr prov, ok_bind]
+  dsimp only [decodeMetaFieldM]
+  rw [hMetaDec, ok_bind]
+  rfl
+
+/-- Polymorphic helper (`Classical.choice`-free): `transmuteM` on
+`wideSlicePtrMrTy` from explicit `inBounds`, `encodeM`, and `decodeM` witnesses
+(parameterized over `Int` so `2 ^ 64` is never unfolded in the kernel). -/
+theorem transmuteM_wideSliceRawPtr_of_codec {M : Type} [Gen.Memory M] [MemoryOps M]
+    (addr len : Int) (prov : Option (Gen.Memory.Provenance M))
+    (bs : List (AbstractByte (Gen.Memory.Provenance M))) (m : Option (Machine M))
+    (hinAddr : inBounds addr .Unsigned x86_64.PTR_SIZE = true)
+    (hinLen : inBounds len .Unsigned x86_64.PTR_SIZE = true)
+    (henc : Type.encodeM (M := M) wideSlicePtrMrTy
+      (mrWidePtrValM { addr := addr, provenance := prov } len) = .ok bs)
+    (hdec : Type.decodeM (M := M) wideSlicePtrMrTy bs =
+      .ok (some (mrWidePtrValM { addr := addr, provenance := prov } len))) :
+    let v := mrWidePtrValM { addr := addr, provenance := prov } len
+    transmuteM (M := M) v wideSlicePtrMrTy wideSlicePtrMrTy m = .ok v := by
+  intro v
+  have hlay : Type.layout wideSlicePtrMrTy = .ok (.Sized ⟨16⟩ ⟨8⟩) := rfl
+  have hCanRep : IntType.can_represent IntType.usize_ty len = true := hinLen
+  unfold transmuteM
+  rw [hlay]
+  simp only [ok_bind, expect_size_sized, size_ne_self_ite_local]
+  rw [show Type.encodeM (M := M) wideSlicePtrMrTy v = .ok bs from henc, ok_bind,
+      show Type.decodeM (M := M) wideSlicePtrMrTy bs = .ok (some v) from hdec, ok_bind]
+  dsimp only [v, mrWidePtrValM]
+  unfold checkValueM checkPtrM
+  simp only [wideSlicePtrMrTy, ThinPointer.widen, ensureElseUb, hinAddr, ↓reduceIte,
+    PtrType.meta_kind, checkPtrMetadataM, hCanRep,
+    PtrType.safe_pointee, Bool.not_true, Bool.false_eq_true, pure, Except.pure, bind, Except.bind]
+
+/-- `Classical.choice`-free polymorphic `transmuteM` identity for wide raw slice
+pointers (`*mut [T]` ↔ `*const [T]`) across BOTH `Mach` and `MachTB`. -/
+theorem transmuteM_wideSliceRawPtr_id {M : Type} [Gen.Memory M] [MemoryOps M]
+    (addr len : Nat) (hAddr : addr < 2 ^ 64) (hLen : len < 2 ^ 64)
+    (prov : Option (Gen.Memory.Provenance M)) (m : Option (Machine M)) :
+    let v := mrWidePtrValM { addr := addr, provenance := prov } (len : Int)
+    transmuteM (M := M) v wideSlicePtrMrTy wideSlicePtrMrTy m = .ok v :=
+  transmuteM_wideSliceRawPtr_of_codec (addr : Int) (len : Int) prov _ m
+    (inBounds_usize_cf addr hAddr) (inBounds_usize_cf len hLen)
+    (encodeWideSliceRawPtrM_eq addr len hAddr hLen prov)
+    (decodeWideSliceRawPtrM_eq addr len hAddr hLen prov)
+
+/-- Polymorphic helper (`Classical.choice`-free): `evalCastOpM` on
+`wideSlicePtrMrTy` from an explicit `transmuteM` witness. -/
+theorem evalCastOpM_transmute_wideSliceRawPtr_of_transmute
+    {M : Type} [Gen.Memory M] [MemoryOps M]
+    (v : Gen.Value M) (m : Option (Machine M))
+    (ht : transmuteM (M := M) v wideSlicePtrMrTy wideSlicePtrMrTy m = .ok v) :
+    evalCastOpM (M := M) (.Transmute wideSlicePtrMrTy) (v, wideSlicePtrMrTy) m =
+      .ok (v, wideSlicePtrMrTy) := by
+  have hlay : Type.layout wideSlicePtrMrTy = .ok (.Sized ⟨16⟩ ⟨8⟩) := rfl
+  unfold evalCastOpM
+  dsimp only []
+  rw [hlay]
+  simp only [ok_bind, expect_size_sized, size_ne_self_ite_local, ht, pure, Except.pure,
+    bind, Except.bind]
+
+/-- `Classical.choice`-free polymorphic `evalCastOpM` identity for wide raw
+slice pointers across `Mach` and `MachTB`. -/
+theorem evalCastOpM_transmute_wideSliceRawPtr_id {M : Type} [Gen.Memory M] [MemoryOps M]
+    (addr len : Nat) (hAddr : addr < 2 ^ 64) (hLen : len < 2 ^ 64)
+    (prov : Option (Gen.Memory.Provenance M)) (m : Option (Machine M)) :
+    let v := mrWidePtrValM { addr := addr, provenance := prov } (len : Int)
+    evalCastOpM (M := M) (.Transmute wideSlicePtrMrTy) (v, wideSlicePtrMrTy) m =
+      .ok (v, wideSlicePtrMrTy) :=
+  evalCastOpM_transmute_wideSliceRawPtr_of_transmute _ m
+    (transmuteM_wideSliceRawPtr_id addr len hAddr hLen prov m)
+
+/-- `Classical.choice`-free polymorphic encoder/decoder & bidirectional
+`transmuteM` identity for `mrBinderWrapperTy inner sz al` (`Binder(T) ↔ T`)
+across BOTH `Mach` and `MachTB`. -/
+theorem transmuteM_binderWrapper_roundtrip {M : Type} [Gen.Memory M] [MemoryOps M]
+    (inner : Gen.Type) (sz : LibSpecr.Size) (al : LibSpecr.Align)
+    (v : Gen.Value M) (bs : List (AbstractByte (Gen.Memory.Provenance M)))
+    (m : Option (Machine M))
+    (hInnerLay : Type.layout inner = .ok (.Sized sz al))
+    (hHead : TupleHeadLayout.head_size_and_align ⟨sz, al, none⟩ = (sz, al))
+    (hEnc : Type.encodeM (M := M) inner v = .ok bs)
+    (hLen : bs.length = sz.bytes)
+    (hDec : Type.decodeM (M := M) inner bs = .ok (some v))
+    (hChk : checkValueM (M := M) v inner m = .ok ()) :
+    Type.encodeM (M := M) (mrBinderWrapperTy inner sz al) (.Tuple [v]) = .ok bs ∧
+    Type.decodeM (M := M) (mrBinderWrapperTy inner sz al) bs = .ok (some (.Tuple [v])) ∧
+    transmuteM (M := M) (.Tuple [v]) (mrBinderWrapperTy inner sz al) inner m = .ok v ∧
+    transmuteM (M := M) v inner (mrBinderWrapperTy inner sz al) m = .ok (.Tuple [v]) := by
+  have hLayWrap : Type.layout (mrBinderWrapperTy inner sz al) = .ok (.Sized sz al) := by
+    simp only [mrBinderWrapperTy, Type.layout, hHead, pure, Except.pure]
+  have hWrite0 : writeSubsliceAtIndex
+      (List.replicate sz.bytes (AbstractByte.Uninit : AbstractByte (Gen.Memory.Provenance M)))
+      0 bs = .ok bs := by
+    have hCond : (0 : Int) ≤ 0 ∧ (0 : Int) + (bs.length : Int) ≤
+        ((List.replicate sz.bytes
+            (AbstractByte.Uninit : AbstractByte (Gen.Memory.Provenance M))).length : Int) := by
+      simp [hLen]
+    unfold writeSubsliceAtIndex
+    rw [ite_eq_left_iff.mpr (fun hn => absurd hCond hn)]
+    simp [hLen]
+  have hSub0 : subsliceWithLength bs 0 sz.bytes = .ok bs := by
+    have hCond : (0 : Int) ≤ 0 ∧ (0 : Int) ≤ (sz.bytes : Int) ∧
+        (0 : Int) + (sz.bytes : Int) ≤ (bs.length : Int) := by
+      simp [hLen, Int.natCast_nonneg]
+    unfold subsliceWithLength
+    rw [ite_eq_left_iff.mpr (fun hn => absurd hCond hn)]
+    have hToNat : (sz.bytes : Int).toNat = bs.length := by
+      rw [Int.toNat_natCast, hLen]
+    simp [hToNat]
+  have hEncWrap : Type.encodeM (M := M) (mrBinderWrapperTy inner sz al) (.Tuple [v]) = .ok bs := by
+    simp only [mrBinderWrapperTy, Type.encodeM, hHead, List.length, ne_eq, not_true_eq_false,
+      ↓reduceIte, Type.encodeFieldsM]
+    rw [hEnc, ok_bind, show ((0 : Nat) : Int) = 0 from rfl, hWrite0, ok_bind]
+    rfl
+  have hDecWrap : Type.decodeM (M := M) (mrBinderWrapperTy inner sz al) bs =
+      .ok (some (.Tuple [v])) := by
+    simp only [mrBinderWrapperTy, Type.decodeM, hHead, hLen, ne_eq, not_true_eq_false,
+      ↓reduceIte, Type.decodeFieldsM]
+    rw [hInnerLay, ok_bind, expect_size_sized, ok_bind,
+        show ((0 : Nat) : Int) = 0 from rfl, hSub0, ok_bind, hDec, ok_bind]
+    rfl
+  have hChkWrap : checkValueM (M := M) (.Tuple [v]) (mrBinderWrapperTy inner sz al) m = .ok () := by
+    simp only [mrBinderWrapperTy, checkValueM, ensureElseUb, beq_self_eq_true, ↓reduceIte,
+      Bool.not_true, Bool.false_eq_true, checkFieldsM]
+    rw [hChk, ok_bind]
+    rfl
+  refine ⟨hEncWrap, hDecWrap, ?_, ?_⟩
+  · unfold transmuteM
+    rw [hLayWrap, ok_bind, expect_size_sized, ok_bind, hInnerLay, ok_bind,
+        expect_size_sized, ok_bind, size_ne_self_ite_local, hEncWrap, ok_bind, hDec, ok_bind]
+    dsimp only []
+    rw [hChk, ok_bind]
+    rfl
+  · unfold transmuteM
+    rw [hInnerLay, ok_bind, expect_size_sized, ok_bind, hLayWrap, ok_bind,
+        expect_size_sized, ok_bind, size_ne_self_ite_local, hEnc, ok_bind, hDecWrap, ok_bind]
+    dsimp only []
+    rw [hChkWrap, ok_bind]
+    rfl
+
 /-! ## §1 (`C1`): `StatementKind.setDiscriminant` (`Mach` & `MachTB`) -/
 
 /-- Variant table of `twoVarEnumMrTy`. -/
@@ -921,6 +1137,127 @@ theorem minirust_setDiscriminantM_twoVar_tagStore
     rw [show ((0 : Nat) : Int) = 0 from rfl, hoff]
     dsimp only []
     rw [hst]
+
+/-- **C1 Universal Deref Step, `.uninit` Deref, & Dangling/OOB UB Law
+(`trusted_setDiscriminant_deref_step_and_ub`)**:
+Invoking real `evalStmt` and `evalSetDiscriminantDerefWrite` on
+`p = ⟨ptrLoc, .deref :: rest⟩`:
+1. When reading `p` yields `.aggregate oldVar fields` and `evalPlaceWrite`
+   succeeds without Tree-Borrows or union-protector conflicts, `evalStmt` steps
+   via `evalSetDiscriminantDerefWrite` to `advanceStmt`, updating ONLY the
+   variant tag to `newVar` while preserving all payload fields `fields` and
+   invalidating conflicting deref borrows.
+2. When `rest = []`, reading `p` faults with `.ub` because the active-frame
+   referent `entry.targetLocal` is `.uninit` (`entry.perm` mutable, offset `0`,
+   ADT pointee), `evalStmt` initializes the referent to the payload-free tag
+   shell `.aggregate newVar []` via `evalSetDiscriminantDerefWrite`.
+3. When reading `p` yields a non-aggregate (e.g., scalar) value, or `p`
+   dereferences a `.disabled` (dangling) borrow or unbacked/OOB global address,
+   `evalStmt` faults with `MirStepNode.fail .ub`. -/
+theorem trusted_setDiscriminant_deref_step_and_ub
+    (s : MachineState) (ptrLoc oldVar newVar : Nat)
+    (rest : List MirAst.ProjectionElem) (fields : List MirSemantics.Value)
+    (locals₁ locals₂ : List LocalSlot) (span : String)
+    (decls : List MirAst.LocalDecl) (layouts : LayoutTable) :
+    let p : MirAst.Place := ⟨ptrLoc, .deref :: rest⟩
+    -- (1) Valid deref SetDiscriminant preserves payload via
+    -- evalSetDiscriminantDerefWrite
+    (evalOperand s.frame.locals (.copy p) s.memory.borrows s.memory.globals layouts
+        s.memory.callerLocals decls s.memory.callStack =
+        .ok (.aggregate oldVar fields) locals₁ →
+      evalStmt s { kind := .setDiscriminant p newVar, span := span } decls layouts =
+        evalSetDiscriminantDerefWrite s locals₁ p rest (.aggregate newVar fields) decls layouts) ∧
+    (evalPlaceWrite locals₁ s.memory.borrows p (.aggregate newVar fields)
+        s.memory.activeProtectors decls layouts s.memory.callStack = .ok locals₂ →
+      derefWriteTreeUB locals₁ s.memory.borrows p = false →
+      derefWriteUnionProtectorUB decls layouts locals₁ s.memory.borrows
+        s.memory.activeProtectors p rest s.memory.callStack = false →
+      evalSetDiscriminantDerefWrite s locals₁ p rest (.aggregate newVar fields) decls layouts =
+        MirStepNode.step
+          (advanceStmt s locals₂
+            { s.memory with
+              borrows := invalidateDerefWriteBorrowsWithLayouts decls layouts locals₁
+                s.memory.borrows p rest s.memory.callStack })) ∧
+    -- (2) Non-aggregate pointee faults with UB
+    (∀ sc, evalOperand s.frame.locals (.copy p) s.memory.borrows s.memory.globals layouts
+        s.memory.callerLocals decls s.memory.callStack = .ok (.scalar sc) locals₁ →
+      evalStmt s { kind := .setDiscriminant p newVar, span := span } decls layouts =
+        MirStepNode.fail .ub) ∧
+    -- (3) Unbacked/OOB pointer (`lookupBorrow = none` & `evalOperand = .ub`)
+    -- faults with UB
+    (∀ ptrVal sz,
+      evalOperand s.frame.locals (.copy ⟨ptrLoc, [.deref]⟩) s.memory.borrows s.memory.globals
+        layouts s.memory.callerLocals decls s.memory.callStack = .ub →
+      get? s.frame.locals ptrLoc = some (.init (.ptr ptrVal sz)) →
+      lookupBorrow s.memory.borrows ptrVal.tag = none →
+      evalStmt s { kind := .setDiscriminant ⟨ptrLoc, [.deref]⟩ newVar, span := span }
+        decls layouts = MirStepNode.fail .ub) := by
+  intro p
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · intro hOp
+    simp only [evalStmt, p, hOp]
+  · intro hWr hTree hUnion
+    unfold evalSetDiscriminantDerefWrite
+    simp only [hWr, hTree, hUnion, Bool.or_self]
+  · intro sc hOp
+    simp only [evalStmt, p, hOp]
+  · intro ptrVal sz hUb hSlot hNoB
+    simp only [evalStmt, hUb, hSlot, hNoB]
+
+/-- **C1 Coupled Two-Sided Step Simulation & `MachTB.wfLive` Preservation
+(`setDiscriminant_twoVar_coupled_lockstep_and_wfLive`)**:
+Simultaneously relates Trusted `evalStmt` (`evalSetDiscriminantLocal`),
+MiniRust `BasicMemory` `Interp.evalStatement` (`Mach`), and MiniRust
+`TreeBorrowsMemory` `evalStatementM` (`MachTB`) on `twoVarEnumMrTy` — proving
+tag update (`oldVar → tag`), payload preservation, and `MachTB.wfLive`
+preservation (`evalStatementM_tb_wfLive`). -/
+theorem setDiscriminant_twoVar_coupled_lockstep_and_wfLive
+    (s : MachineState) (loc oldVar tag : Nat) (fields : List MirSemantics.Value)
+    (locals' : List LocalSlot) (span : String)
+    (decls : List MirAst.LocalDecl) (layouts : LayoutTable)
+    (mBM mBM1 : Mach) (dst : Gen.PlaceExpr) (placeBM : Gen.Place BM)
+    (ptrBM0 : Ptr) (cmBM' : Gen.ConcurrentMemory BM)
+    (mTB mTB1 : MachTB) (placeTB : Gen.Place TBM)
+    (ptrTB0 : ThinPointer TreeBorrowsProvenance) (cmTB' : Gen.ConcurrentMemory TBM)
+    (htag : tag = 0 ∨ tag = 1)
+    (hget : get? s.frame.locals loc = some (.init (.aggregate oldVar fields)))
+    (hset : set? s.frame.locals loc (.init (.aggregate tag fields)) = some locals')
+    (hprot : s.memory.activeProtectors = [])
+    (hpBM : evalPlaceM mBM dst = .ok ((placeBM, twoVarEnumMrTy), mBM1))
+    (halBM : placeBM.aligned = true)
+    (hoffBM : ptrOffsetInboundsM mBM1 placeBM.ptr.thin_pointer 0 = .ok ptrBM0)
+    (hstBM : ConcurrentMemory.store mBM1.mem ptrBM0 [.Init (UInt8.ofNat tag) none] ⟨1⟩ .None =
+      .ok cmBM')
+    (hwfTB : MachTB.wfLive mTB)
+    (hpTB : evalPlaceM mTB dst = .ok ((placeTB, twoVarEnumMrTy), mTB1))
+    (halTB : placeTB.aligned = true)
+    (hoffTB : ptrOffsetInboundsM mTB1 placeTB.ptr.thin_pointer 0 = .ok ptrTB0)
+    (hstTB : ConcurrentMemory.store mTB1.mem ptrTB0 [.Init (UInt8.ofNat tag) none] ⟨1⟩ .None =
+      .ok cmTB') :
+    evalStmt s { kind := .setDiscriminant (locPlace loc) tag, span := span } decls layouts =
+      MirStepNode.step
+        (advanceStmt s locals'
+          { s.memory with
+            borrows := invalidateConflictingBorrows s.memory.borrows loc .none
+              (length s.memory.callStack) }) ∧
+    Interp.evalStatement mBM (.SetDiscriminant dst (Int.ofNat tag)) =
+      .ok { mBM1 with mem := cmBM' } ∧
+    evalStatementM mTB (.SetDiscriminant dst (Int.ofNat tag)) =
+      .ok { mTB1 with mem := cmTB' } ∧
+    MachTB.wfLive { mTB1 with mem := cmTB' } := by
+  have hBM : evalStatementM mBM (.SetDiscriminant dst (Int.ofNat tag)) =
+      .ok { mBM1 with mem := cmBM' } :=
+    minirust_setDiscriminantM_twoVar_tagStore mBM mBM1 dst placeBM tag htag hpBM halBM ptrBM0
+      hoffBM cmBM' hstBM
+  have hTB : evalStatementM mTB (.SetDiscriminant dst (Int.ofNat tag)) =
+      .ok { mTB1 with mem := cmTB' } :=
+    minirust_setDiscriminantM_twoVar_tagStore mTB mTB1 dst placeTB tag htag hpTB halTB ptrTB0
+      hoffTB cmTB' hstTB
+  refine ⟨trusted_setDiscriminant_local_preserves_payload s loc oldVar tag fields locals'
+            span decls layouts hget hset hprot,
+          ?_, hTB, evalStatementM_tb_wfLive hwfTB hTB⟩
+  rw [← evalStatementM_bm_eq]
+  exact hBM
 
 /-! ### C1 Concrete Positive, Deref, `.uninit`, and Fault Witnesses (`Mach` &
 `MachTB`) -/
@@ -1120,14 +1457,39 @@ theorem c1_setDiscriminant_misaligned_and_frozen_ub_witness :
           { (initMachineState c1DerefMir []).memory with
             borrows := [{ tag := 1, targetLocal := 1, targetProjection := [],
                           perm := .frozen, targetFrameDepth := 0 }] } }
+    let sOob : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 2,
+                   locals := [.uninit, .init (.aggregate 0 [.scalar ⟨42, 4⟩]),
+                              .init (.ptr { allocId := 99, offsetBytes := 16 } 8)] }
+        memory := (initMachineState c1DerefMir []).memory }
+    let oobMach : Mach :=
+      let fn := mkMrFn [(localName 0, twoVarEnumMrTy), (localName 1, thinRawPtrTy)]
+        [] (localName 0)
+        [(bbName 0,
+          ⟨[.SetDiscriminant
+              (.Deref (.Load (.Local (localName 1))) twoVarEnumMrTy) 1], .Return, .Regular⟩)]
+      let alloc0 := mkStackAlloc 128 (List.replicate 8 .Uninit) 4
+      let alloc1 := mkStackAlloc 256 c1LocalInitBytes 4
+      let allocPtr := mkStackAlloc 384 (ptrBytes 264 (some (⟨1⟩, ()))) 8
+      let fr : Frame :=
+        { func := fn
+          locals := ⟨[(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+                      (localName 1, { addr := 384, provenance := some (⟨2⟩, ()) })]⟩
+          stack_pop_action := .BottomOfStack, next_block := bbName 0, next_stmt := 0, extra := () }
+      mkMrMach (mkMrProg [(fnName 0, fn)]) [alloc0, alloc1, allocPtr] [fr]
     stepMirFn c1DerefMir sFrozen = MirStepNode.fail .ub ∧
+    stepMirFn c1DerefMir sOob = MirStepNode.fail .ub ∧
     Interp.step c1MisalignedMach =
       .error (.ub "setting the discriminant of a place based on a misaligned pointer") ∧
     Interp.stepTB (liftMachToTB c1MisalignedMach) =
-      .error (.ub "setting the discriminant of a place based on a misaligned pointer") :=
-  ⟨rfl,
+      .error (.ub "setting the discriminant of a place based on a misaligned pointer") ∧
+    (Interp.step oobMach).toOption = none ∧
+    (Interp.stepTB (liftMachToTB oobMach)).toOption = none :=
+  ⟨rfl, rfl,
    eq_error_ub_of_interpUbMsg (by decide +kernel),
-   eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
+   eq_error_ub_of_interpUbMsg (by decide +kernel),
+   by decide +kernel,
+   by decide +kernel⟩
 
 /-! ## §2 (`C2`): `TerminatorKind.unwindResume` (`Mach` & `MachTB`) -/
 
@@ -1160,24 +1522,118 @@ theorem trusted_unwindResume_cleanup_step
       } := by
   simp only [MirSemantics.evalTerminator, hStack, unwindFromCallStack, hAction]
 
-/-- **C2b Trusted `.continue_` Multi-Frame Big-Step Law**: skipping `k`
-intermediate `.continue_` caller frames in `unwindFromCallStack` reduces in ONE
-Trusted step to `unwindFromCallStack` on the remaining stack. -/
+/-- Closed-form memory state produced by popping `conts` consecutive
+`UnwindAction.continue_` caller frames in `unwindFromCallStack`. -/
+def unwindContinueChainMem :
+    List SavedCallerFrame → List SavedCallerFrame → MirSemantics.Memory → MirSemantics.Memory
+  | [], _, mem => mem
+  | caller :: rest, tail, mem =>
+    unwindContinueChainMem rest tail
+      { mem with
+        callStack := rest ++ tail
+        activeCallee := .some caller.callerBody
+        activeProtectors := restoreCallerProtectors caller }
+
+/-- **C2b Exact Closed-Form `.continue_` Multi-Frame Big-Step Law & Coupled
+`1 : k + 1` MiniRust Step Induction (`Mach` & `MachTB` with `MachTB.wfLive`)**:
+1. Skipping `k` intermediate `.continue_` caller frames in `unwindFromCallStack`
+   reduces in ONE Trusted step to `unwindFromCallStack tail
+   (unwindContinueChainMem ...)`,
+   preserving exact `activeCallee` and `activeProtectors` transitions without
+   existential loss.
+2. When `tail = caller :: rest` with `caller.returnUnwind = .cleanup cleanupBb`
+   and MiniRust executes `k` `ResumeUnwind` steps across the intermediate frames
+   followed by `1` final `ResumeUnwind` step (`stepsM (k + 1)`), Trusted steps
+   in `1` step to `(cleanupBb, 0)` while MiniRust reaches the caller cleanup
+   state in `k + 1` steps on BOTH `Mach` and `MachTB` (preserving
+   `MachTB.wfLive` via `stepsTB_wfLive`). -/
 theorem trusted_unwindFromCallStack_continue_chain :
     ∀ (conts : List SavedCallerFrame) (tail : List SavedCallerFrame) (mem : MirSemantics.Memory),
       (∀ c ∈ conts, c.returnUnwind = .continue_) →
-      ∃ mem',
-        mem'.callStack = tail ∧
-        unwindFromCallStack (conts ++ tail) mem = unwindFromCallStack tail mem'
-  | [], tail, mem, _ =>
-    ⟨{ mem with callStack := tail }, rfl, by
-      cases tail <;> simp [unwindFromCallStack]⟩
+      unwindFromCallStack (conts ++ tail) mem =
+        unwindFromCallStack tail (unwindContinueChainMem conts tail mem)
+  | [], _, _, _ => rfl
   | c :: cs, tail, mem, hcont => by
     have hc : c.returnUnwind = .continue_ := hcont c (List.mem_cons_self ..)
     have hcs : ∀ x ∈ cs, x.returnUnwind = .continue_ :=
       fun x hx => hcont x (List.mem_cons_of_mem c hx)
-    simp only [List.cons_append, unwindFromCallStack, hc]
+    simp only [List.cons_append, unwindFromCallStack, hc, unwindContinueChainMem]
     exact trusted_unwindFromCallStack_continue_chain cs tail _ hcs
+
+theorem unwindResume_continue_chain_coupled_steps_and_wfLive
+    (s : MachineState) (conts : List SavedCallerFrame) (caller : SavedCallerFrame)
+    (rest : List SavedCallerFrame) (cleanupBb : Nat) (span : String)
+    (curBody : Option CapturedMir)
+    (mBM mBMk mBMf : Mach) (mTB mTBk mTBf : MachTB)
+    (hStack : s.memory.callStack = conts ++ (caller :: rest))
+    (hCont : ∀ c ∈ conts, c.returnUnwind = .continue_)
+    (hClean : caller.returnUnwind = .cleanup cleanupBb)
+    (hBMk : Interp.steps conts.length mBM = .ok mBMk)
+    (hBM1 : Interp.step mBMk = .ok mBMf)
+    (hwfTB : MachTB.wfLive mTB)
+    (hTBk : Interp.stepsTB conts.length mTB = .ok mTBk)
+    (hTB1 : Interp.stepTB mTBk = .ok mTBf) :
+    let memMid := unwindContinueChainMem conts (caller :: rest) s.memory
+    MirSemantics.evalTerminator s { kind := .unwindResume, span := span } curBody =
+      MirStepNode.step {
+        frame := { caller.frame with blockIdx := cleanupBb, stmtIdx := 0 }
+        memory := {
+          memMid with
+          callStack := rest
+          activeCallee := .some caller.callerBody
+          activeProtectors := restoreCallerProtectors caller
+          borrows := disableFramesAbove memMid.borrows (length rest)
+        }
+      } ∧
+    Interp.steps (conts.length + 1) mBM = .ok mBMf ∧
+    Interp.stepsTB (conts.length + 1) mTB = .ok mTBf ∧
+    MachTB.wfLive mTBf := by
+  intro memMid
+  have hStepsBM : Interp.steps (conts.length + 1) mBM = .ok mBMf := by
+    have hSplit : ∀ k (x y z : Mach), Interp.steps k x = .ok y → Interp.step y = .ok z →
+        Interp.steps (k + 1) x = .ok z := by
+      intro k
+      induction k with
+      | zero =>
+        intro x y z h0 h1
+        simp only [Interp.steps, pure, Except.pure, Except.ok.injEq] at h0
+        subst h0
+        simp only [Nat.zero_add, Interp.steps, h1, ok_bind, pure, Except.pure]
+      | succ k' ih =>
+        intro x y z hsk h1
+        simp only [Interp.steps] at hsk
+        rcases hs1 : Interp.step x with e | x1
+        · simp [hs1, bind, Except.bind] at hsk
+        · rw [hs1, ok_bind] at hsk
+          have ih' := ih x1 y z hsk h1
+          simp only [Nat.succ_add, Interp.steps, hs1, ok_bind]
+          exact ih'
+    exact hSplit conts.length mBM mBMk mBMf hBMk hBM1
+  have hStepsTB : Interp.stepsTB (conts.length + 1) mTB = .ok mTBf := by
+    have hSplitTB : ∀ k (x y z : MachTB), Interp.stepsTB k x = .ok y → Interp.stepTB y = .ok z →
+        Interp.stepsTB (k + 1) x = .ok z := by
+      intro k
+      induction k with
+      | zero =>
+        intro x y z h0 h1
+        simp only [Interp.stepsTB, Interp.stepsM, pure, Except.pure, Except.ok.injEq] at h0
+        subst h0
+        have h1' : stepM x = .ok z := h1
+        simp only [Nat.zero_add, Interp.stepsTB, Interp.stepsM, h1', ok_bind, pure, Except.pure]
+      | succ k' ih =>
+        intro x y z hsk h1
+        simp only [Interp.stepsTB, Interp.stepsM] at hsk
+        rcases hs1 : stepM x with e | x1
+        · simp [hs1, bind, Except.bind] at hsk
+        · rw [hs1, ok_bind] at hsk
+          have ih' := ih x1 y z hsk h1
+          simp only [Nat.succ_add, Interp.stepsTB, Interp.stepsM, hs1, ok_bind]
+          exact ih'
+    exact hSplitTB conts.length mTB mTBk mTBf hTBk hTB1
+  refine ⟨?_, hStepsBM, hStepsTB, stepsTB_wfLive hwfTB hStepsTB⟩
+  simp only [MirSemantics.evalTerminator, hStack,
+    trusted_unwindFromCallStack_continue_chain conts (caller :: rest) s.memory hCont,
+    unwindFromCallStack, hClean, memMid]
 
 /-- **C2c Trusted `.unreachable` UB Law**: unwinding into `.unreachable` faults
 with `MirStepNode.fail .ub`. -/
@@ -1498,11 +1954,48 @@ def c2TbProtectorUnwindMach : Mach :=
   mkMrMach prog [alloc0, alloc1] [callerFr, calleeFr]
 
 theorem c2_machTB_protector_release_on_resumeUnwind_witness :
-    ∃ m3, Interp.stepsTB 3 (liftMachToTB c2TbProtectorUnwindMach) = .ok m3 ∧
+    -- (a) Positive: `ResumeUnwind` runs `end_call`, releasing callee protector
+    (∃ m3, Interp.stepsTB 3 (liftMachToTB c2TbProtectorUnwindMach) = .ok m3 ∧
+      MachTB.wfLive m3 ∧
       (m3.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB)),
        m3.mem.memory.mem.allocations[1]?.map (·.live)) =
-      (some (true, (scalarBytes u32 99).map (projByteTB ∘ liftByteTB)), some false) :=
-  ok_of_map_toOption (by decide +kernel)
+      (some (true, (scalarBytes u32 99).map (projByteTB ∘ liftByteTB)), some false)) ∧
+    -- (b) Trusted non-vacuous borrow disabling & protector restore on cleanup
+    (let callerSaved : SavedCallerFrame :=
+       { callerBody := c2CallerMir
+         frame := { blockIdx := 0, stmtIdx := 0, locals := [.init (.scalar ⟨5, 4⟩)] }
+         destination := locPlace 0
+         returnTarget := 0
+         returnUnwind := .cleanup 1
+         calleeProtectors := [7] }
+     let calleeBorrow : BorrowEntry :=
+       { tag := 11, targetLocal := 0, targetProjection := [],
+         perm := .reservedFrz false, targetFrameDepth := 1 }
+     let callerBorrow : BorrowEntry :=
+       { tag := 10, targetLocal := 0, targetProjection := [],
+         perm := .reservedFrz false, targetFrameDepth := 0 }
+     let sCallee : MachineState :=
+       { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit] }
+         memory := { (initMachineState c2LeafMir []).memory with
+                     callStack := [callerSaved]
+                     activeProtectors := [99]
+                     borrows := [calleeBorrow, callerBorrow] } }
+     match stepMirFn c2LeafMir sCallee with
+     | .tau (.running sAfter) =>
+       sAfter.frame.blockIdx = 1 ∧
+       sAfter.memory.activeProtectors = [7] ∧
+       (lookupBorrow sAfter.memory.borrows 11).map (·.perm) = some .disabled ∧
+       (lookupBorrow sAfter.memory.borrows 10).map (·.perm) = some (.reservedFrz false)
+     | _ => False) := by
+  refine ⟨?_, ⟨rfl, rfl, rfl, rfl⟩⟩
+  obtain ⟨m3, hm3, hOut⟩ :=
+    ok_of_map_toOption (r := Interp.stepsTB 3 (liftMachToTB c2TbProtectorUnwindMach))
+      (f := fun m3 =>
+        (m3.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB)),
+         m3.mem.memory.mem.allocations[1]?.map (·.live)))
+      (b := (some (true, (scalarBytes u32 99).map (projByteTB ∘ liftByteTB)), some false))
+      (by decide +kernel)
+  exact ⟨m3, hm3, liftMachToTB_stepsTB_wfLive hm3, hOut⟩
 
 /-! ## §3 (`C3`): `TerminatorKind.unwindTerminate` (`Mach` & `MachTB`) -/
 
@@ -1576,20 +2069,33 @@ theorem translateStatement_coverage_none
     translateStatement decls { kind := .coverage, span := span } layouts = none :=
   rfl
 
-/-- **C4 Universal Stuttering Equivalence (`coverage_stuttering_step`)**:
+/-- **C4 Universal `stepMirFn` & `mirTree` Stuttering Equivalence
+(`coverage_stuttering_step`)**:
 `minimize` drops `StatementKind::Coverage` (`0` MiniRust statements emitted).
-Trusted advances ONLY `stmtIdx` by `1` with identical `locals` and `memory`,
-matching `0` MiniRust steps on `Mach` and `MachTB`. -/
+At both `evalStmt`, `stepMirFn`, and coinductive `mirTree`, Trusted advances
+ONLY `stmtIdx` by `1` via a silent `.tau` transition with identical `locals`
+and `memory`, matching `0` MiniRust steps on `Mach` and `MachTB`. -/
 theorem coverage_stuttering_step
+    (body : CapturedMir) (bb : BasicBlockData)
     (s : MachineState) (span : String) (decls : List MirAst.LocalDecl)
-    (layouts : LayoutTable) (m : Mach) (mtb : MachTB) :
+    (layouts : LayoutTable) (m : Mach) (mtb : MachTB)
+    (hNoCallee : s.memory.activeCallee = none)
+    (hPhase : body.phase = .runtimePostCleanup)
+    (hBb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hSt : get? bb.statements s.frame.stmtIdx = some { kind := .coverage, span := span }) :
     evalStmt s { kind := .coverage, span := span } decls layouts =
       MirStepNode.step (advanceStmt s s.frame.locals) ∧
+    stepMirFn body s = .tau (.running (advanceStmt s s.frame.locals)) ∧
+    (mirTree body s).observe = .tau (mirTree body (advanceStmt s s.frame.locals)) ∧
     (advanceStmt s s.frame.locals).frame.locals = s.frame.locals ∧
     (advanceStmt s s.frame.locals).memory = s.memory ∧
     Interp.steps 0 m = .ok m ∧
-    Interp.stepsTB 0 mtb = .ok mtb :=
-  ⟨rfl, rfl, rfl, rfl, rfl⟩
+    Interp.stepsTB 0 mtb = .ok mtb := by
+  have hStep : stepMirFn body s = .tau (.running (advanceStmt s s.frame.locals)) := by
+    simp only [stepMirFn, hNoCallee, Option.getD, hPhase, hBb, hSt, evalStmt, MirStepNode.step]
+  refine ⟨rfl, hStep, ?_, rfl, rfl, rfl, rfl⟩
+  rw [mirTree_observe, hStep]
+  rfl
 
 def c4CoverageMir : MirAst.CapturedMir :=
   mkMirBody "ep2::c4_coverage" [mkDecl u32MirTy] 0
@@ -1626,22 +2132,35 @@ theorem translateStatement_backwardIncompatibleDropHint_none
       none :=
   rfl
 
-/-- **C5 Universal Unconditional Stuttering Equivalence**:
-`evalStmt` on `.backwardIncompatibleDropHint p` unconditionally advances
-`stmtIdx`
-with identical `locals` and `memory` without ever reading, dereferencing, or
-checking `p` (even on `.dead`, `.uninit`, or OOB places), matching `0` MiniRust
-steps on `Mach` and `MachTB`. -/
+/-- **C5 Universal Unconditional `stepMirFn` & `mirTree` Stuttering
+Equivalence**:
+`evalStmt`, `stepMirFn`, and `mirTree` on `.backwardIncompatibleDropHint p`
+unconditionally advance `stmtIdx` via a silent `.tau` transition with identical
+`locals` and `memory` without ever reading, dereferencing, or checking `p`
+(even on `.dead`, `.uninit`, or OOB places), matching `0` MiniRust steps on
+`Mach` and `MachTB`. -/
 theorem backwardIncompatibleDropHint_stuttering_step
+    (body : CapturedMir) (bb : BasicBlockData)
     (s : MachineState) (p : MirAst.Place) (span : String)
-    (decls : List MirAst.LocalDecl) (layouts : LayoutTable) (m : Mach) (mtb : MachTB) :
+    (decls : List MirAst.LocalDecl) (layouts : LayoutTable) (m : Mach) (mtb : MachTB)
+    (hNoCallee : s.memory.activeCallee = none)
+    (hPhase : body.phase = .runtimePostCleanup)
+    (hBb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hSt : get? bb.statements s.frame.stmtIdx =
+      some { kind := .backwardIncompatibleDropHint p, span := span }) :
     evalStmt s { kind := .backwardIncompatibleDropHint p, span := span } decls layouts =
       MirStepNode.step (advanceStmt s s.frame.locals) ∧
+    stepMirFn body s = .tau (.running (advanceStmt s s.frame.locals)) ∧
+    (mirTree body s).observe = .tau (mirTree body (advanceStmt s s.frame.locals)) ∧
     (advanceStmt s s.frame.locals).frame.locals = s.frame.locals ∧
     (advanceStmt s s.frame.locals).memory = s.memory ∧
     Interp.steps 0 m = .ok m ∧
-    Interp.stepsTB 0 mtb = .ok mtb :=
-  ⟨rfl, rfl, rfl, rfl, rfl⟩
+    Interp.stepsTB 0 mtb = .ok mtb := by
+  have hStep : stepMirFn body s = .tau (.running (advanceStmt s s.frame.locals)) := by
+    simp only [stepMirFn, hNoCallee, Option.getD, hPhase, hBb, hSt, evalStmt, MirStepNode.step]
+  refine ⟨rfl, hStep, ?_, rfl, rfl, rfl, rfl⟩
+  rw [mirTree_observe, hStep]
+  rfl
 
 def c5DropHintMir : MirAst.CapturedMir :=
   mkMirBody "ep2::c5_drop_hint" [mkDecl u32MirTy, mkDecl rawMutU32MirTy] 0
@@ -1675,20 +2194,38 @@ theorem translateRvalue_fnPtrToPtr_none
     translateRvalue layouts decls targetTy (.cast .fnPtrToPtr op dstTy) = none :=
   rfl
 
-/-- **C6 Universal Lockstep Simulation (`fnPtrToPtr_lockstep_mach_and_tb`)**:
-When Trusted evaluates a valid 8-byte function pointer at `offsetBytes = 0`
-(non-stack, non-`rustIntrinsic` ABI) cast via `CastKind.fnPtrToPtr` to a thin
+/-- Explicit function-pointer entry relation coupling Trusted `(mem, p)` with a
+MiniRust `Machine M` function-pointer table entry `(fnNm, addr, prov)`:
+`p.offsetBytes = 0`, `lookupBorrow mem.borrows p.tag = none`, `addr < 2 ^ 64`,
+and `m.fn_ptrs[fnNm] = { addr, provenance := prov }`. -/
+def FnPtrEntryRel {M : Type} [Gen.Memory M]
+    (mem : MirSemantics.Memory) (p : ProvenancePtr)
+    (m : Machine M) (fnNm : Gen.FnName) (addr : Nat)
+    (prov : Option (Gen.Memory.Provenance M)) : Prop :=
+  p.offsetBytes = 0 ∧
+  lookupBorrow mem.borrows p.tag = none ∧
+  addr < 2 ^ 64 ∧
+  mapIndex m.fn_ptrs fnNm "self.fn_ptrs[fn_name]" = .ok { addr := addr, provenance := prov }
+
+/-- **C6 Universal Coupled Lockstep Simulation
+(`fnPtrToPtr_lockstep_mach_and_tb`)**:
+When `(mem, p)` and MiniRust `(mBM, fnNm, addr, provBM)` / `(mTB, fnNm, addr,
+provTB)`
+satisfy `FnPtrEntryRel` (an 8-byte function pointer at `offsetBytes = 0`,
+non-stack, non-`rustIntrinsic` ABI) cast via `CastKind.fnPtrToPtr` to a thin
 raw pointer `dstTy`:
 1. Trusted `evalRvalue` preserves `.ptr p 8` and `mem` unchanged.
 2. MiniRust `evalCastOp` (`Mach`) and `evalCastOpM` (`MachTB`) on
-   `CastOp.Transmute thinRawPtrTy` preserve `thin` / `thinTB` and their
+   `CastOp.Transmute thinRawPtrTy` preserve `m.fn_ptrs[fnNm]` and its
    function-pointer provenance identically. -/
 theorem fnPtrToPtr_lockstep_mach_and_tb
     (locals locals' : List LocalSlot) (op : MirAst.Operand) (dstTy : MirAst.Ty)
     (mem : MirSemantics.Memory) (decls : List MirAst.LocalDecl) (layouts : LayoutTable)
-    (p : ProvenancePtr) (addr : Nat) (hAddr : addr < 2 ^ 64)
+    (p : ProvenancePtr) (fnNm : Gen.FnName) (addr : Nat)
     (provBM : Option Prov) (provTB : Option TreeBorrowsProvenance)
-    (mBM : Option Mach) (mTB : Option MachTB)
+    (mBM : Mach) (mTB : MachTB)
+    (hRelBM : FnPtrEntryRel mem p mBM fnNm addr provBM)
+    (hRelTB : FnPtrEntryRel mem p mTB fnNm addr provTB)
     (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals decls
       mem.callStack = .ok (.ptr p 8) locals')
     (hDst : isThinRawPtrTy dstTy = true)
@@ -1696,8 +2233,6 @@ theorem fnPtrToPtr_lockstep_mach_and_tb
              | .none => true
              | .some { kind := .fnPtr _ _ _ abi, .. } => Bool.not (callConvEq abi .rustIntrinsic)
              | .some _ => false) = true)
-    (hOff : p.offsetBytes = 0)
-    (hNoBorrow : lookupBorrow mem.borrows p.tag = none)
     (hFnAlloc : (match mem.fnPtrs with
                  | .nil => isFnPtrAllocId p.allocId
                  | _ :: _ =>
@@ -1710,34 +2245,48 @@ theorem fnPtrToPtr_lockstep_mach_and_tb
                    | .none => false) = true) :
     evalRvalue locals (.cast .fnPtrToPtr op dstTy) mem decls layouts =
       .ok (.ptr p 8) locals' mem ∧
+    evalConstantM mBM (.FnPointer fnNm) =
+      .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none)) ∧
+    evalConstantM mTB (.FnPointer fnNm) =
+      .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none)) ∧
     evalCastOp (.Transmute thinRawPtrTy)
-      (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy) mBM =
+      (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy)
+      (some mBM) =
       .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy) ∧
     evalCastOpM (M := TBM) (.Transmute thinRawPtrTy)
-      (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy) mTB =
+      (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy)
+      (some mTB) =
       .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy) := by
-  refine ⟨?_,
-    evalCastOp_transmute_thinRawPtr_id addr hAddr provBM mBM,
-    evalCastOpM_transmute_thinRawPtr_id (M := TBM) addr hAddr provTB mTB⟩
-  show evalFnPtrToPtr locals op dstTy mem decls layouts = _
-  unfold evalFnPtrToPtr
-  simp only [hOp, hDst, hOff, hNoBorrow, Nat.beq_refl]
-  have hBool : ∀ (a b : Bool), a = true → b = true →
-      (match Bool.and true (Bool.and a (Bool.and true (Bool.and true b))) with
-       | true => RvalueEvalResult.ok (.ptr p 8) locals' mem
-       | false => .ub) = .ok (.ptr p 8) locals' mem := by
-    intro a b ha hb; subst ha; subst hb; rfl
-  exact hBool _ _ hSrc hFnAlloc
+  rcases hRelBM with ⟨hOff, hNoBorrow, hAddr, hMapBM⟩
+  rcases hRelTB with ⟨_, _, _, hMapTB⟩
+  refine ⟨?_, ?_, ?_,
+    evalCastOp_transmute_thinRawPtr_id addr hAddr provBM (some mBM),
+    evalCastOpM_transmute_thinRawPtr_id (M := TBM) addr hAddr provTB (some mTB)⟩
+  · show evalFnPtrToPtr locals op dstTy mem decls layouts = _
+    unfold evalFnPtrToPtr
+    simp only [hOp, hDst, hOff, hNoBorrow, Nat.beq_refl]
+    have hBool : ∀ (a b : Bool), a = true → b = true →
+        (match Bool.and true (Bool.and a (Bool.and true (Bool.and true b))) with
+         | true => RvalueEvalResult.ok (.ptr p 8) locals' mem
+         | false => .ub) = .ok (.ptr p 8) locals' mem := by
+      intro a b ha hb; subst ha; subst hb; rfl
+    exact hBool _ _ hSrc hFnAlloc
+  · unfold evalConstantM
+    simp only [hMapBM, bind, Except.bind, pure, Except.pure]
+  · unfold evalConstantM
+    simp only [hMapTB, bind, Except.bind, pure, Except.pure]
 
 /-- **C6 Explicit Characterization of Trusted Extra Checks vs. MiniRust
-`Transmute`
-(`fnPtrToPtr_extra_checks_divergence`)**:
+`Transmute` (`fnPtrToPtr_extra_checks_divergence`)**:
 Unlike MiniRust's type-erased `CastOp.Transmute (.Ptr (.Raw .None))` (which
 preserves any in-bounds thin pointer on both `Mach` and `MachTB`), Trusted
 `evalFnPtrToPtr` faults with `.ub` whenever:
 1. `p.offsetBytes ≠ 0` (nonzero offset on a function pointer),
-2. `lookupBorrow mem.borrows p.tag = some entry` (stack-borrowed pointer), or
-3. `operandTy` has `CallConv.rustIntrinsic` ABI. -/
+2. `lookupBorrow mem.borrows p.tag = some entry` (stack-borrowed pointer),
+3. `operandTy` has `CallConv.rustIntrinsic` ABI,
+4. `mem.fnPtrs` is non-empty and `lookupFnPtr mem.fnPtrs p.allocId = none`
+   (forged/data `allocId`), or
+5. `isThinRawPtrTy dstTy = false` (e.g., wide `*const [u32]` target). -/
 theorem fnPtrToPtr_extra_checks_divergence
     (locals locals' : List LocalSlot) (op : MirAst.Operand) (dstTy : MirAst.Ty)
     (mem : MirSemantics.Memory) (decls : List MirAst.LocalDecl) (layouts : LayoutTable)
@@ -1752,13 +2301,18 @@ theorem fnPtrToPtr_extra_checks_divergence
     (∀ ins out saf, operandTy decls layouts op =
         some { kind := .fnPtr ins out saf .rustIntrinsic, layoutIdx := 0 } →
       evalRvalue locals (.cast .fnPtrToPtr op dstTy) mem decls layouts = .ub) ∧
+    (∀ fpHead fpTail, mem.fnPtrs = fpHead :: fpTail →
+      lookupFnPtr mem.fnPtrs p.allocId = none →
+      evalRvalue locals (.cast .fnPtrToPtr op dstTy) mem decls layouts = .ub) ∧
+    (isThinRawPtrTy dstTy = false →
+      evalRvalue locals (.cast .fnPtrToPtr op dstTy) mem decls layouts = .ub) ∧
     evalCastOp (.Transmute thinRawPtrTy)
       (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy) none =
       .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy) ∧
     evalCastOpM (M := TBM) (.Transmute thinRawPtrTy)
       (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy) none =
       .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy) := by
-  refine ⟨?_, ?_, ?_,
+  refine ⟨?_, ?_, ?_, ?_, ?_,
     evalCastOp_transmute_thinRawPtr_id addr hAddr provBM none,
     evalCastOpM_transmute_thinRawPtr_id (M := TBM) addr hAddr provTB none⟩
   · intro hNe
@@ -1777,6 +2331,17 @@ theorem fnPtrToPtr_extra_checks_divergence
     show evalFnPtrToPtr locals op dstTy mem decls layouts = .ub
     unfold evalFnPtrToPtr
     simp [hOp, hIntr, callConvEq]
+  · intro fpHead fpTail hFps hMiss
+    have hMiss' : lookupFnPtr (fpHead :: fpTail) p.allocId = none := by
+      simpa [hFps] using hMiss
+    show evalFnPtrToPtr locals op dstTy mem decls layouts = .ub
+    unfold evalFnPtrToPtr
+    cases hB : lookupBorrow mem.borrows p.tag <;>
+      simp [hOp, hFps, hMiss', hB, Bool.and_false]
+  · intro hNotThin
+    show evalFnPtrToPtr locals op dstTy mem decls layouts = .ub
+    unfold evalFnPtrToPtr
+    simp [hOp, hNotThin]
 
 /-- Concrete C6 positive, dead-operand UB, and extra-check divergence witnesses
 across `stepMirFn`, `Interp.step`, and `Interp.stepTB`. -/
@@ -1794,11 +2359,12 @@ def c6FnPtrToPtrMrFn : Gen.Function :=
           (.UnOp (.Cast (.Transmute thinRawPtrTy)) (.Load (.Local (localName 1))))],
        .Return, .Regular⟩)]
 
-def c6FnPtrMach (local1Live : Bool := true) : Mach :=
+def c6FnPtrMach (local1Live : Bool := true) (local1Init : Bool := true) : Mach :=
   let prog := mkMrProg [(fnName 0, c6FnPtrToPtrMrFn)]
   let fnAlloc := mkFnAlloc 4096
   let alloc0 := mkStackAlloc 128 (List.replicate 8 .Uninit) 8
-  let alloc1 := mkStackAlloc 256 (ptrBytes 4096 (some (⟨0⟩, ()))) 8
+  let alloc1 := mkStackAlloc 256
+    (if local1Init then ptrBytes 4096 (some (⟨0⟩, ())) else List.replicate 8 .Uninit) 8
   let locs : List (Gen.LocalName × Ptr) :=
     if local1Live then
       [(localName 0, { addr := 128, provenance := some (⟨1⟩, ()) }),
@@ -1817,6 +2383,9 @@ theorem c6_fnPtrToPtr_three_way_and_ub_witness :
     let sDead : MachineState :=
       { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .dead] }
         memory := (initMachineState c6FnPtrToPtrMir []).memory }
+    let sUninit : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .uninit] }
+        memory := (initMachineState c6FnPtrToPtrMir []).memory }
     let sNonzero : MachineState :=
       initMachineState c6FnPtrToPtrMir [.ptr { allocId := fnPtrAllocBase, offsetBytes := 1 } 8]
     (match stepMirFn c6FnPtrToPtrMir sOk with
@@ -1831,10 +2400,18 @@ theorem c6_fnPtrToPtr_three_way_and_ub_witness :
     stepMirFn c6FnPtrToPtrMir sDead = MirStepNode.fail .ub ∧
     Interp.step (c6FnPtrMach false) = .error (.ub "access to a dead local") ∧
     Interp.stepTB (liftMachToTB (c6FnPtrMach false)) = .error (.ub "access to a dead local") ∧
+    stepMirFn c6FnPtrToPtrMir sUninit = MirStepNode.fail .ub ∧
+    Interp.step (c6FnPtrMach true false) =
+      .error (.ub "load at type but the data in memory violates the language invariant") ∧
+    Interp.stepTB (liftMachToTB (c6FnPtrMach true false)) =
+      .error (.ub "load at type but the data in memory violates the language invariant") ∧
     stepMirFn c6FnPtrToPtrMir sNonzero = MirStepNode.fail .ub :=
   ⟨rfl,
    ok_of_map_toOption (by decide +kernel),
    ok_of_map_toOption (by decide +kernel),
+   rfl,
+   eq_error_ub_of_interpUbMsg (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel),
    rfl,
    eq_error_ub_of_interpUbMsg (by decide +kernel),
    eq_error_ub_of_interpUbMsg (by decide +kernel),
@@ -1922,6 +2499,61 @@ theorem transmuteM_u8_to_bool {M : Type} [Gen.Memory M] [MemoryOps M]
       · rfl
     rw [henc, ok_bind, hDecNone _ hU8Ne0 hU8Ne1, ok_bind]
     rfl
+
+/-- **C7 Coupled Two-Sided Thin-Pointer & Integer `CastKind.subtype` Simulation
+(`subtype_thinPtr_and_u32_coupled_lockstep`)**:
+Proves universal lockstep between Trusted `evalRvalue ... (.cast .subtype ...)`
+(`evalByteCast`) and MiniRust `evalCastOp` (`Mach`) + `evalCastOpM` (`MachTB`)
+across BOTH variance/lifetime pointer subtyping (`*mut u32 → *const u32`) and
+same-width integer reinterpretation (`u32 → i32`), completely
+`Classical.choice`-
+free on the MiniRust codecs. -/
+theorem subtype_thinPtr_and_u32_coupled_lockstep
+    (locals locals' : List LocalSlot) (op : MirAst.Operand)
+    (mem : MirSemantics.Memory)
+    (p : ProvenancePtr) (bs : List MirSemantics.AbstractByte)
+    (addr bits : Nat) (hAddr : addr < 2 ^ 64) (hBits : bits < 2 ^ 32)
+    (provBM : Option Prov) (provTB : Option TreeBorrowsProvenance)
+    (mBM : Option Mach) (mTB : Option MachTB) :
+    let decls := [mkDecl rawConstU32MirTy, mkDecl rawMutU32MirTy]
+    (evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals decls
+        mem.callStack = .ok (.ptr p 8) locals' →
+      operandTy decls emptyLayoutTable op = some rawMutU32MirTy →
+      encodeByteCastSourceBytes emptyLayoutTable rawMutU32MirTy (.ptr p 8) = some bs →
+      length bs = 8 →
+      decodeTypedValueFromBytes defaultCodecFuel emptyLayoutTable rawConstU32MirTy bs =
+        some (.ptr p 8) →
+      evalRvalue locals (.cast .subtype op rawConstU32MirTy) mem decls emptyLayoutTable =
+        .ok (.ptr p 8) locals' mem ∧
+      evalCastOp (.Transmute thinRawPtrTy)
+        (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy) mBM =
+        .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy) ∧
+      evalCastOpM (M := TBM) (.Transmute thinRawPtrTy)
+        (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy) mTB =
+        .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy)) ∧
+    evalRvalue [.uninit, .init (.ptr { allocId := 1, offsetBytes := 0 } 8)]
+      (.cast .subtype (.copy (locPlace 1)) rawConstU32MirTy) mem decls emptyLayoutTable =
+      .ok (.ptr { allocId := 1, offsetBytes := 0 } 8)
+          [.uninit, .init (.ptr { allocId := 1, offsetBytes := 0 } 8)] mem ∧
+    transmuteM (M := BM) (.Int (intFromBits bits u32)) u32MrTy i32MrTy mBM =
+      .ok (.Int (intFromBits bits ⟨.Signed, ⟨4⟩⟩)) ∧
+    transmuteM (M := TBM) (.Int (intFromBits bits u32)) u32MrTy i32MrTy mTB =
+      .ok (.Int (intFromBits bits ⟨.Signed, ⟨4⟩⟩)) := by
+  intro decls
+  refine ⟨?_, rfl, transmuteM_u32_to_i32 bits hBits mBM, transmuteM_u32_to_i32 bits hBits mTB⟩
+  intro hOp hSrcTy hEnc hLen hDec
+  refine ⟨?_,
+    evalCastOp_transmute_thinRawPtr_id addr hAddr provBM mBM,
+    evalCastOpM_transmute_thinRawPtr_id (M := TBM) addr hAddr provTB mTB⟩
+  have hResDst : resolveTyWithLocalDecls decls emptyLayoutTable rawConstU32MirTy =
+      rawConstU32MirTy := rfl
+  have hResSrc : resolveTyWithLocalDecls decls emptyLayoutTable rawMutU32MirTy =
+      rawMutU32MirTy := rfl
+  have hSzDst : tyByteSize decls emptyLayoutTable rawConstU32MirTy = some 8 := rfl
+  have hSzSrc : tyByteSize decls emptyLayoutTable rawMutU32MirTy = some 8 := rfl
+  show evalByteCast locals op rawConstU32MirTy mem decls emptyLayoutTable = _
+  unfold evalByteCast
+  simp only [hOp, hResDst, hSzDst, hSrcTy, hResSrc, hSzSrc, hEnc, hLen, hDec, Nat.beq_refl]
 
 /-- `NonZeroU8` MiniRust `Type.Enum` rejecting byte `0` (modeled identically to
 `Translate.orderingTy` with `.Invalid` fallback at `0`). -/
@@ -2042,37 +2674,90 @@ theorem translateRvalue_pointerCoercion_none
       none :=
   rfl
 
-/-- **C8.1 & C8.2 (`ReifyFnPointer` & `ClosureFnPointer`) Universal Lockstep
-Law**:
-On MiniRust (`Mach` & `MachTB`), `evalConstantM` on `Constant.FnPointer fnName`
-loads `m.fn_ptrs[fnName]` as a thin pointer preserving function-pointer
-provenance, matching Trusted's `internFnPtr` allocation creation/lookup. -/
+/-- **C8.1 & C8.2 (`ReifyFnPointer` & `ClosureFnPointer`) Universal Two-Sided
+Lockstep & Strict-Check UB Law (`Mach` & `MachTB`)**:
+Couples Trusted `evalRvalue ... (.cast (.pointerCoercion ck) op targetTy)`
+(`evalReifyFnPointer` + `internFnPtr` across `"ReifyFnPointer"`,
+`"ReifyFnPointer(Safe)"`, `"ReifyFnPointer(Unsafe)"`, `"ClosureFnPointer"`,
+`"ClosureFnPointer(Safe)"`, and `"ClosureFnPointer(Unsafe)"`) directly with
+MiniRust `evalConstantM` / `evalValueM` on `Constant.FnPointer fnNm` (`Mach` &
+`MachTB`), plus universal `.ub` characterization for non-ZST/capturing closures,
+safety mismatches (`"ReifyFnPointer(Safe)"` → `.unsafe_`), and
+`.rustIntrinsic`. -/
 theorem reify_and_closure_fnPointer_lockstep_M
     {M : Type} [Gen.Memory M] [MemoryOps M]
-    (m : Machine M) (fnNm : Gen.FnName) (mrPtr : ThinPointer (Gen.Memory.Provenance M))
-    (hLookup : mapIndex m.fn_ptrs fnNm "self.fn_ptrs[fn_name]" = .ok mrPtr) :
-    evalConstantM m (.FnPointer fnNm) = .ok (.Ptr (ThinPointer.widen mrPtr none)) ∧
-    evalValueM m (.Constant (.FnPointer fnNm) thinRawPtrTy) =
-      .ok ((.Ptr (ThinPointer.widen mrPtr none), thinRawPtrTy), m) := by
-  unfold evalValueM evalConstantM
-  simp only [hLookup, bind, Except.bind, pure, Except.pure, and_self]
+    (locals locals' : List LocalSlot) (op : MirAst.Operand)
+    (mem : MirSemantics.Memory) (decls : List MirAst.LocalDecl) (layouts : LayoutTable)
+    (ck : String) (dp : DefPath) (targs : List RigidTy)
+    (fnIns : List RigidTy) (fnOut : RigidTy) (fnSaf : Safety) (fnAbi : CallConv)
+    (m : Machine M) (fnNm : Gen.FnName) (mrPtr : ThinPointer (Gen.Memory.Provenance M)) :
+    let targetTy : MirAst.Ty := { kind := .fnPtr fnIns fnOut fnSaf fnAbi, layoutIdx := 0 }
+    -- (1) Positive two-sided lockstep (`internFnPtr` ↔ `Constant.FnPointer`)
+    (isReifyFnPointerCoercion ck = true →
+      stringEq ck "UnsafeFnPointer" = false →
+      evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals
+        (callStack := mem.callStack) = .ok (.aggregate 0 []) locals' →
+      callConvEq fnAbi .rustIntrinsic = false →
+      reifyCoercionSafetyCompatible ck fnSaf = true →
+      extractReifyCoercionTarget? ck (operandTy decls layouts op) = some (dp, targs) →
+      checkCalleeSig mem.callees dp fnIns fnOut fnAbi targs mem.traitImpls = true →
+      mapIndex m.fn_ptrs fnNm "self.fn_ptrs[fn_name]" = .ok mrPtr →
+      let (allocId, mem') := internFnPtr mem dp targs (some targetTy.kind)
+      evalRvalue locals (.cast (.pointerCoercion ck) op targetTy) mem decls layouts =
+        .ok (.ptr { allocId := allocId, offsetBytes := 0 } 8) locals' mem' ∧
+      evalConstantM m (.FnPointer fnNm) = .ok (.Ptr (ThinPointer.widen mrPtr none)) ∧
+      evalValueM m (.Constant (.FnPointer fnNm) thinRawPtrTy) =
+        .ok ((.Ptr (ThinPointer.widen mrPtr none), thinRawPtrTy), m)) ∧
+    -- (2) Safety mismatch UB (`ReifyFnPointer(Safe)` to `unsafe fn`)
+    (evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals
+        (callStack := mem.callStack) = .ok .unit locals' →
+      evalRvalue locals (.cast (.pointerCoercion "ReifyFnPointer(Safe)") op fnPtrUnsafeU32MirTy)
+        mem decls layouts = .ub) ∧
+    -- (3) Capturing closure UB (`ClosureFnPointer` on non-empty capture list)
+    (∀ v0 vs,
+      evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals
+        (callStack := mem.callStack) = .ok (.aggregate 0 (v0 :: vs)) locals' →
+      evalRvalue locals (.cast (.pointerCoercion "ClosureFnPointer") op targetTy)
+        mem decls layouts = .ub) := by
+  intro targetTy
+  refine ⟨?_, ?_, ?_⟩
+  · intro hReify hNotUnsafe hOp hAbi hSaf hExt hSig hLookup
+    refine ⟨?_, ?_⟩
+    · show evalReifyFnPointer locals op targetTy mem decls layouts ck = _
+      unfold evalReifyFnPointer
+      simp only [hReify, hNotUnsafe, hOp, targetTy, hAbi, Bool.not_false, hSaf, Bool.and_self,
+        hExt, hSig]
+    · unfold evalValueM evalConstantM
+      simp only [hLookup, bind, Except.bind, pure, Except.pure, and_self]
+  · intro hOp
+    have h1 : isReifyFnPointerCoercion "ReifyFnPointer(Safe)" = true := rfl
+    have h2 : stringEq "ReifyFnPointer(Safe)" "UnsafeFnPointer" = false := rfl
+    have h3 : reifyCoercionSafetyCompatible "ReifyFnPointer(Safe)" .unsafe_ = false := rfl
+    show evalReifyFnPointer locals op fnPtrUnsafeU32MirTy mem decls layouts
+      "ReifyFnPointer(Safe)" = .ub
+    unfold evalReifyFnPointer
+    simp only [h1, h2, hOp, fnPtrUnsafeU32MirTy, h3, Bool.and_false]
+  · intro v0 vs hOp
+    have h1 : isReifyFnPointerCoercion "ClosureFnPointer" = true := rfl
+    have h2 : stringEq "ClosureFnPointer" "UnsafeFnPointer" = false := rfl
+    show evalReifyFnPointer locals op targetTy mem decls layouts "ClosureFnPointer" = .ub
+    unfold evalReifyFnPointer
+    simp only [h1, h2, hOp]
 
-/-- **C8.3 (`UnsafeFnPointer`) Ground-Truth Characterization & Exact
-Divergences**:
-Inspecting `Trusted.MirSemantics.Places` directly (`isReifyFnPointerCoercion` &
-`evalReifyFnPointer`):
-1. **`Trusted` EXECUTES `"UnsafeFnPointer"`** via `evalUnsafeFnPointer`
-   (`isReifyFnPointerCoercion "UnsafeFnPointer" = true`) — NOT `.unsupported`.
-2. **Exact Strict-Check Divergence
-   (`unsafeFnPointer_strict_checks_divergence`)**:
-   `Trusted` faults with `.ub` when coercing to a `.safe` target, coercing an
-   already-`unsafe` fn pointer, `rustIntrinsic` ABI, nonzero `offsetBytes`, or
-   stack pointers — whereas MiniRust erases function-pointer safety/ABI into
-   `PtrType.Raw .None` so `Transmute thinRawPtrTy` succeeds on `Mach` &
-   `MachTB`.
-3. **Unrecognized Coercion Tag (`.unsupported`)**: any tag outside the 6
-   recognized coercion families (e.g., `"UnsafeFnPointer(Unsafe)"`) returns
-   `.unsupported` in `Trusted`. -/
+/-- **C8.3 (`UnsafeFnPointer`) Positive Two-Sided Lockstep & Strict-Check
+Divergences (`Mach` & `MachTB`)**:
+1. **Positive Lockstep**: When `op` evaluates to `.ptr p 8` at a `.safe` fn-ptr
+   type matching `.unsafe_` target `fnPtrUnsafeU32MirTy` (`offsetBytes = 0`,
+   `lookupBorrow = none`, valid `fnPtrs`), Trusted `evalUnsafeFnPointer`
+   returns `.ok (.ptr p 8) locals' mem` in lockstep with MiniRust `Transmute
+   thinRawPtrTy` on BOTH `Mach` and `MachTB`.
+2. **Strict-Check Divergences**: Trusted faults with `.ub` when coercing to a
+   `.safe` target, coercing an already-`.unsafe_` source fn pointer
+   (`.unsafe_ → .unsafe_`), or coercing to `rustIntrinsic` ABI — whereas
+   MiniRust erases fn-ptr safety/ABI into `thinRawPtrTy` so `Transmute` succeeds
+   on `Mach` and `MachTB`.
+3. **Unrecognized Coercion Tag**: tags outside the 6 recognized coercion
+   families (e.g., `"UnsafeFnPointer(Unsafe)"`) return `.unsupported`. -/
 theorem unsafeFnPointer_ground_truth_and_divergences
     (locals locals' : List LocalSlot) (op : MirAst.Operand)
     (mem : MirSemantics.Memory) (decls : List MirAst.LocalDecl) (layouts : LayoutTable)
@@ -2084,8 +2769,24 @@ theorem unsafeFnPointer_ground_truth_and_divergences
     evalRvalue locals (.cast (.pointerCoercion "UnsafeFnPointer") op fnPtrUnsafeU32MirTy)
       mem decls layouts =
       evalUnsafeFnPointer locals op fnPtrUnsafeU32MirTy mem decls layouts ∧
+    -- Positive safe -> unsafe lockstep
+    (operandTy decls layouts op = some fnPtrSafeU32MirTy →
+      p.offsetBytes = 0 →
+      lookupBorrow mem.borrows p.tag = none →
+      mem.fnPtrs = [] →
+      isFnPtrAllocId p.allocId = true →
+      evalRvalue locals (.cast (.pointerCoercion "UnsafeFnPointer") op fnPtrUnsafeU32MirTy)
+        mem decls layouts = .ok (.ptr p 8) locals' mem) ∧
+    -- Strict-check UB (safe target, already-unsafe source, intrinsic target)
     evalRvalue locals (.cast (.pointerCoercion "UnsafeFnPointer") op fnPtrSafeU32MirTy)
       mem decls layouts = .ub ∧
+    (operandTy decls layouts op = some fnPtrUnsafeU32MirTy →
+      evalRvalue locals (.cast (.pointerCoercion "UnsafeFnPointer") op fnPtrUnsafeU32MirTy)
+        mem decls layouts = .ub) ∧
+    evalRvalue locals (.cast (.pointerCoercion "UnsafeFnPointer") op
+        { kind := .fnPtr [.uint .u32] (.uint .u32) .unsafe_ .rustIntrinsic, layoutIdx := 0 })
+      mem decls layouts = .ub ∧
+    -- MiniRust type-erased Transmute succeeds on Mach & MachTB
     evalCastOp (.Transmute thinRawPtrTy)
       (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy) none =
       .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy) ∧
@@ -2094,12 +2795,26 @@ theorem unsafeFnPointer_ground_truth_and_divergences
       .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy) ∧
     evalRvalue locals (.cast (.pointerCoercion "UnsafeFnPointer(Unsafe)") op fnPtrUnsafeU32MirTy)
       mem decls layouts = .unsupported := by
-  refine ⟨rfl, rfl, ?_,
+  refine ⟨rfl, rfl, ?_, ?_, ?_, ?_,
     evalCastOp_transmute_thinRawPtr_id addr hAddr provBM none,
     evalCastOpM_transmute_thinRawPtr_id (M := TBM) addr hAddr provTB none, rfl⟩
-  show evalUnsafeFnPointer locals op fnPtrSafeU32MirTy mem decls layouts = .ub
-  unfold evalUnsafeFnPointer
-  simp [hOp, fnPtrSafeU32MirTy]
+  · intro hSrc hOff hNoB hFps hFnId
+    show evalUnsafeFnPointer locals op fnPtrUnsafeU32MirTy mem decls layouts = _
+    unfold evalUnsafeFnPointer
+    simp [hOp, hSrc, hOff, hNoB, hFps, hFnId, fnPtrUnsafeU32MirTy, fnPtrSafeU32MirTy,
+      callConvEq, rigidTyListEq, rigidTyEq]
+  · show evalUnsafeFnPointer locals op fnPtrSafeU32MirTy mem decls layouts = .ub
+    unfold evalUnsafeFnPointer
+    simp [hOp, fnPtrSafeU32MirTy]
+  · intro hAlreadyUnsafe
+    show evalUnsafeFnPointer locals op fnPtrUnsafeU32MirTy mem decls layouts = .ub
+    unfold evalUnsafeFnPointer
+    simp [hOp, hAlreadyUnsafe, fnPtrUnsafeU32MirTy, callConvEq]
+  · show evalUnsafeFnPointer locals op
+      { kind := .fnPtr [.uint .u32] (.uint .u32) .unsafe_ .rustIntrinsic, layoutIdx := 0 }
+      mem decls layouts = .ub
+    unfold evalUnsafeFnPointer
+    simp [hOp, callConvEq]
 
 private theorem mutToConst_dispatch_flags :
     isReifyFnPointerCoercion "MutToConstPointer" = false ∧
@@ -2114,24 +2829,33 @@ private theorem arrayToPtr_dispatch_flags :
     stringEq "ArrayToPointer" "ArrayToPointer" = true :=
   ⟨rfl, rfl, rfl⟩
 
-/-- **C8.4 (`MutToConstPointer`) Universal 4-Shape Preservation & Shape-Mismatch
-UB**:
-Covers thin provenance pointers, thin scalar addresses, wide slice pointers
-(`*mut [T] → *const [T]`), and wide dyn-vtable pointers
-(`*mut dyn Tr → *const dyn Tr`) on Trusted, paired with MiniRust's
-mutability-erased
-raw pointer representation and explicit `checkPtrMetadataM` `.VTablePointer`
-boundary. -/
+/-- **C8.4 (`MutToConstPointer`) Coupled Two-Sided 4-Shape Preservation (`Mach`
+& `MachTB`) & Shape-Mismatch UB**:
+Couples Trusted `evalRvalue` on `.pointerCoercion "MutToConstPointer"`
+across thin pointers, thin scalar addresses, wide slice pointers
+(`*mut [T] → *const [T]`), provenance-free wide slice pointers, and wide
+dyn-vtable pointers (`*mut dyn Tr → *const dyn Tr`) directly with MiniRust
+`evalCastOpM (.Transmute ...)` on BOTH `Mach` and `MachTB` (both thin AND wide
+slice pointers via `evalCastOpM_transmute_wideSliceRawPtr_id`), plus shape-
+mismatch UB and the `checkPtrMetadataM` `.VTablePointer` boundary. -/
 theorem mutToConstPointer_all_shapes_and_ub
     (locals locals' : List LocalSlot) (op : MirAst.Operand)
     (mem : MirSemantics.Memory) (decls : List MirAst.LocalDecl)
-    (p vt : ProvenancePtr) (addr len : Nat) :
+    (p vt : ProvenancePtr) (addr len : Nat) (hAddr : addr < 2 ^ 64) (hLen : len < 2 ^ 64)
+    (provBM : Option Prov) (provTB : Option TreeBorrowsProvenance)
+    (mBM : Option Mach) (mTB : Option MachTB) :
     -- (a) Thin pointer preservation (*mut u32 -> *const u32)
     (evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals decls
         mem.callStack = .ok (.ptr p 8) locals' →
       operandTy decls emptyLayoutTable op = some rawMutU32MirTy →
       evalRvalue locals (.cast (.pointerCoercion "MutToConstPointer") op rawConstU32MirTy)
-        mem decls emptyLayoutTable = .ok (.ptr p 8) locals' mem) ∧
+        mem decls emptyLayoutTable = .ok (.ptr p 8) locals' mem ∧
+      evalCastOp (.Transmute thinRawPtrTy)
+        (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy) mBM =
+        .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy) ∧
+      evalCastOpM (M := TBM) (.Transmute thinRawPtrTy)
+        (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy) mTB =
+        .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy)) ∧
     -- (b) Thin scalar address preservation
     (evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals decls
         mem.callStack = .ok (.scalar ⟨addr, 8⟩) locals' →
@@ -2144,7 +2868,13 @@ theorem mutToConstPointer_all_shapes_and_ub
         mem.callStack = .ok (annealWidePtrVal p len 8) locals' →
       operandTy decls emptyLayoutTable op = some rawMutSliceU32MirTy →
       evalRvalue locals (.cast (.pointerCoercion "MutToConstPointer") op rawConstSliceU32MirTy)
-        mem decls emptyLayoutTable = .ok (annealWidePtrVal p len 8) locals' mem) ∧
+        mem decls emptyLayoutTable = .ok (annealWidePtrVal p len 8) locals' mem ∧
+      evalCastOpM (M := BM) (.Transmute wideSlicePtrMrTy)
+        (mrWidePtrValM { addr := addr, provenance := provBM } (len : Int), wideSlicePtrMrTy) mBM =
+        .ok (mrWidePtrValM { addr := addr, provenance := provBM } (len : Int), wideSlicePtrMrTy) ∧
+      evalCastOpM (M := TBM) (.Transmute wideSlicePtrMrTy)
+        (mrWidePtrValM { addr := addr, provenance := provTB } (len : Int), wideSlicePtrMrTy) mTB =
+        .ok (mrWidePtrValM { addr := addr, provenance := provTB } (len : Int), wideSlicePtrMrTy)) ∧
     -- (d) Wide dyn-vtable pointer preservation (*mut dyn Tr -> *const dyn Tr)
     (evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals decls
         mem.callStack = .ok (.aggregate 0 [.ptr p 8, .ptr vt 8]) locals' →
@@ -2158,7 +2888,6 @@ theorem mutToConstPointer_all_shapes_and_ub
       evalRvalue locals (.cast (.pointerCoercion "MutToConstPointer") op rawConstSliceU32MirTy)
         mem decls emptyLayoutTable = .ub) ∧
     -- (f) MiniRust wide dyn-vtable PtrType.as_wide_pair & checkPtrMetadataM
-    -- boundary
     (PtrType.as_wide_pair (.Raw (.VTablePointer (traitNameOf 0))) =
       some (.Tuple [(⟨0⟩, thinRawPtrTy), (x86_64.PTR_SIZE, .Ptr (.VTablePtr (traitNameOf 0)))]
         ⟨⟨16⟩, ⟨8⟩, none⟩ none) ∧
@@ -2171,6 +2900,9 @@ theorem mutToConstPointer_all_shapes_and_ub
   refine ⟨?_, ?_, ?_, ?_, ?_, ⟨rfl, fun _ => rfl⟩⟩
   · intro hOp hTy
     have hSh : mutToConstTargetShape? (some rawMutU32MirTy) rawConstU32MirTy = some none := rfl
+    refine ⟨?_,
+      evalCastOp_transmute_thinRawPtr_id addr hAddr provBM mBM,
+      evalCastOpM_transmute_thinRawPtr_id (M := TBM) addr hAddr provTB mTB⟩
     show evalReifyFnPointer locals op rawConstU32MirTy mem decls emptyLayoutTable "MutToConstPointer" = _
     unfold evalReifyFnPointer
     simp only [h1, h2, h3, h4, hL8, hOp, hTy, hSh, Nat.beq_refl]
@@ -2182,6 +2914,9 @@ theorem mutToConstPointer_all_shapes_and_ub
   · intro hOp hTy
     have hSh : mutToConstTargetShape? (some rawMutSliceU32MirTy) rawConstSliceU32MirTy =
         some (some false) := rfl
+    refine ⟨?_,
+      evalCastOpM_transmute_wideSliceRawPtr_id (M := BM) addr len hAddr hLen provBM mBM,
+      evalCastOpM_transmute_wideSliceRawPtr_id (M := TBM) addr len hAddr hLen provTB mTB⟩
     show evalReifyFnPointer locals op rawConstSliceU32MirTy mem decls emptyLayoutTable "MutToConstPointer" = _
     unfold evalReifyFnPointer
     simp only [h1, h2, h3, h4, hL8, hOp, hTy, hSh, annealWidePtrVal, Nat.beq_refl, Bool.and_self]
@@ -2211,18 +2946,32 @@ theorem mutToConstPointer_all_shapes_and_ub
       | none => exact absurd hS (hShape _)
       | some _ => rfl
 
-/-- **C8.5 (`ArrayToPointer`) Universal Preservation (Global, Stack-Borrow,
-Scalar) & UB**. -/
+/-- **C8.5 (`ArrayToPointer`) Coupled Two-Sided Preservation (Global,
+Stack-Borrow `deriveStackElemThinPtr`, Scalar) & UB**:
+Couples Trusted `ArrayToPointer` directly with MiniRust `Transmute thinRawPtrTy`
+on `Mach` & `MachTB`, AND explicitly characterizes `deriveStackElemThinPtr` on
+both `.disabled` stack borrows (`.ub`) and live root `[u32; 2]` borrows at
+`offsetBytes = 0` (minting narrowed subslice tag `mem.nextTag` at
+`targetProjection := [.subslice 0 2 false]`, while MiniRust preserves the thin
+pointer unchanged). -/
 theorem arrayToPointer_global_stack_scalar_and_ub
     (locals locals' : List LocalSlot) (op : MirAst.Operand)
     (mem : MirSemantics.Memory) (decls : List MirAst.LocalDecl)
-    (p : ProvenancePtr) (addr : Nat) :
+    (p : ProvenancePtr) (addr : Nat) (hAddr : addr < 2 ^ 64)
+    (provBM : Option Prov) (provTB : Option TreeBorrowsProvenance)
+    (mBM : Option Mach) (mTB : Option MachTB) :
     (evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals decls
         mem.callStack = .ok (.ptr p 8) locals' →
       operandTy decls emptyLayoutTable op = some rawMutArr2U32MirTy →
       lookupBorrow mem.borrows p.tag = none →
       evalRvalue locals (.cast (.pointerCoercion "ArrayToPointer") op rawMutU32MirTy)
-        mem decls emptyLayoutTable = .ok (.ptr p 8) locals' mem) ∧
+        mem decls emptyLayoutTable = .ok (.ptr p 8) locals' mem ∧
+      evalCastOp (.Transmute thinRawPtrTy)
+        (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy) mBM =
+        .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provBM } none), thinRawPtrTy) ∧
+      evalCastOpM (M := TBM) (.Transmute thinRawPtrTy)
+        (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy) mTB =
+        .ok (.Ptr (ThinPointer.widen { addr := addr, provenance := provTB } none), thinRawPtrTy)) ∧
     (∀ parentEntry,
       evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals decls
         mem.callStack = .ok (.ptr p 8) locals' →
@@ -2230,7 +2979,9 @@ theorem arrayToPointer_global_stack_scalar_and_ub
       lookupBorrow mem.borrows p.tag = some parentEntry →
       evalRvalue locals (.cast (.pointerCoercion "ArrayToPointer") op rawMutU32MirTy)
         mem decls emptyLayoutTable =
-        deriveStackElemThinPtr locals' mem p parentEntry (some 2) 8) ∧
+        deriveStackElemThinPtr locals' mem p parentEntry (some 2) 8 ∧
+      (parentEntry.perm = .disabled →
+        deriveStackElemThinPtr locals' mem p parentEntry (some 2) 8 = .ub)) ∧
     (evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals decls
         mem.callStack = .ok (.scalar ⟨addr, 8⟩) locals' →
       operandTy decls emptyLayoutTable op = some rawMutArr2U32MirTy →
@@ -2248,13 +2999,20 @@ theorem arrayToPointer_global_stack_scalar_and_ub
   have hArrBad : arrayToPointerElemLen? (some rawConstArr2U32MirTy) rawMutU32MirTy = none := rfl
   refine ⟨?_, ?_, ?_, ?_⟩
   · intro hOp hTy hNoB
+    refine ⟨?_,
+      evalCastOp_transmute_thinRawPtr_id addr hAddr provBM mBM,
+      evalCastOpM_transmute_thinRawPtr_id (M := TBM) addr hAddr provTB mTB⟩
     show evalReifyFnPointer locals op rawMutU32MirTy mem decls emptyLayoutTable "ArrayToPointer" = _
     unfold evalReifyFnPointer
     simp only [h1, h2, h3, hL8, hOp, hTy, hArrOk, hNoB, Nat.beq_refl]
   · intro parentEntry hOp hTy hB
-    show evalReifyFnPointer locals op rawMutU32MirTy mem decls emptyLayoutTable "ArrayToPointer" = _
-    unfold evalReifyFnPointer
-    simp only [h1, h2, h3, hL8, hOp, hTy, hArrOk, hB, Nat.beq_refl]
+    refine ⟨?_, ?_⟩
+    · show evalReifyFnPointer locals op rawMutU32MirTy mem decls emptyLayoutTable "ArrayToPointer" = _
+      unfold evalReifyFnPointer
+      simp only [h1, h2, h3, hL8, hOp, hTy, hArrOk, hB, Nat.beq_refl]
+    · intro hDis
+      unfold deriveStackElemThinPtr
+      simp [hDis]
   · intro hOp hTy
     show evalReifyFnPointer locals op rawMutU32MirTy mem decls emptyLayoutTable "ArrayToPointer" = _
     unfold evalReifyFnPointer
@@ -2366,20 +3124,54 @@ theorem c8_all_five_pointer_coercions_three_way_witness :
    ok_of_map_toOption (by decide +kernel),
    ok_of_map_toOption (by decide +kernel)⟩
 
-/-- Concrete C8 negative witness: capturing closure rejected by
-`ClosureFnPointer`
-(`.ub`) and unrecognized coercion tag returns `.unsupported` in Trusted. -/
-theorem c8_capturing_closure_ub_and_unknown_tag_unsupported_witness :
+/-- Concrete C8 wide-slice (`*mut [u32] → *const [u32]`), wide-dyn
+(`*mut dyn Tr → *const dyn Tr`), and negative witnesses across Trusted, `Mach`,
+and `MachTB` (capturing closure `.ub`, already-`unsafe` `UnsafeFnPointer` `.ub`,
+shape-mismatch `.ub`, and unrecognized coercion tag `.unsupported`). -/
+theorem c8_capturing_closure_wide_and_unknown_tag_witness :
     let capDecls := [mkDecl fnPtrSafeU32MirTy, mkDecl (closureCapMirTy "ep2::cap_cl")]
     let mem0 := (initMachineState c8AllFiveMir []).memory
+    let wideMir := mkMirBody "ep2::c8_wide_slice"
+      [mkDecl rawConstSliceU32MirTy, mkDecl rawMutSliceU32MirTy] 1
+      [mkBb [mkSt (.assign (locPlace 0)
+        (.cast (.pointerCoercion "MutToConstPointer") (.copy (locPlace 1)) rawConstSliceU32MirTy))]
+        .return_]
+    let wideBytes := ptrBytes 256 (some (⟨1⟩, ())) ++ scalarBytes IntType.usize_ty 3
+    let wideMach := c7MkTransmuteMach wideSlicePtrMrTy wideSlicePtrMrTy wideBytes 16
+    -- Wide slice *mut [u32] -> *const [u32] 3-way witness
+    runAVal wideMir 4 (initMachineState wideMir [annealWidePtrVal { allocId := 5, offsetBytes := 0 } 3 8]) =
+      some (annealWidePtrVal { allocId := 5, offsetBytes := 0 } 3 8) ∧
+    (∃ m1, Interp.step wideMach = .ok m1 ∧
+      m1.mem.memory.allocations[0]?.map (·.data) = some wideBytes) ∧
+    (∃ m1, Interp.stepTB (liftMachToTB wideMach) = .ok m1 ∧
+      m1.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB) =
+        some (wideBytes.map (projByteTB ∘ liftByteTB))) ∧
+    -- Wide dyn *mut dyn Tr -> *const dyn Tr on Trusted
+    evalRvalue [.uninit, .init (.aggregate 0 [.ptr { allocId := 5, offsetBytes := 0 } 8,
+                                              .ptr { allocId := 9, offsetBytes := 0 } 8])]
+      (.cast (.pointerCoercion "MutToConstPointer") (.copy (locPlace 1)) rawConstDynMirTy)
+      mem0 [mkDecl rawConstDynMirTy, mkDecl rawMutDynMirTy] emptyLayoutTable =
+      .ok (.aggregate 0 [.ptr { allocId := 5, offsetBytes := 0 } 8,
+                         .ptr { allocId := 9, offsetBytes := 0 } 8])
+          [.uninit, .init (.aggregate 0 [.ptr { allocId := 5, offsetBytes := 0 } 8,
+                                         .ptr { allocId := 9, offsetBytes := 0 } 8])] mem0 ∧
+    -- Capturing closure rejected by ClosureFnPointer (.ub)
     evalRvalue [.uninit, .init (.aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨0, 8⟩])]
       (.cast (.pointerCoercion "ClosureFnPointer") (.copy (locPlace 1)) fnPtrSafeU32MirTy)
       mem0 capDecls emptyLayoutTable = .ub ∧
+    -- Already-unsafe fn pointer rejected by UnsafeFnPointer (.ub)
+    evalRvalue [.uninit, .init (.ptr { allocId := fnPtrAllocBase, offsetBytes := 0 } 8)]
+      (.cast (.pointerCoercion "UnsafeFnPointer") (.copy (locPlace 1)) fnPtrUnsafeU32MirTy)
+      mem0 [mkDecl fnPtrUnsafeU32MirTy, mkDecl fnPtrUnsafeU32MirTy] emptyLayoutTable = .ub ∧
+    -- Unrecognized coercion tag returns .unsupported
     evalRvalue [.uninit, .init (.ptr { allocId := fnPtrAllocBase, offsetBytes := 0 } 8)]
       (.cast (.pointerCoercion "UnknownCoercion") (.copy (locPlace 1)) fnPtrUnsafeU32MirTy)
       mem0 [mkDecl fnPtrUnsafeU32MirTy, mkDecl fnPtrSafeU32MirTy] emptyLayoutTable =
       .unsupported :=
-  ⟨rfl, rfl⟩
+  ⟨rfl,
+   ok_of_map_toOption (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel),
+   rfl, rfl, rfl, rfl⟩
 
 /-! ## §9 (`C9`): `ProjectionElem.unwrapUnsafeBinder` (`Mach` & `MachTB`) -/
 
@@ -2393,12 +3185,23 @@ theorem translatePlace_unwrapUnsafeBinder_none
     translateFieldPlace base (.unwrapUnsafeBinder innerTy :: rest) = none :=
   ⟨rfl, rfl⟩
 
-/-- **C9 Trusted Universal Transparency Laws**:
-`ProjectionElem.unwrapUnsafeBinder` is definitionally transparent across
-`readProjectedValue`, `writeProjectedValue`, `splitLastDeref?`,
-`isScalarCompatibleProj`, and `stripTransparentProjections`. -/
+/-- **C9 Trusted Universal Transparency Laws (`evalPlaceRead`,
+`writePlaceValue`, `readProjectedValue`, `writeProjectedValue`,
+`splitLastDeref?`)**:
+1. `ProjectionElem.unwrapUnsafeBinder` is definitionally transparent across
+   `readProjectedValue`, `writeProjectedValue`, `readProjectedValueUnionAware`,
+   `splitLastDeref?` (both `[*p].unwrapUnsafeBinder` AND
+   `[_p.unwrapUnsafeBinder].deref`!), `isScalarCompatibleProj`, and
+   `stripTransparentProjections`.
+2. On whole-local projections (`⟨loc, [.unwrapUnsafeBinder innerTy]⟩` with
+   `localDecls = []`), `evalPlaceRead` and `writePlaceValue` equal the bare
+   local read/write `⟨loc, []⟩` on every initialized slot, while an unlowered
+   non-leading `.deref` (`⟨loc, [.unwrapUnsafeBinder ptrTy, .deref]⟩`) returns
+   `.unsupported` (because Rust `Runtime(PostCleanup)` MIR lowers `*(_p.unwrap)`
+   via `_tmp = copy (_p.unwrap); (*_tmp)`). -/
 theorem trusted_unwrapUnsafeBinder_transparent
-    (locals : List LocalSlot) (val newVal : MirSemantics.Value)
+    (locals : List LocalSlot) (loc : Nat) (val newVal : MirSemantics.Value)
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation)
     (innerTy : MirAst.Ty) (rest : List MirAst.ProjectionElem) :
     readProjectedValue locals val (.unwrapUnsafeBinder innerTy :: rest) =
       readProjectedValue locals val rest ∧
@@ -2406,24 +3209,110 @@ theorem trusted_unwrapUnsafeBinder_transparent
       writeProjectedValue locals val rest newVal ∧
     splitLastDeref? (.unwrapUnsafeBinder innerTy :: rest) = splitLastDeref? rest ∧
     splitLastDeref? [.deref, .unwrapUnsafeBinder innerTy] = some [] ∧
+    splitLastDeref? [.unwrapUnsafeBinder innerTy, .deref] = some [] ∧
     isScalarCompatibleProj (.unwrapUnsafeBinder innerTy :: rest) =
       isScalarCompatibleProj rest ∧
     stripTransparentProjections (.unwrapUnsafeBinder innerTy :: rest) =
-      stripTransparentProjections rest :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+      stripTransparentProjections rest ∧
+    (get? locals loc = some (.init val) →
+      evalPlaceRead locals ⟨loc, [.unwrapUnsafeBinder innerTy]⟩ borrows globals =
+        .ok val locals ∧
+      writePlaceValue locals borrows ⟨loc, [.unwrapUnsafeBinder innerTy]⟩ newVal =
+        writePlaceValue locals borrows ⟨loc, []⟩ newVal ∧
+      writePlaceValue locals borrows ⟨loc, [.unwrapUnsafeBinder innerTy, .deref]⟩ newVal =
+        .unsupported) := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, ?_⟩
+  intro hSlot
+  refine ⟨?_, ?_, ?_⟩
+  · unfold evalPlaceRead
+    dsimp only []
+    rw [hSlot]
+    rfl
+  · unfold writePlaceValue
+    dsimp only []
+    rw [hSlot]
+    rfl
+  · unfold writePlaceValue
+    dsimp only []
+    rw [hSlot]
+    rfl
 
-/-- MiniRust transparent single-field wrapper `#[repr(transparent)] struct
-Binder(T)`:
-offset-0 field 0 with identical size and alignment to `inner`. -/
-@[reducible] def mrBinderWrapperTy (inner : Gen.Type)
-    (sz : LibSpecr.Size) (al : LibSpecr.Align) : Gen.Type :=
-  .Tuple [(⟨0⟩, inner)] ⟨sz, al, none⟩ none
+/-- **C9 MiniRust Polymorphic Field-0 Wrapper Place & `Transmute` Identity
+(`Mach` & `MachTB`)**:
+1. Projecting `.Field base 0` through `mrBinderWrapperTy inner sz al` evaluates
+   to the exact same pointer and alignment (offset `0`) on EVERY `Machine M`
+   (`Mach` and `MachTB`).
+2. `transmuteM_binderWrapper_u32_and_thinPtr` (`Classical.choice`-free): both
+   `mrBinderWrapperTy u32MrTy ⟨4⟩ ⟨4⟩ ↔ u32MrTy` and
+   `mrBinderWrapperTy thinRawPtrTy ⟨8⟩ ⟨8⟩ ↔ thinRawPtrTy` round-trip via
+   `transmuteM` across `Mach` and `MachTB`! -/
+theorem checkValueM_int_of_inBounds {M : Type} [Gen.Memory M] [MemoryOps M]
+    (i : Int) (it : Gen.IntType) (m : Option (Machine M))
+    (hin : inBounds i it.signed it.size = true) :
+    checkValueM (M := M) (.Int i) (.Int it) m = .ok () := by
+  unfold checkValueM IntType.can_represent ensureElseUb
+  rw [hin]
+  rfl
 
-/-- **C9 MiniRust Polymorphic Field-0 Wrapper Place Identity (`Mach` &
-`MachTB`)**:
-Projecting `.Field base 0` through `mrBinderWrapperTy inner sz al` (for a sized
-`inner`) evaluates to the exact same pointer and alignment (offset `0`) on EVERY
-`Machine M` (`Mach` and `MachTB`)! -/
+theorem checkValueM_thinRawPtr_of_inBounds {M : Type} [Gen.Memory M] [MemoryOps M]
+    (addr : Int) (prov : Option (Gen.Memory.Provenance M)) (m : Option (Machine M))
+    (hin : inBounds addr .Unsigned x86_64.PTR_SIZE = true) :
+    checkValueM (M := M) (.Ptr (ThinPointer.widen { addr := addr, provenance := prov } none))
+      thinRawPtrTy m = .ok () := by
+  unfold checkValueM checkPtrM
+  simp only [thinRawPtrTy, ThinPointer.widen, ensureElseUb, hin, ↓reduceIte,
+    PtrType.meta_kind, checkPtrMetadataM, PtrType.safe_pointee,
+    Bool.not_true, Bool.false_eq_true, pure, Except.pure, bind, Except.bind]
+
+theorem transmuteM_binderWrapper_u32_and_thinPtr {M : Type} [Gen.Memory M] [MemoryOps M]
+    (bits addr : Nat) (hBits : bits < 2 ^ 32) (hAddr : addr < 2 ^ 64)
+    (prov : Option (Gen.Memory.Provenance M)) (m : Option (Machine M)) :
+    let vInt : Gen.Value M := .Int (intFromBits bits u32)
+    let vPtr : Gen.Value M := .Ptr (ThinPointer.widen { addr := addr, provenance := prov } none)
+    transmuteM (M := M) (.Tuple [vInt]) (mrBinderWrapperTy u32MrTy ⟨4⟩ ⟨4⟩) u32MrTy m =
+      .ok vInt ∧
+    transmuteM (M := M) vInt u32MrTy (mrBinderWrapperTy u32MrTy ⟨4⟩ ⟨4⟩) m =
+      .ok (.Tuple [vInt]) ∧
+    transmuteM (M := M) (.Tuple [vPtr]) (mrBinderWrapperTy thinRawPtrTy ⟨8⟩ ⟨8⟩) thinRawPtrTy m =
+      .ok vPtr ∧
+    transmuteM (M := M) vPtr thinRawPtrTy (mrBinderWrapperTy thinRawPtrTy ⟨8⟩ ⟨8⟩) m =
+      .ok (.Tuple [vPtr]) := by
+  intro vInt vPtr
+  have hEncI : Type.encodeM (M := M) u32MrTy vInt =
+      .ok ((leBytes bits 4).map (fun b => .Init b none)) :=
+    encodeIntM_intFromBits u32 (by decide) bits hBits
+  have hDecI : Type.decodeM (M := M) u32MrTy ((leBytes bits 4).map (fun b => .Init b none)) =
+      .ok (some vInt) :=
+    decodeIntM_leBytes u32 (by decide) bits hBits
+  have hLenI : ((leBytes bits 4).map
+      (fun b => (AbstractByte.Init b none : AbstractByte (Gen.Memory.Provenance M)))).length = 4 := by
+    rw [List.length_map, leBytes_length]
+  have hChkI : checkValueM (M := M) vInt u32MrTy m = .ok () :=
+    checkValueM_int_of_inBounds (intFromBits bits u32) u32 m
+      (inBounds_intFromBits_cf u32 (by decide) bits hBits)
+  have hRoundI :=
+    transmuteM_binderWrapper_roundtrip (M := M) u32MrTy ⟨4⟩ ⟨4⟩ vInt _ m rfl rfl hEncI hLenI
+      hDecI hChkI
+  have hEncP : Type.encodeM (M := M) thinRawPtrTy vPtr =
+      .ok (encodePtrBytesM (M := M) prov 0 (leBytes addr 8)) := by
+    simp only [thinRawPtrTy, Type.encodeM, PtrType.as_wide_pair, PtrType.meta_kind,
+      vPtr, ThinPointer.widen]
+    exact encodePtrM_eq addr hAddr prov
+  have hDecP : Type.decodeM (M := M) thinRawPtrTy
+      (encodePtrBytesM (M := M) prov 0 (leBytes addr 8)) = .ok (some vPtr) := by
+    simp only [thinRawPtrTy, Type.decodeM, PtrType.as_wide_pair, PtrType.meta_kind,
+      vPtr, ThinPointer.widen]
+    rw [decodePtrM_encodePtrBytesM addr hAddr prov, ok_bind]
+    rfl
+  have hLenP : (encodePtrBytesM (M := M) prov 0 (leBytes addr 8)).length = 8 := by
+    rw [encodePtrBytesM_length, leBytes_length]
+  have hChkP : checkValueM (M := M) vPtr thinRawPtrTy m = .ok () :=
+    checkValueM_thinRawPtr_of_inBounds (addr : Int) prov m (inBounds_usize_cf addr hAddr)
+  have hRoundP :=
+    transmuteM_binderWrapper_roundtrip (M := M) thinRawPtrTy ⟨8⟩ ⟨8⟩ vPtr _ m layout_thinRawPtr
+      rfl hEncP hLenP hDecP hChkP
+  exact ⟨hRoundI.2.2.1, hRoundI.2.2.2, hRoundP.2.2.1, hRoundP.2.2.2⟩
+
 theorem minirust_evalPlaceM_binderWrapper_field0
     {M : Type} [Gen.Memory M] [MemoryOps M]
     (m m1 : Machine M) (base : Gen.PlaceExpr) (place : Gen.Place M)
@@ -2461,16 +3350,22 @@ theorem minirust_evalPlaceM_binderWrapper_field0
 
 def c9BinderReadWriteMir : MirAst.CapturedMir :=
   mkMirBody "ep2::c9_binder_rw"
-    [mkDecl u32MirTy, mkDecl u32MirTy, mkDecl rawMutU32MirTy, mkDecl usizeMirTy,
+    [mkDecl u32MirTy, mkDecl u32MirTy, mkDecl rawMutU32MirTy, mkDecl rawMutU32MirTy,
      mkDecl rawConstSliceU32MirTy] 1
     [mkBb
       [mkSt (.storageLive 2),
+       mkSt (.storageLive 3),
+       -- Write & Copy through .unwrapUnsafeBinder on local 1
        mkSt (.assign (locPlace 1 [.unwrapUnsafeBinder u32MirTy]) (.use (constU32 55))),
        mkSt (.assign (locPlace 0) (.use (.copy (locPlace 1 [.unwrapUnsafeBinder u32MirTy])))),
-       mkSt (.assign (locPlace 2) (.rawPtr .mut (locPlace 1))),
-       mkSt (.assign (locPlace 2 [.deref, .unwrapUnsafeBinder u32MirTy]) (.use (constU32 88))),
+       -- Move via .unwrapUnsafeBinder BEFORE .deref (`_3 = move (_2.unwrap)`)
+       mkSt (.assign (locPlace 2)
+         (.rawPtr .mut (locPlace 1 [.unwrapUnsafeBinder u32MirTy]))),
+       mkSt (.assign (locPlace 3) (.use (.move (locPlace 2 [.unwrapUnsafeBinder rawMutU32MirTy])))),
+       -- Deref followed by .unwrapUnsafeBinder (`(*_3).unwrap = 88`)
+       mkSt (.assign (locPlace 3 [.deref, .unwrapUnsafeBinder u32MirTy]) (.use (constU32 88))),
        mkSt (.assign (locPlace 0)
-         (.use (.copy (locPlace 2 [.deref, .unwrapUnsafeBinder u32MirTy]))))]
+         (.use (.move (locPlace 3 [.deref, .unwrapUnsafeBinder u32MirTy]))))]
       .return_]
 
 def c9BinderMrFn : Gen.Function :=
@@ -2512,22 +3407,26 @@ def c9BinderMach (local1Live : Bool := true) : Mach :=
 `Rvalue.len` via `splitLastDeref?`) and dead-local UB witness across Trusted,
 `Mach`, and `MachTB`. -/
 theorem c9_unwrapUnsafeBinder_three_way_len_and_ub_witness :
-    let sliceLenPlace : MirAst.Place :=
+    let sliceLenPlaceAfter : MirAst.Place :=
       locPlace 0 [.deref, .unwrapUnsafeBinder { kind := .slice (.uint .u32), layoutIdx := 0 }]
+    let sliceLenPlaceBefore : MirAst.Place :=
+      locPlace 0 [.unwrapUnsafeBinder rawConstSliceU32MirTy, .deref]
     let sliceMem := (initMachineState c9BinderReadWriteMir []).memory
     let sliceLocs : List LocalSlot :=
       [.init (annealWidePtrVal { allocId := 9, offsetBytes := 0 } 4 8)]
-    runAVal c9BinderReadWriteMir 10 (initMachineState c9BinderReadWriteMir [.scalar ⟨10, 4⟩]) =
+    runAVal c9BinderReadWriteMir 12 (initMachineState c9BinderReadWriteMir [.scalar ⟨10, 4⟩]) =
       some (.scalar ⟨88, 4⟩) ∧
     (∃ m5, Interp.steps 5 (c9BinderMach true) = .ok m5 ∧
       m5.mem.memory.allocations[0]?.map (·.data) = some (scalarBytes u32 88)) ∧
     (∃ m5, Interp.stepsTB 5 (liftMachToTB (c9BinderMach true)) = .ok m5 ∧
       m5.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB) =
         some ((scalarBytes u32 88).map (projByteTB ∘ liftByteTB))) ∧
-    evalRvalue sliceLocs (.len sliceLenPlace) sliceMem [mkDecl rawConstSliceU32MirTy]
+    evalRvalue sliceLocs (.len sliceLenPlaceAfter) sliceMem [mkDecl rawConstSliceU32MirTy]
+      emptyLayoutTable = .ok (.scalar ⟨4, 8⟩) sliceLocs sliceMem ∧
+    evalRvalue sliceLocs (.len sliceLenPlaceBefore) sliceMem [mkDecl rawConstSliceU32MirTy]
       emptyLayoutTable = .ok (.scalar ⟨4, 8⟩) sliceLocs sliceMem ∧
     stepMirFn c9BinderReadWriteMir
-      { frame := { blockIdx := 0, stmtIdx := 1,
+      { frame := { blockIdx := 0, stmtIdx := 2,
                    locals := [.uninit, .dead, .uninit, .uninit, .uninit] }
         memory := sliceMem } = MirStepNode.fail .ub ∧
     Interp.step (c9BinderMach false) = .error (.ub "access to a dead local") ∧
@@ -2535,7 +3434,7 @@ theorem c9_unwrapUnsafeBinder_three_way_len_and_ub_witness :
   ⟨rfl,
    ok_of_map_toOption (by decide +kernel),
    ok_of_map_toOption (by decide +kernel),
-   rfl, rfl,
+   rfl, rfl, rfl,
    eq_error_ub_of_interpUbMsg (by decide +kernel),
    eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
 
@@ -2563,7 +3462,30 @@ theorem closure_zst_lockstep_M
     evalValueM m (.Tuple [] unitType) = .ok ((.Tuple [], unitType), m) :=
   ⟨rfl, rfl⟩
 
-/-- **C10.2 Universal Multi-Capture Closure Left-to-Right Evaluation & UB Law
+/-- **C10.2 Universal `n`-Capture Closure Inductive Lockstep Law (`Mach` &
+`MachTB`)**:
+For ANY number `n` of captured upvars (`ops` ↔ `es`), left-to-right operand
+evaluation in `evalRvalue ... (.aggregate (.closure dp) ops)` and MiniRust
+`evalValueM ... (.Tuple es mrClTy)` steps in exact lockstep on EVERY `Machine M`
+(`Mach` and `MachTB`). -/
+theorem closure_n_capture_lockstep_M
+    {M : Type} [Gen.Memory M] [MemoryOps M]
+    (locals locals' : List LocalSlot) (dp : DefPath) (ops : List MirAst.Operand)
+    (vals : List MirSemantics.Value)
+    (mem : MirSemantics.Memory) (decls : List MirAst.LocalDecl) (layouts : LayoutTable)
+    (m m' : Machine M) (es : List Gen.ValueExpr) (mvals : List (Gen.Value M))
+    (mrClTy : Gen.Type)
+    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals decls
+      mem.callStack = .ok vals locals')
+    (hEs : evalValuesM m es = .ok (mvals, m')) :
+    evalRvalue locals (.aggregate (.closure dp) ops) mem decls layouts =
+      .ok (.aggregate 0 vals) locals' mem ∧
+    evalValueM m (.Tuple es mrClTy) = .ok ((.Tuple mvals, mrClTy), m') := by
+  constructor
+  · simp only [evalRvalue, hOps]
+  · simp only [evalValueM, hEs, bind, Except.bind, pure, Except.pure]
+
+/-- **C10.3 Universal Two-Capture Closure Left-to-Right Evaluation & UB Law
 (`Mach` & `MachTB`)**. -/
 theorem closure_two_capture_ltr_and_ub_M
     {M : Type} [Gen.Memory M] [MemoryOps M]
@@ -2637,10 +3559,11 @@ def c10CapMrFn : Gen.Function :=
           (.Tuple [.Load (.Local (localName 1)), .Load (.Local (localName 2))] mrClosureCapTy)],
        .Return, .Regular⟩)]
 
-def c10CapMach (local2Live : Bool := true) : Mach :=
+def c10CapMach (local2Live : Bool := true) (local1Init : Bool := true) : Mach :=
   let prog := mkMrProg [(fnName 0, c10CapMrFn)]
   let a0 := mkStackAlloc 128 (List.replicate 16 .Uninit) 8
-  let a1 := mkStackAlloc 256 (scalarBytes u32 7) 4
+  let a1 := mkStackAlloc 256
+    (if local1Init then scalarBytes u32 7 else List.replicate 4 .Uninit) 4
   let a2 := mkStackAlloc 384 (List.replicate 8 .Uninit) 8
   let locs : List (Gen.LocalName × Ptr) :=
     if local2Live then
@@ -2652,7 +3575,8 @@ def c10CapMach (local2Live : Bool := true) : Mach :=
        (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) })]
   let fr : Frame :=
     { func := c10CapMrFn, locals := ⟨locs⟩, stack_pop_action := .BottomOfStack,
-      next_block := bbName 0, next_stmt := if local2Live then 0 else 1, extra := () }
+      next_block := bbName 0, next_stmt := if local2Live && local1Init then 0 else 1,
+      extra := () }
   mkMrMach prog [a0, a1, a2] [fr]
 
 def c10ZstMach : Mach :=
@@ -2671,7 +3595,8 @@ def c10ExpectedCapBytes : List Byte :=
 /-- Concrete C10 witnesses across Trusted, `Mach`, and `MachTB`:
 1. 0-capture ZST closure (`[]`).
 2. 2-capture `(u32(7), &raw const _1)` closure preserving scalar + provenance.
-3. Dead-upvar UB propagation on the 2nd captured operand. -/
+3. Dead-upvar UB propagation on the 2nd captured operand.
+4. Uninitialized-upvar UB propagation on the 1st captured operand. -/
 theorem c10_closure_zst_capture_and_ub_three_way_witness :
     runAVal c10ZstClosureMir 4 (initMachineState c10ZstClosureMir []) =
       some (.aggregate 0 []) ∧
@@ -2691,13 +3616,24 @@ theorem c10_closure_zst_capture_and_ub_three_way_witness :
                    locals := [.uninit, .init (.scalar ⟨7, 4⟩), .dead] }
         memory := (initMachineState c10CapClosureMir []).memory } = MirStepNode.fail .ub ∧
     Interp.step (c10CapMach false) = .error (.ub "access to a dead local") ∧
-    Interp.stepTB (liftMachToTB (c10CapMach false)) = .error (.ub "access to a dead local") :=
+    Interp.stepTB (liftMachToTB (c10CapMach false)) = .error (.ub "access to a dead local") ∧
+    stepMirFn c10CapClosureMir
+      { frame := { blockIdx := 0, stmtIdx := 2,
+                   locals := [.uninit, .uninit, .init (.ptr { allocId := 1, offsetBytes := 0 } 8)] }
+        memory := (initMachineState c10CapClosureMir []).memory } = MirStepNode.fail .ub ∧
+    Interp.step (c10CapMach true false) =
+      .error (.ub "load at type but the data in memory violates the language invariant") ∧
+    Interp.stepTB (liftMachToTB (c10CapMach true false)) =
+      .error (.ub "load at type but the data in memory violates the language invariant") :=
   ⟨rfl,
    ok_of_map_toOption (by decide +kernel),
    ok_of_map_toOption (by decide +kernel),
    rfl,
    ok_of_map_toOption (by decide +kernel),
    ok_of_map_toOption (by decide +kernel),
+   rfl,
+   eq_error_ub_of_interpUbMsg (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel),
    rfl,
    eq_error_ub_of_interpUbMsg (by decide +kernel),
    eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
@@ -2744,7 +3680,13 @@ elab "#assert_unwind_setdiscr_mr_standard_axioms" : command => do
      ``decodeIntM_leBytes,
      ``transmuteM_int_sameSize,
      ``transmuteM_u32_to_i32,
-     ``transmuteM_u8_to_bool]
+     ``transmuteM_u8_to_bool,
+     ``encodeWideSliceRawPtrM_eq,
+     ``decodeWideSliceRawPtrM_eq,
+     ``transmuteM_wideSliceRawPtr_id,
+     ``evalCastOpM_transmute_wideSliceRawPtr_id,
+     ``transmuteM_binderWrapper_roundtrip,
+     ``transmuteM_binderWrapper_u32_and_thinPtr]
   for c in choiceFreeCodecs do
     let axs ← liftCoreM <| Lean.collectAxioms c
     if axs.contains ``Classical.choice then
