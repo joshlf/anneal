@@ -56,9 +56,10 @@ Complete, kernel-checked, `Classical.choice`-free theory covering:
 | `MiriRetagPolicyMirror.create` | `Miri.TreeBorrows.RetagPolicy.create` (`NewPermission::new`) |
 | `stepNodeOnRangeRead` / `stepNodeOnRangeWrite` | `Miri.TreeBorrows.performAccess` + `Tree.LocationState.performAccess` (incl. `accessed`) |
 | `execFnEntryMutRetagSourceOrder` / `execFnEntryMutRetagPrunedSourceOrder` | `Miri.TreeBorrows.RetagPipeline` (`accessTreeForReborrow`) over `TraversalTree.traverse` + `NormalTreeState.performAccess` (`SkipSelfAndChildren`) |
-| `foreignVisitScheduleNodes`, `execFnEntryMutRetagTraversalOrder` | `TraversalTree.initialForeignRoots` + `foreignPostorder` (`foreignEvents` visit order) |
+| `foreignVisitScheduleNodes`, `execFnEntryMutRetagTraversalOrder`, `execFnEntryMutRetagTraversalOrderDirect` | `TraversalTree.initialForeignRoots` + `foreignPostorder` (`foreignEvents` visit order; exact standalone equivalence on `BorrowTreeRootedWF`) |
+| `IdempotentForeignAccess`, `sifa_foreign_transition_idempotent` | `Miri.TreeBorrows.IdempotentForeignAccess` + `LocationState.skipIfKnownNoop` SIFA soundness |
 | `RetagStepErr.protectedReservedIMInvariant` | `AccessOutcome.ImpossibleProtectedReservedIM` / `NormalAccessStatus.PermissionInvariantFailure` (not UB) |
-| `KeyedAllocWorld.checkPtrAccess` | `Miri.Memory.sizeAsI64` + `checkAndDerefPtr` via `ValidityMachine.checkPointerAccessResult` |
+| `KeyedAllocWorld.checkPtrAccess`, `LinearAllocWorld.checkPtrAccess` | `Miri.Memory.sizeAsI64` + `checkAndDerefPtr` via `ValidityMachine.checkPointerAccessResult` |
 | `checkNestedWideSafeRefChildSession`, `dynSizeAlign` | `ValidityVisitor.checkSafe` on wide places (`checkMetadata`, `size_and_align_of_val`) |
 | `VTableData.layoutConsistent`, `validateWideDynSafePtrDeep` | `get_vtable_size_and_align` (`layout_of` the concrete type) + `validatePlace … recursive` |
 | `validateSafeThinRef`, `validateWideDynSafePtr` | `Miri.Interpreter.ValidityVisitor.checkSafe` |
@@ -68,13 +69,15 @@ Complete, kernel-checked, `Classical.choice`-free theory covering:
 Honest scope: Miri's `extra_fn_ptr_map` / va-list tables, export-ID tables, and wildcard provenance are
 not modeled; the machine hook has no memory side effects beyond the race-clock detach; borrow-tree nodes
 carry one coarse byte range (no per-byte lazy permissions, so the `SkipSelfAndChildren` pruning of
-Models 4 and 5 is decided per node rather than per location, and the SIFA cache is not modeled); the
-`execFnEntryMutRetag*` models cover `&mut` / `Box` parameters only (upstream mints `.frozen` / `.cell`
-children for shared references, see `fnEntry_shared_childPerms_outside_mut_models`); Models 1-4 blame the
-first failing FOREIGN node in list order and only Model 5 follows the upstream visit order; allocations
-carry no base addresses, so nested `dyn` vtable words are resolved through an explicit `vtBase` map
-(`validateWideDynSafePtrDeep`) and fail closed without one; and only `.static` / `.memory` globals carry
-a byte payload.
+Models 4 and 5 is decided per node rather than per location, while SIFA cache soundness is proved at the
+per-node transition layer); the `execFnEntryMutRetag*` models cover `&mut` / `Box` parameters only
+(upstream mints `.frozen` / `.cell` children for shared references, see
+`fnEntry_shared_childPerms_outside_mut_models`); Models 1-4 blame the first failing FOREIGN node in list
+order whereas Model 5 and standalone `execFnEntryMutRetagTraversalOrderDirect` follow upstream reverse-
+children postorder (proved identical with no fallback on every `BorrowTreeRootedWF` tree); allocations
+carry no base addresses, so nested `dyn` vtable words are resolved through an explicit non-zero `vtBase`
+map (`validateWideDynSafePtrDeep`) and fail closed without one; and only `.static` / `.memory` globals
+carry a byte payload.
 -/
 
 namespace Anneal.ExtTreeMapAllocAndNoWritable
@@ -2715,6 +2718,41 @@ theorem keyedReserveAllocId_ok_inv {w w' : KeyedAllocWorld} {id : MiriAllocId}
         have hcon' : (w.hasIssued id' || w.containsId id') = false := by simpa using hcon
         rw [Bool.or_eq_false_iff] at hcon'
         exact ⟨by simpa using hexh, hof, hcon'.1, hcon'.2, hw.symm⟩
+
+/-- Post-state characterization of `KeyedAllocWorld.allocate` on success (ergonomic bridge for Episode 2
+`LeanMiriSpec` allocation correspondence): the returned ID was freshly reserved, is now live with
+`entry`, and all unrelated live/dead/global/race entries are preserved unchanged. -/
+theorem keyedAllocate_ok_inv {w w' : KeyedAllocWorld} {entry : LiveAllocEntry} {id : MiriAllocId}
+    (h : w.allocate entry = (w', .ok id)) :
+    w.hasIssued id = false ∧ w.containsId id = false ∧
+    w'.hasIssued id = true ∧ w'.findLive? id = some entry ∧
+    (∀ k, k ≠ id → w'.findLive? k = w.findLive? k) ∧
+    (∀ k, w'.findDead? k = w.findDead? k) ∧
+    (∀ k, w'.findGlobal? k = w.findGlobal? k) ∧
+    (∀ k, w'.findRace? k = w.findRace? k) := by
+  unfold KeyedAllocWorld.allocate at h
+  cases hres : w.reserveAllocId with
+  | mk w1 r =>
+    rw [hres] at h
+    cases r with
+    | error e => simp at h
+    | ok id' =>
+      simp only at h
+      injection h with hw hres
+      injection hres with hid
+      subst hid
+      subst hw
+      rcases keyedReserveAllocId_ok_inv hres with ⟨_, _, hfresh, hnotIn, hw1⟩
+      subst hw1
+      refine ⟨hfresh, hnotIn, ?_, ?_, ?_, ?_, ?_, ?_⟩
+      · simp [KeyedAllocWorld.hasIssued, KeyedAllocWorld.insertLive,
+          ExtTreeMap0.contains_eq_isSome_get?, ExtTreeMap0.get?_insert_self]
+      · simp [KeyedAllocWorld.findLive?, KeyedAllocWorld.insertLive, ExtTreeMap0.get?_insert_self]
+      · intro k hk
+        simp [KeyedAllocWorld.findLive?, KeyedAllocWorld.insertLive, ExtTreeMap0.get?_insert_ne _ _ hk]
+      · intro k; rfl
+      · intro k; rfl
+      · intro k; rfl
 
 theorem keyedReserveAllocId_of_highWater (w : KeyedAllocWorld) (id : MiriAllocId)
     (hnotExh : w.idSupplyExhausted = false)
@@ -6505,6 +6543,1255 @@ theorem execFnEntryMutRetagTraversalOrder_foreignErrorTag_separation :
       .error (.protectedForeignConflict 3) := by
   exact ⟨rfl, rfl, rfl, rfl, rfl⟩
 
+/-! #### Rooted-Tree Schedule Completeness, Standalone Model 5, & SIFA (`IdempotentForeignAccess`) -/
+
+/-- Depth-bounded reachability of `rootTag` along `parentTag` links in `nodes`. -/
+inductive ReachesRoot (nodes : List TreeTagNode) (rootTag : Nat) : Nat → Nat → Prop where
+  | root (r : TreeTagNode) (hr : findNode? nodes rootTag = some r) (hpar : r.parentTag = none) :
+      ReachesRoot nodes rootTag 0 rootTag
+  | step (d t p : Nat) (n : TreeTagNode)
+      (hn : findNode? nodes t = some n) (hpar : n.parentTag = some p)
+      (hprev : ReachesRoot nodes rootTag d p) :
+      ReachesRoot nodes rootTag (d + 1) t
+
+/-- Well-formed rooted borrow tree: tags are unique (`tagsNodup`) and every node in `w.nodes`
+reaches the unique root `rootTag` along `parentTag` links in `< w.nodes.length` steps. -/
+structure BorrowTreeRootedWF (w : FnEntryBorrowWorld) (rootTag : Nat) : Prop where
+  tagsNodup : (w.nodes.map (·.tag)).Nodup
+  reachesRoot : ∀ n ∈ w.nodes, ∃ d < w.nodes.length, ReachesRoot w.nodes rootTag d n.tag
+
+private theorem mem_of_findNode?_eq_some {nodes : List TreeTagNode} {t : Nat} {n : TreeTagNode}
+    (h : findNode? nodes t = some n) : n ∈ nodes ∧ n.tag = t := by
+  induction nodes with
+  | nil => simp [findNode?] at h
+  | cons m rest ih =>
+    simp only [findNode?, List.find?] at h
+    cases hbeq : (m.tag == t) with
+    | true =>
+      rw [hbeq] at h
+      injection h with hmn
+      subst hmn
+      exact ⟨List.mem_cons_self .., eq_of_beq hbeq⟩
+    | false =>
+      rw [hbeq] at h
+      rcases ih h with ⟨hm, ht⟩
+      exact ⟨List.mem_cons_of_mem _ hm, ht⟩
+
+private theorem findNode?_eq_some_of_mem_of_nodup {nodes : List TreeTagNode}
+    (hnodup : (nodes.map (·.tag)).Nodup) {n : TreeTagNode} (hn : n ∈ nodes) :
+    findNode? nodes n.tag = some n := by
+  induction nodes with
+  | nil => cases hn
+  | cons m rest ih =>
+    simp only [List.map_cons, List.nodup_cons] at hnodup
+    rcases hnodup with ⟨hnotMem, hnodupRest⟩
+    simp only [findNode?, List.find?]
+    cases hn with
+    | head =>
+      simp
+    | tail _ hmem =>
+      have hne : m.tag ≠ n.tag := fun heq =>
+        hnotMem (heq ▸ List.mem_map.2 ⟨n, hmem, rfl⟩)
+      have hb : (m.tag == n.tag) = false := beq_false_of_ne hne
+      rw [hb]
+      exact ih hnodupRest hmem
+
+private theorem eq_of_mem_tag_eq_of_nodup {nodes : List TreeTagNode}
+    (hnodup : (nodes.map (·.tag)).Nodup) {n₁ n₂ : TreeTagNode}
+    (h₁ : n₁ ∈ nodes) (h₂ : n₂ ∈ nodes) (ht : n₁.tag = n₂.tag) : n₁ = n₂ := by
+  have hf₁ := findNode?_eq_some_of_mem_of_nodup hnodup h₁
+  have hf₂ := findNode?_eq_some_of_mem_of_nodup hnodup h₂
+  rw [ht] at hf₁
+  rw [hf₁] at hf₂
+  injection hf₂
+
+private theorem reachesRoot_depth_unique {nodes : List TreeTagNode} {rootTag d₁ d₂ t : Nat}
+    (h₁ : ReachesRoot nodes rootTag d₁ t) (h₂ : ReachesRoot nodes rootTag d₂ t) : d₁ = d₂ := by
+  induction h₁ generalizing d₂ with
+  | root r hr hpar =>
+    cases h₂ with
+    | root => rfl
+    | step _ _ p n hn hpar' _ =>
+      rw [hr] at hn
+      injection hn with hEq
+      subst hEq
+      rw [hpar] at hpar'
+      cases hpar'
+  | step d t p n hn hpar hprev ih =>
+    cases h₂ with
+    | root r hr hpar' =>
+      rw [hr] at hn
+      injection hn with hEq
+      subst hEq
+      rw [hpar] at hpar'
+      cases hpar'
+    | step d' _ p' n' hn' hpar' hprev' =>
+      rw [hn] at hn'
+      injection hn' with hEq
+      subst hEq
+      rw [hpar] at hpar'
+      injection hpar' with hp
+      subst hp
+      exact congrArg (· + 1) (ih hprev')
+
+private theorem ancestorPathTagsAux_fuel_irrel {nodes : List TreeTagNode} {rootTag d t : Nat}
+    (h : ReachesRoot nodes rootTag d t) :
+    ∀ f₁ f₂, f₁ ≥ d → f₂ ≥ d → ancestorPathTagsAux nodes f₁ t = ancestorPathTagsAux nodes f₂ t := by
+  induction h with
+  | root r hr hpar =>
+    intro f₁ f₂ _ _
+    cases f₁ <;> cases f₂ <;> simp [ancestorPathTagsAux, hr, hpar]
+  | step d t p n hn hpar hprev ih =>
+    intro f₁ f₂ hf₁ hf₂
+    cases f₁ with
+    | zero => exact False.elim (Nat.not_succ_le_zero d hf₁)
+    | succ f₁' =>
+      cases f₂ with
+      | zero => exact False.elim (Nat.not_succ_le_zero d hf₂)
+      | succ f₂' =>
+        simp only [ancestorPathTagsAux, hn, hpar]
+        exact congrArg (t :: ·) (ih f₁' f₂' (by omega) (by omega))
+
+private theorem root_mem_ancestorPathTagsAux {nodes : List TreeTagNode} {rootTag d t : Nat}
+    (h : ReachesRoot nodes rootTag d t) :
+    ∀ fuel ≥ d, rootTag ∈ ancestorPathTagsAux nodes fuel t := by
+  induction h with
+  | root r hr hpar =>
+    intro fuel _
+    cases fuel <;> simp [ancestorPathTagsAux, hr, hpar]
+  | step d t p n hn hpar hprev ih =>
+    intro fuel hf
+    cases fuel with
+    | zero => exact False.elim (Nat.not_succ_le_zero d hf)
+    | succ f' =>
+      simp only [ancestorPathTagsAux, hn, hpar]
+      exact List.mem_cons_of_mem _ (ih f' (by omega))
+
+private theorem mem_ancestorPathTagsAux_reachesRoot_le {nodes : List TreeTagNode} {rootTag d t : Nat}
+    (h : ReachesRoot nodes rootTag d t) :
+    ∀ fuel ≥ d, ∀ a ∈ ancestorPathTagsAux nodes fuel t,
+      ∃ da ≤ d, ReachesRoot nodes rootTag da a := by
+  induction h with
+  | root r hr hpar =>
+    intro fuel _ a ha
+    have hEq : ancestorPathTagsAux nodes fuel rootTag = [rootTag] := by
+      cases fuel <;> simp [ancestorPathTagsAux, hr, hpar]
+    rw [hEq] at ha
+    simp only [List.mem_singleton] at ha
+    subst ha
+    exact ⟨0, Nat.le_refl 0, ReachesRoot.root r hr hpar⟩
+  | step d t p n hn hpar hprev ih =>
+    intro fuel hf a ha
+    cases fuel with
+    | zero => exact False.elim (Nat.not_succ_le_zero d hf)
+    | succ f' =>
+      simp only [ancestorPathTagsAux, hn, hpar, List.mem_cons] at ha
+      rcases ha with rfl | htail
+      · exact ⟨d + 1, Nat.le_refl _, ReachesRoot.step d a p n hn hpar hprev⟩
+      · rcases ih f' (by omega) a htail with ⟨da, hda, hra⟩
+        exact ⟨da, by omega, hra⟩
+
+private theorem parent_mem_ancestorPathTagsAux_of_mem {nodes : List TreeTagNode} {rootTag d t : Nat}
+    (h : ReachesRoot nodes rootTag d t) :
+    ∀ fuel ≥ d, ∀ a n p, a ∈ ancestorPathTagsAux nodes fuel t →
+      findNode? nodes a = some n → n.parentTag = some p → p ∈ ancestorPathTagsAux nodes fuel t := by
+  induction h with
+  | root r hr hpar =>
+    intro fuel _ a n p ha hfn hnp
+    have hEq : ancestorPathTagsAux nodes fuel rootTag = [rootTag] := by
+      cases fuel <;> simp [ancestorPathTagsAux, hr, hpar]
+    rw [hEq] at ha
+    simp only [List.mem_singleton] at ha
+    subst ha
+    rw [hr] at hfn
+    injection hfn with hEqn
+    subst hEqn
+    rw [hpar] at hnp
+    cases hnp
+  | step d t p0 n0 hn0 hpar0 hprev ih =>
+    intro fuel hf a n p ha hfn hnp
+    cases fuel with
+    | zero => exact False.elim (Nat.not_succ_le_zero d hf)
+    | succ f' =>
+      simp only [ancestorPathTagsAux, hn0, hpar0, List.mem_cons] at ha ⊢
+      rcases ha with rfl | htail
+      · rw [hn0] at hfn
+        injection hfn with hEqn
+        subst hEqn
+        rw [hpar0] at hnp
+        injection hnp with hp
+        subst hp
+        right
+        have hh := ancestorPathTagsAux_head nodes f' p0
+        cases hlist : ancestorPathTagsAux nodes f' p0 with
+        | nil => rw [hlist] at hh; cases hh
+        | cons x xs =>
+          rw [hlist] at hh
+          injection hh with hx
+          subst hx
+          exact List.mem_cons_self ..
+      · right
+        exact ih f' (by omega) a n p htail hfn hnp
+
+private theorem mem_childTagsInListOrder_iff (nodes : List TreeTagNode) (p c : Nat) :
+    c ∈ childTagsInListOrder nodes p ↔ ∃ n ∈ nodes, n.parentTag = some p ∧ n.tag = c := by
+  unfold childTagsInListOrder
+  simp only [List.mem_map, List.mem_filter, beq_iff_eq]
+  constructor
+  · rintro ⟨n, ⟨hn, hpar⟩, rfl⟩
+    exact ⟨n, hn, hpar, rfl⟩
+  · rintro ⟨n, hn, hpar, rfl⟩
+    exact ⟨n, ⟨hn, hpar⟩, rfl⟩
+
+private theorem mem_initialForeignRootTags_of_parent_mem (childrenOf : Nat → List Nat)
+    (anc : List Nat) (p c : Nat) (prev : Option Nat)
+    (hc : c ∈ childrenOf p) (hp : p ∈ anc) (hcNotAnc : c ∉ anc) (hprev : prev ≠ some c) :
+    c ∈ initialForeignRootTags childrenOf anc prev := by
+  induction anc generalizing prev with
+  | nil => cases hp
+  | cons cur rest ih =>
+    simp only [initialForeignRootTags, List.mem_append, List.mem_filter, List.mem_reverse]
+    cases hp with
+    | head =>
+      left
+      exact ⟨hc, bne_iff_ne.2 hprev⟩
+    | tail _ hrest =>
+      right
+      have hneCur : c ≠ cur := fun h => hcNotAnc (h ▸ List.mem_cons_self ..)
+      have hcNotRest : c ∉ rest := fun h => hcNotAnc (List.mem_cons_of_mem _ h)
+      exact ih (some cur) hrest hcNotRest (fun h => hneCur (by injection h with h'; exact h'.symm))
+
+private theorem initialForeignRootTags_sound_of_reachesRoot {nodes : List TreeTagNode}
+    (hnodup : (nodes.map (·.tag)).Nodup) {rootTag d start : Nat}
+    (h : ReachesRoot nodes rootTag d start) :
+    ∀ fuel ≥ d, ∀ prev : Option Nat,
+      (∀ a, prev = some a → ∃ na, findNode? nodes a = some na ∧ na.parentTag = some start) →
+      ∀ r ∈ initialForeignRootTags (childTagsInListOrder nodes) (ancestorPathTagsAux nodes fuel start) prev,
+        ∃ rn ∈ nodes, rn.tag = r ∧
+          r ∉ ancestorPathTagsAux nodes fuel start ∧
+          prev ≠ some r ∧
+          ∃ q ∈ ancestorPathTagsAux nodes fuel start, rn.parentTag = some q := by
+  induction h with
+  | root r0 hr0 hpar0 =>
+    intro fuel _ prev _ r hr
+    have hEq : ancestorPathTagsAux nodes fuel rootTag = [rootTag] := by
+      cases fuel <;> simp [ancestorPathTagsAux, hr0, hpar0]
+    rw [hEq] at hr ⊢
+    simp only [initialForeignRootTags, List.append_nil, List.mem_filter, List.mem_reverse] at hr
+    rcases hr with ⟨hc, hne⟩
+    rcases (mem_childTagsInListOrder_iff nodes rootTag r).1 hc with ⟨rn, hrn, hrnPar, hrnTag⟩
+    have hrNeRoot : r ≠ rootTag := by
+      intro heq
+      subst heq
+      have hf := findNode?_eq_some_of_mem_of_nodup hnodup hrn
+      rw [hrnTag, hr0] at hf
+      injection hf with hEqn
+      subst hEqn
+      rw [hpar0] at hrnPar
+      cases hrnPar
+    exact ⟨rn, hrn, hrnTag, by simp [hrNeRoot], bne_iff_ne.1 hne, rootTag, List.mem_cons_self .., hrnPar⟩
+  | step d t p n hn hpar hprev ih =>
+    intro fuel hf prev hprevSpec r hr
+    cases fuel with
+    | zero => exact False.elim (Nat.not_succ_le_zero d hf)
+    | succ f' =>
+      simp only [ancestorPathTagsAux, hn, hpar] at hr ⊢
+      simp only [initialForeignRootTags, List.mem_append, List.mem_filter, List.mem_reverse] at hr
+      rcases hr with ⟨hc, hnePrev⟩ | htail
+      · rcases (mem_childTagsInListOrder_iff nodes t r).1 hc with ⟨rn, hrn, hrnPar, hrnTag⟩
+        have hfnR : findNode? nodes r = some rn := by
+          rw [← hrnTag]; exact findNode?_eq_some_of_mem_of_nodup hnodup hrn
+        have hrrR : ReachesRoot nodes rootTag (d + 2) r :=
+          ReachesRoot.step (d + 1) r t rn hfnR hrnPar (ReachesRoot.step d t p n hn hpar hprev)
+        have hrNotAnc : r ∉ t :: ancestorPathTagsAux nodes f' p := by
+          intro hmem
+          rcases List.mem_cons.1 hmem with hrt | hinTail
+          · subst hrt
+            have hEqd := reachesRoot_depth_unique hrrR (ReachesRoot.step d r p n hn hpar hprev)
+            omega
+          · rcases mem_ancestorPathTagsAux_reachesRoot_le hprev f' (by omega) r hinTail with ⟨dr, hdr, hrr'⟩
+            have hEqd := reachesRoot_depth_unique hrrR hrr'
+            omega
+        exact ⟨rn, hrn, hrnTag, hrNotAnc, bne_iff_ne.1 hnePrev, t, List.mem_cons_self .., hrnPar⟩
+      · have hsomeSpec : ∀ a, some t = some a → ∃ na, findNode? nodes a = some na ∧ na.parentTag = some p := by
+          intro a ha
+          injection ha with ha'
+          subst ha'
+          exact ⟨n, hn, hpar⟩
+        rcases ih f' (by omega) (some t) hsomeSpec r htail with ⟨rn, hrn, hrnTag, hrNotTail, hneT, q, hq, hrnPar⟩
+        have hrNeT : r ≠ t := fun heq => hneT (congrArg some heq.symm)
+        have hprevNe : prev ≠ some r := by
+          intro heq
+          rcases hprevSpec r heq with ⟨na, hfna, hnapar⟩
+          have hrrA : ReachesRoot nodes rootTag (d + 2) r :=
+            ReachesRoot.step (d + 1) r t na hfna hnapar (ReachesRoot.step d t p n hn hpar hprev)
+          rcases mem_ancestorPathTagsAux_reachesRoot_le hprev f' (by omega) q hq with ⟨dq, hdq, hrrQ⟩
+          have hfnR : findNode? nodes r = some rn := by
+            rw [← hrnTag]; exact findNode?_eq_some_of_mem_of_nodup hnodup hrn
+          have hrrR : ReachesRoot nodes rootTag (dq + 1) r :=
+            ReachesRoot.step dq r q rn hfnR hrnPar hrrQ
+          have hEqd := reachesRoot_depth_unique hrrA hrrR
+          omega
+        refine ⟨rn, hrn, hrnTag, ?_, hprevNe, q, List.mem_cons_of_mem _ hq, hrnPar⟩
+        intro hmem
+        rcases List.mem_cons.1 hmem with rfl | hinTail
+        · exact hrNeT rfl
+        · exact hrNotTail hinTail
+
+private theorem foreignPostorderTags_mono (childrenOf : Nat → List Nat) (skip : Nat → Bool) :
+    ∀ {f₁ f₂ : Nat}, f₁ ≤ f₂ → ∀ {r t : Nat},
+      t ∈ foreignPostorderTags childrenOf skip f₁ r →
+      t ∈ foreignPostorderTags childrenOf skip f₂ r := by
+  intro f₁
+  induction f₁ with
+  | zero =>
+    intro _ _ _ _ ht
+    cases ht
+  | succ f₁' ih =>
+    intro f₂ hle r t ht
+    cases f₂ with
+    | zero => exact False.elim (Nat.not_succ_le_zero f₁' hle)
+    | succ f₂' =>
+      simp only [foreignPostorderTags] at ht ⊢
+      cases hs : skip r with
+      | true => rw [hs] at ht; simp at ht
+      | false =>
+        rw [hs] at ht
+        simp only [Bool.false_eq_true, ↓reduceIte, List.mem_append, List.mem_flatMap,
+          List.mem_reverse, List.mem_singleton] at ht ⊢
+        rcases ht with ⟨c, hc, htc⟩ | rfl
+        · left
+          exact ⟨c, hc, ih (by omega) htc⟩
+        · right; rfl
+
+private theorem mem_foreignPostorderTags_sound {w : FnEntryBorrowWorld} {rootTag parentTag : Nat}
+    (hwf : BorrowTreeRootedWF w rootTag) {dp : Nat}
+    (hdp : ReachesRoot w.nodes rootTag dp parentTag) (hdplt : dp < w.nodes.length)
+    (skip : Nat → Bool) :
+    ∀ fuel r,
+      r ∉ ancestorPathTags w.nodes parentTag →
+      (∀ a ∈ (ancestorPathTags w.nodes r).tail,
+        (ancestorPathTags w.nodes parentTag).contains a = false → skip a = false) →
+      ∀ t ∈ foreignPostorderTags (childTagsInListOrder w.nodes) skip fuel r,
+        t ∉ ancestorPathTags w.nodes parentTag ∧
+        skip t = false ∧
+        (∀ a ∈ (ancestorPathTags w.nodes t).tail,
+          (ancestorPathTags w.nodes parentTag).contains a = false → skip a = false) := by
+  intro fuel
+  induction fuel with
+  | zero =>
+    intro _ _ _ _ ht; cases ht
+  | succ fuel' ih =>
+    intro r hrNotAnc hrAncOk t ht
+    simp only [foreignPostorderTags] at ht
+    cases hsr : skip r with
+    | true => rw [hsr] at ht; simp at ht
+    | false =>
+      rw [hsr] at ht
+      simp only [Bool.false_eq_true, ↓reduceIte, List.mem_append, List.mem_flatMap,
+        List.mem_reverse, List.mem_singleton] at ht
+      rcases ht with ⟨c, hc, htc⟩ | rfl
+      · rcases (mem_childTagsInListOrder_iff w.nodes r c).1 hc with ⟨cn, hcn, hcnPar, hcnTag⟩
+        have hfnC : findNode? w.nodes c = some cn := by
+          rw [← hcnTag]; exact findNode?_eq_some_of_mem_of_nodup hwf.tagsNodup hcn
+        have hcNotAnc : c ∉ ancestorPathTags w.nodes parentTag := by
+          intro hmem
+          have hrInAnc := parent_mem_ancestorPathTagsAux_of_mem hdp (w.nodes.length + 1) (by omega)
+            c cn r hmem hfnC hcnPar
+          exact hrNotAnc hrInAnc
+        rcases hwf.reachesRoot cn hcn with ⟨dc, hdclt, hrrC⟩
+        rw [hcnTag] at hrrC
+        cases hrrC with
+        | root r' hr' hpar' =>
+          rw [hfnC] at hr'
+          injection hr' with hEq; subst hEq
+          rw [hcnPar] at hpar'; cases hpar'
+        | step dr' _ p' n' hn' hpar' hrrR =>
+          rw [hfnC] at hn'
+          injection hn' with hEq; subst hEq
+          rw [hcnPar] at hpar'
+          injection hpar' with hpEq; subst hpEq
+          have htailEq : (ancestorPathTags w.nodes c).tail = ancestorPathTags w.nodes r := by
+            unfold ancestorPathTags
+            simp only [ancestorPathTagsAux, hfnC, hcnPar, List.tail_cons]
+            exact ancestorPathTagsAux_fuel_irrel hrrR w.nodes.length (w.nodes.length + 1)
+              (by omega) (by omega)
+          have hcAncOk : ∀ a ∈ (ancestorPathTags w.nodes c).tail,
+              (ancestorPathTags w.nodes parentTag).contains a = false → skip a = false := by
+            intro a ha haNot
+            rw [htailEq] at ha
+            have hhead := ancestorPathTags_head w.nodes r
+            cases hlist : ancestorPathTags w.nodes r with
+            | nil => rw [hlist] at hhead; cases hhead
+            | cons x xs =>
+              rw [hlist] at hhead ha
+              injection hhead with hx; subst hx
+              rcases List.mem_cons.1 ha with rfl | hxs
+              · exact hsr
+              · exact hrAncOk a (by rw [hlist]; exact hxs) haNot
+          exact ih c hcNotAnc hcAncOk t htc
+      · exact ⟨hrNotAnc, hsr, hrAncOk⟩
+
+private theorem mem_foreignPostorderTags_complete {w : FnEntryBorrowWorld} {rootTag parentTag : Nat}
+    {dp : Nat} (hdp : ReachesRoot w.nodes rootTag dp parentTag) (hdplt : dp < w.nodes.length)
+    (skip : Nat → Bool) :
+    ∀ {d t : Nat}, ReachesRoot w.nodes rootTag d t → d < w.nodes.length →
+      t ∉ ancestorPathTags w.nodes parentTag →
+      (∀ a ∈ (ancestorPathTags w.nodes t).tail,
+        (ancestorPathTags w.nodes parentTag).contains a = false → skip a = false) →
+      ∀ {f x : Nat}, x ∈ foreignPostorderTags (childTagsInListOrder w.nodes) skip f t →
+        ∃ r ∈ initialForeignRootTags (childTagsInListOrder w.nodes) (ancestorPathTags w.nodes parentTag) none,
+          x ∈ foreignPostorderTags (childTagsInListOrder w.nodes) skip (f + d) r := by
+  intro d t hrr
+  induction hrr with
+  | root r0 hr0 hpar0 =>
+    intro _ hnotAnc _ _ _ _
+    exact False.elim (hnotAnc (root_mem_ancestorPathTagsAux hdp (w.nodes.length + 1) (by omega)))
+  | step d' t p n hn hpar hprev ih =>
+    intro hdlt htNotAnc htAncOk f x hx
+    rcases mem_of_findNode?_eq_some hn with ⟨hnMem, hnTag⟩
+    have htChildOfP : t ∈ childTagsInListOrder w.nodes p :=
+      (mem_childTagsInListOrder_iff w.nodes p t).2 ⟨n, hnMem, hpar, hnTag⟩
+    by_cases hpInAnc : p ∈ ancestorPathTags w.nodes parentTag
+    · refine ⟨t, ?_, ?_⟩
+      · exact mem_initialForeignRootTags_of_parent_mem (childTagsInListOrder w.nodes)
+          (ancestorPathTags w.nodes parentTag) p t none htChildOfP hpInAnc htNotAnc (by simp)
+      · exact foreignPostorderTags_mono (childTagsInListOrder w.nodes) skip (by omega) hx
+    · have htailEq : (ancestorPathTags w.nodes t).tail = ancestorPathTags w.nodes p := by
+        unfold ancestorPathTags
+        simp only [ancestorPathTagsAux, hn, hpar, List.tail_cons]
+        exact ancestorPathTagsAux_fuel_irrel hprev w.nodes.length (w.nodes.length + 1)
+          (by omega) (by omega)
+      have hpHead : p ∈ (ancestorPathTags w.nodes t).tail := by
+        rw [htailEq]
+        have hh := ancestorPathTags_head w.nodes p
+        cases hlist : ancestorPathTags w.nodes p with
+        | nil => rw [hlist] at hh; cases hh
+        | cons a as =>
+          rw [hlist] at hh
+          injection hh with ha; subst ha
+          exact List.mem_cons_self ..
+      have hpNotContains : (ancestorPathTags w.nodes parentTag).contains p = false := by
+        cases hcon : (ancestorPathTags w.nodes parentTag).contains p with
+        | false => rfl
+        | true => exact False.elim (hpInAnc (List.mem_of_elem_eq_true hcon))
+      have hskipP : skip p = false := htAncOk p hpHead hpNotContains
+      have hpAncOk : ∀ a ∈ (ancestorPathTags w.nodes p).tail,
+          (ancestorPathTags w.nodes parentTag).contains a = false → skip a = false := by
+        intro a ha haNot
+        have haInP : a ∈ ancestorPathTags w.nodes p := by
+          cases hlist : ancestorPathTags w.nodes p with
+          | nil => rw [hlist] at ha; cases ha
+          | cons b bs => rw [hlist] at ha; exact List.mem_cons_of_mem _ ha
+        exact htAncOk a (by rw [htailEq]; exact haInP) haNot
+      have hxInP : x ∈ foreignPostorderTags (childTagsInListOrder w.nodes) skip (f + 1) p := by
+        simp only [foreignPostorderTags, hskipP, Bool.false_eq_true, ↓reduceIte,
+          List.mem_append, List.mem_flatMap, List.mem_reverse]
+        left
+        exact ⟨t, htChildOfP, hx⟩
+      rcases ih (by omega) hpInAnc hpAncOk hxInP with ⟨r, hr, hxr⟩
+      refine ⟨r, hr, ?_⟩
+      have hfuel : f + 1 + d' = f + (d' + 1) := by omega
+      rwa [hfuel] at hxr
+
+/-- **Rooted-Tree Schedule Completeness & Soundness**: on every well-formed rooted borrow tree
+(`BorrowTreeRootedWF w rootTag`) containing `parentTag`, the upstream reverse-children postorder
+visit schedule `foreignVisitScheduleNodes (childTagsInListOrder w.nodes)` contains a node `n`
+**if and only if** `n ∈ w.nodes` is a non-ancestor foreign node that neither skips itself
+(`!foreignNodeSkipsSubtree`) nor sits under a skipped foreign ancestor (`!isPrunedForeignNode`). -/
+theorem mem_foreignVisitScheduleNodes_iff_activeForeign_of_rootedWF
+    {w : FnEntryBorrowWorld} {rootTag parentTag : Nat} (hwf : BorrowTreeRootedWF w rootTag)
+    {pNode : TreeTagNode} (hp : findNode? w.nodes parentTag = some pNode)
+    (isWrite : Bool) (off len : Nat) (n : TreeTagNode) :
+    n ∈ foreignVisitScheduleNodes (childTagsInListOrder w.nodes) w parentTag isWrite off len ↔
+      n ∈ w.nodes ∧
+      (ancestorPathTags w.nodes parentTag).contains n.tag = false ∧
+      foreignNodeSkipsSubtree isWrite off len n = false ∧
+      isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) isWrite off len n = false := by
+  rcases mem_of_findNode?_eq_some hp with ⟨hpMem, hpTag⟩
+  rcases hwf.reachesRoot pNode hpMem with ⟨dp, hdplt, hdp⟩
+  rw [hpTag] at hdp
+  let skip : Nat → Bool := fun t =>
+    match findNode? w.nodes t with
+    | some a => foreignNodeSkipsSubtree isWrite off len a
+    | none => false
+  have hpruned_iff : ∀ m ∈ w.nodes,
+      (ancestorPathTags w.nodes parentTag).contains m.tag = false →
+      (isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) isWrite off len m = false ↔
+        ∀ a ∈ (ancestorPathTags w.nodes m.tag).tail,
+          (ancestorPathTags w.nodes parentTag).contains a = false → skip a = false) := by
+    intro m _ hmNot
+    unfold isPrunedForeignNode
+    simp only [hmNot, Bool.not_false, Bool.true_and, List.any_eq_false, Bool.and_eq_true,
+      Bool.not_eq_true', not_and]
+    constructor
+    · intro h a ha haNot
+      have hfalse := h a ha haNot
+      cases hfa : findNode? w.nodes a with
+      | none => simp [skip, hfa]
+      | some ancNode =>
+        simp only [hfa] at hfalse
+        cases hsk : foreignNodeSkipsSubtree isWrite off len ancNode with
+        | false => simp [skip, hfa, hsk]
+        | true => exact False.elim (hfalse hsk)
+    · intro h a ha haNot
+      have hsk := h a ha haNot
+      cases hfa : findNode? w.nodes a with
+      | none => simp
+      | some ancNode =>
+        simp only [skip, hfa] at hsk
+        simp [hsk]
+  constructor
+  · intro hmem
+    unfold foreignVisitScheduleNodes at hmem
+    rw [List.mem_flatMap] at hmem
+    rcases hmem with ⟨t, htSched, hfilt⟩
+    rw [List.mem_filter] at hfilt
+    rcases hfilt with ⟨hnMem, htagEq⟩
+    have hteq : n.tag = t := eq_of_beq htagEq
+    subst hteq
+    rw [List.mem_flatMap] at htSched
+    rcases htSched with ⟨r, hrRoot, hnt⟩
+    rcases initialForeignRootTags_sound_of_reachesRoot hwf.tagsNodup hdp (w.nodes.length + 1)
+      (by omega) none (by intro _ h; cases h) r hrRoot with ⟨rn, hrnMem, hrnTag, hrNotAnc, _, q, hqAnc, hrnPar⟩
+    have hfnR : findNode? w.nodes r = some rn := by
+      rw [← hrnTag]; exact findNode?_eq_some_of_mem_of_nodup hwf.tagsNodup hrnMem
+    rcases hwf.reachesRoot rn hrnMem with ⟨dr, hdrlt, hrrR⟩
+    rw [hrnTag] at hrrR
+    cases hrrR with
+    | root r' hr' hpar' =>
+      rw [hfnR] at hr'; injection hr' with hEq; subst hEq
+      rw [hrnPar] at hpar'; cases hpar'
+    | step dq' _ q' n' hn' hpar' hrrQ =>
+      rw [hfnR] at hn'; injection hn' with hEq; subst hEq
+      rw [hrnPar] at hpar'; injection hpar' with hqEq; subst hqEq
+      have hrTailEq : (ancestorPathTags w.nodes r).tail = ancestorPathTags w.nodes q := by
+        unfold ancestorPathTags
+        simp only [ancestorPathTagsAux, hfnR, hrnPar, List.tail_cons]
+        exact ancestorPathTagsAux_fuel_irrel hrrQ w.nodes.length (w.nodes.length + 1)
+          (by omega) (by omega)
+      have hrAncOk : ∀ a ∈ (ancestorPathTags w.nodes r).tail,
+          (ancestorPathTags w.nodes parentTag).contains a = false → skip a = false := by
+        intro a ha haNot
+        rw [hrTailEq] at ha
+        -- Every ancestor of `q ∈ anc` is itself in `anc`, contradicting `haNot`.
+        exfalso
+        have haInAnc : a ∈ ancestorPathTags w.nodes parentTag := by
+          have hstep : ∀ d0 t0 (h0 : ReachesRoot w.nodes rootTag d0 t0),
+              ∀ f0 ≥ d0, t0 ∈ ancestorPathTags w.nodes parentTag →
+              ∀ b ∈ ancestorPathTagsAux w.nodes f0 t0, b ∈ ancestorPathTags w.nodes parentTag := by
+            intro d0 t0 h0
+            induction h0 with
+            | root r'' hr'' hpar'' =>
+              intro f0 _ ht0 b hb
+              have heq : ancestorPathTagsAux w.nodes f0 rootTag = [rootTag] := by
+                cases f0 <;> simp [ancestorPathTagsAux, hr'', hpar'']
+              rw [heq] at hb; simp only [List.mem_singleton] at hb; subst hb; exact ht0
+            | step d1 t1 p1 n1 hn1 hpar1 hprev1 ih1 =>
+              intro f0 hf0 ht1 b hb
+              cases f0 with
+              | zero => exact False.elim (Nat.not_succ_le_zero d1 hf0)
+              | succ f0' =>
+                simp only [ancestorPathTagsAux, hn1, hpar1, List.mem_cons] at hb
+                rcases hb with rfl | hbTail
+                · exact ht1
+                · have hp1InAnc := parent_mem_ancestorPathTagsAux_of_mem hdp (w.nodes.length + 1)
+                    (by omega) t1 n1 p1 ht1 hn1 hpar1
+                  exact ih1 f0' (by omega) hp1InAnc b hbTail
+          exact hstep dq' q hrrQ (w.nodes.length + 1) (by omega) hqAnc a ha
+        have hcon : (ancestorPathTags w.nodes parentTag).contains a = true :=
+          List.elem_eq_true_of_mem haInAnc
+        rw [hcon] at haNot; cases haNot
+      rcases mem_foreignPostorderTags_sound hwf hdp hdplt skip (w.nodes.length + 1) r
+          hrNotAnc hrAncOk n.tag hnt with ⟨hnNotAnc, hskipN, hnAncOk⟩
+      have hnNotCon : (ancestorPathTags w.nodes parentTag).contains n.tag = false := by
+        cases hcon : (ancestorPathTags w.nodes parentTag).contains n.tag with
+        | false => rfl
+        | true => exact False.elim (hnNotAnc (List.mem_of_elem_eq_true hcon))
+      have hfnN : findNode? w.nodes n.tag = some n :=
+        findNode?_eq_some_of_mem_of_nodup hwf.tagsNodup hnMem
+      have hskipSelf : foreignNodeSkipsSubtree isWrite off len n = false := by
+        simpa [skip, hfnN] using hskipN
+      exact ⟨hnMem, hnNotCon, hskipSelf, (hpruned_iff n hnMem hnNotCon).2 hnAncOk⟩
+  · rintro ⟨hnMem, hnNotCon, hskipSelf, hnotPruned⟩
+    have hnNotAnc : n.tag ∉ ancestorPathTags w.nodes parentTag := fun h => by
+      have hcon : (ancestorPathTags w.nodes parentTag).contains n.tag = true :=
+        List.elem_eq_true_of_mem h
+      rw [hcon] at hnNotCon; cases hnNotCon
+    rcases hwf.reachesRoot n hnMem with ⟨dn, hdnlt, hrrN⟩
+    have hfnN : findNode? w.nodes n.tag = some n :=
+      findNode?_eq_some_of_mem_of_nodup hwf.tagsNodup hnMem
+    have hskipN : skip n.tag = false := by simp [skip, hfnN, hskipSelf]
+    have hselfIn : n.tag ∈ foreignPostorderTags (childTagsInListOrder w.nodes) skip 1 n.tag := by
+      simp [foreignPostorderTags, hskipN]
+    have hnAncOk := (hpruned_iff n hnMem hnNotCon).1 hnotPruned
+    rcases mem_foreignPostorderTags_complete hdp hdplt skip hrrN hdnlt hnNotAnc hnAncOk hselfIn with
+      ⟨r, hrRoot, hnt⟩
+    have hntFull : n.tag ∈ foreignPostorderTags (childTagsInListOrder w.nodes) skip (w.nodes.length + 1) r :=
+      foreignPostorderTags_mono (childTagsInListOrder w.nodes) skip (by omega) hnt
+    unfold foreignVisitScheduleNodes
+    rw [List.mem_flatMap]
+    refine ⟨n.tag, ?_, ?_⟩
+    · rw [List.mem_flatMap]
+      exact ⟨r, hrRoot, hntFull⟩
+    · rw [List.mem_filter]
+      exact ⟨hnMem, beq_self_eq_true n.tag⟩
+
+private theorem stepNode_foreign_ok_of_skip (activeProtectors : List Nat) (isWrite : Bool)
+    (off len : Nat) (n : TreeTagNode) (hskip : foreignNodeSkipsSubtree isWrite off len n = true) :
+    (if isWrite then stepNodeOnRangeWrite activeProtectors false off len n
+     else stepNodeOnRangeRead activeProtectors false off len n) = .ok n := by
+  unfold foreignNodeSkipsSubtree at hskip
+  simp only [Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq] at hskip
+  rcases hskip with ⟨hov, hdis | ⟨hnw, hfrz⟩⟩
+  · cases isWrite <;> simp [stepNodeOnRangeWrite, stepNodeOnRangeRead, hov, hdis]
+  · have hwf : isWrite = false := by cases isWrite <;> simp at hnw ⊢
+    subst hwf
+    simp [stepNodeOnRangeRead, hov, hfrz]
+
+/-- **No-Fallback Theorem for Model 5**: on every well-formed rooted borrow tree (`BorrowTreeRootedWF`),
+whenever Model 4 fails with a foreign protector fault, `checkNodesM` over the upstream visit schedule
+`foreignVisitScheduleNodes (childTagsInListOrder w.nodes)` ALWAYS fails directly — Model 5's
+`.ok () => .error e` fallback branch is provably UNREACHABLE on every rooted tree. -/
+theorem execFnEntryMutRetagTraversalOrder_noFallback_of_rootedWF
+    {w : FnEntryBorrowWorld} {rootTag parentTag off len : Nat} (hwf : BorrowTreeRootedWF w rootTag)
+    (policy : FnEntryRetagPolicy) (requireInit : Bool) (t : Nat)
+    (hfail : execFnEntryMutRetagPrunedSourceOrder w parentTag off len policy requireInit =
+        .error (.protectedForeignConflict t) ∨
+      execFnEntryMutRetagPrunedSourceOrder w parentTag off len policy requireInit =
+        .error (.protectedReservedIMInvariant t)) :
+    ∃ e', checkNodesM (fun n =>
+        if policy == .writableChildWrite then
+          stepNodeOnRangeWrite w.activeProtectors false off len n
+        else stepNodeOnRangeRead w.activeProtectors false off len n)
+      (foreignVisitScheduleNodes (childTagsInListOrder w.nodes) w parentTag
+        (policy == .writableChildWrite) off len) = .error e' := by
+  have hprov : ∃ e0, execFnEntryMutRetagPrunedSourceOrder w parentTag off len policy requireInit = .error e0 ∧
+      (e0 = .protectedForeignConflict t ∨ e0 = .protectedReservedIMInvariant t) := by
+    rcases hfail with h | h
+    · exact ⟨_, h, Or.inl rfl⟩
+    · exact ⟨_, h, Or.inr rfl⟩
+  rcases hprov with ⟨e0, he0, hkind⟩
+  have hp : ∃ pNode, findNode? w.nodes parentTag = some pNode := by
+    cases hf : findNode? w.nodes parentTag with
+    | some pn => exact ⟨pn, rfl⟩
+    | none =>
+      unfold execFnEntryMutRetagPrunedSourceOrder at he0
+      cases policy <;> simp [hf] at he0
+      all_goals (rcases hkind with h1 | h1 <;> rw [← he0] at h1 <;> cases h1)
+  rcases hp with ⟨pNode, hpf⟩
+  cases hsched : checkNodesM (fun n =>
+      if policy == .writableChildWrite then
+        stepNodeOnRangeWrite w.activeProtectors false off len n
+      else stepNodeOnRangeRead w.activeProtectors false off len n)
+    (foreignVisitScheduleNodes (childTagsInListOrder w.nodes) w parentTag
+      (policy == .writableChildWrite) off len) with
+  | error e' => exact ⟨e', rfl⟩
+  | ok u =>
+    exfalso
+    have hall := (checkNodesM_ok_iff _ _).1 hsched
+    -- Extract the failing active foreign node directly from Model 4.
+    have hex : ∃ n ∈ w.nodes,
+        (ancestorPathTags w.nodes parentTag).contains n.tag = false ∧
+        isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag)
+          (policy == .writableChildWrite) off len n = false ∧
+        (if policy == .writableChildWrite then
+          stepNodeOnRangeWrite w.activeProtectors false off len n
+         else stepNodeOnRangeRead w.activeProtectors false off len n) = .error e0 := by
+      unfold execFnEntryMutRetagPrunedSourceOrder at he0
+      cases policy with
+      | skipRetag => cases he0
+      | rustcNoWritable =>
+        simp only [hpf] at he0
+        cases hlen0 : (len == 0) with
+        | true => simp [hlen0] at he0
+        | false =>
+          simp only [hlen0, Bool.false_eq_true, ↓reduceIte] at he0
+          cases hanc : checkAncestorPathM w parentTag
+              (stepNodeOnRangeRead w.activeProtectors true off len) with
+          | error eA =>
+            rw [hanc] at he0
+            injection he0 with hEq; subst hEq
+            rcases checkNodesM_error_exists _ _ _ hanc with ⟨n, _, hfn⟩
+            have hdis := (stepNodeOnRangeRead_local_error_classification _ _ _ _ _ hfn).2
+            rcases hkind with h1 | h1 <;> rw [hdis] at h1 <;> cases h1
+          | ok _ =>
+            rw [hanc] at he0
+            cases hfor : checkNodesM (stepNodeOnRangeRead w.activeProtectors false off len)
+                (w.nodes.filter (fun n => !(ancestorPathTags w.nodes parentTag).contains n.tag &&
+                  !isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) false off len n)) with
+            | error eF =>
+              rw [hfor] at he0
+              injection he0 with hEq; subst hEq
+              rcases checkNodesM_error_exists _ _ _ hfor with ⟨n, hnFilt, hfn⟩
+              rw [List.mem_filter] at hnFilt
+              rcases hnFilt with ⟨hnMem, hcond⟩
+              simp only [Bool.and_eq_true, Bool.not_eq_true'] at hcond
+              exact ⟨n, hnMem, hcond.1, hcond.2, hfn⟩
+            | ok _ =>
+              rw [hfor] at he0
+              -- `mapNodesM` cannot fail because both `checkAncestorPathM` and `checkNodesM` succeeded.
+              have hmapOk : ∃ ys, mapNodesM (fun n =>
+                  if (ancestorPathTags w.nodes parentTag).contains n.tag then
+                    stepNodeOnRangeRead w.activeProtectors true off len n
+                  else if isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) false off len n then
+                    .ok n
+                  else stepNodeOnRangeRead w.activeProtectors false off len n) w.nodes = .ok ys := by
+                apply mapNodesM_eq_of_check_and_ok
+                intro n hn
+                cases hcon : (ancestorPathTags w.nodes parentTag).contains n.tag with
+                | true =>
+                  simp only [↓reduceIte]
+                  exact (checkNodesM_ok_iff _ _).1 hanc n ((mem_ancestorPathNodes_iff w.nodes parentTag n).2 ⟨hn, hcon⟩)
+                | false =>
+                  simp only [Bool.false_eq_true, ↓reduceIte]
+                  cases hpr : isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) false off len n with
+                  | true => exact ⟨n, rfl⟩
+                  | false =>
+                    simp only [Bool.false_eq_true, ↓reduceIte]
+                    exact (checkNodesM_ok_iff _ _).1 hfor n
+                      (List.mem_filter.2 ⟨hn, by simp only [hcon, hpr, Bool.not_false, Bool.and_self]⟩)
+              rcases hmapOk with ⟨ys, hys⟩
+              dsimp only at he0
+              rw [hys] at he0
+              cases he0
+      | writableChildWrite =>
+        simp only [hpf] at he0
+        cases hlen0 : (len == 0) with
+        | true => simp [hlen0] at he0
+        | false =>
+          simp only [hlen0, Bool.false_eq_true, ↓reduceIte] at he0
+          cases hro : w.allocReadOnly with
+          | true =>
+            simp only [hro, ↓reduceIte] at he0
+            injection he0 with hEq; rcases hkind with h1 | h1 <;> rw [← hEq] at h1 <;> cases h1
+          | false =>
+            simp only [hro, Bool.false_eq_true, ↓reduceIte] at he0
+            cases hinit : (requireInit && !w.pointeeInitialized) with
+            | true =>
+              simp only [hinit, ↓reduceIte] at he0
+              injection he0 with hEq; rcases hkind with h1 | h1 <;> rw [← hEq] at h1 <;> cases h1
+            | false =>
+              simp only [hinit, Bool.false_eq_true, ↓reduceIte] at he0
+              cases hanc : checkAncestorPathM w parentTag
+                  (stepNodeOnRangeWrite w.activeProtectors true off len) with
+              | error eA =>
+                rw [hanc] at he0
+                injection he0 with hEq; subst hEq
+                rcases checkNodesM_error_exists _ _ _ hanc with ⟨n, _, hfn⟩
+                rcases stepNodeOnRangeWrite_local_error_classification _ _ _ _ _ hfn with ⟨_, h1⟩ | ⟨_, _, h1⟩ <;>
+                  (rcases hkind with h2 | h2 <;> rw [h1] at h2 <;> cases h2)
+              | ok _ =>
+                rw [hanc] at he0
+                cases hfor : checkNodesM (stepNodeOnRangeWrite w.activeProtectors false off len)
+                    (w.nodes.filter (fun n => !(ancestorPathTags w.nodes parentTag).contains n.tag &&
+                      !isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) true off len n)) with
+                | error eF =>
+                  rw [hfor] at he0
+                  injection he0 with hEq; subst hEq
+                  rcases checkNodesM_error_exists _ _ _ hfor with ⟨n, hnFilt, hfn⟩
+                  rw [List.mem_filter] at hnFilt
+                  rcases hnFilt with ⟨hnMem, hcond⟩
+                  simp only [Bool.and_eq_true, Bool.not_eq_true'] at hcond
+                  exact ⟨n, hnMem, hcond.1, hcond.2, hfn⟩
+                | ok _ =>
+                  rw [hfor] at he0
+                  have hmapOk : ∃ ys, mapNodesM (fun n =>
+                      if (ancestorPathTags w.nodes parentTag).contains n.tag then
+                        stepNodeOnRangeWrite w.activeProtectors true off len n
+                      else if isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) true off len n then
+                        .ok n
+                      else stepNodeOnRangeWrite w.activeProtectors false off len n) w.nodes = .ok ys := by
+                    apply mapNodesM_eq_of_check_and_ok
+                    intro n hn
+                    cases hcon : (ancestorPathTags w.nodes parentTag).contains n.tag with
+                    | true =>
+                      simp only [↓reduceIte]
+                      exact (checkNodesM_ok_iff _ _).1 hanc n ((mem_ancestorPathNodes_iff w.nodes parentTag n).2 ⟨hn, hcon⟩)
+                    | false =>
+                      simp only [Bool.false_eq_true, ↓reduceIte]
+                      cases hpr : isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) true off len n with
+                      | true => exact ⟨n, rfl⟩
+                      | false =>
+                        simp only [Bool.false_eq_true, ↓reduceIte]
+                        exact (checkNodesM_ok_iff _ _).1 hfor n
+                          (List.mem_filter.2 ⟨hn, by simp only [hcon, hpr, Bool.not_false, Bool.and_self]⟩)
+                  rcases hmapOk with ⟨ys, hys⟩
+                  dsimp only at he0
+                  rw [hys] at he0
+                  cases he0
+    rcases hex with ⟨n, hnMem, hnNotAnc, hnNotPruned, hnErr⟩
+    have hnotSkip : foreignNodeSkipsSubtree (policy == .writableChildWrite) off len n = false := by
+      cases hsk : foreignNodeSkipsSubtree (policy == .writableChildWrite) off len n with
+      | false => rfl
+      | true =>
+        have hok := stepNode_foreign_ok_of_skip w.activeProtectors (policy == .writableChildWrite) off len n hsk
+        rw [hok] at hnErr; cases hnErr
+    have hnInSched := (mem_foreignVisitScheduleNodes_iff_activeForeign_of_rootedWF hwf hpf
+      (policy == .writableChildWrite) off len n).2 ⟨hnMem, hnNotAnc, hnotSkip, hnNotPruned⟩
+    rcases hall n hnInSched with ⟨_, hok⟩
+    rw [hnErr] at hok; cases hok
+
+/-- Standalone Model 5 (`execFnEntryMutRetagTraversalOrderDirect`): directly checks `checkAncestorPathM`
+bottom-up, then checks foreign nodes directly in upstream reverse-children postorder via
+`foreignVisitScheduleNodes (childTagsInListOrder w.nodes)` (with NO flat-list Model 4 pass and NO
+fallback branch), then commits the pruned node updates. -/
+def execFnEntryMutRetagTraversalOrderDirect (w : FnEntryBorrowWorld)
+    (parentTag rangeOffset rangeLen : Nat)
+    (policy : FnEntryRetagPolicy) (requireInitOnImplicitWrite : Bool := false) :
+    Except RetagStepErr (FnEntryBorrowWorld × Nat) :=
+  match policy with
+  | .skipRetag => .ok (w, parentTag)
+  | .rustcNoWritable | .writableChildWrite =>
+    match findNode? w.nodes parentTag with
+    | none => .error (.missingParentTag parentTag)
+    | some _ =>
+      let childTag := w.nextTag
+      let protId := w.nextProtector
+      let activeProtectors' := protId :: w.activeProtectors
+      let childInitPerm : TreeBorrowPerm :=
+        if rangeLen == 0 then .reservedFrz false
+        else match policy with
+          | .writableChildWrite => .unique
+          | _ => .reservedFrz false
+      let child : TreeTagNode := {
+        tag := childTag
+        parentTag := some parentTag
+        perm := childInitPerm
+        rangeOffset := rangeOffset
+        rangeLen := rangeLen
+        protector := some protId
+        accessed := true
+      }
+      if rangeLen == 0 then
+        .ok ({ w with
+          nodes := child :: w.nodes
+          activeProtectors := activeProtectors'
+          nextTag := childTag + 1
+          nextProtector := protId + 1 }, childTag)
+      else
+        let ancestors := ancestorPathTags w.nodes parentTag
+        match policy with
+        | .rustcNoWritable =>
+          let stepPruned (n : TreeTagNode) : Except RetagStepErr TreeTagNode :=
+            if ancestors.contains n.tag then
+              stepNodeOnRangeRead w.activeProtectors true rangeOffset rangeLen n
+            else if isPrunedForeignNode w.nodes ancestors false rangeOffset rangeLen n then
+              .ok n
+            else
+              stepNodeOnRangeRead w.activeProtectors false rangeOffset rangeLen n
+          let sched := foreignVisitScheduleNodes (childTagsInListOrder w.nodes) w parentTag false rangeOffset rangeLen
+          match checkAncestorPathM w parentTag
+              (stepNodeOnRangeRead w.activeProtectors true rangeOffset rangeLen) with
+          | .error e => .error e
+          | .ok () =>
+            match checkNodesM (stepNodeOnRangeRead w.activeProtectors false rangeOffset rangeLen) sched with
+            | .error e => .error e
+            | .ok () =>
+              match mapNodesM stepPruned w.nodes with
+              | .error e => .error e
+              | .ok nodes' =>
+                .ok ({ w with
+                  nodes := child :: nodes'
+                  activeProtectors := activeProtectors'
+                  nextTag := childTag + 1
+                  nextProtector := protId + 1 }, childTag)
+        | .writableChildWrite =>
+          if w.allocReadOnly then
+            .error .writeToReadOnlyAlloc
+          else if requireInitOnImplicitWrite && !w.pointeeInitialized then
+            .error .uninitializedPointeeWrite
+          else
+            let stepPruned (n : TreeTagNode) : Except RetagStepErr TreeTagNode :=
+              if ancestors.contains n.tag then
+                stepNodeOnRangeWrite w.activeProtectors true rangeOffset rangeLen n
+              else if isPrunedForeignNode w.nodes ancestors true rangeOffset rangeLen n then
+                .ok n
+              else
+                stepNodeOnRangeWrite w.activeProtectors false rangeOffset rangeLen n
+            let sched := foreignVisitScheduleNodes (childTagsInListOrder w.nodes) w parentTag true rangeOffset rangeLen
+            match checkAncestorPathM w parentTag
+                (stepNodeOnRangeWrite w.activeProtectors true rangeOffset rangeLen) with
+            | .error e => .error e
+            | .ok () =>
+              match checkNodesM (stepNodeOnRangeWrite w.activeProtectors false rangeOffset rangeLen) sched with
+              | .error e => .error e
+              | .ok () =>
+                match mapNodesM stepPruned w.nodes with
+                | .error e => .error e
+                | .ok nodes' =>
+                  .ok ({ w with
+                    nodes := child :: nodes'
+                    activeProtectors := activeProtectors'
+                    nextTag := childTag + 1
+                    nextProtector := protId + 1 }, childTag)
+        | .skipRetag => .ok (w, parentTag)
+
+/-- **Standalone Model 5 Exact Equivalence**: on every well-formed rooted borrow tree
+(`BorrowTreeRootedWF w rootTag`), `execFnEntryMutRetagTraversalOrderDirect` (with ZERO flat-list
+Model 4 pass and ZERO fallback) produces the EXACT same result (both `.ok` AND `.error`) as
+`execFnEntryMutRetagTraversalOrder (childTagsInListOrder w.nodes)`. -/
+theorem execFnEntryMutRetagTraversalOrderDirect_eq_traversalOrder_of_rootedWF
+    {w : FnEntryBorrowWorld} {rootTag : Nat} (hwf : BorrowTreeRootedWF w rootTag)
+    (parentTag off len : Nat) (policy : FnEntryRetagPolicy) (requireInit : Bool) :
+    execFnEntryMutRetagTraversalOrderDirect w parentTag off len policy requireInit =
+      execFnEntryMutRetagTraversalOrder (childTagsInListOrder w.nodes) w parentTag off len policy requireInit := by
+  unfold execFnEntryMutRetagTraversalOrderDirect execFnEntryMutRetagTraversalOrder
+    execFnEntryMutRetagPrunedSourceOrder
+  cases policy with
+  | skipRetag => rfl
+  | rustcNoWritable =>
+    cases hpf : findNode? w.nodes parentTag with
+    | none => simp
+    | some pNode =>
+      simp only
+      cases hlen0 : (len == 0) with
+      | true => simp
+      | false =>
+        simp only [Bool.false_eq_true, ↓reduceIte]
+        cases hanc : checkAncestorPathM w parentTag
+            (stepNodeOnRangeRead w.activeProtectors true off len) with
+        | error eA =>
+          rcases checkNodesM_error_exists _ _ _ hanc with ⟨n, _, hfn⟩
+          have hdis := (stepNodeOnRangeRead_local_error_classification _ _ _ _ _ hfn).2
+          simp [hdis]
+        | ok _ =>
+          simp only
+          have hiff : ∀ n,
+              n ∈ foreignVisitScheduleNodes (childTagsInListOrder w.nodes) w parentTag false off len ↔
+                n ∈ w.nodes ∧ (ancestorPathTags w.nodes parentTag).contains n.tag = false ∧
+                foreignNodeSkipsSubtree false off len n = false ∧
+                isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) false off len n = false :=
+            mem_foreignVisitScheduleNodes_iff_activeForeign_of_rootedWF hwf hpf false off len
+          cases hsched : checkNodesM (stepNodeOnRangeRead w.activeProtectors false off len)
+              (foreignVisitScheduleNodes (childTagsInListOrder w.nodes) w parentTag false off len) with
+          | error eS =>
+            rcases checkNodesM_error_exists _ _ _ hsched with ⟨n, hnS, hfnS⟩
+            rcases (hiff n).1 hnS with ⟨hnMem, hnNotAnc, _, hnNotPr⟩
+            cases hfor : checkNodesM (stepNodeOnRangeRead w.activeProtectors false off len)
+                (w.nodes.filter (fun m => !(ancestorPathTags w.nodes parentTag).contains m.tag &&
+                  !isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) false off len m)) with
+            | ok _ =>
+              exfalso
+              rcases (checkNodesM_ok_iff _ _).1 hfor n
+                (List.mem_filter.2 ⟨hnMem, by simp only [hnNotAnc, hnNotPr, Bool.not_false, Bool.and_self]⟩) with ⟨_, hok⟩
+              rw [hfnS] at hok; cases hok
+            | error eF =>
+              rcases checkNodesM_error_exists _ _ _ hfor with ⟨m, _, hfnF⟩
+              have hnePol : (FnEntryRetagPolicy.rustcNoWritable == FnEntryRetagPolicy.writableChildWrite) = false := rfl
+              rcases stepNodeOnRangeRead_foreign_error_classification _ _ _ _ _ hfnF with
+                ⟨_, ⟨_, _, heF⟩ | ⟨_, heF⟩⟩ <;>
+                (simp only [heF, hnePol, Bool.false_eq_true, ↓reduceIte]; rw [hsched])
+          | ok _ =>
+            have hforOk : checkNodesM (stepNodeOnRangeRead w.activeProtectors false off len)
+                (w.nodes.filter (fun m => !(ancestorPathTags w.nodes parentTag).contains m.tag &&
+                  !isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) false off len m)) = .ok () := by
+              rw [checkNodesM_ok_iff]
+              intro n hnFilt
+              rw [List.mem_filter] at hnFilt
+              rcases hnFilt with ⟨hnMem, hcond⟩
+              simp only [Bool.and_eq_true, Bool.not_eq_true'] at hcond
+              cases hsk : foreignNodeSkipsSubtree false off len n with
+              | true =>
+                exact ⟨n, stepNode_foreign_ok_of_skip w.activeProtectors false off len n hsk⟩
+              | false =>
+                exact (checkNodesM_ok_iff _ _).1 hsched n ((hiff n).2 ⟨hnMem, hcond.1, hsk, hcond.2⟩)
+            rw [hforOk]
+            have hmapOk : ∃ ys, mapNodesM (fun n =>
+                if (ancestorPathTags w.nodes parentTag).contains n.tag then
+                  stepNodeOnRangeRead w.activeProtectors true off len n
+                else if isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) false off len n then
+                  .ok n
+                else stepNodeOnRangeRead w.activeProtectors false off len n) w.nodes = .ok ys := by
+              apply mapNodesM_eq_of_check_and_ok
+              intro n hn
+              cases hcon : (ancestorPathTags w.nodes parentTag).contains n.tag with
+              | true =>
+                simp only [↓reduceIte]
+                exact (checkNodesM_ok_iff _ _).1 hanc n ((mem_ancestorPathNodes_iff w.nodes parentTag n).2 ⟨hn, hcon⟩)
+              | false =>
+                simp only [Bool.false_eq_true, ↓reduceIte]
+                cases hpr : isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) false off len n with
+                | true => exact ⟨n, rfl⟩
+                | false =>
+                  simp only [Bool.false_eq_true, ↓reduceIte]
+                  exact (checkNodesM_ok_iff _ _).1 hforOk n
+                    (List.mem_filter.2 ⟨hn, by simp only [hcon, hpr, Bool.not_false, Bool.and_self]⟩)
+            rcases hmapOk with ⟨ys, hys⟩
+            dsimp only
+            rw [hys]
+  | writableChildWrite =>
+    cases hpf : findNode? w.nodes parentTag with
+    | none => simp
+    | some pNode =>
+      simp only
+      cases hlen0 : (len == 0) with
+      | true => simp
+      | false =>
+        simp only [Bool.false_eq_true, ↓reduceIte]
+        cases hro : w.allocReadOnly with
+        | true => simp
+        | false =>
+          simp only [Bool.false_eq_true, ↓reduceIte]
+          cases hinit : (requireInit && !w.pointeeInitialized) with
+          | true => simp
+          | false =>
+            simp only [Bool.false_eq_true, ↓reduceIte]
+            cases hanc : checkAncestorPathM w parentTag
+                (stepNodeOnRangeWrite w.activeProtectors true off len) with
+            | error eA =>
+              rcases checkNodesM_error_exists _ _ _ hanc with ⟨n, _, hfn⟩
+              rcases stepNodeOnRangeWrite_local_error_classification _ _ _ _ _ hfn with
+                ⟨_, heA⟩ | ⟨_, _, heA⟩ <;> simp [heA]
+            | ok _ =>
+              simp only
+              have hiff : ∀ n,
+                  n ∈ foreignVisitScheduleNodes (childTagsInListOrder w.nodes) w parentTag true off len ↔
+                    n ∈ w.nodes ∧ (ancestorPathTags w.nodes parentTag).contains n.tag = false ∧
+                    foreignNodeSkipsSubtree true off len n = false ∧
+                    isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) true off len n = false :=
+                mem_foreignVisitScheduleNodes_iff_activeForeign_of_rootedWF hwf hpf true off len
+              cases hsched : checkNodesM (stepNodeOnRangeWrite w.activeProtectors false off len)
+                  (foreignVisitScheduleNodes (childTagsInListOrder w.nodes) w parentTag true off len) with
+              | error eS =>
+                rcases checkNodesM_error_exists _ _ _ hsched with ⟨n, hnS, hfnS⟩
+                rcases (hiff n).1 hnS with ⟨hnMem, hnNotAnc, _, hnNotPr⟩
+                cases hfor : checkNodesM (stepNodeOnRangeWrite w.activeProtectors false off len)
+                    (w.nodes.filter (fun m => !(ancestorPathTags w.nodes parentTag).contains m.tag &&
+                      !isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) true off len m)) with
+                | ok _ =>
+                  exfalso
+                  rcases (checkNodesM_ok_iff _ _).1 hfor n
+                    (List.mem_filter.2 ⟨hnMem, by simp only [hnNotAnc, hnNotPr, Bool.not_false, Bool.and_self]⟩) with ⟨_, hok⟩
+                  rw [hfnS] at hok; cases hok
+                | error eF =>
+                  rcases checkNodesM_error_exists _ _ _ hfor with ⟨m, _, hfnF⟩
+                  rcases stepNodeOnRangeWrite_foreign_error_classification _ _ _ _ _ hfnF with
+                    ⟨_, ⟨_, heF⟩ | ⟨_, heF⟩⟩ <;> (simp only [heF, beq_self_eq_true, ↓reduceIte]; rw [hsched])
+              | ok _ =>
+                have hforOk : checkNodesM (stepNodeOnRangeWrite w.activeProtectors false off len)
+                    (w.nodes.filter (fun m => !(ancestorPathTags w.nodes parentTag).contains m.tag &&
+                      !isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) true off len m)) = .ok () := by
+                  rw [checkNodesM_ok_iff]
+                  intro n hnFilt
+                  rw [List.mem_filter] at hnFilt
+                  rcases hnFilt with ⟨hnMem, hcond⟩
+                  simp only [Bool.and_eq_true, Bool.not_eq_true'] at hcond
+                  cases hsk : foreignNodeSkipsSubtree true off len n with
+                  | true =>
+                    exact ⟨n, stepNode_foreign_ok_of_skip w.activeProtectors true off len n hsk⟩
+                  | false =>
+                    exact (checkNodesM_ok_iff _ _).1 hsched n ((hiff n).2 ⟨hnMem, hcond.1, hsk, hcond.2⟩)
+                rw [hforOk]
+                have hmapOk : ∃ ys, mapNodesM (fun n =>
+                    if (ancestorPathTags w.nodes parentTag).contains n.tag then
+                      stepNodeOnRangeWrite w.activeProtectors true off len n
+                    else if isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) true off len n then
+                      .ok n
+                    else stepNodeOnRangeWrite w.activeProtectors false off len n) w.nodes = .ok ys := by
+                  apply mapNodesM_eq_of_check_and_ok
+                  intro n hn
+                  cases hcon : (ancestorPathTags w.nodes parentTag).contains n.tag with
+                  | true =>
+                    simp only [↓reduceIte]
+                    exact (checkNodesM_ok_iff _ _).1 hanc n ((mem_ancestorPathNodes_iff w.nodes parentTag n).2 ⟨hn, hcon⟩)
+                  | false =>
+                    simp only [Bool.false_eq_true, ↓reduceIte]
+                    cases hpr : isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) true off len n with
+                    | true => exact ⟨n, rfl⟩
+                    | false =>
+                      simp only [Bool.false_eq_true, ↓reduceIte]
+                      exact (checkNodesM_ok_iff _ _).1 hforOk n
+                        (List.mem_filter.2 ⟨hn, by simp only [hcon, hpr, Bool.not_false, Bool.and_self]⟩)
+                rcases hmapOk with ⟨ys, hys⟩
+                dsimp only
+                rw [hys]
+
+/-- Upstream `Miri.TreeBorrows.IdempotentForeignAccess` (`Permissions.lean:165-239`): per-location
+SIFA cache recording the strongest foreign access performed since the last local access. -/
+inductive IdempotentForeignAccess where
+  | none
+  | read
+  | write
+  deriving DecidableEq, Repr, Inhabited
+
+namespace IdempotentForeignAccess
+
+def rank : IdempotentForeignAccess → Nat
+  | .none => 0
+  | .read => 1
+  | .write => 2
+
+def fromForeign (isWrite : Bool) : IdempotentForeignAccess :=
+  if isWrite then .write else .read
+
+/-- Whether cached `recorded` allows skipping a foreign access `happeningNow` (`LocationState.lean:81`). -/
+def canSkipForeign (recorded happeningNow : IdempotentForeignAccess) : Bool :=
+  happeningNow != .none && decide (happeningNow.rank ≤ recorded.rank)
+
+/-- Update cache on a new access (`Permissions.lean:232`): local resets to `.none`, foreign takes `max`. -/
+def recordNew (recorded : IdempotentForeignAccess) (isLocal isWrite : Bool) :
+    IdempotentForeignAccess :=
+  if isLocal then .none
+  else
+    let next := fromForeign isWrite
+    if recorded.rank ≤ next.rank then next else recorded
+
+end IdempotentForeignAccess
+
+/-- **SIFA Soundness (`LocationState.skipIfKnownNoop`)**: once a node `n` survives a foreign access
+`k1` (`read` or `write`) producing `n'`, EVERY subsequent foreign access `k2` permitted by SIFA
+(`canSkipForeign (fromForeign k1) (fromForeign k2) = true`) on the same range is a provable NO-OP
+returning `.ok n'` unchanged — across all 6 `TreeBorrowPerm` states, both protector polarities, and
+both `accessed` polarities (including `ReservedFrz` protector-conflict latching and unaccessed
+protected `.disabled` transitions). -/
+theorem sifa_foreign_transition_idempotent
+    (activeProtectors : List Nat) (off len : Nat) (isWrite1 isWrite2 : Bool)
+    (n n' : TreeTagNode)
+    (hstep1 : (if isWrite1 then stepNodeOnRangeWrite activeProtectors false off len n
+               else stepNodeOnRangeRead activeProtectors false off len n) = .ok n')
+    (hskip : IdempotentForeignAccess.canSkipForeign
+      (IdempotentForeignAccess.fromForeign isWrite1)
+      (IdempotentForeignAccess.fromForeign isWrite2) = true) :
+    (if isWrite2 then stepNodeOnRangeWrite activeProtectors false off len n'
+     else stepNodeOnRangeRead activeProtectors false off len n') = .ok n' := by
+  rcases n with ⟨tag, par, perm, rOff, rLen, prot, acc⟩
+  cases isWrite1 <;> cases isWrite2
+  · -- read then read
+    simp only [Bool.false_eq_true, ↓reduceIte] at hstep1 ⊢
+    unfold stepNodeOnRangeRead at hstep1 ⊢
+    cases hov : rangesOverlap off len rOff rLen with
+    | false =>
+      simp only [hov, Bool.not_false, ↓reduceIte] at hstep1
+      injection hstep1 with hEq; subst hEq
+      simp [hov]
+    | true =>
+      simp only [hov, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hstep1
+      cases perm with
+      | cell => injection hstep1 with hEq; subst hEq; simp [hov]
+      | frozen => injection hstep1 with hEq; subst hEq; simp [hov]
+      | disabled => injection hstep1 with hEq; subst hEq; simp [hov]
+      | reservedFrz c =>
+        cases hprot : (TreeTagNode.mk tag par (.reservedFrz c) rOff rLen prot acc).isProtected activeProtectors <;>
+          simp only [hprot, ↓reduceIte, Bool.false_eq_true] at hstep1 <;>
+          (injection hstep1 with hEq; subst hEq;
+           simp only [hov, Bool.not_true, Bool.false_eq_true, ↓reduceIte];
+           simp only [TreeTagNode.isProtected] at hprot ⊢; simp [hprot])
+      | reservedIM =>
+        cases hprot : (TreeTagNode.mk tag par .reservedIM rOff rLen prot acc).isProtected activeProtectors with
+        | true => simp [hprot] at hstep1
+        | false =>
+          simp only [hprot, Bool.false_eq_true, ↓reduceIte] at hstep1
+          injection hstep1 with hEq; subst hEq
+          simp [hov, hprot]
+      | unique =>
+        cases hprot : (TreeTagNode.mk tag par .unique rOff rLen prot acc).isProtected activeProtectors with
+        | false =>
+          simp only [hprot, Bool.false_eq_true, ↓reduceIte] at hstep1
+          injection hstep1 with hEq; subst hEq
+          simp [hov]
+        | true =>
+          cases acc with
+          | true => simp [hprot] at hstep1
+          | false =>
+            simp only [hprot, Bool.false_eq_true, ↓reduceIte] at hstep1
+            injection hstep1 with hEq; subst hEq
+            simp [hov]
+  · -- read then write: forbidden by SIFA rank (`2 ≤ 1` is false)
+    simp [IdempotentForeignAccess.canSkipForeign, IdempotentForeignAccess.fromForeign,
+      IdempotentForeignAccess.rank] at hskip
+  · -- write then read
+    simp only [↓reduceIte, Bool.false_eq_true] at hstep1 ⊢
+    unfold stepNodeOnRangeWrite at hstep1
+    unfold stepNodeOnRangeRead
+    cases hov : rangesOverlap off len rOff rLen with
+    | false =>
+      simp only [hov, Bool.not_false, ↓reduceIte] at hstep1
+      injection hstep1 with hEq; subst hEq
+      simp [hov]
+    | true =>
+      simp only [hov, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hstep1
+      cases perm with
+      | cell => injection hstep1 with hEq; subst hEq; simp [hov]
+      | disabled => injection hstep1 with hEq; subst hEq; simp [hov]
+      | reservedIM =>
+        cases hprot : (TreeTagNode.mk tag par .reservedIM rOff rLen prot acc).isProtected activeProtectors with
+        | true => simp [hprot] at hstep1
+        | false =>
+          simp only [hprot, Bool.false_eq_true, ↓reduceIte] at hstep1
+          injection hstep1 with hEq; subst hEq
+          simp [hov, hprot]
+      | reservedFrz c =>
+        cases hprot : (TreeTagNode.mk tag par (.reservedFrz c) rOff rLen prot acc).isProtected activeProtectors <;>
+          cases acc <;>
+          simp only [hprot, Bool.false_eq_true, ↓reduceIte] at hstep1 <;>
+          (cases hstep1 <;> simp [hov])
+      | unique =>
+        cases hprot : (TreeTagNode.mk tag par .unique rOff rLen prot acc).isProtected activeProtectors <;>
+          cases acc <;>
+          simp only [hprot, Bool.false_eq_true, ↓reduceIte] at hstep1 <;>
+          (cases hstep1 <;> simp [hov])
+      | frozen =>
+        cases hprot : (TreeTagNode.mk tag par .frozen rOff rLen prot acc).isProtected activeProtectors <;>
+          cases acc <;>
+          simp only [hprot, Bool.false_eq_true, ↓reduceIte] at hstep1 <;>
+          (cases hstep1 <;> simp [hov])
+  · -- write then write
+    simp only [↓reduceIte] at hstep1 ⊢
+    unfold stepNodeOnRangeWrite at hstep1 ⊢
+    cases hov : rangesOverlap off len rOff rLen with
+    | false =>
+      simp only [hov, Bool.not_false, ↓reduceIte] at hstep1
+      injection hstep1 with hEq; subst hEq
+      simp [hov]
+    | true =>
+      simp only [hov, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hstep1
+      cases perm with
+      | cell => injection hstep1 with hEq; subst hEq; simp [hov]
+      | disabled => injection hstep1 with hEq; subst hEq; simp [hov]
+      | reservedIM =>
+        cases hprot : (TreeTagNode.mk tag par .reservedIM rOff rLen prot acc).isProtected activeProtectors with
+        | true => simp [hprot] at hstep1
+        | false =>
+          simp only [hprot, Bool.false_eq_true, ↓reduceIte] at hstep1
+          injection hstep1 with hEq; subst hEq
+          simp [hov, hprot]
+      | reservedFrz c =>
+        cases hprot : (TreeTagNode.mk tag par (.reservedFrz c) rOff rLen prot acc).isProtected activeProtectors <;>
+          cases acc <;>
+          simp only [hprot, Bool.false_eq_true, ↓reduceIte] at hstep1 <;>
+          (cases hstep1 <;> simp [hov])
+      | unique =>
+        cases hprot : (TreeTagNode.mk tag par .unique rOff rLen prot acc).isProtected activeProtectors <;>
+          cases acc <;>
+          simp only [hprot, Bool.false_eq_true, ↓reduceIte] at hstep1 <;>
+          (cases hstep1 <;> simp [hov])
+      | frozen =>
+        cases hprot : (TreeTagNode.mk tag par .frozen rOff rLen prot acc).isProtected activeProtectors <;>
+          cases acc <;>
+          simp only [hprot, Bool.false_eq_true, ↓reduceIte] at hstep1 <;>
+          (cases hstep1 <;> simp [hov])
+
+/-- SIFA rank-ordering and local-reset separation:
+1. A foreign Read (`rank 1`) does NOT permit skipping a subsequent foreign Write (`rank 2`): on
+   unprotected `.unique`, foreign Read freezes to `.frozen`, and a subsequent foreign Write disables it.
+2. An intervening LOCAL access resets SIFA to `.none` (`recordNew .read true true = .none`): on
+   `.reservedFrz false`, foreign Read is a no-op, local Write activates `.unique`, and the next
+   foreign Read changes `.unique` to `.frozen` (so keeping the stale `.read` SIFA cache would be unsound). -/
+theorem sifa_rank_and_localReset_separation :
+    let uNode : TreeTagNode := ⟨1, some 0, .unique, 0, 4, none, true⟩
+    let rNode : TreeTagNode := ⟨2, some 0, .reservedFrz false, 0, 4, none, true⟩
+    IdempotentForeignAccess.canSkipForeign .read .write = false ∧
+    IdempotentForeignAccess.canSkipForeign .write .read = true ∧
+    IdempotentForeignAccess.recordNew .read true true = .none ∧
+    IdempotentForeignAccess.recordNew .read false true = .write ∧
+    stepNodeOnRangeRead [] false 0 4 uNode = .ok { uNode with perm := .frozen } ∧
+    stepNodeOnRangeWrite [] false 0 4 { uNode with perm := .frozen } = .ok { uNode with perm := .disabled } ∧
+    stepNodeOnRangeRead [] false 0 4 rNode = .ok rNode ∧
+    stepNodeOnRangeWrite [] true 0 4 rNode = .ok { rNode with perm := .unique } ∧
+    stepNodeOnRangeRead [] false 0 4 { rNode with perm := .unique } = .ok { rNode with perm := .frozen } :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 /-! ### 2B. Static-Access Temporary Retag (`charon#1620`) & Syntactic `is_freeze` Static Mutability -/
 
 /-- Type descriptor for static allocation mutability (`intern.rs:222-229`) and `FreezeVisitor` layout decomposition. -/
@@ -7268,6 +8555,29 @@ def KeyedAllocWorld.checkPtrAccess (w : KeyedAllocWorld) (prov : Option (MiriAll
       match w.getAllocInfo id with
       | some info => info.kind != .dead && decide (off.toNat + sizeBytes ≤ info.sizeBytes.toNat)
       | none => false
+
+/-- Linear-list twin of `KeyedAllocWorld.checkPtrAccess` (`Miri.Memory.sizeAsI64` + `checkAndDerefPtr`),
+enabling direct `AllocWorldRel` transport for `LeanMiriSpec` linear-allocation correspondence. -/
+def LinearAllocWorld.checkPtrAccess (lw : LinearAllocWorld) (prov : Option (MiriAllocId × UInt64))
+    (sizeBytes : Nat) : Bool :=
+  if sizeBytes ≥ 9223372036854775808 then false
+  else if sizeBytes == 0 then true
+  else
+    match prov with
+    | none => false
+    | some (id, off) =>
+      match lw.getAllocInfo id with
+      | some info => info.kind != .dead && decide (off.toNat + sizeBytes ≤ info.sizeBytes.toNat)
+      | none => false
+
+/-- `AllocWorldRel` transports `checkPtrAccess` identically across linear and keyed allocation worlds. -/
+theorem allocWorldRel_checkPtrAccess {lw : LinearAllocWorld} {kw : KeyedAllocWorld}
+    (h : AllocWorldRel lw kw) (prov : Option (MiriAllocId × UInt64)) (sizeBytes : Nat) :
+    lw.checkPtrAccess prov sizeBytes = kw.checkPtrAccess prov sizeBytes := by
+  unfold LinearAllocWorld.checkPtrAccess KeyedAllocWorld.checkPtrAccess
+  cases prov with
+  | none => rfl
+  | some p => simp [allocWorldRel_getAllocInfo h p.1]
 
 /-- Safe thin reference validator aligned with `Miri.Interpreter.ValidityVisitor.checkSafe` (`lines 205-228`)
 and `ValidityMachine.scalarMayBeNull`:
@@ -8276,30 +9586,19 @@ def wordProvenance : List (UInt8 × Option MiriAllocId) → Option MiriAllocId
   | (_, p) :: rest => if rest.all (fun q => decide (q.2 = p)) then p else none
 
 /-- Decode the vtable word of a nested wide `dyn` pointer into a `VTablePtrVal`. `vtBase` assigns each
-vtable allocation its base address (Miri pointers carry absolute addresses), so the provenance-relative
-offset is `addr - base`; a word whose provenance has no known base is a dangling integer. -/
+vtable allocation its non-zero base address (Miri allocations never reside at address `0`, and pointers
+carry absolute addresses), so the provenance-relative offset is `addr - base`; a word whose provenance
+has no valid non-zero base is a dangling integer. -/
 def decodeVTableWord (vtBase : MiriAllocId → Option UInt64)
     (word : List (UInt8 × Option MiriAllocId)) : VTablePtrVal :=
   match wordProvenance word with
   | none => if decodeLeUInt64 word == 0 then .null else .danglingInt (decodeLeUInt64 word)
   | some id =>
     match vtBase id with
-    | some base => .provenanced id (decodeLeUInt64 word - base)
+    | some base =>
+      if base == 0 then .danglingInt (decodeLeUInt64 word)
+      else .provenanced id (decodeLeUInt64 word - base)
     | none => .danglingInt (decodeLeUInt64 word)
-
-/-- World-backed nested `dyn` metadata oracle: validates the decoded vtable word with
-`validateVTableHalf` against `resolveTrait traitName` and returns the vtable's concrete
-`(sizeBytes, 2 ^ alignPow2)`; every vtable failure (and a malformed `alignPow2 > 29`) is
-`.nestedInvalidVTable`. -/
-def worldNestedDynOracle (w : KeyedAllocWorld) (reg : VTableRegistry)
-    (resolveTrait : String → DynExistentialSpec) (vtBase : MiriAllocId → Option UInt64) :
-    NestedDynMetaOracle :=
-  fun traitName word =>
-    match validateVTableHalf w reg (decodeVTableWord vtBase word) (resolveTrait traitName) with
-    | .error _ => .error .nestedInvalidVTable
-    | .ok vt =>
-      if vt.alignPow2.toNat > 29 then .error .nestedInvalidVTable
-      else .ok (vt.sizeBytes.toNat, 2 ^ vt.alignPow2.toNat)
 
 /-- Upstream derives a vtable's size and alignment from `layout_of(concrete type)`
 (`get_vtable_size_and_align`); this is the corresponding consistency check on a `VTableData` record:
@@ -8312,6 +9611,20 @@ def VTableData.layoutConsistent (vt : VTableData) : Bool :=
     lay.isSized && decide (vt.sizeBytes.toNat = lay.sizeBytes) &&
       decide (vt.alignPow2.toNat ≤ 29) && decide (2 ^ vt.alignPow2.toNat = lay.alignBytes) &&
       decide (lay.sizeBytes ≤ maxObjectSize64)
+
+/-- World-backed nested `dyn` metadata oracle: validates the decoded vtable word with
+`validateVTableHalf` against `resolveTrait traitName` and enforces `VTableData.layoutConsistent`
+(matching `VTable.getSizeAndAlignRead`, which derives `(size, align)` from `layout_of(concreteTy)`);
+every vtable or layout-consistency failure is `.nestedInvalidVTable`. -/
+def worldNestedDynOracle (w : KeyedAllocWorld) (reg : VTableRegistry)
+    (resolveTrait : String → DynExistentialSpec) (vtBase : MiriAllocId → Option UInt64) :
+    NestedDynMetaOracle :=
+  fun traitName word =>
+    match validateVTableHalf w reg (decodeVTableWord vtBase word) (resolveTrait traitName) with
+    | .error _ => .error .nestedInvalidVTable
+    | .ok vt =>
+      if !vt.layoutConsistent then .error .nestedInvalidVTable
+      else .ok (vt.sizeBytes.toNat, 2 ^ vt.alignPow2.toNat)
 
 theorem validateVTableHalf_sound_of_allocWF
     (w : KeyedAllocWorld) (reg : VTableRegistry) (id : MiriAllocId)
@@ -9107,9 +10420,11 @@ def dynSizeAlign (md : DynMetaVal) : ProtoTy → Except PointeeByteErr (Nat × N
     match computeTyLayout elem with
     | .error e => .error (.layoutErr e)
     | .ok el =>
-      match md with
-      | .sliceLen len => .ok (el.sizeBytes * len, el.alignBytes)
-      | _ => .error (.layoutErr .unsizedField)
+      if !el.isSized then .error (.layoutErr .unsizedField)
+      else
+        match md with
+        | .sliceLen len => .ok (el.sizeBytes * len, el.alignBytes)
+        | _ => .error (.layoutErr .unsizedField)
   | .str =>
     match md with
     | .sliceLen len => .ok (len, 1)
@@ -9171,26 +10486,33 @@ def checkNestedWideSafeRefChildSession (oracle : NestedDynMetaOracle) (inner : P
   match computeTyLayout inner with
   | .error e => .error (.layoutErr e)
   | .ok lay =>
-    let mdRes : Except PointeeByteErr DynMetaVal :=
+    let expectedWidth : Nat :=
       match lay.metaKind with
-      | some .sliceLen => .ok (.sliceLen (decodeLeUInt64 (rawBytes.drop 8)).toNat)
-      | some .dynVTable =>
-        match oracle ((unsizedDynTailTrait? inner).getD "") (rawBytes.drop 8) with
-        | .error e => .error e
-        | .ok (sz, al) => .ok (.vtable sz al)
-      | some .foreignNone | none => .ok .thin
-    match mdRes with
-    | .error e => .error e
-    | .ok md =>
-      let sizeAlign : Except PointeeByteErr (Nat × Nat) :=
-        match md with
-        | .thin => .ok (lay.sizeBytes, lay.alignBytes)
-        | _ => dynSizeAlign md inner
-      match sizeAlign with
+      | some .sliceLen | some .dynVTable => 16
+      | some .foreignNone | none => 8
+    if rawBytes.length != expectedWidth then
+      .error .outOfBoundsPointeeRead
+    else
+      let mdRes : Except PointeeByteErr DynMetaVal :=
+        match lay.metaKind with
+        | some .sliceLen => .ok (.sliceLen (decodeLeUInt64 (rawBytes.drop 8)).toNat)
+        | some .dynVTable =>
+          match oracle ((unsizedDynTailTrait? inner).getD "") (rawBytes.drop 8) with
+          | .error e => .error e
+          | .ok (sz, al) => .ok (.vtable sz al)
+        | some .foreignNone | none => .ok .thin
+      match mdRes with
       | .error e => .error e
-      | .ok (sz, al) =>
-        if sz > maxObjectSize64 then .error .nestedSliceTooBig
-        else checkNestedSafeRefWord sz al lay.isInhabited (rawBytes.take 8)
+      | .ok md =>
+        let sizeAlign : Except PointeeByteErr (Nat × Nat) :=
+          match md with
+          | .thin => .ok (lay.sizeBytes, lay.alignBytes)
+          | _ => dynSizeAlign md inner
+        match sizeAlign with
+        | .error e => .error e
+        | .ok (sz, al) =>
+          if sz > maxObjectSize64 then .error .nestedSliceTooBig
+          else checkNestedSafeRefWord sz al lay.isInhabited (rawBytes.take 8)
 
 mutual
 /-- Recursive pointee byte visitor matching `ValidityVisitor.visit` (`lines 300-471`):
@@ -9236,21 +10558,34 @@ def visitConcreteValue (fuel : Nat) (bytes : List MemByte) (offset : Nat) (ty : 
         if addr == 0 then .error .nullFnPtr else .ok ()
     | .rawPtr _ inner =>
       match unsizedMetadataTail inner with
-      | none | some .foreignNone =>
+      | none =>
         match readInitBytesAt bytes offset 8 with
         | .error e => .error e
         | .ok _ => .ok ()
+      | some .foreignNone =>
+        match readInitBytesAt bytes offset 8 with
+        | .error e => .error e
+        | .ok _ =>
+          match computeTyLayout inner with
+          | .error e => .error (.layoutErr e)
+          | .ok _ => .ok ()
       | some .sliceLen =>
         match readInitBytesAt bytes offset 16 with
         | .error e => .error e
-        | .ok _ => .ok ()
+        | .ok _ =>
+          match computeTyLayout inner with
+          | .error e => .error (.layoutErr e)
+          | .ok _ => .ok ()
       | some .dynVTable =>
         match readInitBytesAt bytes offset 16 with
         | .error e => .error e
         | .ok bs =>
-          match oracle ((unsizedDynTailTrait? inner).getD "") (bs.drop 8) with
-          | .error e => .error e
-          | .ok _ => .ok ()
+          match computeTyLayout inner with
+          | .error e => .error (.layoutErr e)
+          | .ok _ =>
+            match oracle ((unsizedDynTailTrait? inner).getD "") (bs.drop 8) with
+            | .error e => .error e
+            | .ok _ => .ok ()
     | .ref _ inner =>
       match unsizedMetadataTail inner with
       | none =>
@@ -9340,33 +10675,38 @@ def validateWideDynSafePtrWithBytes (w : KeyedAllocWorld) (reg : VTableRegistry)
       | .error pe => .error (.pointeeErr pe)
     else .ok vt
 
-/-- Hardened wide-`dyn` safe-pointer validator: `validateWideDynSafePtrWithBytes` with
-1. a `VTableData.layoutConsistent` gate before any pointee byte is read, so the recursive visitor never
-   reads outside the `[offset, offset + vt.sizeBytes)` range validated by the root access check
-   (upstream obtains BOTH from `layout_of`, so they cannot disagree); and
-2. the world-backed `worldNestedDynOracle`, so nested `&dyn Trait` / `*const dyn Trait` values have their
-   vtable words validated against `(w, reg)` instead of failing closed. -/
+/-- Hardened wide-`dyn` safe-pointer validator matching `ValidityVisitor.checkSafe` (`lines 202-241`) and
+`VTable.getSizeAndAlignRead` (`VTable.lean:97-102`):
+1. validates the vtable half (`validateVTableHalf`) and enforces `VTableData.layoutConsistent` BEFORE any
+   data-pointer check (`checkPtrAccess`, `mayDangle` `addressTooClose`, null, alignment) in ALL modes
+   (shallow, `mayDangle`, and recursive), so an inconsistent vtable can never bypass access/alignment
+   checks or read past the access-checked pointee range; and
+2. runs the recursive concrete-pointee visitor with `worldNestedDynOracle` (which itself enforces
+   `VTableData.layoutConsistent` on every nested `&dyn Trait` / `*const dyn Trait`). -/
 def validateWideDynSafePtrDeep (w : KeyedAllocWorld) (reg : VTableRegistry)
     (resolveTrait : String → DynExistentialSpec) (vtBase : MiriAllocId → Option UInt64)
     (vptr : VTablePtrVal) (dptr : WideDataPtrVal) (expected : DynExistentialSpec)
     (mayDangle : Bool := false) (recursive : Bool := false) (fuel : Nat := 64) :
     Except WideDynErr VTableData :=
-  match validateWideDynSafePtr w reg vptr dptr expected mayDangle false with
+  match validateVTableHalf w reg vptr expected with
   | .error e => .error e
   | .ok vt =>
-    if recursive && !mayDangle then
-      if !vt.layoutConsistent then .error (.pointeeErr .vtableLayoutMismatch)
-      else
-        let (bytes, baseOff) :=
-          match dptr with
-          | .provenanced id off _ => ((w.findAllocBytes? id).getD [], off.toNat)
-          | .maybeNull id off _ => ((w.findAllocBytes? id).getD [], off.toNat)
-          | .danglingInt _ | .null => ([], 0)
-        match visitTrackedConcretePointee fuel bytes baseOff vt.concreteTy
-            (worldNestedDynOracle w reg resolveTrait vtBase) with
-        | .ok () => .ok vt
-        | .error pe => .error (.pointeeErr pe)
-    else .ok vt
+    if !vt.layoutConsistent then .error (.pointeeErr .vtableLayoutMismatch)
+    else
+      match validateWideDynSafePtr w reg vptr dptr expected mayDangle false with
+      | .error e => .error e
+      | .ok vt' =>
+        if recursive && !mayDangle then
+          let (bytes, baseOff) :=
+            match dptr with
+            | .provenanced id off _ => ((w.findAllocBytes? id).getD [], off.toNat)
+            | .maybeNull id off _ => ((w.findAllocBytes? id).getD [], off.toNat)
+            | .danglingInt _ | .null => ([], 0)
+          match visitTrackedConcretePointee fuel bytes baseOff vt'.concreteTy
+              (worldNestedDynOracle w reg resolveTrait vtBase) with
+          | .ok () => .ok vt'
+          | .error pe => .error (.pointeeErr pe)
+        else .ok vt'
 
 /-- Helper constructing an `n`-level nested single-element array `[[...[base; 1]...; 1]; 1]`. -/
 def nestSingleElemArray : Nat → ProtoTy → ProtoTy
@@ -9758,64 +11098,95 @@ theorem VTableData.layoutConsistent_spec (vt : VTableData) (h : vt.layoutConsist
     rcases h with ⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩
     exact ⟨lay, rfl, h1, h2, h4, h3, by rw [h2]; exact h5⟩
 
-/-- Outside the recursive non-dangling mode the hardened validator is exactly the root validator. -/
+/-- Outside the recursive non-dangling mode, the hardened validator coincides with the root validator
+whenever any valid vtable satisfies `VTableData.layoutConsistent` (and identically reports any
+`validateVTableHalf` failure unconditionally). -/
 theorem validateWideDynSafePtrDeep_nonrecursive_eq_root
     (w : KeyedAllocWorld) (reg : VTableRegistry) (resolveTrait : String → DynExistentialSpec)
     (vtBase : MiriAllocId → Option UInt64) (vptr : VTablePtrVal) (dptr : WideDataPtrVal)
     (expected : DynExistentialSpec) (mayDangle recursive : Bool) (fuel : Nat)
-    (h : (recursive && !mayDangle) = false) :
+    (h : (recursive && !mayDangle) = false)
+    (hcons : ∀ vt, validateVTableHalf w reg vptr expected = .ok vt → vt.layoutConsistent = true) :
     validateWideDynSafePtrDeep w reg resolveTrait vtBase vptr dptr expected mayDangle recursive fuel =
       validateWideDynSafePtr w reg vptr dptr expected mayDangle false := by
   unfold validateWideDynSafePtrDeep
-  cases validateWideDynSafePtr w reg vptr dptr expected mayDangle false with
-  | error e => rfl
-  | ok vt => simp [h]
+  cases hvt : validateVTableHalf w reg vptr expected with
+  | error e =>
+    simp [validateWideDynSafePtr, hvt]
+  | ok vt =>
+    have hc := hcons vt hvt
+    simp only [hc, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+    cases validateWideDynSafePtr w reg vptr dptr expected mayDangle false with
+    | error e => rfl
+    | ok vt' => simp [h]
 
 /-- A vtable whose recorded size / alignment disagree with its concrete type's layout is rejected by the
-hardened validator BEFORE any pointee byte is read. -/
+hardened validator BEFORE any data-pointer check or pointee byte read, across ALL modes (shallow,
+`mayDangle`, and recursive), matching `VTable.getSizeAndAlignRead` (`ValidityVisitor.lean:203`). -/
 theorem validateWideDynSafePtrDeep_layoutMismatch_rejected
     (w : KeyedAllocWorld) (reg : VTableRegistry) (resolveTrait : String → DynExistentialSpec)
     (vtBase : MiriAllocId → Option UInt64) (vptr : VTablePtrVal) (dptr : WideDataPtrVal)
-    (expected : DynExistentialSpec) (fuel : Nat) (vt : VTableData)
-    (hroot : validateWideDynSafePtr w reg vptr dptr expected false false = .ok vt)
+    (expected : DynExistentialSpec) (mayDangle recursive : Bool) (fuel : Nat) (vt : VTableData)
+    (hvt : validateVTableHalf w reg vptr expected = .ok vt)
     (hbad : vt.layoutConsistent = false) :
-    validateWideDynSafePtrDeep w reg resolveTrait vtBase vptr dptr expected false true fuel =
+    validateWideDynSafePtrDeep w reg resolveTrait vtBase vptr dptr expected mayDangle recursive fuel =
       .error (.pointeeErr .vtableLayoutMismatch) := by
-  simp [validateWideDynSafePtrDeep, hroot, hbad]
+  simp [validateWideDynSafePtrDeep, hvt, hbad]
 
-/-- Nested `&[T]` under `childSession` for ANY oracle: the length word scales the element size, a dynamic
-size above `isize::MAX` is `InvalidMeta`, and the data word is checked with the DYNAMIC size and the
-element alignment (the slice type itself is always inhabited). -/
+/-- Nested `&[T]` under `childSession` for ANY oracle (given a full 16-byte wide pointer): the length
+word scales the element size, a dynamic size above `isize::MAX` is `InvalidMeta`, and the data word is
+checked with the DYNAMIC size and the element alignment (the slice type itself is always inhabited). -/
 theorem checkNestedWideSafeRefChildSession_slice
     (oracle : NestedDynMetaOracle) (elem : ProtoTy) (el : ProtoLayout)
     (rawBytes : List (UInt8 × Option MiriAllocId))
-    (hl : computeTyLayout elem = .ok el) (hsized : el.isSized = true) :
+    (hl : computeTyLayout elem = .ok el) (hsized : el.isSized = true)
+    (hlen : rawBytes.length = 16) :
     checkNestedWideSafeRefChildSession oracle (.slice elem) rawBytes =
       if el.sizeBytes * (decodeLeUInt64 (rawBytes.drop 8)).toNat > maxObjectSize64 then
         .error .nestedSliceTooBig
       else
         checkNestedSafeRefWord (el.sizeBytes * (decodeLeUInt64 (rawBytes.drop 8)).toNat)
           el.alignBytes true (rawBytes.take 8) := by
-  simp [checkNestedWideSafeRefChildSession, computeTyLayout, dynSizeAlign, hl, hsized]
+  simp [checkNestedWideSafeRefChildSession, computeTyLayout, dynSizeAlign, hl, hsized, hlen]
 
-/-- Nested `&dyn Trait` under `childSession`: the vtable word is validated by the oracle BEFORE every
-data-word check (vtable-first precedence, `lean-miri#82`), and the data word is then checked with the
-vtable's concrete size and alignment. -/
+/-- Nested `&dyn Trait` under `childSession` (given a full 16-byte wide pointer): the vtable word is
+validated by the oracle BEFORE every data-word check (vtable-first precedence, `lean-miri#82`), and
+the data word is then checked with the vtable's concrete size and alignment. -/
 theorem checkNestedWideSafeRefChildSession_dyn
     (oracle : NestedDynMetaOracle) (traitName : String)
-    (rawBytes : List (UInt8 × Option MiriAllocId)) :
+    (rawBytes : List (UInt8 × Option MiriAllocId))
+    (hlen : rawBytes.length = 16) :
     checkNestedWideSafeRefChildSession oracle (.dynamic traitName) rawBytes =
       match oracle traitName (rawBytes.drop 8) with
       | .error e => .error e
       | .ok (sz, al) =>
         if sz > maxObjectSize64 then .error .nestedSliceTooBig
         else checkNestedSafeRefWord sz al true (rawBytes.take 8) := by
-  simp only [checkNestedWideSafeRefChildSession, computeTyLayout, unsizedDynTailTrait?, Option.getD]
+  simp only [checkNestedWideSafeRefChildSession, computeTyLayout, unsizedDynTailTrait?, Option.getD,
+    hlen, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte]
   cases oracle traitName (rawBytes.drop 8) with
   | error e => rfl
   | ok p =>
     rcases p with ⟨sz, al⟩
     simp [dynSizeAlign]
+
+/-- Direct calls to `checkNestedWideSafeRefChildSession` on truncated buffers fail closed with
+`.outOfBoundsPointeeRead` instead of silently zero-decoding missing metadata bytes. -/
+theorem checkNestedWideSafeRefChildSession_truncated_rejected
+    (oracle : NestedDynMetaOracle) (rawBytes : List (UInt8 × Option MiriAllocId))
+    (hshort : rawBytes.length ≠ 16) :
+    checkNestedWideSafeRefChildSession oracle (.slice (.uint 4)) rawBytes =
+      .error .outOfBoundsPointeeRead ∧
+    checkNestedWideSafeRefChildSession oracle (.dynamic "Send") rawBytes =
+      .error .outOfBoundsPointeeRead := by
+  have hbne : (rawBytes.length != 16) = true := bne_iff_ne.2 hshort
+  constructor <;> simp [checkNestedWideSafeRefChildSession, computeTyLayout, hbne]
+
+/-- Direct calls to `dynSizeAlign` on a slice of an unsized element fail closed with `.unsizedField`. -/
+theorem dynSizeAlign_unsizedSliceElem_rejected (len : Nat) :
+    dynSizeAlign (.sliceLen len) (.slice (.slice (.uint 4))) = .error (.layoutErr .unsizedField) ∧
+    dynSizeAlign (.sliceLen len) (.slice (.dynamic "Send")) = .error (.layoutErr .unsizedField) :=
+  ⟨rfl, rfl⟩
 
 /-- A nested RAW wide `dyn` pointer must carry a valid vtable (`ValidityVisitor.primitive .rawPointer` →
 `checkMetadata`): all 16 bytes must be initialized and the metadata word must pass the oracle, while the
@@ -9830,7 +11201,28 @@ theorem visitConcreteValue_nestedRawWideDyn
         match oracle traitName (bs.drop 8) with
         | .error e => .error e
         | .ok _ => .ok () := by
-  simp only [visitConcreteValue, unsizedMetadataTail, unsizedDynTailTrait?, Option.getD]
+  simp only [visitConcreteValue, unsizedMetadataTail, computeTyLayout, unsizedDynTailTrait?, Option.getD]
+
+/-- Unsized nested raw pointers compute `computeTyLayout inner` (`ptrToPlace`, `ValidityVisitor.lean:324`)
+BEFORE metadata checks: layout overflow and unsized non-final fields are rejected fail-closed even for
+raw `*const [T]`, `*const Extern`, and `*const (..., dyn Trait)` pointers (before consulting `oracle`). -/
+theorem visitConcreteValue_nestedRawUnsized_layout_checked (oracle : NestedDynMetaOracle) :
+    let w16 := encodeLeUInt64Bytes 0 ++ encodeLeUInt64Bytes 0
+    let w8 := encodeLeUInt64Bytes 0
+    visitConcreteValue 4 w16 0
+      (.rawPtr false (.tuple [.array (.uint 1) (maxObjectSize64 + 1), .slice (.uint 1)])) oracle =
+      .error (.layoutErr .layoutOverflow) ∧
+    visitConcreteValue 4 w16 0 (.rawPtr false (.slice (.slice (.uint 1)))) oracle =
+      .error (.layoutErr .unsizedField) ∧
+    visitConcreteValue 4 w16 0 (.rawPtr false (.tuple [.slice (.uint 1), .dynamic "Send"])) oracle =
+      .error (.layoutErr .unsizedField) ∧
+    visitConcreteValue 4 w8 0
+      (.rawPtr false (.tuple [.array (.uint 1) (maxObjectSize64 + 1), .foreign])) oracle =
+      .error (.layoutErr .layoutOverflow) := by
+  refine ⟨?_, ?_, ?_, ?_⟩ <;>
+    simp [visitConcreteValue, unsizedMetadataTail, fieldsUnsizedMetadataTail,
+      readInitBytesAt, readInitBytesAt.go, encodeLeUInt64Bytes,
+      computeTyLayout, computeFieldsLayout, maxObjectSize64]
 
 /-- A nested safe reference to a slice- / `str`- / `dyn`-tailed pointee reads its FULL 16-byte wide
 pointer (data word AND metadata word) before any check. -/
@@ -9891,29 +11283,34 @@ theorem dynSizeAlign_customDst_cases :
     dynSizeAlign .thin (.slice (.uint 4)) = .error (.layoutErr .unsizedField) := by
   exact ⟨rfl, rfl, rfl, rfl, rfl⟩
 
-/-- Soundness of the world-backed nested `dyn` oracle: it answers exactly `validateVTableHalf` on the
-decoded vtable word — a valid vtable yields its concrete `(sizeBytes, 2 ^ alignPow2)`, and every vtable
-failure is `.nestedInvalidVTable`. -/
+/-- Soundness of the world-backed nested `dyn` oracle: it answers `validateVTableHalf` gated by
+`VTableData.layoutConsistent` — a layout-consistent valid vtable yields its concrete
+`(sizeBytes, 2 ^ alignPow2)`, whereas both vtable errors AND layout-inconsistent vtables are rejected
+with `.nestedInvalidVTable`. -/
 theorem worldNestedDynOracle_spec (w : KeyedAllocWorld) (reg : VTableRegistry)
     (resolveTrait : String → DynExistentialSpec) (vtBase : MiriAllocId → Option UInt64)
     (traitName : String) (word : List (UInt8 × Option MiriAllocId)) :
     (∀ vt, validateVTableHalf w reg (decodeVTableWord vtBase word) (resolveTrait traitName) = .ok vt →
-      vt.alignPow2.toNat ≤ 29 →
+      vt.layoutConsistent = true →
       worldNestedDynOracle w reg resolveTrait vtBase traitName word =
         .ok (vt.sizeBytes.toNat, 2 ^ vt.alignPow2.toNat)) ∧
+    (∀ vt, validateVTableHalf w reg (decodeVTableWord vtBase word) (resolveTrait traitName) = .ok vt →
+      vt.layoutConsistent = false →
+      worldNestedDynOracle w reg resolveTrait vtBase traitName word = .error .nestedInvalidVTable) ∧
     (∀ err, validateVTableHalf w reg (decodeVTableWord vtBase word) (resolveTrait traitName) = .error err →
       worldNestedDynOracle w reg resolveTrait vtBase traitName word = .error .nestedInvalidVTable) := by
-  constructor
-  · intro vt hvt hal
-    have hnot : ¬ (vt.alignPow2.toNat > 29) := by omega
-    simp [worldNestedDynOracle, hvt, hnot]
+  refine ⟨?_, ?_, ?_⟩
+  · intro vt hvt hcons
+    simp [worldNestedDynOracle, hvt, hcons]
+  · intro vt hvt hbad
+    simp [worldNestedDynOracle, hvt, hbad]
   · intro err herr
     simp [worldNestedDynOracle, herr]
 
 /-- Vtable-word decoding: a provenance-free zero word is the null vtable, a provenance-free non-zero
-word a dangling integer, a word whose 8 bytes all carry provenance `id` at the vtable's base address is
-`.provenanced id 0`, one byte past the base is a non-zero offset, and a word with MIXED provenance reads
-as a provenance-free integer. -/
+word a dangling integer, a word whose 8 bytes all carry provenance `id` at the vtable's non-zero base
+address is `.provenanced id 0`, one byte past the base is a non-zero offset, a word with MIXED provenance
+reads as a provenance-free integer, and a hypothetical base address `0` is rejected as `.danglingInt`. -/
 theorem decodeVTableWord_cases :
     let id : MiriAllocId := ⟨7, by decide⟩
     let vtBase : MiriAllocId → Option UInt64 := fun q => if q = id then some 4096 else none
@@ -9924,8 +11321,9 @@ theorem decodeVTableWord_cases :
     decodeVTableWord vtBase (word 0 (some id)) = .provenanced id 0 ∧
     decodeVTableWord vtBase (word 1 (some id)) = .provenanced id 1 ∧
     decodeVTableWord vtBase ((0, none) :: (word 0 (some id)).drop 1) = .danglingInt 4096 ∧
-    decodeVTableWord (fun _ => none) (word 0 (some id)) = .danglingInt 4096 := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩ <;> first | rfl | decide
+    decodeVTableWord (fun _ => none) (word 0 (some id)) = .danglingInt 4096 ∧
+    decodeVTableWord (fun _ => some 0) (List.replicate 8 (0, some id)) = .danglingInt 0 := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> first | rfl | decide
 
 /-- Hardened recursive validation of nested wide `dyn` pointers and vtable layout consistency:
 1. A `Box<dyn Send>`-style pointee holding a VALID nested `&dyn Send` (data word `64`, vtable word at the
@@ -9935,10 +11333,10 @@ theorem decodeVTableWord_cases :
    reported with the INNER vtable's alignment (`.nestedUnalignedSafeRef 4 66`).
 3. A nested RAW `*const dyn Send` with a null vtable word is `.nestedInvalidVTable`, and is accepted with
    a valid vtable word.
-4. A vtable recording size `0` for a concrete `u64` passes the root access check for ANY data pointer;
-   `validateWideDynSafePtrWithBytes` then reads 8 pointee bytes that were never access-checked (accepting
-   in-bounds bytes and reporting `.outOfBoundsPointeeRead` past the allocation), whereas
-   `validateWideDynSafePtrDeep` rejects the vtable with `.vtableLayoutMismatch` before reading any byte. -/
+4. A vtable recording size `0` for a concrete `u64` (`vtBad`) is rejected by `validateWideDynSafePtrDeep`
+   with `.vtableLayoutMismatch` in ALL modes (recursive, shallow, and `mayDangle`), AND when embedded as
+   the inner vtable of a nested `&dyn Send` or `*const dyn Send`, `worldNestedDynOracle` rejects it with
+   `.nestedInvalidVTable`. -/
 theorem wideDynDeep_nestedDyn_rawDyn_and_layoutMismatch :
     let spec : DynExistentialSpec := ⟨none, AutoTraitSet.ofList [.send], []⟩
     let rt : String → DynExistentialSpec := fun _ => spec
@@ -9956,13 +11354,16 @@ theorem wideDynDeep_nestedDyn_rawDyn_and_layoutMismatch :
         allocToData := (((ExtTreeMap0.empty.insert idVtOuter vtOuter).insert idVtInner vtInner).insert idVtRaw vtRaw).insert idVtBad vtBad }
     let wBase : KeyedAllocWorld :=
       (((KeyedAllocWorld.empty.registerGlobal idVtOuter ⟨.vtable, 24, 3, .not, []⟩).registerGlobal idVtInner ⟨.vtable, 24, 3, .not, []⟩).registerGlobal idVtRaw ⟨.vtable, 24, 3, .not, []⟩).registerGlobal idVtBad ⟨.vtable, 24, 3, .not, []⟩
-    let vb : MiriAllocId → Option UInt64 := fun q => if q = idVtInner then some 4096 else none
+    let vb : MiriAllocId → Option UInt64 := fun q =>
+      if q = idVtInner then some 4096 else if q = idVtBad then some 8192 else none
     let wGood := wBase.insertLive idLive
       ⟨16, 3, .stack, .mut, encodeLeUInt64Bytes 64 ++ encodeLeUInt64Bytes 4096 (some idVtInner)⟩
     let wNullVt := wBase.insertLive idLive
       ⟨16, 3, .stack, .mut, encodeLeUInt64Bytes 64 ++ encodeLeUInt64Bytes 0⟩
     let wUnaligned := wBase.insertLive idLive
       ⟨16, 3, .stack, .mut, encodeLeUInt64Bytes 66 ++ encodeLeUInt64Bytes 4096 (some idVtInner)⟩
+    let wBadInner := wBase.insertLive idLive
+      ⟨16, 3, .stack, .mut, encodeLeUInt64Bytes 64 ++ encodeLeUInt64Bytes 8192 (some idVtBad)⟩
     let wU64 := wBase.insertLive idLive ⟨8, 3, .stack, .mut, encodeLeUInt64Bytes 7⟩
     validateWideDynSafePtrWithBytes wGood reg (.provenanced idVtOuter 0) (.provenanced idLive 0 16) spec false true =
       .error (.pointeeErr .nestedDynVTableUnresolved) ∧
@@ -9982,9 +11383,15 @@ theorem wideDynDeep_nestedDyn_rawDyn_and_layoutMismatch :
       .error (.pointeeErr .outOfBoundsPointeeRead) ∧
     validateWideDynSafePtrDeep wU64 reg rt vb (.provenanced idVtBad 0) (.provenanced idLive 0 16) spec false true =
       .error (.pointeeErr .vtableLayoutMismatch) ∧
-    validateWideDynSafePtrDeep wU64 reg rt vb (.provenanced idVtBad 0) (.provenanced idLive 4 16) spec false true =
-      .error (.pointeeErr .vtableLayoutMismatch) := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
+    validateWideDynSafePtrDeep wU64 reg rt vb (.provenanced idVtBad 0) (.provenanced idLive 4 16) spec false false =
+      .error (.pointeeErr .vtableLayoutMismatch) ∧
+    validateWideDynSafePtrDeep wU64 reg rt vb (.provenanced idVtBad 0) (.danglingInt 18446744073709551611) spec true false =
+      .error (.pointeeErr .vtableLayoutMismatch) ∧
+    validateWideDynSafePtrDeep wBadInner reg rt vb (.provenanced idVtOuter 0) (.provenanced idLive 0 16) spec false true =
+      .error (.pointeeErr .nestedInvalidVTable) ∧
+    validateWideDynSafePtrDeep wBadInner reg rt vb (.provenanced idVtRaw 0) (.provenanced idLive 0 16) spec false true =
+      .error (.pointeeErr .nestedInvalidVTable) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
   · simp [validateWideDynSafePtrWithBytes, validateWideDynSafePtrDeep, validateWideDynSafePtr,
       validateVTableHalf,
       KeyedAllocWorld.insertLive, KeyedAllocWorld.registerGlobal, KeyedAllocWorld.getAllocInfo,
