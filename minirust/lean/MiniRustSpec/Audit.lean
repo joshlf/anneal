@@ -5740,6 +5740,8 @@ open MiniRustSpec.Correspondence in
   minirust_setDiscriminant_tagger_order
   minirust_resumeUnwind_teardown_error
   minirust_unwind_setDiscriminant_step_witness
+  minirust_tb_call_validate_unwind_protector_step_witness
+  minirust_setDiscriminant_field_and_encode_witness
   evalLIntrinsic_sizeOfVal_alignOfVal_str_minirust_layout
   evalLoweredIntrinsicCall_target_none_minirust_ub
   lintrinsicOp_exhaustive_minirust_classification

@@ -2423,21 +2423,35 @@ private theorem activeThread_set {m : Mach} {t : Gen.Thread BM} (t' : Gen.Thread
   exact listIndex_set_self t' hge hget _
 
 /-- `Machine::jump_to_block` on a machine whose active thread is `t` with top
-frame `fr`: only the program counter of `fr` changes. -/
+frame `fr`: only the program counter of `fr` changes, and every non-active
+thread in `m.threads` is preserved. -/
 private theorem jumpToBlock_activeThread {m : Mach} {t : Gen.Thread BM} {fr : Frame}
     (b : Gen.BbName) (ht : Interp.activeThread m = .ok t)
     (hfr : t.stack.getLast? = some fr) :
     ∃ m', Interp.jumpToBlock m b = .ok m' ∧
       Interp.activeThread m' = .ok
         { t with stack := t.stack.dropLast ++ [{ fr with next_block := b, next_stmt := 0 }] } ∧
-      m'.mem = m.mem := by
+      m'.mem = m.mem ∧
+      m'.threads.length = m.threads.length ∧
+      (∀ i, i ≠ m.active_thread.toNat → m'.threads[i]? = m.threads[i]?) := by
   obtain ⟨hge, hget⟩ := listIndex_ok_get ht
   have hlt : m.active_thread.toNat < m.threads.length :=
     (List.getElem?_eq_some_iff.mp hget).1
-  refine ⟨_, ?_, activeThread_set _ ht, rfl⟩
+  refine ⟨_, ?_, activeThread_set _ ht, rfl, List.length_set,
+    fun i hne => List.getElem?_set_ne (Ne.symm hne)⟩
   unfold Interp.jumpToBlock Interp.mutateCurFrame
   rw [ht]
   simp [hfr, listSet, hge, hlt]
+
+/-- `Machine::jump_to_block` fails with `specPanic` when the active thread's
+stack is empty. -/
+private theorem jumpToBlock_empty_stack {m : Mach} {t : Gen.Thread BM}
+    (b : Gen.BbName) (ht : Interp.activeThread m = .ok t) (hemp : t.stack = []) :
+    Interp.jumpToBlock m b =
+      .error (.specPanic "`try_mutate_cur_frame` called on empty stack!") := by
+  unfold Interp.jumpToBlock Interp.mutateCurFrame
+  rw [ht]
+  simp [hemp, specPanic]
 
 /-- `StackFrame::storage_dead` changes only the `locals` of the frame. -/
 private theorem storageDead_stack_pop_action {fr fr' : Frame}
@@ -2509,7 +2523,8 @@ private theorem activeThreadM_set {M : Type} [Gen.Memory M]
   exact listIndex_set_self t' hge hget _
 
 /-- Polymorphic `Machine::jump_to_block` on a machine whose active thread is `t`
-with top frame `fr`: only the program counter of `fr` changes. -/
+with top frame `fr`: only the program counter of `fr` changes, and every
+non-active thread in `m.threads` is preserved. -/
 private theorem jumpToBlockM_activeThread {M : Type} [Gen.Memory M]
     {m : Gen.Machine M} {t : Gen.Thread M} {fr : Gen.StackFrame M}
     (b : Gen.BbName) (ht : Interp.activeThreadM m = .ok t)
@@ -2517,14 +2532,28 @@ private theorem jumpToBlockM_activeThread {M : Type} [Gen.Memory M]
     ∃ m', Interp.jumpToBlockM m b = .ok m' ∧
       Interp.activeThreadM m' = .ok
         { t with stack := t.stack.dropLast ++ [{ fr with next_block := b, next_stmt := 0 }] } ∧
-      m'.mem = m.mem := by
+      m'.mem = m.mem ∧
+      m'.threads.length = m.threads.length ∧
+      (∀ i, i ≠ m.active_thread.toNat → m'.threads[i]? = m.threads[i]?) := by
   obtain ⟨hge, hget⟩ := listIndex_ok_get ht
   have hlt : m.active_thread.toNat < m.threads.length :=
     (List.getElem?_eq_some_iff.mp hget).1
-  refine ⟨_, ?_, activeThreadM_set _ ht, rfl⟩
+  refine ⟨_, ?_, activeThreadM_set _ ht, rfl, List.length_set,
+    fun i hne => List.getElem?_set_ne (Ne.symm hne)⟩
   unfold Interp.jumpToBlockM Interp.mutateCurFrameM
   rw [ht]
   simp [hfr, listSet, hge, hlt]
+
+/-- Polymorphic `Machine::jump_to_block` fails with `specPanic` when the active
+thread's stack is empty. -/
+private theorem jumpToBlockM_empty_stack {M : Type} [Gen.Memory M]
+    {m : Gen.Machine M} {t : Gen.Thread M}
+    (b : Gen.BbName) (ht : Interp.activeThreadM m = .ok t) (hemp : t.stack = []) :
+    Interp.jumpToBlockM m b =
+      .error (.specPanic "`try_mutate_cur_frame` called on empty stack!") := by
+  unfold Interp.jumpToBlockM Interp.mutateCurFrameM
+  rw [ht]
+  simp [hemp, specPanic]
 
 /-- Polymorphic `StackFrame::storage_dead` preserves `stack_pop_action` and
 `extra`. -/
@@ -2584,8 +2613,11 @@ with `.unsupported`:
   and on `Machine M` runs `ConcurrentMemory.end_call cm fr.extra` before
   inspecting `stack_pop_action` (so any `end_call` failure preempts both
   `BottomOfStack` and missing `unwind_block`), then raises UB on
-  `BottomOfStack` or `unwind_block = none`, and otherwise leaves
-  `unwind_payloads` intact and jumps to `unwind_block` in the caller frame.
+  `BottomOfStack` or `unwind_block = none`, raises `specPanic` if
+  `BackToCaller _ (some ubBlk) _` has no caller frame left after popping, and
+  otherwise leaves `unwind_payloads` intact and jumps to `unwind_block` in the
+  caller frame. Every successful unwinding terminator leaves all non-active
+  threads untouched.
 
 Concrete non-vacuous witnesses discharging every branch on both `Mach` and
 `MachTB` (including live-local teardown and Tree Borrows protector release) are
@@ -2603,7 +2635,9 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
           { stack := t.stack.dropLast ++ [{ fr with next_block := blk, next_stmt := 0 }],
             state := t.state,
             unwind_payloads := t.unwind_payloads ++ [p.thin_pointer] } ∧
-        m'.mem = m1.mem) ∧
+        m'.mem = m1.mem ∧
+        m'.threads.length = m1.threads.length ∧
+        (∀ i, i ≠ m1.active_thread.toNat → m'.threads[i]? = m1.threads[i]?)) ∧
     (∀ (payload : Gen.ValueExpr) (v : Val) (ty : Gen.Type) (m1 : Mach),
       (¬ ∃ p, v = .Ptr p ∧ ty = .Ptr (.Raw .None)) →
       Interp.evalValue m payload = .ok ((v, ty), m1) →
@@ -2621,7 +2655,9 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
           { stack := t.stack.dropLast ++ [{ fr with next_block := blk, next_stmt := 0 }],
             state := t.state,
             unwind_payloads := ps } ∧
-        m'.mem = m.mem) ∧
+        m'.mem = m.mem ∧
+        m'.threads.length = m.threads.length ∧
+        (∀ i, i ≠ m.active_thread.toNat → m'.threads[i]? = m.threads[i]?)) ∧
     (∀ (t : Gen.Thread BM),
       Interp.activeThread m = .ok t → t.stack = [] →
       Interp.evalTerminator m .ResumeUnwind =
@@ -2636,6 +2672,11 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
         Interp.evalTerminator m .ResumeUnwind =
           .error (.ub
             "unwinding from a function where the caller did not specify an unwind_block")) ∧
+      (∀ nextBlock unwindBlock retPtr,
+        fr.stack_pop_action = .BackToCaller nextBlock (some unwindBlock) retPtr →
+        t.stack.dropLast = [] →
+        Interp.evalTerminator m .ResumeUnwind =
+          .error (.specPanic "`try_mutate_cur_frame` called on empty stack!")) ∧
       (∀ nextBlock unwindBlock retPtr (caller : Frame),
         fr.stack_pop_action = .BackToCaller nextBlock (some unwindBlock) retPtr →
         t.stack.dropLast.getLast? = some caller →
@@ -2645,7 +2686,9 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
                 [{ caller with next_block := unwindBlock, next_stmt := 0 }],
               state := t.state,
               unwind_payloads := t.unwind_payloads } ∧
-          m'.mem = cm))) ∧
+          m'.mem = cm ∧
+          m'.threads.length = m.threads.length ∧
+          (∀ i, i ≠ m.active_thread.toNat → m'.threads[i]? = m.threads[i]?)))) ∧
     (∀ {M : Type} [Gen.Memory M] [Interp.MemoryOps M] (mM : Gen.Machine M),
       (∀ (payload : Gen.ValueExpr) (p : Gen.Pointer (Gen.Memory.Provenance M))
           (m1 : Gen.Machine M) (t : Gen.Thread M) (fr : Gen.StackFrame M),
@@ -2656,7 +2699,9 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
             { stack := t.stack.dropLast ++ [{ fr with next_block := blk, next_stmt := 0 }],
               state := t.state,
               unwind_payloads := t.unwind_payloads ++ [p.thin_pointer] } ∧
-          m'.mem = m1.mem) ∧
+          m'.mem = m1.mem ∧
+          m'.threads.length = m1.threads.length ∧
+          (∀ i, i ≠ m1.active_thread.toNat → m'.threads[i]? = m1.threads[i]?)) ∧
       (∀ (payload : Gen.ValueExpr) (v : Gen.Value M) (ty : Gen.Type) (m1 : Gen.Machine M),
         (¬ ∃ p, v = .Ptr p ∧ ty = .Ptr (.Raw .None)) →
         Interp.evalValueM mM payload = .ok ((v, ty), m1) →
@@ -2675,7 +2720,9 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
             { stack := t.stack.dropLast ++ [{ fr with next_block := blk, next_stmt := 0 }],
               state := t.state,
               unwind_payloads := ps } ∧
-          m'.mem = mM.mem) ∧
+          m'.mem = mM.mem ∧
+          m'.threads.length = mM.threads.length ∧
+          (∀ i, i ≠ mM.active_thread.toNat → m'.threads[i]? = mM.threads[i]?)) ∧
       (∀ (t : Gen.Thread M),
         Interp.activeThreadM mM = .ok t → t.stack = [] →
         Interp.evalTerminatorM mM .ResumeUnwind =
@@ -2693,6 +2740,11 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
             Interp.evalTerminatorM mM .ResumeUnwind =
               .error (.ub
                 "unwinding from a function where the caller did not specify an unwind_block")) ∧
+          (∀ nextBlock unwindBlock retPtr,
+            fr.stack_pop_action = .BackToCaller nextBlock (some unwindBlock) retPtr →
+            t.stack.dropLast = [] →
+            Interp.evalTerminatorM mM .ResumeUnwind =
+              .error (.specPanic "`try_mutate_cur_frame` called on empty stack!")) ∧
           (∀ nextBlock unwindBlock retPtr (caller : Gen.StackFrame M),
             fr.stack_pop_action = .BackToCaller nextBlock (some unwindBlock) retPtr →
             t.stack.dropLast.getLast? = some caller →
@@ -2702,13 +2754,16 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
                     [{ caller with next_block := unwindBlock, next_stmt := 0 }],
                   state := t.state,
                   unwind_payloads := t.unwind_payloads } ∧
-              m'.mem = cm2)))) := by
+              m'.mem = cm2 ∧
+              m'.threads.length = mM.threads.length ∧
+              (∀ i, i ≠ mM.active_thread.toNat → m'.threads[i]? = mM.threads[i]?))))) := by
   refine ⟨⟨?_, ?_, ?_, ?_, ?_, ?_⟩, ?_⟩
   · intro payload p m1 t fr hev ht hfr
-    obtain ⟨m', hj, hact, hmem⟩ := jumpToBlock_activeThread (fr := fr) blk
+    obtain ⟨m', hj, hact, hmem, hlen, hne⟩ := jumpToBlock_activeThread (fr := fr) blk
       (activeThread_set
         { t with unwind_payloads := t.unwind_payloads ++ [p.thin_pointer] } ht) hfr
-    refine ⟨m', ?_, hact, hmem⟩
+    refine ⟨m', ?_, hact, hmem, hlen.trans List.length_set, fun i hi =>
+      (hne i hi).trans (List.getElem?_set_ne (Ne.symm hi))⟩
     simp only [Interp.evalTerminator, hev, ok_bind]
     rw [mutateActiveThread_eq _ ht]
     exact hj
@@ -2746,9 +2801,10 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
     rw [mutateActiveThread_eq _ ht]
     simp [hemp, ub]
   · intro t ps q fr ht hps hfr
-    obtain ⟨m', hj, hact, hmem⟩ := jumpToBlock_activeThread (fr := fr) blk
+    obtain ⟨m', hj, hact, hmem, hlen, hne⟩ := jumpToBlock_activeThread (fr := fr) blk
       (activeThread_set { t with unwind_payloads := ps } ht) hfr
-    refine ⟨m', ?_, hact, hmem⟩
+    refine ⟨m', ?_, hact, hmem, hlen.trans List.length_set, fun i hi =>
+      (hne i hi).trans (List.getElem?_set_ne (Ne.symm hi))⟩
     simp only [Interp.evalTerminator]
     rw [mutateActiveThread_eq _ ht]
     simp only [hps, List.getLast?_append, List.getLast?_singleton, Option.some_or,
@@ -2783,6 +2839,7 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
       | BottomOfStack => rfl
       | BackToCaller _ unwindBlock _ => cases unwindBlock <;> rfl
     refine ⟨fun hbot => ?_, fun nextBlock retPtr hback => ?_,
+      fun nextBlock unwindBlock retPtr hback hemp => ?_,
       fun nextBlock unwindBlock retPtr caller hback hcaller => ?_⟩
     · rw [hpop, hspa, hbot]
       rfl
@@ -2793,18 +2850,27 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
             threads := m.threads.set m.active_thread.toNat { t with stack := t.stack.dropLast },
             mem := cm } = .ok { t with stack := t.stack.dropLast } :=
         activeThread_set (m := { m with mem := cm }) _ ht
-      obtain ⟨m', hj, hact', hmem⟩ := jumpToBlock_activeThread (fr := caller) unwindBlock
+      rw [hpop, hspa, hback]
+      exact jumpToBlock_empty_stack unwindBlock hact hemp
+    · have hact : Interp.activeThread
+          { m with
+            threads := m.threads.set m.active_thread.toNat { t with stack := t.stack.dropLast },
+            mem := cm } = .ok { t with stack := t.stack.dropLast } :=
+        activeThread_set (m := { m with mem := cm }) _ ht
+      obtain ⟨m', hj, hact', hmem, hlen, hne⟩ := jumpToBlock_activeThread (fr := caller) unwindBlock
         hact hcaller
-      refine ⟨m', ?_, hact', hmem⟩
+      refine ⟨m', ?_, hact', hmem, hlen.trans List.length_set, fun i hi =>
+        (hne i hi).trans (List.getElem?_set_ne (Ne.symm hi))⟩
       rw [hpop, hspa, hback]
       exact hj
   · intro M _ _ mM
     refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
     · intro payload p m1 t fr hev ht hfr
-      obtain ⟨m', hj, hact, hmem⟩ := jumpToBlockM_activeThread (fr := fr) blk
+      obtain ⟨m', hj, hact, hmem, hlen, hne⟩ := jumpToBlockM_activeThread (fr := fr) blk
         (activeThreadM_set
           { t with unwind_payloads := t.unwind_payloads ++ [p.thin_pointer] } ht) hfr
-      refine ⟨m', ?_, hact, hmem⟩
+      refine ⟨m', ?_, hact, hmem, hlen.trans List.length_set, fun i hi =>
+        (hne i hi).trans (List.getElem?_set_ne (Ne.symm hi))⟩
       simp only [Interp.evalTerminatorM, hev, ok_bind]
       rw [mutateActiveThreadM_eq _ ht]
       exact hj
@@ -2842,9 +2908,10 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
       rw [mutateActiveThreadM_eq _ ht]
       simp [hemp, ub]
     · intro t ps q fr ht hps hfr
-      obtain ⟨m', hj, hact, hmem⟩ := jumpToBlockM_activeThread (fr := fr) blk
+      obtain ⟨m', hj, hact, hmem, hlen, hne⟩ := jumpToBlockM_activeThread (fr := fr) blk
         (activeThreadM_set { t with unwind_payloads := ps } ht) hfr
-      refine ⟨m', ?_, hact, hmem⟩
+      refine ⟨m', ?_, hact, hmem, hlen.trans List.length_set, fun i hi =>
+        (hne i hi).trans (List.getElem?_set_ne (Ne.symm hi))⟩
       simp only [Interp.evalTerminatorM]
       rw [mutateActiveThreadM_eq _ ht]
       simp only [hps, List.getLast?_append, List.getLast?_singleton, Option.some_or,
@@ -2888,6 +2955,7 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
       · rw [hpre, herr]
         rfl
       · refine ⟨fun hbot => ?_, fun nextBlock retPtr hback => ?_,
+          fun nextBlock unwindBlock retPtr hback hemp => ?_,
           fun nextBlock unwindBlock retPtr caller hback hcaller => ?_⟩
         · rw [hpre, hok, ok_bind, hbot]
           rfl
@@ -2899,9 +2967,18 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
                   { t with stack := t.stack.dropLast },
                 mem := cm2 } = .ok { t with stack := t.stack.dropLast } :=
             activeThreadM_set (m := { mM with mem := cm2 }) _ ht
-          obtain ⟨m', hj, hact', hmem⟩ := jumpToBlockM_activeThread (fr := caller) unwindBlock
-            hact hcaller
-          refine ⟨m', ?_, hact', hmem⟩
+          rw [hpre, hok, ok_bind, hback]
+          exact jumpToBlockM_empty_stack unwindBlock hact hemp
+        · have hact : Interp.activeThreadM
+              { mM with
+                threads := mM.threads.set mM.active_thread.toNat
+                  { t with stack := t.stack.dropLast },
+                mem := cm2 } = .ok { t with stack := t.stack.dropLast } :=
+            activeThreadM_set (m := { mM with mem := cm2 }) _ ht
+          obtain ⟨m', hj, hact', hmem, hlen, hne⟩ := jumpToBlockM_activeThread (fr := caller)
+            unwindBlock hact hcaller
+          refine ⟨m', ?_, hact', hmem, hlen.trans List.length_set, fun i hi =>
+            (hne i hi).trans (List.getElem?_set_ne (Ne.symm hi))⟩
           rw [hpre, hok, ok_bind, hback]
           exact hj
 
@@ -3500,41 +3577,30 @@ private def uwStepMachBM : Mach :=
     prog := uwStepProg
     fn_ptrs := ⟨[(fnName 1, ⟨0x8000, none⟩)]⟩ }
 
-/-- A Tree Borrows stack allocation as `TreeBorrowsMemory::allocate` creates
-it: `n` uninitialized bytes under a root node that is `Unique` on every byte
-and unprotected. -/
-private def uwFreshAllocTB (addr : Int) (align n : Nat) :
-    Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
-  { data := List.replicate n .Uninit
-    addr := addr
-    align := ⟨align⟩
-    kind := .Stack
-    live := true
-    extra :=
-      { root :=
-          { children := []
-            permissions := List.replicate n (.Unprot .Unique)
-            «protected» := .No } } }
-
-/-- The program of `uwStepMachBM` on `MachTB`, hand-built at the point where
-`uwStepCalleeFn` is about to execute its `SetDiscriminant`: the callee frame
-is as `eval_call` pushes it for the `Call` of `uwStepCallerFn` (return block
-`1`, unwind block `2`), and its return local and enum local are fresh
-allocations (`uwFreshAllocTB`), as after `create_frame` and `StorageLive`. -/
-private def uwStepMidMachTB : MachTB :=
-  { uwMachTB [uwFreshAllocTB 0x100 1 1, uwFreshAllocTB 0x200 1 1, uwFreshAllocTB 0x300 4 8]
+/-- `uwStepCallerFn` about to execute its `Call`, on `MachTB`: exact Tree
+Borrows counterpart of `uwStepMachBM`, starting at the caller's `Call` with
+only the caller's live `u8` return place at `0x100`. -/
+private def uwStepMachTB : MachTB :=
+  { uwMachTB [uwLiveAllocTB 0x100 .Stack (uwRootWithChildren [])]
       [{ func := uwStepCallerFn, locals := ⟨[(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, [])⟩)]⟩,
          stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0,
-         extra := ⟨[]⟩ },
-       { func := uwStepCalleeFn,
-         locals :=
-           ⟨[(⟨⟨0⟩⟩, ⟨0x200, some (⟨1⟩, [])⟩), (⟨⟨1⟩⟩, ⟨0x300, some (⟨2⟩, [])⟩)]⟩,
-         stack_pop_action :=
-           .BackToCaller (some ⟨⟨1⟩⟩) (some ⟨⟨2⟩⟩) ⟨0x100, some (⟨0⟩, [])⟩,
-         next_block := ⟨⟨0⟩⟩, next_stmt := 1, extra := ⟨[]⟩ }]
+         extra := ⟨[]⟩ }]
       [] with
     prog := uwStepProg
     fn_ptrs := ⟨[(fnName 1, ⟨0x8000, none⟩)]⟩ }
+
+/-- Extract the `Stop` error from an `Interp` result so kernel `decide` can
+check error outcomes without needing `DecidableEq` on the success type. -/
+private def interpStopOf {α : Type} (r : Interp α) : Option Interp.Stop :=
+  match r with
+  | .error e => some e
+  | .ok _ => none
+
+private theorem eq_error_of_interpStopOf {α : Type} {r : Interp α} {e : Interp.Stop}
+    (h : interpStopOf r = some e) : r = .error e := by
+  cases r with
+  | ok _ => cases h
+  | error err => cases h; rfl
 
 /-- The enum local of `uwStepCalleeFn` after `SetDiscriminant`: fresh storage
 is uninitialized, and only the three tag bytes have been written. -/
@@ -3542,18 +3608,16 @@ private def uwStepEnumBytes {P : Type} : List (Gen.AbstractByte P) :=
   [.Init 0x03 none, .Uninit, .Uninit, .Uninit,
    .Init 0x78 none, .Init 0x56 none, .Uninit, .Uninit]
 
-/-- **Unwinding and `SetDiscriminant` through `Machine::step`
-(`minirust_unwind_setDiscriminant_step_witness`)**: the other witnesses of
-this section call `evalStatement[M]` / `evalTerminator[M]` on hand-built
-frames. Here a two-function program runs through `Interp.steps` and
-`Interp.stepsTB`, so the new statement and terminators are reached through
-the block lookup, program-counter updates, and data-race check of `step`.
+/-- **Unwinding and `SetDiscriminant` through `Machine::step` on both `Mach`
+and `MachTB` from the caller's `Call`
+(`minirust_unwind_setDiscriminant_step_witness`)**: a two-function program runs
+from the caller's `Call` through all 7 steps (`Call`, `StorageLive`,
+`SetDiscriminant`, `StartUnwind`, `ResumeUnwind`, `StopUnwind`, `Unreachable`)
+under both `Interp.steps` (`Mach`) and `Interp.stepsTB` (`MachTB`), so the new
+statement and terminators are reached through the block lookup, program-counter
+updates, real `Call`/`StorageLive` allocation, and data-race check of `step`.
 Below, `pcs` is the `(next_block, next_stmt)` of every frame, bottom frame
 first.
-
-On `Mach` the run starts at the caller's `Call`, so the unwind block comes
-from that terminator and the callee's locals are made by `create_frame` and
-`StorageLive`:
 - after 3 steps (`Call`, `StorageLive`, `SetDiscriminant`) the callee's enum
   local holds exactly its three tag bytes and the callee is at statement `2`
   of its entry block;
@@ -3564,14 +3628,8 @@ from that terminator and the callee's locals are made by `create_frame` and
   the unwind block `2` named by its `Call`, not at the return block `1`;
 - after 6 steps (`StopUnwind`) the payload stack is empty and the caller is
   in block `3`;
-- the 7th step reaches the `Unreachable` of block `3`, so execution really
-  continued in the caller after the catch block.
-
-On `MachTB` the run starts from `uwStepMidMachTB`, a hand-built machine that
-already stands at the callee's `SetDiscriminant`, and takes the same last
-five steps with the same results. It does not start at the `Call`: checking
-`Call`, `StorageLive`, and the tag stores in one run by `rfl` exhausts memory
-on Tree Borrows, so the `Call` itself is exercised on `Mach` only. -/
+- the 7th step reaches the `Unreachable` of block `3`, so execution continued
+  in the caller after the catch block. -/
 theorem minirust_unwind_setDiscriminant_step_witness :
     let pcsBM (m : Mach) :=
       m.threads.map (fun t => t.stack.map (fun f => (f.next_block, f.next_stmt)))
@@ -3594,22 +3652,230 @@ theorem minirust_unwind_setDiscriminant_step_witness :
           (fun m => (m.threads.map (·.unwind_payloads), pcsBM m)) =
         some ([[]], [[(⟨⟨3⟩⟩, 0)]]) ∧
       Interp.steps 7 uwStepMachBM = .error (.ub "reached unreachable code")) ∧
-    ((Interp.stepsTB 1 uwStepMidMachTB).toOption.map
-          (fun m => (m.mem.memory.mem.allocations.map (·.data), pcsTB m)) =
-        some ([[.Uninit], [.Uninit], uwStepEnumBytes], [[(⟨⟨0⟩⟩, 0), (⟨⟨0⟩⟩, 2)]]) ∧
-      (Interp.stepsTB 2 uwStepMidMachTB).toOption.map
-          (fun m => (m.threads.map (·.unwind_payloads), pcsTB m,
-            m.mem.memory.mem.allocations.map (·.live))) =
-        some ([[payloadTB]], [[(⟨⟨0⟩⟩, 0), (⟨⟨1⟩⟩, 0)]], [true, true, true]) ∧
-      (Interp.stepsTB 3 uwStepMidMachTB).toOption.map
-          (fun m => (m.threads.map (·.unwind_payloads), pcsTB m,
-            m.mem.memory.mem.allocations.map (·.live))) =
-        some ([[payloadTB]], [[(⟨⟨2⟩⟩, 0)]], [true, false, false]) ∧
-      (Interp.stepsTB 4 uwStepMidMachTB).toOption.map
-          (fun m => (m.threads.map (·.unwind_payloads), pcsTB m)) =
-        some ([[]], [[(⟨⟨3⟩⟩, 0)]]) ∧
-      Interp.stepsTB 5 uwStepMidMachTB = .error (.ub "reached unreachable code")) :=
-  ⟨⟨rfl, rfl, rfl, rfl, rfl⟩, ⟨rfl, rfl, rfl, rfl, rfl⟩⟩
+    ((Interp.stepsTB 3 uwStepMachTB).toOption.map
+          (fun m => m.mem.memory.mem.allocations.map (·.data)) =
+        some [[.Uninit], [.Uninit], uwStepEnumBytes] ∧
+      (Interp.stepsTB 3 uwStepMachTB).toOption.map pcsTB =
+        some [[(⟨⟨0⟩⟩, 0), (⟨⟨0⟩⟩, 2)]] ∧
+      (Interp.stepsTB 4 uwStepMachTB).toOption.map (fun m => m.threads.map (·.unwind_payloads)) =
+        some [[payloadTB]] ∧
+      (Interp.stepsTB 4 uwStepMachTB).toOption.map pcsTB =
+        some [[(⟨⟨0⟩⟩, 0), (⟨⟨1⟩⟩, 0)]] ∧
+      (Interp.stepsTB 4 uwStepMachTB).toOption.map
+          (fun m => m.mem.memory.mem.allocations.map (·.live)) =
+        some [true, true, true] ∧
+      (Interp.stepsTB 5 uwStepMachTB).toOption.map (fun m => m.threads.map (·.unwind_payloads)) =
+        some [[payloadTB]] ∧
+      (Interp.stepsTB 5 uwStepMachTB).toOption.map pcsTB =
+        some [[(⟨⟨2⟩⟩, 0)]] ∧
+      (Interp.stepsTB 5 uwStepMachTB).toOption.map
+          (fun m => m.mem.memory.mem.allocations.map (·.live)) =
+        some [true, false, false] ∧
+      (Interp.stepsTB 6 uwStepMachTB).toOption.map (fun m => m.threads.map (·.unwind_payloads)) =
+        some [[]] ∧
+      (Interp.stepsTB 6 uwStepMachTB).toOption.map pcsTB =
+        some [[(⟨⟨3⟩⟩, 0)]] ∧
+      Interp.stepsTB 7 uwStepMachTB = .error (.ub "reached unreachable code")) := by
+  refine ⟨⟨rfl, rfl, rfl, rfl, rfl⟩,
+    ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+     by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+     by decide +kernel, by decide +kernel, eq_error_of_interpStopOf (by decide +kernel)⟩⟩
+
+private def uwProtRefPtrTy : Gen.PtrType :=
+  .Ref .Immutable ⟨.Sized ⟨1⟩ ⟨1⟩, true, .Sized [], true, true⟩
+
+private def uwProtCalleeFn : Gen.Function :=
+  { locals := ⟨[(⟨⟨0⟩⟩, .Int u8), (⟨⟨1⟩⟩, .Ptr uwProtRefPtrTy), (⟨⟨2⟩⟩, sdEnumTy)]⟩
+    args := [⟨⟨1⟩⟩]
+    ret := ⟨⟨0⟩⟩
+    calling_convention := .Rust
+    blocks := ⟨[
+      (⟨⟨0⟩⟩, ⟨[
+          .Validate (.Local ⟨⟨1⟩⟩) true,
+          .StorageLive ⟨⟨2⟩⟩,
+          .SetDiscriminant (.Local ⟨⟨2⟩⟩) 7],
+        .StartUnwind (uwRawThinPtrExpr 0x1000) ⟨⟨1⟩⟩, .Regular⟩),
+      (⟨⟨1⟩⟩, ⟨[], .ResumeUnwind, .Cleanup⟩)]⟩
+    start := ⟨⟨0⟩⟩
+    implicit_writes := false }
+
+private def uwProtCallerFn : Gen.Function :=
+  { locals := ⟨[(⟨⟨0⟩⟩, .Int u8), (⟨⟨1⟩⟩, .Int u8)]⟩
+    args := []
+    ret := ⟨⟨0⟩⟩
+    calling_convention := .Rust
+    blocks := ⟨[
+      (⟨⟨0⟩⟩, ⟨[],
+        .Call (fnPtrExpr (fnName 1)) .Rust
+          [.ByValue (.AddrOf (.Local ⟨⟨1⟩⟩) uwProtRefPtrTy)]
+          (.Local ⟨⟨0⟩⟩) (some ⟨⟨1⟩⟩) (some ⟨⟨2⟩⟩), .Regular⟩),
+      (⟨⟨1⟩⟩, ⟨[], .Unreachable, .Regular⟩),
+      (⟨⟨2⟩⟩, ⟨[], .StopUnwind ⟨⟨3⟩⟩, .Catch⟩),
+      (⟨⟨3⟩⟩, ⟨[.Assign (.Local ⟨⟨1⟩⟩) (.Constant (.Int 0x63) (.Int u8))],
+        .Unreachable, .Regular⟩)]⟩
+    start := ⟨⟨0⟩⟩
+    implicit_writes := false }
+
+private def uwProtProg : Gen.Program :=
+  { functions := ⟨[(fnName 0, uwProtCallerFn), (fnName 1, uwProtCalleeFn)]⟩
+    start := fnName 0
+    globals := ⟨[]⟩
+    traits := ⟨[]⟩
+    vtables := ⟨[]⟩ }
+
+private def uwProtMachTB : MachTB :=
+  let mkAlloc (addr : Int) (b : UInt8) :
+      Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
+    { data := [.Init b none]
+      addr := addr
+      align := ⟨1⟩
+      kind := .Stack
+      live := true
+      extra := { root := uwRootWithChildren [] } }
+  { uwMachTB [mkAlloc 0x100 0x00, mkAlloc 0x200 0x2A]
+      [{ func := uwProtCallerFn
+         locals := ⟨[(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, [])⟩), (⟨⟨1⟩⟩, ⟨0x200, some (⟨1⟩, [])⟩)]⟩
+         stack_pop_action := .BottomOfStack
+         next_block := ⟨⟨0⟩⟩
+         next_stmt := 0
+         extra := ⟨[]⟩ }]
+      [] with
+    prog := uwProtProg
+    fn_ptrs := ⟨[(fnName 1, ⟨0x8000, none⟩)]⟩ }
+
+private def uwAlloc1ProtStatus (m : MachTB) : Option (Gen.Protected × List Gen.Permission) :=
+  m.mem.memory.mem.allocations[1]?.bind fun a =>
+    a.extra.root.children[0]?.bind fun c0 =>
+      c0.children[0]?.map fun c00 => (c00.«protected», c00.permissions)
+
+/-- **End-to-end `MachTB` Tree Borrows protector lifecycle across `Call`,
+`Validate`, `SetDiscriminant`, `StartUnwind`, `ResumeUnwind`, and `StopUnwind`
+(`minirust_tb_call_validate_unwind_protector_step_witness`)**: runs a 9-step
+program through `Interp.stepsTB` starting at the caller's `Call` passing
+`&_1 : &u8`:
+1. After 2 steps (`Call`, `Validate (.Local _1) true`), callee's
+   `frame.extra.protectors` holds `(⟨1⟩, [0, 0])` and that borrow-tree node is
+   `.Strong` / `[.Prot (.Frozen true)]`.
+2. Negative control at step 2: writing to `_1` through caller's root provenance
+   while the protector is active raises Tree Borrows foreign-write UB on the
+   protected `Frozen` reference.
+3. After 4 steps (`StorageLive`, `SetDiscriminant`), the callee's enum local
+   holds `uwStepEnumBytes`.
+4. After 6 steps (`StartUnwind`, `ResumeUnwind`), all three callee locals are
+   dead (`[true, true, false, false, false]`), `TreeBorrowsMemory.end_call`
+   releases the protector to `.No` / `[.Unprot .Frozen]`, `unwind_payloads`
+   retains `[0x1000]`, and the caller stands at unwind block `2`.
+5. After 8 steps (`StopUnwind`, caller `Assign _1 0x63`), mutating `_1` through
+   caller's root provenance succeeds (`[.Init 0x63 none]`, child `[0, 0]` now
+   `.No` / `[.Unprot .Disabled]`), proving `ResumeUnwind` released the
+   protector, and step 9 hits `Unreachable`. -/
+theorem minirust_tb_call_validate_unwind_protector_step_witness :
+    let payloadTB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x1000, none⟩
+    ((Interp.stepsTB 2 uwProtMachTB).toOption.map (fun m =>
+        m.threads.map (fun t => t.stack.map (fun f => f.extra.protectors))) =
+      some [[[], [(⟨1⟩, [0, 0])]]]) ∧
+    ((Interp.stepsTB 2 uwProtMachTB).toOption.map uwAlloc1ProtStatus =
+      some (some (.Strong, [.Prot (.Frozen true)]))) ∧
+    ((Interp.stepsTB 2 uwProtMachTB) >>= fun m =>
+        Interp.ConcurrentMemory.store m.mem ⟨0x200, some (⟨1⟩, [])⟩ [.Init 0x63 none] ⟨1⟩ .None) =
+      .error (.ub
+        "Tree Borrows: foreign write of protected Frozen reference which had a local read") ∧
+    ((Interp.stepsTB 4 uwProtMachTB).toOption.map (fun m =>
+        m.mem.memory.mem.allocations[4]?.map (·.data)) =
+      some (some uwStepEnumBytes)) ∧
+    ((Interp.stepsTB 6 uwProtMachTB).toOption.map (fun m =>
+        m.mem.memory.mem.allocations.map (·.live)) =
+      some [true, true, false, false, false]) ∧
+    ((Interp.stepsTB 6 uwProtMachTB).toOption.map uwAlloc1ProtStatus =
+      some (some (.No, [.Unprot .Frozen]))) ∧
+    ((Interp.stepsTB 6 uwProtMachTB).toOption.map (fun m =>
+        m.threads.map (·.unwind_payloads)) =
+      some [[payloadTB]]) ∧
+    ((Interp.stepsTB 6 uwProtMachTB).toOption.map (fun m =>
+        m.threads.map (fun t => t.stack.map (fun f => (f.next_block, f.next_stmt)))) =
+      some [[(⟨⟨2⟩⟩, 0)]]) ∧
+    ((Interp.stepsTB 8 uwProtMachTB).toOption.map (fun m =>
+        m.mem.memory.mem.allocations[1]?.map (·.data)) =
+      some (some [.Init 0x63 none])) ∧
+    ((Interp.stepsTB 8 uwProtMachTB).toOption.map uwAlloc1ProtStatus =
+      some (some (.No, [.Unprot .Disabled]))) ∧
+    (Interp.stepsTB 9 uwProtMachTB = .error (.ub "reached unreachable code")) := by
+  refine ⟨by decide +kernel, by decide +kernel,
+    eq_error_of_interpStopOf (by decide +kernel), by decide +kernel, by decide +kernel,
+    by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+    by decide +kernel, eq_error_of_interpStopOf (by decide +kernel)⟩
+
+private def sdStructTy : Gen.Type :=
+  .Tuple [(⟨0⟩, .Int u32), (⟨4⟩, sdEnumTy), (⟨12⟩, .Int u32)] ⟨⟨16⟩, ⟨4⟩, none⟩ none
+
+private def sdStructInitBytes {P : Type} : List (Gen.AbstractByte P) :=
+  [.Init 0x10 none, .Init 0x20 none, .Init 0x30 none, .Init 0x40 none] ++
+    sdPayloadBytes ++
+    [.Init 0x50 none, .Init 0x60 none, .Init 0x70 none, .Init 0x80 none]
+
+private def sdStructExpectedBytes {P : Type} : List (Gen.AbstractByte P) :=
+  [.Init 0x10 none, .Init 0x20 none, .Init 0x30 none, .Init 0x40 none] ++
+    sdExpectedBytes ++
+    [.Init 0x50 none, .Init 0x60 none, .Init 0x70 none, .Init 0x80 none]
+
+private def sdBadEncodeEnumTy : Gen.Type :=
+  let vBad : Gen.Variant :=
+    { ty := .Tuple [] ⟨⟨8⟩, ⟨4⟩, none⟩ none
+      tagger := ⟨[(⟨0⟩, (u8, 256)), (⟨16⟩, (u8, 1))]⟩ }
+  .Enum ⟨[(1, vBad)]⟩ u8 .Invalid ⟨8⟩ ⟨4⟩
+
+/-- **Projected `PlaceExpr.Field` `SetDiscriminant` and unrepresentable tagger
+encoding (`minirust_setDiscriminant_field_and_encode_witness`)**:
+1. On both `Mach` and `MachTB`, `SetDiscriminant` on
+   `PlaceExpr.Field (.Local 1) 1` (an 8-byte enum nested at byte offset `4`
+   inside a 16-byte struct at `0x100`) offsets each tag from the field's base
+   pointer (`0x104 + 0` and `0x104 + 4`), leaving surrounding struct fields
+   (bytes `0..3` and `12..15`) and the enum's five payload bytes untouched;
+2. When a tagger entry's integer (`256`) does not fit its `IntType` (`u8`),
+   `Type.encodeInt` raises `specPanic` before the accessor runs (preempting a
+   subsequent out-of-bounds tagger entry at offset `16`), on both `Mach` and
+   `MachTB`. -/
+theorem minirust_setDiscriminant_field_and_encode_witness :
+    let fnStruct := uwFn [(⟨⟨1⟩⟩, sdStructTy), (⟨⟨2⟩⟩, sdBadEncodeEnumTy)]
+    let allocStructBM : Gen.Allocation Unit Unit :=
+      { data := sdStructInitBytes, addr := 0x100, align := ⟨4⟩, kind := .Stack, live := true,
+        extra := () }
+    let allocBadBM : Gen.Allocation Unit Unit :=
+      { data := sdPayloadBytes, addr := 0x200, align := ⟨4⟩, kind := .Stack, live := true,
+        extra := () }
+    let frBM : Frame :=
+      { func := fnStruct
+        locals := ⟨[(⟨⟨1⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩), (⟨⟨2⟩⟩, ⟨0x200, some (⟨1⟩, ())⟩)]⟩
+        stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := () }
+    let mBM := uwMachBM [allocStructBM, allocBadBM] [frBM] []
+    let mkAllocTB (addr : Int) (bs : List (Gen.AbstractByte Gen.TreeBorrowsProvenance)) :
+        Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
+      { data := bs, addr := addr, align := ⟨4⟩, kind := .Stack, live := true,
+        extra :=
+          { root :=
+              { children := [], permissions := List.replicate bs.length (.Unprot .Unique),
+                «protected» := .No } } }
+    let frTB : Gen.StackFrame TBM :=
+      { func := fnStruct
+        locals := ⟨[(⟨⟨1⟩⟩, ⟨0x100, some (⟨0⟩, [])⟩), (⟨⟨2⟩⟩, ⟨0x200, some (⟨1⟩, [])⟩)]⟩
+        stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := ⟨[]⟩ }
+    let mTB := uwMachTB
+      [mkAllocTB 0x100 sdStructInitBytes, mkAllocTB 0x200 sdPayloadBytes] [frTB] []
+    let fieldPlace : Gen.PlaceExpr := .Field (.Local ⟨⟨1⟩⟩) 1
+    let expectedAccs : List Gen.Access :=
+      [⟨.Store, .None, 0x104, ⟨1⟩⟩, ⟨.Store, .None, 0x108, ⟨2⟩⟩]
+    let badEncMsg := "Endianness::encode(..).unwrap()"
+    (∃ m', Interp.evalStatement mBM (.SetDiscriminant fieldPlace 7) = .ok m' ∧
+      m'.mem.memory.allocations[0]?.map (·.data) = some sdStructExpectedBytes ∧
+      m'.mem.accesses = expectedAccs) ∧
+    (∃ m', Interp.evalStatementM mTB (.SetDiscriminant fieldPlace 7) = .ok m' ∧
+      m'.mem.memory.mem.allocations[0]?.map (·.data) = some sdStructExpectedBytes ∧
+      m'.mem.accesses = expectedAccs) ∧
+    (Interp.evalStatement mBM (.SetDiscriminant (.Local ⟨⟨2⟩⟩) 1) =
+      .error (.specPanic badEncMsg) ∧
+     Interp.evalStatementM mTB (.SetDiscriminant (.Local ⟨⟨2⟩⟩) 1) =
+      .error (.specPanic badEncMsg)) :=
+  ⟨⟨_, rfl, rfl, rfl⟩, ⟨_, rfl, rfl, rfl⟩, ⟨rfl, rfl⟩⟩
 
 /-- **`sizeOfVal` & `alignOfVal` on unsized `RigidTy.str` (`&str` / `*const str`) ↔ MiniRust
 `Type.layout (.Slice (.Int u8))` (`evalLIntrinsic_sizeOfVal_alignOfVal_str_minirust_layout`,
