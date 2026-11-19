@@ -6028,6 +6028,122 @@ class TestEpisode2ProjectionAndRewriteOrderHazards(unittest.TestCase):
         )
         self.assertEqual(proof_health.scan_projection_and_rewrite_order_hazards(a1_neg), [])
 
+    def test_b2_quotation_perf_namespace_in_and_advisory_regressions(self) -> None:
+        import lean_lexer
+
+        # 1. A single syntax quotation in a ~500 KiB file must not trigger a full-file
+        # bracket regex scan (< 5.0 ms CPU budget).
+        bc_with_q = "def _q := `(term| 1)\n" + EPISODE1_BYTECODEC.read_text(encoding="utf-8")
+        bc_with_q_st = lean_lexer.strip_comments_and_strings_preserving_offsets(bc_with_q)
+        q_ms = best_of_ms(
+            lambda: lean_lexer.NamespaceTracker.from_source(bc_with_q, stripped=bc_with_q_st),
+            budget_ms=5.0,
+        )
+        self.assertLess(q_ms, 5.0, f"ByteCodec + 1 quotation NamespaceTracker took {q_ms:.2f} ms")
+
+        # 2. `NamespaceTracker`: primed identifiers containing keywords (`x'end`), indented
+        # target commands under `namespace ... in`, col-0 commands inside syntax quotations
+        # under `namespace ... in`, and guillemets containing `` `( ``.
+        ns_b2 = (
+            "namespace A in def f : Nat := 1 + x'end\n"
+            "def outA := 0\n"
+            "namespace B in\n"
+            "  def inB : Nat := 1\n"
+            "  def outB : Nat := 2\n"
+            "namespace C in\n"
+            "def q := `(command|\n"
+            "def innerQuot := 1\n"
+            ")\n"
+            "def outC := 2\n"
+            "def «fake`(open» := 0\n"
+            "namespace D\n"
+            "  def inD := 1\n"
+            "end D\n"
+        )
+        tr = lean_lexer.track_namespaces(ns_b2)
+        self.assertEqual(tr.violations, ())
+        self.assertEqual(tr.namespace_at(ns_b2.index("x'end") + 2), ("A",))
+        self.assertEqual(tr.namespace_at(ns_b2.index("def outA")), ())
+        self.assertEqual(tr.namespace_at(ns_b2.index("def inB")), ("B",))
+        self.assertEqual(tr.namespace_at(ns_b2.index("def outB")), ())
+        self.assertEqual(tr.namespace_at(ns_b2.index(")\n")), ("C",))
+        self.assertEqual(tr.namespace_at(ns_b2.index("def outC")), ())
+        self.assertEqual(tr.namespace_at(ns_b2.index("def inD")), ("D",))
+
+        # 3. Advisory regressions: `|` inside `try` (`cases` / `first` / `||` / `|>` / `rcases`
+        # / `<|>`), `·` / `{` bullets before `dsimp only` -> `simp`, `simpa [my_using_lemma]`,
+        # `have h (x : Nat) : ...`, `simp [-h]` erasure, and `suffices` target tracking.
+        R_PROJ = proof_health.RULE_SIMP_DEEP_PROJECTION_CHAIN
+        S_STMT = proof_health.SUBRULE_SIMP_AFTER_PROJECTION_STATEMENT
+        R_TRY = proof_health.RULE_TRY_RW_HYP_BEFORE_TARGET
+
+        b2_pos = (
+            "theorem p : P := by\n"
+            "  try\n"
+            "    cases h with\n"
+            "    | inl h1 => rw [h1] at hEval ⊢\n"
+            "    | inr h2 => rw [h2] at hEval ⊢\n"
+            "  try\n"
+            "    first\n"
+            "    | simp\n"
+            "    | rw [h] at hEval ⊢\n"
+            "  try have h0 : b1 || b2 = true := rfl; rw [h0] at hEval ⊢\n"
+            "  try have h0 := x |> f; rw [h0] at hEval ⊢\n"
+            "  try rcases h with h1 | h2; rw [h1] at hEval ⊢\n"
+            "  try exact h1 <|> rw [h] at hEval ⊢\n"
+            "  first | try rw [h] at hEval |- | exact h2\n"
+            "  change (advanceStmt s l m).memory.locals = l\n"
+            "  · dsimp only [unrelatedDef]\n"
+            "    simp\n"
+            "  change (advanceStmt s l m).memory.locals = l\n"
+            "  { dsimp only [unrelatedDef]\n"
+            "    simp }\n"
+            "  have : (advanceStmt s l m).memory.locals = l := h0\n"
+            "  simpa [my_using_lemma]\n"
+            "  have h (x : Nat) : (advanceStmt s l m).memory.locals = l := h0 x\n"
+            "  dsimp only [advanceStmt]\n"
+            "  simp at h\n"
+            "  suffices h : (advanceStmt s l m).memory.locals = l by\n"
+            "    dsimp only [advanceStmt]\n"
+            "    simp only [foo] at h\n"
+            "  suffices h : (advanceStmt s l m).memory.locals = l from h0 h\n"
+            "  dsimp only [advanceStmt] at hOther\n"
+            "  simp\n"
+        )
+        self.assertEqual(
+            [(f.line, f.rule, f.subrule) for f in proof_health.scan_projection_and_rewrite_order_hazards(b2_pos)],
+            [
+                (4, R_TRY, ""),
+                (5, R_TRY, ""),
+                (9, R_TRY, ""),
+                (10, R_TRY, ""),
+                (11, R_TRY, ""),
+                (12, R_TRY, ""),
+                (13, R_TRY, ""),
+                (14, R_TRY, ""),
+                (17, R_PROJ, S_STMT),
+                (20, R_PROJ, S_STMT),
+                (22, R_PROJ, S_STMT),
+                (25, R_PROJ, S_STMT),
+                (28, R_PROJ, S_STMT),
+                (31, R_PROJ, S_STMT),
+            ],
+        )
+
+        b2_neg = (
+            "theorem clean : P := by\n"
+            "  have h (x : Nat) : (advanceStmt s l m).memory.locals = l := h0 x\n"
+            "  simp only [foo]\n"
+            "  have h2 : (advanceStmt s l m).memory.locals = l := h0\n"
+            "  simp [-h2]\n"
+            "  have «h3» : (advanceStmt s l m).memory.locals = l := h0\n"
+            "  simp [-«h3»]\n"
+            "  suffices h4 : (advanceStmt s l m).memory.locals = l by\n"
+            "    simp only [foo] at hOther\n"
+            "  first | try simp | rw [h] at hEval ⊢\n"
+        )
+        self.assertEqual(proof_health.scan_projection_and_rewrite_order_hazards(b2_neg), [])
+
 
 if __name__ == "__main__":
     unittest.main()

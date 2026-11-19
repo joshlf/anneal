@@ -835,28 +835,53 @@ def _closed_bracket_spans(stripped: str, bracket_re) -> list[tuple[int, int]]:
     return _merge_spans(raw)
 
 
-def _quotation_spans(stripped: str, quot_re) -> list[tuple[int, int]]:
-    """Single-pass `O(N)` merged `(open_pos, close_pos)` spans of Lean syntax quotations
-    (`` `(...) ``, `` `[...] ``, `` `{...} ``). An unclosed or mismatched earlier quotation
-    never aborts scanning subsequent quotations in the file."""
-    stack: list[tuple[str, int, bool]] = []
+def _quotation_spans(
+    stripped: str, quot_re, *, has_guillemets: bool = False
+) -> list[tuple[int, int]]:
+    """Merged `(open_pos, close_pos)` spans of Lean syntax quotations (`` `(...) ``,
+    `` `[...] ``, `` `{...} ``). Jumps between backticks with single-byte `str.find` so
+    files with a few quotations avoid scanning non-quotation brackets, while advancing past
+    each visited span so even hundreds of unclosed quotations stay strictly `O(N)`."""
     spans: list[tuple[int, int]] = []
-    for m in quot_re.finditer(stripped):
-        tok = m.group()
-        if len(tok) == 2 and tok[0] == "`":
-            stack.append((_CLOSER_OF[tok[1]], m.start() + 1, True))
+    find = stripped.find
+    n = len(stripped)
+    pos = 0
+    while True:
+        q = find("`", pos)
+        if q == -1 or q + 1 >= n:
+            break
+        ch = stripped[q + 1]
+        closer = _CLOSER_OF.get(ch)
+        if closer is None or ch == "⟨":
+            pos = q + 1
             continue
-        if len(tok) != 1:
+        if has_guillemets and _inside_guillemets(stripped, q):
+            pos = q + 2
             continue
-        c = _CLOSER_OF.get(tok)
-        if c is not None:
-            stack.append((c, m.start(), False))
-        elif stack and stack[-1][0] == tok:
-            _, open_pos, is_quot = stack.pop()
-            if is_quot:
-                spans.append((open_pos, m.start()))
-        else:
-            stack.clear()
+        stack: list[tuple[str, int, bool]] = [(closer, q + 1, True)]
+        end_pos = n
+        for m in quot_re.finditer(stripped, q + 2):
+            tok = m.group()
+            if len(tok) == 2 and tok[0] == "`":
+                stack.append((_CLOSER_OF[tok[1]], m.start() + 1, True))
+                continue
+            if len(tok) != 1:
+                continue
+            c = _CLOSER_OF.get(tok)
+            if c is not None:
+                stack.append((c, m.start(), False))
+            elif stack and stack[-1][0] == tok:
+                _, open_pos, is_quot = stack.pop()
+                if is_quot:
+                    spans.append((open_pos, m.start()))
+                if not stack:
+                    end_pos = m.end()
+                    break
+            else:
+                stack.clear()
+                end_pos = m.end()
+                break
+        pos = end_pos
     return _merge_spans(spans)
 
 
@@ -923,7 +948,14 @@ def _enclosing_col0_block(stripped: str, pos: int, line_start: int, cmd_re, n: i
     return blk_start, blk_end
 
 
-def _scope_keyword_hits(stripped: str, bracket_re, quot_re, cmd_re) -> list[tuple[int, str]]:
+def _scope_keyword_hits(
+    stripped: str,
+    bracket_re,
+    quot_re,
+    cmd_re,
+    *,
+    quot_spans: list[tuple[int, int]] | None = None,
+) -> list[tuple[int, str]]:
     """Offsets of standalone top-level `namespace`, `section`, `mutual` and `end` tokens,
     sorted by offset."""
     n = len(stripped)
@@ -951,11 +983,12 @@ def _scope_keyword_hits(stripped: str, bracket_re, quot_re, cmd_re) -> list[tupl
     if not hits:
         return hits
     hits.sort()
-    quot_spans = (
-        _quotation_spans(stripped, quot_re)
-        if ("`(" in stripped or "`[" in stripped or "`{" in stripped)
-        else []
-    )
+    if quot_spans is None:
+        quot_spans = (
+            _quotation_spans(stripped, quot_re, has_guillemets=has_guillemets)
+            if "`" in stripped
+            else []
+        )
     filtered: list[tuple[int, str]] = []
     cached_line_start = -1
     cached_line_spans: list[tuple[int, int]] = []
@@ -1035,7 +1068,13 @@ def _skip_attrs_and_mods(stripped: str, pos: int) -> int:
     return p
 
 
-def _find_in_governed_end(stripped: str, in_end: int, cmd_indent: int) -> tuple[int, bool]:
+def _find_in_governed_end(
+    stripped: str,
+    in_end: int,
+    cmd_indent: int,
+    *,
+    quot_spans: list[tuple[int, int]] = (),  # type: ignore[assignment]
+) -> tuple[int, bool]:
     """Given `<scope_cmd> in` ending at `in_end` with governing line indentation
     `cmd_indent`, return `(end_offset, is_mutual)` for the single command governed by `in`.
 
@@ -1166,7 +1205,16 @@ def _find_in_governed_end(stripped: str, in_end: int, cmd_indent: int) -> tuple[
                     saw_atom = True
                 body_pos += 1
                 continue
-            if ch in ("«", "'"):
+            if ch == "«":
+                bm = bracket_re.match(stripped, body_pos, line_end)
+                if bm is not None and len(bm.group()) > 1:
+                    body_pos = bm.end()
+                    continue
+                body_pos += 1
+                continue
+            if ch == "'" and (
+                body_pos == 0 or not (is_ident_char(stripped[body_pos - 1]) or stripped[body_pos - 1] == "»")
+            ):
                 bm = bracket_re.match(stripped, body_pos, line_end)
                 if bm is not None and len(bm.group()) > 1:
                     body_pos = bm.end()
@@ -1182,14 +1230,30 @@ def _find_in_governed_end(stripped: str, in_end: int, cmd_indent: int) -> tuple[
                     b_depth -= 1
                 body_pos += 1
                 continue
-            if b_depth == 0 and saw_atom:
+            if (
+                b_depth == 0
+                and saw_atom
+                and (
+                    body_pos == 0
+                    or not (is_ident_char(stripped[body_pos - 1]) or stripped[body_pos - 1] in ".«")
+                )
+            ):
                 if is_strict_top_cmd(body_pos) if in_block_body else is_cmd_start(body_pos):
                     return body_pos, False
-            while body_pos < line_end and stripped[body_pos] not in " \t(){}[]⟨⟩«'":
+            while body_pos < line_end:
+                c = stripped[body_pos]
+                if c in " \t(){}[]⟨⟩«":
+                    break
+                if c == "'" and (
+                    body_pos == 0
+                    or not (is_ident_char(stripped[body_pos - 1]) or stripped[body_pos - 1] == "»")
+                ):
+                    break
                 body_pos += 1
 
-    # Multi-line scan: any non-continuation command starting at `indent <= cmd_indent` ends
-    # the governed command.
+    # Multi-line scan: any non-continuation command starting at or left of the governed
+    # command's own line indentation ends it (skipping commands inside syntax quotations).
+    stop_indent = max(cmd_indent, _line_indent_of(stripped, p))
     cur = line_end
     while cur < n:
         m = line_re.search(stripped, cur)
@@ -1197,7 +1261,12 @@ def _find_in_governed_end(stripped: str, in_end: int, cmd_indent: int) -> tuple[
             return n, False
         indent = len(m.group(1))
         cand = m.end()
-        if indent <= cmd_indent and not cont_re.match(stripped, cand) and is_cmd_start(cand):
+        if (
+            indent <= stop_indent
+            and not (quot_spans and _inside_spans(quot_spans, cand))
+            and not cont_re.match(stripped, cand)
+            and is_cmd_start(cand)
+        ):
             return m.start(), False
         cur = cand + 1
     return n, False
@@ -1295,6 +1364,8 @@ class NamespaceTracker:
         def record(offset: int) -> None:
             ns = tuple([nm for kind, nm in stack if kind == SCOPE_NAMESPACE])
             sc = tuple(stack)
+            if offsets and offset < offsets[-1]:
+                offset = offsets[-1]
             if offsets and offsets[-1] == offset:
                 namespaces[-1] = ns
                 scopes_list[-1] = sc
@@ -1340,7 +1411,16 @@ class NamespaceTracker:
                 return -1
             return k + 2
 
-        for pos, kw in _scope_keyword_hits(stripped, bracket_re, quot_re, cmd_re):
+        has_guillemets = "«" in stripped
+        quot_spans: list[tuple[int, int]] = (
+            _quotation_spans(stripped, quot_re, has_guillemets=has_guillemets)
+            if "`" in stripped
+            else []
+        )
+
+        for pos, kw in _scope_keyword_hits(
+            stripped, bracket_re, quot_re, cmd_re, quot_spans=quot_spans
+        ):
             if pos < consumed:
                 continue
             flush_pending_up_to(pos)
@@ -1435,7 +1515,9 @@ class NamespaceTracker:
             if in_end != -1:
                 consumed = in_end
                 cmd_indent = min(kw_col, _line_indent_of(stripped, pos))
-                end_off, is_mut = _find_in_governed_end(stripped, in_end, cmd_indent)
+                end_off, is_mut = _find_in_governed_end(
+                    stripped, in_end, cmd_indent, quot_spans=quot_spans
+                )
                 if not is_mut and end_off <= in_end:
                     continue
                 pushed = part_re.findall(name) if name else [""]
