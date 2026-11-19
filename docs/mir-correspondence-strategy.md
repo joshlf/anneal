@@ -459,7 +459,9 @@ three human-audited semantic surfaces detailed in
 relations, and the locked `CorrespondenceClaim` and `FaultEquivalenceClaim`
 statements), and the outer theorem-stating boundary of $M_{\text{anneal}}$ in
 `Trusted/MirAst.lean` and `Trusted/MirSemantics.lean` (excluding `initState`,
-`evalStep`, and the helpers that only those rules use)—require human semantic
+`evalStep`, and the helpers that only those rules use, once Pass 2 and the
+corresponding `AGENTS.md`/`.gemini/styleguide.md`/`skills/trust-review/SKILL.md`
+review-policy updates are active)—require human semantic
 audit (alongside Stage 1's `trusted/rustc-capture/` and the non-semantic TCB
 enforcement infrastructure). Per-crate verification (`cargo anneal verify`)
 discharges `Trusted.CrateTheorem` or `Trusted.UnitTheorem` over
@@ -470,19 +472,39 @@ blocking repository CI (Pass 2, `anneal-audit --require-correspondence`) proves
 $M_{\text{anneal}}$ to $M_{\text{ref}}$ via $\tau_{\text{prog}}$. Adding or
 refactoring an execution rule in $M_{\text{anneal}}$ (`initState` and
 `evalStep`) is therefore certified by the Lean 4 kernel against $M_{\text{ref}}$
-rather than adding new semantic trust assumptions. Because AST normalization
-happens in Stage 3 (`Theory/Rust/Passes/` $\to$ `StableAst`) above
-$M_{\text{anneal}}$, $\tau_{\text{prog}}$ (`encodeProg` in
-`Trusted/Correspondence.lean`) translates Stage 2's unnormalized captured-MIR
-AST (`Trusted/MirAst.lean`) into the correspondence wrapper's intermediate
-unnormalized reference-program representation (`RefProg`), which reuses
-`MirAst`'s operator enums and mirrors each statement and terminator constructor
-one-to-one while confining $\tau_{\text{prog}}$ to structural bookkeeping such
-as type-table indexing—audited as part of the TCB and checked by kernel-checked
+rather than adding new semantic trust assumptions. Because AST normalization happens in Stage 3 (`Theory/Rust/Passes/` $\to$
+`StableAst`) above $M_{\text{anneal}}$, $\tau_{\text{prog}}$ (`encodeProg` in
+`Trusted/Correspondence.lean`) translates Stage 2's captured-MIR AST
+(`Trusted/MirAst.lean`) into the correspondence wrapper's intermediate
+reference-program representation (`RefProg`), which reuses `MirAst`'s operator
+enums and mirrors each statement and terminator constructor one-to-one while
+confining $\tau_{\text{prog}}$ to structural bookkeeping such as type-table
+indexing—audited as part of the TCB and checked by kernel-checked
 constructor-preservation theorems on `encodeProg` (`MirAst` $\to$ `RefProg`).
-That bookkeeping leaves the cross-AST lowering from `RefProg` into
+Importantly, `lean-miri`'s input contract operates on concrete, monomorphized
+function instances with substituted generic arguments, normalized types,
+concrete layouts, and evaluated MIR constants rather than unnormalized generic
+bodies. Accordingly, neither `encodeProg` nor `evalRefStep` performs hidden
+monomorphization, type normalization, or constant evaluation: in the initial
+correspondence phase, the theorem domain is restricted explicitly to concrete,
+monomorphic captured MIR carrying the concrete instance, layout, and
+evaluated-constant metadata extracted and audited by Stage 1
+(`trusted/rustc-capture/`), while any unnormalized generic body, unevaluated
+MIR constant, or missing compiler-query layout fails closed to `unsupported` in
+both $M_{\text{anneal}}$ and $M_{\text{ref}}$. This initial phase still supports
+modular library-centric verification of concrete library functions over all
+caller inputs and states without a `fn main()`, while full polymorphic
+verification of uninstantiated generic library bodies across arbitrary
+downstream caller types and layouts (the long-term target in
+[`docs/design.md`](design.md#library-centric-verification)) is phased in
+separately by parameterizing $M_{\text{anneal}}$ over generic substitutions and
+layout/trait constraints and connecting every valid concrete substitution to
+$M_{\text{ref}}$ via a kernel-verified instantiation theorem (or formally
+verifying the normalization pass itself)—never by adding unverified lowering to
+`evalRefStep`.
+Within that concrete domain, the cross-AST dispatch from `RefProg` into
 `vendor/lean-miri/`'s internal syntax (`evalRefStep` inside $M_{\text{ref}}$'s
-`Trusted/Correspondence.lean` wrapper) as the remaining semantic-laundering
+`Trusted/Correspondence.lean` wrapper) is the remaining semantic-laundering
 surface, so `evalRefStep` is audited one-to-one as part of the $M_{\text{ref}}$
 TCB and backed by end-to-end semantic canaries: for example, an unchecked
 addition that overflows must exhibit UB, whereas a wrapping addition of the
@@ -671,16 +693,28 @@ with the following totality conditions:
   $(p, q)$ vs. $(\tau_{\text{prog}}(p), q)$ up to $\sim_{\text{out}}$ on
   **every** $(p, q)$, including mixed-faulting inputs.
 
-On every coupled pair of valid executions, the relation enforces four outcome
-cases:
+On every coupled pair of valid executions, the relation enforces four mutually
+exclusive outcome cases over productive executions. When wrapping `lean-miri`,
+additional non-success interpreter or operational-safety stop outcomes beyond
+UB and explicit unsupported features—specifically `failed`, `pending`, and
+`blocked` (unresolved obligations, pending interactions, or interpreter/host
+failures)—must be classified explicitly and fail-closed inside the
+human-audited `Trusted/Correspondence.lean` wrapper (mapping each such stop to
+$\mathsf{unsupported}$, never silently dropping, retrying, or reclassifying it
+as UB or normal termination, unless dedicated outcome cases are added to both
+models and locked in the correspondence witness contract). Under that
+fail-closed wrapper classification, every productive execution partitions into
+four outcome cases:
 
 1. **Faulting executions (universal and bidirectional across every coupled
    pair):** For every choice-coupled pair of valid executions, whenever either
    execution faults with classification
-   $k \in \{\mathsf{undefined}, \mathsf{unsupported}\}$, the other also faults
-   with the exact same classification $k$. In particular, no non-faulting
-   execution in either model may pair with a faulting execution in the other,
-   and neither model may swap `undefined` with `unsupported`.
+   $k \in \{\mathsf{undefined}, \mathsf{unsupported}\}$ (with `lean-miri`'s
+   `failed`, `pending`, and `blocked` stops mapped fail-closed into
+   $\mathsf{unsupported}$ by the locked wrapper), the other also faults with
+   the exact same classification $k$. In particular, no non-faulting execution
+   in either model may pair with a faulting execution in the other, and neither
+   model may swap `undefined` with `unsupported`.
 2. **Normally terminating executions (paired
    $M_{\text{ref}} \to M_{\text{anneal}}$; bidirectional whenever reverse
    totality holds):** For every choice-coupled pair of valid executions,
