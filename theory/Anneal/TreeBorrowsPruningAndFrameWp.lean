@@ -5840,18 +5840,57 @@ theorem disableFrameBorrows_unrelated_frame (borrows : List BorrowEntry)
     exact congrArg (e :: ·)
       (ih fun x hx => hFresh x (List.mem_cons_of_mem _ hx))
 
+/-- With no active protector, no write is a protected-write conflict. -/
+theorem hasProtectedWriteConflict_nil_protectors (borrows : List BorrowEntry)
+    (targetLocal : Local) (writerTag : Option Nat)
+    (writeProj : List ProjectionElem)
+    (writeRangeOff writeRangeLen targetFrameDepth : Nat) :
+    hasProtectedWriteConflict borrows [] targetLocal writerTag writeProj
+      writeRangeOff writeRangeLen targetFrameDepth = false := by
+  rw [hasProtectedWriteConflict_eq_any]
+  refine any_eq_false_of_forall _ borrows fun e _ => ?_
+  unfold protectedWriteConflictAt
+  rw [Trusted.Rustc.V2026_06_01.MirSemantics.isBorrowProtected_nil]
+  cases Bool.and (Nat.beq e.targetFrameDepth targetFrameDepth)
+      (Nat.beq e.targetLocal targetLocal) <;>
+    cases borrowEntryOverlapsWrite e writeProj writeRangeOff writeRangeLen <;>
+    rfl
+
+/-- With no active protector, deallocating a frame conflicts with nothing. -/
+theorem hasFrameDeallocProtectorConflict_nil_protectors
+    (borrows : List BorrowEntry) (depth nLocals : Nat) :
+    hasFrameDeallocProtectorConflict borrows [] depth nLocals = false := by
+  cases borrows <;> rfl
+
 /--
 Entry state of an inline call to `emptyFnAssignUnit`: the callee is active at
-the start of `bb0` with its single local `_0` uninitialized, and either no
-protector is active or no borrow targets the fresh callee frame depth
-`length s₀.memory.callStack` (allowing arbitrary active caller protectors).
+the start of `bb0` with its single local `_0` uninitialized, and the two
+protector checks that the trusted machine performs on this path pass:
+
+- the direct write `_0 = const ()` is not a protected-write conflict
+  (`hasProtectedWriteConflict`, checked by the trusted `evalStmt`);
+- deallocating the callee frame at `return_` conflicts with no active
+  protector (`hasFrameDeallocProtectorConflict`, checked by the trusted
+  `evalTerminator`).
+
+These are exactly the conditions under which the trusted machine runs the
+callee to its `return_` without undefined behavior
+(`emptyFnEntry_iff_runs`), so `EmptyFnEntry` is the weakest precondition of
+the empty function. It holds in particular with no active protector
+(`EmptyFnEntry.of_noProtectors`) and when no borrow targets the callee frame
+depth (`EmptyFnEntry.of_freshFrame`), but also when stale disabled borrows of
+an earlier callee frame at the same depth remain in the table
+(`emptyFnEntry_stale_disabled_borrow`).
 -/
 def EmptyFnEntry (s₀ : MachineState) : Prop :=
   s₀.memory.activeCallee = some emptyFnAssignUnit ∧
   s₀.frame = { blockIdx := 0, stmtIdx := 0, locals := [.uninit] } ∧
-  (s₀.memory.activeProtectors = [] ∨
-    ∀ e, e ∈ s₀.memory.borrows →
-      e.targetFrameDepth ≠ length s₀.memory.callStack)
+  hasProtectedWriteConflict s₀.memory.borrows s₀.memory.activeProtectors 0
+    .none .nil 0 0 (length s₀.memory.callStack) = false ∧
+  hasFrameDeallocProtectorConflict
+    (invalidateConflictingBorrows s₀.memory.borrows 0 .none
+      (length s₀.memory.callStack))
+    s₀.memory.activeProtectors (length s₀.memory.callStack) 1 = false
 
 /--
 Return-ready state of `emptyFnAssignUnit` reached from the entry state `s₀`:
@@ -5877,6 +5916,36 @@ theorem emptyFnReturnState_borrows_eq_of_fresh_frame (s₀ : MachineState)
   rw [beq_false_of_ne (hFresh e he)]
   rfl
 
+/-- An entry state of `emptyFnAssignUnit` with no active protector is an
+`EmptyFnEntry`. -/
+theorem EmptyFnEntry.of_noProtectors {s₀ : MachineState}
+    (hCallee : s₀.memory.activeCallee = some emptyFnAssignUnit)
+    (hFrame :
+      s₀.frame = { blockIdx := 0, stmtIdx := 0, locals := [.uninit] })
+    (hProt : s₀.memory.activeProtectors = []) : EmptyFnEntry s₀ := by
+  refine ⟨hCallee, hFrame, ?_, ?_⟩
+  · rw [hProt]
+    exact hasProtectedWriteConflict_nil_protectors _ _ _ _ _ _ _
+  · rw [hProt]
+    exact hasFrameDeallocProtectorConflict_nil_protectors _ _ _
+
+/-- An entry state of `emptyFnAssignUnit` in which no borrow targets the
+callee frame depth is an `EmptyFnEntry`, whatever protectors are active. -/
+theorem EmptyFnEntry.of_freshFrame {s₀ : MachineState}
+    (hCallee : s₀.memory.activeCallee = some emptyFnAssignUnit)
+    (hFrame :
+      s₀.frame = { blockIdx := 0, stmtIdx := 0, locals := [.uninit] })
+    (hFresh : ∀ e, e ∈ s₀.memory.borrows →
+      e.targetFrameDepth ≠ length s₀.memory.callStack) : EmptyFnEntry s₀ := by
+  refine ⟨hCallee, hFrame,
+    hasProtectedWriteConflict_unrelated_frame _ _ _ _ _ _ _ _ hFresh, ?_⟩
+  have hEq :
+      invalidateConflictingBorrows s₀.memory.borrows 0 .none
+        (length s₀.memory.callStack) = s₀.memory.borrows :=
+    emptyFnReturnState_borrows_eq_of_fresh_frame s₀ hFresh
+  rw [hEq]
+  exact hasFrameDeallocProtectorConflict_unrelated_frame _ _ _ _ hFresh
+
 /-- A call entry into `emptyFnAssignUnit` from a protector-free state is an
 `EmptyFnEntry`. -/
 theorem emptyFnEntry_of_pushCalleeFrame (s : MachineState)
@@ -5886,7 +5955,7 @@ theorem emptyFnEntry_of_pushCalleeFrame (s : MachineState)
     EmptyFnEntry
       (pushCalleeFrame s callerBody localsAfterArgs destination targetBb
         emptyFnAssignUnit argVals unwind) :=
-  ⟨rfl, rfl, Or.inl hProt⟩
+  EmptyFnEntry.of_noProtectors rfl rfl hProt
 
 /--
 A call entry into `emptyFnAssignUnit` from a caller with arbitrary active
@@ -5902,18 +5971,25 @@ theorem emptyFnEntry_of_pushCalleeFrame_fresh (s : MachineState)
     EmptyFnEntry
       (pushCalleeFrame s callerBody localsAfterArgs destination targetBb
         emptyFnAssignUnit argVals unwind) :=
-  ⟨rfl, rfl, Or.inr hFresh⟩
+  EmptyFnEntry.of_freshFrame rfl rfl hFresh
 
 /--
-The body of `emptyFnAssignUnit` is one trusted step: from an entry state (even
-with active caller protectors, provided no borrow targets the fresh callee
-frame depth) the trusted `stepMirFn` executes `_0 = const ()` and reaches the
-return-ready state.
+The trusted step of `emptyFnAssignUnit` at its entry, for every memory: the
+machine evaluates `_0 = const ()`, which is undefined behavior exactly when
+the direct write to `_0` is a protected-write conflict, and otherwise reaches
+the return-ready state.
 -/
-theorem emptyFn_step {body : CapturedMir} {s₀ : MachineState}
-    (h : EmptyFnEntry s₀) :
-    stepMirFn body s₀ = MirStepNode.step (emptyFnReturnState s₀) := by
-  obtain ⟨hCallee, hFrame, hGuard⟩ := h
+theorem emptyFn_stepMirFn_eq {body : CapturedMir} {s₀ : MachineState}
+    (hCallee : s₀.memory.activeCallee = some emptyFnAssignUnit)
+    (hFrame :
+      s₀.frame = { blockIdx := 0, stmtIdx := 0, locals := [.uninit] }) :
+    stepMirFn body s₀ =
+      (match
+        hasProtectedWriteConflict s₀.memory.borrows s₀.memory.activeProtectors
+          0 .none .nil 0 0 (length s₀.memory.callStack)
+      with
+      | true => MirStepNode.fail .ub
+      | false => MirStepNode.step (emptyFnReturnState s₀)) := by
   cases s₀ with
   | mk frame memory =>
     have hFrame' :
@@ -5940,85 +6016,162 @@ theorem emptyFn_step {body : CapturedMir} {s₀ : MachineState}
             span := "unit" })
         hCur (Or.inl rfl) rfl rfl
     rw [hStmt]
-    cases hGuard with
-    | inl hProt =>
-      exact evalStmt_assign_of_evalRvalue (bbIdx := 0) (stmtIdx := 0)
-        (env := [.uninit]) (env₁ := [.uninit]) (env₂ := [.init .unit])
-        (mem := memory) (mem₁ := memory) (val := .unit)
-        (borrows' :=
-          invalidateConflictingBorrows memory.borrows 0 .none
-            (length memory.callStack))
-        rfl hProt rfl
-    | inr hFresh =>
-      have hrv :
-          evalRvalue [.uninit]
-              (.use (.constant { ty := emptyFnUnitTy, val := .zeroSized }))
-              memory emptyFnAssignUnit.localDecls emptyFnAssignUnit.layouts =
-            .ok .unit [.uninit] memory := rfl
-      have hGet0 : get? [LocalSlot.uninit] 0 = some LocalSlot.uninit := rfl
-      have hSet0 :
-          set? [LocalSlot.uninit] 0 (LocalSlot.init Value.unit) =
-            some [LocalSlot.init Value.unit] := rfl
-      unfold evalStmt
+    have hrv :
+        evalRvalue [.uninit]
+            (.use (.constant { ty := emptyFnUnitTy, val := .zeroSized }))
+            memory emptyFnAssignUnit.localDecls emptyFnAssignUnit.layouts =
+          .ok .unit [.uninit] memory := rfl
+    have hGet0 : get? [LocalSlot.uninit] 0 = some LocalSlot.uninit := rfl
+    have hSet0 :
+        set? [LocalSlot.uninit] 0 (LocalSlot.init Value.unit) =
+          some [LocalSlot.init Value.unit] := rfl
+    unfold evalStmt
+    dsimp only []
+    rw [hrv]
+    dsimp only []
+    rw [hGet0]
+    dsimp only []
+    rw [hSet0]
+    dsimp only []
+    cases hP : memory.activeProtectors with
+    | nil =>
+      rw [hasProtectedWriteConflict_nil_protectors]
+      unfold emptyFnReturnState
       dsimp only []
-      rw [hrv]
+      rw [hP]
+      rfl
+    | cons p ps =>
       dsimp only []
-      rw [hGet0]
-      dsimp only []
-      rw [hSet0]
-      dsimp only []
-      cases hP : memory.activeProtectors with
-      | nil =>
-        unfold emptyFnReturnState
-        dsimp only []
-        rw [hP]
-        rfl
-      | cons p ps =>
-        dsimp only []
-        rw [hasProtectedWriteConflict_unrelated_frame memory.borrows (p :: ps)
-          0 .none .nil 0 0 (length memory.callStack) hFresh]
+      cases hasProtectedWriteConflict memory.borrows (p :: ps) 0 .none .nil 0 0
+          (length memory.callStack) with
+      | true => rfl
+      | false =>
         unfold emptyFnReturnState
         dsimp only []
         rw [hP]
         rfl
 
-/-- With no active protector, deallocating a frame conflicts with nothing. -/
-theorem hasFrameDeallocProtectorConflict_nil_protectors
-    (borrows : List BorrowEntry) (depth nLocals : Nat) :
-    hasFrameDeallocProtectorConflict borrows [] depth nLocals = false := by
-  cases borrows <;> rfl
+/--
+Without a protected-write conflict on `_0`, the body of `emptyFnAssignUnit`
+is one trusted step to the return-ready state.
+-/
+theorem emptyFn_step_of_noConflict {body : CapturedMir} {s₀ : MachineState}
+    (hCallee : s₀.memory.activeCallee = some emptyFnAssignUnit)
+    (hFrame :
+      s₀.frame = { blockIdx := 0, stmtIdx := 0, locals := [.uninit] })
+    (hConf :
+      hasProtectedWriteConflict s₀.memory.borrows s₀.memory.activeProtectors 0
+        .none .nil 0 0 (length s₀.memory.callStack) = false) :
+    stepMirFn body s₀ = MirStepNode.step (emptyFnReturnState s₀) := by
+  rw [emptyFn_stepMirFn_eq hCallee hFrame, hConf]
+
+/--
+With a protected-write conflict on `_0`, the entry of `emptyFnAssignUnit` is
+undefined behavior in the trusted machine.
+-/
+theorem emptyFn_step_ub {body : CapturedMir} {s₀ : MachineState}
+    (hCallee : s₀.memory.activeCallee = some emptyFnAssignUnit)
+    (hFrame :
+      s₀.frame = { blockIdx := 0, stmtIdx := 0, locals := [.uninit] })
+    (hConf :
+      hasProtectedWriteConflict s₀.memory.borrows s₀.memory.activeProtectors 0
+        .none .nil 0 0 (length s₀.memory.callStack) = true) :
+    stepMirFn body s₀ = MirStepNode.fail .ub := by
+  rw [emptyFn_stepMirFn_eq hCallee hFrame, hConf]
+
+/--
+The body of `emptyFnAssignUnit` is one trusted step: from an entry state the
+trusted `stepMirFn` executes `_0 = const ()` and reaches the return-ready
+state.
+-/
+theorem emptyFn_step {body : CapturedMir} {s₀ : MachineState}
+    (h : EmptyFnEntry s₀) :
+    stepMirFn body s₀ = MirStepNode.step (emptyFnReturnState s₀) :=
+  emptyFn_step_of_noConflict h.1 h.2.1 h.2.2.1
 
 /-- The state reached by the body of `emptyFnAssignUnit` is ready to return
 `.unit`, even when caller protectors are active. -/
 theorem emptyFn_returnReady {body : CapturedMir} {s₀ : MachineState}
     (h : EmptyFnEntry s₀) : ReturnReady body (emptyFnReturnState s₀) .unit := by
-  obtain ⟨hCallee, _, hGuard⟩ := h
-  refine ⟨emptyFnAssignUnit, _, ?_, Or.inl rfl, rfl, rfl, rfl, rfl, ?_⟩
-  · show s₀.memory.activeCallee.getD body = emptyFnAssignUnit
-    rw [hCallee]
-    rfl
-  · show hasFrameDeallocProtectorConflict
-        (invalidateConflictingBorrows s₀.memory.borrows 0 .none
-          (length s₀.memory.callStack))
-        s₀.memory.activeProtectors (length s₀.memory.callStack) 1 = false
-    cases hGuard with
-    | inl hProt =>
-      rw [hProt]
-      exact hasFrameDeallocProtectorConflict_nil_protectors _ _ _
-    | inr hFresh =>
-      have hEq :
-          invalidateConflictingBorrows s₀.memory.borrows 0 .none
-            (length s₀.memory.callStack) = s₀.memory.borrows :=
-        emptyFnReturnState_borrows_eq_of_fresh_frame s₀ hFresh
-      rw [hEq]
-      exact hasFrameDeallocProtectorConflict_unrelated_frame s₀.memory.borrows
-        s₀.memory.activeProtectors (length s₀.memory.callStack) 1 hFresh
+  obtain ⟨hCallee, _, _, hDealloc⟩ := h
+  refine ⟨emptyFnAssignUnit, _, ?_, Or.inl rfl, rfl, rfl, rfl, rfl, hDealloc⟩
+  show s₀.memory.activeCallee.getD body = emptyFnAssignUnit
+  rw [hCallee]
+  rfl
+
+/--
+**`EmptyFnEntry` is the weakest precondition of the empty function.** For a
+state at the entry of `emptyFnAssignUnit`, `EmptyFnEntry` holds exactly when
+the trusted machine takes a silent step to a state that is ready to return
+`.unit`. Any stronger precondition (for example "no active protector" or "no
+borrow targets the callee frame depth") rejects executions that the trusted
+machine accepts.
+-/
+theorem emptyFnEntry_iff_runs {body : CapturedMir} {s₀ : MachineState}
+    (hCallee : s₀.memory.activeCallee = some emptyFnAssignUnit)
+    (hFrame :
+      s₀.frame = { blockIdx := 0, stmtIdx := 0, locals := [.uninit] }) :
+    EmptyFnEntry s₀ ↔
+      ∃ sRet, stepMirFn body s₀ = MirStepNode.step sRet ∧
+        ReturnReady body sRet .unit := by
+  constructor
+  · intro h
+    exact ⟨emptyFnReturnState s₀, emptyFn_step h, emptyFn_returnReady h⟩
+  · intro ⟨sRet, hStep, hRR⟩
+    cases hC : hasProtectedWriteConflict s₀.memory.borrows
+        s₀.memory.activeProtectors 0 .none .nil 0 0
+        (length s₀.memory.callStack) with
+    | true =>
+      rw [emptyFn_step_ub hCallee hFrame hC] at hStep
+      unfold MirStepNode.fail MirStepNode.step at hStep
+      cases hStep
+    | false =>
+      rw [emptyFn_step_of_noConflict hCallee hFrame hC] at hStep
+      unfold MirStepNode.step at hStep
+      cases hStep
+      obtain ⟨_, _, _, _, _, _, _, _, hDealloc⟩ := hRR
+      exact ⟨hCallee, hFrame, hC, hDealloc⟩
+
+/--
+Entry state of `emptyFnAssignUnit` at frame depth `1` under an active
+protector, where a stale borrow of an earlier callee frame at the same depth
+(disabled and deallocated by that frame's `return_`, as `disableFrameBorrows`
+leaves it) is still in the borrow table.
+-/
+def emptyFnStaleEntry : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit] }
+    memory :=
+      { borrows := [
+          { tag := 5, targetLocal := 0, targetProjection := [],
+            perm := .disabled, targetFrameDepth := 1, allocDead := true }]
+        activeProtectors := [7]
+        callStack := [
+          { callerBody := emptyFnAssignUnit
+            frame := { blockIdx := 0, stmtIdx := 0, locals := [] }
+            destination := { local_ := 0, projection := [] } }]
+        activeCallee := some emptyFnAssignUnit } }
+
+/--
+**Stale borrows do not block the empty function.** The state
+`emptyFnStaleEntry` is an `EmptyFnEntry` although a protector is active and a
+borrow targets the callee frame depth: neither "no active protector" nor "no
+borrow at the callee frame depth" holds, yet the trusted machine runs the
+callee. Such states arise at every call that follows, at the same depth, a
+callee that borrowed one of its locals.
+-/
+theorem emptyFnEntry_stale_disabled_borrow :
+    EmptyFnEntry emptyFnStaleEntry ∧
+    emptyFnStaleEntry.memory.activeProtectors ≠ [] ∧
+    ¬ (∀ e, e ∈ emptyFnStaleEntry.memory.borrows →
+      e.targetFrameDepth ≠ length emptyFnStaleEntry.memory.callStack) :=
+  ⟨⟨rfl, rfl, rfl, rfl⟩, fun h => (by cases h),
+    fun h => h _ (List.mem_cons_self ..) rfl⟩
 
 /--
 **Contract of the empty function, discharged once and for all.** From every
-protector-free entry state, `emptyFnAssignUnit` takes exactly one trusted
-step to the return-ready state `emptyFnReturnState`, returning `.unit` and
-preserving the call stack.
+entry state satisfying the weakest precondition `EmptyFnEntry`,
+`emptyFnAssignUnit` takes exactly one trusted step to the return-ready state
+`emptyFnReturnState`, returning `.unit` and preserving the call stack.
 -/
 def emptyFnContract (body : CapturedMir) : FramePrepContract body where
   Pre := EmptyFnEntry
