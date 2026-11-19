@@ -1284,3 +1284,150 @@ pub fn ub_raw_ptr_read_uninit_struct_padding_kani5183() -> u8 {
     let base: *const u8 = (&raw const s) as *const u8;
     unsafe { *offset(base, 1isize) }
 }
+
+// ============================================================================
+// Category 11: Same-Tag Disjoint `copy_nonoverlapping` (Campaign #16), Static
+// Accesses, and Reads and Writes Through a Shared Reborrow Temporary.
+//
+// Each item that a `__ANNEAL_MODEL_<name>` marker names is a model item, never a
+// manifest test: `miri_difftest_oracle.rs` calls the marked probes live and
+// pins every verdict on which Anneal currently disagrees with Miri (see
+// "Category 11 engine gaps" in `tests/miri-diff/README.md`).
+//
+// - The `pass_copy_nonoverlapping_same_tag_disjoint_*` probes copy between
+//   disjoint parts of one local through two raw pointers that share one tag
+//   (`offset` keeps the tag of its base pointer). Miri returns normally, while
+//   Anneal rejects a `copy_nonoverlapping` whose source and destination share a
+//   tag before it compares their ranges.
+// - Every access to a `static` goes through a reference temporary
+//   (`&raw const S.f` is `&raw const (*{&S}).f`), and Miri retags that
+//   temporary: the bytes outside an `UnsafeCell` are frozen, and the bytes
+//   inside one stay writable. Anneal reports UB at the first access to any
+//   `static`, so both static probes are model items as well.
+// - The two manifest seeds of this category replay the static probes through
+//   an explicit shared reborrow `tmp` of a local, on which Anneal agrees with
+//   Miri.
+// ============================================================================
+
+#[repr(C)]
+pub struct FreezeAndCell {
+    pub frozen: u32,
+    pub cell: UnsafeCell<u32>,
+}
+
+// A `static` must be `Sync`; the corpus never shares one across threads.
+unsafe impl Sync for FreezeAndCell {}
+
+pub const __ANNEAL_MODEL_STATIC_FROZEN_PAIR: &str = "STATIC_FROZEN_PAIR";
+// A `static` without interior mutability, which Miri allocates read-only.
+pub static STATIC_FROZEN_PAIR: PairU32 = PairU32 { a: 7u32, b: 35u32 };
+
+pub const __ANNEAL_MODEL_STATIC_FREEZE_AND_CELL: &str = "STATIC_FREEZE_AND_CELL";
+// A `static` with interior mutability, which Miri allocates writable.
+pub static STATIC_FREEZE_AND_CELL: FreezeAndCell = FreezeAndCell {
+    frozen: 3u32,
+    cell: unsafe { transmute::<u32, UnsafeCell<u32>>(12u32) },
+};
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_pass_copy_nonoverlapping_same_tag_disjoint_array_halves: &str =
+    "pass_copy_nonoverlapping_same_tag_disjoint_array_halves";
+/// Campaign #16 (`ub_copy_nonoverlapping_partial_overlap_array` with its
+/// `offset(p, 1isize)` perturbed to `offset(p, 2isize)`): `arr[0..2]` is copied
+/// onto the disjoint `arr[2..4]` through `p` and `offset(p, 2isize)`, which
+/// share the tag of `p`. `arr` becomes `[10, 20, 10, 20]`, so the result is
+/// `10 ^ 20 = 30` (no copy gives `54`, and a one-element copy gives `34`).
+#[inline(never)]
+pub fn pass_copy_nonoverlapping_same_tag_disjoint_array_halves() -> u32 {
+    let mut arr: [u32; 4] = [10u32, 20u32, 30u32, 40u32];
+    let p: *mut u32 = &raw mut arr[0];
+    unsafe {
+        let dst: *mut u32 = offset(p, 2isize);
+        copy_nonoverlapping(p as *const u32, dst, 2usize);
+    }
+    arr[2] ^ arr[3]
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_pass_copy_nonoverlapping_same_tag_disjoint_struct_fields: &str =
+    "pass_copy_nonoverlapping_same_tag_disjoint_struct_fields";
+/// `pair.a` is copied onto its disjoint sibling field `pair.b` through
+/// `p = &raw mut pair.a` and `offset(p, 1isize)`, which share the tag of `p`
+/// (`&raw mut` creates no new tag, so `p` may access all of `pair`). Returns
+/// `44`.
+#[inline(never)]
+pub fn pass_copy_nonoverlapping_same_tag_disjoint_struct_fields() -> u32 {
+    let mut pair: PairU32 = PairU32 { a: 44u32, b: 33u32 };
+    let p: *mut u32 = &raw mut pair.a;
+    unsafe {
+        let dst: *mut u32 = offset(p, 1isize);
+        copy_nonoverlapping(p as *const u32, dst, 1usize);
+    }
+    pair.b
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_pass_static_const_raw_ptr_read_and_freeze_retag: &str =
+    "pass_static_const_raw_ptr_read_and_freeze_retag";
+/// Reads `STATIC_FROZEN_PAIR.b` through `&raw const` after `&STATIC_FROZEN_PAIR`
+/// is created: every static-access temporary is retagged frozen, and reads
+/// never conflict with frozen tags. Returns `35 ^ 7 ^ (35 << 8) = 8996`.
+#[inline(never)]
+pub fn pass_static_const_raw_ptr_read_and_freeze_retag() -> u32 {
+    let raw: *const u32 = &raw const STATIC_FROZEN_PAIR.b;
+    let shared: &PairU32 = &STATIC_FROZEN_PAIR;
+    let first: u32 = unsafe { *raw };
+    let again: u32 = unsafe { *raw };
+    first ^ shared.a ^ (again << 8u32)
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_ub_static_unsafe_cell_raw_const_cast_mut_write: &str =
+    "ub_static_unsafe_cell_raw_const_cast_mut_write";
+/// Charon PR #1620 (`--no-reconstruct-static-accesses`): a write through
+/// `(&raw const STATIC_FREEZE_AND_CELL.cell) as *const u32 as *mut u32` is
+/// allowed, because the retag of the static-access temporary leaves the
+/// `UnsafeCell` bytes writable. The same write to the `frozen` field is UB,
+/// because that retag froze its bytes.
+#[inline(never)]
+pub fn ub_static_unsafe_cell_raw_const_cast_mut_write() -> u32 {
+    let cell: *mut u32 = (&raw const STATIC_FREEZE_AND_CELL.cell) as *const u32 as *mut u32;
+    unsafe {
+        *cell = 21u32;
+    }
+    let frozen: *mut u32 = (&raw const STATIC_FREEZE_AND_CELL.frozen) as *mut u32;
+    unsafe {
+        *frozen = *cell;
+        *frozen
+    }
+}
+
+/// Local twin of `pass_static_const_raw_ptr_read_and_freeze_retag`: `tmp` plays
+/// the static-access temporary, and `&raw const (*tmp).b` reads stay valid after
+/// the shared reborrow `&*tmp`. Returns `35 ^ 7 ^ (35 << 8) = 8996`.
+pub fn pass_shared_temp_const_raw_ptr_read_and_freeze_retag() -> u32 {
+    let pair: PairU32 = PairU32 { a: 7u32, b: 35u32 };
+    let tmp: &PairU32 = &pair;
+    let raw: *const u32 = &raw const (*tmp).b;
+    let shared: &PairU32 = &*tmp;
+    let first: u32 = unsafe { *raw };
+    let again: u32 = unsafe { *raw };
+    first ^ shared.a ^ (again << 8u32)
+}
+
+/// Local twin of the `frozen` write of
+/// `ub_static_unsafe_cell_raw_const_cast_mut_write`: the shared reborrow `tmp`
+/// freezes the bytes of `frozen` (but not those of `cell`), so the write through
+/// `(&raw const (*tmp).frozen) as *mut u32` is UB.
+pub fn ub_shared_temp_unsafe_cell_raw_const_cast_mut_write() -> u32 {
+    let local: FreezeAndCell = FreezeAndCell {
+        frozen: 3u32,
+        cell: unsafe { transmute::<u32, UnsafeCell<u32>>(12u32) },
+    };
+    let tmp: &FreezeAndCell = &local;
+    let frozen: *mut u32 = (&raw const (*tmp).frozen) as *mut u32;
+    unsafe {
+        *frozen = 21u32;
+        *frozen
+    }
+}

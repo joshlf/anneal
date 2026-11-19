@@ -19,16 +19,17 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anneal_difftest::miri_eval::{
-    MiriEvalOptions, WitnessPolarity, classify_outcome_tags_polarity, divergence_class_slug,
-    evaluate_miri_batches, evaluate_miri_batches_with_options, reproduce_miri_finding,
-    witness_polarity_accounting_holds,
+    MiriEvalOptions, WitnessPolarity, classify_outcome_tags_polarity,
+    classify_verdict_witness_polarity, divergence_class_slug, evaluate_miri_batches,
+    evaluate_miri_batches_with_options, reproduce_miri_finding, witness_polarity_accounting_holds,
 };
 use anneal_difftest::mutators_miri::{
     ArithmeticCastMutator, BitValidityTransmuteMutator, DetRng, GeneratedMiriCandidate,
     MIRI_CORPUS_CRATE_HEADER, MIRI_CORPUS_MODULE_PREAMBLE, MiriAstMutator, MutationMode,
-    PlaceProjectionWrapper, RawPtrOffsetMutator, TreeBorrowsRetagInterleaver,
-    build_standalone_candidate_source, generate_miri_batch, generate_miri_corpus_batch,
-    reconstruct_miri_mutation_steps, replay_miri_mutation_steps,
+    PlaceProjectionWrapper, RAW_MIRI_DIFF_CORPUS_RS, RawPtrOffsetMutator,
+    TreeBorrowsRetagInterleaver, build_standalone_candidate_source, generate_miri_batch,
+    generate_miri_corpus_batch, load_miri_diff_corpus_seeds, reconstruct_miri_mutation_steps,
+    replay_miri_mutation_steps,
 };
 use cargo_anneal::{
     AnnealOutcome, CaptureDriverConfig, ComparisonVerdict, DivergenceKind, MiriOutcome,
@@ -153,11 +154,11 @@ data = json.loads(json_path.read_text())
 assert data["harness"] == "miri-difftest"
 assert data["oracle_comparison"] == "performed"
 assert data["mode"] == "identity"
-assert data["total_candidates"] == 110
-assert data["compiled_candidates"] == 110
+assert data["total_candidates"] == 112
+assert data["compiled_candidates"] == 112
 assert data["compile_failed_candidates"] == 0
-assert data["compared_candidates"] == 110
-assert data["agree_count"] == 110
+assert data["compared_candidates"] == 112
+assert data["agree_count"] == 112
 assert data["diverge_count"] == 0
 assert data["kernel_confirmed_divergences"] == 0
 assert data["not_compared_count"] == 0
@@ -3280,6 +3281,519 @@ pub fn cat9_gap_drop_impl_ub_missed() -> u32 {
             },
             "known Category 9 `Drop` gap `{name}` changed (fixed?); update the pin and \
              tests/miri-diff/README.md"
+        );
+    }
+}
+
+/// 1-based line of the first line of `staged` that contains `needle` and follows
+/// the unique line that contains `header`.
+fn c16_line_after(staged: &str, header: &str, needle: &str) -> u32 {
+    let start = cat9_line_of(staged, header) as usize;
+    staged
+        .lines()
+        .enumerate()
+        .skip(start)
+        .find_map(|(i, l)| l.contains(needle).then_some(i as u32 + 1))
+        .unwrap_or_else(|| panic!("`{needle}` must follow `{header}` in the staged crate"))
+}
+
+/// Source of the corpus function `name` (attributes and doc comments dropped),
+/// renamed to `renamed`, so a candidate can run a corpus body in the root frame.
+fn c16_corpus_fn_renamed(name: &str, renamed: &str) -> String {
+    let file = syn::parse_file(RAW_MIRI_DIFF_CORPUS_RS).expect("corpus parses");
+    let mut func = file
+        .items
+        .into_iter()
+        .find_map(|item| match item {
+            syn::Item::Fn(f) if f.sig.ident == name => Some(f),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("tests/miri-diff/corpus/src/lib.rs must define `{name}`"));
+    func.attrs.clear();
+    func.sig.ident = syn::Ident::new(renamed, func.sig.ident.span());
+    prettyplease::unparse(&syn::File {
+        shebang: None,
+        attrs: Vec::new(),
+        items: vec![syn::Item::Fn(func)],
+    })
+}
+
+/// Campaign #16 same-tag disjoint `copy_nonoverlapping` probes, the static-access
+/// probes, and their local twins (Category 11 of `tests/miri-diff/corpus`), run
+/// live against Miri.
+///
+/// Miri's verdict is pinned exactly. Each Anneal gap is pinned to exactly two
+/// states (a ratchet: any third state, such as an unsound missed fault, a
+/// different value, a fault at a different statement, `NotCompared`, or a
+/// compile failure, fails this test):
+/// - the documented gap, kernel-confirmed, with Anneal's UB at exactly the
+///   documented statement, or
+/// - agreement with Miri, once Anneal is fixed.
+///
+/// Gaps (see "Category 11 engine gaps" in `tests/miri-diff/README.md`):
+/// - `pass_copy_nonoverlapping_same_tag_disjoint_{array_halves,struct_fields}`
+///   (called as intra-crate callees, and run in the root frame as renamed
+///   copies): `false_positive_ub` (`sound_conservative_abstraction`) at the
+///   `copy_nonoverlapping`, because `Statements.lean` checks
+///   `Nat.beq srcPtr.tag dstPtr.tag` before it compares the copied ranges.
+/// - `pass_static_const_raw_ptr_read_and_freeze_retag`: `false_positive_ub` at
+///   the first access to the `static` (Anneal reports UB at every access to a
+///   `static`, reads included).
+/// - `ub_static_unsafe_cell_raw_const_cast_mut_write` and the immutable-static
+///   write control: Miri reports UB at the write, and Anneal reports UB earlier,
+///   at the first access to the `static` (`ub_location_mismatch`,
+///   `value_mismatch`): never a pass.
+/// - `c16_gap_unsafe_cell_field_write_through_shared_temp`: a write to the
+///   `UnsafeCell` field of a local through a shared reborrow of the containing
+///   struct, which Miri allows, is UB in Anneal (`false_positive_ub`). It is the
+///   local twin of the `cell` write of the static UB probe, which therefore
+///   agrees only once both gaps are fixed.
+///
+/// Controls that must agree now: a true same-tag overlap (UB at the copy, so the
+/// copy pins cannot pass by dropping the overlap check), and the two Category
+/// 11 manifest seeds (the local twins of the static probes).
+#[test]
+fn campaign16_same_tag_disjoint_copy_and_static_retag_probes_verify_live() {
+    let dir = unique_temp_dir("campaign16");
+    let findings_dir = dir.join("findings");
+    let root = repo_root();
+
+    let seed_source = |name: &str| -> String {
+        load_miri_diff_corpus_seeds()
+            .into_iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("missing Category 11 manifest seed `{name}`"))
+            .fn_source
+    };
+    let named_sources: Vec<(String, String)> = vec![
+        (
+            "c16_call_array_halves".to_string(),
+            "pub fn c16_call_array_halves() -> u32 {\n    \
+             pass_copy_nonoverlapping_same_tag_disjoint_array_halves()\n}\n"
+                .to_string(),
+        ),
+        (
+            "c16_call_struct_fields".to_string(),
+            "pub fn c16_call_struct_fields() -> u32 {\n    \
+             pass_copy_nonoverlapping_same_tag_disjoint_struct_fields()\n}\n"
+                .to_string(),
+        ),
+        (
+            "c16_root_array_halves".to_string(),
+            c16_corpus_fn_renamed(
+                "pass_copy_nonoverlapping_same_tag_disjoint_array_halves",
+                "c16_root_array_halves",
+            ),
+        ),
+        (
+            "c16_root_struct_fields".to_string(),
+            c16_corpus_fn_renamed(
+                "pass_copy_nonoverlapping_same_tag_disjoint_struct_fields",
+                "c16_root_struct_fields",
+            ),
+        ),
+        (
+            "c16_same_tag_overlap_control".to_string(),
+            r#"pub fn c16_same_tag_overlap_control() -> u32 {
+    let mut arr: [u32; 4] = [10u32, 20u32, 30u32, 40u32];
+    let p: *mut u32 = &raw mut arr[0];
+    unsafe {
+        let dst: *mut u32 = offset(p, 1isize);
+        copy_nonoverlapping(p as *const u32, dst, 2usize);
+    }
+    arr[2]
+}
+"#
+            .to_string(),
+        ),
+        (
+            "c16_call_static_freeze_read".to_string(),
+            "pub fn c16_call_static_freeze_read() -> u32 {\n    \
+             pass_static_const_raw_ptr_read_and_freeze_retag()\n}\n"
+                .to_string(),
+        ),
+        (
+            "c16_call_static_cell_then_frozen_write".to_string(),
+            "pub fn c16_call_static_cell_then_frozen_write() -> u32 {\n    \
+             ub_static_unsafe_cell_raw_const_cast_mut_write()\n}\n"
+                .to_string(),
+        ),
+        (
+            "c16_immutable_static_mut_write_control".to_string(),
+            r#"pub fn c16_immutable_static_mut_write_control() -> u32 {
+    let p: *mut u32 = (&raw const STATIC_FROZEN_PAIR.a) as *mut u32;
+    unsafe {
+        *p = 9u32;
+        *p
+    }
+}
+"#
+            .to_string(),
+        ),
+        (
+            "c16_gap_unsafe_cell_field_write_through_shared_temp".to_string(),
+            r#"pub fn c16_gap_unsafe_cell_field_write_through_shared_temp() -> u32 {
+    let local: FreezeAndCell = FreezeAndCell {
+        frozen: 3u32,
+        cell: unsafe { transmute::<u32, UnsafeCell<u32>>(12u32) },
+    };
+    let tmp: &FreezeAndCell = &local;
+    let cell: *mut u32 = (&raw const (*tmp).cell) as *const u32 as *mut u32;
+    unsafe {
+        *cell = 21u32;
+    }
+    let frozen: *const u32 = &raw const (*tmp).frozen;
+    unsafe { (*cell << 8u32) ^ *frozen }
+}
+"#
+            .to_string(),
+        ),
+        (
+            "pass_shared_temp_const_raw_ptr_read_and_freeze_retag".to_string(),
+            seed_source("pass_shared_temp_const_raw_ptr_read_and_freeze_retag"),
+        ),
+        (
+            "ub_shared_temp_unsafe_cell_raw_const_cast_mut_write".to_string(),
+            seed_source("ub_shared_temp_unsafe_cell_raw_const_cast_mut_write"),
+        ),
+    ];
+    let candidates: Vec<GeneratedMiriCandidate> = named_sources
+        .iter()
+        .enumerate()
+        .map(|(id, (name, fn_src))| GeneratedMiriCandidate {
+            id,
+            seed_index: id,
+            seed_name: name.clone(),
+            fn_name: name.clone(),
+            seed_u64: id as u64,
+            applied_mutators: Vec::new(),
+            tracked_locals: Vec::new(),
+            fn_source: fn_src.clone(),
+            source: build_standalone_candidate_source(fn_src),
+        })
+        .collect();
+    // The batch stages every candidate after the shared header and preamble,
+    // in order, exactly as `evaluate_miri_batches_with_options` does.
+    let mut staged = format!("{MIRI_CORPUS_CRATE_HEADER}\n{MIRI_CORPUS_MODULE_PREAMBLE}\n");
+    for cand in &candidates {
+        staged.push_str(cand.fn_source.trim());
+        staged.push_str("\n\n");
+    }
+
+    let options = MiriEvalOptions {
+        findings_dir: Some(findings_dir.clone()),
+        anneal_repo_root: Some(root),
+        shrink_seeds: None,
+    };
+    let report = evaluate_miri_batches_with_options(
+        "seeded",
+        0xC16_0001,
+        std::slice::from_ref(&candidates),
+        candidates.len(),
+        &options,
+    )
+    .expect("evaluate Campaign #16 / Category 11 live batch");
+    assert_eq!(report.total_candidates, 11);
+    assert_eq!(report.compiled_candidates, 11, "{:?}", report.item_reports);
+    assert_eq!(report.not_compared_count, 0, "{:?}", report.item_reports);
+    assert!(witness_polarity_accounting_holds(&report));
+
+    let item = |name: &str| {
+        report
+            .item_reports
+            .iter()
+            .find(|r| r.name == name)
+            .unwrap_or_else(|| panic!("missing item report `{name}`"))
+    };
+    let polarity = |name: &str| {
+        let rep = item(name);
+        classify_verdict_witness_polarity(&rep.miri, &rep.anneal, &rep.verdict)
+    };
+    let mut conservative_gaps = 0usize;
+    let mut location_gaps = 0usize;
+
+    // Same-tag disjoint copies, through the corpus probes (callee frame) and
+    // through their renamed bodies (root frame): Miri returns the copied value;
+    // Anneal reports UB at the `copy_nonoverlapping` or, once fixed, agrees.
+    let probe_header = |probe: &str| format!("pub fn {probe}() -> u32 {{");
+    for (name, header, bits, copy) in [
+        (
+            "c16_call_array_halves",
+            probe_header("pass_copy_nonoverlapping_same_tag_disjoint_array_halves"),
+            30u128,
+            "copy_nonoverlapping(p as *const u32, dst, 2usize);",
+        ),
+        (
+            "c16_call_struct_fields",
+            probe_header("pass_copy_nonoverlapping_same_tag_disjoint_struct_fields"),
+            44,
+            "copy_nonoverlapping(p as *const u32, dst, 1usize);",
+        ),
+        (
+            "c16_root_array_halves",
+            probe_header("c16_root_array_halves"),
+            30,
+            "copy_nonoverlapping(p as *const u32, dst, 2usize);",
+        ),
+        (
+            "c16_root_struct_fields",
+            probe_header("c16_root_struct_fields"),
+            44,
+            "copy_nonoverlapping(p as *const u32, dst, 1usize);",
+        ),
+    ] {
+        let rep = item(name);
+        assert_eq!(
+            rep.miri,
+            MiriOutcome::PassScalar {
+                bits,
+                size_bytes: 4
+            },
+            "`{name}`: Miri must return the copied value"
+        );
+        let copy_line = c16_line_after(&staged, &header, copy);
+        match (&rep.anneal, polarity(name)) {
+            (
+                AnnealOutcome::Ub { span: Some(s) },
+                Some(WitnessPolarity::SoundConservativeAbstraction),
+            ) if s.start_line == copy_line
+                && matches!(
+                    rep.verdict,
+                    ComparisonVerdict::Diverge(DivergenceKind::FalsePositiveUb { .. })
+                )
+                && rep.kernel_confirmed =>
+            {
+                conservative_gaps += 1;
+            }
+            (
+                AnnealOutcome::PassScalar {
+                    bits: b,
+                    size_bytes: 4,
+                },
+                None,
+            ) if *b == bits && rep.verdict == ComparisonVerdict::Agree => {}
+            (anneal, pol) => panic!(
+                "`{name}` left both pinned states: expected Anneal UB at staged line \
+                 {copy_line} (`{copy}`, false_positive_ub, kernel-confirmed) or agreement \
+                 on `{bits}`, got anneal={anneal:?} verdict={:?} polarity={pol:?} \
+                 kernel_confirmed={}; update the pin and tests/miri-diff/README.md",
+                rep.verdict, rep.kernel_confirmed
+            ),
+        }
+    }
+
+    // A true same-tag overlap must stay UB at the copy in both, so the pins above
+    // cannot hold because Anneal stopped checking overlap.
+    let overlap = item("c16_same_tag_overlap_control");
+    let overlap_line = c16_line_after(
+        &staged,
+        "pub fn c16_same_tag_overlap_control() -> u32 {",
+        "copy_nonoverlapping(p as *const u32, dst, 2usize);",
+    );
+    assert_eq!(overlap.verdict, ComparisonVerdict::Agree, "{overlap:?}");
+    assert!(
+        matches!(&overlap.miri, MiriOutcome::Ub { pos: Some(p), message }
+            if p.line == overlap_line && message.contains("overlapping"))
+            && matches!(&overlap.anneal, AnnealOutcome::Ub { span: Some(s) }
+                if s.start_line == overlap_line),
+        "the same-tag overlap control must be UB at staged line {overlap_line} in both: \
+         miri={:?} anneal={:?}",
+        overlap.miri,
+        overlap.anneal
+    );
+
+    // Static reads and the local `UnsafeCell` field write: Miri returns normally;
+    // Anneal reports UB at the documented statement or, once fixed, agrees.
+    let static_read_line = c16_line_after(
+        &staged,
+        &probe_header("pass_static_const_raw_ptr_read_and_freeze_retag"),
+        "let raw: *const u32 = &raw const STATIC_FROZEN_PAIR.b;",
+    );
+    let local_cell_write_line = c16_line_after(
+        &staged,
+        &probe_header("c16_gap_unsafe_cell_field_write_through_shared_temp"),
+        "*cell = 21u32;",
+    );
+    for (name, bits, gap_line) in [
+        ("c16_call_static_freeze_read", 8996u128, static_read_line),
+        (
+            "c16_gap_unsafe_cell_field_write_through_shared_temp",
+            5379,
+            local_cell_write_line,
+        ),
+    ] {
+        let rep = item(name);
+        assert_eq!(
+            rep.miri,
+            MiriOutcome::PassScalar {
+                bits,
+                size_bytes: 4
+            },
+            "`{name}`: Miri outcome changed"
+        );
+        match (&rep.anneal, polarity(name)) {
+            (
+                AnnealOutcome::Ub { span: Some(s) },
+                Some(WitnessPolarity::SoundConservativeAbstraction),
+            ) if s.start_line == gap_line
+                && matches!(
+                    rep.verdict,
+                    ComparisonVerdict::Diverge(DivergenceKind::FalsePositiveUb { .. })
+                )
+                && rep.kernel_confirmed =>
+            {
+                conservative_gaps += 1;
+            }
+            (
+                AnnealOutcome::PassScalar {
+                    bits: b,
+                    size_bytes: 4,
+                },
+                None,
+            ) if *b == bits && rep.verdict == ComparisonVerdict::Agree => {}
+            (anneal, pol) => panic!(
+                "`{name}` left both pinned states: expected Anneal UB at staged line \
+                 {gap_line} (false_positive_ub, kernel-confirmed) or agreement on `{bits}`, \
+                 got anneal={anneal:?} verdict={:?} polarity={pol:?} kernel_confirmed={}; \
+                 update the pin and tests/miri-diff/README.md",
+                rep.verdict, rep.kernel_confirmed
+            ),
+        }
+    }
+
+    // Static writes: Miri reports UB at the write (frozen bytes of the
+    // interior-mutable static, or the read-only immutable static). Anneal must
+    // report UB too, never a pass: today at the first access to the `static`,
+    // and once fixed at the write itself.
+    let cell_probe = probe_header("ub_static_unsafe_cell_raw_const_cast_mut_write");
+    let immutable = probe_header("c16_immutable_static_mut_write_control");
+    for (name, header, first_access, write, miri_message) in [
+        (
+            "c16_call_static_cell_then_frozen_write",
+            cell_probe.as_str(),
+            "let cell: *mut u32 = (&raw const STATIC_FREEZE_AND_CELL.cell)",
+            "*frozen = *cell;",
+            "is forbidden",
+        ),
+        (
+            "c16_immutable_static_mut_write_control",
+            immutable.as_str(),
+            "let p: *mut u32 = (&raw const STATIC_FROZEN_PAIR.a) as *mut u32;",
+            "*p = 9u32;",
+            "read-only",
+        ),
+    ] {
+        let rep = item(name);
+        let access_line = c16_line_after(&staged, header, first_access);
+        let write_line = c16_line_after(&staged, header, write);
+        assert!(
+            matches!(&rep.miri, MiriOutcome::Ub { pos: Some(p), message }
+                if p.line == write_line && message.contains(miri_message)),
+            "`{name}`: expected Miri UB (`{miri_message}`) at staged line {write_line}, got {:?}",
+            rep.miri
+        );
+        match (&rep.anneal, polarity(name)) {
+            (AnnealOutcome::Ub { span: Some(s) }, Some(WitnessPolarity::ValueMismatch))
+                if s.start_line == access_line
+                    && matches!(
+                        rep.verdict,
+                        ComparisonVerdict::Diverge(DivergenceKind::UbLocationMismatch { .. })
+                    )
+                    && rep.kernel_confirmed =>
+            {
+                location_gaps += 1;
+            }
+            (AnnealOutcome::Ub { span: Some(s) }, None)
+                if s.start_line == write_line && rep.verdict == ComparisonVerdict::Agree => {}
+            (anneal, pol) => panic!(
+                "`{name}` left both pinned states: expected Anneal UB at staged line \
+                 {access_line} (first static access, ub_location_mismatch, \
+                 kernel-confirmed) or agreement at line {write_line}, got anneal={anneal:?} \
+                 verdict={:?} polarity={pol:?} kernel_confirmed={}; update the pin and \
+                 tests/miri-diff/README.md",
+                rep.verdict, rep.kernel_confirmed
+            ),
+        }
+    }
+
+    // The Category 11 manifest seeds (local twins of the static probes) agree.
+    let twin_read = item("pass_shared_temp_const_raw_ptr_read_and_freeze_retag");
+    assert_eq!(twin_read.verdict, ComparisonVerdict::Agree, "{twin_read:?}");
+    assert_eq!(
+        (&twin_read.miri, &twin_read.anneal),
+        (
+            &MiriOutcome::PassScalar {
+                bits: 8996,
+                size_bytes: 4
+            },
+            &AnnealOutcome::PassScalar {
+                bits: 8996,
+                size_bytes: 4
+            }
+        )
+    );
+    let twin_write = item("ub_shared_temp_unsafe_cell_raw_const_cast_mut_write");
+    let twin_write_line = c16_line_after(
+        &staged,
+        &probe_header("ub_shared_temp_unsafe_cell_raw_const_cast_mut_write"),
+        "*frozen = 21u32;",
+    );
+    assert_eq!(
+        twin_write.verdict,
+        ComparisonVerdict::Agree,
+        "{twin_write:?}"
+    );
+    assert!(
+        matches!(&twin_write.miri, MiriOutcome::Ub { pos: Some(p), message }
+            if p.line == twin_write_line && message.contains("is forbidden"))
+            && matches!(&twin_write.anneal, AnnealOutcome::Ub { span: Some(s) }
+                if s.start_line == twin_write_line),
+        "the frozen-field write twin must be UB at staged line {twin_write_line} in both: \
+         miri={:?} anneal={:?}",
+        twin_write.miri,
+        twin_write.anneal
+    );
+
+    // Batch accounting: exactly the pinned gaps diverge, all kernel-confirmed,
+    // and none is an unsound missed fault.
+    let gaps = conservative_gaps + location_gaps;
+    eprintln!(
+        "Campaign #16 / Category 11 pins: {conservative_gaps} sound_conservative_abstraction \
+         gaps, {location_gaps} ub_location_mismatch gaps, {} agreements",
+        report.agree_count
+    );
+    assert_eq!(report.diverge_count, gaps, "{:?}", report.item_reports);
+    assert_eq!(report.agree_count, 11 - gaps, "{:?}", report.item_reports);
+    assert_eq!(report.kernel_confirmed_divergences, gaps);
+    for (slug, expected) in [
+        ("unsound_missed_fault", 0usize),
+        ("sound_conservative_abstraction", conservative_gaps),
+        ("value_mismatch", location_gaps),
+        ("harness_or_extraction_error", 0),
+    ] {
+        assert_eq!(
+            report.witness_polarity_counts.get(slug),
+            Some(&expected),
+            "witness_polarity_counts[{slug}]: {:?}",
+            report.witness_polarity_counts
+        );
+    }
+    assert_eq!(report.findings.len(), gaps);
+    for f in &report.findings {
+        assert!(
+            f.kernel_confirmed,
+            "finding `{}` must be kernel-confirmed",
+            f.fn_name
+        );
+        assert_eq!(
+            WitnessPolarity::from_str_slug(&f.witness_polarity),
+            classify_outcome_tags_polarity(
+                &f.miri_outcome_tag,
+                &f.anneal_outcome_tag,
+                Some(&f.divergence_class),
+            ),
+            "finding `{}` polarity disagrees with its tags",
+            f.fn_name
         );
     }
 }

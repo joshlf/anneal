@@ -12,9 +12,12 @@
 This script checks three invariants for `tests/miri-diff/`:
 
 1. Manifest <-> Corpus consistency (`--check-manifest`, always enabled):
-   Verifies that every `[[tests]]` entry in `tests/miri-diff/manifest.toml`
-   matches a `pub fn <name>()` in `tests/miri-diff/corpus/src/lib.rs` and an
-   entry in `tests/miri-diff/corpus/examples/miri_eval.rs`, that every
+   Verifies that the `[[tests]]` entries in `tests/miri-diff/manifest.toml`
+   list, in order, exactly the zero-argument `pub fn <name>()` items of
+   `tests/miri-diff/corpus/src/lib.rs` other than `helper_add_ten` and the
+   items that a `const __ANNEAL_MODEL_<name>: &str = "<name>"` marker declares
+   as model items, that every entry has a dispatch arm in
+   `tests/miri-diff/corpus/examples/miri_eval.rs`, that every
    `miri_verdict = "ub"` entry records a valid `miri_ub_span`, that all
    `upstream_path` values are clean relative paths (`tests/pass/...`,
    `tests/panic/...`, `tests/fail/...`), and that all `[tests.known_anneal_bug]`
@@ -228,10 +231,47 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
     lib_rs = (corpus_dir / "src" / "lib.rs").read_text(encoding="utf-8")
     eval_rs = (corpus_dir / "examples" / "miri_eval.rs").read_text(encoding="utf-8")
 
+    # A `const __ANNEAL_MODEL_<name>: &str = "<name>";` marker makes `<name>` a
+    # model item (an intra-crate callee or a static), never a manifest test,
+    # exactly as `corpus_model_helper_names` in
+    # `crates/anneal-difftest/src/mutators_miri.rs` treats it. The capture
+    # driver also treats the marker's value as a model item, so the value must
+    # repeat the name.
+    model_names = set(
+        re.findall(r"^(?:pub\s+)?const\s+__ANNEAL_MODEL_([A-Za-z0-9_]+)\s*:", lib_rs, re.MULTILINE)
+    )
+    marker_values = dict(
+        re.findall(
+            r'^(?:pub\s+)?const\s+__ANNEAL_MODEL_([A-Za-z0-9_]+)\s*:\s*&str\s*=\s*"([^"]*)"\s*;',
+            lib_rs,
+            re.MULTILINE,
+        )
+    )
+    mismatched_markers = sorted(
+        name for name in model_names if marker_values.get(name) != name
+    )
+    if mismatched_markers:
+        raise ValueError(
+            "corpus/src/lib.rs declares __ANNEAL_MODEL_<name> markers whose value is "
+            f"not the string \"<name>\": {mismatched_markers}"
+        )
+    item_names = set(
+        re.findall(
+            r"^(?:pub\s+)?(?:fn|static|struct|enum|union)\s+([A-Za-z0-9_]+)\b",
+            lib_rs,
+            re.MULTILINE,
+        )
+    )
+    stale_markers = sorted(model_names - item_names)
+    if stale_markers:
+        raise ValueError(
+            "corpus/src/lib.rs declares __ANNEAL_MODEL_* markers that name no "
+            f"top-level item: {stale_markers}"
+        )
     fn_names_in_lib = [
         m.group(1)
         for m in re.finditer(r"^pub fn ([a-z0-9_]+)\(\)", lib_rs, re.MULTILINE)
-        if m.group(1) != "helper_add_ten"
+        if m.group(1) != "helper_add_ten" and m.group(1) not in model_names
     ]
 
     tests = manifest.get("tests", [])

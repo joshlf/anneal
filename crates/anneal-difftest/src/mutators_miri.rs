@@ -214,6 +214,79 @@ pub fn helper_unwind_guarded(base: u32, delta: u32) -> u32 {
     let _guard = UnwindCleanupGuard(base);
     helper_unwind_leaf(base, delta)
 }
+
+#[repr(C)]
+pub struct FreezeAndCell {
+    pub frozen: u32,
+    pub cell: UnsafeCell<u32>,
+}
+
+unsafe impl Sync for FreezeAndCell {}
+
+pub const __ANNEAL_MODEL_STATIC_FROZEN_PAIR: &str = \"STATIC_FROZEN_PAIR\";
+pub static STATIC_FROZEN_PAIR: PairU32 = PairU32 { a: 7u32, b: 35u32 };
+
+pub const __ANNEAL_MODEL_STATIC_FREEZE_AND_CELL: &str = \"STATIC_FREEZE_AND_CELL\";
+pub static STATIC_FREEZE_AND_CELL: FreezeAndCell = FreezeAndCell {
+    frozen: 3u32,
+    cell: unsafe { transmute::<u32, UnsafeCell<u32>>(12u32) },
+};
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_pass_copy_nonoverlapping_same_tag_disjoint_array_halves: &str =
+    \"pass_copy_nonoverlapping_same_tag_disjoint_array_halves\";
+#[inline(never)]
+pub fn pass_copy_nonoverlapping_same_tag_disjoint_array_halves() -> u32 {
+    let mut arr: [u32; 4] = [10u32, 20u32, 30u32, 40u32];
+    let p: *mut u32 = &raw mut arr[0];
+    unsafe {
+        let dst: *mut u32 = offset(p, 2isize);
+        copy_nonoverlapping(p as *const u32, dst, 2usize);
+    }
+    arr[2] ^ arr[3]
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_pass_copy_nonoverlapping_same_tag_disjoint_struct_fields: &str =
+    \"pass_copy_nonoverlapping_same_tag_disjoint_struct_fields\";
+#[inline(never)]
+pub fn pass_copy_nonoverlapping_same_tag_disjoint_struct_fields() -> u32 {
+    let mut pair: PairU32 = PairU32 { a: 44u32, b: 33u32 };
+    let p: *mut u32 = &raw mut pair.a;
+    unsafe {
+        let dst: *mut u32 = offset(p, 1isize);
+        copy_nonoverlapping(p as *const u32, dst, 1usize);
+    }
+    pair.b
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_pass_static_const_raw_ptr_read_and_freeze_retag: &str =
+    \"pass_static_const_raw_ptr_read_and_freeze_retag\";
+#[inline(never)]
+pub fn pass_static_const_raw_ptr_read_and_freeze_retag() -> u32 {
+    let raw: *const u32 = &raw const STATIC_FROZEN_PAIR.b;
+    let shared: &PairU32 = &STATIC_FROZEN_PAIR;
+    let first: u32 = unsafe { *raw };
+    let again: u32 = unsafe { *raw };
+    first ^ shared.a ^ (again << 8u32)
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_ub_static_unsafe_cell_raw_const_cast_mut_write: &str =
+    \"ub_static_unsafe_cell_raw_const_cast_mut_write\";
+#[inline(never)]
+pub fn ub_static_unsafe_cell_raw_const_cast_mut_write() -> u32 {
+    let cell: *mut u32 = (&raw const STATIC_FREEZE_AND_CELL.cell) as *const u32 as *mut u32;
+    unsafe {
+        *cell = 21u32;
+    }
+    let frozen: *mut u32 = (&raw const STATIC_FREEZE_AND_CELL.frozen) as *mut u32;
+    unsafe {
+        *frozen = *cell;
+        *frozen
+    }
+}
 ";
 
 /// A single closed, zero-argument seed function extracted from
@@ -322,9 +395,9 @@ impl DetRng {
     }
 }
 
-/// Extract the 110 closed zero-argument test functions from
+/// Extract the 112 closed zero-argument test functions from
 /// `tests/miri-diff/corpus/src/lib.rs` (excluding `helper_add_ten` and model
-/// helpers).
+/// items, including the model-marked Category 11 probes).
 pub fn load_miri_diff_corpus_seeds() -> Vec<MiriCorpusSeed> {
     extract_closed_corpus_seeds(RAW_MIRI_DIFF_CORPUS_RS)
 }
@@ -4923,12 +4996,12 @@ mod tests {
     }
 
     #[test]
-    fn corpus_seeds_load_all_110_zero_arg_functions_and_do_not_blocklist_known_bugs() {
+    fn corpus_seeds_load_all_112_zero_arg_functions_and_do_not_blocklist_known_bugs() {
         let seeds = load_miri_diff_corpus_seeds();
         assert_eq!(
             seeds.len(),
-            110,
-            "expected 110 zero-arg functions from tests/miri-diff/corpus/src/lib.rs"
+            112,
+            "expected 112 zero-arg functions from tests/miri-diff/corpus/src/lib.rs"
         );
         assert!(seeds.iter().any(|s| s.name == "pass_integer_arith_basic"));
         assert!(
@@ -4972,8 +5045,24 @@ mod tests {
             "ub_frozen_reborrow_write_in_callee_frame",
             "pass_copy_nonoverlapping_multi_elem_array_pair",
             "ub_raw_ptr_read_uninit_struct_padding_kani5183",
+            "pass_shared_temp_const_raw_ptr_read_and_freeze_retag",
+            "ub_shared_temp_unsafe_cell_raw_const_cast_mut_write",
         ] {
             assert!(seeds.iter().any(|s| s.name == name), "missing seed {name}");
+        }
+        // The Category 11 probes and statics are model items, never seeds.
+        for model in [
+            "pass_copy_nonoverlapping_same_tag_disjoint_array_halves",
+            "pass_copy_nonoverlapping_same_tag_disjoint_struct_fields",
+            "pass_static_const_raw_ptr_read_and_freeze_retag",
+            "ub_static_unsafe_cell_raw_const_cast_mut_write",
+            "STATIC_FROZEN_PAIR",
+            "STATIC_FREEZE_AND_CELL",
+        ] {
+            assert!(
+                corpus_model_helper_names().contains(model),
+                "{model} must be model-marked"
+            );
         }
         // Every model-marked call-chain helper is excluded from the seeds.
         for helper in corpus_model_helper_names() {
