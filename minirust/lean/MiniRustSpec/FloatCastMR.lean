@@ -4296,6 +4296,91 @@ theorem fc_sym_e2e_from_bits_as_u8 :
   exact ⟨⟨mem, runA_sound _ _ _ _ _ hrun⟩, runA_noUB _ _ _ _ _ hrun, hdec,
     hbm1.trans hbm2.symm, htb1.trans htb2.symm⟩
 
+/-! ## 18. The intrinsic-aware fragment predicates (`[adv shard-b A3]`)
+
+`Translate.lean` has four fragment predicates: `inFragment`, `progInFragment` (§1, §11),
+`inFragmentWithIntrinsics`, and `progInFragmentWithIntrinsics`. The last two (which admit
+`Assume`, `PointerExposeProvenance`, and `PointerWithExposedProvenance`) reject float locals and
+float-cast statements as well, so no fragment predicate admits a float. -/
+
+/-- A float local fails `localDeclOk` (whatever its mutability, name, and layout index). -/
+theorem fc_localDeclOk_float (layouts : LayoutTable) (d : LocalDecl) (ft : FloatTy) (idx : Nat)
+    (hty : d.ty = ⟨.float ft, idx⟩) : localDeclOk layouts d = false := by
+  obtain ⟨m, ty, dbg⟩ := d
+  simp only at hty
+  subst hty
+  exact (fc_ptr_ref_box_float_boundary layouts .not ft idx m dbg).2.2.2.2.2.2
+
+/-- **`inFragmentWithIntrinsics` rejects float locals and float-cast statements.** -/
+theorem fc_inFragmentWithIntrinsics_float_rejected (body : CapturedMir)
+    (h : (∃ d ∈ body.localDecls, ∃ (ft : FloatTy) (idx : Nat), d.ty = ⟨.float ft, idx⟩) ∨
+      (∃ bb ∈ body.basicBlocks, ∃ s ∈ bb.statements,
+        ∃ (dst : Place) (k : CastKind) (op : Operand) (ty : Ty) (span : String),
+          fcIsFloatCastKind k = true ∧ s = ⟨.assign dst (.cast k op ty), span⟩)) :
+    inFragmentWithIntrinsics body = false := by
+  have hnone : translateFnWithIntrinsics body = none := by
+    rcases h with h | h
+    · exact (fc_translateFnWithIntrinsics_float_rejected body).1 h
+    · exact (fc_translateFnWithIntrinsics_float_rejected body).2 h
+  simp [inFragmentWithIntrinsics, hnone]
+
+/-- **`progInFragmentWithIntrinsics` rejects every program in which *any* function (entry or
+callee) has a float local**: `bodyInProgFragmentWithIntrinsics` requires `localDeclOk` of every
+local. -/
+theorem fc_progInFragmentWithIntrinsics_float_rejected (entry : CapturedMir)
+    (callees : List CapturedMir) (b : CapturedMir) (hb : b ∈ entry :: callees)
+    (h : ∃ d ∈ b.localDecls, ∃ (ft : FloatTy) (idx : Nat), d.ty = ⟨.float ft, idx⟩) :
+    progInFragmentWithIntrinsics entry callees = false := by
+  obtain ⟨d, hd, ft, idx, hty⟩ := h
+  have hloc : b.localDecls.all (localDeclOk b.layouts) = false := by
+    cases hall : b.localDecls.all (localDeclOk b.layouts) with
+    | false => rfl
+    | true =>
+      have := List.all_eq_true.mp hall d hd
+      rw [fc_localDeclOk_float b.layouts d ft idx hty] at this
+      cases this
+  have hbody : bodyInProgFragmentWithIntrinsics (fnNameMap entry callees) callees b = false := by
+    simp [bodyInProgFragmentWithIntrinsics, hloc]
+  have hall : (entry :: callees).all
+      (bodyInProgFragmentWithIntrinsics (fnNameMap entry callees) callees) = false := by
+    cases h' : (entry :: callees).all
+        (bodyInProgFragmentWithIntrinsics (fnNameMap entry callees) callees) with
+    | false => rfl
+    | true =>
+      have := List.all_eq_true.mp h' b hb
+      rw [hbody] at this
+      cases this
+  simp only [progInFragmentWithIntrinsics, hall, Bool.and_false, Bool.false_and]
+
+/-- **No fragment predicate admits a float local** (all four, for every body / program). -/
+theorem fc_no_fragment_admits_float_local (body : CapturedMir) (callees : List CapturedMir)
+    (h : ∃ d ∈ body.localDecls, ∃ (ft : FloatTy) (idx : Nat), d.ty = ⟨.float ft, idx⟩) :
+    translateFn body = none ∧ translateFnWithIntrinsics body = none ∧
+    inFragment body = false ∧ inFragmentWithIntrinsics body = false ∧
+    progInFragment body callees = false ∧ progInFragmentWithIntrinsics body callees = false :=
+  ⟨fc_translateFn_eq_none_of_float body h, (fc_translateFnWithIntrinsics_float_rejected body).1 h,
+   fc_inFragment_eq_false_of_float body h,
+   fc_inFragmentWithIntrinsics_float_rejected body (.inl h),
+   fc_progInFragment_eq_false_of_float body callees h,
+   fc_progInFragmentWithIntrinsics_float_rejected body callees body (List.mem_cons_self ..) h⟩
+
+/-- Non-vacuity: the float-cast bodies of §7 are rejected by the intrinsic-aware predicates too,
+while Anneal runs them (`fc_anneal_float_cast_runs`). -/
+theorem fc_float_bodies_rejected_with_intrinsics :
+    inFragmentWithIntrinsics fcF2iBody = false ∧ inFragmentWithIntrinsics fcI2fBody = false ∧
+    inFragmentWithIntrinsics fcF2fBody = false ∧
+    progInFragmentWithIntrinsics fcFromBitsAsI32Body [] = false ∧
+    progInFragmentWithIntrinsics fcCarrierCastBody [fcF2iBody] = false :=
+  ⟨fc_inFragmentWithIntrinsics_float_rejected _
+      (.inl ⟨_, List.mem_cons_of_mem _ (List.mem_cons_self ..), _, _, rfl⟩),
+   fc_inFragmentWithIntrinsics_float_rejected _ (.inl ⟨_, List.mem_cons_self .., _, _, rfl⟩),
+   fc_inFragmentWithIntrinsics_float_rejected _ (.inl ⟨_, List.mem_cons_self .., _, _, rfl⟩),
+   fc_progInFragmentWithIntrinsics_float_rejected _ _ _ (List.mem_cons_self ..)
+      ⟨_, List.mem_cons_of_mem _ (List.mem_cons_of_mem _ (List.mem_cons_self ..)), _, _, rfl⟩,
+   fc_progInFragmentWithIntrinsics_float_rejected _ _ fcF2iBody
+      (List.mem_cons_of_mem _ (List.mem_cons_self ..))
+      ⟨_, List.mem_cons_of_mem _ (List.mem_cons_self ..), _, _, rfl⟩⟩
+
 /-! ## Axiom guards
 
 Every public theorem of this module depends at most on `propext`, `Classical.choice`, and
@@ -5745,6 +5830,36 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_from_bits_as_u8' depen
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_sym_e2e_from_bits_as_u8
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_localDeclOk_float' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_localDeclOk_float
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_inFragmentWithIntrinsics_float_rejected' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_inFragmentWithIntrinsics_float_rejected
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_progInFragmentWithIntrinsics_float_rejected' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_progInFragmentWithIntrinsics_float_rejected
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_no_fragment_admits_float_local' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_no_fragment_admits_float_local
+
+/--
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_float_bodies_rejected_with_intrinsics' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_float_bodies_rejected_with_intrinsics
 
 end AxiomGuards
 
