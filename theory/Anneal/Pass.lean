@@ -921,6 +921,31 @@ theorem ContextEquiv.toOutcomeExactPass {Prog₁ : Type u₁} {Prog₂ : Type u�
   down_refines _ q := toOutcomePartial_le (h q)
 
 /--
+Relational query-scoped specification transfer across `outcomeLanguage`:
+supports custom value relations `rVal` (preserving defined panics/aborts via
+`Outcome.Rel rVal`) across distinct program and return types.
+-/
+theorem ContextEquivOn.outcomeTransfer_spec_rel {Prog₁ Prog₂ Query Gap Val₁ Val₂ : Type}
+    {pre : Query → Prop} {rVal : Val₁ → Val₂ → Prop}
+    {sem₁ : Prog₁ → GapSem Query ExecFault Gap Val₁}
+    {sem₂ : Prog₂ → GapSem Query ExecFault Gap Val₂}
+    {p₁ : Prog₁} {p₂ : Prog₂}
+    (h : ContextEquivOn pre rVal (· = ·) (sem₁ p₁) (sem₂ p₂))
+    {spec₁ : (outcomeLanguage sem₁).Behavior} {spec₂ : (outcomeLanguage sem₂).Behavior}
+    (hDef : ∀ q, (spec₂ q).defined → (spec₁ q).defined ∧ pre q)
+    (hRel : ∀ q (hd₁ : (spec₁ q).defined) (hd₂ : (spec₂ q).defined),
+      pre q → BehaviorSet.relImage (Outcome.Rel rVal) ((spec₁ q).val hd₁) ≤ (spec₂ q).val hd₂)
+    (h₁ : (outcomeLanguage sem₁).sem p₁ ≤ spec₁) :
+    (outcomeLanguage sem₂).sem p₂ ≤ spec₂ := by
+  intro q hspec₂
+  obtain ⟨hspec₁, hq⟩ := hDef q hspec₂
+  obtain ⟨hd₁, hle₁⟩ := h₁ q hspec₁
+  obtain ⟨hd₂, hle₂⟩ := toOutcomePartial_le (h q hq) hd₁
+  exact ⟨hd₂, fun out₂ hout₂ =>
+    hRel q hspec₁ hspec₂ hq out₂
+      (BehaviorSet.relImage_monotone (Outcome.Rel rVal) hle₁ out₂ (hle₂ out₂ hout₂))⟩
+
+/--
 Query-scoped specification transfer across `outcomeLanguage`: requires
 `ContextEquivOn pre` only on queries where `spec` is defined.
 -/
@@ -933,13 +958,12 @@ theorem ContextEquivOn.outcomeTransfer_spec {Prog₁ Prog₂ Query Gap Val : Typ
     {spec : (outcomeLanguage sem₁).Behavior}
     (hPre : ∀ q, (spec q).defined → pre q)
     (h₁ : (outcomeLanguage sem₁).sem p₁ ≤ spec) :
-    (outcomeLanguage sem₂).sem p₂ ≤ spec := by
-  intro q hspec
-  obtain ⟨hd₁, hle₁⟩ := h₁ q hspec
-  have hq := hPre q hspec
-  have hd₂ : OutcomeSet.Defined ExecFault.isUB (sem₂ p₂ q) :=
-    ((h q hq).defined_iff (fun _ _ he => he ▸ Iff.rfl)).mp hd₁
-  exact ⟨hd₂, fun out hout => hle₁ out ((h q hq).superset_of_eq (classifyOutcome out) hout)⟩
+    (outcomeLanguage sem₂).sem p₂ ≤ spec :=
+  ContextEquivOn.outcomeTransfer_spec_rel h (fun q hs => ⟨hs, hPre q hs⟩)
+    (fun _ _ _ _ out₂ ⟨out₁, ho₁, hr⟩ => by
+      have heq : out₁ = out₂ := by
+        cases out₁ <;> cases out₂ <;> first | exact congrArg Outcome.normal hr | rfl | cases hr
+      exact heq ▸ ho₁) h₁
 
 /--
 Transfer any Layer 1A specification across `outcomeLanguage` along an exact
@@ -1756,6 +1780,55 @@ theorem stepRequestReachable_of_inv
   exact hReq t i k hIt ht
 
 /--
+Computable fail-closed bounded request checker for any `ITreeF` coalgebra:
+verifies that execution from `s` under `handle` finishes within `fuel` steps
+and every handled request `.vis (.inr i) k` satisfies `pred i = true`.
+-/
+def stepRequestsAll
+    (step : State → ITreeF (SumE (FailE FailureKind) E) (Outcome Val) State)
+    (site : State → Site)
+    (handle : (i : E.I) → OutcomeWithGap ExecFault (GapTag Site) (E.O i))
+    (pred : E.I → Bool) : Nat → State → Bool
+  | 0, _ => false
+  | fuel + 1, s =>
+    let hereOk : Bool :=
+      match step s with
+      | .vis (.inr i) _ => pred i
+      | _ => true
+    hereOk &&
+      match gapStep step site handle s with
+      | .next s' => stepRequestsAll step site handle pred fuel s'
+      | .done _ => true
+
+theorem stepRequestReachable_of_requestsAll
+    {handle : (i : E.I) → OutcomeWithGap ExecFault (GapTag Site) (E.O i)}
+    {pred : E.I → Bool} {fuel : Nat} {s : State}
+    (hCheck : stepRequestsAll step site handle pred fuel s = true)
+    {i : E.I} (hreach : StepRequestReachable step site handle s i) :
+    pred i = true := by
+  obtain ⟨n, t, k, hr, ht⟩ := hreach
+  induction fuel generalizing s n with
+  | zero => cases hCheck
+  | succ fuel ih =>
+    unfold stepRequestsAll at hCheck
+    have hsplit : (match step s with | .vis (.inr j) _ => pred j | _ => true) = true ∧
+        (match gapStep step site handle s with
+          | .next s' => stepRequestsAll step site handle pred fuel s'
+          | .done _ => true) = true := by
+      cases h₁ : (match step s with | .vis (.inr j) _ => pred j | _ => true) with
+      | false => rw [h₁] at hCheck; cases hCheck
+      | true => rw [h₁] at hCheck; exact ⟨rfl, hCheck⟩
+    cases hr with
+    | refl =>
+      have hHere := hsplit.1
+      rw [ht] at hHere
+      exact hHere
+    | @step _ _ s' _ hn hr' =>
+      have hNext := hsplit.2
+      rw [hn] at hNext
+      exact ih (s := s') (n := _) hNext hr'
+
+/--
 Reachable-request bounded handler congruence: `handle₁` and `handle₂` need only
 agree on requests `i` actually reachable from `s` under `handle₁` (enabling
 incremental modular summary linking where `handle₂` adds summaries for unrelated
@@ -2452,43 +2525,222 @@ def MirCallAns.PreservesCallStack (req : MirCallReq) : MirCallAns → Prop
 def MirCallEnv.PreservesCallStack (env : MirCallEnv) : Prop :=
   ∀ req ans, env req = .ok ans → MirCallAns.PreservesCallStack req ans
 
+private theorem lookupFnPtr_lt_nextFnPtrAllocId :
+    ∀ {entries : List FnPtrEntry} {id : AllocId} {e : FnPtrEntry},
+      lookupFnPtr entries id = some e → id < nextFnPtrAllocId entries
+  | [], _, _, h => by cases h
+  | hd :: tl, id, e, h => by
+    dsimp only [lookupFnPtr, nextFnPtrAllocId] at h ⊢
+    have hHd : hd.allocId <
+        (match Nat.ble (nextFnPtrAllocId tl) (Nat.add hd.allocId 1) with
+         | true => Nat.add hd.allocId 1
+         | false => nextFnPtrAllocId tl) := by
+      cases hb : Nat.ble (nextFnPtrAllocId tl) (Nat.add hd.allocId 1) with
+      | true => exact Nat.lt_succ_self hd.allocId
+      | false =>
+        have hlt : Nat.add hd.allocId 1 < nextFnPtrAllocId tl :=
+          Nat.gt_of_not_le (fun hle => by
+            rw [Nat.ble_eq.mpr hle] at hb; cases hb)
+        exact Nat.lt_trans (Nat.lt_succ_self hd.allocId) hlt
+    have hTl : nextFnPtrAllocId tl ≤
+        (match Nat.ble (nextFnPtrAllocId tl) (Nat.add hd.allocId 1) with
+         | true => Nat.add hd.allocId 1
+         | false => nextFnPtrAllocId tl) := by
+      cases hb : Nat.ble (nextFnPtrAllocId tl) (Nat.add hd.allocId 1) with
+      | true => exact Nat.ble_eq.mp hb
+      | false => exact Nat.le_refl _
+    cases heq : Nat.beq hd.allocId id with
+    | true =>
+      rw [← Nat.eq_of_beq_eq_true heq]
+      exact hHd
+    | false =>
+      rw [heq] at h
+      exact Nat.lt_of_lt_of_le (lookupFnPtr_lt_nextFnPtrAllocId h) hTl
+
+private theorem internFnPtr_preserves_lookup {mem : Memory}
+    (defPath : DefPath) (typeArgs : List RigidTy) (fnSig : Option RigidTy)
+    {id : AllocId} {e : FnPtrEntry}
+    (h : lookupFnPtr mem.fnPtrs id = some e) :
+    lookupFnPtr (internFnPtr mem defPath typeArgs fnSig).2.fnPtrs id = some e := by
+  dsimp only [internFnPtr]
+  cases findFnPtrEntry? mem.fnPtrs defPath typeArgs fnSig with
+  | some _ => exact h
+  | none =>
+    dsimp only [lookupFnPtr]
+    have hlt := lookupFnPtr_lt_nextFnPtrAllocId h
+    cases hneq : Nat.beq (nextFnPtrAllocId mem.fnPtrs) id with
+    | false => exact h
+    | true => exact False.elim (Nat.ne_of_gt hlt (Nat.eq_of_beq_eq_true hneq))
+
+private theorem list_append_assoc {α : Type} :
+    ∀ (a b c : List α), List.append a (List.append b c) = List.append (List.append a b) c
+  | [], _, _ => rfl
+  | x :: xs, b, c => congrArg (x :: ·) (list_append_assoc xs b c)
+
+/--
+Re-intern a list of `FnPtrEntry` records sequentially into `mem` via `internFnPtr`,
+recording `(oldAllocId, newAllocId)` pairs while preserving all caller memory fields
+and never shadowing any existing `FnPtrEntry` in `mem.fnPtrs`.
+-/
+def Memory.reinternFnPtrList :
+    Memory → List FnPtrEntry → List (AllocId × AllocId) × Memory
+  | mem, [] => ([], mem)
+  | mem, entry :: rest =>
+    let (newId, mem₁) := internFnPtr mem entry.defPath entry.typeArgs entry.fnSig
+    let (pairs, mem₂) := Memory.reinternFnPtrList mem₁ rest
+    ((entry.allocId, newId) :: pairs, mem₂)
+
+/--
+Re-intern `entries` in oldest-to-newest allocation order (`entries.reverse`) into `mem`.
+-/
+def Memory.reinternFnPtrEntries (mem : Memory) (entries : List FnPtrEntry) :
+    List (AllocId × AllocId) × Memory :=
+  Memory.reinternFnPtrList mem entries.reverse
+
+private theorem reinternFnPtrList_preserves_fields
+    (mem : Memory) (entries : List FnPtrEntry) :
+    let mem' := (Memory.reinternFnPtrList mem entries).2
+    mem'.callees = mem.callees ∧
+      mem'.callStack = mem.callStack ∧
+      mem'.activeCallee = mem.activeCallee ∧
+      mem'.activeProtectors = mem.activeProtectors ∧
+      (∃ fresh, mem'.fnPtrs = List.append fresh mem.fnPtrs) ∧
+      (∀ id e, lookupFnPtr mem.fnPtrs id = some e → lookupFnPtr mem'.fnPtrs id = some e) := by
+  induction entries generalizing mem with
+  | nil => exact ⟨rfl, rfl, rfl, rfl, ⟨[], rfl⟩, fun _ _ h => h⟩
+  | cons entry rest ih =>
+    dsimp only [Memory.reinternFnPtrList]
+    let step1 := internFnPtr mem entry.defPath entry.typeArgs entry.fnSig
+    have h1 : step1.2.callees = mem.callees ∧
+        step1.2.callStack = mem.callStack ∧
+        step1.2.activeCallee = mem.activeCallee ∧
+        step1.2.activeProtectors = mem.activeProtectors ∧
+        (∃ f1, step1.2.fnPtrs = List.append f1 mem.fnPtrs) := by
+      dsimp only [step1, internFnPtr]
+      cases findFnPtrEntry? mem.fnPtrs entry.defPath entry.typeArgs entry.fnSig with
+      | some _ => exact ⟨rfl, rfl, rfl, rfl, ⟨[], rfl⟩⟩
+      | none => exact ⟨rfl, rfl, rfl, rfl, ⟨[_], rfl⟩⟩
+    obtain ⟨hc2, hs2, ha2, hp2, ⟨f2, hf2⟩, hl2⟩ := ih step1.2
+    obtain ⟨hc1, hs1, ha1, hp1, ⟨f1, hf1⟩⟩ := h1
+    refine ⟨hc2.trans hc1, hs2.trans hs1, ha2.trans ha1, hp2.trans hp1,
+      ⟨List.append f2 f1, ?_⟩, fun id e h =>
+        hl2 id e (internFnPtr_preserves_lookup entry.defPath entry.typeArgs entry.fnSig h)⟩
+    rw [hf2, hf1]
+    exact list_append_assoc f2 f1 mem.fnPtrs
+
+theorem Memory.callFramePreserved_reinternFnPtrEntries (mem : Memory) (entries : List FnPtrEntry) :
+    Trusted.VerificationResult.callFramePreserved mem
+      (Memory.reinternFnPtrEntries mem entries).2 := by
+  obtain ⟨hc, hs, ha, hp, hf, _⟩ := reinternFnPtrList_preserves_fields mem entries.reverse
+  exact ⟨hc, hs, ha, hp, hf⟩
+
+theorem Memory.lookupFnPtr_reinternFnPtrEntries_of_some {mem : Memory}
+    (entries : List FnPtrEntry) {id : AllocId} {e : FnPtrEntry}
+    (h : lookupFnPtr mem.fnPtrs id = some e) :
+    lookupFnPtr (Memory.reinternFnPtrEntries mem entries).2.fnPtrs id = some e :=
+  (reinternFnPtrList_preserves_fields mem entries.reverse).2.2.2.2.2 id e h
+
+/-- Look up the remapped `AllocId` for a standalone synthetic function-pointer `AllocId`. -/
+def lookupAllocRemap : List (AllocId × AllocId) → AllocId → AllocId
+  | [], id => id
+  | (src, dst) :: rest, id =>
+    if Nat.beq src id then dst else lookupAllocRemap rest id
+
+/--
+Remap synthetic function-pointer `AllocId`s (`isFnPtrAllocId p.allocId` at `p.offsetBytes == 0`)
+inside a standalone-returned `Value`, leaving scalars, unit, stack borrows, and global
+pointers untouched.
+-/
+def Value.remapFnPtrAllocIds (remap : List (AllocId × AllocId)) : Value → Value
+  | .unit => .unit
+  | .scalar s => .scalar s
+  | .ptr p sz =>
+    if isFnPtrAllocId p.allocId && Nat.beq p.offsetBytes 0 then
+      .ptr { p with allocId := lookupAllocRemap remap p.allocId } sz
+    else
+      .ptr p sz
+  | .aggregate v fs => .aggregate v (remapFnPtrAllocIdsList remap fs)
+where
+  remapFnPtrAllocIdsList (remap : List (AllocId × AllocId)) : List Value → List Value
+    | [] => []
+    | x :: xs => Value.remapFnPtrAllocIds remap x :: remapFnPtrAllocIdsList remap xs
+
 /--
 Restore the caller's suspended frame metadata (`callees`, `traitImpls`,
-`callStack`, `activeCallee`, `activeProtectors`, and existing `fnPtrs`) onto a
-`Memory` returned by a **stateful** callee summary that executed starting from
-`before` (so `after` already carries the caller's `borrows`, `globals`,
-`callerLocals`, and monotonic tag/alloc counters). For a **standalone** summary
-executed from an isolated fresh `initMachineState`, use
-`Memory.preserveCallerMemory` instead so caller borrows and globals are never
-wiped.
+`callStack`, `activeCallee`, `activeProtectors`) and collision-freely re-intern
+any function pointers from `after.fnPtrs` above `before.fnPtrs` (never shadowing
+any existing caller `FnPtrEntry`!).
 -/
 def Memory.restoreCallerFrame (before after : Memory) : Memory :=
-  { after with
-    callees := before.callees
-    traitImpls := before.traitImpls
-    callStack := before.callStack
-    activeCallee := before.activeCallee
-    activeProtectors := before.activeProtectors
-    fnPtrs := List.append after.fnPtrs before.fnPtrs }
+  let base : Memory :=
+    { after with
+      callees := before.callees
+      traitImpls := before.traitImpls
+      callStack := before.callStack
+      activeCallee := before.activeCallee
+      activeProtectors := before.activeProtectors
+      fnPtrs := before.fnPtrs }
+  (Memory.reinternFnPtrEntries base after.fnPtrs).2
 
 theorem Memory.callFramePreserved_restoreCallerFrame (before after : Memory) :
     Trusted.VerificationResult.callFramePreserved before
-      (Memory.restoreCallerFrame before after) :=
-  ⟨rfl, rfl, rfl, rfl, ⟨after.fnPtrs, rfl⟩⟩
+      (Memory.restoreCallerFrame before after) := by
+  have h := Memory.callFramePreserved_reinternFnPtrEntries
+    { after with
+      callees := before.callees
+      traitImpls := before.traitImpls
+      callStack := before.callStack
+      activeCallee := before.activeCallee
+      activeProtectors := before.activeProtectors
+      fnPtrs := before.fnPtrs }
+    after.fnPtrs
+  exact h
+
+theorem Memory.lookupFnPtr_restoreCallerFrame_of_some {before after : Memory}
+    {id : AllocId} {e : FnPtrEntry}
+    (h : lookupFnPtr before.fnPtrs id = some e) :
+    lookupFnPtr (Memory.restoreCallerFrame before after).fnPtrs id = some e :=
+  Memory.lookupFnPtr_reinternFnPtrEntries_of_some after.fnPtrs h
 
 /--
 Preserve the caller's entire `Memory` (`borrows`, `globals`, `callerLocals`,
 `traitImpls`, allocator/tag/protector counters, and call frame) across a
-**standalone** callee run started from an isolated initial state, retaining any
-newly reified `fnPtrs` returned by the callee.
+**standalone** callee run started from an isolated initial state, re-interning
+any newly reified `fnPtrs` via `internFnPtr` so existing caller `fnPtrs` are
+never shadowed!
 -/
 def Memory.preserveCallerMemory (before after : Memory) : Memory :=
-  { before with fnPtrs := List.append after.fnPtrs before.fnPtrs }
+  (Memory.reinternFnPtrEntries before after.fnPtrs).2
 
 theorem Memory.callFramePreserved_preserveCallerMemory (before after : Memory) :
     Trusted.VerificationResult.callFramePreserved before
       (Memory.preserveCallerMemory before after) :=
-  ⟨rfl, rfl, rfl, rfl, ⟨after.fnPtrs, rfl⟩⟩
+  Memory.callFramePreserved_reinternFnPtrEntries before after.fnPtrs
+
+theorem Memory.lookupFnPtr_preserveCallerMemory_of_some {before after : Memory}
+    {id : AllocId} {e : FnPtrEntry}
+    (h : lookupFnPtr before.fnPtrs id = some e) :
+    lookupFnPtr (Memory.preserveCallerMemory before after).fnPtrs id = some e :=
+  Memory.lookupFnPtr_reinternFnPtrEntries_of_some after.fnPtrs h
+
+/--
+Merge a standalone callee return `(retVal, after)` into caller memory `before`:
+re-interns `after.fnPtrs` collision-freely into `before` (never shadowing caller
+`fnPtrs`) and remaps any returned function-pointer `AllocId`s in `retVal`.
+-/
+def Memory.mergeStandaloneReturn (before after : Memory) (retVal : Value) : Value × Memory :=
+  let (remap, mem') := Memory.reinternFnPtrEntries before after.fnPtrs
+  (Value.remapFnPtrAllocIds remap retVal, mem')
+
+theorem Memory.mergeStandaloneReturn_snd (before after : Memory) (retVal : Value) :
+    (Memory.mergeStandaloneReturn before after retVal).2 =
+      Memory.preserveCallerMemory before after := rfl
+
+theorem Memory.callFramePreserved_mergeStandaloneReturn
+    (before after : Memory) (retVal : Value) :
+    Trusted.VerificationResult.callFramePreserved before
+      (Memory.mergeStandaloneReturn before after retVal).2 :=
+  Memory.callFramePreserved_preserveCallerMemory before after
 
 theorem Memory.callFramePreserved_refl (mem : Memory) :
     Trusted.VerificationResult.callFramePreserved mem mem :=
@@ -2604,11 +2856,11 @@ theorem MirCallEnv.ofStatefulOutcome_preservesCallFrame
 /--
 Lift a **standalone** `MirReturn`-producing summary (such as `runMirWithGap` on
 an external `CapturedMir` body, whose fresh `initMachineState` starts with empty
-`borrows`, `callStack = []`, and `activeCallee = none`) into a sealed,
-caller-memory-preserving `MirCallEnv` via `Memory.preserveCallerMemory`. Unlike
-raw `MirCallEnv.ofMirOutcome` or `MirCallEnv.ofStatefulOutcome`, this preserves
-both the caller's call frame AND the caller's live `borrows`, `globals`,
-`callerLocals`, `traitImpls`, and allocator/tag counters.
+`borrows`, `fnPtrs = []`, `callStack = []`, and `activeCallee = none`) into a
+sealed, caller-memory-preserving `MirCallEnv` via `Memory.mergeStandaloneReturn`.
+Preserves caller `borrows`, `globals`, `callerLocals`, `traitImpls`, call frame,
+and existing caller `fnPtrs` (never shadowing caller function pointers!), while
+remapping any returned function-pointer `AllocId`s.
 -/
 def MirCallEnv.ofStandaloneOutcome
     (f : MirCallReq → OutcomeWithGap ExecFault (GapTag DefPath) MirReturn) :
@@ -2616,7 +2868,8 @@ def MirCallEnv.ofStandaloneOutcome
   fun req =>
     match f req with
     | .ok (v, memAfter) =>
-      .ok (.returned v (Memory.preserveCallerMemory req.memory memAfter))
+      let (v', mem') := Memory.mergeStandaloneReturn req.memory memAfter v
+      .ok (.returned v' mem')
     | .fault .panic => .ok (.panicked req.memory)
     | .fault .abort => .ok .aborted
     | .fault .ub => .fault .ub
@@ -3283,47 +3536,63 @@ theorem mirStatefulGapBehaviors_env_congr_on {env₁ env₂ : MirCallEnv}
 
 /--
 Computable fail-closed checker verifying that execution from `st` finishes
-within `fuel` steps and every external call emitted along the path has its
-`defPath` accepted by `pred`. Returns `false` if fuel runs out.
+within `fuel` steps and every external `MirCallReq` emitted along the path
+satisfies `pred req = true` (supporting polymorphic `req.typeArgs` and
+argument-domain `req.args` predicates in addition to `req.defPath`).
 -/
-def mirRequestsAllIn (env : MirCallEnv) (body : CapturedMir)
-    (pred : DefPath → Bool) : Nat → MirSiteState → Bool
-  | 0, _ => false
-  | fuel + 1, st =>
-    let hereOk : Bool :=
-      match stepMirSiteState body st with
-      | .vis (.inr (.inr (.call req))) _ => pred req.defPath
-      | _ => true
-    hereOk &&
-      match mirSiteGapStep env body st with
-      | .next st' => mirRequestsAllIn env body pred fuel st'
-      | .done _ => true
+def mirCallReqsAll (env : MirCallEnv) (body : CapturedMir)
+    (pred : MirCallReq → Bool) : Nat → MirSiteState → Bool :=
+  stepRequestsAll (stepMirSiteState body) (mirSiteOfState body) (mirGapHandle env)
+    (fun i => match i with | .inl _ => true | .inr (.call req) => pred req)
+
+theorem mirCallReachable_of_callReqsAll {env : MirCallEnv} {body : CapturedMir}
+    {pred : MirCallReq → Bool} {fuel : Nat} {st : MirSiteState}
+    (hCheck : mirCallReqsAll env body pred fuel st = true)
+    {req : MirCallReq} (hreach : MirCallReachable env body st req) :
+    pred req = true :=
+  stepRequestReachable_of_requestsAll hCheck hreach
+
+theorem mirGapBehaviors_env_congr_of_callReqsAll {env₁ env₂ : MirCallEnv}
+    {callees : List CapturedMir} {args : List Value}
+    {pred : MirCallReq → Bool} {fuel : Nat}
+    (hCheck : mirCallReqsAll env₁ body pred fuel
+      (mirSiteOfExec body (.running (initMachineStateWithCallees body args callees))) = true)
+    (henv : ∀ req, pred req = true →
+      GapEqErr (· = ·) (· = ·) (env₁.seal req) (env₂.seal req)) :
+    OutcomeSetEquiv (GapEqErr (· = ·) (· = ·))
+      (mirGapBehaviors env₁ callees body args)
+      (mirGapBehaviors env₂ callees body args) :=
+  mirGapBehaviors_env_congr_on (fun req hreach =>
+    henv req (mirCallReachable_of_callReqsAll hCheck hreach))
+
+theorem mirStatefulGapBehaviors_env_congr_of_callReqsAll {env₁ env₂ : MirCallEnv}
+    {callees : List CapturedMir} {q : List Value × Memory}
+    {pred : MirCallReq → Bool} {fuel : Nat}
+    (hCheck : mirCallReqsAll env₁ body pred fuel
+      (mirSiteOfExec body (.running
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          body q.1 q.2 callees))) = true)
+    (henv : ∀ req, pred req = true →
+      GapEqErr (· = ·) (· = ·) (env₁.seal req) (env₂.seal req)) :
+    OutcomeSetEquiv (GapEqErr (· = ·) (· = ·))
+      (mirStatefulGapBehaviors env₁ callees body q)
+      (mirStatefulGapBehaviors env₂ callees body q) :=
+  mirStatefulGapBehaviors_env_congr_on (fun req hreach =>
+    henv req (mirCallReachable_of_callReqsAll hCheck hreach))
 
 /--
-Soundness of `mirRequestsAllIn`: whenever the bounded checker returns `true`,
-every `MirCallReachable` request along the execution satisfies `pred req.defPath = true`.
+`DefPath`-scoped specialization of `mirCallReqsAll`.
 -/
+def mirRequestsAllIn (env : MirCallEnv) (body : CapturedMir)
+    (pred : DefPath → Bool) : Nat → MirSiteState → Bool :=
+  mirCallReqsAll env body (fun req => pred req.defPath)
+
 theorem mirCallReachable_of_requestsAllIn {env : MirCallEnv} {body : CapturedMir}
     {pred : DefPath → Bool} {fuel : Nat} {st : MirSiteState}
     (hCheck : mirRequestsAllIn env body pred fuel st = true)
     {req : MirCallReq} (hreach : MirCallReachable env body st req) :
-    pred req.defPath = true := by
-  obtain ⟨n, t, k, hr, ht⟩ := hreach
-  induction fuel generalizing st n with
-  | zero => cases hCheck
-  | succ fuel ih =>
-    unfold mirRequestsAllIn at hCheck
-    have hsplit := bool_and_split hCheck
-    cases hr with
-    | refl =>
-      have hHere := hsplit.1
-      rw [ht] at hHere
-      exact hHere
-    | @step _ _ s' _ hn hr' =>
-      have hNext := hsplit.2
-      change mirSiteGapStep env body st = .next s' at hn
-      rw [hn] at hNext
-      exact ih (st := s') (n := _) hNext hr'
+    pred req.defPath = true :=
+  mirCallReachable_of_callReqsAll hCheck hreach
 
 /--
 One-step reflective callee-environment congruence: if `mirRequestsAllIn` certifies
@@ -3612,19 +3881,17 @@ theorem gapStep_next_cases {s s' : State}
       ∃ (i : E.I) (k : E.O i → State) (o : E.O i),
         step s = .vis (.inr i) k ∧ handle i = .ok o ∧ s' = k o := by
   cases hs : step s with
-  | ret out => rw [gapStep_of_ret hs] at h; cases h
-  | tau t => rw [gapStep_of_tau hs] at h; cases h; exact Or.inl rfl
+  | ret _ => rw [gapStep_of_ret hs] at h; cases h
+  | tau t => rw [gapStep_of_tau hs] at h; injection h with ht; exact Or.inl (congrArg _ ht)
   | vis i k =>
     cases i with
-    | inl f =>
-      cases f with
-      | fail kind => rw [gapStep_of_fail hs] at h; cases h
+    | inl f => cases f with | fail _ => rw [gapStep_of_fail hs] at h; cases h
     | inr j =>
       rw [gapStep_of_vis hs] at h
       cases ho : handle j with
-      | ok o => rw [ho] at h; cases h; exact Or.inr ⟨j, k, o, rfl, ho, rfl⟩
-      | fault e => rw [ho] at h; cases h
-      | gap g => rw [ho] at h; cases h
+      | ok o => rw [ho] at h; injection h with hk; exact Or.inr ⟨j, k, o, rfl, ho, hk.symm⟩
+      | fault _ => rw [ho] at h; cases h
+      | gap _ => rw [ho] at h; cases h
 
 /--
 A halting step that reports a value is a `.ret (.normal v)` node: neither a
@@ -3637,23 +3904,14 @@ theorem gapStep_done_ok {s : State} {v : Val}
   | ret out =>
     rw [gapStep_of_ret hs] at h
     cases out with
-    | normal w => cases h; rfl
+    | normal w => injection h with ho; injection ho with hw; exact congrArg _ (congrArg _ hw)
     | panic => cases h
     | abort => cases h
-  | tau t => rw [gapStep_of_tau hs] at h; cases h
-  | vis i k =>
+  | tau _ => rw [gapStep_of_tau hs] at h; cases h
+  | vis i _ =>
     cases i with
-    | inl f =>
-      cases f with
-      | fail kind =>
-        rw [gapStep_of_fail hs] at h
-        cases kind <;> cases h
-    | inr j =>
-      rw [gapStep_of_vis hs] at h
-      cases ho : handle j with
-      | ok o => rw [ho] at h; cases h
-      | fault e => rw [ho] at h; cases h
-      | gap g => rw [ho] at h; cases h
+    | inl f => cases f with | fail kind => rw [gapStep_of_fail hs] at h; cases kind <;> cases h
+    | inr j => rw [gapStep_of_vis hs] at h; cases ho : handle j <;> rw [ho] at h <;> cases h
 
 /--
 A halting step that reports a defined outcome (`.ok v`, `.fault .panic`, or
@@ -3667,18 +3925,15 @@ theorem gapStep_done_defined
     (hdef : o.isDefined ExecFault.isUB) :
     ∃ out : Outcome Val, step s = .ret out ∧ o = classifyOutcome out := by
   cases hs : step s with
-  | ret out =>
-    rw [gapStep_of_ret hs] at h
-    cases h
-    exact ⟨out, rfl, rfl⟩
-  | tau t => rw [gapStep_of_tau hs] at h; cases h
-  | vis i k =>
+  | ret out => rw [gapStep_of_ret hs] at h; injection h with ho; exact ⟨out, rfl, ho.symm⟩
+  | tau _ => rw [gapStep_of_tau hs] at h; cases h
+  | vis i _ =>
     cases i with
     | inl f =>
       cases f with
       | fail kind =>
         rw [gapStep_of_fail hs] at h
-        cases h
+        injection h with ho; subst ho
         cases kind with
         | ub => exact False.elim (hdef trivial)
         | unsupported => exact False.elim hdef
@@ -3686,15 +3941,9 @@ theorem gapStep_done_defined
     | inr j =>
       rw [gapStep_of_vis hs] at h
       cases ho : handle j with
-      | ok a => rw [ho] at h; cases h
-      | fault e =>
-        rw [ho] at h
-        cases h
-        exact False.elim (hdef (hNoDefFault j e ho))
-      | gap g =>
-        rw [ho] at h
-        cases h
-        exact False.elim hdef
+      | ok _ => rw [ho] at h; cases h
+      | fault e => rw [ho] at h; injection h with ho'; subst ho'; exact False.elim (hdef (hNoDefFault j e ho))
+      | gap _ => rw [ho] at h; injection h with ho'; subst ho'; exact False.elim hdef
 
 variable [FaultEffect E]
 
@@ -3817,26 +4066,34 @@ private theorem reaches_append_tauStar {F : Effect} [FaultEffect F] {R : Type}
   | tau htau _ ih => exact .tau htau (ih hts)
   | vis hv hnf o _ ih => exact .vis hv hnf o (ih hts)
 
-private theorem reaches_cofix_of_defined
+private theorem gapReach_snoc {State Fault Site Val : Type}
+    {next : State → GapStep State Fault (GapTag Site) Val}
+    {n : Nat} {s t u : State}
+    (hr : GapReach next n s t) (hn : next t = .next u) :
+    GapReach next (n + 1) s u := by
+  induction hr with
+  | refl _ => exact .step hn (.refl u)
+  | step h₀ _ ih => exact .step h₀ (ih hn)
+
+private theorem reaches_cofix_of_noStop
     (hSealed : ∀ i : E.I, handle i ≠ .gap .outOfFuel)
     (hSub : ∀ (i : E.I) (o : E.O i), handle i = .ok o → ∀ o' : E.O i, o' = o)
-    (hNoDefFault : ∀ (i : E.I) (e : ExecFault), handle i = .fault e → e.isUB)
-    {s : State} {tr : List (Event (SumE (FailE FailureKind) E))}
+    {s₀ s : State} {n : Nat}
+    (hgr : GapReach (gapStep step site handle) n s₀ s)
+    (hNoFault : ∀ j e, handle j = .fault e →
+      ¬ gapBehaviors (gapStep step site handle) s₀ (.fault e))
+    (hNoGap : ∀ j g, handle j = .gap g →
+      ¬ gapBehaviors (gapStep step site handle) s₀ (.gap g))
+    {tr : List (Event (SumE (FailE FailureKind) E))}
     {u : ITree (SumE (FailE FailureKind) E) (Outcome Val)}
-    (hreach : Reaches (ITree.cofix step s) tr u)
-    (hDef : OutcomeSet.Defined ExecFault.isUB
-      (gapBehaviors (gapStep step site handle) s)) :
-    ∃ s', u = ITree.cofix step s' ∧
-      OutcomeSet.Defined ExecFault.isUB
-        (gapBehaviors (gapStep step site handle) s') ∧
-      ∀ o, gapBehaviors (gapStep step site handle) s' o →
-        gapBehaviors (gapStep step site handle) s o := by
+    (hreach : Reaches (ITree.cofix step s) tr u) :
+    ∃ m s', GapReach (gapStep step site handle) m s₀ s' ∧ u = ITree.cofix step s' := by
   generalize ht₀ : ITree.cofix step s = t₀ at hreach
-  induction hreach generalizing s with
+  induction hreach generalizing n s with
   | refl =>
     subst ht₀
-    exact ⟨s, rfl, hDef, fun _ ho => ho⟩
-  | @tau x x' _ _ htau _ ih =>
+    exact ⟨n, s, hgr, rfl⟩
+  | @tau _ _ _ _ htau _ ih =>
     subst ht₀
     rw [ITree.observe_cofix] at htau
     cases hs : step s with
@@ -3845,12 +4102,8 @@ private theorem reaches_cofix_of_defined
     | tau s' =>
       rw [hs] at htau
       injection htau with hx'
-      have hback : ∀ o, gapBehaviors (gapStep step site handle) s' o →
-          gapBehaviors (gapStep step site handle) s o :=
-        fun o ho => (gapBehaviors_reach_iff _ (.step (gapStep_of_tau hs) (.refl s')) o).mpr ho
-      obtain ⟨s'', hu, hDef'', hb''⟩ := ih (fun _ ho => hDef (hback _ ho)) hx'
-      exact ⟨s'', hu, hDef'', fun o ho => hback o (hb'' o ho)⟩
-  | @vis x _ idx c _ hv hnf o' _ ih =>
+      exact ih (gapReach_snoc hgr (gapStep_of_tau hs)) hx'
+  | @vis _ _ idx _ _ hv hnf o' _ ih =>
     subst ht₀
     rw [ITree.observe_cofix] at hv
     cases hs : step s with
@@ -3877,17 +4130,13 @@ private theorem reaches_cofix_of_defined
           subst hoo'
           have hstep : gapStep step site handle s = .next (k o') := by
             rw [gapStep_of_vis hs, ho]
-          have hback : ∀ out, gapBehaviors (gapStep step site handle) (k o') out →
-              gapBehaviors (gapStep step site handle) s out :=
-            fun out hm => (gapBehaviors_reach_iff _ (.step hstep (.refl _)) out).mpr hm
-          obtain ⟨s'', hu, hDef'', hb''⟩ := ih (fun _ hm => hDef (hback _ hm)) rfl
-          exact ⟨s'', hu, hDef'', fun out hm => hback out (hb'' out hm)⟩
+          exact ih (gapReach_snoc hgr hstep) rfl
         | fault e =>
           have hstep : gapStep step site handle s = .done (.fault e) := by
             rw [gapStep_of_vis hs, ho]
-          have hmem : gapBehaviors (gapStep step site handle) s (.fault e) :=
+          have hm' : gapBehaviors (gapStep step site handle) s (.fault e) :=
             ⟨(fun h₀ => by cases h₀), 1, runGapSteps_succ_of_done _ hstep 0⟩
-          exact False.elim (hDef hmem (hNoDefFault j e ho))
+          exact False.elim (hNoFault j e ho ((gapBehaviors_reach_iff _ hgr _).mpr hm'))
         | gap g =>
           have hstep : gapStep step site handle s = .done (.gap g) := by
             rw [gapStep_of_vis hs, ho]
@@ -3896,9 +4145,9 @@ private theorem reaches_cofix_of_defined
             intro h₀
             cases OutcomeWithGap.gap.inj h₀
             exact hSealed j ho
-          have hmem : gapBehaviors (gapStep step site handle) s (.gap g) :=
+          have hm' : gapBehaviors (gapStep step site handle) s (.gap g) :=
             ⟨hne, 1, runGapSteps_succ_of_done _ hstep 0⟩
-          exact False.elim (hDef hmem)
+          exact False.elim (hNoGap j g ho ((gapBehaviors_reach_iff _ hgr _).mpr hm'))
 
 /--
 Fuel-free, termination-free `TreeSafe` adequacy: for any sealed,
@@ -3916,8 +4165,11 @@ theorem treeSafe_of_gapBehaviors_defined
       (gapBehaviors (gapStep step site handle) s)) :
     TreeSafe (ITree.cofix step s) := by
   intro tr u hreach ⟨u', idx, c, hts, hvu', hfi⟩
-  obtain ⟨s', rfl, hDef', _⟩ :=
-    reaches_cofix_of_defined hSealed hSub hNoDefFault (reaches_append_tauStar hreach hts) hDef
+  obtain ⟨_, s', hgr, rfl⟩ :=
+    reaches_cofix_of_noStop hSealed hSub (.refl s)
+      (fun j e ho hm => hDef hm (hNoDefFault j e ho))
+      (fun _ _ _ hm => hDef hm)
+      (reaches_append_tauStar hreach hts)
   rw [ITree.observe_cofix] at hvu'
   cases hs : step s' with
   | ret _ => rw [hs] at hvu'; cases hvu'
@@ -3927,10 +4179,10 @@ theorem treeSafe_of_gapBehaviors_defined
     | inl f =>
       cases f with
       | fail kind =>
-        have hmem : gapBehaviors (gapStep step site handle) s'
+        have hm' : gapBehaviors (gapStep step site handle) s'
             (classifyFailure (site s') kind) :=
           ⟨classifyFailure_ne_outOfFuel (site s') kind, 1, runStepsWithGap_of_fail hs 0⟩
-        have hd := hDef' hmem
+        have hd := hDef ((gapBehaviors_reach_iff _ hgr _).mpr hm')
         cases kind with
         | ub => exact hd trivial
         | unsupported => exact hd
@@ -3959,15 +4211,18 @@ theorem reachesRet_iff_gapBehaviors_of_defined
       gapBehaviors (gapStep step site handle) s (classifyOutcome out) := by
   constructor
   · rintro ⟨tr, u, hreach, hu⟩
-    obtain ⟨s', rfl, _, hback⟩ :=
-      reaches_cofix_of_defined hSealed hSub hNoDefFault hreach hDef
+    obtain ⟨_, s', hgr, rfl⟩ :=
+      reaches_cofix_of_noStop hSealed hSub (.refl s)
+        (fun j e ho hm => hDef hm (hNoDefFault j e ho))
+        (fun _ _ _ hm => hDef hm) hreach
     rw [ITree.observe_cofix] at hu
     cases hs : step s' with
     | ret out' =>
       rw [hs] at hu
       injection hu with heq
       subst heq
-      exact hback _ ⟨classifyOutcome_ne_outOfFuel out', 1, runStepsWithGap_of_ret hs 0⟩
+      exact (gapBehaviors_reach_iff _ hgr _).mpr
+        ⟨classifyOutcome_ne_outOfFuel out', 1, runStepsWithGap_of_ret hs 0⟩
     | tau _ => rw [hs] at hu; cases hu
     | vis _ _ => rw [hs] at hu; cases hu
   · rintro ⟨_, fuel, hrun⟩
@@ -4605,6 +4860,31 @@ theorem VerificationResult.of_contextEquiv
       { body := body₂, pre := pre, post := post, callees := callees } :=
   ⟨mirContractHoldsWithSafetyAndCallees_of_contextEquiv hEq hClosed hCert.proof⟩
 
+private theorem mirStatefulGapBehaviors_defined_of_treeSafe
+    {callees : List CapturedMir} {body : CapturedMir} {args : List Value} {mem : Memory}
+    (hs : TreeSafe (Trusted.VerificationResult.mirStatefulTreeWithCallees body args mem callees))
+    (hClosed : ∀ site,
+      ¬ mirStatefulGapBehaviors MirCallEnv.unresolved callees body (args, mem)
+          (.gap (.unresolved site))) :
+    OutcomeSet.Defined ExecFault.isUB
+      (mirStatefulGapBehaviors MirCallEnv.unresolved callees body (args, mem)) := by
+  intro o ⟨hne, fuel, hrun⟩
+  cases o with
+  | ok _ => exact trivial
+  | fault e =>
+    cases e with
+    | ub => exact False.elim (not_mirTree_safe_of_run_undefined hrun (Or.inl rfl) hs)
+    | panic => exact fun h => h
+    | abort => exact fun h => h
+  | gap g =>
+    cases g with
+    | unresolved site => exact False.elim (hClosed site ⟨hne, fuel, hrun⟩)
+    | outOfFuel => exact False.elim (hne rfl)
+    | unsupported site =>
+      exact False.elim (not_mirTree_safe_of_run_undefined hrun (Or.inr (Or.inl ⟨site, rfl⟩)) hs)
+    | budget site =>
+      exact False.elim (not_mirTree_safe_of_run_undefined hrun (Or.inr (Or.inr ⟨site, rfl⟩)) hs)
+
 /--
 Transfer `Trusted.VerificationResult.MirStatefulContractHoldsWithSafetyAndCallees`
 from `body₁` to `body₂` along a relational `ContextEquivOn` on
@@ -4632,27 +4912,8 @@ theorem mirStatefulContractHoldsWithSafetyAndCallees_of_contextEquiv
       body₂ callees safetyPre pre post := by
   intro args mem hsafe
   obtain ⟨hs₁, hval₁⟩ := hBase args mem hsafe
-  let s₁ := Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body₁ args mem callees
   let s₂ := Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body₂ args mem callees
-  have hDef₁ : OutcomeSet.Defined ExecFault.isUB
-      (mirStatefulGapBehaviors MirCallEnv.unresolved callees body₁ (args, mem)) := by
-    intro o ho
-    obtain ⟨hne, fuel, hrun⟩ := ho
-    cases o with
-    | ok _ => exact trivial
-    | fault e =>
-      cases e with
-      | ub => exact False.elim (not_mirTree_safe_of_run_undefined hrun (Or.inl rfl) hs₁)
-      | panic => exact fun h => h
-      | abort => exact fun h => h
-    | gap g =>
-      cases g with
-      | unresolved site => exact False.elim (hClosed args mem hsafe site ⟨hne, fuel, hrun⟩)
-      | outOfFuel => exact False.elim (hne rfl)
-      | unsupported site =>
-        exact False.elim (not_mirTree_safe_of_run_undefined hrun (Or.inr (Or.inl ⟨site, rfl⟩)) hs₁)
-      | budget site =>
-        exact False.elim (not_mirTree_safe_of_run_undefined hrun (Or.inr (Or.inr ⟨site, rfl⟩)) hs₁)
+  have hDef₁ := mirStatefulGapBehaviors_defined_of_treeSafe hs₁ (hClosed args mem hsafe)
   have hDef₂ := ((hEq (args, mem) hsafe).defined_iff ExecFault.eq_preserves_isUB).mp hDef₁
   have hs₂ : TreeSafe (Trusted.VerificationResult.mirStatefulTreeWithCallees
       body₂ args mem callees) := by
@@ -4771,7 +5032,7 @@ private theorem mirExtInterp_step_next {env : MirCallEnv} {body : CapturedMir}
       ITree.fold ((stepMirSiteState body st).map (ITree.cofix (stepMirSiteState body))) := by
     rw [← ITree.fold_observe (ITree.cofix (stepMirSiteState body) st), ITree.observe_cofix]
   cases hs : stepMirSiteState body st with
-  | ret out => rw [gapStep_of_ret hs] at hn; cases hn
+  | ret _ => rw [gapStep_of_ret hs] at hn; cases hn
   | tau s' =>
     rw [gapStep_of_tau hs] at hn
     injection hn with hst'
@@ -4785,13 +5046,9 @@ private theorem mirExtInterp_step_next {env : MirCallEnv} {body : CapturedMir}
     have hB0 : mirExtInterp env body st =
         (Trusted.VerificationResult.handleMirExternalCalls env.toExternalCallHandler idx >>=
           fun o => .tau (mirExtInterp env body (k o))) := by
-      dsimp only [mirExtInterp]
-      rw [hUnf, hs]
-      exact Anneal.ITree.interp_vis _ idx _
+      dsimp only [mirExtInterp]; rw [hUnf, hs]; exact Anneal.ITree.interp_vis _ idx _
     cases idx with
-    | inl f =>
-      cases f with
-      | fail fk => rw [gapStep_of_fail hs] at hn; cases hn
+    | inl f => cases f with | fail _ => rw [gapStep_of_fail hs] at hn; cases hn
     | inr rest =>
       cases rest with
       | inl obsReq =>
@@ -4799,25 +5056,14 @@ private theorem mirExtInterp_step_next {env : MirCallEnv} {body : CapturedMir}
         | emit obs =>
           rw [gapStep_of_vis hs] at hn
           injection hn with hst'
-          right
-          refine ⟨obs, k, hst'.symm, ?_⟩
-          have hB1 : mirExtInterp env body st =
-              (ITree.emit obs >>= fun o => .tau (mirExtInterp env body (k o))) := hB0
-          clear hs hst' hB0
-          rw [hB1]
+          refine Or.inr ⟨obs, k, hst'.symm, ?_⟩
+          rw [show mirExtInterp env body st =
+            (ITree.emit obs >>= fun o => .tau (mirExtInterp env body (k o))) from hB0]
           exact emit_closed_bind_observe obs (fun o => .tau (mirExtInterp env body (k o)))
       | inr callReq =>
         cases callReq with
         | call req =>
-          rw [gapStep_of_vis hs] at hn
-          have hEqH : mirGapHandle env (.inr (.call req)) =
-              (env.seal req).mapFault (fun _ => .ub) := by
-            dsimp only [mirGapHandle, MirCallEnv.seal]
-            cases env req <;> rfl
-          rw [hEqH] at hn
-          have hB1 : mirExtInterp env body st =
-              (env.toExternalCallHandler req >>=
-                fun o => .tau (mirExtInterp env body (k o))) := hB0
+          rw [gapStep_of_vis hs, mirGapHandle_call_eq_seal] at hn
           cases hseal : env.seal req with
           | ok ans =>
             rw [hseal] at hn
@@ -4826,7 +5072,9 @@ private theorem mirExtInterp_step_next {env : MirCallEnv} {body : CapturedMir}
             left
             have hH : env.toExternalCallHandler req = ITree.ret ans := by
               unfold MirCallEnv.toExternalCallHandler; rw [hseal]
-            rw [hB1, hH, Anneal.ITree.ret_bind, ITree.observe_tau]
+            rw [show mirExtInterp env body st =
+              (env.toExternalCallHandler req >>= fun o => .tau (mirExtInterp env body (k o))) from hB0,
+              hH, Anneal.ITree.ret_bind, ITree.observe_tau]
           | fault _ => rw [hseal] at hn; cases hn
           | gap _ => rw [hseal] at hn; cases hn
 
@@ -4847,10 +5095,8 @@ private theorem mirExtInterp_step_done {env : MirCallEnv} {body : CapturedMir}
   | ret out =>
     rw [gapStep_of_ret hs] at hd
     injection hd with ho
-    left
-    refine ⟨out, ho.symm, ?_⟩
-    dsimp only [mirExtInterp]
-    rw [hUnf, hs]
+    refine Or.inl ⟨out, ho.symm, ?_⟩
+    dsimp only [mirExtInterp]; rw [hUnf, hs]
     change (ITree.interp _ (.ret out)).observe = _
     rw [Anneal.ITree.interp_ret, ITree.observe_ret]
   | tau _ => rw [gapStep_of_tau hs] at hd; cases hd
@@ -4858,42 +5104,24 @@ private theorem mirExtInterp_step_done {env : MirCallEnv} {body : CapturedMir}
     have hB0 : mirExtInterp env body st =
         (Trusted.VerificationResult.handleMirExternalCalls env.toExternalCallHandler idx >>=
           fun x => .tau (mirExtInterp env body (k x))) := by
-      dsimp only [mirExtInterp]
-      rw [hUnf, hs]
-      exact Anneal.ITree.interp_vis _ idx _
+      dsimp only [mirExtInterp]; rw [hUnf, hs]; exact Anneal.ITree.interp_vis _ idx _
     cases idx with
     | inl f =>
       cases f with
       | fail fk =>
         rw [gapStep_of_fail hs] at hd
-        injection hd with ho
-        subst ho
-        right
-        refine ⟨?_, classifyFailure_ne_outOfFuel _ fk, fk, ?_⟩
-        · cases fk with
-          | ub => exact fun h => h trivial
-          | unsupported => exact fun h => h
-          | outOfFuel => exact fun h => h
-        · have hB1 : mirExtInterp env body st =
-              (ITree.fail fk >>= fun x => .tau (mirExtInterp env body (k x))) := hB0
-          rw [hB1, fail_bind_observe]; rfl
+        injection hd with ho; subst ho
+        refine Or.inr ⟨by cases fk with | ub => exact fun h => h trivial | _ => exact fun h => h,
+          classifyFailure_ne_outOfFuel _ fk, fk, ?_⟩
+        rw [show mirExtInterp env body st =
+          (ITree.fail fk >>= fun x => .tau (mirExtInterp env body (k x))) from hB0, fail_bind_observe]; rfl
     | inr rest =>
       cases rest with
-      | inl obsReq =>
-        cases obsReq with
-        | emit _ => rw [gapStep_of_vis hs] at hd; cases hd
+      | inl obsReq => cases obsReq with | emit _ => rw [gapStep_of_vis hs] at hd; cases hd
       | inr callReq =>
         cases callReq with
         | call req =>
-          rw [gapStep_of_vis hs] at hd
-          have hEqH : mirGapHandle env (.inr (.call req)) =
-              (env.seal req).mapFault (fun _ => .ub) := by
-            dsimp only [mirGapHandle, MirCallEnv.seal]
-            cases env req <;> rfl
-          rw [hEqH] at hd
-          have hB1 : mirExtInterp env body st =
-              (env.toExternalCallHandler req >>=
-                fun x => .tau (mirExtInterp env body (k x))) := hB0
+          rw [gapStep_of_vis hs, mirGapHandle_call_eq_seal] at hd
           have hCallFail : ∀ fk : FailureKind,
               env.toExternalCallHandler req = ITree.fail fk →
               (mirExtInterp env body st).observe =
@@ -4901,103 +5129,270 @@ private theorem mirExtInterp_step_done {env : MirCallEnv} {body : CapturedMir}
                   (Sup := Trusted.VerificationResult.MirClosedEffect) (FailReq.fail fk))
                   PEmpty.elim := by
             intro fk hH
-            rw [hB1, hH, fail_bind_observe]; rfl
+            rw [show mirExtInterp env body st =
+              (env.toExternalCallHandler req >>= fun x => .tau (mirExtInterp env body (k x))) from hB0,
+              hH, fail_bind_observe]; rfl
           cases hseal : env.seal req with
           | ok _ => rw [hseal] at hd; cases hd
           | fault f =>
-            cases f with
-            | ub =>
-              rw [hseal] at hd
-              injection hd with ho
-              subst ho
-              right
-              exact ⟨fun h => h trivial, (fun h => by cases h), .ub,
-                hCallFail .ub (by unfold MirCallEnv.toExternalCallHandler; rw [hseal])⟩
+            cases f
+            rw [hseal] at hd; injection hd with ho; subst ho
+            exact Or.inr ⟨fun h => h trivial, (fun h => by cases h), .ub,
+              hCallFail .ub (by unfold MirCallEnv.toExternalCallHandler; rw [hseal])⟩
           | gap g =>
+            have hne : g ≠ .outOfFuel := fun hg => MirCallEnv.isSealed_seal env req (hg ▸ hseal)
+            rw [hseal] at hd; injection hd with ho; subst ho
+            refine Or.inr ⟨fun h => h, fun h => hne (OutcomeWithGap.gap.inj h), ?_⟩
             cases g with
+            | outOfFuel => exact False.elim (hne rfl)
             | budget _ =>
-              rw [hseal] at hd
-              injection hd with ho
-              subst ho
-              right
-              exact ⟨fun h => h, (fun h => by cases h), .outOfFuel,
-                hCallFail .outOfFuel (by unfold MirCallEnv.toExternalCallHandler; rw [hseal])⟩
+              exact ⟨.outOfFuel, hCallFail .outOfFuel (by unfold MirCallEnv.toExternalCallHandler; rw [hseal])⟩
             | unsupported _ =>
-              rw [hseal] at hd
-              injection hd with ho
-              subst ho
-              right
-              exact ⟨fun h => h, (fun h => by cases h), .unsupported,
-                hCallFail .unsupported (by unfold MirCallEnv.toExternalCallHandler; rw [hseal])⟩
+              exact ⟨.unsupported, hCallFail .unsupported (by unfold MirCallEnv.toExternalCallHandler; rw [hseal])⟩
             | unresolved _ =>
-              rw [hseal] at hd
-              injection hd with ho
-              subst ho
-              right
-              exact ⟨fun h => h, (fun h => by cases h), .unsupported,
-                hCallFail .unsupported (by unfold MirCallEnv.toExternalCallHandler; rw [hseal])⟩
-            | outOfFuel =>
-              exact False.elim (MirCallEnv.isSealed_seal env req hseal)
+              exact ⟨.unsupported, hCallFail .unsupported (by unfold MirCallEnv.toExternalCallHandler; rw [hseal])⟩
 
-private theorem reaches_mirExtInterp_of_defined {env : MirCallEnv} {body : CapturedMir}
-    {t₀ u : ITree Trusted.VerificationResult.MirClosedEffect MirOutcome}
+private def mirHandlerInterp (h : Trusted.VerificationResult.ExternalCallHandler)
+    (body : CapturedMir) (st : MirSiteState) :
+    ITree Trusted.VerificationResult.MirClosedEffect MirOutcome :=
+  ITree.interp
+    (Trusted.VerificationResult.handleMirExternalCalls h)
+    (ITree.cofix (stepMirSiteState body) st)
+
+private def MHRInv (env : MirCallEnv) (h : Trusted.VerificationResult.ExternalCallHandler)
+    (body : CapturedMir) (st₀ : MirSiteState)
+    (w : ITree Trusted.VerificationResult.MirClosedEffect MirOutcome) : Prop :=
+  (∃ n st, GapReach (mirSiteGapStep env body) n st₀ st ∧ w = mirHandlerInterp h body st) ∨
+  (∃ n st, GapReach (mirSiteGapStep env body) n st₀ st ∧ w = .tau (mirHandlerInterp h body st)) ∨
+  (∃ n st req k ans tr_u u,
+    GapReach (mirSiteGapStep env body) n st₀ st ∧
+    stepMirSiteState body st = .vis (.inr (.inr (.call req))) k ∧
+    env.seal req = .ok ans ∧
+    TreeSafe (h req) ∧
+    (∀ tr_h ans', ReachesRet (h req) tr_h ans' → ans' = ans) ∧
+    Reaches (h req) tr_u u ∧
+    w = (u >>= fun o => .tau (mirHandlerInterp h body (k o))))
+
+private theorem obs_tau_props {P R : Prop}
+    {w t : ITree Trusted.VerificationResult.MirClosedEffect MirOutcome}
+    (hwObs : w.observe = .tau t)
+    {Q : ITree Trusted.VerificationResult.MirClosedEffect MirOutcome → Prop}
+    (ht : Q t) :
+    (∀ w', w.observe = .tau w' → Q w') ∧
+    (∀ idx kw, w.observe = .vis idx kw → P) ∧
+    (∀ out : MirOutcome, w.observe = .ret out → R) :=
+  ⟨fun _ hw => (by rw [hwObs] at hw; injection hw with hw'; exact hw' ▸ ht),
+   fun _ _ hw => (by rw [hwObs] at hw; cases hw),
+   fun _ hw => (by rw [hwObs] at hw; cases hw)⟩
+
+private theorem obs_vis_props {R : Prop}
+    {w : ITree Trusted.VerificationResult.MirClosedEffect MirOutcome}
+    {idx : Trusted.VerificationResult.MirClosedEffect.I}
+    {c : Trusted.VerificationResult.MirClosedEffect.O idx →
+      ITree Trusted.VerificationResult.MirClosedEffect MirOutcome}
+    (hwObs : w.observe = .vis idx c) (hnf : ¬ FaultEffect.isFault idx)
+    {Q : ITree Trusted.VerificationResult.MirClosedEffect MirOutcome → Prop}
+    (hc : ∀ o, Q (c o)) :
+    (∀ w', w.observe = .tau w' → Q w') ∧
+    (∀ idx' kw, w.observe = .vis idx' kw →
+      ¬ FaultEffect.isFault idx' ∧ ∀ o, Q (kw o)) ∧
+    (∀ out : MirOutcome, w.observe = .ret out → R) :=
+  ⟨fun _ hw => (by rw [hwObs] at hw; cases hw),
+   fun _ _ hw => (by
+     rw [hwObs] at hw; injection hw with hij hkw; subst hij; cases eq_of_heq hkw
+     exact ⟨hnf, hc⟩),
+   fun _ hw => (by rw [hwObs] at hw; cases hw)⟩
+
+private theorem mhrInv_inCall_props {env : MirCallEnv}
+    {h : Trusted.VerificationResult.ExternalCallHandler}
+    {body : CapturedMir} {st₀ st : MirSiteState} {n : Nat}
+    {req : MirCallReq} {k : MirCallAns → MirSiteState} {ans : MirCallAns}
+    {tr_u : List (Event Trusted.VerificationResult.MirClosedEffect)}
+    {u : ITree Trusted.VerificationResult.MirClosedEffect MirCallAns}
+    (hgr : GapReach (mirSiteGapStep env body) n st₀ st)
+    (hs : stepMirSiteState body st = .vis (.inr (.inr (.call req))) k)
+    (hseal : env.seal req = .ok ans)
+    (hsafe_h : TreeSafe (h req))
+    (hret_h : ∀ tr_h ans', ReachesRet (h req) tr_h ans' → ans' = ans)
+    (hru : Reaches (h req) tr_u u)
+    {R : MirOutcome → Prop} :
+    let w := (u >>= fun o => .tau (mirHandlerInterp h body (k o)))
+    (∀ w', w.observe = .tau w' → MHRInv env h body st₀ w') ∧
+    (∀ idx kw, w.observe = .vis idx kw →
+      ¬ FaultEffect.isFault idx ∧ ∀ o, MHRInv env h body st₀ (kw o)) ∧
+    (∀ out, w.observe = .ret out → R out) := by
+  let g : MirCallAns → ITree Trusted.VerificationResult.MirClosedEffect MirOutcome :=
+    fun o => .tau (mirHandlerInterp h body (k o))
+  cases hu : u.observe with
+  | ret ans' =>
+    have huEq : u = .ret ans' := by rw [← ITree.fold_observe u, hu]; rfl
+    have hans : ans' = ans := hret_h tr_u ans' ⟨u, hru, hu⟩
+    subst hans
+    have hwObs : (u >>= g).observe = .tau (mirHandlerInterp h body (k ans')) := by
+      rw [huEq, Anneal.ITree.ret_bind, ITree.observe_tau]
+    have hn : mirSiteGapStep env body st = .next (k ans') := by
+      dsimp only [mirSiteGapStep]
+      rw [gapStep_of_vis hs, mirGapHandle_call_eq_seal, hseal]; rfl
+    obtain ⟨h1, h2, h3⟩ := obs_tau_props (P := False) (R := False) hwObs
+      (Q := MHRInv env h body st₀) (Or.inl ⟨n + 1, k ans', gapReach_snoc hgr hn, rfl⟩)
+    exact ⟨h1, fun i kw hv => False.elim (h2 i kw hv), fun out hr => False.elim (h3 out hr)⟩
+  | tau u' =>
+    have huEq : u = .tau u' := by rw [← ITree.fold_observe u, hu]; rfl
+    have hwObs : (u >>= g).observe = .tau (u' >>= g) := by
+      rw [huEq, Anneal.ITree.tau_bind, ITree.observe_tau]
+    have hru' : Reaches (h req) (tr_u ++ []) u' :=
+      Anneal.ITree.reaches_trans hru (.tau hu (.refl u'))
+    rw [List.append_nil] at hru'
+    obtain ⟨h1, h2, h3⟩ := obs_tau_props (P := False) (R := False) hwObs
+      (Q := MHRInv env h body st₀)
+      (Or.inr (Or.inr ⟨n, st, req, k, ans, tr_u, u', hgr, hs, hseal, hsafe_h, hret_h, hru', rfl⟩))
+    exact ⟨h1, fun i kw hv => False.elim (h2 i kw hv), fun out hr => False.elim (h3 out hr)⟩
+  | vis idx c =>
+    have huEq : u = .vis idx c := by rw [← ITree.fold_observe u, hu]; rfl
+    have hwObs : (u >>= g).observe = .vis idx (fun o => c o >>= g) := by
+      rw [huEq, Anneal.ITree.vis_bind, ITree.observe_vis]
+    have hnf : ¬ FaultEffect.isFault idx :=
+      fun hf => hsafe_h tr_u u hru ⟨u, idx, c, .refl u, hu, hf⟩
+    obtain ⟨h1, h2, h3⟩ := obs_vis_props (R := False) hwObs hnf (Q := MHRInv env h body st₀)
+      (fun o => Or.inr (Or.inr ⟨n, st, req, k, ans, tr_u ++ [⟨idx, o⟩], c o,
+        hgr, hs, hseal, hsafe_h, hret_h,
+        Anneal.ITree.reaches_trans hru (.vis hu hnf o (.refl _)), rfl⟩))
+    exact ⟨h1, h2, fun out hr => False.elim (h3 out hr)⟩
+
+private theorem mhrInv_step {env : MirCallEnv}
+    {h : Trusted.VerificationResult.ExternalCallHandler}
+    {body : CapturedMir} {st₀ : MirSiteState}
+    (hDef : OutcomeSet.Defined ExecFault.isUB
+      (gapBehaviors (mirSiteGapStep env body) st₀))
+    (hSub : ∀ req, MirCallReachable env body st₀ req → ∀ ans, env.seal req = .ok ans →
+      TreeSafe (h req) ∧ ∀ tr_h ans', ReachesRet (h req) tr_h ans' → ans' = ans)
+    {w : ITree Trusted.VerificationResult.MirClosedEffect MirOutcome}
+    (hinv : MHRInv env h body st₀ w) :
+    (∀ w', w.observe = .tau w' → MHRInv env h body st₀ w') ∧
+    (∀ idx kw, w.observe = .vis idx kw →
+      ¬ FaultEffect.isFault idx ∧ ∀ o, MHRInv env h body st₀ (kw o)) ∧
+    (∀ out, w.observe = .ret out →
+      gapBehaviors (mirSiteGapStep env body) st₀ (classifyOutcome out)) := by
+  rcases hinv with ⟨n, st, hgr, rfl⟩ | ⟨n, st, hgr, rfl⟩ |
+      ⟨n, st, req, k, ans, tr_u, u, hgr, hs, hseal, hsafe_h, hret_h, hru, rfl⟩
+  · have hUnf : ITree.cofix (stepMirSiteState body) st =
+        ITree.fold ((stepMirSiteState body st).map (ITree.cofix (stepMirSiteState body))) := by
+      rw [← ITree.fold_observe (ITree.cofix (stepMirSiteState body) st), ITree.observe_cofix]
+    cases hs : stepMirSiteState body st with
+    | ret out =>
+      have hwObs : (mirHandlerInterp h body st).observe = .ret out := by
+        dsimp only [mirHandlerInterp]; rw [hUnf, hs]
+        change (ITree.interp _ (.ret out)).observe = _
+        rw [Anneal.ITree.interp_ret, ITree.observe_ret]
+      exact ⟨fun _ hw => (by rw [hwObs] at hw; cases hw),
+        fun _ _ hw => (by rw [hwObs] at hw; cases hw),
+        fun out' hw => (by
+          rw [hwObs] at hw; injection hw with heq; subst heq
+          exact (gapBehaviors_reach_iff _ hgr _).mpr
+            ⟨classifyOutcome_ne_outOfFuel out, 1, runStepsWithGap_of_ret hs 0⟩)⟩
+    | tau st' =>
+      have hwObs : (mirHandlerInterp h body st).observe = .tau (mirHandlerInterp h body st') := by
+        dsimp only [mirHandlerInterp]; rw [hUnf, hs]
+        change (ITree.interp _ (.tau (ITree.cofix (stepMirSiteState body) st'))).observe = _
+        rw [Anneal.ITree.interp_tau, ITree.observe_tau]
+      obtain ⟨h1, h2, h3⟩ := obs_tau_props (P := False) (R := False) hwObs
+        (Q := MHRInv env h body st₀)
+        (Or.inl ⟨n + 1, st', gapReach_snoc hgr (gapStep_of_tau hs), rfl⟩)
+      exact ⟨h1, fun i kw hv => False.elim (h2 i kw hv), fun out hr => False.elim (h3 out hr)⟩
+    | vis idx k =>
+      have hB0 : mirHandlerInterp h body st =
+          (Trusted.VerificationResult.handleMirExternalCalls h idx >>=
+            fun o => .tau (mirHandlerInterp h body (k o))) := by
+        dsimp only [mirHandlerInterp]; rw [hUnf, hs]; exact Anneal.ITree.interp_vis _ idx _
+      cases idx with
+      | inl f =>
+        cases f with
+        | fail fk =>
+          have hm' : gapBehaviors (mirSiteGapStep env body) st
+              (classifyFailure (mirSiteOfState body st) fk) :=
+            ⟨classifyFailure_ne_outOfFuel _ fk, 1,
+              runGapSteps_succ_of_done _ (gapStep_of_fail hs) 0⟩
+          have hdef₀ := hDef ((gapBehaviors_reach_iff _ hgr _).mpr hm')
+          cases fk <;> exact False.elim (by first | exact hdef₀ trivial | exact hdef₀)
+      | inr rest =>
+        cases rest with
+        | inl obsReq =>
+          cases obsReq with
+          | emit obs =>
+            have hwObs : (mirHandlerInterp h body st).observe =
+                .vis (Subeffect.injReq (Sub := ObsE MirObs)
+                  (Sup := Trusted.VerificationResult.MirClosedEffect) (ObsReq.emit obs))
+                  (fun u => .tau (mirHandlerInterp h body (k u))) := by
+              rw [show mirHandlerInterp h body st =
+                (ITree.emit obs >>= fun o => .tau (mirHandlerInterp h body (k o))) from hB0]
+              exact emit_closed_bind_observe obs (fun o => .tau (mirHandlerInterp h body (k o)))
+            obtain ⟨h1, h2, h3⟩ := obs_vis_props (R := False) hwObs (fun hf => hf)
+              (Q := MHRInv env h body st₀)
+              (fun o => by cases o; exact Or.inr (Or.inl
+                ⟨n + 1, k PUnit.unit, gapReach_snoc hgr (gapStep_of_vis hs), rfl⟩))
+            exact ⟨h1, h2, fun out hr => False.elim (h3 out hr)⟩
+        | inr callReq =>
+          cases callReq with
+          | call req =>
+            cases hseal : env.seal req with
+            | ok ans =>
+              obtain ⟨hsafe_h, hret_h⟩ := hSub req ⟨n, st, k, hgr, hs⟩ ans hseal
+              rw [show mirHandlerInterp h body st =
+                (h req >>= fun o => .tau (mirHandlerInterp h body (k o))) from hB0]
+              exact mhrInv_inCall_props hgr hs hseal hsafe_h hret_h (.refl (h req))
+            | fault e =>
+              cases e
+              have hd : mirSiteGapStep env body st = .done (.fault .ub) := by
+                dsimp only [mirSiteGapStep]
+                rw [gapStep_of_vis hs, mirGapHandle_call_eq_seal, hseal]; rfl
+              exact False.elim (hDef ((gapBehaviors_reach_iff _ hgr _).mpr
+                ⟨(fun h₀ => by cases h₀), 1, runGapSteps_succ_of_done _ hd 0⟩) trivial)
+            | gap g =>
+              have hne : g ≠ .outOfFuel :=
+                fun hg => MirCallEnv.isSealed_seal env req (hg ▸ hseal)
+              have hd : mirSiteGapStep env body st = .done (.gap g) := by
+                dsimp only [mirSiteGapStep]
+                rw [gapStep_of_vis hs, mirGapHandle_call_eq_seal, hseal]; rfl
+              exact False.elim (hDef ((gapBehaviors_reach_iff _ hgr _).mpr
+                ⟨fun h₀ => hne (OutcomeWithGap.gap.inj h₀), 1, runGapSteps_succ_of_done _ hd 0⟩))
+  · obtain ⟨h1, h2, h3⟩ := obs_tau_props (P := False) (R := False) (ITree.observe_tau _)
+      (Q := MHRInv env h body st₀) (Or.inl ⟨n, st, hgr, rfl⟩)
+    exact ⟨h1, fun i kw hv => False.elim (h2 i kw hv), fun out hr => False.elim (h3 out hr)⟩
+  · exact mhrInv_inCall_props hgr hs hseal hsafe_h hret_h hru
+
+private theorem reaches_mhrInv {env : MirCallEnv}
+    {h : Trusted.VerificationResult.ExternalCallHandler}
+    {body : CapturedMir} {st₀ : MirSiteState}
+    (hDef : OutcomeSet.Defined ExecFault.isUB
+      (gapBehaviors (mirSiteGapStep env body) st₀))
+    (hSub : ∀ req, MirCallReachable env body st₀ req → ∀ ans, env.seal req = .ok ans →
+      TreeSafe (h req) ∧ ∀ tr_h ans', ReachesRet (h req) tr_h ans' → ans' = ans)
+    {t w : ITree Trusted.VerificationResult.MirClosedEffect MirOutcome}
     {tr : List (Event Trusted.VerificationResult.MirClosedEffect)}
-    (hreach : Reaches t₀ tr u)
-    {st : MirSiteState}
-    (ht₀ : t₀ = mirExtInterp env body st ∨ t₀ = .tau (mirExtInterp env body st))
-    (hDef : OutcomeSet.Defined ExecFault.isUB (gapBehaviors (mirSiteGapStep env body) st)) :
-    ∃ st',
-      (u = mirExtInterp env body st' ∨ u = .tau (mirExtInterp env body st')) ∧
-      OutcomeSet.Defined ExecFault.isUB (gapBehaviors (mirSiteGapStep env body) st') ∧
-      ∀ o, gapBehaviors (mirSiteGapStep env body) st' o →
-        gapBehaviors (mirSiteGapStep env body) st o := by
-  induction hreach generalizing st with
-  | refl => exact ⟨st, ht₀, hDef, fun _ ho => ho⟩
-  | @tau x x' _ _ htau _ ih =>
-    rcases ht₀ with rfl | rfl
-    · cases hm : mirSiteGapStep env body st with
-      | done o =>
-        rcases mirExtInterp_step_done hm with ⟨_, _, hret⟩ | ⟨_, _, _, hfail⟩
-        · rw [hret] at htau; cases htau
-        · rw [hfail] at htau; cases htau
-      | next st' =>
-        rcases mirExtInterp_step_next hm with htau' | ⟨_, _, _, hvis⟩
-        · rw [htau'] at htau
-          injection htau with hx'
-          have hback : ∀ o, gapBehaviors (mirSiteGapStep env body) st' o →
-              gapBehaviors (mirSiteGapStep env body) st o :=
-            fun o ho => (gapBehaviors_reach_iff _ (.step hm (.refl st')) o).mpr ho
-          obtain ⟨st'', hu, hDef'', hb''⟩ := ih (Or.inl hx'.symm) (fun _ ho => hDef (hback _ ho))
-          exact ⟨st'', hu, hDef'', fun o ho => hback o (hb'' o ho)⟩
-        · rw [hvis] at htau; cases htau
-    · rw [ITree.observe_tau] at htau
-      injection htau with hx'
-      exact ih (Or.inl hx'.symm) hDef
-  | @vis x _ idx c _ hv hnf o' _ ih =>
-    rcases ht₀ with rfl | rfl
-    · cases hm : mirSiteGapStep env body st with
-      | done o =>
-        rcases mirExtInterp_step_done hm with ⟨_, _, hret⟩ | ⟨_, _, fk, hfail⟩
-        · rw [hret] at hv; cases hv
-        · rw [hfail] at hv
-          injection hv with hij _
-          subst hij
-          exact False.elim (hnf trivial)
-      | next st' =>
-        rcases mirExtInterp_step_next hm with htau' | ⟨obs, k, hst', hvis⟩
-        · rw [htau'] at hv; cases hv
-        · rw [hvis] at hv
-          injection hv with hij hcj
-          subst hij
-          cases eq_of_heq hcj
-          cases (o' : PUnit.{1})
-          subst hst'
-          have hback : ∀ o, gapBehaviors (mirSiteGapStep env body) (k PUnit.unit) o →
-              gapBehaviors (mirSiteGapStep env body) st o :=
-            fun o ho => (gapBehaviors_reach_iff _ (.step hm (.refl _)) o).mpr ho
-          obtain ⟨st'', hu, hDef'', hb''⟩ := ih (Or.inr rfl) (fun _ ho => hDef (hback _ ho))
-          exact ⟨st'', hu, hDef'', fun o ho => hback o (hb'' o ho)⟩
-    · rw [ITree.observe_tau] at hv; cases hv
+    (hr : Reaches t tr w) (hinv : MHRInv env h body st₀ t) :
+    MHRInv env h body st₀ w := by
+  induction hr with
+  | refl => exact hinv
+  | tau htau _ ih => exact ih ((mhrInv_step hDef hSub hinv).1 _ htau)
+  | vis hv _ o _ ih => exact ih (((mhrInv_step hDef hSub hinv).2.1 _ _ hv).2 o)
+
+private theorem toExternalCallHandler_sub (env : MirCallEnv) (req : MirCallReq)
+    (ans : MirCallAns) (hseal : env.seal req = .ok ans) :
+    TreeSafe (env.toExternalCallHandler req) ∧
+      ∀ tr_h ans', ReachesRet (env.toExternalCallHandler req) tr_h ans' → ans' = ans := by
+  have hH : env.toExternalCallHandler req = ITree.ret ans := by
+    unfold MirCallEnv.toExternalCallHandler; rw [hseal]
+  rw [hH]
+  have hRetReach : ∀ {s₀ u : ITree Trusted.VerificationResult.MirClosedEffect MirCallAns}
+      {tr_h}, Reaches s₀ tr_h u → s₀ = ITree.ret ans → u = ITree.ret ans := by
+    intro s₀ u tr_h hr
+    induction hr with
+    | refl => exact fun hs => hs
+    | tau htau _ _ => intro hs; rw [hs, ITree.observe_ret] at htau; cases htau
+    | vis hv _ _ _ _ => intro hs; rw [hs, ITree.observe_ret] at hv; cases hv
+  refine ⟨fun tr_h u hru ⟨u', _, _, hts, hvu', _⟩ => ?_, fun tr_h ans' ⟨u, hru, hur⟩ => ?_⟩
+  · rw [hRetReach (reaches_append_tauStar hru hts) rfl, ITree.observe_ret] at hvu'; cases hvu'
+  · rw [hRetReach hru rfl, ITree.observe_ret] at hur; injection hur with heq; exact heq.symm
 
 private theorem mirExtInterp_of_run {env : MirCallEnv} {body : CapturedMir}
     {fuel : Nat} {st : MirSiteState} {o : OutcomeWithGap ExecFault (GapTag DefPath) MirReturn}
@@ -5066,22 +5461,11 @@ theorem mirHandledTree_safe_iff_defined (env : MirCallEnv)
       | abort => exact fun h => h
     | gap _ => exact False.elim (hImp (fun h => h) hSafe)
   · obtain ⟨u', idx, c, hts, hvu', hfi⟩ := hfn
-    obtain ⟨st', hu', hDef', _⟩ :=
-      reaches_mirExtInterp_of_defined (reaches_append_tauStar hreach hts) (Or.inl rfl) hDef
-    rcases hu' with rfl | rfl
-    · cases hm : mirSiteGapStep env body st' with
-      | done o =>
-        rcases mirExtInterp_step_done hm with ⟨_, _, hret⟩ | ⟨hnd, hne, _, _⟩
-        · rw [hret] at hvu'; cases hvu'
-        · exact hnd (hDef' ⟨hne, 1, runGapSteps_succ_of_done _ hm 0⟩)
-      | next _ =>
-        rcases mirExtInterp_step_next hm with htau | ⟨_, _, _, hvis⟩
-        · rw [htau] at hvu'; cases hvu'
-        · rw [hvis] at hvu'
-          injection hvu' with hij _
-          subst hij
-          exact hfi
-    · rw [ITree.observe_tau] at hvu'; cases hvu'
+    have hSub := fun req (_ : MirCallReachable env body (mirSiteOfExec body (.running s₀)) req) =>
+      toExternalCallHandler_sub env req
+    have hinv' := reaches_mhrInv hDef hSub (reaches_append_tauStar hreach hts)
+      (Or.inl ⟨0, _, .refl _, rfl⟩)
+    exact ((mhrInv_step hDef hSub hinv').2.1 idx c hvu').1 hfi
 
 /--
 Open-world return characterization for **every** `env : MirCallEnv`: under
@@ -5106,22 +5490,10 @@ theorem mirHandledTree_reachesRet_iff_of_defined {env : MirCallEnv}
   rw [hTree]
   refine ⟨fun h => ?_, fun h => ?_⟩
   · obtain ⟨tr, u, hreach, hu⟩ := h
-    obtain ⟨st', hu', hDef', hback⟩ :=
-      reaches_mirExtInterp_of_defined hreach (Or.inl rfl) hDef
-    rcases hu' with rfl | rfl
-    · cases hm : mirSiteGapStep env body st' with
-      | done o =>
-        rcases mirExtInterp_step_done hm with ⟨out', rfl, hret⟩ | ⟨hnd, hne, _, _⟩
-        · rw [hret] at hu
-          injection hu with heq
-          subst heq
-          exact hback _ ⟨classifyOutcome_ne_outOfFuel out', 1, runGapSteps_succ_of_done _ hm 0⟩
-        · exact False.elim (hnd (hDef' ⟨hne, 1, runGapSteps_succ_of_done _ hm 0⟩))
-      | next _ =>
-        rcases mirExtInterp_step_next hm with htau | ⟨_, _, _, hvis⟩
-        · rw [htau] at hu; cases hu
-        · rw [hvis] at hu; cases hu
-    · rw [ITree.observe_tau] at hu; cases hu
+    have hSub := fun req (_ : MirCallReachable env body (mirSiteOfExec body (.running s₀)) req) =>
+      toExternalCallHandler_sub env req
+    have hinv' := reaches_mhrInv hDef hSub hreach (Or.inl ⟨0, _, .refl _, rfl⟩)
+    exact (mhrInv_step hDef hSub hinv').2.2 out hu
   · obtain ⟨hne, fuel, hrun⟩ := h
     exact (mirExtInterp_of_run hrun hne).2 out rfl
 
@@ -5292,6 +5664,805 @@ theorem ModularVerificationResult.of_contextEquiv
     exact mirClosedStatefulContract_of_contextEquiv hEq
       (fun args mem v₁ m₁ v₂ m₂ hp _ => hPost args mem v₁ m₁ v₂ m₂ hp)
       (hCert.proof env.toExternalCallHandler hAss)⟩
+
+private theorem reaches_mirSite_of_closed {body : CapturedMir} {st₀ : MirSiteState}
+    (hClosed : ∀ site,
+      ¬ gapBehaviors (mirSiteGapStep MirCallEnv.unresolved body) st₀ (.gap (.unresolved site)))
+    {tr : List (Event MirEffect)} {u : ITree MirEffect MirOutcome}
+    (hreach : Reaches (ITree.cofix (stepMirSiteState body) st₀) tr u) :
+    ∃ m st', GapReach (mirSiteGapStep MirCallEnv.unresolved body) m st₀ st' ∧
+      u = ITree.cofix (stepMirSiteState body) st' :=
+  reaches_cofix_of_noStop (site := mirSiteOfState body)
+    (mirGapHandle_ne_outOfFuel MirCallEnv.unresolved)
+    mirGapHandle_unresolved_subsingleton (.refl st₀)
+    (fun j _ ho _ => by cases j with | inl obs => cases obs; cases ho | inr c => cases c; cases ho)
+    (fun j _ ho hm => by
+      cases j with
+      | inl obs => cases obs; cases ho
+      | inr c => cases c; cases ho; exact hClosed _ hm)
+    hreach
+
+/--
+Zero-`Defined` closed-world return adequacy: whenever `body` hits no unresolved
+external calls from `(args, mem)` (`hClosed`), `(∃ tr, ReachesRet ... out)` is
+equivalent to `mirStatefulGapBehaviors ... (classifyOutcome out)` **even when
+other execution steps exhibit `.ub` or `.unsupported`**!
+-/
+theorem mirReachesRet_iff_of_closed {callees : List CapturedMir} {body : CapturedMir}
+    {args : List Value} {mem : Memory}
+    (hClosed : ∀ site,
+      ¬ mirStatefulGapBehaviors MirCallEnv.unresolved callees body (args, mem)
+          (.gap (.unresolved site)))
+    (out : MirOutcome) :
+    (∃ tr, ReachesRet (Trusted.VerificationResult.mirStatefulTreeWithCallees body args mem callees)
+        tr out) ↔
+      mirStatefulGapBehaviors MirCallEnv.unresolved callees body (args, mem)
+        (classifyOutcome out) := by
+  let s := Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem callees
+  change (∃ tr, ReachesRet (mirTree body s) tr out) ↔ _
+  rw [← cofix_stepMirSiteState_eq_mirTree body s]
+  constructor
+  · rintro ⟨tr, u, hreach, hu⟩
+    obtain ⟨_, st', hgr, rfl⟩ := reaches_mirSite_of_closed hClosed hreach
+    rw [ITree.observe_cofix] at hu
+    cases hs : stepMirSiteState body st' with
+    | ret out' =>
+      rw [hs] at hu
+      injection hu with heq
+      subst heq
+      exact (gapBehaviors_reach_iff _ hgr _).mpr
+        ⟨classifyOutcome_ne_outOfFuel out', 1, runStepsWithGap_of_ret hs 0⟩
+    | tau _ => rw [hs] at hu; cases hu
+    | vis _ _ => rw [hs] at hu; cases hu
+  · rintro ⟨_, fuel, hrun⟩
+    exact runStepsWithGap_defined_reachesRet (step := stepMirSiteState body)
+      (site := mirSiteOfState body) (handle := mirGapHandle MirCallEnv.unresolved)
+      mirHandled_not_fault (mirGapHandle_noDefFault MirCallEnv.unresolved) hrun
+
+/--
+Transfer a kernel-audited `Trusted.VerificationResult.UbExceptionVerificationResult`
+certificate from `body₁` to `body₂` along relational `ContextEquivOn` on `pre`
+(even when executions outside `strictSafetyPre` exhibit `.ub` or `.unsupported`!).
+-/
+theorem UbExceptionVerificationResult.of_contextEquiv
+    {callees : List CapturedMir} {body₁ body₂ : CapturedMir}
+    {rVal : MirReturn → MirReturn → Prop}
+    {pre strictSafetyPre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    (hEq : ContextEquivOn (fun q => pre q.1 q.2) rVal (· = ·)
+      (mirStatefulGapBehaviors MirCallEnv.unresolved callees body₁)
+      (mirStatefulGapBehaviors MirCallEnv.unresolved callees body₂))
+    (hPost : ∀ args mem v₁ m₁ v₂ m₂,
+      pre args mem → rVal (v₁, m₁) (v₂, m₂) → post args mem v₁ m₁ → post args mem v₂ m₂)
+    (hClosed : ∀ args mem, pre args mem → ∀ site,
+      ¬ mirStatefulGapBehaviors MirCallEnv.unresolved callees body₁ (args, mem)
+          (.gap (.unresolved site)))
+    (hCert : Trusted.VerificationResult.UbExceptionVerificationResult
+      { body := body₁, pre := pre, strictSafetyPre := strictSafetyPre,
+        post := post, callees := callees }) :
+    Trusted.VerificationResult.UbExceptionVerificationResult
+      { body := body₂, pre := pre, strictSafetyPre := strictSafetyPre,
+        post := post, callees := callees } := by
+  refine ⟨⟨?_, ?_⟩⟩
+  · exact mirStatefulContractHoldsWithSafetyAndCallees_of_contextEquiv
+      (fun q hq => hEq q hq.1)
+      (fun args mem v₁ m₁ v₂ m₂ _ hp hr hv => hPost args mem v₁ m₁ v₂ m₂ hp hr hv)
+      (fun args mem hq => hClosed args mem hq.1)
+      hCert.proof.1
+  · intro args mem hp tr₂ retVal₂ mem₂' hrr₂
+    have hClosed₂ : ∀ site,
+        ¬ mirStatefulGapBehaviors MirCallEnv.unresolved callees body₂ (args, mem)
+            (.gap (.unresolved site)) := by
+      intro site hm₂
+      obtain ⟨o₁, hm₁, hr⟩ := (hEq (args, mem) hp).backward hm₂
+      rw [GapEqErr.gap_iff_right.mp hr] at hm₁
+      exact hClosed args mem hp site hm₁
+    have hm₂ := (mirReachesRet_iff_of_closed hClosed₂ (.normal (retVal₂, mem₂'))).mp ⟨tr₂, hrr₂⟩
+    obtain ⟨o₁, hm₁, hr⟩ := (hEq (args, mem) hp).backward hm₂
+    obtain ⟨⟨retVal₁, mem₁'⟩, rfl, hrv⟩ := GapEqErr.ok_iff_right.mp hr
+    obtain ⟨tr₁, hrr₁⟩ := (mirReachesRet_iff_of_closed (hClosed args mem hp)
+      (.normal (retVal₁, mem₁'))).mpr hm₁
+    exact hPost args mem retVal₁ mem₁' retVal₂ mem₂' hp hrv
+      (hCert.proof.2 args mem hp tr₁ retVal₁ mem₁' hrr₁)
+
+private theorem tauStar_nonTau_of_ne_outOfFuel {body : CapturedMir}
+    {fuel : Nat} {st : MirSiteState}
+    (hne : runGapSteps (mirSiteGapStep MirCallEnv.unresolved body) fuel st ≠ .gap .outOfFuel) :
+    ∃ u', TauStar (ITree.cofix (stepMirSiteState body) st) u' ∧
+      ∀ w, u'.observe ≠ .tau w := by
+  induction fuel generalizing st with
+  | zero => exact False.elim (hne rfl)
+  | succ fuel ih =>
+    cases hs : stepMirSiteState body st with
+    | ret _ =>
+      exact ⟨_, .refl _, fun w hw => by rw [ITree.observe_cofix, hs] at hw; cases hw⟩
+    | vis _ _ =>
+      exact ⟨_, .refl _, fun w hw => by rw [ITree.observe_cofix, hs] at hw; cases hw⟩
+    | tau st' =>
+      have hn : mirSiteGapStep MirCallEnv.unresolved body st = .next st' :=
+        gapStep_of_tau hs
+      rw [runGapSteps_succ_of_next _ hn] at hne
+      obtain ⟨u', hts, hnt⟩ := ih hne
+      have hobs : (ITree.cofix (stepMirSiteState body) st).observe =
+          .tau (ITree.cofix (stepMirSiteState body) st') := by
+        rw [ITree.observe_cofix, hs]; rfl
+      exact ⟨u', .step hobs hts, hnt⟩
+
+/--
+Constructive `Productive` adequacy (`0` `Classical.choice`): any closed-world
+`(body, args, mem)` whose `mirStatefulGapBehaviors` terminates (`OutcomeSet.Terminates`)
+produces a `Productive` `mirStatefulTreeWithCallees`.
+-/
+theorem mirTree_productive_of_terminates_closed {callees : List CapturedMir}
+    {body : CapturedMir} {args : List Value} {mem : Memory}
+    (hClosed : ∀ site,
+      ¬ mirStatefulGapBehaviors MirCallEnv.unresolved callees body (args, mem)
+          (.gap (.unresolved site)))
+    (hTerm : OutcomeSet.Terminates
+      (mirStatefulGapBehaviors MirCallEnv.unresolved callees body (args, mem))) :
+    Productive (Trusted.VerificationResult.mirStatefulTreeWithCallees body args mem callees) := by
+  let s := Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem callees
+  intro tr u hreach
+  change Reaches (mirTree body s) tr u at hreach
+  rw [← cofix_stepMirSiteState_eq_mirTree body s] at hreach
+  obtain ⟨_, st', hgr, rfl⟩ := reaches_mirSite_of_closed hClosed hreach
+  obtain ⟨o, ho⟩ := hTerm
+  obtain ⟨hne, fuel, hrun⟩ := (gapBehaviors_reach_iff _ hgr o).mp ho
+  exact tauStar_nonTau_of_ne_outOfFuel (hrun.symm ▸ hne)
+
+/--
+Constructive total-correctness contract on `mirStatefulTreeWithCallees` (`0` `Classical.choice`):
+`TreeSafe`, `Productive`, existence of a return, panic/abort-freedom, and `post` on all returns.
+-/
+def MirConstructiveTotalHolds (callees : List CapturedMir) (body : CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop) : Prop :=
+  ∀ args mem, pre args mem →
+    let t := Trusted.VerificationResult.mirStatefulTreeWithCallees body args mem callees
+    TreeSafe t ∧ Productive t ∧ (∃ tr out, ReachesRet t tr out) ∧
+      ∀ tr out, ReachesRet t tr out →
+        ∃ retVal mem', out = .normal (retVal, mem') ∧ post args mem retVal mem'
+
+/--
+Transfer constructive total correctness (`MirConstructiveTotalHolds`) from `body₁`
+to `body₂` along relational `ContextEquivOn` (`0` `Classical.choice`).
+-/
+theorem mirConstructiveTotalHolds_of_contextEquiv
+    {callees : List CapturedMir} {body₁ body₂ : CapturedMir}
+    {rVal : MirReturn → MirReturn → Prop}
+    {pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    (hEq : ContextEquivOn (fun q => pre q.1 q.2) rVal (· = ·)
+      (mirStatefulGapBehaviors MirCallEnv.unresolved callees body₁)
+      (mirStatefulGapBehaviors MirCallEnv.unresolved callees body₂))
+    (hPost : ∀ args mem v₁ m₁ v₂ m₂,
+      pre args mem → rVal (v₁, m₁) (v₂, m₂) → post args mem v₁ m₁ → post args mem v₂ m₂)
+    (hClosed : ∀ args mem, pre args mem → ∀ site,
+      ¬ mirStatefulGapBehaviors MirCallEnv.unresolved callees body₁ (args, mem)
+          (.gap (.unresolved site)))
+    (hBase : MirConstructiveTotalHolds callees body₁ pre post) :
+    MirConstructiveTotalHolds callees body₂ pre post := by
+  intro args mem hp
+  obtain ⟨hs₁, _, ⟨tr₀, out₀, hrr₀⟩, hret₁⟩ := hBase args mem hp
+  obtain ⟨rv₀, mm₀, rfl, hpost₀⟩ := hret₁ tr₀ out₀ hrr₀
+  have hm₀ := (mirReachesRet_iff_of_closed (hClosed args mem hp) (.normal (rv₀, mm₀))).mp ⟨tr₀, hrr₀⟩
+  obtain ⟨o₂, hm₀₂, hr₀⟩ := (hEq (args, mem) hp).forward hm₀
+  obtain ⟨⟨rv₂₀, mm₂₀⟩, rfl, _⟩ := GapEqErr.ok_iff.mp hr₀
+  have hDef₁ := mirStatefulGapBehaviors_defined_of_treeSafe hs₁ (hClosed args mem hp)
+  have hDef₂ := ((hEq (args, mem) hp).defined_iff ExecFault.eq_preserves_isUB).mp hDef₁
+  have hClosed₂ : ∀ site,
+      ¬ mirStatefulGapBehaviors MirCallEnv.unresolved callees body₂ (args, mem)
+          (.gap (.unresolved site)) :=
+    fun _ hm₂ => hDef₂ hm₂
+  let s₂ := Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body₂ args mem callees
+  have hs₂ : TreeSafe (Trusted.VerificationResult.mirStatefulTreeWithCallees
+      body₂ args mem callees) := by
+    change TreeSafe (mirTree body₂ s₂)
+    rw [← cofix_stepMirSiteState_eq_mirTree body₂ s₂]
+    exact treeSafe_of_gapBehaviors_defined mirHandled_not_fault
+      (mirGapHandle_ne_outOfFuel MirCallEnv.unresolved)
+      mirGapHandle_unresolved_subsingleton
+      (mirGapHandle_noDefFault MirCallEnv.unresolved) hDef₂
+  have hProd₂ := mirTree_productive_of_terminates_closed hClosed₂ ⟨_, hm₀₂⟩
+  have hex₂ := (mirReachesRet_iff_of_closed hClosed₂ (.normal (rv₂₀, mm₂₀))).mpr hm₀₂
+  obtain ⟨tr₂₀, hrr₂₀⟩ := hex₂
+  refine ⟨hs₂, hProd₂, ⟨tr₂₀, _, hrr₂₀⟩, fun tr₂ out₂ hrr₂ => ?_⟩
+  have hm₂ := (mirReachesRet_iff_of_closed hClosed₂ out₂).mp ⟨tr₂, hrr₂⟩
+  obtain ⟨o₁, hm₁, hr⟩ := (hEq (args, mem) hp).backward hm₂
+  cases out₂ with
+  | normal rm₂ =>
+    rcases rm₂ with ⟨retVal₂, mem₂'⟩
+    obtain ⟨⟨retVal₁, mem₁'⟩, rfl, hrv⟩ := GapEqErr.ok_iff_right.mp hr
+    obtain ⟨tr₁, hrr₁⟩ :=
+      (mirReachesRet_iff_of_closed (hClosed args mem hp) (.normal (retVal₁, mem₁'))).mpr hm₁
+    obtain ⟨rv₁, mm₁, heq₁, hpost₁⟩ := hret₁ tr₁ (.normal (retVal₁, mem₁')) hrr₁
+    injection heq₁ with hp₁
+    injection hp₁ with hrv₁ hmm₁
+    subst hrv₁; subst hmm₁
+    exact ⟨retVal₂, mem₂', rfl, hPost args mem retVal₁ mem₁' retVal₂ mem₂' hp hrv hpost₁⟩
+  | panic =>
+    obtain ⟨e, ho₁, he⟩ := GapEqErr.fault_iff_right.mp hr
+    subst he; subst ho₁
+    obtain ⟨tr₁, hrr₁⟩ := (mirReachesRet_iff_of_closed (hClosed args mem hp) .panic).mpr hm₁
+    obtain ⟨_, _, heq₁, _⟩ := hret₁ tr₁ .panic hrr₁
+    cases heq₁
+  | abort =>
+    obtain ⟨e, ho₁, he⟩ := GapEqErr.fault_iff_right.mp hr
+    subst he; subst ho₁
+    obtain ⟨tr₁, hrr₁⟩ := (mirReachesRet_iff_of_closed (hClosed args mem hp) .abort).mpr hm₁
+    obtain ⟨_, _, heq₁, _⟩ := hret₁ tr₁ .abort hrr₁
+    cases heq₁
+
+private def stepMirClosedObsSilenced (body : CapturedMir) (st : MirSiteState) :
+    ITreeF MirEffect MirOutcome MirSiteState :=
+  match stepMirSiteState body st with
+  | .ret out => .ret out
+  | .tau st' => .tau st'
+  | .vis (.inl (.fail fk)) _ => .vis (.inl (.fail fk)) PEmpty.elim
+  | .vis (.inr (.inl (.emit _))) k => .tau (k PUnit.unit)
+  | .vis (.inr (.inr (.call _))) _ => .vis (.inl (.fail .unsupported)) PEmpty.elim
+
+private theorem interp_silenceMirObs_eq_cofix_of_closed {body : CapturedMir} {st₀ : MirSiteState}
+    (hClosed : ∀ site,
+      ¬ gapBehaviors (mirSiteGapStep MirCallEnv.unresolved body) st₀ (.gap (.unresolved site))) :
+    ITree.interp Trusted.VerificationResult.silenceMirObs
+        (ITree.cofix (stepMirSiteState body) st₀) =
+      ITree.cofix (stepMirClosedObsSilenced body) st₀ := by
+  refine ITree.bisim_eq
+    (fun a b => ∃ m st, GapReach (mirSiteGapStep MirCallEnv.unresolved body) m st₀ st ∧
+      a = ITree.interp Trusted.VerificationResult.silenceMirObs
+        (ITree.cofix (stepMirSiteState body) st) ∧
+      b = ITree.cofix (stepMirClosedObsSilenced body) st)
+    ?_ ⟨0, st₀, .refl st₀, rfl, rfl⟩
+  rintro a b ⟨m, st, hgr, rfl, rfl⟩
+  have hUnf : ITree.cofix (stepMirSiteState body) st =
+      ITree.fold ((stepMirSiteState body st).map (ITree.cofix (stepMirSiteState body))) := by
+    rw [← ITree.fold_observe (ITree.cofix (stepMirSiteState body) st), ITree.observe_cofix]
+  rw [ITree.observe_cofix]
+  dsimp only [stepMirClosedObsSilenced]
+  cases hs : stepMirSiteState body st with
+  | ret out =>
+    have hL : (ITree.interp Trusted.VerificationResult.silenceMirObs
+        (ITree.cofix (stepMirSiteState body) st)).observe = .ret out := by
+      rw [hUnf, hs]
+      change (ITree.interp _ (.ret out)).observe = _
+      rw [Anneal.ITree.interp_ret, ITree.observe_ret]
+    rw [hL]; rfl
+  | tau st' =>
+    have hL : (ITree.interp Trusted.VerificationResult.silenceMirObs
+        (ITree.cofix (stepMirSiteState body) st)).observe =
+        .tau (ITree.interp Trusted.VerificationResult.silenceMirObs
+          (ITree.cofix (stepMirSiteState body) st')) := by
+      rw [hUnf, hs]
+      change (ITree.interp _ (.tau (ITree.cofix _ st'))).observe = _
+      rw [Anneal.ITree.interp_tau, ITree.observe_tau]
+    rw [hL]
+    exact ⟨m + 1, st', gapReach_snoc hgr (gapStep_of_tau hs), rfl, rfl⟩
+  | vis idx k =>
+    have hB0 : ITree.interp Trusted.VerificationResult.silenceMirObs
+        (ITree.cofix (stepMirSiteState body) st) =
+        (Trusted.VerificationResult.silenceMirObs idx >>=
+          fun o => .tau (ITree.interp Trusted.VerificationResult.silenceMirObs
+            (ITree.cofix (stepMirSiteState body) (k o)))) := by
+      rw [hUnf, hs]; exact Anneal.ITree.interp_vis _ idx _
+    rw [hB0]
+    cases idx with
+    | inl f =>
+      cases f with
+      | fail fk =>
+        dsimp only [Trusted.VerificationResult.silenceMirObs]
+        rw [fail_bind_observe]
+        exact ⟨rfl, fun o => PEmpty.elim o⟩
+    | inr rest =>
+      cases rest with
+      | inl obsReq =>
+        cases obsReq with
+        | emit obs =>
+          have hEqA : (Trusted.VerificationResult.silenceMirObs (.inr (.inl (.emit obs))) >>=
+              fun o => .tau (ITree.interp Trusted.VerificationResult.silenceMirObs
+                (ITree.cofix (stepMirSiteState body) (k o)))) =
+              .tau (ITree.interp Trusted.VerificationResult.silenceMirObs
+                (ITree.cofix (stepMirSiteState body) (k PUnit.unit))) :=
+            Anneal.ITree.ret_bind PUnit.unit _
+          rw [hEqA, ITree.observe_tau]
+          exact ⟨m + 1, k PUnit.unit, gapReach_snoc hgr (gapStep_of_vis hs), rfl, rfl⟩
+      | inr callReq =>
+        cases callReq with
+        | call req =>
+          have hd : mirSiteGapStep MirCallEnv.unresolved body st =
+              .done (.gap (.unresolved req.defPath)) := by
+            dsimp only [mirSiteGapStep]; rw [gapStep_of_vis hs]; rfl
+          exact False.elim (hClosed req.defPath ((gapBehaviors_reach_iff _ hgr _).mpr
+            ⟨(fun h₀ => by cases h₀), 1, runGapSteps_succ_of_done _ hd 0⟩))
+
+private theorem runGapSteps_closedObsSilenced_of_closed {body : CapturedMir}
+    (fuel : Nat) {st₀ : MirSiteState}
+    (hClosed : ∀ site,
+      ¬ gapBehaviors (mirSiteGapStep MirCallEnv.unresolved body) st₀ (.gap (.unresolved site))) :
+    runGapSteps
+        (gapStep (stepMirClosedObsSilenced body) (mirSiteOfState body)
+          (mirGapHandle MirCallEnv.unresolved))
+        fuel st₀ =
+      runGapSteps (mirSiteGapStep MirCallEnv.unresolved body) fuel st₀ := by
+  induction fuel generalizing st₀ with
+  | zero => rfl
+  | succ fuel ih =>
+    rw [runGapSteps_succ, runGapSteps_succ]
+    dsimp only [gapStep, stepMirClosedObsSilenced, mirSiteGapStep]
+    cases hs : stepMirSiteState body st₀ with
+    | ret _ => rfl
+    | tau st' =>
+      exact ih (fun site hm => hClosed site
+        ((gapBehaviors_reach_iff _ (.step (gapStep_of_tau hs) (.refl _)) _).mpr hm))
+    | vis idx k =>
+      cases idx with
+      | inl f => cases f; rfl
+      | inr rest =>
+        cases rest with
+        | inl obs =>
+          cases obs
+          exact ih (fun site hm => hClosed site
+            ((gapBehaviors_reach_iff _ (.step (gapStep_of_vis hs) (.refl _)) _).mpr hm))
+        | inr c =>
+          cases c with
+          | call req =>
+            have hd : mirSiteGapStep MirCallEnv.unresolved body st₀ =
+                .done (.gap (.unresolved req.defPath)) := by
+              dsimp only [mirSiteGapStep]; rw [gapStep_of_vis hs]; rfl
+            exact False.elim (hClosed req.defPath
+              ⟨(fun h₀ => by cases h₀), 1, runGapSteps_succ_of_done _ hd 0⟩)
+
+private theorem gapBehaviors_closedObsSilenced_of_closed {body : CapturedMir} {st₀ : MirSiteState}
+    (hClosed : ∀ site,
+      ¬ gapBehaviors (mirSiteGapStep MirCallEnv.unresolved body) st₀ (.gap (.unresolved site))) :
+    gapBehaviors
+        (gapStep (stepMirClosedObsSilenced body) (mirSiteOfState body)
+          (mirGapHandle MirCallEnv.unresolved)) st₀ =
+      gapBehaviors (mirSiteGapStep MirCallEnv.unresolved body) st₀ := by
+  funext o
+  apply propext
+  refine ⟨fun ⟨hne, fuel, hr⟩ => ⟨hne, fuel, (runGapSteps_closedObsSilenced_of_closed fuel hClosed).symm.trans hr⟩,
+    fun ⟨hne, fuel, hr⟩ => ⟨hne, fuel, (runGapSteps_closedObsSilenced_of_closed fuel hClosed).trans hr⟩⟩
+
+private theorem reaches_closedObsSilenced {body : CapturedMir} {st₀ : MirSiteState}
+    (hClosed : ∀ site,
+      ¬ gapBehaviors (mirSiteGapStep MirCallEnv.unresolved body) st₀ (.gap (.unresolved site)))
+    {tr : List (Event MirEffect)} {u : ITree MirEffect MirOutcome}
+    (hreach : Reaches (ITree.cofix (stepMirClosedObsSilenced body) st₀) tr u) :
+    tr = [] ∧ ∃ m st',
+      GapReach
+        (gapStep (stepMirClosedObsSilenced body) (mirSiteOfState body)
+          (mirGapHandle MirCallEnv.unresolved)) m st₀ st' ∧
+      u = ITree.cofix (stepMirClosedObsSilenced body) st' := by
+  have hNoStop {tr' u'} (hr' : Reaches (ITree.cofix (stepMirClosedObsSilenced body) st₀) tr' u') :=
+    reaches_cofix_of_noStop (step := stepMirClosedObsSilenced body)
+      (site := mirSiteOfState body)
+      (mirGapHandle_ne_outOfFuel MirCallEnv.unresolved)
+      mirGapHandle_unresolved_subsingleton (.refl st₀)
+      (fun j _ ho _ => by cases j with | inl o => cases o; cases ho | inr c => cases c; cases ho)
+      (fun j _ ho hm => by
+        rw [gapBehaviors_closedObsSilenced_of_closed hClosed] at hm
+        cases j with
+        | inl o => cases o; cases ho
+        | inr c => cases c; injection ho with hg; subst hg; exact hClosed _ hm)
+      hr'
+  refine ⟨?_, hNoStop hreach⟩
+  generalize ht₀ : ITree.cofix (stepMirClosedObsSilenced body) st₀ = t₀ at hreach
+  suffices ∀ {t w : ITree MirEffect MirOutcome} {tr₀ : List (Event MirEffect)},
+      Reaches t tr₀ w →
+      Reaches (ITree.cofix (stepMirClosedObsSilenced body) st₀) [] t →
+      tr₀ = [] from this hreach (ht₀ ▸ .refl _)
+  intro t w tr₀ hr
+  induction hr with
+  | refl => exact fun _ => rfl
+  | tau htau _ ih =>
+    exact fun hpre => ih (Anneal.ITree.reaches_trans hpre (.tau htau (.refl _)))
+  | vis hv hnf o _ _ =>
+    intro hpre
+    obtain ⟨_, st_q, _, rfl⟩ := hNoStop hpre
+    rw [ITree.observe_cofix] at hv
+    dsimp only [stepMirClosedObsSilenced] at hv
+    cases hs : stepMirSiteState body st_q with
+    | ret _ => rw [hs] at hv; cases hv
+    | tau _ => rw [hs] at hv; cases hv
+    | vis idx _ =>
+      rw [hs] at hv
+      cases idx with
+      | inl f => cases f; injection hv with hi _; subst hi; exact False.elim (hnf trivial)
+      | inr rest =>
+        cases rest with
+        | inl obs => cases obs; cases hv
+        | inr c => cases c; injection hv with hi _; subst hi; exact False.elim (hnf trivial)
+
+private theorem mirObsErased_safe_iff_defined_of_closed {callees : List CapturedMir}
+    {body : CapturedMir} {args : List Value} {mem : Memory}
+    (hClosed : ∀ site,
+      ¬ mirStatefulGapBehaviors MirCallEnv.unresolved callees body (args, mem)
+          (.gap (.unresolved site))) :
+    TreeSafe (Trusted.VerificationResult.mirObsErasedStatefulTreeWithCallees body args mem callees) ↔
+      OutcomeSet.Defined ExecFault.isUB
+        (mirStatefulGapBehaviors MirCallEnv.unresolved callees body (args, mem)) := by
+  let s := Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem callees
+  let st := mirSiteOfExec body (.running s)
+  have hT : Trusted.VerificationResult.mirObsErasedStatefulTreeWithCallees body args mem callees =
+      ITree.cofix (stepMirClosedObsSilenced body) st := by
+    change ITree.interp _ (mirTree body s) = _
+    rw [← cofix_stepMirSiteState_eq_mirTree body s]
+    exact interp_silenceMirObs_eq_cofix_of_closed hClosed
+  rw [hT]
+  constructor
+  · intro hSafe o ho
+    have ho' : gapBehaviors
+        (gapStep (stepMirClosedObsSilenced body) (mirSiteOfState body)
+          (mirGapHandle MirCallEnv.unresolved)) st o := by
+      rw [gapBehaviors_closedObsSilenced_of_closed hClosed]; exact ho
+    obtain ⟨hne, fuel, hrun⟩ := ho'
+    have hRefute (hd : ¬ o.isDefined ExecFault.isUB)
+        (hNoUnres : ∀ site, o ≠ .gap (.unresolved site)) : False :=
+      not_treeSafe_of_runStepsWithGap mirHandled_not_fault hrun hne hd
+        (fun i _ hi => by cases i with | inl x => cases x; cases hi | inr x => cases x; cases hi)
+        (fun i _ hi h => by
+          cases i with
+          | inl x => cases x; cases hi
+          | inr x => cases x; injection hi with hg; subst hg; exact hNoUnres _ h) hSafe
+    cases o with
+    | ok _ => exact trivial
+    | fault e =>
+      cases e with
+      | panic => exact fun h => h
+      | abort => exact fun h => h
+      | ub => exact False.elim (hRefute (fun h => h trivial) (fun _ h => by cases h))
+    | gap g =>
+      cases g with
+      | outOfFuel => exact False.elim (hne rfl)
+      | unresolved site => exact False.elim (hClosed site ho)
+      | unsupported _ => exact False.elim (hRefute (fun h => h) (fun _ h => by cases h))
+      | budget _ => exact False.elim (hRefute (fun h => h) (fun _ h => by cases h))
+  · intro hDef
+    have hDef' : OutcomeSet.Defined ExecFault.isUB
+        (gapBehaviors
+          (gapStep (stepMirClosedObsSilenced body) (mirSiteOfState body)
+            (mirGapHandle MirCallEnv.unresolved)) st) := by
+      rw [gapBehaviors_closedObsSilenced_of_closed hClosed]; exact hDef
+    exact treeSafe_of_gapBehaviors_defined mirHandled_not_fault
+      (mirGapHandle_ne_outOfFuel MirCallEnv.unresolved)
+      mirGapHandle_unresolved_subsingleton
+      (mirGapHandle_noDefFault MirCallEnv.unresolved) hDef'
+
+private theorem mirObsErased_reachesRet_iff_of_closed {callees : List CapturedMir}
+    {body : CapturedMir} {args : List Value} {mem : Memory}
+    (hClosed : ∀ site,
+      ¬ mirStatefulGapBehaviors MirCallEnv.unresolved callees body (args, mem)
+          (.gap (.unresolved site)))
+    (tr : List (Event MirEffect)) (out : MirOutcome) :
+    ReachesRet (Trusted.VerificationResult.mirObsErasedStatefulTreeWithCallees body args mem callees)
+        tr out ↔
+      tr = [] ∧ mirStatefulGapBehaviors MirCallEnv.unresolved callees body (args, mem)
+        (classifyOutcome out) := by
+  let s := Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem callees
+  let st := mirSiteOfExec body (.running s)
+  have hT : Trusted.VerificationResult.mirObsErasedStatefulTreeWithCallees body args mem callees =
+      ITree.cofix (stepMirClosedObsSilenced body) st := by
+    change ITree.interp _ (mirTree body s) = _
+    rw [← cofix_stepMirSiteState_eq_mirTree body s]
+    exact interp_silenceMirObs_eq_cofix_of_closed hClosed
+  rw [hT]
+  constructor
+  · rintro ⟨u, hru, hur⟩
+    obtain ⟨rfl, _, st', hgr, rfl⟩ := reaches_closedObsSilenced hClosed hru
+    rw [ITree.observe_cofix] at hur
+    dsimp only [stepMirClosedObsSilenced] at hur
+    cases hs : stepMirSiteState body st' with
+    | ret out' =>
+      rw [hs] at hur; injection hur with heq; subst heq
+      have hm' : gapBehaviors
+          (gapStep (stepMirClosedObsSilenced body) (mirSiteOfState body)
+            (mirGapHandle MirCallEnv.unresolved)) st (classifyOutcome out') :=
+        (gapBehaviors_reach_iff _ hgr _).mpr
+          ⟨classifyOutcome_ne_outOfFuel out', 1,
+            runStepsWithGap_of_ret (by dsimp only [stepMirClosedObsSilenced]; rw [hs]) 0⟩
+      rw [gapBehaviors_closedObsSilenced_of_closed hClosed] at hm'
+      exact ⟨rfl, hm'⟩
+    | tau _ => rw [hs] at hur; cases hur
+    | vis idx _ =>
+      rw [hs] at hur
+      cases idx with
+      | inl f => cases f; cases hur
+      | inr rest =>
+        cases rest with
+        | inl obs => cases obs; cases hur
+        | inr c => cases c; cases hur
+  · rintro ⟨rfl, _, fuel, hrun⟩
+    have hrun' : runStepsWithGap (stepMirClosedObsSilenced body) (mirSiteOfState body)
+        (mirGapHandle MirCallEnv.unresolved) fuel st = classifyOutcome out :=
+      (runGapSteps_closedObsSilenced_of_closed fuel hClosed).trans hrun
+    obtain ⟨tr', u, hru, hur⟩ := runStepsWithGap_defined_reachesRet
+      (step := stepMirClosedObsSilenced body) (site := mirSiteOfState body)
+      (handle := mirGapHandle MirCallEnv.unresolved)
+      mirHandled_not_fault (mirGapHandle_noDefFault MirCallEnv.unresolved) hrun'
+    obtain ⟨rfl, _⟩ := reaches_closedObsSilenced hClosed hru
+    exact ⟨u, hru, hur⟩
+
+/--
+Branch-observation-erased Layer 1A `toPartial` equality (`0` `Classical.choice`,
+ZERO `hDef`, and ZERO `Prod.snd` trace projection!): whenever `body₁` and `body₂`
+are `ContextEquivOn pre (· = ·) (· = ·)` and hit no unresolved external calls on
+`(args, mem)` (even when their internal `switchInt` branching differs OR they hit
+`.unsupported` gaps, `.ub`, panics, or diverge!), their trusted
+`mirObsErasedStatefulTreeWithCallees` trees have **literally equal** `.toPartial`!
+-/
+theorem mirObsErasedStatefulTree_toPartial_eq_of_contextEquiv
+    {callees₁ callees₂ : List CapturedMir} {body₁ body₂ : CapturedMir}
+    {pre : List Value × Memory → Prop}
+    (hEq : ContextEquivOn pre (· = ·) (· = ·)
+      (mirStatefulGapBehaviors MirCallEnv.unresolved callees₁ body₁)
+      (mirStatefulGapBehaviors MirCallEnv.unresolved callees₂ body₂))
+    {args : List Value} {mem : Memory} (hp : pre (args, mem))
+    (hClosed₁ : ∀ site,
+      ¬ mirStatefulGapBehaviors MirCallEnv.unresolved callees₁ body₁ (args, mem)
+          (.gap (.unresolved site))) :
+    (Trusted.VerificationResult.mirObsErasedStatefulTreeWithCallees
+        body₁ args mem callees₁).toPartial =
+      (Trusted.VerificationResult.mirObsErasedStatefulTreeWithCallees
+        body₂ args mem callees₂).toPartial := by
+  have hClosed₂ : ∀ site,
+      ¬ mirStatefulGapBehaviors MirCallEnv.unresolved callees₂ body₂ (args, mem)
+          (.gap (.unresolved site)) := by
+    intro site hm₂
+    obtain ⟨_, hm₁, hr⟩ := (hEq (args, mem) hp).backward hm₂
+    rw [GapEqErr.gap_iff_right.mp hr] at hm₁
+    exact hClosed₁ site hm₁
+  have hSafe : TreeSafe (Trusted.VerificationResult.mirObsErasedStatefulTreeWithCallees
+        body₁ args mem callees₁) ↔
+      TreeSafe (Trusted.VerificationResult.mirObsErasedStatefulTreeWithCallees
+        body₂ args mem callees₂) := by
+    rw [mirObsErased_safe_iff_defined_of_closed hClosed₁,
+      mirObsErased_safe_iff_defined_of_closed hClosed₂]
+    exact (hEq (args, mem) hp).defined_iff ExecFault.eq_preserves_isUB
+  refine Partial.ext hSafe (fun _ _ => ?_)
+  funext ⟨tr, out⟩
+  apply propext
+  change ReachesRet _ tr out ↔ ReachesRet _ tr out
+  rw [mirObsErased_reachesRet_iff_of_closed hClosed₁,
+    mirObsErased_reachesRet_iff_of_closed hClosed₂]
+  exact ⟨fun ⟨htr, hm₁⟩ => ⟨htr, (hEq (args, mem) hp).subset_of_eq _ hm₁⟩,
+    fun ⟨htr, hm₂⟩ => ⟨htr, (hEq (args, mem) hp).superset_of_eq _ hm₂⟩⟩
+
+/--
+Two-way trusted `RefinesStatefulMirWithCallees` transfer from gap-preserving
+`ContextEquivOn` (`0` `Classical.choice`, ZERO `hDef` side condition — holds even
+when inputs inside `pre` hit shared `.unsupported` gaps, `.ub`, panics, or diverge,
+and even when `body₁` and `body₂` have different `switchInt` branching!).
+-/
+theorem refinesStatefulMirWithCallees_of_contextEquiv
+    {callees₁ callees₂ : List CapturedMir} {body₁ body₂ : CapturedMir}
+    {pre : List Value → Memory → Prop}
+    (hEq : ContextEquivOn (fun q => pre q.1 q.2) (· = ·) (· = ·)
+      (mirStatefulGapBehaviors MirCallEnv.unresolved callees₁ body₁)
+      (mirStatefulGapBehaviors MirCallEnv.unresolved callees₂ body₂))
+    (hClosed₁ : ∀ args mem, pre args mem → ∀ site,
+      ¬ mirStatefulGapBehaviors MirCallEnv.unresolved callees₁ body₁ (args, mem)
+          (.gap (.unresolved site))) :
+    Trusted.VerificationResult.RefinesStatefulMirWithCallees body₂ callees₂ body₁ callees₁ pre ∧
+      Trusted.VerificationResult.RefinesStatefulMirWithCallees body₁ callees₁ body₂ callees₂ pre := by
+  refine ⟨fun args mem hp => ?_, fun args mem hp => ?_⟩
+  · rw [mirObsErasedStatefulTree_toPartial_eq_of_contextEquiv hEq hp (hClosed₁ args mem hp)]
+    exact fun h => ⟨h, fun _ hx => hx⟩
+  · rw [mirObsErasedStatefulTree_toPartial_eq_of_contextEquiv hEq hp (hClosed₁ args mem hp)]
+    exact fun h => ⟨h, fun _ hx => hx⟩
+
+private theorem spin_reaches_eq_aux {E : Effect.{u}} {R : Type u} [FaultEffect E]
+    {s₀ u : ITree E R} {tr : List (Event E)}
+    (hr₀ : Reaches s₀ tr u) : s₀ = ITree.spin → u = ITree.spin := by
+  induction hr₀ with
+  | refl => exact fun hs₀ => hs₀
+  | tau htau _ ih =>
+    intro hs₀
+    rw [hs₀, Anneal.ITree.observe_spin] at htau
+    injection htau with hx
+    exact ih hx.symm
+  | vis hv _ _ _ _ =>
+    intro hs₀
+    rw [hs₀, Anneal.ITree.observe_spin] at hv
+    cases hv
+
+private theorem spin_reaches_eq {E : Effect.{u}} {R : Type u} [FaultEffect E]
+    {tr : List (Event E)} {u : ITree E R}
+    (hr : Reaches (ITree.spin : ITree E R) tr u) :
+    u = ITree.spin :=
+  spin_reaches_eq_aux hr rfl
+
+/--
+For **every** `C : Trusted.VerificationResult.MirCallContract`, there exists a
+valid `ExternalCallHandler` satisfying `C.holdsOn` (namely `fun _ => ITree.spin`)
+that is NOT equal to `env.toExternalCallHandler` for any `env : MirCallEnv`
+(proving that requiring `h = env.toExternalCallHandler` is vacuous on every
+`MirCallContract.holdsOn` modular claim!).
+-/
+theorem mirCallContract_not_all_toExternalCallHandler
+    (C : Trusted.VerificationResult.MirCallContract) :
+    ∃ h : Trusted.VerificationResult.ExternalCallHandler,
+      C.holdsOn h ∧ ∀ env : MirCallEnv, h ≠ env.toExternalCallHandler := by
+  refine ⟨fun _ => ITree.spin, ?_, ?_⟩
+  · intro req _
+    refine ⟨fun tr u hru ⟨u', idx, _, hts, hvu, _⟩ => ?_, fun tr ans ⟨u, hru, hur⟩ => ?_⟩
+    · have hu' := spin_reaches_eq (reaches_append_tauStar hru hts)
+      subst hu'
+      rw [Anneal.ITree.observe_spin] at hvu
+      cases hvu
+    · have hu := spin_reaches_eq hru
+      subst hu
+      rw [Anneal.ITree.observe_spin] at hur
+      cases hur
+  · intro env heq
+    let req₀ : MirCallReq := { defPath := "", args := [], memory := emptyMemory }
+    have hreq : (ITree.spin : ITree Trusted.VerificationResult.MirClosedEffect MirCallAns).observe =
+        (env.toExternalCallHandler req₀).observe :=
+      congrArg ITree.observe (congrFun heq req₀)
+    rw [Anneal.ITree.observe_spin] at hreq
+    unfold MirCallEnv.toExternalCallHandler at hreq
+    have hFailNe : ∀ fk : FailureKind,
+        ITreeF.tau ITree.spin ≠
+          (ITree.fail (E := Trusted.VerificationResult.MirClosedEffect)
+            (R := MirCallAns) fk).observe := by
+      intro fk h
+      unfold ITree.fail ITree.triggerSub at h
+      rw [Anneal.ITree.vis_bind, ITree.observe_vis] at h
+      cases h
+    cases hseal : env.seal req₀ with
+    | ok ans =>
+      rw [hseal, ITree.observe_ret] at hreq
+      cases hreq
+    | fault u =>
+      cases u
+      rw [hseal] at hreq
+      exact hFailNe FailureKind.ub hreq
+    | gap g =>
+      cases g <;> rw [hseal] at hreq <;>
+        first | exact hFailNe FailureKind.outOfFuel hreq
+              | exact hFailNe FailureKind.unsupported hreq
+
+/--
+Reachable-request general `ExternalCallHandler` subsumption: whenever `body`
+satisfies `MirClosedStatefulContractSpec` under `env.toExternalCallHandler`, it
+ALSO satisfies `MirClosedStatefulContractSpec` under **any** `h : ExternalCallHandler`
+(including `.tau`-delayed handlers, `MirObsE`-emitting handlers, and `ITree.spin`
+diverging handlers!) that is `TreeSafe` and agrees on normal returns at every
+`MirCallReachable` request of `body`!
+-/
+theorem mirClosedStatefulContract_of_handler_refines_on {env : MirCallEnv}
+    {h : Trusted.VerificationResult.ExternalCallHandler}
+    {callees : List CapturedMir} {body : CapturedMir}
+    {safetyPre pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    (hSub : ∀ args mem, safetyPre args mem →
+      ∀ req,
+        MirCallReachable env body
+          (mirSiteOfExec body (.running
+            (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+              body args mem callees))) req →
+        ∀ ans, env.seal req = .ok ans →
+          TreeSafe (h req) ∧ ∀ tr_h ans', ReachesRet (h req) tr_h ans' → ans' = ans)
+    (hBase :
+      (fun args mem =>
+        (Trusted.VerificationResult.mirHandledTreeWithCallees
+          body args mem callees env.toExternalCallHandler).toPartial) ≤
+        Trusted.VerificationResult.MirClosedStatefulContractSpec safetyPre pre post) :
+    (fun args mem =>
+      (Trusted.VerificationResult.mirHandledTreeWithCallees
+        body args mem callees h).toPartial) ≤
+      Trusted.VerificationResult.MirClosedStatefulContractSpec safetyPre pre post := by
+  intro args mem hsafe
+  obtain ⟨hsEnv, hvalEnv⟩ := hBase args mem hsafe
+  have hDef := (mirHandledTree_safe_iff_defined env callees body args mem).mp hsEnv
+  let s := Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body args mem callees
+  let st₀ := mirSiteOfExec body (.running s)
+  have hEqTree : Trusted.VerificationResult.mirHandledTreeWithCallees body args mem callees h =
+      mirHandlerInterp h body st₀ := by
+    change ITree.interp _ (mirTree body s) = _
+    rw [← cofix_stepMirSiteState_eq_mirTree body s]
+    rfl
+  have hInit : MHRInv env h body st₀ (mirHandlerInterp h body st₀) :=
+    Or.inl ⟨0, st₀, .refl st₀, rfl⟩
+  have hSub₀ := hSub args mem hsafe
+  refine ⟨?_, fun outPair hrr hp retVal mem' hout => ?_⟩
+  · change TreeSafe (Trusted.VerificationResult.mirHandledTreeWithCallees body args mem callees h)
+    rw [hEqTree]
+    intro tr u hru ⟨u', idx, kw, hts, hvu', hfi⟩
+    have hinv' := reaches_mhrInv hDef hSub₀ (reaches_append_tauStar hru hts) hInit
+    exact ((mhrInv_step hDef hSub₀ hinv').2.1 idx kw hvu').1 hfi
+  · rcases outPair with ⟨tr, out⟩
+    dsimp only at hout
+    subst hout
+    change ReachesRet (Trusted.VerificationResult.mirHandledTreeWithCallees body args mem callees h)
+      tr (.normal (retVal, mem')) at hrr
+    rw [hEqTree] at hrr
+    obtain ⟨u, hru, hur⟩ := hrr
+    have hinv' := reaches_mhrInv hDef hSub₀ hru hInit
+    have hm := (mhrInv_step hDef hSub₀ hinv').2.2 (.normal (retVal, mem')) hur
+    obtain ⟨trEnv, hrrEnv⟩ :=
+      (mirHandledTree_reachesRet_iff_of_defined hDef (.normal (retVal, mem'))).mpr hm
+    exact hvalEnv (trEnv, .normal (retVal, mem')) hrrEnv hp retVal mem' rfl
+
+/--
+General handler-refinement `ModularVerificationResult` transfer: unlike
+`h = env.toExternalCallHandler` (which fails on `.tau`-delayed, `MirObsE`-emitting,
+and `ITree.spin`-diverging handlers admitted by `MirCallContract.holdsOn`), this
+requires only that each `h` satisfying `envAssumed h` refines some `env : MirCallEnv`
+whose `env.toExternalCallHandler` satisfies `envAssumed` and relates `body₁` to
+`body₂` via `ContextEquivOn`!
+-/
+theorem ModularVerificationResult.of_contextEquiv_refines
+    {callees : List CapturedMir} {body₁ body₂ : CapturedMir}
+    {envAssumed : Trusted.VerificationResult.ExternalCallHandler → Prop}
+    {rVal : MirReturn → MirReturn → Prop}
+    {pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    (hHandlers : ∀ h, envAssumed h →
+      ∃ env : MirCallEnv,
+        envAssumed env.toExternalCallHandler ∧
+        ContextEquivOn (fun q => pre q.1 q.2) rVal (· = ·)
+          (mirStatefulGapBehaviors env callees body₁)
+          (mirStatefulGapBehaviors env callees body₂) ∧
+        (∀ args mem, pre args mem →
+          ∀ req,
+            MirCallReachable env body₂
+              (mirSiteOfExec body₂ (.running
+                (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+                  body₂ args mem callees))) req →
+            ∀ ans, env.seal req = .ok ans →
+              TreeSafe (h req) ∧ ∀ tr_h ans', ReachesRet (h req) tr_h ans' → ans' = ans))
+    (hPost : ∀ args mem v₁ m₁ v₂ m₂,
+      pre args mem → rVal (v₁, m₁) (v₂, m₂) → post args mem v₁ m₁ → post args mem v₂ m₂)
+    (hCert : Trusted.VerificationResult.ModularVerificationResult
+      { body := body₁, envAssumed := envAssumed, pre := pre, post := post, callees := callees }) :
+    Trusted.VerificationResult.ModularVerificationResult
+      { body := body₂, envAssumed := envAssumed, pre := pre, post := post, callees := callees } :=
+  ⟨fun h hAss => by
+    obtain ⟨env, hAssEnv, hEq, hSub⟩ := hHandlers h hAss
+    have hEnv₂ := mirClosedStatefulContract_of_contextEquiv hEq
+      (fun args mem v₁ m₁ v₂ m₂ hp _ => hPost args mem v₁ m₁ v₂ m₂ hp)
+      (hCert.proof env.toExternalCallHandler hAssEnv)
+    exact mirClosedStatefulContract_of_handler_refines_on hSub hEnv₂⟩
+
+/--
+Direct `MirCallContract.holdsOn` transfer for `ModularVerificationResult`:
+transfers a modular certificate with `envAssumed := C.holdsOn` across **all**
+`ExternalCallHandler`s satisfying `C.holdsOn` (including `ITree.spin`, `.tau`,
+and `MirObsE` handlers!) whenever a canonical `env : MirCallEnv` implements `C`
+and deterministically characterizes `C.post` on `body₂`'s reachable requests.
+-/
+theorem ModularVerificationResult.of_callContract_contextEquiv
+    {callees : List CapturedMir} {body₁ body₂ : CapturedMir}
+    {C : Trusted.VerificationResult.MirCallContract}
+    {env : MirCallEnv}
+    {rVal : MirReturn → MirReturn → Prop}
+    {pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    (hEnvHolds : C.holdsOn env.toExternalCallHandler)
+    (hEq : ContextEquivOn (fun q => pre q.1 q.2) rVal (· = ·)
+      (mirStatefulGapBehaviors env callees body₁)
+      (mirStatefulGapBehaviors env callees body₂))
+    (hReachContract : ∀ args mem, pre args mem →
+      ∀ req,
+        MirCallReachable env body₂
+          (mirSiteOfExec body₂ (.running
+            (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+              body₂ args mem callees))) req →
+        ∀ ans, env.seal req = .ok ans →
+          C.pre req ∧ ∀ ans', C.post req ans' → ans' = ans)
+    (hPost : ∀ args mem v₁ m₁ v₂ m₂,
+      pre args mem → rVal (v₁, m₁) (v₂, m₂) → post args mem v₁ m₁ → post args mem v₂ m₂)
+    (hCert : Trusted.VerificationResult.ModularVerificationResult
+      { body := body₁, envAssumed := C.holdsOn, pre := pre, post := post, callees := callees }) :
+    Trusted.VerificationResult.ModularVerificationResult
+      { body := body₂, envAssumed := C.holdsOn, pre := pre, post := post, callees := callees } :=
+  ModularVerificationResult.of_contextEquiv_refines
+    (fun h hHolds => ⟨env, hEnvHolds, hEq, fun args mem hp req hreach ans hseal => by
+      obtain ⟨hpre, huniq⟩ := hReachContract args mem hp req hreach ans hseal
+      obtain ⟨hs, hr⟩ := hHolds req hpre
+      exact ⟨hs, fun tr_h ans' hrr => huniq ans' (hr tr_h ans' hrr)⟩⟩)
+    hPost hCert
 
 end MirAdequacy
 

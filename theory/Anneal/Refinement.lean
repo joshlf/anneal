@@ -2224,6 +2224,35 @@ theorem gapFreeOn_det_iff {f : Query → OutcomeWithGap Fault₁ Gap Val₁} :
   ⟨fun h q hq => neverGap_singleton_iff.mp (h q hq),
    fun h q hq => neverGap_singleton_iff.mpr (h q hq)⟩
 
+/-- Binary union of query-scoped `ContextEquivOn` certificates (`0` `Classical.choice`). -/
+theorem ContextEquivOn.sup {pre₁ pre₂ : Query → Prop}
+    (h₁ : ContextEquivOn pre₁ rVal rFault sem₁ sem₂)
+    (h₂ : ContextEquivOn pre₂ rVal rFault sem₁ sem₂) :
+    ContextEquivOn (fun q => pre₁ q ∨ pre₂ q) rVal rFault sem₁ sem₂
+  | q, .inl hp₁ => h₁ q hp₁
+  | q, .inr hp₂ => h₂ q hp₂
+
+/-- Indexed family union of `ContextEquivOn` certificates (e.g., `switchInt` or enum arms). -/
+theorem ContextEquivOn.iSup {ι : Sort uP} {P : ι → Query → Prop}
+    (h : ∀ i, ContextEquivOn (P i) rVal rFault sem₁ sem₂) :
+    ContextEquivOn (fun q => ∃ i, P i q) rVal rFault sem₁ sem₂
+  | q, ⟨i, hi⟩ => h i q hi
+
+/-- Constructive binary-cover patching into full `ContextEquiv`. -/
+theorem ContextEquiv.of_cover {pre₁ pre₂ : Query → Prop}
+    (hCover : ∀ q, pre₁ q ∨ pre₂ q)
+    (h₁ : ContextEquivOn pre₁ rVal rFault sem₁ sem₂)
+    (h₂ : ContextEquivOn pre₂ rVal rFault sem₁ sem₂) :
+    ContextEquiv rVal rFault sem₁ sem₂ :=
+  fun q => (h₁.sup h₂) q (hCover q)
+
+/-- Constructive indexed-cover patching into full `ContextEquiv`. -/
+theorem ContextEquiv.of_iSup_cover {ι : Sort uP} {P : ι → Query → Prop}
+    (hCover : ∀ q, ∃ i, P i q)
+    (h : ∀ i, ContextEquivOn (P i) rVal rFault sem₁ sem₂) :
+    ContextEquiv rVal rFault sem₁ sem₂ :=
+  fun q => (ContextEquivOn.iSup h) q (hCover q)
+
 end EquivLaws
 
 section ProgramEquivLaws
@@ -2943,6 +2972,22 @@ theorem ProgramEquiv.toValExactPass {Prog₁ : Type uP} {Prog₂ : Type uP'}
   up_refines _ q := (h.flip q).forbid_toValPartial_le
   down_refines _ q := (h q).forbid_toValPartial_le
 
+private theorem forbid_toValPartial_le_eq {Val : Type uV}
+    {S₁ : OutcomeSet Fault₁ Gap₁ Val} {S₂ : OutcomeSet Fault₂ Gap₂ Val}
+    (h : OutcomeSetEquiv (GapForbidEq (· = ·) rFault) S₁ S₂) :
+    OutcomeSet.toValPartial S₂ ≤ OutcomeSet.toValPartial S₁ := by
+  intro h₁
+  obtain ⟨h₂, hle⟩ := h.forbid_toValPartial_le h₁
+  exact ⟨h₂, fun v₂ hv₂ => by obtain ⟨_, hv₁, heq⟩ := hle v₂ hv₂; exact heq ▸ hv₁⟩
+
+private theorem toValPartial_le_eq {Gap : Type uG} {Val : Type uV}
+    {S₁ : OutcomeSet Fault₁ Gap Val} {S₂ : OutcomeSet Fault₂ Gap Val}
+    (h : OutcomeSetEquiv (GapEqErr (· = ·) rFault) S₁ S₂) :
+    OutcomeSet.toValPartial S₂ ≤ OutcomeSet.toValPartial S₁ := by
+  intro h₁
+  obtain ⟨h₂, hle⟩ := h.toValPartial_le h₁
+  exact ⟨h₂, fun v₂ hv₂ => by obtain ⟨_, hv₁, heq⟩ := hle v₂ hv₂; exact heq ▸ hv₁⟩
+
 /--
 Exact-value `ProgramEquiv` across arbitrary `Fault₁`, `Fault₂`, `Gap₁`, `Gap₂`
 induces an identity-observation `ExactPass` on `valSemantics`.
@@ -2954,32 +2999,9 @@ theorem ProgramEquiv.toValExactPass_eq {Prog₁ : Type uP} {Prog₂ : Type uP'}
     {p₁ : Prog₁} {p₂ : Prog₂}
     (h : ProgramEquiv (· = ·) rFault (sem₁ p₁) (sem₂ p₂)) :
     ExactPass (valSemantics sem₁) (valSemantics sem₂) id id p₁ p₂ where
-  up_refines _ q h₂ := by
-    have h₁ : OutcomeSet.OnlyValues (sem₁ p₁ q) := fun o₁ ho₁ => by
-      obtain ⟨o₂, ho₂, hr⟩ := (h q).forward ho₁
-      obtain ⟨v₂, rfl⟩ := h₂ ho₂
-      cases o₁ with
-      | ok v₁ => exact ⟨v₁, rfl⟩
-      | fault _ => exact False.elim hr
-      | gap _ => exact False.elim hr
-    refine ⟨h₁, fun v₁ hv₁ => ?_⟩
-    obtain ⟨o₂, ho₂, hr⟩ := (h q).forward hv₁
-    obtain ⟨v₂, rfl⟩ := h₂ ho₂
-    cases (hr : v₁ = v₂)
-    exact ho₂
-  down_refines _ q h₁ := by
-    have h₂ : OutcomeSet.OnlyValues (sem₂ p₂ q) := fun o₂ ho₂ => by
-      obtain ⟨o₁, ho₁, hr⟩ := (h q).backward ho₂
-      obtain ⟨v₁, rfl⟩ := h₁ ho₁
-      cases o₂ with
-      | ok v₂ => exact ⟨v₂, rfl⟩
-      | fault _ => exact False.elim hr
-      | gap _ => exact False.elim hr
-    refine ⟨h₂, fun v₂ hv₂ => ?_⟩
-    obtain ⟨o₁, ho₁, hr⟩ := (h q).backward hv₂
-    obtain ⟨v₁, rfl⟩ := h₁ ho₁
-    cases (hr : v₁ = v₂)
-    exact ho₁
+  up_refines _ q := forbid_toValPartial_le_eq ((h.flip q).mono (fun _ _ hr =>
+    GapForbidEq.mono (fun _ _ hv => Eq.symm hv) (fun _ _ he => he) hr))
+  down_refines _ q := forbid_toValPartial_le_eq (h q)
 
 /--
 `OutcomeSet.bind S k` admits only normal values iff `S` admits only normal
@@ -3021,18 +3043,9 @@ theorem ContextEquiv.toValExactPass_eq {Prog₁ : Type uP} {Prog₂ : Type uP'}
     {p₁ : Prog₁} {p₂ : Prog₂}
     (h : ContextEquiv (· = ·) rFault (sem₁ p₁) (sem₂ p₂)) :
     ExactPass (valSemantics sem₁) (valSemantics sem₂) id id p₁ p₂ where
-  up_refines _ q h₂ := by
-    refine ⟨(h q).onlyValues_iff.mpr h₂, fun v₁ hv₁ => ?_⟩
-    obtain ⟨o₂, ho₂, hr⟩ := (h q).forward hv₁
-    obtain ⟨v₂, rfl⟩ := h₂ ho₂
-    cases (hr : v₁ = v₂)
-    exact ho₂
-  down_refines _ q h₁ := by
-    refine ⟨(h q).onlyValues_iff.mp h₁, fun v₂ hv₂ => ?_⟩
-    obtain ⟨o₁, ho₁, hr⟩ := (h q).backward hv₂
-    obtain ⟨v₁, rfl⟩ := h₁ ho₁
-    cases (hr : v₁ = v₂)
-    exact ho₁
+  up_refines _ q := toValPartial_le_eq ((h.flip q).mono (fun _ _ hr =>
+    GapEqErr.mono (fun _ _ hv => Eq.symm hv) (fun _ _ he => he) hr))
+  down_refines _ q := toValPartial_le_eq (h q)
 
 /-- Layer 1A `Compiles` on `valLanguage` induced by exact-value `ContextEquiv`. -/
 theorem ContextEquiv.valCompiles_eq
@@ -3044,6 +3057,32 @@ theorem ContextEquiv.valCompiles_eq
     (h : ContextEquiv (· = ·) rFault (sem₁ p₁) (sem₂ p₂)) :
     Compiles (valLanguage sem₁) (valLanguage sem₂) id p₁ p₂ :=
   (h.toValExactPass_eq).down_refines trivial
+
+/--
+Relational query-scoped specification transfer across `valLanguage`: supports
+custom value relations `rVal` (such as `fun r₁ r₂ : MirReturn => r₁.1 = r₂.1`
+across distinct post-return borrow histories) and distinct value/fault/program
+types whenever `spec₂` is covered by `pre` and respects `BehaviorSet.relImage rVal`.
+-/
+theorem ContextEquivOn.valTransfer_spec_rel
+    {Prog₁ Prog₂ Query Fault₁ Fault₂ Gap Val₁ Val₂ : Type}
+    {pre : Query → Prop} {rVal : Val₁ → Val₂ → Prop} {rFault : Fault₁ → Fault₂ → Prop}
+    {sem₁ : Prog₁ → GapSem Query Fault₁ Gap Val₁}
+    {sem₂ : Prog₂ → GapSem Query Fault₂ Gap Val₂}
+    {p₁ : Prog₁} {p₂ : Prog₂}
+    (h : ContextEquivOn pre rVal rFault (sem₁ p₁) (sem₂ p₂))
+    {spec₁ : (valLanguage sem₁).Behavior} {spec₂ : (valLanguage sem₂).Behavior}
+    (hDef : ∀ q, (spec₂ q).defined → (spec₁ q).defined ∧ pre q)
+    (hRel : ∀ q (hd₁ : (spec₁ q).defined) (hd₂ : (spec₂ q).defined),
+      pre q → BehaviorSet.relImage rVal ((spec₁ q).val hd₁) ≤ (spec₂ q).val hd₂)
+    (h₁ : (valLanguage sem₁).sem p₁ ≤ spec₁) :
+    (valLanguage sem₂).sem p₂ ≤ spec₂ := by
+  intro q hspec₂
+  obtain ⟨hspec₁, hq⟩ := hDef q hspec₂
+  obtain ⟨hd₁, hle₁⟩ := h₁ q hspec₁
+  obtain ⟨hd₂, hle₂⟩ := (h q hq).toValPartial_le hd₁
+  exact ⟨hd₂, fun v₂ hv₂ =>
+    hRel q hspec₁ hspec₂ hq v₂ (BehaviorSet.relImage_monotone rVal hle₁ v₂ (hle₂ v₂ hv₂))⟩
 
 /--
 Query-scoped specification transfer across `valLanguage`: only `ContextEquivOn pre`
@@ -3060,16 +3099,9 @@ theorem ContextEquivOn.valTransfer_spec
     {spec : (valLanguage sem₁).Behavior}
     (hPre : ∀ q, (spec q).defined → pre q)
     (h₁ : (valLanguage sem₁).sem p₁ ≤ spec) :
-    (valLanguage sem₂).sem p₂ ≤ spec := by
-  intro q hspec
-  obtain ⟨hd₁, hle₁⟩ := h₁ q hspec
-  have hq := hPre q hspec
-  have hd₂ : OutcomeSet.OnlyValues (sem₂ p₂ q) := (h q hq).onlyValues_iff.mp hd₁
-  refine ⟨hd₂, fun v hv₂ => ?_⟩
-  obtain ⟨o₁, ho₁, hr⟩ := (h q hq).backward hv₂
-  obtain ⟨v₁, rfl⟩ := hd₁ ho₁
-  cases (hr : v₁ = v)
-  exact hle₁ v ho₁
+    (valLanguage sem₂).sem p₂ ≤ spec :=
+  h.valTransfer_spec_rel (fun q hs => ⟨hs, hPre q hs⟩)
+    (fun _ _ _ _ _ ⟨_, hv₁, heq⟩ => heq ▸ hv₁) h₁
 
 /--
 Transfer any Layer 1A specification (such as `Language.ContractSpec safetyPre
@@ -3216,6 +3248,34 @@ theorem ContextEquiv.abstracts {Prog₁ Prog₂ Query Fault₁ Fault₂ Gap Val�
   fun q => (h.flip q).toPartial_le (fun e₂ e₁ hr hu => (hUB e₁ e₂ hr).mp hu)
 
 /--
+Relational query-scoped specification transfer across `gapLanguage`: supports
+custom value/fault relations `rVal`, `rFault` (with UB reflection) across distinct
+program, value, and fault types.
+-/
+theorem ContextEquivOn.transfer_spec_rel
+    {Prog₁ Prog₂ Query Fault₁ Fault₂ Gap Val₁ Val₂ : Type}
+    {pre : Query → Prop} {rVal : Val₁ → Val₂ → Prop} {rFault : Fault₁ → Fault₂ → Prop}
+    {isUB₁ : Fault₁ → Prop} {isUB₂ : Fault₂ → Prop}
+    {sem₁ : Prog₁ → GapSem Query Fault₁ Gap Val₁}
+    {sem₂ : Prog₂ → GapSem Query Fault₂ Gap Val₂}
+    {p₁ : Prog₁} {p₂ : Prog₂}
+    (hUB : ∀ e₁ e₂, rFault e₁ e₂ → isUB₂ e₂ → isUB₁ e₁)
+    (h : ContextEquivOn pre rVal rFault (sem₁ p₁) (sem₂ p₂))
+    {spec₁ : (gapLanguage isUB₁ sem₁).Behavior} {spec₂ : (gapLanguage isUB₂ sem₂).Behavior}
+    (hDef : ∀ q, (spec₂ q).defined → (spec₁ q).defined ∧ pre q)
+    (hRel : ∀ q (hd₁ : (spec₁ q).defined) (hd₂ : (spec₂ q).defined),
+      pre q → BehaviorSet.relImage (GapEqErr rVal rFault) ((spec₁ q).val hd₁) ≤ (spec₂ q).val hd₂)
+    (h₁ : (gapLanguage isUB₁ sem₁).sem p₁ ≤ spec₁) :
+    (gapLanguage isUB₂ sem₂).sem p₂ ≤ spec₂ := by
+  intro q hspec₂
+  obtain ⟨hspec₁, hq⟩ := hDef q hspec₂
+  obtain ⟨hd₁, hle₁⟩ := h₁ q hspec₁
+  obtain ⟨hd₂, hle₂⟩ := (h q hq).toPartial_le hUB hd₁
+  exact ⟨hd₂, fun o₂ ho₂ =>
+    hRel q hspec₁ hspec₂ hq o₂
+      (BehaviorSet.relImage_monotone (GapEqErr rVal rFault) hle₁ o₂ (hle₂ o₂ ho₂))⟩
+
+/--
 Query-scoped specification transfer across `gapLanguage`: requires `ContextEquivOn pre`
 only on queries where `spec` is defined (`(spec q).defined → pre q`).
 -/
@@ -3226,12 +3286,9 @@ theorem ContextEquivOn.transfer_spec {Prog Query Fault Gap Val : Type}
     {spec : (gapLanguage isUB sem).Behavior}
     (hPre : ∀ q, (spec q).defined → pre q)
     (h₁ : (gapLanguage isUB sem).sem p₁ ≤ spec) :
-    (gapLanguage isUB sem).sem p₂ ≤ spec := by
-  intro q hspec
-  obtain ⟨hd₁, hle₁⟩ := h₁ q hspec
-  obtain ⟨hd₂, hle₂⟩ :=
-    OutcomeSet.toPartial_le_of_subset (isUB := isUB) (h q (hPre q hspec)).superset_of_eq hd₁
-  exact ⟨hd₂, fun o ho => hle₁ o (hle₂ o ho)⟩
+    (gapLanguage isUB sem).sem p₂ ≤ spec :=
+  h.transfer_spec_rel (fun _ _ hr hu => hr ▸ hu) (fun q hs => ⟨hs, hPre q hs⟩)
+    (fun _ _ _ _ _ ⟨_, ho₁, hr⟩ => GapEqErr.eq_iff.mp hr ▸ ho₁) h₁
 
 /--
 Specification transfer: every Layer 1A specification verified for the baseline
