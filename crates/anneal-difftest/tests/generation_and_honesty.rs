@@ -2155,3 +2155,187 @@ fn write_chain_coverage_bound_separates_depth_one_local_writes_from_scheduled_rm
     assert!(certified_walk.is_depth_certified());
     assert_eq!(certified_walk.under_exploration_reason(), None);
 }
+
+#[test]
+fn external_spec_oracle_lockstep_parity_on_lazy_old_padding_eq_mut_helpers_and_multi_callee_schedules()
+{
+    use anneal_difftest::{
+        SpecContractOracleProbe, SpecExternalCallee, SpecParamBinding, SpecPostconditionVerdict,
+        SpecViolationKind,
+    };
+
+    let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+    let state_layout = LayoutSpec::Struct {
+        name: "PaddedSlotBank".to_string(),
+        total_size: 20,
+        fields: vec![
+            FieldLayout {
+                name: "tag".to_string(),
+                offset: 0,
+                layout: LayoutSpec::Scalar(ScalarLayout::u8()),
+            },
+            FieldLayout {
+                name: "slots".to_string(),
+                offset: 4,
+                layout: LayoutSpec::Array {
+                    elem: Box::new(u32_layout.clone()),
+                    elem_stride: 4,
+                    len: 3,
+                },
+            },
+            FieldLayout {
+                name: "framed".to_string(),
+                offset: 16,
+                layout: u32_layout.clone(),
+            },
+        ],
+    };
+
+    // Exercises:
+    // 1. Short-circuit guarded `old(100u32 / denom)` (and Phase-3 FrameViolation priority
+    //    when `corrupt_frame == 1` even if `old(100u32 / denom)` would trap in Phase 4!),
+    // 2. Poison padding (`0xA5`) on `PaddedSlotBank` compared via `*bank == PaddedSlotBank { .. }`
+    //    and `..*bank` struct update,
+    // 3. `&mut` helper writeback (`add_capped(&mut bank.slots[idx], step)`), `/=`, `%=`,
+    //    and single-evaluation `bank.slots[ext_pick_slot() as usize] += 2u32`,
+    // 4. Multi-callee `EnvSchedule` (`ext_pick_slot` + `ext_tick`) with `global_panic_on_call`
+    //    AND 18 calls to `ext_tick` (exceeding any fixed 16-call horizon via `callee_defaults`).
+    let probe = SpecContractOracleProbe::new(
+        "stress_lockstep_parity",
+        vec![
+            SpecParamBinding::mut_ref("bank", "PaddedSlotBank", state_layout)
+                .with_frame_preserved_fields(["tag", "framed"]),
+            SpecParamBinding::by_value("denom", "u32", u32_layout.clone()),
+            SpecParamBinding::by_value("corrupt_frame", "u32", u32_layout.clone()),
+        ],
+        "u32",
+        u32_layout.clone(),
+        "let slot_idx: usize = (ext_pick_slot() & 1u32) as usize;\n\
+         add_capped(&mut bank.slots[slot_idx], 4u32);\n\
+         bank.slots[ext_pick_slot() as usize % 3usize] += 2u32;\n\
+         bank.slots[2] /= 2u32;\n\
+         bank.slots[1] %= 8u32;\n\
+         let mut iter: u32 = 0u32;\n\
+         let mut ticks: u32 = 0u32;\n\
+         while iter < 18u32 {\n    \
+             ticks = ticks.wrapping_add(ext_tick() & 3u32);\n    \
+             iter += 1u32;\n\
+         }\n\
+         if corrupt_frame == 1u32 {\n    \
+             bank.framed = bank.framed.wrapping_add(1u32);\n\
+         }\n\
+         *bank = PaddedSlotBank { slots: bank.slots, ..*bank };\n\
+         ticks",
+    )
+    .with_type_defs(
+        "#[repr(C)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub struct PaddedSlotBank { pub tag: u8, pub slots: [u32; 3], pub framed: u32 }\n\
+         pub fn add_capped(dst: &mut u32, delta: u32) {\n    \
+             *dst = dst.saturating_add(delta);\n\
+         }",
+    )
+    .with_external_callee(SpecExternalCallee::new(
+        "ext_pick_slot",
+        std::iter::empty::<&str>(),
+        "u32",
+        u32_layout.clone(),
+    ))
+    .with_external_callee(SpecExternalCallee::new(
+        "ext_tick",
+        std::iter::empty::<&str>(),
+        "u32",
+        u32_layout,
+    ))
+    .with_requires(
+        "slots_bounded",
+        "bank.slots[0] <= 1000u32 && bank.slots[1] <= 1000u32 && bank.slots[2] <= 1000u32",
+    )
+    .with_ensures(
+        "guarded_old_div",
+        "(corrupt_frame == 0u32 && denom == 0u32) || old(100u32 / denom) <= 100u32",
+    )
+    .with_ensures(
+        "padded_struct_reflexive_eq",
+        "*bank == PaddedSlotBank { tag: old(bank.tag), slots: bank.slots, framed: old(bank.framed) } && result <= 54u32",
+    );
+
+    let make_trial_bytes = |denom: u32, corrupt_frame: u32| -> Vec<u8> {
+        let mut raw = vec![0xA5u8; 28];
+        raw[0] = 4u8;
+        raw[4..8].copy_from_slice(&10u32.to_le_bytes());
+        raw[8..12].copy_from_slice(&19u32.to_le_bytes());
+        raw[12..16].copy_from_slice(&24u32.to_le_bytes());
+        raw[16..20].copy_from_slice(&555u32.to_le_bytes());
+        raw[20..24].copy_from_slice(&denom.to_le_bytes());
+        raw[24..28].copy_from_slice(&corrupt_frame.to_le_bytes());
+        raw
+    };
+
+    let mut base_sched = EnvSchedule::new()
+        .with_callee_return_size("ext_pick_slot", 4)
+        .with_callee_return_size("ext_tick", 4);
+    base_sched.push_callee_response("ext_pick_slot", 0u32.to_le_bytes().to_vec());
+    base_sched.push_callee_response("ext_pick_slot", 1u32.to_le_bytes().to_vec());
+    base_sched.set_callee_default("ext_tick", 1u32.to_le_bytes().to_vec());
+
+    // Trial 0: `denom == 0, corrupt_frame == 0` -> short-circuits `old(100 / denom)`,
+    // runs 18 `ext_tick` default calls + poison-padded struct equality -> `HOLD`.
+    let t0 = (make_trial_bytes(0, 0), Some(base_sched.clone()));
+
+    // Trial 1: `denom == 5, corrupt_frame == 0` -> evaluates `old(100 / 5) == 20 <= 100` -> `HOLD`.
+    let t1 = (make_trial_bytes(5, 0), Some(base_sched.clone()));
+
+    // Trial 2: `denom == 0, corrupt_frame == 1` -> Phase-3 `FrameViolation("bank.framed")`
+    // MUST fire BEFORE Phase-4 `old(100 / 0)` trap!
+    let t2 = (make_trial_bytes(0, 1), Some(base_sched.clone()));
+
+    // Trial 3: `denom == 0, corrupt_frame == 2` -> guard `(corrupt_frame == 0 && denom == 0)`
+    // is false, so Phase-4 `old(100 / 0)` executes and traps -> `TRAP`.
+    let t3 = (make_trial_bytes(0, 2), Some(base_sched.clone()));
+
+    // Trial 4: Multi-callee `global_panic_on_call = Some(2)` (call 0 = `ext_pick_slot`,
+    // call 1 = `ext_pick_slot`, call 2 = 1st `ext_tick`!) -> `TRAP` in both!
+    let mut global_panic_sched = base_sched;
+    global_panic_sched.set_panic_on_call(2);
+    let t4 = (make_trial_bytes(5, 0), Some(global_panic_sched));
+
+    let trials = vec![t0, t1, t2, t3, t4];
+    let report = probe
+        .verify_spec_postcondition_batch(&trials)
+        .expect("evaluate adversarial parity batch");
+
+    assert_eq!(report.verdicts[0], SpecPostconditionVerdict::VerifiedHold);
+    assert_eq!(report.verdicts[1], SpecPostconditionVerdict::VerifiedHold);
+    assert!(matches!(
+        &report.verdicts[2],
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::FrameCondition { param, field },
+            ..
+        } if param == "bank" && field == "framed"
+    ));
+    assert!(matches!(
+        &report.verdicts[3],
+        SpecPostconditionVerdict::PanicOrTrap { .. }
+    ));
+    assert!(matches!(
+        &report.verdicts[4],
+        SpecPostconditionVerdict::PanicOrTrap { .. }
+    ));
+
+    let exe_src = probe
+        .synthesize_rust_executable_harness_with_schedules(&trials)
+        .expect("synthesize adversarial parity harness");
+    assert!(!contains_unsafe_token(&exe_src));
+    let native_lines = compile_and_run_spec_harness("ep2_b1_lockstep_parity", &exe_src);
+    assert_eq!(
+        native_lines,
+        vec![
+            "TRIAL:0:HOLD",
+            "TRIAL:1:HOLD",
+            "TRIAL:2:FRAME:bank.framed",
+            "TRIAL:3:TRAP",
+            "TRIAL:4:TRAP",
+        ]
+    );
+}
