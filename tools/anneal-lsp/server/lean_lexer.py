@@ -985,17 +985,31 @@ def _enclosing_col0_block(stripped: str, pos: int, line_start: int, cmd_re, n: i
     return blk_start, blk_end
 
 
-def _may_have_unclosed_bracket(seg: str) -> bool:
-    """Fast `str.count`/`find`/`rfind` prefilter: True when `seg` may hold an unclosed
-    `(`, `[`, `{`, `⟨` (including after an earlier stray closing bracket)."""
-    for o, c in (("(", ")"), ("[", "]"), ("{", "}"), ("⟨", "⟩")):
-        co = seg.count(o)
-        if co == 0:
+def _may_have_unclosed_bracket(seg: str, bracket_re) -> bool:
+    """True when `seg` has an unclosed `(`, `[`, `{`, or `⟨` at its end under the same stack
+    rules as `_closed_bracket_spans`, with fast C-level `in`/`count` exits."""
+    if "(" not in seg and "[" not in seg and "{" not in seg and "⟨" not in seg:
+        return False
+    if (
+        seg.count("(") > seg.count(")")
+        or seg.count("[") > seg.count("]")
+        or seg.count("{") > seg.count("}")
+        or seg.count("⟨") > seg.count("⟩")
+    ):
+        return True
+    stack: list[str] = []
+    for m in bracket_re.finditer(seg):
+        tok = m.group()
+        if len(tok) != 1:
             continue
-        cc = seg.count(c)
-        if co != cc or seg.rfind(o) > seg.rfind(c) or (cc > 0 and seg.find(c) < seg.find(o)):
-            return True
-    return ("«" in seg or "'" in seg) and any(c in seg for c in "([{⟨")
+        closer = _CLOSER_OF.get(tok)
+        if closer is not None:
+            stack.append(closer)
+        elif stack and stack[-1] == tok:
+            stack.pop()
+        else:
+            stack.clear()
+    return bool(stack)
 
 
 def _scope_keyword_hits(
@@ -1066,7 +1080,9 @@ def _scope_keyword_hits(
         if line_start > 0:
             blk_bounds = _enclosing_col0_block(stripped, p, line_start, decl_boundary_re, n)
             blk_start, blk_end = blk_bounds
-            if blk_start < line_start and _may_have_unclosed_bracket(stripped[blk_start:line_start]):
+            if blk_start < line_start and _may_have_unclosed_bracket(
+                stripped[blk_start:line_start], bracket_re
+            ):
                 if blk_bounds != cached_blk_bounds:
                     cached_blk_bounds = blk_bounds
                     cached_blk_spans = [
@@ -1083,49 +1099,105 @@ def _column_of(stripped: str, pos: int) -> int:
     return pos - (stripped.rfind("\n", 0, pos) + 1)
 
 
+def _outermost_enclosing_comment_open(text: str, stripped: str, k: int) -> int:
+    """When `stripped[k] == " "` blanks a non-space character in `text`, return the opening
+    offset of the outermost `/- ... -/` block comment enclosing `k` (or `-1` if `k` lies
+    inside a string or line comment). Scans forward from the nearest preceding code token so
+    nested `/-`, overlapping `/-/`, `--` comments, and strings match `_scan` exactly."""
+    sync = k - 1
+    while sync >= 0 and stripped[sync] in _WHITESPACE:
+        sync -= 1
+    pos = sync + 1
+    n = len(text)
+    find = text.find
+    while pos <= k:
+        while pos <= k and text[pos] in _WHITESPACE:
+            pos += 1
+        if pos > k:
+            break
+        if text.startswith("--", pos):
+            nl = find("\n", pos + 2)
+            if nl == -1 or nl > k:
+                return -1
+            pos = nl + 1
+            continue
+        if text.startswith("/-", pos):
+            open_pos = pos
+            depth = 1
+            cur = pos + 2
+            while depth > 0 and cur < n:
+                c = find("-/", cur)
+                if c == -1:
+                    cur = n
+                    break
+                o = find("/-", cur, c)
+                if o != -1:
+                    depth += 1
+                    cur = o + 2
+                else:
+                    depth -= 1
+                    cur = c + 2
+            if k < cur:
+                return open_pos
+            pos = cur
+            continue
+        if text[pos] == '"':
+            h = pos
+            while h > 0 and text[h - 1] == "#":
+                h -= 1
+            if (
+                h > 0
+                and text[h - 1] == "r"
+                and (h < 2 or not (is_ident_char(text[h - 2]) or text[h - 2] == "."))
+            ):
+                closer = '"' + "#" * (pos - h)
+                c = find(closer, pos + 1)
+                cur = n if c == -1 else c + len(closer)
+            else:
+                cur = pos + 1
+                while cur < n:
+                    q = find('"', cur)
+                    if q == -1:
+                        cur = n
+                        break
+                    bs = 0
+                    b = q - 1
+                    while b >= pos + 1 and text[b] == "\\":
+                        bs += 1
+                        b -= 1
+                    cur = q + 1
+                    if bs % 2 == 0:
+                        break
+            if k < cur:
+                return -1
+            pos = cur
+            continue
+        pos += 1
+    return -1
+
+
 def _true_line_indent(text: str, stripped: str, line_start: int, first_tok_pos: int) -> int:
     """True visual indentation of the line starting at `line_start` before `first_tok_pos`,
     unaffected by inline or multi-line `/- ... -/` block comments blanked into spaces in
     `stripped`."""
-    if first_tok_pos <= line_start:
-        return 0
-    k = line_start
     n = len(text)
-    limit = first_tok_pos if first_tok_pos < n else n
-    while k < limit and text[k] in " \t":
-        k += 1
-    if k == first_tok_pos or text.startswith("/-", k) or (k < len(stripped) and stripped[k] != " "):
-        return k - line_start
-    # `text[k]` was blanked into spaces by a multi-line block comment opened on an earlier
-    # line. Walk backwards matching nested `-/` and `/-` (ignoring delimiters inside code/
-    # strings/guillemets where `stripped[pos] != " "`) to locate the outermost `/-`.
-    depth = 1
-    cur = k
-    outer_open = -1
-    while cur > 0 and depth > 0:
-        o = text.rfind("/-", 0, cur)
-        if o == -1:
-            break
-        c = text.rfind("-/", o + 2, cur)
-        if c != -1:
-            if stripped[c] == " ":
-                depth += 1
-            cur = c
-        else:
-            if stripped[o] == " ":
-                depth -= 1
-                if depth == 0:
-                    outer_open = o
-                    break
-            cur = o
-    if outer_open != -1:
+    n_st = len(stripped)
+    for _ in range(8):
+        if first_tok_pos <= line_start:
+            return 0
+        k = line_start
+        limit = first_tok_pos if first_tok_pos < n else n
+        while k < limit and text[k] in " \t":
+            k += 1
+        if k == first_tok_pos or (k < n_st and stripped[k] != " "):
+            return k - line_start
+        outer_open = _outermost_enclosing_comment_open(text, stripped, k)
+        if outer_open == -1 or outer_open >= line_start:
+            return k - line_start
         c_line = text.rfind("\n", 0, outer_open) + 1
-        j = c_line
-        while j < outer_open and text[j] in " \t":
-            j += 1
-        if j == outer_open:
-            return outer_open - c_line
-    return k - line_start
+        first_tok_pos = outer_open
+        line_start = c_line
+    return 0
 
 
 def _skip_attrs_and_mods(stripped: str, pos: int) -> int:
@@ -1230,10 +1302,12 @@ def _find_in_governed_end(
 
     if p >= n:
         return in_end, False
-    if stripped.startswith("mutual", p) and (
-        p + 6 >= n or not (is_ident_char(stripped[p + 6]) or stripped[p + 6] == ".")
-    ):
-        return p, True
+    for blk_scope in _SCOPE_KEYWORDS[:3]:  # `namespace`, `section`, `mutual` (non-`in`)
+        klen = len(blk_scope)
+        if stripped.startswith(blk_scope, p) and (
+            p + klen >= n or not (is_ident_char(stripped[p + klen]) or stripped[p + klen] in ".»")
+        ):
+            return p, True
 
     # Check if a second command shares the target command's opening line (e.g. via `;` or an
     # inline `end` / `def` / `namespace` after `:= expr`).
@@ -1464,7 +1538,10 @@ class NamespaceTracker:
                 scopes_list.append(sc)
 
         def flush_pending_up_to(limit_off: int) -> None:
-            while pending_in and pending_in[-1][2] == -1 and pending_in[-1][0] <= limit_off:
+            while pending_in and (
+                (pending_in[-1][2] == -1 and pending_in[-1][0] <= limit_off)
+                or (pending_in[-1][2] == -2 and pending_in[-1][0] < limit_off)
+            ):
                 end_off, count, _, base = pending_in.pop()
                 if len(stack) >= base + count:
                     del stack[base : base + count]
@@ -1528,7 +1605,7 @@ class NamespaceTracker:
             if kw == SCOPE_MUTUAL:
                 for entry in pending_in:
                     if entry[2] == -2 and entry[0] == pos:
-                        entry[2] = pos
+                        entry[2] = len(stack)
                 stack.append((SCOPE_MUTUAL, ""))
                 mutual_starts.append(pos)
                 consumed = after_kw
@@ -1539,8 +1616,8 @@ class NamespaceTracker:
             consumed = name_end
             if kw == "end":
                 # If an `in`-scoped command sits at the top of the stack without an open
-                # `mutual` inside it, an explicit `end` belongs to the enclosing scope, so
-                # close the `in`-scope right before `end`.
+                # governed scope block inside it, an explicit `end` belongs to the enclosing
+                # scope, so close the `in`-scope right before `end`.
                 while (
                     pending_in
                     and pending_in[-1][2] < 0
@@ -1581,23 +1658,25 @@ class NamespaceTracker:
                             f"line {line_of(pos)}: `end {name}` does not match the open "
                             f"{described}"
                         )
-                popped_mutuals: list[int] = []
                 for kind, _ in closing:
                     if kind == SCOPE_MUTUAL and mutual_starts:
-                        popped_mutuals.append(mutual_starts.pop())
+                        mutual_starts.pop()
                 del stack[len(stack) - len(closing) :]
                 record(pos)
-                if popped_mutuals:
-                    popped_set = set(popped_mutuals)
-                    while pending_in and pending_in[-1][2] in popped_set:
-                        _, p_count, _, base = pending_in.pop()
-                        if len(stack) >= base + p_count:
-                            del stack[base : base + p_count]
-                        record(name_end)
+                while pending_in and pending_in[-1][2] >= 0 and len(stack) <= pending_in[-1][2]:
+                    _, p_count, _, base = pending_in.pop()
+                    if len(stack) >= base + p_count:
+                        del stack[base : base + p_count]
+                    record(name_end)
                 continue
 
             if kw == SCOPE_NAMESPACE and not name:
                 violations.append(f"line {line_of(pos)}: `namespace` without a name")
+                while pending_in and pending_in[-1][2] == -2 and pending_in[-1][0] == pos:
+                    _, p_count, _, base = pending_in.pop()
+                    if len(stack) >= base + p_count:
+                        del stack[base : base + p_count]
+                    record(after_kw)
                 continue
 
             in_end = match_in_keyword(name_end)
@@ -1605,19 +1684,22 @@ class NamespaceTracker:
                 consumed = in_end
                 pos_line_start = stripped.rfind("\n", 0, pos) + 1
                 cmd_indent = min(kw_col, _true_line_indent(text, stripped, pos_line_start, pos))
-                end_off, is_mut = _find_in_governed_end(
+                end_off, is_blk = _find_in_governed_end(
                     stripped, in_end, cmd_indent, text=text, quot_spans=quot_spans
                 )
-                if not is_mut and end_off <= in_end:
+                if not is_blk and end_off <= in_end:
                     continue
                 pushed = part_re.findall(name) if name else [""]
                 base = len(stack)
                 for part in pushed:
                     stack.append((kw if name else SCOPE_SECTION, part))
-                pending_in.append([end_off, len(pushed), -2 if is_mut else -1, base])
+                pending_in.append([end_off, len(pushed), -2 if is_blk else -1, base])
                 record(in_end)
                 continue
 
+            for entry in pending_in:
+                if entry[2] == -2 and entry[0] == pos:
+                    entry[2] = len(stack)
             if name:
                 for part in part_re.findall(name):
                     stack.append((kw, part))
