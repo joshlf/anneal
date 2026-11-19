@@ -26,7 +26,7 @@ use cargo_anneal::{
     DifftestOracleReport, DivergenceKind, ItemOracleReport, MiriOracleConfig, MiriOutcome,
     MiriToolchain, NotComparedReason, OracleItemSpec, ScaffoldConfig, SourcePos, SourceSpan,
     aggregate_unit_manifests, build_lake_build_command, compare_miri_and_anneal,
-    derive_item_module_suffix, discover_zero_arg_pub_fns, normalize_path_against,
+    derive_item_module_suffix, normalize_path_against,
     parse_anneal_probe_output, probe_effective_memory_kib, resolve_default_lake_jobs,
     resolve_rustc_wrapper, run_miri_oracle, scaffold_workspace_with_config, source_files_match,
 };
@@ -1101,23 +1101,60 @@ impl StagedLibSource {
             if let Ok(ts) = lib_rs.parse::<proc_macro2::TokenStream>() {
                 collect_panic_macro_starts(ts, &mut panic_macro_starts);
             }
-            for item in &file.items {
-                if let syn::Item::Fn(func) = item {
-                    let name = func.sig.ident.to_string();
-                    let first = func.sig.fn_token.span.start().line;
-                    let last = func.block.brace_token.span.close().end().line;
-                    fn_lines.insert(name.clone(), (first, last));
+            let reexports = parse_stage_ns_reexports_from_items(&file.items);
+            let mut index_fn = |prefix: Option<&str>, func: &syn::ItemFn, allow_overwrite: bool| {
+                let name = func.sig.ident.to_string();
+                if !allow_overwrite && fn_lines.contains_key(&name) {
+                    return;
+                }
+                let first = func.sig.fn_token.span.start().line;
+                let last = func.block.brace_token.span.close().end().line;
+                fn_lines.insert(name.clone(), (first, last));
 
-                    let mut visitor = ScopeVisitor {
-                        stack: vec![ScopeSegment::Named(name.clone())],
-                        scopes: vec![LexicalScope {
-                            start: (first, 1),
-                            end_excl: (last + 1, 1),
-                            segments: vec![ScopeSegment::Named(name.clone())],
-                        }],
-                    };
-                    syn::visit::visit_block(&mut visitor, &func.block);
-                    fn_scopes.insert(name, visitor.scopes);
+                let mut root_segments = Vec::with_capacity(2);
+                if let Some(mod_name) = prefix {
+                    root_segments.push(ScopeSegment::Named(mod_name.to_string()));
+                }
+                root_segments.push(ScopeSegment::Named(name.clone()));
+                let mut visitor = ScopeVisitor {
+                    stack: root_segments.clone(),
+                    scopes: vec![LexicalScope {
+                        start: (first, 1),
+                        end_excl: (last + 1, 1),
+                        segments: root_segments,
+                    }],
+                };
+                syn::visit::visit_block(&mut visitor, &func.block);
+                fn_scopes.insert(name, visitor.scopes);
+            };
+            for item in &file.items {
+                match item {
+                    syn::Item::Fn(func) => index_fn(None, func, true),
+                    syn::Item::Mod(mod_item) => {
+                        let mod_name = mod_item.ident.to_string();
+                        if mod_name.starts_with("stage_ns_")
+                            && let Some((_, mod_items)) = &mod_item.content
+                        {
+                            let mod_has_reexport = reexports.values().any(|m| m == &mod_name);
+                            for sub in mod_items {
+                                if let syn::Item::Fn(func) = sub
+                                    && matches!(func.vis, syn::Visibility::Public(_))
+                                {
+                                    let fn_name = func.sig.ident.to_string();
+                                    if mod_has_reexport {
+                                        if reexports.get(&fn_name).map(String::as_str)
+                                            == Some(mod_name.as_str())
+                                        {
+                                            index_fn(Some(&mod_name), func, true);
+                                        }
+                                    } else {
+                                        index_fn(Some(&mod_name), func, false);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2239,20 +2276,554 @@ fn format_miri_excerpt(outcome: &MiriOutcome, translated_pos: Option<&str>) -> S
     }
 }
 
-fn translate_pos_to_repro(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DedupedAuxLineMap {
+    emitted_start_line: u32,
+    emitted_end_line: u32,
+    repro_item_start_line: u32,
+}
+
+#[derive(Debug, Clone)]
+struct SeenStagedAuxItem {
+    tokens: String,
+    emitted_start_line: u32,
+    emitted_end_line: u32,
+}
+
+fn blank_char_intervals_preserving_lines(
+    src: &str,
+    intervals: &[((usize, usize), (usize, usize))],
+) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut line = 1usize;
+    let mut col = 1usize;
+    for ch in src.chars() {
+        if ch == '\n' {
+            out.push('\n');
+            line += 1;
+            col = 1;
+        } else {
+            let masked = intervals
+                .iter()
+                .any(|&(start, end_excl)| (line, col) >= start && (line, col) < end_excl);
+            out.push(if masked { ' ' } else { ch });
+            col += 1;
+        }
+    }
+    out
+}
+
+fn collect_stage_ns_use_tree(
+    mod_name: &str,
+    tree: &syn::UseTree,
+    map: &mut BTreeMap<String, String>,
+) {
+    match tree {
+        syn::UseTree::Name(n) if n.ident != "self" => {
+            map.insert(n.ident.to_string(), mod_name.to_string());
+        }
+        syn::UseTree::Rename(r) if r.rename != "_" => {
+            map.insert(r.rename.to_string(), mod_name.to_string());
+        }
+        syn::UseTree::Group(g) => {
+            for sub in &g.items {
+                collect_stage_ns_use_tree(mod_name, sub, map);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_stage_ns_reexports_from_items(items: &[syn::Item]) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for item in items {
+        if let syn::Item::Use(u) = item
+            && matches!(u.vis, syn::Visibility::Public(_))
+        {
+            let tree = match &u.tree {
+                syn::UseTree::Path(p) if p.ident == "self" => &*p.tree,
+                other => other,
+            };
+            if let syn::UseTree::Path(p) = tree {
+                let mod_name = p.ident.to_string();
+                if mod_name.starts_with("stage_ns_") {
+                    collect_stage_ns_use_tree(&mod_name, &p.tree, &mut map);
+                }
+            }
+        }
+    }
+    map
+}
+
+fn parse_stage_ns_reexports(lib_rs: &str) -> BTreeMap<String, String> {
+    syn::parse_file(lib_rs)
+        .map(|f| parse_stage_ns_reexports_from_items(&f.items))
+        .unwrap_or_default()
+}
+
+fn collect_non_entry_vis_blanks_matching_name(
+    item: &syn::Item,
+    target_name: &str,
+    out: &mut Vec<((usize, usize), (usize, usize))>,
+) {
+    let push_if_non_inherited =
+        |vis: &syn::Visibility, out: &mut Vec<((usize, usize), (usize, usize))>| {
+            if !matches!(vis, syn::Visibility::Inherited)
+                && let Some(bounds) = node_span_bounds(vis)
+            {
+                out.push(bounds);
+            }
+        };
+    match item {
+        syn::Item::Fn(i) if i.sig.ident == target_name => push_if_non_inherited(&i.vis, out),
+        syn::Item::Const(i) if i.ident == target_name => push_if_non_inherited(&i.vis, out),
+        syn::Item::Static(i) if i.ident == target_name => push_if_non_inherited(&i.vis, out),
+        syn::Item::Struct(i) if i.ident == target_name => push_if_non_inherited(&i.vis, out),
+        syn::Item::Enum(i) if i.ident == target_name => push_if_non_inherited(&i.vis, out),
+        syn::Item::Union(i) if i.ident == target_name => push_if_non_inherited(&i.vis, out),
+        syn::Item::Type(i) if i.ident == target_name => push_if_non_inherited(&i.vis, out),
+        syn::Item::Trait(i) if i.ident == target_name => push_if_non_inherited(&i.vis, out),
+        syn::Item::Mod(i) if i.ident == target_name => push_if_non_inherited(&i.vis, out),
+        syn::Item::ForeignMod(fm) => {
+            for fi in &fm.items {
+                match fi {
+                    syn::ForeignItem::Fn(f) if f.sig.ident == target_name => {
+                        push_if_non_inherited(&f.vis, out);
+                    }
+                    syn::ForeignItem::Static(s) if s.ident == target_name => {
+                        push_if_non_inherited(&s.vis, out);
+                    }
+                    syn::ForeignItem::Type(t) if t.ident == target_name => {
+                        push_if_non_inherited(&t.vis, out);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        syn::Item::Use(u) => {
+            let mut bound = Vec::new();
+            let mut globs = Vec::new();
+            crate::mutators_miri::collect_use_tree_bound_idents(
+                None,
+                &u.tree,
+                &mut bound,
+                &mut globs,
+            );
+            if bound.iter().any(|id| id == target_name) {
+                push_if_non_inherited(&u.vis, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_redundant_preamble_use_tree_blanks(
+    prefix: &str,
+    parent_ident: Option<&syn::Ident>,
+    tree: &syn::UseTree,
+    out: &mut Vec<((usize, usize), (usize, usize))>,
+) {
+    match tree {
+        syn::UseTree::Path(p) => {
+            let next_prefix = if prefix.is_empty() {
+                p.ident.to_string()
+            } else {
+                format!("{prefix}::{}", p.ident)
+            };
+            collect_redundant_preamble_use_tree_blanks(&next_prefix, Some(&p.ident), &p.tree, out);
+        }
+        syn::UseTree::Group(g) => {
+            for pair in g.items.pairs() {
+                let (sub, comma) = pair.into_tuple();
+                if crate::mutators_miri::use_subtree_is_redundant_with_preamble(
+                    prefix,
+                    parent_ident,
+                    sub,
+                ) {
+                    if let Some(b) = node_span_bounds(sub) {
+                        out.push(b);
+                    }
+                    if let Some(c) = comma
+                        && let Some(cb) = node_span_bounds(c)
+                    {
+                        out.push(cb);
+                    }
+                } else {
+                    collect_redundant_preamble_use_tree_blanks(prefix, parent_ident, sub, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn head_unqualified_type_ident(mut ty: &syn::Type) -> Option<String> {
+    loop {
+        match ty {
+            syn::Type::Paren(p) => ty = &p.elem,
+            syn::Type::Group(g) => ty = &g.elem,
+            syn::Type::Path(tp)
+                if tp.qself.is_none()
+                    && tp.path.leading_colon.is_none()
+                    && tp.path.segments.len() == 1 =>
+            {
+                return Some(tp.path.segments[0].ident.to_string());
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn seed_seen_staged_aux_from_preamble() -> BTreeMap<String, SeenStagedAuxItem> {
+    let mut seen = BTreeMap::new();
+    let repro_prefix = format!("{MIRI_CORPUS_CRATE_HEADER}\n{MIRI_CORPUS_MODULE_PREAMBLE}\n");
+    if let Ok(parsed) = syn::parse_file(&repro_prefix) {
+        for item in &parsed.items {
+            let keys = crate::mutators_miri::aux_item_namespace_keys(item);
+            if keys.is_empty() {
+                continue;
+            }
+            let Some((start, end_excl)) = node_span_bounds(item) else {
+                continue;
+            };
+            let tokens = quote::ToTokens::to_token_stream(item).to_string();
+            let entry = SeenStagedAuxItem {
+                tokens,
+                emitted_start_line: start.0 as u32,
+                emitted_end_line: end_excl.0 as u32,
+            };
+            for key in keys {
+                seen.insert(key, entry.clone());
+            }
+        }
+    }
+    seen
+}
+
+/// Stage `cand.fn_source` into a multi-candidate crate at `batch_start_line`:
+/// - When every non-entry auxiliary item in `cand` either introduces fresh
+///   namespace keys (disjoint from `reserved_entry_names`) or matches an
+///   earlier item's exact token stream, identical duplicates are blanked in
+///   place (recording [`DedupedAuxLineMap`] entries) and new items + `val:<fn>`
+///   are recorded in `seen_aux`.
+/// - When any auxiliary item collides with an earlier crate-root/preamble item
+///   or a batch entry function name, `cand` is wrapped in `pub mod stage_ns_<n>`:
+///   using `use super::*;` by default (`eff_start = batch_start_line + 1`), or
+///   inlining `MIRI_CORPUS_MODULE_PREAMBLE` when a conflicting `impl` attaches
+///   to a non-local preamble type so `E0592`/`E0119` cannot occur. Any `pub`
+///   visibility on a non-entry item inside `stage_ns_<n>` sharing `cand.fn_name`
+///   is blanked in place so `pub use stage_ns_<n>::<fn>;` exports only `val:<fn>`.
+#[cfg(test)]
+fn stage_candidate_source_for_batch(
+    cand: &GeneratedMiriCandidate,
+    batch_start_line: u32,
+    repro_start_line: u32,
+    seen_aux: &mut BTreeMap<String, SeenStagedAuxItem>,
+    next_stage_ns: &mut usize,
+) -> (String, u32, Vec<DedupedAuxLineMap>) {
+    stage_candidate_source_for_batch_with_reserved(
+        cand,
+        batch_start_line,
+        repro_start_line,
+        seen_aux,
+        next_stage_ns,
+        &BTreeSet::new(),
+    )
+}
+
+fn stage_candidate_source_for_batch_with_reserved(
+    cand: &GeneratedMiriCandidate,
+    batch_start_line: u32,
+    repro_start_line: u32,
+    seen_aux: &mut BTreeMap<String, SeenStagedAuxItem>,
+    next_stage_ns: &mut usize,
+    reserved_entry_names: &BTreeSet<String>,
+) -> (String, u32, Vec<DedupedAuxLineMap>) {
+    let trimmed = cand.fn_source.trim();
+    let Ok(parsed) = syn::parse_file(trimmed) else {
+        return (trimmed.to_string(), batch_start_line, Vec::new());
+    };
+    let mut local_type_defs = BTreeSet::new();
+    let mut local_trait_defs = BTreeSet::new();
+    for item in &parsed.items {
+        match item {
+            syn::Item::Struct(s) => {
+                local_type_defs.insert(s.ident.to_string());
+            }
+            syn::Item::Enum(e) => {
+                local_type_defs.insert(e.ident.to_string());
+            }
+            syn::Item::Union(u) => {
+                local_type_defs.insert(u.ident.to_string());
+            }
+            syn::Item::Trait(t) => {
+                local_trait_defs.insert(t.ident.to_string());
+            }
+            _ => {}
+        }
+    }
+    struct AuxCandidateEntry {
+        keys: Vec<String>,
+        start: (usize, usize),
+        end_excl: (usize, usize),
+        local_start: u32,
+        emitted_start: u32,
+        emitted_end: u32,
+        tokens: String,
+        is_non_local_impl: bool,
+    }
+    let mut entries = Vec::new();
+    let mut has_conflict = seen_aux.contains_key(&format!("val:{}", cand.fn_name));
+    let mut needs_isolated_preamble = false;
+    for item in &parsed.items {
+        if let syn::Item::Fn(func) = item
+            && func.sig.ident == cand.fn_name
+        {
+            continue;
+        }
+        let keys = crate::mutators_miri::aux_item_namespace_keys(item);
+        if keys.is_empty() {
+            continue;
+        }
+        let Some((start, end_excl)) = node_span_bounds(item) else {
+            continue;
+        };
+        let local_start = start.0 as u32;
+        let local_end = end_excl.0 as u32;
+        let emitted_start = batch_start_line + local_start.saturating_sub(1);
+        let emitted_end = batch_start_line + local_end.saturating_sub(1);
+        let tokens = quote::ToTokens::to_token_stream(item).to_string();
+        let is_non_local_impl = if let syn::Item::Impl(im) = item {
+            let self_is_local = head_unqualified_type_ident(&im.self_ty)
+                .is_some_and(|id| local_type_defs.contains(&id));
+            let trait_is_local = im.trait_.as_ref().is_some_and(|(_, tp, _)| {
+                tp.leading_colon.is_none()
+                    && tp.segments.len() == 1
+                    && local_trait_defs.contains(&tp.segments[0].ident.to_string())
+            });
+            !(self_is_local || trait_is_local)
+        } else {
+            false
+        };
+        let collides_reserved_entry = keys.iter().any(|k| {
+            k.strip_prefix("val:")
+                .or_else(|| k.strip_prefix("ty:"))
+                .or_else(|| k.strip_prefix("mac:"))
+                .is_some_and(|id| id == cand.fn_name || reserved_entry_names.contains(id))
+        });
+        let exact_match_in_seen = keys
+            .iter()
+            .all(|k| seen_aux.get(k).is_some_and(|prev| !prev.tokens.is_empty() && prev.tokens == tokens));
+        let collides_seen = keys
+            .iter()
+            .any(|k| seen_aux.get(k).is_some_and(|prev| prev.tokens != tokens));
+        let collides_prior_non_local_impl = is_non_local_impl
+            && !exact_match_in_seen
+            && seen_aux.contains_key("__meta:non_local_impl");
+        if collides_reserved_entry || collides_seen || collides_prior_non_local_impl {
+            has_conflict = true;
+        }
+        entries.push(AuxCandidateEntry {
+            keys,
+            start,
+            end_excl,
+            local_start,
+            emitted_start,
+            emitted_end,
+            tokens,
+            is_non_local_impl,
+        });
+    }
+    if has_conflict && entries.iter().any(|e| e.is_non_local_impl) {
+        needs_isolated_preamble = true;
+    }
+    let reserve_entry_val = |seen: &mut BTreeMap<String, SeenStagedAuxItem>, line: u32| {
+        seen.entry(format!("val:{}", cand.fn_name))
+            .or_insert_with(|| SeenStagedAuxItem {
+                tokens: String::new(),
+                emitted_start_line: line,
+                emitted_end_line: line,
+            });
+    };
+    if has_conflict {
+        let ns_idx = *next_stage_ns;
+        *next_stage_ns += 1;
+        let mut vis_blanks = Vec::new();
+        for item in &parsed.items {
+            if let syn::Item::Fn(func) = item
+                && func.sig.ident == cand.fn_name
+            {
+                continue;
+            }
+            collect_non_entry_vis_blanks_matching_name(item, &cand.fn_name, &mut vis_blanks);
+        }
+        let ns_body = if vis_blanks.is_empty() {
+            trimmed.to_string()
+        } else {
+            blank_char_intervals_preserving_lines(trimmed, &vis_blanks)
+        };
+        reserve_entry_val(seen_aux, batch_start_line);
+        if needs_isolated_preamble {
+            let preamble_seen = seed_seen_staged_aux_from_preamble();
+            let mut iso_blanks = vis_blanks;
+            for item in &parsed.items {
+                if let syn::Item::Fn(func) = item
+                    && func.sig.ident == cand.fn_name
+                {
+                    continue;
+                }
+                if let syn::Item::Use(u) = item {
+                    if crate::mutators_miri::use_subtree_is_redundant_with_preamble(
+                        "", None, &u.tree,
+                    ) {
+                        if let Some(bounds) = node_span_bounds(item) {
+                            iso_blanks.push(bounds);
+                        }
+                    } else {
+                        collect_redundant_preamble_use_tree_blanks(
+                            "",
+                            None,
+                            &u.tree,
+                            &mut iso_blanks,
+                        );
+                    }
+                    continue;
+                }
+                let keys = crate::mutators_miri::aux_item_namespace_keys(item);
+                if keys.is_empty() {
+                    continue;
+                }
+                let tokens = quote::ToTokens::to_token_stream(item).to_string();
+                let redundant_with_preamble = keys.iter().all(|k| {
+                    preamble_seen
+                        .get(k)
+                        .is_some_and(|prev| !prev.tokens.is_empty() && prev.tokens == tokens)
+                });
+                if redundant_with_preamble && let Some(bounds) = node_span_bounds(item) {
+                    iso_blanks.push(bounds);
+                }
+            }
+            let iso_body = if iso_blanks.is_empty() {
+                trimmed.to_string()
+            } else {
+                blank_char_intervals_preserving_lines(trimmed, &iso_blanks)
+            };
+            let ns_header =
+                format!("pub mod stage_ns_{ns_idx} {{\n{MIRI_CORPUS_MODULE_PREAMBLE}\n");
+            let header_newlines = ns_header.bytes().filter(|&b| b == b'\n').count() as u32;
+            let eff_start = batch_start_line + header_newlines;
+            let repro_preamble_start = format!("{MIRI_CORPUS_CRATE_HEADER}\n")
+                .bytes()
+                .filter(|&b| b == b'\n')
+                .count() as u32
+                + 1;
+            let wrapped = format!(
+                "{ns_header}{iso_body}\n}} pub use stage_ns_{ns_idx}::{};",
+                cand.fn_name
+            );
+            return (
+                wrapped,
+                eff_start,
+                vec![DedupedAuxLineMap {
+                    emitted_start_line: batch_start_line + 1,
+                    emitted_end_line: eff_start.saturating_sub(1),
+                    repro_item_start_line: repro_preamble_start,
+                }],
+            );
+        }
+        for entry in &entries {
+            if entry.is_non_local_impl {
+                for key in &entry.keys {
+                    seen_aux.insert(
+                        key.clone(),
+                        SeenStagedAuxItem {
+                            tokens: String::new(),
+                            emitted_start_line: entry.emitted_start + 1,
+                            emitted_end_line: entry.emitted_end + 1,
+                        },
+                    );
+                }
+            }
+        }
+        let wrapped = format!(
+            "pub mod stage_ns_{ns_idx} {{ use super::*;\n{ns_body}\n}} pub use stage_ns_{ns_idx}::{};",
+            cand.fn_name
+        );
+        return (wrapped, batch_start_line + 1, Vec::new());
+    }
+
+    let mut blank_intervals = Vec::new();
+    let mut aux_maps = Vec::new();
+    for entry in entries {
+        if let Some(prev) = entry.keys.iter().find_map(|k| seen_aux.get(k)).cloned() {
+            blank_intervals.push((entry.start, entry.end_excl));
+            aux_maps.push(DedupedAuxLineMap {
+                emitted_start_line: prev.emitted_start_line,
+                emitted_end_line: prev.emitted_end_line,
+                repro_item_start_line: repro_start_line + entry.local_start.saturating_sub(1),
+            });
+        } else {
+            let record = SeenStagedAuxItem {
+                tokens: entry.tokens,
+                emitted_start_line: entry.emitted_start,
+                emitted_end_line: entry.emitted_end,
+            };
+            if entry.is_non_local_impl {
+                seen_aux.insert("__meta:non_local_impl".to_string(), record.clone());
+            }
+            for key in entry.keys {
+                seen_aux.insert(key, record.clone());
+            }
+        }
+    }
+    reserve_entry_val(seen_aux, batch_start_line);
+    if blank_intervals.is_empty() {
+        (trimmed.to_string(), batch_start_line, aux_maps)
+    } else {
+        (
+            blank_char_intervals_preserving_lines(trimmed, &blank_intervals),
+            batch_start_line,
+            aux_maps,
+        )
+    }
+}
+
+fn translate_line_to_repro_with_aux(
+    line: u32,
+    batch_start_line: u32,
+    repro_start_line: u32,
+    aux_maps: &[DedupedAuxLineMap],
+) -> u32 {
+    if let Some(m) = aux_maps
+        .iter()
+        .find(|m| line >= m.emitted_start_line && line <= m.emitted_end_line)
+    {
+        m.repro_item_start_line + (line - m.emitted_start_line)
+    } else if line >= batch_start_line {
+        // Subtract before adding: `batch_start_line` may be smaller than
+        // `repro_start_line` (for example when the span already comes from a
+        // single-candidate run), and `u32` cannot represent a negative delta.
+        line - batch_start_line + repro_start_line
+    } else {
+        line
+    }
+}
+
+fn translate_pos_to_repro_with_aux(
     pos: &SourcePos,
     batch_start_line: u32,
     repro_start_line: u32,
+    aux_maps: &[DedupedAuxLineMap],
 ) -> SourcePos {
     if source_files_match(&pos.file, "src/lib.rs") {
-        let line = if pos.line >= batch_start_line {
-            pos.line - batch_start_line + repro_start_line
-        } else {
-            pos.line
-        };
         SourcePos {
             file: "src/lib.rs".to_string(),
-            line,
+            line: translate_line_to_repro_with_aux(
+                pos.line,
+                batch_start_line,
+                repro_start_line,
+                aux_maps,
+            ),
             col: pos.col,
         }
     } else {
@@ -2260,32 +2831,37 @@ fn translate_pos_to_repro(
     }
 }
 
-fn translate_span_to_repro(
+#[cfg(test)]
+fn translate_pos_to_repro(
+    pos: &SourcePos,
+    batch_start_line: u32,
+    repro_start_line: u32,
+) -> SourcePos {
+    translate_pos_to_repro_with_aux(pos, batch_start_line, repro_start_line, &[])
+}
+
+fn translate_span_to_repro_with_aux(
     span: &SourceSpan,
     batch_start_line: u32,
     repro_start_line: u32,
+    aux_maps: &[DedupedAuxLineMap],
 ) -> SourceSpan {
     if source_files_match(&span.file, "src/lib.rs") {
-        // Subtract before adding: `batch_start_line` may be smaller than
-        // `repro_start_line` (for example when the span already comes from a
-        // single-candidate run), and `u32` cannot represent a negative delta.
-        // Lines below `batch_start_line` (preamble lines or `end_line == 0`)
-        // stay at their original line numbers.
-        let start_line = if span.start_line >= batch_start_line {
-            span.start_line - batch_start_line + repro_start_line
-        } else {
-            span.start_line
-        };
-        let end_line = if span.end_line >= batch_start_line {
-            span.end_line - batch_start_line + repro_start_line
-        } else {
-            span.end_line
-        };
         SourceSpan {
             file: "src/lib.rs".to_string(),
-            start_line,
+            start_line: translate_line_to_repro_with_aux(
+                span.start_line,
+                batch_start_line,
+                repro_start_line,
+                aux_maps,
+            ),
             start_col: span.start_col,
-            end_line,
+            end_line: translate_line_to_repro_with_aux(
+                span.end_line,
+                batch_start_line,
+                repro_start_line,
+                aux_maps,
+            ),
             end_col: span.end_col,
         }
     } else {
@@ -2293,11 +2869,45 @@ fn translate_span_to_repro(
     }
 }
 
+#[cfg(test)]
+fn translate_span_to_repro(
+    span: &SourceSpan,
+    batch_start_line: u32,
+    repro_start_line: u32,
+) -> SourceSpan {
+    translate_span_to_repro_with_aux(span, batch_start_line, repro_start_line, &[])
+}
+
 fn extract_mir_neighborhood(corpus_root: &Path, crate_camel: &str, fn_name: &str) -> String {
-    let mir_path = corpus_root
-        .join(".anneal/generated/Mir")
-        .join(crate_camel)
-        .join(format!("{fn_name}.lean"));
+    let crate_mir_dir = corpus_root.join(".anneal/generated/Mir").join(crate_camel);
+    let reexported_ns_path = fs::read_to_string(corpus_root.join("src/lib.rs"))
+        .ok()
+        .and_then(|src| parse_stage_ns_reexports(&src).remove(fn_name))
+        .map(|ns| crate_mir_dir.join(format!("{ns}_{fn_name}.lean")))
+        .filter(|p| p.is_file());
+    let direct_path = crate_mir_dir.join(format!("{fn_name}.lean"));
+    let mir_path = if let Some(ns_path) = reexported_ns_path {
+        ns_path
+    } else if direct_path.is_file() {
+        direct_path
+    } else {
+        let suffix = format!("_{fn_name}.lean");
+        let mut ns_matches: Vec<PathBuf> = fs::read_dir(&crate_mir_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|res| res.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .and_then(|n| n.strip_prefix("stage_ns_"))
+                    .and_then(|n| n.strip_suffix(&suffix))
+                    .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+            })
+            .collect();
+        ns_matches.sort();
+        ns_matches.into_iter().next().unwrap_or(direct_path)
+    };
     let Ok(raw) = fs::read_to_string(&mir_path) else {
         return format!("(Mir module {} not found)", mir_path.display());
     };
@@ -2504,6 +3114,56 @@ impl<'ast> syn::visit::Visit<'ast> for FnAndAuxCollector<'_> {
         syn::visit::visit_item_macro(self, mac);
     }
 
+    fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
+        self.aux_tokens
+            .entry(item.ident.to_string())
+            .or_default()
+            .push(quote::ToTokens::to_token_stream(item));
+        syn::visit::visit_item_static(self, item);
+    }
+
+    fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
+        if !item.ident.to_string().starts_with("__ANNEAL_MODEL_") {
+            self.aux_tokens
+                .entry(item.ident.to_string())
+                .or_default()
+                .push(quote::ToTokens::to_token_stream(item));
+        }
+        syn::visit::visit_item_const(self, item);
+    }
+
+    fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+        self.aux_tokens
+            .entry(item.ident.to_string())
+            .or_default()
+            .push(quote::ToTokens::to_token_stream(item));
+        syn::visit::visit_item_struct(self, item);
+    }
+
+    fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+        self.aux_tokens
+            .entry(item.ident.to_string())
+            .or_default()
+            .push(quote::ToTokens::to_token_stream(item));
+        syn::visit::visit_item_enum(self, item);
+    }
+
+    fn visit_item_union(&mut self, item: &'ast syn::ItemUnion) {
+        self.aux_tokens
+            .entry(item.ident.to_string())
+            .or_default()
+            .push(quote::ToTokens::to_token_stream(item));
+        syn::visit::visit_item_union(self, item);
+    }
+
+    fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+        self.aux_tokens
+            .entry(item.ident.to_string())
+            .or_default()
+            .push(quote::ToTokens::to_token_stream(item));
+        syn::visit::visit_item_type(self, item);
+    }
+
     fn visit_item_impl(&mut self, imp: &'ast syn::ItemImpl) {
         let mut self_idents = BTreeSet::new();
         collect_ident_tokens(
@@ -2545,32 +3205,121 @@ fn collect_fn_and_aux_items(
     }
 }
 
-/// Compute `(reached_fns, reached_aux)` for `items`: the set of functions in
-/// `fn_bodies` and the set of auxiliary type/macro names in `aux_tokens`
-/// transitively reached from `items`.
-fn staged_fns_and_aux_reachable_from_candidates(
-    lib_rs: &str,
-    items: &[OracleItemSpec],
-) -> (BTreeSet<String>, BTreeSet<String>) {
-    let mut fn_bodies: BTreeMap<String, proc_macro2::TokenStream> = BTreeMap::new();
-    let mut aux_tokens: BTreeMap<String, Vec<proc_macro2::TokenStream>> = BTreeMap::new();
-    let mut impl_method_names: BTreeSet<String> = BTreeSet::new();
+#[derive(Default)]
+struct ScopeGraphData {
+    fn_bodies: BTreeMap<String, proc_macro2::TokenStream>,
+    aux_tokens: BTreeMap<String, Vec<proc_macro2::TokenStream>>,
+    impl_method_names: BTreeSet<String>,
+    top_level_fns: BTreeSet<String>,
+    defined_value_names: BTreeSet<String>,
+    defined_type_names: BTreeSet<String>,
+    defined_macro_names: BTreeSet<String>,
+    inherits_super: bool,
+}
+
+fn record_scope_defined_names(items: &[syn::Item], graph: &mut ScopeGraphData) {
+    for item in items {
+        if let syn::Item::Fn(func) = item {
+            graph.top_level_fns.insert(func.sig.ident.to_string());
+        }
+        for key in crate::mutators_miri::aux_item_namespace_keys(item) {
+            if let Some(v) = key.strip_prefix("val:") {
+                graph.defined_value_names.insert(v.to_string());
+            } else if let Some(t) = key.strip_prefix("ty:") {
+                graph.defined_type_names.insert(t.to_string());
+            } else if let Some(m) = key.strip_prefix("mac:") {
+                graph.defined_macro_names.insert(m.to_string());
+            }
+        }
+    }
+}
+
+struct ScopedReachability {
+    root: ScopeGraphData,
+    stage_ns: BTreeMap<String, ScopeGraphData>,
+    reexports: BTreeMap<String, String>,
+    reached_fns_by_scope: BTreeMap<Option<String>, BTreeSet<String>>,
+    reached_aux_by_scope: BTreeMap<Option<String>, BTreeSet<String>>,
+    active_scopes: BTreeSet<Option<String>>,
+}
+
+fn mod_items_use_super_glob(items: &[syn::Item]) -> bool {
+    items.iter().any(|it| {
+        if let syn::Item::Use(u) = it
+            && let syn::UseTree::Path(p) = &u.tree
+        {
+            p.ident == "super" && matches!(&*p.tree, syn::UseTree::Glob(_))
+        } else {
+            false
+        }
+    })
+}
+
+fn compute_scoped_reachability(lib_rs: &str, items: &[OracleItemSpec]) -> ScopedReachability {
+    let mut root = ScopeGraphData::default();
+    let mut stage_ns: BTreeMap<String, ScopeGraphData> = BTreeMap::new();
+    let mut reexports = BTreeMap::new();
+
     if let Ok(file) = syn::parse_file(lib_rs) {
+        reexports = parse_stage_ns_reexports_from_items(&file.items);
+        let mut root_items: Vec<syn::Item> = Vec::new();
+        for item in file.items {
+            match item {
+                syn::Item::Mod(mod_item)
+                    if mod_item.ident.to_string().starts_with("stage_ns_")
+                        && mod_item.content.is_some() =>
+                {
+                    let mod_name = mod_item.ident.to_string();
+                    let sub_items = mod_item.content.map(|(_, v)| v).unwrap_or_default();
+                    let mut ns_data = ScopeGraphData {
+                        inherits_super: mod_items_use_super_glob(&sub_items),
+                        ..ScopeGraphData::default()
+                    };
+                    record_scope_defined_names(&sub_items, &mut ns_data);
+                    collect_fn_and_aux_items(
+                        &sub_items,
+                        &mut ns_data.fn_bodies,
+                        &mut ns_data.aux_tokens,
+                        &mut ns_data.impl_method_names,
+                    );
+                    stage_ns.insert(mod_name, ns_data);
+                }
+                other => {
+                    root_items.push(other);
+                }
+            }
+        }
+        record_scope_defined_names(&root_items, &mut root);
         collect_fn_and_aux_items(
-            &file.items,
-            &mut fn_bodies,
-            &mut aux_tokens,
-            &mut impl_method_names,
+            &root_items,
+            &mut root.fn_bodies,
+            &mut root.aux_tokens,
+            &mut root.impl_method_names,
         );
     }
-    let item_seeds: Vec<String> = items
-        .iter()
-        .map(|spec| spec.name.clone())
-        .filter(|name| fn_bodies.contains_key(name))
-        .collect();
-    let mut worklist: Vec<String> = if !item_seeds.is_empty() {
-        item_seeds
-    } else {
+
+    let mut worklist: Vec<(Option<String>, String)> = Vec::new();
+    for spec in items {
+        if let Some(ns) = reexports.get(&spec.name) {
+            if stage_ns
+                .get(ns)
+                .is_some_and(|g| g.fn_bodies.contains_key(&spec.name))
+            {
+                worklist.push((Some(ns.clone()), spec.name.clone()));
+                continue;
+            }
+        }
+        if root.fn_bodies.contains_key(&spec.name) {
+            worklist.push((None, spec.name.clone()));
+        } else if let Some((ns, _)) = stage_ns
+            .iter()
+            .find(|(_, g)| g.fn_bodies.contains_key(&spec.name))
+        {
+            worklist.push((Some(ns.clone()), spec.name.clone()));
+        }
+    }
+
+    if worklist.is_empty() {
         let candidate_portion = lib_rs
             .split_once(MIRI_CORPUS_MODULE_PREAMBLE)
             .map_or(lib_rs, |(_, rest)| rest);
@@ -2578,34 +3327,132 @@ fn staged_fns_and_aux_reachable_from_candidates(
         if let Ok(tokens) = candidate_portion.parse::<proc_macro2::TokenStream>() {
             collect_ident_tokens(tokens, &mut mentioned);
         }
-        mentioned
-            .into_iter()
-            .filter(|name| fn_bodies.contains_key(name) || aux_tokens.contains_key(name))
-            .collect()
-    };
-    let mut visited_nodes = BTreeSet::new();
-    let mut reached_fns = BTreeSet::new();
-    let mut reached_aux = BTreeSet::new();
-    while let Some(name) = worklist.pop() {
-        if !visited_nodes.insert(name.clone()) {
-            continue;
-        }
-        let mut callees = BTreeSet::new();
-        if let Some(body_ts) = fn_bodies.get(&name) {
-            reached_fns.insert(name.clone());
-            collect_ident_tokens(body_ts.clone(), &mut callees);
-        }
-        if let Some(aux_list) = aux_tokens.get(&name) {
-            reached_aux.insert(name.clone());
-            for ts in aux_list {
-                collect_ident_tokens(ts.clone(), &mut callees);
+        for name in mentioned {
+            if root.fn_bodies.contains_key(&name) || root.aux_tokens.contains_key(&name) {
+                worklist.push((None, name));
             }
         }
-        worklist.extend(callees.into_iter().filter(|callee| {
-            (fn_bodies.contains_key(callee) || aux_tokens.contains_key(callee))
-                && !visited_nodes.contains(callee)
-        }));
     }
+
+    let mut visited: BTreeSet<(Option<String>, String)> = BTreeSet::new();
+    let mut reached_fns_by_scope: BTreeMap<Option<String>, BTreeSet<String>> = BTreeMap::new();
+    let mut reached_aux_by_scope: BTreeMap<Option<String>, BTreeSet<String>> = BTreeMap::new();
+    let mut active_scopes: BTreeSet<Option<String>> = BTreeSet::new();
+
+    while let Some((scope, name)) = worklist.pop() {
+        if !visited.insert((scope.clone(), name.clone())) {
+            continue;
+        }
+        match &scope {
+            Some(ns) => {
+                let Some(ns_graph) = stage_ns.get(ns) else {
+                    continue;
+                };
+                let defined_in_ns =
+                    ns_graph.fn_bodies.contains_key(&name) || ns_graph.aux_tokens.contains_key(&name);
+                if defined_in_ns {
+                    active_scopes.insert(scope.clone());
+                    let mut callees = BTreeSet::new();
+                    if let Some(body_ts) = ns_graph.fn_bodies.get(&name) {
+                        reached_fns_by_scope
+                            .entry(scope.clone())
+                            .or_default()
+                            .insert(name.clone());
+                        collect_ident_tokens(body_ts.clone(), &mut callees);
+                    }
+                    if let Some(aux_list) = ns_graph.aux_tokens.get(&name) {
+                        reached_aux_by_scope
+                            .entry(scope.clone())
+                            .or_default()
+                            .insert(name.clone());
+                        for ts in aux_list {
+                            collect_ident_tokens(ts.clone(), &mut callees);
+                        }
+                    }
+                    for callee in callees {
+                        let next = (scope.clone(), callee);
+                        if !visited.contains(&next) {
+                            worklist.push(next);
+                        }
+                    }
+                }
+                if ns_graph.inherits_super {
+                    let inherits_root_val = !ns_graph.defined_value_names.contains(&name)
+                        && root.fn_bodies.contains_key(&name);
+                    let inherits_root_aux = !ns_graph.defined_type_names.contains(&name)
+                        && !ns_graph.defined_macro_names.contains(&name)
+                        && root.aux_tokens.contains_key(&name);
+                    if inherits_root_val || inherits_root_aux {
+                        let root_node = (None, name);
+                        if !visited.contains(&root_node) {
+                            worklist.push(root_node);
+                        }
+                    }
+                }
+            }
+            None => {
+                if !root.fn_bodies.contains_key(&name) && !root.aux_tokens.contains_key(&name) {
+                    continue;
+                }
+                active_scopes.insert(None);
+                let mut callees = BTreeSet::new();
+                if let Some(body_ts) = root.fn_bodies.get(&name) {
+                    reached_fns_by_scope
+                        .entry(None)
+                        .or_default()
+                        .insert(name.clone());
+                    collect_ident_tokens(body_ts.clone(), &mut callees);
+                }
+                if let Some(aux_list) = root.aux_tokens.get(&name) {
+                    reached_aux_by_scope
+                        .entry(None)
+                        .or_default()
+                        .insert(name.clone());
+                    for ts in aux_list {
+                        collect_ident_tokens(ts.clone(), &mut callees);
+                    }
+                }
+                for callee in callees {
+                    if (root.fn_bodies.contains_key(&callee) || root.aux_tokens.contains_key(&callee))
+                        && !visited.contains(&(None, callee.clone()))
+                    {
+                        worklist.push((None, callee));
+                    }
+                }
+            }
+        }
+    }
+
+    ScopedReachability {
+        root,
+        stage_ns,
+        reexports,
+        reached_fns_by_scope,
+        reached_aux_by_scope,
+        active_scopes,
+    }
+}
+
+/// Compute `(reached_fns, reached_aux)` for `items`: the union across reached
+/// scopes of functions and auxiliary type/macro names transitively reached from `items`.
+#[cfg(test)]
+fn staged_fns_and_aux_reachable_from_candidates(
+    lib_rs: &str,
+    items: &[OracleItemSpec],
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let scoped = compute_scoped_reachability(lib_rs, items);
+    let reached_fns = scoped
+        .reached_fns_by_scope
+        .values()
+        .flatten()
+        .cloned()
+        .collect();
+    let reached_aux = scoped
+        .reached_aux_by_scope
+        .values()
+        .flatten()
+        .cloned()
+        .collect();
     (reached_fns, reached_aux)
 }
 
@@ -2621,6 +3468,7 @@ fn staged_fns_and_aux_reachable_from_candidates(
 /// functions in `lib_rs`, the worklist starts from identifiers in the text after
 /// [`MIRI_CORPUS_MODULE_PREAMBLE`] (or the whole crate if the preamble is not
 /// embedded verbatim).
+#[cfg(test)]
 fn staged_helper_fns_reachable_from_candidates(
     lib_rs: &str,
     items: &[OracleItemSpec],
@@ -3169,22 +4017,43 @@ fn ensure_rustc_wrapper(
 /// 2. `helper_module_suffixes`: deduplicated, deterministically sorted list of intra-crate
 ///    helper callee suffixes (such as `MiriDiffCorpus.helper_add_ten`), strictly excluding
 ///    all root candidates in `items`.
+#[cfg(test)]
 fn partition_subject_callees(
     crate_camel: &str,
     subject_pairs: &[(String, String)],
     items: &[OracleItemSpec],
+) -> (BTreeMap<String, String>, Vec<String>) {
+    partition_subject_callees_with_reexports(crate_camel, subject_pairs, items, &BTreeMap::new())
+}
+
+fn partition_subject_callees_with_reexports(
+    crate_camel: &str,
+    subject_pairs: &[(String, String)],
+    items: &[OracleItemSpec],
+    reexports: &BTreeMap<String, String>,
 ) -> (BTreeMap<String, String>, Vec<String>) {
     let spec_names: BTreeSet<&str> = items.iter().map(|i| i.name.as_str()).collect();
     let mut captured_candidates: BTreeMap<String, String> = BTreeMap::new();
     let mut helpers: BTreeSet<String> = BTreeSet::new();
 
     for (short, suffix) in subject_pairs {
-        let expected_top_suffix = format!("{crate_camel}.{short}");
+        let expected_suffix = match reexports.get(short) {
+            Some(ns) => format!("{crate_camel}.{ns}_{short}"),
+            None => format!("{crate_camel}.{short}"),
+        };
         if spec_names.contains(short.as_str()) {
-            if suffix == &expected_top_suffix || !captured_candidates.contains_key(short) {
+            if suffix == &expected_suffix {
+                if let Some(prev) = captured_candidates.insert(short.clone(), suffix.clone())
+                    && prev != *suffix
+                {
+                    helpers.insert(prev);
+                }
+            } else if !captured_candidates.contains_key(short) && !reexports.contains_key(short) {
                 captured_candidates.insert(short.clone(), suffix.clone());
+            } else {
+                helpers.insert(suffix.clone());
             }
-            if suffix != &expected_top_suffix {
+            if suffix != &expected_suffix {
                 helpers.insert(suffix.clone());
             }
         } else {
@@ -3200,22 +4069,23 @@ fn partition_subject_callees(
     (captured_candidates, helpers.into_iter().collect())
 }
 
+fn split_stage_ns_rel(rel: &str) -> Option<(&str, &str)> {
+    let trimmed = rel.trim_start_matches('_');
+    let after_prefix = trimmed.strip_prefix("stage_ns_")?;
+    let digit_len = after_prefix
+        .bytes()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    if digit_len == 0 || after_prefix.as_bytes().get(digit_len) != Some(&b'_') {
+        return None;
+    }
+    let ns_len = "stage_ns_".len() + digit_len;
+    Some((&trimmed[..ns_len], &after_prefix[digit_len + 1..]))
+}
+
 /// Subset of the batch's `helper_module_suffixes` that `MiriOracleConfirm.lean`
-/// links for `entries`.
-///
-/// - An `impl` method on a self type in `aux_tokens` (such as
-///   `<Crate>.<SelfTy>_as_core_ops_Drop_drop`) is kept only when `<SelfTy>` is
-///   transitively reached from `entries`, so one candidate's `Drop` impl never
-///   causes `MiriOracleConfirm.lean` to link unrelated `Drop` impls from other
-///   candidates or the preamble.
-/// - An item nested inside a top-level function `<enclosing>` (such as a nested
-///   `fn` or closure `<Crate>.<enclosing>.<inner>` / `<Crate>.<enclosing>__closure_0`)
-///   is kept only when `<enclosing>` itself is in `entries` or transitively
-///   reached from `entries`.
-/// - Any other helper is kept when its short name is transitively reached from
-///   `entries` ([`staged_helper_fns_reachable_from_candidates`]), or when its
-///   short name is not a source function or `impl` method in `lib_rs` (such as
-///   a derive-generated trait impl or shim).
+/// links for `entries`, keeping crate-root (`None`) and `stage_ns_<n>` scopes
+/// strictly isolated unless `stage_ns_<n>` reaches an unshadowed `super::*` item.
 fn confirm_helper_module_suffixes(
     lib_rs: &str,
     crate_camel: &str,
@@ -3223,83 +4093,133 @@ fn confirm_helper_module_suffixes(
     helper_module_suffixes: &[String],
     entries: &[OracleItemSpec],
 ) -> Vec<String> {
-    let (entry_reachable_fns, entry_reachable_aux) =
-        staged_fns_and_aux_reachable_from_candidates(lib_rs, entries);
-    let mut source_fns: BTreeMap<String, proc_macro2::TokenStream> = BTreeMap::new();
-    let mut aux_tokens: BTreeMap<String, Vec<proc_macro2::TokenStream>> = BTreeMap::new();
-    let mut impl_method_names: BTreeSet<String> = BTreeSet::new();
-    let mut top_level_fns: BTreeSet<String> = BTreeSet::new();
-    if let Ok(file) = syn::parse_file(lib_rs) {
-        for item in &file.items {
-            if let syn::Item::Fn(func) = item {
-                top_level_fns.insert(func.sig.ident.to_string());
-            }
-        }
-        collect_fn_and_aux_items(
-            &file.items,
-            &mut source_fns,
-            &mut aux_tokens,
-            &mut impl_method_names,
-        );
-    }
+    let scoped = compute_scoped_reachability(lib_rs, entries);
     let crate_prefix = format!("{crate_camel}.");
-    let enclosing_top_fn = |short: &str, suffix: &str| -> Option<String> {
-        let top_suffix = format!("{crate_camel}.{short}");
-        if suffix == top_suffix {
-            return None;
-        }
-        let rel = suffix.strip_prefix(&crate_prefix)?;
-        if let Some((first, _)) = rel.split_once('.')
-            && top_level_fns.contains(first)
-        {
-            return Some(first.to_string());
-        }
-        if short.starts_with("{closure")
-            && let Some((prefix, _)) = rel.rsplit_once("__closure")
-            && top_level_fns.contains(prefix)
-        {
-            return Some(prefix.to_string());
-        }
-        if let Some(prefix) = rel.strip_suffix(&format!("_{short}"))
-            && top_level_fns.contains(prefix)
-        {
-            return Some(prefix.to_string());
-        }
-        None
-    };
-    let matching_impl_self_ty = |short: &str, suffix: &str| -> Option<String> {
-        let rel = suffix.strip_prefix(&crate_prefix)?;
-        let rel_trimmed = rel.trim_start_matches('_');
-        aux_tokens
-            .keys()
-            .filter(|self_ty| {
-                rel_trimmed.starts_with(&format!("{self_ty}_as_"))
-                    || rel_trimmed.starts_with(&format!("{self_ty}."))
-                    || rel_trimmed == format!("{self_ty}_{short}")
-            })
-            .max_by_key(|self_ty| self_ty.len())
-            .cloned()
-    };
+    let empty_set: BTreeSet<String> = BTreeSet::new();
 
     helper_module_suffixes
         .iter()
         .filter(|suffix| {
+            let target_scope: Option<String> = suffix
+                .strip_prefix(&crate_prefix)
+                .and_then(split_stage_ns_rel)
+                .map(|(ns, _)| ns.to_string());
+            let Some(scope_graph) = (match &target_scope {
+                Some(ns) => scoped.stage_ns.get(ns),
+                None => Some(&scoped.root),
+            }) else {
+                return false;
+            };
+            if !scoped.active_scopes.contains(&target_scope) {
+                return false;
+            }
+            let scope_fns = scoped
+                .reached_fns_by_scope
+                .get(&target_scope)
+                .unwrap_or(&empty_set);
+            let scope_aux = scoped
+                .reached_aux_by_scope
+                .get(&target_scope)
+                .unwrap_or(&empty_set);
+
+            let enclosing_top_fn = |short: &str, suf: &str| -> Option<String> {
+                let mut rel = suf.strip_prefix(&crate_prefix)?;
+                while let Some((_, rest)) = split_stage_ns_rel(rel) {
+                    rel = rest;
+                }
+                if rel == short {
+                    return None;
+                }
+                if let Some((first, _)) = rel.split_once('.')
+                    && scope_graph.top_level_fns.contains(first)
+                {
+                    return Some(first.to_string());
+                }
+                if short.starts_with("{closure")
+                    && let Some((prefix, _)) = rel.rsplit_once("__closure")
+                    && scope_graph.top_level_fns.contains(prefix)
+                {
+                    return Some(prefix.to_string());
+                }
+                if let Some(prefix) = rel.strip_suffix(&format!("_{short}"))
+                    && scope_graph.top_level_fns.contains(prefix)
+                {
+                    return Some(prefix.to_string());
+                }
+                None
+            };
+            let matching_impl_self_ty = |short: &str, suf: &str| -> Option<String> {
+                let mut cur = suf.strip_prefix(&crate_prefix)?;
+                while let Some((_, rest)) = split_stage_ns_rel(cur) {
+                    cur = rest;
+                }
+                let rel_trimmed = cur.trim_start_matches('_');
+                if rel_trimmed == short {
+                    return None;
+                }
+                let mut candidate_types: BTreeSet<&String> =
+                    scope_graph.aux_tokens.keys().collect();
+                if target_scope.is_some() && scope_graph.inherits_super {
+                    for root_ty in scoped.root.aux_tokens.keys() {
+                        if !scope_graph.defined_type_names.contains(root_ty) {
+                            candidate_types.insert(root_ty);
+                        }
+                    }
+                }
+                candidate_types
+                    .into_iter()
+                    .filter(|self_ty| {
+                        rel_trimmed.starts_with(&format!("{self_ty}_"))
+                            || rel_trimmed.starts_with(&format!("{self_ty}."))
+                    })
+                    .max_by_key(|self_ty| self_ty.len())
+                    .cloned()
+            };
+            let entry_is_in_target_scope = |entry_name: &str| -> bool {
+                match (&target_scope, scoped.reexports.get(entry_name)) {
+                    (Some(ns), Some(exp_ns)) => ns == exp_ns,
+                    (Some(ns), None) => {
+                        !scoped.root.fn_bodies.contains_key(entry_name)
+                            && scope_graph.fn_bodies.contains_key(entry_name)
+                            && scoped
+                                .stage_ns
+                                .iter()
+                                .find(|(_, g)| g.fn_bodies.contains_key(entry_name))
+                                .is_some_and(|(first_ns, _)| first_ns == ns)
+                    }
+                    (None, Some(_)) => false,
+                    (None, None) => scoped.root.fn_bodies.contains_key(entry_name),
+                }
+            };
+
             subject_pairs
                 .iter()
                 .filter(|(_, s)| s == *suffix)
                 .any(|(short, _)| {
-                    if let Some(self_ty) = matching_impl_self_ty(short, suffix) {
-                        return entry_reachable_aux.contains(&self_ty);
-                    }
-                    let is_opaque =
-                        !source_fns.contains_key(short) && !impl_method_names.contains(short);
+                    let is_opaque = !scope_graph.fn_bodies.contains_key(short)
+                        && !scope_graph.impl_method_names.contains(short);
                     if let Some(enclosing) = enclosing_top_fn(short, suffix) {
-                        let enclosing_reached = entries.iter().any(|s| s.name == enclosing)
-                            || entry_reachable_fns.contains(&enclosing);
-                        return enclosing_reached
-                            && (entry_reachable_fns.contains(short) || is_opaque);
+                        let ambiguous_with_type_impl = scope_graph
+                            .defined_type_names
+                            .contains(&enclosing)
+                            && scope_graph.impl_method_names.contains(short);
+                        if !ambiguous_with_type_impl {
+                            let enclosing_reached = entries
+                                .iter()
+                                .any(|s| s.name == enclosing && entry_is_in_target_scope(&s.name))
+                                || scope_fns.contains(&enclosing);
+                            return enclosing_reached && (scope_fns.contains(short) || is_opaque);
+                        }
                     }
-                    entry_reachable_fns.contains(short) || is_opaque
+                    if let Some(self_ty) = matching_impl_self_ty(short, suffix) {
+                        let root_aux = scoped.reached_aux_by_scope.get(&None).unwrap_or(&empty_set);
+                        let reached_via_super = target_scope.is_some()
+                            && scope_graph.inherits_super
+                            && !scope_graph.defined_type_names.contains(&self_ty)
+                            && root_aux.contains(&self_ty);
+                        return scope_aux.contains(&self_ty) || reached_via_super;
+                    }
+                    scope_fns.contains(short) || is_opaque
                 })
         })
         .cloned()
@@ -4855,8 +5775,10 @@ fn run_linked_difftest_oracle_pipeline(
     let lib_rs = fs::read_to_string(&lib_rs_path)
         .map_err(|err| format!("failed to read {}: {}", lib_rs_path.display(), err))?;
     // Model-marked (`__ANNEAL_MODEL_<name>`) helper functions are linked as
-    // intra-crate callees exactly when the evaluated items reach them.
-    let reachable_helpers = staged_helper_fns_reachable_from_candidates(&lib_rs, items);
+    // intra-crate callees exactly when the evaluated items reach them in their
+    // enclosing scope (`None` for crate root, `Some("stage_ns_<n>")` for
+    // conflict-isolated namespaces).
+    let scoped_reach = compute_scoped_reachability(&lib_rs, items);
 
     let subject_records: Vec<_> = records
         .iter()
@@ -4871,7 +5793,17 @@ fn run_linked_difftest_oracle_pipeline(
                     .rsplit("::")
                     .next()
                     .unwrap_or(&r.target.def_id);
-                return reachable_helpers.contains(short);
+                let model_scope = r
+                    .target
+                    .def_id
+                    .split("::")
+                    .nth(1)
+                    .filter(|seg| seg.starts_with("stage_ns_") && *seg != short)
+                    .map(str::to_string);
+                return scoped_reach
+                    .reached_fns_by_scope
+                    .get(&model_scope)
+                    .is_some_and(|fns| fns.contains(short));
             }
             false
         })
@@ -4902,8 +5834,12 @@ fn run_linked_difftest_oracle_pipeline(
         })
         .collect();
 
-    let (captured_candidates, helper_module_suffixes) =
-        partition_subject_callees(&crate_camel, &subject_pairs, items);
+    let (captured_candidates, helper_module_suffixes) = partition_subject_callees_with_reexports(
+        &crate_camel,
+        &subject_pairs,
+        items,
+        &scoped_reach.reexports,
+    );
 
     let mut present_items: Vec<(OracleItemSpec, String)> = Vec::new();
     let mut anneal_outcomes: BTreeMap<String, AnnealOutcome> = BTreeMap::new();
@@ -5273,25 +6209,27 @@ fn run_linked_difftest_oracle_pipeline(
 
 fn discover_reproducer_candidate_fn(source: &str) -> Option<String> {
     if let Ok(parsed) = syn::parse_file(source) {
+        let local_models = crate::mutators_miri::model_marked_names_in_file(&parsed);
         let mut pub_zero_arg = Vec::new();
         for item in parsed.items {
             if let syn::Item::Fn(func) = item
                 && matches!(func.vis, syn::Visibility::Public(_))
+                && func.sig.asyncness.is_none()
                 && func.sig.inputs.is_empty()
+                && crate::mutators_miri::is_zero_arg_callable_generics(&func.sig.generics)
             {
                 let name = func.sig.ident.to_string();
-                if !crate::mutators_miri::is_corpus_helper_fn_name(&name) {
+                if !crate::mutators_miri::is_helper_fn_name_in_set(&name, &local_models) {
                     pub_zero_arg.push(name);
                 }
             }
         }
-        if let Some(last) = pub_zero_arg.pop() {
-            return Some(last);
-        }
+        return pub_zero_arg.pop();
     }
-    discover_zero_arg_pub_fns(source)
+    let local_models = crate::mutators_miri::model_marked_names_in_source_text(source);
+    crate::mutators_miri::discover_top_level_zero_arg_pub_fns_in_source_text(source)
         .into_iter()
-        .filter(|name| !crate::mutators_miri::is_corpus_helper_fn_name(name))
+        .filter(|name| !crate::mutators_miri::is_helper_fn_name_in_set(name, &local_models))
         .last()
 }
 
@@ -5490,7 +6428,25 @@ pub fn evaluate_miri_batches_with_options(
 
     let mut staged_lib_rs = repro_prefix;
     let mut item_specs: Vec<OracleItemSpec> = Vec::with_capacity(compiled_candidates);
-    let mut cand_by_name: BTreeMap<String, (&GeneratedMiriCandidate, u32)> = BTreeMap::new();
+    let mut cand_by_name: BTreeMap<
+        String,
+        (&GeneratedMiriCandidate, u32, Vec<DedupedAuxLineMap>),
+    > = BTreeMap::new();
+    let mut seen_staged_aux: BTreeMap<String, SeenStagedAuxItem> =
+        seed_seen_staged_aux_from_preamble();
+    let mut next_stage_ns = 0usize;
+
+    let reserved_entry_names: BTreeSet<String> = batches
+        .iter()
+        .zip(&compile_results)
+        .flat_map(|(batch, flags)| {
+            batch
+                .iter()
+                .zip(flags)
+                .filter(|(_, ok)| **ok)
+                .map(|(cand, _)| cand.fn_name.clone())
+        })
+        .collect();
 
     for (b_idx, batch) in batches.iter().enumerate() {
         for (c_idx, cand) in batch.iter().enumerate() {
@@ -5498,7 +6454,16 @@ pub fn evaluate_miri_batches_with_options(
                 continue;
             }
             let batch_start_line = staged_lib_rs.lines().count() as u32 + 1;
-            staged_lib_rs.push_str(cand.fn_source.trim());
+            let (staged_cand_src, eff_batch_start_line, aux_maps) =
+                stage_candidate_source_for_batch_with_reserved(
+                    cand,
+                    batch_start_line,
+                    repro_start_line,
+                    &mut seen_staged_aux,
+                    &mut next_stage_ns,
+                    &reserved_entry_names,
+                );
+            staged_lib_rs.push_str(&staged_cand_src);
             staged_lib_rs.push_str("\n\n");
             let candidate_fuel = if mode == "identity" {
                 DEFAULT_ORACLE_FUEL
@@ -5509,7 +6474,7 @@ pub fn evaluate_miri_batches_with_options(
                 cand.fn_name.clone(),
                 candidate_fuel,
             ));
-            cand_by_name.insert(cand.fn_name.clone(), (cand, batch_start_line));
+            cand_by_name.insert(cand.fn_name.clone(), (cand, eff_batch_start_line, aux_maps));
         }
     }
 
@@ -5595,7 +6560,7 @@ pub fn evaluate_miri_batches_with_options(
                 NotComparedReason::CaptureFailed(_) => "not_compared_capture_failed".to_string(),
             },
         };
-        let template_and_chain = if let Some((cand, _)) = cand_by_name.get(&item_rep.name) {
+        let template_and_chain = if let Some((cand, _, _)) = cand_by_name.get(&item_rep.name) {
             if cand.applied_mutators.is_empty() {
                 format!("{}@identity", cand.seed_name)
             } else {
@@ -5670,7 +6635,7 @@ pub fn evaluate_miri_batches_with_options(
                         fn_name: item_rep.name.clone(),
                         seed_name: cand_by_name
                             .get(&item_rep.name)
-                            .map(|(cand, _)| cand.seed_name.clone())
+                            .map(|(cand, _, _)| cand.seed_name.clone())
                             .unwrap_or_default(),
                         batch_miri_pos,
                         anneal_span: item_rep.anneal.span().map(SourceSpan::display_short),
@@ -5719,7 +6684,7 @@ pub fn evaluate_miri_batches_with_options(
                 *divergence_classes.entry(class_slug.clone()).or_insert(0) += 1;
                 let mut item_kernel_confirmed = item_rep.kernel_confirmed;
 
-                if let Some((cand, batch_start_line)) = cand_by_name.get(&item_rep.name) {
+                if let Some((cand, batch_start_line, aux_maps)) = cand_by_name.get(&item_rep.name) {
                     let (shrink_res, shrink_status) = shrink_divergent_miri_candidate(
                         cand,
                         &shrink_seed_refs,
@@ -5735,10 +6700,10 @@ pub fn evaluate_miri_batches_with_options(
                     let eff_item_rep = reduced.map_or(item_rep, |sr| &sr.minimized_report);
                     item_kernel_confirmed = eff_item_rep.kernel_confirmed;
                     let eff_cand = reduced.map_or(*cand, |sr| &sr.minimized_candidate);
-                    let eff_start_line = if reduced.is_some() {
-                        repro_start_line
+                    let (eff_start_line, eff_aux_maps) = if reduced.is_some() {
+                        (repro_start_line, &[][..])
                     } else {
-                        *batch_start_line
+                        (*batch_start_line, aux_maps.as_slice())
                     };
 
                     let raw_miri_pos = match &eff_item_rep.miri {
@@ -5754,13 +6719,27 @@ pub fn evaluate_miri_batches_with_options(
                         _ => None,
                     };
                     let repro_miri_pos = raw_miri_pos
-                        .map(|p| translate_pos_to_repro(p, eff_start_line, repro_start_line))
+                        .map(|p| {
+                            translate_pos_to_repro_with_aux(
+                                p,
+                                eff_start_line,
+                                repro_start_line,
+                                eff_aux_maps,
+                            )
+                        })
                         .map(|p| p.display_short());
 
                     let raw_anneal_span = eff_item_rep.anneal.span();
                     let batch_anneal_span = item_rep.anneal.span().map(SourceSpan::display_short);
                     let repro_anneal_span = raw_anneal_span
-                        .map(|s| translate_span_to_repro(s, eff_start_line, repro_start_line))
+                        .map(|s| {
+                            translate_span_to_repro_with_aux(
+                                s,
+                                eff_start_line,
+                                repro_start_line,
+                                eff_aux_maps,
+                            )
+                        })
                         .map(|s| s.display_short());
 
                     let miri_outcome_tag = match &eff_item_rep.miri {
@@ -12093,6 +13072,907 @@ pub fn cand_shadow() -> u32 {
             offenders.is_empty(),
             "process-environment mutation in anneal-difftest sources:\n{}",
             offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn discover_reproducer_candidate_fn_honors_file_local_model_markers() {
+        // 1. Standalone minimal reproducer reusing a Category 11 probe name without
+        //    `__ANNEAL_MODEL_*` must be discovered rather than globally blocklisted.
+        let minimal_repro = "\
+#![no_std]
+pub fn pass_copy_nonoverlapping_same_tag_disjoint_array_halves() -> u32 {
+    30u32
+}
+";
+        assert_eq!(
+            discover_reproducer_candidate_fn(minimal_repro).as_deref(),
+            Some("pass_copy_nonoverlapping_same_tag_disjoint_array_halves")
+        );
+
+        // 2. Preamble-backed reproducer skips model-marked preamble probes and picks
+        //    the candidate function, even when a custom file-local model-marked
+        //    helper follows it.
+        let with_preamble_and_trailing_model = format!(
+            "{MIRI_CORPUS_CRATE_HEADER}\n{MIRI_CORPUS_MODULE_PREAMBLE}\n\
+             pub fn cand_under_test() -> u32 {{ 42u32 }}\n\
+             pub const __ANNEAL_MODEL_trailing_zero_arg_helper: &str = \"trailing_zero_arg_helper\";\n\
+             pub fn trailing_zero_arg_helper() -> u32 {{ 99u32 }}\n"
+        );
+        assert_eq!(
+            discover_reproducer_candidate_fn(&with_preamble_and_trailing_model).as_deref(),
+            Some("cand_under_test")
+        );
+
+        // 3. When every zero-arg `pub fn` in a parseable file is model-marked,
+        //    discovery must return `None` rather than falling through to the
+        //    regex fallback and returning a file-local model helper.
+        let only_local_models = "\
+#![no_std]
+pub const __ANNEAL_MODEL_only_helper_a: () = ();
+pub fn only_helper_a() -> u32 { 1u32 }
+pub const __ANNEAL_MODEL_alias_b: &str = \"only_helper_b\";
+pub fn only_helper_b() -> u32 { 2u32 }
+";
+        assert_eq!(discover_reproducer_candidate_fn(only_local_models), None);
+
+        // 4. The non-`syn` fallback path (triggered by syntax `syn` rejects)
+        //    still honors file-local `__ANNEAL_MODEL_*` markers, ignores
+        //    commented-out markers, and allows unmarked Category 11 probe names.
+        let fallback_src = "\
+#![no_std]
+// pub const __ANNEAL_MODEL_pass_copy_nonoverlapping_same_tag_disjoint_array_halves: () = ();
+pub fn pass_copy_nonoverlapping_same_tag_disjoint_array_halves() -> u32 { @@@ }
+pub const __ANNEAL_MODEL_fallback_helper: &str = \"fallback_helper\";
+pub fn fallback_helper() -> u32 { 0u32 }
+";
+        assert!(syn::parse_file(fallback_src).is_err());
+        assert_eq!(
+            discover_reproducer_candidate_fn(fallback_src).as_deref(),
+            Some("pass_copy_nonoverlapping_same_tag_disjoint_array_halves")
+        );
+
+        // 5. `staged_helper_fns_reachable_from_candidates` traverses `static`
+        //    and `const` initializers so model-marked `const fn` helpers only
+        //    referenced via a `static` are still linked when reached.
+        let via_static = "\
+#![no_std]
+pub const __ANNEAL_MODEL_const_init_helper: &str = \"const_init_helper\";
+pub const fn const_init_helper() -> u32 { 7u32 }
+pub static VIA_STATIC: u32 = const_init_helper();
+pub fn cand_reads_static() -> u32 { VIA_STATIC }
+pub const __ANNEAL_MODEL_unreached_helper: () = ();
+pub fn unreached_helper() -> u32 { 9u32 }
+";
+        let reached = staged_helper_fns_reachable_from_candidates(
+            via_static,
+            &[OracleItemSpec::with_fuel("cand_reads_static".to_string(), 64)],
+        );
+        assert!(reached.contains("const_init_helper"), "{reached:?}");
+        assert!(!reached.contains("unreached_helper"), "{reached:?}");
+
+        // 6. `FnAndAuxCollector` traverses `struct`, `enum`, `union`, and `type`
+        //    declarations so transitive `Drop` impls (`UnwindCleanupGuard`) and
+        //    `const fn` array-length helpers reached via ADTs/type aliases are
+        //    linked into `reached_fns` / `reached_aux`.
+        let via_adt_and_type = "\
+#![no_std]
+pub struct UnwindCleanupGuard {
+    pub counter: *mut u32,
+}
+impl Drop for UnwindCleanupGuard {
+    fn drop(&mut self) {}
+}
+pub const __ANNEAL_MODEL_adt_len_helper: &str = \"adt_len_helper\";
+pub const fn adt_len_helper() -> usize { 4usize }
+pub struct FixedBuf(pub [u8; adt_len_helper()]);
+pub enum MaybeCleanup {
+    Empty,
+    Armed(UnwindCleanupGuard),
+}
+pub union RawSlot {
+    pub buf: core::mem::ManuallyDrop<FixedBuf>,
+    pub raw: u32,
+}
+pub type CleanupAlias = MaybeCleanup;
+pub fn cand_touches_alias_and_union() -> u32 {
+    let _a: CleanupAlias = MaybeCleanup::Empty;
+    let u = RawSlot { raw: 5u32 };
+    unsafe { u.raw }
+}
+";
+        let (adt_fns, adt_aux) = staged_fns_and_aux_reachable_from_candidates(
+            via_adt_and_type,
+            &[OracleItemSpec::with_fuel(
+                "cand_touches_alias_and_union".to_string(),
+                64,
+            )],
+        );
+        assert!(adt_fns.contains("adt_len_helper"), "{adt_fns:?}");
+        assert!(adt_aux.contains("UnwindCleanupGuard"), "{adt_aux:?}");
+
+        // 7. Non-`syn` fallback discovery ignores `pub fn` and `__ANNEAL_MODEL_*`
+        //    inside string/raw-string literals and block comments, while honoring
+        //    same-line `#[inline(never)] pub const fn` / `pub extern \"C\" fn`.
+        let fallback_strings_and_attrs = "\
+#![no_std]
+const SPOOF: &str = \"/* not a comment\npub const __ANNEAL_MODEL_real_cand: () = ();\npub fn fake_cand() {}\";
+const RAW_SPOOF: &str = r#\"pub fn fake_raw_cand() {}\"#;
+#[inline(never)] pub extern \"C\" fn real_cand() -> u32 { @@@ }
+pub const __ANNEAL_MODEL_raw_alias: &str = r#\"attr_helper\"#;
+#[inline(never)] pub const fn attr_helper() -> u32 { 7u32 }
+";
+        assert!(syn::parse_file(fallback_strings_and_attrs).is_err());
+        assert_eq!(
+            discover_reproducer_candidate_fn(fallback_strings_and_attrs).as_deref(),
+            Some("real_cand")
+        );
+
+        // 8. Multi-candidate batch staging deduplicates identical seed-local
+        //    auxiliary items (`struct`, `__ANNEAL_MODEL_*`, helper `fn`) across
+        //    candidates without `E0428`, preserves candidate body line numbers,
+        //    and translates helper-interior spans back into `repro.rs` lines.
+        let seed_with_local_aux = "\
+pub struct SeedPair {
+    pub a: u32,
+    pub b: u32,
+}
+pub const __ANNEAL_MODEL_seed_local_helper: &str = \"seed_local_helper\";
+pub fn seed_local_helper(p: SeedPair) -> u32 {
+    p.a.wrapping_add(p.b)
+}
+pub fn pass_seed_uses_local_aux() -> u32 {
+    seed_local_helper(SeedPair { a: 10u32, b: 20u32 })
+}
+";
+        let unrelated_seed = "pub fn pass_unrelated_scalar() -> u32 { 5u32 }\n";
+        let mut batch_cands =
+            crate::mutators_miri::generate_miri_batch(&[unrelated_seed], 1, 0xB2_0001);
+        let aux_cands =
+            crate::mutators_miri::generate_miri_batch(&[seed_with_local_aux], 2, 0xB2_0002);
+        batch_cands.extend(aux_cands);
+
+        let repro_start_line = 500u32;
+        let mut staged = (0..repro_start_line - 1)
+            .map(|_| "// pre")
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let mut seen = BTreeMap::new();
+        let mut next_ns = 0usize;
+        let mut staged_meta = Vec::new();
+        for cand in &batch_cands {
+            let b_start = staged.lines().count() as u32 + 1;
+            let (text, eff_start, maps) = stage_candidate_source_for_batch(
+                cand,
+                b_start,
+                repro_start_line,
+                &mut seen,
+                &mut next_ns,
+            );
+            staged.push_str(&text);
+            staged.push_str("\n\n");
+            staged_meta.push((eff_start, maps));
+        }
+        let parsed_staged = syn::parse_file(&staged).expect("staged crate must parse cleanly");
+        let helper_defs = parsed_staged
+            .items
+            .iter()
+            .filter(|it| matches!(it, syn::Item::Fn(f) if f.sig.ident == "seed_local_helper"))
+            .count();
+        let struct_defs = parsed_staged
+            .items
+            .iter()
+            .filter(|it| matches!(it, syn::Item::Struct(s) if s.ident == "SeedPair"))
+            .count();
+        assert_eq!(helper_defs, 1, "duplicate helper fn in staged crate");
+        assert_eq!(struct_defs, 1, "duplicate struct in staged crate");
+        assert_eq!(next_ns, 0, "identical aux items must dedupe without stage_ns");
+
+        let (b1_start, b1_maps) = &staged_meta[1];
+        let (b2_start, b2_maps) = &staged_meta[2];
+        assert!(b1_maps.is_empty(), "first aux copy is emitted intact");
+        assert_eq!(b2_maps.len(), 3, "second aux copy blanks struct+const+fn");
+
+        let helper_body_batch_line = b1_start + 6;
+        let translated_pos = translate_pos_to_repro_with_aux(
+            &SourcePos {
+                file: "src/lib.rs".to_string(),
+                line: helper_body_batch_line,
+                col: 5,
+            },
+            *b2_start,
+            repro_start_line,
+            b2_maps,
+        );
+        assert_eq!(translated_pos.line, repro_start_line + 6);
+
+        // 9. Conflicting aux items across candidates (redefined `SeedPair` /
+        //    `seed_local_helper`, cross-kind `enum SeedPair` collision, or preamble
+        //    shadowing) isolate into `pub mod stage_ns_<n> { use super::*; ... }`
+        //    without `E0428`, index panic-macro frames under `stage_ns_<n>`,
+        //    locate `stage_ns_<n>_<fn>.lean` MIR neighborhoods, isolate confirm
+        //    helpers across namespaces, and translate lines with zero drift.
+        let conflicting_fn_src = "\
+pub struct SeedPair {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+}
+fn seed_local_helper(p: SeedPair) -> u32 {
+    assert!(p.x == 0u32, \"stage_ns panic check\");
+    p.x ^ p.y ^ p.z
+}
+pub fn panic_conflicting_aux_cand() -> u32 {
+    assert!(false, \"entry stage_ns panic\");
+    seed_local_helper(SeedPair { x: 1u32, y: 2u32, z: 3u32 })
+}
+";
+        let conflicting_cand = GeneratedMiriCandidate {
+            id: 99,
+            seed_index: 0,
+            seed_name: "panic_conflicting_aux_cand".to_string(),
+            fn_name: "panic_conflicting_aux_cand".to_string(),
+            seed_u64: 0xC16_A299,
+            applied_mutators: Vec::new(),
+            tracked_locals: Vec::new(),
+            fn_source: conflicting_fn_src.to_string(),
+            source: crate::mutators_miri::build_standalone_candidate_source(conflicting_fn_src),
+        };
+        let mut full_staged =
+            format!("{MIRI_CORPUS_CRATE_HEADER}\n{MIRI_CORPUS_MODULE_PREAMBLE}\n");
+        let real_repro_start = full_staged.lines().count() as u32 + 1;
+        let mut full_seen = seed_seen_staged_aux_from_preamble();
+        let mut full_ns = 0usize;
+        for cand in batch_cands.iter().chain(std::iter::once(&conflicting_cand)) {
+            let b_start = full_staged.lines().count() as u32 + 1;
+            let (text, eff_start, maps) = stage_candidate_source_for_batch(
+                cand,
+                b_start,
+                real_repro_start,
+                &mut full_seen,
+                &mut full_ns,
+            );
+            if cand.fn_name == "panic_conflicting_aux_cand" {
+                assert_eq!(eff_start, b_start + 1);
+                assert!(maps.is_empty());
+                assert!(text.starts_with("pub mod stage_ns_0 { use super::*;\n"));
+                // Line 11 of `conflicting_fn_src` (0-indexed + 10) is `assert!(false, ...)`;
+                // verify zero-drift translation to `repro.rs`.
+                let assert_pos = translate_pos_to_repro_with_aux(
+                    &SourcePos {
+                        file: "src/lib.rs".to_string(),
+                        line: eff_start + 10,
+                        col: 5,
+                    },
+                    eff_start,
+                    real_repro_start,
+                    &maps,
+                );
+                assert_eq!(assert_pos.line, real_repro_start + 10);
+                assert_eq!(assert_pos.col, 5);
+            }
+            full_staged.push_str(&text);
+            full_staged.push_str("\n\n");
+        }
+        assert_eq!(full_ns, 1);
+        assert!(
+            compile_rust_snippet("conflicting_stage_ns_crate", &full_staged),
+            "conflicting multi-candidate crate must compile without E0428:\n{full_staged}"
+        );
+        let indexed = StagedLibSource::parse(&full_staged);
+        let (ns_first, ns_last) = indexed
+            .fn_line_range("panic_conflicting_aux_cand")
+            .expect("StagedLibSource must index pub fn inside stage_ns_0");
+        assert!(ns_last > ns_first);
+        assert!(indexed.is_panic_macro_call_site_in_frame(
+            "panic_conflicting_aux_cand",
+            &SourcePos {
+                file: "src/lib.rs".to_string(),
+                line: (ns_first + 1) as u32,
+                col: 5,
+            },
+            Some("miri_diff_corpus::stage_ns_0::panic_conflicting_aux_cand"),
+        ));
+
+        // Verify `confirm_helper_module_suffixes` keeps `stage_ns_0_*` helpers out of
+        // root candidates' confirm modules while linking them for `stage_ns_0` entries.
+        let ns_pairs = vec![
+            (
+                "seed_local_helper".to_string(),
+                "MiriDiffCorpus.seed_local_helper".to_string(),
+            ),
+            (
+                "seed_local_helper".to_string(),
+                "MiriDiffCorpus.stage_ns_0_seed_local_helper".to_string(),
+            ),
+        ];
+        let ns_helpers = vec![
+            "MiriDiffCorpus.seed_local_helper".to_string(),
+            "MiriDiffCorpus.stage_ns_0_seed_local_helper".to_string(),
+        ];
+        let root_only_entries = vec![OracleItemSpec::with_fuel(
+            batch_cands[1].fn_name.clone(),
+            200,
+        )];
+        let root_linked = confirm_helper_module_suffixes(
+            &full_staged,
+            "MiriDiffCorpus",
+            &ns_pairs,
+            &ns_helpers,
+            &root_only_entries,
+        );
+        assert_eq!(root_linked, vec!["MiriDiffCorpus.seed_local_helper"]);
+
+        let ns_only_entries = vec![OracleItemSpec::with_fuel(
+            "panic_conflicting_aux_cand".to_string(),
+            200,
+        )];
+        let ns_linked = confirm_helper_module_suffixes(
+            &full_staged,
+            "MiriDiffCorpus",
+            &ns_pairs,
+            &ns_helpers,
+            &ns_only_entries,
+        );
+        assert_eq!(
+            ns_linked,
+            vec!["MiriDiffCorpus.stage_ns_0_seed_local_helper"],
+            "stage_ns_0 entry must link ONLY its stage_ns_0 helper and never shadowed root helpers"
+        );
+
+        // Verify `extract_mir_neighborhood` prefers the `pub use stage_ns_<n>::<fn>`
+        // re-export over an earlier `stage_ns_0` private helper sharing `<fn>`.
+        let mir_tmp = env::temp_dir().join(format!(
+            "anneal_ns_mir_test_{}_{}",
+            std::process::id(),
+            STAGING_DIR_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mir_dir = mir_tmp.join(".anneal/generated/Mir/MiriDiffCorpus");
+        fs::create_dir_all(mir_tmp.join("src")).unwrap();
+        fs::create_dir_all(&mir_dir).unwrap();
+        fs::write(
+            mir_tmp.join("src/lib.rs"),
+            "pub mod stage_ns_0 { fn panic_conflicting_aux_cand() {} }\n\
+             pub mod stage_ns_1 { pub fn panic_conflicting_aux_cand() {} }\n\
+             pub use stage_ns_1::panic_conflicting_aux_cand;\n",
+        )
+        .unwrap();
+        fs::write(
+            mir_dir.join("stage_ns_0_panic_conflicting_aux_cand.lean"),
+            "def wrong_helper : Nat := 0\n",
+        )
+        .unwrap();
+        fs::write(
+            mir_dir.join("stage_ns_1_panic_conflicting_aux_cand.lean"),
+            "def body : CapturedMir := sorry\n",
+        )
+        .unwrap();
+        let mir_snip =
+            extract_mir_neighborhood(&mir_tmp, "MiriDiffCorpus", "panic_conflicting_aux_cand");
+        let _ = fs::remove_dir_all(&mir_tmp);
+        assert!(mir_snip.contains("def body : CapturedMir :="), "{mir_snip}");
+        assert!(!mir_snip.contains("wrong_helper"), "{mir_snip}");
+
+        // 10. `seed_seen_staged_aux_from_preamble` exact line coordinates (accounting
+        //     for `MIRI_CORPUS_CRATE_HEADER`'s trailing newline), conflicting
+        //     `impl PairU32` isolated-preamble `stage_ns_<n>`, entry-vs-helper name
+        //     reservation, `pub struct <fn_name>` + `pub fn <fn_name>` visibility
+        //     blanking, `partition_subject_callees_with_reexports` anti-hijack,
+        //     `StagedLibSource::parse` anti-shadowing, and bidirectional confirm
+        //     isolation when `stage_ns_<n>` types wrap `UnwindCleanupGuard`.
+        let exact_prefix =
+            format!("{MIRI_CORPUS_CRATE_HEADER}\n{MIRI_CORPUS_MODULE_PREAMBLE}\n");
+        let preamble_seen = seed_seen_staged_aux_from_preamble();
+        // `PairU32` starts at its `#[repr(C)]` attribute on the line immediately
+        // preceding `pub struct PairU32 {`.
+        let expected_pair_attr_line = exact_prefix
+            .lines()
+            .position(|l| l.trim() == "pub struct PairU32 {")
+            .expect("PairU32 in preamble") as u32;
+        assert_eq!(
+            preamble_seen
+                .get("ty:PairU32")
+                .map(|e| e.emitted_start_line),
+            Some(expected_pair_attr_line),
+            "preamble line index must account for blank line after MIRI_CORPUS_CRATE_HEADER"
+        );
+
+        let cand_impl_a_src = "\
+impl PairU32 {
+    fn ep1_b3_tag(&self) -> u32 {
+        self.a ^ self.b
+    }
+}
+fn cand_impl_b() -> u32 {
+    0u32
+}
+pub fn cand_impl_a() -> u32 {
+    let p = PairU32 { a: 3u32, b: 5u32 };
+    p.ep1_b3_tag() ^ cand_impl_b()
+}
+";
+        let cand_impl_b_src = "\
+pub struct cand_impl_b {
+    pub guard: UnwindCleanupGuard,
+}
+impl PairU32 {
+    fn ep1_b3_tag(&self) -> u32 {
+        self.a + self.b + 10u32
+    }
+}
+pub fn cand_impl_b() -> u32 {
+    assert!(false, \"ns1 entry panic\");
+    let p = PairU32 { a: 4u32, b: 6u32 };
+    p.ep1_b3_tag()
+}
+";
+        let c_a = GeneratedMiriCandidate {
+            id: 0,
+            seed_index: 0,
+            seed_name: "cand_impl_a".to_string(),
+            fn_name: "cand_impl_a".to_string(),
+            seed_u64: 1,
+            applied_mutators: Vec::new(),
+            tracked_locals: Vec::new(),
+            fn_source: cand_impl_a_src.to_string(),
+            source: crate::mutators_miri::build_standalone_candidate_source(cand_impl_a_src),
+        };
+        let c_b = GeneratedMiriCandidate {
+            id: 1,
+            seed_index: 0,
+            seed_name: "cand_impl_b".to_string(),
+            fn_name: "cand_impl_b".to_string(),
+            seed_u64: 2,
+            applied_mutators: Vec::new(),
+            tracked_locals: Vec::new(),
+            fn_source: cand_impl_b_src.to_string(),
+            source: crate::mutators_miri::build_standalone_candidate_source(cand_impl_b_src),
+        };
+        let reserved: BTreeSet<String> = ["cand_impl_a", "cand_impl_b"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mut tricky_staged = exact_prefix.clone();
+        let tricky_repro_start = tricky_staged.lines().count() as u32 + 1;
+        let mut tricky_seen = seed_seen_staged_aux_from_preamble();
+        let mut tricky_ns = 0usize;
+        let mut b_eff = 0u32;
+        let mut b_maps = Vec::new();
+        for cand in [&c_a, &c_b] {
+            let b_start = tricky_staged.lines().count() as u32 + 1;
+            let (txt, eff, maps) = stage_candidate_source_for_batch_with_reserved(
+                cand,
+                b_start,
+                tricky_repro_start,
+                &mut tricky_seen,
+                &mut tricky_ns,
+                &reserved,
+            );
+            if cand.fn_name == "cand_impl_b" {
+                b_eff = eff;
+                b_maps = maps;
+            }
+            tricky_staged.push_str(&txt);
+            tricky_staged.push_str("\n\n");
+        }
+        assert!(
+            compile_rust_snippet("tricky_impl_and_entry_collision", &tricky_staged),
+            "conflicting impl PairU32 + entry-name collision + pub struct <fn_name> must compile:\n{tricky_staged}"
+        );
+        // Verify isolated-preamble line translation maps both `stage_ns_1`'s
+        // preamble lines and `cand_impl_b`'s body lines accurately to `repro.rs`.
+        assert_eq!(b_maps.len(), 1);
+        let mapped_preamble = translate_pos_to_repro_with_aux(
+            &SourcePos {
+                file: "src/lib.rs".to_string(),
+                line: b_maps[0].emitted_start_line + 5,
+                col: 1,
+            },
+            b_eff,
+            tricky_repro_start,
+            &b_maps,
+        );
+        assert_eq!(mapped_preamble.line, b_maps[0].repro_item_start_line + 5);
+
+        // `StagedLibSource::parse` must index `stage_ns_1::cand_impl_b` (not
+        // `stage_ns_0`'s helper `fn cand_impl_b`), and `partition_subject_callees_with_reexports`
+        // must map `cand_impl_b` to `stage_ns_1_cand_impl_b` rather than `stage_ns_0_cand_impl_b`.
+        let tricky_indexed = StagedLibSource::parse(&tricky_staged);
+        let (cb_first, _) = tricky_indexed
+            .fn_line_range("cand_impl_b")
+            .expect("index cand_impl_b");
+        assert_eq!(cb_first as u32, b_eff + 8);
+        assert!(tricky_indexed.is_panic_macro_call_site_in_frame(
+            "cand_impl_b",
+            &SourcePos {
+                file: "src/lib.rs".to_string(),
+                line: b_eff + 9,
+                col: 5,
+            },
+            Some("miri_diff_corpus::stage_ns_1::cand_impl_b"),
+        ));
+        let reexports = parse_stage_ns_reexports(&tricky_staged);
+        let (part_cands, part_helpers) = partition_subject_callees_with_reexports(
+            "MiriDiffCorpus",
+            &[
+                (
+                    "cand_impl_b".to_string(),
+                    "MiriDiffCorpus.stage_ns_0_cand_impl_b".to_string(),
+                ),
+                (
+                    "cand_impl_b".to_string(),
+                    "MiriDiffCorpus.stage_ns_1_cand_impl_b".to_string(),
+                ),
+            ],
+            &[OracleItemSpec::with_fuel("cand_impl_b".to_string(), 200)],
+            &reexports,
+        );
+        assert_eq!(
+            part_cands.get("cand_impl_b").map(String::as_str),
+            Some("MiriDiffCorpus.stage_ns_1_cand_impl_b")
+        );
+        assert_eq!(
+            part_helpers,
+            vec!["MiriDiffCorpus.stage_ns_0_cand_impl_b".to_string()]
+        );
+
+        // Bidirectional `Drop` isolation: `stage_ns_0` reaching `UnwindCleanupGuard`
+        // via a conflicting `SeedPair` must NOT cause a crate-root `SeedPair`
+        // candidate to link `_UnwindCleanupGuard_as_core_ops_Drop_drop`.
+        let drop_isolation_src = format!(
+            "{exact_prefix}\n\
+             pub struct SeedPair {{ pub a: u32, pub b: u32 }}\n\
+             pub fn root_uses_pair() -> u32 {{ let p = SeedPair {{ a: 1, b: 2 }}; p.a + p.b }}\n\
+             pub mod stage_ns_0 {{ use super::*;\n\
+             pub struct SeedPair {{ pub g: UnwindCleanupGuard }}\n\
+             pub fn ns_uses_guard_pair() -> u32 {{ 0u32 }}\n\
+             }} pub use stage_ns_0::ns_uses_guard_pair;\n"
+        );
+        let drop_pairs = vec![(
+            "drop".to_string(),
+            "MiriDiffCorpus._UnwindCleanupGuard_as_core_ops_Drop_drop".to_string(),
+        )];
+        let drop_helpers =
+            vec!["MiriDiffCorpus._UnwindCleanupGuard_as_core_ops_Drop_drop".to_string()];
+        let root_drop_linked = confirm_helper_module_suffixes(
+            &drop_isolation_src,
+            "MiriDiffCorpus",
+            &drop_pairs,
+            &drop_helpers,
+            &[OracleItemSpec::with_fuel("root_uses_pair".to_string(), 200)],
+        );
+        assert!(
+            root_drop_linked.is_empty(),
+            "stage_ns_0 SeedPair(UnwindCleanupGuard) must not leak Drop into root: {root_drop_linked:?}"
+        );
+        let ns_drop_linked = confirm_helper_module_suffixes(
+            &drop_isolation_src,
+            "MiriDiffCorpus",
+            &drop_pairs,
+            &drop_helpers,
+            &[OracleItemSpec::with_fuel(
+                "ns_uses_guard_pair".to_string(),
+                200,
+            )],
+        );
+        // `ns_uses_guard_pair` didn't even mention `SeedPair`! Verify touching `SeedPair` in ns links Drop:
+        assert!(ns_drop_linked.is_empty());
+
+        // 11. `ep1-A3` regressions:
+        //     (a) `use` imports (`use core::mem::size_of;` repeated across candidates,
+        //         `use core::cell::UnsafeCell;` matching preamble, and conflicting
+        //         `use core::mem::align_of as size_of;`),
+        //     (b) `impl Uninit<LocalA> { fn clash(...) }` vs `impl Uninit<LocalB> { fn clash(...) }`,
+        //         `type PairAlias = PairU32; impl PairAlias` vs `impl PairU32`, and
+        //         `pub(crate) struct <cand.fn_name>` restricted-visibility blanking,
+        //     (c) `stage_ns_0` (`use super::*;`) type/value namespace split (`struct root_model_helper`
+        //         + calling `root_model_helper()`) and `impl RootGuardHolder` preserving
+        //         root `UnwindCleanupGuard` Drop reachability, and
+        //     (d) `discover_reproducer_candidate_fn` skipping `pub async fn`.
+        let use_cand_0_src = "\
+use core::mem::size_of;
+#[derive(Copy, Clone)]
+pub struct LocalA;
+impl Uninit<LocalA> {
+    fn clash(&self) -> u32 { 10u32 }
+}
+type PairAlias = PairU32;
+impl PairAlias {
+    fn alias_ext(&self) -> u32 { self.a }
+}
+pub fn cand_ep1_a3_0() -> u32 {
+    let u: Uninit<LocalA> = Uninit { value: LocalA };
+    let p = PairU32 { a: 2u32, b: 3u32 };
+    (size_of::<PairU32>() as u32) + u.clash() + p.alias_ext()
+}
+";
+        let use_cand_1_src = "\
+use core::mem::size_of;
+pub fn cand_ep1_a3_1() -> u32 {
+    size_of::<u32>() as u32
+}
+";
+        let use_cand_2_src = "\
+use core::cell::UnsafeCell;
+use core::mem::align_of as size_of;
+pub(crate) struct cand_ep1_a3_2 {
+    pub v: u32,
+}
+#[derive(Copy, Clone)]
+pub struct LocalB;
+impl Uninit<LocalB> {
+    fn clash(&self) -> u32 { 20u32 }
+}
+impl PairU32 {
+    fn alias_ext(&self) -> u32 { self.b }
+}
+pub fn cand_ep1_a3_2() -> u32 {
+    let c = UnsafeCell::new(1u32);
+    let _ = &c;
+    let s = cand_ep1_a3_2 { v: size_of::<u64>() as u32 };
+    let u: Uninit<LocalB> = Uninit { value: LocalB };
+    let p = PairU32 { a: 4u32, b: 5u32 };
+    s.v + u.clash() + p.alias_ext()
+}
+";
+        let ep1_a3_cands: Vec<GeneratedMiriCandidate> = [
+            (0usize, "cand_ep1_a3_0", use_cand_0_src),
+            (1usize, "cand_ep1_a3_1", use_cand_1_src),
+            (2usize, "cand_ep1_a3_2", use_cand_2_src),
+        ]
+        .into_iter()
+        .map(|(id, name, src)| GeneratedMiriCandidate {
+            id,
+            seed_index: 0,
+            seed_name: name.to_string(),
+            fn_name: name.to_string(),
+            seed_u64: id as u64 + 100,
+            applied_mutators: Vec::new(),
+            tracked_locals: Vec::new(),
+            fn_source: src.to_string(),
+            source: crate::mutators_miri::build_standalone_candidate_source(src),
+        })
+        .collect();
+        let a3_reserved: BTreeSet<String> = ep1_a3_cands.iter().map(|c| c.fn_name.clone()).collect();
+        let mut a3_staged = exact_prefix.clone();
+        let a3_repro_start = a3_staged.lines().count() as u32 + 1;
+        let mut a3_seen = seed_seen_staged_aux_from_preamble();
+        let mut a3_ns = 0usize;
+        for cand in &ep1_a3_cands {
+            let b_start = a3_staged.lines().count() as u32 + 1;
+            let (txt, _, _) = stage_candidate_source_for_batch_with_reserved(
+                cand,
+                b_start,
+                a3_repro_start,
+                &mut a3_seen,
+                &mut a3_ns,
+                &a3_reserved,
+            );
+            a3_staged.push_str(&txt);
+            a3_staged.push_str("\n\n");
+        }
+        assert!(
+            compile_rust_snippet("ep1_a3_use_uninit_alias_and_pub_crate", &a3_staged),
+            "ep1-A3 use + Uninit<Local> + type-alias impl + pub(crate) struct batch must compile:\n{a3_staged}"
+        );
+
+        let split_ns_src = format!(
+            "{exact_prefix}\n\
+             pub struct RootGuardHolder {{ pub g: UnwindCleanupGuard }}\n\
+             pub const __ANNEAL_MODEL_root_model_helper: &str = \"root_model_helper\";\n\
+             pub fn root_model_helper() -> u32 {{ 9u32 }}\n\
+             pub mod stage_ns_0 {{ use super::*;\n\
+             struct root_model_helper {{ pub a: u32 }}\n\
+             impl RootGuardHolder {{ fn ping(&self) -> u32 {{ 1u32 }} }}\n\
+             pub fn ns_split_entry() -> u32 {{\n\
+                 let _t = root_model_helper {{ a: 2u32 }};\n\
+                 let h = RootGuardHolder {{ g: UnwindCleanupGuard(3u32) }};\n\
+                 h.ping() + root_model_helper()\n\
+             }}\n\
+             }} pub use stage_ns_0::ns_split_entry;\n"
+        );
+        let split_pairs = vec![
+            (
+                "root_model_helper".to_string(),
+                "MiriDiffCorpus.root_model_helper".to_string(),
+            ),
+            (
+                "ping".to_string(),
+                "MiriDiffCorpus.stage_ns_0_RootGuardHolder_ping".to_string(),
+            ),
+            (
+                "drop".to_string(),
+                "MiriDiffCorpus._UnwindCleanupGuard_as_core_ops_Drop_drop".to_string(),
+            ),
+        ];
+        let split_helpers = vec![
+            "MiriDiffCorpus.root_model_helper".to_string(),
+            "MiriDiffCorpus.stage_ns_0_RootGuardHolder_ping".to_string(),
+            "MiriDiffCorpus._UnwindCleanupGuard_as_core_ops_Drop_drop".to_string(),
+        ];
+        let split_linked = confirm_helper_module_suffixes(
+            &split_ns_src,
+            "MiriDiffCorpus",
+            &split_pairs,
+            &split_helpers,
+            &[OracleItemSpec::with_fuel("ns_split_entry".to_string(), 200)],
+        );
+        assert_eq!(
+            split_linked, split_helpers,
+            "type-only shadowing and impl RootGuardHolder in stage_ns_0 must keep super fn + root Drop: {split_linked:?}"
+        );
+
+        assert_eq!(
+            discover_reproducer_candidate_fn(
+                "#![no_std]\npub fn real_sync_repro() -> u32 { 1 }\npub async fn trailing_async() -> u32 { 2 }\n"
+            )
+            .as_deref(),
+            Some("real_sync_repro")
+        );
+
+        // 12. `ep1-B4` regressions:
+        //     (a) grouped `use core::mem::{size_of, transmute};` and non-preamble
+        //         rename `use core::mem::size_of as offset;` inside isolated-preamble
+        //         / `use super::*;` `stage_ns_<n>` modules + `extern "C"` collisions,
+        //     (b) `confirm_helper_module_suffixes` linking specialized `impl`
+        //         methods (`MiriDiffCorpus.Uninit_LocalA_clash` at crate root and
+        //         `MiriDiffCorpus.stage_ns_0_stage_ns_0_Uninit_stage_ns_0_LocalB_clash`
+        //         inside `stage_ns_0`).
+        let grouped_use_iso_src = "\
+use core::mem::{size_of, transmute};
+unsafe extern \"C\" {
+    fn ep1_b4_foreign_sym(x: u32) -> u32;
+}
+impl PairU32 {
+    fn ep1_b4_method(&self) -> u32 { self.a + self.b }
+}
+pub fn cand_ep1_b4_iso() -> u32 {
+    let raw: u32 = unsafe { transmute::<u32, u32>(size_of::<PairU32>() as u32) };
+    (PairU32 { a: raw, b: 1u32 }).ep1_b4_method()
+}
+";
+        let rename_use_super_src = "\
+use core::mem::size_of as offset;
+unsafe extern \"C\" {
+    fn ep1_b4_foreign_sym(x: u64) -> u64;
+}
+pub fn cand_ep1_b4_rename() -> u32 {
+    offset::<PairU32>() as u32
+}
+";
+        let b4_cands: Vec<GeneratedMiriCandidate> = [
+            (0usize, "cand_ep1_a3_0", use_cand_0_src),
+            (1usize, "cand_ep1_b4_iso", grouped_use_iso_src),
+            (2usize, "cand_ep1_b4_rename", rename_use_super_src),
+        ]
+        .into_iter()
+        .map(|(id, name, src)| GeneratedMiriCandidate {
+            id,
+            seed_index: 0,
+            seed_name: name.to_string(),
+            fn_name: name.to_string(),
+            seed_u64: id as u64 + 200,
+            applied_mutators: Vec::new(),
+            tracked_locals: Vec::new(),
+            fn_source: src.to_string(),
+            source: crate::mutators_miri::build_standalone_candidate_source(src),
+        })
+        .collect();
+        let b4_reserved: BTreeSet<String> = b4_cands.iter().map(|c| c.fn_name.clone()).collect();
+        let mut b4_staged = exact_prefix.clone();
+        let b4_repro_start = b4_staged.lines().count() as u32 + 1;
+        let mut b4_seen = seed_seen_staged_aux_from_preamble();
+        let mut b4_ns = 0usize;
+        for cand in &b4_cands {
+            let b_start = b4_staged.lines().count() as u32 + 1;
+            let (txt, _, _) = stage_candidate_source_for_batch_with_reserved(
+                cand,
+                b_start,
+                b4_repro_start,
+                &mut b4_seen,
+                &mut b4_ns,
+                &b4_reserved,
+            );
+            b4_staged.push_str(&txt);
+            b4_staged.push_str("\n\n");
+        }
+        assert!(
+            compile_rust_snippet("ep1_b4_grouped_use_rename_and_foreign", &b4_staged),
+            "ep1-B4 grouped use + rename use + foreign fn collision batch must compile:\n{b4_staged}"
+        );
+
+        // Verify specialized `impl Uninit<LocalA>` (root) and `impl Uninit<LocalB>`
+        // (`stage_ns_0`, doubled `stage_ns_0_stage_ns_0_...` stem from `rustc-capture`)
+        // are linked into their respective `MiriOracleConfirm.lean` callee lists.
+        let spec_impl_pairs = vec![
+            (
+                "clash".to_string(),
+                "MiriDiffCorpus.Uninit_LocalA_clash".to_string(),
+            ),
+            (
+                "clash".to_string(),
+                "MiriDiffCorpus.stage_ns_0_stage_ns_0_Uninit_stage_ns_0_LocalB_clash".to_string(),
+            ),
+        ];
+        let spec_impl_helpers = vec![
+            "MiriDiffCorpus.Uninit_LocalA_clash".to_string(),
+            "MiriDiffCorpus.stage_ns_0_stage_ns_0_Uninit_stage_ns_0_LocalB_clash".to_string(),
+        ];
+        let root_spec_linked = confirm_helper_module_suffixes(
+            &a3_staged,
+            "MiriDiffCorpus",
+            &spec_impl_pairs,
+            &spec_impl_helpers,
+            &[OracleItemSpec::with_fuel("cand_ep1_a3_0".to_string(), 200)],
+        );
+        assert_eq!(
+            root_spec_linked,
+            vec!["MiriDiffCorpus.Uninit_LocalA_clash"],
+            "root candidate must link specialized Uninit<LocalA>::clash: {root_spec_linked:?}"
+        );
+        let ns_spec_linked = confirm_helper_module_suffixes(
+            &a3_staged,
+            "MiriDiffCorpus",
+            &spec_impl_pairs,
+            &spec_impl_helpers,
+            &[OracleItemSpec::with_fuel("cand_ep1_a3_2".to_string(), 200)],
+        );
+        assert_eq!(
+            ns_spec_linked,
+            vec!["MiriDiffCorpus.stage_ns_0_stage_ns_0_Uninit_stage_ns_0_LocalB_clash"],
+            "stage_ns_0 candidate must link specialized Uninit<LocalB>::clash: {ns_spec_linked:?}"
+        );
+
+        // Closures inside a candidate whose name starts with a preamble type prefix
+        // (`Uninit_closure_cand__b0_c0__closure_0`) must bind to `enclosing_top_fn`
+        // rather than being misclassified by `matching_impl_self_ty` as an `impl`
+        // method on `Uninit` (neither dropped when `Uninit` is unreferenced nor
+        // leaked into another candidate that references `Uninit`).
+        let closure_prefix_src = format!(
+            "{exact_prefix}\n\
+             pub fn Uninit_closure_cand__b0_c0() -> u32 {{\n\
+                 let f = |x: u32| x + 1u32;\n\
+                 f(41u32)\n\
+             }}\n\
+             pub fn other_touches_uninit__b0_c1() -> u32 {{\n\
+                 let u: Uninit<u32> = Uninit {{ value: 7u32 }};\n\
+                 unsafe {{ u.value }}\n\
+             }}\n"
+        );
+        let closure_pairs = vec![(
+            "{closure#0}".to_string(),
+            "MiriDiffCorpus.Uninit_closure_cand__b0_c0__closure_0".to_string(),
+        )];
+        let closure_helpers =
+            vec!["MiriDiffCorpus.Uninit_closure_cand__b0_c0__closure_0".to_string()];
+        assert_eq!(
+            confirm_helper_module_suffixes(
+                &closure_prefix_src,
+                "MiriDiffCorpus",
+                &closure_pairs,
+                &closure_helpers,
+                &[OracleItemSpec::with_fuel(
+                    "Uninit_closure_cand__b0_c0".to_string(),
+                    200
+                )],
+            ),
+            closure_helpers,
+            "Uninit_closure_cand must retain its own closure even without referencing Uninit"
+        );
+        assert!(
+            confirm_helper_module_suffixes(
+                &closure_prefix_src,
+                "MiriDiffCorpus",
+                &closure_pairs,
+                &closure_helpers,
+                &[OracleItemSpec::with_fuel(
+                    "other_touches_uninit__b0_c1".to_string(),
+                    200
+                )],
+            )
+            .is_empty(),
+            "other_touches_uninit must not link Uninit_closure_cand's closure"
         );
     }
 }
