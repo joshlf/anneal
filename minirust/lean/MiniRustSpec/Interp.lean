@@ -36,7 +36,11 @@ here.
   (`spec/lang/machine.md`). The daemonic thread choice `pick(..)` then has a
   unique solution; with more than one enabled thread we report
   `Stop.unsupported` instead of resolving the choice.
-* `Statement::Assign`, `Statement::PlaceMention`, `Statement::Validate`
+* All seven `Statement` variants: `Statement::Assign`,
+  `Statement::PlaceMention`, `Statement::SetDiscriminant` (which writes the
+  tags of the chosen variant straight into memory through
+  `encode_discriminant`, `Machine::ptr_offset_inbounds`, and
+  `ConcurrentMemory::store`), `Statement::Validate`
   (through `Machine::retag_val` and `BasicMemory::retag_ptr`),
   `Statement::Deinit` (through `ConcurrentMemory::deinit`),
   `Statement::StorageLive`, and `Statement::StorageDead` (through
@@ -75,7 +79,13 @@ here.
   has no Boolean negation operator: `minimize` expresses `!b` with transmutes
   and integer subtraction (see `MiniRustSpec.Correspondence.Translate`), so
   `UnOp::Int` on a `Value::Bool` stays a spec panic, exactly as upstream.
-* `Terminator::Goto`, `Terminator::Switch`, `Terminator::Unreachable`,
+* All nine `Terminator` variants: `Terminator::Goto`, `Terminator::Switch`,
+  `Terminator::Unreachable`, the unwinding terminators
+  `Terminator::StartUnwind` and `Terminator::StopUnwind` (which push and pop
+  the unwind payload stack of the active thread through
+  `Machine::mutate_active_thread`) and `Terminator::ResumeUnwind` (frame
+  teardown, `storage_dead` of every local, `Memory::end_call`, and the jump
+  to the caller's `unwind_block`),
   `Terminator::Call` (including `Machine::fn_from_ptr`,
   `check_abi_compatibility`, `Machine::prepare_for_inplace_passing`,
   `Machine::eval_argument` for both `ByValue` and `InPlace`,
@@ -2353,6 +2363,23 @@ def mutateCurStack {α : Type} (m : Mach) (f : List Frame → Interp (α × List
   let threads ← listSet m.threads m.active_thread { t with stack := stack' } "mutate_at"
   pure (out, { m with threads := threads })
 
+/-- `Machine::mutate_active_thread` (`spec/lang/machine.md`):
+> "fn mutate_active_thread<O>(&mut self, f: impl FnOnce(&mut Thread<M>) -> O) -> O {
+>     self.threads.mutate_at(self.active_thread, f)
+> }"
+As in `listMutateAt` and `mutateCurStack`, the closure is lifted into
+`Interp`: it returns its output together with the mutated thread, or stops.
+`Terminator::StopUnwind` passes a closure that returns a `Result` which the
+caller unwraps with `?` right away, so a `throw_ub!` of that closure is the
+`Interp` failure of `f` here; the thread such a closure leaves behind is
+dropped with the rest of the machine by that `?`. -/
+def mutateActiveThread {α : Type} (m : Mach) (f : Thread BM → Interp (α × Thread BM)) :
+    Interp (α × Mach) := do
+  let t ← activeThread m
+  let (out, t') ← f t
+  let threads ← listSet m.threads m.active_thread t' "mutate_at"
+  pure (out, { m with threads := threads })
+
 /-- `StackFrame::jump_to_block` (`spec/lang/machine.md`):
 > "self.next_block = b; self.next_stmt = Int::ZERO;"
 and `Machine::jump_to_block` (`spec/lang/step/terminators.md`):
@@ -3764,7 +3791,59 @@ def retagTupleFields (m : Mach) (fnEntry : Bool) : List Val → List (Offset × 
 
 end
 
-/-- `Machine::eval_statement` for `Statement::Assign`, `Statement::PlaceMention`,
+/-- `Machine::eval_statement` for `Statement::SetDiscriminant`
+(`spec/lang/step/statements.md`):
+> "fn eval_statement(&mut self, Statement::SetDiscriminant { destination, value }: Statement) -> NdResult {
+>     let (place, Type::Enum { variants, .. }) = self.eval_place(destination)? else {
+>         panic!(\"setting the discriminant type of a non-enum contradicts well-formedness\");
+>     };
+>     if !place.aligned {
+>         throw_ub!(\"setting the discriminant of a place based on a misaligned pointer\");
+>     }
+>
+>     let tagger = match variants.get(value) {
+>         Some(Variant { tagger, .. }) => tagger,
+>         // guaranteed unreachable by the well-formedness checks
+>         None => panic!(\"setting an invalid discriminant ({value})\"),
+>     };
+>
+>     // Write the tag directly into memory.
+>     // This should be fine as we don't allow encoded data and the tag to overlap for valid enum variants.
+>     let accessor = |offset: Offset, bytes| {
+>         let ptr = self.ptr_offset_inbounds(place.ptr.thin_pointer, offset.bytes())?;
+>         // We have ensured that the place is aligned, so no alignment requirement here
+>         self.mem.store(ptr, bytes, Align::ONE, Atomicity::None)
+>     };
+>     encode_discriminant::<M>(accessor, tagger)?;
+>     ret(())
+> }"
+The `FnMut` accessor reads and writes `self`, so the machine is the state
+that `encodeDiscriminant` threads through it: every tag is checked against
+and stored into the memory left by the tags before it, in the iteration
+order of `tagger`. Each store covers exactly the bytes of one tag at its
+offset from the start of the place, so the bytes of the variant's fields are
+never written. A `tagger` without entries (the untagged variant of a niche
+layout) therefore leaves the machine as `eval_place` returned it. -/
+def evalSetDiscriminant (m : Mach) (destination : PlaceExpr) (value : Int) : Interp Mach := do
+  let ((place, ty), m) ← evalPlace m destination
+  match ty with
+  | .Enum variants _ _ _ _ =>
+    if !place.aligned then
+      ub "setting the discriminant of a place based on a misaligned pointer"
+    else
+      match mapGet variants value with
+      | some variant =>
+        encodeDiscriminant
+          (fun (m : Mach) offset bytes => do
+            let ptr ← ptrOffsetInbounds m place.ptr.thin_pointer (offset.bytes : Int)
+            let cm ← CM.store m.mem ptr bytes ⟨1⟩ .None
+            pure { m with mem := cm })
+          variant.tagger m
+      | none => specPanic s!"setting an invalid discriminant ({value})"
+  | _ => specPanic "setting the discriminant type of a non-enum contradicts well-formedness"
+
+/-- `Machine::eval_statement` for every `Statement`: `Statement::Assign`,
+`Statement::PlaceMention`, `Statement::SetDiscriminant` (`evalSetDiscriminant`),
 `Statement::Validate`, `Statement::Deinit`, `Statement::StorageLive`, and
 `Statement::StorageDead` (`spec/lang/step/statements.md`):
 > "fn eval_statement(&mut self, Statement::Assign { destination, source }: Statement) -> NdResult {
@@ -3821,6 +3900,7 @@ def evalStatement (m : Mach) : Statement → Interp Mach
   | .PlaceMention place => do
     let (_, m) ← evalPlace m place
     pure m
+  | .SetDiscriminant destination value => evalSetDiscriminant m destination value
   | .Validate place fnEntry => do
     let ((p, ty), m) ← evalPlace m place
     let (val, m) ← placeLoad m p ty
@@ -3838,7 +3918,6 @@ def evalStatement (m : Mach) : Statement → Interp Mach
       let size ← LayoutStrategy.expect_size layout "WF ensures deinits are sized"
       let cm ← CM.deinit m.mem p.ptr.thin_pointer size ⟨1⟩
       pure { m with mem := cm }
-  | _ => unsupported "eval_statement for a statement other than Assign/PlaceMention/Validate/StorageLive/StorageDead/Deinit"
 
 /-! ## Tree Borrows reborrow settings (`spec/mem/tree_borrows/tree.md`, `spec/mem/tree_borrows/reborrow_settings.md`) -/
 
@@ -5554,6 +5633,62 @@ def evalReturn (m : Mach) : Interp Mach := do
       | some nb => jumpToBlock m nb
       | none => ub "return from a function where caller did not specify next block"
 
+/-- `Machine::eval_terminator` for `Terminator::ResumeUnwind`
+(`spec/lang/step/terminators.md`):
+> "fn eval_terminator(&mut self, Terminator::ResumeUnwind: Terminator) -> NdResult {
+>     let mut frame = self.mutate_cur_stack(
+>         |stack| stack.pop().unwrap()
+>     );
+>
+>     // Deallocate everything.
+>     while let Some(local) = frame.locals.keys().next() {
+>         frame.storage_dead(&mut self.mem, local)?;
+>     }
+>
+>     // Inform the memory model that this call has ended.
+>     self.mem.end_call(frame.extra)?;
+>
+>     // Perform the stack pop action.
+>     match frame.stack_pop_action {
+>         StackPopAction::BottomOfStack => {
+>             // Only the bottom frame in a stack has no caller.
+>             // It is UB to unwind out of the bottom of the stack.
+>             throw_ub!(\"the function at the bottom of the stack must not unwind\");
+>         }
+>         StackPopAction::BackToCaller { unwind_block, .. } => {
+>             // Jump to the unwind block specified by the caller. Raise UB if `unwind_block` is `None`.
+>             if let Some(unwind_block) = unwind_block {
+>                 self.jump_to_block(unwind_block)?;
+>             } else {
+>                 throw_ub!(\"unwinding from a function where the caller did not specify an unwind_block\");
+>             }
+>         }
+>     }
+>     ret(())
+> }"
+The frame is popped and torn down exactly as in `evalReturn` (`deallocAll`),
+but no return value is loaded or stored, and the jump targets the caller's
+`unwind_block` instead of its `next_block`. The payload stack of the thread
+is left alone: the payload pushed by `Terminator::StartUnwind` stays on it
+until a `Terminator::StopUnwind` in some caller pops it. As in `evalReturn`,
+`end_call` is the default trait method (`ret(())`) for `BasicMemory`, so it
+is the identity here. -/
+def evalResumeUnwind (m : Mach) : Interp Mach := do
+  let t ← activeThread m
+  let frame ← match t.stack.getLast? with
+    | some f => pure f
+    | none => specPanic "stack.pop().unwrap()"
+  let threads ← listSet m.threads m.active_thread { t with stack := t.stack.dropLast } "pop"
+  let m := { m with threads := threads }
+  let (frame, cm) ← deallocAll frame.locals.entries.length frame m.mem
+  let m := { m with mem := cm }
+  match frame.stack_pop_action with
+  | .BottomOfStack => ub "the function at the bottom of the stack must not unwind"
+  | .BackToCaller _ unwindBlock _ =>
+    match unwindBlock with
+    | some unwindBlock => jumpToBlock m unwindBlock
+    | none => ub "unwinding from a function where the caller did not specify an unwind_block"
+
 /-! ## Intrinsics (`spec/lang/step/intrinsics.md`) -/
 
 /-- `unit_value` (`spec/lang/step/intrinsics.md`):
@@ -6168,8 +6303,8 @@ def evalIntrinsic (m : Mach) (op : IntrinsicOp) (arguments : List (Val × «Type
   | _ =>
     unsupported "eval_intrinsic for a thread, lock, or atomic intrinsic"
 
-/-- `Machine::eval_terminator` for `Goto`, `Switch`, `Unreachable`, `Call`,
-`Return`, and `Intrinsic` (`spec/lang/step/terminators.md`):
+/-- `Machine::eval_terminator` for every `Terminator`; for `Goto`, `Switch`,
+`Unreachable`, and `Call` (`spec/lang/step/terminators.md`):
 > "fn eval_terminator(&mut self, Terminator::Goto(block_name): Terminator) -> NdResult {
 >     self.jump_to_block(block_name)?;
 >     ret(())
@@ -6230,7 +6365,35 @@ and for `Intrinsic` (with `evalIntrinsic`):
 >     }
 >
 >     ret(())
-> }" -/
+> }"
+and for `StartUnwind` and `StopUnwind` (with `mutateActiveThread`; the
+payload stack grows at the back, so `push` appends, and `pop` and the
+`last` of `IntrinsicOp::GetUnwindPayload` take the final element):
+> "fn eval_terminator(&mut self, Terminator::StartUnwind { unwind_payload, unwind_block }: Terminator) -> NdResult {
+>     let (Value::Ptr(unwind_payload), Type::Ptr(PtrType::Raw { meta_kind: PointerMetaKind::None })) =
+>         self.eval_value(unwind_payload)?
+>     else {
+>         panic!(\"StartUnwind: the unwind payload is not a raw pointer\");
+>     };
+>     self.mutate_active_thread(|thread| {
+>         thread.unwind_payloads.push(unwind_payload.thin_pointer)
+>     });
+>     self.jump_to_block(unwind_block)?;
+>     ret(())
+> }
+> ..
+> fn eval_terminator(&mut self, Terminator::StopUnwind(block_name): Terminator) -> NdResult {
+>     self.mutate_active_thread(|thread| -> Result<()>{
+>         let Some(_) = thread.unwind_payloads.pop() else {
+>             throw_ub!(\"StopUnwind: the payload stack is empty\");
+>         };
+>         ret(())
+>     } )?;
+>     self.jump_to_block(block_name)?;
+>     ret(())
+> }"
+`Terminator::Return` is `evalReturn` and `Terminator::ResumeUnwind` is
+`evalResumeUnwind`. -/
 def evalTerminator (m : Mach) : Terminator → Interp Mach
   | .Goto blockName => jumpToBlock m blockName
   | .Switch value cases fallback => do
@@ -6247,6 +6410,23 @@ def evalTerminator (m : Mach) : Terminator → Interp Mach
     let (arguments, m) ← evalArguments m arguments
     evalCall m callee callerConv arguments (retPlace, retTy) nextBlock unwindBlock
   | .Return => evalReturn m
+  | .StartUnwind unwindPayload unwindBlock => do
+    let ((val, ty), m) ← evalValue m unwindPayload
+    match val, ty with
+    | .Ptr unwindPayload, .Ptr (.Raw .None) => do
+      let (_, m) ← mutateActiveThread m (fun thread => pure ((),
+        { thread with
+          unwind_payloads := thread.unwind_payloads ++ [unwindPayload.thin_pointer] }))
+      jumpToBlock m unwindBlock
+    | _, _ => specPanic "StartUnwind: the unwind payload is not a raw pointer"
+  | .StopUnwind blockName => do
+    let (_, m) ← mutateActiveThread m (fun thread =>
+      match thread.unwind_payloads.getLast? with
+      | some _ =>
+        pure ((), { thread with unwind_payloads := thread.unwind_payloads.dropLast })
+      | none => ub "StopUnwind: the payload stack is empty")
+    jumpToBlock m blockName
+  | .ResumeUnwind => evalResumeUnwind m
   | .Intrinsic intrinsic arguments retExpr nextBlock => do
     let ((retPlace, retTy), m) ← evalPlace m retExpr
     let (args, m) ← evalArgs m arguments
@@ -6255,7 +6435,6 @@ def evalTerminator (m : Mach) : Terminator → Interp Mach
     match nextBlock with
     | some nb => jumpToBlock m nb
     | none => ub "return from an intrinsic where caller did not specify next block"
-  | _ => unsupported "eval_terminator for a terminator other than Goto/Switch/Unreachable/Call/Return/Intrinsic"
 
 /-! ## The step function (`spec/lang/machine.md`) -/
 
@@ -7998,6 +8177,53 @@ def retagArrayElemsM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) (fnEntr
 
 end
 
+/-- Polymorphic `Machine::eval_statement` for `Statement::SetDiscriminant`
+(`spec/lang/step/statements.md`); see `evalSetDiscriminant`:
+> "fn eval_statement(&mut self, Statement::SetDiscriminant { destination, value }: Statement) -> NdResult {
+>     let (place, Type::Enum { variants, .. }) = self.eval_place(destination)? else {
+>         panic!(\"setting the discriminant type of a non-enum contradicts well-formedness\");
+>     };
+>     if !place.aligned {
+>         throw_ub!(\"setting the discriminant of a place based on a misaligned pointer\");
+>     }
+>
+>     let tagger = match variants.get(value) {
+>         Some(Variant { tagger, .. }) => tagger,
+>         // guaranteed unreachable by the well-formedness checks
+>         None => panic!(\"setting an invalid discriminant ({value})\"),
+>     };
+>
+>     // Write the tag directly into memory.
+>     // This should be fine as we don't allow encoded data and the tag to overlap for valid enum variants.
+>     let accessor = |offset: Offset, bytes| {
+>         let ptr = self.ptr_offset_inbounds(place.ptr.thin_pointer, offset.bytes())?;
+>         // We have ensured that the place is aligned, so no alignment requirement here
+>         self.mem.store(ptr, bytes, Align::ONE, Atomicity::None)
+>     };
+>     encode_discriminant::<M>(accessor, tagger)?;
+>     ret(())
+> }"
+Under Tree Borrows every tag store is a write access through the provenance
+of the place, exactly like the stores of `Statement::Assign`. -/
+def evalSetDiscriminantM {M : Type} [Memory M] [MemoryOps M] (m : Machine M)
+    (destination : PlaceExpr) (value : Int) : Interp (Machine M) := do
+  let ((place, ty), m) ← evalPlaceM m destination
+  match ty with
+  | .Enum variants _ _ _ _ =>
+    if !place.aligned then
+      ub "setting the discriminant of a place based on a misaligned pointer"
+    else
+      match mapGet variants value with
+      | some variant =>
+        encodeDiscriminantM (M := M)
+          (fun (m : Machine M) offset bytes => do
+            let ptr ← ptrOffsetInboundsM m place.ptr.thin_pointer (offset.bytes : Int)
+            let cm ← ConcurrentMemory.store m.mem ptr bytes ⟨1⟩ .None
+            pure { m with mem := cm })
+          variant.tagger m
+      | none => specPanic s!"setting an invalid discriminant ({value})"
+  | _ => specPanic "setting the discriminant type of a non-enum contradicts well-formedness"
+
 /-- Polymorphic `Machine::eval_statement` (`spec/lang/step/statements.md`);
 see `evalStatement`:
 > "fn eval_statement(&mut self, Statement::Assign { destination, source }: Statement) -> NdResult {
@@ -8055,6 +8281,7 @@ def evalStatementM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) :
   | .PlaceMention place => do
     let (_, m) ← evalPlaceM m place
     pure m
+  | .SetDiscriminant destination value => evalSetDiscriminantM m destination value
   | .Validate place fnEntry => do
     let ((p, ty), m) ← evalPlaceM m place
     let (val, m) ← placeLoadM m p ty
@@ -8072,7 +8299,6 @@ def evalStatementM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) :
       let size ← LayoutStrategy.expect_size layout "WF ensures deinits are sized"
       let cm ← ConcurrentMemory.deinit m.mem p.ptr.thin_pointer size ⟨1⟩
       pure { m with mem := cm }
-  | _ => unsupported "eval_statement for a statement other than Assign/PlaceMention/Validate/StorageLive/StorageDead/Deinit"
 
 /-- Polymorphic `IntPtrCast::expose` (`spec/mem/intptrcast.md`); see `IntPtrCast.expose`:
 > "pub fn expose(&mut self, ptr: ThinPointer<Provenance>) {
@@ -8335,6 +8561,18 @@ def mutateCurStackM {M : Type} [Memory M] {α : Type} (m : Machine M)
   let threads ← listSet m.threads m.active_thread { t with stack := stack' } "mutate_at"
   pure (out, { m with threads := threads })
 
+/-- Polymorphic `Machine::mutate_active_thread` (`spec/lang/machine.md`); see
+`mutateActiveThread`:
+> "fn mutate_active_thread<O>(&mut self, f: impl FnOnce(&mut Thread<M>) -> O) -> O {
+>     self.threads.mutate_at(self.active_thread, f)
+> }" -/
+def mutateActiveThreadM {M : Type} [Memory M] {α : Type} (m : Machine M)
+    (f : Thread M → Interp (α × Thread M)) : Interp (α × Machine M) := do
+  let t ← activeThreadM m
+  let (out, t') ← f t
+  let threads ← listSet m.threads m.active_thread t' "mutate_at"
+  pure (out, { m with threads := threads })
+
 /-- Polymorphic `Machine::fn_from_ptr` (`spec/lang/machine.md`); see
 `fnFromPtr`:
 > "fn fn_from_ptr(&self, ptr: Value<M>) -> Result<Function> {" -/
@@ -8541,6 +8779,61 @@ def evalReturnM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) : Interp (Ma
       | some nb => jumpToBlockM m nb
       | none => ub "return from a function where caller did not specify next block"
 
+/-- Polymorphic `Machine::eval_terminator` for `Terminator::ResumeUnwind`
+(`spec/lang/step/terminators.md`); see `evalResumeUnwind`:
+> "fn eval_terminator(&mut self, Terminator::ResumeUnwind: Terminator) -> NdResult {
+>     let mut frame = self.mutate_cur_stack(
+>         |stack| stack.pop().unwrap()
+>     );
+>
+>     // Deallocate everything.
+>     while let Some(local) = frame.locals.keys().next() {
+>         frame.storage_dead(&mut self.mem, local)?;
+>     }
+>
+>     // Inform the memory model that this call has ended.
+>     self.mem.end_call(frame.extra)?;
+>
+>     // Perform the stack pop action.
+>     match frame.stack_pop_action {
+>         StackPopAction::BottomOfStack => {
+>             // Only the bottom frame in a stack has no caller.
+>             // It is UB to unwind out of the bottom of the stack.
+>             throw_ub!(\"the function at the bottom of the stack must not unwind\");
+>         }
+>         StackPopAction::BackToCaller { unwind_block, .. } => {
+>             // Jump to the unwind block specified by the caller. Raise UB if `unwind_block` is `None`.
+>             if let Some(unwind_block) = unwind_block {
+>                 self.jump_to_block(unwind_block)?;
+>             } else {
+>                 throw_ub!(\"unwinding from a function where the caller did not specify an unwind_block\");
+>             }
+>         }
+>     }
+>     ret(())
+> }"
+Here `self.mem.end_call(frame.extra)?` runs after the locals are deallocated
+and before the stack pop action is inspected, as in `evalReturnM`: under
+Tree Borrows it releases the protectors of the unwinding frame, and a `Stop`
+it raises preempts the UB of either stack pop action. -/
+def evalResumeUnwindM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) :
+    Interp (Machine M) := do
+  let t ← activeThreadM m
+  let frame ← match t.stack.getLast? with
+    | some f => pure f
+    | none => specPanic "stack.pop().unwrap()"
+  let threads ← listSet m.threads m.active_thread { t with stack := t.stack.dropLast } "pop"
+  let m := { m with threads := threads }
+  let (frame, cm) ← deallocAllM frame.locals.entries.length frame m.mem
+  let cm ← ConcurrentMemory.end_call cm frame.extra
+  let m := { m with mem := cm }
+  match frame.stack_pop_action with
+  | .BottomOfStack => ub "the function at the bottom of the stack must not unwind"
+  | .BackToCaller _ unwindBlock _ =>
+    match unwindBlock with
+    | some unwindBlock => jumpToBlockM m unwindBlock
+    | none => ub "unwinding from a function where the caller did not specify an unwind_block"
+
 /-- Polymorphic `Machine::eval_terminator` (`spec/lang/step/terminators.md`);
 see `evalTerminator`:
 > "fn eval_terminator(&mut self, Terminator::Goto(block_name): Terminator) -> NdResult {
@@ -8557,6 +8850,30 @@ see `evalTerminator`:
 > ..
 > fn eval_terminator(&mut self, Terminator::Unreachable: Terminator) -> NdResult {
 >     throw_ub!(\"reached unreachable code\");
+> }
+> ..
+> fn eval_terminator(&mut self, Terminator::StartUnwind { unwind_payload, unwind_block }: Terminator) -> NdResult {
+>     let (Value::Ptr(unwind_payload), Type::Ptr(PtrType::Raw { meta_kind: PointerMetaKind::None })) =
+>         self.eval_value(unwind_payload)?
+>     else {
+>         panic!(\"StartUnwind: the unwind payload is not a raw pointer\");
+>     };
+>     self.mutate_active_thread(|thread| {
+>         thread.unwind_payloads.push(unwind_payload.thin_pointer)
+>     });
+>     self.jump_to_block(unwind_block)?;
+>     ret(())
+> }
+> ..
+> fn eval_terminator(&mut self, Terminator::StopUnwind(block_name): Terminator) -> NdResult {
+>     self.mutate_active_thread(|thread| -> Result<()>{
+>         let Some(_) = thread.unwind_payloads.pop() else {
+>             throw_ub!(\"StopUnwind: the payload stack is empty\");
+>         };
+>         ret(())
+>     } )?;
+>     self.jump_to_block(block_name)?;
+>     ret(())
 > }" -/
 def evalTerminatorM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) :
     Terminator → Interp (Machine M)
@@ -8575,6 +8892,23 @@ def evalTerminatorM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) :
     let (arguments, m) ← evalArgumentsM m arguments
     evalCallM m callee callerConv arguments (retPlace, retTy) nextBlock unwindBlock
   | .Return => evalReturnM m
+  | .StartUnwind unwindPayload unwindBlock => do
+    let ((val, ty), m) ← evalValueM m unwindPayload
+    match val, ty with
+    | .Ptr unwindPayload, .Ptr (.Raw .None) => do
+      let (_, m) ← mutateActiveThreadM m (fun thread => pure ((),
+        { thread with
+          unwind_payloads := thread.unwind_payloads ++ [unwindPayload.thin_pointer] }))
+      jumpToBlockM m unwindBlock
+    | _, _ => specPanic "StartUnwind: the unwind payload is not a raw pointer"
+  | .StopUnwind blockName => do
+    let (_, m) ← mutateActiveThreadM m (fun thread =>
+      match thread.unwind_payloads.getLast? with
+      | some _ =>
+        pure ((), { thread with unwind_payloads := thread.unwind_payloads.dropLast })
+      | none => ub "StopUnwind: the payload stack is empty")
+    jumpToBlockM m blockName
+  | .ResumeUnwind => evalResumeUnwindM m
   | .Intrinsic intrinsic arguments retExpr nextBlock => do
     let ((retPlace, retTy), m) ← evalPlaceM m retExpr
     let (args, m) ← evalArgsM m arguments
@@ -8583,7 +8917,6 @@ def evalTerminatorM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) :
     match nextBlock with
     | some nb => jumpToBlockM m nb
     | none => ub "return from an intrinsic where caller did not specify next block"
-  | _ => unsupported "eval_terminator for a terminator other than Goto/Switch/Unreachable/Call/Return/Intrinsic"
 
 /-- Polymorphic `Machine::step` (`spec/lang/machine.md`); see `step`:
 > "if !self.threads.any(|thread| thread.state == ThreadState::Enabled) { throw_deadlock!(); }

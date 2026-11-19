@@ -7868,7 +7868,23 @@ theorem evalStatementM_bm_eq (m : Mach) (stmt : Gen.Statement) :
           | error _ => rfl
           | ok sz =>
             dsimp only [bind, Except.bind, cm_deinit_bm_eq]
-  | _ => rfl
+  | SetDiscriminant dst value =>
+    dsimp only [evalStatementM, evalStatement]
+    unfold evalSetDiscriminantM evalSetDiscriminant
+    refine bind_congr (evalPlaceM_bm_eq m dst) (fun ⟨⟨place, ty⟩, m1⟩ => ?_)
+    dsimp only
+    cases ty with
+    | Enum variants _ _ _ _ =>
+      dsimp only
+      split
+      · rfl
+      · cases mapGet variants value with
+        | none => rfl
+        | some variant =>
+          dsimp only
+          rw [encodeDiscriminantM_bm_eq]
+          rfl
+    | _ => rfl
 
 private theorem deallocAllM_bm_eq :
     ∀ (fuel : Nat) (fr : Frame) (cm : Gen.ConcurrentMemory BM),
@@ -8295,6 +8311,40 @@ private theorem evalReturnM_bm_eq (m : Mach) :
                             | none => rfl
                             | some nb => exact jumpToBlockM_bm_eq m2 nb
 
+private theorem mutateActiveThreadM_bm_eq {α : Type} (m : Mach)
+    (f : Gen.Thread BM → Interp (α × Gen.Thread BM)) :
+    mutateActiveThreadM (M := BM) m f = mutateActiveThread m f := rfl
+
+private theorem evalResumeUnwindM_bm_eq (m : Mach) :
+    evalResumeUnwindM (M := BM) m = evalResumeUnwind m := by
+  unfold evalResumeUnwindM evalResumeUnwind activeThreadM activeThread
+  cases listIndex m.threads m.active_thread "self.threads[self.active_thread]" with
+  | error _ => rfl
+  | ok t =>
+    dsimp only [bind, Except.bind]
+    cases t.stack.getLast? with
+    | none => rfl
+    | some frame =>
+      dsimp only [pure, Except.pure, bind, Except.bind]
+      cases listSet m.threads m.active_thread { t with stack := t.stack.dropLast } "pop" with
+      | error _ => rfl
+      | ok threads =>
+        dsimp only [bind, Except.bind]
+        rw [deallocAllM_bm_eq]
+        rcases deallocAll frame.locals.entries.length frame m.mem with _ | ⟨fr2, cm2⟩
+        · rfl
+        · have hend : ConcurrentMemory.end_call (M := BM) cm2 fr2.extra = .ok cm2 := rfl
+          dsimp only [bind, Except.bind]
+          rw [hend]
+          dsimp only
+          cases fr2.stack_pop_action with
+          | BottomOfStack => rfl
+          | BackToCaller _ unwindBlock _ =>
+            dsimp only
+            cases unwindBlock with
+            | none => rfl
+            | some unwindBlock => exact jumpToBlockM_bm_eq _ unwindBlock
+
 theorem evalTerminatorM_bm_eq (m : Mach) (term : Gen.Terminator) :
     evalTerminatorM (M := BM) m term = evalTerminator m term := by
   cases term with
@@ -8330,7 +8380,25 @@ theorem evalTerminatorM_bm_eq (m : Mach) (term : Gen.Terminator) :
     cases nextBlock with
     | none => rfl
     | some nb => exact jumpToBlockM_bm_eq m4 nb
-  | _ => rfl
+  | StartUnwind payload blk =>
+    unfold evalTerminatorM Interp.evalTerminator
+    refine bind_congr (evalValueM_bm_eq m payload) (fun ⟨⟨v, ty⟩, m1⟩ => ?_)
+    dsimp only
+    split
+    · exact bind_congr (mutateActiveThreadM_bm_eq m1 _)
+        (fun ⟨_, m2⟩ => jumpToBlockM_bm_eq m2 blk)
+    · split
+      · rename_i hne
+        exact (hne _ rfl rfl).elim
+      · rfl
+  | StopUnwind blk =>
+    unfold evalTerminatorM Interp.evalTerminator
+    refine bind_congr ?_ (fun ⟨_, m1⟩ => jumpToBlockM_bm_eq m1 blk)
+    rw [mutateActiveThreadM_bm_eq]
+    congr 1
+    funext thread
+    cases thread.unwind_payloads.getLast? <;> rfl
+  | ResumeUnwind => exact evalResumeUnwindM_bm_eq m
 
 private theorem pickActiveThreadM_bm_eq (m : Mach) :
     pickActiveThreadM (M := BM) m = pickActiveThread m := by
@@ -10495,6 +10563,26 @@ theorem retagArrayElemsM_tb_wfLive (elemTy : Gen.Type) :
 
 end
 
+/-- `encodeDiscriminantM` preserves every invariant `P` of the threaded state
+that each call of its accessor preserves. -/
+private theorem encodeDiscriminantM_inv {M : Type} [Gen.Memory M] {σ : Type} (P : σ → Prop)
+    {accessor : σ → Gen.Offset → List (Gen.AbstractByte (Gen.Memory.Provenance M)) → Interp σ}
+    (hacc : ∀ s offset bytes s', P s → accessor s offset bytes = .ok s' → P s')
+    {tagger : Map Gen.Offset (Gen.IntType × Int)} {s s' : σ}
+    (hs : P s) (h : encodeDiscriminantM (M := M) accessor tagger s = .ok s') : P s' := by
+  unfold encodeDiscriminantM at h
+  generalize tagger.entries = entries at h
+  induction entries generalizing s with
+  | nil =>
+    obtain rfl := interp_pure_ok h
+    exact hs
+  | cons e es ih =>
+    obtain ⟨offset, valueType, value⟩ := e
+    rw [List.foldlM_cons] at h
+    obtain ⟨s1, h1, h⟩ := bind_ok h
+    obtain ⟨bytes, _, h1⟩ := bind_ok h1
+    exact ih (hacc _ _ _ _ hs h1) h
+
 /-- `evalStatementM` on `MachTB` preserves `MachTB.wfLive`. -/
 theorem evalStatementM_tb_wfLive {m m' : MachTB} {stmt : Gen.Statement}
     (hwf : MachTB.wfLive m) (h : evalStatementM m stmt = .ok m') :
@@ -10539,8 +10627,28 @@ theorem evalStatementM_tb_wfLive {m m' : MachTB} {stmt : Gen.Statement}
       obtain ⟨cm, hd, h⟩ := bind_ok h
       obtain rfl := interp_pure_ok h
       exact cm_tb_deinit_wfLive hm1 hd
-  | _ =>
-    unfold evalStatementM at h; cases h
+  | SetDiscriminant dst value =>
+    unfold evalStatementM evalSetDiscriminantM at h
+    obtain ⟨⟨⟨place, ty⟩, m1⟩, hp, h⟩ := bind_ok h
+    have hm1 := evalPlaceM_tb_wfLive dst hwf hp
+    cases ty with
+    | Enum variants _ _ _ _ =>
+      dsimp only at h
+      cases hpa : place.aligned with
+      | false => simp only [hpa, Bool.not_false, ↓reduceIte] at h; cases h
+      | true =>
+        simp only [hpa, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h
+        cases hv : mapGet variants value with
+        | none => simp only [hv] at h; cases h
+        | some variant =>
+          simp only [hv] at h
+          refine encodeDiscriminantM_inv MachTB.wfLive
+            (fun s offset bytes s' hs hacc => ?_) hm1 h
+          obtain ⟨p, _, hacc⟩ := bind_ok hacc
+          obtain ⟨cm, hst, hacc⟩ := bind_ok hacc
+          obtain rfl := interp_pure_ok hacc
+          exact cm_tb_store_wfLive hs hst
+    | _ => dsimp only at h; cases h
 
 /-- `machineExitM` never returns normally (`Machine::exit` ends in
 `throw_machine_stop!()` or a memory leak). -/
@@ -10886,6 +10994,49 @@ theorem evalReturnM_tb_wfLive {m m' : MachTB}
         | none => cases h
         | some nb => exact jumpToBlockM_tb_wfLive hm2 h
 
+/-- `mutateActiveThreadM` on `MachTB` preserves `MachTB.wfLive`: it rewrites
+one thread and leaves the memory alone. -/
+private theorem mutateActiveThreadM_tb_wfLive {α : Type} {m m' : MachTB} {out : α}
+    {f : Gen.Thread TBM → Interp (α × Gen.Thread TBM)}
+    (hwf : MachTB.wfLive m) (h : mutateActiveThreadM m f = .ok (out, m')) :
+    MachTB.wfLive m' := by
+  unfold mutateActiveThreadM at h
+  obtain ⟨t, _, h⟩ := bind_ok h
+  obtain ⟨⟨_, t'⟩, _, h⟩ := bind_ok h
+  obtain ⟨threads, _, h⟩ := bind_ok h
+  obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+  exact hwf
+
+/-- `evalResumeUnwindM` on `MachTB` preserves `MachTB.wfLive` across local
+teardown (`deallocAllM`), frame protector release (`end_call`), and the jump
+to the caller's unwind block. -/
+private theorem evalResumeUnwindM_tb_wfLive {m m' : MachTB}
+    (hwf : MachTB.wfLive m) (h : evalResumeUnwindM m = .ok m') :
+    MachTB.wfLive m' := by
+  unfold evalResumeUnwindM at h
+  obtain ⟨t, _, h⟩ := bind_ok h
+  dsimp only at h
+  cases hlast : t.stack.getLast? with
+  | none => simp only [hlast] at h; cases h
+  | some f =>
+    simp only [hlast] at h
+    obtain ⟨frame, hfr, h⟩ := bind_ok h
+    cases interp_pure_ok hfr
+    obtain ⟨threads, _, h⟩ := bind_ok h
+    obtain ⟨⟨frame1, cm1⟩, hdealloc, h⟩ := bind_ok h
+    dsimp only at h
+    have hcm1 := deallocAllM_tb_wfLive f.locals.entries.length (cm := m.mem) hwf hdealloc
+    obtain ⟨cm2, hend, h⟩ := bind_ok h
+    have hcm2 : MachTB.wfLive { { m with threads := threads } with mem := cm2 } :=
+      cm_tb_end_call_wfLive hcm1 hend
+    cases hspa : frame1.stack_pop_action with
+    | BottomOfStack => simp only [hspa] at h; cases h
+    | BackToCaller _ unwindBlock _ =>
+      simp only [hspa] at h
+      cases unwindBlock with
+      | none => cases h
+      | some unwindBlock => exact jumpToBlockM_tb_wfLive hcm2 h
+
 /-- `evalTerminatorM` on `MachTB` preserves `MachTB.wfLive`. -/
 theorem evalTerminatorM_tb_wfLive {m m' : MachTB} {term : Gen.Terminator}
     (hwf : MachTB.wfLive m) (h : evalTerminatorM m term = .ok m') :
@@ -10926,7 +11077,20 @@ theorem evalTerminatorM_tb_wfLive {m m' : MachTB} {term : Gen.Terminator}
     cases nextBlock with
     | none => cases h
     | some nb => exact jumpToBlockM_tb_wfLive hm4 h
-  | _ => unfold evalTerminatorM at h; cases h
+  | StartUnwind payload blk =>
+    unfold evalTerminatorM at h
+    obtain ⟨⟨⟨v, ty⟩, m1⟩, hv, h⟩ := bind_ok h
+    dsimp only at h
+    have hm1 := evalValueM_tb_wfLive payload hwf hv
+    split at h
+    · obtain ⟨⟨_, m2⟩, hmut, h⟩ := bind_ok h
+      exact jumpToBlockM_tb_wfLive (mutateActiveThreadM_tb_wfLive hm1 hmut) h
+    · cases h
+  | StopUnwind blk =>
+    unfold evalTerminatorM at h
+    obtain ⟨⟨_, m1⟩, hmut, h⟩ := bind_ok h
+    exact jumpToBlockM_tb_wfLive (mutateActiveThreadM_tb_wfLive hwf hmut) h
+  | ResumeUnwind => exact evalResumeUnwindM_tb_wfLive hwf h
 
 /-- Every single step of `MachTB` (`stepTB`) preserves `MachTB.wfLive`. -/
 theorem stepTB_wfLive {m m' : MachTB}
