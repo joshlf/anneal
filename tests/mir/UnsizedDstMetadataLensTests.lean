@@ -2202,7 +2202,8 @@ Seam: the first two intervals start at the exclusive end anchors of
 audited by that file (its `lastAnchor`), and no declaration may start between `prevAnchor` and
 `startAnchor`. Together the two audits therefore cover those modules from that file's start
 anchors through these end anchors without gap or overlap, and moving the boundary in only one of
-the two files, or adding a declaration at the boundary, fails here or there.
+the two files, or adding a declaration at the boundary, fails here or there. This holds only
+where both files are elaborated: a runner that elaborates one of them audits only its side.
 (`V2026_06_01Bridge` has no such neighbor.)
 
 Fails closed if an anchor is missing, has no source range, belongs to the wrong module, is

@@ -1905,7 +1905,8 @@ Seam: each interval also names `lastAnchor`, the last top-level declaration befo
 end anchor, and no declaration may start between the two. `UnsizedDstMetadataLensTests.lean` names
 the same pair (as `prevAnchor` / `startAnchor`), so moving the boundary in only one of the two
 files, or adding a declaration at the boundary, fails here or there instead of silently leaving
-declarations that neither file audits.
+declarations that neither file audits. This holds only where both files are elaborated: a runner
+that elaborates this file alone audits nothing at or after the exclusive end anchors.
 
 Fails closed if an anchor is missing, has no source range, belongs to the wrong module, or is
 misordered; if the start or last anchor was not audited or the end anchor was; if any declaration
