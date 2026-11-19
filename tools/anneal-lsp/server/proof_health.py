@@ -2838,13 +2838,20 @@ def _adv_match_close(stripped: str, open_idx: int, n: int) -> int:
 
 
 def _adv_scan_to(
-    stripped: str, pos: int, n: int, min_indent: int, stops: frozenset[str]
+    stripped: str,
+    pos: int,
+    n: int,
+    min_indent: int,
+    stops: frozenset[str],
+    *,
+    same_line_stops: frozenset[str] = _ADV_NO_STOPS,
 ) -> tuple[int, str, int]:
     """Follow the tactic step (or term) starting at `pos` and return `(end, token, next)`,
     where it stops outside every bracket opened after `pos`:
 
-    * at a token of `stops` (`;`, `<;>`, `,`, `:=`, `by`, `from`, `at`): `token` is that
-      token and `next` the offset just past it;
+    * at a token of `stops` (`;`, `<;>`, `,`, `:=`, `by`, `from`, `at`) or (before the
+      first newline at depth 0) a token of `same_line_stops`: `token` is that token and
+      `next` the offset just past it;
     * at a line end whose next non-blank line is indented less than `min_indent` (a new
       step or a dedent; more deeply indented lines continue the step): `token` is `"\\n"`
       and `next` the offset of that next line's first character;
@@ -2852,6 +2859,7 @@ def _adv_scan_to(
       text, or after `_ADV_SCAN_LIMIT` characters (`token` `""`): `next` is `-1`.
     """
     depth = 0
+    crossed_nl = False
     hard_end = pos + _ADV_SCAN_LIMIT
     if hard_end > n:
         hard_end = n
@@ -2877,7 +2885,8 @@ def _adv_scan_to(
                 return n, "", -1
             if k - line.start(1) < min_indent:
                 return m.start(), "\n", k
-        elif tok in stops:
+            crossed_nl = True
+        elif tok in stops or (not crossed_nl and tok in same_line_stops):
             return m.start(), tok, m.end()
     return hard_end, "", -1
 
@@ -2938,11 +2947,12 @@ def _bracket_unfolds_advance_stmt(bracket_text: str) -> bool:
 
 def _parse_simp_call(
     stripped: str, s_idx: int, n: int, has_guillemets: bool = False
-) -> tuple[str, bool, int, bool, str, tuple[str, ...] | None, bool] | None:
-    """`(tactic_kind, is_dsimp, end, has_only, bracket_text, at_locs, has_using)` of the
+) -> tuple[str, bool, int, bool, str, tuple[str, ...] | None, int] | None:
+    """`(tactic_kind, is_dsimp, end, has_only, bracket_text, at_locs, using_pos)` of the
     simp-family call whose `simp` is at `s_idx` (`dsimp`, `simp`, `simp?`, `simp!`, `simpa`,
     `simp_all`, `simp_arith`, `simp_rw`, ...), or `None` when `simp` is only part of a longer
-    name (`foo.simp`, `simp_wf`, `my_simp`, `«simp»`).
+    name (`foo.simp`, `simp_wf`, `my_simp`, `«simp»`). `using_pos` is the offset of `simpa`'s
+    `using` keyword or `-1`.
 
     `stripped[s_idx:end]` covers named argument groups (`(config := ...)`, `(disch := ...)`),
     `+opt` / `-opt`, `only`, the `[...]` lemma list, optional `at <locs>`, and (for `simpa`)
@@ -3008,7 +3018,7 @@ def _parse_simp_call(
             break
     step_col = _adv_step_col(stripped, s_idx)
     at_locs: tuple[str, ...] | None = None
-    has_using = False
+    using_pos = -1
     k = _adv_skip_ws(stripped, end, n)
     if _adv_word_at(stripped, k, "at", n):
         scanned_locs, k_after_at = _adv_scan_at_locations(
@@ -3019,9 +3029,9 @@ def _parse_simp_call(
     if variant == "a":
         k = _adv_skip_ws(stripped, end, n)
         if _adv_word_at(stripped, k, "using", n):
-            has_using = True
+            using_pos = k
             end = _adv_scan_to(stripped, k + 5, n, step_col + 1, _ADV_USING_STOPS)[0]
-    return tactic_kind, is_dsimp, end, has_only, bracket_text, at_locs, has_using
+    return tactic_kind, is_dsimp, end, has_only, bracket_text, at_locs, using_pos
 
 
 def _advance_stmt_projection_chains(
@@ -3120,30 +3130,18 @@ def _enclosing_simp_call(
     return None
 
 
-def _call_mentions_ident(args_slice: str, ident: str, *, has_using: bool = False) -> bool:
+def _call_mentions_ident(args_slice: str, ident: str, *, using_rel: int = -1) -> bool:
     """True when `args_slice` (after the simp tactic head) references `ident` positively,
     allowing projections (`h.symm`, `h.1`) while excluding qualified names (`Foo.h`,
-    `Foo.«h»`), simp erasures (`[-h]`), config flags (`-zeta`, `+zeta`), and named
-    config/field assignments (`zeta := false`)."""
+    `Foo.«h»`), pre-bracket `only` / config flags (`-zeta`, `+zeta`), named config/field
+    assignments (`zeta := false`), and simp erasures (`[-h]`). `using_rel` is the offset in
+    `args_slice` right past `simpa`'s `using` keyword, or `-1`."""
     if not ident:
         return False
     is_gui = ident[0] == "«"
     klen = len(ident)
     n_sl = len(args_slice)
     has_gui = "«" in args_slice
-    using_rel = -1
-    if has_using:
-        u = args_slice.rfind("using")
-        while u != -1:
-            if (
-                u == 0 or not (_is_ident_char(args_slice[u - 1]) or args_slice[u - 1] in ".«")
-            ) and (
-                u + 5 >= n_sl
-                or not (_is_ident_char(args_slice[u + 5]) or args_slice[u + 5] in ".»")
-            ):
-                using_rel = u + 5
-                break
-            u = args_slice.rfind("using", 0, u)
     pos = args_slice.find(ident)
     while pos != -1:
         end = pos + klen
@@ -3160,7 +3158,12 @@ def _call_mentions_ident(args_slice: str, ident: str, *, has_using: bool = False
             and (is_gui or not (has_gui and lean_lexer._inside_guillemets(args_slice, pos)))
         ):
             in_using = using_rel != -1 and pos >= using_rel
-            if ident == "only" and not in_using:
+            if (
+                ident == "only"
+                and not in_using
+                and "[" not in args_slice[:pos]
+                and args_slice.count("(", 0, pos) <= args_slice.count(")", 0, pos)
+            ):
                 pos = args_slice.find(ident, end)
                 continue
             f = _adv_skip_ws(args_slice, end, n_sl)
@@ -3236,7 +3239,7 @@ def _simp_step_at(
         call = _parse_simp_call(stripped, s, n, has_guillemets)
         if call is None:
             return None
-        tactic_kind, is_dsimp, call_end, has_only, bracket_text, at_locs, has_using = call
+        tactic_kind, is_dsimp, call_end, _, bracket_text, at_locs, using_pos = call
         has_star = at_locs is not None and "*" in at_locs
         loc_set = (
             frozenset(("⊢",))
@@ -3248,16 +3251,20 @@ def _simp_step_at(
                 return tactic_kind, s
             if rem_targets & loc_set:
                 return tactic_kind, s
-            args_slice = stripped[s + len(tactic_kind) : call_end]
+            args_start = s + len(tactic_kind)
+            args_slice = stripped[args_start:call_end]
+            using_rel = using_pos + 5 - args_start if using_pos != -1 else -1
             for hyp in rem_targets:
                 if hyp != "⊢" and (
-                    _call_mentions_ident(args_slice, hyp, has_using=has_using)
-                    or (hyp == "this" and tactic_kind.startswith("simpa") and not has_using)
+                    _call_mentions_ident(args_slice, hyp, using_rel=using_rel)
+                    or (hyp == "this" and tactic_kind.startswith("simpa") and using_pos == -1)
                 ):
                     return tactic_kind, s
         else:
-            unfolds_adv = (not has_only) or _bracket_unfolds_advance_stmt(bracket_text)
-            if unfolds_adv:
+            # `advanceStmt` is a plain `def` (neither `@[simp]` nor `@[reducible]`), so
+            # bare `dsimp`, `dsimp [unrelatedDef]`, and `dsimp [-advanceStmt]` leave it
+            # uncollapsed; only an explicit `advanceStmt` unfold entry collapses it.
+            if _bracket_unfolds_advance_stmt(bracket_text):
                 if rem_targets is None or has_star:
                     return None
                 rem_targets = rem_targets - loc_set
@@ -3379,17 +3386,25 @@ def _simp_after_statement(
             if p != -1
             else None
         )
-        if (
-            step is None
-            and statement_kw == "suffices"
-            and entered_own_by
-            and p != -1
-            and _adv_col(stripped, p) > col
-        ):
-            _, tok2, nxt2 = _adv_scan_to(stripped, p, n, col + 1, _ADV_NO_STOPS)
-            if tok2 == "\n" and _adv_col(stripped, nxt2) == col:
+        if step is None and statement_kw == "suffices" and entered_own_by and p != -1:
+            post_p = -1
+            if stripped[p] == "{":
+                close_brace = _adv_match_close(stripped, p, n)
+                if close_brace != -1:
+                    _, tok2, nxt2 = _adv_scan_to(
+                        stripped, close_brace + 1, n, col + 1, _ADV_STEP_STOPS
+                    )
+                    if tok2 in (";", "<;>"):
+                        post_p = _adv_skip_ws(stripped, nxt2, n)
+                    elif tok2 == "\n" and _adv_col(stripped, nxt2) == col:
+                        post_p = nxt2
+            elif _adv_col(stripped, p) > col:
+                _, tok2, nxt2 = _adv_scan_to(stripped, p, n, col + 1, _ADV_NO_STOPS)
+                if tok2 == "\n" and _adv_col(stripped, nxt2) == col:
+                    post_p = nxt2
+            if post_p != -1:
                 step = _simp_step_at(
-                    stripped, nxt2, n, has_guillemets, targets=frozenset(("⊢",))
+                    stripped, post_p, n, has_guillemets, targets=frozenset(("⊢",))
                 )
         if step is None:
             continue  # inner term/statement did not lead to `simp`: try an enclosing one
@@ -3562,7 +3577,9 @@ def _try_rewrite_hyp_before_target(
             # belongs to a nested `cases` / `match` / `first` / `rcases` tactic.
             line_start = stripped.rfind("\n", 0, t) + 1
             in_first_arm = _is_in_first_arm(stripped, line_start, t)
-            try_stops = _ADV_TRY_STOPS if in_first_arm else _ADV_NO_STOPS
+            same_line_stops = (
+                _ADV_TRY_STOPS if (in_first_arm and not has_nl_after_try) else _ADV_NO_STOPS
+            )
             min_indent = min(first_col, try_col + 1) if first_col > try_col else first_col
             if not has_nl_after_try and not in_first_arm and stripped[first] not in "({":
                 flat = flat_line.match(stripped, first)
@@ -3574,7 +3591,9 @@ def _try_rewrite_hyp_before_target(
                             for head in rw_head.finditer(stripped, first, flat_end):
                                 consider(head)
                         continue
-            scope_end = _adv_scan_to(stripped, first, n, min_indent, try_stops)[0]
+            scope_end = _adv_scan_to(
+                stripped, first, n, min_indent, _ADV_NO_STOPS, same_line_stops=same_line_stops
+            )[0]
         if find("w", first, scope_end) != -1:
             for head in rw_head.finditer(stripped, first, scope_end):
                 consider(head)

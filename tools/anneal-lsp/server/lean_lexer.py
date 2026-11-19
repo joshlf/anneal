@@ -552,6 +552,7 @@ def _inside_guillemets(stripped: str, pos: int) -> bool:
         and g + 1 < line_end
         and stripped[g - 1] == "'"
         and stripped[g + 1] == "'"
+        and (g < 2 or (not is_ident_char(stripped[g - 2]) and stripped[g - 2] != "\\"))
     ):
         g = stripped.rfind("«", line_start, g)
     if g == -1:
@@ -985,14 +986,15 @@ def _enclosing_col0_block(stripped: str, pos: int, line_start: int, cmd_re, n: i
 
 
 def _may_have_unclosed_bracket(seg: str) -> bool:
-    """Fast `str.count` prefilter: True when `seg` may hold an unclosed `(`, `[`, `{`, `⟨`."""
-    if (
-        seg.count("(") > seg.count(")")
-        or seg.count("[") > seg.count("]")
-        or seg.count("{") > seg.count("}")
-        or seg.count("⟨") > seg.count("⟩")
-    ):
-        return True
+    """Fast `str.count`/`find`/`rfind` prefilter: True when `seg` may hold an unclosed
+    `(`, `[`, `{`, `⟨` (including after an earlier stray closing bracket)."""
+    for o, c in (("(", ")"), ("[", "]"), ("{", "}"), ("⟨", "⟩")):
+        co = seg.count(o)
+        if co == 0:
+            continue
+        cc = seg.count(c)
+        if co != cc or seg.rfind(o) > seg.rfind(c) or (cc > 0 and seg.find(c) < seg.find(o)):
+            return True
     return ("«" in seg or "'" in seg) and any(c in seg for c in "([{⟨")
 
 
@@ -1081,9 +1083,10 @@ def _column_of(stripped: str, pos: int) -> int:
     return pos - (stripped.rfind("\n", 0, pos) + 1)
 
 
-def _true_line_indent(text: str, line_start: int, first_tok_pos: int) -> int:
+def _true_line_indent(text: str, stripped: str, line_start: int, first_tok_pos: int) -> int:
     """True visual indentation of the line starting at `line_start` before `first_tok_pos`,
-    unaffected by inline `/- ... -/` block comments blanked into spaces in `stripped`."""
+    unaffected by inline or multi-line `/- ... -/` block comments blanked into spaces in
+    `stripped`."""
     if first_tok_pos <= line_start:
         return 0
     k = line_start
@@ -1091,16 +1094,37 @@ def _true_line_indent(text: str, line_start: int, first_tok_pos: int) -> int:
     limit = first_tok_pos if first_tok_pos < n else n
     while k < limit and text[k] in " \t":
         k += 1
-    if k == first_tok_pos or text.startswith("/-", k):
+    if k == first_tok_pos or text.startswith("/-", k) or (k < len(stripped) and stripped[k] != " "):
         return k - line_start
-    open_c = text.rfind("/-", 0, first_tok_pos)
-    if open_c != -1:
-        c_line = text.rfind("\n", 0, open_c) + 1
+    # `text[k]` was blanked into spaces by a multi-line block comment opened on an earlier
+    # line. Walk backwards matching nested `-/` and `/-` (ignoring delimiters inside code/
+    # strings/guillemets where `stripped[pos] != " "`) to locate the outermost `/-`.
+    depth = 1
+    cur = k
+    outer_open = -1
+    while cur > 0 and depth > 0:
+        o = text.rfind("/-", 0, cur)
+        if o == -1:
+            break
+        c = text.rfind("-/", o + 2, cur)
+        if c != -1:
+            if stripped[c] == " ":
+                depth += 1
+            cur = c
+        else:
+            if stripped[o] == " ":
+                depth -= 1
+                if depth == 0:
+                    outer_open = o
+                    break
+            cur = o
+    if outer_open != -1:
+        c_line = text.rfind("\n", 0, outer_open) + 1
         j = c_line
-        while j < open_c and text[j] in " \t":
+        while j < outer_open and text[j] in " \t":
             j += 1
-        if j == open_c:
-            return open_c - c_line
+        if j == outer_open:
+            return outer_open - c_line
     return k - line_start
 
 
@@ -1318,14 +1342,14 @@ def _find_in_governed_end(
     # Multi-line scan: any non-continuation command starting at or left of the governed
     # command's own true line indentation ends it (skipping syntax quotations).
     p_line_start = stripped.rfind("\n", 0, p) + 1
-    stop_indent = max(cmd_indent, _true_line_indent(src, p_line_start, p))
+    stop_indent = max(cmd_indent, _true_line_indent(src, stripped, p_line_start, p))
     cur = line_end
     while cur < n:
         m = line_re.search(stripped, cur)
         if m is None:
             return n, False
         cand = m.end()
-        indent = _true_line_indent(src, m.start() + 1, cand)
+        indent = _true_line_indent(src, stripped, m.start() + 1, cand)
         if (
             indent <= stop_indent
             and not (quot_spans and _inside_spans(quot_spans, cand))
@@ -1580,7 +1604,7 @@ class NamespaceTracker:
             if in_end != -1:
                 consumed = in_end
                 pos_line_start = stripped.rfind("\n", 0, pos) + 1
-                cmd_indent = min(kw_col, _true_line_indent(text, pos_line_start, pos))
+                cmd_indent = min(kw_col, _true_line_indent(text, stripped, pos_line_start, pos))
                 end_off, is_mut = _find_in_governed_end(
                     stripped, in_end, cmd_indent, text=text, quot_spans=quot_spans
                 )
