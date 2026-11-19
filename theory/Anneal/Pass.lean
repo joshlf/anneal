@@ -22,6 +22,13 @@ By projecting raw `List (Event E)` traces via Lean's standard `List.filterMap`
 and `List.IsPrefix` (`<+:`) rather than duplicating operational transition
 relations, cross-effect compiler passes, `.tau`-erasing optimizer passes, and
 Layer 1A `Language` / `Semantics` adequacy follow concisely and compositionally.
+
+Sections 5–8 instantiate gap-preserving equivalence
+(`Anneal.Refinement.ContextEquiv`) on `ITreeF` coalgebras and `MirStepNode`:
+gap-aware outcome classification (`ExecFault`, `GapTag`), fuel-indexed stepping
+(`runStepsWithGap`, `runMirStepsWithGap`), multi-step and call-handler
+congruence, certificate checkers (`VerifiedContextChecker`), and adequacy for
+the interaction tree unfolded by `ITree.cofix`.
 -/
 
 universe u u₁ u₂ u₃ v₁ v₂
@@ -644,5 +651,1566 @@ theorem eliminateTauForwarder_exactPass
       p (sys.redirectEdges p b c) :=
   exactPass_of_eutt sys.machine sys.machine proj
     (eliminateTauForwarder_eutt sys law p b c hne hfwd)
+
+universe w₁ w₂ w₃ w₄ w₅ w₆ w₇
+
+/-! ## 5. Gap-Aware Outcome Classification and Fuel-Indexed Stepping
+
+Bounded evaluation of an `ITreeF` coalgebra into `OutcomeWithGap`, keeping three
+kinds of non-value results apart:
+
+- `ExecFault.ub`: undefined behavior (`FailureKind.ub`);
+- `ExecFault.panic` / `ExecFault.abort`: *defined* runtime failures
+  (`Outcome.panic` / `Outcome.abort`), never identified with UB;
+- `GapTag`: modeling and budget gaps of the interpreter
+  (`FailureKind.unsupported`, `FailureKind.outOfFuel`, unresolved callees, and
+  the evaluator's own exhausted fuel), which always become `.gap` and never
+  `.ok` or `.fault`.
+-/
+
+/-- Runtime faults of an execution: undefined behavior or a defined failure. -/
+inductive ExecFault : Type where
+  /-- Undefined behavior (`FailureKind.ub`). -/
+  | ub
+  /-- Defined unwinding panic (`Outcome.panic`). -/
+  | panic
+  /-- Defined process abort (`Outcome.abort`). -/
+  | abort
+  deriving DecidableEq, Repr
+
+/-- `.ub` is undefined behavior; `.panic` and `.abort` are defined failures. -/
+def ExecFault.isUB : ExecFault → Prop
+  | .ub => True
+  | .panic => False
+  | .abort => False
+
+instance ExecFault.instDecidableIsUB : (e : ExecFault) → Decidable e.isUB
+  | .ub => isTrue trivial
+  | .panic => isFalse (fun h => h)
+  | .abort => isFalse (fun h => h)
+
+/--
+Modeling and budget gaps of the interpreter. `unsupported`, `budget` and
+`unresolved` carry the site (for MIR, the `DefPath` of the body being executed
+or of the unresolved callee), so gaps reached at different sites are different
+gaps.
+
+`outOfFuel` is reserved for the budget of the bounded evaluator itself (or of a
+handler whose budget grows with it): it is the only gap that a larger `fuel`
+can lift, and the fuel-free semantics `gapBehaviors` does not report it.
+-/
+inductive GapTag (Site : Type u) : Type u where
+  /-- Fail-closed unmodeled construct reached while executing `site`. -/
+  | unsupported (site : Site)
+  /-- The stepped machine itself reported an exhausted budget at `site`. -/
+  | budget (site : Site)
+  /-- Call to `site` that the callee environment does not resolve. -/
+  | unresolved (site : Site)
+  /-- The evaluator's own step budget ran out before the execution finished. -/
+  | outOfFuel
+  deriving DecidableEq, Repr
+
+/-- Classify a defined halting `Outcome`: never a gap and never UB. -/
+def classifyOutcome {Gap : Type u₁} {Val : Type u₂} :
+    Outcome Val → OutcomeWithGap ExecFault Gap Val
+  | .normal v => .ok v
+  | .panic => .fault .panic
+  | .abort => .fault .abort
+
+/--
+Classify an operational `FailureKind` raised at `site`: `.ub` is the runtime
+fault `ExecFault.ub`, while `.unsupported` and `.outOfFuel` are site-tagged
+gaps. A failure raised by the stepped machine is never the evaluator's own
+`GapTag.outOfFuel`, so it stays visible in the fuel-free semantics.
+-/
+def classifyFailure {Site : Type u₁} {Val : Type u₂} (site : Site) :
+    FailureKind → OutcomeWithGap ExecFault (GapTag Site) Val
+  | .ub => .fault .ub
+  | .unsupported => .gap (.unsupported site)
+  | .outOfFuel => .gap (.budget site)
+
+theorem classifyOutcome_isGapFree {Gap : Type u₁} {Val : Type u₂}
+    (out : Outcome Val) :
+    (classifyOutcome (Gap := Gap) out).isGapFree := by
+  cases out <;> exact trivial
+
+/-- Defined halting outcomes are defined: a panic or abort is never UB. -/
+theorem classifyOutcome_isDefined {Gap : Type u₁} {Val : Type u₂}
+    (out : Outcome Val) :
+    (classifyOutcome (Gap := Gap) out).isDefined ExecFault.isUB := by
+  cases out with
+  | normal v => exact trivial
+  | panic => exact fun h => h
+  | abort => exact fun h => h
+
+theorem classifyOutcome_ne_ub {Gap : Type u₁} {Val : Type u₂}
+    (out : Outcome Val) :
+    classifyOutcome (Gap := Gap) out ≠ .fault .ub := by
+  cases out <;> exact fun h => by cases h
+
+theorem classifyOutcome_injective {Gap : Type u₁} {Val : Type u₂}
+    {out₁ out₂ : Outcome Val}
+    (h : classifyOutcome (Gap := Gap) out₁ = classifyOutcome out₂) :
+    out₁ = out₂ := by
+  cases out₁ <;> cases out₂ <;> first | rfl | (cases h; rfl) | cases h
+
+/-- `.unsupported` always classifies as the site-tagged gap. -/
+@[simp]
+theorem classifyFailure_unsupported {Site : Type u₁} {Val : Type u₂} (site : Site) :
+    classifyFailure (Val := Val) site .unsupported = .gap (.unsupported site) :=
+  rfl
+
+@[simp]
+theorem classifyFailure_ub {Site : Type u₁} {Val : Type u₂} (site : Site) :
+    classifyFailure (Val := Val) site .ub = .fault .ub := rfl
+
+@[simp]
+theorem classifyFailure_outOfFuel {Site : Type u₁} {Val : Type u₂} (site : Site) :
+    classifyFailure (Val := Val) site .outOfFuel = .gap (.budget site) := rfl
+
+/-- A halting outcome is never the evaluator's budget gap. -/
+theorem classifyOutcome_ne_outOfFuel {Site : Type u₁} {Val : Type u₂}
+    (out : Outcome Val) :
+    classifyOutcome (Gap := GapTag Site) out ≠ .gap .outOfFuel := by
+  cases out <;> exact fun h => by cases h
+
+/-- A failure of the stepped machine is never the evaluator's budget gap. -/
+theorem classifyFailure_ne_outOfFuel {Site : Type u₁} {Val : Type u₂}
+    (site : Site) (kind : FailureKind) :
+    classifyFailure (Val := Val) site kind ≠ .gap .outOfFuel := by
+  cases kind <;> exact fun h => by cases h
+
+/-- A classified failure is gap-free exactly when it is UB. -/
+theorem classifyFailure_isGapFree_iff {Site : Type u₁} {Val : Type u₂}
+    (site : Site) (kind : FailureKind) :
+    (classifyFailure (Val := Val) site kind).isGapFree ↔ kind = .ub := by
+  cases kind with
+  | ub => exact ⟨fun _ => rfl, fun _ => trivial⟩
+  | unsupported => exact ⟨False.elim, fun h => by cases h⟩
+  | outOfFuel => exact ⟨False.elim, fun h => by cases h⟩
+
+/-- A classified failure is never a value and never a defined failure. -/
+theorem classifyFailure_fault_iff {Site : Type u₁} {Val : Type u₂}
+    (site : Site) (kind : FailureKind) (e : ExecFault) :
+    classifyFailure (Val := Val) site kind = .fault e ↔ kind = .ub ∧ e = .ub := by
+  cases kind with
+  | ub =>
+    exact ⟨fun h => by cases h; exact ⟨rfl, rfl⟩, fun ⟨_, h⟩ => by cases h; rfl⟩
+  | unsupported => exact ⟨fun h => (by cases h), fun ⟨h, _⟩ => by cases h⟩
+  | outOfFuel => exact ⟨fun h => (by cases h), fun ⟨h, _⟩ => by cases h⟩
+
+/-! ### Deterministic gap-classified machines -/
+
+/-- Result of one deterministic gap-classified step: continue or halt. -/
+inductive GapStep (State : Type u) (Fault : Type u₁) (Gap : Type u₂)
+    (Val : Type u₃) : Type (max u u₁ u₂ u₃) where
+  /-- Continue execution at `s`. -/
+  | next (s : State)
+  /-- Halt with outcome `out`. -/
+  | done (out : OutcomeWithGap Fault Gap Val)
+
+/--
+Relate two step results: continuing states by `R`, halting outcomes by
+`GapEqErr rVal rFault`. A continuing step never matches a halting step.
+-/
+def GapStep.Rel {State₁ : Type u} {State₂ : Type v₁} {Fault₁ : Type u₁}
+    {Fault₂ : Type v₂} {Gap : Type u₂} {Val₁ : Type u₃} {Val₂ : Type w₁}
+    (R : State₁ → State₂ → Prop)
+    (rVal : Val₁ → Val₂ → Prop) (rFault : Fault₁ → Fault₂ → Prop) :
+    GapStep State₁ Fault₁ Gap Val₁ → GapStep State₂ Fault₂ Gap Val₂ → Prop
+  | .next s₁, .next s₂ => R s₁ s₂
+  | .next _, .done _ => False
+  | .done _, .next _ => False
+  | .done o₁, .done o₂ => GapEqErr rVal rFault o₁ o₂
+
+theorem GapStep.Rel.flip {State₁ : Type u} {State₂ : Type v₁} {Fault₁ : Type u₁}
+    {Fault₂ : Type v₂} {Gap : Type u₂} {Val₁ : Type u₃} {Val₂ : Type w₁}
+    {R : State₁ → State₂ → Prop}
+    {rVal : Val₁ → Val₂ → Prop} {rFault : Fault₁ → Fault₂ → Prop}
+    {n₁ : GapStep State₁ Fault₁ Gap Val₁} {n₂ : GapStep State₂ Fault₂ Gap Val₂}
+    (h : GapStep.Rel R rVal rFault n₁ n₂) :
+    GapStep.Rel (fun s₂ s₁ => R s₁ s₂) (fun v₂ v₁ => rVal v₁ v₂)
+      (fun e₂ e₁ => rFault e₁ e₂) n₂ n₁ := by
+  cases n₁ <;> cases n₂ <;> first | exact GapEqErr.flip h | exact h
+
+private theorem exists_add_succ_of_lt {n fuel : Nat} (h : n < fuel) :
+    ∃ k, fuel = n + (k + 1) :=
+  let ⟨k, hk⟩ := Nat.le.dest h
+  ⟨k, hk.symm.trans (Nat.add_right_comm n 1 k)⟩
+
+section GapMachine
+
+variable {State : Type u} {Fault : Type u₁} {Site : Type u₂} {Val : Type u₃}
+
+/--
+Run at most `fuel` steps of the gap-classified machine `next` from `s`.
+Exhausting the budget is the gap `GapTag.outOfFuel`, never a value or a fault.
+-/
+def runGapSteps (next : State → GapStep State Fault (GapTag Site) Val) :
+    Nat → State → OutcomeWithGap Fault (GapTag Site) Val
+  | 0, _ => .gap .outOfFuel
+  | fuel + 1, s =>
+    match next s with
+    | .next s' => runGapSteps next fuel s'
+    | .done out => out
+
+variable (next : State → GapStep State Fault (GapTag Site) Val)
+
+@[simp]
+theorem runGapSteps_zero (s : State) :
+    runGapSteps next 0 s = .gap .outOfFuel := rfl
+
+theorem runGapSteps_succ (fuel : Nat) (s : State) :
+    runGapSteps next (fuel + 1) s =
+      match next s with
+      | .next s' => runGapSteps next fuel s'
+      | .done out => out := rfl
+
+theorem runGapSteps_succ_of_next {s s' : State} (h : next s = .next s')
+    (fuel : Nat) :
+    runGapSteps next (fuel + 1) s = runGapSteps next fuel s' := by
+  rw [runGapSteps_succ, h]
+
+theorem runGapSteps_succ_of_done {s : State}
+    {out : OutcomeWithGap Fault (GapTag Site) Val} (h : next s = .done out)
+    (fuel : Nat) :
+    runGapSteps next (fuel + 1) s = out := by
+  rw [runGapSteps_succ, h]
+
+/--
+Fuel monotonicity: once a run finishes with anything other than `.outOfFuel`,
+every larger budget produces the same outcome.
+-/
+theorem runGapSteps_fuel_mono {o : OutcomeWithGap Fault (GapTag Site) Val}
+    (ho : o ≠ .gap .outOfFuel) {fuel : Nat} {s : State}
+    (h : runGapSteps next fuel s = o) (extra : Nat) :
+    runGapSteps next (fuel + extra) s = o := by
+  induction fuel generalizing s with
+  | zero => exact absurd h.symm ho
+  | succ fuel ih =>
+    rw [Nat.add_right_comm, runGapSteps_succ]
+    rw [runGapSteps_succ] at h
+    cases hn : next s with
+    | next s' => rw [hn] at h; exact ih h
+    | done out => rw [hn] at h; exact h
+
+/-- Fuel monotonicity in `≤` form. -/
+theorem runGapSteps_fuel_mono_le {s : State} {fuel fuel' : Nat} (hle : fuel ≤ fuel')
+    (hne : runGapSteps next fuel s ≠ .gap .outOfFuel) :
+    runGapSteps next fuel' s = runGapSteps next fuel s := by
+  obtain ⟨k, rfl⟩ := Nat.le.dest hle
+  exact runGapSteps_fuel_mono next hne rfl k
+
+/-- Runs with different budgets agree whenever neither is out of fuel. -/
+theorem runGapSteps_agree {s : State} {fuel₁ fuel₂ : Nat}
+    (h₁ : runGapSteps next fuel₁ s ≠ .gap .outOfFuel)
+    (h₂ : runGapSteps next fuel₂ s ≠ .gap .outOfFuel) :
+    runGapSteps next fuel₁ s = runGapSteps next fuel₂ s :=
+  (runGapSteps_fuel_mono next h₁ rfl fuel₂).symm.trans
+    ((congrArg (fun n => runGapSteps next n s) (Nat.add_comm fuel₁ fuel₂)).trans
+      (runGapSteps_fuel_mono next h₂ rfl fuel₁))
+
+/-- `s` reaches `s'` in exactly `n` continuing (non-halting) steps. -/
+inductive GapReach (next : State → GapStep State Fault (GapTag Site) Val) :
+    Nat → State → State → Prop where
+  | refl (s : State) : GapReach next 0 s s
+  | step {n : Nat} {s s' s'' : State} :
+      next s = .next s' → GapReach next n s' s'' → GapReach next (n + 1) s s''
+
+theorem GapReach.snoc {n : Nat} {s t u : State} (h : GapReach next n s t)
+    (hn : next t = .next u) : GapReach next (n + 1) s u := by
+  induction h with
+  | refl s => exact .step hn (.refl u)
+  | step hs _ ih => exact .step hs (ih hn)
+
+/-- A prefix of `n` continuing steps consumes exactly `n` units of fuel. -/
+theorem runGapSteps_of_reach {n : Nat} {s s' : State}
+    (h : GapReach next n s s') (fuel : Nat) :
+    runGapSteps next (n + fuel) s = runGapSteps next fuel s' := by
+  induction h with
+  | refl s => rw [Nat.zero_add]
+  | step hs _ ih =>
+    rw [Nat.add_right_comm, runGapSteps_succ_of_next next hs]
+    exact ih
+
+/-- A budget not exceeding a prefix of continuing steps runs out of fuel. -/
+theorem runGapSteps_outOfFuel_of_reach {n : Nat} {s s' : State}
+    (h : GapReach next n s s') {fuel : Nat} (hle : fuel ≤ n) :
+    runGapSteps next fuel s = .gap .outOfFuel := by
+  induction h generalizing fuel with
+  | refl s =>
+    cases Nat.eq_zero_of_le_zero hle
+    rfl
+  | step hs _ ih =>
+    cases fuel with
+    | zero => rfl
+    | succ fuel =>
+      rw [runGapSteps_succ_of_next next hs]
+      exact ih (Nat.le_of_succ_le_succ hle)
+
+/--
+Fuel-free behavior set of a gap-classified machine: the outcomes produced with
+some finite budget. It is empty for a run that never finishes and a singleton
+otherwise (`gapBehaviors_unique`).
+-/
+def gapBehaviors (s : State) : OutcomeSet Fault (GapTag Site) Val :=
+  fun o => o ≠ .gap .outOfFuel ∧ ∃ fuel, runGapSteps next fuel s = o
+
+theorem gapBehaviors_of_run {s : State} {fuel : Nat}
+    (h : runGapSteps next fuel s ≠ .gap .outOfFuel) :
+    gapBehaviors next s (runGapSteps next fuel s) :=
+  ⟨h, fuel, rfl⟩
+
+theorem gapBehaviors_unique {s : State}
+    {o₁ o₂ : OutcomeWithGap Fault (GapTag Site) Val}
+    (h₁ : gapBehaviors next s o₁) (h₂ : gapBehaviors next s o₂) : o₁ = o₂ := by
+  obtain ⟨hne₁, fuel₁, rfl⟩ := h₁
+  obtain ⟨hne₂, fuel₂, rfl⟩ := h₂
+  exact runGapSteps_agree next hne₁ hne₂
+
+/-- With a sufficient budget the fuel-free behavior set is the bounded run. -/
+theorem gapBehaviors_iff_of_run {s : State} {fuel : Nat}
+    (h : runGapSteps next fuel s ≠ .gap .outOfFuel)
+    (o : OutcomeWithGap Fault (GapTag Site) Val) :
+    gapBehaviors next s o ↔ o = runGapSteps next fuel s :=
+  ⟨fun ho => gapBehaviors_unique next ho (gapBehaviors_of_run next h),
+   fun ho => ho ▸ gapBehaviors_of_run next h⟩
+
+/-- Every fuel-free behavior satisfies a predicate established for one finished run. -/
+theorem gapBehaviors_all_of_run {s : State} {fuel : Nat}
+    {P : OutcomeWithGap Fault (GapTag Site) Val → Prop}
+    (hne : runGapSteps next fuel s ≠ .gap .outOfFuel)
+    (hP : P (runGapSteps next fuel s)) :
+    ∀ ⦃o⦄, gapBehaviors next s o → P o :=
+  fun _ ho => (gapBehaviors_iff_of_run next hne _).mp ho ▸ hP
+
+/-- A prefix of continuing steps does not change the fuel-free behavior set. -/
+theorem gapBehaviors_reach_iff {n : Nat} {s s' : State}
+    (h : GapReach next n s s') (o : OutcomeWithGap Fault (GapTag Site) Val) :
+    gapBehaviors next s o ↔ gapBehaviors next s' o := by
+  constructor
+  · rintro ⟨hne, fuel, hf⟩
+    rcases Nat.lt_or_ge n fuel with hlt | hge
+    · obtain ⟨k, rfl⟩ := exists_add_succ_of_lt hlt
+      exact ⟨hne, k + 1, (runGapSteps_of_reach next h (k + 1)).symm.trans hf⟩
+    · exact absurd ((runGapSteps_outOfFuel_of_reach next h hge).symm.trans hf).symm hne
+  · rintro ⟨hne, fuel, hf⟩
+    exact ⟨hne, n + fuel, (runGapSteps_of_reach next h fuel).trans hf⟩
+
+end GapMachine
+
+/-! ### Lockstep and stuttering simulation up to identical gaps -/
+
+section GapSimulation
+
+variable {State₁ : Type u} {State₂ : Type v₁} {Fault₁ : Type u₁} {Fault₂ : Type v₂}
+  {Site : Type u₂} {Val₁ : Type u₃} {Val₂ : Type w₁}
+  {next₁ : State₁ → GapStep State₁ Fault₁ (GapTag Site) Val₁}
+  {next₂ : State₂ → GapStep State₂ Fault₂ (GapTag Site) Val₂}
+  {R : State₁ → State₂ → Prop}
+  {rVal : Val₁ → Val₂ → Prop} {rFault : Fault₁ → Fault₂ → Prop}
+
+/--
+Lockstep congruence: if related states always step to related results, the two
+bounded runs are `GapEqErr`-related for *every* budget, including runs that end
+in an identical gap.
+-/
+theorem runGapSteps_lockstep
+    (hsim : ∀ s₁ s₂, R s₁ s₂ → GapStep.Rel R rVal rFault (next₁ s₁) (next₂ s₂))
+    (fuel : Nat) {s₁ : State₁} {s₂ : State₂} (h : R s₁ s₂) :
+    GapEqErr rVal rFault (runGapSteps next₁ fuel s₁) (runGapSteps next₂ fuel s₂) := by
+  induction fuel generalizing s₁ s₂ with
+  | zero => exact (rfl : GapTag.outOfFuel = GapTag.outOfFuel)
+  | succ fuel ih =>
+    have hstep := hsim s₁ s₂ h
+    rw [runGapSteps_succ, runGapSteps_succ]
+    cases h₁ : next₁ s₁ with
+    | next t₁ =>
+      cases h₂ : next₂ s₂ with
+      | next t₂ => rw [h₁, h₂] at hstep; exact ih hstep
+      | done o₂ => rw [h₁, h₂] at hstep; exact False.elim hstep
+    | done o₁ =>
+      cases h₂ : next₂ s₂ with
+      | next t₂ => rw [h₁, h₂] at hstep; exact False.elim hstep
+      | done o₂ => rw [h₁, h₂] at hstep; exact hstep
+
+private theorem gapBehaviors_forward_of_stutter
+    (hsim : ∀ s₁ s₂, R s₁ s₂ → ∃ n₁ n₂ t₁ t₂,
+      GapReach next₁ n₁ s₁ t₁ ∧ GapReach next₂ n₂ s₂ t₂ ∧
+        GapStep.Rel R rVal rFault (next₁ t₁) (next₂ t₂))
+    (bound : Nat) :
+    ∀ (fuel : Nat) (s₁ : State₁) (s₂ : State₂), fuel ≤ bound → R s₁ s₂ →
+      runGapSteps next₁ fuel s₁ ≠ .gap .outOfFuel →
+      ∃ o₂, gapBehaviors next₂ s₂ o₂ ∧
+        GapEqErr rVal rFault (runGapSteps next₁ fuel s₁) o₂ := by
+  induction bound with
+  | zero =>
+    intro fuel s₁ s₂ hb _ hne
+    cases Nat.eq_zero_of_le_zero hb
+    exact absurd rfl hne
+  | succ bound ih =>
+    intro fuel s₁ s₂ hb hR hne
+    obtain ⟨n₁, n₂, t₁, t₂, hr₁, hr₂, hrel⟩ := hsim s₁ s₂ hR
+    rcases Nat.lt_or_ge n₁ fuel with hlt | hge
+    · obtain ⟨k, rfl⟩ := exists_add_succ_of_lt hlt
+      have hk : k ≤ bound :=
+        Nat.le_trans (Nat.le_add_left k n₁) (Nat.le_of_succ_le_succ hb)
+      rw [runGapSteps_of_reach next₁ hr₁ (k + 1)] at hne ⊢
+      rw [runGapSteps_succ] at hne ⊢
+      cases h₁ : next₁ t₁ with
+      | next u₁ =>
+        cases h₂ : next₂ t₂ with
+        | next u₂ =>
+          rw [h₁, h₂] at hrel
+          rw [h₁] at hne
+          obtain ⟨o₂, ho₂, hro⟩ := ih k u₁ u₂ hk hrel hne
+          exact ⟨o₂, (gapBehaviors_reach_iff next₂ (hr₂.snoc next₂ h₂) o₂).mpr ho₂, hro⟩
+        | done o₂ => rw [h₁, h₂] at hrel; exact False.elim hrel
+      | done o₁ =>
+        cases h₂ : next₂ t₂ with
+        | next u₂ => rw [h₁, h₂] at hrel; exact False.elim hrel
+        | done o₂ =>
+          rw [h₁, h₂] at hrel
+          rw [h₁] at hne
+          have hne₂ : o₂ ≠ .gap .outOfFuel := fun h₀ =>
+            hne (GapEqErr.gap_iff_right.mp (h₀ ▸ hrel))
+          refine ⟨o₂, ⟨hne₂, n₂ + 1, ?_⟩, hrel⟩
+          rw [runGapSteps_of_reach next₂ hr₂ 1, runGapSteps_succ_of_done next₂ h₂]
+    · exact absurd (runGapSteps_outOfFuel_of_reach next₁ hr₁ hge) hne
+
+/--
+Stuttering congruence: if from related states both machines can take some
+(possibly different) number of continuing steps and then step to related
+results, their fuel-free behavior sets are equivalent up to identical gaps. A
+refactoring may therefore change the number of internal steps freely.
+-/
+theorem gapBehaviors_equiv_of_stutter
+    (hsim : ∀ s₁ s₂, R s₁ s₂ → ∃ n₁ n₂ t₁ t₂,
+      GapReach next₁ n₁ s₁ t₁ ∧ GapReach next₂ n₂ s₂ t₂ ∧
+        GapStep.Rel R rVal rFault (next₁ t₁) (next₂ t₂))
+    {s₁ : State₁} {s₂ : State₂} (h : R s₁ s₂) :
+    OutcomeSetEquiv (GapEqErr rVal rFault)
+      (gapBehaviors next₁ s₁) (gapBehaviors next₂ s₂) := by
+  constructor
+  · rintro o₁ ⟨hne, fuel, rfl⟩
+    exact gapBehaviors_forward_of_stutter hsim fuel fuel s₁ s₂ (Nat.le_refl fuel) h hne
+  · rintro o₂ ⟨hne, fuel, rfl⟩
+    obtain ⟨o₁, ho₁, hro⟩ :=
+      gapBehaviors_forward_of_stutter (R := fun s₂ s₁ => R s₁ s₂)
+        (rVal := fun v₂ v₁ => rVal v₁ v₂) (rFault := fun e₂ e₁ => rFault e₁ e₂)
+        (fun s₂ s₁ hR =>
+          let ⟨n₁, n₂, t₁, t₂, hr₁, hr₂, hrel⟩ := hsim s₁ s₂ hR
+          ⟨n₂, n₁, t₂, t₁, hr₂, hr₁, hrel.flip⟩)
+        fuel fuel s₂ s₁ (Nat.le_refl fuel) h hne
+    exact ⟨o₁, ho₁, GapEqErr.flip_iff.mp hro⟩
+
+/--
+Lockstep simulation also relates the fuel-free behavior sets (the stuttering
+congruence with empty prefixes).
+-/
+theorem gapBehaviors_equiv_of_lockstep
+    (hsim : ∀ s₁ s₂, R s₁ s₂ → GapStep.Rel R rVal rFault (next₁ s₁) (next₂ s₂))
+    {s₁ : State₁} {s₂ : State₂} (h : R s₁ s₂) :
+    OutcomeSetEquiv (GapEqErr rVal rFault)
+      (gapBehaviors next₁ s₁) (gapBehaviors next₂ s₂) :=
+  gapBehaviors_equiv_of_stutter
+    (fun s₁ s₂ hR => ⟨0, 0, s₁, s₂, .refl s₁, .refl s₂, hsim s₁ s₂ hR⟩) h
+
+end GapSimulation
+
+
+/-! ### Gap-classified stepping of `ITreeF` coalgebras -/
+
+section ITreeFStepping
+
+variable {State Val Site : Type} {E : Effect.{0}}
+
+/--
+One gap-classified step of an `ITreeF` coalgebra whose effect row starts with
+`FailE FailureKind`. Requests of the remaining row `E` are resolved by the
+handler `handle` (for MIR: observations are erased and external calls are
+delegated to a callee environment); a fault or gap of the handler halts the
+caller with that same fault or gap.
+-/
+def gapStep
+    (step : State → ITreeF (SumE (FailE FailureKind) E) (Outcome Val) State)
+    (site : State → Site)
+    (handle : (i : E.I) → OutcomeWithGap ExecFault (GapTag Site) (E.O i))
+    (s : State) : GapStep State ExecFault (GapTag Site) Val :=
+  match step s with
+  | .ret out => .done (classifyOutcome out)
+  | .tau s' => .next s'
+  | .vis (.inl (.fail kind)) _ => .done (classifyFailure (site s) kind)
+  | .vis (.inr i) k =>
+    match handle i with
+    | .ok o => .next (k o)
+    | .fault e => .done (.fault e)
+    | .gap g => .done (.gap g)
+
+/--
+Fuel-indexed multi-step evaluator of an `ITreeF` coalgebra into
+`OutcomeWithGap`: `.ret (.normal v)` is `.ok v`, `.ret .panic` / `.ret .abort`
+are the defined faults, `FailureKind.ub` is `ExecFault.ub`, and
+`FailureKind.unsupported`, `FailureKind.outOfFuel` and an exhausted budget are
+gaps (`GapTag.unsupported`, `GapTag.budget` and `GapTag.outOfFuel`).
+-/
+def runStepsWithGap
+    (step : State → ITreeF (SumE (FailE FailureKind) E) (Outcome Val) State)
+    (site : State → Site)
+    (handle : (i : E.I) → OutcomeWithGap ExecFault (GapTag Site) (E.O i))
+    (fuel : Nat) (s : State) : OutcomeWithGap ExecFault (GapTag Site) Val :=
+  runGapSteps (gapStep step site handle) fuel s
+
+/-- Fuel-indexed gap-aware evaluation of an `ITreeMachine` program. -/
+def ITreeMachine.runWithGap {Prog : Type}
+    (M : ITreeMachine Prog State (SumE (FailE FailureKind) E) (Outcome Val))
+    (site : State → Site)
+    (handle : (i : E.I) → OutcomeWithGap ExecFault (GapTag Site) (E.O i))
+    (fuel : Nat) (p : Prog) : OutcomeWithGap ExecFault (GapTag Site) Val :=
+  runStepsWithGap (M.step p) site handle fuel (M.init p)
+
+variable
+  {step : State → ITreeF (SumE (FailE FailureKind) E) (Outcome Val) State}
+  {site : State → Site}
+  {handle : (i : E.I) → OutcomeWithGap ExecFault (GapTag Site) (E.O i)}
+
+theorem gapStep_of_ret {s : State} {out : Outcome Val} (h : step s = .ret out) :
+    gapStep step site handle s = .done (classifyOutcome out) := by
+  unfold gapStep; rw [h]
+
+theorem gapStep_of_tau {s s' : State} (h : step s = .tau s') :
+    gapStep step site handle s = .next s' := by
+  unfold gapStep; rw [h]
+
+theorem gapStep_of_fail {s : State} {kind : FailureKind}
+    {k : PEmpty → State} (h : step s = .vis (.inl (.fail kind)) k) :
+    gapStep step site handle s = .done (classifyFailure (site s) kind) := by
+  unfold gapStep; rw [h]
+
+theorem gapStep_of_vis {s : State} {i : E.I} {k : E.O i → State}
+    (h : step s = .vis (.inr i) k) :
+    gapStep step site handle s =
+      match handle i with
+      | .ok o => .next (k o)
+      | .fault e => .done (.fault e)
+      | .gap g => .done (.gap g) := by
+  unfold gapStep; rw [h]
+
+@[simp]
+theorem runStepsWithGap_zero (s : State) :
+    runStepsWithGap step site handle 0 s = .gap .outOfFuel := rfl
+
+/-- A halting node yields its classified outcome with any positive budget. -/
+theorem runStepsWithGap_of_ret {s : State} {out : Outcome Val}
+    (h : step s = .ret out) (fuel : Nat) :
+    runStepsWithGap step site handle (fuel + 1) s = classifyOutcome out :=
+  runGapSteps_succ_of_done _ (gapStep_of_ret h) fuel
+
+/-- A silent step consumes one unit of fuel. -/
+theorem runStepsWithGap_of_tau {s s' : State} (h : step s = .tau s')
+    (fuel : Nat) :
+    runStepsWithGap step site handle (fuel + 1) s =
+      runStepsWithGap step site handle fuel s' :=
+  runGapSteps_succ_of_next _ (gapStep_of_tau h) fuel
+
+/-- A fault node yields its classified failure with any positive budget. -/
+theorem runStepsWithGap_of_fail {s : State} {kind : FailureKind}
+    {k : PEmpty → State} (h : step s = .vis (.inl (.fail kind)) k) (fuel : Nat) :
+    runStepsWithGap step site handle (fuel + 1) s =
+      classifyFailure (site s) kind :=
+  runGapSteps_succ_of_done _ (gapStep_of_fail h) fuel
+
+/--
+`FailureKind.unsupported` always becomes the gap tagged with the current site:
+never a value, never a fault.
+-/
+theorem runStepsWithGap_of_unsupported {s : State} {k : PEmpty → State}
+    (h : step s = .vis (.inl (.fail .unsupported)) k) (fuel : Nat) :
+    runStepsWithGap step site handle (fuel + 1) s = .gap (.unsupported (site s)) :=
+  runStepsWithGap_of_fail h fuel
+
+/--
+Call-handler law: a handled request is the monadic `bind` of the handler's
+outcome with the rest of the run. A gap of the handler (for example a shared
+unmodeled callee) is therefore the outcome of the whole run.
+-/
+theorem runStepsWithGap_of_vis {s : State} {i : E.I} {k : E.O i → State}
+    (h : step s = .vis (.inr i) k) (fuel : Nat) :
+    runStepsWithGap step site handle (fuel + 1) s =
+      (handle i).bind (fun o => runStepsWithGap step site handle fuel (k o)) := by
+  unfold runStepsWithGap
+  rw [runGapSteps_succ, gapStep_of_vis h]
+  cases handle i <;> rfl
+
+/--
+One-step agreement of two coalgebra nodes executed at sites `site₁` and
+`site₂`: equal halting outcomes up to `rVal`, `R`-related successors, the same
+failure kind (at the same site unless it is `FailureKind.ub`, since gaps are
+site-tagged), or the same request with `R`-related continuations.
+-/
+inductive StepNodeRel {State₁ State₂ Val₁ Val₂ : Type}
+    (R : State₁ → State₂ → Prop) (rVal : Val₁ → Val₂ → Prop)
+    (site₁ site₂ : Site) :
+    ITreeF (SumE (FailE FailureKind) E) (Outcome Val₁) State₁ →
+      ITreeF (SumE (FailE FailureKind) E) (Outcome Val₂) State₂ → Prop where
+  | normal {v₁ : Val₁} {v₂ : Val₂} : rVal v₁ v₂ →
+      StepNodeRel R rVal site₁ site₂ (.ret (.normal v₁)) (.ret (.normal v₂))
+  | panic : StepNodeRel R rVal site₁ site₂ (.ret .panic) (.ret .panic)
+  | abort : StepNodeRel R rVal site₁ site₂ (.ret .abort) (.ret .abort)
+  | tau {s₁ : State₁} {s₂ : State₂} : R s₁ s₂ →
+      StepNodeRel R rVal site₁ site₂ (.tau s₁) (.tau s₂)
+  | fail {kind : FailureKind} {k₁ : PEmpty → State₁} {k₂ : PEmpty → State₂} :
+      (kind ≠ .ub → site₁ = site₂) →
+      StepNodeRel R rVal site₁ site₂
+        (.vis (.inl (.fail kind)) k₁) (.vis (.inl (.fail kind)) k₂)
+  | vis {i : E.I} {k₁ : E.O i → State₁} {k₂ : E.O i → State₂} :
+      (∀ o, R (k₁ o) (k₂ o)) →
+      StepNodeRel R rVal site₁ site₂ (.vis (.inr i) k₁) (.vis (.inr i) k₂)
+
+end ITreeFStepping
+
+section ITreeFCongruence
+
+variable {State₁ State₂ Val₁ Val₂ Site : Type} {E : Effect.{0}}
+  {step₁ : State₁ → ITreeF (SumE (FailE FailureKind) E) (Outcome Val₁) State₁}
+  {step₂ : State₂ → ITreeF (SumE (FailE FailureKind) E) (Outcome Val₂) State₂}
+  {site₁ : State₁ → Site} {site₂ : State₂ → Site}
+  {handle₁ handle₂ : (i : E.I) → OutcomeWithGap ExecFault (GapTag Site) (E.O i)}
+  {R : State₁ → State₂ → Prop} {rVal : Val₁ → Val₂ → Prop}
+  {rFault : ExecFault → ExecFault → Prop}
+
+/--
+Agreeing coalgebra nodes resolved by related handlers give related
+gap-classified steps. The handlers may fault or gap arbitrarily: no
+gap-freedom of the callee environment is assumed.
+-/
+theorem gapStep_rel_of_stepNodeRel (hFault : ∀ e, rFault e e)
+    (hh : ∀ i, GapEqErr (· = ·) rFault (handle₁ i) (handle₂ i))
+    {s₁ : State₁} {s₂ : State₂}
+    (h : StepNodeRel R rVal (site₁ s₁) (site₂ s₂) (step₁ s₁) (step₂ s₂)) :
+    GapStep.Rel R rVal rFault (gapStep step₁ site₁ handle₁ s₁)
+      (gapStep step₂ site₂ handle₂ s₂) := by
+  generalize h₁ : step₁ s₁ = n₁ at h
+  generalize h₂ : step₂ s₂ = n₂ at h
+  cases h with
+  | normal hv => rw [gapStep_of_ret h₁, gapStep_of_ret h₂]; exact hv
+  | panic => rw [gapStep_of_ret h₁, gapStep_of_ret h₂]; exact hFault .panic
+  | abort => rw [gapStep_of_ret h₁, gapStep_of_ret h₂]; exact hFault .abort
+  | tau hR => rw [gapStep_of_tau h₁, gapStep_of_tau h₂]; exact hR
+  | @fail kind k₁ k₂ hsite =>
+    rw [gapStep_of_fail h₁, gapStep_of_fail h₂]
+    cases kind with
+    | ub => exact hFault .ub
+    | unsupported =>
+      exact congrArg GapTag.unsupported (hsite (fun h => by cases h))
+    | outOfFuel => exact congrArg GapTag.budget (hsite (fun h => by cases h))
+  | @vis i k₁ k₂ hk =>
+    rw [gapStep_of_vis h₁, gapStep_of_vis h₂]
+    have hi := hh i
+    cases ho₁ : handle₁ i with
+    | ok o₁ =>
+      cases ho₂ : handle₂ i with
+      | ok o₂ =>
+        rw [ho₁, ho₂] at hi
+        cases (hi : o₁ = o₂)
+        exact hk o₁
+      | fault e₂ => rw [ho₁, ho₂] at hi; exact False.elim hi
+      | gap g₂ => rw [ho₁, ho₂] at hi; exact False.elim hi
+    | fault e₁ =>
+      cases ho₂ : handle₂ i with
+      | ok o₂ => rw [ho₁, ho₂] at hi; exact False.elim hi
+      | fault e₂ => rw [ho₁, ho₂] at hi; exact hi
+      | gap g₂ => rw [ho₁, ho₂] at hi; exact False.elim hi
+    | gap g₁ =>
+      cases ho₂ : handle₂ i with
+      | ok o₂ => rw [ho₁, ho₂] at hi; exact False.elim hi
+      | fault e₂ => rw [ho₁, ho₂] at hi; exact False.elim hi
+      | gap g₂ => rw [ho₁, ho₂] at hi; exact hi
+
+/--
+Multi-step congruence for a refactored caller: if related states of the two
+coalgebras always present agreeing nodes, then for **every** shared callee
+environment `handle` (gap-free or not) and every budget, the two bounded runs
+are related up to identical gaps.
+-/
+theorem runStepsWithGap_congr
+    (hsim : ∀ s₁ s₂, R s₁ s₂ →
+      StepNodeRel R rVal (site₁ s₁) (site₂ s₂) (step₁ s₁) (step₂ s₂))
+    (handle : (i : E.I) → OutcomeWithGap ExecFault (GapTag Site) (E.O i))
+    (fuel : Nat) {s₁ : State₁} {s₂ : State₂} (h : R s₁ s₂) :
+    GapEqErr rVal (· = ·) (runStepsWithGap step₁ site₁ handle fuel s₁)
+      (runStepsWithGap step₂ site₂ handle fuel s₂) :=
+  runGapSteps_lockstep
+    (fun s₁ s₂ hR => gapStep_rel_of_stepNodeRel (fun _ => rfl)
+      (fun i => GapEqErr.refl (fun _ => rfl) (fun _ => rfl) (handle i))
+      (hsim s₁ s₂ hR))
+    fuel h
+
+/--
+Multi-step congruence under related callee environments: a refactored caller
+run against a refactored callee environment is related to the original pair,
+as long as the environments agree up to identical gaps.
+-/
+theorem runStepsWithGap_congr_handle (hFault : ∀ e, rFault e e)
+    (hsim : ∀ s₁ s₂, R s₁ s₂ →
+      StepNodeRel R rVal (site₁ s₁) (site₂ s₂) (step₁ s₁) (step₂ s₂))
+    (hh : ∀ i, GapEqErr (· = ·) rFault (handle₁ i) (handle₂ i))
+    (fuel : Nat) {s₁ : State₁} {s₂ : State₂} (h : R s₁ s₂) :
+    GapEqErr rVal rFault (runStepsWithGap step₁ site₁ handle₁ fuel s₁)
+      (runStepsWithGap step₂ site₂ handle₂ fuel s₂) :=
+  runGapSteps_lockstep
+    (fun s₁ s₂ hR => gapStep_rel_of_stepNodeRel hFault hh (hsim s₁ s₂ hR)) fuel h
+
+end ITreeFCongruence
+
+section SharedState
+
+variable {State Val Site : Type} {E : Effect.{0}}
+  {step : State → ITreeF (SumE (FailE FailureKind) E) (Outcome Val) State}
+  {site : State → Site}
+
+/-- Every node agrees with itself at the same site. -/
+theorem StepNodeRel.refl
+    (n : ITreeF (SumE (FailE FailureKind) E) (Outcome Val) State) (x : Site) :
+    StepNodeRel (· = ·) (· = ·) x x n n := by
+  cases n with
+  | ret out =>
+    cases out with
+    | normal v => exact .normal rfl
+    | panic => exact .panic
+    | abort => exact .abort
+  | tau s => exact .tau rfl
+  | vis i k =>
+    cases i with
+    | inl f =>
+      cases f with
+      | fail kind => exact .fail (fun _ => rfl)
+    | inr j => exact .vis (fun _ => rfl)
+
+/--
+Shared unchanged code is related to itself for every budget and every callee
+environment, with no gap-freedom obligation, including when it steps to
+`FailureKind.unsupported`.
+-/
+theorem runStepsWithGap_refl
+    (handle : (i : E.I) → OutcomeWithGap ExecFault (GapTag Site) (E.O i))
+    (fuel : Nat) (s : State) :
+    GapEqErr (· = ·) (· = ·) (runStepsWithGap step site handle fuel s)
+      (runStepsWithGap step site handle fuel s) :=
+  GapEqErr.refl (fun _ => rfl) (fun _ => rfl) _
+
+/--
+Shared unchanged caller under a refactored callee environment: environments
+that agree up to identical gaps give runs that agree up to identical gaps.
+-/
+theorem runStepsWithGap_handle_congr {rFault : ExecFault → ExecFault → Prop}
+    (hFault : ∀ e, rFault e e)
+    {handle₁ handle₂ : (i : E.I) → OutcomeWithGap ExecFault (GapTag Site) (E.O i)}
+    (hh : ∀ i, GapEqErr (· = ·) rFault (handle₁ i) (handle₂ i))
+    (fuel : Nat) (s : State) :
+    GapEqErr (· = ·) rFault (runStepsWithGap step site handle₁ fuel s)
+      (runStepsWithGap step site handle₂ fuel s) :=
+  runStepsWithGap_congr_handle (R := (· = ·)) hFault
+    (fun s₁ s₂ hs => by cases hs; exact StepNodeRel.refl (step s₁) (site s₁))
+    hh fuel rfl
+
+end SharedState
+
+/-! ## 6. Certificate Checkers for Gap-Preserving Equivalence -/
+
+/-- Verified boolean certificate checker for gap-preserving `ContextEquiv`. -/
+structure VerifiedContextChecker
+    {Prog₁ : Type u₁} {Prog₂ : Type u₂} {Cert : Type u₃} {Query : Type u}
+    {Fault₁ : Type v₁} {Fault₂ : Type v₂} {Gap : Type w₁}
+    {Val₁ : Type w₂} {Val₂ : Type w₃}
+    (rVal : Val₁ → Val₂ → Prop) (rFault : Fault₁ → Fault₂ → Prop)
+    (sem₁ : Prog₁ → GapSem Query Fault₁ Gap Val₁)
+    (sem₂ : Prog₂ → GapSem Query Fault₂ Gap Val₂)
+    (check : Prog₁ → Prog₂ → Cert → Bool) : Prop where
+  sound : ∀ {p₁ p₂ cert}, check p₁ p₂ cert = true →
+    ContextEquiv rVal rFault (sem₁ p₁) (sem₂ p₂)
+
+/-- Verified boolean certificate checker for gap-free `ProgramEquiv`. -/
+structure VerifiedProgramChecker
+    {Prog₁ : Type u₁} {Prog₂ : Type u₂} {Cert : Type u₃} {Query : Type u}
+    {Fault₁ : Type v₁} {Fault₂ : Type v₂} {Gap : Type w₁}
+    {Val₁ : Type w₂} {Val₂ : Type w₃}
+    (rVal : Val₁ → Val₂ → Prop) (rFault : Fault₁ → Fault₂ → Prop)
+    (sem₁ : Prog₁ → GapSem Query Fault₁ Gap Val₁)
+    (sem₂ : Prog₂ → GapSem Query Fault₂ Gap Val₂)
+    (check : Prog₁ → Prog₂ → Cert → Bool) : Prop where
+  sound : ∀ {p₁ p₂ cert}, check p₁ p₂ cert = true →
+    ProgramEquiv rVal rFault (sem₁ p₁) (sem₂ p₂)
+
+/-- Verified boolean certificate checker for gap-freedom of a single program. -/
+structure VerifiedGapFreeChecker
+    {Prog : Type u₁} {Cert : Type u₃} {Query : Type u}
+    {Fault : Type v₁} {Gap : Type w₁} {Val : Type w₂}
+    (sem : Prog → GapSem Query Fault Gap Val)
+    (check : Prog → Cert → Bool) : Prop where
+  sound : ∀ {p cert}, check p cert = true → AllGapFree (sem p)
+
+private theorem bool_and_split {a b : Bool} (h : (a && b) = true) :
+    a = true ∧ b = true := by
+  cases a <;> cases b <;> first | exact ⟨rfl, rfl⟩ | cases h
+
+section Checkers
+
+variable {Prog₁ : Type u₁} {Prog₂ : Type u₂} {Cert : Type u₃} {Query : Type u}
+  {Fault₁ : Type v₁} {Fault₂ : Type v₂} {Gap : Type w₁}
+  {Val₁ : Type w₂} {Val₂ : Type w₃}
+  {rVal : Val₁ → Val₂ → Prop} {rFault : Fault₁ → Fault₂ → Prop}
+  {sem₁ : Prog₁ → GapSem Query Fault₁ Gap Val₁}
+  {sem₂ : Prog₂ → GapSem Query Fault₂ Gap Val₂}
+  {check : Prog₁ → Prog₂ → Cert → Bool}
+
+/--
+The syntactic-identity checker is a sound `ContextEquiv` checker for *any*
+semantics: unchanged programs need no gap-freedom certificate.
+-/
+theorem VerifiedContextChecker.identity {Prog : Type u₁} [DecidableEq Prog]
+    {Fault : Type v₁} {Val : Type w₂}
+    (sem : Prog → GapSem Query Fault Gap Val) :
+    VerifiedContextChecker (· = ·) (· = ·) sem sem
+      (fun p₁ p₂ (_ : PUnit.{u₃ + 1}) => decide (p₁ = p₂)) where
+  sound hc := by
+    cases of_decide_eq_true hc
+    exact ContextEquiv.refl (fun _ => rfl) (fun _ => rfl) _
+
+/--
+Compose two `ContextEquiv` checkers through an intermediate program carried in
+the certificate.
+-/
+theorem VerifiedContextChecker.comp
+    {Prog₃ : Type w₄} {Cert' : Type w₅} {Fault₃ : Type w₆} {Val₃ : Type w₇}
+    {rVal' : Val₂ → Val₃ → Prop} {rFault' : Fault₂ → Fault₃ → Prop}
+    {sem₃ : Prog₃ → GapSem Query Fault₃ Gap Val₃}
+    {check' : Prog₂ → Prog₃ → Cert' → Bool}
+    (h₁₂ : VerifiedContextChecker rVal rFault sem₁ sem₂ check)
+    (h₂₃ : VerifiedContextChecker rVal' rFault' sem₂ sem₃ check') :
+    VerifiedContextChecker
+      (fun v₁ v₃ => ∃ v₂, rVal v₁ v₂ ∧ rVal' v₂ v₃)
+      (fun e₁ e₃ => ∃ e₂, rFault e₁ e₂ ∧ rFault' e₂ e₃) sem₁ sem₃
+      (fun p₁ p₃ (c : Prog₂ × Cert × Cert') =>
+        check p₁ c.1 c.2.1 && check' c.1 p₃ c.2.2) where
+  sound hc :=
+    have hb := bool_and_split hc
+    (h₁₂.sound hb.1).comp (h₂₃.sound hb.2)
+
+/--
+Upgrade a `ContextEquiv` checker with a gap-freedom checker for the baseline to
+a gap-free `ProgramEquiv` checker. No gap-freedom certificate is needed for the
+refactored program.
+-/
+theorem VerifiedContextChecker.toProgramChecker {GCert : Type w₅}
+    {gapCheck : Prog₁ → GCert → Bool}
+    (h : VerifiedContextChecker rVal rFault sem₁ sem₂ check)
+    (hg : VerifiedGapFreeChecker sem₁ gapCheck) :
+    VerifiedProgramChecker rVal rFault sem₁ sem₂
+      (fun p₁ p₂ (c : Cert × GCert) => check p₁ p₂ c.1 && gapCheck p₁ c.2) where
+  sound hc :=
+    have hb := bool_and_split hc
+    (h.sound hb.1).toProgramEquiv (hg.sound hb.2)
+
+/-- A `ProgramEquiv` checker also certifies gap-freedom of the refactoring. -/
+theorem VerifiedProgramChecker.gapFree_right
+    (h : VerifiedProgramChecker rVal rFault sem₁ sem₂ check)
+    {p₁ : Prog₁} {p₂ : Prog₂} {cert : Cert} (hc : check p₁ p₂ cert = true) :
+    AllGapFree (sem₂ p₂) :=
+  (h.sound hc).gapFree_right
+
+theorem VerifiedProgramChecker.toContextChecker
+    (h : VerifiedProgramChecker rVal rFault sem₁ sem₂ check) :
+    VerifiedContextChecker rVal rFault sem₁ sem₂ check where
+  sound hc := (h.sound hc).toContextEquiv
+
+/--
+A `ContextEquiv` checker whose fault relation preserves UB-ness is a verified
+`ExactPass` checker on the Layer 1A projections.
+-/
+theorem VerifiedContextChecker.toExactChecker
+    {isUB₁ : Fault₁ → Prop} {isUB₂ : Fault₂ → Prop}
+    (hUB : ∀ e₁ e₂, rFault e₁ e₂ → (isUB₁ e₁ ↔ isUB₂ e₂))
+    (h : VerifiedContextChecker rVal rFault sem₁ sem₂ check) :
+    VerifiedExactChecker (gapSemantics isUB₁ sem₁) (gapSemantics isUB₂ sem₂)
+      (gapObsMap rVal rFault)
+      (gapObsMap (fun v₂ v₁ => rVal v₁ v₂) (fun e₂ e₁ => rFault e₁ e₂))
+      check where
+  sound hc := (h.sound hc).toExactPass hUB
+
+theorem VerifiedContextChecker.toCompilerChecker
+    {isUB₁ : Fault₁ → Prop} {isUB₂ : Fault₂ → Prop}
+    (hUB : ∀ e₁ e₂, rFault e₁ e₂ → (isUB₁ e₁ ↔ isUB₂ e₂))
+    (h : VerifiedContextChecker rVal rFault sem₁ sem₂ check)
+    (G₁ : Spec (Query → Partial (OutcomeSet Fault₁ Gap Val₁))) :
+    VerifiedCompilerChecker (gapSemantics isUB₁ sem₁) (gapSemantics isUB₂ sem₂)
+      G₁ (gapObsMap rVal rFault) check :=
+  (h.toExactChecker hUB).toCompilerChecker G₁
+
+theorem VerifiedContextChecker.toVerifierChecker
+    {isUB₁ : Fault₁ → Prop} {isUB₂ : Fault₂ → Prop}
+    (hUB : ∀ e₁ e₂, rFault e₁ e₂ → (isUB₁ e₁ ↔ isUB₂ e₂))
+    (h : VerifiedContextChecker rVal rFault sem₁ sem₂ check)
+    (G₂ : Spec (Query → Partial (OutcomeSet Fault₂ Gap Val₂))) :
+    VerifiedVerifierChecker (gapSemantics isUB₁ sem₁) (gapSemantics isUB₂ sem₂)
+      G₂ (gapObsMap (fun v₂ v₁ => rVal v₁ v₂) (fun e₂ e₁ => rFault e₁ e₂))
+      check :=
+  (h.toExactChecker hUB).toVerifierChecker G₂
+
+/--
+`ContextEquiv` checker plus a gap-freedom certificate for the baseline gives a
+verified `ExactPass` checker whose accepted pairs are both gap-free.
+-/
+theorem VerifiedContextChecker.toExactChecker_of_gapFree {GCert : Type w₅}
+    {gapCheck : Prog₁ → GCert → Bool}
+    {isUB₁ : Fault₁ → Prop} {isUB₂ : Fault₂ → Prop}
+    (hUB : ∀ e₁ e₂, rFault e₁ e₂ → (isUB₁ e₁ ↔ isUB₂ e₂))
+    (h : VerifiedContextChecker rVal rFault sem₁ sem₂ check)
+    (hg : VerifiedGapFreeChecker sem₁ gapCheck) :
+    VerifiedExactChecker (gapSemantics isUB₁ sem₁) (gapSemantics isUB₂ sem₂)
+      (gapObsMap rVal rFault)
+      (gapObsMap (fun v₂ v₁ => rVal v₁ v₂) (fun e₂ e₁ => rFault e₁ e₂))
+      (fun p₁ p₂ (c : Cert × GCert) => check p₁ p₂ c.1 && gapCheck p₁ c.2) ∧
+    ∀ {p₁ p₂} {c : Cert × GCert},
+      (check p₁ p₂ c.1 && gapCheck p₁ c.2) = true →
+        AllGapFree (sem₁ p₁) ∧ AllGapFree (sem₂ p₂) :=
+  ⟨(h.toProgramChecker hg).toContextChecker.toExactChecker hUB,
+   fun hc =>
+     have hp := (h.toProgramChecker hg).sound hc
+     ⟨hp.gapFree_left, hp.gapFree_right⟩⟩
+
+end Checkers
+
+
+/-! ### Fuel-free equivalence from bounded runs -/
+
+section BoundedToFuelFree
+
+variable {State₁ : Type u} {State₂ : Type v₁} {Fault₁ : Type u₁} {Fault₂ : Type v₂}
+  {Site : Type u₂} {Val₁ : Type u₃} {Val₂ : Type w₁}
+  {next₁ : State₁ → GapStep State₁ Fault₁ (GapTag Site) Val₁}
+  {next₂ : State₂ → GapStep State₂ Fault₂ (GapTag Site) Val₂}
+  {rVal : Val₁ → Val₂ → Prop} {rFault : Fault₁ → Fault₂ → Prop}
+
+/--
+Two bounded runs (with possibly different budgets) that finish with related
+outcomes determine equivalent fuel-free behavior sets.
+-/
+theorem gapBehaviors_equiv_of_runs {s₁ : State₁} {s₂ : State₂} {fuel₁ fuel₂ : Nat}
+    (hne : runGapSteps next₁ fuel₁ s₁ ≠ .gap .outOfFuel)
+    (h : GapEqErr rVal rFault (runGapSteps next₁ fuel₁ s₁)
+      (runGapSteps next₂ fuel₂ s₂)) :
+    OutcomeSetEquiv (GapEqErr rVal rFault)
+      (gapBehaviors next₁ s₁) (gapBehaviors next₂ s₂) := by
+  have hne₂ : runGapSteps next₂ fuel₂ s₂ ≠ .gap .outOfFuel := fun h₀ =>
+    hne (GapEqErr.gap_iff_right.mp (h₀ ▸ h))
+  constructor
+  · intro o₁ ho₁
+    cases (gapBehaviors_iff_of_run next₁ hne o₁).mp ho₁
+    exact ⟨_, gapBehaviors_of_run next₂ hne₂, h⟩
+  · intro o₂ ho₂
+    cases (gapBehaviors_iff_of_run next₂ hne₂ o₂).mp ho₂
+    exact ⟨_, gapBehaviors_of_run next₁ hne, h⟩
+
+/--
+For two finished bounded runs, equivalence of the fuel-free behavior sets is
+exactly `GapEqErr` of the two outcomes. The forward direction is the tool for
+*refuting* an equivalence from two concrete runs.
+-/
+theorem gapBehaviors_equiv_iff_of_runs {s₁ : State₁} {s₂ : State₂}
+    {fuel₁ fuel₂ : Nat}
+    (hne₁ : runGapSteps next₁ fuel₁ s₁ ≠ .gap .outOfFuel)
+    (hne₂ : runGapSteps next₂ fuel₂ s₂ ≠ .gap .outOfFuel) :
+    OutcomeSetEquiv (GapEqErr rVal rFault)
+        (gapBehaviors next₁ s₁) (gapBehaviors next₂ s₂) ↔
+      GapEqErr rVal rFault (runGapSteps next₁ fuel₁ s₁)
+        (runGapSteps next₂ fuel₂ s₂) := by
+  constructor
+  · intro h
+    obtain ⟨o₂, ho₂, hr⟩ := h.forward (gapBehaviors_of_run next₁ hne₁)
+    cases (gapBehaviors_iff_of_run next₂ hne₂ o₂).mp ho₂
+    exact hr
+  · exact gapBehaviors_equiv_of_runs hne₁
+
+/-- A finished bounded run that is gap-free makes the fuel-free set gap-free. -/
+theorem neverGap_gapBehaviors_of_run {s₁ : State₁} {fuel : Nat}
+    (h : (runGapSteps next₁ fuel s₁).isGapFree) :
+    NeverGap (gapBehaviors next₁ s₁) :=
+  gapBehaviors_all_of_run next₁ (fun h₀ => by rw [h₀] at h; exact h) h
+
+/--
+A finished bounded run that is defined (gap-free and not UB) makes the
+fuel-free set defined.
+-/
+theorem defined_gapBehaviors_of_run {isUB : Fault₁ → Prop} {s₁ : State₁}
+    {fuel : Nat} (h : (runGapSteps next₁ fuel s₁).isDefined isUB) :
+    OutcomeSet.Defined isUB (gapBehaviors next₁ s₁) :=
+  gapBehaviors_all_of_run next₁
+    (fun h₀ => by rw [h₀] at h; exact h) h
+
+end BoundedToFuelFree
+
+/-! ## 7. `MirStepNode` Instantiation over `V2026_06_01` MIR
+
+`stepMirState body : MirExecState → MirStepNode` is an `ITreeF` coalgebra over
+`MirEffect = SumE MirFailE (SumE MirObsE MirCallE)`. Its gap-aware evaluator
+erases `MirObsE` observations, delegates unresolved `MirCallE` calls to a callee
+environment, and tags every `MirStepNode.unsupported` with the `DefPath` of the
+body whose code was executing.
+-/
+
+section MirGap
+
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+
+/-- Gap site of a MIR execution state: `DefPath` of the body being executed. -/
+def mirGapSite (body : CapturedMir) : MirExecState → DefPath
+  | .running s => (s.memory.activeCallee.getD body).defPath
+  | .halted _ => body.defPath
+  | .faulted _ => body.defPath
+
+/--
+Callee environment: gap-aware semantics of the external calls a body makes. An
+environment may answer, fault, or report a gap (for example for an unmodeled
+or unresolved callee).
+-/
+abbrev MirCallEnv : Type :=
+  MirCallReq → OutcomeWithGap ExecFault (GapTag DefPath) MirCallAns
+
+/-- Closed-world environment: every external call is an `unresolved` gap. -/
+def MirCallEnv.unresolved : MirCallEnv :=
+  fun req => .gap (.unresolved req.defPath)
+
+/--
+Environment of memory-preserving callee summaries: `f defPath args` is the
+gap-aware result of calling `defPath` on `args`.
+-/
+def MirCallEnv.ofPure
+    (f : DefPath → List Value → OutcomeWithGap ExecFault (GapTag DefPath) Value) :
+    MirCallEnv :=
+  fun req => (f req.defPath req.args).map (fun v => .returned v req.memory)
+
+/-- Handler for the non-fault MIR effects: erase observations, delegate calls. -/
+def mirGapHandle (env : MirCallEnv) :
+    (i : (SumE MirObsE MirCallE).I) →
+      OutcomeWithGap ExecFault (GapTag DefPath) ((SumE MirObsE MirCallE).O i)
+  | .inl (.emit _) => .ok PUnit.unit
+  | .inr (.call req) => env req
+
+/-- One gap-classified step of `body` against callee environment `env`. -/
+def mirGapStep (env : MirCallEnv) (body : CapturedMir) :
+    MirExecState → GapStep MirExecState ExecFault (GapTag DefPath) MirReturn :=
+  gapStep (stepMirState body) (mirGapSite body) (mirGapHandle env)
+
+/--
+Fuel-indexed gap-aware evaluator over `stepMirState body`, starting from an
+arbitrary execution state.
+-/
+def runMirStepsWithGap (env : MirCallEnv) (body : CapturedMir) (fuel : Nat)
+    (s : MirExecState) : OutcomeWithGap ExecFault (GapTag DefPath) MirReturn :=
+  runGapSteps (mirGapStep env body) fuel s
+
+/-- Run `body` on `args` with inline callee bodies `callees`. -/
+def runMirWithGap (env : MirCallEnv) (callees : List CapturedMir)
+    (body : CapturedMir) (fuel : Nat) (args : List Value) :
+    OutcomeWithGap ExecFault (GapTag DefPath) MirReturn :=
+  runMirStepsWithGap env body fuel
+    (.running (initMachineStateWithCallees body args callees))
+
+/-- Deterministic fuel-indexed gap-aware semantics of `body` over arguments. -/
+def mirGapSem (env : MirCallEnv) (callees : List CapturedMir) (fuel : Nat)
+    (body : CapturedMir) :
+    GapSem (List Value) ExecFault (GapTag DefPath) MirReturn :=
+  GapSem.det (runMirWithGap env callees body fuel)
+
+/-- Fuel-free gap-aware semantics of `body` over arguments. -/
+def mirGapBehaviors (env : MirCallEnv) (callees : List CapturedMir)
+    (body : CapturedMir) :
+    GapSem (List Value) ExecFault (GapTag DefPath) MirReturn :=
+  fun args => gapBehaviors (mirGapStep env body)
+    (.running (initMachineStateWithCallees body args callees))
+
+/-- Layer 1A `Language` of `CapturedMir` bodies under gap-aware semantics. -/
+def mirGapLanguage (env : MirCallEnv) (callees : List CapturedMir) : Language :=
+  gapLanguage ExecFault.isUB (mirGapBehaviors env callees)
+
+variable {env : MirCallEnv} {body : CapturedMir}
+
+theorem runMirStepsWithGap_eq (fuel : Nat) (s : MirExecState) :
+    runMirStepsWithGap env body fuel s =
+      runStepsWithGap (stepMirState body) (mirGapSite body) (mirGapHandle env)
+        fuel s := rfl
+
+/--
+A `MirStepNode.unsupported` step is always the gap tagged with the `DefPath` of
+the body being executed: it is never a value and never a fault.
+-/
+theorem runMirStepsWithGap_of_unsupported {s : MachineState}
+    (h : stepMirFn body s = MirStepNode.unsupported) (fuel : Nat) :
+    runMirStepsWithGap env body (fuel + 1) (.running s) =
+      .gap (.unsupported (s.memory.activeCallee.getD body).defPath) :=
+  runStepsWithGap_of_unsupported (step := stepMirState body)
+    (site := mirGapSite body) (s := .running s) (k := PEmpty.elim) h fuel
+
+/-- A `MirStepNode.fail .ub` step is the runtime fault `ExecFault.ub`. -/
+theorem runMirStepsWithGap_of_ub {s : MachineState}
+    (h : stepMirFn body s = MirStepNode.fail .ub) (fuel : Nat) :
+    runMirStepsWithGap env body (fuel + 1) (.running s) = .fault .ub :=
+  runStepsWithGap_of_fail (step := stepMirState body)
+    (site := mirGapSite body) (s := .running s) (k := PEmpty.elim) h fuel
+
+/-- A halted execution state yields its classified `Outcome`. -/
+theorem runMirStepsWithGap_halted (out : MirOutcome) (fuel : Nat) :
+    runMirStepsWithGap env body (fuel + 1) (.halted out) = classifyOutcome out :=
+  runStepsWithGap_of_ret (step := stepMirState body) (s := .halted out) rfl fuel
+
+/-- A body whose phase is not a modeled runtime phase steps to `.unsupported`. -/
+theorem stepMirFn_of_phase_other {s : MachineState} {name : String}
+    (h : (s.memory.activeCallee.getD body).phase = .other name) :
+    stepMirFn body s = MirStepNode.unsupported := by
+  delta stepMirFn
+  dsimp only
+  rw [h]
+
+/--
+Shared unmodeled callee: from *any* state executing a body with an unmodeled
+phase, under *any* root body and callee environment, the run is the gap tagged
+with that body's `DefPath`. No property of the caller is needed.
+-/
+theorem runMirStepsWithGap_of_phase_other {s : MachineState} {name : String}
+    (h : (s.memory.activeCallee.getD body).phase = .other name) (fuel : Nat) :
+    runMirStepsWithGap env body (fuel + 1) (.running s) =
+      .gap (.unsupported (s.memory.activeCallee.getD body).defPath) :=
+  runMirStepsWithGap_of_unsupported (stepMirFn_of_phase_other h) fuel
+
+/--
+While a callee frame is active the root body is irrelevant: two different root
+bodies take the same step from the same state.
+-/
+theorem stepMirFn_eq_of_activeCallee {body₁ body₂ callee : CapturedMir}
+    {s : MachineState} (h : s.memory.activeCallee = some callee) :
+    stepMirFn body₁ s = stepMirFn body₂ s := by
+  delta stepMirFn
+  dsimp only
+  rw [h]
+  rfl
+
+theorem mirGapSite_eq_of_activeCallee {body₁ body₂ callee : CapturedMir}
+    {s : MachineState} (h : s.memory.activeCallee = some callee) :
+    mirGapSite body₁ (.running s) = mirGapSite body₂ (.running s) := by
+  show (s.memory.activeCallee.getD body₁).defPath =
+    (s.memory.activeCallee.getD body₂).defPath
+  rw [h]
+  rfl
+
+/--
+Multi-step congruence for a refactored MIR caller: if related execution states
+of `body₁` and `body₂` always present agreeing step nodes, the two bounded runs
+are related up to identical gaps for every callee environment and budget.
+-/
+theorem runMirStepsWithGap_congr {body₁ body₂ : CapturedMir}
+    {R : MirExecState → MirExecState → Prop} {rVal : MirReturn → MirReturn → Prop}
+    (hsim : ∀ s₁ s₂, R s₁ s₂ →
+      StepNodeRel R rVal (mirGapSite body₁ s₁) (mirGapSite body₂ s₂)
+        (stepMirState body₁ s₁) (stepMirState body₂ s₂))
+    (env : MirCallEnv) (fuel : Nat) {s₁ s₂ : MirExecState} (h : R s₁ s₂) :
+    GapEqErr rVal (· = ·) (runMirStepsWithGap env body₁ fuel s₁)
+      (runMirStepsWithGap env body₂ fuel s₂) :=
+  runStepsWithGap_congr hsim (mirGapHandle env) fuel h
+
+/--
+An unchanged MIR body under two callee environments that agree up to identical
+gaps: the runs agree up to identical gaps.
+-/
+theorem runMirStepsWithGap_env_congr {env₁ env₂ : MirCallEnv}
+    {rFault : ExecFault → ExecFault → Prop} (hFault : ∀ e, rFault e e)
+    (henv : ∀ req, GapEqErr (· = ·) rFault (env₁ req) (env₂ req))
+    (fuel : Nat) (s : MirExecState) :
+    GapEqErr (· = ·) rFault (runMirStepsWithGap env₁ body fuel s)
+      (runMirStepsWithGap env₂ body fuel s) :=
+  runStepsWithGap_handle_congr (step := stepMirState body)
+    (site := mirGapSite body) (handle₁ := mirGapHandle env₁)
+    (handle₂ := mirGapHandle env₂) hFault
+    (fun i =>
+      match i with
+      | .inl (.emit _) => (rfl : PUnit.unit = PUnit.unit)
+      | .inr (.call req) => henv req)
+    fuel s
+
+/-- Fuel monotonicity of bounded MIR runs. -/
+theorem runMirWithGap_fuel_mono {callees : List CapturedMir} {fuel fuel' : Nat}
+    {args : List Value} (hle : fuel ≤ fuel')
+    (hne : runMirWithGap env callees body fuel args ≠ .gap .outOfFuel) :
+    runMirWithGap env callees body fuel' args =
+      runMirWithGap env callees body fuel args :=
+  runGapSteps_fuel_mono_le _ hle hne
+
+/-- With a sufficient budget, the fuel-free semantics is the bounded run. -/
+theorem mirGapBehaviors_iff_of_run {callees : List CapturedMir} {fuel : Nat}
+    {args : List Value}
+    (h : runMirWithGap env callees body fuel args ≠ .gap .outOfFuel)
+    (o : OutcomeWithGap ExecFault (GapTag DefPath) MirReturn) :
+    mirGapBehaviors env callees body args o ↔
+      o = runMirWithGap env callees body fuel args :=
+  gapBehaviors_iff_of_run _ h o
+
+/--
+Two bounded MIR runs (with possibly different budgets) that finish with related
+outcomes determine equivalent fuel-free behavior sets.
+-/
+theorem mirGapBehaviors_equiv_of_runs {env₁ env₂ : MirCallEnv}
+    {callees₁ callees₂ : List CapturedMir} {body₁ body₂ : CapturedMir}
+    {rVal : MirReturn → MirReturn → Prop} {rFault : ExecFault → ExecFault → Prop}
+    {fuel₁ fuel₂ : Nat} {args₁ args₂ : List Value}
+    (hne : runMirWithGap env₁ callees₁ body₁ fuel₁ args₁ ≠ .gap .outOfFuel)
+    (h : GapEqErr rVal rFault (runMirWithGap env₁ callees₁ body₁ fuel₁ args₁)
+      (runMirWithGap env₂ callees₂ body₂ fuel₂ args₂)) :
+    OutcomeSetEquiv (GapEqErr rVal rFault)
+      (mirGapBehaviors env₁ callees₁ body₁ args₁)
+      (mirGapBehaviors env₂ callees₂ body₂ args₂) :=
+  gapBehaviors_equiv_of_runs hne h
+
+/--
+For two finished bounded MIR runs, equivalence of the fuel-free behavior sets
+is exactly `GapEqErr` of the two outcomes.
+-/
+theorem mirGapBehaviors_equiv_iff_of_runs {env₁ env₂ : MirCallEnv}
+    {callees₁ callees₂ : List CapturedMir} {body₁ body₂ : CapturedMir}
+    {rVal : MirReturn → MirReturn → Prop} {rFault : ExecFault → ExecFault → Prop}
+    {fuel₁ fuel₂ : Nat} {args₁ args₂ : List Value}
+    (hne₁ : runMirWithGap env₁ callees₁ body₁ fuel₁ args₁ ≠ .gap .outOfFuel)
+    (hne₂ : runMirWithGap env₂ callees₂ body₂ fuel₂ args₂ ≠ .gap .outOfFuel) :
+    OutcomeSetEquiv (GapEqErr rVal rFault)
+        (mirGapBehaviors env₁ callees₁ body₁ args₁)
+        (mirGapBehaviors env₂ callees₂ body₂ args₂) ↔
+      GapEqErr rVal rFault (runMirWithGap env₁ callees₁ body₁ fuel₁ args₁)
+        (runMirWithGap env₂ callees₂ body₂ fuel₂ args₂) :=
+  gapBehaviors_equiv_iff_of_runs hne₁ hne₂
+
+/-- A finished gap-free bounded MIR run makes the fuel-free semantics gap-free. -/
+theorem neverGap_mirGapBehaviors_of_run {callees : List CapturedMir} {fuel : Nat}
+    {args : List Value}
+    (h : (runMirWithGap env callees body fuel args).isGapFree) :
+    NeverGap (mirGapBehaviors env callees body args) :=
+  neverGap_gapBehaviors_of_run h
+
+/-- A finished defined bounded MIR run makes the fuel-free semantics defined. -/
+theorem defined_mirGapBehaviors_of_run {callees : List CapturedMir} {fuel : Nat}
+    {args : List Value}
+    (h : (runMirWithGap env callees body fuel args).isDefined ExecFault.isUB) :
+    OutcomeSet.Defined ExecFault.isUB (mirGapBehaviors env callees body args) :=
+  defined_gapBehaviors_of_run h
+
+/-- Exact fault matching preserves UB-ness. -/
+theorem ExecFault.eq_preserves_isUB :
+    ∀ e₁ e₂ : ExecFault, e₁ = e₂ → (e₁.isUB ↔ e₂.isUB) :=
+  fun _ _ h => h ▸ Iff.rfl
+
+/--
+A fault relation that identifies UB with a defined panic does not preserve
+UB-ness, so it never satisfies the side condition of the Layer 1A bridges.
+-/
+theorem ExecFault.not_preserves_isUB_of_ub_panic
+    {rFault : ExecFault → ExecFault → Prop} (h : rFault .ub .panic) :
+    ¬ ∀ e₁ e₂ : ExecFault, rFault e₁ e₂ → (e₁.isUB ↔ e₂.isUB) :=
+  fun hUB => (hUB .ub .panic h).mp trivial
+
+/--
+Exact `ContextEquiv` of two MIR bodies induces an identity-observation
+`ExactPass` on their Layer 1A projections (gaps and UB undefined, panics and
+aborts defined), with no gap-freedom obligation on shared callees.
+-/
+theorem mirContextEquiv_exactPass {callees : List CapturedMir}
+    {body₁ body₂ : CapturedMir}
+    (h : ContextEquiv (· = ·) (· = ·) (mirGapBehaviors env callees body₁)
+      (mirGapBehaviors env callees body₂)) :
+    ExactPass (gapSemantics ExecFault.isUB (mirGapBehaviors env callees))
+      (gapSemantics ExecFault.isUB (mirGapBehaviors env callees)) id id
+      body₁ body₂ :=
+  h.toExactPass_eq
+
+/-- Exact `ContextEquiv` of two MIR bodies induces Layer 1A `Compiles`. -/
+theorem mirContextEquiv_compiles {callees : List CapturedMir}
+    {body₁ body₂ : CapturedMir}
+    (h : ContextEquiv (· = ·) (· = ·) (mirGapBehaviors env callees body₁)
+      (mirGapBehaviors env callees body₂)) :
+    Compiles (mirGapLanguage env callees) (mirGapLanguage env callees) id
+      body₁ body₂ :=
+  fun q => OutcomeSet.toPartial_le_of_subset (h q).superset_of_eq
+
+/--
+Query-scoped upgrade for MIR bodies: when the baseline is gap-free and UB-free
+on `pre`, exact `ContextEquivOn pre` is gap-free `ProgramEquivOn pre`, and the
+refactored body is gap-free and UB-free on `pre` as well.
+-/
+theorem mirContextEquivOn_toProgramEquivOn {Query : Type}
+    {pre : Query → Prop}
+    {sem₁ sem₂ : GapSem Query ExecFault (GapTag DefPath) MirReturn}
+    (h : ContextEquivOn pre (· = ·) (· = ·) sem₁ sem₂)
+    (h₁ : ∀ q, pre q → OutcomeSet.Defined ExecFault.isUB (sem₁ q)) :
+    ProgramEquivOn pre (· = ·) (· = ·) sem₁ sem₂ ∧
+      ∀ q, pre q → OutcomeSet.Defined ExecFault.isUB (sem₂ q) :=
+  h.toProgramEquivOn_of_defined ExecFault.eq_preserves_isUB h₁
+
+end MirGap
+
+
+/-! ## 8. Adequacy of Gap-Aware Stepping for the Interaction-Tree Semantics
+
+The gap-aware evaluator steps the same coalgebra that `ITree.cofix` unfolds.
+Every continuing step of the evaluator is a `.tau` or an answered non-fault
+request of the tree, so a value reported by the evaluator is a value the tree
+returns (`ReachesRet`), and a step-level failure reached by the evaluator is a
+reachable fault of the tree (so the tree is not `TreeSafe`).
+-/
+
+section GapMachineWitness
+
+variable {State : Type u} {Fault : Type u₁} {Site : Type u₂} {Val : Type u₃}
+  (next : State → GapStep State Fault (GapTag Site) Val)
+
+/--
+A bounded run that is not out of fuel halts at a state reached by continuing
+steps: the outcome is produced by one halting step.
+-/
+theorem runGapSteps_witness {fuel : Nat} {s : State}
+    (hne : runGapSteps next fuel s ≠ .gap .outOfFuel) :
+    ∃ n s', GapReach next n s s' ∧ next s' = .done (runGapSteps next fuel s) := by
+  induction fuel generalizing s with
+  | zero => exact absurd rfl hne
+  | succ fuel ih =>
+    cases hn : next s with
+    | next t =>
+      rw [runGapSteps_succ_of_next next hn] at hne ⊢
+      obtain ⟨n, s', hr, hd⟩ := ih hne
+      exact ⟨n + 1, s', .step hn hr, hd⟩
+    | done out =>
+      rw [runGapSteps_succ_of_done next hn]
+      exact ⟨0, s, .refl s, hn⟩
+
+end GapMachineWitness
+
+section Adequacy
+
+variable {State Val Site : Type} {E : Effect.{0}}
+  {step : State → ITreeF (SumE (FailE FailureKind) E) (Outcome Val) State}
+  {site : State → Site}
+  {handle : (i : E.I) → OutcomeWithGap ExecFault (GapTag Site) (E.O i)}
+
+/-- A continuing step is a `.tau` or a request answered `.ok` by the handler. -/
+theorem gapStep_next_cases {s s' : State}
+    (h : gapStep step site handle s = .next s') :
+    step s = .tau s' ∨
+      ∃ (i : E.I) (k : E.O i → State) (o : E.O i),
+        step s = .vis (.inr i) k ∧ handle i = .ok o ∧ s' = k o := by
+  cases hs : step s with
+  | ret out => rw [gapStep_of_ret hs] at h; cases h
+  | tau t => rw [gapStep_of_tau hs] at h; cases h; exact Or.inl rfl
+  | vis i k =>
+    cases i with
+    | inl f =>
+      cases f with
+      | fail kind => rw [gapStep_of_fail hs] at h; cases h
+    | inr j =>
+      rw [gapStep_of_vis hs] at h
+      cases ho : handle j with
+      | ok o => rw [ho] at h; cases h; exact Or.inr ⟨j, k, o, rfl, ho, rfl⟩
+      | fault e => rw [ho] at h; cases h
+      | gap g => rw [ho] at h; cases h
+
+/--
+A halting step that reports a value is a `.ret (.normal v)` node: neither a
+failure of the machine nor a fault or gap of the handler is ever a value.
+-/
+theorem gapStep_done_ok {s : State} {v : Val}
+    (h : gapStep step site handle s = .done (.ok v)) :
+    step s = .ret (.normal v) := by
+  cases hs : step s with
+  | ret out =>
+    rw [gapStep_of_ret hs] at h
+    cases out with
+    | normal w => cases h; rfl
+    | panic => cases h
+    | abort => cases h
+  | tau t => rw [gapStep_of_tau hs] at h; cases h
+  | vis i k =>
+    cases i with
+    | inl f =>
+      cases f with
+      | fail kind =>
+        rw [gapStep_of_fail hs] at h
+        cases kind <;> cases h
+    | inr j =>
+      rw [gapStep_of_vis hs] at h
+      cases ho : handle j with
+      | ok o => rw [ho] at h; cases h
+      | fault e => rw [ho] at h; cases h
+      | gap g => rw [ho] at h; cases h
+
+variable [FaultEffect E]
+
+/--
+Continuing steps of the evaluator are reachability in the unfolded interaction
+tree, provided the handled effect row `E` has no fault requests.
+-/
+theorem reaches_of_gapReach (hE : ∀ i : E.I, ¬ FaultEffect.isFault i)
+    {n : Nat} {s s' : State}
+    (h : GapReach (gapStep step site handle) n s s') :
+    ∃ tr, Reaches (ITree.cofix step s) tr (ITree.cofix step s') := by
+  induction h with
+  | refl s => exact ⟨[], .refl _⟩
+  | @step n s t s'' hn _ ih =>
+    obtain ⟨tr, hr⟩ := ih
+    rcases gapStep_next_cases hn with hs | ⟨i, k, o, hs, _, rfl⟩
+    · exact ⟨tr, .tau (by rw [ITree.observe_cofix, hs]; rfl) hr⟩
+    · exact ⟨_, .vis (i := Sum.inr i) (by rw [ITree.observe_cofix, hs]; rfl) (hE i) o hr⟩
+
+/--
+Soundness of reported values: if the gap-aware evaluator returns `.ok v`, the
+unfolded interaction tree returns `.normal v` along some trace.
+-/
+theorem runStepsWithGap_ok_reachesRet (hE : ∀ i : E.I, ¬ FaultEffect.isFault i)
+    {fuel : Nat} {s : State} {v : Val}
+    (h : runStepsWithGap step site handle fuel s = .ok v) :
+    ∃ tr, ReachesRet (ITree.cofix step s) tr (.normal v) := by
+  have hrun : runGapSteps (gapStep step site handle) fuel s = .ok v := h
+  have hne : runGapSteps (gapStep step site handle) fuel s ≠ .gap .outOfFuel :=
+    fun h₀ => by rw [hrun] at h₀; cases h₀
+  obtain ⟨n, s', hr, hd⟩ := runGapSteps_witness _ hne
+  rw [hrun] at hd
+  obtain ⟨tr, hreach⟩ := reaches_of_gapReach hE hr
+  exact ⟨tr, _, hreach, by rw [ITree.observe_cofix, gapStep_done_ok hd]; rfl⟩
+
+/--
+A step-level failure reached by the evaluator is a reachable fault of the
+unfolded interaction tree: the tree is not `TreeSafe`. In particular a reached
+`FailureKind.unsupported` (a gap of the evaluator) and a reached
+`FailureKind.ub` are both "undefined" in the Layer 1A projection of the tree.
+-/
+theorem not_treeSafe_of_gapReach_fail (hE : ∀ i : E.I, ¬ FaultEffect.isFault i)
+    {n : Nat} {s s' : State} {kind : FailureKind} {k : PEmpty → State}
+    (h : GapReach (gapStep step site handle) n s s')
+    (hs : step s' = .vis (.inl (.fail kind)) k) :
+    ¬ TreeSafe (ITree.cofix step s) := by
+  intro hsafe
+  obtain ⟨tr, hreach⟩ := reaches_of_gapReach hE h
+  exact hsafe tr _ hreach
+    ⟨_, Sum.inl (FailReq.fail kind), _, .refl _,
+      by rw [ITree.observe_cofix, hs]; rfl, trivial⟩
+
+/--
+An undefined outcome of the evaluator (UB or a gap other than `.outOfFuel`)
+that is not a fault or gap of the handler comes from a failure node of the
+stepped machine, so the unfolded interaction tree is not `TreeSafe`. The
+evaluator and the Layer 1A projection of the tree therefore agree that such a
+run is undefined.
+-/
+theorem not_treeSafe_of_runStepsWithGap (hE : ∀ i : E.I, ¬ FaultEffect.isFault i)
+    {fuel : Nat} {s : State} {o : OutcomeWithGap ExecFault (GapTag Site) Val}
+    (h : runStepsWithGap step site handle fuel s = o)
+    (hne : o ≠ .gap .outOfFuel) (hundef : ¬ o.isDefined ExecFault.isUB)
+    (hfault : ∀ i e, handle i = .fault e → o ≠ .fault e)
+    (hgap : ∀ i g, handle i = .gap g → o ≠ .gap g) :
+    ¬ TreeSafe (ITree.cofix step s) := by
+  have hrun : runGapSteps (gapStep step site handle) fuel s = o := h
+  obtain ⟨n, s', hr, hd⟩ := runGapSteps_witness _ (hrun ▸ hne)
+  rw [hrun] at hd
+  cases hs : step s' with
+  | ret out =>
+    rw [gapStep_of_ret hs] at hd
+    cases hd
+    exact absurd (classifyOutcome_isDefined out) hundef
+  | tau t => rw [gapStep_of_tau hs] at hd; cases hd
+  | vis i k =>
+    cases i with
+    | inl f =>
+      cases f with
+      | fail kind => exact not_treeSafe_of_gapReach_fail hE hr hs
+    | inr j =>
+      rw [gapStep_of_vis hs] at hd
+      cases ho : handle j with
+      | ok a => rw [ho] at hd; cases hd
+      | fault e => rw [ho] at hd; cases hd; exact absurd rfl (hfault j e ho)
+      | gap g => rw [ho] at hd; cases hd; exact absurd rfl (hgap j g ho)
+
+end Adequacy
+
+section MirAdequacy
+
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+
+/-- Observations and external calls are not fault requests. -/
+theorem mirHandled_not_fault :
+    ∀ i : (SumE MirObsE MirCallE).I, ¬ FaultEffect.isFault i
+  | .inl _ => fun h => h
+  | .inr _ => fun h => h
+
+variable {env : MirCallEnv} {body : CapturedMir}
+
+/--
+Soundness of reported values against the trusted semantics: a value returned
+by the gap-aware evaluator from state `s` is returned by `mirTree body s`.
+-/
+theorem runMirStepsWithGap_ok_reachesRet {fuel : Nat} {s : MachineState}
+    {r : MirReturn} (h : runMirStepsWithGap env body fuel (.running s) = .ok r) :
+    ∃ tr, ReachesRet (mirTree body s) tr (.normal r) :=
+  runStepsWithGap_ok_reachesRet (step := stepMirState body)
+    (site := mirGapSite body) (handle := mirGapHandle env) mirHandled_not_fault h
+
+theorem runMirWithGap_ok_reachesRet {callees : List CapturedMir} {fuel : Nat}
+    {args : List Value} {r : MirReturn}
+    (h : runMirWithGap env callees body fuel args = .ok r) :
+    ∃ tr, ReachesRet
+      (mirTree body (initMachineStateWithCallees body args callees)) tr (.normal r) :=
+  runMirStepsWithGap_ok_reachesRet h
+
+/-- Every value of the fuel-free semantics is returned by the trusted `mirTree`. -/
+theorem mirGapBehaviors_ok_reachesRet {callees : List CapturedMir}
+    {args : List Value} {r : MirReturn}
+    (h : mirGapBehaviors env callees body args (.ok r)) :
+    ∃ tr, ReachesRet
+      (mirTree body (initMachineStateWithCallees body args callees)) tr (.normal r) :=
+  let ⟨_, _, hrun⟩ := h
+  runMirWithGap_ok_reachesRet hrun
+
+/--
+Under the closed-world environment, a run ending in UB or in an `unsupported`
+gap reaches a fault of the trusted `mirTree`: the trusted Layer 1A semantics of
+the body is undefined on these arguments, exactly like the gap-aware one.
+-/
+theorem not_mirNoUBTree_of_run_undefined {callees : List CapturedMir} {fuel : Nat}
+    {args : List Value} {o : OutcomeWithGap ExecFault (GapTag DefPath) MirReturn}
+    (h : runMirWithGap MirCallEnv.unresolved callees body fuel args = o)
+    (ho : o = .fault .ub ∨ ∃ site, o = .gap (.unsupported site)) :
+    ¬ MirNoUBTree (mirTree body (initMachineStateWithCallees body args callees)) := by
+  refine not_treeSafe_of_runStepsWithGap (step := stepMirState body)
+    (site := mirGapSite body) (handle := mirGapHandle MirCallEnv.unresolved)
+    mirHandled_not_fault h ?_ ?_ ?_ ?_
+  · rcases ho with rfl | ⟨site, rfl⟩ <;> exact fun h₀ => by cases h₀
+  · rcases ho with rfl | ⟨site, rfl⟩
+    · exact fun hd => hd trivial
+    · exact fun hd => hd
+  · intro i e hi
+    cases i with
+    | inl obs =>
+      cases obs with
+      | emit ev => cases hi
+    | inr call =>
+      cases call with
+      | call req => cases hi
+  · intro i g hi
+    cases i with
+    | inl obs =>
+      cases obs with
+      | emit ev => cases hi
+    | inr call =>
+      cases call with
+      | call req =>
+        cases hi
+        rcases ho with rfl | ⟨site, rfl⟩ <;> exact fun h₀ => by cases h₀
+
+end MirAdequacy
 
 end Anneal.Pass

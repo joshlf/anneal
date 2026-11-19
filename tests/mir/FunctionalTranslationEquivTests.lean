@@ -31,21 +31,21 @@ suite for `Anneal.FunctionalTranslation` over `V2026_06_01` `CapturedMir` bodies
 
 /-! ## Shared `V2026_06_01` `CapturedMir` AST Builders and Scalar Simplification Lemmas -/
 
-@[reducible] private def boolMirTy : Ty := { kind := .bool, layoutIdx := 0 }
-@[reducible] private def u32MirTy : Ty := { kind := .uint .u32, layoutIdx := 0 }
-@[reducible] private def usizeMirTy : Ty := { kind := .uint .usize, layoutIdx := 0 }
-@[reducible] private def checkedU32MirTy : Ty :=
+@[reducible] def boolMirTy : Ty := { kind := .bool, layoutIdx := 0 }
+@[reducible] def u32MirTy : Ty := { kind := .uint .u32, layoutIdx := 0 }
+@[reducible] def usizeMirTy : Ty := { kind := .uint .usize, layoutIdx := 0 }
+@[reducible] def checkedU32MirTy : Ty :=
   { kind := .tuple [.uint .u32, .bool], layoutIdx := 0 }
 @[reducible] private def u32ArrayMirTy : Ty :=
   { kind := .array (.uint .u32) 0, layoutIdx := 0 }
 
-@[reducible] private def u32ConstOp (n : Nat) : Operand :=
+@[reducible] def u32ConstOp (n : Nat) : Operand :=
   .constant { ty := u32MirTy, val := .scalar (.int { bits := n, sizeBytes := 4 }) }
 
 @[reducible] private def usizeConstOp (n : Nat) : Operand :=
   .constant { ty := usizeMirTy, val := .scalar (.int { bits := n, sizeBytes := 8 }) }
 
-@[reducible] private def defaultU32Layout : TypeLayout := {
+@[reducible] def defaultU32Layout : TypeLayout := {
   size := { bytes := 4 }
   align := { bytes := 4 }
   backendRepr := .memory
@@ -54,23 +54,23 @@ suite for `Anneal.FunctionalTranslation` over `V2026_06_01` `CapturedMir` bodies
   isUninhabited := false
 }
 
-@[reducible] private def defaultFnAbi : FnAbi := {
+@[reducible] def defaultFnAbi : FnAbi := {
   args := []
   ret := { layout := defaultU32Layout, mode := .direct }
   conv := .rust
   canUnwind := false
 }
 
-@[reducible] private def mkDecl (mutability : Mutability) (ty : Ty) : LocalDecl :=
+@[reducible] def mkDecl (mutability : Mutability) (ty : Ty) : LocalDecl :=
   { mutability, ty, debugName := none }
 
-@[reducible] private def mkStmt (kind : StatementKind) : Statement :=
+@[reducible] def mkStmt (kind : StatementKind) : Statement :=
   { kind, span := "FunctionalTranslationTests.lean" }
 
-@[reducible] private def mkTerm (kind : TerminatorKind) : Terminator :=
+@[reducible] def mkTerm (kind : TerminatorKind) : Terminator :=
   { kind, span := "FunctionalTranslationTests.lean" }
 
-@[reducible] private def mkMirBody
+@[reducible] def mkMirBody
     (defPath : DefPath) (argCount : Nat)
     (localDecls : List LocalDecl) (basicBlocks : List BasicBlockData) :
     CapturedMir := {
@@ -82,11 +82,11 @@ suite for `Anneal.FunctionalTranslation` over `V2026_06_01` `CapturedMir` bodies
   allocations := []
 }
 
-@[reducible] private def locPlace (idx : Local) : Place :=
+@[reducible] def locPlace (idx : Local) : Place :=
   { local_ := idx, projection := [] }
 
 /-- Non-dead local slot helper (`none ↦ .uninit`, `some v ↦ .init v`). -/
-@[reducible] private def optSlot : Option Value → LocalSlot
+@[reducible] def optSlot : Option Value → LocalSlot
   | none => .uninit
   | some v => .init v
 
@@ -669,5 +669,769 @@ theorem branchlessMulDouble_obsErased_equiv_branchingSelectDouble
       (Value.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩, emptyMemory) = _
     rw [h_2x]
     rfl
+
+/-! ## Suite 5: Gap-Preserving `ContextEquiv` and Gap-Free `ProgramEquiv`
+
+Kernel-checked positive and negative non-vacuity canaries for
+`Anneal.Refinement.ContextEquiv` and `Anneal.Pass.runMirWithGap` on concrete
+`V2026_06_01` `CapturedMir` bodies:
+
+- two callers (`callerBranchingBody`, `callerRefactoredBody`) that agree on the
+  supported branch up to refactored arithmetic and both call the shared
+  unmodeled helper `unsupportedHelperBody` on the other branch;
+- `ContextEquiv` on **all** inputs with no gap-freedom proof for the helper,
+  upgraded by `ContextEquivOn.toProgramEquivOn` to gap-free `ProgramEquivOn` on
+  the inputs where the baseline is proved gap-free;
+- rejected refactorings: a newly introduced gap, mismatched gap tags, and UB
+  confused with a normal return or with a panic.
+-/
+
+section GapPreservingCanaries
+
+open Anneal.Refinement
+open Anneal.Pass
+
+/-- Function-item operand naming the callee `defPath`. -/
+def fnItemOp (defPath : DefPath) : Operand :=
+  .constant { ty := { kind := .fnDef defPath [], layoutIdx := 0 }, val := .zeroSized }
+
+/--
+Shared helper callee whose MIR phase is not a modeled runtime phase, so
+`stepMirFn` steps to `MirStepNode.unsupported` as soon as it is entered:
+`fn unmodeled_helper(x: u32) -> u32 { /* unmodeled */ }`.
+-/
+def unsupportedHelperBody : CapturedMir :=
+  { mkMirBody "test::unmodeled_helper" 1
+      [mkDecl .mut u32MirTy, mkDecl .not u32MirTy]
+      [ { statements := [mkStmt (.assign (locPlace 0) (.use (.copy (locPlace 1))))]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    phase := .other "unmodeled" }
+
+/-- A second unmodeled helper with a different `DefPath` (a different gap site). -/
+def otherUnsupportedHelperBody : CapturedMir :=
+  { unsupportedHelperBody with defPath := "test::other_unmodeled_helper" }
+
+/-- `switchInt(_1) [0 -> bb2, otherwise -> bb1]`: `flag = true` runs `bb1`. -/
+def flagSwitchBlock : BasicBlockData :=
+  { statements := []
+    terminator := mkTerm (.switchInt (.copy (locPlace 1))
+      { branches := [(0, 2)], otherwise := 1 })
+    isCleanup := false }
+
+/-- `_0 = helper(copy _2) -> bb3`. -/
+def helperCallBlock (helper : DefPath) : BasicBlockData :=
+  { statements := []
+    terminator := mkTerm
+      (.call (fnItemOp helper) [.copy (locPlace 2)] (locPlace 0) (some 3) .continue_)
+    isCleanup := false }
+
+/-- `return`. -/
+def returnBlock : BasicBlockData :=
+  { statements := [], terminator := mkTerm .return_, isCleanup := false }
+
+/--
+Baseline caller:
+`fn caller(flag: bool, x: u32) -> u32 { if flag { x + x } else { unmodeled_helper(x) } }`.
+-/
+def callerBranchingBody : CapturedMir :=
+  mkMirBody "test::caller_branching" 2
+    [mkDecl .mut u32MirTy, mkDecl .not boolMirTy, mkDecl .not u32MirTy]
+    [ flagSwitchBlock,
+      -- bb1: _0 = _2 + _2; return
+      { statements :=
+          [mkStmt (.assign (locPlace 0)
+            (.binaryOp .add (.copy (locPlace 2)) (.copy (locPlace 2))))]
+        terminator := mkTerm .return_
+        isCleanup := false },
+      helperCallBlock "test::unmodeled_helper",
+      returnBlock ]
+
+/--
+Refactored caller (different arithmetic, an extra temporary, more steps):
+`fn caller(flag: bool, x: u32) -> u32 { if flag { let t = x * 2; t } else { helper(x) } }`
+where `helper` is `unmodeled_helper`.
+-/
+def callerRefactoredBody : CapturedMir :=
+  mkMirBody "test::caller_refactored" 2
+    [mkDecl .mut u32MirTy, mkDecl .not boolMirTy, mkDecl .not u32MirTy,
+     mkDecl .mut u32MirTy]
+    [ flagSwitchBlock,
+      -- bb1: StorageLive(_3); _3 = _2 * 2; _0 = copy _3; return
+      { statements :=
+          [mkStmt (.storageLive 3),
+           mkStmt (.assign (locPlace 3)
+            (.binaryOp .mul (.copy (locPlace 2)) (u32ConstOp 2))),
+           mkStmt (.assign (locPlace 0) (.use (.copy (locPlace 3))))]
+        terminator := mkTerm .return_
+        isCleanup := false },
+      helperCallBlock "test::unmodeled_helper",
+      returnBlock ]
+
+/-- Argument list of the query `(flag, x)`. -/
+def callerArgs (q : Bool × Nat) : List Value :=
+  [.scalar (boolToScalar q.1), .scalar ⟨q.2, 4⟩]
+
+/-- Callee bodies linked into every caller run. -/
+def linkedHelpers : List CapturedMir :=
+  [unsupportedHelperBody, otherUnsupportedHelperBody]
+
+/-- Bounded gap-aware run of a caller on the query `(flag, x)`. -/
+def callerRun (body : CapturedMir) (fuel : Nat) (q : Bool × Nat) :
+    OutcomeWithGap ExecFault (GapTag DefPath) MirReturn :=
+  runMirWithGap MirCallEnv.unresolved linkedHelpers body fuel (callerArgs q)
+
+/-- Fuel-free gap-aware semantics of a caller over queries `(flag, x)`. -/
+def callerGapSem (body : CapturedMir) :
+    GapSem (Bool × Nat) ExecFault (GapTag DefPath) MirReturn :=
+  fun q => mirGapBehaviors MirCallEnv.unresolved linkedHelpers body (callerArgs q)
+
+
+/-! ### Part 5A: Positive Canary (Shared Unmodeled Helper, Refactored Arithmetic) -/
+
+/-- Root memory of every caller run: the initial memory linking the helpers. -/
+def linkedMemory : Memory :=
+  (initMachineStateWithCallees callerBranchingBody [] linkedHelpers).memory
+
+/-- Baseline, `flag = true`: three steps to `x + x` (no gap, no fault). -/
+theorem callerBranching_run_true (x : Nat) :
+    callerRun callerBranchingBody 3 (true, x) =
+      .ok (.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩, linkedMemory) :=
+  rfl
+
+/--
+Baseline, `flag = false`: the call enters `unsupportedHelperBody`, whose first
+step is `MirStepNode.unsupported`, giving the gap tagged with the helper.
+-/
+theorem callerBranching_run_false (x : Nat) :
+    callerRun callerBranchingBody 3 (false, x) =
+      .gap (.unsupported "test::unmodeled_helper") :=
+  rfl
+
+/-- Refactored, `flag = true`: five steps to `x * 2`. -/
+theorem callerRefactored_run_true (x : Nat) :
+    callerRun callerRefactoredBody 5 (true, x) =
+      .ok (.scalar ⟨wrapScalarBits (x * 2) (scalarModulus 4), 4⟩, linkedMemory) :=
+  rfl
+
+/-- Refactored, `flag = false`: the identical helper gap. -/
+theorem callerRefactored_run_false (x : Nat) :
+    callerRun callerRefactoredBody 5 (false, x) =
+      .gap (.unsupported "test::unmodeled_helper") :=
+  rfl
+
+/-- A bounded run with a known non-budget outcome is not out of fuel. -/
+theorem ne_outOfFuel_of_eq {o o' : OutcomeWithGap ExecFault (GapTag DefPath) MirReturn}
+    (h : o = o') (h' : o' ≠ .gap .outOfFuel) : o ≠ .gap .outOfFuel :=
+  fun h₀ => h' (h.symm.trans h₀)
+
+/--
+The helper's gap does not depend on who calls it: from *any* machine state in
+which `unsupportedHelperBody` is the active callee, under any root body and any
+callee environment, the run is the gap tagged with the helper's `DefPath`.
+-/
+theorem unsupportedHelper_gap_of_any_caller (env : MirCallEnv) (root : CapturedMir)
+    (s : MachineState) (h : s.memory.activeCallee = some unsupportedHelperBody)
+    (fuel : Nat) :
+    runMirStepsWithGap env root (fuel + 1) (.running s) =
+      .gap (.unsupported "test::unmodeled_helper") := by
+  have hphase : (s.memory.activeCallee.getD root).phase = .other "unmodeled" := by
+    rw [h]; rfl
+  have hrun := runMirStepsWithGap_of_phase_other (env := env) hphase fuel
+  rw [h] at hrun
+  exact hrun
+
+/--
+The two bounded runs (budgets `3` and `5`) are related up to identical gaps on
+**every** input: equal values on `flag = true` and the identical helper gap on
+`flag = false`.
+-/
+theorem callerRefactored_gapEqErr (q : Bool × Nat) :
+    GapEqErr (· = ·) (· = ·) (callerRun callerBranchingBody 3 q)
+      (callerRun callerRefactoredBody 5 q) := by
+  obtain ⟨flag, x⟩ := q
+  cases flag with
+  | true =>
+    rw [callerBranching_run_true, callerRefactored_run_true, Nat.mul_two]
+    exact GapEqErr.refl (fun _ => rfl) (fun _ => rfl) _
+  | false =>
+    rw [callerBranching_run_false, callerRefactored_run_false]
+    exact GapEqErr.refl (fun _ => rfl) (fun _ => rfl) _
+
+theorem callerBranching_run_ne_outOfFuel (q : Bool × Nat) :
+    callerRun callerBranchingBody 3 q ≠ .gap .outOfFuel := by
+  obtain ⟨flag, x⟩ := q
+  cases flag with
+  | true => rw [callerBranching_run_true]; exact fun h => by cases h
+  | false => rw [callerBranching_run_false]; exact fun h => by cases h
+
+theorem callerRefactored_run_ne_outOfFuel (q : Bool × Nat) :
+    callerRun callerRefactoredBody 5 q ≠ .gap .outOfFuel := by
+  obtain ⟨flag, x⟩ := q
+  cases flag with
+  | true => rw [callerRefactored_run_true]; exact fun h => by cases h
+  | false => rw [callerRefactored_run_false]; exact fun h => by cases h
+
+/--
+Positive canary: `ContextEquiv` between the baseline and the refactored caller
+on **all** `flag : Bool` and `x : Nat`, with no gap-freedom proof for
+`unsupportedHelperBody`.
+-/
+theorem callerRefactored_contextEquiv :
+    ContextEquiv (· = ·) (· = ·) (callerGapSem callerBranchingBody)
+      (callerGapSem callerRefactoredBody) :=
+  fun q => mirGapBehaviors_equiv_of_runs (callerBranching_run_ne_outOfFuel q)
+    (callerRefactored_gapEqErr q)
+
+/--
+The same equivalence for the deterministic fuel-indexed semantics, at every
+common budget of at least five steps.
+-/
+theorem callerRefactored_contextEquiv_bounded (fuel : Nat) (hfuel : 5 ≤ fuel) :
+    ContextEquiv (· = ·) (· = ·) (GapSem.det (callerRun callerBranchingBody fuel))
+      (GapSem.det (callerRun callerRefactoredBody fuel)) := by
+  refine contextEquiv_det_iff.mpr (fun q => ?_)
+  have h₁ : callerRun callerBranchingBody fuel q = callerRun callerBranchingBody 3 q :=
+    runMirWithGap_fuel_mono (Nat.le_trans (by decide) hfuel)
+      (callerBranching_run_ne_outOfFuel q)
+  have h₂ : callerRun callerRefactoredBody fuel q =
+      callerRun callerRefactoredBody 5 q :=
+    runMirWithGap_fuel_mono hfuel (callerRefactored_run_ne_outOfFuel q)
+  rw [h₁, h₂]
+  exact callerRefactored_gapEqErr q
+
+/-- The baseline alone is proved gap-free on the inputs with `flag = true`. -/
+theorem callerBranching_gapFreeOn :
+    GapFreeOn (fun q : Bool × Nat => q.1 = true) (callerGapSem callerBranchingBody) := by
+  rintro ⟨flag, x⟩ (rfl : flag = true)
+  have h : (callerRun callerBranchingBody 3 (true, x)).isGapFree := by
+    rw [callerBranching_run_true]; exact trivial
+  exact neverGap_mirGapBehaviors_of_run h
+
+/--
+Upgrade: on `flag = true`, where only the baseline was proved gap-free,
+`ContextEquiv` becomes full gap-free `ProgramEquivOn`.
+-/
+theorem callerRefactored_programEquivOn :
+    ProgramEquivOn (fun q : Bool × Nat => q.1 = true) (· = ·) (· = ·)
+      (callerGapSem callerBranchingBody) (callerGapSem callerRefactoredBody) :=
+  callerRefactored_contextEquiv.toProgramEquivOn callerBranching_gapFreeOn
+
+/--
+Gap-freedom of the refactored caller on `flag = true` is a *consequence* of the
+upgrade: it is never established by evaluating the refactored caller.
+-/
+theorem callerRefactored_gapFreeOn :
+    GapFreeOn (fun q : Bool × Nat => q.1 = true)
+      (callerGapSem callerRefactoredBody) :=
+  callerRefactored_programEquivOn.gapFree_right
+
+/-- Non-vacuity: on `flag = false` the baseline really does hit the helper gap. -/
+theorem callerBranching_gap_of_false (x : Nat) :
+    callerGapSem callerBranchingBody (false, x)
+      (.gap (.unsupported "test::unmodeled_helper")) :=
+  (mirGapBehaviors_iff_of_run (callerBranching_run_ne_outOfFuel (false, x)) _).mpr
+    (callerBranching_run_false x).symm
+
+/--
+Non-vacuity: the related behaviors on `flag = true` are real values. For
+`x + x < 2^32` the refactored caller returns exactly `x + x`.
+-/
+theorem callerRefactored_value_of_true (x : Nat) (hx : x + x < 4294967296) :
+    callerGapSem callerRefactoredBody (true, x)
+      (.ok (.scalar ⟨x + x, 4⟩, linkedMemory)) := by
+  obtain ⟨o₂, ho₂, hr⟩ := (callerRefactored_contextEquiv (true, x)).forward
+    ((mirGapBehaviors_iff_of_run (callerBranching_run_ne_outOfFuel (true, x)) _).mpr
+      (callerBranching_run_true x).symm)
+  rw [wrapScalarBits_of_lt (show x + x < scalarModulus 4 from hx)] at hr
+  cases GapEqErr.eq_iff.mp hr
+  exact ho₂
+
+/--
+Whole-program gap-free equivalence is *not* available for these callers: the
+baseline is not gap-free on `flag = false`, so `ProgramEquiv` on all inputs
+fails while `ContextEquiv` holds.
+-/
+theorem callerRefactored_not_programEquiv :
+    ¬ ProgramEquiv (· = ·) (· = ·) (callerGapSem callerBranchingBody)
+      (callerGapSem callerRefactoredBody) :=
+  fun h => h.gapFree_left (false, 0) (callerBranching_gap_of_false 0)
+
+/--
+Layer 1A bridge: the positive canary induces an identity-observation
+`ExactPass` between the two callers, still with no gap-freedom proof for the
+shared helper.
+-/
+theorem callerRefactored_exactPass :
+    ExactPass (gapSemantics ExecFault.isUB callerGapSem)
+      (gapSemantics ExecFault.isUB callerGapSem) id id
+      callerBranchingBody callerRefactoredBody :=
+  callerRefactored_contextEquiv.toExactPass_eq
+
+/--
+On `flag = true` the upgrade also yields definedness (gap-freedom and
+UB-freedom) of the refactored caller, from definedness of the baseline alone.
+-/
+theorem callerRefactored_defined_of_true :
+    ProgramEquivOn (fun q : Bool × Nat => q.1 = true) (· = ·) (· = ·)
+        (callerGapSem callerBranchingBody) (callerGapSem callerRefactoredBody) ∧
+      ∀ q : Bool × Nat, q.1 = true →
+        OutcomeSet.Defined ExecFault.isUB (callerGapSem callerRefactoredBody q) := by
+  refine mirContextEquivOn_toProgramEquivOn (callerRefactored_contextEquiv.on _) ?_
+  rintro ⟨flag, x⟩ (rfl : flag = true)
+  have h : (callerRun callerBranchingBody 3 (true, x)).isDefined ExecFault.isUB := by
+    rw [callerBranching_run_true]; exact trivial
+  exact defined_mirGapBehaviors_of_run h
+
+/--
+Adequacy: the value obtained through the upgrade is a value of the *trusted*
+interaction-tree semantics `mirTree` of the refactored caller.
+-/
+theorem callerRefactored_mirTree_returns (x : Nat) (hx : x + x < 4294967296) :
+    ∃ tr, Trusted.ITree.ReachesRet
+      (mirTree callerRefactoredBody
+        (initMachineStateWithCallees callerRefactoredBody (callerArgs (true, x))
+          linkedHelpers))
+      tr (.normal (.scalar ⟨x + x, 4⟩, linkedMemory)) :=
+  mirGapBehaviors_ok_reachesRet (callerRefactored_value_of_true x hx)
+
+/--
+On `flag = false` the trusted interaction tree of either caller reaches the
+helper's `unsupported` fault, so the trusted Layer 1A semantics is undefined
+there and says nothing. `ContextEquiv` still records that both callers hit the
+identical gap.
+-/
+theorem callers_not_mirNoUBTree_of_false (x : Nat) :
+    ¬ MirNoUBTree (mirTree callerBranchingBody
+        (initMachineStateWithCallees callerBranchingBody (callerArgs (false, x))
+          linkedHelpers)) ∧
+      ¬ MirNoUBTree (mirTree callerRefactoredBody
+        (initMachineStateWithCallees callerRefactoredBody (callerArgs (false, x))
+          linkedHelpers)) :=
+  ⟨not_mirNoUBTree_of_run_undefined (callerBranching_run_false x) (Or.inr ⟨_, rfl⟩),
+   not_mirNoUBTree_of_run_undefined (callerRefactored_run_false x) (Or.inr ⟨_, rfl⟩)⟩
+
+
+/-! ### Part 5B: Negative Canaries (Rejected Gaps, Gap Tags, and Faults) -/
+
+/--
+Buggy refactoring that calls the unmodeled helper on **every** input, also on
+`flag = true` where the baseline returns a value:
+`fn caller_buggy(flag: bool, x: u32) -> u32 { unmodeled_helper(x) }`.
+-/
+def callerBuggyBody : CapturedMir :=
+  mkMirBody "test::caller_buggy" 2
+    [mkDecl .mut u32MirTy, mkDecl .not boolMirTy, mkDecl .not u32MirTy]
+    [ { statements := [], terminator := mkTerm (.goto 2), isCleanup := false },
+      returnBlock,
+      helperCallBlock "test::unmodeled_helper",
+      returnBlock ]
+
+/--
+Refactoring that redirects the unmodeled branch to a *different* unmodeled
+helper: `if flag { x + x } else { other_unmodeled_helper(x) }`.
+-/
+def callerOtherHelperBody : CapturedMir :=
+  mkMirBody "test::caller_other_helper" 2
+    [mkDecl .mut u32MirTy, mkDecl .not boolMirTy, mkDecl .not u32MirTy]
+    [ flagSwitchBlock,
+      { statements :=
+          [mkStmt (.assign (locPlace 0)
+            (.binaryOp .add (.copy (locPlace 2)) (.copy (locPlace 2))))]
+        terminator := mkTerm .return_
+        isCleanup := false },
+      helperCallBlock "test::other_unmodeled_helper",
+      returnBlock ]
+
+theorem callerBuggy_run (q : Bool × Nat) :
+    callerRun callerBuggyBody 3 q = .gap (.unsupported "test::unmodeled_helper") :=
+  rfl
+
+theorem callerOtherHelper_run_false (x : Nat) :
+    callerRun callerOtherHelperBody 3 (false, x) =
+      .gap (.unsupported "test::other_unmodeled_helper") :=
+  rfl
+
+/--
+Negative canary (newly introduced gap): on `flag = true` the baseline returns a
+value while the buggy refactoring hits the helper gap. A value is never
+`GapEqErr`-related to a gap.
+-/
+theorem callerBuggy_not_gapEqErr (x : Nat) :
+    ¬ GapEqErr (· = ·) (· = ·) (callerRun callerBranchingBody 3 (true, x))
+      (callerRun callerBuggyBody 3 (true, x)) := by
+  rw [callerBranching_run_true, callerBuggy_run]
+  exact GapEqErr.not_ok_gap
+
+/-- The buggy refactoring is therefore rejected by `ContextEquiv`. -/
+theorem callerBuggy_not_contextEquiv :
+    ¬ ContextEquiv (· = ·) (· = ·) (callerGapSem callerBranchingBody)
+      (callerGapSem callerBuggyBody) :=
+  fun h => callerBuggy_not_gapEqErr 0
+    ((mirGapBehaviors_equiv_iff_of_runs
+      (callerBranching_run_ne_outOfFuel (true, 0))
+      (ne_outOfFuel_of_eq (callerBuggy_run (true, 0)) (fun h₀ => by cases h₀))).mp
+      (h (true, 0)))
+
+/--
+Negative canary (mismatched gap tags): on `flag = false` both callers hit an
+unmodeled helper, but not the same one. Gaps match only when identical.
+-/
+theorem callerOtherHelper_not_gapEqErr (x : Nat) :
+    ¬ GapEqErr (· = ·) (· = ·) (callerRun callerBranchingBody 3 (false, x))
+      (callerRun callerOtherHelperBody 3 (false, x)) := by
+  rw [callerBranching_run_false, callerOtherHelper_run_false]
+  intro h
+  exact absurd (GapTag.unsupported.inj h) (by decide)
+
+/-- Redirecting to a different unmodeled helper is rejected by `ContextEquiv`. -/
+theorem callerOtherHelper_not_contextEquiv :
+    ¬ ContextEquiv (· = ·) (· = ·) (callerGapSem callerBranchingBody)
+      (callerGapSem callerOtherHelperBody) :=
+  fun h => callerOtherHelper_not_gapEqErr 0
+    ((mirGapBehaviors_equiv_iff_of_runs
+      (callerBranching_run_ne_outOfFuel (false, 0))
+      (ne_outOfFuel_of_eq (callerOtherHelper_run_false 0)
+        (fun h₀ => by cases h₀))).mp
+      (h (false, 0)))
+
+/--
+Checked accessor: `fn checked(flag: bool, x: u32) -> u32 { assert!(flag); x }`
+(a defined panic on `flag = false`).
+-/
+def assertFlagBody : CapturedMir :=
+  mkMirBody "test::assert_flag" 2
+    [mkDecl .mut u32MirTy, mkDecl .not boolMirTy, mkDecl .not u32MirTy]
+    [ { statements := []
+        terminator := mkTerm (.assert (.copy (locPlace 1)) true 1 .continue_)
+        isCleanup := false },
+      { statements := [mkStmt (.assign (locPlace 0) (.use (.copy (locPlace 2))))]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+/--
+Unchecked accessor:
+`unsafe fn unchecked(flag: bool, x: u32) -> u32 { if !flag { unreachable_unchecked() } x }`
+(undefined behavior on `flag = false`).
+-/
+def assumeFlagBody : CapturedMir :=
+  mkMirBody "test::assume_flag" 2
+    [mkDecl .mut u32MirTy, mkDecl .not boolMirTy, mkDecl .not u32MirTy]
+    [ flagSwitchBlock,
+      { statements := [mkStmt (.assign (locPlace 0) (.use (.copy (locPlace 2))))]
+        terminator := mkTerm .return_
+        isCleanup := false },
+      { statements := [], terminator := mkTerm .unreachable, isCleanup := false } ]
+
+/-- Total accessor: `fn total(flag: bool, x: u32) -> u32 { x }`. -/
+def returnArgBody : CapturedMir :=
+  mkMirBody "test::return_arg" 2
+    [mkDecl .mut u32MirTy, mkDecl .not boolMirTy, mkDecl .not u32MirTy]
+    [ { statements := [mkStmt (.assign (locPlace 0) (.use (.copy (locPlace 2))))]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+/-- `assert!(flag)` with `flag = false` is the *defined* fault `.panic`. -/
+theorem assertFlag_run_false (x : Nat) :
+    callerRun assertFlagBody 3 (false, x) = .fault .panic := rfl
+
+/-- `unreachable_unchecked()` with `flag = false` is the fault `.ub`. -/
+theorem assumeFlag_run_false (x : Nat) :
+    callerRun assumeFlagBody 3 (false, x) = .fault .ub := rfl
+
+theorem returnArg_run (q : Bool × Nat) :
+    callerRun returnArgBody 3 q = .ok (.scalar ⟨q.2, 4⟩, linkedMemory) := rfl
+
+/-- Outcome level: UB is never related to a normal return. -/
+theorem ub_not_gapEqErr_ok (v : MirReturn) :
+    ¬ GapEqErr (Gap := GapTag DefPath) (· = ·) (· = ·)
+      (.fault ExecFault.ub) (.ok v) :=
+  GapEqErr.not_fault_ok
+
+/-- Outcome level: under exact fault matching UB is never related to a panic. -/
+theorem ub_not_gapEqErr_panic :
+    ¬ GapEqErr (Gap := GapTag DefPath) (Val₁ := MirReturn) (Val₂ := MirReturn)
+      (· = ·) (· = ·) (.fault ExecFault.ub) (.fault ExecFault.panic) :=
+  fun h => by cases h
+
+/-- Outcome level: a gap is never related to a fault, in either direction. -/
+theorem gap_not_gapEqErr_ub (g : GapTag DefPath) :
+    ¬ GapEqErr (Val₁ := MirReturn) (Val₂ := MirReturn) (· = ·) (· = ·)
+      (.gap g) (.fault ExecFault.ub) :=
+  GapEqErr.not_gap_fault
+
+/--
+Negative canary (UB vs. normal return): replacing the total accessor by the
+unchecked one turns a value into UB on `flag = false`.
+-/
+theorem assumeFlag_not_gapEqErr_returnArg (x : Nat) :
+    ¬ GapEqErr (· = ·) (· = ·) (callerRun assumeFlagBody 3 (false, x))
+      (callerRun returnArgBody 3 (false, x)) := by
+  rw [assumeFlag_run_false, returnArg_run]
+  exact GapEqErr.not_fault_ok
+
+/--
+Negative canary (UB vs. panic): the unchecked accessor is not equivalent to the
+checked one, because UB is never conflated with a defined panic.
+-/
+theorem assumeFlag_not_gapEqErr_assertFlag (x : Nat) :
+    ¬ GapEqErr (· = ·) (· = ·) (callerRun assumeFlagBody 3 (false, x))
+      (callerRun assertFlagBody 3 (false, x)) := by
+  rw [assumeFlag_run_false, assertFlag_run_false]
+  exact ub_not_gapEqErr_panic
+
+theorem assertFlag_not_contextEquiv_assumeFlag :
+    ¬ ContextEquiv (· = ·) (· = ·) (callerGapSem assumeFlagBody)
+      (callerGapSem assertFlagBody) :=
+  fun h => assumeFlag_not_gapEqErr_assertFlag 0
+    ((mirGapBehaviors_equiv_iff_of_runs
+      (ne_outOfFuel_of_eq (assumeFlag_run_false 0) (fun h₀ => by cases h₀))
+      (ne_outOfFuel_of_eq (assertFlag_run_false 0) (fun h₀ => by cases h₀))).mp
+      (h (false, 0)))
+
+/--
+Negative canary (gap vs. fault): replacing the unmodeled helper call by UB is
+rejected as well. A gap says nothing about the program, so it is never traded
+for a fault.
+-/
+theorem callerBuggy_not_gapEqErr_assumeFlag (x : Nat) :
+    ¬ GapEqErr (· = ·) (· = ·) (callerRun callerBuggyBody 3 (false, x))
+      (callerRun assumeFlagBody 3 (false, x)) := by
+  rw [callerBuggy_run, assumeFlag_run_false]
+  exact GapEqErr.not_gap_fault
+
+/--
+Negative canary (fault vs. gap): the checked accessor panics on `flag = false`
+where the buggy caller hits the helper gap. A defined fault is never related
+to a gap either.
+-/
+theorem assertFlag_not_gapEqErr_callerBuggy (x : Nat) :
+    ¬ GapEqErr (· = ·) (· = ·) (callerRun assertFlagBody 3 (false, x))
+      (callerRun callerBuggyBody 3 (false, x)) := by
+  rw [assertFlag_run_false, callerBuggy_run]
+  exact GapEqErr.not_fault_gap
+
+/--
+Soundness of the UB side condition: a fault relation that conflates UB with a
+panic does relate the unchecked and the checked accessor outcome-wise, but it
+is rejected by every Layer 1A bridge (`ExecFault.not_preserves_isUB_of_ub_panic`),
+and rightly so: the checked accessor is defined on `flag = false` while the
+unchecked one is not.
+-/
+theorem conflating_fault_relation_rejected (x : Nat) :
+    GapEqErr (· = ·) (fun _ _ => True) (callerRun assumeFlagBody 3 (false, x))
+        (callerRun assertFlagBody 3 (false, x)) ∧
+      (¬ ∀ e₁ e₂ : ExecFault, (fun _ _ => True) e₁ e₂ → (e₁.isUB ↔ e₂.isUB)) ∧
+      OutcomeSet.Defined ExecFault.isUB (callerGapSem assertFlagBody (false, x)) ∧
+      ¬ OutcomeSet.Defined ExecFault.isUB (callerGapSem assumeFlagBody (false, x)) := by
+  refine ⟨?_, ExecFault.not_preserves_isUB_of_ub_panic trivial, ?_, ?_⟩
+  · rw [assumeFlag_run_false, assertFlag_run_false]
+    exact trivial
+  · have h : (callerRun assertFlagBody 3 (false, x)).isDefined ExecFault.isUB := by
+      rw [assertFlag_run_false]; exact fun hub => hub
+    exact defined_mirGapBehaviors_of_run h
+  · intro hdef
+    have hmem : callerGapSem assumeFlagBody (false, x) (.fault .ub) :=
+      (mirGapBehaviors_iff_of_run
+        (ne_outOfFuel_of_eq (assumeFlag_run_false x) (fun h₀ => by cases h₀)) _).mpr
+        (assumeFlag_run_false x).symm
+    exact hdef hmem trivial
+
+/-! ### Part 5C: Any Callee Environment (`GapEqErr.bind_congr`) -/
+
+/--
+Baseline caller of an *external* helper (no linked body):
+`fn tail_caller(flag: bool, x: u32) -> u32 { if flag { x + x } else { become ext_helper(x) } }`.
+-/
+def tailCallerBody : CapturedMir :=
+  mkMirBody "test::tail_caller" 2
+    [mkDecl .mut u32MirTy, mkDecl .not boolMirTy, mkDecl .not u32MirTy]
+    [ flagSwitchBlock,
+      { statements :=
+          [mkStmt (.assign (locPlace 0)
+            (.binaryOp .add (.copy (locPlace 2)) (.copy (locPlace 2))))]
+        terminator := mkTerm .return_
+        isCleanup := false },
+      { statements := []
+        terminator := mkTerm
+          (.tailCall (fnItemOp "test::ext_helper") [.copy (locPlace 2)])
+        isCleanup := false } ]
+
+/-- Refactored caller of the same external helper (`x * 2` via a temporary). -/
+def tailCallerRefactoredBody : CapturedMir :=
+  mkMirBody "test::tail_caller_refactored" 2
+    [mkDecl .mut u32MirTy, mkDecl .not boolMirTy, mkDecl .not u32MirTy,
+     mkDecl .mut u32MirTy]
+    [ flagSwitchBlock,
+      { statements :=
+          [mkStmt (.storageLive 3),
+           mkStmt (.assign (locPlace 3)
+            (.binaryOp .mul (.copy (locPlace 2)) (u32ConstOp 2))),
+           mkStmt (.assign (locPlace 0) (.use (.copy (locPlace 3))))]
+        terminator := mkTerm .return_
+        isCleanup := false },
+      { statements := []
+        terminator := mkTerm
+          (.tailCall (fnItemOp "test::ext_helper") [.copy (locPlace 2)])
+        isCleanup := false } ]
+
+/-- Root memory of the external-helper callers (no linked callee bodies). -/
+def unlinkedMemory : Memory := (initMachineState tailCallerBody []).memory
+
+/-- The external request both callers issue on `flag = false`. -/
+def extHelperReq (x : Nat) : MirCallReq :=
+  { defPath := "test::ext_helper", typeArgs := [], args := [.scalar ⟨x, 4⟩],
+    memory := unlinkedMemory }
+
+/-- Machine state of a tail caller after the `flag = false` switch to `bb2`. -/
+def tailCallerAtCall (body : CapturedMir) (x : Nat) : MachineState :=
+  { frame :=
+      { blockIdx := 2
+        stmtIdx := 0
+        locals := (initMachineState body (callerArgs (false, x))).frame.locals }
+    memory := (initMachineState body (callerArgs (false, x))).memory }
+
+/-- Bounded run against the memory-preserving helper summary `f`. -/
+def tailRun
+    (f : DefPath → List Value → OutcomeWithGap ExecFault (GapTag DefPath) Value)
+    (body : CapturedMir) (fuel : Nat) (q : Bool × Nat) :
+    OutcomeWithGap ExecFault (GapTag DefPath) MirReturn :=
+  runMirWithGap (MirCallEnv.ofPure f) [] body fuel (callerArgs q)
+
+/--
+Call-handler law on the baseline: on `flag = false` the run is the `bind` of
+the environment's answer with the rest of the run, for every environment.
+-/
+theorem tailCaller_run_false (env : MirCallEnv) (x fuel : Nat) :
+    runMirWithGap env [] tailCallerBody (fuel + 2) (callerArgs (false, x)) =
+      (env (extHelperReq x)).bind (fun ans =>
+        runMirStepsWithGap env tailCallerBody fuel (resumeExternalTailCall ans)) :=
+  (runGapSteps_succ_of_next (mirGapStep env tailCallerBody)
+      (s := .running (initMachineStateWithCallees tailCallerBody
+        (callerArgs (false, x)) []))
+      (s' := .running (tailCallerAtCall tailCallerBody x)) rfl (fuel + 1)).trans
+    (runStepsWithGap_of_vis (step := stepMirState tailCallerBody)
+      (site := mirGapSite tailCallerBody) (handle := mirGapHandle env)
+      (s := .running (tailCallerAtCall tailCallerBody x))
+      (i := .inr (.call (extHelperReq x))) (k := resumeExternalTailCall) rfl fuel)
+
+/-- Call-handler law on the refactored caller: the same request and `bind`. -/
+theorem tailCallerRefactored_run_false (env : MirCallEnv) (x fuel : Nat) :
+    runMirWithGap env [] tailCallerRefactoredBody (fuel + 2) (callerArgs (false, x)) =
+      (env (extHelperReq x)).bind (fun ans =>
+        runMirStepsWithGap env tailCallerRefactoredBody fuel
+          (resumeExternalTailCall ans)) :=
+  (runGapSteps_succ_of_next (mirGapStep env tailCallerRefactoredBody)
+      (s := .running (initMachineStateWithCallees tailCallerRefactoredBody
+        (callerArgs (false, x)) []))
+      (s' := .running (tailCallerAtCall tailCallerRefactoredBody x)) rfl
+      (fuel + 1)).trans
+    (runStepsWithGap_of_vis (step := stepMirState tailCallerRefactoredBody)
+      (site := mirGapSite tailCallerRefactoredBody) (handle := mirGapHandle env)
+      (s := .running (tailCallerAtCall tailCallerRefactoredBody x))
+      (i := .inr (.call (extHelperReq x))) (k := resumeExternalTailCall) rfl fuel)
+
+/--
+For **every** helper summary `f` (returning, faulting, or hitting any gap), the
+baseline's `flag = false` run is `f`'s outcome on the helper request.
+-/
+theorem tailCaller_run_false_pure
+    (f : DefPath → List Value → OutcomeWithGap ExecFault (GapTag DefPath) Value)
+    (x : Nat) :
+    tailRun f tailCallerBody 3 (false, x) =
+      (f "test::ext_helper" [.scalar ⟨x, 4⟩]).map (fun v => (v, unlinkedMemory)) := by
+  show runMirWithGap (MirCallEnv.ofPure f) [] tailCallerBody (1 + 2)
+    (callerArgs (false, x)) = _
+  rw [tailCaller_run_false]
+  show ((f "test::ext_helper" [.scalar ⟨x, 4⟩]).map
+    (fun v => MirCallAns.returned v unlinkedMemory)).bind _ = _
+  cases f "test::ext_helper" [.scalar ⟨x, 4⟩] <;> rfl
+
+theorem tailCallerRefactored_run_false_pure
+    (f : DefPath → List Value → OutcomeWithGap ExecFault (GapTag DefPath) Value)
+    (x : Nat) :
+    tailRun f tailCallerRefactoredBody 3 (false, x) =
+      (f "test::ext_helper" [.scalar ⟨x, 4⟩]).map (fun v => (v, unlinkedMemory)) := by
+  show runMirWithGap (MirCallEnv.ofPure f) [] tailCallerRefactoredBody (1 + 2)
+    (callerArgs (false, x)) = _
+  rw [tailCallerRefactored_run_false]
+  show ((f "test::ext_helper" [.scalar ⟨x, 4⟩]).map
+    (fun v => MirCallAns.returned v unlinkedMemory)).bind _ = _
+  cases f "test::ext_helper" [.scalar ⟨x, 4⟩] <;> rfl
+
+theorem tailCaller_run_true
+    (f : DefPath → List Value → OutcomeWithGap ExecFault (GapTag DefPath) Value)
+    (x : Nat) :
+    tailRun f tailCallerBody 3 (true, x) =
+      .ok (.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩, unlinkedMemory) :=
+  rfl
+
+theorem tailCallerRefactored_run_true
+    (f : DefPath → List Value → OutcomeWithGap ExecFault (GapTag DefPath) Value)
+    (x : Nat) :
+    tailRun f tailCallerRefactoredBody 5 (true, x) =
+      .ok (.scalar ⟨wrapScalarBits (x * 2) (scalarModulus 4), 4⟩, unlinkedMemory) :=
+  rfl
+
+/--
+Positive canary, modular in the callee: for **every** helper summary `f` the
+two callers are related up to identical gaps on every input. On `flag = false`
+both runs are `f`'s outcome, whatever it is; nothing about `f` is assumed.
+-/
+theorem tailCallerRefactored_gapEqErr_any_helper
+    (f : DefPath → List Value → OutcomeWithGap ExecFault (GapTag DefPath) Value)
+    (q : Bool × Nat) :
+    GapEqErr (· = ·) (· = ·) (tailRun f tailCallerBody 3 q)
+      (tailRun f tailCallerRefactoredBody (if q.1 then 5 else 3) q) := by
+  obtain ⟨flag, x⟩ := q
+  cases flag with
+  | true =>
+    show GapEqErr _ _ _ (tailRun f tailCallerRefactoredBody 5 (true, x))
+    rw [tailCaller_run_true, tailCallerRefactored_run_true, Nat.mul_two]
+    exact GapEqErr.refl (fun _ => rfl) (fun _ => rfl) _
+  | false =>
+    show GapEqErr _ _ _ (tailRun f tailCallerRefactoredBody 3 (false, x))
+    rw [tailCaller_run_false_pure, tailCallerRefactored_run_false_pure]
+    exact GapEqErr.refl (fun _ => rfl) (fun _ => rfl) _
+
+/--
+Summary of the unmodeled helper obtained by *running* `unsupportedHelperBody`:
+its gap-aware semantics is the gap tagged with its own `DefPath`.
+-/
+def unmodeledHelperSummary (_ : DefPath) (args : List Value) :
+    OutcomeWithGap ExecFault (GapTag DefPath) Value :=
+  (runMirWithGap MirCallEnv.unresolved [] unsupportedHelperBody 2 args).map Prod.fst
+
+theorem unmodeledHelperSummary_eq (defPath : DefPath) (args : List Value) :
+    unmodeledHelperSummary defPath args =
+      .gap (.unsupported "test::unmodeled_helper") :=
+  rfl
+
+/--
+Instantiating the any-helper canary with the unmodeled helper: both callers hit
+the helper's own gap, and that gap is what makes them equivalent there.
+-/
+theorem tailCaller_run_false_unmodeled (x : Nat) :
+    tailRun unmodeledHelperSummary tailCallerBody 3 (false, x) =
+        .gap (.unsupported "test::unmodeled_helper") ∧
+      tailRun unmodeledHelperSummary tailCallerRefactoredBody 3 (false, x) =
+        .gap (.unsupported "test::unmodeled_helper") := by
+  rw [tailCaller_run_false_pure, tailCallerRefactored_run_false_pure,
+    unmodeledHelperSummary_eq]
+  exact ⟨rfl, rfl⟩
+
+/--
+With no summary at all (`MirCallEnv.unresolved`), the external call is the
+`unresolved` gap tagged with the callee, again identical for both callers.
+-/
+theorem tailCaller_run_false_unresolved (x : Nat) :
+    runMirWithGap MirCallEnv.unresolved [] tailCallerBody 3 (callerArgs (false, x)) =
+        .gap (.unresolved "test::ext_helper") ∧
+      runMirWithGap MirCallEnv.unresolved [] tailCallerRefactoredBody 3
+          (callerArgs (false, x)) =
+        .gap (.unresolved "test::ext_helper") :=
+  ⟨rfl, rfl⟩
+
+end GapPreservingCanaries
 
 end Anneal.FunctionalTranslationEquivTests
