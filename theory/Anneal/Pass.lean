@@ -1735,6 +1735,27 @@ theorem StepRequestReachable.of_step
   exact ⟨n + 1, t, k, .step hn hr, ht⟩
 
 /--
+Inductive-invariant criterion for `StepRequestReachable`: if `I` holds at `s`,
+is preserved by continuing `gapStep` steps, and implies `P i` at every handled
+request `.vis (.inr i) k`, then every reachable request satisfies `P`.
+-/
+theorem stepRequestReachable_of_inv
+    {handle : (i : E.I) → OutcomeWithGap ExecFault (GapTag Site) (E.O i)}
+    {I : State → Prop} {P : E.I → Prop} {s : State}
+    (hInit : I s)
+    (hStep : ∀ t t', I t → gapStep step site handle t = .next t' → I t')
+    (hReq : ∀ t i k, I t → step t = .vis (.inr i) k → P i) :
+    ∀ i, StepRequestReachable step site handle s i → P i := by
+  intro i hreach
+  obtain ⟨n, t, k, hr, ht⟩ := hreach
+  have hIt : I t := by
+    clear ht
+    induction hr with
+    | refl _ => exact hInit
+    | step hn _ ih => exact ih (hStep _ _ hInit hn)
+  exact hReq t i k hIt ht
+
+/--
 Reachable-request bounded handler congruence: `handle₁` and `handle₂` need only
 agree on requests `i` actually reachable from `s` under `handle₁` (enabling
 incremental modular summary linking where `handle₂` adds summaries for unrelated
@@ -2432,14 +2453,19 @@ def MirCallEnv.PreservesCallStack (env : MirCallEnv) : Prop :=
   ∀ req ans, env req = .ok ans → MirCallAns.PreservesCallStack req ans
 
 /--
-Restore the caller's suspended frame metadata (`callees`, `callStack`,
-`activeCallee`, `activeProtectors`, and existing `fnPtrs`) onto a `Memory`
-returned by a standalone callee summary (such as `runMirWithGap`), preventing
-standalone summaries from wiping out an active inline caller frame.
+Restore the caller's suspended frame metadata (`callees`, `traitImpls`,
+`callStack`, `activeCallee`, `activeProtectors`, and existing `fnPtrs`) onto a
+`Memory` returned by a **stateful** callee summary that executed starting from
+`before` (so `after` already carries the caller's `borrows`, `globals`,
+`callerLocals`, and monotonic tag/alloc counters). For a **standalone** summary
+executed from an isolated fresh `initMachineState`, use
+`Memory.preserveCallerMemory` instead so caller borrows and globals are never
+wiped.
 -/
 def Memory.restoreCallerFrame (before after : Memory) : Memory :=
   { after with
     callees := before.callees
+    traitImpls := before.traitImpls
     callStack := before.callStack
     activeCallee := before.activeCallee
     activeProtectors := before.activeProtectors
@@ -2448,6 +2474,20 @@ def Memory.restoreCallerFrame (before after : Memory) : Memory :=
 theorem Memory.callFramePreserved_restoreCallerFrame (before after : Memory) :
     Trusted.VerificationResult.callFramePreserved before
       (Memory.restoreCallerFrame before after) :=
+  ⟨rfl, rfl, rfl, rfl, ⟨after.fnPtrs, rfl⟩⟩
+
+/--
+Preserve the caller's entire `Memory` (`borrows`, `globals`, `callerLocals`,
+`traitImpls`, allocator/tag/protector counters, and call frame) across a
+**standalone** callee run started from an isolated initial state, retaining any
+newly reified `fnPtrs` returned by the callee.
+-/
+def Memory.preserveCallerMemory (before after : Memory) : Memory :=
+  { before with fnPtrs := List.append after.fnPtrs before.fnPtrs }
+
+theorem Memory.callFramePreserved_preserveCallerMemory (before after : Memory) :
+    Trusted.VerificationResult.callFramePreserved before
+      (Memory.preserveCallerMemory before after) :=
   ⟨rfl, rfl, rfl, rfl, ⟨after.fnPtrs, rfl⟩⟩
 
 theorem Memory.callFramePreserved_refl (mem : Memory) :
@@ -2510,12 +2550,65 @@ theorem MirCallEnv.ofPure_preservesCallStack
   (MirCallEnv.ofPure_preservesCallFrame f).toPreservesCallStack
 
 /--
-Lift a standalone `MirReturn`-producing summary (such as `runMirWithGap` on an
-external `CapturedMir` body, whose fresh `initMachineState` starts with
-`callStack = []` and `activeCallee = none`) into a sealed, frame-preserving
-`MirCallEnv` by restoring `req.memory`'s caller frame metadata via
-`Memory.restoreCallerFrame`. Unlike raw `MirCallEnv.ofMirOutcome`, this never
-wipes out an active inline caller frame!
+Lift a **stateful** `MirReturn`-producing summary (executed starting from
+`req.memory`) into a sealed, frame-preserving `MirCallEnv` via
+`Memory.restoreCallerFrame` (keeping `memAfter`'s heap/borrow mutations while
+restoring caller call-frame metadata). Do NOT use this on disconnected
+standalone runs starting from empty `initMachineState` (which would wipe out
+caller `borrows`, `globals`, and `callerLocals`); use `MirCallEnv.ofStandaloneOutcome`
+or `MirCallEnv.ofStandaloneBody` for standalone runs.
+-/
+def MirCallEnv.ofStatefulOutcome
+    (f : MirCallReq → OutcomeWithGap ExecFault (GapTag DefPath) MirReturn) :
+    MirCallEnv :=
+  fun req =>
+    match f req with
+    | .ok (v, memAfter) =>
+      .ok (.returned v (Memory.restoreCallerFrame req.memory memAfter))
+    | .fault .panic => .ok (.panicked req.memory)
+    | .fault .abort => .ok .aborted
+    | .fault .ub => .fault .ub
+    | .gap g => .gap (g.sealOutOfFuel req.defPath)
+
+theorem MirCallEnv.isSealed_ofStatefulOutcome
+    (f : MirCallReq → OutcomeWithGap ExecFault (GapTag DefPath) MirReturn) :
+    (MirCallEnv.ofStatefulOutcome f).IsSealed := by
+  intro req
+  unfold MirCallEnv.ofStatefulOutcome
+  cases f req with
+  | ok _ => exact fun h => by cases h
+  | fault e => cases e <;> exact fun h => by cases h
+  | gap g =>
+    intro h
+    exact GapTag.sealOutOfFuel_ne_outOfFuel req.defPath g (OutcomeWithGap.gap.inj h)
+
+theorem MirCallEnv.ofStatefulOutcome_preservesCallFrame
+    (f : MirCallReq → OutcomeWithGap ExecFault (GapTag DefPath) MirReturn) :
+    (MirCallEnv.ofStatefulOutcome f).PreservesCallFrame := by
+  intro req ans h
+  unfold MirCallEnv.ofStatefulOutcome at h
+  cases hf : f req with
+  | ok vm =>
+    rw [hf] at h
+    cases vm
+    cases h
+    exact Memory.callFramePreserved_restoreCallerFrame req.memory _
+  | fault e =>
+    rw [hf] at h
+    cases e with
+    | ub => cases h
+    | panic => cases h; exact Memory.callFramePreserved_refl req.memory
+    | abort => cases h; exact trivial
+  | gap g => rw [hf] at h; cases h
+
+/--
+Lift a **standalone** `MirReturn`-producing summary (such as `runMirWithGap` on
+an external `CapturedMir` body, whose fresh `initMachineState` starts with empty
+`borrows`, `callStack = []`, and `activeCallee = none`) into a sealed,
+caller-memory-preserving `MirCallEnv` via `Memory.preserveCallerMemory`. Unlike
+raw `MirCallEnv.ofMirOutcome` or `MirCallEnv.ofStatefulOutcome`, this preserves
+both the caller's call frame AND the caller's live `borrows`, `globals`,
+`callerLocals`, `traitImpls`, and allocator/tag counters.
 -/
 def MirCallEnv.ofStandaloneOutcome
     (f : MirCallReq → OutcomeWithGap ExecFault (GapTag DefPath) MirReturn) :
@@ -2523,7 +2616,7 @@ def MirCallEnv.ofStandaloneOutcome
   fun req =>
     match f req with
     | .ok (v, memAfter) =>
-      .ok (.returned v (Memory.restoreCallerFrame req.memory memAfter))
+      .ok (.returned v (Memory.preserveCallerMemory req.memory memAfter))
     | .fault .panic => .ok (.panicked req.memory)
     | .fault .abort => .ok .aborted
     | .fault .ub => .fault .ub
@@ -2551,7 +2644,7 @@ theorem MirCallEnv.ofStandaloneOutcome_preservesCallFrame
     rw [hf] at h
     cases vm
     cases h
-    exact Memory.callFramePreserved_restoreCallerFrame req.memory _
+    exact Memory.callFramePreserved_preserveCallerMemory req.memory _
   | fault e =>
     rw [hf] at h
     cases e with
@@ -3107,6 +3200,11 @@ def MirCallReachable (env : MirCallEnv) (body : CapturedMir)
   StepRequestReachable (stepMirSiteState body) (mirSiteOfState body)
     (mirGapHandle env) st (.inr (.call req))
 
+private theorem mirGapHandle_call_eq_seal (env : MirCallEnv) (req : MirCallReq) :
+    mirGapHandle env (.inr (.call req)) = (env.seal req).mapFault (fun _ => .ub) := by
+  dsimp only [mirGapHandle, MirCallEnv.seal]
+  cases env req <;> rfl
+
 /--
 Reachable-request bounded callee-environment congruence: `env₁` and `env₂` need
 only agree (after handler sealing) on external calls actually reachable from `s`.
@@ -3128,12 +3226,7 @@ theorem runMirStepsWithGap_env_congr_on {env₁ env₂ : MirCallEnv}
   | inr call =>
     cases call with
     | call req =>
-      have hEq : ∀ env : MirCallEnv,
-          mirGapHandle env (.inr (.call req)) = (env.seal req).mapFault (fun _ => .ub) := by
-        intro env
-        dsimp only [mirGapHandle, MirCallEnv.seal]
-        cases env req <;> rfl
-      rw [hEq env₁, hEq env₂]
+      rw [mirGapHandle_call_eq_seal env₁ req, mirGapHandle_call_eq_seal env₂ req]
       exact (henv req hreach).mapFault_congr (fun _ _ _ => hFault .ub)
 
 /--
@@ -3159,13 +3252,114 @@ theorem mirGapBehaviors_env_congr_on {env₁ env₂ : MirCallEnv}
   | inr call =>
     cases call with
     | call req =>
-      have hEq : ∀ env : MirCallEnv,
-          mirGapHandle env (.inr (.call req)) = (env.seal req).mapFault (fun _ => .ub) := by
-        intro env
-        dsimp only [mirGapHandle, MirCallEnv.seal]
-        cases env req <;> rfl
-      rw [hEq env₁, hEq env₂]
+      rw [mirGapHandle_call_eq_seal env₁ req, mirGapHandle_call_eq_seal env₂ req]
       exact (henv req hreach).mapFault_congr (fun _ _ _ => rfl)
+
+/--
+Stateful reachable-request fuel-free callee-environment congruence over `(args, mem)`.
+-/
+theorem mirStatefulGapBehaviors_env_congr_on {env₁ env₂ : MirCallEnv}
+    {callees : List CapturedMir} {q : List Value × Memory}
+    (henv : ∀ req,
+      MirCallReachable env₁ body
+        (mirSiteOfExec body (.running
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            body q.1 q.2 callees))) req →
+      GapEqErr (· = ·) (· = ·) (env₁.seal req) (env₂.seal req)) :
+    OutcomeSetEquiv (GapEqErr (· = ·) (· = ·))
+      (mirStatefulGapBehaviors env₁ callees body q)
+      (mirStatefulGapBehaviors env₂ callees body q) := by
+  refine gapBehaviors_handle_congr_on (step := stepMirSiteState body)
+    (site := mirSiteOfState body) (handle₁ := mirGapHandle env₁)
+    (handle₂ := mirGapHandle env₂) (fun _ => rfl) ?_
+  intro i hreach
+  cases i with
+  | inl obs => cases obs; exact (rfl : PUnit.unit = PUnit.unit)
+  | inr call =>
+    cases call with
+    | call req =>
+      rw [mirGapHandle_call_eq_seal env₁ req, mirGapHandle_call_eq_seal env₂ req]
+      exact (henv req hreach).mapFault_congr (fun _ _ _ => rfl)
+
+/--
+Computable fail-closed checker verifying that execution from `st` finishes
+within `fuel` steps and every external call emitted along the path has its
+`defPath` accepted by `pred`. Returns `false` if fuel runs out.
+-/
+def mirRequestsAllIn (env : MirCallEnv) (body : CapturedMir)
+    (pred : DefPath → Bool) : Nat → MirSiteState → Bool
+  | 0, _ => false
+  | fuel + 1, st =>
+    let hereOk : Bool :=
+      match stepMirSiteState body st with
+      | .vis (.inr (.inr (.call req))) _ => pred req.defPath
+      | _ => true
+    hereOk &&
+      match mirSiteGapStep env body st with
+      | .next st' => mirRequestsAllIn env body pred fuel st'
+      | .done _ => true
+
+/--
+Soundness of `mirRequestsAllIn`: whenever the bounded checker returns `true`,
+every `MirCallReachable` request along the execution satisfies `pred req.defPath = true`.
+-/
+theorem mirCallReachable_of_requestsAllIn {env : MirCallEnv} {body : CapturedMir}
+    {pred : DefPath → Bool} {fuel : Nat} {st : MirSiteState}
+    (hCheck : mirRequestsAllIn env body pred fuel st = true)
+    {req : MirCallReq} (hreach : MirCallReachable env body st req) :
+    pred req.defPath = true := by
+  obtain ⟨n, t, k, hr, ht⟩ := hreach
+  induction fuel generalizing st n with
+  | zero => cases hCheck
+  | succ fuel ih =>
+    unfold mirRequestsAllIn at hCheck
+    have hsplit := bool_and_split hCheck
+    cases hr with
+    | refl =>
+      have hHere := hsplit.1
+      rw [ht] at hHere
+      exact hHere
+    | @step _ _ s' _ hn hr' =>
+      have hNext := hsplit.2
+      change mirSiteGapStep env body st = .next s' at hn
+      rw [hn] at hNext
+      exact ih (st := s') (n := _) hNext hr'
+
+/--
+One-step reflective callee-environment congruence: if `mirRequestsAllIn` certifies
+that every external call emitted by `(body, args)` satisfies `pred`, then `env₁`
+and `env₂` need only agree on `pred`-matching callees!
+-/
+theorem mirGapBehaviors_env_congr_of_requestsAllIn {env₁ env₂ : MirCallEnv}
+    {callees : List CapturedMir} {args : List Value}
+    {pred : DefPath → Bool} {fuel : Nat}
+    (hCheck : mirRequestsAllIn env₁ body pred fuel
+      (mirSiteOfExec body (.running (initMachineStateWithCallees body args callees))) = true)
+    (henv : ∀ req, pred req.defPath = true →
+      GapEqErr (· = ·) (· = ·) (env₁.seal req) (env₂.seal req)) :
+    OutcomeSetEquiv (GapEqErr (· = ·) (· = ·))
+      (mirGapBehaviors env₁ callees body args)
+      (mirGapBehaviors env₂ callees body args) :=
+  mirGapBehaviors_env_congr_on (fun req hreach =>
+    henv req (mirCallReachable_of_requestsAllIn hCheck hreach))
+
+/--
+Stateful one-step reflective callee-environment congruence via `mirRequestsAllIn`.
+-/
+theorem mirStatefulGapBehaviors_env_congr_of_requestsAllIn {env₁ env₂ : MirCallEnv}
+    {callees : List CapturedMir} {q : List Value × Memory}
+    {pred : DefPath → Bool} {fuel : Nat}
+    (hCheck : mirRequestsAllIn env₁ body pred fuel
+      (mirSiteOfExec body (.running
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          body q.1 q.2 callees))) = true)
+    (henv : ∀ req, pred req.defPath = true →
+      GapEqErr (· = ·) (· = ·) (env₁.seal req) (env₂.seal req)) :
+    OutcomeSetEquiv (GapEqErr (· = ·) (· = ·))
+      (mirStatefulGapBehaviors env₁ callees body q)
+      (mirStatefulGapBehaviors env₂ callees body q) :=
+  mirStatefulGapBehaviors_env_congr_on (fun req hreach =>
+    henv req (mirCallReachable_of_requestsAllIn hCheck hreach))
 
 /-- Fuel monotonicity of bounded MIR runs. -/
 theorem runMirWithGap_fuel_mono {callees : List CapturedMir} {fuel fuel' : Nat}
@@ -4092,15 +4286,14 @@ or a machine-reported `budget` gap reaches a fault of the trusted `mirTree`:
 the trusted Layer 1A semantics of the body is undefined on these arguments,
 exactly like the gap-aware one.
 -/
-theorem not_mirNoUBTree_of_run_undefined {callees : List CapturedMir} {fuel : Nat}
-    {args : List Value} {o : OutcomeWithGap ExecFault (GapTag DefPath) MirReturn}
-    (h : runMirWithGap MirCallEnv.unresolved callees body fuel args = o)
+private theorem not_mirTree_safe_of_run_undefined {s : MachineState} {fuel : Nat}
+    {o : OutcomeWithGap ExecFault (GapTag DefPath) MirReturn}
+    (h : runMirStepsWithGap MirCallEnv.unresolved body fuel (.running s) = o)
     (ho : o = .fault .ub ∨ (∃ site, o = .gap (.unsupported site)) ∨
       (∃ site, o = .gap (.budget site))) :
-    ¬ MirNoUBTree (mirTree body (initMachineStateWithCallees body args callees)) := by
+    ¬ MirNoUBTree (mirTree body s) := by
   unfold MirNoUBTree
-  rw [← cofix_stepMirSiteState_eq_mirTree body
-    (initMachineStateWithCallees body args callees)]
+  rw [← cofix_stepMirSiteState_eq_mirTree body s]
   refine not_treeSafe_of_runStepsWithGap (step := stepMirSiteState body)
     (site := mirSiteOfState body) (handle := mirGapHandle MirCallEnv.unresolved)
     mirHandled_not_fault h ?_ ?_ ?_ ?_
@@ -4127,6 +4320,14 @@ theorem not_mirNoUBTree_of_run_undefined {callees : List CapturedMir} {fuel : Na
       | call req =>
         cases hi
         rcases ho with rfl | ⟨site, rfl⟩ | ⟨site, rfl⟩ <;> exact fun h₀ => by cases h₀
+
+theorem not_mirNoUBTree_of_run_undefined {callees : List CapturedMir} {fuel : Nat}
+    {args : List Value} {o : OutcomeWithGap ExecFault (GapTag DefPath) MirReturn}
+    (h : runMirWithGap MirCallEnv.unresolved callees body fuel args = o)
+    (ho : o = .fault .ub ∨ (∃ site, o = .gap (.unsupported site)) ∨
+      (∃ site, o = .gap (.budget site))) :
+    ¬ MirNoUBTree (mirTree body (initMachineStateWithCallees body args callees)) :=
+  not_mirTree_safe_of_run_undefined h ho
 
 /--
 Under *any* callee environment `env`, if a bounded run ends in a non-`outOfFuel`
@@ -4403,6 +4604,107 @@ theorem VerificationResult.of_contextEquiv
     Trusted.VerificationResult.VerificationResult
       { body := body₂, pre := pre, post := post, callees := callees } :=
   ⟨mirContractHoldsWithSafetyAndCallees_of_contextEquiv hEq hClosed hCert.proof⟩
+
+/--
+Transfer `Trusted.VerificationResult.MirStatefulContractHoldsWithSafetyAndCallees`
+from `body₁` to `body₂` along a relational `ContextEquivOn` on
+`mirStatefulGapBehaviors MirCallEnv.unresolved`, supporting custom return
+relations `rVal` (e.g., value equality when `post` is independent of internal
+borrow-tag metadata) and requiring `hClosed` only on `safetyPre`.
+-/
+theorem mirStatefulContractHoldsWithSafetyAndCallees_of_contextEquiv
+    {callees : List CapturedMir} {body₁ body₂ : CapturedMir}
+    {rVal : MirReturn → MirReturn → Prop}
+    {safetyPre pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    (hEq : ContextEquivOn (fun q => safetyPre q.1 q.2) rVal (· = ·)
+      (mirStatefulGapBehaviors MirCallEnv.unresolved callees body₁)
+      (mirStatefulGapBehaviors MirCallEnv.unresolved callees body₂))
+    (hPost : ∀ args mem v₁ m₁ v₂ m₂,
+      safetyPre args mem → pre args mem →
+      rVal (v₁, m₁) (v₂, m₂) → post args mem v₁ m₁ → post args mem v₂ m₂)
+    (hClosed : ∀ args mem, safetyPre args mem → ∀ site,
+      ¬ mirStatefulGapBehaviors MirCallEnv.unresolved callees body₁ (args, mem)
+          (.gap (.unresolved site)))
+    (hBase : Trusted.VerificationResult.MirStatefulContractHoldsWithSafetyAndCallees
+      body₁ callees safetyPre pre post) :
+    Trusted.VerificationResult.MirStatefulContractHoldsWithSafetyAndCallees
+      body₂ callees safetyPre pre post := by
+  intro args mem hsafe
+  obtain ⟨hs₁, hval₁⟩ := hBase args mem hsafe
+  let s₁ := Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body₁ args mem callees
+  let s₂ := Trusted.VerificationResult.initMachineStateWithMemoryAndCallees body₂ args mem callees
+  have hDef₁ : OutcomeSet.Defined ExecFault.isUB
+      (mirStatefulGapBehaviors MirCallEnv.unresolved callees body₁ (args, mem)) := by
+    intro o ho
+    obtain ⟨hne, fuel, hrun⟩ := ho
+    cases o with
+    | ok _ => exact trivial
+    | fault e =>
+      cases e with
+      | ub => exact False.elim (not_mirTree_safe_of_run_undefined hrun (Or.inl rfl) hs₁)
+      | panic => exact fun h => h
+      | abort => exact fun h => h
+    | gap g =>
+      cases g with
+      | unresolved site => exact False.elim (hClosed args mem hsafe site ⟨hne, fuel, hrun⟩)
+      | outOfFuel => exact False.elim (hne rfl)
+      | unsupported site =>
+        exact False.elim (not_mirTree_safe_of_run_undefined hrun (Or.inr (Or.inl ⟨site, rfl⟩)) hs₁)
+      | budget site =>
+        exact False.elim (not_mirTree_safe_of_run_undefined hrun (Or.inr (Or.inr ⟨site, rfl⟩)) hs₁)
+  have hDef₂ := ((hEq (args, mem) hsafe).defined_iff ExecFault.eq_preserves_isUB).mp hDef₁
+  have hs₂ : TreeSafe (Trusted.VerificationResult.mirStatefulTreeWithCallees
+      body₂ args mem callees) := by
+    change TreeSafe (mirTree body₂ s₂)
+    rw [← cofix_stepMirSiteState_eq_mirTree body₂ s₂]
+    exact treeSafe_of_gapBehaviors_defined mirHandled_not_fault
+      (mirGapHandle_ne_outOfFuel MirCallEnv.unresolved)
+      mirGapHandle_unresolved_subsingleton
+      (mirGapHandle_noDefFault MirCallEnv.unresolved) hDef₂
+  refine ⟨hs₂, fun outPair hrr₂ hp retVal₂ mem₂' hout => ?_⟩
+  rcases outPair with ⟨tr₂, out₂⟩
+  dsimp only at hout
+  subst hout
+  have hm₂ : mirStatefulGapBehaviors MirCallEnv.unresolved callees body₂ (args, mem)
+      (classifyOutcome (.normal (retVal₂, mem₂'))) := by
+    change ReachesRet (mirTree body₂ s₂) tr₂ (.normal (retVal₂, mem₂')) at hrr₂
+    rw [← cofix_stepMirSiteState_eq_mirTree body₂ s₂] at hrr₂
+    exact (reachesRet_iff_gapBehaviors_of_defined mirHandled_not_fault
+      (mirGapHandle_ne_outOfFuel MirCallEnv.unresolved)
+      mirGapHandle_unresolved_subsingleton
+      (mirGapHandle_noDefFault MirCallEnv.unresolved) hDef₂ _).mp ⟨tr₂, hrr₂⟩
+  obtain ⟨o₁, hm₁, hr⟩ := (hEq (args, mem) hsafe).backward hm₂
+  obtain ⟨⟨retVal₁, mem₁'⟩, rfl, hret⟩ := GapEqErr.ok_iff_right.mp hr
+  obtain ⟨_, _, hrun₁⟩ := hm₁
+  obtain ⟨tr₁, hrr₁⟩ := runMirStepsWithGap_ok_reachesRet hrun₁
+  exact hPost args mem retVal₁ mem₁' retVal₂ mem₂' hsafe hp hret
+    (hval₁ (tr₁, .normal (retVal₁, mem₁')) hrr₁ hp retVal₁ mem₁' rfl)
+
+/--
+Transfer a kernel-audited `Trusted.VerificationResult.StatefulVerificationResult`
+certificate from `body₁` to `body₂` along a relational `ContextEquivOn` on
+`mirStatefulGapBehaviors MirCallEnv.unresolved`.
+-/
+theorem StatefulVerificationResult.of_contextEquiv
+    {callees : List CapturedMir} {body₁ body₂ : CapturedMir}
+    {rVal : MirReturn → MirReturn → Prop}
+    {pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    (hEq : ContextEquivOn (fun q => pre q.1 q.2) rVal (· = ·)
+      (mirStatefulGapBehaviors MirCallEnv.unresolved callees body₁)
+      (mirStatefulGapBehaviors MirCallEnv.unresolved callees body₂))
+    (hPost : ∀ args mem v₁ m₁ v₂ m₂,
+      pre args mem → rVal (v₁, m₁) (v₂, m₂) → post args mem v₁ m₁ → post args mem v₂ m₂)
+    (hClosed : ∀ args mem, pre args mem → ∀ site,
+      ¬ mirStatefulGapBehaviors MirCallEnv.unresolved callees body₁ (args, mem)
+          (.gap (.unresolved site)))
+    (hCert : Trusted.VerificationResult.StatefulVerificationResult
+      { body := body₁, pre := pre, post := post, callees := callees }) :
+    Trusted.VerificationResult.StatefulVerificationResult
+      { body := body₂, pre := pre, post := post, callees := callees } :=
+  ⟨mirStatefulContractHoldsWithSafetyAndCallees_of_contextEquiv hEq
+    (fun args mem v₁ m₁ v₂ m₂ hp _ => hPost args mem v₁ m₁ v₂ m₂ hp) hClosed hCert.proof⟩
 
 /--
 Embed any `MirCallEnv` into a trusted `Trusted.VerificationResult.ExternalCallHandler`
@@ -4916,6 +5218,80 @@ theorem mirContextEquiv_mirHandledTree_exactPass {env : MirCallEnv}
     rw [mirContextEquivOn_mirHandledTree_toPartial_eq (pre := fun _ => True)
       (fun a _ => hEq a) trivial]
     exact fun h => ⟨h, fun _ hx => hx⟩
+
+/--
+Open-world relational contract transfer on `mirHandledTreeWithCallees` for
+**every** `env : MirCallEnv` (requiring ZERO `hClosed` and allowing custom
+return relations `rVal`, e.g., `r₁.1 = r₂.1` when a refactored body introduces
+local borrows that change post-return memory metadata!).
+-/
+theorem mirClosedStatefulContract_of_contextEquiv {env : MirCallEnv}
+    {callees : List CapturedMir} {body₁ body₂ : CapturedMir}
+    {rVal : MirReturn → MirReturn → Prop}
+    {safetyPre pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    (hEq : ContextEquivOn (fun q => safetyPre q.1 q.2) rVal (· = ·)
+      (mirStatefulGapBehaviors env callees body₁)
+      (mirStatefulGapBehaviors env callees body₂))
+    (hPost : ∀ args mem v₁ m₁ v₂ m₂,
+      safetyPre args mem → pre args mem →
+      rVal (v₁, m₁) (v₂, m₂) → post args mem v₁ m₁ → post args mem v₂ m₂)
+    (hBase :
+      (fun args mem =>
+        (Trusted.VerificationResult.mirHandledTreeWithCallees
+          body₁ args mem callees env.toExternalCallHandler).toPartial) ≤
+        Trusted.VerificationResult.MirClosedStatefulContractSpec safetyPre pre post) :
+    (fun args mem =>
+      (Trusted.VerificationResult.mirHandledTreeWithCallees
+        body₂ args mem callees env.toExternalCallHandler).toPartial) ≤
+      Trusted.VerificationResult.MirClosedStatefulContractSpec safetyPre pre post := by
+  intro args mem hsafe
+  obtain ⟨hs₁, hval₁⟩ := hBase args mem hsafe
+  have hDef₁ := (mirHandledTree_safe_iff_defined env callees body₁ args mem).mp hs₁
+  have hDef₂ := ((hEq (args, mem) hsafe).defined_iff ExecFault.eq_preserves_isUB).mp hDef₁
+  have hs₂ := (mirHandledTree_safe_iff_defined env callees body₂ args mem).mpr hDef₂
+  refine ⟨hs₂, fun outPair hrr₂ hp retVal₂ mem₂' hout => ?_⟩
+  rcases outPair with ⟨tr₂, out₂⟩
+  dsimp only at hout
+  subst hout
+  have hm₂ :=
+    (mirHandledTree_reachesRet_iff_of_defined hDef₂ (.normal (retVal₂, mem₂'))).mp ⟨tr₂, hrr₂⟩
+  obtain ⟨o₁, hm₁, hr⟩ := (hEq (args, mem) hsafe).backward hm₂
+  obtain ⟨⟨retVal₁, mem₁'⟩, rfl, hret⟩ := GapEqErr.ok_iff_right.mp hr
+  obtain ⟨tr₁, hrr₁⟩ :=
+    (mirHandledTree_reachesRet_iff_of_defined hDef₁ (.normal (retVal₁, mem₁'))).mpr hm₁
+  exact hPost args mem retVal₁ mem₁' retVal₂ mem₂' hsafe hp hret
+    (hval₁ (tr₁, .normal (retVal₁, mem₁')) hrr₁ hp retVal₁ mem₁' rfl)
+
+/--
+Transfer a kernel-audited `Trusted.VerificationResult.ModularVerificationResult`
+certificate from `body₁` to `body₂` whenever every external call handler
+admitted by `envAssumed` is realized by a `MirCallEnv` under which `body₁` and
+`body₂` are `ContextEquivOn` `pre` (supporting custom `rVal` such as return-value
+equality across distinct borrow histories, with ZERO `hClosed` side condition!).
+-/
+theorem ModularVerificationResult.of_contextEquiv
+    {callees : List CapturedMir} {body₁ body₂ : CapturedMir}
+    {envAssumed : Trusted.VerificationResult.ExternalCallHandler → Prop}
+    {rVal : MirReturn → MirReturn → Prop}
+    {pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    (hHandlers : ∀ h, envAssumed h →
+      ∃ env : MirCallEnv, h = env.toExternalCallHandler ∧
+        ContextEquivOn (fun q => pre q.1 q.2) rVal (· = ·)
+          (mirStatefulGapBehaviors env callees body₁)
+          (mirStatefulGapBehaviors env callees body₂))
+    (hPost : ∀ args mem v₁ m₁ v₂ m₂,
+      pre args mem → rVal (v₁, m₁) (v₂, m₂) → post args mem v₁ m₁ → post args mem v₂ m₂)
+    (hCert : Trusted.VerificationResult.ModularVerificationResult
+      { body := body₁, envAssumed := envAssumed, pre := pre, post := post, callees := callees }) :
+    Trusted.VerificationResult.ModularVerificationResult
+      { body := body₂, envAssumed := envAssumed, pre := pre, post := post, callees := callees } :=
+  ⟨fun h hAss => by
+    obtain ⟨env, rfl, hEq⟩ := hHandlers h hAss
+    exact mirClosedStatefulContract_of_contextEquiv hEq
+      (fun args mem v₁ m₁ v₂ m₂ hp _ => hPost args mem v₁ m₁ v₂ m₂ hp)
+      (hCert.proof env.toExternalCallHandler hAss)⟩
 
 end MirAdequacy
 
