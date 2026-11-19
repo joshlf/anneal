@@ -40,10 +40,10 @@ their historical import identifiers. Preserve local changes when updating.
 | [`swarm-model-refinement`](swarm-model-refinement/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | `swarm-model-refinement/` at `3bf3f345b2916f8417306ba197f779b0b4429c1d` |
 | [`tech-lead`](tech-lead/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | `tech-lead/` at `3bf3f345b2916f8417306ba197f779b0b4429c1d` |
 | [`williams-style`](williams-style/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | `williams-style/` at `b563468a8148df117283494915cee5b6561cc47f` |
-| [`change-review`](change-review/SKILL.md) | Repository-owned | Complete-change local preflight and hosted review; [maintainer contract](../docs/review-policy-design.md) |
+| [`change-review`](change-review/SKILL.md) | Repository-owned | Local and hosted review workflow, risk sizing, pipelining, and receipts ([maintainer contract](../docs/review-policy-design.md)) |
 | [`architectural-design`](architectural-design/SKILL.md) | Repository-owned | End-to-end architectural design workflow for `joshlf/anneal` |
-| [`source-control`](source-control/SKILL.md) | Repository-owned | Adapted from [`google/zerocopy`'s Contributing Guide](https://github.com/google/zerocopy/discussions/1318) |
-| [`trust-review`](trust-review/SKILL.md) | Repository-owned | Derived from [`PRINCIPLES.md`](../PRINCIPLES.md) and [`docs/trust-model.md`](../docs/trust-model.md) |
+| [`source-control`](source-control/SKILL.md) | Repository-owned | Adapted from [`google/zerocopy`'s Contributing Guide](https://github.com/google/zerocopy/discussions/1318); commits, worker quarantine, publication, and stacks |
+| [`trust-review`](trust-review/SKILL.md) | Repository-owned | Derived from [`META_PRINCIPLES.md`](../META_PRINCIPLES.md), [`PRINCIPLES.md`](../PRINCIPLES.md), [`THREAT_MODEL.md`](../THREAT_MODEL.md), and [`docs/trust-model.md`](../docs/trust-model.md) |
 
 ## Local modifications
 
