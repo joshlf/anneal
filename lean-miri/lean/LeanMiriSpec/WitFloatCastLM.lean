@@ -32,17 +32,19 @@ bit-for-bit after every step. No shadow evaluator is defined.
   hand-built intermediate states), the lockstep-run closure `WfcRun`, the lockstep predicates
   `WfcLockstep` / `WfcReturns` /
   `WfcUB` (carrying explicit `StepRelLM3_1` over arbitrary `allocMap`) and read-backs
-  `MiriHoldsScalar` / `MiriHoldsUninit` / `MiriHoldsIndirectScalar` / `MiriHoldsIndirectUninit`
-  (`wfc_miri_scalar_at`, `wfc_miri_uninit_at`, `wfc_miri_indirect_scalar`,
-  `wfc_miri_promoted_scalar`, `wfc_miri_promoted_uninit`), and the packaged step lemmas
-  `wfc_step_{constant,copy,move}`, `wfc_ub_{copy,move}`, `wfc_step_return_any` / `wfc_step_return`,
-  `wfc_step_storage{Live,Dead}`.
+  `MiriHoldsScalar` / `MiriHoldsUninit` / `MiriHoldsIndirectScalar` / `MiriHoldsIndirectUninit` /
+  `MiriPromotedFreed` (`wfc_miri_scalar_at`, `wfc_miri_uninit_at`, `wfc_miri_indirect_scalar`,
+  `wfc_miri_promoted_scalar`, `wfc_miri_promoted_uninit`, `wfc_miri_promoted_freed`), and the
+  packaged step lemmas `wfc_step_{constant,copy,move}`, `wfc_ub_{copy,move}`,
+  `wfc_step_return_any` / `wfc_step_return`, `wfc_step_storageLive` / `wfc_step_storageLive_mem`,
+  `wfc_step_storageDead` / `wfc_step_storageDead_any`.
 * **From program entry**: the (W1)–(W4) headline witnesses, the (W2) deterministic-mode, selector,
   and `copy` / `move` selector witnesses, and the (W5) uninitialized / moved-from / dead /
-  `f16` / `f128` witnesses all start at `initMachineState body []` / `wfcMiriEntry` and run the
-  `StorageLive` prologue in lockstep (`WfcRun`); only the memory-backed (W5f) witnesses start from
-  hand-built `StateRelLM3_1` states (a force-allocated `LocalRel.indirect` local is never produced by
-  `StorageLive`).
+  `f16` / `f128` **and** `&raw`-promoted memory-backed (W5f-1a / W5f-1b) witnesses all start at
+  `initMachineState body []` / `wfcMiriEntry` and run their `StorageLive` prologues in lockstep
+  (`WfcRun`); only the unpromoted force-allocated `LocalRel.indirect` witness (W5f-2, plus
+  single-step selector helpers) starts from a hand-built `StateRelLM3_1` state (no MIR statement
+  without `&raw` produces an unpromoted `LocalRel.indirect` scalar local).
 * **(W1)** `wfcW1_end_to_end`: 9 `f32 ↔ f64` casts + `return`: subnormal halfway ties
   `1.5·2⁻¹⁴⁹` / `2.5·2⁻¹⁴⁹ ↦ 0x2`, `f32::MAX + ½ulp ↦ +∞`, `-0.0` sign preservation, and exact
   `f32 → f64 → f32` round trips (subnormal and normal).
@@ -62,16 +64,22 @@ bit-for-bit after every step. No shadow evaluator is defined.
   formats: `lean-miri`'s `FloatBits.toInteger` and Anneal's `evalFloatToIntSaturating`).
 * **(W4)** `wfcW4_end_to_end` (9 casts + `return`: `u128::MAX as f32 = +∞`,
   `u128::MAX as f64 = 2¹²⁸`, `i128::MIN as f32 = -2¹²⁷`, `2²⁴ + 1 / 2²⁴ + 3` and
-  `2⁵³ + 1 / 2⁵³ + 3` ties to even).
+  `2⁵³ + 1 / 2⁵³ + 3` ties to even), `wfcW4_fromInteger_all_sources` (two-sided
+  `FloatBits.fromInteger` + `evalFloatCast .intToFloat` across all 12 integer source types and both
+  formats), and `wfcW4_signed_negative_ties` (signed negative `i32` / `i64` halfway ties and
+  `i64::MIN + 1`).
 * **(W5)** `wfcW5_uninit_source_ub`, `wfcW5_moved_from_ub`, `wfcW5_dead_source_ub` (from program
   entry, through `StorageLive` / `StorageDead`) fault with `.ub` in both machines
   (`StepRelLM3_1.ub`); `wfcW5_f16_f128_fail_closed` + `wfcW5_f16_f128_uninit_source_vs_target`
   (`.unsupported` fail-closed and uninit source-vs-target evaluation-order contrast);
   `wfcW5_bool_char_boundary` (`bool` and `char` Anneal fail-closed vs `lean-miri` `Cast.cast`);
-  `wfcW5_promoted_raw_pipeline_end_to_end` + `wfcW5_promoted_uninit_ub` (multi-step `&raw mut`
-  promoted local + float-cast memory reads/writes + Tree Borrows invalidation + `return`); and
-  `wfcW5_indirect_float_pipeline_end_to_end` (multi-step unpromoted stack-allocated
-  `LocalRel.indirect` `f64` destination write + indirect `copy` + indirect `move` + `return`).
+  `wfcW5_promoted_raw_pipeline_end_to_end`, `wfcW5_promoted_uninit_ub`, and
+  `wfcW5_rawPtr_dead_and_promoted_dead_ub` (from program entry: `StorageLive` + `&raw mut`
+  promoted local over both `emptyLayoutTable` and non-empty 64-bit `wfcStage1Layouts` + float-cast
+  memory reads/writes + Tree Borrows `.active`/`.unique ↦ .disabled` + `StorageDead` stack
+  deallocation `MiriPromotedFreed` + `return` / UB); and `wfcW5_indirect_float_pipeline_end_to_end`
+  (multi-step unpromoted stack-allocated `LocalRel.indirect` `f64` destination write + indirect
+  `copy` + indirect `move` + `return`).
 
 Every public theorem carries a `#guard_msgs (whitespace := lax) in #print axioms` guard (standard
 axioms only: `propext`, `Classical.choice`, `Quot.sound`).
@@ -335,6 +343,17 @@ inductive MiriHoldsIndirectUninit (m : AnnealStepState) (k : Nat) (allocId : Mir
         (Miri.Memory.allocRange Miri.ABI.Size.ZERO sz) ≠ .ok (.ok ()) →
       MiriHoldsIndirectUninit m k allocId sz
 
+/-- `lean-miri` local `k` of the single frame of `m` has been retired by `StorageDead`: `k` is
+`.dead` in the frame and `allocId` is absent from `m.machine.memory.live` (`inductive` so kernel
+`isDefEq` never unfolds `Array.find?` over symbolic `m`). -/
+inductive MiriPromotedFreed (m : AnnealStepState) (k : Nat) (allocId : Miri.Memory.AllocId) :
+    Prop where
+  | mk (tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit) :
+      m.stack.frames = #[tf] →
+      (tf.locals[k]?).map Miri.Interpreter.LocalState.value = some .dead →
+      m.machine.memory.live.find? (fun x => x.1 == allocId) = none →
+      MiriPromotedFreed m k allocId
+
 /-- **Per-local immediate read-back**: in any `StateRelLM3_1`-related pair (with arbitrary
 `allocMap`) where local `k` is immediate in `lean-miri`, an Anneal local `k` holding the float /
 integer scalar `sc` is mirrored by an immediate `ScalarRel`-related `lean-miri` scalar. -/
@@ -481,6 +500,29 @@ theorem wfc_miri_promoted_uninit {body : CapturedMir} {s : MachineState} {m : An
   obtain ⟨hun, _⟩ := hloc.indirect_stackAllocPlace_spec (e := e) hmls_eq hbase hfind
     (halloc.live_key_unique e he) (hty.size_ne_zero body.layouts)
   exact ⟨tf, lay, localAlloc, hframes, hlay, hfind, hun rfl⟩
+
+/-- **Read-back of a retired (`StorageDead`) promoted (`e ∈ allocMap`) local**: `lean-miri` local
+`e.localIdx` is `.dead` in the frame and `e.allocId` has been removed from `m.machine.memory.live`. -/
+theorem wfc_miri_promoted_freed {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    {e : AllocMapEntry} (he : e ∈ allocMap)
+    (himm_e : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf e.localIdx)
+    {decl : LocalDecl}
+    (hdecl : get? body.localDecls e.localIdx = some decl)
+    (hslot : get? s.frame.locals e.localIdx = some .dead) :
+    MiriPromotedFreed m e.localIdx e.allocId := by
+  obtain ⟨tf, hframes, _, _, hfr, _, _, _, _, _, halloc, _⟩ := id hstate
+  obtain ⟨slot, mls, _, _, hslot', hmls, _, hloc⟩ := hfr.lookup_local hdecl
+  rw [hslot] at hslot'
+  cases hslot'
+  cases hloc with
+  | base hb =>
+    cases hb with
+    | dead _ _ =>
+      exact ⟨tf, hframes, by rw [hmls]; rfl, (halloc.local_alloc_sync tf hframes e he).2 hslot⟩
+    | immediate _ _ _ _ hv => rcases hv with ⟨hs, _⟩ | ⟨_, hs, _⟩ <;> cases hs
+    | indirect _ mp _ _ _ _ => exact absurd rfl (himm_e tf hframes _ hmls mp)
 
 /-- **One lockstep float-cast step writing `⟨bits, w⟩` into local `k`** under the
 refinement-witness hooks `annealStepHooksFloat b.localDecls b.layouts`: Anneal's
@@ -780,6 +822,135 @@ theorem wfc_step_storageLive {b : CapturedMir} {s s' : MachineState} {m : Anneal
     subst hmls''
     cases hval
   · exact himm tf hframes k mls' hmls' mp hval
+
+/-- **`StorageLive` lockstep step preserving `m.machine`** under `WfcAllImm` (`deallocLocalMemory`
+is the identity on `.dead` and `.live (.immediate _)`), so `AllocIdSupplyReady.empty` and
+`nextAllocId = 1` survive any `StorageLive` prologue from `wfcMiriEntry`. -/
+theorem wfc_step_storageLive_mem {b : CapturedMir} {s s' : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM3_1 b s m []) (himm : WfcAllImm m)
+    (hphase : ∀ p, b.phase ≠ .other p)
+    {bb : BasicBlockData} {loc : Local} {decl : LocalDecl} {span : String}
+    (hbb : get? b.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.storageLive loc, span⟩)
+    (hdecl : get? b.localDecls loc = some decl)
+    (hs : stepMirFn b s = .step s') :
+    ∃ m', Miri.Interpreter.Step.step (annealStepHooksFloat b.localDecls b.layouts) () m =
+        (m', .ok true) ∧ StateRelLM3_1 b s' m' [] ∧ WfcAllImm m' ∧ m'.machine = m.machine := by
+  have heq := step_float_eq_annealStepHooks_at_stmt hstate true annealChooseQuietedNaN hbb hstmt
+    trivial
+  have hr := step_storageLive_lm3_1_simulation hstate hphase hbb hstmt hdecl (fun _ h => nomatch h)
+  rw [← heq] at hr
+  obtain ⟨m', hm', hrel'⟩ := wfc_step_of_stepRel hr hs
+  have hm'_eq := hm'
+  obtain ⟨tf, hframes, _, _, hfr, _⟩ := id hstate
+  obtain ⟨_, mls, _, hlt_mf, _, hmls, hmls_eq, hloc⟩ := hfr.lookup_local hdecl
+  have hty : ∃ ty, tf.body.locals[loc]? = some ty := by
+    rw [hfr.body_eq, translateBody_locals_getElem? b loc, hdecl]
+    exact ⟨_, rfl⟩
+  have hlive : LocalAllocLive m.machine.memory (tf.locals[loc]'hlt_mf).value := by
+    rw [hmls_eq]; exact hloc.allocLive
+  have hm : Miri.Interpreter.Step.evalStatement (annealStepHooks b.localDecls b.layouts) ()
+      (translateStmt ⟨.storageLive loc, span⟩) m =
+      ({ stack := ⟨#[{ tf with
+            locals := tf.locals.set loc
+              { tf.locals[loc]'hlt_mf with value := .live (.immediate .uninit) } hlt_mf }]⟩
+         machine := { m.machine with
+            memory := deallocLocalMemory m.machine.memory (tf.locals[loc]'hlt_mf).value } },
+        .ok ()) := by
+    simp only [Miri.Interpreter.Step.evalStatement, translateStmt, translateStmtKind]
+    exact annealStepHooks_storageLive_any_eq hframes hlt_mf hty hlive
+  rw [heq, miri_step_at_statement_ok _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm rfl
+    hfr.location_eq] at hm'_eq
+  injection hm'_eq with hm'1 _
+  subst hm'1
+  refine ⟨_, hm', hrel', ?_, ?_⟩
+  · intro tf' htf' k mls' hmls' mp hval
+    injection htf' with h1
+    injection h1 with h2 _
+    subst h2
+    simp only [Array.getElem?_set] at hmls'
+    split at hmls'
+    · injection hmls' with hmls''
+      subst hmls''
+      cases hval
+    · exact himm tf hframes k mls' hmls' mp hval
+  · dsimp only []
+    rw [hmls_eq]
+    cases hv : mls.value with
+    | dead => rfl
+    | live op =>
+      cases op with
+      | immediate _ => rfl
+      | indirect mp => exact False.elim (himm tf hframes loc mls hmls mp hv)
+
+/-- **`StorageDead` lockstep step for arbitrary `allocMap`** (including `&raw`-promoted locals):
+disables `allocMap` entries targeting `loc` (`disableAllocMapLocal`, setting `allocDead := true`),
+frees any stack allocation owned by `loc` in `lean-miri`, makes `loc` immediate (`.dead`) in
+`lean-miri`, and preserves immediacy of every other local. -/
+theorem wfc_step_storageDead_any {b : CapturedMir} {s s' : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 b s m allocMap)
+    (hphase : ∀ p, b.phase ≠ .other p)
+    {bb : BasicBlockData} {loc : Local} {decl : LocalDecl} {span : String}
+    (hbb : get? b.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.storageDead loc, span⟩)
+    (hdecl : get? b.localDecls loc = some decl) (hne0 : loc ≠ 0)
+    (hs : stepMirFn b s = .step s') :
+    ∃ m', Miri.Interpreter.Step.step (annealStepHooksFloat b.localDecls b.layouts) () m =
+        (m', .ok true) ∧
+      StateRelLM3_1 b s' m' (disableAllocMapLocal allocMap loc) ∧
+      (∀ tf', m'.stack.frames = #[tf'] → IsImmediateFrameLocal tf' loc) ∧
+      (∀ tf tf', m.stack.frames = #[tf] → m'.stack.frames = #[tf'] →
+        ∀ k, IsImmediateFrameLocal tf k → IsImmediateFrameLocal tf' k) := by
+  have heq := step_float_eq_annealStepHooks_at_stmt hstate true annealChooseQuietedNaN hbb hstmt
+    trivial
+  have hr := step_storageDead_lm3_1_simulation hstate hphase hbb hstmt hdecl hne0
+  rw [← heq] at hr
+  obtain ⟨m', hm', hrel'⟩ := wfc_step_of_stepRel hr hs
+  have hm'_eq := hm'
+  obtain ⟨tf, hframes, _, _, hfr, _⟩ := id hstate
+  obtain ⟨_, _, _, hlt_mf, _, _, hmls_eq, hloc⟩ := hfr.lookup_local hdecl
+  have hlive : LocalAllocLive m.machine.memory (tf.locals[loc]'hlt_mf).value := by
+    rw [hmls_eq]; exact hloc.allocLive
+  have hm : Miri.Interpreter.Step.evalStatement (annealStepHooks b.localDecls b.layouts) ()
+      (translateStmt ⟨.storageDead loc, span⟩) m =
+      ({ stack := ⟨#[{ tf with
+            locals := tf.locals.set loc
+              { tf.locals[loc]'hlt_mf with value := .dead } hlt_mf }]⟩
+         machine := { m.machine with
+            memory := deallocLocalMemory m.machine.memory (tf.locals[loc]'hlt_mf).value } },
+        .ok ()) := by
+    simp only [Miri.Interpreter.Step.evalStatement, translateStmt, translateStmtKind]
+    exact annealStepHooks_storageDead_any_eq hframes hlt_mf hne0 hlive
+  rw [heq, miri_step_at_statement_ok _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm rfl
+    hfr.location_eq] at hm'_eq
+  injection hm'_eq with hm'1 _
+  subst hm'1
+  refine ⟨_, hm', hrel', ?_, ?_⟩
+  · intro tf' htf' mls' hmls' mp hval
+    injection htf' with h1
+    injection h1 with h2 _
+    subst h2
+    simp only [Array.getElem?_set] at hmls'
+    split at hmls'
+    · injection hmls' with hmls''
+      subst hmls''
+      cases hval
+    · contradiction
+  · intro tf₀ tf' htf₀ htf' k hk mls' hmls' mp hval
+    rw [hframes] at htf₀
+    injection htf₀ with h0
+    injection h0 with h0' _
+    subst h0'
+    injection htf' with h1
+    injection h1 with h2 _
+    subst h2
+    simp only [Array.getElem?_set] at hmls'
+    split at hmls'
+    · injection hmls' with hmls''
+      subst hmls''
+      cases hval
+    · exact hk mls' hmls' mp hval
 
 /-- **`StorageDead` lockstep step** under `annealStepHooksFloat` (conservative extension of
 `step_storageDead_lm3_1_simulation`): `lean-miri` makes the local `.dead`, so every local stays
@@ -2222,6 +2393,113 @@ theorem wfcW4_end_to_end :
     wfc_miri_uninit l₃.2.2.1 i₃ rfl (Or.inr ⟨_, rfl⟩) rfl, l₄, l₅, l₆, l₇, l₈, l₉,
     wfc_step_return l₉.2.2.1 i₉ hph rfl rfl rfl rfl rfl rfl (Or.inl ⟨_, rfl⟩) hret⟩
 
+/-! ### (W4) All twelve integer sources × both target formats at the `lean-miri` primitive -/
+
+/-- MIR type for an integer cast target/source `s`. -/
+def wfcTargetTy : FloatIntTarget → Ty
+  | .signed it => wfcIntTy it
+  | .unsigned ut => wfcUintTy ut
+
+/-- MIR type for an IEEE float format `f`. -/
+def wfcFmtTy : IeeeFormat → Ty
+  | .binary32 => wfcF32Ty
+  | .binary64 => wfcF64Ty
+
+/-- Closed-form `f32` bit pattern of the all-ones integer `2^w - 1` (`-1 ↦ -1.0` on signed sources;
+`MAX` on unsigned sources: exact on `u8`/`u16`, rounded up to `2³²` / `2⁶⁴` on `u32`/`u64`/`usize`,
+and overflowing `f32::MAX + ½ulp` to `+∞` on `u128`). -/
+def wfcAllOnesToF32 (s : FloatIntTarget) : Nat :=
+  if s.isSigned then 0xBF800000
+  else match s.bitWidth .bits64 with
+    | 8 => 0x437F0000
+    | 16 => 0x477FFF00
+    | 32 => 0x4F800000
+    | 64 => 0x5F800000
+    | _ => 0x7F800000
+
+/-- Closed-form `f64` bit pattern of the all-ones integer `2^w - 1` (`-1 ↦ -1.0` on signed sources;
+`MAX` on unsigned sources: exact on `u8`/`u16`/`u32` and rounded up to `2⁶⁴` / `2¹²⁸` on
+`u64`/`usize`/`u128`). -/
+def wfcAllOnesToF64 (s : FloatIntTarget) : Nat :=
+  if s.isSigned then 0xBFF0000000000000
+  else match s.bitWidth .bits64 with
+    | 8 => 0x406FE00000000000
+    | 16 => 0x40EFFFE000000000
+    | 32 => 0x41EFFFFFFFE00000
+    | 64 => 0x43F0000000000000
+    | _ => 0x47F0000000000000
+
+/-- **Two-sided** int-to-float bit pattern: `lean-miri`'s `FloatBits.fromInteger` and Anneal's
+`evalFloatCast .intToFloat` both produce any closed form `V` of `evalIntToFloatRoundTiesToEven`
+(`floatBits_fromInteger_intValueOfBits`). -/
+theorem wfc_fromInteger (s : FloatIntTarget) (bits : Nat) (f : IeeeFormat) (V : Nat)
+    (hv : evalIntToFloatRoundTiesToEven s.isSigned (s.bitWidth .bits64) bits f = V) :
+    Miri.Interpreter.FloatBits.fromInteger (ieeeFormatToMiri f)
+        (intValueOfBits s.isSigned (s.bitWidth .bits64) bits) =
+      .ok ⟨ieeeFormatToMiri f, BitVec.ofNat 128 V⟩ ∧
+    evalFloatCast .intToFloat (some (wfcTargetTy s)) (wfcFmtTy f) emptyLayoutTable
+        (.scalar ⟨bits, s.bitWidth .bits64 / 8⟩) = some (.scalar ⟨V, f.byteWidth⟩) := by
+  refine ⟨by rw [floatBits_fromInteger_intValueOfBits, hv], ?_⟩
+  subst hv
+  cases s with
+  | signed w => cases w <;> cases f <;> rfl
+  | unsigned w => cases w <;> cases f <;> rfl
+
+/-- **(W4) two-sided `roundTiesToEven` int-to-float for every one of the twelve integer source
+types** (64-bit `isize` / `usize`) and both target formats: `lean-miri`'s `FloatBits.fromInteger`
+(the primitive behind `Cast.cast .IntToFloat`) **and** Anneal's `evalFloatCast .intToFloat` agree on
+`0 ↦ +0.0`, `1 ↦ 1.0`, the all-ones bit pattern `2^w - 1` (`-1 ↦ -1.0` on signed sources; `MAX` on
+unsigned sources through `u128::MAX ↦ +∞_f32` / `2¹²⁸_f64`), and the top-bit power of two
+`2^(w - 1)` (`MIN = -2^(w - 1)` exact on signed sources including `i128::MIN = -2¹²⁷_f32`,
+`+2^(w - 1)` exact on unsigned sources). -/
+theorem wfcW4_fromInteger_all_sources (s : FloatIntTarget) :
+    let w := s.bitWidth .bits64
+    let both (bits : Nat) (f : IeeeFormat) (V : Nat) :=
+      Miri.Interpreter.FloatBits.fromInteger (ieeeFormatToMiri f)
+          (intValueOfBits s.isSigned w bits) = .ok ⟨ieeeFormatToMiri f, BitVec.ofNat 128 V⟩ ∧
+      evalFloatCast .intToFloat (some (wfcTargetTy s)) (wfcFmtTy f) emptyLayoutTable
+          (.scalar ⟨bits, w / 8⟩) = some (.scalar ⟨V, f.byteWidth⟩)
+    both 0 .binary32 0 ∧ both 0 .binary64 0 ∧
+    both 1 .binary32 0x3F800000 ∧ both 1 .binary64 0x3FF0000000000000 ∧
+    both (2 ^ w - 1) .binary32 (wfcAllOnesToF32 s) ∧
+    both (2 ^ w - 1) .binary64 (wfcAllOnesToF64 s) ∧
+    both (2 ^ (w - 1)) .binary32
+      ((if s.isSigned then 382 + w else 126 + w) * 2 ^ 23) ∧
+    both (2 ^ (w - 1)) .binary64
+      ((if s.isSigned then 3070 + w else 1022 + w) * 2 ^ 52) := by
+  intro w both
+  refine ⟨wfc_fromInteger s 0 .binary32 0 ?_, wfc_fromInteger s 0 .binary64 0 ?_,
+    wfc_fromInteger s 1 .binary32 0x3F800000 ?_,
+    wfc_fromInteger s 1 .binary64 0x3FF0000000000000 ?_,
+    wfc_fromInteger s (2 ^ w - 1) .binary32 (wfcAllOnesToF32 s) ?_,
+    wfc_fromInteger s (2 ^ w - 1) .binary64 (wfcAllOnesToF64 s) ?_,
+    wfc_fromInteger s (2 ^ (w - 1)) .binary32 _ ?_,
+    wfc_fromInteger s (2 ^ (w - 1)) .binary64 _ ?_⟩ <;>
+    (cases s <;> rename_i it <;> cases it <;> decide +kernel)
+
+/-- **(W4) two-sided signed negative halfway ties and `i64::MIN + 1` rounding**: complements
+`wfcW4Body`'s positive ties with negative signed `i32 -> f32` ties `-(2²⁴ + 1) ↦ -2²⁴`
+(`0xCB80_0000`) and `-(2²⁴ + 3) ↦ -(2²⁴ + 4)` (`0xCB80_0002`), negative signed `i64 -> f64` ties
+`-(2⁵³ + 1) ↦ -2⁵³` (`0xC340_0000_0000_0000`) and `-(2⁵³ + 3) ↦ -(2⁵³ + 4)`
+(`0xC340_0000_0000_0002`), and `i64::MIN + 1 = -(2⁶³ - 1) ↦ -2⁶³` in both `f32` (`0xDF00_0000`) and
+`f64` (`0xC3E0_0000_0000_0000`). -/
+theorem wfcW4_signed_negative_ties :
+    let both (s : FloatIntTarget) (bits : Nat) (f : IeeeFormat) (V : Nat) :=
+      Miri.Interpreter.FloatBits.fromInteger (ieeeFormatToMiri f)
+          (intValueOfBits s.isSigned (s.bitWidth .bits64) bits) =
+        .ok ⟨ieeeFormatToMiri f, BitVec.ofNat 128 V⟩ ∧
+      evalFloatCast .intToFloat (some (wfcTargetTy s)) (wfcFmtTy f) emptyLayoutTable
+          (.scalar ⟨bits, s.bitWidth .bits64 / 8⟩) = some (.scalar ⟨V, f.byteWidth⟩)
+    both (.signed .i32) (2 ^ 32 - (2 ^ 24 + 1)) .binary32 0xCB800000 ∧
+    both (.signed .i32) (2 ^ 32 - (2 ^ 24 + 3)) .binary32 0xCB800002 ∧
+    both (.signed .i64) (2 ^ 64 - (2 ^ 53 + 1)) .binary64 0xC340000000000000 ∧
+    both (.signed .i64) (2 ^ 64 - (2 ^ 53 + 3)) .binary64 0xC340000000000002 ∧
+    both (.signed .i64) 0x8000000000000001 .binary32 0xDF000000 ∧
+    both (.signed .i64) 0x8000000000000001 .binary64 0xC3E0000000000000 :=
+  ⟨wfc_fromInteger _ _ _ _ rfl, wfc_fromInteger _ _ _ _ rfl,
+   wfc_fromInteger _ _ _ _ rfl, wfc_fromInteger _ _ _ _ rfl,
+   wfc_fromInteger _ _ _ _ rfl, wfc_fromInteger _ _ _ _ rfl⟩
+
 /-! ## (W5) Negative controls: UB, fail-closed boundaries, and memory-backed locals -/
 
 /-- **(W5a) uninitialized-source body** `bb0: StorageLive(_1); _0 = copy _1 as u32; return`
@@ -2714,90 +2992,336 @@ theorem wfcW5_bool_char_boundary (destRef : Miri.Interpreter.RuntimePlaceRef Ann
 /-- `*mut i64`. -/
 def wfcRawPtrMutI64Ty : Ty := { kind := .rawPtr .mut (.int .i64), layoutIdx := 0 }
 
-/-- **(W5f-1a) uninitialized promoted-local UB body** (`_0 : f64`, `_1 : i64`, `_2 : *mut i64`):
-`bb0: _2 = &raw mut _1; _0 = copy _1 as f64; return`. -/
+/-- Placeholder ZST layout at index `0` (`unresolvedLayoutIdx`), matching
+`Anneal.CastStage1Tests.unitPlaceholderLayout`. -/
+def wfcUnitPlaceholderLayout : TypeLayout :=
+  { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := .memory,
+    fields := .arbitrary [] [], variants := .single 0, isUninhabited := false }
+
+/-- Non-empty 64-bit `LayoutTable` matching `Anneal.CastStage1Tests.castStage1Layouts` at index `0`
+so `rawPtrPerm` exercises its resolved `some tl` branch (`.active`) alongside `emptyLayoutTable`
+(`.unique`). -/
+def wfcStage1Layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [wfcUnitPlaceholderLayout] }
+
+/-- Single-basic-block `Runtime(PostCleanup)` body `bb0: stmts; return` over custom `layouts`. -/
+def wfcBodyLayouts (name : String) (decls : List LocalDecl) (retSz : Nat)
+    (layouts : LayoutTable) (stmts : List StatementKind) : CapturedMir :=
+  { wfcBody name decls retSz stmts with layouts := layouts }
+
+/-- **(W5f-1a) uninitialized promoted-local UB body** from program entry (`emptyLayoutTable`,
+`_0 : f64`, `_1 : i64`, `_2 : *mut i64`):
+`bb0: StorageLive(_1); StorageLive(_2); _2 = &raw mut _1; _0 = copy _1 as f64; return`. -/
 def wfcW5PromUBody : CapturedMir :=
   wfcBody "wit_float_cast_lm::w5_promoted_uninit_ub"
     [wfcDecl wfcF64Ty, wfcDecl (wfcIntTy .i64), wfcDecl wfcRawPtrMutI64Ty] 8
-    [.assign (local_ 2) (.rawPtr .mut (local_ 1)),
+    [.storageLive 1, .storageLive 2,
+     .assign (local_ 2) (.rawPtr .mut (local_ 1)),
      .assign (local_ 0) (.cast .intToFloat (.copy (local_ 1)) wfcF64Ty)]
 
-def wfcW5PromUS0 : MachineState := wfcAt wfcW5PromUBody 0 [.uninit, .uninit, .uninit]
+def wfcW5PromUS0 : MachineState := wfcAt wfcW5PromUBody 0 [.uninit, .dead, .dead]
+def wfcW5PromUS1 : MachineState := wfcAt wfcW5PromUBody 1 [.uninit, .uninit, .dead]
+def wfcW5PromUS2 : MachineState := wfcAt wfcW5PromUBody 2 [.uninit, .uninit, .uninit]
 
 abbrev wfcW5PromUE1 : AllocMapEntry :=
   rawPtrAllocMapEntry wfcW5PromUBody.localDecls wfcW5PromUBody.layouts .mut 1 1 floatWitAllocId1
 
-def wfcW5PromUS1 : MachineState :=
-  { frame := { blockIdx := 0, stmtIdx := 1,
+def wfcW5PromUS3 : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 3,
                locals := [.uninit, .uninit, .init (.ptr { allocId := 1, offsetBytes := 0 } 8)] }
-    memory := { wfcW5PromUS0.memory with borrows := [wfcW5PromUE1.toBorrowEntry], nextTag := 2 } }
+    memory := { wfcW5PromUS2.memory with borrows := [wfcW5PromUE1.toBorrowEntry], nextTag := 2 } }
+
+set_option maxRecDepth 200000 in
+theorem wfcW5PromU_anneal_run :
+    initMachineState wfcW5PromUBody [] = wfcW5PromUS0 ∧
+    stepMirFn wfcW5PromUBody wfcW5PromUS0 = .step wfcW5PromUS1 ∧
+    stepMirFn wfcW5PromUBody wfcW5PromUS1 = .step wfcW5PromUS2 ∧
+    stepMirFn wfcW5PromUBody wfcW5PromUS2 = .step wfcW5PromUS3 ∧
+    stepMirFn wfcW5PromUBody wfcW5PromUS3 = .fail .ub :=
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
 
 /-- **(W5f-1a) reading an uninitialized `&raw`-promoted local in a float cast faults with UB in
-both machines**: `_2 = &raw mut _1` promotes `.uninit` `_1 : i64` into `allocMap = [wfcW5PromUE1]`
-at `AllocId 1` (`MiriHoldsIndirectUninit`), and `_0 = copy _1 as f64` faults with `.ub` in both
-`stepMirFn` and `Step.step` (`WfcUB ... [wfcW5PromUE1]`). -/
+both machines, from program entry**: after `StorageLive(_1); StorageLive(_2)` (`WfcRun` from
+`initMachineState` / `wfcMiriEntry`), `_2 = &raw mut _1` promotes `.uninit` `_1 : i64` into
+`allocMap = [wfcW5PromUE1]` (`perm = .unique` on `emptyLayoutTable`) at `AllocId 1`
+(`MiriHoldsIndirectUninit`), and `_0 = copy _1 as f64` faults with `.ub` in both `stepMirFn` and
+`Step.step` (`WfcUB ... [wfcW5PromUE1]`). -/
 theorem wfcW5_promoted_uninit_ub :
-    ∃ m₁ : AnnealStepState,
+    initMachineState wfcW5PromUBody [] = wfcW5PromUS0 ∧
+    ∃ mₚ m₁ : AnnealStepState,
       let b := wfcW5PromUBody
-      stepMirFn b wfcW5PromUS0 = .step wfcW5PromUS1 ∧
-      Miri.Interpreter.Step.step (annealStepHooksFloat b.localDecls b.layouts) ()
-        (wfcMiriInit b wfcF64Ty) = (m₁, .ok true) ∧
-      StateRelLM3_1 b wfcW5PromUS1 m₁ [wfcW5PromUE1] ∧
+      WfcRun b wfcW5PromUS0 (wfcMiriEntry b wfcF64Ty) wfcW5PromUS2 mₚ ∧
+      stepMirFn b wfcW5PromUS2 = .step wfcW5PromUS3 ∧
+      Miri.Interpreter.Step.step (annealStepHooksFloat b.localDecls b.layouts) () mₚ =
+        (m₁, .ok true) ∧
+      StateRelLM3_1 b wfcW5PromUS3 m₁ [wfcW5PromUE1] ∧
+      wfcW5PromUE1.perm = .unique ∧
       MiriHoldsIndirectUninit m₁ 1 floatWitAllocId1 (Miri.ABI.Size.ofBytes 8) ∧
-      WfcUB b wfcW5PromUS1 m₁ [wfcW5PromUE1] := by
+      WfcUB b wfcW5PromUS3 m₁ [wfcW5PromUE1] := by
   have hph : ∀ p, wfcW5PromUBody.phase ≠ .other p := fun _ h => nomatch h
-  have hrel₀ := wfc_stateRel_init wfcW5PromUBody wfcF64Ty wfcW5PromUS0 rfl rfl rfl rfl rfl rfl
-  have himm₀ := wfc_allImm_init wfcW5PromUBody wfcF64Ty
-  have hs₁ : stepMirFn wfcW5PromUBody wfcW5PromUS0 = .step wfcW5PromUS1 := rfl
-  have hs₂ : stepMirFn wfcW5PromUBody wfcW5PromUS1 = .fail .ub := rfl
-  have hm_eq₁ := step_float_eq_annealStepHooks_at_stmt hrel₀ true annealChooseQuietedNaN rfl rfl rfl
-  have hr₁ := step_rawPtr_addrOf_lm3_1_simulation hrel₀ hph rfl rfl rfl rfl rfl
+  obtain ⟨h0, h1, h2, hs₁, hs₂⟩ := wfcW5PromU_anneal_run
+  have hrel_ent : StateRelLM3_1 wfcW5PromUBody wfcW5PromUS0
+      (wfcMiriEntry wfcW5PromUBody wfcF64Ty) [] := by
+    rw [← h0]; exact wfc_stateRel_entry _ _ rfl rfl rfl rfl rfl rfl (by decide)
+  obtain ⟨p₁, e₁, r₁, q₁, hm_p₁⟩ :=
+    wfc_step_storageLive_mem hrel_ent (wfc_allImm_entry _ _) hph rfl rfl rfl h1
+  obtain ⟨p₂, e₂, r₂, q₂, hm_p₂⟩ := wfc_step_storageLive_mem r₁ q₁ hph rfl rfl rfl h2
+  have hmach : p₂.machine = AnnealMachine.empty := hm_p₂.trans hm_p₁
+  rcases p₂ with ⟨stackₚ, machₚ⟩
+  dsimp only at hmach
+  subst hmach
+  have hrun : WfcRun wfcW5PromUBody wfcW5PromUS0
+      (wfcMiriEntry wfcW5PromUBody wfcF64Ty) wfcW5PromUS2
+      { stack := stackₚ, machine := AnnealMachine.empty } :=
+    .step h1 e₁ r₁ (.step h2 e₂ r₂ (.refl _ _))
+  have hm_eq₁ := step_float_eq_annealStepHooks_at_stmt r₂ true annealChooseQuietedNaN rfl rfl rfl
+  have hr₁ := step_rawPtr_addrOf_lm3_1_simulation r₂ hph rfl rfl rfl rfl rfl
     (Or.inr (Or.inr (Or.inl ⟨.i64, rfl⟩))) (by decide)
-    (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩) AllocIdSupplyReady.empty
+    (fun tf htf => ⟨q₂ tf htf 2, q₂ tf htf 1⟩) AllocIdSupplyReady.empty
   obtain ⟨m₁, hm₁_base, hrel₁⟩ := wfc_step_of_stepRel hr₁ hs₁
   have hm₁ : Miri.Interpreter.Step.step
       (annealStepHooksFloat wfcW5PromUBody.localDecls wfcW5PromUBody.layouts) ()
-      (wfcMiriInit wfcW5PromUBody wfcF64Ty) = (m₁, .ok true) := hm_eq₁.trans hm₁_base
-  have htag₀ : wfcW5PromUS0.memory.nextTag = 1 := rfl
-  have hid₀ : (⟨(wfcMiriInit wfcW5PromUBody wfcF64Ty).machine.memory.nextAllocId,
-      AllocIdSupplyReady.empty.nonzero⟩ : Miri.Memory.AllocId) = floatWitAllocId1 := rfl
-  rw [htag₀, hid₀] at hrel₁
-  obtain ⟨_, himm₁_step⟩ := step_rawPtr_addrOf_preserves_supply hrel₀ rfl rfl rfl rfl rfl
+      { stack := stackₚ, machine := AnnealMachine.empty } = (m₁, .ok true) := hm_eq₁.trans hm₁_base
+  have hmap₁_eq :
+      [rawPtrAllocMapEntry wfcW5PromUBody.localDecls wfcW5PromUBody.layouts .mut 1
+        wfcW5PromUS2.memory.nextTag ⟨AnnealMachine.empty.memory.nextAllocId,
+          AllocIdSupplyReady.empty.nonzero⟩] = [wfcW5PromUE1] := rfl
+  have hrel₁' : StateRelLM3_1 wfcW5PromUBody wfcW5PromUS3 m₁ [wfcW5PromUE1] :=
+    (congrArg (StateRelLM3_1 wfcW5PromUBody wfcW5PromUS3 m₁) hmap₁_eq).mp hrel₁
+  obtain ⟨_, himm₁_step⟩ := step_rawPtr_addrOf_preserves_supply r₂ rfl rfl rfl rfl rfl
     (Or.inr (Or.inr (Or.inl ⟨.i64, rfl⟩))) (by decide)
-    (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩) AllocIdSupplyReady.empty (by decide)
+    (fun tf htf => ⟨q₂ tf htf 2, q₂ tf htf 1⟩) AllocIdSupplyReady.empty
+    (show AnnealMachine.empty.memory.nextAllocId.toNat + 1 < 2 ^ 32 by decide)
     (fun h => nomatch h) hm₁_base
+  obtain ⟨tfₚ, htfₚ, _⟩ := id r₂
   have himm₁_0 : ∀ tf₁, m₁.stack.frames = #[tf₁] → IsImmediateFrameLocal tf₁ 0 :=
-    fun tf₁ htf₁ => himm₁_step _ tf₁ rfl htf₁ 0 (by decide) (himm₀ _ rfl 0)
+    fun tf₁ htf₁ => himm₁_step tfₚ tf₁ htfₚ htf₁ 0 (by decide) (q₂ tfₚ htfₚ 0)
   have hr₂ : StepRelLM3_1 wfcW5PromUBody m₁ [wfcW5PromUE1]
-      (stepMirFn wfcW5PromUBody wfcW5PromUS1)
+      (stepMirFn wfcW5PromUBody wfcW5PromUS3)
       (Miri.Interpreter.Step.step
         (annealStepHooksFloat wfcW5PromUBody.localDecls wfcW5PromUBody.layouts) () m₁) :=
-    step_cast_float_copy_anyLocal_simulation hrel₁ hph rfl rfl rfl rfl
+    step_cast_float_copy_anyLocal_simulation hrel₁' hph rfl rfl rfl rfl
       (.intToFloat (t := .signed .i64) rfl rfl) rfl
       (fun _ _ => Or.inr ⟨wfcW5PromUE1, .head _, rfl⟩)
       (fun tf₁ htf₁ => Or.inl (himm₁_0 tf₁ htf₁))
-  have hun₁ := wfc_miri_promoted_uninit hrel₁ (.head _) rfl (Or.inr ⟨.signed .i64, rfl⟩) rfl
-  exact ⟨m₁, hs₁, hm₁, hrel₁, hun₁, hs₂, hr₂, wfc_ub_of_stepRel hr₂ hs₂⟩
+  have hun₁ := wfc_miri_promoted_uninit hrel₁' (.head _) rfl (Or.inr ⟨.signed .i64, rfl⟩) rfl
+  exact ⟨h0, _, m₁, hrun, hs₁, hm₁, hrel₁', rfl, hun₁, hs₂, hr₂, wfc_ub_of_stepRel hr₂ hs₂⟩
 
-/-- **(W5f-1b) multi-step `&raw`-promoted local + float-cast pipeline ending in `return`**
+/-- **(W5f-1a') dead-target `&raw` and post-`StorageDead` promoted float-cast UB bodies**:
+* `wfcW5RawDeadBody`: `bb0: StorageLive(_2); _2 = &raw mut _1; _0 = copy _1 as f64; return`
+  (`_1` never made live).
+* `wfcW5PromDeadCastBody`: `bb0: StorageLive(_1); StorageLive(_2); _2 = &raw mut _1;
+  _1 = const -42.75_f64 as i64; StorageDead(_1); _0 = copy _1 as f64; return`. -/
+def wfcW5RawDeadBody : CapturedMir :=
+  wfcBody "wit_float_cast_lm::w5_raw_ptr_dead_ub"
+    [wfcDecl wfcF64Ty, wfcDecl (wfcIntTy .i64), wfcDecl wfcRawPtrMutI64Ty] 8
+    [.storageLive 2,
+     .assign (local_ 2) (.rawPtr .mut (local_ 1)),
+     .assign (local_ 0) (.cast .intToFloat (.copy (local_ 1)) wfcF64Ty)]
+
+def wfcW5RDS0 : MachineState := wfcAt wfcW5RawDeadBody 0 [.uninit, .dead, .dead]
+def wfcW5RDS1 : MachineState := wfcAt wfcW5RawDeadBody 1 [.uninit, .dead, .uninit]
+
+abbrev wfcW5RDE1 : AllocMapEntry :=
+  rawPtrAllocMapEntry wfcW5RawDeadBody.localDecls wfcW5RawDeadBody.layouts .mut 1 1 floatWitAllocId1
+
+def wfcW5PromDeadCastBody : CapturedMir :=
+  wfcBody "wit_float_cast_lm::w5_promoted_dead_cast_ub"
+    [wfcDecl wfcF64Ty, wfcDecl (wfcIntTy .i64), wfcDecl wfcRawPtrMutI64Ty] 8
+    [.storageLive 1, .storageLive 2,
+     .assign (local_ 2) (.rawPtr .mut (local_ 1)),
+     .assign (local_ 1) (.cast .floatToInt (.constant (wfcConst wfcF64Ty 0xC045600000000000 8))
+       (wfcIntTy .i64)),
+     .storageDead 1,
+     .assign (local_ 0) (.cast .intToFloat (.copy (local_ 1)) wfcF64Ty)]
+
+def wfcW5PromDCE1 : AllocMapEntry :=
+  rawPtrAllocMapEntry wfcW5PromDeadCastBody.localDecls wfcW5PromDeadCastBody.layouts .mut 1 1
+    floatWitAllocId1
+def wfcW5PromDCMap2 : List AllocMapEntry := updateAllocMapOnWrite [wfcW5PromDCE1] 1 none
+def wfcW5PromDCMap3 : List AllocMapEntry := disableAllocMapLocal wfcW5PromDCMap2 1
+
+def wfcW5PromDCS0 : MachineState := wfcAt wfcW5PromDeadCastBody 0 [.uninit, .dead, .dead]
+def wfcW5PromDCS1 : MachineState := wfcAt wfcW5PromDeadCastBody 1 [.uninit, .uninit, .dead]
+def wfcW5PromDCS2 : MachineState := wfcAt wfcW5PromDeadCastBody 2 [.uninit, .uninit, .uninit]
+def wfcW5PromDCS3 : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 3,
+               locals := [.uninit, .uninit, .init (.ptr { allocId := 1, offsetBytes := 0 } 8)] }
+    memory := { wfcW5PromDCS2.memory with
+                borrows := [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .unique }]
+                nextTag := 2 } }
+def wfcW5PromDCS4 : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 4,
+               locals := [.uninit, .init (.scalar ⟨0xFFFFFFFFFFFFFFD6, 8⟩),
+                          .init (.ptr { allocId := 1, offsetBytes := 0 } 8)] }
+    memory := { wfcW5PromDCS3.memory with
+                borrows := [{ tag := 1, targetLocal := 1, targetProjection := [],
+                              perm := .disabled, allocDead := false }] } }
+def wfcW5PromDCS5 : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 5,
+               locals := [.uninit, .dead, .init (.ptr { allocId := 1, offsetBytes := 0 } 8)] }
+    memory := { wfcW5PromDCS4.memory with
+                borrows := [{ tag := 1, targetLocal := 1, targetProjection := [],
+                              perm := .disabled, allocDead := true }] } }
+
+set_option maxRecDepth 200000 in
+theorem wfcW5PromDead_anneal_run :
+    initMachineState wfcW5RawDeadBody [] = wfcW5RDS0 ∧
+    stepMirFn wfcW5RawDeadBody wfcW5RDS0 = .step wfcW5RDS1 ∧
+    stepMirFn wfcW5RawDeadBody wfcW5RDS1 = .fail .ub ∧
+    initMachineState wfcW5PromDeadCastBody [] = wfcW5PromDCS0 ∧
+    stepMirFn wfcW5PromDeadCastBody wfcW5PromDCS0 = .step wfcW5PromDCS1 ∧
+    stepMirFn wfcW5PromDeadCastBody wfcW5PromDCS1 = .step wfcW5PromDCS2 ∧
+    stepMirFn wfcW5PromDeadCastBody wfcW5PromDCS2 = .step wfcW5PromDCS3 ∧
+    stepMirFn wfcW5PromDeadCastBody wfcW5PromDCS3 = .step wfcW5PromDCS4 ∧
+    stepMirFn wfcW5PromDeadCastBody wfcW5PromDCS4 = .step wfcW5PromDCS5 ∧
+    stepMirFn wfcW5PromDeadCastBody wfcW5PromDCS5 = .fail .ub :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- **(W5f-1a') dead-local `&raw mut` and post-`StorageDead` promoted float-cast UB from program
+entry**:
+1. Taking `_2 = &raw mut _1` before `StorageLive(_1)` faults with `WfcUB` in both machines.
+2. Promoting `_1` via `&raw mut _1`, writing `-42_i64` into `AllocId 1`, and running
+   `StorageDead(_1)` frees `AllocId 1` (`MiriPromotedFreed`, `allocDead = true`); reading the
+   retired `_1` in `_0 = copy _1 as f64` then faults with `WfcUB` in both machines. -/
+theorem wfcW5_rawPtr_dead_and_promoted_dead_ub :
+    initMachineState wfcW5RawDeadBody [] = wfcW5RDS0 ∧
+    initMachineState wfcW5PromDeadCastBody [] = wfcW5PromDCS0 ∧
+    ∃ m_rd m_dc₀ m_dc₁ m_dc₂ m_dc₃ : AnnealStepState,
+      WfcRun wfcW5RawDeadBody wfcW5RDS0 (wfcMiriEntry wfcW5RawDeadBody wfcF64Ty) wfcW5RDS1 m_rd ∧
+      WfcUB wfcW5RawDeadBody wfcW5RDS1 m_rd [wfcW5RDE1] ∧
+      WfcRun wfcW5PromDeadCastBody wfcW5PromDCS0
+        (wfcMiriEntry wfcW5PromDeadCastBody wfcF64Ty) wfcW5PromDCS2 m_dc₀ ∧
+      Miri.Interpreter.Step.step
+        (annealStepHooksFloat wfcW5PromDeadCastBody.localDecls wfcW5PromDeadCastBody.layouts)
+        () m_dc₀ = (m_dc₁, .ok true) ∧
+      Miri.Interpreter.Step.step
+        (annealStepHooksFloat wfcW5PromDeadCastBody.localDecls wfcW5PromDeadCastBody.layouts)
+        () m_dc₁ = (m_dc₂, .ok true) ∧
+      Miri.Interpreter.Step.step
+        (annealStepHooksFloat wfcW5PromDeadCastBody.localDecls wfcW5PromDeadCastBody.layouts)
+        () m_dc₂ = (m_dc₃, .ok true) ∧
+      StateRelLM3_1 wfcW5PromDeadCastBody wfcW5PromDCS5 m_dc₃ wfcW5PromDCMap3 ∧
+      MiriPromotedFreed m_dc₃ 1 floatWitAllocId1 ∧
+      WfcUB wfcW5PromDeadCastBody wfcW5PromDCS5 m_dc₃ wfcW5PromDCMap3 := by
+  obtain ⟨hrd0, hrd1, hrd_ub, hdc0, hdc1, hdc2, hdc3, hdc4, hdc5, hdc_ub⟩ :=
+    wfcW5PromDead_anneal_run
+  have hph_rd : ∀ p, wfcW5RawDeadBody.phase ≠ .other p := fun _ h => nomatch h
+  have hph_dc : ∀ p, wfcW5PromDeadCastBody.phase ≠ .other p := fun _ h => nomatch h
+  -- Part 1: `&raw mut _1` on never-live `_1`
+  have hrel_rd0 : StateRelLM3_1 wfcW5RawDeadBody wfcW5RDS0
+      (wfcMiriEntry wfcW5RawDeadBody wfcF64Ty) [] := by
+    rw [← hrd0]; exact wfc_stateRel_entry _ _ rfl rfl rfl rfl rfl rfl (by decide)
+  obtain ⟨p_rd, e_rd, r_rd, q_rd, hm_rd⟩ :=
+    wfc_step_storageLive_mem hrel_rd0 (wfc_allImm_entry _ _) hph_rd rfl rfl rfl hrd1
+  rcases p_rd with ⟨stack_rd, mach_rd⟩
+  dsimp only at hm_rd
+  subst hm_rd
+  have hm_eq_rd := step_float_eq_annealStepHooks_at_stmt r_rd true annealChooseQuietedNaN rfl rfl
+    rfl
+  have hr_rd := step_rawPtr_addrOf_lm3_1_simulation r_rd hph_rd rfl rfl rfl rfl rfl
+    (Or.inr (Or.inr (Or.inl ⟨.i64, rfl⟩))) (by decide)
+    (fun tf htf => ⟨q_rd tf htf 2, q_rd tf htf 1⟩) AllocIdSupplyReady.empty
+  rw [← hm_eq_rd] at hr_rd
+  have hub_rd : WfcUB wfcW5RawDeadBody wfcW5RDS1
+      { stack := stack_rd, machine := AnnealMachine.empty } [wfcW5RDE1] :=
+    ⟨hrd_ub, hr_rd, wfc_ub_of_stepRel hr_rd hrd_ub⟩
+  -- Part 2: `StorageDead(_1)` on `&raw`-promoted `_1`, followed by `copy _1 as f64`
+  have hrel_dc0 : StateRelLM3_1 wfcW5PromDeadCastBody wfcW5PromDCS0
+      (wfcMiriEntry wfcW5PromDeadCastBody wfcF64Ty) [] := by
+    rw [← hdc0]; exact wfc_stateRel_entry _ _ rfl rfl rfl rfl rfl rfl (by decide)
+  obtain ⟨p₁, e₁, r₁, q₁, hm_p₁⟩ :=
+    wfc_step_storageLive_mem hrel_dc0 (wfc_allImm_entry _ _) hph_dc rfl rfl rfl hdc1
+  obtain ⟨p₂, e₂, r₂, q₂, hm_p₂⟩ := wfc_step_storageLive_mem r₁ q₁ hph_dc rfl rfl rfl hdc2
+  have hmach : p₂.machine = AnnealMachine.empty := hm_p₂.trans hm_p₁
+  rcases p₂ with ⟨stack_dc, mach_dc⟩
+  dsimp only at hmach
+  subst hmach
+  have hm_eq_dc1 := step_float_eq_annealStepHooks_at_stmt r₂ true annealChooseQuietedNaN rfl rfl rfl
+  have hr_dc1 := step_rawPtr_addrOf_lm3_1_simulation r₂ hph_dc rfl rfl rfl rfl rfl
+    (Or.inr (Or.inr (Or.inl ⟨.i64, rfl⟩))) (by decide)
+    (fun tf htf => ⟨q₂ tf htf 2, q₂ tf htf 1⟩) AllocIdSupplyReady.empty
+  obtain ⟨m_dc₁, hm_dc1_base, hrel_dc1_raw⟩ := wfc_step_of_stepRel hr_dc1 hdc3
+  have hm_dc1 : Miri.Interpreter.Step.step
+      (annealStepHooksFloat wfcW5PromDeadCastBody.localDecls wfcW5PromDeadCastBody.layouts) ()
+      { stack := stack_dc, machine := AnnealMachine.empty } = (m_dc₁, .ok true) :=
+    hm_eq_dc1.trans hm_dc1_base
+  have hmap_dc1 :
+      [rawPtrAllocMapEntry wfcW5PromDeadCastBody.localDecls wfcW5PromDeadCastBody.layouts .mut 1
+        wfcW5PromDCS2.memory.nextTag ⟨AnnealMachine.empty.memory.nextAllocId,
+          AllocIdSupplyReady.empty.nonzero⟩] = [wfcW5PromDCE1] := rfl
+  have hrel_dc1 : StateRelLM3_1 wfcW5PromDeadCastBody wfcW5PromDCS3 m_dc₁ [wfcW5PromDCE1] :=
+    (congrArg (StateRelLM3_1 wfcW5PromDeadCastBody wfcW5PromDCS3 m_dc₁) hmap_dc1).mp hrel_dc1_raw
+  obtain ⟨_, himm_dc1_step⟩ := step_rawPtr_addrOf_preserves_supply r₂ rfl rfl rfl rfl rfl
+    (Or.inr (Or.inr (Or.inl ⟨.i64, rfl⟩))) (by decide)
+    (fun tf htf => ⟨q₂ tf htf 2, q₂ tf htf 1⟩) AllocIdSupplyReady.empty
+    (show AnnealMachine.empty.memory.nextAllocId.toNat + 1 < 2 ^ 32 by decide)
+    (fun h => nomatch h) hm_dc1_base
+  obtain ⟨tf_dc₀, htf_dc₀, _⟩ := id r₂
+  have himm_dc1_0 : ∀ tf₁, m_dc₁.stack.frames = #[tf₁] → IsImmediateFrameLocal tf₁ 0 :=
+    fun tf₁ htf₁ => himm_dc1_step tf_dc₀ tf₁ htf_dc₀ htf₁ 0 (by decide) (q₂ tf_dc₀ htf_dc₀ 0)
+  have hcan8 : (0xC045600000000000 : Nat) < scalarModulus 8 := by decide
+  have hr_dc2 := step_cast_float_constant_anyLocal_simulation hrel_dc1 hph_dc rfl rfl rfl
+    (.floatToInt (t := .signed .i64) rfl rfl) rfl rfl wfcVSB8 hcan8 rfl
+    (fun _ _ => Or.inr ⟨wfcW5PromDCE1, .head _, rfl⟩)
+  obtain ⟨m_dc₂, hm_dc2, hrel_dc2⟩ := wfc_step_of_stepRel hr_dc2 hdc4
+  have hp_dc2 := step_cast_float_constant_anyLocal_preserves hrel_dc1 true annealChooseQuietedNaN
+    (Or.inl ⟨rfl, rfl⟩) rfl rfl rfl (.floatToInt (t := .signed .i64) rfl rfl) rfl rfl wfcVSB8
+    hcan8 rfl (fun h => nomatch h) (fun _ _ => Or.inr ⟨wfcW5PromDCE1, .head _, rfl⟩) rfl
+    m_dc₂ hm_dc2
+  obtain ⟨tf_dc₁, htf_dc₁, _⟩ := id hrel_dc1
+  have himm_dc2_0 : ∀ tf₂, m_dc₂.stack.frames = #[tf₂] → IsImmediateFrameLocal tf₂ 0 :=
+    fun tf₂ htf₂ => hp_dc2.2 tf_dc₁ tf₂ htf_dc₁ htf₂ 0 (himm_dc1_0 tf_dc₁ htf_dc₁)
+  obtain ⟨m_dc₃, hm_dc3, hrel_dc3, himm_dc3_1, hpres_dc3⟩ :=
+    wfc_step_storageDead_any hrel_dc2 hph_dc rfl rfl rfl (by decide) hdc5
+  obtain ⟨tf_dc₂, htf_dc₂, _⟩ := id hrel_dc2
+  have himm_dc3_0 : ∀ tf₃, m_dc₃.stack.frames = #[tf₃] → IsImmediateFrameLocal tf₃ 0 :=
+    fun tf₃ htf₃ => hpres_dc3 tf_dc₂ tf₃ htf_dc₂ htf₃ 0 (himm_dc2_0 tf_dc₂ htf_dc₂)
+  have hr_dc4_raw := step_cast_float_copy_anyLocal_simulation hrel_dc3 hph_dc rfl rfl rfl rfl
+    (.intToFloat (t := .signed .i64) rfl rfl) rfl
+    (fun tf₃ htf₃ => Or.inl (himm_dc3_1 tf₃ htf₃))
+    (fun tf₃ htf₃ => Or.inl (himm_dc3_0 tf₃ htf₃))
+  have hmap_dc4 : updateAllocMapOnWrite wfcW5PromDCMap3 0 none = wfcW5PromDCMap3 := rfl
+  have hr_dc4 : StepRelLM3_1 wfcW5PromDeadCastBody m_dc₃ wfcW5PromDCMap3
+      (stepMirFn wfcW5PromDeadCastBody wfcW5PromDCS5)
+      (Miri.Interpreter.Step.step
+        (annealStepHooksFloat wfcW5PromDeadCastBody.localDecls wfcW5PromDeadCastBody.layouts)
+        () m_dc₃) :=
+    (congrArg (fun mp => StepRelLM3_1 wfcW5PromDeadCastBody m_dc₃ mp _ _) hmap_dc4).mp hr_dc4_raw
+  have he_dc3 : { wfcW5PromDCE1 with perm := .disabled, allocDead := true } ∈ wfcW5PromDCMap3 :=
+    .head _
+  exact ⟨hrd0, hdc0, _, _, m_dc₁, m_dc₂, m_dc₃,
+    .step hrd1 e_rd r_rd (.refl _ _), hub_rd,
+    .step hdc1 e₁ r₁ (.step hdc2 e₂ r₂ (.refl _ _)),
+    hm_dc1, hm_dc2, hm_dc3, hrel_dc3,
+    wfc_miri_promoted_freed hrel_dc3 he_dc3 himm_dc3_1 rfl rfl,
+    hdc_ub, hr_dc4, wfc_ub_of_stepRel hr_dc4 hdc_ub⟩
+
+/-- **(W5f-1b) multi-step `&raw`-promoted local + float-cast pipeline + `StorageDead` + `return`**
+from program entry over non-empty 64-bit `wfcStage1Layouts`
 (`_0 : f64` returned, `_1 : i64`, `_2 : *mut i64`, `_3 : f32`):
 ```text
-bb0: _2 = &raw mut _1                             // promotes _1 into allocMap = [e₁] at AllocId 1
+bb0: StorageLive(_1); StorageLive(_2); StorageLive(_3)
+     _2 = &raw mut _1                             // promotes _1 into allocMap = [e₁] (.active)
      _1 = const -42.75_f64 as i64                 // writes -42_i64 to AllocId 1, disables e₁
      _3 = copy _1 as f32                          // reads AllocId 1 ↦ -42.0_f32 (0xC228_0000)
      _1 = move _3 as i64                          // writes -42_i64 to AllocId 1, deinitializes _3
      _0 = copy _1 as f64                          // reads AllocId 1 ↦ -42.0_f64 (0xC045_0000_0000_0000)
+     StorageDead(_3); StorageDead(_2); StorageDead(_1)  // frees AllocId 1 (allocDead = true)
      return
 ``` -/
 def wfcW5PromBody : CapturedMir :=
-  wfcBody "wit_float_cast_lm::w5_promoted_raw_pipeline"
+  wfcBodyLayouts "wit_float_cast_lm::w5_promoted_raw_pipeline"
     [wfcDecl wfcF64Ty, wfcDecl (wfcIntTy .i64), wfcDecl wfcRawPtrMutI64Ty, wfcDecl wfcF32Ty] 8
-    [.assign (local_ 2) (.rawPtr .mut (local_ 1)),
+    wfcStage1Layouts
+    [.storageLive 1, .storageLive 2, .storageLive 3,
+     .assign (local_ 2) (.rawPtr .mut (local_ 1)),
      .assign (local_ 1) (.cast .floatToInt (.constant (wfcConst wfcF64Ty 0xC045600000000000 8))
        (wfcIntTy .i64)),
      .assign (local_ 3) (.cast .intToFloat (.copy (local_ 1)) wfcF32Ty),
      .assign (local_ 1) (.cast .floatToInt (.move (local_ 3)) (wfcIntTy .i64)),
-     .assign (local_ 0) (.cast .intToFloat (.copy (local_ 1)) wfcF64Ty)]
+     .assign (local_ 0) (.cast .intToFloat (.copy (local_ 1)) wfcF64Ty),
+     .storageDead 3, .storageDead 2, .storageDead 1]
 
 def wfcW5PromE1 : AllocMapEntry :=
   rawPtrAllocMapEntry wfcW5PromBody.localDecls wfcW5PromBody.layouts .mut 1 1 floatWitAllocId1
@@ -2805,53 +3329,84 @@ def wfcW5PromE1 : AllocMapEntry :=
 def wfcW5PromMap2 : List AllocMapEntry :=
   updateAllocMapOnWrite [wfcW5PromE1] 1 none
 
+def wfcW5PromMapDead : List AllocMapEntry :=
+  disableAllocMapLocal wfcW5PromMap2 1
+
 def wfcW5PromBor1 : BorrowEntry :=
-  { tag := 1, targetLocal := 1, targetProjection := [], perm := .unique }
+  { tag := 1, targetLocal := 1, targetProjection := [], perm := .active }
 
 def wfcW5PromBor2 : BorrowEntry :=
   { tag := 1, targetLocal := 1, targetProjection := [], perm := .disabled, allocDead := false }
 
-def wfcW5PromS0 : MachineState := wfcAt wfcW5PromBody 0 [.uninit, .uninit, .uninit, .uninit]
-def wfcW5PromS1 : MachineState :=
-  { frame := { blockIdx := 0, stmtIdx := 1,
+def wfcW5PromBorDead : BorrowEntry :=
+  { tag := 1, targetLocal := 1, targetProjection := [], perm := .disabled, allocDead := true }
+
+def wfcW5PromS0 : MachineState := wfcAt wfcW5PromBody 0 [.uninit, .dead, .dead, .dead]
+def wfcW5PromS1 : MachineState := wfcAt wfcW5PromBody 1 [.uninit, .uninit, .dead, .dead]
+def wfcW5PromS2 : MachineState := wfcAt wfcW5PromBody 2 [.uninit, .uninit, .uninit, .dead]
+def wfcW5PromS3 : MachineState := wfcAt wfcW5PromBody 3 [.uninit, .uninit, .uninit, .uninit]
+def wfcW5PromS4 : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 4,
                locals := [.uninit, .uninit, .init (.ptr { allocId := 1, offsetBytes := 0 } 8),
                           .uninit] }
-    memory := { wfcW5PromS0.memory with borrows := [wfcW5PromBor1], nextTag := 2 } }
-def wfcW5PromS2 : MachineState :=
-  { frame := { blockIdx := 0, stmtIdx := 2,
+    memory := { wfcW5PromS3.memory with borrows := [wfcW5PromBor1], nextTag := 2 } }
+def wfcW5PromS5 : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 5,
                locals := [.uninit, .init (.scalar ⟨0xFFFFFFFFFFFFFFD6, 8⟩),
                           .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .uninit] }
-    memory := { wfcW5PromS1.memory with borrows := [wfcW5PromBor2] } }
-def wfcW5PromS3 : MachineState :=
-  { frame := { blockIdx := 0, stmtIdx := 3,
+    memory := { wfcW5PromS4.memory with borrows := [wfcW5PromBor2] } }
+def wfcW5PromS6 : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 6,
                locals := [.uninit, .init (.scalar ⟨0xFFFFFFFFFFFFFFD6, 8⟩),
                           .init (.ptr { allocId := 1, offsetBytes := 0 } 8),
                           .init (.scalar ⟨0xC2280000, 4⟩)] }
-    memory := wfcW5PromS2.memory }
-def wfcW5PromS4 : MachineState :=
-  { frame := { blockIdx := 0, stmtIdx := 4,
+    memory := wfcW5PromS5.memory }
+def wfcW5PromS7 : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 7,
                locals := [.uninit, .init (.scalar ⟨0xFFFFFFFFFFFFFFD6, 8⟩),
                           .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .uninit] }
-    memory := wfcW5PromS3.memory }
-def wfcW5PromS5 : MachineState :=
-  { frame := { blockIdx := 0, stmtIdx := 5,
+    memory := wfcW5PromS6.memory }
+def wfcW5PromS8 : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 8,
                locals := [.init (.scalar ⟨0xC045000000000000, 8⟩),
                           .init (.scalar ⟨0xFFFFFFFFFFFFFFD6, 8⟩),
                           .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .uninit] }
-    memory := wfcW5PromS4.memory }
+    memory := wfcW5PromS7.memory }
+def wfcW5PromS9 : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 9,
+               locals := [.init (.scalar ⟨0xC045000000000000, 8⟩),
+                          .init (.scalar ⟨0xFFFFFFFFFFFFFFD6, 8⟩),
+                          .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .dead] }
+    memory := { wfcW5PromS8.memory with borrows := [wfcW5PromBor2] } }
+def wfcW5PromS10 : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 10,
+               locals := [.init (.scalar ⟨0xC045000000000000, 8⟩),
+                          .init (.scalar ⟨0xFFFFFFFFFFFFFFD6, 8⟩), .dead, .dead] }
+    memory := { wfcW5PromS9.memory with borrows := [wfcW5PromBor2] } }
+def wfcW5PromS11 : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 11,
+               locals := [.init (.scalar ⟨0xC045000000000000, 8⟩), .dead, .dead, .dead] }
+    memory := { wfcW5PromS10.memory with borrows := [wfcW5PromBorDead] } }
 
 set_option maxRecDepth 200000 in
 theorem wfcW5Prom_anneal_run :
+    initMachineState wfcW5PromBody [] = wfcW5PromS0 ∧
     stepMirFn wfcW5PromBody wfcW5PromS0 = .step wfcW5PromS1 ∧
     stepMirFn wfcW5PromBody wfcW5PromS1 = .step wfcW5PromS2 ∧
     stepMirFn wfcW5PromBody wfcW5PromS2 = .step wfcW5PromS3 ∧
     stepMirFn wfcW5PromBody wfcW5PromS3 = .step wfcW5PromS4 ∧
     stepMirFn wfcW5PromBody wfcW5PromS4 = .step wfcW5PromS5 ∧
-    stepMirFn wfcW5PromBody wfcW5PromS5 =
+    stepMirFn wfcW5PromBody wfcW5PromS5 = .step wfcW5PromS6 ∧
+    stepMirFn wfcW5PromBody wfcW5PromS6 = .step wfcW5PromS7 ∧
+    stepMirFn wfcW5PromBody wfcW5PromS7 = .step wfcW5PromS8 ∧
+    stepMirFn wfcW5PromBody wfcW5PromS8 = .step wfcW5PromS9 ∧
+    stepMirFn wfcW5PromBody wfcW5PromS9 = .step wfcW5PromS10 ∧
+    stepMirFn wfcW5PromBody wfcW5PromS10 = .step wfcW5PromS11 ∧
+    stepMirFn wfcW5PromBody wfcW5PromS11 =
       .retNormal (.scalar ⟨0xC045000000000000, 8⟩)
-        { wfcW5PromS5.memory with
-          borrows := disableFrameBorrows wfcW5PromS5.memory.borrows 0 4 } :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+        { wfcW5PromS11.memory with
+          borrows := disableFrameBorrows wfcW5PromS11.memory.borrows 0 4 } :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 private theorem wfc_preserves_imm_ne {b : CapturedMir} {s : MachineState} {m m' : AnnealStepState}
     {allocMap : List AllocMapEntry} {skip : Nat}
@@ -2864,67 +3419,95 @@ private theorem wfc_preserves_imm_ne {b : CapturedMir} {s : MachineState} {m m' 
   exact fun tf' htf' k hne => hpres tf tf' htf htf' k (himm tf htf k hne)
 
 /-- **(W5f-1b) end-to-end two-sided promoted `&raw` + float-cast + Tree Borrows invalidation +
-`return` witness**: from `wfcMiriInit`, `_2 = &raw mut _1` promotes `_1 : i64` into
-`allocMap = [wfcW5PromE1]` at `AllocId 1`; `_1 = const -42.75_f64 as i64` writes `-42_i64` into
-`lean-miri`'s stack allocation at `AllocId 1` (`MiriHoldsIndirectScalar`) and disables `wfcW5PromE1`
-(`perm = .disabled`); `_3 = copy _1 as f32` reads the promoted stack allocation into immediate `_3`
-(`-42.0_f32`); `_1 = move _3 as i64` deinitializes `_3` (`MiriHoldsUninit`) and writes `-42_i64`
-back into `AllocId 1`; `_0 = copy _1 as f64` reads `AllocId 1` into immediate `_0` (`-42.0_f64`);
-and `wfc_step_return_any` pops the root frame and returns `-42.0_f64` in both machines despite
-`allocMap ≠ []` and memory-backed `_1`! -/
+`StorageDead` stack deallocation + `return` witness from program entry** over non-empty 64-bit
+`wfcStage1Layouts` (mirroring `Anneal.CastStage1Tests.promotedRawFloatBody` 1-to-1):
+after `StorageLive(_1.._3)` (`WfcRun` from `initMachineState` / `wfcMiriEntry`),
+`_2 = &raw mut _1` promotes `_1 : i64` into `allocMap = [wfcW5PromE1]` (`perm = .active`) at
+`AllocId 1`; `_1 = const -42.75_f64 as i64` writes `-42_i64` into `lean-miri`'s stack allocation at
+`AllocId 1` (`MiriHoldsIndirectScalar`) and transitions `wfcW5PromE1` to `.disabled`
+(`allocDead = false`); `_3 = copy _1 as f32` reads `AllocId 1` into immediate `_3` (`-42.0_f32`);
+`_1 = move _3 as i64` deinitializes `_3` (`MiriHoldsUninit`) and writes `-42_i64` back into
+`AllocId 1`; `_0 = copy _1 as f64` reads `AllocId 1` into immediate `_0` (`-42.0_f64`);
+`StorageDead(_3); StorageDead(_2); StorageDead(_1)` retires `wfcW5PromE1` (`allocDead = true`),
+frees `AllocId 1` from `lean-miri` live memory (`MiriPromotedFreed`), and restores `WfcAllImm`;
+and `wfc_step_return_any` pops the root frame and returns `-42.0_f64` in both machines! -/
 theorem wfcW5_promoted_raw_pipeline_end_to_end :
-    ∃ m₁ m₂ m₃ m₄ m₅ : AnnealStepState,
+    initMachineState wfcW5PromBody [] = wfcW5PromS0 ∧
+    ∃ mₚ m₁ m₂ m₃ m₄ m₅ m₆ m₇ m₈ : AnnealStepState,
       let b := wfcW5PromBody
       let hooks := annealStepHooksFloat b.localDecls b.layouts
-      stepMirFn b wfcW5PromS0 = .step wfcW5PromS1 ∧
-      Miri.Interpreter.Step.step hooks () (wfcMiriInit b wfcF64Ty) = (m₁, .ok true) ∧
-      StateRelLM3_1 b wfcW5PromS1 m₁ [wfcW5PromE1] ∧
+      WfcRun b wfcW5PromS0 (wfcMiriEntry b wfcF64Ty) wfcW5PromS3 mₚ ∧
+      stepMirFn b wfcW5PromS3 = .step wfcW5PromS4 ∧
+      Miri.Interpreter.Step.step hooks () mₚ = (m₁, .ok true) ∧
+      StateRelLM3_1 b wfcW5PromS4 m₁ [wfcW5PromE1] ∧
+      wfcW5PromE1.perm = .active ∧
       MiriHoldsIndirectUninit m₁ 1 floatWitAllocId1 (Miri.ABI.Size.ofBytes 8) ∧
-      stepMirFn b wfcW5PromS1 = .step wfcW5PromS2 ∧
+      stepMirFn b wfcW5PromS4 = .step wfcW5PromS5 ∧
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
-      StateRelLM3_1 b wfcW5PromS2 m₂ wfcW5PromMap2 ∧
+      StateRelLM3_1 b wfcW5PromS5 m₂ wfcW5PromMap2 ∧
       wfcW5PromMap2 = [{ wfcW5PromE1 with perm := .disabled, allocDead := false }] ∧
       MiriHoldsIndirectScalar m₂ 1 floatWitAllocId1 ⟨0xFFFFFFFFFFFFFFD6, 8⟩ ∧
-      stepMirFn b wfcW5PromS2 = .step wfcW5PromS3 ∧
+      stepMirFn b wfcW5PromS5 = .step wfcW5PromS6 ∧
       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
-      StateRelLM3_1 b wfcW5PromS3 m₃ wfcW5PromMap2 ∧
+      StateRelLM3_1 b wfcW5PromS6 m₃ wfcW5PromMap2 ∧
       MiriHoldsScalar m₃ 3 ⟨0xC2280000, 4⟩ ∧
-      stepMirFn b wfcW5PromS3 = .step wfcW5PromS4 ∧
+      stepMirFn b wfcW5PromS6 = .step wfcW5PromS7 ∧
       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
-      StateRelLM3_1 b wfcW5PromS4 m₄ wfcW5PromMap2 ∧
+      StateRelLM3_1 b wfcW5PromS7 m₄ wfcW5PromMap2 ∧
       MiriHoldsUninit m₄ 3 ∧
       MiriHoldsIndirectScalar m₄ 1 floatWitAllocId1 ⟨0xFFFFFFFFFFFFFFD6, 8⟩ ∧
-      stepMirFn b wfcW5PromS4 = .step wfcW5PromS5 ∧
+      stepMirFn b wfcW5PromS7 = .step wfcW5PromS8 ∧
       Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
-      StateRelLM3_1 b wfcW5PromS5 m₅ wfcW5PromMap2 ∧
+      StateRelLM3_1 b wfcW5PromS8 m₅ wfcW5PromMap2 ∧
       MiriHoldsScalar m₅ 0 ⟨0xC045000000000000, 8⟩ ∧
-      WfcReturns b wfcW5PromS5 m₅ (.scalar ⟨0xC045000000000000, 8⟩) := by
+      Miri.Interpreter.Step.step hooks () m₅ = (m₆, .ok true) ∧
+      Miri.Interpreter.Step.step hooks () m₆ = (m₇, .ok true) ∧
+      Miri.Interpreter.Step.step hooks () m₇ = (m₈, .ok true) ∧
+      StateRelLM3_1 b wfcW5PromS11 m₈ wfcW5PromMapDead ∧
+      wfcW5PromMapDead = [{ wfcW5PromE1 with perm := .disabled, allocDead := true }] ∧
+      MiriPromotedFreed m₈ 1 floatWitAllocId1 ∧
+      WfcAllImm m₈ ∧
+      WfcReturns b wfcW5PromS11 m₈ (.scalar ⟨0xC045000000000000, 8⟩) := by
   have hph : ∀ p, wfcW5PromBody.phase ≠ .other p := fun _ h => nomatch h
-  obtain ⟨hs₁, hs₂, hs₃, hs₄, hs₅, hret⟩ := wfcW5Prom_anneal_run
-  have hrel₀ := wfc_stateRel_init wfcW5PromBody wfcF64Ty wfcW5PromS0 rfl rfl rfl rfl rfl rfl
-  have himm₀ := wfc_allImm_init wfcW5PromBody wfcF64Ty
+  obtain ⟨h0, hp1, hp2, hp3, hs₁, hs₂, hs₃, hs₄, hs₅, hd3, hd2, hd1, hret⟩ := wfcW5Prom_anneal_run
+  have hrel_ent : StateRelLM3_1 wfcW5PromBody wfcW5PromS0
+      (wfcMiriEntry wfcW5PromBody wfcF64Ty) [] := by
+    rw [← h0]; exact wfc_stateRel_entry _ _ rfl rfl rfl rfl rfl rfl (by decide)
+  obtain ⟨p₁, e₁, r₁, q₁, hm_p₁⟩ :=
+    wfc_step_storageLive_mem hrel_ent (wfc_allImm_entry _ _) hph rfl rfl rfl hp1
+  obtain ⟨p₂, e₂, r₂, q₂, hm_p₂⟩ := wfc_step_storageLive_mem r₁ q₁ hph rfl rfl rfl hp2
+  obtain ⟨p₃, e₃, r₃, q₃, hm_p₃⟩ := wfc_step_storageLive_mem r₂ q₂ hph rfl rfl rfl hp3
+  have hmach : p₃.machine = AnnealMachine.empty := hm_p₃.trans (hm_p₂.trans hm_p₁)
+  rcases p₃ with ⟨stackₚ, machₚ⟩
+  dsimp only at hmach
+  subst hmach
+  have hrun : WfcRun wfcW5PromBody wfcW5PromS0 (wfcMiriEntry wfcW5PromBody wfcF64Ty) wfcW5PromS3
+      { stack := stackₚ, machine := AnnealMachine.empty } :=
+    .step hp1 e₁ r₁ (.step hp2 e₂ r₂ (.step hp3 e₃ r₃ (.refl _ _)))
   -- Step 1: `_2 = &raw mut _1`
-  have hm_eq₁ := step_float_eq_annealStepHooks_at_stmt hrel₀ true annealChooseQuietedNaN rfl rfl rfl
-  have hr₁ := step_rawPtr_addrOf_lm3_1_simulation hrel₀ hph rfl rfl rfl rfl rfl
+  have hm_eq₁ := step_float_eq_annealStepHooks_at_stmt r₃ true annealChooseQuietedNaN rfl rfl rfl
+  have hr₁ := step_rawPtr_addrOf_lm3_1_simulation r₃ hph rfl rfl rfl rfl rfl
     (Or.inr (Or.inr (Or.inl ⟨.i64, rfl⟩))) (by decide)
-    (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩) AllocIdSupplyReady.empty
+    (fun tf htf => ⟨q₃ tf htf 2, q₃ tf htf 1⟩) AllocIdSupplyReady.empty
   obtain ⟨m₁, hm₁_base, hrel₁⟩ := wfc_step_of_stepRel hr₁ hs₁
   have hm₁ : Miri.Interpreter.Step.step
       (annealStepHooksFloat wfcW5PromBody.localDecls wfcW5PromBody.layouts) ()
-      (wfcMiriInit wfcW5PromBody wfcF64Ty) = (m₁, .ok true) := hm_eq₁.trans hm₁_base
+      { stack := stackₚ, machine := AnnealMachine.empty } = (m₁, .ok true) := hm_eq₁.trans hm₁_base
   have hmap₁_eq :
       [rawPtrAllocMapEntry wfcW5PromBody.localDecls wfcW5PromBody.layouts .mut 1
-        wfcW5PromS0.memory.nextTag
-        ⟨(wfcMiriInit wfcW5PromBody wfcF64Ty).machine.memory.nextAllocId,
+        wfcW5PromS3.memory.nextTag
+        ⟨AnnealMachine.empty.memory.nextAllocId,
           AllocIdSupplyReady.empty.nonzero⟩] = [wfcW5PromE1] := rfl
-  have hrel₁' : StateRelLM3_1 wfcW5PromBody wfcW5PromS1 m₁ [wfcW5PromE1] :=
-    (congrArg (StateRelLM3_1 wfcW5PromBody wfcW5PromS1 m₁) hmap₁_eq).mp hrel₁
-  obtain ⟨_, himm₁_step⟩ := step_rawPtr_addrOf_preserves_supply hrel₀ rfl rfl rfl rfl rfl
+  have hrel₁' : StateRelLM3_1 wfcW5PromBody wfcW5PromS4 m₁ [wfcW5PromE1] :=
+    (congrArg (StateRelLM3_1 wfcW5PromBody wfcW5PromS4 m₁) hmap₁_eq).mp hrel₁
+  obtain ⟨_, himm₁_step⟩ := step_rawPtr_addrOf_preserves_supply r₃ rfl rfl rfl rfl rfl
     (Or.inr (Or.inr (Or.inl ⟨.i64, rfl⟩))) (by decide)
-    (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩) AllocIdSupplyReady.empty (by decide)
+    (fun tf htf => ⟨q₃ tf htf 2, q₃ tf htf 1⟩) AllocIdSupplyReady.empty
+    (show AnnealMachine.empty.memory.nextAllocId.toNat + 1 < 2 ^ 32 by decide)
     (fun h => nomatch h) hm₁_base
+  obtain ⟨tfₚ, htfₚ, _⟩ := id r₃
   have himm₁ : ∀ tf₁, m₁.stack.frames = #[tf₁] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf₁ k :=
-    fun tf₁ htf₁ k hne => himm₁_step _ tf₁ rfl htf₁ k hne (himm₀ _ rfl k)
+    fun tf₁ htf₁ k hne => himm₁_step tfₚ tf₁ htfₚ htf₁ k hne (q₃ tfₚ htfₚ k)
   -- Step 2: `_1 = const -42.75_f64 as i64` (writes into promoted `_1`, disables `wfcW5PromE1`)
   have hcan8 : (0xC045600000000000 : Nat) < scalarModulus 8 := by decide
   have hr₂ := step_cast_float_constant_anyLocal_simulation hrel₁' hph rfl rfl rfl
@@ -2943,8 +3526,8 @@ theorem wfcW5_promoted_raw_pipeline_end_to_end :
     (fun _ _ => Or.inr ⟨_, he₂, rfl⟩)
     (fun tf₂ htf₂ => Or.inl (himm₂ tf₂ htf₂ 3 (by decide)))
   obtain ⟨m₃, hm₃, hrel₃_raw⟩ := wfc_step_of_stepRel hr₃ hs₃
-  have hrel₃ : StateRelLM3_1 wfcW5PromBody wfcW5PromS3 m₃ wfcW5PromMap2 :=
-    (congrArg (StateRelLM3_1 wfcW5PromBody wfcW5PromS3 m₃) hmap₃_eq).mp hrel₃_raw
+  have hrel₃ : StateRelLM3_1 wfcW5PromBody wfcW5PromS6 m₃ wfcW5PromMap2 :=
+    (congrArg (StateRelLM3_1 wfcW5PromBody wfcW5PromS6 m₃) hmap₃_eq).mp hrel₃_raw
   have hp₃ := step_cast_float_copy_anyLocal_preserves hrel₂ true annealChooseQuietedNaN
     (Or.inl ⟨rfl, rfl⟩) rfl rfl rfl rfl (.intToFloat (t := .signed .i64) rfl rfl) rfl
     (fun h => nomatch h) (fun _ _ => Or.inr ⟨_, he₂, rfl⟩)
@@ -2957,8 +3540,8 @@ theorem wfcW5_promoted_raw_pipeline_end_to_end :
     (fun tf₃ htf₃ => himm₃ tf₃ htf₃ 3 (by decide))
     (fun _ _ => Or.inr ⟨_, he₂, rfl⟩)
   obtain ⟨m₄, hm₄, hrel₄_raw⟩ := wfc_step_of_stepRel hr₄ hs₄
-  have hrel₄ : StateRelLM3_1 wfcW5PromBody wfcW5PromS4 m₄ wfcW5PromMap2 :=
-    (congrArg (StateRelLM3_1 wfcW5PromBody wfcW5PromS4 m₄) hmap₄_eq).mp hrel₄_raw
+  have hrel₄ : StateRelLM3_1 wfcW5PromBody wfcW5PromS7 m₄ wfcW5PromMap2 :=
+    (congrArg (StateRelLM3_1 wfcW5PromBody wfcW5PromS7 m₄) hmap₄_eq).mp hrel₄_raw
   have hp₄ := step_cast_float_move_anyLocal_preserves hrel₃ true annealChooseQuietedNaN
     (Or.inl ⟨rfl, rfl⟩) rfl rfl rfl rfl (.floatToInt (t := .signed .i64) rfl rfl) rfl
     (fun h => nomatch h) (fun tf₃ htf₃ => himm₃ tf₃ htf₃ 3 (by decide))
@@ -2971,8 +3554,8 @@ theorem wfcW5_promoted_raw_pipeline_end_to_end :
     (fun _ _ => Or.inr ⟨_, he₂, rfl⟩)
     (fun tf₄ htf₄ => Or.inl (himm₄ tf₄ htf₄ 0 (by decide)))
   obtain ⟨m₅, hm₅, hrel₅_raw⟩ := wfc_step_of_stepRel hr₅ hs₅
-  have hrel₅ : StateRelLM3_1 wfcW5PromBody wfcW5PromS5 m₅ wfcW5PromMap2 :=
-    (congrArg (StateRelLM3_1 wfcW5PromBody wfcW5PromS5 m₅) hmap₅_eq).mp hrel₅_raw
+  have hrel₅ : StateRelLM3_1 wfcW5PromBody wfcW5PromS8 m₅ wfcW5PromMap2 :=
+    (congrArg (StateRelLM3_1 wfcW5PromBody wfcW5PromS8 m₅) hmap₅_eq).mp hrel₅_raw
   have hp₅ := step_cast_float_copy_anyLocal_preserves hrel₄ true annealChooseQuietedNaN
     (Or.inl ⟨rfl, rfl⟩) rfl rfl rfl rfl (.intToFloat (t := .signed .i64) rfl rfl) rfl
     (fun h => nomatch h) (fun _ _ => Or.inr ⟨_, he₂, rfl⟩)
@@ -2980,8 +3563,29 @@ theorem wfcW5_promoted_raw_pipeline_end_to_end :
   have himm₅ := wfc_preserves_imm_ne hrel₄ hp₅.2 himm₄
   have himm₅_0 : ∀ tf₅, m₅.stack.frames = #[tf₅] → IsImmediateFrameLocal tf₅ 0 :=
     fun tf₅ htf₅ => himm₅ tf₅ htf₅ 0 (by decide)
-  exact ⟨m₁, m₂, m₃, m₄, m₅,
-    hs₁, hm₁, hrel₁',
+  -- Epilogue: `StorageDead(_3); StorageDead(_2); StorageDead(_1)`
+  have hmap₆_eq : disableAllocMapLocal wfcW5PromMap2 3 = wfcW5PromMap2 := rfl
+  obtain ⟨m₆, hm₆, hrel₆_raw, _, hpres₆⟩ :=
+    wfc_step_storageDead_any hrel₅ hph rfl rfl rfl (by decide) hd3
+  have hrel₆ : StateRelLM3_1 wfcW5PromBody wfcW5PromS9 m₆ wfcW5PromMap2 :=
+    (congrArg (StateRelLM3_1 wfcW5PromBody wfcW5PromS9 m₆) hmap₆_eq).mp hrel₆_raw
+  have himm₆ := wfc_preserves_imm_ne hrel₅ hpres₆ himm₅
+  have hmap₇_eq : disableAllocMapLocal wfcW5PromMap2 2 = wfcW5PromMap2 := rfl
+  obtain ⟨m₇, hm₇, hrel₇_raw, _, hpres₇⟩ :=
+    wfc_step_storageDead_any hrel₆ hph rfl rfl rfl (by decide) hd2
+  have hrel₇ : StateRelLM3_1 wfcW5PromBody wfcW5PromS10 m₇ wfcW5PromMap2 :=
+    (congrArg (StateRelLM3_1 wfcW5PromBody wfcW5PromS10 m₇) hmap₇_eq).mp hrel₇_raw
+  have himm₇ := wfc_preserves_imm_ne hrel₆ hpres₇ himm₆
+  obtain ⟨m₈, hm₈, hrel₈, himm₈_1, hpres₈⟩ :=
+    wfc_step_storageDead_any hrel₇ hph rfl rfl rfl (by decide) hd1
+  obtain ⟨tf₇, htf₇, _⟩ := id hrel₇
+  have himm₈ : WfcAllImm m₈ := fun tf₈ htf₈ k =>
+    if hk : k = 1 then hk ▸ himm₈_1 tf₈ htf₈
+    else hpres₈ tf₇ tf₈ htf₇ htf₈ k (himm₇ tf₇ htf₇ k hk)
+  have he_dead : { wfcW5PromE1 with perm := .disabled, allocDead := true } ∈ wfcW5PromMapDead :=
+    .head _
+  exact ⟨h0, _, m₁, m₂, m₃, m₄, m₅, m₆, m₇, m₈, hrun,
+    hs₁, hm₁, hrel₁', rfl,
     wfc_miri_promoted_uninit hrel₁' (.head _) rfl (Or.inr ⟨.signed .i64, rfl⟩) rfl,
     hs₂, hm₂, hrel₂, rfl,
     wfc_miri_promoted_scalar hrel₂ he₂ rfl (Or.inr ⟨.signed .i64, rfl⟩) rfl,
@@ -2992,7 +3596,11 @@ theorem wfcW5_promoted_raw_pipeline_end_to_end :
     wfc_miri_promoted_scalar hrel₄ he₂ rfl (Or.inr ⟨.signed .i64, rfl⟩) rfl,
     hs₅, hm₅, hrel₅,
     wfc_miri_scalar_at hrel₅ himm₅_0 rfl (Or.inl ⟨_, rfl⟩) rfl,
-    wfc_step_return_any hrel₅ himm₅_0 hph rfl rfl rfl rfl rfl rfl (Or.inl ⟨_, rfl⟩) hret⟩
+    hm₆, hm₇, hm₈, hrel₈, rfl,
+    wfc_miri_promoted_freed hrel₈ he_dead (fun tf htf => himm₈ tf htf 1) rfl rfl,
+    himm₈,
+    wfc_step_return_any hrel₈ (fun tf htf => himm₈ tf htf 0) hph rfl rfl rfl rfl rfl rfl
+      (Or.inl ⟨_, rfl⟩) hret⟩
 
 /-! #### Unpromoted stack-allocated `LocalRel.indirect` float multi-step witness ending in `return` -/
 
@@ -3814,6 +4422,13 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_miri_promoted_uninit' depend
 #print axioms wfc_miri_promoted_uninit
 
 /--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_miri_promoted_freed' depends on axioms:
+  [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfc_miri_promoted_freed
+
+/--
 info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_step_of_stepRel' depends on axioms:
   [propext, Classical.choice, Quot.sound]
 -/
@@ -3896,6 +4511,20 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_step_storageDead' depends on
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms wfc_step_storageDead
+
+/--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_step_storageLive_mem' depends on axioms:
+  [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfc_step_storageLive_mem
+
+/--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_step_storageDead_any' depends on axioms:
+  [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfc_step_storageDead_any
 
 /--
 info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcVSB1' does not depend on any axioms
@@ -4089,6 +4718,27 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW4_end_to_end' depends on axi
 #print axioms wfcW4_end_to_end
 
 /--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfc_fromInteger' depends on axioms:
+  [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfc_fromInteger
+
+/--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW4_fromInteger_all_sources' depends on axioms:
+  [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfcW4_fromInteger_all_sources
+
+/--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW4_signed_negative_ties' depends on axioms:
+  [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfcW4_signed_negative_ties
+
+/--
 info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5U_anneal_run' depends on axioms:
   [propext, Quot.sound]
 -/
@@ -4180,11 +4830,32 @@ info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5_bool_char_boundary' depend
 #print axioms wfcW5_bool_char_boundary
 
 /--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5PromU_anneal_run' depends on axioms:
+  [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfcW5PromU_anneal_run
+
+/--
 info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5_promoted_uninit_ub' depends on axioms:
   [propext, Classical.choice, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms wfcW5_promoted_uninit_ub
+
+/--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5PromDead_anneal_run' depends on axioms:
+  [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfcW5PromDead_anneal_run
+
+/--
+info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5_rawPtr_dead_and_promoted_dead_ub' depends on axioms:
+  [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wfcW5_rawPtr_dead_and_promoted_dead_ub
 
 /--
 info: 'LeanMiriSpec.Correspondence.WitFloatCast.wfcW5Prom_anneal_run' depends on axioms:

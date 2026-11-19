@@ -405,8 +405,9 @@ theorem fcast_float_to_int_saturation_extremes :
 
 /-- `roundTiesToEven` integer-to-float at the format limits: `u128::MAX as f32 = +∞` (it exceeds
 `f32::MAX + ½ulp`), `u128::MAX as f64 = 2¹²⁸`, `i128::MIN as f32 = -2¹²⁷` exactly,
-`u64::MAX as f32 = 2⁶⁴`, `i64::MAX as f32 = 2⁶³`, and the `2²⁴ + 1` / `2²⁴ + 3` (`f32`) and
-`2⁵³ + 1` (`f64`) ties rounding to the even neighbour. -/
+`u64::MAX as f32 = 2⁶⁴`, `i64::MAX as f32 = 2⁶³`, `i64::MIN + 1 as f32 / f64 = -2⁶³`, and both
+positive and signed negative `2²⁴ + 1` / `2²⁴ + 3` (`f32`) and `±(2⁵³ + 1)` / `±(2⁵³ + 3)` (`f64`)
+halfway ties rounding to the even neighbour. -/
 theorem fcast_int_to_float_limits_and_ties :
     fcast .intToFloat (.uint .u128) (.float .f32) (2 ^ 128 - 1) 16 = some (.scalar ⟨0x7F800000, 4⟩) ∧
     fcast .intToFloat (.uint .u128) (.float .f64) (2 ^ 128 - 1) 16 =
@@ -416,11 +417,19 @@ theorem fcast_int_to_float_limits_and_ties :
       some (.scalar ⟨0x5F800000, 4⟩) ∧
     fcast .intToFloat (.int .i64) (.float .f32) 0x7FFFFFFFFFFFFFFF 8 =
       some (.scalar ⟨0x5F000000, 4⟩) ∧
+    fcast .intToFloat (.int .i64) (.float .f32) 0x8000000000000001 8 =
+      some (.scalar ⟨0xDF000000, 4⟩) ∧
+    fcast .intToFloat (.int .i64) (.float .f64) 0x8000000000000001 8 =
+      some (.scalar ⟨0xC3E0000000000000, 8⟩) ∧
     fcast .intToFloat (.int .i32) (.float .f32) 16777217 4 = some (.scalar ⟨0x4B800000, 4⟩) ∧
     fcast .intToFloat (.int .i32) (.float .f32) 16777219 4 = some (.scalar ⟨0x4B800002, 4⟩) ∧
     fcast .intToFloat (.uint .u64) (.float .f64) (2 ^ 53 + 1) 8 =
-      some (.scalar ⟨0x4340000000000000, 8⟩) := by
-  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+      some (.scalar ⟨0x4340000000000000, 8⟩) ∧
+    fcast .intToFloat (.int .i64) (.float .f64) (2 ^ 64 - (2 ^ 53 + 1)) 8 =
+      some (.scalar ⟨0xC340000000000000, 8⟩) ∧
+    fcast .intToFloat (.int .i64) (.float .f64) (2 ^ 64 - (2 ^ 53 + 3)) 8 =
+      some (.scalar ⟨0xC340000000000002, 8⟩) := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 
 /-! ## Section 10.1: End-to-end multi-statement `stepMirFn` float-cast runs
@@ -558,13 +567,14 @@ theorem stepMirFn_float_to_int_all_targets_run :
     retScalar? (runFloatSteps floatToIntAllTargetsBody 28 s₀) = some ⟨0x7F, 1⟩ :=
   ⟨rfl, rfl⟩
 
-/-- (W4) `StorageLive(_1.._8)`, then the integer-to-float casts of
-`LeanMiriSpec.WitFloatCastLM.wfcW4Body`, then `return`. -/
+/-- (W4) `StorageLive(_1.._10)`, then the integer-to-float casts of
+`LeanMiriSpec.WitFloatCastLM.wfcW4Body` plus signed negative `i64 -> f64` halfway ties, then
+`return`. -/
 def intToFloatTiesBody : CapturedMir :=
   floatBody "cast_stage1::int_to_float_ties"
     [.float .f32, .float .f32, .float .f64, .float .f32, .float .f32, .float .f32, .float .f64,
-     .float .f64, .uint .u128]
-    ((List.range 8).map (fun i => .storageLive (i + 1)) ++
+     .float .f64, .uint .u128, .float .f64, .float .f64]
+    ((List.range 10).map (fun i => .storageLive (i + 1)) ++
     [fCast 8 .floatToInt (fConst (.float .f32) 0x7F800000 4) (.uint .u128),
      fCast 1 .intToFloat (.copy (fPlace 8)) (.float .f32),
      fCast 2 .intToFloat (.move (fPlace 8)) (.float .f64),
@@ -573,21 +583,26 @@ def intToFloatTiesBody : CapturedMir :=
      fCast 5 .intToFloat (fConst (.int .i32) (2 ^ 24 + 3) 4) (.float .f32),
      fCast 6 .intToFloat (fConst (.uint .u64) (2 ^ 53 + 1) 8) (.float .f64),
      fCast 7 .intToFloat (fConst (.uint .u64) (2 ^ 53 + 3) 8) (.float .f64),
+     fCast 9 .intToFloat (fConst (.int .i64) (2 ^ 64 - (2 ^ 53 + 1)) 8) (.float .f64),
+     fCast 10 .intToFloat (fConst (.int .i64) (2 ^ 64 - (2 ^ 53 + 3)) 8) (.float .f64),
      fCast 0 .intToFloat (fConst (.int .i8) 0x80 1) (.float .f32)])
 
 set_option maxRecDepth 200000 in
 /-- End-to-end `stepMirFn` run of the integer-to-float limits: `u128::MAX as f32 = +∞`,
 `u128::MAX as f64 = 2¹²⁸`, `i128::MIN as f32 = -2¹²⁷`, ties `2²⁴ + 1 ↦ 2²⁴`,
-`2²⁴ + 3 ↦ 2²⁴ + 4`, `2⁵³ + 1 ↦ 2⁵³`, `2⁵³ + 3 ↦ 2⁵³ + 4`, and `i8::MIN as f32 = -128.0`. -/
+`2²⁴ + 3 ↦ 2²⁴ + 4`, `2⁵³ + 1 ↦ 2⁵³`, `2⁵³ + 3 ↦ 2⁵³ + 4`, signed negative `i64` ties
+`-(2⁵³ + 1) ↦ -2⁵³` (`0xC340_0000_0000_0000`) and `-(2⁵³ + 3) ↦ -(2⁵³ + 4)`
+(`0xC340_0000_0000_0002`), and `i8::MIN as f32 = -128.0`. -/
 theorem stepMirFn_int_to_float_ties_run :
     let s₀ := initMachineState intToFloatTiesBody []
-    stepLocals? (runFloatSteps intToFloatTiesBody 17 s₀) =
+    stepLocals? (runFloatSteps intToFloatTiesBody 21 s₀) =
       some [.init (.scalar ⟨0xC3000000, 4⟩), .init (.scalar ⟨0x7F800000, 4⟩),
         .init (.scalar ⟨0x47F0000000000000, 8⟩), .init (.scalar ⟨0xFF000000, 4⟩),
         .init (.scalar ⟨0x4B800000, 4⟩), .init (.scalar ⟨0x4B800002, 4⟩),
         .init (.scalar ⟨0x4340000000000000, 8⟩), .init (.scalar ⟨0x4340000000000002, 8⟩),
-        .uninit] ∧
-    retScalar? (runFloatSteps intToFloatTiesBody 18 s₀) = some ⟨0xC3000000, 4⟩ :=
+        .uninit, .init (.scalar ⟨0xC340000000000000, 8⟩),
+        .init (.scalar ⟨0xC340000000000002, 8⟩)] ∧
+    retScalar? (runFloatSteps intToFloatTiesBody 22 s₀) = some ⟨0xC3000000, 4⟩ :=
   ⟨rfl, rfl⟩
 
 /-- (W2) `StorageLive(_1.._4)`; `_1 = const 0x7F80_0001_f32 as f64`;
@@ -661,9 +676,31 @@ def floatCharBody : CapturedMir :=
   floatBody "cast_stage1::float_char" [.float .f64]
     [fCast 0 .intToFloat (fConst .char 0x41 4) (.float .f64)]
 
+def rawPtrDeadBody : CapturedMir :=
+  floatBody "cast_stage1::raw_ptr_dead" [.float .f64, .int .i64, .rawPtr .mut (.int .i64)]
+    [.storageLive 2, .assign (fPlace 2) (.rawPtr .mut (fPlace 1)),
+     fCast 0 .intToFloat (.copy (fPlace 1)) (.float .f64)]
+
+def promotedUninitFloatBody : CapturedMir :=
+  floatBody "cast_stage1::promoted_uninit_float"
+    [.float .f64, .int .i64, .rawPtr .mut (.int .i64)]
+    [.storageLive 1, .storageLive 2,
+     .assign (fPlace 2) (.rawPtr .mut (fPlace 1)),
+     fCast 0 .intToFloat (.copy (fPlace 1)) (.float .f64)]
+
+def promotedDeadFloatBody : CapturedMir :=
+  floatBody "cast_stage1::promoted_dead_float"
+    [.float .f64, .int .i64, .rawPtr .mut (.int .i64)]
+    [.storageLive 1, .storageLive 2,
+     .assign (fPlace 2) (.rawPtr .mut (fPlace 1)),
+     fCast 1 .floatToInt (fConst (.float .f64) 0xC045600000000000 8) (.int .i64),
+     .storageDead 1,
+     fCast 0 .intToFloat (.copy (fPlace 1)) (.float .f64)]
+
 set_option maxRecDepth 200000 in
 /-- End-to-end `stepMirFn` negative controls: reading a dead (`StorageDead`), never-live,
-uninitialized, or moved-from source in a float cast faults with `.ub`; `f16`/`f128` sources and
+uninitialized, moved-from, `&raw`-promoted uninitialized, or `&raw`-promoted `StorageDead` source in
+a float cast — or taking `&raw mut` of a dead local — faults with `.ub`; `f16`/`f128` sources and
 targets and `bool`/`char` sources fail closed with `.unsupported`. -/
 theorem stepMirFn_float_ub_and_fail_closed_runs :
     runFloatSteps floatDeadBody 4 (initMachineState floatDeadBody []) = MirStepNode.fail .ub ∧
@@ -672,6 +709,12 @@ theorem stepMirFn_float_ub_and_fail_closed_runs :
     runFloatSteps floatUninitBody 2 (initMachineState floatUninitBody []) =
       MirStepNode.fail .ub ∧
     runFloatSteps floatMovedBody 5 (initMachineState floatMovedBody []) =
+      MirStepNode.fail .ub ∧
+    runFloatSteps rawPtrDeadBody 2 (initMachineState rawPtrDeadBody []) =
+      MirStepNode.fail .ub ∧
+    runFloatSteps promotedUninitFloatBody 4 (initMachineState promotedUninitFloatBody []) =
+      MirStepNode.fail .ub ∧
+    runFloatSteps promotedDeadFloatBody 6 (initMachineState promotedDeadFloatBody []) =
       MirStepNode.fail .ub ∧
     runFloatSteps floatF16Body 1 (initMachineState floatF16Body []) = MirStepNode.unsupported ∧
     runFloatSteps floatF128SrcBody 1 (initMachineState floatF128SrcBody []) =
@@ -682,7 +725,7 @@ theorem stepMirFn_float_ub_and_fail_closed_runs :
       MirStepNode.unsupported ∧
     runFloatSteps floatBoolBody 1 (initMachineState floatBoolBody []) = MirStepNode.unsupported ∧
     runFloatSteps floatCharBody 1 (initMachineState floatCharBody []) = MirStepNode.unsupported :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- (W5) Address-taken (`&raw mut _1`) local + float-to-int write (invalidating the raw-pointer
 borrow entry) + int-to-float reads (`copy` & `move` round-trip) + `StorageDead` + `return`. -/
