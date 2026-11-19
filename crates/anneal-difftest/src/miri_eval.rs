@@ -2361,20 +2361,45 @@ fn parse_stage_ns_reexports(lib_rs: &str) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
-fn non_entry_item_vis_matching_name<'a>(
-    item: &'a syn::Item,
+fn collect_non_entry_vis_blanks_matching_name(
+    item: &syn::Item,
     target_name: &str,
-) -> Option<&'a syn::Visibility> {
+    out: &mut Vec<((usize, usize), (usize, usize))>,
+) {
+    let push_if_non_inherited =
+        |vis: &syn::Visibility, out: &mut Vec<((usize, usize), (usize, usize))>| {
+            if !matches!(vis, syn::Visibility::Inherited)
+                && let Some(bounds) = node_span_bounds(vis)
+            {
+                out.push(bounds);
+            }
+        };
     match item {
-        syn::Item::Fn(i) if i.sig.ident == target_name => Some(&i.vis),
-        syn::Item::Const(i) if i.ident == target_name => Some(&i.vis),
-        syn::Item::Static(i) if i.ident == target_name => Some(&i.vis),
-        syn::Item::Struct(i) if i.ident == target_name => Some(&i.vis),
-        syn::Item::Enum(i) if i.ident == target_name => Some(&i.vis),
-        syn::Item::Union(i) if i.ident == target_name => Some(&i.vis),
-        syn::Item::Type(i) if i.ident == target_name => Some(&i.vis),
-        syn::Item::Trait(i) if i.ident == target_name => Some(&i.vis),
-        syn::Item::Mod(i) if i.ident == target_name => Some(&i.vis),
+        syn::Item::Fn(i) if i.sig.ident == target_name => push_if_non_inherited(&i.vis, out),
+        syn::Item::Const(i) if i.ident == target_name => push_if_non_inherited(&i.vis, out),
+        syn::Item::Static(i) if i.ident == target_name => push_if_non_inherited(&i.vis, out),
+        syn::Item::Struct(i) if i.ident == target_name => push_if_non_inherited(&i.vis, out),
+        syn::Item::Enum(i) if i.ident == target_name => push_if_non_inherited(&i.vis, out),
+        syn::Item::Union(i) if i.ident == target_name => push_if_non_inherited(&i.vis, out),
+        syn::Item::Type(i) if i.ident == target_name => push_if_non_inherited(&i.vis, out),
+        syn::Item::Trait(i) if i.ident == target_name => push_if_non_inherited(&i.vis, out),
+        syn::Item::Mod(i) if i.ident == target_name => push_if_non_inherited(&i.vis, out),
+        syn::Item::ForeignMod(fm) => {
+            for fi in &fm.items {
+                match fi {
+                    syn::ForeignItem::Fn(f) if f.sig.ident == target_name => {
+                        push_if_non_inherited(&f.vis, out);
+                    }
+                    syn::ForeignItem::Static(s) if s.ident == target_name => {
+                        push_if_non_inherited(&s.vis, out);
+                    }
+                    syn::ForeignItem::Type(t) if t.ident == target_name => {
+                        push_if_non_inherited(&t.vis, out);
+                    }
+                    _ => {}
+                }
+            }
+        }
         syn::Item::Use(u) => {
             let mut bound = Vec::new();
             let mut globs = Vec::new();
@@ -2384,9 +2409,51 @@ fn non_entry_item_vis_matching_name<'a>(
                 &mut bound,
                 &mut globs,
             );
-            bound.iter().any(|id| id == target_name).then_some(&u.vis)
+            if bound.iter().any(|id| id == target_name) {
+                push_if_non_inherited(&u.vis, out);
+            }
         }
-        _ => None,
+        _ => {}
+    }
+}
+
+fn collect_redundant_preamble_use_tree_blanks(
+    prefix: &str,
+    parent_ident: Option<&syn::Ident>,
+    tree: &syn::UseTree,
+    out: &mut Vec<((usize, usize), (usize, usize))>,
+) {
+    match tree {
+        syn::UseTree::Path(p) => {
+            let next_prefix = if prefix.is_empty() {
+                p.ident.to_string()
+            } else {
+                format!("{prefix}::{}", p.ident)
+            };
+            collect_redundant_preamble_use_tree_blanks(&next_prefix, Some(&p.ident), &p.tree, out);
+        }
+        syn::UseTree::Group(g) => {
+            for pair in g.items.pairs() {
+                let (sub, comma) = pair.into_tuple();
+                if crate::mutators_miri::use_subtree_is_redundant_with_preamble(
+                    prefix,
+                    parent_ident,
+                    sub,
+                ) {
+                    if let Some(b) = node_span_bounds(sub) {
+                        out.push(b);
+                    }
+                    if let Some(c) = comma
+                        && let Some(cb) = node_span_bounds(c)
+                    {
+                        out.push(cb);
+                    }
+                } else {
+                    collect_redundant_preamble_use_tree_blanks(prefix, parent_ident, sub, out);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2588,12 +2655,7 @@ fn stage_candidate_source_for_batch_with_reserved(
             {
                 continue;
             }
-            if let Some(vis) = non_entry_item_vis_matching_name(item, &cand.fn_name)
-                && !matches!(vis, syn::Visibility::Inherited)
-                && let Some(bounds) = node_span_bounds(vis)
-            {
-                vis_blanks.push(bounds);
-            }
+            collect_non_entry_vis_blanks_matching_name(item, &cand.fn_name, &mut vis_blanks);
         }
         let ns_body = if vis_blanks.is_empty() {
             trimmed.to_string()
@@ -2610,19 +2672,33 @@ fn stage_candidate_source_for_batch_with_reserved(
                 {
                     continue;
                 }
+                if let syn::Item::Use(u) = item {
+                    if crate::mutators_miri::use_subtree_is_redundant_with_preamble(
+                        "", None, &u.tree,
+                    ) {
+                        if let Some(bounds) = node_span_bounds(item) {
+                            iso_blanks.push(bounds);
+                        }
+                    } else {
+                        collect_redundant_preamble_use_tree_blanks(
+                            "",
+                            None,
+                            &u.tree,
+                            &mut iso_blanks,
+                        );
+                    }
+                    continue;
+                }
                 let keys = crate::mutators_miri::aux_item_namespace_keys(item);
                 if keys.is_empty() {
                     continue;
                 }
                 let tokens = quote::ToTokens::to_token_stream(item).to_string();
-                let redundant_with_preamble = match item {
-                    syn::Item::Use(_) => keys.iter().all(|k| preamble_seen.contains_key(k)),
-                    _ => keys.iter().all(|k| {
-                        preamble_seen
-                            .get(k)
-                            .is_some_and(|prev| !prev.tokens.is_empty() && prev.tokens == tokens)
-                    }),
-                };
+                let redundant_with_preamble = keys.iter().all(|k| {
+                    preamble_seen
+                        .get(k)
+                        .is_some_and(|prev| !prev.tokens.is_empty() && prev.tokens == tokens)
+                });
                 if redundant_with_preamble && let Some(bounds) = node_span_bounds(item) {
                     iso_blanks.push(bounds);
                 }
@@ -4071,18 +4147,28 @@ fn confirm_helper_module_suffixes(
                 None
             };
             let matching_impl_self_ty = |short: &str, suf: &str| -> Option<String> {
-                let rel = suf.strip_prefix(&crate_prefix)?;
-                let rel_trimmed = split_stage_ns_rel(rel).map_or_else(
-                    || rel.trim_start_matches('_'),
-                    |(_, rest)| rest.trim_start_matches('_'),
-                );
-                scope_graph
-                    .aux_tokens
-                    .keys()
+                let mut cur = suf.strip_prefix(&crate_prefix)?;
+                while let Some((_, rest)) = split_stage_ns_rel(cur) {
+                    cur = rest;
+                }
+                let rel_trimmed = cur.trim_start_matches('_');
+                if rel_trimmed == short {
+                    return None;
+                }
+                let mut candidate_types: BTreeSet<&String> =
+                    scope_graph.aux_tokens.keys().collect();
+                if target_scope.is_some() && scope_graph.inherits_super {
+                    for root_ty in scoped.root.aux_tokens.keys() {
+                        if !scope_graph.defined_type_names.contains(root_ty) {
+                            candidate_types.insert(root_ty);
+                        }
+                    }
+                }
+                candidate_types
+                    .into_iter()
                     .filter(|self_ty| {
-                        rel_trimmed.starts_with(&format!("{self_ty}_as_"))
+                        rel_trimmed.starts_with(&format!("{self_ty}_"))
                             || rel_trimmed.starts_with(&format!("{self_ty}."))
-                            || rel_trimmed == format!("{self_ty}_{short}")
                     })
                     .max_by_key(|self_ty| self_ty.len())
                     .cloned()
@@ -4108,6 +4194,17 @@ fn confirm_helper_module_suffixes(
                 .iter()
                 .filter(|(_, s)| s == *suffix)
                 .any(|(short, _)| {
+                    let is_opaque = !scope_graph.fn_bodies.contains_key(short)
+                        && !scope_graph.impl_method_names.contains(short);
+                    if scope_graph.fn_bodies.contains_key(short)
+                        && let Some(enclosing) = enclosing_top_fn(short, suffix)
+                    {
+                        let enclosing_reached = entries
+                            .iter()
+                            .any(|s| s.name == enclosing && entry_is_in_target_scope(&s.name))
+                            || scope_fns.contains(&enclosing);
+                        return enclosing_reached && (scope_fns.contains(short) || is_opaque);
+                    }
                     if let Some(self_ty) = matching_impl_self_ty(short, suffix) {
                         let root_aux = scoped.reached_aux_by_scope.get(&None).unwrap_or(&empty_set);
                         let reached_via_super = target_scope.is_some()
@@ -4116,8 +4213,6 @@ fn confirm_helper_module_suffixes(
                             && root_aux.contains(&self_ty);
                         return scope_aux.contains(&self_ty) || reached_via_super;
                     }
-                    let is_opaque = !scope_graph.fn_bodies.contains_key(short)
-                        && !scope_graph.impl_method_names.contains(short);
                     if let Some(enclosing) = enclosing_top_fn(short, suffix) {
                         let enclosing_reached = entries
                             .iter()
@@ -13715,6 +13810,119 @@ pub fn cand_ep1_a3_2() -> u32 {
             )
             .as_deref(),
             Some("real_sync_repro")
+        );
+
+        // 12. `ep1-B4` regressions:
+        //     (a) grouped `use core::mem::{size_of, transmute};` and non-preamble
+        //         rename `use core::mem::size_of as offset;` inside isolated-preamble
+        //         / `use super::*;` `stage_ns_<n>` modules + `extern "C"` collisions,
+        //     (b) `confirm_helper_module_suffixes` linking specialized `impl`
+        //         methods (`MiriDiffCorpus.Uninit_LocalA_clash` at crate root and
+        //         `MiriDiffCorpus.stage_ns_0_stage_ns_0_Uninit_stage_ns_0_LocalB_clash`
+        //         inside `stage_ns_0`).
+        let grouped_use_iso_src = "\
+use core::mem::{size_of, transmute};
+unsafe extern \"C\" {
+    fn ep1_b4_foreign_sym(x: u32) -> u32;
+}
+impl PairU32 {
+    fn ep1_b4_method(&self) -> u32 { self.a + self.b }
+}
+pub fn cand_ep1_b4_iso() -> u32 {
+    let raw: u32 = unsafe { transmute::<u32, u32>(size_of::<PairU32>() as u32) };
+    (PairU32 { a: raw, b: 1u32 }).ep1_b4_method()
+}
+";
+        let rename_use_super_src = "\
+use core::mem::size_of as offset;
+unsafe extern \"C\" {
+    fn ep1_b4_foreign_sym(x: u64) -> u64;
+}
+pub fn cand_ep1_b4_rename() -> u32 {
+    offset::<PairU32>() as u32
+}
+";
+        let b4_cands: Vec<GeneratedMiriCandidate> = [
+            (0usize, "cand_ep1_a3_0", use_cand_0_src),
+            (1usize, "cand_ep1_b4_iso", grouped_use_iso_src),
+            (2usize, "cand_ep1_b4_rename", rename_use_super_src),
+        ]
+        .into_iter()
+        .map(|(id, name, src)| GeneratedMiriCandidate {
+            id,
+            seed_index: 0,
+            seed_name: name.to_string(),
+            fn_name: name.to_string(),
+            seed_u64: id as u64 + 200,
+            applied_mutators: Vec::new(),
+            tracked_locals: Vec::new(),
+            fn_source: src.to_string(),
+            source: crate::mutators_miri::build_standalone_candidate_source(src),
+        })
+        .collect();
+        let b4_reserved: BTreeSet<String> = b4_cands.iter().map(|c| c.fn_name.clone()).collect();
+        let mut b4_staged = exact_prefix.clone();
+        let b4_repro_start = b4_staged.lines().count() as u32 + 1;
+        let mut b4_seen = seed_seen_staged_aux_from_preamble();
+        let mut b4_ns = 0usize;
+        for cand in &b4_cands {
+            let b_start = b4_staged.lines().count() as u32 + 1;
+            let (txt, _, _) = stage_candidate_source_for_batch_with_reserved(
+                cand,
+                b_start,
+                b4_repro_start,
+                &mut b4_seen,
+                &mut b4_ns,
+                &b4_reserved,
+            );
+            b4_staged.push_str(&txt);
+            b4_staged.push_str("\n\n");
+        }
+        assert!(
+            compile_rust_snippet("ep1_b4_grouped_use_rename_and_foreign", &b4_staged),
+            "ep1-B4 grouped use + rename use + foreign fn collision batch must compile:\n{b4_staged}"
+        );
+
+        // Verify specialized `impl Uninit<LocalA>` (root) and `impl Uninit<LocalB>`
+        // (`stage_ns_0`, doubled `stage_ns_0_stage_ns_0_...` stem from `rustc-capture`)
+        // are linked into their respective `MiriOracleConfirm.lean` callee lists.
+        let spec_impl_pairs = vec![
+            (
+                "clash".to_string(),
+                "MiriDiffCorpus.Uninit_LocalA_clash".to_string(),
+            ),
+            (
+                "clash".to_string(),
+                "MiriDiffCorpus.stage_ns_0_stage_ns_0_Uninit_stage_ns_0_LocalB_clash".to_string(),
+            ),
+        ];
+        let spec_impl_helpers = vec![
+            "MiriDiffCorpus.Uninit_LocalA_clash".to_string(),
+            "MiriDiffCorpus.stage_ns_0_stage_ns_0_Uninit_stage_ns_0_LocalB_clash".to_string(),
+        ];
+        let root_spec_linked = confirm_helper_module_suffixes(
+            &a3_staged,
+            "MiriDiffCorpus",
+            &spec_impl_pairs,
+            &spec_impl_helpers,
+            &[OracleItemSpec::with_fuel("cand_ep1_a3_0".to_string(), 200)],
+        );
+        assert_eq!(
+            root_spec_linked,
+            vec!["MiriDiffCorpus.Uninit_LocalA_clash"],
+            "root candidate must link specialized Uninit<LocalA>::clash: {root_spec_linked:?}"
+        );
+        let ns_spec_linked = confirm_helper_module_suffixes(
+            &a3_staged,
+            "MiriDiffCorpus",
+            &spec_impl_pairs,
+            &spec_impl_helpers,
+            &[OracleItemSpec::with_fuel("cand_ep1_a3_2".to_string(), 200)],
+        );
+        assert_eq!(
+            ns_spec_linked,
+            vec!["MiriDiffCorpus.stage_ns_0_stage_ns_0_Uninit_stage_ns_0_LocalB_clash"],
+            "stage_ns_0 candidate must link specialized Uninit<LocalB>::clash: {ns_spec_linked:?}"
         );
     }
 }

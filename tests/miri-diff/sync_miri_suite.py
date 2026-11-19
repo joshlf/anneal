@@ -475,10 +475,12 @@ def _mask_nested_blocks_and_attrs(clean_src: str) -> str:
 
 
 _TOP_PREFIX = r"(?:^|[;}])\s*"
-_FN_QUALS = r"(?:const\s+|unsafe\s+|extern(?:\s+(?:(?:b|c)?r#*)?\"[^\"]*\"#*)?\s+)*"
-_ANY_FN_QUALS = (
-    r"(?:const\s+|async\s+|unsafe\s+|extern(?:\s+(?:(?:b|c)?r#*)?\"[^\"]*\"#*)?\s+)*"
+_EXTERN_QUAL = (
+    r"(?:extern\s+(?=(?:const|async|unsafe|fn)\b)"
+    r"|extern\s*(?:(?:b|c)?r#*)?\"[^\"]*\"#*\s*)"
 )
+_FN_QUALS = rf"(?:const\s+|unsafe\s+|{_EXTERN_QUAL})*"
+_ANY_FN_QUALS = rf"(?:const\s+|async\s+|unsafe\s+|{_EXTERN_QUAL})*"
 
 
 def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
@@ -642,15 +644,16 @@ def check_manifest_and_corpus(manifest_path: Path, corpus_dir: Path) -> dict:
         if m.group(1) != "helper_add_ten" and m.group(1) not in model_names
     ]
     all_unmarked_top_fns = [
-        m.group(1)
+        m.group(1).removeprefix("r#")
         for m in re.finditer(
             _TOP_PREFIX
             + r"(?:pub(?:\s*\([^)]*\))?\s+)?"
             + _ANY_FN_QUALS
-            + r"fn\s+([A-Za-z0-9_]+)\b",
+            + r"fn\s+((?:r#)?[A-Za-z0-9_]+)\b",
             top_lib_no_str,
         )
-        if m.group(1) != "helper_add_ten" and m.group(1) not in model_names
+        if m.group(1).removeprefix("r#") != "helper_add_ten"
+        and m.group(1).removeprefix("r#") not in model_names
     ]
     rogue_top_fns = sorted(set(all_unmarked_top_fns) - set(fn_names_in_lib))
     if rogue_top_fns:

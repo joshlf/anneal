@@ -4380,22 +4380,56 @@ pub fn pass_c16_preamble_impl_b() -> u32 {
         preamble_impl_b_src,
     ));
 
+    // (e) a divergent candidate calling a specialized `impl Uninit<C16SpecTag>`
+    //     inherent method (`stage_ns_<n>_stage_ns_<n>_Uninit_..._c16_spec_copy`),
+    //     proving live that `confirm_helper_module_suffixes` links specialized
+    //     `impl` methods in `MiriOracleConfirm.lean` (`rfl` kernel confirmation).
+    let specialized_impl_div_src = "\
+use core::mem::size_of;
+#[derive(Copy, Clone)]
+pub struct C16SpecTag;
+impl Uninit<C16SpecTag> {
+    fn c16_spec_copy(&self) -> u32 {
+        let mut buf: [u32; 4] = [9u32, 10u32, 0u32, 0u32];
+        unsafe {
+            let base: *mut u32 = &raw mut buf as *mut u32;
+            let dst: *mut u32 = offset(base as *const u32, 2isize) as *mut u32;
+            copy_nonoverlapping(base as *const u32, dst, 2usize);
+        }
+        wrapping_add(wrapping_add(buf[2], buf[3]), size_of::<C16SpecTag>() as u32)
+    }
+}
+pub fn pass_c16_specialized_impl_div() -> u32 {
+    let u: Uninit<C16SpecTag> = Uninit { value: C16SpecTag };
+    u.c16_spec_copy()
+}
+";
+    let mut spec_div_cand = handwritten_candidate(
+        6,
+        "pass_c16_specialized_impl_div",
+        "pass_c16_specialized_impl_div",
+        "identity",
+        specialized_impl_div_src,
+    );
+    spec_div_cand.applied_mutators.clear();
+    multi_batch.push(spec_div_cand);
+
     let multi_findings_dir = dir.join("multi_item_findings");
     let multi_report = evaluate_miri_batches_with_options(
         "c16_multi_item_batch",
         0xC16_B201,
         &[multi_batch],
-        6,
+        7,
         &MiriEvalOptions {
             findings_dir: Some(multi_findings_dir),
             anneal_repo_root: Some(root.clone()),
             shrink_seeds: Some(vec![multi_item_seed.to_string()]),
         },
     )
-    .expect("6-candidate unmarked + conflicting multi-item batch must stage without E0428/E0592");
-    assert_eq!(multi_report.compiled_candidates, 6);
+    .expect("7-candidate unmarked + conflicting + specialized-impl batch must stage cleanly");
+    assert_eq!(multi_report.compiled_candidates, 7);
     assert_eq!(multi_report.compile_failed_candidates, 0);
-    assert_eq!(multi_report.compared_candidates, 6);
+    assert_eq!(multi_report.compared_candidates, 7);
     assert_eq!(multi_report.not_compared_count, 0);
     assert_eq!(
         multi_report
@@ -4464,6 +4498,36 @@ pub fn pass_c16_preamble_impl_b() -> u32 {
         assert_eq!(
             ns_repro_anneal_tag, ns_finding.anneal_outcome_tag,
             "stage_ns_1 translated UB span must match standalone repro.rs byte-for-byte"
+        );
+    }
+
+    if let Some(spec_finding) = multi_report
+        .findings
+        .iter()
+        .find(|f| f.fn_name == "pass_c16_specialized_impl_div")
+    {
+        assert_eq!(spec_finding.divergence_class, "false_positive_ub");
+        assert!(spec_finding.kernel_confirmed);
+        assert!(
+            spec_finding
+                .kernel_confirm_theorems
+                .contains("c16_spec_copy.body"),
+            "specialized impl Uninit<C16SpecTag>::c16_spec_copy must be linked in confirm:\n{}",
+            spec_finding.kernel_confirm_theorems
+        );
+        let spec_repro_path = spec_finding
+            .repro_path
+            .as_ref()
+            .expect("specialized impl finding repro.rs");
+        let spec_repro_rep = reproduce_miri_finding(spec_repro_path, Some(&root))
+            .expect("reproduce specialized impl finding standalone");
+        let spec_repro_tag = match &spec_repro_rep.anneal {
+            AnnealOutcome::Ub { span: Some(s) } => format!("ub@{}", s.display_short()),
+            other => other.summary_tag(),
+        };
+        assert_eq!(
+            spec_repro_tag, spec_finding.anneal_outcome_tag,
+            "specialized impl isolated-preamble UB span must match standalone repro.rs"
         );
     }
 }

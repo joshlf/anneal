@@ -5502,45 +5502,150 @@ pub(crate) fn collect_use_tree_bound_idents(
     }
 }
 
-fn prune_preamble_use_tree(
+pub(crate) fn normalize_use_target_path(raw: &str) -> String {
+    let stripped = raw.trim_start_matches("::");
+    let core_norm = if let Some(rest) = stripped.strip_prefix("std::") {
+        format!("core::{rest}")
+    } else {
+        stripped.to_string()
+    };
+    if core_norm == "core::mem::transmute" {
+        "core::intrinsics::transmute".to_string()
+    } else {
+        core_norm
+    }
+}
+
+pub(crate) fn collect_use_tree_leaf_targets(
+    prefix: &str,
     parent_ident: Option<&syn::Ident>,
     tree: &syn::UseTree,
-    preamble_keys: &std::collections::BTreeSet<String>,
-) -> Option<syn::UseTree> {
-    let ident_conflicts_preamble = |id: &str| {
-        preamble_keys.contains(&format!("ty:{id}"))
-            || preamble_keys.contains(&format!("val:{id}"))
-            || preamble_keys.contains(&format!("mac:{id}"))
-    };
+    out: &mut Vec<(String, String)>,
+) {
     match tree {
         syn::UseTree::Name(n) => {
-            let eff = if n.ident == "self" {
-                parent_ident.map(std::string::ToString::to_string)?
+            if n.ident == "self" {
+                if let Some(p) = parent_ident {
+                    out.push((p.to_string(), normalize_use_target_path(prefix)));
+                }
             } else {
-                n.ident.to_string()
-            };
-            (!ident_conflicts_preamble(&eff)).then(|| syn::UseTree::Name(n.clone()))
-        }
-        syn::UseTree::Rename(r) => {
-            if r.rename != "_" && ident_conflicts_preamble(&r.rename.to_string()) {
-                None
-            } else {
-                Some(syn::UseTree::Rename(r.clone()))
+                let bound = n.ident.to_string();
+                let target = if prefix.is_empty() {
+                    bound.clone()
+                } else {
+                    format!("{prefix}::{bound}")
+                };
+                out.push((bound, normalize_use_target_path(&target)));
             }
         }
-        syn::UseTree::Path(p) => prune_preamble_use_tree(Some(&p.ident), &p.tree, preamble_keys)
-            .map(|sub| {
+        syn::UseTree::Rename(r) => {
+            if r.rename != "_" {
+                let orig = if r.ident == "self" {
+                    match parent_ident {
+                        Some(p) => p.to_string(),
+                        None => return,
+                    }
+                } else {
+                    r.ident.to_string()
+                };
+                let target = if r.ident == "self" || prefix.is_empty() {
+                    if r.ident == "self" {
+                        prefix.to_string()
+                    } else {
+                        orig
+                    }
+                } else {
+                    format!("{prefix}::{orig}")
+                };
+                out.push((r.rename.to_string(), normalize_use_target_path(&target)));
+            }
+        }
+        syn::UseTree::Path(p) => {
+            let next_prefix = if prefix.is_empty() {
+                p.ident.to_string()
+            } else {
+                format!("{prefix}::{}", p.ident)
+            };
+            collect_use_tree_leaf_targets(&next_prefix, Some(&p.ident), &p.tree, out);
+        }
+        syn::UseTree::Group(g) => {
+            for sub in &g.items {
+                collect_use_tree_leaf_targets(prefix, parent_ident, sub, out);
+            }
+        }
+        syn::UseTree::Glob(_) => {}
+    }
+}
+
+pub(crate) fn preamble_use_target_map() -> &'static std::collections::BTreeMap<String, String> {
+    static MAP: std::sync::OnceLock<std::collections::BTreeMap<String, String>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut out = std::collections::BTreeMap::new();
+        if let Ok(file) = syn::parse_file(MIRI_CORPUS_MODULE_PREAMBLE) {
+            for item in &file.items {
+                if let Item::Use(u) = item {
+                    let mut leaves = Vec::new();
+                    collect_use_tree_leaf_targets("", None, &u.tree, &mut leaves);
+                    for (bound, target) in leaves {
+                        out.insert(bound, target);
+                    }
+                }
+            }
+        }
+        out
+    })
+}
+
+pub(crate) fn use_subtree_is_redundant_with_preamble(
+    prefix: &str,
+    parent_ident: Option<&syn::Ident>,
+    tree: &syn::UseTree,
+) -> bool {
+    let mut leaves = Vec::new();
+    collect_use_tree_leaf_targets(prefix, parent_ident, tree, &mut leaves);
+    let mut bound = Vec::new();
+    let mut globs = Vec::new();
+    collect_use_tree_bound_idents(parent_ident, tree, &mut bound, &mut globs);
+    if !globs.is_empty() || leaves.is_empty() {
+        return false;
+    }
+    let preamble_uses = preamble_use_target_map();
+    leaves
+        .iter()
+        .all(|(b, target)| preamble_uses.get(b) == Some(target))
+}
+
+fn prune_preamble_use_tree(
+    prefix: &str,
+    parent_ident: Option<&syn::Ident>,
+    tree: &syn::UseTree,
+) -> Option<syn::UseTree> {
+    if use_subtree_is_redundant_with_preamble(prefix, parent_ident, tree) {
+        return None;
+    }
+    match tree {
+        syn::UseTree::Name(n) => Some(syn::UseTree::Name(n.clone())),
+        syn::UseTree::Rename(r) => Some(syn::UseTree::Rename(r.clone())),
+        syn::UseTree::Path(p) => {
+            let next_prefix = if prefix.is_empty() {
+                p.ident.to_string()
+            } else {
+                format!("{prefix}::{}", p.ident)
+            };
+            prune_preamble_use_tree(&next_prefix, Some(&p.ident), &p.tree).map(|sub| {
                 syn::UseTree::Path(syn::UsePath {
                     ident: p.ident.clone(),
                     colon2_token: p.colon2_token,
                     tree: Box::new(sub),
                 })
-            }),
+            })
+        }
         syn::UseTree::Group(g) => {
             let kept: Vec<syn::UseTree> = g
                 .items
                 .iter()
-                .filter_map(|sub| prune_preamble_use_tree(parent_ident, sub, preamble_keys))
+                .filter_map(|sub| prune_preamble_use_tree(prefix, parent_ident, sub))
                 .collect();
             match kept.len() {
                 0 => None,
@@ -5635,6 +5740,16 @@ pub(crate) fn aux_item_namespace_keys(item: &Item) -> Vec<String> {
                 }
             }
         }
+        Item::ForeignMod(fm) => fm
+            .items
+            .iter()
+            .filter_map(|fi| match fi {
+                syn::ForeignItem::Fn(f) => Some(format!("val:{}", f.sig.ident)),
+                syn::ForeignItem::Static(s) => Some(format!("val:{}", s.ident)),
+                syn::ForeignItem::Type(t) => Some(format!("ty:{}", t.ident)),
+                _ => None,
+            })
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -5694,7 +5809,7 @@ fn close_miri_seed(
                 kept_items.push(Item::Const(c));
             }
             Item::Use(mut u) => {
-                if let Some(pruned) = prune_preamble_use_tree(None, &u.tree, preamble_keys) {
+                if let Some(pruned) = prune_preamble_use_tree("", None, &u.tree) {
                     u.tree = pruned;
                     kept_items.push(Item::Use(u));
                 }
@@ -8678,6 +8793,28 @@ pub async fn trailing_async_helper() -> u32 {
                 "pub async fn rogue_async() {} pub fn sync_cand() { @@@ }"
             ),
             vec!["sync_cand"]
+        );
+        // Target-aware `prune_preamble_use_tree` must NOT delete a `use` rename
+        // whose target path differs from `MIRI_CORPUS_MODULE_PREAMBLE` (such as
+        // `use core::mem::size_of as offset;`), while `aux_item_namespace_keys`
+        // tracks `extern "C"` foreign `fn`/`static`/`type` declarations.
+        let non_preamble_rename: syn::ItemUse =
+            syn::parse_quote!(use core::mem::{size_of as offset, transmute};);
+        let pruned_rename = prune_preamble_use_tree("", None, &non_preamble_rename.tree)
+            .expect("must keep size_of as offset while pruning transmute");
+        assert_eq!(
+            pruned_rename.to_token_stream().to_string(),
+            "core :: mem :: size_of as offset"
+        );
+        let foreign_block: Item = syn::parse_quote! {
+            unsafe extern "C" {
+                fn ext_sym(x: u32) -> u32;
+                static EXT_SLOT: u32;
+            }
+        };
+        assert_eq!(
+            aux_item_namespace_keys(&foreign_block),
+            vec!["val:ext_sym".to_string(), "val:EXT_SLOT".to_string()]
         );
 
         // 2. `close_miri_seed` / `seeded_type_expr` must synthesize valid `FreezeAndCell`,
