@@ -3375,13 +3375,243 @@ fn collect_pat_bound_idents_with_consts(
 struct LazyOldClosureSpec {
     var_name: String,
     inner_src: String,
-    referenced_mut_params: BTreeSet<String>,
+    mutated_mut_params: BTreeSet<String>,
+}
+
+fn find_mut_required_params_in_old(
+    expr: &Expr,
+    params: &[SpecParamBinding],
+    const_names: &BTreeSet<String>,
+    shared_helper_param_indices: &BTreeMap<String, BTreeSet<usize>>,
+) -> BTreeSet<String> {
+    struct MutNeedVisitor<'a> {
+        params: &'a [SpecParamBinding],
+        const_names: &'a BTreeSet<String>,
+        shared_helper_param_indices: &'a BTreeMap<String, BTreeSet<usize>>,
+        shadowed: Vec<BTreeSet<String>>,
+        out: BTreeSet<String>,
+    }
+    impl<'ast> MutNeedVisitor<'ast> {
+        fn unshadowed_mut_param(&self, ident: &str) -> Option<String> {
+            let shadowed = self.shadowed.iter().any(|s| s.contains(ident))
+                || self.const_names.contains(ident);
+            if !shadowed && self.params.iter().any(|p| p.is_mut_ref && p.name == ident) {
+                Some(ident.to_string())
+            } else {
+                None
+            }
+        }
+
+        fn mark_place_root(&mut self, mut target: &'ast Expr) {
+            loop {
+                match target {
+                    Expr::Paren(p) => target = &p.expr,
+                    Expr::Group(g) => target = &g.expr,
+                    Expr::Reference(r) => target = &r.expr,
+                    Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => target = &u.expr,
+                    Expr::Field(f) => target = &f.base,
+                    Expr::Index(ix) => target = &ix.expr,
+                    Expr::Path(ep)
+                        if ep.qself.is_none()
+                            && ep.path.leading_colon.is_none()
+                            && ep.path.segments.len() == 1 =>
+                    {
+                        if let Some(pname) =
+                            self.unshadowed_mut_param(&ep.path.segments[0].ident.to_string())
+                        {
+                            self.out.insert(pname);
+                        }
+                        return;
+                    }
+                    _ => return,
+                }
+            }
+        }
+
+        fn visit_cond_with_let_bindings(&mut self, cond: &'ast Expr) {
+            match cond {
+                Expr::Paren(p) => self.visit_cond_with_let_bindings(&p.expr),
+                Expr::Group(g) => self.visit_cond_with_let_bindings(&g.expr),
+                Expr::Let(el) => {
+                    self.visit_expr(&el.expr);
+                    if let Some(frame) = self.shadowed.last_mut() {
+                        collect_pat_bound_idents_with_consts(&el.pat, self.const_names, frame);
+                    }
+                }
+                Expr::Binary(eb) if matches!(eb.op, BinOp::And(_)) => {
+                    self.visit_cond_with_let_bindings(&eb.left);
+                    self.visit_cond_with_let_bindings(&eb.right);
+                }
+                other => self.visit_expr(other),
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for MutNeedVisitor<'ast> {
+        fn visit_block(&mut self, block: &'ast syn::Block) {
+            self.shadowed.push(BTreeSet::new());
+            for stmt in &block.stmts {
+                if let syn::Stmt::Local(loc) = stmt {
+                    if let Some(init) = &loc.init {
+                        self.visit_expr(&init.expr);
+                        if let Some((_, div_expr)) = &init.diverge {
+                            self.visit_expr(div_expr);
+                        }
+                    }
+                    if let Some(frame) = self.shadowed.last_mut() {
+                        collect_pat_bound_idents_with_consts(&loc.pat, self.const_names, frame);
+                    }
+                } else {
+                    visit::visit_stmt(self, stmt);
+                }
+            }
+            self.shadowed.pop();
+        }
+
+        fn visit_expr(&mut self, node: &'ast Expr) {
+            match node {
+                Expr::Closure(closure) => {
+                    let mut frame = BTreeSet::new();
+                    for pat in &closure.inputs {
+                        collect_pat_bound_idents_with_consts(pat, self.const_names, &mut frame);
+                    }
+                    self.shadowed.push(frame);
+                    self.visit_expr(&closure.body);
+                    self.shadowed.pop();
+                    return;
+                }
+                Expr::Match(em) => {
+                    self.visit_expr(&em.expr);
+                    for arm in &em.arms {
+                        let mut frame = BTreeSet::new();
+                        collect_pat_bound_idents_with_consts(&arm.pat, self.const_names, &mut frame);
+                        self.shadowed.push(frame);
+                        if let Some((_, guard_expr)) = &arm.guard {
+                            self.visit_expr(guard_expr);
+                        }
+                        self.visit_expr(&arm.body);
+                        self.shadowed.pop();
+                    }
+                    return;
+                }
+                Expr::If(ei) => {
+                    self.shadowed.push(BTreeSet::new());
+                    self.visit_cond_with_let_bindings(&ei.cond);
+                    self.visit_block(&ei.then_branch);
+                    self.shadowed.pop();
+                    if let Some((_, else_expr)) = &ei.else_branch {
+                        self.visit_expr(else_expr);
+                    }
+                    return;
+                }
+                Expr::While(ew) => {
+                    self.shadowed.push(BTreeSet::new());
+                    self.visit_cond_with_let_bindings(&ew.cond);
+                    self.visit_block(&ew.body);
+                    self.shadowed.pop();
+                    return;
+                }
+                Expr::ForLoop(efl) => {
+                    self.visit_expr(&efl.expr);
+                    let mut frame = BTreeSet::new();
+                    collect_pat_bound_idents_with_consts(&efl.pat, self.const_names, &mut frame);
+                    self.shadowed.push(frame);
+                    self.visit_block(&efl.body);
+                    self.shadowed.pop();
+                    return;
+                }
+                Expr::Assign(ea) => {
+                    self.mark_place_root(&ea.left);
+                }
+                Expr::Binary(eb)
+                    if matches!(
+                        eb.op,
+                        BinOp::AddAssign(_)
+                            | BinOp::SubAssign(_)
+                            | BinOp::MulAssign(_)
+                            | BinOp::DivAssign(_)
+                            | BinOp::RemAssign(_)
+                            | BinOp::BitXorAssign(_)
+                            | BinOp::BitAndAssign(_)
+                            | BinOp::BitOrAssign(_)
+                            | BinOp::ShlAssign(_)
+                            | BinOp::ShrAssign(_)
+                    ) =>
+                {
+                    self.mark_place_root(&eb.left);
+                }
+                Expr::Reference(er) if er.mutability.is_some() => {
+                    self.mark_place_root(&er.expr);
+                }
+                Expr::Call(ec) => {
+                    let mut fexpr: &Expr = &ec.func;
+                    loop {
+                        match fexpr {
+                            Expr::Paren(p) => fexpr = &p.expr,
+                            Expr::Group(g) => fexpr = &g.expr,
+                            _ => break,
+                        }
+                    }
+                    let callee_opt = match fexpr {
+                        Expr::Path(ep) if ep.qself.is_none() => {
+                            let joined = ep
+                                .path
+                                .segments
+                                .iter()
+                                .map(|s| s.ident.to_string())
+                                .collect::<Vec<_>>()
+                                .join("::");
+                            Some(strip_crate_or_self_prefix(&joined).to_string())
+                        }
+                        _ => None,
+                    };
+                    let shared_idxs = callee_opt
+                        .as_deref()
+                        .and_then(|n| self.shared_helper_param_indices.get(n));
+                    for (idx, arg) in ec.args.iter().enumerate() {
+                        let is_known_shared_ref =
+                            shared_idxs.is_some_and(|set| set.contains(&idx));
+                        if !is_known_shared_ref {
+                            self.mark_place_root(arg);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            visit::visit_expr(self, node);
+        }
+    }
+
+    let mut v = MutNeedVisitor {
+        params,
+        const_names,
+        shared_helper_param_indices,
+        shadowed: Vec::new(),
+        out: BTreeSet::new(),
+    };
+    v.visit_expr(expr);
+    v.out
+}
+
+fn strip_crate_or_self_prefix(path_str: &str) -> &str {
+    let mut s = path_str.trim();
+    loop {
+        if let Some(rest) = s.strip_prefix("::") {
+            s = rest;
+        } else if let Some(rest) = s.strip_prefix("self::") {
+            s = rest;
+        } else if let Some(rest) = s.strip_prefix("crate::") {
+            s = rest;
+        } else {
+            return s;
+        }
+    }
 }
 
 fn rewrite_old_expressions_for_rust(
     expr: &mut Expr,
     params: &[SpecParamBinding],
     const_names: &BTreeSet<String>,
+    shared_helper_param_indices: &BTreeMap<String, BTreeSet<usize>>,
     needed_pre_params: &mut BTreeSet<String>,
     lazy_old_closures: &mut Vec<LazyOldClosureSpec>,
 ) {
@@ -3392,7 +3622,6 @@ fn rewrite_old_expressions_for_rust(
         params: &'a [SpecParamBinding],
         const_names: &'a BTreeSet<String>,
         needed_pre_params: &'a mut BTreeSet<String>,
-        referenced_mut_params: &'a mut BTreeSet<String>,
         shadowed: Vec<BTreeSet<String>>,
     }
     impl PreParamRewriter<'_> {
@@ -3520,7 +3749,6 @@ fn rewrite_old_expressions_for_rust(
                 {
                     self.needed_pre_params.insert(param.name.clone());
                     if param.is_mut_ref {
-                        self.referenced_mut_params.insert(param.name.clone());
                         let pre_ref_ident = syn::Ident::new(
                             &format!("__anneal_pre_ref_{}", param.name),
                             proc_macro2::Span::call_site(),
@@ -3543,6 +3771,7 @@ fn rewrite_old_expressions_for_rust(
     struct Hoister<'a> {
         params: &'a [SpecParamBinding],
         const_names: &'a BTreeSet<String>,
+        shared_helper_param_indices: &'a BTreeMap<String, BTreeSet<usize>>,
         needed_pre_params: &'a mut BTreeSet<String>,
         lazy_old_closures: &'a mut Vec<LazyOldClosureSpec>,
     }
@@ -3557,19 +3786,23 @@ fn rewrite_old_expressions_for_rust(
                 && call.args.len() == 1
             {
                 let mut inner = call.args[0].clone();
-                let mut referenced_mut_params = BTreeSet::new();
+                let mutated_mut_params = find_mut_required_params_in_old(
+                    &inner,
+                    self.params,
+                    self.const_names,
+                    self.shared_helper_param_indices,
+                );
                 PreParamRewriter {
                     params: self.params,
                     const_names: self.const_names,
                     needed_pre_params: self.needed_pre_params,
-                    referenced_mut_params: &mut referenced_mut_params,
                     shadowed: Vec::new(),
                 }
                 .visit_expr_mut(&mut inner);
                 let inner_tokens = inner.to_token_stream().to_string();
                 let var_name = if let Some(existing) = self.lazy_old_closures.iter().find(|spec| {
                     spec.inner_src == inner_tokens
-                        && spec.referenced_mut_params == referenced_mut_params
+                        && spec.mutated_mut_params == mutated_mut_params
                 }) {
                     existing.var_name.clone()
                 } else {
@@ -3577,7 +3810,7 @@ fn rewrite_old_expressions_for_rust(
                     self.lazy_old_closures.push(LazyOldClosureSpec {
                         var_name: fresh.clone(),
                         inner_src: inner_tokens,
-                        referenced_mut_params,
+                        mutated_mut_params,
                     });
                     fresh
                 };
@@ -3591,6 +3824,7 @@ fn rewrite_old_expressions_for_rust(
     Hoister {
         params,
         const_names,
+        shared_helper_param_indices,
         needed_pre_params,
         lazy_old_closures,
     }
@@ -3688,15 +3922,29 @@ impl SpecTypeMetadata {
     }
 
     fn resolve_type_ident(&self, ident: &str) -> String {
-        let cur = ident.trim().to_string();
+        let cur = strip_crate_or_self_prefix(ident).to_string();
         if let Some(alias_ty) = self.type_aliases.get(&cur) {
             let resolved = self.resolve_syn_type(alias_ty);
             if let syn::Type::Path(tp) = resolved
                 && tp.qself.is_none()
-                && tp.path.segments.len() == 1
-                && matches!(tp.path.segments[0].arguments, syn::PathArguments::None)
             {
-                return tp.path.segments[0].ident.to_string();
+                let segs: Vec<String> = tp
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect();
+                let joined = segs.join("::");
+                let stripped = strip_crate_or_self_prefix(&joined);
+                if !stripped.contains("::")
+                    && tp
+                        .path
+                        .segments
+                        .last()
+                        .is_some_and(|seg| matches!(seg.arguments, syn::PathArguments::None))
+                {
+                    return stripped.to_string();
+                }
             }
         }
         cur
@@ -3707,10 +3955,23 @@ impl SpecTypeMetadata {
             match ty {
                 syn::Type::Paren(tp) => ty = &tp.elem,
                 syn::Type::Group(tg) => ty = &tg.elem,
-                syn::Type::Path(tp) if tp.qself.is_none() && tp.path.segments.len() == 1 => {
-                    let seg = &tp.path.segments[0];
-                    if matches!(seg.arguments, syn::PathArguments::None)
-                        && let Some(target) = self.type_aliases.get(&seg.ident.to_string())
+                syn::Type::Path(tp) if tp.qself.is_none() => {
+                    let segs: Vec<String> = tp
+                        .path
+                        .segments
+                        .iter()
+                        .map(|s| s.ident.to_string())
+                        .collect();
+                    let joined = segs.join("::");
+                    let stripped = strip_crate_or_self_prefix(&joined);
+                    let no_args = tp
+                        .path
+                        .segments
+                        .last()
+                        .is_some_and(|seg| matches!(seg.arguments, syn::PathArguments::None));
+                    if !stripped.contains("::")
+                        && no_args
+                        && let Some(target) = self.type_aliases.get(stripped)
                     {
                         ty = target;
                     } else {
@@ -4637,32 +4898,70 @@ fn spec_trap<T>(msg: impl Into<String>) -> Result<T, SpecExecFlow> {
 
 const MAX_SPEC_CALL_DEPTH: usize = 128;
 
+type SavedShadowBinding = (
+    String,
+    Option<SpecEvalValue>,
+    Option<(String, Vec<SpecPlaceStep>)>,
+);
+
 struct SpecEvalContext<'a> {
     env: BTreeMap<String, SpecEvalValue>,
+    mut_aliases: BTreeMap<String, (String, Vec<SpecPlaceStep>)>,
     pre_env: Option<&'a BTreeMap<String, SpecEvalValue>>,
     struct_layouts: &'a BTreeMap<String, LayoutSpec>,
     enum_layouts: &'a BTreeMap<String, LayoutSpec>,
     type_meta: &'a SpecTypeMetadata,
     external_callees: &'a BTreeMap<String, LayoutSpec>,
+    external_callee_ret_tys: &'a BTreeMap<String, syn::Type>,
     helper_fns: &'a BTreeMap<String, syn::ItemFn>,
     schedule: Option<&'a mut EnvSchedule>,
     call_index: usize,
     call_depth: usize,
 }
 
-fn restore_shadowed_env(
+fn restore_shadowed_bindings(
     env: &mut BTreeMap<String, SpecEvalValue>,
-    saved: Vec<(String, Option<SpecEvalValue>)>,
+    mut_aliases: &mut BTreeMap<String, (String, Vec<SpecPlaceStep>)>,
+    saved: Vec<SavedShadowBinding>,
 ) {
-    for (k, prev) in saved.into_iter().rev() {
-        match prev {
+    for (k, prev_val, prev_alias) in saved.into_iter().rev() {
+        match prev_val {
             Some(v) => {
-                env.insert(k, v);
+                env.insert(k.clone(), v);
             }
             None => {
                 env.remove(&k);
             }
         }
+        match prev_alias {
+            Some(a) => {
+                mut_aliases.insert(k, a);
+            }
+            None => {
+                mut_aliases.remove(&k);
+            }
+        }
+    }
+}
+
+fn syntactic_place_root_ident(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Paren(p) => syntactic_place_root_ident(&p.expr),
+        Expr::Group(g) => syntactic_place_root_ident(&g.expr),
+        Expr::Reference(er) => syntactic_place_root_ident(&er.expr),
+        Expr::Unary(un) if matches!(un.op, syn::UnOp::Deref(_)) => {
+            syntactic_place_root_ident(&un.expr)
+        }
+        Expr::Field(ef) => syntactic_place_root_ident(&ef.base),
+        Expr::Index(ix) => syntactic_place_root_ident(&ix.expr),
+        Expr::Path(ep)
+            if ep.qself.is_none()
+                && ep.path.leading_colon.is_none()
+                && ep.path.segments.len() == 1 =>
+        {
+            Some(ep.path.segments[0].ident.to_string())
+        }
+        _ => None,
     }
 }
 
@@ -4701,26 +5000,155 @@ fn compare_ordered_spec_values(lhs: &SpecEvalValue, rhs: &SpecEvalValue) -> Resu
 }
 
 impl<'a> SpecEvalContext<'a> {
-    fn eval_block(&mut self, block: &syn::Block) -> Result<SpecEvalValue, SpecExecFlow> {
-        let mut shadowed: Vec<(String, Option<SpecEvalValue>)> = Vec::new();
-        let res = self.eval_block_inner(block, &mut shadowed);
-        for (name, prev) in shadowed.into_iter().rev() {
-            match prev {
-                Some(v) => {
-                    self.env.insert(name, v);
-                }
-                None => {
-                    self.env.remove(&name);
-                }
+    fn save_and_insert_val(
+        &mut self,
+        name: String,
+        val: SpecEvalValue,
+        shadowed: &mut Vec<SavedShadowBinding>,
+    ) {
+        let prev_val = self.env.insert(name.clone(), val);
+        let prev_alias = self.mut_aliases.remove(&name);
+        shadowed.push((name, prev_val, prev_alias));
+    }
+
+    fn save_and_insert_mut_alias(
+        &mut self,
+        name: String,
+        target: (String, Vec<SpecPlaceStep>),
+        shadowed: &mut Vec<SavedShadowBinding>,
+    ) {
+        let prev_val = self.env.remove(&name);
+        let prev_alias = self.mut_aliases.insert(name.clone(), target);
+        shadowed.push((name, prev_val, prev_alias));
+    }
+
+    fn expr_contains_mut_borrow_or_alias(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Paren(p) => self.expr_contains_mut_borrow_or_alias(&p.expr),
+            Expr::Group(g) => self.expr_contains_mut_borrow_or_alias(&g.expr),
+            Expr::Reference(er) => er.mutability.is_some(),
+            Expr::Path(ep)
+                if ep.qself.is_none()
+                    && ep.path.leading_colon.is_none()
+                    && ep.path.segments.len() == 1 =>
+            {
+                self.mut_aliases
+                    .contains_key(&ep.path.segments[0].ident.to_string())
+            }
+            Expr::Tuple(et) => et
+                .elems
+                .iter()
+                .any(|el| self.expr_contains_mut_borrow_or_alias(el)),
+            _ => false,
+        }
+    }
+
+    fn try_bind_local_mut_aliases(
+        &mut self,
+        pat: &Pat,
+        ty_hint: Option<&syn::Type>,
+        init: &Expr,
+        shadowed: &mut Vec<SavedShadowBinding>,
+    ) -> Result<bool, SpecExecFlow> {
+        match pat {
+            Pat::Paren(pp) => {
+                return self.try_bind_local_mut_aliases(&pp.pat, ty_hint, init, shadowed);
+            }
+            Pat::Type(pt) => {
+                return self.try_bind_local_mut_aliases(&pt.pat, Some(&pt.ty), init, shadowed);
+            }
+            _ => {}
+        }
+        let mut init_inner = init;
+        loop {
+            match init_inner {
+                Expr::Paren(p) => init_inner = &p.expr,
+                Expr::Group(g) => init_inner = &g.expr,
+                _ => break,
             }
         }
+        if let Pat::Ident(pi) = pat
+            && pi.by_ref.is_none()
+            && pi.subpat.is_none()
+        {
+            let bname = pi.ident.to_string();
+            if self.type_meta.const_items.contains_key(&bname) {
+                return Ok(false);
+            }
+            if let Some(hint) = ty_hint {
+                let resolved = self.type_meta.resolve_syn_type(hint);
+                if !matches!(resolved, syn::Type::Reference(tr) if tr.mutability.is_some()) {
+                    return Ok(false);
+                }
+            }
+            if let Expr::Reference(er) = init_inner
+                && er.mutability.is_some()
+                && let Some(syntactic_root) = syntactic_place_root_ident(&er.expr)
+                && (self.env.contains_key(&syntactic_root)
+                    || self.mut_aliases.contains_key(&syntactic_root))
+            {
+                let (root, steps) = self.resolve_place_path(&er.expr)?;
+                let root_val = self
+                    .env
+                    .get(&root)
+                    .ok_or_else(|| format!("unknown `&mut` borrow target `{root}`"))?;
+                let _ = read_at_place_steps(root_val, &steps)?;
+                if bname != "_" {
+                    self.save_and_insert_mut_alias(bname, (root, steps), shadowed);
+                }
+                return Ok(true);
+            }
+            if let Expr::Path(ep) = init_inner
+                && ep.qself.is_none()
+                && ep.path.leading_colon.is_none()
+                && ep.path.segments.len() == 1
+            {
+                let src_id = ep.path.segments[0].ident.to_string();
+                if let Some(target) = self.mut_aliases.get(&src_id).cloned() {
+                    if bname != "_" {
+                        self.save_and_insert_mut_alias(bname, target, shadowed);
+                    }
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        if let (Pat::Tuple(pt), Expr::Tuple(et)) = (pat, init_inner)
+            && pt.elems.len() == et.elems.len()
+            && !pt.elems.iter().any(|p| matches!(p, Pat::Rest(_)))
+            && self.expr_contains_mut_borrow_or_alias(init_inner)
+        {
+            let elem_hints: Option<Vec<&syn::Type>> = ty_hint
+                .map(|t| self.type_meta.resolve_syn_type(t))
+                .and_then(|rt| match rt {
+                    syn::Type::Tuple(tt) if tt.elems.len() == pt.elems.len() => {
+                        Some(tt.elems.iter().collect())
+                    }
+                    _ => None,
+                });
+            for (idx, (sub_pat, sub_expr)) in pt.elems.iter().zip(et.elems.iter()).enumerate() {
+                let sub_hint = elem_hints.as_ref().map(|v| v[idx]);
+                if !self.try_bind_local_mut_aliases(sub_pat, sub_hint, sub_expr, shadowed)? {
+                    let v = self.eval_expr(sub_expr)?;
+                    self.bind_local_pattern(sub_pat, sub_hint, v, shadowed)?;
+                }
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn eval_block(&mut self, block: &syn::Block) -> Result<SpecEvalValue, SpecExecFlow> {
+        let mut shadowed: Vec<SavedShadowBinding> = Vec::new();
+        let res = self.eval_block_inner(block, &mut shadowed);
+        restore_shadowed_bindings(&mut self.env, &mut self.mut_aliases, shadowed);
         res
     }
 
     fn eval_block_inner(
         &mut self,
         block: &syn::Block,
-        shadowed: &mut Vec<(String, Option<SpecEvalValue>)>,
+        shadowed: &mut Vec<SavedShadowBinding>,
     ) -> Result<SpecEvalValue, SpecExecFlow> {
         let mut last = SpecEvalValue::Unit;
         for stmt in &block.stmts {
@@ -4730,6 +5158,17 @@ impl<'a> SpecEvalContext<'a> {
                         .init
                         .as_ref()
                         .ok_or_else(|| "uninitialized local `let` binding in spec probe".to_string())?;
+                    if init_expr.diverge.is_none()
+                        && self.try_bind_local_mut_aliases(
+                            &loc.pat,
+                            None,
+                            &init_expr.expr,
+                            shadowed,
+                        )?
+                    {
+                        last = SpecEvalValue::Unit;
+                        continue;
+                    }
                     let val = self.eval_expr(&init_expr.expr)?;
                     if let Some((_, diverge_expr)) = &init_expr.diverge {
                         let pat_inner: &Pat = match &loc.pat {
@@ -4744,8 +5183,7 @@ impl<'a> SpecEvalContext<'a> {
                         let mut bindings = Vec::new();
                         if self.try_match_pattern(pat_inner, &coerced_val, &mut bindings)? {
                             for (bname, bval) in bindings {
-                                let prev = self.env.insert(bname.clone(), bval);
-                                shadowed.push((bname, prev));
+                                self.save_and_insert_val(bname, bval, shadowed);
                             }
                         } else {
                             let _ = self.eval_expr(diverge_expr)?;
@@ -4790,11 +5228,13 @@ impl<'a> SpecEvalContext<'a> {
         }
         let mut c_ctx = SpecEvalContext {
             env: BTreeMap::new(),
+            mut_aliases: BTreeMap::new(),
             pre_env: None,
             struct_layouts: self.struct_layouts,
             enum_layouts: self.enum_layouts,
             type_meta: self.type_meta,
             external_callees: self.external_callees,
+            external_callee_ret_tys: self.external_callee_ret_tys,
             helper_fns: self.helper_fns,
             schedule: None,
             call_index: 0,
@@ -4853,7 +5293,7 @@ impl<'a> SpecEvalContext<'a> {
         pat: &Pat,
         ty_hint: Option<&syn::Type>,
         val: SpecEvalValue,
-        shadowed: &mut Vec<(String, Option<SpecEvalValue>)>,
+        shadowed: &mut Vec<SavedShadowBinding>,
     ) -> Result<(), String> {
         use quote::ToTokens;
         match pat {
@@ -4884,8 +5324,7 @@ impl<'a> SpecEvalContext<'a> {
                 }
                 let bind_name = pi.ident.to_string();
                 if bind_name != "_" {
-                    let prev = self.env.insert(bind_name.clone(), coerced);
-                    shadowed.push((bind_name, prev));
+                    self.save_and_insert_val(bind_name, coerced, shadowed);
                 }
                 Ok(())
             }
@@ -5051,11 +5490,13 @@ impl<'a> SpecEvalContext<'a> {
     fn eval_pure_pat_expr(&self, expr: &Expr) -> Result<SpecEvalValue, SpecExecFlow> {
         let mut tmp_ctx = SpecEvalContext {
             env: self.env.clone(),
+            mut_aliases: self.mut_aliases.clone(),
             pre_env: self.pre_env,
             struct_layouts: self.struct_layouts,
             enum_layouts: self.enum_layouts,
             type_meta: self.type_meta,
             external_callees: self.external_callees,
+            external_callee_ret_tys: self.external_callee_ret_tys,
             helper_fns: self.helper_fns,
             schedule: None,
             call_index: 0,
@@ -5174,13 +5615,22 @@ impl<'a> SpecEvalContext<'a> {
                 Ok(true)
             }
             Pat::Path(pp) if pp.qself.is_none() && pp.path.segments.len() >= 2 => {
-                let segs: Vec<String> = pp
+                let raw_joined = pp
                     .path
                     .segments
                     .iter()
                     .map(|s| s.ident.to_string())
-                    .collect();
-                let assoc_name = &segs[segs.len() - 1];
+                    .collect::<Vec<_>>()
+                    .join("::");
+                let stripped = strip_crate_or_self_prefix(&raw_joined);
+                let segs: Vec<&str> = stripped.split("::").filter(|s| !s.is_empty()).collect();
+                if segs.len() == 1 {
+                    if let Some(const_val) = self.eval_const_item(segs[0])? {
+                        return Ok(scrutinee.semantic_eq(&const_val)?);
+                    }
+                    return spec_trap(format!("unknown path pattern `{raw_joined}`"));
+                }
+                let assoc_name = segs[segs.len() - 1];
                 let raw_ty_name = segs[..segs.len() - 1].join("::");
                 if segs.len() == 2 {
                     let ty_name = self.type_meta.resolve_type_ident(&raw_ty_name);
@@ -5208,10 +5658,24 @@ impl<'a> SpecEvalContext<'a> {
                 let cval = eval_assoc_int_const_with_meta(&raw_ty_name, assoc_name, self.type_meta)?;
                 Ok(scrutinee.semantic_eq(&cval)?)
             }
-            Pat::TupleStruct(pts) if pts.qself.is_none() && pts.path.segments.len() == 2 => {
-                let raw_ty_name = pts.path.segments[0].ident.to_string();
+            Pat::TupleStruct(pts) if pts.qself.is_none() && pts.path.segments.len() >= 2 => {
+                let raw_joined = pts
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                let stripped = strip_crate_or_self_prefix(&raw_joined);
+                let Some((raw_ty_ref, var_ref)) = stripped.split_once("::") else {
+                    return spec_trap(format!("unsupported tuple-struct pattern `{raw_joined}`"));
+                };
+                if var_ref.contains("::") {
+                    return spec_trap(format!("unsupported tuple-struct pattern `{raw_joined}`"));
+                }
+                let raw_ty_name = raw_ty_ref.to_string();
                 let ty_name = self.type_meta.resolve_type_ident(&raw_ty_name);
-                let var_name = pts.path.segments[1].ident.to_string();
+                let var_name = var_ref.to_string();
                 let SpecEvalValue::Enum {
                     name,
                     variant_name,
@@ -5270,10 +5734,21 @@ impl<'a> SpecEvalContext<'a> {
             }
             Pat::Struct(ps) => {
                 let checkpoint = bindings.len();
-                if ps.qself.is_none() && ps.path.segments.len() == 2 {
-                    let raw_ty_name = ps.path.segments[0].ident.to_string();
+                let raw_joined = ps
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                let stripped = strip_crate_or_self_prefix(&raw_joined);
+                if ps.qself.is_none()
+                    && let Some((raw_ty_ref, var_ref)) = stripped.split_once("::")
+                    && !var_ref.contains("::")
+                {
+                    let raw_ty_name = raw_ty_ref.to_string();
                     let ty_name = self.type_meta.resolve_type_ident(&raw_ty_name);
-                    let var_name = ps.path.segments[1].ident.to_string();
+                    let var_name = var_ref.to_string();
                     if self.enum_layouts.contains_key(&ty_name) {
                         let SpecEvalValue::Enum {
                             name,
@@ -5323,12 +5798,7 @@ impl<'a> SpecEvalContext<'a> {
                 let SpecEvalValue::Struct { name, fields, .. } = scrutinee else {
                     return spec_trap("cannot match struct pattern against non-struct scrutinee");
                 };
-                let raw_pat_sname = ps
-                    .path
-                    .segments
-                    .last()
-                    .map(|s| s.ident.to_string())
-                    .unwrap_or_default();
+                let raw_pat_sname = stripped.rsplit("::").next().unwrap_or_default().to_string();
                 let pat_sname = self.type_meta.resolve_type_ident(&raw_pat_sname);
                 let val_sname = self.type_meta.resolve_type_ident(name);
                 if pat_sname != val_sname {
@@ -5403,7 +5873,7 @@ impl<'a> SpecEvalContext<'a> {
     fn eval_cond_with_let_bindings(
         &mut self,
         cond: &Expr,
-        shadowed: &mut Vec<(String, Option<SpecEvalValue>)>,
+        shadowed: &mut Vec<SavedShadowBinding>,
     ) -> Result<bool, SpecExecFlow> {
         match cond {
             Expr::Paren(p) => self.eval_cond_with_let_bindings(&p.expr, shadowed),
@@ -5415,8 +5885,7 @@ impl<'a> SpecEvalContext<'a> {
                     return Ok(false);
                 }
                 for (bname, bval) in bindings {
-                    let prev = self.env.insert(bname.clone(), bval);
-                    shadowed.push((bname, prev));
+                    self.save_and_insert_val(bname, bval, shadowed);
                 }
                 Ok(true)
             }
@@ -5446,7 +5915,11 @@ impl<'a> SpecEvalContext<'a> {
                 self.resolve_place_path(&un.expr)
             }
             Expr::Path(ep) if ep.qself.is_none() && ep.path.segments.len() == 1 => {
-                Ok((ep.path.segments[0].ident.to_string(), Vec::new()))
+                let id = ep.path.segments[0].ident.to_string();
+                if let Some((alias_root, alias_steps)) = self.mut_aliases.get(&id) {
+                    return Ok((alias_root.clone(), alias_steps.clone()));
+                }
+                Ok((id, Vec::new()))
             }
             Expr::Field(ef) => {
                 let (root, mut steps) = self.resolve_place_path(&ef.base)?;
@@ -5485,29 +5958,55 @@ impl<'a> SpecEvalContext<'a> {
         pat: &Pat,
         orig_elem: SpecEvalValue,
     ) -> Result<SpecEvalValue, String> {
+        self.reconstruct_mut_iter_elem_inner(pat, orig_elem, false)
+    }
+
+    fn reconstruct_mut_iter_elem_inner(
+        &self,
+        pat: &Pat,
+        orig_elem: SpecEvalValue,
+        under_deref_pat: bool,
+    ) -> Result<SpecEvalValue, String> {
         match pat {
-            // `Pat::Reference` (e.g. `for &mut x in &mut arr` or `for &x in &mut arr`)
-            // copies a `Copy` element by value in Rust and does NOT write back!
-            Pat::Wild(_)
-            | Pat::Rest(_)
-            | Pat::Lit(_)
-            | Pat::Range(_)
-            | Pat::Path(_)
-            | Pat::Reference(_) => Ok(orig_elem),
-            Pat::Paren(pp) => self.reconstruct_mut_iter_elem(&pp.pat, orig_elem),
-            Pat::Type(pt) => self.reconstruct_mut_iter_elem(&pt.pat, orig_elem),
+            Pat::Wild(_) | Pat::Rest(_) | Pat::Lit(_) | Pat::Range(_) | Pat::Path(_) => {
+                Ok(orig_elem)
+            }
+            // Crossing `&pat` / `&mut pat` dereferences the `&mut T` iterator item
+            // to place `T`: plain `Ident` bindings under it copy `T` by value,
+            // whereas `ref mut r` (`by_ref + mutability`) reborrows `T` mutably!
+            Pat::Reference(pr) => self.reconstruct_mut_iter_elem_inner(&pr.pat, orig_elem, true),
+            Pat::Paren(pp) => {
+                self.reconstruct_mut_iter_elem_inner(&pp.pat, orig_elem, under_deref_pat)
+            }
+            Pat::Type(pt) => {
+                self.reconstruct_mut_iter_elem_inner(&pt.pat, orig_elem, under_deref_pat)
+            }
             Pat::Ident(pi) => {
                 let name = pi.ident.to_string();
                 if self.type_meta.const_items.contains_key(&name) {
                     return Ok(orig_elem);
                 }
-                if name == "_" {
-                    if let Some((_, sub)) = &pi.subpat {
-                        return self.reconstruct_mut_iter_elem(sub, orig_elem);
+                let from_sub = match &pi.subpat {
+                    Some((_, sub)) => {
+                        self.reconstruct_mut_iter_elem_inner(sub, orig_elem.clone(), under_deref_pat)?
                     }
-                    return Ok(orig_elem);
+                    None => orig_elem.clone(),
+                };
+                let is_shared_ref = pi.by_ref.is_some() && pi.mutability.is_none();
+                let is_mut_place_ident = name != "_"
+                    && !is_shared_ref
+                    && (!under_deref_pat || (pi.by_ref.is_some() && pi.mutability.is_some()));
+                if !is_mut_place_ident {
+                    return Ok(from_sub);
                 }
-                Ok(self.env.get(&name).cloned().unwrap_or(orig_elem))
+                let Some(self_val) = self.env.get(&name).cloned() else {
+                    return Ok(from_sub);
+                };
+                if pi.subpat.is_none() || !self_val.semantic_eq(&orig_elem).unwrap_or(false) {
+                    Ok(self_val)
+                } else {
+                    Ok(from_sub)
+                }
             }
             Pat::Tuple(pt) => {
                 let SpecEvalValue::Tuple {
@@ -5523,17 +6022,29 @@ impl<'a> SpecEvalContext<'a> {
                     let prefix = &pat_elems[..rest_pos];
                     let suffix = &pat_elems[rest_pos + 1..];
                     for (idx, sp) in prefix.iter().enumerate() {
-                        elems[idx] = self.reconstruct_mut_iter_elem(sp, elems[idx].clone())?;
+                        elems[idx] = self.reconstruct_mut_iter_elem_inner(
+                            sp,
+                            elems[idx].clone(),
+                            under_deref_pat,
+                        )?;
                     }
                     let tail_start = elems.len().saturating_sub(suffix.len());
                     for (off, sp) in suffix.iter().enumerate() {
                         let idx = tail_start + off;
-                        elems[idx] = self.reconstruct_mut_iter_elem(sp, elems[idx].clone())?;
+                        elems[idx] = self.reconstruct_mut_iter_elem_inner(
+                            sp,
+                            elems[idx].clone(),
+                            under_deref_pat,
+                        )?;
                     }
                 } else {
                     for (idx, sp) in pat_elems.iter().enumerate() {
                         if idx < elems.len() {
-                            elems[idx] = self.reconstruct_mut_iter_elem(sp, elems[idx].clone())?;
+                            elems[idx] = self.reconstruct_mut_iter_elem_inner(
+                                sp,
+                                elems[idx].clone(),
+                                under_deref_pat,
+                            )?;
                         }
                     }
                 }
@@ -5563,7 +6074,11 @@ impl<'a> SpecEvalContext<'a> {
                     if let Member::Named(fid) = &fp.member {
                         let fname = fid.to_string();
                         if let Some(prev_f) = fields.get(&fname).cloned() {
-                            let next_f = self.reconstruct_mut_iter_elem(&fp.pat, prev_f)?;
+                            let next_f = self.reconstruct_mut_iter_elem_inner(
+                                &fp.pat,
+                                prev_f,
+                                under_deref_pat,
+                            )?;
                             fields.insert(fname, next_f);
                         }
                     }
@@ -5598,17 +6113,29 @@ impl<'a> SpecEvalContext<'a> {
                     let prefix = &pat_elems[..rest_pos];
                     let suffix = &pat_elems[rest_pos + 1..];
                     for (idx, sp) in prefix.iter().enumerate() {
-                        elems[idx] = self.reconstruct_mut_iter_elem(sp, elems[idx].clone())?;
+                        elems[idx] = self.reconstruct_mut_iter_elem_inner(
+                            sp,
+                            elems[idx].clone(),
+                            under_deref_pat,
+                        )?;
                     }
                     let tail_start = elems.len().saturating_sub(suffix.len());
                     for (off, sp) in suffix.iter().enumerate() {
                         let idx = tail_start + off;
-                        elems[idx] = self.reconstruct_mut_iter_elem(sp, elems[idx].clone())?;
+                        elems[idx] = self.reconstruct_mut_iter_elem_inner(
+                            sp,
+                            elems[idx].clone(),
+                            under_deref_pat,
+                        )?;
                     }
                 } else {
                     for (idx, sp) in pat_elems.iter().enumerate() {
                         if idx < elems.len() {
-                            elems[idx] = self.reconstruct_mut_iter_elem(sp, elems[idx].clone())?;
+                            elems[idx] = self.reconstruct_mut_iter_elem_inner(
+                                sp,
+                                elems[idx].clone(),
+                                under_deref_pat,
+                            )?;
                         }
                     }
                 }
@@ -5798,23 +6325,35 @@ impl<'a> SpecEvalContext<'a> {
                     match cond_res {
                         Ok(true) => {}
                         Ok(false) => {
-                            restore_shadowed_env(&mut self.env, cond_shadowed);
+                            restore_shadowed_bindings(
+                                &mut self.env,
+                                &mut self.mut_aliases,
+                                cond_shadowed,
+                            );
                             break;
                         }
                         Err(flow) => {
-                            restore_shadowed_env(&mut self.env, cond_shadowed);
+                            restore_shadowed_bindings(
+                                &mut self.env,
+                                &mut self.mut_aliases,
+                                cond_shadowed,
+                            );
                             return Err(flow);
                         }
                     }
                     iters += 1;
                     if iters > MAX_SPEC_LOOP_ITERS {
-                        restore_shadowed_env(&mut self.env, cond_shadowed);
+                        restore_shadowed_bindings(
+                            &mut self.env,
+                            &mut self.mut_aliases,
+                            cond_shadowed,
+                        );
                         return spec_trap(format!(
                             "`while` loop exceeded bounded step budget ({MAX_SPEC_LOOP_ITERS} iterations)"
                         ));
                     }
                     let body_res = self.eval_block(&ew.body);
-                    restore_shadowed_env(&mut self.env, cond_shadowed);
+                    restore_shadowed_bindings(&mut self.env, &mut self.mut_aliases, cond_shadowed);
                     match body_res {
                         Ok(_) | Err(SpecExecFlow::Continue) => {}
                         Err(SpecExecFlow::Break(SpecEvalValue::Unit)) => break,
@@ -5894,11 +6433,19 @@ impl<'a> SpecEvalContext<'a> {
                         if let Err(e) =
                             self.bind_local_pattern(&efl.pat, None, cur.clone(), &mut iter_shadowed)
                         {
-                            restore_shadowed_env(&mut self.env, iter_shadowed);
+                            restore_shadowed_bindings(
+                                &mut self.env,
+                                &mut self.mut_aliases,
+                                iter_shadowed,
+                            );
                             return spec_trap(e);
                         }
                         let body_res = self.eval_block(&efl.body);
-                        restore_shadowed_env(&mut self.env, iter_shadowed);
+                        restore_shadowed_bindings(
+                            &mut self.env,
+                            &mut self.mut_aliases,
+                            iter_shadowed,
+                        );
                         match body_res {
                             Ok(_) | Err(SpecExecFlow::Continue) => {}
                             Err(SpecExecFlow::Break(SpecEvalValue::Unit)) => break,
@@ -5928,9 +6475,25 @@ impl<'a> SpecEvalContext<'a> {
                     return Ok(SpecEvalValue::Unit);
                 }
 
-                if let Expr::Reference(er) = iter_target
-                    && er.mutability.is_some()
-                    && let Ok((root_name, base_steps)) = self.resolve_place_path(&er.expr)
+                let mut_iter_place: Option<(String, Vec<SpecPlaceStep>)> =
+                    if let Expr::Reference(er) = iter_target
+                        && er.mutability.is_some()
+                        && let Some(sroot) = syntactic_place_root_ident(&er.expr)
+                        && (self.env.contains_key(&sroot) || self.mut_aliases.contains_key(&sroot))
+                    {
+                        Some(self.resolve_place_path(&er.expr)?)
+                    } else if let Expr::Path(ep) = iter_target
+                        && ep.qself.is_none()
+                        && ep.path.leading_colon.is_none()
+                        && ep.path.segments.len() == 1
+                    {
+                        self.mut_aliases
+                            .get(&ep.path.segments[0].ident.to_string())
+                            .cloned()
+                    } else {
+                        None
+                    };
+                if let Some((root_name, base_steps)) = mut_iter_place
                     && self.env.contains_key(&root_name)
                 {
                     let cur_root = self
@@ -5961,12 +6524,20 @@ impl<'a> SpecEvalContext<'a> {
                         if let Err(e) =
                             self.bind_local_pattern(&efl.pat, None, elem.clone(), &mut iter_shadowed)
                         {
-                            restore_shadowed_env(&mut self.env, iter_shadowed);
+                            restore_shadowed_bindings(
+                                &mut self.env,
+                                &mut self.mut_aliases,
+                                iter_shadowed,
+                            );
                             return spec_trap(e);
                         }
                         let body_res = self.eval_block(&efl.body);
                         let wb_res = self.reconstruct_mut_iter_elem(&efl.pat, elem);
-                        restore_shadowed_env(&mut self.env, iter_shadowed);
+                        restore_shadowed_bindings(
+                            &mut self.env,
+                            &mut self.mut_aliases,
+                            iter_shadowed,
+                        );
                         let updated_elem = wb_res.map_err(SpecExecFlow::Trap)?;
                         let cur_root_after = self
                             .env
@@ -6008,11 +6579,15 @@ impl<'a> SpecEvalContext<'a> {
                     let mut iter_shadowed = Vec::new();
                     if let Err(e) = self.bind_local_pattern(&efl.pat, None, elem, &mut iter_shadowed)
                     {
-                        restore_shadowed_env(&mut self.env, iter_shadowed);
+                        restore_shadowed_bindings(
+                            &mut self.env,
+                            &mut self.mut_aliases,
+                            iter_shadowed,
+                        );
                         return spec_trap(e);
                     }
                     let body_res = self.eval_block(&efl.body);
-                    restore_shadowed_env(&mut self.env, iter_shadowed);
+                    restore_shadowed_bindings(&mut self.env, &mut self.mut_aliases, iter_shadowed);
                     match body_res {
                         Ok(_) | Err(SpecExecFlow::Continue) => {}
                         Err(SpecExecFlow::Break(SpecEvalValue::Unit)) => break,
@@ -6037,43 +6612,40 @@ impl<'a> SpecEvalContext<'a> {
                     }
                     let mut shadowed = Vec::with_capacity(bindings.len());
                     for (bname, bval) in bindings {
-                        let prev = self.env.insert(bname.clone(), bval);
-                        shadowed.push((bname, prev));
+                        self.save_and_insert_val(bname, bval, &mut shadowed);
                     }
-                    let restore_env =
-                        |env: &mut BTreeMap<String, SpecEvalValue>,
-                         saved: Vec<(String, Option<SpecEvalValue>)>| {
-                            for (k, prev) in saved.into_iter().rev() {
-                                match prev {
-                                    Some(v) => {
-                                        env.insert(k, v);
-                                    }
-                                    None => {
-                                        env.remove(&k);
-                                    }
-                                }
-                            }
-                        };
                     if let Some((_, guard_expr)) = &arm.guard {
                         let guard_res = self.eval_expr(guard_expr);
                         match guard_res {
                             Ok(SpecEvalValue::Bool(true)) => {}
                             Ok(SpecEvalValue::Bool(false)) => {
-                                restore_env(&mut self.env, shadowed);
+                                restore_shadowed_bindings(
+                                    &mut self.env,
+                                    &mut self.mut_aliases,
+                                    shadowed,
+                                );
                                 continue;
                             }
                             Ok(other) => {
-                                restore_env(&mut self.env, shadowed);
+                                restore_shadowed_bindings(
+                                    &mut self.env,
+                                    &mut self.mut_aliases,
+                                    shadowed,
+                                );
                                 return spec_trap(format!("non-boolean `match` guard: {other:?}"));
                             }
                             Err(flow) => {
-                                restore_env(&mut self.env, shadowed);
+                                restore_shadowed_bindings(
+                                    &mut self.env,
+                                    &mut self.mut_aliases,
+                                    shadowed,
+                                );
                                 return Err(flow);
                             }
                         }
                     }
                     let body_res = self.eval_expr(&arm.body);
-                    restore_env(&mut self.env, shadowed);
+                    restore_shadowed_bindings(&mut self.env, &mut self.mut_aliases, shadowed);
                     return body_res;
                 }
                 spec_trap("non-exhaustive `match` expression: no arm matched scrutinee")
@@ -6128,23 +6700,40 @@ impl<'a> SpecEvalContext<'a> {
                 )),
             },
             Expr::Path(ep) if ep.qself.is_none() => {
-                if ep.path.segments.len() == 1 {
+                if ep.path.leading_colon.is_none() && ep.path.segments.len() == 1 {
                     let id = ep.path.segments[0].ident.to_string();
                     if let Some(val) = self.env.get(&id) {
                         return Ok(val.clone());
+                    }
+                    if let Some((alias_root, alias_steps)) = self.mut_aliases.get(&id) {
+                        let root_val = self.env.get(alias_root).ok_or_else(|| {
+                            format!("dangling `&mut` alias root `{alias_root}` for `{id}`")
+                        })?;
+                        return Ok(read_at_place_steps(root_val, alias_steps)?);
                     }
                     if let Some(const_val) = self.eval_const_item(&id)? {
                         return Ok(const_val);
                     }
                     Err(SpecExecFlow::Trap(format!("unknown variable `{id}`")))
-                } else if ep.path.segments.len() >= 2 {
-                    let segs: Vec<String> = ep
+                } else if !ep.path.segments.is_empty() {
+                    let raw_joined = ep
                         .path
                         .segments
                         .iter()
                         .map(|s| s.ident.to_string())
-                        .collect();
-                    let assoc = segs[segs.len() - 1].clone();
+                        .collect::<Vec<_>>()
+                        .join("::");
+                    let stripped = strip_crate_or_self_prefix(&raw_joined);
+                    let segs: Vec<&str> = stripped.split("::").filter(|s| !s.is_empty()).collect();
+                    if segs.len() == 1 {
+                        if let Some(const_val) = self.eval_const_item(segs[0])? {
+                            return Ok(const_val);
+                        }
+                        return Err(SpecExecFlow::Trap(format!(
+                            "unknown path item `{raw_joined}`"
+                        )));
+                    }
+                    let assoc = segs[segs.len() - 1].to_string();
                     let raw_ty = segs[..segs.len() - 1].join("::");
                     if segs.len() == 2 {
                         let ty = self.type_meta.resolve_type_ident(&raw_ty);
@@ -6320,10 +6909,21 @@ impl<'a> SpecEvalContext<'a> {
                 Ok(elems[idx].clone())
             }
             Expr::Struct(es) => {
-                if es.qself.is_none() && es.path.segments.len() == 2 {
-                    let raw_enum = es.path.segments[0].ident.to_string();
+                let raw_joined = es
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                let stripped = strip_crate_or_self_prefix(&raw_joined);
+                if es.qself.is_none()
+                    && let Some((raw_enum_ref, var_ref)) = stripped.split_once("::")
+                    && !var_ref.contains("::")
+                {
+                    let raw_enum = raw_enum_ref.to_string();
                     let enum_name = self.type_meta.resolve_type_ident(&raw_enum);
-                    let var_name = es.path.segments[1].ident.to_string();
+                    let var_name = var_ref.to_string();
                     if let Some(elayout @ LayoutSpec::Enum { total_size, variants, .. }) =
                         self.enum_layouts.get(&enum_name)
                     {
@@ -6404,12 +7004,7 @@ impl<'a> SpecEvalContext<'a> {
                         });
                     }
                 }
-                let raw_sname = es
-                    .path
-                    .segments
-                    .last()
-                    .map(|s| s.ident.to_string())
-                    .unwrap_or_default();
+                let raw_sname = stripped.rsplit("::").next().unwrap_or_default().to_string();
                 let sname = self.type_meta.resolve_type_ident(&raw_sname);
                 let layout = self
                     .struct_layouts
@@ -6484,6 +7079,58 @@ impl<'a> SpecEvalContext<'a> {
                 })
             }
             Expr::Assign(ea) => {
+                let mut lhs_inner: &Expr = &ea.left;
+                loop {
+                    match lhs_inner {
+                        Expr::Paren(p) => lhs_inner = &p.expr,
+                        Expr::Group(g) => lhs_inner = &g.expr,
+                        _ => break,
+                    }
+                }
+                if let Expr::Path(ep) = lhs_inner
+                    && ep.qself.is_none()
+                    && ep.path.leading_colon.is_none()
+                    && ep.path.segments.len() == 1
+                {
+                    let lhs_id = ep.path.segments[0].ident.to_string();
+                    if self.mut_aliases.contains_key(&lhs_id) {
+                        let mut rhs_inner: &Expr = &ea.right;
+                        loop {
+                            match rhs_inner {
+                                Expr::Paren(p) => rhs_inner = &p.expr,
+                                Expr::Group(g) => rhs_inner = &g.expr,
+                                _ => break,
+                            }
+                        }
+                        if let Expr::Reference(er) = rhs_inner
+                            && er.mutability.is_some()
+                            && let Some(sroot) = syntactic_place_root_ident(&er.expr)
+                            && (self.env.contains_key(&sroot)
+                                || self.mut_aliases.contains_key(&sroot))
+                        {
+                            let (root, steps) = self.resolve_place_path(&er.expr)?;
+                            let root_val = self
+                                .env
+                                .get(&root)
+                                .ok_or_else(|| format!("unknown `&mut` borrow target `{root}`"))?;
+                            let _ = read_at_place_steps(root_val, &steps)?;
+                            self.mut_aliases.insert(lhs_id, (root, steps));
+                            return Ok(SpecEvalValue::Unit);
+                        }
+                        if let Expr::Path(rp) = rhs_inner
+                            && rp.qself.is_none()
+                            && rp.path.leading_colon.is_none()
+                            && rp.path.segments.len() == 1
+                            && let Some(target) = self
+                                .mut_aliases
+                                .get(&rp.path.segments[0].ident.to_string())
+                                .cloned()
+                        {
+                            self.mut_aliases.insert(lhs_id, target);
+                            return Ok(SpecEvalValue::Unit);
+                        }
+                    }
+                }
                 let rhs = self.eval_expr(&ea.right)?;
                 self.assign_place(&ea.left, rhs)?;
                 Ok(SpecEvalValue::Unit)
@@ -6494,11 +7141,19 @@ impl<'a> SpecEvalContext<'a> {
                 match cond_res {
                     Ok(true) => {
                         let then_res = self.eval_block(&ei.then_branch);
-                        restore_shadowed_env(&mut self.env, cond_shadowed);
+                        restore_shadowed_bindings(
+                            &mut self.env,
+                            &mut self.mut_aliases,
+                            cond_shadowed,
+                        );
                         then_res
                     }
                     Ok(false) => {
-                        restore_shadowed_env(&mut self.env, cond_shadowed);
+                        restore_shadowed_bindings(
+                            &mut self.env,
+                            &mut self.mut_aliases,
+                            cond_shadowed,
+                        );
                         if let Some((_, else_expr)) = &ei.else_branch {
                             self.eval_expr(else_expr)
                         } else {
@@ -6506,7 +7161,11 @@ impl<'a> SpecEvalContext<'a> {
                         }
                     }
                     Err(flow) => {
-                        restore_shadowed_env(&mut self.env, cond_shadowed);
+                        restore_shadowed_bindings(
+                            &mut self.env,
+                            &mut self.mut_aliases,
+                            cond_shadowed,
+                        );
                         Err(flow)
                     }
                 }
@@ -6697,33 +7356,15 @@ impl<'a> SpecEvalContext<'a> {
             for a in &ec.args {
                 evaled_args.push(self.eval_expr(a)?);
             }
-            let mut shadowed: Vec<(String, Option<SpecEvalValue>)> = Vec::new();
+            let mut shadowed: Vec<SavedShadowBinding> = Vec::new();
             for (pat, val) in closure.inputs.iter().zip(evaled_args) {
                 if let Err(e) = self.bind_local_pattern(pat, None, val, &mut shadowed) {
-                    for (k, prev) in shadowed.into_iter().rev() {
-                        match prev {
-                            Some(v) => {
-                                self.env.insert(k, v);
-                            }
-                            None => {
-                                self.env.remove(&k);
-                            }
-                        }
-                    }
+                    restore_shadowed_bindings(&mut self.env, &mut self.mut_aliases, shadowed);
                     return spec_trap(e);
                 }
             }
             let body_res = self.eval_expr(&closure.body);
-            for (k, prev) in shadowed.into_iter().rev() {
-                match prev {
-                    Some(v) => {
-                        self.env.insert(k, v);
-                    }
-                    None => {
-                        self.env.remove(&k);
-                    }
-                }
-            }
+            restore_shadowed_bindings(&mut self.env, &mut self.mut_aliases, shadowed);
             let mut out_val = match body_res {
                 Ok(v) | Err(SpecExecFlow::Return(v)) => v,
                 Err(flow) => return spec_trap(flow.into_trap_detail("closure body")),
@@ -6734,7 +7375,7 @@ impl<'a> SpecEvalContext<'a> {
             return Ok(out_val);
         }
 
-        let callee_name = match target_expr {
+        let raw_callee_name = match target_expr {
             Expr::Path(ep) if ep.qself.is_none() => ep
                 .path
                 .segments
@@ -6749,6 +7390,7 @@ impl<'a> SpecEvalContext<'a> {
                 ));
             }
         };
+        let callee_name = strip_crate_or_self_prefix(&raw_callee_name).to_string();
         if callee_name == "old" {
             let Some(pre) = self.pre_env else {
                 return spec_trap("`old(...)` is only valid inside `ensures` postconditions");
@@ -6758,11 +7400,13 @@ impl<'a> SpecEvalContext<'a> {
             }
             let mut sub_ctx = SpecEvalContext {
                 env: pre.clone(),
+                mut_aliases: BTreeMap::new(),
                 pre_env: None,
                 struct_layouts: self.struct_layouts,
                 enum_layouts: self.enum_layouts,
                 type_meta: self.type_meta,
                 external_callees: self.external_callees,
+                external_callee_ret_tys: self.external_callee_ret_tys,
                 helper_fns: self.helper_fns,
                 schedule: None,
                 call_index: 0,
@@ -6889,11 +7533,13 @@ impl<'a> SpecEvalContext<'a> {
             }
             let mut sub_ctx = SpecEvalContext {
                 env: fn_env,
+                mut_aliases: BTreeMap::new(),
                 pre_env: None,
                 struct_layouts: self.struct_layouts,
                 enum_layouts: self.enum_layouts,
                 type_meta: self.type_meta,
                 external_callees: self.external_callees,
+                external_callee_ret_tys: self.external_callee_ret_tys,
                 helper_fns: self.helper_fns,
                 schedule: self.schedule.as_deref_mut(),
                 call_index: self.call_index,
@@ -7002,20 +7648,33 @@ impl<'a> SpecEvalContext<'a> {
             .external_callees
             .get(&callee_name)
             .or_else(|| self.external_callees.get(short_callee));
+        let declared_ret_ty = self
+            .external_callee_ret_tys
+            .get(&callee_name)
+            .or_else(|| self.external_callee_ret_tys.get(short_callee));
         let effective_sched_callee =
             resolve_sched_callee_key(sched_ref, &callee_name, short_callee);
-        let sched_expected_sz = sched_ref.expected_return_size(&effective_sched_callee);
+        let sched_expected_sz = sched_ref
+            .expected_return_size(&effective_sched_callee)
+            .or_else(|| sched_ref.expected_return_size(&callee_name))
+            .or_else(|| sched_ref.expected_return_size(short_callee));
         match sched_ref.next_action(&effective_sched_callee, idx) {
             crate::instrument::EnvAction::PanicOnCall(p_idx) => {
                 spec_trap(format!("scheduled panic on `{callee_name}` at call {p_idx}"))
             }
             crate::instrument::EnvAction::ReturnBytes(bytes) => {
-                if let Err(e) = sched_ref.validate_callee_payload(&effective_sched_callee, &bytes) {
+                if let Err(e) = validate_sched_payload_for_callee(
+                    sched_ref,
+                    &effective_sched_callee,
+                    &callee_name,
+                    short_callee,
+                    &bytes,
+                ) {
                     return spec_trap(format!(
                         "EnvSchedule payload validation failed for `{callee_name}`: {e}"
                     ));
                 }
-                if let Some(ext_layout) = declared_ret_layout {
+                let mut decoded_val = if let Some(ext_layout) = declared_ret_layout {
                     let ext_sz = ext_layout.total_size();
                     if bytes.len() != ext_sz {
                         return spec_trap(format!(
@@ -7024,11 +7683,11 @@ impl<'a> SpecEvalContext<'a> {
                         ));
                     }
                     if ext_sz == 0 {
-                        Ok(SpecEvalValue::Unit)
+                        SpecEvalValue::Unit
                     } else {
-                        Ok(SpecEvalValue::from_layout_bytes(ext_layout, &bytes).map_err(|e| {
+                        SpecEvalValue::from_layout_bytes(ext_layout, &bytes).map_err(|e| {
                             format!("invalid EnvSchedule return bytes for `{callee_name}`: {e}")
-                        })?)
+                        })?
                     }
                 } else {
                     let sz = sched_expected_sz.unwrap_or(bytes.len());
@@ -7039,14 +7698,21 @@ impl<'a> SpecEvalContext<'a> {
                         ));
                     }
                     if sz == 0 {
-                        Ok(SpecEvalValue::Unit)
+                        SpecEvalValue::Unit
                     } else {
                         let layout = LayoutSpec::Scalar(ScalarLayout::unsigned(sz));
-                        Ok(SpecEvalValue::from_layout_bytes(&layout, &bytes).map_err(|e| {
+                        SpecEvalValue::from_layout_bytes(&layout, &bytes).map_err(|e| {
                             format!("invalid EnvSchedule return bytes for `{callee_name}`: {e}")
-                        })?)
+                        })?
                     }
+                };
+                if let Some(ret_syn_ty) = declared_ret_ty {
+                    decoded_val = coerce_value_to_syn_type(decoded_val, ret_syn_ty, self.type_meta)
+                        .map_err(|e| {
+                            format!("invalid EnvSchedule return value for `{callee_name}`: {e}")
+                        })?;
                 }
+                Ok(decoded_val)
             }
             crate::instrument::EnvAction::PassThrough => spec_trap(format!(
                 "EnvSchedule returned PassThrough (no scheduled payload) for external call `{callee_name}`"
@@ -7369,6 +8035,130 @@ fn coerce_value_to_syn_type(
             })
         }
         other => {
+            if let SpecEvalValue::Struct {
+                name,
+                layout,
+                raw_bytes,
+                mut fields,
+            } = val
+            {
+                let resolved_sname = meta.resolve_type_ident(&name);
+                if let Some(fmap) = meta
+                    .struct_syn_field_tys
+                    .get(&resolved_sname)
+                    .or_else(|| meta.struct_syn_field_tys.get(&name))
+                {
+                    for (fname, fty) in fmap {
+                        if let Some(prev_v) = fields.remove(fname) {
+                            let next_v = coerce_value_to_syn_type(prev_v, fty, meta)?;
+                            fields.insert(fname.clone(), next_v);
+                        }
+                    }
+                    let prov = SpecEvalValue::Struct {
+                        name: name.clone(),
+                        layout: layout.clone(),
+                        raw_bytes,
+                        fields: fields.clone(),
+                    };
+                    let new_raw = prov.to_layout_bytes();
+                    return Ok(SpecEvalValue::Struct {
+                        name,
+                        layout,
+                        raw_bytes: new_raw,
+                        fields,
+                    });
+                }
+                return Ok(SpecEvalValue::Struct {
+                    name,
+                    layout,
+                    raw_bytes,
+                    fields,
+                });
+            }
+            if let SpecEvalValue::Enum {
+                name,
+                layout,
+                variant_name,
+                discriminant,
+                payload: Some(pv),
+                raw_bytes,
+            } = val
+            {
+                let resolved_ename = meta.resolve_type_ident(&name);
+                let coerced_payload = if let Some(vsyn) = meta
+                    .enum_variants
+                    .get(&resolved_ename)
+                    .or_else(|| meta.enum_variants.get(&name))
+                    .and_then(|vm| vm.get(&variant_name))
+                {
+                    match vsyn {
+                        EnumVariantSyntax::Unit => *pv,
+                        EnumVariantSyntax::Tuple(ftys) => {
+                            if ftys.len() == 1
+                                && let Ok(pty) = syn::parse_str::<syn::Type>(&ftys[0])
+                            {
+                                coerce_value_to_syn_type(*pv, &pty, meta)?
+                            } else if let Ok(tup_ty) =
+                                syn::parse_str::<syn::Type>(&format!("({},)", ftys.join(", ")))
+                            {
+                                coerce_value_to_syn_type(*pv, &tup_ty, meta)?
+                            } else {
+                                *pv
+                            }
+                        }
+                        EnumVariantSyntax::Struct(sfields) => match *pv {
+                            SpecEvalValue::Struct {
+                                name: ps_name,
+                                layout: ps_layout,
+                                raw_bytes: ps_raw,
+                                fields: mut ps_fields,
+                            } => {
+                                for (fname, fty_str) in sfields {
+                                    if let Ok(fty) = syn::parse_str::<syn::Type>(fty_str)
+                                        && let Some(prev_f) = ps_fields.remove(fname)
+                                    {
+                                        let next_f = coerce_value_to_syn_type(prev_f, &fty, meta)?;
+                                        ps_fields.insert(fname.clone(), next_f);
+                                    }
+                                }
+                                let prov = SpecEvalValue::Struct {
+                                    name: ps_name.clone(),
+                                    layout: ps_layout.clone(),
+                                    raw_bytes: ps_raw,
+                                    fields: ps_fields.clone(),
+                                };
+                                let new_ps_raw = prov.to_layout_bytes();
+                                SpecEvalValue::Struct {
+                                    name: ps_name,
+                                    layout: ps_layout,
+                                    raw_bytes: new_ps_raw,
+                                    fields: ps_fields,
+                                }
+                            }
+                            other_pv => other_pv,
+                        },
+                    }
+                } else {
+                    *pv
+                };
+                let prov_enum = SpecEvalValue::Enum {
+                    name: name.clone(),
+                    layout: layout.clone(),
+                    variant_name: variant_name.clone(),
+                    discriminant,
+                    payload: Some(Box::new(coerced_payload.clone())),
+                    raw_bytes,
+                };
+                let new_raw = prov_enum.to_layout_bytes();
+                return Ok(SpecEvalValue::Enum {
+                    name,
+                    layout,
+                    variant_name,
+                    discriminant,
+                    payload: Some(Box::new(coerced_payload)),
+                    raw_bytes: new_raw,
+                });
+            }
             let ty_str = other.to_token_stream().to_string().replace(' ', "");
             let is_nonzero = meta.parse_nonzero_underlying_prim(&ty_str).is_some();
             let coerced = if let Some((sz, sig)) = meta.parse_scalar_type(&ty_str)
@@ -8416,6 +9206,25 @@ impl SpecContractOracleProbe {
 
         let type_meta = SpecTypeMetadata::from_type_defs(&self.type_defs_rust);
         let const_names = type_meta.const_name_set();
+        let mut shared_helper_param_indices: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+        if !self.type_defs_rust.trim().is_empty()
+            && let Ok(parsed_defs) = syn::parse_file(&self.type_defs_rust)
+        {
+            for item in parsed_defs.items {
+                if let syn::Item::Fn(f) = item {
+                    let mut idxs = BTreeSet::new();
+                    for (idx, fn_arg) in f.sig.inputs.iter().enumerate() {
+                        if let syn::FnArg::Typed(pat_ty) = fn_arg
+                            && let syn::Type::Reference(tr) = type_meta.resolve_syn_type(&pat_ty.ty)
+                            && tr.mutability.is_none()
+                        {
+                            idxs.insert(idx);
+                        }
+                    }
+                    shared_helper_param_indices.insert(f.sig.ident.to_string(), idxs);
+                }
+            }
+        }
 
         let mut needed_pre_params = BTreeSet::new();
         let mut lazy_old_closures: Vec<LazyOldClosureSpec> = Vec::new();
@@ -8427,6 +9236,7 @@ impl SpecContractOracleProbe {
                 &mut expr,
                 &self.params,
                 &const_names,
+                &shared_helper_param_indices,
                 &mut needed_pre_params,
                 &mut lazy_old_closures,
             );
@@ -8610,7 +9420,7 @@ impl SpecContractOracleProbe {
             out.push_str(t);
             out.push('\n');
         }
-        if !self.requires.is_empty() {
+        for (req_idx, req) in self.requires.iter().enumerate() {
             out.push_str("    #[allow(unused_mut, unused_variables)]\n    {\n");
             if !self.external_callees.is_empty() {
                 out.push_str("        let _req_pure_guard = __AnnealPureSpecGuard::enter();\n");
@@ -8623,26 +9433,31 @@ impl SpecContractOracleProbe {
                          let _ = &{};\n",
                         p.name, p.rust_ty, p.name, p.name, p.rust_ty, p.name, p.name
                     ));
+                } else {
+                    out.push_str(&format!(
+                        "        let {}: {} = {}.clone();\n        \
+                         let _ = &{};\n",
+                        p.name, p.rust_ty, p.name, p.name
+                    ));
                 }
             }
-            for (req_idx, req) in self.requires.iter().enumerate() {
-                out.push_str(&format!(
-                    "        let __anneal_req_{req_idx}: bool = {};\n        \
-                     if !__anneal_req_{req_idx} {{\n            \
-                         return SpecProbeOutcome::VacuouslyFiltered;\n        \
-                     }}\n",
-                    req.rust_expr
-                ));
-            }
-            out.push_str("    }\n");
+            out.push_str(&format!(
+                "        let __anneal_req_{req_idx}: bool = {};\n        \
+                 if !__anneal_req_{req_idx} {{\n            \
+                     return SpecProbeOutcome::VacuouslyFiltered;\n        \
+                 }}\n    }}\n",
+                req.rust_expr
+            ));
         }
         for p in &self.params {
             if needed_pre_params.contains(&p.name) {
                 if p.is_mut_ref {
                     out.push_str(&format!(
                         "    let __anneal_pre_{}: {} = (*{}).clone();\n    \
-                         let _ = &__anneal_pre_{};\n",
-                        p.name, p.rust_ty, p.name, p.name
+                         let __anneal_pre_ref_{}: &{} = &__anneal_pre_{};\n    \
+                         let _ = &__anneal_pre_{};\n    \
+                         let _ = __anneal_pre_ref_{};\n",
+                        p.name, p.rust_ty, p.name, p.name, p.rust_ty, p.name, p.name, p.name
                     ));
                 } else {
                     out.push_str(&format!(
@@ -8686,7 +9501,7 @@ impl SpecContractOracleProbe {
             out.push_str("    let _ens_pure_guard = __AnnealPureSpecGuard::enter();\n");
         }
         for spec in &lazy_old_closures {
-            if spec.referenced_mut_params.is_empty() {
+            if spec.mutated_mut_params.is_empty() {
                 out.push_str(&format!(
                     "    let {} = || {{ {} }};\n",
                     spec.var_name, spec.inner_src
@@ -8694,7 +9509,7 @@ impl SpecContractOracleProbe {
             } else {
                 let mut local_rebinds = String::new();
                 for p in &self.params {
-                    if p.is_mut_ref && spec.referenced_mut_params.contains(&p.name) {
+                    if p.is_mut_ref && spec.mutated_mut_params.contains(&p.name) {
                         local_rebinds.push_str(&format!(
                             "let mut __anneal_pre_local_{}: {} = __anneal_pre_{}.clone(); \
                              let __anneal_pre_ref_{}: &mut {} = &mut __anneal_pre_local_{}; \
@@ -8711,11 +9526,28 @@ impl SpecContractOracleProbe {
             }
         }
         for (ens_idx, (label, expr_src)) in rewritten_ensures.iter().enumerate() {
+            out.push_str("    #[allow(unused_mut, unused_variables)]\n    {\n");
+            for p in &self.params {
+                if p.is_mut_ref {
+                    out.push_str(&format!(
+                        "        let mut __anneal_ens_local_{}: {} = (*{}).clone();\n        \
+                         let {}: &mut {} = &mut __anneal_ens_local_{};\n        \
+                         let _ = &{};\n",
+                        p.name, p.rust_ty, p.name, p.name, p.rust_ty, p.name, p.name
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "        let {}: {} = {}.clone();\n        \
+                         let _ = &{};\n",
+                        p.name, p.rust_ty, p.name, p.name
+                    ));
+                }
+            }
             out.push_str(&format!(
-                "    let __anneal_ens_{ens_idx}: bool = {expr_src};\n    \
-                 if !__anneal_ens_{ens_idx} {{\n        \
-                     return SpecProbeOutcome::PostconditionViolation({label:?});\n    \
-                 }}\n"
+                "        let __anneal_ens_{ens_idx}: bool = {expr_src};\n        \
+                 if !__anneal_ens_{ens_idx} {{\n            \
+                     return SpecProbeOutcome::PostconditionViolation({label:?});\n        \
+                 }}\n    }}\n"
             ));
         }
         out.push_str("    SpecProbeOutcome::VerifiedHold\n}\n\n");
@@ -8811,19 +9643,28 @@ impl SpecContractOracleProbe {
                 let type_meta = SpecTypeMetadata::from_type_defs(&self.type_defs_rust);
                 for ext in &self.external_callees {
                     let sched_key = resolve_sched_callee_key(sched, &ext.name, &ext.name);
+                    let parsed_ext_ret_ty = syn::parse_str::<syn::Type>(&ext.ret_rust_ty).ok();
                     let decode_opt_lit = |bytes: &[u8]| -> String {
-                        if sched.validate_callee_payload(&sched_key, bytes).is_ok()
+                        if validate_sched_payload_for_callee(
+                            sched, &sched_key, &ext.name, &ext.name, bytes,
+                        )
+                        .is_ok()
                             && bytes.len() == ext.ret_layout.total_size()
-                            && let Ok(val) =
+                            && let Ok(raw_val) =
                                 SpecEvalValue::from_layout_bytes(&ext.ret_layout, bytes)
                         {
-                            format!(
-                                "Some({})",
-                                val.rust_literal_with_defs(&ext.ret_rust_ty, &type_meta)
-                            )
-                        } else {
-                            "None".to_string()
+                            let val_res = match &parsed_ext_ret_ty {
+                                Some(rty) => coerce_value_to_syn_type(raw_val, rty, &type_meta),
+                                None => Ok(raw_val),
+                            };
+                            if let Ok(val) = val_res {
+                                return format!(
+                                    "Some({})",
+                                    val.rust_literal_with_defs(&ext.ret_rust_ty, &type_meta)
+                                );
+                            }
                         }
+                        "None".to_string()
                     };
                     if let Some(rem_panic) =
                         remaining_calls_until_callee_panic(sched, &sched_key)
@@ -8833,7 +9674,16 @@ impl SpecContractOracleProbe {
                             ext.name
                         ));
                     }
-                    if let Some(queue) = find_sched_entry(&sched.callee_queues, &ext.name) {
+                    let queue_opt = sched
+                        .callee_queues
+                        .get(&sched_key)
+                        .filter(|q| !q.is_empty())
+                        .or_else(|| {
+                            sched.callee_queues.get(&sched_key).or_else(|| {
+                                find_sched_entry(&sched.callee_queues, &ext.name)
+                            })
+                        });
+                    if let Some(queue) = queue_opt {
                         for item_bytes in queue {
                             bindings_code.push_str(&format!(
                                 "        __anneal_push_schedule_{}({});\n",
@@ -8842,7 +9692,11 @@ impl SpecContractOracleProbe {
                             ));
                         }
                     }
-                    if let Some(def_bytes) = find_sched_entry(&sched.callee_defaults, &ext.name) {
+                    let def_opt = sched
+                        .callee_defaults
+                        .get(&sched_key)
+                        .or_else(|| find_sched_entry(&sched.callee_defaults, &ext.name));
+                    if let Some(def_bytes) = def_opt {
                         bindings_code.push_str(&format!(
                             "        __anneal_set_default_{}(Some({}));\n",
                             ext.name,
@@ -8855,8 +9709,15 @@ impl SpecContractOracleProbe {
             let mut call_args = Vec::with_capacity(self.params.len());
             for p in &self.params {
                 let sz = p.layout.total_size();
-                let val = SpecEvalValue::from_layout_bytes(&p.layout, &raw_trial[cursor..cursor + sz])
-                    .map_err(|e| format!("trial {t_idx} param `{}` invalid: {e}", p.name))?;
+                let raw_val =
+                    SpecEvalValue::from_layout_bytes(&p.layout, &raw_trial[cursor..cursor + sz])
+                        .map_err(|e| format!("trial {t_idx} param `{}` invalid: {e}", p.name))?;
+                let val = if let Ok(pty) = syn::parse_str::<syn::Type>(&p.rust_ty) {
+                    coerce_value_to_syn_type(raw_val, &pty, &type_meta)
+                        .map_err(|e| format!("trial {t_idx} param `{}` invalid: {e}", p.name))?
+                } else {
+                    raw_val
+                };
                 cursor += sz;
                 let lit = val.rust_literal_with_defs(&p.rust_ty, &type_meta);
                 if p.is_mut_ref {
@@ -8927,9 +9788,13 @@ impl SpecContractOracleProbe {
         let mut struct_layouts = BTreeMap::new();
         let mut enum_layouts = BTreeMap::new();
         let mut external_callees = BTreeMap::new();
+        let mut external_callee_ret_tys = BTreeMap::new();
         for ext in &self.external_callees {
             collect_named_layouts(&ext.ret_layout, &mut struct_layouts, &mut enum_layouts);
             external_callees.insert(ext.name.clone(), ext.ret_layout.clone());
+            if let Ok(rty) = syn::parse_str::<syn::Type>(&ext.ret_rust_ty) {
+                external_callee_ret_tys.insert(ext.name.clone(), rty);
+            }
         }
         let type_meta = SpecTypeMetadata::from_type_defs(&self.type_defs_rust);
         let mut helper_fns = BTreeMap::new();
@@ -8976,57 +9841,69 @@ impl SpecContractOracleProbe {
             let sz = p.layout.total_size();
             let slice = &packed_arg_bytes[cursor..cursor + sz];
             cursor += sz;
-            let val = SpecEvalValue::from_layout_bytes(&p.layout, slice)?;
+            let raw_val = SpecEvalValue::from_layout_bytes(&p.layout, slice)?;
+            let val = if let Ok(pty) = syn::parse_str::<syn::Type>(&p.rust_ty) {
+                coerce_value_to_syn_type(raw_val, &pty, &type_meta).map_err(|reason| {
+                    ScheduleError::InvalidBitPattern {
+                        context: p.name.clone(),
+                        reason,
+                    }
+                })?
+            } else {
+                raw_val
+            };
             pre_raw_by_param.insert(p.name.clone(), slice.to_vec());
             pre_env.insert(p.name.clone(), val);
         }
         collect_named_layouts(&self.ret_layout, &mut struct_layouts, &mut enum_layouts);
 
-        // Phase 1: Evaluate `requires` preconditions in order BEFORE executing the body.
-        {
+        // Phase 1: Evaluate `requires` preconditions in order BEFORE executing the body,
+        // giving each clause its own isolated `pre_env` clone so scratch mutations in
+        // `requires[i]` cannot pollute `requires[i + 1]`.
+        for (idx, req) in self.requires.iter().enumerate() {
             let mut req_ctx = SpecEvalContext {
                 env: pre_env.clone(),
+                mut_aliases: BTreeMap::new(),
                 pre_env: None,
                 struct_layouts: &struct_layouts,
                 enum_layouts: &enum_layouts,
                 type_meta: &type_meta,
                 external_callees: &external_callees,
+                external_callee_ret_tys: &external_callee_ret_tys,
                 helper_fns: &helper_fns,
                 schedule: None,
                 call_index: 0,
                 call_depth: 0,
             };
-            for (idx, req) in self.requires.iter().enumerate() {
-                let expr = syn::parse_str::<Expr>(&req.rust_expr).map_err(|e| {
-                    ScheduleError::InvalidBitPattern {
-                        context: req.label.clone(),
-                        reason: e.to_string(),
-                    }
-                })?;
-                match req_ctx.eval_expr(&expr) {
-                    Ok(SpecEvalValue::Bool(true)) => {}
-                    Ok(SpecEvalValue::Bool(false)) => {
-                        return Ok(SpecPostconditionVerdict::VacuouslyFiltered {
-                            failed_requires_index: idx,
-                            failed_requires_label: req.label.clone(),
-                        });
-                    }
-                    Ok(other) => {
-                        return Ok(SpecPostconditionVerdict::PanicOrTrap {
-                            phase: SpecExecPhase::Requires,
-                            detail: format!(
-                                "`requires` clause `{}` returned non-bool {other:?}",
-                                req.label
-                            ),
-                        });
-                    }
-                    Err(flow) => {
-                        return Ok(SpecPostconditionVerdict::PanicOrTrap {
-                            phase: SpecExecPhase::Requires,
-                            detail: flow
-                                .into_trap_detail(&format!("`requires` clause `{}`", req.label)),
-                        });
-                    }
+            let expr = syn::parse_str::<Expr>(&req.rust_expr).map_err(|e| {
+                ScheduleError::InvalidBitPattern {
+                    context: req.label.clone(),
+                    reason: e.to_string(),
+                }
+            })?;
+            match req_ctx.eval_expr(&expr) {
+                Ok(SpecEvalValue::Bool(true)) => {}
+                Ok(SpecEvalValue::Bool(false)) => {
+                    return Ok(SpecPostconditionVerdict::VacuouslyFiltered {
+                        failed_requires_index: idx,
+                        failed_requires_label: req.label.clone(),
+                    });
+                }
+                Ok(other) => {
+                    return Ok(SpecPostconditionVerdict::PanicOrTrap {
+                        phase: SpecExecPhase::Requires,
+                        detail: format!(
+                            "`requires` clause `{}` returned non-bool {other:?}",
+                            req.label
+                        ),
+                    });
+                }
+                Err(flow) => {
+                    return Ok(SpecPostconditionVerdict::PanicOrTrap {
+                        phase: SpecExecPhase::Requires,
+                        detail: flow
+                            .into_trap_detail(&format!("`requires` clause `{}`", req.label)),
+                    });
                 }
             }
         }
@@ -9041,11 +9918,13 @@ impl SpecContractOracleProbe {
         })?;
         let mut body_ctx = SpecEvalContext {
             env: pre_env.clone(),
+            mut_aliases: BTreeMap::new(),
             pre_env: None,
             struct_layouts: &struct_layouts,
             enum_layouts: &enum_layouts,
             type_meta: &type_meta,
             external_callees: &external_callees,
+            external_callee_ret_tys: &external_callee_ret_tys,
             helper_fns: &helper_fns,
             schedule,
             call_index: 0,
@@ -9069,6 +9948,17 @@ impl SpecContractOracleProbe {
                 });
             }
         };
+        if let Ok(ret_syn_ty) = syn::parse_str::<syn::Type>(&self.ret_rust_ty) {
+            result_val = match coerce_value_to_syn_type(result_val, &ret_syn_ty, &type_meta) {
+                Ok(coerced) => coerced,
+                Err(trap) => {
+                    return Ok(SpecPostconditionVerdict::PanicOrTrap {
+                        phase: SpecExecPhase::Body,
+                        detail: trap,
+                    });
+                }
+            };
+        }
 
         // Phase 3: Check frame conditions on `&mut` parameters using
         // `LayoutSpec::mask_padding_as_unknown` (and active-variant semantic
@@ -9139,19 +10029,21 @@ impl SpecContractOracleProbe {
         }
         post_env.insert("result".to_string(), result_val);
 
-        let mut ens_ctx = SpecEvalContext {
-            env: post_env,
-            pre_env: Some(&pre_env),
-            struct_layouts: &struct_layouts,
-            enum_layouts: &enum_layouts,
-            type_meta: &type_meta,
-            external_callees: &external_callees,
-            helper_fns: &helper_fns,
-            schedule: None,
-            call_index: 0,
-            call_depth: 0,
-        };
         for (idx, ens) in self.ensures.iter().enumerate() {
+            let mut ens_ctx = SpecEvalContext {
+                env: post_env.clone(),
+                mut_aliases: BTreeMap::new(),
+                pre_env: Some(&pre_env),
+                struct_layouts: &struct_layouts,
+                enum_layouts: &enum_layouts,
+                type_meta: &type_meta,
+                external_callees: &external_callees,
+                external_callee_ret_tys: &external_callee_ret_tys,
+                helper_fns: &helper_fns,
+                schedule: None,
+                call_index: 0,
+                call_depth: 0,
+            };
             let expr = syn::parse_str::<Expr>(&ens.rust_expr).map_err(|e| {
                 ScheduleError::InvalidBitPattern {
                     context: ens.label.clone(),
@@ -9233,16 +10125,41 @@ fn find_sched_entry<'a, V>(map: &'a BTreeMap<String, V>, short_callee: &str) -> 
 }
 
 fn resolve_sched_callee_key(sched: &EnvSchedule, callee_name: &str, short_callee: &str) -> String {
-    let has_exact = |key: &str| -> bool {
+    let has_active_action = |key: &str| -> bool {
+        sched.callee_queues.get(key).is_some_and(|q| !q.is_empty())
+            || sched.callee_defaults.contains_key(key)
+            || sched.callee_panic_on_call.contains_key(key)
+    };
+    if has_active_action(callee_name) {
+        return callee_name.to_string();
+    }
+    if has_active_action(short_callee) {
+        return short_callee.to_string();
+    }
+    for (k, q) in &sched.callee_queues {
+        if !q.is_empty() && k.rsplit("::").next() == Some(short_callee) {
+            return k.clone();
+        }
+    }
+    for k in sched
+        .callee_defaults
+        .keys()
+        .chain(sched.callee_panic_on_call.keys())
+    {
+        if k.rsplit("::").next() == Some(short_callee) {
+            return k.clone();
+        }
+    }
+
+    let has_any_action = |key: &str| -> bool {
         sched.callee_queues.contains_key(key)
             || sched.callee_defaults.contains_key(key)
             || sched.callee_panic_on_call.contains_key(key)
-            || sched.callee_return_sizes.contains_key(key)
     };
-    if has_exact(callee_name) {
+    if has_any_action(callee_name) {
         return callee_name.to_string();
     }
-    if has_exact(short_callee) {
+    if has_any_action(short_callee) {
         return short_callee.to_string();
     }
     for k in sched
@@ -9250,13 +10167,50 @@ fn resolve_sched_callee_key(sched: &EnvSchedule, callee_name: &str, short_callee
         .keys()
         .chain(sched.callee_defaults.keys())
         .chain(sched.callee_panic_on_call.keys())
-        .chain(sched.callee_return_sizes.keys())
     {
         if k.rsplit("::").next() == Some(short_callee) {
             return k.clone();
         }
     }
+
+    if sched.callee_return_sizes.contains_key(callee_name) {
+        return callee_name.to_string();
+    }
+    if sched.callee_return_sizes.contains_key(short_callee) {
+        return short_callee.to_string();
+    }
+    for k in sched.callee_return_sizes.keys() {
+        if k.rsplit("::").next() == Some(short_callee) {
+            return k.clone();
+        }
+    }
     callee_name.to_string()
+}
+
+fn validate_sched_payload_for_callee(
+    sched: &EnvSchedule,
+    effective_key: &str,
+    callee_name: &str,
+    short_callee: &str,
+    bytes: &[u8],
+) -> Result<(), ScheduleError> {
+    sched.validate_callee_payload(effective_key, bytes)?;
+    if callee_name != effective_key {
+        sched.validate_callee_payload(callee_name, bytes)?;
+    }
+    if short_callee != effective_key && short_callee != callee_name {
+        sched.validate_callee_payload(short_callee, bytes)?;
+    }
+    for k in sched.callee_return_sizes.keys() {
+        if k.rsplit("::").next() == Some(short_callee)
+            && k != effective_key
+            && k != callee_name
+            && k != short_callee
+        {
+            sched.validate_callee_payload(k, bytes)?;
+        }
+    }
+    Ok(())
 }
 
 fn parse_stripped_callee_call_counts(sched: &EnvSchedule) -> BTreeMap<String, usize> {
@@ -9873,6 +10827,38 @@ impl WriteChainCoverageBound {
         callee_layouts: &BTreeMap<String, LayoutSpec>,
         planned_steps: &[EnvScheduledWriteStep],
     ) -> usize {
+        self.observe_env_schedule_impl(schedule, callee_layouts, planned_steps, false)
+    }
+
+    /// Single-trial unwind-stopping variant of [`Self::observe_env_schedule`]:
+    /// halts `planned_steps` immediately upon the first panicking, unscheduled
+    /// (`PassThrough`), or payload-invalid environment call so post-unwind steps
+    /// in a linear callee body cannot fabricate causal chain depth after a trap.
+    pub fn observe_env_schedule_until_unwind(
+        &mut self,
+        schedule: &EnvSchedule,
+        planned_steps: &[EnvScheduledWriteStep],
+    ) -> usize {
+        self.observe_env_schedule_until_unwind_with_layouts(schedule, &BTreeMap::new(), planned_steps)
+    }
+
+    /// Layout-validating variant of [`Self::observe_env_schedule_until_unwind`].
+    pub fn observe_env_schedule_until_unwind_with_layouts(
+        &mut self,
+        schedule: &EnvSchedule,
+        callee_layouts: &BTreeMap<String, LayoutSpec>,
+        planned_steps: &[EnvScheduledWriteStep],
+    ) -> usize {
+        self.observe_env_schedule_impl(schedule, callee_layouts, planned_steps, true)
+    }
+
+    fn observe_env_schedule_impl(
+        &mut self,
+        schedule: &EnvSchedule,
+        callee_layouts: &BTreeMap<String, LayoutSpec>,
+        planned_steps: &[EnvScheduledWriteStep],
+        stop_on_broken_link: bool,
+    ) -> usize {
         let mut sim = schedule.clone();
         for (call_idx, planned) in planned_steps.iter().enumerate() {
             let trimmed_callee = planned.callee.trim();
@@ -9883,6 +10869,9 @@ impl WriteChainCoverageBound {
                     env_callee: Some(planned.callee.clone()),
                     env_link_satisfied: false,
                 });
+                if stop_on_broken_link {
+                    break;
+                }
                 continue;
             }
             let short_callee = trimmed_callee
@@ -9898,15 +10887,25 @@ impl WriteChainCoverageBound {
                     let zst_declared = declared_layout
                         .map(|l| l.total_size() == 0)
                         .unwrap_or(false);
-                    let non_empty_or_zst = !bytes.is_empty()
-                        || zst_declared
-                        || sim.expected_return_size(&effective_callee) == Some(0);
+                    let zst_expected = sim
+                        .expected_return_size(&effective_callee)
+                        .or_else(|| sim.expected_return_size(trimmed_callee))
+                        .or_else(|| sim.expected_return_size(short_callee))
+                        == Some(0);
+                    let non_empty_or_zst = !bytes.is_empty() || zst_declared || zst_expected;
                     let layout_ok = match declared_layout {
                         Some(layout) => layout.validate_bytes(&bytes).is_ok(),
                         None => true,
                     };
                     non_empty_or_zst
-                        && sim.validate_callee_payload(&effective_callee, &bytes).is_ok()
+                        && validate_sched_payload_for_callee(
+                            &sim,
+                            &effective_callee,
+                            trimmed_callee,
+                            short_callee,
+                            &bytes,
+                        )
+                        .is_ok()
                         && layout_ok
                 }
                 crate::instrument::EnvAction::PanicOnCall(_)
@@ -9918,6 +10917,9 @@ impl WriteChainCoverageBound {
                 env_callee: Some(trimmed_callee.to_string()),
                 env_link_satisfied: link_ok,
             });
+            if !link_ok && stop_on_broken_link {
+                break;
+            }
         }
         self.max_observed_depth
     }
@@ -11847,5 +12849,230 @@ mod tests {
         assert_eq!(qual_depth, 2);
         assert_eq!(qual_tracker.broken_env_links(), 0);
         assert!(qual_tracker.is_depth_certified());
+    }
+
+    #[test]
+    fn ep2_a3_local_mut_aliases_action_first_sched_keys_old_shared_refs_clause_isolation_and_unwind_cutoff() {
+        let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+        let lanes_layout = LayoutSpec::Array {
+            elem: Box::new(u32_layout.clone()),
+            elem_stride: 4,
+            len: 3,
+        };
+        let delta_layout = LayoutSpec::Enum {
+            name: "MaybeDelta".to_string(),
+            total_size: 8,
+            tag_offset: 0,
+            tag_size: 1,
+            variants: vec![
+                EnumVariantLayout {
+                    name: "Empty".to_string(),
+                    discriminant: 0,
+                    payload_offset: 4,
+                    payload: None,
+                },
+                EnumVariantLayout {
+                    name: "Add".to_string(),
+                    discriminant: 1,
+                    payload_offset: 4,
+                    payload: Some(Box::new(u32_layout.clone())),
+                },
+            ],
+        };
+        let state_layout = LayoutSpec::Struct {
+            name: "AliasState".to_string(),
+            total_size: 20,
+            fields: vec![
+                FieldLayout {
+                    name: "lanes".to_string(),
+                    offset: 0,
+                    layout: lanes_layout,
+                },
+                FieldLayout {
+                    name: "total".to_string(),
+                    offset: 12,
+                    layout: u32_layout.clone(),
+                },
+                FieldLayout {
+                    name: "framed".to_string(),
+                    offset: 16,
+                    layout: u32_layout.clone(),
+                },
+            ],
+        };
+
+        // Note: `ext_nz` deliberately uses plain `ScalarLayout::u32()` (without `with_valid_range(1..)`)
+        // to verify `SpecEvalContext` + `synthesize_rust_executable_harness_with_schedules`
+        // still enforce `NonZeroU32 != 0` via `ret_rust_ty` ONLY when called!
+        let probe = SpecContractOracleProbe::new(
+            "alias_and_clause_isolation_probe",
+            vec![
+                SpecParamBinding::mut_ref("st", "self::StateAlias", state_layout)
+                    .with_frame_preserved_fields(["framed"]),
+                SpecParamBinding::by_value("mode", "u32", u32_layout.clone()),
+                SpecParamBinding::by_value("seed_delta", "self::MaybeDelta", delta_layout),
+            ],
+            "u32",
+            u32_layout.clone(),
+            "let r_tot = &mut st.total;\n\
+             *r_tot += 5u32;\n\
+             {\n    \
+                 let r_tot: u32 = 999u32;\n    \
+                 let _ = r_tot;\n\
+             }\n\
+             *r_tot += 1u32;\n\
+             let mut rebind_ref = &mut st.lanes[0];\n\
+             *rebind_ref += 2u32;\n\
+             rebind_ref = &mut st.lanes[2];\n\
+             *rebind_ref += 4u32;\n\
+             for &mut ref mut lane_ref in &mut st.lanes {\n    \
+                 *lane_ref += 1u32;\n\
+             }\n\
+             let mut pairs: [(u32, u32); 2] = [(1u32, 2u32), (3u32, 4u32)];\n\
+             for whole @ &mut (a, _) in &mut pairs {\n    \
+                 whole.1 += a;\n\
+             }\n\
+             for &mut (_, ref mut b) in &mut pairs {\n    \
+                 *b += 10u32;\n\
+             }\n\
+             let d: crate::MaybeDelta = if mode == 0u32 {\n    \
+                 crate::MaybeDelta::Empty\n\
+             } else {\n    \
+                 self::MaybeDelta::Add(self::MAGIC_BONUS)\n\
+             };\n\
+             let seed_bonus: u32 = match seed_delta {\n    \
+                 crate::MaybeDelta::Empty => 0u32,\n    \
+                 self::MaybeDelta::Add(sv) => sv,\n\
+             };\n\
+             let bonus: u32 = match d {\n    \
+                 self::MaybeDelta::Empty => seed_bonus,\n    \
+                 crate::MaybeDelta::Add(v) => v + seed_bonus,\n\
+             };\n\
+             let ext_v: u32 = self::ext_read();\n\
+             let nz_extra: u32 = if mode == 2u32 { ext_nz().get() } else { 0u32 };\n\
+             st.total = st.total + st.lanes[0] + st.lanes[1] + st.lanes[2] + pairs[0].1 + pairs[1].1 + bonus + ext_v + nz_extra;\n\
+             st.total",
+        )
+        .with_type_defs(
+            "pub const MAGIC_BONUS: u32 = 7;\n\
+             #[repr(C, u8)]\n\
+             #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+             pub enum MaybeDelta { Empty = 0, Add(u32) = 1 }\n\
+             #[repr(C)]\n\
+             #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+             pub struct AliasState { pub lanes: [u32; 3], pub total: u32, pub framed: u32 }\n\
+             pub type StateAlias = AliasState;\n\
+             pub fn read_total_ref(s: &AliasState) -> &u32 { &s.total }\n\
+             pub fn scratch_bump(s: &mut AliasState) -> u32 {\n    \
+                 s.total += 50u32;\n    \
+                 s.total\n\
+             }",
+        )
+        .with_external_callee(SpecExternalCallee::new(
+            "ext_read",
+            std::iter::empty::<&str>(),
+            "u32",
+            u32_layout.clone(),
+        ))
+        .with_external_callee(SpecExternalCallee::new(
+            "ext_nz",
+            std::iter::empty::<&str>(),
+            "core::num::NonZeroU32",
+            u32_layout,
+        ))
+        .with_requires("req_scratch_0", "self::scratch_bump(st) == st.total")
+        .with_requires("req_isolated_1", "st.total <= 20u32")
+        .with_ensures(
+            "old_shared_refs_and_ens_scratch_0",
+            "old(&st.total) == old(read_total_ref(st)) \
+             && old(self::scratch_bump(st)) == old(st.total) + 50u32 \
+             && self::scratch_bump(st) == result + 50u32",
+        )
+        .with_ensures(
+            "ens_isolated_1",
+            "st.total == result \
+             && st.lanes[0] == old(st.lanes[0]) + 3u32 \
+             && st.lanes[1] == old(st.lanes[1]) + 1u32 \
+             && st.lanes[2] == old(st.lanes[2]) + 5u32",
+        );
+
+        let make_raw = |total: u32, mode: u32| -> Vec<u8> {
+            let mut b = Vec::with_capacity(32);
+            b.extend_from_slice(&1u32.to_le_bytes()); // lanes[0] = 1
+            b.extend_from_slice(&2u32.to_le_bytes()); // lanes[1] = 2
+            b.extend_from_slice(&3u32.to_le_bytes()); // lanes[2] = 3
+            b.extend_from_slice(&total.to_le_bytes());
+            b.extend_from_slice(&88u32.to_le_bytes()); // framed = 88
+            b.extend_from_slice(&mode.to_le_bytes());
+            let mut delta_bytes = [0u8; 8];
+            delta_bytes[0] = 1u8; // MaybeDelta::Add(2)
+            delta_bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
+            b.extend_from_slice(&delta_bytes);
+            b
+        };
+
+        // Short `callee_return_sizes["ext_read"] = 4` + module-qualified `callee_queues["sensor_mod::ext_read"]`!
+        let mut mixed_sched = EnvSchedule::new().with_callee_return_size("ext_read", 4);
+        mixed_sched.push_callee_response("sensor_mod::ext_read", 9u32.to_le_bytes().to_vec());
+        // Zero bytes queued for `ext_nz` (`NonZeroU32`): when `mode = 1` does NOT call `ext_nz()`,
+        // trial must still `VerifiedHold`, whereas `mode = 2` calling `ext_nz()` must `PanicOrTrap(Body)`!
+        mixed_sched.push_callee_response("ext_nz", 0u32.to_le_bytes().to_vec());
+
+        let mut s_hold = mixed_sched.clone();
+        assert_eq!(
+            probe
+                .verify_spec_postcondition_against_schedule(&make_raw(10, 1), Some(&mut s_hold))
+                .expect("eval ep2-A3 hold"),
+            SpecPostconditionVerdict::VerifiedHold
+        );
+
+        let mut s_nz_trap = mixed_sched.clone();
+        assert!(matches!(
+            probe
+                .verify_spec_postcondition_against_schedule(&make_raw(10, 2), Some(&mut s_nz_trap))
+                .expect("eval ep2-A3 nonzero zero return trap"),
+            SpecPostconditionVerdict::PanicOrTrap {
+                phase: SpecExecPhase::Body,
+                ..
+            }
+        ));
+
+        // Cross-key return-size mismatch (`callee_return_sizes["ext_read"] = 8` registered after pushing 4-byte response on `"sensor_mod::ext_read"`):
+        let mut bad_sz_sched = EnvSchedule::new();
+        bad_sz_sched.push_callee_response("sensor_mod::ext_read", 9u32.to_le_bytes().to_vec());
+        bad_sz_sched.register_callee_return_size("ext_read", 8);
+        assert!(matches!(
+            probe
+                .verify_spec_postcondition_against_schedule(
+                    &make_raw(10, 0),
+                    Some(&mut bad_sz_sched)
+                )
+                .expect("eval cross-key size mismatch"),
+            SpecPostconditionVerdict::PanicOrTrap {
+                phase: SpecExecPhase::Body,
+                ..
+            }
+        ));
+
+        // Unwind-stopping walk observer halts at `PanicOnCall(0)` on step 0 instead of executing steps 1..3:
+        let mut unwind_sched = EnvSchedule::new().with_callee_return_size("ext_read", 4);
+        unwind_sched.set_callee_default("ext_read", 4u32.to_le_bytes().to_vec());
+        unwind_sched.set_panic_on_call(0);
+        let planned = [
+            EnvScheduledWriteStep::new("ext_read", "s0", std::iter::empty::<&str>()),
+            EnvScheduledWriteStep::new("ext_read", "s1", std::iter::empty::<&str>()),
+            EnvScheduledWriteStep::new("ext_read", "s2", ["s1"]),
+            EnvScheduledWriteStep::new("ext_read", "s3", ["s2"]),
+        ];
+        let mut single_trial_walk = WriteChainCoverageBound::new(4, 3);
+        let max_after_unwind = single_trial_walk.observe_env_schedule_until_unwind_with_layouts(
+            &unwind_sched,
+            &probe.external_callee_layout_map(),
+            &planned,
+        );
+        assert_eq!(max_after_unwind, 0);
+        assert_eq!(single_trial_walk.steps_observed(), 0);
+        assert_eq!(single_trial_walk.broken_env_links(), 1);
+        assert!(!single_trial_walk.is_depth_certified());
     }
 }

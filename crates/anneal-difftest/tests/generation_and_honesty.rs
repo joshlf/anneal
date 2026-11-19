@@ -3206,3 +3206,311 @@ fn ep2_b3_lockstep_parity_on_for_mut_writeback_nonzero_min_old_block_mut_pure_sp
     assert_eq!(walk_bound.broken_env_links(), 0);
     assert!(walk_bound.is_depth_certified());
 }
+
+#[test]
+fn ep2_a3_lockstep_parity_on_local_mut_aliases_mixed_sched_keys_old_refs_clause_isolation_and_self_paths()
+{
+    use anneal_difftest::{
+        EnumVariantLayout, EnvScheduledWriteStep, SpecContractOracleProbe, SpecExecPhase,
+        SpecExternalCallee, SpecParamBinding, SpecPostconditionVerdict, SpecViolationKind,
+        WriteChainCoverageBound,
+    };
+
+    let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+    let lanes_layout = LayoutSpec::Array {
+        elem: Box::new(u32_layout.clone()),
+        elem_stride: 4,
+        len: 3,
+    };
+    let delta_layout = LayoutSpec::Enum {
+        name: "MaybeDelta".to_string(),
+        total_size: 8,
+        tag_offset: 0,
+        tag_size: 1,
+        variants: vec![
+            EnumVariantLayout {
+                name: "Empty".to_string(),
+                discriminant: 0,
+                payload_offset: 4,
+                payload: None,
+            },
+            EnumVariantLayout {
+                name: "Add".to_string(),
+                discriminant: 1,
+                payload_offset: 4,
+                payload: Some(Box::new(u32_layout.clone())),
+            },
+        ],
+    };
+    let state_layout = LayoutSpec::Struct {
+        name: "AliasState".to_string(),
+        total_size: 20,
+        fields: vec![
+            FieldLayout {
+                name: "lanes".to_string(),
+                offset: 0,
+                layout: lanes_layout,
+            },
+            FieldLayout {
+                name: "total".to_string(),
+                offset: 12,
+                layout: u32_layout.clone(),
+            },
+            FieldLayout {
+                name: "framed".to_string(),
+                offset: 16,
+                layout: u32_layout.clone(),
+            },
+        ],
+    };
+
+    // Exercises all 6 `ep2-A3` fixes in lockstep against compiled `rustc --edition=2024 -D warnings`:
+    // 1. Local `&mut` place aliases (`let r = &mut st.total;`, tuple `(&mut a, &mut b)`,
+    //    rebinding `rebind_ref = &mut st.lanes[2];`, lexical shadowing, `for whole @ (_, b)`,
+    //    and `for &mut ref mut lane_ref`),
+    // 2. Action-first `resolve_sched_callee_key` when `callee_return_sizes` uses short `"ext_read"`
+    //    while `callee_queues` uses module-qualified `"sensor_mod::ext_read"` + cross-key size mismatch,
+    // 3. Reference-returning `old(&st.total) == old(read_total_ref(st))` alongside mutating
+    //    `old(self::scratch_bump(st))` + per-clause `requires[i]` / `ensures[i]` scratch isolation,
+    // 4. `self::` / `crate::` module-root paths across constants, enums, structs, aliases, and helpers,
+    // 5. `NonZeroU32` zero-payload validation against `ret_rust_ty` ONLY when invoked (not during staging!),
+    // 6. `WriteChainCoverageBound::observe_env_schedule_until_unwind_with_layouts` single-trial cutoff.
+    let probe = SpecContractOracleProbe::new(
+        "ep2_a3_alias_ref_and_sched_parity",
+        vec![
+            SpecParamBinding::mut_ref("st", "self::StateAlias", state_layout)
+                .with_frame_preserved_fields(["framed"]),
+            SpecParamBinding::by_value("mode", "u32", u32_layout.clone()),
+            SpecParamBinding::by_value("seed_delta", "self::MaybeDelta", delta_layout),
+        ],
+        "u32",
+        u32_layout.clone(),
+        "if mode == 77u32 {\n    \
+             let f_ref = &mut st.framed;\n    \
+             *f_ref += 1u32;\n\
+         }\n\
+         let r_tot = &mut st.total;\n\
+         *r_tot += 5u32;\n\
+         {\n    \
+             let r_tot: u32 = 999u32;\n    \
+             let _ = r_tot;\n\
+         }\n\
+         *r_tot += 1u32;\n\
+         let (l0_ref, tot_ref) = (&mut st.lanes[0], &mut st.total);\n\
+         *l0_ref += 2u32;\n\
+         *tot_ref += 3u32;\n\
+         let mut rebind_ref = &mut st.lanes[0];\n\
+         *rebind_ref += 1u32;\n\
+         rebind_ref = &mut st.lanes[2];\n\
+         *rebind_ref += 4u32;\n\
+         for &mut ref mut lane_ref in &mut st.lanes {\n    \
+             *lane_ref += 1u32;\n\
+         }\n\
+         let mut pairs: [(u32, u32); 2] = [(1u32, 2u32), (3u32, 4u32)];\n\
+         for whole @ &mut (a, _) in &mut pairs {\n    \
+             whole.1 += a;\n\
+         }\n\
+         for &mut (_, ref mut b) in &mut pairs {\n    \
+             *b += 10u32;\n\
+         }\n\
+         let d: crate::MaybeDelta = if mode == 0u32 {\n    \
+             crate::MaybeDelta::Empty\n\
+         } else {\n    \
+             self::MaybeDelta::Add(self::MAGIC_BONUS)\n\
+         };\n\
+         let seed_bonus: u32 = match seed_delta {\n    \
+             crate::MaybeDelta::Empty => 0u32,\n    \
+             self::MaybeDelta::Add(sv) => sv,\n\
+         };\n\
+         let bonus: u32 = match d {\n    \
+             self::MaybeDelta::Empty => seed_bonus,\n    \
+             crate::MaybeDelta::Add(v) => v + seed_bonus,\n\
+         };\n\
+         let ext_v: u32 = self::ext_read();\n\
+         let nz_extra: u32 = if mode == 2u32 { ext_nz().get() } else { 0u32 };\n\
+         st.total = st.total + st.lanes[0] + st.lanes[1] + st.lanes[2] + pairs[0].1 + pairs[1].1 + bonus + ext_v + nz_extra;\n\
+         st.total",
+    )
+    .with_type_defs(
+        "pub const MAGIC_BONUS: u32 = 7;\n\
+         #[repr(C, u8)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub enum MaybeDelta { Empty = 0, Add(u32) = 1 }\n\
+         #[repr(C)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub struct AliasState { pub lanes: [u32; 3], pub total: u32, pub framed: u32 }\n\
+         pub type StateAlias = AliasState;\n\
+         pub fn read_total_ref(s: &AliasState) -> &u32 { &s.total }\n\
+         pub fn scratch_bump(s: &mut AliasState) -> u32 {\n    \
+             s.total += 50u32;\n    \
+             s.total\n\
+         }",
+    )
+    .with_external_callee(SpecExternalCallee::new(
+        "ext_read",
+        std::iter::empty::<&str>(),
+        "u32",
+        u32_layout.clone(),
+    ))
+    .with_external_callee(SpecExternalCallee::new(
+        "ext_nz",
+        std::iter::empty::<&str>(),
+        "core::num::NonZeroU32",
+        u32_layout,
+    ))
+    .with_requires("req_scratch_0", "self::scratch_bump(st) == st.total")
+    .with_requires("req_isolated_1", "st.total <= 20u32")
+    .with_ensures(
+        "old_shared_refs_and_ens_scratch_0",
+        "old(&st.total) == old(read_total_ref(st)) \
+         && old(self::scratch_bump(st)) == old(st.total) + 50u32 \
+         && self::scratch_bump(st) == result + 50u32",
+    )
+    .with_ensures(
+        "ens_isolated_1",
+        "mode != 9u32 \
+         && st.total == result \
+         && st.lanes[0] == old(st.lanes[0]) + 4u32 \
+         && st.lanes[1] == old(st.lanes[1]) + 1u32 \
+         && st.lanes[2] == old(st.lanes[2]) + 5u32",
+    );
+
+    let make_trial = |total: u32, mode: u32| -> Vec<u8> {
+        let mut b = Vec::with_capacity(32);
+        b.extend_from_slice(&1u32.to_le_bytes()); // lanes[0] = 1
+        b.extend_from_slice(&2u32.to_le_bytes()); // lanes[1] = 2
+        b.extend_from_slice(&3u32.to_le_bytes()); // lanes[2] = 3
+        b.extend_from_slice(&total.to_le_bytes());
+        b.extend_from_slice(&88u32.to_le_bytes()); // framed = 88
+        b.extend_from_slice(&mode.to_le_bytes());
+        let mut delta_bytes = [0u8; 8];
+        delta_bytes[0] = 1u8; // MaybeDelta::Add(2)
+        delta_bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
+        b.extend_from_slice(&delta_bytes);
+        b
+    };
+
+    // Short `callee_return_sizes["ext_read"] = 4` + module-qualified `callee_queues["sensor_mod::ext_read"]`,
+    // plus `0u32` queued on `ext_nz` (`NonZeroU32` with plain `ScalarLayout::u32()`):
+    let mut mixed_sched = EnvSchedule::new().with_callee_return_size("ext_read", 4);
+    mixed_sched.push_callee_response("sensor_mod::ext_read", 9u32.to_le_bytes().to_vec());
+    mixed_sched.push_callee_response("ext_nz", 0u32.to_le_bytes().to_vec());
+
+    // Cross-key return-size mismatch (`callee_return_sizes["ext_read"] = 8` registered after pushing 4-byte `"sensor_mod::ext_read"`):
+    let mut bad_sz_sched = EnvSchedule::new();
+    bad_sz_sched.push_callee_response("sensor_mod::ext_read", 9u32.to_le_bytes().to_vec());
+    bad_sz_sched.push_callee_response("ext_nz", 3u32.to_le_bytes().to_vec());
+    bad_sz_sched.register_callee_return_size("ext_read", 8);
+
+    let trials = vec![
+        // Trial 0: `total = 10, mode = 1` -> `req_scratch_0` mutates only its own scratch, so `req_isolated_1`
+        // still sees `10 <= 20`, `ext_nz` (`0`) is NOT called, `ens_0` scratch does NOT pollute `ens_1` -> HOLD!
+        (make_trial(10, 1), Some(mixed_sched.clone())),
+        // Trial 1: `total = 25` fails `req_isolated_1` even with `0` staged in `ext_nz` -> FILTERED (no eager unwrap panic!)
+        (make_trial(25, 2), Some(mixed_sched.clone())),
+        // Trial 2: `total = 10, mode = 2` calls `ext_nz()` which pops invalid `0` for `NonZeroU32` -> TRAP!
+        (make_trial(10, 2), Some(mixed_sched.clone())),
+        // Trial 3: `total = 10, mode = 77` mutates framed `st.framed` via local `&mut` alias -> FRAME:st.framed!
+        (make_trial(10, 77), Some(mixed_sched.clone())),
+        // Trial 4: `total = 10, mode = 9` fails `ens_isolated_1` -> VIOLATION:ens_isolated_1!
+        (make_trial(10, 9), Some(mixed_sched.clone())),
+        // Trial 5: cross-key return-size mismatch (`ext_read` 8B vs `sensor_mod::ext_read` 4B) -> TRAP!
+        (make_trial(10, 0), Some(bad_sz_sched)),
+    ];
+
+    let report = probe
+        .verify_spec_postcondition_batch(&trials)
+        .expect("verify ep2-A3 parity batch");
+    assert_eq!(report.verdicts[0], SpecPostconditionVerdict::VerifiedHold);
+    assert!(matches!(
+        &report.verdicts[1],
+        SpecPostconditionVerdict::VacuouslyFiltered {
+            failed_requires_index: 1,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &report.verdicts[2],
+        SpecPostconditionVerdict::PanicOrTrap {
+            phase: SpecExecPhase::Body,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &report.verdicts[3],
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::FrameCondition { param, field },
+            ..
+        } if param == "st" && field == "framed"
+    ));
+    assert!(matches!(
+        &report.verdicts[4],
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::EnsuresClause {
+                clause_index: 1,
+                label,
+            },
+            ..
+        } if label == "ens_isolated_1"
+    ));
+    assert!(matches!(
+        &report.verdicts[5],
+        SpecPostconditionVerdict::PanicOrTrap {
+            phase: SpecExecPhase::Body,
+            ..
+        }
+    ));
+
+    let exe_src = probe
+        .synthesize_rust_executable_harness_with_schedules(&trials)
+        .expect("synthesize ep2-A3 executable harness");
+    assert!(!contains_unsafe_token(&exe_src));
+    let native_lines = compile_and_run_spec_harness("ep2_a3_lockstep_parity", &exe_src);
+    assert_eq!(
+        native_lines,
+        vec![
+            "TRIAL:0:HOLD",
+            "TRIAL:1:FILTERED",
+            "TRIAL:2:TRAP",
+            "TRIAL:3:FRAME:st.framed",
+            "TRIAL:4:VIOLATION:ens_isolated_1",
+            "TRIAL:5:TRAP",
+        ]
+    );
+
+    // Mixed short/qualified schedule keys ALSO certify `WriteChainCoverageBound`, whereas
+    // `observe_env_schedule_until_unwind_with_layouts` halts immediately on `PanicOnCall(0)`:
+    let mut mixed_walk = WriteChainCoverageBound::new(2, 2);
+    let mut two_hop_mixed = EnvSchedule::new().with_callee_return_size("ext_read", 4);
+    two_hop_mixed.set_callee_default("sensor_mod::ext_read", 9u32.to_le_bytes().to_vec());
+    assert_eq!(
+        mixed_walk.observe_env_schedule_until_unwind_with_layouts(
+            &two_hop_mixed,
+            &probe.external_callee_layout_map(),
+            &[
+                EnvScheduledWriteStep::new("ext_read", "s0", std::iter::empty::<&str>()),
+                EnvScheduledWriteStep::new("ext_read", "s1", ["s0"]),
+            ],
+        ),
+        2
+    );
+    assert!(mixed_walk.is_depth_certified());
+
+    let mut unwind_sched = two_hop_mixed.clone();
+    unwind_sched.set_panic_on_call(0);
+    let mut unwind_walk = WriteChainCoverageBound::new(2, 2);
+    assert_eq!(
+        unwind_walk.observe_env_schedule_until_unwind_with_layouts(
+            &unwind_sched,
+            &probe.external_callee_layout_map(),
+            &[
+                EnvScheduledWriteStep::new("ext_read", "s0", std::iter::empty::<&str>()),
+                EnvScheduledWriteStep::new("ext_read", "s1", std::iter::empty::<&str>()),
+                EnvScheduledWriteStep::new("ext_read", "s2", ["s1"]),
+            ],
+        ),
+        0
+    );
+    assert_eq!(unwind_walk.broken_env_links(), 1);
+    assert_eq!(unwind_walk.steps_observed(), 0);
+}
