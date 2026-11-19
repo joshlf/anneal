@@ -2871,8 +2871,8 @@ theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
                     threads := mM.threads.set mM.active_thread.toNat
                       { t with stack := t.stack.dropLast },
                     mem := cm2 } unwindBlock
-              | none =>
-                ub "unwinding from a function where the caller did not specify an unwind_block") := by
+              | none => ub
+                "unwinding from a function where the caller did not specify an unwind_block") := by
         simp only [Interp.evalTerminatorM, Interp.evalResumeUnwindM]
         rw [ht]
         simp only [ok_bind, hfr, pure_ok, listSet, hge, hlt, and_self, ↓reduceIte, hdealloc,
@@ -3003,8 +3003,8 @@ conditional hypotheses exercising:
      `.Strong → .No`, permission `.Prot (.Frozen true) → .Unprot .Frozen`)
      while jumping the caller to `unwind_block`;
    - `deallocAllM` raising Tree Borrows UB when unwinding tries to deallocate a
-     strongly protected local (`"Tree Borrows: deallocating strongly protected`
-     `allocation"`);
+     strongly protected local
+     (`"Tree Borrows: deallocating strongly protected allocation"`);
    - `end_call` raising Tree Borrows protector-conflict UB when releasing a
      `Prot .Unique` protector conflicts with a strongly protected
      `Prot (.Frozen true)` sibling, **preempting** `BottomOfStack` UB (proving
@@ -3141,11 +3141,13 @@ theorem minirust_unwind_concrete_witnesses :
     (Interp.evalTerminatorM mProtDeallocTB .ResumeUnwind =
       .error (.ub "Tree Borrows: deallocating strongly protected allocation") ∧
      Interp.evalTerminatorM mEndCallConflictTB .ResumeUnwind =
-      .error (.ub "Tree Borrows: foreign write of protected Frozen reference which had a local read") ∧
+      .error (.ub
+        "Tree Borrows: foreign write of protected Frozen reference which had a local read") ∧
      Interp.evalTerminatorM m0TB .ResumeUnwind =
       .error (.ub "the function at the bottom of the stack must not unwind") ∧
      Interp.evalTerminatorM mNoUnwindTB .ResumeUnwind =
-      .error (.ub "unwinding from a function where the caller did not specify an unwind_block")) := by
+      .error (.ub
+        "unwinding from a function where the caller did not specify an unwind_block")) := by
   refine ⟨⟨_, rfl, rfl, rfl⟩, ⟨_, rfl, rfl, rfl⟩, ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩,
     ⟨_, rfl, rfl, rfl⟩, ⟨rfl, rfl, rfl⟩, ⟨_, rfl, rfl, rfl, rfl⟩, ⟨rfl, rfl, rfl, rfl⟩⟩
 
@@ -3191,9 +3193,10 @@ kernel-checked witnesses on both `Mach` and `MachTB`:
   6. Concrete negative controls on both `Mach` and `MachTB`: misaligned enum
      with missing variant `99` (UB wins over missing variant), misaligned
      non-enum (`specPanic` wins over misaligned UB), missing negative
-     discriminant `-1`, empty-tagger niche variant through an aligned null raw
-     pointer (succeeds with zero accesses), and out-of-bounds tagger offset
-     (`ptr_offset_inbounds` UB);
+     discriminant `-1`, empty-tagger niche variant through an aligned raw
+     pointer without provenance (succeeds with zero accesses: nothing is
+     stored, so the missing provenance never matters), and out-of-bounds
+     tagger offset (`ptr_offset_inbounds` UB);
   7. Concrete Tree Borrows per-byte aliasing witnesses on `MachTB`:
      `SetDiscriminant` through a `Frozen` pointer raises
      `"Tree Borrows: local write of Frozen reference"`, while a pointer that is
@@ -3268,7 +3271,7 @@ theorem minirust_setDiscriminant_supported :
      let loc : Gen.PlaceExpr := .Local ⟨⟨1⟩⟩
      let misalignEnum : Gen.PlaceExpr := .Deref (uwRawThinPtrExpr 0x101) sdEnumTy
      let misalignNonEnum : Gen.PlaceExpr := .Deref (uwRawThinPtrExpr 0x101) (.Int u32)
-     let nullAlignedEnum : Gen.PlaceExpr := .Deref (uwRawThinPtrExpr 0x100) sdEnumTy
+     let noProvAlignedEnum : Gen.PlaceExpr := .Deref (uwRawThinPtrExpr 0x100) sdEnumTy
      let expectedAccs : List Gen.Access :=
        [⟨.Store, .None, 0x100, ⟨1⟩⟩, ⟨.Store, .None, 0x104, ⟨2⟩⟩]
      let disc : Gen.Discriminator :=
@@ -3290,7 +3293,7 @@ theorem minirust_setDiscriminant_supported :
          "setting the discriminant type of a non-enum contradicts well-formedness") ∧
       Interp.evalStatement mBM (.SetDiscriminant loc (-1)) =
        .error (.specPanic "setting an invalid discriminant (-1)") ∧
-      Interp.evalStatement mBM (.SetDiscriminant nullAlignedEnum 8) = .ok mBM ∧
+      Interp.evalStatement mBM (.SetDiscriminant noProvAlignedEnum 8) = .ok mBM ∧
       Interp.evalStatement mBM (.SetDiscriminant loc 9) =
        .error (.ub "dereferencing pointer outside the bounds of its allocation")) ∧
      (Interp.evalStatementM mTB (.SetDiscriminant misalignEnum 99) =
@@ -3300,7 +3303,7 @@ theorem minirust_setDiscriminant_supported :
          "setting the discriminant type of a non-enum contradicts well-formedness") ∧
       Interp.evalStatementM mTB (.SetDiscriminant loc (-1)) =
        .error (.specPanic "setting an invalid discriminant (-1)") ∧
-      Interp.evalStatementM mTB (.SetDiscriminant nullAlignedEnum 8) = .ok mTB ∧
+      Interp.evalStatementM mTB (.SetDiscriminant noProvAlignedEnum 8) = .ok mTB ∧
       Interp.evalStatementM mTB (.SetDiscriminant loc 9) =
        .error (.ub "dereferencing pointer outside the bounds of its allocation")) ∧
      (Interp.evalStatementM mTBFrozen (.SetDiscriminant loc 7) =
@@ -3345,6 +3348,268 @@ theorem minirust_setDiscriminant_supported :
     · simp [Interp.evalStatementM, Interp.evalSetDiscriminantM, hp, ha, hnone, specPanic]
     · simp [Interp.evalStatementM, Interp.evalSetDiscriminantM, hp, ha, hsome,
         Interp.encodeDiscriminantM]
+
+/-- An enum whose variants list their tags in an order that differs from the
+order of the tag offsets: variant `1` lists the tag at offset `4` before the
+tag at offset `0`, and variants `2` and `3` each pair an out-of-bounds tag
+(offset `16` in an 8-byte enum) with an in-bounds tag (offset `0`), in
+opposite orders. -/
+private def sdOrderEnumTy : Gen.Type :=
+  let mk (tagger : List (Gen.Offset × (Gen.IntType × Int))) : Gen.Variant :=
+    { ty := .Tuple [] ⟨⟨8⟩, ⟨4⟩, none⟩ none, tagger := ⟨tagger⟩ }
+  .Enum
+    ⟨[(1, mk [(⟨4⟩, (u16, 0x5678)), (⟨0⟩, (u8, 0x03))]),
+      (2, mk [(⟨16⟩, (u8, 1)), (⟨0⟩, (u8, 0x03))]),
+      (3, mk [(⟨0⟩, (u8, 0x03)), (⟨16⟩, (u8, 1))])]⟩
+    u8 .Invalid ⟨8⟩ ⟨4⟩
+
+/-- **`Statement::SetDiscriminant` writes its tags in `tagger.entries` order
+(`minirust_setDiscriminant_tagger_order`)**: the witnesses of
+`minirust_setDiscriminant_supported` list their tags by ascending offset, so
+they cannot tell the order of the entries from the order of the offsets.
+Here the two differ:
+1. on `Mach` and `MachTB`, a variant listing the `u16` tag at offset `4`
+   before the `u8` tag at offset `0` produces the same bytes, but records its
+   two `Store` accesses as `0x104` then `0x100`: entry order, not address
+   order;
+2. on `MachTB` through an all-`Frozen` pointer, where both the out-of-bounds
+   tag and the in-bounds tag fail, the tag listed first decides the UB: the
+   bounds error of `ptr_offset_inbounds` when the out-of-bounds tag comes
+   first, the Tree Borrows write error when the in-bounds tag comes first.
+   So the reported `Stop` is that of the first failing entry in list
+   order. -/
+theorem minirust_setDiscriminant_tagger_order :
+    let fnEnum := uwFn [(⟨⟨1⟩⟩, sdOrderEnumTy)]
+    let allocBM : Gen.Allocation Unit Unit :=
+      { data := sdPayloadBytes, addr := 0x100, align := ⟨4⟩, kind := .Stack, live := true,
+        extra := () }
+    let frBM : Frame :=
+      { func := fnEnum, locals := ⟨[(⟨⟨1⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩)]⟩,
+        stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := () }
+    let mBM := uwMachBM [allocBM] [frBM] []
+    let mkAllocTB (perm : Gen.Permission) :
+        Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
+      { data := sdPayloadBytes, addr := 0x100, align := ⟨4⟩, kind := .Stack, live := true,
+        extra :=
+          { root :=
+              { children := [], permissions := List.replicate 8 perm, «protected» := .No } } }
+    let frTB : Gen.StackFrame TBM :=
+      { func := fnEnum, locals := ⟨[(⟨⟨1⟩⟩, ⟨0x100, some (⟨0⟩, [])⟩)]⟩,
+        stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := ⟨[]⟩ }
+    let mTB := uwMachTB [mkAllocTB (.Unprot .Unique)] [frTB] []
+    let mTBFrozen := uwMachTB [mkAllocTB (.Unprot .Frozen)] [frTB] []
+    let loc : Gen.PlaceExpr := .Local ⟨⟨1⟩⟩
+    let entryOrderAccs : List Gen.Access :=
+      [⟨.Store, .None, 0x104, ⟨2⟩⟩, ⟨.Store, .None, 0x100, ⟨1⟩⟩]
+    (∃ m', Interp.evalStatement mBM (.SetDiscriminant loc 1) = .ok m' ∧
+      m'.mem.memory.allocations.map (·.data) = [sdExpectedBytes] ∧
+      m'.mem.accesses = entryOrderAccs) ∧
+    (∃ m', Interp.evalStatementM mTB (.SetDiscriminant loc 1) = .ok m' ∧
+      m'.mem.memory.mem.allocations.map (·.data) = [sdExpectedBytes] ∧
+      m'.mem.accesses = entryOrderAccs) ∧
+    (Interp.evalStatementM mTBFrozen (.SetDiscriminant loc 2) =
+      .error (.ub "dereferencing pointer outside the bounds of its allocation") ∧
+     Interp.evalStatementM mTBFrozen (.SetDiscriminant loc 3) =
+      .error (.ub "Tree Borrows: local write of Frozen reference")) :=
+  ⟨⟨_, rfl, rfl, rfl⟩, ⟨_, rfl, rfl, rfl⟩, ⟨rfl, rfl⟩⟩
+
+/-- **`ResumeUnwind` propagates a failing frame teardown
+(`minirust_resumeUnwind_teardown_error`)**: this closes the case analysis of
+`minirust_unwind_terminators_supported`, whose `ResumeUnwind` clauses assume
+that `deallocAll` / `deallocAllM` succeeded. When `storage_dead` of a local of
+the popped frame stops (for example with Tree Borrows UB on a strongly
+protected local), `ResumeUnwind` stops with that same `Stop`. On `Machine M`
+this is before `end_call` runs, and on both machines it is before
+`stack_pop_action` is inspected, so a failing teardown preempts the UB of
+unwinding out of the bottom of the stack and of a missing unwind block. -/
+theorem minirust_resumeUnwind_teardown_error :
+    (∀ (m : Mach) (t : Gen.Thread BM) (fr : Frame) (e : Interp.Stop),
+      Interp.activeThread m = .ok t → t.stack.getLast? = some fr →
+      Interp.deallocAll fr.locals.entries.length fr m.mem = .error e →
+      Interp.evalTerminator m .ResumeUnwind = .error e) ∧
+    (∀ {M : Type} [Gen.Memory M] [Interp.MemoryOps M] (mM : Gen.Machine M)
+        (t : Gen.Thread M) (fr : Gen.StackFrame M) (e : Interp.Stop),
+      Interp.activeThreadM mM = .ok t → t.stack.getLast? = some fr →
+      Interp.deallocAllM fr.locals.entries.length fr mM.mem = .error e →
+      Interp.evalTerminatorM mM .ResumeUnwind = .error e) := by
+  refine ⟨?_, ?_⟩
+  · intro m t fr e ht hfr hdealloc
+    obtain ⟨hge, hget⟩ := listIndex_ok_get ht
+    have hlt : m.active_thread.toNat < m.threads.length :=
+      (List.getElem?_eq_some_iff.mp hget).1
+    simp only [Interp.evalTerminator, Interp.evalResumeUnwind]
+    rw [ht]
+    simp only [ok_bind, hfr, pure_ok, listSet, hge, hlt, and_self, ↓reduceIte, hdealloc,
+      error_bind]
+  · intro M _ _ mM t fr e ht hfr hdealloc
+    obtain ⟨hge, hget⟩ := listIndex_ok_get ht
+    have hlt : mM.active_thread.toNat < mM.threads.length :=
+      (List.getElem?_eq_some_iff.mp hget).1
+    simp only [Interp.evalTerminatorM, Interp.evalResumeUnwindM]
+    rw [ht]
+    simp only [ok_bind, hfr, pure_ok, listSet, hge, hlt, and_self, ↓reduceIte, hdealloc,
+      error_bind]
+
+/-- Callee of `minirust_unwind_setDiscriminant_step_witness`: its entry block
+brings an enum local to life, sets its discriminant, and starts unwinding into
+the cleanup block, which resumes unwinding in the caller. -/
+private def uwStepCalleeFn : Gen.Function :=
+  { locals := ⟨[(⟨⟨0⟩⟩, .Int u8), (⟨⟨1⟩⟩, sdEnumTy)]⟩
+    args := []
+    ret := ⟨⟨0⟩⟩
+    calling_convention := .Rust
+    blocks := ⟨[
+      (⟨⟨0⟩⟩, ⟨[.StorageLive ⟨⟨1⟩⟩, .SetDiscriminant (.Local ⟨⟨1⟩⟩) 7],
+        .StartUnwind (uwRawThinPtrExpr 0x1000) ⟨⟨1⟩⟩, .Regular⟩),
+      (⟨⟨1⟩⟩, ⟨[], .ResumeUnwind, .Cleanup⟩)]⟩
+    start := ⟨⟨0⟩⟩
+    implicit_writes := false }
+
+/-- Caller of `minirust_unwind_setDiscriminant_step_witness`: it calls
+`uwStepCalleeFn` with return block `1` and unwind block `2`; the unwind block
+is a catch block that stops unwinding and continues in block `3`. -/
+private def uwStepCallerFn : Gen.Function :=
+  { locals := ⟨[(⟨⟨0⟩⟩, .Int u8)]⟩
+    args := []
+    ret := ⟨⟨0⟩⟩
+    calling_convention := .Rust
+    blocks := ⟨[
+      (⟨⟨0⟩⟩, ⟨[], .Call (fnPtrExpr (fnName 1)) .Rust [] (.Local ⟨⟨0⟩⟩)
+        (some ⟨⟨1⟩⟩) (some ⟨⟨2⟩⟩), .Regular⟩),
+      (⟨⟨1⟩⟩, ⟨[], .Unreachable, .Regular⟩),
+      (⟨⟨2⟩⟩, ⟨[], .StopUnwind ⟨⟨3⟩⟩, .Catch⟩),
+      (⟨⟨3⟩⟩, ⟨[], .Unreachable, .Regular⟩)]⟩
+    start := ⟨⟨0⟩⟩
+    implicit_writes := false }
+
+private def uwStepProg : Gen.Program :=
+  { functions := ⟨[(fnName 0, uwStepCallerFn), (fnName 1, uwStepCalleeFn)]⟩
+    start := fnName 0
+    globals := ⟨[]⟩
+    traits := ⟨[]⟩
+    vtables := ⟨[]⟩ }
+
+/-- `uwStepCallerFn` about to execute its `Call`, on `Mach`: one thread, one
+frame, and the caller's `u8` return place live at `0x100`. -/
+private def uwStepMachBM : Mach :=
+  { uwMachBM [uwLiveStackAllocBM 0x100]
+      [{ func := uwStepCallerFn, locals := ⟨[(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩)]⟩,
+         stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0,
+         extra := () }]
+      [] with
+    prog := uwStepProg
+    fn_ptrs := ⟨[(fnName 1, ⟨0x8000, none⟩)]⟩ }
+
+/-- A Tree Borrows stack allocation as `TreeBorrowsMemory::allocate` creates
+it: `n` uninitialized bytes under a root node that is `Unique` on every byte
+and unprotected. -/
+private def uwFreshAllocTB (addr : Int) (align n : Nat) :
+    Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
+  { data := List.replicate n .Uninit
+    addr := addr
+    align := ⟨align⟩
+    kind := .Stack
+    live := true
+    extra :=
+      { root :=
+          { children := []
+            permissions := List.replicate n (.Unprot .Unique)
+            «protected» := .No } } }
+
+/-- The program of `uwStepMachBM` on `MachTB`, hand-built at the point where
+`uwStepCalleeFn` is about to execute its `SetDiscriminant`: the callee frame
+is as `eval_call` pushes it for the `Call` of `uwStepCallerFn` (return block
+`1`, unwind block `2`), and its return local and enum local are fresh
+allocations (`uwFreshAllocTB`), as after `create_frame` and `StorageLive`. -/
+private def uwStepMidMachTB : MachTB :=
+  { uwMachTB [uwFreshAllocTB 0x100 1 1, uwFreshAllocTB 0x200 1 1, uwFreshAllocTB 0x300 4 8]
+      [{ func := uwStepCallerFn, locals := ⟨[(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, [])⟩)]⟩,
+         stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0,
+         extra := ⟨[]⟩ },
+       { func := uwStepCalleeFn,
+         locals :=
+           ⟨[(⟨⟨0⟩⟩, ⟨0x200, some (⟨1⟩, [])⟩), (⟨⟨1⟩⟩, ⟨0x300, some (⟨2⟩, [])⟩)]⟩,
+         stack_pop_action :=
+           .BackToCaller (some ⟨⟨1⟩⟩) (some ⟨⟨2⟩⟩) ⟨0x100, some (⟨0⟩, [])⟩,
+         next_block := ⟨⟨0⟩⟩, next_stmt := 1, extra := ⟨[]⟩ }]
+      [] with
+    prog := uwStepProg
+    fn_ptrs := ⟨[(fnName 1, ⟨0x8000, none⟩)]⟩ }
+
+/-- The enum local of `uwStepCalleeFn` after `SetDiscriminant`: fresh storage
+is uninitialized, and only the three tag bytes have been written. -/
+private def uwStepEnumBytes {P : Type} : List (Gen.AbstractByte P) :=
+  [.Init 0x03 none, .Uninit, .Uninit, .Uninit,
+   .Init 0x78 none, .Init 0x56 none, .Uninit, .Uninit]
+
+/-- **Unwinding and `SetDiscriminant` through `Machine::step`
+(`minirust_unwind_setDiscriminant_step_witness`)**: the other witnesses of
+this section call `evalStatement[M]` / `evalTerminator[M]` on hand-built
+frames. Here a two-function program runs through `Interp.steps` and
+`Interp.stepsTB`, so the new statement and terminators are reached through
+the block lookup, program-counter updates, and data-race check of `step`.
+Below, `pcs` is the `(next_block, next_stmt)` of every frame, bottom frame
+first.
+
+On `Mach` the run starts at the caller's `Call`, so the unwind block comes
+from that terminator and the callee's locals are made by `create_frame` and
+`StorageLive`:
+- after 3 steps (`Call`, `StorageLive`, `SetDiscriminant`) the callee's enum
+  local holds exactly its three tag bytes and the callee is at statement `2`
+  of its entry block;
+- after 4 steps (`StartUnwind`) the payload stack is `[0x1000]`, the callee
+  is in its cleanup block, and all three allocations are still live;
+- after 5 steps (`ResumeUnwind`) the callee frame is gone, both of its locals
+  are dead, the payload is still on the payload stack, and the caller is at
+  the unwind block `2` named by its `Call`, not at the return block `1`;
+- after 6 steps (`StopUnwind`) the payload stack is empty and the caller is
+  in block `3`;
+- the 7th step reaches the `Unreachable` of block `3`, so execution really
+  continued in the caller after the catch block.
+
+On `MachTB` the run starts from `uwStepMidMachTB`, a hand-built machine that
+already stands at the callee's `SetDiscriminant`, and takes the same last
+five steps with the same results. It does not start at the `Call`: checking
+`Call`, `StorageLive`, and the tag stores in one run by `rfl` exhausts memory
+on Tree Borrows, so the `Call` itself is exercised on `Mach` only. -/
+theorem minirust_unwind_setDiscriminant_step_witness :
+    let pcsBM (m : Mach) :=
+      m.threads.map (fun t => t.stack.map (fun f => (f.next_block, f.next_stmt)))
+    let pcsTB (m : MachTB) :=
+      m.threads.map (fun t => t.stack.map (fun f => (f.next_block, f.next_stmt)))
+    let payload : Ptr := ⟨0x1000, none⟩
+    let payloadTB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x1000, none⟩
+    ((Interp.steps 3 uwStepMachBM).toOption.map
+          (fun m => (m.mem.memory.allocations.map (·.data), pcsBM m)) =
+        some ([[.Uninit], [.Uninit], uwStepEnumBytes], [[(⟨⟨0⟩⟩, 0), (⟨⟨0⟩⟩, 2)]]) ∧
+      (Interp.steps 4 uwStepMachBM).toOption.map
+          (fun m => (m.threads.map (·.unwind_payloads), pcsBM m,
+            m.mem.memory.allocations.map (·.live))) =
+        some ([[payload]], [[(⟨⟨0⟩⟩, 0), (⟨⟨1⟩⟩, 0)]], [true, true, true]) ∧
+      (Interp.steps 5 uwStepMachBM).toOption.map
+          (fun m => (m.threads.map (·.unwind_payloads), pcsBM m,
+            m.mem.memory.allocations.map (·.live))) =
+        some ([[payload]], [[(⟨⟨2⟩⟩, 0)]], [true, false, false]) ∧
+      (Interp.steps 6 uwStepMachBM).toOption.map
+          (fun m => (m.threads.map (·.unwind_payloads), pcsBM m)) =
+        some ([[]], [[(⟨⟨3⟩⟩, 0)]]) ∧
+      Interp.steps 7 uwStepMachBM = .error (.ub "reached unreachable code")) ∧
+    ((Interp.stepsTB 1 uwStepMidMachTB).toOption.map
+          (fun m => (m.mem.memory.mem.allocations.map (·.data), pcsTB m)) =
+        some ([[.Uninit], [.Uninit], uwStepEnumBytes], [[(⟨⟨0⟩⟩, 0), (⟨⟨0⟩⟩, 2)]]) ∧
+      (Interp.stepsTB 2 uwStepMidMachTB).toOption.map
+          (fun m => (m.threads.map (·.unwind_payloads), pcsTB m,
+            m.mem.memory.mem.allocations.map (·.live))) =
+        some ([[payloadTB]], [[(⟨⟨0⟩⟩, 0), (⟨⟨1⟩⟩, 0)]], [true, true, true]) ∧
+      (Interp.stepsTB 3 uwStepMidMachTB).toOption.map
+          (fun m => (m.threads.map (·.unwind_payloads), pcsTB m,
+            m.mem.memory.mem.allocations.map (·.live))) =
+        some ([[payloadTB]], [[(⟨⟨2⟩⟩, 0)]], [true, false, false]) ∧
+      (Interp.stepsTB 4 uwStepMidMachTB).toOption.map
+          (fun m => (m.threads.map (·.unwind_payloads), pcsTB m)) =
+        some ([[]], [[(⟨⟨3⟩⟩, 0)]]) ∧
+      Interp.stepsTB 5 uwStepMidMachTB = .error (.ub "reached unreachable code")) :=
+  ⟨⟨rfl, rfl, rfl, rfl, rfl⟩, ⟨rfl, rfl, rfl, rfl, rfl⟩⟩
 
 /-- **`sizeOfVal` & `alignOfVal` on unsized `RigidTy.str` (`&str` / `*const str`) ↔ MiniRust
 `Type.layout (.Slice (.Int u8))` (`evalLIntrinsic_sizeOfVal_alignOfVal_str_minirust_layout`,
