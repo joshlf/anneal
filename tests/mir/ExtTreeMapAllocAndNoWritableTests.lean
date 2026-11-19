@@ -2488,8 +2488,9 @@ theorem canary_part2A_frameExit_lifecycle_inv :
 /-- Success of the protector-end access and of explicit range accesses is characterized pointwise
 (order-independent), and the protector-end access leaves the released tag's strict descendants untouched. -/
 theorem canary_part2A_access_order_independence_and_skipChildren :
-    (∃ nodes', relWAfter = { relW with nodes := nodes' } ∧
-      ListRel (ProtectorEndStepRel relW 1 true 0 8) relW.nodes nodes') ∧
+    ((∃ n, findNode? relW.nodes 1 = some n) ∧
+      ∃ nodes', relWAfter = { relW with nodes := nodes' } ∧
+        ListRel (ProtectorEndStepRel relW 1 true 0 8) relW.nodes nodes') ∧
     ListRel (fun n n' => (ancestorPathTags relW.nodes 1).contains n.tag = false →
       isStrictDescendantOf relW.nodes 1 n = true → n' = n) relW.nodes relWAfter.nodes ∧
     isStrictDescendantOf relW.nodes 1 relC = true ∧ isStrictDescendantOf relW.nodes 1 relY = false ∧
@@ -2503,13 +2504,128 @@ theorem canary_part2A_access_order_independence_and_skipChildren :
         ListRel (PrunedStepRel relW 1 false 0 8
           (fun isLoc m => stepNodeOnRangeRead relW.activeProtectors isLoc 0 8 m)) relW.nodes nodes') := by
   have hok : execProtectorEndAccess relW 1 true 0 8 = .ok relWAfter := rfl
-  have hinv := (execProtectorEndAccess_ok_iff relW relWAfter 1 true 0 8).1 hok
+  have hinv := (execProtectorEndAccess_ok_iff relW relWAfter 1 true 0 8 (by decide)).1 hok
   have hdesc := execProtectorEndAccess_descendants_untouched hok
   have hw := (execWorldRangeWrite_ok_iff relW
     { relW with nodes := [{ relC with perm := .disabled }, { relY with perm := .disabled }, relX, relR] }
     1 0 8 (by decide)).1 rfl
   have hr := (execWorldRangeRead_ok_iff relW relW 1 0 8 (by decide)).1 rfl
   exact ⟨hinv, hdesc, rfl, rfl, hw, hr⟩
+
+private def disjA : TreeTagNode := ⟨1, some 0, .unique, 0, 4, some 7, true⟩
+private def disjB : TreeTagNode := ⟨2, some 0, .reservedFrz false, 4, 4, some 8, true⟩
+private def disjW : FnEntryBorrowWorld where
+  nodes := [disjB, disjA, relR]
+  activeProtectors := [7, 8]
+  nextTag := 3
+  nextProtector := 9
+
+/-- Guard soundness on `execProtectorEndAccess` (zero-length no-op, missing-tag `.missingParentTag`),
+the end-to-end `FnEntry` retag → function-exit bridge (`.rustcNoWritable` emits implicit READ, non-ZST
+`.writableChildWrite` emits implicit WRITE, both agree between Miri and MiniRust), and multi-entry
+Miri/MiniRust frame-exit agreement on a two-parameter disjoint-field frame (`[0, 4)` and `[4, 8)`). -/
+theorem canary_part2A_protectorEnd_guards_retagBridge_and_multiEntryDisjoint :
+    execProtectorEndAccess relW 99 true 0 0 = .ok relW ∧
+    execProtectorEndAccess relW 99 true 0 8 = .error (.missingParentTag 99) ∧
+    (∃ child, findNode? invChainW1.nodes 1 = some child ∧
+      execFrameExitMiniRust invChainW1 [(1, 10)] = execFrameExitMiri invChainW1 [(1, 10)] ∧
+      protectorEndAccessIsWrite? child = some false) ∧
+    (∃ wW child,
+      execFnEntryMutRetagPrunedSourceOrder invChainW0 0 0 4 .writableChildWrite false = .ok (wW, 1) ∧
+      findNode? wW.nodes 1 = some child ∧
+      execFrameExitMiniRust wW [(1, 10)] = execFrameExitMiri wW [(1, 10)] ∧
+      protectorEndAccessIsWrite? child = some true) ∧
+    FrameProtectorsRangeDisjoint disjW.nodes [(1, 7), (2, 8)] ∧
+    FrameEntriesRangeDisjoint disjW.nodes [(1, 7), (2, 8)] ∧
+    stepNodeOnRangeAccess ([7, 8].filter (· != 7)) false true 4 4 disjB =
+      stepNodeOnRangeAccess [7, 8] false true 4 4 disjB ∧
+    execProtectorEndAccess (releaseProtector disjW 7) 2 false 4 4 =
+      (execProtectorEndAccess disjW 2 false 4 4).map (releaseProtector · 7) ∧
+    ListRel NodeMetaRel disjW.nodes disjW.nodes ∧
+    execProtectorEndAccessFor protectorEndAccessIsWrite? (releaseProtector disjW 7) 2 =
+      (execProtectorEndAccessFor protectorEndAccessIsWrite? disjW 2).map (releaseProtector · 7) ∧
+    execFrameExitSequential protectorEndAccessIsWrite? disjW [(1, 7), (2, 8)] =
+      execFrameExitMiri disjW [(1, 7), (2, 8)] ∧
+    execFrameExitMiniRust disjW [(1, 7), (2, 8)] = execFrameExitMiri disjW [(1, 7), (2, 8)] := by
+  have hg := execProtectorEndAccess_missingTag_and_zeroLen relW 99 true 0 8
+  have hrNo := execFnEntryMutRetagPrunedSourceOrder_child_singleton_exit_eq
+    invChainW0 invChainW1 0 0 4 1 .rustcNoWritable false (by decide) rfl
+  rcases hrNo with ⟨c1, hf1, _, _, heq1, hk1, _⟩
+  let wWr : FnEntryBorrowWorld := {
+    nodes := [⟨1, some 0, .unique, 0, 4, some 10, true⟩, ⟨0, none, .unique, 0, 4, none, true⟩]
+    activeProtectors := [10]
+    nextTag := 2
+    nextProtector := 11 }
+  have hwrOk : execFnEntryMutRetagPrunedSourceOrder invChainW0 0 0 4 .writableChildWrite false = .ok (wWr, 1) := rfl
+  have hrWr := execFnEntryMutRetagPrunedSourceOrder_child_singleton_exit_eq
+    invChainW0 wWr 0 0 4 1 .writableChildWrite false (by decide) hwrOk
+  rcases hrWr with ⟨c2, hf2, _, _, heq2, _, hk2⟩
+  have hprot : FrameProtectorsRangeDisjoint disjW.nodes [(1, 7), (2, 8)] := by
+    refine List.Pairwise.cons ?_ (List.Pairwise.cons (fun _ h => nomatch h) List.Pairwise.nil)
+    intro e2 he2 n2 hn2 htag2 m hm hpm
+    rcases List.mem_singleton.mp he2 with rfl
+    simp only [disjW, List.mem_cons, List.not_mem_nil, or_false] at hn2 hm
+    rcases hn2 with rfl | rfl | rfl
+    · rcases hm with rfl | rfl | rfl
+      · cases hpm
+      · rfl
+      · cases hpm
+    · cases htag2
+    · cases htag2
+  have hent : FrameEntriesRangeDisjoint disjW.nodes [(1, 7), (2, 8)] := by
+    refine List.Pairwise.cons ?_ (List.Pairwise.cons (fun _ h => nomatch h) List.Pairwise.nil)
+    intro e2 he2 n1 hn1 htag1 n2 hn2 htag2
+    rcases List.mem_singleton.mp he2 with rfl
+    simp only [disjW, List.mem_cons, List.not_mem_nil, or_false] at hn1 hn2
+    rcases hn1 with rfl | rfl | rfl
+    · cases htag1
+    · rcases hn2 with rfl | rfl | rfl
+      · rfl
+      · cases htag2
+      · cases htag2
+    · cases htag1
+  have henv : ∀ e ∈ ([(1, 7), (2, 8)] : List (Nat × Nat)), ∀ n ∈ disjW.nodes, n.tag = e.1 →
+      n.perm ≠ .disabled ∧ (n.perm = .unique → n.accessed = true) := by
+    intro e he n hn htag
+    simp only [List.mem_cons, List.not_mem_nil, or_false] at he
+    simp only [disjW, List.mem_cons, List.not_mem_nil, or_false] at hn
+    rcases he with rfl | rfl
+    · rcases hn with rfl | rfl | rfl
+      · cases htag
+      · exact ⟨by decide, fun _ => rfl⟩
+      · cases htag
+    · rcases hn with rfl | rfl | rfl
+      · exact ⟨by decide, fun h => by cases h⟩
+      · cases htag
+      · cases htag
+  have hstep := stepNodeOnRangeAccess_releaseProtector_of_disjoint [7, 8] 7 false true 4 4 disjB
+    (fun h => by cases h)
+  have hcommA := execProtectorEndAccess_comm_releaseProtector_of_disjoint disjW 2 7 false 4 4 (by
+    intro m hm hpm
+    simp only [disjW, List.mem_cons, List.not_mem_nil, or_false] at hm
+    rcases hm with rfl | rfl | rfl
+    · cases hpm
+    · rfl
+    · cases hpm)
+  have hmeta := execProtectorEndAccessFor_nodeMetaRel (kind? := protectorEndAccessIsWrite?)
+    (w := disjW) (w' := disjW) (t := 2) rfl
+  have hcommF := execProtectorEndAccessFor_comm_releaseProtector_of_disjoint protectorEndAccessIsWrite?
+    disjW 2 7 (by
+      intro n hn htag m hm hpm
+      simp only [disjW, List.mem_cons, List.not_mem_nil, or_false] at hn hm
+      rcases hn with rfl | rfl | rfl
+      · rcases hm with rfl | rfl | rfl
+        · cases hpm
+        · rfl
+        · cases hpm
+      · cases htag
+      · cases htag)
+  have hseq := execFrameExitSequential_eq_allAccessThenRelease_of_disjointProtectors
+    protectorEndAccessIsWrite? [(1, 7), (2, 8)] disjW hprot
+  have hmulti := execFrameExit_miri_eq_miniRust_of_disjointFrame disjW [(1, 7), (2, 8)] hprot hent henv
+  exact ⟨hg.1, hg.2 (by decide) rfl, ⟨c1, hf1, heq1, hk1 (Or.inl rfl)⟩,
+    ⟨wWr, c2, hwrOk, hf2, heq2, hk2 rfl (by decide)⟩,
+    hprot, hent, hstep, hcommA, hmeta, hcommF, hseq, hmulti⟩
 
 /-- Read-only precedes bounds (`getAllocRawMut` before `checkedBounds`): an OUT-OF-BOUNDS non-zero write
 into an immutable static reports `.readOnlyAlloc`, into a mutable static `.outOfBounds`; plus direct uses
@@ -3173,17 +3289,18 @@ info: 'Anneal.ExtTreeMapAllocAndNoWritable.ProtectorEndStepRel.nodeMetaRel' depe
 #guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.ProtectorEndStepRel.nodeMetaRel
 
 /--
-info: 'Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccess_ok_inv' depends on axioms: [propext]
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccess_ok_inv' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccess_ok_inv
 
 /--
-info: 'Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccess_descendants_untouched' depends on axioms: [propext]
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccess_descendants_untouched' depends on axioms: [propext,
+ Quot.sound]
 -/
 #guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccess_descendants_untouched
 
 /--
-info: 'Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccess_preserves_inv' depends on axioms: [propext]
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccess_preserves_inv' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccess_preserves_inv
 
@@ -3193,7 +3310,7 @@ info: 'Anneal.ExtTreeMapAllocAndNoWritable.protectorEnd_self_step_invariant' dep
 #guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.protectorEnd_self_step_invariant
 
 /--
-info: 'Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccessFor_preserves_inv' depends on axioms: [propext]
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccessFor_preserves_inv' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccessFor_preserves_inv
 
@@ -3203,7 +3320,7 @@ info: 'Anneal.ExtTreeMapAllocAndNoWritable.releaseProtectors_preserves_inv' depe
 #guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.releaseProtectors_preserves_inv
 
 /--
-info: 'Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccesses_preserves_inv' depends on axioms: [propext]
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccesses_preserves_inv' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccesses_preserves_inv
 
@@ -3402,6 +3519,53 @@ info: 'Anneal.ExtTreeMapAllocAndNoWritable.sortDedupKeyIds_perm' depends on axio
 info: 'Anneal.ExtTreeMapAllocAndNoWritable.execFrameExit_miri_eq_miniRust_singleton' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execFrameExit_miri_eq_miniRust_singleton
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccess_missingTag_and_zeroLen' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccess_missingTag_and_zeroLen
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.execFnEntryMutRetagPrunedSourceOrder_child_singleton_exit_eq' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execFnEntryMutRetagPrunedSourceOrder_child_singleton_exit_eq
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.stepNodeOnRangeAccess_releaseProtector_of_disjoint' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.stepNodeOnRangeAccess_releaseProtector_of_disjoint
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccess_comm_releaseProtector_of_disjoint' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccess_comm_releaseProtector_of_disjoint
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccessFor_nodeMetaRel' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccessFor_nodeMetaRel
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccessFor_comm_releaseProtector_of_disjoint' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execProtectorEndAccessFor_comm_releaseProtector_of_disjoint
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.execFrameExitSequential_eq_allAccessThenRelease_of_disjointProtectors' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execFrameExitSequential_eq_allAccessThenRelease_of_disjointProtectors
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritable.execFrameExit_miri_eq_miniRust_of_disjointFrame' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms Anneal.ExtTreeMapAllocAndNoWritable.execFrameExit_miri_eq_miniRust_of_disjointFrame
 
 /-! ## Section 6: Meta-Level `run_cmd` Audit & Rolled-Back Self-Tests -/
 

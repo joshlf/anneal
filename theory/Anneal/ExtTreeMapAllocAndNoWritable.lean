@@ -87,15 +87,20 @@ models cover `&mut` / `Box` parameters only
 order whereas Model 5 and standalone `execFnEntryMutRetagTraversalOrderDirect` follow upstream reverse-
 children postorder (proved identical with no fallback on every `BorrowTreeRootedWF` tree), and the
 explicit accesses `execWorldRange{Read,Write}` and the protector-end access `execProtectorEndAccess` use
-the same list-order foreign blame (their success results are order-independent, see the `_ok_inv`
-inversions); function exit is modeled per allocation with the coarse node range, so a protected node
-written on only part of its range performs its implicit protector-end WRITE over the whole range (upstream
-decides per location), the wildcard-exposure update `updateExposureForProtectorRelease` is not modeled,
-and pinned Miri (`execFrameExitMiri`: all implicit accesses, then pop every protector) and MiniRust
-(`execFrameExitMiniRust`: access and unprotect entry by entry, no protected-self step, different kind
-table on unreachable shapes) are kept as separate definitions that coincide on single-entry frames whose
-protected node is neither `.disabled` nor an unaccessed `.unique`
-(`execFrameExit_miri_eq_miniRust_singleton`), with no agreement theorem for multi-entry frames; allocations
+the same list-order foreign blame with zero-length no-op and missing-tag fail-closed guards (their success
+results are order-independent, see the `_ok_inv`/`_ok_iff` characterizations); function exit is modeled per
+allocation with the coarse node range, so a protected node written on only part of its range performs its
+implicit protector-end WRITE over the whole range (upstream decides per location), the wildcard-exposure
+update `updateExposureForProtectorRelease` is not modeled, and pinned Miri (`execFrameExitMiri`: all
+implicit accesses, then pop every protector) and MiniRust (`execFrameExitMiniRust`: access and unprotect
+entry by entry, no protected-self step, different kind table on unreachable shapes) are kept as separate
+definitions proved identical both on single-entry frames in the reachable envelope
+(`execFrameExit_miri_eq_miniRust_singleton`, connected directly to `FnEntry` retags via
+`execFnEntryMutRetagPrunedSourceOrder_child_singleton_exit_eq`) and on arbitrary multi-entry frames with
+pairwise disjoint protected/entry ranges (`execFrameExit_miri_eq_miniRust_of_disjointFrame`, plus
+general order agreement `execFrameExitSequential_eq_allAccessThenRelease_of_disjointProtectors`), while
+overlapping multi-entry frames remain unbridged in general (separating on non-reachable conflicted-parent
+states, `execFrameExit_miri_vs_sequential_separation`); allocations
 carry no base addresses, so nested `dyn` vtable words are resolved through an explicit non-zero `vtBase`
 map (`validateWideDynSafePtrDeep`) and fail closed without one; only `.static` / `.memory` globals
 carry a byte payload; and `StaticTyDesc` models scalar/padding/`UnsafeCell`/struct composites
@@ -8633,29 +8638,48 @@ allocation-mutability check is made (the release operates on the borrow tree dir
 `getAllocRawMut`). -/
 def execProtectorEndAccess (w : FnEntryBorrowWorld) (sourceTag : Nat) (isWrite : Bool)
     (off len : Nat) : Except RetagStepErr FnEntryBorrowWorld :=
-  let ancestors := ancestorPathTags w.nodes sourceTag
-  let stepPruned (n : TreeTagNode) : Except RetagStepErr TreeTagNode :=
-    if ancestors.contains n.tag then
-      stepNodeOnRangeAccess w.activeProtectors isWrite true off len n
-    else if isStrictDescendantOf w.nodes sourceTag n ||
-        isPrunedForeignNode w.nodes ancestors isWrite off len n then
-      .ok n
-    else
-      stepNodeOnRangeAccess w.activeProtectors isWrite false off len n
-  let activeForeign := w.nodes.filter (fun n =>
-    !ancestors.contains n.tag &&
-      !(isStrictDescendantOf w.nodes sourceTag n ||
-        isPrunedForeignNode w.nodes ancestors isWrite off len n))
-  match checkAncestorPathM w sourceTag
-      (stepNodeOnRangeAccess w.activeProtectors isWrite true off len) with
-  | .error e => .error e
-  | .ok () =>
-    match checkNodesM (stepNodeOnRangeAccess w.activeProtectors isWrite false off len) activeForeign with
-    | .error e => .error e
-    | .ok () =>
-      match mapNodesM stepPruned w.nodes with
+  if len == 0 then
+    .ok w
+  else
+    match findNode? w.nodes sourceTag with
+    | none => .error (.missingParentTag sourceTag)
+    | some _ =>
+      let ancestors := ancestorPathTags w.nodes sourceTag
+      let stepPruned (n : TreeTagNode) : Except RetagStepErr TreeTagNode :=
+        if ancestors.contains n.tag then
+          stepNodeOnRangeAccess w.activeProtectors isWrite true off len n
+        else if isStrictDescendantOf w.nodes sourceTag n ||
+            isPrunedForeignNode w.nodes ancestors isWrite off len n then
+          .ok n
+        else
+          stepNodeOnRangeAccess w.activeProtectors isWrite false off len n
+      let activeForeign := w.nodes.filter (fun n =>
+        !ancestors.contains n.tag &&
+          !(isStrictDescendantOf w.nodes sourceTag n ||
+            isPrunedForeignNode w.nodes ancestors isWrite off len n))
+      match checkAncestorPathM w sourceTag
+          (stepNodeOnRangeAccess w.activeProtectors isWrite true off len) with
       | .error e => .error e
-      | .ok nodes' => .ok { w with nodes := nodes' }
+      | .ok () =>
+        match checkNodesM (stepNodeOnRangeAccess w.activeProtectors isWrite false off len) activeForeign with
+        | .error e => .error e
+        | .ok () =>
+          match mapNodesM stepPruned w.nodes with
+          | .error e => .error e
+          | .ok nodes' => .ok { w with nodes := nodes' }
+
+/-- Guard soundness for `execProtectorEndAccess`: zero-sized protector-end accesses are a no-op, and
+non-zero accesses through a missing tag fail closed with `.missingParentTag` (never mutating foreign
+nodes). -/
+theorem execProtectorEndAccess_missingTag_and_zeroLen (w : FnEntryBorrowWorld) (sourceTag : Nat)
+    (isWrite : Bool) (off len : Nat) :
+    execProtectorEndAccess w sourceTag isWrite off 0 = .ok w ∧
+    (len ≠ 0 → findNode? w.nodes sourceTag = none →
+      execProtectorEndAccess w sourceTag isWrite off len = .error (.missingParentTag sourceTag)) := by
+  refine ⟨rfl, ?_⟩
+  intro hlen hfn
+  have hb : (len == 0) = false := beq_false_of_ne hlen
+  simp [execProtectorEndAccess, hb, hfn]
 
 /-- Per-node success relation of `execProtectorEndAccess`: LOCAL step on the access path, identity on the
 strict descendants of the released tag and beneath skipped foreign subtrees, FOREIGN step elsewhere. -/
@@ -8696,43 +8720,81 @@ theorem execProtectorEndAccess_ok_inv {w w' : FnEntryBorrowWorld} {sourceTag : N
     ∃ nodes', w' = { w with nodes := nodes' } ∧
       ListRel (ProtectorEndStepRel w sourceTag isWrite off len) w.nodes nodes' := by
   unfold execProtectorEndAccess at hok
-  cases hanc : checkAncestorPathM w sourceTag
-      (stepNodeOnRangeAccess w.activeProtectors isWrite true off len) with
-  | error _ => rw [hanc] at hok; cases hok
-  | ok _ =>
-    rw [hanc] at hok
-    simp only at hok
-    split at hok
-    · cases hok
-    · split at hok
-      · cases hok
-      · rename_i nodes' hmap
-        injection hok with hw
-        refine ⟨nodes', hw.symm, ?_⟩
-        have hrel0 := (mapNodesM_ok_iff _ _ _).1 hmap
-        refine ListRel.imp (fun x y hxy => ?_) hrel0
+  cases hlen : (len == 0) with
+  | true =>
+    have hl0 : len = 0 := eq_of_beq hlen
+    subst hl0
+    simp only [hlen, ↓reduceIte] at hok
+    injection hok with hw
+    subst hw
+    refine ⟨w.nodes, rfl, ?_⟩
+    have hstep0 : ∀ (isLoc : Bool) (n : TreeTagNode),
+        stepNodeOnRangeAccess w.activeProtectors isWrite isLoc off 0 n = .ok n := by
+      intro isLoc n
+      unfold stepNodeOnRangeAccess stepNodeOnRangeWrite stepNodeOnRangeRead
+      cases isWrite <;> simp [rangesOverlap]
+    have hrefl : ∀ xs : List TreeTagNode,
+        ListRel (ProtectorEndStepRel w sourceTag isWrite off 0) xs xs := by
+      intro xs
+      induction xs with
+      | nil => exact ListRel.nil
+      | cons x rest ih =>
+        refine ListRel.cons ?_ ih
         unfold ProtectorEndStepRel
         cases ha : (ancestorPathTags w.nodes sourceTag).contains x.tag with
-        | true =>
-          simp only [ha, ↓reduceIte] at hxy
-          exact Or.inl ⟨rfl, hxy⟩
+        | true => exact Or.inl ⟨rfl, hstep0 true x⟩
         | false =>
-          simp only [ha, Bool.false_eq_true, ↓reduceIte] at hxy
           cases hd : isStrictDescendantOf w.nodes sourceTag x with
-          | true =>
-            simp only [hd, Bool.true_or, ↓reduceIte] at hxy
-            injection hxy with hEq
-            exact Or.inr (Or.inl ⟨rfl, Or.inl rfl, hEq.symm⟩)
+          | true => exact Or.inr (Or.inl ⟨rfl, Or.inl rfl, rfl⟩)
           | false =>
-            simp only [hd, Bool.false_or] at hxy
-            cases hp : isPrunedForeignNode w.nodes (ancestorPathTags w.nodes sourceTag) isWrite off len x with
+            cases hp : isPrunedForeignNode w.nodes (ancestorPathTags w.nodes sourceTag) isWrite off 0 x with
+            | true => exact Or.inr (Or.inl ⟨rfl, Or.inr rfl, rfl⟩)
+            | false => exact Or.inr (Or.inr ⟨rfl, rfl, rfl, hstep0 false x⟩)
+    exact hrefl w.nodes
+  | false =>
+    simp only [hlen, Bool.false_eq_true, ↓reduceIte] at hok
+    cases hfn : findNode? w.nodes sourceTag with
+    | none => rw [hfn] at hok; cases hok
+    | some _ =>
+      rw [hfn] at hok
+      simp only at hok
+      cases hanc : checkAncestorPathM w sourceTag
+          (stepNodeOnRangeAccess w.activeProtectors isWrite true off len) with
+      | error _ => rw [hanc] at hok; cases hok
+      | ok _ =>
+        rw [hanc] at hok
+        simp only at hok
+        split at hok
+        · cases hok
+        · split at hok
+          · cases hok
+          · rename_i nodes' hmap
+            injection hok with hw
+            refine ⟨nodes', hw.symm, ?_⟩
+            have hrel0 := (mapNodesM_ok_iff _ _ _).1 hmap
+            refine ListRel.imp (fun x y hxy => ?_) hrel0
+            unfold ProtectorEndStepRel
+            cases ha : (ancestorPathTags w.nodes sourceTag).contains x.tag with
             | true =>
-              simp only [hp, ↓reduceIte] at hxy
-              injection hxy with hEq
-              exact Or.inr (Or.inl ⟨rfl, Or.inr rfl, hEq.symm⟩)
+              simp only [ha, ↓reduceIte] at hxy
+              exact Or.inl ⟨rfl, hxy⟩
             | false =>
-              simp only [hp, Bool.false_eq_true, ↓reduceIte] at hxy
-              exact Or.inr (Or.inr ⟨rfl, rfl, rfl, hxy⟩)
+              simp only [ha, Bool.false_eq_true, ↓reduceIte] at hxy
+              cases hd : isStrictDescendantOf w.nodes sourceTag x with
+              | true =>
+                simp only [hd, Bool.true_or, ↓reduceIte] at hxy
+                injection hxy with hEq
+                exact Or.inr (Or.inl ⟨rfl, Or.inl rfl, hEq.symm⟩)
+              | false =>
+                simp only [hd, Bool.false_or] at hxy
+                cases hp : isPrunedForeignNode w.nodes (ancestorPathTags w.nodes sourceTag) isWrite off len x with
+                | true =>
+                  simp only [hp, ↓reduceIte] at hxy
+                  injection hxy with hEq
+                  exact Or.inr (Or.inl ⟨rfl, Or.inr rfl, hEq.symm⟩)
+                | false =>
+                  simp only [hp, Bool.false_eq_true, ↓reduceIte] at hxy
+                  exact Or.inr (Or.inr ⟨rfl, rfl, rfl, hxy⟩)
 
 /-- `SkipChildrenOfAccessed`: a successful protector-end access leaves every strict descendant of the
 released tag (that is not itself on the access path) literally unchanged. -/
@@ -9098,18 +9160,27 @@ theorem execWorldRangeRead_ok_inv {w w' : FnEntryBorrowWorld} {readerTag off len
             (fun isLoc m => stepNodeOnRangeRead w.activeProtectors isLoc off len m) x y hxy)
             ((mapNodesM_ok_iff _ _ _).1 hmap)
 
-/-- **Order-independence of the protector-end access**: it succeeds with result `w'` EXACTLY when every
-node admits its `ProtectorEndStepRel` step. The bottom-up ancestor check and the list-order foreign check
-never reject a world on which every per-node step succeeds, so only the BLAMED tag of a failing access
-depends on the visit order (upstream reverse-children postorder, MiniRust root-first pre-order). -/
+/-- **Order-independence of the protector-end access** (non-zero length): it succeeds with result `w'`
+EXACTLY when `sourceTag` exists and every node admits its `ProtectorEndStepRel` step. The bottom-up
+ancestor check and the list-order foreign check never reject a world on which every per-node step
+succeeds, so only the BLAMED tag of a failing access depends on the visit order (upstream reverse-children
+postorder, MiniRust root-first pre-order). -/
 theorem execProtectorEndAccess_ok_iff (w w' : FnEntryBorrowWorld) (sourceTag : Nat) (isWrite : Bool)
-    (off len : Nat) :
+    (off len : Nat) (hlen : len ≠ 0) :
     execProtectorEndAccess w sourceTag isWrite off len = .ok w' ↔
+      (∃ n, findNode? w.nodes sourceTag = some n) ∧
       ∃ nodes', w' = { w with nodes := nodes' } ∧
         ListRel (ProtectorEndStepRel w sourceTag isWrite off len) w.nodes nodes' := by
+  have hlen0 : (len == 0) = false := beq_false_of_ne hlen
   constructor
-  · exact execProtectorEndAccess_ok_inv
-  · rintro ⟨nodes', hw, hrel⟩
+  · intro hok
+    have hok' := hok
+    unfold execProtectorEndAccess at hok'
+    simp only [hlen0, Bool.false_eq_true, ↓reduceIte] at hok'
+    cases hfn : findNode? w.nodes sourceTag with
+    | none => rw [hfn] at hok'; cases hok'
+    | some pn => exact ⟨⟨pn, rfl⟩, execProtectorEndAccess_ok_inv hok⟩
+  · rintro ⟨⟨pn, hfn⟩, nodes', hw, hrel⟩
     subst hw
     have hmap : mapNodesM (fun n =>
         if (ancestorPathTags w.nodes sourceTag).contains n.tag then
@@ -9156,7 +9227,7 @@ theorem execProtectorEndAccess_ok_iff (w w' : FnEntryBorrowWorld) (sourceTag : N
         · rw [hcond.2.2] at hp; cases hp
       · exact ⟨y, hs⟩
     unfold execProtectorEndAccess
-    simp only [hanc, hfor, hmap]
+    simp only [hlen0, Bool.false_eq_true, ↓reduceIte, hfn, hanc, hfor, hmap]
 
 /-- Converse of `prunedStep_ok_imp_rel` at the level of the three Model 4 phases: whenever every node
 admits its `PrunedStepRel` step, the bottom-up ancestor check, the list-order unpruned-foreign check, and
@@ -9271,6 +9342,481 @@ theorem execFrameExit_miri_eq_miniRust_singleton (w : FnEntryBorrowWorld) (prote
   simp only [execFrameExitMiniRust, execFrameExitSequential, execFrameExitMiri, List.map_cons,
     List.map_nil, execProtectorEndAccesses, releaseProtectors, List.foldl_cons, List.foldl_nil, hfor]
   cases execProtectorEndAccessFor protectorEndAccessIsWrite? w protectedTag <;> rfl
+
+/-- **End-to-end `FnEntry` retag → function-exit bridge**: after any successful non-skip Model 4
+`FnEntry` retag (`.rustcNoWritable` or `.writableChildWrite`, zero-sized or non-zero), the freshly
+minted protected child node lies in the reachable kind-table envelope (`perm ≠ .disabled`,
+`accessed = true`), so immediately exiting its singleton protector frame agrees identically between
+MiniRust and pinned Miri, with implicit READ for `.rustcNoWritable` / ZST and implicit WRITE for
+non-ZST `.writableChildWrite`. -/
+theorem execFnEntryMutRetagPrunedSourceOrder_child_singleton_exit_eq
+    (w w' : FnEntryBorrowWorld) (parentTag off len childTag : Nat)
+    (policy : FnEntryRetagPolicy) (requireInit : Bool)
+    (hpol : policy ≠ .skipRetag)
+    (hok : execFnEntryMutRetagPrunedSourceOrder w parentTag off len policy requireInit =
+      .ok (w', childTag)) :
+    ∃ child, findNode? w'.nodes childTag = some child ∧
+      child.perm ≠ .disabled ∧ child.accessed = true ∧
+      execFrameExitMiniRust w' [(childTag, w.nextProtector)] =
+        execFrameExitMiri w' [(childTag, w.nextProtector)] ∧
+      (policy = .rustcNoWritable ∨ len = 0 → protectorEndAccessIsWrite? child = some false) ∧
+      (policy = .writableChildWrite → len ≠ 0 → protectorEndAccessIsWrite? child = some true) := by
+  unfold execFnEntryMutRetagPrunedSourceOrder at hok
+  cases policy with
+  | skipRetag => exact absurd rfl hpol
+  | rustcNoWritable =>
+    simp only at hok
+    cases hfn : findNode? w.nodes parentTag with
+    | none => rw [hfn] at hok; cases hok
+    | some _ =>
+      rw [hfn] at hok; simp only at hok
+      let child : TreeTagNode :=
+        ⟨w.nextTag, some parentTag, .reservedFrz false, off, len, some w.nextProtector, true⟩
+      cases hlen : (len == 0) with
+      | true =>
+        simp only [hlen, ↓reduceIte] at hok
+        injection hok with hp
+        have hw' := congrArg Prod.fst hp
+        have hc := congrArg Prod.snd hp
+        subst hw'; subst hc
+        have hfc : findNode? (child :: w.nodes) w.nextTag = some child := by
+          simp [child, findNode?, List.find?]
+        refine ⟨child, hfc, (fun h => by cases h), rfl, ?_, (fun _ => rfl), (fun h _ => by cases h)⟩
+        exact execFrameExit_miri_eq_miniRust_singleton _ _ _ child hfc (fun h => by cases h) (fun h => by cases h)
+      | false =>
+        simp only [hlen, Bool.false_eq_true, ↓reduceIte] at hok
+        split at hok
+        · cases hok
+        · split at hok
+          · cases hok
+          · split at hok
+            · cases hok
+            · rename_i nodes' _
+              injection hok with hp
+              have hw' := congrArg Prod.fst hp
+              have hc := congrArg Prod.snd hp
+              subst hw'; subst hc
+              have hfc : findNode? (child :: nodes') w.nextTag = some child := by
+                simp [child, findNode?, List.find?]
+              refine ⟨child, hfc, (fun h => by cases h), rfl, ?_, (fun _ => rfl), (fun h _ => by cases h)⟩
+              exact execFrameExit_miri_eq_miniRust_singleton _ _ _ child hfc (fun h => by cases h) (fun h => by cases h)
+  | writableChildWrite =>
+    simp only at hok
+    cases hfn : findNode? w.nodes parentTag with
+    | none => rw [hfn] at hok; cases hok
+    | some _ =>
+      rw [hfn] at hok; simp only at hok
+      cases hlen : (len == 0) with
+      | true =>
+        have hl0 : len = 0 := eq_of_beq hlen
+        simp only [hlen, ↓reduceIte] at hok
+        injection hok with hp
+        have hw' := congrArg Prod.fst hp
+        have hc := congrArg Prod.snd hp
+        subst hw'; subst hc
+        let child : TreeTagNode :=
+          ⟨w.nextTag, some parentTag, .reservedFrz false, off, len, some w.nextProtector, true⟩
+        have hfc : findNode? (child :: w.nodes) w.nextTag = some child := by
+          simp [child, findNode?, List.find?]
+        refine ⟨child, hfc, (fun h => by cases h), rfl, ?_, (fun _ => rfl), (fun _ hne => absurd hl0 hne)⟩
+        exact execFrameExit_miri_eq_miniRust_singleton _ _ _ child hfc (fun h => by cases h) (fun h => by cases h)
+      | false =>
+        simp only [hlen, Bool.false_eq_true, ↓reduceIte] at hok
+        cases hro : w.allocReadOnly with
+        | true => simp [hro] at hok
+        | false =>
+          simp only [hro, Bool.false_eq_true, ↓reduceIte] at hok
+          cases hri : (requireInit && !w.pointeeInitialized) with
+          | true => simp [hri] at hok
+          | false =>
+            simp only [hri, Bool.false_eq_true, ↓reduceIte] at hok
+            split at hok
+            · cases hok
+            · split at hok
+              · cases hok
+              · split at hok
+                · cases hok
+                · rename_i nodes' _
+                  injection hok with hp
+                  have hw' := congrArg Prod.fst hp
+                  have hc := congrArg Prod.snd hp
+                  subst hw'; subst hc
+                  let child : TreeTagNode :=
+                    ⟨w.nextTag, some parentTag, .unique, off, len, some w.nextProtector, true⟩
+                  have hfc : findNode? (child :: nodes') w.nextTag = some child := by
+                    simp [child, findNode?, List.find?]
+                  refine ⟨child, hfc, (fun h => by cases h), rfl, ?_, ?_, (fun _ _ => rfl)⟩
+                  · exact execFrameExit_miri_eq_miniRust_singleton _ _ _ child hfc (fun h => by cases h) (fun _ => rfl)
+                  · rintro (h | h)
+                    · cases h
+                    · subst h; simp at hlen
+
+private theorem isProtected_filter_ne (activeProtectors : List Nat) (p : Nat) (n : TreeTagNode)
+    (hne : n.protector ≠ some p) :
+    n.isProtected (activeProtectors.filter (· != p)) = n.isProtected activeProtectors := by
+  unfold TreeTagNode.isProtected
+  cases hp : n.protector with
+  | none => rfl
+  | some q =>
+    simp only
+    have hqp : q ≠ p := fun h => hne (by rw [hp, h])
+    cases h : activeProtectors.any (· == q) with
+    | false =>
+      rw [List.any_eq_false] at h ⊢
+      intro x hx
+      exact h x (List.mem_filter.mp hx).1
+    | true =>
+      rw [List.any_eq_true] at h ⊢
+      rcases h with ⟨x, hx, hxq⟩
+      have hxeq : x = q := eq_of_beq hxq
+      subst hxeq
+      refine ⟨x, List.mem_filter.mpr ⟨hx, ?_⟩, hxq⟩
+      simp [bne, beq_false_of_ne hqp]
+
+private theorem checkNodesM_congr {f g : TreeTagNode → Except RetagStepErr TreeTagNode}
+    {xs : List TreeTagNode} (hfg : ∀ n ∈ xs, f n = g n) :
+    checkNodesM f xs = checkNodesM g xs := by
+  induction xs with
+  | nil => rfl
+  | cons x rest ih =>
+    simp only [checkNodesM, hfg x (List.mem_cons_self ..)]
+    cases g x with
+    | error _ => rfl
+    | ok _ => exact ih (fun n hn => hfg n (List.mem_cons_of_mem _ hn))
+
+private theorem mapNodesM_congr {f g : TreeTagNode → Except RetagStepErr TreeTagNode}
+    {xs : List TreeTagNode} (hfg : ∀ n ∈ xs, f n = g n) :
+    mapNodesM f xs = mapNodesM g xs := by
+  induction xs with
+  | nil => rfl
+  | cons x rest ih =>
+    simp only [mapNodesM, hfg x (List.mem_cons_self ..)]
+    cases g x with
+    | error _ => rfl
+    | ok _ => simp only [ih (fun n hn => hfg n (List.mem_cons_of_mem _ hn))]
+
+/-- Popping protector `p` does not alter `stepNodeOnRangeAccess` on any node that either does not carry
+`some p` or whose byte range is disjoint from `[off, off + len)`. -/
+theorem stepNodeOnRangeAccess_releaseProtector_of_disjoint (activeProtectors : List Nat)
+    (p : Nat) (isWrite isLocal : Bool) (off len : Nat) (n : TreeTagNode)
+    (hdisj : n.protector = some p → rangesOverlap off len n.rangeOffset n.rangeLen = false) :
+    stepNodeOnRangeAccess (activeProtectors.filter (· != p)) isWrite isLocal off len n =
+      stepNodeOnRangeAccess activeProtectors isWrite isLocal off len n := by
+  cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
+  | false =>
+    unfold stepNodeOnRangeAccess stepNodeOnRangeWrite stepNodeOnRangeRead
+    cases isWrite <;> simp [hov]
+  | true =>
+    have hne : n.protector ≠ some p := fun hp => by
+      have hf := hdisj hp
+      rw [hov] at hf; cases hf
+    have hprot := isProtected_filter_ne activeProtectors p n hne
+    unfold stepNodeOnRangeAccess stepNodeOnRangeWrite stepNodeOnRangeRead
+    cases isWrite <;> cases isLocal <;> cases n.perm <;> simp [hov, hprot]
+
+/-- Popping protector `p` commutes with `execProtectorEndAccess` whenever every node carrying `some p`
+has a byte range disjoint from `[off, off + len)`. -/
+theorem execProtectorEndAccess_comm_releaseProtector_of_disjoint (w : FnEntryBorrowWorld)
+    (sourceTag p : Nat) (isWrite : Bool) (off len : Nat)
+    (hdisj : ∀ n ∈ w.nodes, n.protector = some p →
+      rangesOverlap off len n.rangeOffset n.rangeLen = false) :
+    execProtectorEndAccess (releaseProtector w p) sourceTag isWrite off len =
+      (execProtectorEndAccess w sourceTag isWrite off len).map (releaseProtector · p) := by
+  unfold execProtectorEndAccess
+  cases hlen : (len == 0) with
+  | true => simp [Except.map]
+  | false =>
+    simp only [Bool.false_eq_true, ↓reduceIte, releaseProtector]
+    cases hfn : findNode? w.nodes sourceTag with
+    | none => rfl
+    | some _ =>
+      have hanc : checkAncestorPathM { w with activeProtectors := w.activeProtectors.filter (· != p) }
+          sourceTag (stepNodeOnRangeAccess (w.activeProtectors.filter (· != p)) isWrite true off len) =
+          checkAncestorPathM w sourceTag (stepNodeOnRangeAccess w.activeProtectors isWrite true off len) := by
+        unfold checkAncestorPathM
+        exact checkNodesM_congr (fun n hn =>
+          stepNodeOnRangeAccess_releaseProtector_of_disjoint _ p isWrite true off len n
+            (hdisj n ((mem_ancestorPathNodes_iff w.nodes sourceTag n).1 hn).1))
+      have hfor : checkNodesM (stepNodeOnRangeAccess (w.activeProtectors.filter (· != p)) isWrite false off len)
+          (w.nodes.filter (fun n =>
+            !(ancestorPathTags w.nodes sourceTag).contains n.tag &&
+              !(isStrictDescendantOf w.nodes sourceTag n ||
+                isPrunedForeignNode w.nodes (ancestorPathTags w.nodes sourceTag) isWrite off len n))) =
+          checkNodesM (stepNodeOnRangeAccess w.activeProtectors isWrite false off len)
+          (w.nodes.filter (fun n =>
+            !(ancestorPathTags w.nodes sourceTag).contains n.tag &&
+              !(isStrictDescendantOf w.nodes sourceTag n ||
+                isPrunedForeignNode w.nodes (ancestorPathTags w.nodes sourceTag) isWrite off len n))) := by
+        exact checkNodesM_congr (fun n hn =>
+          stepNodeOnRangeAccess_releaseProtector_of_disjoint _ p isWrite false off len n
+            (hdisj n (List.mem_filter.mp hn).1))
+      have hmap : mapNodesM (fun n =>
+          if (ancestorPathTags w.nodes sourceTag).contains n.tag then
+            stepNodeOnRangeAccess (w.activeProtectors.filter (· != p)) isWrite true off len n
+          else if isStrictDescendantOf w.nodes sourceTag n ||
+              isPrunedForeignNode w.nodes (ancestorPathTags w.nodes sourceTag) isWrite off len n then
+            .ok n
+          else stepNodeOnRangeAccess (w.activeProtectors.filter (· != p)) isWrite false off len n) w.nodes =
+          mapNodesM (fun n =>
+          if (ancestorPathTags w.nodes sourceTag).contains n.tag then
+            stepNodeOnRangeAccess w.activeProtectors isWrite true off len n
+          else if isStrictDescendantOf w.nodes sourceTag n ||
+              isPrunedForeignNode w.nodes (ancestorPathTags w.nodes sourceTag) isWrite off len n then
+            .ok n
+          else stepNodeOnRangeAccess w.activeProtectors isWrite false off len n) w.nodes := by
+        refine mapNodesM_congr (fun n hn => ?_)
+        cases (ancestorPathTags w.nodes sourceTag).contains n.tag with
+        | true =>
+          exact stepNodeOnRangeAccess_releaseProtector_of_disjoint _ p isWrite true off len n (hdisj n hn)
+        | false =>
+          cases (isStrictDescendantOf w.nodes sourceTag n ||
+              isPrunedForeignNode w.nodes (ancestorPathTags w.nodes sourceTag) isWrite off len n) with
+          | true => rfl
+          | false =>
+            exact stepNodeOnRangeAccess_releaseProtector_of_disjoint _ p isWrite false off len n (hdisj n hn)
+      simp only [hanc, hfor]
+      cases checkAncestorPathM w sourceTag (stepNodeOnRangeAccess w.activeProtectors isWrite true off len) with
+      | error _ => rfl
+      | ok _ =>
+        cases checkNodesM (stepNodeOnRangeAccess w.activeProtectors isWrite false off len) _ with
+        | error _ => rfl
+        | ok _ =>
+          change (match mapNodesM (fun n =>
+              if (ancestorPathTags w.nodes sourceTag).contains n.tag then
+                stepNodeOnRangeAccess (w.activeProtectors.filter (· != p)) isWrite true off len n
+              else if isStrictDescendantOf w.nodes sourceTag n ||
+                  isPrunedForeignNode w.nodes (ancestorPathTags w.nodes sourceTag) isWrite off len n then
+                .ok n
+              else stepNodeOnRangeAccess (w.activeProtectors.filter (· != p)) isWrite false off len n) w.nodes with
+            | .error e => Except.error e
+            | .ok nodes' => Except.ok { w with nodes := nodes', activeProtectors := w.activeProtectors.filter (· != p) }) = _
+          rw [hmap]
+          cases mapNodesM (fun n =>
+              if (ancestorPathTags w.nodes sourceTag).contains n.tag then
+                stepNodeOnRangeAccess w.activeProtectors isWrite true off len n
+              else if isStrictDescendantOf w.nodes sourceTag n ||
+                  isPrunedForeignNode w.nodes (ancestorPathTags w.nodes sourceTag) isWrite off len n then
+                .ok n
+              else stepNodeOnRangeAccess w.activeProtectors isWrite false off len n) w.nodes with
+          | error _ => rfl
+          | ok _ => rfl
+
+/-- `execProtectorEndAccessFor` preserves per-node metadata (`tag`, `parentTag`, range, `protector`). -/
+theorem execProtectorEndAccessFor_nodeMetaRel {kind? : TreeTagNode → Option Bool}
+    {w w' : FnEntryBorrowWorld} {t : Nat}
+    (hok : execProtectorEndAccessFor kind? w t = .ok w') :
+    ListRel NodeMetaRel w.nodes w'.nodes := by
+  unfold execProtectorEndAccessFor at hok
+  cases hfn : findNode? w.nodes t with
+  | none => rw [hfn] at hok; cases hok
+  | some n =>
+    rw [hfn] at hok; simp only at hok
+    cases hk : kind? n with
+    | none =>
+      rw [hk] at hok; injection hok with hw; subst hw
+      exact listRel_nodeMetaRel_refl w.nodes
+    | some isWrite =>
+      rw [hk] at hok
+      rcases execProtectorEndAccess_ok_inv hok with ⟨nodes', hw, hrel⟩
+      subst hw
+      exact ListRel.imp (fun _ _ h => ProtectorEndStepRel.nodeMetaRel h) hrel
+
+/-- Popping protector `p` commutes with `execProtectorEndAccessFor` whenever every node carrying `some p`
+is range-disjoint from `t`'s node. -/
+theorem execProtectorEndAccessFor_comm_releaseProtector_of_disjoint
+    (kind? : TreeTagNode → Option Bool) (w : FnEntryBorrowWorld) (t p : Nat)
+    (hdisj : ∀ n ∈ w.nodes, n.tag = t → ∀ m ∈ w.nodes, m.protector = some p →
+      rangesOverlap n.rangeOffset n.rangeLen m.rangeOffset m.rangeLen = false) :
+    execProtectorEndAccessFor kind? (releaseProtector w p) t =
+      (execProtectorEndAccessFor kind? w t).map (releaseProtector · p) := by
+  have hnodes : (releaseProtector w p).nodes = w.nodes := rfl
+  unfold execProtectorEndAccessFor
+  rw [hnodes]
+  cases hfn : findNode? w.nodes t with
+  | none => rfl
+  | some n =>
+    simp only
+    cases hk : kind? n with
+    | none => rfl
+    | some isWrite =>
+      rcases mem_of_findNode?_eq_some hfn with ⟨hmem, htag⟩
+      exact execProtectorEndAccess_comm_releaseProtector_of_disjoint w t p isWrite n.rangeOffset n.rangeLen
+        (fun m hm hp => hdisj n hmem htag m hm hp)
+
+private theorem execProtectorEndAccesses_comm_releaseProtector_of_disjoint
+    (kind? : TreeTagNode → Option Bool) (tags : List Nat) (p : Nat) :
+    ∀ (w : FnEntryBorrowWorld),
+      (∀ t ∈ tags, ∀ n ∈ w.nodes, n.tag = t → ∀ m ∈ w.nodes, m.protector = some p →
+        rangesOverlap n.rangeOffset n.rangeLen m.rangeOffset m.rangeLen = false) →
+      execProtectorEndAccesses kind? (releaseProtector w p) tags =
+        (execProtectorEndAccesses kind? w tags).map (releaseProtector · p) := by
+  induction tags with
+  | nil => intro w _; rfl
+  | cons t rest ih =>
+    intro w hdisj
+    simp only [execProtectorEndAccesses]
+    rw [execProtectorEndAccessFor_comm_releaseProtector_of_disjoint kind? w t p
+      (hdisj t (List.mem_cons_self ..))]
+    cases h1 : execProtectorEndAccessFor kind? w t with
+    | error _ => rfl
+    | ok w1 =>
+      simp only [Except.map]
+      have hmeta := execProtectorEndAccessFor_nodeMetaRel h1
+      refine ih w1 (fun t' ht' n' hn' htag' m' hm' hprot' => ?_)
+      rcases ListRel.exists_of_mem_right hmeta hn' with ⟨n, hn, hmn⟩
+      rcases ListRel.exists_of_mem_right hmeta hm' with ⟨m, hm, hmm⟩
+      rw [hmn.2.2.2.1, hmn.2.2.2.2.1, hmm.2.2.2.1, hmm.2.2.2.2.1]
+      exact hdisj t' (List.mem_cons_of_mem _ ht') n hn (hmn.1.symm.trans htag') m hm (hmm.2.2.1.symm.trans hprot')
+
+/-- Pairwise protector-to-later-entry range disjointness for an exiting frame: for every earlier entry
+`(_, p₁)` and later entry `(t₂, _)`, every node protected by `p₁` is range-disjoint from `t₂`'s node. -/
+def FrameProtectorsRangeDisjoint (nodes : List TreeTagNode) (frame : List (Nat × Nat)) : Prop :=
+  frame.Pairwise (fun e1 e2 =>
+    ∀ n2 ∈ nodes, n2.tag = e2.1 → ∀ m ∈ nodes, m.protector = some e1.2 →
+      rangesOverlap n2.rangeOffset n2.rangeLen m.rangeOffset m.rangeLen = false)
+
+/-- **Multi-entry frame-exit order agreement (any access-kind table)**: when earlier entries' protected
+nodes are range-disjoint from later entries' nodes, sequential release (`execFrameExitSequential`) and
+Miri's all-accesses-then-pop-all order compute the exact same result. -/
+theorem execFrameExitSequential_eq_allAccessThenRelease_of_disjointProtectors
+    (kind? : TreeTagNode → Option Bool) (frame : List (Nat × Nat)) :
+    ∀ (w : FnEntryBorrowWorld),
+      FrameProtectorsRangeDisjoint w.nodes frame →
+      execFrameExitSequential kind? w frame =
+        match execProtectorEndAccesses kind? w (frame.map (·.1)) with
+        | .error e => .error e
+        | .ok w' => .ok (releaseProtectors w' (frame.map (·.2))) := by
+  induction frame with
+  | nil => intro w _; rfl
+  | cons tp rest ih =>
+    intro w hdisj
+    rcases tp with ⟨t, p⟩
+    cases hdisj with
+    | cons hhead htail =>
+      simp only [execFrameExitSequential, List.map_cons, execProtectorEndAccesses]
+      cases h1 : execProtectorEndAccessFor kind? w t with
+      | error _ => rfl
+      | ok w1 =>
+        simp only
+        have hmeta := execProtectorEndAccessFor_nodeMetaRel h1
+        have htail1 : FrameProtectorsRangeDisjoint (releaseProtector w1 p).nodes rest := by
+          refine List.Pairwise.imp (fun {e1 e2} h n2 hn2 htag2 m hm hprot => ?_) htail
+          rcases ListRel.exists_of_mem_right hmeta hn2 with ⟨n20, hn20, hmn2⟩
+          rcases ListRel.exists_of_mem_right hmeta hm with ⟨m0, hm0, hmm⟩
+          rw [hmn2.2.2.2.1, hmn2.2.2.2.2.1, hmm.2.2.2.1, hmm.2.2.2.2.1]
+          exact h n20 hn20 (hmn2.1.symm.trans htag2) m0 hm0 (hmm.2.2.1.symm.trans hprot)
+        rw [ih (releaseProtector w1 p) htail1]
+        have hhead1 : ∀ t' ∈ rest.map (·.1), ∀ n' ∈ w1.nodes, n'.tag = t' →
+            ∀ m' ∈ w1.nodes, m'.protector = some p →
+              rangesOverlap n'.rangeOffset n'.rangeLen m'.rangeOffset m'.rangeLen = false := by
+          intro t' ht' n' hn' htag' m' hm' hprot'
+          rcases List.mem_map.mp ht' with ⟨e2, he2, rfl⟩
+          rcases ListRel.exists_of_mem_right hmeta hn' with ⟨n0, hn0, hmn⟩
+          rcases ListRel.exists_of_mem_right hmeta hm' with ⟨m0, hm0, hmm⟩
+          rw [hmn.2.2.2.1, hmn.2.2.2.2.1, hmm.2.2.2.1, hmm.2.2.2.2.1]
+          exact hhead e2 he2 n0 hn0 (hmn.1.symm.trans htag') m0 hm0 (hmm.2.2.1.symm.trans hprot')
+        rw [execProtectorEndAccesses_comm_releaseProtector_of_disjoint kind? (rest.map (·.1)) p w1 hhead1]
+        cases execProtectorEndAccesses kind? w1 (rest.map (·.1)) with
+        | error _ => rfl
+        | ok w2 => rfl
+
+/-- Pairwise entry-to-entry range disjointness for an exiting frame: every earlier entry's node is
+range-disjoint from every later entry's node (so earlier implicit accesses leave later nodes unchanged). -/
+def FrameEntriesRangeDisjoint (nodes : List TreeTagNode) (frame : List (Nat × Nat)) : Prop :=
+  frame.Pairwise (fun e1 e2 =>
+    ∀ n1 ∈ nodes, n1.tag = e1.1 → ∀ n2 ∈ nodes, n2.tag = e2.1 →
+      rangesOverlap n1.rangeOffset n1.rangeLen n2.rangeOffset n2.rangeLen = false)
+
+private theorem ProtectorEndStepRel.eq_of_disjoint {w : FnEntryBorrowWorld} {sourceTag : Nat}
+    {isWrite : Bool} {off len : Nat} {x y : TreeTagNode}
+    (h : ProtectorEndStepRel w sourceTag isWrite off len x y)
+    (hdisj : rangesOverlap off len x.rangeOffset x.rangeLen = false) : y = x := by
+  rcases h with ⟨_, hs⟩ | ⟨_, _, hEq⟩ | ⟨_, _, _, hs⟩
+  · unfold stepNodeOnRangeAccess stepNodeOnRangeWrite stepNodeOnRangeRead at hs
+    cases isWrite <;> simp [hdisj] at hs <;> exact hs.symm
+  · exact hEq
+  · unfold stepNodeOnRangeAccess stepNodeOnRangeWrite stepNodeOnRangeRead at hs
+    cases isWrite <;> simp [hdisj] at hs <;> exact hs.symm
+
+private theorem execProtectorEndAccesses_miri_eq_miniRust_of_disjointEntries
+    (frame : List (Nat × Nat)) :
+    ∀ (w : FnEntryBorrowWorld),
+      FrameEntriesRangeDisjoint w.nodes frame →
+      (∀ e ∈ frame, ∀ n ∈ w.nodes, n.tag = e.1 →
+        n.perm ≠ .disabled ∧ (n.perm = .unique → n.accessed = true)) →
+      execProtectorEndAccesses protectorEndAccessIsWriteMiniRust? w (frame.map (·.1)) =
+        execProtectorEndAccesses protectorEndAccessIsWrite? w (frame.map (·.1)) := by
+  induction frame with
+  | nil => intro w _ _; rfl
+  | cons tp rest ih =>
+    intro w hdisj henv
+    rcases tp with ⟨t, p⟩
+    cases hdisj with
+    | cons hhead htail =>
+      simp only [List.map_cons, execProtectorEndAccesses]
+      have hforEq : execProtectorEndAccessFor protectorEndAccessIsWriteMiniRust? w t =
+          execProtectorEndAccessFor protectorEndAccessIsWrite? w t := by
+        unfold execProtectorEndAccessFor
+        cases hfn : findNode? w.nodes t with
+        | none => rfl
+        | some n =>
+          simp only
+          rcases mem_of_findNode?_eq_some hfn with ⟨hmem, htag⟩
+          rcases henv (t, p) (List.mem_cons_self ..) n hmem htag with ⟨hnd, huniq⟩
+          rw [← protectorEndAccess_miri_eq_miniRust n hnd huniq]
+      rw [hforEq]
+      cases h1 : execProtectorEndAccessFor protectorEndAccessIsWrite? w t with
+      | error _ => rfl
+      | ok w1 =>
+        simp only
+        have hmeta := execProtectorEndAccessFor_nodeMetaRel h1
+        have htail1 : FrameEntriesRangeDisjoint w1.nodes rest := by
+          refine List.Pairwise.imp (fun {e1 e2} h n1 hn1 htag1 n2 hn2 htag2 => ?_) htail
+          rcases ListRel.exists_of_mem_right hmeta hn1 with ⟨n10, hn10, hmn1⟩
+          rcases ListRel.exists_of_mem_right hmeta hn2 with ⟨n20, hn20, hmn2⟩
+          rw [hmn1.2.2.2.1, hmn1.2.2.2.2.1, hmn2.2.2.2.1, hmn2.2.2.2.2.1]
+          exact h n10 hn10 (hmn1.1.symm.trans htag1) n20 hn20 (hmn2.1.symm.trans htag2)
+        have henv1 : ∀ e ∈ rest, ∀ n' ∈ w1.nodes, n'.tag = e.1 →
+            n'.perm ≠ .disabled ∧ (n'.perm = .unique → n'.accessed = true) := by
+          intro e he n' hn' htage
+          have hmemW : n' ∈ w.nodes := by
+            unfold execProtectorEndAccessFor at h1
+            cases hfn : findNode? w.nodes t with
+            | none => rw [hfn] at h1; cases h1
+            | some nt =>
+              rw [hfn] at h1; simp only at h1
+              cases hk : protectorEndAccessIsWrite? nt with
+              | none => rw [hk] at h1; injection h1 with hw; subst hw; exact hn'
+              | some isWrite =>
+                rw [hk] at h1
+                rcases execProtectorEndAccess_ok_inv h1 with ⟨nodes', hw, hrel⟩
+                subst hw
+                rcases ListRel.exists_of_mem_right hrel hn' with ⟨n0, hn0, hstep⟩
+                rcases mem_of_findNode?_eq_some hfn with ⟨hntMem, hntTag⟩
+                have htag0 : n0.tag = e.1 := (ProtectorEndStepRel.nodeMetaRel hstep).1.symm.trans htage
+                have hnoOv := hhead e he nt hntMem hntTag n0 hn0 htag0
+                have hEq := ProtectorEndStepRel.eq_of_disjoint hstep hnoOv
+                rw [hEq]; exact hn0
+          exact henv e (List.mem_cons_of_mem _ he) n' hmemW htage
+        exact ih w1 htail1 henv1
+
+/-- **Multi-entry Miri / MiniRust frame-exit agreement on disjoint-range frames**: generalizes
+`execFrameExit_miri_eq_miniRust_singleton` to arbitrary multi-parameter frames (e.g., disjoint
+struct/tuple `&mut` fields). When every frame entry lies in the reachable kind-table envelope
+(`perm ≠ .disabled`, `perm = .unique → accessed = true`), earlier entries' nodes are range-disjoint
+from later entries' nodes, and earlier entries' protected nodes are range-disjoint from later entries'
+nodes, `execFrameExitMiniRust` and `execFrameExitMiri` are the EXACT SAME computation. -/
+theorem execFrameExit_miri_eq_miniRust_of_disjointFrame
+    (w : FnEntryBorrowWorld) (frame : List (Nat × Nat))
+    (hprot : FrameProtectorsRangeDisjoint w.nodes frame)
+    (hentries : FrameEntriesRangeDisjoint w.nodes frame)
+    (henv : ∀ e ∈ frame, ∀ n ∈ w.nodes, n.tag = e.1 →
+      n.perm ≠ .disabled ∧ (n.perm = .unique → n.accessed = true)) :
+    execFrameExitMiniRust w frame = execFrameExitMiri w frame := by
+  unfold execFrameExitMiniRust execFrameExitMiri
+  rw [execFrameExitSequential_eq_allAccessThenRelease_of_disjointProtectors
+    protectorEndAccessIsWriteMiniRust? frame w hprot]
+  rw [execProtectorEndAccesses_miri_eq_miniRust_of_disjointEntries frame w hentries henv]
 
 /-! ### 2B. Static-Access Temporary Retag (`charon#1620`) & Syntactic `is_freeze` Static Mutability -/
 
