@@ -69,11 +69,11 @@ uninterpreted external call.
 
 ## Corpus Coverage
 
-The corpus holds 110 tests: 51 `pass`, 12 `panic` (11 certified via
+The corpus holds 112 tests: 52 `pass`, 12 `panic` (11 certified via
 `verifySafePanicMirPointBounded` and `panic_explicit_macro` via
-`verifyModularSafePanicMirBounded`), and 47 `ub`, grouped into ten categories
+`verifyModularSafePanicMirBounded`), and 48 `ub`, grouped into eleven categories
 that `// Category N` comments in [`corpus/src/lib.rs`](corpus/src/lib.rs) mark.
-Anneal agrees with Miri on all 110 tests: `manifest.toml` records no open
+Anneal agrees with Miri on all 112 tests: `manifest.toml` records no open
 `known_anneal_bug` entry.
 Category 8 adds 12 tests covering layout-sensitive types and raw-pointer retags
 (`pass_option_some_niche_and_single_c_mut` exercises both niche encoding and
@@ -226,6 +226,66 @@ recursion depth, the stack, or a signal) is reported with
 `kernel_confirmed = false`, and any other failure (a theorem the kernel
 rejects, or an elaboration error) still aborts the run.
 
+Category 11 adds 2 tests, which access a local through an explicit shared
+reborrow `tmp`, the form of the reference temporary behind every `static` access
+(`&raw const S.f` is `&raw const (*{&S}).f`; Charon PR #1620):
+
+| Theme | Tests |
+| :--- | :--- |
+| Reads through `&raw const` after a shared reborrow | `pass_shared_temp_const_raw_ptr_read_and_freeze_retag` (`&raw const (*tmp).b` of a `PairU32` is read before and after the reborrow `&*tmp`, returning `35 ^ 7 ^ (35 << 8) = 8996`) |
+| Writes to frozen bytes of a struct that contains an `UnsafeCell` | `ub_shared_temp_unsafe_cell_raw_const_cast_mut_write` (`tmp: &FreezeAndCell` freezes the bytes of `frozen`, so writing through `(&raw const (*tmp).frozen) as *mut u32` is UB) |
+
+### Category 11 engine gaps
+
+Category 11 also declares model items (`static`s and probes that a
+`__ANNEAL_MODEL_<name>` marker names), which are not manifest tests:
+`sync_miri_suite.py` and `mutators_miri.rs` skip every model-marked item.
+`campaign16_same_tag_disjoint_copy_and_static_retag_probes_verify_live` in
+[`miri_difftest_oracle.rs`](../../crates/anneal-difftest/tests/miri_difftest_oracle.rs)
+calls each probe live, pins Miri's verdict exactly, and pins Anneal's verdict to
+either the gap below (kernel-confirmed, with Anneal's UB at exactly the listed
+statement) or agreement with Miri:
+
+- Same-tag disjoint `copy_nonoverlapping` (Nightly Campaign #16:
+  `ub_copy_nonoverlapping_partial_overlap_array` with `offset(p, 1isize)`
+  perturbed to `offset(p, 2isize)`).
+  `pass_copy_nonoverlapping_same_tag_disjoint_array_halves` (Miri `30`, `&raw
+  mut arr[0]` on `[u32; 4]`, exercising `Statements.lean`'s `copyViaBytes`
+  same-tag guard),
+  `pass_copy_nonoverlapping_same_tag_disjoint_u8_array_halves` (Miri
+  `285803779`, `(&raw mut arr) as *mut u8` on `[u8; 8]`, directly entering
+  `Statements.lean`'s `sameContainer` array-slice branch and hitting `Nat.beq
+  srcPtr.tag dstPtr.tag`), and
+  `pass_copy_nonoverlapping_same_tag_disjoint_struct_fields` (Miri `44`, `&raw
+  mut pair.a` on `PairU32`) copy between disjoint parts of one local through two
+  pointers that share one tag. Both forward (`src < dst`) and backward (`dst <
+  src`) disjoint copies, plus whole-struct `(&raw mut pair) as *mut u32`, report
+  UB at the `copy_nonoverlapping` (`false_positive_ub`,
+  `sound_conservative_abstraction`), both when a candidate calls a probe and
+  when it runs the probe's body in the root frame. Zero-byte same-tag copies
+  (`count == 0` on `[u32; 4]` and `[u8; 8]`, plus `count == 1` on `()` in
+  `Statements.lean`'s `evalCopySingleDirect`) likewise report `false_positive_ub`,
+  whereas same-tag disjoint byte copies inside `OverlayU32` (`evalCopyUnionBytes`
+  via `rangesDisjoint`) and true same-tag overlaps on both `[u32; 4]` and
+  `[u8; 8]` agree with Miri today.
+- `static` accesses. Anneal reports UB at the first access to any `static`,
+  reads included. `pass_static_const_raw_ptr_read_and_freeze_retag` (Miri
+  `8996`) and an isolated `UnsafeCell` write to `STATIC_FREEZE_AND_CELL.cell`
+  (Miri `5379`) are `false_positive_ub`.
+  `ub_static_unsafe_cell_raw_const_cast_mut_write` (Miri: UB at the write to the
+  frozen field of `STATIC_FREEZE_AND_CELL`), a direct write to
+  `STATIC_FREEZE_AND_CELL.frozen` without touching `cell` first (Miri: Tree
+  Borrows UB `"is forbidden"` on the writable static allocation), and a write
+  through `(&raw const STATIC_FROZEN_PAIR.a) as *mut u32` (Miri: UB, because an
+  immutable `static` is read-only) are `ub_location_mismatch`
+  (`value_mismatch`): Anneal reports UB before Miri's write and never passes.
+- `UnsafeCell` fields. A write to the `UnsafeCell` field of a struct through a
+  shared reborrow of the struct, which Miri allows, is UB in Anneal
+  (`false_positive_ub`). The static UB probe writes its `cell` field this way
+  before its frozen write, so it agrees with Miri only once both this gap and
+  the `static` gap are fixed. Its manifest twin writes no `UnsafeCell` field
+  and agrees.
+
 ## Policy on `known_anneal_bug` Entries
 
 > **Every `[tests.known_anneal_bug]` block in [`manifest.toml`](manifest.toml)
@@ -255,7 +315,7 @@ rejects, or an elaboration error) still aborts the run.
 
 ### Summary of Open Anneal Bugs Exposed by the Suite
 
-The suite currently exposes no open Anneal bug: all 110 tests agree with Miri.
+The suite currently exposes no open Anneal bug: all 112 tests agree with Miri.
 
 ## Running the Suite
 
