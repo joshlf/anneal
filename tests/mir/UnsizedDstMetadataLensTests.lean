@@ -2207,9 +2207,9 @@ the two files, or adding a declaration at the boundary, fails here or there.
 
 Fails closed if an anchor is missing, has no source range, belongs to the wrong module, is
 misordered, or was not audited; if any declaration spans an interval boundary (so both boundaries
-are clean cuts between top-level declarations) or starts between `prevAnchor` and `startAnchor`;
-or if any declaration violates the constructive-axiom, projection-discipline, or reachability
-invariants.
+are clean cuts between top-level declarations), extends past `prevAnchor`, or starts between
+`prevAnchor` and `startAnchor`; or if any declaration violates the constructive-axiom,
+projection-discipline, or reachability invariants.
 
 Compiler-generated auxiliaries without a source range (`_proof_*`, `match_*`, `_f`, equation
 lemmas) are not counted: `collectAxioms` is transitive, so their axioms are audited through the

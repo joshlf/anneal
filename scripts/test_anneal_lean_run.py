@@ -66,7 +66,10 @@ _AMBIENT_ANNEAL_ENV_PREFIXES: tuple[str, ...] = (
     "ANNEAL_OOM_",
 )
 _ENV_PATCHER: Any = None
-_EXEC_GUARD: Any = None
+# Every Python-level way to replace the current process image ends in `os.execv` or
+# `os.execve` (`os.execl*` / `os.execvp*` are wrappers around them).
+_GUARDED_EXEC_FUNCTIONS: tuple[str, ...] = ("execv", "execve", "execvp", "execvpe")
+_EXEC_GUARDS: list[Any] = []
 _XDG_TMPDIR: tempfile.TemporaryDirectory[str] | None = None
 # Text of the `anneal-workloads.slice` unit `ensure_workloads_slice` reconciles on this
 # host, or `None` when it refuses to write one (no delegated `systemd --user`).
@@ -139,7 +142,7 @@ def _file_identity(path: Path) -> tuple[int, int, str]:
 
 
 def setUpModule() -> None:
-    global _ENV_PATCHER, _EXEC_GUARD, _XDG_TMPDIR, _SLICE_UNIT_SEED
+    global _ENV_PATCHER, _XDG_TMPDIR, _SLICE_UNIT_SEED
     _XDG_TMPDIR = tempfile.TemporaryDirectory(prefix="anneal-test-xdg-")
     patch_vals = {**_HERMETIC_GIT_ENV, "XDG_CONFIG_HOME": _XDG_TMPDIR.name}
     _ENV_PATCHER = mock.patch.dict(os.environ, patch_vals)
@@ -151,9 +154,11 @@ def setUpModule() -> None:
     # The re-entrancy pass-through of `alr.main` `os.execvp`s its command.  In-process that
     # would replace the unittest runner and end the run early with the command's own exit
     # status (`true` -> 0: a truncated run reported as success), so fail loudly instead.
-    # Subprocesses are unaffected (`subprocess` does not go through `os.execvp`).
-    _EXEC_GUARD = mock.patch.object(os, "execvp", side_effect=_forbid_in_process_exec)
-    _EXEC_GUARD.start()
+    # Subprocesses are unaffected (`subprocess` does not go through `os.exec*`).
+    for name in _GUARDED_EXEC_FUNCTIONS:
+        guard = mock.patch.object(os, name, side_effect=_forbid_in_process_exec)
+        guard.start()
+        _EXEC_GUARDS.append(guard)
     # In-process `alr.main([... "--", cmd])` runs reconcile the unit under this module-wide
     # `XDG_CONFIG_HOME`; seed it so they never reload the live user manager either.
     _SLICE_UNIT_SEED = _render_live_workloads_slice_unit()
@@ -162,8 +167,8 @@ def setUpModule() -> None:
 
 def tearDownModule() -> None:
     global _XDG_TMPDIR, _SLICE_UNIT_SEED
-    if _EXEC_GUARD is not None:
-        _EXEC_GUARD.stop()
+    while _EXEC_GUARDS:
+        _EXEC_GUARDS.pop().stop()
     if _ENV_PATCHER is not None:
         _ENV_PATCHER.stop()
     if _XDG_TMPDIR is not None:
@@ -986,7 +991,14 @@ class TestCliAndLimits(unittest.TestCase):
         """A leaked `ANNEAL_LEAN_RUN_IN_SCOPE=1` fails loudly instead of `exec`ing the
         command over the unittest runner (which would end the run early with exit 0)."""
         self.assertNotIn("ANNEAL_LEAN_RUN_IN_SCOPE", os.environ)
-        self.assertIsNotNone(_EXEC_GUARD)
+        # Check the guards before provoking the pass-through: without them the call below
+        # would really replace this process.  The direct calls name a missing binary, so
+        # even an unguarded primitive could only raise.
+        self.assertEqual(len(_EXEC_GUARDS), len(_GUARDED_EXEC_FUNCTIONS))
+        for name in _GUARDED_EXEC_FUNCTIONS:
+            self.assertIsInstance(getattr(os, name), mock.Mock, name)
+            with self.assertRaisesRegex(AssertionError, "replace the unittest runner"):
+                getattr(os, name)("/nonexistent/anneal-test-exec", ["anneal-test-exec"])
         with mock.patch.dict(os.environ, {"ANNEAL_LEAN_RUN_IN_SCOPE": "1"}):
             with self.assertRaisesRegex(AssertionError, "replace the unittest runner"):
                 alr.main(["--mode", "file", "--no-slot-lock", "--", "true"])

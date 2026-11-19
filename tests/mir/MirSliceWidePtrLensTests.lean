@@ -1910,7 +1910,7 @@ declarations that neither file audits.
 Fails closed if an anchor is missing, has no source range, belongs to the wrong module, or is
 misordered; if the start or last anchor was not audited or the end anchor was; if any declaration
 spans an interval boundary (so both boundaries are clean cuts between top-level declarations) or
-starts after `lastAnchor`; or if fewer declarations than expected are found.
+starts after or extends past `lastAnchor`; or if fewer declarations than expected are found.
 
 Compiler-generated auxiliaries without a source range (`_proof_*`, `match_*`, `_f`, equation
 lemmas) are not counted: `collectAxioms` is transitive, so their axioms are audited through the
