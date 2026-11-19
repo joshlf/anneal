@@ -9413,6 +9413,15 @@ Compute the declared field count of a non-union single-variant aggregate type
   returns `.none` (failing closed when arity is unknown or `ty` is a union,
   multi-variant enum, or uninhabited type).
 
+Modeling note (`agent_docs/trusted-rust.md`): the quoted `Arbitrary` offsets
+justify only the `FieldsShape.arbitrary` case. `rustc` assigns
+`FieldsShape::Primitive` to field-less scalar layouts, and `rustc-capture` emits
+it only for those layouts and for uninstantiated type-parameter placeholders, so
+captured struct layouts never take the `.primitive` branch. Reading a
+`.primitive` entry at a non-zero index under an `.adt` type as a one-field
+transparent wrapper is a modeling choice for hand-assembled layout tables, not a
+documented `rustc` guarantee.
+
 Reference (`compiler/rustc_abi/src/lib.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1643-L1679>

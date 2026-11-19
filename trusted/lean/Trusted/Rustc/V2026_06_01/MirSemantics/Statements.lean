@@ -3671,12 +3671,34 @@ def setDiscriminantUninitPayload?
 
 /--
 Validate and pad the payload field list `fields` of an already-initialized
-aggregate at `p` when `SetDiscriminant(p, variantIdx)` switches to `variantIdx`:
-when `p` has a captured ADT layout in `layouts`, checks that `variantIdx` is an
-inhabited in-range variant (`enumVariantPayloadArity?`) and pads trailing slots
-up to `arity` with `Value.uninit` (`padFieldsToArity`) so switching from a
-narrower variant (such as `None`) to a wider variant (`Some(T)`) marks unwritten
-payload fields uninitialized; when no layout entry is present, preserves `fields`.
+aggregate at `p` when `SetDiscriminant(p, variantIdx)` sets its variant to
+`variantIdx`:
+- When `p` resolves to an ADT with a captured layout entry in `layouts` and
+  `variantIdx` is an inhabited in-range variant with payload arity `arity`
+  (`enumVariantPayloadArity?`), pads trailing slots up to `arity` with
+  `Value.uninit` (`padFieldsToArity`), so switching from a narrower variant
+  (such as `None`) to a wider variant (`Some(T)`) marks the unwritten payload
+  fields uninitialized.
+- Otherwise (no resolved place type, a non-ADT place such as a coroutine, no
+  captured layout entry, or an out-of-range or uninhabited `variantIdx`),
+  returns `.none`, so `evalStmt` fails closed with `.ub`: without the target
+  variant's arity the model cannot tell which payload fields the new variant
+  leaves uninitialized, and keeping a shorter `fields` list would let a later
+  whole-value read of `p` succeed although trailing payload fields were never
+  written. This matches `setDiscriminantUninitPayload?`, which fails closed on
+  the same missing layout data for an `.uninit` local.
+
+Modeling note (`agent_docs/trusted-rust.md`): the quoted documentation says
+`SetDiscriminant` writes only the bytes the layout requires for the tag, so the
+model keeps the payload values already present in `fields` under the new
+variant. Those values describe the underlying bytes at the new variant's field
+types only when each retained field of the target variant has the same offset,
+size, and type as the corresponding field of the source variant (as in the
+shared-prefix witnesses `wit_lm2_3_prefix_setDiscriminant_read` and
+`wit_lm2_3_upcast_setDiscriminant_read_and_trailing_ub`). Re-reading a retained
+`Value` at a target-variant field whose offset, size, or type differs is not
+justified by the quoted documentation and remains an unsupported modeling
+assumption of this definition.
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -3707,9 +3729,9 @@ def padSetDiscriminantInitFields?
         match enumVariantPayloadArity? localDecls layouts rTy variantIdx with
         | .some arity => .some (padFieldsToArity fields arity)
         | .none => .none
-      | .none => .some fields
-    | _ => .some fields
-  | .none => .some fields
+      | .none => .none
+    | _ => .none
+  | .none => .none
 
 /--
 `SetDiscriminant(loc, variantIdx)` on a whole local of the active frame whose
@@ -6693,6 +6715,29 @@ theorem evalStmt_deinit_projected_borrow_invalidation_and_protector_ub
         (advanceStmt sUnprot localsAfter
           { memUnprot with borrows := [{ b0 with perm := .disabled }, b1] }) ∧
     evalStmt sProt ⟨.deinit ⟨1, [.field 0 u32Ty]⟩, "d0p"⟩ decls emptyLayoutTable =
+      MirStepNode.fail .ub := by
+  exact ⟨rfl, rfl⟩
+
+/--
+`B2` fail-closed `SetDiscriminant` regression
+(`evalStmt_setDiscriminant_init_without_layout_ub`): on an initialized
+`_1 : Option<u32>` holding `None` (`.aggregate 0 []`), `SetDiscriminant(_1, 1)`
+without a captured layout entry for `Option<u32>` cannot determine the payload
+arity of `Some`, so `padSetDiscriminantInitFields?` returns `.none` and
+`evalStmt` faults with `.ub` instead of storing the payload-less
+`.aggregate 1 []`, which a later `copy _1` would read as a fully initialized
+`Some` value.
+-/
+theorem evalStmt_setDiscriminant_init_without_layout_ub :
+    let optTy : Ty := { kind := .adt "core::option::Option" [.uint .u32], layoutIdx := 0 }
+    let decls : List LocalDecl :=
+      [ { mutability := .mut, ty := { kind := .uint .u32, layoutIdx := 0 }, debugName := .none }
+      , { mutability := .mut, ty := optTy, debugName := .none } ]
+    let s : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .init (.aggregate 0 [])] }
+        memory := emptyMemory }
+    padSetDiscriminantInitFields? decls emptyLayoutTable ⟨1, .nil⟩ 1 [] = .none ∧
+    evalStmt s ⟨.setDiscriminant ⟨1, .nil⟩ 1, "sd"⟩ decls emptyLayoutTable =
       MirStepNode.fail .ub := by
   exact ⟨rfl, rfl⟩
 
