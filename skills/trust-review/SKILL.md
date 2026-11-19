@@ -92,10 +92,19 @@ hashed in `trusted/root-manifest.sha256`: `Cargo.toml`, `Cargo.lock`,
    `ci/`, `.github/`, and pinned root manifests, reject any new Rust crate,
    `build.rs`, proc-macro, `Makefile`, `GNUmakefile`, `Justfile`, `lakefile*`,
    `lean-toolchain`, `.nix`, workflow, `.pre-commit-config.yaml`, or shell or
-   Python script.
+   Python script (except unexecuted SHA-256-pinned provenance files under
+   `vendor/lean-miri/`).
 3. **Lean file placement and `theory/` purity:** Outside `trusted/`, `ci/`,
    `.github/`, and pinned root manifests, reject `.lean` files outside
-   `theory/` (audit `.lean` files inside `trusted/` under Pass 2). In
+   `theory/` and the SHA-256-pinned `vendor/lean-miri/` reference model
+   (audit `.lean` files inside `trusted/` under Pass 2). For any change
+   touching `vendor/lean-miri/` (which bypasses Phase 1 syntactic preflight
+   and belongs to the correspondence TCB), verify `LOCKED_MIRI_COMMIT`,
+   `vendor_tree.manifest_sha256`, `LOCKED_PATCHED_MIRI_FILES`,
+   `LOCKED_UPSTREAM_PIN_SHA256` in `trusted/audit/src/lib.rs`, and human
+   audit of both the resolved old-to-new reference-model semantic diff on any
+   upstream pin update and any compile-time code (`run_cmd`, `initialize`,
+   custom tactic `elab`s) in vendored or patched modules. In
    `theory/`, `.lean` files must use only pure declarations and tactics
    admitted by
    [`TrustedBoundary.lean`](../../trusted/audit/TrustedBoundary.lean)'s
@@ -261,8 +270,12 @@ or audit them is permitted).
   agreement alone is circular and never suffices.
 - **Lockstep artifact closure:** Every tracked derived lockfile, manifest,
   negative test, or packaged bundle present in either `base` or `head` (such as
-  `trusted/root-manifest.sha256`, `trusted/lean/foundation-lock.json`, or
-  packaged toolchain archives) must stay synchronized, use
+  `trusted/root-manifest.sha256`, `trusted/lean/foundation-lock.json`,
+  `vendor/lean-miri/UPSTREAM_PIN.json` and the `LOCKED_*` constants in
+  `trusted/audit/src/lib.rs`—`LOCKED_SYSROOT_FOUNDATION_MANIFEST_SHA256`,
+  `LOCKED_UPSTREAM_PIN_SHA256`, `LOCKED_MIRI_COMMIT`,
+  `LOCKED_PATCHED_MIRI_FILES`—or packaged toolchain archives) must stay
+  synchronized, use
   workspace-independent relative paths (never embedding local machine or
   worktree paths), and pass against downstream consumer fixtures. Never delete
   a lockfile, test, or bundle to evade a check. Absent future artifacts are not

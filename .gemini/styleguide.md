@@ -93,7 +93,8 @@ never proves defect absence or substitutes for CI or merge gates.
     `.github/`, and pinned root manifests, reject any new Rust crate,
     `build.rs`, proc-macro, `Makefile`, `GNUmakefile`, `Justfile`, `lakefile*`,
     `lean-toolchain`, `.nix`, workflow, `.pre-commit-config.yaml`, shell/Python
-    script, or `.lean` file outside `theory/`.
+    script (except unexecuted pinned `vendor/lean-miri/` provenance files), or
+    `.lean` file outside `theory/` and pinned `vendor/lean-miri/`.
   - *`theory/` purity and `TrustedBoundary.lean` exclusions:* `theory/` `.lean`
     files must use only pure declarations and tactics admitted by
     `TrustedBoundary.lean`'s allowlists (`trusted/lean/` stays tactic-free).
