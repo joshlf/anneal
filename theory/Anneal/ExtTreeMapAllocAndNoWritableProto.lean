@@ -9215,12 +9215,14 @@ theorem validateRawPtrFull_customDynDst_layout_and_vtable_soundness
     simp [hunszAdt, hadtOk, htailAdt, htrAdt, hvOk, Except.mapError, Except.map,
       Bind.bind, Except.bind]
 
-/-- Deferred recursive `childSession` pointee errors (`ValidityVisitor.lean:302–329, 412–418, 527–556`,
-`[adv A3]`, discharging B3 open item `(iii)`). -/
+/-- Deferred recursive `childSession` pointee errors (`ValidityVisitor.lean:302–339, 412–418, 527–556`,
+`[adv A3]`; `char` / function-pointer cases added in `[adv B4]`). -/
 inductive TrackedDynPointeeErr where
   | uninhabitedPointee
   | uninitPointeeByte
   | invalidBoolScalar (byte : UInt8)
+  | invalidCharScalar (value : UInt64)
+  | nullFnPtr
   | nestedAddressTooClose (sizeBytes : Nat)
   | nullNestedSafePtr
   | uninhabitedNestedSafePtr
@@ -9243,20 +9245,112 @@ def allBytesWithoutProvenance : List AbstractByte → Bool
   | .init _ (some _) :: _ => false
   | .init _ none :: rest => allBytesWithoutProvenance rest
 
+/-- Unicode-scalar-value check of `Scalar.toChar` (`ValidityVisitor.lean:311–312`, `[adv B4]`):
+`v < 0xD800` or `0xE000 ≤ v < 0x110000`. -/
+def isUnicodeScalarValue (v : UInt64) : Bool :=
+  decide (v.toNat < 0xD800) || (decide (0xE000 ≤ v.toNat) && decide (v.toNat < 0x110000))
+
+/-- In-memory field offsets of a tuple/struct body (`[adv B4]`), using exactly the
+`roundUpToAlign accSize l.alignBytes` placement of `computeFieldsLayout` (declaration order is memory
+order in this model, matching upstream's "fields follow in-memory order" visit, line 342). -/
+def fieldByteOffsets (maxSize : Nat) : Nat → List ProtoTy → List (Nat × ProtoTy)
+  | _, [] => []
+  | accSize, f :: rest =>
+    match computeTyLayout maxSize f with
+    | .ok l =>
+      let off := roundUpToAlign accSize l.alignBytes
+      (off, f) :: fieldByteOffsets maxSize (off + l.sizeBytes) rest
+    | .error _ => []
+
+/-- Nested safe reference inside a tracked pointee, checked by `checkSafe` under `childSession`
+(`flags.mayDangle = true`, `refTracking = none`, `ValidityVisitor.lean:198–241, 552`; A3's logic,
+factored out in `[adv B4]`): initialized pointer read, integer `addressTooClose`, non-null,
+`opsemInhabited innerPt`, and alignment, while `checkPointerAccess` and further tracking are skipped.
+Pointers are 8 bytes in this model's `computeTyLayout`, so wide nested references are checked on their
+data word only (their metadata is not modeled). -/
+def checkNestedSafeRefChildSession (maxSize : Nat) (innerPt : ProtoTy)
+    (pointeeSlice : List AbstractByte) : Except TrackedDynPointeeErr Unit := do
+  if !(Nat.beq pointeeSlice.length 8) || !(allBytesInitialized pointeeSlice) then
+    throw .uninitPointeeByte
+  let innerLay ←
+    match computeTyLayout maxSize innerPt with
+    | .ok il => .ok il
+    | .error _ => .error .uninhabitedNestedSafePtr
+  let addr := decodeLittleEndianU64 pointeeSlice
+  if allBytesWithoutProvenance pointeeSlice &&
+      decide (addr.toNat + innerLay.sizeBytes ≥ usizeMax64) then
+    throw (.nestedAddressTooClose innerLay.sizeBytes)
+  if addr == 0 then
+    throw .nullNestedSafePtr
+  if !innerLay.isInhabited then
+    throw .uninhabitedNestedSafePtr
+  if innerLay.alignBytes > 0 && (addr.toNat % innerLay.alignBytes != 0) then
+    throw (.unalignedNestedSafePtr innerLay.alignBytes addr)
+  return ()
+
+/-- Fuel-bounded recursive value visitor for the concrete pointee of a tracked `&dyn Trait`
+(`ValidityVisitor.visit` + `primitive`, lines 299–339 & 344–473, under `childSession`; `[adv B4]`).
+A3's `visitTrackedConcretePointee` checked only `bool`, integer scalars and nested references and
+**accepted every other pointee of the right length** (tuples, structs, arrays, raw and function
+pointers), and checked `char` only for initialization — missing UB that upstream's recursive mode
+reports. This visitor follows upstream:
+- `!` fails (`primitive .never`); `bool` must be `0`/`1`; `char` must be an initialized Unicode scalar
+  value (`Scalar.toChar`); integers and raw pointers must be initialized (`readImmediate`);
+- function pointers must be initialized and non-null (`refTracking = none` ⇒ `scalarMayBeNull`,
+  line 334); nested references use `checkNestedSafeRefChildSession`;
+- arrays visit every element at stride `elemSize`; tuples/structs visit every field at its
+  `fieldByteOffsets` offset, in memory order, stopping at the first failure (padding is not read).
+Depth beyond the fuel bound is accepted (upstream reports resource exhaustion instead). -/
+def visitConcreteValue (maxSize : Nat) : Nat → ProtoTy → List AbstractByte →
+    Except TrackedDynPointeeErr Unit
+  | 0, _, _ => .ok ()
+  | fuel + 1, ty, bytes =>
+    match ty with
+    | .never => .error .uninhabitedPointee
+    | .bool =>
+      match bytes with
+      | .init b _ :: _ => if b ≤ 1 then .ok () else .error (.invalidBoolScalar b)
+      | _ => .error .uninitPointeeByte
+    | .char =>
+      let s := bytes.take 4
+      if !(Nat.beq s.length 4) || !(allBytesInitialized s) then .error .uninitPointeeByte
+      else if isUnicodeScalarValue (decodeLittleEndianU64 s) then .ok ()
+      else .error (.invalidCharScalar (decodeLittleEndianU64 s))
+    | .u8 | .u16 | .u32 | .u64 | .usize | .i32 | .i64 | .isize | .rawPtr _ _ =>
+      let need :=
+        match computeTyLayout maxSize ty with
+        | .ok l => l.sizeBytes
+        | .error _ => 0
+      let s := bytes.take need
+      if !(Nat.beq s.length need) || !(allBytesInitialized s) then .error .uninitPointeeByte
+      else .ok ()
+    | .fnPtr =>
+      let s := bytes.take 8
+      if !(Nat.beq s.length 8) || !(allBytesInitialized s) then .error .uninitPointeeByte
+      else if decodeLittleEndianU64 s == 0 && allBytesWithoutProvenance s then .error .nullFnPtr
+      else .ok ()
+    | .ref _ innerPt => checkNestedSafeRefChildSession maxSize innerPt (bytes.take 8)
+    | .array elem n =>
+      match computeTyLayout maxSize elem with
+      | .ok el =>
+        (List.range n).foldlM (fun _ i =>
+          visitConcreteValue maxSize fuel elem ((bytes.drop (i * el.sizeBytes)).take el.sizeBytes)) ()
+      | .error _ => .ok ()
+    | .tuple fields | .adt _ fields =>
+      (fieldByteOffsets maxSize 0 fields).foldlM (fun _ p =>
+        match computeTyLayout maxSize p.2 with
+        | .ok fl => visitConcreteValue maxSize fuel p.2 ((bytes.drop p.1).take fl.sizeBytes)
+        | .error _ => .ok ()) ()
+    | .str | .slice _ | .dynamic _ | .foreign _ => .ok ()
+
 /-- Deferred recursive reference-tracker visitor on the unpacked concrete pointee of `&dyn Trait`
-(`ValidityVisitor.lean:302–329, 412–418, 552`, `[adv A3]`):
+(`ValidityVisitor.lean:302–339, 412–418, 552`, `[adv A3]`, full value visitor `[adv B4]`):
 `validatePlace … (recursive := true)` pops each tracked `(mplace, dyn Trait)` under
 `childSession := { flags := { reset := false, mayDangle := true }, refTracking := none }`, unpacks
-`dyn Trait` to `desc.concreteTy`, and visits the pointee slice in `w.live`:
-- `.bool` reads 1 byte (`lines 308–310`): `.uninit` -> `.uninitPointeeByte`, `b > 1` ->
-  `.invalidBoolScalar b`, `0` or `1` -> `.ok ()`.
-- Integer/char scalars require `lay.sizeBytes` initialized bytes (`line 308`).
-- Nested safe references `.ref _ innerPt` run `checkSafe` under `childSession`
-  (`flags.mayDangle = true`, `refTracking = none`, `lines 198–241, 552`): initialized 8-byte read,
-  integer `addressTooClose`, non-null, `opsemInhabited innerPt`, and alignment still run, while
-  `checkPointerAccess` and further `refTracking` are skipped — so an aligned non-null **dangling**
-  integer `&u32` inside `&(&u32 as dyn Send)` **succeeds** even under `-Zmiri-recursive-validation`,
-  whereas `&!` inside `&(&! as dyn Sync)` fails `opsemInhabited` (`line 226`)! -/
+`dyn Trait` to `desc.concreteTy`, and visits the pointee bytes: uninhabited concrete types fail first,
+then `visitConcreteValue` checks the contents (an aligned non-null **dangling** integer `&u32` inside
+`&(&u32 as dyn Send)` succeeds even under `-Zmiri-recursive-validation`, whereas `&!` inside fails
+`opsemInhabited`, line 226). -/
 def visitTrackedConcretePointee (maxSize : Nat) (concreteTy : ProtoTy)
     (pointeeSlice : List AbstractByte) : Except TrackedDynPointeeErr Unit := do
   let lay ←
@@ -9265,63 +9359,34 @@ def visitTrackedConcretePointee (maxSize : Nat) (concreteTy : ProtoTy)
     | .error _ => .error .uninhabitedPointee
   if !lay.isInhabited then
     throw .uninhabitedPointee
-  match concreteTy with
-  | .bool =>
-    match pointeeSlice with
-    | [.init b _] =>
-      if b ≤ 1 then .ok () else .error (.invalidBoolScalar b)
-    | _ => .error .uninitPointeeByte
-  | .u8 | .u16 | .char | .u32 | .u64 | .usize | .i32 | .i64 | .isize =>
-    if !(Nat.beq pointeeSlice.length lay.sizeBytes) || !(allBytesInitialized pointeeSlice) then
-      .error .uninitPointeeByte
-    else
-      .ok ()
-  | .ref _ innerPt =>
-    if !(Nat.beq pointeeSlice.length 8) || !(allBytesInitialized pointeeSlice) then
-      throw .uninitPointeeByte
-    let innerLay ←
-      match computeTyLayout maxSize innerPt with
-      | .ok il => .ok il
-      | .error _ => .error .uninhabitedNestedSafePtr
-    let addr := decodeLittleEndianU64 pointeeSlice
-    if allBytesWithoutProvenance pointeeSlice &&
-        decide (addr.toNat + innerLay.sizeBytes ≥ usizeMax64) then
-      throw (.nestedAddressTooClose innerLay.sizeBytes)
-    if addr == 0 then
-      throw .nullNestedSafePtr
-    if !innerLay.isInhabited then
-      throw .uninhabitedNestedSafePtr
-    if innerLay.alignBytes > 0 && (addr.toNat % innerLay.alignBytes != 0) then
-      throw (.unalignedNestedSafePtr innerLay.alignBytes addr)
-    return ()
-  | _ =>
-    if !(Nat.beq pointeeSlice.length lay.sizeBytes) then
-      .error .uninitPointeeByte
-    else
-      .ok ()
+  visitConcreteValue maxSize 64 concreteTy pointeeSlice
 
-/-- Memory-content-aware wide `dyn` safe-pointer validator (`[adv A3]`, discharging B3 open item
-`(iii)`): runs `validateWideDynSafePtr` on the root pointer first, and under `recursive && !mayDangle`
-additionally runs `visitTrackedConcretePointee` (`childSession` `mayDangle = true, refTracking = none`)
-on `(liveEntry.bytes.drop dataOff).take sz`. -/
+/-- Memory-content-aware wide `dyn` safe-pointer validator (`[adv A3]`, attribution fix `[adv B4]`):
+runs the *root* `checkSafe` (`validateWideDynSafePtr … (recursive := false)`) first and, under
+`recursive && !mayDangle`, the deferred tracker visit `visitTrackedConcretePointee` on the pointee
+bytes `(liveEntry.bytes.drop dataOff).take sz` (the empty slice for a dangling-integer ZST pointee,
+which upstream tracks too). `[adv B4]`: A3 passed `recursive` to the root validator, so its coarse
+uninhabitedness summary fired *inside the root check* and reported `.rootErr .uninhabitedPointee`,
+although upstream's root `checkSafe` never inspects the concrete type — that failure belongs to the
+deferred visit (`.pointeeErr`). -/
 def validateWideDynSafePtrWithBytes (w : KeyedAllocWorld) (reg : VTableRegistry) (maxSize : Nat)
     (expectedSpec : DynExistentialSpec) (mayDangle : Bool)
     (dataPtr vtablePtr : ScalarPtrHalf) (recursive : Bool := false) :
     Except WideDynFullErr (ProtoTy × UInt64 × UInt64) := do
   let rootRes ←
-    (validateWideDynSafePtr w reg maxSize expectedSpec mayDangle dataPtr vtablePtr recursive).mapError
+    (validateWideDynSafePtr w reg maxSize expectedSpec mayDangle dataPtr vtablePtr false).mapError
       WideDynFullErr.rootErr
   let (concreteTy, sz, al) := rootRes
   if recursive && !mayDangle then
-    match dataPtr with
-    | .provenanced _ dataId dataOff =>
-      let slice :=
+    let slice :=
+      match dataPtr with
+      | .provenanced _ dataId dataOff =>
         match w.findLive? dataId with
         | some liveEntry => (liveEntry.bytes.drop dataOff.toNat).take sz.toNat
         | none => []
-      (visitTrackedConcretePointee maxSize concreteTy slice).mapError WideDynFullErr.pointeeErr
-      return (concreteTy, sz, al)
-    | _ => return (concreteTy, sz, al)
+      | _ => []
+    (visitTrackedConcretePointee maxSize concreteTy slice).mapError WideDynFullErr.pointeeErr
+    return (concreteTy, sz, al)
   else
     return (concreteTy, sz, al)
 
@@ -9441,5 +9506,125 @@ theorem wideDyn_recursive_bytes_and_childSession_mayDangle
   · unfold validateWideDynSafePtrWithBytes; dsimp only [wNullRef]; rw [hrootRU, hfind]; rfl
   · unfold validateWideDynSafePtrWithBytes; dsimp only [wDangRef]; rw [hrootRU, hfind]; rfl
   · unfold validateWideDynSafePtrWithBytes; dsimp only [wDangRef]; rw [hrootRN, hfind]; rfl
+
+
+/-- **Recursive Mode Rejects Invalid Aggregate, `char`, and Function-Pointer Pointees
+(`wideDyn_recursive_aggregate_char_fnPtr_contents`, `[adv B4]`)**: matching `ValidityVisitor.lean`
+lines 302–339 & 441–457 under `childSession`, for every world and registry in which the vtables
+`vtPair : (u8, bool)`, `vtChar : char`, `vtFn : fn()` and `vtNever : (u32, !)` validate:
+1. `(u8, bool)` with bytes `[0x07, 0x02]` is accepted by default (non-recursive) validation but rejected
+   by recursive validation with `.pointeeErr (.invalidBoolScalar 2)` — the `bool` field at offset `1`
+   (A3's visitor accepted *any* 2-byte tuple) — while the valid `[0x07, 0x01]` is accepted recursively;
+2. a `char` with bytes `00 D8 00 00` (the surrogate `0xD800`) is rejected with
+   `.pointeeErr (.invalidCharScalar 0xD800)` (A3 checked initialization only);
+3. a zero `fn()` pointer is rejected with `.pointeeErr .nullFnPtr` (A3 accepted any 8 bytes);
+4. an uninhabited concrete type is reported by the deferred visit (`.pointeeErr .uninhabitedPointee`),
+   not by the root `checkSafe` (A3 reported `.rootErr .uninhabitedPointee`). -/
+theorem wideDyn_recursive_aggregate_char_fnPtr_contents
+    (w : KeyedAllocWorld) (reg : VTableRegistry) (expectedSpec : DynExistentialSpec)
+    (vtPair vtChar vtFn vtNever : ScalarPtrHalf)
+    (descPair descChar descFn descNever : VTableDescriptor)
+    (dataId : MiriAllocId) (addr : UInt64)
+    (hvPair : validateVTableHalf w reg vtPair expectedSpec = .ok descPair)
+    (hctPair : descPair.concreteTy = .tuple [.u8, .bool])
+    (hszPair : descPair.sizeBytes = 2) (halPair : descPair.alignBytes = 1)
+    (hvChar : validateVTableHalf w reg vtChar expectedSpec = .ok descChar)
+    (hctChar : descChar.concreteTy = .char)
+    (hszChar : descChar.sizeBytes = 4) (halChar : descChar.alignBytes = 4)
+    (hvFn : validateVTableHalf w reg vtFn expectedSpec = .ok descFn)
+    (hctFn : descFn.concreteTy = .fnPtr)
+    (hszFn : descFn.sizeBytes = 8) (halFn : descFn.alignBytes = 8)
+    (hvNever : validateVTableHalf w reg vtNever expectedSpec = .ok descNever)
+    (hctNever : descNever.concreteTy = .tuple [.u32, .never])
+    (hszNever : descNever.sizeBytes = 4) (halNever : descNever.alignBytes = 4)
+    (hnz : addr ≠ 0) (halign4 : addr % 4 = 0) (halign8 : addr % 8 = 0) :
+    let wPair := w.insertLive dataId ⟨.heap, 8, 8, .mut, [.init 7 none, .init 2 none]⟩
+    let wPairOk := w.insertLive dataId ⟨.heap, 8, 8, .mut, [.init 7 none, .init 1 none]⟩
+    let wChar := w.insertLive dataId ⟨.heap, 8, 8, .mut,
+      [.init 0 none, .init 0xD8 none, .init 0 none, .init 0 none]⟩
+    let wZero := w.insertLive dataId ⟨.heap, 8, 8, .mut, zeroInitBytes 8⟩
+    validateWideDynSafePtrWithBytes wPair reg maxRepresentableSize64 expectedSpec false
+      (.provenanced addr dataId 0) vtPair = .ok (.tuple [.u8, .bool], 2, 1) ∧
+    validateWideDynSafePtrWithBytes wPair reg maxRepresentableSize64 expectedSpec false
+      (.provenanced addr dataId 0) vtPair true = .error (.pointeeErr (.invalidBoolScalar 2)) ∧
+    validateWideDynSafePtrWithBytes wPairOk reg maxRepresentableSize64 expectedSpec false
+      (.provenanced addr dataId 0) vtPair true = .ok (.tuple [.u8, .bool], 2, 1) ∧
+    validateWideDynSafePtrWithBytes wChar reg maxRepresentableSize64 expectedSpec false
+      (.provenanced addr dataId 0) vtChar true = .error (.pointeeErr (.invalidCharScalar 0xD800)) ∧
+    validateWideDynSafePtrWithBytes wZero reg maxRepresentableSize64 expectedSpec false
+      (.provenanced addr dataId 0) vtFn true = .error (.pointeeErr .nullFnPtr) ∧
+    validateWideDynSafePtrWithBytes wZero reg maxRepresentableSize64 expectedSpec false
+      (.provenanced addr dataId 0) vtNever true = .error (.pointeeErr .uninhabitedPointee) := by
+  intro wPair wPairOk wChar wZero
+  have haddr0 : (addr == 0) = false := beq_false_of_ne hnz
+  have hmod1 : (addr % 1 != 0) = false := by
+    have h1 : addr % 1 = 0 := UInt64.mod_one
+    rw [h1]; rfl
+  have hmod4 : (addr % 4 != 0) = false := by rw [halign4]; rfl
+  have hmod8 : (addr % 8 != 0) = false := by rw [halign8]; rfl
+  have hinfo : ∀ bs, (w.insertLive dataId ⟨.heap, 8, 8, .mut, bs⟩).getAllocInfo dataId =
+      .ok ⟨8, 8, .liveData, .mut⟩ := by
+    intro bs
+    unfold KeyedAllocWorld.getAllocInfo KeyedAllocWorld.findLive? KeyedAllocWorld.insertLive
+    dsimp only
+    rw [ExtTreeMap0.get?_insert_self]
+  have hfind : ∀ bs, (w.insertLive dataId ⟨.heap, 8, 8, .mut, bs⟩).findLive? dataId =
+      some ⟨.heap, 8, 8, .mut, bs⟩ := by
+    intro bs
+    unfold KeyedAllocWorld.findLive? KeyedAllocWorld.insertLive
+    exact ExtTreeMap0.get?_insert_self _ _ _
+  have hvP : ∀ e, validateVTableHalf (w.insertLive dataId e) reg vtPair expectedSpec = .ok descPair :=
+    fun e => (validateVTableHalf_insertLive_eq w dataId e reg vtPair expectedSpec).trans hvPair
+  have hvC : ∀ e, validateVTableHalf (w.insertLive dataId e) reg vtChar expectedSpec = .ok descChar :=
+    fun e => (validateVTableHalf_insertLive_eq w dataId e reg vtChar expectedSpec).trans hvChar
+  have hvF : ∀ e, validateVTableHalf (w.insertLive dataId e) reg vtFn expectedSpec = .ok descFn :=
+    fun e => (validateVTableHalf_insertLive_eq w dataId e reg vtFn expectedSpec).trans hvFn
+  have hvN : ∀ e, validateVTableHalf (w.insertLive dataId e) reg vtNever expectedSpec =
+      .ok descNever :=
+    fun e => (validateVTableHalf_insertLive_eq w dataId e reg vtNever expectedSpec).trans hvNever
+  have hrootP : ∀ bs,
+      validateWideDynSafePtr (w.insertLive dataId ⟨.heap, 8, 8, .mut, bs⟩) reg maxRepresentableSize64
+        expectedSpec false (.provenanced addr dataId 0) vtPair false = .ok (.tuple [.u8, .bool], 2, 1) := by
+    intro bs
+    unfold validateWideDynSafePtr
+    rw [hvP]
+    dsimp only [Bind.bind, Except.bind]
+    rw [hszPair, halPair, hctPair, hinfo, haddr0, hmod1]
+    rfl
+  have hrootC : ∀ bs,
+      validateWideDynSafePtr (w.insertLive dataId ⟨.heap, 8, 8, .mut, bs⟩) reg maxRepresentableSize64
+        expectedSpec false (.provenanced addr dataId 0) vtChar false = .ok (.char, 4, 4) := by
+    intro bs
+    unfold validateWideDynSafePtr
+    rw [hvC]
+    dsimp only [Bind.bind, Except.bind]
+    rw [hszChar, halChar, hctChar, hinfo, haddr0, hmod4]
+    rfl
+  have hrootF : ∀ bs,
+      validateWideDynSafePtr (w.insertLive dataId ⟨.heap, 8, 8, .mut, bs⟩) reg maxRepresentableSize64
+        expectedSpec false (.provenanced addr dataId 0) vtFn false = .ok (.fnPtr, 8, 8) := by
+    intro bs
+    unfold validateWideDynSafePtr
+    rw [hvF]
+    dsimp only [Bind.bind, Except.bind]
+    rw [hszFn, halFn, hctFn, hinfo, haddr0, hmod8]
+    rfl
+  have hrootN : ∀ bs,
+      validateWideDynSafePtr (w.insertLive dataId ⟨.heap, 8, 8, .mut, bs⟩) reg maxRepresentableSize64
+        expectedSpec false (.provenanced addr dataId 0) vtNever false =
+        .ok (.tuple [.u32, .never], 4, 4) := by
+    intro bs
+    unfold validateWideDynSafePtr
+    rw [hvN]
+    dsimp only [Bind.bind, Except.bind]
+    rw [hszNever, halNever, hctNever, hinfo, haddr0, hmod4]
+    rfl
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+  · unfold validateWideDynSafePtrWithBytes; dsimp only [wPair]; rw [hrootP]; rfl
+  · unfold validateWideDynSafePtrWithBytes; dsimp only [wPair]; rw [hrootP, hfind]; rfl
+  · unfold validateWideDynSafePtrWithBytes; dsimp only [wPairOk]; rw [hrootP, hfind]; rfl
+  · unfold validateWideDynSafePtrWithBytes; dsimp only [wChar]; rw [hrootC, hfind]; rfl
+  · unfold validateWideDynSafePtrWithBytes; dsimp only [wZero]; rw [hrootF, hfind]; rfl
+  · unfold validateWideDynSafePtrWithBytes; dsimp only [wZero]; rw [hrootN, hfind]; rfl
 
 end Anneal.ExtTreeMapAllocAndNoWritableProto

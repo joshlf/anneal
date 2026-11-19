@@ -2513,6 +2513,83 @@ theorem canary_part3C_recursive_pointee_bytes_and_childSession_mayDangle :
     a3DescBool a3DescRefU32 a3DescRefNever testIdMax 16
     hvB rfl rfl rfl hvRU rfl rfl rfl hvRN rfl rfl rfl (by decide) (by decide)
 
+def b4DescPair : VTableDescriptor :=
+  ⟨testId1, .tuple [.u8, .bool], .principalLess [.send], "drop_u8_bool", 2, 1,
+    [.dropInPlace "drop_u8_bool", .size 2, .align 1]⟩
+
+def b4DescChar : VTableDescriptor :=
+  ⟨testId2, .char, .principalLess [.send], "drop_char", 4, 4,
+    [.dropInPlace "drop_char", .size 4, .align 4]⟩
+
+def b4DescFn : VTableDescriptor :=
+  ⟨testId3, .fnPtr, .principalLess [.send], "drop_fn_ptr", 8, 8,
+    [.dropInPlace "drop_fn_ptr", .size 8, .align 8]⟩
+
+def b4DescNever : VTableDescriptor :=
+  ⟨testIdMaxPrev, .tuple [.u32, .never], .principalLess [.send], "drop_u32_never", 4, 4,
+    [.dropInPlace "drop_u32_never", .size 4, .align 4]⟩
+
+def b4ChildSessionWorld : KeyedAllocWorld :=
+  (((KeyedAllocWorld.empty.registerGlobal ⟨testId1, .vtable, 0, 1, .not⟩).registerGlobal
+    ⟨testId2, .vtable, 0, 4, .not⟩).registerGlobal ⟨testId3, .vtable, 0, 8, .not⟩).registerGlobal
+    ⟨testIdMaxPrev, .vtable, 0, 4, .not⟩
+
+def b4ChildSessionReg : VTableRegistry where
+  byKey := ((((∅ : ExtTreeMap0 VTableKey VTableDescriptor).insert
+      (mkCanonicalVTableKey (.tuple [.u8, .bool]) none [.send]) b4DescPair).insert
+      (mkCanonicalVTableKey .char none [.send]) b4DescChar).insert
+      (mkCanonicalVTableKey .fnPtr none [.send]) b4DescFn).insert
+      (mkCanonicalVTableKey (.tuple [.u32, .never]) none [.send]) b4DescNever
+  byAlloc := ((((∅ : ExtTreeMap0 MiriAllocId VTableDescriptor).insert testId1 b4DescPair).insert
+      testId2 b4DescChar).insert testId3 b4DescFn).insert testIdMaxPrev b4DescNever
+
+/-- **`[adv B4]` Closed canary — recursive validation of aggregate, `char`, and function-pointer
+pointees behind `&dyn Send`** (`wideDyn_recursive_aggregate_char_fnPtr_contents`):
+1. `(u8, bool)` holding `[0x07, 0x02]` passes default validation but fails recursive validation with
+   `.invalidBoolScalar 2` (field at offset `1`; A3's visitor accepted any 2-byte tuple), while
+   `[0x07, 0x01]` passes recursively;
+2. the surrogate `char` `0xD800` fails with `.invalidCharScalar 0xD800`;
+3. a zero `fn()` pointer fails with `.nullFnPtr`;
+4. `(u32, !)` fails in the deferred visit (`.pointeeErr .uninhabitedPointee`), not in the root check. -/
+theorem canary_part3C_recursive_aggregate_char_fnPtr_pointees :
+    let specSend := DynExistentialSpec.principalLess [.send]
+    let vtP := ScalarPtrHalf.provenanced 0x1000 testId1 0
+    let vtC := ScalarPtrHalf.provenanced 0x2000 testId2 0
+    let vtF := ScalarPtrHalf.provenanced 0x3000 testId3 0
+    let vtN := ScalarPtrHalf.provenanced 0x4000 testIdMaxPrev 0
+    let wPair := b4ChildSessionWorld.insertLive testIdMax ⟨.heap, 8, 8, .mut, [.init 7 none, .init 2 none]⟩
+    let wPairOk := b4ChildSessionWorld.insertLive testIdMax ⟨.heap, 8, 8, .mut, [.init 7 none, .init 1 none]⟩
+    let wChar := b4ChildSessionWorld.insertLive testIdMax ⟨.heap, 8, 8, .mut,
+      [.init 0 none, .init 0xD8 none, .init 0 none, .init 0 none]⟩
+    let wZero := b4ChildSessionWorld.insertLive testIdMax ⟨.heap, 8, 8, .mut,
+      Anneal.BitValidity.zeroInitBytes 8⟩
+    validateWideDynSafePtrWithBytes wPair b4ChildSessionReg maxRepresentableSize64 specSend false
+      (.provenanced 16 testIdMax 0) vtP = .ok (.tuple [.u8, .bool], 2, 1) ∧
+    validateWideDynSafePtrWithBytes wPair b4ChildSessionReg maxRepresentableSize64 specSend false
+      (.provenanced 16 testIdMax 0) vtP true = .error (.pointeeErr (.invalidBoolScalar 2)) ∧
+    validateWideDynSafePtrWithBytes wPairOk b4ChildSessionReg maxRepresentableSize64 specSend false
+      (.provenanced 16 testIdMax 0) vtP true = .ok (.tuple [.u8, .bool], 2, 1) ∧
+    validateWideDynSafePtrWithBytes wChar b4ChildSessionReg maxRepresentableSize64 specSend false
+      (.provenanced 16 testIdMax 0) vtC true = .error (.pointeeErr (.invalidCharScalar 0xD800)) ∧
+    validateWideDynSafePtrWithBytes wZero b4ChildSessionReg maxRepresentableSize64 specSend false
+      (.provenanced 16 testIdMax 0) vtF true = .error (.pointeeErr .nullFnPtr) ∧
+    validateWideDynSafePtrWithBytes wZero b4ChildSessionReg maxRepresentableSize64 specSend false
+      (.provenanced 16 testIdMax 0) vtN true = .error (.pointeeErr .uninhabitedPointee) := by
+  have hvP : validateVTableHalf b4ChildSessionWorld b4ChildSessionReg
+      (.provenanced 0x1000 testId1 0) (.principalLess [.send]) = .ok b4DescPair := by decide +kernel
+  have hvC : validateVTableHalf b4ChildSessionWorld b4ChildSessionReg
+      (.provenanced 0x2000 testId2 0) (.principalLess [.send]) = .ok b4DescChar := by decide +kernel
+  have hvF : validateVTableHalf b4ChildSessionWorld b4ChildSessionReg
+      (.provenanced 0x3000 testId3 0) (.principalLess [.send]) = .ok b4DescFn := by decide +kernel
+  have hvN : validateVTableHalf b4ChildSessionWorld b4ChildSessionReg
+      (.provenanced 0x4000 testIdMaxPrev 0) (.principalLess [.send]) = .ok b4DescNever := by
+    decide +kernel
+  exact wideDyn_recursive_aggregate_char_fnPtr_contents
+    b4ChildSessionWorld b4ChildSessionReg (.principalLess [.send])
+    (.provenanced 0x1000 testId1 0) (.provenanced 0x2000 testId2 0) (.provenanced 0x3000 testId3 0)
+    (.provenanced 0x4000 testIdMaxPrev 0) b4DescPair b4DescChar b4DescFn b4DescNever testIdMax 16
+    hvP rfl rfl rfl hvC rfl rfl rfl hvF rfl rfl rfl hvN rfl rfl rfl (by decide) (by decide) (by decide)
+
 /-! ## Section 4: Explicit `#guard_msgs in #print axioms` Verification -/
 
 /-- info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.KeyedAllocWorld.ext' depends on axioms: [propext, Quot.sound] -/
@@ -2715,6 +2792,13 @@ info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.wideDyn_recursive_bytes_and_chil
 -/
 #guard_msgs in
 #print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.wideDyn_recursive_bytes_and_childSession_mayDangle
+
+/--
+info: 'Anneal.ExtTreeMapAllocAndNoWritableProto.wideDyn_recursive_aggregate_char_fnPtr_contents' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms Anneal.ExtTreeMapAllocAndNoWritableProto.wideDyn_recursive_aggregate_char_fnPtr_contents
 
 /-! ## Section 5: Deterministic Workload Generators & Elaboration Benchmarks (`M = 16, 64, 128, 256`) -/
 
@@ -2998,6 +3082,17 @@ run_cmd do
     | _ => acc
 
   let collectPrunedReachableClosure (env : Environment) (roots : Array Name) : NameSet := Id.run do
+    -- `[adv B4]`: only declarations of this test file or of the prototype module can (transitively)
+    -- reference a prototype theorem — no imported module imports the prototype — so foreign
+    -- declarations are recorded as visited but not expanded. The reachability verdict for every
+    -- prototype theorem is unchanged, while A3's non-memoized `collectLiveConstantsAux` walk over
+    -- every reachable `Init`/`Std`/`Lean` declaration body (which pushed the receipt run toward the
+    -- 180 s `anneal-lean-run` limit on a loaded host) is skipped.
+    let isAuditedDecl (nm : Name) : Bool :=
+      match env.getModuleIdxFor? nm with
+      | none => true
+      | some idx =>
+        env.header.moduleNames[idx.toNat]? == some `Anneal.ExtTreeMapAllocAndNoWritableProto
     let mut visited : NameSet := {}
     let mut worklist : Array Name := roots
     while !worklist.isEmpty do
@@ -3006,6 +3101,8 @@ run_cmd do
       if visited.contains curr then
         continue
       visited := visited.insert curr
+      if !isAuditedDecl curr then
+        continue
       match env.find? curr with
       | none => continue
       | some ci =>
