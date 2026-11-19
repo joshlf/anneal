@@ -2494,3 +2494,210 @@ fn ep2_a1_lockstep_parity_on_diverging_returns_loops_old_ref_rewrites_and_preste
         ]
     );
 }
+
+#[test]
+fn ep2_b2_lockstep_parity_on_old_match_shadowing_neg_patterns_enums_aliases_recursion_and_deep_prestep()
+{
+    use anneal_difftest::{
+        EnumVariantLayout, SpecContractOracleProbe, SpecExternalCallee, SpecParamBinding,
+        SpecPostconditionVerdict, SpecViolationKind,
+    };
+
+    let i32_layout = LayoutSpec::Scalar(ScalarLayout::i32());
+    let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+    let usize_layout = LayoutSpec::Scalar(ScalarLayout::unsigned(8));
+    let maybe_word_layout = LayoutSpec::Enum {
+        name: "MaybeWord".to_string(),
+        total_size: 8,
+        tag_offset: 0,
+        tag_size: 1,
+        variants: vec![
+            EnumVariantLayout {
+                name: "Empty".to_string(),
+                discriminant: 0,
+                payload_offset: 4,
+                payload: None,
+            },
+            EnumVariantLayout {
+                name: "Ready".to_string(),
+                discriminant: 1,
+                payload_offset: 4,
+                payload: Some(Box::new(u32_layout.clone())),
+            },
+        ],
+    };
+    let state_layout = LayoutSpec::Struct {
+        name: "EnumState".to_string(),
+        total_size: 24,
+        fields: vec![
+            FieldLayout {
+                name: "status".to_string(),
+                offset: 0,
+                layout: maybe_word_layout.clone(),
+            },
+            FieldLayout {
+                name: "cursor".to_string(),
+                offset: 8,
+                layout: usize_layout.clone(),
+            },
+            FieldLayout {
+                name: "active".to_string(),
+                offset: 16,
+                layout: u32_layout.clone(),
+            },
+        ],
+    };
+    let pair_usize_layout = LayoutSpec::Tuple {
+        total_size: 16,
+        elements: vec![(0, usize_layout.clone()), (8, usize_layout)],
+    };
+
+    // Exercises all 6 `ep2-B2` adversarial findings end-to-end against `rustc -D warnings`:
+    // 1. `old(match ... { x => ... })` & `old(if let MaybeWord::Ready(x) = ...)` shadowing `x: i32`,
+    // 2. Negative untyped `match` patterns (`-5 | -1`, `-4..=-2`), slice rest patterns, & `if let` chains,
+    // 3. Target self-recursion (`recursive_enum_probe(..., hops - 1)`),
+    // 4. `type Word = u32;`, `usize` struct/tuple/array literal synthesis (`(usize, usize)`),
+    // 5. Pre-stepped `EnvSchedule` > 256 calls (`300` pre-steps with `panic_on_call = 2` already passed
+    //    vs `panic_on_call = 300` firing on call 0 of the trial!),
+    // 6. `#[repr(C, u8)]` `Enum` inactive-payload poison frame safety vs real variant mutation (`FRAME`).
+    let probe = SpecContractOracleProbe::new(
+        "recursive_enum_probe",
+        vec![
+            SpecParamBinding::mut_ref("st", "EnumState", state_layout)
+                .with_frame_preserved_fields(["status", "cursor"]),
+            SpecParamBinding::by_value("x", "i32", i32_layout),
+            SpecParamBinding::by_value("hops", "Word", u32_layout.clone()),
+            SpecParamBinding::by_value("bounds", "(usize, usize)", pair_usize_layout),
+        ],
+        "Word",
+        u32_layout,
+        "if hops > 0u32 {\n    \
+             st.active = st.active + 1u32;\n    \
+             return recursive_enum_probe(st, x, hops - 1u32, bounds);\n\
+         }\n\
+         let ext_ev: MaybeWord = ext_poll(bounds.0);\n\
+         if x == -99i32 {\n    \
+             st.status = MaybeWord::Ready(77u32);\n\
+         } else if let MaybeWord::Empty = st.status {\n    \
+             st.status = MaybeWord::Empty;\n\
+         }\n\
+         let env_bonus: Word = match ext_ev {\n    \
+             MaybeWord::Empty => 1u32,\n    \
+             MaybeWord::Ready(v) => v & 7u32,\n\
+         };\n\
+         let pat_delta: Word = match x {\n    \
+             -5 | -1 => 9u32,\n    \
+             -4..=-2 => 4u32,\n    \
+             0..=8 => (x as Word) + 2u32,\n    \
+             _ => 0u32,\n\
+         };\n\
+         let window: [usize; 3] = [bounds.0, st.cursor, bounds.1];\n\
+         let win_bonus: Word = match window {\n    \
+             [lo, .., hi] if lo <= hi && hi <= 32usize => (hi - lo) as Word,\n    \
+             _ => 0u32,\n\
+         };\n\
+         st.active = st.active + env_bonus + pat_delta + win_bonus;\n\
+         st.active",
+    )
+    .with_type_defs(
+        "pub type Word = u32;\n\
+         #[repr(C, u8)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub enum MaybeWord { Empty = 0, Ready(Word) = 1 }\n\
+         #[repr(C)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub struct EnumState { pub status: MaybeWord, pub cursor: usize, pub active: Word }",
+    )
+    .with_external_callee(SpecExternalCallee::new(
+        "ext_poll",
+        ["usize"],
+        "MaybeWord",
+        maybe_word_layout,
+    ))
+    .with_requires(
+        "bounded",
+        "hops <= 3u32 && st.active <= 500u32 && st.cursor <= 16usize && bounds.0 <= 16usize && bounds.1 <= 16usize",
+    )
+    .with_ensures(
+        "shadowed_old_match_and_if_let",
+        "old(match st.active { x if x > 0u32 => x, _ => 0u32 }) == old(st.active) \
+         && old(if let MaybeWord::Ready(x) = st.status && x > 0u32 { x } else { 0u32 }) <= 1000u32",
+    )
+    .with_ensures("strict_progress", "result > old(st.active)");
+
+    let make_trial = |disc: u8, payload: u32, x: i32, hops: u32| -> Vec<u8> {
+        let mut b = vec![0xEEu8; 48];
+        b[0] = disc;
+        b[4..8].copy_from_slice(&payload.to_le_bytes());
+        b[8..16].copy_from_slice(&4u64.to_le_bytes()); // cursor = 4usize
+        b[16..20].copy_from_slice(&10u32.to_le_bytes()); // active = 10
+        b[24..28].copy_from_slice(&x.to_le_bytes());
+        b[28..32].copy_from_slice(&hops.to_le_bytes());
+        b[32..40].copy_from_slice(&2u64.to_le_bytes()); // bounds.0 = 2usize
+        b[40..48].copy_from_slice(&7u64.to_le_bytes()); // bounds.1 = 7usize
+        b
+    };
+
+    let mut ready_bytes = vec![0xCCu8; 8];
+    ready_bytes[0] = 1u8;
+    ready_bytes[4..8].copy_from_slice(&6u32.to_le_bytes());
+    let mut base_sched = EnvSchedule::new().with_callee_return_size("ext_poll", 8);
+    base_sched.set_callee_default("ext_poll", ready_bytes);
+
+    // Pre-stepped 300 times (> 256!) AFTER `panic_on_call = 2` already passed -> MUST HOLD, NOT TRAP!
+    let mut passed_panic_sched = base_sched.clone();
+    passed_panic_sched.set_callee_panic_on_call("ext_poll", 2);
+    for g in 0..300usize {
+        let _ = passed_panic_sched.next_action("ext_poll", g);
+    }
+
+    // Pre-stepped 300 times (> 256!) WITH `panic_on_call = 300` -> MUST TRAP on trial call 0!
+    let mut deep_active_panic_sched = base_sched.clone();
+    deep_active_panic_sched.set_callee_panic_on_call("ext_poll", 300);
+    for g in 0..300usize {
+        let _ = deep_active_panic_sched.next_action("ext_poll", g);
+    }
+
+    let trials = vec![
+        // Trial 0: `Empty` with `0xEE` poison in payload + `x = -5` + `hops = 2` + passed deep panic -> HOLD
+        (make_trial(0, 0xDEAD_BEEF, -5, 2), Some(passed_panic_sched)),
+        // Trial 1: `Ready(15)` + `x = -3` (negative range `-4..=-2`) + `hops = 1` -> HOLD
+        (make_trial(1, 15, -3, 1), Some(base_sched.clone())),
+        // Trial 2: `Empty` mutated to `Ready(77)` when `x == -99` -> FRAME:st.status
+        (make_trial(0, 0, -99, 0), Some(base_sched)),
+        // Trial 3: Pre-stepped 300 calls hitting `callee_panic_on_call = 300` -> TRAP
+        (make_trial(1, 9, 3, 0), Some(deep_active_panic_sched)),
+    ];
+
+    let report = probe
+        .verify_spec_postcondition_batch(&trials)
+        .expect("verify ep2-B2 parity batch");
+    assert_eq!(report.verdicts[0], SpecPostconditionVerdict::VerifiedHold);
+    assert_eq!(report.verdicts[1], SpecPostconditionVerdict::VerifiedHold);
+    assert!(matches!(
+        &report.verdicts[2],
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::FrameCondition { param, field },
+            ..
+        } if param == "st" && field == "status"
+    ));
+    assert!(matches!(
+        &report.verdicts[3],
+        SpecPostconditionVerdict::PanicOrTrap { .. }
+    ));
+
+    let exe_src = probe
+        .synthesize_rust_executable_harness_with_schedules(&trials)
+        .expect("synthesize ep2-B2 executable harness");
+    assert!(!contains_unsafe_token(&exe_src));
+    let native_lines = compile_and_run_spec_harness("ep2_b2_lockstep_parity", &exe_src);
+    assert_eq!(
+        native_lines,
+        vec![
+            "TRIAL:0:HOLD",
+            "TRIAL:1:HOLD",
+            "TRIAL:2:FRAME:st.status",
+            "TRIAL:3:TRAP",
+        ]
+    );
+}

@@ -3324,7 +3324,10 @@ fn validate_old_calls_in_ensures(expr: &Expr) -> Result<(), String> {
 fn collect_pat_bound_idents(pat: &Pat, out: &mut BTreeSet<String>) {
     match pat {
         Pat::Ident(pi) => {
-            out.insert(pi.ident.to_string());
+            let id = pi.ident.to_string();
+            if id != "_" {
+                out.insert(id);
+            }
             if let Some((_, sub)) = &pi.subpat {
                 collect_pat_bound_idents(sub, out);
             }
@@ -3333,6 +3336,26 @@ fn collect_pat_bound_idents(pat: &Pat, out: &mut BTreeSet<String>) {
         Pat::Tuple(pt) => {
             for el in &pt.elems {
                 collect_pat_bound_idents(el, out);
+            }
+        }
+        Pat::TupleStruct(pts) => {
+            for el in &pts.elems {
+                collect_pat_bound_idents(el, out);
+            }
+        }
+        Pat::Struct(ps) => {
+            for fp in &ps.fields {
+                collect_pat_bound_idents(&fp.pat, out);
+            }
+        }
+        Pat::Slice(psl) => {
+            for el in &psl.elems {
+                collect_pat_bound_idents(el, out);
+            }
+        }
+        Pat::Or(po) => {
+            for case in &po.cases {
+                collect_pat_bound_idents(case, out);
             }
         }
         Pat::Paren(pp) => collect_pat_bound_idents(&pp.pat, out),
@@ -3354,6 +3377,25 @@ fn rewrite_old_expressions_for_rust(
         params: &'a [SpecParamBinding],
         needed_pre_params: &'a mut BTreeSet<String>,
         shadowed: Vec<BTreeSet<String>>,
+    }
+    impl PreParamRewriter<'_> {
+        fn visit_cond_with_let_bindings(&mut self, cond: &mut Expr) {
+            match cond {
+                Expr::Paren(p) => self.visit_cond_with_let_bindings(&mut p.expr),
+                Expr::Group(g) => self.visit_cond_with_let_bindings(&mut g.expr),
+                Expr::Let(el) => {
+                    self.visit_expr_mut(&mut el.expr);
+                    if let Some(frame) = self.shadowed.last_mut() {
+                        collect_pat_bound_idents(&el.pat, frame);
+                    }
+                }
+                Expr::Binary(eb) if matches!(eb.op, BinOp::And(_)) => {
+                    self.visit_cond_with_let_bindings(&mut eb.left);
+                    self.visit_cond_with_let_bindings(&mut eb.right);
+                }
+                other => self.visit_expr_mut(other),
+            }
+        }
     }
     impl VisitMut for PreParamRewriter<'_> {
         fn visit_block_mut(&mut self, block: &mut syn::Block) {
@@ -3391,15 +3433,58 @@ fn rewrite_old_expressions_for_rust(
         }
 
         fn visit_expr_mut(&mut self, node: &mut Expr) {
-            if let Expr::Closure(closure) = node {
-                let mut frame = BTreeSet::new();
-                for pat in &closure.inputs {
-                    collect_pat_bound_idents(pat, &mut frame);
+            match node {
+                Expr::Closure(closure) => {
+                    let mut frame = BTreeSet::new();
+                    for pat in &closure.inputs {
+                        collect_pat_bound_idents(pat, &mut frame);
+                    }
+                    self.shadowed.push(frame);
+                    self.visit_expr_mut(&mut closure.body);
+                    self.shadowed.pop();
+                    return;
                 }
-                self.shadowed.push(frame);
-                self.visit_expr_mut(&mut closure.body);
-                self.shadowed.pop();
-                return;
+                Expr::Match(em) => {
+                    self.visit_expr_mut(&mut em.expr);
+                    for arm in &mut em.arms {
+                        let mut frame = BTreeSet::new();
+                        collect_pat_bound_idents(&arm.pat, &mut frame);
+                        self.shadowed.push(frame);
+                        if let Some((_, guard_expr)) = &mut arm.guard {
+                            self.visit_expr_mut(guard_expr);
+                        }
+                        self.visit_expr_mut(&mut arm.body);
+                        self.shadowed.pop();
+                    }
+                    return;
+                }
+                Expr::If(ei) => {
+                    self.shadowed.push(BTreeSet::new());
+                    self.visit_cond_with_let_bindings(&mut ei.cond);
+                    self.visit_block_mut(&mut ei.then_branch);
+                    self.shadowed.pop();
+                    if let Some((_, else_expr)) = &mut ei.else_branch {
+                        self.visit_expr_mut(else_expr);
+                    }
+                    return;
+                }
+                Expr::While(ew) => {
+                    self.shadowed.push(BTreeSet::new());
+                    self.visit_cond_with_let_bindings(&mut ew.cond);
+                    self.visit_block_mut(&mut ew.body);
+                    self.shadowed.pop();
+                    return;
+                }
+                Expr::ForLoop(efl) => {
+                    self.visit_expr_mut(&mut efl.expr);
+                    let mut frame = BTreeSet::new();
+                    collect_pat_bound_idents(&efl.pat, &mut frame);
+                    self.shadowed.push(frame);
+                    self.visit_block_mut(&mut efl.body);
+                    self.shadowed.pop();
+                    return;
+                }
+                _ => {}
             }
             if let Expr::Path(ep) = node
                 && ep.qself.is_none()
@@ -3481,6 +3566,101 @@ fn rewrite_old_expressions_for_rust(
     .visit_expr_mut(expr);
 }
 
+#[derive(Debug, Clone, Default)]
+struct SpecTypeMetadata {
+    type_aliases: BTreeMap<String, syn::Type>,
+    struct_field_tys: BTreeMap<String, BTreeMap<String, String>>,
+    enum_variant_tys: BTreeMap<String, BTreeMap<String, Option<String>>>,
+}
+
+impl SpecTypeMetadata {
+    fn from_type_defs(type_defs_rust: &str) -> Self {
+        use quote::ToTokens;
+        let mut meta = Self::default();
+        if type_defs_rust.trim().is_empty() {
+            return meta;
+        }
+        let Ok(parsed) = syn::parse_file(type_defs_rust) else {
+            return meta;
+        };
+        for item in parsed.items {
+            match item {
+                syn::Item::Type(it) => {
+                    meta.type_aliases.insert(it.ident.to_string(), *it.ty);
+                }
+                syn::Item::Struct(is) => {
+                    let mut fmap = BTreeMap::new();
+                    if let syn::Fields::Named(named) = is.fields {
+                        for f in named.named {
+                            if let Some(fid) = f.ident {
+                                fmap.insert(fid.to_string(), f.ty.to_token_stream().to_string());
+                            }
+                        }
+                    }
+                    meta.struct_field_tys.insert(is.ident.to_string(), fmap);
+                }
+                syn::Item::Enum(ie) => {
+                    let mut vmap = BTreeMap::new();
+                    for v in ie.variants {
+                        let vname = v.ident.to_string();
+                        let pty = match v.fields {
+                            syn::Fields::Unit => None,
+                            syn::Fields::Unnamed(fu) if fu.unnamed.len() == 1 => {
+                                Some(fu.unnamed[0].ty.to_token_stream().to_string())
+                            }
+                            syn::Fields::Unnamed(fu) if fu.unnamed.len() > 1 => {
+                                let parts: Vec<String> = fu
+                                    .unnamed
+                                    .iter()
+                                    .map(|f| f.ty.to_token_stream().to_string())
+                                    .collect();
+                                Some(format!("({},)", parts.join(", ")))
+                            }
+                            _ => None,
+                        };
+                        vmap.insert(vname, pty);
+                    }
+                    meta.enum_variant_tys.insert(ie.ident.to_string(), vmap);
+                }
+                _ => {}
+            }
+        }
+        meta
+    }
+
+    fn resolve_syn_type<'b>(&'b self, mut ty: &'b syn::Type) -> &'b syn::Type {
+        for _ in 0..16 {
+            match ty {
+                syn::Type::Paren(tp) => ty = &tp.elem,
+                syn::Type::Group(tg) => ty = &tg.elem,
+                syn::Type::Path(tp) if tp.qself.is_none() && tp.path.segments.len() == 1 => {
+                    let seg = &tp.path.segments[0];
+                    if matches!(seg.arguments, syn::PathArguments::None)
+                        && let Some(target) = self.type_aliases.get(&seg.ident.to_string())
+                    {
+                        ty = target;
+                    } else {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        ty
+    }
+
+    fn parse_scalar_type(&self, ty_name: &str) -> Option<(usize, bool)> {
+        use quote::ToTokens;
+        if let Some(spec) = parse_scalar_type_spec(ty_name) {
+            return Some(spec);
+        }
+        let parsed = syn::parse_str::<syn::Type>(ty_name).ok()?;
+        let resolved = self.resolve_syn_type(&parsed);
+        let resolved_str = resolved.to_token_stream().to_string().replace(' ', "");
+        parse_scalar_type_spec(&resolved_str)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SpecEvalValue {
     Unit,
@@ -3509,6 +3689,14 @@ enum SpecEvalValue {
         elem_stride: usize,
         raw_bytes: Vec<u8>,
         elems: Vec<SpecEvalValue>,
+    },
+    Enum {
+        name: String,
+        layout: LayoutSpec,
+        variant_name: String,
+        discriminant: u128,
+        payload: Option<Box<SpecEvalValue>>,
+        raw_bytes: Vec<u8>,
     },
 }
 
@@ -3589,10 +3777,43 @@ impl SpecEvalValue {
                     elems,
                 })
             }
-            LayoutSpec::Enum { .. } => Err(ScheduleError::InvalidBitPattern {
-                context: "SpecEvalValue::Enum".to_string(),
-                reason: "enum decoding in SpecContractOracleProbe requires struct/scalar/array/tuple layouts".to_string(),
-            }),
+            LayoutSpec::Enum {
+                name,
+                tag_offset,
+                tag_size,
+                variants,
+                ..
+            } => {
+                let n = (*tag_size).min(16);
+                let disc = decode_scalar_le_bytes(&raw[*tag_offset..*tag_offset + n])
+                    & width_mask((n * 8) as u32);
+                let variant = variants
+                    .iter()
+                    .find(|v| v.discriminant == disc)
+                    .ok_or_else(|| ScheduleError::InvalidBitPattern {
+                        context: format!("SpecEvalValue::Enum({name})"),
+                        reason: format!("unknown discriminant {disc:#x}"),
+                    })?;
+                let payload = match &variant.payload {
+                    Some(p_layout) => {
+                        let start = variant.payload_offset;
+                        let end = start + p_layout.total_size();
+                        Some(Box::new(Self::decode_validated(
+                            p_layout,
+                            &raw[start..end],
+                        )?))
+                    }
+                    None => None,
+                };
+                Ok(Self::Enum {
+                    name: name.clone(),
+                    layout: layout.clone(),
+                    variant_name: variant.name.clone(),
+                    discriminant: disc,
+                    payload,
+                    raw_bytes: raw.to_vec(),
+                })
+            }
         }
     }
 
@@ -3650,6 +3871,37 @@ impl SpecEvalValue {
                     let end = start + eb.len();
                     if end <= out.len() {
                         out[start..end].copy_from_slice(&eb);
+                    }
+                }
+                out
+            }
+            Self::Enum {
+                layout:
+                    LayoutSpec::Enum {
+                        tag_offset,
+                        tag_size,
+                        variants,
+                        ..
+                    },
+                discriminant,
+                payload,
+                raw_bytes,
+                ..
+            } => {
+                let mut out = raw_bytes.clone();
+                let tb = encode_scalar_le_bytes(*discriminant, *tag_size);
+                let tend = *tag_offset + tb.len();
+                if tend <= out.len() {
+                    out[*tag_offset..tend].copy_from_slice(&tb);
+                }
+                if let (Some(pv), Some(vspec)) = (
+                    payload,
+                    variants.iter().find(|v| v.discriminant == *discriminant),
+                ) {
+                    let pb = pv.to_layout_bytes();
+                    let pend = vspec.payload_offset + pb.len();
+                    if pend <= out.len() {
+                        out[vspec.payload_offset..pend].copy_from_slice(&pb);
                     }
                 }
                 out
@@ -3776,6 +4028,34 @@ impl SpecEvalValue {
                 }
                 Ok(true)
             }
+            (
+                Self::Enum {
+                    name: na,
+                    discriminant: da,
+                    payload: pa,
+                    ..
+                },
+                Self::Enum {
+                    name: nb,
+                    discriminant: db,
+                    payload: pb,
+                    ..
+                },
+            ) => {
+                if na != nb {
+                    return Err(format!(
+                        "mismatched enum types in equality: `{na}` vs `{nb}`"
+                    ));
+                }
+                if da != db {
+                    return Ok(false);
+                }
+                match (pa, pb) {
+                    (None, None) => Ok(true),
+                    (Some(va), Some(vb)) => va.semantic_eq(vb),
+                    _ => Ok(false),
+                }
+            }
             _ => Err(format!(
                 "mismatched value kinds in equality: {lhs:?} vs {rhs:?}"
             )),
@@ -3801,14 +4081,28 @@ impl SpecEvalValue {
             }
             Self::Struct { layout, .. }
             | Self::Tuple { layout, .. }
-            | Self::Array { layout, .. } => layout.clone(),
+            | Self::Array { layout, .. }
+            | Self::Enum { layout, .. } => layout.clone(),
         }
     }
 
-    fn rust_literal(&self, rust_ty: &str) -> String {
+    fn rust_literal_with_defs(&self, rust_ty: &str, meta: &SpecTypeMetadata) -> String {
+        use quote::ToTokens;
+        let trimmed_ty = rust_ty.trim();
+        let resolved_ty_str = syn::parse_str::<syn::Type>(trimmed_ty)
+            .ok()
+            .map(|parsed| meta.resolve_syn_type(&parsed).to_token_stream().to_string())
+            .unwrap_or_else(|| trimmed_ty.to_string());
+
         match self {
             Self::Unit => "()".to_string(),
-            Self::Bool(b) => b.to_string(),
+            Self::Bool(b) => {
+                if trimmed_ty.is_empty() || trimmed_ty == "bool" {
+                    b.to_string()
+                } else {
+                    b.to_string()
+                }
+            }
             Self::Char(c) => format!("{c:?}"),
             Self::Int {
                 bits,
@@ -3816,8 +4110,30 @@ impl SpecEvalValue {
                 signed,
                 ..
             } => {
-                let ty = rust_ty.trim();
-                if *signed {
+                let canonical_prim = if parse_scalar_type_spec(trimmed_ty).is_some() {
+                    Some(trimmed_ty)
+                } else {
+                    let clean_res = resolved_ty_str.replace(' ', "");
+                    if parse_scalar_type_spec(&clean_res).is_some() {
+                        None
+                    } else {
+                        None
+                    }
+                };
+                let fallback_prim = default_rust_ty_for_layout(&LayoutSpec::Scalar(if *signed {
+                    ScalarLayout::signed(*size_bytes)
+                } else {
+                    ScalarLayout::unsigned(*size_bytes)
+                }));
+                let clean_res = resolved_ty_str.replace(' ', "");
+                let prim_suffix = if let Some(p) = canonical_prim {
+                    p
+                } else if parse_scalar_type_spec(&clean_res).is_some() {
+                    clean_res.as_str()
+                } else {
+                    fallback_prim.as_str()
+                };
+                let prim_lit = if *signed {
                     let bw = (*size_bytes * 8) as u32;
                     let min_v = if bw >= 128 {
                         i128::MIN
@@ -3826,13 +4142,18 @@ impl SpecEvalValue {
                     };
                     let v = self.to_signed_i128().unwrap_or(0);
                     if v == min_v {
-                        format!("{ty}::MIN")
+                        format!("{prim_suffix}::MIN")
                     } else {
-                        format!("{v}{ty}")
+                        format!("{v}{prim_suffix}")
                     }
                 } else {
                     let masked = *bits & width_mask((*size_bytes * 8) as u32);
-                    format!("{masked}{ty}")
+                    format!("{masked}{prim_suffix}")
+                };
+                if canonical_prim.is_some() || trimmed_ty.is_empty() {
+                    prim_lit
+                } else {
+                    format!("{prim_lit} as {trimmed_ty}")
                 }
             }
             Self::Struct {
@@ -3841,11 +4162,15 @@ impl SpecEvalValue {
                 fields: map,
                 ..
             } => {
+                let declared_fields = meta.struct_field_tys.get(name);
                 let mut parts = Vec::with_capacity(fields.len());
                 for f in fields {
                     if let Some(v) = map.get(&f.name) {
-                        let fty = default_rust_ty_for_layout(&f.layout);
-                        parts.push(format!("{}: {}", f.name, v.rust_literal(&fty)));
+                        let fty = declared_fields
+                            .and_then(|m| m.get(&f.name))
+                            .cloned()
+                            .unwrap_or_else(|| default_rust_ty_for_layout(&f.layout));
+                        parts.push(format!("{}: {}", f.name, v.rust_literal_with_defs(&fty, meta)));
                     }
                 }
                 format!("{name} {{ {} }}", parts.join(", "))
@@ -3858,20 +4183,75 @@ impl SpecEvalValue {
                 if elems.is_empty() {
                     return "()".to_string();
                 }
+                let parsed_elem_tys: Option<Vec<String>> = syn::parse_str::<syn::Type>(&resolved_ty_str)
+                    .ok()
+                    .and_then(|pt| match pt {
+                        syn::Type::Tuple(tt) if tt.elems.len() == elems.len() => Some(
+                            tt.elems
+                                .iter()
+                                .map(|t| t.to_token_stream().to_string())
+                                .collect(),
+                        ),
+                        _ => None,
+                    });
                 let parts: Vec<String> = elements
                     .iter()
                     .zip(elems)
-                    .map(|((_, l), v)| v.rust_literal(&default_rust_ty_for_layout(l)))
+                    .enumerate()
+                    .map(|(idx, ((_, l), v))| {
+                        let ety = parsed_elem_tys
+                            .as_ref()
+                            .map(|v_tys| v_tys[idx].clone())
+                            .unwrap_or_else(|| default_rust_ty_for_layout(l));
+                        v.rust_literal_with_defs(&ety, meta)
+                    })
                     .collect();
                 format!("({},)", parts.join(", "))
             }
             Self::Array {
                 elem_layout, elems, ..
             } => {
-                let ety = default_rust_ty_for_layout(elem_layout);
-                let parts: Vec<String> = elems.iter().map(|v| v.rust_literal(&ety)).collect();
+                let parsed_elem_ty: Option<String> = syn::parse_str::<syn::Type>(&resolved_ty_str)
+                    .ok()
+                    .and_then(|pt| match pt {
+                        syn::Type::Array(ta) => Some(ta.elem.to_token_stream().to_string()),
+                        _ => None,
+                    });
+                let ety = parsed_elem_ty.unwrap_or_else(|| default_rust_ty_for_layout(elem_layout));
+                let parts: Vec<String> = elems
+                    .iter()
+                    .map(|v| v.rust_literal_with_defs(&ety, meta))
+                    .collect();
                 format!("[{}]", parts.join(", "))
             }
+            Self::Enum {
+                name,
+                layout: LayoutSpec::Enum { variants, .. },
+                variant_name,
+                discriminant,
+                payload,
+                ..
+            } => match payload {
+                None => format!("{name}::{variant_name}"),
+                Some(pv) => {
+                    let fallback_pty = variants
+                        .iter()
+                        .find(|v| v.discriminant == *discriminant)
+                        .and_then(|v| v.payload.as_ref())
+                        .map(|pl| default_rust_ty_for_layout(pl))
+                        .unwrap_or_else(|| "u32".to_string());
+                    let pty = meta
+                        .enum_variant_tys
+                        .get(name)
+                        .and_then(|vm| vm.get(variant_name))
+                        .and_then(|opt| opt.clone())
+                        .unwrap_or(fallback_pty);
+                    format!(
+                        "{name}::{variant_name}({})",
+                        pv.rust_literal_with_defs(&pty, meta)
+                    )
+                }
+            },
             _ => "()".to_string(),
         }
     }
@@ -4058,14 +4438,69 @@ fn spec_trap<T>(msg: impl Into<String>) -> Result<T, SpecExecFlow> {
     Err(SpecExecFlow::Trap(msg.into()))
 }
 
+const MAX_SPEC_CALL_DEPTH: usize = 128;
+
 struct SpecEvalContext<'a> {
     env: BTreeMap<String, SpecEvalValue>,
     pre_env: Option<&'a BTreeMap<String, SpecEvalValue>>,
     struct_layouts: &'a BTreeMap<String, LayoutSpec>,
+    enum_layouts: &'a BTreeMap<String, LayoutSpec>,
+    type_meta: &'a SpecTypeMetadata,
     external_callees: &'a BTreeMap<String, LayoutSpec>,
     helper_fns: &'a BTreeMap<String, syn::ItemFn>,
     schedule: Option<&'a mut EnvSchedule>,
     call_index: usize,
+    call_depth: usize,
+}
+
+fn restore_shadowed_env(
+    env: &mut BTreeMap<String, SpecEvalValue>,
+    saved: Vec<(String, Option<SpecEvalValue>)>,
+) {
+    for (k, prev) in saved.into_iter().rev() {
+        match prev {
+            Some(v) => {
+                env.insert(k, v);
+            }
+            None => {
+                env.remove(&k);
+            }
+        }
+    }
+}
+
+fn compare_ordered_spec_values(lhs: &SpecEvalValue, rhs: &SpecEvalValue) -> Result<std::cmp::Ordering, String> {
+    let (l, r) = coerce_untyped_int_pair(lhs.clone(), rhs.clone())?;
+    match (&l, &r) {
+        (SpecEvalValue::Char(a), SpecEvalValue::Char(b)) => Ok(a.cmp(b)),
+        (
+            SpecEvalValue::Int {
+                bits: a,
+                size_bytes: sa,
+                signed: sga,
+                ..
+            },
+            SpecEvalValue::Int {
+                bits: b,
+                size_bytes: sb,
+                signed: sgb,
+                ..
+            },
+        ) => {
+            if sa != sb || sga != sgb {
+                return Err(format!(
+                    "mismatched integer types in range pattern: ({sa}B, signed={sga}) vs ({sb}B, signed={sgb})"
+                ));
+            }
+            if *sga {
+                Ok(l.to_signed_i128()?.cmp(&r.to_signed_i128()?))
+            } else {
+                let mask = width_mask((*sa * 8) as u32);
+                Ok((a & mask).cmp(&(b & mask)))
+            }
+        }
+        _ => Err(format!("range pattern requires scalar integer or char, got {l:?} and {r:?}")),
+    }
 }
 
 impl<'a> SpecEvalContext<'a> {
@@ -4177,7 +4612,7 @@ impl<'a> SpecEvalContext<'a> {
         match pat {
             Pat::Wild(_) => {
                 if let Some(ty) = ty_hint {
-                    let _ = coerce_value_to_syn_type(val, ty)?;
+                    let _ = coerce_value_to_syn_type(val, ty, self.type_meta)?;
                 }
                 Ok(())
             }
@@ -4185,7 +4620,7 @@ impl<'a> SpecEvalContext<'a> {
             Pat::Type(pt) => self.bind_local_pattern(&pt.pat, Some(&pt.ty), val, shadowed),
             Pat::Ident(pi) => {
                 let coerced = match ty_hint {
-                    Some(ty) => coerce_value_to_syn_type(val, ty)?,
+                    Some(ty) => coerce_value_to_syn_type(val, ty, self.type_meta)?,
                     None => val,
                 };
                 let bind_name = pi.ident.to_string();
@@ -4196,8 +4631,9 @@ impl<'a> SpecEvalContext<'a> {
                 Ok(())
             }
             Pat::Tuple(pt) => {
-                let coerced = match ty_hint {
-                    Some(ty) => coerce_value_to_syn_type(val, ty)?,
+                let resolved_hint = ty_hint.map(|t| self.type_meta.resolve_syn_type(t));
+                let coerced = match resolved_hint {
+                    Some(ty) => coerce_value_to_syn_type(val, ty, self.type_meta)?,
                     None => val,
                 };
                 if pt.elems.is_empty() {
@@ -4220,7 +4656,7 @@ impl<'a> SpecEvalContext<'a> {
                         elems.len()
                     ));
                 }
-                let elem_tys: Option<Vec<&syn::Type>> = match ty_hint {
+                let elem_tys: Option<Vec<&syn::Type>> = match resolved_hint {
                     Some(syn::Type::Tuple(tt)) if tt.elems.len() == pt.elems.len() => {
                         Some(tt.elems.iter().collect())
                     }
@@ -4232,11 +4668,77 @@ impl<'a> SpecEvalContext<'a> {
                 }
                 Ok(())
             }
+            Pat::Struct(ps) => {
+                let SpecEvalValue::Struct { name, fields, .. } = val else {
+                    return Err(format!(
+                        "cannot destructure non-struct value with `{}`",
+                        pat.to_token_stream()
+                    ));
+                };
+                let pat_sname = ps
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                if pat_sname != name {
+                    return Err(format!(
+                        "struct pattern `{pat_sname}` does not match value struct `{name}`"
+                    ));
+                }
+                for fp in &ps.fields {
+                    let Member::Named(fid) = &fp.member else {
+                        return Err("unnamed struct pattern field unsupported".to_string());
+                    };
+                    let fname = fid.to_string();
+                    let fval = fields
+                        .get(&fname)
+                        .cloned()
+                        .ok_or_else(|| format!("unknown field `{fname}` on struct `{name}`"))?;
+                    self.bind_local_pattern(&fp.pat, None, fval, shadowed)?;
+                }
+                Ok(())
+            }
+            Pat::Slice(psl) => {
+                let SpecEvalValue::Array { elems, .. } = val else {
+                    return Err(format!(
+                        "cannot destructure non-array value with `{}`",
+                        pat.to_token_stream()
+                    ));
+                };
+                if elems.len() != psl.elems.len() {
+                    return Err(format!(
+                        "slice/array pattern length mismatch: expected {}, got {}",
+                        psl.elems.len(),
+                        elems.len()
+                    ));
+                }
+                for (sub_pat, sub_val) in psl.elems.iter().zip(elems) {
+                    self.bind_local_pattern(sub_pat, None, sub_val, shadowed)?;
+                }
+                Ok(())
+            }
             other => Err(format!(
                 "unsupported local binding pattern `{}`",
                 other.to_token_stream()
             )),
         }
+    }
+
+    fn eval_pure_pat_expr(&self, expr: &Expr) -> Result<SpecEvalValue, SpecExecFlow> {
+        let mut tmp_ctx = SpecEvalContext {
+            env: self.env.clone(),
+            pre_env: self.pre_env,
+            struct_layouts: self.struct_layouts,
+            enum_layouts: self.enum_layouts,
+            type_meta: self.type_meta,
+            external_callees: self.external_callees,
+            helper_fns: self.helper_fns,
+            schedule: None,
+            call_index: 0,
+            call_depth: self.call_depth,
+        };
+        tmp_ctx.eval_expr(expr)
     }
 
     fn try_match_pattern(
@@ -4249,6 +4751,7 @@ impl<'a> SpecEvalContext<'a> {
         match pat {
             Pat::Wild(_) => Ok(true),
             Pat::Paren(pp) => self.try_match_pattern(&pp.pat, scrutinee, bindings),
+            Pat::Reference(pr) => self.try_match_pattern(&pr.pat, scrutinee, bindings),
             Pat::Or(po) => {
                 for case_pat in &po.cases {
                     let checkpoint = bindings.len();
@@ -4260,21 +4763,169 @@ impl<'a> SpecEvalContext<'a> {
                 Ok(false)
             }
             Pat::Lit(pl) => {
-                let mut tmp_ctx = SpecEvalContext {
-                    env: self.env.clone(),
-                    pre_env: self.pre_env,
-                    struct_layouts: self.struct_layouts,
-                    external_callees: self.external_callees,
-                    helper_fns: self.helper_fns,
-                    schedule: None,
-                    call_index: 0,
-                };
                 let lit_val = match &pl.lit {
                     Lit::Bool(b) => SpecEvalValue::Bool(b.value),
                     Lit::Char(c) => SpecEvalValue::Char(c.value()),
-                    _ => tmp_ctx.eval_expr(&Expr::Lit(pl.clone()))?,
+                    _ => self.eval_pure_pat_expr(&Expr::Lit(pl.clone()))?,
                 };
                 Ok(scrutinee.semantic_eq(&lit_val)?)
+            }
+            Pat::Range(pr) => {
+                if let Some(start_expr) = &pr.start {
+                    let lo = self.eval_pure_pat_expr(start_expr)?;
+                    if compare_ordered_spec_values(scrutinee, &lo)? == std::cmp::Ordering::Less {
+                        return Ok(false);
+                    }
+                }
+                if let Some(end_expr) = &pr.end {
+                    let hi = self.eval_pure_pat_expr(end_expr)?;
+                    let ord = compare_ordered_spec_values(scrutinee, &hi)?;
+                    let ok = match pr.limits {
+                        syn::RangeLimits::Closed(_) => ord != std::cmp::Ordering::Greater,
+                        syn::RangeLimits::HalfOpen(_) => ord == std::cmp::Ordering::Less,
+                    };
+                    if !ok {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Pat::Path(pp) if pp.qself.is_none() && pp.path.segments.len() == 2 => {
+                let ty_name = pp.path.segments[0].ident.to_string();
+                let assoc_name = pp.path.segments[1].ident.to_string();
+                if self.enum_layouts.contains_key(&ty_name) {
+                    return match scrutinee {
+                        SpecEvalValue::Enum {
+                            name,
+                            variant_name,
+                            payload: None,
+                            ..
+                        } if name == &ty_name => Ok(variant_name == &assoc_name),
+                        SpecEvalValue::Enum { name, .. } if name == &ty_name => Ok(false),
+                        other => spec_trap(format!(
+                            "cannot match enum pattern `{ty_name}::{assoc_name}` against {other:?}"
+                        )),
+                    };
+                }
+                let cval = eval_assoc_int_const_with_meta(&ty_name, &assoc_name, self.type_meta)?;
+                Ok(scrutinee.semantic_eq(&cval)?)
+            }
+            Pat::TupleStruct(pts) if pts.qself.is_none() && pts.path.segments.len() == 2 => {
+                let ty_name = pts.path.segments[0].ident.to_string();
+                let var_name = pts.path.segments[1].ident.to_string();
+                let SpecEvalValue::Enum {
+                    name,
+                    variant_name,
+                    payload,
+                    ..
+                } = scrutinee
+                else {
+                    return spec_trap(format!(
+                        "cannot match enum variant `{ty_name}::{var_name}(..)` against {scrutinee:?}"
+                    ));
+                };
+                if name != &ty_name {
+                    return spec_trap(format!(
+                        "enum pattern `{ty_name}` does not match scrutinee `{name}`"
+                    ));
+                }
+                if variant_name != &var_name {
+                    return Ok(false);
+                }
+                let Some(pv) = payload else {
+                    return spec_trap(format!(
+                        "unit enum variant `{ty_name}::{var_name}` matched with tuple payload"
+                    ));
+                };
+                if pts.elems.len() == 1 {
+                    self.try_match_pattern(&pts.elems[0], pv, bindings)
+                } else {
+                    let SpecEvalValue::Tuple { elems, .. } = pv.as_ref() else {
+                        return spec_trap(format!(
+                            "enum variant `{ty_name}::{var_name}` payload arity mismatch"
+                        ));
+                    };
+                    if elems.len() != pts.elems.len() {
+                        return spec_trap(format!(
+                            "enum variant `{ty_name}::{var_name}` expected {} fields, got {}",
+                            pts.elems.len(),
+                            elems.len()
+                        ));
+                    }
+                    for (sp, sv) in pts.elems.iter().zip(elems.iter()) {
+                        if !self.try_match_pattern(sp, sv, bindings)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+            }
+            Pat::Struct(ps) => {
+                let SpecEvalValue::Struct { name, fields, .. } = scrutinee else {
+                    return spec_trap("cannot match struct pattern against non-struct scrutinee");
+                };
+                let pat_sname = ps
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                if pat_sname != *name {
+                    return spec_trap(format!(
+                        "struct pattern `{pat_sname}` does not match scrutinee `{name}`"
+                    ));
+                }
+                for fp in &ps.fields {
+                    let Member::Named(fid) = &fp.member else {
+                        return spec_trap("unnamed struct pattern field unsupported");
+                    };
+                    let fname = fid.to_string();
+                    let fval = fields
+                        .get(&fname)
+                        .ok_or_else(|| format!("unknown field `{fname}` on struct `{name}`"))?;
+                    if !self.try_match_pattern(&fp.pat, fval, bindings)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Pat::Slice(psl) => {
+                let SpecEvalValue::Array { elems, .. } = scrutinee else {
+                    return spec_trap("cannot match slice/array pattern against non-array scrutinee");
+                };
+                let pat_elems: Vec<&Pat> = psl.elems.iter().collect();
+                if let Some(rest_pos) = pat_elems.iter().position(|p| matches!(p, Pat::Rest(_))) {
+                    let prefix = &pat_elems[..rest_pos];
+                    let suffix = &pat_elems[rest_pos + 1..];
+                    if suffix.iter().any(|p| matches!(p, Pat::Rest(_))) {
+                        return spec_trap("multiple `..` rest patterns in array slice pattern");
+                    }
+                    if elems.len() < prefix.len() + suffix.len() {
+                        return Ok(false);
+                    }
+                    for (sp, sv) in prefix.iter().zip(elems.iter()) {
+                        if !self.try_match_pattern(sp, sv, bindings)? {
+                            return Ok(false);
+                        }
+                    }
+                    let tail_start = elems.len() - suffix.len();
+                    for (sp, sv) in suffix.iter().zip(elems[tail_start..].iter()) {
+                        if !self.try_match_pattern(sp, sv, bindings)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                } else {
+                    if elems.len() != pat_elems.len() {
+                        return Ok(false);
+                    }
+                    for (sp, sv) in pat_elems.iter().zip(elems.iter()) {
+                        if !self.try_match_pattern(sp, sv, bindings)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
             }
             Pat::Ident(pi) => {
                 if let Some((_, sub)) = &pi.subpat
@@ -4314,20 +4965,44 @@ impl<'a> SpecEvalContext<'a> {
                 if let Ok(neg_expr) = syn::parse_str::<Expr>(&s)
                     && matches!(neg_expr, Expr::Unary(_) | Expr::Path(_))
                 {
-                    let mut tmp_ctx = SpecEvalContext {
-                        env: self.env.clone(),
-                        pre_env: self.pre_env,
-                        struct_layouts: self.struct_layouts,
-                        external_callees: self.external_callees,
-                        helper_fns: self.helper_fns,
-                        schedule: None,
-                        call_index: 0,
-                    };
-                    let pat_val = tmp_ctx.eval_expr(&neg_expr)?;
+                    let pat_val = self.eval_pure_pat_expr(&neg_expr)?;
                     return Ok(scrutinee.semantic_eq(&pat_val)?);
                 }
                 spec_trap(format!("unsupported `match` pattern `{s}`"))
             }
+        }
+    }
+
+    fn eval_cond_with_let_bindings(
+        &mut self,
+        cond: &Expr,
+        shadowed: &mut Vec<(String, Option<SpecEvalValue>)>,
+    ) -> Result<bool, SpecExecFlow> {
+        match cond {
+            Expr::Paren(p) => self.eval_cond_with_let_bindings(&p.expr, shadowed),
+            Expr::Group(g) => self.eval_cond_with_let_bindings(&g.expr, shadowed),
+            Expr::Let(el) => {
+                let scrut = self.eval_expr(&el.expr)?;
+                let mut bindings = Vec::new();
+                if !self.try_match_pattern(&el.pat, &scrut, &mut bindings)? {
+                    return Ok(false);
+                }
+                for (bname, bval) in bindings {
+                    let prev = self.env.insert(bname.clone(), bval);
+                    shadowed.push((bname, prev));
+                }
+                Ok(true)
+            }
+            Expr::Binary(eb) if matches!(eb.op, BinOp::And(_)) => {
+                if !self.eval_cond_with_let_bindings(&eb.left, shadowed)? {
+                    return Ok(false);
+                }
+                self.eval_cond_with_let_bindings(&eb.right, shadowed)
+            }
+            other => match self.eval_expr(other)? {
+                SpecEvalValue::Bool(b) => Ok(b),
+                val => spec_trap(format!("non-boolean condition: {val:?}")),
+            },
         }
     }
 
@@ -4538,18 +5213,29 @@ impl<'a> SpecEvalContext<'a> {
                 const MAX_SPEC_LOOP_ITERS: usize = 10_000;
                 let mut iters = 0usize;
                 loop {
-                    match self.eval_expr(&ew.cond)? {
-                        SpecEvalValue::Bool(false) => break,
-                        SpecEvalValue::Bool(true) => {}
-                        other => return spec_trap(format!("non-boolean `while` condition: {other:?}")),
+                    let mut cond_shadowed = Vec::new();
+                    let cond_res = self.eval_cond_with_let_bindings(&ew.cond, &mut cond_shadowed);
+                    match cond_res {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            restore_shadowed_env(&mut self.env, cond_shadowed);
+                            break;
+                        }
+                        Err(flow) => {
+                            restore_shadowed_env(&mut self.env, cond_shadowed);
+                            return Err(flow);
+                        }
                     }
                     iters += 1;
                     if iters > MAX_SPEC_LOOP_ITERS {
+                        restore_shadowed_env(&mut self.env, cond_shadowed);
                         return spec_trap(format!(
                             "`while` loop exceeded bounded step budget ({MAX_SPEC_LOOP_ITERS} iterations)"
                         ));
                     }
-                    match self.eval_block(&ew.body) {
+                    let body_res = self.eval_block(&ew.body);
+                    restore_shadowed_env(&mut self.env, cond_shadowed);
+                    match body_res {
                         Ok(_) | Err(SpecExecFlow::Continue) => {}
                         Err(SpecExecFlow::Break(SpecEvalValue::Unit)) => break,
                         Err(SpecExecFlow::Break(other)) => {
@@ -4638,17 +5324,30 @@ impl<'a> SpecEvalContext<'a> {
                 Lit::Char(c) => Ok(SpecEvalValue::Char(c.value())),
                 Lit::Int(li) => {
                     let suffix = li.suffix();
+                    let digits = li.base10_digits();
                     if suffix.is_empty() {
-                        let v = li
-                            .base10_parse::<u128>()
-                            .map_err(|e| format!("invalid int literal `{li}`: {e}"))?;
-                        Ok(SpecEvalValue::Int {
-                            bits: v,
-                            size_bytes: 4,
-                            signed: false,
-                            untyped_lit: true,
-                        })
-                    } else if let Some((sz, sig)) = parse_scalar_type_spec(suffix) {
+                        if digits.starts_with('-') {
+                            let v = li
+                                .base10_parse::<i128>()
+                                .map_err(|e| format!("invalid negative int literal `{li}`: {e}"))?;
+                            Ok(SpecEvalValue::Int {
+                                bits: v as u128,
+                                size_bytes: 4,
+                                signed: true,
+                                untyped_lit: true,
+                            })
+                        } else {
+                            let v = li
+                                .base10_parse::<u128>()
+                                .map_err(|e| format!("invalid int literal `{li}`: {e}"))?;
+                            Ok(SpecEvalValue::Int {
+                                bits: v,
+                                size_bytes: 4,
+                                signed: false,
+                                untyped_lit: true,
+                            })
+                        }
+                    } else if let Some((sz, sig)) = self.type_meta.parse_scalar_type(suffix) {
                         if sig {
                             let v = li
                                 .base10_parse::<i128>()
@@ -4679,7 +5378,37 @@ impl<'a> SpecEvalContext<'a> {
                 } else if ep.path.segments.len() == 2 {
                     let ty = ep.path.segments[0].ident.to_string();
                     let assoc = ep.path.segments[1].ident.to_string();
-                    Ok(eval_assoc_int_const(&ty, &assoc)?)
+                    if let Some(elayout @ LayoutSpec::Enum { total_size, variants, .. }) =
+                        self.enum_layouts.get(&ty)
+                    {
+                        let vspec = variants
+                            .iter()
+                            .find(|v| v.name == assoc)
+                            .ok_or_else(|| format!("unknown enum variant `{ty}::{assoc}`"))?;
+                        if vspec.payload.is_some() {
+                            return spec_trap(format!(
+                                "enum variant `{ty}::{assoc}` requires a payload argument"
+                            ));
+                        }
+                        let provisional = SpecEvalValue::Enum {
+                            name: ty.clone(),
+                            layout: elayout.clone(),
+                            variant_name: assoc.clone(),
+                            discriminant: vspec.discriminant,
+                            payload: None,
+                            raw_bytes: vec![0u8; *total_size],
+                        };
+                        let raw_bytes = provisional.to_layout_bytes();
+                        return Ok(SpecEvalValue::Enum {
+                            name: ty,
+                            layout: elayout.clone(),
+                            variant_name: assoc,
+                            discriminant: vspec.discriminant,
+                            payload: None,
+                            raw_bytes,
+                        });
+                    }
+                    Ok(eval_assoc_int_const_with_meta(&ty, &assoc, self.type_meta)?)
                 } else {
                     spec_trap(format!("unsupported path `{}`", ep.to_token_stream()))
                 }
@@ -4903,21 +5632,32 @@ impl<'a> SpecEvalContext<'a> {
                 Ok(SpecEvalValue::Unit)
             }
             Expr::If(ei) => {
-                let cond = self.eval_expr(&ei.cond)?;
-                let SpecEvalValue::Bool(taken) = cond else {
-                    return spec_trap(format!("non-boolean `if` condition: {cond:?}"));
-                };
-                if taken {
-                    self.eval_block(&ei.then_branch)
-                } else if let Some((_, else_expr)) = &ei.else_branch {
-                    self.eval_expr(else_expr)
-                } else {
-                    Ok(SpecEvalValue::Unit)
+                let mut cond_shadowed = Vec::new();
+                let cond_res = self.eval_cond_with_let_bindings(&ei.cond, &mut cond_shadowed);
+                match cond_res {
+                    Ok(true) => {
+                        let then_res = self.eval_block(&ei.then_branch);
+                        restore_shadowed_env(&mut self.env, cond_shadowed);
+                        then_res
+                    }
+                    Ok(false) => {
+                        restore_shadowed_env(&mut self.env, cond_shadowed);
+                        if let Some((_, else_expr)) = &ei.else_branch {
+                            self.eval_expr(else_expr)
+                        } else {
+                            Ok(SpecEvalValue::Unit)
+                        }
+                    }
+                    Err(flow) => {
+                        restore_shadowed_env(&mut self.env, cond_shadowed);
+                        Err(flow)
+                    }
                 }
             }
             Expr::Cast(ec) => {
                 let inner = self.eval_expr(&ec.expr)?;
-                let ty_str = ec.ty.to_token_stream().to_string().replace(' ', "");
+                let resolved_ty = self.type_meta.resolve_syn_type(&ec.ty);
+                let ty_str = resolved_ty.to_token_stream().to_string().replace(' ', "");
                 if ty_str == "char" {
                     return match inner {
                         SpecEvalValue::Char(c) => Ok(SpecEvalValue::Char(c)),
@@ -4936,13 +5676,25 @@ impl<'a> SpecEvalContext<'a> {
                         other => spec_trap(format!("only `u8` can be cast to `char`, got {other:?}")),
                     };
                 }
-                let Some((target_sz, target_sig)) = parse_scalar_type_spec(&ty_str) else {
+                let Some((target_sz, target_sig)) = self.type_meta.parse_scalar_type(&ty_str) else {
+                    if let SpecEvalValue::Enum { discriminant, .. } = inner
+                        && let Some((sz, sig)) = parse_scalar_type_spec(&ty_str)
+                    {
+                        let mask = width_mask((sz * 8) as u32);
+                        return Ok(SpecEvalValue::Int {
+                            bits: discriminant & mask,
+                            size_bytes: sz,
+                            signed: sig,
+                            untyped_lit: false,
+                        });
+                    }
                     return spec_trap(format!("unsupported cast target `{ty_str}`"));
                 };
                 let target_mask = width_mask((target_sz * 8) as u32);
                 let raw_u128 = match inner {
                     SpecEvalValue::Bool(b) => u128::from(b),
                     SpecEvalValue::Char(c) => c as u32 as u128,
+                    SpecEvalValue::Enum { discriminant, .. } => discriminant & target_mask,
                     ref iv @ SpecEvalValue::Int { signed, bits, .. } => {
                         if signed {
                             (iv.to_signed_i128()? as u128) & target_mask
@@ -5110,7 +5862,7 @@ impl<'a> SpecEvalContext<'a> {
                 Err(flow) => return spec_trap(flow.into_trap_detail("closure body")),
             };
             if let syn::ReturnType::Type(_, ret_ty) = &closure.output {
-                out_val = coerce_value_to_syn_type(out_val, ret_ty)?;
+                out_val = coerce_value_to_syn_type(out_val, ret_ty, self.type_meta)?;
             }
             return Ok(out_val);
         }
@@ -5141,10 +5893,13 @@ impl<'a> SpecEvalContext<'a> {
                 env: pre.clone(),
                 pre_env: None,
                 struct_layouts: self.struct_layouts,
+                enum_layouts: self.enum_layouts,
+                type_meta: self.type_meta,
                 external_callees: self.external_callees,
                 helper_fns: self.helper_fns,
                 schedule: None,
                 call_index: 0,
+                call_depth: self.call_depth,
             };
             return match sub_ctx.eval_expr(&ec.args[0]) {
                 Ok(v) => Ok(v),
@@ -5152,8 +5907,78 @@ impl<'a> SpecEvalContext<'a> {
             };
         }
 
-        // Helper function defined inside `type_defs_rust` (supports `&mut T` place writeback)!
+        // Tuple-style `Enum::Variant(...)` constructor!
+        if let Some((enum_name, var_name)) = callee_name.split_once("::")
+            && !var_name.contains("::")
+            && let Some(elayout @ LayoutSpec::Enum { total_size, variants, .. }) =
+                self.enum_layouts.get(enum_name)
+        {
+            let vspec = variants
+                .iter()
+                .find(|v| v.name == var_name)
+                .ok_or_else(|| format!("unknown enum variant `{enum_name}::{var_name}`"))?;
+            let Some(p_layout) = &vspec.payload else {
+                return spec_trap(format!(
+                    "unit enum variant `{enum_name}::{var_name}` takes no arguments"
+                ));
+            };
+            let raw_payload_val = if ec.args.len() == 1 {
+                self.eval_expr(&ec.args[0])?
+            } else {
+                let mut elems = Vec::with_capacity(ec.args.len());
+                let mut layout_elems = Vec::with_capacity(ec.args.len());
+                let mut offset = 0usize;
+                for arg_expr in &ec.args {
+                    let ev = self.eval_expr(arg_expr)?;
+                    let el_layout = ev.inferred_layout();
+                    let sz = el_layout.total_size();
+                    layout_elems.push((offset, el_layout));
+                    offset += sz;
+                    elems.push(ev);
+                }
+                let tlayout = LayoutSpec::Tuple {
+                    total_size: offset,
+                    elements: layout_elems,
+                };
+                let prov = SpecEvalValue::Tuple {
+                    layout: tlayout.clone(),
+                    raw_bytes: vec![0u8; offset],
+                    elems: elems.clone(),
+                };
+                let tbytes = prov.to_layout_bytes();
+                SpecEvalValue::Tuple {
+                    layout: tlayout,
+                    raw_bytes: tbytes,
+                    elems,
+                }
+            };
+            let coerced_payload = coerce_value_to_layout(raw_payload_val, p_layout)?;
+            let provisional = SpecEvalValue::Enum {
+                name: enum_name.to_string(),
+                layout: elayout.clone(),
+                variant_name: var_name.to_string(),
+                discriminant: vspec.discriminant,
+                payload: Some(Box::new(coerced_payload.clone())),
+                raw_bytes: vec![0u8; *total_size],
+            };
+            let raw_bytes = provisional.to_layout_bytes();
+            return Ok(SpecEvalValue::Enum {
+                name: enum_name.to_string(),
+                layout: elayout.clone(),
+                variant_name: var_name.to_string(),
+                discriminant: vspec.discriminant,
+                payload: Some(Box::new(coerced_payload)),
+                raw_bytes,
+            });
+        }
+
+        // Helper function defined inside `type_defs_rust` or recursive target function!
         if let Some(helper_fn) = self.helper_fns.get(&callee_name) {
+            if self.call_depth >= MAX_SPEC_CALL_DEPTH {
+                return spec_trap(format!(
+                    "call to `{callee_name}` exceeded bounded recursion depth ({MAX_SPEC_CALL_DEPTH})"
+                ));
+            }
             if helper_fn.sig.inputs.len() != ec.args.len() {
                 return spec_trap(format!(
                     "helper `{callee_name}` expects {} argument(s), got {}",
@@ -5168,7 +5993,8 @@ impl<'a> SpecEvalContext<'a> {
                     return spec_trap(format!("unsupported `self` receiver in helper `{callee_name}`"));
                 };
                 let (pname, _) = extract_local_pat_and_ty(&pat_ty.pat)?;
-                let (is_mut_ref, inner_ty): (bool, &syn::Type) = match &*pat_ty.ty {
+                let resolved_param_ty = self.type_meta.resolve_syn_type(&pat_ty.ty);
+                let (is_mut_ref, inner_ty): (bool, &syn::Type) = match resolved_param_ty {
                     syn::Type::Reference(tr) => (tr.mutability.is_some(), &tr.elem),
                     other => (false, other),
                 };
@@ -5186,17 +6012,20 @@ impl<'a> SpecEvalContext<'a> {
                 } else {
                     self.eval_expr(call_arg_expr)?
                 };
-                let coerced = coerce_value_to_syn_type(arg_val, inner_ty)?;
+                let coerced = coerce_value_to_syn_type(arg_val, inner_ty, self.type_meta)?;
                 fn_env.insert(pname, coerced);
             }
             let mut sub_ctx = SpecEvalContext {
                 env: fn_env,
                 pre_env: None,
                 struct_layouts: self.struct_layouts,
+                enum_layouts: self.enum_layouts,
+                type_meta: self.type_meta,
                 external_callees: self.external_callees,
                 helper_fns: self.helper_fns,
                 schedule: self.schedule.as_deref_mut(),
                 call_index: self.call_index,
+                call_depth: self.call_depth + 1,
             };
             let mut out_val = match sub_ctx.eval_block(&helper_fn.block) {
                 Ok(v) | Err(SpecExecFlow::Return(v)) => v,
@@ -5217,7 +6046,7 @@ impl<'a> SpecEvalContext<'a> {
                 }
             }
             if let syn::ReturnType::Type(_, ret_ty) = &helper_fn.sig.output {
-                out_val = coerce_value_to_syn_type(out_val, ret_ty)?;
+                out_val = coerce_value_to_syn_type(out_val, ret_ty, self.type_meta)?;
             }
             return Ok(out_val);
         }
@@ -5574,12 +6403,17 @@ fn coerce_value_to_layout(val: SpecEvalValue, layout: &LayoutSpec) -> Result<Spe
     }
 }
 
-fn coerce_value_to_syn_type(val: SpecEvalValue, ty: &syn::Type) -> Result<SpecEvalValue, String> {
+fn coerce_value_to_syn_type(
+    val: SpecEvalValue,
+    ty: &syn::Type,
+    meta: &SpecTypeMetadata,
+) -> Result<SpecEvalValue, String> {
     use quote::ToTokens;
-    match ty {
-        syn::Type::Paren(tp) => coerce_value_to_syn_type(val, &tp.elem),
-        syn::Type::Group(tg) => coerce_value_to_syn_type(val, &tg.elem),
-        syn::Type::Reference(tr) => coerce_value_to_syn_type(val, &tr.elem),
+    let resolved = meta.resolve_syn_type(ty);
+    match resolved {
+        syn::Type::Paren(tp) => coerce_value_to_syn_type(val, &tp.elem, meta),
+        syn::Type::Group(tg) => coerce_value_to_syn_type(val, &tg.elem, meta),
+        syn::Type::Reference(tr) => coerce_value_to_syn_type(val, &tr.elem, meta),
         syn::Type::Tuple(tt) => {
             if tt.elems.is_empty() {
                 return Ok(val);
@@ -5598,7 +6432,7 @@ fn coerce_value_to_syn_type(val: SpecEvalValue, ty: &syn::Type) -> Result<SpecEv
             let mut layout_elems = Vec::with_capacity(elems.len());
             let mut offset = 0usize;
             for (ev, el_ty) in elems.into_iter().zip(tt.elems.iter()) {
-                let cv = coerce_value_to_syn_type(ev, el_ty)?;
+                let cv = coerce_value_to_syn_type(ev, el_ty, meta)?;
                 let el_layout = cv.inferred_layout();
                 let sz = el_layout.total_size();
                 layout_elems.push((offset, el_layout));
@@ -5627,7 +6461,7 @@ fn coerce_value_to_syn_type(val: SpecEvalValue, ty: &syn::Type) -> Result<SpecEv
             };
             let mut coerced_elems = Vec::with_capacity(elems.len());
             for ev in elems {
-                coerced_elems.push(coerce_value_to_syn_type(ev, &ta.elem)?);
+                coerced_elems.push(coerce_value_to_syn_type(ev, &ta.elem, meta)?);
             }
             let elem_layout = coerced_elems
                 .first()
@@ -5658,7 +6492,7 @@ fn coerce_value_to_syn_type(val: SpecEvalValue, ty: &syn::Type) -> Result<SpecEv
         }
         other => {
             let ty_str = other.to_token_stream().to_string().replace(' ', "");
-            if let Some((sz, sig)) = parse_scalar_type_spec(&ty_str)
+            if let Some((sz, sig)) = meta.parse_scalar_type(&ty_str)
                 && let SpecEvalValue::Int {
                     bits,
                     signed: rsig,
@@ -5674,8 +6508,12 @@ fn coerce_value_to_syn_type(val: SpecEvalValue, ty: &syn::Type) -> Result<SpecEv
     }
 }
 
-fn eval_assoc_int_const(ty: &str, assoc: &str) -> Result<SpecEvalValue, String> {
-    let Some((sz, sig)) = parse_scalar_type_spec(ty) else {
+fn eval_assoc_int_const_with_meta(
+    ty: &str,
+    assoc: &str,
+    meta: &SpecTypeMetadata,
+) -> Result<SpecEvalValue, String> {
+    let Some((sz, sig)) = meta.parse_scalar_type(ty) else {
         return Err(format!("unknown integer type `{ty}` for `{ty}::{assoc}`"));
     };
     let bw = (sz * 8) as u32;
@@ -6862,28 +7700,27 @@ impl SpecContractOracleProbe {
                 ));
             }
             if let Some(sched) = opt_sched {
+                let type_meta = SpecTypeMetadata::from_type_defs(&self.type_defs_rust);
                 for ext in &self.external_callees {
-                    let initial_count = probe_live_callee_call_count(sched, &ext.name);
-                    if initial_count > 0 {
-                        bindings_code.push_str(&format!(
-                            "        __anneal_set_callee_call_count_{}({initial_count}usize);\n",
-                            ext.name
-                        ));
-                    }
                     let decode_opt_lit = |bytes: &[u8]| -> String {
                         if sched.validate_callee_payload(&ext.name, bytes).is_ok()
                             && bytes.len() == ext.ret_layout.total_size()
                             && let Ok(val) =
                                 SpecEvalValue::from_layout_bytes(&ext.ret_layout, bytes)
                         {
-                            format!("Some({})", val.rust_literal(&ext.ret_rust_ty))
+                            format!(
+                                "Some({})",
+                                val.rust_literal_with_defs(&ext.ret_rust_ty, &type_meta)
+                            )
                         } else {
                             "None".to_string()
                         }
                     };
-                    if let Some(&c_panic) = sched.callee_panic_on_call.get(&ext.name) {
+                    if let Some(rem_panic) =
+                        remaining_calls_until_callee_panic(sched, &ext.name)
+                    {
                         bindings_code.push_str(&format!(
-                            "        __anneal_set_callee_panic_{}(Some({c_panic}usize));\n",
+                            "        __anneal_set_callee_panic_{}(Some({rem_panic}usize));\n",
                             ext.name
                         ));
                     }
@@ -6905,13 +7742,14 @@ impl SpecContractOracleProbe {
                     }
                 }
             }
+            let type_meta = SpecTypeMetadata::from_type_defs(&self.type_defs_rust);
             let mut call_args = Vec::with_capacity(self.params.len());
             for p in &self.params {
                 let sz = p.layout.total_size();
                 let val = SpecEvalValue::from_layout_bytes(&p.layout, &raw_trial[cursor..cursor + sz])
                     .map_err(|e| format!("trial {t_idx} param `{}` invalid: {e}", p.name))?;
                 cursor += sz;
-                let lit = val.rust_literal(&p.rust_ty);
+                let lit = val.rust_literal_with_defs(&p.rust_ty, &type_meta);
                 if p.is_mut_ref {
                     bindings_code.push_str(&format!(
                         "        let mut __arg_{}: {} = {};\n",
@@ -6978,11 +7816,13 @@ impl SpecContractOracleProbe {
         }
 
         let mut struct_layouts = BTreeMap::new();
+        let mut enum_layouts = BTreeMap::new();
         let mut external_callees = BTreeMap::new();
         for ext in &self.external_callees {
-            collect_named_struct_layouts(&ext.ret_layout, &mut struct_layouts);
+            collect_named_layouts(&ext.ret_layout, &mut struct_layouts, &mut enum_layouts);
             external_callees.insert(ext.name.clone(), ext.ret_layout.clone());
         }
+        let type_meta = SpecTypeMetadata::from_type_defs(&self.type_defs_rust);
         let mut helper_fns = BTreeMap::new();
         if !self.type_defs_rust.trim().is_empty()
             && let Ok(parsed_defs) = syn::parse_file(&self.type_defs_rust)
@@ -6993,11 +7833,37 @@ impl SpecContractOracleProbe {
                 }
             }
         }
+        // Register the target function itself in `helper_fns` so recursive
+        // `#[spec]` bodies invoke `<fn_name>(...)` in lockstep with compiled Rust
+        // rather than misdispatching self-calls to `EnvSchedule`.
+        {
+            let self_params: Vec<String> = self
+                .params
+                .iter()
+                .map(|p| {
+                    if p.is_mut_ref {
+                        format!("{}: &mut {}", p.name, p.rust_ty)
+                    } else {
+                        format!("{}: {}", p.name, p.rust_ty)
+                    }
+                })
+                .collect();
+            let self_fn_src = format!(
+                "fn {}({}) -> {} {{\n{}\n}}",
+                self.fn_name,
+                self_params.join(", "),
+                self.ret_rust_ty,
+                self.callee_body_rust
+            );
+            if let Ok(self_item_fn) = syn::parse_str::<syn::ItemFn>(&self_fn_src) {
+                helper_fns.insert(self.fn_name.clone(), self_item_fn);
+            }
+        }
         let mut pre_env = BTreeMap::new();
         let mut pre_raw_by_param: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         let mut cursor = 0usize;
         for p in &self.params {
-            collect_named_struct_layouts(&p.layout, &mut struct_layouts);
+            collect_named_layouts(&p.layout, &mut struct_layouts, &mut enum_layouts);
             let sz = p.layout.total_size();
             let slice = &packed_arg_bytes[cursor..cursor + sz];
             cursor += sz;
@@ -7005,7 +7871,7 @@ impl SpecContractOracleProbe {
             pre_raw_by_param.insert(p.name.clone(), slice.to_vec());
             pre_env.insert(p.name.clone(), val);
         }
-        collect_named_struct_layouts(&self.ret_layout, &mut struct_layouts);
+        collect_named_layouts(&self.ret_layout, &mut struct_layouts, &mut enum_layouts);
 
         // Phase 1: Evaluate `requires` preconditions in order BEFORE executing the body.
         {
@@ -7013,10 +7879,13 @@ impl SpecContractOracleProbe {
                 env: pre_env.clone(),
                 pre_env: None,
                 struct_layouts: &struct_layouts,
+                enum_layouts: &enum_layouts,
+                type_meta: &type_meta,
                 external_callees: &external_callees,
                 helper_fns: &helper_fns,
                 schedule: None,
                 call_index: 0,
+                call_depth: 0,
             };
             for (idx, req) in self.requires.iter().enumerate() {
                 let expr = syn::parse_str::<Expr>(&req.rust_expr).map_err(|e| {
@@ -7065,10 +7934,13 @@ impl SpecContractOracleProbe {
             env: pre_env.clone(),
             pre_env: None,
             struct_layouts: &struct_layouts,
+            enum_layouts: &enum_layouts,
+            type_meta: &type_meta,
             external_callees: &external_callees,
             helper_fns: &helper_fns,
             schedule,
             call_index: 0,
+            call_depth: 0,
         };
         let mut result_val = match body_ctx.eval_block(&body_block) {
             Ok(v) | Err(SpecExecFlow::Return(v)) => v,
@@ -7090,8 +7962,9 @@ impl SpecContractOracleProbe {
         };
 
         // Phase 3: Check frame conditions on `&mut` parameters using
-        // `LayoutSpec::mask_padding_as_unknown` so padding bytes never cause
-        // false alarms while every occupied data byte of framed fields is checked!
+        // `LayoutSpec::mask_padding_as_unknown` (and active-variant semantic
+        // equality when `Enum` layouts are present so inactive union payload
+        // bytes never cause false alarms).
         for p in &self.params {
             if !p.is_mut_ref || p.frame_preserved_fields.is_empty() {
                 continue;
@@ -7106,13 +7979,25 @@ impl SpecContractOracleProbe {
                     if let Some(fspec) = fields.iter().find(|f| &f.name == ff) {
                         let start = fspec.offset;
                         let end = start + fspec.layout.total_size();
-                        let pre_masked = fspec
-                            .layout
-                            .mask_padding_as_unknown(&pre_bytes[start..end])?;
-                        let post_masked = fspec
-                            .layout
-                            .mask_padding_as_unknown(&post_bytes[start..end])?;
-                        if pre_masked != post_masked {
+                        let field_changed = if layout_contains_enum(&fspec.layout)
+                            && let (
+                                Some(SpecEvalValue::Struct { fields: pre_f, .. }),
+                                SpecEvalValue::Struct { fields: post_f, .. },
+                            ) = (pre_env.get(&p.name), post_val)
+                            && let (Some(pre_fv), Some(post_fv)) =
+                                (pre_f.get(ff), post_f.get(ff))
+                        {
+                            !pre_fv.semantic_eq(post_fv).unwrap_or(false)
+                        } else {
+                            let pre_masked = fspec
+                                .layout
+                                .mask_padding_as_unknown(&pre_bytes[start..end])?;
+                            let post_masked = fspec
+                                .layout
+                                .mask_padding_as_unknown(&post_bytes[start..end])?;
+                            pre_masked != post_masked
+                        };
+                        if field_changed {
                             return Ok(SpecPostconditionVerdict::PostconditionViolation {
                                 kind: SpecViolationKind::FrameCondition {
                                     param: p.name.clone(),
@@ -7149,10 +8034,13 @@ impl SpecContractOracleProbe {
             env: post_env,
             pre_env: Some(&pre_env),
             struct_layouts: &struct_layouts,
+            enum_layouts: &enum_layouts,
+            type_meta: &type_meta,
             external_callees: &external_callees,
             helper_fns: &helper_fns,
             schedule: None,
             call_index: 0,
+            call_depth: 0,
         };
         for (idx, ens) in self.ensures.iter().enumerate() {
             let expr = syn::parse_str::<Expr>(&ens.rust_expr).map_err(|e| {
@@ -7226,39 +8114,56 @@ impl SpecContractOracleProbe {
     }
 }
 
-fn probe_live_callee_call_count(sched: &EnvSchedule, callee: &str) -> usize {
-    for candidate in 0..=256usize {
-        let mut sim = sched.clone();
-        sim.global_panic_on_call = None;
-        sim.set_callee_panic_on_call(callee, candidate);
+fn remaining_calls_until_callee_panic(sched: &EnvSchedule, callee: &str) -> Option<usize> {
+    let target_k = *sched.callee_panic_on_call.get(callee)?;
+    let mut sim = sched.clone();
+    sim.global_panic_on_call = None;
+    for delta in 0..=target_k {
         if matches!(
             sim.next_action(callee, usize::MAX),
             crate::instrument::EnvAction::PanicOnCall(_)
         ) {
-            return candidate;
+            return Some(delta);
         }
     }
-    0
+    None
 }
 
-fn collect_named_struct_layouts(layout: &LayoutSpec, out: &mut BTreeMap<String, LayoutSpec>) {
+fn layout_contains_enum(layout: &LayoutSpec) -> bool {
+    match layout {
+        LayoutSpec::Enum { .. } => true,
+        LayoutSpec::Struct { fields, .. } => fields.iter().any(|f| layout_contains_enum(&f.layout)),
+        LayoutSpec::Tuple { elements, .. } => {
+            elements.iter().any(|(_, el)| layout_contains_enum(el))
+        }
+        LayoutSpec::Array { elem, .. } => layout_contains_enum(elem),
+        LayoutSpec::Scalar(_) => false,
+    }
+}
+
+fn collect_named_layouts(
+    layout: &LayoutSpec,
+    struct_out: &mut BTreeMap<String, LayoutSpec>,
+    enum_out: &mut BTreeMap<String, LayoutSpec>,
+) {
     match layout {
         LayoutSpec::Struct { name, fields, .. } => {
-            out.insert(name.clone(), layout.clone());
+            struct_out.insert(name.clone(), layout.clone());
             for f in fields {
-                collect_named_struct_layouts(&f.layout, out);
+                collect_named_layouts(&f.layout, struct_out, enum_out);
             }
         }
         LayoutSpec::Tuple { elements, .. } => {
             for (_, el) in elements {
-                collect_named_struct_layouts(el, out);
+                collect_named_layouts(el, struct_out, enum_out);
             }
         }
-        LayoutSpec::Array { elem, .. } => collect_named_struct_layouts(elem, out),
-        LayoutSpec::Enum { variants, .. } => {
+        LayoutSpec::Array { elem, .. } => collect_named_layouts(elem, struct_out, enum_out),
+        LayoutSpec::Enum { name, variants, .. } => {
+            enum_out.insert(name.clone(), layout.clone());
             for v in variants {
                 if let Some(p) = &v.payload {
-                    collect_named_struct_layouts(p, out);
+                    collect_named_layouts(p, struct_out, enum_out);
                 }
             }
         }
@@ -7623,7 +8528,7 @@ impl WriteChainCoverageBound {
     /// broken env step, or unknown).
     #[inline]
     pub fn current_slot_depth(&self, slot: &str) -> usize {
-        self.live_slot_depths.get(slot).copied().unwrap_or(0)
+        self.live_slot_depths.get(slot.trim()).copied().unwrap_or(0)
     }
 
     /// Total valid write steps observed.
@@ -7648,18 +8553,21 @@ impl WriteChainCoverageBound {
     /// and returning the newly assigned live causal depth of `step.written_slot`
     /// (`0` if `written_slot` is empty, configuration is invalid, or `env_link_satisfied` is `false`).
     pub fn observe_step(&mut self, step: &WriteChainStep) -> usize {
-        if self.num_slots == 0 || self.min_walk_length == 0 || step.written_slot.trim().is_empty() {
+        let written = step.written_slot.trim();
+        if self.num_slots == 0 || self.min_walk_length == 0 || written.is_empty() {
             return 0;
         }
         if !step.env_link_satisfied {
             self.broken_env_links += 1;
-            self.live_slot_depths.remove(&step.written_slot);
+            self.live_slot_depths.remove(written);
             return 0;
         }
 
         let max_dep = step
             .read_slots
             .iter()
+            .map(|src| src.trim())
+            .filter(|src| !src.is_empty())
             .filter_map(|src| self.live_slot_depths.get(src).copied())
             .max()
             .unwrap_or(0);
@@ -7668,9 +8576,8 @@ impl WriteChainCoverageBound {
             self.rmw_transitions_observed += 1;
         }
         self.steps_observed += 1;
-        self.ever_written_slots.insert(step.written_slot.clone());
-        self.live_slot_depths
-            .insert(step.written_slot.clone(), new_depth);
+        self.ever_written_slots.insert(written.to_string());
+        self.live_slot_depths.insert(written.to_string(), new_depth);
         if new_depth > self.max_observed_depth {
             self.max_observed_depth = new_depth;
         }
@@ -9186,5 +10093,141 @@ mod tests {
         );
         assert!(typed_tracker.is_depth_certified());
         assert_eq!(typed_tracker.rmw_transitions_observed(), 1);
+    }
+
+    #[test]
+    fn ep2_b2_old_match_if_let_shadowing_neg_range_enums_aliases_recursion_and_deep_prestep() {
+        let i32_layout = LayoutSpec::Scalar(ScalarLayout::i32());
+        let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+        let usize_layout = LayoutSpec::Scalar(ScalarLayout::unsigned(8));
+
+        let maybe_word_layout = LayoutSpec::Enum {
+            name: "MaybeWord".to_string(),
+            total_size: 8,
+            tag_offset: 0,
+            tag_size: 1,
+            variants: vec![
+                EnumVariantLayout {
+                    name: "Empty".to_string(),
+                    discriminant: 0,
+                    payload_offset: 4,
+                    payload: None,
+                },
+                EnumVariantLayout {
+                    name: "Ready".to_string(),
+                    discriminant: 1,
+                    payload_offset: 4,
+                    payload: Some(Box::new(u32_layout.clone())),
+                },
+            ],
+        };
+
+        let container_layout = LayoutSpec::Struct {
+            name: "EnumState".to_string(),
+            total_size: 24,
+            fields: vec![
+                FieldLayout {
+                    name: "status".to_string(),
+                    offset: 0,
+                    layout: maybe_word_layout.clone(),
+                },
+                FieldLayout {
+                    name: "cursor".to_string(),
+                    offset: 8,
+                    layout: usize_layout.clone(),
+                },
+                FieldLayout {
+                    name: "active".to_string(),
+                    offset: 16,
+                    layout: u32_layout.clone(),
+                },
+            ],
+        };
+
+        // Exercises:
+        // 1. `old(match st.active { x if x > 0u32 => x, _ => 0u32 })` and
+        //    `old(if let MaybeWord::Ready(x) = st.status { x } else { 0u32 })`
+        //    shadowing parameter `x: i32` without rewriting bound `x: u32` to `i32`!
+        // 2. Negative untyped `match` patterns (`-5 | -1 => ...`), range patterns (`-4..=-2`, `0..=10`),
+        //    struct/array slice destructuring, `if let` let-chains, and `#[repr(C, u8)]` `Enum`
+        //    inactive-union-payload frame preservation (`st.status = MaybeWord::Empty` with `0xDD` poison)!
+        // 3. `type Word = u32;` alias + `usize` struct/tuple/array literal synthesis!
+        // 4. Target self-recursion (`recursive_step(..., depth - 1)`) + bounded recursion guard!
+        let probe = SpecContractOracleProbe::new(
+            "recursive_enum_and_pattern_step",
+            vec![
+                SpecParamBinding::mut_ref("st", "EnumState", container_layout)
+                    .with_frame_preserved_fields(["status", "cursor"]),
+                SpecParamBinding::by_value("x", "i32", i32_layout),
+                SpecParamBinding::by_value("depth", "Word", u32_layout.clone()),
+            ],
+            "Word",
+            u32_layout,
+            "if depth > 0u32 {\n    \
+                 st.active = st.active + 2u32;\n    \
+                 return recursive_enum_and_pattern_step(st, x, depth - 1u32);\n\
+             }\n\
+             if let MaybeWord::Empty = st.status {\n    \
+                 st.status = MaybeWord::Empty;\n\
+             }\n\
+             let delta: u32 = match x {\n    \
+                 -5 | -1 => 7u32,\n    \
+                 -4..=-2 => 3u32,\n    \
+                 0..=10 => (x as Word) + 1u32,\n    \
+                 _ => 0u32,\n\
+             };\n\
+             let arr: [usize; 3] = [st.cursor, 2usize, 9usize];\n\
+             let bonus: u32 = match arr {\n    \
+                 [first, .., 9usize] if first <= 100usize => first as u32,\n    \
+                 _ => 0u32,\n\
+             };\n\
+             st.active = st.active + delta + bonus;\n\
+             st.active",
+        )
+        .with_type_defs(
+            "pub type Word = u32;\n\
+             #[repr(C, u8)]\n\
+             #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+             pub enum MaybeWord { Empty = 0, Ready(Word) = 1 }\n\
+             #[repr(C)]\n\
+             #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+             pub struct EnumState { pub status: MaybeWord, pub cursor: usize, pub active: Word }",
+        )
+        .with_requires(
+            "bounded_depth_and_active",
+            "depth <= 4u32 && st.active <= 1000u32 && st.cursor <= 50usize",
+        )
+        .with_ensures(
+            "shadowed_old_match_and_if_let",
+            "old(match st.active { x if x >= 1u32 => x, _ => 0u32 }) == old(st.active) \
+             && old(if let MaybeWord::Ready(x) = st.status && x > 0u32 { x } else { 0u32 }) <= 100_000u32",
+        )
+        .with_ensures("grows_active", "result >= old(st.active)");
+
+        // Poison inactive union bytes `4..8` of `MaybeWord::Empty` with `0xDD`:
+        // reassigning `st.status = MaybeWord::Empty` must NOT trigger a false FrameCondition!
+        let mut raw = vec![0xDDu8; 32];
+        raw[0] = 0u8; // MaybeWord::Empty
+        raw[8..16].copy_from_slice(&5u64.to_le_bytes()); // cursor = 5usize
+        raw[16..20].copy_from_slice(&10u32.to_le_bytes()); // active = 10
+        raw[24..28].copy_from_slice(&(-5i32).to_le_bytes()); // x = -5 (negative untyped arm!)
+        raw[28..32].copy_from_slice(&3u32.to_le_bytes()); // depth = 3 (self-recursion!)
+
+        let v = probe
+            .verify_spec_postcondition_against_schedule(&raw, None)
+            .expect("eval ep2-B2 probe");
+        assert_eq!(v, SpecPostconditionVerdict::VerifiedHold);
+
+        // Whitespace-canonical slot names in `WriteChainCoverageBound`: `" s0 "` and `"s0"`
+        // alias the same slot rather than inflating `distinct_slots_written()` or breaking RMW links.
+        let mut ws_tracker = WriteChainCoverageBound::new(2, 2);
+        assert_eq!(ws_tracker.observe_step(&WriteChainStep::local_write(" s0 ")), 1);
+        assert_eq!(
+            ws_tracker.observe_step(&WriteChainStep::dependent_write("s1", ["s0", "   "])),
+            2
+        );
+        assert_eq!(ws_tracker.distinct_slots_written(), 2);
+        assert_eq!(ws_tracker.current_slot_depth("s0"), 1);
+        assert!(ws_tracker.is_depth_certified());
     }
 }
