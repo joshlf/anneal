@@ -24,7 +24,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from typing import Any, Iterator
+from typing import Any, Iterator, MutableMapping
 import unittest
 from unittest import mock
 
@@ -66,10 +66,14 @@ _AMBIENT_ANNEAL_ENV_PREFIXES: tuple[str, ...] = (
     "ANNEAL_OOM_",
 )
 _ENV_PATCHER: Any = None
+_EXEC_GUARD: Any = None
 _XDG_TMPDIR: tempfile.TemporaryDirectory[str] | None = None
+# Text of the `anneal-workloads.slice` unit `ensure_workloads_slice` reconciles on this
+# host, or `None` when it refuses to write one (no delegated `systemd --user`).
+_SLICE_UNIT_SEED: str | None = None
 
 
-def _scrub_ambient_anneal_env(env: dict[str, str]) -> None:
+def _scrub_ambient_anneal_env(env: MutableMapping[str, str]) -> None:
     for key in list(env):
         if key.startswith(_AMBIENT_ANNEAL_ENV_PREFIXES):
             env.pop(key, None)
@@ -87,8 +91,55 @@ def _isolated_cli_env(
     return env
 
 
+def _forbid_in_process_exec(file: str, args: Any, *rest: Any) -> None:
+    raise AssertionError(
+        f"in-process exec of {args!r} would replace the unittest runner and report the "
+        "command's exit status as the suite's (did ANNEAL_LEAN_RUN_IN_SCOPE leak into "
+        "the test process?)"
+    )
+
+
+def _render_live_workloads_slice_unit() -> str | None:
+    """Unit text `ensure_workloads_slice` renders on this host (`None` if it refuses)."""
+    try:
+        info = alr.probe_host_envelope(is_probe=True)
+    except Exception:  # noqa: BLE001 - seeding is best-effort; the probe has its own tests
+        return None
+    if not (info.get("user_systemd_active") and info.get("t_cg_is_user_service")):
+        return None
+    return alr.render_workloads_slice_unit(
+        int(info["w_slice_high_mb"]), int(info["w_slice_max_mb"])
+    )
+
+
+def _seed_workloads_slice_unit(xdg_config_home: Path) -> Path | None:
+    """Pre-renders `anneal-workloads.slice` under an isolated `XDG_CONFIG_HOME`.
+
+    A command-executing `anneal-lean-run` first reconciles
+    `$XDG_CONFIG_HOME/systemd/user/anneal-workloads.slice`.  Under an *empty* isolated
+    `XDG_CONFIG_HOME` the unit looks absent, so every such run would write it there and
+    then `systemctl --user daemon-reload` the host's live user manager.  Seeding the exact
+    text the script would render keeps that reconciliation a content-diff no-op: tests
+    neither read the host's real unit file nor reload the host's `systemd --user`.
+
+    Returns the seeded path, or `None` when this host never reconciles the unit.
+    """
+    if _SLICE_UNIT_SEED is None:
+        return None
+    unit = xdg_config_home / "systemd" / "user" / "anneal-workloads.slice"
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    unit.write_text(_SLICE_UNIT_SEED, encoding="utf-8")
+    return unit
+
+
+def _file_identity(path: Path) -> tuple[int, int, str]:
+    """`(inode, mtime_ns, text)`: changes whenever the file is rewritten or replaced."""
+    st = path.stat()
+    return st.st_ino, st.st_mtime_ns, path.read_text(encoding="utf-8")
+
+
 def setUpModule() -> None:
-    global _ENV_PATCHER, _XDG_TMPDIR
+    global _ENV_PATCHER, _EXEC_GUARD, _XDG_TMPDIR, _SLICE_UNIT_SEED
     _XDG_TMPDIR = tempfile.TemporaryDirectory(prefix="anneal-test-xdg-")
     patch_vals = {**_HERMETIC_GIT_ENV, "XDG_CONFIG_HOME": _XDG_TMPDIR.name}
     _ENV_PATCHER = mock.patch.dict(os.environ, patch_vals)
@@ -97,15 +148,28 @@ def setUpModule() -> None:
     for name in alr._GIT_LOCAL_ENV_VARS:
         os.environ.pop(name, None)
     _scrub_ambient_anneal_env(os.environ)
+    # The re-entrancy pass-through of `alr.main` `os.execvp`s its command.  In-process that
+    # would replace the unittest runner and end the run early with the command's own exit
+    # status (`true` -> 0: a truncated run reported as success), so fail loudly instead.
+    # Subprocesses are unaffected (`subprocess` does not go through `os.execvp`).
+    _EXEC_GUARD = mock.patch.object(os, "execvp", side_effect=_forbid_in_process_exec)
+    _EXEC_GUARD.start()
+    # In-process `alr.main([... "--", cmd])` runs reconcile the unit under this module-wide
+    # `XDG_CONFIG_HOME`; seed it so they never reload the live user manager either.
+    _SLICE_UNIT_SEED = _render_live_workloads_slice_unit()
+    _seed_workloads_slice_unit(Path(_XDG_TMPDIR.name))
 
 
 def tearDownModule() -> None:
-    global _XDG_TMPDIR
+    global _XDG_TMPDIR, _SLICE_UNIT_SEED
+    if _EXEC_GUARD is not None:
+        _EXEC_GUARD.stop()
     if _ENV_PATCHER is not None:
         _ENV_PATCHER.stop()
     if _XDG_TMPDIR is not None:
         _XDG_TMPDIR.cleanup()
         _XDG_TMPDIR = None
+    _SLICE_UNIT_SEED = None
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +180,67 @@ def tearDownModule() -> None:
 def _write_cgroup_file(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+# Synthetic hosts: 16 logical cores, 64 GiB RAM, one process in `/user.slice/job.scope`
+# whose only (optional) memory ceiling is `user.slice/memory.max`.
+SYNTHETIC_HOST_CORES = 16
+
+
+def _write_synthetic_host_base(root: Path) -> None:
+    """Writes the `/proc/meminfo` and `/proc/self/cgroup` stand-ins shared by every host."""
+    _write_cgroup_file(
+        root / "meminfo",
+        "MemTotal:       67108864 kB\nMemAvailable:   50331648 kB\n",
+    )
+    _write_cgroup_file(root / "proc_cgroup", "0::/user.slice/job.scope\n")
+
+
+def _write_synthetic_cgroup_root(
+    root: Path, name: str, user_slice_max_mib: int | None
+) -> Path:
+    """Writes cgroup v2 root `root/name`; `user_slice_max_mib=None` leaves it uncapped."""
+    cg = root / name
+    ceiling = "max" if user_slice_max_mib is None else str(user_slice_max_mib * MIB)
+    _write_cgroup_file(cg / "user.slice" / "memory.max", f"{ceiling}\n")
+    _write_cgroup_file(cg / "user.slice" / "job.scope" / "memory.max", "max\n")
+    _write_cgroup_file(
+        cg / "user.slice" / "job.scope" / "memory.stat",
+        f"anon {512 * MIB}\nshmem 0\nfile {1024 * MIB}\n",
+    )
+    return cg
+
+
+# `(cgroup root name, user.slice memory.max in MiB, is_cg_capped, s_heavy_safe)`.
+SYNTHETIC_HOSTS: tuple[tuple[str, int | None, bool, int], ...] = (
+    ("cg_uncapped", None, False, 2),
+    ("cg_capped_1", 12288, True, 1),
+    ("cg_capped_2", 32768, True, 2),
+)
+
+# Runs the real `main()` of `scripts/anneal-lean-run` in a fresh interpreter with only the
+# host probe's inputs redirected to a synthetic host, so argument parsing, environment and
+# `$XDG_CONFIG_HOME` handling and the JSON contract are exercised end to end for a cgroup
+# regime the machine running the tests may not have.
+# argv: <script> <host root> <cgroup root name> [anneal-lean-run args...]
+_SYNTHETIC_HOST_CLI_SHIM = f"""\
+import functools, importlib.machinery, importlib.util, pathlib, sys
+script, root, cg_name = sys.argv[1], pathlib.Path(sys.argv[2]), sys.argv[3]
+loader = importlib.machinery.SourceFileLoader("anneal_lean_run_synthetic", script)
+spec = importlib.util.spec_from_loader("anneal_lean_run_synthetic", loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+mod.probe_host_envelope = functools.partial(
+    mod.probe_host_envelope,
+    meminfo_path=root / "meminfo",
+    cgroup_root=root / cg_name,
+    proc_cgroup_path=root / "proc_cgroup",
+    cpu_cores={SYNTHETIC_HOST_CORES},
+    user_systemd_active=False,
+    runtime_base=root,
+)
+sys.exit(mod.main(sys.argv[4:]))
+"""
 
 
 FAKE_CGROUP_INFO: dict[str, Any] = {
@@ -857,6 +982,64 @@ class TestCliAndLimits(unittest.TestCase):
             err,
         )
 
+    def test_in_process_passthrough_cannot_replace_the_test_runner(self) -> None:
+        """A leaked `ANNEAL_LEAN_RUN_IN_SCOPE=1` fails loudly instead of `exec`ing the
+        command over the unittest runner (which would end the run early with exit 0)."""
+        self.assertNotIn("ANNEAL_LEAN_RUN_IN_SCOPE", os.environ)
+        self.assertIsNotNone(_EXEC_GUARD)
+        with mock.patch.dict(os.environ, {"ANNEAL_LEAN_RUN_IN_SCOPE": "1"}):
+            with self.assertRaisesRegex(AssertionError, "replace the unittest runner"):
+                alr.main(["--mode", "file", "--no-slot-lock", "--", "true"])
+        self.assertNotIn("ANNEAL_LEAN_RUN_IN_SCOPE", os.environ)
+
+    def test_command_execution_leaves_live_user_systemd_alone(self) -> None:
+        """Under the isolated module-wide `XDG_CONFIG_HOME`, running a command neither
+        rewrites `anneal-workloads.slice` nor reloads the host's `systemd --user`."""
+        if _SLICE_UNIT_SEED is None:
+            self.skipTest("no delegated systemd --user: the slice unit is never reconciled")
+        unit = alr._workloads_slice_unit_path()
+        assert _XDG_TMPDIR is not None
+        self.assertEqual(unit.parents[2], Path(_XDG_TMPDIR.name))
+        before = _file_identity(unit)
+        self.assertEqual(before[2], _SLICE_UNIT_SEED)
+
+        real_run = subprocess.run
+        seen: list[list[str]] = []
+
+        def spy(argv: list[str], *args: Any, **kwargs: Any) -> Any:
+            seen.append([str(a) for a in argv])
+            return real_run(argv, *args, **kwargs)
+
+        with mock.patch.object(alr.subprocess, "run", side_effect=spy):
+            rc = alr.main(
+                ["--mode", "file", "--no-slot-lock", "--concurrency", "1", "--", "true"]
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual([argv for argv in seen if "daemon-reload" in argv], [])
+        self.assertEqual(_file_identity(unit), before)
+
+        # Positive control: the same run under an *unseeded* `XDG_CONFIG_HOME` does
+        # reconcile the unit (reload stubbed out), so the checks above are not vacuous.
+        seen.clear()
+
+        def stub(argv: list[str], *args: Any, **kwargs: Any) -> Any:
+            seen.append([str(a) for a in argv])
+            if "daemon-reload" in seen[-1]:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return real_run(argv, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory(prefix="anneal-unseeded-xdg-") as empty_xdg:
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": empty_xdg}), mock.patch.object(
+                alr.subprocess, "run", side_effect=stub
+            ):
+                rc = alr.main(
+                    ["--mode", "file", "--no-slot-lock", "--concurrency", "1", "--", "true"]
+                )
+            self.assertEqual(rc, 0)
+            self.assertEqual(len([argv for argv in seen if "daemon-reload" in argv]), 1)
+            written = Path(empty_xdg) / "systemd" / "user" / "anneal-workloads.slice"
+            self.assertEqual(written.read_text(encoding="utf-8"), _SLICE_UNIT_SEED)
+
     def test_timeout_captures_cgroup_snapshot_before_terminating_process(self) -> None:
         """On timeout, the live child scope (`pid=proc.pid`) must be sampled before `_kill_systemd_scope`."""
         events: list[tuple[str, int | None]] = []
@@ -968,137 +1151,184 @@ class TestCliAndLimits(unittest.TestCase):
 
 
 class TestCliSubprocess(unittest.TestCase):
-    """Runs `scripts/anneal-lean-run` as a real subprocess (stdin=/dev/null)."""
+    """Runs `scripts/anneal-lean-run` as a real subprocess (stdin=/dev/null).
 
-    def _cli(
-        self, *args: str, env_extra: dict[str, str] | None = None
+    Every subprocess is isolated from the invoking host: ambient `ANNEAL_LEAN_*` /
+    `ANNEAL_WORKTREE_*` / `ANNEAL_LSP_*` / `ANNEAL_OOM_*` variables are scrubbed, and
+    `XDG_CONFIG_HOME` is a fresh empty directory unless `env_extra` provides one.
+    """
+
+    def _run_isolated(
+        self, argv: list[str], env_extra: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory(prefix="anneal-cli-xdg-") as xdg_dir:
-            env = _isolated_cli_env(Path(xdg_dir), env_extra)
             return subprocess.run(
-                [sys.executable, str(SCRIPT_PATH), *args],
+                argv,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 check=False,
-                env=env,
+                env=_isolated_cli_env(Path(xdg_dir), env_extra),
                 timeout=120,
             )
 
+    def _cli(
+        self, *args: str, env_extra: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        return self._run_isolated([sys.executable, str(SCRIPT_PATH), *args], env_extra)
+
+    def _synthetic_cli(
+        self,
+        host_root: Path,
+        cgroup_name: str,
+        *args: str,
+        env_extra: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """`_cli` against synthetic host `host_root` / `cgroup_name` (same isolation)."""
+        return self._run_isolated(
+            [
+                sys.executable,
+                "-B",
+                "-c",
+                _SYNTHETIC_HOST_CLI_SHIM,
+                str(SCRIPT_PATH),
+                str(host_root),
+                cgroup_name,
+                *args,
+            ],
+            env_extra,
+        )
+
+    def _probe_json(self, res: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+        self.assertEqual(res.returncode, 0, res.stderr)
+        data = json.loads(res.stdout)
+        self.assertIsInstance(data, dict)
+        return data
+
+    def _assert_concurrency(self, data: dict[str, Any], expected: int) -> None:
+        for key in ("concurrency", "w_eff", "build_slots"):
+            self.assertEqual(data[key], expected, key)
+
+    @staticmethod
+    def _host_bounded(requested: int, data: dict[str, Any]) -> int:
+        """Concurrency the probed host grants for `requested`: cgroup-capped hosts clamp
+        it to `s_heavy_safe`, uncapped hosts honor it."""
+        if data["is_cg_capped"]:
+            return min(requested, data["s_heavy_safe"])
+        return requested
+
     def test_cli_backward_compatible_probe_and_execution(self) -> None:
         if os.access(SCRIPT_PATH, os.X_OK):
-            with tempfile.TemporaryDirectory(prefix="anneal-cli-xdg-") as xdg_dir:
-                direct = subprocess.run(
-                    [str(SCRIPT_PATH), "--print-limits", "--json"],
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    env=_isolated_cli_env(Path(xdg_dir)),
-                    timeout=120,
-                )
-            self.assertEqual(direct.returncode, 0, direct.stderr)
-            self.assertIn("cgroup_avail_mib", json.loads(direct.stdout))
+            direct = self._run_isolated([str(SCRIPT_PATH), "--print-limits", "--json"])
+            self.assertIn("cgroup_avail_mib", self._probe_json(direct))
 
         probe = self._cli("--probe")
         self.assertEqual(probe.returncode, 0, probe.stderr)
         self.assertIn("Cgroup v2", probe.stdout)
         self.assertIn("Hard RAM Cap", probe.stdout)
 
-        env_json = self._cli(
-            "--probe",
-            "--json",
-            env_extra={
-                "ANNEAL_WORKTREE_CONCURRENCY": "2",
-                "ANNEAL_LEAN_MEMORY_MAX_MB": "3000",
-                "ANNEAL_LEAN_TIMEOUT_SEC": "77",
-            },
+        # An isolated probe sees no host override at all: neither ambient `ANNEAL_*`
+        # variables nor `{$XDG_CONFIG_HOME,~/.config}/anneal/concurrency`.
+        default = self._probe_json(self._cli("--probe", "--json"))
+        self._assert_concurrency(default, 1)
+        self.assertEqual(default["mode"], "build")
+        self.assertEqual(default["timeout_sec"], 900)
+
+        data = self._probe_json(
+            self._cli(
+                "--probe",
+                "--json",
+                env_extra={
+                    "ANNEAL_WORKTREE_CONCURRENCY": "2",
+                    "ANNEAL_LEAN_MEMORY_MAX_MB": "3000",
+                    "ANNEAL_LEAN_TIMEOUT_SEC": "77",
+                },
+            )
         )
-        self.assertEqual(env_json.returncode, 0, env_json.stderr)
-        data = json.loads(env_json.stdout)
-        expected_conc = (
-            min(2, data["s_heavy_safe"]) if data["is_cg_capped"] else 2
-        )
+        self._assert_concurrency(data, self._host_bounded(2, data))
         expected_mem = (
             min(3000, data["w_slice_max_mb"]) if data["is_cg_capped"] else 3000
         )
-        self.assertEqual(data["concurrency"], expected_conc)
-        self.assertEqual(data["w_eff"], expected_conc)
-        self.assertEqual(data["build_slots"], expected_conc)
         self.assertEqual(data["memory_max_mb"], expected_mem)
         if data["w_slice_max_mb"] >= 3000:
             self.assertEqual(data["memory_max_mb"], 3000)
         self.assertEqual(data["timeout_sec"], 77)
 
-        # `--unsafe-ignore-cgroup` bypasses the `w_slice_max_mb` cap on explicit
-        # `--memory-max-mb` overrides while keeping `is_cg_capped` and
-        # `s_heavy_safe` concurrency clamping fail-closed.
-        over_cap_mb = data["w_slice_max_mb"] + 1024
-        capped_override = self._cli(
-            "--memory-max-mb",
-            str(over_cap_mb),
-            "--probe",
-            "--json",
-            env_extra={"ANNEAL_WORKTREE_CONCURRENCY": "2"},
+        # `--unsafe-ignore-cgroup` only lifts the `w_slice_max_mb` clamp on an explicit
+        # `--memory-max-mb`.  It neither flips `is_cg_capped` nor un-clamps concurrency, so
+        # the sibling probe reports `is_cg_capped is False` / `concurrency == 2` exactly on
+        # uncapped hosts and stays clamped to `s_heavy_safe` on capped ones.
+        unsafe = self._probe_json(
+            self._cli(
+                "--unsafe-ignore-cgroup",
+                "--probe",
+                "--json",
+                env_extra={"ANNEAL_WORKTREE_CONCURRENCY": "2"},
+            )
         )
-        self.assertEqual(capped_override.returncode, 0, capped_override.stderr)
-        capped_data = json.loads(capped_override.stdout)
+        self.assertIs(unsafe["is_cg_capped"], data["is_cg_capped"])
+        self._assert_concurrency(unsafe, self._host_bounded(2, unsafe))
+
+        over_cap_mb = data["w_slice_max_mb"] + 1024
+        capped_data = self._probe_json(
+            self._cli(
+                "--memory-max-mb",
+                str(over_cap_mb),
+                "--probe",
+                "--json",
+                env_extra={"ANNEAL_WORKTREE_CONCURRENCY": "2"},
+            )
+        )
         self.assertEqual(
             capped_data["memory_max_mb"],
-            capped_data["w_slice_max_mb"]
+            min(over_cap_mb, capped_data["w_slice_max_mb"])
             if capped_data["is_cg_capped"]
             else over_cap_mb,
         )
-        self.assertEqual(capped_data["concurrency"], expected_conc)
+        self._assert_concurrency(capped_data, self._host_bounded(2, capped_data))
 
-        unsafe_override = self._cli(
-            "--unsafe-ignore-cgroup",
-            "--memory-max-mb",
-            str(over_cap_mb),
-            "--probe",
-            "--json",
-            env_extra={"ANNEAL_WORKTREE_CONCURRENCY": "2"},
-        )
-        self.assertEqual(unsafe_override.returncode, 0, unsafe_override.stderr)
-        unsafe_data = json.loads(unsafe_override.stdout)
-        self.assertEqual(unsafe_data["memory_max_mb"], over_cap_mb)
-        self.assertEqual(unsafe_data["is_cg_capped"], data["is_cg_capped"])
-        self.assertEqual(unsafe_data["concurrency"], expected_conc)
-
-        # Populated `$XDG_CONFIG_HOME/anneal/concurrency` is read and subject to
-        # the same host cgroup cap (`min(3, s_heavy_safe)` when capped else `3`).
-        with tempfile.TemporaryDirectory(prefix="anneal-xdg-cfg-") as cfg_dir:
-            cfg_file = Path(cfg_dir) / "anneal" / "concurrency"
-            cfg_file.parent.mkdir(parents=True, exist_ok=True)
-            cfg_file.write_text("3\n", encoding="utf-8")
-            cfg_probe = self._cli(
+        unsafe_data = self._probe_json(
+            self._cli(
+                "--unsafe-ignore-cgroup",
+                "--memory-max-mb",
+                str(over_cap_mb),
                 "--probe",
                 "--json",
-                env_extra={"XDG_CONFIG_HOME": cfg_dir},
+                env_extra={"ANNEAL_WORKTREE_CONCURRENCY": "2"},
             )
-            self.assertEqual(cfg_probe.returncode, 0, cfg_probe.stderr)
-            cfg_data = json.loads(cfg_probe.stdout)
-            expected_cfg_conc = (
-                min(3, cfg_data["s_heavy_safe"])
-                if cfg_data["is_cg_capped"]
-                else 3
+        )
+        self.assertEqual(unsafe_data["memory_max_mb"], over_cap_mb)
+        self.assertIs(unsafe_data["is_cg_capped"], data["is_cg_capped"])
+        self._assert_concurrency(unsafe_data, self._host_bounded(2, unsafe_data))
+
+        # A populated `$XDG_CONFIG_HOME/anneal/concurrency` is read, and is subject to the
+        # same host bound with or without `--unsafe-ignore-cgroup`.
+        with tempfile.TemporaryDirectory(prefix="anneal-xdg-cfg-") as cfg_dir:
+            _write_cgroup_file(Path(cfg_dir) / "anneal" / "concurrency", "3\n")
+            for flags in ((), ("--unsafe-ignore-cgroup",)):
+                cfg_data = self._probe_json(
+                    self._cli(
+                        *flags,
+                        "--probe",
+                        "--json",
+                        env_extra={"XDG_CONFIG_HOME": cfg_dir},
+                    )
+                )
+                self._assert_concurrency(cfg_data, self._host_bounded(3, cfg_data))
+
+        bad_env = self._probe_json(
+            self._cli(
+                "--probe", "--json", env_extra={"ANNEAL_WORKTREE_CONCURRENCY": "abc"}
             )
-            self.assertEqual(cfg_data["concurrency"], expected_cfg_conc)
-            self.assertEqual(cfg_data["w_eff"], expected_cfg_conc)
-            self.assertEqual(cfg_data["build_slots"], expected_cfg_conc)
-
-        bad_env = self._cli(
-            "--probe", "--json", env_extra={"ANNEAL_WORKTREE_CONCURRENCY": "abc"}
         )
-        self.assertEqual(bad_env.returncode, 0, bad_env.stderr)
-        self.assertEqual(json.loads(bad_env.stdout)["concurrency"], 1)
+        self._assert_concurrency(bad_env, 1)
 
-        flags = self._cli(
-            "--concurrency", "1", "--memory-max-mb", "2500", "--timeout", "60",
-            "--probe", "--json",
+        flag_data = self._probe_json(
+            self._cli(
+                "--concurrency", "1", "--memory-max-mb", "2500", "--timeout", "60",
+                "--probe", "--json",
+            )
         )
-        self.assertEqual(flags.returncode, 0, flags.stderr)
-        flag_data = json.loads(flags.stdout)
         self.assertEqual(flag_data["concurrency"], 1)
         self.assertEqual(
             flag_data["memory_max_mb"],
@@ -1108,16 +1338,224 @@ class TestCliSubprocess(unittest.TestCase):
         )
         self.assertEqual(flag_data["timeout_sec"], 60)
 
-        for argv, expected_rc in (
-            (["--mode", "file", "--no-slot-lock", "--concurrency", "1", "--", "true"], 0),
-            (["--mode", "build", "--no-slot-lock", "--concurrency", "1", "--", "true"], 0),
-            (["--no-slot-lock", "--", "sh", "-c", "exit 5"], 5),
-        ):
-            res = self._cli(*argv)
-            self.assertEqual(res.returncode, expected_rc, (argv, res.stderr))
+        # Command-executing runs reconcile `anneal-workloads.slice` under `XDG_CONFIG_HOME`.
+        # Give them a seeded one and check they leave it untouched: no rewrite, hence no
+        # `systemctl --user daemon-reload` of the host's live user manager.
+        with tempfile.TemporaryDirectory(prefix="anneal-cli-run-xdg-") as run_xdg:
+            unit = _seed_workloads_slice_unit(Path(run_xdg))
+            before = None if unit is None else _file_identity(unit)
+            for argv, expected_rc in (
+                (["--mode", "file", "--no-slot-lock", "--concurrency", "1", "--", "true"], 0),
+                (["--mode", "build", "--no-slot-lock", "--concurrency", "1", "--", "true"], 0),
+                (["--no-slot-lock", "--", "sh", "-c", "exit 5"], 5),
+            ):
+                res = self._cli(*argv, env_extra={"XDG_CONFIG_HOME": run_xdg})
+                self.assertEqual(res.returncode, expected_rc, (argv, res.stderr))
+            if unit is not None:
+                self.assertEqual(_file_identity(unit), before)
 
         usage = self._cli()
         self.assertEqual(usage.returncode, 2)
+
+    def test_cli_synthetic_hosts_cover_uncapped_and_capped_regimes(self) -> None:
+        """Both cgroup regimes through the real CLI, whichever host runs the tests.
+
+        The live probes of `test_cli_backward_compatible_probe_and_execution` only ever see
+        the regime of the machine they run on: a cgroup-capped 8 GiB host never reports
+        `is_cg_capped == False`, and an uncapped workstation never exercises the
+        `s_heavy_safe` clamp.  Here the same subprocess CLI runs against synthetic hosts,
+        so `ANNEAL_WORKTREE_CONCURRENCY=2 -> 2` and `$XDG_CONFIG_HOME/anneal/concurrency`
+        `3 -> 3` (uncapped) and both `s_heavy_safe` clamps (capped) hold on every machine.
+        """
+        # host -> concurrency granted for a requested 2 (environment / `--concurrency`)
+        # and for a requested 3 (`$XDG_CONFIG_HOME/anneal/concurrency`).
+        granted = {"cg_uncapped": (2, 3), "cg_capped_1": (1, 1), "cg_capped_2": (2, 2)}
+        with tempfile.TemporaryDirectory(prefix="anneal-synth-host-") as tmp:
+            root = Path(tmp)
+            _write_synthetic_host_base(root)
+            xdg_three = root / "xdg_three"
+            _write_cgroup_file(xdg_three / "anneal" / "concurrency", "3\n")
+            for cg_name, ceiling_mib, capped, s_heavy_safe in SYNTHETIC_HOSTS:
+                _write_synthetic_cgroup_root(root, cg_name, ceiling_mib)
+                conc_for_2, conc_for_3 = granted[cg_name]
+
+                def probe(
+                    *args: str,
+                    env_extra: dict[str, str] | None = None,
+                    cg_name: str = cg_name,
+                ) -> dict[str, Any]:
+                    return self._probe_json(
+                        self._synthetic_cli(
+                            root, cg_name, *args, "--probe", "--json", env_extra=env_extra
+                        )
+                    )
+
+                with self.subTest(host=cg_name):
+                    default = probe()
+                    self.assertIs(default["is_cg_capped"], capped)
+                    self.assertEqual(default["s_heavy_safe"], s_heavy_safe)
+                    self.assertEqual(default["cpu_cores"], SYNTHETIC_HOST_CORES)
+                    self.assertEqual(default["mem_total_mb"], 65536)
+                    self._assert_concurrency(default, 1)
+                    self.assertEqual(default["timeout_sec"], 900)
+                    w_slice_max_mb = default["w_slice_max_mb"]
+                    self.assertGreater(w_slice_max_mb, 3000)
+
+                    overridden = probe(
+                        env_extra={
+                            "ANNEAL_WORKTREE_CONCURRENCY": "2",
+                            "ANNEAL_LEAN_MEMORY_MAX_MB": "3000",
+                            "ANNEAL_LEAN_TIMEOUT_SEC": "77",
+                        }
+                    )
+                    self._assert_concurrency(overridden, conc_for_2)
+                    self.assertEqual(overridden["memory_max_mb"], 3000)
+                    self.assertEqual(overridden["timeout_sec"], 77)
+
+                    unsafe = probe(
+                        "--unsafe-ignore-cgroup",
+                        env_extra={"ANNEAL_WORKTREE_CONCURRENCY": "2"},
+                    )
+                    self.assertIs(unsafe["is_cg_capped"], capped)
+                    self._assert_concurrency(unsafe, conc_for_2)
+
+                    self._assert_concurrency(probe("--concurrency", "2"), conc_for_2)
+
+                    for flags in ((), ("--unsafe-ignore-cgroup",)):
+                        from_file = probe(
+                            *flags, env_extra={"XDG_CONFIG_HOME": str(xdg_three)}
+                        )
+                        self.assertIs(from_file["is_cg_capped"], capped)
+                        self._assert_concurrency(from_file, conc_for_3)
+
+                    over_cap_mb = w_slice_max_mb + 1024
+                    clamped = probe("--memory-max-mb", str(over_cap_mb))
+                    self.assertEqual(
+                        clamped["memory_max_mb"],
+                        w_slice_max_mb if capped else over_cap_mb,
+                    )
+                    lifted = probe(
+                        "--unsafe-ignore-cgroup", "--memory-max-mb", str(over_cap_mb)
+                    )
+                    self.assertEqual(lifted["memory_max_mb"], over_cap_mb)
+                    self.assertIs(lifted["is_cg_capped"], capped)
+                    self._assert_concurrency(lifted, 1)
+
+    def test_scrubbed_prefixes_cover_every_anneal_variable_of_the_script(self) -> None:
+        """An `ANNEAL_*` variable added to `scripts/anneal-lean-run` must be scrubbed too."""
+        names = set(
+            re.findall(r"ANNEAL_[A-Z0-9_]+", SCRIPT_PATH.read_text(encoding="utf-8"))
+        )
+        for known in (
+            "ANNEAL_WORKTREE_CONCURRENCY",
+            "ANNEAL_LEAN_MEMORY_MAX_MB",
+            "ANNEAL_LEAN_TIMEOUT_SEC",
+            "ANNEAL_LEAN_RUN_IN_SCOPE",
+        ):
+            self.assertIn(known, names)
+        self.assertEqual(
+            sorted(n for n in names if not n.startswith(_AMBIENT_ANNEAL_ENV_PREFIXES)),
+            [],
+        )
+
+    def test_cli_isolation_scrubs_poisoned_ambient_environment(self) -> None:
+        """Neither ambient `ANNEAL_*` overrides nor host concurrency files reach `_cli`.
+
+        Runs on an uncapped synthetic host, where a leaked concurrency override would be
+        honored verbatim instead of being hidden by a capped host's `s_heavy_safe == 1` clamp.
+        """
+        ambient_overrides = {
+            "ANNEAL_WORKTREE_CONCURRENCY": "6",
+            "ANNEAL_LEAN_MEMORY_MAX_MB": "1234",
+            "ANNEAL_LEAN_TIMEOUT_SEC": "55",
+        }
+        with tempfile.TemporaryDirectory(prefix="anneal-ambient-") as tmp:
+            root = Path(tmp)
+            _write_synthetic_host_base(root)
+            _write_synthetic_cgroup_root(root, "cg_uncapped", None)
+            poisoned_xdg = root / "poisoned_xdg"
+            _write_cgroup_file(poisoned_xdg / "anneal" / "concurrency", "7\n")
+            poisoned_home = root / "poisoned_home"
+            _write_cgroup_file(
+                poisoned_home / ".config" / "anneal" / "concurrency", "5\n"
+            )
+            poison = {
+                **ambient_overrides,
+                "HOME": str(poisoned_home),
+                "XDG_CONFIG_HOME": str(poisoned_xdg),
+                "ANNEAL_LEAN_RUN_IN_SCOPE": "1",
+                "ANNEAL_LEAN_RUN_ACTIVE": "1",
+                "ANNEAL_LEAN_RUN_LEAN_M_MB": "99",
+                "ANNEAL_LSP_NO_EVICT": "1",
+                "ANNEAL_LSP_SOCKET": str(root / "no-such.sock"),
+                "ANNEAL_OOM_OFFLOAD_CMD": "false",
+            }
+
+            def synthetic(env_extra: dict[str, str] | None = None) -> dict[str, Any]:
+                return self._probe_json(
+                    self._synthetic_cli(
+                        root, "cg_uncapped", "--probe", "--json", env_extra=env_extra
+                    )
+                )
+
+            clean = synthetic()
+            self.assertIs(clean["is_cg_capped"], False)
+            self._assert_concurrency(clean, 1)
+            self.assertEqual(clean["timeout_sec"], 900)
+
+            with mock.patch.dict(os.environ, poison):
+                fresh_xdg = root / "fresh_xdg"
+                env = _isolated_cli_env(fresh_xdg)
+                self.assertEqual(
+                    [k for k in env if k.startswith(_AMBIENT_ANNEAL_ENV_PREFIXES)], []
+                )
+                self.assertEqual(env["XDG_CONFIG_HOME"], str(fresh_xdg))
+                # `env_extra` is applied after the scrub, so explicit overrides survive it.
+                explicit = _isolated_cli_env(
+                    fresh_xdg,
+                    {
+                        "ANNEAL_WORKTREE_CONCURRENCY": "2",
+                        "XDG_CONFIG_HOME": str(poisoned_xdg),
+                    },
+                )
+                self.assertEqual(explicit["ANNEAL_WORKTREE_CONCURRENCY"], "2")
+                self.assertEqual(explicit["XDG_CONFIG_HOME"], str(poisoned_xdg))
+                self.assertNotIn("ANNEAL_LEAN_MEMORY_MAX_MB", explicit)
+                self.assertNotIn("ANNEAL_LEAN_TIMEOUT_SEC", explicit)
+
+                isolated = synthetic()
+                live = self._probe_json(self._cli("--probe", "--json"))
+                direct = (
+                    self._probe_json(
+                        self._run_isolated(
+                            [str(SCRIPT_PATH), "--print-limits", "--json"]
+                        )
+                    )
+                    if os.access(SCRIPT_PATH, os.X_OK)
+                    else None
+                )
+
+            # The synthetic host is deterministic: a poisoned parent changes nothing.
+            self.assertEqual(isolated, clean)
+            for live_data in (live, direct):
+                if live_data is not None:
+                    self._assert_concurrency(live_data, 1)
+                    self.assertEqual(live_data["timeout_sec"], 900)
+
+            # Positive controls: each poison is honored once passed explicitly, so the
+            # equality above is not vacuous.
+            leaked_env = synthetic(env_extra=ambient_overrides)
+            self._assert_concurrency(leaked_env, 6)
+            self.assertEqual(leaked_env["memory_max_mb"], 1234)
+            self.assertEqual(leaked_env["timeout_sec"], 55)
+            leaked_xdg = synthetic(env_extra={"XDG_CONFIG_HOME": str(poisoned_xdg)})
+            self._assert_concurrency(leaked_xdg, 7)
+            # `XDG_CONFIG_HOME=""` falls back to `$HOME/.config`, which the isolated
+            # non-empty `XDG_CONFIG_HOME` of `_cli` therefore masks.
+            leaked_home = synthetic(
+                env_extra={"HOME": str(poisoned_home), "XDG_CONFIG_HOME": ""}
+            )
+            self._assert_concurrency(leaked_home, 5)
 
 
 class TestWorkloadMemoryEnvelopeV2(unittest.TestCase):
@@ -1210,47 +1648,15 @@ class TestWorkloadMemoryEnvelopeV2(unittest.TestCase):
     def test_concurrency_isolation_uncapped_and_capped(self) -> None:
         """Hermetically verifies `XDG_CONFIG_HOME` / `HOME` isolation and
         `ANNEAL_WORKTREE_CONCURRENCY` behavior under both uncapped and cgroup-capped
-        regimes (even when tests run on a 1-slot cgroup-capped capsule)."""
+        regimes (even when tests run on a 1-slot cgroup-capped host)."""
         with tempfile.TemporaryDirectory(prefix="anneal-conc-iso-") as tmp:
             root = Path(tmp)
+            _write_synthetic_host_base(root)
             meminfo = root / "meminfo"
-            meminfo.write_text(
-                "MemTotal:       67108864 kB\nMemAvailable:   50331648 kB\n",
-                encoding="utf-8",
-            )
             proc_cg = root / "proc_cgroup"
-            proc_cg.write_text("0::/user.slice/job.scope\n", encoding="utf-8")
-
-            uncapped_cg = root / "cg_uncapped"
-            _write_cgroup_file(uncapped_cg / "user.slice" / "memory.max", "max\n")
-            _write_cgroup_file(uncapped_cg / "user.slice" / "job.scope" / "memory.max", "max\n")
-            _write_cgroup_file(
-                uncapped_cg / "user.slice" / "job.scope" / "memory.stat",
-                f"anon {512 * MIB}\nshmem 0\nfile {1024 * MIB}\n",
-            )
-
-            capped_1slot_cg = root / "cg_capped_1"
-            _write_cgroup_file(
-                capped_1slot_cg / "user.slice" / "memory.max", f"{12288 * MIB}\n"
-            )
-            _write_cgroup_file(
-                capped_1slot_cg / "user.slice" / "job.scope" / "memory.max", "max\n"
-            )
-            _write_cgroup_file(
-                capped_1slot_cg / "user.slice" / "job.scope" / "memory.stat",
-                f"anon {512 * MIB}\nshmem 0\nfile {1024 * MIB}\n",
-            )
-
-            capped_2slot_cg = root / "cg_capped_2"
-            _write_cgroup_file(
-                capped_2slot_cg / "user.slice" / "memory.max", f"{32768 * MIB}\n"
-            )
-            _write_cgroup_file(
-                capped_2slot_cg / "user.slice" / "job.scope" / "memory.max", "max\n"
-            )
-            _write_cgroup_file(
-                capped_2slot_cg / "user.slice" / "job.scope" / "memory.stat",
-                f"anon {512 * MIB}\nshmem 0\nfile {1024 * MIB}\n",
+            uncapped_cg, capped_1slot_cg, capped_2slot_cg = (
+                _write_synthetic_cgroup_root(root, name, ceiling_mib)
+                for name, ceiling_mib, _capped, _s_heavy_safe in SYNTHETIC_HOSTS
             )
 
             fake_home = root / "home"
@@ -1272,7 +1678,7 @@ class TestWorkloadMemoryEnvelopeV2(unittest.TestCase):
                     meminfo_path=meminfo,
                     cgroup_root=uncapped_cg,
                     proc_cgroup_path=proc_cg,
-                    cpu_cores=16,
+                    cpu_cores=SYNTHETIC_HOST_CORES,
                     user_systemd_active=False,
                     runtime_base=root,
                     is_probe=True,
@@ -1301,7 +1707,7 @@ class TestWorkloadMemoryEnvelopeV2(unittest.TestCase):
                     meminfo_path=meminfo,
                     cgroup_root=uncapped_cg,
                     proc_cgroup_path=proc_cg,
-                    cpu_cores=16,
+                    cpu_cores=SYNTHETIC_HOST_CORES,
                     user_systemd_active=False,
                     runtime_base=root,
                     is_probe=True,
@@ -1320,7 +1726,7 @@ class TestWorkloadMemoryEnvelopeV2(unittest.TestCase):
                     meminfo_path=meminfo,
                     cgroup_root=uncapped_cg,
                     proc_cgroup_path=proc_cg,
-                    cpu_cores=16,
+                    cpu_cores=SYNTHETIC_HOST_CORES,
                     user_systemd_active=False,
                     runtime_base=root,
                     is_probe=True,
@@ -1343,7 +1749,7 @@ class TestWorkloadMemoryEnvelopeV2(unittest.TestCase):
                     meminfo_path=meminfo,
                     cgroup_root=capped_1slot_cg,
                     proc_cgroup_path=proc_cg,
-                    cpu_cores=16,
+                    cpu_cores=SYNTHETIC_HOST_CORES,
                     user_systemd_active=False,
                     runtime_base=root,
                     is_probe=True,
@@ -1357,7 +1763,7 @@ class TestWorkloadMemoryEnvelopeV2(unittest.TestCase):
                     meminfo_path=meminfo,
                     cgroup_root=capped_1slot_cg,
                     proc_cgroup_path=proc_cg,
-                    cpu_cores=16,
+                    cpu_cores=SYNTHETIC_HOST_CORES,
                     user_systemd_active=False,
                     runtime_base=root,
                     is_probe=True,
@@ -1369,7 +1775,7 @@ class TestWorkloadMemoryEnvelopeV2(unittest.TestCase):
                     meminfo_path=meminfo,
                     cgroup_root=capped_1slot_cg,
                     proc_cgroup_path=proc_cg,
-                    cpu_cores=16,
+                    cpu_cores=SYNTHETIC_HOST_CORES,
                     user_systemd_active=False,
                     runtime_base=root,
                     is_probe=True,
@@ -1390,7 +1796,7 @@ class TestWorkloadMemoryEnvelopeV2(unittest.TestCase):
                     meminfo_path=meminfo,
                     cgroup_root=capped_2slot_cg,
                     proc_cgroup_path=proc_cg,
-                    cpu_cores=16,
+                    cpu_cores=SYNTHETIC_HOST_CORES,
                     user_systemd_active=False,
                     runtime_base=root,
                     is_probe=True,

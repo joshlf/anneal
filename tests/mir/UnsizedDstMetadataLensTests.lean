@@ -2186,17 +2186,35 @@ theorem ptrToPtr_spatialPin_scalarAddr_and_negative_canaries :
 
 /-! ## 8. Automated `run_cmd` Axiom & Reachability Audit -/
 
-/-! Audits every declaration in the closed span-inclusive anchor intervals
-`[startAnchor.range.pos.line, endAnchor.range.endPos.line]` across `Anneal.MirLiftCore`
-(`[updateBorrowPerm_tag, mirStep_assign_cast_ptrToPtr_wide_to_wide]`), `Anneal.SepLogicLenses`
+/-! Audits every declaration with a source range whose first line lies in the closed
+span-inclusive anchor interval `[startAnchor.range.pos.line, endAnchor.range.endPos.line]` of
+`Anneal.MirLiftCore` (`[updateBorrowPerm_tag, mirStep_assign_cast_ptrToPtr_wide_to_wide]`),
+`Anneal.SepLogicLenses`
 (`[WidePtrVal.dataVal, UnsizedSliceDstAt.evalRvalue_cast_ptrToPtr_wide_to_wide]`), and
 `Anneal.PureLift.V2026_06_01Bridge`
-(`[stdWideSliceVal, mirStep_assign_cast_ptrToPtr_wide_to_wide_preserves_spatialPin]`), using
-`endRange.range.endPos.line` so auxiliary `_proof_*` / matcher constants generated inside
-`endAnchor`'s body are included while any declarations appended after `endAnchor` ends are excluded.
-Fails closed if any anchor is missing, belongs to the wrong module, is misordered, or was not
-audited, or if any declaration violates constructive-axiom, projection-discipline, or reachability
-invariants. -/
+(`[stdWideSliceVal, mirStep_assign_cast_ptrToPtr_wide_to_wide_preserves_spatialPin]`). The upper
+bound is the *last* line of `endAnchor`'s declaration range, so `endAnchor` and every ranged
+declaration nested in its span are included, while declarations appended after `endAnchor` start
+on a later line and are excluded.
+
+Seam: the first two intervals start at the exclusive end anchors of
+`MirSliceWidePtrLensTests.lean`. Each also names `prevAnchor`, the last top-level declaration
+audited by that file (its `lastAnchor`), and no declaration may start between `prevAnchor` and
+`startAnchor`. Together the two audits therefore cover those modules from that file's start
+anchors through these end anchors without gap or overlap, and moving the boundary in only one of
+the two files, or adding a declaration at the boundary, fails here or there.
+(`V2026_06_01Bridge` has no such neighbor.)
+
+Fails closed if an anchor is missing, has no source range, belongs to the wrong module, is
+misordered, or was not audited; if any declaration spans an interval boundary (so both boundaries
+are clean cuts between top-level declarations) or starts between `prevAnchor` and `startAnchor`;
+or if any declaration violates the constructive-axiom, projection-discipline, or reachability
+invariants.
+
+Compiler-generated auxiliaries without a source range (`_proof_*`, `match_*`, `_f`, equation
+lemmas) are not counted: `collectAxioms` is transitive, so their axioms are audited through the
+declarations that use them; the projection-discipline check follows matchers explicitly, and the
+reachability search walks through them. -/
 open Lean Elab Command in
 run_cmd do
   let env ← getEnv
@@ -2206,12 +2224,17 @@ run_cmd do
   let mut theorems : Nat := 0
   let mut auditedThms : Array Name := #[]
   let mut modIdxs : Array ModuleIdx := #[]
-  for (modName, startAnchor, endAnchor, minCount) in
-      [(`Anneal.MirLiftCore, ``Anneal.MirLiftCore.updateBorrowPerm_tag,
+  for (modName, prevAnchor?, startAnchor, endAnchor, minCount) in
+      [(`Anneal.MirLiftCore,
+          some ``Anneal.MirLiftCore.mirWpConverges_nil_narrow_of_closed_poly_clean,
+          ``Anneal.MirLiftCore.updateBorrowPerm_tag,
           ``Anneal.MirLiftCore.mirStep_assign_cast_ptrToPtr_wide_to_wide, 100),
-       (`Anneal.SepLogicLenses, ``Anneal.SepLogicLenses.WidePtrVal.dataVal,
+       (`Anneal.SepLogicLenses,
+          some ``Anneal.SepLogicLenses.ActiveTypedSliceMutBorrow.derefWriteWithLayouts_single,
+          ``Anneal.SepLogicLenses.WidePtrVal.dataVal,
           ``Anneal.SepLogicLenses.UnsizedSliceDstAt.evalRvalue_cast_ptrToPtr_wide_to_wide, 60),
-       (`Anneal.PureLift.V2026_06_01Bridge, ``Anneal.PureLift.V2026_06_01Bridge.stdWideSliceVal,
+       (`Anneal.PureLift.V2026_06_01Bridge, none,
+          ``Anneal.PureLift.V2026_06_01Bridge.stdWideSliceVal,
           ``Anneal.PureLift.V2026_06_01Bridge.mirStep_assign_cast_ptrToPtr_wide_to_wide_preserves_spatialPin, 40)] do
     let some modIdx := env.getModuleIdx? modName | throwError "module {modName} not imported"
     modIdxs := modIdxs.push modIdx
@@ -2225,12 +2248,36 @@ run_cmd do
     let endLine := endRange.range.endPos.line
     if endRange.range.pos.line < startLine || endLine < endRange.range.pos.line then
       throwError "{modName}: invalid anchor range [{startLine}, {endLine}] for {startAnchor} .. {endAnchor}"
+    -- `(prevAnchor, last line of its declaration range)` for intervals with a seam neighbor.
+    let mut prev? : Option (Name × Nat) := none
+    if let some prevAnchor := prevAnchor? then
+      unless env.getModuleIdxFor? prevAnchor == some modIdx do
+        throwError "previous anchor {prevAnchor} does not belong to module {modName}"
+      let some prevRange ← findDeclarationRanges? prevAnchor | throwError "no range for {prevAnchor}"
+      let prevEndLine := prevRange.range.endPos.line
+      unless prevEndLine < startLine do
+        throwError "{modName}: previous anchor {prevAnchor} (last line {prevEndLine}) does not end \
+          before start anchor {startAnchor} (line {startLine})"
+      prev? := some (prevAnchor, prevEndLine)
     let mut count : Nat := 0
     let mut modAudited : NameSet := {}
     for (n, ci) in env.constants.map₁.toList do
       if env.getModuleIdxFor? n == some modIdx then
         if let some r ← findDeclarationRanges? n then
-          if startLine ≤ r.range.pos.line && r.range.pos.line ≤ endLine then
+          let declLine := r.range.pos.line
+          let declEndLine := r.range.endPos.line
+          if declLine < startLine && startLine ≤ declEndLine then
+            throwError "{modName}: {n} (lines {declLine}-{declEndLine}) spans start anchor \
+              {startAnchor} (line {startLine})"
+          if let some (prevAnchor, prevEndLine) := prev? then
+            if prevEndLine < declLine && declLine < startLine then
+              throwError "{modName}: {n} (line {declLine}) starts after previous anchor \
+                {prevAnchor} (last line {prevEndLine}) and before start anchor {startAnchor} (line \
+                {startLine}); update the seam here and in MirSliceWidePtrLensTests.lean together"
+          if startLine ≤ declLine && declLine ≤ endLine then
+            if endLine < declEndLine then
+              throwError "{modName}: {n} (lines {declLine}-{declEndLine}) extends past end anchor \
+                {endAnchor} (last line {endLine})"
             if ci.isUnsafe then throwError "unsafe declaration: {n}"
             let axs ← collectAxioms n
             for a in axs do

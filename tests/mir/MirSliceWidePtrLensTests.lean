@@ -1891,14 +1891,30 @@ theorem polyChain_and_empty_intrinsic_narrow_clean_decidable :
 
 /-! ## Kernel axiom audit -/
 
-/-! Audits every declaration in the bounded half-open intervals `[startLine, endLine)` for
-`Anneal.SepLogicLenses` (`[WidePtrVal, WidePtrVal.dataVal)`) and `Anneal.MirLiftCore`
-(`[CalleeEnv, updateBorrowPerm_tag)`), plus every witness in this file: no `unsafe` declaration;
-every module declaration is *constructive* (axioms within `{propext, Quot.sound}`, so no
-`Classical.choice`), and every witness uses only `{propext, Classical.choice, Quot.sound}` (so no
-`sorryAx` and no `Lean.ofReduceBool` / `native_decide` anywhere). Fails closed if any anchor is
-missing, belongs to the wrong module, is misordered, or if fewer declarations than expected are
-found.
+/-! Audits every declaration with a source range whose first line lies in the bounded half-open
+interval `[startLine, endLine)` of `Anneal.SepLogicLenses` (`[WidePtrVal, WidePtrVal.dataVal)`) and
+`Anneal.MirLiftCore` (`[CalleeEnv, updateBorrowPerm_tag)`), plus every witness in this file: no
+`unsafe` declaration; every module declaration is *constructive* (axioms within
+`{propext, Quot.sound}`, so no `Classical.choice`), and every witness uses only
+`{propext, Classical.choice, Quot.sound}` (so no `sorryAx` and no `Lean.ofReduceBool` /
+`native_decide` anywhere). `startLine` / `endLine` are the first lines of the two anchors'
+declaration ranges (doc comment included), so the exclusive end anchor and everything after it
+belong to `UnsizedDstMetadataLensTests.lean`, which starts its intervals at the same anchors.
+
+Seam: each interval also names `lastAnchor`, the last top-level declaration before the exclusive
+end anchor, and no declaration may start between the two. `UnsizedDstMetadataLensTests.lean` names
+the same pair (as `prevAnchor` / `startAnchor`), so moving the boundary in only one of the two
+files, or adding a declaration at the boundary, fails here or there instead of silently leaving
+declarations that neither file audits.
+
+Fails closed if an anchor is missing, has no source range, belongs to the wrong module, or is
+misordered; if the start or last anchor was not audited or the end anchor was; if any declaration
+spans an interval boundary (so both boundaries are clean cuts between top-level declarations) or
+starts after `lastAnchor`; or if fewer declarations than expected are found.
+
+Compiler-generated auxiliaries without a source range (`_proof_*`, `match_*`, `_f`, equation
+lemmas) are not counted: `collectAxioms` is transitive, so their axioms are audited through the
+declarations that use them, and the reachability search below walks through them.
 
 Non-vacuity: additionally fails unless *every* audited module theorem (public or private) is
 reachable from the concrete witnesses of this file, following used constants through auxiliary
@@ -1914,28 +1930,47 @@ run_cmd do
   let mut auditedSet : NameSet := {}
   let mut auditedThms : Array Name := #[]
   let mut modIdxs : Array ModuleIdx := #[]
-  for (modName, startAnchor, endAnchor, minCount) in
+  for (modName, startAnchor, lastAnchor, endAnchor, minCount) in
       [(`Anneal.SepLogicLenses, ``Anneal.SepLogicLenses.WidePtrVal,
+          ``Anneal.SepLogicLenses.ActiveTypedSliceMutBorrow.derefWriteWithLayouts_single,
           ``Anneal.SepLogicLenses.WidePtrVal.dataVal, 100),
        (`Anneal.MirLiftCore, ``Anneal.MirLiftCore.CalleeEnv,
+          ``Anneal.MirLiftCore.mirWpConverges_nil_narrow_of_closed_poly_clean,
           ``Anneal.MirLiftCore.updateBorrowPerm_tag, 185)] do
     let some modIdx := env.getModuleIdx? modName | throwError "module {modName} not imported"
     modIdxs := modIdxs.push modIdx
-    unless env.getModuleIdxFor? startAnchor == some modIdx do
-      throwError "start anchor {startAnchor} does not belong to module {modName}"
-    unless env.getModuleIdxFor? endAnchor == some modIdx do
-      throwError "end anchor {endAnchor} does not belong to module {modName}"
+    for (role, anchor) in [("start", startAnchor), ("last", lastAnchor), ("end", endAnchor)] do
+      unless env.getModuleIdxFor? anchor == some modIdx do
+        throwError "{role} anchor {anchor} does not belong to module {modName}"
     let some startRange ← findDeclarationRanges? startAnchor | throwError "no range for {startAnchor}"
+    let some lastRange ← findDeclarationRanges? lastAnchor | throwError "no range for {lastAnchor}"
     let some endRange ← findDeclarationRanges? endAnchor | throwError "no range for {endAnchor}"
     let startLine := startRange.range.pos.line
+    let lastLine := lastRange.range.pos.line
+    let lastEndLine := lastRange.range.endPos.line
     let endLine := endRange.range.pos.line
     if endLine ≤ startLine then
       throwError "{modName}: invalid anchor range [{startLine}, {endLine}) for {startAnchor} .. {endAnchor}"
+    unless startLine ≤ lastLine && lastEndLine < endLine do
+      throwError "{modName}: last anchor {lastAnchor} (lines {lastLine}-{lastEndLine}) does not lie \
+        inside [{startLine}, {endLine}) of {startAnchor} .. {endAnchor}"
     let mut count : Nat := 0
     for (n, ci) in env.constants.map₁.toList do
       if env.getModuleIdxFor? n == some modIdx then
         if let some r ← findDeclarationRanges? n then
-          if startLine ≤ r.range.pos.line && r.range.pos.line < endLine then
+          let declLine := r.range.pos.line
+          let declEndLine := r.range.endPos.line
+          if declLine < startLine && startLine ≤ declEndLine then
+            throwError "{modName}: {n} (lines {declLine}-{declEndLine}) spans start anchor \
+              {startAnchor} (line {startLine})"
+          if startLine ≤ declLine && declLine < endLine then
+            if endLine ≤ declEndLine then
+              throwError "{modName}: {n} (lines {declLine}-{declEndLine}) spans exclusive end \
+                anchor {endAnchor} (line {endLine})"
+            if lastEndLine < declLine then
+              throwError "{modName}: {n} (line {declLine}) starts after last anchor {lastAnchor} \
+                (last line {lastEndLine}) and before exclusive end anchor {endAnchor} (line \
+                {endLine}); update the seam here and in UnsizedDstMetadataLensTests.lean together"
             if ci.isUnsafe then throwError "unsafe declaration: {n}"
             let axs ← collectAxioms n
             for a in axs do
@@ -1948,6 +1983,8 @@ run_cmd do
               auditedThms := auditedThms.push n
     unless auditedSet.contains startAnchor do
       throwError "{modName}: start anchor {startAnchor} was not audited"
+    unless auditedSet.contains lastAnchor do
+      throwError "{modName}: last anchor {lastAnchor} was not audited"
     if auditedSet.contains endAnchor then
       throwError "{modName}: exclusive end anchor {endAnchor} was unexpectedly audited"
     if count < minCount then
