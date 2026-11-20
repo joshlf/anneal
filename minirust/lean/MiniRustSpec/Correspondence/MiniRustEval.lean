@@ -8701,8 +8701,14 @@ theorem checkPtr_congr_mach {M1 M2 : Mach} (hmem : M1.mem = M2.mem)
     checkPtr ptr ptrTy (some M1) = checkPtr ptr ptrTy (some M2) := by
   have hvl : vtableLookup M1 = vtableLookup M2 := by
     funext p; unfold vtableLookup; rw [hvt, hprog]
+  have hvf : vtableFromPtr M1 = vtableFromPtr M2 := by
+    funext p; unfold vtableFromPtr; rw [hvt, hprog]
+  have hmd : ∀ (pm : Option (Gen.PointerMeta Prov)) (kind : Gen.PointerMetaKind),
+      checkPtrMetadata pm kind (some M1) = checkPtrMetadata pm kind (some M2) := by
+    intro pm kind
+    rcases pm with _ | (_ | _) <;> cases kind <;> simp only [checkPtrMetadata, hvf]
   unfold checkPtr
-  simp only [hvl, hmem]
+  simp only [hvl, hvf, hmd, hmem]
 
 /-- `Machine::check_value` reads only the machine's memory and vtables. -/
 theorem checkValue_congr_mach {M1 M2 : Mach} (hmem : M1.mem = M2.mem)

@@ -125,9 +125,15 @@ here.
   and terminators, including `Terminator::Call` and every intrinsic above.
 
 Everything else returns `Stop.unsupported`, so the interpretation is partial
-but never silently wrong. In particular, `check_ptr` for vtable pointers
-(`PtrType::VTablePtr`) and for safe pointers with provenance when no machine is
-supplied (`m = none` on non-ZST pointees) returns `Stop.unsupported`.
+but never silently wrong. `Machine::check_ptr` and `Machine::check_ptr_metadata`
+are methods of the machine: given a machine (`m = some mach`, which is what every
+`Mach` / `Machine M` execution passes), `checkPtr` / `checkPtrMetadata` (and
+`checkPtrM` / `checkPtrMetadataM`) decide vtable pointers (`PtrType::VTablePtr`,
+`PointerMeta::VTablePointer`) through `Machine::vtable_from_ptr` (`vtableFromPtr`
+/ `vtableFromPtrM`) and safe pointers through `Memory::dereferenceable`. Only the
+machine-free form (`m = none`, used by lemmas about values that do not depend on
+a machine) returns `Stop.unsupported` on vtable pointers, on vtable-pointer
+metadata, and on safe pointers with provenance to non-ZST pointees.
 
 ## Effects
 
@@ -2384,6 +2390,20 @@ def fnFromPtr (m : Mach) (ptr : Val) : Interp Function :=
       | none => ub "invalid pointer for function lookup"
   | _ => ub "trying to look up a function based on a non-pointer value"
 
+/-- `Machine::vtable_from_ptr` (`spec/lang/machine.md`):
+> "fn vtable_from_ptr(&self, ptr: ThinPointer<M::Provenance>) -> Result<VTable> {
+>     let Some((vtable_name, _)) = self.vtable_ptrs.iter().find(|(_, vtable_ptr)| *vtable_ptr == ptr) else {
+>         throw_ub!(\"invalid pointer for vtable lookup\");
+>     };
+>     ret(self.prog.vtables[vtable_name])
+> }"
+A pointer that is not one of the machine's vtable pointers is UB (unlike
+`vtableLookup`, whose `unwrap` makes it a spec panic). -/
+def vtableFromPtr (m : Mach) (ptr : Ptr) : Interp VTable :=
+  match m.vtable_ptrs.entries.find? (fun (_, (vtablePtr : Ptr)) => decide (vtablePtr = ptr)) with
+  | some (vtableName, _) => mapIndex m.prog.vtables vtableName "self.prog.vtables[vtable_name]"
+  | none => ub "invalid pointer for vtable lookup"
+
 /-- `Machine::vtable_lookup` (`spec/lang/machine.md`):
 > "fn vtable_lookup(&self) -> impl Fn(ThinPointer<M::Provenance>) -> VTable + 'static {
 >     // This copies the data to return a static closure, as it is used in mutate functions, which mutably borrow self.
@@ -2439,14 +2459,35 @@ def computeAlign (m : Mach) (layout : LayoutStrategy) (metadata : Option (Pointe
 The integer check is `check_value` at `Type::Int`, inlined (it is
 `ensure_else_ub(int_ty.can_represent(i), ..)`, see `checkValue`). Checking a
 vtable pointer needs the machine's vtables (`Machine::vtable_from_ptr`), so it
-is outside the fragment. -/
-def checkPtrMetadata (ptrMeta : Option (PointerMeta Prov)) (kind : PointerMetaKind) : Interp Unit :=
+is decided when a machine `m` is supplied. The recursive call
+`self.check_ptr(ptr.widen(None), PtrType::VTablePtr(trait_name))` is inlined:
+of `check_ptr`, the address bound check applies to `ptr.addr`,
+`check_ptr_metadata(None, PointerMetaKind::None)` is `Ok` (`ptr.widen(None)`
+has no metadata and `PtrType::VTablePtr(_).meta_kind()` is
+`PointerMetaKind::None`), `PtrType::VTablePtr(_).safe_pointee()` is `None`, and
+the `PtrType::VTablePtr(trait_name)` branch is
+> "let vtable = self.vtable_from_ptr(ptr.thin_pointer)?;
+>  ensure_else_ub(vtable.trait_name == trait_name, \"Value::Ptr: invalid vtable in metadata\")?;"
+(`checkPtrMetadata_vtablePointer_eq_checkPtr` in `Correspondence.VTablePtr`
+proves that the inlined check is `checkPtr (ptr.widen none) (.VTablePtr
+trait_name) (some m)`). Without a machine (`m = none`) the vtable case is
+outside the fragment. -/
+def checkPtrMetadata (ptrMeta : Option (PointerMeta Prov)) (kind : PointerMetaKind)
+    (m : Option Mach := none) : Interp Unit :=
   match ptrMeta, kind with
   | none, .None => pure ()
   | some (.ElementCount num), .ElementCount =>
     ensureElseUb (IntType.can_represent IntType.usize_ty num) "Value::Int: invalid integer value"
-  | some (.VTablePointer _), .VTablePointer _ =>
-    unsupported "check_ptr_metadata for vtable pointer metadata (Machine::vtable_from_ptr)"
+  | some (.VTablePointer ptr), .VTablePointer traitName =>
+    match m with
+    | some mach => do
+      ensureElseUb (inBounds ptr.addr .Unsigned x86_64.PTR_SIZE)
+        "Value::Ptr: pointer out-of-bounds"
+      let vtable ← vtableFromPtr mach ptr
+      ensureElseUb (decide (vtable.trait_name = traitName))
+        "Value::Ptr: invalid vtable in metadata"
+    | none =>
+      unsupported "check_ptr_metadata for vtable pointer metadata (Machine::vtable_from_ptr)"
   | _, _ => ub "Value::Ptr: invalid metadata"
 
 /-- `Machine::check_ptr` (`spec/lang/representation.md`):
@@ -2475,7 +2516,10 @@ def checkPtrMetadata (ptrMeta : Option (PointerMeta Prov)) (kind : PointerMetaKi
 >
 >         // However, we do not care about the data stored wherever this pointer points to.
 >     } else if let PtrType::VTablePtr(trait_name) = ptr_ty {
->         ..
+>         // This is a \"stand-alone\" vtable pointer, something that does not exist
+>         // in surface Rust. Ensure that it points to an allocated vtable for the correct trait.
+>         let vtable = self.vtable_from_ptr(ptr.thin_pointer)?;
+>         ensure_else_ub(vtable.trait_name == trait_name, \"Value::Ptr: invalid vtable in metadata\")?;
 >     }
 >
 >     Ok(())
@@ -2485,11 +2529,13 @@ metadata is well formed; nothing is required of its provenance or of the
 memory it points to. A safe pointer (`PtrType::Ref` or `PtrType::Box`) must
 also have a pointee size fitting in `isize::MAX`, a non-null aligned address,
 an inhabited pointee, and dereferenceable memory (`CM.dereferenceable` when a
-machine `m` is supplied). -/
+machine `m` is supplied). A stand-alone vtable pointer (`PtrType::VTablePtr`)
+must be one of the machine's vtable pointers, for a vtable of the named trait
+(`vtableFromPtr` when a machine `m` is supplied). -/
 def checkPtr (ptr : Pointer Prov) (ptrTy : PtrType) (m : Option Mach := none) : Interp Unit := do
   ensureElseUb (inBounds ptr.thin_pointer.addr .Unsigned x86_64.PTR_SIZE)
     "Value::Ptr: pointer out-of-bounds"
-  checkPtrMetadata ptr.metadata (PtrType.meta_kind ptrTy)
+  checkPtrMetadata ptr.metadata (PtrType.meta_kind ptrTy) m
   match PtrType.safe_pointee ptrTy with
   | some pointee => do
     let lookup : Ptr → Interp VTable := match m with
@@ -2518,7 +2564,13 @@ def checkPtr (ptr : Pointer Prov) (ptrTy : PtrType) (m : Option Mach := none) : 
         | some _ => unsupported "check_ptr for a safe pointer (Memory::dereferenceable)"
   | none =>
     match ptrTy with
-    | .VTablePtr _ => unsupported "check_ptr for a vtable pointer (Machine::vtable_from_ptr)"
+    | .VTablePtr traitName =>
+      match m with
+      | some mach => do
+        let vtable ← vtableFromPtr mach ptr.thin_pointer
+        ensureElseUb (decide (vtable.trait_name = traitName))
+          "Value::Ptr: invalid vtable in metadata"
+      | none => unsupported "check_ptr for a vtable pointer (Machine::vtable_from_ptr)"
     | _ => pure ()
 
 mutual
@@ -7167,6 +7219,20 @@ def tryMutateCurFrameM {M : Type} [Memory M] (m : Machine M)
 def jumpToBlockM {M : Type} [Memory M] (m : Machine M) (b : BbName) : Interp (Machine M) :=
   mutateCurFrameM m (fun fr => { fr with next_block := b, next_stmt := 0 })
 
+/-- Polymorphic `Machine::vtable_from_ptr` (`spec/lang/machine.md`); see `vtableFromPtr`:
+> "fn vtable_from_ptr(&self, ptr: ThinPointer<M::Provenance>) -> Result<VTable> {
+>     let Some((vtable_name, _)) = self.vtable_ptrs.iter().find(|(_, vtable_ptr)| *vtable_ptr == ptr) else {
+>         throw_ub!(\"invalid pointer for vtable lookup\");
+>     };
+>     ret(self.prog.vtables[vtable_name])
+> }" -/
+def vtableFromPtrM {M : Type} [Memory M] [MemoryOps M] (m : Machine M)
+    (ptr : ThinPointer (Memory.Provenance M)) : Interp VTable :=
+  match m.vtable_ptrs.entries.find?
+      (fun (_, (vtablePtr : ThinPointer (Memory.Provenance M))) => decide (vtablePtr = ptr)) with
+  | some (vtableName, _) => mapIndex m.prog.vtables vtableName "self.prog.vtables[vtable_name]"
+  | none => ub "invalid pointer for vtable lookup"
+
 /-- Polymorphic `Machine::vtable_lookup` (`spec/lang/machine.md`); see `vtableLookup`:
 > "fn vtable_lookup(&self) -> impl Fn(ThinPointer<M::Provenance>) -> VTable + 'static {
 >     // This copies the data to return a static closure, as it is used in mutate functions, which mutably borrow self.
@@ -7219,15 +7285,27 @@ see `checkPtrMetadata`:
 >     };
 >
 >     Ok(())
-> }" -/
-def checkPtrMetadataM {Provenance : Type} (ptrMeta : Option (PointerMeta Provenance))
-    (kind : PointerMetaKind) : Interp Unit :=
+> }"
+As in `checkPtrMetadata`, the vtable case inlines
+`self.check_ptr(ptr.widen(None), PtrType::VTablePtr(trait_name))` when a machine
+`m` is supplied (`vtableFromPtrM`), and is outside the fragment without one. -/
+def checkPtrMetadataM {M : Type} [Memory M] [MemoryOps M]
+    (ptrMeta : Option (PointerMeta (Memory.Provenance M)))
+    (kind : PointerMetaKind) (m : Option (Machine M) := none) : Interp Unit :=
   match ptrMeta, kind with
   | none, .None => pure ()
   | some (.ElementCount num), .ElementCount =>
     ensureElseUb (IntType.can_represent IntType.usize_ty num) "Value::Int: invalid integer value"
-  | some (.VTablePointer _), .VTablePointer _ =>
-    unsupported "check_ptr_metadata for vtable pointer metadata (Machine::vtable_from_ptr)"
+  | some (.VTablePointer ptr), .VTablePointer traitName =>
+    match m with
+    | some mach => do
+      ensureElseUb (inBounds ptr.addr .Unsigned x86_64.PTR_SIZE)
+        "Value::Ptr: pointer out-of-bounds"
+      let vtable ← vtableFromPtrM mach ptr
+      ensureElseUb (decide (vtable.trait_name = traitName))
+        "Value::Ptr: invalid vtable in metadata"
+    | none =>
+      unsupported "check_ptr_metadata for vtable pointer metadata (Machine::vtable_from_ptr)"
   | _, _ => ub "Value::Ptr: invalid metadata"
 
 /-- Polymorphic `Machine::check_ptr` (`spec/lang/representation.md`); see `checkPtr`:
@@ -7256,7 +7334,10 @@ def checkPtrMetadataM {Provenance : Type} (ptrMeta : Option (PointerMeta Provena
 >
 >         // However, we do not care about the data stored wherever this pointer points to.
 >     } else if let PtrType::VTablePtr(trait_name) = ptr_ty {
->         ..
+>         // This is a \"stand-alone\" vtable pointer, something that does not exist
+>         // in surface Rust. Ensure that it points to an allocated vtable for the correct trait.
+>         let vtable = self.vtable_from_ptr(ptr.thin_pointer)?;
+>         ensure_else_ub(vtable.trait_name == trait_name, \"Value::Ptr: invalid vtable in metadata\")?;
 >     }
 >
 >     Ok(())
@@ -7265,7 +7346,7 @@ def checkPtrM {M : Type} [Memory M] [MemoryOps M] (ptr : Pointer (Memory.Provena
     (ptrTy : PtrType) (m : Option (Machine M) := none) : Interp Unit := do
   ensureElseUb (inBounds ptr.thin_pointer.addr .Unsigned x86_64.PTR_SIZE)
     "Value::Ptr: pointer out-of-bounds"
-  checkPtrMetadataM ptr.metadata (PtrType.meta_kind ptrTy)
+  checkPtrMetadataM ptr.metadata (PtrType.meta_kind ptrTy) m
   match PtrType.safe_pointee ptrTy with
   | some pointee => do
     let lookup : ThinPointer (Memory.Provenance M) → Interp VTable := match m with
@@ -7294,7 +7375,13 @@ def checkPtrM {M : Type} [Memory M] [MemoryOps M] (ptr : Pointer (Memory.Provena
         | some _ => unsupported "check_ptr for a safe pointer (Memory::dereferenceable)"
   | none =>
     match ptrTy with
-    | .VTablePtr _ => unsupported "check_ptr for a vtable pointer (Machine::vtable_from_ptr)"
+    | .VTablePtr traitName =>
+      match m with
+      | some mach => do
+        let vtable ← vtableFromPtrM mach ptr.thin_pointer
+        ensureElseUb (decide (vtable.trait_name = traitName))
+          "Value::Ptr: invalid vtable in metadata"
+      | none => unsupported "check_ptr for a vtable pointer (Machine::vtable_from_ptr)"
     | _ => pure ()
 
 mutual

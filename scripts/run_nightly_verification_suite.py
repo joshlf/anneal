@@ -258,11 +258,21 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             # `CastKind.fnPtrToPtr` is evaluated by `evalFnPtrToPtr`
             # (`trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Places.lean`) with a
             # two-sided refinement in `theory/Anneal/Mir/Cast.lean`
-            # (`evalRvalue_cast_fnPtrToPtr_eq` and its `.ok` / `.ub` lemmas) and
-            # kernel-checked tests in `tests/mir/WidePtrSliceFnPtrTests.lean` and
-            # `tests/mir/SymbolicEvalTests.lean`; there is not yet a MiniRustSpec /
-            # LeanMiriSpec step-simulation theorem for it.
-            ("fnPtrToPtr", "supported_and_tested"),
+            # (`evalRvalue_cast_fnPtrToPtr_eq` and its `.ok` / `.ub` lemmas), kernel-checked
+            # tests in `tests/mir/WidePtrSliceFnPtrTests.lean`, `tests/mir/SymbolicEvalTests.lean`
+            # and `tests/mir/UnalignedVolatileVTableTests.lean`, and a MiniRustSpec
+            # correspondence in `minirust/lean/MiniRustSpec/Correspondence/NullaryFnPtrBridge.lean`
+            # (audited as `[NULLARY-FNPTR-AUDIT]` in `MiniRustSpec/Audit.lean`): the two-sided
+            # Trusted characterization `evalRvalue_fnPtrToPtr_ok_iff`, MiniRust's
+            # `PtrType::FnPtr` -> `PtrType::Raw` transmute on `Mach` and every `Machine M`
+            # (`evalUnOp_fnPtrToPtr_ok_iff`, `evalUnOpM_fnPtrToPtr_ok_iff`), preservation of the
+            # function-pointer value relation by the cast on both sides
+            # (`fnPtrToPtr_preserves_FnPtrRel`, `fnPtrToPtr_preserves_FnPtrRel_mach`), and
+            # `trusted_ub_not_FnPtrRel` (a Trusted `.ub` operand is related to no MiniRust
+            # function pointer). The UB locus differs and is proved as a divergence, not parity
+            # (`fnPtrToPtr_data_pointer_divergence`): Trusted faults at the cast on a data
+            # pointer, MiniRust's transmute succeeds and `fn_from_ptr` raises the UB at the call.
+            ("fnPtrToPtr", "proved_corresponding"),
         ],
     },
     {
@@ -5223,8 +5233,10 @@ def _run_step(
 # module they import needs an up-to-date `.olean` before they run; `Anneal.ByteCodec`,
 # `Anneal.Mir.Cast` and `Anneal.Mir.AdtAndControl` are outside the
 # `Trusted`/`Anneal`/`MiniRust` import closure, and so are the `Correspondence` /
-# `MiniRustSpec` modules imported by `MirUntestedVariantCorrespondenceTests.lean`
-# (`Anneal.SepLogicLenses`, `Anneal.MirLoops` and `Anneal.MirFuelFree` are inside it).
+# `MiniRustSpec` modules imported by `MirUntestedVariantCorrespondenceTests.lean` and
+# `UnalignedVolatileVTableTests.lean` (`MiniRustSpec.Correspondence.VTablePtr` imports only
+# `MiniRustSpec.Interp`, which the former's `MiniRustSpec.Correspondence.Translate` already
+# needs; `Anneal.SepLogicLenses`, `Anneal.MirLoops` and `Anneal.MirFuelFree` are inside it).
 MIR_STANDALONE_LEAN_TESTS: tuple[tuple[str, str], ...] = (
     ("tests_mir_bit_validity_stage1", "tests/mir/BitValidityStage1Tests.lean"),
     ("tests_mir_byte_codec", "tests/mir/ByteCodecTests.lean"),
@@ -5233,6 +5245,7 @@ MIR_STANDALONE_LEAN_TESTS: tuple[tuple[str, str], ...] = (
     ("tests_mir_slice_wide_ptr_lens", "tests/mir/MirSliceWidePtrLensTests.lean"),
     ("tests_mir_untested_variant_correspondence", "tests/mir/MirUntestedVariantCorrespondenceTests.lean"),
     ("tests_mir_volatile_unaligned_ptr", "tests/mir/VolatileUnalignedPtrTests.lean"),
+    ("tests_mir_unaligned_volatile_vtable", "tests/mir/UnalignedVolatileVTableTests.lean"),
 )
 CORE_THEORY_LIBS: tuple[str, ...] = ("Trusted", "Anneal", "MiniRust")
 _LOCAL_LEAN_LIB_FALLBACK: tuple[str, ...] = (
@@ -5257,6 +5270,7 @@ _MIR_TEST_MODULE_FALLBACK: tuple[str, ...] = (
     "Correspondence.V2026_06_01.L5_ControlAndCalls",
     "MiniRustSpec.Correspondence.Translate",
     "Trusted.MirSemantics",
+    "MiniRustSpec.Correspondence.VTablePtr",
 )
 _LEAN_HEADER_TOKEN_RE = re.compile(r"(?:«[^»\n]*»|[^\s«])+")
 

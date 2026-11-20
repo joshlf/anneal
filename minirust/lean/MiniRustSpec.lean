@@ -28,7 +28,10 @@ import MiniRustSpec.Correspondence.TbWitness
 import MiniRustSpec.Correspondence.Provenance
 import MiniRustSpec.Correspondence.ProvenanceWitness
 import MiniRustSpec.Correspondence.IntrinsicFallback
+import MiniRustSpec.Correspondence.VTablePtr
 import MiniRustSpec.Correspondence.WideSliceDst
+import MiniRustSpec.Correspondence.VolatileBridge
+import MiniRustSpec.Correspondence.NullaryFnPtrBridge
 import MiniRustSpec.Correspondence.IntrinsicBoundary
 import MiniRustSpec.Audit
 

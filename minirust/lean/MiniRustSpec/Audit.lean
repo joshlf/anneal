@@ -17,6 +17,9 @@ import MiniRustSpec.Correspondence.TbWitness
 import MiniRustSpec.Correspondence.Provenance
 import MiniRustSpec.Correspondence.ProvenanceWitness
 import MiniRustSpec.Correspondence.WideSliceDst
+import MiniRustSpec.Correspondence.VTablePtr
+import MiniRustSpec.Correspondence.VolatileBridge
+import MiniRustSpec.Correspondence.NullaryFnPtrBridge
 import MiniRustSpec.Correspondence.IntrinsicBoundary
 
 /-!
@@ -45,7 +48,14 @@ dereference-copy correspondence lemmas, and `Correspondence.TbWitness` 3-way
 witnesses), `[PROV-AUDIT]` (the MR-3.3 provenance-cast theorems and
 witnesses), `[WIDE-SLICE-DST-AUDIT]` (the wide-slice and unsized DST
 pointer-metadata, layout, indexing, reborrowing, and divergence theorems and
-witnesses of `Correspondence.WideSliceDst`), or `[DEINIT-AUDIT]` (the projected-`Deinit` fragment `inFragmentD`
+witnesses of `Correspondence.WideSliceDst`), `[VTABLE-PTR-AUDIT]` (the
+`Machine::vtable_from_ptr` / `check_ptr` / `check_ptr_metadata` characterizations for vtable
+pointers and trait-object safe pointers on `Mach`, every `Machine M`, and `MachTB`, the
+`Stop.unsupported`-freedom of validity checking with a machine, the `Mach` ↔ `MachTB` agreement
+theorems, and the witnesses of `Correspondence.VTablePtr`), `[VOLATILE-BRIDGE-AUDIT]` (the
+unaligned / volatile raw-pointer intrinsic correspondence of `Correspondence.VolatileBridge`),
+`[NULLARY-FNPTR-AUDIT]` (the `Rvalue::NullaryOp` and `CastKind::FnPtrToPtr` correspondence of
+`Correspondence.NullaryFnPtrBridge`), or `[DEINIT-AUDIT]` (the projected-`Deinit` fragment `inFragmentD`
 of `Correspondence.DeinitWindow`, the `Rvalue::Discriminant` lowering, the
 sub-place audit hook `subplace_audit_closure` of `Correspondence.DeinitBridge`
 — the one `MiniRustSpec` module that imports `Anneal.Mir.AdtAndControl` — and
@@ -5653,6 +5663,7 @@ open MiniRustSpec.Correspondence in
   bdUbChecks_anneal_ret
   bdNullaryOp_translateRvalue
   bdUbChecks_rejected
+  bdNullaryOp_all_variants_minirust
   bdCopy0_anneal_ret
   bdCopy1_anneal_ret
   bdCopy2_anneal_ret
@@ -7139,6 +7150,473 @@ example
 end WideSliceDstStatementPins
 
 end WideSliceDstAuditPins
+
+section VTablePtrAuditPins
+
+open MiniRustSpec
+open MiniRustSpec.Gen
+open MiniRustSpec.LibSpecr
+open MiniRustSpec.Interp
+open MiniRustSpec.Correspondence
+open MiniRustSpec.Correspondence.VTablePtr
+
+/-! `[VTABLE-PTR-AUDIT]` (`[adv ep2-A0]`): every theorem of `Correspondence.VTablePtr` (the
+`Machine::vtable_from_ptr` / `check_ptr` / `check_ptr_metadata` characterizations for vtable
+pointers and trait-object safe pointers on `Mach`, on every `Machine M`, and on `MachTB`, the
+`Stop.unsupported`-freedom of validity checking with a machine, the `Mach` ↔ `MachTB` agreement
+theorems, and their witnesses), the `BasicMemory` transfer lemmas of `Correspondence.Pointers`
+that the closed branches made public, and the `Mach` corollaries of
+`Correspondence.WideSliceDst`. -/
+#check_theorem_deps "[VTABLE-PTR-AUDIT]"
+  VTablePtr.NoUnsupported.ok
+  VTablePtr.NoUnsupported.pure
+  VTablePtr.NoUnsupported.ub
+  VTablePtr.NoUnsupported.specPanic
+  VTablePtr.NoUnsupported.ensureElseUb
+  VTablePtr.NoUnsupported.bind
+  VTablePtr.NoUnsupported.mapIndex
+  VTablePtr.NoUnsupported.forM
+  VTablePtr.vtableFromPtrM_eq
+  VTablePtr.vtableLookupM_eq
+  VTablePtr.vtableFromPtrM_unregistered_ub
+  VTablePtr.vtableFromPtrM_eq_of_first
+  VTablePtr.vtableFromPtrM_eq_ok_iff
+  VTablePtr.vtableFromPtrM_eq_ub_iff
+  VTablePtr.vtableFromPtrM_registered_missing_specPanic
+  VTablePtr.vtableFromPtrM_noUnsupported
+  VTablePtr.vtableLookupM_of_vtableFromPtrM_ok
+  VTablePtr.checkPtrMetadataM_vtablePointer_eq_checkPtrM
+  VTablePtr.checkPtrMetadataM_vtable_kind_mismatch_ub
+  VTablePtr.checkPtrM_oob_ub
+  VTablePtr.checkPtrM_vtablePtr_thin_eq
+  VTablePtr.checkPtrM_vtablePtr_eq_ok_iff
+  VTablePtr.checkPtrM_vtablePtr_metadata_ub
+  VTablePtr.checkPtrM_vtablePtr_unregistered_ub
+  VTablePtr.checkPtrM_vtablePtr_wrong_trait_ub
+  VTablePtr.checkPtrM_traitObject_eq
+  VTablePtr.checkPtrM_traitObject_bad_metadata_ub
+  VTablePtr.safePtrTail_eq_ok_iff
+  VTablePtr.safePtrTail_ub
+  VTablePtr.checkPtrM_traitObject_eq_ok_iff
+  VTablePtr.checkPtrM_traitObject_vtable_cases
+  VTablePtr.vtableLookupM_noUnsupported
+  VTablePtr.compute_size_and_align_noUnsupported
+  VTablePtr.checkPtrMetadataM_noUnsupported
+  VTablePtr.checkPtrM_noUnsupported
+  VTablePtr.checkUnionChunksM_noUnsupported
+  VTablePtr.checkValueM_noUnsupported
+  VTablePtr.checkFieldsM_noUnsupported
+  VTablePtr.checkVariantM_noUnsupported
+  VTablePtr.expect_size_noUnsupported
+  VTablePtr.transmuteM_noUnsupported
+  VTablePtr.evalUnOpM_transmute_noUnsupported
+  VTablePtr.layout_ptr_noUnsupported
+  VTablePtr.listIndex_noUnsupported
+  VTablePtr.BasicMemory.check_ptr_noUnsupported
+  VTablePtr.BM.check_ptr_noUnsupported
+  VTablePtr.derefNoUnsupported_BM
+  VTablePtr.derefNoUnsupported_TBM
+  VTablePtr.checkPtrTB_noUnsupported
+  VTablePtr.checkValueTB_noUnsupported
+  VTablePtr.checkValueBM_noUnsupported
+  VTablePtr.evalUnOpTB_transmute_noUnsupported
+  VTablePtr.vtableFromPtr_eq_vtableFromPtrM
+  VTablePtr.checkPtrMetadata_eq_checkPtrMetadataM
+  VTablePtr.checkPtr_eq_checkPtrM
+  VTablePtr.vtableFromPtr_eq_ok_iff
+  VTablePtr.vtableFromPtr_eq_ub_iff
+  VTablePtr.vtableFromPtr_noUnsupported
+  VTablePtr.checkPtrMetadata_vtablePointer_eq_checkPtr
+  VTablePtr.checkPtr_vtablePtr_eq_ok_iff
+  VTablePtr.checkPtr_vtablePtr_ub
+  VTablePtr.checkPtr_traitObject_eq_ok_iff
+  VTablePtr.checkPtr_noUnsupported
+  VTablePtr.vtableFromPtr_agree
+  VTablePtr.checkPtr_vtablePtr_agree
+  VTablePtr.checkPtr_traitObject_agree
+  VTablePtr.vtableFromPtr_witness
+  VTablePtr.checkPtr_vtablePtr_witness
+  VTablePtr.checkPtr_dynRef_witness
+  VTablePtr.transmute_vtablePtr_witness
+  VTablePtr.vtMach_vtMachTB_agree
+  VTablePtr.vtablePtr_child_path_divergence
+  vtableFromPtrM_bm_eq
+  checkPtrMetadataM_bm_eq
+  checkPtrM_bm_eq
+  WideSliceDst.checkValue_noUnsupported
+  WideSliceDst.transmute_noUnsupported
+  WideSliceDst.evalUnOp_transmute_noUnsupported
+
+namespace VTablePtrStatementPins
+
+example {M : Type} [Memory M] [MemoryOps M] (m : Machine M)
+    (ptr : ThinPointer (Memory.Provenance M)) (vtable : VTable) :
+    vtableFromPtrM m ptr = .ok vtable ↔
+      ∃ name, FirstVTableName m.vtable_ptrs.entries ptr name ∧
+        mapGet m.prog.vtables name = some vtable :=
+  vtableFromPtrM_eq_ok_iff m ptr vtable
+
+example {M : Type} [Memory M] [MemoryOps M] (m : Machine M)
+    (ptr : ThinPointer (Memory.Provenance M)) (msg : String) :
+    vtableFromPtrM m ptr = .error (.ub msg) ↔
+      msg = "invalid pointer for vtable lookup" ∧ ∀ e ∈ m.vtable_ptrs.entries, e.2 ≠ ptr :=
+  vtableFromPtrM_eq_ub_iff m ptr msg
+
+example {M : Type} [Memory M] [MemoryOps M] (m : Machine M)
+    (vp : ThinPointer (Memory.Provenance M)) (traitName : TraitName) :
+    checkPtrMetadataM (some (.VTablePointer vp)) (.VTablePointer traitName) (some m) =
+      checkPtrM (ThinPointer.widen vp none) (.VTablePtr traitName) (some m) :=
+  checkPtrMetadataM_vtablePointer_eq_checkPtrM m vp traitName
+
+example {M : Type} [Memory M] [MemoryOps M] (m : Machine M)
+    (ptr : Pointer (Memory.Provenance M)) (traitName : TraitName) :
+    checkPtrM ptr (.VTablePtr traitName) (some m) = .ok () ↔
+      inBounds ptr.thin_pointer.addr .Unsigned x86_64.PTR_SIZE = true ∧
+      ptr.metadata = none ∧
+      ∃ vtable, vtableFromPtrM m ptr.thin_pointer = .ok vtable ∧
+        vtable.trait_name = traitName :=
+  checkPtrM_vtablePtr_eq_ok_iff m ptr traitName
+
+example {M : Type} [Memory M] [MemoryOps M] (m : Machine M)
+    (ptr : Pointer (Memory.Provenance M)) (ptrTy : PtrType) (pointee : PointeeInfo)
+    (traitName : TraitName)
+    (hsafe : PtrType.safe_pointee ptrTy = some pointee)
+    (hlay : pointee.layout = .TraitObject traitName) :
+    checkPtrM ptr ptrTy (some m) = .ok () ↔
+      inBounds ptr.thin_pointer.addr .Unsigned x86_64.PTR_SIZE = true ∧
+      ∃ vp vtable, ptr.metadata = some (.VTablePointer vp) ∧
+        inBounds vp.addr .Unsigned x86_64.PTR_SIZE = true ∧
+        vtableFromPtrM m vp = .ok vtable ∧ vtable.trait_name = traitName ∧
+        inBounds vtable.size.bytes .Signed x86_64.PTR_SIZE = true ∧
+        ptr.thin_pointer.addr ≠ 0 ∧
+        Align.is_aligned vtable.align ptr.thin_pointer.addr = true ∧
+        pointee.inhabited = true ∧
+        ConcurrentMemory.dereferenceable m.mem ptr.thin_pointer vtable.size = .ok () :=
+  checkPtrM_traitObject_eq_ok_iff m ptr ptrTy pointee traitName hsafe hlay
+
+example {M : Type} [Memory M] [MemoryOps M] (hderef : DerefNoUnsupported M) (m : Machine M)
+    (val : Value M) (ty : Gen.«Type») (w : String) :
+    checkValueM val ty (some m) ≠ .error (.unsupported w) :=
+  checkValueM_noUnsupported hderef m val ty w
+
+example (m : Mach) (val : Val) (ty : Gen.«Type») (w : String) :
+    checkValue val ty (some m) ≠ .error (.unsupported w) :=
+  WideSliceDst.checkValue_noUnsupported m val ty w
+
+example (mt : MachTB) (val : Value TBM) (ty : Gen.«Type») (w : String) :
+    checkValueM val ty (some mt) ≠ .error (.unsupported w) :=
+  checkValueTB_noUnsupported mt val ty w
+
+example (ptr : Pointer Prov) (ptrTy : PtrType) (mo : Option Mach) :
+    checkPtr ptr ptrTy mo = checkPtrM (M := BM) ptr ptrTy mo :=
+  checkPtr_eq_checkPtrM ptr ptrTy mo
+
+example (m : Mach) (ptr : Pointer Prov) (traitName : TraitName) :
+    checkPtr ptr (.VTablePtr traitName) (some m) = .ok () ↔
+      inBounds ptr.thin_pointer.addr .Unsigned x86_64.PTR_SIZE = true ∧
+      ptr.metadata = none ∧
+      ∃ vtable, vtableFromPtr m ptr.thin_pointer = .ok vtable ∧
+        vtable.trait_name = traitName :=
+  checkPtr_vtablePtr_eq_ok_iff m ptr traitName
+
+example (m : Mach) (mt : MachTB) (h : VTablesAgree m mt)
+    (ptr : Pointer TreeBorrowsProvenance) (traitName : TraitName)
+    (hf : PathFaithful mt ptr.thin_pointer) :
+    checkPtr (erasePathPtr ptr) (.VTablePtr traitName) (some m) =
+      checkPtrM ptr (.VTablePtr traitName) (some mt) :=
+  checkPtr_vtablePtr_agree m mt h ptr traitName hf
+
+example (m : Mach) (mt : MachTB) (h : VTablesAgree m mt)
+    (ptr : Pointer TreeBorrowsProvenance) (ptrTy : PtrType) (pointee : PointeeInfo)
+    (traitName : TraitName)
+    (hsafe : PtrType.safe_pointee ptrTy = some pointee)
+    (hlay : pointee.layout = .TraitObject traitName)
+    (hf : ∀ vp, ptr.metadata = some (.VTablePointer vp) → PathFaithful mt vp)
+    (hderef : ∀ size, CM.dereferenceable m.mem (erasePath ptr.thin_pointer) size =
+      ConcurrentMemory.dereferenceable mt.mem ptr.thin_pointer size) :
+    checkPtr (erasePathPtr ptr) ptrTy (some m) = checkPtrM ptr ptrTy (some mt) :=
+  checkPtr_traitObject_agree m mt h ptr ptrTy pointee traitName hsafe hlay hf hderef
+
+end VTablePtrStatementPins
+
+end VTablePtrAuditPins
+
+section VolatileBridgeAuditPins
+
+open Trusted.Effect
+open Trusted.ITree
+open Trusted.Rustc.V2026_06_01
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+open Trusted.Rustc.V2026_06_01.Layout
+open MiniRustSpec
+open MiniRustSpec.Gen
+open MiniRustSpec.LibSpecr
+open MiniRustSpec.Interp
+open MiniRustSpec.Correspondence
+
+/-! `[VOLATILE-BRIDGE-AUDIT]` (`[adv ep2-A0]`): every theorem of `Correspondence.VolatileBridge` (the
+correspondence between the `Trusted` unaligned / volatile raw-pointer intrinsics and MiniRust's
+typed and byte memory model on `Mach` and `MachTB`). -/
+#check_theorem_deps "[VOLATILE-BRIDGE-AUDIT]"
+  VolatileBridge.mr_bm_load_misaligned_ub
+  VolatileBridge.mr_bm_store_misaligned_ub
+  VolatileBridge.mr_tbm_load_misaligned_ub
+  VolatileBridge.mr_tbm_store_misaligned_ub
+  VolatileBridge.mr_bm_load_zero_len_ok
+  VolatileBridge.mr_bm_store_zero_len_ok
+  VolatileBridge.mr_tbm_load_zero_len_ok
+  VolatileBridge.mr_tbm_store_zero_len_ok
+  VolatileBridge.mr_typedLoad_misaligned_ub
+  VolatileBridge.mr_typedStore_misaligned_ub
+  VolatileBridge.mr_typedLoadM_tb_misaligned_ub
+  VolatileBridge.mr_typedStoreM_tb_misaligned_ub
+  VolatileBridge.mr_load_misaligned_ub
+  VolatileBridge.mr_loadTB_misaligned_ub
+  VolatileBridge.mr_store_misaligned_ub
+  VolatileBridge.mr_storeTB_misaligned_ub
+  VolatileBridge.mr_copy_src_misaligned_ub
+  VolatileBridge.mr_copy_dst_misaligned_ub
+  VolatileBridge.mr_copy_zero_misaligned_ub
+  VolatileBridge.mr_set_misaligned_ub
+  VolatileBridge.mr_copyTB_src_misaligned_ub
+  VolatileBridge.mr_copyTB_dst_misaligned_ub
+  VolatileBridge.mr_copyTB_zero_misaligned_ub
+  VolatileBridge.mr_setTB_misaligned_ub
+  VolatileBridge.trusted_unaligned_never_consults_alignment
+  VolatileBridge.trusted_addr_alignment_parity
+  VolatileBridge.trusted_load_misaligned_ub
+  VolatileBridge.trusted_store_misaligned_ub
+  VolatileBridge.trusted_copy_misaligned_ub
+  VolatileBridge.trusted_set_misaligned_ub
+  VolatileBridge.mr_copy_misaligned_error
+  VolatileBridge.mr_copyTB_misaligned_error
+  VolatileBridge.volatile_load_misaligned_parity
+  VolatileBridge.volatile_store_misaligned_parity
+  VolatileBridge.volatile_copy_misaligned_parity
+  VolatileBridge.volatile_set_misaligned_parity
+  VolatileBridge.trustedVolatileAction_spec
+  VolatileBridge.trustedUnlinkedAction_spec
+  VolatileBridge.lockstep_volatile_load_misaligned
+  VolatileBridge.lockstep_volatile_load_zst_misaligned
+  VolatileBridge.lockstep_volatile_store_misaligned
+  VolatileBridge.lockstep_volatile_store_zst_misaligned
+  VolatileBridge.lockstep_volatile_copy_count0_misaligned
+  VolatileBridge.lockstep_volatile_copy_zst_misaligned
+  VolatileBridge.lockstep_volatile_set_count0_and_zst_misaligned
+  VolatileBridge.loadedInt_sound
+  VolatileBridge.loadedIntTB_sound
+  VolatileBridge.storedBytes_sound
+  VolatileBridge.storedBytesTB_sound
+  VolatileBridge.placement_dependent_alignment_witness
+  VolatileBridge.lockstep_unaligned_load_offset1
+  VolatileBridge.lockstep_unaligned_store_offset1
+  VolatileBridge.lockstep_unaligned_out_of_bounds_ub
+  VolatileBridge.lockstep_unaligned_dead_allocation_ub
+  VolatileBridge.lockstep_unaligned_null_nonzst_ub
+  VolatileBridge.divergence_null_zst_read_write_unaligned
+  VolatileBridge.lockstep_unaligned_uninit_ub
+  VolatileBridge.lockstep_tree_borrows_conflict_ub
+  VolatileBridge.lockstep_volatile_copy_dst_src_count_order
+  VolatileBridge.lockstep_volatile_copy_memory_memmove
+  VolatileBridge.lockstep_volatile_set_memory_fill
+  VolatileBridge.overlap_predicate_parity
+  VolatileBridge.lockstep_volatile_copy_nonoverlapping_overlap_ub
+  VolatileBridge.trusted_volatile_load_mmio_unsupported
+  VolatileBridge.trusted_volatile_store_mmio_unsupported
+  VolatileBridge.mr_bm_load_no_provenance_ub
+  VolatileBridge.mr_bm_store_no_provenance_ub
+  VolatileBridge.mr_tbm_load_no_provenance_ub
+  VolatileBridge.mr_tbm_store_no_provenance_ub
+  VolatileBridge.volatile_load_mmio_one_way_soundness
+  VolatileBridge.mirStep_fail_not_noUB
+  VolatileBridge.volatile_store_mmio_one_way_soundness
+  VolatileBridge.mmio_volatile_load_step_unsupported
+  VolatileBridge.mmio_volatile_store_step_unsupported
+  VolatileBridge.mmio_volatile_not_noUB
+  VolatileBridge.mr_endianness_decode_eq_intFromBits
+  VolatileBridge.codec_int_decode_agreement
+  VolatileBridge.tDecodeIsUb_sound
+  VolatileBridge.mDecodeIsInvalid_sound
+  VolatileBridge.codec_bool_validity_all_bytes
+  VolatileBridge.codec_uninit_byte_invalid
+  VolatileBridge.interp_ok_of_toOption
+  VolatileBridge.decodedInt_sound
+  VolatileBridge.lockstep_int_encode_round_trip
+  VolatileBridge.decodedPtr_sound
+  VolatileBridge.lockstep_pointer_bytes_provenance
+  VolatileBridge.lockstep_nonzero_validity
+  VolatileBridge.decodedVariantInt_sound
+  VolatileBridge.lockstep_char_validity
+  VolatileBridge.lockstep_bool_invalid_bit_pattern_ub
+  VolatileBridge.lockstep_never_uninhabited
+  VolatileBridge.mr_bm_check_ptr_in_bounds
+  VolatileBridge.mr_bm_load_in_bounds
+  VolatileBridge.mr_bm_store_in_bounds
+  VolatileBridge.mr_copy_is_memmove
+  VolatileBridge.mr_set_is_fill
+  VolatileBridge.splice_spec
+  VolatileBridge.trusted_encode_le_eq_leBytes
+  VolatileBridge.leValue_leBytes
+  VolatileBridge.codec_int_encode_agreement
+  VolatileBridge.leBytes_length
+  VolatileBridge.codec_int_round_trip
+  VolatileBridge.codec_usize_isize_agreement
+  VolatileBridge.lockstep_mmio_aligned_0x40000000
+  VolatileBridge.trustedActionIsUb_sound
+  VolatileBridge.trustedActionBytes_sound
+  VolatileBridge.lockstep_volatile_copy_memory_exhaustive
+  VolatileBridge.lockstep_volatile_copy_nonoverlapping_exhaustive
+  VolatileBridge.lockstep_volatile_set_memory_exhaustive
+  VolatileBridge.interpIsUb_sound
+  VolatileBridge.trustedActionScalar_sound
+  VolatileBridge.lockstep_unaligned_load_store_exhaustive
+
+end VolatileBridgeAuditPins
+
+section NullaryFnPtrBridgeAuditPins
+
+open Trusted.Effect
+open Trusted.ITree
+open Trusted.Rustc.V2026_06_01
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+open Trusted.Rustc.V2026_06_01.Layout
+open MiniRustSpec
+open MiniRustSpec.Gen
+open MiniRustSpec.LibSpecr
+open MiniRustSpec.Interp
+open MiniRustSpec.Correspondence
+
+/-! `[NULLARY-FNPTR-AUDIT]` (`[adv ep2-A0]`): every theorem of `Correspondence.NullaryFnPtrBridge`
+(the `Rvalue::NullaryOp` and `CastKind::FnPtrToPtr` correspondence between `Trusted` and
+MiniRust on `Mach` and `MachTB`). -/
+#check_theorem_deps "[NULLARY-FNPTR-AUDIT]"
+  NullaryFnPtrBridge.inBounds_usize_iff
+  NullaryFnPtrBridge.encodePtr_inBounds
+  NullaryFnPtrBridge.encodePtr_outOfBounds
+  NullaryFnPtrBridge.decodePtr_encodePtrBytes
+  NullaryFnPtrBridge.layout_fnPtr
+  NullaryFnPtrBridge.layout_thinRawPtr
+  NullaryFnPtrBridge.checkValue_fnPtr_ok_iff
+  NullaryFnPtrBridge.checkValue_fnPtr_oob_ub
+  NullaryFnPtrBridge.checkValue_fnPtr_wide_ub
+  NullaryFnPtrBridge.transmute_fnPtr_thinRaw_ok
+  NullaryFnPtrBridge.evalUnOp_fnPtrToPtr_ok
+  NullaryFnPtrBridge.evalUnOp_fnPtrToPtr_oob_specPanic
+  NullaryFnPtrBridge.evalUnOp_fnPtrToPtr_wide_specPanic
+  NullaryFnPtrBridge.evalUnOp_fnPtrToPtr_ok_iff
+  NullaryFnPtrBridge.fnFromPtr_thin_eq
+  NullaryFnPtrBridge.fnFromPtr_unregistered_ub
+  NullaryFnPtrBridge.fnFromPtr_wide_ub
+  NullaryFnPtrBridge.fnFromPtr_after_fnPtrToPtr
+  NullaryFnPtrBridge.encodePtrM_inBounds
+  NullaryFnPtrBridge.encodePtrM_outOfBounds
+  NullaryFnPtrBridge.decodePtrM_encodePtrBytesM
+  NullaryFnPtrBridge.checkValueM_fnPtr_ok_iff
+  NullaryFnPtrBridge.checkValueM_fnPtr_oob_ub
+  NullaryFnPtrBridge.checkValueM_fnPtr_wide_ub
+  NullaryFnPtrBridge.transmuteM_fnPtr_thinRaw_ok
+  NullaryFnPtrBridge.evalUnOpM_fnPtrToPtr_ok
+  NullaryFnPtrBridge.evalUnOpM_fnPtrToPtr_oob_specPanic
+  NullaryFnPtrBridge.evalUnOpM_fnPtrToPtr_wide_specPanic
+  NullaryFnPtrBridge.evalUnOpM_fnPtrToPtr_ok_iff
+  NullaryFnPtrBridge.fnFromPtrM_thin_eq
+  NullaryFnPtrBridge.fnFromPtrM_unregistered_ub
+  NullaryFnPtrBridge.fnFromPtrM_wide_ub
+  NullaryFnPtrBridge.fnFromPtrM_after_fnPtrToPtr
+  NullaryFnPtrBridge.evalUnOpTB_fnPtrToPtr_ok
+  NullaryFnPtrBridge.evalUnOpBM_fnPtrToPtr_ok
+  NullaryFnPtrBridge.fnPtrValueValid_eq_true_iff
+  NullaryFnPtrBridge.evalFnPtrToPtr_ptr_eq
+  NullaryFnPtrBridge.evalRvalue_fnPtrToPtr_ptr_ok_iff
+  NullaryFnPtrBridge.evalRvalue_fnPtrToPtr_ptr_ub_iff
+  NullaryFnPtrBridge.evalRvalue_fnPtrToPtr_nonPtr_ub
+  NullaryFnPtrBridge.evalRvalue_fnPtrToPtr_unsupported_iff
+  NullaryFnPtrBridge.evalRvalue_fnPtrToPtr_ok_iff
+  NullaryFnPtrBridge.evalRvalue_fnPtrToPtr_borrowed_ub
+  NullaryFnPtrBridge.evalRvalue_fnPtrToPtr_unregistered_ub
+  NullaryFnPtrBridge.evalRvalue_fnPtrToPtr_nonThinTarget_ub
+  NullaryFnPtrBridge.translateTy_thinRawPtr
+  NullaryFnPtrBridge.FnPtrRel.trusted_cast_ok
+  NullaryFnPtrBridge.trusted_ub_not_FnPtrRel
+  NullaryFnPtrBridge.borrowed_not_FnPtrRel
+  NullaryFnPtrBridge.FnPtrRel.minirust_cast_ok
+  NullaryFnPtrBridge.fnPtrToPtr_preserves_FnPtrRel
+  NullaryFnPtrBridge.FnPtrRel.fnFromPtrM_eq
+  NullaryFnPtrBridge.fnPtrToPtr_preserves_FnPtrRel_mach
+  NullaryFnPtrBridge.fnPtrToPtr_data_pointer_divergence
+  NullaryFnPtrBridge.wit_trusted_reify
+  NullaryFnPtrBridge.wit_trusted_fnPtrToPtr_ok
+  NullaryFnPtrBridge.wit_trusted_fnPtrToPtr_wideTarget_ub
+  NullaryFnPtrBridge.wit_mach_lockstep
+  NullaryFnPtrBridge.wit_machTB_lockstep
+  NullaryFnPtrBridge.wit_FnPtrRel
+  NullaryFnPtrBridge.wit_lockstep_preserved
+  NullaryFnPtrBridge.wit_trusted_borrowed_ub
+  NullaryFnPtrBridge.wit_trusted_empty_table_accepts_unregistered
+  NullaryFnPtrBridge.wit_minirust_data_pointer
+  NullaryFnPtrBridge.wit_translateTy_rawUnit
+  NullaryFnPtrBridge.layoutPointerBytes_of_64
+  NullaryFnPtrBridge.maxObjSize_of_64
+  NullaryFnPtrBridge.valid_size_iff
+  NullaryFnPtrBridge.evalNullaryOp_sizeOf_eq
+  NullaryFnPtrBridge.evalNullaryOp_alignOf_eq
+  NullaryFnPtrBridge.evalNullaryOp_offsetOf_eq
+  NullaryFnPtrBridge.evalNullaryOp_ne_ub
+  NullaryFnPtrBridge.evalNullaryOp_ok_state
+  NullaryFnPtrBridge.layout_int_agrees
+  NullaryFnPtrBridge.layout_intArray_agrees
+  NullaryFnPtrBridge.layout_rawPtr_agrees
+  NullaryFnPtrBridge.layout_ref_agrees
+  NullaryFnPtrBridge.layout_box_minirust
+  NullaryFnPtrBridge.layout_tupleSpec
+  NullaryFnPtrBridge.layout_intBoolTuple
+  NullaryFnPtrBridge.layout_ordering
+  NullaryFnPtrBridge.translateTy_eq
+  NullaryFnPtrBridge.translateTy_layout_agrees
+  NullaryFnPtrBridge.nullaryOp_sizeOf_minirust_layout
+  NullaryFnPtrBridge.nullaryOp_sizeOf_ok_iff
+  NullaryFnPtrBridge.nullaryOp_sizeOf_unsupported_iff
+  NullaryFnPtrBridge.nullaryOp_alignOf_minirust_layout
+  NullaryFnPtrBridge.nullaryOp_alignOf_ok_iff
+  NullaryFnPtrBridge.declLayoutCoherent_of_nonAggregate
+  NullaryFnPtrBridge.mrFieldOffset_eq_some_iff
+  NullaryFnPtrBridge.mrPathOffset_single
+  NullaryFnPtrBridge.resolveOffsetOfPath_field
+  NullaryFnPtrBridge.resolveOffsetOfPath_variant_ne_zero
+  NullaryFnPtrBridge.mrFieldOffset_tupleSpec
+  NullaryFnPtrBridge.nullaryOp_offsetOf_field_minirust
+  NullaryFnPtrBridge.nullaryOp_offsetOf_field_out_of_range
+  NullaryFnPtrBridge.nullaryOp_offsetOf_variant_ne_zero_unsupported
+  NullaryFnPtrBridge.resolveOffsetOfPath_spec_path
+  NullaryFnPtrBridge.nullaryOp_offsetOf_path_minirust
+  NullaryFnPtrBridge.declLayoutCoherent_of_same_entry
+  NullaryFnPtrBridge.declLayoutCoherent_of_eval
+  NullaryFnPtrBridge.evalRvalue_nullaryOp_eq
+  NullaryFnPtrBridge.nullaryOp_sizeOf_alignOf_of_minirust_layout
+  NullaryFnPtrBridge.nullaryOp_ubChecks_ok_iff
+  NullaryFnPtrBridge.nullaryOp_ubChecks_nonBool_unsupported
+  NullaryFnPtrBridge.nullaryOp_ubChecks_minirust
+  NullaryFnPtrBridge.ubChecks_minirustM
+  NullaryFnPtrBridge.ubChecks_agrees_iff_session_flag
+  NullaryFnPtrBridge.nullaryOp_contractChecks_unsupported
+  NullaryFnPtrBridge.nullaryOp_contractChecks_minirust_contrast
+  NullaryFnPtrBridge.wit_translateTy_aggregates
+  NullaryFnPtrBridge.wit_declLayoutCoherent
+  NullaryFnPtrBridge.wit_sizeOf_alignOf_primitives
+  NullaryFnPtrBridge.wit_sizeOf_alignOf_aggregates
+  NullaryFnPtrBridge.wit_sizeOf_alignOf_fixedAbi
+  NullaryFnPtrBridge.wit_sizeOf_oversized_unsupported
+  NullaryFnPtrBridge.wit_offsetOf
+  NullaryFnPtrBridge.wit_ubChecks_contractChecks
+  NullaryFnPtrBridge.sizeOf_divergence_size_not_multiple_of_align
+  NullaryFnPtrBridge.sizeOf_divergence_layoutIdx_ignored
+  NullaryFnPtrBridge.sizeOf_unsupported_without_decl
+  NullaryFnPtrBridge.wit_nullaryOp_bodies_reachRet
+  NullaryFnPtrBridge.wit_fnPtrToPtr_body_reachRet
+
+end NullaryFnPtrBridgeAuditPins
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment — as well as every declaration

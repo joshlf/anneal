@@ -6,13 +6,21 @@
 //! and its evaluator never inspect a callee's spelling, so supporting another `rustc` version
 //! means adding another adapter, not touching the semantics. The tables mirror
 //! `Trusted.Rustc.V2026_06_01.MirSemantics`:
-//! - `classifyRustIntrinsic?` (every modeled `core::intrinsics::*` value intrinsic except
-//!   `const_eval_select`, which `rustc` removes before `optimized_mir` and Anneal does not
-//!   model), `isDirectExactDivTarget` (`core::intrinsics::exact_div`), and the memory
-//!   intrinsics `core::intrinsics::copy_nonoverlapping` / `core::intrinsics::write_bytes`
-//!   (which `Trusted` models as statements and leaves as external calls in call form; Anneal
-//!   executes them inline with the statement's semantics) are
-//!   [`RUST_INTRINSIC_DEF_PATHS_V2026_06_01`];
+//! - [`RUST_INTRINSIC_DEF_PATHS_V2026_06_01`] (27 paths, each mapped to the [`IntrinsicOp`] of
+//!   the same name) is `isDirectExactDivTarget` (`core::intrinsics::exact_div`) together with
+//!   26 of the 34 `core::intrinsics::*` paths of `classifyRustIntrinsic?`: its 24 value
+//!   intrinsics and the call forms of the memory intrinsics,
+//!   `core::intrinsics::copy_nonoverlapping` / `core::intrinsics::write_bytes` (which
+//!   `Trusted` evaluates with `evalCopyNonOverlappingCall` / `evalWriteBytesCall`). The other
+//!   8 paths of `classifyRustIntrinsic?` are deliberately not listed:
+//!   - `core::intrinsics::const_eval_select`, which `rustc` removes before `optimized_mir`
+//!     and Anneal does not model;
+//!   - the 7 volatile memory intrinsics (`isVolatileMemIntrinsicKind`), which are
+//!     `Trusted`-only (see below): `core::intrinsics::unaligned_volatile_load`,
+//!     `core::intrinsics::unaligned_volatile_store`, `core::intrinsics::volatile_load`,
+//!     `core::intrinsics::volatile_store`,
+//!     `core::intrinsics::volatile_copy_nonoverlapping_memory`,
+//!     `core::intrinsics::volatile_copy_memory`, and `core::intrinsics::volatile_set_memory`;
 //! - `isUnreachableCallTarget` is [`UNREACHABLE_DEF_PATHS_V2026_06_01`];
 //! - `isAbortingPanicDefPath` is [`ABORTING_PANIC_DEF_PATHS_V2026_06_01`];
 //! - `isUnwindingPanicDefPath` is [`UNWINDING_PANIC_DEF_PATHS_V2026_06_01`];
@@ -29,6 +37,28 @@
 //! Like `Trusted`'s `evalTerminator` (which consults `lookupCallee` before any intrinsic
 //! or panic classification), [`classify_linked_call_target_v2026_06_01`] prefers a body linked
 //! in a [`CallTable`] over these tables.
+//!
+//! # `Trusted`-only paths
+//!
+//! Besides `const_eval_select`, `Trusted` evaluates a direct call of 11 paths inline that
+//! Anneal deliberately does not: the 7 volatile memory intrinsics above
+//! (`evalVolatileMemIntrinsicCall`), for which Anneal has no [`IntrinsicOp`], and the 4
+//! `core::ptr` raw-pointer access functions that `Trusted` evaluates when no body is linked
+//! for them (`evalUnlinkedPtrAccessCall?`: `core::ptr::read_unaligned`,
+//! `core::ptr::write_unaligned`, `core::ptr::read_volatile`, and `core::ptr::write_volatile`),
+//! for which this module has no table. [`lower_intrinsic_kind_v2026_06_01`] is `None` for
+//! each of them, so a direct call of one is a call of an ordinary function
+//! ([`CallTarget::Fn`]): Anneal runs a body linked for it in a [`CallTable`], and otherwise
+//! leaves the call to the caller's call handler or, without one, fails the evaluation
+//! ([`CfgEvalError::UnsupportedCall`], or [`CfgEvalError::UnknownCallee`] under a call
+//! table). It never executes such a call inline. For the 7 volatile memory intrinsics, this
+//! is the Rust counterpart of the Lean theorem
+//! `MiniRustSpec.Correspondence.lintrinsicOp_volatile_lowered_fail_closed`
+//! (`minirust/lean/MiniRustSpec/Correspondence/IntrinsicBoundary.lean`), by which Anneal's
+//! lowered evaluator takes no step on a volatile memory intrinsic.
+//!
+//! [`CfgEvalError::UnsupportedCall`]: crate::lower::cfg::CfgEvalError::UnsupportedCall
+//! [`CfgEvalError::UnknownCallee`]: crate::lower::cfg::CfgEvalError::UnknownCallee
 
 use crate::ir::{CallTarget, CalleeSymbol, IntrinsicOp, PointerCoercionKind, Safety};
 use crate::lower::cfg::CallTable;
@@ -86,8 +116,16 @@ pub fn pointer_coercion_spelling_v2026_06_01(kind: PointerCoercionKind) -> &'sta
         .map_or("", |(tag, _)| tag)
 }
 
-/// `core::intrinsics::*` paths of the inline intrinsics (`classifyRustIntrinsic?`,
-/// `isDirectExactDivTarget`, and the call forms of the memory intrinsics).
+/// `core::intrinsics::*` paths of the inline intrinsics, each with the [`IntrinsicOp`] of the
+/// same name: `isDirectExactDivTarget` (`exact_div`) and the 26 entries of
+/// `classifyRustIntrinsic?` that Anneal executes inline (its 24 value intrinsics and the call
+/// forms of the memory intrinsics, `copy_nonoverlapping` and `write_bytes`).
+///
+/// `classifyRustIntrinsic?` has 34 entries. The other 8 are deliberately absent:
+/// `const_eval_select` (not modeled: `rustc` removes it before `optimized_mir`) and the 7
+/// `Trusted`-only volatile memory intrinsics (`unaligned_volatile_load`,
+/// `unaligned_volatile_store`, `volatile_load`, `volatile_store`,
+/// `volatile_copy_nonoverlapping_memory`, `volatile_copy_memory`, and `volatile_set_memory`).
 pub const RUST_INTRINSIC_DEF_PATHS_V2026_06_01: &[(&str, IntrinsicOp)] = &[
     ("core::intrinsics::ub_checks", IntrinsicOp::UbChecks),
     ("core::intrinsics::arith_offset", IntrinsicOp::ArithOffset),
@@ -187,6 +225,11 @@ pub const UNWINDING_PANIC_DEF_PATHS_V2026_06_01: &[&str] = &[
 /// The inline intrinsic or diverging entry point that `def_path` (a direct callee's canonical
 /// `DefPath`, compared exactly as `Trusted`'s `stringEq`) names in `rustc` `V2026_06_01`, or
 /// `None` for an ordinary function.
+///
+/// It is also `None` for the paths that `Trusted` classifies or evaluates inline and Anneal
+/// deliberately does not: `core::intrinsics::const_eval_select`, the 7 volatile memory
+/// intrinsics of `classifyRustIntrinsic?`, and the 4 `core::ptr` raw-pointer access functions
+/// of `evalUnlinkedPtrAccessCall?` (see the module documentation's `Trusted`-only paths).
 pub fn lower_intrinsic_kind_v2026_06_01(def_path: &str) -> Option<IntrinsicOp> {
     if let Some((_, op)) = RUST_INTRINSIC_DEF_PATHS_V2026_06_01
         .iter()

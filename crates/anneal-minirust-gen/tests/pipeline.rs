@@ -361,8 +361,10 @@ fn anchors_match_generated_items_and_cover_interp() {
     // `Correspondence/PointerWitness.lean`, `Correspondence/RefWitness.lean`,
     // `Correspondence/TbWitness.lean`, `Correspondence/Provenance.lean`,
     // `Correspondence/ProvenanceWitness.lean`,
-    // `Correspondence/IntrinsicFallback.lean`, and
-    // `Correspondence/IntrinsicBoundary.lean` must be explicitly listed in
+    // `Correspondence/IntrinsicFallback.lean`,
+    // `Correspondence/IntrinsicBoundary.lean`, `Correspondence/VTablePtr.lean`,
+    // `Correspondence/VolatileBridge.lean`, and
+    // `Correspondence/NullaryFnPtrBridge.lean` must be explicitly listed in
     // `Audit.lean` so `lake build MiniRustSpec` logs its axioms.
     let audit_text =
         std::fs::read_to_string(minirust_dir().join("lean/MiniRustSpec/Audit.lean")).unwrap();
@@ -376,6 +378,9 @@ fn anchors_match_generated_items_and_cover_interp() {
         "lean/MiniRustSpec/Correspondence/ProvenanceWitness.lean",
         "lean/MiniRustSpec/Correspondence/IntrinsicFallback.lean",
         "lean/MiniRustSpec/Correspondence/IntrinsicBoundary.lean",
+        "lean/MiniRustSpec/Correspondence/VTablePtr.lean",
+        "lean/MiniRustSpec/Correspondence/VolatileBridge.lean",
+        "lean/MiniRustSpec/Correspondence/NullaryFnPtrBridge.lean",
     ] {
         let text = std::fs::read_to_string(minirust_dir().join(rel)).unwrap();
         for line in text.lines() {

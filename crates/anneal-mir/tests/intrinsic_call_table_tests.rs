@@ -366,8 +366,9 @@ fn adt_def(ty: &Ty) -> &Arc<AdtDef> {
 
 #[test]
 fn test_adapter_maps_every_trusted_def_path_and_nothing_else() {
-    // `classifyRustIntrinsic?` (minus `const_eval_select`) + `exact_div` + the memory
-    // intrinsics; `isUnreachableCallTarget`; `isAbortingPanicDefPath`; `isUnwindingPanicDefPath`.
+    // `classifyRustIntrinsic?` (minus `const_eval_select` and the seven `Trusted`-only volatile
+    // memory intrinsics) + `exact_div`; `isUnreachableCallTarget`; `isAbortingPanicDefPath`;
+    // `isUnwindingPanicDefPath`.
     assert_eq!(RUST_INTRINSIC_DEF_PATHS_V2026_06_01.len(), 27);
     assert_eq!(UNREACHABLE_DEF_PATHS_V2026_06_01.len(), 3);
     assert_eq!(ABORTING_PANIC_DEF_PATHS_V2026_06_01.len(), 10);
@@ -438,7 +439,8 @@ fn test_adapter_maps_every_trusted_def_path_and_nothing_else() {
     ] {
         assert_eq!(lower_intrinsic_kind_v2026_06_01(path), Some(op));
     }
-    // Near misses, wrappers, and unmodeled intrinsics are ordinary functions.
+    // Near misses, wrappers, unmodeled intrinsics, and the `Trusted`-only volatile memory
+    // intrinsics and `core::ptr` raw-pointer access functions are ordinary functions.
     for path in [
         "core::intrinsics::const_eval_select",
         "core::ptr::copy_nonoverlapping",
@@ -449,7 +451,11 @@ fn test_adapter_maps_every_trusted_def_path_and_nothing_else() {
         "core::panicking::panic_fmt::other",
         "core::num::<impl u32>::leading_zeros",
         "",
-    ] {
+    ]
+    .into_iter()
+    .chain(TRUSTED_ONLY_VOLATILE_INTRINSIC_DEF_PATHS)
+    .chain(TRUSTED_ONLY_UNLINKED_PTR_ACCESS_DEF_PATHS)
+    {
         assert_eq!(lower_intrinsic_kind_v2026_06_01(path), None, "{path}");
         assert_eq!(lower_call_target_v2026_06_01(path), None);
         assert_eq!(
@@ -5076,51 +5082,291 @@ fn test_b2_unaligned_frame_addr_base_is_rejected_and_multi_depth_out_of_fuel_res
 // A2 regression tests
 // ---------------------------------------------------------------------------------------------
 
-/// The string literals of the Lean definition `def <name>` in `Terminators.lean` (up to the
-/// next top-level declaration or doc comment).
-fn trusted_def_strings(source: &str, name: &str) -> Vec<String> {
-    let header = format!("\ndef {name} ");
-    let start = source
-        .find(&header)
-        .unwrap_or_else(|| panic!("`def {name}` not found in Terminators.lean"));
-    let body = &source[start + header.len()..];
+/// The body of the Lean definition `def <name>` in `Terminators.lean`: the text after its name,
+/// up to the next top-level declaration or doc comment. The name must be followed by whitespace
+/// (a definition whose name only starts with `<name>` does not match) and be defined exactly
+/// once.
+fn trusted_def_body<'a>(source: &'a str, name: &str) -> &'a str {
+    let header = format!("\ndef {name}");
+    let starts: Vec<usize> = source
+        .match_indices(&header)
+        .map(|(at, _)| at + header.len())
+        .filter(|after| source[*after..].starts_with(&[' ', '\n'][..]))
+        .collect();
+    assert_eq!(
+        starts.len(),
+        1,
+        "`def {name}` must be defined exactly once in Terminators.lean"
+    );
+    let body = &source[starts[0]..];
     let end = ["\n/--", "\ndef ", "\ntheorem ", "\n@["]
         .iter()
         .filter_map(|marker| body.find(marker))
         .min()
         .unwrap_or(body.len());
-    body[..end]
-        .split('"')
+    &body[..end]
+}
+
+/// The string literals of the Lean definition `def <name>` in `Terminators.lean` (up to the
+/// next top-level declaration or doc comment), in source order.
+fn trusted_def_strings(source: &str, name: &str) -> Vec<String> {
+    let segments: Vec<&str> = trusted_def_body(source, name).split('"').collect();
+    assert_eq!(
+        segments.len() % 2,
+        1,
+        "unbalanced string literal in `def {name}`"
+    );
+    segments
+        .into_iter()
         .skip(1)
         .step_by(2)
         .map(str::to_owned)
         .collect()
 }
 
+/// The entries of `classifyRustIntrinsic?` in source order: each `DefPath` literal with the
+/// `RustIntrinsicKind` constructor it is classified as
+/// (`match stringEq defPath "<path>" with | true => .some .<kind>`).
+fn trusted_classify_entries(source: &str) -> Vec<(String, String)> {
+    let segments: Vec<&str> = trusted_def_body(source, "classifyRustIntrinsic?")
+        .split('"')
+        .collect();
+    assert_eq!(segments.len() % 2, 1, "unbalanced string literal");
+    (1..segments.len())
+        .step_by(2)
+        .map(|i| {
+            let path = segments[i];
+            assert!(
+                segments[i - 1].ends_with("match stringEq defPath "),
+                "{path} is not compared with `defPath`"
+            );
+            let kind = segments[i + 1]
+                .strip_prefix(" with")
+                .map(str::trim_start)
+                .and_then(|arm| arm.strip_prefix("| true => .some ."))
+                .and_then(|kind| kind.split_whitespace().next())
+                .unwrap_or_else(|| panic!("{path} is not classified as a `.some` kind"));
+            (path.to_owned(), kind.to_owned())
+        })
+        .collect()
+}
+
+/// The `RustIntrinsicKind` constructors that `isVolatileMemIntrinsicKind` maps to `true` (the
+/// kinds that `evalVolatileMemIntrinsicCall` evaluates), in source order.
+fn trusted_volatile_mem_kinds(source: &str) -> Vec<String> {
+    trusted_def_body(source, "isVolatileMemIntrinsicKind")
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("| .")?.strip_suffix(" => true"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The seven volatile memory intrinsics of `classifyRustIntrinsic?` (the `RustIntrinsicKind`s
+/// of `isVolatileMemIntrinsicKind`). Only `Trusted` evaluates them
+/// (`evalVolatileMemIntrinsicCall`): `anneal-mir` has no [`IntrinsicOp`] for them, and its
+/// `V2026_06_01` adapter deliberately leaves them unclassified.
+const TRUSTED_ONLY_VOLATILE_INTRINSIC_DEF_PATHS: [&str; 7] = [
+    "core::intrinsics::unaligned_volatile_load",
+    "core::intrinsics::unaligned_volatile_store",
+    "core::intrinsics::volatile_load",
+    "core::intrinsics::volatile_store",
+    "core::intrinsics::volatile_copy_nonoverlapping_memory",
+    "core::intrinsics::volatile_copy_memory",
+    "core::intrinsics::volatile_set_memory",
+];
+
+/// The four `core::ptr` raw-pointer access functions (ordinary functions, not
+/// `core::intrinsics::*` intrinsics) that only `Trusted` evaluates inline, when no body is
+/// linked for them (`evalUnlinkedPtrAccessCall?`). `anneal-mir` has no table for them.
+const TRUSTED_ONLY_UNLINKED_PTR_ACCESS_DEF_PATHS: [&str; 4] = [
+    "core::ptr::read_unaligned",
+    "core::ptr::write_unaligned",
+    "core::ptr::read_volatile",
+    "core::ptr::write_volatile",
+];
+
+/// Asserts that `anneal-mir` leaves `def_path` (a path that `Trusted` evaluates inline)
+/// unhandled: the `V2026_06_01` adapter classifies it as an ordinary function, it is in no
+/// adapter table, no [`IntrinsicOp`] has its name, and an unlinked call of it never takes an
+/// inline step (without a call handler the evaluation fails closed, with
+/// [`CfgEvalError::UnsupportedCall`] or, under a call table, [`CfgEvalError::UnknownCallee`];
+/// with an external-call handler, the handler is asked about the call by name).
+fn assert_adapter_leaves_trusted_only_def_path_unhandled(def_path: &str) {
+    let symbol = CalleeSymbol::new(def_path);
+    assert_eq!(
+        lower_intrinsic_kind_v2026_06_01(def_path),
+        None,
+        "{def_path}"
+    );
+    assert_eq!(lower_call_target_v2026_06_01(def_path), None, "{def_path}");
+    assert_eq!(
+        classify_call_target_v2026_06_01(def_path),
+        CallTarget::Fn(symbol.clone()),
+        "{def_path}"
+    );
+    assert_eq!(
+        classify_linked_call_target_v2026_06_01(def_path, &CallTable::new()),
+        CallTarget::Fn(symbol.clone()),
+        "{def_path}"
+    );
+    assert!(
+        RUST_INTRINSIC_DEF_PATHS_V2026_06_01
+            .iter()
+            .all(|(path, _)| *path != def_path),
+        "{def_path}"
+    );
+    for table in [
+        UNREACHABLE_DEF_PATHS_V2026_06_01,
+        ABORTING_PANIC_DEF_PATHS_V2026_06_01,
+        UNWINDING_PANIC_DEF_PATHS_V2026_06_01,
+    ] {
+        assert!(!table.contains(&def_path), "{def_path}");
+    }
+    let name = def_path.rsplit("::").next().unwrap();
+    assert!(
+        IntrinsicOp::ALL.iter().all(|op| op.name() != name),
+        "{def_path}"
+    );
+    for pw in PWS {
+        // `fn(_1: u32) -> u32 { bb0: _0 = <def_path>(copy _1) -> bb1; bb1: return }`: the
+        // callee is opaque to Anneal, so the argument and return types are immaterial.
+        let body = lower(
+            &mk(
+                vec![u32_ty(), u32_ty()],
+                vec![
+                    blk(
+                        vec![],
+                        call(
+                            Constant::FnDef(classify_call_target_v2026_06_01(def_path)),
+                            vec![cp(1)],
+                            0,
+                            Some(1),
+                            UnwindAction::Continue,
+                        ),
+                    ),
+                    blk(vec![], Terminator::Return),
+                ],
+            ),
+            pw,
+        );
+        let args = [iv(&u32_ty(), 1, pw)];
+        assert_eq!(
+            eval_lowered_body_cfg(&body, &args, 8),
+            Err(CfgEvalError::UnsupportedCall { bb: 0 }),
+            "{def_path}"
+        );
+        assert_eq!(
+            eval_lowered_body_cfg_with_call_table(&body, &args, 8, &CallTable::new()),
+            Err(CfgEvalError::UnknownCallee {
+                bb: 0,
+                callee: symbol.clone()
+            }),
+            "{def_path}"
+        );
+        let mut external_calls = 0;
+        let outcome = eval_lowered_body_cfg_with_call_table_and_calls(
+            &body,
+            &args,
+            8,
+            &CallTable::new(),
+            |call| {
+                external_calls += 1;
+                assert_eq!(
+                    *call,
+                    ExternalCall {
+                        call_stack: &[],
+                        bb: 0,
+                        callee: Some(&symbol),
+                        func: &MirValue::Unit,
+                        args: &args,
+                    },
+                    "{def_path}"
+                );
+                Ok(CallOutcome::Return(iv(&u32_ty(), 7, pw)))
+            },
+        );
+        assert_eq!(returned(outcome), iv(&u32_ty(), 7, pw), "{def_path}");
+        assert_eq!(external_calls, 1, "{def_path}");
+    }
+}
+
 #[test]
 fn test_a2_adapter_tables_match_trusted_terminators_lean_exactly() {
+    use std::collections::BTreeSet;
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Terminators.lean"
     );
     let source =
         std::fs::read_to_string(path).unwrap_or_else(|err| panic!("cannot read {path}: {err}"));
-    let set = |paths: Vec<String>| paths.into_iter().collect::<std::collections::BTreeSet<_>>();
-    let table_set = |paths: &[&str]| {
-        paths
-            .iter()
-            .map(|p| p.to_string())
-            .collect::<std::collections::BTreeSet<_>>()
-    };
-    // `classifyRustIntrinsic?`: every path but `const_eval_select` (not modeled: `rustc` removes
-    // it before `optimized_mir`) is the intrinsic of the same name.
-    let classify = trusted_def_strings(&source, "classifyRustIntrinsic?");
-    assert_eq!(classify.len(), 25);
-    let mut expected_intrinsics = std::collections::BTreeSet::new();
+    let set = |paths: Vec<String>| paths.into_iter().collect::<BTreeSet<_>>();
+    let table_set = |paths: &[&str]| paths.iter().map(|p| p.to_string()).collect::<BTreeSet<_>>();
+    // `classifyRustIntrinsic?` has exactly 34 entries, all distinct `core::intrinsics::*` paths
+    // classified as distinct `RustIntrinsicKind`s:
+    // - 26 are the intrinsic of the same name here (the 24 value intrinsics and the call forms
+    //   `copy_nonoverlapping` / `write_bytes` of the memory intrinsics);
+    // - 1 is `const_eval_select` (not modeled: `rustc` removes it before `optimized_mir`);
+    // - 7 are the volatile memory intrinsics, which only `Trusted` evaluates.
+    let entries = trusted_classify_entries(&source);
+    let classify: Vec<String> = entries.iter().map(|(path, _)| path.clone()).collect();
+    assert_eq!(
+        classify,
+        trusted_def_strings(&source, "classifyRustIntrinsic?")
+    );
+    assert_eq!(classify.len(), 34);
+    assert_eq!(set(classify.clone()).len(), 34, "path classified twice");
+    let kinds: BTreeSet<&str> = entries.iter().map(|(_, kind)| kind.as_str()).collect();
+    assert_eq!(kinds.len(), 34, "kind classified twice");
+    // The `Trusted`-only volatile memory intrinsics are exactly the seven pinned paths: the
+    // paths that `classifyRustIntrinsic?` classifies as a kind of `isVolatileMemIntrinsicKind`
+    // (the kinds that `evalVolatileMemIntrinsicCall` evaluates).
+    let volatile_kinds = trusted_volatile_mem_kinds(&source);
+    assert_eq!(volatile_kinds.len(), 7);
+    assert_eq!(set(volatile_kinds.clone()).len(), 7, "kind listed twice");
+    let trusted_volatile: BTreeSet<String> = entries
+        .iter()
+        .filter(|(_, kind)| volatile_kinds.contains(kind))
+        .map(|(path, _)| path.clone())
+        .collect();
+    let pinned_volatile = table_set(&TRUSTED_ONLY_VOLATILE_INTRINSIC_DEF_PATHS);
+    assert_eq!(pinned_volatile.len(), 7);
+    assert_eq!(trusted_volatile, pinned_volatile);
+    // Every pinned path is an entry of `classifyRustIntrinsic?` that the adapter leaves `None`
+    // and that no adapter table lists. This is the Rust mirror of the Lean theorem
+    // `lintrinsicOp_volatile_lowered_fail_closed`
+    // (`minirust/lean/MiniRustSpec/Correspondence/IntrinsicBoundary.lean`): Anneal's lowered
+    // evaluator takes no step on a volatile memory intrinsic, so it never claims a
+    // volatile-access step that `Trusted`'s `evalVolatileMemIntrinsicCall` would have to match.
+    for path in TRUSTED_ONLY_VOLATILE_INTRINSIC_DEF_PATHS {
+        assert!(
+            classify.iter().any(|entry| entry == path),
+            "{path} is not in classifyRustIntrinsic?"
+        );
+        assert_eq!(lower_intrinsic_kind_v2026_06_01(path), None, "{path}");
+        assert!(
+            RUST_INTRINSIC_DEF_PATHS_V2026_06_01
+                .iter()
+                .all(|(listed, _)| *listed != path),
+            "{path}"
+        );
+        assert_adapter_leaves_trusted_only_def_path_unhandled(path);
+    }
+    // Every other path but `const_eval_select` is the intrinsic of the same name.
+    let mut expected_intrinsics = BTreeSet::new();
+    let mut not_modeled = 0;
+    let mut trusted_only = 0;
     for path in &classify {
-        let name = path.rsplit("::").next().unwrap();
+        let name = path
+            .strip_prefix("core::intrinsics::")
+            .unwrap_or_else(|| panic!("{path} is not a `core::intrinsics::*` path"));
+        assert_eq!(path.rsplit("::").next(), Some(name), "{path}");
         if name == "const_eval_select" {
             assert_eq!(lower_intrinsic_kind_v2026_06_01(path), None);
+            not_modeled += 1;
+            continue;
+        }
+        if TRUSTED_ONLY_VOLATILE_INTRINSIC_DEF_PATHS.contains(&path.as_str()) {
+            trusted_only += 1;
             continue;
         }
         let op = IntrinsicOp::ALL
@@ -5130,6 +5376,10 @@ fn test_a2_adapter_tables_match_trusted_terminators_lean_exactly() {
         assert_eq!(lower_intrinsic_kind_v2026_06_01(path), Some(op), "{path}");
         expected_intrinsics.insert(path.clone());
     }
+    assert_eq!(
+        (expected_intrinsics.len(), not_modeled, trusted_only),
+        (26, 1, 7)
+    );
     // `isDirectExactDivTarget`.
     let exact_div = trusted_def_strings(&source, "isDirectExactDivTarget");
     assert_eq!(exact_div, vec!["core::intrinsics::exact_div".to_string()]);
@@ -5138,14 +5388,35 @@ fn test_a2_adapter_tables_match_trusted_terminators_lean_exactly() {
         Some(IntrinsicOp::ExactDiv)
     );
     expected_intrinsics.insert(exact_div[0].clone());
-    // The only additions: the call forms of the memory intrinsics (statements in `Trusted`).
-    expected_intrinsics.insert("core::intrinsics::copy_nonoverlapping".into());
-    expected_intrinsics.insert("core::intrinsics::write_bytes".into());
-    let intrinsic_table: std::collections::BTreeSet<String> = RUST_INTRINSIC_DEF_PATHS_V2026_06_01
+    // The adapter adds nothing: the call forms of the memory intrinsics are entries of
+    // `classifyRustIntrinsic?` itself (`.copyNonOverlapping`, `.writeBytes`).
+    for (path, kind) in [
+        (
+            "core::intrinsics::copy_nonoverlapping",
+            "copyNonOverlapping",
+        ),
+        ("core::intrinsics::write_bytes", "writeBytes"),
+    ] {
+        assert!(entries.contains(&(path.to_string(), kind.to_string())));
+        assert!(expected_intrinsics.contains(path), "{path}");
+    }
+    let intrinsic_table: BTreeSet<String> = RUST_INTRINSIC_DEF_PATHS_V2026_06_01
         .iter()
         .map(|(p, _)| p.to_string())
         .collect();
     assert_eq!(intrinsic_table, expected_intrinsics);
+    assert_eq!(RUST_INTRINSIC_DEF_PATHS_V2026_06_01.len(), 27);
+    // `evalUnlinkedPtrAccessCall?`: the four `core::ptr` raw-pointer access functions that
+    // `Trusted` evaluates inline when no body is linked are `Trusted`-only as well.
+    let unlinked_ptr_access = trusted_def_strings(&source, "evalUnlinkedPtrAccessCall?");
+    assert_eq!(unlinked_ptr_access.len(), 4);
+    assert_eq!(
+        set(unlinked_ptr_access),
+        table_set(&TRUSTED_ONLY_UNLINKED_PTR_ACCESS_DEF_PATHS)
+    );
+    for path in TRUSTED_ONLY_UNLINKED_PTR_ACCESS_DEF_PATHS {
+        assert_adapter_leaves_trusted_only_def_path_unhandled(path);
+    }
     // The diverging entry points, exactly.
     assert_eq!(
         set(trusted_def_strings(&source, "isUnreachableCallTarget")),

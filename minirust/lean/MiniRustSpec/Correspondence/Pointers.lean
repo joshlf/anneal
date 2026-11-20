@@ -262,7 +262,8 @@ theorem inBounds_goodSize {sz : Size} (hgood : GoodSize sz.bytes) :
   · rw [h8]; decide
   · rw [h16]; decide
 
-@[simp] theorem checkPtrMetadata_none : checkPtrMetadata none .None = .ok () := rfl
+@[simp] theorem checkPtrMetadata_none {m : Option Mach} :
+    checkPtrMetadata none .None m = .ok () := rfl
 
 @[simp] theorem compute_size_and_align_sized {Provenance : Type}
     (vtables : Gen.ThinPointer Provenance → Interp Gen.VTable) (sz : Size) (al : Align) :
@@ -6970,24 +6971,51 @@ private theorem vtableLookupM_bm_eq (m : Mach) :
   rcases m.vtable_ptrs.entries.find? (fun e : Gen.VTableName × Ptr => decide (e.2 = ptr)) with
     _ | ⟨_, _⟩ <;> rfl
 
-private theorem checkPtrMetadataM_bm_eq (pm : Option (Gen.PointerMeta Prov))
-    (kind : Gen.PointerMetaKind) :
-    checkPtrMetadataM pm kind = checkPtrMetadata pm kind := by
+/-- `Machine::vtable_from_ptr` of the polymorphic machine at `BasicMemory` is `vtableFromPtr`. -/
+theorem vtableFromPtrM_bm_eq (m : Mach) :
+    vtableFromPtrM (M := BM) m = vtableFromPtr m := by
+  funext (ptr : Ptr)
+  unfold vtableFromPtrM vtableFromPtr
+  conv =>
+    lhs
+    rw [find?_eq_of_eq (q := fun e : Gen.VTableName × Ptr => decide (e.2 = ptr))
+      (by intro ⟨_, vp⟩; exact congrArg (@decide (vp = ptr)) (Subsingleton.elim _ _))]
+  conv =>
+    rhs
+    rw [find?_eq_of_eq (q := fun e : Gen.VTableName × Ptr => decide (e.2 = ptr))
+      (by intro ⟨_, vp⟩; rfl)]
+  rcases m.vtable_ptrs.entries.find? (fun e : Gen.VTableName × Ptr => decide (e.2 = ptr)) with
+    _ | ⟨_, _⟩ <;> rfl
+
+/-- `Machine::check_ptr_metadata` of the polymorphic machine at `BasicMemory` is
+`checkPtrMetadata`, with or without a machine (including vtable-pointer metadata). -/
+theorem checkPtrMetadataM_bm_eq (pm : Option (Gen.PointerMeta Prov))
+    (kind : Gen.PointerMetaKind) (m : Option Mach) :
+    checkPtrMetadataM (M := BM) pm kind m = checkPtrMetadata pm kind m := by
   unfold checkPtrMetadataM checkPtrMetadata
-  rcases pm with _ | (_ | _) <;> cases kind <;> rfl
+  rcases pm with _ | (_ | vp) <;> cases kind <;> try rfl
+  cases m with
+  | none => rfl
+  | some mach => dsimp only; rw [vtableFromPtrM_bm_eq]
 
 private theorem cm_dereferenceable_bm_eq (cm : Gen.ConcurrentMemory BM) (ptr : Ptr) (sz : Size) :
     ConcurrentMemory.dereferenceable (M := BM) cm ptr sz =
       CM.dereferenceable cm ptr sz := rfl
 
-private theorem checkPtrM_bm_eq (ptr : Gen.Pointer Prov) (ptrTy : Gen.PtrType)
+/-- `Machine::check_ptr` of the polymorphic machine at `BasicMemory` is `checkPtr`, with or
+without a machine (including stand-alone vtable pointers and trait-object safe pointers). -/
+theorem checkPtrM_bm_eq (ptr : Gen.Pointer Prov) (ptrTy : Gen.PtrType)
     (m : Option Mach) :
     checkPtrM (M := BM) ptr ptrTy m = checkPtr ptr ptrTy m := by
   unfold checkPtrM checkPtr
   refine bind_congr_right _ (fun _ => ?_)
-  refine bind_congr (checkPtrMetadataM_bm_eq _ _) (fun _ => ?_)
+  refine bind_congr (checkPtrMetadataM_bm_eq _ _ _) (fun _ => ?_)
   cases PtrType.safe_pointee ptrTy with
-  | none => cases ptrTy <;> rfl
+  | none =>
+    cases ptrTy <;> try rfl
+    cases m with
+    | none => rfl
+    | some mach => dsimp only; rw [vtableFromPtrM_bm_eq]
   | some pointee =>
     dsimp only
     refine bind_congr ?_ (fun ⟨size, align⟩ => ?_)

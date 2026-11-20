@@ -11,6 +11,8 @@ those terms.
 import Lean
 import MiniRustSpec.Correspondence.IntrinsicFallback
 import MiniRustSpec.Correspondence.DeinitBridge
+import MiniRustSpec.Correspondence.VolatileBridge
+import MiniRustSpec.Correspondence.NullaryFnPtrBridge
 import Trusted.VerificationResult
 
 /-!
@@ -22,8 +24,22 @@ happens to the intrinsic-related MIR constructs outside `progInFragment` (note
 that `StatementKind::Intrinsic(Assume)` *is* now inside `progInFragment`; see
 `Witness.lean`):
 
-1. `Rvalue::NullaryOp(UbChecks)`: Anneal fails closed (`unsupported`), while
-   `minimize` produces a `bool` constant fixed by the compilation session.
+1. `Rvalue::NullaryOp`: Anneal evaluates `SizeOf`, `AlignOf`, `OffsetOf`, and
+   `UbChecks` through `evalNullaryOp` and fails closed (`unsupported`) on
+   `ContractChecks`, while `minimize` has no nullary rvalue (it folds sizes,
+   alignments, and offsets into constants of the translated types and lowers the
+   runtime-check flags to `bool` constants fixed by the compilation session), so the
+   construct stays outside `progInFragment`. Section 1 records the witnesses, and
+   `Correspondence.NullaryFnPtrBridge` (imported here) proves the symbolic
+   correspondence across all `NullOp` variants: `SizeOf` / `AlignOf` against MiniRust's
+   `Type::layout` of the translated type (`nullaryOp_sizeOf_ok_iff`,
+   `nullaryOp_alignOf_ok_iff`, `nullaryOp_sizeOf_minirust_layout`), `OffsetOf` against
+   the tuple field byte offsets (`nullaryOp_offsetOf_field_minirust`,
+   `nullaryOp_offsetOf_path_minirust`), `UbChecks` against the `true` session flag
+   (`nullaryOp_ubChecks_minirust`, `ubChecks_agrees_iff_session_flag`), and
+   `ContractChecks` as fail-closed (`nullaryOp_contractChecks_unsupported`), together
+   with the precise divergences (`sizeOf_divergence_size_not_multiple_of_align`,
+   `sizeOf_divergence_layoutIdx_ignored`, `sizeOf_unsupported_without_decl`).
 2. `StatementKind::Intrinsic(CopyNonOverlapping)`: Anneal executes it, while
    `minimize` aborts translation. With `count = 0` Anneal never checks that
    `src` and `dst` are pointers, and a two-element `u32` copy between two
@@ -87,6 +103,32 @@ both semantics, and `lintrinsicOp_exhaustive_minirust_classification` partitions
 `LIntrinsicOp` constructors across their five correspondence regimes (the seven volatile memory
 intrinsics of `[adv ep1-A0]` are evaluated by `Trusted` only: the lowered evaluator fails closed on
 them, `lintrinsicOp_volatile_lowered_fail_closed`).
+
+`[adv ep2-A0]`: this module also imports the two `Trusted` ↔ MiniRust bridges that do not need
+`Anneal.*` (so they stay outside `DeinitBridge`'s import cone and are audited as
+`[VOLATILE-BRIDGE-AUDIT]` / `[NULLARY-FNPTR-AUDIT]`):
+* `Correspondence.VolatileBridge` relates the `Trusted` evaluation of the 7 volatile memory
+  intrinsics and the 4 unlinked `core::ptr::{read,write}_{unaligned,volatile}` helpers
+  (`evalVolatileMemIntrinsicCall`, `evalUnlinkedPtrAccessCall?`) to MiniRust's typed and byte
+  memory model on `Mach` and `MachTB` (`mrLoad` / `mrStore` / `mrCopy` / `mrSet` and their `TB`
+  twins): two-sided alignment-first UB parity on a shared address for every size including 0
+  (`volatile_load_misaligned_parity`, `volatile_store_misaligned_parity`,
+  `volatile_copy_misaligned_parity`, `volatile_set_misaligned_parity`), little-endian integer
+  codec agreement and round trip at every width (`codec_int_decode_agreement`,
+  `codec_int_encode_agreement`, `codec_int_round_trip`), `bool` validity at all 256 bytes,
+  in-allocation unaligned load / store, memmove, and fill lockstep (including the
+  bounded-exhaustive `lockstep_*_exhaustive` theorems), and one-way soundness on aligned
+  addresses outside all allocations (`volatile_load_mmio_one_way_soundness`,
+  `volatile_store_mmio_one_way_soundness`, `mmio_volatile_not_noUB`); the places where the two
+  semantics differ are proved as divergences (`placement_dependent_alignment_witness`,
+  `divergence_null_zst_read_write_unaligned`).
+* `Correspondence.NullaryFnPtrBridge` covers `Rvalue::NullaryOp` (Section 1) and
+  `CastKind::FnPtrToPtr`: the two-sided `Trusted` characterization
+  (`evalRvalue_fnPtrToPtr_ok_iff`), MiniRust's `PtrType::FnPtr` -> `PtrType::Raw` transmute on
+  `Mach` and every `Machine M` (`evalUnOp_fnPtrToPtr_ok_iff`, `evalUnOpM_fnPtrToPtr_ok_iff`), the
+  function-pointer value relation `FnPtrRel` preserved by the cast on both sides
+  (`fnPtrToPtr_preserves_FnPtrRel`), and the UB-locus divergence
+  (`fnPtrToPtr_data_pointer_divergence`).
 -/
 
 namespace MiniRustSpec.Correspondence
@@ -195,7 +237,12 @@ def bdCallReq? : MirStepNode → Option MirCallReq
   | .vis (.inr (.inr (.call req))) _ => some req
   | _ => none
 
-/-! ## 1. `Rvalue::NullaryOp(UbChecks)` -/
+/-! ## 1. `Rvalue::NullaryOp` (`SizeOf`, `AlignOf`, `OffsetOf`, `UbChecks`, `ContractChecks`)
+
+The concrete `UbChecks` boundary witnesses live here; the symbolic correspondence of every
+`NullOp` variant with MiniRust's `Type::layout`, tuple field offsets, and the `ub_checks`
+session flag is proved in `Correspondence.NullaryFnPtrBridge` (Part A) and restated for this
+module's fixtures by `bdNullaryOp_all_variants_minirust` below. -/
 
 /-- MIR of `fn ub_checks() -> bool`, which reads the `ub_checks` flag:
 ```text
@@ -243,6 +290,40 @@ theorem bdUbChecks_rejected :
     statementOk [boolDecl] (mkStmt (.assign (local_ 0) (.nullaryOp .ubChecks boolTy))) = false ∧
       inFragment bdUbChecksBody = false :=
   ⟨rfl, by decide +kernel⟩
+
+/-- **All `NullOp` variants against MiniRust** (`Correspondence.NullaryFnPtrBridge`, Part A), for
+every state: (1) on a 64-bit layout table whose declaration layouts are coherent with the type's
+own entry, `SizeOf` returns exactly the size of MiniRust's `Type::layout` of the translated type
+when that size is a valid object size, and is `unsupported` otherwise (`AlignOf` and `OffsetOf`:
+`nullaryOp_alignOf_minirust_layout`, `nullaryOp_offsetOf_field_minirust`); (2) `UbChecks` at `bool` is `true`, the value MiniRust's `Constant::Bool(true)`
+evaluates to on every machine; (3) `ContractChecks` is `unsupported` for every type and state
+(fail-closed), never a fabricated value. -/
+theorem bdNullaryOp_all_variants_minirust :
+    (∀ (locals : List LocalSlot) (mem : Memory) (decls : List LocalDecl) (layouts : LayoutTable)
+        (ty : Ty) (mrTy : Gen.«Type»),
+        layouts.pointerBits = 64 →
+        translateTy layouts ty = some mrTy →
+        NullaryFnPtrBridge.DeclLayoutCoherent decls layouts ty →
+        ∃ sz al,
+          Interp.Type.layout mrTy = .ok (.Sized ⟨sz⟩ ⟨al⟩) ∧
+            evalRvalue locals (.nullaryOp .sizeOf ty) mem decls layouts =
+              if x86_64.valid_size ⟨sz⟩ = true then .ok (.scalar ⟨sz, 8⟩) locals mem
+              else .unsupported) ∧
+    (∀ (locals : List LocalSlot) (idx : LayoutIdx) (mem : Memory) (decls : List LocalDecl)
+        (layouts : LayoutTable) (m : Mach),
+        evalRvalue locals (.nullaryOp .ubChecks ⟨.bool, idx⟩) mem decls layouts =
+            .ok (.scalar ⟨1, 1⟩) locals mem ∧
+          evalConstant m (.Bool true) = .ok (.Bool true)) ∧
+    (∀ (locals : List LocalSlot) (ty : Ty) (mem : Memory) (decls : List LocalDecl)
+        (layouts : LayoutTable),
+        evalRvalue locals (.nullaryOp .contractChecks ty) mem decls layouts = .unsupported) :=
+  ⟨fun locals mem decls layouts ty mrTy hbits htr hcoh =>
+      NullaryFnPtrBridge.nullaryOp_sizeOf_minirust_layout locals ty mem decls layouts mrTy
+        hbits htr hcoh,
+    fun locals idx mem decls layouts m =>
+      ⟨(bdNullaryOp_ubChecks_contractChecks locals idx ⟨.bool, idx⟩ mem decls layouts).1, rfl⟩,
+    fun locals ty mem decls layouts =>
+      (bdNullaryOp_ubChecks_contractChecks locals 0 ty mem decls layouts).2⟩
 
 /-! ## 2. `StatementKind::Intrinsic(CopyNonOverlapping)` -/
 

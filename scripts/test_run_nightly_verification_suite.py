@@ -134,7 +134,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         # Exactly the `Trusted.Rustc.V2026_06_01.MirAst` constructors (checked against the Lean
         # inductives by `scripts/audit_mir_coverage_matrix.py`).
         self.assertEqual(mir["total_variants"], 94)
-        self.assertGreaterEqual(mir["proved_corresponding"], 73)
+        self.assertGreaterEqual(mir["proved_corresponding"], 77)
         self.assertEqual(mir["supported_untested"], 0)
         self.assertEqual(mir["untested_variants"], [])
         self.assertEqual(
@@ -151,6 +151,9 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         }
         self.assertEqual(statuses["StatementKind.constEvalCounter"], "proved_corresponding")
         self.assertEqual(statuses["TerminatorKind.tailCall"], "proved_corresponding")
+        # `CastKind.fnPtrToPtr` has a MiniRustSpec correspondence
+        # (`MiniRustSpec/Correspondence/NullaryFnPtrBridge.lean`, `[NULLARY-FNPTR-AUDIT]`).
+        self.assertEqual(statuses["CastKind.fnPtrToPtr"], "proved_corresponding")
         # Explicit phase boundary (rejected after borrowck by rustc and Miri).
         self.assertEqual(statuses["ProjectionElem.opaqueCast"], "supported_and_tested")
         self.assertGreaterEqual(mir["stage1_lowered_lintrinsic_op_variants"], 30)
@@ -1568,8 +1571,9 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         self.assertEqual(len(suite._MIR_TEST_MODULE_FALLBACK), len(set(suite._MIR_TEST_MODULE_FALLBACK)))
         # The exact standalone `tests/mir` suites the nightly runs, including the
         # `Anneal.Mir.AdtAndControl` kernel-regression / axiom-pin suite, Episode 1's slice-lens
-        # witnesses, Episode 2's untested-variant correspondence suite, and the kernel-checked
-        # volatile / unaligned raw-pointer access suite.
+        # witnesses, Episode 2's untested-variant correspondence suite, the kernel-checked
+        # volatile / unaligned raw-pointer access suite, and the end-to-end unaligned / volatile /
+        # `VTablePtr` canary suite (Trusted, `Mach` and `MachTB`).
         self.assertEqual(
             sorted(rel for _step, rel in suite.MIR_STANDALONE_LEAN_TESTS),
             sorted(
@@ -1582,6 +1586,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     "MirSliceWidePtrLensTests",
                     "MirUntestedVariantCorrespondenceTests",
                     "VolatileUnalignedPtrTests",
+                    "UnalignedVolatileVTableTests",
                 )
             ),
         )

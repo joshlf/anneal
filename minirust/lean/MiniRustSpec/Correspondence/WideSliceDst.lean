@@ -12,6 +12,7 @@ import Lean
 import MiniRustSpec.Correspondence.TbWitness
 import MiniRustSpec.Correspondence.ProvenanceWitness
 import MiniRustSpec.Correspondence.IntrinsicFallback
+import MiniRustSpec.Correspondence.VTablePtr
 
 /-!
 # Wide-Slice and Unsized DST Pointer-Metadata Correspondence (`MiniRustSpec`)
@@ -1204,10 +1205,10 @@ theorem checkPtr_sliceRef_null_and_zeroByte_reborrow_divergence
       checkPtr (ThinPointer.widen thin (some (.ElementCount (Int.ofNat len))))
         (sliceRefPtrType mutbl ⟨0⟩ ⟨elemAlign⟩ freeze) m = .ok ()) := by
   have hMetaLen :
-      checkPtrMetadata (some (.ElementCount (Int.ofNat len))) .ElementCount = Except.ok () :=
+      checkPtrMetadata (some (.ElementCount (Int.ofNat len))) .ElementCount m = Except.ok () :=
     (checkPtrMetadata_elementCount_iff_anneal_usize len).1.mpr hLen
   have hMeta0 :
-      checkPtrMetadata (some (.ElementCount 0)) .ElementCount = Except.ok () :=
+      checkPtrMetadata (some (.ElementCount 0)) .ElementCount m = Except.ok () :=
     (checkPtrMetadata_elementCount_iff_anneal_usize 0).1.mpr (by decide)
   have hex_ok : ∀ {α β : Type} (x : α) (f : α → Except Stop β),
       (Bind.bind (Except.ok x) f) = f x := fun _ _ => rfl
@@ -2147,7 +2148,7 @@ theorem checkPtr_sliceRef_overflow_ub
     rw [hAddr]
     rfl
   have hMeta :
-      checkPtrMetadata (some (.ElementCount (Int.ofNat len))) .ElementCount = Except.ok () :=
+      checkPtrMetadata (some (.ElementCount (Int.ofNat len))) .ElementCount m = Except.ok () :=
     (checkPtrMetadata_elementCount_iff_anneal_usize len).1.mpr hLen
   have hProdNonneg : (0 : Int) ≤ Int.ofNat len * (elemSz : Int) :=
     Int.mul_nonneg (Int.natCast_nonneg len) (Int.natCast_nonneg elemSz)
@@ -2412,7 +2413,7 @@ theorem checkPtr_rawSlice_ok (thin : Ptr) (len : Nat) (m : Option Mach)
         "Value::Ptr: pointer out-of-bounds" = Except.ok () := by
     unfold ensureElseUb; rw [hAddr]; rfl
   have hMeta :
-      checkPtrMetadata (some (.ElementCount (Int.ofNat len))) .ElementCount = Except.ok () :=
+      checkPtrMetadata (some (.ElementCount (Int.ofNat len))) .ElementCount m = Except.ok () :=
     (checkPtrMetadata_elementCount_iff_anneal_usize len).1.mpr hLen
   simp only [checkPtr, ThinPointer.widen, PtrType.meta_kind, PtrType.safe_pointee, hAddrOk, hMeta]
   rfl
@@ -3094,5 +3095,67 @@ theorem wideSliceWitnesses_translateStatement_correspondence :
       some (.Assign (.Local (localName 10))
         (.UnOp (.Cast (.IntToInt u32)) (.Load (.Local (localName 9))))) :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-! ## `[adv ep2-A0]` Validity checking on `Mach` never stops with `Stop.unsupported`
+
+`Correspondence.VTablePtr` closes the vtable-pointer and trait-object safe-pointer branches of
+`Machine::check_ptr` and proves, for the polymorphic machine, that `check_value` with a machine
+never stops with `Stop.unsupported`. `checkValueM_bm_eq` (`Correspondence.Pointers`) transfers
+that to `checkValue` on `Mach`, and `Machine::transmute` / `CastOp::Transmute` inherit it. -/
+
+/-- **`check_value` on `Mach` with a machine never stops with `Stop.unsupported`**: the
+`m = none` fallbacks of `checkPtr` / `checkPtrMetadata` (vtable pointers, vtable-pointer
+metadata, trait-object safe pointers, safe-pointer dereferenceability) are unreachable from
+every `Mach` execution. -/
+theorem checkValue_noUnsupported (m : Mach) (val : Val) (ty : Gen.«Type») :
+    VTablePtr.NoUnsupported (checkValue val ty (some m)) := by
+  rw [← checkValueM_bm_eq]
+  exact VTablePtr.checkValueBM_noUnsupported m val ty
+
+/-- **`Machine::transmute` on `Mach`: the validity check contributes no `Stop.unsupported`.**
+`transmute` with a machine never stops with `unsupported` whenever its machine-independent
+re-encoding (`Type::layout`, `type1.encode`, `type2.decode`) does not. -/
+theorem transmute_noUnsupported (m : Mach) (val : Val) (type1 type2 : Gen.«Type»)
+    (hl1 : VTablePtr.NoUnsupported (Type.layout type1))
+    (hl2 : VTablePtr.NoUnsupported (Type.layout type2))
+    (henc : VTablePtr.NoUnsupported (Type.encode type1 val))
+    (hdec : ∀ bytes, VTablePtr.NoUnsupported (Type.decode type2 bytes)) :
+    VTablePtr.NoUnsupported (transmute val type1 type2 (some m)) := by
+  unfold transmute
+  refine VTablePtr.NoUnsupported.bind hl1 (fun l1 => ?_)
+  refine VTablePtr.NoUnsupported.bind (VTablePtr.expect_size_noUnsupported _ _) (fun s1 => ?_)
+  refine VTablePtr.NoUnsupported.bind hl2 (fun l2 => ?_)
+  refine VTablePtr.NoUnsupported.bind (VTablePtr.expect_size_noUnsupported _ _) (fun s2 => ?_)
+  split
+  · exact VTablePtr.NoUnsupported.specPanic _
+  · refine VTablePtr.NoUnsupported.bind henc (fun bytes => ?_)
+    refine VTablePtr.NoUnsupported.bind (hdec bytes) (fun o => ?_)
+    cases o with
+    | none => exact VTablePtr.NoUnsupported.ub _
+    | some raw =>
+      exact VTablePtr.NoUnsupported.bind (checkValue_noUnsupported m raw type2)
+        (fun _ => VTablePtr.NoUnsupported.pure _)
+
+/-- **`eval_un_op` for `CastOp::Transmute` on `Mach`: the validity check contributes no
+`Stop.unsupported`** (see `transmute_noUnsupported`; `evalValue` passes `some m`). -/
+theorem evalUnOp_transmute_noUnsupported (m : Mach) (newTy oldTy : Gen.«Type») (operand : Val)
+    (hl1 : VTablePtr.NoUnsupported (Type.layout oldTy))
+    (hl2 : VTablePtr.NoUnsupported (Type.layout newTy))
+    (henc : VTablePtr.NoUnsupported (Type.encode oldTy operand))
+    (hdec : ∀ bytes, VTablePtr.NoUnsupported (Type.decode newTy bytes)) :
+    VTablePtr.NoUnsupported
+      (evalUnOp (.Cast (.Transmute newTy)) (operand, oldTy) (some m)) := by
+  show VTablePtr.NoUnsupported (evalCastOp (.Transmute newTy) (operand, oldTy) (some m))
+  unfold evalCastOp
+  dsimp only
+  refine VTablePtr.NoUnsupported.bind hl1 (fun l1 => ?_)
+  refine VTablePtr.NoUnsupported.bind (VTablePtr.expect_size_noUnsupported _ _) (fun s1 => ?_)
+  refine VTablePtr.NoUnsupported.bind hl2 (fun l2 => ?_)
+  refine VTablePtr.NoUnsupported.bind (VTablePtr.expect_size_noUnsupported _ _) (fun s2 => ?_)
+  split
+  · exact VTablePtr.NoUnsupported.ub _
+  · exact VTablePtr.NoUnsupported.bind
+      (transmute_noUnsupported m operand oldTy newTy hl1 hl2 henc hdec)
+      (fun _ => VTablePtr.NoUnsupported.pure _)
 
 end MiniRustSpec.Correspondence.WideSliceDst
