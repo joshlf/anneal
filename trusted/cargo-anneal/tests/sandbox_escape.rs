@@ -378,6 +378,7 @@ fn sandbox_escape_vectors_blocked_in_tier1_and_tier2() {
             ro_mounts,
             rw_out,
             rw_tmp,
+            child_cwd: None,
             extra_env,
             timeout: Duration::from_secs(30),
         };
@@ -439,6 +440,7 @@ fn wall_clock_timeout_kills_process_group_in_tier1_and_tier2() {
                 host: tmp_dir.clone(),
                 child: PathBuf::from("/work/tmp"),
             },
+            child_cwd: None,
             extra_env,
             timeout: Duration::from_millis(250),
         };
@@ -514,6 +516,7 @@ fn live_lean_compiles_and_blocks_hostile_eval_in_tier1_and_tier2() {
             ro_mounts: ro_mounts.clone(),
             rw_out: rw_out.clone(),
             rw_tmp: rw_tmp.clone(),
+            child_cwd: None,
             extra_env: BTreeMap::new(),
             timeout: Duration::from_secs(60),
         };
@@ -581,6 +584,7 @@ fn live_lean_compiles_and_blocks_hostile_eval_in_tier1_and_tier2() {
             ro_mounts: h_ro,
             rw_out: h_rw_out,
             rw_tmp: h_rw_tmp,
+            child_cwd: None,
             extra_env: BTreeMap::new(),
             timeout: Duration::from_secs(60),
         };
@@ -663,6 +667,7 @@ fn live_lean_compiles_and_blocks_hostile_eval_in_tier1_and_tier2() {
             ro_mounts: i_ro,
             rw_out: i_rw_out,
             rw_tmp: i_rw_tmp,
+            child_cwd: None,
             extra_env: BTreeMap::new(),
             timeout: Duration::from_secs(60),
         };
@@ -748,6 +753,7 @@ fn live_lean_tier2_getrusage_enforces_memory_limit() {
         ro_mounts,
         rw_out,
         rw_tmp,
+        child_cwd: None,
         extra_env: BTreeMap::new(),
         timeout: Duration::from_secs(30),
     };
@@ -822,6 +828,7 @@ fn tier1_as_pid1_prevents_post_exit_out_writes() {
             ro_mounts,
             rw_out,
             rw_tmp,
+            child_cwd: None,
             extra_env,
             timeout: Duration::from_secs(30),
         };

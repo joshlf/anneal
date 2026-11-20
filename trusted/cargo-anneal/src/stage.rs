@@ -1059,6 +1059,7 @@ impl Checker {
             ro_mounts,
             rw_out,
             rw_tmp,
+            child_cwd: None,
             extra_env: BTreeMap::new(),
             timeout: self.child_timeout,
         };
@@ -1180,6 +1181,25 @@ impl Checker {
         let (_run_dir, in_dir, out_dir, tmp_dir) = self.prepare_run_dirs()?;
         set_mode(&in_dir, 0o500)?;
 
+        // Preserve canonical `stage`-relative source paths (`src/...`) so
+        // Lean's embedded source-path strings match pinned `.olean` SHA-256
+        // digests (`UPSTREAM_PIN.json`) under both Tier 1 `bwrap` and direct
+        // builds.
+        let rel_src = src_root
+            .strip_prefix(&self.stage)
+            .ok()
+            .filter(|rel| rel.starts_with("src"))
+            .and_then(|rel_root| {
+                src_file
+                    .strip_prefix(&self.stage)
+                    .ok()
+                    .map(|rel_file| (rel_root.to_path_buf(), rel_file.to_path_buf()))
+            });
+        let src_child_mount = match &rel_src {
+            Some((rel_root, _)) => PathBuf::from("/work").join(rel_root),
+            None => PathBuf::from("/work/src"),
+        };
+
         let mut ro_mounts = vec![
             MountSpec {
                 host: runtime.toolchain_dir.clone(),
@@ -1191,7 +1211,7 @@ impl Checker {
             },
             MountSpec {
                 host: src_root.to_path_buf(),
-                child: PathBuf::from("/work/src"),
+                child: src_child_mount,
             },
         ];
         for (idx, lp) in lean_path_dirs.iter().enumerate() {
@@ -1243,12 +1263,23 @@ impl Checker {
         if warn_as_err {
             compile_args.push("-DwarningAsError=true".to_string());
         }
+        let (root_arg, file_arg, child_cwd) = match &rel_src {
+            Some((rel_root, rel_file)) => (
+                rel_root.to_string_lossy().into_owned(),
+                rel_file.to_string_lossy().into_owned(),
+                Some(MountSpec {
+                    host: self.stage.clone(),
+                    child: PathBuf::from("/work"),
+                }),
+            ),
+            None => (mapper.map_str(src_root)?, mapper.map_str(src_file)?, None),
+        };
         compile_args.extend([
             "-R".to_string(),
-            mapper.map_str(src_root)?,
+            root_arg,
             "-o".to_string(),
             mapper.map_str(&out_host)?,
-            mapper.map_str(src_file)?,
+            file_arg,
         ]);
 
         let policy = SandboxPolicy {
@@ -1257,6 +1288,7 @@ impl Checker {
             ro_mounts,
             rw_out,
             rw_tmp,
+            child_cwd,
             extra_env,
             timeout: self.child_timeout,
         };
@@ -1474,6 +1506,7 @@ impl Checker {
             ro_mounts,
             rw_out,
             rw_tmp,
+            child_cwd: None,
             extra_env: BTreeMap::new(),
             timeout: self.child_timeout,
         };

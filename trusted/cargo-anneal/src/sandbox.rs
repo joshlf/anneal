@@ -98,6 +98,11 @@ pub struct SandboxPolicy {
     pub ro_mounts: Vec<MountSpec>,
     pub rw_out: MountSpec,
     pub rw_tmp: MountSpec,
+    /// Optional working directory inside the child (defaults to `rw_tmp`).
+    /// Tier 1 `bwrap` uses `child` (for example `/work`); Tier 2 and
+    /// unsandboxed modes use `host` (without granting Landlock access to
+    /// `host` itself).
+    pub child_cwd: Option<MountSpec>,
     pub extra_env: BTreeMap<String, String>,
     pub timeout: Duration,
 }
@@ -473,6 +478,7 @@ fn run_functional_lean_probe(runtime: &SandboxRuntime, stage_root: &Path) -> Res
         ro_mounts,
         rw_out,
         rw_tmp,
+        child_cwd: None,
         extra_env: BTreeMap::new(),
         timeout: Duration::from_secs(60),
     };
@@ -1064,9 +1070,13 @@ fn drain_bounded(mut reader: impl Read, limit: usize) -> Vec<u8> {
 }
 
 fn run_unsandboxed(policy: &SandboxPolicy) -> Result<Output, Failure> {
+    let cwd = policy
+        .child_cwd
+        .as_ref()
+        .map_or(policy.rw_tmp.host.as_path(), |m| m.host.as_path());
     let mut cmd = Command::new(&policy.exec_bin);
     cmd.args(&policy.args)
-        .current_dir(&policy.rw_tmp.host)
+        .current_dir(cwd)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", &policy.rw_tmp.host)
@@ -1970,12 +1980,14 @@ mod linux {
         cmd.arg("--bind")
             .arg(&policy.rw_out.host)
             .arg(&policy.rw_out.child);
+        let bwrap_cwd = policy
+            .child_cwd
+            .as_ref()
+            .map_or(Path::new("/work/tmp"), |m| m.child.as_path());
         cmd.args([
             "--size",
             "1073741824",
             "--tmpfs",
-            "/work/tmp",
-            "--chdir",
             "/work/tmp",
             "--setenv",
             "PATH",
@@ -1987,6 +1999,7 @@ mod linux {
             "TMPDIR",
             "/work/tmp",
         ]);
+        cmd.arg("--chdir").arg(bwrap_cwd);
         for (k, v) in &policy.extra_env {
             cmd.arg("--setenv").arg(k).arg(v);
         }
@@ -2017,9 +2030,13 @@ mod linux {
         let kill_idx = compiled.kill_pid_idx;
         let tgkill_idx = compiled.tgkill_pid_idx;
 
+        let cwd = policy
+            .child_cwd
+            .as_ref()
+            .map_or(policy.rw_tmp.host.as_path(), |m| m.host.as_path());
         let mut cmd = Command::new(&policy.exec_bin);
         cmd.args(&policy.args)
-            .current_dir(&policy.rw_tmp.host)
+            .current_dir(cwd)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", &policy.rw_tmp.host)
