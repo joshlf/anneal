@@ -15419,7 +15419,7 @@ here (`none`) fails closed and strictly preserves single-step refinement against
 The seven volatile memory intrinsics (`.unalignedVolatileLoad` ... `.volatileSetMemory`) are
 rejected (`none`): the lowered frame has no raw-pointer memory model for them, and an Anneal error
 refines every Trusted step. `Trusted`'s exact semantics of each is characterized by
-`evalTerminator_call_volatileIntrinsic_eq` and its per-intrinsic corollaries. -/
+`evalTerminator_call_volatileMemIntrinsic_eq` and its per-intrinsic corollaries. -/
 def evalLoweredIntrinsicCall (env : CfgEnv) (body : LBody) (bb : Nat) (inCleanup : Bool)
     (args : List Operand) (avs : List Value) (slots2 : List LocalSlotState)
     (destination : Place) (destTy : Ty) (target : Option Nat) (unwind : UnwindAction)
@@ -34573,9 +34573,9 @@ theorem rawPtrLoadAction_volatile_addr_unsupported {requiresAlign : Bool}
      simp only [rawPtrLoadAction, rawPtrArgOfValue?, Nat.beq_refl, hLay, classifyRawPtrTarget,
        hAligned, Bool.not_true, Bool.and, hInh, hSize])
 
-/-- **Volatile store outside Rust allocations.** A volatile store of a storable value of a
-non-zero-sized `T` through an aligned provenance-less address is unsupported: never a successful
-step and never `.ub`. -/
+/-- **Volatile store outside Rust allocations.** A volatile store of a storable value of an
+inhabited, non-zero-sized `T` through an aligned provenance-less address is unsupported: never a
+successful step and never `.ub`. -/
 theorem rawPtrStoreAction_volatile_addr_unsupported {requiresAlign : Bool}
     {borrows : List BorrowEntry} {globals : List CapturedAllocation}
     {cs : List SavedCallerFrame} {cl : List LocalSlot} {ap : List Nat}
@@ -34586,14 +34586,15 @@ theorem rawPtrStoreAction_volatile_addr_unsupported {requiresAlign : Bool}
     (hAligned :
       rawPtrTargetAligned? cs locals' decls layouts
         (match requiresAlign with | true => align | false => 1) (.addr addr) .outside = some true)
-    (hVal : rawPtrStoreValueFault? layouts elemTy size val = none)
+    (hInh : tyIsUninhabited layouts elemTy = false)
+    (hVal : rawPtrStoreValueFault? layouts elemTy val = none)
     (hSize : Nat.beq size 0 = false) :
     rawPtrStoreAction true requiresAlign borrows globals cs cl ap target decls layouts argOps
         [.scalar ⟨addr, layoutPointerBytes layouts⟩, val] locals' = .fault .unsupported := by
   cases requiresAlign <;>
     (dsimp only at hAligned
      simp only [rawPtrStoreAction, rawPtrArgOfValue?, Nat.beq_refl, hLay, classifyRawPtrTarget,
-       hAligned, Bool.not_true, Bool.and, hVal, hSize])
+       hAligned, Bool.not_true, Bool.and, hInh, hVal, hSize])
 
 /-- **Zero-sized volatile access.** A volatile load of an inhabited zero-sized `T` through any
 aligned provenance-less address (including null) returns the unique value of `T` without touching
@@ -34610,7 +34611,7 @@ theorem rawPtrAccessAction_volatile_zst_addr {requiresAlign : Bool}
         (match requiresAlign with | true => align | false => 1) (.addr addr) .outside = some true)
     (hInh : tyIsUninhabited layouts elemTy = false)
     (hZst : rawPtrZstValue? layouts elemTy = some zstVal)
-    (hVal : rawPtrStoreValueFault? layouts elemTy 0 val = none) :
+    (hVal : rawPtrStoreValueFault? layouts elemTy val = none) :
     rawPtrLoadAction true requiresAlign borrows globals cs ap target decls layouts argOps
         [.scalar ⟨addr, layoutPointerBytes layouts⟩] locals' = .ret zstVal ∧
     rawPtrStoreAction true requiresAlign borrows globals cs cl ap target decls layouts argOps
@@ -34621,7 +34622,7 @@ theorem rawPtrAccessAction_volatile_zst_addr {requiresAlign : Bool}
      · simp only [rawPtrLoadAction, rawPtrArgOfValue?, Nat.beq_refl, hLay, classifyRawPtrTarget,
          hAligned, Bool.not_true, Bool.and, hInh, hZst]
      · simp only [rawPtrStoreAction, rawPtrArgOfValue?, Nat.beq_refl, hLay, classifyRawPtrTarget,
-         hAligned, Bool.not_true, Bool.and, hVal])
+         hAligned, Bool.not_true, Bool.and, hInh, hVal])
 
 /-- **Uninhabited load.** An aligned load of an uninhabited `T` is `.ub`, even when `T` is
 zero-sized and the access is volatile. -/
@@ -34643,6 +34644,43 @@ theorem rawPtrLoadAction_uninhabited_ub {isVolatile requiresAlign : Bool}
      simp only [rawPtrLoadAction, rawPtrArgOfValue?, Nat.beq_refl, hLay, classifyRawPtrTarget,
        hAligned, hInh]
      cases Bool.and (Bool.not isVolatile) (rawPtrArgIsNull (.addr addr)) <;> rfl)
+
+/-- **Uninhabited store.** An aligned store of an uninhabited `T` is `.ub`, even when `T` is
+zero-sized and the access is volatile. -/
+theorem rawPtrStoreAction_uninhabited_ub {isVolatile requiresAlign : Bool}
+    {borrows : List BorrowEntry} {globals : List CapturedAllocation}
+    {cs : List SavedCallerFrame} {cl : List LocalSlot} {ap : List Nat}
+    {target : ResolvedCallTarget} {decls : List LocalDecl} {layouts : LayoutTable}
+    {argOps : List Operand} {locals' : List LocalSlot} {addr : Nat} {val : Value}
+    {elemTy : Ty} {size align : Nat}
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
+    (hAligned :
+      rawPtrTargetAligned? cs locals' decls layouts
+        (match requiresAlign with | true => align | false => 1) (.addr addr) .outside = some true)
+    (hInh : tyIsUninhabited layouts elemTy = true) :
+    rawPtrStoreAction isVolatile requiresAlign borrows globals cs cl ap target decls layouts argOps
+        [.scalar ⟨addr, layoutPointerBytes layouts⟩, val] locals' = .fault .ub := by
+  cases requiresAlign <;>
+    (dsimp only at hAligned
+     simp only [rawPtrStoreAction, rawPtrArgOfValue?, Nat.beq_refl, hLay, classifyRawPtrTarget,
+       hAligned, hInh]
+     cases Bool.and (Bool.not isVolatile) (rawPtrArgIsNull (.addr addr)) <;> rfl)
+
+/-- **Unknown base alignment fails closed (`none`, never false `.ub`).** For any alignment
+requirement `reqAlign > 1`, an `.untracked` provenance pointer and a `.global` allocation with
+unknown alignment (`alloc.align.bytes = 0`) yield `none` regardless of `ptr.offsetBytes`. -/
+theorem rawPtrTargetAligned?_unknown_align_none
+    {cs : List SavedCallerFrame} {locals' : List LocalSlot}
+    {decls : List LocalDecl} {layouts : LayoutTable}
+    {reqAlign : Nat} {ptr : ProvenancePtr} {alloc : CapturedAllocation}
+    (hAlign : Nat.ble reqAlign 1 = false)
+    (hZero : Nat.beq alloc.align.bytes 0 = true) :
+    rawPtrTargetAligned? cs locals' decls layouts reqAlign (.prov ptr) .untracked = none ∧
+    rawPtrTargetAligned? cs locals' decls layouts reqAlign (.prov ptr) (.global ptr alloc) =
+      none := by
+  constructor
+  · simp only [rawPtrTargetAligned?, hAlign]
+  · simp only [rawPtrTargetAligned?, hAlign, hZero]
 
 /-- **Null `read_unaligned` / `write_unaligned`.** A non-volatile access through the null pointer
 is `.ub` whatever the size of `T` (even zero): a null pointer is never valid for reads or
@@ -34683,11 +34721,9 @@ theorem rawPtrLoadAction_nonvolatile_addr_ub
 
 /-- **`(dst, src, count)` argument order of the volatile copies.** For a non-empty volatile copy
 whose two pointers are aligned tracked stack pointers, the plan copies from the *second* argument
-(`src`) to the *first* (`dst`): the non-overlapping form, and the overlapping form across two
-different locals, are `copy_nonoverlapping(src, dst, count)` on the source and destination
-operands and values, and the overlapping form within one local copies from `src`'s place to
-`dst`'s. -/
-theorem volatileCopyPlan_stack_dst_src_order {nonOverlapping : Bool}
+(`src`) to the *first* (`dst`) via `.copyStack srcPtr dstPtr srcEntry dstEntry elemTy count
+(count * size)`. -/
+theorem volatileCopyPlan_stack_dst_src_order
     {borrows : List BorrowEntry} {globals : List CapturedAllocation}
     {cs : List SavedCallerFrame}
     {target : ResolvedCallTarget} {decls : List LocalDecl} {layouts : LayoutTable}
@@ -34706,31 +34742,39 @@ theorem volatileCopyPlan_stack_dst_src_order {nonOverlapping : Bool}
     (hSrcAl : rawPtrTargetAligned? cs locals' decls layouts align (.prov srcPtr)
       (.stack srcPtr srcEntry) = some true)
     (hNonZero : Nat.beq (Nat.mul countSc.bits size) 0 = false) :
-    volatileCopyPlan nonOverlapping borrows globals cs target decls layouts [dstOp, srcOp, cntOp]
+    volatileCopyPlan borrows globals cs target decls layouts [dstOp, srcOp, cntOp]
         [.ptr dstPtr (layoutPointerBytes layouts), .ptr srcPtr (layoutPointerBytes layouts),
           .scalar countSc] locals' =
-      (match
-        Bool.or nonOverlapping
-          (Bool.not
-            (Bool.and (Nat.beq srcEntry.targetFrameDepth dstEntry.targetFrameDepth)
-              (Nat.beq srcEntry.targetLocal dstEntry.targetLocal)))
-      with
-      | true =>
-        .nonOverlapping srcOp dstOp (.ptr srcPtr (layoutPointerBytes layouts))
-          (.ptr dstPtr (layoutPointerBytes layouts)) countSc.bits
-      | false => .withinLocal srcPtr dstPtr srcEntry dstEntry (Nat.mul countSc.bits size)) := by
+      .copyStack srcPtr dstPtr srcEntry dstEntry elemTy countSc.bits (Nat.mul countSc.bits size) := by
   simp only [volatileCopyPlan, hCount, rawPtrArgOfValue?, Nat.beq_refl, hLay, hRange, hDst, hSrc,
     hDstAl, hSrcAl, hNonZero]
-  cases Bool.or nonOverlapping
-    (Bool.not
-      (Bool.and (Nat.beq srcEntry.targetFrameDepth dstEntry.targetFrameDepth)
-        (Nat.beq srcEntry.targetLocal dstEntry.targetLocal))) <;> rfl
+
+/-- **Dead stack allocations in volatile copy and set.** A non-empty `volatileCopyStackAction`
+whose source or destination borrow entry has `allocDead = true`, and a non-empty
+`volatileSetStackAction` whose destination borrow entry has `allocDead = true`, fault with `.ub`
+(use-after-free). -/
+theorem volatileCopySetStackAction_allocDead_ub
+    {nonOverlapping : Bool} {borrows : List BorrowEntry} {cs : List SavedCallerFrame}
+    {cl : List LocalSlot} {ap : List Nat} {decls : List LocalDecl} {layouts : LayoutTable}
+    {locals' : List LocalSlot} {srcPtr dstPtr : ProvenancePtr}
+    {srcEntry dstEntry : BorrowEntry} {elemTy : Ty} {count valByte byteCount : Nat} :
+    (srcEntry.allocDead = true →
+      volatileCopyStackAction nonOverlapping borrows cs cl ap decls layouts locals' srcPtr dstPtr
+          srcEntry dstEntry elemTy count byteCount = .fault .ub) ∧
+    (dstEntry.allocDead = true →
+      volatileSetStackAction borrows cs cl ap decls layouts locals' dstPtr dstEntry valByte
+          byteCount = .fault .ub) := by
+  constructor
+  · intro hDead
+    simp only [volatileCopyStackAction, resolveRawPtrStackTarget, hDead]
+  · intro hDead
+    simp only [volatileSetStackAction, resolveRawPtrStackTarget, hDead]
 
 /-- **Zero-length volatile copy and set.** A volatile copy or set of zero bytes
 (`count * size_of::<T>() = 0`) through aligned pointers copies and writes nothing, whatever the
 pointers point to (including memory outside all Rust allocations); a misaligned destination is
 `.ub` even then. -/
-theorem volatileCopySetPlan_zero_bytes {nonOverlapping : Bool}
+theorem volatileCopySetPlan_zero_bytes
     {borrows : List BorrowEntry} {globals : List CapturedAllocation}
     {cs : List SavedCallerFrame}
     {target : ResolvedCallTarget} {decls : List LocalDecl} {layouts : LayoutTable}
@@ -34745,7 +34789,7 @@ theorem volatileCopySetPlan_zero_bytes {nonOverlapping : Bool}
     (hVal : Nat.blt valBits 256 = true) :
     ((rawPtrTargetAligned? cs locals' decls layouts align (.addr dstAddr) .outside = some true →
       rawPtrTargetAligned? cs locals' decls layouts align (.addr srcAddr) .outside = some true →
-      volatileCopyPlan nonOverlapping borrows globals cs target decls layouts argOps
+      volatileCopyPlan borrows globals cs target decls layouts argOps
         [.scalar ⟨dstAddr, layoutPointerBytes layouts⟩,
           .scalar ⟨srcAddr, layoutPointerBytes layouts⟩, .scalar countSc] locals' = .noCopy) ∧
     (rawPtrTargetAligned? cs locals' decls layouts align (.addr dstAddr) .outside = some true →
@@ -34753,7 +34797,7 @@ theorem volatileCopySetPlan_zero_bytes {nonOverlapping : Bool}
         [.scalar ⟨dstAddr, layoutPointerBytes layouts⟩, .scalar ⟨valBits, 1⟩, .scalar countSc]
         locals' = .noWrite)) ∧
     (rawPtrTargetAligned? cs locals' decls layouts align (.addr dstAddr) .outside = some false →
-      volatileCopyPlan nonOverlapping borrows globals cs target decls layouts argOps
+      volatileCopyPlan borrows globals cs target decls layouts argOps
         [.scalar ⟨dstAddr, layoutPointerBytes layouts⟩,
           .scalar ⟨srcAddr, layoutPointerBytes layouts⟩, .scalar countSc] locals' = .fault .ub ∧
       volatileSetPlan borrows globals cs target decls layouts argOps

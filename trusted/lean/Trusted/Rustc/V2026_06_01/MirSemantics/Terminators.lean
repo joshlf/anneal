@@ -3092,11 +3092,14 @@ def resolveRawPtrElemLayout
       | _, _ => .fault .unsupported
 
 /--
-Frame-qualified slot, `LocalDecl`s, and `LayoutTable` of the local `loc` of the
-stack frame at depth `depth` of `callStack`: the active frame
+Frame-qualified local slots, slot, `LocalDecl`s, and `LayoutTable` of the local
+`loc` of the stack frame at depth `depth` of `callStack`: the active frame
 (`depth = length callStack`, slots `locals'`, declarations `bodyLocalDecls`) or
 a suspended caller frame (`savedFrameAtDepth?`, with its saved slots and its
 body's declarations).
+Returning the owning frame's full slot list alongside the slot ensures any
+`ProjectionElem.index` projection on `entry.targetProjection` reads its index
+local from the owning frame rather than the active callee frame.
 Returns `.none` when no such frame is live, when the frame has no slot `loc`,
 or when the target is a caller-owned referent slot of the root frame
 (`Memory.callerLocals`), whose declarations are not in scope; callers treat
@@ -3115,17 +3118,17 @@ def rawPtrTargetFrame?
     (bodyLocalDecls : List LocalDecl)
     (bodyLayouts : LayoutTable)
     (depth loc : Nat) :
-    Option (LocalSlot × List LocalDecl × LayoutTable) :=
+    Option (List LocalSlot × LocalSlot × List LocalDecl × LayoutTable) :=
   match Nat.beq depth (length callStack) with
   | true =>
     match get? locals' loc with
-    | .some slot => .some (slot, bodyLocalDecls, bodyLayouts)
+    | .some slot => .some (locals', slot, bodyLocalDecls, bodyLayouts)
     | .none => .none
   | false =>
     match savedFrameAtDepth? callStack depth with
     | .some sf =>
       match get? sf.frame.locals loc with
-      | .some slot => .some (slot, sf.callerBody.localDecls, sf.callerBody.layouts)
+      | .some slot => .some (sf.frame.locals, slot, sf.callerBody.localDecls, sf.callerBody.layouts)
       | .none => .none
     | .none => .none
 
@@ -3139,21 +3142,24 @@ step to `MirStepNode.unsupported`).
 - `reqAlign ≤ 1` is always satisfied.
 - A provenance-less address is aligned iff it is a multiple of `reqAlign`; so
   is the address `offsetBytes` of a pointer value without provenance
-  (`allocId = 0`).
-- A pointer tracked by a Tree Borrows entry is misaligned when its byte offset
-  is not a multiple of `reqAlign` (as `checkDerefAlign`) or when the address
-  `addr(entry.targetLocal, entry.targetProjection) + offsetBytes` is not
-  `reqAlign`-aligned in every placement of the target local
-  (`checkTargetPlaceAlignWalk`, which rejects pointers to misaligned fields of
-  `#[repr(packed)]` structs). It is aligned when, in addition, the target
-  place's type has a known alignment that is a multiple of `reqAlign`;
-  otherwise the result is `.none`.
-- A pointer into a captured global allocation is aligned iff its byte offset
-  is a multiple of `reqAlign` and the allocation's alignment is at least
-  `reqAlign` (as `checkGlobalAllocAlign`).
-- A pointer into an untracked allocation is misaligned when its byte offset is
-  not a multiple of `reqAlign` (some placement of an allocation of any
-  alignment puts that offset at a misaligned address) and otherwise `.none`.
+  (`allocId = 0`, `tgt = .outside`).
+- A pointer into an untracked allocation (`tgt = .untracked`) has unknown base
+  address alignment, so it always returns `.none` when `reqAlign > 1` rather
+  than falsely faulting on a nonzero offset from an unknown base.
+- A pointer into a captured global allocation (`tgt = .global _ alloc`) returns
+  `.none` when `alloc.align.bytes = 0` (unknown alignment), `.some false` when
+  `1 ≤ alloc.align.bytes < reqAlign`, and otherwise checks
+  `ptr.offsetBytes % reqAlign = 0` (matching `checkGlobalAllocAlign`).
+- A pointer tracked by a Tree Borrows entry (`tgt = .stack _ entry`) checks
+  `addr(entry.targetLocal, entry.targetProjection) + ptr.offsetBytes` rather
+  than `ptr.offsetBytes` alone, so a pointer offset back to an aligned boundary
+  from an unaligned sub-place (for example `(&raw const s.unaligned_byte).add(3)`
+  inside an `align(4)` struct) is not falsely rejected. It returns `.some false`
+  when `checkTargetPlaceAlignWalk` proves misalignment (including misaligned
+  fields of `#[repr(packed)]` structs), `.some true` when the root local's exact
+  alignment is at least `reqAlign` (`tyExactByteAlign?`) and the combined offset
+  `relOff + ptr.offsetBytes` (`projectionChainByteOffset?`) is a multiple of
+  `reqAlign`, and `.none` otherwise.
 
 Reference (The Rust Reference, "Size and Alignment"):
 <https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
@@ -3194,62 +3200,75 @@ def rawPtrTargetAligned?
     match arg with
     | .addr addr => .some (Nat.beq (Nat.mod addr reqAlign) 0)
     | .prov ptr =>
-      match Nat.beq (Nat.mod ptr.offsetBytes reqAlign) 0 with
-      | false => .some false
-      | true =>
-        match tgt with
-        | .outside => .some true
-        | .untracked => .none
-        | .global _ alloc => .some (Nat.ble reqAlign alloc.align.bytes)
-        | .stack _ entry =>
-          match
-            rawPtrTargetFrame?
-              callStack
-              locals'
-              bodyLocalDecls
-              bodyLayouts
-              entry.targetFrameDepth
-              entry.targetLocal
-          with
+      match tgt with
+      | .outside => .some (Nat.beq (Nat.mod ptr.offsetBytes reqAlign) 0)
+      | .untracked => .none
+      | .global _ alloc =>
+        match Nat.beq alloc.align.bytes 0 with
+        | true => .none
+        | false =>
+          match Nat.ble reqAlign alloc.align.bytes with
+          | false => .some false
+          | true => .some (Nat.beq (Nat.mod ptr.offsetBytes reqAlign) 0)
+      | .stack _ entry =>
+        match
+          rawPtrTargetFrame?
+            callStack
+            locals'
+            bodyLocalDecls
+            bodyLayouts
+            entry.targetFrameDepth
+            entry.targetLocal
+        with
+        | .none => .none
+        | .some (_, slot, targetDecls, targetLayouts) =>
+          match get? targetDecls entry.targetLocal with
           | .none => .none
-          | .some (_, targetDecls, targetLayouts) =>
-            match get? targetDecls entry.targetLocal with
-            | .none => .none
-            | .some rootDecl =>
-              match
-                checkTargetPlaceAlignWalk
-                  targetDecls
-                  targetLayouts
-                  reqAlign
-                  ptr.offsetBytes
-                  (.some rootDecl.ty)
-                  .none
-                  .none
-                  entry.targetProjection
-              with
-              | false => .some false
-              | true =>
-                match
-                  placeTyResolved
-                    targetDecls
-                    targetLayouts
-                    { local_ := entry.targetLocal, projection := entry.targetProjection }
-                with
-                | .none => .none
-                | .some placeTy =>
-                  match intrinsicRigidTyAlign targetDecls targetLayouts placeTy.kind with
+          | .some rootDecl =>
+            let rootValOpt : Option Value :=
+              match slot with
+              | .init v => .some v
+              | _ => .none
+            match
+              checkTargetPlaceAlignWalk
+                targetDecls
+                targetLayouts
+                reqAlign
+                ptr.offsetBytes
+                (.some rootDecl.ty)
+                rootValOpt
+                .none
+                entry.targetProjection
+            with
+            | false => .some false
+            | true =>
+              match tyExactByteAlign? targetDecls targetLayouts rootDecl.ty with
+              | .none => .none
+              | .some encAlign =>
+                match Nat.ble reqAlign encAlign with
+                | false => .some false
+                | true =>
+                  match
+                    projectionChainByteOffset?
+                      targetLayouts
+                      (.some rootDecl.ty)
+                      rootValOpt
+                      .none
+                      0
+                      targetDecls
+                      (normalizeSubsliceProjections
+                        (stripTransparentProjections entry.targetProjection))
+                  with
                   | .none => .none
-                  | .some placeAlign =>
-                    match Nat.beq (Nat.mod placeAlign reqAlign) 0 with
-                    | true => .some true
-                    | false => .none
+                  | .some relOff =>
+                    .some (Nat.beq (Nat.mod (Nat.add relOff ptr.offsetBytes) reqAlign) 0)
 
 /--
 Resolution of the stack place a tracked raw pointer accesses
-(`resolveRawPtrStackTarget`): the owning frame's `LocalDecl`s and
-`LayoutTable`, the type `placeTy` of the borrow entry's target place, and the
-target local's `slot` (`.ok`); or the fault with which the access steps
-(`.fault`).
+(`resolveRawPtrStackTarget`): the owning frame's slots `targetLocals`,
+`LocalDecl`s, `LayoutTable`, root local type `rootTy`, the type `placeTy` and
+byte size `placeSize` of the borrow entry's target place, and the target
+local's `slot` (`.ok`); or the fault with which the access steps (`.fault`).
 
 Reference (`core::ptr` module documentation, `library/core/src/ptr/mod.rs` at
 commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -3260,11 +3279,15 @@ commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
 > //! [`NonNull::dangling`] are all dangling."
 -/
 inductive RawPtrStackTarget : Type where
-  /-- The access is within the live target place of type `placeTy`. -/
+  /-- The access is within the live target place of type `placeTy` and byte size
+  `placeSize` inside root local type `rootTy`. -/
   | ok
+      (targetLocals : List LocalSlot)
       (targetDecls : List LocalDecl)
       (targetLayouts : LayoutTable)
+      (rootTy : Ty)
       (placeTy : Ty)
+      (placeSize : Nat)
       (slot : LocalSlot) :
       RawPtrStackTarget
   /-- The access faults with `kind`. -/
@@ -3282,12 +3305,13 @@ Checks, in order:
 3. A byte-ranged entry (`entry.rangeLen ≠ 0`) is unsupported.
 4. The target local must be a slot of a live frame with declarations in scope
    (`rawPtrTargetFrame?`, else unsupported); a `.dead` slot is `.ub`.
-5. The type and size of the entry's target place must resolve (else
-   unsupported), and the accessed range `[offsetBytes, offsetBytes +
-   accessBytes)` must lie within that place. A range that leaves a whole local
-   (`entry.targetProjection = []`) leaves its allocation and is `.ub`; a range
-   that leaves a sub-place may still be inside the allocation, where the Tree
-   Borrows range of `entry` no longer covers it, so it is unsupported.
+5. The root local declaration and the type and size of the entry's target place
+   must resolve (else unsupported), and the accessed range `[offsetBytes,
+   offsetBytes + accessBytes)` must lie within that place. A range that leaves
+   a whole local (`entry.targetProjection = []`) leaves its allocation and is
+   `.ub`; a range that leaves a sub-place may still be inside the allocation,
+   where the Tree Borrows range of `entry` no longer covers it, so it is
+   unsupported.
 
 Reference (`core::ptr` module documentation, `library/core/src/ptr/mod.rs` at
 commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -3310,9 +3334,9 @@ Reference (The Rust Reference, "Behavior considered undefined"):
 > "- Breaking the pointer aliasing rules."
 
 Modeling choice: restricting the access to the entry's target place
-(conditions 3 and 5) is Anneal's. It makes the Tree Borrows transitions of
-`borrowsAfterRawPtrRead` and `borrowsAfterWriteBytes`, which act on the whole
-target place, cover every accessed byte.
+(conditions 3 and 5) is Anneal's. It ensures `entry`'s Tree Borrows provenance
+covers every accessed byte, while `borrowsAfterRawPtrAccess` tracks byte-level
+overlap against foreign borrows on the same local.
 -/
 def resolveRawPtrStackTarget
     (callStack : List SavedCallerFrame)
@@ -3347,25 +3371,30 @@ def resolveRawPtrStackTarget
             entry.targetLocal
         with
         | .none => .fault .unsupported
-        | .some (.dead, _, _) => .fault .ub
-        | .some (slot, targetDecls, targetLayouts) =>
-          match
-            placeTyResolved
-              targetDecls
-              targetLayouts
-              { local_ := entry.targetLocal, projection := entry.targetProjection }
-          with
+        | .some (_, .dead, _, _) => .fault .ub
+        | .some (targetLocals, slot, targetDecls, targetLayouts) =>
+          match get? targetDecls entry.targetLocal with
           | .none => .fault .unsupported
-          | .some placeTy =>
-            match tyByteSize targetDecls targetLayouts placeTy with
+          | .some rootDecl =>
+            let rootTy := resolveTyWithLocalDecls targetDecls targetLayouts rootDecl.ty
+            match
+              placeTyResolved
+                targetDecls
+                targetLayouts
+                { local_ := entry.targetLocal, projection := entry.targetProjection }
+            with
             | .none => .fault .unsupported
-            | .some placeSize =>
-              match Nat.ble (Nat.add offsetBytes accessBytes) placeSize with
-              | true => .ok targetDecls targetLayouts placeTy slot
-              | false =>
-                match entry.targetProjection with
-                | .nil => .fault .ub
-                | _ :: _ => .fault .unsupported
+            | .some placeTy =>
+              match tyByteSize targetDecls targetLayouts placeTy with
+              | .none => .fault .unsupported
+              | .some placeSize =>
+                match Nat.ble (Nat.add offsetBytes accessBytes) placeSize with
+                | true =>
+                  .ok targetLocals targetDecls targetLayouts rootTy placeTy placeSize slot
+                | false =>
+                  match entry.targetProjection with
+                  | .nil => .fault .ub
+                  | _ :: _ => .fault .unsupported
 
 /--
 Fault of a typed load of `elemKind` that meets uninitialized memory: `.ub`
@@ -3377,6 +3406,8 @@ representation cannot always express).
 Reference (The Rust Reference, "Behavior considered undefined — Invalid
 values"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "- An integer (`i*`/`u*`), floating point value (`f*`), or raw pointer must be initialized, i.e., must not be obtained from uninitialized memory."
 
 > "Note: Uninitialized memory is also implicitly invalid for any type that has a restricted set of valid values. In other words, the only cases in which reading uninitialized memory is permitted are inside `union`s and in “padding” (the gaps between the fields of a type)."
 -/
@@ -3418,6 +3449,55 @@ def rawPtrBytesAnyUninit : List AbstractByte → Bool
   | .init _ _ :: rest => rawPtrBytesAnyUninit rest
 
 /--
+Test whether some initialized byte of `bytes` carries pointer provenance.
+
+Reading bytes that carry pointer provenance at an integer or non-pointer type is
+not undefined behavior in Rust (the result depends on the pointer's runtime
+address), so the model must fail closed with `MirStepNode.unsupported` rather
+than discarding provenance and returning an invented numeric address.
+
+Reference (`core::ptr` module documentation, `library/core/src/ptr/mod.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L157-L161>
+
+> "//! A pointer value in Rust semantically contains the following information:
+> //!
+> //! * The **address** it points to, which can be represented by a `usize`.
+> //! * The **provenance** it has, defining the memory it has permission to access. Provenance can be
+> //!   absent, in which case the pointer does not have permission to access any memory."
+-/
+@[reducible]
+def rawPtrBytesAnyProv : List AbstractByte → Bool
+  | .nil => false
+  | .init _ (.some _) :: _ => true
+  | _ :: rest => rawPtrBytesAnyProv rest
+
+/--
+Test whether every byte of `bytes` is initialized with the exact provenance pair
+`(allocId, tag)`. Used when decoding a thin pointer from bytes so both `allocId`
+and Tree Borrows `tag` are preserved and mixed-provenance byte sequences fail
+closed.
+
+Reference (`core::ptr` module documentation, `library/core/src/ptr/mod.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L157-L161>
+
+> "//! A pointer value in Rust semantically contains the following information:
+> //!
+> //! * The **address** it points to, which can be represented by a `usize`.
+> //! * The **provenance** it has, defining the memory it has permission to access. Provenance can be
+> //!   absent, in which case the pointer does not have permission to access any memory."
+-/
+@[reducible]
+def rawPtrBytesUniformProv (allocId tag : Nat) : List AbstractByte → Bool
+  | .nil => true
+  | .init _ (.some (a, t)) :: rest =>
+    match Bool.and (Nat.beq a allocId) (Nat.beq t tag) with
+    | true => rawPtrBytesUniformProv allocId tag rest
+    | false => false
+  | _ :: _ => false
+
+/--
 Fault of a typed load of `elemKind` whose bytes `bytes` do not decode
 (`decodeTypedValueFromBytes = .none`):
 - for a primitive scalar type, `.ub` when a byte is uninitialized or when every
@@ -3451,6 +3531,238 @@ def rawPtrDecodeFault (elemKind : RigidTy) (bytes : List AbstractByte) : Failure
     match Bool.and (isThinPtrKind elemKind) (rawPtrBytesAnyUninit bytes) with
     | true => .ub
     | false => .unsupported
+
+/--
+Byte width of an integer `RigidTy` on a target with `ptrBytes`-wide pointers.
+
+Reference (The Rust Reference, "Numeric types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/numeric.html>
+
+> "The usize type is an unsigned integer type with the same number of bits as the platform’s pointer type. It can represent every memory address in the process."
+>
+> "The isize type is a signed two’s complement integer type with the same number of bits as the platform’s pointer type."
+-/
+@[reducible]
+def rawPtrIntByteWidth (ptrBytes : Nat) : RigidTy → Option Nat
+  | .uint .u8 | .int .i8 => .some 1
+  | .uint .u16 | .int .i16 => .some 2
+  | .uint .u32 | .int .i32 => .some 4
+  | .uint .u64 | .int .i64 => .some 8
+  | .uint .u128 | .int .i128 => .some 16
+  | .uint .usize | .int .isize => .some ptrBytes
+  | _ => .none
+
+/--
+Byte width of an IEEE floating-point `FloatTy` (`f16`..`f128`).
+
+Reference (The Rust Reference, "Floating-Point Types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/numeric.html#floating-point-types>
+
+> "The IEEE 754-2008 “binary32” and “binary64” floating-point types are f32 and f64, respectively."
+-/
+@[reducible]
+def rawPtrFloatByteWidth : FloatTy → Nat
+  | .f16 => 2
+  | .f32 => 4
+  | .f64 => 8
+  | .f128 => 16
+
+/--
+Check a validity predicate `check` on every element value of an array at element
+type `elemTy`.
+
+Reference (The Rust Reference, "Behavior considered undefined — Invalid
+values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
+-/
+@[reducible]
+def rawPtrAllValuesValid?
+    (check : Ty → Value → Bool)
+    (elemTy : Ty) :
+    List Value → Bool
+  | .nil => true
+  | v :: vs =>
+    match check elemTy v with
+    | true => rawPtrAllValuesValid? check elemTy vs
+    | false => false
+
+/--
+Check a validity predicate `check` elementwise across tuple field types `ks`,
+optional layout indices `fls`, and runtime field values `vs`.
+
+Reference (The Rust Reference, "Behavior considered undefined — Invalid
+values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
+-/
+@[reducible]
+def rawPtrTupleFieldsValid?
+    (check : Ty → Value → Bool)
+    (layouts : LayoutTable) :
+    List RigidTy → List LayoutIdx → List Value → Bool
+  | .nil, _, .nil => true
+  | k :: ks, fl :: fls, v :: vs =>
+    match check { kind := k, layoutIdx := fl } v with
+    | true => rawPtrTupleFieldsValid? check layouts ks fls vs
+    | false => false
+  | k :: ks, .nil, v :: vs =>
+    match check { kind := k, layoutIdx := synthKindLayoutIdx layouts k } v with
+    | true => rawPtrTupleFieldsValid? check layouts ks .nil vs
+    | false => false
+  | _, _, _ => false
+
+/--
+Fuel-bounded structural validity check of runtime `Value` `v` against static
+type `ty` for raw-pointer loads and stores: rejects uninhabited types (`.never`
+or `tyIsUninhabited`), invalid `bool` / `char` bit patterns, scalar width
+mismatches, null references and function pointers, and invalid elements inside
+tuples and fixed-length arrays, as well as ABI-mismatched value shapes (such as
+a scalar passed at `()` or an aggregate type).
+
+Reference (The Rust Reference, "Behavior considered undefined — Invalid
+values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
+
+> "- A bool value must be false (0) or true (1)."
+
+> "- A char value must not be a surrogate (i.e., must not be in the range
+> 0xD800..=0xDFFF) and must be equal to or less than char::MAX."
+
+Reference (The Rust Reference, "Never type"):
+<https://doc.rust-lang.org/1.98.0/reference/types/never.html>
+
+> "The never type ! is a type with no values, representing the result of computations that never complete."
+
+Modeling choice: ADTs whose `TypeLayout` fixes a single variant require matching
+variant index, while multi-variant enums and unions are accepted at aggregate
+shape so valid enums and unions are never falsely rejected.
+-/
+def rawPtrValueValid? : Nat → LayoutTable → Ty → Value → Bool
+  | .zero, _, _, _ => true
+  | .succ fuel', layouts, ty, v =>
+    let ptrBytes := layoutPointerBytes layouts
+    match tyIsUninhabited layouts ty with
+    | true => false
+    | false =>
+      match ty.kind with
+      | .never => false
+      | .bool =>
+        match v with
+        | .scalar sc => Bool.and (Nat.beq sc.sizeBytes 1) (Nat.ble sc.bits 1)
+        | _ => false
+      | .char =>
+        match v with
+        | .scalar sc => Bool.and (Nat.beq sc.sizeBytes 4) (isValidCharCode sc.bits)
+        | _ => false
+      | .int w =>
+        match rawPtrIntByteWidth ptrBytes (.int w), v with
+        | .some expected, .scalar sc => Nat.beq sc.sizeBytes expected
+        | _, _ => false
+      | .uint w =>
+        match rawPtrIntByteWidth ptrBytes (.uint w), v with
+        | .some expected, .scalar sc => Nat.beq sc.sizeBytes expected
+        | _, _ => false
+      | .float fk =>
+        match v with
+        | .scalar sc => Nat.beq sc.sizeBytes (rawPtrFloatByteWidth fk)
+        | _ => false
+      | .rawPtr _ pointee =>
+        match pointee with
+        | .slice _ | .str | .dynamic _ =>
+          match v with
+          | .aggregate 0 (dataVal :: metaVal :: .nil) =>
+            Bool.and
+              (match rawPtrArgOfValue? ptrBytes dataVal with
+               | .some _ => true
+               | .none => false)
+              (isValidWidePtrMetaVal metaVal)
+          | _ => false
+        | _ =>
+          match rawPtrArgOfValue? ptrBytes v with
+          | .some _ => true
+          | .none => false
+      | .ref _ pointee =>
+        match pointee with
+        | .slice _ | .str | .dynamic _ =>
+          match v with
+          | .aggregate 0 (dataVal :: metaVal :: .nil) =>
+            match rawPtrArgOfValue? ptrBytes dataVal with
+            | .some arg =>
+              Bool.and (Bool.not (rawPtrArgIsNull arg)) (isValidWidePtrMetaVal metaVal)
+            | .none => false
+          | _ => false
+        | _ =>
+          match rawPtrArgOfValue? ptrBytes v with
+          | .some arg => Bool.not (rawPtrArgIsNull arg)
+          | .none => false
+      | .fnPtr _ _ _ _ =>
+        match rawPtrArgOfValue? ptrBytes v with
+        | .some arg => Bool.not (rawPtrArgIsNull arg)
+        | .none => false
+      | .tuple .nil | .fnDef _ _ =>
+        match v with
+        | .unit => true
+        | .aggregate 0 .nil => true
+        | _ => false
+      | .tuple (k :: ks) =>
+        match v with
+        | .aggregate 0 fields =>
+          let fieldLays : List LayoutIdx :=
+            match LayoutTable.lookup layouts ty.layoutIdx with
+            | .some l =>
+              match Nat.beq (length l.fieldLayouts) (length (k :: ks)) with
+              | true => l.fieldLayouts
+              | false => .nil
+            | .none => .nil
+          rawPtrTupleFieldsValid? (rawPtrValueValid? fuel' layouts) layouts (k :: ks) fieldLays fields
+        | _ => false
+      | .array _ .zero =>
+        match v with
+        | .aggregate 0 .nil => true
+        | .unit => true
+        | _ => false
+      | .array elemK (.succ n) =>
+        match v with
+        | .aggregate 0 elems =>
+          let elemLayIdx : LayoutIdx :=
+            match LayoutTable.lookup layouts ty.layoutIdx with
+            | .some { fieldLayouts := flIdx :: _, .. } => flIdx
+            | _ => synthKindLayoutIdx layouts elemK
+          Bool.and
+            (Nat.beq (length elems) (.succ n))
+            (rawPtrAllValuesValid? (rawPtrValueValid? fuel' layouts)
+              { kind := elemK, layoutIdx := elemLayIdx } elems)
+        | _ => false
+      | .adt _ _ =>
+        match v with
+        | .aggregate varIdx _ =>
+          match LayoutTable.lookup layouts ty.layoutIdx with
+          | .some { variants := .single expectedVar, .. } => Nat.beq varIdx expectedVar
+          | _ => true
+        | .unit =>
+          match LayoutTable.lookup layouts ty.layoutIdx with
+          | .some l => Nat.beq l.size.bytes 0
+          | .none => false
+        | .scalar sc =>
+          match LayoutTable.lookup layouts ty.layoutIdx with
+          | .some { fields := .primitive, size := sz, backendRepr := .scalar (.initialized _ vr), .. } =>
+            Bool.and (Nat.beq sc.sizeBytes sz.bytes) (wrappingRangeContains vr sc.bits)
+          | .some { fields := .primitive, size := sz, .. } => Nat.beq sc.sizeBytes sz.bytes
+          | _ => false
+        | .ptr _ pSz =>
+          match LayoutTable.lookup layouts ty.layoutIdx with
+          | .some { fields := .primitive, size := sz, .. } => Nat.beq pSz sz.bytes
+          | _ => false
+        | _ => false
+      | _ => true
 
 /--
 Encode the value `v` of a place of type `ty` to its byte representation, as
@@ -3497,22 +3809,134 @@ inductive RawPtrLoadResult : Type where
   | fault (kind : FailureKind) : RawPtrLoadResult
 
 /--
+Decode `bytes` as a thin pointer (`isThinPtrKind elemKind = true`) of width
+`ptrBytes` without forging provenance or discarding Tree Borrows tags:
+- uninitialized bytes fault with `.ub` (raw pointers, references, and function
+  pointers must be initialized in Rust 1.98.0);
+- all-plain bytes (no provenance) decode to the provenance-less address
+  `Value.scalar ⟨bits, ptrBytes⟩` for `.rawPtr`, to `.ub` on address `0` for
+  `.ref` / `.fnPtr`, and to `.unsupported` on non-zero address for `.ref` /
+  `.fnPtr`;
+- bytes carrying one uniform provenance `(allocId, tag)` decode to
+  `Value.ptr { allocId, offsetBytes := bits } ptrBytes` (where `allocId` is the
+  pointer's Tree Borrows tag), rejecting null (`allocId = 0 ∧ bits = 0`) for
+  `.ref` / `.fnPtr`;
+- mixed-provenance or wrong-length byte sequences fail closed with
+  `.unsupported`.
+
+Reference (The Rust Reference, "Behavior considered undefined — Invalid
+values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "- An integer (`i*`/`u*`), floating point value (`f*`), or raw pointer must be initialized, i.e., must not be obtained from uninitialized memory."
+
+Reference (`core::ptr` module documentation, `library/core/src/ptr/mod.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L157-L161>
+
+> "//! A pointer value in Rust semantically contains the following information:
+> //!
+> //! * The **address** it points to, which can be represented by a `usize`.
+> //! * The **provenance** it has, defining the memory it has permission to access. Provenance can be
+> //!   absent, in which case the pointer does not have permission to access any memory."
+-/
+def rawPtrDecodeThinPtr
+    (ptrBytes : Nat)
+    (elemKind : RigidTy)
+    (bytes : List AbstractByte) :
+    RawPtrLoadResult :=
+  match Nat.beq (length bytes) ptrBytes with
+  | false => .fault .unsupported
+  | true =>
+    match rawPtrBytesAnyUninit bytes with
+    | true => .fault .ub
+    | false =>
+      match bytes with
+      | .init _ .none :: _ =>
+        match rawPtrBytesAllPlainInit bytes, decodeLittleEndianBytes bytes with
+        | true, .some (bits, _) =>
+          match elemKind with
+          | .rawPtr _ _ => .ok (.scalar ⟨bits, ptrBytes⟩)
+          | .ref _ _ | .fnPtr _ _ _ _ =>
+            match Nat.beq bits 0 with
+            | true => .fault .ub
+            | false => .fault .unsupported
+          | _ => .fault .unsupported
+        | _, _ => .fault .unsupported
+      | .init _ (.some (allocId, tag)) :: _ =>
+        match rawPtrBytesUniformProv allocId tag bytes, decodeLittleEndianBytes bytes with
+        | true, .some (bits, _) =>
+          let isNonNullKind : Bool :=
+            match elemKind with
+            | .ref _ _ | .fnPtr _ _ _ _ => true
+            | _ => false
+          match Bool.and isNonNullKind (Bool.and (Nat.beq allocId 0) (Nat.beq bits 0)) with
+          | true => .fault .ub
+          | false =>
+            .ok (.ptr { allocId := allocId, offsetBytes := bits } ptrBytes)
+        | _, _ => .fault .unsupported
+      | _ => .fault .unsupported
+
+/--
+Decode `bytes` at `elemTy` for a raw-pointer load from either a stack local or
+a captured global allocation:
+- thin pointers use `rawPtrDecodeThinPtr` (preserving provenance/tag and never
+  forging an `allocId` from plain integer bytes);
+- non-thin-pointer types fail closed with `.unsupported` whenever any byte
+  carries pointer provenance (reading pointer bytes as integers or byte arrays
+  depends on the pointer's runtime address and must never return an invented
+  `0`);
+- all other byte sequences decode via `decodeTypedValueFromBytes`, checking
+  initialization (`valueContainsUninit`) and structural validity
+  (`rawPtrValueValid?`) and classifying decode failure via `rawPtrDecodeFault`.
+
+Reference (The Rust Reference, "Behavior considered undefined — Invalid
+values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
+
+> "Note: Uninitialized memory is also implicitly invalid for any type that has a restricted set of valid values. In other words, the only cases in which reading uninitialized memory is permitted are inside `union`s and in “padding” (the gaps between the fields of a type)."
+-/
+def rawPtrDecodeBytes
+    (bodyLayouts : LayoutTable)
+    (elemTy : Ty)
+    (bytes : List AbstractByte) :
+    RawPtrLoadResult :=
+  match isThinPtrKind elemTy.kind with
+  | true => rawPtrDecodeThinPtr (layoutPointerBytes bodyLayouts) elemTy.kind bytes
+  | false =>
+    match rawPtrBytesAnyProv bytes with
+    | true => .fault .unsupported
+    | false =>
+      match decodeTypedValueFromBytes defaultCodecFuel bodyLayouts elemTy bytes with
+      | .none => .fault (rawPtrDecodeFault elemTy.kind bytes)
+      | .some v =>
+        match valueContainsUninit v with
+        | true => .fault (rawPtrUninitFault elemTy.kind)
+        | false =>
+          match rawPtrValueValid? 16 bodyLayouts elemTy v with
+          | true => .ok v
+          | false => .fault .ub
+
+/--
 Load a value of type `elemTy` (of `accessBytes > 0` bytes) at byte offset
 `offsetBytes` of the target place of `entry`, whose type is `placeTy` and whose
-local has slot `slot` (as resolved by `resolveRawPtrStackTarget`).
+local has slot `slot` in owning-frame slots `targetLocals` (as resolved by
+`resolveRawPtrStackTarget`).
 
 - An uninitialized target local faults with `rawPtrUninitFault`.
 - When the access covers the target place exactly at its own type
   (`offsetBytes = 0` and `placeTy` is `elemTy`), the value is the place's value
-  (`readProjectedForLocal`). This path does not depend on the place's address,
-  so it serves unaligned places such as a field of a `#[repr(packed)]` struct.
+  (`readProjectedForLocal` using `targetLocals`). This path does not depend on
+  the place's address, so it serves unaligned places such as a field of a
+  `#[repr(packed)]` struct.
 - Otherwise the place's value is encoded to bytes (`rawPtrEncodeValue?`), the
   accessed bytes are sliced out, and they are decoded at `elemTy`
-  (`decodeTypedValueFromBytes`): a load at an interior byte offset or at
-  another type. A place without a byte encoding is unsupported; bytes that do
-  not decode fault with `rawPtrDecodeFault`.
+  (`rawPtrDecodeBytes`): a load at an interior byte offset or at another type.
 - The loaded value must be fully initialized (`valueContainsUninit`, else
-  `rawPtrUninitFault`) and valid for `elemTy` (`validateValueForTy?`, else
+  `rawPtrUninitFault`) and valid for `elemTy` (`rawPtrValueValid?`, else
   `.ub`).
 
 Reference (`core::ptr::read_unaligned` documentation,
@@ -3544,7 +3968,7 @@ Modeling choice: the typed value representation and its byte codec are
 Anneal's. Shapes they cannot express are unsupported, never a successful load.
 -/
 def loadRawPtrStackValue
-    (locals' : List LocalSlot)
+    (targetLocals : List LocalSlot)
     (bodyLayouts : LayoutTable)
     (targetDecls : List LocalDecl)
     (targetLayouts : LayoutTable)
@@ -3562,7 +3986,7 @@ def loadRawPtrStackValue
       | .nil => .ok rootVal
       | pHead :: pTail =>
         readProjectedForLocal
-          locals'
+          targetLocals
           targetDecls
           targetLayouts
           entry.targetLocal
@@ -3572,38 +3996,284 @@ def loadRawPtrStackValue
     | .ub => .fault .ub
     | .unsupported => .fault .unsupported
     | .ok baseVal =>
-      let loaded : RawPtrLoadResult :=
-        match Bool.and (Nat.beq offsetBytes 0) (rigidTyEq placeTy.kind elemTy.kind) with
-        | true => .ok baseVal
-        | false =>
-          match rawPtrEncodeValue? targetDecls targetLayouts placeTy baseVal with
-          | .none => .fault .unsupported
-          | .some baseBytes =>
-            match sliceAbstractBytes baseBytes offsetBytes accessBytes with
-            | .none => .fault .unsupported
-            | .some accessed =>
-              match decodeTypedValueFromBytes defaultCodecFuel bodyLayouts elemTy accessed with
-              | .some v => .ok v
-              | .none => .fault (rawPtrDecodeFault elemTy.kind accessed)
-      match loaded with
-      | .fault kind => .fault kind
-      | .ok v =>
-        match valueContainsUninit v with
+      match Bool.and (Nat.beq offsetBytes 0) (rigidTyEq placeTy.kind elemTy.kind) with
+      | true =>
+        match valueContainsUninit baseVal with
         | true => .fault (rawPtrUninitFault elemTy.kind)
         | false =>
-          match validateValueForTy? bodyLayouts (.some elemTy) v with
-          | true => .ok v
+          match rawPtrValueValid? 16 bodyLayouts elemTy baseVal with
+          | true => .ok baseVal
           | false => .fault .ub
+      | false =>
+        match rawPtrEncodeValue? targetDecls targetLayouts placeTy baseVal with
+        | .none => .fault .unsupported
+        | .some baseBytes =>
+          match sliceAbstractBytes baseBytes offsetBytes accessBytes with
+          | .none => .fault .unsupported
+          | .some accessed => rawPtrDecodeBytes bodyLayouts elemTy accessed
 
 /--
-Tree Borrows read check and transition for a load through the raw pointer `ptr`
-with entry `entry`, over the entry's whole target place: exactly the check and
-transition `evalUseRvalue` applies to the load `copy (*ptr)`
-(`derefReadTreeUB`, `freezeDerefReadBorrowsAt`). With two or more borrow
-entries, a read that is undefined behavior somewhere in the hierarchy
-(`hasTreeReadUB`) yields `.none`, and otherwise the foreign-read transition
-(`freezeTreeBorrowsOnReadAtProj`) is applied; with fewer entries the only entry
-is the reader's own, which a child read leaves unchanged.
+Structural equality on `TreeBorrowPerm` values. Used to detect foreign Tree
+Borrows transitions that are guaranteed no-ops regardless of byte overlap.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+-/
+@[reducible]
+def rawPtrTreeBorrowPermEq : TreeBorrowPerm → TreeBorrowPerm → Bool
+  | .cell, .cell => true
+  | .reservedFrz c₁, .reservedFrz c₂ =>
+    match c₁, c₂ with
+    | true, true => true
+    | false, false => true
+    | _, _ => false
+  | .reservedIM, .reservedIM => true
+  | .unique, .unique => true
+  | .frozen, .frozen => true
+  | .disabled, .disabled => true
+  | _, _ => false
+
+/--
+Outcome of applying a byte-range-aware Tree Borrows access to a borrow list
+(`borrowsAfterRawPtrAccess`, `borrowsAfterRawPtrCopy`): updated borrow list
+(`.ok`) or a fault (`.fault .ub` on aliasing / protector UB, `.fault
+.unsupported` when byte overlap against a conflicting foreign borrow cannot be
+decided).
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+-/
+inductive RawPtrBorrowResult : Type where
+  /-- Updated Tree Borrows list after the access. -/
+  | ok (borrows' : List BorrowEntry) : RawPtrBorrowResult
+  /-- The access faults with `kind`. -/
+  | fault (kind : FailureKind) : RawPtrBorrowResult
+
+/--
+Decide whether foreign borrow entry `b` on the same `(targetFrameDepth,
+targetLocal)` overlaps a raw-pointer access of `accessBytes > 0` bytes at
+`offsetBytes` inside `entry.targetProjection` (of byte size `placeSize`):
+`.some true` (definitely overlaps), `.some false` (definitely disjoint), or
+`.none` (byte range undecidable).
+
+When `accessBytes < placeSize` (a strict sub-range access through a container
+pointer) or `b.rangeLen ≠ 0`, both the accessed interval and `b`'s interval are
+resolved to byte ranges within the root local so disjoint sibling/child borrows
+are never falsely invalidated or flagged as protector UB.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+
+Modeling choice: byte-interval overlap resolution uses Anneal's
+`projectionChainByteOffset?` and `tyByteSize` helpers and returns `.none` (fail
+closed when the transition matters) if either interval cannot be computed.
+-/
+def rawPtrEntryOverlapsAccess
+    (targetDecls : List LocalDecl)
+    (targetLayouts : LayoutTable)
+    (rootTy : Ty)
+    (rootValOpt : Option Value)
+    (entry : BorrowEntry)
+    (offsetBytes accessBytes placeSize : Nat)
+    (b : BorrowEntry) :
+    Option Bool :=
+  let fullPlace : Bool :=
+    Bool.and (Nat.beq offsetBytes 0) (Nat.beq accessBytes placeSize)
+  match Nat.beq b.rangeLen 0, b.targetProjection with
+  | true, .nil => .some true
+  | true, _ :: _ =>
+    match fullPlace with
+    | true => .some (projectionsOverlap b.targetProjection entry.targetProjection)
+    | false =>
+      match projectionsOverlap b.targetProjection entry.targetProjection with
+      | false => .some false
+      | true =>
+        let entryBaseOpt :=
+          projectionChainByteOffset?
+            targetLayouts
+            (.some rootTy)
+            rootValOpt
+            .none
+            0
+            targetDecls
+            (normalizeSubsliceProjections
+              (stripTransparentProjections entry.targetProjection))
+        let bBaseOpt :=
+          projectionChainByteOffset?
+            targetLayouts
+            (.some rootTy)
+            rootValOpt
+            .none
+            0
+            targetDecls
+            (normalizeSubsliceProjections
+              (stripTransparentProjections b.targetProjection))
+        let bSizeOpt : Option Nat :=
+          match
+            placeTyResolved
+              targetDecls
+              targetLayouts
+              { local_ := b.targetLocal, projection := b.targetProjection }
+          with
+          | .some bPlaceTy => tyByteSize targetDecls targetLayouts bPlaceTy
+          | .none => .none
+        match entryBaseOpt, bBaseOpt, bSizeOpt with
+        | .some entryBase, .some bBase, .some bSize =>
+          .some (byteRangesOverlapBool (Nat.add entryBase offsetBytes) accessBytes bBase bSize)
+        | _, _, _ => .none
+  | false, _ =>
+    let entryBaseOpt :=
+      projectionChainByteOffset?
+        targetLayouts
+        (.some rootTy)
+        rootValOpt
+        .none
+        0
+        targetDecls
+        (normalizeSubsliceProjections
+          (stripTransparentProjections entry.targetProjection))
+    match entryBaseOpt with
+    | .some entryBase =>
+      .some
+        (byteRangesOverlapBool
+          (Nat.add entryBase offsetBytes)
+          accessBytes
+          b.rangeOffset
+          b.rangeLen)
+    | .none => .none
+
+/--
+Apply a single Tree Borrows read or write access through `accessTag` (whose
+borrow entry is `entry`) across the suffix `bs` of `allBorrows`, preserving
+list length on `.ok`.
+
+- Ancestor-or-self entries (`isBorrowDescendantOrSelf allBorrows accessTag
+  b.tag = true`) undergo `treeBorrowNodeAccess accessKind .localAccess` with
+  protector status `isBorrowProtected activeProtectors b` (catching `.disabled`
+  on read/write, `.frozen` on write, and protected `.reservedFrz true` on write
+  across the entire ancestor chain, and activating reservations on write).
+- Foreign entries on the same `(targetFrameDepth, targetLocal)` undergo
+  `treeBorrowNodeAccess accessKind .foreignAccess` iff they overlap the accessed
+  byte range (`rawPtrEntryOverlapsAccess`); guaranteed no-op transitions skip
+  overlap resolution, and undecidable non-noop overlaps fail closed with
+  `.unsupported` while still letting any definite `.ub` later in `bs` win.
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/perms.rs` and `tree.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/perms.rs#L179-L198>
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/tree.rs#L157-L159>
+
+> "ReservedFrz { conflicted: true } if protected => return None,
+> ReservedFrz { .. } | ReservedIM | Unique => Unique,
+> Frozen | Disabled => return None,"
+
+> "if protected && self.accessed && transition.produces_disabled() {
+>     return Err(TransitionError::ProtectedDisabled(old_perm));
+> }"
+-/
+def rawPtrBorrowStepList
+    (allBorrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (accessKind : TreeBorrowAccessKind)
+    (targetDecls : List LocalDecl)
+    (targetLayouts : LayoutTable)
+    (rootTy : Ty)
+    (rootValOpt : Option Value)
+    (accessTag : Nat)
+    (entry : BorrowEntry)
+    (offsetBytes accessBytes placeSize : Nat) :
+    List BorrowEntry → RawPtrBorrowResult
+  | .nil => .ok .nil
+  | b :: rest =>
+    match
+      Bool.and
+        (Nat.beq b.targetFrameDepth entry.targetFrameDepth)
+        (Nat.beq b.targetLocal entry.targetLocal)
+    with
+    | false =>
+      match
+        rawPtrBorrowStepList
+          allBorrows activeProtectors accessKind targetDecls targetLayouts rootTy rootValOpt
+          accessTag entry offsetBytes accessBytes placeSize rest
+      with
+      | .ok rest' => .ok (b :: rest')
+      | .fault kind => .fault kind
+    | true =>
+      let isProt := isBorrowProtected activeProtectors b
+      match isBorrowDescendantOrSelf allBorrows accessTag b.tag with
+      | true =>
+        let tr := treeBorrowNodeAccess accessKind .localAccess b.perm isProt
+        match treeBorrowTransitionIsUB tr with
+        | true => .fault .ub
+        | false =>
+          let b' := applyTreeBorrowTransition b tr
+          match
+            rawPtrBorrowStepList
+              allBorrows activeProtectors accessKind targetDecls targetLayouts rootTy rootValOpt
+              accessTag entry offsetBytes accessBytes placeSize rest
+          with
+          | .ok rest' => .ok (b' :: rest')
+          | .fault kind => .fault kind
+      | false =>
+        let tr := treeBorrowNodeAccess accessKind .foreignAccess b.perm isProt
+        let isNoop : Bool :=
+          match tr with
+          | .transition p' => rawPtrTreeBorrowPermEq p' b.perm
+          | _ => false
+        match isNoop with
+        | true =>
+          match
+            rawPtrBorrowStepList
+              allBorrows activeProtectors accessKind targetDecls targetLayouts rootTy rootValOpt
+              accessTag entry offsetBytes accessBytes placeSize rest
+          with
+          | .ok rest' => .ok (b :: rest')
+          | .fault kind => .fault kind
+        | false =>
+          match
+            rawPtrEntryOverlapsAccess
+              targetDecls targetLayouts rootTy rootValOpt entry offsetBytes accessBytes placeSize b
+          with
+          | .some false =>
+            match
+              rawPtrBorrowStepList
+                allBorrows activeProtectors accessKind targetDecls targetLayouts rootTy rootValOpt
+                accessTag entry offsetBytes accessBytes placeSize rest
+            with
+            | .ok rest' => .ok (b :: rest')
+            | .fault kind => .fault kind
+          | .some true =>
+            match treeBorrowTransitionIsUB tr with
+            | true => .fault .ub
+            | false =>
+              let b' := applyTreeBorrowTransition b tr
+              match
+                rawPtrBorrowStepList
+                  allBorrows activeProtectors accessKind targetDecls targetLayouts rootTy rootValOpt
+                  accessTag entry offsetBytes accessBytes placeSize rest
+              with
+              | .ok rest' => .ok (b' :: rest')
+              | .fault kind => .fault kind
+          | .none =>
+            match
+              rawPtrBorrowStepList
+                allBorrows activeProtectors accessKind targetDecls targetLayouts rootTy rootValOpt
+                accessTag entry offsetBytes accessBytes placeSize rest
+            with
+            | .fault .ub => .fault .ub
+            | _ => .fault .unsupported
+
+/--
+Byte-range-aware Tree Borrows check and permission transition for a raw-pointer
+read (`accessKind = .read`) or write (`accessKind = .write`) of `accessBytes`
+bytes at `offsetBytes` within `entry`'s target place (of size `placeSize`).
 
 Reference (`core::ptr::read_volatile` documentation,
 `library/core/src/ptr/mod.rs` at commit
@@ -3626,49 +4296,113 @@ Reference (The Rust Reference, "Behavior considered undefined"):
 Modeling choice: Tree Borrows is Anneal's aliasing model; the Reference does
 not fix the aliasing rules.
 -/
-def borrowsAfterRawPtrRead
+@[reducible]
+def borrowsAfterRawPtrAccess
     (borrows : List BorrowEntry)
     (activeProtectors : List Nat)
-    (ptr : ProvenancePtr)
-    (entry : BorrowEntry) :
-    Option (List BorrowEntry) :=
-  match borrows with
-  | b₁ :: b₂ :: restBorrows =>
-    let allBorrows := b₁ :: b₂ :: restBorrows
-    match
-      hasTreeReadUB
-        allBorrows
-        allBorrows
-        activeProtectors
-        entry.targetLocal
-        (.some ptr.tag)
-        entry.targetProjection
-        entry.rangeOffset
-        entry.rangeLen
-        entry.targetFrameDepth
-    with
-    | true => .none
-    | false =>
-      .some
-        (freezeTreeBorrowsOnReadAtProj
-          allBorrows
-          allBorrows
-          entry.targetLocal
-          (.some ptr.tag)
-          entry.targetProjection
-          entry.rangeOffset
-          entry.rangeLen
-          activeProtectors
-          entry.targetFrameDepth)
-  | _ => .some borrows
+    (accessKind : TreeBorrowAccessKind)
+    (targetDecls : List LocalDecl)
+    (targetLayouts : LayoutTable)
+    (rootTy : Ty)
+    (rootValOpt : Option Value)
+    (accessTag : Nat)
+    (entry : BorrowEntry)
+    (offsetBytes accessBytes placeSize : Nat) :
+    RawPtrBorrowResult :=
+  rawPtrBorrowStepList
+    borrows
+    activeProtectors
+    accessKind
+    targetDecls
+    targetLayouts
+    rootTy
+    rootValOpt
+    accessTag
+    entry
+    offsetBytes
+    accessBytes
+    placeSize
+    borrows
 
 /--
-Construct the unique value of the zero-sized type `elemTy`: `Value.unit` for
-the types `isZeroSizedUnitElemTy` represents by it (`()`, function items,
-zero-length arrays, and tuples and arrays of these), and otherwise the value
-`decodeTypedValueFromBytes` decodes from zero bytes (for example a fieldless
-struct). Returns `.none`, which callers treat as unsupported, when the codec
-has no value of `elemTy` over zero bytes.
+Two-phase Tree Borrows read-then-write check and transition for a volatile copy
+(`volatile_copy_nonoverlapping_memory` or `volatile_copy_memory`) of `byteCount`
+bytes from `(srcPtr, srcEntry)` to `(dstPtr, dstEntry)`: first applies the
+source read (`borrowsAfterRawPtrAccess .read`), then looks up `dstPtr.tag` in
+the post-read borrow state and applies the destination write
+(`borrowsAfterRawPtrAccess .write`). If the source read freezes or conflicts a
+protected destination tag, the destination write faults with `.ub`.
+
+Reference (`core::ptr::copy` documentation, `library/core/src/ptr/mod.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L575-L580>
+
+> "/// * `src` must be [valid] for reads of `count * size_of::<T>()` bytes or that number must be 0.
+> ///
+> /// * `dst` must be [valid] for writes of `count * size_of::<T>()` bytes or that number must be 0,
+> ///   and `dst` must remain valid even when `src` is read for `count * size_of::<T>()` bytes. (This
+> ///   means if the memory ranges overlap, the `dst` pointer must not be invalidated by `src` reads.)"
+-/
+def borrowsAfterRawPtrCopy
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (srcDecls : List LocalDecl)
+    (srcLayouts : LayoutTable)
+    (srcRootTy : Ty)
+    (srcRootValOpt : Option Value)
+    (srcPtr : ProvenancePtr)
+    (srcEntry : BorrowEntry)
+    (srcPlaceSize : Nat)
+    (dstDecls : List LocalDecl)
+    (dstLayouts : LayoutTable)
+    (dstRootTy : Ty)
+    (dstRootValOpt : Option Value)
+    (dstPtr : ProvenancePtr)
+    (dstPlaceSize : Nat)
+    (byteCount : Nat) :
+    RawPtrBorrowResult :=
+  match
+    borrowsAfterRawPtrAccess
+      borrows
+      activeProtectors
+      .read
+      srcDecls
+      srcLayouts
+      srcRootTy
+      srcRootValOpt
+      srcPtr.tag
+      srcEntry
+      srcPtr.offsetBytes
+      byteCount
+      srcPlaceSize
+  with
+  | .fault kind => .fault kind
+  | .ok borrows1 =>
+    match lookupBorrow borrows1 dstPtr.tag with
+    | .none => .fault .unsupported
+    | .some dstEntry1 =>
+      borrowsAfterRawPtrAccess
+        borrows1
+        activeProtectors
+        .write
+        dstDecls
+        dstLayouts
+        dstRootTy
+        dstRootValOpt
+        dstPtr.tag
+        dstEntry1
+        dstPtr.offsetBytes
+        byteCount
+        dstPlaceSize
+
+/--
+Construct the canonical unique `Value` of an inhabited zero-sized type `elemTy`
+by decoding zero bytes via `decodeTypedValueFromBytes`: `Value.unit` for `()`
+and function items, `Value.aggregate 0 .nil` for `[T; 0]`, nested `.aggregate`
+tuples/arrays of ZSTs (preserving field/element projections), and
+`Value.aggregate variantIdx .nil` for unit structs. Returns `.none`, which
+callers treat as unsupported, when the codec has no value of `elemTy` over zero
+bytes.
 
 Reference (`core::ptr::read_volatile` documentation,
 `library/core/src/ptr/mod.rs` at commit
@@ -3682,9 +4416,7 @@ size `0`, which has exactly one value; its `Value` representation is Anneal's.
 -/
 @[reducible]
 def rawPtrZstValue? (bodyLayouts : LayoutTable) (elemTy : Ty) : Option Value :=
-  match isZeroSizedUnitElemTy 8 elemTy.kind with
-  | true => .some .unit
-  | false => decodeTypedValueFromBytes defaultCodecFuel bodyLayouts elemTy .nil
+  decodeTypedValueFromBytes defaultCodecFuel bodyLayouts elemTy .nil
 
 /--
 Outcome of the machine-state-independent part of a raw-pointer memory access
@@ -4001,25 +4733,12 @@ def rawPtrLoadAction
                   match Nat.ble (Nat.add ptr.offsetBytes size) (length alloc.bytes) with
                   | false => .fault .ub
                   | true =>
-                    match
-                      evalGlobalDerefRead
-                        locals'
-                        alloc
-                        ptr.offsetBytes
-                        ptrBytes
-                        .nil
-                        bodyLayouts
-                        (.some elemTy)
-                    with
-                    | .ok v _ =>
-                      match valueContainsUninit v with
-                      | true => .fault (rawPtrUninitFault elemTy.kind)
-                      | false =>
-                        match validateValueForTy? bodyLayouts (.some elemTy) v with
-                        | true => .ret v
-                        | false => .fault .ub
-                    | .ub => .fault .ub
-                    | .unsupported => .fault .unsupported
+                    match globalAllocSliceToAbstractBytes alloc ptr.offsetBytes size with
+                    | .none => .fault .unsupported
+                    | .some absBytes =>
+                      match rawPtrDecodeBytes bodyLayouts elemTy absBytes with
+                      | .fault kind => .fault kind
+                      | .ok v => .ret v
                 | .stack ptr entry =>
                   match
                     resolveRawPtrStackTarget
@@ -4033,25 +4752,43 @@ def rawPtrLoadAction
                       false
                   with
                   | .fault kind => .fault kind
-                  | .ok targetDecls targetLayouts placeTy slot =>
+                  | .ok targetLocals targetDecls targetLayouts rootTy placeTy placeSize slot =>
+                    let rootValOpt : Option Value :=
+                      match slot with
+                      | .init rv => .some rv
+                      | _ => .none
                     match
-                      loadRawPtrStackValue
-                        locals'
-                        bodyLayouts
+                      borrowsAfterRawPtrAccess
+                        borrows
+                        activeProtectors
+                        .read
                         targetDecls
                         targetLayouts
+                        rootTy
+                        rootValOpt
+                        ptr.tag
                         entry
                         ptr.offsetBytes
                         size
-                        placeTy
-                        elemTy
-                        slot
+                        placeSize
                     with
                     | .fault kind => .fault kind
-                    | .ok v =>
-                      match borrowsAfterRawPtrRead borrows activeProtectors ptr entry with
-                      | .none => .fault .ub
-                      | .some borrows' => .retBorrows borrows' v
+                    | .ok borrows' =>
+                      match
+                        loadRawPtrStackValue
+                          targetLocals
+                          bodyLayouts
+                          targetDecls
+                          targetLayouts
+                          entry
+                          ptr.offsetBytes
+                          size
+                          placeTy
+                          elemTy
+                          slot
+                      with
+                      | .fault kind => .fault kind
+                      | .ok v => .retBorrows borrows' v
   | _ => .fault .ub
 
 /--
@@ -4105,12 +4842,12 @@ def evalRawPtrLoadCall
       locals')
 
 /--
-Fault of storing the argument value `val` at type `elemTy` of `size` bytes, or
-`.none` when `val` is a storable value of `elemTy`:
+Fault of storing the argument value `val` at type `elemTy`, or `.none` when
+`val` is a storable value of `elemTy`:
 - a value containing `Value.uninit` faults with `rawPtrUninitFault`;
-- a value that is invalid for `elemTy` (`validateValueForTy?`) is `.ub`;
-- for a primitive scalar `elemTy`, a value that is not a scalar of exactly
-  `size` bytes is `.ub` (the call passes an ABI-incompatible argument).
+- a value failing `rawPtrValueValid?` (invalid `bool`/`char` bits including
+  inside tuples/arrays, null `&T`/`fn()`, uninhabited `T`, scalar width
+  mismatch, or ABI-incompatible value shape) is `.ub`.
 
 Reference (The Rust Reference, "Behavior considered undefined — Invalid
 values"):
@@ -4127,22 +4864,14 @@ values"):
 def rawPtrStoreValueFault?
     (bodyLayouts : LayoutTable)
     (elemTy : Ty)
-    (size : Nat)
     (val : Value) :
     Option FailureKind :=
   match valueContainsUninit val with
   | true => .some (rawPtrUninitFault elemTy.kind)
   | false =>
-    match validateValueForTy? bodyLayouts (.some elemTy) val with
+    match rawPtrValueValid? 16 bodyLayouts elemTy val with
+    | true => .none
     | false => .some .ub
-    | true =>
-      match isPrimitiveScalarKind elemTy.kind, val with
-      | true, .scalar sc =>
-        match Nat.beq sc.sizeBytes size with
-        | true => .none
-        | false => .some .ub
-      | true, _ => .some .ub
-      | false, _ => .none
 
 /--
 Outcome of storing a typed value through a tracked raw pointer
@@ -4163,24 +4892,224 @@ inductive RawPtrStoreResult : Type where
   | fault (kind : FailureKind) : RawPtrStoreResult
 
 /--
+Decode the bytes `bytes` at the type `ty` of the aggregate value `oldVal` they
+replace: at the layout-faithful type `resolveFaithfulAggregateTy?` finds for
+`oldVal` (the type `rawPtrEncodeValue?` encodes it at). Returns `.none` for a
+non-aggregate `oldVal`, for an aggregate without a layout-faithful type, when
+any byte carries pointer provenance (so provenance is never silently discarded
+into an integer or tag-stripped pointer), and for bytes that are not a valid
+value of that type.
+
+Reference (`core::ptr::copy` documentation, `library/core/src/ptr/mod.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L566-L567>
+
+> "/// The copy is "untyped" in the sense that data may be uninitialized or otherwise violate the
+> /// requirements of `T`. The initialization state is preserved exactly."
+
+Modeling choice: a typed slot holds only valid values of its type, so bytes
+that do not decode make the store/copy/set unsupported rather than undefined
+behavior.
+-/
+def rawPtrDecodeAggregate?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (ty : Ty)
+    (oldVal : Value)
+    (bytes : List AbstractByte) :
+    Option Value :=
+  match rawPtrBytesAnyProv bytes with
+  | true => .none
+  | false =>
+    match oldVal with
+    | .aggregate varIdx fields =>
+      match resolveFaithfulAggregateTy? localDecls layouts ty varIdx fields with
+      | .some resolvedTy =>
+        match decodeTypedValueFromBytes defaultCodecFuel layouts resolvedTy bytes with
+        | .some newVal =>
+          match rawPtrValueValid? 16 layouts resolvedTy newVal with
+          | true => .some newVal
+          | false => .none
+        | .none => .none
+      | .none => .none
+    | _ => .none
+
+/--
+Splice `patchBytes` at byte offset `offsetBytes` into the existing value
+`oldVal` of a stack place of type `placeTy`, returning the decoded replacement
+`Value` or `.none` (fail-closed unsupported):
+- scalars require all-plain-init merged bytes and valid scalar bits for
+  `placeTy` (`rawPtrValueValid?`, so writing invalid `bool`/`char` bits or
+  pointer provenance into a typed scalar slot fails closed rather than
+  corrupting the slot);
+- thin pointers decode via `rawPtrDecodeThinPtr` (preserving `(allocId, tag)`
+  and never forging an `allocId` from plain integer bytes);
+- aggregates encode via `rawPtrEncodeValue?`, splice, and decode via
+  `rawPtrDecodeAggregate?`.
+
+Reference (`core::ptr::write_bytes` documentation, `library/core/src/ptr/mod.rs`
+at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L665-L667>
+
+> "/// Additionally, note that changing `*dst` in this way can easily lead to undefined behavior (UB)
+> /// later if the written bytes are not a valid representation of some `T`. For instance, the
+> /// following is an **incorrect** use of this function:"
+
+Modeling choice: a typed slot holds only valid values of its declared type;
+writing bytes that violate `placeTy`'s validity invariant (which is not itself
+UB in Rust until read at `placeTy`) fails closed as `.unsupported`.
+-/
+def rawPtrSpliceBytesIntoPlace?
+    (targetDecls : List LocalDecl)
+    (targetLayouts : LayoutTable)
+    (placeTy : Ty)
+    (oldVal : Value)
+    (offsetBytes : Nat)
+    (patchBytes : List AbstractByte) :
+    Option Value :=
+  let ptrBytes := layoutPointerBytes targetLayouts
+  match oldVal with
+  | .uninit => .none
+  | .unit =>
+    match Bool.and (Nat.beq offsetBytes 0) (Nat.beq (length patchBytes) 0) with
+    | true => .some .unit
+    | false => .none
+  | .scalar oldSc =>
+    let oldBytes := encodeLittleEndianBytes oldSc.bits oldSc.sizeBytes .none
+    match writeAbstractBytesAt oldBytes offsetBytes patchBytes with
+    | .none => .none
+    | .some mergedBytes =>
+      match isThinPtrKind placeTy.kind with
+      | true =>
+        match rawPtrDecodeThinPtr ptrBytes placeTy.kind mergedBytes with
+        | .ok v => .some v
+        | .fault _ => .none
+      | false =>
+        match rawPtrBytesAllPlainInit mergedBytes, decodeLittleEndianBytes mergedBytes with
+        | true, .some (mergedBits, _) =>
+          let cand : Value := .scalar ⟨mergedBits, oldSc.sizeBytes⟩
+          match rawPtrValueValid? 16 targetLayouts placeTy cand with
+          | true => .some cand
+          | false => .none
+        | _, _ => .none
+  | .ptr _ pSz =>
+    match Nat.beq pSz ptrBytes with
+    | false => .none
+    | true =>
+      match encodeUntypedValueToBytes defaultCodecFuel oldVal with
+      | .none => .none
+      | .some oldBytes =>
+        match writeAbstractBytesAt oldBytes offsetBytes patchBytes with
+        | .none => .none
+        | .some mergedBytes =>
+          match rawPtrDecodeThinPtr ptrBytes placeTy.kind mergedBytes with
+          | .ok v => .some v
+          | .fault _ => .none
+  | .aggregate _ _ =>
+    match rawPtrEncodeValue? targetDecls targetLayouts placeTy oldVal with
+    | .none => .none
+    | .some oldBytes =>
+      match writeAbstractBytesAt oldBytes offsetBytes patchBytes with
+      | .none => .none
+      | .some mergedBytes =>
+        rawPtrDecodeAggregate? targetDecls targetLayouts placeTy oldVal mergedBytes
+
+/--
+Splice `patchBytes` at byte offset `offsetBytes` into the target place of
+`entry` (whose type is `placeTy`, byte size `placeSize`, and owning local has
+`slot` in owning-frame slots `targetLocals`), returning the target local's new
+slot or a fault (`.ub` on `.dead`, `.unsupported` when the slot cannot hold the
+resulting bytes).
+
+Reference (`core::ptr::write_unaligned` documentation,
+`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L1937-L1940>
+
+> "/// Overwrites a memory location with the given value without reading or
+> /// dropping the old value.
+> ///
+> /// Unlike [`write()`], the pointer may be unaligned."
+-/
+def writeRawPtrBytesToStackSlot
+    (targetLocals : List LocalSlot)
+    (targetDecls : List LocalDecl)
+    (targetLayouts : LayoutTable)
+    (entry : BorrowEntry)
+    (offsetBytes placeSize : Nat)
+    (placeTy : Ty)
+    (slot : LocalSlot)
+    (patchBytes : List AbstractByte) :
+    RawPtrStoreResult :=
+  match slot with
+  | .dead => .fault .ub
+  | .uninit =>
+    match
+      entry.targetProjection,
+      Bool.and (Nat.beq offsetBytes 0) (Nat.beq (length patchBytes) placeSize)
+    with
+    | .nil, true =>
+      match rawPtrDecodeBytes targetLayouts placeTy patchBytes with
+      | .ok v => .ok (.init v)
+      | .fault _ => .fault .unsupported
+    | _, _ => .fault .unsupported
+  | .init rootVal =>
+    let writeBack : Value → RawPtrStoreResult := fun newPlaceVal =>
+      match entry.targetProjection with
+      | .nil => .ok (.init newPlaceVal)
+      | pHead :: pTail =>
+        match
+          writeProjectedForLocal
+            targetLocals
+            targetDecls
+            targetLayouts
+            entry.targetLocal
+            rootVal
+            (pHead :: pTail)
+            newPlaceVal
+        with
+        | .ok rootVal' => .ok (.init rootVal')
+        | .ub => .fault .ub
+        | .unsupported => .fault .unsupported
+    let oldRes : ProjReadResult :=
+      match entry.targetProjection with
+      | .nil => .ok rootVal
+      | pHead :: pTail =>
+        readProjectedForLocal
+          targetLocals
+          targetDecls
+          targetLayouts
+          entry.targetLocal
+          rootVal
+          (pHead :: pTail)
+    match oldRes with
+    | .ok oldVal =>
+      match
+        rawPtrSpliceBytesIntoPlace?
+          targetDecls targetLayouts placeTy oldVal offsetBytes patchBytes
+      with
+      | .some newPlaceVal => writeBack newPlaceVal
+      | .none => .fault .unsupported
+    | _ => .fault .unsupported
+
+/--
 Store the value `val` of type `elemTy` at byte offset `offsetBytes` of the
-target place of `entry`, whose type is `placeTy` and whose local has slot
-`slot` (as resolved by `resolveRawPtrStackTarget`), returning the local's new
-slot.
+target place of `entry`, whose type is `placeTy`, byte size `placeSize`, and
+whose local has slot `slot` in owning-frame slots `targetLocals` (as resolved
+by `resolveRawPtrStackTarget`), returning the local's new slot.
 
 - When the store covers the target place exactly at its own type
   (`offsetBytes = 0` and `placeTy` is `elemTy`), `val` replaces the place's
-  value (`writeProjectedForLocal`, or the whole slot for a whole local, which
-  may be uninitialized). This path does not depend on the place's address, so
-  it serves unaligned places such as a field of a `#[repr(packed)]` struct.
-- Otherwise (an interior byte offset or another type) the bytes of `val` are
-  spliced into the byte representation of the place's current value, which is
-  decoded back at the place's type (`spliceSubValueAtByteOffset?`). When the
-  place has no byte encoding, or the resulting bytes are not a valid value of
-  the place's type, the store is unsupported: the typed slot cannot hold them,
-  although the store itself is not undefined behavior.
-- A store into an uninitialized local other than a whole-local store is
-  unsupported.
+  value (`writeProjectedForLocal` using `targetLocals`, or the whole slot for a
+  whole local, which may be uninitialized). This path does not depend on the
+  place's address, so it serves unaligned places such as a field of a
+  `#[repr(packed)]` struct.
+- Otherwise (an interior byte offset or another type) `val` is encoded to bytes
+  (`rawPtrEncodeValue?`) and spliced into the place via
+  `writeRawPtrBytesToStackSlot`. When the place has no byte encoding, or the
+  resulting bytes are not a valid value of the place's type, the store is
+  unsupported: the typed slot cannot hold them, although the store itself is
+  not undefined behavior.
 
 Reference (`core::ptr::write_unaligned` documentation,
 `library/core/src/ptr/mod.rs` at commit
@@ -4212,74 +5141,58 @@ Modeling choice: the typed value representation and its byte codec are
 Anneal's. Shapes they cannot express are unsupported, never a successful store.
 -/
 def storeRawPtrStackValue
-    (locals' : List LocalSlot)
+    (targetLocals : List LocalSlot)
     (bodyLocalDecls : List LocalDecl)
     (bodyLayouts : LayoutTable)
     (targetDecls : List LocalDecl)
     (targetLayouts : LayoutTable)
     (entry : BorrowEntry)
-    (offsetBytes : Nat)
+    (offsetBytes placeSize : Nat)
     (placeTy elemTy : Ty)
     (slot : LocalSlot)
     (val : Value) :
     RawPtrStoreResult :=
   let isDirect : Bool :=
     Bool.and (Nat.beq offsetBytes 0) (rigidTyEq placeTy.kind elemTy.kind)
-  match slot with
-  | .dead => .fault .ub
-  | .uninit =>
-    match isDirect, entry.targetProjection with
-    | true, .nil => .ok (.init val)
-    | _, _ => .fault .unsupported
-  | .init rootVal =>
-    let writeBack : Value → RawPtrStoreResult := fun newPlaceVal =>
+  match isDirect with
+  | true =>
+    match slot with
+    | .dead => .fault .ub
+    | .uninit =>
       match entry.targetProjection with
-      | .nil => .ok (.init newPlaceVal)
+      | .nil => .ok (.init val)
+      | _ :: _ => .fault .unsupported
+    | .init rootVal =>
+      match entry.targetProjection with
+      | .nil => .ok (.init val)
       | pHead :: pTail =>
         match
           writeProjectedForLocal
-            locals'
+            targetLocals
             targetDecls
             targetLayouts
             entry.targetLocal
             rootVal
             (pHead :: pTail)
-            newPlaceVal
+            val
         with
         | .ok rootVal' => .ok (.init rootVal')
         | .ub => .fault .ub
         | .unsupported => .fault .unsupported
-    match isDirect with
-    | true => writeBack val
-    | false =>
-      let oldRes : ProjReadResult :=
-        match entry.targetProjection with
-        | .nil => .ok rootVal
-        | pHead :: pTail =>
-          readProjectedForLocal
-            locals'
-            targetDecls
-            targetLayouts
-            entry.targetLocal
-            rootVal
-            (pHead :: pTail)
-      match oldRes with
-      | .ok oldVal =>
-        match
-          spliceSubValueAtByteOffset?
-            bodyLocalDecls
-            targetDecls
-            targetLayouts
-            (.some placeTy)
-            oldVal
-            offsetBytes
-            (.some elemTy)
-            val
-            bodyLayouts
-        with
-        | .some newPlaceVal => writeBack newPlaceVal
-        | .none => .fault .unsupported
-      | _ => .fault .unsupported
+  | false =>
+    match rawPtrEncodeValue? bodyLocalDecls bodyLayouts elemTy val with
+    | .none => .fault .unsupported
+    | .some patchBytes =>
+      writeRawPtrBytesToStackSlot
+        targetLocals
+        targetDecls
+        targetLayouts
+        entry
+        offsetBytes
+        placeSize
+        placeTy
+        slot
+        patchBytes
 
 /--
 Compute the `RawPtrCallAction` of a typed store `f::<T>(dst, val)` through the
@@ -4302,9 +5215,11 @@ Checks, in order:
    undecidable alignment is unsupported.
 3. A non-volatile store through a null pointer is `.ub`, even when `T` is
    zero-sized: a null pointer is never valid for writes.
-4. `val` must be a storable value of `T` (`rawPtrStoreValueFault?`).
-5. A zero-sized `T` writes no memory, and no Tree Borrows access happens.
-6. Otherwise (`size_of::<T>() > 0`), by `classifyRawPtrTarget`:
+4. An uninhabited `T` (`tyIsUninhabited`) is `.ub`, even when `T` is
+   zero-sized: passing a value of an uninhabited type is immediate UB.
+5. `val` must be a storable value of `T` (`rawPtrStoreValueFault?`).
+6. A zero-sized `T` writes no memory, and no Tree Borrows access happens.
+7. Otherwise (`size_of::<T>() > 0`), by `classifyRawPtrTarget`:
    - `.outside` (no provenance): a non-volatile store is `.ub`; a volatile
      store may be a store to memory outside all Rust allocations, whose effect
      the hardware defines, so it is unsupported.
@@ -4312,12 +5227,13 @@ Checks, in order:
    - `.global`: a store to an immutable allocation, or past the end of the
      allocation, is `.ub`; a store to a mutable global is unsupported.
    - `.stack`: the target place is resolved and bounds-checked
-     (`resolveRawPtrStackTarget`), the new slot is computed
-     (`storeRawPtrStackValue`), the Tree Borrows write check and transition are
-     applied (`borrowsAfterWriteBytes`: ancestor permissions, active
-     protectors, and invalidation of overlapping foreign borrows), and the slot
-     is committed to its frame (`writeFrameLocalSlot`).
-7. The action returns `()`; `evalRawPtrStoreCall` writes it to the call
+     (`resolveRawPtrStackTarget`), the byte-range-aware Tree Borrows write
+     check and transition are applied (`borrowsAfterRawPtrAccess .write`:
+     ancestor permissions, active protectors, and invalidation of overlapping
+     foreign borrows without clobbering disjoint sibling/child borrows), the new
+     slot is computed (`storeRawPtrStackValue`), and the slot is committed to
+     its frame (`writeFrameLocalSlot`).
+8. The action returns `()`; `evalRawPtrStoreCall` writes it to the call
    destination (`finishRawPtrCallAction`).
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
@@ -4418,6 +5334,11 @@ Reference (The Rust Reference, "Behavior considered undefined"):
 
 > "- Breaking the pointer aliasing rules."
 
+Reference (The Rust Reference, "Never type"):
+<https://doc.rust-lang.org/1.98.0/reference/types/never.html>
+
+> "The never type ! is a type with no values, representing the result of computations that never complete."
+
 Modeling choices and scope:
 - The documentation states the safety contract of `write_volatile` and
   `write_unaligned`, and that `volatile_store` is the intrinsic behind
@@ -4474,70 +5395,92 @@ def rawPtrStoreAction
           match Bool.and (Bool.not isVolatile) (rawPtrArgIsNull dstArg) with
           | true => .fault .ub
           | false =>
-            match rawPtrStoreValueFault? bodyLayouts elemTy size val with
-            | .some kind => .fault kind
-            | .none =>
-              match Nat.beq size 0 with
-              | true => .ret .unit
-              | false =>
-                match dstTgt with
-                | .outside =>
-                  match isVolatile with
-                  | true => .fault .unsupported
-                  | false => .fault .ub
-                | .untracked => .fault .unsupported
-                | .global ptr alloc =>
-                  match
-                    mutabilityEq alloc.mutability .not,
-                    Nat.ble (Nat.add ptr.offsetBytes size) (length alloc.bytes)
-                  with
-                  | false, true => .fault .unsupported
-                  | _, _ => .fault .ub
-                | .stack ptr entry =>
-                  match
-                    resolveRawPtrStackTarget
-                      callStack
-                      locals'
-                      bodyLocalDecls
-                      bodyLayouts
-                      entry
-                      ptr.offsetBytes
-                      size
-                      true
-                  with
-                  | .fault kind => .fault kind
-                  | .ok targetDecls targetLayouts placeTy slot =>
+            match tyIsUninhabited bodyLayouts elemTy with
+            | true => .fault .ub
+            | false =>
+              match rawPtrStoreValueFault? bodyLayouts elemTy val with
+              | .some kind => .fault kind
+              | .none =>
+                match Nat.beq size 0 with
+                | true => .ret .unit
+                | false =>
+                  match dstTgt with
+                  | .outside =>
+                    match isVolatile with
+                    | true => .fault .unsupported
+                    | false => .fault .ub
+                  | .untracked => .fault .unsupported
+                  | .global ptr alloc =>
                     match
-                      storeRawPtrStackValue
+                      mutabilityEq alloc.mutability .not,
+                      Nat.ble (Nat.add ptr.offsetBytes size) (length alloc.bytes)
+                    with
+                    | false, true => .fault .unsupported
+                    | _, _ => .fault .ub
+                  | .stack ptr entry =>
+                    match
+                      resolveRawPtrStackTarget
+                        callStack
                         locals'
                         bodyLocalDecls
                         bodyLayouts
-                        targetDecls
-                        targetLayouts
                         entry
                         ptr.offsetBytes
-                        placeTy
-                        elemTy
-                        slot
-                        val
+                        size
+                        true
                     with
                     | .fault kind => .fault kind
-                    | .ok slot' =>
-                      match borrowsAfterWriteBytes borrows activeProtectors ptr.tag entry with
-                      | .none => .fault .ub
-                      | .some borrows' =>
+                    | .ok targetLocals targetDecls targetLayouts rootTy placeTy placeSize slot =>
+                      let rootValOpt : Option Value :=
+                        match slot with
+                        | .init rv => .some rv
+                        | _ => .none
+                      match
+                        borrowsAfterRawPtrAccess
+                          borrows
+                          activeProtectors
+                          .write
+                          targetDecls
+                          targetLayouts
+                          rootTy
+                          rootValOpt
+                          ptr.tag
+                          entry
+                          ptr.offsetBytes
+                          size
+                          placeSize
+                      with
+                      | .fault kind => .fault kind
+                      | .ok borrows' =>
                         match
-                          writeFrameLocalSlot
-                            locals'
-                            callStack
-                            callerLocals
-                            entry.targetFrameDepth
-                            entry.targetLocal
-                            slot'
+                          storeRawPtrStackValue
+                            targetLocals
+                            bodyLocalDecls
+                            bodyLayouts
+                            targetDecls
+                            targetLayouts
+                            entry
+                            ptr.offsetBytes
+                            placeSize
+                            placeTy
+                            elemTy
+                            slot
+                            val
                         with
-                        | .none => .fault .unsupported
-                        | .some (locals₄, callStack', callerLocals') =>
-                          .retStack borrows' locals₄ callStack' callerLocals' .unit
+                        | .fault kind => .fault kind
+                        | .ok slot' =>
+                          match
+                            writeFrameLocalSlot
+                              locals'
+                              callStack
+                              callerLocals
+                              entry.targetFrameDepth
+                              entry.targetLocal
+                              slot'
+                          with
+                          | .none => .fault .unsupported
+                          | .some (locals₄, callStack', callerLocals') =>
+                            .retStack borrows' locals₄ callStack' callerLocals' .unit
   | _ => .fault .ub
 
 /--
@@ -4593,59 +5536,71 @@ def evalRawPtrStoreCall
       locals')
 
 /--
-Decode the bytes `bytes` at the type `ty` of the aggregate value `oldVal` they
-replace: at the layout-faithful type `resolveFaithfulAggregateTy?` finds for
-`oldVal` (the type `rawPtrEncodeValue?` encodes it at). Returns `.none` for a
-non-aggregate `oldVal`, for an aggregate without a layout-faithful type, and
-for bytes that are not a valid value of that type.
+Construct a list of `n` initialized provenance-less `AbstractByte`s equal to
+`b`, used to build the byte patch of `volatile_set_memory`.
 
-Reference (`core::ptr::copy` documentation, `library/core/src/ptr/mod.rs` at
-commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L566-L567>
+Reference (`core::ptr::write_bytes` documentation, `library/core/src/ptr/mod.rs`
+at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L646-L650>
 
-> "/// The copy is "untyped" in the sense that data may be uninitialized or otherwise violate the
-> /// requirements of `T`. The initialization state is preserved exactly."
-
-Modeling choice: a typed slot holds only valid values of its type, so bytes
-that do not decode make the copy unsupported rather than undefined behavior.
+> "/// Sets `count * size_of::<T>()` bytes of memory starting at `dst` to
+> /// `val`.
+> ///
+> /// `write_bytes` is similar to C's [`memset`], but sets `count *
+> /// size_of::<T>()` bytes to `val`."
 -/
-def rawPtrDecodeAggregate?
-    (localDecls : List LocalDecl)
-    (layouts : LayoutTable)
-    (ty : Ty)
-    (oldVal : Value)
-    (bytes : List AbstractByte) :
-    Option Value :=
-  match oldVal with
-  | .aggregate varIdx fields =>
-    match resolveFaithfulAggregateTy? localDecls layouts ty varIdx fields with
-    | .some resolvedTy =>
-      decodeTypedValueFromBytes defaultCodecFuel layouts resolvedTy bytes
-    | .none => .none
-  | _ => .none
+@[reducible]
+def rawPtrReplicateInitByte (b : UInt8) : Nat → List AbstractByte
+  | .zero => .nil
+  | .succ k => .init b .none :: rawPtrReplicateInitByte b k
 
 /--
-Compute the `RawPtrCallAction` of `volatile_copy_memory::<T>(dst, src, count)`
-for `byteCount = count * size_of::<T>() > 0` bytes when `src` and `dst` are
-tracked by the Tree Borrows entries `srcEntry` and `dstEntry` of the *same*
-stack local, where the two ranges may overlap.
+Compute the `RawPtrCallAction` of `volatile_copy_nonoverlapping_memory::<T>(dst,
+src, count)` (`nonOverlapping = true`) or `volatile_copy_memory::<T>(dst, src,
+count)` (`nonOverlapping = false`) for `byteCount = count * size_of::<T>() > 0`
+bytes when both `src` and `dst` are tracked stack pointers.
 
-The source range is resolved for a read and the destination range for a write
-(`resolveRawPtrStackTarget`, each within its entry's target place). The
-local's value is encoded to bytes (`rawPtrEncodeValue?`), the source bytes are
-read first and then written at the destination (`sliceAbstractBytes`,
-`writeAbstractBytesAt`), and the result is decoded at the local's type
-(`rawPtrDecodeAggregate?`); the byte offsets of the two target places within
-the local come from `projectionChainByteOffset?`. The Tree Borrows
-read-then-write transition is `borrowsAfterCopySingleDirect`. Every shape the
-byte codec cannot express (a non-aggregate local, an uninitialized local, an
-unresolved place offset, or bytes that are not a valid value of the local's
-type) is unsupported.
+Handles both cross-local / cross-frame copies and same-local (disjoint or
+overlapping) copies uniformly in byte space:
+1. Resolves both `srcEntry` (for read) and `dstEntry` (for write) with
+   `resolveRawPtrStackTarget` (checking `allocDead`, child permissions,
+   `rangeLen = 0`, live frame, `.dead` slot, and place bounds).
+2. When `nonOverlapping = true` and both entries target the same
+   `(targetFrameDepth, targetLocal)`, checks byte-range overlap in the root
+   local (`byteRangesOverlapBool`): overlapping ranges fault with `.ub`,
+   disjoint ranges (even sharing the same pointer tag) are permitted, and
+   undecidable overlapping projections fail closed with `.unsupported`.
+3. Applies the two-phase byte-range-aware Tree Borrows read-then-write
+   transition (`borrowsAfterRawPtrCopy`: checks source read UB, applies foreign
+   read transitions, checks destination write UB including protected
+   `.reservedFrz true`, and invalidates only overlapping foreign borrows).
+4. Reads the source value/bytes BEFORE modifying the destination (preserving
+   `memmove` semantics on overlapping ranges): uses a direct value copy only
+   when `count = 1`, both offsets are `0`, and both places exactly match
+   `elemTy` and `byteCount`, and otherwise encodes `src`, slices `byteCount`
+   bytes at `srcPtr.offsetBytes`, and splices them into `dst` via
+   `writeRawPtrBytesToStackSlot` (failing closed `.unsupported` on `.uninit`
+   source or unrepresentable destination bytes, never falsely reporting `.ub`
+   on an untyped copy).
 
-Reference (`core::ptr::copy` documentation, `library/core/src/ptr/mod.rs` at
-commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+Reference (`core::ptr::copy_nonoverlapping` and `core::ptr::copy` documentation,
+`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L455-L465>
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L563-L567>
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L575-L581>
+
+> "/// Behavior is undefined if any of the following conditions are violated:
+> ///
+> /// * `src` must be [valid] for reads of `count * size_of::<T>()` bytes or that number must be 0.
+> ///
+> /// * `dst` must be [valid] for writes of `count * size_of::<T>()` bytes or that number must be 0.
+> ///
+> /// * Both `src` and `dst` must be properly aligned.
+> ///
+> /// * The region of memory beginning at `src` with a size of `count *
+> ///   size_of::<T>()` bytes must *not* overlap with the region of memory
+> ///   beginning at `dst` with the same size."
 
 > "/// Copying takes place as if the bytes were copied from `src`
 > /// to a temporary array and then copied from the array to `dst`.
@@ -4665,7 +5620,8 @@ Modeling choice: `volatile_copy_memory` is documented only as the volatile
 `llvm.memmove` (see `evalVolatileCopyMemoryCall`); inside Rust allocations the
 model gives it the semantics of `core::ptr::copy`, the documented `memmove`.
 -/
-def volatileCopyWithinLocalAction
+def volatileCopyStackAction
+    (nonOverlapping : Bool)
     (borrows : List BorrowEntry)
     (callStack : List SavedCallerFrame)
     (callerLocals : List LocalSlot)
@@ -4675,108 +5631,200 @@ def volatileCopyWithinLocalAction
     (locals' : List LocalSlot)
     (srcPtr dstPtr : ProvenancePtr)
     (srcEntry dstEntry : BorrowEntry)
-    (byteCount : Nat) :
+    (elemTy : Ty)
+    (count byteCount : Nat) :
     RawPtrCallAction :=
   match
     resolveRawPtrStackTarget
-      callStack
-      locals'
-      bodyLocalDecls
-      bodyLayouts
-      srcEntry
-      srcPtr.offsetBytes
-      byteCount
-      false
+      callStack locals' bodyLocalDecls bodyLayouts srcEntry srcPtr.offsetBytes byteCount false
   with
   | .fault kind => .fault kind
-  | .ok targetDecls targetLayouts _ slot =>
+  | .ok srcLocals srcDecls srcLayouts srcRootTy srcPlaceTy srcPlaceSize srcSlot =>
     match
       resolveRawPtrStackTarget
-        callStack
-        locals'
-        bodyLocalDecls
-        bodyLayouts
-        dstEntry
-        dstPtr.offsetBytes
-        byteCount
-        true
+        callStack locals' bodyLocalDecls bodyLayouts dstEntry dstPtr.offsetBytes byteCount true
     with
     | .fault kind => .fault kind
-    | .ok _ _ _ _ =>
-      match slot, get? targetDecls srcEntry.targetLocal with
-      | .init rootVal, .some rootDecl =>
-        let rootTy := resolveTyWithLocalDecls targetDecls targetLayouts rootDecl.ty
-        match
-          projectionChainByteOffset?
-            targetLayouts
-            (.some rootDecl.ty)
-            (.some rootVal)
-            .none
-            0
-            targetDecls
-            (normalizeSubsliceProjections
-              (stripTransparentProjections srcEntry.targetProjection)),
-          projectionChainByteOffset?
-            targetLayouts
-            (.some rootDecl.ty)
-            (.some rootVal)
-            .none
-            0
-            targetDecls
-            (normalizeSubsliceProjections
-              (stripTransparentProjections dstEntry.targetProjection)),
-          rawPtrEncodeValue? targetDecls targetLayouts rootTy rootVal
-        with
-        | .some srcBase, .some dstBase, .some rootBytes =>
-          match
-            sliceAbstractBytes rootBytes (Nat.add srcBase srcPtr.offsetBytes) byteCount
-          with
-          | .none => .fault .unsupported
-          | .some copied =>
+    | .ok dstLocals dstDecls dstLayouts dstRootTy dstPlaceTy dstPlaceSize dstSlot =>
+      let srcRootValOpt : Option Value :=
+        match srcSlot with
+        | .init v => .some v
+        | _ => .none
+      let dstRootValOpt : Option Value :=
+        match dstSlot with
+        | .init v => .some v
+        | _ => .none
+      let sameLocal : Bool :=
+        Bool.and
+          (Nat.beq srcEntry.targetFrameDepth dstEntry.targetFrameDepth)
+          (Nat.beq srcEntry.targetLocal dstEntry.targetLocal)
+      let overlapFault : Option FailureKind :=
+        match Bool.and nonOverlapping sameLocal with
+        | false => .none
+        | true =>
+          let srcBaseOpt :=
+            projectionChainByteOffset?
+              srcLayouts
+              (.some srcRootTy)
+              srcRootValOpt
+              .none
+              0
+              srcDecls
+              (normalizeSubsliceProjections
+                (stripTransparentProjections srcEntry.targetProjection))
+          let dstBaseOpt :=
+            projectionChainByteOffset?
+              dstLayouts
+              (.some dstRootTy)
+              dstRootValOpt
+              .none
+              0
+              dstDecls
+              (normalizeSubsliceProjections
+                (stripTransparentProjections dstEntry.targetProjection))
+          match srcBaseOpt, dstBaseOpt with
+          | .some srcBase, .some dstBase =>
             match
-              writeAbstractBytesAt rootBytes (Nat.add dstBase dstPtr.offsetBytes) copied
+              byteRangesOverlapBool
+                (Nat.add srcBase srcPtr.offsetBytes)
+                byteCount
+                (Nat.add dstBase dstPtr.offsetBytes)
+                byteCount
             with
-            | .none => .fault .unsupported
-            | .some merged =>
-              match rawPtrDecodeAggregate? targetDecls targetLayouts rootTy rootVal merged with
-              | .none => .fault .unsupported
-              | .some rootVal' =>
-                match
-                  borrowsAfterCopySingleDirect
-                    borrows
-                    activeProtectors
-                    srcPtr
-                    dstPtr
-                    srcEntry
-                    dstEntry
-                with
-                | .none => .fault .ub
-                | .some borrows' =>
-                  match
-                    writeFrameLocalSlot
-                      locals'
-                      callStack
-                      callerLocals
-                      dstEntry.targetFrameDepth
-                      dstEntry.targetLocal
-                      (.init rootVal')
-                  with
+            | true => .some .ub
+            | false => .none
+          | _, _ =>
+            match projectionsOverlap srcEntry.targetProjection dstEntry.targetProjection with
+            | false => .none
+            | true => .some .unsupported
+      match overlapFault with
+      | .some kind => .fault kind
+      | .none =>
+        match
+          borrowsAfterRawPtrCopy
+            borrows
+            activeProtectors
+            srcDecls
+            srcLayouts
+            srcRootTy
+            srcRootValOpt
+            srcPtr
+            srcEntry
+            srcPlaceSize
+            dstDecls
+            dstLayouts
+            dstRootTy
+            dstRootValOpt
+            dstPtr
+            dstPlaceSize
+            byteCount
+        with
+        | .fault kind => .fault kind
+        | .ok borrows' =>
+          match srcSlot with
+          | .dead => .fault .ub
+          | .uninit => .fault .unsupported
+          | .init srcRootVal =>
+            let srcBaseRes : ProjReadResult :=
+              match srcEntry.targetProjection with
+              | .nil => .ok srcRootVal
+              | pHead :: pTail =>
+                readProjectedForLocal
+                  srcLocals
+                  srcDecls
+                  srcLayouts
+                  srcEntry.targetLocal
+                  srcRootVal
+                  (pHead :: pTail)
+            match srcBaseRes with
+            | .ub => .fault .ub
+            | .unsupported => .fault .unsupported
+            | .ok srcBaseVal =>
+              let isDirectWholeCopy : Bool :=
+                Bool.and
+                  (Nat.beq count 1)
+                  (Bool.and
+                    (Nat.beq srcPtr.offsetBytes 0)
+                    (Bool.and
+                      (Nat.beq dstPtr.offsetBytes 0)
+                      (Bool.and
+                        (Nat.beq byteCount srcPlaceSize)
+                        (Bool.and
+                          (Nat.beq byteCount dstPlaceSize)
+                          (Bool.and
+                            (rigidTyEq srcPlaceTy.kind elemTy.kind)
+                            (rigidTyEq dstPlaceTy.kind elemTy.kind))))))
+              let dstRes : RawPtrStoreResult :=
+                match isDirectWholeCopy with
+                | true =>
+                  match srcBaseVal with
+                  | .uninit => .fault .unsupported
+                  | _ =>
+                    match dstSlot with
+                    | .dead => .fault .ub
+                    | .uninit =>
+                      match dstEntry.targetProjection with
+                      | .nil => .ok (.init srcBaseVal)
+                      | _ :: _ => .fault .unsupported
+                    | .init dstRootVal =>
+                      match dstEntry.targetProjection with
+                      | .nil => .ok (.init srcBaseVal)
+                      | pHead :: pTail =>
+                        match
+                          writeProjectedForLocal
+                            dstLocals
+                            dstDecls
+                            dstLayouts
+                            dstEntry.targetLocal
+                            dstRootVal
+                            (pHead :: pTail)
+                            srcBaseVal
+                        with
+                        | .ok dstRootVal' => .ok (.init dstRootVal')
+                        | .ub => .fault .ub
+                        | .unsupported => .fault .unsupported
+                | false =>
+                  match rawPtrEncodeValue? srcDecls srcLayouts srcPlaceTy srcBaseVal with
                   | .none => .fault .unsupported
-                  | .some (locals₄, callStack', callerLocals') =>
-                    .retStack borrows' locals₄ callStack' callerLocals' .unit
-        | _, _, _ => .fault .unsupported
-      | _, _ => .fault .unsupported
+                  | .some srcBytes =>
+                    match sliceAbstractBytes srcBytes srcPtr.offsetBytes byteCount with
+                    | .none => .fault .unsupported
+                    | .some copied =>
+                      writeRawPtrBytesToStackSlot
+                        dstLocals
+                        dstDecls
+                        dstLayouts
+                        dstEntry
+                        dstPtr.offsetBytes
+                        dstPlaceSize
+                        dstPlaceTy
+                        dstSlot
+                        copied
+              match dstRes with
+              | .fault kind => .fault kind
+              | .ok dstSlot' =>
+                match
+                  writeFrameLocalSlot
+                    locals'
+                    callStack
+                    callerLocals
+                    dstEntry.targetFrameDepth
+                    dstEntry.targetLocal
+                    dstSlot'
+                with
+                | .none => .fault .unsupported
+                | .some (locals₄, callStack', callerLocals') =>
+                  .retStack borrows' locals₄ callStack' callerLocals' .unit
 
 /--
 Plan of a volatile copy call (`volatileCopyPlan`), executed by
 `evalVolatileCopyMemoryCall`:
 - `.fault kind`: the call faults;
 - `.noCopy`: no byte is copied (`count * size_of::<T>() = 0`);
-- `.nonOverlapping srcOp dstOp srcVal dstVal count`: the memory effect of
-  `copy_nonoverlapping::<T>(src, dst, count)` on the source and destination
-  operands and values (in `copy_nonoverlapping`'s order: source first);
-- `.withinLocal srcPtr dstPtr srcEntry dstEntry byteCount`: a possibly
-  overlapping copy of `byteCount` bytes within one stack local.
+- `.copyStack srcPtr dstPtr srcEntry dstEntry elemTy count byteCount`: copy
+  `byteCount = count * size_of::<T>()` bytes from the tracked stack place of
+  `srcEntry` to that of `dstEntry` (with `srcPtr`, the second argument of the
+  intrinsic, first and `dstPtr`, the first argument, second).
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -4792,27 +5840,21 @@ inductive VolatileCopyPlan : Type where
   | fault (kind : FailureKind) : VolatileCopyPlan
   /-- Zero bytes are copied: memory is unchanged. -/
   | noCopy : VolatileCopyPlan
-  /-- Copy `count` elements from `srcVal` to `dstVal` as
-  `copy_nonoverlapping(src, dst, count)`. -/
-  | nonOverlapping
-      (srcOp dstOp : Operand)
-      (srcVal dstVal : Value)
-      (count : Nat) :
-      VolatileCopyPlan
-  /-- Copy `byteCount` bytes within one stack local, from the place of
-  `srcEntry` to the place of `dstEntry`. -/
-  | withinLocal
+  /-- Copy `byteCount` bytes (`count` elements of `elemTy`) from `srcPtr`/`srcEntry`
+  to `dstPtr`/`dstEntry`. -/
+  | copyStack
       (srcPtr dstPtr : ProvenancePtr)
       (srcEntry dstEntry : BorrowEntry)
-      (byteCount : Nat) :
+      (elemTy : Ty)
+      (count byteCount : Nat) :
       VolatileCopyPlan
 
 /--
 Plan a direct call `volatile_copy_nonoverlapping_memory::<T>(dst, src,
-count)` (`nonOverlapping = true`) or `volatile_copy_memory::<T>(dst, src,
-count)` (`nonOverlapping = false`) as a `VolatileCopyPlan`, which
-`evalVolatileCopyMemoryCall` executes. Both take the destination first: the
-argument order `(dst, src, count)` is the opposite of
+count)` or `volatile_copy_memory::<T>(dst, src, count)` as a
+`VolatileCopyPlan`, which `evalVolatileCopyMemoryCall` executes (applying
+overlap rejection when `nonOverlapping = true`). Both take the destination
+first: the argument order `(dst, src, count)` is the opposite of
 `copy_nonoverlapping(src, dst, count)`.
 
 Checks, in order:
@@ -4825,17 +5867,13 @@ Checks, in order:
    copied, and an undecidable alignment is unsupported.
 4. Zero bytes (`count = 0` or a zero-sized `T`) leave memory unchanged.
 5. Otherwise both pointers must be tracked stack pointers
-   (`classifyRawPtrTarget`). A destination in an immutable global is `.ub`;
-   every other pointer that is not a tracked stack pointer (no provenance, an
-   untracked allocation, or a global) is unsupported, since a volatile copy
+   (`classifyRawPtrTarget`). A destination in an immutable global, or either
+   endpoint past the end of a global allocation, is `.ub`; every other pair
+   that is not two tracked stack pointers (no provenance, an untracked
+   allocation, or an in-bounds global) is unsupported, since a volatile copy
    may access memory outside all Rust allocations.
-6. For tracked stack pointers, the non-overlapping form has the memory effect
-   of `copy_nonoverlapping::<T>(src, dst, count)`
-   (`evalCopyNonOverlappingWithCount`, on the `src` and `dst` operands and
-   values in that order), including its overlap check. The overlapping form
-   has the same effect when `src` and `dst` point into different stack locals
-   (different allocations cannot overlap), and otherwise copies within the
-   local, reading the source bytes first (`volatileCopyWithinLocalAction`).
+6. For tracked stack pointers, `volatileCopyStackAction` executes the copy in
+   byte space with exact `allocDead`, bounds, overlap, and Tree Borrows checks.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -4898,14 +5936,10 @@ Modeling choices and scope:
 - The bound `count * size_of::<T>() <= isize::MAX` is checked for every
   pointer: no Rust allocation is larger, and the model does not execute
   copies outside Rust allocations.
-- The statement-level `copy_nonoverlapping` semantics steps over a zero-count
-  copy without checks; here the alignment of both pointers is checked first,
-  as documented.
 - Volatile copies are modeled as silent steps; the guarantee that they are not
   optimized out concerns compilation and is not modeled.
 -/
 def volatileCopyPlan
-    (nonOverlapping : Bool)
     (borrows : List BorrowEntry)
     (globals : List CapturedAllocation)
     (callStack : List SavedCallerFrame)
@@ -4927,7 +5961,7 @@ def volatileCopyPlan
     | true, .some dstArg, .some srcArg =>
       match resolveRawPtrElemLayout target bodyLocalDecls bodyLayouts argOps with
       | .fault kind => .fault kind
-      | .ok _ size align =>
+      | .ok elemTy size align =>
         let byteCount := Nat.mul countSc.bits size
         match Nat.ble (signedHalfModulus ptrBytes) byteCount with
         | true => .fault .ub
@@ -4946,23 +5980,24 @@ def volatileCopyPlan
             | false =>
               match dstTgt, srcTgt with
               | .stack dstPtr dstEntry, .stack srcPtr srcEntry =>
-                match argOps with
-                | dstOp :: srcOp :: _ =>
-                  match
-                    Bool.or
-                      nonOverlapping
-                      (Bool.not
-                        (Bool.and
-                          (Nat.beq srcEntry.targetFrameDepth dstEntry.targetFrameDepth)
-                          (Nat.beq srcEntry.targetLocal dstEntry.targetLocal)))
-                  with
-                  | true => .nonOverlapping srcOp dstOp srcVal dstVal countSc.bits
-                  | false => .withinLocal srcPtr dstPtr srcEntry dstEntry byteCount
-                | _ => .fault .unsupported
-              | .global _ dstAlloc, _ =>
-                match mutabilityEq dstAlloc.mutability .not with
-                | true => .fault .ub
-                | false => .fault .unsupported
+                .copyStack srcPtr dstPtr srcEntry dstEntry elemTy countSc.bits byteCount
+              | .global dstPtr dstAlloc, _ =>
+                match
+                  mutabilityEq dstAlloc.mutability .not,
+                  Nat.ble (Nat.add dstPtr.offsetBytes byteCount) (length dstAlloc.bytes)
+                with
+                | false, true =>
+                  match srcTgt with
+                  | .global srcPtr srcAlloc =>
+                    match Nat.ble (Nat.add srcPtr.offsetBytes byteCount) (length srcAlloc.bytes) with
+                    | true => .fault .unsupported
+                    | false => .fault .ub
+                  | _ => .fault .unsupported
+                | _, _ => .fault .ub
+              | _, .global srcPtr srcAlloc =>
+                match Nat.ble (Nat.add srcPtr.offsetBytes byteCount) (length srcAlloc.bytes) with
+                | true => .fault .unsupported
+                | false => .fault .ub
               | _, _ => .fault .unsupported
           | _, _ => .fault .unsupported
     | _, _, _ => .fault .ub
@@ -4975,11 +6010,7 @@ count)` (`nonOverlapping = false`) by executing its `VolatileCopyPlan`
 (`volatileCopyPlan` on the current memory):
 - `.fault`: fault;
 - `.noCopy`: write `()` to `destination` and continue at `targetBb`;
-- `.nonOverlapping`: the statement-level `copy_nonoverlapping` semantics
-  (`evalCopyNonOverlappingWithCount`, with the source operand and value first),
-  then `()` to `destination` (`finishMemIntrinsicCall`);
-- `.withinLocal`: `volatileCopyWithinLocalAction`, completed by
-  `finishRawPtrCallAction`.
+- `.copyStack`: `volatileCopyStackAction`, completed by `finishRawPtrCallAction`.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -5004,7 +6035,6 @@ def evalVolatileCopyMemoryCall
     MirStepNode :=
   match
     volatileCopyPlan
-      nonOverlapping
       s.memory.borrows
       s.memory.globals
       s.memory.callStack
@@ -5017,28 +6047,14 @@ def evalVolatileCopyMemoryCall
   with
   | .fault kind => MirStepNode.fail kind
   | .noCopy => writeIntrinsicReturn s locals' destination targetBb .unit
-  | .nonOverlapping srcOp dstOp srcVal dstVal count =>
-    finishMemIntrinsicCall
-      s
-      (evalCopyNonOverlappingWithCount
-        s
-        srcOp
-        dstOp
-        bodyLocalDecls
-        bodyLayouts
-        srcVal
-        dstVal
-        count
-        locals')
-      destination
-      targetBb
-  | .withinLocal srcPtr dstPtr srcEntry dstEntry byteCount =>
+  | .copyStack srcPtr dstPtr srcEntry dstEntry elemTy count byteCount =>
     finishRawPtrCallAction
       s
       locals'
       destination
       targetBb
-      (volatileCopyWithinLocalAction
+      (volatileCopyStackAction
+        nonOverlapping
         s.memory.borrows
         s.memory.callStack
         s.memory.callerLocals
@@ -5050,14 +6066,114 @@ def evalVolatileCopyMemoryCall
         dstPtr
         srcEntry
         dstEntry
+        elemTy
+        count
         byteCount)
+
+/--
+Compute the `RawPtrCallAction` of `volatile_set_memory::<T>(dst, val, count)`
+for `byteCount = count * size_of::<T>() > 0` bytes on a tracked stack pointer
+`dstPtr` with entry `dstEntry`:
+1. Resolves `dstEntry` with `resolveRawPtrStackTarget` (checking `allocDead`,
+   child write permission, `rangeLen = 0`, live frame, `.dead` slot, and place
+   bounds).
+2. Applies byte-range-aware Tree Borrows write checks and transitions
+   (`borrowsAfterRawPtrAccess .write`).
+3. Constructs `byteCount` copies of `valByte` (`rawPtrReplicateInitByte`) and
+   splices them into the destination stack place (`writeRawPtrBytesToStackSlot`),
+   failing closed with `.unsupported` if the resulting bytes violate the typed
+   slot's validity invariant (never reporting `.ub` on the set itself).
+4. Commits the updated slot via `writeFrameLocalSlot`.
+
+Reference (`core::ptr::write_bytes` documentation, `library/core/src/ptr/mod.rs`
+at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L656-L667>
+
+> "/// Behavior is undefined if any of the following conditions are violated:
+> ///
+> /// * `dst` must be [valid] for writes of `count * size_of::<T>()` bytes.
+> ///
+> /// * `dst` must be properly aligned.
+> ///
+> /// Note that even if the effectively copied size (`count * size_of::<T>()`) is
+> /// `0`, the pointer must be properly aligned.
+> ///
+> /// Additionally, note that changing `*dst` in this way can easily lead to undefined behavior (UB)
+> /// later if the written bytes are not a valid representation of some `T`. For instance, the
+> /// following is an **incorrect** use of this function:"
+-/
+def volatileSetStackAction
+    (borrows : List BorrowEntry)
+    (callStack : List SavedCallerFrame)
+    (callerLocals : List LocalSlot)
+    (activeProtectors : List Nat)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (locals' : List LocalSlot)
+    (dstPtr : ProvenancePtr)
+    (dstEntry : BorrowEntry)
+    (valByte byteCount : Nat) :
+    RawPtrCallAction :=
+  match
+    resolveRawPtrStackTarget
+      callStack locals' bodyLocalDecls bodyLayouts dstEntry dstPtr.offsetBytes byteCount true
+  with
+  | .fault kind => .fault kind
+  | .ok dstLocals dstDecls dstLayouts dstRootTy dstPlaceTy dstPlaceSize dstSlot =>
+    let dstRootValOpt : Option Value :=
+      match dstSlot with
+      | .init v => .some v
+      | _ => .none
+    match
+      borrowsAfterRawPtrAccess
+        borrows
+        activeProtectors
+        .write
+        dstDecls
+        dstLayouts
+        dstRootTy
+        dstRootValOpt
+        dstPtr.tag
+        dstEntry
+        dstPtr.offsetBytes
+        byteCount
+        dstPlaceSize
+    with
+    | .fault kind => .fault kind
+    | .ok borrows' =>
+      let patchBytes := rawPtrReplicateInitByte (UInt8.ofNat valByte) byteCount
+      match
+        writeRawPtrBytesToStackSlot
+          dstLocals
+          dstDecls
+          dstLayouts
+          dstEntry
+          dstPtr.offsetBytes
+          dstPlaceSize
+          dstPlaceTy
+          dstSlot
+          patchBytes
+      with
+      | .fault kind => .fault kind
+      | .ok dstSlot' =>
+        match
+          writeFrameLocalSlot
+            locals'
+            callStack
+            callerLocals
+            dstEntry.targetFrameDepth
+            dstEntry.targetLocal
+            dstSlot'
+        with
+        | .none => .fault .unsupported
+        | .some (locals₄, callStack', callerLocals') =>
+          .retStack borrows' locals₄ callStack' callerLocals' .unit
 
 /--
 Plan of a `volatile_set_memory` call (`volatileSetPlan`), executed by
 `evalVolatileSetMemoryCall`: a fault (`.fault kind`), no memory effect
-(`.noWrite`, when `count * size_of::<T>() = 0`), or the memory effect of
-`write_bytes::<T>(dst, val, count)` through a tracked stack pointer
-(`.writeBytes`).
+(`.noWrite`, when `count * size_of::<T>() = 0`), or a byte fill of a tracked
+stack pointer (`.setStack`).
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -5076,8 +6192,13 @@ inductive VolatileSetPlan : Type where
   | fault (kind : FailureKind) : VolatileSetPlan
   /-- Zero bytes are written: memory is unchanged. -/
   | noWrite : VolatileSetPlan
-  /-- The memory effect of `write_bytes::<T>(dst, val, count)`. -/
-  | writeBytes : VolatileSetPlan
+  /-- Fill `byteCount` bytes at tracked stack pointer `(dstPtr, dstEntry)` with
+  `valByte`. -/
+  | setStack
+      (dstPtr : ProvenancePtr)
+      (dstEntry : BorrowEntry)
+      (valByte byteCount : Nat) :
+      VolatileSetPlan
 
 /--
 Plan a direct call `volatile_set_memory::<T>(dst, val, count)` as a
@@ -5092,11 +6213,12 @@ Checks, in order:
    misaligned pointer is `.ub` even when no byte is written, and an undecidable
    alignment is unsupported.
 4. Zero bytes (`count = 0` or a zero-sized `T`) leave memory unchanged.
-5. Otherwise, by `classifyRawPtrTarget`: a tracked stack pointer has the
-   memory effect of `write_bytes::<T>(dst, val, count)` (`evalWriteBytesCall`);
-   a destination in an immutable global is `.ub`; every other pointer (no
-   provenance, an untracked allocation, or a mutable global) is unsupported,
-   since a volatile store may access memory outside all Rust allocations.
+5. Otherwise, by `classifyRawPtrTarget`: a tracked stack pointer executes
+   `volatileSetStackAction` (checking `allocDead`, `rangeLen = 0`, bounds, and
+   byte-range-aware Tree Borrows); a destination in an immutable global or past
+   the end of a global is `.ub`; every other pointer (no provenance, an
+   untracked allocation, or an in-bounds mutable global) is unsupported, since
+   a volatile store may access memory outside all Rust allocations.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -5131,9 +6253,8 @@ at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
 
 Modeling choices and scope:
 - A zero-byte volatile set is a no-op for every aligned pointer, including a
-  pointer without provenance; `evalWriteBytesCall` is consulted only for a
-  non-zero byte count through a tracked stack pointer, where it applies the
-  `write_bytes` checks of `writeBytesAction`.
+  pointer without provenance; `volatileSetStackAction` is consulted for a
+  non-zero byte count through a tracked stack pointer.
 - Volatile stores are modeled as silent steps; the guarantee that they are not
   optimized out concerns compilation and is not modeled.
 -/
@@ -5175,11 +6296,14 @@ def volatileSetPlan
             | true => .noWrite
             | false =>
               match dstTgt with
-              | .stack _ _ => .writeBytes
-              | .global _ dstAlloc =>
-                match mutabilityEq dstAlloc.mutability .not with
-                | true => .fault .ub
-                | false => .fault .unsupported
+              | .stack dstPtr dstEntry => .setStack dstPtr dstEntry valSc.bits byteCount
+              | .global dstPtr dstAlloc =>
+                match
+                  mutabilityEq dstAlloc.mutability .not,
+                  Nat.ble (Nat.add dstPtr.offsetBytes byteCount) (length dstAlloc.bytes)
+                with
+                | false, true => .fault .unsupported
+                | _, _ => .fault .ub
               | .outside => .fault .unsupported
               | .untracked => .fault .unsupported
     | _, _ => .fault .ub
@@ -5188,8 +6312,8 @@ def volatileSetPlan
 /--
 Evaluate a direct call `volatile_set_memory::<T>(dst, val, count)` by executing
 its `VolatileSetPlan` (`volatileSetPlan` on the current memory): fault, write
-`()` to `destination` without a memory effect, or evaluate the call as
-`write_bytes::<T>(dst, val, count)` (`evalWriteBytesCall`).
+`()` to `destination` without a memory effect, or fill bytes into the tracked
+stack target (`volatileSetStackAction`, completed by `finishRawPtrCallAction`).
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -5228,17 +6352,24 @@ def evalVolatileSetMemoryCall
   with
   | .fault kind => MirStepNode.fail kind
   | .noWrite => writeIntrinsicReturn s locals' destination targetBb .unit
-  | .writeBytes =>
-    evalWriteBytesCall
+  | .setStack dstPtr dstEntry valByte byteCount =>
+    finishRawPtrCallAction
       s
-      target
-      bodyLocalDecls
-      bodyLayouts
-      argOps
-      argVals
       locals'
       destination
       targetBb
+      (volatileSetStackAction
+        s.memory.borrows
+        s.memory.callStack
+        s.memory.callerLocals
+        s.memory.activeProtectors
+        bodyLocalDecls
+        bodyLayouts
+        locals'
+        dstPtr
+        dstEntry
+        valByte
+        byteCount)
 
 /--
 Test whether `kind` is one of the seven volatile memory intrinsics

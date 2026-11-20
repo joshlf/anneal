@@ -16667,25 +16667,20 @@ theorem evalVolatileCopyMemoryCall_withCalleeCtx
           argOps argVals locals' destination targetBb) := by
   unfold evalVolatileCopyMemoryCall
   have hPlan :
-      volatileCopyPlan nonOverlapping
+      volatileCopyPlan
         (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s).memory.borrows
         (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s).memory.globals
         (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s).memory.callStack
         target bodyLocalDecls bodyLayouts argOps argVals locals' =
-      volatileCopyPlan nonOverlapping s.memory.borrows s.memory.globals s.memory.callStack
+      volatileCopyPlan s.memory.borrows s.memory.globals s.memory.callStack
         target bodyLocalDecls bodyLayouts argOps argVals locals' := rfl
   rw [hPlan]
-  cases volatileCopyPlan nonOverlapping s.memory.borrows s.memory.globals s.memory.callStack
+  cases volatileCopyPlan s.memory.borrows s.memory.globals s.memory.callStack
       target bodyLocalDecls bodyLayouts argOps argVals locals' with
   | fault kind => rfl
   | noCopy =>
     exact writeIntrinsicReturn_withCalleeCtx c ac ti s locals' destination targetBb .unit
-  | nonOverlapping srcOp dstOp srcVal dstVal count =>
-    dsimp only
-    rw [evalCopyNonOverlappingWithCount_withCalleeCtx c ac ti s srcOp dstOp bodyLocalDecls
-      bodyLayouts srcVal dstVal count locals']
-    exact finishMemIntrinsicCall_mapMem_withCalleeCtx c ac ti s _ destination targetBb
-  | withinLocal srcPtr dstPtr srcEntry dstEntry byteCount =>
+  | copyStack srcPtr dstPtr srcEntry dstEntry elemTy count byteCount =>
     exact finishRawPtrCallAction_withCalleeCtx c ac ti s locals' destination targetBb _
 
 theorem evalVolatileSetMemoryCall_withCalleeCtx
@@ -16714,9 +16709,8 @@ theorem evalVolatileSetMemoryCall_withCalleeCtx
   | fault kind => rfl
   | noWrite =>
     exact writeIntrinsicReturn_withCalleeCtx c ac ti s locals' destination targetBb .unit
-  | writeBytes =>
-    exact evalWriteBytesCall_withCalleeCtx c ac ti s target bodyLocalDecls bodyLayouts argOps
-      argVals locals' destination targetBb
+  | setStack dstPtr dstEntry valByte byteCount =>
+    exact finishRawPtrCallAction_withCalleeCtx c ac ti s locals' destination targetBb _
 
 /-- **Volatile memory intrinsics commute with callee-context replacement.** -/
 theorem evalVolatileMemIntrinsicCall_withCalleeCtx
@@ -18885,6 +18879,53 @@ private theorem finishRawPtrCallAction_callerBodies (s : MachineState) (locals' 
               callerLocals := callerLocals' } }
         locals₄ destination targetBb retVal)
 
+private theorem rawPtrCallActionCallerBodies_matchBorrow {cs : List SavedCallerFrame}
+    {r : RawPtrBorrowResult} {f : List BorrowEntry → RawPtrCallAction}
+    (h : ∀ bs', rawPtrCallActionCallerBodies cs (f bs')) :
+    rawPtrCallActionCallerBodies cs
+      (match r with | .fault kind => .fault kind | .ok bs' => f bs') := by
+  cases r with
+  | fault _ => trivial
+  | ok bs' => exact h bs'
+
+private theorem rawPtrCallActionCallerBodies_matchOptFault {cs : List SavedCallerFrame}
+    {o : Option FailureKind} {a : RawPtrCallAction}
+    (h : rawPtrCallActionCallerBodies cs a) :
+    rawPtrCallActionCallerBodies cs
+      (match o with | .some kind => .fault kind | .none => a) := by
+  cases o <;> first | trivial | exact h
+
+private theorem rawPtrCallActionCallerBodies_matchProjRead {cs : List SavedCallerFrame}
+    {r : ProjReadResult} {f : Value → RawPtrCallAction}
+    (h : ∀ v, rawPtrCallActionCallerBodies cs (f v)) :
+    rawPtrCallActionCallerBodies cs
+      (match r with | .ub => .fault .ub | .unsupported => .fault .unsupported | .ok v => f v) := by
+  cases r with
+  | ub => trivial
+  | unsupported => trivial
+  | ok v => exact h v
+
+private theorem rawPtrCallActionCallerBodies_matchStore {cs : List SavedCallerFrame}
+    {r : RawPtrStoreResult} {f : LocalSlot → RawPtrCallAction}
+    (h : ∀ slot', rawPtrCallActionCallerBodies cs (f slot')) :
+    rawPtrCallActionCallerBodies cs
+      (match r with | .fault kind => .fault kind | .ok slot' => f slot') := by
+  cases r with
+  | fault _ => trivial
+  | ok slot' => exact h slot'
+
+private theorem rawPtrCallActionCallerBodies_matchWriteSlot
+    {locals' : List LocalSlot} {cs : List SavedCallerFrame} {cl : List LocalSlot}
+    {depth idx : Nat} {slot' : LocalSlot} {borrows' : List BorrowEntry} {retVal : Value} :
+    rawPtrCallActionCallerBodies cs
+      (match writeFrameLocalSlot locals' cs cl depth idx slot' with
+      | .none => .fault .unsupported
+      | .some (locals₄, callStack', callerLocals') =>
+        .retStack borrows' locals₄ callStack' callerLocals' retVal) := by
+  cases h : writeFrameLocalSlot locals' cs cl depth idx slot' with
+  | none => trivial
+  | some p => exact writeFrameLocalSlot_callerBodies h
+
 private theorem rawPtrLoadAction_callerBodies
     {isVolatile requiresAlign : Bool} {borrows : List BorrowEntry}
     {globals : List CapturedAllocation} {cs : List SavedCallerFrame} {ap : List Nat}
@@ -18894,9 +18935,61 @@ private theorem rawPtrLoadAction_callerBodies
       (rawPtrLoadAction isVolatile requiresAlign borrows globals cs ap target decls layouts argOps
         argVals locals') := by
   unfold rawPtrLoadAction
-  dsimp only
-  repeat' split
-  all_goals exact True.intro
+  rcases argVals with _ | ⟨srcVal, _ | ⟨_, _⟩⟩
+  · trivial
+  · dsimp only
+    cases rawPtrArgOfValue? (layoutPointerBytes layouts) srcVal with
+    | none => trivial
+    | some srcArg =>
+      cases resolveRawPtrElemLayout target decls layouts argOps with
+      | fault _ => trivial
+      | ok elemTy size align =>
+        dsimp only
+        cases rawPtrTargetAligned? cs locals' decls layouts
+            (match requiresAlign with | true => align | false => 1) srcArg
+            (classifyRawPtrTarget borrows globals srcArg) with
+        | none => trivial
+        | some b =>
+          cases b with
+          | false => trivial
+          | true =>
+            cases Bool.and (Bool.not isVolatile) (rawPtrArgIsNull srcArg) with
+            | true => trivial
+            | false =>
+              cases tyIsUninhabited layouts elemTy with
+              | true => trivial
+              | false =>
+                cases Nat.beq size 0 with
+                | true =>
+                  dsimp only
+                  cases rawPtrZstValue? layouts elemTy <;> trivial
+                | false =>
+                  cases classifyRawPtrTarget borrows globals srcArg with
+                  | outside => cases isVolatile <;> trivial
+                  | untracked => trivial
+                  | global ptr alloc =>
+                    dsimp only
+                    cases Nat.ble (Nat.add ptr.offsetBytes size) (length alloc.bytes) with
+                    | false => trivial
+                    | true =>
+                      dsimp only
+                      cases globalAllocSliceToAbstractBytes alloc ptr.offsetBytes size with
+                      | none => trivial
+                      | some bs =>
+                        dsimp only
+                        cases rawPtrDecodeBytes layouts elemTy bs <;> trivial
+                  | stack ptr entry =>
+                    dsimp only
+                    cases resolveRawPtrStackTarget cs locals' decls layouts entry ptr.offsetBytes
+                        size false with
+                    | fault _ => trivial
+                    | ok tl td tlay rt pt psz slot =>
+                      dsimp only
+                      apply rawPtrCallActionCallerBodies_matchBorrow
+                      intro borrows'
+                      cases loadRawPtrStackValue tl layouts td tlay entry ptr.offsetBytes size pt
+                          elemTy slot <;> trivial
+  · trivial
 
 private theorem rawPtrStoreAction_callerBodies
     {isVolatile requiresAlign : Bool} {borrows : List BorrowEntry}
@@ -18908,25 +19001,110 @@ private theorem rawPtrStoreAction_callerBodies
       (rawPtrStoreAction isVolatile requiresAlign borrows globals cs cl ap target decls layouts
         argOps argVals locals') := by
   unfold rawPtrStoreAction
-  dsimp only
-  repeat' split
-  all_goals first
-    | exact True.intro
-    | exact writeFrameLocalSlot_callerBodies (by assumption)
+  rcases argVals with _ | ⟨dstVal, _ | ⟨val, _ | ⟨_, _⟩⟩⟩
+  · trivial
+  · trivial
+  · dsimp only
+    cases rawPtrArgOfValue? (layoutPointerBytes layouts) dstVal with
+    | none => trivial
+    | some dstArg =>
+      cases resolveRawPtrElemLayout target decls layouts argOps with
+      | fault _ => trivial
+      | ok elemTy size align =>
+        dsimp only
+        cases rawPtrTargetAligned? cs locals' decls layouts
+            (match requiresAlign with | true => align | false => 1) dstArg
+            (classifyRawPtrTarget borrows globals dstArg) with
+        | none => trivial
+        | some b =>
+          cases b with
+          | false => trivial
+          | true =>
+            cases Bool.and (Bool.not isVolatile) (rawPtrArgIsNull dstArg) with
+            | true => trivial
+            | false =>
+              cases tyIsUninhabited layouts elemTy with
+              | true => trivial
+              | false =>
+                cases rawPtrStoreValueFault? layouts elemTy val with
+                | some _ => trivial
+                | none =>
+                  cases Nat.beq size 0 with
+                  | true => trivial
+                  | false =>
+                    cases classifyRawPtrTarget borrows globals dstArg with
+                    | outside => cases isVolatile <;> trivial
+                    | untracked => trivial
+                    | global ptr alloc =>
+                      dsimp only
+                      cases mutabilityEq alloc.mutability .not <;>
+                        cases Nat.ble (Nat.add ptr.offsetBytes size) (length alloc.bytes) <;>
+                        trivial
+                    | stack ptr entry =>
+                      dsimp only
+                      cases resolveRawPtrStackTarget cs locals' decls layouts entry ptr.offsetBytes
+                          size true with
+                      | fault _ => trivial
+                      | ok tl td tlay rt pt psz slot =>
+                        dsimp only
+                        apply rawPtrCallActionCallerBodies_matchBorrow
+                        intro borrows'
+                        apply rawPtrCallActionCallerBodies_matchStore
+                        intro slot'
+                        exact rawPtrCallActionCallerBodies_matchWriteSlot
+  · trivial
 
-private theorem volatileCopyWithinLocalAction_callerBodies
+private theorem volatileCopyStackAction_callerBodies
+    {nonOverlapping : Bool} {borrows : List BorrowEntry} {cs : List SavedCallerFrame}
+    {cl : List LocalSlot} {ap : List Nat} {decls : List LocalDecl} {layouts : LayoutTable}
+    {locals' : List LocalSlot} {srcPtr dstPtr : ProvenancePtr}
+    {srcEntry dstEntry : BorrowEntry} {elemTy : Ty} {count byteCount : Nat} :
+    rawPtrCallActionCallerBodies cs
+      (volatileCopyStackAction nonOverlapping borrows cs cl ap decls layouts locals' srcPtr dstPtr
+        srcEntry dstEntry elemTy count byteCount) := by
+  unfold volatileCopyStackAction
+  cases resolveRawPtrStackTarget cs locals' decls layouts srcEntry srcPtr.offsetBytes byteCount
+      false with
+  | fault _ => trivial
+  | ok sl sd slay srt spt spsz sslot =>
+    dsimp only
+    cases resolveRawPtrStackTarget cs locals' decls layouts dstEntry dstPtr.offsetBytes byteCount
+        true with
+    | fault _ => trivial
+    | ok dl dd dlay drt dpt dpsz dslot =>
+      dsimp only
+      apply rawPtrCallActionCallerBodies_matchOptFault
+      apply rawPtrCallActionCallerBodies_matchBorrow
+      intro borrows'
+      cases sslot with
+      | dead => trivial
+      | uninit => trivial
+      | init srcRootVal =>
+        dsimp only
+        apply rawPtrCallActionCallerBodies_matchProjRead
+        intro srcBaseVal
+        apply rawPtrCallActionCallerBodies_matchStore
+        intro dstSlot'
+        exact rawPtrCallActionCallerBodies_matchWriteSlot
+
+private theorem volatileSetStackAction_callerBodies
     {borrows : List BorrowEntry} {cs : List SavedCallerFrame} {cl : List LocalSlot}
     {ap : List Nat} {decls : List LocalDecl} {layouts : LayoutTable} {locals' : List LocalSlot}
-    {srcPtr dstPtr : ProvenancePtr} {srcEntry dstEntry : BorrowEntry} {byteCount : Nat} :
+    {dstPtr : ProvenancePtr} {dstEntry : BorrowEntry} {valByte byteCount : Nat} :
     rawPtrCallActionCallerBodies cs
-      (volatileCopyWithinLocalAction borrows cs cl ap decls layouts locals' srcPtr dstPtr srcEntry
-        dstEntry byteCount) := by
-  unfold volatileCopyWithinLocalAction
-  dsimp only
-  repeat' split
-  all_goals first
-    | exact True.intro
-    | exact writeFrameLocalSlot_callerBodies (by assumption)
+      (volatileSetStackAction borrows cs cl ap decls layouts locals' dstPtr dstEntry valByte
+        byteCount) := by
+  unfold volatileSetStackAction
+  cases resolveRawPtrStackTarget cs locals' decls layouts dstEntry dstPtr.offsetBytes byteCount
+      true with
+  | fault _ => trivial
+  | ok dl dd dlay drt dpt dpsz dslot =>
+    dsimp only
+    apply rawPtrCallActionCallerBodies_matchBorrow
+    intro borrows'
+    apply rawPtrCallActionCallerBodies_matchStore
+    intro dstSlot'
+    exact rawPtrCallActionCallerBodies_matchWriteSlot
 
 theorem evalRawPtrLoadCall_callerBodies (isVolatile requiresAlign : Bool) (s : MachineState)
     (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
@@ -18958,17 +19136,13 @@ theorem evalVolatileCopyMemoryCall_callerBodies (nonOverlapping : Bool) (s : Mac
       (evalVolatileCopyMemoryCall nonOverlapping s target bodyLocalDecls bodyLayouts argOps
         argVals locals' destination targetBb) := by
   unfold evalVolatileCopyMemoryCall
-  cases volatileCopyPlan nonOverlapping s.memory.borrows s.memory.globals s.memory.callStack
+  cases volatileCopyPlan s.memory.borrows s.memory.globals s.memory.callStack
       target bodyLocalDecls bodyLayouts argOps argVals locals' with
   | fault _ => exact ns_fail
   | noCopy => exact writeIntrinsicReturn_callerBodies s locals' destination targetBb .unit
-  | nonOverlapping srcOp dstOp srcVal dstVal count =>
-    exact finishMemIntrinsicCall_callerBodies s _ destination targetBb
-      (evalCopyNonOverlappingWithCount_callerBodies s srcOp dstOp bodyLocalDecls bodyLayouts
-        srcVal dstVal count locals')
-  | withinLocal srcPtr dstPtr srcEntry dstEntry byteCount =>
+  | copyStack srcPtr dstPtr srcEntry dstEntry elemTy count byteCount =>
     exact finishRawPtrCallAction_callerBodies s locals' destination targetBb _
-      volatileCopyWithinLocalAction_callerBodies
+      volatileCopyStackAction_callerBodies
 
 theorem evalVolatileSetMemoryCall_callerBodies (s : MachineState)
     (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
@@ -18982,9 +19156,9 @@ theorem evalVolatileSetMemoryCall_callerBodies (s : MachineState)
       target bodyLocalDecls bodyLayouts argOps argVals locals' with
   | fault _ => exact ns_fail
   | noWrite => exact writeIntrinsicReturn_callerBodies s locals' destination targetBb .unit
-  | writeBytes =>
-    exact evalWriteBytesCall_callerBodies s target bodyLocalDecls bodyLayouts argOps argVals
-      locals' destination targetBb
+  | setStack dstPtr dstEntry valByte byteCount =>
+    exact finishRawPtrCallAction_callerBodies s locals' destination targetBb _
+      volatileSetStackAction_callerBodies
 
 /-- **Volatile memory intrinsics keep every saved caller body.** -/
 theorem evalVolatileMemIntrinsicCall_callerBodies (kind : RustIntrinsicKind) (s : MachineState)

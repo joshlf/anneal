@@ -142,13 +142,19 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   RawPtrElemLayout resolveRawPtrElemLayout rawPtrTargetFrame?
   rawPtrTargetAligned? RawPtrStackTarget resolveRawPtrStackTarget
   rawPtrUninitFault rawPtrBytesAllPlainInit rawPtrBytesAnyUninit
-  rawPtrDecodeFault rawPtrEncodeValue? RawPtrLoadResult loadRawPtrStackValue
-  borrowsAfterRawPtrRead rawPtrZstValue? RawPtrCallAction
-  finishRawPtrCallAction rawPtrLoadAction evalRawPtrLoadCall
-  rawPtrStoreValueFault? RawPtrStoreResult storeRawPtrStackValue
-  rawPtrStoreAction evalRawPtrStoreCall rawPtrDecodeAggregate?
-  volatileCopyWithinLocalAction VolatileCopyPlan volatileCopyPlan
-  evalVolatileCopyMemoryCall VolatileSetPlan volatileSetPlan
+  rawPtrBytesAnyProv rawPtrBytesUniformProv rawPtrDecodeFault
+  rawPtrIntByteWidth rawPtrFloatByteWidth rawPtrAllValuesValid?
+  rawPtrTupleFieldsValid? rawPtrValueValid? rawPtrEncodeValue?
+  RawPtrLoadResult rawPtrDecodeThinPtr rawPtrDecodeBytes loadRawPtrStackValue
+  rawPtrTreeBorrowPermEq RawPtrBorrowResult rawPtrEntryOverlapsAccess
+  rawPtrBorrowStepList borrowsAfterRawPtrAccess borrowsAfterRawPtrCopy
+  rawPtrZstValue? RawPtrCallAction finishRawPtrCallAction
+  rawPtrLoadAction evalRawPtrLoadCall rawPtrStoreValueFault?
+  RawPtrStoreResult rawPtrDecodeAggregate? rawPtrSpliceBytesIntoPlace?
+  writeRawPtrBytesToStackSlot storeRawPtrStackValue rawPtrStoreAction
+  evalRawPtrStoreCall rawPtrReplicateInitByte volatileCopyStackAction
+  VolatileCopyPlan volatileCopyPlan evalVolatileCopyMemoryCall
+  volatileSetStackAction VolatileSetPlan volatileSetPlan
   evalVolatileSetMemoryCall isVolatileMemIntrinsicKind
   evalVolatileMemIntrinsicCall
   evalUnlinkedPtrAccessCall? evalDirectRustIntrinsic?
