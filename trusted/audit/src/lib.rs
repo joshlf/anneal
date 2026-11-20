@@ -83,9 +83,11 @@
 //!    replay of all correspondence declarations onto that replayed vendor
 //!    kernel environment, 21-root Miri and correspondence cone purity, all 30
 //!    correspondence, wiring, and canary claims, and reference-evaluator
-//!    regression checks (reaching the 21 required `Miri.*` primitives while
-//!    rejecting the 25 named `M_anneal` evaluator entry points, with human
-//!    review of `trusted/correspondence/` remaining the semantic boundary).
+//!    independence checks (reaching the 21 required `Miri.*` primitives while
+//!    restricting `Trusted` dependencies in the reference-evaluator cone to
+//!    `Trusted.MirAst*`, `Trusted.MirModel`, and `Trusted.Correspondence*`,
+//!    with human review of `trusted/correspondence/` and `Trusted.MirModel`
+//!    remaining the semantic boundary).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
@@ -2921,8 +2923,8 @@ impl Checker {
         let miri_lib =
             self.verify_and_stage_miri_entries(vendor_dir, closure_entries, expected_sources)?;
 
-        // Compile `Trusted.Correspondence.*` into `lib/` and
-        // `Anneal.MirCorrespondenceProof.*` into `theory-lib/` inside
+        // Compile `Trusted.Correspondence*` into `lib/` and
+        // `Anneal.MirCorrespondence*` into `theory-lib/` inside
         // per-module OS-level `bwrap` sandboxes. For `Trusted` modules,
         // `corr_theory_lib` is neither mounted nor in `LEAN_PATH`, so they
         // cannot resolve compiled `theory/` or `correspondence/` modules even
