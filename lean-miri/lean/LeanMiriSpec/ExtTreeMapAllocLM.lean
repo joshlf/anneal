@@ -119,8 +119,9 @@ simulation relations (`StateRelLM3_1`, `StateRelLM3_2`, `annealResolvePtr`,
   and nested `childSession` (`recursive = true`) vtable-before-data-UB precedence and `mayDangle` behavior
   through the full `ValidityVisitor.validatePlace` driver (direct `&(&dyn Trait)`, struct-wrapped
   `&(S { f0: &dyn Trait, ... })`, `[T; N]` `Sized` array fast-paths incl. empty arrays of every element class
-  (direct and behind safe references), and `[&dyn Trait; N]` / `&[&dyn Trait; N]` with the FIRST invalid vtable
-  at an arbitrary element index (both `recursive = false` and `recursive = true`).
+  (direct for both `recursive` flags; behind safe references under recursive validation), and
+  `[&dyn Trait; N]` / `&[&dyn Trait; N]` with the FIRST invalid vtable at an arbitrary element index (the
+  direct form for both `recursive` flags; the reference form under recursive validation).
 * **Part 3** — closed (hypothesis-free) non-vacuity canaries across all parts.
 * **Part 4** — exhaustive `#guard_msgs in #print axioms` pins for every public
   theorem.
@@ -1138,8 +1139,6 @@ theorem keyedRowsRel_perm_invariant {Prov Extra MachineKind : Type}
 
 local macro "miriKAIndexStep" : term =>
   `(miri_etm_private% Miri.Memory.KeyedArray Miri.Memory.indexStep)
-local macro "miriKACanonicalIndex" : term =>
-  `(miri_etm_private% Miri.Memory.KeyedArray Miri.Memory.canonicalIndex)
 local macro "miriKAKeys" : term =>
   `(miri_etm_private% Miri.Memory.KeyedArray Miri.Memory.KeyedArray.keys)
 local macro "miriKARows" : term =>
@@ -1160,8 +1159,6 @@ local macro "miriMSVaListTable" : term =>
   `(miri_etm_private% Miri.Memory.MemoryState Miri.Memory.MemoryState.vaListTable)
 local macro "miriMSContainsId" : term =>
   `(miri_etm_private% Miri.Memory.MemoryState Miri.Memory.MemoryState.containsId)
-local macro "miriMSFindLive?" : term =>
-  `(miri_etm_private% Miri.Memory.MemoryState Miri.Memory.MemoryState.findLive?)
 local macro "miriMSInsertLive" : term =>
   `(miri_etm_private% Miri.Memory.MemoryState Miri.Memory.MemoryState.insertLive)
 local macro "miriMSRemoveLive" : term =>
@@ -1176,8 +1173,6 @@ local macro "miriAllocMachBefore" : term =>
   `(miri_etm_private% Miri.Interpreter.AllocationMachine Miri.Interpreter.AllocationMachine.before)
 local macro "miriAllocRawBytes" : term =>
   `(miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.rawBytes)
-local macro "miriNodeAt" : term =>
-  `(miri_etm_private% Miri.TreeBorrows.Traversal Miri.TreeBorrows.Tree.TraversalTree.nodeAt)
 local macro "miriAncestorPathAux" : term =>
   `(miri_etm_private% Miri.TreeBorrows.Traversal
     Miri.TreeBorrows.Tree.TraversalTree.ancestorPathAux)
@@ -7283,9 +7278,9 @@ theorem visit_nested_wideSafeRef_childSession {S C E F A Pad : Type}
     ptrImm target size align sc intVal addr rfl rfl hcl hrd hpt (Or.inr hcmOk) hsa hfrom htry haddr
   exact ⟨hmd.1, fun hlt hnn hinh hal => ((((hmd.2 hlt).2 hnn).2 hinh).2 hal)⟩
 
-/-! ## Part 2D. Round-1 counter-audit strengthenings
+/-! ## Part 2D. Strengthenings across Parts 1C, 1E, and 2
 
-Strengthenings of Parts 1C, 1E, and 2: two-way and hypothesis-minimal `StateRelLM3_*` liftings,
+Two-way and hypothesis-minimal `StateRelLM3_*` liftings,
 the frame pop for arbitrarily many protectors with a whole-frame simulation against
 `execFrameExitMiri`, and state/choice-polymorphic vtable reads through the `validatePlace` driver
 with the exact `annealValidityHooks` boundary. -/
@@ -8831,13 +8826,17 @@ Closes the remaining operational gaps across all three tracks:
   `MachineHooks.beforeStackPopWithEnsure` vs per-allocation `execFrameExitMiri`, and end-to-end
   `FnEntry` retag (`RetagPolicy.create` + `RetagPipeline.retagPointerValue`) + intra-call access +
   `releaseProtector` contrast between `writableChildWrite` (`&mut T`) and `rustcNoWritable`
-  (`#[rustc_no_writable]`).
+  (`#[rustc_no_writable]`); plus the per-segment lift to multi-segment trees of an unexposed tag
+  (2E.1a.2).
 * **2E.2** — Multi-reader and multi-byte vector-clock correspondence (`VClockAlloc.writeNonAtomic` ↔
   `hasDeallocDataRace`) and full end-to-end `AllocationMachine.deallocate` ↔
-  `KeyedAllocWorld.deallocateMachine` lockstep across every deallocation branch.
+  `KeyedAllocWorld.deallocateMachine` lockstep across every deallocation branch; its derived
+  corollaries and the keyed-world frame of store / retag / frame-exit write-backs (2E.2a.1); and
+  `PlaceMachine.allocateStackRaw` with the composed allocation lifecycle (2E.2a.2).
 * **2E.3** — Nested `childSession` (`recursive = true`) invalid-vtable-before-data-UB precedence and
   `mayDangle` behavior through the full `ValidityVisitor.validatePlace` driver (direct `&(&dyn Trait)`
-  and struct-wrapped `&(S { f0: &dyn Trait, ... })`). -/
+  and struct-wrapped `&(S { f0: &dyn Trait, ... })`); plus `[T; N]` array fast paths and
+  first-invalid-vtable precedence in `[&dyn Trait; N]` / `&[&dyn Trait; N]` (2E.3b). -/
 
 /-! ### 2E.1 Real implicit-access `BorrowTree.releaseProtector`, multi-allocation frame exit, and
 `writableChildWrite` vs `rustcNoWritable` end-to-end simulation -/
@@ -20385,7 +20384,10 @@ for recursive validation (`recursive = true, reset = false`) of `&[T; 0]` / `&[!
 5. Non-null dangling **aligned** `&[!; 0]` (ZST empty array) succeeds `.ok ()`!
 
 The non-numeric, non-ZST empty-array case behind a safe reference (`&[&dyn Trait; 0]`,
-`&[(u8, u16); 0]`) is proved in `validatePlace_ref_emptyArray_nonZst`. -/
+`&[(u8, u16); 0]`) is proved in `validatePlace_ref_emptyArray_nonZst`.
+
+Scope: the theorem-level hypothesis `debugAssertions = false` is consulted only on the success path
+of part 5; parts 1–4 are stated under it, but their proofs never consult it. -/
 theorem validatePlace_ref_emptyArray_and_uninhabited {S C E F A Pad : Type}
     (h : Miri.Interpreter.ValidityVisitor.Hooks Miri.Memory.Provenance S C E F A Pad) (c : C)
     (fuel : Nat) (outerPlace : Miri.Interpreter.RuntimePlace Miri.Memory.Provenance) (st : S)
@@ -20740,8 +20742,10 @@ under recursive validation (`recursive = true, reset = false`):
    No hypothesis constrains the projection, read, or visit of any element.
 
 Scope: every hook result is assumed to leave the state unchanged and `withGhostValidation` is
-assumed transparent. Numeric and ZST empty arrays behind safe references are covered by
-`validatePlace_ref_emptyArray_and_uninhabited`. -/
+assumed transparent. Parts 1 and 2 place no hypothesis on the pointee being an array: they restate
+parts 1 and 3 of `validatePlace_ref_emptyArray_and_uninhabited` under this hypothesis set, and their
+proofs never consult `debugAssertions = false`, which only part 3 uses. Numeric and ZST empty arrays
+behind safe references are covered by `validatePlace_ref_emptyArray_and_uninhabited`. -/
 theorem validatePlace_ref_emptyArray_nonZst {S C E F A Pad : Type}
     (h : Miri.Interpreter.ValidityVisitor.Hooks Miri.Memory.Provenance S C E F A Pad) (c : C)
     (fuel : Nat) (outerPlace : Miri.Interpreter.RuntimePlace Miri.Memory.Provenance) (st : S)
@@ -22892,7 +22896,7 @@ theorem fnEntry_writableChildWrite_vs_rustcNoWritable_endToEnd_canary :
       rcases h4 sib with ⟨hout, _, entry, w1, _, hfind, hret, _, _, _, hsibSt, w2, hw2, hchSt, w3, _, hw3, _, _, _, hrelSt, hfrzM, w4, w4D, _, hfe, hfrzT, _, _, hrelW⟩
       exact ⟨hout, entry, w1, hfind, hret, hsibSt, hchSt, hrelSt, hfrzM, w2, w3, w4, hw2, hw3, hfe, hfrzT, w4D, hrelW⟩
 
-/-! ### Part 3B. Round-3 closed non-vacuity canaries (`multiSeg_strongWeak_releaseProtector_canary`,
+/-! ### Part 3B. Further closed non-vacuity canaries (`multiSeg_strongWeak_releaseProtector_canary`,
 `multiStep_lifecycle_noABA_and_detached_canary`, `array_sized_zst_uninhabited_and_nested_array_wideDyn_canary`,
 `array_empty_and_firstInvalidVTable_index1_canary`) -/
 
