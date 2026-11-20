@@ -951,6 +951,9 @@ impl Checker {
         });
         let bytes =
             serde_json::to_vec(&setup_obj).map_err(|e| Failure::new(2, "setup", e.to_string()))?;
+        if setup_path.symlink_metadata().is_ok() {
+            fs::remove_file(setup_path).map_err(|e| Failure::new(2, "setup", e.to_string()))?;
+        }
         fs::write(setup_path, bytes).map_err(|e| Failure::new(2, "setup", e.to_string()))?;
         set_mode(setup_path, 0o444)?;
         Ok(())
