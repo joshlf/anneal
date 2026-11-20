@@ -1186,9 +1186,17 @@ theorem volatile_load_store_mmio_misaligned_ub :
       MirStepNode.fail .ub :=
   ⟨by kernel_rfl, by kernel_rfl⟩
 
-/-- `volatile_copy_memory` and `volatile_set_memory` on aligned provenance-less addresses step to
-`MirStepNode.unsupported`. -/
+/-- `volatile_copy_nonoverlapping_memory`, `volatile_copy_memory`, and `volatile_set_memory` on
+aligned provenance-less addresses step to `MirStepNode.unsupported`. -/
 theorem volatile_copy_set_mmio_aligned_unsupported :
+    stepMirFn
+        (constCallBody vCopyNonoverlapping tyU32
+          [cAddr tyPtrMutU32 0x40000000, cAddr tyPtrConstU32 0x40001000, cUsize 1] tyUnit)
+        (initMachineState
+          (constCallBody vCopyNonoverlapping tyU32
+            [cAddr tyPtrMutU32 0x40000000, cAddr tyPtrConstU32 0x40001000, cUsize 1] tyUnit)
+          []) =
+      MirStepNode.unsupported ∧
     stepMirFn
         (constCallBody vCopy tyU32
           [cAddr tyPtrMutU32 0x40000000, cAddr tyPtrConstU32 0x40001000, cUsize 1] tyUnit)
@@ -1201,7 +1209,7 @@ theorem volatile_copy_set_mmio_aligned_unsupported :
         (initMachineState
           (constCallBody vSet tyU32 [cAddr tyPtrMutU32 0x40000000, cU8 0, cUsize 1] tyUnit) []) =
       MirStepNode.unsupported :=
-  ⟨by kernel_rfl, by kernel_rfl⟩
+  ⟨by kernel_rfl, by kernel_rfl, by kernel_rfl⟩
 
 /-- A volatile load of a non-zero-sized type at the null address is treated as an access outside
 all Rust allocations: `MirStepNode.unsupported`, not `.ub` (the non-volatile `read_unaligned` at
@@ -1328,17 +1336,55 @@ theorem minirust_transmute_vtablePtr_and_dyn_ref_ok :
       .ok (.Ptr ⟨dataPtrTB 64, some (.VTablePointer vtPtrATB)⟩, .Ptr dynRefA) :=
   ⟨rfl, rfl, rfl, rfl⟩
 
+/-- Single-allocation `TreeBorrowsMemory` (8 bytes at address 64) with borrow tree `root`. -/
+private def tbMemOf (root : MiniRustSpec.Gen.Node) : MiniRustSpec.Interp.TBM :=
+  { params := { implicit_writes := false },
+    mem :=
+      { allocations :=
+          [{ data := List.replicate 8 (.Init 0x11 none), addr := 64, align := ⟨4⟩, kind := .Stack,
+             live := true, extra := { root := root } }],
+        _phantom := ⟨⟩ } }
+
+private def tbSingleNode (perm : MiniRustSpec.Gen.Permission) : MiniRustSpec.Gen.Node :=
+  { children := [], permissions := List.replicate 8 perm, «protected» := .No }
+
 /-- MiniRust's byte memory accepts an unaligned load at an odd address at alignment 1 (4 bytes
 at address 65 of the live allocation) and zero-sized accesses through an aligned
-provenance-free pointer, on `BasicMemory` and (for the zero-sized ones) `TreeBorrowsMemory`. -/
+provenance-free pointer, on both `BasicMemory` and `TreeBorrowsMemory`. -/
 theorem minirust_unaligned_and_zero_sized_access_ok :
     (MiniRustSpec.Interp.BM.load vtMach.mem.memory (dataPtr 65) ⟨4⟩ ⟨1⟩).map Prod.fst =
       .ok (List.replicate 4 .Uninit) ∧
+    (MiniRustSpec.Interp.TreeBorrowsMemory.load (tbMemOf (tbSingleNode (.Unprot .Unique)))
+      (dataPtrTB 65) ⟨4⟩ ⟨1⟩).map Prod.fst = .ok (List.replicate 4 (.Init 0x11 none)) ∧
     (MiniRustSpec.Interp.BM.load vtMach.mem.memory { addr := 4, provenance := none } ⟨0⟩ ⟨4⟩).map
       Prod.fst = .ok [] ∧
     (MiniRustSpec.Interp.TreeBorrowsMemory.load vtMachTB.mem.memory
       { addr := 4, provenance := none } ⟨0⟩ ⟨4⟩).map Prod.fst = .ok [] :=
-  ⟨rfl, rfl, rfl⟩
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- Custom DST struct `struct CustomDst { head: u32, tail: dyn TraitA }` (head size 4, align 4,
+plus `vtableA` dynamic size 4, align 4 = total size 8, align 4). -/
+private def customDstDynRefA : MiniRustSpec.Gen.PtrType :=
+  .Ref .Immutable { layout := .Tuple ⟨⟨4⟩, ⟨4⟩, none⟩ (.TraitObject traitA), inhabited := true,
+                    unsafe_cells := .TraitObject, freeze := true, unpin := true }
+
+/-- `&CustomDst` passes `check_ptr` at address 64 (8 bytes `[64..72)` fit inside `[64..72)`),
+fails with unaligned UB at address 66, and fails with non-dereferenceable UB at address 68
+(distinguishing it from bare `&dyn TraitA`, whose dynamic size 4 succeeds at 68), on both
+`Mach` and `MachTB`. -/
+theorem minirust_custom_dst_dyn_tail_checkPtr :
+    checkPtr ⟨dataPtr 64, some (.VTablePointer vtPtrA)⟩ customDstDynRefA (some vtMach) = .ok () ∧
+    checkPtrM ⟨dataPtrTB 64, some (.VTablePointer vtPtrATB)⟩ customDstDynRefA (some vtMachTB) =
+      .ok () ∧
+    checkPtr ⟨dataPtr 66, some (.VTablePointer vtPtrA)⟩ customDstDynRefA (some vtMach) =
+      .error (.ub "Value::Ptr: unaligned safe pointer") ∧
+    checkPtrM ⟨dataPtrTB 66, some (.VTablePointer vtPtrATB)⟩ customDstDynRefA (some vtMachTB) =
+      .error (.ub "Value::Ptr: unaligned safe pointer") ∧
+    checkPtr ⟨dataPtr 68, some (.VTablePointer vtPtrA)⟩ customDstDynRefA (some vtMach) =
+      .error (.ub "Value::Ptr: non-dereferenceable safe pointer") ∧
+    checkPtrM ⟨dataPtrTB 68, some (.VTablePointer vtPtrATB)⟩ customDstDynRefA (some vtMachTB) =
+      .error (.ub "Value::Ptr: non-dereferenceable safe pointer") :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-! ### 4.2 Negative `undefined` (`.error (.ub _)`) canaries -/
 
@@ -1467,6 +1513,90 @@ theorem minirust_misaligned_oob_dead_access_ub :
       { addr := 0, provenance := none } ⟨4⟩ ⟨1⟩ =
       .error (.ub "dereferencing pointer without provenance") :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+private def tbProtTree (childPerm : MiniRustSpec.Gen.Permission) : MiniRustSpec.Gen.Node :=
+  { children := [{ children := [], permissions := List.replicate 8 childPerm,
+                   «protected» := .Strong }],
+    permissions := List.replicate 8 (.Unprot .Unique),
+    «protected» := .No }
+
+/-- MiniRust `TreeBorrowsMemory` negative UB + positive control canaries for `.Frozen` write,
+`.Disabled` read/write, and `Protected.Strong` active-protector foreign-write conflicts, across
+both unaligned (align 1, address 65) and aligned (align 4, address 64) accesses. -/
+theorem minirust_tb_frozen_disabled_protector_ub :
+    -- Frozen write UB (align 1 & align 4), plus positive Frozen read control
+    MiniRustSpec.Interp.TreeBorrowsMemory.store (tbMemOf (tbSingleNode (.Unprot .Frozen)))
+        (dataPtrTB 65) (List.replicate 4 (.Init 0x22 none)) ⟨1⟩ =
+      .error (.ub "Tree Borrows: local write of Frozen reference") ∧
+    MiniRustSpec.Interp.TreeBorrowsMemory.store (tbMemOf (tbSingleNode (.Unprot .Frozen)))
+        (dataPtrTB 64) (List.replicate 4 (.Init 0x22 none)) ⟨4⟩ =
+      .error (.ub "Tree Borrows: local write of Frozen reference") ∧
+    (MiniRustSpec.Interp.TreeBorrowsMemory.load (tbMemOf (tbSingleNode (.Unprot .Frozen)))
+        (dataPtrTB 65) ⟨4⟩ ⟨1⟩).map Prod.fst =
+      .ok (List.replicate 4 (.Init 0x11 none)) ∧
+    -- Disabled read & write UB
+    MiniRustSpec.Interp.TreeBorrowsMemory.load (tbMemOf (tbSingleNode (.Unprot .Disabled)))
+        (dataPtrTB 65) ⟨4⟩ ⟨1⟩ =
+      .error (.ub "Tree Borrows: local read of Disabled reference") ∧
+    MiniRustSpec.Interp.TreeBorrowsMemory.store (tbMemOf (tbSingleNode (.Unprot .Disabled)))
+        (dataPtrTB 65) (List.replicate 4 (.Init 0x22 none)) ⟨1⟩ =
+      .error (.ub "Tree Borrows: local write of Disabled reference") ∧
+    -- Protected Reserved (had local read) foreign-write UB (align 1 & align 4) + foreign-read ok
+    MiniRustSpec.Interp.TreeBorrowsMemory.store (tbMemOf (tbProtTree (.Prot (.Reserved true false))))
+        (dataPtrTB 65) (List.replicate 4 (.Init 0x22 none)) ⟨1⟩ =
+      .error (.ub "Tree Borrows: foreign write of protected Reserved reference which had a local read") ∧
+    MiniRustSpec.Interp.TreeBorrowsMemory.store (tbMemOf (tbProtTree (.Prot (.Reserved true false))))
+        (dataPtrTB 64) (List.replicate 4 (.Init 0x22 none)) ⟨4⟩ =
+      .error (.ub "Tree Borrows: foreign write of protected Reserved reference which had a local read") ∧
+    (MiniRustSpec.Interp.TreeBorrowsMemory.load (tbMemOf (tbProtTree (.Prot (.Reserved true false))))
+        (dataPtrTB 65) ⟨4⟩ ⟨1⟩).map Prod.fst =
+      .ok (List.replicate 4 (.Init 0x11 none)) ∧
+    -- Protected Frozen (had local read) foreign-write UB
+    MiniRustSpec.Interp.TreeBorrowsMemory.store (tbMemOf (tbProtTree (.Prot (.Frozen true))))
+        (dataPtrTB 65) (List.replicate 4 (.Init 0x22 none)) ⟨1⟩ =
+      .error (.ub "Tree Borrows: foreign write of protected Frozen reference which had a local read") :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+private def canaryFnName : MiniRustSpec.Gen.FnName := ⟨⟨0⟩⟩
+
+private def canaryFn : MiniRustSpec.Gen.Function :=
+  { locals := ⟨[]⟩, args := [], ret := ⟨⟨0⟩⟩, calling_convention := .Rust, blocks := ⟨[]⟩,
+    start := ⟨⟨0⟩⟩, implicit_writes := false }
+
+private def canaryFnThin : MiniRustSpec.Interp.Ptr :=
+  { addr := 4096, provenance := some (⟨0⟩, ()) }
+
+private def canaryFnThinTB : MiniRustSpec.Gen.ThinPointer MiniRustSpec.Gen.TreeBorrowsProvenance :=
+  { addr := 4096, provenance := some (⟨0⟩, []) }
+
+private def canaryFnMach : MiniRustSpec.Interp.Mach :=
+  { vtMach with
+    prog := { vtMach.prog with functions := ⟨[(canaryFnName, canaryFn)]⟩ },
+    fn_ptrs := ⟨[(canaryFnName, canaryFnThin)]⟩ }
+
+private def canaryFnMachTB : MiniRustSpec.Interp.MachTB :=
+  { vtMachTB with
+    prog := { vtMachTB.prog with functions := ⟨[(canaryFnName, canaryFn)]⟩ },
+    fn_ptrs := ⟨[(canaryFnName, canaryFnThinTB)]⟩ }
+
+/-- MiniRust `CastKind.fnPtrToPtr` lowering (`Transmute` from `PtrType::FnPtr` to
+`PtrType::Raw { meta_kind: None }`) and `Machine::fn_from_ptr` on both `Mach` and `MachTB`:
+the transmute preserves the thin pointer, `fn_from_ptr` resolves the registered function, and
+`fn_from_ptr` rejects a data pointer with UB `"invalid pointer for function lookup"`. -/
+theorem minirust_fnPtrToPtr_transmute_and_fnFromPtr :
+    MiniRustSpec.Interp.evalUnOp (.Cast (.Transmute (.Ptr (.Raw .None))))
+        (.Ptr ⟨canaryFnThin, none⟩, .Ptr .FnPtr) (some canaryFnMach) =
+      .ok (.Ptr ⟨canaryFnThin, none⟩, .Ptr (.Raw .None)) ∧
+    MiniRustSpec.Interp.evalUnOpM (.Cast (.Transmute (.Ptr (.Raw .None))))
+        (.Ptr ⟨canaryFnThinTB, none⟩, .Ptr .FnPtr) (some canaryFnMachTB) =
+      .ok (.Ptr ⟨canaryFnThinTB, none⟩, .Ptr (.Raw .None)) ∧
+    MiniRustSpec.Interp.fnFromPtr canaryFnMach (.Ptr ⟨canaryFnThin, none⟩) = .ok canaryFn ∧
+    MiniRustSpec.Interp.fnFromPtrM canaryFnMachTB (.Ptr ⟨canaryFnThinTB, none⟩) = .ok canaryFn ∧
+    MiniRustSpec.Interp.fnFromPtr canaryFnMach (.Ptr ⟨dataPtr 64, none⟩) =
+      .error (.ub "invalid pointer for function lookup") ∧
+    MiniRustSpec.Interp.fnFromPtrM canaryFnMachTB (.Ptr ⟨dataPtrTB 64, none⟩) =
+      .error (.ub "invalid pointer for function lookup") :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-! ### 4.3 `Stop.unsupported` only without a machine -/
 
@@ -1793,5 +1923,26 @@ info: 'Anneal.Mir.UnalignedVolatileVTableTests.minirust_unsupported_only_without
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms minirust_unsupported_only_without_machine
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.minirust_custom_dst_dyn_tail_checkPtr' depends on axioms:
+[propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms minirust_custom_dst_dyn_tail_checkPtr
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.minirust_tb_frozen_disabled_protector_ub' depends on axioms:
+[propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms minirust_tb_frozen_disabled_protector_ub
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.minirust_fnPtrToPtr_transmute_and_fnFromPtr' depends on axioms:
+[propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms minirust_fnPtrToPtr_transmute_and_fnFromPtr
 
 end Anneal.Mir.UnalignedVolatileVTableTests

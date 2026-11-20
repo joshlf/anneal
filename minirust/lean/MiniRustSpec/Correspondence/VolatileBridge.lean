@@ -568,6 +568,45 @@ theorem trusted_addr_alignment_parity
       | succ k => rfl
     simp [hmod]
 
+/-- On a global allocation target with positive recorded alignment, Trusted's
+`rawPtrTargetAligned?` requires `reqAlign ≤ alloc.align.bytes` and `ptr.offsetBytes % reqAlign = 0`
+(alignment in every admissible placement of the global). -/
+theorem trusted_global_target_aligned_iff
+    (callStack : List SavedCallerFrame) (locals' : List LocalSlot)
+    (decls : List LocalDecl) (layouts : LayoutTable)
+    (reqAlign : Nat) (ptr : ProvenancePtr) (alloc : CapturedAllocation)
+    (hReq : 1 < reqAlign) (hAllocPos : 0 < alloc.align.bytes) :
+    rawPtrTargetAligned? callStack locals' decls layouts reqAlign (.prov ptr)
+        (.global ptr alloc) =
+      .some (decide (reqAlign ≤ alloc.align.bytes ∧ ptr.offsetBytes % reqAlign = 0)) := by
+  have hble1 : Nat.ble reqAlign 1 = false := by
+    cases h : Nat.ble reqAlign 1 with
+    | false => rfl
+    | true => exact absurd (Nat.le_of_ble_eq_true h) (by omega)
+  have hbeq0 : Nat.beq alloc.align.bytes 0 = false := by
+    cases h : alloc.align.bytes with
+    | zero => omega
+    | succ _ => rfl
+  unfold rawPtrTargetAligned?
+  rw [hble1]
+  dsimp only
+  rw [hbeq0]
+  dsimp only
+  cases hle : Nat.ble reqAlign alloc.align.bytes with
+  | false =>
+    have hnot : ¬ (reqAlign ≤ alloc.align.bytes) := by
+      intro h
+      rw [Nat.ble_eq_true_of_le h] at hle
+      cases hle
+    simp [hnot]
+  | true =>
+    have hle' : reqAlign ≤ alloc.align.bytes := Nat.le_of_ble_eq_true hle
+    have hmod : Nat.beq (Nat.mod ptr.offsetBytes reqAlign) 0 =
+        decide (ptr.offsetBytes % reqAlign = 0) := by
+      change Nat.beq (ptr.offsetBytes % reqAlign) 0 = decide (ptr.offsetBytes % reqAlign = 0)
+      cases ptr.offsetBytes % reqAlign <;> rfl
+    simp [hle', hmod]
+
 /-- A raw-pointer load that requires alignment is `.fault .ub` whenever `rawPtrTargetAligned?`
 answers `some false`: before the null, inhabitedness, size and target checks, hence also for a
 zero-sized `T`. -/
@@ -1615,6 +1654,92 @@ theorem lockstep_tree_borrows_conflict_ub :
         .ok (.Int 0x12345678, m') ∧ machBytesTB m' = [vbPlain vbArr8]) :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, loadedIntTB_sound (by decide +kernel)⟩
 
+/-- Trusted memory with parent tag `10` (`active`) and a strongly-protected child tag `11`
+(`protector = some 1`, `1 ∈ activeProtectors`) aliasing the whole local `_1`. -/
+def vbMemProt (childPerm : TreeBorrowPerm := .reserved) : Memory :=
+  { borrows :=
+      [{ tag := 11, targetLocal := 1, targetProjection := [], perm := childPerm,
+         protector := .some 1, parentTag := .some 10, targetFrameDepth := 0 },
+       vbEntry 10],
+    activeProtectors := [1] }
+
+/-- `MachTB` whose single stack allocation has a two-node Tree Borrows tree: root `Unique`
+(accessed via `vbPtrTB`) and one `Protected.Strong` child (`path = [0]`) with permission
+`childPerm` on every byte. -/
+def vbMachTBProt (data : List (Gen.AbstractByte Gen.TreeBorrowsProvenance))
+    (childPerm : Gen.Permission := .Prot (.Reserved true false))
+    (live : Bool := true) (base : Int := vbBase) : Interp.MachTB :=
+  { prog := vbProg,
+    mem :=
+      { memory :=
+          { params := { implicit_writes := false },
+            mem :=
+              { allocations :=
+                  [{ data := data, addr := base, align := ⟨1⟩, kind := .Stack, live := live,
+                     extra :=
+                       { root :=
+                           { children :=
+                               [{ children := [],
+                                  permissions := List.replicate data.length childPerm,
+                                  «protected» := .Strong }],
+                             permissions := List.replicate data.length (.Unprot .Unique),
+                             «protected» := .No } } }],
+                _phantom := ⟨⟩ } },
+        accesses := [] },
+    intptrcast := { exposed := ⟨[]⟩ },
+    threads := [], active_thread := 0, synchronized_threads := ⟨[]⟩, locks := [],
+    global_ptrs := ⟨[]⟩, fn_ptrs := ⟨[]⟩, vtable_ptrs := ⟨[]⟩,
+    stdout := ⟨[]⟩, stderr := ⟨[]⟩ }
+
+/-- Active-protector Tree Borrows conflicts in lockstep between Trusted and `MachTB`:
+a foreign write through parent pointer `vbTPtr`/`vbPtrTB` while a child tag is strongly protected
+with `Reserved` (had local read), `Frozen` (had local read), or `Unique`/`active` is UB on both
+Trusted and `MachTB`, for both unaligned (`u32` at offset 1) and aligned volatile (`u8` at offset 1)
+stores; a foreign read of a protected `Unique`/`active` child is UB on both; and a foreign read of
+a protected `Reserved` or `Frozen` child is allowed on both. -/
+theorem lockstep_tree_borrows_protector_conflict_ub :
+    -- Foreign write to protected Reserved (unaligned u32 & aligned volatile u8)
+    trustedVolatileAction .unalignedVolatileStore (vbMemProt .reserved)
+        (vbTarget "core::intrinsics::unaligned_volatile_store" vbTyU32) (vbDecls vbTyUnit)
+        vbTbl [] [vbTPtr 1, .scalar ⟨0x04030201, 4⟩] (vbLocals vbArr8) = .fault .ub ∧
+    trustedVolatileAction .volatileStore (vbMemProt .reserved)
+        (vbTarget "core::intrinsics::volatile_store" vbTyU8) (vbDecls vbTyUnit)
+        vbTbl [] [vbTPtr 1, .scalar ⟨0x5A, 1⟩] (vbLocals vbArr8) = .fault .ub ∧
+    trustedUnlinkedAction (vbMemProt .reserved)
+        (vbTarget "core::ptr::write_unaligned" vbTyU32) (vbDecls vbTyUnit)
+        vbTbl [] [vbTPtr 1, .scalar ⟨0x04030201, 4⟩] (vbLocals vbArr8) = .some (.fault .ub) ∧
+    mrStoreTB false (vbMachTBProt (vbPlain vbArr8) (.Prot (.Reserved true false))) (vbPtrTB 1)
+        (.Int 0x04030201) vbMrU32 =
+      .error (.ub "Tree Borrows: foreign write of protected Reserved reference which had a local read") ∧
+    mrStoreTB true (vbMachTBProt (vbPlain vbArr8) (.Prot (.Reserved true false))) (vbPtrTB 1)
+        (.Int 0x5A) (.Int ⟨.Unsigned, ⟨1⟩⟩) =
+      .error (.ub "Tree Borrows: foreign write of protected Reserved reference which had a local read") ∧
+    -- Foreign write to protected Frozen
+    trustedVolatileAction .unalignedVolatileStore (vbMemProt .frozen)
+        (vbTarget "core::intrinsics::unaligned_volatile_store" vbTyU32) (vbDecls vbTyUnit)
+        vbTbl [] [vbTPtr 1, .scalar ⟨0x04030201, 4⟩] (vbLocals vbArr8) = .fault .ub ∧
+    mrStoreTB false (vbMachTBProt (vbPlain vbArr8) (.Prot (.Frozen true))) (vbPtrTB 1)
+        (.Int 0x04030201) vbMrU32 =
+      .error (.ub "Tree Borrows: foreign write of protected Frozen reference which had a local read") ∧
+    -- Foreign read of protected Unique/active is UB on both
+    trustedVolatileAction .unalignedVolatileLoad (vbMemProt .active)
+        (vbTarget "core::intrinsics::unaligned_volatile_load" vbTyU32) (vbDecls vbTyU32)
+        vbTbl [] [vbTPtr 1] (vbLocals vbArr8) = .fault .ub ∧
+    mrLoadTB false (vbMachTBProt (vbPlain vbArr8) (.Prot .Unique)) (vbPtrTB 1) vbMrU32 =
+      .error (.ub "Tree Borrows: foreign read of protected Unique reference") ∧
+    -- Positive control: foreign read of protected Reserved is allowed on both (and marks
+    -- the protected child's foreign-read conflict latch: `reservedFrz true` / `had_foreign_read = true`)
+    trustedVolatileAction .unalignedVolatileLoad (vbMemProt .reserved)
+        (vbTarget "core::intrinsics::unaligned_volatile_load" vbTyU32) (vbDecls vbTyU32)
+        vbTbl [] [vbTPtr 1] (vbLocals vbArr8) =
+      .retBorrows
+        [{ tag := 11, targetLocal := 1, targetProjection := [], perm := .reservedFrz true,
+           protector := .some 1, parentTag := .some 10, targetFrameDepth := 0 },
+         vbEntry 10] (.scalar ⟨0x12345678, 4⟩) ∧
+    (∃ m', mrLoadTB false (vbMachTBProt (vbPlain vbArr8) (.Prot (.Reserved true false)))
+        (vbPtrTB 1) vbMrU32 = .ok (.Int 0x12345678, m') ∧ machBytesTB m' = [vbPlain vbArr8]) :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, loadedIntTB_sound (by decide +kernel)⟩
+
 /-! ## 6. Copy and set: lockstep witnesses (item 4) -/
 
 /-- MiniRust `u8`. -/
@@ -2033,6 +2158,294 @@ theorem mmio_volatile_not_noUB (addr bits : Nat)
    mirStep_fail_not_noUB _ _ .unsupported (mmio_volatile_store_step_unsupported addr bits hAl).1,
    mirStep_fail_not_noUB _ _ .unsupported (mmio_volatile_store_step_unsupported addr bits hAl).2⟩
 
+/-- A non-zero-byte volatile copy whose `dst` and `src` are aligned provenance-less addresses
+(and whose byte count fits `isize::MAX`) fails closed in Trusted with `.fault .unsupported`. -/
+theorem trusted_volatile_copy_mmio_unsupported
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (callStack : List SavedCallerFrame)
+    (target : ResolvedCallTarget) (decls : List LocalDecl) (layouts : LayoutTable)
+    (argOps : List Operand) (locals' : List LocalSlot)
+    (dstAddr srcAddr count : Nat) (elemTy : Ty) (size align : Nat)
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
+    (hpos : 0 < align)
+    (hDstAl : Interp.Align.is_aligned ⟨align⟩ (dstAddr : Int) = true)
+    (hSrcAl : Interp.Align.is_aligned ⟨align⟩ (srcAddr : Int) = true)
+    (hSmall : count * size < signedHalfModulus (layoutPointerBytes layouts))
+    (hNonZero : count * size ≠ 0) :
+    volatileCopyPlan borrows globals callStack target decls layouts argOps
+      [.scalar ⟨dstAddr, layoutPointerBytes layouts⟩,
+       .scalar ⟨srcAddr, layoutPointerBytes layouts⟩,
+       .scalar ⟨count, layoutPointerBytes layouts⟩] locals' = .fault .unsupported := by
+  have hBle : Nat.ble (signedHalfModulus (layoutPointerBytes layouts)) (Nat.mul count size) =
+      false := by
+    cases h : Nat.ble (signedHalfModulus (layoutPointerBytes layouts)) (Nat.mul count size) with
+    | false => rfl
+    | true =>
+      have := Nat.le_of_ble_eq_true h
+      change signedHalfModulus (layoutPointerBytes layouts) ≤ count * size at this
+      omega
+  have hZero : Nat.beq (Nat.mul count size) 0 = false := by
+    change Nat.beq (count * size) 0 = false
+    cases h : count * size with
+    | zero => exact absurd h hNonZero
+    | succ _ => rfl
+  have hDA := trusted_addr_alignment_parity callStack locals' decls layouts align dstAddr .outside
+    hpos
+  rw [hDstAl] at hDA
+  have hSA := trusted_addr_alignment_parity callStack locals' decls layouts align srcAddr .outside
+    hpos
+  rw [hSrcAl] at hSA
+  unfold volatileCopyPlan
+  dsimp only
+  rw [Nat.beq_refl, rawPtrArgOfValue_addr, rawPtrArgOfValue_addr]
+  dsimp only
+  rw [hLay]
+  dsimp only
+  rw [hBle]
+  dsimp only
+  simp only [classifyRawPtrTarget, hDA, hSA, hZero]
+
+/-- A non-zero-byte `volatile_set_memory` whose `dst` is an aligned provenance-less address
+(and whose byte count fits `isize::MAX`) fails closed in Trusted with `.fault .unsupported`. -/
+theorem trusted_volatile_set_mmio_unsupported
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (callStack : List SavedCallerFrame)
+    (target : ResolvedCallTarget) (decls : List LocalDecl) (layouts : LayoutTable)
+    (argOps : List Operand) (locals' : List LocalSlot)
+    (dstAddr count : Nat) (val : UInt8) (elemTy : Ty) (size align : Nat)
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
+    (hpos : 0 < align)
+    (hDstAl : Interp.Align.is_aligned ⟨align⟩ (dstAddr : Int) = true)
+    (hSmall : count * size < signedHalfModulus (layoutPointerBytes layouts))
+    (hNonZero : count * size ≠ 0) :
+    volatileSetPlan borrows globals callStack target decls layouts argOps
+      [.scalar ⟨dstAddr, layoutPointerBytes layouts⟩,
+       .scalar ⟨val.toNat, 1⟩,
+       .scalar ⟨count, layoutPointerBytes layouts⟩] locals' = .fault .unsupported := by
+  have hValLt : Nat.blt val.toNat 256 = true := Nat.ble_eq_true_of_le val.toNat_lt
+  have hBle : Nat.ble (signedHalfModulus (layoutPointerBytes layouts)) (Nat.mul count size) =
+      false := by
+    cases h : Nat.ble (signedHalfModulus (layoutPointerBytes layouts)) (Nat.mul count size) with
+    | false => rfl
+    | true =>
+      have := Nat.le_of_ble_eq_true h
+      change signedHalfModulus (layoutPointerBytes layouts) ≤ count * size at this
+      omega
+  have hZero : Nat.beq (Nat.mul count size) 0 = false := by
+    change Nat.beq (count * size) 0 = false
+    cases h : count * size with
+    | zero => exact absurd h hNonZero
+    | succ _ => rfl
+  have hDA := trusted_addr_alignment_parity callStack locals' decls layouts align dstAddr .outside
+    hpos
+  rw [hDstAl] at hDA
+  unfold volatileSetPlan
+  dsimp only
+  rw [Nat.beq_refl, hValLt, Nat.beq_refl, Bool.and_true, Bool.and_true, rawPtrArgOfValue_addr]
+  dsimp only
+  rw [hLay]
+  dsimp only
+  rw [hBle]
+  dsimp only
+  simp only [classifyRawPtrTarget, hDA, hZero]
+
+/-- One-way soundness of `volatile_copy_nonoverlapping_memory` and `volatile_copy_memory` on
+aligned addresses outside all allocations: Trusted steps to `MirStepNode.unsupported` for both
+intrinsics, where MiniRust (`mrCopy` / `mrCopyTB`) reports UB on both memories. -/
+theorem volatile_copy_mmio_one_way_soundness
+    (s : MachineState) (target : ResolvedCallTarget) (decls : List LocalDecl)
+    (layouts : LayoutTable) (argOps : List Operand) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx)
+    (elemTy : Ty) (size align dstAddr srcAddr count : Nat)
+    (m : Interp.Mach) (mtb : Interp.MachTB) (mty : Gen.«Type») (msize : LibSpecr.Size)
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
+    (hMLay : Interp.Type.layout mty = .ok (.Sized msize ⟨align⟩))
+    (hpos : 0 < align)
+    (hDstAl : Interp.Align.is_aligned ⟨align⟩ (dstAddr : Int) = true)
+    (hSrcAl : Interp.Align.is_aligned ⟨align⟩ (srcAddr : Int) = true)
+    (hSmall : count * size < signedHalfModulus (layoutPointerBytes layouts))
+    (hNonZero : count * size ≠ 0) (hMNonZero : count * msize.bytes ≠ 0) :
+    evalVolatileMemIntrinsicCall .volatileCopyNonOverlappingMemory s target decls layouts argOps
+        [.scalar ⟨dstAddr, layoutPointerBytes layouts⟩,
+         .scalar ⟨srcAddr, layoutPointerBytes layouts⟩,
+         .scalar ⟨count, layoutPointerBytes layouts⟩] locals' destination targetBb =
+      MirStepNode.unsupported ∧
+    evalVolatileMemIntrinsicCall .volatileCopyMemory s target decls layouts argOps
+        [.scalar ⟨dstAddr, layoutPointerBytes layouts⟩,
+         .scalar ⟨srcAddr, layoutPointerBytes layouts⟩,
+         .scalar ⟨count, layoutPointerBytes layouts⟩] locals' destination targetBb =
+      MirStepNode.unsupported ∧
+    mrCopy m ⟨dstAddr, none⟩ ⟨srcAddr, none⟩ count mty =
+      .error (.ub "dereferencing pointer without provenance") ∧
+    mrCopyTB mtb ⟨dstAddr, none⟩ ⟨srcAddr, none⟩ count mty =
+      .error (.ub "dereferencing pointer without provenance") := by
+  have hT := trusted_volatile_copy_mmio_unsupported s.memory.borrows s.memory.globals
+    s.memory.callStack target decls layouts argOps locals' dstAddr srcAddr count elemTy size align
+    hLay hpos hDstAl hSrcAl hSmall hNonZero
+  have hb := mr_bm_load_no_provenance_ub m.mem.memory srcAddr ⟨count * msize.bytes⟩ ⟨align⟩ hSrcAl
+    hMNonZero
+  have hbTB : Interp.MemoryOps.load mtb.mem.memory
+      (⟨srcAddr, none⟩ : Gen.ThinPointer Gen.TreeBorrowsProvenance)
+      ⟨count * msize.bytes⟩ ⟨align⟩ =
+      .error (.ub "dereferencing pointer without provenance") :=
+    mr_tbm_load_no_provenance_ub mtb.mem.memory srcAddr ⟨count * msize.bytes⟩ ⟨align⟩ hSrcAl
+      hMNonZero
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · rw [trustedVolatileAction_spec]
+    simp only [trustedVolatileAction, trustedCopyAction, hT]
+    rfl
+  · rw [trustedVolatileAction_spec]
+    simp only [trustedVolatileAction, trustedCopyAction, hT]
+    rfl
+  · simp [mrCopy, hMLay, Interp.LayoutStrategy.expect_size, Interp.LayoutStrategy.expect_align,
+      Interp.CM.load, hb, bind, Except.bind, pure, Except.pure]
+  · simp [mrCopyTB, hMLay, Interp.LayoutStrategy.expect_size, Interp.LayoutStrategy.expect_align,
+      Interp.ConcurrentMemory.load, hbTB, bind, Except.bind, pure, Except.pure]
+
+/-- One-way soundness of `volatile_set_memory` on an aligned address outside all allocations:
+Trusted steps to `MirStepNode.unsupported`, where MiniRust (`mrSet` / `mrSetTB`) reports UB on
+both memories. -/
+theorem volatile_set_mmio_one_way_soundness
+    (s : MachineState) (target : ResolvedCallTarget) (decls : List LocalDecl)
+    (layouts : LayoutTable) (argOps : List Operand) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx)
+    (elemTy : Ty) (size align dstAddr count : Nat) (val : UInt8)
+    (m : Interp.Mach) (mtb : Interp.MachTB) (mty : Gen.«Type») (msize : LibSpecr.Size)
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
+    (hMLay : Interp.Type.layout mty = .ok (.Sized msize ⟨align⟩))
+    (hpos : 0 < align)
+    (hDstAl : Interp.Align.is_aligned ⟨align⟩ (dstAddr : Int) = true)
+    (hSmall : count * size < signedHalfModulus (layoutPointerBytes layouts))
+    (hNonZero : count * size ≠ 0) (hMNonZero : count * msize.bytes ≠ 0) :
+    evalVolatileMemIntrinsicCall .volatileSetMemory s target decls layouts argOps
+        [.scalar ⟨dstAddr, layoutPointerBytes layouts⟩,
+         .scalar ⟨val.toNat, 1⟩,
+         .scalar ⟨count, layoutPointerBytes layouts⟩] locals' destination targetBb =
+      MirStepNode.unsupported ∧
+    mrSet m ⟨dstAddr, none⟩ val count mty =
+      .error (.ub "dereferencing pointer without provenance") ∧
+    mrSetTB mtb ⟨dstAddr, none⟩ val count mty =
+      .error (.ub "dereferencing pointer without provenance") := by
+  have hT := trusted_volatile_set_mmio_unsupported s.memory.borrows s.memory.globals
+    s.memory.callStack target decls layouts argOps locals' dstAddr count val elemTy size align
+    hLay hpos hDstAl hSmall hNonZero
+  have hlen : (List.replicate (count * msize.bytes)
+      (Gen.AbstractByte.Init val none : Interp.Byte)).length ≠ 0 := by
+    rw [List.length_replicate]; exact hMNonZero
+  have hlenTB : (List.replicate (count * msize.bytes)
+      (Gen.AbstractByte.Init val none : Gen.AbstractByte Gen.TreeBorrowsProvenance)).length ≠ 0 := by
+    rw [List.length_replicate]; exact hMNonZero
+  have hb := mr_bm_store_no_provenance_ub m.mem.memory dstAddr _ ⟨align⟩ hDstAl hlen
+  have hbTB : Interp.MemoryOps.store mtb.mem.memory
+      (⟨dstAddr, none⟩ : Gen.ThinPointer Gen.TreeBorrowsProvenance)
+      (List.replicate (count * msize.bytes) (.Init val none)) ⟨align⟩ =
+      .error (.ub "dereferencing pointer without provenance") :=
+    mr_tbm_store_no_provenance_ub mtb.mem.memory dstAddr _ ⟨align⟩ hDstAl hlenTB
+  refine ⟨?_, ?_, ?_⟩
+  · rw [trustedVolatileAction_spec]
+    simp only [trustedVolatileAction, trustedSetAction, hT]
+    rfl
+  · simp [mrSet, hMLay, Interp.LayoutStrategy.expect_size, Interp.LayoutStrategy.expect_align,
+      Interp.CM.store, hb, bind, Except.bind, pure, Except.pure]
+  · simp [mrSetTB, hMLay, Interp.LayoutStrategy.expect_size, Interp.LayoutStrategy.expect_align,
+      Interp.ConcurrentMemory.store, hbTB, bind, Except.bind, pure, Except.pure]
+
+/-- `_0 = fnPath::<u32>(copy _1, copy _2, copy _3)` with `_1, _2 : *const u32`, `_3 : usize`. -/
+def vbMmioCopyBody (fnPath : String) : CapturedMir :=
+  vbCallBody [vbDecl vbTyUnit, vbDecl vbTyPtrU32, vbDecl vbTyPtrU32, vbDecl ⟨.uint .usize, 2⟩]
+    fnPath [.uint .u32] [.copy ⟨1, []⟩, .copy ⟨2, []⟩, .copy ⟨3, []⟩]
+
+/-- `_0 = volatile_set_memory::<u32>(copy _1, copy _2, copy _3)`. -/
+def vbMmioSetBody : CapturedMir :=
+  vbCallBody [vbDecl vbTyUnit, vbDecl vbTyPtrU32, vbDecl vbTyU8, vbDecl ⟨.uint .usize, 2⟩]
+    "core::intrinsics::volatile_set_memory" [.uint .u32]
+    [.copy ⟨1, []⟩, .copy ⟨2, []⟩, .copy ⟨3, []⟩]
+
+/-- `_1 = dstAddr`, `_2 = srcAddr`, `_3 = 1usize`. -/
+def vbMmioCopyState (dstAddr srcAddr : Nat) : MachineState :=
+  vbState [.uninit, .init (.scalar ⟨dstAddr, 8⟩), .init (.scalar ⟨srcAddr, 8⟩),
+    .init (.scalar ⟨1, 8⟩)]
+
+/-- `_1 = dstAddr`, `_2 = val`, `_3 = 1usize`. -/
+def vbMmioSetState (dstAddr : Nat) (val : UInt8) : MachineState :=
+  vbState [.uninit, .init (.scalar ⟨dstAddr, 8⟩), .init (.scalar ⟨val.toNat, 1⟩),
+    .init (.scalar ⟨1, 8⟩)]
+
+/-- `stepMirFn` on `volatile_copy_nonoverlapping_memory`, `volatile_copy_memory`, and
+`volatile_set_memory` at any 4-aligned provenance-less addresses (`count = 1`) is
+`MirStepNode.unsupported`. -/
+theorem mmio_volatile_copy_set_step_unsupported (dstAddr srcAddr : Nat) (val : UInt8)
+    (hDstAl : Interp.Align.is_aligned ⟨4⟩ (dstAddr : Int) = true)
+    (hSrcAl : Interp.Align.is_aligned ⟨4⟩ (srcAddr : Int) = true) :
+    stepMirFn (vbMmioCopyBody "core::intrinsics::volatile_copy_nonoverlapping_memory")
+        (vbMmioCopyState dstAddr srcAddr) = MirStepNode.unsupported ∧
+    stepMirFn (vbMmioCopyBody "core::intrinsics::volatile_copy_memory")
+        (vbMmioCopyState dstAddr srcAddr) = MirStepNode.unsupported ∧
+    stepMirFn vbMmioSetBody (vbMmioSetState dstAddr val) = MirStepNode.unsupported := by
+  have h1 : stepMirFn (vbMmioCopyBody "core::intrinsics::volatile_copy_nonoverlapping_memory")
+      (vbMmioCopyState dstAddr srcAddr) =
+      evalVolatileMemIntrinsicCall .volatileCopyNonOverlappingMemory
+        (vbMmioCopyState dstAddr srcAddr)
+        (vbTarget "core::intrinsics::volatile_copy_nonoverlapping_memory" vbTyU32)
+        [vbDecl vbTyUnit, vbDecl vbTyPtrU32, vbDecl vbTyPtrU32, vbDecl ⟨.uint .usize, 2⟩] vbTbl
+        [.copy ⟨1, []⟩, .copy ⟨2, []⟩, .copy ⟨3, []⟩]
+        [.scalar ⟨dstAddr, layoutPointerBytes vbTbl⟩,
+         .scalar ⟨srcAddr, layoutPointerBytes vbTbl⟩,
+         .scalar ⟨1, layoutPointerBytes vbTbl⟩]
+        [.uninit, .init (.scalar ⟨dstAddr, 8⟩), .init (.scalar ⟨srcAddr, 8⟩),
+         .init (.scalar ⟨1, 8⟩)] ⟨0, []⟩ 1 := rfl
+  have h2 : stepMirFn (vbMmioCopyBody "core::intrinsics::volatile_copy_memory")
+      (vbMmioCopyState dstAddr srcAddr) =
+      evalVolatileMemIntrinsicCall .volatileCopyMemory
+        (vbMmioCopyState dstAddr srcAddr)
+        (vbTarget "core::intrinsics::volatile_copy_memory" vbTyU32)
+        [vbDecl vbTyUnit, vbDecl vbTyPtrU32, vbDecl vbTyPtrU32, vbDecl ⟨.uint .usize, 2⟩] vbTbl
+        [.copy ⟨1, []⟩, .copy ⟨2, []⟩, .copy ⟨3, []⟩]
+        [.scalar ⟨dstAddr, layoutPointerBytes vbTbl⟩,
+         .scalar ⟨srcAddr, layoutPointerBytes vbTbl⟩,
+         .scalar ⟨1, layoutPointerBytes vbTbl⟩]
+        [.uninit, .init (.scalar ⟨dstAddr, 8⟩), .init (.scalar ⟨srcAddr, 8⟩),
+         .init (.scalar ⟨1, 8⟩)] ⟨0, []⟩ 1 := rfl
+  have h3 : stepMirFn vbMmioSetBody (vbMmioSetState dstAddr val) =
+      evalVolatileMemIntrinsicCall .volatileSetMemory
+        (vbMmioSetState dstAddr val)
+        (vbTarget "core::intrinsics::volatile_set_memory" vbTyU32)
+        [vbDecl vbTyUnit, vbDecl vbTyPtrU32, vbDecl vbTyU8, vbDecl ⟨.uint .usize, 2⟩] vbTbl
+        [.copy ⟨1, []⟩, .copy ⟨2, []⟩, .copy ⟨3, []⟩]
+        [.scalar ⟨dstAddr, layoutPointerBytes vbTbl⟩,
+         .scalar ⟨val.toNat, 1⟩,
+         .scalar ⟨1, layoutPointerBytes vbTbl⟩]
+        [.uninit, .init (.scalar ⟨dstAddr, 8⟩), .init (.scalar ⟨val.toNat, 1⟩),
+         .init (.scalar ⟨1, 8⟩)] ⟨0, []⟩ 1 := rfl
+  rw [h1, h2, h3]
+  exact
+    ⟨(volatile_copy_mmio_one_way_soundness _ _ _ _ _ _ _ _ _ 4 4 dstAddr srcAddr 1 (vbMach [])
+        (vbMachTB []) vbMrU32 ⟨4⟩ rfl rfl (by decide) hDstAl hSrcAl (by decide) (by decide)
+        (by decide)).1,
+     (volatile_copy_mmio_one_way_soundness _ _ _ _ _ _ _ _ _ 4 4 dstAddr srcAddr 1 (vbMach [])
+        (vbMachTB []) vbMrU32 ⟨4⟩ rfl rfl (by decide) hDstAl hSrcAl (by decide) (by decide)
+        (by decide)).2.1,
+     (volatile_set_mmio_one_way_soundness _ _ _ _ _ _ _ _ _ 4 4 dstAddr 1 val (vbMach [])
+        (vbMachTB []) vbMrU32 ⟨4⟩ rfl rfl (by decide) hDstAl (by decide) (by decide)
+        (by decide)).1⟩
+
+/-- The three volatile copy/set intrinsics at aligned provenance-less addresses falsify
+`MirNoUBTree`: Trusted certifies no execution of them. -/
+theorem mmio_volatile_copy_set_not_noUB (dstAddr srcAddr : Nat) (val : UInt8)
+    (hDstAl : Interp.Align.is_aligned ⟨4⟩ (dstAddr : Int) = true)
+    (hSrcAl : Interp.Align.is_aligned ⟨4⟩ (srcAddr : Int) = true) :
+    ¬ MirNoUBTree (mirTree (vbMmioCopyBody "core::intrinsics::volatile_copy_nonoverlapping_memory")
+        (vbMmioCopyState dstAddr srcAddr)) ∧
+    ¬ MirNoUBTree (mirTree (vbMmioCopyBody "core::intrinsics::volatile_copy_memory")
+        (vbMmioCopyState dstAddr srcAddr)) ∧
+    ¬ MirNoUBTree (mirTree vbMmioSetBody (vbMmioSetState dstAddr val)) :=
+  ⟨mirStep_fail_not_noUB _ _ .unsupported
+      (mmio_volatile_copy_set_step_unsupported dstAddr srcAddr val hDstAl hSrcAl).1,
+   mirStep_fail_not_noUB _ _ .unsupported
+      (mmio_volatile_copy_set_step_unsupported dstAddr srcAddr val hDstAl hSrcAl).2.1,
+   mirStep_fail_not_noUB _ _ .unsupported
+      (mmio_volatile_copy_set_step_unsupported dstAddr srcAddr val hDstAl hSrcAl).2.2⟩
+
 /-! ## 8. Byte codec and bit validity (item 2) -/
 
 /-- Trusted provenance-free initialised bytes. -/
@@ -2161,6 +2574,24 @@ theorem codec_bool_validity_all_bytes (n : Nat) (hn : n < 256) :
         mDecodeIsInvalid (Interp.Type.decode .Bool (vbPlain [UInt8.ofNat k])) = true := by
       decide +kernel
     exact ⟨tDecodeIsUb_sound (all n hn h).1, mDecodeIsInvalid_sound (all n hn h).2⟩
+
+/-- `bool` validity for every byte value `n < 256`, generalized over every little-endian
+`LayoutTable` and `LayoutIdx`. -/
+theorem codec_bool_validity_all_bytes_general (layouts : LayoutTable) (idx : LayoutIdx)
+    (hLE : layouts.isLittleEndian = true) (n : Nat) (hn : n < 256) :
+    (n ≤ 1 →
+      rawPtrDecodeBytes layouts ⟨.bool, idx⟩ (tPlain [UInt8.ofNat n]) = .ok (.scalar ⟨n, 1⟩) ∧
+      Interp.Type.decode .Bool (vbPlain [UInt8.ofNat n]) =
+        .ok (some (.Bool (decide (n = 1))))) ∧
+    (1 < n →
+      rawPtrDecodeBytes layouts ⟨.bool, idx⟩ (tPlain [UInt8.ofNat n]) = .fault .ub ∧
+      Interp.Type.decode .Bool (vbPlain [UInt8.ofNat n]) = .ok none) := by
+  have heq : rawPtrDecodeBytes layouts ⟨.bool, idx⟩ (tPlain [UInt8.ofNat n]) =
+      rawPtrDecodeBytes vbTbl vbTyBool (tPlain [UInt8.ofNat n]) := by
+    simp only [rawPtrDecodeBytes, hLE, vbTbl, vbTyBool]
+    rfl
+  rw [heq]
+  exact codec_bool_validity_all_bytes n hn
 
 /-- A `u32` with one uninitialised byte, at any of the four positions and whatever the other
 bytes are, is `.fault .ub` in Trusted and "no value" in MiniRust. -/
@@ -2576,6 +3007,333 @@ theorem mr_set_is_fill (m : Interp.Mach) (dst : Interp.Ptr) (val : UInt8) (count
   simp [mrSet, hLay, Interp.LayoutStrategy.expect_size, Interp.LayoutStrategy.expect_align,
     Interp.CM.store, hstore, bind, Except.bind, pure, Except.pure]
 
+/-- `BasicMemory::check_ptr` inside `TreeBorrowsMemory` for a non-zero-sized in-bounds access into
+live allocation `a` returns its allocation id, path, and byte offset. -/
+theorem mr_tbm_check_ptr_in_bounds (tbm : Interp.TBM)
+    (ptr : Gen.ThinPointer Gen.TreeBorrowsProvenance) (n : Nat)
+    (i : Nat) (path : Gen.Path)
+    (a : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra) (o : Nat)
+    (hn : n ≠ 0)
+    (hprov : ptr.provenance = some (⟨(i : Int)⟩, path))
+    (hget : tbm.mem.allocations[i]? = some a) (hlive : a.live = true)
+    (haddr : ptr.addr = a.addr + (o : Int)) (hbound : o + n ≤ a.data.length) :
+    Interp.BasicMemory.check_ptr tbm.mem ptr ⟨n⟩ = .ok (some (⟨(i : Int)⟩, path, ⟨o⟩)) := by
+  have hoff : a.addr + (o : Int) - a.addr = (o : Int) := by
+    rw [Int.add_comm]; exact Int.add_sub_cancel _ _
+  simp [Interp.BasicMemory.check_ptr, hn, hprov, Interp.listIndex, hget, hlive, haddr, hoff,
+    Interp.Allocation.size, bind, Except.bind, pure, Except.pure]
+  intro h
+  omega
+
+/-- A non-zero-sized aligned in-bounds `TreeBorrowsMemory::load` returns the bytes of allocation
+`a` at offset `o` and updates only `a.extra.root` according to `Node::access`. -/
+theorem mr_tbm_load_in_bounds (tbm : Interp.TBM)
+    (ptr : Gen.ThinPointer Gen.TreeBorrowsProvenance) (n : Nat) (align : LibSpecr.Align)
+    (i : Nat) (path : Gen.Path)
+    (a : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra) (o : Nat) (root' : Gen.Node)
+    (hn : n ≠ 0)
+    (hal : Interp.Align.is_aligned align ptr.addr = true)
+    (hprov : ptr.provenance = some (⟨(i : Int)⟩, path))
+    (hget : tbm.mem.allocations[i]? = some a) (hlive : a.live = true)
+    (haddr : ptr.addr = a.addr + (o : Int)) (hbound : o + n ≤ a.data.length)
+    (hacc : Interp.Node.access a.extra.root (some path) .Read ⟨o⟩ ⟨n⟩ = .ok root') :
+    Interp.TreeBorrowsMemory.load tbm ptr ⟨n⟩ align =
+      .ok ((a.data.drop o).take n,
+        { tbm with
+          mem := { tbm.mem with
+            allocations := tbm.mem.allocations.set i { a with extra := { root := root' } } } }) := by
+  obtain ⟨hi, hai⟩ := List.getElem?_eq_some_iff.mp hget
+  have hck := mr_tbm_check_ptr_in_bounds tbm ptr n i path a o hn hprov hget hlive haddr hbound
+  have hb' : (o : Int) + (n : Int) ≤ (a.data.length : Int) := by omega
+  simp [Interp.TreeBorrowsMemory.load, Interp.BasicMemory.load, hal, hck, Interp.listIndex,
+    Interp.listSet, hi, hai, hacc, Interp.subsliceWithLength, hb', bind, Except.bind, pure,
+    Except.pure]
+
+/-- A non-empty aligned in-bounds `TreeBorrowsMemory::store` splices `bytes` into allocation `a`
+at offset `o` and updates `a.extra.root` according to `Node::access`. -/
+theorem mr_tbm_store_in_bounds (tbm : Interp.TBM)
+    (ptr : Gen.ThinPointer Gen.TreeBorrowsProvenance)
+    (bytes : List (Gen.AbstractByte Gen.TreeBorrowsProvenance)) (align : LibSpecr.Align)
+    (i : Nat) (path : Gen.Path)
+    (a : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra) (o : Nat) (root' : Gen.Node)
+    (hn : bytes.length ≠ 0)
+    (hal : Interp.Align.is_aligned align ptr.addr = true)
+    (hprov : ptr.provenance = some (⟨(i : Int)⟩, path))
+    (hget : tbm.mem.allocations[i]? = some a) (hlive : a.live = true)
+    (haddr : ptr.addr = a.addr + (o : Int)) (hbound : o + bytes.length ≤ a.data.length)
+    (hacc : Interp.Node.access a.extra.root (some path) .Write ⟨o⟩ ⟨bytes.length⟩ = .ok root') :
+    Interp.TreeBorrowsMemory.store tbm ptr bytes align =
+      .ok { tbm with
+            mem := { tbm.mem with
+              allocations := tbm.mem.allocations.set i
+                { a with
+                  data := a.data.take o ++ bytes ++ a.data.drop (o + bytes.length),
+                  extra := { root := root' } } } } := by
+  obtain ⟨hi, hai⟩ := List.getElem?_eq_some_iff.mp hget
+  have hck := mr_tbm_check_ptr_in_bounds tbm ptr bytes.length i path a o hn hprov hget hlive
+    haddr hbound
+  have hb' : (o : Int) + (bytes.length : Int) ≤ (a.data.length : Int) := by omega
+  simp [Interp.TreeBorrowsMemory.store, Interp.BasicMemory.store, hal, hck, Interp.listIndex,
+    Interp.listSet, hi, hai, hacc, Interp.writeSubsliceAtIndex, hb', bind, Except.bind, pure,
+    Except.pure]
+
+private theorem node_transitionRange_replicate_unique (kind : Gen.AccessKind) (len : Nat) :
+    ∀ (n o : Nat), o + n ≤ len →
+      Interp.Node.transitionRange .Local kind o n (List.replicate len (.Unprot .Unique)) =
+        .ok (List.replicate len (.Unprot .Unique))
+  | 0, _, _ => rfl
+  | rem + 1, o, h => by
+    have ho : o < len := by omega
+    have hlen : o < (List.replicate len (Gen.Permission.Unprot .Unique)).length := by
+      simpa using ho
+    have hget : (List.replicate len (Gen.Permission.Unprot .Unique))[o]? = some (.Unprot .Unique) := by
+      rw [List.getElem?_eq_getElem hlen, List.getElem_replicate]
+    have hset : (List.replicate len (Gen.Permission.Unprot .Unique)).set o (.Unprot .Unique) =
+        List.replicate len (.Unprot .Unique) := by
+      calc (List.replicate len (Gen.Permission.Unprot .Unique)).set o (.Unprot .Unique)
+          = (List.replicate len (Gen.Permission.Unprot .Unique)).set o
+              (List.replicate len (Gen.Permission.Unprot .Unique))[o] := by
+            rw [List.getElem_replicate]
+        _ = List.replicate len (.Unprot .Unique) := List.set_getElem_self hlen
+    have htr : Interp.Permission.transition (.Unprot .Unique) kind .Local =
+        .ok (.Unprot .Unique) := by
+      cases kind <;> rfl
+    have h0 : (0 : Int) ≤ Int.ofNat o := Int.natCast_nonneg o
+    have htn : (Int.ofNat o).toNat = o := rfl
+    unfold Interp.Node.transitionRange
+    simp only [Interp.listMutateAt, Interp.listIndex, Interp.listSet, h0, ↓reduceIte, htn, hget,
+      htr, hset, List.length_replicate, ho, bind, Except.bind, pure, Except.pure]
+    exact node_transitionRange_replicate_unique kind len rem (o + 1) (by omega)
+
+/-- On a leaf root node whose permissions are all unprotected `Unique`, any in-bounds local read
+or write succeeds and leaves the borrow tree unchanged. -/
+theorem mr_tbm_node_access_root_unique (kind : Gen.AccessKind) (len o n : Nat) (h : o + n ≤ len) :
+    let root : Gen.Node :=
+      { children := [], permissions := List.replicate len (.Unprot .Unique), «protected» := .No }
+    Interp.Node.access root (some []) kind ⟨o⟩ ⟨n⟩ = .ok root := by
+  intro root
+  simp only [root, Interp.Node.access, Interp.Node.transition, Option.isSome_some, ↓reduceIte,
+    node_transitionRange_replicate_unique kind len n o h, Interp.Node.accessChildren,
+    bind, Except.bind, pure, Except.pure]
+
+/-- Symbolic `memmove` on `MachTB`: for source and destination ranges inside one live allocation
+with permitted Tree Borrows read and write transitions, `mrCopyTB` succeeds and the allocation's
+data becomes `a.data.take dstOff ++ (a.data.drop srcOff).take n ++ a.data.drop (dstOff + n)` for
+every relative overlap (disjoint, forward, or backward). -/
+theorem mr_copyTB_is_memmove (m : Interp.MachTB)
+    (dst src : Gen.ThinPointer Gen.TreeBorrowsProvenance) (count : Nat)
+    (ty : Gen.«Type») (size : LibSpecr.Size) (tyAlign : LibSpecr.Align)
+    (i : Nat) (srcPath dstPath : Gen.Path)
+    (a : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra) (srcOff dstOff : Nat)
+    (root1 root2 : Gen.Node)
+    (hLay : Interp.Type.layout ty = .ok (.Sized size tyAlign))
+    (hn : count * size.bytes ≠ 0)
+    (hsal : Interp.Align.is_aligned tyAlign src.addr = true)
+    (hdal : Interp.Align.is_aligned tyAlign dst.addr = true)
+    (hsprov : src.provenance = some (⟨(i : Int)⟩, srcPath))
+    (hdprov : dst.provenance = some (⟨(i : Int)⟩, dstPath))
+    (hget : m.mem.memory.mem.allocations[i]? = some a) (hlive : a.live = true)
+    (hsaddr : src.addr = a.addr + (srcOff : Int))
+    (hdaddr : dst.addr = a.addr + (dstOff : Int))
+    (hsb : srcOff + count * size.bytes ≤ a.data.length)
+    (hdb : dstOff + count * size.bytes ≤ a.data.length)
+    (hRead : Interp.Node.access a.extra.root (some srcPath) .Read ⟨srcOff⟩ ⟨count * size.bytes⟩ =
+      .ok root1)
+    (hWrite : Interp.Node.access root1 (some dstPath) .Write ⟨dstOff⟩ ⟨count * size.bytes⟩ =
+      .ok root2) :
+    ∃ m', mrCopyTB m dst src count ty = .ok m' ∧
+      m'.mem.memory.mem.allocations = m.mem.memory.mem.allocations.set i
+        { a with
+          data := a.data.take dstOff ++ (a.data.drop srcOff).take (count * size.bytes) ++
+            a.data.drop (dstOff + count * size.bytes),
+          extra := { root := root2 } } := by
+  obtain ⟨hi, _⟩ := List.getElem?_eq_some_iff.mp hget
+  have hload : Interp.MemoryOps.load m.mem.memory src ⟨count * size.bytes⟩ tyAlign =
+      .ok ((a.data.drop srcOff).take (count * size.bytes),
+        { m.mem.memory with
+          mem := { m.mem.memory.mem with
+            allocations := m.mem.memory.mem.allocations.set i { a with extra := { root := root1 } } } }) :=
+    mr_tbm_load_in_bounds m.mem.memory src (count * size.bytes) tyAlign i srcPath a srcOff root1
+      hn hsal hsprov hget hlive hsaddr hsb hRead
+  have hlen : ((a.data.drop srcOff).take (count * size.bytes)).length = count * size.bytes := by
+    simp [List.length_take, List.length_drop]
+    omega
+  let a1 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
+    { a with extra := { root := root1 } }
+  let tbm1 : Interp.TBM :=
+    { m.mem.memory with
+      mem := { m.mem.memory.mem with
+        allocations := m.mem.memory.mem.allocations.set i a1 } }
+  have hget1 : tbm1.mem.allocations[i]? = some a1 := by
+    simp [tbm1, List.getElem?_set_self hi]
+  have hstore : Interp.MemoryOps.store tbm1 dst ((a.data.drop srcOff).take (count * size.bytes))
+      tyAlign =
+      .ok { tbm1 with
+            mem := { tbm1.mem with
+              allocations := tbm1.mem.allocations.set i
+                { a1 with
+                  data := a.data.take dstOff ++ (a.data.drop srcOff).take (count * size.bytes) ++
+                    a.data.drop (dstOff + count * size.bytes),
+                  extra := { root := root2 } } } } := by
+    have hst := mr_tbm_store_in_bounds tbm1 dst ((a.data.drop srcOff).take (count * size.bytes))
+      tyAlign i dstPath a1 dstOff root2 (by rw [hlen]; exact hn) hdal hdprov hget1 hlive hdaddr
+      (by rw [hlen]; exact hdb) (by rw [hlen]; exact hWrite)
+    rw [hlen] at hst
+    exact hst
+  have hsetset : tbm1.mem.allocations.set i
+      { a1 with
+        data := a.data.take dstOff ++ (a.data.drop srcOff).take (count * size.bytes) ++
+          a.data.drop (dstOff + count * size.bytes),
+        extra := { root := root2 } } =
+      m.mem.memory.mem.allocations.set i
+        { a with
+          data := a.data.take dstOff ++ (a.data.drop srcOff).take (count * size.bytes) ++
+            a.data.drop (dstOff + count * size.bytes),
+          extra := { root := root2 } } := by
+    simp [tbm1, a1]
+  refine ⟨{ m with
+            mem :=
+              { memory :=
+                  { tbm1 with
+                    mem := { tbm1.mem with
+                      allocations := tbm1.mem.allocations.set i
+                        { a1 with
+                          data := a.data.take dstOff ++
+                            (a.data.drop srcOff).take (count * size.bytes) ++
+                            a.data.drop (dstOff + count * size.bytes),
+                          extra := { root := root2 } } } },
+                accesses :=
+                  m.mem.accesses ++ [⟨.Load, .None, src.addr, ⟨count * size.bytes⟩⟩] ++
+                    [⟨.Store, .None, dst.addr, ⟨count * size.bytes⟩⟩] } },
+    ?_, hsetset⟩
+  simp [mrCopyTB, hLay, Interp.LayoutStrategy.expect_size, Interp.LayoutStrategy.expect_align,
+    Interp.ConcurrentMemory.load, hload, Interp.ConcurrentMemory.store, hstore, hlen, tbm1, a1,
+    bind, Except.bind, pure, Except.pure]
+
+/-- Symbolic repeated-byte fill on `MachTB`: `mrSetTB` succeeds under any permitted write
+transition and splices `List.replicate (count * size.bytes) (.Init val none)` into allocation `i`. -/
+theorem mr_setTB_is_fill (m : Interp.MachTB)
+    (dst : Gen.ThinPointer Gen.TreeBorrowsProvenance) (val : UInt8) (count : Nat)
+    (ty : Gen.«Type») (size : LibSpecr.Size) (tyAlign : LibSpecr.Align)
+    (i : Nat) (dstPath : Gen.Path)
+    (a : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra) (dstOff : Nat) (root' : Gen.Node)
+    (hLay : Interp.Type.layout ty = .ok (.Sized size tyAlign))
+    (hn : count * size.bytes ≠ 0)
+    (hdal : Interp.Align.is_aligned tyAlign dst.addr = true)
+    (hdprov : dst.provenance = some (⟨(i : Int)⟩, dstPath))
+    (hget : m.mem.memory.mem.allocations[i]? = some a) (hlive : a.live = true)
+    (hdaddr : dst.addr = a.addr + (dstOff : Int))
+    (hdb : dstOff + count * size.bytes ≤ a.data.length)
+    (hWrite : Interp.Node.access a.extra.root (some dstPath) .Write ⟨dstOff⟩ ⟨count * size.bytes⟩ =
+      .ok root') :
+    ∃ m', mrSetTB m dst val count ty = .ok m' ∧
+      m'.mem.memory.mem.allocations = m.mem.memory.mem.allocations.set i
+        { a with
+          data := a.data.take dstOff ++ List.replicate (count * size.bytes) (.Init val none) ++
+            a.data.drop (dstOff + count * size.bytes),
+          extra := { root := root' } } := by
+  have hlen : (List.replicate (count * size.bytes)
+      (Gen.AbstractByte.Init val none : Gen.AbstractByte Gen.TreeBorrowsProvenance)).length =
+      count * size.bytes :=
+    List.length_replicate
+  have hstore : Interp.MemoryOps.store m.mem.memory dst
+      (List.replicate (count * size.bytes) (.Init val none)) tyAlign =
+      .ok { m.mem.memory with
+            mem := { m.mem.memory.mem with
+              allocations := m.mem.memory.mem.allocations.set i
+                { a with
+                  data := a.data.take dstOff ++
+                    List.replicate (count * size.bytes) (.Init val none) ++
+                    a.data.drop (dstOff + count * size.bytes),
+                  extra := { root := root' } } } } := by
+    have hst := mr_tbm_store_in_bounds m.mem.memory dst
+      (List.replicate (count * size.bytes) (.Init val none)) tyAlign i dstPath a dstOff root'
+      (by rw [hlen]; exact hn) hdal hdprov hget hlive hdaddr (by rw [hlen]; exact hdb)
+      (by rw [hlen]; exact hWrite)
+    rw [hlen] at hst
+    exact hst
+  refine ⟨{ m with
+            mem :=
+              { memory :=
+                  { m.mem.memory with
+                    mem := { m.mem.memory.mem with
+                      allocations := m.mem.memory.mem.allocations.set i
+                        { a with
+                          data := a.data.take dstOff ++
+                            List.replicate (count * size.bytes) (.Init val none) ++
+                            a.data.drop (dstOff + count * size.bytes),
+                          extra := { root := root' } } } },
+                accesses :=
+                  m.mem.accesses ++ [⟨.Store, .None, dst.addr, ⟨count * size.bytes⟩⟩] } },
+    ?_, rfl⟩
+  simp [mrSetTB, hLay, Interp.LayoutStrategy.expect_size, Interp.LayoutStrategy.expect_align,
+    Interp.ConcurrentMemory.store, hstore, bind, Except.bind, pure, Except.pure]
+
+/-- Unconditional `memmove` corollary on `MachTB` for a single-node unprotected-`Unique` borrow
+tree (no `Node::access` hypothesis required). -/
+theorem mr_copyTB_root_unique_is_memmove (m : Interp.MachTB)
+    (dst src : Gen.ThinPointer Gen.TreeBorrowsProvenance) (count : Nat)
+    (ty : Gen.«Type») (size : LibSpecr.Size) (tyAlign : LibSpecr.Align)
+    (i : Nat) (a : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra) (srcOff dstOff : Nat)
+    (hLay : Interp.Type.layout ty = .ok (.Sized size tyAlign))
+    (hn : count * size.bytes ≠ 0)
+    (hsal : Interp.Align.is_aligned tyAlign src.addr = true)
+    (hdal : Interp.Align.is_aligned tyAlign dst.addr = true)
+    (hsprov : src.provenance = some (⟨(i : Int)⟩, []))
+    (hdprov : dst.provenance = some (⟨(i : Int)⟩, []))
+    (hget : m.mem.memory.mem.allocations[i]? = some a) (hlive : a.live = true)
+    (hroot : a.extra.root =
+      { children := [], permissions := List.replicate a.data.length (.Unprot .Unique),
+        «protected» := .No })
+    (hsaddr : src.addr = a.addr + (srcOff : Int))
+    (hdaddr : dst.addr = a.addr + (dstOff : Int))
+    (hsb : srcOff + count * size.bytes ≤ a.data.length)
+    (hdb : dstOff + count * size.bytes ≤ a.data.length) :
+    ∃ m', mrCopyTB m dst src count ty = .ok m' ∧
+      m'.mem.memory.mem.allocations = m.mem.memory.mem.allocations.set i
+        { a with
+          data := a.data.take dstOff ++ (a.data.drop srcOff).take (count * size.bytes) ++
+            a.data.drop (dstOff + count * size.bytes) } := by
+  have hRead : Interp.Node.access a.extra.root (some []) .Read ⟨srcOff⟩ ⟨count * size.bytes⟩ =
+      .ok a.extra.root := by
+    rw [hroot]
+    exact mr_tbm_node_access_root_unique .Read a.data.length srcOff (count * size.bytes) hsb
+  have hWrite : Interp.Node.access a.extra.root (some []) .Write ⟨dstOff⟩ ⟨count * size.bytes⟩ =
+      .ok a.extra.root := by
+    rw [hroot]
+    exact mr_tbm_node_access_root_unique .Write a.data.length dstOff (count * size.bytes) hdb
+  exact mr_copyTB_is_memmove m dst src count ty size tyAlign i [] [] a srcOff dstOff
+    a.extra.root a.extra.root hLay hn hsal hdal hsprov hdprov hget hlive hsaddr hdaddr hsb hdb
+    hRead hWrite
+
+/-- Unconditional repeated-byte fill corollary on `MachTB` for a single-node unprotected-`Unique`
+borrow tree (no `Node::access` hypothesis required). -/
+theorem mr_setTB_root_unique_is_fill (m : Interp.MachTB)
+    (dst : Gen.ThinPointer Gen.TreeBorrowsProvenance) (val : UInt8) (count : Nat)
+    (ty : Gen.«Type») (size : LibSpecr.Size) (tyAlign : LibSpecr.Align)
+    (i : Nat) (a : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra) (dstOff : Nat)
+    (hLay : Interp.Type.layout ty = .ok (.Sized size tyAlign))
+    (hn : count * size.bytes ≠ 0)
+    (hdal : Interp.Align.is_aligned tyAlign dst.addr = true)
+    (hdprov : dst.provenance = some (⟨(i : Int)⟩, []))
+    (hget : m.mem.memory.mem.allocations[i]? = some a) (hlive : a.live = true)
+    (hroot : a.extra.root =
+      { children := [], permissions := List.replicate a.data.length (.Unprot .Unique),
+        «protected» := .No })
+    (hdaddr : dst.addr = a.addr + (dstOff : Int))
+    (hdb : dstOff + count * size.bytes ≤ a.data.length) :
+    ∃ m', mrSetTB m dst val count ty = .ok m' ∧
+      m'.mem.memory.mem.allocations = m.mem.memory.mem.allocations.set i
+        { a with
+          data := a.data.take dstOff ++ List.replicate (count * size.bytes) (.Init val none) ++
+            a.data.drop (dstOff + count * size.bytes) } := by
+  have hWrite : Interp.Node.access a.extra.root (some []) .Write ⟨dstOff⟩ ⟨count * size.bytes⟩ =
+      .ok a.extra.root := by
+    rw [hroot]
+    exact mr_tbm_node_access_root_unique .Write a.data.length dstOff (count * size.bytes) hdb
+  exact mr_setTB_is_fill m dst val count ty size tyAlign i [] a dstOff a.extra.root hLay hn hdal
+    hdprov hget hlive hdaddr hdb hWrite
+
 /-- Reading of the spliced buffer `d.take t ++ snap ++ d.drop (t + |snap|)`: the destination
 range holds exactly `snap`, the bytes before and after it are those of `d`, and the length is
 that of `d`. -/
@@ -2776,6 +3534,46 @@ theorem codec_usize_isize_agreement (b0 b1 b2 b3 b4 b5 b6 b7 : UInt8) :
    intEncodeAgree_of _ _ _ 8 (by decide) rfl rfl,
    intRoundTrip_of _ _ _ _ rfl (fun _ => intDecodeAgree_of _ _ _ _ rfl rfl rfl),
    intRoundTrip_of _ _ _ _ rfl (fun _ => intDecodeAgree_of _ _ _ _ rfl rfl rfl)⟩
+
+/-- `usize` and `isize` generalized over every 64-bit little-endian `LayoutTable` and `LayoutIdx`:
+decode agreement for all bytes, encode agreement, and round trip for every representable bit
+pattern. -/
+theorem codec_usize_isize_agreement_general (layouts : LayoutTable) (idx : LayoutIdx)
+    (hLE : layouts.isLittleEndian = true) (hPtr : layouts.pointerBits = 64)
+    (b0 b1 b2 b3 b4 b5 b6 b7 : UInt8) :
+    IntDecodeAgree layouts ⟨.uint .usize, idx⟩ [b0, b1, b2, b3, b4, b5, b6, b7] ∧
+    IntDecodeAgree layouts ⟨.int .isize, idx⟩ [b0, b1, b2, b3, b4, b5, b6, b7] ∧
+    IntEncodeAgree layouts ⟨.uint .usize, idx⟩ 8 ∧
+    IntEncodeAgree layouts ⟨.int .isize, idx⟩ 8 ∧
+    IntRoundTrip layouts ⟨.uint .usize, idx⟩ 8 ∧
+    IntRoundTrip layouts ⟨.int .isize, idx⟩ 8 := by
+  have hpb : layoutPointerBytes layouts = 8 := by
+    unfold layoutPointerBytes; rw [hPtr]
+  have hdecU : ∀ (bs : List UInt8), bs.length = 8 →
+      rawPtrDecodeBytes layouts ⟨.uint .usize, idx⟩ (tPlain bs) =
+        .ok (.scalar ⟨Interp.leValue bs, bs.length⟩) := by
+    intro bs hlen
+    match bs, hlen with
+    | [x0, x1, x2, x3, x4, x5, x6, x7], _ =>
+      simp only [rawPtrDecodeBytes, hLE, hpb]
+      rfl
+  have hdecI : ∀ (bs : List UInt8), bs.length = 8 →
+      rawPtrDecodeBytes layouts ⟨.int .isize, idx⟩ (tPlain bs) =
+        .ok (.scalar ⟨Interp.leValue bs, bs.length⟩) := by
+    intro bs hlen
+    match bs, hlen with
+    | [x0, x1, x2, x3, x4, x5, x6, x7], _ =>
+      simp only [rawPtrDecodeBytes, hLE, hpb]
+      rfl
+  refine
+    ⟨intDecodeAgree_of _ _ _ _ rfl (hdecU _ rfl) rfl,
+     intDecodeAgree_of _ _ _ _ rfl (hdecI _ rfl) rfl,
+     intEncodeAgree_of _ _ _ 8 (by decide) hLE rfl,
+     intEncodeAgree_of _ _ _ 8 (by decide) hLE rfl,
+     intRoundTrip_of _ _ _ _ rfl (fun bits =>
+       intDecodeAgree_of _ _ _ _ rfl (hdecU _ (leBytes_length bits 8)) rfl),
+     intRoundTrip_of _ _ _ _ rfl (fun bits =>
+       intDecodeAgree_of _ _ _ _ rfl (hdecI _ (leBytes_length bits 8)) rfl)⟩
 
 /-! ### An instance of Section 7 at the address `0x4000_0000` (item 5) -/
 
@@ -3035,8 +3833,9 @@ Item 1 (alignment first):
   mr_copy_zero_misaligned_ub, mr_set_misaligned_ub, mr_copyTB_src_misaligned_ub,
   mr_copyTB_dst_misaligned_ub, mr_copyTB_zero_misaligned_ub, mr_setTB_misaligned_ub,
   trusted_unaligned_never_consults_alignment, trusted_addr_alignment_parity,
-  trusted_load_misaligned_ub, trusted_store_misaligned_ub, trusted_copy_misaligned_ub,
-  trusted_set_misaligned_ub, mr_copy_misaligned_error, mr_copyTB_misaligned_error,
+  trusted_global_target_aligned_iff, trusted_load_misaligned_ub, trusted_store_misaligned_ub,
+  trusted_copy_misaligned_ub, trusted_set_misaligned_ub, mr_copy_misaligned_error,
+  mr_copyTB_misaligned_error,
   volatile_load_misaligned_parity, volatile_store_misaligned_parity,
   volatile_copy_misaligned_parity, volatile_set_misaligned_parity,
   lockstep_volatile_load_misaligned, lockstep_volatile_load_zst_misaligned,
@@ -3046,32 +3845,41 @@ Item 1 (alignment first):
 
 Item 2 (byte codec and bit validity):
   mr_endianness_decode_eq_intFromBits, codec_int_decode_agreement, codec_bool_validity_all_bytes,
-  codec_uninit_byte_invalid, lockstep_int_encode_round_trip, lockstep_pointer_bytes_provenance,
+  codec_bool_validity_all_bytes_general, codec_uninit_byte_invalid,
+  lockstep_int_encode_round_trip, lockstep_pointer_bytes_provenance,
   lockstep_nonzero_validity, lockstep_char_validity, lockstep_bool_invalid_bit_pattern_ub,
   lockstep_never_uninhabited, trusted_encode_le_eq_leBytes, leValue_leBytes,
-  codec_int_encode_agreement, leBytes_length, codec_int_round_trip, codec_usize_isize_agreement
+  codec_int_encode_agreement, leBytes_length, codec_int_round_trip, codec_usize_isize_agreement,
+  codec_usize_isize_agreement_general
 
 Item 3 (in-allocation unaligned accesses):
   lockstep_unaligned_load_offset1, lockstep_unaligned_store_offset1,
   lockstep_unaligned_out_of_bounds_ub, lockstep_unaligned_dead_allocation_ub,
   lockstep_unaligned_null_nonzst_ub, divergence_null_zst_read_write_unaligned,
   lockstep_unaligned_uninit_ub, lockstep_tree_borrows_conflict_ub,
-  lockstep_unaligned_load_store_exhaustive
+  lockstep_tree_borrows_protector_conflict_ub, lockstep_unaligned_load_store_exhaustive
 
 Item 4 (copy / set):
   lockstep_volatile_copy_dst_src_count_order, lockstep_volatile_copy_memory_memmove,
   lockstep_volatile_set_memory_fill, overlap_predicate_parity,
   lockstep_volatile_copy_nonoverlapping_overlap_ub, mr_bm_check_ptr_in_bounds,
-  mr_bm_load_in_bounds, mr_bm_store_in_bounds, mr_copy_is_memmove, mr_set_is_fill, splice_spec,
+  mr_bm_load_in_bounds, mr_bm_store_in_bounds, mr_copy_is_memmove, mr_set_is_fill,
+  mr_tbm_check_ptr_in_bounds, mr_tbm_load_in_bounds, mr_tbm_store_in_bounds,
+  mr_tbm_node_access_root_unique, mr_copyTB_is_memmove, mr_setTB_is_fill,
+  mr_copyTB_root_unique_is_memmove, mr_setTB_root_unique_is_fill, splice_spec,
   lockstep_volatile_copy_memory_exhaustive, lockstep_volatile_copy_nonoverlapping_exhaustive,
   lockstep_volatile_set_memory_exhaustive
 
 Item 5 (aligned addresses outside all allocations):
   trusted_volatile_load_mmio_unsupported, trusted_volatile_store_mmio_unsupported,
+  trusted_volatile_copy_mmio_unsupported, trusted_volatile_set_mmio_unsupported,
   mr_bm_load_no_provenance_ub, mr_bm_store_no_provenance_ub, mr_tbm_load_no_provenance_ub,
   mr_tbm_store_no_provenance_ub, volatile_load_mmio_one_way_soundness, mirStep_fail_not_noUB,
-  volatile_store_mmio_one_way_soundness, mmio_volatile_load_step_unsupported,
-  mmio_volatile_store_step_unsupported, mmio_volatile_not_noUB, lockstep_mmio_aligned_0x40000000
+  volatile_store_mmio_one_way_soundness, volatile_copy_mmio_one_way_soundness,
+  volatile_set_mmio_one_way_soundness, mmio_volatile_load_step_unsupported,
+  mmio_volatile_store_step_unsupported, mmio_volatile_not_noUB,
+  mmio_volatile_copy_set_step_unsupported, mmio_volatile_copy_set_not_noUB,
+  lockstep_mmio_aligned_0x40000000
 
 Infrastructure (Trusted action specs, observation soundness):
   trustedVolatileAction_spec, trustedUnlinkedAction_spec, loadedInt_sound, loadedIntTB_sound,

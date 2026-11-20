@@ -3158,4 +3158,34 @@ theorem evalUnOp_transmute_noUnsupported (m : Mach) (newTy oldTy : Gen.«Type»)
       (transmute_noUnsupported m operand oldTy newTy hl1 hl2 henc hdec)
       (fun _ => VTablePtr.NoUnsupported.pure _)
 
+/-- `Type::encode` on `BasicMemory` never stops with `Stop.unsupported`. -/
+theorem type_encode_noUnsupported (ty : Gen.«Type») (val : Val) :
+    VTablePtr.NoUnsupported (Type.encode ty val) := by
+  rw [← Type.encodeM_bm_eq]
+  exact VTablePtr.type_encodeM_noUnsupported (M := BM) ty val
+
+/-- `Type::decode` on `BasicMemory` never stops with `Stop.unsupported`. -/
+theorem type_decode_noUnsupported (ty : Gen.«Type») (bytes : List Byte) :
+    VTablePtr.NoUnsupported (Type.decode ty bytes) := by
+  rw [← Type.decodeM_bm_eq]
+  exact VTablePtr.type_decodeM_noUnsupported (M := BM) ty bytes
+
+/-- **Unconditional `Machine::transmute` on `Mach`**: never stops with `Stop.unsupported`,
+for every value and every pair of MiniRust types. -/
+theorem transmute_noUnsupported_uncond (m : Mach) (val : Val) (type1 type2 : Gen.«Type») :
+    VTablePtr.NoUnsupported (transmute val type1 type2 (some m)) :=
+  transmute_noUnsupported m val type1 type2
+    (VTablePtr.type_layout_noUnsupported type1) (VTablePtr.type_layout_noUnsupported type2)
+    (type_encode_noUnsupported type1 val) (type_decode_noUnsupported type2)
+
+/-- **Unconditional `CastOp::Transmute` on `Mach`**: `eval_un_op` for `CastOp::Transmute`
+with a machine NEVER stops with `Stop.unsupported`, for every operand and every pair of types. -/
+theorem evalUnOp_transmute_noUnsupported_uncond (m : Mach) (newTy oldTy : Gen.«Type»)
+    (operand : Val) :
+    VTablePtr.NoUnsupported
+      (evalUnOp (.Cast (.Transmute newTy)) (operand, oldTy) (some m)) :=
+  evalUnOp_transmute_noUnsupported m newTy oldTy operand
+    (VTablePtr.type_layout_noUnsupported oldTy) (VTablePtr.type_layout_noUnsupported newTy)
+    (type_encode_noUnsupported oldTy operand) (type_decode_noUnsupported newTy)
+
 end MiniRustSpec.Correspondence.WideSliceDst

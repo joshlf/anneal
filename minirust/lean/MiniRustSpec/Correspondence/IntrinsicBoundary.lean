@@ -320,7 +320,7 @@ theorem bdNullaryOp_all_variants_minirust :
   ⟨fun locals mem decls layouts ty mrTy hbits htr hcoh =>
       NullaryFnPtrBridge.nullaryOp_sizeOf_minirust_layout locals ty mem decls layouts mrTy
         hbits htr hcoh,
-    fun locals idx mem decls layouts m =>
+    fun locals idx mem decls layouts _m =>
       ⟨(bdNullaryOp_ubChecks_contractChecks locals idx ⟨.bool, idx⟩ mem decls layouts).1, rfl⟩,
     fun locals ty mem decls layouts =>
       (bdNullaryOp_ubChecks_contractChecks locals 0 ty mem decls layouts).2⟩

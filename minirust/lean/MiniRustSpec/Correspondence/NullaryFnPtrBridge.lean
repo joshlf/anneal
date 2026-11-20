@@ -2619,6 +2619,73 @@ theorem nullaryOp_offsetOf_field_out_of_range (locals : List LocalSlot) (ty : Ty
   rw [nullaryOp_offsetOf_field_minirust locals ty mem localDecls layouts fields size align hPtr hT
     hDecl hEntry i, hNone]
 
+/-- **A3 (MiniRust `evalPlaceM`, out-of-range field)**: whenever `mrFieldOffset?` returns `none`
+on a sized MiniRust tuple type (no unsized tail), projecting that field in `evalPlaceM` is a
+specification panic (`"field projection to non-existing unsized tail"` at `i = fs.length`, or
+`"field projection to invalid field"` for `i > fs.length`), on every `Machine M` (in particular
+`Mach` and `MachTB`). -/
+theorem evalPlaceM_field_out_of_range_specPanic {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m m' : Gen.Machine M) (rootExpr : Gen.PlaceExpr) (pl : Gen.Place M)
+    (fs : List (Gen.Offset × Gen.Type)) (h : Gen.TupleHeadLayout) (i : Nat)
+    (hRoot : evalPlaceM (M := M) m rootExpr = .ok ((pl, .Tuple fs h none), m'))
+    (hNone : mrFieldOffset? (.Tuple fs h none) i = none) :
+    ∃ msg, evalPlaceM (M := M) m (.Field rootExpr (i : Int)) = .error (.specPanic msg) := by
+  have hge : fs.length ≤ i := by
+    simp only [mrFieldOffset?, Option.map_eq_none_iff] at hNone
+    exact List.getElem?_eq_none_iff.mp hNone
+  have hnotlt : ¬ ((0 : Int) ≤ (i : Int) ∧ (i : Int) < (fs.length : Int)) := by omega
+  unfold evalPlaceM
+  rw [hRoot]
+  dsimp only [bind, Except.bind]
+  rw [ifNeg hnotlt]
+  by_cases heq : (i : Int) = (fs.length : Int)
+  · rw [ifPos heq]; exact ⟨_, rfl⟩
+  · rw [ifNeg heq]; exact ⟨_, rfl⟩
+
+/-- **A3 (MiniRust `evalPlace` on `Mach`, out-of-range field)**: same specification panic for
+the concrete `BasicMemory` interpreter. -/
+theorem evalPlace_field_out_of_range_specPanic (m m' : Mach) (rootExpr : Gen.PlaceExpr)
+    (pl : Gen.Place BM) (fs : List (Gen.Offset × Gen.Type)) (h : Gen.TupleHeadLayout) (i : Nat)
+    (hRoot : evalPlace m rootExpr = .ok ((pl, .Tuple fs h none), m'))
+    (hNone : mrFieldOffset? (.Tuple fs h none) i = none) :
+    ∃ msg, evalPlace m (.Field rootExpr (i : Int)) = .error (.specPanic msg) := by
+  have hge : fs.length ≤ i := by
+    simp only [mrFieldOffset?, Option.map_eq_none_iff] at hNone
+    exact List.getElem?_eq_none_iff.mp hNone
+  have hnotlt : ¬ ((0 : Int) ≤ (i : Int) ∧ (i : Int) < (fs.length : Int)) := by omega
+  unfold evalPlace
+  rw [hRoot]
+  dsimp only [bind, Except.bind]
+  rw [ifNeg hnotlt]
+  by_cases heq : (i : Int) = (fs.length : Int)
+  · rw [ifPos heq]; exact ⟨_, rfl⟩
+  · rw [ifNeg heq]; exact ⟨_, rfl⟩
+
+/-- **A3 (`OffsetOf` out-of-range ↔ MiniRust `evalPlaceM` specPanic)**: for a translated tuple or
+struct type, an out-of-range field index `i ≥ fields.length` yields `.unsupported` in Trusted and
+a specification panic in MiniRust's `evalPlaceM` (on every `Machine M`). -/
+theorem nullaryOp_offsetOf_out_of_range_matches_evalPlaceM
+    {M : Type} [Gen.Memory M] [MemoryOps M]
+    (locals : List LocalSlot) (ty : Ty) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : Layout.LayoutTable)
+    (fields : List (Nat × TupleSpec)) (size align : Nat)
+    (hPtr : layouts.pointerBits = 64)
+    (hT : tupleTypeOf layouts ty = some (fields, size, align))
+    (hDecl : DeclLayoutCoherent localDecls layouts ty)
+    (hEntry : findDeclLayoutForRigidTy localDecls layouts ty.kind =
+      Layout.LayoutTable.lookup layouts ty.layoutIdx)
+    (i : Nat) (hi : fields.length ≤ i)
+    (m m' : Gen.Machine M) (rootExpr : Gen.PlaceExpr) (pl : Gen.Place M)
+    (hRoot : evalPlaceM (M := M) m rootExpr =
+      .ok ((pl, (TupleSpec.tuple fields size align).toMiniRustTy), m')) :
+    evalRvalue locals (.nullaryOp (.offsetOf [(0, i)]) ty) mem localDecls layouts = .unsupported ∧
+      ∃ msg, evalPlaceM (M := M) m (.Field rootExpr (i : Int)) = .error (.specPanic msg) := by
+  obtain ⟨hNone, hUnsup⟩ :=
+    nullaryOp_offsetOf_field_out_of_range locals ty mem localDecls layouts fields size align
+      hPtr hT hDecl hEntry i hi
+  exact ⟨hUnsup,
+    evalPlaceM_field_out_of_range_specPanic m m' rootExpr pl _ _ i hRoot hNone⟩
+
 /-- **A3 (`OffsetOf`, enum-variant paths)**: the tuple and struct types of the translated fragment
 have a single variant, so every path whose first hop names a variant other than `0` is
 `.unsupported` in Trusted. (Trusted's evaluator does resolve variant fields of multi-variant enum
@@ -2877,6 +2944,129 @@ theorem nullaryOp_sizeOf_alignOf_of_minirust_layout (locals : List LocalSlot) (t
       ⟨⟨_, hL⟩, hV⟩,
     (nullaryOp_alignOf_ok_iff locals ty mem localDecls layouts mrTy hPtr hTr hDecl al).mpr
       ⟨sz, hL, hV, hP, hLt⟩⟩
+
+/-- Every entry of `layouts` has a valid Rust alignment (a power of two below `2^64`), as
+guaranteed by `rustc`'s `TypeLayout` construction. -/
+def TableAlignWf (layouts : Layout.LayoutTable) : Prop :=
+  ∀ l ∈ layouts.entries,
+    Layout.Align.isPowerOfTwoBytes l.align = true ∧ l.align.bytes < 18446744073709551616
+
+private theorem intTyBytes_align_wf {k : RigidTy} {s : Signedness} {n : Nat}
+    (h : intTyBytes k = some (s, n)) :
+    Layout.Align.isPowerOfTwoBytes ⟨n⟩ = true ∧ n < 18446744073709551616 := by
+  cases k with
+  | uint u => cases u <;> cases h <;> exact ⟨by decide, by decide⟩
+  | int i => cases i <;> cases h <;> exact ⟨by decide, by decide⟩
+  | _ => simp [intTyBytes] at h
+
+/-- **Alignment well-formedness of translated types**: under `TableAlignWf layouts`, every type in
+the translated fragment whose MiniRust layout is `Sized(sz, al)` has a power-of-two alignment
+below `2^64`. -/
+theorem translateTy_align_wf (layouts : Layout.LayoutTable) (ty : Ty) (mrTy : Gen.Type)
+    (sz al : Nat) (hWf : TableAlignWf layouts)
+    (hTr : translateTy layouts ty = some mrTy)
+    (hL : Interp.Type.layout mrTy = .ok (.Sized ⟨sz⟩ ⟨al⟩)) :
+    Layout.Align.isPowerOfTwoBytes ⟨al⟩ = true ∧ al < 18446744073709551616 := by
+  rw [translateTy_eq] at hTr
+  by_cases hB : isBoolTy ty = true
+  · simp only [hB] at hTr; cases hTr; cases hL; exact ⟨by decide, by decide⟩
+  · simp only [hB] at hTr
+    by_cases hO : isOrderingTy ty = true
+    · simp only [hO] at hTr; cases hTr; rw [layout_ordering] at hL; cases hL
+      exact ⟨by decide, by decide⟩
+    · simp only [hO] at hTr
+      cases hIB : intBoolTupleOf ty with
+      | some it =>
+        rw [hIB] at hTr; cases hTr
+        rw [layout_intBoolTuple] at hL; cases hL
+        rcases ty with ⟨k, idx⟩
+        cases k <;> simp [intBoolTupleOf] at hIB
+        case tuple ks =>
+          cases ks with
+          | nil => simp at hIB
+          | cons k1 rest =>
+            cases rest with
+            | nil => simp at hIB
+            | cons k2 rest2 =>
+              cases rest2 with
+              | cons _ _ => simp at hIB
+              | nil =>
+                cases k2 <;> simp at hIB
+                obtain ⟨a, b, hk, rfl⟩ := hIB
+                exact intTyBytes_align_wf hk
+      | none =>
+        rw [hIB] at hTr
+        cases hI : intTypeOf ty with
+        | some it =>
+          rw [hI] at hTr; cases hTr
+          have hk := intTypeOf_eq_some hI
+          have hL' := (layout_int_agrees hk [] layouts).2.2
+          rw [hL'] at hL; cases hL
+          exact intTyBytes_align_wf hk
+        | none =>
+          rw [hI] at hTr
+          cases hA : arrayTypeOf ty with
+          | some r =>
+            rcases r with ⟨elemIt, count⟩
+            rw [hA] at hTr; cases hTr
+            obtain ⟨ek, _, hek⟩ := arrayTypeOf_eq_some hA
+            have hL' := (layout_intArray_agrees hek count [] layouts).2.2
+            rw [hL'] at hL; cases hL
+            exact intTyBytes_align_wf hek
+          | none =>
+            rw [hA] at hTr
+            cases hT : tupleTypeOf layouts ty with
+            | some r =>
+              rcases r with ⟨fields, size, align⟩
+              rw [hT] at hTr; cases hTr
+              rw [layout_tupleSpec] at hL; cases hL
+              obtain ⟨_, _, hSpec⟩ := tupleTypeOf_inv hT
+              obtain ⟨l, _, _, _, hl, _, _, _, hal, _, _⟩ := specOfRigidTy_tuple_inv hSpec
+              subst hal
+              exact hWf l (List.mem_of_getElem? hl)
+            | none =>
+              rw [hT] at hTr
+              cases hR : rawPtrTypeOf ty with
+              | some t =>
+                rw [hR] at hTr; cases hTr
+                obtain ⟨m, pointee, mk, _, hmk, rfl⟩ := rawPtrTypeOf_eq_some hR
+                obtain ⟨_, _, _, hL'⟩ := layout_rawPtr_agrees hmk m [] layouts
+                rw [hL'] at hL; cases hL
+                exact ⟨by decide, by decide⟩
+              | none =>
+                rw [hR] at hTr
+                cases hRef : refTypeOf ty with
+                | some t =>
+                  rw [hRef] at hTr; cases hTr
+                  have hL' := (layout_ref_agrees hRef [] layouts).2.2
+                  rw [hL'] at hL; cases hL
+                  exact ⟨by decide, by decide⟩
+                | none =>
+                  rw [hRef] at hTr
+                  have hL' := layout_box_minirust hTr
+                  rw [hL'] at hL; cases hL
+                  exact ⟨by decide, by decide⟩
+
+/-- **A2 (`AlignOf`, clean `.ok` iff under `TableAlignWf`)**: when `layouts` satisfies
+`TableAlignWf`, the redundant power-of-two and `< 2^64` side conditions drop out completely —
+Trusted's `AlignOf(ty)` returns `al` iff MiniRust's `Type::layout` is `Sized(sz, al)` with a
+valid size `sz ≤ isize::MAX`. -/
+theorem nullaryOp_alignOf_wf_ok_iff (locals : List LocalSlot) (ty : Ty) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : Layout.LayoutTable) (mrTy : Gen.Type)
+    (hPtr : layouts.pointerBits = 64) (hWf : TableAlignWf layouts)
+    (hTr : translateTy layouts ty = some mrTy)
+    (hDecl : DeclLayoutCoherent localDecls layouts ty) (al : Nat) :
+    evalRvalue locals (.nullaryOp .alignOf ty) mem localDecls layouts =
+        .ok (.scalar ⟨al, 8⟩) locals mem ↔
+      ∃ sz, Interp.Type.layout mrTy = .ok (.Sized ⟨sz⟩ ⟨al⟩) ∧
+        x86_64.valid_size ⟨sz⟩ = true := by
+  rw [nullaryOp_alignOf_ok_iff locals ty mem localDecls layouts mrTy hPtr hTr hDecl al]
+  constructor
+  · rintro ⟨sz, hL, hV, _, _⟩
+    exact ⟨sz, hL, hV⟩
+  · rintro ⟨sz, hL, hV⟩
+    obtain ⟨hP, hLt⟩ := translateTy_align_wf layouts ty mrTy sz al hWf hTr hL
+    exact ⟨sz, hL, hV, hP, hLt⟩
 
 /-! ### A4. `UbChecks` -/
 
@@ -3499,6 +3689,98 @@ theorem wit_fnPtrToPtr_body_reachRet :
     ∃ mem, Trusted.ITree.ReachesRet (mirCallTree wFnPtrToPtrBody []) []
       (.normal (.ptr ⟨65536, 0⟩ 8, mem)) :=
   runN_ret_sound wFnPtrToPtrBody 8 _ rfl
+
+/-- Fuel-bounded run of `stepMirFn` through silent steps to a fault node. -/
+private def runFaultN (body : CapturedMir) : Nat → MachineState → Option Trusted.Effect.FailureKind
+  | 0, _ => none
+  | fuel + 1, s =>
+    match stepMirFn body s with
+    | .tau (.running s') => runFaultN body fuel s'
+    | .vis (.inl (.fail fk)) _ => some fk
+    | _ => none
+
+private theorem runFaultN_not_noUB (body : CapturedMir) (fuel : Nat) :
+    ∀ (s : MachineState) (fk : Trusted.Effect.FailureKind),
+      runFaultN body fuel s = some fk → ¬ MirNoUBTree (mirTree body s) := by
+  induction fuel with
+  | zero => intro s fk h; simp [runFaultN] at h
+  | succ fuel ih =>
+    intro s fk h hsafe
+    have hobs := mirTree_observe body s
+    simp only [runFaultN] at h
+    generalize hstep : stepMirFn body s = node at h hobs
+    cases node with
+    | tau x =>
+      cases x with
+      | running s' =>
+        have hsafe' : MirNoUBTree (mirTree body s') := by
+          intro tr u hreach
+          exact hsafe tr u (.tau hobs hreach)
+        exact ih s' fk h hsafe'
+      | halted _ => simp at h
+      | faulted _ => simp at h
+    | ret _ => simp at h
+    | vis i k =>
+      cases i with
+      | inr _ => simp at h
+      | inl e =>
+        cases e with
+        | fail fk' =>
+          exact hsafe [] (mirTree body s) (.refl _)
+            ⟨mirTree body s, _, _, .refl _, hobs, trivial⟩
+
+/-- `fn fn_ptr_data() -> *const () { StorageLive(_1); StorageLive(_2); _2 = 7u32;
+_1 = &raw const _2; _0 = copy _1 as *const (); return }` — casts a stack data pointer via
+`CastKind.fnPtrToPtr`. -/
+def wFnPtrToPtrDataBody : CapturedMir :=
+  witBody "bridge::fn_ptr_data" wDecls wLayouts
+    [{ kind := .storageLive 1, span := "bridge" },
+     { kind := .storageLive 2, span := "bridge" },
+     { kind := .assign { local_ := 2, projection := [] }
+        (.use (.constant { ty := wU32Ty, val := .scalar (.int ⟨7, 4⟩) })), span := "bridge" },
+     { kind := .assign { local_ := 1, projection := [] }
+        (.rawPtr .not { local_ := 2, projection := [] }), span := "bridge" },
+     assign0 (.cast .fnPtrToPtr wCopy1 wRawUnitTy)]
+
+/-- **End-to-end (B4 negative UB)**: casting `&raw const x` via `CastKind.fnPtrToPtr` faults
+with `.ub` inside `mirCallTree`, refuting `MirNoUBTree`. -/
+theorem wit_fnPtrToPtr_data_body_not_noUB :
+    runFaultN wFnPtrToPtrDataBody 8 (initMachineState wFnPtrToPtrDataBody []) = some .ub ∧
+      ¬ MirNoUBTree (mirCallTree wFnPtrToPtrDataBody []) :=
+  ⟨rfl, runFaultN_not_noUB wFnPtrToPtrDataBody 8 _ .ub rfl⟩
+
+/-- **B4 (instantiating `FnPtrRel.fnFromPtrM_eq` and `fnPtrToPtr_data_pointer_divergence`)**:
+single-application witnesses exercising both polymorphic theorems on `Mach` and `MachTB`. -/
+theorem wit_fnFromPtrM_and_divergence :
+    (fnFromPtrM (M := BM) wMach (.Ptr ⟨wFnThin, none⟩) = .ok wFn ∧
+      fnFromPtrM (M := TBM) wMachTB (.Ptr ⟨wFnThinTB, none⟩) = .ok wFn) ∧
+    (∃ (mem' : Memory),
+      evalRvalue wLocalsB (.cast .fnPtrToPtr wCopy1 wRawUnitTy) mem' wDecls wLayouts = .ub ∧
+      evalUnOpM (M := TBM) (.Cast (.Transmute (.Ptr (.Raw .None))))
+          (.Ptr ⟨wDataThinTB, none⟩, .Ptr .FnPtr) (some wMachTB) =
+        .ok (.Ptr ⟨wDataThinTB, none⟩, .Ptr (.Raw .None)) ∧
+      fnFromPtrM (M := TBM) wMachTB (.Ptr ⟨wDataThinTB, none⟩) =
+        .error (.ub "invalid pointer for function lookup")) := by
+  refine ⟨⟨?_, ?_⟩, ?_⟩
+  · obtain ⟨p, entry, f, hp, hL, hN, hEq⟩ := wit_FnPtrRel.1.fnFromPtrM_eq (by
+      intro e₁ he₁ e₂ he₂ _
+      simp [wMach] at he₁ he₂
+      rcases he₁ with rfl; rcases he₂ with rfl; rfl)
+    cases hp; cases hL; cases hN
+    exact hEq
+  · obtain ⟨p, entry, f, hp, hL, hN, hEq⟩ := wit_FnPtrRel.2.fnFromPtrM_eq (by
+      intro e₁ he₁ e₂ he₂ _
+      simp [wMachTB] at he₁ he₂
+      rcases he₁ with rfl; rcases he₂ with rfl; rfl)
+    cases hp; cases hL; cases hN
+    exact hEq
+  · obtain ⟨mem', e, _, hB, _⟩ := wit_trusted_borrowed_ub
+    refine ⟨mem', fnPtrToPtr_data_pointer_divergence wLocalsB wLocalsB wCopy1 wRawUnitTy mem'
+      wDecls wLayouts ⟨1, 0⟩ 8 e rfl hB wMachTB wDataThinTB (by decide) ?_⟩
+    intro entry hentry
+    simp [wMachTB, wFnThinTB] at hentry
+    rcases hentry with rfl
+    decide
 
 
 end MiniRustSpec.Correspondence.NullaryFnPtrBridge

@@ -7176,6 +7176,9 @@ that the closed branches made public, and the `Mach` corollaries of
   VTablePtr.NoUnsupported.bind
   VTablePtr.NoUnsupported.mapIndex
   VTablePtr.NoUnsupported.forM
+  VTablePtr.NoUnsupported.mapM
+  VTablePtr.NoUnsupported.tryMapM
+  VTablePtr.NoUnsupported.foldlM
   VTablePtr.vtableFromPtrM_eq
   VTablePtr.vtableLookupM_eq
   VTablePtr.vtableFromPtrM_unregistered_ub
@@ -7198,6 +7201,7 @@ that the closed branches made public, and the `Mach` corollaries of
   VTablePtr.safePtrTail_eq_ok_iff
   VTablePtr.safePtrTail_ub
   VTablePtr.checkPtrM_traitObject_eq_ok_iff
+  VTablePtr.checkPtrM_tupleTraitObject_eq_ok_iff
   VTablePtr.checkPtrM_traitObject_vtable_cases
   VTablePtr.vtableLookupM_noUnsupported
   VTablePtr.compute_size_and_align_noUnsupported
@@ -7208,6 +7212,33 @@ that the closed branches made public, and the `Mach` corollaries of
   VTablePtr.checkFieldsM_noUnsupported
   VTablePtr.checkVariantM_noUnsupported
   VTablePtr.expect_size_noUnsupported
+  VTablePtr.expect_align_noUnsupported
+  VTablePtr.intType_align_noUnsupported
+  VTablePtr.size_mulInt_noUnsupported
+  VTablePtr.subsliceWithLength_noUnsupported
+  VTablePtr.writeSubsliceAtIndex_noUnsupported
+  VTablePtr.type_layout_noUnsupported
+  VTablePtr.decodeIntM_noUnsupported
+  VTablePtr.encodeIntM_noUnsupported
+  VTablePtr.decodePtrM_noUnsupported
+  VTablePtr.encodePtrM_noUnsupported
+  VTablePtr.decodeValueM_noUnsupported
+  VTablePtr.encodeAsValueM_noUnsupported
+  VTablePtr.decodeMetaFieldM_noUnsupported
+  VTablePtr.decodeWidePtrM_noUnsupported
+  VTablePtr.encodeWidePtrM_noUnsupported
+  VTablePtr.decodeDiscriminantM_noUnsupported
+  VTablePtr.decodeDiscriminantChildrenM_noUnsupported
+  VTablePtr.encodeDiscriminantM_noUnsupported
+  VTablePtr.encodeUnionChunksM_noUnsupported
+  VTablePtr.type_decodeM_noUnsupported
+  VTablePtr.type_decodeFieldsM_noUnsupported
+  VTablePtr.type_decodeVariantM_noUnsupported
+  VTablePtr.type_encodeM_noUnsupported
+  VTablePtr.type_encodeFieldsM_noUnsupported
+  VTablePtr.type_encodeVariantM_noUnsupported
+  VTablePtr.transmuteM_noUnsupported_uncond
+  VTablePtr.evalUnOpM_transmute_noUnsupported_uncond
   VTablePtr.transmuteM_noUnsupported
   VTablePtr.evalUnOpM_transmute_noUnsupported
   VTablePtr.layout_ptr_noUnsupported
@@ -7219,6 +7250,8 @@ that the closed branches made public, and the `Mach` corollaries of
   VTablePtr.checkPtrTB_noUnsupported
   VTablePtr.checkValueTB_noUnsupported
   VTablePtr.checkValueBM_noUnsupported
+  VTablePtr.evalUnOpTB_transmute_noUnsupported_uncond
+  VTablePtr.evalUnOpBM_transmute_noUnsupported_uncond
   VTablePtr.evalUnOpTB_transmute_noUnsupported
   VTablePtr.vtableFromPtr_eq_vtableFromPtrM
   VTablePtr.checkPtrMetadata_eq_checkPtrMetadataM
@@ -7230,20 +7263,28 @@ that the closed branches made public, and the `Mach` corollaries of
   VTablePtr.checkPtr_vtablePtr_eq_ok_iff
   VTablePtr.checkPtr_vtablePtr_ub
   VTablePtr.checkPtr_traitObject_eq_ok_iff
+  VTablePtr.checkPtr_tupleTraitObject_eq_ok_iff
   VTablePtr.checkPtr_noUnsupported
   VTablePtr.vtableFromPtr_agree
   VTablePtr.checkPtr_vtablePtr_agree
   VTablePtr.checkPtr_traitObject_agree
+  VTablePtr.dereferenceable_agree_of_memAllocsAgree
+  VTablePtr.checkPtr_traitObject_agree_of_memAllocsAgree
   VTablePtr.vtableFromPtr_witness
   VTablePtr.checkPtr_vtablePtr_witness
   VTablePtr.checkPtr_dynRef_witness
   VTablePtr.transmute_vtablePtr_witness
   VTablePtr.vtMach_vtMachTB_agree
+  VTablePtr.vtMach_vtMachTB_agree_structural
   VTablePtr.vtablePtr_child_path_divergence
   vtableFromPtrM_bm_eq
   checkPtrMetadataM_bm_eq
   checkPtrM_bm_eq
   WideSliceDst.checkValue_noUnsupported
+  WideSliceDst.type_encode_noUnsupported
+  WideSliceDst.type_decode_noUnsupported
+  WideSliceDst.transmute_noUnsupported_uncond
+  WideSliceDst.evalUnOp_transmute_noUnsupported_uncond
   WideSliceDst.transmute_noUnsupported
   WideSliceDst.evalUnOp_transmute_noUnsupported
 
@@ -7337,6 +7378,56 @@ example (m : Mach) (mt : MachTB) (h : VTablesAgree m mt)
     checkPtr (erasePathPtr ptr) ptrTy (some m) = checkPtrM ptr ptrTy (some mt) :=
   checkPtr_traitObject_agree m mt h ptr ptrTy pointee traitName hsafe hlay hf hderef
 
+example {M : Type} [Memory M] [MemoryOps M] (m : Machine M)
+    (ptr : Pointer (Memory.Provenance M)) (ptrTy : PtrType) (pointee : PointeeInfo)
+    (head : TupleHeadLayout) (traitName : TraitName)
+    (hsafe : PtrType.safe_pointee ptrTy = some pointee)
+    (hlay : pointee.layout = .Tuple head (.TraitObject traitName)) :
+    checkPtrM ptr ptrTy (some m) = .ok () ↔
+      inBounds ptr.thin_pointer.addr .Unsigned x86_64.PTR_SIZE = true ∧
+      ∃ vp vtable, ptr.metadata = some (.VTablePointer vp) ∧
+        inBounds vp.addr .Unsigned x86_64.PTR_SIZE = true ∧
+        vtableFromPtrM m vp = .ok vtable ∧ vtable.trait_name = traitName ∧
+        let (fullSize, fullAlign) := TupleHeadLayout.full_size_and_align head vtable.size vtable.align
+        inBounds fullSize.bytes .Signed x86_64.PTR_SIZE = true ∧
+        ptr.thin_pointer.addr ≠ 0 ∧
+        Align.is_aligned fullAlign ptr.thin_pointer.addr = true ∧
+        pointee.inhabited = true ∧
+        ConcurrentMemory.dereferenceable m.mem ptr.thin_pointer fullSize = .ok () :=
+  checkPtrM_tupleTraitObject_eq_ok_iff m ptr ptrTy pointee head traitName hsafe hlay
+
+example {M : Type} [Memory M] [MemoryOps M] (hderef : DerefNoUnsupported M) (m : Machine M)
+    (val : Value M) (srcTy dstTy : Gen.«Type») (w : String) :
+    transmuteM val srcTy dstTy (some m) ≠ .error (.unsupported w) :=
+  transmuteM_noUnsupported_uncond hderef m val srcTy dstTy w
+
+example {M : Type} [Memory M] [MemoryOps M] (hderef : DerefNoUnsupported M) (m : Machine M)
+    (dstTy srcTy : Gen.«Type») (val : Value M) (w : String) :
+    evalUnOpM (.Cast (.Transmute dstTy)) (val, srcTy) (some m) ≠ .error (.unsupported w) :=
+  evalUnOpM_transmute_noUnsupported_uncond hderef m dstTy srcTy val w
+
+example (mt : MachTB) (dstTy srcTy : Gen.«Type») (val : Value TBM) (w : String) :
+    evalUnOpM (.Cast (.Transmute dstTy)) (val, srcTy) (some mt) ≠ .error (.unsupported w) :=
+  evalUnOpTB_transmute_noUnsupported_uncond mt dstTy srcTy val w
+
+example (m : Mach) (val : Val) (srcTy dstTy : Gen.«Type») (w : String) :
+    transmute val srcTy dstTy (some m) ≠ .error (.unsupported w) :=
+  WideSliceDst.transmute_noUnsupported_uncond m val srcTy dstTy w
+
+example (m : Mach) (dstTy srcTy : Gen.«Type») (val : Val) (w : String) :
+    evalUnOp (.Cast (.Transmute dstTy)) (val, srcTy) (some m) ≠ .error (.unsupported w) :=
+  WideSliceDst.evalUnOp_transmute_noUnsupported_uncond m dstTy srcTy val w
+
+example (m : Mach) (mt : MachTB) (hvt : VTablesAgree m mt) (hmem : MemAllocsAgree m mt)
+    (ptr : Pointer TreeBorrowsProvenance) (ptrTy : PtrType) (pointee : PointeeInfo)
+    (traitName : TraitName)
+    (hsafe : PtrType.safe_pointee ptrTy = some pointee)
+    (hlay : pointee.layout = .TraitObject traitName)
+    (hf : ∀ vp, ptr.metadata = some (.VTablePointer vp) → PathFaithful mt vp) :
+    checkPtr (erasePathPtr ptr) ptrTy (some m) = checkPtrM ptr ptrTy (some mt) :=
+  checkPtr_traitObject_agree_of_memAllocsAgree m mt hvt hmem ptr ptrTy pointee traitName hsafe hlay
+    hf
+
 end VTablePtrStatementPins
 
 end VTablePtrAuditPins
@@ -7385,6 +7476,7 @@ typed and byte memory model on `Mach` and `MachTB`). -/
   VolatileBridge.mr_setTB_misaligned_ub
   VolatileBridge.trusted_unaligned_never_consults_alignment
   VolatileBridge.trusted_addr_alignment_parity
+  VolatileBridge.trusted_global_target_aligned_iff
   VolatileBridge.trusted_load_misaligned_ub
   VolatileBridge.trusted_store_misaligned_ub
   VolatileBridge.trusted_copy_misaligned_ub
@@ -7417,6 +7509,7 @@ typed and byte memory model on `Mach` and `MachTB`). -/
   VolatileBridge.divergence_null_zst_read_write_unaligned
   VolatileBridge.lockstep_unaligned_uninit_ub
   VolatileBridge.lockstep_tree_borrows_conflict_ub
+  VolatileBridge.lockstep_tree_borrows_protector_conflict_ub
   VolatileBridge.lockstep_volatile_copy_dst_src_count_order
   VolatileBridge.lockstep_volatile_copy_memory_memmove
   VolatileBridge.lockstep_volatile_set_memory_fill
@@ -7424,6 +7517,8 @@ typed and byte memory model on `Mach` and `MachTB`). -/
   VolatileBridge.lockstep_volatile_copy_nonoverlapping_overlap_ub
   VolatileBridge.trusted_volatile_load_mmio_unsupported
   VolatileBridge.trusted_volatile_store_mmio_unsupported
+  VolatileBridge.trusted_volatile_copy_mmio_unsupported
+  VolatileBridge.trusted_volatile_set_mmio_unsupported
   VolatileBridge.mr_bm_load_no_provenance_ub
   VolatileBridge.mr_bm_store_no_provenance_ub
   VolatileBridge.mr_tbm_load_no_provenance_ub
@@ -7431,14 +7526,19 @@ typed and byte memory model on `Mach` and `MachTB`). -/
   VolatileBridge.volatile_load_mmio_one_way_soundness
   VolatileBridge.mirStep_fail_not_noUB
   VolatileBridge.volatile_store_mmio_one_way_soundness
+  VolatileBridge.volatile_copy_mmio_one_way_soundness
+  VolatileBridge.volatile_set_mmio_one_way_soundness
   VolatileBridge.mmio_volatile_load_step_unsupported
   VolatileBridge.mmio_volatile_store_step_unsupported
   VolatileBridge.mmio_volatile_not_noUB
+  VolatileBridge.mmio_volatile_copy_set_step_unsupported
+  VolatileBridge.mmio_volatile_copy_set_not_noUB
   VolatileBridge.mr_endianness_decode_eq_intFromBits
   VolatileBridge.codec_int_decode_agreement
   VolatileBridge.tDecodeIsUb_sound
   VolatileBridge.mDecodeIsInvalid_sound
   VolatileBridge.codec_bool_validity_all_bytes
+  VolatileBridge.codec_bool_validity_all_bytes_general
   VolatileBridge.codec_uninit_byte_invalid
   VolatileBridge.interp_ok_of_toOption
   VolatileBridge.decodedInt_sound
@@ -7455,6 +7555,14 @@ typed and byte memory model on `Mach` and `MachTB`). -/
   VolatileBridge.mr_bm_store_in_bounds
   VolatileBridge.mr_copy_is_memmove
   VolatileBridge.mr_set_is_fill
+  VolatileBridge.mr_tbm_check_ptr_in_bounds
+  VolatileBridge.mr_tbm_load_in_bounds
+  VolatileBridge.mr_tbm_store_in_bounds
+  VolatileBridge.mr_tbm_node_access_root_unique
+  VolatileBridge.mr_copyTB_is_memmove
+  VolatileBridge.mr_setTB_is_fill
+  VolatileBridge.mr_copyTB_root_unique_is_memmove
+  VolatileBridge.mr_setTB_root_unique_is_fill
   VolatileBridge.splice_spec
   VolatileBridge.trusted_encode_le_eq_leBytes
   VolatileBridge.leValue_leBytes
@@ -7462,6 +7570,7 @@ typed and byte memory model on `Mach` and `MachTB`). -/
   VolatileBridge.leBytes_length
   VolatileBridge.codec_int_round_trip
   VolatileBridge.codec_usize_isize_agreement
+  VolatileBridge.codec_usize_isize_agreement_general
   VolatileBridge.lockstep_mmio_aligned_0x40000000
   VolatileBridge.trustedActionIsUb_sound
   VolatileBridge.trustedActionBytes_sound
@@ -7471,6 +7580,149 @@ typed and byte memory model on `Mach` and `MachTB`). -/
   VolatileBridge.interpIsUb_sound
   VolatileBridge.trustedActionScalar_sound
   VolatileBridge.lockstep_unaligned_load_store_exhaustive
+
+namespace VolatileBridgeStatementPins
+
+open MiniRustSpec.Correspondence.VolatileBridge
+
+example (callStack : List SavedCallerFrame) (locals' : List LocalSlot)
+    (decls : List MirAst.LocalDecl) (layouts : LayoutTable) (reqAlign addr : Nat) (tgt : RawPtrTarget)
+    (hpos : 0 < reqAlign) :
+    rawPtrTargetAligned? callStack locals' decls layouts reqAlign (.addr addr) tgt =
+      .some (Interp.Align.is_aligned ⟨reqAlign⟩ (addr : Int)) :=
+  trusted_addr_alignment_parity callStack locals' decls layouts reqAlign addr tgt hpos
+
+example (callStack : List SavedCallerFrame) (locals' : List LocalSlot)
+    (decls : List MirAst.LocalDecl) (layouts : LayoutTable)
+    (reqAlign : Nat) (ptr : ProvenancePtr) (alloc : CapturedAllocation)
+    (hReq : 1 < reqAlign) (hAllocPos : 0 < alloc.align.bytes) :
+    rawPtrTargetAligned? callStack locals' decls layouts reqAlign (.prov ptr)
+        (.global ptr alloc) =
+      .some (decide (reqAlign ≤ alloc.align.bytes ∧ ptr.offsetBytes % reqAlign = 0)) :=
+  trusted_global_target_aligned_iff callStack locals' decls layouts reqAlign ptr alloc hReq
+    hAllocPos
+
+example (s : MachineState) (target : ResolvedCallTarget) (decls : List MirAst.LocalDecl)
+    (layouts : LayoutTable) (argOps : List Operand) (locals' : List LocalSlot)
+    (destination : MirAst.Place) (targetBb : BasicBlockIdx)
+    (elemTy : Ty) (size align addr : Nat)
+    (m : Interp.Mach) (prov : Option Interp.Prov)
+    (mtb : Interp.MachTB) (provTB : Option Gen.TreeBorrowsProvenance)
+    (mty : Gen.«Type») (msize : LibSpecr.Size)
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
+    (hMLay : Interp.Type.layout mty = .ok (.Sized msize ⟨align⟩))
+    (hpos : 0 < align)
+    (hMis : Interp.Align.is_aligned ⟨align⟩ (addr : Int) = false) :
+    evalVolatileMemIntrinsicCall .volatileLoad s target decls layouts argOps
+        [.scalar ⟨addr, layoutPointerBytes layouts⟩] locals' destination targetBb =
+      MirStepNode.fail .ub ∧
+    mrLoad true m ⟨addr, prov⟩ mty = .error (.ub "load from a misaligned pointer") ∧
+    mrLoadTB true mtb ⟨addr, provTB⟩ mty = .error (.ub "load from a misaligned pointer") :=
+  volatile_load_misaligned_parity s target decls layouts argOps locals' destination targetBb
+    elemTy size align addr m prov mtb provTB mty msize hLay hMLay hpos hMis
+
+example (s : MachineState) (target : ResolvedCallTarget) (decls : List MirAst.LocalDecl)
+    (layouts : LayoutTable) (argOps : List Operand) (locals' : List LocalSlot)
+    (destination : MirAst.Place) (targetBb : BasicBlockIdx)
+    (elemTy : Ty) (size align dstAddr srcAddr count : Nat)
+    (m : Interp.Mach) (mtb : Interp.MachTB) (mty : Gen.«Type») (msize : LibSpecr.Size)
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
+    (hMLay : Interp.Type.layout mty = .ok (.Sized msize ⟨align⟩))
+    (hpos : 0 < align)
+    (hDstAl : Interp.Align.is_aligned ⟨align⟩ (dstAddr : Int) = true)
+    (hSrcAl : Interp.Align.is_aligned ⟨align⟩ (srcAddr : Int) = true)
+    (hSmall : count * size < signedHalfModulus (layoutPointerBytes layouts))
+    (hNonZero : count * size ≠ 0) (hMNonZero : count * msize.bytes ≠ 0) :
+    evalVolatileMemIntrinsicCall .volatileCopyNonOverlappingMemory s target decls layouts argOps
+        [.scalar ⟨dstAddr, layoutPointerBytes layouts⟩,
+         .scalar ⟨srcAddr, layoutPointerBytes layouts⟩,
+         .scalar ⟨count, layoutPointerBytes layouts⟩] locals' destination targetBb =
+      MirStepNode.unsupported ∧
+    evalVolatileMemIntrinsicCall .volatileCopyMemory s target decls layouts argOps
+        [.scalar ⟨dstAddr, layoutPointerBytes layouts⟩,
+         .scalar ⟨srcAddr, layoutPointerBytes layouts⟩,
+         .scalar ⟨count, layoutPointerBytes layouts⟩] locals' destination targetBb =
+      MirStepNode.unsupported ∧
+    mrCopy m ⟨dstAddr, none⟩ ⟨srcAddr, none⟩ count mty =
+      .error (.ub "dereferencing pointer without provenance") ∧
+    mrCopyTB mtb ⟨dstAddr, none⟩ ⟨srcAddr, none⟩ count mty =
+      .error (.ub "dereferencing pointer without provenance") :=
+  volatile_copy_mmio_one_way_soundness s target decls layouts argOps locals' destination targetBb
+    elemTy size align dstAddr srcAddr count m mtb mty msize hLay hMLay hpos hDstAl hSrcAl hSmall
+    hNonZero hMNonZero
+
+example (s : MachineState) (target : ResolvedCallTarget) (decls : List MirAst.LocalDecl)
+    (layouts : LayoutTable) (argOps : List Operand) (locals' : List LocalSlot)
+    (destination : MirAst.Place) (targetBb : BasicBlockIdx)
+    (elemTy : Ty) (size align dstAddr count : Nat) (val : UInt8)
+    (m : Interp.Mach) (mtb : Interp.MachTB) (mty : Gen.«Type») (msize : LibSpecr.Size)
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
+    (hMLay : Interp.Type.layout mty = .ok (.Sized msize ⟨align⟩))
+    (hpos : 0 < align)
+    (hDstAl : Interp.Align.is_aligned ⟨align⟩ (dstAddr : Int) = true)
+    (hSmall : count * size < signedHalfModulus (layoutPointerBytes layouts))
+    (hNonZero : count * size ≠ 0) (hMNonZero : count * msize.bytes ≠ 0) :
+    evalVolatileMemIntrinsicCall .volatileSetMemory s target decls layouts argOps
+        [.scalar ⟨dstAddr, layoutPointerBytes layouts⟩,
+         .scalar ⟨val.toNat, 1⟩,
+         .scalar ⟨count, layoutPointerBytes layouts⟩] locals' destination targetBb =
+      MirStepNode.unsupported ∧
+    mrSet m ⟨dstAddr, none⟩ val count mty =
+      .error (.ub "dereferencing pointer without provenance") ∧
+    mrSetTB mtb ⟨dstAddr, none⟩ val count mty =
+      .error (.ub "dereferencing pointer without provenance") :=
+  volatile_set_mmio_one_way_soundness s target decls layouts argOps locals' destination targetBb
+    elemTy size align dstAddr count val m mtb mty msize hLay hMLay hpos hDstAl hSmall hNonZero
+    hMNonZero
+
+example (m : Interp.MachTB)
+    (dst src : Gen.ThinPointer Gen.TreeBorrowsProvenance) (count : Nat)
+    (ty : Gen.«Type») (size : LibSpecr.Size) (tyAlign : LibSpecr.Align)
+    (i : Nat) (a : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra) (srcOff dstOff : Nat)
+    (hLay : Interp.Type.layout ty = .ok (.Sized size tyAlign))
+    (hn : count * size.bytes ≠ 0)
+    (hsal : Interp.Align.is_aligned tyAlign src.addr = true)
+    (hdal : Interp.Align.is_aligned tyAlign dst.addr = true)
+    (hsprov : src.provenance = some (⟨(i : Int)⟩, []))
+    (hdprov : dst.provenance = some (⟨(i : Int)⟩, []))
+    (hget : m.mem.memory.mem.allocations[i]? = some a) (hlive : a.live = true)
+    (hroot : a.extra.root =
+      { children := [], permissions := List.replicate a.data.length (.Unprot .Unique),
+        «protected» := .No })
+    (hsaddr : src.addr = a.addr + (srcOff : Int))
+    (hdaddr : dst.addr = a.addr + (dstOff : Int))
+    (hsb : srcOff + count * size.bytes ≤ a.data.length)
+    (hdb : dstOff + count * size.bytes ≤ a.data.length) :
+    ∃ m', mrCopyTB m dst src count ty = .ok m' ∧
+      m'.mem.memory.mem.allocations = m.mem.memory.mem.allocations.set i
+        { a with
+          data := a.data.take dstOff ++ (a.data.drop srcOff).take (count * size.bytes) ++
+            a.data.drop (dstOff + count * size.bytes) } :=
+  mr_copyTB_root_unique_is_memmove m dst src count ty size tyAlign i a srcOff dstOff hLay hn hsal
+    hdal hsprov hdprov hget hlive hroot hsaddr hdaddr hsb hdb
+
+example (layouts : LayoutTable) (idx : LayoutIdx) (hLE : layouts.isLittleEndian = true)
+    (hPtr : layouts.pointerBits = 64) (b0 b1 b2 b3 b4 b5 b6 b7 : UInt8) :
+    IntDecodeAgree layouts ⟨.uint .usize, idx⟩ [b0, b1, b2, b3, b4, b5, b6, b7] ∧
+    IntDecodeAgree layouts ⟨.int .isize, idx⟩ [b0, b1, b2, b3, b4, b5, b6, b7] ∧
+    IntEncodeAgree layouts ⟨.uint .usize, idx⟩ 8 ∧
+    IntEncodeAgree layouts ⟨.int .isize, idx⟩ 8 ∧
+    IntRoundTrip layouts ⟨.uint .usize, idx⟩ 8 ∧
+    IntRoundTrip layouts ⟨.int .isize, idx⟩ 8 :=
+  codec_usize_isize_agreement_general layouts idx hLE hPtr b0 b1 b2 b3 b4 b5 b6 b7
+
+example (layouts : LayoutTable) (idx : LayoutIdx) (hLE : layouts.isLittleEndian = true)
+    (n : Nat) (hn : n < 256) :
+    (n ≤ 1 →
+      rawPtrDecodeBytes layouts ⟨.bool, idx⟩ (tPlain [UInt8.ofNat n]) = .ok (.scalar ⟨n, 1⟩) ∧
+      Interp.Type.decode .Bool (vbPlain [UInt8.ofNat n]) =
+        .ok (some (.Bool (decide (n = 1))))) ∧
+    (1 < n →
+      rawPtrDecodeBytes layouts ⟨.bool, idx⟩ (tPlain [UInt8.ofNat n]) = .fault .ub ∧
+      Interp.Type.decode .Bool (vbPlain [UInt8.ofNat n]) = .ok none) :=
+  codec_bool_validity_all_bytes_general layouts idx hLE n hn
+
+end VolatileBridgeStatementPins
 
 end VolatileBridgeAuditPins
 
@@ -7588,6 +7840,9 @@ MiniRust on `Mach` and `MachTB`). -/
   NullaryFnPtrBridge.mrFieldOffset_tupleSpec
   NullaryFnPtrBridge.nullaryOp_offsetOf_field_minirust
   NullaryFnPtrBridge.nullaryOp_offsetOf_field_out_of_range
+  NullaryFnPtrBridge.evalPlaceM_field_out_of_range_specPanic
+  NullaryFnPtrBridge.evalPlace_field_out_of_range_specPanic
+  NullaryFnPtrBridge.nullaryOp_offsetOf_out_of_range_matches_evalPlaceM
   NullaryFnPtrBridge.nullaryOp_offsetOf_variant_ne_zero_unsupported
   NullaryFnPtrBridge.resolveOffsetOfPath_spec_path
   NullaryFnPtrBridge.nullaryOp_offsetOf_path_minirust
@@ -7595,6 +7850,8 @@ MiniRust on `Mach` and `MachTB`). -/
   NullaryFnPtrBridge.declLayoutCoherent_of_eval
   NullaryFnPtrBridge.evalRvalue_nullaryOp_eq
   NullaryFnPtrBridge.nullaryOp_sizeOf_alignOf_of_minirust_layout
+  NullaryFnPtrBridge.translateTy_align_wf
+  NullaryFnPtrBridge.nullaryOp_alignOf_wf_ok_iff
   NullaryFnPtrBridge.nullaryOp_ubChecks_ok_iff
   NullaryFnPtrBridge.nullaryOp_ubChecks_nonBool_unsupported
   NullaryFnPtrBridge.nullaryOp_ubChecks_minirust
@@ -7615,6 +7872,105 @@ MiniRust on `Mach` and `MachTB`). -/
   NullaryFnPtrBridge.sizeOf_unsupported_without_decl
   NullaryFnPtrBridge.wit_nullaryOp_bodies_reachRet
   NullaryFnPtrBridge.wit_fnPtrToPtr_body_reachRet
+  NullaryFnPtrBridge.wit_fnPtrToPtr_data_body_not_noUB
+  NullaryFnPtrBridge.wit_fnFromPtrM_and_divergence
+
+namespace NullaryFnPtrBridgeStatementPins
+
+open MiniRustSpec.Correspondence.NullaryFnPtrBridge
+
+example {M : Type} [Gen.Memory M] [MemoryOps M] (m? : Option (Gen.Machine M))
+    (p : Gen.Pointer (Gen.Memory.Provenance M)) (r : Gen.Value M × Gen.Type) :
+    evalUnOpM (M := M) (.Cast (.Transmute (.Ptr (.Raw .None)))) (.Ptr p, .Ptr .FnPtr) m? =
+        .ok r ↔
+      checkValueM (M := M) (.Ptr p) (.Ptr .FnPtr) m? = .ok () ∧
+        r = (.Ptr p, .Ptr (.Raw .None)) :=
+  evalUnOpM_fnPtrToPtr_ok_iff m? p r
+
+example (locals : List LocalSlot) (op : Operand)
+    (targetTy : Ty) (mem : MirSemantics.Memory) (localDecls : List MirAst.LocalDecl)
+    (layouts : Layout.LayoutTable) (v : MirSemantics.Value) (locals' : List LocalSlot)
+    (mem' : MirSemantics.Memory) :
+    evalRvalue locals (.cast .fnPtrToPtr op targetTy) mem localDecls layouts =
+        .ok v locals' mem' ↔
+      ∃ p sz,
+        evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+          mem.callStack = .ok (.ptr p sz) locals' ∧
+        v = .ptr p 8 ∧ mem' = mem ∧
+        isThinRawPtrTy targetTy = true ∧
+        fnPtrSrcTyValid (operandTy localDecls layouts op) = true ∧
+        fnPtrValueValid mem p sz = true :=
+  evalRvalue_fnPtrToPtr_ok_iff locals op targetTy mem localDecls layouts v locals' mem'
+
+example {M : Type} [Gen.Memory M] [MemoryOps M] {fnMap : FnMap}
+    {mem : MirSemantics.Memory} {m : Gen.Machine M}
+    {tv : MirSemantics.Value} {mv : Gen.Value M} (hRel : FnPtrRel fnMap mem m tv mv)
+    (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty)
+    (localDecls : List MirAst.LocalDecl) (layouts : Layout.LayoutTable)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack = .ok tv locals')
+    (hT : isThinRawPtrTy targetTy = true)
+    (hS : fnPtrSrcTyValid (operandTy localDecls layouts op) = true) :
+    ∃ (tv' : MirSemantics.Value) (mv' : Gen.Value M),
+      evalRvalue locals (.cast .fnPtrToPtr op targetTy) mem localDecls layouts =
+        .ok tv' locals' mem ∧
+      evalUnOpM (M := M) (.Cast (.Transmute (.Ptr (.Raw .None)))) (mv, .Ptr .FnPtr) (some m) =
+        .ok (mv', .Ptr (.Raw .None)) ∧
+      FnPtrRel fnMap mem m tv' mv' :=
+  fnPtrToPtr_preserves_FnPtrRel hRel locals locals' op targetTy localDecls layouts hOp hT hS
+
+example (locals : List LocalSlot) (ty : Ty) (mem : MirSemantics.Memory)
+    (localDecls : List MirAst.LocalDecl) (layouts : Layout.LayoutTable) (mrTy : Gen.Type)
+    (hPtr : layouts.pointerBits = 64) (hTr : translateTy layouts ty = some mrTy)
+    (hDecl : DeclLayoutCoherent localDecls layouts ty) (sz : Nat) :
+    evalRvalue locals (.nullaryOp .sizeOf ty) mem localDecls layouts =
+        .ok (.scalar ⟨sz, 8⟩) locals mem ↔
+      (∃ al, Interp.Type.layout mrTy = .ok (.Sized ⟨sz⟩ al)) ∧
+        x86_64.valid_size ⟨sz⟩ = true :=
+  nullaryOp_sizeOf_ok_iff locals ty mem localDecls layouts mrTy hPtr hTr hDecl sz
+
+example (locals : List LocalSlot) (ty : Ty) (mem : MirSemantics.Memory)
+    (localDecls : List MirAst.LocalDecl) (layouts : Layout.LayoutTable) (mrTy : Gen.Type)
+    (hPtr : layouts.pointerBits = 64) (hWf : TableAlignWf layouts)
+    (hTr : translateTy layouts ty = some mrTy)
+    (hDecl : DeclLayoutCoherent localDecls layouts ty) (al : Nat) :
+    evalRvalue locals (.nullaryOp .alignOf ty) mem localDecls layouts =
+        .ok (.scalar ⟨al, 8⟩) locals mem ↔
+      ∃ sz, Interp.Type.layout mrTy = .ok (.Sized ⟨sz⟩ ⟨al⟩) ∧
+        x86_64.valid_size ⟨sz⟩ = true :=
+  nullaryOp_alignOf_wf_ok_iff locals ty mem localDecls layouts mrTy hPtr hWf hTr hDecl al
+
+example {M : Type} [Gen.Memory M] [MemoryOps M]
+    (locals : List LocalSlot) (ty : Ty) (mem : MirSemantics.Memory)
+    (localDecls : List MirAst.LocalDecl) (layouts : Layout.LayoutTable)
+    (fields : List (Nat × TupleSpec)) (size align : Nat)
+    (hPtr : layouts.pointerBits = 64)
+    (hT : tupleTypeOf layouts ty = some (fields, size, align))
+    (hDecl : DeclLayoutCoherent localDecls layouts ty)
+    (hEntry : findDeclLayoutForRigidTy localDecls layouts ty.kind =
+      Layout.LayoutTable.lookup layouts ty.layoutIdx)
+    (i : Nat) (hi : fields.length ≤ i)
+    (m m' : Gen.Machine M) (rootExpr : Gen.PlaceExpr) (pl : Gen.Place M)
+    (hRoot : evalPlaceM (M := M) m rootExpr =
+      .ok ((pl, (TupleSpec.tuple fields size align).toMiniRustTy), m')) :
+    evalRvalue locals (.nullaryOp (.offsetOf [(0, i)]) ty) mem localDecls layouts = .unsupported ∧
+      ∃ msg, evalPlaceM (M := M) m (.Field rootExpr (i : Int)) = .error (.specPanic msg) :=
+  nullaryOp_offsetOf_out_of_range_matches_evalPlaceM locals ty mem localDecls layouts fields size
+    align hPtr hT hDecl hEntry i hi m m' rootExpr pl hRoot
+
+example (locals : List LocalSlot) (ty : Ty) (mem : MirSemantics.Memory)
+    (localDecls : List MirAst.LocalDecl) (layouts : Layout.LayoutTable) (v : MirSemantics.Value)
+    (locals' : List LocalSlot) (mem' : MirSemantics.Memory) :
+    evalRvalue locals (.nullaryOp .ubChecks ty) mem localDecls layouts = .ok v locals' mem' ↔
+      ty.kind = .bool ∧ v = .scalar ⟨1, 1⟩ ∧ locals' = locals ∧ mem' = mem :=
+  nullaryOp_ubChecks_ok_iff locals ty mem localDecls layouts v locals' mem'
+
+example (locals : List LocalSlot) (ty : Ty) (mem : MirSemantics.Memory)
+    (localDecls : List MirAst.LocalDecl) (layouts : Layout.LayoutTable) :
+    evalRvalue locals (.nullaryOp .contractChecks ty) mem localDecls layouts = .unsupported :=
+  nullaryOp_contractChecks_unsupported locals ty mem localDecls layouts
+
+end NullaryFnPtrBridgeStatementPins
 
 end NullaryFnPtrBridgeAuditPins
 

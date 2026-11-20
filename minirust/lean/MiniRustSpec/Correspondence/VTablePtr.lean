@@ -215,6 +215,41 @@ theorem NoUnsupported.forM {α : Type} (f : α → Interp Unit) (hf : ∀ a, NoU
     show NoUnsupported (f x >>= fun _ => xs.forM f)
     exact NoUnsupported.bind (hf x) (fun _ => NoUnsupported.forM f hf xs)
 
+private theorem mapM_loop_noUnsupported {α β : Type} (f : α → Interp β)
+    (hf : ∀ a, NoUnsupported (f a)) :
+    ∀ (xs : List α) (acc : List β), NoUnsupported (List.mapM.loop f xs acc)
+  | [], acc => NoUnsupported.pure _
+  | x :: xs, acc => by
+    simp only [List.mapM.loop]
+    exact NoUnsupported.bind (hf x) (fun y => mapM_loop_noUnsupported f hf xs (y :: acc))
+
+theorem NoUnsupported.mapM {α β : Type} (f : α → Interp β) (hf : ∀ a, NoUnsupported (f a))
+    (xs : List α) : NoUnsupported (xs.mapM f) :=
+  mapM_loop_noUnsupported f hf xs []
+
+theorem NoUnsupported.tryMapM {α β : Type} (f : α → Interp (Option β))
+    (hf : ∀ a, NoUnsupported (f a)) :
+    ∀ xs : List α, NoUnsupported (Interp.tryMapM f xs)
+  | [] => NoUnsupported.pure (some [])
+  | x :: xs => by
+    unfold Interp.tryMapM
+    refine NoUnsupported.bind (hf x) (fun o => ?_)
+    cases o with
+    | none => exact NoUnsupported.pure none
+    | some y =>
+      refine NoUnsupported.bind (NoUnsupported.tryMapM f hf xs) (fun os => ?_)
+      cases os with
+      | none => exact NoUnsupported.pure none
+      | some ys => exact NoUnsupported.pure (some (y :: ys))
+
+theorem NoUnsupported.foldlM {α β : Type} (f : β → α → Interp β)
+    (hf : ∀ b a, NoUnsupported (f b a)) :
+    ∀ (xs : List α) (init : β), NoUnsupported (xs.foldlM f init)
+  | [], init => NoUnsupported.pure init
+  | x :: xs, init => by
+    show NoUnsupported (f init x >>= fun b' => xs.foldlM f b')
+    exact NoUnsupported.bind (hf init x) (fun b' => NoUnsupported.foldlM f hf xs b')
+
 /-! ## `Machine::vtable_from_ptr` -/
 
 section Polymorphic
@@ -743,6 +778,96 @@ theorem checkPtrM_traitObject_vtable_cases (m : Machine M)
   · rw [hnf, (checkPtrM_vtablePtr_eq_ok_iff m _ traitName).2 ⟨hinv, rfl, vtable, hv, ht⟩,
       okBind, vtableLookupM_of_vtableFromPtrM_ok m vp vtable hv, okBind]
 
+/-- **`check_ptr` at a custom DST struct whose unsized tail is a trait object**
+(`LayoutStrategy.Tuple head (.TraitObject traitName)`): accepts the pointer iff its address
+fits `usize`, its metadata is a valid vtable pointer for `traitName`, and the safe-pointer tail
+holds for the combined dynamic `(size, align) = TupleHeadLayout.full_size_and_align head
+vtable.size vtable.align`. -/
+theorem checkPtrM_tupleTraitObject_eq_ok_iff (m : Machine M)
+    (ptr : Pointer (Memory.Provenance M)) (ptrTy : PtrType) (pointee : PointeeInfo)
+    (head : TupleHeadLayout) (traitName : TraitName)
+    (hsafe : PtrType.safe_pointee ptrTy = some pointee)
+    (hlay : pointee.layout = .Tuple head (.TraitObject traitName)) :
+    checkPtrM ptr ptrTy (some m) = .ok () ↔
+      inBounds ptr.thin_pointer.addr .Unsigned x86_64.PTR_SIZE = true ∧
+      ∃ vp vtable, ptr.metadata = some (.VTablePointer vp) ∧
+        inBounds vp.addr .Unsigned x86_64.PTR_SIZE = true ∧
+        vtableFromPtrM m vp = .ok vtable ∧ vtable.trait_name = traitName ∧
+        let (fullSize, fullAlign) := TupleHeadLayout.full_size_and_align head vtable.size vtable.align
+        inBounds fullSize.bytes .Signed x86_64.PTR_SIZE = true ∧
+        ptr.thin_pointer.addr ≠ 0 ∧
+        Align.is_aligned fullAlign ptr.thin_pointer.addr = true ∧
+        pointee.inhabited = true ∧
+        ConcurrentMemory.dereferenceable m.mem ptr.thin_pointer fullSize = .ok () := by
+  have hmk : PtrType.meta_kind ptrTy = .VTablePointer traitName := by
+    cases ptrTy with
+    | Ref _ p =>
+      cases Option.some.inj hsafe
+      simp only [PtrType.meta_kind, hlay, LayoutStrategy.meta_kind]
+    | Box p =>
+      cases Option.some.inj hsafe
+      simp only [PtrType.meta_kind, hlay, LayoutStrategy.meta_kind]
+    | Raw _ => cases hsafe
+    | FnPtr => cases hsafe
+    | VTablePtr _ => cases hsafe
+  rcases ptr with ⟨tp, md⟩
+  cases hin : inBounds tp.addr .Unsigned x86_64.PTR_SIZE with
+  | false =>
+    rw [checkPtrM_oob_ub _ _ _ hin]
+    constructor
+    · intro h; cases h
+    · rintro ⟨h, _⟩; cases h
+  | true =>
+    rcases md with _ | (num | vp)
+    · have hub : checkPtrM ⟨tp, none⟩ ptrTy (some m) = .error (.ub "Value::Ptr: invalid metadata") := by
+        unfold checkPtrM; rw [hmk, hin, ensureElseUb_true, okBind]; rfl
+      rw [hub]
+      constructor
+      · intro h; cases h
+      · rintro ⟨_, _, _, h, _⟩; cases h
+    · have hub : checkPtrM ⟨tp, some (.ElementCount num)⟩ ptrTy (some m) =
+          .error (.ub "Value::Ptr: invalid metadata") := by
+        unfold checkPtrM; rw [hmk, hin, ensureElseUb_true, okBind]; rfl
+      rw [hub]
+      constructor
+      · intro h; cases h
+      · rintro ⟨_, _, _, h, _⟩; cases h
+    · have hnf : checkPtrM ⟨tp, some (.VTablePointer vp)⟩ ptrTy (some m) =
+          (checkPtrM ⟨vp, none⟩ (.VTablePtr traitName) (some m) >>= fun _ =>
+            vtableLookupM m vp >>= fun vtable =>
+              let (fullSize, fullAlign) :=
+                TupleHeadLayout.full_size_and_align head vtable.size vtable.align
+              safePtrTail m tp pointee fullSize fullAlign) := by
+        unfold checkPtrM
+        rw [hmk, hsafe]
+        dsimp only
+        rw [hin, ensureElseUb_true, okBind, hlay, checkPtrMetadataM_vtablePointer_eq_checkPtrM]
+        refine bindCongr rfl (fun _ => ?_)
+        have hcsa :
+            LayoutStrategy.compute_size_and_align (vtableLookupM m)
+              (.Tuple head (.TraitObject traitName)) (some (.VTablePointer vp)) =
+            (vtableLookupM m vp >>= fun vtable =>
+              Pure.pure (TupleHeadLayout.full_size_and_align head vtable.size vtable.align)) := by
+          simp only [LayoutStrategy.compute_size_and_align]
+          cases vtableLookupM m vp <;> rfl
+        rw [hcsa]
+        cases vtableLookupM m vp with
+        | error e => rfl
+        | ok vtable => rfl
+      rw [hnf, bind_eq_ok_iff]
+      constructor
+      · rintro ⟨_, hmeta, htail⟩
+        rcases (checkPtrM_vtablePtr_eq_ok_iff m _ traitName).1 hmeta with
+          ⟨hinv, _, vtable, hv, ht⟩
+        rw [vtableLookupM_of_vtableFromPtrM_ok m vp vtable hv, okBind] at htail
+        rcases (safePtrTail_eq_ok_iff m tp pointee _ _).1 htail with ⟨h1, h2, h3, h4, h5⟩
+        exact ⟨rfl, vp, vtable, rfl, hinv, hv, ht, h1, h2, h3, h4, h5⟩
+      · rintro ⟨_, vp', vtable, hmd, hinv, hv, ht, h1, h2, h3, h4, h5⟩
+        cases hmd
+        refine ⟨(), (checkPtrM_vtablePtr_eq_ok_iff m _ traitName).2 ⟨hinv, rfl, vtable, hv, ht⟩, ?_⟩
+        rw [vtableLookupM_of_vtableFromPtrM_ok m vp vtable hv, okBind]
+        exact (safePtrTail_eq_ok_iff m tp pointee _ _).2 ⟨h1, h2, h3, h4, h5⟩
+
 /-! ## With a machine, validity checking never stops with `Stop.unsupported` -/
 
 /-- Memories whose `dereferenceable` never reports `Stop.unsupported` (`BasicMemory` and
@@ -942,6 +1067,452 @@ theorem expect_size_noUnsupported (l : LayoutStrategy) (msg : String) :
     | exact NoUnsupported.pure _
     | exact NoUnsupported.specPanic _
 
+theorem expect_align_noUnsupported (l : LayoutStrategy) (msg : String) :
+    NoUnsupported (LayoutStrategy.expect_align l msg) := by
+  unfold LayoutStrategy.expect_align
+  cases l <;> first
+    | exact NoUnsupported.pure _
+    | exact NoUnsupported.specPanic _
+
+theorem intType_align_noUnsupported (t : IntType) : NoUnsupported (IntType.align t) := by
+  unfold IntType.align
+  cases alignFromBytes t.size.bytes with
+  | some _ => exact NoUnsupported.pure _
+  | none => exact NoUnsupported.specPanic _
+
+theorem size_mulInt_noUnsupported (s : Size) (n : Int) : NoUnsupported (Size.mulInt s n) := by
+  unfold Size.mulInt
+  cases Size.from_bytes ((s.bytes : Int) * n) with
+  | some _ => exact NoUnsupported.pure _
+  | none => exact NoUnsupported.specPanic _
+
+theorem subsliceWithLength_noUnsupported {T : Type} (xs : List T) (start len : Int) :
+    NoUnsupported (subsliceWithLength xs start len) := by
+  unfold subsliceWithLength
+  split
+  · exact NoUnsupported.pure _
+  · exact NoUnsupported.specPanic _
+
+theorem writeSubsliceAtIndex_noUnsupported {T : Type} (xs : List T) (start : Int) (src : List T) :
+    NoUnsupported (writeSubsliceAtIndex xs start src) := by
+  unfold writeSubsliceAtIndex
+  split
+  · exact NoUnsupported.pure _
+  · exact NoUnsupported.specPanic _
+
+/-- `Type::layout` never stops with `Stop.unsupported`, for every MiniRust type. -/
+theorem type_layout_noUnsupported : ∀ (ty : «Type»), NoUnsupported (Type.layout ty)
+  | .Int t =>
+    NoUnsupported.bind (intType_align_noUnsupported t) (fun _ => NoUnsupported.pure _)
+  | .Bool => NoUnsupported.pure _
+  | .Ptr p => by
+    unfold Type.layout
+    split <;> exact NoUnsupported.pure _
+  | .Union _ _ _ _ => NoUnsupported.pure _
+  | .Enum _ _ _ _ _ => NoUnsupported.pure _
+  | .Tuple _ _ none => NoUnsupported.pure _
+  | .Tuple _ _ (some tailTy) =>
+    NoUnsupported.bind (type_layout_noUnsupported tailTy) (fun _ => NoUnsupported.pure _)
+  | .Array elem count =>
+    NoUnsupported.bind (type_layout_noUnsupported elem) (fun l =>
+      NoUnsupported.bind (expect_size_noUnsupported l _) (fun sz =>
+        NoUnsupported.bind (expect_align_noUnsupported l _) (fun _ =>
+          NoUnsupported.bind (size_mulInt_noUnsupported sz count) (fun _ =>
+            NoUnsupported.pure _))))
+  | .Slice elem =>
+    NoUnsupported.bind (type_layout_noUnsupported elem) (fun l =>
+      NoUnsupported.bind (expect_size_noUnsupported l _) (fun _ =>
+        NoUnsupported.bind (type_layout_noUnsupported elem) (fun l' =>
+          NoUnsupported.bind (expect_align_noUnsupported l' _) (fun _ =>
+            NoUnsupported.pure _))))
+  | .TraitObject _ => NoUnsupported.pure _
+
+omit [MemoryOps M] in
+theorem decodeIntM_noUnsupported (t : IntType)
+    (bytes : List (AbstractByte (Memory.Provenance M))) :
+    NoUnsupported (Type.decodeIntM (M := M) t bytes) := by
+  rcases t with ⟨sg, sz⟩
+  dsimp only [Type.decodeIntM]
+  split
+  · exact NoUnsupported.specPanic _
+  · cases bytes.mapM AbstractByte.dataM <;> exact NoUnsupported.pure _
+
+omit [MemoryOps M] in
+theorem encodeIntM_noUnsupported (t : IntType) (val : Value M) :
+    NoUnsupported (Type.encodeIntM (M := M) t val) := by
+  rcases t with ⟨sg, sz⟩
+  cases val with
+  | Int i =>
+    dsimp only [Type.encodeIntM]
+    cases Endianness.encode x86_64.ENDIANNESS sg sz i with
+    | some _ => exact NoUnsupported.pure _
+    | none => exact NoUnsupported.specPanic _
+  | _ => exact NoUnsupported.specPanic _
+
+theorem decodePtrM_noUnsupported (bytes : List (AbstractByte (Memory.Provenance M))) :
+    NoUnsupported (decodePtrM (M := M) bytes) := by
+  unfold decodePtrM
+  split
+  · exact NoUnsupported.specPanic _
+  · cases bytes.mapM AbstractByte.dataM <;> exact NoUnsupported.pure _
+
+omit [MemoryOps M] in
+theorem encodePtrM_noUnsupported (ptr : ThinPointer (Memory.Provenance M)) :
+    NoUnsupported (encodePtrM (M := M) ptr) := by
+  unfold encodePtrM
+  cases Endianness.encode x86_64.ENDIANNESS .Unsigned x86_64.PTR_SIZE ptr.addr with
+  | some _ => exact NoUnsupported.pure _
+  | none => exact NoUnsupported.specPanic _
+
+omit [MemoryOps M] in
+theorem decodeValueM_noUnsupported (mk : PointerMetaKind) (v : Value M) :
+    NoUnsupported (PointerMetaKind.decode_valueM (M := M) mk v) := by
+  cases mk <;> cases v <;> first
+    | exact NoUnsupported.pure _
+    | exact NoUnsupported.specPanic _
+    | (rename_i xs; cases xs <;> first | exact NoUnsupported.pure _ | exact NoUnsupported.specPanic _)
+    | (rename_i p; rcases p with ⟨_, md⟩; cases md <;> first | exact NoUnsupported.pure _ | exact NoUnsupported.specPanic _)
+
+omit [MemoryOps M] in
+theorem encodeAsValueM_noUnsupported (mk : PointerMetaKind)
+    (md : Option (PointerMeta (Memory.Provenance M))) :
+    NoUnsupported (PointerMetaKind.encode_as_valueM (M := M) mk md) := by
+  cases mk <;> rcases md with _ | (_ | _) <;> first
+    | exact NoUnsupported.pure _
+    | exact NoUnsupported.specPanic _
+
+theorem decodeMetaFieldM_noUnsupported (mk : PointerMetaKind)
+    (bytes : List (AbstractByte (Memory.Provenance M))) :
+    NoUnsupported (decodeMetaFieldM (M := M) mk bytes) := by
+  cases mk with
+  | ElementCount =>
+    unfold decodeMetaFieldM
+    exact decodeIntM_noUnsupported (M := M) _ _
+  | VTablePointer _ =>
+    unfold decodeMetaFieldM
+    refine NoUnsupported.bind (decodePtrM_noUnsupported (M := M) bytes) (fun o => ?_)
+    cases o <;> exact NoUnsupported.pure _
+  | None => exact NoUnsupported.specPanic _
+
+theorem decodeWidePtrM_noUnsupported (mk : PointerMetaKind)
+    (bytes : List (AbstractByte (Memory.Provenance M))) :
+    NoUnsupported (decodeWidePtrM (M := M) mk bytes) := by
+  unfold decodeWidePtrM
+  split
+  · exact NoUnsupported.specPanic _
+  · refine NoUnsupported.bind (decodePtrM_noUnsupported (M := M) _) (fun o1 => ?_)
+    cases o1 with
+    | none => exact NoUnsupported.pure _
+    | some thin =>
+      refine NoUnsupported.bind (decodeMetaFieldM_noUnsupported (M := M) mk _) (fun o2 => ?_)
+      cases o2 with
+      | none => exact NoUnsupported.pure _
+      | some mv =>
+        refine NoUnsupported.bind (decodeValueM_noUnsupported (M := M) mk mv) (fun pm => ?_)
+        cases pm with
+        | some _ => exact NoUnsupported.pure _
+        | none => exact NoUnsupported.specPanic _
+
+omit [MemoryOps M] in
+theorem encodeWidePtrM_noUnsupported (mk : PointerMetaKind)
+    (ptr : Pointer (Memory.Provenance M)) :
+    NoUnsupported (encodeWidePtrM (M := M) mk ptr) := by
+  unfold encodeWidePtrM
+  refine NoUnsupported.bind (encodeAsValueM_noUnsupported (M := M) mk ptr.metadata) (fun mv => ?_)
+  refine NoUnsupported.bind (encodePtrM_noUnsupported (M := M) ptr.thin_pointer) (fun _ => ?_)
+  cases mk with
+  | ElementCount =>
+    exact NoUnsupported.bind (encodeIntM_noUnsupported (M := M) _ mv) (fun _ => NoUnsupported.pure _)
+  | VTablePointer _ =>
+    cases mv with
+    | Ptr p =>
+      rcases p with ⟨vp, md⟩
+      cases md with
+      | none =>
+        exact NoUnsupported.bind (encodePtrM_noUnsupported (M := M) vp)
+          (fun _ => NoUnsupported.pure _)
+      | some _ =>
+        exact NoUnsupported.bind (NoUnsupported.specPanic _) (fun _ => NoUnsupported.pure _)
+    | _ =>
+      exact NoUnsupported.bind (NoUnsupported.specPanic _) (fun _ => NoUnsupported.pure _)
+  | None =>
+    exact NoUnsupported.bind (NoUnsupported.specPanic _) (fun _ => NoUnsupported.pure _)
+
+section MemOnlyNoUnsupported
+
+omit [MemoryOps M]
+
+mutual
+
+theorem decodeDiscriminantM_noUnsupported {σ : Type}
+    (accessor : σ → Offset → Size → Interp (List (AbstractByte (Memory.Provenance M)) × σ))
+    (hacc : ∀ s o sz, NoUnsupported (accessor s o sz)) :
+    ∀ (d : Discriminator) (s : σ), NoUnsupported (decodeDiscriminantM (M := M) accessor d s)
+  | .Known _, _ => NoUnsupported.pure _
+  | .Invalid, _ => NoUnsupported.pure _
+  | .Branch off vt fb ⟨children⟩, s => by
+    dsimp only [decodeDiscriminantM]
+    refine NoUnsupported.bind (hacc s off vt.size) (fun ⟨bs, s'⟩ => ?_)
+    refine NoUnsupported.bind (decodeIntM_noUnsupported (M := M) vt bs) (fun o => ?_)
+    cases o with
+    | some v =>
+      cases v with
+      | Int val =>
+        exact decodeDiscriminantChildrenM_noUnsupported accessor hacc val
+          (decodeDiscriminantM (M := M) accessor fb)
+          (fun s'' => decodeDiscriminantM_noUnsupported accessor hacc fb s'') children s'
+      | _ => exact NoUnsupported.pure _
+    | none => exact NoUnsupported.pure _
+
+theorem decodeDiscriminantChildrenM_noUnsupported {σ : Type}
+    (accessor : σ → Offset → Size → Interp (List (AbstractByte (Memory.Provenance M)) × σ))
+    (hacc : ∀ s o sz, NoUnsupported (accessor s o sz))
+    (val : Int) (onFallback : σ → Interp (Option Int × σ))
+    (hfb : ∀ s, NoUnsupported (onFallback s)) :
+    ∀ (children : List ((Int × Int) × Discriminator)) (s : σ),
+      NoUnsupported (decodeDiscriminantChildrenM (M := M) accessor val onFallback children s)
+  | [], s => hfb s
+  | ((lo, hi), child) :: rest, s => by
+    dsimp only [decodeDiscriminantChildrenM]
+    split
+    · exact decodeDiscriminantM_noUnsupported accessor hacc child s
+    · exact decodeDiscriminantChildrenM_noUnsupported accessor hacc val onFallback hfb rest s
+
+end
+
+end MemOnlyNoUnsupported
+
+omit [MemoryOps M] in
+theorem encodeDiscriminantM_noUnsupported {σ : Type}
+    (accessor : σ → Offset → List (AbstractByte (Memory.Provenance M)) → Interp σ)
+    (hacc : ∀ s o bs, NoUnsupported (accessor s o bs))
+    (tagger : Map Offset (IntType × Int)) (s : σ) :
+    NoUnsupported (encodeDiscriminantM (M := M) accessor tagger s) := by
+  unfold encodeDiscriminantM
+  refine NoUnsupported.foldlM _ (fun s' entry => ?_) tagger.entries s
+  rcases entry with ⟨off, vt, val⟩
+  exact NoUnsupported.bind (encodeIntM_noUnsupported (M := M) vt (.Int val))
+    (fun bs => hacc s' off bs)
+
+omit [MemoryOps M] in
+theorem encodeUnionChunksM_noUnsupported :
+    ∀ (chunks : List (Offset × Size))
+      (chunkData : List (List (AbstractByte (Memory.Provenance M))))
+      (bytes : List (AbstractByte (Memory.Provenance M))),
+      NoUnsupported (Type.encodeUnionChunksM (M := M) chunks chunkData bytes)
+  | [], _, _ => NoUnsupported.pure _
+  | (_ :: _), [], _ => NoUnsupported.pure _
+  | (off, sz) :: chunks, data :: chunkData, bytes => by
+    dsimp only [Type.encodeUnionChunksM]
+    split
+    · exact NoUnsupported.specPanic _
+    · exact NoUnsupported.bind (writeSubsliceAtIndex_noUnsupported bytes off.bytes data)
+        (fun bytes' => encodeUnionChunksM_noUnsupported chunks chunkData bytes')
+
+mutual
+
+/-- `Type::decode` never stops with `Stop.unsupported`, for every MiniRust type and byte list. -/
+theorem type_decodeM_noUnsupported :
+    ∀ (ty : «Type») (bytes : List (AbstractByte (Memory.Provenance M))),
+      NoUnsupported (Type.decodeM (M := M) ty bytes)
+  | .Bool, bytes => by
+    dsimp only [Type.decodeM]
+    split
+    · exact NoUnsupported.specPanic _
+    · split <;> exact NoUnsupported.pure _
+  | .Int t, bytes => decodeIntM_noUnsupported (M := M) t bytes
+  | .Tuple fields headLayout unsizedField, bytes => by
+    dsimp only [Type.decodeM]
+    cases unsizedField with
+    | some _ => exact NoUnsupported.specPanic _
+    | none =>
+      dsimp only
+      split
+      · exact NoUnsupported.specPanic _
+      · refine NoUnsupported.bind (type_decodeFieldsM_noUnsupported fields bytes) (fun o => ?_)
+        cases o <;> exact NoUnsupported.pure _
+  | .Array elem count, bytes => by
+    dsimp only [Type.decodeM]
+    refine NoUnsupported.bind (type_layout_noUnsupported elem) (fun l => ?_)
+    refine NoUnsupported.bind (expect_size_noUnsupported l _) (fun esz => ?_)
+    refine NoUnsupported.bind (size_mulInt_noUnsupported esz count) (fun fsz => ?_)
+    split
+    · exact NoUnsupported.specPanic _
+    · refine NoUnsupported.bind
+        (NoUnsupported.mapM _ (fun _ => subsliceWithLength_noUnsupported bytes _ _) _)
+        (fun chunks => ?_)
+      refine NoUnsupported.bind
+        (NoUnsupported.tryMapM _ (fun eb => type_decodeM_noUnsupported elem eb) chunks)
+        (fun _ => NoUnsupported.pure _)
+  | .Union _ chunks _ _, bytes => by
+    dsimp only [Type.decodeM]
+    split
+    · exact NoUnsupported.specPanic _
+    · exact NoUnsupported.bind
+        (NoUnsupported.mapM _ (fun c => subsliceWithLength_noUnsupported bytes c.1.bytes c.2.bytes)
+          chunks)
+        (fun _ => NoUnsupported.pure _)
+  | .Enum ⟨variants⟩ _ disc _ _, bytes => by
+    dsimp only [Type.decodeM]
+    split
+    · exact NoUnsupported.specPanic _
+    · refine NoUnsupported.bind
+        (decodeDiscriminantM_noUnsupported (M := M)
+          (fun _ off sz =>
+            subsliceWithLength bytes off.bytes sz.bytes >>= fun bs => Pure.pure (bs, ()))
+          (fun _ off sz =>
+            NoUnsupported.bind (subsliceWithLength_noUnsupported bytes off.bytes sz.bytes)
+              (fun _ => NoUnsupported.pure _))
+          disc ())
+        (fun ⟨dOpt, _⟩ => ?_)
+      cases dOpt with
+      | none => exact NoUnsupported.pure _
+      | some d =>
+        refine NoUnsupported.bind (type_decodeVariantM_noUnsupported variants d bytes) (fun o => ?_)
+        cases o <;> exact NoUnsupported.pure _
+  | .Slice _, _ => NoUnsupported.specPanic _
+  | .TraitObject _, _ => NoUnsupported.specPanic _
+  | .Ptr ptrType, bytes => by
+    dsimp only [Type.decodeM]
+    cases PtrType.as_wide_pair ptrType with
+    | some _ => exact decodeWidePtrM_noUnsupported (M := M) _ bytes
+    | none =>
+      refine NoUnsupported.bind (decodePtrM_noUnsupported (M := M) bytes) (fun o => ?_)
+      cases o <;> exact NoUnsupported.pure _
+
+theorem type_decodeFieldsM_noUnsupported :
+    ∀ (fields : List (Offset × «Type»)) (bytes : List (AbstractByte (Memory.Provenance M))),
+      NoUnsupported (Type.decodeFieldsM (M := M) fields bytes)
+  | [], _ => NoUnsupported.pure _
+  | (off, ty) :: rest, bytes => by
+    dsimp only [Type.decodeFieldsM]
+    refine NoUnsupported.bind (type_layout_noUnsupported ty) (fun l => ?_)
+    refine NoUnsupported.bind (expect_size_noUnsupported l _) (fun sz => ?_)
+    refine NoUnsupported.bind (subsliceWithLength_noUnsupported bytes off.bytes sz.bytes)
+      (fun sub => ?_)
+    refine NoUnsupported.bind (type_decodeM_noUnsupported ty sub) (fun o => ?_)
+    cases o with
+    | none => exact NoUnsupported.pure _
+    | some _ =>
+      refine NoUnsupported.bind (type_decodeFieldsM_noUnsupported rest bytes) (fun os => ?_)
+      cases os <;> exact NoUnsupported.pure _
+
+theorem type_decodeVariantM_noUnsupported :
+    ∀ (variants : List (Int × Variant)) (disc : Int)
+      (bytes : List (AbstractByte (Memory.Provenance M))),
+      NoUnsupported (Type.decodeVariantM (M := M) variants disc bytes)
+  | [], _, _ => NoUnsupported.specPanic _
+  | (d, ⟨ty, _⟩) :: rest, disc, bytes => by
+    dsimp only [Type.decodeVariantM]
+    split
+    · exact type_decodeM_noUnsupported ty bytes
+    · exact type_decodeVariantM_noUnsupported rest disc bytes
+
+end
+
+section EncodeNoUnsupported
+
+omit [MemoryOps M]
+
+mutual
+
+/-- `Type::encode` never stops with `Stop.unsupported`, for every MiniRust type and value. -/
+theorem type_encodeM_noUnsupported :
+    ∀ (ty : «Type») (val : Value M), NoUnsupported (Type.encodeM (M := M) ty val)
+  | .Bool, .Bool _ => NoUnsupported.pure _
+  | .Bool, .Int _ => NoUnsupported.specPanic _
+  | .Bool, .Ptr _ => NoUnsupported.specPanic _
+  | .Bool, .Tuple _ => NoUnsupported.specPanic _
+  | .Bool, .Union _ => NoUnsupported.specPanic _
+  | .Bool, .Variant _ _ => NoUnsupported.specPanic _
+  | .Int t, val => encodeIntM_noUnsupported (M := M) t val
+  | .Tuple fields headLayout unsizedField, val => by
+    dsimp only [Type.encodeM]
+    cases unsizedField with
+    | some _ => exact NoUnsupported.specPanic _
+    | none =>
+      cases val with
+      | Tuple vals =>
+        dsimp only
+        split
+        · exact NoUnsupported.specPanic _
+        · exact type_encodeFieldsM_noUnsupported fields vals _
+      | _ => exact NoUnsupported.specPanic _
+  | .Array elem count, val => by
+    cases val with
+    | Tuple vals =>
+      dsimp only [Type.encodeM]
+      split
+      · exact NoUnsupported.specPanic _
+      · refine NoUnsupported.bind
+          (NoUnsupported.mapM _ (fun v =>
+            NoUnsupported.bind (type_encodeM_noUnsupported elem v) (fun bs =>
+              NoUnsupported.bind (type_layout_noUnsupported elem) (fun l =>
+                NoUnsupported.bind (expect_size_noUnsupported l _) (fun esz => by
+                  split
+                  · exact NoUnsupported.specPanic _
+                  · exact NoUnsupported.pure _)))) vals)
+          (fun _ => NoUnsupported.pure _)
+    | _ => exact NoUnsupported.specPanic _
+  | .Union _ chunks _ _, val => by
+    dsimp only [Type.encodeM]
+    cases val with
+    | Union chunkData =>
+      dsimp only
+      split
+      · exact NoUnsupported.specPanic _
+      · exact encodeUnionChunksM_noUnsupported chunks chunkData _
+    | _ => exact NoUnsupported.specPanic _
+  | .Enum ⟨variants⟩ _ _ _ _, val => by
+    dsimp only [Type.encodeM]
+    cases val with
+    | Variant disc data => exact type_encodeVariantM_noUnsupported variants disc data
+    | _ => exact NoUnsupported.specPanic _
+  | .Slice _, _ => NoUnsupported.specPanic _
+  | .TraitObject _, _ => NoUnsupported.specPanic _
+  | .Ptr ptrType, val => by
+    dsimp only [Type.encodeM]
+    cases val with
+    | Ptr ptr =>
+      rcases ptr with ⟨thin, md⟩
+      cases PtrType.as_wide_pair ptrType with
+      | some _ => exact encodeWidePtrM_noUnsupported (M := M) _ ⟨thin, md⟩
+      | none =>
+        cases md with
+        | none => exact encodePtrM_noUnsupported (M := M) thin
+        | some _ => exact NoUnsupported.specPanic _
+    | _ => exact NoUnsupported.specPanic _
+
+theorem type_encodeFieldsM_noUnsupported :
+    ∀ (fields : List (Offset × «Type»)) (vals : List (Value M))
+      (bytes : List (AbstractByte (Memory.Provenance M))),
+      NoUnsupported (Type.encodeFieldsM (M := M) fields vals bytes)
+  | [], _, _ => NoUnsupported.pure _
+  | (_ :: _), [], _ => NoUnsupported.pure _
+  | (off, ty) :: fields, v :: vals, bytes => by
+    dsimp only [Type.encodeFieldsM]
+    refine NoUnsupported.bind (type_encodeM_noUnsupported ty v) (fun fb => ?_)
+    refine NoUnsupported.bind (writeSubsliceAtIndex_noUnsupported bytes off.bytes fb) (fun bs' => ?_)
+    exact type_encodeFieldsM_noUnsupported fields vals bs'
+
+theorem type_encodeVariantM_noUnsupported :
+    ∀ (variants : List (Int × Variant)) (disc : Int) (data : Value M),
+      NoUnsupported (Type.encodeVariantM (M := M) variants disc data)
+  | [], _, _ => NoUnsupported.specPanic _
+  | (d, ⟨ty, tagger⟩) :: rest, disc, data => by
+    dsimp only [Type.encodeVariantM]
+    split
+    · refine NoUnsupported.bind (type_encodeM_noUnsupported ty data) (fun bs => ?_)
+      exact encodeDiscriminantM_noUnsupported (M := M)
+        (fun bytes off vbs => writeSubsliceAtIndex bytes off.bytes vbs)
+        (fun bytes off vbs => writeSubsliceAtIndex_noUnsupported bytes off.bytes vbs)
+        tagger bs
+    · exact type_encodeVariantM_noUnsupported rest disc data
+
+end
+
+end EncodeNoUnsupported
+
 /-- **`transmute` with a machine: the validity check contributes no
 `Stop.unsupported`.** `Machine::transmute` never stops with `unsupported` whenever its
 machine-independent re-encoding (`Type::layout`, `type1.encode`, `type2.decode`) does
@@ -968,6 +1539,15 @@ theorem transmuteM_noUnsupported (hderef : DerefNoUnsupported M) (m : Machine M)
       exact NoUnsupported.bind (checkValueM_noUnsupported hderef m raw type2)
         (fun _ => NoUnsupported.pure _)
 
+/-- **Unconditional `transmute` `Stop.unsupported`-freedom**: `Machine::transmute` with a
+machine NEVER stops with `Stop.unsupported`, for every value and every pair of types. -/
+theorem transmuteM_noUnsupported_uncond (hderef : DerefNoUnsupported M) (m : Machine M)
+    (val : Value M) (type1 type2 : «Type») :
+    NoUnsupported (transmuteM val type1 type2 (some m)) :=
+  transmuteM_noUnsupported hderef m val type1 type2
+    (type_layout_noUnsupported type1) (type_layout_noUnsupported type2)
+    (type_encodeM_noUnsupported type1 val) (type_decodeM_noUnsupported type2)
+
 /-- **`eval_un_op` for `CastOp::Transmute` with a machine: the validity check
 contributes no `Stop.unsupported`** (see `transmuteM_noUnsupported`). -/
 theorem evalUnOpM_transmute_noUnsupported (hderef : DerefNoUnsupported M) (m : Machine M)
@@ -988,6 +1568,16 @@ theorem evalUnOpM_transmute_noUnsupported (hderef : DerefNoUnsupported M) (m : M
   · exact NoUnsupported.bind
       (transmuteM_noUnsupported hderef m operand oldTy newTy hl1 hl2 henc hdec)
       (fun _ => NoUnsupported.pure _)
+
+/-- **Unconditional `CastOp::Transmute` `Stop.unsupported`-freedom**: `eval_un_op` for
+`CastOp::Transmute` with a machine NEVER stops with `Stop.unsupported`, for every operand
+and every pair of types. -/
+theorem evalUnOpM_transmute_noUnsupported_uncond (hderef : DerefNoUnsupported M) (m : Machine M)
+    (newTy oldTy : «Type») (operand : Value M) :
+    NoUnsupported (evalUnOpM (.Cast (.Transmute newTy)) (operand, oldTy) (some m)) :=
+  evalUnOpM_transmute_noUnsupported hderef m newTy oldTy operand
+    (type_layout_noUnsupported oldTy) (type_layout_noUnsupported newTy)
+    (type_encodeM_noUnsupported oldTy operand) (type_decodeM_noUnsupported newTy)
 
 /-- `Type::layout` of a pointer type never stops with `Stop.unsupported`. -/
 theorem layout_ptr_noUnsupported (p : PtrType) : NoUnsupported (Type.layout (.Ptr p)) := by
@@ -1090,6 +1680,20 @@ theorem evalUnOpTB_transmute_noUnsupported (mt : MachTB) (newTy oldTy : «Type»
     NoUnsupported (evalUnOpM (.Cast (.Transmute newTy)) (operand, oldTy) (some mt)) :=
   evalUnOpM_transmute_noUnsupported derefNoUnsupported_TBM mt newTy oldTy operand
     hl1 hl2 henc hdec
+
+/-- **Unconditional `CastOp::Transmute` on `MachTB`**: never stops with `Stop.unsupported`,
+for every operand and every pair of MiniRust types. -/
+theorem evalUnOpTB_transmute_noUnsupported_uncond (mt : MachTB) (newTy oldTy : «Type»)
+    (operand : Value TBM) :
+    NoUnsupported (evalUnOpM (.Cast (.Transmute newTy)) (operand, oldTy) (some mt)) :=
+  evalUnOpM_transmute_noUnsupported_uncond derefNoUnsupported_TBM mt newTy oldTy operand
+
+/-- **Unconditional `CastOp::Transmute` on polymorphic `Mach` (`BM`)**: never stops with
+`Stop.unsupported`, for every operand and every pair of MiniRust types. -/
+theorem evalUnOpBM_transmute_noUnsupported_uncond (m : Mach) (newTy oldTy : «Type»)
+    (operand : Val) :
+    NoUnsupported (evalUnOpM (M := BM) (.Cast (.Transmute newTy)) (operand, oldTy) (some m)) :=
+  evalUnOpM_transmute_noUnsupported_uncond derefNoUnsupported_BM m newTy oldTy operand
 
 /-! ## `Mach`: the `BasicMemory` transcription is the polymorphic one -/
 
@@ -1256,6 +1860,26 @@ theorem checkPtr_traitObject_eq_ok_iff (m : Mach) (ptr : Pointer Prov) (ptrTy : 
   rw [checkPtr_eq_checkPtrM, vtableFromPtr_eq_vtableFromPtrM]
   exact checkPtrM_traitObject_eq_ok_iff (M := BM) m ptr ptrTy pointee traitName hsafe hlay
 
+/-- `check_ptr` on `Mach` at a custom DST struct with a trait-object tail
+(`LayoutStrategy.Tuple head (.TraitObject traitName)`). -/
+theorem checkPtr_tupleTraitObject_eq_ok_iff (m : Mach) (ptr : Pointer Prov) (ptrTy : PtrType)
+    (pointee : PointeeInfo) (head : TupleHeadLayout) (traitName : TraitName)
+    (hsafe : PtrType.safe_pointee ptrTy = some pointee)
+    (hlay : pointee.layout = .Tuple head (.TraitObject traitName)) :
+    checkPtr ptr ptrTy (some m) = .ok () ↔
+      inBounds ptr.thin_pointer.addr .Unsigned x86_64.PTR_SIZE = true ∧
+      ∃ vp vtable, ptr.metadata = some (.VTablePointer vp) ∧
+        inBounds vp.addr .Unsigned x86_64.PTR_SIZE = true ∧
+        vtableFromPtr m vp = .ok vtable ∧ vtable.trait_name = traitName ∧
+        let (fullSize, fullAlign) := TupleHeadLayout.full_size_and_align head vtable.size vtable.align
+        inBounds fullSize.bytes .Signed x86_64.PTR_SIZE = true ∧
+        ptr.thin_pointer.addr ≠ 0 ∧
+        Align.is_aligned fullAlign ptr.thin_pointer.addr = true ∧
+        pointee.inhabited = true ∧
+        CM.dereferenceable m.mem ptr.thin_pointer fullSize = .ok () := by
+  rw [checkPtr_eq_checkPtrM, vtableFromPtr_eq_vtableFromPtrM]
+  exact checkPtrM_tupleTraitObject_eq_ok_iff (M := BM) m ptr ptrTy pointee head traitName hsafe hlay
+
 /-- `check_ptr` on `Mach` with a machine never stops with `Stop.unsupported`. -/
 theorem checkPtr_noUnsupported (m : Mach) (ptr : Pointer Prov) (ptrTy : PtrType) :
     NoUnsupported (checkPtr ptr ptrTy (some m)) := by
@@ -1420,6 +2044,103 @@ theorem checkPtr_traitObject_agree (m : Mach) (mt : MachTB) (h : VTablesAgree m 
       refine bindCongr rfl (fun _ => ?_)
       refine bindCongr rfl (fun _ => ?_)
       exact congrArg derefStep (hderef vtable.size)
+
+/-- Structural memory-allocation agreement between a `Mach` (`BasicMemory`) and a `MachTB`
+(`TreeBorrowsMemory`): both machines have the same number of allocations, and each allocation
+index agrees on liveness, base address, and byte size (ignoring Tree Borrows extras). -/
+structure MemAllocsAgree (m : Mach) (mt : MachTB) : Prop where
+  length_eq : m.mem.memory.allocations.length = mt.mem.memory.mem.allocations.length
+  entry_eq : ∀ (i : Nat) (h1 : i < m.mem.memory.allocations.length)
+      (h2 : i < mt.mem.memory.mem.allocations.length),
+    let a1 := m.mem.memory.allocations[i]
+    let a2 := mt.mem.memory.mem.allocations[i]
+    a1.live = a2.live ∧ a1.addr = a2.addr ∧ a1.data.length = a2.data.length
+
+/-- **`MemAllocsAgree` implies dereferenceability agreement for every pointer and size**:
+`TreeBorrowsMemory::dereferenceable` checks only the underlying `BasicMemory` allocation
+liveness and bounds, never Tree Borrows paths or permissions. -/
+theorem dereferenceable_agree_of_memAllocsAgree (m : Mach) (mt : MachTB)
+    (hmem : MemAllocsAgree m mt) (tp : ThinPointer TreeBorrowsProvenance) (size : Size) :
+    CM.dereferenceable m.mem (erasePath tp) size =
+      ConcurrentMemory.dereferenceable mt.mem tp size := by
+  show BM.dereferenceable m.mem.memory (erasePath tp) size =
+    TreeBorrowsMemory.dereferenceable mt.mem.memory tp size
+  unfold BM.dereferenceable TreeBorrowsMemory.dereferenceable
+  unfold BM.check_ptr BasicMemory.check_ptr
+  dsimp only [erasePath]
+  by_cases hsz : size.bytes = 0
+  · simp [hsz]
+  · simp only [hsz, ↓reduceIte]
+    cases hprov : tp.provenance with
+    | none => rfl
+    | some pr =>
+      rcases pr with ⟨allocId, path⟩
+      simp only [Option.map_some]
+      unfold listIndex
+      by_cases hnonneg : (0 : Int) ≤ allocId._0
+      · simp only [hnonneg, ↓reduceIte]
+        have hlt_iff : allocId._0.toNat < m.mem.memory.allocations.length ↔
+            allocId._0.toNat < mt.mem.memory.mem.allocations.length := by
+          rw [hmem.length_eq]
+        by_cases hlt1 : allocId._0.toNat < m.mem.memory.allocations.length
+        · have hlt2 : allocId._0.toNat < mt.mem.memory.mem.allocations.length := hlt_iff.1 hlt1
+          have hg1 : m.mem.memory.allocations[allocId._0.toNat]? =
+              some m.mem.memory.allocations[allocId._0.toNat] :=
+            List.getElem?_eq_getElem hlt1
+          have hg2 : mt.mem.memory.mem.allocations[allocId._0.toNat]? =
+              some mt.mem.memory.mem.allocations[allocId._0.toNat] :=
+            List.getElem?_eq_getElem hlt2
+          obtain ⟨hlive, haddr, hlen⟩ := hmem.entry_eq allocId._0.toNat hlt1 hlt2
+          simp only [hg1, hg2, Allocation.size, bind, Except.bind, pure, Except.pure]
+          have hlive' : (!m.mem.memory.allocations[allocId._0.toNat].live) =
+              (!mt.mem.memory.mem.allocations[allocId._0.toNat].live) :=
+            congrArg (!·) hlive
+          by_cases hdead : (!mt.mem.memory.mem.allocations[allocId._0.toNat].live) = true
+          · have hdead1 : (!m.mem.memory.allocations[allocId._0.toNat].live) = true :=
+              hlive'.trans hdead
+            simp only [hdead, hdead1, ↓reduceIte]; rfl
+          · have hdead1 : ¬ (!m.mem.memory.allocations[allocId._0.toNat].live) = true := by
+              rw [hlive']; exact hdead
+            simp only [hdead, hdead1]
+            have hoob_iff :
+                (tp.addr - m.mem.memory.allocations[allocId._0.toNat].addr < 0 ∨
+                 tp.addr - m.mem.memory.allocations[allocId._0.toNat].addr + ↑size.bytes >
+                   ↑m.mem.memory.allocations[allocId._0.toNat].data.length) ↔
+                (tp.addr - mt.mem.memory.mem.allocations[allocId._0.toNat].addr < 0 ∨
+                 tp.addr - mt.mem.memory.mem.allocations[allocId._0.toNat].addr + ↑size.bytes >
+                   ↑mt.mem.memory.mem.allocations[allocId._0.toNat].data.length) := by
+              rw [haddr, hlen]
+            by_cases hoob :
+                tp.addr - mt.mem.memory.mem.allocations[allocId._0.toNat].addr < 0 ∨
+                tp.addr - mt.mem.memory.mem.allocations[allocId._0.toNat].addr + ↑size.bytes >
+                  ↑mt.mem.memory.mem.allocations[allocId._0.toNat].data.length
+            · simp only [hoob, hoob_iff.mpr hoob, ↓reduceIte]; rfl
+            · have hoob1 : ¬ (tp.addr - m.mem.memory.allocations[allocId._0.toNat].addr < 0 ∨
+                tp.addr - m.mem.memory.allocations[allocId._0.toNat].addr + ↑size.bytes >
+                  ↑m.mem.memory.allocations[allocId._0.toNat].data.length) :=
+                fun h => hoob (hoob_iff.mp h)
+              simp only [hoob, hoob1, ↓reduceIte]; rfl
+        · have hlt2 : ¬ allocId._0.toNat < mt.mem.memory.mem.allocations.length :=
+            fun h => hlt1 (hlt_iff.2 h)
+          simp only [List.getElem?_eq_none (Nat.le_of_not_lt hlt1),
+              List.getElem?_eq_none (Nat.le_of_not_lt hlt2)]
+          rfl
+      · simp only [hnonneg, ↓reduceIte]
+        rfl
+
+/-- **`Mach` ↔ `MachTB` agreement for `&dyn Trait` / `Box<dyn Trait>` from structural state
+relations alone** (`VTablesAgree` + `MemAllocsAgree` + `PathFaithful`): no ad-hoc
+dereferenceability hypothesis is needed. -/
+theorem checkPtr_traitObject_agree_of_memAllocsAgree (m : Mach) (mt : MachTB)
+    (hvt : VTablesAgree m mt) (hmem : MemAllocsAgree m mt)
+    (ptr : Pointer TreeBorrowsProvenance) (ptrTy : PtrType) (pointee : PointeeInfo)
+    (traitName : TraitName)
+    (hsafe : PtrType.safe_pointee ptrTy = some pointee)
+    (hlay : pointee.layout = .TraitObject traitName)
+    (hf : ∀ vp, ptr.metadata = some (.VTablePointer vp) → PathFaithful mt vp) :
+    checkPtr (erasePathPtr ptr) ptrTy (some m) = checkPtrM ptr ptrTy (some mt) :=
+  checkPtr_traitObject_agree m mt hvt ptr ptrTy pointee traitName hsafe hlay hf
+    (fun sz => dereferenceable_agree_of_memAllocsAgree m mt hmem ptr.thin_pointer sz)
 
 /-! ## Concrete witnesses on `Mach` and `MachTB`
 
@@ -1692,5 +2413,28 @@ theorem vtablePtr_child_path_divergence :
   refine ⟨?_, rfl, rfl, rfl⟩
   unfold PathFaithful
   decide
+
+/-- The witness machines satisfy `MemAllocsAgree`, so `checkPtr_traitObject_agree_of_memAllocsAgree`
+applies to `&dyn TraitA` without any ad-hoc dereferenceability assumption. -/
+theorem vtMach_vtMachTB_agree_structural :
+    MemAllocsAgree vtMach vtMachTB ∧
+    checkPtr (erasePathPtr ⟨dataPtrTB 64, some (.VTablePointer vtPtrATB)⟩) dynRefA (some vtMach) =
+      checkPtrM ⟨dataPtrTB 64, some (.VTablePointer vtPtrATB)⟩ dynRefA (some vtMachTB) ∧
+    checkPtr (erasePathPtr ⟨dataPtrTB 66, some (.VTablePointer vtPtrATB)⟩) dynRefA (some vtMach) =
+      checkPtrM ⟨dataPtrTB 66, some (.VTablePointer vtPtrATB)⟩ dynRefA (some vtMachTB) := by
+  have hmem : MemAllocsAgree vtMach vtMachTB := by
+    refine ⟨rfl, ?_⟩
+    intro i h1 h2
+    have hi : i = 0 ∨ i = 1 := by
+      change i < 2 at h1
+      omega
+    rcases hi with rfl | rfl <;> exact ⟨rfl, rfl, rfl⟩
+  have hvt : VTablesAgree vtMach vtMachTB := ⟨rfl, rfl⟩
+  have hA : PathFaithful vtMachTB vtPtrATB := by unfold PathFaithful; decide
+  refine ⟨hmem,
+    checkPtr_traitObject_agree_of_memAllocsAgree vtMach vtMachTB hvt hmem _ dynRefA _ traitA
+      rfl rfl (by intro vp h; cases h; exact hA),
+    checkPtr_traitObject_agree_of_memAllocsAgree vtMach vtMachTB hvt hmem _ dynRefA _ traitA
+      rfl rfl (by intro vp h; cases h; exact hA)⟩
 
 end MiniRustSpec.Correspondence.VTablePtr
