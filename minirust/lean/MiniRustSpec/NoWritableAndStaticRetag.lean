@@ -87,8 +87,10 @@ mechanically generated MiniRust Tree Borrows specification (`MiniRustSpec.Gen`,
      `tree_read_or_write_simulates_node_access_iff_pruneInert`,
      `tbm_release_protector_simulates_execFrameExitMiniRust_step_iff_pruneInert`,
      `tbm_release_protector_diverges_of_not_pruneInert`,
-     `tbm_end_call_lockstep_iff_pruneInert`), plus closed multi-entry, deep-tree,
-     strict-descendant, and state/UB-divergence canaries.
+     `tbm_end_call_lockstep_iff_pruneInert`), the bridge from the lockstep
+     predicate to the real `TreeBorrowsMemory.end_call` fold
+     (`endCallLockstepSim_end_call`), plus closed multi-entry, deep-tree,
+     strict-descendant, lockstep-`iff`, and state/UB-divergence canaries.
    - **4.9**: **symbolic whole-tree `TreeBorrowsMemory.deallocate`**:
      `permission_prevents_deallocation_iff_foreign_write_err`,
      `contains_strong_protector_iff`, the one-directional
@@ -165,15 +167,21 @@ mechanically generated MiniRust Tree Borrows specification (`MiniRustSpec.Gen`,
      models answer `.ok`); the **two-layer retag alignment & dereferenceability
      boundary** (`tbm_retag_ptr_raw_and_pinned_noop`,
      `tbm_retag_ptr_ignores_alignment`, `tbm_retag_ptr_safe_dereferenceable_ub`,
+     `tbm_retag_ptr_zst_safe_skips_dereferenceable`,
      `checkPtrM_tb_safe_vs_raw_boundary`,
      `evalStatementM_tb_validate_safe_vs_raw_boundary`: `TreeBorrowsMemory.retag_ptr`
      itself enforces `BasicMemory.check_ptr` dereferenceability on every non-ZST
      safe pointer including `#[rustc_no_writable]` `&mut T` and `&UnsafeCell<T>`
-     while ignoring alignment and treating `Raw` / pinned `!unpin` as no-ops,
-     whereas `Machine::check_ptr` inside `Statement::Validate` enforces non-null,
-     alignment, inhabitedness, and dereferenceability for ALL safe pointers
+     while ignoring alignment and treating `Raw` / pinned `!unpin` as no-ops;
+     for ZERO-SIZED safe pointers it checks NOTHING — given a parent path that
+     names a node, a retag into a dead allocation or far past its end succeeds
+     and still adds a child node (and, on function entry, a protector), and an
+     address below the allocation base stops with a spec panic rather than UB;
+     `Machine::check_ptr` inside `Statement::Validate`
+     enforces non-null, alignment, and inhabitedness for ALL safe pointers
      including `#[rustc_no_writable]`, ZST, and pinned references before
-     `retag_ptr` runs); plus **choice-free symbolic `MachTB.wfLive`
+     `retag_ptr` runs, and dereferenceability for the non-ZST ones (the
+     length-`0` check is vacuous); plus **choice-free symbolic `MachTB.wfLive`
      preservation** and **`MachTB` `IntrinsicOp.Deallocate` stack preservation**
      (`evalIntrinsicM_tb_wfLive_choiceFree`,
      `evalIntrinsicM_tb_deallocate_post_state`,
@@ -209,7 +217,17 @@ mechanically generated MiniRust Tree Borrows specification (`MiniRustSpec.Gen`,
   `tbm_release_protector_simulates_execFrameExitMiniRust_step_iff_pruneInert`,
   `tbm_release_protector_diverges_of_not_pruneInert`,
   `tbm_end_call_lockstep_iff_pruneInert`), with closed witnesses of both state
-  divergence and UB-vs-OK outcome divergence when it fails.
+  divergence and UB-vs-OK outcome divergence when it fails. All four statements
+  are relative to a SUCCESSFUL pruned Anneal step; the multi-entry `iff` is about
+  the step-by-step `EndCallLockstepSim` predicate, which
+  `endCallLockstepSim_end_call` connects to `TreeBorrowsMemory.end_call` in the
+  forward direction only (no converse from final-state agreement back to
+  lockstep is claimed).
+- Alignment is never checked by `TreeBorrowsMemory.retag_ptr`; the `Ref` vs.
+  `Raw` alignment contrast lives one layer up, in `Statement::Validate`. The
+  spec panic of `tbm_retag_ptr_zst_safe_skips_dereferenceable` is proved for
+  `TreeBorrowsMemory.retag_ptr` only; no `MachTB` program reaching it is
+  exhibited here.
 - The `Trusted` connection is a run-level statement: the parameter-map adapter
   coincides with the trusted `stepMirFn` at every fuel under an
   all-`rustcNoWritable` map; the `writableChildWrite` side runs through the
@@ -9779,6 +9797,50 @@ theorem tbm_end_call_lockstep_iff_pruneInert :
         intro w1' hw1'
         rw [hw1] at hw1'; cases hw1'
         exact ⟨tbm1, alloc1, hrel1, halloc1, hinv1, hih.mpr (hpr.2 w1 hw1)⟩
+
+/-- **`EndCallLockstepSim` implies success of the real `TreeBorrowsMemory.end_call`**:
+the step-by-step predicate characterized by `tbm_end_call_lockstep_iff_pruneInert`
+is stated over iterated `TreeBorrowsMemory.release_protector`; this bridge
+connects it to the fold computed by `TreeBorrowsMemory.end_call` (forward
+direction only). Whenever the Anneal frame exit succeeds
+(`execFrameExitMiniRust w frame = .ok w'`) and lockstep holds,
+`TreeBorrowsMemory.end_call` on the corresponding protector list succeeds into a
+`TreeSimInv`-related final tree — with NO side conditions on the frame, the
+tags, the embedding, or the tree depth beyond lockstep itself. -/
+theorem endCallLockstepSim_end_call (off len : Nat) (emb : Nat → Gen.Path) (id : Nat) :
+    ∀ (frame : List (Nat × Nat)) (w w' : FnEntryBorrowWorld)
+      (tbm : Gen.TreeBorrowsMemory Gen.x86_64)
+      (alloc : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra),
+      tbm.mem.allocations[id]? = some alloc →
+      TreeSimInv off len emb w alloc.extra.root →
+      execFrameExitMiniRust w frame = .ok w' →
+      EndCallLockstepSim off len emb id w tbm frame →
+      ∃ tbm' alloc',
+        TreeBorrowsMemory.end_call tbm ⟨frame.map (fun tp => (⟨(id : Int)⟩, emb tp.1))⟩ = .ok tbm' ∧
+        tbm'.mem.allocations[id]? = some alloc' ∧
+        TreeSimInv off len emb w' alloc'.extra.root
+  | [], w, w', tbm, alloc, halloc, hinv, hw, _ => by
+    cases hw
+    exact ⟨tbm, alloc, rfl, halloc, hinv⟩
+  | (t, p) :: rest, w, w', tbm, alloc, _, _, hw, hlock => by
+    have hconsWorld : execFrameExitMiniRust w ((t, p) :: rest) =
+        (match execFrameExitMiniRust w [(t, p)] with
+        | .error e => .error e
+        | .ok w1 => execFrameExitMiniRust w1 rest) := by
+      cases h : execProtectorEndAccessFor protectorEndAccessIsWriteMiniRust? w t <;>
+        simp [execFrameExitMiniRust, execFrameExitSequential, h]
+    rw [hconsWorld] at hw
+    cases hw1 : execFrameExitMiniRust w [(t, p)] with
+    | error _ => rw [hw1] at hw; cases hw
+    | ok w1 =>
+      rw [hw1] at hw
+      obtain ⟨tbm1, alloc1, hrel1, halloc1, hinv1, hrest⟩ := hlock w1 hw1
+      obtain ⟨tbm', alloc', hend, halloc', hinv'⟩ :=
+        endCallLockstepSim_end_call off len emb id rest w1 w' tbm1 alloc1 halloc1 hinv1 hw hrest
+      refine ⟨tbm', alloc', ?_, halloc', hinv'⟩
+      unfold TreeBorrowsMemory.end_call at hend ⊢
+      simp only [List.map_cons, List.foldlM_cons, bind, Except.bind, hrel1]
+      exact hend
 
 /-! #### Deallocation & Byte-Local Helpers -/
 
@@ -20063,6 +20125,53 @@ theorem canary_endCall_strictDescendant_and_divergence :
     ⟨hnotPrA, wDivA, tbmDivA, allocDivA, hwDivA, hrelDivA, halDivA, hnotInvA⟩,
     ⟨hnotPrB, ⟨wDivB, hwDivB⟩, rfl⟩⟩
 
+/-- **Closed non-vacuity canary for `tbm_end_call_lockstep_iff_pruneInert` and
+`endCallLockstepSim_end_call`** (zero hypotheses) on the strict-descendant world
+`strictDescExitWorld` / `strictDescExitTreeMR` with frame `[(1, 7)]`:
+1. the multi-entry `iff` fires in its `FrameExitPruneInert → EndCallLockstepSim`
+   direction, so the lockstep predicate HOLDS on a concrete depth-3 borrow tree;
+2. the bridge then turns that lockstep fact into a successful real
+   `TreeBorrowsMemory.end_call` whose final tree is `TreeSimInv`-related to the
+   Anneal post-exit world. -/
+theorem canary_endCall_lockstep_iff_and_end_call_bridge :
+    EndCallLockstepSim 0 8 strictDescExitEmb 0 strictDescExitWorld
+      (mkTbmWithTree strictDescExitTreeMR) [(1, 7)] ∧
+    (∃ w' tbm' alloc',
+      execFrameExitMiniRust strictDescExitWorld [(1, 7)] = .ok w' ∧
+      TreeBorrowsMemory.end_call (mkTbmWithTree strictDescExitTreeMR)
+        ⟨([(1, 7)] : List (Nat × Nat)).map
+          (fun tp => (⟨((0 : Nat) : Int)⟩, strictDescExitEmb tp.1))⟩ = .ok tbm' ∧
+      tbm'.mem.allocations[0]? = some alloc' ∧
+      TreeSimInv 0 8 strictDescExitEmb w' alloc'.extra.root) := by
+  have hprDesc : FrameExitPruneInert 0 8 strictDescExitWorld [(1, 7)] :=
+    canary_endCall_strictDescendant_and_divergence.2.2.1
+  obtain ⟨wDesc, _, _, hwDesc, _⟩ := canary_endCall_strictDescendant_and_divergence.2.2.2.1
+  have hlenDesc : ∀ q m, nodeAt strictDescExitTreeMR q = some m → m.permissions.length = 8 := by
+    intro q m hm
+    have hmem := nodeAt_mem_nodePaths strictDescExitTreeMR q m hm
+    have hps : nodePaths strictDescExitTreeMR = [[], [0], [0, 0], [0, 0, 0]] := rfl
+    rw [hps] at hmem; simp only [List.mem_cons, List.not_mem_nil, or_false] at hmem
+    rcases hmem with rfl | rfl | rfl | rfl <;> (cases hm; rfl)
+  have houtDesc : ∀ (tp : Nat × Nat) (_ : tp ∈ ([(1, 7)] : List (Nat × Nat))),
+      ∀ m, nodeAt strictDescExitTreeMR (strictDescExitEmb tp.1) = some m →
+        OutsideNoProtectorAccess 0 8 m := by
+    intro tp _ m hm b p hp hb
+    have hlt : b < m.permissions.length := (List.getElem?_eq_some_iff.mp hp).1
+    have h8 := hlenDesc _ m hm; exfalso; omega
+  have hinvDesc : TreeSimInv 0 8 strictDescExitEmb strictDescExitWorld strictDescExitTreeMR :=
+    treeSimInv_of_bool _ _ _ _ _ (by decide +kernel)
+  have hiff := tbm_end_call_lockstep_iff_pruneInert [(1, 7)]
+    (mkTbmWithTree strictDescExitTreeMR) 0 _ 0 8 (by decide) strictDescExitEmb strictDescExitWorld
+    wDesc rfl rfl hlenDesc hinvDesc
+    (by decide +kernel) (by decide +kernel)
+    (by intro tp htp; simp only [List.mem_cons, List.not_mem_nil, or_false] at htp; subst htp; exact ⟨_, rfl, rfl, rfl, rfl, rfl⟩)
+    (by decide +kernel) (by decide +kernel) (by decide +kernel) (by decide +kernel)
+    houtDesc hwDesc
+  have hlock := hiff.mpr hprDesc
+  obtain ⟨tbm', alloc', hend, hal, hinv'⟩ := endCallLockstepSim_end_call 0 8 strictDescExitEmb 0
+    [(1, 7)] strictDescExitWorld wDesc (mkTbmWithTree strictDescExitTreeMR) _ rfl hinvDesc hwDesc hlock
+  exact ⟨hlock, wDesc, tbm', alloc', hwDesc, hend, hal, hinv'⟩
+
 /-- **Closed non-vacuity canary for lifted `TreeSimInvMulti` (`retag_ptr` +
 disjoint-window `end_call`) and symbolic nested `split_at_mut`** (zero hypotheses):
 1. Fires `tbm_retag_ptr_fnEntry_mutOrBox_simulates_world_multi` and
@@ -21713,6 +21822,119 @@ theorem tbm_retag_ptr_ignores_alignment
       TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (.Box pi2) fnEntry fnIw lookup := by
   refine ⟨?_, ?_, ?_⟩ <;> rfl
 
+/-- `ReborrowSettings.new` on a sized, non-pinned safe pointer always yields
+`some settings` with one `inside` permission per pointee byte, an `outside`
+permission matching the protector, and a protector that is active exactly on
+function entry. -/
+private theorem b3_reborrowSettings_new_sized_safe
+    (tbm : Gen.TreeBorrowsMemory Gen.x86_64) (ptr : Gen.Pointer Gen.TreeBorrowsProvenance)
+    (pointee : Gen.PointeeInfo) (sz : Nat) (al : LibSpecr.Align)
+    (cells : List (Gen.Offset × LibSpecr.Size)) (mask : List Bool)
+    (hlay : pointee.layout = .Sized ⟨sz⟩ al)
+    (hcells : pointee.unsafe_cells = .Sized cells)
+    (hmask : cellsToFreezeMask cells ⟨sz⟩ = .ok mask)
+    (ptrType : Gen.PtrType)
+    (hptrTy : ptrType = .Ref .Immutable pointee ∨
+      (pointee.unpin = true ∧ (ptrType = .Ref .Mutable pointee ∨ ptrType = .Box pointee)))
+    (fnEntry fnIw : Bool)
+    (lookup : Gen.ThinPointer Gen.TreeBorrowsProvenance → Interp Gen.VTable) :
+    ∃ settings,
+      ReborrowSettings.new lookup ptr ptrType fnEntry tbm.params fnIw = .ok (some settings) ∧
+      settings.inside.length = sz ∧
+      Permission.matches_protector settings.outside settings.«protected» = true ∧
+      Protected.yes settings.«protected» = fnEntry := by
+  have hmaskLen : mask.length = sz := a1_cellsToFreezeMask_length hmask
+  have hpermOk : ∀ (prot : Gen.Protected) (imp : Bool),
+      (imp = true → Protected.yes prot = true) →
+      ∀ (inside frozen : Bool), ∃ p, ReborrowSettings.perm ptrType prot imp inside frozen = .ok p := by
+    intro prot imp himp inside frozen
+    rcases hptrTy with rfl | ⟨_, rfl | rfl⟩
+    · unfold ReborrowSettings.perm; cases frozen <;> exact ⟨_, rfl⟩
+    · unfold ReborrowSettings.perm
+      cases himpIn : (imp && inside) with
+      | false => exact ⟨_, rfl⟩
+      | true =>
+        have h1 : imp = true := (Bool.and_eq_true .. |>.mp himpIn).1
+        rw [himp h1]; exact ⟨_, rfl⟩
+    · unfold ReborrowSettings.perm
+      cases himpIn : (imp && inside) with
+      | false => exact ⟨_, rfl⟩
+      | true =>
+        have h1 : imp = true := (Bool.and_eq_true .. |>.mp himpIn).1
+        rw [himp h1]; exact ⟨_, rfl⟩
+  have hpermOut : ∀ (prot : Gen.Protected) (imp frozen : Bool), ∃ p,
+      ReborrowSettings.perm ptrType prot imp false frozen = .ok p ∧
+      Permission.matches_protector p prot = true := by
+    intro prot imp frozen
+    rcases hptrTy with rfl | ⟨_, rfl | rfl⟩ <;> cases prot <;> cases imp <;> cases frozen <;>
+      exact ⟨_, rfl, rfl⟩
+  have hyesS : ∀ b : Bool, Protected.yes (if b then Gen.Protected.Strong else .No) = b := by
+    intro b; cases b <;> rfl
+  have hyesW : ∀ b : Bool, Protected.yes (if b then Gen.Protected.Weak else .No) = b := by
+    intro b; cases b <;> rfl
+  have hmapOk : ∀ (prot : Gen.Protected) (imp : Bool),
+      (imp = true → Protected.yes prot = true) →
+      ∀ (bs : List Bool), ∃ ps,
+        bs.mapM (fun frz => ReborrowSettings.perm ptrType prot imp true frz) = .ok ps ∧
+        ps.length = bs.length := by
+    intro prot imp himp bs
+    induction bs with
+    | nil => exact ⟨[], rfl, rfl⟩
+    | cons b rest ih =>
+      obtain ⟨p, hp⟩ := hpermOk prot imp himp true b
+      obtain ⟨ps, hps, hlen⟩ := ih
+      exact ⟨p :: ps, by simp only [List.mapM_cons, hp, hps, bind, Except.bind, pure, Except.pure],
+        by simp only [List.length_cons, hlen]⟩
+  have hprotYesImp : ∀ (prot : Gen.Protected),
+      (Protected.yes prot && tbm.params.implicit_writes && fnIw) = true → Protected.yes prot = true := by
+    intro prot h; simp only [Bool.and_eq_true] at h; exact h.1.1
+  rcases hptrTy with rfl | ⟨hunpin, rfl | rfl⟩
+  · let prot : Gen.Protected := if fnEntry then .Strong else .No
+    obtain ⟨ps, hps, hpsLen⟩ := hmapOk prot _ (hprotYesImp prot) mask
+    obtain ⟨pOut, hpOut, hpOutMp⟩ := hpermOut prot
+      (Protected.yes prot && tbm.params.implicit_writes && fnIw) pointee.freeze
+    refine ⟨{ inside := ps, outside := pOut, «protected» := prot }, ?_, hpsLen.trans hmaskLen,
+      hpOutMp, hyesS fnEntry⟩
+    unfold ReborrowSettings.new PtrType.safe_pointee
+    simp only [Bool.false_eq_true, ↓reduceIte, hcells, hlay, UnsafeCellStrategy.freeze_mask, hmask,
+      bind, Except.bind]
+    change (mask.mapM (fun freeze => ReborrowSettings.perm (.Ref .Immutable pointee) prot
+        (Protected.yes prot && tbm.params.implicit_writes && fnIw) true freeze) >>= fun inside =>
+      ReborrowSettings.perm (.Ref .Immutable pointee) prot
+        (Protected.yes prot && tbm.params.implicit_writes && fnIw) false pointee.freeze >>= fun outside =>
+      pure (some ({ inside := inside, outside := outside, «protected» := prot } : Gen.ReborrowSettings))) = _
+    rw [hps, hpOut]; rfl
+  · let prot : Gen.Protected := if fnEntry then .Strong else .No
+    obtain ⟨ps, hps, hpsLen⟩ := hmapOk prot _ (hprotYesImp prot) mask
+    obtain ⟨pOut, hpOut, hpOutMp⟩ := hpermOut prot
+      (Protected.yes prot && tbm.params.implicit_writes && fnIw) pointee.freeze
+    refine ⟨{ inside := ps, outside := pOut, «protected» := prot }, ?_, hpsLen.trans hmaskLen,
+      hpOutMp, hyesS fnEntry⟩
+    unfold ReborrowSettings.new PtrType.safe_pointee
+    simp only [hunpin, Bool.not_true, Bool.false_eq_true, ↓reduceIte, hcells, hlay,
+      UnsafeCellStrategy.freeze_mask, hmask, bind, Except.bind]
+    change (mask.mapM (fun freeze => ReborrowSettings.perm (.Ref .Mutable pointee) prot
+        (Protected.yes prot && tbm.params.implicit_writes && fnIw) true freeze) >>= fun inside =>
+      ReborrowSettings.perm (.Ref .Mutable pointee) prot
+        (Protected.yes prot && tbm.params.implicit_writes && fnIw) false pointee.freeze >>= fun outside =>
+      pure (some ({ inside := inside, outside := outside, «protected» := prot } : Gen.ReborrowSettings))) = _
+    rw [hps, hpOut]; rfl
+  · let prot : Gen.Protected := if fnEntry then .Weak else .No
+    obtain ⟨ps, hps, hpsLen⟩ := hmapOk prot _ (hprotYesImp prot) mask
+    obtain ⟨pOut, hpOut, hpOutMp⟩ := hpermOut prot
+      (Protected.yes prot && tbm.params.implicit_writes && fnIw) pointee.freeze
+    refine ⟨{ inside := ps, outside := pOut, «protected» := prot }, ?_, hpsLen.trans hmaskLen,
+      hpOutMp, hyesW fnEntry⟩
+    unfold ReborrowSettings.new PtrType.safe_pointee
+    simp only [hunpin, Bool.not_true, Bool.false_eq_true, ↓reduceIte, hcells, hlay,
+      UnsafeCellStrategy.freeze_mask, hmask, bind, Except.bind]
+    change (mask.mapM (fun freeze => ReborrowSettings.perm (.Box pointee) prot
+        (Protected.yes prot && tbm.params.implicit_writes && fnIw) true freeze) >>= fun inside =>
+      ReborrowSettings.perm (.Box pointee) prot
+        (Protected.yes prot && tbm.params.implicit_writes && fnIw) false pointee.freeze >>= fun outside =>
+      pure (some ({ inside := inside, outside := outside, «protected» := prot } : Gen.ReborrowSettings))) = _
+    rw [hps, hpOut]; rfl
+
 /-- **`TreeBorrowsMemory.retag_ptr` DOES enforce dereferenceability / bounds /
 liveness / provenance on EVERY non-ZST safe pointer**, including
 `#[rustc_no_writable]` `&mut T` (`fnIw = false`, which performs NO child write!),
@@ -21749,85 +21971,8 @@ theorem tbm_retag_ptr_safe_dereferenceable_ub
           ptr.thin_pointer.addr - alloc.addr + (sz : Int) > (alloc.data.length : Int)) →
         TreeBorrowsMemory.retag_ptr tbm frameExtra ptr ptrType fnEntry fnIw lookup =
           .error (.ub "dereferencing pointer outside the bounds of its allocation"))) := by
-  have hmaskLen : mask.length = sz := a1_cellsToFreezeMask_length hmask
-  have hnewSome : ∃ settings,
-      ReborrowSettings.new lookup ptr ptrType fnEntry tbm.params fnIw = .ok (some settings) ∧
-      settings.inside.length = sz := by
-    have hpermOk : ∀ (prot : Gen.Protected) (imp : Bool),
-        (imp = true → Protected.yes prot = true) →
-        ∀ (inside frozen : Bool), ∃ p, ReborrowSettings.perm ptrType prot imp inside frozen = .ok p := by
-      intro prot imp himp inside frozen
-      rcases hptrTy with rfl | ⟨_, rfl | rfl⟩
-      · unfold ReborrowSettings.perm; cases frozen <;> exact ⟨_, rfl⟩
-      · unfold ReborrowSettings.perm
-        cases himpIn : (imp && inside) with
-        | false => exact ⟨_, rfl⟩
-        | true =>
-          have h1 : imp = true := (Bool.and_eq_true .. |>.mp himpIn).1
-          rw [himp h1]; exact ⟨_, rfl⟩
-      · unfold ReborrowSettings.perm
-        cases himpIn : (imp && inside) with
-        | false => exact ⟨_, rfl⟩
-        | true =>
-          have h1 : imp = true := (Bool.and_eq_true .. |>.mp himpIn).1
-          rw [himp h1]; exact ⟨_, rfl⟩
-    have hmapOk : ∀ (prot : Gen.Protected) (imp : Bool),
-        (imp = true → Protected.yes prot = true) →
-        ∀ (bs : List Bool), ∃ ps,
-          bs.mapM (fun frz => ReborrowSettings.perm ptrType prot imp true frz) = .ok ps ∧
-          ps.length = bs.length := by
-      intro prot imp himp bs
-      induction bs with
-      | nil => exact ⟨[], rfl, rfl⟩
-      | cons b rest ih =>
-        obtain ⟨p, hp⟩ := hpermOk prot imp himp true b
-        obtain ⟨ps, hps, hlen⟩ := ih
-        exact ⟨p :: ps, by simp only [List.mapM_cons, hp, hps, bind, Except.bind, pure, Except.pure],
-          by simp only [List.length_cons, hlen]⟩
-    have hprotYesImp : ∀ (prot : Gen.Protected),
-        (Protected.yes prot && tbm.params.implicit_writes && fnIw) = true → Protected.yes prot = true := by
-      intro prot h; simp only [Bool.and_eq_true] at h; exact h.1.1
-    rcases hptrTy with rfl | ⟨hunpin, rfl | rfl⟩
-    · let prot : Gen.Protected := if fnEntry then .Strong else .No
-      obtain ⟨ps, hps, hpsLen⟩ := hmapOk prot _ (hprotYesImp prot) mask
-      obtain ⟨pOut, hpOut⟩ := hpermOk prot _ (hprotYesImp prot) false pointee.freeze
-      refine ⟨{ inside := ps, outside := pOut, «protected» := prot }, ?_, hpsLen.trans hmaskLen⟩
-      unfold ReborrowSettings.new PtrType.safe_pointee
-      simp only [Bool.false_eq_true, ↓reduceIte, hcells, hlay, UnsafeCellStrategy.freeze_mask, hmask,
-        bind, Except.bind]
-      change (mask.mapM (fun freeze => ReborrowSettings.perm (.Ref .Immutable pointee) prot
-          (Protected.yes prot && tbm.params.implicit_writes && fnIw) true freeze) >>= fun inside =>
-        ReborrowSettings.perm (.Ref .Immutable pointee) prot
-          (Protected.yes prot && tbm.params.implicit_writes && fnIw) false pointee.freeze >>= fun outside =>
-        pure (some ({ inside := inside, outside := outside, «protected» := prot } : Gen.ReborrowSettings))) = _
-      rw [hps, hpOut]; rfl
-    · let prot : Gen.Protected := if fnEntry then .Strong else .No
-      obtain ⟨ps, hps, hpsLen⟩ := hmapOk prot _ (hprotYesImp prot) mask
-      obtain ⟨pOut, hpOut⟩ := hpermOk prot _ (hprotYesImp prot) false pointee.freeze
-      refine ⟨{ inside := ps, outside := pOut, «protected» := prot }, ?_, hpsLen.trans hmaskLen⟩
-      unfold ReborrowSettings.new PtrType.safe_pointee
-      simp only [hunpin, Bool.not_true, Bool.false_eq_true, ↓reduceIte, hcells, hlay,
-        UnsafeCellStrategy.freeze_mask, hmask, bind, Except.bind]
-      change (mask.mapM (fun freeze => ReborrowSettings.perm (.Ref .Mutable pointee) prot
-          (Protected.yes prot && tbm.params.implicit_writes && fnIw) true freeze) >>= fun inside =>
-        ReborrowSettings.perm (.Ref .Mutable pointee) prot
-          (Protected.yes prot && tbm.params.implicit_writes && fnIw) false pointee.freeze >>= fun outside =>
-        pure (some ({ inside := inside, outside := outside, «protected» := prot } : Gen.ReborrowSettings))) = _
-      rw [hps, hpOut]; rfl
-    · let prot : Gen.Protected := if fnEntry then .Weak else .No
-      obtain ⟨ps, hps, hpsLen⟩ := hmapOk prot _ (hprotYesImp prot) mask
-      obtain ⟨pOut, hpOut⟩ := hpermOk prot _ (hprotYesImp prot) false pointee.freeze
-      refine ⟨{ inside := ps, outside := pOut, «protected» := prot }, ?_, hpsLen.trans hmaskLen⟩
-      unfold ReborrowSettings.new PtrType.safe_pointee
-      simp only [hunpin, Bool.not_true, Bool.false_eq_true, ↓reduceIte, hcells, hlay,
-        UnsafeCellStrategy.freeze_mask, hmask, bind, Except.bind]
-      change (mask.mapM (fun freeze => ReborrowSettings.perm (.Box pointee) prot
-          (Protected.yes prot && tbm.params.implicit_writes && fnIw) true freeze) >>= fun inside =>
-        ReborrowSettings.perm (.Box pointee) prot
-          (Protected.yes prot && tbm.params.implicit_writes && fnIw) false pointee.freeze >>= fun outside =>
-        pure (some ({ inside := inside, outside := outside, «protected» := prot } : Gen.ReborrowSettings))) = _
-      rw [hps, hpOut]; rfl
-  obtain ⟨settings, hnew, hsLen⟩ := hnewSome
+  obtain ⟨settings, hnew, hsLen, _, _⟩ := b3_reborrowSettings_new_sized_safe tbm ptr pointee sz al
+    cells mask hlay hcells hmask ptrType hptrTy fnEntry fnIw lookup
   refine ⟨fun hnone => ?_, fun id path alloc hprov halloc => ⟨fun hdead => ?_, fun hlive hoob => ?_⟩⟩
   · unfold TreeBorrowsMemory.retag_ptr
     rw [hnew]
@@ -21854,6 +21999,159 @@ theorem tbm_retag_ptr_safe_dereferenceable_ub
     simp only [hsLen, hprov, hnn, Int.toNat_natCast, halloc, hlive,
       Bool.not_true, Bool.false_eq_true, hcond, ↓reduceIte, bind, Except.bind, pure, Except.pure, ub]
     rw [ite_eq_right_iff.mpr (fun h => absurd h hsz)]
+
+/-- `TreeBorrowsMemory.reborrow` with an EMPTY `inside` list (zero-sized pointee):
+`BasicMemory.check_ptr` returns `none` without inspecting provenance, liveness,
+or bounds, so the reborrow is decided by the provenance and the address alone. -/
+private theorem b3_reborrow_zst (tbm : Gen.TreeBorrowsMemory Gen.x86_64)
+    (thin : Gen.ThinPointer Gen.TreeBorrowsProvenance) (outside : Gen.Permission)
+    (prot : Gen.Protected) (frameExtra : Gen.TreeBorrowsFrameExtra)
+    (hmp : Permission.matches_protector outside prot = true) :
+    (thin.provenance = none →
+      TreeBorrowsMemory.reborrow tbm thin
+          { inside := [], outside := outside, «protected» := prot } frameExtra =
+        .ok (thin, tbm, frameExtra)) ∧
+    (∀ (id : Nat) (path : Gen.Path)
+        (alloc : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra),
+      thin.provenance = some (⟨(id : Int)⟩, path) →
+      tbm.mem.allocations[id]? = some alloc →
+      (thin.addr < alloc.addr →
+        TreeBorrowsMemory.reborrow tbm thin
+            { inside := [], outside := outside, «protected» := prot } frameExtra =
+          .error (.specPanic "Offset::from_bytes(ptr.addr - allocation.addr).unwrap()")) ∧
+      (alloc.addr ≤ thin.addr → ∀ pNode, nodeAt alloc.extra.root path = some pNode →
+        ∃ root1,
+          Node.add_node alloc.extra.root path
+              ⟨[], List.replicate alloc.data.length outside, prot⟩ =
+            .ok (path ++ [(pNode.children.length : Int)], root1) ∧
+          TreeBorrowsMemory.reborrow tbm thin
+              { inside := [], outside := outside, «protected» := prot } frameExtra =
+            .ok ({ thin with
+                provenance := some (⟨(id : Int)⟩, path ++ [(pNode.children.length : Int)]) },
+              { tbm with mem := { tbm.mem with allocations := (tbm.mem.allocations.set id
+                  { alloc with extra := { root := root1 } }) } },
+              if Protected.yes prot then
+                { protectors := frameExtra.protectors ++
+                    [(⟨(id : Int)⟩, path ++ [(pNode.children.length : Int)])] }
+              else frameExtra))) := by
+  have hck : BasicMemory.check_ptr tbm.mem thin ⟨([] : List Gen.Permission).length⟩ = .ok none := rfl
+  refine ⟨fun hnone => ?_, fun id path alloc hprov halloc => ⟨fun hlt => ?_, fun hge pNode hpNode => ?_⟩⟩
+  · unfold TreeBorrowsMemory.reborrow
+    dsimp only
+    rw [hck]
+    simp only [bind, Except.bind, hnone]
+    rfl
+  · have hneg : ¬ (0 ≤ thin.addr - alloc.addr) := Int.not_le.mpr (a2_int_sub_neg hlt)
+    unfold TreeBorrowsMemory.reborrow
+    dsimp only
+    rw [hck]
+    simp only [bind, Except.bind, hprov]
+    rw [a1_listMutateAt_natCast _ _ _ _ alloc halloc]
+    simp only [Size.from_bytes, hneg, ↓reduceIte, bind, Except.bind, specPanic]
+  · obtain ⟨root1, hadd, _⟩ := node_add_node_spec alloc.extra.root pNode
+      ⟨[], List.replicate alloc.data.length outside, prot⟩ path hpNode rfl
+    refine ⟨root1, hadd, ?_⟩
+    have hnn : 0 ≤ thin.addr - alloc.addr := Int.sub_nonneg_of_le hge
+    have hall : ((List.replicate (Allocation.size alloc).bytes outside).all
+        fun x => Permission.matches_protector x prot) = true := by
+      rw [List.all_eq_true]
+      intro p hp
+      rw [List.eq_of_mem_replicate hp]
+      exact hmp
+    have hadd' : Node.add_node alloc.extra.root path
+        { children := [], permissions := List.replicate (Allocation.size alloc).bytes outside,
+          «protected» := prot } =
+        .ok (path ++ [(pNode.children.length : Int)], root1) := hadd
+    unfold TreeBorrowsMemory.reborrow
+    dsimp only
+    rw [hck]
+    simp only [bind, Except.bind, hprov]
+    rw [a1_listMutateAt_natCast _ _ _ _ alloc halloc]
+    simp only [Size.from_bytes, hnn, ↓reduceIte, List.length_nil, Nat.lt_irrefl, gt_iff_lt, hall,
+      Bool.not_true, Bool.false_eq_true, hadd', TreeBorrowsMemory.reborrowInitAccess,
+      bind, Except.bind, pure, Except.pure]
+
+/-- **ZST half of the `TreeBorrowsMemory.retag_ptr` dereferenceability boundary
+(exact three-way case split)**: for EVERY zero-sized, non-pinned safe pointer
+(`&T`, `&mut T` under `#[rustc_no_writable]` or the standard policy, `Box<T>`;
+any `fnEntry` / `fnIw`), `reborrow` calls `BasicMemory.check_ptr` with length `0`,
+which returns before looking at provenance, liveness, or bounds. Hence, in
+contrast to the non-ZST theorem `tbm_retag_ptr_safe_dereferenceable_ub`:
+1. **no provenance**: the retag is a no-op for ANY address (null and dangling
+   included);
+2. **provenance into ANY allocation — live OR DEAD — at ANY address at or above
+   its base (arbitrarily far past its end)**: the retag SUCCEEDS whenever the
+   parent path names a node, adds a leaf child whose permissions are
+   `outside` on every byte, and pushes a protector exactly when `fnEntry`
+   (so a dead allocation's tree still grows and still receives protectors);
+3. **provenance with an address BELOW the allocation base**: the retag stops
+   with the spec panic `Offset::from_bytes(ptr.addr - allocation.addr).unwrap()`
+   — a `specPanic`, NOT Undefined Behavior — because `reborrow` computes the
+   offset without the bounds check that `check_ptr` skipped.
+No liveness, upper-bound, or alignment hypothesis appears: this removes the
+`alloc.live = true` and `off ≤ alloc.data.length` side conditions under which
+`tbm_retag_ptr_fnEntry_zst_wholeTree` is stated. -/
+theorem tbm_retag_ptr_zst_safe_skips_dereferenceable
+    (tbm : Gen.TreeBorrowsMemory Gen.x86_64) (frameExtra : Gen.TreeBorrowsFrameExtra)
+    (ptr : Gen.Pointer Gen.TreeBorrowsProvenance)
+    (pointee : Gen.PointeeInfo) (al : LibSpecr.Align)
+    (cells : List (Gen.Offset × LibSpecr.Size)) (mask : List Bool)
+    (hlay : pointee.layout = .Sized ⟨0⟩ al)
+    (hcells : pointee.unsafe_cells = .Sized cells)
+    (hmask : cellsToFreezeMask cells ⟨0⟩ = .ok mask)
+    (ptrType : Gen.PtrType)
+    (hptrTy : ptrType = .Ref .Immutable pointee ∨
+      (pointee.unpin = true ∧ (ptrType = .Ref .Mutable pointee ∨ ptrType = .Box pointee)))
+    (fnEntry fnIw : Bool)
+    (lookup : Gen.ThinPointer Gen.TreeBorrowsProvenance → Interp Gen.VTable) :
+    (ptr.thin_pointer.provenance = none →
+      TreeBorrowsMemory.retag_ptr tbm frameExtra ptr ptrType fnEntry fnIw lookup =
+        .ok (ptr, tbm, frameExtra)) ∧
+    (∀ (id : Nat) (path : Gen.Path)
+        (alloc : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra),
+      ptr.thin_pointer.provenance = some (⟨(id : Int)⟩, path) →
+      tbm.mem.allocations[id]? = some alloc →
+      (ptr.thin_pointer.addr < alloc.addr →
+        TreeBorrowsMemory.retag_ptr tbm frameExtra ptr ptrType fnEntry fnIw lookup =
+          .error (.specPanic "Offset::from_bytes(ptr.addr - allocation.addr).unwrap()")) ∧
+      (alloc.addr ≤ ptr.thin_pointer.addr →
+        ∀ pNode, nodeAt alloc.extra.root path = some pNode →
+        ∃ outside prot root1,
+          Protected.yes prot = fnEntry ∧
+          Node.add_node alloc.extra.root path
+              ⟨[], List.replicate alloc.data.length outside, prot⟩ =
+            .ok (path ++ [(pNode.children.length : Int)], root1) ∧
+          TreeBorrowsMemory.retag_ptr tbm frameExtra ptr ptrType fnEntry fnIw lookup =
+            .ok (ThinPointer.widen { ptr.thin_pointer with
+                  provenance := some (⟨(id : Int)⟩, path ++ [(pNode.children.length : Int)]) }
+                ptr.metadata,
+              { tbm with mem := { tbm.mem with allocations := (tbm.mem.allocations.set id
+                  { alloc with extra := { root := root1 } }) } },
+              if fnEntry then
+                { protectors := frameExtra.protectors ++
+                    [(⟨(id : Int)⟩, path ++ [(pNode.children.length : Int)])] }
+              else frameExtra))) := by
+  obtain ⟨settings, hnew, hsLen, hmpOut, hyes⟩ := b3_reborrowSettings_new_sized_safe tbm ptr pointee 0
+    al cells mask hlay hcells hmask ptrType hptrTy fnEntry fnIw lookup
+  obtain ⟨inside, outside, prot⟩ := settings
+  dsimp only at hsLen hmpOut hyes
+  obtain rfl : inside = [] := List.eq_nil_of_length_eq_zero hsLen
+  obtain ⟨hnoneR, hsomeR⟩ := b3_reborrow_zst tbm ptr.thin_pointer outside prot frameExtra hmpOut
+  have hret : ∀ r, TreeBorrowsMemory.reborrow tbm ptr.thin_pointer
+        { inside := [], outside := outside, «protected» := prot } frameExtra = r →
+      TreeBorrowsMemory.retag_ptr tbm frameExtra ptr ptrType fnEntry fnIw lookup =
+        (r >>= fun x => pure (ThinPointer.widen x.1 ptr.metadata, x.2.1, x.2.2)) := by
+    intro r hr
+    subst hr
+    unfold TreeBorrowsMemory.retag_ptr
+    rw [hnew]
+    rfl
+  refine ⟨fun hnone => ?_, fun id path alloc hprov halloc => ⟨fun hlt => ?_, fun hge pNode hpNode => ?_⟩⟩
+  · rw [hret _ (hnoneR hnone)]; rfl
+  · rw [hret _ ((hsomeR id path alloc hprov halloc).1 hlt)]; rfl
+  · obtain ⟨root1, hadd, hreb⟩ := (hsomeR id path alloc hprov halloc).2 hge pNode hpNode
+    refine ⟨outside, prot, root1, hyes, hadd, ?_⟩
+    rw [hret _ hreb, ← hyes]; rfl
 
 private theorem a2_checkPtrM_safe_step {M : Type} [Gen.Memory M] [MemoryOps M]
     (m : Gen.Machine M) (thin : Gen.ThinPointer (Gen.Memory.Provenance M))
@@ -21883,27 +22181,7 @@ private theorem a2_checkPtrM_safe_step {M : Type} [Gen.Memory M] [MemoryOps M]
   have hmetaOk : checkPtrMetadataM (Provenance := Gen.Memory.Provenance M) none .None = .ok () := rfl
   cases ptrTy with
   | Raw _ | FnPtr | VTablePtr _ => cases hsafe
-  | Ref _ p =>
-    cases hsafe
-    refine ⟨fun hnull => ?_, fun hnz hmis => ?_, fun hnz hal huninh => ?_, fun hnz hal hinh msg hder => ?_⟩
-    · unfold checkPtrM; rw [h1 _ () _ (hensT _ _ haddrBounds)]
-      dsimp only [PtrType.meta_kind, LayoutStrategy.meta_kind, PtrType.safe_pointee]
-      rw [h1 _ () _ hmetaOk, h1 _ (⟨sz⟩, al) _ hcsa, h1 _ () _ (hensT _ _ hszBounds),
-          h2 _ _ _ (hensF _ _ (by rw [hnull]; rfl))]
-    · unfold checkPtrM; rw [h1 _ () _ (hensT _ _ haddrBounds)]
-      dsimp only [PtrType.meta_kind, LayoutStrategy.meta_kind, PtrType.safe_pointee]
-      rw [h1 _ () _ hmetaOk, h1 _ (⟨sz⟩, al) _ hcsa, h1 _ () _ (hensT _ _ hszBounds),
-          h1 _ () _ (hensT _ _ (bne_iff_ne.mpr hnz)), h2 _ _ _ (hensF _ _ hmis)]
-    · unfold checkPtrM; rw [h1 _ () _ (hensT _ _ haddrBounds)]
-      dsimp only [PtrType.meta_kind, LayoutStrategy.meta_kind, PtrType.safe_pointee]
-      rw [h1 _ () _ hmetaOk, h1 _ (⟨sz⟩, al) _ hcsa, h1 _ () _ (hensT _ _ hszBounds),
-          h1 _ () _ (hensT _ _ (bne_iff_ne.mpr hnz)), h1 _ () _ (hensT _ _ hal), h2 _ _ _ (hensF _ _ huninh)]
-    · unfold checkPtrM; rw [h1 _ () _ (hensT _ _ haddrBounds)]
-      dsimp only [PtrType.meta_kind, LayoutStrategy.meta_kind, PtrType.safe_pointee]
-      rw [h1 _ () _ hmetaOk, h1 _ (⟨sz⟩, al) _ hcsa, h1 _ () _ (hensT _ _ hszBounds),
-          h1 _ () _ (hensT _ _ (bne_iff_ne.mpr hnz)), h1 _ () _ (hensT _ _ hal),
-          h1 _ () _ (hensT _ _ hinh), hder]; rfl
-  | Box p =>
+  | Ref _ p | Box p =>
     cases hsafe
     refine ⟨fun hnull => ?_, fun hnz hmis => ?_, fun hnz hal huninh => ?_, fun hnz hal hinh msg hder => ?_⟩
     · unfold checkPtrM; rw [h1 _ () _ (hensT _ _ haddrBounds)]
@@ -23009,6 +23287,63 @@ theorem canary_retag_alignment_and_deref_boundary :
         nwsrVtableLookup with
     | ok r => exact ⟨r, rfl⟩ | error _ => rw [h] at h5chk; cases h5chk
   exact ⟨h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12⟩
+
+/-- **Closed non-vacuity canary for `tbm_retag_ptr_zst_safe_skips_dereferenceable`**
+(zero hypotheses) on a DEAD 4-byte allocation at `[256, 260)`, contrasting a
+`#[rustc_no_writable]` `FnEntry` `&mut u8`, a `#[rustc_no_writable]` `FnEntry`
+ZST `&mut ()`, and a raw pointer:
+1. non-ZST `&mut u8` at `256`: exact `.ub "dereferencing pointer to dead allocation"`;
+2. ZST `&mut ()` at `256` (inside the dead allocation) and at `100000` (far past
+   its end): the retag SUCCEEDS and pushes the protector `(0, [0])`;
+3. ZST `&mut ()` at `255` (one byte below the base): exact
+   `.specPanic "Offset::from_bytes(ptr.addr - allocation.addr).unwrap()"`;
+4. ZST `&mut ()` without provenance at `255`, and a raw pointer at `255`: no-ops. -/
+theorem canary_retag_ptr_zst_dead_oob_and_specPanic :
+    let deadAlloc : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
+      { mkRootAllocTB (tbU32Bytes 1) 256 4 .Global with live := false }
+    let tbmD : Gen.TreeBorrowsMemory Gen.x86_64 :=
+      { params := ⟨true⟩, mem := { allocations := [deadAlloc], _phantom := ⟨⟩ } }
+    let zstTy : Gen.PtrType := .Ref .Mutable (pointeeInfoOfFacts ⟨true, true, true⟩ 0 1 [])
+    let u8Ty : Gen.PtrType := .Ref .Mutable (pointeeInfoOfFacts ⟨true, true, true⟩ 1 1 [])
+    let ptrAt : Int → Gen.Pointer Gen.TreeBorrowsProvenance := fun a =>
+      ThinPointer.widen { addr := a, provenance := some (⟨0⟩, []) } none
+    let ptrNoProv : Gen.Pointer Gen.TreeBorrowsProvenance :=
+      ThinPointer.widen { addr := 255, provenance := none } none
+    TreeBorrowsMemory.retag_ptr tbmD TreeBorrowsMemory.new_call (ptrAt 256) u8Ty true false
+        nwsrVtableLookup = .error (.ub "dereferencing pointer to dead allocation") ∧
+    (∃ r, TreeBorrowsMemory.retag_ptr tbmD TreeBorrowsMemory.new_call (ptrAt 256) zstTy true false
+        nwsrVtableLookup = .ok r ∧ r.2.2.protectors = [(⟨0⟩, [0])]) ∧
+    (∃ r, TreeBorrowsMemory.retag_ptr tbmD TreeBorrowsMemory.new_call (ptrAt 100000) zstTy true false
+        nwsrVtableLookup = .ok r ∧ r.2.2.protectors = [(⟨0⟩, [0])]) ∧
+    TreeBorrowsMemory.retag_ptr tbmD TreeBorrowsMemory.new_call (ptrAt 255) zstTy true false
+        nwsrVtableLookup =
+      .error (.specPanic "Offset::from_bytes(ptr.addr - allocation.addr).unwrap()") ∧
+    TreeBorrowsMemory.retag_ptr tbmD TreeBorrowsMemory.new_call ptrNoProv zstTy true false
+        nwsrVtableLookup = .ok (ptrNoProv, tbmD, TreeBorrowsMemory.new_call) ∧
+    TreeBorrowsMemory.retag_ptr tbmD TreeBorrowsMemory.new_call (ptrAt 255) (.Raw .None) true false
+        nwsrVtableLookup = .ok (ptrAt 255, tbmD, TreeBorrowsMemory.new_call) := by
+  dsimp only
+  have hz := fun (p : Gen.Pointer Gen.TreeBorrowsProvenance) =>
+    tbm_retag_ptr_zst_safe_skips_dereferenceable
+      { params := ⟨true⟩, mem := { allocations :=
+        [{ mkRootAllocTB (tbU32Bytes 1) 256 4 .Global with live := false }], _phantom := ⟨⟩ } }
+      TreeBorrowsMemory.new_call p (pointeeInfoOfFacts ⟨true, true, true⟩ 0 1 []) ⟨1⟩ [] [] rfl rfl rfl
+      (.Ref .Mutable (pointeeInfoOfFacts ⟨true, true, true⟩ 0 1 [])) (Or.inr ⟨rfl, Or.inl rfl⟩)
+      true false nwsrVtableLookup
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+  · exact ((tbm_retag_ptr_safe_dereferenceable_ub _ TreeBorrowsMemory.new_call _
+      (pointeeInfoOfFacts ⟨true, true, true⟩ 1 1 []) 1 ⟨1⟩ [] [true] rfl (by decide) rfl rfl
+      _ (Or.inr ⟨rfl, Or.inl rfl⟩) true false nwsrVtableLookup).2 0 [] _ rfl rfl).1 rfl
+  · obtain ⟨_, _, _, _, _, hok⟩ := ((hz (ThinPointer.widen { addr := 256, provenance := some (⟨0⟩, []) }
+      none)).2 0 [] _ rfl rfl).2 (by decide) _ rfl
+    exact ⟨_, hok, rfl⟩
+  · obtain ⟨_, _, _, _, _, hok⟩ := ((hz (ThinPointer.widen { addr := 100000, provenance := some (⟨0⟩, []) }
+      none)).2 0 [] _ rfl rfl).2 (by decide) _ rfl
+    exact ⟨_, hok, rfl⟩
+  · exact ((hz (ThinPointer.widen { addr := 255, provenance := some (⟨0⟩, []) } none)).2 0 [] _ rfl
+      rfl).1 (by decide)
+  · exact (hz (ThinPointer.widen { addr := 255, provenance := none } none)).1 rfl
+  · rfl
 
 /-- **Closed non-vacuity canary for `tbm_deallocate_full_spec` &
 `evalIntrinsicM_tb_deallocate_post_state`** (zero hypotheses):
@@ -24354,6 +24689,30 @@ info: 'MiniRustSpec.NoWritableAndStaticRetag.canary_retag_alignment_and_deref_bo
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.NoWritableAndStaticRetag.canary_retag_alignment_and_deref_boundary
+
+/--
+info: 'MiniRustSpec.NoWritableAndStaticRetag.endCallLockstepSim_end_call' depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.NoWritableAndStaticRetag.endCallLockstepSim_end_call
+
+/--
+info: 'MiniRustSpec.NoWritableAndStaticRetag.tbm_retag_ptr_zst_safe_skips_dereferenceable' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.NoWritableAndStaticRetag.tbm_retag_ptr_zst_safe_skips_dereferenceable
+
+/--
+info: 'MiniRustSpec.NoWritableAndStaticRetag.canary_endCall_lockstep_iff_and_end_call_bridge' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.NoWritableAndStaticRetag.canary_endCall_lockstep_iff_and_end_call_bridge
+
+/--
+info: 'MiniRustSpec.NoWritableAndStaticRetag.canary_retag_ptr_zst_dead_oob_and_specPanic' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.NoWritableAndStaticRetag.canary_retag_ptr_zst_dead_oob_and_specPanic
 
 end AxiomGuards
 
