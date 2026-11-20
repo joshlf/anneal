@@ -2221,10 +2221,10 @@ theorem declLayoutCoherent_of_nonAggregate (localDecls : List LocalDecl)
 /-- The byte offset MiniRust's `PlaceExpr::Field` adds for field `i` of a tuple type: the offset
 component of `sized_fields[i]` (`spec/lang/step/expressions.md`:
 > "let (offset, field_ty) = match ty {
->      Type::Tuple { sized_fields, sized_head_layout, unsized_field } => {
+>      Type::Tuple { sized_fields, unsized_field, sized_head_layout } => {
 >          if field >= 0 && field < sized_fields.len() {
 >              sized_fields[field]
->          } ..
+>          }"
 ), `none` when the type is not a tuple or has no sized field `i`. -/
 def mrFieldOffset? (mrTy : Gen.Type) (i : Nat) : Option Nat :=
   match mrTy with
@@ -2805,6 +2805,165 @@ theorem nullaryOp_offsetOf_path_minirust (locals : List LocalSlot) (ty : Ty) (me
   · simp [h, (valid_size_iff size).mpr h]
   · have hvs : ¬ x86_64.valid_size ⟨size⟩ = true := fun hvs => h ((valid_size_iff size).mp hvs)
     simp [h, hvs]
+
+/-- Every scalar leaf reachable in `(idx, spec)` under `layouts` records
+`VariantsShape.single 0` and `FieldsShape.primitive` when `LayoutTable.lookup layouts idx`
+succeeds, as `rustc-capture` emits for primitive integer types. Together with
+`FieldLayoutsRecorded`, this makes nested-path `offset_of!` resolution exact in both directions
+(both `some off` and `none`). -/
+inductive ScalarLeavesPrimitive (layouts : Layout.LayoutTable) : Nat → TupleSpec → Prop
+  | scalar (idx : Nat) (it : Gen.IntType) :
+      (∀ l, Layout.LayoutTable.lookup layouts idx = some l →
+        l.variants = .single 0 ∧ l.fields = .primitive) →
+      ScalarLeavesPrimitive layouts idx (.scalar it)
+  | tuple (idx : Nat) (fields : List (Nat × TupleSpec)) (size align : Nat) :
+      (∀ l, Layout.LayoutTable.lookup layouts idx = some l →
+        ∀ (i : Nat) (o : Nat) (s : TupleSpec), fields[i]? = some (o, s) →
+          ScalarLeavesPrimitive layouts (l.fieldLayouts[i]?.getD 0) s) →
+      ScalarLeavesPrimitive layouts idx (.tuple fields size align)
+
+private theorem specOfRigidTy_scalar_not_tuple {layouts : Layout.LayoutTable} {k : RigidTy}
+    {idx : Nat} {it : Gen.IntType} (h : specOfRigidTy layouts k idx = some (.scalar it)) :
+    ∀ ks, k ≠ .tuple ks := by
+  intro ks hEq
+  subst hEq
+  simp only [specOfRigidTy] at h
+  cases hl : Layout.LayoutTable.lookup layouts idx with
+  | none => rw [hl] at h; cases h
+  | some l =>
+    rw [hl] at h
+    simp only [Option.bind_eq_bind, Option.bind_some] at h
+    split at h
+    · split at h
+      · cases hs : specOfFieldList layouts _ ks l.fieldLayouts with
+        | none => rw [hs] at h; cases h
+        | some fs => rw [hs] at h; cases h
+      · cases h
+    · cases h
+
+/-- **A3 (nested paths, two-sided `resolveOffsetOfPath` equality)**: under `FieldLayoutsRecorded`
+and `ScalarLeavesPrimitive`, Trusted's `resolveOffsetOfPath` matches MiniRust's `mrPathOffset?`
+for **every** field path `path : List Nat` — agreeing on both `some off` and `none` (out-of-range
+field index or descending into a scalar leaf). -/
+theorem resolveOffsetOfPath_spec_path_eq (layouts : Layout.LayoutTable)
+    (sF aF : RigidTy → Option Nat) (lo : RigidTy → Option Layout.TypeLayout)
+    (hRec : FieldLayoutsRecorded layouts) :
+    ∀ (path : List Nat) (k : RigidTy) (kindOpt : Option RigidTy) (idx : Nat) (spec : TupleSpec),
+      (kindOpt = none ∨ kindOpt = some k) →
+      specOfRigidTy layouts k idx = some spec →
+      ScalarLeavesPrimitive layouts idx spec →
+      resolveOffsetOfPath layouts sF aF lo kindOpt (Layout.LayoutTable.lookup layouts idx)
+          (path.map (fun i => ((0 : VariantIdx), (i : FieldIdx)))) =
+        mrPathOffset? spec.toMiniRustTy path := by
+  intro path
+  induction path with
+  | nil =>
+    intro k kindOpt idx spec _ _ _
+    rw [List.map_nil, resolveOffsetOfPath_nil, mrPathOffset?]
+  | cons i rest ih =>
+    intro k kindOpt idx spec hKind hSpec hPrim
+    cases spec with
+    | scalar it =>
+      simp only [TupleSpec.toMiniRustTy, mrPathOffset?, List.map_cons]
+      cases hl : Layout.LayoutTable.lookup layouts idx with
+      | none =>
+        rcases hKind with rfl | rfl
+        · rfl
+        · have hnt := specOfRigidTy_scalar_not_tuple hSpec
+          cases k with
+          | tuple ks => exact absurd rfl (hnt ks)
+          | _ => rfl
+      | some l =>
+        cases hPrim with
+        | scalar _ _ hP =>
+          obtain ⟨hv, hfp⟩ := hP l hl
+          apply resolveOffsetOfPath_step_none
+          unfold layoutVariantFieldOffset?
+          rw [hv, hfp]
+    | tuple fields size align =>
+      obtain ⟨l, offsets, mi, fks, hl, hv, hf, _, _, hk, hFL⟩ := specOfRigidTy_tuple_inv hSpec
+      obtain ⟨hlen, hget⟩ := specOfFieldList_getElem? layouts offsets fks l.fieldLayouts fields hFL
+      rw [List.map_cons, hl,
+        resolveOffsetOfPath_single0_step layouts sF aF lo kindOpt l offsets mi hv hf]
+      simp only [TupleSpec.toMiniRustTy, mrPathOffset?, fieldsToMiniRust_getElem?]
+      cases hfi : fields[i]? with
+      | none =>
+        have hge : fields.length ≤ i := List.getElem?_eq_none_iff.mp hfi
+        have hoffNone : offsets[i]? = none := List.getElem?_eq_none_iff.mpr (by omega)
+        rw [hoffNone]
+        rfl
+      | some f =>
+        rcases f with ⟨o, s⟩
+        obtain ⟨off', fk, hoff, ho, hfk, hs⟩ := hget i o s hfi
+        have hmem : l ∈ layouts.entries := List.mem_of_getElem? hl
+        have hflLen := hRec l hmem offsets mi hf
+        have hi : i < offsets.length := by
+          rcases Nat.lt_or_ge i offsets.length with h | h
+          · exact h
+          · rw [List.getElem?_eq_none_iff.mpr h] at hoff; cases hoff
+        have hfl : l.fieldLayouts[i]? = some l.fieldLayouts[i] :=
+          List.getElem?_eq_getElem (by omega)
+        have hPrimChild : ScalarLeavesPrimitive layouts l.fieldLayouts[i] s := by
+          cases hPrim with
+          | tuple _ _ _ _ hP =>
+            have hPc := hP l hl i o s hfi
+            rw [hfl, Option.getD_some] at hPc
+            exact hPc
+        rw [hfl] at hs
+        simp only [Option.getD_some] at hs
+        have hck : childKindOf kindOpt i = none ∨ childKindOf kindOpt i = some fk := by
+          rcases hKind with rfl | rfl
+          · exact Or.inl rfl
+          · rcases hk with rfl | ⟨p, rfl⟩
+            · exact Or.inr hfk
+            · exact Or.inl rfl
+        rw [hoff]
+        dsimp only
+        rw [hfl]
+        dsimp only
+        rw [ih fk (childKindOf kindOpt i) l.fieldLayouts[i] s hck hs hPrimChild, ho]
+        cases hmr : mrPathOffset? s.toMiniRustTy rest <;> simp [hmr]
+
+/-- **A3 (`OffsetOf`, nested paths, two-sided)**: under `FieldLayoutsRecorded` and
+`ScalarLeavesPrimitive`, Trusted's `Rvalue.nullaryOp (.offsetOf ..)` agrees with MiniRust's
+`mrPathOffset?` for **every** path `path : List Nat`: returning `.ok (.scalar ⟨off, 8⟩)` iff
+`mrPathOffset? = some off`, `x86_64.valid_size ⟨size⟩ = true`, and `off ≤ size`, and
+`.unsupported` otherwise (including every invalid/out-of-range/over-deep path). -/
+theorem nullaryOp_offsetOf_path_minirust_two_sided (locals : List LocalSlot) (ty : Ty)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : Layout.LayoutTable)
+    (fields : List (Nat × TupleSpec)) (size align : Nat)
+    (hPtr : layouts.pointerBits = 64)
+    (hRec : FieldLayoutsRecorded layouts)
+    (hPrim : ScalarLeavesPrimitive layouts ty.layoutIdx (.tuple fields size align))
+    (hT : tupleTypeOf layouts ty = some (fields, size, align))
+    (hDecl : DeclLayoutCoherent localDecls layouts ty)
+    (hEntry : findDeclLayoutForRigidTy localDecls layouts ty.kind =
+      Layout.LayoutTable.lookup layouts ty.layoutIdx)
+    (path : List Nat) :
+    evalRvalue locals
+        (.nullaryOp (.offsetOf (path.map (fun i => ((0 : VariantIdx), (i : FieldIdx))))) ty) mem
+        localDecls layouts =
+      match mrPathOffset? (TupleSpec.tuple fields size align).toMiniRustTy path with
+      | some off =>
+        if x86_64.valid_size ⟨size⟩ = true ∧ off ≤ size then .ok (.scalar ⟨off, 8⟩) locals mem
+        else .unsupported
+      | none => .unsupported := by
+  obtain ⟨hO, hIB, hSpec⟩ := tupleTypeOf_inv hT
+  obtain ⟨hSz, _, _⟩ := hDecl size align (by simp [aggLayoutOf, hO, hIB, hT])
+  show evalNullaryOp locals (.offsetOf (path.map (fun i => ((0 : VariantIdx), (i : FieldIdx)))))
+    ty mem localDecls layouts = _
+  rw [evalNullaryOp_offsetOf_eq, hSz, hEntry,
+    resolveOffsetOfPath_spec_path_eq layouts _ _ _ hRec path ty.kind (some ty.kind)
+      ty.layoutIdx _ (Or.inr rfl) hSpec hPrim,
+    maxObjSize_of_64 layouts hPtr, layoutPointerBytes_of_64 layouts hPtr]
+  cases mrPathOffset? (TupleSpec.tuple fields size align).toMiniRustTy path with
+  | none => rfl
+  | some off =>
+    dsimp only
+    by_cases h : size ≤ 9223372036854775807
+    · simp [h, (valid_size_iff size).mpr h]
+    · have hvs : ¬ x86_64.valid_size ⟨size⟩ = true := fun hvs => h ((valid_size_iff size).mp hvs)
+      simp [h, hvs]
 
 /-! ### A1-A3. Declaration-layout coherence from raw layout-table facts -/
 
@@ -3467,6 +3626,50 @@ theorem wit_offsetOf :
       wit_declLayoutCoherent.2.1 rfl 2 (by decide)
   · exact nullaryOp_offsetOf_variant_ne_zero_unsupported [] aPTy emptyMemory aDecls aLayouts _ 8 4
       rfl rfl 1 0 (by decide) []
+
+private theorem aOuterScalarLeavesPrimitive :
+    ScalarLeavesPrimitive aLayouts aOuterTy.layoutIdx
+      (.tuple [(0, .tuple [(0, .scalar ⟨.Unsigned, ⟨1⟩⟩), (4, .scalar ⟨.Unsigned, ⟨4⟩⟩)] 8 4),
+               (8, .scalar ⟨.Unsigned, ⟨2⟩⟩)] 12 4) := by
+  refine .tuple _ _ _ _ (fun l hl i o s hfi => ?_)
+  cases hl
+  rcases i with _ | _ | _
+  · cases hfi
+    refine .tuple _ _ _ _ (fun l' hl' j o' s' hfj => ?_)
+    cases hl'
+    rcases j with _ | _ | _
+    · cases hfj; exact .scalar _ _ (fun ls hls => by cases hls; exact ⟨rfl, rfl⟩)
+    · cases hfj; exact .scalar _ _ (fun ls hls => by cases hls; exact ⟨rfl, rfl⟩)
+    · cases hfj
+  · cases hfi; exact .scalar _ _ (fun ls hls => by cases hls; exact ⟨rfl, rfl⟩)
+  · cases hfi
+
+/-- **A3 witness (two-sided nested paths)**: `aOuterTy` (`(P, u16)`) satisfies both
+`FieldLayoutsRecorded` and `ScalarLeavesPrimitive`, so `nullaryOp_offsetOf_path_minirust_two_sided`
+discharges both valid nested paths (`[0, 1] -> some 4`) and invalid nested paths (`[0, 2]`
+out-of-range inside `P`, and `[0, 1, 0]` descending into the scalar `u32` leaf `P.b`, both `none` /
+`.unsupported`). -/
+theorem wit_offsetOf_path_two_sided :
+    FieldLayoutsRecorded aLayouts ∧
+    ScalarLeavesPrimitive aLayouts aOuterTy.layoutIdx
+      (.tuple [(0, .tuple [(0, .scalar ⟨.Unsigned, ⟨1⟩⟩), (4, .scalar ⟨.Unsigned, ⟨4⟩⟩)] 8 4),
+               (8, .scalar ⟨.Unsigned, ⟨2⟩⟩)] 12 4) ∧
+    evalRvalue [] (.nullaryOp (.offsetOf [(0, 0), (0, 1)]) aOuterTy) emptyMemory aDecls aLayouts =
+      .ok (.scalar ⟨4, 8⟩) [] emptyMemory ∧
+    evalRvalue [] (.nullaryOp (.offsetOf [(0, 0), (0, 2)]) aOuterTy) emptyMemory aDecls aLayouts =
+      .unsupported ∧
+    evalRvalue [] (.nullaryOp (.offsetOf [(0, 0), (0, 1), (0, 0)]) aOuterTy) emptyMemory aDecls
+        aLayouts = .unsupported := by
+  refine ⟨aFieldLayoutsRecorded, aOuterScalarLeavesPrimitive, ?_, ?_, ?_⟩
+  · exact (nullaryOp_offsetOf_path_minirust_two_sided [] aOuterTy emptyMemory aDecls aLayouts _ 12 4
+      rfl aFieldLayoutsRecorded aOuterScalarLeavesPrimitive rfl wit_declLayoutCoherent.2.2 rfl
+      [0, 1]).trans rfl
+  · exact (nullaryOp_offsetOf_path_minirust_two_sided [] aOuterTy emptyMemory aDecls aLayouts _ 12 4
+      rfl aFieldLayoutsRecorded aOuterScalarLeavesPrimitive rfl wit_declLayoutCoherent.2.2 rfl
+      [0, 2]).trans rfl
+  · exact (nullaryOp_offsetOf_path_minirust_two_sided [] aOuterTy emptyMemory aDecls aLayouts _ 12 4
+      rfl aFieldLayoutsRecorded aOuterScalarLeavesPrimitive rfl wit_declLayoutCoherent.2.2 rfl
+      [0, 1, 0]).trans rfl
 
 /-- **A4/A5 witness**: `UbChecks` at `bool` is `true`, at `u8` it is `.unsupported`;
 `ContractChecks` is `.unsupported`. -/

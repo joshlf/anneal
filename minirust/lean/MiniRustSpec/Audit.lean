@@ -7270,12 +7270,14 @@ that the closed branches made public, and the `Mach` corollaries of
   VTablePtr.checkPtr_traitObject_agree
   VTablePtr.dereferenceable_agree_of_memAllocsAgree
   VTablePtr.checkPtr_traitObject_agree_of_memAllocsAgree
+  VTablePtr.checkPtr_tupleTraitObject_agree_of_memAllocsAgree
   VTablePtr.vtableFromPtr_witness
   VTablePtr.checkPtr_vtablePtr_witness
   VTablePtr.checkPtr_dynRef_witness
   VTablePtr.transmute_vtablePtr_witness
   VTablePtr.vtMach_vtMachTB_agree
   VTablePtr.vtMach_vtMachTB_agree_structural
+  VTablePtr.vtMach_vtMachTB_customDst_agree
   VTablePtr.vtablePtr_child_path_divergence
   vtableFromPtrM_bm_eq
   checkPtrMetadataM_bm_eq
@@ -7428,6 +7430,16 @@ example (m : Mach) (mt : MachTB) (hvt : VTablesAgree m mt) (hmem : MemAllocsAgre
   checkPtr_traitObject_agree_of_memAllocsAgree m mt hvt hmem ptr ptrTy pointee traitName hsafe hlay
     hf
 
+example (m : Mach) (mt : MachTB) (hvt : VTablesAgree m mt) (hmem : MemAllocsAgree m mt)
+    (ptr : Pointer TreeBorrowsProvenance) (ptrTy : PtrType) (pointee : PointeeInfo)
+    (head : TupleHeadLayout) (traitName : TraitName)
+    (hsafe : PtrType.safe_pointee ptrTy = some pointee)
+    (hlay : pointee.layout = .Tuple head (.TraitObject traitName))
+    (hf : ∀ vp, ptr.metadata = some (.VTablePointer vp) → PathFaithful mt vp) :
+    checkPtr (erasePathPtr ptr) ptrTy (some m) = checkPtrM ptr ptrTy (some mt) :=
+  checkPtr_tupleTraitObject_agree_of_memAllocsAgree m mt hvt hmem ptr ptrTy pointee head traitName
+    hsafe hlay hf
+
 end VTablePtrStatementPins
 
 end VTablePtrAuditPins
@@ -7533,6 +7545,8 @@ typed and byte memory model on `Mach` and `MachTB`). -/
   VolatileBridge.mmio_volatile_not_noUB
   VolatileBridge.mmio_volatile_copy_set_step_unsupported
   VolatileBridge.mmio_volatile_copy_set_not_noUB
+  VolatileBridge.unlinked_read_write_volatile_misaligned_parity
+  VolatileBridge.unlinked_read_write_volatile_mmio_one_way_soundness
   VolatileBridge.mr_endianness_decode_eq_intFromBits
   VolatileBridge.codec_int_decode_agreement
   VolatileBridge.tDecodeIsUb_sound
@@ -7722,6 +7736,46 @@ example (layouts : LayoutTable) (idx : LayoutIdx) (hLE : layouts.isLittleEndian 
       Interp.Type.decode .Bool (vbPlain [UInt8.ofNat n]) = .ok none) :=
   codec_bool_validity_all_bytes_general layouts idx hLE n hn
 
+example (s : MachineState) (target : ResolvedCallTarget) (decls : List MirAst.LocalDecl)
+    (layouts : LayoutTable) (argOps : List Operand) (locals' : List LocalSlot)
+    (destination : MirAst.Place) (targetBb : BasicBlockIdx)
+    (elemTy : Ty) (size align addr : Nat) (val : MirSemantics.Value)
+    (m : Interp.Mach) (mval : Interp.Val) (mbytes : List Interp.Byte)
+    (mtb : Interp.MachTB) (mvalTB : Gen.Value Interp.TBM)
+    (mbytesTB : List (Gen.AbstractByte Gen.TreeBorrowsProvenance))
+    (mty : Gen.«Type») (msize : LibSpecr.Size)
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
+    (hMLay : Interp.Type.layout mty = .ok (.Sized msize ⟨align⟩))
+    (hpos : 0 < align)
+    (hAl : Interp.Align.is_aligned ⟨align⟩ (addr : Int) = true)
+    (hInh : rawPtrTyIsUninhabited layouts elemTy = false)
+    (hVal : rawPtrStoreValueFault? layouts elemTy val = .none)
+    (hSize : size ≠ 0) (hMSize : msize.bytes ≠ 0)
+    (hChk : Interp.checkValue mval mty (some m) = .ok ())
+    (hEnc : Interp.Type.encode mty mval = .ok mbytes)
+    (hChkTB : Interp.checkValueM mvalTB mty (some mtb) = .ok ())
+    (hEncTB : Interp.Type.encodeM (M := Interp.TBM) mty mvalTB = .ok mbytesTB)
+    (hMLen : mbytes.length ≠ 0) (hMLenTB : mbytesTB.length ≠ 0) :
+    (target.defPath = "core::ptr::read_volatile" →
+      evalUnlinkedPtrAccessCall? s target decls layouts argOps
+          [.scalar ⟨addr, layoutPointerBytes layouts⟩] locals' destination targetBb =
+        some MirStepNode.unsupported ∧
+      mrLoad true m ⟨addr, none⟩ mty =
+        .error (.ub "dereferencing pointer without provenance") ∧
+      mrLoadTB true mtb ⟨addr, none⟩ mty =
+        .error (.ub "dereferencing pointer without provenance")) ∧
+    (target.defPath = "core::ptr::write_volatile" →
+      evalUnlinkedPtrAccessCall? s target decls layouts argOps
+          [.scalar ⟨addr, layoutPointerBytes layouts⟩, val] locals' destination targetBb =
+        some MirStepNode.unsupported ∧
+      mrStore true m ⟨addr, none⟩ mval mty =
+        .error (.ub "dereferencing pointer without provenance") ∧
+      mrStoreTB true mtb ⟨addr, none⟩ mvalTB mty =
+        .error (.ub "dereferencing pointer without provenance")) :=
+  unlinked_read_write_volatile_mmio_one_way_soundness s target decls layouts argOps locals'
+    destination targetBb elemTy size align addr val m mval mbytes mtb mvalTB mbytesTB mty msize
+    hLay hMLay hpos hAl hInh hVal hSize hMSize hChk hEnc hChkTB hEncTB hMLen hMLenTB
+
 end VolatileBridgeStatementPins
 
 end VolatileBridgeAuditPins
@@ -7846,6 +7900,8 @@ MiniRust on `Mach` and `MachTB`). -/
   NullaryFnPtrBridge.nullaryOp_offsetOf_variant_ne_zero_unsupported
   NullaryFnPtrBridge.resolveOffsetOfPath_spec_path
   NullaryFnPtrBridge.nullaryOp_offsetOf_path_minirust
+  NullaryFnPtrBridge.resolveOffsetOfPath_spec_path_eq
+  NullaryFnPtrBridge.nullaryOp_offsetOf_path_minirust_two_sided
   NullaryFnPtrBridge.declLayoutCoherent_of_same_entry
   NullaryFnPtrBridge.declLayoutCoherent_of_eval
   NullaryFnPtrBridge.evalRvalue_nullaryOp_eq
@@ -7876,6 +7932,7 @@ MiniRust on `Mach` and `MachTB`). -/
   NullaryFnPtrBridge.wit_fnFromPtrM_and_divergence
   NullaryFnPtrBridge.wit_tableAlignWf
   NullaryFnPtrBridge.wit_alignOf_wf_ok_iff_instance
+  NullaryFnPtrBridge.wit_offsetOf_path_two_sided
 
 namespace NullaryFnPtrBridgeStatementPins
 
@@ -7971,6 +8028,28 @@ example (locals : List LocalSlot) (ty : Ty) (mem : MirSemantics.Memory)
     (localDecls : List MirAst.LocalDecl) (layouts : Layout.LayoutTable) :
     evalRvalue locals (.nullaryOp .contractChecks ty) mem localDecls layouts = .unsupported :=
   nullaryOp_contractChecks_unsupported locals ty mem localDecls layouts
+
+example (locals : List LocalSlot) (ty : Ty) (mem : MirSemantics.Memory)
+    (localDecls : List MirAst.LocalDecl) (layouts : Layout.LayoutTable)
+    (fields : List (Nat × TupleSpec)) (size align : Nat)
+    (hPtr : layouts.pointerBits = 64)
+    (hRec : FieldLayoutsRecorded layouts)
+    (hPrim : ScalarLeavesPrimitive layouts ty.layoutIdx (.tuple fields size align))
+    (hT : tupleTypeOf layouts ty = some (fields, size, align))
+    (hDecl : DeclLayoutCoherent localDecls layouts ty)
+    (hEntry : findDeclLayoutForRigidTy localDecls layouts ty.kind =
+      Layout.LayoutTable.lookup layouts ty.layoutIdx)
+    (path : List Nat) :
+    evalRvalue locals
+        (.nullaryOp (.offsetOf (path.map (fun i => ((0 : VariantIdx), (i : FieldIdx))))) ty) mem
+        localDecls layouts =
+      match mrPathOffset? (TupleSpec.tuple fields size align).toMiniRustTy path with
+      | some off =>
+        if x86_64.valid_size ⟨size⟩ = true ∧ off ≤ size then .ok (.scalar ⟨off, 8⟩) locals mem
+        else .unsupported
+      | none => .unsupported :=
+  nullaryOp_offsetOf_path_minirust_two_sided locals ty mem localDecls layouts fields size align
+    hPtr hRec hPrim hT hDecl hEntry path
 
 end NullaryFnPtrBridgeStatementPins
 

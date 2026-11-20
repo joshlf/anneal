@@ -2142,6 +2142,94 @@ theorem checkPtr_traitObject_agree_of_memAllocsAgree (m : Mach) (mt : MachTB)
   checkPtr_traitObject_agree m mt hvt ptr ptrTy pointee traitName hsafe hlay hf
     (fun sz => dereferenceable_agree_of_memAllocsAgree m mt hmem ptr.thin_pointer sz)
 
+/-- **`Mach` ↔ `MachTB` agreement for custom DST safe pointers whose unsized tail is a trait
+object** (`LayoutStrategy.Tuple head (.TraitObject traitName)`) from structural state relations
+alone (`VTablesAgree` + `MemAllocsAgree` + `PathFaithful`). -/
+theorem checkPtr_tupleTraitObject_agree_of_memAllocsAgree (m : Mach) (mt : MachTB)
+    (hvt : VTablesAgree m mt) (hmem : MemAllocsAgree m mt)
+    (ptr : Pointer TreeBorrowsProvenance) (ptrTy : PtrType) (pointee : PointeeInfo)
+    (head : TupleHeadLayout) (traitName : TraitName)
+    (hsafe : PtrType.safe_pointee ptrTy = some pointee)
+    (hlay : pointee.layout = .Tuple head (.TraitObject traitName))
+    (hf : ∀ vp, ptr.metadata = some (.VTablePointer vp) → PathFaithful mt vp) :
+    checkPtr (erasePathPtr ptr) ptrTy (some m) = checkPtrM ptr ptrTy (some mt) := by
+  have hmk : PtrType.meta_kind ptrTy = .VTablePointer traitName := by
+    cases ptrTy with
+    | Ref _ p =>
+      cases Option.some.inj hsafe
+      simp only [PtrType.meta_kind, hlay, LayoutStrategy.meta_kind]
+    | Box p =>
+      cases Option.some.inj hsafe
+      simp only [PtrType.meta_kind, hlay, LayoutStrategy.meta_kind]
+    | Raw _ => cases hsafe
+    | FnPtr => cases hsafe
+    | VTablePtr _ => cases hsafe
+  rw [checkPtr_eq_checkPtrM]
+  rcases ptr with ⟨tp, md⟩
+  cases hin : inBounds tp.addr .Unsigned x86_64.PTR_SIZE with
+  | false =>
+    rw [checkPtrM_oob_ub (some mt) ⟨tp, md⟩ _ hin]
+    exact checkPtrM_oob_ub (M := BM) (some m) (erasePathPtr ⟨tp, md⟩) _ hin
+  | true =>
+    rcases md with _ | (n | vp)
+    · have h1 : checkPtrM (M := BM) ⟨erasePath tp, none⟩ ptrTy (some m) =
+          .error (.ub "Value::Ptr: invalid metadata") := by
+        unfold checkPtrM; rw [hmk]; dsimp only [erasePath]; rw [hin, ensureElseUb_true, okBind]; rfl
+      have h2 : checkPtrM ⟨tp, none⟩ ptrTy (some mt) =
+          .error (.ub "Value::Ptr: invalid metadata") := by
+        unfold checkPtrM; rw [hmk]; dsimp only; rw [hin, ensureElseUb_true, okBind]; rfl
+      rw [h2]; exact h1
+    · have h1 : checkPtrM (M := BM) ⟨erasePath tp, some (.ElementCount n)⟩ ptrTy (some m) =
+          .error (.ub "Value::Ptr: invalid metadata") := by
+        unfold checkPtrM; rw [hmk]; dsimp only [erasePath]; rw [hin, ensureElseUb_true, okBind]; rfl
+      have h2 : checkPtrM ⟨tp, some (.ElementCount n)⟩ ptrTy (some mt) =
+          .error (.ub "Value::Ptr: invalid metadata") := by
+        unfold checkPtrM; rw [hmk]; dsimp only; rw [hin, ensureElseUb_true, okBind]; rfl
+      rw [h2]; exact h1
+    · have hnfM : ∀ (M' : Type) [Memory M'] [MemoryOps M'] (mm : Machine M')
+          (tp' vp' : ThinPointer (Memory.Provenance M')),
+          inBounds tp'.addr .Unsigned x86_64.PTR_SIZE = true →
+          checkPtrM ⟨tp', some (.VTablePointer vp')⟩ ptrTy (some mm) =
+            (checkPtrM ⟨vp', none⟩ (.VTablePtr traitName) (some mm) >>= fun _ =>
+              vtableLookupM mm vp' >>= fun vtable =>
+                let (fullSize, fullAlign) :=
+                  TupleHeadLayout.full_size_and_align head vtable.size vtable.align
+                safePtrTail mm tp' pointee fullSize fullAlign) := by
+        intro M' _ _ mm tp' vp' hin'
+        unfold checkPtrM
+        rw [hmk, hsafe]
+        dsimp only
+        rw [hin', ensureElseUb_true, okBind, hlay, checkPtrMetadataM_vtablePointer_eq_checkPtrM]
+        refine bindCongr rfl (fun _ => ?_)
+        have hcsa :
+            LayoutStrategy.compute_size_and_align (vtableLookupM mm)
+              (.Tuple head (.TraitObject traitName)) (some (.VTablePointer vp')) =
+            (vtableLookupM mm vp' >>= fun vtable =>
+              Pure.pure (TupleHeadLayout.full_size_and_align head vtable.size vtable.align)) := by
+          simp only [LayoutStrategy.compute_size_and_align]
+          cases vtableLookupM mm vp' <;> rfl
+        rw [hcsa]
+        cases vtableLookupM mm vp' <;> rfl
+      have hmeta : checkPtrM (M := BM) ⟨erasePath vp, none⟩ (.VTablePtr traitName) (some m) =
+          checkPtrM ⟨vp, none⟩ (.VTablePtr traitName) (some mt) := by
+        have hagree := checkPtr_vtablePtr_agree m mt hvt ⟨vp, none⟩ traitName (hf vp rfl)
+        rw [checkPtr_eq_checkPtrM] at hagree
+        exact hagree
+      show checkPtrM (M := BM) ⟨erasePath tp, some (.VTablePointer (erasePath vp))⟩ ptrTy
+        (some m) = _
+      rw [hnfM BM m (erasePath tp) (erasePath vp) hin, hnfM TBM mt tp vp hin,
+        hmeta, vtableLookup_agree m mt hvt vp (hf vp rfl)]
+      refine bindCongr rfl (fun _ => ?_)
+      refine bindCongr rfl (fun vtable => ?_)
+      unfold safePtrTail
+      refine bindCongr rfl (fun _ => ?_)
+      refine bindCongr rfl (fun _ => ?_)
+      refine bindCongr rfl (fun _ => ?_)
+      refine bindCongr rfl (fun _ => ?_)
+      exact congrArg derefStep
+        (dereferenceable_agree_of_memAllocsAgree m mt hmem tp
+          (TupleHeadLayout.full_size_and_align head vtable.size vtable.align).1)
+
 /-! ## Concrete witnesses on `Mach` and `MachTB`
 
 Two machines with the same program: vtables `vtableA` (trait `traitA`, size 4, align
@@ -2436,5 +2524,37 @@ theorem vtMach_vtMachTB_agree_structural :
       rfl rfl (by intro vp h; cases h; exact hA),
     checkPtr_traitObject_agree_of_memAllocsAgree vtMach vtMachTB hvt hmem _ dynRefA _ traitA
       rfl rfl (by intro vp h; cases h; exact hA)⟩
+
+/-- Concrete custom-DST `&Wrapper(u32, dyn TraitA)` (`TupleHeadLayout` of size 4, align 4,
+tailed by `TraitObject traitA`): `checkPtr_tupleTraitObject_agree_of_memAllocsAgree` applies on
+`vtMach` / `vtMachTB` for both the valid 8-byte pointer at address 64 and the OOB pointer at 68. -/
+theorem vtMach_vtMachTB_customDst_agree :
+    let head : TupleHeadLayout := ⟨⟨4⟩, ⟨4⟩, none⟩
+    let customRef : PtrType :=
+      .Ref .Immutable { layout := .Tuple head (.TraitObject traitA), inhabited := true,
+                        unsafe_cells := .TraitObject, freeze := true, unpin := true }
+    checkPtr (erasePathPtr ⟨dataPtrTB 64, some (.VTablePointer vtPtrATB)⟩) customRef (some vtMach) =
+      checkPtrM ⟨dataPtrTB 64, some (.VTablePointer vtPtrATB)⟩ customRef (some vtMachTB) ∧
+    checkPtr (erasePathPtr ⟨dataPtrTB 64, some (.VTablePointer vtPtrATB)⟩) customRef (some vtMach) =
+      .ok () ∧
+    checkPtr (erasePathPtr ⟨dataPtrTB 68, some (.VTablePointer vtPtrATB)⟩) customRef (some vtMach) =
+      checkPtrM ⟨dataPtrTB 68, some (.VTablePointer vtPtrATB)⟩ customRef (some vtMachTB) ∧
+    checkPtr (erasePathPtr ⟨dataPtrTB 68, some (.VTablePointer vtPtrATB)⟩) customRef (some vtMach) =
+      .error (.ub "Value::Ptr: non-dereferenceable safe pointer") := by
+  have hmem : MemAllocsAgree vtMach vtMachTB := by
+    refine ⟨rfl, ?_⟩
+    intro i h1 h2
+    have hi : i = 0 ∨ i = 1 := by
+      change i < 2 at h1
+      omega
+    rcases hi with rfl | rfl <;> exact ⟨rfl, rfl, rfl⟩
+  have hvt : VTablesAgree vtMach vtMachTB := ⟨rfl, rfl⟩
+  have hA : PathFaithful vtMachTB vtPtrATB := by unfold PathFaithful; decide
+  refine ⟨checkPtr_tupleTraitObject_agree_of_memAllocsAgree vtMach vtMachTB hvt hmem _ _ _ _
+      traitA rfl rfl (by intro vp h; cases h; exact hA),
+    rfl,
+    checkPtr_tupleTraitObject_agree_of_memAllocsAgree vtMach vtMachTB hvt hmem _ _ _ _
+      traitA rfl rfl (by intro vp h; cases h; exact hA),
+    rfl⟩
 
 end MiniRustSpec.Correspondence.VTablePtr

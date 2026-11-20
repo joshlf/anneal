@@ -2350,6 +2350,165 @@ theorem volatile_set_mmio_one_way_soundness
   · simp [mrSetTB, hMLay, Interp.LayoutStrategy.expect_size, Interp.LayoutStrategy.expect_align,
       Interp.ConcurrentMemory.store, hbTB, bind, Except.bind, pure, Except.pure]
 
+/-- Symbolic misaligned-pointer parity for `core::ptr::read_volatile` and
+`core::ptr::write_volatile` via `evalUnlinkedPtrAccessCall?`: when Trusted's
+`rawPtrTargetAligned?` rejects alignment and MiniRust's `Align.is_aligned` is `false`, Trusted
+faults with `.ub` and MiniRust reports the misaligned-load/store UB on both `Mach` and `MachTB`. -/
+theorem unlinked_read_write_volatile_misaligned_parity
+    (s : MachineState) (target : ResolvedCallTarget) (decls : List LocalDecl)
+    (layouts : LayoutTable) (argOps : List Operand) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx)
+    (ptrVal storeVal : Value) (ptrArg : RawPtrArg) (elemTy : Ty) (size align : Nat)
+    (m : Interp.Mach) (mptr : Interp.Ptr) (mval : Interp.Val) (mbytes : List Interp.Byte)
+    (mtb : Interp.MachTB) (mptrTB : Gen.ThinPointer Gen.TreeBorrowsProvenance)
+    (mvalTB : Gen.Value Interp.TBM)
+    (mbytesTB : List (Gen.AbstractByte Gen.TreeBorrowsProvenance))
+    (mty : Gen.«Type») (msize : LibSpecr.Size)
+    (hArg : rawPtrArgOfValue? (layoutPointerBytes layouts) ptrVal = .some ptrArg)
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
+    (hMis : rawPtrTargetAligned? s.memory.callStack locals' decls layouts align ptrArg
+      (classifyRawPtrTarget s.memory.borrows s.memory.globals ptrArg) = .some false)
+    (hMLay : Interp.Type.layout mty = .ok (.Sized msize ⟨align⟩))
+    (hMMis : Interp.Align.is_aligned ⟨align⟩ mptr.addr = false)
+    (hMMisTB : Interp.Align.is_aligned ⟨align⟩ mptrTB.addr = false)
+    (hChk : Interp.checkValue mval mty (some m) = .ok ())
+    (hEnc : Interp.Type.encode mty mval = .ok mbytes)
+    (hChkTB : Interp.checkValueM mvalTB mty (some mtb) = .ok ())
+    (hEncTB : Interp.Type.encodeM (M := Interp.TBM) mty mvalTB = .ok mbytesTB) :
+    (target.defPath = "core::ptr::read_volatile" →
+      evalUnlinkedPtrAccessCall? s target decls layouts argOps [ptrVal] locals' destination
+          targetBb = some (MirStepNode.fail .ub) ∧
+      mrLoad true m mptr mty = .error (.ub "load from a misaligned pointer") ∧
+      mrLoadTB true mtb mptrTB mty = .error (.ub "load from a misaligned pointer")) ∧
+    (target.defPath = "core::ptr::write_volatile" →
+      evalUnlinkedPtrAccessCall? s target decls layouts argOps [ptrVal, storeVal] locals'
+          destination targetBb = some (MirStepNode.fail .ub) ∧
+      mrStore true m mptr mval mty = .error (.ub "store to a misaligned pointer") ∧
+      mrStoreTB true mtb mptrTB mvalTB mty = .error (.ub "store to a misaligned pointer")) := by
+  constructor
+  · intro hPath
+    have hT := trusted_load_misaligned_ub true s.memory.borrows s.memory.globals
+      s.memory.callStack s.memory.activeProtectors target decls layouts argOps ptrVal locals'
+      ptrArg elemTy size align hArg hLay hMis
+    refine ⟨?_, ?_, ?_⟩
+    · rw [trustedUnlinkedAction_spec]
+      simp only [trustedUnlinkedAction, hPath]
+      have h1 : stringEq "core::ptr::read_volatile" "core::ptr::read_unaligned" = false := rfl
+      have h2 : stringEq "core::ptr::read_volatile" "core::ptr::write_unaligned" = false := rfl
+      have h3 : stringEq "core::ptr::read_volatile" "core::ptr::read_volatile" = true := rfl
+      rw [h1, h2, h3]
+      dsimp only
+      rw [hT]; rfl
+    · exact mr_load_misaligned_ub m mptr mty msize ⟨align⟩ hMLay hMMis
+    · exact mr_loadTB_misaligned_ub mtb mptrTB mty msize ⟨align⟩ hMLay hMMisTB
+  · intro hPath
+    have hT := trusted_store_misaligned_ub true s.memory.borrows s.memory.globals
+      s.memory.callStack s.memory.callerLocals s.memory.activeProtectors target decls layouts
+      argOps ptrVal storeVal locals' ptrArg elemTy size align hArg hLay hMis
+    refine ⟨?_, ?_, ?_⟩
+    · rw [trustedUnlinkedAction_spec]
+      simp only [trustedUnlinkedAction, hPath]
+      have h1 : stringEq "core::ptr::write_volatile" "core::ptr::read_unaligned" = false := rfl
+      have h2 : stringEq "core::ptr::write_volatile" "core::ptr::write_unaligned" = false := rfl
+      have h3 : stringEq "core::ptr::write_volatile" "core::ptr::read_volatile" = false := rfl
+      have h4 : stringEq "core::ptr::write_volatile" "core::ptr::write_volatile" = true := rfl
+      rw [h1, h2, h3, h4]
+      dsimp only
+      rw [hT]; rfl
+    · exact mr_store_misaligned_ub m mptr mval mty mbytes msize ⟨align⟩ hMLay hChk hEnc hMMis
+    · exact mr_storeTB_misaligned_ub mtb mptrTB mvalTB mty mbytesTB msize ⟨align⟩ hMLay hChkTB
+        hEncTB hMMisTB
+
+/-- Symbolic Item 5 MMIO one-way soundness for `core::ptr::read_volatile` and
+`core::ptr::write_volatile` via `evalUnlinkedPtrAccessCall?`: at any aligned provenance-less
+address for a non-zero-sized inhabited `T`, Trusted fails closed with `MirStepNode.unsupported`
+where MiniRust reports UB on both `Mach` and `MachTB`. -/
+theorem unlinked_read_write_volatile_mmio_one_way_soundness
+    (s : MachineState) (target : ResolvedCallTarget) (decls : List LocalDecl)
+    (layouts : LayoutTable) (argOps : List Operand) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx)
+    (elemTy : Ty) (size align addr : Nat) (val : Value)
+    (m : Interp.Mach) (mval : Interp.Val) (mbytes : List Interp.Byte)
+    (mtb : Interp.MachTB) (mvalTB : Gen.Value Interp.TBM)
+    (mbytesTB : List (Gen.AbstractByte Gen.TreeBorrowsProvenance))
+    (mty : Gen.«Type») (msize : LibSpecr.Size)
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
+    (hMLay : Interp.Type.layout mty = .ok (.Sized msize ⟨align⟩))
+    (hpos : 0 < align)
+    (hAl : Interp.Align.is_aligned ⟨align⟩ (addr : Int) = true)
+    (hInh : rawPtrTyIsUninhabited layouts elemTy = false)
+    (hVal : rawPtrStoreValueFault? layouts elemTy val = .none)
+    (hSize : size ≠ 0) (hMSize : msize.bytes ≠ 0)
+    (hChk : Interp.checkValue mval mty (some m) = .ok ())
+    (hEnc : Interp.Type.encode mty mval = .ok mbytes)
+    (hChkTB : Interp.checkValueM mvalTB mty (some mtb) = .ok ())
+    (hEncTB : Interp.Type.encodeM (M := Interp.TBM) mty mvalTB = .ok mbytesTB)
+    (hMLen : mbytes.length ≠ 0) (hMLenTB : mbytesTB.length ≠ 0) :
+    (target.defPath = "core::ptr::read_volatile" →
+      evalUnlinkedPtrAccessCall? s target decls layouts argOps
+          [.scalar ⟨addr, layoutPointerBytes layouts⟩] locals' destination targetBb =
+        some MirStepNode.unsupported ∧
+      mrLoad true m ⟨addr, none⟩ mty =
+        .error (.ub "dereferencing pointer without provenance") ∧
+      mrLoadTB true mtb ⟨addr, none⟩ mty =
+        .error (.ub "dereferencing pointer without provenance")) ∧
+    (target.defPath = "core::ptr::write_volatile" →
+      evalUnlinkedPtrAccessCall? s target decls layouts argOps
+          [.scalar ⟨addr, layoutPointerBytes layouts⟩, val] locals' destination targetBb =
+        some MirStepNode.unsupported ∧
+      mrStore true m ⟨addr, none⟩ mval mty =
+        .error (.ub "dereferencing pointer without provenance") ∧
+      mrStoreTB true mtb ⟨addr, none⟩ mvalTB mty =
+        .error (.ub "dereferencing pointer without provenance")) := by
+  constructor
+  · intro hPath
+    have hT := trusted_volatile_load_mmio_unsupported true s.memory.borrows s.memory.globals
+      s.memory.callStack s.memory.activeProtectors target decls layouts argOps locals' addr
+      elemTy size align hLay hpos (fun _ => hAl) hInh hSize
+    have hb := mr_bm_load_no_provenance_ub m.mem.memory addr msize ⟨align⟩ hAl hMSize
+    have hbTB : Interp.MemoryOps.load mtb.mem.memory
+        (⟨addr, none⟩ : Gen.ThinPointer Gen.TreeBorrowsProvenance) msize ⟨align⟩ =
+        .error (.ub "dereferencing pointer without provenance") :=
+      mr_tbm_load_no_provenance_ub mtb.mem.memory addr msize ⟨align⟩ hAl hMSize
+    refine ⟨?_, ?_, ?_⟩
+    · rw [trustedUnlinkedAction_spec]
+      simp only [trustedUnlinkedAction, hPath]
+      have h1 : stringEq "core::ptr::read_volatile" "core::ptr::read_unaligned" = false := rfl
+      have h2 : stringEq "core::ptr::read_volatile" "core::ptr::write_unaligned" = false := rfl
+      have h3 : stringEq "core::ptr::read_volatile" "core::ptr::read_volatile" = true := rfl
+      rw [h1, h2, h3]
+      dsimp only
+      rw [hT]; rfl
+    · simp [mrLoad, mrAccessAlign, hMLay, Interp.LayoutStrategy.expect_align, Interp.typedLoad,
+        Interp.LayoutStrategy.expect_size, Interp.CM.load, hb, bind, Except.bind, pure, Except.pure]
+    · simp [mrLoadTB, mrAccessAlign, hMLay, Interp.LayoutStrategy.expect_align, Interp.typedLoadM,
+        Interp.LayoutStrategy.expect_size, Interp.ConcurrentMemory.load, hbTB, bind, Except.bind,
+        pure, Except.pure]
+  · intro hPath
+    have hT := trusted_volatile_store_mmio_unsupported true s.memory.borrows s.memory.globals
+      s.memory.callStack s.memory.callerLocals s.memory.activeProtectors target decls layouts
+      argOps locals' addr val elemTy size align hLay hpos (fun _ => hAl) hInh hVal hSize
+    have hb := mr_bm_store_no_provenance_ub m.mem.memory addr mbytes ⟨align⟩ hAl hMLen
+    have hbTB : Interp.MemoryOps.store mtb.mem.memory
+        (⟨addr, none⟩ : Gen.ThinPointer Gen.TreeBorrowsProvenance) mbytesTB ⟨align⟩ =
+        .error (.ub "dereferencing pointer without provenance") :=
+      mr_tbm_store_no_provenance_ub mtb.mem.memory addr mbytesTB ⟨align⟩ hAl hMLenTB
+    refine ⟨?_, ?_, ?_⟩
+    · rw [trustedUnlinkedAction_spec]
+      simp only [trustedUnlinkedAction, hPath]
+      have h1 : stringEq "core::ptr::write_volatile" "core::ptr::read_unaligned" = false := rfl
+      have h2 : stringEq "core::ptr::write_volatile" "core::ptr::write_unaligned" = false := rfl
+      have h3 : stringEq "core::ptr::write_volatile" "core::ptr::read_volatile" = false := rfl
+      have h4 : stringEq "core::ptr::write_volatile" "core::ptr::write_volatile" = true := rfl
+      rw [h1, h2, h3, h4]
+      dsimp only
+      rw [hT]; rfl
+    · simp [mrStore, mrAccessAlign, hMLay, Interp.LayoutStrategy.expect_align, Interp.typedStore,
+        hChk, hEnc, Interp.CM.store, hb, bind, Except.bind, pure, Except.pure]
+    · simp [mrStoreTB, mrAccessAlign, hMLay, Interp.LayoutStrategy.expect_align,
+        Interp.typedStoreM, hChkTB, hEncTB, Interp.ConcurrentMemory.store, hbTB, bind,
+        Except.bind, pure, Except.pure]
+
 /-- `_0 = fnPath::<u32>(copy _1, copy _2, copy _3)` with `_1, _2 : *const u32`, `_3 : usize`. -/
 def vbMmioCopyBody (fnPath : String) : CapturedMir :=
   vbCallBody [vbDecl vbTyUnit, vbDecl vbTyPtrU32, vbDecl vbTyPtrU32, vbDecl ⟨.uint .usize, 2⟩]
@@ -3879,7 +4038,8 @@ Item 5 (aligned addresses outside all allocations):
   volatile_set_mmio_one_way_soundness, mmio_volatile_load_step_unsupported,
   mmio_volatile_store_step_unsupported, mmio_volatile_not_noUB,
   mmio_volatile_copy_set_step_unsupported, mmio_volatile_copy_set_not_noUB,
-  lockstep_mmio_aligned_0x40000000
+  lockstep_mmio_aligned_0x40000000, unlinked_read_write_volatile_misaligned_parity,
+  unlinked_read_write_volatile_mmio_one_way_soundness
 
 Infrastructure (Trusted action specs, observation soundness):
   trustedVolatileAction_spec, trustedUnlinkedAction_spec, loadedInt_sound, loadedIntTB_sound,
