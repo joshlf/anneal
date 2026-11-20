@@ -6748,6 +6748,21 @@ class TestEpisode2ProjectionAndRewriteOrderHazards(unittest.TestCase):
         )
         self.assertEqual(proof_health.scan_projection_and_rewrite_order_hazards(a4_neg), [])
 
+    def test_nested_standalone_attr_open_rejected_in_match_balanced_attribute(self) -> None:
+        # Unquoted, non-as-pattern nested `@[` inside `@[...]` is malformed and must return `None`,
+        # whereas `@[` inside syntax quotations `` `(@[...]) `` and identifier as-patterns `x@[y]`
+        # remains balanced.
+        lx = proof_health.lean_lexer
+        self.assertIsNone(lx.match_balanced_attribute("@[a @[b] ]", 0))
+        self.assertEqual(
+            [(s.start_pos, s.end_pos, s.content) for s in lx.scan_balanced_attributes("@[a @[b] ]\ndef f := 1\n")],
+            [(4, 8, "b")],
+        )
+        quoted = "@[foo `(@[bar])]"
+        self.assertEqual(lx.match_balanced_attribute(quoted, 0), len(quoted))
+        as_pat = "@[foo x@[y]]"
+        self.assertEqual(lx.match_balanced_attribute(as_pat, 0), len(as_pat))
+
 
 if __name__ == "__main__":
     unittest.main()
