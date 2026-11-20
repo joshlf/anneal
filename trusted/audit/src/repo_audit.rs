@@ -22,7 +22,7 @@ use serde_json::json;
 use walkdir::WalkDir;
 
 use cargo_anneal::{
-    AdmittedToolchain, Failure, ImportEdge, Json, OLEAN_PARTS, PARTS, PreflightResult,
+    AdmittedToolchain, Failure, ImportEdge, Json, OLEAN_PARTS, PARTS, PreflightResult, SandboxMode,
     TargetAuditRequest, is_lean_ident, regular, sha256_file, stage_regular_file, topo_sort_modules,
 };
 
@@ -309,7 +309,10 @@ impl Checker {
     /// Create a new repository [`Checker`] with `require_mir_wp = true` by
     /// default and optional `ANNEAL_MIRI_CACHE_DIR` discovery.
     pub fn new(checkout: &Path, lean: Option<&Path>) -> io::Result<Self> {
-        let inner = cargo_anneal::Checker::new(checkout, lean)?;
+        let mut inner = cargo_anneal::Checker::new(checkout, lean)?;
+        // Pass 1 (`trusted/lean/` + `theory/`) stays unchanged; Pass 2 switches
+        // strictly to `SandboxMode::RequireBwrap` inside `run_correspondence`.
+        inner.set_sandbox_mode(SandboxMode::Unsandboxed);
         let miri_cache_dir = env::var_os("ANNEAL_MIRI_CACHE_DIR")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from);
@@ -330,7 +333,8 @@ impl Checker {
     where
         I: IntoIterator<Item = (String, String)>,
     {
-        let inner = cargo_anneal::Checker::new_with_env(checkout, lean, ambient_env)?;
+        let mut inner = cargo_anneal::Checker::new_with_env(checkout, lean, ambient_env)?;
+        inner.set_sandbox_mode(SandboxMode::Unsandboxed);
         Ok(Self {
             inner,
             modules: BTreeMap::new(),
@@ -400,6 +404,8 @@ impl Checker {
         self.modules.clear();
         self.theory_modules.clear();
         self.sysroot_foundation = None;
+        self.inner
+            .set_sandbox_mode(SandboxMode::PreferBwrapOrLandlock);
         self.inner.run_target(request)
     }
 
@@ -762,6 +768,7 @@ impl Checker {
             ensure_miri_cache_outside_checkout(&root, cache_dir)?;
         }
         check_checkout_cargo_hygiene(&root, self.require_mir_wp)?;
+        self.inner.set_sandbox_mode(SandboxMode::Unsandboxed);
         self.reset_stage()?;
 
         // Scan and stage repository trees before `tool_admission` so missing
@@ -957,6 +964,12 @@ impl Checker {
         // any vendored or correspondence module against `Init`/`Std`/`Lean`.
         self.ensure_sysroot_foundation()?;
 
+        // Enforce Tier 1 `linux_bwrap` (`SandboxMode::RequireBwrap`) across
+        // all three Pass 2 surfaces (cold `vendor/lean-miri/`,
+        // `"correspondence-preflight"`, and `trusted/correspondence/` +
+        // `correspondence/`, even on `--miri-cache-dir` cache hits).
+        self.inner.set_sandbox_mode(SandboxMode::RequireBwrap);
+
         let miri_lib =
             self.verify_and_stage_miri_entries(vendor_dir, closure_entries, expected_sources)?;
 
@@ -968,11 +981,8 @@ impl Checker {
         let stage = self.inner.stage().to_path_buf();
         let corr_trusted_lib = stage.join("lib");
         let corr_theory_lib = stage.join("theory-lib");
-        let corr_trusted_lean_path = env::join_paths([&corr_trusted_lib, &miri_lib])
-            .map_err(|e| Failure::operational("compile", e.to_string()))?;
+        let corr_trusted_dirs = vec![corr_trusted_lib.clone(), miri_lib.clone()];
         let search_dirs = vec![corr_trusted_lib.clone(), corr_theory_lib.clone(), miri_lib];
-        let corr_theory_lean_path = env::join_paths(&search_dirs)
-            .map_err(|e| Failure::operational("compile", e.to_string()))?;
 
         // Re-parse every Pass 2 source under the Pass 2 union compile parser
         // environment (`foundation` + Pass 1 `trusted`/`theory` + pinned
@@ -1013,30 +1023,20 @@ impl Checker {
         for module in &preflight.trusted_order {
             let staged_src = &corr_trusted_modules[module];
             let out_olean = corr_trusted_lib.join(format!("{}.olean", module.replace('.', "/")));
-            if let Some(parent) = out_olean.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| Failure::operational("compile", e.to_string()))?;
-            }
             self.inner.mark_execution_began();
             // Importing the 160-module `Miri.Interpreter.ExecutionMachine`
             // closure consumes ~1.7 GiB of Lean's `-M` allocator at startup,
             // so Pass 2 uses `-M4096` rather than Pass 1's `-M2048`.
-            let args = vec![
-                "-j1".to_string(),
-                "-M4096".to_string(),
-                "-t0".to_string(),
-                "-DElab.async=false".to_string(),
-                "-Ddebug.skipKernelTC=false".to_string(),
-                "-R".to_string(),
-                corr_trusted_src_root.to_string_lossy().into_owned(),
-                "-o".to_string(),
-                out_olean.to_string_lossy().into_owned(),
-                staged_src.to_string_lossy().into_owned(),
-            ];
-            self.inner.process_with_path(
-                &format!("compile-{module}"),
-                &args,
-                Some(&corr_trusted_lean_path),
+            self.inner.compile_lean_module_with_root(
+                module,
+                &corr_trusted_src_root,
+                staged_src,
+                &out_olean,
+                &corr_trusted_dirs,
+                4096,
+                false,
+                &[],
+                &[],
             )?;
             regular(&out_olean, "compile")?;
         }
@@ -1045,28 +1045,17 @@ impl Checker {
         for module in &preflight.theory_order {
             let staged_src = &corr_theory_modules[module];
             let out_olean = corr_theory_lib.join(format!("{}.olean", module.replace('.', "/")));
-            if let Some(parent) = out_olean.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| Failure::operational("compile", e.to_string()))?;
-            }
             self.inner.mark_execution_began();
-            let args = vec![
-                "-j1".to_string(),
-                "-M4096".to_string(),
-                "-t0".to_string(),
-                "-DElab.async=false".to_string(),
-                "-Ddebug.skipKernelTC=false".to_string(),
-                "-DwarningAsError=true".to_string(),
-                "-R".to_string(),
-                corr_theory_src_root.to_string_lossy().into_owned(),
-                "-o".to_string(),
-                out_olean.to_string_lossy().into_owned(),
-                staged_src.to_string_lossy().into_owned(),
-            ];
-            self.inner.process_with_path(
-                &format!("compile-{module}"),
-                &args,
-                Some(&corr_theory_lean_path),
+            self.inner.compile_lean_module_with_root(
+                module,
+                &corr_theory_src_root,
+                staged_src,
+                &out_olean,
+                &search_dirs,
+                4096,
+                true,
+                &[],
+                &[],
             )?;
             regular(&out_olean, "compile")?;
         }
@@ -1143,8 +1132,7 @@ impl Checker {
             }
         }
 
-        let miri_lean_path = env::join_paths([&miri_lib])
-            .map_err(|e| Failure::operational("miri-compile", e.to_string()))?;
+        let miri_lean_dirs = vec![miri_lib.clone()];
         for entry in entries {
             let rel_stem = entry.module.replace('.', "/");
             let rel_olean = format!("{rel_stem}.olean");
@@ -1199,22 +1187,22 @@ impl Checker {
             }
             if !cache_hit {
                 self.inner.mark_execution_began();
-                let compile_args = vec![
-                    "-j1".to_string(),
-                    "-M2048".to_string(),
-                    "-t0".to_string(),
-                    "-DElab.async=false".to_string(),
-                    "-Ddebug.skipKernelTC=false".to_string(),
-                    "-R".to_string(),
-                    "src/vendor-miri".to_string(),
-                    "-o".to_string(),
-                    format!("miri-lib/{rel_olean}"),
-                    format!("src/vendor-miri/{}", entry.path),
-                ];
-                self.inner.process_with_path(
-                    &format!("compile-{}", entry.module),
-                    &compile_args,
-                    Some(&miri_lean_path),
+                self.inner.set_sandbox_mode(SandboxMode::RequireBwrap);
+                let staged_src = miri_src_root.join(&entry.path);
+                // Promote optional `.olean.server`/`.olean.private` sidecars so
+                // the explicit SHA-256/presence policy below enforces the pin
+                // with exit code 1, while validating and discarding Lean
+                // `module` `.ir`/`.ir.sig` outputs without promoting them.
+                self.inner.compile_lean_module_with_root(
+                    &entry.module,
+                    &miri_src_root,
+                    &staged_src,
+                    &staged_olean,
+                    &miri_lean_dirs,
+                    2048,
+                    false,
+                    &["olean.server", "olean.private"],
+                    &["ir", "ir.sig"],
                 )?;
             }
             let actual_olean_sha = sha256_file(&staged_olean, "miri-pin")?;
