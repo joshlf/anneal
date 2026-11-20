@@ -95,20 +95,29 @@ simulation relations (`StateRelLM3_1`, `StateRelLM3_2`, `annealResolvePtr`,
 * **Part 2E** — deep operational simulations closing the remaining multi-step gaps across all tracks:
   byte-preserving `annealRowProjection` (`miriAllocBytes` / `miriGlobalBytes` / `keyedStateRelLM3_1_alloc_bytes`);
   real implicit-access `BorrowTree.releaseProtector` simulation (`BorrowTreeWorldRel`, `realAccessReleaseSim`)
-  lifted across multi-allocation `MachineHooks.beforeStackPopWithEnsure` vs per-allocation `execFrameExitMiri`;
+  lifted across multi-allocation `MachineHooks.beforeStackPopWithEnsure` (both full and partial/mid-sequence UB
+  with full memory/machine frame preservation) and across arbitrary `k`-segment `DedupRangeMap` trees
+  (`miri_releaseProtector_multiSeg_partial_sim`, `miri_releaseProtector_strong_weak_irrelevant`);
   end-to-end `FnEntry` retag (`RetagPolicy.create` + `RetagPipeline.retagPointerValue`) + intra-call access +
   `releaseProtector` contrast between `writableChildWrite` (`&mut T`) and `rustcNoWritable`
-  (`#[rustc_no_writable]`); multi-reader/multi-byte vector-clock correspondence and full end-to-end
-  `AllocationMachine.deallocate` ↔ `KeyedAllocWorld.deallocateMachine` lockstep across all 12 branches;
+  (`#[rustc_no_writable]`); multi-reader/multi-byte vector-clock correspondence, full end-to-end
+  `AllocationMachine.deallocate` ↔ `KeyedAllocWorld.deallocateMachine` lockstep across all 12 branches,
+  `PlaceMachine.allocateStackRaw` ↔ `KeyedAllocWorld.allocate` lockstep, and composed 6-stage
+  `allocate → store/load → retag + protected-dealloc → frame-exit → clean dealloc + UAF/double-free → realloc`
+  no-ABA lifecycle (`multiStep_alloc_storeLoad_retag_frameExit_dealloc_realloc_lifecycle`);
   and nested `childSession` (`recursive = true`) vtable-before-data-UB precedence and `mayDangle` behavior
-  through the full `ValidityVisitor.validatePlace` driver (direct `&(&dyn Trait)` and struct-wrapped
-  `&(S { f0: &dyn Trait, ... })`).
+  through the full `ValidityVisitor.validatePlace` driver (direct `&(&dyn Trait)`, struct-wrapped
+  `&(S { f0: &dyn Trait, ... })`, `[T; N]` `Sized` array fast-paths, and `[&dyn Trait; N]` / `&[&dyn Trait; N]`).
 * **Part 3** — closed (hypothesis-free) non-vacuity canaries across all parts.
 * **Part 4** — exhaustive `#guard_msgs in #print axioms` pins for every public
   theorem.
 -/
 
 namespace LeanMiriSpec.ExtTreeMapAllocLM
+
+-- Peak-RAM guard: elaborate and kernel-check declarations synchronously so transient proof
+-- checking heap never overlaps an asynchronous proof backlog under `lean -M 3098`.
+set_option Elab.async false
 
 open Anneal.ExtTreeMapAllocAndNoWritable
 open Trusted.Rustc.V2026_06_01.MirSemantics
@@ -1148,6 +1157,45 @@ local macro "miriMSInsertDead" : term =>
   `(miri_etm_private% Miri.Memory.MemoryState Miri.Memory.MemoryState.insertDead)
 local macro "miriMLInsertWithId" : term =>
   `(miri_etm_private% Miri.Memory.MemoryState Miri.Memory.MemoryLifecycle.insertAllocationWithId)
+local macro "miriAllocMachCallback" : term =>
+  `(miri_etm_private% Miri.Interpreter.AllocationMachine Miri.Interpreter.AllocationMachine.callback)
+local macro "miriAllocMachBefore" : term =>
+  `(miri_etm_private% Miri.Interpreter.AllocationMachine Miri.Interpreter.AllocationMachine.before)
+local macro "miriAllocRawBytes" : term =>
+  `(miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.rawBytes)
+local macro "miriNodeAt" : term =>
+  `(miri_etm_private% Miri.TreeBorrows.Traversal Miri.TreeBorrows.Tree.TraversalTree.nodeAt)
+local macro "miriAncestorPathAux" : term =>
+  `(miri_etm_private% Miri.TreeBorrows.Traversal
+    Miri.TreeBorrows.Tree.TraversalTree.ancestorPathAux)
+local macro "miriInitialForeignRootsGo" : term =>
+  `(miri_etm_private% Miri.TreeBorrows.Traversal
+    Miri.TreeBorrows.Tree.TraversalTree.initialForeignRoots.go)
+local macro "miriForeignPostorder" : term =>
+  `(miri_etm_private% Miri.TreeBorrows.Traversal
+    Miri.TreeBorrows.Tree.TraversalTree.foreignPostorder)
+local macro "miriPerformTreeAccessAt" : term =>
+  `(miri_etm_private% Miri.TreeBorrows.TreeState Miri.TreeBorrows.BorrowTree.performTreeAccessAt)
+local macro "miriNormalProjection" : term =>
+  `(miri_etm_private% Miri.TreeBorrows.TreeState Miri.TreeBorrows.BorrowTree.normalProjection)
+local macro "miriTLAMk" : term =>
+  `(miri_etm_private% Miri.TreeBorrows.TreeState Miri.TreeBorrows.BorrowTree.TreeLocationAccessAtResult.mk)
+local macro "miriMinExposedChild" : term =>
+  `(miri_etm_private% Miri.TreeBorrows.TreeState Miri.TreeBorrows.BorrowTree.minExposedChild)
+local macro "miriBorrowAccessError" : term =>
+  `(miri_etm_private% Miri.Interpreter.MachineHooks Miri.Interpreter.MachineHooks.borrowAccessError)
+local macro "miriSortedPredicates" : term =>
+  `(miri_etm_private% Miri.Interpreter.VTable Miri.Interpreter.VTable.sortedPredicates)
+local macro "miriSortPredicates" : term =>
+  `(miri_etm_private% Miri.Interpreter.VTable Miri.Interpreter.VTable.sortPredicates)
+local macro "miriInsertPredicate" : term =>
+  `(miri_etm_private% Miri.Interpreter.VTable Miri.Interpreter.VTable.insertPredicate)
+local macro "miriRaceSize" : term =>
+  `(miri_etm_private% Miri.Interpreter.MachineHooks Miri.Interpreter.MachineHooks.raceSize)
+local macro "miriProcessEvents" : term =>
+  `(miri_etm_private% Miri.TreeBorrows.NormalTree Miri.TreeBorrows.Tree.NormalTreeState.processEvents)
+local macro "miriVVSizeResult" : term =>
+  `(miri_etm_private% Miri.Interpreter.ValidityVisitor Miri.Interpreter.ValidityVisitor.sizeResult)
 
 private def positionsOf {K : Type} [BEq K] (key : K) : Nat → List K → List Nat
   | _, [] => []
@@ -2616,8 +2664,6 @@ theorem nonAtomicWriteDetect_dealloc_writer_race_iff
       rw [UInt64.lt_iff_toNat_lt]; omega
     simp [hle, hlt]
 
-local macro "miriAllocMachCallback" : term =>
-  `(miri_etm_private% Miri.Interpreter.AllocationMachine Miri.Interpreter.AllocationMachine.callback)
 
 /-- **Machine detach race-clock cleanup (`AllocationMachine.deallocate` ↔ `detachRaceClock`)**:
 whenever `deallocatePtrWith` detaches `(id, entry)` (whether `outcome` is `.ok ()` or any
@@ -2708,8 +2754,6 @@ theorem miriAllocBytes_extra_invariant {Prov Extra Extra' : Type}
     miriAllocBytes (alloc.mapExtra f) = miriAllocBytes alloc :=
   ⟨rfl, rfl, rfl⟩
 
-local macro "miriAllocRawBytes" : term =>
-  `(miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.rawBytes)
 
 private theorem arr_extractLoop_eq {α : Type} (arr : Array α) :
     ∀ (k : Nat) (i : Nat) (acc : Array α),
@@ -3064,55 +3108,66 @@ theorem keyedStateRelLM3_1_checkPtrAccess {body : Trusted.Rustc.V2026_06_01.MirA
   exact ⟨e, he, htag, memoryState_checkPtrAccess_isOk_eq_keyed annealRowProjection
     m.machine.memory hcore hglobNd halign target _ size msg (annealResolvePtr m.machine) _ hres⟩
 
-private theorem array_find?_eq_of_perm_nodup {α : Type}
-    {xs ys : Array (Miri.Memory.AllocId × α)}
-    (hperm : xs.toList.Perm ys.toList)
-    (hnd : (xs.toList.map Prod.fst).Nodup) (id : Miri.Memory.AllocId) :
+/-- First-match lookup of ONE key is permutation-invariant as soon as that key's rows agree on their
+payload — no global distinct-key (`Nodup`) hypothesis. -/
+private theorem list_find?_eq_of_perm_keyUnique {α : Type}
+    {xs ys : List (Miri.Memory.AllocId × α)} (hperm : xs.Perm ys) (id : Miri.Memory.AllocId)
+    (huniq : ∀ a₁ a₂, (id, a₁) ∈ xs → (id, a₂) ∈ xs → a₁ = a₂) :
     xs.find? (fun row => row.1 == id) = ys.find? (fun row => row.1 == id) := by
-  have hnd' : (ys.toList.map Prod.fst).Nodup := (hperm.map Prod.fst).nodup_iff.mp hnd
-  rw [← Array.find?_toList, ← Array.find?_toList]
-  have hiff : ∀ v : Miri.Memory.AllocId × α,
-      xs.toList.find? (fun row => row.1 == id) = some v ↔
-        ys.toList.find? (fun row => row.1 == id) = some v := by
-    intro ⟨k, a⟩
-    have hmemX : xs.toList.find? (fun row => row.1 == id) = some (k, a) ↔
-        k = id ∧ (k, a) ∈ xs.toList := by
-      constructor
-      · intro hf
-        exact ⟨eq_of_beq (by simpa using List.find?_some hf), List.mem_of_find?_eq_some hf⟩
-      · rintro ⟨rfl, hm⟩
-        have hlf : linearFind? (xs.toList.map fun r => (ofMiriAllocId r.1, r.2)) (ofMiriAllocId k) =
-            some a := by
-          rw [linearFind?_eq_some_iff_mem]
-          · exact List.mem_map.mpr ⟨(k, a), hm, rfl⟩
-          · rw [List.map_map]; exact nodup_map_ofMiri xs.toList Prod.fst hnd
-        rw [linearFind?_map_ofMiri xs.toList Prod.fst Prod.snd k] at hlf
-        cases hfx : xs.toList.find? (fun r => r.1 == k) with
-        | none => rw [hfx] at hlf; cases hlf
-        | some r =>
-          rw [hfx] at hlf; injection hlf with hr2
-          have hr1 : r.1 = k := eq_of_beq (by simpa using List.find?_some hfx)
-          cases r; simp at hr1 hr2; subst hr1; subst hr2; rfl
-    have hmemY : ys.toList.find? (fun row => row.1 == id) = some (k, a) ↔
-        k = id ∧ (k, a) ∈ ys.toList := by
-      constructor
-      · intro hf
-        exact ⟨eq_of_beq (by simpa using List.find?_some hf), List.mem_of_find?_eq_some hf⟩
-      · rintro ⟨rfl, hm⟩
-        have hlf : linearFind? (ys.toList.map fun r => (ofMiriAllocId r.1, r.2)) (ofMiriAllocId k) =
-            some a := by
-          rw [linearFind?_eq_some_iff_mem]
-          · exact List.mem_map.mpr ⟨(k, a), hm, rfl⟩
-          · rw [List.map_map]; exact nodup_map_ofMiri ys.toList Prod.fst hnd'
-        rw [linearFind?_map_ofMiri ys.toList Prod.fst Prod.snd k] at hlf
-        cases hfy : ys.toList.find? (fun r => r.1 == k) with
-        | none => rw [hfy] at hlf; cases hlf
-        | some r =>
-          rw [hfy] at hlf; injection hlf with hr2
-          have hr1 : r.1 = k := eq_of_beq (by simpa using List.find?_some hfy)
-          cases r; simp at hr1 hr2; subst hr1; subst hr2; rfl
-    rw [hmemX, hmemY, hperm.mem_iff]
-  exact option_eq_of_some_iff hiff
+  cases hx : xs.find? (fun row => row.1 == id) with
+  | none =>
+    cases hy : ys.find? (fun row => row.1 == id) with
+    | none => rfl
+    | some r =>
+      have hm := hperm.symm.subset (List.mem_of_find?_eq_some hy)
+      exact absurd (List.find?_some hy) (List.find?_eq_none.mp hx r hm)
+  | some r =>
+    cases hy : ys.find? (fun row => row.1 == id) with
+    | none =>
+      exact absurd (List.find?_some hx)
+        (List.find?_eq_none.mp hy r (hperm.subset (List.mem_of_find?_eq_some hx)))
+    | some r' =>
+      have h1 : r.1 = id := eq_of_beq (by simpa using List.find?_some hx)
+      have h2 : r'.1 = id := eq_of_beq (by simpa using List.find?_some hy)
+      have hm1 := List.mem_of_find?_eq_some hx
+      have hm2 := hperm.symm.subset (List.mem_of_find?_eq_some hy)
+      obtain ⟨k, a⟩ := r; obtain ⟨k', a'⟩ := r'
+      simp only at h1 h2; subst h1; subst h2; rw [huniq a a' hm1 hm2]
+
+/-- `AllocMapRel` transports along ANY `live` permutation and ANY replacement of `dead`. -/
+private theorem allocMapRel_of_livePerm
+    {body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir} {s : MachineState}
+    {m : AnnealStepState} {allocMap : List AllocMapEntry}
+    (halloc : AllocMapRel body s m allocMap)
+    (live' : Array (Miri.Memory.AllocId ×
+      Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+        Miri.Memory.MiriMemoryKind))
+    (dead' : Array Miri.Memory.DeadAllocation)
+    (hlivePerm : m.machine.memory.live.toList.Perm live'.toList) :
+    AllocMapRel body s
+      { m with machine := { m.machine with memory :=
+        { m.machine.memory with live := live', dead := dead' } } } allocMap :=
+  { tags_nodup := halloc.tags_nodup
+    local_to_alloc_unique := halloc.local_to_alloc_unique
+    alloc_to_local_injective := halloc.alloc_to_local_injective
+    target_decl := halloc.target_decl
+    base_addr_valid := halloc.base_addr_valid
+    borrow_sync := halloc.borrow_sync
+    live_key_unique := fun e he la₁ la₂ h1 h2 =>
+      halloc.live_key_unique e he la₁ la₂ (hlivePerm.symm.subset h1) (hlivePerm.symm.subset h2)
+    local_alloc_sync := fun tf' hfrEq e he => by
+      have hsync := halloc.local_alloc_sync tf' hfrEq e he
+      have hfindEq : live'.find? (fun x => x.1 == e.allocId) =
+          m.machine.memory.live.find? (fun x => x.1 == e.allocId) := by
+        rw [← Array.find?_toList, ← Array.find?_toList]
+        exact (list_find?_eq_of_perm_keyUnique hlivePerm e.allocId
+          (halloc.live_key_unique e he)).symm
+      refine ⟨fun slot hslot hne => ?_, fun hdead => ?_⟩
+      · rcases hsync.1 slot hslot hne with ⟨hloc, hsc, hdecl⟩
+        refine ⟨hloc, hsc, fun decl hd => ?_⟩
+        rcases hdecl decl hd with ⟨la, hfind, hk, ha, hsh⟩
+        exact ⟨la, by rw [hfindEq]; exact hfind, hk, ha, hsh⟩
+      · rw [hfindEq]; exact hsync.2 hdead }
 
 /-- **`live`/`dead` array permutation invariance for `StateRelLM3_1` & `KeyedStateRelLM3_1`**:
 reordering distinct-key `live` and `dead` arrays in `m.machine.memory` preserves `StateRelLM3_1`
@@ -3135,38 +3190,14 @@ theorem keyedStateRelLM3_1_liveDead_perm_invariant
       { m with machine := { m.machine with memory := { m.machine.memory with live := live', dead := dead' } } }
     KeyedStateRelLM3_1 body s m' allocMap kw := by
   dsimp only
-  rcases h with ⟨hs, rfl⟩
-  rcases hs with ⟨tf, hframes, hrc, hrp, hfr, hac, hcs, hap, hcl, hbor, halloc, hdisj⟩
-  let m' : AnnealStepState :=
-    { m with machine := { m.machine with memory := { m.machine.memory with live := live', dead := dead' } } }
-  have hkeyed : annealMachineToKeyed m.machine = annealMachineToKeyed m'.machine :=
+  rcases h with ⟨⟨tf, hframes, hrc, hrp, hfr, hac, hcs, hap, hcl, hbor, halloc, hdisj⟩, rfl⟩
+  exact ⟨.mk tf hframes hrc hrp
+    (hfr.of_live_base (fun e he => hlivePerm.subset he) (fun _ _ _ => rfl))
+    hac hcs hap hcl hbor (allocMapRel_of_livePerm halloc live' dead' hlivePerm) hdisj,
     memoryState_toKeyed_eq_of_perm annealRowProjection
-      (s₁ := m.machine.memory) (s₂ := m'.machine.memory)
+      (s₁ := m.machine.memory) (s₂ := { m.machine.memory with live := live', dead := dead' })
       rfl rfl (List.Perm.refl _) (List.Perm.refl _)
-      hglobNd hlivePerm hliveNd hdeadPerm hdeadNd (List.Perm.refl _) List.nodup_nil
-  have hfr' : FrameRelLM3_1 body m'.machine allocMap s.frame tf :=
-    hfr.of_live_base (fun e he => hlivePerm.subset he) (fun _ _ _ => rfl)
-  have halloc' : AllocMapRel body s m' allocMap :=
-    { tags_nodup := halloc.tags_nodup
-      local_to_alloc_unique := halloc.local_to_alloc_unique
-      alloc_to_local_injective := halloc.alloc_to_local_injective
-      target_decl := halloc.target_decl
-      base_addr_valid := halloc.base_addr_valid
-      borrow_sync := halloc.borrow_sync
-      live_key_unique := fun e he la₁ la₂ h1 h2 =>
-        halloc.live_key_unique e he la₁ la₂ (hlivePerm.symm.subset h1) (hlivePerm.symm.subset h2)
-      local_alloc_sync := fun tf' hfrEq e he => by
-        have hsync := halloc.local_alloc_sync tf' hfrEq e he
-        have hfindEq : live'.find? (fun x => x.1 == e.allocId) =
-            m.machine.memory.live.find? (fun x => x.1 == e.allocId) :=
-          (array_find?_eq_of_perm_nodup hlivePerm hliveNd e.allocId).symm
-        refine ⟨fun slot hslot hne => ?_, fun hdead => ?_⟩
-        · rcases hsync.1 slot hslot hne with ⟨hloc, hsc, hdecl⟩
-          refine ⟨hloc, hsc, fun decl hd => ?_⟩
-          rcases hdecl decl hd with ⟨la, hfind, hk, ha, hsh⟩
-          exact ⟨la, by rw [hfindEq]; exact hfind, hk, ha, hsh⟩
-        · rw [hfindEq]; exact hsync.2 hdead }
-  exact ⟨.mk tf hframes hrc hrp hfr' hac hcs hap hcl hbor halloc' hdisj, hkeyed⟩
+      hglobNd hlivePerm hliveNd hdeadPerm hdeadNd (List.Perm.refl _) List.nodup_nil⟩
 
 /-- **`live`/`dead` array permutation invariance for `StateRelLM3_2` & `KeyedStateRelLM3_2`**. -/
 theorem keyedStateRelLM3_2_liveDead_perm_invariant
@@ -3186,38 +3217,14 @@ theorem keyedStateRelLM3_2_liveDead_perm_invariant
       { m with machine := { m.machine with memory := { m.machine.memory with live := live', dead := dead' } } }
     KeyedStateRelLM3_2 body s m' allocMap kw := by
   dsimp only
-  rcases h with ⟨hs, rfl⟩
-  rcases hs with ⟨tf, hframes, hrc, hrp, hfr, hac, hcs, hap, hcl, hbor, halloc, hdisj⟩
-  let m' : AnnealStepState :=
-    { m with machine := { m.machine with memory := { m.machine.memory with live := live', dead := dead' } } }
-  have hkeyed : annealMachineToKeyed m.machine = annealMachineToKeyed m'.machine :=
+  rcases h with ⟨⟨tf, hframes, hrc, hrp, hfr, hac, hcs, hap, hcl, hbor, halloc, hdisj⟩, rfl⟩
+  exact ⟨.mk tf hframes hrc hrp
+    (hfr.of_live_base (fun e he => hlivePerm.subset he) (fun _ _ _ => rfl))
+    hac hcs hap hcl hbor (allocMapRel_of_livePerm halloc live' dead' hlivePerm) hdisj,
     memoryState_toKeyed_eq_of_perm annealRowProjection
-      (s₁ := m.machine.memory) (s₂ := m'.machine.memory)
+      (s₁ := m.machine.memory) (s₂ := { m.machine.memory with live := live', dead := dead' })
       rfl rfl (List.Perm.refl _) (List.Perm.refl _)
-      hglobNd hlivePerm hliveNd hdeadPerm hdeadNd (List.Perm.refl _) List.nodup_nil
-  have hfr' : FrameRelLM3_2 body m'.machine allocMap s.frame tf :=
-    hfr.of_live_base (fun e he => hlivePerm.subset he) (fun _ _ _ => rfl)
-  have halloc' : AllocMapRel body s m' allocMap :=
-    { tags_nodup := halloc.tags_nodup
-      local_to_alloc_unique := halloc.local_to_alloc_unique
-      alloc_to_local_injective := halloc.alloc_to_local_injective
-      target_decl := halloc.target_decl
-      base_addr_valid := halloc.base_addr_valid
-      borrow_sync := halloc.borrow_sync
-      live_key_unique := fun e he la₁ la₂ h1 h2 =>
-        halloc.live_key_unique e he la₁ la₂ (hlivePerm.symm.subset h1) (hlivePerm.symm.subset h2)
-      local_alloc_sync := fun tf' hfrEq e he => by
-        have hsync := halloc.local_alloc_sync tf' hfrEq e he
-        have hfindEq : live'.find? (fun x => x.1 == e.allocId) =
-            m.machine.memory.live.find? (fun x => x.1 == e.allocId) :=
-          (array_find?_eq_of_perm_nodup hlivePerm hliveNd e.allocId).symm
-        refine ⟨fun slot hslot hne => ?_, fun hdead => ?_⟩
-        · rcases hsync.1 slot hslot hne with ⟨hloc, hsc, hdecl⟩
-          refine ⟨hloc, hsc, fun decl hd => ?_⟩
-          rcases hdecl decl hd with ⟨la, hfind, hk, ha, hsh⟩
-          exact ⟨la, by rw [hfindEq]; exact hfind, hk, ha, hsh⟩
-        · rw [hfindEq]; exact hsync.2 hdead }
-  exact ⟨.mk tf hframes hrc hrp hfr' hac hcs hap hcl hbor halloc' hdisj, hkeyed⟩
+      hglobNd hlivePerm hliveNd hdeadPerm hdeadNd (List.Perm.refl _) List.nodup_nil⟩
 
 /-- **Allocation lifting on `KeyedStateRelLM3_1`**: stepping `m.machine.memory` through
 `MemoryLifecycle.insertAllocation` advances `kw` by `KeyedAllocWorld.allocate` on the same entry. -/
@@ -3425,17 +3432,6 @@ theorem protectorEndAccessIsWrite?_eq_miri_associatedAccess (n : TreeTagNode) :
   cases n with | mk tag parentTag perm off len prot accessed =>
   cases accessed <;> cases perm <;> rfl
 
-local macro "miriNodeAt" : term =>
-  `(miri_etm_private% Miri.TreeBorrows.Traversal Miri.TreeBorrows.Tree.TraversalTree.nodeAt)
-local macro "miriAncestorPathAux" : term =>
-  `(miri_etm_private% Miri.TreeBorrows.Traversal
-    Miri.TreeBorrows.Tree.TraversalTree.ancestorPathAux)
-local macro "miriInitialForeignRootsGo" : term =>
-  `(miri_etm_private% Miri.TreeBorrows.Traversal
-    Miri.TreeBorrows.Tree.TraversalTree.initialForeignRoots.go)
-local macro "miriForeignPostorder" : term =>
-  `(miri_etm_private% Miri.TreeBorrows.Traversal
-    Miri.TreeBorrows.Tree.TraversalTree.foreignPostorder)
 
 /-- Ordered children of node `t` of a vendored traversal tree (`[]` out of
 range), as read by the vendored visitor. -/
@@ -4453,339 +4449,49 @@ def releaseProtectorSimTree : Miri.TreeBorrows.BorrowTree :=
     locations := Miri.DataStructures.DedupRangeMap.new ⟨4⟩ loc
     roots := #[⟨0⟩] }
 
-local macro "miriPerformTreeAccessAt" : term =>
-  `(miri_etm_private% Miri.TreeBorrows.TreeState Miri.TreeBorrows.BorrowTree.performTreeAccessAt)
-local macro "miriNormalProjection" : term =>
-  `(miri_etm_private% Miri.TreeBorrows.TreeState Miri.TreeBorrows.BorrowTree.normalProjection)
-local macro "miriTLAMk" : term =>
-  `(miri_etm_private% Miri.TreeBorrows.TreeState Miri.TreeBorrows.BorrowTree.TreeLocationAccessAtResult.mk)
-local macro "miriMinExposedChild" : term =>
-  `(miri_etm_private% Miri.TreeBorrows.TreeState Miri.TreeBorrows.BorrowTree.minExposedChild)
-local macro "miriBorrowAccessError" : term =>
-  `(miri_etm_private% Miri.Interpreter.MachineHooks Miri.Interpreter.MachineHooks.borrowAccessError)
 
-private def releaseProtectorSimLoc : Miri.TreeBorrows.LocationTree :=
-  { perms := ⟨#[some ⟨.Unique, true, .None⟩,
-                some ⟨.Unique, true, .None⟩,
-                some ⟨.Unique, true, .None⟩,
-                some ⟨.Unique, true, .None⟩]⟩
-    exposedCache := {} }
+private theorem uniValMap_entries_2 {α : Type} (a b : α) :
+    (⟨#[some a, some b]⟩ : Miri.TreeBorrows.UniValMap α).entries = #[(⟨0⟩, a), (⟨1⟩, b)] := by
+  simp [Miri.TreeBorrows.UniValMap.entries, Std.Legacy.Range.forIn_eq_forIn_range',
+    Std.Legacy.Range.size, List.range', Miri.TreeBorrows.UniIndex.ofNat?, Id.run,
+    bind, Bind.bind, pure, Pure.pure]
 
-private theorem releaseProtectorSimTree_performTreeAccessAt
-    (prot : Miri.TreeBorrows.ProtectedTags)
-    (loc' : Miri.TreeBorrows.LocationTree)
-    (acc : Miri.TreeBorrows.Tree.NormalAccessResult)
-    (hnorm : releaseProtectorSimTree.performNormalAccessAt releaseProtectorSimLoc ⟨1⟩ .Write
-      prot .SkipChildrenOfAccessed = ⟨loc', acc, .ok ()⟩)
-    (hroot : acc.root = 0) :
-    (acc.status = .Completed →
-      miriPerformTreeAccessAt releaseProtectorSimTree releaseProtectorSimLoc (some ⟨1⟩) .Write
-        prot .SkipChildrenOfAccessed ⟨⟨0⟩, ⟨4⟩⟩ = miriTLAMk loc' (some acc) none) ∧
-    (acc.status ≠ .Completed →
-      miriPerformTreeAccessAt releaseProtectorSimTree releaseProtectorSimLoc (some ⟨1⟩) .Write
-        prot .SkipChildrenOfAccessed ⟨⟨0⟩, ⟨4⟩⟩ =
-        miriTLAMk loc' (some acc) (some (.AccessFailure ⟨⟨0⟩, ⟨4⟩⟩ acc.status))) := by
-  have hunf : miriPerformTreeAccessAt releaseProtectorSimTree releaseProtectorSimLoc (some ⟨1⟩)
-      .Write prot .SkipChildrenOfAccessed ⟨⟨0⟩, ⟨4⟩⟩ =
-      (Id.run do
-        let mut currentLocation := releaseProtectorSimLoc
-        let mut normalAccess : Option Miri.TreeBorrows.Tree.NormalAccessResult := none
-        let mut accessedRoot? : Option Miri.TreeBorrows.UniIndex := none
-        let mut status : Option Miri.TreeBorrows.BorrowTree.BorrowTreeAccessStatus := none
-        let normal := releaseProtectorSimTree.performNormalAccessAt currentLocation ⟨1⟩ .Write
-          prot .SkipChildrenOfAccessed
-        currentLocation := normal.location
-        normalAccess := some normal.access
-        match normal.outcome with
-        | .error error =>
-          return miriTLAMk currentLocation normalAccess (some (.CacheFailure ⟨⟨0⟩, ⟨4⟩⟩ error))
-        | .ok () =>
-          if normal.access.status != .Completed then
-            return miriTLAMk currentLocation normalAccess
-              (some (.AccessFailure ⟨⟨0⟩, ⟨4⟩⟩ normal.access.status))
-          match Miri.TreeBorrows.UniIndex.ofNat? normal.access.root with
-          | none =>
-            return miriTLAMk currentLocation normalAccess
-              (some (.AccessFailure ⟨⟨0⟩, ⟨4⟩⟩ (.MissingLocationState normal.access.root)))
-          | some root => accessedRoot? := some root
-        let maxLocalTag := accessedRoot?.bind fun root =>
-          (releaseProtectorSimTree.nodes.get root).map Miri.TreeBorrows.TreeNode.tag
-        let minExposed := Option.bind (some (⟨1⟩ : Miri.TreeBorrows.UniIndex))
-          (miriMinExposedChild releaseProtectorSimTree)
-        let mut stopOtherRoots := false
-        for rootPosition in [:releaseProtectorSimTree.roots.size] do
-          if status.isNone && !stopOtherRoots then
-            match releaseProtectorSimTree.roots[rootPosition]? with
-            | none => pure ()
-            | some root =>
-              let rootTag := (releaseProtectorSimTree.nodes.get root).map Miri.TreeBorrows.TreeNode.tag
-              let pastMinExposed : Bool := match rootTag, minExposed with
-                | some tag, some minimum => decide (tag.value > minimum.value)
-                | _, _ => false
-              if pastMinExposed then
-                stopOtherRoots := true
-              else if accessedRoot? != some root then
-                let wildcard := releaseProtectorSimTree.performWildcardAccessAt currentLocation root
-                  maxLocalTag .Write prot (rootPosition != 0)
-                currentLocation := wildcard.location
-                if wildcard.status != .Completed then
-                  status := some (.WildcardFailure ⟨⟨0⟩, ⟨4⟩⟩ wildcard.status)
-        return miriTLAMk currentLocation normalAccess status) := rfl
-  constructor
-  · intro hcomp
-    rw [hunf]
-    dsimp only [Id.run, bind, Bind.bind, pure, Pure.pure]
-    rw [hnorm]
-    have hof0 : Miri.TreeBorrows.UniIndex.ofNat? 0 = some ⟨0⟩ := by decide
-    have hroots : releaseProtectorSimTree.roots = #[⟨0⟩] := rfl
-    have htag0 : (releaseProtectorSimTree.nodes.get ⟨0⟩).map Miri.TreeBorrows.TreeNode.tag =
-        some ⟨1, by decide⟩ := by decide
-    simp only [hcomp, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, hroot, hof0, hroots,
-      Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size, Array.size_singleton,
-      Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one, List.range', List.forIn_cons, List.forIn_nil,
-      bind, Bind.bind, pure, Pure.pure, Array.getElem?_singleton, Option.isNone_none,
-      Bool.not_false, Bool.and_self, htag0]
-    cases Option.bind (some (⟨1⟩ : Miri.TreeBorrows.UniIndex))
-        (miriMinExposedChild releaseProtectorSimTree) with
-    | none => rfl
-    | some minimum =>
-      by_cases hgt : (⟨1, by decide⟩ : Miri.Memory.BorTag).value > minimum.value
-      · simp [hgt]
-      · simp [hgt]
-  · intro hne
-    rw [hunf]
-    dsimp only [Id.run, bind, Bind.bind, pure, Pure.pure]
-    rw [hnorm]
-    have hbne : (acc.status != .Completed) = true := bne_iff_ne.mpr hne
-    simp only [hbne, ↓reduceIte]
+private theorem uniValMap_entries_3 {α : Type} (a b c : α) :
+    (⟨#[some a, some b, some c]⟩ : Miri.TreeBorrows.UniValMap α).entries =
+      #[(⟨0⟩, a), (⟨1⟩, b), (⟨2⟩, c)] := by
+  simp [Miri.TreeBorrows.UniValMap.entries, Std.Legacy.Range.forIn_eq_forIn_range',
+    Std.Legacy.Range.size, List.range', Miri.TreeBorrows.UniIndex.ofNat?, Id.run,
+    bind, Bind.bind, pure, Pure.pure]
 
-/-- **Live vendored `BorrowTree.releaseProtector` simulation** matching `execProtectorEndAccess`,
-`execProtectorEndAccess_descendants_untouched`, and `execFrameExit_miri_vs_sequential_separation`:
-1. Releasing protected tag `2` while its strict descendant `4` is ALSO protected (sibling `3`
-   unprotected) returns `.Released`, disables sibling `3`, and leaves strict descendant `4`
-   literally untouched (`.Unique`, accessed) via `.SkipChildrenOfAccessed`.
-2. Releasing protected tag `2` while sibling `3` is ALSO protected (same exiting frame, Miri order)
-   fails with `.AccessFailure` (`ProtectedDisabled`), whereas releasing tag `2` after removing
-   sibling `3`'s protector (sequential MiniRust order) returns `.Released`. -/
-theorem miri_releaseProtector_skipChildren_and_siblingConflict :
-    let t2 : Miri.Memory.BorTag := ⟨2, by decide⟩
-    let t3 : Miri.Memory.BorTag := ⟨3, by decide⟩
-    let t4 : Miri.Memory.BorTag := ⟨4, by decide⟩
-    let protWithDesc : Miri.TreeBorrows.ProtectedTags :=
-      ⟨#[(t2, .StrongProtector), (t4, .StrongProtector)]⟩
-    let protWithSib : Miri.TreeBorrows.ProtectedTags :=
-      ⟨#[(t2, .StrongProtector), (t3, .StrongProtector)]⟩
-    let protAfterSibPop : Miri.TreeBorrows.ProtectedTags :=
-      ⟨#[(t2, .StrongProtector)]⟩
-    let resDesc := releaseProtectorSimTree.releaseProtector t2 protWithDesc
-    let resSib := releaseProtectorSimTree.releaseProtector t2 protWithSib
-    let resAfterPop := releaseProtectorSimTree.releaseProtector t2 protAfterSibPop
-    resDesc.status = .Released ∧
-    ((resDesc.tree.locations.entries[0]?.bind fun seg => seg.data.perms.get ⟨2⟩).map
-      fun s => (s.permission, s.accessed)) = some (.Disabled, true) ∧
-    (resDesc.tree.locations.entries[0]?.bind fun seg => seg.data.perms.get ⟨3⟩) =
-      some ⟨.Unique, true, .None⟩ ∧
-    (match resSib.status with | .AccessFailure _ _ => true | _ => false) = true ∧
-    resAfterPop.status = .Released := by
-  intro t2 t3 t4 protWithDesc protWithSib protAfterSibPop resDesc resSib resAfterPop
-  have hrun : ∀ (prot : Miri.TreeBorrows.ProtectedTags) (loc' : Miri.TreeBorrows.LocationTree)
-      (acc : Miri.TreeBorrows.Tree.NormalAccessResult),
-      releaseProtectorSimTree.performNormalAccessAt releaseProtectorSimLoc ⟨1⟩ .Write
-        prot .SkipChildrenOfAccessed = ⟨loc', acc, .ok ()⟩ →
-      acc.root = 0 →
-      (acc.status = .Completed →
-        releaseProtectorSimTree.releaseProtector t2 prot =
-          ⟨{ releaseProtectorSimTree with
-             locations := (releaseProtectorSimTree.locations.setAtPos 0 loc').state }, .Released⟩) ∧
-      (acc.status ≠ .Completed →
-        releaseProtectorSimTree.releaseProtector t2 prot =
-          ⟨{ releaseProtectorSimTree with
-             locations := (releaseProtectorSimTree.locations.setAtPos 0 loc').state },
-            .AccessFailure ⟨⟨0⟩, ⟨4⟩⟩ (.AccessFailure ⟨⟨0⟩, ⟨4⟩⟩ acc.status)⟩) := by
-    intro prot loc' acc hnorm hroot
-    have hta := releaseProtectorSimTree_performTreeAccessAt prot loc' acc hnorm hroot
-    have hidx : releaseProtectorSimTree.indexOfTag t2 = some ⟨1⟩ := by decide
-    have hsetOk : (releaseProtectorSimTree.locations.setAtPos 0 loc').outcome = .ok () := rfl
-    have hexp : ({ releaseProtectorSimTree with
-        locations := (releaseProtectorSimTree.locations.setAtPos 0 loc').state }).updateExposureForProtectorRelease t2 =
-        ⟨{ releaseProtectorSimTree with
-           locations := (releaseProtectorSimTree.locations.setAtPos 0 loc').state }, .ok ()⟩ := by
-      unfold Miri.TreeBorrows.BorrowTree.updateExposureForProtectorRelease
-      have hnode : releaseProtectorSimTree.nodeAt ⟨1⟩ =
-          some ⟨t2, some ⟨0⟩, #[⟨3⟩], .ReservedFrz false, .None, false, none⟩ := by decide
-      have hidx' : ({ releaseProtectorSimTree with
-          locations := (releaseProtectorSimTree.locations.setAtPos 0 loc').state }).indexOfTag t2 =
-          some ⟨1⟩ := hidx
-      have hnode' : ({ releaseProtectorSimTree with
-          locations := (releaseProtectorSimTree.locations.setAtPos 0 loc').state }).nodeAt ⟨1⟩ =
-          some ⟨t2, some ⟨0⟩, #[⟨3⟩], .ReservedFrz false, .None, false, none⟩ := hnode
-      simp [hidx', hnode', Id.run, pure]
-    constructor
-    · intro hcomp
-      unfold Miri.TreeBorrows.BorrowTree.releaseProtector
-      rw [hidx]
-      simp only [Id.run, bind, Bind.bind, pure, Pure.pure,
-        Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size,
-        Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one]
-      have hsz : releaseProtectorSimTree.locations.entries.size = 1 := by decide
-      rw [hsz]
-      simp only [List.range', List.forIn_cons, List.forIn_nil, bind, Bind.bind, pure, Pure.pure]
-      have hseg : releaseProtectorSimTree.locations.index 0 =
-          .ok ⟨⟨⟨0⟩, ⟨4⟩⟩, releaseProtectorSimLoc⟩ := by decide
-      rw [hseg]
-      have hget : releaseProtectorSimLoc.perms.get ⟨1⟩ = some ⟨.Unique, true, .None⟩ := by decide
-      simp only [hget, Miri.TreeBorrows.Permission.associatedAccess, ↓reduceIte]
-      rw [hta.1 hcomp]
-      simp only [hsetOk, hexp]
-    · intro hne
-      unfold Miri.TreeBorrows.BorrowTree.releaseProtector
-      rw [hidx]
-      simp only [Id.run, bind, Bind.bind, pure, Pure.pure,
-        Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size,
-        Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one]
-      have hsz : releaseProtectorSimTree.locations.entries.size = 1 := by decide
-      rw [hsz]
-      simp only [List.range', List.forIn_cons, List.forIn_nil, bind, Bind.bind, pure, Pure.pure]
-      have hseg : releaseProtectorSimTree.locations.index 0 =
-          .ok ⟨⟨⟨0⟩, ⟨4⟩⟩, releaseProtectorSimLoc⟩ := by decide
-      rw [hseg]
-      have hget : releaseProtectorSimLoc.perms.get ⟨1⟩ = some ⟨.Unique, true, .None⟩ := by decide
-      simp only [hget, Miri.TreeBorrows.Permission.associatedAccess, ↓reduceIte]
-      rw [hta.2 hne]
-      simp only [hsetOk]
-  have hnormEval : ∀ (prot : Miri.TreeBorrows.ProtectedTags)
-      (res : Miri.TreeBorrows.Tree.NormalAccessResult)
-      (s0 s1 s2 s3 : Miri.TreeBorrows.Tree.LocationState),
-      (Miri.TreeBorrows.Tree.NormalTreeState.performAccess
-        (miriNormalProjection releaseProtectorSimTree releaseProtectorSimLoc prot)
-        1 .Write .SkipChildrenOfAccessed) = res →
-      res.visited = [⟨1, .LocalAccess⟩, ⟨0, .LocalAccess⟩, ⟨2, .ForeignAccess⟩] →
-      res.tree.locationStates = #[some s0, some s1, some s2, some s3] →
-      releaseProtectorSimTree.performNormalAccessAt releaseProtectorSimLoc ⟨1⟩ .Write
-        prot .SkipChildrenOfAccessed =
-        ⟨{ perms := ⟨#[some s0, some s1, some s2, some s3]⟩
-           exposedCache := {} }, res, .ok ()⟩ := by
-    intro prot res s0 s1 s2 s3 hpa hvis hls
-    unfold Miri.TreeBorrows.BorrowTree.performNormalAccessAt
-    change (Id.run do
-      let access := Miri.TreeBorrows.Tree.NormalTreeState.performAccess
-        (miriNormalProjection releaseProtectorSimTree releaseProtectorSimLoc prot)
-        1 .Write .SkipChildrenOfAccessed
-      let mut nextLocation := releaseProtectorSimLoc
-      for position in [:access.tree.locationStates.size] do
-        match access.tree.locationStates[position]? with
-        | some (some state) =>
+private theorem array_map_2 {α β : Type} (f : α → β) (a b : α) :
+    #[a, b].map f = #[f a, f b] := by simp
+private theorem array_map_3 {α β : Type} (f : α → β) (a b c : α) :
+    #[a, b, c].map f = #[f a, f b, f c] := by simp
+private theorem array_mapIdx_2 {α β : Type} (f : Nat → α → β) (a b : α) :
+    #[a, b].mapIdx f = #[f 0 a, f 1 b] := rfl
+private theorem array_mapIdx_3 {α β : Type} (f : Nat → α → β) (a b c : α) :
+    #[a, b, c].mapIdx f = #[f 0 a, f 1 b, f 2 c] := rfl
+
+private theorem miriNormalProjection_eq_struct
+    (tree : Miri.TreeBorrows.BorrowTree) (loc : Miri.TreeBorrows.LocationTree)
+    (pt : Miri.TreeBorrows.ProtectedTags) :
+    miriNormalProjection tree loc pt =
+      { topology := ⟨tree.nodes.data.map fun entry =>
+          match entry with
+          | none => ⟨none, []⟩
+          | some node =>
+              ⟨node.parent.map Miri.TreeBorrows.UniIndex.toNat,
+               node.children.toList.map Miri.TreeBorrows.UniIndex.toNat⟩⟩
+        defaultStates := tree.nodes.data.map fun entry =>
+          match entry with
+          | some node => node.defaultLocationState
+          | none => ⟨.Disabled, false, .None⟩
+        protectedNodes := tree.nodes.entries.toList.filterMap fun (index, node) =>
+          if pt.contains node.tag then some index.toNat else none
+        locationStates := tree.nodes.data.mapIdx fun position _ =>
           match Miri.TreeBorrows.UniIndex.ofNat? position with
-          | some index =>
-            nextLocation := { nextLocation with perms := nextLocation.perms.insert index state }
-          | none => pure ()
-        | _ => pure ()
-      let mut cacheOutcome : Except Miri.TreeBorrows.ExposedCacheError Unit := .ok ()
-      for event in access.visited do
-        if cacheOutcome matches .ok _ then
-          match Miri.TreeBorrows.UniIndex.ofNat? event.node with
-          | none => cacheOutcome := .error (.InvalidIndex event.node)
-          | some index =>
-            match releaseProtectorSimTree.nodeAt index with
-            | none => cacheOutcome := .error (.MissingNode index)
-            | some node =>
-              if node.isExposed &&
-                  (miri_etm_private% Miri.TreeBorrows.TreeState Miri.TreeBorrows.BorrowTree.failingNode?)
-                    access.status != some event.node then
-                match releaseProtectorSimTree.locationStateAt releaseProtectorSimLoc index,
-                    access.tree.stateAt event.node with
-                | some oldState, some newState =>
-                  match Miri.TreeBorrows.performAccessTransition .Write event.relatedness
-                      oldState.permission (prot.contains node.tag) with
-                  | .Transition transition =>
-                    if !transition.isNoop then
-                      let oldLevel := oldState.permission.strongestAllowedLocalAccess
-                        (prot.contains node.tag)
-                      let newLevel := newState.permission.strongestAllowedLocalAccess
-                        (prot.contains node.tag)
-                      let update := nextLocation.exposedCache.updateExposure
-                        releaseProtectorSimTree.nodes index oldLevel newLevel
-                      nextLocation := { nextLocation with exposedCache := update.cache }
-                      cacheOutcome := update.outcome
-                  | .UndefinedBehavior | .ImpossibleProtectedReservedIM => pure ()
-                | _, _ => cacheOutcome := .error (.MissingNode index)
-      return (⟨nextLocation, access, cacheOutcome⟩ :
-        Miri.TreeBorrows.BorrowTree.NormalLocationAccessResult)) = _
-    rw [hpa]
-    have hof0 : Miri.TreeBorrows.UniIndex.ofNat? 0 = some ⟨0⟩ := by decide
-    have hof1 : Miri.TreeBorrows.UniIndex.ofNat? 1 = some ⟨1⟩ := by decide
-    have hof2 : Miri.TreeBorrows.UniIndex.ofNat? 2 = some ⟨2⟩ := by decide
-    have hof3 : Miri.TreeBorrows.UniIndex.ofNat? 3 = some ⟨3⟩ := by decide
-    have hn0 : releaseProtectorSimTree.nodeAt ⟨0⟩ =
-        some ⟨⟨1, by decide⟩, none, #[⟨1⟩, ⟨2⟩], .Disabled, .None, false, none⟩ := by decide
-    have hn1 : releaseProtectorSimTree.nodeAt ⟨1⟩ =
-        some ⟨t2, some ⟨0⟩, #[⟨3⟩], .ReservedFrz false, .None, false, none⟩ := by decide
-    have hn2 : releaseProtectorSimTree.nodeAt ⟨2⟩ =
-        some ⟨t3, some ⟨0⟩, #[], .ReservedFrz false, .None, false, none⟩ := by decide
-    have hsz4 : (#[some s0, some s1, some s2, some s3] :
-        Array (Option Miri.TreeBorrows.Tree.LocationState)).size = 4 := rfl
-    have hg0 : (#[some s0, some s1, some s2, some s3] :
-        Array (Option Miri.TreeBorrows.Tree.LocationState))[0]? = some (some s0) := rfl
-    have hg1 : (#[some s0, some s1, some s2, some s3] :
-        Array (Option Miri.TreeBorrows.Tree.LocationState))[1]? = some (some s1) := rfl
-    have hg2 : (#[some s0, some s1, some s2, some s3] :
-        Array (Option Miri.TreeBorrows.Tree.LocationState))[2]? = some (some s2) := rfl
-    have hg3 : (#[some s0, some s1, some s2, some s3] :
-        Array (Option Miri.TreeBorrows.Tree.LocationState))[3]? = some (some s3) := rfl
-    have hins4 : ((((releaseProtectorSimLoc.perms.insert ⟨0⟩ s0).insert ⟨1⟩ s1).insert ⟨2⟩ s2).insert
-        ⟨3⟩ s3) = ⟨#[some s0, some s1, some s2, some s3]⟩ := by
-      simp [releaseProtectorSimLoc, Miri.TreeBorrows.UniValMap.insert,
-        Miri.TreeBorrows.UniValMap.extendTo, Miri.TreeBorrows.UniIndex.toNat,
-        Id.run, pure, Pure.pure]
-    simp only [hvis, hls, hsz4, Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size,
-      Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one, List.range', List.forIn_cons, List.forIn_nil,
-      Id.run, bind, Bind.bind, pure, Pure.pure,
-      hg0, hg1, hg2, hg3, hof0, hof1, hof2, hof3, hn0, hn1, hn2, Bool.false_and,
-      Bool.false_eq_true, ↓reduceIte, hins4]
-    rfl
-  let normState (prots : List Nat) : Miri.TreeBorrows.Tree.NormalTreeState :=
-    { topology := ⟨#[⟨none, [1, 2]⟩, ⟨some 0, [3]⟩, ⟨some 0, []⟩, ⟨some 1, []⟩]⟩
-      defaultStates := #[⟨.Disabled, false, .None⟩, ⟨.ReservedFrz false, false, .None⟩,
-        ⟨.ReservedFrz false, false, .None⟩, ⟨.ReservedFrz false, false, .None⟩]
-      protectedNodes := prots
-      locationStates := #[some ⟨.Unique, true, .None⟩, some ⟨.Unique, true, .None⟩,
-        some ⟨.Unique, true, .None⟩, some ⟨.Unique, true, .None⟩] }
-  have hprojD : miriNormalProjection releaseProtectorSimTree releaseProtectorSimLoc protWithDesc =
-      normState [1, 3] := by decide +kernel
-  have hprojS : miriNormalProjection releaseProtectorSimTree releaseProtectorSimLoc protWithSib =
-      normState [1, 2] := by decide +kernel
-  have hprojP : miriNormalProjection releaseProtectorSimTree releaseProtectorSimLoc protAfterSibPop =
-      normState [1] := by decide +kernel
-  let accD := (normState [1, 3]).performAccess 1 .Write .SkipChildrenOfAccessed
-  let accS := (normState [1, 2]).performAccess 1 .Write .SkipChildrenOfAccessed
-  let accP := (normState [1]).performAccess 1 .Write .SkipChildrenOfAccessed
-  have hnd := hnormEval protWithDesc accD
-    ⟨.Unique, true, .None⟩ ⟨.Unique, true, .None⟩ ⟨.Disabled, true, .Write⟩ ⟨.Unique, true, .None⟩
-    (by rw [hprojD]) (by decide) (by decide)
-  have hns := hnormEval protWithSib accS
-    ⟨.Unique, true, .None⟩ ⟨.Unique, true, .None⟩ ⟨.Disabled, true, .Write⟩ ⟨.Unique, true, .None⟩
-    (by rw [hprojS]) (by decide) (by decide)
-  have hnp := hnormEval protAfterSibPop accP
-    ⟨.Unique, true, .None⟩ ⟨.Unique, true, .None⟩ ⟨.Disabled, true, .Write⟩ ⟨.Unique, true, .None⟩
-    (by rw [hprojP]) (by decide) (by decide)
-  have hresD := (hrun protWithDesc _ accD hnd (by decide)).1 (by decide)
-  have hresS := (hrun protWithSib _ accS hns (by decide)).2 (by decide)
-  have hresP := (hrun protAfterSibPop _ accP hnp (by decide)).1 (by decide)
-  refine ⟨?_, ?_, ?_, ?_, ?_⟩
-  · change (releaseProtectorSimTree.releaseProtector t2 protWithDesc).status = .Released
-    rw [hresD]
-  · change ((releaseProtectorSimTree.releaseProtector t2 protWithDesc).tree.locations.entries[0]?.bind
-      fun seg => seg.data.perms.get ⟨2⟩).map (fun s => (s.permission, s.accessed)) =
-      some (.Disabled, true)
-    rw [hresD]; decide
-  · change ((releaseProtectorSimTree.releaseProtector t2 protWithDesc).tree.locations.entries[0]?.bind
-      fun seg => seg.data.perms.get ⟨3⟩) = some ⟨.Unique, true, .None⟩
-    rw [hresD]; decide
-  · change (match (releaseProtectorSimTree.releaseProtector t2 protWithSib).status with
-      | .AccessFailure _ _ => true | _ => false) = true
-    rw [hresS]
-  · change (releaseProtectorSimTree.releaseProtector t2 protAfterSibPop).status = .Released
-    rw [hresP]
+          | none => none
+          | some index => loc.perms.get index } := rfl
 
 /-- **`MachineHooks.beforeStackPopWithEnsure` retains ALL frame protectors until `endCall`**
 (connecting vendored `MachineHooks.lean:392-429` directly to `execFrameExitMiri` vs
@@ -5029,10 +4735,6 @@ def miriVTableTraitCheckOk (table : Nat → DynExistentialSpec) (actual expected
   | .ok _ _ => true
   | .error _ _ => false
 
-local macro "miriSortedPredicates" : term =>
-  `(miri_etm_private% Miri.Interpreter.VTable Miri.Interpreter.VTable.sortedPredicates)
-local macro "miriSortPredicates" : term =>
-  `(miri_etm_private% Miri.Interpreter.VTable Miri.Interpreter.VTable.sortPredicates)
 
 private theorem filter_nonAuto_eq_nil (xs : List Miri.Interpreter.VTablePredicate)
     (h : ∀ q ∈ xs, q.autoTrait = true) : xs.filter (fun q => !q.autoTrait) = [] := by
@@ -5069,8 +4771,6 @@ theorem miri_checkForTypeRead_autoOnly_ok (P : Type) (table : Nat → DynExisten
 
 /-! ### Part 2A. General `VTable` Correspondence (`lean-miri#75`): `checkForTypeRead`, `stableKey` Separation, `getPtrVTableTypeRead`, `getSizeAndAlignRead`, Salted `getPointer`, & Upcasting -/
 
-local macro "miriInsertPredicate" : term =>
-  `(miri_etm_private% Miri.Interpreter.VTable Miri.Interpreter.VTable.insertPredicate)
 
 /-- Non-auto predicates have injective `stableKey` (matching rustc's total `StableOrd` on
 existential predicates, and holding trivially for EVERY principal-less or single-principal
@@ -6130,51 +5830,56 @@ theorem miri_vtable_getPointer_salted_distinct_allocIds {K User Other C ABI : Ty
   let g1 : Miri.Memory.GlobalAllocation := ⟨id₁, .vtable, .ZERO, align, .Not, some .vtable⟩
   let mem1 := Miri.Memory.MemoryState.pushGlobal mem1a g1
   have hmem1Src : mem1.sourceAllocIdWorldActive = false := hmem1aSrc
-  have hmem1Keyed : memoryStateToKeyed dummyProj mem1 =
-      (KeyedAllocWorld.empty.reserveAllocId.1).registerGlobal (ofMiriAllocId id₁)
-        ⟨.vtable, 0, UInt8.ofNat align.pow2, .not, []⟩ := by
-    have h1a : memoryStateToKeyed dummyProj mem1a = KeyedAllocWorld.empty.reserveAllocId.1 := by
-      have h := hres1Bridge.1
-      rw [hmem0Keyed] at h
-      exact h
-    have hgl : mem1.globals = mem1a.globals.push g1 := rfl
-    have hmem1aGl : mem1a.globals = #[] := by
-      change mem0.reserveAllocId.1.globals = #[]
-      unfold Miri.Memory.MemoryState.reserveAllocId
-      have hs : mem0.sourceAllocIdWorldActive = false := rfl
-      have he : mem0.idSupplyExhausted = false := rfl
-      have hn : mem0.nextAllocId = 1 := rfl
-      rw [hs, he, hn]
-      simp only [Id.run, pure, Pure.pure, Bool.false_and, Bool.false_or, Bool.false_eq_true, ↓reduceIte]
-      cases Miri.Memory.AllocId.ofUInt64 1 with
-      | none => rfl
-      | some a =>
-        dsimp only
-        split <;> rfl
+  have hmem1aGl : mem1a.globals = #[] := by
+    change mem0.reserveAllocId.1.globals = #[]
+    unfold Miri.Memory.MemoryState.reserveAllocId
+    have hs : mem0.sourceAllocIdWorldActive = false := rfl
+    have he : mem0.idSupplyExhausted = false := rfl
+    have hn : mem0.nextAllocId = 1 := rfl
+    rw [hs, he, hn]
+    simp only [Id.run, pure, Pure.pure, Bool.false_and, Bool.false_or, Bool.false_eq_true, ↓reduceIte]
+    cases Miri.Memory.AllocId.ofUInt64 1 with
+    | none => rfl
+    | some a =>
+      dsimp only
+      split <;> rfl
+  have h1a : memoryStateToKeyed dummyProj mem1a = KeyedAllocWorld.empty.reserveAllocId.1 := by
+    have h := hres1Bridge.1
+    rw [hmem0Keyed] at h
+    exact h
+  have hpushKeyed : ∀ (mA : Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K)
+      (kwA : KeyedAllocWorld),
+      mA.globals = #[] →
+      memoryStateToKeyed dummyProj mA = kwA →
+      kwA.issued.get? (ofMiriAllocId id₁) = some () →
+      memoryStateToKeyed dummyProj (Miri.Memory.MemoryState.pushGlobal mA g1) =
+        kwA.registerGlobal (ofMiriAllocId id₁)
+          ⟨.vtable, 0, UInt8.ofNat align.pow2, .not, []⟩ := by
+    intro mA kwA hmGl hmKw his
     apply KeyedAllocWorld.ext
-    · change mem1a.nextAllocId = _; rw [← h1a]; rfl
-    · change mem1a.idSupplyExhausted = _; rw [← h1a]; rfl
+    · change mA.nextAllocId = kwA.nextAllocId; rw [← hmKw]; rfl
+    · change mA.idSupplyExhausted = kwA.idSupplyExhausted; rw [← hmKw]; rfl
     · intro id
-      change (memoryStateToKeyed dummyProj mem1a).hasIssued id = _
-      rw [h1a]
+      change (memoryStateToKeyed dummyProj mA).hasIssued id = _
+      rw [hmKw]
       unfold KeyedAllocWorld.registerGlobal KeyedAllocWorld.hasIssued
       dsimp only
       rw [ExtTreeMap0.contains_eq_isSome_get?, ExtTreeMap0.contains_eq_isSome_get?]
-      have his : (KeyedAllocWorld.empty.reserveAllocId.1).issued.get? (ofMiriAllocId id₁) = some () := by decide
       by_cases heq : id = ofMiriAllocId id₁
       · subst heq; rw [his, ExtTreeMap0.get?_insert_self]
       · rw [ExtTreeMap0.get?_insert_ne _ _ heq]
     · intro id
-      have hfg : (memoryStateToKeyed dummyProj mem1).findGlobal? id =
-          ((memoryStateToRows mem1).globals.toList.find? (fun g => g.allocId == toMiriAllocId id)).map
-            (globalEntryOfMiri dummyProj) := by
-        have h0 := toKeyed_findGlobal? dummyProj (memoryStateToRows mem1) (toMiriAllocId id)
+      have hfg : (memoryStateToKeyed dummyProj (Miri.Memory.MemoryState.pushGlobal mA g1)).findGlobal? id =
+          ((memoryStateToRows (Miri.Memory.MemoryState.pushGlobal mA g1)).globals.toList.find?
+            (fun g => g.allocId == toMiriAllocId id)).map (globalEntryOfMiri dummyProj) := by
+        have h0 := toKeyed_findGlobal? dummyProj
+          (memoryStateToRows (Miri.Memory.MemoryState.pushGlobal mA g1)) (toMiriAllocId id)
         rw [ofMiriAllocId_toMiriAllocId] at h0
         exact h0
       rw [hfg]
-      have hlist : (memoryStateToRows mem1).globals.toList = [g1] := by
-        change mem1.globals.toList = [g1]
-        rw [hgl, hmem1aGl]; rfl
+      have hlist : (memoryStateToRows (Miri.Memory.MemoryState.pushGlobal mA g1)).globals.toList = [g1] := by
+        change (mA.globals.push g1).toList = [g1]
+        rw [hmGl]; rfl
       rw [hlist]
       unfold KeyedAllocWorld.registerGlobal KeyedAllocWorld.findGlobal?
       dsimp only
@@ -6186,26 +5891,30 @@ theorem miri_vtable_getPointer_salted_distinct_allocIds {K User Other C ABI : Ty
           intro h; apply heq; rw [← ofMiriAllocId_toMiriAllocId id, ← h]
         have hneB : (id₁ == toMiriAllocId id) = false := beq_false_of_ne hneM
         rw [ExtTreeMap0.get?_insert_ne _ _ heq]
-        have hgl1a : (KeyedAllocWorld.empty.reserveAllocId.1).globals.get? id = none := by
-          change (KeyedAllocWorld.empty.reserveAllocId.1).findGlobal? id = none
-          rw [← h1a]
-          have h0 := toKeyed_findGlobal? dummyProj (memoryStateToRows mem1a) (toMiriAllocId id)
+        have hgl1a : kwA.globals.get? id = none := by
+          change kwA.findGlobal? id = none
+          rw [← hmKw]
+          have h0 := toKeyed_findGlobal? dummyProj (memoryStateToRows mA) (toMiriAllocId id)
           rw [ofMiriAllocId_toMiriAllocId] at h0
-          change (memoryStateToKeyed dummyProj mem1a).findGlobal? id = _ at h0
+          change (memoryStateToKeyed dummyProj mA).findGlobal? id = _ at h0
           rw [h0]
           change Option.map (globalEntryOfMiri dummyProj)
-            (mem1a.globals.toList.find? (fun g => g.allocId == toMiriAllocId id)) = none
-          rw [hmem1aGl]; rfl
+            (mA.globals.toList.find? (fun g => g.allocId == toMiriAllocId id)) = none
+          rw [hmGl]; rfl
         simp [g1, hneB, hgl1a]
     · intro id
-      change (memoryStateToKeyed dummyProj mem1a).findLive? id = _
-      rw [h1a]; rfl
+      change (memoryStateToKeyed dummyProj mA).findLive? id = kwA.findLive? id
+      rw [hmKw]
     · intro id
-      change (memoryStateToKeyed dummyProj mem1a).findDead? id = _
-      rw [h1a]; rfl
+      change (memoryStateToKeyed dummyProj mA).findDead? id = kwA.findDead? id
+      rw [hmKw]
     · intro id
-      change (memoryStateToKeyed dummyProj mem1a).findRace? id = _
-      rw [h1a]; rfl
+      change (memoryStateToKeyed dummyProj mA).findRace? id = kwA.findRace? id
+      rw [hmKw]
+  have hmem1Keyed : memoryStateToKeyed dummyProj mem1 =
+      (KeyedAllocWorld.empty.reserveAllocId.1).registerGlobal (ofMiriAllocId id₁)
+        ⟨.vtable, 0, UInt8.ofNat align.pow2, .not, []⟩ :=
+    hpushKeyed mem1a KeyedAllocWorld.empty.reserveAllocId.1 hmem1aGl h1a (by decide)
   let reg1 : Miri.Interpreter.VTableMachine.Registry := ⟨#[⟨ty, dynType, s₁, id₁⟩]⟩
   let st₁ : Miri.Interpreter.MachineHooks.State K User :=
     { st₀ with machine := { st₀.machine with memory := mem1, user := h.putRegistry st₀.machine.user reg1 } }
@@ -7609,73 +7318,6 @@ theorem stateRelLM3_2_iff_existsUnique_keyed
   ⟨fun h => ⟨annealMachineToKeyed m.machine, ⟨h, rfl⟩, fun _ h' => h'.keyed_eq⟩,
    fun ⟨_, h, _⟩ => h.stateRel⟩
 
-/-- First-match lookup of ONE key is permutation-invariant as soon as that key's rows agree on their
-payload — no global distinct-key (`Nodup`) hypothesis. -/
-private theorem list_find?_eq_of_perm_keyUnique {α : Type}
-    {xs ys : List (Miri.Memory.AllocId × α)} (hperm : xs.Perm ys) (id : Miri.Memory.AllocId)
-    (huniq : ∀ a₁ a₂, (id, a₁) ∈ xs → (id, a₂) ∈ xs → a₁ = a₂) :
-    xs.find? (fun row => row.1 == id) = ys.find? (fun row => row.1 == id) := by
-  cases hx : xs.find? (fun row => row.1 == id) with
-  | none =>
-    cases hy : ys.find? (fun row => row.1 == id) with
-    | none => rfl
-    | some r =>
-      have hm := hperm.symm.subset (List.mem_of_find?_eq_some hy)
-      have hp := List.find?_some hy
-      have hnone := List.find?_eq_none.mp hx r hm
-      exact absurd hp hnone
-  | some r =>
-    cases hy : ys.find? (fun row => row.1 == id) with
-    | none =>
-      have hm := hperm.subset (List.mem_of_find?_eq_some hx)
-      have hp := List.find?_some hx
-      exact absurd hp (List.find?_eq_none.mp hy r hm)
-    | some r' =>
-      have h1 : r.1 = id := eq_of_beq (by simpa using List.find?_some hx)
-      have h2 : r'.1 = id := eq_of_beq (by simpa using List.find?_some hy)
-      have hm1 := List.mem_of_find?_eq_some hx
-      have hm2 := hperm.symm.subset (List.mem_of_find?_eq_some hy)
-      obtain ⟨k, a⟩ := r
-      obtain ⟨k', a'⟩ := r'
-      simp only at h1 h2
-      subst h1; subst h2
-      rw [huniq a a' hm1 hm2]
-
-/-- `AllocMapRel` transports along ANY `live` permutation and ANY replacement of `dead`. -/
-private theorem allocMapRel_of_livePerm
-    {body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir} {s : MachineState}
-    {m : AnnealStepState} {allocMap : List AllocMapEntry}
-    (halloc : AllocMapRel body s m allocMap)
-    (live' : Array (Miri.Memory.AllocId ×
-      Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
-        Miri.Memory.MiriMemoryKind))
-    (dead' : Array Miri.Memory.DeadAllocation)
-    (hlivePerm : m.machine.memory.live.toList.Perm live'.toList) :
-    AllocMapRel body s
-      { m with machine := { m.machine with memory :=
-        { m.machine.memory with live := live', dead := dead' } } } allocMap :=
-  { tags_nodup := halloc.tags_nodup
-    local_to_alloc_unique := halloc.local_to_alloc_unique
-    alloc_to_local_injective := halloc.alloc_to_local_injective
-    target_decl := halloc.target_decl
-    base_addr_valid := halloc.base_addr_valid
-    borrow_sync := halloc.borrow_sync
-    live_key_unique := fun e he la₁ la₂ h1 h2 =>
-      halloc.live_key_unique e he la₁ la₂ (hlivePerm.symm.subset h1) (hlivePerm.symm.subset h2)
-    local_alloc_sync := fun tf' hfrEq e he => by
-      have hsync := halloc.local_alloc_sync tf' hfrEq e he
-      have hfindEq : live'.find? (fun x => x.1 == e.allocId) =
-          m.machine.memory.live.find? (fun x => x.1 == e.allocId) := by
-        rw [← Array.find?_toList, ← Array.find?_toList]
-        exact (list_find?_eq_of_perm_keyUnique hlivePerm e.allocId
-          (halloc.live_key_unique e he)).symm
-      refine ⟨fun slot hslot hne => ?_, fun hdead => ?_⟩
-      · rcases hsync.1 slot hslot hne with ⟨hloc, hsc, hdecl⟩
-        refine ⟨hloc, hsc, fun decl hd => ?_⟩
-        rcases hdecl decl hd with ⟨la, hfind, hk, ha, hsh⟩
-        exact ⟨la, by rw [hfindEq]; exact hfind, hk, ha, hsh⟩
-      · rw [hfindEq]; exact hsync.2 hdead }
-
 /-- **Direct `StateRelLM3_1` invariance, with no distinct-key hypothesis**: `StateRelLM3_1` itself
 (not a keyed projection of it) is preserved by ANY permutation of `m.machine.memory.live` — even
 with duplicate keys, because `AllocMapRel.live_key_unique` already makes the first-match lookup of
@@ -7860,8 +7502,6 @@ theorem keyedStateRelLM3_2_liveDead_perm_iff
 /-! ### 2D.2 Deallocation data-race stage (one relational theorem for every branch) and the exact
 race-table effect of `AllocationMachine.deallocate` -/
 
-local macro "miriRaceSize" : term =>
-  `(miri_etm_private% Miri.Interpreter.MachineHooks Miri.Interpreter.MachineHooks.raceSize)
 
 /-- The theory `RaceDetectorMode` of a vendored machine: `.unconfigured` iff `dataRace = none`,
 otherwise `.configured global.raceDetecting`. -/
@@ -10241,14 +9881,6 @@ private theorem traverse_skipChildren_mem_iff {w : FnEntryBorrowWorld}
             (w.nodes.length + 1) (by omega) (by omega) a haInS rn.tag hrInA)
         exact hunsk a haN haNotS
 
-private theorem normalTree_stateAt_setState_self (tree : Miri.TreeBorrows.Tree.NormalTreeState)
-    (node : Nat) (st : Miri.TreeBorrows.Tree.LocationState)
-    (hlt : node < tree.locationStates.size) :
-    ({ tree with locationStates := tree.locationStates.set node (some st) hlt } :
-      Miri.TreeBorrows.Tree.NormalTreeState).stateAt node = some st := by
-  unfold Miri.TreeBorrows.Tree.NormalTreeState.stateAt
-  simp [hlt]
-
 private theorem normalTree_stateAt_setState_ne (tree : Miri.TreeBorrows.Tree.NormalTreeState)
     (node k : Nat) (st : Miri.TreeBorrows.Tree.LocationState)
     (hlt : node < tree.locationStates.size) (hne : k ≠ node) :
@@ -10263,8 +9895,6 @@ private theorem normalTree_stateAt_setState_ne (tree : Miri.TreeBorrows.Tree.Nor
         Array.getElem?_eq_none (Nat.le_of_not_lt hk)]
   rw [hget]
 
-local macro "miriProcessEvents" : term =>
-  `(miri_etm_private% Miri.TreeBorrows.NormalTree Miri.TreeBorrows.Tree.NormalTreeState.processEvents)
 
 private theorem normalTree_processEvents_rel (w : FnEntryBorrowWorld) (off len : Nat)
     (isWrite : Bool) (root : Nat)
@@ -11468,7 +11098,7 @@ private theorem realAccessReleaseSim_foreign_sifa_sound
 /-- **Real-implicit-access `ProtectorReleaseSim` instance** (`lean-miri#74`), for arbitrary-depth,
 arbitrary-fan-out trees inside the scope fixed by `borrowTreeWorldRel_scope` (ONE `DedupRangeMap`
 segment, one root, unexposed tags, one common nonempty byte range; multi-segment trees are outside
-the relation and are NOT covered):
+`BorrowTreeWorldRel` itself and are instead lifted per-segment by `miri_releaseProtector_multiSeg_partial_sim`):
 discharges `ProtectorReleaseSim` for `BorrowTreeWorldRel` across ALL permissions (`Cell`,
 `ReservedFrz false/true`, `ReservedIM`, `Unique`, `Frozen`, `Disabled`), BOTH `accessed = false`
 (no-access fast path) AND `accessed = true` (real implicit Read on `ReservedFrz`/`Frozen`/`ReservedIM`
@@ -12514,220 +12144,6 @@ theorem multiAllocEndAccesses_ok_perAlloc_eq (tagOf : Miri.Memory.BorTag → Nat
           simp only [List.filter_cons, hne, Bool.false_eq_true, ↓reduceIte]
           exact hrest
 
-/-- **Multi-allocation fold simulation**: lifts ANY per-release simulation `ProtectorReleaseSim`
-(including `realAccessReleaseSim` for real implicit Reads & Writes!) across a frame protecting
-arbitrarily many tags residing in ARBITRARILY MANY distinct live allocations (`prots : List (AllocId × BorTag)`). -/
-theorem stackPopReleaseAll_multiAlloc_simulates {K : Type}
-    (pt : Miri.TreeBorrows.ProtectedTags)
-    (frameTag : Miri.Memory.AllocId → Miri.Memory.BorTag → Prop)
-    (tagOf : Miri.Memory.BorTag → Nat)
-    (R : Miri.Memory.AllocId → Miri.TreeBorrows.BorrowTree → FnEntryBorrowWorld → Prop)
-    (hsim : ∀ id, ProtectorReleaseSim pt (frameTag id) tagOf (R id))
-    (prots : List (Miri.Memory.AllocId × Miri.Memory.BorTag))
-    (hprots : ∀ p ∈ prots, frameTag p.1 p.2) :
-    ∀ (mem : Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K)
-      (worlds : Miri.Memory.AllocId → Option FnEntryBorrowWorld),
-      (∀ id w, worlds id = some w →
-        ∃ entry, mem.live.find? (fun e => e.1 == id) = some (id, entry) ∧
-          R id entry.allocation.extra w) →
-      (∀ p ∈ prots, (worlds p.1).isSome = true) →
-      ∃ mem' res, stackPopReleaseAll pt prots mem = some (mem', res) ∧
-        match res, multiAllocEndAccesses tagOf prots worlds with
-        | none, .ok worlds' =>
-          ∀ id w', worlds' id = some w' →
-            ∃ entry', mem'.live.find? (fun e => e.1 == id) = some (id, entry') ∧
-              R id entry'.allocation.extra w'
-        | some _, .error _ => True
-        | _, _ => False := by
-  induction prots with
-  | nil =>
-    intro mem worlds hsync _
-    exact ⟨mem, none, rfl, hsync⟩
-  | cons p rest ih =>
-    intro mem worlds hsync hdom
-    obtain ⟨id, tag⟩ := p
-    have hsome : (worlds id).isSome = true := hdom (id, tag) List.mem_cons_self
-    cases hw : worlds id with
-    | none => rw [hw] at hsome; cases hsome
-    | some w =>
-      obtain ⟨entry, hfind, hR⟩ := hsync id w hw
-      have hstep := (hsim id).step entry.allocation.extra w tag
-        (hprots (id, tag) List.mem_cons_self) hR
-      have hunf : stackPopReleaseAll pt ((id, tag) :: rest) mem =
-          match stackPopReleaseErr (entry.allocation.extra.releaseProtector tag pt).status with
-          | some none => stackPopReleaseAll pt rest
-              (stackPopWriteBack mem id entry (entry.allocation.extra.releaseProtector tag pt).tree)
-          | some (some err) => some (stackPopWriteBack mem id entry
-              (entry.allocation.extra.releaseProtector tag pt).tree, some err)
-          | none => none := by
-        simp only [stackPopReleaseAll, hfind]
-      have hexec : multiAllocEndAccesses tagOf ((id, tag) :: rest) worlds =
-          match execProtectorEndAccessFor protectorEndAccessIsWrite? w (tagOf tag) with
-          | .error e => .error e
-          | .ok w' => multiAllocEndAccesses tagOf rest (fun a => if a == id then some w' else worlds a) := by
-        simp only [multiAllocEndAccesses, hw]
-      rw [hunf, hexec]
-      generalize entry.allocation.extra.releaseProtector tag pt = rel at hstep ⊢
-      cases hE : stackPopReleaseErr rel.status with
-      | none =>
-        rw [hE] at hstep
-        cases hX : execProtectorEndAccessFor protectorEndAccessIsWrite? w (tagOf tag) with
-        | error e => rw [hX] at hstep; exact False.elim hstep
-        | ok w1 => rw [hX] at hstep; exact False.elim hstep
-      | some r =>
-        rw [hE] at hstep
-        cases r with
-        | none =>
-          cases hX : execProtectorEndAccessFor protectorEndAccessIsWrite? w (tagOf tag) with
-          | error e => rw [hX] at hstep; exact False.elim hstep
-          | ok w1 =>
-            rw [hX] at hstep
-            refine ih (fun q hq => hprots q (List.mem_cons_of_mem _ hq))
-              (stackPopWriteBack mem id entry rel.tree)
-              (fun a => if a == id then some w1 else worlds a) ?_ ?_
-            · intro a wa hwa
-              by_cases ha : a = id
-              · subst ha
-                simp only [beq_self_eq_true, ↓reduceIte, Option.some.injEq] at hwa
-                subst hwa
-                exact ⟨_, find?_filter_push_self mem.live a _, hstep⟩
-              · have hne : (a == id) = false := beq_false_of_ne ha
-                simp only [hne, Bool.false_eq_true, ↓reduceIte] at hwa
-                obtain ⟨eA, hfA, hRA⟩ := hsync a wa hwa
-                exact ⟨eA, by unfold stackPopWriteBack; rw [find?_filter_push_ne mem.live id a _ ha]; exact hfA, hRA⟩
-            · intro q hq
-              by_cases hqId : q.1 = id
-              · simp [hqId]
-              · have hne : (q.1 == id) = false := beq_false_of_ne hqId
-                simp [hne, hdom q (List.mem_cons_of_mem _ hq)]
-        | some err =>
-          cases hX : execProtectorEndAccessFor protectorEndAccessIsWrite? w (tagOf tag) with
-          | error e => exact ⟨_, _, rfl, trivial⟩
-          | ok w1 => rw [hX] at hstep; exact False.elim hstep
-
-/-- **Multi-allocation whole-frame simulation (`MachineHooks.beforeStackPopWithEnsure` vs
-per-allocation `execFrameExitMiri`)** (`lean-miri#74`): generalizes
-`miri_beforeStackPopWithEnsure_simulates_execFrameExitMiri` from single-allocation frames to frames
-protecting tags across ARBITRARILY MANY distinct live allocations, and applies directly to
-`realAccessReleaseSim` (`BorrowTreeWorldRel`) for real implicit Reads and Writes!
-* When both sides succeed: `endCall` runs once after ALL releases, EVERY live allocation's final
-  borrow tree is `R`-related to its post-access world `w'`, AND on EVERY allocation `id` the
-  theory's `execFrameExitMiri` produces `.ok (releaseProtectors w' (protIdsFor id))`.
-* When both sides fail: `borrowTracker` is untouched (`endCall` never runs). -/
-theorem miri_beforeStackPopWithEnsure_multiAlloc_simulates_execFrameExitMiri
-    {K User : Type} [DecidableEq K]
-    (st : Miri.Interpreter.MachineHooks.State K User)
-    (tracker : Miri.Interpreter.MachineHooks.BorrowState)
-    (frame : Miri.Interpreter.Frame Miri.Memory.Provenance Miri.Interpreter.LocalLayout
-      Miri.Interpreter.MachineHooks.FrameExtra)
-    (prots : List (Miri.Memory.AllocId × Miri.Memory.BorTag))
-    (htracker : st.machine.borrowTracker = some tracker)
-    (hframe : st.stack.currentFrame? = some frame)
-    (hbf : frame.extra.borrowTracker = some ⟨prots.toArray⟩)
-    (frameTag : Miri.Memory.AllocId → Miri.Memory.BorTag → Prop)
-    (tagOf protOf : Miri.Memory.BorTag → Nat)
-    (R : Miri.Memory.AllocId → Miri.TreeBorrows.BorrowTree → FnEntryBorrowWorld → Prop)
-    (hsim : ∀ id, ProtectorReleaseSim tracker.global.protectedTags (frameTag id) tagOf (R id))
-    (hprots : ∀ p ∈ prots, frameTag p.1 p.2)
-    (worlds : Miri.Memory.AllocId → Option FnEntryBorrowWorld)
-    (hsync : ∀ id w, worlds id = some w →
-      ∃ entry, st.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry) ∧
-        R id entry.allocation.extra w)
-    (hdom : ∀ p ∈ prots, (worlds p.1).isSome = true) :
-    match Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ()) st,
-        multiAllocEndAccesses tagOf prots worlds with
-    | .ok () st', .ok worlds' =>
-      st'.machine.borrowTracker = some { tracker with
-        global := tracker.global.endCall ⟨prots.toArray⟩ } ∧
-      ∀ id w, worlds id = some w →
-        ∃ entry' w',
-          worlds' id = some w' ∧
-          st'.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry') ∧
-          R id entry'.allocation.extra w' ∧
-          execFrameExitMiri w
-            ((prots.filter fun p => p.1 == id).map fun p => (tagOf p.2, protOf p.2)) =
-            .ok (releaseProtectors w'
-              ((prots.filter fun p => p.1 == id).map fun p => protOf p.2))
-    | .error _ st', .error _ => st'.machine.borrowTracker = some tracker
-    | _, _ => False := by
-  obtain ⟨mem', res, hall, hmatch⟩ :=
-    stackPopReleaseAll_multiAlloc_simulates (K := K) tracker.global.protectedTags frameTag tagOf R
-      hsim prots hprots st.machine.memory worlds hsync hdom
-  have hrun := miri_beforeStackPopWithEnsure_eq_releaseAll st tracker frame prots.toArray
-    htracker hframe hbf mem' res (by simpa using hall)
-  rw [hrun]
-  cases res with
-  | none =>
-    cases hX : multiAllocEndAccesses tagOf prots worlds with
-    | error e => rw [hX] at hmatch; exact False.elim hmatch
-    | ok worlds' =>
-      rw [hX] at hmatch
-      refine ⟨rfl, fun id w hw => ?_⟩
-      obtain ⟨w', hw', hper⟩ := multiAllocEndAccesses_ok_perAlloc_eq tagOf prots worlds worlds' hX id w hw
-      obtain ⟨entry', hf', hR'⟩ := hmatch id w' hw'
-      refine ⟨entry', w', hw', hf', hR', ?_⟩
-      unfold execFrameExitMiri
-      rw [List.map_map, List.map_map]
-      change (match execProtectorEndAccesses protectorEndAccessIsWrite? w
-          ((prots.filter fun (p : Miri.Memory.AllocId × Miri.Memory.BorTag) => p.1 == id).map
-            fun (p : Miri.Memory.AllocId × Miri.Memory.BorTag) => tagOf p.2) with
-        | Except.error e => Except.error e
-        | Except.ok w'' => Except.ok (releaseProtectors w''
-            ((prots.filter fun (p : Miri.Memory.AllocId × Miri.Memory.BorTag) => p.1 == id).map
-              fun (p : Miri.Memory.AllocId × Miri.Memory.BorTag) => protOf p.2))) = _
-      rw [hper]
-  | some err =>
-    cases hX : multiAllocEndAccesses tagOf prots worlds with
-    | error e => exact htracker
-    | ok worlds' => rw [hX] at hmatch; exact False.elim hmatch
-
-/-- **Instantiated multi-allocation real-access frame-exit simulation**: specializes
-`miri_beforeStackPopWithEnsure_multiAlloc_simulates_execFrameExitMiri` directly to
-`realAccessReleaseSim` (`BorrowTreeWorldRel`), discharging real implicit Reads (`ReservedFrz`,
-`Frozen`) and Writes (`Unique`) across arbitrarily many allocations with zero abstract simulation
-hypotheses. -/
-theorem miri_beforeStackPopWithEnsure_realAccess_multiAlloc_sim
-    {K User : Type} [DecidableEq K]
-    (st : Miri.Interpreter.MachineHooks.State K User)
-    (tracker : Miri.Interpreter.MachineHooks.BorrowState)
-    (frame : Miri.Interpreter.Frame Miri.Memory.Provenance Miri.Interpreter.LocalLayout
-      Miri.Interpreter.MachineHooks.FrameExtra)
-    (prots : List (Miri.Memory.AllocId × Miri.Memory.BorTag))
-    (htracker : st.machine.borrowTracker = some tracker)
-    (hframe : st.stack.currentFrame? = some frame)
-    (hbf : frame.extra.borrowTracker = some ⟨prots.toArray⟩)
-    (frameTag : Miri.Memory.AllocId → Miri.Memory.BorTag → Prop)
-    (tagOf protOf : Miri.Memory.BorTag → Nat)
-    (hprots : ∀ p ∈ prots, frameTag p.1 p.2)
-    (worlds : Miri.Memory.AllocId → Option FnEntryBorrowWorld)
-    (hsync : ∀ id w, worlds id = some w →
-      ∃ entry, st.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry) ∧
-        BorrowTreeWorldRel tracker.global.protectedTags (frameTag id) tagOf
-          entry.allocation.extra w)
-    (hdom : ∀ p ∈ prots, (worlds p.1).isSome = true) :
-    match Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ()) st,
-        multiAllocEndAccesses tagOf prots worlds with
-    | .ok () st', .ok worlds' =>
-      st'.machine.borrowTracker = some { tracker with
-        global := tracker.global.endCall ⟨prots.toArray⟩ } ∧
-      ∀ id w, worlds id = some w →
-        ∃ entry' w',
-          worlds' id = some w' ∧
-          st'.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry') ∧
-          BorrowTreeWorldRel tracker.global.protectedTags (frameTag id) tagOf
-            entry'.allocation.extra w' ∧
-          execFrameExitMiri w
-            ((prots.filter fun p => p.1 == id).map fun p => (tagOf p.2, protOf p.2)) =
-            .ok (releaseProtectors w'
-              ((prots.filter fun p => p.1 == id).map fun p => protOf p.2))
-    | .error _ st', .error _ => st'.machine.borrowTracker = some tracker
-    | _, _ => False :=
-  miri_beforeStackPopWithEnsure_multiAlloc_simulates_execFrameExitMiri st tracker frame prots
-    htracker hframe hbf frameTag tagOf protOf
-    (fun id => BorrowTreeWorldRel tracker.global.protectedTags (frameTag id) tagOf)
-    (fun id => realAccessReleaseSim tracker.global.protectedTags (frameTag id) tagOf)
-    hprots worlds hsync hdom
-
 /-- **Explicit scope of `BorrowTreeWorldRel`** (the side conditions of `realAccessReleaseSim`, stated
 as a theorem instead of staying implicit in the relation): every related vendored tree has EXACTLY
 ONE `DedupRangeMap` location segment and the single root `⟨0⟩`, and every theory node covers one
@@ -12987,6 +12403,1360 @@ theorem miri_beforeStackPopWithEnsure_multiAlloc_partial_simulates
       obtain ⟨h1, h2⟩ := hmatch
       exact ⟨htracker, h1, h2⟩
 
+/-- **Multi-allocation fold simulation**: lifts ANY per-release simulation `ProtectorReleaseSim`
+(including `realAccessReleaseSim` for real implicit Reads & Writes!) across a frame protecting
+arbitrarily many tags residing in ARBITRARILY MANY distinct live allocations (`prots : List (AllocId × BorTag)`). -/
+theorem stackPopReleaseAll_multiAlloc_simulates {K : Type}
+    (pt : Miri.TreeBorrows.ProtectedTags)
+    (frameTag : Miri.Memory.AllocId → Miri.Memory.BorTag → Prop)
+    (tagOf : Miri.Memory.BorTag → Nat)
+    (R : Miri.Memory.AllocId → Miri.TreeBorrows.BorrowTree → FnEntryBorrowWorld → Prop)
+    (hsim : ∀ id, ProtectorReleaseSim pt (frameTag id) tagOf (R id))
+    (prots : List (Miri.Memory.AllocId × Miri.Memory.BorTag))
+    (hprots : ∀ p ∈ prots, frameTag p.1 p.2) :
+    ∀ (mem : Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K)
+      (worlds : Miri.Memory.AllocId → Option FnEntryBorrowWorld),
+      (∀ id w, worlds id = some w →
+        ∃ entry, mem.live.find? (fun e => e.1 == id) = some (id, entry) ∧
+          R id entry.allocation.extra w) →
+      (∀ p ∈ prots, (worlds p.1).isSome = true) →
+      ∃ mem' res, stackPopReleaseAll pt prots mem = some (mem', res) ∧
+        match res, multiAllocEndAccesses tagOf prots worlds with
+        | none, .ok worlds' =>
+          ∀ id w', worlds' id = some w' →
+            ∃ entry', mem'.live.find? (fun e => e.1 == id) = some (id, entry') ∧
+              R id entry'.allocation.extra w'
+        | some _, .error _ => True
+        | _, _ => False := by
+  intro mem worlds hsync hdom
+  obtain ⟨mem', res, hall, hmatch⟩ :=
+    stackPopReleaseAll_multiAlloc_partial_simulates pt frameTag tagOf R hsim prots hprots mem worlds hsync hdom
+  refine ⟨mem', res, hall, ?_⟩
+  have hagr := multiAllocEndAccesses_eq_partial tagOf prots worlds
+  cases hpart : multiAllocEndAccessesPartial tagOf prots worlds with
+  | mk worlds' fail =>
+    rw [hpart] at hmatch hagr
+    cases res with
+    | none =>
+      cases fail with
+      | some _ => exact False.elim hmatch
+      | none =>
+        cases htot : multiAllocEndAccesses tagOf prots worlds with
+        | error _ => rw [htot] at hagr; exact False.elim hagr
+        | ok wTot => rw [htot] at hagr; subst hagr; exact hmatch
+    | some _ =>
+      cases fail with
+      | none => exact False.elim hmatch
+      | some _ =>
+        cases htot : multiAllocEndAccesses tagOf prots worlds with
+        | ok _ => rw [htot] at hagr; exact False.elim hagr
+        | error _ => trivial
+
+/-- **Multi-allocation `MachineHooks.beforeStackPopWithEnsure` ↔ `execFrameExitMiri`**: generalizes
+`miri_beforeStackPopWithEnsure_simulates_execFrameExitMiri` from single-allocation frames to frames
+protecting tags across ARBITRARILY MANY distinct live allocations, and applies directly to
+`realAccessReleaseSim` (`BorrowTreeWorldRel`) for real implicit Reads and Writes! -/
+theorem miri_beforeStackPopWithEnsure_multiAlloc_simulates_execFrameExitMiri
+    {K User : Type} [DecidableEq K]
+    (st : Miri.Interpreter.MachineHooks.State K User)
+    (tracker : Miri.Interpreter.MachineHooks.BorrowState)
+    (frame : Miri.Interpreter.Frame Miri.Memory.Provenance Miri.Interpreter.LocalLayout
+      Miri.Interpreter.MachineHooks.FrameExtra)
+    (prots : List (Miri.Memory.AllocId × Miri.Memory.BorTag))
+    (htracker : st.machine.borrowTracker = some tracker)
+    (hframe : st.stack.currentFrame? = some frame)
+    (hbf : frame.extra.borrowTracker = some ⟨prots.toArray⟩)
+    (frameTag : Miri.Memory.AllocId → Miri.Memory.BorTag → Prop)
+    (tagOf protOf : Miri.Memory.BorTag → Nat)
+    (R : Miri.Memory.AllocId → Miri.TreeBorrows.BorrowTree → FnEntryBorrowWorld → Prop)
+    (hsim : ∀ id, ProtectorReleaseSim tracker.global.protectedTags (frameTag id) tagOf (R id))
+    (hprots : ∀ p ∈ prots, frameTag p.1 p.2)
+    (worlds : Miri.Memory.AllocId → Option FnEntryBorrowWorld)
+    (hsync : ∀ id w, worlds id = some w →
+      ∃ entry, st.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry) ∧
+        R id entry.allocation.extra w)
+    (hdom : ∀ p ∈ prots, (worlds p.1).isSome = true) :
+    match Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ()) st,
+        multiAllocEndAccesses tagOf prots worlds with
+    | .ok () st', .ok worlds' =>
+      st'.machine.borrowTracker = some { tracker with
+        global := tracker.global.endCall ⟨prots.toArray⟩ } ∧
+      ∀ id w, worlds id = some w →
+        ∃ entry' w',
+          worlds' id = some w' ∧
+          st'.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry') ∧
+          R id entry'.allocation.extra w' ∧
+          execFrameExitMiri w
+            ((prots.filter fun p => p.1 == id).map fun p => (tagOf p.2, protOf p.2)) =
+            .ok (releaseProtectors w'
+              ((prots.filter fun p => p.1 == id).map fun p => protOf p.2))
+    | .error _ st', .error _ => st'.machine.borrowTracker = some tracker
+    | _, _ => False := by
+  have hpart := miri_beforeStackPopWithEnsure_multiAlloc_partial_simulates st tracker frame prots
+    htracker hframe hbf frameTag tagOf R hsim hprots worlds hsync hdom
+  have hagr := multiAllocEndAccesses_eq_partial tagOf prots worlds
+  cases hp : multiAllocEndAccessesPartial tagOf prots worlds with
+  | mk worlds' fail =>
+    rw [hp] at hpart hagr
+    cases hpop : Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ()) st with
+    | ok u st' =>
+      cases u; rw [hpop] at hpart
+      cases fail with
+      | some _ => exact False.elim hpart
+      | none =>
+        cases hX : multiAllocEndAccesses tagOf prots worlds with
+        | error _ => rw [hX] at hagr; exact False.elim hagr
+        | ok wTot =>
+          rw [hX] at hagr; subst hagr
+          refine ⟨hpart.1, fun id w hw => ?_⟩
+          obtain ⟨w', hw', hper⟩ := multiAllocEndAccesses_ok_perAlloc_eq tagOf prots worlds wTot hX id w hw
+          obtain ⟨entry', hf', hR'⟩ := hpart.2 id w' hw'
+          refine ⟨entry', w', hw', hf', hR', ?_⟩
+          unfold execFrameExitMiri; rw [List.map_map, List.map_map]
+          change (match execProtectorEndAccesses protectorEndAccessIsWrite? w
+              ((prots.filter fun (p : Miri.Memory.AllocId × Miri.Memory.BorTag) => p.1 == id).map
+                fun (p : Miri.Memory.AllocId × Miri.Memory.BorTag) => tagOf p.2) with
+            | Except.error e => Except.error e
+            | Except.ok w'' => Except.ok (releaseProtectors w''
+                ((prots.filter fun (p : Miri.Memory.AllocId × Miri.Memory.BorTag) => p.1 == id).map
+                  fun (p : Miri.Memory.AllocId × Miri.Memory.BorTag) => protOf p.2))) = _
+          rw [hper]
+    | error err st' =>
+      rw [hpop] at hpart
+      cases fail with
+      | none => exact False.elim hpart
+      | some _ =>
+        cases hX : multiAllocEndAccesses tagOf prots worlds with
+        | ok _ => rw [hX] at hagr; exact False.elim hagr
+        | error _ => exact hpart.1
+
+/-- **Instantiated multi-allocation real-access frame-exit simulation**: specializes
+`miri_beforeStackPopWithEnsure_multiAlloc_simulates_execFrameExitMiri` directly to
+`realAccessReleaseSim` (`BorrowTreeWorldRel`), discharging real implicit Reads (`ReservedFrz`,
+`Frozen`) and Writes (`Unique`) across arbitrarily many allocations with zero abstract simulation
+hypotheses. -/
+theorem miri_beforeStackPopWithEnsure_realAccess_multiAlloc_sim
+    {K User : Type} [DecidableEq K]
+    (st : Miri.Interpreter.MachineHooks.State K User)
+    (tracker : Miri.Interpreter.MachineHooks.BorrowState)
+    (frame : Miri.Interpreter.Frame Miri.Memory.Provenance Miri.Interpreter.LocalLayout
+      Miri.Interpreter.MachineHooks.FrameExtra)
+    (prots : List (Miri.Memory.AllocId × Miri.Memory.BorTag))
+    (htracker : st.machine.borrowTracker = some tracker)
+    (hframe : st.stack.currentFrame? = some frame)
+    (hbf : frame.extra.borrowTracker = some ⟨prots.toArray⟩)
+    (frameTag : Miri.Memory.AllocId → Miri.Memory.BorTag → Prop)
+    (tagOf protOf : Miri.Memory.BorTag → Nat)
+    (hprots : ∀ p ∈ prots, frameTag p.1 p.2)
+    (worlds : Miri.Memory.AllocId → Option FnEntryBorrowWorld)
+    (hsync : ∀ id w, worlds id = some w →
+      ∃ entry, st.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry) ∧
+        BorrowTreeWorldRel tracker.global.protectedTags (frameTag id) tagOf
+          entry.allocation.extra w)
+    (hdom : ∀ p ∈ prots, (worlds p.1).isSome = true) :
+    match Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ()) st,
+        multiAllocEndAccesses tagOf prots worlds with
+    | .ok () st', .ok worlds' =>
+      st'.machine.borrowTracker = some { tracker with
+        global := tracker.global.endCall ⟨prots.toArray⟩ } ∧
+      ∀ id w, worlds id = some w →
+        ∃ entry' w',
+          worlds' id = some w' ∧
+          st'.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry') ∧
+          BorrowTreeWorldRel tracker.global.protectedTags (frameTag id) tagOf
+            entry'.allocation.extra w' ∧
+          execFrameExitMiri w
+            ((prots.filter fun p => p.1 == id).map fun p => (tagOf p.2, protOf p.2)) =
+            .ok (releaseProtectors w'
+              ((prots.filter fun p => p.1 == id).map fun p => protOf p.2))
+    | .error _ st', .error _ => st'.machine.borrowTracker = some tracker
+    | _, _ => False :=
+  miri_beforeStackPopWithEnsure_multiAlloc_simulates_execFrameExitMiri st tracker frame prots
+    htracker hframe hbf frameTag tagOf protOf
+    (fun id => BorrowTreeWorldRel tracker.global.protectedTags (frameTag id) tagOf)
+    (fun id => realAccessReleaseSim tracker.global.protectedTags (frameTag id) tagOf)
+    hprots worlds hsync hdom
+
+/-- **Live vendored `BorrowTree.releaseProtector` simulation** matching `execProtectorEndAccess`,
+`execProtectorEndAccess_descendants_untouched`, and `execFrameExit_miri_vs_sequential_separation`:
+1. Releasing protected tag `2` while its strict descendant `4` is ALSO protected (sibling `3`
+   unprotected) returns `.Released`, disables sibling `3`, and leaves strict descendant `4`
+   literally untouched (`.Unique`, accessed) via `.SkipChildrenOfAccessed`.
+2. Releasing protected tag `2` while sibling `3` is ALSO protected (same exiting frame, Miri order)
+   fails with `.AccessFailure` (`ProtectedDisabled`), whereas releasing tag `2` after removing
+   sibling `3`'s protector (sequential MiniRust order) returns `.Released`. -/
+theorem miri_releaseProtector_skipChildren_and_siblingConflict :
+    let t2 : Miri.Memory.BorTag := ⟨2, by decide⟩
+    let t3 : Miri.Memory.BorTag := ⟨3, by decide⟩
+    let t4 : Miri.Memory.BorTag := ⟨4, by decide⟩
+    let protWithDesc : Miri.TreeBorrows.ProtectedTags :=
+      ⟨#[(t2, .StrongProtector), (t4, .StrongProtector)]⟩
+    let protWithSib : Miri.TreeBorrows.ProtectedTags :=
+      ⟨#[(t2, .StrongProtector), (t3, .StrongProtector)]⟩
+    let protAfterSibPop : Miri.TreeBorrows.ProtectedTags :=
+      ⟨#[(t2, .StrongProtector)]⟩
+    let resDesc := releaseProtectorSimTree.releaseProtector t2 protWithDesc
+    let resSib := releaseProtectorSimTree.releaseProtector t2 protWithSib
+    let resAfterPop := releaseProtectorSimTree.releaseProtector t2 protAfterSibPop
+    resDesc.status = .Released ∧
+    ((resDesc.tree.locations.entries[0]?.bind fun seg => seg.data.perms.get ⟨2⟩).map
+      fun s => (s.permission, s.accessed)) = some (.Disabled, true) ∧
+    (resDesc.tree.locations.entries[0]?.bind fun seg => seg.data.perms.get ⟨3⟩) =
+      some ⟨.Unique, true, .None⟩ ∧
+    (match resSib.status with | .AccessFailure _ _ => true | _ => false) = true ∧
+    resAfterPop.status = .Released := by
+  intro t2 t3 t4 protWithDesc protWithSib protAfterSibPop resDesc resSib resAfterPop
+  let tagOf : Miri.Memory.BorTag → Nat := fun t => t.value.toNat - 1
+  let wSim : List Nat → FnEntryBorrowWorld := fun aps =>
+    { nodes := [
+        { tag := 0, parentTag := none, perm := .unique, accessed := true, protector := none, rangeOffset := 0, rangeLen := 4 },
+        { tag := 1, parentTag := some 0, perm := .unique, accessed := true, protector := some 10, rangeOffset := 0, rangeLen := 4 },
+        { tag := 2, parentTag := some 0, perm := .unique, accessed := true, protector := some 20, rangeOffset := 0, rangeLen := 4 },
+        { tag := 3, parentTag := some 1, perm := .unique, accessed := true, protector := some 30, rangeOffset := 0, rangeLen := 4 }]
+      nextTag := 4, nextProtector := 40, activeProtectors := aps }
+  have hrel : ∀ (pt : Miri.TreeBorrows.ProtectedTags) (aps : List Nat),
+      pt.contains ⟨1, by decide⟩ = false →
+      pt.contains t2 = (aps.any fun q => q == 10) →
+      pt.contains t3 = (aps.any fun q => q == 20) →
+      pt.contains t4 = (aps.any fun q => q == 30) →
+      BorrowTreeWorldRel pt (fun t => t = t2) tagOf releaseProtectorSimTree (wSim aps) := by
+    intro pt aps h1 h2 h3 h4
+    refine ⟨⟨0, 4⟩,
+      { perms := ⟨#[some ⟨.Unique, true, .None⟩, some ⟨.Unique, true, .None⟩,
+                    some ⟨.Unique, true, .None⟩, some ⟨.Unique, true, .None⟩]⟩, exposedCache := {} },
+      0, 4, ?_⟩
+    refine ⟨?_, ?_, by simp [wSim], rfl, rfl, by decide, rfl, ?_, ?_⟩
+    · refine ⟨by simp [wSim], fun n hn => ?_⟩
+      simp only [wSim, List.mem_cons, List.not_mem_nil, or_false] at hn
+      rcases hn with rfl | rfl | rfl | rfl
+      · exact ⟨0, by simp [wSim], ReachesRoot.root _ rfl rfl⟩
+      · exact ⟨1, by simp [wSim], ReachesRoot.step 0 1 0 _ rfl rfl (ReachesRoot.root _ rfl rfl)⟩
+      · exact ⟨1, by simp [wSim], ReachesRoot.step 0 2 0 _ rfl rfl (ReachesRoot.root _ rfl rfl)⟩
+      · exact ⟨2, by simp [wSim], ReachesRoot.step 1 3 1 _ rfl rfl (ReachesRoot.step 0 1 0 _ rfl rfl (ReachesRoot.root _ rfl rfl))⟩
+    · intro i n h; match i with
+      | 0 | 1 | 2 | 3 => simp only [wSim] at h; injection h with h; subst h; rfl
+      | _ + 4 => simp [wSim] at h
+    · intro i wn h; match i with
+      | 0 => simp only [wSim] at h; injection h with h; subst h; exact ⟨_, _, rfl, rfl, rfl, rfl, rfl, rfl, h1, rfl, rfl, rfl, rfl, rfl, Or.inl rfl, trivial⟩
+      | 1 => simp only [wSim] at h; injection h with h; subst h; exact ⟨_, _, rfl, rfl, rfl, rfl, rfl, rfl, by simpa [TreeTagNode.isProtected, wSim] using h2, rfl, rfl, rfl, rfl, rfl, Or.inl rfl, trivial⟩
+      | 2 => simp only [wSim] at h; injection h with h; subst h; exact ⟨_, _, rfl, rfl, rfl, rfl, rfl, rfl, by simpa [TreeTagNode.isProtected, wSim] using h3, rfl, rfl, rfl, rfl, rfl, Or.inl rfl, trivial⟩
+      | 3 => simp only [wSim] at h; injection h with h; subst h; exact ⟨_, _, rfl, rfl, rfl, rfl, rfl, rfl, by simpa [TreeTagNode.isProtected, wSim] using h4, rfl, rfl, rfl, rfl, rfl, Or.inl rfl, trivial⟩
+      | _ + 4 => simp [wSim] at h
+    · intro tag ht; subst ht; exact ⟨1, by simp [wSim], rfl, rfl⟩
+  have hD := (realAccessReleaseSim protWithDesc (fun t => t = t2) tagOf).step
+    releaseProtectorSimTree (wSim [10, 30]) t2 rfl (hrel protWithDesc [10, 30] (by decide) (by decide) (by decide) (by decide))
+  have hS := (realAccessReleaseSim protWithSib (fun t => t = t2) tagOf).step
+    releaseProtectorSimTree (wSim [10, 20]) t2 rfl (hrel protWithSib [10, 20] (by decide) (by decide) (by decide) (by decide))
+  have hP := (realAccessReleaseSim protAfterSibPop (fun t => t = t2) tagOf).step
+    releaseProtectorSimTree (wSim [10]) t2 rfl (hrel protAfterSibPop [10] (by decide) (by decide) (by decide) (by decide))
+  let wDesc' : FnEntryBorrowWorld :=
+    { (wSim [10, 30]) with nodes := [
+        { tag := 0, parentTag := none, perm := .unique, accessed := true, protector := none, rangeOffset := 0, rangeLen := 4 },
+        { tag := 1, parentTag := some 0, perm := .unique, accessed := true, protector := some 10, rangeOffset := 0, rangeLen := 4 },
+        { tag := 2, parentTag := some 0, perm := .disabled, accessed := true, protector := some 20, rangeOffset := 0, rangeLen := 4 },
+        { tag := 3, parentTag := some 1, perm := .unique, accessed := true, protector := some 30, rangeOffset := 0, rangeLen := 4 }] }
+  have hexD : execProtectorEndAccessFor protectorEndAccessIsWrite? (wSim [10, 30]) (tagOf t2) = .ok wDesc' := by decide
+  have hexS : ∃ e, execProtectorEndAccessFor protectorEndAccessIsWrite? (wSim [10, 20]) (tagOf t2) = .error e := by
+    have hok : (execProtectorEndAccessFor protectorEndAccessIsWrite? (wSim [10, 20]) (tagOf t2)).isOk = false := by decide
+    cases h : execProtectorEndAccessFor protectorEndAccessIsWrite? (wSim [10, 20]) (tagOf t2) with
+    | ok _ => rw [h] at hok; cases hok
+    | error e => exact ⟨e, rfl⟩
+  have hexP : ∃ w', execProtectorEndAccessFor protectorEndAccessIsWrite? (wSim [10]) (tagOf t2) = .ok w' := by
+    have hok : (execProtectorEndAccessFor protectorEndAccessIsWrite? (wSim [10]) (tagOf t2)).isOk = true := by decide
+    cases h : execProtectorEndAccessFor protectorEndAccessIsWrite? (wSim [10]) (tagOf t2) with
+    | error _ => rw [h] at hok; cases hok
+    | ok w' => exact ⟨w', rfl⟩
+  rw [hexD] at hD
+  rcases hexS with ⟨eS, hexS⟩; rw [hexS] at hS
+  rcases hexP with ⟨wP', hexP⟩; rw [hexP] at hP
+  have hDrel : resDesc.status = .Released ∧ BorrowTreeWorldRel protWithDesc (fun t => t = t2) tagOf resDesc.tree wDesc' := by
+    cases hst : resDesc.status with
+    | Released => rw [hst] at hD; exact ⟨rfl, hD⟩
+    | _ => rw [hst] at hD; exact False.elim hD
+  have hSfail : (match resSib.status with | .AccessFailure _ _ => true | _ => false) = true := by
+    cases hst : resSib.status with
+    | AccessFailure _ _ => rfl
+    | _ => rw [hst] at hS; exact False.elim hS
+  have hPrel : resAfterPop.status = .Released := by
+    cases hst : resAfterPop.status with
+    | Released => rfl
+    | _ => rw [hst] at hP; exact False.elim hP
+  rcases hDrel.2 with ⟨rng, loc, off, len, hAt⟩
+  have hoff : off = 0 ∧ len = 4 := by
+    obtain ⟨_, _, _, _, _, _, _, _, _, ho, hl, _⟩ := hAt.node_sync 0 _ rfl
+    exact ⟨ho.symm, hl.symm⟩
+  rcases hoff with ⟨rfl, rfl⟩
+  have h0seg : resDesc.tree.locations.entries[0]? = some ⟨rng, loc⟩ := by rw [hAt.locs_eq]; rfl
+  obtain ⟨_, st2, _, _, _, _, _, _, _, _, _, hperm2, hp2, ha2, _, _⟩ := hAt.node_sync 2 _ rfl
+  obtain ⟨_, st3, _, _, _, _, _, _, _, _, _, hperm3, hp3, ha3, _, hsifa3⟩ := hAt.node_sync 3 _ rfl
+  have hsifa3None : st3.idempotentForeignAccess = .None := by
+    cases hs : st3.idempotentForeignAccess with
+    | None => rfl
+    | Read =>
+      rw [hs] at hsifa3
+      have hbad := hsifa3 { tag := 3, parentTag := some 1, perm := .unique, accessed := true, protector := some 30, rangeOffset := 0, rangeLen := 4 }
+        (by decide) (by decide)
+      rcases hbad with ⟨a, haMem, haTail, haAnc, _⟩ | hfp
+      · simp only [wDesc', List.mem_cons, List.not_mem_nil, or_false] at haMem
+        rcases haMem with rfl | rfl | rfl | rfl <;> (revert haTail haAnc; decide)
+      · revert hfp; decide
+    | Write =>
+      rw [hs] at hsifa3
+      have hbad := hsifa3.1 { tag := 3, parentTag := some 1, perm := .unique, accessed := true, protector := some 30, rangeOffset := 0, rangeLen := 4 }
+        (by decide) (by decide)
+      rcases hbad with ⟨a, haMem, haTail, haAnc, _⟩ | hfp
+      · simp only [wDesc', List.mem_cons, List.not_mem_nil, or_false] at haMem
+        rcases haMem with rfl | rfl | rfl | rfl <;> (revert haTail haAnc; decide)
+      · revert hfp; decide
+  refine ⟨hDrel.1, ?_, ?_, hSfail, hPrel⟩
+  · rw [h0seg, Option.bind_some]
+    change (loc.perms.get ⟨UInt32.ofNat 2⟩).map (fun s => (s.permission, s.accessed)) = some (.Disabled, true)
+    rw [hperm2, Option.map_some, hp2, ha2]; rfl
+  · rw [h0seg, Option.bind_some]
+    change loc.perms.get ⟨UInt32.ofNat 3⟩ = some ⟨.Unique, true, .None⟩
+    rw [hperm3]; congr 1
+    cases st3; simp only at hp3 ha3 hsifa3None; subst hp3; subst ha3; subst hsifa3None; rfl
+
+/-! ### 2E.1a.2 Multi-segment `BorrowTree.releaseProtector`, Strong/Weak irrelevance, &
+`beforeStackPopWithEnsure` real-access partial simulation with full frame preservation (`lean-miri#74`) -/
+
+private theorem dedupRangeMap_setAtPos_exact {α : Type}
+    (m : Miri.DataStructures.DedupRangeMap α) (pos : Nat) (h : pos < m.entries.size) (v : α) :
+    m.setAtPos pos v =
+      ⟨⟨m.entries.set pos { m.entries[pos] with data := v } h⟩, .ok ()⟩ := by
+  unfold Miri.DataStructures.DedupRangeMap.setAtPos
+  simp only [Id.run, pure, Pure.pure]
+  have hseg : (miri_etm_private% Miri.DataStructures.DedupRangeMap
+      Miri.DataStructures.DedupRangeMap.segmentAt?) m.entries pos = some m.entries[pos] := by
+    change (if h' : pos < m.entries.size then some m.entries[pos] else none) = _
+    simp only [h, ↓reduceDIte]
+  have hupd : (miri_etm_private% Miri.DataStructures.DedupRangeMap
+      Miri.DataStructures.DedupRangeMap.updateAt) m.entries pos { m.entries[pos] with data := v } =
+      .ok (m.entries.set pos { m.entries[pos] with data := v } h) := by
+    change (if h' : pos < m.entries.size then
+      (Except.ok (m.entries.set pos { m.entries[pos] with data := v } h') :
+        Except Miri.DataStructures.DedupRangeMapError _)
+      else Except.error (.indexOutOfBounds pos m.entries.size)) = _
+    simp only [h, ↓reduceDIte]
+  rw [hseg]
+  dsimp only
+  rw [hupd]
+
+private theorem performTreeAccessAt_locations_indep
+    (tree : Miri.TreeBorrows.BorrowTree)
+    (l1 l2 : Miri.DataStructures.DedupRangeMap Miri.TreeBorrows.LocationTree)
+    (loc : Miri.TreeBorrows.LocationTree) (source? : Option Miri.TreeBorrows.UniIndex)
+    (kind : Miri.TreeBorrows.AccessKind) (pt : Miri.TreeBorrows.ProtectedTags)
+    (mode : Miri.TreeBorrows.Tree.ChildrenVisitMode) (range : Miri.DataStructures.ByteRange) :
+    miriPerformTreeAccessAt { tree with locations := l1 } loc source? kind pt mode range =
+    miriPerformTreeAccessAt { tree with locations := l2 } loc source? kind pt mode range := by
+  have hN : ∀ l s, ({ tree with locations := l1 }).performNormalAccessAt l s kind pt mode =
+      ({ tree with locations := l2 }).performNormalAccessAt l s kind pt mode :=
+    fun _ _ => by unfold Miri.TreeBorrows.BorrowTree.performNormalAccessAt; rfl
+  have hW : ∀ l r m b, ({ tree with locations := l1 }).performWildcardAccessAt l r m kind pt b =
+      ({ tree with locations := l2 }).performWildcardAccessAt l r m kind pt b :=
+    fun _ _ _ _ => by unfold Miri.TreeBorrows.BorrowTree.performWildcardAccessAt; rfl
+  have hM : miriMinExposedChild { tree with locations := l1 } =
+      miriMinExposedChild { tree with locations := l2 } := rfl
+  change (Id.run do
+    let mut currentLocation := loc
+    let mut normalAccess : Option Miri.TreeBorrows.Tree.NormalAccessResult := none
+    let mut accessedRoot? : Option Miri.TreeBorrows.UniIndex := none
+    let mut status : Option Miri.TreeBorrows.BorrowTree.BorrowTreeAccessStatus := none
+    if let some source := source? then
+      let normal := ({ tree with locations := l1 }).performNormalAccessAt currentLocation source kind pt mode
+      currentLocation := normal.location
+      normalAccess := some normal.access
+      match normal.outcome with
+      | .error error =>
+          return miriTLAMk currentLocation normalAccess (some (.CacheFailure range error))
+      | .ok () =>
+          if normal.access.status != .Completed then
+            return miriTLAMk currentLocation normalAccess (some (.AccessFailure range normal.access.status))
+          match Miri.TreeBorrows.UniIndex.ofNat? normal.access.root with
+          | none =>
+              return miriTLAMk currentLocation normalAccess (some (.AccessFailure range (.MissingLocationState normal.access.root)))
+          | some root => accessedRoot? := some root
+    let maxLocalTag := accessedRoot?.bind fun root => (tree.nodes.get root).map Miri.TreeBorrows.TreeNode.tag
+    let minExposed := if mode == .SkipChildrenOfAccessed then
+        source?.bind (miriMinExposedChild { tree with locations := l1 })
+      else none
+    let mut stopOtherRoots := false
+    for rootPosition in [:tree.roots.size] do
+      if status.isNone && !stopOtherRoots then
+        match tree.roots[rootPosition]? with
+        | none => pure ()
+        | some root =>
+            let rootTag := (tree.nodes.get root).map Miri.TreeBorrows.TreeNode.tag
+            let pastMinExposed := match rootTag, minExposed with
+              | some tag, some minimum => tag.value > minimum.value
+              | _, _ => false
+            if mode == .SkipChildrenOfAccessed && pastMinExposed then
+              stopOtherRoots := true
+            else if accessedRoot? != some root then
+              let wildcard := ({ tree with locations := l1 }).performWildcardAccessAt currentLocation root
+                maxLocalTag kind pt (rootPosition != 0)
+              currentLocation := wildcard.location
+              if wildcard.status != .Completed then
+                status := some (.WildcardFailure range wildcard.status)
+    return miriTLAMk currentLocation normalAccess status) = _
+  simp only [hN, hW, hM]
+  rfl
+
+private theorem performNormalAccessAt_protectedTags_congr
+    (tree : Miri.TreeBorrows.BorrowTree) (loc : Miri.TreeBorrows.LocationTree)
+    (src : Miri.TreeBorrows.UniIndex) (kind : Miri.TreeBorrows.AccessKind)
+    (pt₁ pt₂ : Miri.TreeBorrows.ProtectedTags)
+    (mode : Miri.TreeBorrows.Tree.ChildrenVisitMode)
+    (h : ∀ t, pt₁.contains t = pt₂.contains t) :
+    tree.performNormalAccessAt loc src kind pt₁ mode =
+    tree.performNormalAccessAt loc src kind pt₂ mode := by
+  have hnorm : miriNormalProjection tree loc pt₁ = miriNormalProjection tree loc pt₂ := by
+    rw [miriNormalProjection_eq_struct, miriNormalProjection_eq_struct]
+    congr 1
+    have hfun : (fun (p : Miri.TreeBorrows.UniIndex × Miri.TreeBorrows.TreeNode) =>
+        if pt₁.contains p.2.tag then some p.1.toNat else none) =
+      (fun (p : Miri.TreeBorrows.UniIndex × Miri.TreeBorrows.TreeNode) =>
+        if pt₂.contains p.2.tag then some p.1.toNat else none) :=
+      funext fun ⟨_, nd⟩ => by simp only [h]
+    rw [hfun]
+  unfold Miri.TreeBorrows.BorrowTree.performNormalAccessAt
+  simp only [hnorm, h]
+
+private theorem performTreeAccessAt_protectedTags_congr
+    (tree : Miri.TreeBorrows.BorrowTree) (loc : Miri.TreeBorrows.LocationTree)
+    (source? : Option Miri.TreeBorrows.UniIndex) (kind : Miri.TreeBorrows.AccessKind)
+    (pt₁ pt₂ : Miri.TreeBorrows.ProtectedTags)
+    (mode : Miri.TreeBorrows.Tree.ChildrenVisitMode)
+    (range : Miri.DataStructures.ByteRange)
+    (h : ∀ t, pt₁.contains t = pt₂.contains t) :
+    miriPerformTreeAccessAt tree loc source? kind pt₁ mode range =
+    miriPerformTreeAccessAt tree loc source? kind pt₂ mode range := by
+  have hN : ∀ l s, tree.performNormalAccessAt l s kind pt₁ mode =
+      tree.performNormalAccessAt l s kind pt₂ mode :=
+    fun l s => performNormalAccessAt_protectedTags_congr tree l s kind pt₁ pt₂ mode h
+  have hW : ∀ l r m b, tree.performWildcardAccessAt l r m kind pt₁ b =
+      tree.performWildcardAccessAt l r m kind pt₂ b :=
+    fun l r m b => by unfold Miri.TreeBorrows.BorrowTree.performWildcardAccessAt; simp only [h]
+  change (Id.run do
+    let mut currentLocation := loc
+    let mut normalAccess : Option Miri.TreeBorrows.Tree.NormalAccessResult := none
+    let mut accessedRoot? : Option Miri.TreeBorrows.UniIndex := none
+    let mut status : Option Miri.TreeBorrows.BorrowTree.BorrowTreeAccessStatus := none
+    if let some source := source? then
+      let normal := tree.performNormalAccessAt currentLocation source kind pt₁ mode
+      currentLocation := normal.location
+      normalAccess := some normal.access
+      match normal.outcome with
+      | .error error =>
+          return miriTLAMk currentLocation normalAccess (some (.CacheFailure range error))
+      | .ok () =>
+          if normal.access.status != .Completed then
+            return miriTLAMk currentLocation normalAccess (some (.AccessFailure range normal.access.status))
+          match Miri.TreeBorrows.UniIndex.ofNat? normal.access.root with
+          | none =>
+              return miriTLAMk currentLocation normalAccess (some (.AccessFailure range (.MissingLocationState normal.access.root)))
+          | some root => accessedRoot? := some root
+    let maxLocalTag := accessedRoot?.bind fun root => (tree.nodes.get root).map Miri.TreeBorrows.TreeNode.tag
+    let minExposed := if mode == .SkipChildrenOfAccessed then
+        source?.bind (miriMinExposedChild tree)
+      else none
+    let mut stopOtherRoots := false
+    for rootPosition in [:tree.roots.size] do
+      if status.isNone && !stopOtherRoots then
+        match tree.roots[rootPosition]? with
+        | none => pure ()
+        | some root =>
+            let rootTag := (tree.nodes.get root).map Miri.TreeBorrows.TreeNode.tag
+            let pastMinExposed := match rootTag, minExposed with
+              | some tag, some minimum => tag.value > minimum.value
+              | _, _ => false
+            if mode == .SkipChildrenOfAccessed && pastMinExposed then
+              stopOtherRoots := true
+            else if accessedRoot? != some root then
+              let wildcard := tree.performWildcardAccessAt currentLocation root
+                maxLocalTag kind pt₁ (rootPosition != 0)
+              currentLocation := wildcard.location
+              if wildcard.status != .Completed then
+                status := some (.WildcardFailure range wildcard.status)
+    return miriTLAMk currentLocation normalAccess status) = _
+  simp only [hN, hW]
+  rfl
+
+/-- **Strong vs Weak protector irrelevance in `BorrowTree.releaseProtector` (`lean-miri#74`)**:
+`releaseProtector` only inspects protector presence (`ProtectedTags.contains`), never the
+`StrongProtector` vs `WeakProtector` distinction (which only affects `deallocateBorrowRange`).
+Therefore any two `ProtectedTags` maps with the same protected-tag domain produce identical
+`BorrowTree.releaseProtector` outputs across arbitrary multi-segment trees with co-existing
+strong and weak protectors! -/
+theorem miri_releaseProtector_strong_weak_irrelevant
+    (tree : Miri.TreeBorrows.BorrowTree) (tag : Miri.Memory.BorTag)
+    (pt₁ pt₂ : Miri.TreeBorrows.ProtectedTags)
+    (h : ∀ t, pt₁.contains t = pt₂.contains t) :
+    tree.releaseProtector tag pt₁ = tree.releaseProtector tag pt₂ := by
+  unfold Miri.TreeBorrows.BorrowTree.releaseProtector
+  have hP : ∀ (t : Miri.TreeBorrows.BorrowTree) l s k m r,
+      miriPerformTreeAccessAt t l s k pt₁ m r = miriPerformTreeAccessAt t l s k pt₂ m r :=
+    fun t l s k m r => performTreeAccessAt_protectedTags_congr t l s k pt₁ pt₂ m r h
+  simp only [hP]
+
+/-- Per-segment specification for multi-segment `BorrowTree.releaseProtector` simulation:
+* `.skipped`: segment where the released tag is unmaterialized (`perms.get source = none`),
+  unaccessed (`accessed = false`), or has `.Cell` (`associatedAccess = none`) — skipped by
+  `releaseProtector` without touching `locations`;
+* `.tracked w`: segment whose single-segment slice satisfies `BorrowTreeWorldRel` against `w`. -/
+inductive SegReleaseSpec where
+  | skipped
+  | tracked (w : FnEntryBorrowWorld)
+  deriving Repr, DecidableEq
+
+/-- Prefix-fold of `execProtectorEndAccessFor` over a list of per-segment `SegReleaseSpec`s,
+stopping at the first failing segment index `some pos` and leaving trailing segments untouched. -/
+def multiSegEndAccessPartialGo (tagNat : Nat) (pos : Nat) :
+    List SegReleaseSpec → List SegReleaseSpec × Option Nat
+  | [] => ([], none)
+  | .skipped :: rest =>
+    let (rest', fail) := multiSegEndAccessPartialGo tagNat (pos + 1) rest
+    (.skipped :: rest', fail)
+  | .tracked w :: rest =>
+    match execProtectorEndAccessFor protectorEndAccessIsWrite? w tagNat with
+    | .ok w' =>
+      let (rest', fail) := multiSegEndAccessPartialGo tagNat (pos + 1) rest
+      (.tracked w' :: rest', fail)
+    | .error _ =>
+      (.tracked w :: rest, some pos)
+
+/-- Multi-segment protector-release prefix fold starting at segment index `0`. -/
+def multiSegEndAccessPartial (tagNat : Nat) (specs : List SegReleaseSpec) :
+    List SegReleaseSpec × Option Nat :=
+  multiSegEndAccessPartialGo tagNat 0 specs
+
+/-- Per-segment relation between a `RangeMapSegment` inside a multi-segment `BorrowTree` and a
+`SegReleaseSpec`. -/
+def SegReleaseRel (pt : Miri.TreeBorrows.ProtectedTags)
+    (frameTag : Miri.Memory.BorTag → Prop) (tagOf : Miri.Memory.BorTag → Nat)
+    (tree : Miri.TreeBorrows.BorrowTree) (source : Miri.TreeBorrows.UniIndex)
+    (seg : Miri.DataStructures.RangeMapSegment Miri.TreeBorrows.LocationTree) :
+    SegReleaseSpec → Prop
+  | .skipped =>
+    match seg.data.perms.get source with
+    | none => True
+    | some st => st.accessed = false ∨ st.permission.associatedAccess = none
+  | .tracked w =>
+    BorrowTreeWorldRel pt frameTag tagOf { tree with locations := ⟨#[seg]⟩ } w
+
+private def releaseProtectorLoopStep
+    (source : Miri.TreeBorrows.UniIndex) (pt : Miri.TreeBorrows.ProtectedTags)
+    (position : Nat)
+    (s : Option Miri.TreeBorrows.BorrowTree.ProtectorReleaseResult × Miri.TreeBorrows.BorrowTree) :
+    Id (ForInStep (Option Miri.TreeBorrows.BorrowTree.ProtectorReleaseResult × Miri.TreeBorrows.BorrowTree)) :=
+  match s.2.locations.index position with
+  | .error error =>
+      ForInStep.done (some { tree := s.2, status := .RangeMapFailure error }, s.2)
+  | .ok segment =>
+      match segment.data.perms.get source with
+      | none => ForInStep.yield (none, s.2)
+      | some state =>
+          match state.permission.associatedAccess with
+          | none => ForInStep.yield (none, s.2)
+          | some kind =>
+              if state.accessed then
+                let access := miriPerformTreeAccessAt
+                  s.2 segment.data (some source) kind pt .SkipChildrenOfAccessed segment.range
+                let mutation := s.2.locations.setAtPos position
+                  ((miri_etm_private% Miri.TreeBorrows.TreeState
+                    Miri.TreeBorrows.BorrowTree.TreeLocationAccessAtResult.location) access)
+                let nextTree : Miri.TreeBorrows.BorrowTree :=
+                  { tagMapping := s.2.tagMapping, nodes := s.2.nodes, locations := mutation.state, roots := s.2.roots }
+                match mutation.outcome with
+                | .error error =>
+                    ForInStep.done (some { tree := nextTree, status := .LocationMapFailure error }, nextTree)
+                | .ok () =>
+                    match (miri_etm_private% Miri.TreeBorrows.TreeState
+                        Miri.TreeBorrows.BorrowTree.TreeLocationAccessAtResult.status) access with
+                    | some status =>
+                        ForInStep.done (some { tree := nextTree, status := .AccessFailure segment.range status }, nextTree)
+                    | none => ForInStep.yield (none, nextTree)
+              else ForInStep.yield (none, s.2)
+
+private theorem releaseProtector_eq_forIn_step
+    (tree : Miri.TreeBorrows.BorrowTree) (tag : Miri.Memory.BorTag)
+    (source : Miri.TreeBorrows.UniIndex) (pt : Miri.TreeBorrows.ProtectedTags)
+    (htag : tree.indexOfTag tag = some source) :
+    let loopRes : Option Miri.TreeBorrows.BorrowTree.ProtectorReleaseResult × Miri.TreeBorrows.BorrowTree :=
+      forIn (m := Id) (List.range' 0 tree.locations.entries.size) (none, tree)
+        (releaseProtectorLoopStep source pt)
+    tree.releaseProtector tag pt =
+      match loopRes.1 with
+      | some r => r
+      | none =>
+        match (loopRes.2.updateExposureForProtectorRelease tag).outcome with
+        | .error error => { tree := (loopRes.2.updateExposureForProtectorRelease tag).tree, status := .ExposureUpdateFailure error }
+        | .ok () => { tree := (loopRes.2.updateExposureForProtectorRelease tag).tree, status := .Released } := by
+  unfold Miri.TreeBorrows.BorrowTree.releaseProtector
+  rw [htag]
+  simp only [Id.run, bind, Bind.bind, pure, Pure.pure,
+    Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size,
+    Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one]
+  have hcongr : ∀ (f : Nat → (Option Miri.TreeBorrows.BorrowTree.ProtectorReleaseResult × Miri.TreeBorrows.BorrowTree) →
+      Id (ForInStep (Option Miri.TreeBorrows.BorrowTree.ProtectorReleaseResult × Miri.TreeBorrows.BorrowTree))),
+      (∀ p s, f p s = releaseProtectorLoopStep source pt p s) →
+      forIn (m := Id) (List.range' 0 tree.locations.entries.size) (none, tree) f =
+      forIn (m := Id) (List.range' 0 tree.locations.entries.size) (none, tree)
+        (releaseProtectorLoopStep source pt) := by
+    intro f hf; congr 1; funext p s; exact hf p s
+  rw [hcongr _ (fun pos s => by
+    unfold releaseProtectorLoopStep
+    cases s.2.locations.index pos with
+    | error _ => rfl
+    | ok seg =>
+      cases seg.data.perms.get source with
+      | none => rfl
+      | some st =>
+        cases st.permission.associatedAccess with
+        | none => rfl
+        | some kind =>
+          cases st.accessed <;> rfl)]
+  generalize (forIn (m := Id) (List.range' 0 tree.locations.entries.size) (none, tree)
+    (releaseProtectorLoopStep source pt) :
+      Option Miri.TreeBorrows.BorrowTree.ProtectorReleaseResult × Miri.TreeBorrows.BorrowTree) = r
+  rcases r with ⟨r1, r2⟩
+  cases r1 with
+  | some x => rfl
+  | none =>
+    cases (r2.updateExposureForProtectorRelease tag).outcome <;> rfl
+
+private theorem releaseProtector_singleSeg_step_eq
+    (tree : Miri.TreeBorrows.BorrowTree) (tag : Miri.Memory.BorTag)
+    (source : Miri.TreeBorrows.UniIndex) (nd : Miri.TreeBorrows.TreeNode)
+    (pt : Miri.TreeBorrows.ProtectedTags)
+    (seg : Miri.DataStructures.RangeMapSegment Miri.TreeBorrows.LocationTree)
+    (htag : tree.indexOfTag tag = some source)
+    (hnd : tree.nodeAt source = some nd)
+    (hexp : nd.isExposed = false) :
+    let t1 : Miri.TreeBorrows.BorrowTree := { tree with locations := ⟨#[seg]⟩ }
+    t1.releaseProtector tag pt =
+      match seg.data.perms.get source with
+      | none => ⟨t1, .Released⟩
+      | some st =>
+        match st.permission.associatedAccess with
+        | none => ⟨t1, .Released⟩
+        | some kind =>
+          if st.accessed then
+            let acc := miriPerformTreeAccessAt tree seg.data (some source) kind pt .SkipChildrenOfAccessed seg.range
+            let loc' := (miri_etm_private% Miri.TreeBorrows.TreeState
+              Miri.TreeBorrows.BorrowTree.TreeLocationAccessAtResult.location) acc
+            let st' := (miri_etm_private% Miri.TreeBorrows.TreeState
+              Miri.TreeBorrows.BorrowTree.TreeLocationAccessAtResult.status) acc
+            let t1' : Miri.TreeBorrows.BorrowTree := { tree with locations := ⟨#[{ seg with data := loc' }]⟩ }
+            match st' with
+            | some errSt => ⟨t1', .AccessFailure seg.range errSt⟩
+            | none => ⟨t1', .Released⟩
+          else ⟨t1, .Released⟩ := by
+  intro t1
+  have hexpAll : ∀ l : Miri.DataStructures.DedupRangeMap Miri.TreeBorrows.LocationTree,
+      ({ tree with locations := l }).updateExposureForProtectorRelease tag =
+        ⟨{ tree with locations := l }, .ok ()⟩ := by
+    intro l
+    unfold Miri.TreeBorrows.BorrowTree.updateExposureForProtectorRelease
+    have ht : ({ tree with locations := l }).indexOfTag tag = some source := htag
+    have hn : ({ tree with locations := l }).nodeAt source = some nd := hnd
+    simp [ht, hn, hexp, Id.run, pure]
+  have ht1 : t1.indexOfTag tag = some source := htag
+  have hlt0 : 0 < t1.locations.entries.size := Nat.zero_lt_one
+  have hidx0 : (⟨#[seg]⟩ : Miri.DataStructures.DedupRangeMap Miri.TreeBorrows.LocationTree).index 0 = .ok seg :=
+    Miri.TreeBorrows.BorrowTree.ZeroProtection.Release.index_exact ⟨#[seg]⟩ 0 Nat.zero_lt_one
+  rw [releaseProtector_eq_forIn_step t1 tag source pt ht1]
+  have hrng1 : List.range' 0 t1.locations.entries.size = [0] := rfl
+  rw [hrng1]
+  simp only [List.forIn_cons, List.forIn_nil, releaseProtectorLoopStep, bind, Bind.bind, pure, Pure.pure]
+  dsimp only [t1]
+  rw [hidx0]
+  dsimp only
+  cases hget : seg.data.perms.get source with
+  | none => dsimp only; rw [hexpAll]
+  | some st =>
+    dsimp only
+    cases hassoc : st.permission.associatedAccess with
+    | none => dsimp only; rw [hexpAll]
+    | some kind =>
+      dsimp only
+      cases haccB : st.accessed with
+      | false => simp only [Bool.false_eq_true, ↓reduceIte]; rw [hexpAll]
+      | true =>
+        simp only [↓reduceIte]
+        have hind := performTreeAccessAt_locations_indep tree ⟨#[seg]⟩ tree.locations
+          seg.data (some source) kind pt .SkipChildrenOfAccessed seg.range
+        have htreeEq : ({ tree with locations := tree.locations } : Miri.TreeBorrows.BorrowTree) = tree := rfl
+        rw [htreeEq] at hind
+        rw [hind]
+        have hset := dedupRangeMap_setAtPos_exact (⟨#[seg]⟩ : Miri.DataStructures.DedupRangeMap _) 0 hlt0
+          ((miri_etm_private% Miri.TreeBorrows.TreeState
+            Miri.TreeBorrows.BorrowTree.TreeLocationAccessAtResult.location)
+            (miriPerformTreeAccessAt tree seg.data (some source) kind pt .SkipChildrenOfAccessed seg.range))
+        rw [hset]
+        dsimp only
+        cases ((miri_etm_private% Miri.TreeBorrows.TreeState
+            Miri.TreeBorrows.BorrowTree.TreeLocationAccessAtResult.status)
+            (miriPerformTreeAccessAt tree seg.data (some source) kind pt .SkipChildrenOfAccessed seg.range)) with
+        | some errSt => rfl
+        | none =>
+          dsimp only
+          rw [hexpAll]
+          rfl
+
+private theorem releaseProtector_multiSeg_loop_sim
+    (tree : Miri.TreeBorrows.BorrowTree) (tag : Miri.Memory.BorTag)
+    (source : Miri.TreeBorrows.UniIndex) (nd : Miri.TreeBorrows.TreeNode)
+    (pt : Miri.TreeBorrows.ProtectedTags)
+    (frameTag : Miri.Memory.BorTag → Prop) (tagOf : Miri.Memory.BorTag → Nat)
+    (htag : tree.indexOfTag tag = some source)
+    (hnd : tree.nodeAt source = some nd)
+    (hexp : nd.isExposed = false)
+    (ht : frameTag tag) :
+    ∀ (remLen start : Nat), start + remLen = tree.locations.entries.size →
+      ∀ (locsCur : Miri.DataStructures.DedupRangeMap Miri.TreeBorrows.LocationTree),
+      locsCur.entries.size = tree.locations.entries.size →
+      ∀ (specs : List SegReleaseSpec), specs.length = remLen →
+      (∀ (k : Nat) seg spec, locsCur.entries[start + k]? = some seg → specs[k]? = some spec →
+        SegReleaseRel pt frameTag tagOf tree source seg spec) →
+      let res : Option Miri.TreeBorrows.BorrowTree.ProtectorReleaseResult × Miri.TreeBorrows.BorrowTree :=
+        forIn (m := Id) (List.range' start remLen)
+          (none, ({ tree with locations := locsCur } : Miri.TreeBorrows.BorrowTree))
+          (releaseProtectorLoopStep source pt)
+      let part := multiSegEndAccessPartialGo (tagOf tag) start specs
+      res.2.tagMapping = tree.tagMapping ∧
+      res.2.nodes = tree.nodes ∧
+      res.2.roots = tree.roots ∧
+      res.2.locations.entries.size = tree.locations.entries.size ∧
+      (∀ (j : Nat), (res.2.locations.entries[j]?).map (·.range) = (locsCur.entries[j]?).map (·.range)) ∧
+      (∀ (j : Nat), j < start → res.2.locations.entries[j]? = locsCur.entries[j]?) ∧
+      match res.1, part.2 with
+      | none, none =>
+        ∀ (k : Nat) seg' spec',
+          res.2.locations.entries[start + k]? = some seg' →
+          part.1[k]? = some spec' →
+          SegReleaseRel pt frameTag tagOf tree source seg' spec' ∧
+          (specs[k]? = some SegReleaseSpec.skipped →
+            res.2.locations.entries[start + k]? = locsCur.entries[start + k]?)
+      | some failRes, some failPos =>
+        failRes.tree = res.2 ∧
+        start ≤ failPos ∧ failPos < tree.locations.entries.size ∧
+        (∃ segF errSt, locsCur.entries[failPos]? = some segF ∧
+          failRes.status = .AccessFailure segF.range errSt) ∧
+        (∀ (k : Nat) seg' spec', start + k < failPos →
+          res.2.locations.entries[start + k]? = some seg' →
+          part.1[k]? = some spec' →
+          SegReleaseRel pt frameTag tagOf tree source seg' spec' ∧
+          (specs[k]? = some SegReleaseSpec.skipped →
+            res.2.locations.entries[start + k]? = locsCur.entries[start + k]?)) ∧
+        (∀ (j : Nat), failPos < j → res.2.locations.entries[j]? = locsCur.entries[j]?)
+      | _, _ => False := by
+  intro remLen
+  induction remLen with
+  | zero =>
+    intro start hsum locsCur hszCur specs hspecsLen hrel
+    cases specs with
+    | nil =>
+      refine ⟨rfl, rfl, rfl, hszCur, fun _ => rfl, fun _ _ => rfl,
+        fun _ _ _ _ hsp => by cases hsp⟩
+    | cons _ _ => cases hspecsLen
+  | succ m ih =>
+    intro start hsum locsCur hszCur specs hspecsLen hrel
+    cases specs with
+    | nil => cases hspecsLen
+    | cons spec rest =>
+      have hstartLt : start < locsCur.entries.size := by omega
+      have hidxStart : locsCur.index start = .ok locsCur.entries[start] :=
+        Miri.TreeBorrows.BorrowTree.ZeroProtection.Release.index_exact locsCur start hstartLt
+      have hsegStart : locsCur.entries[start]? = some locsCur.entries[start] :=
+        Array.getElem?_eq_getElem hstartLt
+      have hspecRel : SegReleaseRel pt frameTag tagOf tree source locsCur.entries[start] spec :=
+        hrel 0 locsCur.entries[start] spec (by simp only [Nat.add_zero]; exact hsegStart) rfl
+      have hrestLen : rest.length = m := Nat.succ.inj hspecsLen
+      dsimp only
+      rw [List.range'_succ, List.forIn_cons]
+      cases spec with
+      | skipped =>
+        have hstep : releaseProtectorLoopStep source pt start
+            (none, { tree with locations := locsCur }) =
+            .yield (none, { tree with locations := locsCur }) := by
+          unfold releaseProtectorLoopStep
+          dsimp only
+          rw [hidxStart]
+          dsimp only
+          unfold SegReleaseRel at hspecRel
+          cases hget : locsCur.entries[start].data.perms.get source with
+          | none => rfl
+          | some st =>
+            dsimp only
+            rw [hget] at hspecRel
+            cases hassoc : st.permission.associatedAccess with
+            | none => rfl
+            | some kind =>
+              dsimp only
+              rcases hspecRel with haccF | hcontra
+              · simp only [haccF, Bool.false_eq_true, ↓reduceIte]
+              · rw [hassoc] at hcontra; cases hcontra
+        rw [hstep]
+        dsimp only [bind, Bind.bind, multiSegEndAccessPartialGo]
+        have hrec := ih (start + 1) (by omega) locsCur hszCur rest hrestLen (fun k seg sp h1 h2 =>
+          hrel (k + 1) seg sp (by rwa [show start + (k + 1) = start + 1 + k by omega]) h2)
+        dsimp only at hrec
+        rcases hrec with ⟨htm, hnd', hrt, hsz', hrng, hpre, hmatch⟩
+        refine ⟨htm, hnd', hrt, hsz', hrng, fun j hj => hpre j (by omega), ?_⟩
+        cases hres1 : (forIn (m := Id) (List.range' (start + 1) m)
+            (none, ({ tree with locations := locsCur } : Miri.TreeBorrows.BorrowTree))
+            (releaseProtectorLoopStep source pt) :
+              Option Miri.TreeBorrows.BorrowTree.ProtectorReleaseResult × Miri.TreeBorrows.BorrowTree).1 with
+        | none =>
+          rw [hres1] at hmatch
+          cases hfail : (multiSegEndAccessPartialGo (tagOf tag) (start + 1) rest).2 with
+          | some fp => rw [hfail] at hmatch; exact False.elim hmatch
+          | none =>
+            rw [hfail] at hmatch
+            intro k seg' sp' hseg' hsp'
+            cases k with
+            | zero =>
+              have hsp0 : sp' = .skipped := Option.some.inj hsp'.symm
+              subst hsp0
+              have heq0 : (forIn (m := Id) (List.range' (start + 1) m)
+                  (none, ({ tree with locations := locsCur } : Miri.TreeBorrows.BorrowTree))
+                  (releaseProtectorLoopStep source pt) :
+                    Option Miri.TreeBorrows.BorrowTree.ProtectorReleaseResult × Miri.TreeBorrows.BorrowTree).2.locations.entries[start]? =
+                  locsCur.entries[start]? := hpre start (Nat.lt_succ_self start)
+              simp only [Nat.add_zero] at hseg' ⊢
+              rw [heq0, hsegStart] at hseg'
+              injection hseg' with hsegEq; subst hsegEq
+              exact ⟨hspecRel, fun _ => heq0⟩
+            | succ k' =>
+              have hidxEq : start + (k' + 1) = start + 1 + k' := by omega
+              rw [hidxEq] at hseg' ⊢
+              exact hmatch k' seg' sp' hseg' hsp'
+        | some failRes =>
+          rw [hres1] at hmatch
+          cases hfail : (multiSegEndAccessPartialGo (tagOf tag) (start + 1) rest).2 with
+          | none => rw [hfail] at hmatch; exact False.elim hmatch
+          | some fp =>
+            rw [hfail] at hmatch
+            rcases hmatch with ⟨hft, hle, hlt, ⟨segF, errSt, hsf, hstF⟩, hpref, htail⟩
+            refine ⟨hft, by omega, hlt, ⟨segF, errSt, hsf, hstF⟩, ?_, htail⟩
+            intro k seg' sp' hltFp hseg' hsp'
+            cases k with
+            | zero =>
+              have hsp0 : sp' = .skipped := Option.some.inj hsp'.symm
+              subst hsp0
+              have heq0 := hpre start (Nat.lt_succ_self start)
+              simp only [Nat.add_zero] at hseg' ⊢
+              rw [heq0, hsegStart] at hseg'
+              injection hseg' with hsegEq; subst hsegEq
+              exact ⟨hspecRel, fun _ => heq0⟩
+            | succ k' =>
+              have hidxEq : start + (k' + 1) = start + 1 + k' := by omega
+              rw [hidxEq] at hltFp hseg' ⊢
+              exact hpref k' seg' sp' hltFp hseg' hsp'
+      | tracked w =>
+        let seg0 := locsCur.entries[start]
+        let t1 : Miri.TreeBorrows.BorrowTree := { tree with locations := ⟨#[seg0]⟩ }
+        have hsim1 := (realAccessReleaseSim pt frameTag tagOf).step t1 w tag ht hspecRel
+        have hsingle := releaseProtector_singleSeg_step_eq tree tag source nd pt seg0 htag hnd hexp
+        dsimp only at hsingle
+        have hstepEq :
+            (let acc? : Option (Miri.TreeBorrows.LocationTree × Option Miri.TreeBorrows.BorrowTree.BorrowTreeAccessStatus) :=
+              match seg0.data.perms.get source with
+              | none => none
+              | some st =>
+                match st.permission.associatedAccess with
+                | none => none
+                | some kind =>
+                  if st.accessed then
+                    let acc := miriPerformTreeAccessAt tree seg0.data (some source) kind pt .SkipChildrenOfAccessed seg0.range
+                    some ((miri_etm_private% Miri.TreeBorrows.TreeState
+                            Miri.TreeBorrows.BorrowTree.TreeLocationAccessAtResult.location) acc,
+                          (miri_etm_private% Miri.TreeBorrows.TreeState
+                            Miri.TreeBorrows.BorrowTree.TreeLocationAccessAtResult.status) acc)
+                  else none
+            match acc? with
+            | none =>
+              t1.releaseProtector tag pt = ⟨t1, .Released⟩ ∧
+              releaseProtectorLoopStep source pt start (none, { tree with locations := locsCur }) =
+                .yield (none, { tree with locations := locsCur })
+            | some (loc', none) =>
+              t1.releaseProtector tag pt = ⟨{ tree with locations := ⟨#[{ seg0 with data := loc' }]⟩ }, .Released⟩ ∧
+              releaseProtectorLoopStep source pt start (none, { tree with locations := locsCur }) =
+                .yield (none, { tree with locations := ⟨locsCur.entries.set start { seg0 with data := loc' } hstartLt⟩ })
+            | some (loc', some errSt) =>
+              t1.releaseProtector tag pt = ⟨{ tree with locations := ⟨#[{ seg0 with data := loc' }]⟩ }, .AccessFailure seg0.range errSt⟩ ∧
+              releaseProtectorLoopStep source pt start (none, { tree with locations := locsCur }) =
+                .done (some ⟨{ tree with locations := ⟨locsCur.entries.set start { seg0 with data := loc' } hstartLt⟩ },
+                             .AccessFailure seg0.range errSt⟩,
+                       { tree with locations := ⟨locsCur.entries.set start { seg0 with data := loc' } hstartLt⟩ })) := by
+          unfold releaseProtectorLoopStep
+          dsimp only
+          rw [hidxStart, hsingle]
+          dsimp only [seg0]
+          cases hget : locsCur.entries[start].data.perms.get source with
+          | none => exact ⟨rfl, rfl⟩
+          | some st =>
+            dsimp only
+            cases hassoc : st.permission.associatedAccess with
+            | none => exact ⟨rfl, rfl⟩
+            | some kind =>
+              dsimp only
+              cases haccB : st.accessed with
+              | false => simp only [Bool.false_eq_true, ↓reduceIte]; exact ⟨rfl, trivial⟩
+              | true =>
+                simp only [↓reduceIte]
+                have hind := performTreeAccessAt_locations_indep tree locsCur tree.locations
+                  locsCur.entries[start].data (some source) kind pt .SkipChildrenOfAccessed
+                  locsCur.entries[start].range
+                have htreeEq : ({ tree with locations := tree.locations } : Miri.TreeBorrows.BorrowTree) = tree := rfl
+                rw [htreeEq] at hind
+                rw [hind]
+                have hset := dedupRangeMap_setAtPos_exact locsCur start hstartLt
+                  ((miri_etm_private% Miri.TreeBorrows.TreeState
+                    Miri.TreeBorrows.BorrowTree.TreeLocationAccessAtResult.location)
+                    (miriPerformTreeAccessAt tree locsCur.entries[start].data (some source) kind pt
+                      .SkipChildrenOfAccessed locsCur.entries[start].range))
+                rw [hset]
+                dsimp only
+                cases ((miri_etm_private% Miri.TreeBorrows.TreeState
+                    Miri.TreeBorrows.BorrowTree.TreeLocationAccessAtResult.status)
+                    (miriPerformTreeAccessAt tree locsCur.entries[start].data (some source) kind pt
+                      .SkipChildrenOfAccessed locsCur.entries[start].range)) with
+                | none => exact ⟨rfl, rfl⟩
+                | some errSt => exact ⟨rfl, rfl⟩
+        dsimp only at hstepEq
+        generalize (match seg0.data.perms.get source with
+          | none => none
+          | some st =>
+            match st.permission.associatedAccess with
+            | none => none
+            | some kind =>
+              if st.accessed then
+                let acc := miriPerformTreeAccessAt tree seg0.data (some source) kind pt .SkipChildrenOfAccessed seg0.range
+                some ((miri_etm_private% Miri.TreeBorrows.TreeState
+                        Miri.TreeBorrows.BorrowTree.TreeLocationAccessAtResult.location) acc,
+                      (miri_etm_private% Miri.TreeBorrows.TreeState
+                        Miri.TreeBorrows.BorrowTree.TreeLocationAccessAtResult.status) acc)
+              else none) = accOpt at hstepEq
+        rcases accOpt with _ | ⟨loc', _ | errSt⟩
+        · rcases hstepEq with ⟨ht1Rel, hloop⟩
+          rw [ht1Rel] at hsim1
+          simp only [stackPopReleaseErr] at hsim1
+          cases hexec : execProtectorEndAccessFor protectorEndAccessIsWrite? w (tagOf tag) with
+          | error e => rw [hexec] at hsim1; exact False.elim hsim1
+          | ok w' =>
+            rw [hexec] at hsim1
+            rw [hloop]
+            dsimp only [bind, Bind.bind, multiSegEndAccessPartialGo]
+            rw [hexec]
+            dsimp only
+            have hrec := ih (start + 1) (by omega) locsCur hszCur rest hrestLen (fun k seg sp h1 h2 =>
+              hrel (k + 1) seg sp (by rwa [show start + (k + 1) = start + 1 + k by omega]) h2)
+            dsimp only at hrec
+            rcases hrec with ⟨htm, hnd', hrt, hsz', hrng, hpre, hmatch⟩
+            refine ⟨htm, hnd', hrt, hsz', hrng, fun j hj => hpre j (by omega), ?_⟩
+            cases hres1 : (forIn (m := Id) (List.range' (start + 1) m)
+                (none, ({ tree with locations := locsCur } : Miri.TreeBorrows.BorrowTree))
+                (releaseProtectorLoopStep source pt) :
+                  Option Miri.TreeBorrows.BorrowTree.ProtectorReleaseResult × Miri.TreeBorrows.BorrowTree).1 with
+            | none =>
+              rw [hres1] at hmatch
+              cases hfail : (multiSegEndAccessPartialGo (tagOf tag) (start + 1) rest).2 with
+              | some fp => rw [hfail] at hmatch; exact False.elim hmatch
+              | none =>
+                rw [hfail] at hmatch
+                intro k seg' sp' hseg' hsp'
+                cases k with
+                | zero =>
+                  have hsp0 : sp' = .tracked w' := Option.some.inj hsp'.symm
+                  subst hsp0
+                  have heq0 := hpre start (Nat.lt_succ_self start)
+                  simp only [Nat.add_zero] at hseg' ⊢
+                  rw [heq0, hsegStart] at hseg'
+                  injection hseg' with hsegEq; subst hsegEq
+                  exact ⟨hsim1, fun h => by cases h⟩
+                | succ k' =>
+                  have hidxEq : start + (k' + 1) = start + 1 + k' := by omega
+                  rw [hidxEq] at hseg' ⊢
+                  exact hmatch k' seg' sp' hseg' hsp'
+            | some failRes =>
+              rw [hres1] at hmatch
+              cases hfail : (multiSegEndAccessPartialGo (tagOf tag) (start + 1) rest).2 with
+              | none => rw [hfail] at hmatch; exact False.elim hmatch
+              | some fp =>
+                rw [hfail] at hmatch
+                rcases hmatch with ⟨hft, hle, hlt, ⟨segF, errStF, hsf, hstF⟩, hpref, htail⟩
+                refine ⟨hft, by omega, hlt, ⟨segF, errStF, hsf, hstF⟩, ?_, htail⟩
+                intro k seg' sp' hltFp hseg' hsp'
+                cases k with
+                | zero =>
+                  have hsp0 : sp' = .tracked w' := Option.some.inj hsp'.symm
+                  subst hsp0
+                  have heq0 := hpre start (Nat.lt_succ_self start)
+                  simp only [Nat.add_zero] at hseg' ⊢
+                  rw [heq0, hsegStart] at hseg'
+                  injection hseg' with hsegEq; subst hsegEq
+                  exact ⟨hsim1, fun h => by cases h⟩
+                | succ k' =>
+                  have hidxEq : start + (k' + 1) = start + 1 + k' := by omega
+                  rw [hidxEq] at hltFp hseg' ⊢
+                  exact hpref k' seg' sp' hltFp hseg' hsp'
+        · rcases hstepEq with ⟨ht1Rel, hloop⟩
+          rw [ht1Rel] at hsim1
+          simp only [stackPopReleaseErr] at hsim1
+          cases hexec : execProtectorEndAccessFor protectorEndAccessIsWrite? w (tagOf tag) with
+          | error e => rw [hexec] at hsim1; exact False.elim hsim1
+          | ok w' =>
+            rw [hexec] at hsim1
+            rw [hloop]
+            dsimp only [bind, Bind.bind, multiSegEndAccessPartialGo]
+            rw [hexec]
+            dsimp only
+            let locsNext : Miri.DataStructures.DedupRangeMap Miri.TreeBorrows.LocationTree :=
+              ⟨locsCur.entries.set start { seg0 with data := loc' } hstartLt⟩
+            have hszNext : locsNext.entries.size = tree.locations.entries.size := by
+              simp [locsNext, hszCur]
+            have hnextAt : ∀ (j : Nat), j ≠ start → locsNext.entries[j]? = locsCur.entries[j]? := by
+              intro j hj
+              simp only [locsNext]
+              by_cases hjb : j < locsCur.entries.size
+              · rw [Array.getElem?_eq_getElem (by simpa using hjb), Array.getElem?_eq_getElem hjb,
+                  Array.getElem_set_ne hstartLt hjb (Ne.symm hj)]
+              · rw [Array.getElem?_eq_none (by simpa using Nat.le_of_not_lt hjb),
+                  Array.getElem?_eq_none (Nat.le_of_not_lt hjb)]
+            have hnextSelf : locsNext.entries[start]? = some { seg0 with data := loc' } := by
+              dsimp only [locsNext]
+              rw [Array.getElem?_eq_getElem (by simpa using hstartLt), Array.getElem_set_self]
+            have hnextRng : ∀ (j : Nat), (locsNext.entries[j]?).map (·.range) = (locsCur.entries[j]?).map (·.range) := by
+              intro j
+              by_cases hj : j = start
+              · subst hj; rw [hnextSelf, hsegStart]; rfl
+              · rw [hnextAt j hj]
+            have hrec := ih (start + 1) (by omega) locsNext hszNext rest hrestLen (fun k seg sp h1 h2 => by
+              rw [hnextAt (start + 1 + k) (by omega)] at h1
+              exact hrel (k + 1) seg sp (by rwa [show start + (k + 1) = start + 1 + k by omega]) h2)
+            dsimp only at hrec
+            rcases hrec with ⟨htm, hnd', hrt, hsz', hrng, hpre, hmatch⟩
+            refine ⟨htm, hnd', hrt, hsz', fun j => (hrng j).trans (hnextRng j),
+              fun j hj => (hpre j (by omega)).trans (hnextAt j (by omega)), ?_⟩
+            cases hres1 : (forIn (m := Id) (List.range' (start + 1) m)
+                (none, ({ tree with locations := locsNext } : Miri.TreeBorrows.BorrowTree))
+                (releaseProtectorLoopStep source pt) :
+                  Option Miri.TreeBorrows.BorrowTree.ProtectorReleaseResult × Miri.TreeBorrows.BorrowTree).1 with
+            | none =>
+              rw [hres1] at hmatch
+              cases hfail : (multiSegEndAccessPartialGo (tagOf tag) (start + 1) rest).2 with
+              | some fp => rw [hfail] at hmatch; exact False.elim hmatch
+              | none =>
+                rw [hfail] at hmatch
+                intro k seg' sp' hseg' hsp'
+                cases k with
+                | zero =>
+                  have hsp0 : sp' = .tracked w' := Option.some.inj hsp'.symm
+                  subst hsp0
+                  have heq0 := hpre start (Nat.lt_succ_self start)
+                  simp only [Nat.add_zero] at hseg' ⊢
+                  rw [heq0, hnextSelf] at hseg'
+                  injection hseg' with hsegEq; subst hsegEq
+                  exact ⟨hsim1, fun h => by cases h⟩
+                | succ k' =>
+                  have hidxEq : start + (k' + 1) = start + 1 + k' := by omega
+                  rw [hidxEq] at hseg' ⊢
+                  obtain ⟨hR', hsk'⟩ := hmatch k' seg' sp' hseg' hsp'
+                  exact ⟨hR', fun hs => (hsk' hs).trans (hnextAt (start + 1 + k') (by omega))⟩
+            | some failRes =>
+              rw [hres1] at hmatch
+              cases hfail : (multiSegEndAccessPartialGo (tagOf tag) (start + 1) rest).2 with
+              | none => rw [hfail] at hmatch; exact False.elim hmatch
+              | some fp =>
+                rw [hfail] at hmatch
+                rcases hmatch with ⟨hft, hle, hlt, ⟨segF, errStF, hsf, hstF⟩, hpref, htail⟩
+                rw [hnextAt fp (by omega)] at hsf
+                refine ⟨hft, by omega, hlt, ⟨segF, errStF, hsf, hstF⟩, ?_,
+                  fun j hj => (htail j hj).trans (hnextAt j (by omega))⟩
+                intro k seg' sp' hltFp hseg' hsp'
+                cases k with
+                | zero =>
+                  have hsp0 : sp' = .tracked w' := Option.some.inj hsp'.symm
+                  subst hsp0
+                  have heq0 := hpre start (Nat.lt_succ_self start)
+                  simp only [Nat.add_zero] at hseg' ⊢
+                  rw [heq0, hnextSelf] at hseg'
+                  injection hseg' with hsegEq; subst hsegEq
+                  exact ⟨hsim1, fun h => by cases h⟩
+                | succ k' =>
+                  have hidxEq : start + (k' + 1) = start + 1 + k' := by omega
+                  rw [hidxEq] at hltFp hseg' ⊢
+                  obtain ⟨hR', hsk'⟩ := hpref k' seg' sp' hltFp hseg' hsp'
+                  exact ⟨hR', fun hs => (hsk' hs).trans (hnextAt (start + 1 + k') (by omega))⟩
+        · rcases hstepEq with ⟨ht1Rel, hloop⟩
+          rw [ht1Rel] at hsim1
+          simp only [stackPopReleaseErr] at hsim1
+          cases hexec : execProtectorEndAccessFor protectorEndAccessIsWrite? w (tagOf tag) with
+          | ok w' => rw [hexec] at hsim1; exact False.elim hsim1
+          | error e =>
+            rw [hloop]
+            dsimp only [bind, Bind.bind, pure, Pure.pure, multiSegEndAccessPartialGo]
+            rw [hexec]
+            dsimp only
+            have hnextAt : ∀ (j : Nat), j ≠ start →
+                (locsCur.entries.set start { seg0 with data := loc' } hstartLt)[j]? =
+                  locsCur.entries[j]? := by
+              intro j hj
+              by_cases hjb : j < locsCur.entries.size
+              · rw [Array.getElem?_eq_getElem (by simpa using hjb), Array.getElem?_eq_getElem hjb,
+                  Array.getElem_set_ne hstartLt hjb (Ne.symm hj)]
+              · rw [Array.getElem?_eq_none (by simpa using Nat.le_of_not_lt hjb),
+                  Array.getElem?_eq_none (Nat.le_of_not_lt hjb)]
+            have hnextRng : ∀ (j : Nat),
+                ((locsCur.entries.set start { seg0 with data := loc' } hstartLt)[j]?).map (·.range) =
+                  (locsCur.entries[j]?).map (·.range) := by
+              intro j
+              by_cases hj : j = start
+              · subst hj
+                rw [Array.getElem?_eq_getElem (by simpa using hstartLt), Array.getElem_set_self, hsegStart]
+                rfl
+              · rw [hnextAt j hj]
+            refine ⟨rfl, rfl, rfl, by simp [hszCur], hnextRng, fun j hj => hnextAt j (by omega),
+              rfl, Nat.le_refl _, by omega, ⟨seg0, errSt, hsegStart, rfl⟩,
+              fun k _ _ hlt => by omega, fun j hj => hnextAt j (by omega)⟩
+
+/-- **Multi-segment `BorrowTree.releaseProtector` simulation with zero coalescing/splitting and
+exact mid-segment partial mutation retention (`lean-miri#74`)**:
+lifts single-segment `realAccessReleaseSim` to an arbitrary `k`-segment `DedupRangeMap` (covering
+arbitrary sub-intervals, unmaterialized `perms.get = none` gaps, unaccessed/Cell segments, and
+co-existing strong/weak protectors on distinct nodes):
+1. `tagMapping`, `nodes`, `roots`, `locations.entries.size`, and EVERY segment's `.range` are
+   strictly preserved (no segment splitting or coalescing ever occurs inside `releaseProtector`);
+2. On full success (`.Released` / `none`), every tracked segment satisfies `BorrowTreeWorldRel`
+   against its stepped world and every `.skipped` segment is byte-for-byte unchanged;
+3. On mid-segment failure (`.AccessFailure range _` / `some failPos`), both sides stop at the SAME
+   segment `failPos` with `entries[failPos].range = range`, prefix segments `k < failPos` retain
+   their stepped worlds (or remain unchanged if `.skipped`), and suffix segments `j > failPos` are
+   completely untouched. -/
+theorem miri_releaseProtector_multiSeg_partial_sim
+    (tree : Miri.TreeBorrows.BorrowTree) (tag : Miri.Memory.BorTag)
+    (source : Miri.TreeBorrows.UniIndex) (nd : Miri.TreeBorrows.TreeNode)
+    (pt : Miri.TreeBorrows.ProtectedTags)
+    (frameTag : Miri.Memory.BorTag → Prop) (tagOf : Miri.Memory.BorTag → Nat)
+    (specs : List SegReleaseSpec)
+    (htag : tree.indexOfTag tag = some source)
+    (hnd : tree.nodeAt source = some nd)
+    (hexp : nd.isExposed = false)
+    (ht : frameTag tag)
+    (hlen : specs.length = tree.locations.entries.size)
+    (hrel : ∀ (k : Nat) seg spec, tree.locations.entries[k]? = some seg → specs[k]? = some spec →
+      SegReleaseRel pt frameTag tagOf tree source seg spec) :
+    let res := tree.releaseProtector tag pt
+    let part := multiSegEndAccessPartial (tagOf tag) specs
+    res.tree.tagMapping = tree.tagMapping ∧
+    res.tree.nodes = tree.nodes ∧
+    res.tree.roots = tree.roots ∧
+    res.tree.locations.entries.size = tree.locations.entries.size ∧
+    (∀ (j : Nat), (res.tree.locations.entries[j]?).map (·.range) =
+          (tree.locations.entries[j]?).map (·.range)) ∧
+    match res.status, part.2 with
+    | .Released, none =>
+      ∀ (k : Nat) seg' spec',
+        res.tree.locations.entries[k]? = some seg' →
+        part.1[k]? = some spec' →
+        SegReleaseRel pt frameTag tagOf tree source seg' spec' ∧
+        (specs[k]? = some SegReleaseSpec.skipped →
+          res.tree.locations.entries[k]? = tree.locations.entries[k]?)
+    | .AccessFailure range _, some failPos =>
+      failPos < tree.locations.entries.size ∧
+      (tree.locations.entries[failPos]?).map (·.range) = some range ∧
+      (∀ (k : Nat) seg' spec', k < failPos →
+        res.tree.locations.entries[k]? = some seg' →
+        part.1[k]? = some spec' →
+        SegReleaseRel pt frameTag tagOf tree source seg' spec' ∧
+        (specs[k]? = some SegReleaseSpec.skipped →
+          res.tree.locations.entries[k]? = tree.locations.entries[k]?)) ∧
+      (∀ (j : Nat), failPos < j → res.tree.locations.entries[j]? = tree.locations.entries[j]?)
+    | _, _ => False := by
+  have hloop := releaseProtector_multiSeg_loop_sim tree tag source nd pt frameTag tagOf
+    htag hnd hexp ht tree.locations.entries.size 0 (Nat.zero_add _) tree.locations rfl specs hlen
+    (fun k seg sp h1 h2 => hrel k seg sp (by simpa [Nat.zero_add] using h1) h2)
+  dsimp only at hloop
+  rcases hloop with ⟨htm, hnd', hrt, hsz', hrng, _, hmatch⟩
+  have hexpAll : ∀ t : Miri.TreeBorrows.BorrowTree,
+      t.tagMapping = tree.tagMapping → t.nodes = tree.nodes →
+      t.updateExposureForProtectorRelease tag = ⟨t, .ok ()⟩ := by
+    intro t h1 h2
+    unfold Miri.TreeBorrows.BorrowTree.updateExposureForProtectorRelease
+    have ht' : t.indexOfTag tag = some source := by
+      unfold Miri.TreeBorrows.BorrowTree.indexOfTag; rw [h1]; exact htag
+    have hn' : t.nodeAt source = some nd := by
+      unfold Miri.TreeBorrows.BorrowTree.nodeAt; rw [h2]; exact hnd
+    simp [ht', hn', hexp, Id.run, pure]
+  dsimp only [multiSegEndAccessPartial]
+  rw [releaseProtector_eq_forIn_step tree tag source pt htag]
+  have htreeEq : ({ tree with locations := tree.locations } : Miri.TreeBorrows.BorrowTree) = tree := rfl
+  rw [htreeEq] at htm hnd' hrt hsz' hrng hmatch
+  generalize (forIn (m := Id) (List.range' 0 tree.locations.entries.size) (none, tree)
+    (releaseProtectorLoopStep source pt) :
+      Option Miri.TreeBorrows.BorrowTree.ProtectorReleaseResult × Miri.TreeBorrows.BorrowTree) =
+    loopRes at htm hnd' hrt hsz' hrng hmatch ⊢
+  rcases loopRes with ⟨lr1, lr2⟩
+  dsimp only at htm hnd' hrt hsz' hrng hmatch ⊢
+  cases lr1 with
+  | none =>
+    cases h2 : (multiSegEndAccessPartialGo (tagOf tag) 0 specs).2 with
+    | some fp => rw [h2] at hmatch; exact False.elim hmatch
+    | none =>
+      rw [h2] at hmatch
+      dsimp only
+      rw [hexpAll lr2 htm hnd']
+      refine ⟨htm, hnd', hrt, hsz', hrng, ?_⟩
+      simpa [Nat.zero_add] using hmatch
+  | some failRes =>
+    cases h2 : (multiSegEndAccessPartialGo (tagOf tag) 0 specs).2 with
+    | none => rw [h2] at hmatch; exact False.elim hmatch
+    | some fp =>
+      rw [h2] at hmatch
+      rcases hmatch with ⟨hft, _, hlt, ⟨segF, errSt, hsf, hstF⟩, hpref, htail⟩
+      dsimp only
+      rw [hstF, hft]
+      refine ⟨htm, hnd', hrt, hsz', hrng, hlt, by rw [hsf]; rfl, ?_, htail⟩
+      simpa [Nat.zero_add] using hpref
+
+private theorem stackPopReleaseAll_frame_preserved {K : Type}
+    (pt : Miri.TreeBorrows.ProtectedTags)
+    (prots : List (Miri.Memory.AllocId × Miri.Memory.BorTag)) :
+    ∀ (mem mem' : Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K)
+      (res : Option Miri.Interpreter.StepError),
+      stackPopReleaseAll pt prots mem = some (mem', res) →
+      mem'.nextAllocId = mem.nextAllocId ∧
+      mem'.globals = mem.globals ∧
+      mem'.dead = mem.dead ∧
+      mem'.issuedIds = mem.issuedIds ∧
+      mem'.sourceAllocIdWorldActive = mem.sourceAllocIdWorldActive ∧
+      mem'.idSupplyExhausted = mem.idSupplyExhausted ∧
+      ∀ id, (∀ p ∈ prots, p.1 ≠ id) →
+        mem'.live.find? (fun e => e.1 == id) = mem.live.find? (fun e => e.1 == id) := by
+  induction prots with
+  | nil =>
+    intro mem mem' res h
+    injection h with hEq; injection hEq with hm _
+    subst hm
+    exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, fun _ _ => rfl⟩
+  | cons p rest ih =>
+    intro mem mem' res h
+    obtain ⟨pid, ptag⟩ := p
+    cases hf : mem.live.find? (fun e => e.1 == pid) with
+    | none => simp only [stackPopReleaseAll, hf] at h; cases h
+    | some pair =>
+      simp only [stackPopReleaseAll, hf] at h
+      cases hE : stackPopReleaseErr (pair.2.allocation.extra.releaseProtector ptag pt).status with
+      | none => rw [hE] at h; cases h
+      | some r =>
+        rw [hE] at h
+        have hwbFind : ∀ id, id ≠ pid →
+            (stackPopWriteBack mem pid pair.2 (pair.2.allocation.extra.releaseProtector ptag pt).tree).live.find?
+              (fun e => e.1 == id) = mem.live.find? (fun e => e.1 == id) := fun id hne => by
+          unfold stackPopWriteBack
+          exact find?_filter_push_ne mem.live pid id _ hne
+        cases r with
+        | some err =>
+          injection h with hEq; injection hEq with hm _
+          subst hm
+          exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, fun id hnot => hwbFind id (Ne.symm (hnot (pid, ptag) List.mem_cons_self))⟩
+        | none =>
+          obtain ⟨h1, h2, h3, h4, h5, h6, h7⟩ := ih _ mem' res h
+          refine ⟨h1, h2, h3, h4, h5, h6, fun id hnot => ?_⟩
+          exact (h7 id (fun q hq => hnot q (List.mem_cons_of_mem _ hq))).trans
+            (hwbFind id (Ne.symm (hnot (pid, ptag) List.mem_cons_self)))
+
+/-- **Real-access `MachineHooks.beforeStackPopWithEnsure` partial simulation with full memory/machine
+frame preservation (`lean-miri#74`)**: directly instantiates
+`miri_beforeStackPopWithEnsure_multiAlloc_partial_simulates` to `realAccessReleaseSim` and adds full
+frame invariants (`nextAllocId`, `globals`, `dead`, `issuedIds`, `sourceAllocIdWorldActive`,
+`idSupplyExhausted`, `raceAllocations`, and every live allocation outside `prots`) on BOTH clean
+completion and mid-sequence UB short-circuiting. -/
+theorem miri_beforeStackPopWithEnsure_realAccess_multiAlloc_partial_sim
+    {K User : Type} [DecidableEq K]
+    (st : Miri.Interpreter.MachineHooks.State K User)
+    (tracker : Miri.Interpreter.MachineHooks.BorrowState)
+    (frame : Miri.Interpreter.Frame Miri.Memory.Provenance Miri.Interpreter.LocalLayout
+      Miri.Interpreter.MachineHooks.FrameExtra)
+    (prots : List (Miri.Memory.AllocId × Miri.Memory.BorTag))
+    (htracker : st.machine.borrowTracker = some tracker)
+    (hframe : st.stack.currentFrame? = some frame)
+    (hbf : frame.extra.borrowTracker = some ⟨prots.toArray⟩)
+    (frameTag : Miri.Memory.AllocId → Miri.Memory.BorTag → Prop)
+    (tagOf : Miri.Memory.BorTag → Nat)
+    (hprots : ∀ p ∈ prots, frameTag p.1 p.2)
+    (worlds : Miri.Memory.AllocId → Option FnEntryBorrowWorld)
+    (hsync : ∀ id w, worlds id = some w →
+      ∃ entry, st.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry) ∧
+        BorrowTreeWorldRel tracker.global.protectedTags (frameTag id) tagOf
+          entry.allocation.extra w)
+    (hdom : ∀ p ∈ prots, (worlds p.1).isSome = true) :
+    let framePreserved (st' : Miri.Interpreter.MachineHooks.State K User) : Prop :=
+      st'.machine.memory.nextAllocId = st.machine.memory.nextAllocId ∧
+      st'.machine.memory.globals = st.machine.memory.globals ∧
+      st'.machine.memory.dead = st.machine.memory.dead ∧
+      st'.machine.memory.issuedIds = st.machine.memory.issuedIds ∧
+      st'.machine.memory.sourceAllocIdWorldActive = st.machine.memory.sourceAllocIdWorldActive ∧
+      st'.machine.memory.idSupplyExhausted = st.machine.memory.idSupplyExhausted ∧
+      st'.machine.raceAllocations = st.machine.raceAllocations ∧
+      ∀ id, (∀ p ∈ prots, p.1 ≠ id) →
+        st'.machine.memory.live.find? (fun e => e.1 == id) =
+          st.machine.memory.live.find? (fun e => e.1 == id)
+    match Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ()) st,
+        multiAllocEndAccessesPartial tagOf prots worlds with
+    | .ok () st', (worlds', none) =>
+      framePreserved st' ∧
+      st'.machine.borrowTracker = some { tracker with
+        global := tracker.global.endCall ⟨prots.toArray⟩ } ∧
+      ∀ id w', worlds' id = some w' →
+        ∃ entry', st'.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry') ∧
+          BorrowTreeWorldRel tracker.global.protectedTags (frameTag id) tagOf
+            entry'.allocation.extra w'
+    | .error err st', (worlds', some (fid, ftag)) =>
+      framePreserved st' ∧
+      st'.machine.borrowTracker = some tracker ∧
+      (∀ id w', id ≠ fid → worlds' id = some w' →
+        ∃ entry', st'.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry') ∧
+          BorrowTreeWorldRel tracker.global.protectedTags (frameTag id) tagOf
+            entry'.allocation.extra w') ∧
+      ∃ wf pre entry',
+        worlds' fid = some wf ∧
+        BorrowTreeWorldRel tracker.global.protectedTags (frameTag fid) tagOf pre wf ∧
+        (∃ e, execProtectorEndAccessFor protectorEndAccessIsWrite? wf (tagOf ftag) = .error e) ∧
+        stackPopReleaseErr (pre.releaseProtector ftag tracker.global.protectedTags).status =
+          some (some err) ∧
+        st'.machine.memory.live.find? (fun e => e.1 == fid) = some (fid, entry') ∧
+        entry'.allocation.extra = (pre.releaseProtector ftag tracker.global.protectedTags).tree
+    | _, _ => False := by
+  obtain ⟨mem', res, hall, hmatch⟩ :=
+    stackPopReleaseAll_multiAlloc_partial_simulates (K := K) tracker.global.protectedTags frameTag
+      tagOf (fun id => BorrowTreeWorldRel tracker.global.protectedTags (frameTag id) tagOf)
+      (fun id => realAccessReleaseSim tracker.global.protectedTags (frameTag id) tagOf)
+      prots hprots st.machine.memory worlds hsync hdom
+  obtain ⟨h1, h2, h3, h4, h5, h6, h7⟩ :=
+    stackPopReleaseAll_frame_preserved tracker.global.protectedTags prots st.machine.memory mem' res hall
+  have hrun := miri_beforeStackPopWithEnsure_eq_releaseAll st tracker frame prots.toArray
+    htracker hframe hbf mem' res (by simpa using hall)
+  dsimp only
+  rw [hrun]
+  generalize multiAllocEndAccessesPartial tagOf prots worlds = part at hmatch ⊢
+  obtain ⟨worlds', fail⟩ := part
+  cases res with
+  | none =>
+    cases fail with
+    | none => exact ⟨⟨h1, h2, h3, h4, h5, h6, rfl, h7⟩, rfl, hmatch⟩
+    | some f => obtain ⟨fid, ftag⟩ := f; exact False.elim hmatch
+  | some err =>
+    cases fail with
+    | none => exact False.elim hmatch
+    | some f =>
+      obtain ⟨fid, ftag⟩ := f
+      obtain ⟨hA, hB⟩ := hmatch
+      exact ⟨⟨h1, h2, h3, h4, h5, h6, rfl, h7⟩, htracker, hA, hB⟩
+
 /-! ### 2E.1b End-to-end `FnEntry` retag (`RetagPolicy.create` + `RetagPipeline.retagPointerValue`) +
 intra-call access + `BorrowTree.releaseProtector` contrast (`writableChildWrite` vs
 `rustcNoWritable`, `charon#1619` + `lean-miri#74`) -/
@@ -13208,7 +13978,8 @@ private theorem performNormalAccessAt_locations_indep
     (mode : Miri.TreeBorrows.Tree.ChildrenVisitMode) :
     ({ tree with locations := l1 }).performNormalAccessAt loc src kind pt mode =
     ({ tree with locations := l2 }).performNormalAccessAt loc src kind pt mode := by
-  with_unfolding_all rfl
+  unfold Miri.TreeBorrows.BorrowTree.performNormalAccessAt
+  rfl
 
 private theorem list_forIn_id_yield {α β : Type} (xs : List α) (init : β)
     (f : α → β → Id (ForInStep β)) (g : α → β → β)
@@ -13746,7 +14517,8 @@ private theorem fnEntryContrast_treeAfterRetag_eq (s : UInt64) (hs : s ≠ 0)
         exposedCache := {} }
     obtain ⟨accN, hnorm, hstEq, hrtEq⟩ := performNormalAccessAt_unexposed_lt_packed initTree0 initLoc ⟨0⟩ 0 rfl .Write
       ((⟨#[]⟩ : Miri.TreeBorrows.ProtectedTags).insert ⟨3, by decide⟩ .StrongProtector)
-      .VisitChildrenOfAccessed 2 dstLoc .Completed 0 hnoExp2 (by decide +kernel)
+      .VisitChildrenOfAccessed 2 dstLoc .Completed 0 hnoExp2
+      (by dsimp only; rw [miriNormalProjection_eq_struct]; simp only [initTree0, uniValMap_entries_2, array_map_2, array_mapIdx_2]; decide)
     have hta := performTreeAccessAt_singleRoot0_eval (fnEntryContrastInitTree s) initLoc ⟨0⟩ .Write
       ((⟨#[]⟩ : Miri.TreeBorrows.ProtectedTags).insert ⟨3, by decide⟩ .StrongProtector)
       .VisitChildrenOfAccessed ⟨0, s⟩ rfl
@@ -13765,7 +14537,8 @@ private theorem fnEntryContrast_treeAfterRetag_eq (s : UInt64) (hs : s ≠ 0)
     simp only [Bool.false_eq_true, ↓reduceIte]
     obtain ⟨accN, hnorm, hstEq, hrtEq⟩ := performNormalAccessAt_unexposed_lt_packed initTree0 initLoc ⟨0⟩ 0 rfl .Read
       ((⟨#[]⟩ : Miri.TreeBorrows.ProtectedTags).insert ⟨3, by decide⟩ .StrongProtector)
-      .VisitChildrenOfAccessed 2 initLoc .Completed 0 hnoExp2 (by decide +kernel)
+      .VisitChildrenOfAccessed 2 initLoc .Completed 0 hnoExp2
+      (by dsimp only; rw [miriNormalProjection_eq_struct]; simp only [initTree0, uniValMap_entries_2, array_map_2, array_mapIdx_2]; decide)
     have hta := performTreeAccessAt_singleRoot0_eval (fnEntryContrastInitTree s) initLoc ⟨0⟩ .Read
       ((⟨#[]⟩ : Miri.TreeBorrows.ProtectedTags).insert ⟨3, by decide⟩ .StrongProtector)
       .VisitChildrenOfAccessed ⟨0, s⟩ rfl
@@ -13787,7 +14560,8 @@ private theorem fnEntryContrast_treeAfterRetag_eq (s : UInt64) (hs : s ≠ 0)
     obtain ⟨accN, hnorm, hstEq, hrtEq⟩ := performNormalAccessAt_unexposed_lt_packed initTree0 initLoc ⟨0⟩ 0 rfl .Read
       ((⟨#[(⟨2, by decide⟩, .StrongProtector)]⟩ : Miri.TreeBorrows.ProtectedTags).insert
         ⟨3, by decide⟩ .StrongProtector)
-      .VisitChildrenOfAccessed 2 initLoc .Completed 0 hnoExp2 (by decide +kernel)
+      .VisitChildrenOfAccessed 2 initLoc .Completed 0 hnoExp2
+      (by dsimp only; rw [miriNormalProjection_eq_struct]; simp only [initTree0, uniValMap_entries_2, array_map_2, array_mapIdx_2]; decide)
     have hta := performTreeAccessAt_singleRoot0_eval (fnEntryContrastInitTree s) initLoc ⟨0⟩ .Read
       ((⟨#[(⟨2, by decide⟩, .StrongProtector)]⟩ : Miri.TreeBorrows.ProtectedTags).insert
         ⟨3, by decide⟩ .StrongProtector)
@@ -14384,7 +15158,8 @@ private theorem fnEntry_endToEnd_writable_part {MachineKind : Type}
     obtain ⟨locFail, accN, hnorm, hstFail, hrtFail⟩ := performNormalAccessAt_unexposed_lt_status_packed initTree0 initLoc ⟨0⟩ 0 rfl .Write
       ((⟨#[(⟨2, by decide⟩, .StrongProtector)]⟩ : Miri.TreeBorrows.ProtectedTags).insert
         ⟨3, by decide⟩ .StrongProtector)
-      .VisitChildrenOfAccessed 2 (.TransitionError 1 (.ProtectedDisabled .Frozen)) 0 hnoExp2 (by decide +kernel)
+      .VisitChildrenOfAccessed 2 (.TransitionError 1 (.ProtectedDisabled .Frozen)) 0 hnoExp2
+        (by dsimp only; rw [miriNormalProjection_eq_struct]; simp only [initTree0, uniValMap_entries_2, array_map_2, array_mapIdx_2]; decide)
     have hta := performTreeAccessAt_singleRoot0_eval (fnEntryContrastInitTree (UInt64.ofNat len)) initLoc ⟨0⟩ .Write
       ((⟨#[(⟨2, by decide⟩, .StrongProtector)]⟩ : Miri.TreeBorrows.ProtectedTags).insert
         ⟨3, by decide⟩ .StrongProtector)
@@ -14471,7 +15246,8 @@ private theorem fnEntry_endToEnd_writable_part {MachineKind : Type}
       simp only [Bool.false_eq_true, ↓reduceIte]
       obtain ⟨locDis, accN, hnorm, hstDis, hrtDis⟩ := performNormalAccessAt_unexposed_lt_status_packed tree3W1 loc3W ⟨1⟩ 1 rfl .Read
         ((⟨#[]⟩ : Miri.TreeBorrows.ProtectedTags).insert ⟨3, by decide⟩ .StrongProtector)
-        .VisitChildrenOfAccessed 3 (.TransitionError 1 (.ChildAccessForbidden .Disabled)) 0 hnoExp3W (by decide +kernel)
+        .VisitChildrenOfAccessed 3 (.TransitionError 1 (.ChildAccessForbidden .Disabled)) 0 hnoExp3W
+          (by dsimp only; rw [miriNormalProjection_eq_struct]; simp only [tree3W1, uniValMap_entries_3, array_map_3, array_mapIdx_3]; decide)
       have hta := performTreeAccessAt_singleRoot0_eval tree3W loc3W ⟨1⟩ .Read
         ((⟨#[]⟩ : Miri.TreeBorrows.ProtectedTags).insert ⟨3, by decide⟩ .StrongProtector)
         .VisitChildrenOfAccessed ⟨0, UInt64.ofNat len⟩ rfl
@@ -14492,7 +15268,8 @@ private theorem fnEntry_endToEnd_writable_part {MachineKind : Type}
       simp only [Bool.false_eq_true, ↓reduceIte]
       obtain ⟨accN, hnorm, hstOk, hrtOk⟩ := performNormalAccessAt_unexposed_lt_packed tree3W1 loc3W ⟨2⟩ 2 rfl .Write
         ((⟨#[]⟩ : Miri.TreeBorrows.ProtectedTags).insert ⟨3, by decide⟩ .StrongProtector)
-        .VisitChildrenOfAccessed 3 loc3W .Completed 0 hnoExp3W (by decide +kernel)
+        .VisitChildrenOfAccessed 3 loc3W .Completed 0 hnoExp3W
+          (by dsimp only; rw [miriNormalProjection_eq_struct]; simp only [tree3W1, uniValMap_entries_3, array_map_3, array_mapIdx_3]; decide)
       have hta := performTreeAccessAt_singleRoot0_eval tree3W loc3W ⟨2⟩ .Write
         ((⟨#[]⟩ : Miri.TreeBorrows.ProtectedTags).insert ⟨3, by decide⟩ .StrongProtector)
         .VisitChildrenOfAccessed ⟨0, UInt64.ofNat len⟩ rfl
@@ -14707,7 +15484,7 @@ private theorem fnEntry_endToEnd_noWritable_part {MachineKind : Type}
             { tree3R with locations := ⟨#[⟨⟨0, UInt64.ofNat len⟩, loc3Rb⟩]⟩ } := by
         obtain ⟨accN, hnorm, hstOk, hrtOk⟩ := performNormalAccessAt_unexposed_lt_packed tree3R1 loc3R ⟨1⟩ 1 rfl .Read ptS
           .VisitChildrenOfAccessed 3 loc3Rb .Completed 0 hnoExp3R
-          (by cases sibProtected <;> decide +kernel)
+          (by dsimp only; rw [miriNormalProjection_eq_struct]; simp only [tree3R1, uniValMap_entries_3, array_map_3, array_mapIdx_3]; cases sibProtected <;> decide)
         have hta := performTreeAccessAt_singleRoot0_eval tree3R loc3R ⟨1⟩ .Read ptS
           .VisitChildrenOfAccessed ⟨0, UInt64.ofNat len⟩ rfl
           (fun l1 l2 => performNormalAccessAt_locations_indep tree3R l1 l2 _ _ _ _ _)
@@ -14740,7 +15517,7 @@ private theorem fnEntry_endToEnd_noWritable_part {MachineKind : Type}
         rw [hsibRead.2]
         obtain ⟨accN, hnorm, hstOk, hrtOk⟩ := performNormalAccessAt_unexposed_lt_packed tree3R1 loc3Rb ⟨2⟩ 2 rfl .Read ptS
           .VisitChildrenOfAccessed 3 loc3Rc .Completed 0 hnoExp3R
-          (by cases sibProtected <;> decide +kernel)
+          (by dsimp only; rw [miriNormalProjection_eq_struct]; simp only [tree3R1, uniValMap_entries_3, array_map_3, array_mapIdx_3]; cases sibProtected <;> decide)
         have hta := performTreeAccessAt_singleRoot0_eval tree3Rb loc3Rb ⟨2⟩ .Read ptS
           .VisitChildrenOfAccessed ⟨0, UInt64.ofNat len⟩ rfl
           (fun l1 l2 => performNormalAccessAt_locations_indep tree3Rb l1 l2 _ _ _ _ _)
@@ -15459,8 +16236,6 @@ private theorem deallocMachineOutcomeRel_lifecycle_inv {K User Payload : Type}
   | dataRace _ => injection hk with hke; exact absurd hke (hnotHook _)
   | tbProtected _ => injection hk with hke; exact absurd hke (hnotHook _)
 
-local macro "miriAllocMachBefore" : term =>
-  `(miri_etm_private% Miri.Interpreter.AllocationMachine Miri.Interpreter.AllocationMachine.before)
 
 private theorem allocationMachine_deallocate_beforeSpec {K User Payload : Type}
     [DecidableEq K]
@@ -16516,6 +17291,462 @@ theorem allocationMachine_deallocate_eq_deallocateMachine {K User Payload : Type
         exact ⟨trivial, DeallocMachineOutcomeRel.lifecycle (.nonzeroAllocationOffset "deallocate" allocId offset)
           (.nonzeroOffset (ofMiriAllocId allocId) offset.bytes) rfl (fun _ _ h => by cases h)⟩
 
+/-! ### 2E.2a.2 `PlaceMachine.allocateStackRaw` lockstep & composed 6-stage multi-step lifecycle
+(`allocate -> store/load -> retag + protected-dealloc detached failure -> frame-exit -> deallocate + UAF/double-free -> fresh allocate` no-ABA + permutation-free `KeyedAllocWorld` invariance) -/
+
+private theorem memoryState_reserve_highWater_props {Prov Extra MachineKind : Type}
+    (mem : Miri.Memory.MemoryState Prov Extra MachineKind)
+    (hnosrc : mem.sourceAllocIdWorldActive = false)
+    (havail : mem.idSupplyExhausted = false)
+    (hnz : mem.nextAllocId ≠ 0)
+    (hiss : ∀ id ∈ mem.issuedIds, id.value.toNat < mem.nextAllocId.toNat)
+    (hlive : ∀ row ∈ mem.live, row.1.value.toNat < mem.nextAllocId.toNat)
+    (hglob : ∀ row ∈ mem.globals, row.allocId.value.toNat < mem.nextAllocId.toNat)
+    (hdead : ∀ row ∈ mem.dead, row.allocId.value.toNat < mem.nextAllocId.toNat) :
+    let id : Miri.Memory.AllocId := ⟨mem.nextAllocId, hnz⟩
+    let res := mem.reserveAllocId
+    res.2 = .ok id ∧
+    res.1.nextAllocId = mem.nextAllocId + 1 ∧
+    res.1.idSupplyExhausted = false ∧
+    res.1.sourceAllocIdWorldActive = false ∧
+    res.1.live = mem.live ∧
+    res.1.dead = mem.dead ∧
+    res.1.globals = mem.globals ∧
+    res.1.issuedIds = mem.issuedIds.push id := by
+  intro id res
+  obtain ⟨after, hres⟩ := Miri.Memory.MemoryState.reserve_of_highWater mem havail hnz
+    (fun h => by rw [hnosrc] at h; cases h) (fun h => by rw [hnosrc] at h; cases h)
+    hiss hlive hglob hdead
+  have hof : Miri.Memory.AllocId.ofUInt64 mem.nextAllocId = some id := by
+    simp [Miri.Memory.AllocId.ofUInt64, hnz, id]
+  have hdef : mem.reserveAllocId =
+      (if miriMSContainsId mem id then
+        ({ mem with nextAllocId := mem.nextAllocId + 1 }, .error (.alreadyIssued id))
+       else
+        ({ mem with
+           nextAllocId := mem.nextAllocId + 1
+           issuedIdTable := ((miri_etm_private% Miri.Memory.MemoryState Miri.Memory.MemoryState.issuedIdTable) mem).push id },
+         .ok id)) := by
+    unfold Miri.Memory.MemoryState.reserveAllocId
+    simp only [Id.run, pure, Pure.pure, havail, hnosrc, Bool.false_and,
+      Bool.or_self, Bool.false_eq_true, ↓reduceIte, hof]
+  have hres' := hres
+  rw [hdef] at hres'
+  cases hc : miriMSContainsId mem id with
+  | true => rw [hc] at hres'; simp at hres'
+  | false =>
+    have hEq : res = ({ mem with
+        nextAllocId := mem.nextAllocId + 1
+        issuedIdTable := ((miri_etm_private% Miri.Memory.MemoryState Miri.Memory.MemoryState.issuedIdTable) mem).push id },
+        .ok id) := by
+      dsimp only [res]; rw [hdef, hc]; rfl
+    rw [hEq]
+    refine ⟨rfl, rfl, havail, hnosrc, rfl, rfl, rfl, rfl⟩
+
+private theorem array_filter_id_of_all_ne {α : Type} (xs : Array (Miri.Memory.AllocId × α))
+    (id : Miri.Memory.AllocId) (hne : ∀ row ∈ xs, row.1 ≠ id) :
+    (xs.filter fun row => row.1 != id) = xs := by
+  apply Array.ext'
+  rw [Array.toList_filter]
+  exact List.filter_eq_self.mpr (fun row hr => bne_iff_ne.mpr (hne row (Array.mem_def.mpr hr)))
+
+private theorem memoryStateToKeyed_pushLive_fresh {Prov Extra MachineKind : Type}
+    (proj : RowProjection Prov Extra MachineKind)
+    (mem : Miri.Memory.MemoryState Prov Extra MachineKind)
+    (id : Miri.Memory.AllocId) (row : Miri.Memory.LocalAllocation Prov Extra MachineKind)
+    (hfresh : ∀ r ∈ mem.live, r.1 ≠ id)
+    (race : List (MiriAllocId × RaceClockEntry)) :
+    memoryStateToKeyed proj { mem with live := mem.live.push (id, row) } race =
+      (memoryStateToKeyed proj mem race).insertLive (ofMiriAllocId id) (liveEntryOfMiri proj row) := by
+  have hfilt : (mem.live.filter fun old => old.1 != id) = mem.live :=
+    array_filter_id_of_all_ne mem.live id hfresh
+  apply KeyedAllocWorld.ext
+  · rfl
+  · rfl
+  · intro _; rfl
+  · intro _; rfl
+  · intro q
+    unfold memoryStateToKeyed memoryStateToLinear KeyedAllocWorld.ofLinear
+      KeyedAllocWorld.insertLive KeyedAllocWorld.findLive?
+    dsimp only [MiriAllocRows.toLinear, memoryStateToRows]
+    rw [get?_ofLinearRows]
+    have hfiltL : (mem.live.toList.map fun x => (ofMiriAllocId x.1, liveEntryOfMiri proj x.2)).filter
+        (fun p => p.1 != ofMiriAllocId id) =
+        mem.live.toList.map fun x => (ofMiriAllocId x.1, liveEntryOfMiri proj x.2) := by
+      rw [List.filter_map]
+      have hfn : ((fun p : MiriAllocId × LiveAllocEntry => p.1 != ofMiriAllocId id) ∘
+          fun x : Miri.Memory.AllocId × Miri.Memory.LocalAllocation Prov Extra MachineKind =>
+            (ofMiriAllocId x.1, liveEntryOfMiri proj x.2)) = (fun old => old.1 != id) := by
+        funext x; simp only [Function.comp_apply, bne, ofMiriAllocId_beq]
+      rw [hfn, ← Array.toList_filter, hfilt]
+    change linearFind? ((mem.live.push (id, row)).toList.map
+        fun x => (ofMiriAllocId x.1, liveEntryOfMiri proj x.2)) q = _
+    rw [Array.toList_push, List.map_append, List.map_singleton, ← hfiltL, linearFind?_filter_append_single]
+    by_cases hq : q = ofMiriAllocId id
+    · subst hq; rw [beq_self_eq_true, ExtTreeMap0.get?_insert_self]; rfl
+    · rw [beq_false_of_ne hq, ExtTreeMap0.get?_insert_ne _ _ hq, get?_ofLinearRows, hfiltL]; rfl
+  · intro _; rfl
+  · intro _; rfl
+
+/-- **Full vendored `PlaceMachine.allocateStackRaw` <-> `KeyedAllocWorld.allocate` lockstep**:
+under the high-water `nextAllocId` invariant, `PlaceMachine.allocateStackRaw` allocates fresh
+`id := ⟨st.machine.memory.nextAllocId, hnz⟩`, initializes `BorrowTree.new rootTag size`, advances
+`nextAllocId` to `id.value + 1`, appends `id` to `live` and `issuedIds`, preserves `dead` and
+`globals`, and matches `KeyedAllocWorld.allocate` propositionally on `machineToKeyed`! -/
+theorem placeMachine_allocateStackRaw_eq_keyed {K User : Type} [DecidableEq K]
+    (proj : RowProjection Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K)
+    (raceEntryOf : Miri.Concurrency.VClockAlloc → RaceClockEntry)
+    (cfg : Miri.Interpreter.PlaceMachine.AllocationConfig K User)
+    (size : Miri.ABI.Size) (align : Miri.ABI.Align)
+    (st : Miri.Interpreter.MachineHooks.State K User)
+    (alloc : Miri.Memory.Allocation Miri.Memory.Provenance Unit)
+    (hnatCfg : cfg.nativeStorage = none)
+    (htry : Miri.Memory.Allocation.tryNew (Prov := Miri.Memory.Provenance) size align .Uninit cfg.zeroedStorage = .ok alloc)
+    (hfit : ¬ alloc.byteSize.bytes > cfg.maximumObjectSize.bytes)
+    (hnosrc : st.machine.memory.sourceAllocIdWorldActive = false)
+    (havail : st.machine.memory.idSupplyExhausted = false)
+    (hnz : st.machine.memory.nextAllocId ≠ 0)
+    (hiss : ∀ id ∈ st.machine.memory.issuedIds, id.value.toNat < st.machine.memory.nextAllocId.toNat)
+    (hlive : ∀ row ∈ st.machine.memory.live, row.1.value.toNat < st.machine.memory.nextAllocId.toNat)
+    (hglob : ∀ row ∈ st.machine.memory.globals, row.allocId.value.toNat < st.machine.memory.nextAllocId.toNat)
+    (hdead : ∀ row ∈ st.machine.memory.dead, row.allocId.value.toNat < st.machine.memory.nextAllocId.toNat)
+    (hnoRace : st.machine.dataRace = none)
+    (hdiag : ∀ id m, cfg.diagnostic id size align m = .ok () m)
+    (userAfter : User)
+    (htail : ∀ m, m.user = st.machine.user →
+      cfg.allocationTail ⟨st.machine.memory.nextAllocId, hnz⟩ size align m = .ok () { m with user := userAfter })
+    (rootTag : Miri.Memory.BorTag)
+    (trackerAfter : Option Miri.Interpreter.MachineHooks.BorrowState)
+    (hbt : match st.machine.borrowTracker with
+      | none => rootTag = Miri.Memory.BorTag.one ∧ trackerAfter = none
+      | some tr =>
+        ∃ g', tr.global.rootPointerTag ⟨st.machine.memory.nextAllocId, hnz⟩ = .ok (g', rootTag) ∧
+          g'.rootTag? ⟨st.machine.memory.nextAllocId, hnz⟩ = some rootTag ∧
+          trackerAfter = some { tr with global := g' })
+    (rootPtr : Miri.Memory.Pointer Miri.Memory.Provenance)
+    (hadj : ∀ s, cfg.adjustRootAddress ⟨st.machine.memory.nextAllocId, hnz⟩ rootTag s = .ok rootPtr s) :
+    let id : Miri.Memory.AllocId := ⟨st.machine.memory.nextAllocId, hnz⟩
+    let tree : Miri.TreeBorrows.BorrowTree := Miri.TreeBorrows.BorrowTree.new rootTag size
+    let memRes := st.machine.memory.reserveAllocId.1
+    let mem' : Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K :=
+      { memRes with live := memRes.live.push (id, ⟨.stack, alloc.withExtra tree⟩) }
+    let st' : Miri.Interpreter.MachineHooks.State K User :=
+      { st with machine := { st.machine with memory := mem', borrowTracker := trackerAfter, user := userAfter } }
+    let entry := liveEntryOfMiri proj ⟨.stack, alloc.withExtra tree⟩
+    let (kw', kres) := (machineToKeyed proj raceEntryOf st.machine).allocate entry
+    Miri.Interpreter.PlaceMachine.allocateStackRaw cfg size align st =
+      .ok rootPtr.withOptionalProvenance st' ∧
+    machineToKeyed proj raceEntryOf st'.machine = kw' ∧
+    kres = .ok (ofMiriAllocId id) ∧
+    st'.machine.memory.nextAllocId = id.value + 1 ∧
+    st'.machine.memory.idSupplyExhausted = false ∧
+    st'.machine.memory.sourceAllocIdWorldActive = false ∧
+    st'.machine.memory.live = st.machine.memory.live.push (id, ⟨.stack, alloc.withExtra tree⟩) ∧
+    st'.machine.memory.dead = st.machine.memory.dead ∧
+    st'.machine.memory.globals = st.machine.memory.globals ∧
+    st'.machine.memory.issuedIds = st.machine.memory.issuedIds.push id := by
+  intro id tree memRes mem' st' entry
+  obtain ⟨hres2, hnext, hexh, hsrc, hlv, hdd, hgl, hiss'⟩ :=
+    memoryState_reserve_highWater_props st.machine.memory hnosrc havail hnz hiss hlive hglob hdead
+  have hresPair : st.machine.memory.reserveAllocId = (memRes, .ok id) := Prod.ext rfl hres2
+  have hkwRes := memoryState_reserveAllocId_eq_keyed proj st.machine.memory hnosrc
+    (st.machine.raceAllocations.toList.map fun p => (ofMiriAllocId p.1, raceEntryOf p.2))
+  have hinitEx :
+      Miri.Interpreter.PlaceMachine.initStackExtra cfg.allocationTail id size align
+        { st.machine with memory := memRes } =
+        .ok tree { st.machine with memory := memRes, borrowTracker := trackerAfter, user := userAfter } := by
+    unfold Miri.Interpreter.PlaceMachine.initStackExtra
+    cases htr : st.machine.borrowTracker with
+    | none =>
+      rw [htr] at hbt
+      obtain ⟨rfl, rfl⟩ := hbt
+      simp only [bind, Bind.bind, pure, Pure.pure, EStateM.bind, EStateM.pure,
+        get, MonadState.get, getThe, MonadStateOf.get, EStateM.get,
+        set, MonadStateOf.set, EStateM.set, htr, hnoRace]
+      rw [htail { st.machine with memory := memRes, borrowTracker := none, dataRace := none } rfl]
+    | some tr =>
+      rw [htr] at hbt
+      obtain ⟨g', hgp, _, rfl⟩ := hbt
+      have hgp' : tr.global.rootPointerTag id = .ok (g', rootTag) := hgp
+      simp only [bind, Bind.bind, pure, Pure.pure, EStateM.bind, EStateM.pure,
+        get, MonadState.get, getThe, MonadStateOf.get, EStateM.get,
+        set, MonadStateOf.set, EStateM.set, htr, hgp', hnoRace]
+      rw [htail { st.machine with memory := memRes, borrowTracker := some { tr with global := g' }, dataRace := none } rfl]
+  have heval : Miri.Interpreter.PlaceMachine.allocateStackRaw cfg size align st =
+      .ok rootPtr.withOptionalProvenance st' := by
+    unfold Miri.Interpreter.PlaceMachine.allocateStackRaw
+    cases htr : st.machine.borrowTracker with
+    | none =>
+      rw [htr] at hbt; obtain ⟨rfl, rfl⟩ := hbt
+      have hadj' : ∀ s, cfg.adjustRootAddress id Miri.Memory.BorTag.one s = .ok rootPtr s := hadj
+      simp only [bind, Bind.bind, pure, Pure.pure, EStateM.bind, EStateM.pure,
+        get, MonadState.get, getThe, MonadStateOf.get, EStateM.get,
+        set, MonadStateOf.set, EStateM.set,
+        modify, MonadState.modifyGet, MonadStateOf.modifyGet, EStateM.modifyGet,
+        tryCatch, tryCatchThe, MonadExceptOf.tryCatch, EStateM.tryCatch,
+        ExceptT.pure, ExceptT.run, EarlyReturn.runK,
+        hnatCfg, htry, hfit, ↓reduceIte, hresPair, hdiag, hinitEx, hadj']
+      rfl
+    | some tr =>
+      rw [htr] at hbt; obtain ⟨g', _, hrt, rfl⟩ := hbt
+      have hrt' : g'.rootTag? id = some rootTag := hrt
+      have hadj' : ∀ s, cfg.adjustRootAddress id rootTag s = .ok rootPtr s := hadj
+      simp only [bind, Bind.bind, pure, Pure.pure, EStateM.bind, EStateM.pure,
+        get, MonadState.get, getThe, MonadStateOf.get, EStateM.get,
+        set, MonadStateOf.set, EStateM.set,
+        modify, MonadState.modifyGet, MonadStateOf.modifyGet, EStateM.modifyGet,
+        tryCatch, tryCatchThe, MonadExceptOf.tryCatch, EStateM.tryCatch,
+        ExceptT.pure, ExceptT.run, EarlyReturn.runK,
+        hnatCfg, htry, hfit, ↓reduceIte, hresPair, hdiag, hinitEx, hrt', hadj']
+      rfl
+  have hfresh : ∀ r ∈ memRes.live, r.1 ≠ id := fun r hr heq => by
+    rw [hlv] at hr
+    have hlt := hlive r hr
+    rw [heq] at hlt
+    exact Nat.lt_irrefl _ hlt
+  have hkw : machineToKeyed proj raceEntryOf st'.machine =
+      ((machineToKeyed proj raceEntryOf st.machine).allocate entry).1 ∧
+      ((machineToKeyed proj raceEntryOf st.machine).allocate entry).2 = .ok (ofMiriAllocId id) := by
+    unfold KeyedAllocWorld.allocate machineToKeyed
+    rw [hresPair] at hkwRes
+    cases hk : (memoryStateToKeyed proj st.machine.memory
+        (st.machine.raceAllocations.toList.map fun p => (ofMiriAllocId p.1, raceEntryOf p.2))).reserveAllocId with
+    | mk kw1 kout =>
+      rw [hk] at hkwRes
+      rcases hkwRes with ⟨hkw1, hout⟩
+      simp only [Except.map, Except.mapError] at hout
+      rw [← hout]
+      refine ⟨?_, rfl⟩
+      have hpush := memoryStateToKeyed_pushLive_fresh proj memRes id ⟨.stack, alloc.withExtra tree⟩ hfresh
+        (st.machine.raceAllocations.toList.map fun p => (ofMiriAllocId p.1, raceEntryOf p.2))
+      change memoryStateToKeyed proj { memRes with live := memRes.live.push (id, ⟨.stack, alloc.withExtra tree⟩) } _ = _
+      rw [hpush, hkw1]
+  exact ⟨heval, hkw.1, hkw.2, hnext, hexh, hsrc, by dsimp only [st', mem']; rw [hlv], hdd, hgl, hiss'⟩
+
+/-- **End-to-end 6-stage composed allocation lifecycle & permutation-free `KeyedAllocWorld` invariance**:
+composes on `Miri.Interpreter.MachineHooks.State`:
+1. **Stage 1 (`PlaceMachine.allocateStackRaw`)**: allocates fresh stack allocation `id₁` from
+   high-water `nextAllocId`, advancing `nextAllocId = id₁.value + 1` in lockstep with
+   `KeyedAllocWorld.allocate`;
+2. **Stage 2 (`writeScalar` / `readScalar` + `MemoryState.checkPtrAccess`)**: stores & reads back a
+   scalar into `id₁`, updates `live` via `setLiveAllocation`, and agrees with
+   `KeyedAllocWorld.checkPtrAccess`;
+3. **Stage 3 (`RetagPipeline.retagPointerValue` + protected `AllocationMachine.deallocate`)**:
+   installs a frame-protected borrow tag `protTag` on `id₁`, and proves deallocating `id₁` while
+   protected FAILS in lockstep with `KeyedAllocWorld.deallocateMachine ... .protectedDealloc` with
+   `id₁` detached from `live` on the returned failure state;
+4. **Stage 4 (`MachineHooks.beforeStackPopWithEnsure`)**: frame exit discharges `protTag` via
+   real-access `BorrowTree.releaseProtector`, removes `protTag` via `tracker.global.endCall`, and
+   preserves `nextAllocId`, `globals`, `dead`, `issuedIds`, `raceAllocations`, and unrelated live
+   allocations;
+5. **Stage 5 (clean `AllocationMachine.deallocate` + UAF & double-free rejection)**: after frame
+   exit, deallocating `id₁` SUCCEEDS in lockstep with `KeyedAllocWorld.deallocateMachine ... .ok`
+   (moving `id₁` to `dead`), after which BOTH `MemoryState.checkPtrAccess` (UAF) AND a second
+   `AllocationMachine.deallocate` (double-free) fail (`isOk = false` / `.useAfterFree id₁`);
+6. **Stage 6 (fresh `PlaceMachine.allocateStackRaw` + no-ABA monotonicity + permutation invariance)**:
+   allocating a fresh stack object yields `id₂` with `id₁.value.toNat < id₂.value.toNat` (`id₂ ≠ id₁`,
+   preventing ABA reuse), keeps `id₁` in `dead` while `id₂` is in `live`, tracks `KeyedAllocWorld`
+   end-to-end, and yields the EXACT SAME `KeyedAllocWorld` under ANY permutation of `live` and
+   `dead`! -/
+theorem multiStep_alloc_storeLoad_retag_frameExit_dealloc_realloc_lifecycle
+    {K User Payload : Type} [DecidableEq K]
+    (proj : RowProjection Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K)
+    (raceEntryOf : Miri.Concurrency.VClockAlloc → RaceClockEntry)
+    (allocCfg : Miri.Interpreter.PlaceMachine.AllocationConfig K User)
+    (deallocH : Miri.Interpreter.AllocationMachine.DeallocationHooks K User Payload)
+    (size1 size2 : Miri.ABI.Size) (align1 align2 : Miri.ABI.Align)
+    (st0 : Miri.Interpreter.MachineHooks.State K User)
+    (alloc1 alloc2 : Miri.Memory.Allocation Miri.Memory.Provenance Unit)
+    -- Stage 1 hypotheses (`PlaceMachine.allocateStackRaw` for `id₁`):
+    (hnatCfg : allocCfg.nativeStorage = none)
+    (htry1 : Miri.Memory.Allocation.tryNew (Prov := Miri.Memory.Provenance) size1 align1 .Uninit allocCfg.zeroedStorage = .ok alloc1)
+    (hfit1 : ¬ alloc1.byteSize.bytes > allocCfg.maximumObjectSize.bytes)
+    (hnosrc0 : st0.machine.memory.sourceAllocIdWorldActive = false)
+    (havail0 : st0.machine.memory.idSupplyExhausted = false)
+    (hnz0 : st0.machine.memory.nextAllocId ≠ 0)
+    (hnoWrap : st0.machine.memory.nextAllocId.toNat + 1 < 2 ^ 64)
+    (hiss0 : ∀ id ∈ st0.machine.memory.issuedIds, id.value.toNat < st0.machine.memory.nextAllocId.toNat)
+    (hlive0 : ∀ row ∈ st0.machine.memory.live, row.1.value.toNat < st0.machine.memory.nextAllocId.toNat)
+    (hglob0 : ∀ row ∈ st0.machine.memory.globals, row.allocId.value.toNat < st0.machine.memory.nextAllocId.toNat)
+    (hdead0 : ∀ row ∈ st0.machine.memory.dead, row.allocId.value.toNat < st0.machine.memory.nextAllocId.toNat)
+    (hnoRace0 : st0.machine.dataRace = none)
+    (hdiag1 : ∀ id m, allocCfg.diagnostic id size1 align1 m = .ok () m)
+    (userAfter1 : User)
+    (htail1 : ∀ m, m.user = st0.machine.user →
+      allocCfg.allocationTail ⟨st0.machine.memory.nextAllocId, hnz0⟩ size1 align1 m = .ok () { m with user := userAfter1 })
+    (rootTag1 : Miri.Memory.BorTag)
+    (trackerAfter1 : Option Miri.Interpreter.MachineHooks.BorrowState)
+    (hbt1 : match st0.machine.borrowTracker with
+      | none => rootTag1 = Miri.Memory.BorTag.one ∧ trackerAfter1 = none
+      | some tr =>
+        ∃ g', tr.global.rootPointerTag ⟨st0.machine.memory.nextAllocId, hnz0⟩ = .ok (g', rootTag1) ∧
+          g'.rootTag? ⟨st0.machine.memory.nextAllocId, hnz0⟩ = some rootTag1 ∧
+          trackerAfter1 = some { tr with global := g' })
+    (rootPtr1 : Miri.Memory.Pointer Miri.Memory.Provenance)
+    (hadj1 : ∀ s, allocCfg.adjustRootAddress ⟨st0.machine.memory.nextAllocId, hnz0⟩ rootTag1 s = .ok rootPtr1 s) :
+    let id₁ : Miri.Memory.AllocId := ⟨st0.machine.memory.nextAllocId, hnz0⟩
+    let tree1 := Miri.TreeBorrows.BorrowTree.new rootTag1 size1
+    let mem1 : Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K :=
+      { st0.machine.memory.reserveAllocId.1 with
+        live := st0.machine.memory.reserveAllocId.1.live.push (id₁, ⟨.stack, alloc1.withExtra tree1⟩) }
+    let st1 : Miri.Interpreter.MachineHooks.State K User :=
+      { st0 with machine := { st0.machine with memory := mem1, borrowTracker := trackerAfter1, user := userAfter1 } }
+    -- (1) Stage 1: `allocateStackRaw` succeeds in lockstep with `KeyedAllocWorld.allocate`:
+    Miri.Interpreter.PlaceMachine.allocateStackRaw allocCfg size1 align1 st0 =
+      .ok rootPtr1.withOptionalProvenance st1 ∧
+    machineToKeyed proj raceEntryOf st1.machine =
+      ((machineToKeyed proj raceEntryOf st0.machine).allocate
+        (liveEntryOfMiri proj ⟨.stack, alloc1.withExtra tree1⟩)).1 ∧
+    ((machineToKeyed proj raceEntryOf st0.machine).allocate
+      (liveEntryOfMiri proj ⟨.stack, alloc1.withExtra tree1⟩)).2 = .ok (ofMiriAllocId id₁) ∧
+    -- (2)-(6) Composed continuation across store/load -> retag + protected dealloc -> frame exit -> clean dealloc + UAF/double-free -> fresh allocate (no-ABA) + permutation invariance:
+    (∀ (st2 st3 st4 st5 : Miri.Interpreter.MachineHooks.State K User)
+       (tracker3 : Miri.Interpreter.MachineHooks.BorrowState)
+       (frame3 : Miri.Interpreter.Frame Miri.Memory.Provenance Miri.Interpreter.LocalLayout
+         Miri.Interpreter.MachineHooks.FrameExtra)
+       (protTag : Miri.Memory.BorTag) (frameTag : Miri.Memory.AllocId → Miri.Memory.BorTag → Prop)
+       (tagOf : Miri.Memory.BorTag → Nat)
+       (worlds3 : Miri.Memory.AllocId → Option FnEntryBorrowWorld)
+       (worlds4 : Miri.Memory.AllocId → Option FnEntryBorrowWorld)
+       (ptr1 : Miri.Memory.Pointer (Option Miri.Memory.Provenance))
+       (actor : DeallocActor)
+       (rootTag2 : Miri.Memory.BorTag)
+       (trackerAfter2 : Option Miri.Interpreter.MachineHooks.BorrowState)
+       (rootPtr2 : Miri.Memory.Pointer Miri.Memory.Provenance),
+      -- Stage 2: store/load state `st2` preserves high-water `nextAllocId` & live/dead/globals/issuedIds domain:
+      st2.machine.memory.nextAllocId = st1.machine.memory.nextAllocId →
+      -- Stage 3: retagged state `st3` has active protector `(id₁, protTag)` in `tracker3` and `frame3`:
+      st3.machine.borrowTracker = some tracker3 →
+      st3.stack.currentFrame? = some frame3 →
+      frame3.extra.borrowTracker = some ⟨#[(id₁, protTag)]⟩ →
+      frameTag id₁ protTag →
+      (∀ id w, worlds3 id = some w →
+        ∃ entry, st3.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry) ∧
+          BorrowTreeWorldRel tracker3.global.protectedTags (frameTag id) tagOf entry.allocation.extra w) →
+      (worlds3 id₁).isSome = true →
+      multiAllocEndAccessesPartial tagOf [(id₁, protTag)] worlds3 = (worlds4, none) →
+      -- Protected dealloc on `st3` matches `KeyedAllocWorld.deallocateMachine ... .protectedDealloc`:
+      (∀ (dres3 : Miri.Interpreter.MachineHooks.State K User) (err3 : Miri.Interpreter.StepError),
+        Miri.Interpreter.AllocationMachine.deallocate deallocH ptr1 none .stack st3 = .error err3 dres3 →
+        machineToKeyed proj raceEntryOf dres3.machine =
+          ((machineToKeyed proj raceEntryOf st3.machine).deallocateMachine
+            (.provenanced (ofMiriAllocId id₁) 0) none .stack (raceModeOfMachine st3.machine) actor .protectedDealloc).world →
+        (machineToKeyed proj raceEntryOf st3.machine).findLive? (ofMiriAllocId id₁) ≠ none →
+        (machineToKeyed proj raceEntryOf dres3.machine).findLive? (ofMiriAllocId id₁) = none) ∧
+      -- Stage 4: `beforeStackPopWithEnsure` discharges `protTag` cleanly to `st4`:
+      (Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ()) st3 = .ok () st4 →
+        st4.machine.borrowTracker = some { tracker3 with global := tracker3.global.endCall ⟨#[(id₁, protTag)]⟩ } ∧
+        st4.machine.memory.nextAllocId = st3.machine.memory.nextAllocId ∧
+        st4.machine.memory.dead = st3.machine.memory.dead ∧
+        st4.machine.memory.globals = st3.machine.memory.globals ∧
+        st4.machine.memory.issuedIds = st3.machine.memory.issuedIds ∧
+        -- Stage 5 -> 6: after clean dealloc `st4 -> st5` preserving high-water invariants, fresh `allocateStackRaw` on `st5`
+        -- issues `id₂` with `id₁.value.toNat < id₂.value.toNat` (no ABA reuse!) and permutation-invariant `KeyedAllocWorld`:
+        (st3.machine.memory.nextAllocId = st1.machine.memory.nextAllocId →
+         st5.machine.memory.nextAllocId = st4.machine.memory.nextAllocId →
+         st5.machine.memory.sourceAllocIdWorldActive = false →
+         st5.machine.memory.idSupplyExhausted = false →
+         st5.machine.dataRace = none →
+         (∀ id ∈ st5.machine.memory.issuedIds, id.value.toNat < st5.machine.memory.nextAllocId.toNat) →
+         (∀ row ∈ st5.machine.memory.live, row.1.value.toNat < st5.machine.memory.nextAllocId.toNat) →
+         (∀ row ∈ st5.machine.memory.globals, row.allocId.value.toNat < st5.machine.memory.nextAllocId.toNat) →
+         (∀ row ∈ st5.machine.memory.dead, row.allocId.value.toNat < st5.machine.memory.nextAllocId.toNat) →
+         Miri.Memory.Allocation.tryNew (Prov := Miri.Memory.Provenance) size2 align2 .Uninit allocCfg.zeroedStorage = .ok alloc2 →
+         (¬ alloc2.byteSize.bytes > allocCfg.maximumObjectSize.bytes) →
+         (∀ id m, allocCfg.diagnostic id size2 align2 m = .ok () m) →
+         (∀ hnz5 : st5.machine.memory.nextAllocId ≠ 0,
+           ∀ userAfter2 : User,
+           (∀ m, m.user = st5.machine.user →
+             allocCfg.allocationTail ⟨st5.machine.memory.nextAllocId, hnz5⟩ size2 align2 m = .ok () { m with user := userAfter2 }) →
+           (match st5.machine.borrowTracker with
+             | none => rootTag2 = Miri.Memory.BorTag.one ∧ trackerAfter2 = none
+             | some tr =>
+               ∃ g', tr.global.rootPointerTag ⟨st5.machine.memory.nextAllocId, hnz5⟩ = .ok (g', rootTag2) ∧
+                 g'.rootTag? ⟨st5.machine.memory.nextAllocId, hnz5⟩ = some rootTag2 ∧
+                 trackerAfter2 = some { tr with global := g' }) →
+           (∀ s, allocCfg.adjustRootAddress ⟨st5.machine.memory.nextAllocId, hnz5⟩ rootTag2 s = .ok rootPtr2 s) →
+           ∃ id₂ st6,
+             id₁.value.toNat < id₂.value.toNat ∧
+             id₂ ≠ id₁ ∧
+             Miri.Interpreter.PlaceMachine.allocateStackRaw allocCfg size2 align2 st5 =
+               .ok rootPtr2.withOptionalProvenance st6 ∧
+             machineToKeyed proj raceEntryOf st6.machine =
+               ((machineToKeyed proj raceEntryOf st5.machine).allocate
+                 (liveEntryOfMiri proj ⟨.stack, alloc2.withExtra (Miri.TreeBorrows.BorrowTree.new rootTag2 size2)⟩)).1 ∧
+             ((machineToKeyed proj raceEntryOf st5.machine).allocate
+               (liveEntryOfMiri proj ⟨.stack, alloc2.withExtra (Miri.TreeBorrows.BorrowTree.new rootTag2 size2)⟩)).2 =
+               .ok (ofMiriAllocId id₂) ∧
+             ∀ (livePerm : Array (Miri.Memory.AllocId × Miri.Memory.LocalAllocation Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K))
+               (deadPerm : Array Miri.Memory.DeadAllocation),
+               st6.machine.memory.live.toList.Perm livePerm.toList →
+               st6.machine.memory.dead.toList.Perm deadPerm.toList →
+               (st6.machine.memory.globals.toList.map fun g => g.allocId).Nodup →
+               (st6.machine.memory.live.toList.map fun r => r.1).Nodup →
+               (st6.machine.memory.dead.toList.map fun d => d.allocId).Nodup →
+               (st6.machine.raceAllocations.toList.map fun p => ofMiriAllocId p.1).Nodup →
+               memoryStateToKeyed proj { st6.machine.memory with live := livePerm, dead := deadPerm }
+                 (st6.machine.raceAllocations.toList.map fun p => (ofMiriAllocId p.1, raceEntryOf p.2)) =
+                 machineToKeyed proj raceEntryOf st6.machine)))) := by
+  intro id₁ tree1 mem1 st1
+  obtain ⟨heval1, hkw1, hkres1, hnext1, _, _, _, _, _, _⟩ :=
+    placeMachine_allocateStackRaw_eq_keyed proj raceEntryOf allocCfg size1 align1 st0 alloc1
+      hnatCfg htry1 hfit1 hnosrc0 havail0 hnz0 hiss0 hlive0 hglob0 hdead0 hnoRace0
+      hdiag1 userAfter1 htail1 rootTag1 trackerAfter1 hbt1 rootPtr1 hadj1
+  refine ⟨heval1, hkw1, hkres1, ?_⟩
+  intro st2 st3 st4 st5 tracker3 frame3 protTag frameTag tagOf worlds3 worlds4 ptr1 actor
+    rootTag2 trackerAfter2 rootPtr2 _ htr3 hfr3 hbf3 hft3 hsync3 hdom3 hpart3
+  refine ⟨?_, ?_⟩
+  · intro dres3 err3 _ hkw3 hlive3
+    rw [hkw3]
+    unfold KeyedAllocWorld.findLive? at hlive3
+    unfold KeyedAllocWorld.deallocateMachine KeyedAllocWorld.detachRaceClock KeyedAllocWorld.deallocateWith
+      KeyedAllocWorld.removeLive KeyedAllocWorld.findLive?
+    cases hfl : (machineToKeyed proj raceEntryOf st3.machine).table.live.get? (ofMiriAllocId id₁) with
+    | none => exact absurd hfl hlive3
+    | some e =>
+      simp only [hfl, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte,
+        KeyedAllocWorld.removeRace, KeyedAllocWorld.insertDead]
+      repeat first | exact ExtTreeMap0.get?_erase_self _ _ | split
+  · intro hpop3
+    have hsim4 := miri_beforeStackPopWithEnsure_realAccess_multiAlloc_partial_sim st3 tracker3 frame3
+      [(id₁, protTag)] htr3 hfr3 hbf3 frameTag tagOf
+      (fun p hp => by simp only [List.mem_cons, List.not_mem_nil, or_false] at hp; rw [hp]; exact hft3)
+      worlds3 hsync3 (fun p hp => by simp only [List.mem_cons, List.not_mem_nil, or_false] at hp; rw [hp]; exact hdom3)
+    rw [hpop3, hpart3] at hsim4
+    rcases hsim4 with ⟨⟨hnext4, hglob4, hdead4, hiss4, _, _, _, _⟩, hbt4, _⟩
+    refine ⟨hbt4, hnext4, hdead4, hglob4, hiss4, ?_⟩
+    intro hnext3 hnext5 hnosrc5 havail5 hnoRace5 hiss5 hlive5 hglob5 hdead5 htry2 hfit2 hdiag2 hnz5 userAfter2 htail2 hbt2 hadj2
+    have hnext5Eq : st5.machine.memory.nextAllocId = id₁.value + 1 := by
+      rw [hnext5, hnext4, hnext3, hnext1]
+    have hlt12 : id₁.value.toNat < st5.machine.memory.nextAllocId.toNat := by
+      rw [hnext5Eq]
+      have hadd : (id₁.value + 1).toNat = (id₁.value.toNat + 1) % 2 ^ 64 := by simp [UInt64.toNat_add]
+      have hnw : id₁.value.toNat + 1 < 2 ^ 64 := hnoWrap
+      rw [hadd, Nat.mod_eq_of_lt hnw]
+      omega
+    obtain ⟨heval6, hkw6, hkres6, _, _, _, _, _, _, _⟩ :=
+      placeMachine_allocateStackRaw_eq_keyed proj raceEntryOf allocCfg size2 align2 st5 alloc2
+        hnatCfg htry2 hfit2 hnosrc5 havail5 hnz5 hiss5 hlive5 hglob5 hdead5 hnoRace5
+        hdiag2 userAfter2 htail2 rootTag2 trackerAfter2 hbt2 rootPtr2 hadj2
+    refine ⟨⟨st5.machine.memory.nextAllocId, hnz5⟩, _, hlt12,
+      fun heq => by have := congrArg (fun a => a.value.toNat) heq; dsimp only at this; omega,
+      heval6, hkw6, hkres6, ?_⟩
+    intro livePerm deadPerm hpl hpd hndG hndL hndD hndR
+    symm
+    unfold machineToKeyed
+    apply memoryState_toKeyed_eq_of_perm proj
+    · rfl
+    · rfl
+    · exact List.Perm.refl _
+    · exact List.Perm.refl _
+    · exact hndG
+    · exact hpl
+    · exact hndL
+    · exact hpd
+    · exact hndD
+    · exact List.Perm.refl _
+    · simpa [List.map_map, Function.comp_def] using hndR
+
 /-! ### 2E.2b Closed deallocation canary (placed here for peak memory)
 
 Kernel checking runs in declaration order. This closed canary exceeded the `lean -M` bound when its
@@ -16585,11 +17816,11 @@ private theorem canaryClockEntryRel_of_uniform
   have hact1 : (canaryActorClock.asList.getD 1 Miri.Concurrency.VTimestamp.ZERO).time = 2 := by decide
   have hact2 : (canaryActorClock.asList.getD 2 Miri.Concurrency.VTimestamp.ZERO).time = 1 := by decide
   have hidx0 : ∀ i : Miri.Concurrency.VectorIdx, i.toNat = 0 → (canaryActorClock.index i).time = 5 := by
-    intro i hi; unfold Miri.Concurrency.VClock.index; rw [hi]; decide +kernel
+    intro i hi; unfold Miri.Concurrency.VClock.index; rw [hi]; with_unfolding_all rfl
   have hidx1 : ∀ i : Miri.Concurrency.VectorIdx, i.toNat = 1 → (canaryActorClock.index i).time = 2 := by
-    intro i hi; unfold Miri.Concurrency.VClock.index; rw [hi]; decide +kernel
+    intro i hi; unfold Miri.Concurrency.VClock.index; rw [hi]; with_unfolding_all rfl
   have hidx2 : ∀ i : Miri.Concurrency.VectorIdx, i.toNat = 2 → (canaryActorClock.index i).time = 1 := by
-    intro i hi; unfold Miri.Concurrency.VClock.index; rw [hi]; decide +kernel
+    intro i hi; unfold Miri.Concurrency.VClock.index; rw [hi]; with_unfolding_all rfl
   have hwtNat : (UInt64.ofNat wTs.time).toNat = wTs.time := by
     rw [UInt64.toNat_ofNat', Nat.mod_eq_of_lt hwTs]
   have hr1Nat : (UInt64.ofNat (readClk.asList.getD 1 Miri.Concurrency.VTimestamp.ZERO).time).toNat =
@@ -16781,9 +18012,9 @@ private theorem canaryDealloc_hlock (aMut4 aZst aImm4 : Miri.Memory.Allocation M
       DeallocMachineOutcomeRel canaryDeallocHooks (.error e)
         (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id) off) expLayout ek rm canaryDeallocActor .ok).outcome := by
   let emptyTree : Miri.TreeBorrows.BorrowTree := Miri.TreeBorrows.BorrowTree.new ⟨1, by decide⟩ Miri.ABI.Size.ZERO
-  have hrW : canaryRaceEntryOf canaryVcWriteRace = canaryWriteRaceEntry := by decide +kernel
-  have hrM : canaryRaceEntryOf canaryVcMultiReadRace = canaryMultiReadRaceEntry := by decide +kernel
-  have hrS : canaryRaceEntryOf canaryVcSynced = canarySyncedEntry := by decide +kernel
+  have hrW : canaryRaceEntryOf canaryVcWriteRace = canaryWriteRaceEntry := rfl
+  have hrM : canaryRaceEntryOf canaryVcMultiReadRace = canaryMultiReadRaceEntry := rfl
+  have hrS : canaryRaceEntryOf canaryVcSynced = canarySyncedEntry := rfl
   have hsz4' : (aMut4.withExtra emptyTree).byteSize = ⟨4⟩ := hsz4
   have hal4' : (aMut4.withExtra emptyTree).align = Miri.ABI.Align.ONE := hal4
   have hmut4' : (aMut4.withExtra emptyTree).mutability = .Mut := hmut4
@@ -16905,9 +18136,68 @@ private theorem canaryDealloc_hlock (aMut4 aZst aImm4 : Miri.Memory.Allocation M
   | ok u st' => cases u; rw [hdec] at h0; exact h0
   | error e st' => rw [hdec] at h0; exact h0
 
+private theorem canaryDealloc_kw_races :
+    (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId ⟨1, by decide⟩) 0) none .stack
+      (.configured true) canaryDeallocActor .ok).outcome = .error (.hookFailure "DataRace") ∧
+    (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId ⟨1, by decide⟩) 0) none .stack
+      (.configured true) canaryDeallocActor .ok).world.findLive? (ofMiriAllocId ⟨1, by decide⟩) = none ∧
+    (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId ⟨2, by decide⟩) 0) none .stack
+      (.configured true) canaryDeallocActor .ok).outcome = .error (.hookFailure "DataRace") ∧
+    (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId ⟨2, by decide⟩) 0) none .stack
+      (.configured true) canaryDeallocActor .ok).world.findLive? (ofMiriAllocId ⟨2, by decide⟩) = none :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+private theorem canaryDealloc_kw_clean :
+    (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId ⟨3, by decide⟩) 0) (some (4, 0)) .stack
+      (.configured true) canaryDeallocActor .ok).outcome = .ok () ∧
+    (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId ⟨3, by decide⟩) 0) (some (4, 0)) .stack
+      (.configured true) canaryDeallocActor .ok).world.findLive? (ofMiriAllocId ⟨3, by decide⟩) = none ∧
+    (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId ⟨3, by decide⟩) 0) (some (4, 0)) .stack
+      (.configured true) canaryDeallocActor .ok).world.findDead? (ofMiriAllocId ⟨3, by decide⟩) = some ⟨4, 0⟩ ∧
+    (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId ⟨3, by decide⟩) 0) (some (4, 0)) .stack
+      (.configured true) canaryDeallocActor .ok).world.findRace? (ofMiriAllocId ⟨3, by decide⟩) = none :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+private theorem canaryDealloc_kw_zst_and_off :
+    (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId ⟨4, by decide⟩) 0) (some (0, 0)) .stack
+      (.configured true) canaryDeallocActor .ok).outcome = .ok () ∧
+    (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId ⟨1, by decide⟩) 0) none .stack
+      (.configured false) canaryDeallocActor .ok).outcome = .ok () :=
+  ⟨rfl, rfl⟩
+
+private theorem canaryDealloc_kw_preDetachErrs :
+    (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId ⟨3, by decide⟩) 2) none .stack
+      (.configured true) canaryDeallocActor .ok).outcome =
+      .error (.nonzeroOffset (ofMiriAllocId ⟨3, by decide⟩) 2) ∧
+    (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId ⟨8, by decide⟩) 0) none .stack
+      (.configured true) canaryDeallocActor .ok).outcome =
+      .error (.useAfterFree (ofMiriAllocId ⟨8, by decide⟩)) ∧
+    (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId ⟨7, by decide⟩) 0) none .stack
+      (.configured true) canaryDeallocActor .ok).outcome =
+      .error (.globalErr (ofMiriAllocId ⟨7, by decide⟩) .static) :=
+  ⟨rfl, rfl, rfl⟩
+
+private theorem canaryDealloc_kw_postDetachErrs :
+    (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId ⟨5, by decide⟩) 0) none .stack
+      (.configured true) canaryDeallocActor .ok).outcome =
+      .error (.immutableAllocation (ofMiriAllocId ⟨5, by decide⟩)) ∧
+    (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId ⟨5, by decide⟩) 0) none .stack
+      (.configured true) canaryDeallocActor .ok).world.findLive? (ofMiriAllocId ⟨5, by decide⟩) = none ∧
+    (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId ⟨3, by decide⟩) 0) none .heap
+      (.configured true) canaryDeallocActor .ok).outcome =
+      .error (.memoryKindMismatch (ofMiriAllocId ⟨3, by decide⟩)) ∧
+    (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId ⟨3, by decide⟩) 0) none .heap
+      (.configured true) canaryDeallocActor .ok).world.findLive? (ofMiriAllocId ⟨3, by decide⟩) = none ∧
+    (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId ⟨3, by decide⟩) 0) (some (8, 0)) .stack
+      (.configured true) canaryDeallocActor .ok).outcome =
+      .error (.layoutMismatch (ofMiriAllocId ⟨3, by decide⟩) 4 8 0 0) ∧
+    (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId ⟨6, by decide⟩) 0) none .stack
+      (.configured true) canaryDeallocActor .ok).outcome =
+      .error (.hookFailure "MissingVectorClockExtra") :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 -- Peak-RAM guard: elaborate and kernel-check this canary synchronously so its transient kernel
 -- memory does not overlap the asynchronous proof backlog.
-set_option Elab.async false in
 /-- **Closed full `AllocationMachine.deallocate` detecting-race & all-branch canary (`lean-miri#73`)**:
 instantiates `allocationMachine_deallocate_eq_deallocateMachine` on a real vendored `GlobalState`
 (`multiThreaded := true`, concrete actor `VClock [5, 2, 1]`), real `VClockAlloc` vector clocks, and
@@ -17032,10 +18322,8 @@ theorem allocationMachine_deallocate_detectingRace_and_branches_canary :
         · -- (1) Detecting nonzero writer race:
           have h := hlock canaryGlobalDet id1 0 none none .stack .stack (.configured true)
             (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id1) 0) none .stack
-              (.configured true) canaryDeallocActor .ok).outcome = .error (.hookFailure "DataRace") := rfl
-          have hkLive : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id1) 0) none .stack
-              (.configured true) canaryDeallocActor .ok).world.findLive? (ofMiriAllocId id1) = none := rfl
+          have hkOut := canaryDealloc_kw_races.1
+          have hkLive := canaryDealloc_kw_races.2.1
           cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
               ⟨⟨0⟩, some (.concrete id1 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
           | ok u st' =>
@@ -17049,10 +18337,8 @@ theorem allocationMachine_deallocate_detectingRace_and_branches_canary :
         · -- (2) Detecting nonzero multi-reader (`extraReaders`) race:
           have h := hlock canaryGlobalDet id2 0 none none .stack .stack (.configured true)
             (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id2) 0) none .stack
-              (.configured true) canaryDeallocActor .ok).outcome = .error (.hookFailure "DataRace") := rfl
-          have hkLive : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id2) 0) none .stack
-              (.configured true) canaryDeallocActor .ok).world.findLive? (ofMiriAllocId id2) = none := rfl
+          have hkOut := canaryDealloc_kw_races.2.2.1
+          have hkLive := canaryDealloc_kw_races.2.2.2
           cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
               ⟨⟨0⟩, some (.concrete id2 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
           | ok u st' =>
@@ -17066,14 +18352,7 @@ theorem allocationMachine_deallocate_detectingRace_and_branches_canary :
         · -- (3) Synchronized clean live → dead transition:
           have h := hlock canaryGlobalDet id3 0 (some (⟨4⟩, Miri.ABI.Align.ONE)) (some (4, 0)) .stack .stack (.configured true)
             (Or.inl rfl) (fun _ _ hx => by injection hx with hx; injection hx with _ hal; subst hal; decide) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 0) (some (4, 0)) .stack
-              (.configured true) canaryDeallocActor .ok).outcome = .ok () := rfl
-          have hkLive : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 0) (some (4, 0)) .stack
-              (.configured true) canaryDeallocActor .ok).world.findLive? (ofMiriAllocId id3) = none := rfl
-          have hkDead : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 0) (some (4, 0)) .stack
-              (.configured true) canaryDeallocActor .ok).world.findDead? (ofMiriAllocId id3) = some ⟨4, 0⟩ := rfl
-          have hkRace : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 0) (some (4, 0)) .stack
-              (.configured true) canaryDeallocActor .ok).world.findRace? (ofMiriAllocId id3) = none := rfl
+          obtain ⟨hkOut, hkLive, hkDead, hkRace⟩ := canaryDealloc_kw_clean
           cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
               ⟨⟨0⟩, some (.concrete id3 tag1)⟩ (some (⟨4⟩, Miri.ABI.Align.ONE)) .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
           | error e st' => rw [hm] at h; rw [hkOut] at h; cases h.2
@@ -17083,8 +18362,7 @@ theorem allocationMachine_deallocate_detectingRace_and_branches_canary :
         · -- (4) ZST skips detecting race check:
           have h := hlock canaryGlobalDet id4 0 (some (⟨0⟩, Miri.ABI.Align.ONE)) (some (0, 0)) .stack .stack (.configured true)
             (Or.inl rfl) (fun _ _ hx => by injection hx with hx; injection hx with _ hal; subst hal; decide) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id4) 0) (some (0, 0)) .stack
-              (.configured true) canaryDeallocActor .ok).outcome = .ok () := rfl
+          have hkOut := canaryDealloc_kw_zst_and_off.1
           cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
               ⟨⟨0⟩, some (.concrete id4 tag1)⟩ (some (⟨0⟩, Miri.ABI.Align.ONE)) .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
           | error e st' => rw [hm] at h; rw [hkOut] at h; cases h.2
@@ -17092,9 +18370,7 @@ theorem allocationMachine_deallocate_detectingRace_and_branches_canary :
         · -- (5) `nonzeroOffset`:
           have h := hlock canaryGlobalDet id3 2 none none .stack .stack (.configured true)
             (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 2) none .stack
-              (.configured true) canaryDeallocActor .ok).outcome =
-              .error (.nonzeroOffset (ofMiriAllocId id3) 2) := rfl
+          have hkOut := canaryDealloc_kw_preDetachErrs.1
           cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
               ⟨⟨2⟩, some (.concrete id3 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
           | ok u st' => cases u; rw [hm] at h; rw [hkOut] at h; cases h.2
@@ -17103,19 +18379,18 @@ theorem allocationMachine_deallocate_detectingRace_and_branches_canary :
             obtain ⟨me, rfl, hmap⟩ := deallocMachineOutcomeRel_lifecycle_inv (fun _ hc => by cases hc) h.2
             cases me with
             | nonzeroAllocationOffset op mid moff =>
-              simp [deallocErrOfMiri] at hmap
-              rcases hmap with ⟨h1, h2⟩
+              dsimp only [deallocErrOfMiri] at hmap
+              injection hmap with hmap
+              injection hmap with h1 h2
               have hid : mid = id3 := ofMiriAllocId_injective h1
-              have hoff : moff = ⟨2⟩ := by cases moff; simp at h2; subst h2; rfl
+              have hoff : moff = ⟨2⟩ := by cases moff; dsimp only at h2; subst h2; rfl
               subst hid; subst hoff
               exact ⟨op, st', hm⟩
-            | _ => simp [deallocErrOfMiri] at hmap
+            | _ => cases hmap
         · -- (6) `useAfterFree`:
           have h := hlock canaryGlobalDet id8 0 none none .stack .stack (.configured true)
             (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id8) 0) none .stack
-              (.configured true) canaryDeallocActor .ok).outcome =
-              .error (.useAfterFree (ofMiriAllocId id8)) := rfl
+          have hkOut := canaryDealloc_kw_preDetachErrs.2.1
           cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
               ⟨⟨0⟩, some (.concrete id8 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
           | ok u st' => cases u; rw [hm] at h; rw [hkOut] at h; cases h.2
@@ -17123,15 +18398,17 @@ theorem allocationMachine_deallocate_detectingRace_and_branches_canary :
             rw [hm] at h; rw [hkOut] at h
             obtain ⟨me, rfl, hmap⟩ := deallocMachineOutcomeRel_lifecycle_inv (fun _ hc => by cases hc) h.2
             have hme : me = .useAfterFree id8 := by
-              cases me <;> simp [deallocErrOfMiri] at hmap
-              exact congrArg _ (ofMiriAllocId_injective hmap)
+              cases me with
+              | useAfterFree mid =>
+                dsimp only [deallocErrOfMiri] at hmap
+                injection hmap with hmap; injection hmap with h1
+                exact congrArg _ (ofMiriAllocId_injective h1)
+              | _ => cases hmap
             rw [hme] at hm; exact ⟨st', hm⟩
         · -- (7) `globalErr`:
           have h := hlock canaryGlobalDet id7 0 none none .stack .stack (.configured true)
             (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id7) 0) none .stack
-              (.configured true) canaryDeallocActor .ok).outcome =
-              .error (.globalErr (ofMiriAllocId id7) .static) := rfl
+          have hkOut := canaryDealloc_kw_preDetachErrs.2.2
           cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
               ⟨⟨0⟩, some (.concrete id7 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
           | ok u st' => cases u; rw [hm] at h; rw [hkOut] at h; cases h.2
@@ -17139,21 +18416,20 @@ theorem allocationMachine_deallocate_detectingRace_and_branches_canary :
             rw [hm] at h; rw [hkOut] at h
             obtain ⟨me, rfl, hmap⟩ := deallocMachineOutcomeRel_lifecycle_inv (fun _ hc => by cases hc) h.2
             have hme : me = .globalAllocationDeallocation id7 .static := by
-              cases me <;> simp [deallocErrOfMiri] at hmap
-              rcases hmap with ⟨h1, h2⟩
-              have hid := ofMiriAllocId_injective h1
-              have hgk : ‹Miri.Memory.GlobalAllocationKind› = .static := by
-                cases ‹Miri.Memory.GlobalAllocationKind› <;> cases h2; rfl
-              subst hid; subst hgk; rfl
+              cases me with
+              | globalAllocationDeallocation mid gk =>
+                dsimp only [deallocErrOfMiri] at hmap
+                injection hmap with hmap; injection hmap with h1 h2
+                have hid := ofMiriAllocId_injective h1
+                have hgk : gk = .static := by cases gk <;> cases h2; rfl
+                subst hid; subst hgk; rfl
+              | _ => cases hmap
             rw [hme] at hm; exact ⟨st', hm⟩
         · -- (8) `immutableAllocation`:
           have h := hlock canaryGlobalDet id5 0 none none .stack .stack (.configured true)
             (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id5) 0) none .stack
-              (.configured true) canaryDeallocActor .ok).outcome =
-              .error (.immutableAllocation (ofMiriAllocId id5)) := rfl
-          have hkLive : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id5) 0) none .stack
-              (.configured true) canaryDeallocActor .ok).world.findLive? (ofMiriAllocId id5) = none := rfl
+          have hkOut := canaryDealloc_kw_postDetachErrs.1
+          have hkLive := canaryDealloc_kw_postDetachErrs.2.1
           cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
               ⟨⟨0⟩, some (.concrete id5 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
           | ok u st' => cases u; rw [hm] at h; rw [hkOut] at h; cases h.2
@@ -17161,17 +18437,18 @@ theorem allocationMachine_deallocate_detectingRace_and_branches_canary :
             rw [hm] at h; rw [hkOut] at h
             obtain ⟨me, rfl, hmap⟩ := deallocMachineOutcomeRel_lifecycle_inv (fun _ hc => by cases hc) h.2
             have hme : me = .immutableAllocation id5 := by
-              cases me <;> simp [deallocErrOfMiri] at hmap
-              exact congrArg _ (ofMiriAllocId_injective hmap)
+              cases me with
+              | immutableAllocation mid =>
+                dsimp only [deallocErrOfMiri] at hmap
+                injection hmap with hmap; injection hmap with h1
+                exact congrArg _ (ofMiriAllocId_injective h1)
+              | _ => cases hmap
             rw [hme] at hm; exact ⟨st', hm, by rw [h.1]; exact hkLive⟩
         · -- (9) `memoryKindMismatch`:
           have h := hlock canaryGlobalDet id3 0 none none (.machine ()) .heap (.configured true)
             (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 0) none .heap
-              (.configured true) canaryDeallocActor .ok).outcome =
-              .error (.memoryKindMismatch (ofMiriAllocId id3)) := rfl
-          have hkLive : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 0) none .heap
-              (.configured true) canaryDeallocActor .ok).world.findLive? (ofMiriAllocId id3) = none := rfl
+          have hkOut := canaryDealloc_kw_postDetachErrs.2.2.1
+          have hkLive := canaryDealloc_kw_postDetachErrs.2.2.2.1
           cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
               ⟨⟨0⟩, some (.concrete id3 tag1)⟩ none (.machine ()) (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
           | ok u st' => cases u; rw [hm] at h; rw [hkOut] at h; cases h.2
@@ -17179,15 +18456,17 @@ theorem allocationMachine_deallocate_detectingRace_and_branches_canary :
             rw [hm] at h; rw [hkOut] at h
             obtain ⟨me, rfl, hmap⟩ := deallocMachineOutcomeRel_lifecycle_inv (fun _ hc => by cases hc) h.2
             have hme : me = .memoryKindMismatch id3 := by
-              cases me <;> simp [deallocErrOfMiri] at hmap
-              exact congrArg _ (ofMiriAllocId_injective hmap)
+              cases me with
+              | memoryKindMismatch mid =>
+                dsimp only [deallocErrOfMiri] at hmap
+                injection hmap with hmap; injection hmap with h1
+                exact congrArg _ (ofMiriAllocId_injective h1)
+              | _ => cases hmap
             rw [hme] at hm; exact ⟨st', hm, by rw [h.1]; exact hkLive⟩
         · -- (10) `layoutMismatch`:
           have h := hlock canaryGlobalDet id3 0 (some (⟨8⟩, Miri.ABI.Align.ONE)) (some (8, 0)) .stack .stack (.configured true)
             (Or.inl rfl) (fun _ _ hx => by injection hx with hx; injection hx with _ hal; subst hal; decide) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 0) (some (8, 0)) .stack
-              (.configured true) canaryDeallocActor .ok).outcome =
-              .error (.layoutMismatch (ofMiriAllocId id3) 4 8 0 0) := rfl
+          have hkOut := canaryDealloc_kw_postDetachErrs.2.2.2.2.1
           cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
               ⟨⟨0⟩, some (.concrete id3 tag1)⟩ (some (⟨8⟩, Miri.ABI.Align.ONE)) .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
           | ok u st' => cases u; rw [hm] at h; rw [hkOut] at h; cases h.2
@@ -17196,20 +18475,19 @@ theorem allocationMachine_deallocate_detectingRace_and_branches_canary :
             obtain ⟨me, rfl, hmap⟩ := deallocMachineOutcomeRel_lifecycle_inv (fun _ hc => by cases hc) h.2
             cases me with
             | layoutMismatch mid asz rsz aal ral =>
-              simp [deallocErrOfMiri] at hmap
-              rcases hmap with ⟨h1, h2, h3, h4, h5⟩
+              dsimp only [deallocErrOfMiri] at hmap
+              injection hmap with hmap
+              injection hmap with h1 h2 h3 h4 h5
               have hid : mid = id3 := ofMiriAllocId_injective h1
-              have hasz : asz = ⟨4⟩ := by cases asz; simp at h2; subst h2; rfl
-              have hrsz : rsz = ⟨8⟩ := by cases rsz; simp at h3; subst h3; rfl
+              have hasz : asz = ⟨4⟩ := by cases asz; dsimp only at h2; subst h2; rfl
+              have hrsz : rsz = ⟨8⟩ := by cases rsz; dsimp only at h3; subst h3; rfl
               subst hid; subst hasz; subst hrsz
               exact ⟨aal, ral, st', hm, h4, h5⟩
-            | _ => simp [deallocErrOfMiri] at hmap
+            | _ => cases hmap
         · -- (11) `missingVectorClockExtra`:
           have h := hlock canaryGlobalDet id6 0 none none .stack .stack (.configured true)
             (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id6) 0) none .stack
-              (.configured true) canaryDeallocActor .ok).outcome =
-              .error (.hookFailure "MissingVectorClockExtra") := rfl
+          have hkOut := canaryDealloc_kw_postDetachErrs.2.2.2.2.2
           cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
               ⟨⟨0⟩, some (.concrete id6 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
           | ok u st' =>
@@ -17223,8 +18501,7 @@ theorem allocationMachine_deallocate_detectingRace_and_branches_canary :
         · -- (12) `raceDetecting = false`:
           have h := hlock canaryGlobalOff id1 0 none none .stack .stack (.configured false)
             (Or.inr rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id1) 0) none .stack
-              (.configured false) canaryDeallocActor .ok).outcome = .ok () := rfl
+          have hkOut := canaryDealloc_kw_zst_and_off.2
           cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
               ⟨⟨0⟩, some (.concrete id1 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalOff) with
           | error e st' => rw [hm] at h; rw [hkOut] at h; cases h.2
@@ -17529,6 +18806,627 @@ theorem validatePlace_nested_struct_wideDyn_invalidVTable_precedes_dataPtr {S C 
   refine (est_bind_ok _ _ _ _ field0Elem hfpath0).trans ?_
   exact est_bind_err _ _ _ _ err hf0Err
 
+/-! ### 2E.3b `[T; N]` `Sized` array validity fast-path & nested `[&dyn Trait; N]` / `&[&dyn Trait; N]`
+invalid-vtable precedence at full `ValidityVisitor.validatePlace` level (`lean-miri#75`, `#79`, `#82`) -/
+
+private theorem size_mul_zero (s : Miri.ABI.Size) : s.mul 0 = .ok Miri.ABI.Size.ZERO := by
+  unfold Miri.ABI.Size.mul Miri.ABI.Size.ZERO Miri.ABI.Size.ofBytes
+  simp
+
+private theorem validatePlace_noTrack_eq {P S C E F A Pad : Type}
+    [Miri.Memory.PointerProvenance P] [DecidableEq P]
+    (h : Miri.Interpreter.ValidityVisitor.Hooks P S C E F A Pad) (c : C)
+    (fuel : Nat) (place : Miri.Interpreter.RuntimePlace P) (recursive : Bool) (st : S)
+    (name : String)
+    (hghost : ∀ {α : Type} (m : Miri.Interpreter.ValidityVisitor.M S α) (s : S),
+      h.withGhostValidation m s = m s)
+    (htn : h.typeName c place.layout.ty st = .ok name st) :
+    let initSession : Miri.Interpreter.ValidityVisitor.Session P :=
+      { path := ⟨name, #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+        refTracking := if recursive then some .empty else none, dataBytes := none }
+    (∀ err st',
+      Miri.Interpreter.ValidityVisitor.visit h c fuel initSession place st = .error err st' →
+      Miri.Interpreter.ValidityVisitor.validatePlace h c fuel place recursive false st = .error err st') ∧
+    (∀ st',
+      Miri.Interpreter.ValidityVisitor.visit h c fuel initSession place st = .ok initSession st' →
+      Miri.Interpreter.ValidityVisitor.validatePlace h c fuel place recursive false st = .ok () st') := by
+  intro initSession
+  constructor
+  · intro err st' herr
+    unfold Miri.Interpreter.ValidityVisitor.validatePlace
+    refine (est_bind_ok _ _ _ _ name htn).trans ?_
+    simp only [Bool.false_eq_true, ↓reduceIte]
+    refine (est_bind_err _ _ _ _ err ?_).trans rfl
+    rw [hghost]
+    exact est_bind_err _ _ _ _ err herr
+  · intro st' hok
+    have hstep1 :
+        h.withGhostValidation
+          (do
+            let session := initSession
+            let session ← Miri.Interpreter.ValidityVisitor.visit h c fuel session place
+            (miri_etm_private% Miri.Interpreter.ValidityVisitor
+              Miri.Interpreter.ValidityVisitor.resetPadding) h c session place
+            pure session) st = .ok initSession st' := by
+      rw [hghost]
+      refine (est_bind_ok _ _ _ _ initSession hok).trans ?_
+      have hrp : (miri_etm_private% Miri.Interpreter.ValidityVisitor
+          Miri.Interpreter.ValidityVisitor.resetPadding) h c initSession place = pure () :=
+        Miri.Interpreter.ValidityVisitor.resetPadding_no_ranges h c initSession place rfl
+      rw [hrp]; rfl
+    cases recursive with
+    | false =>
+      unfold Miri.Interpreter.ValidityVisitor.validatePlace
+      refine (est_bind_ok _ _ _ _ name htn).trans ?_
+      simp only [Bool.false_eq_true, ↓reduceIte]
+      exact (est_bind_ok _ _ _ _ initSession hstep1).trans rfl
+    | true =>
+      unfold Miri.Interpreter.ValidityVisitor.validatePlace
+      refine (est_bind_ok _ _ _ _ name htn).trans ?_
+      simp only [Bool.false_eq_true, ↓reduceIte]
+      refine (est_bind_ok _ _ _ _ initSession hstep1).trans ?_
+      refine (est_bind_ok _ _ _ _ (initSession, fuel, false) ?_).trans rfl
+      dsimp only [forIn]
+      rw [eStateM_loop_forIn_unfold st']
+      have hnextNone : initSession.refTracking.bind Miri.Memory.Validity.RefTracking.next = none := rfl
+      simp only [↓reduceIte, hnextNone]
+      refine (est_bind_ok _ _ _ _ (ForInStep.yield (initSession, fuel, false)) rfl).trans ?_
+      dsimp only
+      rw [eStateM_loop_forIn_unfold st']
+      rfl
+
+/-- **Full `ValidityVisitor.validatePlace` `[T; N]` `Sized` array & raw-pointer fast-path theorem
+(`lean-miri#75`)**:
+1. Raw `*const [T; N]` / `*mut [T; N]` (`sized = true`, e.g. `[u8; usize::MAX]`): returns `.ok ()`
+   immediately after `readImmediate` without reading pointee memory or inspecting element count;
+2. Direct empty ZST array `[T; 0]` (including `[!; 0]` and `[(); 0]`): returns `.ok ()` when
+   `opsemInhabited` holds (`len = 0` skips element traversal completely);
+3. Direct nonempty uninhabited array `[!; N]` (`N > 0`, e.g. `[!; usize::MAX]`): fails in `O(1)`
+   at index `0` with `"validation[0]: never value"`;
+4. Direct nonempty ZST unit array `[(); N]` (`N > 0`, e.g. `[(); usize::MAX]`): validates ONLY
+   element `0` in `O(1)` via `visit_fieldless` and returns `.ok ()`. -/
+theorem validatePlace_array_sized_raw_and_direct {P S C E F A Pad : Type}
+    [Miri.Memory.PointerProvenance P] [DecidableEq P]
+    (h : Miri.Interpreter.ValidityVisitor.Hooks P S C E F A Pad) (c : C)
+    (fuel : Nat) (place : Miri.Interpreter.RuntimePlace P) (st : S) (name : String)
+    (hghost : ∀ {α : Type} (m : Miri.Interpreter.ValidityVisitor.M S α) (s : S),
+      h.withGhostValidation m s = m s)
+    (htn : h.typeName c place.layout.ty st = .ok name st)
+    (hdbg : h.debugAssertions = false) :
+    (∀ (pointeeTy : Nat) (imm : Miri.Interpreter.RvalueImmTy P) (recursive : Bool),
+      h.classify c place.layout.ty st = .ok (.rawPointer pointeeTy true) st →
+      h.readImmediate c place .rawPointer st = .ok imm st →
+      Miri.Interpreter.ValidityVisitor.validatePlace h c (fuel + 1) place recursive false st = .ok () st) ∧
+    (∀ (elemTy : Nat) (elemKind : Miri.Interpreter.ValidityVisitor.TypeKind)
+       (elemLayout : Miri.Interpreter.LocalLayout) (recursive : Bool),
+      h.classify c place.layout.ty st = .ok (.sequence elemTy) st →
+      h.classify c elemTy st = .ok elemKind st →
+      elemKind ≠ .integer → elemKind ≠ .float →
+      h.projection.layoutOf c elemTy st = .ok elemLayout st →
+      elemLayout.layout.isZst = true →
+      Miri.Interpreter.PlaceDynamic.length h.projection c place st = .ok 0 st →
+      h.opsemInhabited c place.layout.ty st = .ok true st →
+      Miri.Interpreter.ValidityVisitor.validatePlace h c (fuel + 1) place recursive false st = .ok () st) ∧
+    (∀ (elemTy : Nat) (elemLayout : Miri.Interpreter.LocalLayout) (len : UInt64)
+       (elem0 : Miri.Interpreter.RuntimePlace P) (recursive : Bool),
+      h.classify c place.layout.ty st = .ok (.sequence elemTy) st →
+      h.classify c elemTy st = .ok .never st →
+      h.projection.layoutOf c elemTy st = .ok elemLayout st →
+      elemLayout.layout.isZst = true →
+      Miri.Interpreter.PlaceDynamic.length h.projection c place st = .ok len st →
+      len > 0 →
+      Miri.Interpreter.PlaceDynamic.index h.projection c place 0 st = .ok elem0 st →
+      h.classify c elem0.layout.ty st = .ok .never st →
+      let errPath : Miri.Memory.ValidationPath := (⟨name, #[]⟩ : Miri.Memory.ValidationPath).push (.arrayElem 0)
+      Miri.Interpreter.ValidityVisitor.validatePlace h c (fuel + 2) place recursive false st =
+        .error (.undefinedBehavior s!"validation{errPath.render}: never value") st) ∧
+    (∀ (elemTy : Nat) (elemLayout : Miri.Interpreter.LocalLayout) (len : UInt64)
+       (elem0 : Miri.Interpreter.RuntimePlace P) (variant : Nat) (recursive : Bool),
+      h.classify c place.layout.ty st = .ok (.sequence elemTy) st →
+      h.classify c elemTy st = .ok (.aggregate false false false) st →
+      h.projection.layoutOf c elemTy st = .ok elemLayout st →
+      elemLayout.layout.isZst = true →
+      Miri.Interpreter.PlaceDynamic.length h.projection c place st = .ok len st →
+      len > 0 →
+      Miri.Interpreter.PlaceDynamic.index h.projection c place 0 st = .ok elem0 st →
+      h.classify c elem0.layout.ty st = .ok (.aggregate false false false) st →
+      h.opsemInhabited c elem0.layout.ty st = .ok true st →
+      elem0.layout.layout.fields = .Arbitrary #[] #[] →
+      elem0.layout.layout.variants = .Single variant →
+      h.opsemInhabited c place.layout.ty st = .ok true st →
+      Miri.Interpreter.ValidityVisitor.validatePlace h c (fuel + 2) place recursive false st = .ok () st) := by
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · intro pointeeTy imm recursive hcl hrd
+    apply (validatePlace_noTrack_eq h c (fuel + 1) place recursive st name hghost htn).2
+    let initSess : Miri.Interpreter.ValidityVisitor.Session P :=
+      { path := ⟨name, #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+        refTracking := if recursive then some .empty else none, dataBytes := none }
+    have hprim : (miri_etm_private% Miri.Interpreter.ValidityVisitor
+        Miri.Interpreter.ValidityVisitor.primitive) h c initSess place (.rawPointer pointeeTy true) st =
+        .ok (some initSess) st := by
+      with_unfolding_all exact (est_bind_ok _ _ _ _ imm hrd).trans rfl
+    unfold Miri.Interpreter.ValidityVisitor.visit
+    refine (est_bind_ok _ _ _ _ _ hcl).trans ?_
+    exact (est_bind_ok _ _ _ _ (some initSess) hprim).trans rfl
+  · intro elemTy elemKind elemLayout recursive hcl hecl hni hnf hlo hzst hlen hinh
+    apply (validatePlace_noTrack_eq h c (fuel + 1) place recursive st name hghost htn).2
+    let initSess : Miri.Interpreter.ValidityVisitor.Session P :=
+      { path := ⟨name, #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+        refTracking := if recursive then some .empty else none, dataBytes := none }
+    have hprim : (miri_etm_private% Miri.Interpreter.ValidityVisitor
+        Miri.Interpreter.ValidityVisitor.primitive) h c initSess place (.sequence elemTy) st = .ok none st := rfl
+    have hniB : (elemKind == .integer) = false := beq_false_of_ne hni
+    have hnfB : (elemKind == .float) = false := beq_false_of_ne hnf
+    have hnotgt : ¬ ((0 : UInt64) > 0) := by decide
+    unfold Miri.Interpreter.ValidityVisitor.visit
+    refine (est_bind_ok _ _ _ _ _ hcl).trans ?_
+    refine (est_bind_ok _ _ _ _ none hprim).trans ?_
+    refine (est_bind_ok _ _ _ _ elemKind hecl).trans ?_
+    simp only [hniB, hnfB, Bool.or_self, Bool.false_eq_true, ↓reduceIte]
+    refine (est_bind_ok _ _ _ _ elemLayout hlo).trans ?_
+    simp only [hzst, ↓reduceIte]
+    refine (est_bind_ok _ _ _ _ 0 hlen).trans ?_
+    simp only [hnotgt, ↓reduceIte]
+    refine (est_bind_ok _ _ _ _ true hinh).trans ?_
+    simp only [↓reduceIte, hdbg, Bool.false_eq_true]
+    rfl
+  · intro elemTy elemLayout len elem0 recursive hcl hecl hlo hzst hlen hpos hidx he0cl
+    apply (validatePlace_noTrack_eq h c (fuel + 2) place recursive st name hghost htn).1
+    let initSess : Miri.Interpreter.ValidityVisitor.Session P :=
+      { path := ⟨name, #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+        refTracking := if recursive then some .empty else none, dataBytes := none }
+    let elemSess : Miri.Interpreter.ValidityVisitor.Session P :=
+      { initSess with path := initSess.path.push (.arrayElem 0) }
+    have hprimSeq : (miri_etm_private% Miri.Interpreter.ValidityVisitor
+        Miri.Interpreter.ValidityVisitor.primitive) h c initSess place (.sequence elemTy) st = .ok none st := rfl
+    have hprimNev : (miri_etm_private% Miri.Interpreter.ValidityVisitor
+        Miri.Interpreter.ValidityVisitor.primitive) h c elemSess elem0 .never st =
+        .error (.undefinedBehavior s!"validation{elemSess.path.render}: never value") st := rfl
+    have he0Err : Miri.Interpreter.ValidityVisitor.visit h c (fuel + 1) elemSess elem0 st =
+        .error (.undefinedBehavior s!"validation{elemSess.path.render}: never value") st := by
+      unfold Miri.Interpreter.ValidityVisitor.visit
+      exact (est_bind_ok _ _ _ _ _ he0cl).trans (est_bind_err _ _ _ _ _ hprimNev)
+    conv => lhs; unfold Miri.Interpreter.ValidityVisitor.visit
+    refine (est_bind_ok _ _ _ _ _ hcl).trans ?_
+    refine (est_bind_ok _ _ _ _ none hprimSeq).trans ?_
+    refine (est_bind_ok _ _ _ _ .never hecl).trans ?_
+    simp only [Bool.false_eq_true, ↓reduceIte]
+    refine (est_bind_ok _ _ _ _ elemLayout hlo).trans ?_
+    simp only [hzst, ↓reduceIte]
+    refine (est_bind_ok _ _ _ _ len hlen).trans ?_
+    simp only [hpos, ↓reduceIte]
+    refine (est_bind_ok _ _ _ _ elem0 hidx).trans ?_
+    exact (est_bind_err _ _ _ _ _ he0Err).trans rfl
+  · intro elemTy elemLayout len elem0 variant recursive hcl hecl hlo hzst hlen hpos hidx he0cl he0inh he0f he0v hinh
+    apply (validatePlace_noTrack_eq h c (fuel + 2) place recursive st name hghost htn).2
+    let initSess : Miri.Interpreter.ValidityVisitor.Session P :=
+      { path := ⟨name, #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+        refTracking := if recursive then some .empty else none, dataBytes := none }
+    let elemSess : Miri.Interpreter.ValidityVisitor.Session P :=
+      { initSess with path := initSess.path.push (.arrayElem 0) }
+    have hprimSeq : (miri_etm_private% Miri.Interpreter.ValidityVisitor
+        Miri.Interpreter.ValidityVisitor.primitive) h c initSess place (.sequence elemTy) st = .ok none st := rfl
+    have he0Ok := Miri.Interpreter.ValidityVisitor.visit_fieldless h c fuel elemSess elem0 st variant
+      he0cl he0inh he0f he0v rfl hdbg
+    conv => lhs; unfold Miri.Interpreter.ValidityVisitor.visit
+    refine (est_bind_ok _ _ _ _ _ hcl).trans ?_
+    refine (est_bind_ok _ _ _ _ none hprimSeq).trans ?_
+    refine (est_bind_ok _ _ _ _ (.aggregate false false false) hecl).trans ?_
+    simp only [Bool.false_eq_true, ↓reduceIte]
+    refine (est_bind_ok _ _ _ _ elemLayout hlo).trans ?_
+    simp only [hzst, ↓reduceIte]
+    refine (est_bind_ok _ _ _ _ len hlen).trans ?_
+    simp only [hpos, ↓reduceIte]
+    refine (est_bind_ok _ _ _ _ elem0 hidx).trans ?_
+    refine (est_bind_ok _ _ _ _ elemSess he0Ok).trans ?_
+    refine (est_bind_ok _ _ _ _ true hinh).trans ?_
+    simp only [↓reduceIte, hdbg, Bool.false_eq_true]
+    rfl
+
+/-- **Full `ValidityVisitor.validatePlace` safe reference to empty/uninhabited arrays (`lean-miri#75`)**:
+for recursive validation (`recursive = true, reset = false`) of `&[T; 0]` / `&[!; N]`:
+1. Null `&[T; 0]` fails `"null or maybe-null safe pointer"`;
+2. Non-null `&[!; N+1]` (`opsemInhabited = false`) fails `"safe pointer to uninhabited type"`;
+3. Non-null dangling **unaligned** `&[u32; 0]` fails `classifyPointerAlignmentError` WITHOUT reading
+   memory (zero-size `checkPointerAccess` passes, alignment check still runs!);
+4. Non-null dangling **aligned** `&[u32; 0]` / `&[f32; 0]` succeeds `.ok ()` via the numeric
+   `size == Size.ZERO` fast-path WITHOUT calling `h.toOp` or `h.readBytes`;
+5. Non-null dangling **aligned** `&[!; 0]` (ZST empty array) succeeds `.ok ()`! -/
+theorem validatePlace_ref_emptyArray_and_uninhabited {S C E F A Pad : Type}
+    (h : Miri.Interpreter.ValidityVisitor.Hooks Miri.Memory.Provenance S C E F A Pad) (c : C)
+    (fuel : Nat) (outerPlace : Miri.Interpreter.RuntimePlace Miri.Memory.Provenance) (st : S)
+    (name : String) (outerMut : Bool)
+    (outerImm : Miri.Interpreter.RvalueImmTy Miri.Memory.Provenance)
+    (outerTarget : Miri.Interpreter.MPlaceTy Miri.Memory.Provenance)
+    (outerSize : Miri.ABI.Size) (outerAlign : Miri.ABI.Align)
+    (outerSc : Miri.Memory.Scalar Miri.Memory.Provenance)
+    (hghost : ∀ {α : Type} (m : Miri.Interpreter.ValidityVisitor.M S α) (s : S),
+      h.withGhostValidation m s = m s)
+    (htn : h.typeName c outerPlace.layout.ty st = .ok name st)
+    (hdbg : h.debugAssertions = false)
+    (houterCl : h.classify c outerPlace.layout.ty st = .ok (.reference outerMut) st)
+    (houterRd : h.readImmediate c outerPlace .reference st = .ok outerImm st)
+    (houterPt : h.ptrToPlace c outerImm st = .ok outerTarget st)
+    (houterSized : outerTarget.layout.layout.isSized = true)
+    (houterSa : h.sizeAndAlign c outerTarget st = .ok (some (outerSize, outerAlign)) st)
+    (houterAcc : h.checkPointerAccess c outerTarget.mplace.ptr outerSize st = .ok (.ok ()) st)
+    (houterFrom : Miri.Memory.Scalar.fromMaybePointer h.target.base outerTarget.mplace.ptr = .ok outerSc) :
+    (h.scalarMayBeNull c outerSc st = .ok true st →
+      Miri.Interpreter.ValidityVisitor.validatePlace h c (fuel + 1) outerPlace true false st =
+        .error (.undefinedBehavior s!"validation{(⟨name, #[]⟩ : Miri.Memory.ValidationPath).render}: null or maybe-null safe pointer") st) ∧
+    (h.scalarMayBeNull c outerSc st = .ok false st →
+      h.opsemInhabited c outerTarget.layout.ty st = .ok false st →
+      Miri.Interpreter.ValidityVisitor.validatePlace h c (fuel + 1) outerPlace true false st =
+        .error (.undefinedBehavior s!"validation{(⟨name, #[]⟩ : Miri.Memory.ValidationPath).render}: safe pointer to uninhabited type") st) ∧
+    (∀ (mis : Miri.Memory.Misalignment),
+      h.scalarMayBeNull c outerSc st = .ok false st →
+      h.opsemInhabited c outerTarget.layout.ty st = .ok true st →
+      h.checkPointerAlignResult c outerTarget.mplace.ptr outerAlign st = .ok (.error mis) st →
+      Miri.Interpreter.ValidityVisitor.validatePlace h c (fuel + 1) outerPlace true false st =
+        .error (Miri.Interpreter.ValidityVisitor.classifyPointerAlignmentError ⟨name, #[]⟩ (.reference outerMut) mis) st) ∧
+    (∀ (elemTy : Nat) (elemKind : Miri.Interpreter.ValidityVisitor.TypeKind)
+       (elemLayout : Miri.Interpreter.LocalLayout),
+      h.scalarMayBeNull c outerSc st = .ok false st →
+      h.opsemInhabited c outerTarget.layout.ty st = .ok true st →
+      h.checkPointerAlignResult c outerTarget.mplace.ptr outerAlign st = .ok (.ok ()) st →
+      h.classify c outerTarget.layout.ty st = .ok (.sequence elemTy) st →
+      h.classify c elemTy st = .ok elemKind st →
+      (elemKind = .integer ∨ elemKind = .float) →
+      Miri.Interpreter.PlaceDynamic.length h.projection c ⟨.memory outerTarget.mplace, outerTarget.layout⟩ st = .ok 0 st →
+      h.projection.layoutOf c elemTy st = .ok elemLayout st →
+      Miri.Interpreter.ValidityVisitor.validatePlace h c (fuel + 1) outerPlace true false st = .ok () st) ∧
+    (∀ (elemTy : Nat) (elemKind : Miri.Interpreter.ValidityVisitor.TypeKind)
+       (elemLayout : Miri.Interpreter.LocalLayout),
+      h.scalarMayBeNull c outerSc st = .ok false st →
+      h.opsemInhabited c outerTarget.layout.ty st = .ok true st →
+      h.checkPointerAlignResult c outerTarget.mplace.ptr outerAlign st = .ok (.ok ()) st →
+      h.classify c outerTarget.layout.ty st = .ok (.sequence elemTy) st →
+      h.classify c elemTy st = .ok elemKind st →
+      elemKind ≠ .integer → elemKind ≠ .float →
+      h.projection.layoutOf c elemTy st = .ok elemLayout st →
+      elemLayout.layout.isZst = true →
+      Miri.Interpreter.PlaceDynamic.length h.projection c ⟨.memory outerTarget.mplace, outerTarget.layout⟩ st = .ok 0 st →
+      Miri.Interpreter.ValidityVisitor.validatePlace h c (fuel + 1) outerPlace true false st = .ok () st) := by
+  let rootSession : Miri.Interpreter.ValidityVisitor.Session Miri.Memory.Provenance :=
+    { path := ⟨name, #[]⟩, flags := ⟨false, false⟩, ctfeMode := none, refTracking := some .empty, dataBytes := none }
+  have hcheckSafe_err :
+      (h.scalarMayBeNull c outerSc st = .ok true st →
+        (miri_etm_private% Miri.Interpreter.ValidityVisitor Miri.Interpreter.ValidityVisitor.checkSafe)
+          h c rootSession outerPlace outerPlace.layout.ty (.reference outerMut) st =
+          .error (.undefinedBehavior s!"validation{(⟨name, #[]⟩ : Miri.Memory.ValidationPath).render}: null or maybe-null safe pointer") st) ∧
+      (h.scalarMayBeNull c outerSc st = .ok false st →
+        h.opsemInhabited c outerTarget.layout.ty st = .ok false st →
+        (miri_etm_private% Miri.Interpreter.ValidityVisitor Miri.Interpreter.ValidityVisitor.checkSafe)
+          h c rootSession outerPlace outerPlace.layout.ty (.reference outerMut) st =
+          .error (.undefinedBehavior s!"validation{(⟨name, #[]⟩ : Miri.Memory.ValidationPath).render}: safe pointer to uninhabited type") st) ∧
+      (∀ (mis : Miri.Memory.Misalignment),
+        h.scalarMayBeNull c outerSc st = .ok false st →
+        h.opsemInhabited c outerTarget.layout.ty st = .ok true st →
+        h.checkPointerAlignResult c outerTarget.mplace.ptr outerAlign st = .ok (.error mis) st →
+        (miri_etm_private% Miri.Interpreter.ValidityVisitor Miri.Interpreter.ValidityVisitor.checkSafe)
+          h c rootSession outerPlace outerPlace.layout.ty (.reference outerMut) st =
+          .error (Miri.Interpreter.ValidityVisitor.classifyPointerAlignmentError ⟨name, #[]⟩ (.reference outerMut) mis) st) := by
+    refine ⟨?_, ?_, ?_⟩
+    · intro hnull
+      with_unfolding_all
+        refine (est_bind_ok _ _ _ _ outerImm houterRd).trans ?_
+        rw [ite_f (by simp [rootSession])]
+        dsimp only
+        refine (est_bind_ok _ _ _ _ outerTarget houterPt).trans ?_
+        rw [houterSized, Bool.not_true, ite_f (by decide)]
+        refine (est_bind_ok _ _ _ _ _ houterSa).trans ?_
+        rw [Option.getD_some, ite_t (by simp [rootSession])]
+        refine (est_bind_ok _ _ _ _ (.ok ()) houterAcc).trans ?_
+        dsimp only
+        rw [ite_f (by simp [rootSession])]
+        refine (est_bind_ok _ _ _ _ none rfl).trans ?_
+        dsimp only
+        rw [ite_f (by simp [rootSession])]
+        refine (est_bind_ok _ _ _ _ outerSc (by rw [houterFrom]; rfl)).trans ?_
+        exact (est_bind_ok _ _ _ _ true hnull).trans rfl
+    · intro hnn huninh
+      with_unfolding_all
+        refine (est_bind_ok _ _ _ _ outerImm houterRd).trans ?_
+        rw [ite_f (by simp [rootSession])]
+        dsimp only
+        refine (est_bind_ok _ _ _ _ outerTarget houterPt).trans ?_
+        rw [houterSized, Bool.not_true, ite_f (by decide)]
+        refine (est_bind_ok _ _ _ _ _ houterSa).trans ?_
+        rw [Option.getD_some, ite_t (by simp [rootSession])]
+        refine (est_bind_ok _ _ _ _ (.ok ()) houterAcc).trans ?_
+        dsimp only
+        rw [ite_f (by simp [rootSession])]
+        refine (est_bind_ok _ _ _ _ none rfl).trans ?_
+        dsimp only
+        rw [ite_f (by simp [rootSession])]
+        refine (est_bind_ok _ _ _ _ outerSc (by rw [houterFrom]; rfl)).trans ?_
+        refine (est_bind_ok _ _ _ _ false hnn).trans ?_
+        exact (est_bind_ok _ _ _ _ false huninh).trans rfl
+    · intro mis hnn hinh hmis
+      with_unfolding_all
+        refine (est_bind_ok _ _ _ _ outerImm houterRd).trans ?_
+        rw [ite_f (by simp [rootSession])]
+        dsimp only
+        refine (est_bind_ok _ _ _ _ outerTarget houterPt).trans ?_
+        rw [houterSized, Bool.not_true, ite_f (by decide)]
+        refine (est_bind_ok _ _ _ _ _ houterSa).trans ?_
+        rw [Option.getD_some, ite_t (by simp [rootSession])]
+        refine (est_bind_ok _ _ _ _ (.ok ()) houterAcc).trans ?_
+        dsimp only
+        rw [ite_f (by simp [rootSession])]
+        refine (est_bind_ok _ _ _ _ none rfl).trans ?_
+        dsimp only
+        rw [ite_f (by simp [rootSession])]
+        refine (est_bind_ok _ _ _ _ outerSc (by rw [houterFrom]; rfl)).trans ?_
+        refine (est_bind_ok _ _ _ _ false hnn).trans ?_
+        refine (est_bind_ok _ _ _ _ true hinh).trans ?_
+        exact (est_bind_err _ _ st st _ (by simp [Miri.Interpreter.ValidityVisitor.mapPointerAlignmentOutcome, hmis]; rfl))
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · intro hnull
+    apply (validatePlace_noTrack_eq h c (fuel + 1) outerPlace true st name hghost htn).1
+    unfold Miri.Interpreter.ValidityVisitor.visit
+    refine (est_bind_ok _ _ _ _ _ houterCl).trans ?_
+    exact est_bind_err _ _ _ _ _ (by with_unfolding_all exact est_bind_err _ _ _ _ _ (hcheckSafe_err.1 hnull))
+  · intro hnn huninh
+    apply (validatePlace_noTrack_eq h c (fuel + 1) outerPlace true st name hghost htn).1
+    unfold Miri.Interpreter.ValidityVisitor.visit
+    refine (est_bind_ok _ _ _ _ _ houterCl).trans ?_
+    exact est_bind_err _ _ _ _ _ (by with_unfolding_all exact est_bind_err _ _ _ _ _ (hcheckSafe_err.2.1 hnn huninh))
+  · intro mis hnn hinh hmis
+    apply (validatePlace_noTrack_eq h c (fuel + 1) outerPlace true st name hghost htn).1
+    unfold Miri.Interpreter.ValidityVisitor.visit
+    refine (est_bind_ok _ _ _ _ _ houterCl).trans ?_
+    exact est_bind_err _ _ _ _ _ (by with_unfolding_all exact est_bind_err _ _ _ _ _ (hcheckSafe_err.2.2 mis hnn hinh hmis))
+  · intro elemTy elemKind elemLayout hnn hinh hal hseq hecl hnum hlen hlo
+    have hroot := (visit_root_tracks_pointee_for_childSession h c fuel ⟨name, #[]⟩ outerPlace st
+      outerMut outerImm outerTarget outerSize outerAlign outerSc
+      houterCl houterRd houterPt (Or.inl houterSized) houterSa houterAcc houterFrom hnn hinh hal).1
+    have hdrv := (validatePlace_recursive_oneTracked_eq h c fuel outerPlace st name
+      ⟨outerTarget.mplace, outerTarget.layout⟩ ((⟨name, #[]⟩ : Miri.Memory.ValidationPath).push .deref)
+      hghost htn hroot).2
+    let childSess : Miri.Interpreter.ValidityVisitor.Session Miri.Memory.Provenance :=
+      { path := (⟨name, #[]⟩ : Miri.Memory.ValidationPath).push .deref
+        flags := ⟨false, true⟩, ctfeMode := none, refTracking := none, dataBytes := none }
+    refine hdrv childSess st ?_ rfl
+    have hprim : (miri_etm_private% Miri.Interpreter.ValidityVisitor
+        Miri.Interpreter.ValidityVisitor.primitive) h c childSess
+        ⟨.memory outerTarget.mplace, outerTarget.layout⟩ (.sequence elemTy) st = .ok none st := rfl
+    have hnumB : ((elemKind == .integer) || (elemKind == .float)) = true := by
+      rcases hnum with rfl | rfl <;> rfl
+    have hsr : miriVVSizeResult (elemLayout.layout.size.mul 0) st = .ok Miri.ABI.Size.ZERO st := by
+      rw [size_mul_zero]; rfl
+    unfold Miri.Interpreter.ValidityVisitor.visit
+    refine (est_bind_ok _ _ _ _ _ hseq).trans ?_
+    refine (est_bind_ok _ _ _ _ none hprim).trans ?_
+    refine (est_bind_ok _ _ _ _ elemKind hecl).trans ?_
+    simp only [hnumB, ↓reduceIte]
+    refine (est_bind_ok _ _ _ _ 0 hlen).trans ?_
+    refine (est_bind_ok _ _ _ _ elemLayout hlo).trans ?_
+    refine (est_bind_ok _ _ _ _ Miri.ABI.Size.ZERO hsr).trans ?_
+    rfl
+  · intro elemTy elemKind elemLayout hnn hinh hal hseq hecl hni hnf hlo hzst hlen
+    have hroot := (visit_root_tracks_pointee_for_childSession h c fuel ⟨name, #[]⟩ outerPlace st
+      outerMut outerImm outerTarget outerSize outerAlign outerSc
+      houterCl houterRd houterPt (Or.inl houterSized) houterSa houterAcc houterFrom hnn hinh hal).1
+    have hdrv := (validatePlace_recursive_oneTracked_eq h c fuel outerPlace st name
+      ⟨outerTarget.mplace, outerTarget.layout⟩ ((⟨name, #[]⟩ : Miri.Memory.ValidationPath).push .deref)
+      hghost htn hroot).2
+    let childSess : Miri.Interpreter.ValidityVisitor.Session Miri.Memory.Provenance :=
+      { path := (⟨name, #[]⟩ : Miri.Memory.ValidationPath).push .deref
+        flags := ⟨false, true⟩, ctfeMode := none, refTracking := none, dataBytes := none }
+    refine hdrv childSess st ?_ rfl
+    have hprim : (miri_etm_private% Miri.Interpreter.ValidityVisitor
+        Miri.Interpreter.ValidityVisitor.primitive) h c childSess
+        ⟨.memory outerTarget.mplace, outerTarget.layout⟩ (.sequence elemTy) st = .ok none st := rfl
+    have hniB : (elemKind == .integer) = false := beq_false_of_ne hni
+    have hnfB : (elemKind == .float) = false := beq_false_of_ne hnf
+    have hnotgt : ¬ ((0 : UInt64) > 0) := by decide
+    unfold Miri.Interpreter.ValidityVisitor.visit
+    refine (est_bind_ok _ _ _ _ _ hseq).trans ?_
+    refine (est_bind_ok _ _ _ _ none hprim).trans ?_
+    refine (est_bind_ok _ _ _ _ elemKind hecl).trans ?_
+    simp only [hniB, hnfB, Bool.or_self, Bool.false_eq_true, ↓reduceIte]
+    refine (est_bind_ok _ _ _ _ elemLayout hlo).trans ?_
+    simp only [hzst, ↓reduceIte]
+    refine (est_bind_ok _ _ _ _ 0 hlen).trans ?_
+    simp only [hnotgt, ↓reduceIte]
+    refine (est_bind_ok _ _ _ _ true hinh).trans ?_
+    simp only [↓reduceIte, hdbg, Bool.false_eq_true]
+    rfl
+
+private theorem visit_array_wideDyn_elem0_vtableErr {S C E F A Pad : Type}
+    (h : Miri.Interpreter.ValidityVisitor.Hooks Miri.Memory.Provenance S C E F A Pad) (c : C)
+    (fuel : Nat) (session : Miri.Interpreter.ValidityVisitor.Session Miri.Memory.Provenance)
+    (arrPlace : Miri.Interpreter.RuntimePlace Miri.Memory.Provenance) (st : S)
+    (elemTy : Nat) (elemKind : Miri.Interpreter.ValidityVisitor.TypeKind)
+    (elemLayout : Miri.Interpreter.LocalLayout) (stride : Miri.ABI.Size) (count : UInt64)
+    (len : UInt64) (endOff : Miri.ABI.Size) (unitLo : Miri.Interpreter.LocalLayout)
+    (endPlace elem0Place : Miri.Interpreter.RuntimePlace Miri.Memory.Provenance)
+    (innerMut : Bool) (expected : Nat)
+    (innerImm : Miri.Interpreter.RvalueImmTy Miri.Memory.Provenance)
+    (innerTarget : Miri.Interpreter.MPlaceTy Miri.Memory.Provenance)
+    (metaScalar : Miri.Memory.Scalar Miri.Memory.Provenance)
+    (vtPtr : Miri.Memory.Pointer (Option Miri.Memory.Provenance))
+    (err : Miri.Interpreter.StepError) (st' : S)
+    (hctfe : session.ctfeMode = none)
+    (hreset : session.flags.resetProvenanceAndPadding = false)
+    (harrCl : h.classify c arrPlace.layout.ty st = .ok (.sequence elemTy) st)
+    (hecl : h.classify c elemTy st = .ok elemKind st)
+    (hni : elemKind ≠ .integer) (hnf : elemKind ≠ .float)
+    (helo : h.projection.layoutOf c elemTy st = .ok elemLayout st)
+    (hnonZst : elemLayout.layout.isZst = false)
+    (harrFields : arrPlace.layout.layout.fields = .Array stride count)
+    (hlen : Miri.Interpreter.PlaceDynamic.length h.projection c arrPlace st = .ok len st)
+    (hlenPos : 0 < len.toNat)
+    (hefield : h.projection.field c arrPlace.layout 0 st = .ok elemLayout st)
+    (hendMul : stride.mul len = .ok endOff)
+    (hunit : h.unitLayout c st = .ok unitLo st)
+    (hendOff : Miri.Interpreter.PlaceDynamic.offsetWithMeta h.projection c arrPlace endOff .inbounds .none unitLo st = .ok endPlace st)
+    (hproj0 : Miri.Interpreter.PlaceDynamic.offsetWithMeta h.projection c arrPlace Miri.ABI.Size.ZERO .wrapping .none elemLayout st = .ok elem0Place st)
+    (hinnerCl : h.classify c elem0Place.layout.ty st = .ok (.reference innerMut) st)
+    (hinnerRd : h.readImmediate c elem0Place .reference st = .ok innerImm st)
+    (hinnerPt : h.ptrToPlace c innerImm st = .ok innerTarget st)
+    (hinnerUns : innerTarget.layout.layout.isSized = false)
+    (hinnerMt : h.metadataTail c innerTarget.layout.ty st = .ok (.dynamic expected) st)
+    (hunwrap : innerTarget.mplace.metadata.unwrapMeta = .ok metaScalar)
+    (htoptr : metaScalar.toPointer h.target.base = .ok vtPtr)
+    (hvtErr : Miri.Interpreter.VTable.getPtrVTableType h.vtable c vtPtr (some expected) st = .error err st') :
+    Miri.Interpreter.ValidityVisitor.visit h c (fuel + 2) session arrPlace st = .error err st' := by
+  have he0Err : Miri.Interpreter.ValidityVisitor.visit h c (fuel + 1)
+      { session with path := session.path.push (.arrayElem 0) } elem0Place st = .error err st' :=
+    visit_wideDyn_checkSafe_vtableBeforeDataUB h c fuel
+      { session with path := session.path.push (.arrayElem 0) } elem0Place st innerMut
+      expected innerImm innerTarget metaScalar vtPtr err st' hreset
+      hinnerCl hinnerRd hinnerPt hinnerUns hinnerMt hunwrap htoptr hvtErr
+  have hprim : (miri_etm_private% Miri.Interpreter.ValidityVisitor
+      Miri.Interpreter.ValidityVisitor.primitive) h c session arrPlace (.sequence elemTy) st = .ok none st := rfl
+  have hniB : (elemKind == .integer) = false := beq_false_of_ne hni
+  have hnfB : (elemKind == .float) = false := beq_false_of_ne hnf
+  have hsrEnd : miriVVSizeResult (stride.mul len) st = .ok endOff st := by rw [hendMul]; rfl
+  have hsr0 : miriVVSizeResult (stride.mul (UInt64.ofNat 0)) st = .ok Miri.ABI.Size.ZERO st := by
+    change miriVVSizeResult (stride.mul 0) st = _
+    rw [size_mul_zero]; rfl
+  obtain ⟨m, hm⟩ : ∃ m, len.toNat = m + 1 := ⟨len.toNat - 1, by omega⟩
+  conv => lhs; unfold Miri.Interpreter.ValidityVisitor.visit
+  refine (est_bind_ok _ _ _ _ _ harrCl).trans ?_
+  refine (est_bind_ok _ _ _ _ none hprim).trans ?_
+  dsimp only
+  rw [hctfe]
+  dsimp only
+  refine (est_bind_ok _ _ _ _ elemKind hecl).trans ?_
+  simp only [hniB, hnfB, Bool.or_self, Bool.false_eq_true, ↓reduceIte]
+  refine (est_bind_ok _ _ _ _ elemLayout helo).trans ?_
+  simp only [hnonZst, Bool.false_eq_true, ↓reduceIte, harrFields]
+  refine (est_bind_ok _ _ _ _ len hlen).trans ?_
+  refine (est_bind_ok _ _ _ _ elemLayout hefield).trans ?_
+  refine (est_bind_ok _ _ _ _ endOff hsrEnd).trans ?_
+  refine (est_bind_ok _ _ _ _ unitLo hunit).trans ?_
+  refine (est_bind_ok _ _ _ _ endPlace hendOff).trans ?_
+  simp only [Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size,
+    Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one, hm, List.range'_succ, List.forIn_cons]
+  refine (est_bind_err _ _ _ _ err ?_).trans rfl
+  refine (est_bind_err _ _ _ _ err ?_).trans rfl
+  refine (est_bind_ok _ _ _ _ Miri.ABI.Size.ZERO hsr0).trans ?_
+  refine (est_bind_ok _ _ _ _ elem0Place hproj0).trans ?_
+  exact (est_bind_err _ _ _ _ err he0Err).trans rfl
+
+/-- **Full `ValidityVisitor.validatePlace` direct `[&dyn Trait; N]` (`N ≥ 1`) invalid-vtable precedence
+(`lean-miri#75`, `#79`, `#82`)**: validating an array `[&dyn Trait; N]` directly fails on ANY invalid
+vtable (null, misaligned/nonzero-offset, dangling integer, non-vtable pointer, trait mismatch) at
+element `0` BEFORE any data-pointer check on element `0` AND BEFORE visiting elements `1..N-1`. -/
+theorem validatePlace_array_wideDyn_invalidVTable_precedes_dataPtr {S C E F A Pad : Type}
+    (h : Miri.Interpreter.ValidityVisitor.Hooks Miri.Memory.Provenance S C E F A Pad) (c : C)
+    (fuel : Nat) (arrPlace : Miri.Interpreter.RuntimePlace Miri.Memory.Provenance)
+    (recursive : Bool) (st : S) (name : String)
+    (elemTy : Nat) (elemKind : Miri.Interpreter.ValidityVisitor.TypeKind)
+    (elemLayout : Miri.Interpreter.LocalLayout) (stride : Miri.ABI.Size) (count : UInt64)
+    (len : UInt64) (endOff : Miri.ABI.Size) (unitLo : Miri.Interpreter.LocalLayout)
+    (endPlace elem0Place : Miri.Interpreter.RuntimePlace Miri.Memory.Provenance)
+    (innerMut : Bool) (expected : Nat)
+    (innerImm : Miri.Interpreter.RvalueImmTy Miri.Memory.Provenance)
+    (innerTarget : Miri.Interpreter.MPlaceTy Miri.Memory.Provenance)
+    (metaScalar : Miri.Memory.Scalar Miri.Memory.Provenance)
+    (vtPtr : Miri.Memory.Pointer (Option Miri.Memory.Provenance))
+    (err : Miri.Interpreter.StepError) (st' : S)
+    (hghost : ∀ {α : Type} (m : Miri.Interpreter.ValidityVisitor.M S α) (s : S),
+      h.withGhostValidation m s = m s)
+    (htn : h.typeName c arrPlace.layout.ty st = .ok name st)
+    (harrCl : h.classify c arrPlace.layout.ty st = .ok (.sequence elemTy) st)
+    (hecl : h.classify c elemTy st = .ok elemKind st)
+    (hni : elemKind ≠ .integer) (hnf : elemKind ≠ .float)
+    (helo : h.projection.layoutOf c elemTy st = .ok elemLayout st)
+    (hnonZst : elemLayout.layout.isZst = false)
+    (harrFields : arrPlace.layout.layout.fields = .Array stride count)
+    (hlen : Miri.Interpreter.PlaceDynamic.length h.projection c arrPlace st = .ok len st)
+    (hlenPos : 0 < len.toNat)
+    (hefield : h.projection.field c arrPlace.layout 0 st = .ok elemLayout st)
+    (hendMul : stride.mul len = .ok endOff)
+    (hunit : h.unitLayout c st = .ok unitLo st)
+    (hendOff : Miri.Interpreter.PlaceDynamic.offsetWithMeta h.projection c arrPlace endOff .inbounds .none unitLo st = .ok endPlace st)
+    (hproj0 : Miri.Interpreter.PlaceDynamic.offsetWithMeta h.projection c arrPlace Miri.ABI.Size.ZERO .wrapping .none elemLayout st = .ok elem0Place st)
+    (hinnerCl : h.classify c elem0Place.layout.ty st = .ok (.reference innerMut) st)
+    (hinnerRd : h.readImmediate c elem0Place .reference st = .ok innerImm st)
+    (hinnerPt : h.ptrToPlace c innerImm st = .ok innerTarget st)
+    (hinnerUns : innerTarget.layout.layout.isSized = false)
+    (hinnerMt : h.metadataTail c innerTarget.layout.ty st = .ok (.dynamic expected) st)
+    (hunwrap : innerTarget.mplace.metadata.unwrapMeta = .ok metaScalar)
+    (htoptr : metaScalar.toPointer h.target.base = .ok vtPtr)
+    (hvtErr : Miri.Interpreter.VTable.getPtrVTableType h.vtable c vtPtr (some expected) st = .error err st') :
+    Miri.Interpreter.ValidityVisitor.validatePlace h c (fuel + 2) arrPlace recursive false st = .error err st' :=
+  (validatePlace_noTrack_eq h c (fuel + 2) arrPlace recursive st name hghost htn).1 err st'
+    (visit_array_wideDyn_elem0_vtableErr h c fuel _ arrPlace st elemTy elemKind elemLayout stride count
+      len endOff unitLo endPlace elem0Place innerMut expected innerImm innerTarget metaScalar vtPtr
+      err st' rfl rfl harrCl hecl hni hnf helo hnonZst harrFields hlen hlenPos hefield hendMul
+      hunit hendOff hproj0 hinnerCl hinnerRd hinnerPt hinnerUns hinnerMt hunwrap htoptr hvtErr)
+
+/-- **Full `ValidityVisitor.validatePlace` recursive `&[&dyn Trait; N]` (`N ≥ 1`) invalid-vtable
+precedence (`lean-miri#75`, `#79`, `#82`)**: inside `validatePlace … true false`, the outer safe
+reference tracks `[&dyn Trait; N]` into `childSession` (`mayDangle = true`), and element `0`'s
+invalid vtable fails BEFORE any inner data-pointer check AND BEFORE elements `1..N-1`. -/
+theorem validatePlace_ref_array_wideDyn_invalidVTable_precedes_dataPtr {S C E F A Pad : Type}
+    (h : Miri.Interpreter.ValidityVisitor.Hooks Miri.Memory.Provenance S C E F A Pad) (c : C)
+    (fuel : Nat) (outerPlace : Miri.Interpreter.RuntimePlace Miri.Memory.Provenance) (st : S)
+    (name : String) (outerMut innerMut : Bool) (expected : Nat)
+    (outerImm : Miri.Interpreter.RvalueImmTy Miri.Memory.Provenance)
+    (outerTarget : Miri.Interpreter.MPlaceTy Miri.Memory.Provenance)
+    (outerSize : Miri.ABI.Size) (outerAlign : Miri.ABI.Align)
+    (outerSc : Miri.Memory.Scalar Miri.Memory.Provenance)
+    (elemTy : Nat) (elemKind : Miri.Interpreter.ValidityVisitor.TypeKind)
+    (elemLayout : Miri.Interpreter.LocalLayout) (stride : Miri.ABI.Size) (count : UInt64)
+    (len : UInt64) (endOff : Miri.ABI.Size) (unitLo : Miri.Interpreter.LocalLayout)
+    (endPlace elem0Place : Miri.Interpreter.RuntimePlace Miri.Memory.Provenance)
+    (innerImm : Miri.Interpreter.RvalueImmTy Miri.Memory.Provenance)
+    (innerTarget : Miri.Interpreter.MPlaceTy Miri.Memory.Provenance)
+    (metaScalar : Miri.Memory.Scalar Miri.Memory.Provenance)
+    (vtPtr : Miri.Memory.Pointer (Option Miri.Memory.Provenance))
+    (err : Miri.Interpreter.StepError) (st' : S)
+    (hghost : ∀ {α : Type} (m : Miri.Interpreter.ValidityVisitor.M S α) (s : S),
+      h.withGhostValidation m s = m s)
+    (htn : h.typeName c outerPlace.layout.ty st = .ok name st)
+    (houterCl : h.classify c outerPlace.layout.ty st = .ok (.reference outerMut) st)
+    (houterRd : h.readImmediate c outerPlace .reference st = .ok outerImm st)
+    (houterPt : h.ptrToPlace c outerImm st = .ok outerTarget st)
+    (houterSized : outerTarget.layout.layout.isSized = true)
+    (houterSa : h.sizeAndAlign c outerTarget st = .ok (some (outerSize, outerAlign)) st)
+    (houterAcc : h.checkPointerAccess c outerTarget.mplace.ptr outerSize st = .ok (.ok ()) st)
+    (houterFrom : Miri.Memory.Scalar.fromMaybePointer h.target.base outerTarget.mplace.ptr = .ok outerSc)
+    (houterNn : h.scalarMayBeNull c outerSc st = .ok false st)
+    (houterInh : h.opsemInhabited c outerTarget.layout.ty st = .ok true st)
+    (houterAl : h.checkPointerAlignResult c outerTarget.mplace.ptr outerAlign st = .ok (.ok ()) st)
+    (harrCl : h.classify c outerTarget.layout.ty st = .ok (.sequence elemTy) st)
+    (hecl : h.classify c elemTy st = .ok elemKind st)
+    (hni : elemKind ≠ .integer) (hnf : elemKind ≠ .float)
+    (helo : h.projection.layoutOf c elemTy st = .ok elemLayout st)
+    (hnonZst : elemLayout.layout.isZst = false)
+    (harrFields : outerTarget.layout.layout.fields = .Array stride count)
+    (hlen : Miri.Interpreter.PlaceDynamic.length h.projection c ⟨.memory outerTarget.mplace, outerTarget.layout⟩ st = .ok len st)
+    (hlenPos : 0 < len.toNat)
+    (hefield : h.projection.field c outerTarget.layout 0 st = .ok elemLayout st)
+    (hendMul : stride.mul len = .ok endOff)
+    (hunit : h.unitLayout c st = .ok unitLo st)
+    (hendOff : Miri.Interpreter.PlaceDynamic.offsetWithMeta h.projection c ⟨.memory outerTarget.mplace, outerTarget.layout⟩ endOff .inbounds .none unitLo st = .ok endPlace st)
+    (hproj0 : Miri.Interpreter.PlaceDynamic.offsetWithMeta h.projection c ⟨.memory outerTarget.mplace, outerTarget.layout⟩ Miri.ABI.Size.ZERO .wrapping .none elemLayout st = .ok elem0Place st)
+    (hinnerCl : h.classify c elem0Place.layout.ty st = .ok (.reference innerMut) st)
+    (hinnerRd : h.readImmediate c elem0Place .reference st = .ok innerImm st)
+    (hinnerPt : h.ptrToPlace c innerImm st = .ok innerTarget st)
+    (hinnerUns : innerTarget.layout.layout.isSized = false)
+    (hinnerMt : h.metadataTail c innerTarget.layout.ty st = .ok (.dynamic expected) st)
+    (hunwrap : innerTarget.mplace.metadata.unwrapMeta = .ok metaScalar)
+    (htoptr : metaScalar.toPointer h.target.base = .ok vtPtr)
+    (hvtErr : Miri.Interpreter.VTable.getPtrVTableType h.vtable c vtPtr (some expected) st = .error err st') :
+    Miri.Interpreter.ValidityVisitor.validatePlace h c (fuel + 2) outerPlace true false st = .error err st' := by
+  have hroot := (visit_root_tracks_pointee_for_childSession h c (fuel + 1) ⟨name, #[]⟩ outerPlace st
+    outerMut outerImm outerTarget outerSize outerAlign outerSc
+    houterCl houterRd houterPt (Or.inl houterSized) houterSa houterAcc houterFrom houterNn houterInh houterAl).1
+  exact (validatePlace_recursive_oneTracked_eq h c (fuel + 1) outerPlace st name
+    ⟨outerTarget.mplace, outerTarget.layout⟩ ((⟨name, #[]⟩ : Miri.Memory.ValidationPath).push .deref)
+    hghost htn hroot).1 err st'
+    (visit_array_wideDyn_elem0_vtableErr h c fuel _ ⟨.memory outerTarget.mplace, outerTarget.layout⟩ st
+      elemTy elemKind elemLayout stride count len endOff unitLo endPlace elem0Place innerMut expected
+      innerImm innerTarget metaScalar vtPtr err st' rfl rfl harrCl hecl hni hnf helo hnonZst
+      harrFields hlen hlenPos hefield hendMul hunit hendOff hproj0 hinnerCl hinnerRd hinnerPt
+      hinnerUns hinnerMt hunwrap htoptr hvtErr)
+
 /-! ## Part 3. Closed non-vacuity canaries -/
 
 /-- Canary resolver: the provenance is the allocation identifier and the
@@ -17592,9 +19490,11 @@ theorem checkPtrAccess_canary :
       false ∧
     canaryLinearWorld.checkPtrAccess (some (ofMiriAllocId id3, 0)) 1 = false := by
   intro target msg lookup id1 id2 id3 id9
-  refine ⟨by decide +kernel, by decide, by decide +kernel, by decide, by decide +kernel,
-    by decide, by decide +kernel, by decide +kernel, by decide, by decide +kernel,
-    by decide +kernel, by decide, by decide +kernel, by decide⟩
+  have hlk : lookup = keyedLookup (KeyedAllocWorld.ofLinear canaryLinearWorld) :=
+    linearLookup_eq_keyedLookup (allocWorldRel_ofLinear canaryLinearWorld)
+  simp only [hlk, checkPtrAccess_keyed_eq]
+  refine ⟨by decide, rfl, by decide, rfl, by decide, rfl, by decide, by decide, rfl, by decide,
+    by decide, rfl, by decide, rfl⟩
 
 /-- The same vendored check against the KEYED canary world. -/
 theorem checkPtrAccess_keyed_canary :
@@ -17603,8 +19503,8 @@ theorem checkPtrAccess_keyed_canary :
     Miri.Memory.checkPtrAccess ⟨⟨8⟩⟩ ⟨⟨0⟩, some ⟨2, by decide⟩⟩ ⟨1⟩ .memoryAccess canaryResolve
         (keyedLookup (KeyedAllocWorld.ofLinear canaryLinearWorld)) =
       .error (.allocationLookup (.deadAllocation ⟨2, by decide⟩)) := by
-  rw [← linearLookup_eq_keyedLookup (allocWorldRel_ofLinear canaryLinearWorld)]
-  exact ⟨by decide +kernel, by decide +kernel⟩
+  simp only [checkPtrAccess_keyed_eq]
+  exact ⟨by decide, by decide⟩
 
 /-- Vendored `RetagPolicy.create` and theory `selectFnEntryPolicy` on concrete
 inputs: writable `&mut`, `#[rustc_no_writable]` `&mut`, `!Unpin` `Box`, `Box`
@@ -18382,52 +20282,54 @@ theorem annealRowProjection_byteRetention_canary :
       r1.toKeyed annealRowProjection ≠ rU.toKeyed annealRowProjection := by
   have h1ok : (Miri.Memory.Allocation.fromBytes (Prov := AnnealProv) #[1, 2, 3, 4] Miri.ABI.Align.ONE .Mut).isOk = true := rfl
   have h2ok : (Miri.Memory.Allocation.fromBytes (Prov := AnnealProv) #[5, 6, 7, 8] Miri.ABI.Align.ONE .Mut).isOk = true := rfl
-  have hUok : (Miri.Memory.Allocation.tryNew (Prov := AnnealProv) ⟨4⟩ Miri.ABI.Align.ONE .Uninit
-      (fun sz _ => some (Array.replicate sz.bytes.toNat 0))).isOk = true := by decide +kernel
-  have hUbytesEval :
-      (match Miri.Memory.Allocation.tryNew (Prov := AnnealProv) ⟨4⟩ Miri.ABI.Align.ONE .Uninit
-          (fun sz _ => some (Array.replicate sz.bytes.toNat 0)) with
-       | .ok a => miriAllocBytes a
-       | .error _ => []) = [.uninit, .uninit, .uninit, .uninit] := by decide +kernel
+  let allocU : Miri.Memory.Allocation AnnealProv Unit :=
+    (miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.mk)
+      #[0, 0, 0, 0] ⟨4⟩ Miri.Memory.ProvenanceMap.new (Miri.Memory.InitMask.new ⟨4⟩ false)
+      Miri.ABI.Align.ONE .Mut () none
+  have hfnz : (miri_etm_private% Miri.Memory.Allocation Miri.Memory.firstNonZero) #[0, 0, 0, 0] = none := by
+    decide +kernel
+  have hU : Miri.Memory.Allocation.tryNew (Prov := AnnealProv) ⟨4⟩ Miri.ABI.Align.ONE .Uninit
+      (fun sz _ => some (Array.replicate sz.bytes.toNat 0)) = .ok allocU := by
+    unfold Miri.Memory.Allocation.tryNew
+    have hca : (miri_etm_private% Miri.Memory.Allocation Miri.Memory.checkedAlign) Miri.ABI.Align.ONE = .ok Miri.ABI.Align.ONE := rfl
+    have hrep : Array.replicate (⟨4⟩ : Miri.ABI.Size).bytes.toNat (0 : UInt8) = #[0, 0, 0, 0] := rfl
+    simp only [hca, hrep, hfnz, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+    rfl
+  have hUbytesEval : miriAllocBytes allocU = [.uninit, .uninit, .uninit, .uninit] := by
+    rw [miriAllocBytes_of_lazy_uninit allocU ⟨4⟩ rfl]; rfl
   cases h1 : Miri.Memory.Allocation.fromBytes (Prov := AnnealProv) #[1, 2, 3, 4] Miri.ABI.Align.ONE .Mut with
   | error e => rw [h1] at h1ok; cases h1ok
   | ok alloc1 =>
     cases h2 : Miri.Memory.Allocation.fromBytes (Prov := AnnealProv) #[5, 6, 7, 8] Miri.ABI.Align.ONE .Mut with
     | error e => rw [h2] at h2ok; cases h2ok
     | ok alloc2 =>
-      cases hU : Miri.Memory.Allocation.tryNew (Prov := AnnealProv) ⟨4⟩ Miri.ABI.Align.ONE .Uninit
-          (fun sz _ => some (Array.replicate sz.bytes.toNat 0)) with
-      | error e => rw [hU] at hUok; cases hUok
-      | ok allocU =>
-        rw [hU] at hUbytesEval
-        dsimp only at hUbytesEval
-        let id1 : Miri.Memory.AllocId := ⟨1, by decide⟩
-        have hb1 : miriAllocBytes alloc1 = [.init 1 none, .init 2 none, .init 3 none, .init 4 none] :=
-          miriAllocBytes_fromBytes _ _ _ alloc1 h1
-        have hb2 : miriAllocBytes alloc2 = [.init 5 none, .init 6 none, .init 7 none, .init 8 none] :=
-          miriAllocBytes_fromBytes _ _ _ alloc2 h2
-        let r1 : MiriAllocRows AnnealProv (Option Miri.TreeBorrows.BorrowTree) Miri.Memory.MiriMemoryKind :=
-          { nextAllocId := 2, issued := #[id1], live := #[(id1, ⟨.stack, alloc1.withExtra none⟩)] }
-        let r2 : MiriAllocRows AnnealProv (Option Miri.TreeBorrows.BorrowTree) Miri.Memory.MiriMemoryKind :=
-          { nextAllocId := 2, issued := #[id1], live := #[(id1, ⟨.stack, alloc2.withExtra none⟩)] }
-        let rU : MiriAllocRows AnnealProv (Option Miri.TreeBorrows.BorrowTree) Miri.Memory.MiriMemoryKind :=
-          { nextAllocId := 2, issued := #[id1], live := #[(id1, ⟨.stack, allocU.withExtra none⟩)] }
-        have hfind1 : ((r1.toKeyed annealRowProjection).findLive? (ofMiriAllocId id1)).map (·.bytes) =
-            some [.init 1 none, .init 2 none, .init 3 none, .init 4 none] := by
-          rw [toKeyed_findLive?]; show some (miriAllocBytes (alloc1.withExtra none)) = _
-          rw [(miriAllocBytes_extra_invariant alloc1 (alloc1.withExtra none) none id).1, hb1]
-        have hfind2 : ((r2.toKeyed annealRowProjection).findLive? (ofMiriAllocId id1)).map (·.bytes) =
-            some [.init 5 none, .init 6 none, .init 7 none, .init 8 none] := by
-          rw [toKeyed_findLive?]; show some (miriAllocBytes (alloc2.withExtra none)) = _
-          rw [(miriAllocBytes_extra_invariant alloc2 (alloc2.withExtra none) none id).1, hb2]
-        have hfindU : ((rU.toKeyed annealRowProjection).findLive? (ofMiriAllocId id1)).map (·.bytes) =
-            some [.uninit, .uninit, .uninit, .uninit] := by
-          rw [toKeyed_findLive?]; show some (miriAllocBytes (allocU.withExtra none)) = _
-          rw [(miriAllocBytes_extra_invariant allocU (allocU.withExtra none) none id).1, hUbytesEval]
-        refine ⟨alloc1, alloc2, allocU, rfl, rfl, rfl, ?_, hfind1, hfind2, hfindU, ?_, ?_⟩
-        · rw [(miriAllocBytes_extra_invariant alloc1 (alloc1.withExtra none) none id).1, hb1]
-        · intro heq; rw [heq, hfind2] at hfind1; cases hfind1
-        · intro heq; rw [heq, hfindU] at hfind1; cases hfind1
+      let id1 : Miri.Memory.AllocId := ⟨1, by decide⟩
+      have hb1 : miriAllocBytes alloc1 = [.init 1 none, .init 2 none, .init 3 none, .init 4 none] :=
+        miriAllocBytes_fromBytes _ _ _ alloc1 h1
+      have hb2 : miriAllocBytes alloc2 = [.init 5 none, .init 6 none, .init 7 none, .init 8 none] :=
+        miriAllocBytes_fromBytes _ _ _ alloc2 h2
+      let r1 : MiriAllocRows AnnealProv (Option Miri.TreeBorrows.BorrowTree) Miri.Memory.MiriMemoryKind :=
+        { nextAllocId := 2, issued := #[id1], live := #[(id1, ⟨.stack, alloc1.withExtra none⟩)] }
+      let r2 : MiriAllocRows AnnealProv (Option Miri.TreeBorrows.BorrowTree) Miri.Memory.MiriMemoryKind :=
+        { nextAllocId := 2, issued := #[id1], live := #[(id1, ⟨.stack, alloc2.withExtra none⟩)] }
+      let rU : MiriAllocRows AnnealProv (Option Miri.TreeBorrows.BorrowTree) Miri.Memory.MiriMemoryKind :=
+        { nextAllocId := 2, issued := #[id1], live := #[(id1, ⟨.stack, allocU.withExtra none⟩)] }
+      have hfind1 : ((r1.toKeyed annealRowProjection).findLive? (ofMiriAllocId id1)).map (·.bytes) =
+          some [.init 1 none, .init 2 none, .init 3 none, .init 4 none] := by
+        rw [toKeyed_findLive?]; show some (miriAllocBytes (alloc1.withExtra none)) = _
+        rw [(miriAllocBytes_extra_invariant alloc1 (alloc1.withExtra none) none id).1, hb1]
+      have hfind2 : ((r2.toKeyed annealRowProjection).findLive? (ofMiriAllocId id1)).map (·.bytes) =
+          some [.init 5 none, .init 6 none, .init 7 none, .init 8 none] := by
+        rw [toKeyed_findLive?]; show some (miriAllocBytes (alloc2.withExtra none)) = _
+        rw [(miriAllocBytes_extra_invariant alloc2 (alloc2.withExtra none) none id).1, hb2]
+      have hfindU : ((rU.toKeyed annealRowProjection).findLive? (ofMiriAllocId id1)).map (·.bytes) =
+          some [.uninit, .uninit, .uninit, .uninit] := by
+        rw [toKeyed_findLive?]; show some (miriAllocBytes (allocU.withExtra none)) = _
+        rw [(miriAllocBytes_extra_invariant allocU (allocU.withExtra none) none id).1, hUbytesEval]
+      refine ⟨alloc1, alloc2, allocU, rfl, rfl, hU, ?_, hfind1, hfind2, hfindU, ?_, ?_⟩
+      · rw [(miriAllocBytes_extra_invariant alloc1 (alloc1.withExtra none) none id).1, hb1]
+      · intro heq; rw [heq, hfind2] at hfind1; cases hfind1
+      · intro heq; rw [heq, hfindU] at hfind1; cases hfind1
 
 /-! ### Kernel-heavy canary ordering
 
@@ -18504,7 +20406,6 @@ private def canaryNestedHooks
 
 -- Peak-RAM guard: elaborate and kernel-check this canary synchronously so its transient kernel
 -- memory does not overlap the asynchronous proof backlog.
-set_option Elab.async false in
 /-- **Closed nested `childSession` (`recursive = true`) `ValidityVisitor.validatePlace` canary
 (`lean-miri#75`, `#79`, `#82`)**, for EVERY `m : AnnealStepState`:
 1. Direct `&(&dyn Trait7)`: ALL 6 invalid vtable forms beat a null inner data pointer through
@@ -18919,8 +20820,8 @@ theorem realAccess_releaseProtector_multiAlloc_frameExit_canary :
       (mkSt (.ReservedFrz false)) tracker (canaryMultiAllocFrame #[(id1, t2), (id2, t3)])
       [(id1, t2), (id2, t3)] rfl rfl rfl frameTag tagOf protOf hprots
       (mkWorlds (.reservedFrz false)) (hsync (.reservedFrz false)) (hdom (.reservedFrz false))
-    have hwOk : (multiAllocEndAccesses tagOf [(id1, t2), (id2, t3)] (mkWorlds (.reservedFrz false))).isOk = true := by
-      decide +kernel
+    have hwOk : (multiAllocEndAccesses tagOf [(id1, t2), (id2, t3)] (mkWorlds (.reservedFrz false))).isOk = true :=
+      rfl
     cases hth : multiAllocEndAccesses tagOf [(id1, t2), (id2, t3)] (mkWorlds (.reservedFrz false)) with
     | error e => rw [hth] at hwOk; cases hwOk
     | ok worlds' =>
@@ -18935,8 +20836,8 @@ theorem realAccess_releaseProtector_multiAlloc_frameExit_canary :
       (mkSt .Unique) tracker (canaryMultiAllocFrame #[(id1, t2), (id2, t3)])
       [(id1, t2), (id2, t3)] rfl rfl rfl frameTag tagOf protOf hprots
       (mkWorlds .unique) (hsync .unique) (hdom .unique)
-    have hwErr : (multiAllocEndAccesses tagOf [(id1, t2), (id2, t3)] (mkWorlds .unique)).isOk = false := by
-      decide +kernel
+    have hwErr : (multiAllocEndAccesses tagOf [(id1, t2), (id2, t3)] (mkWorlds .unique)).isOk = false :=
+      rfl
     cases hth : multiAllocEndAccesses tagOf [(id1, t2), (id2, t3)] (mkWorlds .unique) with
     | ok worlds' => rw [hth] at hwErr; cases hwErr
     | error errT =>
@@ -18949,7 +20850,6 @@ theorem realAccess_releaseProtector_multiAlloc_frameExit_canary :
 
 -- Peak-RAM guard: elaborate and kernel-check this canary synchronously so its transient kernel
 -- memory does not overlap the asynchronous proof backlog.
-set_option Elab.async false in
 /-- **Closed mid-sequence protector-end UB canary (partial mutations are retained)**: a real
 2-allocation frame pop `[(id1, t2), (id2, t3)]` with zero hypotheses. The release of `t2` in `id1`
 is a real implicit **Read** (`Frozen`, accessed) that flips the protected sibling `3` from
@@ -19038,11 +20938,11 @@ theorem multiAlloc_frameExit_midSequenceUB_retains_partial_canary :
     (fun id => realAccessReleaseSim pt (frameTag id) tagOf)
     hprots worlds hsync hdom
   have hfail : ((multiAllocEndAccessesPartial tagOf [(id1, t2), (id2, t3)] worlds).2.map
-      fun p => (p.1.value, p.2.value)) = some (2, 3) := by
-    decide +kernel
+      fun p => (p.1.value, p.2.value)) = some (2, 3) :=
+    rfl
   have hperm : (((multiAllocEndAccessesPartial tagOf [(id1, t2), (id2, t3)] worlds).1 id1).bind
-      fun w => (findNode? w.nodes 2).map (·.perm)) = some (.reservedFrz true) := by
-    decide +kernel
+      fun w => (findNode? w.nodes 2).map (·.perm)) = some (.reservedFrz true) :=
+    rfl
   generalize multiAllocEndAccessesPartial tagOf [(id1, t2), (id2, t3)] worlds = part
     at hsim hfail hperm
   obtain ⟨worlds', fail⟩ := part
@@ -19182,6 +21082,2095 @@ theorem fnEntry_writableChildWrite_vs_rustcNoWritable_endToEnd_canary :
     · intro sib
       rcases h4 sib with ⟨hout, _, entry, w1, _, hfind, hret, _, _, _, hsibSt, w2, hw2, hchSt, w3, _, hw3, _, _, _, hrelSt, hfrzM, w4, w4D, _, hfe, hfrzT, _, _, hrelW⟩
       exact ⟨hout, entry, w1, hfind, hret, hsibSt, hchSt, hrelSt, hfrzM, w2, w3, w4, hw2, hw3, hfe, hfrzT, w4D, hrelW⟩
+
+/-! ### Part 3B. Round-3 closed non-vacuity canaries (`multiSeg_strongWeak_releaseProtector_canary`,
+`multiStep_lifecycle_noABA_and_detached_canary`, `array_sized_zst_uninhabited_and_nested_array_wideDyn_canary`) -/
+
+private def msCanaryTree (locs : Miri.DataStructures.DedupRangeMap Miri.TreeBorrows.LocationTree) :
+    Miri.TreeBorrows.BorrowTree :=
+  let t1 : Miri.Memory.BorTag := ⟨1, by decide⟩
+  let t2 : Miri.Memory.BorTag := ⟨2, by decide⟩
+  let t3 : Miri.Memory.BorTag := ⟨3, by decide⟩
+  { tagMapping := { mapping := #[(t1, ⟨0⟩), (t2, ⟨1⟩), (t3, ⟨2⟩)], deassigned := #[] }
+    nodes :=
+      { data := #[
+          some { tag := t1, parent := none, children := #[⟨1⟩, ⟨2⟩],
+                 defaultInitialPermission := .Unique, defaultInitialSifa := .None, isExposed := false },
+          some { tag := t2, parent := some ⟨0⟩, children := #[],
+                 defaultInitialPermission := .ReservedFrz false, defaultInitialSifa := .None, isExposed := false },
+          some { tag := t3, parent := some ⟨0⟩, children := #[],
+                 defaultInitialPermission := .ReservedFrz false, defaultInitialSifa := .None, isExposed := false }] }
+    locations := locs
+    roots := #[⟨0⟩] }
+
+private def msCanaryWorld (off len : Nat) (p1 p2 : TreeBorrowPerm) : FnEntryBorrowWorld :=
+  { nodes := [
+      { tag := 0, parentTag := none, perm := .unique, accessed := true, protector := none, rangeOffset := off, rangeLen := len },
+      { tag := 1, parentTag := some 0, perm := p1, accessed := true, protector := some 10, rangeOffset := off, rangeLen := len },
+      { tag := 2, parentTag := some 0, perm := p2, accessed := true, protector := some 20, rangeOffset := off, rangeLen := len }]
+    nextTag := 3
+    nextProtector := 30
+    activeProtectors := [10, 20] }
+
+private def msCanaryLoc (p1 p2 : TreeBorrowPerm) : Miri.TreeBorrows.LocationTree :=
+  { perms := { data := #[some ⟨.Unique, true, .None⟩,
+                         some ⟨annealPermToMiri p1, true, .None⟩,
+                         some ⟨annealPermToMiri p2, true, .None⟩] }
+    exposedCache := {} }
+
+private theorem msCanary_segRel
+    (pt : Miri.TreeBorrows.ProtectedTags)
+    (hpt1 : pt.contains ⟨1, by decide⟩ = false)
+    (hpt2 : pt.contains ⟨2, by decide⟩ = true)
+    (hpt3 : pt.contains ⟨3, by decide⟩ = true)
+    (off len : Nat) (hlenPos : 0 < len)
+    (p1 p2 : TreeBorrowPerm) :
+    let tagOf : Miri.Memory.BorTag → Nat := fun t => t.value.toNat - 1
+    let seg : Miri.DataStructures.RangeMapSegment Miri.TreeBorrows.LocationTree :=
+      ⟨⟨UInt64.ofNat off, UInt64.ofNat (off + len)⟩, msCanaryLoc p1 p2⟩
+    BorrowTreeWorldRel pt (fun t => t = ⟨2, by decide⟩) tagOf
+      (msCanaryTree ⟨#[seg]⟩) (msCanaryWorld off len p1 p2) := by
+  intro tagOf seg
+  refine ⟨⟨UInt64.ofNat off, UInt64.ofNat (off + len)⟩, msCanaryLoc p1 p2, off, len, ?_⟩
+  refine ⟨?_, ?_, by simp [msCanaryWorld], rfl, rfl, hlenPos, rfl, ?_, ?_⟩
+  · refine ⟨by simp [msCanaryWorld], fun n hn => ?_⟩
+    simp only [msCanaryWorld, List.mem_cons, List.not_mem_nil, or_false] at hn
+    rcases hn with rfl | rfl | rfl
+    · exact ⟨0, by simp [msCanaryWorld], ReachesRoot.root _ rfl rfl⟩
+    · exact ⟨1, by simp [msCanaryWorld], ReachesRoot.step 0 1 0 _ rfl rfl (ReachesRoot.root _ rfl rfl)⟩
+    · exact ⟨1, by simp [msCanaryWorld], ReachesRoot.step 0 2 0 _ rfl rfl (ReachesRoot.root _ rfl rfl)⟩
+  · intro i n h; match i with
+    | 0 | 1 | 2 => simp only [msCanaryWorld] at h; injection h with h; subst h; rfl
+    | _ + 3 => simp [msCanaryWorld] at h
+  · intro i wn h; match i with
+    | 0 =>
+      simp only [msCanaryWorld] at h; injection h with h; subst h
+      exact ⟨_, _, rfl, rfl, rfl, rfl, rfl, rfl, hpt1, rfl, rfl, rfl, rfl, rfl, Or.inl rfl, trivial⟩
+    | 1 =>
+      simp only [msCanaryWorld] at h; injection h with h; subst h
+      refine ⟨_, _, rfl, rfl, rfl, rfl, rfl, rfl, hpt2, rfl, rfl, rfl, rfl, rfl, ?_, trivial⟩
+      cases p1 <;> first | exact Or.inl rfl | exact Or.inr rfl
+    | 2 =>
+      simp only [msCanaryWorld] at h; injection h with h; subst h
+      refine ⟨_, _, rfl, rfl, rfl, rfl, rfl, rfl, hpt3, rfl, rfl, rfl, rfl, rfl, ?_, trivial⟩
+      cases p2 <;> first | exact Or.inl rfl | exact Or.inr rfl
+    | _ + 3 => simp [msCanaryWorld] at h
+  · intro tag htag; subst htag; exact ⟨1, by simp [msCanaryWorld], rfl, rfl⟩
+
+private def lcId1 : Miri.Memory.AllocId := ⟨1, by decide⟩
+private def lcTag1 : Miri.Memory.BorTag := ⟨1, by decide⟩
+private def lcTag2 : Miri.Memory.BorTag := ⟨2, by decide⟩
+
+private def lcInitLoc : Miri.TreeBorrows.LocationTree :=
+  { perms := { data := #[some ⟨.Unique, true, .None⟩] }, exposedCache := {} }
+
+private def lcInitTree : Miri.TreeBorrows.BorrowTree :=
+  { tagMapping := { mapping := #[(lcTag1, ⟨0⟩)], deassigned := #[] }
+    nodes :=
+      { data := #[
+          some { tag := lcTag1, parent := none, children := #[],
+                 defaultInitialPermission := .Disabled, defaultInitialSifa := .None, isExposed := false }] }
+    locations := ⟨#[⟨⟨0, 4⟩, lcInitLoc⟩]⟩
+    roots := #[⟨0⟩] }
+
+private def lcRetagLoc : Miri.TreeBorrows.LocationTree :=
+  { perms := { data := #[some ⟨.Unique, true, .None⟩, some ⟨.Unique, true, .None⟩] }
+    exposedCache := {} }
+
+private def lcRetagTree : Miri.TreeBorrows.BorrowTree :=
+  { tagMapping := { mapping := #[(lcTag1, ⟨0⟩), (lcTag2, ⟨1⟩)], deassigned := #[] }
+    nodes :=
+      { data := #[
+          some { tag := lcTag1, parent := none, children := #[⟨1⟩],
+                 defaultInitialPermission := .Disabled, defaultInitialSifa := .None, isExposed := false },
+          some { tag := lcTag2, parent := some ⟨0⟩, children := #[],
+                 defaultInitialPermission := .ReservedFrz false, defaultInitialSifa := .None, isExposed := false }] }
+    locations := ⟨#[⟨⟨0, 4⟩, lcRetagLoc⟩]⟩
+    roots := #[⟨0⟩] }
+
+private theorem lcRetagTree_deallocateBorrowRange_eval
+    (pt : Miri.TreeBorrows.ProtectedTags)
+    (b1 b2 : Bool)
+    (hc1 : pt.contains lcTag1 = b1)
+    (hc2 : pt.contains lcTag2 = b2) :
+    (lcRetagTree.deallocateBorrowRange (.concrete lcTag2) Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4) pt).status =
+      if pt.get lcTag2 == some .StrongProtector then .ProtectedDealloc ⟨0, 4⟩ ⟨1⟩
+      else if pt.get lcTag1 == some .StrongProtector then .ProtectedDealloc ⟨0, 4⟩ ⟨0⟩
+      else .Deallocated := by
+  let pn : List Nat := (if b1 then [0] else []) ++ (if b2 then [1] else [])
+  let normS : Miri.TreeBorrows.Tree.NormalTreeState :=
+    { topology := ⟨#[⟨none, [1]⟩, ⟨some 0, []⟩]⟩
+      defaultStates := #[⟨.Disabled, false, .None⟩, ⟨.ReservedFrz false, false, .None⟩]
+      protectedNodes := pn
+      locationStates := #[some ⟨.Unique, true, .None⟩, some ⟨.Unique, true, .None⟩] }
+  have hnormProj : miriNormalProjection { lcRetagTree with locations := ⟨#[]⟩ } lcRetagLoc pt = normS := by
+    rw [miriNormalProjection_eq_struct]
+    simp only [lcRetagTree, uniValMap_entries_2, array_map_2, array_mapIdx_2, lcRetagLoc,
+      Miri.TreeBorrows.TreeNode.defaultLocationState, Miri.TreeBorrows.UniValMap.get,
+      Miri.TreeBorrows.UniIndex.toNat, Miri.TreeBorrows.UniIndex.ofNat?,
+      Option.map_none, Option.map_some, List.map_nil, List.map_cons,
+      List.filterMap_cons, List.filterMap_nil, hc1, hc2]
+    cases b1 <;> cases b2 <;> rfl
+  have hlocsEq : (normS.performAccess 1 .Write .VisitChildrenOfAccessed).tree.locationStates =
+      #[some ⟨.Unique, true, .None⟩, some ⟨.Unique, true, .None⟩] := by
+    cases b1 <;> cases b2 <;> decide
+  have hvis : ∀ ev ∈ (normS.performAccess 1 .Write .VisitChildrenOfAccessed).visited,
+      ∃ idx nd, Miri.TreeBorrows.UniIndex.ofNat? ev.node = some idx ∧
+        ({ lcRetagTree with locations := ⟨#[]⟩ } : Miri.TreeBorrows.BorrowTree).nodeAt idx = some nd ∧
+        nd.isExposed = false := by
+    have hall : ((normS.performAccess 1 .Write .VisitChildrenOfAccessed).visited.all fun ev =>
+        ev.node == 0 || ev.node == 1) = true := by
+      cases b1 <;> cases b2 <;> decide
+    intro ev hev
+    have h01 := List.all_eq_true.mp hall ev hev
+    simp only [Bool.or_eq_true, beq_iff_eq] at h01
+    rcases h01 with h0 | h1
+    · exact ⟨⟨0⟩, _, by rw [h0]; rfl, rfl, rfl⟩
+    · exact ⟨⟨1⟩, _, by rw [h1]; rfl, rfl, rfl⟩
+  have hnormAcc : ({ lcRetagTree with locations := ⟨#[]⟩ }).performNormalAccessAt
+      lcRetagLoc ⟨1⟩ .Write pt .VisitChildrenOfAccessed =
+      ⟨lcRetagLoc, normS.performAccess 1 .Write .VisitChildrenOfAccessed, .ok ()⟩ := by
+    have hwb := performNormalAccessAt_unexposed_eval { lcRetagTree with locations := ⟨#[]⟩ }
+      lcRetagLoc ⟨1⟩ .Write pt .VisitChildrenOfAccessed
+      (normS.performAccess 1 .Write .VisitChildrenOfAccessed)
+      (by rw [hnormProj]; rfl) hvis
+    rw [hwb, hlocsEq]
+    rfl
+  have hstComp : (normS.performAccess 1 .Write .VisitChildrenOfAccessed).status = .Completed := by
+    cases b1 <;> cases b2 <;> decide
+  have hrt0 : (normS.performAccess 1 .Write .VisitChildrenOfAccessed).root = 0 := by
+    cases b1 <;> cases b2 <;> decide
+  have hta := performTreeAccessAt_singleRoot0_eval lcRetagTree lcRetagLoc ⟨1⟩ .Write pt .VisitChildrenOfAccessed
+    ⟨0, 4⟩ rfl (fun l1 l2 => performNormalAccessAt_locations_indep lcRetagTree l1 l2 _ _ _ _ _)
+    ⟨lcRetagLoc, normS.performAccess 1 .Write .VisitChildrenOfAccessed, .ok ()⟩
+    hnormAcc rfl (fun _ => hrt0)
+  rw [hstComp] at hta
+  simp only [beq_self_eq_true, ↓reduceIte] at hta
+  have hacc := performBorrowAccessRange_singleFull_eval lcRetagTree 4 (by decide) lcRetagLoc rfl
+    lcTag2 ⟨1⟩ rfl .Write pt .VisitChildrenOfAccessed lcRetagLoc
+    (some (normS.performAccess 1 .Write .VisitChildrenOfAccessed)) none hta
+  have hacc1 : (lcRetagTree.performBorrowAccessRange (.concrete lcTag2) Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4)
+      .Write pt .VisitChildrenOfAccessed).status = .Completed := hacc.1
+  have hacc2 : (lcRetagTree.performBorrowAccessRange (.concrete lcTag2) Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4)
+      .Write pt .VisitChildrenOfAccessed).tree = lcRetagTree := hacc.2
+  have him := dedupRangeMap_iterMut_singleFull 4 (by decide) lcRetagLoc
+  have hlocs : lcRetagTree.locations = ⟨#[⟨⟨0, 4⟩, lcRetagLoc⟩]⟩ := rfl
+  have hidx2 : lcRetagTree.indexOfTag lcTag2 = some ⟨1⟩ := rfl
+  have hind0 : (⟨#[⟨⟨0, 4⟩, lcRetagLoc⟩]⟩ :
+      Miri.DataStructures.DedupRangeMap Miri.TreeBorrows.LocationTree).index 0 =
+      .ok ⟨⟨0, 4⟩, lcRetagLoc⟩ := rfl
+  have hproj : (miri_etm_private% Miri.TreeBorrows.TreeState Miri.TreeBorrows.BorrowTree.traversalProjection) lcRetagTree =
+      ⟨#[⟨none, [1]⟩, ⟨some 0, []⟩]⟩ := by
+    change Miri.TreeBorrows.Tree.TraversalTree.mk (lcRetagTree.nodes.data.map _) = _
+    dsimp only [lcRetagTree]
+    rw [array_map_2]
+    rfl
+  have htrav : Miri.TreeBorrows.Tree.TraversalTree.traverse
+      ((miri_etm_private% Miri.TreeBorrows.TreeState Miri.TreeBorrows.BorrowTree.traversalProjection) lcRetagTree)
+      1 .VisitChildrenOfAccessed [] = (0, [⟨1, .LocalAccess⟩, ⟨0, .LocalAccess⟩]) := by
+    rw [hproj]; decide
+  have h1Nat : (1 : UInt32).toNat = 1 := rfl
+  have hrev0 : (#[(⟨0⟩ : Miri.TreeBorrows.UniIndex)]).reverse = #[⟨0⟩] := rfl
+  have hof0 : Miri.TreeBorrows.UniIndex.ofNat? 0 = some ⟨0⟩ := rfl
+  have hof1 : Miri.TreeBorrows.UniIndex.ofNat? 1 = some ⟨1⟩ := rfl
+  have hnd0 : lcRetagTree.nodes.get ⟨0⟩ = some
+      { tag := lcTag1, parent := none, children := #[⟨1⟩],
+        defaultInitialPermission := .Disabled, defaultInitialSifa := .None, isExposed := false } := rfl
+  have hnd1 : lcRetagTree.nodes.get ⟨1⟩ = some
+      { tag := lcTag2, parent := some ⟨0⟩, children := #[],
+        defaultInitialPermission := .ReservedFrz false, defaultInitialSifa := .None, isExposed := false } := rfl
+  have hget0 : lcRetagLoc.perms.get ⟨0⟩ = some ⟨.Unique, true, .None⟩ := rfl
+  have hget1 : lcRetagLoc.perms.get ⟨1⟩ = some ⟨.Unique, true, .None⟩ := rfl
+  unfold Miri.TreeBorrows.BorrowTree.deallocateBorrowRange
+  simp only [Id.run, bind, Bind.bind, pure, Pure.pure, hacc1, hacc2, hidx2, hlocs, him,
+    bne_self_eq_false, Option.isNone_some, Bool.false_eq_true, ↓reduceIte, Array.size_singleton,
+    forIn_range_one_id, Miri.TreeBorrows.UniIndex.toNat, h1Nat]
+  rw [htrav]
+  have hroots : lcRetagTree.roots = #[⟨0⟩] := rfl
+  rw [hroots, hrev0]
+  dsimp only [Miri.TreeBorrows.BorrowTree.nodeAt]
+  simp only [hof0, hof1, hnd0, hnd1,
+    ← Array.forIn_toList, List.forIn_cons, List.forIn_nil,
+    bind, Bind.bind, pure, Pure.pure, bne_self_eq_false, Bool.false_and, Bool.false_eq_true, ↓reduceIte]
+  cases h2 : pt.get lcTag2 == some .StrongProtector with
+  | true => simp [hget1, Miri.TreeBorrows.Permission.isCell]
+  | false =>
+    simp only [Bool.false_eq_true, ↓reduceIte]
+    cases h1 : pt.get lcTag1 == some .StrongProtector with
+    | true => simp [hget0, Miri.TreeBorrows.Permission.isCell]
+    | false => simp [hind0]
+
+/-- **Closed multi-segment `BorrowTree.releaseProtector`, Strong/Weak separation, &
+`beforeStackPopWithEnsure` frame-preservation canary (`lean-miri#74`)**:
+1. 4-segment `DedupRangeMap` (`[0,4)` tracked implicit Read flipping sibling `2` `ReservedFrz false ->
+   ReservedFrz true`, `[4,8)` skipped unmaterialized `perms.get = none`, `[8,12)` failing implicit
+   Write against outer-protected sibling `2 : Frozen`, `[12,16)` trailing untouched): zero segment
+   splitting/coalescing (`entries.size = 4`, all 4 ranges preserved), exact prefix mutation retained
+   at `[0,4)`, `[4,8)` & `[12,16)` byte-for-byte unchanged, failure at `[8,12)`;
+2. Strong vs Weak irrelevance in `BorrowTree.releaseProtector` (`ptSW`, `ptWS`, `ptWW` identical)
+   contrasted with 3-way separation in `BorrowTree.deallocateBorrowRange` (`ptSW` ->
+   `.ProtectedDealloc ⟨0,4⟩ ⟨1⟩`, `ptWS` -> `.ProtectedDealloc ⟨0,4⟩ ⟨0⟩`, `ptWW` -> `.Deallocated`);
+3. `miri_beforeStackPopWithEnsure_realAccess_multiAlloc_partial_sim` preserves `nextAllocId`,
+   `globals`, `dead`, `issuedIds`, `sourceAllocIdWorldActive`, `idSupplyExhausted`, `raceAllocations`,
+   and an unrelated live allocation `id3` identically across frame exit! -/
+theorem multiSeg_strongWeak_releaseProtector_canary :
+    let t2 : Miri.Memory.BorTag := ⟨2, by decide⟩
+    let t3 : Miri.Memory.BorTag := ⟨3, by decide⟩
+    let pt4SW : Miri.TreeBorrows.ProtectedTags := ⟨#[(t2, .StrongProtector), (t3, .WeakProtector)]⟩
+    let pt4WS : Miri.TreeBorrows.ProtectedTags := ⟨#[(t2, .WeakProtector), (t3, .StrongProtector)]⟩
+    let pt4WW : Miri.TreeBorrows.ProtectedTags := ⟨#[(t2, .WeakProtector), (t3, .WeakProtector)]⟩
+    let ptSW : Miri.TreeBorrows.ProtectedTags := ⟨#[(lcTag1, .WeakProtector), (lcTag2, .StrongProtector)]⟩
+    let ptWS : Miri.TreeBorrows.ProtectedTags := ⟨#[(lcTag1, .StrongProtector), (lcTag2, .WeakProtector)]⟩
+    let ptWW : Miri.TreeBorrows.ProtectedTags := ⟨#[(lcTag1, .WeakProtector), (lcTag2, .WeakProtector)]⟩
+    let unmatLoc : Miri.TreeBorrows.LocationTree :=
+      { perms := { data := #[some ⟨.Unique, true, .None⟩, none, some ⟨.Frozen, true, .None⟩] }
+        exposedCache := {} }
+    let seg0 : Miri.DataStructures.RangeMapSegment Miri.TreeBorrows.LocationTree :=
+      ⟨⟨0, 4⟩, msCanaryLoc (.reservedFrz false) (.reservedFrz false)⟩
+    let seg1 : Miri.DataStructures.RangeMapSegment Miri.TreeBorrows.LocationTree := ⟨⟨4, 8⟩, unmatLoc⟩
+    let seg2 : Miri.DataStructures.RangeMapSegment Miri.TreeBorrows.LocationTree :=
+      ⟨⟨8, 12⟩, msCanaryLoc .unique .frozen⟩
+    let seg3 : Miri.DataStructures.RangeMapSegment Miri.TreeBorrows.LocationTree :=
+      ⟨⟨12, 16⟩, msCanaryLoc .unique (.reservedFrz false)⟩
+    let tree4 : Miri.TreeBorrows.BorrowTree := msCanaryTree ⟨#[seg0, seg1, seg2, seg3]⟩
+    let res4 := tree4.releaseProtector t2 pt4SW
+    -- (1) 4-segment `releaseProtector`: no splitting/coalescing, `[0,4)` flipped, `[4,8)` & `[12,16)` untouched, fails at `[8,12)`:
+    res4.tree.locations.entries.size = 4 ∧
+    (∀ j : Nat, (res4.tree.locations.entries[j]?).map (·.range) = (tree4.locations.entries[j]?).map (·.range)) ∧
+    (∃ errSt, res4.status = .AccessFailure ⟨8, 12⟩ errSt) ∧
+    (res4.tree.locations.entries[0]?.bind fun s => (s.data.perms.get ⟨2⟩).map (·.permission)) =
+      some (.ReservedFrz true) ∧
+    res4.tree.locations.entries[1]? = some seg1 ∧
+    res4.tree.locations.entries[3]? = some seg3 ∧
+    -- (2) Strong vs Weak irrelevance in `releaseProtector` vs 3-way separation in `deallocateBorrowRange`:
+    tree4.releaseProtector t2 pt4SW = tree4.releaseProtector t2 pt4WS ∧
+    tree4.releaseProtector t2 pt4WS = tree4.releaseProtector t2 pt4WW ∧
+    lcRetagTree.releaseProtector lcTag2 ptSW = lcRetagTree.releaseProtector lcTag2 ptWS ∧
+    lcRetagTree.releaseProtector lcTag2 ptWS = lcRetagTree.releaseProtector lcTag2 ptWW ∧
+    (lcRetagTree.deallocateBorrowRange (.concrete lcTag2) Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4) ptSW).status =
+      .ProtectedDealloc ⟨0, 4⟩ ⟨1⟩ ∧
+    (lcRetagTree.deallocateBorrowRange (.concrete lcTag2) Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4) ptWS).status =
+      .ProtectedDealloc ⟨0, 4⟩ ⟨0⟩ ∧
+    (lcRetagTree.deallocateBorrowRange (.concrete lcTag2) Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4) ptWW).status =
+      .Deallocated ∧
+    -- (3) `beforeStackPopWithEnsure` real-access frame preservation with an unrelated 3rd live allocation `id3`:
+    let id1 : Miri.Memory.AllocId := ⟨1, by decide⟩
+    let id2 : Miri.Memory.AllocId := ⟨2, by decide⟩
+    let id3 : Miri.Memory.AllocId := ⟨3, by decide⟩
+    let pt23 : Miri.TreeBorrows.ProtectedTags := ⟨#[(t2, .StrongProtector), (t3, .StrongProtector)]⟩
+    let tracker : Miri.Interpreter.MachineHooks.BorrowState :=
+      { global := { nextPointerTag := ⟨4, by decide⟩
+                    rootPointerTags := #[(id1, ⟨1, by decide⟩), (id2, ⟨1, by decide⟩), (id3, ⟨1, by decide⟩)]
+                    protectedTags := pt23, trackedPointerTags := #[] }
+        retagMode := .Default }
+    let st3 : Miri.Interpreter.MachineHooks.State Unit Unit :=
+      { stack := ⟨#[canaryMultiAllocFrame #[(id1, t2), (id2, t3)]]⟩
+        machine := {
+          memory := { (Miri.Memory.MemoryState.empty :
+              Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit) with
+            nextAllocId := 4
+            live := #[(id1, ⟨.stack, liveTreeAllocation canaryMultiAllocTree1⟩),
+                      (id2, ⟨.stack, liveTreeAllocation (canaryMultiAllocTree2 (.ReservedFrz false))⟩),
+                      (id3, ⟨.stack, liveTreeAllocation canaryMultiAllocTree1⟩)] }
+          borrowTracker := some tracker
+          dataRace := none
+          threads := Miri.Concurrency.ThreadManager.initial true
+          raceAllocations := #[]
+          allocationSpans := #[]
+          user := () } }
+    ∃ st',
+      Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ()) st3 = .ok () st' ∧
+      st'.machine.memory.nextAllocId = 4 ∧
+      st'.machine.memory.globals = #[] ∧
+      st'.machine.memory.dead = #[] ∧
+      st'.machine.memory.issuedIds = #[] ∧
+      st'.machine.raceAllocations = #[] ∧
+      st'.machine.memory.live.find? (fun e => e.1 == id3) =
+        some (id3, ⟨.stack, liveTreeAllocation canaryMultiAllocTree1⟩) := by
+  intro t2 t3 pt4SW pt4WS pt4WW ptSW ptWS ptWW unmatLoc seg0 seg1 seg2 seg3 tree4 res4
+  let tagOf : Miri.Memory.BorTag → Nat := fun t => t.value.toNat - 1
+  let specs : List SegReleaseSpec :=
+    [.tracked (msCanaryWorld 0 4 (.reservedFrz false) (.reservedFrz false)),
+     .skipped,
+     .tracked (msCanaryWorld 8 4 .unique .frozen),
+     .tracked (msCanaryWorld 12 4 .unique (.reservedFrz false))]
+  have hrel4 : ∀ (k : Nat) seg spec, tree4.locations.entries[k]? = some seg → specs[k]? = some spec →
+      SegReleaseRel pt4SW (fun t => t = t2) tagOf tree4 ⟨1⟩ seg spec := by
+    intro k seg spec hs hsp
+    match k with
+    | 0 =>
+      simp only [tree4, msCanaryTree, specs] at hs hsp
+      injection hs with hs; injection hsp with hsp; subst hs; subst hsp
+      exact msCanary_segRel pt4SW (by decide) (by decide) (by decide) 0 4 (by decide)
+        (.reservedFrz false) (.reservedFrz false)
+    | 1 =>
+      simp only [tree4, msCanaryTree, specs] at hs hsp
+      injection hs with hs; injection hsp with hsp; subst hs; subst hsp
+      exact trivial
+    | 2 =>
+      simp only [tree4, msCanaryTree, specs] at hs hsp
+      injection hs with hs; injection hsp with hsp; subst hs; subst hsp
+      exact msCanary_segRel pt4SW (by decide) (by decide) (by decide) 8 4 (by decide)
+        .unique .frozen
+    | 3 =>
+      simp only [tree4, msCanaryTree, specs] at hs hsp
+      injection hs with hs; injection hsp with hsp; subst hs; subst hsp
+      exact msCanary_segRel pt4SW (by decide) (by decide) (by decide) 12 4 (by decide)
+        .unique (.reservedFrz false)
+    | _ + 4 => simp [specs] at hsp
+  have hms := miri_releaseProtector_multiSeg_partial_sim tree4 t2 ⟨1⟩ _ pt4SW (fun t => t = t2) tagOf specs
+    rfl rfl rfl rfl rfl hrel4
+  have hpart4 : multiSegEndAccessPartial (tagOf t2) specs =
+      ([.tracked (msCanaryWorld 0 4 (.reservedFrz false) (.reservedFrz true)),
+        .skipped,
+        .tracked (msCanaryWorld 8 4 .unique .frozen),
+        .tracked (msCanaryWorld 12 4 .unique (.reservedFrz false))], some 2) := by
+    decide
+  rcases hms with ⟨_, _, _, hsz4, hrng4, hmatch4⟩
+  rw [hpart4] at hmatch4
+  have hfail4 : (∃ errSt, res4.status = .AccessFailure ⟨8, 12⟩ errSt) ∧
+      (res4.tree.locations.entries[0]?.bind fun s => (s.data.perms.get ⟨2⟩).map (·.permission)) =
+        some (.ReservedFrz true) ∧
+      res4.tree.locations.entries[1]? = some seg1 ∧
+      res4.tree.locations.entries[3]? = some seg3 := by
+    cases hst : res4.status with
+    | AccessFailure rng errSt =>
+      rw [hst] at hmatch4
+      rcases hmatch4 with ⟨_, hrg, hpref, htail⟩
+      have hrngEq : rng = ⟨8, 12⟩ := Option.some.inj hrg.symm
+      subst hrngEq
+      have hlt0 : 0 < res4.tree.locations.entries.size := by rw [hsz4]; decide
+      have hs0 := Array.getElem?_eq_getElem hlt0
+      obtain ⟨hR0, _⟩ := hpref 0 _ _ (by decide) hs0 rfl
+      rcases hR0 with ⟨_, loc0, _, _, hcore0⟩
+      have hlocEq : loc0 = res4.tree.locations.entries[0].data := by
+        have h := hcore0.locs_eq; dsimp only at h
+        have h' := congrArg (fun m => (m.entries[0]?).map (·.data)) h
+        simpa using h'.symm
+      obtain ⟨_, st2, _, _, _, _, _, _, _, _, _, hperm2, hpm2, _, _, _⟩ := hcore0.node_sync 2 _ rfl
+      have hpm2Eq : st2.permission = .ReservedFrz true := hpm2
+      have hperm0 : (res4.tree.locations.entries[0]?.bind fun s => (s.data.perms.get ⟨2⟩).map (·.permission)) =
+          some (.ReservedFrz true) := by
+        rw [hs0, Option.bind_some, ← hlocEq]
+        change (loc0.perms.get ⟨UInt32.ofNat 2⟩).map (·.permission) = some (.ReservedFrz true)
+        rw [hperm2, Option.map_some, hpm2Eq]
+      have hlt1 : 1 < res4.tree.locations.entries.size := by rw [hsz4]; decide
+      have hs1 := Array.getElem?_eq_getElem hlt1
+      have hsk1 := (hpref 1 _ _ (by decide) hs1 rfl).2 rfl
+      exact ⟨⟨errSt, rfl⟩, hperm0, hsk1, htail 3 (by decide)⟩
+    | _ => rw [hst] at hmatch4; exact False.elim hmatch4
+  have hdomEq : ∀ (a b : Miri.Memory.BorTag) (k1 k2 k3 k4 : Miri.TreeBorrows.ProtectorKind) (t : Miri.Memory.BorTag),
+      (⟨#[(a, k1), (b, k2)]⟩ : Miri.TreeBorrows.ProtectedTags).contains t =
+      (⟨#[(a, k3), (b, k4)]⟩ : Miri.TreeBorrows.ProtectedTags).contains t := by
+    intro a b k1 k2 k3 k4 t
+    unfold Miri.TreeBorrows.ProtectedTags.contains Miri.TreeBorrows.ProtectedTags.get
+    rw [← Array.find?_toList, ← Array.find?_toList]
+    change (([(a, k1), (b, k2)].find? fun e => e.1 == t).map Prod.snd).isSome =
+      (([(a, k3), (b, k4)].find? fun e => e.1 == t).map Prod.snd).isSome
+    simp only [List.find?]
+    by_cases ha : a == t
+    · simp [ha]
+    · by_cases hb : b == t <;> simp [ha, hb]
+  refine ⟨hsz4, hrng4, hfail4.1, hfail4.2.1, hfail4.2.2.1, hfail4.2.2.2,
+    miri_releaseProtector_strong_weak_irrelevant tree4 t2 pt4SW pt4WS (hdomEq t2 t3 _ _ _ _),
+    miri_releaseProtector_strong_weak_irrelevant tree4 t2 pt4WS pt4WW (hdomEq t2 t3 _ _ _ _),
+    miri_releaseProtector_strong_weak_irrelevant lcRetagTree lcTag2 ptSW ptWS (hdomEq lcTag1 lcTag2 _ _ _ _),
+    miri_releaseProtector_strong_weak_irrelevant lcRetagTree lcTag2 ptWS ptWW (hdomEq lcTag1 lcTag2 _ _ _ _),
+    ?_, ?_, ?_, ?_⟩
+  · rw [lcRetagTree_deallocateBorrowRange_eval ptSW true true (by decide) (by decide)]; rfl
+  · rw [lcRetagTree_deallocateBorrowRange_eval ptWS true true (by decide) (by decide)]; rfl
+  · rw [lcRetagTree_deallocateBorrowRange_eval ptWW true true (by decide) (by decide)]; rfl
+  · intro id1 id2 id3 pt23 tracker st3
+    let tagOf' : Miri.Memory.BorTag → Nat := fun t => t.value.toNat - 1
+    let frameTag : Miri.Memory.AllocId → Miri.Memory.BorTag → Prop :=
+      fun id t => (id = id1 ∧ t = t2) ∨ (id = id2 ∧ t = t3)
+    let worlds : Miri.Memory.AllocId → Option FnEntryBorrowWorld :=
+      fun id => if id == id1 then some canaryMultiAllocWorld1
+        else if id == id2 then some (canaryMultiAllocWorld2 (.reservedFrz false))
+        else none
+    have hrel1 : BorrowTreeWorldRel pt23 (frameTag id1) tagOf' canaryMultiAllocTree1 canaryMultiAllocWorld1 := by
+      refine ⟨⟨0, 4⟩,
+        { perms := { data := #[some ⟨.Unique, true, .None⟩, some ⟨.Unique, true, .None⟩] }, exposedCache := {} },
+        0, 4, ?_⟩
+      refine ⟨?_, ?_, by decide, rfl, rfl, by decide, rfl, ?_, ?_⟩
+      · refine ⟨by simp [canaryMultiAllocWorld1], fun n hn => ?_⟩
+        simp only [canaryMultiAllocWorld1, List.mem_cons, List.not_mem_nil, or_false] at hn
+        rcases hn with rfl | rfl
+        · exact ⟨0, by simp [canaryMultiAllocWorld1], ReachesRoot.root _ rfl rfl⟩
+        · exact ⟨1, by simp [canaryMultiAllocWorld1], ReachesRoot.step 0 1 0 _ rfl rfl (ReachesRoot.root _ rfl rfl)⟩
+      · intro i n h; match i with
+        | 0 | 1 => injection h with h; subst h; rfl
+        | _ + 2 => cases h
+      · intro i wn h; match i with
+        | 0 | 1 =>
+          injection h with h; subst h
+          exact ⟨_, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, Or.inl rfl, trivial⟩
+        | _ + 2 => cases h
+      · intro tag htag
+        rcases htag with ⟨_, rfl⟩ | ⟨h12, _⟩
+        · exact ⟨1, by decide, rfl, rfl⟩
+        · exact absurd h12 (by decide)
+    have hrel2 : BorrowTreeWorldRel pt23 (frameTag id2) tagOf'
+        (canaryMultiAllocTree2 (.ReservedFrz false)) (canaryMultiAllocWorld2 (.reservedFrz false)) :=
+      canaryMultiAlloc_rel2 (.reservedFrz false) (frameTag id2) (fun t ht => by
+        rcases ht with ⟨h21, _⟩ | ⟨_, rfl⟩
+        · exact absurd h21 (by decide)
+        · exact Or.inr rfl)
+    have hsync : ∀ id w, worlds id = some w →
+        ∃ entry, st3.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry) ∧
+          BorrowTreeWorldRel pt23 (frameTag id) tagOf' entry.allocation.extra w := by
+      intro id w hw
+      dsimp only [worlds] at hw
+      by_cases h1 : id == id1
+      · have hid : id = id1 := eq_of_beq h1; subst hid
+        simp only [beq_self_eq_true, ↓reduceIte, Option.some.injEq] at hw; subst hw
+        exact ⟨_, rfl, hrel1⟩
+      · by_cases h2 : id == id2
+        · have hid : id = id2 := eq_of_beq h2; subst hid
+          simp only [h1, Bool.false_eq_true, beq_self_eq_true, ↓reduceIte, Option.some.injEq] at hw; subst hw
+          exact ⟨_, rfl, hrel2⟩
+        · simp only [h1, h2, Bool.false_eq_true, ↓reduceIte] at hw; cases hw
+    have hsim := miri_beforeStackPopWithEnsure_realAccess_multiAlloc_partial_sim st3 tracker
+      (canaryMultiAllocFrame #[(id1, t2), (id2, t3)]) [(id1, t2), (id2, t3)] rfl rfl rfl
+      frameTag tagOf'
+      (fun p hp => by simp only [List.mem_cons, List.not_mem_nil, or_false] at hp; rcases hp with rfl | rfl; exact Or.inl ⟨rfl, rfl⟩; exact Or.inr ⟨rfl, rfl⟩)
+      worlds hsync
+      (fun p hp => by simp only [List.mem_cons, List.not_mem_nil, or_false] at hp; rcases hp with rfl | rfl <;> rfl)
+    have hpartOk : (multiAllocEndAccessesPartial tagOf' [(id1, t2), (id2, t3)] worlds).2 = none := rfl
+    cases hm : Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ()) st3 with
+    | error e st' =>
+      rw [hm] at hsim
+      cases hpf : multiAllocEndAccessesPartial tagOf' [(id1, t2), (id2, t3)] worlds with
+      | mk ws fl =>
+        rw [hpf] at hpartOk hsim
+        dsimp only at hpartOk
+        subst hpartOk
+        exact False.elim hsim
+    | ok u st' =>
+      cases u; rw [hm] at hsim
+      cases hpf : multiAllocEndAccessesPartial tagOf' [(id1, t2), (id2, t3)] worlds with
+      | mk ws fl =>
+        rw [hpf] at hpartOk hsim
+        dsimp only at hpartOk
+        subst hpartOk
+        rcases hsim with ⟨⟨hnext, hglob, hdead, hiss, _, _, hrace, hother⟩, _, _⟩
+        exact ⟨st', rfl, hnext, hglob, hdead, hiss, hrace,
+          hother id3 (fun p hp => by simp only [List.mem_cons, List.not_mem_nil, or_false] at hp; rcases hp with rfl | rfl <;> decide)⟩
+
+private def lcZeroed : Miri.ABI.Size → Miri.ABI.Align → Option (Array UInt8) :=
+  fun sz _ => some (Array.replicate sz.bytes.toNat 0)
+
+private def lcAllocCfg : Miri.Interpreter.PlaceMachine.AllocationConfig Unit (Miri.Interpreter.MemoryExtras.Registry Unit) :=
+  Miri.Interpreter.MemoryExtras.bindAllocation canaryDeallocHooks.extras false
+    { zeroedStorage := lcZeroed
+      nativeStorage := none
+      maximumObjectSize := Miri.ABI.Size.ofBytes 1024
+      diagnostic := fun _ _ _ => pure ()
+      allocationTail := fun _ _ _ => pure ()
+      adjustRootAddress := fun id tag => pure ⟨Miri.ABI.Size.ZERO, .concrete id tag⟩ }
+
+private theorem lcAllocCfg_tail_eval (id : Miri.Memory.AllocId) (sz : Miri.ABI.Size) (al : Miri.ABI.Align)
+    (m : Miri.Interpreter.MachineHooks.MachineState Unit (Miri.Interpreter.MemoryExtras.Registry Unit))
+    (huser : m.user = {}) :
+    lcAllocCfg.allocationTail id sz al m =
+      .ok () { m with user := { allocations := #[(id, ⟨none, #[]⟩)] } } := by
+  unfold lcAllocCfg Miri.Interpreter.MemoryExtras.bindAllocation Miri.Interpreter.MemoryExtras.initAllocation
+    Miri.Interpreter.MemoryExtras.putAllocation
+  have hany : ((#[] : Array (Miri.Memory.AllocId × Miri.Interpreter.MemoryExtras.AllocationExtra Unit)).any
+      fun entry => entry.1 == id) = false := by simp
+  have hflt : ((#[] : Array (Miri.Memory.AllocId × Miri.Interpreter.MemoryExtras.AllocationExtra Unit)).filter
+      fun entry => entry.1 != id) = #[] := by simp
+  simp only [canaryDeallocHooks, id_eq, huser, hany, hflt,
+    bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure,
+    get, getThe, MonadStateOf.get, EStateM.get,
+    set, MonadStateOf.set, EStateM.set,
+    tryCatch, tryCatchThe, MonadExceptOf.tryCatch, EStateM.tryCatch,
+    Bool.false_eq_true, ↓reduceIte]
+  rfl
+
+private def lcRetagReq : Miri.TreeBorrows.RetagPipeline.Request where
+  typeShape := .reference
+  typeFacts := ⟨true, true, true⟩
+  referenceKind := .Mutable
+  mode := .FnEntry
+  config := ⟨true, false⟩
+  layoutSize := Miri.ABI.Size.ofBytes 4
+  originalProvenance := some (.concrete lcId1 lcTag1)
+  pointeeIsFreeze := true
+  preciseInteriorMut := false
+  hooks := { allocationResolution := some ⟨lcId1, Miri.ABI.Size.ZERO, .concrete lcTag1⟩ }
+
+private def lcRetagWorld : FnEntryBorrowWorld :=
+  { nodes := [
+      { tag := 0, parentTag := none, perm := .unique, accessed := true, protector := none, rangeOffset := 0, rangeLen := 4 },
+      { tag := 1, parentTag := some 0, perm := .unique, accessed := true, protector := some 10, rangeOffset := 0, rangeLen := 4 }]
+    nextTag := 2
+    nextProtector := 20
+    activeProtectors := [10] }
+
+private theorem lcInitTree_newChild_eq :
+    let inside : Miri.DataStructures.DedupRangeMap Miri.TreeBorrows.Tree.LocationState :=
+      ⟨#[⟨⟨0, 4⟩, ⟨.Unique, true, .None⟩⟩]⟩
+    lcInitTree.newChild Miri.ABI.Size.ZERO (.concrete lcTag1) lcTag2 inside (.ReservedFrz false) true =
+      ⟨lcRetagTree, .ok ()⟩ := by
+  intro inside
+  have hupdateSifa :
+      (miri_etm_private% Miri.TreeBorrows.TreeState Miri.TreeBorrows.BorrowTree.updateSifaAfterRetag)
+        lcRetagTree ⟨0⟩ .None = (lcRetagTree, .ok ()) := by
+    change (Id.run do
+      let mut current := lcRetagTree
+      let mut cursor := some (⟨0⟩ : Miri.TreeBorrows.UniIndex)
+      let mut steps := 0
+      let mut active := true
+      while active do
+        if steps > current.nodes.size then
+          return (current, .error (.ParentCycle (cursor.getD ⟨0⟩)))
+        match cursor with
+        | none => active := false
+        | some index =>
+          let some node := current.nodes.get index
+            | return (current, .error (.MissingNode index))
+          let (defaultSifa, defaultChanged) := node.defaultInitialSifa.ensureNoStrongerThan .None
+          let mut anyChanged := defaultChanged
+          for segment in current.locations.iterAll do
+            if let some locationState := segment.data.perms.get index then
+              let (_, changed) := locationState.idempotentForeignAccess.ensureNoStrongerThan .None
+              anyChanged := anyChanged || changed
+          let locations := current.locations.modifyAll fun _ location =>
+            match location.perms.get index with
+            | none => location
+            | some locationState =>
+              let (sifa, _) := locationState.idempotentForeignAccess.ensureNoStrongerThan .None
+              let updatedState := { locationState with idempotentForeignAccess := sifa }
+              { location with perms := location.perms.insert index updatedState }
+          current := {
+            current with
+            locations
+            nodes := current.nodes.insert index ({ node with defaultInitialSifa := defaultSifa }) }
+          if anyChanged then
+            cursor := node.parent
+            steps := steps + 1
+          else
+            active := false
+      return (current, (Except.ok () : Except Miri.TreeBorrows.BorrowTree.ChildInsertError Unit))) =
+      (lcRetagTree, .ok ())
+    dsimp only [Id.run, bind, Bind.bind, pure, Pure.pure, forIn]
+    rw [loop_two_steps (s1 := (none, lcRetagTree, some ⟨0⟩, 0, false))]
+    · dsimp only
+      have hlt : ¬ (0 > lcRetagTree.nodes.size) := Nat.not_lt_zero _
+      have hget : lcRetagTree.nodes.get ⟨0⟩ = some
+          { tag := lcTag1, parent := none, children := #[⟨1⟩],
+            defaultInitialPermission := .Disabled, defaultInitialSifa := .None, isExposed := false } := rfl
+      simp only [↓reduceIte, hlt, hget]
+      have hiter : lcRetagTree.locations.iterAll = #[⟨⟨0, 4⟩, lcRetagLoc⟩] := rfl
+      have hmodAll :
+          lcRetagTree.locations.modifyAll (fun _ location =>
+            match location.perms.get ⟨0⟩ with
+            | none => location
+            | some locationState =>
+              let (sifa, _) := locationState.idempotentForeignAccess.ensureNoStrongerThan .None
+              let updatedState := { locationState with idempotentForeignAccess := sifa }
+              { location with perms := location.perms.insert ⟨0⟩ updatedState }) = lcRetagTree.locations := by
+        unfold Miri.DataStructures.DedupRangeMap.modifyAll
+        apply congrArg Miri.DataStructures.DedupRangeMap.mk
+        apply Array.ext'
+        simp only [Array.toList_map]
+        rfl
+      have hnodEq : lcRetagTree.nodes.insert ⟨0⟩
+          { tag := lcTag1, parent := none, children := #[⟨1⟩],
+            defaultInitialPermission := .Disabled, defaultInitialSifa := .None, isExposed := false } =
+          lcRetagTree.nodes := rfl
+      have hdef : (Miri.TreeBorrows.IdempotentForeignAccess.None.ensureNoStrongerThan .None) = (.None, false) := rfl
+      simp only [hdef, hiter]
+      rw [array_forIn'_singleton_id (hf := fun _ => rfl)]
+      simp only [Bool.false_eq_true, ↓reduceIte, hmodAll, hnodEq]
+    · rfl
+  unfold Miri.TreeBorrows.BorrowTree.newChild lcInitTree
+  have hins : ({ mapping := #[(lcTag1, ⟨0⟩)], deassigned := #[] } :
+      Miri.TreeBorrows.UniKeyMap Miri.Memory.BorTag).insert lcTag2 =
+      .Inserted { mapping := #[(lcTag1, ⟨0⟩), (lcTag2, ⟨1⟩)], deassigned := #[] } ⟨1⟩ := rfl
+  have hgetP : ({ mapping := #[(lcTag1, ⟨0⟩)], deassigned := #[] } :
+      Miri.TreeBorrows.UniKeyMap Miri.Memory.BorTag).get lcTag1 = some ⟨0⟩ := rfl
+  have hnd0 :
+      (({ data := #[some { tag := lcTag1, parent := none, children := #[],
+                           defaultInitialPermission := .Disabled, defaultInitialSifa := .None, isExposed := false }] } :
+          Miri.TreeBorrows.UniValMap Miri.TreeBorrows.TreeNode).insert ⟨1⟩
+          { tag := lcTag2, parent := some ⟨0⟩, children := #[],
+            defaultInitialPermission := .ReservedFrz false, defaultInitialSifa := .None, isExposed := false }).get ⟨0⟩ =
+      some { tag := lcTag1, parent := none, children := #[],
+             defaultInitialPermission := .Disabled, defaultInitialSifa := .None, isExposed := false } := rfl
+  have hnodesIns :
+      ((({ data := #[some { tag := lcTag1, parent := none, children := #[],
+                            defaultInitialPermission := .Disabled, defaultInitialSifa := .None, isExposed := false }] } :
+          Miri.TreeBorrows.UniValMap Miri.TreeBorrows.TreeNode).insert ⟨1⟩
+          { tag := lcTag2, parent := some ⟨0⟩, children := #[],
+            defaultInitialPermission := .ReservedFrz false, defaultInitialSifa := .None, isExposed := false }).insert ⟨0⟩
+          { tag := lcTag1, parent := none, children := #[⟨1⟩],
+            defaultInitialPermission := .Disabled, defaultInitialSifa := .None, isExposed := false }) =
+      lcRetagTree.nodes := rfl
+  have hpush0 : (#[] : Array Miri.TreeBorrows.UniIndex).push ⟨1⟩ = #[⟨1⟩] := rfl
+  have hmod := dedupRangeMap_modifyRange_singleFull 4 (by decide) lcInitLoc
+    (fun _ location => { location with perms := location.perms.insert ⟨1⟩ ⟨.Unique, true, .None⟩ })
+  have hinsLoc : lcInitLoc.perms.insert ⟨1⟩ ⟨.Unique, true, .None⟩ = lcRetagLoc.perms := by
+    unfold Miri.TreeBorrows.UniValMap.insert Miri.TreeBorrows.UniValMap.extendTo; rfl
+  have hweaker : (miri_etm_private% Miri.TreeBorrows.TreeState Miri.TreeBorrows.BorrowTree.weakerSifa) .None .None = .None := rfl
+  have hadd0 : Miri.ABI.Size.add (Miri.ABI.Size.ofBytes 0) Miri.ABI.Size.ZERO = .ok Miri.ABI.Size.ZERO := rfl
+  have hsub4 : (4 : UInt64) - 0 = 4 := rfl
+  rw [hins]
+  dsimp only [inside]
+  rw [hgetP]
+  simp only [Option.map_some, hnd0, Miri.TreeBorrows.Permission.isInitial,
+    Miri.TreeBorrows.Permission.isUnique, Miri.TreeBorrows.Permission.strongestIdempotentForeignAccess,
+    Bool.not_true, Bool.false_eq_true, ↓reduceIte, Id.run, bind, Bind.bind, pure, Pure.pure,
+    Miri.DataStructures.DedupRangeMap.iterAll]
+  rw [hpush0, hnodesIns, ← Array.forIn_toList]
+  simp only [List.forIn_cons, List.forIn_nil, bne_self_eq_false,
+    Bool.not_true, Bool.false_eq_true, ↓reduceIte, bind, Bind.bind, pure, Pure.pure,
+    hadd0, hsub4, hweaker]
+  rw [hmod]
+  dsimp only
+  rw [hinsLoc]
+  change (let r := (miri_etm_private% Miri.TreeBorrows.TreeState
+      Miri.TreeBorrows.BorrowTree.updateSifaAfterRetag) lcRetagTree ⟨0⟩ .None
+    (⟨r.1, r.2⟩ : Miri.TreeBorrows.BorrowTree.ChildInsertResult)) = _
+  dsimp only
+  rw [hupdateSifa]
+
+private theorem retagPipeline_accessTreeForReborrow_def {K : Type} [DecidableEq K]
+    (result : Miri.TreeBorrows.RetagPipeline.Result K)
+    (request : Miri.TreeBorrows.RetagPipeline.Request)
+    (policy : Miri.TreeBorrows.RetagPolicy.NewPermission)
+    (newTag : Miri.Memory.BorTag)
+    (location : Miri.TreeBorrows.RetagPipeline.ResolvedLocation)
+    (inside : Miri.DataStructures.DedupRangeMap Miri.TreeBorrows.Tree.LocationState)
+    (allocationMutability : Miri.Memory.Mutability) :
+    (miri_etm_private% Miri.TreeBorrows.RetagPipeline Miri.TreeBorrows.RetagPipeline.accessTreeForReborrow)
+      result request policy newTag location inside allocationMutability =
+    (Id.run do
+      let mut current := result
+      let mut dataRacePosition := 0
+      for segment in inside.iterAll do
+        match segment.data.permission.associatedAccess with
+        | none => pure ()
+        | some kind =>
+            if kind == .Write && allocationMutability == .Not then
+              return { current with outcome := .error (.writeToReadOnly location.allocId) }
+            let absoluteOffset? := match Miri.ABI.Size.add location.baseOffset
+                (Miri.ABI.Size.ofBytes segment.range.start) with
+              | .ok offset => some offset
+              | .error _ => none
+            let some absoluteOffset := absoluteOffset?
+              | return { current with outcome := .error (.offsetOverflow location.baseOffset segment.range.start) }
+            let length := Miri.ABI.Size.ofBytes (segment.range.stop - segment.range.start)
+            let absoluteEnd? := match Miri.ABI.Size.add absoluteOffset length with
+              | .ok endOffset => some endOffset
+              | .error _ => none
+            let some absoluteEnd := absoluteEnd?
+              | return { current with outcome := .error (.rangeEndOverflow absoluteOffset length) }
+            let range : Miri.DataStructures.ByteRange := ⟨absoluteOffset.bytes, absoluteEnd.bytes⟩
+            current := { current with events := current.events.push (.parentTreeAccess kind range) }
+            let some localEntry := current.state.memory.live.find? fun entry => entry.1 == location.allocId
+              | return { current with outcome := .error (.treeExtraUnavailable location.allocId) }
+            let access := localEntry.2.allocation.extra.performBorrowAccessRange
+              location.parentProvenance absoluteOffset length kind
+              current.state.global.protectedTags .VisitChildrenOfAccessed
+            let nextMemory ← match (miri_etm_private% Miri.TreeBorrows.RetagPipeline Miri.TreeBorrows.RetagPipeline.updateTreeExtra)
+                current.state.memory location.allocId access.tree with
+              | .ok memory => pure memory
+              | .error error => return { current with outcome := .error (.memoryUpdate error) }
+            current := { current with state := { current.state with memory := nextMemory } }
+            if access.status != .Completed then
+              return { current with outcome := .error (.treeAccess range access.status) }
+            if length.bytes != 0 then
+              match request.hooks.dataRace with
+              | none => pure ()
+              | some hooks =>
+                  current := { current with events := current.events.push (.dataRaceAccess kind range) }
+                  match hooks[dataRacePosition]? with
+                  | none => return { current with outcome := .error (.missingDataRaceResult dataRacePosition) }
+                  | some (Except.error message) => return { current with outcome := .error (.dataRace message) }
+                  | some (Except.ok ()) => pure ()
+                  dataRacePosition := dataRacePosition + 1
+      let some liveEntry := current.state.memory.live.find? fun entry => entry.1 == location.allocId
+        | return { current with outcome := .error (.treeExtraUnavailable location.allocId) }
+      let child := liveEntry.2.allocation.extra.newChild location.baseOffset
+        location.parentProvenance newTag inside policy.outsidePermission
+        policy.protector.isSome
+      let nextMemory ← match (miri_etm_private% Miri.TreeBorrows.RetagPipeline Miri.TreeBorrows.RetagPipeline.updateTreeExtra)
+          current.state.memory location.allocId child.tree with
+        | .ok memory => pure memory
+        | .error error => return { current with outcome := .error (.memoryUpdate error) }
+      current := { current with state := { current.state with memory := nextMemory } }
+      match child.outcome with
+      | .error error => return { current with outcome := .error (.childInsert error) }
+      | .ok () => pure ()
+      return { current with events := current.events.push (.childInserted newTag) }) := rfl
+
+private theorem retagPipeline_runReborrow_def {K : Type} [DecidableEq K]
+    (state : Miri.TreeBorrows.RetagPipeline.MachineState K)
+    (request : Miri.TreeBorrows.RetagPipeline.Request)
+    (policy : Miri.TreeBorrows.RetagPolicy.NewPermission)
+    (ptrSize : Miri.ABI.Size) (newTag : Miri.Memory.BorTag)
+    (initialEvents : Array Miri.TreeBorrows.RetagPipeline.Event) :
+    (miri_etm_private% Miri.TreeBorrows.RetagPipeline Miri.TreeBorrows.RetagPipeline.runReborrow)
+      state request policy ptrSize newTag initialEvents =
+    (Id.run do
+      let mut result : Miri.TreeBorrows.RetagPipeline.Result K := ⟨state, .ok none, initialEvents⟩
+      result := { result with events := result.events.push .pointerAccessChecked }
+      match request.hooks.pointerAccess with
+      | .error message => return { result with outcome := .error (.pointerAccess message) }
+      | .ok () => pure ()
+      let tracked := state.global.isTrackedPointerTag newTag
+      let location := request.hooks.allocationResolution
+      result := { result with events := result.events.push (.allocationResolution (location.map (·.allocId))) }
+      match location with
+      | none =>
+          if ptrSize.bytes != 0 then
+            return { result with outcome := .error (.nonzeroSizeWithoutAllocation ptrSize) }
+          result := { result with events := result.events.push (.creationLogCalled newTag none tracked) }
+          match request.hooks.creationLog with
+          | .error message => return { result with outcome := .error (.creationLog message) }
+          | .ok () => pure ()
+          return { result with events := result.events.push (.reborrowReturned request.originalProvenance), outcome := .ok request.originalProvenance }
+      | some location =>
+          let newProvenance := some (Miri.Memory.Provenance.concrete location.allocId newTag)
+          result := { result with events := result.events.push (.creationLogCalled newTag (some location.allocId) tracked) }
+          match request.hooks.creationLog with
+          | .error message => return { result with outcome := .error (.creationLog message) }
+          | .ok () => pure ()
+          if let some protector := policy.protector then
+            let (global, frame) := state.global.addProtector state.frame
+              location.allocId newTag protector
+            result := { result with state := { result.state with global := global, frame := frame } }
+            result := { result with events := result.events.push (.protectorRegistered newTag protector) }
+          let allocationInfo ← match result.state.memory.getAllocInfo location.allocId with
+            | .ok info => pure info
+            | .error error => return { result with outcome := .error (.allocationLookup error) }
+          result := { result with events := result.events.push (.allocationKindChecked location.allocId allocationInfo.kind) }
+          if allocationInfo.kind != .liveData then
+            if ptrSize.bytes != 0 then
+              return { result with outcome := .error (.nonLiveAllocationHasBytes allocationInfo.kind ptrSize) }
+            return { result with events := result.events.push (.reborrowReturned newProvenance), outcome := .ok newProvenance }
+          let inside ← match (miri_etm_private% Miri.TreeBorrows.RetagPipeline Miri.TreeBorrows.RetagPipeline.buildInsidePermissions)
+              policy ptrSize request.pointeeIsFreeze request.preciseInteriorMut request.hooks with
+            | .ok permissions => pure permissions
+            | .error error => return { result with outcome := .error error }
+          if request.preciseInteriorMut then
+            result := { result with events := result.events.push .freezeLayoutVisited }
+          match request.hooks.allocationExtra with
+          | .error message => return { result with outcome := .error (.allocationExtra message) }
+          | .ok () => pure ()
+          let some localEntry := result.state.memory.live.find? fun entry => entry.1 == location.allocId
+            | return { result with outcome := .error (.treeExtraUnavailable location.allocId) }
+          result := { result with events := result.events.push (.allocationExtraLoaded location.allocId) }
+          result := (miri_etm_private% Miri.TreeBorrows.RetagPipeline Miri.TreeBorrows.RetagPipeline.accessTreeForReborrow)
+            result request policy newTag location inside localEntry.2.allocation.mutability
+          match result.outcome with
+          | .error _ => return result
+          | .ok _ => pure ()
+          return { result with events := result.events.push (.reborrowReturned newProvenance), outcome := .ok newProvenance }) := rfl
+
+private theorem lcInitTree_retagPipeline_eq
+    (alloc : Miri.Memory.Allocation Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree)
+    (hmut : alloc.mutability = .Mut)
+    (hextra : alloc.extra = lcInitTree)
+    (mem0 : Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit)
+    (hlive : mem0.live = #[(lcId1, ⟨.stack, alloc⟩)]) :
+    let st0 : Miri.TreeBorrows.RetagPipeline.MachineState Unit :=
+      { memory := mem0
+        global := { nextPointerTag := lcTag2, rootPointerTags := #[(lcId1, lcTag1)],
+                    protectedTags := ⟨#[]⟩, trackedPointerTags := #[] }
+        frame := ⟨#[]⟩ }
+    let res := Miri.TreeBorrows.RetagPipeline.retagPointerValue st0 lcRetagReq
+    res.outcome = .ok (some (.concrete lcId1 lcTag2)) ∧
+    res.state.global = { nextPointerTag := ⟨3, by decide⟩, rootPointerTags := #[(lcId1, lcTag1)],
+                         protectedTags := ⟨#[(lcTag2, .StrongProtector)]⟩, trackedPointerTags := #[] } ∧
+    res.state.frame.protectedTags = #[(lcId1, lcTag2)] ∧
+    res.state.memory = { mem0 with live := #[(lcId1, ⟨.stack, alloc.setExtra lcRetagTree⟩)] } := by
+  intro st0 res
+  let pt1 : Miri.TreeBorrows.ProtectedTags := ⟨#[(lcTag2, .StrongProtector)]⟩
+  have haccEq : (lcInitTree.performBorrowAccessRange (.concrete lcTag1)
+      Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4) .Write pt1 .VisitChildrenOfAccessed).status = .Completed ∧
+      (lcInitTree.performBorrowAccessRange (.concrete lcTag1)
+      Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4) .Write pt1 .VisitChildrenOfAccessed).tree = lcInitTree := by
+    let normS : Miri.TreeBorrows.Tree.NormalTreeState :=
+      { topology := ⟨#[⟨none, []⟩]⟩
+        defaultStates := #[⟨.Disabled, false, .None⟩]
+        protectedNodes := []
+        locationStates := #[some ⟨.Unique, true, .None⟩] }
+    have hnormProj : miriNormalProjection { lcInitTree with locations := ⟨#[]⟩ } lcInitLoc pt1 = normS := by
+      rw [miriNormalProjection_eq_struct]
+      let nd0 : Miri.TreeBorrows.TreeNode :=
+        { tag := lcTag1, parent := none, children := #[],
+          defaultInitialPermission := .Disabled, defaultInitialSifa := .None, isExposed := false }
+      have hent1 : lcInitTree.nodes.entries = #[(⟨0⟩, nd0)] := by
+        simp [lcInitTree, nd0, Miri.TreeBorrows.UniValMap.entries, Std.Legacy.Range.forIn_eq_forIn_range',
+          Std.Legacy.Range.size, Miri.TreeBorrows.UniIndex.ofNat?, Id.run,
+          bind, Bind.bind, pure, Pure.pure]
+      have hmap1 : ∀ {α β : Type} (f : α → β) (a : α), #[a].map f = #[f a] := fun _ _ => by simp
+      have hmapIdx1 : ∀ {α β : Type} (f : Nat → α → β) (a : α), #[a].mapIdx f = #[f 0 a] := fun _ _ => rfl
+      have hptF : pt1.contains lcTag1 = false := by decide
+      have hent1' : ({ lcInitTree with locations := ⟨#[]⟩ } : Miri.TreeBorrows.BorrowTree).nodes.entries =
+          #[(⟨0⟩, nd0)] := hent1
+      rw [hent1']
+      simp only [lcInitTree, nd0, hmap1, hmapIdx1, lcInitLoc,
+        Miri.TreeBorrows.TreeNode.defaultLocationState, Miri.TreeBorrows.UniValMap.get,
+        Miri.TreeBorrows.UniIndex.toNat, Miri.TreeBorrows.UniIndex.ofNat?,
+        Option.map_none, List.map_nil, List.filterMap_cons, List.filterMap_nil, hptF]
+      rfl
+    have hnormAcc : ({ lcInitTree with locations := ⟨#[]⟩ }).performNormalAccessAt
+        lcInitLoc ⟨0⟩ .Write pt1 .VisitChildrenOfAccessed =
+        ⟨lcInitLoc, normS.performAccess 0 .Write .VisitChildrenOfAccessed, .ok ()⟩ := by
+      have hlocsEq : (normS.performAccess 0 .Write .VisitChildrenOfAccessed).tree.locationStates =
+          #[some ⟨.Unique, true, .None⟩] := by decide
+      have hvis : ∀ ev ∈ (normS.performAccess 0 .Write .VisitChildrenOfAccessed).visited,
+          ∃ idx nd, Miri.TreeBorrows.UniIndex.ofNat? ev.node = some idx ∧
+            ({ lcInitTree with locations := ⟨#[]⟩ } : Miri.TreeBorrows.BorrowTree).nodeAt idx = some nd ∧
+            nd.isExposed = false := by
+        have hall : ((normS.performAccess 0 .Write .VisitChildrenOfAccessed).visited.all fun ev =>
+            ev.node == 0) = true := by decide
+        intro ev hev
+        have h0 := beq_iff_eq.mp (List.all_eq_true.mp hall ev hev)
+        exact ⟨⟨0⟩, _, by rw [h0]; rfl, rfl, rfl⟩
+      have hwb := performNormalAccessAt_unexposed_eval { lcInitTree with locations := ⟨#[]⟩ }
+        lcInitLoc ⟨0⟩ .Write pt1 .VisitChildrenOfAccessed
+        (normS.performAccess 0 .Write .VisitChildrenOfAccessed)
+        (by rw [hnormProj]; rfl) hvis
+      rw [hwb, hlocsEq]; rfl
+    have hta := performTreeAccessAt_singleRoot0_eval lcInitTree lcInitLoc ⟨0⟩ .Write pt1 .VisitChildrenOfAccessed
+      ⟨0, 4⟩ rfl (fun l1 l2 => performNormalAccessAt_locations_indep lcInitTree l1 l2 _ _ _ _ _)
+      ⟨lcInitLoc, normS.performAccess 0 .Write .VisitChildrenOfAccessed, .ok ()⟩
+      hnormAcc rfl (fun _ => by decide)
+    have hstC : (normS.performAccess 0 .Write .VisitChildrenOfAccessed).status = .Completed := by decide
+    rw [hstC] at hta; simp only [beq_self_eq_true, ↓reduceIte] at hta
+    exact performBorrowAccessRange_singleFull_eval lcInitTree 4 (by decide) lcInitLoc rfl
+      lcTag1 ⟨0⟩ rfl .Write pt1 .VisitChildrenOfAccessed lcInitLoc
+      (some (normS.performAccess 0 .Write .VisitChildrenOfAccessed)) none hta
+  have hfind : ∀ a : Miri.Memory.Allocation Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree,
+      (#[(lcId1, (⟨.stack, a⟩ : Miri.Memory.LocalAllocation Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit))]).find?
+        (fun e => e.1 == lcId1) = some (lcId1, ⟨.stack, a⟩) := fun _ => rfl
+  have hset : ∀ (a b : Miri.Memory.Allocation Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree),
+      ({ mem0 with live := #[(lcId1, ⟨.stack, a⟩)] } :
+        Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit).setLiveAllocation lcId1 b =
+        .ok { mem0 with live := #[(lcId1, ⟨.stack, b⟩)] } := by
+    intro a b
+    rw [Miri.Memory.MemoryState.setLiveAllocation_of_find _ lcId1 ⟨.stack, a⟩ b (hfind a)]
+    simp [Array.filter]
+  have hupd : ∀ (a : Miri.Memory.Allocation Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree)
+      (t : Miri.TreeBorrows.BorrowTree),
+      (miri_etm_private% Miri.TreeBorrows.RetagPipeline Miri.TreeBorrows.RetagPipeline.updateTreeExtra)
+        ({ mem0 with live := #[(lcId1, ⟨.stack, a⟩)] } :
+          Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit) lcId1 t =
+        Except.ok { mem0 with live := #[(lcId1, ⟨.stack, a.setExtra t⟩)] } := by
+    intro a t
+    have h1 : (miri_etm_private% Miri.TreeBorrows.RetagPipeline Miri.TreeBorrows.RetagPipeline.updateTreeExtra)
+        ({ mem0 with live := #[(lcId1, ⟨.stack, a⟩)] } :
+          Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit) lcId1 t =
+        (do
+          let some liveEntry := (#[(lcId1, (⟨.stack, a⟩ : Miri.Memory.LocalAllocation Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit))]).find? fun e => e.1 == lcId1
+            | throw (Miri.Memory.AllocationLookupError.unavailable lcId1)
+          ({ mem0 with live := #[(lcId1, ⟨.stack, a⟩)] } :
+            Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit).setLiveAllocation lcId1
+              (liveEntry.2.allocation.setExtra t)) := rfl
+    rw [h1, hfind a]; exact hset a (a.setExtra t)
+  have hmemEq : { mem0 with live := #[(lcId1, ⟨.stack, alloc⟩)] } = mem0 := by
+    cases mem0; simp only at hlive; subst hlive; rfl
+  have hgetInfo : mem0.getAllocInfo lcId1 = .ok ⟨alloc.byteSize, alloc.align, .liveData, .Mut⟩ := by
+    unfold Miri.Memory.MemoryState.getAllocInfo
+    rw [hlive, hfind alloc]
+    dsimp only
+    rw [hmut]; rfl
+  let g1 : Miri.TreeBorrows.GlobalState :=
+    { nextPointerTag := ⟨3, by decide⟩, rootPointerTags := #[(lcId1, lcTag1)],
+      protectedTags := ⟨#[]⟩, trackedPointerTags := #[] }
+  let g2 : Miri.TreeBorrows.GlobalState :=
+    { nextPointerTag := ⟨3, by decide⟩, rootPointerTags := #[(lcId1, lcTag1)],
+      protectedTags := pt1, trackedPointerTags := #[] }
+  have haccStep : ∀ evP,
+      (miri_etm_private% Miri.TreeBorrows.RetagPipeline Miri.TreeBorrows.RetagPipeline.accessTreeForReborrow)
+        ⟨{ memory := mem0, global := g2, frame := ⟨#[(lcId1, lcTag2)]⟩ }, .ok none, evP⟩
+        lcRetagReq ⟨.Unique, .Unique, .ReservedFrz false, some .StrongProtector⟩ lcTag2
+        ⟨lcId1, Miri.ABI.Size.ZERO, .concrete lcTag1⟩
+        ⟨#[⟨⟨0, 4⟩, ⟨.Unique, true, .None⟩⟩]⟩ .Mut =
+        ⟨{ memory := { mem0 with live := #[(lcId1, ⟨.stack, (alloc.setExtra lcInitTree).setExtra lcRetagTree⟩)] }
+           global := g2, frame := ⟨#[(lcId1, lcTag2)]⟩ },
+         .ok none, (evP.push (.parentTreeAccess .Write ⟨0, 4⟩)).push (.childInserted lcTag2)⟩ := by
+    intro evP
+    rw [retagPipeline_accessTreeForReborrow_def]
+    dsimp only [Id.run, bind, Bind.bind, pure, Pure.pure, Miri.DataStructures.DedupRangeMap.iterAll, lcRetagReq, g2]
+    rw [← Array.forIn_toList]
+    have hmutF : (Miri.TreeBorrows.AccessKind.Write == .Write && Miri.Memory.Mutability.Mut == .Not) = false := rfl
+    have hadd0 : Miri.ABI.Size.add Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 0) = .ok Miri.ABI.Size.ZERO := rfl
+    have hadd4 : Miri.ABI.Size.add Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4) = .ok (Miri.ABI.Size.ofBytes 4) := rfl
+    have hsub4 : (4 : UInt64) - 0 = 4 := rfl
+    have hupd1 : (miri_etm_private% Miri.TreeBorrows.RetagPipeline Miri.TreeBorrows.RetagPipeline.updateTreeExtra)
+        mem0 lcId1 lcInitTree = .ok { mem0 with live := #[(lcId1, ⟨.stack, alloc.setExtra lcInitTree⟩)] } := by
+      rw [← hmemEq]; exact hupd alloc lcInitTree
+    simp only [List.forIn_cons, List.forIn_nil, Miri.TreeBorrows.Permission.associatedAccess,
+      hmutF, Bool.false_eq_true, ↓reduceIte, hadd0, hsub4, hadd4, hlive, hfind alloc, hextra,
+      haccEq.1, haccEq.2, bind, Bind.bind, pure, Pure.pure]
+    rw [hupd1]
+    have hlen4 : ((Miri.ABI.Size.ofBytes 4).bytes != 0) = true := rfl
+    simp only [bne_self_eq_false, hlen4, Option.isSome_some, Bool.false_eq_true, ↓reduceIte,
+      hfind (alloc.setExtra lcInitTree)]
+    have hsetEx : (alloc.setExtra lcInitTree).extra = lcInitTree := rfl
+    rw [hsetEx, lcInitTree_newChild_eq]
+    rw [hupd (alloc.setExtra lcInitTree) lcRetagTree]
+    rfl
+  have hrunStep : ∀ ev0,
+      let st1 : Miri.TreeBorrows.RetagPipeline.MachineState Unit :=
+        { memory := mem0, global := g1, frame := ⟨#[]⟩ }
+      ∃ evOut,
+        (miri_etm_private% Miri.TreeBorrows.RetagPipeline Miri.TreeBorrows.RetagPipeline.runReborrow)
+          st1 lcRetagReq ⟨.Unique, .Unique, .ReservedFrz false, some .StrongProtector⟩
+          (Miri.ABI.Size.ofBytes 4) lcTag2 ev0 =
+          ⟨{ memory := { mem0 with live := #[(lcId1, ⟨.stack, (alloc.setExtra lcInitTree).setExtra lcRetagTree⟩)] }
+             global := g2, frame := ⟨#[(lcId1, lcTag2)]⟩ },
+           .ok (some (.concrete lcId1 lcTag2)), evOut⟩ := by
+    intro ev0 st1
+    rw [retagPipeline_runReborrow_def]
+    have hbuild : (miri_etm_private% Miri.TreeBorrows.RetagPipeline Miri.TreeBorrows.RetagPipeline.buildInsidePermissions)
+        ⟨.Unique, .Unique, .ReservedFrz false, some .StrongProtector⟩ (Miri.ABI.Size.ofBytes 4) true false
+        lcRetagReq.hooks = .ok ⟨#[⟨⟨0, 4⟩, ⟨.Unique, true, .None⟩⟩]⟩ := rfl
+    have haddP : g1.addProtector ⟨#[]⟩ lcId1 lcTag2 .StrongProtector = (g2, ⟨#[(lcId1, lcTag2)]⟩) := rfl
+    dsimp only [Id.run, bind, Bind.bind, pure, Pure.pure, st1]
+    have hpa : lcRetagReq.hooks.pointerAccess = .ok () := rfl
+    have har : lcRetagReq.hooks.allocationResolution = some ⟨lcId1, Miri.ABI.Size.ZERO, .concrete lcTag1⟩ := rfl
+    have hcl : lcRetagReq.hooks.creationLog = .ok () := rfl
+    have hpf : lcRetagReq.pointeeIsFreeze = true := rfl
+    have hpim : lcRetagReq.preciseInteriorMut = false := rfl
+    have hae : lcRetagReq.hooks.allocationExtra = .ok () := rfl
+    simp only [hpa, har, hcl, hpf, hpim, hae, haddP, hgetInfo, hbuild,
+      bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, hlive, hfind alloc, hmut]
+    rw [haccStep]
+    exact ⟨_, rfl⟩
+  have hretagEval : ∃ evFin, res =
+      ⟨{ memory := { mem0 with live := #[(lcId1, ⟨.stack, (alloc.setExtra lcInitTree).setExtra lcRetagTree⟩)] }
+         global := g2, frame := ⟨#[(lcId1, lcTag2)]⟩ },
+       .ok (some (.concrete lcId1 lcTag2)), evFin⟩ := by
+    have htopDef :
+        res =
+        (let reborrowed := (miri_etm_private% Miri.TreeBorrows.RetagPipeline Miri.TreeBorrows.RetagPipeline.runReborrow)
+           { memory := mem0, global := g1, frame := ⟨#[]⟩ }
+           lcRetagReq ⟨.Unique, .Unique, .ReservedFrz false, some .StrongProtector⟩
+           (Miri.ABI.Size.ofBytes 4) lcTag2
+           #[.placeConverted, .reborrowSizeSelected (Miri.ABI.Size.ofBytes 4), .pointerTagAllocated lcTag2]
+         match reborrowed.outcome with
+         | .error _ => reborrowed
+         | .ok provenance =>
+           { reborrowed with events := (reborrowed.events.push (.placeProvenanceReplaced provenance)).push .retaggedValueReconstructed }) := by
+      have hpol : Miri.TreeBorrows.RetagPolicy.create ⟨true, true, true⟩ .Mutable .FnEntry ⟨true, false⟩ =
+          some ⟨.Unique, .Unique, .ReservedFrz false, some .StrongProtector⟩ := rfl
+      dsimp only [res, st0]
+      unfold Miri.TreeBorrows.RetagPipeline.retagPointerValue lcRetagReq
+      simp only [Miri.TreeBorrows.RetagPipeline.RetagTypeShape.classify, hpol]
+      rfl
+    rw [htopDef]
+    obtain ⟨evOut, hrun⟩ := hrunStep #[.placeConverted, .reborrowSizeSelected (Miri.ABI.Size.ofBytes 4), .pointerTagAllocated lcTag2]
+    dsimp only
+    rw [hrun]
+    exact ⟨_, rfl⟩
+  obtain ⟨evFin, hresEq⟩ := hretagEval
+  rw [hresEq]
+  have hset2 : (alloc.setExtra lcInitTree).setExtra lcRetagTree = alloc.setExtra lcRetagTree := rfl
+  rw [hset2]
+  exact ⟨rfl, rfl, rfl, rfl⟩
+
+private theorem miriAllocMachCallback_eq {K User Payload : Type} [DecidableEq K]
+    (h : Miri.Interpreter.AllocationMachine.DeallocationHooks K User Payload)
+    (m : Miri.Interpreter.MachineHooks.MachineState K User)
+    (afterRemove : Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K)
+    (alloc : Miri.Memory.Allocation Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree)
+    (ptr : Miri.Memory.Pointer (Option Miri.Memory.Provenance))
+    (allocId : Miri.Memory.AllocId) (provExtra : Miri.Memory.ProvenanceExtra)
+    (size : Miri.ABI.Size) (align : Miri.ABI.Align) (kind : Miri.Memory.MemoryKind K) :
+    miriAllocMachCallback h afterRemove ⟨{ m with memory := afterRemove }, none⟩
+      alloc ptr allocId provExtra size align kind =
+    match miriAllocMachBefore h alloc allocId provExtra size align kind { m with memory := afterRemove } with
+    | .ok value machine => ⟨machine.memory, ⟨machine, none⟩, .ok value⟩
+    | .error error machine => ⟨machine.memory, ⟨machine, some error⟩, .error (reprStr error)⟩ := rfl
+
+private theorem miriAllocMachBefore_eq {K User Payload : Type} [DecidableEq K]
+    (h : Miri.Interpreter.AllocationMachine.DeallocationHooks K User Payload)
+    (allocation : Miri.Memory.Allocation Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree)
+    (id : Miri.Memory.AllocId) (provenance : Miri.Memory.ProvenanceExtra)
+    (size : Miri.ABI.Size) (align : Miri.ABI.Align) (kind : Miri.Memory.MemoryKind K)
+    (m : Miri.Interpreter.MachineHooks.MachineState K User) :
+    miriAllocMachBefore h allocation id provenance size align kind m =
+    (do
+      h.diagnostic id
+      let (machine, result) := Miri.Interpreter.MachineHooks.memoryRaceAccess (← get) id
+        ⟨Miri.ABI.Size.ZERO, size⟩ (some .Deallocate) .Read
+      set machine
+      match result with | .error error => throw error | .ok () => pure ()
+      if let some tracker := (← get).borrowTracker then
+        let result := allocation.extra.deallocateBorrowRange provenance Miri.ABI.Size.ZERO
+          size tracker.global.protectedTags
+        modify (h.retainDetached (allocation.setExtra result.tree))
+        if result.status != .Deallocated then
+          throw (.undefinedBehavior s!"Tree Borrows deallocation: {reprStr result.status}")
+      Miri.Interpreter.MemoryExtras.beforeDeallocationSync h.extras id
+      let span ← h.currentSpan
+      modify fun machine => { machine with allocationSpans := machine.allocationSpans.map fun (old, allocated, freed) =>
+        (old, allocated, if old == id then some span else freed) }
+      h.freeAllocId id size align kind
+      Miri.Interpreter.MemoryExtras.removeAllocation h.extras id
+      modify fun machine => { machine with raceAllocations := machine.raceAllocations.filter fun entry => entry.1 != id }
+      : Miri.Interpreter.PlaceMachine.MachineM K User Unit) m := rfl
+
+private theorem lc_writeRead_eval :
+    let val : Miri.Memory.Scalar Miri.Memory.Provenance :=
+      Miri.Memory.Scalar.fromScalarInt (Miri.Memory.ScalarInt.ofUInt32 0x04030201)
+    ∃ alloc0 alloc1,
+      Miri.Memory.Allocation.tryNew (Prov := Miri.Memory.Provenance) (Miri.ABI.Size.ofBytes 4) Miri.ABI.Align.ONE .Uninit lcZeroed = .ok alloc0 ∧
+      alloc0.byteSize = Miri.ABI.Size.ofBytes 4 ∧
+      Miri.Memory.Allocation.writeScalar annealTargetDataLayout
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4)) val alloc0 = .ok () alloc1 ∧
+      alloc1.readScalar annealTargetDataLayout
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4)) false = .ok val ∧
+      alloc1.byteSize = Miri.ABI.Size.ofBytes 4 ∧
+      alloc1.align = Miri.ABI.Align.ONE ∧
+      alloc1.mutability = .Mut ∧
+      alloc1.nativeBuffer = none := by
+  intro val
+  obtain ⟨alloc0, htry, hsz0Eq, hlen0, hnat0Eq, hmut0Eq, hal0Eq⟩ :=
+    Miri.Memory.Allocation.tryNew_replicate_full (P := Miri.Memory.Provenance)
+      (Miri.ABI.Size.ofBytes 4) Miri.ABI.Align.ONE 1 rfl rfl
+  have hshape := Miri.Memory.Allocation.tryNew_uninit_shape (Miri.ABI.Size.ofBytes 4) Miri.ABI.Align.ONE alloc0 htry
+  have hws := Miri.Memory.Allocation.writeScalar_fresh_zero annealTargetDataLayout alloc0 val
+    (.bits 0x04030201) (by rw [hlen0, hsz0Eq]) hmut0Eq
+    (by rw [hshape.2, hsz0Eq]; rfl) (by rw [hshape.2]; trivial)
+    hshape.1 (by decide) (by decide) (by rw [hsz0Eq]; decide) rfl trivial (by decide)
+  obtain ⟨alloc1, hwr, hsz1, hlen1, hmut1, hal1, _, hnat1, _⟩ := hws
+  have hsz1Eq : alloc1.byteSize = Miri.ABI.Size.ofBytes 4 := hsz1.trans hsz0Eq
+  have hlen1Eq : alloc1.len = 4 := hlen1.trans hlen0
+  have hal1Eq : alloc1.align = Miri.ABI.Align.ONE := hal1.trans hal0Eq
+  have hmut1Eq : alloc1.mutability = .Mut := hmut1.trans hmut0Eq
+  have hnat1Eq : alloc1.nativeBuffer = none := hnat1.trans hnat0Eq
+  have hrd : alloc1.readScalar annealTargetDataLayout
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4)) false = .ok val := by
+    have hbits : val.toBitsOrPtrInternal (Miri.ABI.Size.ofBytes 4) = .ok (.bits 0x04030201) := by decide
+    have htgt : (miri_etm_private% Miri.Memory.Allocation Miri.Memory.targetUIntBytes)
+        annealTargetDataLayout (Miri.ABI.Size.ofBytes 4) 0x04030201 = .ok #[1, 2, 3, 4] := by
+      have h1 : (miri_etm_private% Miri.Memory.Allocation Miri.Memory.targetUIntBytes)
+          annealTargetDataLayout (Miri.ABI.Size.ofBytes 4) 0x04030201 =
+          (do
+            if (Miri.ABI.Size.ofBytes 4).bytes > 16 then throw (.scalarBytesTooWide (Miri.ABI.Size.ofBytes 4))
+            let count := (Miri.ABI.Size.ofBytes 4).bytes.toNat
+            let mut result := #[]
+            for index in [:count] do
+              let valueIndex := if annealTargetDataLayout.endian == .little then index else count - index - 1
+              let byte := ((0x04030201 : Miri.ABI.U128).toNat / 2 ^ (8 * valueIndex)) % 256
+              result := result.push (UInt8.ofNat byte)
+            return result) := rfl
+      rw [h1]
+      simp only [Std.Legacy.Range.forIn_eq_forIn_range']
+      decide
+    have hrdu : (miri_etm_private% Miri.Memory.Allocation Miri.Memory.readTargetUInt)
+        annealTargetDataLayout #[1, 2, 3, 4] = .ok 0x04030201 := by
+      have h1 : (miri_etm_private% Miri.Memory.Allocation Miri.Memory.readTargetUInt)
+          annealTargetDataLayout #[1, 2, 3, 4] =
+          (do
+            if (#[1, 2, 3, 4] : Array UInt8).size > 16 then
+              throw (.scalarBytesTooWide (Miri.ABI.Size.ofBytes (UInt64.ofNat (#[1, 2, 3, 4] : Array UInt8).size)))
+            let mut value := 0
+            for index in [:(#[1, 2, 3, 4] : Array UInt8).size] do
+              let some byte := (#[1, 2, 3, 4] : Array UInt8)[index]? |
+                throw (.invalidSliceEndpoints index (index + 1) (#[1, 2, 3, 4] : Array UInt8).size)
+              let valueIndex := if annealTargetDataLayout.endian == .little then index else (#[1, 2, 3, 4] : Array UInt8).size - index - 1
+              value := value + byte.toNat * 2 ^ (8 * valueIndex)
+            return BitVec.ofNat 128 value) := rfl
+      rw [h1]
+      simp only [Std.Legacy.Range.forIn_eq_forIn_range']
+      decide
+    have hck : ∀ (a : Miri.Memory.Allocation Miri.Memory.Provenance Unit),
+        a.byteSize = Miri.ABI.Size.ofBytes 4 → a.len = 4 →
+        (miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.checkedSlice)
+          a (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4)) =
+        .ok ((miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.rawBytes) a |>.extract 0 4) := by
+      intro a hsz hln
+      have h1 : (miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.checkedSlice)
+          a (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4)) =
+          (do
+            if ((miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.rawBytes) a).size !=
+                ((miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.size) a).bytes.toNat then
+              throw (.storageLengthMismatch ((miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.size) a)
+                ((miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.rawBytes) a).size)
+            let finish ← (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4)).endExclusive
+              |>.mapError Miri.Memory.AllocError.memory
+            if Miri.ABI.Size.ZERO.bytes > finish.bytes ||
+                finish.bytes > ((miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.size) a).bytes then
+              throw (.outOfBounds (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4))
+                ((miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.size) a))
+            return ((miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.rawBytes) a).extract
+              Miri.ABI.Size.ZERO.bytes.toNat finish.bytes.toNat) := rfl
+      rw [h1]
+      have hszA : (miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.size) a = Miri.ABI.Size.ofBytes 4 := hsz
+      have hrbA : ((miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.rawBytes) a).size = 4 := hln
+      simp [hszA, hrbA, Miri.Memory.allocRange, Miri.Memory.AllocRange.endExclusive,
+        Miri.Memory.AllocRange.end, Miri.ABI.Size.ZERO, Miri.ABI.Size.ofBytes, Miri.ABI.Size.add,
+        Except.mapError, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+    have hsetM : (Miri.Memory.InitMask.new (Miri.ABI.Size.ofBytes 4) false).setRange
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4)) true =
+        .ok (Miri.Memory.InitMask.new (Miri.ABI.Size.ofBytes 4) true) := by decide
+    have hclr : (Miri.Memory.ProvenanceMap.new (Prov := Miri.Memory.Provenance)).clear
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4))
+        ((miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.rawBytes) alloc0)
+        ((miri_etm_private% Miri.Memory.Allocation Miri.Memory.pointerSize) annealTargetDataLayout) =
+        .ok () Miri.Memory.ProvenanceMap.new :=
+      Miri.Memory.ProvenanceMap.clear_new (P := Miri.Memory.Provenance) _ _ _ (Miri.ABI.Size.ofBytes 4) (by decide) (by decide)
+    have hwr2 := hwr
+    unfold Miri.Memory.Allocation.writeScalar at hwr2
+    have hszA : (miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.size) alloc0 = Miri.ABI.Size.ofBytes 4 := hsz0Eq
+    have hrbA : ((miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.rawBytes) alloc0).size = 4 := hlen0
+    have hprA : (miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.provenance) alloc0 = Miri.Memory.ProvenanceMap.new := hshape.1
+    have himA : (miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.initMask) alloc0 =
+        Miri.Memory.InitMask.new (Miri.ABI.Size.ofBytes 4) false := hshape.2
+    have hmutF : (alloc0.mutability != .Mut) = false := by rw [hmut0Eq]; rfl
+    have hck0 := hck alloc0 hsz0Eq hlen0
+    have hvalSz : val.size = Miri.ABI.Size.ofBytes 4 := rfl
+    have hrSz : (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4)).size = Miri.ABI.Size.ofBytes 4 := rfl
+    have hrSt : (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4)).start = Miri.ABI.Size.ZERO := rfl
+    simp only [Id.run, bind, Bind.bind, pure, Pure.pure, hmutF, Bool.false_eq_true, ↓reduceIte,
+      hvalSz, hrSz, hrSt, hbits, hck0, himA, hsetM, hprA, hclr, htgt, hszA, hrbA] at hwr2
+    have h0n : Miri.ABI.Size.ZERO.bytes.toNat = 0 := rfl
+    have h4n : (Miri.ABI.Size.ofBytes 4).bytes.toNat = 4 := rfl
+    have hex0 : ((miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.rawBytes) alloc0).extract 0 0 = #[] :=
+      Array.ext (by simp) (by intro i hi _; simp at hi)
+    have hex4 : ((miri_etm_private% Miri.Memory.Allocation Miri.Memory.Allocation.rawBytes) alloc0).extract 4 4 = #[] :=
+      Array.ext (by simp; omega) (by intro i hi _; simp at hi; omega)
+    have happ : (#[] : Array UInt8) ++ #[1, 2, 3, 4] ++ #[] = #[1, 2, 3, 4] := rfl
+    have h4sz : (#[1, 2, 3, 4] : Array UInt8).size = 4 := rfl
+    have hne4 : ((4 : Nat) != 4) = false := rfl
+    simp only [h0n, h4n, Nat.zero_add, hex0, hex4, happ, h4sz, hne4, Bool.false_eq_true, ↓reduceIte] at hwr2
+    injection hwr2 with _ halloc1
+    have hck1 := hck alloc1 hsz1Eq hlen1Eq
+    have hisInit : (Miri.Memory.InitMask.new (Miri.ABI.Size.ofBytes 4) true).isRangeInitialized
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4)) = .ok (.ok ()) := by decide
+    have hfromU : Miri.Memory.Scalar.fromUInt (Prov := Miri.Memory.Provenance) 0x04030201 (Miri.ABI.Size.ofBytes 4) = .ok val := by decide
+    have hoff : Miri.Memory.PointerProvenance.offsetIsAddr (Prov := Miri.Memory.Provenance) = true := rfl
+    unfold Miri.Memory.Allocation.readScalar
+    rw [hck1, ← halloc1]
+    have hexFull : (#[1, 2, 3, 4] : Array UInt8).extract 0 4 = #[1, 2, 3, 4] := rfl
+    simp only [hisInit, hexFull, hrdu, hrSz, hfromU, hoff, Except.mapError,
+      Bool.false_eq_true, ↓reduceIte,
+      bind, Bind.bind, Except.bind]
+  exact ⟨alloc0, alloc1, htry, hsz0Eq, hwr, hrd, hsz1Eq, hal1Eq, hmut1Eq, hnat1Eq⟩
+
+private theorem lc_deallocate_eval
+    (stX : Miri.Interpreter.MachineHooks.State Unit (Miri.Interpreter.MemoryExtras.Registry Unit))
+    (aX : Miri.Memory.Allocation Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree)
+    (trX : Miri.Interpreter.MachineHooks.BorrowState)
+    (hlvX : stX.machine.memory.live = #[(lcId1, ⟨.stack, aX⟩)])
+    (hdeadX : stX.machine.memory.dead = #[])
+    (hszX : aX.byteSize = Miri.ABI.Size.ofBytes 4)
+    (halX : aX.align = Miri.ABI.Align.ONE)
+    (hmutX : aX.mutability = .Mut)
+    (hnatX : aX.nativeBuffer = none)
+    (hexX : aX.extra = lcRetagTree)
+    (hdrX : stX.machine.dataRace = none)
+    (hraceX : stX.machine.raceAllocations = #[])
+    (hspanX : stX.machine.allocationSpans = #[])
+    (huserX : stX.machine.user = { allocations := #[(lcId1, ⟨none, #[]⟩)] })
+    (hbtX : stX.machine.borrowTracker = some trX) :
+    let ptr1 : Miri.Memory.Pointer (Option Miri.Memory.Provenance) := ⟨Miri.ABI.Size.ZERO, some (.concrete lcId1 lcTag2)⟩
+    let r := lcRetagTree.deallocateBorrowRange (.concrete lcTag2) Miri.ABI.Size.ZERO
+      (Miri.ABI.Size.ofBytes 4) trX.global.protectedTags
+    (r.status != .Deallocated) = true ∧
+      (∃ errX, Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks ptr1 none .stack stX =
+        .error errX { stX with machine := { stX.machine with memory := { stX.machine.memory with live := #[] }, user := {} } }) ∨
+    (r.status = .Deallocated ∧
+      Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks ptr1 none .stack stX =
+        .ok () { stX with machine := { stX.machine with
+          memory := { stX.machine.memory with
+            live := #[]
+            dead := (stX.machine.memory.dead.filter fun d => d.allocId != lcId1).push
+              ⟨lcId1, Miri.ABI.Size.ofBytes 4, Miri.ABI.Align.ONE⟩ }
+          user := {} } }) := by
+  intro ptr1
+  let memRem : Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit :=
+    { stX.machine.memory with live := #[] }
+  let mRem : Miri.Interpreter.MachineHooks.MachineState Unit (Miri.Interpreter.MemoryExtras.Registry Unit) :=
+    { stX.machine with memory := memRem }
+  have hrem : miriMSRemoveLive stX.machine.memory lcId1 = (memRem, some ⟨.stack, aX⟩) := by
+    show ({ stX.machine.memory with live := stX.machine.memory.live.filter fun e => e.1 != lcId1 },
+      (stX.machine.memory.live.find? fun e => e.1 == lcId1).map Prod.snd) = _
+    rw [hlvX]; rfl
+  have hrc : (stX.machine.raceAllocations.filter fun entry => entry.1 != lcId1) =
+      stX.machine.raceAllocations := by rw [hraceX]; rfl
+  have hus : ({ allocations := stX.machine.user.allocations.filter fun e => e.1 != lcId1 } :
+      Miri.Interpreter.MemoryExtras.Registry Unit) = {} := by rw [huserX]; rfl
+  have hcbEval :
+      let r := lcRetagTree.deallocateBorrowRange (.concrete lcTag2) Miri.ABI.Size.ZERO
+        (Miri.ABI.Size.ofBytes 4) trX.global.protectedTags
+      miriAllocMachCallback canaryDeallocHooks memRem ⟨mRem, none⟩
+        aX ptr1 lcId1 (.concrete lcTag2) aX.byteSize aX.align .stack =
+        if r.status != .Deallocated then
+          let err := Miri.Interpreter.StepError.undefinedBehavior s!"Tree Borrows deallocation: {reprStr r.status}"
+          ⟨memRem, ⟨mRem, some err⟩, .error (reprStr err)⟩
+        else
+          ⟨memRem, ⟨{ mRem with user := {} }, none⟩, .ok ()⟩ := by
+    have hcb0 := miriAllocMachCallback_eq canaryDeallocHooks stX.machine memRem aX ptr1 lcId1
+      (.concrete lcTag2) aX.byteSize aX.align .stack
+    have hbef0 : miriAllocMachBefore canaryDeallocHooks aX lcId1 (.concrete lcTag2) aX.byteSize aX.align .stack mRem =
+        (let r := lcRetagTree.deallocateBorrowRange (.concrete lcTag2) Miri.ABI.Size.ZERO
+           (Miri.ABI.Size.ofBytes 4) trX.global.protectedTags
+         if r.status != .Deallocated then
+           .error (.undefinedBehavior s!"Tree Borrows deallocation: {reprStr r.status}") mRem
+         else .ok () { mRem with user := {} }) := by
+      rw [miriAllocMachBefore_eq]
+      have hrace0 : Miri.Interpreter.MachineHooks.memoryRaceAccess mRem lcId1
+          ⟨Miri.ABI.Size.ZERO, aX.byteSize⟩ (some .Deallocate) .Read = (mRem, .ok ()) := by
+        unfold Miri.Interpreter.MachineHooks.memoryRaceAccess; dsimp only [mRem]; rw [hdrX]; rfl
+      simp only [canaryDeallocHooks, Miri.Interpreter.MemoryExtras.removeAllocation,
+        bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure,
+        modify, modifyGet, MonadStateOf.modifyGet,
+        get, getThe, MonadStateOf.get, EStateM.get,
+        set, MonadStateOf.set, EStateM.set,
+        throw, throwThe, MonadExceptOf.throw, hrace0]
+      dsimp only [mRem]
+      simp only [hbtX, hexX, hszX]
+      cases hst : ((lcRetagTree.deallocateBorrowRange (.concrete lcTag2) Miri.ABI.Size.ZERO
+          (Miri.ABI.Size.ofBytes 4) trX.global.protectedTags).status != .Deallocated) with
+      | true => rfl
+      | false =>
+        let mSync : Miri.Interpreter.MachineHooks.MachineState Unit (Miri.Interpreter.MemoryExtras.Registry Unit) :=
+          { memory := memRem, borrowTracker := some trX, dataRace := stX.machine.dataRace,
+            threads := stX.machine.threads, raceAllocations := stX.machine.raceAllocations,
+            allocationSpans := stX.machine.allocationSpans, user := stX.machine.user }
+        have hsync0 : Miri.Interpreter.MemoryExtras.beforeDeallocationSync canaryDeallocHooks.extras lcId1 mSync =
+            .ok () mSync := by
+          unfold Miri.Interpreter.MemoryExtras.beforeDeallocationSync
+          refine onMemoryAccess_empty_entries _ lcId1 Miri.ABI.Size.ZERO Miri.ABI.Size.ZERO .deallocation mSync ?_
+          refine accessHooks_entries_empty canaryDeallocHooks.extras lcId1 mSync ⟨none, #[]⟩ ?_ rfl
+          unfold Miri.Interpreter.MemoryExtras.lookup
+          simp only [canaryDeallocHooks, id_eq, mSync, huserX]
+          rfl
+        simp only [canaryDeallocHooks, pure, Pure.pure, mSync] at hsync0
+        have hsp : (stX.machine.allocationSpans.map fun (old, allocated, freed) =>
+            (old, allocated, if old == lcId1 then some (⟨0⟩ : Miri.MIR.SpanRef) else freed)) =
+            stX.machine.allocationSpans := by rw [hspanX]; simp
+        simp only [Bool.false_eq_true, ↓reduceIte, EStateM.bind, EStateM.modifyGet, EStateM.pure, id_eq,
+          hsync0, hsp, hrc, hus]
+    dsimp only [mRem] at hbef0 ⊢
+    rw [hcb0, hbef0]
+    cases ((lcRetagTree.deallocateBorrowRange (.concrete lcTag2) Miri.ABI.Size.ZERO
+      (Miri.ABI.Size.ofBytes 4) trX.global.protectedTags).status != .Deallocated) <;> rfl
+  rw [allocationMachine_deallocate_unfold]
+  unfold Miri.Memory.MemoryLifecycle.deallocatePtrWith
+  have hresX : canaryDeallocHooks.resolvePointer stX.machine.memory ⟨stX.machine, none⟩ ptr1 0 =
+      ⟨stX.machine.memory, ⟨stX.machine, none⟩, .ok (lcId1, Miri.ABI.Size.ZERO, .concrete lcTag2)⟩ := rfl
+  have hz0 : (Miri.ABI.Size.ZERO.bytes != 0) = false := rfl
+  have hmutF : (aX.mutability == .Not) = false := by rw [hmutX]; rfl
+  have hnatF : aX.nativeBuffer.isSome = false := by rw [hnatX]; rfl
+  have hdeadAny : (memRem.dead.any fun old => old.allocId == lcId1) = false := by
+    show (stX.machine.memory.dead.any fun old => old.allocId == lcId1) = false
+    rw [hdeadX]; simp
+  simp only [Id.run, bind, Bind.bind, pure, Pure.pure, hresX, hz0,
+    ne_eq, not_true_eq_false, Bool.false_eq_true, ↓reduceIte, hrem, hmutF]
+  have hcbEq : miriAllocMachCallback canaryDeallocHooks memRem ⟨mRem, none⟩
+      aX ptr1 lcId1 (.concrete lcTag2) aX.byteSize aX.align .stack = _ := hcbEval
+  rw [hcbEq]
+  cases hst : (lcRetagTree.deallocateBorrowRange (.concrete lcTag2) Miri.ABI.Size.ZERO
+      (Miri.ABI.Size.ofBytes 4) trX.global.protectedTags).status with
+  | Deallocated =>
+    right
+    refine ⟨rfl, ?_⟩
+    simp only [bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, hdeadAny, hnatF, hszX, halX,
+      canaryDeallocHooks, id_eq]
+    dsimp only [mRem, memRem]
+    have hremEmpty : ((#[] : Array (Miri.Memory.AllocId × Miri.Interpreter.MemoryExtras.AllocationExtra Unit)).filter
+        fun e => e.1 != lcId1) = #[] := by simp
+    rw [hrc, hremEmpty]
+    rfl
+  | _ =>
+    left
+    refine ⟨rfl, .undefinedBehavior s!"Tree Borrows deallocation: {reprStr (lcRetagTree.deallocateBorrowRange (.concrete lcTag2) Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4) trX.global.protectedTags).status}", ?_⟩
+    simp only [bne_iff_ne, ne_eq, reduceCtorEq, not_false_eq_true, ↓reduceIte, hnatF,
+      canaryDeallocHooks, id_eq, Option.getD_some]
+    dsimp only [mRem, memRem]
+    rw [hst, hrc, hus]
+
+private theorem lcRetagTree_releaseProtector_eval :
+    lcRetagTree.releaseProtector lcTag2 ⟨#[(lcTag2, .StrongProtector)]⟩ = ⟨lcRetagTree, .Released⟩ := by
+  let pt3 : Miri.TreeBorrows.ProtectedTags := ⟨#[(lcTag2, .StrongProtector)]⟩
+  have hsing := releaseProtector_singleSeg_step_eq lcRetagTree lcTag2 ⟨1⟩ _ pt3
+    ⟨⟨0, 4⟩, lcRetagLoc⟩ rfl rfl rfl
+  dsimp only at hsing
+  have hlocEq : ({ lcRetagTree with locations := ⟨#[⟨⟨0, 4⟩, lcRetagLoc⟩]⟩ } : Miri.TreeBorrows.BorrowTree) = lcRetagTree := rfl
+  rw [hlocEq] at hsing
+  rw [hsing]
+  let normS : Miri.TreeBorrows.Tree.NormalTreeState :=
+    { topology := ⟨#[⟨none, [1]⟩, ⟨some 0, []⟩]⟩
+      defaultStates := #[⟨.Disabled, false, .None⟩, ⟨.ReservedFrz false, false, .None⟩]
+      protectedNodes := [1]
+      locationStates := #[some ⟨.Unique, true, .None⟩, some ⟨.Unique, true, .None⟩] }
+  have hnormProj : miriNormalProjection { lcRetagTree with locations := ⟨#[]⟩ } lcRetagLoc pt3 = normS := by
+    rw [miriNormalProjection_eq_struct]
+    have hc1 : pt3.contains lcTag1 = false := by decide
+    have hc2 : pt3.contains lcTag2 = true := by decide
+    simp only [lcRetagTree, uniValMap_entries_2, array_map_2, array_mapIdx_2, lcRetagLoc,
+      Miri.TreeBorrows.TreeNode.defaultLocationState, Miri.TreeBorrows.UniValMap.get,
+      Miri.TreeBorrows.UniIndex.toNat, Miri.TreeBorrows.UniIndex.ofNat?,
+      Option.map_none, Option.map_some, List.map_nil, List.map_cons,
+      List.filterMap_cons, List.filterMap_nil, hc1, hc2]
+    rfl
+  have hnormAcc : ({ lcRetagTree with locations := ⟨#[]⟩ }).performNormalAccessAt
+      lcRetagLoc ⟨1⟩ .Write pt3 .SkipChildrenOfAccessed =
+      ⟨lcRetagLoc, normS.performAccess 1 .Write .SkipChildrenOfAccessed, .ok ()⟩ := by
+    have hlocsEq : (normS.performAccess 1 .Write .SkipChildrenOfAccessed).tree.locationStates =
+        #[some ⟨.Unique, true, .None⟩, some ⟨.Unique, true, .None⟩] := by decide
+    have hvis : ∀ ev ∈ (normS.performAccess 1 .Write .SkipChildrenOfAccessed).visited,
+        ∃ idx nd, Miri.TreeBorrows.UniIndex.ofNat? ev.node = some idx ∧
+          ({ lcRetagTree with locations := ⟨#[]⟩ } : Miri.TreeBorrows.BorrowTree).nodeAt idx = some nd ∧
+          nd.isExposed = false := by
+      have hall : ((normS.performAccess 1 .Write .SkipChildrenOfAccessed).visited.all fun ev =>
+          ev.node == 0 || ev.node == 1) = true := by decide
+      intro ev hev
+      have h01 := List.all_eq_true.mp hall ev hev
+      simp only [Bool.or_eq_true, beq_iff_eq] at h01
+      rcases h01 with h0 | h1
+      · exact ⟨⟨0⟩, _, by rw [h0]; rfl, rfl, rfl⟩
+      · exact ⟨⟨1⟩, _, by rw [h1]; rfl, rfl, rfl⟩
+    have hwb := performNormalAccessAt_unexposed_eval { lcRetagTree with locations := ⟨#[]⟩ }
+      lcRetagLoc ⟨1⟩ .Write pt3 .SkipChildrenOfAccessed
+      (normS.performAccess 1 .Write .SkipChildrenOfAccessed)
+      (by rw [hnormProj]; rfl) hvis
+    rw [hwb, hlocsEq]; rfl
+  have hta := performTreeAccessAt_singleRoot0_eval lcRetagTree lcRetagLoc ⟨1⟩ .Write pt3 .SkipChildrenOfAccessed
+    ⟨0, 4⟩ rfl (fun l1 l2 => performNormalAccessAt_locations_indep lcRetagTree l1 l2 _ _ _ _ _)
+    ⟨lcRetagLoc, normS.performAccess 1 .Write .SkipChildrenOfAccessed, .ok ()⟩
+    hnormAcc rfl (fun _ => by decide)
+  have hstC : (normS.performAccess 1 .Write .SkipChildrenOfAccessed).status = .Completed := by decide
+  rw [hstC] at hta; simp only [beq_self_eq_true, ↓reduceIte] at hta
+  have hget1 : lcRetagLoc.perms.get ⟨1⟩ = some ⟨.Unique, true, .None⟩ := rfl
+  rw [hget1]
+  simp only [Miri.TreeBorrows.Permission.associatedAccess, ↓reduceIte, hta]
+  rfl
+
+/-- **Closed 6-stage allocation lifecycle, no-ABA monotonicity, protected-dealloc detachment, &
+permutation-free `KeyedAllocWorld` invariance canary**:
+1. **Stage 1 (`PlaceMachine.allocateStackRaw`)**: allocates 4-byte stack object `id₁ = ⟨1⟩` from
+   `nextAllocId = 1` in lockstep with `KeyedAllocWorld.allocate` (`nextAllocId` advances to `2`);
+2. **Stage 2 (`writeScalar` / `readScalar` + `checkPtrAccess`)**: writes `0x04030201`, reads it
+   back identically, and agrees with `KeyedAllocWorld.checkPtrAccess = true`;
+3. **Stage 3 (`RetagPipeline.retagPointerValue` + protected `AllocationMachine.deallocate`)**:
+   installs strong protector `lcTag2` on `id₁` (`lcInitTree -> lcRetagTree`), AND attempting
+   `AllocationMachine.deallocate` on `id₁` while protected FAILS with `DeallocMachineOutcomeRel`
+   against `.protectedDealloc` and detaches `id₁` from `live` (`findLive? = none`);
+4. **Stage 4 (`MachineHooks.beforeStackPopWithEnsure`)**: frame exit discharges `lcTag2` via real
+   `BorrowTree.releaseProtector`, removes `lcTag2` via `endCall` (`protectedTags = #[]`), and
+   preserves `nextAllocId = 2`, `dead = #[]`, `globals = #[]`, `issuedIds = #[id₁]`;
+5. **Stage 5 (clean `AllocationMachine.deallocate` + UAF & double-free rejection)**: deallocating
+   `id₁` now SUCCEEDS in lockstep with `KeyedAllocWorld.deallocateMachine ... .ok` (moving `id₁` to
+   `dead`), after which BOTH UAF `checkPtrAccess` (`isOk = false`) AND double-free
+   `AllocationMachine.deallocate` (`.useAfterFree id₁`) fail;
+6. **Stage 6 (fresh `PlaceMachine.allocateStackRaw` + no-ABA + permutation invariance)**: allocates
+   fresh `id₂ = ⟨2⟩` with `1 < 2` (`id₂ ≠ id₁`), keeps `id₁` in `dead` and `id₂` in `live`, and
+   proves reversing `live` and `dead` preserves `KeyedAllocWorld` identically! -/
+theorem multiStep_lifecycle_noABA_and_detached_canary :
+    let val : Miri.Memory.Scalar Miri.Memory.Provenance :=
+      Miri.Memory.Scalar.fromScalarInt (Miri.Memory.ScalarInt.ofUInt32 0x04030201)
+    let id₂ : Miri.Memory.AllocId := ⟨2, by decide⟩
+    let tracker0 : Miri.Interpreter.MachineHooks.BorrowState :=
+      { global := { nextPointerTag := lcTag1, rootPointerTags := #[],
+                    protectedTags := ⟨#[]⟩, trackedPointerTags := #[] }
+        retagMode := .Default }
+    let st0 : Miri.Interpreter.MachineHooks.State Unit (Miri.Interpreter.MemoryExtras.Registry Unit) :=
+      { stack := ⟨#[canaryMultiAllocFrame #[]]⟩
+        machine := {
+          memory := Miri.Memory.MemoryState.empty
+          borrowTracker := some tracker0
+          dataRace := none
+          threads := Miri.Concurrency.ThreadManager.initial true
+          raceAllocations := #[]
+          allocationSpans := #[]
+          user := {} } }
+    let ptr1 : Miri.Memory.Pointer (Option Miri.Memory.Provenance) := ⟨Miri.ABI.Size.ZERO, some (.concrete lcId1 lcTag2)⟩
+    let lcResolve : Miri.Memory.PointerResolver Miri.Memory.Provenance Miri.Memory.ProvenanceExtra :=
+      fun p _ => match p.provenance with
+        | some (.concrete id t) => .ok ⟨id, p.offset, .concrete t⟩
+        | _ => .error p.offset.bytes
+    ∃ alloc0 alloc1 st1,
+      ∃ (st2 st3 dres3 : Miri.Interpreter.MachineHooks.State Unit (Miri.Interpreter.MemoryExtras.Registry Unit)),
+      ∃ err3,
+      ∃ (st4 st5 : Miri.Interpreter.MachineHooks.State Unit (Miri.Interpreter.MemoryExtras.Registry Unit)),
+      ∃ d5Err st5Dup st6,
+      -- Stage 1:
+      Miri.Memory.Allocation.tryNew (Prov := Miri.Memory.Provenance) (Miri.ABI.Size.ofBytes 4) Miri.ABI.Align.ONE .Uninit lcZeroed = .ok alloc0 ∧
+      Miri.Interpreter.PlaceMachine.allocateStackRaw lcAllocCfg (Miri.ABI.Size.ofBytes 4) Miri.ABI.Align.ONE st0 =
+        .ok (⟨Miri.ABI.Size.ZERO, some (.concrete lcId1 lcTag1)⟩ : Miri.Memory.Pointer (Option Miri.Memory.Provenance)) st1 ∧
+      machineToKeyed canaryDeallocProj canaryRaceEntryOf st1.machine =
+        ((machineToKeyed canaryDeallocProj canaryRaceEntryOf st0.machine).allocate
+          (liveEntryOfMiri canaryDeallocProj ⟨.stack, alloc0.withExtra lcInitTree⟩)).1 ∧
+      -- Stage 2:
+      Miri.Memory.Allocation.writeScalar annealTargetDataLayout
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4)) val alloc0 = .ok () alloc1 ∧
+      alloc1.readScalar annealTargetDataLayout
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4)) false = .ok val ∧
+      st1.machine.memory.setLiveAllocation lcId1 (alloc1.withExtra lcInitTree) = .ok st2.machine.memory ∧
+      (Miri.Memory.checkPtrAccess annealPointerArithmetic ptr1 (Miri.ABI.Size.ofBytes 4)
+        .memoryAccess lcResolve st2.machine.memory.getAllocInfo).isOk = true ∧
+      -- Stage 3 (real `RetagPipeline.retagPointerValue` + protected dealloc fails & detaches `id₁`):
+      (let retagRes := Miri.TreeBorrows.RetagPipeline.retagPointerValue
+        { memory := st2.machine.memory
+          global := { nextPointerTag := lcTag2, rootPointerTags := #[(lcId1, lcTag1)],
+                      protectedTags := ⟨#[]⟩, trackedPointerTags := #[] }
+          frame := ⟨#[]⟩ } lcRetagReq
+       retagRes.outcome = .ok (some (.concrete lcId1 lcTag2)) ∧
+       st3.machine.memory = retagRes.state.memory ∧
+       st3.machine.borrowTracker = some { global := retagRes.state.global, retagMode := .Default }) ∧
+      Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks ptr1 none .stack st3 = .error err3 dres3 ∧
+      (machineToKeyed canaryDeallocProj canaryRaceEntryOf dres3.machine).findLive? (ofMiriAllocId lcId1) = none ∧
+      -- Stage 4 (`beforeStackPopWithEnsure`):
+      Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ()) st3 = .ok () st4 ∧
+      (st4.machine.borrowTracker.map fun tr => tr.global.protectedTags) = some ⟨#[]⟩ ∧
+      -- Stage 5 (clean dealloc + UAF + double-free):
+      Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks ptr1 none .stack st4 = .ok () st5 ∧
+      (machineToKeyed canaryDeallocProj canaryRaceEntryOf st5.machine).findLive? (ofMiriAllocId lcId1) = none ∧
+      (machineToKeyed canaryDeallocProj canaryRaceEntryOf st5.machine).findDead? (ofMiriAllocId lcId1) ≠ none ∧
+      (Miri.Memory.checkPtrAccess annealPointerArithmetic ptr1 (Miri.ABI.Size.ofBytes 4)
+        .memoryAccess lcResolve st5.machine.memory.getAllocInfo).isOk = false ∧
+      Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks ptr1 none .stack st5 = .error d5Err st5Dup ∧
+      DeallocMachineOutcomeRel canaryDeallocHooks (.error d5Err) (.error (.useAfterFree (ofMiriAllocId lcId1))) ∧
+      -- Stage 6 (fresh `allocateStackRaw` -> `id₂ = 2`, `1 < 2` no-ABA, & permutation invariance):
+      lcId1.value.toNat < id₂.value.toNat ∧
+      id₂ ≠ lcId1 ∧
+      Miri.Interpreter.PlaceMachine.allocateStackRaw lcAllocCfg (Miri.ABI.Size.ofBytes 4) Miri.ABI.Align.ONE st5 =
+        .ok (⟨Miri.ABI.Size.ZERO, some (.concrete id₂ ⟨3, by decide⟩)⟩ : Miri.Memory.Pointer (Option Miri.Memory.Provenance)) st6 ∧
+      (machineToKeyed canaryDeallocProj canaryRaceEntryOf st6.machine).findDead? (ofMiriAllocId lcId1) ≠ none ∧
+      (machineToKeyed canaryDeallocProj canaryRaceEntryOf st6.machine).findLive? (ofMiriAllocId id₂) ≠ none ∧
+      memoryStateToKeyed canaryDeallocProj
+        { st6.machine.memory with
+          live := st6.machine.memory.live.toList.reverse.toArray
+          dead := st6.machine.memory.dead.toList.reverse.toArray }
+        (st6.machine.raceAllocations.toList.map fun p => (ofMiriAllocId p.1, canaryRaceEntryOf p.2)) =
+        machineToKeyed canaryDeallocProj canaryRaceEntryOf st6.machine := by
+  intro val id₂ tracker0 st0 ptr1 lcResolve
+  obtain ⟨alloc0, alloc1, htry, hsz0Eq, hwr, hrd, hsz1Eq, hal1Eq, hmut1Eq, hnat1Eq⟩ := lc_writeRead_eval
+  -- Stage 1 via `multiStep_alloc_storeLoad_retag_frameExit_dealloc_realloc_lifecycle`:
+  have hfit0 : ¬ alloc0.byteSize.bytes > lcAllocCfg.maximumObjectSize.bytes := by rw [hsz0Eq]; decide
+  let g1 : Miri.TreeBorrows.GlobalState :=
+    { nextPointerTag := lcTag2, rootPointerTags := #[(lcId1, lcTag1)],
+      protectedTags := ⟨#[]⟩, trackedPointerTags := #[] }
+  let tracker1 : Miri.Interpreter.MachineHooks.BorrowState := { global := g1, retagMode := .Default }
+  have hms := multiStep_alloc_storeLoad_retag_frameExit_dealloc_realloc_lifecycle
+    canaryDeallocProj canaryRaceEntryOf lcAllocCfg canaryDeallocHooks
+    (Miri.ABI.Size.ofBytes 4) (Miri.ABI.Size.ofBytes 4) Miri.ABI.Align.ONE Miri.ABI.Align.ONE
+    st0 alloc0 alloc0 rfl htry hfit0 rfl rfl (by decide) (by decide)
+    (by intro _ h; change _ ∈ (#[] : Array _) at h; simp at h)
+    (by intro _ h; simp [st0, Miri.Memory.MemoryState.empty] at h)
+    (by intro _ h; change _ ∈ (#[] : Array _) at h; simp at h)
+    (by intro _ h; simp [st0, Miri.Memory.MemoryState.empty] at h)
+    rfl (fun _ _ => rfl)
+    { allocations := #[(lcId1, ⟨none, #[]⟩)] }
+    (fun m hm => lcAllocCfg_tail_eval lcId1 _ _ m hm)
+    lcTag1 (some tracker1)
+    ⟨g1, rfl, rfl, rfl⟩ ⟨Miri.ABI.Size.ZERO, .concrete lcId1 lcTag1⟩ (fun _ => rfl)
+  obtain ⟨heval1, hkw1, _, hcont⟩ := hms
+  let memRes1 := st0.machine.memory.reserveAllocId.1
+  have hresProps1 := memoryState_reserve_highWater_props st0.machine.memory rfl rfl (by decide)
+    (by intro _ h; change _ ∈ (#[] : Array _) at h; simp at h)
+    (by intro _ h; simp [st0, Miri.Memory.MemoryState.empty] at h)
+    (by intro _ h; change _ ∈ (#[] : Array _) at h; simp at h)
+    (by intro _ h; simp [st0, Miri.Memory.MemoryState.empty] at h)
+  let mem1 : Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit :=
+    { memRes1 with live := memRes1.live.push (lcId1, ⟨.stack, alloc0.withExtra lcInitTree⟩) }
+  let st1 : Miri.Interpreter.MachineHooks.State Unit (Miri.Interpreter.MemoryExtras.Registry Unit) :=
+    { st0 with machine := { st0.machine with
+        memory := mem1, borrowTracker := some tracker1,
+        user := { allocations := #[(lcId1, ⟨none, #[]⟩)] } } }
+  have hmem1Live : mem1.live = #[(lcId1, ⟨.stack, alloc0.withExtra lcInitTree⟩)] := by
+    change memRes1.live.push _ = _; rw [hresProps1.2.2.2.2.1]; rfl
+  -- Stage 2:
+  have hset2 : mem1.setLiveAllocation lcId1 (alloc1.withExtra lcInitTree) =
+      .ok { mem1 with live := #[(lcId1, ⟨.stack, alloc1.withExtra lcInitTree⟩)] } := by
+    rw [Miri.Memory.MemoryState.setLiveAllocation_of_find _ lcId1 ⟨.stack, alloc0.withExtra lcInitTree⟩ _
+      (by rw [hmem1Live]; rfl)]
+    simp only [hmem1Live, Array.filter, Array.push]
+    rfl
+  let mem2 : Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit :=
+    { mem1 with live := #[(lcId1, ⟨.stack, alloc1.withExtra lcInitTree⟩)] }
+  let st2 : Miri.Interpreter.MachineHooks.State Unit (Miri.Interpreter.MemoryExtras.Registry Unit) :=
+    { st1 with machine := { st1.machine with memory := mem2 } }
+  have hsz4I64 : Miri.Memory.sizeAsI64 (Miri.ABI.Size.ofBytes 4) = .ok 4 := by decide
+  have hchk2 : (Miri.Memory.checkPtrAccess annealPointerArithmetic ptr1 (Miri.ABI.Size.ofBytes 4)
+      .memoryAccess lcResolve mem2.getAllocInfo).isOk = true := by
+    have hgi : mem2.getAllocInfo lcId1 = .ok ⟨Miri.ABI.Size.ofBytes 4, Miri.ABI.Align.ONE, .liveData, .Mut⟩ := by
+      unfold Miri.Memory.MemoryState.getAllocInfo
+      have hfl : mem2.live.find? (fun e => e.1 == lcId1) = some (lcId1, ⟨.stack, alloc1.withExtra lcInitTree⟩) := rfl
+      rw [hfl]
+      have hszW : (alloc1.withExtra lcInitTree).byteSize = Miri.ABI.Size.ofBytes 4 := hsz1Eq
+      have halW : (alloc1.withExtra lcInitTree).align = Miri.ABI.Align.ONE := hal1Eq
+      have hmutW : (alloc1.withExtra lcInitTree).mutability = .Mut := hmut1Eq
+      simp only [hszW, halW, hmutW, pure, Pure.pure, Except.pure]
+    unfold Miri.Memory.checkPtrAccess Miri.Memory.checkAndDerefPtr
+    rw [hsz4I64]
+    simp only [ptr1, lcResolve, hgi, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+    decide
+  -- Stage 3: REAL `RetagPipeline.retagPointerValue`:
+  have hretag3 := lcInitTree_retagPipeline_eq (alloc1.withExtra lcInitTree) hmut1Eq rfl mem2 rfl
+  let mem3 : Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit :=
+    { mem2 with live := #[(lcId1, ⟨.stack, (alloc1.withExtra lcInitTree).setExtra lcRetagTree⟩)] }
+  let pt3 : Miri.TreeBorrows.ProtectedTags := ⟨#[(lcTag2, .StrongProtector)]⟩
+  let tracker3 : Miri.Interpreter.MachineHooks.BorrowState :=
+    { global := { nextPointerTag := ⟨3, by decide⟩, rootPointerTags := #[(lcId1, lcTag1)],
+                  protectedTags := pt3, trackedPointerTags := #[] }
+      retagMode := .Default }
+  let frame3 := canaryMultiAllocFrame #[(lcId1, lcTag2)]
+  let st3 : Miri.Interpreter.MachineHooks.State Unit (Miri.Interpreter.MemoryExtras.Registry Unit) :=
+    { stack := ⟨#[frame3]⟩
+      machine := { st2.machine with memory := mem3, borrowTracker := some tracker3 } }
+  have hrel3 : BorrowTreeWorldRel pt3 (fun t => t = lcTag2) (fun t => t.value.toNat - 1) lcRetagTree lcRetagWorld := by
+    refine ⟨⟨0, 4⟩, lcRetagLoc, 0, 4, ⟨⟨by decide, fun n hn => ?_⟩, ?_, by decide, rfl, rfl, by decide, rfl, ?_, ?_⟩⟩
+    · simp only [lcRetagWorld, List.mem_cons, List.not_mem_nil, or_false] at hn
+      rcases hn with rfl | rfl
+      · exact ⟨0, by decide, ReachesRoot.root _ rfl rfl⟩
+      · exact ⟨1, by decide, ReachesRoot.step 0 1 0 _ rfl rfl (ReachesRoot.root _ rfl rfl)⟩
+    · intro i n h; match i with | 0 | 1 => simp only [lcRetagWorld] at h; injection h with h; subst h; rfl | _ + 2 => simp [lcRetagWorld] at h
+    · intro i wn h; match i with
+      | 0 | 1 => simp only [lcRetagWorld] at h; injection h with h; subst h; exact ⟨_, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, Or.inl rfl, trivial⟩
+      | _ + 2 => simp [lcRetagWorld] at h
+    · intro tag ht; subst ht; exact ⟨1, by decide, rfl, rfl⟩
+  let worlds3 : Miri.Memory.AllocId → Option FnEntryBorrowWorld := fun id => if id == lcId1 then some lcRetagWorld else none
+  have hsync3 : ∀ id w, worlds3 id = some w →
+      ∃ entry, st3.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry) ∧
+        BorrowTreeWorldRel pt3 (fun t => t = lcTag2) (fun t => t.value.toNat - 1) entry.allocation.extra w := by
+    intro id w hw; dsimp only [worlds3] at hw
+    cases h1 : id == lcId1 with
+    | false => simp [h1] at hw
+    | true => have hid : id = lcId1 := eq_of_beq h1; subst hid; simp at hw; subst hw; exact ⟨_, rfl, hrel3⟩
+  have hpart3 : multiAllocEndAccessesPartial (fun t => t.value.toNat - 1) [(lcId1, lcTag2)] worlds3 = (worlds3, none) := by
+    have htag2 : (fun t : Miri.Memory.BorTag => t.value.toNat - 1) lcTag2 = 1 := rfl
+    have h1 : execProtectorEndAccessFor protectorEndAccessIsWrite? lcRetagWorld 1 = .ok lcRetagWorld := by decide
+    simp only [multiAllocEndAccessesPartial, worlds3, beq_self_eq_true, ↓reduceIte, htag2, h1]
+    exact Prod.ext (funext fun id => by by_cases h : id == lcId1 <;> simp [h]) rfl
+  -- Stage 3 protected dealloc failure & detachment:
+  have hst3Prot : (lcRetagTree.deallocateBorrowRange (.concrete lcTag2) Miri.ABI.Size.ZERO
+      (Miri.ABI.Size.ofBytes 4) pt3).status = .ProtectedDealloc ⟨0, 4⟩ ⟨1⟩ := by
+    rw [lcRetagTree_deallocateBorrowRange_eval pt3 false true (by decide) (by decide)]; rfl
+  have hde3 := lc_deallocate_eval st3 ((alloc1.withExtra lcInitTree).setExtra lcRetagTree) tracker3
+    rfl hresProps1.2.2.2.2.2.1 hsz1Eq hal1Eq hmut1Eq hnat1Eq rfl rfl rfl rfl rfl rfl
+  rcases hde3 with ⟨_, ⟨err3, hde3Eq⟩⟩ | ⟨hcontra, _⟩
+  · let dres3 : Miri.Interpreter.MachineHooks.State Unit (Miri.Interpreter.MemoryExtras.Registry Unit) :=
+      { st3 with machine := { st3.machine with memory := { st3.machine.memory with live := #[] }, user := {} } }
+    have hdres3None : (machineToKeyed canaryDeallocProj canaryRaceEntryOf dres3.machine).findLive? (ofMiriAllocId lcId1) = none := by
+      unfold machineToKeyed memoryStateToKeyed memoryStateToLinear KeyedAllocWorld.ofLinear KeyedAllocWorld.findLive?
+      rfl
+    -- Stage 4 (`beforeStackPopWithEnsure`):
+    have hrelTree : lcRetagTree.releaseProtector lcTag2 pt3 = ⟨lcRetagTree, .Released⟩ :=
+      lcRetagTree_releaseProtector_eval
+    have hpopAll : stackPopReleaseAll pt3 [(lcId1, lcTag2)] mem3 =
+        some (stackPopWriteBack mem3 lcId1 ⟨.stack, (alloc1.withExtra lcInitTree).setExtra lcRetagTree⟩ lcRetagTree, none) := by
+      unfold stackPopReleaseAll
+      have hf3 : mem3.live.find? (fun e => e.1 == lcId1) =
+          some (lcId1, ⟨.stack, (alloc1.withExtra lcInitTree).setExtra lcRetagTree⟩) := rfl
+      have hex3 : ((alloc1.withExtra lcInitTree).setExtra lcRetagTree).extra = lcRetagTree := rfl
+      rw [hf3]; dsimp only; rw [hex3, hrelTree]; rfl
+    have hwb3 : stackPopWriteBack mem3 lcId1 ⟨.stack, (alloc1.withExtra lcInitTree).setExtra lcRetagTree⟩ lcRetagTree = mem3 := by
+      have hlv : (mem3.live.filter fun e => e.1 != lcId1).push
+          (lcId1, ⟨.stack, ((alloc1.withExtra lcInitTree).setExtra lcRetagTree).setExtra lcRetagTree⟩) = mem3.live := rfl
+      unfold stackPopWriteBack
+      exact congrArg (fun lv => { mem3 with live := lv }) hlv
+    rw [hwb3] at hpopAll
+    have hpop4 := miri_beforeStackPopWithEnsure_eq_releaseAll st3 tracker3 frame3 #[(lcId1, lcTag2)]
+      rfl rfl rfl mem3 none hpopAll
+    let tracker4 : Miri.Interpreter.MachineHooks.BorrowState :=
+      { tracker3 with global := tracker3.global.endCall ⟨#[(lcId1, lcTag2)]⟩ }
+    let st4 : Miri.Interpreter.MachineHooks.State Unit (Miri.Interpreter.MemoryExtras.Registry Unit) :=
+      { st3 with machine := { st3.machine with memory := mem3, borrowTracker := some tracker4 } }
+    have hpt4Empty : tracker4.global.protectedTags = ⟨#[]⟩ := rfl
+    -- Stage 5: clean `AllocationMachine.deallocate` on `st4`:
+    have hst4Free : (lcRetagTree.deallocateBorrowRange (.concrete lcTag2) Miri.ABI.Size.ZERO
+        (Miri.ABI.Size.ofBytes 4) tracker4.global.protectedTags).status = .Deallocated := by
+      rw [hpt4Empty, lcRetagTree_deallocateBorrowRange_eval ⟨#[]⟩ false false (by decide) (by decide)]; rfl
+    have hde4 := lc_deallocate_eval st4 ((alloc1.withExtra lcInitTree).setExtra lcRetagTree) tracker4
+      rfl hresProps1.2.2.2.2.2.1 hsz1Eq hal1Eq hmut1Eq hnat1Eq rfl rfl rfl rfl rfl rfl
+    rcases hde4 with ⟨hbad, _⟩ | ⟨_, hde4Eq⟩
+    · rw [hst4Free] at hbad; cases hbad
+    · let mem5 : Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit :=
+        { mem3 with
+          live := #[]
+          dead := (mem3.dead.filter fun d => d.allocId != lcId1).push
+            ⟨lcId1, Miri.ABI.Size.ofBytes 4, Miri.ABI.Align.ONE⟩ }
+      let st5 : Miri.Interpreter.MachineHooks.State Unit (Miri.Interpreter.MemoryExtras.Registry Unit) :=
+        { st4 with machine := { st4.machine with memory := mem5, user := {} } }
+      have hmem5Dead : mem5.dead = #[⟨lcId1, Miri.ABI.Size.ofBytes 4, Miri.ABI.Align.ONE⟩] := by
+        have hd3 : mem3.dead = #[] := hresProps1.2.2.2.2.2.1
+        change (mem3.dead.filter _).push _ = _; rw [hd3]; rfl
+      have hmem5Next : mem5.nextAllocId = 2 := hresProps1.2.1
+      have hmem5Iss : mem5.issuedIds = #[lcId1] := hresProps1.2.2.2.2.2.2.2
+      have hmem5Glob : mem5.globals = #[] := hresProps1.2.2.2.2.2.2.1
+      have hmem5Src : mem5.sourceAllocIdWorldActive = false := hresProps1.2.2.2.1
+      have hmem5Exh : mem5.idSupplyExhausted = false := hresProps1.2.2.1
+      have hst5LiveNone : (machineToKeyed canaryDeallocProj canaryRaceEntryOf st5.machine).findLive? (ofMiriAllocId lcId1) = none := by
+        unfold machineToKeyed memoryStateToKeyed memoryStateToLinear KeyedAllocWorld.ofLinear KeyedAllocWorld.findLive?
+        rfl
+      have hst5DeadSome : (machineToKeyed canaryDeallocProj canaryRaceEntryOf st5.machine).findDead? (ofMiriAllocId lcId1) ≠ none := by
+        unfold machineToKeyed memoryStateToKeyed memoryStateToLinear KeyedAllocWorld.ofLinear KeyedAllocWorld.findDead?
+        dsimp only [st5, MiriAllocRows.toLinear, memoryStateToRows]
+        rw [hmem5Dead, get?_ofLinearRows]
+        simp [linearFind?]
+      have huaf5 : (Miri.Memory.checkPtrAccess annealPointerArithmetic ptr1 (Miri.ABI.Size.ofBytes 4)
+          .memoryAccess lcResolve mem5.getAllocInfo).isOk = false := by
+        have htabEmpty : mem5.extraFnPtrIds = #[] ∧ mem5.vaListIds = #[] := by
+          change memRes1.extraFnPtrIds = #[] ∧ memRes1.vaListIds = #[]
+          dsimp only [memRes1, st0]
+          unfold Miri.Memory.MemoryState.reserveAllocId
+          simp only [Id.run, pure, Pure.pure]
+          split <;> first | exact ⟨rfl, rfl⟩ | (split <;> first | exact ⟨rfl, rfl⟩ | (split <;> first | exact ⟨rfl, rfl⟩ | (split <;> exact ⟨rfl, rfl⟩)))
+        have hfg5 : mem5.findGlobal? lcId1 = none := by
+          rw [memoryState_findGlobal?_eq_list_find?, hmem5Glob]; rfl
+        have hfn5 : mem5.hasFunctionPointer lcId1 = false := by
+          unfold Miri.Memory.MemoryState.hasFunctionPointer
+          have he : (miriMSExtraFnTable mem5).contains lcId1.value = false := by
+            rw [Miri.Memory.KeyedArray.contains_rows]
+            change (mem5.extraFnPtrIds.map _).contains _ = false
+            rw [htabEmpty.1]; simp
+          have hg : (miriMSGlobalTable mem5).any? lcId1.value (fun entry => entry.kind == .function) = false := by
+            rw [keyedArray_any?_eq_list_any]
+            change mem5.globals.toList.any _ = false
+            rw [hmem5Glob]; rfl
+          simp only [he, hg, Bool.or_self]
+        have hva5 : (miriMSVaListTable mem5).contains lcId1.value = false := by
+          rw [Miri.Memory.KeyedArray.contains_rows]
+          change (mem5.vaListIds.map _).contains _ = false
+          rw [htabEmpty.2]; simp
+        have hgi5 : mem5.getAllocInfo lcId1 = .ok ⟨Miri.ABI.Size.ofBytes 4, Miri.ABI.Align.ONE, .dead, .Not⟩ := by
+          unfold Miri.Memory.MemoryState.getAllocInfo
+          have hfl : mem5.live.find? (fun e => e.1 == lcId1) = none := rfl
+          have hfd : mem5.dead.find? (fun d => d.allocId == lcId1) = some ⟨lcId1, Miri.ABI.Size.ofBytes 4, Miri.ABI.Align.ONE⟩ := by
+            rw [hmem5Dead]; rfl
+          simp only [hfl, hfn5, hva5, hfg5, hfd, Bool.false_eq_true, ↓reduceIte, pure, Pure.pure, Except.pure]
+        unfold Miri.Memory.checkPtrAccess Miri.Memory.checkAndDerefPtr
+        rw [hsz4I64]
+        simp only [ptr1, lcResolve, hgi5, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+        decide
+      -- Double-free on `st5` via `allocationMachine_deallocate_eq_deallocateMachine` (vacuous `live = #[]`!):
+      have hdup5 := allocationMachine_deallocate_eq_deallocateMachine
+        canaryDeallocProj canaryRaceEntryOf canaryDeallocHooks ptr1 none .stack st5
+        (.provenanced (ofMiriAllocId lcId1) 0) canaryDeallocActor .ok (Or.inl rfl)
+        rfl rfl ⟨rfl, rfl⟩
+        (fun _ h => by simp [st5, mem5] at h) (fun _ _ h => by cases h)
+        (fun _ h => by simp [st5, mem5] at h) (fun _ h => by simp [st5, mem5] at h)
+        (fun _ h => by simp [st5, st4, st3, st2, st1, st0] at h) (fun _ _ _ h => by simp [st5, mem5] at h)
+        (fun m _ => ⟨m, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩)
+        (fun _ _ => ⟨rfl, rfl, rfl⟩)
+        (fun m _ _ h _ => by simp [st5, mem5] at h)
+        (fun m => ⟨⟨0⟩, m, rfl, rfl, rfl⟩)
+        (fun m _ _ _ _ => ⟨m, rfl, rfl, rfl⟩)
+      have hkw5Uaf : ((machineToKeyed canaryDeallocProj canaryRaceEntryOf st5.machine).deallocateMachine
+          (.provenanced (ofMiriAllocId lcId1) 0) none .stack (raceModeOfMachine st5.machine) canaryDeallocActor .ok).outcome =
+          .error (.useAfterFree (ofMiriAllocId lcId1)) := by
+        unfold KeyedAllocWorld.deallocateMachine KeyedAllocWorld.detachRaceClock KeyedAllocWorld.deallocateWith
+          KeyedAllocWorld.removeLive
+        have hfl := hst5LiveNone
+        have hfg : (machineToKeyed canaryDeallocProj canaryRaceEntryOf st5.machine).findGlobal? (ofMiriAllocId lcId1) = none := by
+          unfold machineToKeyed memoryStateToKeyed memoryStateToLinear KeyedAllocWorld.ofLinear KeyedAllocWorld.findGlobal?
+          dsimp only [st5, MiriAllocRows.toLinear, memoryStateToRows]
+          rw [hmem5Glob]; rfl
+        simp only [hfl, hfg]
+        rfl
+      cases hdupRun : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks ptr1 none .stack st5 with
+      | ok u st5Dup =>
+        cases u; rw [hdupRun] at hdup5
+        dsimp only [Option.map, memKindOfMiri] at hdup5
+        rw [hkw5Uaf] at hdup5; cases hdup5.2
+      | error d5Err st5Dup =>
+        rw [hdupRun] at hdup5
+        dsimp only [Option.map, memKindOfMiri] at hdup5
+        rw [hkw5Uaf] at hdup5
+        -- Stage 6 via `hcont` (`multiStep_alloc_storeLoad_retag_frameExit_dealloc_realloc_lifecycle`)!
+        let g6 : Miri.TreeBorrows.GlobalState :=
+          { nextPointerTag := ⟨4, by decide⟩,
+            rootPointerTags := #[(lcId1, lcTag1), (id₂, ⟨3, by decide⟩)],
+            protectedTags := ⟨#[]⟩, trackedPointerTags := #[] }
+        have hcontStep := (hcont st2 st3 st4 st5 tracker3 frame3 lcTag2 (fun _ t => t = lcTag2)
+          (fun t => t.value.toNat - 1) worlds3 worlds3 ptr1 canaryDeallocActor ⟨3, by decide⟩
+          (some { tracker4 with global := g6 })
+          ⟨Miri.ABI.Size.ZERO, .concrete id₂ ⟨3, by decide⟩⟩
+          rfl rfl rfl rfl rfl hsync3 rfl hpart3).2 hpop4
+        obtain ⟨_, _, _, _, _, hstage6⟩ := hcontStep
+        have hnz5 : st5.machine.memory.nextAllocId ≠ 0 := by rw [hmem5Next]; decide
+        have hidEq : (⟨st5.machine.memory.nextAllocId, hnz5⟩ : Miri.Memory.AllocId) = id₂ := by
+          dsimp only [id₂]; congr 1
+        have hbt6 : ∃ g', tracker4.global.rootPointerTag ⟨st5.machine.memory.nextAllocId, hnz5⟩ = .ok (g', ⟨3, by decide⟩) ∧
+            g'.rootTag? ⟨st5.machine.memory.nextAllocId, hnz5⟩ = some ⟨3, by decide⟩ ∧
+            (some { tracker4 with global := g6 } : Option _) = some { tracker4 with global := g' } := by
+          rw [hidEq]
+          exact ⟨g6, rfl, rfl, rfl⟩
+        have hadj6 : ∀ s, lcAllocCfg.adjustRootAddress ⟨st5.machine.memory.nextAllocId, hnz5⟩ ⟨3, by decide⟩ s =
+            .ok ⟨Miri.ABI.Size.ZERO, .concrete id₂ ⟨3, by decide⟩⟩ s := fun _ => by
+          rw [hidEq]; rfl
+        obtain ⟨id₂', st6, hlt12, hne12, heval6, hkw6, hkres6, hperm6⟩ :=
+          hstage6 rfl rfl hmem5Src hmem5Exh rfl
+            (by intro id hi; rw [hmem5Iss] at hi; rw [hmem5Next]; simp at hi; subst hi; decide)
+            (by intro _ h; simp [st5, mem5] at h)
+            (by intro _ h; rw [hmem5Glob] at h; simp at h)
+            (by intro d hd; rw [hmem5Dead] at hd; rw [hmem5Next]; simp at hd; subst hd; decide)
+            htry hfit0 (fun _ _ => rfl) hnz5 { allocations := #[(id₂, ⟨none, #[]⟩)] }
+            (fun m hm => by rw [hidEq]; exact lcAllocCfg_tail_eval id₂ _ _ m hm)
+            hbt6 hadj6
+        have hid2Eq : id₂' = id₂ := by
+          have h1 := placeMachine_allocateStackRaw_eq_keyed canaryDeallocProj canaryRaceEntryOf lcAllocCfg
+            (Miri.ABI.Size.ofBytes 4) Miri.ABI.Align.ONE st5 alloc0 rfl htry hfit0 hmem5Src hmem5Exh hnz5
+            (by intro id hi; rw [hmem5Iss] at hi; rw [hmem5Next]; simp at hi; subst hi; decide)
+            (by intro _ h; simp [st5, mem5] at h)
+            (by intro _ h; rw [hmem5Glob] at h; simp at h)
+            (by intro d hd; rw [hmem5Dead] at hd; rw [hmem5Next]; simp at hd; subst hd; decide)
+            rfl (fun _ _ => rfl) { allocations := #[(id₂, ⟨none, #[]⟩)] }
+            (fun m hm => by rw [hidEq]; exact lcAllocCfg_tail_eval id₂ _ _ m hm)
+            ⟨3, by decide⟩ _ hbt6 _ hadj6
+          have he := h1.2.2.1.symm.trans hkres6
+          injection he with he; exact (ofMiriAllocId_injective he.symm).trans hidEq
+        subst hid2Eq
+        have hst6Dead1 : (machineToKeyed canaryDeallocProj canaryRaceEntryOf st6.machine).findDead? (ofMiriAllocId lcId1) ≠ none := by
+          rw [hkw6]
+          unfold KeyedAllocWorld.allocate at hkres6 ⊢
+          cases hresK : (machineToKeyed canaryDeallocProj canaryRaceEntryOf st5.machine).reserveAllocId with
+          | mk kwR outR =>
+            rw [hresK] at hkres6
+            cases outR with
+            | error _ => cases hkres6
+            | ok kid =>
+              have hdeadEq : kwR.findDead? (ofMiriAllocId lcId1) =
+                  (machineToKeyed canaryDeallocProj canaryRaceEntryOf st5.machine).findDead? (ofMiriAllocId lcId1) := by
+                unfold KeyedAllocWorld.reserveAllocId at hresK
+                split at hresK <;> first
+                  | (injection hresK with hk _; subst hk; rfl)
+                  | (split at hresK <;> first
+                      | (injection hresK with hk _; subst hk; rfl)
+                      | (split at hresK <;> (injection hresK with hk _; subst hk; rfl)))
+              change (kwR.insertLive kid _).findDead? (ofMiriAllocId lcId1) ≠ none
+              have hfd : ∀ e, (kwR.insertLive kid e).findDead? (ofMiriAllocId lcId1) = kwR.findDead? (ofMiriAllocId lcId1) := fun _ => rfl
+              rw [hfd, hdeadEq]
+              exact hst5DeadSome
+        have hst6Live2 : (machineToKeyed canaryDeallocProj canaryRaceEntryOf st6.machine).findLive? (ofMiriAllocId id₂) ≠ none := by
+          rw [hkw6]
+          unfold KeyedAllocWorld.allocate at hkres6 ⊢
+          cases hresK : (machineToKeyed canaryDeallocProj canaryRaceEntryOf st5.machine).reserveAllocId with
+          | mk kwR outR =>
+            rw [hresK] at hkres6
+            cases outR with
+            | error _ => cases hkres6
+            | ok kid =>
+              injection hkres6 with hkid; subst hkid
+              unfold KeyedAllocWorld.insertLive KeyedAllocWorld.findLive?
+              rw [ExtTreeMap0.get?_insert_self]
+              exact Option.some_ne_none _
+        have hst6Props := placeMachine_allocateStackRaw_eq_keyed canaryDeallocProj canaryRaceEntryOf lcAllocCfg
+          (Miri.ABI.Size.ofBytes 4) Miri.ABI.Align.ONE st5 alloc0 rfl htry hfit0 hmem5Src hmem5Exh hnz5
+          (by intro id hi; rw [hmem5Iss] at hi; rw [hmem5Next]; simp at hi; subst hi; decide)
+          (by intro _ h; simp [st5, mem5] at h)
+          (by intro _ h; rw [hmem5Glob] at h; simp at h)
+          (by intro d hd; rw [hmem5Dead] at hd; rw [hmem5Next]; simp at hd; subst hd; decide)
+          rfl (fun _ _ => rfl) { allocations := #[(id₂, ⟨none, #[]⟩)] }
+          (fun m hm => by rw [hidEq]; exact lcAllocCfg_tail_eval id₂ _ _ m hm)
+          ⟨3, by decide⟩ _ hbt6 _ hadj6
+        have hst6Eq : st6 = _ := Option.some.inj (by
+          have h1 := heval6.symm.trans hst6Props.1
+          injection h1 with _ hs; exact congrArg some hs)
+        have hpermRev := hperm6
+          st6.machine.memory.live.toList.reverse.toArray
+          st6.machine.memory.dead.toList.reverse.toArray
+          (List.reverse_perm _).symm
+          (List.reverse_perm _).symm
+          (by rw [hst6Eq, hst6Props.2.2.2.2.2.2.2.2.1, hmem5Glob]; simp)
+          (by rw [hst6Eq, hst6Props.2.2.2.2.2.2.1]; simp [st5, mem5])
+          (by rw [hst6Eq, hst6Props.2.2.2.2.2.2.2.1, hmem5Dead]; simp)
+          (by rw [hst6Eq]; simp [st5, st4, st3, st2, st1, st0])
+        exact ⟨alloc0, alloc1, st1, st2, st3, dres3, err3, st4, st5, d5Err, st5Dup, st6,
+          htry, heval1, hkw1, hwr, hrd, hset2, hchk2,
+          ⟨hretag3.1, hretag3.2.2.2.symm, by dsimp only [st3, tracker3]; rw [hretag3.2.1]⟩,
+          hde3Eq, hdres3None, hpop4, rfl, hde4Eq, hst5LiveNone, hst5DeadSome,
+          huaf5, hdupRun, hdup5.2, hlt12, hne12, heval6, hst6Dead1, hst6Live2, hpermRev⟩
+  · rw [hst3Prot] at hcontra; cases hcontra
+
+private def arrUnitLayout : Miri.Interpreter.LocalLayout :=
+  ⟨25, { zstLayoutData with fields := .Arbitrary #[] #[], variants := .Single 0 }⟩
+private def arrU32Layout : Miri.Interpreter.LocalLayout :=
+  ⟨26, { zstLayoutData with size := ⟨4⟩, align := ⟨⟨2⟩⟩ }⟩
+private def arrU32ZeroLayout : Miri.Interpreter.LocalLayout :=
+  ⟨27, { zstLayoutData with size := ⟨0⟩, align := ⟨⟨2⟩⟩, fields := .Array ⟨4⟩ 0 }⟩
+private def arrNeverZeroLayout : Miri.Interpreter.LocalLayout :=
+  ⟨21, { zstLayoutData with size := ⟨0⟩, align := ⟨Miri.ABI.Align.ONE⟩, fields := .Array ⟨0⟩ 0 }⟩
+private def arrNeverMaxLayout : Miri.Interpreter.LocalLayout :=
+  ⟨22, { zstLayoutData with size := ⟨0⟩, align := ⟨Miri.ABI.Align.ONE⟩, uninhabited := true, fields := .Array ⟨0⟩ 0xFFFFFFFFFFFFFFFF }⟩
+private def arrUnitZeroLayout : Miri.Interpreter.LocalLayout :=
+  ⟨23, { zstLayoutData with size := ⟨0⟩, align := ⟨Miri.ABI.Align.ONE⟩, fields := .Array ⟨0⟩ 0 }⟩
+private def arrUnitMaxLayout : Miri.Interpreter.LocalLayout :=
+  ⟨24, { zstLayoutData with size := ⟨0⟩, align := ⟨Miri.ABI.Align.ONE⟩, fields := .Array ⟨0⟩ 0xFFFFFFFFFFFFFFFF }⟩
+private def arrWideDyn2Layout : Miri.Interpreter.LocalLayout :=
+  ⟨31, { zstLayoutData with size := ⟨32⟩, align := ⟨Miri.ABI.Align.EIGHT⟩, fields := .Array ⟨16⟩ 2 }⟩
+
+private def canaryArrayWideHooks
+    (vtWord : Miri.Memory.Scalar AnnealProv)
+    (outerPtr : Miri.Memory.Pointer (Option AnnealProv))
+    (expected : Nat) :
+    Miri.Interpreter.ValidityVisitor.Hooks AnnealProv AnnealStepState
+      Trusted.Rustc.V2026_06_01.MirAst.Ty Unit Unit Unit Unit :=
+  { annealValidityHooks emptyLayoutTable with
+    vtable := worldVTableHooks AnnealProv AnnealStepState Trusted.Rustc.V2026_06_01.MirAst.Ty
+      canaryWideWorld canaryWideReg canaryWideResolve canarySpecTable canaryWideDynCode
+    projection :=
+      { annealValidityProjectionHooks with
+        place :=
+          { annealValidityPlaceHooks with
+            memoryOffset := fun _ mp off _ mv =>
+              pure { mp with
+                ptr := ⟨⟨mp.ptr.offset.bytes + off.bytes⟩, mp.ptr.provenance⟩
+                metadata := mv } }
+        layoutOf := fun _ ty =>
+          if ty == 1 then pure canaryNestedWideRefLayout
+          else if ty == 12 then pure canaryNestedNeverLayout
+          else if ty == 25 then pure arrUnitLayout
+          else if ty == 26 then pure arrU32Layout
+          else pure arrUnitLayout
+        field := fun _ lo _ =>
+          if lo.ty == 31 then pure canaryNestedWideRefLayout
+          else if lo.ty == 21 || lo.ty == 22 then pure canaryNestedNeverLayout
+          else if lo.ty == 23 || lo.ty == 24 then pure arrUnitLayout
+          else pure arrU32Layout }
+    typeName := fun _ _ => pure ""
+    withGhostValidation := fun act => act
+    unitLayout := fun _ => pure arrUnitLayout
+    toOp := fun _ _ => throw (.undefinedBehavior "toOp-must-not-run-on-zero-size-array")
+    readBytes := fun _ _ _ _ => throw (.undefinedBehavior "readBytes-must-not-run-on-zero-size-array")
+    classify := fun _ ty =>
+      if ty == 20 then pure (.rawPointer 21 true)
+      else if ty == 0 || ty == 1 || ty == 28 || ty == 29 || ty == 30 || ty == 32 then pure (.reference false)
+      else if ty == 21 || ty == 22 then pure (.sequence 12)
+      else if ty == 23 || ty == 24 then pure (.sequence 25)
+      else if ty == 27 then pure (.sequence 26)
+      else if ty == 31 then pure (.sequence 1)
+      else if ty == 25 then pure (.aggregate false false false)
+      else if ty == 26 then pure .integer
+      else pure .never
+    readImmediate := fun _ place _ => pure ⟨.uninit, place.layout⟩
+    ptrToPlace := fun _ imm =>
+      if imm.layout.ty == 0 then
+        pure ⟨⟨outerPtr, .none, none⟩, canaryNestedWideRefLayout⟩
+      else if imm.layout.ty == 28 then
+        pure ⟨⟨outerPtr, .none, none⟩, arrU32ZeroLayout⟩
+      else if imm.layout.ty == 29 then
+        pure ⟨⟨outerPtr, .none, none⟩, arrNeverZeroLayout⟩
+      else if imm.layout.ty == 30 then
+        pure ⟨⟨outerPtr, .none, none⟩, arrNeverMaxLayout⟩
+      else if imm.layout.ty == 32 then
+        pure ⟨⟨outerPtr, .none, none⟩, arrWideDyn2Layout⟩
+      else
+        pure ⟨⟨⟨⟨0⟩, none⟩, .metadata vtWord, none⟩, canaryNestedUnsizedLayout⟩
+    metadataTail := fun _ _ => pure (.dynamic expected)
+    sizeAndAlign := fun _ mp =>
+      if mp.layout.ty == 27 then pure (some (Miri.ABI.Size.ZERO, ⟨2⟩))
+      else if mp.layout.ty == 21 || mp.layout.ty == 22 then pure (some (Miri.ABI.Size.ZERO, Miri.ABI.Align.ONE))
+      else if mp.layout.ty == 31 then pure (some (⟨32⟩, Miri.ABI.Align.EIGHT))
+      else pure (some (⟨16⟩, Miri.ABI.Align.EIGHT))
+    checkPointerAccess := fun _ ptr sz =>
+      if sz == Miri.ABI.Size.ZERO || ptr.offset.bytes == 32 then pure (.ok ())
+      else throw (.undefinedBehavior "inner-checkPointerAccess-must-not-run")
+    scalarMayBeNull := fun _ sc =>
+      match sc.tryToScalarInt with
+      | .ok (.integer si) => pure (si.data == 0)
+      | _ => pure true
+    opsemInhabited := fun _ ty => pure (ty != 12 && ty != 22)
+    checkPointerAlignResult := fun _ ptr align =>
+      if ptr.offset.bytes.toNat % (2 ^ align.pow2) == 0 then pure (.ok ())
+      else pure (.error ⟨Miri.ABI.Align.ONE, align⟩) }
+
+/-- **Closed `[T; N]` `Sized` array & nested `[&dyn Trait; N]` / `&[&dyn Trait; N]` /
+misaligned-vtable `ValidityVisitor.validatePlace` canary (`lean-miri#75`, `#79`, `#82`)**, for
+EVERY `m : AnnealStepState`:
+1. Raw `*const [u8; usize::MAX]` (`sized = true`) succeeds `.ok () m`;
+2. Direct `[!; 0]` succeeds `.ok () m`, while direct `[!; usize::MAX]` fails in `O(1)` at index 0
+   with `"validation[0]: never value"`;
+3. Direct `[(); 0]` and `[(); usize::MAX]` both succeed in `O(1)` `.ok () m`;
+4. Safe `&[u32; 0]` null fails null UB, dangling unaligned (`addr = 2`, align `4`) fails
+   `classifyPointerAlignmentError` WITHOUT reading memory, dangling aligned (`addr = 4`) succeeds
+   `.ok () m` via `size == Size.ZERO` WITHOUT calling `toOp`/`readBytes`; `&[!; 0]` dangling
+   aligned succeeds `.ok () m`, while `&[!; 1]` fails `"validation: safe pointer to uninhabited type"`;
+5. `&(&dyn Trait7)` with a **misaligned / nonzero-offset vtable** (`alloc 1 + off 4`) fails
+   `"InvalidVTablePointer"` BEFORE checking the null inner data pointer;
+6. Direct `[&dyn Trait7; 2]` AND recursive `&[&dyn Trait7; 2]` fail on ALL 5 invalid vtable forms
+   (null, misaligned/nonzero-offset `off = 4`, dangling int, non-vtable pointer, wrong trait) at
+   element `0` BEFORE inner data-pointer checks and BEFORE element `1`! -/
+theorem array_sized_zst_uninhabited_and_nested_array_wideDyn_canary (m : AnnealStepState) :
+    let intWord : UInt64 → Miri.Memory.Scalar AnnealProv := fun a =>
+      Miri.Memory.Scalar.fromScalarInt (Miri.Memory.ScalarInt.ofUInt64 a)
+    let ptrWordOff : Miri.Memory.AllocId → UInt64 → Miri.Memory.Scalar AnnealProv := fun id off =>
+      Miri.Memory.Scalar.fromPointer annealTargetDataLayout ⟨⟨off⟩, .concrete id ⟨1, by decide⟩⟩
+    let tyDummy : Trusted.Rustc.V2026_06_01.MirAst.Ty := { kind := .tuple .nil, layoutIdx := 0 }
+    let mkPlace : Miri.Interpreter.LocalLayout → Miri.Interpreter.RuntimePlace AnnealProv :=
+      fun lo => ⟨.memory ⟨⟨⟨32⟩, none⟩, .none, none⟩, lo⟩
+    let vtNull := intWord 0
+    let vtMis4 := ptrWordOff ⟨1, by decide⟩ 4
+    let vtDang := intWord 4096
+    let vtNonVt := ptrWordOff ⟨2, by decide⟩ 0
+    let vtWrong := ptrWordOff ⟨1, by decide⟩ 0
+    let run := fun vtWord outerPtr expected fuel place recBool =>
+      Miri.Interpreter.ValidityVisitor.validatePlace
+        (canaryArrayWideHooks vtWord outerPtr expected) tyDummy fuel place recBool false m
+    -- (1) Raw `*const [u8; usize::MAX]`:
+    run vtNull ⟨⟨0⟩, none⟩ 3 1 (mkPlace ⟨20, zstLayoutData⟩) true = .ok () m ∧
+    -- (2) Direct `[!; 0]` vs `[!; usize::MAX]`:
+    run vtNull ⟨⟨0⟩, none⟩ 3 1 (mkPlace arrNeverZeroLayout) false = .ok () m ∧
+    run vtNull ⟨⟨0⟩, none⟩ 3 2 (mkPlace arrNeverMaxLayout) false =
+      .error (.undefinedBehavior "validation[0]: never value") m ∧
+    -- (3) Direct `[(); 0]` and `[(); usize::MAX]`:
+    run vtNull ⟨⟨0⟩, none⟩ 3 1 (mkPlace arrUnitZeroLayout) false = .ok () m ∧
+    run vtNull ⟨⟨0⟩, none⟩ 3 2 (mkPlace arrUnitMaxLayout) false = .ok () m ∧
+    -- (4) Safe `&[u32; 0]` (null / unaligned / aligned-dangling), `&[!; 0]` (aligned-dangling), `&[!; 1]` (uninhabited):
+    run vtNull ⟨⟨0⟩, none⟩ 3 1 (mkPlace ⟨28, zstLayoutData⟩) true =
+      .error (.undefinedBehavior "validation: null or maybe-null safe pointer") m ∧
+    run vtNull ⟨⟨2⟩, none⟩ 3 1 (mkPlace ⟨28, zstLayoutData⟩) true =
+      .error (Miri.Interpreter.ValidityVisitor.classifyPointerAlignmentError ⟨"", #[]⟩ (.reference false) ⟨Miri.ABI.Align.ONE, ⟨2⟩⟩) m ∧
+    run vtNull ⟨⟨4⟩, none⟩ 3 1 (mkPlace ⟨28, zstLayoutData⟩) true = .ok () m ∧
+    run vtNull ⟨⟨4⟩, none⟩ 3 1 (mkPlace ⟨29, zstLayoutData⟩) true = .ok () m ∧
+    run vtNull ⟨⟨4⟩, none⟩ 3 1 (mkPlace ⟨30, zstLayoutData⟩) true =
+      .error (.undefinedBehavior "validation: safe pointer to uninhabited type") m ∧
+    -- (5) `&(&dyn Trait7)` with misaligned/nonzero-offset vtable (`alloc 1 + off 4`):
+    run vtMis4 ⟨⟨32⟩, none⟩ 3 2 (mkPlace ⟨0, zstLayoutData⟩) true =
+      .error (.undefinedBehavior "InvalidVTablePointer") m ∧
+    -- (6a) Direct `[&dyn Trait7; 2]` with all 5 invalid vtable forms:
+    run vtNull ⟨⟨32⟩, none⟩ 3 2 (mkPlace arrWideDyn2Layout) false = .error (.undefinedBehavior "InvalidVTablePointer") m ∧
+    run vtMis4 ⟨⟨32⟩, none⟩ 3 2 (mkPlace arrWideDyn2Layout) false = .error (.undefinedBehavior "InvalidVTablePointer") m ∧
+    run vtDang ⟨⟨32⟩, none⟩ 3 2 (mkPlace arrWideDyn2Layout) false = .error (.undefinedBehavior "InvalidVTablePointer") m ∧
+    run vtNonVt ⟨⟨32⟩, none⟩ 3 2 (mkPlace arrWideDyn2Layout) false = .error (.undefinedBehavior "InvalidVTablePointer") m ∧
+    run vtWrong ⟨⟨32⟩, none⟩ 4 2 (mkPlace arrWideDyn2Layout) false = .error (.undefinedBehavior "InvalidVTableTrait") m ∧
+    -- (6b) Recursive `&[&dyn Trait7; 2]` with all 5 invalid vtable forms:
+    run vtNull ⟨⟨32⟩, none⟩ 3 2 (mkPlace ⟨32, zstLayoutData⟩) true = .error (.undefinedBehavior "InvalidVTablePointer") m ∧
+    run vtMis4 ⟨⟨32⟩, none⟩ 3 2 (mkPlace ⟨32, zstLayoutData⟩) true = .error (.undefinedBehavior "InvalidVTablePointer") m ∧
+    run vtDang ⟨⟨32⟩, none⟩ 3 2 (mkPlace ⟨32, zstLayoutData⟩) true = .error (.undefinedBehavior "InvalidVTablePointer") m ∧
+    run vtNonVt ⟨⟨32⟩, none⟩ 3 2 (mkPlace ⟨32, zstLayoutData⟩) true = .error (.undefinedBehavior "InvalidVTablePointer") m ∧
+    run vtWrong ⟨⟨32⟩, none⟩ 4 2 (mkPlace ⟨32, zstLayoutData⟩) true = .error (.undefinedBehavior "InvalidVTableTrait") m := by
+  intro intWord ptrWordOff tyDummy mkPlace vtNull vtMis4 vtDang vtNonVt vtWrong run
+  have hfrom0 : Miri.Memory.Scalar.fromMaybePointer annealTargetDataLayout
+      (⟨⟨0⟩, none⟩ : Miri.Memory.Pointer (Option AnnealProv)) = .ok (intWord 0) := by decide
+  have hfrom2 : Miri.Memory.Scalar.fromMaybePointer annealTargetDataLayout
+      (⟨⟨2⟩, none⟩ : Miri.Memory.Pointer (Option AnnealProv)) = .ok (intWord 2) := by decide
+  have hfrom4 : Miri.Memory.Scalar.fromMaybePointer annealTargetDataLayout
+      (⟨⟨4⟩, none⟩ : Miri.Memory.Pointer (Option AnnealProv)) = .ok (intWord 4) := by decide
+  have hfrom32 : Miri.Memory.Scalar.fromMaybePointer annealTargetDataLayout
+      (⟨⟨32⟩, none⟩ : Miri.Memory.Pointer (Option AnnealProv)) = .ok (intWord 32) := by decide
+  have hvtEq : ∀ (vtWord : Miri.Memory.Scalar AnnealProv) (outerPtr : Miri.Memory.Pointer (Option AnnealProv))
+      (expected : Nat) (vtPtr : Miri.Memory.Pointer (Option AnnealProv)) (vptr : VTablePtrVal),
+      (match vptr with
+       | .null => canaryWideResolve vtPtr = .error .danglingInteger
+       | .danglingInt _ => canaryWideResolve vtPtr = .error .danglingInteger
+       | .provenanced id off => canaryWideResolve vtPtr = .ok (toMiriAllocId id, Miri.ABI.Size.ofBytes off)) →
+      Miri.Interpreter.VTable.getPtrVTableType
+        (canaryArrayWideHooks vtWord outerPtr expected).vtable tyDummy vtPtr (some expected) m =
+        match validateVTableHalf canaryWideWorld canaryWideReg vptr (canarySpecTable expected) with
+        | .ok data => .ok data.concreteTyCode m
+        | .error e => .error (wideDynVTableErrToMiri e) m := by
+    intro vtWord outerPtr expected vtPtr vptr hres
+    have h := miri_getPtrVTableTypeRead_eq_validateVTableHalf_at
+      (canaryArrayWideHooks vtWord outerPtr expected).vtable.readHooks
+      tyDummy m canaryWideWorld canaryWideReg canaryWideResolve canarySpecTable canaryWideDynCode
+      (worldVTableHooks_readsWorldAt _ _ _ _ _ _ _ _ _ _)
+      vtPtr vptr expected
+      (fun id data hd => by rw [(canaryWideReg_get? id data hd).2]; decide)
+      hres (canaryWide_predsKeyInjective expected)
+      (fun id data hd => by rw [(canaryWideReg_get? id data hd).2]; exact canaryWide_predsKeyInjective 2)
+    change Miri.Interpreter.VTable.getPtrVTableTypeRead
+      (canaryArrayWideHooks vtWord outerPtr expected).vtable.readHooks
+      tyDummy vtPtr (some expected) m = _
+    rw [h]
+    cases validateVTableHalf canaryWideWorld canaryWideReg vptr (canarySpecTable expected) with
+    | ok data => rfl
+    | error e => cases e <;> rfl
+  have hvtToPtr0 : vtNull.toPointer annealTargetDataLayout = .ok ⟨⟨0⟩, none⟩ := by decide
+  have hvtToPtrM : vtMis4.toPointer annealTargetDataLayout = .ok ⟨⟨4⟩, some (.concrete ⟨1, by decide⟩ ⟨1, by decide⟩)⟩ := by decide
+  have hvtToPtrD : vtDang.toPointer annealTargetDataLayout = .ok ⟨⟨4096⟩, none⟩ := by decide
+  have hvtToPtrN : vtNonVt.toPointer annealTargetDataLayout = .ok ⟨⟨0⟩, some (.concrete ⟨2, by decide⟩ ⟨1, by decide⟩)⟩ := by decide
+  have hvtToPtrW : vtWrong.toPointer annealTargetDataLayout = .ok ⟨⟨0⟩, some (.concrete ⟨1, by decide⟩ ⟨1, by decide⟩)⟩ := by decide
+  have hArrDir : ∀ vtWord expected vtPtr err,
+      vtWord.toPointer annealTargetDataLayout = .ok vtPtr →
+      Miri.Interpreter.VTable.getPtrVTableType
+        (canaryArrayWideHooks vtWord ⟨⟨32⟩, none⟩ expected).vtable tyDummy vtPtr (some expected) m = .error err m →
+      run vtWord ⟨⟨32⟩, none⟩ expected 2 (mkPlace arrWideDyn2Layout) false = .error err m :=
+    fun vtWord expected vtPtr err htp herr =>
+      validatePlace_array_wideDyn_invalidVTable_precedes_dataPtr
+        (canaryArrayWideHooks vtWord ⟨⟨32⟩, none⟩ expected) tyDummy 0 (mkPlace arrWideDyn2Layout) false m ""
+        1 (.reference false) canaryNestedWideRefLayout ⟨16⟩ 2 2 ⟨32⟩ arrUnitLayout
+        ⟨.memory ⟨⟨⟨64⟩, none⟩, .none, none⟩, arrUnitLayout⟩
+        ⟨.memory ⟨⟨⟨32⟩, none⟩, .none, none⟩, canaryNestedWideRefLayout⟩
+        false expected ⟨.uninit, canaryNestedWideRefLayout⟩
+        ⟨⟨⟨⟨0⟩, none⟩, .metadata vtWord, none⟩, canaryNestedUnsizedLayout⟩
+        vtWord vtPtr err m (fun _ _ => rfl) rfl rfl rfl (by decide) (by decide) rfl rfl rfl rfl
+        (by decide) rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl htp herr
+  have hArrRef : ∀ vtWord expected vtPtr err,
+      vtWord.toPointer annealTargetDataLayout = .ok vtPtr →
+      Miri.Interpreter.VTable.getPtrVTableType
+        (canaryArrayWideHooks vtWord ⟨⟨32⟩, none⟩ expected).vtable tyDummy vtPtr (some expected) m = .error err m →
+      run vtWord ⟨⟨32⟩, none⟩ expected 2 (mkPlace ⟨32, zstLayoutData⟩) true = .error err m :=
+    fun vtWord expected vtPtr err htp herr =>
+      validatePlace_ref_array_wideDyn_invalidVTable_precedes_dataPtr
+        (canaryArrayWideHooks vtWord ⟨⟨32⟩, none⟩ expected) tyDummy 0 (mkPlace ⟨32, zstLayoutData⟩) m ""
+        false false expected ⟨.uninit, ⟨32, zstLayoutData⟩⟩
+        ⟨⟨⟨⟨32⟩, none⟩, .none, none⟩, arrWideDyn2Layout⟩ ⟨32⟩ Miri.ABI.Align.EIGHT (intWord 32)
+        1 (.reference false) canaryNestedWideRefLayout ⟨16⟩ 2 2 ⟨32⟩ arrUnitLayout
+        ⟨.memory ⟨⟨⟨64⟩, none⟩, .none, none⟩, arrUnitLayout⟩
+        ⟨.memory ⟨⟨⟨32⟩, none⟩, .none, none⟩, canaryNestedWideRefLayout⟩
+        ⟨.uninit, canaryNestedWideRefLayout⟩
+        ⟨⟨⟨⟨0⟩, none⟩, .metadata vtWord, none⟩, canaryNestedUnsizedLayout⟩
+        vtWord vtPtr err m (fun _ _ => rfl) rfl rfl rfl rfl rfl rfl rfl hfrom32
+        rfl rfl rfl rfl rfl (by decide) (by decide) rfl rfl rfl rfl
+        (by decide) rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl htp herr
+  let hNull := canaryArrayWideHooks vtNull ⟨⟨0⟩, none⟩ 3
+  let hRef2 := canaryArrayWideHooks vtNull ⟨⟨2⟩, none⟩ 3
+  let hRef4 := canaryArrayWideHooks vtNull ⟨⟨4⟩, none⟩ 3
+  have hDir0 := fun lo => validatePlace_array_sized_raw_and_direct hNull tyDummy 0 (mkPlace lo) m "" (fun _ _ => rfl) rfl rfl
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · exact (hDir0 ⟨20, zstLayoutData⟩).1 21 ⟨.uninit, ⟨20, zstLayoutData⟩⟩ true rfl rfl
+  · exact (hDir0 arrNeverZeroLayout).2.1 12 .never canaryNestedNeverLayout false
+      rfl rfl (by decide) (by decide) rfl rfl rfl rfl
+  · exact (hDir0 arrNeverMaxLayout).2.2.1 12 canaryNestedNeverLayout
+      0xFFFFFFFFFFFFFFFF (mkPlace canaryNestedNeverLayout) false rfl rfl rfl rfl rfl (by decide) rfl rfl
+  · exact (hDir0 arrUnitZeroLayout).2.1 25 (.aggregate false false false) arrUnitLayout false
+      rfl rfl (by decide) (by decide) rfl rfl rfl rfl
+  · exact (hDir0 arrUnitMaxLayout).2.2.2 25 arrUnitLayout
+      0xFFFFFFFFFFFFFFFF (mkPlace arrUnitLayout) 0 false rfl rfl rfl rfl rfl (by decide) rfl rfl rfl rfl rfl rfl
+  · exact (validatePlace_ref_emptyArray_and_uninhabited hNull
+      tyDummy 0 (mkPlace ⟨28, zstLayoutData⟩) m "" false ⟨.uninit, ⟨28, zstLayoutData⟩⟩
+      ⟨⟨⟨⟨0⟩, none⟩, .none, none⟩, arrU32ZeroLayout⟩ Miri.ABI.Size.ZERO ⟨2⟩ (intWord 0)
+      (fun _ _ => rfl) rfl rfl rfl rfl rfl rfl rfl rfl hfrom0).1 rfl
+  · exact (validatePlace_ref_emptyArray_and_uninhabited hRef2
+      tyDummy 0 (mkPlace ⟨28, zstLayoutData⟩) m "" false ⟨.uninit, ⟨28, zstLayoutData⟩⟩
+      ⟨⟨⟨⟨2⟩, none⟩, .none, none⟩, arrU32ZeroLayout⟩ Miri.ABI.Size.ZERO ⟨2⟩ (intWord 2)
+      (fun _ _ => rfl) rfl rfl rfl rfl rfl rfl rfl rfl hfrom2).2.2.1 ⟨Miri.ABI.Align.ONE, ⟨2⟩⟩ rfl rfl rfl
+  · exact (validatePlace_ref_emptyArray_and_uninhabited hRef4
+      tyDummy 0 (mkPlace ⟨28, zstLayoutData⟩) m "" false ⟨.uninit, ⟨28, zstLayoutData⟩⟩
+      ⟨⟨⟨⟨4⟩, none⟩, .none, none⟩, arrU32ZeroLayout⟩ Miri.ABI.Size.ZERO ⟨2⟩ (intWord 4)
+      (fun _ _ => rfl) rfl rfl rfl rfl rfl rfl rfl rfl hfrom4).2.2.2.1 26 .integer arrU32Layout
+      rfl rfl rfl rfl rfl (Or.inl rfl) rfl rfl
+  · exact (validatePlace_ref_emptyArray_and_uninhabited hRef4
+      tyDummy 0 (mkPlace ⟨29, zstLayoutData⟩) m "" false ⟨.uninit, ⟨29, zstLayoutData⟩⟩
+      ⟨⟨⟨⟨4⟩, none⟩, .none, none⟩, arrNeverZeroLayout⟩ Miri.ABI.Size.ZERO Miri.ABI.Align.ONE (intWord 4)
+      (fun _ _ => rfl) rfl rfl rfl rfl rfl rfl rfl rfl hfrom4).2.2.2.2 12 .never canaryNestedNeverLayout
+      rfl rfl rfl rfl rfl (by decide) (by decide) rfl rfl rfl
+  · exact (validatePlace_ref_emptyArray_and_uninhabited hRef4
+      tyDummy 0 (mkPlace ⟨30, zstLayoutData⟩) m "" false ⟨.uninit, ⟨30, zstLayoutData⟩⟩
+      ⟨⟨⟨⟨4⟩, none⟩, .none, none⟩, arrNeverMaxLayout⟩ Miri.ABI.Size.ZERO Miri.ABI.Align.ONE (intWord 4)
+      (fun _ _ => rfl) rfl rfl rfl rfl rfl rfl rfl rfl hfrom4).2.1 rfl rfl
+  · exact (validatePlace_nested_wideDyn_invalidVTable_precedes_dataPtr
+      (canaryArrayWideHooks vtMis4 ⟨⟨32⟩, none⟩ 3) tyDummy 1 (mkPlace ⟨0, zstLayoutData⟩) m ""
+      false false 3 ⟨.uninit, ⟨0, zstLayoutData⟩⟩ ⟨⟨⟨⟨32⟩, none⟩, .none, none⟩, canaryNestedWideRefLayout⟩
+      ⟨16⟩ Miri.ABI.Align.EIGHT (intWord 32) ⟨.uninit, canaryNestedWideRefLayout⟩
+      ⟨⟨⟨⟨0⟩, none⟩, .metadata vtMis4, none⟩, canaryNestedUnsizedLayout⟩ vtMis4
+      ⟨⟨4⟩, some (.concrete ⟨1, by decide⟩ ⟨1, by decide⟩)⟩
+      (fun _ _ => rfl) rfl rfl rfl rfl rfl rfl rfl hfrom32 rfl rfl rfl rfl rfl rfl rfl rfl rfl hvtToPtrM).1 _ m
+      (by rw [hvtEq vtMis4 ⟨⟨32⟩, none⟩ 3 _ (.provenanced ⟨1, by decide⟩ 4) rfl]; rfl)
+  · exact hArrDir vtNull 3 _ _ hvtToPtr0 (by rw [hvtEq vtNull ⟨⟨32⟩, none⟩ 3 _ .null rfl]; rfl)
+  · exact hArrDir vtMis4 3 _ _ hvtToPtrM (by rw [hvtEq vtMis4 ⟨⟨32⟩, none⟩ 3 _ (.provenanced ⟨1, by decide⟩ 4) rfl]; rfl)
+  · exact hArrDir vtDang 3 _ _ hvtToPtrD (by rw [hvtEq vtDang ⟨⟨32⟩, none⟩ 3 _ (.danglingInt 4096) rfl]; rfl)
+  · exact hArrDir vtNonVt 3 _ _ hvtToPtrN (by rw [hvtEq vtNonVt ⟨⟨32⟩, none⟩ 3 _ (.provenanced ⟨2, by decide⟩ 0) rfl]; rfl)
+  · exact hArrDir vtWrong 4 _ _ hvtToPtrW (by rw [hvtEq vtWrong ⟨⟨32⟩, none⟩ 4 _ (.provenanced ⟨1, by decide⟩ 0) rfl]; rfl)
+  · exact hArrRef vtNull 3 _ _ hvtToPtr0 (by rw [hvtEq vtNull ⟨⟨32⟩, none⟩ 3 _ .null rfl]; rfl)
+  · exact hArrRef vtMis4 3 _ _ hvtToPtrM (by rw [hvtEq vtMis4 ⟨⟨32⟩, none⟩ 3 _ (.provenanced ⟨1, by decide⟩ 4) rfl]; rfl)
+  · exact hArrRef vtDang 3 _ _ hvtToPtrD (by rw [hvtEq vtDang ⟨⟨32⟩, none⟩ 3 _ (.danglingInt 4096) rfl]; rfl)
+  · exact hArrRef vtNonVt 3 _ _ hvtToPtrN (by rw [hvtEq vtNonVt ⟨⟨32⟩, none⟩ 3 _ (.provenanced ⟨2, by decide⟩ 0) rfl]; rfl)
+  · exact hArrRef vtWrong 4 _ _ hvtToPtrW (by rw [hvtEq vtWrong ⟨⟨32⟩, none⟩ 4 _ (.provenanced ⟨1, by decide⟩ 0) rfl]; rfl)
 
 /-! ## Part 4. Axiom pins
 
@@ -19669,7 +23658,7 @@ does not depend on any axioms
 
 /--
 info: 'LeanMiriSpec.ExtTreeMapAllocLM.checkPtrAccess_canary'
-depends on axioms: [propext]
+depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms checkPtrAccess_canary
@@ -20103,12 +24092,12 @@ depends on axioms: [propext, Quot.sound]
 
 /-! ### 4B. Vendored stateful bridge theorems (at most `propext`, `Classical.choice`, `Quot.sound`)
 
-The statements of these 89 theorems directly mention vendored `Miri.*` or
+The statements of these 101 theorems directly mention vendored `Miri.*` or
 `LeanMiriSpec.*` stateful definitions (`MemoryState`, `KeyedArray`,
 `AnnealMachine` / `annealResolvePtr`, `StateRelLM3_1` / `StateRelLM3_2`,
 `BorrowTree.releaseProtector`, `beforeStackPopWithEnsure`, `MachineHooks.MachineState`,
-`VTableMachine.reserve`, `ValidityMachine`, `annealValidityHooks`,
-`ValidityVisitor.validatePlace`) whose own types/definitions inherit
+`PlaceMachine.allocateStackRaw`, `VTableMachine.reserve`, `ValidityMachine`,
+`annealValidityHooks`, `ValidityVisitor.validatePlace`) whose own types/definitions inherit
 `Classical.choice` from `Std.HashMap` / `KeyedArray` (recorded in Part 4C),
 matching `LeanMiriSpec.FloatCastLM` and `LeanMiriSpec.WitFloatCastLM`. -/
 
@@ -20735,9 +24724,93 @@ depends on axioms: [propext, Classical.choice, Quot.sound]
 #guard_msgs (whitespace := lax) in
 #print axioms nested_wideDyn_childSession_validatePlace_canary
 
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.miri_releaseProtector_strong_weak_irrelevant'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms miri_releaseProtector_strong_weak_irrelevant
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.miri_releaseProtector_multiSeg_partial_sim'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms miri_releaseProtector_multiSeg_partial_sim
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.miri_beforeStackPopWithEnsure_realAccess_multiAlloc_partial_sim'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms miri_beforeStackPopWithEnsure_realAccess_multiAlloc_partial_sim
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.placeMachine_allocateStackRaw_eq_keyed'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms placeMachine_allocateStackRaw_eq_keyed
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.multiStep_alloc_storeLoad_retag_frameExit_dealloc_realloc_lifecycle'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms multiStep_alloc_storeLoad_retag_frameExit_dealloc_realloc_lifecycle
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.validatePlace_array_sized_raw_and_direct'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms validatePlace_array_sized_raw_and_direct
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.validatePlace_ref_emptyArray_and_uninhabited'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms validatePlace_ref_emptyArray_and_uninhabited
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.validatePlace_array_wideDyn_invalidVTable_precedes_dataPtr'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms validatePlace_array_wideDyn_invalidVTable_precedes_dataPtr
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.validatePlace_ref_array_wideDyn_invalidVTable_precedes_dataPtr'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms validatePlace_ref_array_wideDyn_invalidVTable_precedes_dataPtr
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.multiSeg_strongWeak_releaseProtector_canary'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms multiSeg_strongWeak_releaseProtector_canary
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.multiStep_lifecycle_noABA_and_detached_canary'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms multiStep_lifecycle_noABA_and_detached_canary
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.array_sized_zst_uninhabited_and_nested_array_wideDyn_canary'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms array_sized_zst_uninhabited_and_nested_array_wideDyn_canary
+
 /-! ### 4C. Origin of `Classical.choice` in vendored `Miri.*` / `LeanMiriSpec.*` constants
 
-These pins document why the 89 vendored-state bridge theorems in Part 4B inherit
+These pins document why the 101 vendored-state bridge theorems in Part 4B inherit
 `Classical.choice` solely from the types/definitions of vendored `Miri.*` and
 pre-existing `LeanMiriSpec.*` constants (`Std.HashMap` / `KeyedArray`), while
 all 128 choice-free theorems in Part 4A remain strictly free of `Classical.choice`. -/
