@@ -9171,7 +9171,8 @@ def annealWideDynHooks (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
 /-! ## Part 2E. Deep operational simulations (`lean-miri#73`, `#74`, `#75`, `#82`, `charon#1619`)
 
 Closes the remaining operational gaps across all three tracks:
-* **2E.1** — General real implicit-access `BorrowTree.releaseProtector` simulation (`BorrowTreeWorldRel`
+* **2E.1** — Real implicit-access `BorrowTree.releaseProtector` simulation on single-segment,
+  uniform-range trees of arbitrary depth (scope pinned by `borrowTreeWorldRel_scope`; `BorrowTreeWorldRel`
   with inductive SIFA soundness `SifaSoundFor`, discharging `ProtectorReleaseSim` for real implicit
   Reads on `ReservedFrz`/`Frozen` and Writes on `Unique`), multi-allocation frame exit across
   `MachineHooks.beforeStackPopWithEnsure` vs per-allocation `execFrameExitMiri`, and end-to-end
@@ -11464,7 +11465,10 @@ private theorem realAccessReleaseSim_foreign_sifa_sound
           exact ⟨an, hanInW', by rw [hancSame]; exact haTail,
             by rw [hancSame]; exact hjInA, hforSkW⟩
 
-/-- **General real-implicit-access `ProtectorReleaseSim` instance** (`lean-miri#74`):
+/-- **Real-implicit-access `ProtectorReleaseSim` instance** (`lean-miri#74`), for arbitrary-depth,
+arbitrary-fan-out trees inside the scope fixed by `borrowTreeWorldRel_scope` (ONE `DedupRangeMap`
+segment, one root, unexposed tags, one common nonempty byte range; multi-segment trees are outside
+the relation and are NOT covered):
 discharges `ProtectorReleaseSim` for `BorrowTreeWorldRel` across ALL permissions (`Cell`,
 `ReservedFrz false/true`, `ReservedIM`, `Unique`, `Frozen`, `Disabled`), BOTH `accessed = false`
 (no-access fast path) AND `accessed = true` (real implicit Read on `ReservedFrz`/`Frozen`/`ReservedIM`
@@ -12723,6 +12727,265 @@ theorem miri_beforeStackPopWithEnsure_realAccess_multiAlloc_sim
     (fun id => BorrowTreeWorldRel tracker.global.protectedTags (frameTag id) tagOf)
     (fun id => realAccessReleaseSim tracker.global.protectedTags (frameTag id) tagOf)
     hprots worlds hsync hdom
+
+/-- **Explicit scope of `BorrowTreeWorldRel`** (the side conditions of `realAccessReleaseSim`, stated
+as a theorem instead of staying implicit in the relation): every related vendored tree has EXACTLY
+ONE `DedupRangeMap` location segment and the single root `⟨0⟩`, and every theory node covers one
+common NONEMPTY byte range. Depth, fan-out, permissions, protectors and `accessed` bits are
+unrestricted. Trees with several location segments (per-offset permission splits) are therefore
+outside the relation: one `FnEntryBorrowWorld` node carries one permission, a vendored tag carries
+one permission PER segment. -/
+theorem borrowTreeWorldRel_scope {pt : Miri.TreeBorrows.ProtectedTags}
+    {frameTag : Miri.Memory.BorTag → Prop} {tagOf : Miri.Memory.BorTag → Nat}
+    {tree : Miri.TreeBorrows.BorrowTree} {w : FnEntryBorrowWorld}
+    (h : BorrowTreeWorldRel pt frameTag tagOf tree w) :
+    tree.locations.entries.size = 1 ∧ tree.roots = #[⟨0⟩] ∧
+    ∃ off len, 0 < len ∧ ∀ n ∈ w.nodes, n.rangeOffset = off ∧ n.rangeLen = len := by
+  obtain ⟨_, _, off, len, hAt⟩ := h
+  refine ⟨congrArg (fun l => l.entries.size) hAt.locs_eq, hAt.roots_eq, off, len, hAt.hlen_pos,
+    fun n hn => ?_⟩
+  obtain ⟨i, hi⟩ := List.getElem?_of_mem hn
+  obtain ⟨_, _, _, _, _, _, _, _, _, hoff, hlen, _⟩ := hAt.node_sync i n hi
+  exact ⟨hoff, hlen⟩
+
+/-- Theory-side **prefix semantics** of a multi-allocation frame exit: the per-allocation worlds
+reached by the longest successful prefix of implicit protector-end accesses, paired with the first
+failing `(allocation, tag)` (`none` when every release succeeds). `multiAllocEndAccesses` discards
+all state on failure (`Except`); this fold keeps the mutations already committed by earlier
+releases, matching the imperative release loop of `MachineHooks.beforeStackPopWithEnsure`. -/
+def multiAllocEndAccessesPartial (tagOf : Miri.Memory.BorTag → Nat) :
+    List (Miri.Memory.AllocId × Miri.Memory.BorTag) →
+    (Miri.Memory.AllocId → Option FnEntryBorrowWorld) →
+    (Miri.Memory.AllocId → Option FnEntryBorrowWorld) ×
+      Option (Miri.Memory.AllocId × Miri.Memory.BorTag)
+  | [], worlds => (worlds, none)
+  | (id, tag) :: rest, worlds =>
+    match worlds id with
+    | none => (worlds, some (id, tag))
+    | some w =>
+      match execProtectorEndAccessFor protectorEndAccessIsWrite? w (tagOf tag) with
+      | .error _ => (worlds, some (id, tag))
+      | .ok w' =>
+        multiAllocEndAccessesPartial tagOf rest (fun a => if a == id then some w' else worlds a)
+
+/-- `multiAllocEndAccesses` is exactly the success projection of `multiAllocEndAccessesPartial`:
+`.ok worlds'` iff the prefix fold reports no failing release (with the same final worlds), and
+`.error _` iff it reports one. -/
+theorem multiAllocEndAccesses_eq_partial (tagOf : Miri.Memory.BorTag → Nat)
+    (prots : List (Miri.Memory.AllocId × Miri.Memory.BorTag)) :
+    ∀ (worlds : Miri.Memory.AllocId → Option FnEntryBorrowWorld),
+      match multiAllocEndAccesses tagOf prots worlds,
+          (multiAllocEndAccessesPartial tagOf prots worlds).2 with
+      | .ok worlds', none => worlds' = (multiAllocEndAccessesPartial tagOf prots worlds).1
+      | .error _, some _ => True
+      | _, _ => False := by
+  induction prots with
+  | nil => intro worlds; exact rfl
+  | cons p rest ih =>
+    intro worlds
+    obtain ⟨id, tag⟩ := p
+    cases hw : worlds id with
+    | none =>
+      have h1 : multiAllocEndAccesses tagOf ((id, tag) :: rest) worlds =
+          .error (.missingParentTag (tagOf tag)) := by
+        simp only [multiAllocEndAccesses, hw]
+      have h2 : multiAllocEndAccessesPartial tagOf ((id, tag) :: rest) worlds =
+          (worlds, some (id, tag)) := by
+        simp only [multiAllocEndAccessesPartial, hw]
+      rw [h1, h2]; exact trivial
+    | some w =>
+      have h1 : multiAllocEndAccesses tagOf ((id, tag) :: rest) worlds =
+          match execProtectorEndAccessFor protectorEndAccessIsWrite? w (tagOf tag) with
+          | .error e => .error e
+          | .ok w' => multiAllocEndAccesses tagOf rest
+              (fun a => if a == id then some w' else worlds a) := by
+        simp only [multiAllocEndAccesses, hw]
+      have h2 : multiAllocEndAccessesPartial tagOf ((id, tag) :: rest) worlds =
+          match execProtectorEndAccessFor protectorEndAccessIsWrite? w (tagOf tag) with
+          | .error _ => (worlds, some (id, tag))
+          | .ok w' => multiAllocEndAccessesPartial tagOf rest
+              (fun a => if a == id then some w' else worlds a) := by
+        simp only [multiAllocEndAccessesPartial, hw]
+      rw [h1, h2]
+      cases execProtectorEndAccessFor protectorEndAccessIsWrite? w (tagOf tag) with
+      | error e => exact trivial
+      | ok w' => exact ih (fun a => if a == id then some w' else worlds a)
+
+/-- **Mid-sequence protector-end UB keeps the committed prefix** (release-fold level): for ANY
+per-release simulation, `stackPopReleaseAll` and the prefix fold `multiAllocEndAccessesPartial` agree
+on whether, and at WHICH `(allocation, tag)`, the frame exit fails. On failure every allocation
+other than the failing one is still `R`-related to its prefix world (mutations of earlier releases
+are retained, not rolled back), and the failing allocation holds exactly the tree written back by
+the failed `BorrowTree.releaseProtector` from an `R`-related pre-state. -/
+theorem stackPopReleaseAll_multiAlloc_partial_simulates {K : Type}
+    (pt : Miri.TreeBorrows.ProtectedTags)
+    (frameTag : Miri.Memory.AllocId → Miri.Memory.BorTag → Prop)
+    (tagOf : Miri.Memory.BorTag → Nat)
+    (R : Miri.Memory.AllocId → Miri.TreeBorrows.BorrowTree → FnEntryBorrowWorld → Prop)
+    (hsim : ∀ id, ProtectorReleaseSim pt (frameTag id) tagOf (R id))
+    (prots : List (Miri.Memory.AllocId × Miri.Memory.BorTag))
+    (hprots : ∀ p ∈ prots, frameTag p.1 p.2) :
+    ∀ (mem : Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K)
+      (worlds : Miri.Memory.AllocId → Option FnEntryBorrowWorld),
+      (∀ id w, worlds id = some w →
+        ∃ entry, mem.live.find? (fun e => e.1 == id) = some (id, entry) ∧
+          R id entry.allocation.extra w) →
+      (∀ p ∈ prots, (worlds p.1).isSome = true) →
+      ∃ mem' res, stackPopReleaseAll pt prots mem = some (mem', res) ∧
+        match res, multiAllocEndAccessesPartial tagOf prots worlds with
+        | none, (worlds', none) =>
+          ∀ id w', worlds' id = some w' →
+            ∃ entry', mem'.live.find? (fun e => e.1 == id) = some (id, entry') ∧
+              R id entry'.allocation.extra w'
+        | some err, (worlds', some (fid, ftag)) =>
+          (∀ id w', id ≠ fid → worlds' id = some w' →
+            ∃ entry', mem'.live.find? (fun e => e.1 == id) = some (id, entry') ∧
+              R id entry'.allocation.extra w') ∧
+          ∃ wf pre entry',
+            worlds' fid = some wf ∧ R fid pre wf ∧
+            (∃ e, execProtectorEndAccessFor protectorEndAccessIsWrite? wf (tagOf ftag) = .error e) ∧
+            stackPopReleaseErr (pre.releaseProtector ftag pt).status = some (some err) ∧
+            mem'.live.find? (fun e => e.1 == fid) = some (fid, entry') ∧
+            entry'.allocation.extra = (pre.releaseProtector ftag pt).tree
+        | _, _ => False := by
+  induction prots with
+  | nil =>
+    intro mem worlds hsync _
+    exact ⟨mem, none, rfl, hsync⟩
+  | cons p rest ih =>
+    intro mem worlds hsync hdom
+    obtain ⟨id, tag⟩ := p
+    have hsome : (worlds id).isSome = true := hdom (id, tag) List.mem_cons_self
+    cases hw : worlds id with
+    | none => rw [hw] at hsome; cases hsome
+    | some w =>
+      obtain ⟨entry, hfind, hR⟩ := hsync id w hw
+      have hstep := (hsim id).step entry.allocation.extra w tag
+        (hprots (id, tag) List.mem_cons_self) hR
+      have hunf : stackPopReleaseAll pt ((id, tag) :: rest) mem =
+          match stackPopReleaseErr (entry.allocation.extra.releaseProtector tag pt).status with
+          | some none => stackPopReleaseAll pt rest
+              (stackPopWriteBack mem id entry (entry.allocation.extra.releaseProtector tag pt).tree)
+          | some (some err) => some (stackPopWriteBack mem id entry
+              (entry.allocation.extra.releaseProtector tag pt).tree, some err)
+          | none => none := by
+        simp only [stackPopReleaseAll, hfind]
+      have hpart : multiAllocEndAccessesPartial tagOf ((id, tag) :: rest) worlds =
+          match execProtectorEndAccessFor protectorEndAccessIsWrite? w (tagOf tag) with
+          | .error _ => (worlds, some (id, tag))
+          | .ok w' => multiAllocEndAccessesPartial tagOf rest
+              (fun a => if a == id then some w' else worlds a) := by
+        simp only [multiAllocEndAccessesPartial, hw]
+      rw [hunf, hpart]
+      cases hE : stackPopReleaseErr (entry.allocation.extra.releaseProtector tag pt).status with
+      | none =>
+        rw [hE] at hstep
+        cases hX : execProtectorEndAccessFor protectorEndAccessIsWrite? w (tagOf tag) with
+        | error e => rw [hX] at hstep; exact False.elim hstep
+        | ok w1 => rw [hX] at hstep; exact False.elim hstep
+      | some r =>
+        rw [hE] at hstep
+        cases r with
+        | none =>
+          cases hX : execProtectorEndAccessFor protectorEndAccessIsWrite? w (tagOf tag) with
+          | error e => rw [hX] at hstep; exact False.elim hstep
+          | ok w1 =>
+            rw [hX] at hstep
+            refine ih (fun q hq => hprots q (List.mem_cons_of_mem _ hq))
+              (stackPopWriteBack mem id entry (entry.allocation.extra.releaseProtector tag pt).tree)
+              (fun a => if a == id then some w1 else worlds a) ?_ ?_
+            · intro a wa hwa
+              by_cases ha : a = id
+              · subst ha
+                simp only [beq_self_eq_true, ↓reduceIte, Option.some.injEq] at hwa
+                subst hwa
+                exact ⟨_, find?_filter_push_self mem.live a _, hstep⟩
+              · have hne : (a == id) = false := beq_false_of_ne ha
+                simp only [hne, Bool.false_eq_true, ↓reduceIte] at hwa
+                obtain ⟨eA, hfA, hRA⟩ := hsync a wa hwa
+                exact ⟨eA, by unfold stackPopWriteBack; rw [find?_filter_push_ne mem.live id a _ ha]; exact hfA, hRA⟩
+            · intro q hq
+              by_cases hqId : q.1 = id
+              · simp [hqId]
+              · have hne : (q.1 == id) = false := beq_false_of_ne hqId
+                simp [hne, hdom q (List.mem_cons_of_mem _ hq)]
+        | some err =>
+          cases hX : execProtectorEndAccessFor protectorEndAccessIsWrite? w (tagOf tag) with
+          | ok w1 => rw [hX] at hstep; exact False.elim hstep
+          | error e =>
+            refine ⟨_, some err, rfl, ?_, w, entry.allocation.extra, _, hw, hR, ⟨e, hX⟩, hE,
+              find?_filter_push_self mem.live id _, rfl⟩
+            intro a wa ha hwa
+            obtain ⟨eA, hfA, hRA⟩ := hsync a wa hwa
+            exact ⟨eA, by unfold stackPopWriteBack; rw [find?_filter_push_ne mem.live id a _ ha]; exact hfA, hRA⟩
+
+/-- **Mid-sequence protector-end UB at `MachineHooks.beforeStackPopWithEnsure`** (`lean-miri#74`):
+the vendored frame pop and the prefix fold `multiAllocEndAccessesPartial` either both complete (one
+`endCall`, every allocation `R`-related to its final world) or both stop at the SAME failing
+`(fid, ftag)`. In the failing case `borrowTracker` is untouched (`endCall` never runs) and the
+returned machine state RETAINS the partial mutations: every other allocation is `R`-related to its
+prefix world, and `fid` holds the tree written back by the failed `releaseProtector`. -/
+theorem miri_beforeStackPopWithEnsure_multiAlloc_partial_simulates
+    {K User : Type} [DecidableEq K]
+    (st : Miri.Interpreter.MachineHooks.State K User)
+    (tracker : Miri.Interpreter.MachineHooks.BorrowState)
+    (frame : Miri.Interpreter.Frame Miri.Memory.Provenance Miri.Interpreter.LocalLayout
+      Miri.Interpreter.MachineHooks.FrameExtra)
+    (prots : List (Miri.Memory.AllocId × Miri.Memory.BorTag))
+    (htracker : st.machine.borrowTracker = some tracker)
+    (hframe : st.stack.currentFrame? = some frame)
+    (hbf : frame.extra.borrowTracker = some ⟨prots.toArray⟩)
+    (frameTag : Miri.Memory.AllocId → Miri.Memory.BorTag → Prop)
+    (tagOf : Miri.Memory.BorTag → Nat)
+    (R : Miri.Memory.AllocId → Miri.TreeBorrows.BorrowTree → FnEntryBorrowWorld → Prop)
+    (hsim : ∀ id, ProtectorReleaseSim tracker.global.protectedTags (frameTag id) tagOf (R id))
+    (hprots : ∀ p ∈ prots, frameTag p.1 p.2)
+    (worlds : Miri.Memory.AllocId → Option FnEntryBorrowWorld)
+    (hsync : ∀ id w, worlds id = some w →
+      ∃ entry, st.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry) ∧
+        R id entry.allocation.extra w)
+    (hdom : ∀ p ∈ prots, (worlds p.1).isSome = true) :
+    match Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ()) st,
+        multiAllocEndAccessesPartial tagOf prots worlds with
+    | .ok () st', (worlds', none) =>
+      st'.machine.borrowTracker = some { tracker with
+        global := tracker.global.endCall ⟨prots.toArray⟩ } ∧
+      ∀ id w', worlds' id = some w' →
+        ∃ entry', st'.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry') ∧
+          R id entry'.allocation.extra w'
+    | .error err st', (worlds', some (fid, ftag)) =>
+      st'.machine.borrowTracker = some tracker ∧
+      (∀ id w', id ≠ fid → worlds' id = some w' →
+        ∃ entry', st'.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry') ∧
+          R id entry'.allocation.extra w') ∧
+      ∃ wf pre entry',
+        worlds' fid = some wf ∧ R fid pre wf ∧
+        (∃ e, execProtectorEndAccessFor protectorEndAccessIsWrite? wf (tagOf ftag) = .error e) ∧
+        stackPopReleaseErr (pre.releaseProtector ftag tracker.global.protectedTags).status =
+          some (some err) ∧
+        st'.machine.memory.live.find? (fun e => e.1 == fid) = some (fid, entry') ∧
+        entry'.allocation.extra = (pre.releaseProtector ftag tracker.global.protectedTags).tree
+    | _, _ => False := by
+  obtain ⟨mem', res, hall, hmatch⟩ :=
+    stackPopReleaseAll_multiAlloc_partial_simulates (K := K) tracker.global.protectedTags frameTag
+      tagOf R hsim prots hprots st.machine.memory worlds hsync hdom
+  have hrun := miri_beforeStackPopWithEnsure_eq_releaseAll st tracker frame prots.toArray
+    htracker hframe hbf mem' res (by simpa using hall)
+  rw [hrun]
+  generalize multiAllocEndAccessesPartial tagOf prots worlds = part at hmatch ⊢
+  obtain ⟨worlds', fail⟩ := part
+  cases res with
+  | none =>
+    cases fail with
+    | none => exact ⟨rfl, hmatch⟩
+    | some f => obtain ⟨fid, ftag⟩ := f; exact False.elim hmatch
+  | some err =>
+    cases fail with
+    | none => exact False.elim hmatch
+    | some f =>
+      obtain ⟨fid, ftag⟩ := f
+      obtain ⟨h1, h2⟩ := hmatch
+      exact ⟨htracker, h1, h2⟩
 
 /-! ### 2E.1b End-to-end `FnEntry` retag (`RetagPolicy.create` + `RetagPipeline.retagPointerValue`) +
 intra-call access + `BorrowTree.releaseProtector` contrast (`writableChildWrite` vs
@@ -16253,6 +16516,720 @@ theorem allocationMachine_deallocate_eq_deallocateMachine {K User Payload : Type
         exact ⟨trivial, DeallocMachineOutcomeRel.lifecycle (.nonzeroAllocationOffset "deallocate" allocId offset)
           (.nonzeroOffset (ofMiriAllocId allocId) offset.bytes) rfl (fun _ _ h => by cases h)⟩
 
+/-! ### 2E.2b Closed deallocation canary (placed here for peak memory)
+
+Kernel checking runs in declaration order. This closed canary exceeded the `lean -M` bound when its
+kernel check ran near the end of the module, so it sits directly after the lockstep theorem it
+instantiates rather than in Part 3 and is checked while less of the module is resident. -/
+
+private def canaryTs (n : Nat) (h : 2 * n < 4294967296 := by decide) : Miri.Concurrency.VTimestamp :=
+  Miri.Concurrency.VTimestamp.ofPacked (2 * n) h
+
+private def canaryActorClock : Miri.Concurrency.VClock :=
+  Miri.Concurrency.VClock.nonzero [canaryTs 5, canaryTs 2] (canaryTs 1) (by decide)
+
+private def canaryDeallocActor : DeallocActor :=
+  DeallocActor.ofVClock 0 [(0, 5), (1, 2), (2, 1)]
+
+private def canaryRaceEntryOf (vc : Miri.Concurrency.VClockAlloc) : RaceClockEntry :=
+  let c := vc.allocRanges.initialCell
+  { writerThread := UInt32.ofNat c.write.1.toNat
+    writeTimestamp := UInt64.ofNat c.write.2.time
+    readerThread := 1
+    readTimestamp := UInt64.ofNat (c.read.asList.getD 1 Miri.Concurrency.VTimestamp.ZERO).time
+    extraReaders := [(2, UInt64.ofNat (c.read.asList.getD 2 Miri.Concurrency.VTimestamp.ZERO).time)] }
+
+private def canaryVcUniform (sz : Nat) (hsz : sz < 2 ^ 64)
+    (wIdx : Miri.Concurrency.VectorIdx) (wTs : Miri.Concurrency.VTimestamp)
+    (readClk : Miri.Concurrency.VClock) : Miri.Concurrency.VClockAlloc :=
+  { allocRanges := {
+      length := Miri.Concurrency.ByteSize.ofU64 sz hsz
+      initialCell := { write := (wIdx, wTs), writeType := .Write, read := readClk, atomicOps := none }
+      overrides := [] } }
+
+private def canaryDeallocProj : RowProjection Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit :=
+  ⟨fun _ => .heap, fun _ => [], fun _ => []⟩
+
+private def canaryDeallocHooks :
+    Miri.Interpreter.AllocationMachine.DeallocationHooks Unit (Miri.Interpreter.MemoryExtras.Registry Unit) Unit where
+  extras :=
+    { get := id
+      put := fun _ r => r
+      onAccess := fun _ _ => pure ()
+      weakError := fun _ => .invalidProgram "" }
+  resolvePointer := fun mem st ptr _ =>
+    match ptr.provenance with
+    | some (.concrete id tag) => ⟨mem, st, .ok (id, ptr.offset, .concrete tag)⟩
+    | _ => ⟨mem, st, .error ptr.offset.bytes⟩
+  diagnostic := fun _ => pure ()
+  currentSpan := pure ⟨0⟩
+  freeAllocId := fun _ _ _ _ => pure ()
+  retainDetached := fun _ m => m
+  nativeDrop := none
+  error := Miri.Interpreter.AllocationMachine.deallocationError
+
+private theorem canaryClockEntryRel_of_uniform
+    (wIdx : Miri.Concurrency.VectorIdx) (wTs : Miri.Concurrency.VTimestamp)
+    (readClk : Miri.Concurrency.VClock) (sz : Nat) (hsz : sz < 2 ^ 64)
+    (hwIdx : wIdx.toNat < 3) (hwTs : wTs.time < 2 ^ 64)
+    (hrLen : readClk.asList.length ≤ 3)
+    (hr0 : (readClk.asList.getD 0 Miri.Concurrency.VTimestamp.ZERO).time ≤ 5)
+    (hr1 : (readClk.asList.getD 1 Miri.Concurrency.VTimestamp.ZERO).time < 2 ^ 64)
+    (hr2 : (readClk.asList.getD 2 Miri.Concurrency.VTimestamp.ZERO).time < 2 ^ 64)
+    (hself : wIdx.toNat = 0 → wTs.time ≤ 5) :
+    ClockEntryRel canaryDeallocActor
+      { Miri.Concurrency.ThreadClockSet.default with clock := canaryActorClock }
+      (canaryVcUniform sz hsz wIdx wTs readClk).allocRanges.initialCell
+      (canaryRaceEntryOf (canaryVcUniform sz hsz wIdx wTs readClk)) := by
+  have hact0 : (canaryActorClock.asList.getD 0 Miri.Concurrency.VTimestamp.ZERO).time = 5 := by decide
+  have hact1 : (canaryActorClock.asList.getD 1 Miri.Concurrency.VTimestamp.ZERO).time = 2 := by decide
+  have hact2 : (canaryActorClock.asList.getD 2 Miri.Concurrency.VTimestamp.ZERO).time = 1 := by decide
+  have hidx0 : ∀ i : Miri.Concurrency.VectorIdx, i.toNat = 0 → (canaryActorClock.index i).time = 5 := by
+    intro i hi; unfold Miri.Concurrency.VClock.index; rw [hi]; decide +kernel
+  have hidx1 : ∀ i : Miri.Concurrency.VectorIdx, i.toNat = 1 → (canaryActorClock.index i).time = 2 := by
+    intro i hi; unfold Miri.Concurrency.VClock.index; rw [hi]; decide +kernel
+  have hidx2 : ∀ i : Miri.Concurrency.VectorIdx, i.toNat = 2 → (canaryActorClock.index i).time = 1 := by
+    intro i hi; unfold Miri.Concurrency.VClock.index; rw [hi]; decide +kernel
+  have hwtNat : (UInt64.ofNat wTs.time).toNat = wTs.time := by
+    rw [UInt64.toNat_ofNat', Nat.mod_eq_of_lt hwTs]
+  have hr1Nat : (UInt64.ofNat (readClk.asList.getD 1 Miri.Concurrency.VTimestamp.ZERO).time).toNat =
+      (readClk.asList.getD 1 Miri.Concurrency.VTimestamp.ZERO).time := by
+    rw [UInt64.toNat_ofNat', Nat.mod_eq_of_lt hr1]
+  have hr2Nat : (UInt64.ofNat (readClk.asList.getD 2 Miri.Concurrency.VTimestamp.ZERO).time).toNat =
+      (readClk.asList.getD 2 Miri.Concurrency.VTimestamp.ZERO).time := by
+    rw [UInt64.toNat_ofNat', Nat.mod_eq_of_lt hr2]
+  refine ⟨rfl, ?_, ?_, ?_, ?_⟩
+  · intro hs
+    dsimp only [canaryRaceEntryOf, canaryVcUniform, canaryDeallocActor] at hs ⊢
+    have h0 : wIdx.toNat = 0 := by
+      have := congrArg UInt32.toNat hs
+      simp only [UInt32.toNat_ofNat', Nat.mod_eq_of_lt (by omega : wIdx.toNat < 2 ^ 32)] at this
+      exact this
+    rw [hidx0 wIdx h0]
+    exact hself h0
+  · intro hne
+    dsimp only [canaryRaceEntryOf, canaryVcUniform, canaryDeallocActor] at hne ⊢
+    refine ⟨hwtNat.symm, ?_⟩
+    match hw : wIdx.toNat with
+    | 0 => exact absurd (by rw [hw]; rfl) hne
+    | 1 => rw [hidx1 wIdx hw]; rfl
+    | 2 => rw [hidx2 wIdx hw]; rfl
+    | _ + 3 => omega
+  · intro i hnz
+    dsimp only [canaryRaceEntryOf, canaryVcUniform, canaryDeallocActor]
+    match i with
+    | 0 => left; rw [hact0]; exact hr0
+    | 1 =>
+      right
+      refine ⟨1, UInt64.ofNat (readClk.asList.getD 1 Miri.Concurrency.VTimestamp.ZERO).time,
+        by simp, by decide, hr1Nat.symm, by rw [hact1]; rfl⟩
+    | 2 =>
+      right
+      refine ⟨2, UInt64.ofNat (readClk.asList.getD 2 Miri.Concurrency.VTimestamp.ZERO).time,
+        by simp, by decide, hr2Nat.symm, by rw [hact2]; rfl⟩
+    | k + 3 =>
+      have hnone : readClk.asList[k + 3]? = none := List.getElem?_eq_none (by omega)
+      have h0 : (readClk.asList.getD (k + 3) Miri.Concurrency.VTimestamp.ZERO).time = 0 := by
+        simp [List.getD_eq_getElem?_getD, hnone]; rfl
+      exact absurd h0 hnz
+  · intro rt rts hmem hne
+    dsimp only [canaryRaceEntryOf, canaryVcUniform, canaryDeallocActor] at hmem hne ⊢
+    simp only [List.mem_cons, List.not_mem_nil, or_false] at hmem
+    rcases hmem with h1 | h2
+    · injection h1 with hrt hrts; subst hrt; subst hrts
+      exact ⟨1, hr1Nat.symm, by rw [hact1]; rfl⟩
+    · injection h2 with hrt hrts; subst hrt; subst hrts
+      exact ⟨2, hr2Nat.symm, by rw [hact2]; rfl⟩
+
+private def canaryWriteRaceEntry : RaceClockEntry :=
+  { writerThread := 1, writeTimestamp := 4, readerThread := 1, readTimestamp := 0, extraReaders := [(2, 0)] }
+
+private def canaryMultiReadRaceEntry : RaceClockEntry :=
+  { writerThread := 0, writeTimestamp := 1, readerThread := 1, readTimestamp := 2, extraReaders := [(2, 3)] }
+
+private def canarySyncedEntry : RaceClockEntry :=
+  { writerThread := 1, writeTimestamp := 2, readerThread := 1, readTimestamp := 1, extraReaders := [(2, 1)] }
+
+private def canaryDeallocKw0 : KeyedAllocWorld :=
+  let baseKw : KeyedAllocWorld :=
+    KeyedAllocWorld.ofLinear
+      { nextAllocId := 9
+        issued := []
+        globals := [(⟨7, by decide⟩, ⟨.static, 4, 0, .not, []⟩)]
+        live := [(⟨1, by decide⟩, ⟨4, 0, .stack, .mut, []⟩),
+                 (⟨2, by decide⟩, ⟨4, 0, .stack, .mut, []⟩),
+                 (⟨3, by decide⟩, ⟨4, 0, .stack, .mut, []⟩),
+                 (⟨4, by decide⟩, ⟨0, 0, .stack, .mut, []⟩),
+                 (⟨5, by decide⟩, ⟨4, 0, .stack, .not, []⟩),
+                 (⟨6, by decide⟩, ⟨4, 0, .stack, .mut, []⟩)]
+        dead := [] }
+  { baseKw with
+    table := { baseKw.table with
+      race := ofLinearRows
+        [(⟨1, by decide⟩, canaryWriteRaceEntry),
+         (⟨2, by decide⟩, canaryMultiReadRaceEntry),
+         (⟨3, by decide⟩, canarySyncedEntry),
+         (⟨4, by decide⟩, canaryWriteRaceEntry),
+         (⟨5, by decide⟩, canarySyncedEntry)] } }
+
+private theorem array_qsort_empty {α : Type} (lt : α → α → Bool) : (#[] : Array α).qsort lt = #[] := by
+  simp [Array.qsort]
+
+private theorem onMemoryAccess_empty_entries {S T : Type}
+    (h : Miri.Concurrency.SyncObject.AccessHooks S T)
+    (id : Miri.Memory.AllocId) (start size : Miri.ABI.Size)
+    (kind : Miri.Concurrency.SyncObject.AccessKind) (s : S)
+    (hent : h.entries id s = .ok #[] s) :
+    Miri.Concurrency.SyncObject.onMemoryAccess h id start size kind s = .ok () s := by
+  unfold Miri.Concurrency.SyncObject.onMemoryAccess
+  simp only [bind, Bind.bind, pure, Pure.pure, EStateM.bind, EStateM.pure, hent,
+    array_qsort_empty, forIn]
+  rfl
+
+private theorem accessHooks_entries_empty {K User Payload : Type}
+    (h : Miri.Interpreter.MemoryExtras.Hooks K User Payload)
+    (id : Miri.Memory.AllocId)
+    (m : Miri.Interpreter.MemoryExtras.Machine K User)
+    (extra : Miri.Interpreter.MemoryExtras.AllocationExtra Payload)
+    (hlook : Miri.Interpreter.MemoryExtras.lookup h m id = .ok extra)
+    (hsync : extra.sync = #[]) :
+    (Miri.Interpreter.MemoryExtras.accessHooks h).entries id m = .ok #[] m := by
+  unfold Miri.Interpreter.MemoryExtras.accessHooks
+  simp only [bind, Bind.bind, pure, Pure.pure, EStateM.bind, EStateM.pure, get, getThe,
+    MonadStateOf.get, EStateM.get, hlook]
+  change (match (EStateM.Result.ok extra m : EStateM.Result Miri.Interpreter.StepError _ _) with
+    | .ok e s => EStateM.Result.ok (e.sync.map _) s
+    | .error err s => EStateM.Result.error err s) = .ok #[] m
+  simp [hsync]
+
+private def canaryVcWriteRace : Miri.Concurrency.VClockAlloc :=
+  canaryVcUniform 4 (by decide) (Miri.Concurrency.VectorIdx.ofU32 1 (by decide)) (canaryTs 4) .default
+
+private def canaryVcMultiReadRace : Miri.Concurrency.VClockAlloc :=
+  canaryVcUniform 4 (by decide) (Miri.Concurrency.VectorIdx.ofU32 0 (by decide))
+    (canaryTs 1) (Miri.Concurrency.VClock.nonzero [canaryTs 0, canaryTs 2] (canaryTs 3) (by decide))
+
+private def canaryVcSynced : Miri.Concurrency.VClockAlloc :=
+  canaryVcUniform 4 (by decide) (Miri.Concurrency.VectorIdx.ofU32 1 (by decide))
+    (canaryTs 2) (Miri.Concurrency.VClock.nonzero [canaryTs 0, canaryTs 1] (canaryTs 1) (by decide))
+
+private def canaryGlobalDet : Miri.Concurrency.GlobalState :=
+  { Miri.Concurrency.GlobalState.initial true false with
+    multiThreaded := true
+    vectorClocks := [{ Miri.Concurrency.ThreadClockSet.default with clock := canaryActorClock }] }
+
+private def canaryGlobalOff : Miri.Concurrency.GlobalState :=
+  canaryGlobalDet.withDataRaceFreeAction true
+
+private def canaryDeallocSt (aMut4 aZst aImm4 : Miri.Memory.Allocation Miri.Memory.Provenance)
+    (g : Miri.Concurrency.GlobalState) :
+    Miri.Interpreter.MachineHooks.State Unit (Miri.Interpreter.MemoryExtras.Registry Unit) :=
+  let id1 : Miri.Memory.AllocId := ⟨1, by decide⟩
+  let id2 : Miri.Memory.AllocId := ⟨2, by decide⟩
+  let id3 : Miri.Memory.AllocId := ⟨3, by decide⟩
+  let id4 : Miri.Memory.AllocId := ⟨4, by decide⟩
+  let id5 : Miri.Memory.AllocId := ⟨5, by decide⟩
+  let id6 : Miri.Memory.AllocId := ⟨6, by decide⟩
+  let id7 : Miri.Memory.AllocId := ⟨7, by decide⟩
+  let emptyTree : Miri.TreeBorrows.BorrowTree := Miri.TreeBorrows.BorrowTree.new ⟨1, by decide⟩ Miri.ABI.Size.ZERO
+  { stack := ⟨#[]⟩
+    machine := {
+      memory := { (Miri.Memory.MemoryState.empty :
+          Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit).pushGlobal
+          ⟨id7, .static, ⟨4⟩, Miri.ABI.Align.ONE, .Not, none⟩ with
+        nextAllocId := 9
+        live := #[(id1, ⟨.stack, aMut4.withExtra emptyTree⟩),
+                  (id2, ⟨.stack, aMut4.withExtra emptyTree⟩),
+                  (id3, ⟨.stack, aMut4.withExtra emptyTree⟩),
+                  (id4, ⟨.stack, aZst.withExtra emptyTree⟩),
+                  (id5, ⟨.stack, aImm4.withExtra emptyTree⟩),
+                  (id6, ⟨.stack, aMut4.withExtra emptyTree⟩)] }
+      borrowTracker := none
+      dataRace := some g
+      threads := Miri.Concurrency.ThreadManager.initial true
+      raceAllocations := #[(id1, canaryVcWriteRace), (id2, canaryVcMultiReadRace), (id3, canaryVcSynced),
+                           (id4, canaryVcWriteRace), (id5, canaryVcSynced)]
+      allocationSpans := #[]
+      user := ⟨#[(id1, ⟨none, #[]⟩), (id2, ⟨none, #[]⟩), (id3, ⟨none, #[]⟩),
+                 (id4, ⟨none, #[]⟩), (id5, ⟨none, #[]⟩), (id6, ⟨none, #[]⟩)]⟩ } }
+
+private theorem canaryDealloc_hlock (aMut4 aZst aImm4 : Miri.Memory.Allocation Miri.Memory.Provenance)
+    (hsz4 : aMut4.byteSize = ⟨4⟩) (hal4 : aMut4.align = Miri.ABI.Align.ONE)
+    (hmut4 : aMut4.mutability = .Mut) (hnn4 : aMut4.nativeBuffer = none)
+    (hsz0 : aZst.byteSize = ⟨0⟩) (hal0 : aZst.align = Miri.ABI.Align.ONE)
+    (hmut0 : aZst.mutability = .Mut) (hnn0 : aZst.nativeBuffer = none)
+    (hszI : aImm4.byteSize = ⟨4⟩) (halI : aImm4.align = Miri.ABI.Align.ONE)
+    (hmutI : aImm4.mutability = .Not) (hnnI : aImm4.nativeBuffer = none)
+    (g : Miri.Concurrency.GlobalState) (id : Miri.Memory.AllocId) (off : UInt64)
+    (lay : Option (Miri.ABI.Size × Miri.ABI.Align)) (expLayout : Option (UInt64 × UInt8))
+    (k : Miri.Memory.MemoryKind Unit) (ek : AllocMemKind) (rm : RaceDetectorMode)
+    (hg : g = canaryGlobalDet ∨ g = canaryGlobalOff)
+    (halReq : ∀ sz al, lay = some (sz, al) → al.pow2 < 256)
+    (hexp : lay.map (fun p => (p.1.bytes, UInt8.ofNat p.2.pow2)) = expLayout)
+    (hek : memKindOfMiri canaryDeallocProj.machineKind k = ek)
+    (hrm : raceModeOfMachine (canaryDeallocSt aMut4 aZst aImm4 g).machine = rm) :
+    match Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
+        ⟨⟨off⟩, some (.concrete id ⟨1, by decide⟩)⟩ lay k (canaryDeallocSt aMut4 aZst aImm4 g) with
+    | .ok () st' =>
+      machineToKeyed canaryDeallocProj canaryRaceEntryOf st'.machine =
+        (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id) off) expLayout ek rm canaryDeallocActor .ok).world ∧
+      DeallocMachineOutcomeRel canaryDeallocHooks (.ok ())
+        (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id) off) expLayout ek rm canaryDeallocActor .ok).outcome
+    | .error e st' =>
+      machineToKeyed canaryDeallocProj canaryRaceEntryOf st'.machine =
+        (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id) off) expLayout ek rm canaryDeallocActor .ok).world ∧
+      DeallocMachineOutcomeRel canaryDeallocHooks (.error e)
+        (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id) off) expLayout ek rm canaryDeallocActor .ok).outcome := by
+  let emptyTree : Miri.TreeBorrows.BorrowTree := Miri.TreeBorrows.BorrowTree.new ⟨1, by decide⟩ Miri.ABI.Size.ZERO
+  have hrW : canaryRaceEntryOf canaryVcWriteRace = canaryWriteRaceEntry := by decide +kernel
+  have hrM : canaryRaceEntryOf canaryVcMultiReadRace = canaryMultiReadRaceEntry := by decide +kernel
+  have hrS : canaryRaceEntryOf canaryVcSynced = canarySyncedEntry := by decide +kernel
+  have hsz4' : (aMut4.withExtra emptyTree).byteSize = ⟨4⟩ := hsz4
+  have hal4' : (aMut4.withExtra emptyTree).align = Miri.ABI.Align.ONE := hal4
+  have hmut4' : (aMut4.withExtra emptyTree).mutability = .Mut := hmut4
+  have hsz0' : (aZst.withExtra emptyTree).byteSize = ⟨0⟩ := hsz0
+  have hal0' : (aZst.withExtra emptyTree).align = Miri.ABI.Align.ONE := hal0
+  have hmut0' : (aZst.withExtra emptyTree).mutability = .Mut := hmut0
+  have hszI' : (aImm4.withExtra emptyTree).byteSize = ⟨4⟩ := hszI
+  have halI' : (aImm4.withExtra emptyTree).align = Miri.ABI.Align.ONE := halI
+  have hmutI' : (aImm4.withExtra emptyTree).mutability = .Not := hmutI
+  have hkwEq : machineToKeyed canaryDeallocProj canaryRaceEntryOf (canaryDeallocSt aMut4 aZst aImm4 g).machine =
+      canaryDeallocKw0 := by
+    have hglob : (canaryDeallocSt aMut4 aZst aImm4 g).machine.memory.globals =
+        #[⟨⟨7, by decide⟩, .static, ⟨4⟩, Miri.ABI.Align.ONE, .Not, none⟩] := rfl
+    have hissued : (canaryDeallocSt aMut4 aZst aImm4 g).machine.memory.issuedIds = #[] := rfl
+    have hdead : (canaryDeallocSt aMut4 aZst aImm4 g).machine.memory.dead = #[] := rfl
+    have hexh : (canaryDeallocSt aMut4 aZst aImm4 g).machine.memory.idSupplyExhausted = false := rfl
+    unfold machineToKeyed memoryStateToKeyed memoryStateToLinear KeyedAllocWorld.ofLinear
+      MiriAllocRows.toLinear memoryStateToRows liveEntryOfMiri
+    rw [hglob, hissued, hdead, hexh]
+    simp only [canaryDeallocSt, canaryDeallocProj, List.map_cons, List.map_nil]
+    rw [hsz4', hal4', hmut4', hsz0', hal0', hmut0', hszI', halI', hmutI', hrW, hrM, hrS]
+    rfl
+  have h0 := allocationMachine_deallocate_eq_deallocateMachine canaryDeallocProj canaryRaceEntryOf
+    canaryDeallocHooks ⟨⟨off⟩, some (.concrete id ⟨1, by decide⟩)⟩ lay k (canaryDeallocSt aMut4 aZst aImm4 g)
+    (.provenanced (ofMiriAllocId id) off) canaryDeallocActor .ok (Or.inl rfl)
+    rfl rfl ⟨rfl, rfl⟩
+    (by
+      intro row hrow
+      simp only [canaryDeallocSt, List.mem_cons, List.not_mem_nil, or_false] at hrow
+      rcases hrow with rfl | rfl | rfl | rfl | rfl | rfl <;>
+        first | (show aMut4.align.pow2 < 256; rw [hal4]; decide)
+              | (show aZst.align.pow2 < 256; rw [hal0]; decide)
+              | (show aImm4.align.pow2 < 256; rw [halI]; decide))
+    halReq
+    (by
+      intro row hrow
+      simp only [canaryDeallocSt, List.mem_cons, List.not_mem_nil, or_false] at hrow
+      rcases hrow with rfl | rfl | rfl | rfl | rfl | rfl <;> (cases k <;> rfl))
+    (by
+      intro row hrow
+      simp only [canaryDeallocSt, List.mem_cons, List.not_mem_nil, or_false] at hrow
+      rcases hrow with rfl | rfl | rfl | rfl | rfl | rfl <;>
+        first | exact hnn4 | exact hnn0 | exact hnnI)
+    (by
+      intro g' hg' hdet
+      injection hg' with hEq; subst hEq
+      rcases hg with rfl | rfl
+      · refine ⟨Miri.Concurrency.VectorIdx.ofU32 0 (by decide),
+          { Miri.Concurrency.ThreadClockSet.default with clock := canaryActorClock }, rfl, ?_⟩
+        intro rid vc row hrf hlive hnz
+        have hmemR : (rid, vc) ∈ (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet).machine.raceAllocations.toList := by
+          rw [← Array.find?_toList] at hrf; exact List.mem_of_find?_eq_some hrf
+        have hmemL : (rid, row) ∈ (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet).machine.memory.live.toList := by
+          rw [← Array.find?_toList] at hlive; exact List.mem_of_find?_eq_some hlive
+        simp only [canaryDeallocSt, List.mem_cons, List.not_mem_nil, or_false] at hmemR hmemL
+        have hcellAt : ∀ (vc' : Miri.Concurrency.VClockAlloc) (k : Nat),
+            vc'.allocRanges.overrides = [] → k < vc'.allocRanges.length.bytes →
+            vc'.cellAt k = .ok vc'.allocRanges.initialCell := by
+          intro vc' k hov hk
+          unfold Miri.Concurrency.VClockAlloc.cellAt Miri.Concurrency.AllocationRanges.cellAt
+          simp only [hk, ↓reduceIte, hov]
+          rw [miri_etm_private% Miri.Concurrency.DataRace Miri.Concurrency.AllocationRanges.findOverride.eq_1]
+        rcases hmemL with hEqL | hEqL | hEqL | hEqL | hEqL | hEqL <;>
+          (injection hEqL with h1 h2; subst h1; subst h2)
+        · have hsz : (aMut4.withExtra emptyTree).byteSize.bytes = 4 := congrArg Miri.ABI.Size.bytes hsz4'
+          rcases hmemR with hR | hR | hR | hR | hR <;>
+            first | (injection hR with hR1 _; exact absurd hR1 (by decide))
+                  | (injection hR with _ hR2; subst hR2
+                     exact ⟨_, by rw [hsz]; decide, fun k hk => hcellAt _ k rfl (by rw [hsz] at hk; exact hk),
+                       canaryClockEntryRel_of_uniform _ _ _ _ _ (by decide) (by decide) (by decide)
+                         (by decide) (by decide) (by decide) (fun h => absurd h (by decide))⟩)
+        · have hsz : (aMut4.withExtra emptyTree).byteSize.bytes = 4 := congrArg Miri.ABI.Size.bytes hsz4'
+          rcases hmemR with hR | hR | hR | hR | hR <;>
+            first | (injection hR with hR1 _; exact absurd hR1 (by decide))
+                  | (injection hR with _ hR2; subst hR2
+                     exact ⟨_, by rw [hsz]; decide, fun k hk => hcellAt _ k rfl (by rw [hsz] at hk; exact hk),
+                       canaryClockEntryRel_of_uniform _ _ _ _ _ (by decide) (by decide) (by decide)
+                         (by decide) (by decide) (by decide) (fun _ => by decide)⟩)
+        · have hsz : (aMut4.withExtra emptyTree).byteSize.bytes = 4 := congrArg Miri.ABI.Size.bytes hsz4'
+          rcases hmemR with hR | hR | hR | hR | hR <;>
+            first | (injection hR with hR1 _; exact absurd hR1 (by decide))
+                  | (injection hR with _ hR2; subst hR2
+                     exact ⟨_, by rw [hsz]; decide, fun k hk => hcellAt _ k rfl (by rw [hsz] at hk; exact hk),
+                       canaryClockEntryRel_of_uniform _ _ _ _ _ (by decide) (by decide) (by decide)
+                         (by decide) (by decide) (by decide) (fun h => absurd h (by decide))⟩)
+        · exact absurd (congrArg Miri.ABI.Size.bytes hsz0') hnz
+        · have hsz : (aImm4.withExtra emptyTree).byteSize.bytes = 4 := congrArg Miri.ABI.Size.bytes hszI'
+          rcases hmemR with hR | hR | hR | hR | hR <;>
+            first | (injection hR with hR1 _; exact absurd hR1 (by decide))
+                  | (injection hR with _ hR2; subst hR2
+                     exact ⟨_, by rw [hsz]; decide, fun k hk => hcellAt _ k rfl (by rw [hsz] at hk; exact hk),
+                       canaryClockEntryRel_of_uniform _ _ _ _ _ (by decide) (by decide) (by decide)
+                         (by decide) (by decide) (by decide) (fun h => absurd h (by decide))⟩)
+        · rcases hmemR with hR | hR | hR | hR | hR <;>
+            (injection hR with hR1 _; exact absurd hR1 (by decide))
+      · exact absurd hdet (by decide))
+    (fun _ _ _ _ => rfl)
+    (fun m _ => ⟨m, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩)
+    (fun _ _ => ⟨rfl, rfl, rfl⟩)
+    (by
+      intro m rid row hlive hmUser
+      have hmemL : (rid, row) ∈ (canaryDeallocSt aMut4 aZst aImm4 g).machine.memory.live.toList := by
+        rw [← Array.find?_toList] at hlive; exact List.mem_of_find?_eq_some hlive
+      simp only [canaryDeallocSt, List.mem_cons, List.not_mem_nil, or_false] at hmemL
+      refine ⟨m, ?_, rfl, rfl⟩
+      unfold Miri.Interpreter.MemoryExtras.beforeDeallocationSync
+      refine onMemoryAccess_empty_entries _ rid Miri.ABI.Size.ZERO Miri.ABI.Size.ZERO .deallocation m ?_
+      refine accessHooks_entries_empty canaryDeallocHooks.extras rid m ⟨none, #[]⟩ ?_ rfl
+      unfold Miri.Interpreter.MemoryExtras.lookup
+      simp only [canaryDeallocHooks, id_eq, hmUser, canaryDeallocSt]
+      rcases hmemL with hEqL | hEqL | hEqL | hEqL | hEqL | hEqL <;>
+        (injection hEqL with h1 _; subst h1; rfl))
+    (fun m => ⟨⟨0⟩, m, rfl, rfl, rfl⟩)
+    (fun m _ _ _ _ => ⟨m, rfl, rfl, rfl⟩)
+  dsimp only at h0
+  rw [hkwEq, hexp, hek, hrm] at h0
+  cases hdec : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
+      ⟨⟨off⟩, some (.concrete id ⟨1, by decide⟩)⟩ lay k (canaryDeallocSt aMut4 aZst aImm4 g) with
+  | ok u st' => cases u; rw [hdec] at h0; exact h0
+  | error e st' => rw [hdec] at h0; exact h0
+
+-- Peak-RAM guard: elaborate and kernel-check this canary synchronously so its transient kernel
+-- memory does not overlap the asynchronous proof backlog.
+set_option Elab.async false in
+/-- **Closed full `AllocationMachine.deallocate` detecting-race & all-branch canary (`lean-miri#73`)**:
+instantiates `allocationMachine_deallocate_eq_deallocateMachine` on a real vendored `GlobalState`
+(`multiThreaded := true`, concrete actor `VClock [5, 2, 1]`), real `VClockAlloc` vector clocks, and
+real `MemoryExtras.Registry Unit`, witnessing with zero hypotheses:
+1. nonzero detecting **writer** data race (`write = (idx 1, time 4) > 2`);
+2. nonzero detecting **multi-reader (`extraReaders`)** data race (`read = [0, 2, 3]`, thread 2 `3 > 1`);
+3. synchronized **clean live → dead** transition (`findLive? = none`, `findDead? = some ⟨4, 0⟩`, `findRace? = none`);
+4. **ZST race-check skip** (0-byte allocation succeeds even with the racing writer clock);
+5. **`nonzeroOffset`** (`offset = 2`), **`useAfterFree`**, **`globalErr`** (`.static`),
+   **`immutableAllocation`** (detached from live), **`memoryKindMismatch`** (detached from live),
+   **`layoutMismatch`**, **`missingVectorClockExtra`**, and **`raceDetecting = false`** (`ongoingActionDataRaceFree = true`). -/
+theorem allocationMachine_deallocate_detectingRace_and_branches_canary :
+    let id1 : Miri.Memory.AllocId := ⟨1, by decide⟩
+    let id2 : Miri.Memory.AllocId := ⟨2, by decide⟩
+    let id3 : Miri.Memory.AllocId := ⟨3, by decide⟩
+    let id4 : Miri.Memory.AllocId := ⟨4, by decide⟩
+    let id5 : Miri.Memory.AllocId := ⟨5, by decide⟩
+    let id6 : Miri.Memory.AllocId := ⟨6, by decide⟩
+    let id7 : Miri.Memory.AllocId := ⟨7, by decide⟩
+    let id8 : Miri.Memory.AllocId := ⟨8, by decide⟩
+    let tag1 : Miri.Memory.BorTag := ⟨1, by decide⟩
+    let emptyTree : Miri.TreeBorrows.BorrowTree := Miri.TreeBorrows.BorrowTree.new tag1 Miri.ABI.Size.ZERO
+    let vcWriteRace := canaryVcUniform 4 (by decide) (Miri.Concurrency.VectorIdx.ofU32 1 (by decide))
+      (canaryTs 4) .default
+    let vcMultiReadRace := canaryVcUniform 4 (by decide) (Miri.Concurrency.VectorIdx.ofU32 0 (by decide))
+      (canaryTs 1) (Miri.Concurrency.VClock.nonzero [canaryTs 0, canaryTs 2] (canaryTs 3) (by decide))
+    let vcSynced := canaryVcUniform 4 (by decide) (Miri.Concurrency.VectorIdx.ofU32 1 (by decide))
+      (canaryTs 2) (Miri.Concurrency.VClock.nonzero [canaryTs 0, canaryTs 1] (canaryTs 1) (by decide))
+    let globalDet : Miri.Concurrency.GlobalState :=
+      { Miri.Concurrency.GlobalState.initial true false with
+        multiThreaded := true
+        vectorClocks := [{ Miri.Concurrency.ThreadClockSet.default with clock := canaryActorClock }] }
+    let globalOff : Miri.Concurrency.GlobalState := globalDet.withDataRaceFreeAction true
+    ∃ aMut4 aZst aImm4,
+      Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance) #[1, 2, 3, 4] Miri.ABI.Align.ONE .Mut = .ok aMut4 ∧
+      Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance) #[] Miri.ABI.Align.ONE .Mut = .ok aZst ∧
+      Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance) #[9, 8, 7, 6] Miri.ABI.Align.ONE .Not = .ok aImm4 ∧
+      let mkSt := fun (g : Miri.Concurrency.GlobalState) =>
+        ({ stack := ⟨#[]⟩
+           machine := {
+             memory := { (Miri.Memory.MemoryState.empty :
+                 Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit).pushGlobal
+                 ⟨id7, .static, ⟨4⟩, Miri.ABI.Align.ONE, .Not, none⟩ with
+               nextAllocId := 9
+               live := #[(id1, ⟨.stack, aMut4.withExtra emptyTree⟩),
+                         (id2, ⟨.stack, aMut4.withExtra emptyTree⟩),
+                         (id3, ⟨.stack, aMut4.withExtra emptyTree⟩),
+                         (id4, ⟨.stack, aZst.withExtra emptyTree⟩),
+                         (id5, ⟨.stack, aImm4.withExtra emptyTree⟩),
+                         (id6, ⟨.stack, aMut4.withExtra emptyTree⟩)] }
+             borrowTracker := none
+             dataRace := some g
+             threads := Miri.Concurrency.ThreadManager.initial true
+             raceAllocations := #[(id1, vcWriteRace), (id2, vcMultiReadRace), (id3, vcSynced),
+                                  (id4, vcWriteRace), (id5, vcSynced)]
+             allocationSpans := #[]
+             user := ⟨#[(id1, ⟨none, #[]⟩), (id2, ⟨none, #[]⟩), (id3, ⟨none, #[]⟩),
+                        (id4, ⟨none, #[]⟩), (id5, ⟨none, #[]⟩), (id6, ⟨none, #[]⟩)]⟩ } } :
+          Miri.Interpreter.MachineHooks.State Unit (Miri.Interpreter.MemoryExtras.Registry Unit))
+      let ptr := fun (id : Miri.Memory.AllocId) (off : UInt64) =>
+        (⟨⟨off⟩, some (.concrete id tag1)⟩ : Miri.Memory.Pointer (Option Miri.Memory.Provenance))
+      let run := fun (g : Miri.Concurrency.GlobalState) (id : Miri.Memory.AllocId) (off : UInt64)
+          (lay : Option (Miri.ABI.Size × Miri.ABI.Align)) (k : Miri.Memory.MemoryKind Unit) =>
+        Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks (ptr id off) lay k (mkSt g)
+      -- (1) Detecting nonzero writer race:
+      (∃ msg st', run globalDet id1 0 none .stack = .error (.undefinedBehavior msg) st' ∧
+        (machineToKeyed canaryDeallocProj canaryRaceEntryOf st'.machine).findLive? (ofMiriAllocId id1) = none) ∧
+      -- (2) Detecting nonzero multi-reader (`extraReaders`) race:
+      (∃ msg st', run globalDet id2 0 none .stack = .error (.undefinedBehavior msg) st' ∧
+        (machineToKeyed canaryDeallocProj canaryRaceEntryOf st'.machine).findLive? (ofMiriAllocId id2) = none) ∧
+      -- (3) Synchronized clean live → dead transition:
+      (∃ st', run globalDet id3 0 (some (⟨4⟩, Miri.ABI.Align.ONE)) .stack = .ok () st' ∧
+        (machineToKeyed canaryDeallocProj canaryRaceEntryOf st'.machine).findLive? (ofMiriAllocId id3) = none ∧
+        (machineToKeyed canaryDeallocProj canaryRaceEntryOf st'.machine).findDead? (ofMiriAllocId id3) = some ⟨4, 0⟩ ∧
+        (machineToKeyed canaryDeallocProj canaryRaceEntryOf st'.machine).findRace? (ofMiriAllocId id3) = none) ∧
+      -- (4) ZST skips detecting data-race check:
+      (∃ st', run globalDet id4 0 (some (⟨0⟩, Miri.ABI.Align.ONE)) .stack = .ok () st') ∧
+      -- (5) `nonzeroOffset`:
+      (∃ op st', run globalDet id3 2 none .stack =
+        .error (canaryDeallocHooks.error (.nonzeroAllocationOffset op id3 ⟨2⟩)) st') ∧
+      -- (6) `useAfterFree`:
+      (∃ st', run globalDet id8 0 none .stack =
+        .error (canaryDeallocHooks.error (.useAfterFree id8)) st') ∧
+      -- (7) `globalErr`:
+      (∃ st', run globalDet id7 0 none .stack =
+        .error (canaryDeallocHooks.error (.globalAllocationDeallocation id7 .static)) st') ∧
+      -- (8) `immutableAllocation` (detached from live):
+      (∃ st', run globalDet id5 0 none .stack =
+        .error (canaryDeallocHooks.error (.immutableAllocation id5)) st' ∧
+        (machineToKeyed canaryDeallocProj canaryRaceEntryOf st'.machine).findLive? (ofMiriAllocId id5) = none) ∧
+      -- (9) `memoryKindMismatch` (detached from live):
+      (∃ st', run globalDet id3 0 none (.machine ()) =
+        .error (canaryDeallocHooks.error (.memoryKindMismatch id3)) st' ∧
+        (machineToKeyed canaryDeallocProj canaryRaceEntryOf st'.machine).findLive? (ofMiriAllocId id3) = none) ∧
+      -- (10) `layoutMismatch`:
+      (∃ a1 a2 st', run globalDet id3 0 (some (⟨8⟩, Miri.ABI.Align.ONE)) .stack =
+        .error (canaryDeallocHooks.error (.layoutMismatch id3 ⟨4⟩ ⟨8⟩ a1 a2)) st' ∧
+        UInt8.ofNat a1.pow2 = 0 ∧ UInt8.ofNat a2.pow2 = 0) ∧
+      -- (11) `missingVectorClockExtra`:
+      (∃ msg st', run globalDet id6 0 none .stack = .error (.invalidProgram msg) st') ∧
+      -- (12) `raceDetecting = false` (`ongoingActionDataRaceFree = true`) skips detecting race on `id1`:
+      (∃ st', run globalOff id1 0 none .stack = .ok () st') := by
+  intro id1 id2 id3 id4 id5 id6 id7 id8 tag1 emptyTree vcWriteRace vcMultiReadRace vcSynced globalDet globalOff
+  have hok4 : (Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance) #[1, 2, 3, 4] Miri.ABI.Align.ONE .Mut).isOk = true := rfl
+  have hok0 : (Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance) #[] Miri.ABI.Align.ONE .Mut).isOk = true := rfl
+  have hokI : (Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance) #[9, 8, 7, 6] Miri.ABI.Align.ONE .Not).isOk = true := rfl
+  cases hfb4 : Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance) #[1, 2, 3, 4] Miri.ABI.Align.ONE .Mut with
+  | error e => rw [hfb4] at hok4; cases hok4
+  | ok aMut4 =>
+    cases hfb0 : Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance) #[] Miri.ABI.Align.ONE .Mut with
+    | error e => rw [hfb0] at hok0; cases hok0
+    | ok aZst =>
+      cases hfbI : Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance) #[9, 8, 7, 6] Miri.ABI.Align.ONE .Not with
+      | error e => rw [hfbI] at hokI; cases hokI
+      | ok aImm4 =>
+        rcases allocation_fromBytes_props _ _ _ aMut4 hfb4 with ⟨hsz4, hal4, hmut4, hnn4⟩
+        rcases allocation_fromBytes_props _ _ _ aZst hfb0 with ⟨hsz0, hal0, hmut0, hnn0⟩
+        rcases allocation_fromBytes_props _ _ _ aImm4 hfbI with ⟨hszI, halI, hmutI, hnnI⟩
+        have hlock := canaryDealloc_hlock aMut4 aZst aImm4 hsz4 hal4 hmut4 hnn4
+          hsz0 hal0 hmut0 hnn0 hszI halI hmutI hnnI
+        refine ⟨aMut4, aZst, aImm4, rfl, rfl, rfl, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+        · -- (1) Detecting nonzero writer race:
+          have h := hlock canaryGlobalDet id1 0 none none .stack .stack (.configured true)
+            (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
+          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id1) 0) none .stack
+              (.configured true) canaryDeallocActor .ok).outcome = .error (.hookFailure "DataRace") := rfl
+          have hkLive : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id1) 0) none .stack
+              (.configured true) canaryDeallocActor .ok).world.findLive? (ofMiriAllocId id1) = none := rfl
+          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
+              ⟨⟨0⟩, some (.concrete id1 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
+          | ok u st' =>
+            cases u; rw [hm] at h; rw [hkOut] at h
+            obtain ⟨_, hbad⟩ := deallocMachineOutcomeRel_dataRace_inv h.2; cases hbad
+          | error e st' =>
+            rw [hm] at h; rw [hkOut] at h
+            obtain ⟨msg, heq⟩ := deallocMachineOutcomeRel_dataRace_inv h.2
+            injection heq with he; subst he
+            exact ⟨msg, st', hm, by rw [h.1]; exact hkLive⟩
+        · -- (2) Detecting nonzero multi-reader (`extraReaders`) race:
+          have h := hlock canaryGlobalDet id2 0 none none .stack .stack (.configured true)
+            (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
+          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id2) 0) none .stack
+              (.configured true) canaryDeallocActor .ok).outcome = .error (.hookFailure "DataRace") := rfl
+          have hkLive : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id2) 0) none .stack
+              (.configured true) canaryDeallocActor .ok).world.findLive? (ofMiriAllocId id2) = none := rfl
+          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
+              ⟨⟨0⟩, some (.concrete id2 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
+          | ok u st' =>
+            cases u; rw [hm] at h; rw [hkOut] at h
+            obtain ⟨_, hbad⟩ := deallocMachineOutcomeRel_dataRace_inv h.2; cases hbad
+          | error e st' =>
+            rw [hm] at h; rw [hkOut] at h
+            obtain ⟨msg, heq⟩ := deallocMachineOutcomeRel_dataRace_inv h.2
+            injection heq with he; subst he
+            exact ⟨msg, st', hm, by rw [h.1]; exact hkLive⟩
+        · -- (3) Synchronized clean live → dead transition:
+          have h := hlock canaryGlobalDet id3 0 (some (⟨4⟩, Miri.ABI.Align.ONE)) (some (4, 0)) .stack .stack (.configured true)
+            (Or.inl rfl) (fun _ _ hx => by injection hx with hx; injection hx with _ hal; subst hal; decide) rfl rfl rfl
+          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 0) (some (4, 0)) .stack
+              (.configured true) canaryDeallocActor .ok).outcome = .ok () := rfl
+          have hkLive : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 0) (some (4, 0)) .stack
+              (.configured true) canaryDeallocActor .ok).world.findLive? (ofMiriAllocId id3) = none := rfl
+          have hkDead : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 0) (some (4, 0)) .stack
+              (.configured true) canaryDeallocActor .ok).world.findDead? (ofMiriAllocId id3) = some ⟨4, 0⟩ := rfl
+          have hkRace : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 0) (some (4, 0)) .stack
+              (.configured true) canaryDeallocActor .ok).world.findRace? (ofMiriAllocId id3) = none := rfl
+          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
+              ⟨⟨0⟩, some (.concrete id3 tag1)⟩ (some (⟨4⟩, Miri.ABI.Align.ONE)) .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
+          | error e st' => rw [hm] at h; rw [hkOut] at h; cases h.2
+          | ok u st' =>
+            cases u; rw [hm] at h; rw [hkOut] at h
+            exact ⟨st', hm, by rw [h.1]; exact hkLive, by rw [h.1]; exact hkDead, by rw [h.1]; exact hkRace⟩
+        · -- (4) ZST skips detecting race check:
+          have h := hlock canaryGlobalDet id4 0 (some (⟨0⟩, Miri.ABI.Align.ONE)) (some (0, 0)) .stack .stack (.configured true)
+            (Or.inl rfl) (fun _ _ hx => by injection hx with hx; injection hx with _ hal; subst hal; decide) rfl rfl rfl
+          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id4) 0) (some (0, 0)) .stack
+              (.configured true) canaryDeallocActor .ok).outcome = .ok () := rfl
+          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
+              ⟨⟨0⟩, some (.concrete id4 tag1)⟩ (some (⟨0⟩, Miri.ABI.Align.ONE)) .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
+          | error e st' => rw [hm] at h; rw [hkOut] at h; cases h.2
+          | ok u st' => cases u; exact ⟨st', hm⟩
+        · -- (5) `nonzeroOffset`:
+          have h := hlock canaryGlobalDet id3 2 none none .stack .stack (.configured true)
+            (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
+          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 2) none .stack
+              (.configured true) canaryDeallocActor .ok).outcome =
+              .error (.nonzeroOffset (ofMiriAllocId id3) 2) := rfl
+          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
+              ⟨⟨2⟩, some (.concrete id3 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
+          | ok u st' => cases u; rw [hm] at h; rw [hkOut] at h; cases h.2
+          | error e st' =>
+            rw [hm] at h; rw [hkOut] at h
+            obtain ⟨me, rfl, hmap⟩ := deallocMachineOutcomeRel_lifecycle_inv (fun _ hc => by cases hc) h.2
+            cases me with
+            | nonzeroAllocationOffset op mid moff =>
+              simp [deallocErrOfMiri] at hmap
+              rcases hmap with ⟨h1, h2⟩
+              have hid : mid = id3 := ofMiriAllocId_injective h1
+              have hoff : moff = ⟨2⟩ := by cases moff; simp at h2; subst h2; rfl
+              subst hid; subst hoff
+              exact ⟨op, st', hm⟩
+            | _ => simp [deallocErrOfMiri] at hmap
+        · -- (6) `useAfterFree`:
+          have h := hlock canaryGlobalDet id8 0 none none .stack .stack (.configured true)
+            (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
+          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id8) 0) none .stack
+              (.configured true) canaryDeallocActor .ok).outcome =
+              .error (.useAfterFree (ofMiriAllocId id8)) := rfl
+          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
+              ⟨⟨0⟩, some (.concrete id8 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
+          | ok u st' => cases u; rw [hm] at h; rw [hkOut] at h; cases h.2
+          | error e st' =>
+            rw [hm] at h; rw [hkOut] at h
+            obtain ⟨me, rfl, hmap⟩ := deallocMachineOutcomeRel_lifecycle_inv (fun _ hc => by cases hc) h.2
+            have hme : me = .useAfterFree id8 := by
+              cases me <;> simp [deallocErrOfMiri] at hmap
+              exact congrArg _ (ofMiriAllocId_injective hmap)
+            rw [hme] at hm; exact ⟨st', hm⟩
+        · -- (7) `globalErr`:
+          have h := hlock canaryGlobalDet id7 0 none none .stack .stack (.configured true)
+            (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
+          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id7) 0) none .stack
+              (.configured true) canaryDeallocActor .ok).outcome =
+              .error (.globalErr (ofMiriAllocId id7) .static) := rfl
+          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
+              ⟨⟨0⟩, some (.concrete id7 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
+          | ok u st' => cases u; rw [hm] at h; rw [hkOut] at h; cases h.2
+          | error e st' =>
+            rw [hm] at h; rw [hkOut] at h
+            obtain ⟨me, rfl, hmap⟩ := deallocMachineOutcomeRel_lifecycle_inv (fun _ hc => by cases hc) h.2
+            have hme : me = .globalAllocationDeallocation id7 .static := by
+              cases me <;> simp [deallocErrOfMiri] at hmap
+              rcases hmap with ⟨h1, h2⟩
+              have hid := ofMiriAllocId_injective h1
+              have hgk : ‹Miri.Memory.GlobalAllocationKind› = .static := by
+                cases ‹Miri.Memory.GlobalAllocationKind› <;> cases h2; rfl
+              subst hid; subst hgk; rfl
+            rw [hme] at hm; exact ⟨st', hm⟩
+        · -- (8) `immutableAllocation`:
+          have h := hlock canaryGlobalDet id5 0 none none .stack .stack (.configured true)
+            (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
+          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id5) 0) none .stack
+              (.configured true) canaryDeallocActor .ok).outcome =
+              .error (.immutableAllocation (ofMiriAllocId id5)) := rfl
+          have hkLive : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id5) 0) none .stack
+              (.configured true) canaryDeallocActor .ok).world.findLive? (ofMiriAllocId id5) = none := rfl
+          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
+              ⟨⟨0⟩, some (.concrete id5 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
+          | ok u st' => cases u; rw [hm] at h; rw [hkOut] at h; cases h.2
+          | error e st' =>
+            rw [hm] at h; rw [hkOut] at h
+            obtain ⟨me, rfl, hmap⟩ := deallocMachineOutcomeRel_lifecycle_inv (fun _ hc => by cases hc) h.2
+            have hme : me = .immutableAllocation id5 := by
+              cases me <;> simp [deallocErrOfMiri] at hmap
+              exact congrArg _ (ofMiriAllocId_injective hmap)
+            rw [hme] at hm; exact ⟨st', hm, by rw [h.1]; exact hkLive⟩
+        · -- (9) `memoryKindMismatch`:
+          have h := hlock canaryGlobalDet id3 0 none none (.machine ()) .heap (.configured true)
+            (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
+          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 0) none .heap
+              (.configured true) canaryDeallocActor .ok).outcome =
+              .error (.memoryKindMismatch (ofMiriAllocId id3)) := rfl
+          have hkLive : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 0) none .heap
+              (.configured true) canaryDeallocActor .ok).world.findLive? (ofMiriAllocId id3) = none := rfl
+          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
+              ⟨⟨0⟩, some (.concrete id3 tag1)⟩ none (.machine ()) (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
+          | ok u st' => cases u; rw [hm] at h; rw [hkOut] at h; cases h.2
+          | error e st' =>
+            rw [hm] at h; rw [hkOut] at h
+            obtain ⟨me, rfl, hmap⟩ := deallocMachineOutcomeRel_lifecycle_inv (fun _ hc => by cases hc) h.2
+            have hme : me = .memoryKindMismatch id3 := by
+              cases me <;> simp [deallocErrOfMiri] at hmap
+              exact congrArg _ (ofMiriAllocId_injective hmap)
+            rw [hme] at hm; exact ⟨st', hm, by rw [h.1]; exact hkLive⟩
+        · -- (10) `layoutMismatch`:
+          have h := hlock canaryGlobalDet id3 0 (some (⟨8⟩, Miri.ABI.Align.ONE)) (some (8, 0)) .stack .stack (.configured true)
+            (Or.inl rfl) (fun _ _ hx => by injection hx with hx; injection hx with _ hal; subst hal; decide) rfl rfl rfl
+          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 0) (some (8, 0)) .stack
+              (.configured true) canaryDeallocActor .ok).outcome =
+              .error (.layoutMismatch (ofMiriAllocId id3) 4 8 0 0) := rfl
+          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
+              ⟨⟨0⟩, some (.concrete id3 tag1)⟩ (some (⟨8⟩, Miri.ABI.Align.ONE)) .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
+          | ok u st' => cases u; rw [hm] at h; rw [hkOut] at h; cases h.2
+          | error e st' =>
+            rw [hm] at h; rw [hkOut] at h
+            obtain ⟨me, rfl, hmap⟩ := deallocMachineOutcomeRel_lifecycle_inv (fun _ hc => by cases hc) h.2
+            cases me with
+            | layoutMismatch mid asz rsz aal ral =>
+              simp [deallocErrOfMiri] at hmap
+              rcases hmap with ⟨h1, h2, h3, h4, h5⟩
+              have hid : mid = id3 := ofMiriAllocId_injective h1
+              have hasz : asz = ⟨4⟩ := by cases asz; simp at h2; subst h2; rfl
+              have hrsz : rsz = ⟨8⟩ := by cases rsz; simp at h3; subst h3; rfl
+              subst hid; subst hasz; subst hrsz
+              exact ⟨aal, ral, st', hm, h4, h5⟩
+            | _ => simp [deallocErrOfMiri] at hmap
+        · -- (11) `missingVectorClockExtra`:
+          have h := hlock canaryGlobalDet id6 0 none none .stack .stack (.configured true)
+            (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
+          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id6) 0) none .stack
+              (.configured true) canaryDeallocActor .ok).outcome =
+              .error (.hookFailure "MissingVectorClockExtra") := rfl
+          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
+              ⟨⟨0⟩, some (.concrete id6 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
+          | ok u st' =>
+            cases u; rw [hm] at h; rw [hkOut] at h
+            obtain ⟨_, hbad⟩ := deallocMachineOutcomeRel_missingClock_inv h.2; cases hbad
+          | error e st' =>
+            rw [hm] at h; rw [hkOut] at h
+            obtain ⟨msg, heq⟩ := deallocMachineOutcomeRel_missingClock_inv h.2
+            injection heq with he; subst he
+            exact ⟨msg, st', hm⟩
+        · -- (12) `raceDetecting = false`:
+          have h := hlock canaryGlobalOff id1 0 none none .stack .stack (.configured false)
+            (Or.inr rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
+          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id1) 0) none .stack
+              (.configured false) canaryDeallocActor .ok).outcome = .ok () := rfl
+          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
+              ⟨⟨0⟩, some (.concrete id1 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalOff) with
+          | error e st' => rw [hm] at h; rw [hkOut] at h; cases h.2
+          | ok u st' => cases u; exact ⟨st', hm⟩
+
 /-! ### 2E.3 Nested `childSession` (`recursive = true`) vtable precedence at full
 `ValidityVisitor.validatePlace` level (`lean-miri#75`, `#79`, `#82`) -/
 
@@ -17452,1050 +18429,11 @@ theorem annealRowProjection_byteRetention_canary :
         · intro heq; rw [heq, hfind2] at hfind1; cases hfind1
         · intro heq; rw [heq, hfindU] at hfind1; cases hfind1
 
-private def canaryMultiAllocFrame (prots : Array (Miri.Memory.AllocId × Miri.Memory.BorTag)) :
-    Miri.Interpreter.Frame Miri.Memory.Provenance Miri.Interpreter.LocalLayout
-      Miri.Interpreter.MachineHooks.FrameExtra where
-  body := { phase := .Built, argumentCount := 0, spreadArgument := none, locals := #[], basicBlocks := #[] }
-  bodyIdentity := .ofCanonicalIndex 0
-  functionInstance := { kind := .Item 0, args := #[] }
-  extra := { borrowTracker := some ⟨prots⟩, catchUnwind := none, userRelevance := 0, dataRace := none }
-  returnContinuation := .stop false
-  returnPlace := .frameLocal 0 0 none ⟨0, zstLayoutData⟩ (.ofAllocationToken 0)
-  localsIdentity := .ofAllocationToken 0
-  locals := #[]
-  vaList := #[]
-  trackCallerArg := none
-  location := .unwinding ⟨0⟩
+/-! ### Kernel-heavy canary ordering
 
-private def canaryMultiAllocTree1 : Miri.TreeBorrows.BorrowTree where
-  tagMapping := { mapping := #[(⟨1, by decide⟩, ⟨0⟩), (⟨2, by decide⟩, ⟨1⟩)], deassigned := #[] }
-  nodes :=
-    { data := #[
-        some { tag := ⟨1, by decide⟩, parent := none, children := #[⟨1⟩],
-               defaultInitialPermission := .Unique, defaultInitialSifa := .None, isExposed := false },
-        some { tag := ⟨2, by decide⟩, parent := some ⟨0⟩, children := #[],
-               defaultInitialPermission := .Unique, defaultInitialSifa := .None, isExposed := false }] }
-  locations := ⟨#[⟨⟨0, 4⟩,
-    { perms := { data := #[some ⟨.Unique, true, .None⟩, some ⟨.Unique, true, .None⟩] }
-      exposedCache := {} }⟩]⟩
-  roots := #[⟨0⟩]
-
-private def canaryMultiAllocTree2 (p3 : Miri.TreeBorrows.Permission) : Miri.TreeBorrows.BorrowTree where
-  tagMapping := { mapping := #[(⟨1, by decide⟩, ⟨0⟩), (⟨2, by decide⟩, ⟨1⟩), (⟨3, by decide⟩, ⟨2⟩)],
-                  deassigned := #[] }
-  nodes :=
-    { data := #[
-        some { tag := ⟨1, by decide⟩, parent := none, children := #[⟨1⟩, ⟨2⟩],
-               defaultInitialPermission := .Unique, defaultInitialSifa := .None, isExposed := false },
-        some { tag := ⟨2, by decide⟩, parent := some ⟨0⟩, children := #[],
-               defaultInitialPermission := .Frozen, defaultInitialSifa := .None, isExposed := false },
-        some { tag := ⟨3, by decide⟩, parent := some ⟨0⟩, children := #[],
-               defaultInitialPermission := p3, defaultInitialSifa := .None, isExposed := false }] }
-  locations := ⟨#[⟨⟨0, 4⟩,
-    { perms := { data := #[some ⟨.Unique, true, .None⟩, some ⟨.Frozen, true, .None⟩, some ⟨p3, true, .None⟩] }
-      exposedCache := {} }⟩]⟩
-  roots := #[⟨0⟩]
-
-private def canaryMultiAllocWorld1 : FnEntryBorrowWorld where
-  nodes := [
-    ⟨0, none, .unique, 0, 4, none, true⟩,
-    ⟨1, some 0, .unique, 0, 4, some 20, true⟩]
-  activeProtectors := [20]
-  nextTag := 2
-  nextProtector := 21
-
-private def canaryMultiAllocWorld2 (p3 : TreeBorrowPerm) : FnEntryBorrowWorld where
-  nodes := [
-    ⟨0, none, .unique, 0, 4, none, true⟩,
-    ⟨1, some 0, .frozen, 0, 4, some 10, true⟩,
-    ⟨2, some 0, p3, 0, 4, some 30, true⟩]
-  activeProtectors := [10, 30]
-  nextTag := 3
-  nextProtector := 31
-
-/-- **Closed real implicit-access, multi-allocation `beforeStackPopWithEnsure` ↔ `execFrameExitMiri`
-canary (`lean-miri#74` + `charon#1619`)**:
-exercises a real 2-allocation frame pop `[(id1, t2), (id2, t3)]` where `id1` performs a real
-implicit **Write** (`Unique`) and `id2` performs either:
-1. a real implicit **Read** (`ReservedFrz false`) preserving outer-protected sibling `2 : Frozen`
-   — succeeding on BOTH `MachineHooks.beforeStackPopWithEnsure` and `multiAllocEndAccesses`,
-   updating `tracker.global` via `endCall`, maintaining `BorrowTreeWorldRel`, and matching
-   per-allocation `execFrameExitMiri` on BOTH `id1` and `id2`; OR
-2. a conflicting implicit **Write** (`Unique`) against outer-protected sibling `2 : Frozen` on `id2`
-   — failing on BOTH sides and retaining `borrowTracker = some tracker`. -/
-theorem realAccess_releaseProtector_multiAlloc_frameExit_canary :
-    let id1 : Miri.Memory.AllocId := ⟨1, by decide⟩
-    let id2 : Miri.Memory.AllocId := ⟨2, by decide⟩
-    let t2 : Miri.Memory.BorTag := ⟨2, by decide⟩
-    let t3 : Miri.Memory.BorTag := ⟨3, by decide⟩
-    let pt : Miri.TreeBorrows.ProtectedTags := ⟨#[(t2, .StrongProtector), (t3, .StrongProtector)]⟩
-    let tracker : Miri.Interpreter.MachineHooks.BorrowState :=
-      { global := { nextPointerTag := ⟨4, by decide⟩, rootPointerTags := #[(id1, ⟨1, by decide⟩), (id2, ⟨1, by decide⟩)],
-                    protectedTags := pt, trackedPointerTags := #[] }
-        retagMode := .Default }
-    let mkSt := fun (p3 : Miri.TreeBorrows.Permission) =>
-      ({ stack := ⟨#[canaryMultiAllocFrame #[(id1, t2), (id2, t3)]]⟩
-         machine := {
-           memory := { (Miri.Memory.MemoryState.empty :
-               Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit) with
-             nextAllocId := 3
-             live := #[(id1, ⟨.stack, liveTreeAllocation canaryMultiAllocTree1⟩),
-                       (id2, ⟨.stack, liveTreeAllocation (canaryMultiAllocTree2 p3)⟩)] }
-           borrowTracker := some tracker
-           dataRace := none
-           threads := Miri.Concurrency.ThreadManager.initial true
-           raceAllocations := #[]
-           allocationSpans := #[]
-           user := () } } : Miri.Interpreter.MachineHooks.State Unit Unit)
-    let tagOf : Miri.Memory.BorTag → Nat := fun t => t.value.toNat - 1
-    let protOf : Miri.Memory.BorTag → Nat := fun t => if t == t2 then 20 else 30
-    let frameTag : Miri.Memory.AllocId → Miri.Memory.BorTag → Prop :=
-      fun id t => (id = id1 ∧ t = t2) ∨ (id = id2 ∧ t = t3)
-    let mkWorlds := fun (p3 : TreeBorrowPerm) (id : Miri.Memory.AllocId) =>
-      if id == id1 then some canaryMultiAllocWorld1
-      else if id == id2 then some (canaryMultiAllocWorld2 p3)
-      else none
-    -- (1) Multi-allocation real implicit Write (id1) + real implicit Read (id2) succeeds & matches `execFrameExitMiri`:
-    (∃ st' worlds',
-      Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ()) (mkSt (.ReservedFrz false)) =
-        .ok () st' ∧
-      multiAllocEndAccesses tagOf [(id1, t2), (id2, t3)] (mkWorlds (.reservedFrz false)) = .ok worlds' ∧
-      st'.machine.borrowTracker = some { tracker with global := tracker.global.endCall ⟨#[(id1, t2), (id2, t3)]⟩ } ∧
-      (∀ id w, mkWorlds (.reservedFrz false) id = some w →
-        ∃ entry' w',
-          worlds' id = some w' ∧
-          st'.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry') ∧
-          BorrowTreeWorldRel pt (frameTag id) tagOf entry'.allocation.extra w' ∧
-          execFrameExitMiri w
-            (([(id1, t2), (id2, t3)].filter fun p => p.1 == id).map fun p => (tagOf p.2, protOf p.2)) =
-            .ok (releaseProtectors w'
-              (([(id1, t2), (id2, t3)].filter fun p => p.1 == id).map fun p => protOf p.2)))) ∧
-    -- (2) Multi-allocation failure on `id2` (conflicting implicit Write) fails BOTH sides & retains `tracker`:
-    (∃ errM st' errT,
-      Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ()) (mkSt .Unique) =
-        .error errM st' ∧
-      multiAllocEndAccesses tagOf [(id1, t2), (id2, t3)] (mkWorlds .unique) = .error errT ∧
-      st'.machine.borrowTracker = some tracker) := by
-  intro id1 id2 t2 t3 pt tracker mkSt tagOf protOf frameTag mkWorlds
-  have hrel1 : BorrowTreeWorldRel pt (frameTag id1) tagOf canaryMultiAllocTree1 canaryMultiAllocWorld1 := by
-    refine ⟨⟨0, 4⟩,
-      { perms := { data := #[some ⟨.Unique, true, .None⟩, some ⟨.Unique, true, .None⟩] }, exposedCache := {} },
-      0, 4, ?_⟩
-    refine ⟨?_, ?_, by decide, rfl, rfl, by decide, rfl, ?_, ?_⟩
-    · refine ⟨by simp [canaryMultiAllocWorld1], fun n hn => ?_⟩
-      simp only [canaryMultiAllocWorld1, List.mem_cons, List.not_mem_nil, or_false] at hn
-      rcases hn with rfl | rfl
-      · exact ⟨0, by simp [canaryMultiAllocWorld1], ReachesRoot.root _ rfl rfl⟩
-      · exact ⟨1, by simp [canaryMultiAllocWorld1], ReachesRoot.step 0 1 0 _ rfl rfl (ReachesRoot.root _ rfl rfl)⟩
-    · intro i n h; match i with
-      | 0 => injection h with h; subst h; rfl
-      | 1 => injection h with h; subst h; rfl
-      | _ + 2 => cases h
-    · intro i wn h; match i with
-      | 0 =>
-        injection h with h; subst h
-        exact ⟨_, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, Or.inl rfl, trivial⟩
-      | 1 =>
-        injection h with h; subst h
-        exact ⟨_, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, Or.inl rfl, trivial⟩
-      | _ + 2 => cases h
-    · intro tag htag
-      rcases htag with ⟨_, rfl⟩ | ⟨h12, _⟩
-      · exact ⟨1, by decide, rfl, rfl⟩
-      · exact absurd h12 (by decide)
-  have hrel2 : ∀ (p3 : TreeBorrowPerm),
-      BorrowTreeWorldRel pt (frameTag id2) tagOf
-        (canaryMultiAllocTree2 (annealPermToMiri p3)) (canaryMultiAllocWorld2 p3) := by
-    intro p3
-    refine ⟨⟨0, 4⟩,
-      { perms := { data := #[some ⟨.Unique, true, .None⟩, some ⟨.Frozen, true, .None⟩,
-                             some ⟨annealPermToMiri p3, true, .None⟩] }, exposedCache := {} },
-      0, 4, ?_⟩
-    refine ⟨?_, ?_, by simp [canaryMultiAllocWorld2], rfl, rfl, by decide, rfl, ?_, ?_⟩
-    · refine ⟨by simp [canaryMultiAllocWorld2], fun n hn => ?_⟩
-      simp only [canaryMultiAllocWorld2, List.mem_cons, List.not_mem_nil, or_false] at hn
-      rcases hn with rfl | rfl | rfl
-      · exact ⟨0, by simp [canaryMultiAllocWorld2], ReachesRoot.root _ rfl rfl⟩
-      · exact ⟨1, by simp [canaryMultiAllocWorld2], ReachesRoot.step 0 1 0 _ rfl rfl (ReachesRoot.root _ rfl rfl)⟩
-      · exact ⟨1, by simp [canaryMultiAllocWorld2], ReachesRoot.step 0 2 0 _ rfl rfl (ReachesRoot.root _ rfl rfl)⟩
-    · intro i n h; match i with
-      | 0 => injection h with h; subst h; rfl
-      | 1 => injection h with h; subst h; rfl
-      | 2 => injection h with h; subst h; rfl
-      | _ + 3 => cases h
-    · intro i wn h; match i with
-      | 0 =>
-        injection h with h; subst h
-        exact ⟨_, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, Or.inl rfl, trivial⟩
-      | 1 =>
-        injection h with h; subst h
-        exact ⟨_, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, Or.inl rfl, trivial⟩
-      | 2 =>
-        injection h with h; subst h
-        exact ⟨_, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, Or.inl rfl, trivial⟩
-      | _ + 3 => cases h
-    · intro tag htag
-      rcases htag with ⟨h21, _⟩ | ⟨_, rfl⟩
-      · exact absurd h21 (by decide)
-      · exact ⟨2, by simp [canaryMultiAllocWorld2], rfl, rfl⟩
-  have hsync : ∀ (p3 : TreeBorrowPerm) (id : Miri.Memory.AllocId) (w : FnEntryBorrowWorld),
-      mkWorlds p3 id = some w →
-      ∃ entry, (mkSt (annealPermToMiri p3)).machine.memory.live.find? (fun e => e.1 == id) = some (id, entry) ∧
-        BorrowTreeWorldRel pt (frameTag id) tagOf entry.allocation.extra w := by
-    intro p3 id w hw
-    dsimp only [mkWorlds] at hw
-    by_cases h1 : id == id1
-    · have hid : id = id1 := eq_of_beq h1; subst hid
-      simp only [beq_self_eq_true, ↓reduceIte, Option.some.injEq] at hw; subst hw
-      exact ⟨_, rfl, hrel1⟩
-    · by_cases h2 : id == id2
-      · have hid : id = id2 := eq_of_beq h2; subst hid
-        simp only [h1, Bool.false_eq_true, beq_self_eq_true, ↓reduceIte, Option.some.injEq] at hw; subst hw
-        exact ⟨_, rfl, hrel2 p3⟩
-      · simp only [h1, h2, Bool.false_eq_true, ↓reduceIte] at hw; cases hw
-  have hprots : ∀ p ∈ [(id1, t2), (id2, t3)], frameTag p.1 p.2 := by
-    intro p hp; simp only [List.mem_cons, List.not_mem_nil, or_false] at hp
-    rcases hp with rfl | rfl
-    · exact Or.inl ⟨rfl, rfl⟩
-    · exact Or.inr ⟨rfl, rfl⟩
-  have hdom : ∀ (p3 : TreeBorrowPerm) (p : Miri.Memory.AllocId × Miri.Memory.BorTag),
-      p ∈ [(id1, t2), (id2, t3)] → (mkWorlds p3 p.1).isSome = true := by
-    intro p3 p hp; simp only [List.mem_cons, List.not_mem_nil, or_false] at hp
-    rcases hp with rfl | rfl <;> rfl
-  constructor
-  · have hsim := miri_beforeStackPopWithEnsure_realAccess_multiAlloc_sim
-      (mkSt (.ReservedFrz false)) tracker (canaryMultiAllocFrame #[(id1, t2), (id2, t3)])
-      [(id1, t2), (id2, t3)] rfl rfl rfl frameTag tagOf protOf hprots
-      (mkWorlds (.reservedFrz false)) (hsync (.reservedFrz false)) (hdom (.reservedFrz false))
-    have hwOk : (multiAllocEndAccesses tagOf [(id1, t2), (id2, t3)] (mkWorlds (.reservedFrz false))).isOk = true := by
-      decide +kernel
-    cases hth : multiAllocEndAccesses tagOf [(id1, t2), (id2, t3)] (mkWorlds (.reservedFrz false)) with
-    | error e => rw [hth] at hwOk; cases hwOk
-    | ok worlds' =>
-      rw [hth] at hsim
-      cases hm : Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ())
-          (mkSt (.ReservedFrz false)) with
-      | error e st' => rw [hm] at hsim; cases hsim
-      | ok u st' =>
-        cases u; rw [hm] at hsim
-        exact ⟨st', worlds', rfl, rfl, hsim.1, hsim.2⟩
-  · have hsim := miri_beforeStackPopWithEnsure_realAccess_multiAlloc_sim
-      (mkSt .Unique) tracker (canaryMultiAllocFrame #[(id1, t2), (id2, t3)])
-      [(id1, t2), (id2, t3)] rfl rfl rfl frameTag tagOf protOf hprots
-      (mkWorlds .unique) (hsync .unique) (hdom .unique)
-    have hwErr : (multiAllocEndAccesses tagOf [(id1, t2), (id2, t3)] (mkWorlds .unique)).isOk = false := by
-      decide +kernel
-    cases hth : multiAllocEndAccesses tagOf [(id1, t2), (id2, t3)] (mkWorlds .unique) with
-    | ok worlds' => rw [hth] at hwErr; cases hwErr
-    | error errT =>
-      rw [hth] at hsim
-      cases hm : Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ()) (mkSt .Unique) with
-      | ok u st' => rw [hm] at hsim; cases hsim
-      | error errM st' =>
-        rw [hm] at hsim
-        exact ⟨errM, st', errT, rfl, rfl, hsim⟩
-
-/-- **Closed end-to-end `FnEntry` retag (`writableChildWrite` vs `rustcNoWritable`) + intra-call
-access + `releaseProtector` canary (`charon#1619` + `lean-miri#74`)**:
-instantiates `fnEntry_endToEnd_writableChildWrite_vs_rustcNoWritable` on a concrete 4-byte mutable
-stack allocation built via `Allocation.fromBytes #[1, 2, 3, 4] .ONE .Mut` with
-`fnEntryContrastInitTree 4`, witnessing all 4 operational contrast clauses with zero hypotheses. -/
-theorem fnEntry_writableChildWrite_vs_rustcNoWritable_endToEnd_canary :
-    ∃ alloc0,
-      Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance) #[1, 2, 3, 4] Miri.ABI.Align.ONE .Mut =
-        .ok alloc0 ∧
-      let id : Miri.Memory.AllocId := ⟨1, by decide⟩
-      let alloc := alloc0.withExtra (fnEntryContrastInitTree 4)
-      let sz : Miri.ABI.Size := Miri.ABI.Size.ofBytes 4
-      let tagOf : Miri.Memory.BorTag → Nat := fun t => t.value.toNat - 1
-      let w0 := fnEntryContrastInitWorld 4
-      -- (1) `RetagPolicy.create` exact mode separation:
-      (Miri.TreeBorrows.RetagPolicy.create ⟨true, true, true⟩ .Mutable .FnEntry ⟨true, false⟩ =
-          some ⟨.Unique, .Unique, .ReservedFrz false, some .StrongProtector⟩ ∧
-       Miri.TreeBorrows.RetagPolicy.create ⟨true, true, true⟩ .Mutable .FnEntry ⟨true, true⟩ =
-          some ⟨.ReservedFrz false, .ReservedFrz false, .ReservedFrz false, some .StrongProtector⟩) ∧
-      -- (2) `writableChildWrite` on outer-protected sibling `2 : Frozen` fails UB on BOTH sides:
-      ((match (Miri.TreeBorrows.RetagPipeline.retagPointerValue
-          (fnEntryContrastMachine id alloc (.stack : Miri.Memory.MemoryKind Unit) true)
-          (fnEntryContrastRequest id 4 false)).outcome with
-        | .error (.treeAccess _ (.AccessFailure _ (.TransitionError 1 (.ProtectedDisabled .Frozen)))) => true
-        | _ => false) = true ∧
-       (execFnEntryMutRetagPrunedSourceOrder (w0 true) 0 0 4 .writableChildWrite).isOk = false) ∧
-      -- (3) `writableChildWrite` on unprotected sibling disables sibling `2` + implicit Write on exit:
-      (let res := Miri.TreeBorrows.RetagPipeline.retagPointerValue
-          (fnEntryContrastMachine id alloc (.stack : Miri.Memory.MemoryKind Unit) false)
-          (fnEntryContrastRequest id 4 false);
-        res.outcome = .ok (some (.concrete id ⟨3, by decide⟩)) ∧
-        ∃ entry w1,
-          res.state.memory.live.find? (fun e => e.1 == id) = some (id, entry) ∧
-          execFnEntryMutRetagPrunedSourceOrder (w0 false) 0 0 4 .writableChildWrite = .ok (w1, 2) ∧
-          (entry.allocation.extra.performBorrowAccessRange (.concrete ⟨2, by decide⟩)
-            Miri.ABI.Size.ZERO sz .Read res.state.global.protectedTags .VisitChildrenOfAccessed).status =
-            .AccessFailure ⟨0, 4⟩ (.TransitionError 1 (.ChildAccessForbidden .Disabled)) ∧
-          (execWorldRangeRead w1 1 0 4).isOk = false ∧
-          (let intra := entry.allocation.extra.performBorrowAccessRange (.concrete ⟨3, by decide⟩)
-              Miri.ABI.Size.ZERO sz .Write res.state.global.protectedTags .VisitChildrenOfAccessed;
-            intra.status = .Completed ∧
-            (intra.tree.releaseProtector ⟨3, by decide⟩ res.state.global.protectedTags).status = .Released ∧
-            ∃ w2 w3, execWorldRangeWrite w1 2 0 4 = .ok w2 ∧
-              execFrameExitMiri w2 [(2, 20)] = .ok (releaseProtectors w3 [20]))) ∧
-      -- (4) `rustcNoWritable` preserves sibling `2 : Frozen` across BOTH retag AND `releaseProtector`
-      --     for BOTH `sibProtected = false` and `sibProtected = true`:
-      (∀ sibProtected : Bool,
-        let res := Miri.TreeBorrows.RetagPipeline.retagPointerValue
-          (fnEntryContrastMachine id alloc (.stack : Miri.Memory.MemoryKind Unit) sibProtected)
-          (fnEntryContrastRequest id 4 true);
-        res.outcome = .ok (some (.concrete id ⟨3, by decide⟩)) ∧
-        ∃ entry w1,
-          res.state.memory.live.find? (fun e => e.1 == id) = some (id, entry) ∧
-          execFnEntryMutRetagPrunedSourceOrder (w0 sibProtected) 0 0 4 .rustcNoWritable = .ok (w1, 2) ∧
-          (let sibRead := entry.allocation.extra.performBorrowAccessRange (.concrete ⟨2, by decide⟩)
-              Miri.ABI.Size.ZERO sz .Read res.state.global.protectedTags .VisitChildrenOfAccessed;
-            sibRead.status = .Completed ∧
-            let childRead := sibRead.tree.performBorrowAccessRange (.concrete ⟨3, by decide⟩)
-              Miri.ABI.Size.ZERO sz .Read res.state.global.protectedTags .VisitChildrenOfAccessed;
-            childRead.status = .Completed ∧
-            let rel := childRead.tree.releaseProtector ⟨3, by decide⟩ res.state.global.protectedTags;
-            rel.status = .Released ∧
-            (rel.tree.locations.entries[0]?.bind fun seg =>
-              (seg.data.perms.get ⟨1⟩).map (·.permission)) = some .Frozen ∧
-            ∃ w2 w3 w4,
-              execWorldRangeRead w1 1 0 4 = .ok w2 ∧
-              execWorldRangeRead w2 2 0 4 = .ok w3 ∧
-              execFrameExitMiri w3 [(2, 20)] = .ok (releaseProtectors w4 [20]) ∧
-              (findNode? w4.nodes 1).map (·.perm) = some .frozen ∧
-              ∃ w4Dense, BorrowTreeWorldRel res.state.global.protectedTags
-                (fun t => t = ⟨3, by decide⟩) tagOf rel.tree w4Dense)) := by
-  have hok : (Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance)
-      #[1, 2, 3, 4] Miri.ABI.Align.ONE .Mut).isOk = true := rfl
-  cases hfb : Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance)
-      #[1, 2, 3, 4] Miri.ABI.Align.ONE .Mut with
-  | error e => rw [hfb] at hok; cases hok
-  | ok alloc0 =>
-    have hmut0 : alloc0.mutability = .Mut := (allocation_fromBytes_props _ _ _ alloc0 hfb).2.2.1
-    have hmain := fnEntry_endToEnd_writableChildWrite_vs_rustcNoWritable
-      ⟨1, by decide⟩ (alloc0.withExtra (fnEntryContrastInitTree 4))
-      (.stack : Miri.Memory.MemoryKind Unit) 4 (by decide) (by decide) hmut0 rfl
-    rcases hmain with ⟨h1a, h1b, h2, h3, h4⟩
-    refine ⟨alloc0, rfl, ⟨h1a, h1b⟩, ?_, ?_, ?_⟩
-    · refine ⟨?_, by rw [h2.2]; rfl⟩
-      have h2a : (Miri.TreeBorrows.RetagPipeline.retagPointerValue
-          (fnEntryContrastMachine ⟨1, by decide⟩ (alloc0.withExtra (fnEntryContrastInitTree 4))
-            (.stack : Miri.Memory.MemoryKind Unit) true)
-          (fnEntryContrastRequest ⟨1, by decide⟩ 4 false)).outcome =
-          .error (.treeAccess ⟨0, 4⟩ (.AccessFailure ⟨0, 4⟩ (.TransitionError 1 (.ProtectedDisabled .Frozen)))) :=
-        h2.1
-      rw [h2a]; rfl
-    · rcases h3 with ⟨hout, _, entry, w1, _, hfind, hret, _, _, _, hdisM, hdisT, hintraSt, w2, _, hw2, _, _, _, hrelSt, w3, _, _, hfe, _, _, _⟩
-      exact ⟨hout, entry, w1, hfind, hret, hdisM, hdisT, hintraSt, hrelSt, w2, w3, hw2, hfe⟩
-    · intro sib
-      rcases h4 sib with ⟨hout, _, entry, w1, _, hfind, hret, _, _, _, hsibSt, w2, hw2, hchSt, w3, _, hw3, _, _, _, hrelSt, hfrzM, w4, w4D, _, hfe, hfrzT, _, _, hrelW⟩
-      exact ⟨hout, entry, w1, hfind, hret, hsibSt, hchSt, hrelSt, hfrzM, w2, w3, w4, hw2, hw3, hfe, hfrzT, w4D, hrelW⟩
-
-private def canaryTs (n : Nat) (h : 2 * n < 4294967296 := by decide) : Miri.Concurrency.VTimestamp :=
-  Miri.Concurrency.VTimestamp.ofPacked (2 * n) h
-
-private def canaryActorClock : Miri.Concurrency.VClock :=
-  Miri.Concurrency.VClock.nonzero [canaryTs 5, canaryTs 2] (canaryTs 1) (by decide)
-
-private def canaryDeallocActor : DeallocActor :=
-  DeallocActor.ofVClock 0 [(0, 5), (1, 2), (2, 1)]
-
-private def canaryRaceEntryOf (vc : Miri.Concurrency.VClockAlloc) : RaceClockEntry :=
-  let c := vc.allocRanges.initialCell
-  { writerThread := UInt32.ofNat c.write.1.toNat
-    writeTimestamp := UInt64.ofNat c.write.2.time
-    readerThread := 1
-    readTimestamp := UInt64.ofNat (c.read.asList.getD 1 Miri.Concurrency.VTimestamp.ZERO).time
-    extraReaders := [(2, UInt64.ofNat (c.read.asList.getD 2 Miri.Concurrency.VTimestamp.ZERO).time)] }
-
-private def canaryVcUniform (sz : Nat) (hsz : sz < 2 ^ 64)
-    (wIdx : Miri.Concurrency.VectorIdx) (wTs : Miri.Concurrency.VTimestamp)
-    (readClk : Miri.Concurrency.VClock) : Miri.Concurrency.VClockAlloc :=
-  { allocRanges := {
-      length := Miri.Concurrency.ByteSize.ofU64 sz hsz
-      initialCell := { write := (wIdx, wTs), writeType := .Write, read := readClk, atomicOps := none }
-      overrides := [] } }
-
-private def canaryDeallocProj : RowProjection Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit :=
-  ⟨fun _ => .heap, fun _ => [], fun _ => []⟩
-
-private def canaryDeallocHooks :
-    Miri.Interpreter.AllocationMachine.DeallocationHooks Unit (Miri.Interpreter.MemoryExtras.Registry Unit) Unit where
-  extras :=
-    { get := id
-      put := fun _ r => r
-      onAccess := fun _ _ => pure ()
-      weakError := fun _ => .invalidProgram "" }
-  resolvePointer := fun mem st ptr _ =>
-    match ptr.provenance with
-    | some (.concrete id tag) => ⟨mem, st, .ok (id, ptr.offset, .concrete tag)⟩
-    | _ => ⟨mem, st, .error ptr.offset.bytes⟩
-  diagnostic := fun _ => pure ()
-  currentSpan := pure ⟨0⟩
-  freeAllocId := fun _ _ _ _ => pure ()
-  retainDetached := fun _ m => m
-  nativeDrop := none
-  error := Miri.Interpreter.AllocationMachine.deallocationError
-
-private theorem canaryClockEntryRel_of_uniform
-    (wIdx : Miri.Concurrency.VectorIdx) (wTs : Miri.Concurrency.VTimestamp)
-    (readClk : Miri.Concurrency.VClock) (sz : Nat) (hsz : sz < 2 ^ 64)
-    (hwIdx : wIdx.toNat < 3) (hwTs : wTs.time < 2 ^ 64)
-    (hrLen : readClk.asList.length ≤ 3)
-    (hr0 : (readClk.asList.getD 0 Miri.Concurrency.VTimestamp.ZERO).time ≤ 5)
-    (hr1 : (readClk.asList.getD 1 Miri.Concurrency.VTimestamp.ZERO).time < 2 ^ 64)
-    (hr2 : (readClk.asList.getD 2 Miri.Concurrency.VTimestamp.ZERO).time < 2 ^ 64)
-    (hself : wIdx.toNat = 0 → wTs.time ≤ 5) :
-    ClockEntryRel canaryDeallocActor
-      { Miri.Concurrency.ThreadClockSet.default with clock := canaryActorClock }
-      (canaryVcUniform sz hsz wIdx wTs readClk).allocRanges.initialCell
-      (canaryRaceEntryOf (canaryVcUniform sz hsz wIdx wTs readClk)) := by
-  have hact0 : (canaryActorClock.asList.getD 0 Miri.Concurrency.VTimestamp.ZERO).time = 5 := by decide
-  have hact1 : (canaryActorClock.asList.getD 1 Miri.Concurrency.VTimestamp.ZERO).time = 2 := by decide
-  have hact2 : (canaryActorClock.asList.getD 2 Miri.Concurrency.VTimestamp.ZERO).time = 1 := by decide
-  have hidx0 : ∀ i : Miri.Concurrency.VectorIdx, i.toNat = 0 → (canaryActorClock.index i).time = 5 := by
-    intro i hi; unfold Miri.Concurrency.VClock.index; rw [hi]; decide +kernel
-  have hidx1 : ∀ i : Miri.Concurrency.VectorIdx, i.toNat = 1 → (canaryActorClock.index i).time = 2 := by
-    intro i hi; unfold Miri.Concurrency.VClock.index; rw [hi]; decide +kernel
-  have hidx2 : ∀ i : Miri.Concurrency.VectorIdx, i.toNat = 2 → (canaryActorClock.index i).time = 1 := by
-    intro i hi; unfold Miri.Concurrency.VClock.index; rw [hi]; decide +kernel
-  have hwtNat : (UInt64.ofNat wTs.time).toNat = wTs.time := by
-    rw [UInt64.toNat_ofNat', Nat.mod_eq_of_lt hwTs]
-  have hr1Nat : (UInt64.ofNat (readClk.asList.getD 1 Miri.Concurrency.VTimestamp.ZERO).time).toNat =
-      (readClk.asList.getD 1 Miri.Concurrency.VTimestamp.ZERO).time := by
-    rw [UInt64.toNat_ofNat', Nat.mod_eq_of_lt hr1]
-  have hr2Nat : (UInt64.ofNat (readClk.asList.getD 2 Miri.Concurrency.VTimestamp.ZERO).time).toNat =
-      (readClk.asList.getD 2 Miri.Concurrency.VTimestamp.ZERO).time := by
-    rw [UInt64.toNat_ofNat', Nat.mod_eq_of_lt hr2]
-  refine ⟨rfl, ?_, ?_, ?_, ?_⟩
-  · intro hs
-    dsimp only [canaryRaceEntryOf, canaryVcUniform, canaryDeallocActor] at hs ⊢
-    have h0 : wIdx.toNat = 0 := by
-      have := congrArg UInt32.toNat hs
-      simp only [UInt32.toNat_ofNat', Nat.mod_eq_of_lt (by omega : wIdx.toNat < 2 ^ 32)] at this
-      exact this
-    rw [hidx0 wIdx h0]
-    exact hself h0
-  · intro hne
-    dsimp only [canaryRaceEntryOf, canaryVcUniform, canaryDeallocActor] at hne ⊢
-    refine ⟨hwtNat.symm, ?_⟩
-    match hw : wIdx.toNat with
-    | 0 => exact absurd (by rw [hw]; rfl) hne
-    | 1 => rw [hidx1 wIdx hw]; rfl
-    | 2 => rw [hidx2 wIdx hw]; rfl
-    | _ + 3 => omega
-  · intro i hnz
-    dsimp only [canaryRaceEntryOf, canaryVcUniform, canaryDeallocActor]
-    match i with
-    | 0 => left; rw [hact0]; exact hr0
-    | 1 =>
-      right
-      refine ⟨1, UInt64.ofNat (readClk.asList.getD 1 Miri.Concurrency.VTimestamp.ZERO).time,
-        by simp, by decide, hr1Nat.symm, by rw [hact1]; rfl⟩
-    | 2 =>
-      right
-      refine ⟨2, UInt64.ofNat (readClk.asList.getD 2 Miri.Concurrency.VTimestamp.ZERO).time,
-        by simp, by decide, hr2Nat.symm, by rw [hact2]; rfl⟩
-    | k + 3 =>
-      have hnone : readClk.asList[k + 3]? = none := List.getElem?_eq_none (by omega)
-      have h0 : (readClk.asList.getD (k + 3) Miri.Concurrency.VTimestamp.ZERO).time = 0 := by
-        simp [List.getD_eq_getElem?_getD, hnone]; rfl
-      exact absurd h0 hnz
-  · intro rt rts hmem hne
-    dsimp only [canaryRaceEntryOf, canaryVcUniform, canaryDeallocActor] at hmem hne ⊢
-    simp only [List.mem_cons, List.not_mem_nil, or_false] at hmem
-    rcases hmem with h1 | h2
-    · injection h1 with hrt hrts; subst hrt; subst hrts
-      exact ⟨1, hr1Nat.symm, by rw [hact1]; rfl⟩
-    · injection h2 with hrt hrts; subst hrt; subst hrts
-      exact ⟨2, hr2Nat.symm, by rw [hact2]; rfl⟩
-
-private def canaryWriteRaceEntry : RaceClockEntry :=
-  { writerThread := 1, writeTimestamp := 4, readerThread := 1, readTimestamp := 0, extraReaders := [(2, 0)] }
-
-private def canaryMultiReadRaceEntry : RaceClockEntry :=
-  { writerThread := 0, writeTimestamp := 1, readerThread := 1, readTimestamp := 2, extraReaders := [(2, 3)] }
-
-private def canarySyncedEntry : RaceClockEntry :=
-  { writerThread := 1, writeTimestamp := 2, readerThread := 1, readTimestamp := 1, extraReaders := [(2, 1)] }
-
-private def canaryDeallocKw0 : KeyedAllocWorld :=
-  let baseKw : KeyedAllocWorld :=
-    KeyedAllocWorld.ofLinear
-      { nextAllocId := 9
-        issued := []
-        globals := [(⟨7, by decide⟩, ⟨.static, 4, 0, .not, []⟩)]
-        live := [(⟨1, by decide⟩, ⟨4, 0, .stack, .mut, []⟩),
-                 (⟨2, by decide⟩, ⟨4, 0, .stack, .mut, []⟩),
-                 (⟨3, by decide⟩, ⟨4, 0, .stack, .mut, []⟩),
-                 (⟨4, by decide⟩, ⟨0, 0, .stack, .mut, []⟩),
-                 (⟨5, by decide⟩, ⟨4, 0, .stack, .not, []⟩),
-                 (⟨6, by decide⟩, ⟨4, 0, .stack, .mut, []⟩)]
-        dead := [] }
-  { baseKw with
-    table := { baseKw.table with
-      race := ofLinearRows
-        [(⟨1, by decide⟩, canaryWriteRaceEntry),
-         (⟨2, by decide⟩, canaryMultiReadRaceEntry),
-         (⟨3, by decide⟩, canarySyncedEntry),
-         (⟨4, by decide⟩, canaryWriteRaceEntry),
-         (⟨5, by decide⟩, canarySyncedEntry)] } }
-
-private theorem array_qsort_empty {α : Type} (lt : α → α → Bool) : (#[] : Array α).qsort lt = #[] := by
-  simp [Array.qsort]
-
-private theorem onMemoryAccess_empty_entries {S T : Type}
-    (h : Miri.Concurrency.SyncObject.AccessHooks S T)
-    (id : Miri.Memory.AllocId) (start size : Miri.ABI.Size)
-    (kind : Miri.Concurrency.SyncObject.AccessKind) (s : S)
-    (hent : h.entries id s = .ok #[] s) :
-    Miri.Concurrency.SyncObject.onMemoryAccess h id start size kind s = .ok () s := by
-  unfold Miri.Concurrency.SyncObject.onMemoryAccess
-  simp only [bind, Bind.bind, pure, Pure.pure, EStateM.bind, EStateM.pure, hent,
-    array_qsort_empty, forIn]
-  rfl
-
-private theorem accessHooks_entries_empty {K User Payload : Type}
-    (h : Miri.Interpreter.MemoryExtras.Hooks K User Payload)
-    (id : Miri.Memory.AllocId)
-    (m : Miri.Interpreter.MemoryExtras.Machine K User)
-    (extra : Miri.Interpreter.MemoryExtras.AllocationExtra Payload)
-    (hlook : Miri.Interpreter.MemoryExtras.lookup h m id = .ok extra)
-    (hsync : extra.sync = #[]) :
-    (Miri.Interpreter.MemoryExtras.accessHooks h).entries id m = .ok #[] m := by
-  unfold Miri.Interpreter.MemoryExtras.accessHooks
-  simp only [bind, Bind.bind, pure, Pure.pure, EStateM.bind, EStateM.pure, get, getThe,
-    MonadStateOf.get, EStateM.get, hlook]
-  change (match (EStateM.Result.ok extra m : EStateM.Result Miri.Interpreter.StepError _ _) with
-    | .ok e s => EStateM.Result.ok (e.sync.map _) s
-    | .error err s => EStateM.Result.error err s) = .ok #[] m
-  simp [hsync]
-
-private def canaryVcWriteRace : Miri.Concurrency.VClockAlloc :=
-  canaryVcUniform 4 (by decide) (Miri.Concurrency.VectorIdx.ofU32 1 (by decide)) (canaryTs 4) .default
-
-private def canaryVcMultiReadRace : Miri.Concurrency.VClockAlloc :=
-  canaryVcUniform 4 (by decide) (Miri.Concurrency.VectorIdx.ofU32 0 (by decide))
-    (canaryTs 1) (Miri.Concurrency.VClock.nonzero [canaryTs 0, canaryTs 2] (canaryTs 3) (by decide))
-
-private def canaryVcSynced : Miri.Concurrency.VClockAlloc :=
-  canaryVcUniform 4 (by decide) (Miri.Concurrency.VectorIdx.ofU32 1 (by decide))
-    (canaryTs 2) (Miri.Concurrency.VClock.nonzero [canaryTs 0, canaryTs 1] (canaryTs 1) (by decide))
-
-private def canaryGlobalDet : Miri.Concurrency.GlobalState :=
-  { Miri.Concurrency.GlobalState.initial true false with
-    multiThreaded := true
-    vectorClocks := [{ Miri.Concurrency.ThreadClockSet.default with clock := canaryActorClock }] }
-
-private def canaryGlobalOff : Miri.Concurrency.GlobalState :=
-  canaryGlobalDet.withDataRaceFreeAction true
-
-private def canaryDeallocSt (aMut4 aZst aImm4 : Miri.Memory.Allocation Miri.Memory.Provenance)
-    (g : Miri.Concurrency.GlobalState) :
-    Miri.Interpreter.MachineHooks.State Unit (Miri.Interpreter.MemoryExtras.Registry Unit) :=
-  let id1 : Miri.Memory.AllocId := ⟨1, by decide⟩
-  let id2 : Miri.Memory.AllocId := ⟨2, by decide⟩
-  let id3 : Miri.Memory.AllocId := ⟨3, by decide⟩
-  let id4 : Miri.Memory.AllocId := ⟨4, by decide⟩
-  let id5 : Miri.Memory.AllocId := ⟨5, by decide⟩
-  let id6 : Miri.Memory.AllocId := ⟨6, by decide⟩
-  let id7 : Miri.Memory.AllocId := ⟨7, by decide⟩
-  let emptyTree : Miri.TreeBorrows.BorrowTree := Miri.TreeBorrows.BorrowTree.new ⟨1, by decide⟩ Miri.ABI.Size.ZERO
-  { stack := ⟨#[]⟩
-    machine := {
-      memory := { (Miri.Memory.MemoryState.empty :
-          Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit).pushGlobal
-          ⟨id7, .static, ⟨4⟩, Miri.ABI.Align.ONE, .Not, none⟩ with
-        nextAllocId := 9
-        live := #[(id1, ⟨.stack, aMut4.withExtra emptyTree⟩),
-                  (id2, ⟨.stack, aMut4.withExtra emptyTree⟩),
-                  (id3, ⟨.stack, aMut4.withExtra emptyTree⟩),
-                  (id4, ⟨.stack, aZst.withExtra emptyTree⟩),
-                  (id5, ⟨.stack, aImm4.withExtra emptyTree⟩),
-                  (id6, ⟨.stack, aMut4.withExtra emptyTree⟩)] }
-      borrowTracker := none
-      dataRace := some g
-      threads := Miri.Concurrency.ThreadManager.initial true
-      raceAllocations := #[(id1, canaryVcWriteRace), (id2, canaryVcMultiReadRace), (id3, canaryVcSynced),
-                           (id4, canaryVcWriteRace), (id5, canaryVcSynced)]
-      allocationSpans := #[]
-      user := ⟨#[(id1, ⟨none, #[]⟩), (id2, ⟨none, #[]⟩), (id3, ⟨none, #[]⟩),
-                 (id4, ⟨none, #[]⟩), (id5, ⟨none, #[]⟩), (id6, ⟨none, #[]⟩)]⟩ } }
-
-private theorem canaryDealloc_hlock (aMut4 aZst aImm4 : Miri.Memory.Allocation Miri.Memory.Provenance)
-    (hsz4 : aMut4.byteSize = ⟨4⟩) (hal4 : aMut4.align = Miri.ABI.Align.ONE)
-    (hmut4 : aMut4.mutability = .Mut) (hnn4 : aMut4.nativeBuffer = none)
-    (hsz0 : aZst.byteSize = ⟨0⟩) (hal0 : aZst.align = Miri.ABI.Align.ONE)
-    (hmut0 : aZst.mutability = .Mut) (hnn0 : aZst.nativeBuffer = none)
-    (hszI : aImm4.byteSize = ⟨4⟩) (halI : aImm4.align = Miri.ABI.Align.ONE)
-    (hmutI : aImm4.mutability = .Not) (hnnI : aImm4.nativeBuffer = none)
-    (g : Miri.Concurrency.GlobalState) (id : Miri.Memory.AllocId) (off : UInt64)
-    (lay : Option (Miri.ABI.Size × Miri.ABI.Align)) (expLayout : Option (UInt64 × UInt8))
-    (k : Miri.Memory.MemoryKind Unit) (ek : AllocMemKind) (rm : RaceDetectorMode)
-    (hg : g = canaryGlobalDet ∨ g = canaryGlobalOff)
-    (halReq : ∀ sz al, lay = some (sz, al) → al.pow2 < 256)
-    (hexp : lay.map (fun p => (p.1.bytes, UInt8.ofNat p.2.pow2)) = expLayout)
-    (hek : memKindOfMiri canaryDeallocProj.machineKind k = ek)
-    (hrm : raceModeOfMachine (canaryDeallocSt aMut4 aZst aImm4 g).machine = rm) :
-    match Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
-        ⟨⟨off⟩, some (.concrete id ⟨1, by decide⟩)⟩ lay k (canaryDeallocSt aMut4 aZst aImm4 g) with
-    | .ok () st' =>
-      machineToKeyed canaryDeallocProj canaryRaceEntryOf st'.machine =
-        (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id) off) expLayout ek rm canaryDeallocActor .ok).world ∧
-      DeallocMachineOutcomeRel canaryDeallocHooks (.ok ())
-        (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id) off) expLayout ek rm canaryDeallocActor .ok).outcome
-    | .error e st' =>
-      machineToKeyed canaryDeallocProj canaryRaceEntryOf st'.machine =
-        (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id) off) expLayout ek rm canaryDeallocActor .ok).world ∧
-      DeallocMachineOutcomeRel canaryDeallocHooks (.error e)
-        (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id) off) expLayout ek rm canaryDeallocActor .ok).outcome := by
-  let emptyTree : Miri.TreeBorrows.BorrowTree := Miri.TreeBorrows.BorrowTree.new ⟨1, by decide⟩ Miri.ABI.Size.ZERO
-  have hrW : canaryRaceEntryOf canaryVcWriteRace = canaryWriteRaceEntry := by decide +kernel
-  have hrM : canaryRaceEntryOf canaryVcMultiReadRace = canaryMultiReadRaceEntry := by decide +kernel
-  have hrS : canaryRaceEntryOf canaryVcSynced = canarySyncedEntry := by decide +kernel
-  have hsz4' : (aMut4.withExtra emptyTree).byteSize = ⟨4⟩ := hsz4
-  have hal4' : (aMut4.withExtra emptyTree).align = Miri.ABI.Align.ONE := hal4
-  have hmut4' : (aMut4.withExtra emptyTree).mutability = .Mut := hmut4
-  have hsz0' : (aZst.withExtra emptyTree).byteSize = ⟨0⟩ := hsz0
-  have hal0' : (aZst.withExtra emptyTree).align = Miri.ABI.Align.ONE := hal0
-  have hmut0' : (aZst.withExtra emptyTree).mutability = .Mut := hmut0
-  have hszI' : (aImm4.withExtra emptyTree).byteSize = ⟨4⟩ := hszI
-  have halI' : (aImm4.withExtra emptyTree).align = Miri.ABI.Align.ONE := halI
-  have hmutI' : (aImm4.withExtra emptyTree).mutability = .Not := hmutI
-  have hkwEq : machineToKeyed canaryDeallocProj canaryRaceEntryOf (canaryDeallocSt aMut4 aZst aImm4 g).machine =
-      canaryDeallocKw0 := by
-    have hglob : (canaryDeallocSt aMut4 aZst aImm4 g).machine.memory.globals =
-        #[⟨⟨7, by decide⟩, .static, ⟨4⟩, Miri.ABI.Align.ONE, .Not, none⟩] := rfl
-    have hissued : (canaryDeallocSt aMut4 aZst aImm4 g).machine.memory.issuedIds = #[] := rfl
-    have hdead : (canaryDeallocSt aMut4 aZst aImm4 g).machine.memory.dead = #[] := rfl
-    have hexh : (canaryDeallocSt aMut4 aZst aImm4 g).machine.memory.idSupplyExhausted = false := rfl
-    unfold machineToKeyed memoryStateToKeyed memoryStateToLinear KeyedAllocWorld.ofLinear
-      MiriAllocRows.toLinear memoryStateToRows liveEntryOfMiri
-    rw [hglob, hissued, hdead, hexh]
-    simp only [canaryDeallocSt, canaryDeallocProj, List.map_cons, List.map_nil]
-    rw [hsz4', hal4', hmut4', hsz0', hal0', hmut0', hszI', halI', hmutI', hrW, hrM, hrS]
-    rfl
-  have h0 := allocationMachine_deallocate_eq_deallocateMachine canaryDeallocProj canaryRaceEntryOf
-    canaryDeallocHooks ⟨⟨off⟩, some (.concrete id ⟨1, by decide⟩)⟩ lay k (canaryDeallocSt aMut4 aZst aImm4 g)
-    (.provenanced (ofMiriAllocId id) off) canaryDeallocActor .ok (Or.inl rfl)
-    rfl rfl ⟨rfl, rfl⟩
-    (by
-      intro row hrow
-      simp only [canaryDeallocSt, List.mem_cons, List.not_mem_nil, or_false] at hrow
-      rcases hrow with rfl | rfl | rfl | rfl | rfl | rfl <;>
-        first | (show aMut4.align.pow2 < 256; rw [hal4]; decide)
-              | (show aZst.align.pow2 < 256; rw [hal0]; decide)
-              | (show aImm4.align.pow2 < 256; rw [halI]; decide))
-    halReq
-    (by
-      intro row hrow
-      simp only [canaryDeallocSt, List.mem_cons, List.not_mem_nil, or_false] at hrow
-      rcases hrow with rfl | rfl | rfl | rfl | rfl | rfl <;> (cases k <;> rfl))
-    (by
-      intro row hrow
-      simp only [canaryDeallocSt, List.mem_cons, List.not_mem_nil, or_false] at hrow
-      rcases hrow with rfl | rfl | rfl | rfl | rfl | rfl <;>
-        first | exact hnn4 | exact hnn0 | exact hnnI)
-    (by
-      intro g' hg' hdet
-      injection hg' with hEq; subst hEq
-      rcases hg with rfl | rfl
-      · refine ⟨Miri.Concurrency.VectorIdx.ofU32 0 (by decide),
-          { Miri.Concurrency.ThreadClockSet.default with clock := canaryActorClock }, rfl, ?_⟩
-        intro rid vc row hrf hlive hnz
-        have hmemR : (rid, vc) ∈ (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet).machine.raceAllocations.toList := by
-          rw [← Array.find?_toList] at hrf; exact List.mem_of_find?_eq_some hrf
-        have hmemL : (rid, row) ∈ (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet).machine.memory.live.toList := by
-          rw [← Array.find?_toList] at hlive; exact List.mem_of_find?_eq_some hlive
-        simp only [canaryDeallocSt, List.mem_cons, List.not_mem_nil, or_false] at hmemR hmemL
-        have hcellAt : ∀ (vc' : Miri.Concurrency.VClockAlloc) (k : Nat),
-            vc'.allocRanges.overrides = [] → k < vc'.allocRanges.length.bytes →
-            vc'.cellAt k = .ok vc'.allocRanges.initialCell := by
-          intro vc' k hov hk
-          unfold Miri.Concurrency.VClockAlloc.cellAt Miri.Concurrency.AllocationRanges.cellAt
-          simp only [hk, ↓reduceIte, hov]
-          rw [miri_etm_private% Miri.Concurrency.DataRace Miri.Concurrency.AllocationRanges.findOverride.eq_1]
-        rcases hmemL with hEqL | hEqL | hEqL | hEqL | hEqL | hEqL <;>
-          (injection hEqL with h1 h2; subst h1; subst h2)
-        · have hsz : (aMut4.withExtra emptyTree).byteSize.bytes = 4 := congrArg Miri.ABI.Size.bytes hsz4'
-          rcases hmemR with hR | hR | hR | hR | hR <;>
-            first | (injection hR with hR1 _; exact absurd hR1 (by decide))
-                  | (injection hR with _ hR2; subst hR2
-                     exact ⟨_, by rw [hsz]; decide, fun k hk => hcellAt _ k rfl (by rw [hsz] at hk; exact hk),
-                       canaryClockEntryRel_of_uniform _ _ _ _ _ (by decide) (by decide) (by decide)
-                         (by decide) (by decide) (by decide) (fun h => absurd h (by decide))⟩)
-        · have hsz : (aMut4.withExtra emptyTree).byteSize.bytes = 4 := congrArg Miri.ABI.Size.bytes hsz4'
-          rcases hmemR with hR | hR | hR | hR | hR <;>
-            first | (injection hR with hR1 _; exact absurd hR1 (by decide))
-                  | (injection hR with _ hR2; subst hR2
-                     exact ⟨_, by rw [hsz]; decide, fun k hk => hcellAt _ k rfl (by rw [hsz] at hk; exact hk),
-                       canaryClockEntryRel_of_uniform _ _ _ _ _ (by decide) (by decide) (by decide)
-                         (by decide) (by decide) (by decide) (fun _ => by decide)⟩)
-        · have hsz : (aMut4.withExtra emptyTree).byteSize.bytes = 4 := congrArg Miri.ABI.Size.bytes hsz4'
-          rcases hmemR with hR | hR | hR | hR | hR <;>
-            first | (injection hR with hR1 _; exact absurd hR1 (by decide))
-                  | (injection hR with _ hR2; subst hR2
-                     exact ⟨_, by rw [hsz]; decide, fun k hk => hcellAt _ k rfl (by rw [hsz] at hk; exact hk),
-                       canaryClockEntryRel_of_uniform _ _ _ _ _ (by decide) (by decide) (by decide)
-                         (by decide) (by decide) (by decide) (fun h => absurd h (by decide))⟩)
-        · exact absurd (congrArg Miri.ABI.Size.bytes hsz0') hnz
-        · have hsz : (aImm4.withExtra emptyTree).byteSize.bytes = 4 := congrArg Miri.ABI.Size.bytes hszI'
-          rcases hmemR with hR | hR | hR | hR | hR <;>
-            first | (injection hR with hR1 _; exact absurd hR1 (by decide))
-                  | (injection hR with _ hR2; subst hR2
-                     exact ⟨_, by rw [hsz]; decide, fun k hk => hcellAt _ k rfl (by rw [hsz] at hk; exact hk),
-                       canaryClockEntryRel_of_uniform _ _ _ _ _ (by decide) (by decide) (by decide)
-                         (by decide) (by decide) (by decide) (fun h => absurd h (by decide))⟩)
-        · rcases hmemR with hR | hR | hR | hR | hR <;>
-            (injection hR with hR1 _; exact absurd hR1 (by decide))
-      · exact absurd hdet (by decide))
-    (fun _ _ _ _ => rfl)
-    (fun m _ => ⟨m, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩)
-    (fun _ _ => ⟨rfl, rfl, rfl⟩)
-    (by
-      intro m rid row hlive hmUser
-      have hmemL : (rid, row) ∈ (canaryDeallocSt aMut4 aZst aImm4 g).machine.memory.live.toList := by
-        rw [← Array.find?_toList] at hlive; exact List.mem_of_find?_eq_some hlive
-      simp only [canaryDeallocSt, List.mem_cons, List.not_mem_nil, or_false] at hmemL
-      refine ⟨m, ?_, rfl, rfl⟩
-      unfold Miri.Interpreter.MemoryExtras.beforeDeallocationSync
-      refine onMemoryAccess_empty_entries _ rid Miri.ABI.Size.ZERO Miri.ABI.Size.ZERO .deallocation m ?_
-      refine accessHooks_entries_empty canaryDeallocHooks.extras rid m ⟨none, #[]⟩ ?_ rfl
-      unfold Miri.Interpreter.MemoryExtras.lookup
-      simp only [canaryDeallocHooks, id_eq, hmUser, canaryDeallocSt]
-      rcases hmemL with hEqL | hEqL | hEqL | hEqL | hEqL | hEqL <;>
-        (injection hEqL with h1 _; subst h1; rfl))
-    (fun m => ⟨⟨0⟩, m, rfl, rfl, rfl⟩)
-    (fun m _ _ _ _ => ⟨m, rfl, rfl, rfl⟩)
-  dsimp only at h0
-  rw [hkwEq, hexp, hek, hrm] at h0
-  cases hdec : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
-      ⟨⟨off⟩, some (.concrete id ⟨1, by decide⟩)⟩ lay k (canaryDeallocSt aMut4 aZst aImm4 g) with
-  | ok u st' => cases u; rw [hdec] at h0; exact h0
-  | error e st' => rw [hdec] at h0; exact h0
-
-/-- **Closed full `AllocationMachine.deallocate` detecting-race & all-branch canary (`lean-miri#73`)**:
-instantiates `allocationMachine_deallocate_eq_deallocateMachine` on a real vendored `GlobalState`
-(`multiThreaded := true`, concrete actor `VClock [5, 2, 1]`), real `VClockAlloc` vector clocks, and
-real `MemoryExtras.Registry Unit`, witnessing with zero hypotheses:
-1. nonzero detecting **writer** data race (`write = (idx 1, time 4) > 2`);
-2. nonzero detecting **multi-reader (`extraReaders`)** data race (`read = [0, 2, 3]`, thread 2 `3 > 1`);
-3. synchronized **clean live → dead** transition (`findLive? = none`, `findDead? = some ⟨4, 0⟩`, `findRace? = none`);
-4. **ZST race-check skip** (0-byte allocation succeeds even with the racing writer clock);
-5. **`nonzeroOffset`** (`offset = 2`), **`useAfterFree`**, **`globalErr`** (`.static`),
-   **`immutableAllocation`** (detached from live), **`memoryKindMismatch`** (detached from live),
-   **`layoutMismatch`**, **`missingVectorClockExtra`**, and **`raceDetecting = false`** (`ongoingActionDataRaceFree = true`). -/
-theorem allocationMachine_deallocate_detectingRace_and_branches_canary :
-    let id1 : Miri.Memory.AllocId := ⟨1, by decide⟩
-    let id2 : Miri.Memory.AllocId := ⟨2, by decide⟩
-    let id3 : Miri.Memory.AllocId := ⟨3, by decide⟩
-    let id4 : Miri.Memory.AllocId := ⟨4, by decide⟩
-    let id5 : Miri.Memory.AllocId := ⟨5, by decide⟩
-    let id6 : Miri.Memory.AllocId := ⟨6, by decide⟩
-    let id7 : Miri.Memory.AllocId := ⟨7, by decide⟩
-    let id8 : Miri.Memory.AllocId := ⟨8, by decide⟩
-    let tag1 : Miri.Memory.BorTag := ⟨1, by decide⟩
-    let emptyTree : Miri.TreeBorrows.BorrowTree := Miri.TreeBorrows.BorrowTree.new tag1 Miri.ABI.Size.ZERO
-    let vcWriteRace := canaryVcUniform 4 (by decide) (Miri.Concurrency.VectorIdx.ofU32 1 (by decide))
-      (canaryTs 4) .default
-    let vcMultiReadRace := canaryVcUniform 4 (by decide) (Miri.Concurrency.VectorIdx.ofU32 0 (by decide))
-      (canaryTs 1) (Miri.Concurrency.VClock.nonzero [canaryTs 0, canaryTs 2] (canaryTs 3) (by decide))
-    let vcSynced := canaryVcUniform 4 (by decide) (Miri.Concurrency.VectorIdx.ofU32 1 (by decide))
-      (canaryTs 2) (Miri.Concurrency.VClock.nonzero [canaryTs 0, canaryTs 1] (canaryTs 1) (by decide))
-    let globalDet : Miri.Concurrency.GlobalState :=
-      { Miri.Concurrency.GlobalState.initial true false with
-        multiThreaded := true
-        vectorClocks := [{ Miri.Concurrency.ThreadClockSet.default with clock := canaryActorClock }] }
-    let globalOff : Miri.Concurrency.GlobalState := globalDet.withDataRaceFreeAction true
-    ∃ aMut4 aZst aImm4,
-      Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance) #[1, 2, 3, 4] Miri.ABI.Align.ONE .Mut = .ok aMut4 ∧
-      Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance) #[] Miri.ABI.Align.ONE .Mut = .ok aZst ∧
-      Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance) #[9, 8, 7, 6] Miri.ABI.Align.ONE .Not = .ok aImm4 ∧
-      let mkSt := fun (g : Miri.Concurrency.GlobalState) =>
-        ({ stack := ⟨#[]⟩
-           machine := {
-             memory := { (Miri.Memory.MemoryState.empty :
-                 Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit).pushGlobal
-                 ⟨id7, .static, ⟨4⟩, Miri.ABI.Align.ONE, .Not, none⟩ with
-               nextAllocId := 9
-               live := #[(id1, ⟨.stack, aMut4.withExtra emptyTree⟩),
-                         (id2, ⟨.stack, aMut4.withExtra emptyTree⟩),
-                         (id3, ⟨.stack, aMut4.withExtra emptyTree⟩),
-                         (id4, ⟨.stack, aZst.withExtra emptyTree⟩),
-                         (id5, ⟨.stack, aImm4.withExtra emptyTree⟩),
-                         (id6, ⟨.stack, aMut4.withExtra emptyTree⟩)] }
-             borrowTracker := none
-             dataRace := some g
-             threads := Miri.Concurrency.ThreadManager.initial true
-             raceAllocations := #[(id1, vcWriteRace), (id2, vcMultiReadRace), (id3, vcSynced),
-                                  (id4, vcWriteRace), (id5, vcSynced)]
-             allocationSpans := #[]
-             user := ⟨#[(id1, ⟨none, #[]⟩), (id2, ⟨none, #[]⟩), (id3, ⟨none, #[]⟩),
-                        (id4, ⟨none, #[]⟩), (id5, ⟨none, #[]⟩), (id6, ⟨none, #[]⟩)]⟩ } } :
-          Miri.Interpreter.MachineHooks.State Unit (Miri.Interpreter.MemoryExtras.Registry Unit))
-      let ptr := fun (id : Miri.Memory.AllocId) (off : UInt64) =>
-        (⟨⟨off⟩, some (.concrete id tag1)⟩ : Miri.Memory.Pointer (Option Miri.Memory.Provenance))
-      let run := fun (g : Miri.Concurrency.GlobalState) (id : Miri.Memory.AllocId) (off : UInt64)
-          (lay : Option (Miri.ABI.Size × Miri.ABI.Align)) (k : Miri.Memory.MemoryKind Unit) =>
-        Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks (ptr id off) lay k (mkSt g)
-      -- (1) Detecting nonzero writer race:
-      (∃ msg st', run globalDet id1 0 none .stack = .error (.undefinedBehavior msg) st' ∧
-        (machineToKeyed canaryDeallocProj canaryRaceEntryOf st'.machine).findLive? (ofMiriAllocId id1) = none) ∧
-      -- (2) Detecting nonzero multi-reader (`extraReaders`) race:
-      (∃ msg st', run globalDet id2 0 none .stack = .error (.undefinedBehavior msg) st' ∧
-        (machineToKeyed canaryDeallocProj canaryRaceEntryOf st'.machine).findLive? (ofMiriAllocId id2) = none) ∧
-      -- (3) Synchronized clean live → dead transition:
-      (∃ st', run globalDet id3 0 (some (⟨4⟩, Miri.ABI.Align.ONE)) .stack = .ok () st' ∧
-        (machineToKeyed canaryDeallocProj canaryRaceEntryOf st'.machine).findLive? (ofMiriAllocId id3) = none ∧
-        (machineToKeyed canaryDeallocProj canaryRaceEntryOf st'.machine).findDead? (ofMiriAllocId id3) = some ⟨4, 0⟩ ∧
-        (machineToKeyed canaryDeallocProj canaryRaceEntryOf st'.machine).findRace? (ofMiriAllocId id3) = none) ∧
-      -- (4) ZST skips detecting data-race check:
-      (∃ st', run globalDet id4 0 (some (⟨0⟩, Miri.ABI.Align.ONE)) .stack = .ok () st') ∧
-      -- (5) `nonzeroOffset`:
-      (∃ op st', run globalDet id3 2 none .stack =
-        .error (canaryDeallocHooks.error (.nonzeroAllocationOffset op id3 ⟨2⟩)) st') ∧
-      -- (6) `useAfterFree`:
-      (∃ st', run globalDet id8 0 none .stack =
-        .error (canaryDeallocHooks.error (.useAfterFree id8)) st') ∧
-      -- (7) `globalErr`:
-      (∃ st', run globalDet id7 0 none .stack =
-        .error (canaryDeallocHooks.error (.globalAllocationDeallocation id7 .static)) st') ∧
-      -- (8) `immutableAllocation` (detached from live):
-      (∃ st', run globalDet id5 0 none .stack =
-        .error (canaryDeallocHooks.error (.immutableAllocation id5)) st' ∧
-        (machineToKeyed canaryDeallocProj canaryRaceEntryOf st'.machine).findLive? (ofMiriAllocId id5) = none) ∧
-      -- (9) `memoryKindMismatch` (detached from live):
-      (∃ st', run globalDet id3 0 none (.machine ()) =
-        .error (canaryDeallocHooks.error (.memoryKindMismatch id3)) st' ∧
-        (machineToKeyed canaryDeallocProj canaryRaceEntryOf st'.machine).findLive? (ofMiriAllocId id3) = none) ∧
-      -- (10) `layoutMismatch`:
-      (∃ a1 a2 st', run globalDet id3 0 (some (⟨8⟩, Miri.ABI.Align.ONE)) .stack =
-        .error (canaryDeallocHooks.error (.layoutMismatch id3 ⟨4⟩ ⟨8⟩ a1 a2)) st' ∧
-        UInt8.ofNat a1.pow2 = 0 ∧ UInt8.ofNat a2.pow2 = 0) ∧
-      -- (11) `missingVectorClockExtra`:
-      (∃ msg st', run globalDet id6 0 none .stack = .error (.invalidProgram msg) st') ∧
-      -- (12) `raceDetecting = false` (`ongoingActionDataRaceFree = true`) skips detecting race on `id1`:
-      (∃ st', run globalOff id1 0 none .stack = .ok () st') := by
-  intro id1 id2 id3 id4 id5 id6 id7 id8 tag1 emptyTree vcWriteRace vcMultiReadRace vcSynced globalDet globalOff
-  have hok4 : (Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance) #[1, 2, 3, 4] Miri.ABI.Align.ONE .Mut).isOk = true := rfl
-  have hok0 : (Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance) #[] Miri.ABI.Align.ONE .Mut).isOk = true := rfl
-  have hokI : (Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance) #[9, 8, 7, 6] Miri.ABI.Align.ONE .Not).isOk = true := rfl
-  cases hfb4 : Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance) #[1, 2, 3, 4] Miri.ABI.Align.ONE .Mut with
-  | error e => rw [hfb4] at hok4; cases hok4
-  | ok aMut4 =>
-    cases hfb0 : Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance) #[] Miri.ABI.Align.ONE .Mut with
-    | error e => rw [hfb0] at hok0; cases hok0
-    | ok aZst =>
-      cases hfbI : Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance) #[9, 8, 7, 6] Miri.ABI.Align.ONE .Not with
-      | error e => rw [hfbI] at hokI; cases hokI
-      | ok aImm4 =>
-        rcases allocation_fromBytes_props _ _ _ aMut4 hfb4 with ⟨hsz4, hal4, hmut4, hnn4⟩
-        rcases allocation_fromBytes_props _ _ _ aZst hfb0 with ⟨hsz0, hal0, hmut0, hnn0⟩
-        rcases allocation_fromBytes_props _ _ _ aImm4 hfbI with ⟨hszI, halI, hmutI, hnnI⟩
-        have hlock := canaryDealloc_hlock aMut4 aZst aImm4 hsz4 hal4 hmut4 hnn4
-          hsz0 hal0 hmut0 hnn0 hszI halI hmutI hnnI
-        refine ⟨aMut4, aZst, aImm4, rfl, rfl, rfl, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
-        · -- (1) Detecting nonzero writer race:
-          have h := hlock canaryGlobalDet id1 0 none none .stack .stack (.configured true)
-            (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id1) 0) none .stack
-              (.configured true) canaryDeallocActor .ok).outcome = .error (.hookFailure "DataRace") := rfl
-          have hkLive : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id1) 0) none .stack
-              (.configured true) canaryDeallocActor .ok).world.findLive? (ofMiriAllocId id1) = none := rfl
-          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
-              ⟨⟨0⟩, some (.concrete id1 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
-          | ok u st' =>
-            cases u; rw [hm] at h; rw [hkOut] at h
-            obtain ⟨_, hbad⟩ := deallocMachineOutcomeRel_dataRace_inv h.2; cases hbad
-          | error e st' =>
-            rw [hm] at h; rw [hkOut] at h
-            obtain ⟨msg, heq⟩ := deallocMachineOutcomeRel_dataRace_inv h.2
-            injection heq with he; subst he
-            exact ⟨msg, st', hm, by rw [h.1]; exact hkLive⟩
-        · -- (2) Detecting nonzero multi-reader (`extraReaders`) race:
-          have h := hlock canaryGlobalDet id2 0 none none .stack .stack (.configured true)
-            (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id2) 0) none .stack
-              (.configured true) canaryDeallocActor .ok).outcome = .error (.hookFailure "DataRace") := rfl
-          have hkLive : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id2) 0) none .stack
-              (.configured true) canaryDeallocActor .ok).world.findLive? (ofMiriAllocId id2) = none := rfl
-          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
-              ⟨⟨0⟩, some (.concrete id2 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
-          | ok u st' =>
-            cases u; rw [hm] at h; rw [hkOut] at h
-            obtain ⟨_, hbad⟩ := deallocMachineOutcomeRel_dataRace_inv h.2; cases hbad
-          | error e st' =>
-            rw [hm] at h; rw [hkOut] at h
-            obtain ⟨msg, heq⟩ := deallocMachineOutcomeRel_dataRace_inv h.2
-            injection heq with he; subst he
-            exact ⟨msg, st', hm, by rw [h.1]; exact hkLive⟩
-        · -- (3) Synchronized clean live → dead transition:
-          have h := hlock canaryGlobalDet id3 0 (some (⟨4⟩, Miri.ABI.Align.ONE)) (some (4, 0)) .stack .stack (.configured true)
-            (Or.inl rfl) (fun _ _ hx => by injection hx with hx; injection hx with _ hal; subst hal; decide) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 0) (some (4, 0)) .stack
-              (.configured true) canaryDeallocActor .ok).outcome = .ok () := rfl
-          have hkLive : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 0) (some (4, 0)) .stack
-              (.configured true) canaryDeallocActor .ok).world.findLive? (ofMiriAllocId id3) = none := rfl
-          have hkDead : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 0) (some (4, 0)) .stack
-              (.configured true) canaryDeallocActor .ok).world.findDead? (ofMiriAllocId id3) = some ⟨4, 0⟩ := rfl
-          have hkRace : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 0) (some (4, 0)) .stack
-              (.configured true) canaryDeallocActor .ok).world.findRace? (ofMiriAllocId id3) = none := rfl
-          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
-              ⟨⟨0⟩, some (.concrete id3 tag1)⟩ (some (⟨4⟩, Miri.ABI.Align.ONE)) .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
-          | error e st' => rw [hm] at h; rw [hkOut] at h; cases h.2
-          | ok u st' =>
-            cases u; rw [hm] at h; rw [hkOut] at h
-            exact ⟨st', hm, by rw [h.1]; exact hkLive, by rw [h.1]; exact hkDead, by rw [h.1]; exact hkRace⟩
-        · -- (4) ZST skips detecting race check:
-          have h := hlock canaryGlobalDet id4 0 (some (⟨0⟩, Miri.ABI.Align.ONE)) (some (0, 0)) .stack .stack (.configured true)
-            (Or.inl rfl) (fun _ _ hx => by injection hx with hx; injection hx with _ hal; subst hal; decide) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id4) 0) (some (0, 0)) .stack
-              (.configured true) canaryDeallocActor .ok).outcome = .ok () := rfl
-          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
-              ⟨⟨0⟩, some (.concrete id4 tag1)⟩ (some (⟨0⟩, Miri.ABI.Align.ONE)) .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
-          | error e st' => rw [hm] at h; rw [hkOut] at h; cases h.2
-          | ok u st' => cases u; exact ⟨st', hm⟩
-        · -- (5) `nonzeroOffset`:
-          have h := hlock canaryGlobalDet id3 2 none none .stack .stack (.configured true)
-            (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 2) none .stack
-              (.configured true) canaryDeallocActor .ok).outcome =
-              .error (.nonzeroOffset (ofMiriAllocId id3) 2) := rfl
-          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
-              ⟨⟨2⟩, some (.concrete id3 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
-          | ok u st' => cases u; rw [hm] at h; rw [hkOut] at h; cases h.2
-          | error e st' =>
-            rw [hm] at h; rw [hkOut] at h
-            obtain ⟨me, rfl, hmap⟩ := deallocMachineOutcomeRel_lifecycle_inv (fun _ hc => by cases hc) h.2
-            cases me with
-            | nonzeroAllocationOffset op mid moff =>
-              simp [deallocErrOfMiri] at hmap
-              rcases hmap with ⟨h1, h2⟩
-              have hid : mid = id3 := ofMiriAllocId_injective h1
-              have hoff : moff = ⟨2⟩ := by cases moff; simp at h2; subst h2; rfl
-              subst hid; subst hoff
-              exact ⟨op, st', hm⟩
-            | _ => simp [deallocErrOfMiri] at hmap
-        · -- (6) `useAfterFree`:
-          have h := hlock canaryGlobalDet id8 0 none none .stack .stack (.configured true)
-            (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id8) 0) none .stack
-              (.configured true) canaryDeallocActor .ok).outcome =
-              .error (.useAfterFree (ofMiriAllocId id8)) := rfl
-          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
-              ⟨⟨0⟩, some (.concrete id8 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
-          | ok u st' => cases u; rw [hm] at h; rw [hkOut] at h; cases h.2
-          | error e st' =>
-            rw [hm] at h; rw [hkOut] at h
-            obtain ⟨me, rfl, hmap⟩ := deallocMachineOutcomeRel_lifecycle_inv (fun _ hc => by cases hc) h.2
-            have hme : me = .useAfterFree id8 := by
-              cases me <;> simp [deallocErrOfMiri] at hmap
-              exact congrArg _ (ofMiriAllocId_injective hmap)
-            rw [hme] at hm; exact ⟨st', hm⟩
-        · -- (7) `globalErr`:
-          have h := hlock canaryGlobalDet id7 0 none none .stack .stack (.configured true)
-            (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id7) 0) none .stack
-              (.configured true) canaryDeallocActor .ok).outcome =
-              .error (.globalErr (ofMiriAllocId id7) .static) := rfl
-          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
-              ⟨⟨0⟩, some (.concrete id7 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
-          | ok u st' => cases u; rw [hm] at h; rw [hkOut] at h; cases h.2
-          | error e st' =>
-            rw [hm] at h; rw [hkOut] at h
-            obtain ⟨me, rfl, hmap⟩ := deallocMachineOutcomeRel_lifecycle_inv (fun _ hc => by cases hc) h.2
-            have hme : me = .globalAllocationDeallocation id7 .static := by
-              cases me <;> simp [deallocErrOfMiri] at hmap
-              rcases hmap with ⟨h1, h2⟩
-              have hid := ofMiriAllocId_injective h1
-              have hgk : ‹Miri.Memory.GlobalAllocationKind› = .static := by
-                cases ‹Miri.Memory.GlobalAllocationKind› <;> cases h2; rfl
-              subst hid; subst hgk; rfl
-            rw [hme] at hm; exact ⟨st', hm⟩
-        · -- (8) `immutableAllocation`:
-          have h := hlock canaryGlobalDet id5 0 none none .stack .stack (.configured true)
-            (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id5) 0) none .stack
-              (.configured true) canaryDeallocActor .ok).outcome =
-              .error (.immutableAllocation (ofMiriAllocId id5)) := rfl
-          have hkLive : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id5) 0) none .stack
-              (.configured true) canaryDeallocActor .ok).world.findLive? (ofMiriAllocId id5) = none := rfl
-          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
-              ⟨⟨0⟩, some (.concrete id5 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
-          | ok u st' => cases u; rw [hm] at h; rw [hkOut] at h; cases h.2
-          | error e st' =>
-            rw [hm] at h; rw [hkOut] at h
-            obtain ⟨me, rfl, hmap⟩ := deallocMachineOutcomeRel_lifecycle_inv (fun _ hc => by cases hc) h.2
-            have hme : me = .immutableAllocation id5 := by
-              cases me <;> simp [deallocErrOfMiri] at hmap
-              exact congrArg _ (ofMiriAllocId_injective hmap)
-            rw [hme] at hm; exact ⟨st', hm, by rw [h.1]; exact hkLive⟩
-        · -- (9) `memoryKindMismatch`:
-          have h := hlock canaryGlobalDet id3 0 none none (.machine ()) .heap (.configured true)
-            (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 0) none .heap
-              (.configured true) canaryDeallocActor .ok).outcome =
-              .error (.memoryKindMismatch (ofMiriAllocId id3)) := rfl
-          have hkLive : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 0) none .heap
-              (.configured true) canaryDeallocActor .ok).world.findLive? (ofMiriAllocId id3) = none := rfl
-          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
-              ⟨⟨0⟩, some (.concrete id3 tag1)⟩ none (.machine ()) (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
-          | ok u st' => cases u; rw [hm] at h; rw [hkOut] at h; cases h.2
-          | error e st' =>
-            rw [hm] at h; rw [hkOut] at h
-            obtain ⟨me, rfl, hmap⟩ := deallocMachineOutcomeRel_lifecycle_inv (fun _ hc => by cases hc) h.2
-            have hme : me = .memoryKindMismatch id3 := by
-              cases me <;> simp [deallocErrOfMiri] at hmap
-              exact congrArg _ (ofMiriAllocId_injective hmap)
-            rw [hme] at hm; exact ⟨st', hm, by rw [h.1]; exact hkLive⟩
-        · -- (10) `layoutMismatch`:
-          have h := hlock canaryGlobalDet id3 0 (some (⟨8⟩, Miri.ABI.Align.ONE)) (some (8, 0)) .stack .stack (.configured true)
-            (Or.inl rfl) (fun _ _ hx => by injection hx with hx; injection hx with _ hal; subst hal; decide) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id3) 0) (some (8, 0)) .stack
-              (.configured true) canaryDeallocActor .ok).outcome =
-              .error (.layoutMismatch (ofMiriAllocId id3) 4 8 0 0) := rfl
-          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
-              ⟨⟨0⟩, some (.concrete id3 tag1)⟩ (some (⟨8⟩, Miri.ABI.Align.ONE)) .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
-          | ok u st' => cases u; rw [hm] at h; rw [hkOut] at h; cases h.2
-          | error e st' =>
-            rw [hm] at h; rw [hkOut] at h
-            obtain ⟨me, rfl, hmap⟩ := deallocMachineOutcomeRel_lifecycle_inv (fun _ hc => by cases hc) h.2
-            cases me with
-            | layoutMismatch mid asz rsz aal ral =>
-              simp [deallocErrOfMiri] at hmap
-              rcases hmap with ⟨h1, h2, h3, h4, h5⟩
-              have hid : mid = id3 := ofMiriAllocId_injective h1
-              have hasz : asz = ⟨4⟩ := by cases asz; simp at h2; subst h2; rfl
-              have hrsz : rsz = ⟨8⟩ := by cases rsz; simp at h3; subst h3; rfl
-              subst hid; subst hasz; subst hrsz
-              exact ⟨aal, ral, st', hm, h4, h5⟩
-            | _ => simp [deallocErrOfMiri] at hmap
-        · -- (11) `missingVectorClockExtra`:
-          have h := hlock canaryGlobalDet id6 0 none none .stack .stack (.configured true)
-            (Or.inl rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id6) 0) none .stack
-              (.configured true) canaryDeallocActor .ok).outcome =
-              .error (.hookFailure "MissingVectorClockExtra") := rfl
-          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
-              ⟨⟨0⟩, some (.concrete id6 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalDet) with
-          | ok u st' =>
-            cases u; rw [hm] at h; rw [hkOut] at h
-            obtain ⟨_, hbad⟩ := deallocMachineOutcomeRel_missingClock_inv h.2; cases hbad
-          | error e st' =>
-            rw [hm] at h; rw [hkOut] at h
-            obtain ⟨msg, heq⟩ := deallocMachineOutcomeRel_missingClock_inv h.2
-            injection heq with he; subst he
-            exact ⟨msg, st', hm⟩
-        · -- (12) `raceDetecting = false`:
-          have h := hlock canaryGlobalOff id1 0 none none .stack .stack (.configured false)
-            (Or.inr rfl) (fun _ _ hx => by cases hx) rfl rfl rfl
-          have hkOut : (canaryDeallocKw0.deallocateMachine (.provenanced (ofMiriAllocId id1) 0) none .stack
-              (.configured false) canaryDeallocActor .ok).outcome = .ok () := rfl
-          cases hm : Miri.Interpreter.AllocationMachine.deallocate canaryDeallocHooks
-              ⟨⟨0⟩, some (.concrete id1 tag1)⟩ none .stack (canaryDeallocSt aMut4 aZst aImm4 canaryGlobalOff) with
-          | error e st' => rw [hm] at h; rw [hkOut] at h; cases h.2
-          | ok u st' => cases u; exact ⟨st', hm⟩
+Kernel checking runs in declaration order. The nested `validatePlace` canary exceeded the `lean -M`
+bound when its kernel check ran last in the module, so it is placed before the frame-exit and
+`FnEntry` canaries and is checked while less of the module is resident. -/
 
 private def canaryNestedWideRefLayout : Miri.Interpreter.LocalLayout :=
   ⟨1, { zstLayoutData with size := ⟨16⟩, align := ⟨Miri.ABI.Align.EIGHT⟩ }⟩
@@ -18564,6 +18502,9 @@ private def canaryNestedHooks
       else pure (.error ⟨Miri.ABI.Align.ONE, align⟩)
     fieldPath := fun _ _ idx _ => pure (.field (toString idx)) }
 
+-- Peak-RAM guard: elaborate and kernel-check this canary synchronously so its transient kernel
+-- memory does not overlap the asynchronous proof backlog.
+set_option Elab.async false in
 /-- **Closed nested `childSession` (`recursive = true`) `ValidityVisitor.validatePlace` canary
 (`lean-miri#75`, `#79`, `#82`)**, for EVERY `m : AnnealStepState`:
 1. Direct `&(&dyn Trait7)`: ALL 6 invalid vtable forms beat a null inner data pointer through
@@ -18751,6 +18692,496 @@ theorem nested_wideDyn_childSession_validatePlace_canary (m : AnnealStepState) :
   · exact hstructBad (ptrWord ⟨1, by decide⟩) 4
       ⟨⟨0⟩, some (.concrete ⟨1, by decide⟩ ⟨1, by decide⟩)⟩ (.provenanced ⟨1, by decide⟩ 0)
       (.invalidVTableTrait (canarySpecTable 2) (canarySpecTable 4)) (by decide) rfl rfl
+
+private def canaryMultiAllocFrame (prots : Array (Miri.Memory.AllocId × Miri.Memory.BorTag)) :
+    Miri.Interpreter.Frame Miri.Memory.Provenance Miri.Interpreter.LocalLayout
+      Miri.Interpreter.MachineHooks.FrameExtra where
+  body := { phase := .Built, argumentCount := 0, spreadArgument := none, locals := #[], basicBlocks := #[] }
+  bodyIdentity := .ofCanonicalIndex 0
+  functionInstance := { kind := .Item 0, args := #[] }
+  extra := { borrowTracker := some ⟨prots⟩, catchUnwind := none, userRelevance := 0, dataRace := none }
+  returnContinuation := .stop false
+  returnPlace := .frameLocal 0 0 none ⟨0, zstLayoutData⟩ (.ofAllocationToken 0)
+  localsIdentity := .ofAllocationToken 0
+  locals := #[]
+  vaList := #[]
+  trackCallerArg := none
+  location := .unwinding ⟨0⟩
+
+private def canaryMultiAllocTree1 : Miri.TreeBorrows.BorrowTree where
+  tagMapping := { mapping := #[(⟨1, by decide⟩, ⟨0⟩), (⟨2, by decide⟩, ⟨1⟩)], deassigned := #[] }
+  nodes :=
+    { data := #[
+        some { tag := ⟨1, by decide⟩, parent := none, children := #[⟨1⟩],
+               defaultInitialPermission := .Unique, defaultInitialSifa := .None, isExposed := false },
+        some { tag := ⟨2, by decide⟩, parent := some ⟨0⟩, children := #[],
+               defaultInitialPermission := .Unique, defaultInitialSifa := .None, isExposed := false }] }
+  locations := ⟨#[⟨⟨0, 4⟩,
+    { perms := { data := #[some ⟨.Unique, true, .None⟩, some ⟨.Unique, true, .None⟩] }
+      exposedCache := {} }⟩]⟩
+  roots := #[⟨0⟩]
+
+private def canaryMultiAllocTree2 (p3 : Miri.TreeBorrows.Permission) : Miri.TreeBorrows.BorrowTree where
+  tagMapping := { mapping := #[(⟨1, by decide⟩, ⟨0⟩), (⟨2, by decide⟩, ⟨1⟩), (⟨3, by decide⟩, ⟨2⟩)],
+                  deassigned := #[] }
+  nodes :=
+    { data := #[
+        some { tag := ⟨1, by decide⟩, parent := none, children := #[⟨1⟩, ⟨2⟩],
+               defaultInitialPermission := .Unique, defaultInitialSifa := .None, isExposed := false },
+        some { tag := ⟨2, by decide⟩, parent := some ⟨0⟩, children := #[],
+               defaultInitialPermission := .Frozen, defaultInitialSifa := .None, isExposed := false },
+        some { tag := ⟨3, by decide⟩, parent := some ⟨0⟩, children := #[],
+               defaultInitialPermission := p3, defaultInitialSifa := .None, isExposed := false }] }
+  locations := ⟨#[⟨⟨0, 4⟩,
+    { perms := { data := #[some ⟨.Unique, true, .None⟩, some ⟨.Frozen, true, .None⟩, some ⟨p3, true, .None⟩] }
+      exposedCache := {} }⟩]⟩
+  roots := #[⟨0⟩]
+
+private def canaryMultiAllocWorld1 : FnEntryBorrowWorld where
+  nodes := [
+    ⟨0, none, .unique, 0, 4, none, true⟩,
+    ⟨1, some 0, .unique, 0, 4, some 20, true⟩]
+  activeProtectors := [20]
+  nextTag := 2
+  nextProtector := 21
+
+private def canaryMultiAllocWorld2 (p3 : TreeBorrowPerm) : FnEntryBorrowWorld where
+  nodes := [
+    ⟨0, none, .unique, 0, 4, none, true⟩,
+    ⟨1, some 0, .frozen, 0, 4, some 10, true⟩,
+    ⟨2, some 0, p3, 0, 4, some 30, true⟩]
+  activeProtectors := [10, 30]
+  nextTag := 3
+  nextProtector := 31
+
+/-- Shared canary relation: the 3-node `[root: Unique, sibling 2: Frozen, node 3: p3]` tree and world
+are `BorrowTreeWorldRel`-related under protectors `{2, 3}` for any frame-tag set inside `{2, 3}`. -/
+private theorem canaryMultiAlloc_rel2 (p3 : TreeBorrowPerm) (frameTag : Miri.Memory.BorTag → Prop)
+    (hft : ∀ t, frameTag t → t = ⟨2, by decide⟩ ∨ t = ⟨3, by decide⟩) :
+    BorrowTreeWorldRel ⟨#[(⟨2, by decide⟩, .StrongProtector), (⟨3, by decide⟩, .StrongProtector)]⟩
+      frameTag (fun t => t.value.toNat - 1)
+      (canaryMultiAllocTree2 (annealPermToMiri p3)) (canaryMultiAllocWorld2 p3) := by
+  refine ⟨⟨0, 4⟩,
+    { perms := { data := #[some ⟨.Unique, true, .None⟩, some ⟨.Frozen, true, .None⟩,
+                           some ⟨annealPermToMiri p3, true, .None⟩] }, exposedCache := {} },
+    0, 4, ?_⟩
+  refine ⟨?_, ?_, by simp [canaryMultiAllocWorld2], rfl, rfl, by decide, rfl, ?_, ?_⟩
+  · refine ⟨by simp [canaryMultiAllocWorld2], fun n hn => ?_⟩
+    simp only [canaryMultiAllocWorld2, List.mem_cons, List.not_mem_nil, or_false] at hn
+    rcases hn with rfl | rfl | rfl
+    · exact ⟨0, by simp [canaryMultiAllocWorld2], ReachesRoot.root _ rfl rfl⟩
+    · exact ⟨1, by simp [canaryMultiAllocWorld2], ReachesRoot.step 0 1 0 _ rfl rfl (ReachesRoot.root _ rfl rfl)⟩
+    · exact ⟨1, by simp [canaryMultiAllocWorld2], ReachesRoot.step 0 2 0 _ rfl rfl (ReachesRoot.root _ rfl rfl)⟩
+  · intro i n h; match i with
+    | 0 => injection h with h; subst h; rfl
+    | 1 => injection h with h; subst h; rfl
+    | 2 => injection h with h; subst h; rfl
+    | _ + 3 => cases h
+  · intro i wn h; match i with
+    | 0 =>
+      injection h with h; subst h
+      exact ⟨_, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, Or.inl rfl, trivial⟩
+    | 1 =>
+      injection h with h; subst h
+      exact ⟨_, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, Or.inl rfl, trivial⟩
+    | 2 =>
+      injection h with h; subst h
+      exact ⟨_, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, Or.inl rfl, trivial⟩
+    | _ + 3 => cases h
+  · intro tag htag
+    rcases hft tag htag with rfl | rfl
+    · exact ⟨1, by simp [canaryMultiAllocWorld2], rfl, rfl⟩
+    · exact ⟨2, by simp [canaryMultiAllocWorld2], rfl, rfl⟩
+
+/-- **Closed real implicit-access, multi-allocation `beforeStackPopWithEnsure` ↔ `execFrameExitMiri`
+canary (`lean-miri#74` + `charon#1619`)**:
+exercises a real 2-allocation frame pop `[(id1, t2), (id2, t3)]` where `id1` performs a real
+implicit **Write** (`Unique`) and `id2` performs either:
+1. a real implicit **Read** (`ReservedFrz false`) preserving outer-protected sibling `2 : Frozen`
+   — succeeding on BOTH `MachineHooks.beforeStackPopWithEnsure` and `multiAllocEndAccesses`,
+   updating `tracker.global` via `endCall`, maintaining `BorrowTreeWorldRel`, and matching
+   per-allocation `execFrameExitMiri` on BOTH `id1` and `id2`; OR
+2. a conflicting implicit **Write** (`Unique`) against outer-protected sibling `2 : Frozen` on `id2`
+   — failing on BOTH sides and retaining `borrowTracker = some tracker`. -/
+theorem realAccess_releaseProtector_multiAlloc_frameExit_canary :
+    let id1 : Miri.Memory.AllocId := ⟨1, by decide⟩
+    let id2 : Miri.Memory.AllocId := ⟨2, by decide⟩
+    let t2 : Miri.Memory.BorTag := ⟨2, by decide⟩
+    let t3 : Miri.Memory.BorTag := ⟨3, by decide⟩
+    let pt : Miri.TreeBorrows.ProtectedTags := ⟨#[(t2, .StrongProtector), (t3, .StrongProtector)]⟩
+    let tracker : Miri.Interpreter.MachineHooks.BorrowState :=
+      { global := { nextPointerTag := ⟨4, by decide⟩, rootPointerTags := #[(id1, ⟨1, by decide⟩), (id2, ⟨1, by decide⟩)],
+                    protectedTags := pt, trackedPointerTags := #[] }
+        retagMode := .Default }
+    let mkSt := fun (p3 : Miri.TreeBorrows.Permission) =>
+      ({ stack := ⟨#[canaryMultiAllocFrame #[(id1, t2), (id2, t3)]]⟩
+         machine := {
+           memory := { (Miri.Memory.MemoryState.empty :
+               Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit) with
+             nextAllocId := 3
+             live := #[(id1, ⟨.stack, liveTreeAllocation canaryMultiAllocTree1⟩),
+                       (id2, ⟨.stack, liveTreeAllocation (canaryMultiAllocTree2 p3)⟩)] }
+           borrowTracker := some tracker
+           dataRace := none
+           threads := Miri.Concurrency.ThreadManager.initial true
+           raceAllocations := #[]
+           allocationSpans := #[]
+           user := () } } : Miri.Interpreter.MachineHooks.State Unit Unit)
+    let tagOf : Miri.Memory.BorTag → Nat := fun t => t.value.toNat - 1
+    let protOf : Miri.Memory.BorTag → Nat := fun t => if t == t2 then 20 else 30
+    let frameTag : Miri.Memory.AllocId → Miri.Memory.BorTag → Prop :=
+      fun id t => (id = id1 ∧ t = t2) ∨ (id = id2 ∧ t = t3)
+    let mkWorlds := fun (p3 : TreeBorrowPerm) (id : Miri.Memory.AllocId) =>
+      if id == id1 then some canaryMultiAllocWorld1
+      else if id == id2 then some (canaryMultiAllocWorld2 p3)
+      else none
+    -- (1) Multi-allocation real implicit Write (id1) + real implicit Read (id2) succeeds & matches `execFrameExitMiri`:
+    (∃ st' worlds',
+      Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ()) (mkSt (.ReservedFrz false)) =
+        .ok () st' ∧
+      multiAllocEndAccesses tagOf [(id1, t2), (id2, t3)] (mkWorlds (.reservedFrz false)) = .ok worlds' ∧
+      st'.machine.borrowTracker = some { tracker with global := tracker.global.endCall ⟨#[(id1, t2), (id2, t3)]⟩ } ∧
+      (∀ id w, mkWorlds (.reservedFrz false) id = some w →
+        ∃ entry' w',
+          worlds' id = some w' ∧
+          st'.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry') ∧
+          BorrowTreeWorldRel pt (frameTag id) tagOf entry'.allocation.extra w' ∧
+          execFrameExitMiri w
+            (([(id1, t2), (id2, t3)].filter fun p => p.1 == id).map fun p => (tagOf p.2, protOf p.2)) =
+            .ok (releaseProtectors w'
+              (([(id1, t2), (id2, t3)].filter fun p => p.1 == id).map fun p => protOf p.2)))) ∧
+    -- (2) Multi-allocation failure on `id2` (conflicting implicit Write) fails BOTH sides & retains `tracker`:
+    (∃ errM st' errT,
+      Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ()) (mkSt .Unique) =
+        .error errM st' ∧
+      multiAllocEndAccesses tagOf [(id1, t2), (id2, t3)] (mkWorlds .unique) = .error errT ∧
+      st'.machine.borrowTracker = some tracker) := by
+  intro id1 id2 t2 t3 pt tracker mkSt tagOf protOf frameTag mkWorlds
+  have hrel1 : BorrowTreeWorldRel pt (frameTag id1) tagOf canaryMultiAllocTree1 canaryMultiAllocWorld1 := by
+    refine ⟨⟨0, 4⟩,
+      { perms := { data := #[some ⟨.Unique, true, .None⟩, some ⟨.Unique, true, .None⟩] }, exposedCache := {} },
+      0, 4, ?_⟩
+    refine ⟨?_, ?_, by decide, rfl, rfl, by decide, rfl, ?_, ?_⟩
+    · refine ⟨by simp [canaryMultiAllocWorld1], fun n hn => ?_⟩
+      simp only [canaryMultiAllocWorld1, List.mem_cons, List.not_mem_nil, or_false] at hn
+      rcases hn with rfl | rfl
+      · exact ⟨0, by simp [canaryMultiAllocWorld1], ReachesRoot.root _ rfl rfl⟩
+      · exact ⟨1, by simp [canaryMultiAllocWorld1], ReachesRoot.step 0 1 0 _ rfl rfl (ReachesRoot.root _ rfl rfl)⟩
+    · intro i n h; match i with
+      | 0 => injection h with h; subst h; rfl
+      | 1 => injection h with h; subst h; rfl
+      | _ + 2 => cases h
+    · intro i wn h; match i with
+      | 0 =>
+        injection h with h; subst h
+        exact ⟨_, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, Or.inl rfl, trivial⟩
+      | 1 =>
+        injection h with h; subst h
+        exact ⟨_, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, Or.inl rfl, trivial⟩
+      | _ + 2 => cases h
+    · intro tag htag
+      rcases htag with ⟨_, rfl⟩ | ⟨h12, _⟩
+      · exact ⟨1, by decide, rfl, rfl⟩
+      · exact absurd h12 (by decide)
+  have hrel2 : ∀ (p3 : TreeBorrowPerm),
+      BorrowTreeWorldRel pt (frameTag id2) tagOf
+        (canaryMultiAllocTree2 (annealPermToMiri p3)) (canaryMultiAllocWorld2 p3) := fun p3 =>
+    canaryMultiAlloc_rel2 p3 (frameTag id2) (fun t ht => by
+      rcases ht with ⟨h21, _⟩ | ⟨_, rfl⟩
+      · exact absurd h21 (by decide)
+      · exact Or.inr rfl)
+  have hsync : ∀ (p3 : TreeBorrowPerm) (id : Miri.Memory.AllocId) (w : FnEntryBorrowWorld),
+      mkWorlds p3 id = some w →
+      ∃ entry, (mkSt (annealPermToMiri p3)).machine.memory.live.find? (fun e => e.1 == id) = some (id, entry) ∧
+        BorrowTreeWorldRel pt (frameTag id) tagOf entry.allocation.extra w := by
+    intro p3 id w hw
+    dsimp only [mkWorlds] at hw
+    by_cases h1 : id == id1
+    · have hid : id = id1 := eq_of_beq h1; subst hid
+      simp only [beq_self_eq_true, ↓reduceIte, Option.some.injEq] at hw; subst hw
+      exact ⟨_, rfl, hrel1⟩
+    · by_cases h2 : id == id2
+      · have hid : id = id2 := eq_of_beq h2; subst hid
+        simp only [h1, Bool.false_eq_true, beq_self_eq_true, ↓reduceIte, Option.some.injEq] at hw; subst hw
+        exact ⟨_, rfl, hrel2 p3⟩
+      · simp only [h1, h2, Bool.false_eq_true, ↓reduceIte] at hw; cases hw
+  have hprots : ∀ p ∈ [(id1, t2), (id2, t3)], frameTag p.1 p.2 := by
+    intro p hp; simp only [List.mem_cons, List.not_mem_nil, or_false] at hp
+    rcases hp with rfl | rfl
+    · exact Or.inl ⟨rfl, rfl⟩
+    · exact Or.inr ⟨rfl, rfl⟩
+  have hdom : ∀ (p3 : TreeBorrowPerm) (p : Miri.Memory.AllocId × Miri.Memory.BorTag),
+      p ∈ [(id1, t2), (id2, t3)] → (mkWorlds p3 p.1).isSome = true := by
+    intro p3 p hp; simp only [List.mem_cons, List.not_mem_nil, or_false] at hp
+    rcases hp with rfl | rfl <;> rfl
+  constructor
+  · have hsim := miri_beforeStackPopWithEnsure_realAccess_multiAlloc_sim
+      (mkSt (.ReservedFrz false)) tracker (canaryMultiAllocFrame #[(id1, t2), (id2, t3)])
+      [(id1, t2), (id2, t3)] rfl rfl rfl frameTag tagOf protOf hprots
+      (mkWorlds (.reservedFrz false)) (hsync (.reservedFrz false)) (hdom (.reservedFrz false))
+    have hwOk : (multiAllocEndAccesses tagOf [(id1, t2), (id2, t3)] (mkWorlds (.reservedFrz false))).isOk = true := by
+      decide +kernel
+    cases hth : multiAllocEndAccesses tagOf [(id1, t2), (id2, t3)] (mkWorlds (.reservedFrz false)) with
+    | error e => rw [hth] at hwOk; cases hwOk
+    | ok worlds' =>
+      rw [hth] at hsim
+      cases hm : Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ())
+          (mkSt (.ReservedFrz false)) with
+      | error e st' => rw [hm] at hsim; cases hsim
+      | ok u st' =>
+        cases u; rw [hm] at hsim
+        exact ⟨st', worlds', rfl, rfl, hsim.1, hsim.2⟩
+  · have hsim := miri_beforeStackPopWithEnsure_realAccess_multiAlloc_sim
+      (mkSt .Unique) tracker (canaryMultiAllocFrame #[(id1, t2), (id2, t3)])
+      [(id1, t2), (id2, t3)] rfl rfl rfl frameTag tagOf protOf hprots
+      (mkWorlds .unique) (hsync .unique) (hdom .unique)
+    have hwErr : (multiAllocEndAccesses tagOf [(id1, t2), (id2, t3)] (mkWorlds .unique)).isOk = false := by
+      decide +kernel
+    cases hth : multiAllocEndAccesses tagOf [(id1, t2), (id2, t3)] (mkWorlds .unique) with
+    | ok worlds' => rw [hth] at hwErr; cases hwErr
+    | error errT =>
+      rw [hth] at hsim
+      cases hm : Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ()) (mkSt .Unique) with
+      | ok u st' => rw [hm] at hsim; cases hsim
+      | error errM st' =>
+        rw [hm] at hsim
+        exact ⟨errM, st', errT, rfl, rfl, hsim⟩
+
+-- Peak-RAM guard: elaborate and kernel-check this canary synchronously so its transient kernel
+-- memory does not overlap the asynchronous proof backlog.
+set_option Elab.async false in
+/-- **Closed mid-sequence protector-end UB canary (partial mutations are retained)**: a real
+2-allocation frame pop `[(id1, t2), (id2, t3)]` with zero hypotheses. The release of `t2` in `id1`
+is a real implicit **Read** (`Frozen`, accessed) that flips the protected sibling `3` from
+`ReservedFrz false` to `ReservedFrz true`; the release of `t3` in `id2` is an implicit **Write**
+(`Unique`) against the protected `Frozen` sibling and is UB. The vendored
+`MachineHooks.beforeStackPopWithEnsure` fails, the prefix fold stops at exactly `(id2, t3)`,
+`borrowTracker` is untouched, AND the returned `MemoryState` still holds `id1`'s mutated tree
+(`ReservedFrz true`), whereas the initial tree held `ReservedFrz false`. -/
+theorem multiAlloc_frameExit_midSequenceUB_retains_partial_canary :
+    let id1 : Miri.Memory.AllocId := ⟨1, by decide⟩
+    let id2 : Miri.Memory.AllocId := ⟨2, by decide⟩
+    let t2 : Miri.Memory.BorTag := ⟨2, by decide⟩
+    let t3 : Miri.Memory.BorTag := ⟨3, by decide⟩
+    let pt : Miri.TreeBorrows.ProtectedTags := ⟨#[(t2, .StrongProtector), (t3, .StrongProtector)]⟩
+    let tracker : Miri.Interpreter.MachineHooks.BorrowState :=
+      { global := { nextPointerTag := ⟨4, by decide⟩, rootPointerTags := #[(id1, ⟨1, by decide⟩), (id2, ⟨1, by decide⟩)],
+                    protectedTags := pt, trackedPointerTags := #[] }
+        retagMode := .Default }
+    let st0 : Miri.Interpreter.MachineHooks.State Unit Unit :=
+      { stack := ⟨#[canaryMultiAllocFrame #[(id1, t2), (id2, t3)]]⟩
+        machine := {
+          memory := { (Miri.Memory.MemoryState.empty :
+              Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit) with
+            nextAllocId := 3
+            live := #[(id1, ⟨.stack, liveTreeAllocation (canaryMultiAllocTree2 (.ReservedFrz false))⟩),
+                      (id2, ⟨.stack, liveTreeAllocation (canaryMultiAllocTree2 .Unique)⟩)] }
+          borrowTracker := some tracker
+          dataRace := none
+          threads := Miri.Concurrency.ThreadManager.initial true
+          raceAllocations := #[]
+          allocationSpans := #[]
+          user := () } }
+    let tagOf : Miri.Memory.BorTag → Nat := fun t => t.value.toNat - 1
+    let worlds : Miri.Memory.AllocId → Option FnEntryBorrowWorld := fun id =>
+      if id == id1 then some (canaryMultiAllocWorld2 (.reservedFrz false))
+      else if id == id2 then some (canaryMultiAllocWorld2 .unique)
+      else none
+    ∃ err st' entry1,
+      Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ()) st0 = .error err st' ∧
+      st'.machine.borrowTracker = some tracker ∧
+      ((multiAllocEndAccessesPartial tagOf [(id1, t2), (id2, t3)] worlds).2.map
+        fun p => (p.1.value, p.2.value)) = some (2, 3) ∧
+      st'.machine.memory.live.find? (fun e => e.1 == id1) = some (id1, entry1) ∧
+      (∃ (range : Miri.DataStructures.ByteRange) (loc : Miri.TreeBorrows.LocationTree)
+          (s : Miri.TreeBorrows.Tree.LocationState),
+        entry1.allocation.extra.locations = ⟨#[⟨range, loc⟩]⟩ ∧
+        loc.perms.get ⟨2⟩ = some s ∧ s.permission = .ReservedFrz true) ∧
+      (∃ (loc0 : Miri.TreeBorrows.LocationTree) (s0 : Miri.TreeBorrows.Tree.LocationState),
+        (canaryMultiAllocTree2 (.ReservedFrz false)).locations = ⟨#[⟨⟨0, 4⟩, loc0⟩]⟩ ∧
+        loc0.perms.get ⟨2⟩ = some s0 ∧ s0.permission = .ReservedFrz false) := by
+  intro id1 id2 t2 t3 pt tracker st0 tagOf worlds
+  let frameTag : Miri.Memory.AllocId → Miri.Memory.BorTag → Prop :=
+    fun id t => (id = id1 ∧ t = t2) ∨ (id = id2 ∧ t = t3)
+  have hft : ∀ (id : Miri.Memory.AllocId) (t : Miri.Memory.BorTag),
+      frameTag id t → t = t2 ∨ t = t3 := by
+    intro id t h
+    rcases h with ⟨_, h⟩ | ⟨_, h⟩
+    · exact Or.inl h
+    · exact Or.inr h
+  have hsync : ∀ (id : Miri.Memory.AllocId) (w : FnEntryBorrowWorld), worlds id = some w →
+      ∃ entry, st0.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry) ∧
+        BorrowTreeWorldRel pt (frameTag id) tagOf entry.allocation.extra w := by
+    intro id w hw
+    dsimp only [worlds] at hw
+    by_cases h1 : id == id1
+    · have hid : id = id1 := eq_of_beq h1; subst hid
+      simp only [beq_self_eq_true, ↓reduceIte, Option.some.injEq] at hw; subst hw
+      exact ⟨_, rfl, canaryMultiAlloc_rel2 (.reservedFrz false) (frameTag id1) (hft id1)⟩
+    · by_cases h2 : id == id2
+      · have hid : id = id2 := eq_of_beq h2; subst hid
+        simp only [h1, Bool.false_eq_true, beq_self_eq_true, ↓reduceIte, Option.some.injEq] at hw; subst hw
+        exact ⟨_, rfl, canaryMultiAlloc_rel2 .unique (frameTag id2) (hft id2)⟩
+      · simp only [h1, h2, Bool.false_eq_true, ↓reduceIte] at hw; cases hw
+  have hprots : ∀ p ∈ [(id1, t2), (id2, t3)], frameTag p.1 p.2 := by
+    intro p hp; simp only [List.mem_cons, List.not_mem_nil, or_false] at hp
+    rcases hp with rfl | rfl
+    · exact Or.inl ⟨rfl, rfl⟩
+    · exact Or.inr ⟨rfl, rfl⟩
+  have hdom : ∀ p ∈ [(id1, t2), (id2, t3)], (worlds p.1).isSome = true := by
+    intro p hp; simp only [List.mem_cons, List.not_mem_nil, or_false] at hp
+    rcases hp with rfl | rfl <;> rfl
+  have hsim := miri_beforeStackPopWithEnsure_multiAlloc_partial_simulates
+    st0 tracker (canaryMultiAllocFrame #[(id1, t2), (id2, t3)])
+    [(id1, t2), (id2, t3)] rfl rfl rfl frameTag tagOf
+    (fun id => BorrowTreeWorldRel pt (frameTag id) tagOf)
+    (fun id => realAccessReleaseSim pt (frameTag id) tagOf)
+    hprots worlds hsync hdom
+  have hfail : ((multiAllocEndAccessesPartial tagOf [(id1, t2), (id2, t3)] worlds).2.map
+      fun p => (p.1.value, p.2.value)) = some (2, 3) := by
+    decide +kernel
+  have hperm : (((multiAllocEndAccessesPartial tagOf [(id1, t2), (id2, t3)] worlds).1 id1).bind
+      fun w => (findNode? w.nodes 2).map (·.perm)) = some (.reservedFrz true) := by
+    decide +kernel
+  generalize multiAllocEndAccessesPartial tagOf [(id1, t2), (id2, t3)] worlds = part
+    at hsim hfail hperm
+  obtain ⟨worlds', fail⟩ := part
+  cases fail with
+  | none => simp at hfail
+  | some f =>
+    obtain ⟨fid, ftag⟩ := f
+    cases hm : Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ()) st0 with
+    | ok u st' => cases u; rw [hm] at hsim; exact False.elim hsim
+    | error err st' =>
+      rw [hm] at hsim
+      obtain ⟨htr, hothers, _⟩ := hsim
+      have hne : id1 ≠ fid := by
+        intro h
+        have h1 : fid.value = 2 := congrArg Prod.fst (Option.some.inj hfail)
+        rw [← h] at h1
+        exact absurd h1 (by decide)
+      cases hw1 : worlds' id1 with
+      | none =>
+        have hnone : (none : Option TreeBorrowPerm) = some (.reservedFrz true) := by
+          have h := hperm
+          change ((worlds' id1).bind fun w => (findNode? w.nodes 2).map (·.perm)) = _ at h
+          rw [hw1] at h; exact h
+        cases hnone
+      | some w1 =>
+        obtain ⟨entry1, hfind1, hR1⟩ := hothers id1 w1 hne hw1
+        obtain ⟨range, loc, _, _, hAt⟩ := hR1
+        have hperm' : (w1.nodes[2]?).map (·.perm) = some (.reservedFrz true) := by
+          have h := hperm
+          change ((worlds' id1).bind fun w => (findNode? w.nodes 2).map (·.perm)) = _ at h
+          rw [hw1] at h
+          rw [← findNode?_eq_getElem?_of_denseTags hAt.hdense 2]; exact h
+        cases hn : w1.nodes[2]? with
+        | none => rw [hn] at hperm'; cases hperm'
+        | some wn =>
+          rw [hn] at hperm'
+          have hwnPerm : wn.perm = .reservedFrz true := Option.some.inj hperm'
+          obtain ⟨_, s, _, _, _, _, _, _, _, _, _, hlocGet, hpermEq, _⟩ := hAt.node_sync 2 wn hn
+          exact ⟨err, st', entry1, rfl, htr, hfail, hfind1,
+            ⟨range, loc, s, hAt.locs_eq, hlocGet,
+              hpermEq.trans (congrArg annealPermToMiri hwnPerm)⟩,
+            ⟨_, _, rfl, rfl, rfl⟩⟩
+
+/-- **Closed end-to-end `FnEntry` retag (`writableChildWrite` vs `rustcNoWritable`) + intra-call
+access + `releaseProtector` canary (`charon#1619` + `lean-miri#74`)**:
+instantiates `fnEntry_endToEnd_writableChildWrite_vs_rustcNoWritable` on a concrete 4-byte mutable
+stack allocation built via `Allocation.fromBytes #[1, 2, 3, 4] .ONE .Mut` with
+`fnEntryContrastInitTree 4`, witnessing all 4 operational contrast clauses with zero hypotheses. -/
+theorem fnEntry_writableChildWrite_vs_rustcNoWritable_endToEnd_canary :
+    ∃ alloc0,
+      Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance) #[1, 2, 3, 4] Miri.ABI.Align.ONE .Mut =
+        .ok alloc0 ∧
+      let id : Miri.Memory.AllocId := ⟨1, by decide⟩
+      let alloc := alloc0.withExtra (fnEntryContrastInitTree 4)
+      let sz : Miri.ABI.Size := Miri.ABI.Size.ofBytes 4
+      let tagOf : Miri.Memory.BorTag → Nat := fun t => t.value.toNat - 1
+      let w0 := fnEntryContrastInitWorld 4
+      -- (1) `RetagPolicy.create` exact mode separation:
+      (Miri.TreeBorrows.RetagPolicy.create ⟨true, true, true⟩ .Mutable .FnEntry ⟨true, false⟩ =
+          some ⟨.Unique, .Unique, .ReservedFrz false, some .StrongProtector⟩ ∧
+       Miri.TreeBorrows.RetagPolicy.create ⟨true, true, true⟩ .Mutable .FnEntry ⟨true, true⟩ =
+          some ⟨.ReservedFrz false, .ReservedFrz false, .ReservedFrz false, some .StrongProtector⟩) ∧
+      -- (2) `writableChildWrite` on outer-protected sibling `2 : Frozen` fails UB on BOTH sides:
+      ((match (Miri.TreeBorrows.RetagPipeline.retagPointerValue
+          (fnEntryContrastMachine id alloc (.stack : Miri.Memory.MemoryKind Unit) true)
+          (fnEntryContrastRequest id 4 false)).outcome with
+        | .error (.treeAccess _ (.AccessFailure _ (.TransitionError 1 (.ProtectedDisabled .Frozen)))) => true
+        | _ => false) = true ∧
+       (execFnEntryMutRetagPrunedSourceOrder (w0 true) 0 0 4 .writableChildWrite).isOk = false) ∧
+      -- (3) `writableChildWrite` on unprotected sibling disables sibling `2` + implicit Write on exit:
+      (let res := Miri.TreeBorrows.RetagPipeline.retagPointerValue
+          (fnEntryContrastMachine id alloc (.stack : Miri.Memory.MemoryKind Unit) false)
+          (fnEntryContrastRequest id 4 false);
+        res.outcome = .ok (some (.concrete id ⟨3, by decide⟩)) ∧
+        ∃ entry w1,
+          res.state.memory.live.find? (fun e => e.1 == id) = some (id, entry) ∧
+          execFnEntryMutRetagPrunedSourceOrder (w0 false) 0 0 4 .writableChildWrite = .ok (w1, 2) ∧
+          (entry.allocation.extra.performBorrowAccessRange (.concrete ⟨2, by decide⟩)
+            Miri.ABI.Size.ZERO sz .Read res.state.global.protectedTags .VisitChildrenOfAccessed).status =
+            .AccessFailure ⟨0, 4⟩ (.TransitionError 1 (.ChildAccessForbidden .Disabled)) ∧
+          (execWorldRangeRead w1 1 0 4).isOk = false ∧
+          (let intra := entry.allocation.extra.performBorrowAccessRange (.concrete ⟨3, by decide⟩)
+              Miri.ABI.Size.ZERO sz .Write res.state.global.protectedTags .VisitChildrenOfAccessed;
+            intra.status = .Completed ∧
+            (intra.tree.releaseProtector ⟨3, by decide⟩ res.state.global.protectedTags).status = .Released ∧
+            ∃ w2 w3, execWorldRangeWrite w1 2 0 4 = .ok w2 ∧
+              execFrameExitMiri w2 [(2, 20)] = .ok (releaseProtectors w3 [20]))) ∧
+      -- (4) `rustcNoWritable` preserves sibling `2 : Frozen` across BOTH retag AND `releaseProtector`
+      --     for BOTH `sibProtected = false` and `sibProtected = true`:
+      (∀ sibProtected : Bool,
+        let res := Miri.TreeBorrows.RetagPipeline.retagPointerValue
+          (fnEntryContrastMachine id alloc (.stack : Miri.Memory.MemoryKind Unit) sibProtected)
+          (fnEntryContrastRequest id 4 true);
+        res.outcome = .ok (some (.concrete id ⟨3, by decide⟩)) ∧
+        ∃ entry w1,
+          res.state.memory.live.find? (fun e => e.1 == id) = some (id, entry) ∧
+          execFnEntryMutRetagPrunedSourceOrder (w0 sibProtected) 0 0 4 .rustcNoWritable = .ok (w1, 2) ∧
+          (let sibRead := entry.allocation.extra.performBorrowAccessRange (.concrete ⟨2, by decide⟩)
+              Miri.ABI.Size.ZERO sz .Read res.state.global.protectedTags .VisitChildrenOfAccessed;
+            sibRead.status = .Completed ∧
+            let childRead := sibRead.tree.performBorrowAccessRange (.concrete ⟨3, by decide⟩)
+              Miri.ABI.Size.ZERO sz .Read res.state.global.protectedTags .VisitChildrenOfAccessed;
+            childRead.status = .Completed ∧
+            let rel := childRead.tree.releaseProtector ⟨3, by decide⟩ res.state.global.protectedTags;
+            rel.status = .Released ∧
+            (rel.tree.locations.entries[0]?.bind fun seg =>
+              (seg.data.perms.get ⟨1⟩).map (·.permission)) = some .Frozen ∧
+            ∃ w2 w3 w4,
+              execWorldRangeRead w1 1 0 4 = .ok w2 ∧
+              execWorldRangeRead w2 2 0 4 = .ok w3 ∧
+              execFrameExitMiri w3 [(2, 20)] = .ok (releaseProtectors w4 [20]) ∧
+              (findNode? w4.nodes 1).map (·.perm) = some .frozen ∧
+              ∃ w4Dense, BorrowTreeWorldRel res.state.global.protectedTags
+                (fun t => t = ⟨3, by decide⟩) tagOf rel.tree w4Dense)) := by
+  have hok : (Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance)
+      #[1, 2, 3, 4] Miri.ABI.Align.ONE .Mut).isOk = true := rfl
+  cases hfb : Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance)
+      #[1, 2, 3, 4] Miri.ABI.Align.ONE .Mut with
+  | error e => rw [hfb] at hok; cases hok
+  | ok alloc0 =>
+    have hmut0 : alloc0.mutability = .Mut := (allocation_fromBytes_props _ _ _ alloc0 hfb).2.2.1
+    have hmain := fnEntry_endToEnd_writableChildWrite_vs_rustcNoWritable
+      ⟨1, by decide⟩ (alloc0.withExtra (fnEntryContrastInitTree 4))
+      (.stack : Miri.Memory.MemoryKind Unit) 4 (by decide) (by decide) hmut0 rfl
+    rcases hmain with ⟨h1a, h1b, h2, h3, h4⟩
+    refine ⟨alloc0, rfl, ⟨h1a, h1b⟩, ?_, ?_, ?_⟩
+    · refine ⟨?_, by rw [h2.2]; rfl⟩
+      have h2a : (Miri.TreeBorrows.RetagPipeline.retagPointerValue
+          (fnEntryContrastMachine ⟨1, by decide⟩ (alloc0.withExtra (fnEntryContrastInitTree 4))
+            (.stack : Miri.Memory.MemoryKind Unit) true)
+          (fnEntryContrastRequest ⟨1, by decide⟩ 4 false)).outcome =
+          .error (.treeAccess ⟨0, 4⟩ (.AccessFailure ⟨0, 4⟩ (.TransitionError 1 (.ProtectedDisabled .Frozen)))) :=
+        h2.1
+      rw [h2a]; rfl
+    · rcases h3 with ⟨hout, _, entry, w1, _, hfind, hret, _, _, _, hdisM, hdisT, hintraSt, w2, _, hw2, _, _, _, hrelSt, w3, _, _, hfe, _, _, _⟩
+      exact ⟨hout, entry, w1, hfind, hret, hdisM, hdisT, hintraSt, hrelSt, w2, w3, hw2, hfe⟩
+    · intro sib
+      rcases h4 sib with ⟨hout, _, entry, w1, _, hfind, hret, _, _, _, hsibSt, w2, hw2, hchSt, w3, _, hw3, _, _, _, hrelSt, hfrzM, w4, w4D, _, hfe, hfrzT, _, _, hrelW⟩
+      exact ⟨hout, entry, w1, hfind, hret, hsibSt, hchSt, hrelSt, hfrzM, w2, w3, w4, hw2, hw3, hfe, hfrzT, w4D, hrelW⟩
 
 /-! ## Part 4. Axiom pins
 
@@ -19622,6 +20053,20 @@ depends on axioms: [propext, Quot.sound]
 #print axioms multiAllocEndAccesses_ok_perAlloc_eq
 
 /--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.multiAllocEndAccesses_eq_partial'
+depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms multiAllocEndAccesses_eq_partial
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.borrowTreeWorldRel_scope'
+depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms borrowTreeWorldRel_scope
+
+/--
 info: 'LeanMiriSpec.ExtTreeMapAllocLM.vclock_le_iff_forall_index'
 depends on axioms: [propext, Quot.sound]
 -/
@@ -19658,7 +20103,7 @@ depends on axioms: [propext, Quot.sound]
 
 /-! ### 4B. Vendored stateful bridge theorems (at most `propext`, `Classical.choice`, `Quot.sound`)
 
-The statements of these 86 theorems directly mention vendored `Miri.*` or
+The statements of these 89 theorems directly mention vendored `Miri.*` or
 `LeanMiriSpec.*` stateful definitions (`MemoryState`, `KeyedArray`,
 `AnnealMachine` / `annealResolvePtr`, `StateRelLM3_1` / `StateRelLM3_2`,
 `BorrowTree.releaseProtector`, `beforeStackPopWithEnsure`, `MachineHooks.MachineState`,
@@ -20249,6 +20694,27 @@ depends on axioms: [propext, Classical.choice, Quot.sound]
 #print axioms realAccess_releaseProtector_multiAlloc_frameExit_canary
 
 /--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.stackPopReleaseAll_multiAlloc_partial_simulates'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms stackPopReleaseAll_multiAlloc_partial_simulates
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.miri_beforeStackPopWithEnsure_multiAlloc_partial_simulates'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms miri_beforeStackPopWithEnsure_multiAlloc_partial_simulates
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.multiAlloc_frameExit_midSequenceUB_retains_partial_canary'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms multiAlloc_frameExit_midSequenceUB_retains_partial_canary
+
+/--
 info: 'LeanMiriSpec.ExtTreeMapAllocLM.fnEntry_writableChildWrite_vs_rustcNoWritable_endToEnd_canary'
 depends on axioms: [propext, Classical.choice, Quot.sound]
 -/
@@ -20271,10 +20737,10 @@ depends on axioms: [propext, Classical.choice, Quot.sound]
 
 /-! ### 4C. Origin of `Classical.choice` in vendored `Miri.*` / `LeanMiriSpec.*` constants
 
-These pins document why the 86 vendored-state bridge theorems in Part 4B inherit
+These pins document why the 89 vendored-state bridge theorems in Part 4B inherit
 `Classical.choice` solely from the types/definitions of vendored `Miri.*` and
 pre-existing `LeanMiriSpec.*` constants (`Std.HashMap` / `KeyedArray`), while
-all 126 choice-free theorems in Part 4A remain strictly free of `Classical.choice`. -/
+all 128 choice-free theorems in Part 4A remain strictly free of `Classical.choice`. -/
 
 /--
 info: 'Std.HashMap'
