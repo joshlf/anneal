@@ -267,6 +267,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Cache Cargo dependencies and build artifacts
         id: cargo_cache
@@ -552,6 +553,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Compile and test ExecSeal on aarch64
         run: |
           set -euo pipefail
