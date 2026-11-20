@@ -261,6 +261,14 @@ jobs:
           printf 'ANNEAL_TEST_SOURCE_REVISION=%s\n' "$revision" >> "$GITHUB_ENV"
           printf 'source_revision=%s\n' "$revision"
 
+      - name: Install bubblewrap for ExecSeal containment
+        id: bubblewrap
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Cache Cargo dependencies and build artifacts
         id: cargo_cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -532,6 +540,30 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  sandbox-aarch64:
+    runs-on: ubuntu-24.04-arm
+    name: ExecSeal aarch64 containment tests
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install bubblewrap
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Compile and test ExecSeal on aarch64
+        run: |
+          set -euo pipefail
+          cargo clippy --locked -p cargo-anneal --lib --test sandbox_escape -- -D warnings
+          cargo test --locked -p cargo-anneal --lib sandbox:: -- --test-threads=1
+          cargo test --locked -p cargo-anneal --test sandbox_escape -- --test-threads=1 \
+            sandbox_escape_vectors_blocked_in_tier1_and_tier2 \
+            wall_clock_timeout_kills_process_group_in_tier1_and_tier2 \
+            tier1_as_pid1_prevents_post_exit_out_writes
+
   # Used to signal to branch protections that all other jobs have succeeded.
   all-jobs-succeed:
       # WARNING: This name is load-bearing! It's how GitHub's settings UI configures which jobs
@@ -542,7 +574,7 @@ jobs:
       # success in branch protection, so this aggregation must fail closed.
       if: ${{ always() }}
       runs-on: ubuntu-latest
-      needs: [static-checks, build-exocrate, test-and-verify]
+      needs: [static-checks, build-exocrate, test-and-verify, sandbox-aarch64]
       steps:
         - name: Reject workflow cancellation
           if: ${{ cancelled() }}
