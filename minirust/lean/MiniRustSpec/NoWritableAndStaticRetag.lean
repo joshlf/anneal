@@ -168,21 +168,29 @@ mechanically generated MiniRust Tree Borrows specification (`MiniRustSpec.Gen`,
      boundary** (`tbm_retag_ptr_raw_and_pinned_noop`,
      `tbm_retag_ptr_ignores_alignment`, `tbm_retag_ptr_safe_dereferenceable_ub`,
      `tbm_retag_ptr_zst_safe_skips_dereferenceable`,
-     `checkPtrM_tb_safe_vs_raw_boundary`,
-     `evalStatementM_tb_validate_safe_vs_raw_boundary`: `TreeBorrowsMemory.retag_ptr`
-     itself enforces `BasicMemory.check_ptr` dereferenceability on every non-ZST
-     safe pointer including `#[rustc_no_writable]` `&mut T` and `&UnsafeCell<T>`
-     while ignoring alignment and treating `Raw` / pinned `!unpin` as no-ops;
-     for ZERO-SIZED safe pointers it checks NOTHING — given a parent path that
-     names a node, a retag into a dead allocation or far past its end succeeds
-     and still adds a child node (and, on function entry, a protector), and an
-     address below the allocation base stops with a spec panic rather than UB;
-     `Machine::check_ptr` inside `Statement::Validate`
-     enforces non-null, alignment, and inhabitedness for ALL safe pointers
-     including `#[rustc_no_writable]`, ZST, and pinned references before
-     `retag_ptr` runs, and dereferenceability for the non-ZST ones (the
-     length-`0` check is vacuous); plus **choice-free symbolic `MachTB.wfLive`
-     preservation** and **`MachTB` `IntrinsicOp.Deallocate` stack preservation**
+     `checkPtrM_tb_safe_vs_raw_boundary`, `checkPtrM_tb_safe_ok_iff`,
+     `tbm_retag_ptr_pointee_data_irrelevant`,
+     `evalStatementM_tb_validate_safe_vs_raw_boundary`,
+     `evalStatementM_tb_validate_uninit_ptr_ub`,
+     `canary_machTB_validate_zst_align_uninit_and_specPanic`, and
+     `trusted_and_machTB_static_mut_vs_freeze_and_unsafeCell`:
+     `TreeBorrowsMemory.retag_ptr` enforces `BasicMemory.check_ptr`
+     dereferenceability on every non-ZST safe pointer including
+     `#[rustc_no_writable]` `&mut T` and `&UnsafeCell<T>` while ignoring
+     alignment and pointee byte contents (`TbmSameMetaDiffData`, e.g. `.Uninit`
+     pointee bytes) and treating `Raw` / pinned `!unpin` as no-ops; for
+     ZERO-SIZED safe pointers it is completely `fnIw`-invariant, yields exact
+     protector strength (`Weak` for `Box`, `Strong` for `&`/`&mut` on `fnEntry`)
+     with passive `outside` permissions, succeeds into dead or past-the-end
+     allocations, and stops with a spec panic below the allocation base;
+     `Machine::check_ptr` inside `Statement::Validate` (`checkPtrM_tb_safe_ok_iff`)
+     enforces non-null, alignment (`al = 1` vs. `al > 1`), and inhabitedness for
+     ALL safe pointers (before `retag_ptr` runs) and dereferenceability for
+     non-ZST ones, while ANY `.Uninit` byte in the 8-byte pointer representation
+     itself triggers `"load at type but the data in memory violates the language
+     invariant"` for BOTH safe and raw thin pointers before `checkPtrM` runs; plus
+     **choice-free symbolic `MachTB.wfLive` preservation** and **`MachTB`
+     `IntrinsicOp.Deallocate` stack preservation**
      (`evalIntrinsicM_tb_wfLive_choiceFree`,
      `evalIntrinsicM_tb_deallocate_post_state`,
      `evalReturnM_tb_wfLive_choiceFree`, `evalTerminatorM_tb_wfLive_choiceFree`,
@@ -197,15 +205,17 @@ mechanically generated MiniRust Tree Borrows specification (`MiniRustSpec.Gen`,
 ## Scope of the whole-tree results
 
 - Single-window `TreeSimInv` (Sections 4.3–4.8) relates the two models on one
-  byte window overlapped by every Anneal node's coarse range; multi-window
-  `TreeSimInvMulti` and the byte-local frame laws (Section 4.10) lift the
-  single-window restriction across `load`, `store`, `retag_ptr`, and
-  `release_protector` / `end_call` (including two-entry disjoint-window frames
-  via `tbm_end_call_twoDisjointWindows_simulates_execFrameExitMiniRust`), while
+  byte window overlapped by every Anneal node's coarse range; its access,
+  retag, and frame-exit simulations are derived as corollaries of the lifted
+  multi-window `TreeSimInvMulti` theorems and byte-local frame laws (Section
+  4.10), covering `load`, `store`, `retag_ptr`, and `release_protector` /
+  `end_call` (including two-entry disjoint-window frames via
+  `tbm_end_call_twoDisjointWindows_simulates_execFrameExitMiniRust`), while
   `tbm_nestedSplitAtMut_symbolic` proves the nested outer-`#[rustc_no_writable]`
-  → two sub-slice `retag_ptr`s → stores → inner/outer `end_call`s → sibling-read
-  pattern symbolically for arbitrary slice length `N`, arbitrary disjoint
-  sub-slices, and arbitrary surrounding `wfLive` borrow trees.
+  → two sub-slice `retag_ptr`s → stores → inner `end_call` (in BOTH forward and
+  reverse protector release order!) → outer `end_call` → sibling-read pattern
+  symbolically for arbitrary slice length `N`, arbitrary disjoint sub-slices,
+  and arbitrary surrounding `wfLive` borrow trees.
 - The access, retag, and frame-exit simulations assume that the Anneal ancestor
   set coincides with the MiniRust path-prefix relation (`hloc`) and that pinned
   Miri's `SkipSelfAndChildren` pruning is INERT on visited nodes: every pruned
@@ -218,21 +228,36 @@ mechanically generated MiniRust Tree Borrows specification (`MiniRustSpec.Gen`,
   `tbm_release_protector_diverges_of_not_pruneInert`,
   `tbm_end_call_lockstep_iff_pruneInert`), with closed witnesses of both state
   divergence and UB-vs-OK outcome divergence when it fails. All four statements
-  are relative to a SUCCESSFUL pruned Anneal step; the multi-entry `iff` is about
-  the step-by-step `EndCallLockstepSim` predicate, which
-  `endCallLockstepSim_end_call` connects to `TreeBorrowsMemory.end_call` in the
-  forward direction only (no converse from final-state agreement back to
-  lockstep is claimed).
+  are relative to a SUCCESSFUL pruned Anneal step; `endCallLockstepSim_end_call`
+  connects `EndCallLockstepSim` to `TreeBorrowsMemory.end_call` (preserving
+  `TreeBorrowsMemory.wfLive` choice-free). For singleton frames (`frame.length
+  = 1`) the converse IS an exact `↔` (`endCallLockstepSim_singleton_iff_end_call`),
+  whereas for `frame.length ≥ 2` the converse is strictly FALSE and BOTH
+  `FrameExitPruneInert` and `EndCallLockstepSim` are protector-release-order
+  sensitive on the EXACT SAME 4-node borrow tree
+  (`endCallLockstepSim_end_call_converse_false_and_order_sensitive`: order
+  `[(1, 10), (3, 20)]` violates both yet still ends in a `TreeSimInv`-related
+  `wfLive` final tree because `PermissionProt.unprotect` erases the intermediate
+  `had_foreign_read` divergence, whereas reversing to `[(3, 20), (1, 10)]` makes
+  pruning inert so both hold and fire `tbm_end_call_lockstep_iff_pruneInert` +
+  `endCallLockstepSim_end_call` on a genuine 2-entry frame).
 - Alignment is never checked by `TreeBorrowsMemory.retag_ptr`; the `Ref` vs.
-  `Raw` alignment contrast lives one layer up, in `Statement::Validate`. The
-  spec panic of `tbm_retag_ptr_zst_safe_skips_dereferenceable` is proved for
-  `TreeBorrowsMemory.retag_ptr` only; no `MachTB` program reaching it is
-  exhibited here.
-- The `Trusted` connection is a run-level statement: the parameter-map adapter
-  coincides with the trusted `stepMirFn` at every fuel under an
-  all-`rustcNoWritable` map; the `writableChildWrite` side runs through the
-  Anneal-side adapter, and the `MachTB` and `Trusted` runs of the witness
-  program are related by their observable outcomes, not by a step simulation.
+  `Raw` alignment contrast lives one layer up in `Statement::Validate`
+  (`checkPtrM_tb_safe_ok_iff`). In `MachTB`, `Statement::Validate` DOES reach
+  BOTH dead/past-the-end ZST success AND the below-base ZST spec panic (for
+  `al = 1` at `base - 1`, and for `al = 4` at `base - 4`, while `al = 4` at
+  `base - 1` is caught first by `checkPtrM`'s alignment UB), and rejects ANY
+  `.Uninit` byte in the 8-byte pointer itself for BOTH safe and raw pointers
+  while ignoring `.Uninit` pointee bytes
+  (`canary_machTB_validate_zst_align_uninit_and_specPanic`).
+- The `Trusted` connection covers BOTH `#[rustc_no_writable]` (run-level
+  all-fuel coincidence of `stepMirFnWithParamMap` with `stepMirFn` under an
+  all-`rustcNoWritable` map; `writableChildWrite` runs through the Anneal-side
+  adapter, and `MachTB` / `Trusted` runs are related by observable outcomes)
+  AND `charon#1620` global/static retags (`trusted_and_machTB_static_mut_vs_freeze_and_unsafeCell`:
+  `.retag .raw` provenance-preserving no-op on `&raw const`/`&raw mut` globals,
+  `.retag .default` `&u32` vs. `&mut u32` on `.not` Freeze vs. `.mut` `static mut`
+  globals, and ZST provenance-free non-null vs. null scalar retags).
 - Symbolic `MachTB.wfLive` preservation across arbitrary `stepsTB n` executions
   is proved choice-free in Section 6.4 (`stepsTB_wfLive_choiceFree`,
   `machTB_staticAccess_steps_wfLive`, `machTB_harnesses_steps_wfLive`): it is a
@@ -242,8 +267,6 @@ mechanically generated MiniRust Tree Borrows specification (`MiniRustSpec.Gen`,
 -/
 
 namespace MiniRustSpec.NoWritableAndStaticRetag
-
-set_option Elab.async false
 
 open Anneal.ExtTreeMapAllocAndNoWritable
 open Trusted.Rustc.V2026_06_01.MirAst
@@ -570,6 +593,66 @@ def machTopProtectorCount (m0 : MachTB) (n : Nat) : Option Nat :=
   | .ok m' =>
     (m'.threads[0]?.bind (fun t => t.stack.getLast?)).map (fun fr => fr.extra.protectors.length)
   | .error _ => none
+
+private theorem a3_machTB_retSnapshot_and_wfLive {n : Nat} {m0 : MachTB}
+    {expected : Option (Bool × List (Option UInt8)) × List Nat}
+    (h : (match Interp.stepsTB n m0 with
+          | .ok m' =>
+            decide ((m'.mem.memory.mem.allocations[0]?.map (fun a => (a.live, projDataBytesTB a.data)),
+              m'.threads.map (·.stack.length)) = expected) &&
+            tbmWfLiveBool m'.mem.memory
+          | .error _ => false) = true) :
+    machRetSnapshot m0 n = some expected ∧
+    (∃ m', Interp.stepsTB n m0 = .ok m' ∧ MachTB.wfLive m') := by
+  cases hst : Interp.stepsTB n m0 with
+  | error _ => rw [hst] at h; cases h
+  | ok m' =>
+    rw [hst] at h
+    have ⟨h1, h2⟩ := (Bool.and_eq_true _ _).mp h
+    refine ⟨?_, m', rfl, machTB_wfLive_of_bool m' h2⟩
+    unfold machRetSnapshot; rw [hst]; exact congrArg some (of_decide_eq_true h1)
+
+private theorem a3_machTB_allocSnapshot_and_wfLive {n idx : Nat} {m0 : MachTB}
+    {expected : Bool × List (Option UInt8)}
+    (h : (match Interp.stepsTB n m0 with
+          | .ok m' =>
+            decide (m'.mem.memory.mem.allocations[idx]?.map (fun a => (a.live, projDataBytesTB a.data)) =
+              some expected) &&
+            tbmWfLiveBool m'.mem.memory
+          | .error _ => false) = true) :
+    machAllocSnapshot m0 n idx = some expected ∧
+    (∃ m', Interp.stepsTB n m0 = .ok m' ∧ MachTB.wfLive m') := by
+  cases hst : Interp.stepsTB n m0 with
+  | error _ => rw [hst] at h; cases h
+  | ok m' =>
+    rw [hst] at h
+    have ⟨h1, h2⟩ := (Bool.and_eq_true _ _).mp h
+    refine ⟨?_, m', rfl, machTB_wfLive_of_bool m' h2⟩
+    unfold machAllocSnapshot; rw [hst]; exact of_decide_eq_true h1
+
+private theorem a3_machTB_ret_alloc_wfLive {n idx : Nat} {m0 : MachTB}
+    {expRet : Option (Bool × List (Option UInt8)) × List Nat}
+    {expAlloc : Bool × List (Option UInt8)}
+    (h : (match Interp.stepsTB n m0 with
+          | .ok m' =>
+            decide ((m'.mem.memory.mem.allocations[0]?.map (fun a => (a.live, projDataBytesTB a.data)),
+              m'.threads.map (·.stack.length)) = expRet) &&
+            decide (m'.mem.memory.mem.allocations[idx]?.map (fun a => (a.live, projDataBytesTB a.data)) =
+              some expAlloc) &&
+            tbmWfLiveBool m'.mem.memory
+          | .error _ => false) = true) :
+    machRetSnapshot m0 n = some expRet ∧
+    machAllocSnapshot m0 n idx = some expAlloc ∧
+    (∃ m', Interp.stepsTB n m0 = .ok m' ∧ MachTB.wfLive m') := by
+  cases hst : Interp.stepsTB n m0 with
+  | error _ => rw [hst] at h; cases h
+  | ok m' =>
+    rw [hst] at h
+    have ⟨h12, h3⟩ := (Bool.and_eq_true _ _).mp h
+    have ⟨h1, h2⟩ := (Bool.and_eq_true _ _).mp h12
+    refine ⟨?_, ?_, m', rfl, machTB_wfLive_of_bool m' h3⟩
+    · unfold machRetSnapshot; rw [hst]; exact congrArg some (of_decide_eq_true h1)
+    · unfold machAllocSnapshot; rw [hst]; exact of_decide_eq_true h2
 
 /-- Sentinel bottom caller function used by `MachTB` execution harnesses so
 `Terminator.Return` stores the return value into `allocations[0]` and lands at
@@ -1487,8 +1570,29 @@ theorem tbm_rustcNoWritable_vs_writable_full_lifecycle :
       execFnEntryMutRetagPrunedSourceOrder w pTag off len .rustcNoWritable reqInit = .ok (w', cTag) →
       ∀ n ∈ w.nodes, n.perm = .frozen →
         ∃ n' ∈ w'.nodes, n'.tag = n.tag ∧ n'.perm = .frozen) := by
-  refine ⟨by decide +kernel, by decide +kernel,
-    tbm_trace_ok_and_wfLive_of_bool (by decide +kernel),
+  have hfull : (tbBytesOutcome (tbmNoWritableFullLifecycleTrace.map (·.1)) =
+        some (.inl [some 42, some 0, some 0, some 0])) ∧
+      (tbBytesOutcome (tbmNoWritableFullLifecycleTrace.map (·.2.1)) =
+        some (.inl [some 42, some 0, some 0, some 0])) ∧
+      (∃ tbmFinal, tbmNoWritableFullLifecycleTrace.map (·.2.2) = .ok tbmFinal ∧
+        TreeBorrowsMemory.wfLive tbmFinal) := by
+    have hc : (match tbmNoWritableFullLifecycleTrace with
+      | .ok (b1, b2, tbmF) =>
+        decide (projDataBytesTB b1 = [some 42, some 0, some 0, some 0]) &&
+        decide (projDataBytesTB b2 = [some 42, some 0, some 0, some 0]) &&
+        tbmWfLiveBool tbmF
+      | .error _ => false) = true := by decide +kernel
+    cases ht : tbmNoWritableFullLifecycleTrace with
+    | error _ => rw [ht] at hc; cases hc
+    | ok res =>
+      rcases res with ⟨b1, b2, tbmF⟩
+      rw [ht] at hc
+      have ⟨h12, h3⟩ := (Bool.and_eq_true _ _).mp hc
+      have ⟨h1, h2⟩ := (Bool.and_eq_true _ _).mp h12
+      refine ⟨?_, ?_, tbmF, by simp [Except.map], tbm_wfLive_of_bool tbmF h3⟩
+      · unfold tbBytesOutcome; simp [Except.map, of_decide_eq_true h1]
+      · unfold tbBytesOutcome; simp [Except.map, of_decide_eq_true h2]
+  refine ⟨hfull.1, hfull.2.1, hfull.2.2,
     by decide +kernel, by decide +kernel, by decide +kernel,
     tbm_trace_ok_and_wfLive_of_bool (by decide +kernel),
     by decide +kernel, ?_⟩
@@ -1776,10 +1880,27 @@ theorem disjoint_two_param_frame_exit_miri_miniRust_and_tbm :
               · rcases List.mem_cons.mp hn with rfl | hn
                 · cases htag
                 · cases hn
+  have htrOf : ∀ (rev : Bool),
+      ((match tbmDisjointTwoParamExitTrace rev with
+        | .ok (bs, tbm', _) =>
+          decide (projDataBytesTB bs = [some 22, some 0, some 0, some 0]) && tbmWfLiveBool tbm'
+        | .error _ => false) = true) →
+      tbBytesOutcome ((tbmDisjointTwoParamExitTrace rev).map (·.1)) =
+        some (.inl [some 22, some 0, some 0, some 0]) ∧
+      (∃ tbm', (tbmDisjointTwoParamExitTrace rev).map (·.2.1) = .ok tbm' ∧
+        TreeBorrowsMemory.wfLive tbm') := by
+    intro rev hc
+    cases ht : tbmDisjointTwoParamExitTrace rev with
+    | error _ => rw [ht] at hc; cases hc
+    | ok res =>
+      rcases res with ⟨bs, tbm', _⟩; rw [ht] at hc
+      have ⟨h1, h2⟩ := (Bool.and_eq_true _ _).mp hc
+      exact ⟨by unfold tbBytesOutcome; simp [Except.map, of_decide_eq_true h1],
+        tbm', by simp [Except.map], tbm_wfLive_of_bool tbm' h2⟩
+  have hf := htrOf false (by decide +kernel)
+  have hr := htrOf true (by decide +kernel)
   exact ⟨hagree, ⟨rfl, rfl, rfl⟩,
-    by decide +kernel, by decide +kernel,
-    tbm_trace_ok_and_wfLive_of_bool (by decide +kernel),
-    tbm_trace_ok_and_wfLive_of_bool (by decide +kernel),
+    hf.1, hr.1, hf.2, hr.2,
     by decide +kernel, by decide +kernel⟩
 
 /-! ### 1.4 End-to-End `MachTB` (`stepsTB` + `MachTB.wfLive`) & `Trusted` (`stepMirFn`) Witnesses -/
@@ -1893,9 +2014,8 @@ theorem machTB_forgetStyle_noWritable_vs_writable_e2e :
     machRetSnapshot mNoWr 13 = some (some (true, [some 42, some 0, some 0, some 0]), [1]) ∧
     (∃ m', Interp.stepsTB 13 mNoWr = .ok m' ∧ MachTB.wfLive m') ∧
     machStopOutcome mWr 12 = some (.ub "Tree Borrows: local read of Disabled reference") :=
-  ⟨by decide +kernel,
-   machTB_steps_ok_and_wfLive_of_bool (by decide +kernel),
-   by decide +kernel⟩
+  let h := a3_machTB_retSnapshot_and_wfLive (by decide +kernel)
+  ⟨h.1, h.2, by decide +kernel⟩
 
 /-- **End-to-end `MachTB` `!Unpin` `&mut` skip-retag witness**: even when the
 callee has `implicit_writes = true`, a `!Unpin` `&mut` parameter
@@ -1907,9 +2027,8 @@ theorem machTB_pinned_mut_skips_retag_e2e :
     machTopProtectorCount mPinned 9 = some 0 ∧
     machRetSnapshot mPinned 13 = some (some (true, [some 42, some 0, some 0, some 0]), [1]) ∧
     (∃ m', Interp.stepsTB 13 mPinned = .ok m' ∧ MachTB.wfLive m') :=
-  ⟨by decide +kernel,
-   by decide +kernel,
-   machTB_steps_ok_and_wfLive_of_bool (by decide +kernel)⟩
+  let h := a3_machTB_retSnapshot_and_wfLive (by decide +kernel)
+  ⟨by decide +kernel, h.1, h.2⟩
 
 /-- Caller function leaving `_1 : u32` **uninitialized**, taking `_2 = &mut _1`
 and sibling `_3 = &_1`, calling `forgetStyleCalleeFn`, and then validating `_3`
@@ -1998,10 +2117,8 @@ theorem machTB_forgetStyle_uninit_pointee_e2e :
     machRetSnapshot mNoWr 13 = some (some (true, [some 1, some 0, some 0, some 0]), [1]) ∧
     (∃ m', Interp.stepsTB 13 mNoWr = .ok m' ∧ MachTB.wfLive m') ∧
     machStopOutcome mWr 11 = some (.ub "Tree Borrows: local read of Disabled reference") :=
-  ⟨by decide +kernel,
-   by decide +kernel,
-   machTB_steps_ok_and_wfLive_of_bool (by decide +kernel),
-   by decide +kernel⟩
+  let h := a3_machTB_retSnapshot_and_wfLive (by decide +kernel)
+  ⟨by decide +kernel, h.1, h.2, by decide +kernel⟩
 
 /-- Callee mode for the `#[rustc_no_writable]` conflict-latch & parent-write
 `MachTB` suite (`0` = foreign read + clean return, `1` = foreign read then
@@ -2141,10 +2258,8 @@ theorem machTB_noWritable_conflicted_latch_and_parent_write_e2e :
       some (.ub "Tree Borrows: local write to protected Reserved reference that had a foreign read") ∧
     machStopOutcome mParWr 12 =
       some (.ub "Tree Borrows: foreign write of protected Reserved reference which had a local read") :=
-  ⟨by decide +kernel,
-   machTB_steps_ok_and_wfLive_of_bool (by decide +kernel),
-   by decide +kernel,
-   by decide +kernel⟩
+  let h := a3_machTB_retSnapshot_and_wfLive (by decide +kernel)
+  ⟨h.1, h.2, by decide +kernel, by decide +kernel⟩
 
 /-! #### `Trusted` (`stepMirFn` + `evalFnEntryRetagWithParamMap`) Companion Witness -/
 
@@ -2841,6 +2956,7 @@ theorem staticShapeA_pureFreeze_correspondence :
     machRetSnapshot mEras 7 = some (some (true, [some 1, some 0, some 0, some 0]), [1]) ∧
     machAllocSnapshot mEras 7 1 = some (true, [some 99, some 0, some 0, some 0]) ∧
     (∃ m', Interp.stepsTB 7 mEras = .ok m' ∧ MachTB.wfLive m') :=
+  let h := a3_machTB_ret_alloc_wfLive (by decide +kernel)
   ⟨rfl, rfl, rfl,
    (static_pureFreeze_preserved_ub_vs_erased_unsound 4 1 2 0 (by decide) (by decide)).1,
    (static_pureFreeze_preserved_ub_vs_erased_unsound 4 1 2 0 (by decide) (by decide)).2,
@@ -2848,9 +2964,7 @@ theorem staticShapeA_pureFreeze_correspondence :
    by decide +kernel,
    tbm_trace_ok_and_wfLive_of_bool (by decide +kernel),
    by decide +kernel,
-   by decide +kernel,
-   by decide +kernel,
-   machTB_steps_ok_and_wfLive_of_bool (by decide +kernel)⟩
+   h.1, h.2.1, h.2.2⟩
 
 /-- `MachTB` witness for Shape (b) (`static S: AtomicI32` / `UnsafeCell<u32>`)
 executing **repeated** interior-mutable writes (`11` then `77`) through the
@@ -2955,14 +3069,26 @@ theorem staticShapeB_pureUnsafeCell_correspondence :
       some (some (true, [some 77, some 0, some 0, some 0]), [1]) ∧
     machAllocSnapshot staticShapeBRepeatedWriteMachTB 8 1 =
       some (true, [some 77, some 0, some 0, some 0]) ∧
-    (∃ m', Interp.stepsTB 8 staticShapeBRepeatedWriteMachTB = .ok m' ∧ MachTB.wfLive m') :=
-  ⟨rfl, rfl, rfl,
-   (static_pureUnsafeCell_preserved_write_ok 4 1 2 0 (by decide) (by decide)).2,
-   by decide +kernel,
-   tbm_trace_ok_and_wfLive_of_bool (by decide +kernel),
-   by decide +kernel,
-   by decide +kernel,
-   machTB_steps_ok_and_wfLive_of_bool (by decide +kernel)⟩
+    (∃ m', Interp.stepsTB 8 staticShapeBRepeatedWriteMachTB = .ok m' ∧ MachTB.wfLive m') := by
+  have htbm : tbBytesOutcome (tbmShapeBRepeatedWriteTrace.map (·.1)) =
+        some (.inl [some 77, some 0, some 0, some 0]) ∧
+      (∃ tbm', tbmShapeBRepeatedWriteTrace.map (·.2) = .ok tbm' ∧ TreeBorrowsMemory.wfLive tbm') := by
+    have hc : (match tbmShapeBRepeatedWriteTrace with
+      | .ok (bs, tbm') => decide (projDataBytesTB bs = [some 77, some 0, some 0, some 0]) && tbmWfLiveBool tbm'
+      | .error _ => false) = true := by decide +kernel
+    cases ht : tbmShapeBRepeatedWriteTrace with
+    | error _ => rw [ht] at hc; cases hc
+    | ok res =>
+      rcases res with ⟨bs, tbm'⟩; rw [ht] at hc
+      have ⟨h1, h2⟩ := (Bool.and_eq_true _ _).mp hc
+      exact ⟨by unfold tbBytesOutcome; simp [Except.map, of_decide_eq_true h1],
+        tbm', by simp [Except.map], tbm_wfLive_of_bool tbm' h2⟩
+  have hm := a3_machTB_ret_alloc_wfLive (n := 8) (idx := 1) (m0 := staticShapeBRepeatedWriteMachTB)
+    (expRet := (some (true, [some 77, some 0, some 0, some 0]), [1]))
+    (expAlloc := (true, [some 77, some 0, some 0, some 0])) (by decide +kernel)
+  exact ⟨rfl, rfl, rfl,
+    (static_pureUnsafeCell_preserved_write_ok 4 1 2 0 (by decide) (by decide)).2,
+    htbm.1, htbm.2, hm.1, hm.2.1, hm.2.2⟩
 
 /-- Initial 8-byte payload for Shape (c) `(u8=3, Padding[3]=Uninit, AtomicI32=10)`. -/
 def staticShapeCInitBytes : List (Gen.AbstractByte Gen.TreeBorrowsProvenance) :=
@@ -3040,17 +3166,19 @@ theorem staticShapeC_mixedComposite_correspondence :
     machAllocSnapshot mErasPad 7 1 =
       some (true, [some 3, some 9, none, none, some 10, some 0, some 0, some 0]) ∧
     (∃ m', Interp.stepsTB 7 mErasPad = .ok m' ∧ MachTB.wfLive m') :=
+  let hCell := a3_machTB_ret_alloc_wfLive (by decide +kernel)
+  let hEU := a3_machTB_allocSnapshot_and_wfLive (by decide +kernel)
+  let hEP := a3_machTB_allocSnapshot_and_wfLive (by decide +kernel)
   ⟨rfl, rfl, rfl, rfl, rfl, rfl,
    by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
    tbm_trace_ok_and_wfLive_of_bool (by decide +kernel),
    by decide +kernel, by decide +kernel,
    tbm_trace_ok_and_wfLive_of_bool (by decide +kernel),
    tbm_trace_ok_and_wfLive_of_bool (by decide +kernel),
+   hCell.1, hCell.2.1, hCell.2.2,
    by decide +kernel, by decide +kernel,
-   machTB_steps_ok_and_wfLive_of_bool (by decide +kernel),
-   by decide +kernel, by decide +kernel,
-   by decide +kernel, machTB_steps_ok_and_wfLive_of_bool (by decide +kernel),
-   by decide +kernel, machTB_steps_ok_and_wfLive_of_bool (by decide +kernel)⟩
+   hEU.1, hEU.2,
+   hEP.1, hEP.2⟩
 
 /-- **Shape (d) — Zero-sized `UnsafeCell<()>` composite static (`static S: (u8,
 UnsafeCell<()>)`) correspondence**:
@@ -3082,15 +3210,14 @@ theorem staticShapeD_zstUnsafeCellComposite_correspondence :
     machRetSnapshot mEras 7 = some (some (true, [some 1, some 0, some 0, some 0]), [1]) ∧
     machAllocSnapshot mEras 7 1 = some (true, [some 9]) ∧
     (∃ m', Interp.stepsTB 7 mEras = .ok m' ∧ MachTB.wfLive m') :=
+  let h := a3_machTB_ret_alloc_wfLive (by decide +kernel)
   ⟨rfl, rfl, rfl, rfl, rfl,
    (static_zstUnsafeCell_composite_miri_separation 1 1 2 0 (by decide) (by decide)).2.2.2.1,
    (static_zstUnsafeCell_composite_miri_separation 1 1 2 0 (by decide) (by decide)).2.2.2.2,
    by decide +kernel,
    tbm_trace_ok_and_wfLive_of_bool (by decide +kernel),
    by decide +kernel,
-   by decide +kernel,
-   by decide +kernel,
-   machTB_steps_ok_and_wfLive_of_bool (by decide +kernel)⟩
+   h.1, h.2.1, h.2.2⟩
 
 /-! ## Part 3: Closed Non-Vacuity Canaries -/
 
@@ -3389,6 +3516,28 @@ theorem transitionRange_stable_eq (nr : Gen.NodeRelation) (k : Gen.AccessKind)
     · exact hout b (Or.inl (by omega))
   rw [hrun, heq]
 
+private theorem c1_transitionRange_ok_full (r : Gen.NodeRelation) (k : Gen.AccessKind)
+    (off len : Nat) (ps ps' : List Gen.Permission)
+    (h : Node.transitionRange r k off len ps = .ok ps') :
+    ps'.length = ps.length ∧
+    (∀ b, b < off ∨ off + len ≤ b → ps'[b]? = ps[b]?) ∧
+    (∀ b, off ≤ b → b < off + len →
+      ∃ p p', ps[b]? = some p ∧ Permission.transition p k r = .ok p' ∧ ps'[b]? = some p') := by
+  have hpoint : ∀ b, off ≤ b → b < off + len →
+      ∃ p p', ps[b]? = some p ∧ Permission.transition p k r = .ok p' := by
+    intro b h1 h2
+    exact transitionRange_ok_inv r k len off ps ps' h b h1 h2
+  obtain ⟨ps2, hrun2, hlen2, hout2, hin2⟩ :=
+    transitionRange_ok_of_pointwise r k len off ps hpoint
+  rw [h] at hrun2
+  cases hrun2
+  refine ⟨hlen2, hout2, fun b h1 h2 => ?_⟩
+  obtain ⟨p, p', hp, htr⟩ := hpoint b h1 h2
+  obtain ⟨p'', htr'', hget⟩ := hin2 b h1 h2 p hp
+  rw [htr] at htr''
+  cases htr''
+  exact ⟨p, p', hp, htr, hget⟩
+
 /-! ### 4.2 Path-Indexed Whole-Tree Specification of `Node.access` -/
 
 /-- Subtree of a MiniRust borrow tree at a relative `Path` (child indices). -/
@@ -3418,6 +3567,7 @@ def locOf : Option Gen.Path → Gen.Path → Bool
 def locRel (path : Option Gen.Path) (q : Gen.Path) : Gen.NodeRelation :=
   if locOf path q then .Local else .Foreign
 
+/-- When no access path is present (`none`), every node is `Foreign` (`locOf none q = false`). -/
 theorem locOf_none (q : Gen.Path) : locOf none q = false := by
   induction q with
   | nil => rfl
@@ -3743,6 +3893,86 @@ structure TreeSimInv (off len : Nat) (emb : Nat → Gen.Path) (w : FnEntryBorrow
   protUniqAcc : ∀ n ∈ w.nodes, n.isProtected w.activeProtectors = true →
     n.perm = .unique → n.accessed = true
 
+/-- **Foreign-passive byte permissions**: permissions on a byte OUTSIDE a node's
+inside range (`ReborrowSettings.outside`) that survive EVERY foreign read AND
+every foreign write without UB, and are closed under foreign transitions. -/
+def permIsForeignPassive : Gen.Permission → Bool
+  | .Unprot _ => true
+  | .Prot (.Reserved false _) => true
+  | .Prot (.Frozen false) => true
+  | .Prot .Cell => true
+  | .Prot .Disabled => true
+  | _ => false
+
+/-- `permIsForeignPassive` is closed under ALL foreign reads and foreign
+writes (never raises UB). -/
+theorem permission_isForeignPassive_preserved (p : Gen.Permission) (k : Gen.AccessKind)
+    (hp : permIsForeignPassive p = true) :
+    ∃ p', Permission.transition p k .Foreign = .ok p' ∧ permIsForeignPassive p' = true := by
+  cases p with
+  | Unprot u =>
+    cases u <;> cases k <;> exact ⟨_, rfl, rfl⟩
+  | Prot pp =>
+    cases pp with
+    | Unique => cases hp
+    | Reserved hlr hfr =>
+      cases hlr with
+      | true => cases hp
+      | false => cases hfr <;> cases k <;> exact ⟨_, rfl, rfl⟩
+    | Frozen hlr =>
+      cases hlr with
+      | true => cases hp
+      | false => cases k <;> exact ⟨_, rfl, rfl⟩
+    | Cell => cases k <;> exact ⟨_, rfl, rfl⟩
+    | Disabled => cases k <;> exact ⟨_, rfl, rfl⟩
+
+/-- **Multi-range whole-tree relational invariant (`TreeSimInvMulti`)**: strictly
+generalizes `TreeSimInv` by removing the universal `overlap` restriction (which
+makes `TreeSimInv` unsatisfiable on multi-slice borrow trees with disjoint
+sub-slices such as `disjointTwoParamWorld` / `<[T]>::split_at_mut`).
+- Every Anneal node whose range overlaps `[off, off + len)` satisfies the exact
+  window relation `NodeWindowRel`.
+- Every Anneal node whose range is **disjoint** from `[off, off + len)` carries
+  foreign-passive permissions (`permIsForeignPassive = true`, matching
+  MiniRust's `ReborrowSettings.outside`) on `[off, off + len)`. -/
+structure TreeSimInvMulti (off len : Nat) (emb : Nat → Gen.Path) (w : FnEntryBorrowWorld)
+    (t : Gen.Node) : Prop where
+  nodes : ∀ n ∈ w.nodes, ∃ m, nodeAt t (emb n.tag) = some m ∧
+    if rangesOverlap off len n.rangeOffset n.rangeLen = true then
+      NodeWindowRel w.activeProtectors off len n m
+    else
+      Protected.yes m.«protected» = n.isProtected w.activeProtectors ∧
+      ∀ b, off ≤ b → b < off + len → ∃ p, m.permissions[b]? = some p ∧ permIsForeignPassive p = true
+  surj : ∀ q m, nodeAt t q = some m → ∃ n ∈ w.nodes, emb n.tag = q
+  noProtIM : ∀ n ∈ w.nodes, n.isProtected w.activeProtectors = true → n.perm ≠ .reservedIM
+  protUniqAcc : ∀ n ∈ w.nodes, n.isProtected w.activeProtectors = true →
+    n.perm = .unique → n.accessed = true
+
+/-- `TreeSimInvMulti` strictly generalizes `TreeSimInv`. -/
+theorem treeSimInvMulti_of_treeSimInv (off len : Nat) (emb : Nat → Gen.Path)
+    (w : FnEntryBorrowWorld) (t : Gen.Node) (h : TreeSimInv off len emb w t) :
+    TreeSimInvMulti off len emb w t where
+  nodes := fun n hn => by
+    obtain ⟨m, hm, hrel⟩ := h.nodes n hn
+    exact ⟨m, hm, by rw [h.overlap n hn]; exact hrel⟩
+  surj := h.surj
+  noProtIM := h.noProtIM
+  protUniqAcc := h.protUniqAcc
+
+private theorem a3_treeSimInv_of_multi (off len : Nat) (emb : Nat → Gen.Path)
+    (w : FnEntryBorrowWorld) (t : Gen.Node)
+    (h : TreeSimInvMulti off len emb w t)
+    (hov : ∀ n ∈ w.nodes, rangesOverlap off len n.rangeOffset n.rangeLen = true) :
+    TreeSimInv off len emb w t where
+  nodes := fun n hn => by
+    obtain ⟨m, hm, hnod⟩ := h.nodes n hn
+    simp only [hov n hn, ↓reduceIte] at hnod
+    exact ⟨m, hm, hnod⟩
+  surj := h.surj
+  overlap := hov
+  noProtIM := h.noProtIM
+  protUniqAcc := h.protUniqAcc
+
 private theorem nwsr_stepRead_meta (ap : List Nat) (isLocal : Bool) (off len : Nat)
     (n n' : TreeTagNode) (h : stepNodeOnRangeRead ap isLocal off len n = .ok n') :
     n'.tag = n.tag ∧ n'.protector = n.protector ∧ n'.rangeOffset = n.rangeOffset ∧
@@ -3776,52 +4006,6 @@ private theorem nwsr_stepWrite_meta (ap : List Nat) (isLocal : Bool) (off len : 
           | exact (fun _ _ _ => rfl)
           | exact (fun henv => henv)
           | (intro _ _ hu; cases hu)⟩
-
-/-- Per-node lockstep interface between an Anneal node step and MiniRust
-`Permission.transition` used by the whole-tree simulation. -/
-private def NodeStepSim (ap : List Nat) (k : Gen.AccessKind)
-    (step : Bool → TreeTagNode → Except RetagStepErr TreeTagNode) (n : TreeTagNode) : Prop :=
-  ∀ isLocal, ∃ p,
-    permToMiniRust (n.isProtected ap) n.accessed n.perm = some p ∧
-    (∀ n', step isLocal n = .ok n' →
-      n'.tag = n.tag ∧ n'.isProtected ap = n.isProtected ap ∧
-      n'.rangeOffset = n.rangeOffset ∧ n'.rangeLen = n.rangeLen ∧
-      (n'.isProtected ap = true → n'.perm ≠ .reservedIM) ∧
-      (n'.isProtected ap = true → n'.perm = .unique → n'.accessed = true) ∧
-      ∃ p', Permission.transition p k (nodeRelToMiniRust isLocal) = .ok p' ∧
-        permToMiniRust (n.isProtected ap) n'.accessed n'.perm = some p') ∧
-    (∀ e, step isLocal n = .error e →
-      ∃ msg, Permission.transition p k (nodeRelToMiniRust isLocal) = .error (.ub msg))
-
-private theorem nwsr_stepRead_sim (ap : List Nat) (off len : Nat) (n : TreeTagNode)
-    (hov : rangesOverlap off len n.rangeOffset n.rangeLen = true)
-    (hIM : n.isProtected ap = true → n.perm ≠ .reservedIM)
-    (hUA : n.isProtected ap = true → n.perm = .unique → n.accessed = true) :
-    NodeStepSim ap .Read (fun isLoc m => stepNodeOnRangeRead ap isLoc off len m) n := by
-  intro isLocal
-  obtain ⟨p, hp, hok, herr⟩ :=
-    stepNodeOnRangeRead_simulates_permission_transition ap isLocal off len n hov hIM hUA
-  refine ⟨p, hp, fun n' hn' => ?_, herr⟩
-  obtain ⟨htag, hprot, hro, hrl, hIM', hUA'⟩ := nwsr_stepRead_meta ap isLocal off len n n' hn'
-  have hpe : n'.isProtected ap = n.isProtected ap := by
-    unfold TreeTagNode.isProtected
-    rw [hprot]
-  exact ⟨htag, hpe, hro, hrl, fun hp' him => hIM (hpe ▸ hp') (hIM' him), hUA' hUA, hok n' hn'⟩
-
-private theorem nwsr_stepWrite_sim (ap : List Nat) (off len : Nat) (n : TreeTagNode)
-    (hov : rangesOverlap off len n.rangeOffset n.rangeLen = true)
-    (hIM : n.isProtected ap = true → n.perm ≠ .reservedIM)
-    (hUA : n.isProtected ap = true → n.perm = .unique → n.accessed = true) :
-    NodeStepSim ap .Write (fun isLoc m => stepNodeOnRangeWrite ap isLoc off len m) n := by
-  intro isLocal
-  obtain ⟨p, hp, hok, herr⟩ :=
-    stepNodeOnRangeWrite_simulates_permission_transition ap isLocal off len n hov hIM hUA
-  refine ⟨p, hp, fun n' hn' => ?_, herr⟩
-  obtain ⟨htag, hprot, hro, hrl, hIM', hUA'⟩ := nwsr_stepWrite_meta ap isLocal off len n n' hn'
-  have hpe : n'.isProtected ap = n.isProtected ap := by
-    unfold TreeTagNode.isProtected
-    rw [hprot]
-  exact ⟨htag, hpe, hro, hrl, fun hp' him => hIM (hpe ▸ hp') (hIM' him), hUA' hUA, hok n' hn'⟩
 
 /-- Whether the FOREIGN step of an access of kind `isWrite` on `[off, off + len)`
 leaves the Anneal node `n` unchanged. On a node skipped by pinned Miri's
@@ -3860,24 +4044,43 @@ private theorem nwsr_listRel_of_forall {α β : Type} {R : α → β → Prop} :
     obtain ⟨ys, hys⟩ := nwsr_listRel_of_forall xs (fun z hz => h z (List.mem_cons_of_mem _ hz))
     exact ⟨y :: ys, .cons hy hys⟩
 
-private theorem nwsr_tree_sim_core
+private def c1_NodeStepSimMulti (ap : List Nat) (off len : Nat) (k : Gen.AccessKind)
+    (step : Bool → TreeTagNode → Except RetagStepErr TreeTagNode) (n : TreeTagNode) : Prop :=
+  (rangesOverlap off len n.rangeOffset n.rangeLen = true →
+    ∀ isLocal, ∃ p,
+      permToMiniRust (n.isProtected ap) n.accessed n.perm = some p ∧
+      (∀ n', step isLocal n = .ok n' →
+        n'.tag = n.tag ∧ n'.isProtected ap = n.isProtected ap ∧
+        n'.rangeOffset = n.rangeOffset ∧ n'.rangeLen = n.rangeLen ∧
+        (n'.isProtected ap = true → n'.perm ≠ .reservedIM) ∧
+        (n'.isProtected ap = true → n'.perm = .unique → n'.accessed = true) ∧
+        ∃ p', Permission.transition p k (nodeRelToMiniRust isLocal) = .ok p' ∧
+          permToMiniRust (n.isProtected ap) n'.accessed n'.perm = some p') ∧
+      (∀ e, step isLocal n = .error e →
+        ∃ msg, Permission.transition p k (nodeRelToMiniRust isLocal) = .error (.ub msg))) ∧
+  (rangesOverlap off len n.rangeOffset n.rangeLen = false →
+    ∀ isLocal, step isLocal n = .ok n)
+
+private theorem c1_tree_sim_multi_core
     (k : Gen.AccessKind) (isWrite : Bool)
     (step : Bool → TreeTagNode → Except RetagStepErr TreeTagNode)
     (off len : Nat) (hlen : 0 < len) (emb : Nat → Gen.Path)
     (w : FnEntryBorrowWorld) (t : Gen.Node) (tag : Nat)
-    (hinv : TreeSimInv off len emb w t)
-    (hstep : ∀ n ∈ w.nodes, NodeStepSim w.activeProtectors k step n)
+    (hinv : TreeSimInvMulti off len emb w t)
+    (hstep : ∀ n ∈ w.nodes, c1_NodeStepSimMulti w.activeProtectors off len k step n)
     (hloc : ∀ n ∈ w.nodes,
       (ancestorPathTags w.nodes tag).contains n.tag = locOf (some (emb tag)) (emb n.tag))
+    (hancOv : ∀ n ∈ w.nodes,
+      (ancestorPathTags w.nodes tag).contains n.tag = true →
+      rangesOverlap off len n.rangeOffset n.rangeLen = true)
     (hnoprune : ∀ n ∈ w.nodes,
       isPrunedForeignNode w.nodes (ancestorPathTags w.nodes tag) isWrite off len n = true →
       step false n = .ok n) :
     (∀ nodes', ListRel (PrunedStepRel w tag isWrite off len step) w.nodes nodes' →
       ∃ t', Node.access t (some (emb tag)) k ⟨off⟩ ⟨len⟩ = .ok t' ∧
-        TreeSimInv off len emb { w with nodes := nodes' } t') ∧
+        TreeSimInvMulti off len emb { w with nodes := nodes' } t') ∧
     ((∀ nodes', ¬ ListRel (PrunedStepRel w tag isWrite off len step) w.nodes nodes') →
       ∃ msg, Node.access t (some (emb tag)) k ⟨off⟩ ⟨len⟩ = .error (.ub msg)) := by
-  -- Locality bridge: `PrunedStepRel` is exactly the path-determined step.
   have hpr : ∀ n ∈ w.nodes, ∀ n', PrunedStepRel w tag isWrite off len step n n' →
       step (locOf (some (emb tag)) (emb n.tag)) n = .ok n' := by
     intro n hn n' hrel
@@ -3898,14 +4101,26 @@ private theorem nwsr_tree_sim_core
         rw [hnoprune n hn hp] at hs
         cases hs
         exact Or.inr (Or.inl ⟨by rw [hloc n hn, hl], hp, rfl⟩)
-  -- Every MiniRust node is the image of an Anneal node carrying the window relation.
+  have hdisjForeign : ∀ n ∈ w.nodes, rangesOverlap off len n.rangeOffset n.rangeLen = false →
+      locRel (some (emb tag)) (emb n.tag) = .Foreign := by
+    intro n hn hdisj
+    unfold locRel
+    cases hl : locOf (some (emb tag)) (emb n.tag) with
+    | false => rfl
+    | true =>
+      have hanc : (ancestorPathTags w.nodes tag).contains n.tag = true := by rw [hloc n hn, hl]
+      have hov := hancOv n hn hanc
+      rw [hov] at hdisj; cases hdisj
   have hmr : ∀ q m, nodeAt t q = some m → ∃ n ∈ w.nodes, emb n.tag = q ∧
-      NodeWindowRel w.activeProtectors off len n m := by
+      (if rangesOverlap off len n.rangeOffset n.rangeLen = true then
+        NodeWindowRel w.activeProtectors off len n m
+       else
+        Protected.yes m.«protected» = n.isProtected w.activeProtectors ∧
+        ∀ b, off ≤ b → b < off + len → ∃ p, m.permissions[b]? = some p ∧ permIsForeignPassive p = true) := by
     intro q m hq
     obtain ⟨n, hn, hemb⟩ := hinv.surj q m hq
     obtain ⟨m', hm', hrel⟩ := hinv.nodes n hn
-    rw [hemb, hq] at hm'
-    cases hm'
+    rw [hemb, hq] at hm'; cases hm'
     exact ⟨n, hn, hemb, hrel⟩
   have hrelNode : ∀ (isLocal : Bool), nodeRelToMiniRust isLocal =
       (if isLocal then Gen.NodeRelation.Local else .Foreign) := fun _ => rfl
@@ -3915,128 +4130,306 @@ private theorem nwsr_tree_sim_core
         ∃ ps', Node.transitionRange (locRel (some (emb tag)) q) k off len m.permissions =
           .ok ps' := by
       intro q m hq
-      obtain ⟨n, hn, hemb, _, p, hp, hwin⟩ := hmr q m hq
-      obtain ⟨n', _, hnn'⟩ := hrel.exists_of_mem_left hn
-      have hs := hpr n hn n' hnn'
-      obtain ⟨p0, hp0, hok, _⟩ := hstep n hn (locOf (some (emb tag)) (emb n.tag))
-      rw [hp] at hp0
-      cases hp0
-      obtain ⟨_, _, _, _, _, _, p', htr, _⟩ := hok n' hs
-      rw [hemb] at htr
-      obtain ⟨ps', hrun, _⟩ := transitionRange_ok_of_pointwise
-        (locRel (some (emb tag)) q) k len off m.permissions
-        (fun b h1 h2 => ⟨p, p', hwin b h1 h2, htr⟩)
-      exact ⟨ps', hrun⟩
+      obtain ⟨n, hn, hemb, hnod⟩ := hmr q m hq
+      cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
+      | true =>
+        simp only [hov, ↓reduceIte] at hnod
+        obtain ⟨_, p, hp, hwin⟩ := hnod
+        obtain ⟨n', _, hnn'⟩ := hrel.exists_of_mem_left hn
+        have hs := hpr n hn n' hnn'
+        obtain ⟨p0, hp0, hok, _⟩ := (hstep n hn).1 hov (locOf (some (emb tag)) (emb n.tag))
+        rw [hp] at hp0; cases hp0
+        obtain ⟨_, _, _, _, _, _, p', htr, _⟩ := hok n' hs
+        rw [hemb] at htr
+        obtain ⟨ps', hrun, _⟩ := transitionRange_ok_of_pointwise
+          (locRel (some (emb tag)) q) k len off m.permissions
+          (fun b h1 h2 => ⟨p, p', hwin b h1 h2, htr⟩)
+        exact ⟨ps', hrun⟩
+      | false =>
+        simp only [hov, Bool.false_eq_true, ↓reduceIte] at hnod
+        have hfor := hdisjForeign n hn hov
+        rw [hemb] at hfor
+        rw [hfor]
+        obtain ⟨ps', hrun, _⟩ := transitionRange_ok_of_pointwise .Foreign k len off m.permissions
+          (fun b h1 h2 => by
+            obtain ⟨p, hpb, hpas⟩ := hnod.2 b h1 h2
+            obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p k hpas
+            exact ⟨p, p', hpb, htr⟩)
+        exact ⟨ps', hrun⟩
     obtain ⟨t', hacc, hpost⟩ :=
       node_access_ok_of_pointwise k off len t (some (emb tag)) hpoint
     refine ⟨t', hacc, ?_⟩
-    -- Per-node post-state facts.
     have hnode : ∀ n' ∈ nodes', ∃ n ∈ w.nodes, n'.tag = n.tag ∧
         n'.rangeOffset = n.rangeOffset ∧ n'.rangeLen = n.rangeLen ∧
         (n'.isProtected w.activeProtectors = true → n'.perm ≠ .reservedIM) ∧
         (n'.isProtected w.activeProtectors = true → n'.perm = .unique → n'.accessed = true) ∧
         ∃ m', nodeAt t' (emb n'.tag) = some m' ∧
-          NodeWindowRel w.activeProtectors off len n' m' := by
+          if rangesOverlap off len n'.rangeOffset n'.rangeLen = true then
+            NodeWindowRel w.activeProtectors off len n' m'
+          else
+            Protected.yes m'.«protected» = n'.isProtected w.activeProtectors ∧
+            ∀ b, off ≤ b → b < off + len → ∃ p, m'.permissions[b]? = some p ∧ permIsForeignPassive p = true := by
       intro n' hn'
       obtain ⟨n, hn, hnn'⟩ := hrel.exists_of_mem_right hn'
       have hs := hpr n hn n' hnn'
-      obtain ⟨m, hm, hprotm, p, hp, hwin⟩ := hinv.nodes n hn
-      obtain ⟨p0, hp0, hok, _⟩ := hstep n hn (locOf (some (emb tag)) (emb n.tag))
-      rw [hp] at hp0
-      cases hp0
-      obtain ⟨htag, hpe, hro, hrl, hIM, hUA, p', htr, hp'⟩ := hok n' hs
+      obtain ⟨m, hm, hnod⟩ := hinv.nodes n hn
       obtain ⟨m', hm', hprot', hrun⟩ := (hpost (emb n.tag)).1 m hm
-      refine ⟨n, hn, htag, hro, hrl, hIM, hUA, m', by rw [htag]; exact hm', ?_, p', ?_, ?_⟩
-      · rw [hprot', hprotm, hpe]
-      · rw [hpe]; exact hp'
-      · intro b h1 h2
+      cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
+      | true =>
+        simp only [hov, ↓reduceIte] at hnod
+        obtain ⟨hprotm, p, hp, hwin⟩ := hnod
+        obtain ⟨p0, hp0, hok, _⟩ := (hstep n hn).1 hov (locOf (some (emb tag)) (emb n.tag))
+        rw [hp] at hp0; cases hp0
+        obtain ⟨htag, hpe, hro, hrl, hIM, hUA, p', htr, hp'⟩ := hok n' hs
+        refine ⟨n, hn, htag, hro, hrl, hIM, hUA, m', by rw [htag]; exact hm', ?_⟩
+        rw [hro, hrl]
+        simp only [hov, ↓reduceIte]
+        refine ⟨by rw [hprot', hprotm, hpe], p', by rw [hpe]; exact hp', fun b h1 h2 => ?_⟩
         obtain ⟨ps', hrun', _, _, hin⟩ := transitionRange_ok_of_pointwise
           (locRel (some (emb tag)) (emb n.tag)) k len off m.permissions
           (fun b h1 h2 => ⟨p, p', hwin b h1 h2, htr⟩)
-        rw [hrun] at hrun'
-        cases hrun'
+        rw [hrun] at hrun'; cases hrun'
         obtain ⟨p'', htr'', hget⟩ := hin b h1 h2 p (hwin b h1 h2)
-        have htr2 : Permission.transition p k (locRel (some (emb tag)) (emb n.tag)) =
-            .ok p' := htr
-        rw [htr2] at htr''
-        cases htr''
+        have htr2 : Permission.transition p k (locRel (some (emb tag)) (emb n.tag)) = .ok p' := htr
+        rw [htr2] at htr''; cases htr''
         exact hget
-    refine ⟨?_, ?_, ?_, ?_, ?_⟩
+      | false =>
+        simp only [hov, Bool.false_eq_true, ↓reduceIte] at hnod
+        have hstay := (hstep n hn).2 hov (locOf (some (emb tag)) (emb n.tag))
+        rw [hstay] at hs
+        have hneq : n' = n := by cases hs; rfl
+        subst hneq
+        have hfor := hdisjForeign n' hn hov
+        rw [hfor] at hrun
+        obtain ⟨_, _, hin⟩ := c1_transitionRange_ok_full .Foreign k off len m.permissions
+          m'.permissions hrun
+        refine ⟨n', hn, rfl, rfl, rfl, hinv.noProtIM n' hn, hinv.protUniqAcc n' hn, m', hm', ?_⟩
+        simp only [hov, Bool.false_eq_true, ↓reduceIte]
+        refine ⟨by rw [hprot', hnod.1], fun b h1 h2 => ?_⟩
+        obtain ⟨p, hpb, hpas⟩ := hnod.2 b h1 h2
+        obtain ⟨p0, p', hp0, htr, hp'⟩ := hin b h1 h2
+        rw [hpb] at hp0; cases hp0
+        obtain ⟨p'', htr'', hpas'⟩ := permission_isForeignPassive_preserved p k hpas
+        rw [htr] at htr''; cases htr''
+        exact ⟨p', hp', hpas'⟩
+    refine ⟨?_, ?_, ?_, ?_⟩
     · intro n' hn'
       obtain ⟨_, _, _, _, _, _, _, m', hm', hrel'⟩ := hnode n' hn'
       exact ⟨m', hm', hrel'⟩
     · intro q m' hq'
       cases hq : nodeAt t q with
-      | none =>
-        rw [(hpost q).2 hq] at hq'
-        cases hq'
+      | none => rw [(hpost q).2 hq] at hq'; cases hq'
       | some m =>
         obtain ⟨n, hn, hemb⟩ := hinv.surj q m hq
         obtain ⟨n', hn', hnn'⟩ := hrel.exists_of_mem_left hn
         have hs := hpr n hn n' hnn'
-        obtain ⟨_, _, hok, _⟩ := hstep n hn (locOf (some (emb tag)) (emb n.tag))
-        obtain ⟨htag, _⟩ := hok n' hs
-        exact ⟨n', hn', by rw [htag]; exact hemb⟩
-    · intro n' hn'
-      obtain ⟨n, hn, _, hro, hrl, _⟩ := hnode n' hn'
-      rw [hro, hrl]
-      exact hinv.overlap n hn
-    · intro n' hn'
-      obtain ⟨_, _, _, _, _, hIM, _⟩ := hnode n' hn'
-      exact hIM
-    · intro n' hn'
-      obtain ⟨_, _, _, _, _, _, hUA, _⟩ := hnode n' hn'
-      exact hUA
+        cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
+        | true =>
+          obtain ⟨_, _, hok, _⟩ := (hstep n hn).1 hov (locOf (some (emb tag)) (emb n.tag))
+          obtain ⟨htag, _⟩ := hok n' hs
+          exact ⟨n', hn', by rw [htag]; exact hemb⟩
+        | false =>
+          have hstay := (hstep n hn).2 hov (locOf (some (emb tag)) (emb n.tag))
+          rw [hstay] at hs
+          have hneq : n' = n := by cases hs; rfl
+          subst hneq
+          exact ⟨n', hn', hemb⟩
+    · intro n' hn'; obtain ⟨_, _, _, _, _, hIM, _⟩ := hnode n' hn'; exact hIM
+    · intro n' hn'; obtain ⟨_, _, _, _, _, _, hUA, _⟩ := hnode n' hn'; exact hUA
   · intro hno
     cases hacc : Node.access t (some (emb tag)) k ⟨off⟩ ⟨len⟩ with
     | ok t' =>
       exfalso
       have hall : ∀ n ∈ w.nodes, ∃ n', PrunedStepRel w tag isWrite off len step n n' := by
         intro n hn
-        obtain ⟨m, hm, _, p, hp, hwin⟩ := hinv.nodes n hn
-        obtain ⟨ps', hrun⟩ := node_access_ok_inv k off len t t' (some (emb tag)) hacc
-          (emb n.tag) m hm
-        obtain ⟨q0, q0', hq0, htr0⟩ := transitionRange_ok_inv
-          (locRel (some (emb tag)) (emb n.tag)) k len off m.permissions ps' hrun off
-          (Nat.le_refl _) (by omega)
-        rw [hwin off (Nat.le_refl _) (by omega)] at hq0
-        cases hq0
-        obtain ⟨p0, hp0, _, herr⟩ := hstep n hn (locOf (some (emb tag)) (emb n.tag))
-        rw [hp] at hp0
-        cases hp0
-        cases hs : step (locOf (some (emb tag)) (emb n.tag)) n with
-        | ok n' => exact ⟨n', hrp n hn n' hs⟩
-        | error e =>
-          obtain ⟨msg, hmsg⟩ := herr e hs
-          rw [hrelNode] at hmsg
-          have htr0' : Permission.transition p k
-              (if locOf (some (emb tag)) (emb n.tag) then Gen.NodeRelation.Local else .Foreign) =
-              .ok q0' := htr0
-          rw [htr0'] at hmsg
-          cases hmsg
+        cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
+        | false =>
+          exact ⟨n, hrp n hn n ((hstep n hn).2 hov (locOf (some (emb tag)) (emb n.tag)))⟩
+        | true =>
+          obtain ⟨m, hm, hnod⟩ := hinv.nodes n hn
+          simp only [hov, ↓reduceIte] at hnod
+          obtain ⟨_, p, hp, hwin⟩ := hnod
+          obtain ⟨ps', hrun⟩ := node_access_ok_inv k off len t t' (some (emb tag)) hacc
+            (emb n.tag) m hm
+          obtain ⟨q0, q0', hq0, htr0⟩ := transitionRange_ok_inv
+            (locRel (some (emb tag)) (emb n.tag)) k len off m.permissions ps' hrun off
+            (Nat.le_refl _) (by omega)
+          rw [hwin off (Nat.le_refl _) (by omega)] at hq0; cases hq0
+          obtain ⟨p0, hp0, _, herr⟩ := (hstep n hn).1 hov (locOf (some (emb tag)) (emb n.tag))
+          rw [hp] at hp0; cases hp0
+          cases hs : step (locOf (some (emb tag)) (emb n.tag)) n with
+          | ok n' => exact ⟨n', hrp n hn n' hs⟩
+          | error e =>
+            obtain ⟨msg, hmsg⟩ := herr e hs
+            rw [hrelNode] at hmsg
+            have htr0' : Permission.transition p k
+                (if locOf (some (emb tag)) (emb n.tag) then Gen.NodeRelation.Local else .Foreign) =
+                .ok q0' := htr0
+            rw [htr0'] at hmsg; cases hmsg
       obtain ⟨nodes', hrel⟩ := nwsr_listRel_of_forall w.nodes hall
       exact hno nodes' hrel
     | error e =>
       obtain ⟨q, m, hq, herr⟩ := node_access_error_inv k off len t (some (emb tag)) e hacc
-      obtain ⟨n, _, _, _, p, _, hwin⟩ := hmr q m hq
-      have hlast := hwin (off + len - 1) (by omega) (by omega)
-      have hlt : off + len - 1 < m.permissions.length :=
-        (List.getElem?_eq_some_iff.mp hlast).1
+      obtain ⟨n, _, _, hnod⟩ := hmr q m hq
+      have hlenM : off + len ≤ m.permissions.length := by
+        cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
+        | true =>
+          simp only [hov, ↓reduceIte] at hnod
+          obtain ⟨_, p, _, hwin⟩ := hnod
+          have hlast := hwin (off + len - 1) (by omega) (by omega)
+          have hlt := (List.getElem?_eq_some_iff.mp hlast).1
+          omega
+        | false =>
+          simp only [hov, Bool.false_eq_true, ↓reduceIte] at hnod
+          obtain ⟨p, hlast, _⟩ := hnod.2 (off + len - 1) (by omega) (by omega)
+          have hlt := (List.getElem?_eq_some_iff.mp hlast).1
+          omega
       obtain ⟨msg, hmsg⟩ := transitionRange_error_is_ub (locRel (some (emb tag)) q) k len off
-        m.permissions e (by omega) herr
+        m.permissions e hlenM herr
       exact ⟨msg, by rw [hmsg]⟩
+
+/-- **Multi-range whole-tree READ simulation (`TreeSimInvMulti`)**: generalizes
+`tree_read_simulates_node_access` to multi-slice borrow trees containing disjoint
+sub-slices (e.g., `disjointTwoParamWorld`, `<[T]>::split_at_mut`), requiring only
+that the accessed tag's ancestors overlap `[off, off + len)` (`hancOv`). -/
+theorem tree_read_simulates_node_access_multi
+    (off len : Nat) (hlen : 0 < len) (emb : Nat → Gen.Path)
+    (w : FnEntryBorrowWorld) (t : Gen.Node) (tag : Nat)
+    (hinv : TreeSimInvMulti off len emb w t)
+    (htag : ∃ n, findNode? w.nodes tag = some n)
+    (hloc : ∀ n ∈ w.nodes,
+      (ancestorPathTags w.nodes tag).contains n.tag = locOf (some (emb tag)) (emb n.tag))
+    (hancOv : ∀ n ∈ w.nodes,
+      (ancestorPathTags w.nodes tag).contains n.tag = true →
+      rangesOverlap off len n.rangeOffset n.rangeLen = true)
+    (hnoprune : ∀ n ∈ w.nodes,
+      isPrunedForeignNode w.nodes (ancestorPathTags w.nodes tag) false off len n = true →
+      foreignStepInert w.activeProtectors false off len n = true) :
+    (∀ w', execWorldRangeRead w tag off len = .ok w' →
+      ∃ t', Node.access t (some (emb tag)) .Read ⟨off⟩ ⟨len⟩ = .ok t' ∧
+        TreeSimInvMulti off len emb w' t') ∧
+    (∀ e, execWorldRangeRead w tag off len = .error e →
+      ∃ msg, Node.access t (some (emb tag)) .Read ⟨off⟩ ⟨len⟩ = .error (.ub msg)) ∧
+    (∀ t', Node.access t (some (emb tag)) .Read ⟨off⟩ ⟨len⟩ = .ok t' →
+      ∃ w', execWorldRangeRead w tag off len = .ok w' ∧ TreeSimInvMulti off len emb w' t') := by
+  have hne : len ≠ 0 := by omega
+  have hstep : ∀ n ∈ w.nodes, c1_NodeStepSimMulti w.activeProtectors off len .Read
+      (fun isLoc m => stepNodeOnRangeRead w.activeProtectors isLoc off len m) n := by
+    intro n hn
+    refine ⟨fun hov isLocal => ?_, fun hdisj isLocal => ?_⟩
+    · obtain ⟨p, hp, hok, herr⟩ := stepNodeOnRangeRead_simulates_permission_transition
+        w.activeProtectors isLocal off len n hov (hinv.noProtIM n hn) (hinv.protUniqAcc n hn)
+      refine ⟨p, hp, fun n' hn' => ?_, herr⟩
+      obtain ⟨htag', hprot', hro, hrl, hIM', hUA'⟩ := nwsr_stepRead_meta _ isLocal off len n n' hn'
+      have hpe : n'.isProtected w.activeProtectors = n.isProtected w.activeProtectors := by
+        unfold TreeTagNode.isProtected; rw [hprot']
+      exact ⟨htag', hpe, hro, hrl, fun hp' him => hinv.noProtIM n hn (hpe ▸ hp') (hIM' him),
+        hUA' (hinv.protUniqAcc n hn), hok n' hn'⟩
+    · unfold stepNodeOnRangeRead
+      simp only [hdisj, Bool.not_false, ↓reduceIte]
+  obtain ⟨hfwd, hbwd⟩ := c1_tree_sim_multi_core .Read false
+    (fun isLoc m => stepNodeOnRangeRead w.activeProtectors isLoc off len m)
+    off len hlen emb w t tag hinv hstep hloc hancOv
+    (fun n hn hp => nwsr_foreignStepInert_read (hnoprune n hn hp))
+  have h1 : ∀ w', execWorldRangeRead w tag off len = .ok w' →
+      ∃ t', Node.access t (some (emb tag)) .Read ⟨off⟩ ⟨len⟩ = .ok t' ∧
+        TreeSimInvMulti off len emb w' t' := by
+    intro w' hok
+    obtain ⟨_, nodes', hw', hrel⟩ := (execWorldRangeRead_ok_iff w w' tag off len hne).mp hok
+    rw [hw']; exact hfwd nodes' hrel
+  have h2 : ∀ e, execWorldRangeRead w tag off len = .error e →
+      ∃ msg, Node.access t (some (emb tag)) .Read ⟨off⟩ ⟨len⟩ = .error (.ub msg) := by
+    intro e herr
+    apply hbwd
+    intro nodes' hrel
+    have hok := (execWorldRangeRead_ok_iff w { w with nodes := nodes' } tag off len hne).mpr
+      ⟨htag, nodes', rfl, hrel⟩
+    rw [herr] at hok; cases hok
+  refine ⟨h1, h2, ?_⟩
+  intro t' hacc
+  cases hr : execWorldRangeRead w tag off len with
+  | ok w' =>
+    obtain ⟨t'', hacc'', hinv'⟩ := h1 w' hr
+    rw [hacc] at hacc''; cases hacc''
+    exact ⟨w', rfl, hinv'⟩
+  | error e =>
+    obtain ⟨msg, hmsg⟩ := h2 e hr
+    rw [hacc] at hmsg; cases hmsg
+
+/-- **Multi-range whole-tree WRITE simulation (`TreeSimInvMulti`)**: generalizes
+`tree_write_simulates_node_access` to multi-slice borrow trees containing disjoint
+sub-slices. -/
+theorem tree_write_simulates_node_access_multi
+    (off len : Nat) (hlen : 0 < len) (emb : Nat → Gen.Path)
+    (w : FnEntryBorrowWorld) (t : Gen.Node) (tag : Nat)
+    (hinv : TreeSimInvMulti off len emb w t)
+    (hro : w.allocReadOnly = false)
+    (htag : ∃ n, findNode? w.nodes tag = some n)
+    (hloc : ∀ n ∈ w.nodes,
+      (ancestorPathTags w.nodes tag).contains n.tag = locOf (some (emb tag)) (emb n.tag))
+    (hancOv : ∀ n ∈ w.nodes,
+      (ancestorPathTags w.nodes tag).contains n.tag = true →
+      rangesOverlap off len n.rangeOffset n.rangeLen = true)
+    (hnoprune : ∀ n ∈ w.nodes,
+      isPrunedForeignNode w.nodes (ancestorPathTags w.nodes tag) true off len n = true →
+      foreignStepInert w.activeProtectors true off len n = true) :
+    (∀ w', execWorldRangeWrite w tag off len = .ok w' →
+      ∃ t', Node.access t (some (emb tag)) .Write ⟨off⟩ ⟨len⟩ = .ok t' ∧
+        TreeSimInvMulti off len emb w' t') ∧
+    (∀ e, execWorldRangeWrite w tag off len = .error e →
+      ∃ msg, Node.access t (some (emb tag)) .Write ⟨off⟩ ⟨len⟩ = .error (.ub msg)) ∧
+    (∀ t', Node.access t (some (emb tag)) .Write ⟨off⟩ ⟨len⟩ = .ok t' →
+      ∃ w', execWorldRangeWrite w tag off len = .ok w' ∧ TreeSimInvMulti off len emb w' t') := by
+  have hne : len ≠ 0 := by omega
+  have hstep : ∀ n ∈ w.nodes, c1_NodeStepSimMulti w.activeProtectors off len .Write
+      (fun isLoc m => stepNodeOnRangeWrite w.activeProtectors isLoc off len m) n := by
+    intro n hn
+    refine ⟨fun hov isLocal => ?_, fun hdisj isLocal => ?_⟩
+    · obtain ⟨p, hp, hok, herr⟩ := stepNodeOnRangeWrite_simulates_permission_transition
+        w.activeProtectors isLocal off len n hov (hinv.noProtIM n hn) (hinv.protUniqAcc n hn)
+      refine ⟨p, hp, fun n' hn' => ?_, herr⟩
+      obtain ⟨htag', hprot', hro', hrl, hIM', hUA'⟩ := nwsr_stepWrite_meta _ isLocal off len n n' hn'
+      have hpe : n'.isProtected w.activeProtectors = n.isProtected w.activeProtectors := by
+        unfold TreeTagNode.isProtected; rw [hprot']
+      exact ⟨htag', hpe, hro', hrl, fun hp' him => hinv.noProtIM n hn (hpe ▸ hp') (hIM' him),
+        hUA' (hinv.protUniqAcc n hn), hok n' hn'⟩
+    · unfold stepNodeOnRangeWrite
+      simp only [hdisj, Bool.not_false, ↓reduceIte]
+  obtain ⟨hfwd, hbwd⟩ := c1_tree_sim_multi_core .Write true
+    (fun isLoc m => stepNodeOnRangeWrite w.activeProtectors isLoc off len m)
+    off len hlen emb w t tag hinv hstep hloc hancOv
+    (fun n hn hp => nwsr_foreignStepInert_write (hnoprune n hn hp))
+  have h1 : ∀ w', execWorldRangeWrite w tag off len = .ok w' →
+      ∃ t', Node.access t (some (emb tag)) .Write ⟨off⟩ ⟨len⟩ = .ok t' ∧
+        TreeSimInvMulti off len emb w' t' := by
+    intro w' hok
+    obtain ⟨_, _, nodes', hw', hrel⟩ := (execWorldRangeWrite_ok_iff w w' tag off len hne).mp hok
+    rw [hw']; exact hfwd nodes' hrel
+  have h2 : ∀ e, execWorldRangeWrite w tag off len = .error e →
+      ∃ msg, Node.access t (some (emb tag)) .Write ⟨off⟩ ⟨len⟩ = .error (.ub msg) := by
+    intro e herr
+    apply hbwd
+    intro nodes' hrel
+    have hok := (execWorldRangeWrite_ok_iff w { w with nodes := nodes' } tag off len hne).mpr
+      ⟨hro, htag, nodes', rfl, hrel⟩
+    rw [herr] at hok; cases hok
+  refine ⟨h1, h2, ?_⟩
+  intro t' hacc
+  cases hr : execWorldRangeWrite w tag off len with
+  | ok w' =>
+    obtain ⟨t'', hacc'', hinv'⟩ := h1 w' hr
+    rw [hacc] at hacc''; cases hacc''
+    exact ⟨w', rfl, hinv'⟩
+  | error e =>
+    obtain ⟨msg, hmsg⟩ := h2 e hr
+    rw [hacc] at hmsg; cases hmsg
 
 /-- **Whole-tree relational READ simulation** (`execWorldRangeRead` ↔ MiniRust
 `Node.access … AccessKind::Read`, the tree access performed by
-`TreeBorrowsMemory.load`): for EVERY borrow world `w` and MiniRust borrow tree `t`
-of ANY shape and size related by `TreeSimInv` on the non-empty byte window
-`[off, off + len)`, whenever the Anneal ancestor set of `tag` coincides with the
-MiniRust path-prefix relation (`hloc`) and Miri's `SkipSelfAndChildren` pruning is
-inert (`hnoprune`: every pruned node is unchanged by the foreign step it skips,
-`foreignStepInert`; this holds in particular whenever no node is pruned, the
-hypothesis of
-`execFnEntryMutRetagPrunedSourceOrder_eq_sourceOrder_of_noSkippedForeignSubtree`):
-1. every successful Anneal read is matched by a successful MiniRust tree access
+`TreeBorrowsMemory.load`): over ANY `TreeSimInv`-related borrow tree (`0 < len`)
+where Miri's `SkipSelfAndChildren` pruning is inert (`hnoprune`,
+`foreignStepInert`):
+1. every successful Anneal read is matched by a successful MiniRust `Node.access`
    whose result is again `TreeSimInv`-related (the invariant is inductive);
 2. every Anneal read error is Tree Borrows UB in MiniRust;
 3. conversely every successful MiniRust access is matched by a successful Anneal
@@ -4058,41 +4451,27 @@ theorem tree_read_simulates_node_access
       ∃ msg, Node.access t (some (emb tag)) .Read ⟨off⟩ ⟨len⟩ = .error (.ub msg)) ∧
     (∀ t', Node.access t (some (emb tag)) .Read ⟨off⟩ ⟨len⟩ = .ok t' →
       ∃ w', execWorldRangeRead w tag off len = .ok w' ∧ TreeSimInv off len emb w' t') := by
-  have hne : len ≠ 0 := by omega
-  obtain ⟨hfwd, hbwd⟩ := nwsr_tree_sim_core .Read false
-    (fun isLoc m => stepNodeOnRangeRead w.activeProtectors isLoc off len m)
-    off len hlen emb w t tag hinv
-    (fun n hn => nwsr_stepRead_sim w.activeProtectors off len n (hinv.overlap n hn)
-      (hinv.noProtIM n hn) (hinv.protUniqAcc n hn))
-    hloc (fun n hn hp => nwsr_foreignStepInert_read (hnoprune n hn hp))
-  have h1 : ∀ w', execWorldRangeRead w tag off len = .ok w' →
-      ∃ t', Node.access t (some (emb tag)) .Read ⟨off⟩ ⟨len⟩ = .ok t' ∧
-        TreeSimInv off len emb w' t' := by
-    intro w' hok
-    obtain ⟨_, nodes', hw', hrel⟩ := (execWorldRangeRead_ok_iff w w' tag off len hne).mp hok
-    rw [hw']
-    exact hfwd nodes' hrel
-  have h2 : ∀ e, execWorldRangeRead w tag off len = .error e →
-      ∃ msg, Node.access t (some (emb tag)) .Read ⟨off⟩ ⟨len⟩ = .error (.ub msg) := by
-    intro e herr
-    apply hbwd
-    intro nodes' hrel
-    have hok := (execWorldRangeRead_ok_iff w { w with nodes := nodes' } tag off len hne).mpr
-      ⟨htag, nodes', rfl, hrel⟩
-    rw [herr] at hok
-    cases hok
-  refine ⟨h1, h2, ?_⟩
-  intro t' hacc
-  cases hr : execWorldRangeRead w tag off len with
-  | ok w' =>
-    obtain ⟨t'', hacc'', hinv'⟩ := h1 w' hr
-    rw [hacc] at hacc''
-    cases hacc''
-    exact ⟨w', rfl, hinv'⟩
-  | error e =>
-    obtain ⟨msg, hmsg⟩ := h2 e hr
-    rw [hacc] at hmsg
-    cases hmsg
+  have hov' : ∀ w', execWorldRangeRead w tag off len = .ok w' →
+      ∀ n' ∈ w'.nodes, rangesOverlap off len n'.rangeOffset n'.rangeLen = true := by
+    intro w' hok n' hn'
+    obtain ⟨_, nodes', hw', hrel⟩ := (execWorldRangeRead_ok_iff w w' tag off len (by omega)).mp hok
+    rw [hw'] at hn'
+    obtain ⟨n, hn, hr⟩ := hrel.exists_of_mem_right hn'
+    rcases hr with hstep | ⟨_, _, rfl⟩ | ⟨_, _, hstep⟩
+    · obtain ⟨_, _, hro, hrl, _, _⟩ := nwsr_stepRead_meta _ true off len n n' hstep.2
+      rw [hro, hrl]; exact hinv.overlap n hn
+    · exact hinv.overlap n' hn
+    · obtain ⟨_, _, hro, hrl, _, _⟩ := nwsr_stepRead_meta _ false off len n n' hstep
+      rw [hro, hrl]; exact hinv.overlap n hn
+  obtain ⟨h1, h2, h3⟩ := tree_read_simulates_node_access_multi off len hlen emb w t tag
+    (treeSimInvMulti_of_treeSimInv _ _ _ _ _ hinv) htag hloc (fun n hn _ => hinv.overlap n hn) hnoprune
+  exact ⟨fun w' hw' => by
+      obtain ⟨t', ha, hm⟩ := h1 w' hw'
+      exact ⟨t', ha, a3_treeSimInv_of_multi _ _ _ _ _ hm (hov' w' hw')⟩,
+    h2,
+    fun t' ht' => by
+      obtain ⟨w', hw', hm⟩ := h3 t' ht'
+      exact ⟨w', hw', a3_treeSimInv_of_multi _ _ _ _ _ hm (hov' w' hw')⟩⟩
 
 /-- **Whole-tree relational WRITE simulation** (`execWorldRangeWrite` ↔ MiniRust
 `Node.access … AccessKind::Write`, the tree access performed by
@@ -4117,41 +4496,27 @@ theorem tree_write_simulates_node_access
       ∃ msg, Node.access t (some (emb tag)) .Write ⟨off⟩ ⟨len⟩ = .error (.ub msg)) ∧
     (∀ t', Node.access t (some (emb tag)) .Write ⟨off⟩ ⟨len⟩ = .ok t' →
       ∃ w', execWorldRangeWrite w tag off len = .ok w' ∧ TreeSimInv off len emb w' t') := by
-  have hne : len ≠ 0 := by omega
-  obtain ⟨hfwd, hbwd⟩ := nwsr_tree_sim_core .Write true
-    (fun isLoc m => stepNodeOnRangeWrite w.activeProtectors isLoc off len m)
-    off len hlen emb w t tag hinv
-    (fun n hn => nwsr_stepWrite_sim w.activeProtectors off len n (hinv.overlap n hn)
-      (hinv.noProtIM n hn) (hinv.protUniqAcc n hn))
-    hloc (fun n hn hp => nwsr_foreignStepInert_write (hnoprune n hn hp))
-  have h1 : ∀ w', execWorldRangeWrite w tag off len = .ok w' →
-      ∃ t', Node.access t (some (emb tag)) .Write ⟨off⟩ ⟨len⟩ = .ok t' ∧
-        TreeSimInv off len emb w' t' := by
-    intro w' hok
-    obtain ⟨_, _, nodes', hw', hrel⟩ := (execWorldRangeWrite_ok_iff w w' tag off len hne).mp hok
-    rw [hw']
-    exact hfwd nodes' hrel
-  have h2 : ∀ e, execWorldRangeWrite w tag off len = .error e →
-      ∃ msg, Node.access t (some (emb tag)) .Write ⟨off⟩ ⟨len⟩ = .error (.ub msg) := by
-    intro e herr
-    apply hbwd
-    intro nodes' hrel
-    have hok := (execWorldRangeWrite_ok_iff w { w with nodes := nodes' } tag off len hne).mpr
-      ⟨hro, htag, nodes', rfl, hrel⟩
-    rw [herr] at hok
-    cases hok
-  refine ⟨h1, h2, ?_⟩
-  intro t' hacc
-  cases hr : execWorldRangeWrite w tag off len with
-  | ok w' =>
-    obtain ⟨t'', hacc'', hinv'⟩ := h1 w' hr
-    rw [hacc] at hacc''
-    cases hacc''
-    exact ⟨w', rfl, hinv'⟩
-  | error e =>
-    obtain ⟨msg, hmsg⟩ := h2 e hr
-    rw [hacc] at hmsg
-    cases hmsg
+  have hov' : ∀ w', execWorldRangeWrite w tag off len = .ok w' →
+      ∀ n' ∈ w'.nodes, rangesOverlap off len n'.rangeOffset n'.rangeLen = true := by
+    intro w' hok n' hn'
+    obtain ⟨_, _, nodes', hw', hrel⟩ := (execWorldRangeWrite_ok_iff w w' tag off len (by omega)).mp hok
+    rw [hw'] at hn'
+    obtain ⟨n, hn, hr⟩ := hrel.exists_of_mem_right hn'
+    rcases hr with hstep | ⟨_, _, rfl⟩ | ⟨_, _, hstep⟩
+    · obtain ⟨_, _, hro', hrl, _, _⟩ := nwsr_stepWrite_meta _ true off len n n' hstep.2
+      rw [hro', hrl]; exact hinv.overlap n hn
+    · exact hinv.overlap n' hn
+    · obtain ⟨_, _, hro', hrl, _, _⟩ := nwsr_stepWrite_meta _ false off len n n' hstep
+      rw [hro', hrl]; exact hinv.overlap n hn
+  obtain ⟨h1, h2, h3⟩ := tree_write_simulates_node_access_multi off len hlen emb w t tag
+    (treeSimInvMulti_of_treeSimInv _ _ _ _ _ hinv) hro htag hloc (fun n hn _ => hinv.overlap n hn) hnoprune
+  exact ⟨fun w' hw' => by
+      obtain ⟨t', ha, hm⟩ := h1 w' hw'
+      exact ⟨t', ha, a3_treeSimInv_of_multi _ _ _ _ _ hm (hov' w' hw')⟩,
+    h2,
+    fun t' ht' => by
+      obtain ⟨w', hw', hm⟩ := h3 t' ht'
+      exact ⟨w', hw', a3_treeSimInv_of_multi _ _ _ _ _ hm (hov' w' hw')⟩⟩
 
 /-! ### 4.4 `TreeBorrowsMemory.store` / `load` as `Node.access` & Two-Node Tree Equations -/
 
@@ -4452,6 +4817,7 @@ def nodeWindowRelBool (ap : List Nat) (off len : Nat) (n : TreeTagNode) (m : Gen
   | some p => (List.range len).all (fun i => decide (m.permissions[off + i]? = some p))
   | none => false
 
+/-- Lift `nodeWindowRelBool` to `NodeWindowRel`. -/
 theorem nodeWindowRel_of_bool (ap : List Nat) (off len : Nat) (n : TreeTagNode) (m : Gen.Node)
     (h : nodeWindowRelBool ap off len n m = true) : NodeWindowRel ap off len n m := by
   unfold nodeWindowRelBool at h
@@ -4720,6 +5086,22 @@ private theorem a1_isPrefixOf_append_singleton_iff :
     · rintro (⟨rfl, h1⟩ | ⟨rfl, rfl⟩)
       · exact ⟨rfl, (a1_isPrefixOf_append_singleton_iff tl rest k).mpr (Or.inl h1)⟩
       · exact ⟨rfl, (a1_isPrefixOf_append_singleton_iff tl (tl ++ [k]) k).mpr (Or.inr rfl)⟩
+
+private theorem b1_isPrefixOf_refl : ∀ (p : Gen.Path), p.isPrefixOf p = true
+  | [] => rfl
+  | h :: tl => by simp only [List.isPrefixOf, a1_int_beq_self, Bool.true_and]; exact b1_isPrefixOf_refl tl
+
+private theorem b1_nodeAt_prefix_eq {p q : Gen.Path} :
+    p.isPrefixOf q = true → q.isPrefixOf p = true → p = q := by
+  induction p generalizing q with
+  | nil => intro _ h2; cases q with | nil => rfl | cons _ _ => cases h2
+  | cons a ps ih =>
+    intro h1 h2
+    cases q with
+    | nil => cases h1
+    | cons b qs =>
+      simp only [List.isPrefixOf, Bool.and_eq_true, a1_int_beq_iff] at h1 h2
+      rw [h1.1, ih h1.2 h2.2]
 
 private theorem a1_nodeAt_append :
     ∀ (p : Gen.Path) (n : Gen.Node) (suf : Gen.Path),
@@ -5423,49 +5805,6 @@ private theorem a1_cellsToFreezeMask_length {cells : List (Gen.Offset × LibSpec
     cases h
     exact Decidable.of_not_not hnot
 
-
-private def A1NodeStepSim (ap : List Nat) (k : Gen.AccessKind)
-    (step : Bool → TreeTagNode → Except RetagStepErr TreeTagNode) (n : TreeTagNode) : Prop :=
-  ∀ isLocal, ∃ p,
-    permToMiniRust (n.isProtected ap) n.accessed n.perm = some p ∧
-    (∀ n', step isLocal n = .ok n' →
-      n'.tag = n.tag ∧ n'.protector = n.protector ∧ n'.isProtected ap = n.isProtected ap ∧
-      n'.rangeOffset = n.rangeOffset ∧ n'.rangeLen = n.rangeLen ∧
-      (n'.isProtected ap = true → n'.perm ≠ .reservedIM) ∧
-      (n'.isProtected ap = true → n'.perm = .unique → n'.accessed = true) ∧
-      ∃ p', Permission.transition p k (nodeRelToMiniRust isLocal) = .ok p' ∧
-        permToMiniRust (n.isProtected ap) n'.accessed n'.perm = some p') ∧
-    (∀ e, step isLocal n = .error e →
-      ∃ msg, Permission.transition p k (nodeRelToMiniRust isLocal) = .error (.ub msg))
-
-private theorem a1_stepRead_sim (ap : List Nat) (off len : Nat) (n : TreeTagNode)
-    (hov : rangesOverlap off len n.rangeOffset n.rangeLen = true)
-    (hIM : n.isProtected ap = true → n.perm ≠ .reservedIM)
-    (hUA : n.isProtected ap = true → n.perm = .unique → n.accessed = true) :
-    A1NodeStepSim ap .Read (fun isLoc m => stepNodeOnRangeRead ap isLoc off len m) n := by
-  intro isLocal
-  obtain ⟨p, hp, hok, herr⟩ :=
-    stepNodeOnRangeRead_simulates_permission_transition ap isLocal off len n hov hIM hUA
-  refine ⟨p, hp, fun n' hn' => ?_, herr⟩
-  obtain ⟨htag, hprot, hro, hrl, hIM', hUA'⟩ := nwsr_stepRead_meta ap isLocal off len n n' hn'
-  have hpe : n'.isProtected ap = n.isProtected ap := by
-    unfold TreeTagNode.isProtected; rw [hprot]
-  exact ⟨htag, hprot, hpe, hro, hrl, fun hp' him => hIM (hpe ▸ hp') (hIM' him), hUA' hUA, hok n' hn'⟩
-
-private theorem a1_stepWrite_sim (ap : List Nat) (off len : Nat) (n : TreeTagNode)
-    (hov : rangesOverlap off len n.rangeOffset n.rangeLen = true)
-    (hIM : n.isProtected ap = true → n.perm ≠ .reservedIM)
-    (hUA : n.isProtected ap = true → n.perm = .unique → n.accessed = true) :
-    A1NodeStepSim ap .Write (fun isLoc m => stepNodeOnRangeWrite ap isLoc off len m) n := by
-  intro isLocal
-  obtain ⟨p, hp, hok, herr⟩ :=
-    stepNodeOnRangeWrite_simulates_permission_transition ap isLocal off len n hov hIM hUA
-  refine ⟨p, hp, fun n' hn' => ?_, herr⟩
-  obtain ⟨htag, hprot, hro, hrl, hIM', hUA'⟩ := nwsr_stepWrite_meta ap isLocal off len n n' hn'
-  have hpe : n'.isProtected ap = n.isProtected ap := by
-    unfold TreeTagNode.isProtected; rw [hprot]
-  exact ⟨htag, hprot, hpe, hro, hrl, fun hp' him => hIM (hpe ▸ hp') (hIM' him), hUA' hUA, hok n' hn'⟩
-
 private theorem a1_execFnEntryMutRetagPrunedSourceOrder_rustcNoWritable_ok_iff
     (w : FnEntryBorrowWorld) (parentTag off len : Nat) (requireInit : Bool) (hlen : len ≠ 0)
     (res : FnEntryBorrowWorld × Nat) :
@@ -5568,6 +5907,635 @@ private theorem a1_execFnEntryMutRetagPrunedSourceOrder_writableChildWrite_ok_if
     unfold execFnEntryMutRetagPrunedSourceOrder
     simp only [hfn, hlen0, hro, hreq, Bool.false_eq_true, ↓reduceIte, h1', h2', h3']
 
+private def a2_NodeStepSimMulti (ap : List Nat) (off len : Nat) (k : Gen.AccessKind)
+    (step : Bool → TreeTagNode → Except RetagStepErr TreeTagNode) (n : TreeTagNode) : Prop :=
+  (rangesOverlap off len n.rangeOffset n.rangeLen = true →
+    ∀ isLocal, ∃ p,
+      permToMiniRust (n.isProtected ap) n.accessed n.perm = some p ∧
+      (∀ n', step isLocal n = .ok n' →
+        n'.tag = n.tag ∧ n'.protector = n.protector ∧
+        n'.isProtected ap = n.isProtected ap ∧
+        n'.rangeOffset = n.rangeOffset ∧ n'.rangeLen = n.rangeLen ∧
+        (n'.isProtected ap = true → n'.perm ≠ .reservedIM) ∧
+        (n'.isProtected ap = true → n'.perm = .unique → n'.accessed = true) ∧
+        ∃ p', Permission.transition p k (nodeRelToMiniRust isLocal) = .ok p' ∧
+          permToMiniRust (n.isProtected ap) n'.accessed n'.perm = some p') ∧
+      (∀ e, step isLocal n = .error e →
+        ∃ msg, Permission.transition p k (nodeRelToMiniRust isLocal) = .error (.ub msg))) ∧
+  (rangesOverlap off len n.rangeOffset n.rangeLen = false →
+    ∀ isLocal, step isLocal n = .ok n)
+
+/-- **Lifted multi-window `TreeBorrowsMemory.retag_ptr` simulation (`TreeSimInvMulti`)**:
+removes the universal `overlap` restriction of `tbm_retag_ptr_fnEntry_mutOrBox_simulates_world`
+so `&mut T` / `Box<T>` `FnEntry` retags on sub-slices `[off, off + len)` inside
+multi-slice borrow trees (e.g. nested `split_at_mut`, where disjoint siblings carry
+`permIsForeignPassive` on `[off, off + len)`) simulate
+`execFnEntryMutRetagPrunedSourceOrder` in lockstep, preserving `TreeSimInvMulti`,
+`TreeBorrowsMemory.wfLive`, every pre-existing node's bytes outside `[off, off + len)`,
+and the new child's `.Prot (.Reserved false false)` outside bytes. -/
+theorem tbm_retag_ptr_fnEntry_mutOrBox_simulates_world_multi
+    (tbm : Gen.TreeBorrowsMemory Gen.x86_64) (frameExtra : Gen.TreeBorrowsFrameExtra)
+    (ptr : Gen.Pointer Gen.TreeBorrowsProvenance)
+    (lookup : Gen.ThinPointer Gen.TreeBorrowsProvenance → Interp Gen.VTable)
+    (facts : ParamTypeFacts) (kind : RefParamKind) (attrs : ParamRetagAttrs)
+    (hkind : kind ≠ .shared) (hunpin : (facts.isUnpin && facts.isUnsafeUnpin) = true)
+    (htbmParams : tbm.params = ⟨attrs.implicitWrites⟩)
+    (id : Nat) (alloc : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra)
+    (off len align : Nat) (hlen : 0 < len)
+    (cells : List (Gen.Offset × LibSpecr.Size)) (mask : List Bool)
+    (hmask : cellsToFreezeMask cells ⟨len⟩ = .ok mask)
+    (emb : Nat → Gen.Path) (w : FnEntryBorrowWorld) (parentTag : Nat) (requireInit : Bool)
+    (hprov : ptr.thin_pointer.provenance = some (⟨(id : Int)⟩, emb parentTag))
+    (halloc : tbm.mem.allocations[id]? = some alloc) (hlive : alloc.live = true)
+    (hoff : ptr.thin_pointer.addr - alloc.addr = (off : Int))
+    (hbound : off + len ≤ alloc.data.length)
+    (hinv : TreeSimInvMulti off len emb w alloc.extra.root)
+    (htag : ∃ pn, findNode? w.nodes parentTag = some pn)
+    (hfreshTag : ∀ n ∈ w.nodes, n.tag ≠ w.nextTag)
+    (hfreshProt : ∀ n ∈ w.nodes, n.protector ≠ some w.nextProtector)
+    (hloc : ∀ n ∈ w.nodes,
+      (ancestorPathTags w.nodes parentTag).contains n.tag = locOf (some (emb parentTag)) (emb n.tag))
+    (hancOv : ∀ n ∈ w.nodes,
+      (ancestorPathTags w.nodes parentTag).contains n.tag = true →
+      rangesOverlap off len n.rangeOffset n.rangeLen = true)
+    (hnoprune : ∀ n ∈ w.nodes,
+      isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag)
+        (selectFnEntryPolicy facts kind attrs == .writableChildWrite) off len n = true →
+      foreignStepInert w.activeProtectors
+        (selectFnEntryPolicy facts kind attrs == .writableChildWrite) off len n = true)
+    (hwritableGates : selectFnEntryPolicy facts kind attrs = .writableChildWrite →
+      w.allocReadOnly = false ∧ (requireInit && !w.pointeeInitialized) = false) :
+    let info := pointeeInfoOfFacts facts len align cells
+    let expectedProt : Gen.Protected := if kind = .box then .Weak else .Strong
+    let policy := selectFnEntryPolicy facts kind attrs
+    ∃ pNode, nodeAt alloc.extra.root (emb parentTag) = some pNode ∧
+      let childPath := emb parentTag ++ [(pNode.children.length : Int)]
+      let emb' := extendEmb emb w.nextTag childPath
+      (∀ w' childTag, execFnEntryMutRetagPrunedSourceOrder w parentTag off len policy requireInit =
+          .ok (w', childTag) →
+        ∃ tbm' alloc',
+          TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (ptrTypeOfParamKind kind info) true
+            (!attrs.rustcNoWritable) lookup =
+            .ok (ThinPointer.widen { ptr.thin_pointer with provenance := some (⟨(id : Int)⟩, childPath) }
+              ptr.metadata, tbm',
+              { protectors := frameExtra.protectors ++ [(⟨(id : Int)⟩, childPath)] }) ∧
+          tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
+          (TreeBorrowsMemory.wfLive tbm → TreeBorrowsMemory.wfLive tbm') ∧
+          (∃ mc, nodeAt alloc'.extra.root childPath = some mc ∧ mc.«protected» = expectedProt ∧
+            ∀ b, b < alloc.data.length → (b < off ∨ off + len ≤ b) →
+              mc.permissions[b]? = some (.Prot (.Reserved false false))) ∧
+          (∀ q m, nodeAt alloc.extra.root q = some m →
+            ∃ m', nodeAt alloc'.extra.root q = some m' ∧ m'.«protected» = m.«protected» ∧
+              ∀ b, b < off ∨ off + len ≤ b → m'.permissions[b]? = m.permissions[b]?) ∧
+          TreeSimInvMulti off len emb' w' alloc'.extra.root) ∧
+      (∀ e, execFnEntryMutRetagPrunedSourceOrder w parentTag off len policy requireInit = .error e →
+        ∃ msg, TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (ptrTypeOfParamKind kind info) true
+          (!attrs.rustcNoWritable) lookup = .error (.ub msg)) ∧
+      (∀ r, TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (ptrTypeOfParamKind kind info) true
+          (!attrs.rustcNoWritable) lookup = .ok r →
+        ∃ w' childTag, execFnEntryMutRetagPrunedSourceOrder w parentTag off len policy requireInit =
+          .ok (w', childTag) ∧
+          r.1 = ThinPointer.widen { ptr.thin_pointer with provenance := some (⟨(id : Int)⟩, childPath) }
+            ptr.metadata ∧
+          r.2.2 = { protectors := frameExtra.protectors ++ [(⟨(id : Int)⟩, childPath)] } ∧
+          ∃ alloc', r.2.1.mem.allocations[id]? = some alloc' ∧
+            TreeSimInvMulti off len emb' w' alloc'.extra.root) := by
+  have hmaskLen : mask.length = len := a1_cellsToFreezeMask_length hmask
+  obtain ⟨pn, hpn⟩ := htag
+  have hpnMem : pn ∈ w.nodes := (mem_of_findNode?_eq_some hpn).1
+  have hpnTag : pn.tag = parentTag := (mem_of_findNode?_eq_some hpn).2
+  obtain ⟨pNode, hpNode, _⟩ := hinv.nodes pn hpnMem
+  rw [hpnTag] at hpNode
+  refine ⟨pNode, hpNode, ?_⟩
+  let info := pointeeInfoOfFacts facts len align cells
+  let expectedProt : Gen.Protected := if kind = .box then .Weak else .Strong
+  have hProtYes : Protected.yes expectedProt = true := by
+    dsimp only [expectedProt]; split <;> rfl
+  let childPath := emb parentTag ++ [(pNode.children.length : Int)]
+  let emb' := extendEmb emb w.nextTag childPath
+  have hneLen : len ≠ 0 := by omega
+  have hpolNotSkip : selectFnEntryPolicy facts kind attrs ≠ .skipRetag := by
+    unfold selectFnEntryPolicy
+    cases kind with
+    | shared => exact absurd rfl hkind
+    | mutable | box =>
+      simp only [hunpin, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+      split <;> decide
+  have hsettings := reborrowSettings_fnEntry_mutOrBox_eq_policy lookup ptr facts kind attrs hkind
+    len align cells mask hmask
+  rw [← htbmParams] at hsettings
+  have hlocChild : ∀ q m, nodeAt alloc.extra.root q = some m →
+      locOf (some childPath) q = locOf (some (emb parentTag)) q :=
+    fun q m hm => locOf_childPath_eq_parentPath alloc.extra.root (emb parentTag) q pNode m hpNode hm
+  have hlocChildSelf : locOf (some childPath) childPath = true := by
+    rw [locOf_some_eq_isPrefixOf]
+    exact b1_isPrefixOf_refl childPath
+  have hdisjForeign : ∀ n ∈ w.nodes, rangesOverlap off len n.rangeOffset n.rangeLen = false →
+      locOf (some (emb parentTag)) (emb n.tag) = false := by
+    intro n hn hdisj
+    cases hl : locOf (some (emb parentTag)) (emb n.tag) with
+    | false => rfl
+    | true =>
+      have hov := hancOv n hn (by rw [hloc n hn, hl])
+      rw [hov] at hdisj; cases hdisj
+  have hmr : ∀ q m, nodeAt alloc.extra.root q = some m → ∃ n ∈ w.nodes, emb n.tag = q ∧
+      (if rangesOverlap off len n.rangeOffset n.rangeLen = true then
+        NodeWindowRel w.activeProtectors off len n m
+       else
+        Protected.yes m.«protected» = n.isProtected w.activeProtectors ∧
+        ∀ b, off ≤ b → b < off + len → ∃ p, m.permissions[b]? = some p ∧ permIsForeignPassive p = true) := by
+    intro q m hq
+    obtain ⟨n, hn, hemb⟩ := hinv.surj q m hq
+    obtain ⟨m', hm', hrel⟩ := hinv.nodes n hn
+    rw [hemb, hq] at hm'; cases hm'
+    exact ⟨n, hn, hemb, hrel⟩
+  have hcore :
+      ∀ (isWrite : Bool) (k : Gen.AccessKind) (pInit pAfter : Gen.Permission)
+        (childPerm : TreeBorrowPerm)
+        (step : Bool → TreeTagNode → Except RetagStepErr TreeTagNode),
+        Permission.init_access pInit = some k →
+        Permission.transition pInit k .Local = .ok pAfter →
+        Permission.matches_protector pInit expectedProt = true →
+        permToMiniRust true true childPerm = some pAfter →
+        childPerm ≠ .reservedIM →
+        (∀ n ∈ w.nodes, a2_NodeStepSimMulti w.activeProtectors off len k step n) →
+        (∀ n ∈ w.nodes,
+          isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) isWrite off len n = true →
+          step false n = .ok n) →
+        ReborrowSettings.new lookup ptr (ptrTypeOfParamKind kind info) true tbm.params
+          (!attrs.rustcNoWritable) =
+          .ok (some { inside := List.replicate len pInit, outside := .Prot (.Reserved false false), «protected» := expectedProt }) →
+        let childNodeW : TreeTagNode :=
+          ⟨w.nextTag, some parentTag, childPerm, off, len, some w.nextProtector, true⟩
+        (∀ nodes', ListRel (PrunedStepRel w parentTag isWrite off len step) w.nodes nodes' →
+          ∃ tbm' alloc',
+            TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (ptrTypeOfParamKind kind info) true
+              (!attrs.rustcNoWritable) lookup =
+              .ok (ThinPointer.widen { ptr.thin_pointer with provenance := some (⟨(id : Int)⟩, childPath) }
+                ptr.metadata, tbm',
+                { protectors := frameExtra.protectors ++ [(⟨(id : Int)⟩, childPath)] }) ∧
+            tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
+            (TreeBorrowsMemory.wfLive tbm → TreeBorrowsMemory.wfLive tbm') ∧
+            (∃ mc, nodeAt alloc'.extra.root childPath = some mc ∧ mc.«protected» = expectedProt ∧
+              ∀ b, b < alloc.data.length → (b < off ∨ off + len ≤ b) →
+                mc.permissions[b]? = some (.Prot (.Reserved false false))) ∧
+            (∀ q m, nodeAt alloc.extra.root q = some m →
+              ∃ m', nodeAt alloc'.extra.root q = some m' ∧ m'.«protected» = m.«protected» ∧
+                ∀ b, b < off ∨ off + len ≤ b → m'.permissions[b]? = m.permissions[b]?) ∧
+            TreeSimInvMulti off len emb'
+              { w with
+                nodes := childNodeW :: nodes'
+                activeProtectors := w.nextProtector :: w.activeProtectors
+                nextTag := w.nextTag + 1
+                nextProtector := w.nextProtector + 1 } alloc'.extra.root) ∧
+        ((∀ nodes', ¬ ListRel (PrunedStepRel w parentTag isWrite off len step) w.nodes nodes') →
+          ∃ msg, TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (ptrTypeOfParamKind kind info) true
+            (!attrs.rustcNoWritable) lookup = .error (.ub msg)) := by
+    intro isWrite k pInit pAfter childPerm step hinitK hchildTr hmpInit hchildP hchildNoIM hstep hnpr hnew
+    let s : Gen.ReborrowSettings :=
+      { inside := List.replicate len pInit, outside := .Prot (.Reserved false false),
+        «protected» := expectedProt }
+    have hmpOut : Permission.matches_protector s.outside s.«protected» = true := by
+      simp [s, Permission.matches_protector, hProtYes]
+    have hmpIn : ∀ p ∈ s.inside, Permission.matches_protector p s.«protected» = true := by
+      intro p hp; rw [List.eq_of_mem_replicate hp]; exact hmpInit
+    have hsLen : s.inside.length = len := List.length_replicate
+    obtain ⟨root1, hadd, hreb⟩ := tbm_reborrow_eq tbm ptr.thin_pointer s frameExtra id
+      (emb parentTag) alloc pNode off hprov halloc hlive hoff (by rw [hsLen]; exact hbound)
+      hpNode hmpOut hmpIn
+    let childPerms := reborrowChildPerms alloc.data.length off s.outside s.inside
+    let childNodeMR : Gen.Node := ⟨[], childPerms, expectedProt⟩
+    obtain ⟨root1', hadd', hchildAt1, hexist1, hsurj1⟩ :=
+      node_add_node_spec alloc.extra.root pNode childNodeMR (emb parentTag) hpNode rfl
+    rw [hadd] at hadd'; cases hadd'
+    have hchildPermSpec := a1_reborrowChildPerms_spec alloc.data.length off s.outside s.inside
+      (by rw [hsLen]; exact hbound)
+    have hretagEq : TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (ptrTypeOfParamKind kind info)
+        true (!attrs.rustcNoWritable) lookup =
+        (TreeBorrowsMemory.reborrowInitAccess childPath ⟨off⟩ 0 s.inside root1 >>= fun root2 =>
+          pure (ThinPointer.widen { ptr.thin_pointer with provenance := some (⟨(id : Int)⟩, childPath) }
+              ptr.metadata,
+            { tbm with mem := { tbm.mem with allocations := (tbm.mem.allocations.set id
+              { alloc with extra := { root := root2 } }) } },
+            { protectors := frameExtra.protectors ++ [(⟨(id : Int)⟩, childPath)] })) := by
+      unfold TreeBorrowsMemory.retag_ptr
+      rw [hnew]
+      dsimp only [s, childPath] at hreb ⊢
+      simp only [bind, Except.bind, hreb, hProtYes, ↓reduceIte]
+      cases TreeBorrowsMemory.reborrowInitAccess (emb parentTag ++ [(pNode.children.length : Int)])
+        ⟨off⟩ 0 (List.replicate len pInit) root1 <;> rfl
+    have hpr : ∀ n ∈ w.nodes, ∀ n', PrunedStepRel w parentTag isWrite off len step n n' →
+        step (locOf (some (emb parentTag)) (emb n.tag)) n = .ok n' := by
+      intro n hn n' hrel
+      rcases hrel with ⟨hc, hs⟩ | ⟨hc, hp, hEq⟩ | ⟨hc, _, hs⟩
+      · rw [← hloc n hn, hc]; exact hs
+      · rw [← hloc n hn, hc, hEq]; exact hnpr n hn hp
+      · rw [← hloc n hn, hc]; exact hs
+    have hrp : ∀ n ∈ w.nodes, ∀ n', step (locOf (some (emb parentTag)) (emb n.tag)) n = .ok n' →
+        PrunedStepRel w parentTag isWrite off len step n n' := by
+      intro n hn n' hs
+      cases hl : locOf (some (emb parentTag)) (emb n.tag) with
+      | true => rw [hl] at hs; exact Or.inl ⟨by rw [hloc n hn, hl], hs⟩
+      | false =>
+        rw [hl] at hs
+        cases hp : isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) isWrite off
+            len n with
+        | false => exact Or.inr (Or.inr ⟨by rw [hloc n hn, hl], hp, hs⟩)
+        | true =>
+          rw [hnpr n hn hp] at hs; cases hs
+          exact Or.inr (Or.inl ⟨by rw [hloc n hn, hl], hp, rfl⟩)
+    have hidlt : id < tbm.mem.allocations.length := (List.getElem?_eq_some_iff.mp halloc).1
+    constructor
+    · intro nodes' hrel
+      have hpoint : ∀ q m1, nodeAt root1 q = some m1 → ∀ i < s.inside.length, ∀ pm,
+          s.inside[i]? = some pm → ∀ k', Permission.init_access pm = some k' →
+            ∃ p p', m1.permissions[off + 0 + i]? = some p ∧
+              Permission.transition p k' (locRel (some childPath) q) = .ok p' := by
+        intro q m1 hm1 i hi pm hpm k' hk'
+        have hpmEq : pm = pInit := List.eq_of_mem_replicate (List.mem_of_getElem? hpm)
+        rw [hpmEq, hinitK] at hk'; cases hk'
+        rw [Nat.add_zero]
+        rcases hsurj1 q m1 hm1 with ⟨rfl, rfl⟩ | ⟨m0, hm0, hps0, _⟩
+        · have hget : childPerms[off + i]? = some pInit := by
+            rw [hchildPermSpec.2.1 (off + i) (by omega) (by omega)]
+            have e : off + i - off = i := by omega
+            rw [e]; exact nwsr_getElem?_replicate_lt (by rw [hsLen] at hi; exact hi)
+          have hlocR : locRel (some childPath) childPath = .Local := by
+            unfold locRel; rw [hlocChildSelf]; rfl
+          rw [hlocR]; exact ⟨pInit, pAfter, hget, hchildTr⟩
+        · obtain ⟨n, hn, hemb, hnod⟩ := hmr q m0 hm0
+          have hlocEq : locRel (some childPath) q =
+              nodeRelToMiniRust (locOf (some (emb parentTag)) (emb n.tag)) := by
+            unfold locRel nodeRelToMiniRust; rw [hlocChild q m0 hm0, hemb]
+          cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
+          | true =>
+            simp only [hov, ↓reduceIte] at hnod
+            obtain ⟨_, p, hp, hwin⟩ := hnod
+            obtain ⟨n', _, hnn'⟩ := hrel.exists_of_mem_left hn
+            have hs := hpr n hn n' hnn'
+            obtain ⟨p0, hp0, hok, _⟩ := (hstep n hn).1 hov (locOf (some (emb parentTag)) (emb n.tag))
+            rw [hp] at hp0; cases hp0
+            obtain ⟨_, _, _, _, _, _, _, p', htr, _⟩ := hok n' hs
+            rw [hps0, hlocEq]
+            exact ⟨p, p', hwin (off + i) (by omega) (by rw [hsLen] at hi; omega), htr⟩
+          | false =>
+            simp only [hov, Bool.false_eq_true, ↓reduceIte] at hnod
+            have hfor : locOf (some (emb parentTag)) (emb n.tag) = false := hdisjForeign n hn hov
+            obtain ⟨p, hpb, hpas⟩ := hnod.2 (off + i) (by omega) (by rw [hsLen] at hi; omega)
+            obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p k hpas
+            rw [hps0, hlocEq, hfor]
+            exact ⟨p, p', hpb, htr⟩
+      obtain ⟨root2, hinitRun, hinitPost⟩ :=
+        reborrowInitAccess_ok_of_pointwise childPath off s.inside 0 root1 hpoint
+      have hretagOk : TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (ptrTypeOfParamKind kind info)
+          true (!attrs.rustcNoWritable) lookup =
+          .ok (ThinPointer.widen { ptr.thin_pointer with provenance := some (⟨(id : Int)⟩, childPath) }
+              ptr.metadata,
+            { tbm with mem := { tbm.mem with allocations := (tbm.mem.allocations.set id
+              { alloc with extra := { root := root2 } }) } },
+            { protectors := frameExtra.protectors ++ [(⟨(id : Int)⟩, childPath)] }) := by
+        rw [hretagEq, hinitRun]; rfl
+      obtain ⟨mc2, hmc2, hmc2Prot, _, hmc2Out, hmc2In⟩ := (hinitPost childPath).2 childNodeMR hchildAt1
+      have hmcOutSpec : ∀ b, b < alloc.data.length → (b < off ∨ off + len ≤ b) →
+          mc2.permissions[b]? = some (.Prot (.Reserved false false)) := by
+        intro b hblt hout
+        have hout' : b < off + 0 ∨ off + 0 + s.inside.length ≤ b := by
+          rw [Nat.add_zero, hsLen]; exact hout
+        rw [hmc2Out b hout']
+        exact hchildPermSpec.2.2.1 b hblt (by rw [hsLen]; exact hout)
+      have holdFrame : ∀ q m, nodeAt alloc.extra.root q = some m →
+          ∃ m', nodeAt root2 q = some m' ∧ m'.«protected» = m.«protected» ∧
+            ∀ b, b < off ∨ off + len ≤ b → m'.permissions[b]? = m.permissions[b]? := by
+        intro q m hm
+        obtain ⟨m1, hm1, hm1Ps, hm1Prot⟩ := hexist1 q m hm
+        obtain ⟨m2, hm2, hm2Prot, _, hm2Out, _⟩ := (hinitPost q).2 m1 hm1
+        refine ⟨m2, hm2, hm2Prot.trans hm1Prot, fun b hout => ?_⟩
+        rw [hm2Out b (by rw [Nat.add_zero, hsLen]; exact hout), hm1Ps]
+      refine ⟨_, _, hretagOk, List.getElem?_set_self hidlt, hlive,
+        fun hwf => TreeBorrowsMemory.retag_ptr_wfLive hwf hretagOk,
+        ⟨mc2, hmc2, hmc2Prot, hmcOutSpec⟩, holdFrame, ?_⟩
+      let childNodeW : TreeTagNode :=
+        ⟨w.nextTag, some parentTag, childPerm, off, len, some w.nextProtector, true⟩
+      have hnodeOld : ∀ n' ∈ nodes', ∃ n ∈ w.nodes, n'.tag = n.tag ∧ n'.tag ≠ w.nextTag ∧
+          n'.isProtected (w.nextProtector :: w.activeProtectors) = n.isProtected w.activeProtectors ∧
+          n'.rangeOffset = n.rangeOffset ∧ n'.rangeLen = n.rangeLen ∧
+          (n'.isProtected (w.nextProtector :: w.activeProtectors) = true → n'.perm ≠ .reservedIM) ∧
+          (n'.isProtected (w.nextProtector :: w.activeProtectors) = true → n'.perm = .unique →
+            n'.accessed = true) ∧
+          ∃ m2, nodeAt root2 (emb' n'.tag) = some m2 ∧
+            if rangesOverlap off len n'.rangeOffset n'.rangeLen = true then
+              NodeWindowRel (w.nextProtector :: w.activeProtectors) off len n' m2
+            else
+              Protected.yes m2.«protected» = n'.isProtected (w.nextProtector :: w.activeProtectors) ∧
+              ∀ b, off ≤ b → b < off + len →
+                ∃ p, m2.permissions[b]? = some p ∧ permIsForeignPassive p = true := by
+        intro n' hn'
+        obtain ⟨n, hn, hnn'⟩ := hrel.exists_of_mem_right hn'
+        have hs := hpr n hn n' hnn'
+        obtain ⟨m0, hm0, hnod⟩ := hinv.nodes n hn
+        obtain ⟨m1, hm1, hm1Ps, hm1Prot⟩ := hexist1 (emb n.tag) m0 hm0
+        obtain ⟨m2, hm2, hm2Prot, _, _, hm2In⟩ := (hinitPost (emb n.tag)).2 m1 hm1
+        have hlocEq : locRel (some childPath) (emb n.tag) =
+            nodeRelToMiniRust (locOf (some (emb parentTag)) (emb n.tag)) := by
+          unfold locRel nodeRelToMiniRust; rw [hlocChild (emb n.tag) m0 hm0]
+        cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
+        | true =>
+          simp only [hov, ↓reduceIte] at hnod
+          obtain ⟨hprot0, p, hp, hwin0⟩ := hnod
+          obtain ⟨p0, hp0, hok, _⟩ := (hstep n hn).1 hov (locOf (some (emb parentTag)) (emb n.tag))
+          rw [hp] at hp0; cases hp0
+          obtain ⟨htagEq, hprotField, hpe, hro, hrl, hIM, hUA, p', htr, hp'⟩ := hok n' hs
+          have hprotNew : n'.isProtected (w.nextProtector :: w.activeProtectors) =
+              n.isProtected w.activeProtectors := by
+            rw [a1_isProtected_cons_ne n' w.nextProtector w.activeProtectors
+              (hprotField ▸ hfreshProt n hn)]
+            exact hpe
+          have htagNe : n'.tag ≠ w.nextTag := htagEq ▸ hfreshTag n hn
+          have hemb'Eq : emb' n'.tag = emb n.tag := by
+            unfold emb' extendEmb; simp only [htagNe, ↓reduceIte]; exact congrArg emb htagEq
+          refine ⟨n, hn, htagEq, htagNe, hprotNew, hro, hrl,
+            fun hp'' => hIM (hpe.trans (hprotNew.symm.trans hp'')),
+            fun hp'' => hUA (hpe.trans (hprotNew.symm.trans hp'')),
+            m2, by rw [hemb'Eq]; exact hm2, ?_⟩
+          rw [hro, hrl]; simp only [hov, ↓reduceIte]
+          refine ⟨by rw [hm2Prot, hm1Prot, hprot0, hprotNew], p', by rw [hprotNew]; exact hp', ?_⟩
+          intro b hb1 hb2
+          have hi : b - off < s.inside.length := by rw [hsLen]; omega
+          have hpm : s.inside[b - off]? = some pInit := nwsr_getElem?_replicate_lt (by rw [hsLen] at hi; exact hi)
+          have hm1Get : m1.permissions[off + 0 + (b - off)]? = some p := by
+            rw [hm1Ps, Nat.add_zero]; have e : off + (b - off) = b := by omega
+            rw [e]; exact hwin0 b hb1 hb2
+          have hstepB := hm2In (b - off) hi pInit hpm p hm1Get
+          rw [hinitK] at hstepB
+          obtain ⟨p'', htr'', hm2Get⟩ := hstepB
+          rw [hlocEq, htr] at htr''; cases htr''
+          have e : off + 0 + (b - off) = b := by omega
+          rw [e] at hm2Get; exact hm2Get
+        | false =>
+          simp only [hov, Bool.false_eq_true, ↓reduceIte] at hnod
+          have hstay := (hstep n hn).2 hov (locOf (some (emb parentTag)) (emb n.tag))
+          rw [hstay] at hs
+          have hn'Eq : n' = n := by cases hs; rfl
+          rw [hn'Eq]
+          have hprotNew : n.isProtected (w.nextProtector :: w.activeProtectors) =
+              n.isProtected w.activeProtectors :=
+            a1_isProtected_cons_ne n w.nextProtector w.activeProtectors (hfreshProt n hn)
+          have htagNe : n.tag ≠ w.nextTag := hfreshTag n hn
+          have hemb'Eq : emb' n.tag = emb n.tag := by
+            unfold emb' extendEmb; simp only [htagNe, ↓reduceIte]
+          have hfor : locOf (some (emb parentTag)) (emb n.tag) = false := hdisjForeign n hn hov
+          refine ⟨n, hn, rfl, htagNe, hprotNew, rfl, rfl,
+            fun hp'' => hinv.noProtIM n hn (hprotNew.symm.trans hp''),
+            fun hp'' => hinv.protUniqAcc n hn (hprotNew.symm.trans hp''),
+            m2, by rw [hemb'Eq]; exact hm2, ?_⟩
+          simp only [hov, Bool.false_eq_true, ↓reduceIte]
+          refine ⟨by rw [hm2Prot, hm1Prot, hnod.1, hprotNew], fun b hb1 hb2 => ?_⟩
+          have hi : b - off < s.inside.length := by rw [hsLen]; omega
+          have hpm : s.inside[b - off]? = some pInit := nwsr_getElem?_replicate_lt (by rw [hsLen] at hi; exact hi)
+          obtain ⟨p, hpb, hpas⟩ := hnod.2 b hb1 hb2
+          have hm1Get : m1.permissions[off + 0 + (b - off)]? = some p := by
+            rw [hm1Ps, Nat.add_zero]; have e : off + (b - off) = b := by omega
+            rw [e]; exact hpb
+          have hstepB := hm2In (b - off) hi pInit hpm p hm1Get
+          rw [hinitK] at hstepB
+          obtain ⟨p'', htr'', hm2Get⟩ := hstepB
+          rw [hlocEq, hfor] at htr''
+          obtain ⟨p', htr', hpas'⟩ := permission_isForeignPassive_preserved p k hpas
+          change Permission.transition p k .Foreign = .ok p'' at htr''
+          rw [htr'] at htr''; cases htr''
+          have e : off + 0 + (b - off) = b := by omega
+          rw [e] at hm2Get
+          exact ⟨p'', hm2Get, hpas'⟩
+      have hchildProtW : childNodeW.isProtected (w.nextProtector :: w.activeProtectors) = true := by
+        simp [childNodeW, TreeTagNode.isProtected]
+      have hemb'Child : emb' childNodeW.tag = childPath := by
+        unfold emb' extendEmb childNodeW; simp
+      refine ⟨?_, ?_, ?_, ?_⟩
+      · intro n' hn'
+        rcases List.mem_cons.mp hn' with rfl | hn''
+        · refine ⟨mc2, by rw [hemb'Child]; exact hmc2, ?_⟩
+          have hovSelf : rangesOverlap off len off len = true :=
+            a1_rangesOverlap_self hlen
+          simp only [hovSelf, ↓reduceIte]
+          refine ⟨by rw [hmc2Prot, hProtYes, hchildProtW], pAfter, by rw [hchildProtW]; exact hchildP, ?_⟩
+          intro b hb1 hb2
+          have hi : b - off < s.inside.length := by rw [hsLen]; omega
+          have hpm : s.inside[b - off]? = some pInit := nwsr_getElem?_replicate_lt (by rw [hsLen] at hi; exact hi)
+          have hget1 : childNodeMR.permissions[off + 0 + (b - off)]? = some pInit := by
+            rw [Nat.add_zero]; have e : off + (b - off) = b := by omega
+            rw [e, hchildPermSpec.2.1 b hb1 (by rw [hsLen]; exact hb2)]; exact hpm
+          have hstepB := hmc2In (b - off) hi pInit hpm pInit hget1
+          rw [hinitK] at hstepB
+          obtain ⟨p'', htr'', hmc2Get⟩ := hstepB
+          have hlocR : locRel (some childPath) childPath = .Local := by
+            unfold locRel; rw [hlocChildSelf]; rfl
+          rw [hlocR, hchildTr] at htr''; cases htr''
+          have e : off + 0 + (b - off) = b := by omega
+          rw [e] at hmc2Get; exact hmc2Get
+        · obtain ⟨_, _, _, _, _, _, _, _, _, m2, hm2, hrel2⟩ := hnodeOld n' hn''
+          exact ⟨m2, hm2, hrel2⟩
+      · intro q m2 hq2
+        cases hq1 : nodeAt root1 q with
+        | none => rw [(hinitPost q).1 hq1] at hq2; cases hq2
+        | some m1 =>
+          rcases hsurj1 q m1 hq1 with ⟨rfl, _⟩ | ⟨m0, hm0, _, _⟩
+          · exact ⟨childNodeW, List.mem_cons_self .., hemb'Child⟩
+          · obtain ⟨n, hn, hemb⟩ := hinv.surj q m0 hm0
+            obtain ⟨n', hn', hnn'⟩ := hrel.exists_of_mem_left hn
+            have hs := hpr n hn n' hnn'
+            have htagEq : n'.tag = n.tag := by
+              cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
+              | true =>
+                obtain ⟨_, _, hok, _⟩ := (hstep n hn).1 hov (locOf (some (emb parentTag)) (emb n.tag))
+                exact (hok n' hs).1
+              | false =>
+                rw [(hstep n hn).2 hov (locOf (some (emb parentTag)) (emb n.tag))] at hs
+                cases hs; rfl
+            have hne : n'.tag ≠ w.nextTag := htagEq ▸ hfreshTag n hn
+            refine ⟨n', List.mem_cons_of_mem _ hn', ?_⟩
+            unfold emb' extendEmb; simp only [hne, ↓reduceIte]; rw [htagEq, hemb]
+      · intro n' hn' hp''
+        rcases List.mem_cons.mp hn' with rfl | hn''
+        · exact hchildNoIM
+        · obtain ⟨_, _, _, _, _, _, _, hIM, _⟩ := hnodeOld n' hn''; exact hIM hp''
+      · intro n' hn' hp'' hu
+        rcases List.mem_cons.mp hn' with rfl | hn''
+        · rfl
+        · obtain ⟨_, _, _, _, _, _, _, _, hUA, _⟩ := hnodeOld n' hn''; exact hUA hp'' hu
+    · intro hno
+      rw [hretagEq]
+      cases hrun : TreeBorrowsMemory.reborrowInitAccess childPath ⟨off⟩ 0 s.inside root1 with
+      | ok root2 =>
+        exfalso
+        have hall : ∀ n ∈ w.nodes, ∃ n', PrunedStepRel w parentTag isWrite off len step n n' := by
+          intro n hn
+          cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
+          | false =>
+            exact ⟨n, hrp n hn n ((hstep n hn).2 hov (locOf (some (emb parentTag)) (emb n.tag)))⟩
+          | true =>
+            obtain ⟨m0, hm0, hnod⟩ := hinv.nodes n hn
+            simp only [hov, ↓reduceIte] at hnod
+            obtain ⟨_, p, hp, hwin0⟩ := hnod
+            obtain ⟨m1, hm1, hm1Ps, _⟩ := hexist1 (emb n.tag) m0 hm0
+            have hpm0 : s.inside[0]? = some pInit := nwsr_getElem?_replicate_lt hlen
+            obtain ⟨q0, q0', hq0, htr0⟩ := reborrowInitAccess_ok_inv childPath off s.inside 0 root1
+              root2 hrun (emb n.tag) m1 hm1 0 (by rw [hsLen]; exact hlen) pInit hpm0 k hinitK
+            rw [hm1Ps, Nat.add_zero, hwin0 off (Nat.le_refl _) (by omega)] at hq0; cases hq0
+            obtain ⟨p0, hp0, _, herr⟩ := (hstep n hn).1 hov (locOf (some (emb parentTag)) (emb n.tag))
+            rw [hp] at hp0; cases hp0
+            cases hs : step (locOf (some (emb parentTag)) (emb n.tag)) n with
+            | ok n' => exact ⟨n', hrp n hn n' hs⟩
+            | error e =>
+              obtain ⟨msg, hmsg⟩ := herr e hs
+              have hlocEq : locRel (some childPath) (emb n.tag) =
+                  nodeRelToMiniRust (locOf (some (emb parentTag)) (emb n.tag)) := by
+                unfold locRel nodeRelToMiniRust; rw [hlocChild (emb n.tag) m0 hm0]
+              rw [hlocEq] at htr0; rw [htr0] at hmsg; cases hmsg
+        obtain ⟨nodes', hrel⟩ := nwsr_listRel_of_forall w.nodes hall
+        exact hno nodes' hrel
+      | error e =>
+        have hlenRoot1 : ∀ q m1, nodeAt root1 q = some m1 → off + 0 + s.inside.length ≤ m1.permissions.length := by
+          intro q m1 hm1
+          rcases hsurj1 q m1 hm1 with ⟨rfl, rfl⟩ | ⟨m0, hm0, hps0, _⟩
+          · show off + 0 + s.inside.length ≤ childPerms.length
+            rw [hchildPermSpec.1, Nat.add_zero, hsLen]; exact hbound
+          · obtain ⟨n, _, _, hnod⟩ := hmr q m0 hm0
+            cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
+            | true =>
+              simp only [hov, ↓reduceIte] at hnod
+              obtain ⟨_, _, _, hwin0⟩ := hnod
+              have hlt := (List.getElem?_eq_some_iff.mp (hwin0 (off + len - 1) (by omega) (by omega))).1
+              rw [hps0, Nat.add_zero, hsLen]; omega
+            | false =>
+              simp only [hov, Bool.false_eq_true, ↓reduceIte] at hnod
+              obtain ⟨_, hlast, _⟩ := hnod.2 (off + len - 1) (by omega) (by omega)
+              have hlt := (List.getElem?_eq_some_iff.mp hlast).1
+              rw [hps0, Nat.add_zero, hsLen]; omega
+        obtain ⟨msg, hmsg⟩ := reborrowInitAccess_error_is_ub childPath off s.inside 0 root1 e
+          hlenRoot1 hrun
+        exact ⟨msg, by rw [hmsg]; rfl⟩
+  dsimp only
+  cases hpv : selectFnEntryPolicy facts kind attrs with
+  | skipRetag => exact absurd hpv hpolNotSkip
+  | rustcNoWritable =>
+    have hnew' : ReborrowSettings.new lookup ptr (ptrTypeOfParamKind kind info) true tbm.params
+        (!attrs.rustcNoWritable) =
+        .ok (some (Gen.ReborrowSettings.mk
+          (List.replicate len (.Prot (.Reserved false false)))
+          (.Prot (.Reserved false false)) expectedProt)) := by
+      have h1 := hsettings; rw [hpv, hmaskLen] at h1; exact h1
+    have hnpr' : ∀ n ∈ w.nodes, isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag)
+        false off len n = true → stepNodeOnRangeRead w.activeProtectors false off len n = .ok n := by
+      intro n hn hp; have := hnoprune n hn; rw [hpv] at this; exact nwsr_foreignStepInert_read (this hp)
+    have hmpInit : Permission.matches_protector (.Prot (.Reserved false false)) expectedProt = true := by
+      simp [Permission.matches_protector, hProtYes]
+    have hstepR : ∀ n ∈ w.nodes, a2_NodeStepSimMulti w.activeProtectors off len .Read
+        (fun isLoc m => stepNodeOnRangeRead w.activeProtectors isLoc off len m) n := by
+      intro n hn
+      refine ⟨fun hov isLocal => ?_, fun hdisj _ => by unfold stepNodeOnRangeRead; simp only [hdisj, Bool.not_false, ↓reduceIte]⟩
+      obtain ⟨p, hp, hok, herr⟩ := stepNodeOnRangeRead_simulates_permission_transition
+        w.activeProtectors isLocal off len n hov (hinv.noProtIM n hn) (hinv.protUniqAcc n hn)
+      refine ⟨p, hp, fun n' hn' => ?_, herr⟩
+      obtain ⟨htag', hprot', hro, hrl, hIM', hUA'⟩ := nwsr_stepRead_meta _ isLocal off len n n' hn'
+      have hpe : n'.isProtected w.activeProtectors = n.isProtected w.activeProtectors := by
+        unfold TreeTagNode.isProtected; rw [hprot']
+      exact ⟨htag', hprot', hpe, hro, hrl, fun hp' him => hinv.noProtIM n hn (hpe ▸ hp') (hIM' him),
+        hUA' (hinv.protUniqAcc n hn), hok n' hn'⟩
+    obtain ⟨hfwd, hbwd⟩ := hcore false .Read (.Prot (.Reserved false false))
+      (.Prot (.Reserved true false)) (.reservedFrz false)
+      (fun isLoc m => stepNodeOnRangeRead w.activeProtectors isLoc off len m)
+      rfl rfl hmpInit rfl (by decide) hstepR hnpr' hnew'
+    refine ⟨?_, ?_, ?_⟩
+    · intro w' childTag hok
+      obtain ⟨_, nodes', hpair, hrel⟩ :=
+        (a1_execFnEntryMutRetagPrunedSourceOrder_rustcNoWritable_ok_iff w parentTag off len
+          requireInit hneLen (w', childTag)).mp hok
+      injection hpair with hw' _; rw [hw']; exact hfwd nodes' hrel
+    · intro e herr
+      apply hbwd; intro nodes' hrel
+      have hok := (a1_execFnEntryMutRetagPrunedSourceOrder_rustcNoWritable_ok_iff w parentTag off len
+        requireInit hneLen _).mpr ⟨⟨pn, hpn⟩, nodes', rfl, hrel⟩
+      rw [herr] at hok; cases hok
+    · intro r hret
+      cases he : execFnEntryMutRetagPrunedSourceOrder w parentTag off len .rustcNoWritable requireInit with
+      | ok res =>
+        rcases res with ⟨w', ct⟩
+        obtain ⟨_, nodes', hpair, hrel⟩ :=
+          (a1_execFnEntryMutRetagPrunedSourceOrder_rustcNoWritable_ok_iff w parentTag off len
+            requireInit hneLen (w', ct)).mp he
+        injection hpair with hw' _
+        have hfwd' := hfwd nodes' hrel; rw [← hw'] at hfwd'
+        obtain ⟨tbm', alloc', hret', hal', _, _, _, _, hinv'⟩ := hfwd'
+        rw [hret] at hret'; cases hret'
+        exact ⟨w', ct, rfl, rfl, rfl, alloc', hal', hinv'⟩
+      | error e =>
+        have hno : ∀ nodes', ¬ ListRel (PrunedStepRel w parentTag false off len
+            (fun isLoc m => stepNodeOnRangeRead w.activeProtectors isLoc off len m)) w.nodes nodes' := by
+          intro nodes' hrel
+          have hok := (a1_execFnEntryMutRetagPrunedSourceOrder_rustcNoWritable_ok_iff w parentTag off len
+            requireInit hneLen _).mpr ⟨⟨pn, hpn⟩, nodes', rfl, hrel⟩
+          rw [he] at hok; cases hok
+        obtain ⟨msg, hmsg⟩ := hbwd hno; rw [hret] at hmsg; cases hmsg
+  | writableChildWrite =>
+    obtain ⟨hro, hreq⟩ := hwritableGates hpv
+    have hnew' : ReborrowSettings.new lookup ptr (ptrTypeOfParamKind kind info) true tbm.params
+        (!attrs.rustcNoWritable) =
+        .ok (some (Gen.ReborrowSettings.mk
+          (List.replicate len (.Prot .Unique))
+          (.Prot (.Reserved false false)) expectedProt)) := by
+      have h1 := hsettings; rw [hpv, hmaskLen] at h1; exact h1
+    have hnpr' : ∀ n ∈ w.nodes, isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag)
+        true off len n = true → stepNodeOnRangeWrite w.activeProtectors false off len n = .ok n := by
+      intro n hn hp; have := hnoprune n hn; rw [hpv] at this; exact nwsr_foreignStepInert_write (this hp)
+    have hmpInit : Permission.matches_protector (.Prot .Unique) expectedProt = true := by
+      simp [Permission.matches_protector, hProtYes]
+    have hstepW : ∀ n ∈ w.nodes, a2_NodeStepSimMulti w.activeProtectors off len .Write
+        (fun isLoc m => stepNodeOnRangeWrite w.activeProtectors isLoc off len m) n := by
+      intro n hn
+      refine ⟨fun hov isLocal => ?_, fun hdisj _ => by unfold stepNodeOnRangeWrite; simp only [hdisj, Bool.not_false, ↓reduceIte]⟩
+      obtain ⟨p, hp, hok, herr⟩ := stepNodeOnRangeWrite_simulates_permission_transition
+        w.activeProtectors isLocal off len n hov (hinv.noProtIM n hn) (hinv.protUniqAcc n hn)
+      refine ⟨p, hp, fun n' hn' => ?_, herr⟩
+      obtain ⟨htag', hprot', hro', hrl, hIM', hUA'⟩ := nwsr_stepWrite_meta _ isLocal off len n n' hn'
+      have hpe : n'.isProtected w.activeProtectors = n.isProtected w.activeProtectors := by
+        unfold TreeTagNode.isProtected; rw [hprot']
+      exact ⟨htag', hprot', hpe, hro', hrl, fun hp' him => hinv.noProtIM n hn (hpe ▸ hp') (hIM' him),
+        hUA' (hinv.protUniqAcc n hn), hok n' hn'⟩
+    obtain ⟨hfwd, hbwd⟩ := hcore true .Write (.Prot .Unique) (.Prot .Unique) .unique
+      (fun isLoc m => stepNodeOnRangeWrite w.activeProtectors isLoc off len m)
+      rfl rfl hmpInit rfl (by decide) hstepW hnpr' hnew'
+    refine ⟨?_, ?_, ?_⟩
+    · intro w' childTag hok
+      obtain ⟨_, _, _, nodes', hpair, hrel⟩ :=
+        (a1_execFnEntryMutRetagPrunedSourceOrder_writableChildWrite_ok_iff w parentTag off len
+          requireInit hneLen (w', childTag)).mp hok
+      injection hpair with hw' _; rw [hw']; exact hfwd nodes' hrel
+    · intro e herr
+      apply hbwd; intro nodes' hrel
+      have hok := (a1_execFnEntryMutRetagPrunedSourceOrder_writableChildWrite_ok_iff w parentTag off len
+        requireInit hneLen _).mpr ⟨hro, hreq, ⟨pn, hpn⟩, nodes', rfl, hrel⟩
+      rw [herr] at hok; cases hok
+    · intro r hret
+      cases he : execFnEntryMutRetagPrunedSourceOrder w parentTag off len .writableChildWrite requireInit with
+      | ok res =>
+        rcases res with ⟨w', ct⟩
+        obtain ⟨_, _, _, nodes', hpair, hrel⟩ :=
+          (a1_execFnEntryMutRetagPrunedSourceOrder_writableChildWrite_ok_iff w parentTag off len
+            requireInit hneLen (w', ct)).mp he
+        injection hpair with hw' _
+        have hfwd' := hfwd nodes' hrel; rw [← hw'] at hfwd'
+        obtain ⟨tbm', alloc', hret', hal', _, _, _, _, hinv'⟩ := hfwd'
+        rw [hret] at hret'; cases hret'
+        exact ⟨w', ct, rfl, rfl, rfl, alloc', hal', hinv'⟩
+      | error e =>
+        have hno : ∀ nodes', ¬ ListRel (PrunedStepRel w parentTag true off len
+            (fun isLoc m => stepNodeOnRangeWrite w.activeProtectors isLoc off len m)) w.nodes nodes' := by
+          intro nodes' hrel
+          have hok := (a1_execFnEntryMutRetagPrunedSourceOrder_writableChildWrite_ok_iff w parentTag off len
+            requireInit hneLen _).mpr ⟨hro, hreq, ⟨pn, hpn⟩, nodes', rfl, hrel⟩
+          rw [he] at hok; cases hok
+        obtain ⟨msg, hmsg⟩ := hbwd hno; rw [hret] at hmsg; cases hmsg
+
 /-- **Symbolic whole-tree `TreeSimInv` simulation for `TreeBorrowsMemory.retag_ptr`
 on `&mut T` / `Box<T>` at `FnEntry`**, for borrow trees of arbitrary depth, every
 `Unpin` pointee, and both the `#[rustc_no_writable]` and the standard policy,
@@ -5632,478 +6600,60 @@ theorem tbm_retag_ptr_fnEntry_mutOrBox_simulates_world
           r.2.2 = { protectors := frameExtra.protectors ++ [(⟨(id : Int)⟩, childPath)] } ∧
           ∃ alloc', r.2.1.mem.allocations[id]? = some alloc' ∧
             TreeSimInv off len emb' w' alloc'.extra.root) := by
-  have hmaskLen : mask.length = len := a1_cellsToFreezeMask_length hmask
-  obtain ⟨pn, hpn⟩ := htag
-  have hpnMem : pn ∈ w.nodes := (mem_of_findNode?_eq_some hpn).1
-  have hpnTag : pn.tag = parentTag := (mem_of_findNode?_eq_some hpn).2
-  obtain ⟨pNode, hpNode, _⟩ := hinv.nodes pn hpnMem
-  rw [hpnTag] at hpNode
-  refine ⟨pNode, hpNode, ?_⟩
-  let info := pointeeInfoOfFacts facts len align cells
-  let expectedProt : Gen.Protected := if kind = .box then .Weak else .Strong
-  have hProtYes : Protected.yes expectedProt = true := by
-    dsimp only [expectedProt]; split <;> rfl
-  let childPath := emb parentTag ++ [(pNode.children.length : Int)]
-  let emb' := extendEmb emb w.nextTag childPath
-  have hneLen : len ≠ 0 := by omega
-  have hpolNotSkip : selectFnEntryPolicy facts kind attrs ≠ .skipRetag := by
-    unfold selectFnEntryPolicy
-    cases kind with
-    | shared => exact absurd rfl hkind
-    | mutable | box =>
-      simp only [hunpin, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
-      split <;> decide
-  have hsettings := reborrowSettings_fnEntry_mutOrBox_eq_policy lookup ptr facts kind attrs hkind
-    len align cells mask hmask
-  rw [← htbmParams] at hsettings
-  have hlocChild : ∀ q m, nodeAt alloc.extra.root q = some m →
-      locOf (some childPath) q = locOf (some (emb parentTag)) q :=
-    fun q m hm => locOf_childPath_eq_parentPath alloc.extra.root (emb parentTag) q pNode m hpNode hm
-  have hlocChildSelf : locOf (some childPath) childPath = true := by
-    rw [locOf_some_eq_isPrefixOf]
-    have h1 := a1_isPrefixOf_append_right childPath []
-    rw [List.append_nil] at h1
-    exact h1
-  have hcore :
-      ∀ (isWrite : Bool) (k : Gen.AccessKind) (pInit pAfter : Gen.Permission)
-        (childPerm : TreeBorrowPerm)
-        (step : Bool → TreeTagNode → Except RetagStepErr TreeTagNode),
-        Permission.init_access pInit = some k →
-        Permission.transition pInit k .Local = .ok pAfter →
-        Permission.matches_protector pInit expectedProt = true →
-        permToMiniRust true true childPerm = some pAfter →
-        childPerm ≠ .reservedIM →
-        (∀ n ∈ w.nodes, A1NodeStepSim w.activeProtectors k step n) →
-        (∀ n ∈ w.nodes,
-          isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) isWrite off len n = true →
-          step false n = .ok n) →
-        ReborrowSettings.new lookup ptr (ptrTypeOfParamKind kind info) true tbm.params
-          (!attrs.rustcNoWritable) =
-          .ok (some { inside := List.replicate len pInit, outside := .Prot (.Reserved false false), «protected» := expectedProt }) →
-        let childNodeW : TreeTagNode :=
-          ⟨w.nextTag, some parentTag, childPerm, off, len, some w.nextProtector, true⟩
-        (∀ nodes', ListRel (PrunedStepRel w parentTag isWrite off len step) w.nodes nodes' →
-          ∃ tbm' alloc',
-            TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (ptrTypeOfParamKind kind info) true
-              (!attrs.rustcNoWritable) lookup =
-              .ok (ThinPointer.widen { ptr.thin_pointer with provenance := some (⟨(id : Int)⟩, childPath) }
-                ptr.metadata, tbm',
-                { protectors := frameExtra.protectors ++ [(⟨(id : Int)⟩, childPath)] }) ∧
-            tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
-            (TreeBorrowsMemory.wfLive tbm → TreeBorrowsMemory.wfLive tbm') ∧
-            (∃ mc, nodeAt alloc'.extra.root childPath = some mc ∧ mc.«protected» = expectedProt) ∧
-            TreeSimInv off len emb'
-              { w with
-                nodes := childNodeW :: nodes'
-                activeProtectors := w.nextProtector :: w.activeProtectors
-                nextTag := w.nextTag + 1
-                nextProtector := w.nextProtector + 1 } alloc'.extra.root) ∧
-        ((∀ nodes', ¬ ListRel (PrunedStepRel w parentTag isWrite off len step) w.nodes nodes') →
-          ∃ msg, TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (ptrTypeOfParamKind kind info) true
-            (!attrs.rustcNoWritable) lookup = .error (.ub msg)) := by
-    intro isWrite k pInit pAfter childPerm step hinitK hchildTr hmpInit hchildP hchildNoIM hstep hnpr hnew
-    let s : Gen.ReborrowSettings :=
-      { inside := List.replicate len pInit, outside := .Prot (.Reserved false false),
-        «protected» := expectedProt }
-    have hmpOut : Permission.matches_protector s.outside s.«protected» = true := by
-      simp [s, Permission.matches_protector, hProtYes]
-    have hmpIn : ∀ p ∈ s.inside, Permission.matches_protector p s.«protected» = true := by
-      intro p hp
-      rw [List.eq_of_mem_replicate hp]
-      exact hmpInit
-    have hsLen : s.inside.length = len := List.length_replicate
-    obtain ⟨root1, hadd, hreb⟩ := tbm_reborrow_eq tbm ptr.thin_pointer s frameExtra id
-      (emb parentTag) alloc pNode off hprov halloc hlive hoff (by rw [hsLen]; exact hbound)
-      hpNode hmpOut hmpIn
-    let childPerms := reborrowChildPerms alloc.data.length off s.outside s.inside
-    let childNodeMR : Gen.Node := ⟨[], childPerms, expectedProt⟩
-    obtain ⟨root1', hadd', hchildAt1, hexist1, hsurj1⟩ :=
-      node_add_node_spec alloc.extra.root pNode childNodeMR (emb parentTag) hpNode rfl
-    rw [hadd] at hadd'
-    cases hadd'
-    have hchildPermSpec := a1_reborrowChildPerms_spec alloc.data.length off s.outside s.inside
-      (by rw [hsLen]; exact hbound)
-    have hretagEq : TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (ptrTypeOfParamKind kind info)
-        true (!attrs.rustcNoWritable) lookup =
-        (TreeBorrowsMemory.reborrowInitAccess childPath ⟨off⟩ 0 s.inside root1 >>= fun root2 =>
-          pure (ThinPointer.widen { ptr.thin_pointer with provenance := some (⟨(id : Int)⟩, childPath) }
-              ptr.metadata,
-            { tbm with mem := { tbm.mem with allocations := (tbm.mem.allocations.set id
-              { alloc with extra := { root := root2 } }) } },
-            { protectors := frameExtra.protectors ++ [(⟨(id : Int)⟩, childPath)] })) := by
-      unfold TreeBorrowsMemory.retag_ptr
-      rw [hnew]
-      dsimp only [s, childPath] at hreb ⊢
-      simp only [bind, Except.bind, hreb, hProtYes, ↓reduceIte]
-      cases TreeBorrowsMemory.reborrowInitAccess (emb parentTag ++ [(pNode.children.length : Int)])
-        ⟨off⟩ 0 (List.replicate len pInit) root1 <;> rfl
-    have hpr : ∀ n ∈ w.nodes, ∀ n', PrunedStepRel w parentTag isWrite off len step n n' →
-        step (locOf (some (emb parentTag)) (emb n.tag)) n = .ok n' := by
-      intro n hn n' hrel
-      rcases hrel with ⟨hc, hs⟩ | ⟨hc, hp, hEq⟩ | ⟨hc, _, hs⟩
-      · rw [← hloc n hn, hc]; exact hs
-      · rw [← hloc n hn, hc, hEq]; exact hnpr n hn hp
-      · rw [← hloc n hn, hc]; exact hs
-    have hrp : ∀ n ∈ w.nodes, ∀ n', step (locOf (some (emb parentTag)) (emb n.tag)) n = .ok n' →
-        PrunedStepRel w parentTag isWrite off len step n n' := by
-      intro n hn n' hs
-      cases hl : locOf (some (emb parentTag)) (emb n.tag) with
-      | true => rw [hl] at hs; exact Or.inl ⟨by rw [hloc n hn, hl], hs⟩
-      | false =>
-        rw [hl] at hs
-        cases hp : isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) isWrite off
-            len n with
-        | false => exact Or.inr (Or.inr ⟨by rw [hloc n hn, hl], hp, hs⟩)
-        | true =>
-          rw [hnpr n hn hp] at hs
-          cases hs
-          exact Or.inr (Or.inl ⟨by rw [hloc n hn, hl], hp, rfl⟩)
-    have hmr : ∀ q m, nodeAt alloc.extra.root q = some m → ∃ n ∈ w.nodes, emb n.tag = q ∧
-        NodeWindowRel w.activeProtectors off len n m := by
-      intro q m hq
-      obtain ⟨n, hn, hemb⟩ := hinv.surj q m hq
-      obtain ⟨m', hm', hrel⟩ := hinv.nodes n hn
-      rw [hemb, hq] at hm'
-      cases hm'
-      exact ⟨n, hn, hemb, hrel⟩
-    have hidlt : id < tbm.mem.allocations.length := (List.getElem?_eq_some_iff.mp halloc).1
-    constructor
-    · intro nodes' hrel
-      have hpoint : ∀ q m1, nodeAt root1 q = some m1 → ∀ i < s.inside.length, ∀ pm,
-          s.inside[i]? = some pm → ∀ k', Permission.init_access pm = some k' →
-            ∃ p p', m1.permissions[off + 0 + i]? = some p ∧
-              Permission.transition p k' (locRel (some childPath) q) = .ok p' := by
-        intro q m1 hm1 i hi pm hpm k' hk'
-        have hpmEq : pm = pInit := List.eq_of_mem_replicate (List.mem_of_getElem? hpm)
-        rw [hpmEq] at hk'
-        rw [hinitK] at hk'
-        cases hk'
-        rw [Nat.add_zero]
-        rcases hsurj1 q m1 hm1 with ⟨rfl, rfl⟩ | ⟨m0, hm0, hps0, _⟩
-        · have hget : childPerms[off + i]? = some pInit := by
-            rw [hchildPermSpec.2.1 (off + i) (by omega) (by omega)]
-            have e : off + i - off = i := by omega
-            rw [e]
-            exact nwsr_getElem?_replicate_lt (by rw [hsLen] at hi; exact hi)
-          have hlocR : locRel (some childPath) childPath = .Local := by
-            unfold locRel; rw [hlocChildSelf]; rfl
-          rw [hlocR]
-          exact ⟨pInit, pAfter, hget, hchildTr⟩
-        · obtain ⟨n, hn, hemb, _, p, hp, hwin⟩ := hmr q m0 hm0
-          obtain ⟨n', _, hnn'⟩ := hrel.exists_of_mem_left hn
-          have hs := hpr n hn n' hnn'
-          obtain ⟨p0, hp0, hok, _⟩ := hstep n hn (locOf (some (emb parentTag)) (emb n.tag))
-          rw [hp] at hp0
-          cases hp0
-          obtain ⟨_, _, _, _, _, _, _, p', htr, _⟩ := hok n' hs
-          have hlocEq : locRel (some childPath) q = nodeRelToMiniRust (locOf (some (emb parentTag)) (emb n.tag)) := by
-            unfold locRel nodeRelToMiniRust
-            rw [hlocChild q m0 hm0, hemb]
-          rw [hps0, hlocEq]
-          exact ⟨p, p', hwin (off + i) (by omega) (by rw [hsLen] at hi; omega), htr⟩
-      obtain ⟨root2, hinitRun, hinitPost⟩ :=
-        reborrowInitAccess_ok_of_pointwise childPath off s.inside 0 root1 hpoint
-      have hretagOk : TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (ptrTypeOfParamKind kind info)
-          true (!attrs.rustcNoWritable) lookup =
-          .ok (ThinPointer.widen { ptr.thin_pointer with provenance := some (⟨(id : Int)⟩, childPath) }
-              ptr.metadata,
-            { tbm with mem := { tbm.mem with allocations := (tbm.mem.allocations.set id
-              { alloc with extra := { root := root2 } }) } },
-            { protectors := frameExtra.protectors ++ [(⟨(id : Int)⟩, childPath)] }) := by
-        rw [hretagEq, hinitRun]
-        rfl
-      obtain ⟨mc2, hmc2, hmc2Prot, _, _, hmc2In⟩ := (hinitPost childPath).2 childNodeMR hchildAt1
-      refine ⟨_, _, hretagOk, List.getElem?_set_self hidlt, hlive,
-        fun hwf => TreeBorrowsMemory.retag_ptr_wfLive hwf hretagOk,
-        ⟨mc2, hmc2, hmc2Prot⟩, ?_⟩
-      let childNodeW : TreeTagNode :=
-        ⟨w.nextTag, some parentTag, childPerm, off, len, some w.nextProtector, true⟩
-      have hnodeOld : ∀ n' ∈ nodes', ∃ n ∈ w.nodes, n'.tag = n.tag ∧ n'.tag ≠ w.nextTag ∧
-          n'.isProtected (w.nextProtector :: w.activeProtectors) = n.isProtected w.activeProtectors ∧
-          n'.rangeOffset = n.rangeOffset ∧ n'.rangeLen = n.rangeLen ∧
-          (n'.isProtected (w.nextProtector :: w.activeProtectors) = true → n'.perm ≠ .reservedIM) ∧
-          (n'.isProtected (w.nextProtector :: w.activeProtectors) = true → n'.perm = .unique →
-            n'.accessed = true) ∧
-          ∃ m2, nodeAt root2 (emb' n'.tag) = some m2 ∧
-            NodeWindowRel (w.nextProtector :: w.activeProtectors) off len n' m2 := by
-        intro n' hn'
-        obtain ⟨n, hn, hnn'⟩ := hrel.exists_of_mem_right hn'
-        have hs := hpr n hn n' hnn'
-        obtain ⟨m0, hm0, hprot0, p, hp, hwin0⟩ := hinv.nodes n hn
-        obtain ⟨p0, hp0, hok, _⟩ := hstep n hn (locOf (some (emb parentTag)) (emb n.tag))
-        rw [hp] at hp0
-        cases hp0
-        obtain ⟨htagEq, hprotField, hpe, hro, hrl, hIM, hUA, p', htr, hp'⟩ := hok n' hs
-        have hprotNew : n'.isProtected (w.nextProtector :: w.activeProtectors) =
-            n.isProtected w.activeProtectors := by
-          rw [a1_isProtected_cons_ne n' w.nextProtector w.activeProtectors
-            (hprotField ▸ hfreshProt n hn)]
-          exact hpe
-        have htagNe : n'.tag ≠ w.nextTag := htagEq ▸ hfreshTag n hn
-        obtain ⟨m1, hm1, hm1Ps, hm1Prot⟩ := hexist1 (emb n.tag) m0 hm0
-        obtain ⟨m2, hm2, hm2Prot, _, _, hm2In⟩ := (hinitPost (emb n.tag)).2 m1 hm1
-        have hemb'Eq : emb' n'.tag = emb n.tag := by
-          unfold emb' extendEmb
-          simp only [htagNe, ↓reduceIte]
-          exact congrArg emb htagEq
-        refine ⟨n, hn, htagEq, htagNe, hprotNew, hro, hrl,
-          fun hp'' => hIM (hpe.trans (hprotNew.symm.trans hp'')),
-          fun hp'' => hUA (hpe.trans (hprotNew.symm.trans hp'')),
-          m2, by rw [hemb'Eq]; exact hm2, ?_, p', by rw [hprotNew]; exact hp', ?_⟩
-        · rw [hm2Prot, hm1Prot, hprot0, hprotNew]
-        · intro b hb1 hb2
-          have hi : b - off < s.inside.length := by rw [hsLen]; omega
-          have hpm : s.inside[b - off]? = some pInit := nwsr_getElem?_replicate_lt (by rw [hsLen] at hi; exact hi)
-          have hm1Get : m1.permissions[off + 0 + (b - off)]? = some p := by
-            rw [hm1Ps, Nat.add_zero]
-            have e : off + (b - off) = b := by omega
-            rw [e]
-            exact hwin0 b hb1 hb2
-          have hstepB := hm2In (b - off) hi pInit hpm p hm1Get
-          rw [hinitK] at hstepB
-          obtain ⟨p'', htr'', hm2Get⟩ := hstepB
-          have hlocEq : locRel (some childPath) (emb n.tag) =
-              nodeRelToMiniRust (locOf (some (emb parentTag)) (emb n.tag)) := by
-            unfold locRel nodeRelToMiniRust
-            rw [hlocChild (emb n.tag) m0 hm0]
-          rw [hlocEq] at htr''
-          rw [htr] at htr''
-          cases htr''
-          have e : off + 0 + (b - off) = b := by omega
-          rw [e] at hm2Get
-          exact hm2Get
-      have hchildProtW : childNodeW.isProtected (w.nextProtector :: w.activeProtectors) = true := by
-        simp [childNodeW, TreeTagNode.isProtected]
-      have hemb'Child : emb' childNodeW.tag = childPath := by
-        unfold emb' extendEmb childNodeW
-        simp
-      refine ⟨?_, ?_, ?_, ?_, ?_⟩
-      · intro n' hn'
-        rcases List.mem_cons.mp hn' with rfl | hn''
-        · refine ⟨mc2, by rw [hemb'Child]; exact hmc2, ?_, pAfter, by rw [hchildProtW]; exact hchildP, ?_⟩
-          · rw [hmc2Prot, hProtYes, hchildProtW]
-          · intro b hb1 hb2
-            have hi : b - off < s.inside.length := by rw [hsLen]; omega
-            have hpm : s.inside[b - off]? = some pInit := nwsr_getElem?_replicate_lt (by rw [hsLen] at hi; exact hi)
-            have hget1 : childNodeMR.permissions[off + 0 + (b - off)]? = some pInit := by
-              rw [Nat.add_zero]
-              have e : off + (b - off) = b := by omega
-              rw [e, hchildPermSpec.2.1 b hb1 (by rw [hsLen]; exact hb2)]
-              exact hpm
-            have hstepB := hmc2In (b - off) hi pInit hpm pInit hget1
-            rw [hinitK] at hstepB
-            obtain ⟨p'', htr'', hmc2Get⟩ := hstepB
-            have hlocR : locRel (some childPath) childPath = .Local := by
-              unfold locRel; rw [hlocChildSelf]; rfl
-            rw [hlocR, hchildTr] at htr''
-            cases htr''
-            have e : off + 0 + (b - off) = b := by omega
-            rw [e] at hmc2Get
-            exact hmc2Get
-        · obtain ⟨_, _, _, _, _, _, _, _, _, m2, hm2, hrel2⟩ := hnodeOld n' hn''
-          exact ⟨m2, hm2, hrel2⟩
-      · intro q m2 hq2
-        cases hq1 : nodeAt root1 q with
-        | none => rw [(hinitPost q).1 hq1] at hq2; cases hq2
-        | some m1 =>
-          rcases hsurj1 q m1 hq1 with ⟨rfl, _⟩ | ⟨m0, hm0, _, _⟩
-          · exact ⟨childNodeW, List.mem_cons_self .., hemb'Child⟩
-          · obtain ⟨n, hn, hemb⟩ := hinv.surj q m0 hm0
-            obtain ⟨n', hn', hnn'⟩ := hrel.exists_of_mem_left hn
-            have hs := hpr n hn n' hnn'
-            obtain ⟨_, _, hok, _⟩ := hstep n hn (locOf (some (emb parentTag)) (emb n.tag))
-            obtain ⟨htagEq, _⟩ := hok n' hs
-            have hne : n'.tag ≠ w.nextTag := htagEq ▸ hfreshTag n hn
-            refine ⟨n', List.mem_cons_of_mem _ hn', ?_⟩
-            unfold emb' extendEmb
-            simp only [hne, ↓reduceIte]
-            rw [htagEq, hemb]
-      · intro n' hn'
-        rcases List.mem_cons.mp hn' with rfl | hn''
-        · exact a1_rangesOverlap_self hlen
-        · obtain ⟨n, hn, _, _, _, hro, hrl, _⟩ := hnodeOld n' hn''
+  have hov' : ∀ w' childTag,
+      execFnEntryMutRetagPrunedSourceOrder w parentTag off len
+        (selectFnEntryPolicy facts kind attrs) requireInit = .ok (w', childTag) →
+      ∀ n' ∈ w'.nodes, rangesOverlap off len n'.rangeOffset n'.rangeLen = true := by
+    intro w' childTag hok n' hn'
+    have hpol : selectFnEntryPolicy facts kind attrs = .rustcNoWritable ∨
+        selectFnEntryPolicy facts kind attrs = .writableChildWrite := by
+      unfold selectFnEntryPolicy
+      cases kind with
+      | shared => exact absurd rfl hkind
+      | mutable | «box» =>
+        simp only [hunpin, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+        cases attrs.implicitWrites <;> cases attrs.rustcNoWritable <;> simp
+    rcases hpol with hpol | hpol
+    · rw [hpol] at hok
+      obtain ⟨_, nodes', hres, hrel⟩ := (a1_execFnEntryMutRetagPrunedSourceOrder_rustcNoWritable_ok_iff
+        w parentTag off len requireInit (by omega) (w', childTag)).mp hok
+      have hwEq : w' = _ := congrArg Prod.fst hres
+      rw [hwEq] at hn'
+      rcases List.mem_cons.mp hn' with rfl | hn''
+      · exact a1_rangesOverlap_self hlen
+      · obtain ⟨n, hn, hr⟩ := hrel.exists_of_mem_right hn''
+        rcases hr with hs | ⟨_, _, rfl⟩ | ⟨_, _, hs⟩
+        · obtain ⟨_, _, hro, hrl, _, _⟩ := nwsr_stepRead_meta _ true off len n n' hs.2
           rw [hro, hrl]; exact hinv.overlap n hn
-      · intro n' hn' hp''
-        rcases List.mem_cons.mp hn' with rfl | hn''
-        · exact hchildNoIM
-        · obtain ⟨_, _, _, _, _, _, _, hIM, _⟩ := hnodeOld n' hn''
-          exact hIM hp''
-      · intro n' hn' hp'' hu
-        rcases List.mem_cons.mp hn' with rfl | hn''
-        · rfl
-        · obtain ⟨_, _, _, _, _, _, _, _, hUA, _⟩ := hnodeOld n' hn''
-          exact hUA hp'' hu
-    · intro hno
-      rw [hretagEq]
-      cases hrun : TreeBorrowsMemory.reborrowInitAccess childPath ⟨off⟩ 0 s.inside root1 with
-      | ok root2 =>
-        exfalso
-        have hall : ∀ n ∈ w.nodes, ∃ n', PrunedStepRel w parentTag isWrite off len step n n' := by
-          intro n hn
-          obtain ⟨m0, hm0, _, p, hp, hwin0⟩ := hinv.nodes n hn
-          obtain ⟨m1, hm1, hm1Ps, _⟩ := hexist1 (emb n.tag) m0 hm0
-          have hpm0 : s.inside[0]? = some pInit := nwsr_getElem?_replicate_lt hlen
-          obtain ⟨q0, q0', hq0, htr0⟩ := reborrowInitAccess_ok_inv childPath off s.inside 0 root1
-            root2 hrun (emb n.tag) m1 hm1 0 (by rw [hsLen]; exact hlen) pInit hpm0 k hinitK
-          rw [hm1Ps, Nat.add_zero, hwin0 off (Nat.le_refl _) (by omega)] at hq0
-          cases hq0
-          obtain ⟨p0, hp0, _, herr⟩ := hstep n hn (locOf (some (emb parentTag)) (emb n.tag))
-          rw [hp] at hp0
-          cases hp0
-          cases hs : step (locOf (some (emb parentTag)) (emb n.tag)) n with
-          | ok n' => exact ⟨n', hrp n hn n' hs⟩
-          | error e =>
-            obtain ⟨msg, hmsg⟩ := herr e hs
-            have hlocEq : locRel (some childPath) (emb n.tag) =
-                nodeRelToMiniRust (locOf (some (emb parentTag)) (emb n.tag)) := by
-              unfold locRel nodeRelToMiniRust
-              rw [hlocChild (emb n.tag) m0 hm0]
-            rw [hlocEq] at htr0
-            rw [htr0] at hmsg
-            cases hmsg
-        obtain ⟨nodes', hrel⟩ := nwsr_listRel_of_forall w.nodes hall
-        exact hno nodes' hrel
-      | error e =>
-        have hlenRoot1 : ∀ q m1, nodeAt root1 q = some m1 → off + 0 + s.inside.length ≤ m1.permissions.length := by
-          intro q m1 hm1
-          rcases hsurj1 q m1 hm1 with ⟨rfl, rfl⟩ | ⟨m0, hm0, hps0, _⟩
-          · show off + 0 + s.inside.length ≤ childPerms.length
-            rw [hchildPermSpec.1, Nat.add_zero, hsLen]; exact hbound
-          · obtain ⟨n, _, _, _, _, _, hwin0⟩ := hmr q m0 hm0
-            have hlast := hwin0 (off + len - 1) (by omega) (by omega)
-            have hlt : off + len - 1 < m0.permissions.length := (List.getElem?_eq_some_iff.mp hlast).1
-            rw [hps0, Nat.add_zero, hsLen]; omega
-        obtain ⟨msg, hmsg⟩ := reborrowInitAccess_error_is_ub childPath off s.inside 0 root1 e
-          hlenRoot1 hrun
-        exact ⟨msg, by rw [hmsg]; rfl⟩
-  -- Dispatch on `selectFnEntryPolicy facts kind attrs`.
-  dsimp only
-  cases hpv : selectFnEntryPolicy facts kind attrs with
-  | skipRetag => exact absurd hpv hpolNotSkip
-  | rustcNoWritable =>
-    have hnew' : ReborrowSettings.new lookup ptr (ptrTypeOfParamKind kind info) true tbm.params
-        (!attrs.rustcNoWritable) =
-        .ok (some (Gen.ReborrowSettings.mk
-          (List.replicate len (.Prot (.Reserved false false)))
-          (.Prot (.Reserved false false)) expectedProt)) := by
-      have h1 := hsettings
-      rw [hpv, hmaskLen] at h1
-      exact h1
-    have hnpr' : ∀ n ∈ w.nodes, isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag)
-        false off len n = true →
-        stepNodeOnRangeRead w.activeProtectors false off len n = .ok n := by
-      intro n hn hp
-      have := hnoprune n hn
-      rw [hpv] at this
-      exact nwsr_foreignStepInert_read (this hp)
-    have hmpInit : Permission.matches_protector (.Prot (.Reserved false false)) expectedProt = true := by
-      simp [Permission.matches_protector, hProtYes]
-    obtain ⟨hfwd, hbwd⟩ := hcore false .Read (.Prot (.Reserved false false))
-      (.Prot (.Reserved true false)) (.reservedFrz false)
-      (fun isLoc m => stepNodeOnRangeRead w.activeProtectors isLoc off len m)
-      rfl rfl hmpInit rfl (by decide)
-      (fun n hn => a1_stepRead_sim w.activeProtectors off len n (hinv.overlap n hn)
-        (hinv.noProtIM n hn) (hinv.protUniqAcc n hn))
-      hnpr' hnew'
-    refine ⟨?_, ?_, ?_⟩
-    · intro w' childTag hok
-      obtain ⟨_, nodes', hpair, hrel⟩ :=
-        (a1_execFnEntryMutRetagPrunedSourceOrder_rustcNoWritable_ok_iff w parentTag off len
-          requireInit hneLen (w', childTag)).mp hok
-      injection hpair with hw' _
-      rw [hw']
-      exact hfwd nodes' hrel
-    · intro e herr
-      apply hbwd
-      intro nodes' hrel
-      have hok := (a1_execFnEntryMutRetagPrunedSourceOrder_rustcNoWritable_ok_iff w parentTag off len
-        requireInit hneLen _).mpr ⟨⟨pn, hpn⟩, nodes', rfl, hrel⟩
-      rw [herr] at hok; cases hok
-    · intro r hret
-      cases he : execFnEntryMutRetagPrunedSourceOrder w parentTag off len .rustcNoWritable requireInit with
-      | ok res =>
-        rcases res with ⟨w', ct⟩
-        obtain ⟨_, nodes', hpair, hrel⟩ :=
-          (a1_execFnEntryMutRetagPrunedSourceOrder_rustcNoWritable_ok_iff w parentTag off len
-            requireInit hneLen (w', ct)).mp he
-        injection hpair with hw' _
-        have hfwd' := hfwd nodes' hrel
-        rw [← hw'] at hfwd'
-        obtain ⟨tbm', alloc', hret', hal', _, _, _, hinv'⟩ := hfwd'
-        rw [hret] at hret'
-        cases hret'
-        exact ⟨w', ct, rfl, rfl, rfl, alloc', hal', hinv'⟩
-      | error e =>
-        have hno : ∀ nodes', ¬ ListRel (PrunedStepRel w parentTag false off len
-            (fun isLoc m => stepNodeOnRangeRead w.activeProtectors isLoc off len m)) w.nodes nodes' := by
-          intro nodes' hrel
-          have hok := (a1_execFnEntryMutRetagPrunedSourceOrder_rustcNoWritable_ok_iff w parentTag off len
-            requireInit hneLen _).mpr ⟨⟨pn, hpn⟩, nodes', rfl, hrel⟩
-          rw [he] at hok; cases hok
-        obtain ⟨msg, hmsg⟩ := hbwd hno
-        rw [hret] at hmsg; cases hmsg
-  | writableChildWrite =>
-    obtain ⟨hro, hreq⟩ := hwritableGates hpv
-    have hnew' : ReborrowSettings.new lookup ptr (ptrTypeOfParamKind kind info) true tbm.params
-        (!attrs.rustcNoWritable) =
-        .ok (some (Gen.ReborrowSettings.mk
-          (List.replicate len (.Prot .Unique))
-          (.Prot (.Reserved false false)) expectedProt)) := by
-      have h1 := hsettings
-      rw [hpv, hmaskLen] at h1
-      exact h1
-    have hnpr' : ∀ n ∈ w.nodes, isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag)
-        true off len n = true →
-        stepNodeOnRangeWrite w.activeProtectors false off len n = .ok n := by
-      intro n hn hp
-      have := hnoprune n hn
-      rw [hpv] at this
-      exact nwsr_foreignStepInert_write (this hp)
-    have hmpInit : Permission.matches_protector (.Prot .Unique) expectedProt = true := by
-      simp [Permission.matches_protector, hProtYes]
-    obtain ⟨hfwd, hbwd⟩ := hcore true .Write (.Prot .Unique) (.Prot .Unique) .unique
-      (fun isLoc m => stepNodeOnRangeWrite w.activeProtectors isLoc off len m)
-      rfl rfl hmpInit rfl (by decide)
-      (fun n hn => a1_stepWrite_sim w.activeProtectors off len n (hinv.overlap n hn)
-        (hinv.noProtIM n hn) (hinv.protUniqAcc n hn))
-      hnpr' hnew'
-    refine ⟨?_, ?_, ?_⟩
-    · intro w' childTag hok
-      obtain ⟨_, _, _, nodes', hpair, hrel⟩ :=
-        (a1_execFnEntryMutRetagPrunedSourceOrder_writableChildWrite_ok_iff w parentTag off len
-          requireInit hneLen (w', childTag)).mp hok
-      injection hpair with hw' _
-      rw [hw']
-      exact hfwd nodes' hrel
-    · intro e herr
-      apply hbwd
-      intro nodes' hrel
-      have hok := (a1_execFnEntryMutRetagPrunedSourceOrder_writableChildWrite_ok_iff w parentTag off len
-        requireInit hneLen _).mpr ⟨hro, hreq, ⟨pn, hpn⟩, nodes', rfl, hrel⟩
-      rw [herr] at hok; cases hok
-    · intro r hret
-      cases he : execFnEntryMutRetagPrunedSourceOrder w parentTag off len .writableChildWrite requireInit with
-      | ok res =>
-        rcases res with ⟨w', ct⟩
-        obtain ⟨_, _, _, nodes', hpair, hrel⟩ :=
-          (a1_execFnEntryMutRetagPrunedSourceOrder_writableChildWrite_ok_iff w parentTag off len
-            requireInit hneLen (w', ct)).mp he
-        injection hpair with hw' _
-        have hfwd' := hfwd nodes' hrel
-        rw [← hw'] at hfwd'
-        obtain ⟨tbm', alloc', hret', hal', _, _, _, hinv'⟩ := hfwd'
-        rw [hret] at hret'
-        cases hret'
-        exact ⟨w', ct, rfl, rfl, rfl, alloc', hal', hinv'⟩
-      | error e =>
-        have hno : ∀ nodes', ¬ ListRel (PrunedStepRel w parentTag true off len
-            (fun isLoc m => stepNodeOnRangeWrite w.activeProtectors isLoc off len m)) w.nodes nodes' := by
-          intro nodes' hrel
-          have hok := (a1_execFnEntryMutRetagPrunedSourceOrder_writableChildWrite_ok_iff w parentTag off len
-            requireInit hneLen _).mpr ⟨hro, hreq, ⟨pn, hpn⟩, nodes', rfl, hrel⟩
-          rw [he] at hok; cases hok
-        obtain ⟨msg, hmsg⟩ := hbwd hno
-        rw [hret] at hmsg; cases hmsg
+        · exact hinv.overlap n' hn
+        · obtain ⟨_, _, hro, hrl, _, _⟩ := nwsr_stepRead_meta _ false off len n n' hs
+          rw [hro, hrl]; exact hinv.overlap n hn
+    · rw [hpol] at hok
+      obtain ⟨_, _, _, nodes', hres, hrel⟩ := (a1_execFnEntryMutRetagPrunedSourceOrder_writableChildWrite_ok_iff
+        w parentTag off len requireInit (by omega) (w', childTag)).mp hok
+      have hwEq : w' = _ := congrArg Prod.fst hres
+      rw [hwEq] at hn'
+      rcases List.mem_cons.mp hn' with rfl | hn''
+      · exact a1_rangesOverlap_self hlen
+      · obtain ⟨n, hn, hr⟩ := hrel.exists_of_mem_right hn''
+        rcases hr with hs | ⟨_, _, rfl⟩ | ⟨_, _, hs⟩
+        · obtain ⟨_, _, hro, hrl, _, _⟩ := nwsr_stepWrite_meta _ true off len n n' hs.2
+          rw [hro, hrl]; exact hinv.overlap n hn
+        · exact hinv.overlap n' hn
+        · obtain ⟨_, _, hro, hrl, _, _⟩ := nwsr_stepWrite_meta _ false off len n n' hs
+          rw [hro, hrl]; exact hinv.overlap n hn
+  obtain ⟨pNode, hpNode, h1, h2, h3⟩ := tbm_retag_ptr_fnEntry_mutOrBox_simulates_world_multi
+    tbm frameExtra ptr lookup facts kind attrs hkind hunpin htbmParams id alloc off len align hlen
+    cells mask hmask emb w parentTag requireInit hprov halloc hlive hoff hbound
+    (treeSimInvMulti_of_treeSimInv _ _ _ _ _ hinv) htag hfreshTag hfreshProt hloc
+    (fun n hn _ => hinv.overlap n hn) hnoprune hwritableGates
+  refine ⟨pNode, hpNode, fun w' ct hok => ?_, h2, fun r hr => ?_⟩
+  · obtain ⟨tbm', alloc', hret, hal, hlv, hwf, ⟨mc, hmc, hmp, _⟩, _, hm⟩ := h1 w' ct hok
+    exact ⟨tbm', alloc', hret, hal, hlv, hwf, ⟨mc, hmc, hmp⟩,
+      a3_treeSimInv_of_multi _ _ _ _ _ hm (hov' w' ct hok)⟩
+  · obtain ⟨w', ct, hok, hr1, hr2, alloc', hal, hm⟩ := h3 r hr
+    exact ⟨w', ct, hok, hr1, hr2, alloc', hal,
+      a3_treeSimInv_of_multi _ _ _ _ _ hm (hov' w' ct hok)⟩
 
 /-- **Model 5 (`execFnEntryMutRetagTraversalOrderDirect`) corollary**: on every
 rooted borrow tree (`BorrowTreeRootedWF w rootTag`), `TreeBorrowsMemory.retag_ptr`
@@ -7880,22 +8430,6 @@ private theorem b1_isProtected_releaseProtector_other (n : TreeTagNode) (protId 
       rw [h2'] at h2; cases h2
     · exact h1.trans h2.symm
 
-private theorem b1_isPrefixOf_refl : ∀ (p : Gen.Path), p.isPrefixOf p = true
-  | [] => rfl
-  | h :: tl => by simp only [List.isPrefixOf, a1_int_beq_self, Bool.true_and]; exact b1_isPrefixOf_refl tl
-
-private theorem b1_nodeAt_prefix_eq {p q : Gen.Path} :
-    p.isPrefixOf q = true → q.isPrefixOf p = true → p = q := by
-  induction p generalizing q with
-  | nil => intro _ h2; cases q with | nil => rfl | cons _ _ => cases h2
-  | cons a ps ih =>
-    intro h1 h2
-    cases q with
-    | nil => cases h1
-    | cons b qs =>
-      simp only [List.isPrefixOf, Bool.and_eq_true, a1_int_beq_iff] at h1 h2
-      rw [h1.1, ih h1.2 h2.2]
-
 /-- Purely topological no-nested-foreign-ancestors predicate on `nodes` for access
 source `srcTag`: every non-ancestor node's strict ancestors already lie on the
 access path to `srcTag`. Preserved automatically across all permission-only
@@ -8017,6 +8551,806 @@ private theorem b1_listRel_nodeMetaRel_isStrictDescendantOf {xs ys : List TreeTa
   unfold isStrictDescendantOf
   rw [hxy.1, b1_listRel_nodeMetaRel_ancestorPathTags hrel x.tag]
 
+/-- **Lifted multi-window `TreeBorrowsMemory.release_protector` simulation (`TreeSimInvMulti`)**:
+removes the universal `overlap` restriction of
+`tbm_release_protector_simulates_execFrameExitMiniRust_step` so protector releases
+on sub-slice windows `[off, off + len)` inside multi-slice borrow trees simulate
+`execFrameExitMiniRust` in lockstep, preserving `TreeSimInvMulti`, `wfLive`,
+other nodes' outside bytes, and producing `permIsForeignPassive` on the released
+node's outside bytes. -/
+theorem tbm_release_protector_simulates_execFrameExitMiniRust_step_multi
+    (tbm : Gen.TreeBorrowsMemory Gen.x86_64)
+    (id : Nat) (alloc : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra)
+    (off len : Nat) (hlen : 0 < len)
+    (emb : Nat → Gen.Path) (w : FnEntryBorrowWorld) (protectedTag protId : Nat) (pn : TreeTagNode)
+    (halloc : tbm.mem.allocations[id]? = some alloc) (hlive : alloc.live = true)
+    (hEqLen : ∀ q m, nodeAt alloc.extra.root q = some m → m.permissions.length = alloc.data.length)
+    (hinv : TreeSimInvMulti off len emb w alloc.extra.root)
+    (htagsNodup : (w.nodes.map (·.tag)).Nodup)
+    (hpn : findNode? w.nodes protectedTag = some pn)
+    (hpnProt : pn.protector = some protId)
+    (hactProt : w.activeProtectors.contains protId = true)
+    (hpnRange : pn.rangeOffset = off ∧ pn.rangeLen = len)
+    (hprotUnique : ∀ n ∈ w.nodes, n.tag ≠ protectedTag → n.protector ≠ some protId)
+    (hembInj : ∀ n ∈ w.nodes, emb n.tag = emb protectedTag → n.tag = protectedTag)
+    (hloc : ∀ n ∈ w.nodes,
+      (ancestorPathTags w.nodes protectedTag).contains n.tag =
+        locOf (some (emb protectedTag)) (emb n.tag))
+    (hancOv : ∀ n ∈ w.nodes,
+      (ancestorPathTags w.nodes protectedTag).contains n.tag = true →
+      rangesOverlap off len n.rangeOffset n.rangeLen = true)
+    (hdesc : ∀ n ∈ w.nodes,
+      isStrictDescendantOf w.nodes protectedTag n =
+        ((emb protectedTag).isPrefixOf (emb n.tag) && decide (n.tag ≠ protectedTag)))
+    (hpruneInert : ∀ n ∈ w.nodes, ∀ isWrite,
+      protectorEndAccessIsWriteMiniRust? pn = some isWrite →
+      isStrictDescendantOf w.nodes protectedTag n = false →
+      isPrunedForeignNode w.nodes (ancestorPathTags w.nodes protectedTag) isWrite off len n = true →
+      stepNodeOnRangeAccess w.activeProtectors isWrite false off len n = .ok n)
+    (hOutside : ∀ m, nodeAt alloc.extra.root (emb protectedTag) = some m →
+      OutsideNoProtectorAccess off len m) :
+    (∀ w', execFrameExitMiniRust w [(protectedTag, protId)] = .ok w' →
+      ∃ tbm' alloc',
+        TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb protectedTag) = .ok tbm' ∧
+        tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
+        alloc'.data.length = alloc.data.length ∧
+        (∀ q m, nodeAt alloc'.extra.root q = some m → m.permissions.length = alloc'.data.length) ∧
+        (TreeBorrowsMemory.wfLive tbm → TreeBorrowsMemory.wfLive tbm') ∧
+        ListRel NodeMetaRel w.nodes w'.nodes ∧
+        w'.activeProtectors = w.activeProtectors.filter (· != protId) ∧
+        TreeSimInvMulti off len emb w' alloc'.extra.root ∧
+        (∃ mt, nodeAt alloc'.extra.root (emb protectedTag) = some mt ∧ mt.«protected» = .No ∧
+          ∀ b, b < alloc.data.length → (b < off ∨ off + len ≤ b) →
+            ∃ p', mt.permissions[b]? = some p' ∧ permIsForeignPassive p' = true) ∧
+        (∀ q m, nodeAt alloc.extra.root q = some m → q ≠ emb protectedTag →
+          ∃ m', nodeAt alloc'.extra.root q = some m' ∧ m'.«protected» = m.«protected» ∧
+            (∀ b, b < off ∨ off + len ≤ b → m'.permissions[b]? = m.permissions[b]?) ∧
+            (∀ (b : Nat) (pp0 : Gen.PermissionProt) p',
+              m.permissions[b]? = some (Gen.Permission.Prot pp0) → m'.permissions[b]? = some p' →
+              ∃ pp', p' = Gen.Permission.Prot pp'))) ∧
+    (∀ e, execFrameExitMiniRust w [(protectedTag, protId)] = .error e →
+      ∃ msg, TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb protectedTag) = .error (.ub msg)) ∧
+    (∀ tbm', TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb protectedTag) = .ok tbm' →
+      ∃ w' alloc',
+        execFrameExitMiniRust w [(protectedTag, protId)] = .ok w' ∧
+        tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
+        TreeSimInvMulti off len emb w' alloc'.extra.root) := by
+  have hpnMemTag := mem_of_findNode?_eq_some hpn
+  have hpnMem : pn ∈ w.nodes := hpnMemTag.1
+  have hpnTag : pn.tag = protectedTag := hpnMemTag.2
+  have hpnOv : rangesOverlap off len pn.rangeOffset pn.rangeLen = true := by
+    rw [hpnRange.1, hpnRange.2]; exact a1_rangesOverlap_self hlen
+  have hpnIsProt : pn.isProtected w.activeProtectors = true := by
+    unfold TreeTagNode.isProtected; rw [hpnProt]
+    exact List.any_eq_true.mpr ⟨protId, List.contains_iff_mem.mp hactProt, beq_self_eq_true protId⟩
+  obtain ⟨tNode, htNode, htNod⟩ := hinv.nodes pn hpnMem
+  simp only [hpnOv, ↓reduceIte] at htNod
+  obtain ⟨htProt, pPn, hpPn, hwinPn⟩ := htNod
+  rw [hpnTag] at htNode
+  rw [hpnIsProt] at htProt hpPn
+  have hnoIMPn : pn.perm ≠ .reservedIM := hinv.noProtIM pn hpnMem hpnIsProt
+  have huniqPn : pn.perm = .unique → pn.accessed = true := hinv.protUniqAcc pn hpnMem hpnIsProt
+  obtain ⟨pPn', hunpPn, hpPn'⟩ := b1_unprotect_permToMiniRust pn pPn hpPn hnoIMPn huniqPn
+  have htOut := hOutside tNode htNode
+  have hallUnp : ∀ p ∈ tNode.permissions, ∃ y, Permission.unprotect p = .ok y := by
+    intro p hp
+    obtain ⟨b, hbLt, hbEq⟩ := List.getElem_of_mem hp
+    have hbGet : tNode.permissions[b]? = some p := by rw [List.getElem?_eq_getElem hbLt, hbEq]
+    rcases Decidable.em (off ≤ b ∧ b < off + len) with ⟨hb1, hb2⟩ | hout
+    · have h1 := hwinPn b hb1 hb2; rw [hbGet] at h1; cases h1; exact ⟨_, hunpPn⟩
+    · obtain ⟨p', hp'⟩ := htOut b p hbGet (b1_not_in_window hout); exact ⟨(p', none), hp'⟩
+  obtain ⟨pairs, hpairs, hpairsLen, hpairsGet⟩ :=
+    b1_list_mapM_ok_of_forall Permission.unprotect tNode.permissions hallUnp
+  let accesses := pairs.map Prod.snd
+  let unprotPerms := pairs.map Prod.fst
+  have haccLen : accesses.length = tNode.permissions.length := by
+    dsimp only [accesses]; rw [List.length_map, hpairsLen]
+  have hunpLen : unprotPerms.length = tNode.permissions.length := by
+    dsimp only [unprotPerms]; rw [List.length_map, hpairsLen]
+  have haccIn : ∀ b, off ≤ b → b < off + len →
+      accesses[b]? = some ((protectorEndAccessIsWriteMiniRust? pn).map (fun isW => if isW then .Write else .Read)) ∧
+      unprotPerms[b]? = some pPn' := by
+    intro b hb1 hb2
+    have hbGet := hwinPn b hb1 hb2
+    have hbLt : b < tNode.permissions.length := (List.getElem?_eq_some_iff.mp hbGet).1
+    obtain ⟨x, y, hx, hy, hfx⟩ := hpairsGet b hbLt
+    rw [hbGet] at hx; cases hx
+    rw [hunpPn] at hfx; cases hfx
+    dsimp only [accesses, unprotPerms]; rw [List.getElem?_map, List.getElem?_map, hy]; exact ⟨rfl, rfl⟩
+  have haccOut : ∀ b, b < off ∨ off + len ≤ b → b < accesses.length →
+      accesses[b]? = some none := by
+    intro b hout hblt
+    rw [haccLen] at hblt
+    obtain ⟨x, y, hx, hy, hfx⟩ := hpairsGet b hblt
+    obtain ⟨p', hp'⟩ := htOut b x hx hout
+    rw [hp'] at hfx; cases hfx
+    dsimp only [accesses]; rw [List.getElem?_map, hy]; rfl
+  have hunpPassive : ∀ b, b < alloc.data.length →
+      ∃ p', unprotPerms[b]? = some p' ∧ permIsForeignPassive p' = true := by
+    intro b hblt
+    have hbltT : b < tNode.permissions.length := by rw [hEqLen _ tNode htNode]; exact hblt
+    obtain ⟨x, y, _, hy, hfx⟩ := hpairsGet b hbltT
+    cases x with
+    | Unprot _ => cases hfx
+    | Prot pp =>
+      unfold Permission.unprotect at hfx
+      cases hfx
+      exact ⟨.Unprot (PermissionProt.unprotect pp).1, by dsimp only [unprotPerms]; rw [List.getElem?_map, hy]; rfl, rfl⟩
+  obtain ⟨root1, _, hsuf1, hother1, hrelEq⟩ :=
+    tbm_release_protector_eq tbm id (emb protectedTag) alloc tNode pairs halloc hlive htNode htProt hpairs
+  have hroot1AtTarget : nodeAt root1 (emb protectedTag) = some { tNode with permissions := unprotPerms } := by
+    have h1 := hsuf1 []; rw [List.append_nil] at h1; exact h1
+  have hroot1Other : ∀ q, q ≠ emb protectedTag →
+      (nodeAt alloc.extra.root q = none → nodeAt root1 q = none) ∧
+      (∀ m, nodeAt alloc.extra.root q = some m →
+        ∃ m1, nodeAt root1 q = some m1 ∧ m1.permissions = m.permissions ∧ m1.«protected» = m.«protected») := by
+    intro q hqne
+    cases hpre : (emb protectedTag).isPrefixOf q with
+    | false =>
+      have ho := hother1 q hpre
+      exact ⟨ho.1, fun m hm => by obtain ⟨m1, hm1, hp1, hp2, _⟩ := ho.2 m hm; exact ⟨m1, hm1, hp1, hp2⟩⟩
+    | true =>
+      obtain ⟨suf, rfl⟩ := a1_isPrefixOf_eq_append _ _ hpre
+      have hsufNe : suf ≠ [] := fun h => hqne (by rw [h, List.append_nil])
+      have hsame : nodeAt root1 (emb protectedTag ++ suf) = nodeAt alloc.extra.root (emb protectedTag ++ suf) := by
+        rw [hsuf1 suf, a1_nodeAt_append, htNode]
+        cases suf with
+        | nil => exact absurd rfl hsufNe
+        | cons a as => rfl
+      exact ⟨fun h => by rw [hsame, h], fun m hm => ⟨m, by rw [hsame, hm], rfl, rfl⟩⟩
+  have hroot1EqLen : ∀ q m1, nodeAt root1 q = some m1 → m1.permissions.length = alloc.data.length := by
+    intro q m1 hm1
+    rcases Decidable.em (q = emb protectedTag) with rfl | hqne
+    · rw [hroot1AtTarget] at hm1; cases hm1; exact hunpLen.trans (hEqLen _ tNode htNode)
+    · cases hm0 : nodeAt alloc.extra.root q with
+      | none => rw [(hroot1Other q hqne).1 hm0] at hm1; cases hm1
+      | some m0 =>
+        obtain ⟨m1', hm1', hps, _⟩ := (hroot1Other q hqne).2 m0 hm0
+        rw [hm1'] at hm1; cases hm1; rw [hps]; exact hEqLen q m0 hm0
+  have haccEqData : accesses.length = alloc.data.length := haccLen.trans (hEqLen _ tNode htNode)
+  have hboundWindow : off + len ≤ alloc.data.length := by
+    have hlast := hwinPn (off + len - 1) (by omega) (by omega)
+    have hlt := (List.getElem?_eq_some_iff.mp hlast).1
+    rw [hEqLen _ tNode htNode] at hlt; omega
+  have hmr : ∀ q m, nodeAt alloc.extra.root q = some m → ∃ n ∈ w.nodes, emb n.tag = q ∧
+      (if rangesOverlap off len n.rangeOffset n.rangeLen = true then
+        NodeWindowRel w.activeProtectors off len n m
+       else
+        Protected.yes m.«protected» = n.isProtected w.activeProtectors ∧
+        ∀ b, off ≤ b → b < off + len → ∃ p, m.permissions[b]? = some p ∧ permIsForeignPassive p = true) := by
+    intro q m hm
+    obtain ⟨n, hn, hemb⟩ := hinv.surj q m hm
+    obtain ⟨m', hm', hnod⟩ := hinv.nodes n hn
+    rw [hemb, hm] at hm'; cases hm'
+    exact ⟨n, hn, hemb, hnod⟩
+  have hidlt : id < tbm.mem.allocations.length := (List.getElem?_eq_some_iff.mp halloc).1
+  have hpostEqLen : ∀ root2,
+      (∀ q, (nodeAt root1 q = none → nodeAt root2 q = none) ∧
+        (∀ m1, nodeAt root1 q = some m1 → ∃ m2, nodeAt root2 q = some m2 ∧ ReleasePost (some (emb protectedTag)) accesses q m1 m2)) →
+      ∀ q m2, nodeAt root2 q = some m2 → m2.permissions.length = alloc.data.length := by
+    intro root2 hpost2 q m2 hm2
+    cases hm1 : nodeAt root1 q with
+    | none => rw [(hpost2 q).1 hm1] at hm2; cases hm2
+    | some m1 =>
+      obtain ⟨m2', hm2', hrel⟩ := (hpost2 q).2 m1 hm1
+      rw [hm2'] at hm2; cases hm2
+      have hl1 := hroot1EqLen q m1 hm1
+      unfold ReleasePost at hrel
+      rcases Decidable.em (emb protectedTag = q) with rfl | hne
+      · simp only [↓reduceIte] at hrel; rw [hrel.2]; exact hl1
+      · simp only [hne, ↓reduceIte] at hrel
+        cases hpre : (emb protectedTag).isPrefixOf q with
+        | true => simp only [hpre, ↓reduceIte] at hrel; rw [hrel]; exact hl1
+        | false => simp only [hpre, Bool.false_eq_true, ↓reduceIte] at hrel; exact hrel.2.1.trans hl1
+  have hpostTarget : ∀ root2,
+      (∀ q, (nodeAt root1 q = none → nodeAt root2 q = none) ∧
+        (∀ m1, nodeAt root1 q = some m1 → ∃ m2, nodeAt root2 q = some m2 ∧ ReleasePost (some (emb protectedTag)) accesses q m1 m2)) →
+      ∃ mt, nodeAt root2 (emb protectedTag) = some mt ∧ mt.«protected» = .No ∧
+        ∀ b, b < alloc.data.length → (b < off ∨ off + len ≤ b) →
+          ∃ p', mt.permissions[b]? = some p' ∧ permIsForeignPassive p' = true := by
+    intro root2 hpost2
+    obtain ⟨mt, hmt, hrel⟩ := (hpost2 (emb protectedTag)).2 _ hroot1AtTarget
+    unfold ReleasePost at hrel; simp only [↓reduceIte] at hrel
+    exact ⟨mt, hmt, hrel.1, fun b hblt _ => by rw [hrel.2]; exact hunpPassive b hblt⟩
+  have hpostOutside : ∀ root2,
+      (∀ q, (nodeAt root1 q = none → nodeAt root2 q = none) ∧
+        (∀ m1, nodeAt root1 q = some m1 → ∃ m2, nodeAt root2 q = some m2 ∧ ReleasePost (some (emb protectedTag)) accesses q m1 m2)) →
+      ∀ q m, nodeAt alloc.extra.root q = some m → q ≠ emb protectedTag →
+        ∃ m2, nodeAt root2 q = some m2 ∧ m2.«protected» = m.«protected» ∧
+          (∀ b, b < off ∨ off + len ≤ b → m2.permissions[b]? = m.permissions[b]?) ∧
+          (∀ (b : Nat) (pp0 : Gen.PermissionProt) p',
+            m.permissions[b]? = some (Gen.Permission.Prot pp0) → m2.permissions[b]? = some p' →
+            ∃ pp', p' = Gen.Permission.Prot pp') := by
+    intro root2 hpost2 q m hm hqne
+    obtain ⟨m1, hm1, hm1Ps, hm1Prot⟩ := (hroot1Other q hqne).2 m hm
+    obtain ⟨m2, hm2, hrel⟩ := (hpost2 q).2 m1 hm1
+    unfold ReleasePost at hrel
+    have hne' : emb protectedTag ≠ q := hqne.symm
+    simp only [hne', ↓reduceIte] at hrel
+    cases hpre : (emb protectedTag).isPrefixOf q with
+    | true =>
+      simp only [hpre, ↓reduceIte] at hrel
+      refine ⟨m2, hm2, by rw [hrel, hm1Prot], fun b _ => by rw [hrel, hm1Ps], fun b pp0 p' h0 h2 => ?_⟩
+      rw [hrel, hm1Ps, h0] at h2; cases h2; exact ⟨pp0, rfl⟩
+    | false =>
+      simp only [hpre, Bool.false_eq_true, ↓reduceIte] at hrel
+      refine ⟨m2, hm2, hrel.1.trans hm1Prot, fun b hb => ?_, fun b pp0 p' h0 h2 => ?_⟩
+      · rcases Decidable.em (b < accesses.length) with hblt | hbge
+        · have hstep := hrel.2.2.2 b hblt
+          rw [haccOut b hb hblt] at hstep; rw [hstep, hm1Ps]
+        · rw [hrel.2.2.1 b (by omega), hm1Ps]
+      · rcases Decidable.em (b < accesses.length) with hblt | hbge
+        · have hstep := hrel.2.2.2 b hblt
+          cases ha : accesses[b]? with
+          | none => exact False.elim (Nat.not_le_of_gt hblt (List.getElem?_eq_none_iff.mp ha))
+          | some ak =>
+            cases ak with
+            | none => rw [ha] at hstep; rw [hstep, hm1Ps, h0] at h2; cases h2; exact ⟨pp0, rfl⟩
+            | some k =>
+              rw [ha] at hstep
+              obtain ⟨p2, htr, hp2⟩ := hstep (Gen.Permission.Prot pp0) (by rw [hm1Ps]; exact h0)
+              rw [h2] at hp2; cases hp2
+              unfold Permission.transition at htr
+              obtain ⟨pp', _, hok⟩ := nwsr_bind_ok htr
+              cases hok; exact ⟨pp', rfl⟩
+        · rw [hrel.2.2.1 b (by omega), hm1Ps, h0] at h2; cases h2; exact ⟨pp0, rfl⟩
+  have hdisjForeign : ∀ n ∈ w.nodes, rangesOverlap off len n.rangeOffset n.rangeLen = false →
+      locOf (some (emb protectedTag)) (emb n.tag) = false := by
+    intro n hn hdisj
+    cases hl : locOf (some (emb protectedTag)) (emb n.tag) with
+    | false => rfl
+    | true =>
+      have hov := hancOv n hn (by rw [hloc n hn, hl])
+      rw [hov] at hdisj; cases hdisj
+  cases hkind : protectorEndAccessIsWriteMiniRust? pn with
+  | none =>
+    have hallNone : ∀ i < accesses.length, accesses[i]? = some none := by
+      intro i hi
+      rcases Decidable.em (off ≤ i ∧ i < off + len) with ⟨hi1, hi2⟩ | hout
+      · have h1 := (haccIn i hi1 hi2).1; rw [hkind] at h1; exact h1
+      · exact haccOut i (b1_not_in_window hout) hi
+    have hpoint : ∀ q m1, nodeAt root1 q = some m1 → (emb protectedTag).isPrefixOf q = false →
+        ∀ i < accesses.length, ∀ k, accesses[i]? = some (some k) →
+          ∃ p p', m1.permissions[i]? = some p ∧ Permission.transition p k (locRel (some (emb protectedTag)) q) = .ok p' := by
+      intro _ _ _ _ i hi k hk; rw [hallNone i hi] at hk; cases hk
+    obtain ⟨root2, hrel2, hpost2⟩ :=
+      node_release_protector_ok_of_pointwise root1 (some (emb protectedTag)) accesses hpoint
+    have htbmOk : TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb protectedTag) =
+        .ok { tbm with mem := { tbm.mem with allocations := (tbm.mem.allocations.set id { alloc with extra := { root := root2 } }) } } := by
+      rw [hrelEq, hrel2]; rfl
+    have hworldOk : execFrameExitMiniRust w [(protectedTag, protId)] = .ok (releaseProtector w protId) := by
+      simp [execFrameExitMiniRust, execFrameExitSequential, execProtectorEndAccessFor, hpn, hkind]
+    have hinv2 : TreeSimInvMulti off len emb (releaseProtector w protId) root2 := by
+      refine ⟨?_, ?_, ?_, ?_⟩
+      · intro n hn
+        obtain ⟨m0, hm0, hnod0⟩ := hinv.nodes n hn
+        rcases Decidable.em (n.tag = protectedTag) with htagEq | htagNe
+        · have hneq : n = pn := b1_eq_of_mem_of_findNode?_of_nodup w.nodes protectedTag n pn htagsNodup hn htagEq hpn
+          subst n
+          obtain ⟨m2, hm2, hrel⟩ := (hpost2 (emb protectedTag)).2 _ hroot1AtTarget
+          unfold ReleasePost at hrel; simp only [↓reduceIte] at hrel
+          have hisP : pn.isProtected (w.activeProtectors.filter (· != protId)) = false :=
+            b1_isProtected_releaseProtector_self pn protId w.activeProtectors hpnProt
+          refine ⟨m2, by rw [hpnTag]; exact hm2, ?_⟩
+          simp only [hpnOv, ↓reduceIte]
+          refine ⟨?_, pPn', ?_, fun b hb1 hb2 => by rw [hrel.2]; exact (haccIn b hb1 hb2).2⟩
+          · change Protected.yes m2.«protected» = pn.isProtected (w.activeProtectors.filter (· != protId))
+            rw [hrel.1, hisP]; rfl
+          · change permToMiniRust (pn.isProtected (w.activeProtectors.filter (· != protId))) pn.accessed pn.perm = some pPn'
+            rw [hisP]; exact hpPn'
+        · have hqne : emb n.tag ≠ emb protectedTag := fun h => htagNe (hembInj n hn h)
+          obtain ⟨m1, hm1, hm1Ps, hm1Prot⟩ := (hroot1Other (emb n.tag) hqne).2 m0 hm0
+          obtain ⟨m2, hm2, hrel⟩ := (hpost2 (emb n.tag)).2 m1 hm1
+          have hisP : n.isProtected (w.activeProtectors.filter (· != protId)) = n.isProtected w.activeProtectors :=
+            b1_isProtected_releaseProtector_other n protId w.activeProtectors (hprotUnique n hn htagNe)
+          unfold ReleasePost at hrel
+          have hne' : emb protectedTag ≠ emb n.tag := hqne.symm
+          simp only [hne', ↓reduceIte] at hrel
+          have hpsSame : ∀ b, off ≤ b → b < off + len → m2.permissions[b]? = m0.permissions[b]? := by
+            intro b hb1 hb2
+            cases hpre : (emb protectedTag).isPrefixOf (emb n.tag) with
+            | true => simp only [hpre, ↓reduceIte] at hrel; rw [hrel, hm1Ps]
+            | false =>
+              simp only [hpre, Bool.false_eq_true, ↓reduceIte] at hrel
+              have hstep := hrel.2.2.2 b (by rw [haccEqData]; omega)
+              rw [hallNone b (by rw [haccEqData]; omega)] at hstep; rw [hstep, hm1Ps]
+          have hprotSame : m2.«protected» = m0.«protected» := by
+            cases hpre : (emb protectedTag).isPrefixOf (emb n.tag) with
+            | true => simp only [hpre, ↓reduceIte] at hrel; rw [hrel, hm1Prot]
+            | false => simp only [hpre, Bool.false_eq_true, ↓reduceIte] at hrel; rw [hrel.1, hm1Prot]
+          refine ⟨m2, hm2, ?_⟩
+          cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
+          | true =>
+            simp only [hov, ↓reduceIte] at hnod0 ⊢
+            obtain ⟨hprot0, p, hp, hwin0⟩ := hnod0
+            refine ⟨?_, p, ?_, fun b hb1 hb2 => by rw [hpsSame b hb1 hb2, hwin0 b hb1 hb2]⟩
+            · change Protected.yes m2.«protected» = n.isProtected (w.activeProtectors.filter (· != protId))
+              rw [hisP, hprotSame]; exact hprot0
+            · change permToMiniRust (n.isProtected (w.activeProtectors.filter (· != protId))) n.accessed n.perm = some p
+              rw [hisP]; exact hp
+          | false =>
+            simp only [hov, Bool.false_eq_true, ↓reduceIte] at hnod0 ⊢
+            refine ⟨?_, fun b hb1 hb2 => by rw [hpsSame b hb1 hb2]; exact hnod0.2 b hb1 hb2⟩
+            change Protected.yes m2.«protected» = n.isProtected (w.activeProtectors.filter (· != protId))
+            rw [hisP, hprotSame]; exact hnod0.1
+      · intro q m2 hm2
+        cases hm1 : nodeAt root1 q with
+        | none => rw [(hpost2 q).1 hm1] at hm2; cases hm2
+        | some m1 =>
+          rcases Decidable.em (q = emb protectedTag) with rfl | hqne
+          · exact ⟨pn, hpnMem, by rw [hpnTag]⟩
+          · cases hm0 : nodeAt alloc.extra.root q with
+            | none => rw [(hroot1Other q hqne).1 hm0] at hm1; cases hm1
+            | some m0 => exact hinv.surj q m0 hm0
+      · intro n hn hp'
+        rcases Decidable.em (n.tag = protectedTag) with htagEq | htagNe
+        · have hneq := b1_eq_of_mem_of_findNode?_of_nodup w.nodes protectedTag n pn htagsNodup hn htagEq hpn
+          subst n; have hisP := b1_isProtected_releaseProtector_self pn protId w.activeProtectors hpnProt
+          change pn.isProtected (w.activeProtectors.filter (· != protId)) = true at hp'
+          rw [hisP] at hp'; cases hp'
+        · have hisP := b1_isProtected_releaseProtector_other n protId w.activeProtectors (hprotUnique n hn htagNe)
+          change n.isProtected (w.activeProtectors.filter (· != protId)) = true at hp'
+          rw [hisP] at hp'; exact hinv.noProtIM n hn hp'
+      · intro n hn hp' hu
+        rcases Decidable.em (n.tag = protectedTag) with htagEq | htagNe
+        · have hneq := b1_eq_of_mem_of_findNode?_of_nodup w.nodes protectedTag n pn htagsNodup hn htagEq hpn
+          subst n; have hisP := b1_isProtected_releaseProtector_self pn protId w.activeProtectors hpnProt
+          change pn.isProtected (w.activeProtectors.filter (· != protId)) = true at hp'
+          rw [hisP] at hp'; cases hp'
+        · have hisP := b1_isProtected_releaseProtector_other n protId w.activeProtectors (hprotUnique n hn htagNe)
+          change n.isProtected (w.activeProtectors.filter (· != protId)) = true at hp'
+          rw [hisP] at hp'; exact hinv.protUniqAcc n hn hp' hu
+    have hmetaRefl : ∀ xs : List TreeTagNode, ListRel NodeMetaRel xs xs := by
+      intro xs; induction xs with | nil => exact .nil | cons x tl ih => exact .cons (NodeMetaRel.refl x) ih
+    refine ⟨?_, ?_, ?_⟩
+    · intro w' hw'; rw [hworldOk] at hw'; cases hw'
+      exact ⟨_, _, htbmOk, List.getElem?_set_self hidlt, hlive, rfl,
+        hpostEqLen root2 hpost2, fun hwf => tbm_release_protector_wfLive_choiceFree hwf htbmOk,
+        hmetaRefl w.nodes, rfl, hinv2, hpostTarget root2 hpost2, hpostOutside root2 hpost2⟩
+    · intro e he; rw [hworldOk] at he; cases he
+    · intro tbm' htbm'; rw [htbmOk] at htbm'; cases htbm'
+      exact ⟨releaseProtector w protId, _, hworldOk, List.getElem?_set_self hidlt, hlive, hinv2⟩
+  | some isWrite =>
+    let k : Gen.AccessKind := if isWrite then .Write else .Read
+    have hneLen : len ≠ 0 := by omega
+    have hstepSim : ∀ n ∈ w.nodes, a2_NodeStepSimMulti w.activeProtectors off len k
+        (fun isLoc m => stepNodeOnRangeAccess w.activeProtectors isWrite isLoc off len m) n := by
+      intro n hn
+      cases isWrite with
+      | false =>
+        refine ⟨fun hov isLocal => ?_, fun hdisj _ => by unfold stepNodeOnRangeAccess stepNodeOnRangeRead; simp only [Bool.false_eq_true, hdisj, Bool.not_false, ↓reduceIte]⟩
+        obtain ⟨p, hp, hok, herr⟩ := stepNodeOnRangeRead_simulates_permission_transition
+          w.activeProtectors isLocal off len n hov (hinv.noProtIM n hn) (hinv.protUniqAcc n hn)
+        refine ⟨p, hp, fun n' hn' => ?_, herr⟩
+        have hn'' : stepNodeOnRangeRead w.activeProtectors isLocal off len n = .ok n' := hn'
+        obtain ⟨htag', hprot', hro, hrl, hIM', hUA'⟩ := nwsr_stepRead_meta _ isLocal off len n n' hn''
+        have hpe : n'.isProtected w.activeProtectors = n.isProtected w.activeProtectors := by
+          unfold TreeTagNode.isProtected; rw [hprot']
+        exact ⟨htag', hprot', hpe, hro, hrl, fun hp' him => hinv.noProtIM n hn (hpe ▸ hp') (hIM' him),
+          hUA' (hinv.protUniqAcc n hn), hok n' hn''⟩
+      | true =>
+        refine ⟨fun hov isLocal => ?_, fun hdisj _ => by unfold stepNodeOnRangeAccess stepNodeOnRangeWrite; simp only [hdisj, Bool.not_false, ↓reduceIte]⟩
+        obtain ⟨p, hp, hok, herr⟩ := stepNodeOnRangeWrite_simulates_permission_transition
+          w.activeProtectors isLocal off len n hov (hinv.noProtIM n hn) (hinv.protUniqAcc n hn)
+        refine ⟨p, hp, fun n' hn' => ?_, herr⟩
+        have hn'' : stepNodeOnRangeWrite w.activeProtectors isLocal off len n = .ok n' := hn'
+        obtain ⟨htag', hprot', hro, hrl, hIM', hUA'⟩ := nwsr_stepWrite_meta _ isLocal off len n n' hn''
+        have hpe : n'.isProtected w.activeProtectors = n.isProtected w.activeProtectors := by
+          unfold TreeTagNode.isProtected; rw [hprot']
+        exact ⟨htag', hprot', hpe, hro, hrl, fun hp' him => hinv.noProtIM n hn (hpe ▸ hp') (hIM' him),
+          hUA' (hinv.protUniqAcc n hn), hok n' hn''⟩
+    have hworldEq : execFrameExitMiniRust w [(protectedTag, protId)] =
+        (match execProtectorEndAccess w protectedTag isWrite off len with
+        | .error e => .error e
+        | .ok w1 => .ok (releaseProtector w1 protId)) := by
+      unfold execFrameExitMiniRust execFrameExitSequential execProtectorEndAccessFor
+      simp only [hpn, hkind, hpnRange.1, hpnRange.2]
+      cases execProtectorEndAccess w protectedTag isWrite off len <;> rfl
+    have haccChar : ∀ i < accesses.length,
+        accesses[i]? = some (if off ≤ i ∧ i < off + len then some k else none) := by
+      intro i hi
+      rcases Decidable.em (off ≤ i ∧ i < off + len) with ⟨hi1, hi2⟩ | hout
+      · simp only [hi1, hi2, and_self, ↓reduceIte]; have h1 := (haccIn i hi1 hi2).1; rw [hkind] at h1; exact h1
+      · simp only [hout, ↓reduceIte]; exact haccOut i (b1_not_in_window hout) hi
+    have hrelToStep : ∀ n ∈ w.nodes, ∀ n',
+        ProtectorEndStepRel w protectedTag isWrite off len n n' →
+        (emb protectedTag).isPrefixOf (emb n.tag) = false →
+        stepNodeOnRangeAccess w.activeProtectors isWrite (locOf (some (emb protectedTag)) (emb n.tag)) off len n = .ok n' := by
+      intro n hn n' hrel hnotDesc
+      have hdescF : isStrictDescendantOf w.nodes protectedTag n = false := by
+        rw [hdesc n hn, hnotDesc]; rfl
+      rcases hrel with ⟨ha, hs⟩ | ⟨ha, hsk, hEq⟩ | ⟨ha, _, _, hs⟩
+      · rw [← hloc n hn, ha]; exact hs
+      · subst n'; rcases hsk with hd | hp
+        · rw [hdescF] at hd; cases hd
+        · rw [← hloc n hn, ha]; exact hpruneInert n hn isWrite hkind hdescF hp
+      · rw [← hloc n hn, ha]; exact hs
+    have hstepToRel : ∀ n ∈ w.nodes,
+        (∀ n', (emb protectedTag).isPrefixOf (emb n.tag) = false →
+          stepNodeOnRangeAccess w.activeProtectors isWrite (locOf (some (emb protectedTag)) (emb n.tag)) off len n = .ok n' →
+          ProtectorEndStepRel w protectedTag isWrite off len n n') := by
+      intro n hn n' hnotDesc hs
+      have hdescF : isStrictDescendantOf w.nodes protectedTag n = false := by
+        rw [hdesc n hn, hnotDesc]; rfl
+      cases hl : locOf (some (emb protectedTag)) (emb n.tag) with
+      | true => rw [hl] at hs; exact Or.inl ⟨by rw [hloc n hn, hl], hs⟩
+      | false =>
+        rw [hl] at hs
+        cases hp : isPrunedForeignNode w.nodes (ancestorPathTags w.nodes protectedTag) isWrite off len n with
+        | true =>
+          have hsame := hpruneInert n hn isWrite hkind hdescF hp
+          rw [hsame] at hs; cases hs
+          exact Or.inr (Or.inl ⟨by rw [hloc n hn, hl], Or.inr hp, rfl⟩)
+        | false =>
+          exact Or.inr (Or.inr ⟨by rw [hloc n hn, hl], hdescF, hp, hs⟩)
+    have hfwd : ∀ nodes', ListRel (ProtectorEndStepRel w protectedTag isWrite off len) w.nodes nodes' →
+        ∃ tbm' alloc',
+          TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb protectedTag) = .ok tbm' ∧
+          tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
+          alloc'.data.length = alloc.data.length ∧
+          (∀ q m, nodeAt alloc'.extra.root q = some m → m.permissions.length = alloc'.data.length) ∧
+          (TreeBorrowsMemory.wfLive tbm → TreeBorrowsMemory.wfLive tbm') ∧
+          ListRel NodeMetaRel w.nodes nodes' ∧
+          TreeSimInvMulti off len emb (releaseProtector { w with nodes := nodes' } protId) alloc'.extra.root ∧
+          (∃ mt, nodeAt alloc'.extra.root (emb protectedTag) = some mt ∧ mt.«protected» = .No ∧
+            ∀ b, b < alloc.data.length → (b < off ∨ off + len ≤ b) →
+              ∃ p', mt.permissions[b]? = some p' ∧ permIsForeignPassive p' = true) ∧
+          (∀ q m, nodeAt alloc.extra.root q = some m → q ≠ emb protectedTag →
+            ∃ m', nodeAt alloc'.extra.root q = some m' ∧ m'.«protected» = m.«protected» ∧
+              (∀ b, b < off ∨ off + len ≤ b → m'.permissions[b]? = m.permissions[b]?) ∧
+              (∀ (b : Nat) (pp0 : Gen.PermissionProt) p',
+                m.permissions[b]? = some (Gen.Permission.Prot pp0) → m'.permissions[b]? = some p' →
+                ∃ pp', p' = Gen.Permission.Prot pp')) := by
+      intro nodes' hrel
+      have hpoint : ∀ q m1, nodeAt root1 q = some m1 → (emb protectedTag).isPrefixOf q = false →
+          ∀ i < accesses.length, ∀ k', accesses[i]? = some (some k') →
+            ∃ p p', m1.permissions[i]? = some p ∧
+              Permission.transition p k' (locRel (some (emb protectedTag)) q) = .ok p' := by
+        intro q m1 hm1 hnotPre i hi k' hk'
+        have hqne : q ≠ emb protectedTag := fun h => by rw [h, b1_isPrefixOf_refl] at hnotPre; cases hnotPre
+        have hci := haccChar i hi; rw [hk'] at hci
+        rcases Decidable.em (off ≤ i ∧ i < off + len) with ⟨hi1, hi2⟩ | hout
+        · simp only [hi1, hi2, and_self, ↓reduceIte] at hci; cases hci
+          cases hm0 : nodeAt alloc.extra.root q with
+          | none => rw [(hroot1Other q hqne).1 hm0] at hm1; cases hm1
+          | some m0 =>
+            obtain ⟨m1', hm1', hm1Ps, _⟩ := (hroot1Other q hqne).2 m0 hm0
+            rw [hm1'] at hm1; cases hm1
+            obtain ⟨n, hn, hemb, hnod⟩ := hmr q m0 hm0
+            have hlocEq : locRel (some (emb protectedTag)) q =
+                nodeRelToMiniRust (locOf (some (emb protectedTag)) (emb n.tag)) := by
+              unfold locRel nodeRelToMiniRust; rw [hemb]
+            cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
+            | true =>
+              simp only [hov, ↓reduceIte] at hnod
+              obtain ⟨_, p, hp, hwin0⟩ := hnod
+              obtain ⟨n', _, hnn'⟩ := hrel.exists_of_mem_left hn
+              have hs := hrelToStep n hn n' hnn' (by rw [hemb]; exact hnotPre)
+              obtain ⟨p0, hp0, hok, _⟩ := (hstepSim n hn).1 hov (locOf (some (emb protectedTag)) (emb n.tag))
+              rw [hp] at hp0; cases hp0
+              obtain ⟨_, _, _, _, _, _, _, p', htr, _⟩ := hok n' hs
+              rw [hm1Ps, hlocEq]; exact ⟨p, p', hwin0 i hi1 hi2, htr⟩
+            | false =>
+              simp only [hov, Bool.false_eq_true, ↓reduceIte] at hnod
+              have hfor := hdisjForeign n hn hov
+              obtain ⟨p, hpb, hpas⟩ := hnod.2 i hi1 hi2
+              obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p k hpas
+              rw [hm1Ps, hlocEq, hfor]; exact ⟨p, p', hpb, htr⟩
+        · simp only [hout, ↓reduceIte] at hci; cases hci
+      obtain ⟨root2, hrel2, hpost2⟩ :=
+        node_release_protector_ok_of_pointwise root1 (some (emb protectedTag)) accesses hpoint
+      have htbmOk : TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb protectedTag) =
+          .ok { tbm with mem := { tbm.mem with allocations := (tbm.mem.allocations.set id { alloc with extra := { root := root2 } }) } } := by
+        rw [hrelEq, hrel2]; rfl
+      have hmeta : ListRel NodeMetaRel w.nodes nodes' :=
+        ListRel.imp (fun _ _ h => ProtectorEndStepRel.nodeMetaRel h) hrel
+      have hinv2 : TreeSimInvMulti off len emb (releaseProtector { w with nodes := nodes' } protId) root2 := by
+        refine ⟨?_, ?_, ?_, ?_⟩
+        · intro n' hn'
+          obtain ⟨n, hn, hnn'⟩ := hrel.exists_of_mem_right hn'
+          have hnm := ProtectorEndStepRel.nodeMetaRel hnn'
+          obtain ⟨m0, hm0, hnod0⟩ := hinv.nodes n hn
+          rcases Decidable.em (n.tag = protectedTag) with htagEq | htagNe
+          · have hneq := b1_eq_of_mem_of_findNode?_of_nodup w.nodes protectedTag n pn htagsNodup hn htagEq hpn
+            subst n
+            have hn'Eq : n' = pn := by
+              rcases hnn' with ⟨_, hs⟩ | ⟨_, _, hEq⟩ | ⟨ha, _, _, _⟩
+              · rw [b1_protectorEnd_self_invariant_miniRust w.activeProtectors off len pn isWrite hkind huniqPn] at hs
+                cases hs; rfl
+              · exact hEq
+              · have hself : (ancestorPathTags w.nodes protectedTag).contains pn.tag = true := by
+                  rw [hloc pn hpnMem, hpnTag, locOf_some_eq_isPrefixOf, b1_isPrefixOf_refl]
+                rw [hself] at ha; cases ha
+            subst n'
+            obtain ⟨m2, hm2, hr2⟩ := (hpost2 (emb protectedTag)).2 _ hroot1AtTarget
+            unfold ReleasePost at hr2; simp only [↓reduceIte] at hr2
+            have hisP : pn.isProtected (w.activeProtectors.filter (· != protId)) = false :=
+              b1_isProtected_releaseProtector_self pn protId w.activeProtectors hpnProt
+            refine ⟨m2, by rw [hpnTag]; exact hm2, ?_⟩
+            simp only [hpnOv, ↓reduceIte]
+            refine ⟨?_, pPn', ?_, fun b hb1 hb2 => by rw [hr2.2]; exact (haccIn b hb1 hb2).2⟩
+            · change Protected.yes m2.«protected» = pn.isProtected (w.activeProtectors.filter (· != protId))
+              rw [hr2.1, hisP]; rfl
+            · change permToMiniRust (pn.isProtected (w.activeProtectors.filter (· != protId))) pn.accessed pn.perm = some pPn'
+              rw [hisP]; exact hpPn'
+          · have hqne : emb n.tag ≠ emb protectedTag := fun h => htagNe (hembInj n hn h)
+            have hprotNe : n'.protector ≠ some protId := hnm.2.2.1.symm ▸ hprotUnique n hn htagNe
+            have hisP : n'.isProtected (w.activeProtectors.filter (· != protId)) = n'.isProtected w.activeProtectors :=
+              b1_isProtected_releaseProtector_other n' protId w.activeProtectors hprotNe
+            obtain ⟨m1, hm1, hm1Ps, hm1Prot⟩ := (hroot1Other (emb n.tag) hqne).2 m0 hm0
+            obtain ⟨m2, hm2, hr2⟩ := (hpost2 (emb n.tag)).2 m1 hm1
+            unfold ReleasePost at hr2
+            have hne' : emb protectedTag ≠ emb n.tag := hqne.symm
+            simp only [hne', ↓reduceIte] at hr2
+            cases hpre : (emb protectedTag).isPrefixOf (emb n.tag) with
+            | true =>
+              simp only [hpre, ↓reduceIte] at hr2
+              have hdescT : isStrictDescendantOf w.nodes protectedTag n = true := by
+                rw [hdesc n hn, hpre, decide_eq_true htagNe]; rfl
+              have hn'Eq : n' = n := by
+                rcases hnn' with ⟨ha, _⟩ | ⟨_, _, hEq⟩ | ⟨_, hdescF, _, _⟩
+                · have hnotPre : (emb n.tag).isPrefixOf (emb protectedTag) = true := by
+                    rw [← locOf_some_eq_isPrefixOf, ← hloc n hn]; exact ha
+                  exact absurd (b1_nodeAt_prefix_eq hpre hnotPre).symm hqne
+                · exact hEq
+                · rw [hdescT] at hdescF; cases hdescF
+              subst n'
+              refine ⟨m2, hm2, ?_⟩
+              cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
+              | true =>
+                simp only [hov, ↓reduceIte] at hnod0 ⊢
+                obtain ⟨hprot0, p, hp, hwin0⟩ := hnod0
+                refine ⟨?_, p, ?_, fun b hb1 hb2 => by rw [hr2, hm1Ps]; exact hwin0 b hb1 hb2⟩
+                · change Protected.yes m2.«protected» = n.isProtected (w.activeProtectors.filter (· != protId))
+                  rw [hisP, hr2, hm1Prot]; exact hprot0
+                · change permToMiniRust (n.isProtected (w.activeProtectors.filter (· != protId))) n.accessed n.perm = some p
+                  rw [hisP]; exact hp
+              | false =>
+                simp only [hov, Bool.false_eq_true, ↓reduceIte] at hnod0 ⊢
+                refine ⟨?_, fun b hb1 hb2 => by rw [hr2, hm1Ps]; exact hnod0.2 b hb1 hb2⟩
+                change Protected.yes m2.«protected» = n.isProtected (w.activeProtectors.filter (· != protId))
+                rw [hisP, hr2, hm1Prot]; exact hnod0.1
+            | false =>
+              simp only [hpre, Bool.false_eq_true, ↓reduceIte] at hr2
+              have hs := hrelToStep n hn n' hnn' hpre
+              have hlocEq : locRel (some (emb protectedTag)) (emb n.tag) =
+                  nodeRelToMiniRust (locOf (some (emb protectedTag)) (emb n.tag)) := rfl
+              cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
+              | true =>
+                simp only [hov, ↓reduceIte] at hnod0
+                obtain ⟨hprot0, p, hp, hwin0⟩ := hnod0
+                obtain ⟨p0, hp0, hok, _⟩ := (hstepSim n hn).1 hov (locOf (some (emb protectedTag)) (emb n.tag))
+                rw [hp] at hp0; cases hp0
+                obtain ⟨htag', _, hpe, hro, hrl, _, _, p', htr, hp'⟩ := hok n' hs
+                refine ⟨m2, by rw [htag']; exact hm2, ?_⟩
+                rw [hro, hrl]; simp only [hov, ↓reduceIte]
+                refine ⟨?_, p', ?_, ?_⟩
+                · change Protected.yes m2.«protected» = n'.isProtected (w.activeProtectors.filter (· != protId))
+                  rw [hisP, hpe, hr2.1, hm1Prot]; exact hprot0
+                · change permToMiniRust (n'.isProtected (w.activeProtectors.filter (· != protId))) n'.accessed n'.perm = some p'
+                  rw [hisP, hpe]; exact hp'
+                · intro b hb1 hb2
+                  have hsb := hr2.2.2.2 b (by rw [haccEqData]; omega)
+                  rw [haccChar b (by rw [haccEqData]; omega)] at hsb
+                  simp only [hb1, hb2, and_self, ↓reduceIte] at hsb
+                  obtain ⟨p2, htr1, hp2⟩ := hsb p (by rw [hm1Ps]; exact hwin0 b hb1 hb2)
+                  rw [hlocEq, htr] at htr1; cases htr1
+                  exact hp2
+              | false =>
+                simp only [hov, Bool.false_eq_true, ↓reduceIte] at hnod0
+                have hstay := (hstepSim n hn).2 hov (locOf (some (emb protectedTag)) (emb n.tag))
+                dsimp only at hstay
+                rw [hstay] at hs
+                have hn'Eq : n' = n := by cases hs; rfl
+                subst n'
+                have hfor := hdisjForeign n hn hov
+                refine ⟨m2, hm2, ?_⟩
+                simp only [hov, Bool.false_eq_true, ↓reduceIte]
+                refine ⟨?_, fun b hb1 hb2 => ?_⟩
+                · change Protected.yes m2.«protected» = n.isProtected (w.activeProtectors.filter (· != protId))
+                  rw [hisP, hr2.1, hm1Prot]; exact hnod0.1
+                · have hsb := hr2.2.2.2 b (by rw [haccEqData]; omega)
+                  rw [haccChar b (by rw [haccEqData]; omega)] at hsb
+                  simp only [hb1, hb2, and_self, ↓reduceIte] at hsb
+                  obtain ⟨p0, hpb0, hpas0⟩ := hnod0.2 b hb1 hb2
+                  obtain ⟨p2, htr1, hp2⟩ := hsb p0 (by rw [hm1Ps]; exact hpb0)
+                  rw [hlocEq, hfor] at htr1
+                  obtain ⟨p3, htr3, hpas3⟩ := permission_isForeignPassive_preserved p0 k hpas0
+                  change Permission.transition p0 k .Foreign = .ok p2 at htr1
+                  rw [htr3] at htr1; cases htr1
+                  exact ⟨p2, hp2, hpas3⟩
+        · intro q m2 hm2
+          cases hm1 : nodeAt root1 q with
+          | none => rw [(hpost2 q).1 hm1] at hm2; cases hm2
+          | some m1 =>
+            rcases Decidable.em (q = emb protectedTag) with rfl | hqne
+            · obtain ⟨n', hn', hnn'⟩ := hrel.exists_of_mem_left hpnMem
+              exact ⟨n', hn', by rw [(ProtectorEndStepRel.nodeMetaRel hnn').1, hpnTag]⟩
+            · cases hm0 : nodeAt alloc.extra.root q with
+              | none => rw [(hroot1Other q hqne).1 hm0] at hm1; cases hm1
+              | some m0 =>
+                obtain ⟨n, hn, hemb⟩ := hinv.surj q m0 hm0
+                obtain ⟨n', hn', hnn'⟩ := hrel.exists_of_mem_left hn
+                exact ⟨n', hn', by rw [(ProtectorEndStepRel.nodeMetaRel hnn').1, hemb]⟩
+        · intro n' hn' hp''
+          obtain ⟨n, hn, hnn'⟩ := hrel.exists_of_mem_right hn'
+          have hnm := ProtectorEndStepRel.nodeMetaRel hnn'
+          rcases Decidable.em (n.tag = protectedTag) with htagEq | htagNe
+          · have hneq := b1_eq_of_mem_of_findNode?_of_nodup w.nodes protectedTag n pn htagsNodup hn htagEq hpn
+            subst n
+            have hisP : n'.isProtected (w.activeProtectors.filter (· != protId)) = false :=
+              b1_isProtected_releaseProtector_self n' protId w.activeProtectors (hnm.2.2.1.trans hpnProt)
+            change n'.isProtected (w.activeProtectors.filter (· != protId)) = true at hp''
+            rw [hisP] at hp''; cases hp''
+          · have hprotNe : n'.protector ≠ some protId := hnm.2.2.1.symm ▸ hprotUnique n hn htagNe
+            have hisP := b1_isProtected_releaseProtector_other n' protId w.activeProtectors hprotNe
+            change n'.isProtected (w.activeProtectors.filter (· != protId)) = true at hp''
+            rw [hisP] at hp''
+            cases hpre : (emb protectedTag).isPrefixOf (emb n.tag) with
+            | true =>
+              have hdescT : isStrictDescendantOf w.nodes protectedTag n = true := by
+                rw [hdesc n hn, hpre, decide_eq_true htagNe]; rfl
+              have hqne : emb n.tag ≠ emb protectedTag := fun h => htagNe (hembInj n hn h)
+              have hn'Eq : n' = n := by
+                rcases hnn' with ⟨ha, _⟩ | ⟨_, _, hEq⟩ | ⟨_, hdescF, _, _⟩
+                · have hnotPre : (emb n.tag).isPrefixOf (emb protectedTag) = true := by
+                    rw [← locOf_some_eq_isPrefixOf, ← hloc n hn]; exact ha
+                  exact absurd (b1_nodeAt_prefix_eq hpre hnotPre).symm hqne
+                · exact hEq
+                · rw [hdescT] at hdescF; cases hdescF
+              subst n'; exact hinv.noProtIM n hn hp''
+            | false =>
+              have hs := hrelToStep n hn n' hnn' hpre
+              cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
+              | true =>
+                obtain ⟨_, _, hok, _⟩ := (hstepSim n hn).1 hov (locOf (some (emb protectedTag)) (emb n.tag))
+                exact (hok n' hs).2.2.2.2.2.1 hp''
+              | false =>
+                have hstay := (hstepSim n hn).2 hov (locOf (some (emb protectedTag)) (emb n.tag))
+                dsimp only at hstay
+                rw [hstay] at hs
+                cases hs; exact hinv.noProtIM n' hn hp''
+        · intro n' hn' hp'' hu
+          obtain ⟨n, hn, hnn'⟩ := hrel.exists_of_mem_right hn'
+          have hnm := ProtectorEndStepRel.nodeMetaRel hnn'
+          rcases Decidable.em (n.tag = protectedTag) with htagEq | htagNe
+          · have hneq := b1_eq_of_mem_of_findNode?_of_nodup w.nodes protectedTag n pn htagsNodup hn htagEq hpn
+            subst n
+            have hisP : n'.isProtected (w.activeProtectors.filter (· != protId)) = false :=
+              b1_isProtected_releaseProtector_self n' protId w.activeProtectors (hnm.2.2.1.trans hpnProt)
+            change n'.isProtected (w.activeProtectors.filter (· != protId)) = true at hp''
+            rw [hisP] at hp''; cases hp''
+          · have hprotNe : n'.protector ≠ some protId := hnm.2.2.1.symm ▸ hprotUnique n hn htagNe
+            have hisP := b1_isProtected_releaseProtector_other n' protId w.activeProtectors hprotNe
+            change n'.isProtected (w.activeProtectors.filter (· != protId)) = true at hp''
+            rw [hisP] at hp''
+            cases hpre : (emb protectedTag).isPrefixOf (emb n.tag) with
+            | true =>
+              have hdescT : isStrictDescendantOf w.nodes protectedTag n = true := by
+                rw [hdesc n hn, hpre, decide_eq_true htagNe]; rfl
+              have hqne : emb n.tag ≠ emb protectedTag := fun h => htagNe (hembInj n hn h)
+              have hn'Eq : n' = n := by
+                rcases hnn' with ⟨ha, _⟩ | ⟨_, _, hEq⟩ | ⟨_, hdescF, _, _⟩
+                · have hnotPre : (emb n.tag).isPrefixOf (emb protectedTag) = true := by
+                    rw [← locOf_some_eq_isPrefixOf, ← hloc n hn]; exact ha
+                  exact absurd (b1_nodeAt_prefix_eq hpre hnotPre).symm hqne
+                · exact hEq
+                · rw [hdescT] at hdescF; cases hdescF
+              subst n'; exact hinv.protUniqAcc n hn hp'' hu
+            | false =>
+              have hs := hrelToStep n hn n' hnn' hpre
+              cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
+              | true =>
+                obtain ⟨_, _, hok, _⟩ := (hstepSim n hn).1 hov (locOf (some (emb protectedTag)) (emb n.tag))
+                exact (hok n' hs).2.2.2.2.2.2.1 hp'' hu
+              | false =>
+                have hstay := (hstepSim n hn).2 hov (locOf (some (emb protectedTag)) (emb n.tag))
+                dsimp only at hstay
+                rw [hstay] at hs
+                cases hs; exact hinv.protUniqAcc n' hn hp'' hu
+      exact ⟨_, _, htbmOk, List.getElem?_set_self hidlt, hlive, rfl,
+        hpostEqLen root2 hpost2, fun hwf => tbm_release_protector_wfLive_choiceFree hwf htbmOk,
+        hmeta, hinv2, hpostTarget root2 hpost2, hpostOutside root2 hpost2⟩
+    have hbwd : (∀ nodes', ¬ ListRel (ProtectorEndStepRel w protectedTag isWrite off len) w.nodes nodes') →
+        ∃ msg, TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb protectedTag) = .error (.ub msg) := by
+      intro hno
+      rw [hrelEq]
+      cases hrun : Node.release_protector root1 (some (emb protectedTag)) accesses with
+      | ok root2 =>
+        exfalso
+        have hall : ∀ n ∈ w.nodes, ∃ n', ProtectorEndStepRel w protectedTag isWrite off len n n' := by
+          intro n hn
+          rcases Decidable.em (n.tag = protectedTag) with htagEq | htagNe
+          · have hneq := b1_eq_of_mem_of_findNode?_of_nodup w.nodes protectedTag n pn htagsNodup hn htagEq hpn
+            subst n
+            have hself : (ancestorPathTags w.nodes protectedTag).contains pn.tag = true := by
+              rw [hloc pn hpnMem, hpnTag, locOf_some_eq_isPrefixOf, b1_isPrefixOf_refl]
+            exact ⟨pn, Or.inl ⟨hself, b1_protectorEnd_self_invariant_miniRust w.activeProtectors off len pn isWrite hkind huniqPn⟩⟩
+          · cases hpre : (emb protectedTag).isPrefixOf (emb n.tag) with
+            | true =>
+              have hqne : emb n.tag ≠ emb protectedTag := fun h => htagNe (hembInj n hn h)
+              have hnotAnc : (ancestorPathTags w.nodes protectedTag).contains n.tag = false := by
+                rw [hloc n hn, locOf_some_eq_isPrefixOf]
+                cases h2 : (emb n.tag).isPrefixOf (emb protectedTag) with
+                | false => rfl
+                | true =>
+                  exact absurd (b1_nodeAt_prefix_eq hpre h2).symm hqne
+              have hdescT : isStrictDescendantOf w.nodes protectedTag n = true := by
+                rw [hdesc n hn, hpre, decide_eq_true htagNe]; rfl
+              exact ⟨n, Or.inr (Or.inl ⟨hnotAnc, Or.inl hdescT, rfl⟩)⟩
+            | false =>
+              cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
+              | false =>
+                exact ⟨n, hstepToRel n hn n hpre ((hstepSim n hn).2 hov (locOf (some (emb protectedTag)) (emb n.tag)))⟩
+              | true =>
+                have hqne : emb n.tag ≠ emb protectedTag := fun h => htagNe (hembInj n hn h)
+                obtain ⟨m0, hm0, hnod0⟩ := hinv.nodes n hn
+                simp only [hov, ↓reduceIte] at hnod0
+                obtain ⟨_, p, hp, hwin0⟩ := hnod0
+                obtain ⟨m1, hm1, hm1Ps, _⟩ := (hroot1Other (emb n.tag) hqne).2 m0 hm0
+                have hoffAcc : off < accesses.length := by rw [haccEqData]; omega
+                have haccOff : accesses[off]? = some (some k) := by
+                  rw [haccChar off hoffAcc]
+                  have h1 : off ≤ off ∧ off < off + len := ⟨Nat.le_refl _, by omega⟩
+                  simp only [h1, and_self, ↓reduceIte]
+                obtain ⟨q0, q0', hq0, htr0⟩ := node_release_protector_ok_inv root1 root2
+                  (some (emb protectedTag)) accesses hrun (emb n.tag) m1 hm1 hpre off hoffAcc k haccOff
+                rw [hm1Ps, hwin0 off (Nat.le_refl _) (by omega)] at hq0; cases hq0
+                obtain ⟨p0, hp0, _, herr⟩ := (hstepSim n hn).1 hov (locOf (some (emb protectedTag)) (emb n.tag))
+                rw [hp] at hp0; cases hp0
+                cases hs : stepNodeOnRangeAccess w.activeProtectors isWrite
+                    (locOf (some (emb protectedTag)) (emb n.tag)) off len n with
+                | ok n' => exact ⟨n', hstepToRel n hn n' hpre hs⟩
+                | error e =>
+                  obtain ⟨msg, hmsg⟩ := herr e hs
+                  have hlocEq : locRel (some (emb protectedTag)) (emb n.tag) =
+                      nodeRelToMiniRust (locOf (some (emb protectedTag)) (emb n.tag)) := rfl
+                  rw [hlocEq] at htr0; rw [htr0] at hmsg; cases hmsg
+        obtain ⟨nodes', hrel⟩ := nwsr_listRel_of_forall w.nodes hall
+        exact hno nodes' hrel
+      | error e =>
+        obtain ⟨msg, hmsg⟩ := node_release_protector_error_is_ub root1 (some (emb protectedTag))
+          accesses e (fun q m1 hm1 => by rw [haccEqData, hroot1EqLen q m1 hm1]; exact Nat.le_refl _) hrun
+        exact ⟨msg, by rw [hmsg]; rfl⟩
+    refine ⟨?_, ?_, ?_⟩
+    · intro w' hw'
+      rw [hworldEq] at hw'
+      cases hpe : execProtectorEndAccess w protectedTag isWrite off len with
+      | error _ => rw [hpe] at hw'; cases hw'
+      | ok w1 =>
+        rw [hpe] at hw'; cases hw'
+        obtain ⟨_, nodes', hw1, hrel⟩ := (execProtectorEndAccess_ok_iff w w1 protectedTag isWrite off len hneLen).mp hpe
+        subst hw1
+        obtain ⟨tbm', alloc', h1, h2, h3, h4, h5, h6, h7, h8, h9, h10⟩ := hfwd nodes' hrel
+        exact ⟨tbm', alloc', h1, h2, h3, h4, h5, h6, h7, rfl, h8, h9, h10⟩
+    · intro e herr
+      rw [hworldEq] at herr
+      apply hbwd; intro nodes' hrel
+      have hok := (execProtectorEndAccess_ok_iff w { w with nodes := nodes' } protectedTag isWrite off len hneLen).mpr
+        ⟨⟨pn, hpn⟩, nodes', rfl, hrel⟩
+      rw [hok] at herr; cases herr
+    · intro tbm' htbm'
+      cases hw : execFrameExitMiniRust w [(protectedTag, protId)] with
+      | ok w' =>
+        rw [hworldEq] at hw
+        cases hpe : execProtectorEndAccess w protectedTag isWrite off len with
+        | error _ => rw [hpe] at hw; cases hw
+        | ok w1 =>
+          rw [hpe] at hw; cases hw
+          obtain ⟨_, nodes', hw1, hrel⟩ := (execProtectorEndAccess_ok_iff w w1 protectedTag isWrite off len hneLen).mp hpe
+          subst hw1
+          obtain ⟨tbm'', alloc', h1, h2, h3, _, _, _, _, h8, _, _⟩ := hfwd nodes' hrel
+          rw [htbm'] at h1; cases h1
+          exact ⟨releaseProtector { w with nodes := nodes' } protId, alloc', rfl, h2, h3, h8⟩
+      | error e =>
+        have hno : ∀ nodes', ¬ ListRel (ProtectorEndStepRel w protectedTag isWrite off len) w.nodes nodes' := by
+          intro nodes' hrel
+          have hok := (execProtectorEndAccess_ok_iff w { w with nodes := nodes' } protectedTag isWrite off len hneLen).mpr
+            ⟨⟨pn, hpn⟩, nodes', rfl, hrel⟩
+          rw [hworldEq, hok] at hw; cases hw
+        obtain ⟨msg, hmsg⟩ := hbwd hno
+        rw [htbm'] at hmsg; cases hmsg
+
 /-- **Symbolic single-step whole-tree `TreeSimInv` simulation for
 `TreeBorrowsMemory.release_protector` vs `execFrameExitMiniRust w [(protectedTag, protId)]`**:
 over ANY `TreeSimInv`-related borrow tree (`0 < len`) with unique node tags, ANY
@@ -8080,680 +9414,23 @@ theorem tbm_release_protector_simulates_execFrameExitMiniRust_step
         execFrameExitMiniRust w [(protectedTag, protId)] = .ok w' ∧
         tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
         TreeSimInv off len emb w' alloc'.extra.root) := by
-  have hpnMemTag := mem_of_findNode?_eq_some hpn
-  have hpnMem : pn ∈ w.nodes := hpnMemTag.1
-  have hpnTag : pn.tag = protectedTag := hpnMemTag.2
-  have hpnIsProt : pn.isProtected w.activeProtectors = true := by
-    unfold TreeTagNode.isProtected; rw [hpnProt]
-    exact List.any_eq_true.mpr ⟨protId, List.contains_iff_mem.mp hactProt, beq_self_eq_true protId⟩
-  obtain ⟨tNode, htNode, htProt, pPn, hpPn, hwinPn⟩ := hinv.nodes pn hpnMem
-  rw [hpnTag] at htNode
-  rw [hpnIsProt] at htProt hpPn
-  have hnoIMPn : pn.perm ≠ .reservedIM := hinv.noProtIM pn hpnMem hpnIsProt
-  have huniqPn : pn.perm = .unique → pn.accessed = true := hinv.protUniqAcc pn hpnMem hpnIsProt
-  obtain ⟨pPn', hunpPn, hpPn'⟩ := b1_unprotect_permToMiniRust pn pPn hpPn hnoIMPn huniqPn
-  have htOut := hOutside tNode htNode
-  have hallUnp : ∀ p ∈ tNode.permissions, ∃ y, Permission.unprotect p = .ok y := by
-    intro p hp
-    obtain ⟨b, hbLt, hbEq⟩ := List.getElem_of_mem hp
-    have hbGet : tNode.permissions[b]? = some p := by rw [List.getElem?_eq_getElem hbLt, hbEq]
-    rcases Decidable.em (off ≤ b ∧ b < off + len) with ⟨hb1, hb2⟩ | hout
-    · have h1 := hwinPn b hb1 hb2
-      rw [hbGet] at h1; cases h1
-      exact ⟨_, hunpPn⟩
-    · have hout' : b < off ∨ off + len ≤ b := b1_not_in_window hout
-      obtain ⟨p', hp'⟩ := htOut b p hbGet hout'
-      exact ⟨(p', none), hp'⟩
-  obtain ⟨pairs, hpairs, hpairsLen, hpairsGet⟩ :=
-    b1_list_mapM_ok_of_forall Permission.unprotect tNode.permissions hallUnp
-  let accesses := pairs.map Prod.snd
-  let unprotPerms := pairs.map Prod.fst
-  have haccLen : accesses.length = tNode.permissions.length := by
-    dsimp only [accesses]; rw [List.length_map, hpairsLen]
-  have hunpLen : unprotPerms.length = tNode.permissions.length := by
-    dsimp only [unprotPerms]; rw [List.length_map, hpairsLen]
-  have haccIn : ∀ b, off ≤ b → b < off + len →
-      accesses[b]? = some ((protectorEndAccessIsWriteMiniRust? pn).map (fun isW => if isW then .Write else .Read)) ∧
-      unprotPerms[b]? = some pPn' := by
-    intro b hb1 hb2
-    have hbGet := hwinPn b hb1 hb2
-    have hbLt : b < tNode.permissions.length := (List.getElem?_eq_some_iff.mp hbGet).1
-    obtain ⟨x, y, hx, hy, hfx⟩ := hpairsGet b hbLt
-    rw [hbGet] at hx; cases hx
-    rw [hunpPn] at hfx; cases hfx
-    dsimp only [accesses, unprotPerms]
-    rw [List.getElem?_map, List.getElem?_map, hy]
-    exact ⟨rfl, rfl⟩
-  have haccOut : ∀ b, b < off ∨ off + len ≤ b → b < accesses.length →
-      accesses[b]? = some none := by
-    intro b hout hblt
-    rw [haccLen] at hblt
-    obtain ⟨x, y, hx, hy, hfx⟩ := hpairsGet b hblt
-    obtain ⟨p', hp'⟩ := htOut b x hx hout
-    rw [hp'] at hfx; cases hfx
-    dsimp only [accesses]
-    rw [List.getElem?_map, hy]
-    rfl
-  obtain ⟨root1, _, hsuf1, hother1, hrelEq⟩ :=
-    tbm_release_protector_eq tbm id (emb protectedTag) alloc tNode pairs halloc hlive htNode htProt hpairs
-  have hroot1AtTarget : nodeAt root1 (emb protectedTag) = some { tNode with permissions := unprotPerms } := by
-    have h1 := hsuf1 []
-    rw [List.append_nil] at h1
-    exact h1
-  have hroot1Other : ∀ q, q ≠ emb protectedTag →
-      (nodeAt alloc.extra.root q = none → nodeAt root1 q = none) ∧
-      (∀ m, nodeAt alloc.extra.root q = some m →
-        ∃ m1, nodeAt root1 q = some m1 ∧ m1.permissions = m.permissions ∧ m1.«protected» = m.«protected») := by
-    intro q hqne
-    cases hpre : (emb protectedTag).isPrefixOf q with
-    | false =>
-      have ho := hother1 q hpre
-      exact ⟨ho.1, fun m hm => by obtain ⟨m1, hm1, hp1, hp2, _⟩ := ho.2 m hm; exact ⟨m1, hm1, hp1, hp2⟩⟩
-    | true =>
-      have hex : ∃ suf, q = emb protectedTag ++ suf ∧ suf ≠ [] := by
-        have hprefApp : ∀ (p r : Gen.Path), p.isPrefixOf r = true → ∃ suf, r = p ++ suf := by
-          intro p
-          induction p with
-          | nil => intro r _; exact ⟨r, rfl⟩
-          | cons a ps ih =>
-            intro r hr
-            cases r with
-            | nil => cases hr
-            | cons b rs =>
-              simp only [List.isPrefixOf, Bool.and_eq_true, a1_int_beq_iff] at hr
-              obtain ⟨rfl, hrest⟩ := hr
-              obtain ⟨suf, rfl⟩ := ih rs hrest
-              exact ⟨suf, rfl⟩
-        obtain ⟨suf, rfl⟩ := hprefApp (emb protectedTag) q hpre
-        refine ⟨suf, rfl, fun hs => hqne (by rw [hs, List.append_nil])⟩
-      obtain ⟨suf, rfl, hsufNe⟩ := hex
-      have hsame : nodeAt root1 (emb protectedTag ++ suf) = nodeAt alloc.extra.root (emb protectedTag ++ suf) := by
-        rw [hsuf1 suf, a1_nodeAt_append, htNode]
-        cases suf with
-        | nil => exact absurd rfl hsufNe
-        | cons j s =>
-          cases tNode with | mk cs ps pr => rfl
-      rw [hsame]
-      exact ⟨fun h => h, fun m hm => ⟨m, hm, rfl, rfl⟩⟩
-  have hroot1EqLen : ∀ q m1, nodeAt root1 q = some m1 → m1.permissions.length = alloc.data.length := by
-    intro q m1 hm1
-    rcases Decidable.em (q = emb protectedTag) with rfl | hqne
-    · rw [hroot1AtTarget] at hm1; cases hm1
-      exact hunpLen.trans (hEqLen (emb protectedTag) tNode htNode)
-    · cases hm0 : nodeAt alloc.extra.root q with
-      | none => rw [(hroot1Other q hqne).1 hm0] at hm1; cases hm1
-      | some m0 =>
-        obtain ⟨m1', hm1', hps, _⟩ := (hroot1Other q hqne).2 m0 hm0
-        rw [hm1'] at hm1; cases hm1
-        rw [hps]; exact hEqLen q m0 hm0
-  have hmr : ∀ q m, nodeAt alloc.extra.root q = some m → ∃ n ∈ w.nodes, emb n.tag = q ∧
-      NodeWindowRel w.activeProtectors off len n m := by
-    intro q m hq
-    obtain ⟨n, hn, hemb⟩ := hinv.surj q m hq
-    obtain ⟨m', hm', hrel⟩ := hinv.nodes n hn
-    rw [hemb, hq] at hm'; cases hm'
-    exact ⟨n, hn, hemb, hrel⟩
-  have hidlt : id < tbm.mem.allocations.length := (List.getElem?_eq_some_iff.mp halloc).1
-  have hlenBound : off + len ≤ tNode.permissions.length := by
-    have hlast := hwinPn (off + len - 1) (by omega) (by omega)
-    have hlt := (List.getElem?_eq_some_iff.mp hlast).1
-    omega
-  have hpostEqLen : ∀ root2,
-      (∀ q, (nodeAt root1 q = none → nodeAt root2 q = none) ∧
-        (∀ m1, nodeAt root1 q = some m1 → ∃ m2, nodeAt root2 q = some m2 ∧ ReleasePost (some (emb protectedTag)) accesses q m1 m2)) →
-      ∀ q m2, nodeAt root2 q = some m2 → m2.permissions.length = alloc.data.length := by
-    intro root2 hpost2 q m2 hm2
-    cases hm1 : nodeAt root1 q with
-    | none => rw [(hpost2 q).1 hm1] at hm2; cases hm2
-    | some m1 =>
-      obtain ⟨m2', hm2', hrel⟩ := (hpost2 q).2 m1 hm1
-      rw [hm2'] at hm2; cases hm2
-      have hl1 := hroot1EqLen q m1 hm1
-      unfold ReleasePost at hrel
-      rcases Decidable.em (emb protectedTag = q) with rfl | hne
-      · simp only [↓reduceIte] at hrel; rw [hrel.2]; exact hl1
-      · simp only [hne, ↓reduceIte] at hrel
-        cases hpre : (emb protectedTag).isPrefixOf q with
-        | true => simp only [hpre, ↓reduceIte] at hrel; rw [hrel]; exact hl1
-        | false => simp only [hpre, Bool.false_eq_true, ↓reduceIte] at hrel; exact hrel.2.1.trans hl1
-  have hpostOutside : ∀ root2,
-      (∀ q, (nodeAt root1 q = none → nodeAt root2 q = none) ∧
-        (∀ m1, nodeAt root1 q = some m1 → ∃ m2, nodeAt root2 q = some m2 ∧ ReleasePost (some (emb protectedTag)) accesses q m1 m2)) →
-      ∀ q m, nodeAt alloc.extra.root q = some m → q ≠ emb protectedTag →
-        ∃ m2, nodeAt root2 q = some m2 ∧
-          ∀ b, b < off ∨ off + len ≤ b → m2.permissions[b]? = m.permissions[b]? := by
-    intro root2 hpost2 q m hm hqne
-    obtain ⟨m1, hm1, hm1Ps, _⟩ := (hroot1Other q hqne).2 m hm
-    obtain ⟨m2, hm2, hrel⟩ := (hpost2 q).2 m1 hm1
-    refine ⟨m2, hm2, fun b hb => ?_⟩
-    unfold ReleasePost at hrel
-    have hne' : emb protectedTag ≠ q := hqne.symm
-    simp only [hne', ↓reduceIte] at hrel
-    cases hpre : (emb protectedTag).isPrefixOf q with
-    | true =>
-      simp only [hpre, ↓reduceIte] at hrel
-      rw [hrel, hm1Ps]
-    | false =>
-      simp only [hpre, Bool.false_eq_true, ↓reduceIte] at hrel
-      rcases Decidable.em (b < accesses.length) with hblt | hbge
-      · have hstep := hrel.2.2.2 b hblt
-        rw [haccOut b hb hblt] at hstep
-        rw [hstep, hm1Ps]
-      · rw [hrel.2.2.1 b (by omega), hm1Ps]
-  -- Split on `protectorEndAccessIsWriteMiniRust? pn`.
-  cases hkind : protectorEndAccessIsWriteMiniRust? pn with
-  | none =>
-    have hallNone : ∀ i < accesses.length, accesses[i]? = some none := by
-      intro i hi
-      rcases Decidable.em (off ≤ i ∧ i < off + len) with ⟨hi1, hi2⟩ | hout
-      · have h1 := (haccIn i hi1 hi2).1
-        rw [hkind] at h1; exact h1
-      · exact haccOut i (b1_not_in_window hout) hi
-    have hpoint : ∀ q m1, nodeAt root1 q = some m1 →
-        (emb protectedTag).isPrefixOf q = false →
-        ∀ i < accesses.length, ∀ k, accesses[i]? = some (some k) →
-          ∃ p p', m1.permissions[i]? = some p ∧
-            Permission.transition p k (locRel (some (emb protectedTag)) q) = .ok p' := by
-      intro _ _ _ _ i hi k hk
-      rw [hallNone i hi] at hk; cases hk
-    obtain ⟨root2, hrel2, hpost2⟩ :=
-      node_release_protector_ok_of_pointwise root1 (some (emb protectedTag)) accesses hpoint
-    have htbmOk : TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb protectedTag) =
-        .ok { tbm with mem := { tbm.mem with allocations := (tbm.mem.allocations.set id { alloc with extra := { root := root2 } }) } } := by
-      rw [hrelEq, hrel2]; rfl
-    have hworldOk : execFrameExitMiniRust w [(protectedTag, protId)] = .ok (releaseProtector w protId) := by
-      simp [execFrameExitMiniRust, execFrameExitSequential, execProtectorEndAccessFor, hpn, hkind]
-    have hinv2 : TreeSimInv off len emb (releaseProtector w protId) root2 := by
-      refine ⟨?_, ?_, ?_, ?_, ?_⟩
-      · intro n hn
-        obtain ⟨m0, hm0, hprot0, p, hp, hwin0⟩ := hinv.nodes n hn
-        rcases Decidable.em (n.tag = protectedTag) with htagEq | htagNe
-        · have hneq : n = pn := b1_eq_of_mem_of_findNode?_of_nodup w.nodes protectedTag n pn htagsNodup hn htagEq hpn
-          subst n
-          obtain ⟨m2, hm2, hrel⟩ := (hpost2 (emb protectedTag)).2 _ hroot1AtTarget
-          unfold ReleasePost at hrel
-          simp only [↓reduceIte] at hrel
-          have hisP : pn.isProtected (w.activeProtectors.filter (· != protId)) = false :=
-            b1_isProtected_releaseProtector_self pn protId w.activeProtectors hpnProt
-          refine ⟨m2, by rw [hpnTag]; exact hm2, ?_, pPn', ?_, ?_⟩
-          · change Protected.yes m2.«protected» = pn.isProtected (w.activeProtectors.filter (· != protId))
-            rw [hrel.1, hisP]; rfl
-          · change permToMiniRust (pn.isProtected (w.activeProtectors.filter (· != protId))) pn.accessed pn.perm = some pPn'
-            rw [hisP]; exact hpPn'
-          · intro b hb1 hb2
-            rw [hrel.2]
-            exact (haccIn b hb1 hb2).2
-        · have hqne : emb n.tag ≠ emb protectedTag := fun h => htagNe (hembInj n hn h)
-          obtain ⟨m1, hm1, hm1Ps, hm1Prot⟩ := (hroot1Other (emb n.tag) hqne).2 m0 hm0
-          obtain ⟨m2, hm2, hrel⟩ := (hpost2 (emb n.tag)).2 m1 hm1
-          have hisP : n.isProtected (w.activeProtectors.filter (· != protId)) = n.isProtected w.activeProtectors :=
-            b1_isProtected_releaseProtector_other n protId w.activeProtectors (hprotUnique n hn htagNe)
-          unfold ReleasePost at hrel
-          have hne' : emb protectedTag ≠ emb n.tag := hqne.symm
-          simp only [hne', ↓reduceIte] at hrel
-          refine ⟨m2, hm2, ?_, p, ?_, ?_⟩
-          · change Protected.yes m2.«protected» = n.isProtected (w.activeProtectors.filter (· != protId))
-            rw [hisP]
-            cases hpre : (emb protectedTag).isPrefixOf (emb n.tag) with
-            | true => simp only [hpre, ↓reduceIte] at hrel; rw [hrel, hm1Prot]; exact hprot0
-            | false => simp only [hpre, Bool.false_eq_true, ↓reduceIte] at hrel; rw [hrel.1, hm1Prot]; exact hprot0
-          · change permToMiniRust (n.isProtected (w.activeProtectors.filter (· != protId))) n.accessed n.perm = some p
-            rw [hisP]; exact hp
-          · intro b hb1 hb2
-            cases hpre : (emb protectedTag).isPrefixOf (emb n.tag) with
-            | true => simp only [hpre, ↓reduceIte] at hrel; rw [hrel, hm1Ps]; exact hwin0 b hb1 hb2
-            | false =>
-              simp only [hpre, Bool.false_eq_true, ↓reduceIte] at hrel
-              have hstep := hrel.2.2.2 b (by rw [haccLen]; omega)
-              rw [hallNone b (by rw [haccLen]; omega)] at hstep
-              rw [hstep, hm1Ps]; exact hwin0 b hb1 hb2
-      · intro q m2 hm2
-        cases hm1 : nodeAt root1 q with
-        | none => rw [(hpost2 q).1 hm1] at hm2; cases hm2
-        | some m1 =>
-          rcases Decidable.em (q = emb protectedTag) with rfl | hqne
-          · exact ⟨pn, hpnMem, by rw [hpnTag]⟩
-          · cases hm0 : nodeAt alloc.extra.root q with
-            | none => rw [(hroot1Other q hqne).1 hm0] at hm1; cases hm1
-            | some m0 => exact hinv.surj q m0 hm0
-      · intro n hn; exact hinv.overlap n hn
-      · intro n hn hp'
-        rcases Decidable.em (n.tag = protectedTag) with htagEq | htagNe
-        · have hneq := b1_eq_of_mem_of_findNode?_of_nodup w.nodes protectedTag n pn htagsNodup hn htagEq hpn
-          subst n
-          have hisP := b1_isProtected_releaseProtector_self pn protId w.activeProtectors hpnProt
-          change pn.isProtected (w.activeProtectors.filter (· != protId)) = true at hp'
-          rw [hisP] at hp'; cases hp'
-        · have hisP := b1_isProtected_releaseProtector_other n protId w.activeProtectors (hprotUnique n hn htagNe)
-          change n.isProtected (w.activeProtectors.filter (· != protId)) = true at hp'
-          rw [hisP] at hp'
-          exact hinv.noProtIM n hn hp'
-      · intro n hn hp' hu
-        rcases Decidable.em (n.tag = protectedTag) with htagEq | htagNe
-        · have hneq := b1_eq_of_mem_of_findNode?_of_nodup w.nodes protectedTag n pn htagsNodup hn htagEq hpn
-          subst n
-          have hisP := b1_isProtected_releaseProtector_self pn protId w.activeProtectors hpnProt
-          change pn.isProtected (w.activeProtectors.filter (· != protId)) = true at hp'
-          rw [hisP] at hp'; cases hp'
-        · have hisP := b1_isProtected_releaseProtector_other n protId w.activeProtectors (hprotUnique n hn htagNe)
-          change n.isProtected (w.activeProtectors.filter (· != protId)) = true at hp'
-          rw [hisP] at hp'
-          exact hinv.protUniqAcc n hn hp' hu
-    have hmetaRefl : ∀ xs : List TreeTagNode, ListRel NodeMetaRel xs xs := by
-      intro xs; induction xs with | nil => exact ListRel.nil | cons x tl ih => exact ListRel.cons (NodeMetaRel.refl x) ih
-    refine ⟨?_, ?_, ?_⟩
-    · intro w' hw'
-      rw [hworldOk] at hw'; cases hw'
-      exact ⟨_, _, htbmOk, List.getElem?_set_self hidlt, hlive, rfl,
-        hpostEqLen root2 hpost2, fun hwf => tbm_release_protector_wfLive_choiceFree hwf htbmOk,
-        hmetaRefl w.nodes, rfl, hinv2, hpostOutside root2 hpost2⟩
-    · intro e he
-      rw [hworldOk] at he; cases he
-    · intro tbm' htbm'
-      rw [htbmOk] at htbm'; cases htbm'
-      exact ⟨releaseProtector w protId, _, hworldOk, List.getElem?_set_self hidlt, hlive, hinv2⟩
-  | some isWrite =>
-    let k : Gen.AccessKind := if isWrite then .Write else .Read
-    have hneLen : len ≠ 0 := by omega
-    have hstepSim : ∀ n ∈ w.nodes, A1NodeStepSim w.activeProtectors k
-        (fun isLoc m => stepNodeOnRangeAccess w.activeProtectors isWrite isLoc off len m) n := by
-      intro n hn
-      cases isWrite with
-      | false => exact a1_stepRead_sim w.activeProtectors off len n (hinv.overlap n hn) (hinv.noProtIM n hn) (hinv.protUniqAcc n hn)
-      | true => exact a1_stepWrite_sim w.activeProtectors off len n (hinv.overlap n hn) (hinv.noProtIM n hn) (hinv.protUniqAcc n hn)
-    have hworldEq : execFrameExitMiniRust w [(protectedTag, protId)] =
-        (match execProtectorEndAccess w protectedTag isWrite off len with
-        | .error e => .error e
-        | .ok w1 => .ok (releaseProtector w1 protId)) := by
-      unfold execFrameExitMiniRust execFrameExitSequential execProtectorEndAccessFor
-      simp only [hpn, hkind, hpnRange.1, hpnRange.2]
-      cases execProtectorEndAccess w protectedTag isWrite off len <;> rfl
-    have haccChar : ∀ i < accesses.length,
-        accesses[i]? = some (if off ≤ i ∧ i < off + len then some k else none) := by
-      intro i hi
-      rcases Decidable.em (off ≤ i ∧ i < off + len) with ⟨hi1, hi2⟩ | hout
-      · simp only [hi1, hi2, and_self, ↓reduceIte]
-        have h1 := (haccIn i hi1 hi2).1
-        rw [hkind] at h1; exact h1
-      · simp only [hout, ↓reduceIte]
-        exact haccOut i (b1_not_in_window hout) hi
-    -- Helper relating `ProtectorEndStepRel` on non-descendant nodes to `stepNodeOnRangeAccess`.
-    have hrelToStep : ∀ n ∈ w.nodes, ∀ n',
-        ProtectorEndStepRel w protectedTag isWrite off len n n' →
-        (emb protectedTag).isPrefixOf (emb n.tag) = false →
-        stepNodeOnRangeAccess w.activeProtectors isWrite (locOf (some (emb protectedTag)) (emb n.tag)) off len n = .ok n' := by
-      intro n hn n' hrel hnotDesc
-      have hdescF : isStrictDescendantOf w.nodes protectedTag n = false := by
-        rw [hdesc n hn, hnotDesc]; rfl
-      rcases hrel with ⟨ha, hs⟩ | ⟨ha, hsk, hEq⟩ | ⟨ha, _, _, hs⟩
-      · rw [← hloc n hn, ha]; exact hs
-      · subst n'
-        rcases hsk with hd | hp
-        · rw [hdescF] at hd; cases hd
-        · rw [← hloc n hn, ha]
-          exact hpruneInert n hn isWrite hkind hdescF hp
-      · rw [← hloc n hn, ha]; exact hs
-    have hstepToRel : ∀ n ∈ w.nodes,
-        (∀ n', (emb protectedTag).isPrefixOf (emb n.tag) = false →
-          stepNodeOnRangeAccess w.activeProtectors isWrite (locOf (some (emb protectedTag)) (emb n.tag)) off len n = .ok n' →
-          ProtectorEndStepRel w protectedTag isWrite off len n n') := by
-      intro n hn n' hnotDesc hs
-      have hdescF : isStrictDescendantOf w.nodes protectedTag n = false := by
-        rw [hdesc n hn, hnotDesc]; rfl
-      cases hl : locOf (some (emb protectedTag)) (emb n.tag) with
-      | true =>
-        rw [hl] at hs
-        exact Or.inl ⟨by rw [hloc n hn, hl], hs⟩
-      | false =>
-        rw [hl] at hs
-        cases hp : isPrunedForeignNode w.nodes (ancestorPathTags w.nodes protectedTag) isWrite off len n with
-        | true =>
-          have hsame := hpruneInert n hn isWrite hkind hdescF hp
-          rw [hsame] at hs; cases hs
-          exact Or.inr (Or.inl ⟨by rw [hloc n hn, hl], Or.inr hp, rfl⟩)
-        | false =>
-          exact Or.inr (Or.inr ⟨by rw [hloc n hn, hl], hdescF, hp, hs⟩)
-    -- Forward proof when `ListRel ProtectorEndStepRel w.nodes nodes'`.
-    have hfwd : ∀ nodes', ListRel (ProtectorEndStepRel w protectedTag isWrite off len) w.nodes nodes' →
-        ∃ tbm' alloc',
-          TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb protectedTag) = .ok tbm' ∧
-          tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
-          alloc'.data.length = alloc.data.length ∧
-          (∀ q m, nodeAt alloc'.extra.root q = some m → m.permissions.length = alloc'.data.length) ∧
-          (TreeBorrowsMemory.wfLive tbm → TreeBorrowsMemory.wfLive tbm') ∧
-          ListRel NodeMetaRel w.nodes nodes' ∧
-          TreeSimInv off len emb (releaseProtector { w with nodes := nodes' } protId) alloc'.extra.root ∧
-          (∀ q m, nodeAt alloc.extra.root q = some m → q ≠ emb protectedTag →
-            ∃ m', nodeAt alloc'.extra.root q = some m' ∧
-              (∀ b, b < off ∨ off + len ≤ b → m'.permissions[b]? = m.permissions[b]?)) := by
-      intro nodes' hrel
-      have hpoint : ∀ q m1, nodeAt root1 q = some m1 →
-          (emb protectedTag).isPrefixOf q = false →
-          ∀ i < accesses.length, ∀ k', accesses[i]? = some (some k') →
-            ∃ p p', m1.permissions[i]? = some p ∧
-              Permission.transition p k' (locRel (some (emb protectedTag)) q) = .ok p' := by
-        intro q m1 hm1 hnotPre i hi k' hk'
-        have hqne : q ≠ emb protectedTag := by
-          intro h; rw [h, b1_isPrefixOf_refl] at hnotPre; cases hnotPre
-        have hci := haccChar i hi
-        rw [hk'] at hci
-        rcases Decidable.em (off ≤ i ∧ i < off + len) with ⟨hi1, hi2⟩ | hout
-        · simp only [hi1, hi2, and_self, ↓reduceIte] at hci
-          cases hci
-          cases hm0 : nodeAt alloc.extra.root q with
-          | none => rw [(hroot1Other q hqne).1 hm0] at hm1; cases hm1
-          | some m0 =>
-            obtain ⟨m1', hm1', hm1Ps, _⟩ := (hroot1Other q hqne).2 m0 hm0
-            rw [hm1'] at hm1; cases hm1
-            obtain ⟨n, hn, hemb, _, p, hp, hwin0⟩ := hmr q m0 hm0
-            obtain ⟨n', _, hnn'⟩ := hrel.exists_of_mem_left hn
-            have hs := hrelToStep n hn n' hnn' (by rw [hemb]; exact hnotPre)
-            obtain ⟨p0, hp0, hok, _⟩ := hstepSim n hn (locOf (some (emb protectedTag)) (emb n.tag))
-            rw [hp] at hp0; cases hp0
-            obtain ⟨_, _, _, _, _, _, _, p', htr, _⟩ := hok n' hs
-            have hlocEq : locRel (some (emb protectedTag)) q =
-                nodeRelToMiniRust (locOf (some (emb protectedTag)) (emb n.tag)) := by
-              unfold locRel nodeRelToMiniRust; rw [hemb]
-            rw [hm1Ps, hlocEq]
-            exact ⟨p, p', hwin0 i hi1 hi2, htr⟩
-        · simp only [hout, ↓reduceIte] at hci; cases hci
-      obtain ⟨root2, hrel2, hpost2⟩ :=
-        node_release_protector_ok_of_pointwise root1 (some (emb protectedTag)) accesses hpoint
-      have htbmOk : TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb protectedTag) =
-          .ok { tbm with mem := { tbm.mem with allocations := (tbm.mem.allocations.set id { alloc with extra := { root := root2 } }) } } := by
-        rw [hrelEq, hrel2]; rfl
-      have hmeta : ListRel NodeMetaRel w.nodes nodes' :=
-        ListRel.imp (fun _ _ h => ProtectorEndStepRel.nodeMetaRel h) hrel
-      have hinv2 : TreeSimInv off len emb (releaseProtector { w with nodes := nodes' } protId) root2 := by
-        refine ⟨?_, ?_, ?_, ?_, ?_⟩
-        · intro n' hn'
-          obtain ⟨n, hn, hnn'⟩ := hrel.exists_of_mem_right hn'
-          have hnm := ProtectorEndStepRel.nodeMetaRel hnn'
-          obtain ⟨m0, hm0, hprot0, p, hp, hwin0⟩ := hinv.nodes n hn
-          rcases Decidable.em (n.tag = protectedTag) with htagEq | htagNe
-          · have hneq := b1_eq_of_mem_of_findNode?_of_nodup w.nodes protectedTag n pn htagsNodup hn htagEq hpn
-            subst n
-            -- On `pn`, `ProtectorEndStepRel` gives `n' = pn` (self-step invariant)!
-            have hn'Eq : n' = pn := by
-              rcases hnn' with ⟨_, hs⟩ | ⟨_, _, hEq⟩ | ⟨ha, _, _, _⟩
-              · rw [b1_protectorEnd_self_invariant_miniRust w.activeProtectors off len pn isWrite hkind huniqPn] at hs
-                cases hs; rfl
-              · exact hEq
-              · have hself : (ancestorPathTags w.nodes protectedTag).contains pn.tag = true := by
-                  rw [hloc pn hpnMem, hpnTag, locOf_some_eq_isPrefixOf, b1_isPrefixOf_refl]
-                rw [hself] at ha; cases ha
-            subst n'
-            obtain ⟨m2, hm2, hr2⟩ := (hpost2 (emb protectedTag)).2 _ hroot1AtTarget
-            unfold ReleasePost at hr2; simp only [↓reduceIte] at hr2
-            have hisP := b1_isProtected_releaseProtector_self pn protId w.activeProtectors hpnProt
-            refine ⟨m2, by rw [hpnTag]; exact hm2, ?_, pPn', ?_, ?_⟩
-            · change Protected.yes m2.«protected» = pn.isProtected (w.activeProtectors.filter (· != protId))
-              rw [hr2.1, hisP]; rfl
-            · change permToMiniRust (pn.isProtected (w.activeProtectors.filter (· != protId))) pn.accessed pn.perm = some pPn'
-              rw [hisP]; exact hpPn'
-            · intro b hb1 hb2; rw [hr2.2]; exact (haccIn b hb1 hb2).2
-          · have hqne : emb n.tag ≠ emb protectedTag := fun h => htagNe (hembInj n hn h)
-            have hisP : n'.isProtected (w.activeProtectors.filter (· != protId)) = n.isProtected w.activeProtectors := by
-              have hprotNe : n'.protector ≠ some protId := by
-                rw [hnm.2.2.1]; exact hprotUnique n hn htagNe
-              rw [b1_isProtected_releaseProtector_other n' protId w.activeProtectors hprotNe]
-              unfold TreeTagNode.isProtected; rw [hnm.2.2.1]
-            obtain ⟨m1, hm1, hm1Ps, hm1Prot⟩ := (hroot1Other (emb n.tag) hqne).2 m0 hm0
-            obtain ⟨m2, hm2, hr2⟩ := (hpost2 (emb n.tag)).2 m1 hm1
-            unfold ReleasePost at hr2
-            have hne' : emb protectedTag ≠ emb n.tag := hqne.symm
-            simp only [hne', ↓reduceIte] at hr2
-            cases hpre : (emb protectedTag).isPrefixOf (emb n.tag) with
-            | true =>
-              simp only [hpre, ↓reduceIte] at hr2
-              have hdescT : isStrictDescendantOf w.nodes protectedTag n = true := by
-                rw [hdesc n hn, hpre]; simp [htagNe]
-              have hancF : (ancestorPathTags w.nodes protectedTag).contains n.tag = false := by
-                rw [hloc n hn, locOf_some_eq_isPrefixOf]
-                cases hrev : (emb n.tag).isPrefixOf (emb protectedTag) with
-                | false => rfl
-                | true =>
-                  exfalso
-                  exact hqne (b1_nodeAt_prefix_eq hrev hpre)
-              have hn'Eq : n' = n := by
-                rcases hnn' with ⟨ha, _⟩ | ⟨_, _, hEq⟩ | ⟨_, hd, _, _⟩
-                · rw [hancF] at ha; cases ha
-                · exact hEq
-                · rw [hdescT] at hd; cases hd
-              subst n'
-              refine ⟨m2, hm2, ?_, p, ?_, ?_⟩
-              · change Protected.yes m2.«protected» = n.isProtected (w.activeProtectors.filter (· != protId))
-                rw [hr2, hm1Prot, hisP]; exact hprot0
-              · change permToMiniRust (n.isProtected (w.activeProtectors.filter (· != protId))) n.accessed n.perm = some p
-                rw [hisP]; exact hp
-              · intro b hb1 hb2; rw [hr2, hm1Ps]; exact hwin0 b hb1 hb2
-            | false =>
-              simp only [hpre, Bool.false_eq_true, ↓reduceIte] at hr2
-              have hs := hrelToStep n hn n' hnn' hpre
-              obtain ⟨p0, hp0, hok, _⟩ := hstepSim n hn (locOf (some (emb protectedTag)) (emb n.tag))
-              rw [hp] at hp0; cases hp0
-              obtain ⟨htagEq', _, _, _, _, _, _, p', htr, hp'⟩ := hok n' hs
-              refine ⟨m2, by rw [htagEq']; exact hm2, ?_, p', ?_, ?_⟩
-              · change Protected.yes m2.«protected» = n'.isProtected (w.activeProtectors.filter (· != protId))
-                rw [hr2.1, hm1Prot, hisP]; exact hprot0
-              · change permToMiniRust (n'.isProtected (w.activeProtectors.filter (· != protId))) n'.accessed n'.perm = some p'
-                rw [hisP]; exact hp'
-              · intro b hb1 hb2
-                have hblt : b < accesses.length := by rw [haccLen]; omega
-                have hstepB := hr2.2.2.2 b hblt
-                have hci := haccChar b hblt
-                simp only [hb1, hb2, and_self, ↓reduceIte] at hci
-                rw [hci] at hstepB
-                obtain ⟨p'', htr'', hm2Get⟩ := hstepB p (by rw [hm1Ps]; exact hwin0 b hb1 hb2)
-                have hlocEq : locRel (some (emb protectedTag)) (emb n.tag) =
-                    nodeRelToMiniRust (locOf (some (emb protectedTag)) (emb n.tag)) := rfl
-                rw [hlocEq, htr] at htr''
-                cases htr''
-                exact hm2Get
-        · intro q m2 hm2
-          cases hm1 : nodeAt root1 q with
-          | none => rw [(hpost2 q).1 hm1] at hm2; cases hm2
-          | some m1 =>
-            rcases Decidable.em (q = emb protectedTag) with rfl | hqne
-            · obtain ⟨pn', hpn'Mem, hnn'⟩ := hrel.exists_of_mem_left hpnMem
-              have hnm := ProtectorEndStepRel.nodeMetaRel hnn'
-              exact ⟨pn', hpn'Mem, by rw [hnm.1, hpnTag]⟩
-            · cases hm0 : nodeAt alloc.extra.root q with
-              | none => rw [(hroot1Other q hqne).1 hm0] at hm1; cases hm1
-              | some m0 =>
-                obtain ⟨n, hn, hemb⟩ := hinv.surj q m0 hm0
-                obtain ⟨n', hn', hnn'⟩ := hrel.exists_of_mem_left hn
-                have hnm := ProtectorEndStepRel.nodeMetaRel hnn'
-                exact ⟨n', hn', by rw [hnm.1, hemb]⟩
-        · intro n' hn'
-          obtain ⟨n, hn, hnn'⟩ := hrel.exists_of_mem_right hn'
-          have hnm := ProtectorEndStepRel.nodeMetaRel hnn'
-          rw [hnm.2.2.2.1, hnm.2.2.2.2.1]
-          exact hinv.overlap n hn
-        · intro n' hn' hp'
-          obtain ⟨n, hn, hnn'⟩ := hrel.exists_of_mem_right hn'
-          have hnm := ProtectorEndStepRel.nodeMetaRel hnn'
-          rcases Decidable.em (n.tag = protectedTag) with htagEq | htagNe
-          · have hneq := b1_eq_of_mem_of_findNode?_of_nodup w.nodes protectedTag n pn htagsNodup hn htagEq hpn
-            subst n
-            have hpEq : n'.protector = some protId := hnm.2.2.1.trans hpnProt
-            have hisP := b1_isProtected_releaseProtector_self n' protId w.activeProtectors hpEq
-            change n'.isProtected (w.activeProtectors.filter (· != protId)) = true at hp'
-            rw [hisP] at hp'; cases hp'
-          · have hprotNe : n'.protector ≠ some protId := by rw [hnm.2.2.1]; exact hprotUnique n hn htagNe
-            have hisP : n'.isProtected (w.activeProtectors.filter (· != protId)) = n'.isProtected w.activeProtectors :=
-              b1_isProtected_releaseProtector_other n' protId w.activeProtectors hprotNe
-            change n'.isProtected (w.activeProtectors.filter (· != protId)) = true at hp'
-            rw [hisP] at hp'
-            have hisP0 : n.isProtected w.activeProtectors = true := by
-              unfold TreeTagNode.isProtected at hp' ⊢; rw [← hnm.2.2.1]; exact hp'
-            cases hpre : (emb protectedTag).isPrefixOf (emb n.tag) with
-            | true =>
-              have hdescT : isStrictDescendantOf w.nodes protectedTag n = true := by
-                rw [hdesc n hn, hpre]; simp [htagNe]
-              have hancF : (ancestorPathTags w.nodes protectedTag).contains n.tag = false := by
-                rw [hloc n hn, locOf_some_eq_isPrefixOf]
-                cases hrev : (emb n.tag).isPrefixOf (emb protectedTag) with
-                | false => rfl
-                | true =>
-                  exfalso
-                  exact htagNe (hembInj n hn (b1_nodeAt_prefix_eq hrev hpre))
-              rcases hnn' with ⟨ha, _⟩ | ⟨_, _, hEq⟩ | ⟨_, hd, _, _⟩
-              · rw [hancF] at ha; cases ha
-              · subst n'; exact hinv.noProtIM n hn hisP0
-              · rw [hdescT] at hd; cases hd
-            | false =>
-              have hs := hrelToStep n hn n' hnn' hpre
-              obtain ⟨_, _, hok, _⟩ := hstepSim n hn (locOf (some (emb protectedTag)) (emb n.tag))
-              obtain ⟨_, _, _, _, _, hIM, _⟩ := hok n' hs
-              exact hIM hp'
-        · intro n' hn' hp' hu
-          obtain ⟨n, hn, hnn'⟩ := hrel.exists_of_mem_right hn'
-          have hnm := ProtectorEndStepRel.nodeMetaRel hnn'
-          rcases Decidable.em (n.tag = protectedTag) with htagEq | htagNe
-          · have hneq := b1_eq_of_mem_of_findNode?_of_nodup w.nodes protectedTag n pn htagsNodup hn htagEq hpn
-            subst n
-            have hpEq : n'.protector = some protId := hnm.2.2.1.trans hpnProt
-            have hisP := b1_isProtected_releaseProtector_self n' protId w.activeProtectors hpEq
-            change n'.isProtected (w.activeProtectors.filter (· != protId)) = true at hp'
-            rw [hisP] at hp'; cases hp'
-          · have hprotNe : n'.protector ≠ some protId := by rw [hnm.2.2.1]; exact hprotUnique n hn htagNe
-            have hisP : n'.isProtected (w.activeProtectors.filter (· != protId)) = n'.isProtected w.activeProtectors :=
-              b1_isProtected_releaseProtector_other n' protId w.activeProtectors hprotNe
-            change n'.isProtected (w.activeProtectors.filter (· != protId)) = true at hp'
-            rw [hisP] at hp'
-            have hisP0 : n.isProtected w.activeProtectors = true := by
-              unfold TreeTagNode.isProtected at hp' ⊢; rw [← hnm.2.2.1]; exact hp'
-            cases hpre : (emb protectedTag).isPrefixOf (emb n.tag) with
-            | true =>
-              have hdescT : isStrictDescendantOf w.nodes protectedTag n = true := by
-                rw [hdesc n hn, hpre]; simp [htagNe]
-              have hancF : (ancestorPathTags w.nodes protectedTag).contains n.tag = false := by
-                rw [hloc n hn, locOf_some_eq_isPrefixOf]
-                cases hrev : (emb n.tag).isPrefixOf (emb protectedTag) with
-                | false => rfl
-                | true =>
-                  exfalso
-                  exact htagNe (hembInj n hn (b1_nodeAt_prefix_eq hrev hpre))
-              rcases hnn' with ⟨ha, _⟩ | ⟨_, _, hEq⟩ | ⟨_, hd, _, _⟩
-              · rw [hancF] at ha; cases ha
-              · subst n'; exact hinv.protUniqAcc n hn hisP0 hu
-              · rw [hdescT] at hd; cases hd
-            | false =>
-              have hs := hrelToStep n hn n' hnn' hpre
-              obtain ⟨_, _, hok, _⟩ := hstepSim n hn (locOf (some (emb protectedTag)) (emb n.tag))
-              obtain ⟨_, _, _, _, _, _, hUA, _⟩ := hok n' hs
-              exact hUA hp' hu
-      exact ⟨_, _, htbmOk, List.getElem?_set_self hidlt, hlive, rfl,
-        hpostEqLen root2 hpost2, fun hwf => tbm_release_protector_wfLive_choiceFree hwf htbmOk,
-        hmeta, hinv2, hpostOutside root2 hpost2⟩
-    -- Backward / error direction.
-    have hbwd : (∀ nodes', ¬ ListRel (ProtectorEndStepRel w protectedTag isWrite off len) w.nodes nodes') →
-        ∃ msg, TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb protectedTag) = .error (.ub msg) := by
-      intro hno
-      rw [hrelEq]
-      cases hrun : Node.release_protector root1 (some (emb protectedTag)) accesses with
-      | ok root2 =>
-        exfalso
-        have hall : ∀ n ∈ w.nodes, ∃ n', ProtectorEndStepRel w protectedTag isWrite off len n n' := by
-          intro n hn
-          rcases Decidable.em (n.tag = protectedTag) with htagEq | htagNe
-          · have hneq := b1_eq_of_mem_of_findNode?_of_nodup w.nodes protectedTag n pn htagsNodup hn htagEq hpn
-            subst n
-            have hself : (ancestorPathTags w.nodes protectedTag).contains pn.tag = true := by
-              rw [hloc pn hpnMem, hpnTag, locOf_some_eq_isPrefixOf, b1_isPrefixOf_refl]
-            exact ⟨pn, Or.inl ⟨hself,
-              b1_protectorEnd_self_invariant_miniRust w.activeProtectors off len pn isWrite hkind huniqPn⟩⟩
-          · cases hpre : (emb protectedTag).isPrefixOf (emb n.tag) with
-            | true =>
-              have hdescT : isStrictDescendantOf w.nodes protectedTag n = true := by
-                rw [hdesc n hn, hpre]; simp [htagNe]
-              have hancF : (ancestorPathTags w.nodes protectedTag).contains n.tag = false := by
-                rw [hloc n hn, locOf_some_eq_isPrefixOf]
-                cases hrev : (emb n.tag).isPrefixOf (emb protectedTag) with
-                | false => rfl
-                | true =>
-                  exfalso
-                  exact htagNe (hembInj n hn (b1_nodeAt_prefix_eq hrev hpre))
-              exact ⟨n, Or.inr (Or.inl ⟨hancF, Or.inl hdescT, rfl⟩)⟩
-            | false =>
-              have hqne : emb n.tag ≠ emb protectedTag := fun h => htagNe (hembInj n hn h)
-              obtain ⟨m0, hm0, _, p, hp, hwin0⟩ := hinv.nodes n hn
-              obtain ⟨m1, hm1, hm1Ps, _⟩ := (hroot1Other (emb n.tag) hqne).2 m0 hm0
-              have hoffLt : off < accesses.length := by rw [haccLen]; omega
-              have haccOff : accesses[off]? = some (some k) := by
-                have hci := haccChar off hoffLt
-                have hin : off ≤ off ∧ off < off + len := ⟨Nat.le_refl _, by omega⟩
-                simp only [hin, and_self, ↓reduceIte] at hci
-                exact hci
-              obtain ⟨q0, q0', hq0, htr0⟩ :=
-                node_release_protector_ok_inv root1 root2 (some (emb protectedTag)) accesses hrun
-                  (emb n.tag) m1 hm1 hpre off hoffLt k haccOff
-              rw [hm1Ps, hwin0 off (Nat.le_refl _) (by omega)] at hq0
-              cases hq0
-              obtain ⟨p0, hp0, _, herr⟩ := hstepSim n hn (locOf (some (emb protectedTag)) (emb n.tag))
-              rw [hp] at hp0; cases hp0
-              cases hs : stepNodeOnRangeAccess w.activeProtectors isWrite
-                  (locOf (some (emb protectedTag)) (emb n.tag)) off len n with
-              | ok n' => exact ⟨n', hstepToRel n hn n' hpre hs⟩
-              | error e =>
-                obtain ⟨msg, hmsg⟩ := herr e hs
-                have hlocEq : locRel (some (emb protectedTag)) (emb n.tag) =
-                    nodeRelToMiniRust (locOf (some (emb protectedTag)) (emb n.tag)) := rfl
-                rw [hlocEq] at htr0
-                rw [htr0] at hmsg; cases hmsg
-        obtain ⟨nodes', hrel⟩ := b1_listRel_of_forall w.nodes hall
-        exact hno nodes' hrel
-      | error e =>
-        have hlen1 : ∀ q m1, nodeAt root1 q = some m1 → accesses.length ≤ m1.permissions.length := by
-          intro q m1 hm1
-          rw [hroot1EqLen q m1 hm1, haccLen, hEqLen (emb protectedTag) tNode htNode]
-          exact Nat.le_refl _
-        obtain ⟨msg, hmsg⟩ := node_release_protector_error_is_ub root1 (some (emb protectedTag)) accesses e hlen1 hrun
-        exact ⟨msg, by rw [hmsg]; rfl⟩
-    refine ⟨?_, ?_, ?_⟩
-    · intro w' hw'
-      rw [hworldEq] at hw'
-      cases hpe : execProtectorEndAccess w protectedTag isWrite off len with
-      | error _ => rw [hpe] at hw'; cases hw'
-      | ok w1 =>
-        rw [hpe] at hw'; cases hw'
-        obtain ⟨_, nodes', hw1, hrel⟩ := (execProtectorEndAccess_ok_iff w w1 protectedTag isWrite off len hneLen).mp hpe
-        subst hw1
-        obtain ⟨tbm', alloc', h1, h2, h3, h4, h5, h6, h7, h8, h9⟩ := hfwd nodes' hrel
-        exact ⟨tbm', alloc', h1, h2, h3, h4, h5, h6, h7, rfl, h8, h9⟩
-    · intro e he
-      rw [hworldEq] at he
-      cases hpe : execProtectorEndAccess w protectedTag isWrite off len with
-      | ok w1 => rw [hpe] at he; cases he
-      | error e' =>
-        apply hbwd
-        intro nodes' hrel
-        have hok := (execProtectorEndAccess_ok_iff w { w with nodes := nodes' } protectedTag isWrite off len hneLen).mpr
-          ⟨⟨pn, hpn⟩, nodes', rfl, hrel⟩
-        rw [hpe] at hok; cases hok
-    · intro tbm' htbm'
-      cases hw : execFrameExitMiniRust w [(protectedTag, protId)] with
-      | ok w' =>
-        rw [hworldEq] at hw
-        cases hpe : execProtectorEndAccess w protectedTag isWrite off len with
-        | error _ => rw [hpe] at hw; cases hw
-        | ok w1 =>
-          rw [hpe] at hw; cases hw
-          obtain ⟨_, nodes', hw1, hrel⟩ := (execProtectorEndAccess_ok_iff w w1 protectedTag isWrite off len hneLen).mp hpe
-          subst hw1
-          obtain ⟨tbm'', alloc', h1, h2, h3, _, _, _, _, h8, _⟩ := hfwd nodes' hrel
-          rw [htbm'] at h1; cases h1
-          exact ⟨releaseProtector { w with nodes := nodes' } protId, alloc',
-            rfl, h2, h3, h8⟩
-      | error e =>
-        have hno : ∀ nodes', ¬ ListRel (ProtectorEndStepRel w protectedTag isWrite off len) w.nodes nodes' := by
-          intro nodes' hrel
-          have hok := (execProtectorEndAccess_ok_iff w { w with nodes := nodes' } protectedTag isWrite off len hneLen).mpr
-            ⟨⟨pn, hpn⟩, nodes', rfl, hrel⟩
-          rw [hworldEq, hok] at hw; cases hw
-        obtain ⟨msg, hmsg⟩ := hbwd hno
-        rw [htbm'] at hmsg; cases hmsg
+  obtain ⟨h1, h2, h3⟩ := tbm_release_protector_simulates_execFrameExitMiniRust_step_multi
+    tbm id alloc off len hlen emb w protectedTag protId pn halloc hlive hEqLen
+    (treeSimInvMulti_of_treeSimInv _ _ _ _ _ hinv) htagsNodup hpn hpnProt hactProt hpnRange
+    hprotUnique hembInj hloc (fun n hn _ => hinv.overlap n hn) hdesc hpruneInert hOutside
+  have hovOfMeta : ∀ {w' : FnEntryBorrowWorld}, ListRel NodeMetaRel w.nodes w'.nodes →
+      ∀ n' ∈ w'.nodes, rangesOverlap off len n'.rangeOffset n'.rangeLen = true := by
+    intro w' hmeta n' hn'
+    obtain ⟨n, hn, hnm⟩ := hmeta.exists_of_mem_right hn'
+    rw [hnm.2.2.2.1, hnm.2.2.2.2.1]; exact hinv.overlap n hn
+  refine ⟨fun w' hw' => ?_, h2, fun tbm' htbm' => ?_⟩
+  · obtain ⟨tbm', alloc', hrel, hal, hlv, hdl, heql, hwf, hmeta, hact, hm, _, hout⟩ := h1 w' hw'
+    exact ⟨tbm', alloc', hrel, hal, hlv, hdl, heql, hwf, hmeta, hact,
+      a3_treeSimInv_of_multi _ _ _ _ _ hm (hovOfMeta hmeta),
+      fun q m hm0 hne => by obtain ⟨m', hm', _, hb, _⟩ := hout q m hm0 hne; exact ⟨m', hm', hb⟩⟩
+  · obtain ⟨w', alloc', hw', hal, hlv, hm⟩ := h3 tbm' htbm'
+    obtain ⟨tbm'', _, hrel'', _, _, _, _, _, hmeta, _, _, _, _⟩ := h1 w' hw'
+    exact ⟨w', alloc', hw', hal, hlv, a3_treeSimInv_of_multi _ _ _ _ _ hm (hovOfMeta hmeta)⟩
 
 /-- **Step-indexed pruning-inertness of a frame exit** on the window
 `[off, off + len)`: at EVERY intermediate world of the sequential (MiniRust-order)
@@ -8868,26 +9545,9 @@ theorem frameExitPruneInert_of_noNestedForeignAncestors (off len : Nat) :
       rw [b1_listRel_nodeMetaRel_ancestorPathTags hmeta tp.1]
       exact h tp (List.mem_cons_of_mem _ htp) n0 hn0 hnotAnc u hu
 
-/-- **Symbolic multi-entry whole-tree `TreeSimInv` simulation for
-`TreeBorrowsMemory.end_call` vs `execFrameExitMiniRust` on borrow trees of
-ARBITRARY depth**: for ANY frame `frame : List (Nat × Nat)` of distinct
-`(tag, protId)` entries covering `[off, off + len)` (`0 < len`) on ANY
-`TreeSimInv`-related borrow tree — released nodes may have arbitrarily deep
-descendant subtrees and foreign subtrees may be arbitrarily nested — whose
-`SkipSelfAndChildren` pruning is inert along the exit (`FrameExitPruneInert`) and
-whose released nodes have passive outside bytes (`OutsideNoProtectorAccess`):
-1. `execFrameExitMiniRust w frame = .ok w'` implies
-   `TreeBorrowsMemory.end_call tbm ⟨frame.map (fun tp => (⟨id⟩, emb tp.1))⟩ = .ok tbm'`,
-   preserving `alloc'.live = true`, `TreeBorrowsMemory.wfLive` (choice-free),
-   and `TreeSimInv off len emb w' alloc'.extra.root`;
-2. `execFrameExitMiniRust w frame = .error e` implies
-   `TreeBorrowsMemory.end_call` fails with `.error (.ub msg)`;
-3. conversely, `TreeBorrowsMemory.end_call` succeeding implies `execFrameExitMiniRust`
-   succeeds with a `TreeSimInv`-related post-state.
-
-All frame entries share the window `[off, off + len)` and the allocation `id`
-(the scope of the single-window `TreeSimInv`). -/
-theorem tbm_end_call_simulates_execFrameExitMiniRust_of_pruneInert :
+/-- **Multi-entry `TreeBorrowsMemory.end_call` simulation under `TreeSimInvMulti`**
+(single window `[off, off + len)` inside a multi-slice borrow tree of arbitrary depth). -/
+theorem tbm_end_call_simulates_execFrameExitMiniRust_multi :
     ∀ (frame : List (Nat × Nat))
       (tbm : Gen.TreeBorrowsMemory Gen.x86_64)
       (id : Nat) (alloc : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra)
@@ -8896,7 +9556,7 @@ theorem tbm_end_call_simulates_execFrameExitMiniRust_of_pruneInert :
       tbm.mem.allocations[id]? = some alloc →
       alloc.live = true →
       (∀ q m, nodeAt alloc.extra.root q = some m → m.permissions.length = alloc.data.length) →
-      TreeSimInv off len emb w alloc.extra.root →
+      TreeSimInvMulti off len emb w alloc.extra.root →
       (w.nodes.map (·.tag)).Nodup →
       (frame.map Prod.snd).Nodup →
       (∀ tp ∈ frame, ∃ pn, findNode? w.nodes tp.1 = some pn ∧
@@ -8906,6 +9566,9 @@ theorem tbm_end_call_simulates_execFrameExitMiniRust_of_pruneInert :
       (∀ tp ∈ frame, ∀ n ∈ w.nodes, emb n.tag = emb tp.1 → n.tag = tp.1) →
       (∀ tp ∈ frame, ∀ n ∈ w.nodes,
         (ancestorPathTags w.nodes tp.1).contains n.tag = locOf (some (emb tp.1)) (emb n.tag)) →
+      (∀ tp ∈ frame, ∀ n ∈ w.nodes,
+        (ancestorPathTags w.nodes tp.1).contains n.tag = true →
+        rangesOverlap off len n.rangeOffset n.rangeLen = true) →
       (∀ tp ∈ frame, ∀ n ∈ w.nodes,
         isStrictDescendantOf w.nodes tp.1 n =
           ((emb tp.1).isPrefixOf (emb n.tag) && decide (n.tag ≠ tp.1))) →
@@ -8918,27 +9581,22 @@ theorem tbm_end_call_simulates_execFrameExitMiniRust_of_pruneInert :
           TreeBorrowsMemory.end_call tbm extra = .ok tbm' ∧
           tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
           (TreeBorrowsMemory.wfLive tbm → TreeBorrowsMemory.wfLive tbm') ∧
-          TreeSimInv off len emb w' alloc'.extra.root) ∧
+          TreeSimInvMulti off len emb w' alloc'.extra.root) ∧
       (∀ e, execFrameExitMiniRust w frame = .error e →
         ∃ msg, TreeBorrowsMemory.end_call tbm extra = .error (.ub msg)) ∧
       (∀ tbm', TreeBorrowsMemory.end_call tbm extra = .ok tbm' →
         ∃ w' alloc',
           execFrameExitMiniRust w frame = .ok w' ∧
           tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
-          TreeSimInv off len emb w' alloc'.extra.root)
+          TreeSimInvMulti off len emb w' alloc'.extra.root)
   | [] => by
-    intro tbm id alloc off len _ emb w halloc hlive _ hinv _ _ _ _ _ _ _ _ _
-    refine ⟨?_, ?_, ?_⟩
-    · intro w' hw'
-      cases hw'
-      exact ⟨tbm, alloc, rfl, halloc, hlive, fun h => h, hinv⟩
-    · intro e he; cases he
-    · intro tbm' htbm'
-      cases htbm'
-      exact ⟨w, alloc, rfl, halloc, hlive, hinv⟩
+    intro tbm id alloc off len _ emb w halloc hlive _ hinv _ _ _ _ _ _ _ _ _ _
+    exact ⟨fun w' hw' => by cases hw'; exact ⟨tbm, alloc, rfl, halloc, hlive, fun h => h, hinv⟩,
+      fun e he => (by cases he),
+      fun tbm' htbm' => by cases htbm'; exact ⟨w, alloc, rfl, halloc, hlive, hinv⟩⟩
   | (t, p) :: rest => by
     intro tbm id alloc off len hlen emb w halloc hlive hEqLen hinv htagsNodup hframeNodup
-      hframeNodes hprotUnique hembInj hloc hdesc hprune hOutside
+      hframeNodes hprotUnique hembInj hloc hancOv hdesc hprune hOutside
     rw [List.map_cons, List.nodup_cons] at hframeNodup
     obtain ⟨pn, hpn, hpnProt, hactProt, hpnOff, hpnLen⟩ := hframeNodes (t, p) (List.mem_cons_self ..)
     obtain ⟨hpruneHead, hpruneTail⟩ := hprune
@@ -8947,18 +9605,17 @@ theorem tbm_end_call_simulates_execFrameExitMiniRust_of_pruneInert :
         isStrictDescendantOf w.nodes t n = false →
         isPrunedForeignNode w.nodes (ancestorPathTags w.nodes t) isWrite off len n = true →
         stepNodeOnRangeAccess w.activeProtectors isWrite false off len n = .ok n := by
-      rw [hpn] at hpruneHead
-      exact hpruneHead
+      rw [hpn] at hpruneHead; exact hpruneHead
     obtain ⟨hstepOk, hstepErr, hstepBack⟩ :=
-      tbm_release_protector_simulates_execFrameExitMiniRust_step
+      tbm_release_protector_simulates_execFrameExitMiniRust_step_multi
         tbm id alloc off len hlen emb w t p pn halloc hlive hEqLen hinv htagsNodup
         hpn hpnProt hactProt ⟨hpnOff, hpnLen⟩
         (hprotUnique (t, p) (List.mem_cons_self ..))
         (hembInj (t, p) (List.mem_cons_self ..))
         (hloc (t, p) (List.mem_cons_self ..))
+        (hancOv (t, p) (List.mem_cons_self ..))
         (hdesc (t, p) (List.mem_cons_self ..))
-        hpruneInert
-        (hOutside (t, p) (List.mem_cons_self ..))
+        hpruneInert (hOutside (t, p) (List.mem_cons_self ..))
     have hconsWorld : execFrameExitMiniRust w ((t, p) :: rest) =
         (match execFrameExitMiniRust w [(t, p)] with
         | .error e => .error e
@@ -8969,9 +9626,7 @@ theorem tbm_end_call_simulates_execFrameExitMiniRust_of_pruneInert :
         TreeBorrowsMemory.end_call tbm ⟨(((t, p) :: rest).map (fun tp => (⟨(id : Int)⟩, emb tp.1)))⟩ =
         (TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb t) >>= fun tbm1 =>
           TreeBorrowsMemory.end_call tbm1 ⟨rest.map (fun tp => (⟨(id : Int)⟩, emb tp.1))⟩) := by
-      unfold TreeBorrowsMemory.end_call
-      simp only [List.map_cons, List.foldlM_cons]
-    -- Helper lifting all invariants from `(w, tbm, alloc)` to `(w1, tbm1, alloc1)` for `rest`.
+      unfold TreeBorrowsMemory.end_call; simp only [List.map_cons, List.foldlM_cons]
     have hihOfStep : ∀ w1, execFrameExitMiniRust w [(t, p)] = .ok w1 →
         ∃ (tbm1 : Gen.TreeBorrowsMemory Gen.x86_64)
           (alloc1 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra),
@@ -8982,16 +9637,16 @@ theorem tbm_end_call_simulates_execFrameExitMiniRust_of_pruneInert :
               TreeBorrowsMemory.end_call tbm1 ⟨rest.map (fun tp => (⟨(id : Int)⟩, emb tp.1))⟩ = .ok tbm' ∧
               tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
               (TreeBorrowsMemory.wfLive tbm1 → TreeBorrowsMemory.wfLive tbm') ∧
-              TreeSimInv off len emb w' alloc'.extra.root) ∧
+              TreeSimInvMulti off len emb w' alloc'.extra.root) ∧
           (∀ e, execFrameExitMiniRust w1 rest = .error e →
             ∃ msg, TreeBorrowsMemory.end_call tbm1 ⟨rest.map (fun tp => (⟨(id : Int)⟩, emb tp.1))⟩ = .error (.ub msg)) ∧
           (∀ tbm', TreeBorrowsMemory.end_call tbm1 ⟨rest.map (fun tp => (⟨(id : Int)⟩, emb tp.1))⟩ = .ok tbm' →
             ∃ w' alloc',
               execFrameExitMiniRust w1 rest = .ok w' ∧
               tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
-              TreeSimInv off len emb w' alloc'.extra.root) := by
+              TreeSimInvMulti off len emb w' alloc'.extra.root) := by
       intro w1 hw1
-      obtain ⟨tbm1, alloc1, hrel1, halloc1, hlive1, _, hEqLen1, hwf1, hmeta1, hact1, hinv1, hout1⟩ :=
+      obtain ⟨tbm1, alloc1, hrel1, halloc1, hlive1, _, hEqLen1, hwf1, hmeta1, hact1, hinv1, _, hout1⟩ :=
         hstepOk w1 hw1
       have htags1 : (w1.nodes.map (·.tag)).Nodup := by
         rw [ListRel.nodeMetaRel_map_tag_eq hmeta1]; exact htagsNodup
@@ -9003,8 +9658,7 @@ theorem tbm_end_call_simulates_execFrameExitMiniRust_of_pruneInert :
         obtain ⟨pn1, hpn1, hnm⟩ := (b1_listRel_nodeMetaRel_findNode? hmeta1 tp.1).2 pn0 hpn0
         have hpNe : tp.2 ≠ p := fun h => hframeNodup.1 (h ▸ List.mem_map.mpr ⟨tp, htp, rfl⟩)
         have hact1' : w1.activeProtectors.contains tp.2 = true := by
-          rw [hact1]
-          apply List.contains_iff_mem.mpr
+          rw [hact1]; apply List.contains_iff_mem.mpr
           exact List.mem_filter.mpr ⟨List.contains_iff_mem.mp ha0, by simp [bne, hpNe]⟩
         exact ⟨pn1, hpn1, hnm.2.2.1.trans hp0, hact1', hnm.2.2.2.1.trans ho0, hnm.2.2.2.2.1.trans hl0⟩
       have hpu1 : ∀ tp ∈ rest, ∀ n1 ∈ w1.nodes, n1.tag ≠ tp.1 → n1.protector ≠ some tp.2 := by
@@ -9023,6 +9677,14 @@ theorem tbm_end_call_simulates_execFrameExitMiniRust_of_pruneInert :
         obtain ⟨n0, hn0, hnm⟩ := hmeta1.exists_of_mem_right hn1
         rw [b1_listRel_nodeMetaRel_ancestorPathTags hmeta1 tp.1, hnm.1]
         exact hloc tp (List.mem_cons_of_mem _ htp) n0 hn0
+      have hancOv1 : ∀ tp ∈ rest, ∀ n1 ∈ w1.nodes,
+          (ancestorPathTags w1.nodes tp.1).contains n1.tag = true →
+          rangesOverlap off len n1.rangeOffset n1.rangeLen = true := by
+        intro tp htp n1 hn1 hanc
+        obtain ⟨n0, hn0, hnm⟩ := hmeta1.exists_of_mem_right hn1
+        rw [b1_listRel_nodeMetaRel_ancestorPathTags hmeta1 tp.1, hnm.1] at hanc
+        rw [hnm.2.2.2.1, hnm.2.2.2.2.1]
+        exact hancOv tp (List.mem_cons_of_mem _ htp) n0 hn0 hanc
       have hdesc1 : ∀ tp ∈ rest, ∀ n1 ∈ w1.nodes,
           isStrictDescendantOf w1.nodes tp.1 n1 =
             ((emb tp.1).isPrefixOf (emb n1.tag) && decide (n1.tag ≠ tp.1)) := by
@@ -9030,7 +9692,6 @@ theorem tbm_end_call_simulates_execFrameExitMiniRust_of_pruneInert :
         obtain ⟨n0, hn0, hnm⟩ := hmeta1.exists_of_mem_right hn1
         rw [b1_listRel_nodeMetaRel_isStrictDescendantOf hmeta1 tp.1 hnm, hnm.1]
         exact hdesc tp (List.mem_cons_of_mem _ htp) n0 hn0
-      have hprune1 : FrameExitPruneInert off len w1 rest := hpruneTail w1 hw1
       have houtRest : ∀ tp ∈ rest, ∀ m1, nodeAt alloc1.extra.root (emb tp.1) = some m1 →
           OutsideNoProtectorAccess off len m1 := by
         intro tp htp m1 hm1 b p0 hp0 hb
@@ -9040,22 +9701,20 @@ theorem tbm_end_call_simulates_execFrameExitMiniRust_of_pruneInert :
         have hneTag : tp.1 ≠ t := by
           intro hEq
           have heqPn := b1_eq_of_mem_of_findNode?_of_nodup w.nodes t pn0 pn htagsNodup htpMem (htpTag.trans hEq) hpn
-          subst heqPn
-          rw [hpnProt] at hp0'
-          cases hp0'
+          subst heqPn; rw [hpnProt] at hp0'; cases hp0'
           exact hframeNodup.1 (List.mem_map.mpr ⟨tp, htp, rfl⟩)
         have hneEmb : emb tp.1 ≠ emb t := fun h => hneTag (by
           have h1 := hembInj (t, p) (List.mem_cons_self ..) pn0 htpMem (by rw [htpTag]; exact h)
           rw [htpTag] at h1; exact h1)
         obtain ⟨m0, hm0, _⟩ := hinv.nodes pn0 htpMem
         rw [htpTag] at hm0
-        obtain ⟨m1', hm1', hsame⟩ := hout1 (emb tp.1) m0 hm0 hneEmb
+        obtain ⟨m1', hm1', _, hsame, _⟩ := hout1 (emb tp.1) m0 hm0 hneEmb
         rw [hm1'] at hm1; cases hm1
         rw [hsame b hb] at hp0
         exact hOutside tp (List.mem_cons_of_mem _ htp) m0 hm0 b p0 hp0 hb
-      obtain ⟨hr1, hr2, hr3⟩ := tbm_end_call_simulates_execFrameExitMiniRust_of_pruneInert rest
+      obtain ⟨hr1, hr2, hr3⟩ := tbm_end_call_simulates_execFrameExitMiniRust_multi rest
         tbm1 id alloc1 off len hlen emb w1 halloc1 hlive1 hEqLen1 hinv1 htags1 hframeNodup.2
-        hfnRest hpu1 hemb1 hloc1 hdesc1 hprune1 houtRest
+        hfnRest hpu1 hemb1 hloc1 hancOv1 hdesc1 (hpruneTail w1 hw1) houtRest
       exact ⟨tbm1, alloc1, hrel1, hwf1, hr1, hr2, hr3⟩
     refine ⟨?_, ?_, ?_⟩
     · intro w' hw'
@@ -9066,9 +9725,8 @@ theorem tbm_end_call_simulates_execFrameExitMiniRust_of_pruneInert :
         rw [hw1] at hw'
         obtain ⟨tbm1, _, hrel1, hwf1, hr1, _, _⟩ := hihOfStep w1 hw1
         obtain ⟨tbm', alloc', hend', halloc', hlive', hwf2, hinv'⟩ := hr1 w' hw'
-        refine ⟨tbm', alloc', ?_, halloc', hlive', fun h => hwf2 (hwf1 h), hinv'⟩
-        rw [hconsTbm, hrel1]
-        exact hend'
+        exact ⟨tbm', alloc', by rw [hconsTbm, hrel1]; exact hend', halloc', hlive',
+          fun h => hwf2 (hwf1 h), hinv'⟩
     · intro e he
       rw [hconsWorld] at he
       cases hw1 : execFrameExitMiniRust w [(t, p)] with
@@ -9088,6 +9746,109 @@ theorem tbm_end_call_simulates_execFrameExitMiniRust_of_pruneInert :
       rw [hrel1'] at hrel1; cases hrel1
       obtain ⟨w', alloc', hw', halloc', hlive', hinv'⟩ := hr3 tbm' hend'
       exact ⟨w', alloc', by rw [hconsWorld, hw1]; exact hw', halloc', hlive', hinv'⟩
+
+private theorem a3_listRel_nodeMetaRel_trans :
+    ∀ {xs ys zs : List TreeTagNode},
+      ListRel NodeMetaRel xs ys → ListRel NodeMetaRel ys zs → ListRel NodeMetaRel xs zs
+  | [], [], [], .nil, .nil => .nil
+  | _ :: _, _ :: _, _ :: _, .cons h1 t1, .cons h2 t2 =>
+    .cons ⟨h2.1.trans h1.1, h2.2.1.trans h1.2.1, h2.2.2.1.trans h1.2.2.1,
+      h2.2.2.2.1.trans h1.2.2.2.1, h2.2.2.2.2.1.trans h1.2.2.2.2.1,
+      fun h => h1.2.2.2.2.2 (h2.2.2.2.2.2 h)⟩
+      (a3_listRel_nodeMetaRel_trans t1 t2)
+
+private theorem a3_execFrameExitMiniRust_nodeMetaRel :
+    ∀ (frame : List (Nat × Nat)) (w w' : FnEntryBorrowWorld),
+      execFrameExitMiniRust w frame = .ok w' → ListRel NodeMetaRel w.nodes w'.nodes
+  | [], w, w', hw => by
+    cases hw; exact listRel_nodeMetaRel_refl w.nodes
+  | (t, p) :: rest, w, w', hw => by
+    have hc : execFrameExitMiniRust w ((t, p) :: rest) =
+        (match execFrameExitMiniRust w [(t, p)] with
+        | .error e => .error e
+        | .ok w1 => execFrameExitMiniRust w1 rest) := by
+      cases h : execProtectorEndAccessFor protectorEndAccessIsWriteMiniRust? w t <;>
+        simp [execFrameExitMiniRust, execFrameExitSequential, h]
+    rw [hc] at hw
+    cases hw1 : execFrameExitMiniRust w [(t, p)] with
+    | error _ => rw [hw1] at hw; cases hw
+    | ok w1 =>
+      rw [hw1] at hw
+      exact a3_listRel_nodeMetaRel_trans
+        (execFrameExitMiniRust_singleton_nodeMetaRel w w1 t p hw1)
+        (a3_execFrameExitMiniRust_nodeMetaRel rest w1 w' hw)
+
+/-- **Symbolic multi-entry whole-tree `TreeSimInv` simulation for
+`TreeBorrowsMemory.end_call` vs `execFrameExitMiniRust` on borrow trees of
+ARBITRARY depth**: for ANY frame `frame : List (Nat × Nat)` of distinct
+`(tag, protId)` entries covering `[off, off + len)` (`0 < len`) on ANY
+`TreeSimInv`-related borrow tree — released nodes may have arbitrarily deep
+descendant subtrees and foreign subtrees may be arbitrarily nested — whose
+`SkipSelfAndChildren` pruning is inert along the exit (`FrameExitPruneInert`) and
+whose released nodes have passive outside bytes (`OutsideNoProtectorAccess`):
+1. `execFrameExitMiniRust w frame = .ok w'` implies `TreeBorrowsMemory.end_call`
+   succeeds into a `TreeSimInv`-related tree preserving `alloc'.live = true` and
+   `TreeBorrowsMemory.wfLive` (choice-free!);
+2. `execFrameExitMiniRust w frame = .error e` implies
+   `TreeBorrowsMemory.end_call` fails with `.error (.ub msg)`;
+3. conversely, `TreeBorrowsMemory.end_call` succeeding implies `execFrameExitMiniRust`
+   succeeds with a `TreeSimInv`-related post-state.
+
+All frame entries share the window `[off, off + len)` and the allocation `id`
+(the scope of the single-window `TreeSimInv`). -/
+theorem tbm_end_call_simulates_execFrameExitMiniRust_of_pruneInert
+    (frame : List (Nat × Nat))
+    (tbm : Gen.TreeBorrowsMemory Gen.x86_64)
+    (id : Nat) (alloc : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra)
+    (off len : Nat) (hlen : 0 < len)
+    (emb : Nat → Gen.Path) (w : FnEntryBorrowWorld)
+    (halloc : tbm.mem.allocations[id]? = some alloc)
+    (hlive : alloc.live = true)
+    (hEqLen : ∀ q m, nodeAt alloc.extra.root q = some m → m.permissions.length = alloc.data.length)
+    (hinv : TreeSimInv off len emb w alloc.extra.root)
+    (htagsNodup : (w.nodes.map (·.tag)).Nodup)
+    (hframeNodup : (frame.map Prod.snd).Nodup)
+    (hframeNodes : ∀ tp ∈ frame, ∃ pn, findNode? w.nodes tp.1 = some pn ∧
+      pn.protector = some tp.2 ∧ w.activeProtectors.contains tp.2 = true ∧
+      pn.rangeOffset = off ∧ pn.rangeLen = len)
+    (hprotUnique : ∀ tp ∈ frame, ∀ n ∈ w.nodes, n.tag ≠ tp.1 → n.protector ≠ some tp.2)
+    (hembInj : ∀ tp ∈ frame, ∀ n ∈ w.nodes, emb n.tag = emb tp.1 → n.tag = tp.1)
+    (hloc : ∀ tp ∈ frame, ∀ n ∈ w.nodes,
+      (ancestorPathTags w.nodes tp.1).contains n.tag = locOf (some (emb tp.1)) (emb n.tag))
+    (hdesc : ∀ tp ∈ frame, ∀ n ∈ w.nodes,
+      isStrictDescendantOf w.nodes tp.1 n =
+        ((emb tp.1).isPrefixOf (emb n.tag) && decide (n.tag ≠ tp.1)))
+    (hprune : FrameExitPruneInert off len w frame)
+    (hOutside : ∀ tp ∈ frame, ∀ m, nodeAt alloc.extra.root (emb tp.1) = some m →
+      OutsideNoProtectorAccess off len m) :
+    let extra : Gen.TreeBorrowsFrameExtra := ⟨frame.map (fun tp => (⟨(id : Int)⟩, emb tp.1))⟩
+    (∀ w', execFrameExitMiniRust w frame = .ok w' →
+      ∃ tbm' alloc',
+        TreeBorrowsMemory.end_call tbm extra = .ok tbm' ∧
+        tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
+        (TreeBorrowsMemory.wfLive tbm → TreeBorrowsMemory.wfLive tbm') ∧
+        TreeSimInv off len emb w' alloc'.extra.root) ∧
+    (∀ e, execFrameExitMiniRust w frame = .error e →
+      ∃ msg, TreeBorrowsMemory.end_call tbm extra = .error (.ub msg)) ∧
+    (∀ tbm', TreeBorrowsMemory.end_call tbm extra = .ok tbm' →
+      ∃ w' alloc',
+        execFrameExitMiniRust w frame = .ok w' ∧
+        tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
+        TreeSimInv off len emb w' alloc'.extra.root) := by
+  obtain ⟨h1, h2, h3⟩ := tbm_end_call_simulates_execFrameExitMiniRust_multi frame tbm id alloc
+    off len hlen emb w halloc hlive hEqLen (treeSimInvMulti_of_treeSimInv _ _ _ _ _ hinv)
+    htagsNodup hframeNodup hframeNodes hprotUnique hembInj hloc
+    (fun _ _ n hn _ => hinv.overlap n hn) hdesc hprune hOutside
+  have hov' : ∀ {w'}, execFrameExitMiniRust w frame = .ok w' →
+      ∀ n' ∈ w'.nodes, rangesOverlap off len n'.rangeOffset n'.rangeLen = true := by
+    intro w' hw' n' hn'
+    obtain ⟨n, hn, hnm⟩ := (a3_execFrameExitMiniRust_nodeMetaRel frame w w' hw').exists_of_mem_right hn'
+    rw [hnm.2.2.2.1, hnm.2.2.2.2.1]; exact hinv.overlap n hn
+  refine ⟨fun w' hw' => ?_, h2, fun tbm' htbm' => ?_⟩
+  · obtain ⟨tbm', alloc', hend, hal, hlv, hwf, hm⟩ := h1 w' hw'
+    exact ⟨tbm', alloc', hend, hal, hlv, hwf, a3_treeSimInv_of_multi _ _ _ _ _ hm (hov' hw')⟩
+  · obtain ⟨w', alloc', hw', hal, hlv, hm⟩ := h3 tbm' htbm'
+    exact ⟨w', alloc', hw', hal, hlv, a3_treeSimInv_of_multi _ _ _ _ _ hm (hov' hw')⟩
 
 /-- **Shallow-tree corollary of
 `tbm_end_call_simulates_execFrameExitMiniRust_of_pruneInert`**: the multi-entry
@@ -9798,15 +10559,18 @@ theorem tbm_end_call_lockstep_iff_pruneInert :
         rw [hw1] at hw1'; cases hw1'
         exact ⟨tbm1, alloc1, hrel1, halloc1, hinv1, hih.mpr (hpr.2 w1 hw1)⟩
 
-/-- **`EndCallLockstepSim` implies success of the real `TreeBorrowsMemory.end_call`**:
-the step-by-step predicate characterized by `tbm_end_call_lockstep_iff_pruneInert`
-is stated over iterated `TreeBorrowsMemory.release_protector`; this bridge
-connects it to the fold computed by `TreeBorrowsMemory.end_call` (forward
-direction only). Whenever the Anneal frame exit succeeds
-(`execFrameExitMiniRust w frame = .ok w'`) and lockstep holds,
-`TreeBorrowsMemory.end_call` on the corresponding protector list succeeds into a
-`TreeSimInv`-related final tree — with NO side conditions on the frame, the
-tags, the embedding, or the tree depth beyond lockstep itself. -/
+/-- **`EndCallLockstepSim` implies success of the real `TreeBorrowsMemory.end_call`
+(preserving `TreeBorrowsMemory.wfLive`)**: the step-by-step predicate characterized
+by `tbm_end_call_lockstep_iff_pruneInert` is stated over iterated
+`TreeBorrowsMemory.release_protector`; this bridge connects it to the fold computed
+by `TreeBorrowsMemory.end_call` (forward direction only — for singleton frames the
+converse holds by `endCallLockstepSim_singleton_iff_end_call`, whereas for
+`frame.length ≥ 2` the converse is FALSE by
+`endCallLockstepSim_end_call_converse_false_and_order_sensitive`). Whenever the
+Anneal frame exit succeeds (`execFrameExitMiniRust w frame = .ok w'`) and lockstep
+holds, `TreeBorrowsMemory.end_call` on the corresponding protector list succeeds
+into a `TreeSimInv`-related final tree preserving `TreeBorrowsMemory.wfLive`
+(choice-free) — with NO side conditions beyond lockstep itself. -/
 theorem endCallLockstepSim_end_call (off len : Nat) (emb : Nat → Gen.Path) (id : Nat) :
     ∀ (frame : List (Nat × Nat)) (w w' : FnEntryBorrowWorld)
       (tbm : Gen.TreeBorrowsMemory Gen.x86_64)
@@ -9818,10 +10582,11 @@ theorem endCallLockstepSim_end_call (off len : Nat) (emb : Nat → Gen.Path) (id
       ∃ tbm' alloc',
         TreeBorrowsMemory.end_call tbm ⟨frame.map (fun tp => (⟨(id : Int)⟩, emb tp.1))⟩ = .ok tbm' ∧
         tbm'.mem.allocations[id]? = some alloc' ∧
-        TreeSimInv off len emb w' alloc'.extra.root
+        TreeSimInv off len emb w' alloc'.extra.root ∧
+        (TreeBorrowsMemory.wfLive tbm → TreeBorrowsMemory.wfLive tbm')
   | [], w, w', tbm, alloc, halloc, hinv, hw, _ => by
     cases hw
-    exact ⟨tbm, alloc, rfl, halloc, hinv⟩
+    exact ⟨tbm, alloc, rfl, halloc, hinv, fun h => h⟩
   | (t, p) :: rest, w, w', tbm, alloc, _, _, hw, hlock => by
     have hconsWorld : execFrameExitMiniRust w ((t, p) :: rest) =
         (match execFrameExitMiniRust w [(t, p)] with
@@ -9835,12 +10600,48 @@ theorem endCallLockstepSim_end_call (off len : Nat) (emb : Nat → Gen.Path) (id
     | ok w1 =>
       rw [hw1] at hw
       obtain ⟨tbm1, alloc1, hrel1, halloc1, hinv1, hrest⟩ := hlock w1 hw1
-      obtain ⟨tbm', alloc', hend, halloc', hinv'⟩ :=
+      obtain ⟨tbm', alloc', hend, halloc', hinv', hwf'⟩ :=
         endCallLockstepSim_end_call off len emb id rest w1 w' tbm1 alloc1 halloc1 hinv1 hw hrest
-      refine ⟨tbm', alloc', ?_, halloc', hinv'⟩
+      refine ⟨tbm', alloc', ?_, halloc', hinv',
+        fun hwf => hwf' (tbm_release_protector_wfLive_choiceFree hwf hrel1)⟩
       unfold TreeBorrowsMemory.end_call at hend ⊢
       simp only [List.map_cons, List.foldlM_cons, bind, Except.bind, hrel1]
       exact hend
+
+/-- **Exact bidirectional characterization for singleton frames (`frame = [(t, p)]`)**:
+on a 1-entry frame where `execFrameExitMiniRust w [(t, p)] = .ok w'`,
+`EndCallLockstepSim` is EQUIVALENT (`↔`) to `TreeBorrowsMemory.end_call` succeeding
+into a `TreeSimInv`-related final tree. Together with
+`endCallLockstepSim_end_call_converse_false_and_order_sensitive`, this pinpoints
+`frame.length ≥ 2` as the exact threshold where final-state agreement decouples
+from step-by-step lockstep simulation. -/
+theorem endCallLockstepSim_singleton_iff_end_call
+    (off len : Nat) (emb : Nat → Gen.Path) (id : Nat)
+    (t p : Nat) (w w' : FnEntryBorrowWorld)
+    (tbm : Gen.TreeBorrowsMemory Gen.x86_64)
+    (alloc : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra)
+    (halloc : tbm.mem.allocations[id]? = some alloc)
+    (hinv : TreeSimInv off len emb w alloc.extra.root)
+    (hw : execFrameExitMiniRust w [(t, p)] = .ok w') :
+    EndCallLockstepSim off len emb id w tbm [(t, p)] ↔
+      ∃ tbm' alloc',
+        TreeBorrowsMemory.end_call tbm ⟨[(⟨(id : Int)⟩, emb t)]⟩ = .ok tbm' ∧
+        tbm'.mem.allocations[id]? = some alloc' ∧
+        TreeSimInv off len emb w' alloc'.extra.root := by
+  constructor
+  · intro hlock
+    obtain ⟨tbm', alloc', hend, hal, hinv', _⟩ :=
+      endCallLockstepSim_end_call off len emb id [(t, p)] w w' tbm alloc halloc hinv hw hlock
+    exact ⟨tbm', alloc', hend, hal, hinv'⟩
+  · intro ⟨tbm', alloc', hend, hal, hinv'⟩ w1 hw1
+    rw [hw] at hw1; cases hw1
+    have hrel : TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb t) = .ok tbm' := by
+      unfold TreeBorrowsMemory.end_call at hend
+      simp only [List.foldlM_cons, List.foldlM_nil, bind, Except.bind, pure, Except.pure] at hend
+      cases hr : TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb t) with
+      | error e => rw [hr] at hend; cases hend
+      | ok t1 => rw [hr] at hend; cases hend; rfl
+    exact ⟨tbm', alloc', hrel, hal, hinv', trivial⟩
 
 /-! #### Deallocation & Byte-Local Helpers -/
 
@@ -9946,28 +10747,6 @@ private theorem c1_access_node_of_nodeAt_ok {t t' : Gen.Node} {path : Option Gen
   rw [h] at hacc2
   cases hacc2
   exact hpost
-
-private theorem c1_transitionRange_ok_full (r : Gen.NodeRelation) (k : Gen.AccessKind)
-    (off len : Nat) (ps ps' : List Gen.Permission)
-    (h : Node.transitionRange r k off len ps = .ok ps') :
-    ps'.length = ps.length ∧
-    (∀ b, b < off ∨ off + len ≤ b → ps'[b]? = ps[b]?) ∧
-    (∀ b, off ≤ b → b < off + len →
-      ∃ p p', ps[b]? = some p ∧ Permission.transition p k r = .ok p' ∧ ps'[b]? = some p') := by
-  have hpoint : ∀ b, off ≤ b → b < off + len →
-      ∃ p p', ps[b]? = some p ∧ Permission.transition p k r = .ok p' := by
-    intro b h1 h2
-    exact transitionRange_ok_inv r k len off ps ps' h b h1 h2
-  obtain ⟨ps2, hrun2, hlen2, hout2, hin2⟩ :=
-    transitionRange_ok_of_pointwise r k len off ps hpoint
-  rw [h] at hrun2
-  cases hrun2
-  refine ⟨hlen2, hout2, fun b h1 h2 => ?_⟩
-  obtain ⟨p, p', hp, htr⟩ := hpoint b h1 h2
-  obtain ⟨p'', htr'', hget⟩ := hin2 b h1 h2 p hp
-  rw [htr] at htr''
-  cases htr''
-  exact ⟨p, p', hp, htr, hget⟩
 
 /-! ### 4.9 Symbolic `TreeBorrowsMemory.deallocate` (`Protected::Strong` vs. `Box<T>` `Protected::Weak`) -/
 
@@ -12525,53 +13304,45 @@ private theorem c1_slice_disjoint_splitAtMut_endCalls
       (hwfLeaf (pairs0.map Prod.fst) (by rw [List.length_map, hp0Len, hc0fLen]) huP0)
       (hwfLeaf ps1After0 (by rw [h1Len', List.length_map, hp1Len, hc1fLen]) h1Unprot')
 
-private theorem c1_slice_disjoint_splitAtMut_sound
+private theorem a3_splitAtMut_retags
     (data : List (Gen.AbstractByte Gen.TreeBorrowsProvenance)) (addr : Int) (align : Nat)
     (off1 len1 off2 len2 : Nat)
     (hlen1 : 0 < len1) (hlen2 : 0 < len2)
     (hdisj : off1 + len1 ≤ off2) (hbound : off2 + len2 ≤ data.length)
-    (wBytes1 wBytes2 : List (Gen.AbstractByte Gen.TreeBorrowsProvenance))
-    (hw1 : wBytes1.length = len1) (hw2 : wBytes2.length = len2)
     (al1 al2 : Nat)
-    (hal1 : Align.is_aligned ⟨al1⟩ (addr + (off1 : Int)) = true)
-    (hal2 : Align.is_aligned ⟨al2⟩ (addr + (off2 : Int)) = true)
     (lookup : Gen.ThinPointer Gen.TreeBorrowsProvenance → Interp Gen.VTable)
     (fnIw1 fnIw2 : Bool) :
     let tbm0 : Gen.TreeBorrowsMemory Gen.x86_64 :=
       { params := ⟨true⟩
         mem := { allocations := [mkRootAllocTB data addr align .Stack], _phantom := ⟨⟩ } }
     let p1In : Gen.Pointer Gen.TreeBorrowsProvenance :=
-      { thin_pointer := { addr := addr + (off1 : Int), provenance := some (⟨0⟩, []) },
-        metadata := none }
+      { thin_pointer := { addr := addr + (off1 : Int), provenance := some (⟨0⟩, []) }, metadata := none }
     let p2In : Gen.Pointer Gen.TreeBorrowsProvenance :=
-      { thin_pointer := { addr := addr + (off2 : Int), provenance := some (⟨0⟩, []) },
-        metadata := none }
-    ∃ tbm1 tbm2 fe1 fe2 tbm12 tbm21 tbmEndFwd tbmEndRev,
+      { thin_pointer := { addr := addr + (off2 : Int), provenance := some (⟨0⟩, []) }, metadata := none }
+    let p1After : Gen.Permission := if fnIw1 then .Prot .Unique else .Prot (.Reserved true false)
+    let p2After : Gen.Permission := if fnIw2 then .Prot .Unique else .Prot (.Reserved true false)
+    let p0Out2 : Gen.Permission := if fnIw2 then .Prot .Disabled else .Prot (.Reserved false true)
+    ∃ tbm1 c0ps2 c1ps2,
+      let tbm2 : Gen.TreeBorrowsMemory Gen.x86_64 :=
+        { params := ⟨true⟩, mem := { allocations := [{ mkRootAllocTB data addr align .Stack with
+            extra := { root := ⟨[⟨[], c0ps2, .Strong⟩, ⟨[], c1ps2, .Strong⟩],
+              List.replicate data.length (.Unprot .Unique), .No⟩ } }], _phantom := ⟨⟩ } }
       TreeBorrowsMemory.retag_ptr tbm0 TreeBorrowsMemory.new_call p1In
           (.Ref .Mutable (slicePointeeInfoMR len1 al1)) true fnIw1 lookup =
         .ok ({ thin_pointer := { addr := addr + (off1 : Int), provenance := some (⟨0⟩, [0]) },
-               metadata := none }, tbm1, fe1) ∧
-      TreeBorrowsMemory.retag_ptr tbm1 fe1 p2In
+               metadata := none }, tbm1, { protectors := [(⟨0⟩, [0])] }) ∧
+      TreeBorrowsMemory.retag_ptr tbm1 { protectors := [(⟨0⟩, [0])] } p2In
           (.Ref .Mutable (slicePointeeInfoMR len2 al2)) true fnIw2 lookup =
         .ok ({ thin_pointer := { addr := addr + (off2 : Int), provenance := some (⟨0⟩, [1]) },
-               metadata := none }, tbm2, fe2) ∧
-      fe2 = { protectors := [(⟨0⟩, [0]), (⟨0⟩, [1])] } ∧
+               metadata := none }, tbm2, { protectors := [(⟨0⟩, [0]), (⟨0⟩, [1])] }) ∧
       TreeBorrowsMemory.wfLive tbm2 ∧
-      (TreeBorrowsMemory.store tbm2
-          { addr := addr + (off1 : Int), provenance := some (⟨0⟩, [0]) } wBytes1 ⟨al1⟩ >>=
-        fun t => TreeBorrowsMemory.store t
-          { addr := addr + (off2 : Int), provenance := some (⟨0⟩, [1]) } wBytes2 ⟨al2⟩) =
-        .ok tbm12 ∧
-      (TreeBorrowsMemory.store tbm2
-          { addr := addr + (off2 : Int), provenance := some (⟨0⟩, [1]) } wBytes2 ⟨al2⟩ >>=
-        fun t => TreeBorrowsMemory.store t
-          { addr := addr + (off1 : Int), provenance := some (⟨0⟩, [0]) } wBytes1 ⟨al1⟩) =
-        .ok tbm21 ∧
-      tbmRootOf tbm12 0 = tbmRootOf tbm21 0 ∧
-      TreeBorrowsMemory.end_call tbm12 fe2 = .ok tbmEndFwd ∧
-      TreeBorrowsMemory.wfLive tbmEndFwd ∧
-      TreeBorrowsMemory.end_call tbm12 { protectors := fe2.protectors.reverse } = .ok tbmEndRev ∧
-      TreeBorrowsMemory.wfLive tbmEndRev := by
+      c0ps2.length = data.length ∧ c1ps2.length = data.length ∧
+      (∀ b, b < data.length →
+        c0ps2[b]? = some (if off1 ≤ b ∧ b < off1 + len1 then p1After
+          else if off2 ≤ b ∧ b < off2 + len2 then p0Out2 else .Prot (.Reserved false false))) ∧
+      (∀ b, b < data.length →
+        c1ps2[b]? = some (if off2 ≤ b ∧ b < off2 + len2 then p2After
+          else .Prot (.Reserved false false))) := by
   dsimp only
   have hwf0 : TreeBorrowsMemory.wfLive
       ({ params := ⟨true⟩, mem := { allocations := [mkRootAllocTB data addr align .Stack], _phantom := ⟨⟩ } } : Gen.TreeBorrowsMemory Gen.x86_64) := by
@@ -12853,6 +13624,69 @@ private theorem c1_slice_disjoint_splitAtMut_sound
     dsimp only [p2Init, c1Perms0] at hinitRun2
     rw [hinitRun2]; rfl
   have hwf2 : TreeBorrowsMemory.wfLive tbm2 := TreeBorrowsMemory.retag_ptr_wfLive hwf1 hretag2
+  exact ⟨_, c0ps2, c1ps2, hretag1, hretag2, hwf2, hc0Len2, hc1Len2, hc0Get2,
+    fun b hb => by rw [hc1Get2 b hb]; by_cases h : off2 ≤ b ∧ b < off2 + len2 <;> simp [h, p2After]⟩
+
+private theorem a3_splitAtMut_stores
+    (data : List (Gen.AbstractByte Gen.TreeBorrowsProvenance)) (addr : Int) (align : Nat)
+    (off1 len1 off2 len2 : Nat)
+    (hlen1 : 0 < len1) (hlen2 : 0 < len2)
+    (hdisj : off1 + len1 ≤ off2) (hbound : off2 + len2 ≤ data.length)
+    (wBytes1 wBytes2 : List (Gen.AbstractByte Gen.TreeBorrowsProvenance))
+    (hw1 : wBytes1.length = len1) (hw2 : wBytes2.length = len2)
+    (al1 al2 : Nat)
+    (hal1 : Align.is_aligned ⟨al1⟩ (addr + (off1 : Int)) = true)
+    (hal2 : Align.is_aligned ⟨al2⟩ (addr + (off2 : Int)) = true)
+    (fnIw1 fnIw2 : Bool)
+    (c0ps2 c1ps2 : List Gen.Permission)
+    (hc0Len2 : c0ps2.length = data.length) (hc1Len2 : c1ps2.length = data.length)
+    (hc0Get2 : ∀ b, b < data.length →
+      c0ps2[b]? = some (if off1 ≤ b ∧ b < off1 + len1 then
+          (if fnIw1 then .Prot .Unique else .Prot (.Reserved true false))
+        else if off2 ≤ b ∧ b < off2 + len2 then
+          (if fnIw2 then .Prot .Disabled else .Prot (.Reserved false true))
+        else .Prot (.Reserved false false)))
+    (hc1Get2 : ∀ b, b < data.length →
+      c1ps2[b]? = some (if off2 ≤ b ∧ b < off2 + len2 then
+          (if fnIw2 then .Prot .Unique else .Prot (.Reserved true false))
+        else .Prot (.Reserved false false))) :
+    let tbm2 : Gen.TreeBorrowsMemory Gen.x86_64 :=
+      { params := ⟨true⟩, mem := { allocations := [{ mkRootAllocTB data addr align .Stack with
+          extra := { root := ⟨[⟨[], c0ps2, .Strong⟩, ⟨[], c1ps2, .Strong⟩],
+            List.replicate data.length (.Unprot .Unique), .No⟩ } }], _phantom := ⟨⟩ } }
+    let data1 := data.take off1 ++ wBytes1 ++ data.drop (off1 + len1)
+    let data12 := data1.take off2 ++ wBytes2 ++ data1.drop (off2 + len2)
+    ∃ c0f c1f tbm21,
+      let rootF : Gen.Node := ⟨[⟨[], c0f, .Strong⟩, ⟨[], c1f, .Strong⟩],
+        List.replicate data.length (.Unprot .Unique), .No⟩
+      let tbm12 : Gen.TreeBorrowsMemory Gen.x86_64 :=
+        { params := ⟨true⟩, mem := { allocations := [{
+            mkRootAllocTB data12 addr align .Stack with extra := { root := rootF } }], _phantom := ⟨⟩ } }
+      data12.length = data.length ∧
+      c0f.length = data.length ∧ c1f.length = data.length ∧
+      (∀ b, b < data.length →
+        c0f[b]? = some (if off1 ≤ b ∧ b < off1 + len1 then .Prot .Unique
+          else if off2 ≤ b ∧ b < off2 + len2 then .Prot .Disabled else .Prot (.Reserved false false))) ∧
+      (∀ b, b < data.length →
+        c1f[b]? = some (if off1 ≤ b ∧ b < off1 + len1 then .Prot .Disabled
+          else if off2 ≤ b ∧ b < off2 + len2 then .Prot .Unique else .Prot (.Reserved false false))) ∧
+      (TreeBorrowsMemory.store tbm2
+          { addr := addr + (off1 : Int), provenance := some (⟨0⟩, [0]) } wBytes1 ⟨al1⟩ >>=
+        fun t => TreeBorrowsMemory.store t
+          { addr := addr + (off2 : Int), provenance := some (⟨0⟩, [1]) } wBytes2 ⟨al2⟩) = .ok tbm12 ∧
+      (TreeBorrowsMemory.store tbm2
+          { addr := addr + (off2 : Int), provenance := some (⟨0⟩, [1]) } wBytes2 ⟨al2⟩ >>=
+        fun t => TreeBorrowsMemory.store t
+          { addr := addr + (off1 : Int), provenance := some (⟨0⟩, [0]) } wBytes1 ⟨al1⟩) = .ok tbm21 ∧
+      tbmRootOf tbm12 0 = tbmRootOf tbm21 0 := by
+  dsimp only
+  let p1After : Gen.Permission := if fnIw1 then .Prot .Unique else .Prot (.Reserved true false)
+  let p2After : Gen.Permission := if fnIw2 then .Prot .Unique else .Prot (.Reserved true false)
+  let p0Out2 : Gen.Permission := if fnIw2 then .Prot .Disabled else .Prot (.Reserved false true)
+  let tbm2 : Gen.TreeBorrowsMemory Gen.x86_64 :=
+    { params := ⟨true⟩, mem := { allocations := [{ mkRootAllocTB data addr align .Stack with
+        extra := { root := ⟨[⟨[], c0ps2, .Strong⟩, ⟨[], c1ps2, .Strong⟩],
+          List.replicate data.length (.Unprot .Unique), .No⟩ } }], _phantom := ⟨⟩ } }
   -- Step 3: stores on [off1, off1 + len1) via [0] and [off2, off2 + len2) via [1]
   have hp1W : Permission.transition p1After .Write .Local = .ok (.Prot .Unique) := by
     cases fnIw1 <;> rfl
@@ -12902,7 +13736,7 @@ private theorem c1_slice_disjoint_splitAtMut_sound
       rw [hp1W] at htr''; cases htr''; exact hget'
     · rw [hc0o b hout, hc0Get2 b hb]
       have hn1 : ¬ (off1 ≤ b ∧ b < off1 + len1) := fun ⟨_, _⟩ => by omega
-      simp only [hn1, ↓reduceIte]
+      simp only [hn1, ↓reduceIte]; rfl
   have hc1sGet : ∀ b, b < data.length →
       c1s[b]? = some (if off1 ≤ b ∧ b < off1 + len1 then .Prot .Disabled
         else if off2 ≤ b ∧ b < off2 + len2 then p2After else .Prot (.Reserved false false)) := by
@@ -12918,7 +13752,7 @@ private theorem c1_slice_disjoint_splitAtMut_sound
       have hn1 : ¬ (off1 ≤ b ∧ b < off1 + len1) := fun ⟨_, _⟩ => by omega
       simp only [hn1, ↓reduceIte]
       by_cases h2 : off2 ≤ b ∧ b < off2 + len2
-      · simp only [h2, and_self, ↓reduceIte]
+      · simp only [h2, and_self, ↓reduceIte]; rfl
       · simp only [h2, ↓reduceIte]
   have hrootW2 : Node.transitionRange .Local .Write off2 len2
       (List.replicate data.length (.Unprot .Unique)) =
@@ -13047,26 +13881,87 @@ private theorem c1_slice_disjoint_splitAtMut_sound
       off1 rfl rfl rfl hal1 (by show addr + (off1 : Int) - addr = (off1 : Int); omega)
       (by omega) (by show off1 + wBytes1.length ≤ data2.length; rw [hdata2Len]; omega)
     rw [heq, hw1, haccRev2]; rfl
-  -- Step 4: end_call in both orders via c1_slice_disjoint_splitAtMut_endCalls!
+  refine ⟨c0f, c1f, tbm21, hdata12Len, by rw [hc0l2, hc0l, hc0Len2], by rw [hc1l2, hc1l, hc1Len2],
+    hc0fGet, hc1fGet, ?_, ?_, rfl⟩
+  · rw [hstore1]; exact hstore12
+  · rw [hstore2]; exact hstore21
+
+private theorem c1_slice_disjoint_splitAtMut_sound
+    (data : List (Gen.AbstractByte Gen.TreeBorrowsProvenance)) (addr : Int) (align : Nat)
+    (off1 len1 off2 len2 : Nat)
+    (hlen1 : 0 < len1) (hlen2 : 0 < len2)
+    (hdisj : off1 + len1 ≤ off2) (hbound : off2 + len2 ≤ data.length)
+    (wBytes1 wBytes2 : List (Gen.AbstractByte Gen.TreeBorrowsProvenance))
+    (hw1 : wBytes1.length = len1) (hw2 : wBytes2.length = len2)
+    (al1 al2 : Nat)
+    (hal1 : Align.is_aligned ⟨al1⟩ (addr + (off1 : Int)) = true)
+    (hal2 : Align.is_aligned ⟨al2⟩ (addr + (off2 : Int)) = true)
+    (lookup : Gen.ThinPointer Gen.TreeBorrowsProvenance → Interp Gen.VTable)
+    (fnIw1 fnIw2 : Bool) :
+    let tbm0 : Gen.TreeBorrowsMemory Gen.x86_64 :=
+      { params := ⟨true⟩
+        mem := { allocations := [mkRootAllocTB data addr align .Stack], _phantom := ⟨⟩ } }
+    let p1In : Gen.Pointer Gen.TreeBorrowsProvenance :=
+      { thin_pointer := { addr := addr + (off1 : Int), provenance := some (⟨0⟩, []) },
+        metadata := none }
+    let p2In : Gen.Pointer Gen.TreeBorrowsProvenance :=
+      { thin_pointer := { addr := addr + (off2 : Int), provenance := some (⟨0⟩, []) },
+        metadata := none }
+    ∃ tbm1 tbm2 fe1 fe2 tbm12 tbm21 tbmEndFwd tbmEndRev,
+      TreeBorrowsMemory.retag_ptr tbm0 TreeBorrowsMemory.new_call p1In
+          (.Ref .Mutable (slicePointeeInfoMR len1 al1)) true fnIw1 lookup =
+        .ok ({ thin_pointer := { addr := addr + (off1 : Int), provenance := some (⟨0⟩, [0]) },
+               metadata := none }, tbm1, fe1) ∧
+      TreeBorrowsMemory.retag_ptr tbm1 fe1 p2In
+          (.Ref .Mutable (slicePointeeInfoMR len2 al2)) true fnIw2 lookup =
+        .ok ({ thin_pointer := { addr := addr + (off2 : Int), provenance := some (⟨0⟩, [1]) },
+               metadata := none }, tbm2, fe2) ∧
+      fe2 = { protectors := [(⟨0⟩, [0]), (⟨0⟩, [1])] } ∧
+      TreeBorrowsMemory.wfLive tbm2 ∧
+      (TreeBorrowsMemory.store tbm2
+          { addr := addr + (off1 : Int), provenance := some (⟨0⟩, [0]) } wBytes1 ⟨al1⟩ >>=
+        fun t => TreeBorrowsMemory.store t
+          { addr := addr + (off2 : Int), provenance := some (⟨0⟩, [1]) } wBytes2 ⟨al2⟩) =
+        .ok tbm12 ∧
+      (TreeBorrowsMemory.store tbm2
+          { addr := addr + (off2 : Int), provenance := some (⟨0⟩, [1]) } wBytes2 ⟨al2⟩ >>=
+        fun t => TreeBorrowsMemory.store t
+          { addr := addr + (off1 : Int), provenance := some (⟨0⟩, [0]) } wBytes1 ⟨al1⟩) =
+        .ok tbm21 ∧
+      tbmRootOf tbm12 0 = tbmRootOf tbm21 0 ∧
+      TreeBorrowsMemory.end_call tbm12 fe2 = .ok tbmEndFwd ∧
+      TreeBorrowsMemory.wfLive tbmEndFwd ∧
+      TreeBorrowsMemory.end_call tbm12 { protectors := fe2.protectors.reverse } = .ok tbmEndRev ∧
+      TreeBorrowsMemory.wfLive tbmEndRev := by
+  dsimp only
+  obtain ⟨tbm1, c0ps2, c1ps2, hretag1, hretag2, hwf2, hc0Len2, hc1Len2, hc0Get2, hc1Get2⟩ :=
+    a3_splitAtMut_retags data addr align off1 len1 off2 len2 hlen1 hlen2 hdisj hbound al1 al2 lookup fnIw1 fnIw2
+  obtain ⟨c0f, c1f, tbm21, hdata12Len, hc0fLen, hc1fLen, hc0fGet, hc1fGet, hst12, hst21, hcomm⟩ :=
+    a3_splitAtMut_stores data addr align off1 len1 off2 len2 hlen1 hlen2 hdisj hbound wBytes1 wBytes2
+      hw1 hw2 al1 al2 hal1 hal2 fnIw1 fnIw2 c0ps2 c1ps2 hc0Len2 hc1Len2 hc0Get2 hc1Get2
+  let data1 := data.take off1 ++ wBytes1 ++ data.drop (off1 + len1)
+  let data12 := data1.take off2 ++ wBytes2 ++ data1.drop (off2 + len2)
   obtain ⟨tbmEndFwd, tbmEndRev, hEndFwd, hwfFwd, hEndRev, hwfRev⟩ :=
     c1_slice_disjoint_splitAtMut_endCalls data12 addr align off1 len1 off2 len2 hdisj
       (by rw [hdata12Len]; exact hbound) c0f c1f
-      (by rw [hc0l2, hc0l, hc0Len2, hdata12Len])
-      (by rw [hc1l2, hc1l, hc1Len2, hdata12Len])
+      (by rw [hc0fLen, hdata12Len]) (by rw [hc1fLen, hdata12Len])
       (fun b hb => hc0fGet b (by rw [← hdata12Len]; exact hb))
       (fun b hb => hc1fGet b (by rw [← hdata12Len]; exact hb))
+  let tbm12 : Gen.TreeBorrowsMemory Gen.x86_64 :=
+    { params := ⟨true⟩, mem := { allocations := [{
+        mkRootAllocTB data12 addr align .Stack with
+        extra := { root := ⟨[⟨[], c0f, .Strong⟩, ⟨[], c1f, .Strong⟩],
+          List.replicate data.length (.Unprot .Unique), .No⟩ } }], _phantom := ⟨⟩ } }
   have htbm12Eq : tbm12 =
       { params := ⟨true⟩, mem := { allocations := [{
           mkRootAllocTB data12 addr align .Stack with
           extra := { root := ⟨[⟨[], c0f, .Strong⟩, ⟨[], c1f, .Strong⟩],
             List.replicate data12.length (.Unprot .Unique), .No⟩ } }], _phantom := ⟨⟩ } } := by
-    simp only [tbm12, rootF, hdata12Len]
+    simp only [tbm12, data12, data1, hdata12Len]
   rw [← htbm12Eq] at hEndFwd hEndRev
-  refine ⟨_, tbm2, { protectors := [(⟨0⟩, [0])] }, { protectors := [(⟨0⟩, [0]), (⟨0⟩, [1])] },
+  exact ⟨tbm1, _, { protectors := [(⟨0⟩, [0])] }, { protectors := [(⟨0⟩, [0]), (⟨0⟩, [1])] },
     tbm12, tbm21, tbmEndFwd, tbmEndRev,
-    hretag1, hretag2, rfl, hwf2, ?_, ?_, rfl, hEndFwd, hwfFwd, hEndRev, hwfRev⟩
-  · rw [hstore1]; exact hstore12
-  · rw [hstore2]; exact hstore21
+    hretag1, hretag2, rfl, hwf2, hst12, hst21, hcomm, hEndFwd, hwfFwd, hEndRev, hwfRev⟩
 
 private theorem c1_slice_getMut_perByte_refinement
     (data : List (Gen.AbstractByte Gen.TreeBorrowsProvenance)) (addr : Int) (align : Nat)
@@ -13671,72 +14566,6 @@ theorem tbm_slice_disjoint_getMut_sound
    c1_slice_getMut_perByte_refinement data addr align off1 len1 off2 len2
       hlen1 hlen2 hdisj hbound wBytes2 hw2 al1 al2 hal1 hal2 lookup⟩
 
-/-- **Foreign-passive byte permissions**: permissions on a byte OUTSIDE a node's
-inside range (`ReborrowSettings.outside`) that survive EVERY foreign read AND
-every foreign write without UB, and are closed under foreign transitions. -/
-def permIsForeignPassive : Gen.Permission → Bool
-  | .Unprot _ => true
-  | .Prot (.Reserved false _) => true
-  | .Prot (.Frozen false) => true
-  | .Prot .Cell => true
-  | .Prot .Disabled => true
-  | _ => false
-
-/-- `permIsForeignPassive` is closed under ALL foreign reads and foreign
-writes (never raises UB). -/
-theorem permission_isForeignPassive_preserved (p : Gen.Permission) (k : Gen.AccessKind)
-    (hp : permIsForeignPassive p = true) :
-    ∃ p', Permission.transition p k .Foreign = .ok p' ∧ permIsForeignPassive p' = true := by
-  cases p with
-  | Unprot u =>
-    cases u <;> cases k <;> exact ⟨_, rfl, rfl⟩
-  | Prot pp =>
-    cases pp with
-    | Unique => cases hp
-    | Reserved hlr hfr =>
-      cases hlr with
-      | true => cases hp
-      | false => cases hfr <;> cases k <;> exact ⟨_, rfl, rfl⟩
-    | Frozen hlr =>
-      cases hlr with
-      | true => cases hp
-      | false => cases k <;> exact ⟨_, rfl, rfl⟩
-    | Cell => cases k <;> exact ⟨_, rfl, rfl⟩
-    | Disabled => cases k <;> exact ⟨_, rfl, rfl⟩
-
-/-- **Multi-range whole-tree relational invariant (`TreeSimInvMulti`)**: strictly
-generalizes `TreeSimInv` by removing the universal `overlap` restriction (which
-makes `TreeSimInv` unsatisfiable on multi-slice borrow trees with disjoint
-sub-slices such as `disjointTwoParamWorld` / `<[T]>::split_at_mut`).
-- Every Anneal node whose range overlaps `[off, off + len)` satisfies the exact
-  window relation `NodeWindowRel`.
-- Every Anneal node whose range is **disjoint** from `[off, off + len)` carries
-  foreign-passive permissions (`permIsForeignPassive = true`, matching
-  MiniRust's `ReborrowSettings.outside`) on `[off, off + len)`. -/
-structure TreeSimInvMulti (off len : Nat) (emb : Nat → Gen.Path) (w : FnEntryBorrowWorld)
-    (t : Gen.Node) : Prop where
-  nodes : ∀ n ∈ w.nodes, ∃ m, nodeAt t (emb n.tag) = some m ∧
-    if rangesOverlap off len n.rangeOffset n.rangeLen = true then
-      NodeWindowRel w.activeProtectors off len n m
-    else
-      Protected.yes m.«protected» = n.isProtected w.activeProtectors ∧
-      ∀ b, off ≤ b → b < off + len → ∃ p, m.permissions[b]? = some p ∧ permIsForeignPassive p = true
-  surj : ∀ q m, nodeAt t q = some m → ∃ n ∈ w.nodes, emb n.tag = q
-  noProtIM : ∀ n ∈ w.nodes, n.isProtected w.activeProtectors = true → n.perm ≠ .reservedIM
-  protUniqAcc : ∀ n ∈ w.nodes, n.isProtected w.activeProtectors = true →
-    n.perm = .unique → n.accessed = true
-
-/-- `TreeSimInvMulti` strictly generalizes `TreeSimInv`. -/
-theorem treeSimInvMulti_of_treeSimInv (off len : Nat) (emb : Nat → Gen.Path)
-    (w : FnEntryBorrowWorld) (t : Gen.Node) (h : TreeSimInv off len emb w t) :
-    TreeSimInvMulti off len emb w t where
-  nodes := fun n hn => by
-    obtain ⟨m, hm, hrel⟩ := h.nodes n hn
-    exact ⟨m, hm, by rw [h.overlap n hn]; exact hrel⟩
-  surj := h.surj
-  noProtIM := h.noProtIM
-  protUniqAcc := h.protUniqAcc
-
 /-- Computable checker for `TreeSimInvMulti`. -/
 def treeSimInvMultiBool (off len : Nat) (emb : Nat → Gen.Path) (w : FnEntryBorrowWorld)
     (t : Gen.Node) : Bool :=
@@ -13820,386 +14649,6 @@ theorem treeSimInvMulti_of_bool (off len : Nat) (emb : Nat → Gen.Path)
     rcases h2.2 with hne | hacc
     · exact absurd huniq (of_decide_eq_true hne)
     · exact hacc
-
-private def c1_NodeStepSimMulti (ap : List Nat) (off len : Nat) (k : Gen.AccessKind)
-    (step : Bool → TreeTagNode → Except RetagStepErr TreeTagNode) (n : TreeTagNode) : Prop :=
-  (rangesOverlap off len n.rangeOffset n.rangeLen = true →
-    ∀ isLocal, ∃ p,
-      permToMiniRust (n.isProtected ap) n.accessed n.perm = some p ∧
-      (∀ n', step isLocal n = .ok n' →
-        n'.tag = n.tag ∧ n'.isProtected ap = n.isProtected ap ∧
-        n'.rangeOffset = n.rangeOffset ∧ n'.rangeLen = n.rangeLen ∧
-        (n'.isProtected ap = true → n'.perm ≠ .reservedIM) ∧
-        (n'.isProtected ap = true → n'.perm = .unique → n'.accessed = true) ∧
-        ∃ p', Permission.transition p k (nodeRelToMiniRust isLocal) = .ok p' ∧
-          permToMiniRust (n.isProtected ap) n'.accessed n'.perm = some p') ∧
-      (∀ e, step isLocal n = .error e →
-        ∃ msg, Permission.transition p k (nodeRelToMiniRust isLocal) = .error (.ub msg))) ∧
-  (rangesOverlap off len n.rangeOffset n.rangeLen = false →
-    ∀ isLocal, step isLocal n = .ok n)
-
-private theorem c1_tree_sim_multi_core
-    (k : Gen.AccessKind) (isWrite : Bool)
-    (step : Bool → TreeTagNode → Except RetagStepErr TreeTagNode)
-    (off len : Nat) (hlen : 0 < len) (emb : Nat → Gen.Path)
-    (w : FnEntryBorrowWorld) (t : Gen.Node) (tag : Nat)
-    (hinv : TreeSimInvMulti off len emb w t)
-    (hstep : ∀ n ∈ w.nodes, c1_NodeStepSimMulti w.activeProtectors off len k step n)
-    (hloc : ∀ n ∈ w.nodes,
-      (ancestorPathTags w.nodes tag).contains n.tag = locOf (some (emb tag)) (emb n.tag))
-    (hancOv : ∀ n ∈ w.nodes,
-      (ancestorPathTags w.nodes tag).contains n.tag = true →
-      rangesOverlap off len n.rangeOffset n.rangeLen = true)
-    (hnoprune : ∀ n ∈ w.nodes,
-      isPrunedForeignNode w.nodes (ancestorPathTags w.nodes tag) isWrite off len n = true →
-      step false n = .ok n) :
-    (∀ nodes', ListRel (PrunedStepRel w tag isWrite off len step) w.nodes nodes' →
-      ∃ t', Node.access t (some (emb tag)) k ⟨off⟩ ⟨len⟩ = .ok t' ∧
-        TreeSimInvMulti off len emb { w with nodes := nodes' } t') ∧
-    ((∀ nodes', ¬ ListRel (PrunedStepRel w tag isWrite off len step) w.nodes nodes') →
-      ∃ msg, Node.access t (some (emb tag)) k ⟨off⟩ ⟨len⟩ = .error (.ub msg)) := by
-  have hpr : ∀ n ∈ w.nodes, ∀ n', PrunedStepRel w tag isWrite off len step n n' →
-      step (locOf (some (emb tag)) (emb n.tag)) n = .ok n' := by
-    intro n hn n' hrel
-    rcases hrel with ⟨hc, hs⟩ | ⟨hc, hp, hEq⟩ | ⟨hc, _, hs⟩
-    · rw [← hloc n hn, hc]; exact hs
-    · rw [← hloc n hn, hc, hEq]; exact hnoprune n hn hp
-    · rw [← hloc n hn, hc]; exact hs
-  have hrp : ∀ n ∈ w.nodes, ∀ n', step (locOf (some (emb tag)) (emb n.tag)) n = .ok n' →
-      PrunedStepRel w tag isWrite off len step n n' := by
-    intro n hn n' hs
-    cases hl : locOf (some (emb tag)) (emb n.tag) with
-    | true => rw [hl] at hs; exact Or.inl ⟨by rw [hloc n hn, hl], hs⟩
-    | false =>
-      rw [hl] at hs
-      cases hp : isPrunedForeignNode w.nodes (ancestorPathTags w.nodes tag) isWrite off len n with
-      | false => exact Or.inr (Or.inr ⟨by rw [hloc n hn, hl], hp, hs⟩)
-      | true =>
-        rw [hnoprune n hn hp] at hs
-        cases hs
-        exact Or.inr (Or.inl ⟨by rw [hloc n hn, hl], hp, rfl⟩)
-  have hdisjForeign : ∀ n ∈ w.nodes, rangesOverlap off len n.rangeOffset n.rangeLen = false →
-      locRel (some (emb tag)) (emb n.tag) = .Foreign := by
-    intro n hn hdisj
-    unfold locRel
-    cases hl : locOf (some (emb tag)) (emb n.tag) with
-    | false => rfl
-    | true =>
-      have hanc : (ancestorPathTags w.nodes tag).contains n.tag = true := by rw [hloc n hn, hl]
-      have hov := hancOv n hn hanc
-      rw [hov] at hdisj; cases hdisj
-  have hmr : ∀ q m, nodeAt t q = some m → ∃ n ∈ w.nodes, emb n.tag = q ∧
-      (if rangesOverlap off len n.rangeOffset n.rangeLen = true then
-        NodeWindowRel w.activeProtectors off len n m
-       else
-        Protected.yes m.«protected» = n.isProtected w.activeProtectors ∧
-        ∀ b, off ≤ b → b < off + len → ∃ p, m.permissions[b]? = some p ∧ permIsForeignPassive p = true) := by
-    intro q m hq
-    obtain ⟨n, hn, hemb⟩ := hinv.surj q m hq
-    obtain ⟨m', hm', hrel⟩ := hinv.nodes n hn
-    rw [hemb, hq] at hm'; cases hm'
-    exact ⟨n, hn, hemb, hrel⟩
-  have hrelNode : ∀ (isLocal : Bool), nodeRelToMiniRust isLocal =
-      (if isLocal then Gen.NodeRelation.Local else .Foreign) := fun _ => rfl
-  constructor
-  · intro nodes' hrel
-    have hpoint : ∀ q m, nodeAt t q = some m →
-        ∃ ps', Node.transitionRange (locRel (some (emb tag)) q) k off len m.permissions =
-          .ok ps' := by
-      intro q m hq
-      obtain ⟨n, hn, hemb, hnod⟩ := hmr q m hq
-      cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
-      | true =>
-        simp only [hov, ↓reduceIte] at hnod
-        obtain ⟨_, p, hp, hwin⟩ := hnod
-        obtain ⟨n', _, hnn'⟩ := hrel.exists_of_mem_left hn
-        have hs := hpr n hn n' hnn'
-        obtain ⟨p0, hp0, hok, _⟩ := (hstep n hn).1 hov (locOf (some (emb tag)) (emb n.tag))
-        rw [hp] at hp0; cases hp0
-        obtain ⟨_, _, _, _, _, _, p', htr, _⟩ := hok n' hs
-        rw [hemb] at htr
-        obtain ⟨ps', hrun, _⟩ := transitionRange_ok_of_pointwise
-          (locRel (some (emb tag)) q) k len off m.permissions
-          (fun b h1 h2 => ⟨p, p', hwin b h1 h2, htr⟩)
-        exact ⟨ps', hrun⟩
-      | false =>
-        simp only [hov, Bool.false_eq_true, ↓reduceIte] at hnod
-        have hfor := hdisjForeign n hn hov
-        rw [hemb] at hfor
-        rw [hfor]
-        obtain ⟨ps', hrun, _⟩ := transitionRange_ok_of_pointwise .Foreign k len off m.permissions
-          (fun b h1 h2 => by
-            obtain ⟨p, hpb, hpas⟩ := hnod.2 b h1 h2
-            obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p k hpas
-            exact ⟨p, p', hpb, htr⟩)
-        exact ⟨ps', hrun⟩
-    obtain ⟨t', hacc, hpost⟩ :=
-      node_access_ok_of_pointwise k off len t (some (emb tag)) hpoint
-    refine ⟨t', hacc, ?_⟩
-    have hnode : ∀ n' ∈ nodes', ∃ n ∈ w.nodes, n'.tag = n.tag ∧
-        n'.rangeOffset = n.rangeOffset ∧ n'.rangeLen = n.rangeLen ∧
-        (n'.isProtected w.activeProtectors = true → n'.perm ≠ .reservedIM) ∧
-        (n'.isProtected w.activeProtectors = true → n'.perm = .unique → n'.accessed = true) ∧
-        ∃ m', nodeAt t' (emb n'.tag) = some m' ∧
-          if rangesOverlap off len n'.rangeOffset n'.rangeLen = true then
-            NodeWindowRel w.activeProtectors off len n' m'
-          else
-            Protected.yes m'.«protected» = n'.isProtected w.activeProtectors ∧
-            ∀ b, off ≤ b → b < off + len → ∃ p, m'.permissions[b]? = some p ∧ permIsForeignPassive p = true := by
-      intro n' hn'
-      obtain ⟨n, hn, hnn'⟩ := hrel.exists_of_mem_right hn'
-      have hs := hpr n hn n' hnn'
-      obtain ⟨m, hm, hnod⟩ := hinv.nodes n hn
-      obtain ⟨m', hm', hprot', hrun⟩ := (hpost (emb n.tag)).1 m hm
-      cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
-      | true =>
-        simp only [hov, ↓reduceIte] at hnod
-        obtain ⟨hprotm, p, hp, hwin⟩ := hnod
-        obtain ⟨p0, hp0, hok, _⟩ := (hstep n hn).1 hov (locOf (some (emb tag)) (emb n.tag))
-        rw [hp] at hp0; cases hp0
-        obtain ⟨htag, hpe, hro, hrl, hIM, hUA, p', htr, hp'⟩ := hok n' hs
-        refine ⟨n, hn, htag, hro, hrl, hIM, hUA, m', by rw [htag]; exact hm', ?_⟩
-        rw [hro, hrl]
-        simp only [hov, ↓reduceIte]
-        refine ⟨by rw [hprot', hprotm, hpe], p', by rw [hpe]; exact hp', fun b h1 h2 => ?_⟩
-        obtain ⟨ps', hrun', _, _, hin⟩ := transitionRange_ok_of_pointwise
-          (locRel (some (emb tag)) (emb n.tag)) k len off m.permissions
-          (fun b h1 h2 => ⟨p, p', hwin b h1 h2, htr⟩)
-        rw [hrun] at hrun'; cases hrun'
-        obtain ⟨p'', htr'', hget⟩ := hin b h1 h2 p (hwin b h1 h2)
-        have htr2 : Permission.transition p k (locRel (some (emb tag)) (emb n.tag)) = .ok p' := htr
-        rw [htr2] at htr''; cases htr''
-        exact hget
-      | false =>
-        simp only [hov, Bool.false_eq_true, ↓reduceIte] at hnod
-        have hstay := (hstep n hn).2 hov (locOf (some (emb tag)) (emb n.tag))
-        rw [hstay] at hs
-        have hneq : n' = n := by cases hs; rfl
-        subst hneq
-        have hfor := hdisjForeign n' hn hov
-        rw [hfor] at hrun
-        obtain ⟨_, _, hin⟩ := c1_transitionRange_ok_full .Foreign k off len m.permissions
-          m'.permissions hrun
-        refine ⟨n', hn, rfl, rfl, rfl, hinv.noProtIM n' hn, hinv.protUniqAcc n' hn, m', hm', ?_⟩
-        simp only [hov, Bool.false_eq_true, ↓reduceIte]
-        refine ⟨by rw [hprot', hnod.1], fun b h1 h2 => ?_⟩
-        obtain ⟨p, hpb, hpas⟩ := hnod.2 b h1 h2
-        obtain ⟨p0, p', hp0, htr, hp'⟩ := hin b h1 h2
-        rw [hpb] at hp0; cases hp0
-        obtain ⟨p'', htr'', hpas'⟩ := permission_isForeignPassive_preserved p k hpas
-        rw [htr] at htr''; cases htr''
-        exact ⟨p', hp', hpas'⟩
-    refine ⟨?_, ?_, ?_, ?_⟩
-    · intro n' hn'
-      obtain ⟨_, _, _, _, _, _, _, m', hm', hrel'⟩ := hnode n' hn'
-      exact ⟨m', hm', hrel'⟩
-    · intro q m' hq'
-      cases hq : nodeAt t q with
-      | none => rw [(hpost q).2 hq] at hq'; cases hq'
-      | some m =>
-        obtain ⟨n, hn, hemb⟩ := hinv.surj q m hq
-        obtain ⟨n', hn', hnn'⟩ := hrel.exists_of_mem_left hn
-        have hs := hpr n hn n' hnn'
-        cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
-        | true =>
-          obtain ⟨_, _, hok, _⟩ := (hstep n hn).1 hov (locOf (some (emb tag)) (emb n.tag))
-          obtain ⟨htag, _⟩ := hok n' hs
-          exact ⟨n', hn', by rw [htag]; exact hemb⟩
-        | false =>
-          have hstay := (hstep n hn).2 hov (locOf (some (emb tag)) (emb n.tag))
-          rw [hstay] at hs
-          have hneq : n' = n := by cases hs; rfl
-          subst hneq
-          exact ⟨n', hn', hemb⟩
-    · intro n' hn'; obtain ⟨_, _, _, _, _, hIM, _⟩ := hnode n' hn'; exact hIM
-    · intro n' hn'; obtain ⟨_, _, _, _, _, _, hUA, _⟩ := hnode n' hn'; exact hUA
-  · intro hno
-    cases hacc : Node.access t (some (emb tag)) k ⟨off⟩ ⟨len⟩ with
-    | ok t' =>
-      exfalso
-      have hall : ∀ n ∈ w.nodes, ∃ n', PrunedStepRel w tag isWrite off len step n n' := by
-        intro n hn
-        cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
-        | false =>
-          exact ⟨n, hrp n hn n ((hstep n hn).2 hov (locOf (some (emb tag)) (emb n.tag)))⟩
-        | true =>
-          obtain ⟨m, hm, hnod⟩ := hinv.nodes n hn
-          simp only [hov, ↓reduceIte] at hnod
-          obtain ⟨_, p, hp, hwin⟩ := hnod
-          obtain ⟨ps', hrun⟩ := node_access_ok_inv k off len t t' (some (emb tag)) hacc
-            (emb n.tag) m hm
-          obtain ⟨q0, q0', hq0, htr0⟩ := transitionRange_ok_inv
-            (locRel (some (emb tag)) (emb n.tag)) k len off m.permissions ps' hrun off
-            (Nat.le_refl _) (by omega)
-          rw [hwin off (Nat.le_refl _) (by omega)] at hq0; cases hq0
-          obtain ⟨p0, hp0, _, herr⟩ := (hstep n hn).1 hov (locOf (some (emb tag)) (emb n.tag))
-          rw [hp] at hp0; cases hp0
-          cases hs : step (locOf (some (emb tag)) (emb n.tag)) n with
-          | ok n' => exact ⟨n', hrp n hn n' hs⟩
-          | error e =>
-            obtain ⟨msg, hmsg⟩ := herr e hs
-            rw [hrelNode] at hmsg
-            have htr0' : Permission.transition p k
-                (if locOf (some (emb tag)) (emb n.tag) then Gen.NodeRelation.Local else .Foreign) =
-                .ok q0' := htr0
-            rw [htr0'] at hmsg; cases hmsg
-      obtain ⟨nodes', hrel⟩ := nwsr_listRel_of_forall w.nodes hall
-      exact hno nodes' hrel
-    | error e =>
-      obtain ⟨q, m, hq, herr⟩ := node_access_error_inv k off len t (some (emb tag)) e hacc
-      obtain ⟨n, _, _, hnod⟩ := hmr q m hq
-      have hlenM : off + len ≤ m.permissions.length := by
-        cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
-        | true =>
-          simp only [hov, ↓reduceIte] at hnod
-          obtain ⟨_, p, _, hwin⟩ := hnod
-          have hlast := hwin (off + len - 1) (by omega) (by omega)
-          have hlt := (List.getElem?_eq_some_iff.mp hlast).1
-          omega
-        | false =>
-          simp only [hov, Bool.false_eq_true, ↓reduceIte] at hnod
-          obtain ⟨p, hlast, _⟩ := hnod.2 (off + len - 1) (by omega) (by omega)
-          have hlt := (List.getElem?_eq_some_iff.mp hlast).1
-          omega
-      obtain ⟨msg, hmsg⟩ := transitionRange_error_is_ub (locRel (some (emb tag)) q) k len off
-        m.permissions e hlenM herr
-      exact ⟨msg, by rw [hmsg]⟩
-
-/-- **Multi-range whole-tree READ simulation (`TreeSimInvMulti`)**: generalizes
-`tree_read_simulates_node_access` to multi-slice borrow trees containing disjoint
-sub-slices (e.g., `disjointTwoParamWorld`, `<[T]>::split_at_mut`), requiring only
-that the accessed tag's ancestors overlap `[off, off + len)` (`hancOv`). -/
-theorem tree_read_simulates_node_access_multi
-    (off len : Nat) (hlen : 0 < len) (emb : Nat → Gen.Path)
-    (w : FnEntryBorrowWorld) (t : Gen.Node) (tag : Nat)
-    (hinv : TreeSimInvMulti off len emb w t)
-    (htag : ∃ n, findNode? w.nodes tag = some n)
-    (hloc : ∀ n ∈ w.nodes,
-      (ancestorPathTags w.nodes tag).contains n.tag = locOf (some (emb tag)) (emb n.tag))
-    (hancOv : ∀ n ∈ w.nodes,
-      (ancestorPathTags w.nodes tag).contains n.tag = true →
-      rangesOverlap off len n.rangeOffset n.rangeLen = true)
-    (hnoprune : ∀ n ∈ w.nodes,
-      isPrunedForeignNode w.nodes (ancestorPathTags w.nodes tag) false off len n = true →
-      foreignStepInert w.activeProtectors false off len n = true) :
-    (∀ w', execWorldRangeRead w tag off len = .ok w' →
-      ∃ t', Node.access t (some (emb tag)) .Read ⟨off⟩ ⟨len⟩ = .ok t' ∧
-        TreeSimInvMulti off len emb w' t') ∧
-    (∀ e, execWorldRangeRead w tag off len = .error e →
-      ∃ msg, Node.access t (some (emb tag)) .Read ⟨off⟩ ⟨len⟩ = .error (.ub msg)) ∧
-    (∀ t', Node.access t (some (emb tag)) .Read ⟨off⟩ ⟨len⟩ = .ok t' →
-      ∃ w', execWorldRangeRead w tag off len = .ok w' ∧ TreeSimInvMulti off len emb w' t') := by
-  have hne : len ≠ 0 := by omega
-  have hstep : ∀ n ∈ w.nodes, c1_NodeStepSimMulti w.activeProtectors off len .Read
-      (fun isLoc m => stepNodeOnRangeRead w.activeProtectors isLoc off len m) n := by
-    intro n hn
-    refine ⟨fun hov isLocal => ?_, fun hdisj isLocal => ?_⟩
-    · obtain ⟨p, hp, hok, herr⟩ := stepNodeOnRangeRead_simulates_permission_transition
-        w.activeProtectors isLocal off len n hov (hinv.noProtIM n hn) (hinv.protUniqAcc n hn)
-      refine ⟨p, hp, fun n' hn' => ?_, herr⟩
-      obtain ⟨htag', hprot', hro, hrl, hIM', hUA'⟩ := nwsr_stepRead_meta _ isLocal off len n n' hn'
-      have hpe : n'.isProtected w.activeProtectors = n.isProtected w.activeProtectors := by
-        unfold TreeTagNode.isProtected; rw [hprot']
-      exact ⟨htag', hpe, hro, hrl, fun hp' him => hinv.noProtIM n hn (hpe ▸ hp') (hIM' him),
-        hUA' (hinv.protUniqAcc n hn), hok n' hn'⟩
-    · unfold stepNodeOnRangeRead
-      simp only [hdisj, Bool.not_false, ↓reduceIte]
-  obtain ⟨hfwd, hbwd⟩ := c1_tree_sim_multi_core .Read false
-    (fun isLoc m => stepNodeOnRangeRead w.activeProtectors isLoc off len m)
-    off len hlen emb w t tag hinv hstep hloc hancOv
-    (fun n hn hp => nwsr_foreignStepInert_read (hnoprune n hn hp))
-  have h1 : ∀ w', execWorldRangeRead w tag off len = .ok w' →
-      ∃ t', Node.access t (some (emb tag)) .Read ⟨off⟩ ⟨len⟩ = .ok t' ∧
-        TreeSimInvMulti off len emb w' t' := by
-    intro w' hok
-    obtain ⟨_, nodes', hw', hrel⟩ := (execWorldRangeRead_ok_iff w w' tag off len hne).mp hok
-    rw [hw']; exact hfwd nodes' hrel
-  have h2 : ∀ e, execWorldRangeRead w tag off len = .error e →
-      ∃ msg, Node.access t (some (emb tag)) .Read ⟨off⟩ ⟨len⟩ = .error (.ub msg) := by
-    intro e herr
-    apply hbwd
-    intro nodes' hrel
-    have hok := (execWorldRangeRead_ok_iff w { w with nodes := nodes' } tag off len hne).mpr
-      ⟨htag, nodes', rfl, hrel⟩
-    rw [herr] at hok; cases hok
-  refine ⟨h1, h2, ?_⟩
-  intro t' hacc
-  cases hr : execWorldRangeRead w tag off len with
-  | ok w' =>
-    obtain ⟨t'', hacc'', hinv'⟩ := h1 w' hr
-    rw [hacc] at hacc''; cases hacc''
-    exact ⟨w', rfl, hinv'⟩
-  | error e =>
-    obtain ⟨msg, hmsg⟩ := h2 e hr
-    rw [hacc] at hmsg; cases hmsg
-
-/-- **Multi-range whole-tree WRITE simulation (`TreeSimInvMulti`)**: generalizes
-`tree_write_simulates_node_access` to multi-slice borrow trees containing disjoint
-sub-slices. -/
-theorem tree_write_simulates_node_access_multi
-    (off len : Nat) (hlen : 0 < len) (emb : Nat → Gen.Path)
-    (w : FnEntryBorrowWorld) (t : Gen.Node) (tag : Nat)
-    (hinv : TreeSimInvMulti off len emb w t)
-    (hro : w.allocReadOnly = false)
-    (htag : ∃ n, findNode? w.nodes tag = some n)
-    (hloc : ∀ n ∈ w.nodes,
-      (ancestorPathTags w.nodes tag).contains n.tag = locOf (some (emb tag)) (emb n.tag))
-    (hancOv : ∀ n ∈ w.nodes,
-      (ancestorPathTags w.nodes tag).contains n.tag = true →
-      rangesOverlap off len n.rangeOffset n.rangeLen = true)
-    (hnoprune : ∀ n ∈ w.nodes,
-      isPrunedForeignNode w.nodes (ancestorPathTags w.nodes tag) true off len n = true →
-      foreignStepInert w.activeProtectors true off len n = true) :
-    (∀ w', execWorldRangeWrite w tag off len = .ok w' →
-      ∃ t', Node.access t (some (emb tag)) .Write ⟨off⟩ ⟨len⟩ = .ok t' ∧
-        TreeSimInvMulti off len emb w' t') ∧
-    (∀ e, execWorldRangeWrite w tag off len = .error e →
-      ∃ msg, Node.access t (some (emb tag)) .Write ⟨off⟩ ⟨len⟩ = .error (.ub msg)) ∧
-    (∀ t', Node.access t (some (emb tag)) .Write ⟨off⟩ ⟨len⟩ = .ok t' →
-      ∃ w', execWorldRangeWrite w tag off len = .ok w' ∧ TreeSimInvMulti off len emb w' t') := by
-  have hne : len ≠ 0 := by omega
-  have hstep : ∀ n ∈ w.nodes, c1_NodeStepSimMulti w.activeProtectors off len .Write
-      (fun isLoc m => stepNodeOnRangeWrite w.activeProtectors isLoc off len m) n := by
-    intro n hn
-    refine ⟨fun hov isLocal => ?_, fun hdisj isLocal => ?_⟩
-    · obtain ⟨p, hp, hok, herr⟩ := stepNodeOnRangeWrite_simulates_permission_transition
-        w.activeProtectors isLocal off len n hov (hinv.noProtIM n hn) (hinv.protUniqAcc n hn)
-      refine ⟨p, hp, fun n' hn' => ?_, herr⟩
-      obtain ⟨htag', hprot', hro', hrl, hIM', hUA'⟩ := nwsr_stepWrite_meta _ isLocal off len n n' hn'
-      have hpe : n'.isProtected w.activeProtectors = n.isProtected w.activeProtectors := by
-        unfold TreeTagNode.isProtected; rw [hprot']
-      exact ⟨htag', hpe, hro', hrl, fun hp' him => hinv.noProtIM n hn (hpe ▸ hp') (hIM' him),
-        hUA' (hinv.protUniqAcc n hn), hok n' hn'⟩
-    · unfold stepNodeOnRangeWrite
-      simp only [hdisj, Bool.not_false, ↓reduceIte]
-  obtain ⟨hfwd, hbwd⟩ := c1_tree_sim_multi_core .Write true
-    (fun isLoc m => stepNodeOnRangeWrite w.activeProtectors isLoc off len m)
-    off len hlen emb w t tag hinv hstep hloc hancOv
-    (fun n hn hp => nwsr_foreignStepInert_write (hnoprune n hn hp))
-  have h1 : ∀ w', execWorldRangeWrite w tag off len = .ok w' →
-      ∃ t', Node.access t (some (emb tag)) .Write ⟨off⟩ ⟨len⟩ = .ok t' ∧
-        TreeSimInvMulti off len emb w' t' := by
-    intro w' hok
-    obtain ⟨_, _, nodes', hw', hrel⟩ := (execWorldRangeWrite_ok_iff w w' tag off len hne).mp hok
-    rw [hw']; exact hfwd nodes' hrel
-  have h2 : ∀ e, execWorldRangeWrite w tag off len = .error e →
-      ∃ msg, Node.access t (some (emb tag)) .Write ⟨off⟩ ⟨len⟩ = .error (.ub msg) := by
-    intro e herr
-    apply hbwd
-    intro nodes' hrel
-    have hok := (execWorldRangeWrite_ok_iff w { w with nodes := nodes' } tag off len hne).mpr
-      ⟨hro, htag, nodes', rfl, hrel⟩
-    rw [herr] at hok; cases hok
-  refine ⟨h1, h2, ?_⟩
-  intro t' hacc
-  cases hr : execWorldRangeWrite w tag off len with
-  | ok w' =>
-    obtain ⟨t'', hacc'', hinv'⟩ := h1 w' hr
-    rw [hacc] at hacc''; cases hacc''
-    exact ⟨w', rfl, hinv'⟩
-  | error e =>
-    obtain ⟨msg, hmsg⟩ := h2 e hr
-    rw [hacc] at hmsg; cases hmsg
 
 /-- **Lifted multi-range `TreeBorrowsMemory.load` simulation** (`TreeSimInvMulti`). -/
 theorem tbm_load_simulates_execWorldRangeRead_multi
@@ -14347,24 +14796,6 @@ theorem treeSimInvMulti_preserved_on_disjoint_window
     rw [hbytes b (hout2 b h1 h2)]
     exact hnod.2 b h1 h2
 
-private def a2_NodeStepSimMulti (ap : List Nat) (off len : Nat) (k : Gen.AccessKind)
-    (step : Bool → TreeTagNode → Except RetagStepErr TreeTagNode) (n : TreeTagNode) : Prop :=
-  (rangesOverlap off len n.rangeOffset n.rangeLen = true →
-    ∀ isLocal, ∃ p,
-      permToMiniRust (n.isProtected ap) n.accessed n.perm = some p ∧
-      (∀ n', step isLocal n = .ok n' →
-        n'.tag = n.tag ∧ n'.protector = n.protector ∧
-        n'.isProtected ap = n.isProtected ap ∧
-        n'.rangeOffset = n.rangeOffset ∧ n'.rangeLen = n.rangeLen ∧
-        (n'.isProtected ap = true → n'.perm ≠ .reservedIM) ∧
-        (n'.isProtected ap = true → n'.perm = .unique → n'.accessed = true) ∧
-        ∃ p', Permission.transition p k (nodeRelToMiniRust isLocal) = .ok p' ∧
-          permToMiniRust (n.isProtected ap) n'.accessed n'.perm = some p') ∧
-      (∀ e, step isLocal n = .error e →
-        ∃ msg, Permission.transition p k (nodeRelToMiniRust isLocal) = .error (.ub msg))) ∧
-  (rangesOverlap off len n.rangeOffset n.rangeLen = false →
-    ∀ isLocal, step isLocal n = .ok n)
-
 private theorem a2_rangesOverlap_false_of_disjoint {off1 len1 off2 len2 : Nat}
     (hdisj : off1 + len1 ≤ off2 ∨ off2 + len2 ≤ off1) :
     rangesOverlap off2 len2 off1 len1 = false := by
@@ -14374,627 +14805,6 @@ private theorem a2_rangesOverlap_false_of_disjoint {off1 len1 off2 len2 : Nat}
   | true =>
     simp only [Bool.and_eq_true, bne_iff_ne, decide_eq_true_eq] at h
     rcases hdisj with hd | hd <;> omega
-
-private theorem a2_isPrefixOf_antisymm {p q : Gen.Path}
-    (hpq : p.isPrefixOf q = true) (hqp : q.isPrefixOf p = true) : p = q := by
-  obtain ⟨s1, rfl⟩ := a1_isPrefixOf_eq_append p q hpq
-  obtain ⟨s2, hs2⟩ := a1_isPrefixOf_eq_append (p ++ s1) p hqp
-  have hlen := congrArg List.length hs2
-  simp only [List.length_append] at hlen
-  cases s1 with
-  | nil => exact (List.append_nil p).symm
-  | cons _ _ => simp only [List.length_cons] at hlen; omega
-
-/-- **Lifted multi-window `TreeBorrowsMemory.retag_ptr` simulation (`TreeSimInvMulti`)**:
-removes the universal `overlap` restriction of `tbm_retag_ptr_fnEntry_mutOrBox_simulates_world`
-so `&mut T` / `Box<T>` `FnEntry` retags on sub-slices `[off, off + len)` inside
-multi-slice borrow trees (e.g. nested `split_at_mut`, where disjoint siblings carry
-`permIsForeignPassive` on `[off, off + len)`) simulate
-`execFnEntryMutRetagPrunedSourceOrder` in lockstep, preserving `TreeSimInvMulti`,
-`TreeBorrowsMemory.wfLive`, every pre-existing node's bytes outside `[off, off + len)`,
-and the new child's `.Prot (.Reserved false false)` outside bytes. -/
-theorem tbm_retag_ptr_fnEntry_mutOrBox_simulates_world_multi
-    (tbm : Gen.TreeBorrowsMemory Gen.x86_64) (frameExtra : Gen.TreeBorrowsFrameExtra)
-    (ptr : Gen.Pointer Gen.TreeBorrowsProvenance)
-    (lookup : Gen.ThinPointer Gen.TreeBorrowsProvenance → Interp Gen.VTable)
-    (facts : ParamTypeFacts) (kind : RefParamKind) (attrs : ParamRetagAttrs)
-    (hkind : kind ≠ .shared) (hunpin : (facts.isUnpin && facts.isUnsafeUnpin) = true)
-    (htbmParams : tbm.params = ⟨attrs.implicitWrites⟩)
-    (id : Nat) (alloc : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra)
-    (off len align : Nat) (hlen : 0 < len)
-    (cells : List (Gen.Offset × LibSpecr.Size)) (mask : List Bool)
-    (hmask : cellsToFreezeMask cells ⟨len⟩ = .ok mask)
-    (emb : Nat → Gen.Path) (w : FnEntryBorrowWorld) (parentTag : Nat) (requireInit : Bool)
-    (hprov : ptr.thin_pointer.provenance = some (⟨(id : Int)⟩, emb parentTag))
-    (halloc : tbm.mem.allocations[id]? = some alloc) (hlive : alloc.live = true)
-    (hoff : ptr.thin_pointer.addr - alloc.addr = (off : Int))
-    (hbound : off + len ≤ alloc.data.length)
-    (hinv : TreeSimInvMulti off len emb w alloc.extra.root)
-    (htag : ∃ pn, findNode? w.nodes parentTag = some pn)
-    (hfreshTag : ∀ n ∈ w.nodes, n.tag ≠ w.nextTag)
-    (hfreshProt : ∀ n ∈ w.nodes, n.protector ≠ some w.nextProtector)
-    (hloc : ∀ n ∈ w.nodes,
-      (ancestorPathTags w.nodes parentTag).contains n.tag = locOf (some (emb parentTag)) (emb n.tag))
-    (hancOv : ∀ n ∈ w.nodes,
-      (ancestorPathTags w.nodes parentTag).contains n.tag = true →
-      rangesOverlap off len n.rangeOffset n.rangeLen = true)
-    (hnoprune : ∀ n ∈ w.nodes,
-      isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag)
-        (selectFnEntryPolicy facts kind attrs == .writableChildWrite) off len n = true →
-      foreignStepInert w.activeProtectors
-        (selectFnEntryPolicy facts kind attrs == .writableChildWrite) off len n = true)
-    (hwritableGates : selectFnEntryPolicy facts kind attrs = .writableChildWrite →
-      w.allocReadOnly = false ∧ (requireInit && !w.pointeeInitialized) = false) :
-    let info := pointeeInfoOfFacts facts len align cells
-    let expectedProt : Gen.Protected := if kind = .box then .Weak else .Strong
-    let policy := selectFnEntryPolicy facts kind attrs
-    ∃ pNode, nodeAt alloc.extra.root (emb parentTag) = some pNode ∧
-      let childPath := emb parentTag ++ [(pNode.children.length : Int)]
-      let emb' := extendEmb emb w.nextTag childPath
-      (∀ w' childTag, execFnEntryMutRetagPrunedSourceOrder w parentTag off len policy requireInit =
-          .ok (w', childTag) →
-        ∃ tbm' alloc',
-          TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (ptrTypeOfParamKind kind info) true
-            (!attrs.rustcNoWritable) lookup =
-            .ok (ThinPointer.widen { ptr.thin_pointer with provenance := some (⟨(id : Int)⟩, childPath) }
-              ptr.metadata, tbm',
-              { protectors := frameExtra.protectors ++ [(⟨(id : Int)⟩, childPath)] }) ∧
-          tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
-          (TreeBorrowsMemory.wfLive tbm → TreeBorrowsMemory.wfLive tbm') ∧
-          (∃ mc, nodeAt alloc'.extra.root childPath = some mc ∧ mc.«protected» = expectedProt ∧
-            ∀ b, b < alloc.data.length → (b < off ∨ off + len ≤ b) →
-              mc.permissions[b]? = some (.Prot (.Reserved false false))) ∧
-          (∀ q m, nodeAt alloc.extra.root q = some m →
-            ∃ m', nodeAt alloc'.extra.root q = some m' ∧ m'.«protected» = m.«protected» ∧
-              ∀ b, b < off ∨ off + len ≤ b → m'.permissions[b]? = m.permissions[b]?) ∧
-          TreeSimInvMulti off len emb' w' alloc'.extra.root) ∧
-      (∀ e, execFnEntryMutRetagPrunedSourceOrder w parentTag off len policy requireInit = .error e →
-        ∃ msg, TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (ptrTypeOfParamKind kind info) true
-          (!attrs.rustcNoWritable) lookup = .error (.ub msg)) ∧
-      (∀ r, TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (ptrTypeOfParamKind kind info) true
-          (!attrs.rustcNoWritable) lookup = .ok r →
-        ∃ w' childTag, execFnEntryMutRetagPrunedSourceOrder w parentTag off len policy requireInit =
-          .ok (w', childTag) ∧
-          r.1 = ThinPointer.widen { ptr.thin_pointer with provenance := some (⟨(id : Int)⟩, childPath) }
-            ptr.metadata ∧
-          r.2.2 = { protectors := frameExtra.protectors ++ [(⟨(id : Int)⟩, childPath)] } ∧
-          ∃ alloc', r.2.1.mem.allocations[id]? = some alloc' ∧
-            TreeSimInvMulti off len emb' w' alloc'.extra.root) := by
-  have hmaskLen : mask.length = len := a1_cellsToFreezeMask_length hmask
-  obtain ⟨pn, hpn⟩ := htag
-  have hpnMem : pn ∈ w.nodes := (mem_of_findNode?_eq_some hpn).1
-  have hpnTag : pn.tag = parentTag := (mem_of_findNode?_eq_some hpn).2
-  obtain ⟨pNode, hpNode, _⟩ := hinv.nodes pn hpnMem
-  rw [hpnTag] at hpNode
-  refine ⟨pNode, hpNode, ?_⟩
-  let info := pointeeInfoOfFacts facts len align cells
-  let expectedProt : Gen.Protected := if kind = .box then .Weak else .Strong
-  have hProtYes : Protected.yes expectedProt = true := by
-    dsimp only [expectedProt]; split <;> rfl
-  let childPath := emb parentTag ++ [(pNode.children.length : Int)]
-  let emb' := extendEmb emb w.nextTag childPath
-  have hneLen : len ≠ 0 := by omega
-  have hpolNotSkip : selectFnEntryPolicy facts kind attrs ≠ .skipRetag := by
-    unfold selectFnEntryPolicy
-    cases kind with
-    | shared => exact absurd rfl hkind
-    | mutable | box =>
-      simp only [hunpin, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
-      split <;> decide
-  have hsettings := reborrowSettings_fnEntry_mutOrBox_eq_policy lookup ptr facts kind attrs hkind
-    len align cells mask hmask
-  rw [← htbmParams] at hsettings
-  have hlocChild : ∀ q m, nodeAt alloc.extra.root q = some m →
-      locOf (some childPath) q = locOf (some (emb parentTag)) q :=
-    fun q m hm => locOf_childPath_eq_parentPath alloc.extra.root (emb parentTag) q pNode m hpNode hm
-  have hlocChildSelf : locOf (some childPath) childPath = true := by
-    rw [locOf_some_eq_isPrefixOf]
-    exact b1_isPrefixOf_refl childPath
-  have hdisjForeign : ∀ n ∈ w.nodes, rangesOverlap off len n.rangeOffset n.rangeLen = false →
-      locOf (some (emb parentTag)) (emb n.tag) = false := by
-    intro n hn hdisj
-    cases hl : locOf (some (emb parentTag)) (emb n.tag) with
-    | false => rfl
-    | true =>
-      have hov := hancOv n hn (by rw [hloc n hn, hl])
-      rw [hov] at hdisj; cases hdisj
-  have hmr : ∀ q m, nodeAt alloc.extra.root q = some m → ∃ n ∈ w.nodes, emb n.tag = q ∧
-      (if rangesOverlap off len n.rangeOffset n.rangeLen = true then
-        NodeWindowRel w.activeProtectors off len n m
-       else
-        Protected.yes m.«protected» = n.isProtected w.activeProtectors ∧
-        ∀ b, off ≤ b → b < off + len → ∃ p, m.permissions[b]? = some p ∧ permIsForeignPassive p = true) := by
-    intro q m hq
-    obtain ⟨n, hn, hemb⟩ := hinv.surj q m hq
-    obtain ⟨m', hm', hrel⟩ := hinv.nodes n hn
-    rw [hemb, hq] at hm'; cases hm'
-    exact ⟨n, hn, hemb, hrel⟩
-  have hcore :
-      ∀ (isWrite : Bool) (k : Gen.AccessKind) (pInit pAfter : Gen.Permission)
-        (childPerm : TreeBorrowPerm)
-        (step : Bool → TreeTagNode → Except RetagStepErr TreeTagNode),
-        Permission.init_access pInit = some k →
-        Permission.transition pInit k .Local = .ok pAfter →
-        Permission.matches_protector pInit expectedProt = true →
-        permToMiniRust true true childPerm = some pAfter →
-        childPerm ≠ .reservedIM →
-        (∀ n ∈ w.nodes, a2_NodeStepSimMulti w.activeProtectors off len k step n) →
-        (∀ n ∈ w.nodes,
-          isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) isWrite off len n = true →
-          step false n = .ok n) →
-        ReborrowSettings.new lookup ptr (ptrTypeOfParamKind kind info) true tbm.params
-          (!attrs.rustcNoWritable) =
-          .ok (some { inside := List.replicate len pInit, outside := .Prot (.Reserved false false), «protected» := expectedProt }) →
-        let childNodeW : TreeTagNode :=
-          ⟨w.nextTag, some parentTag, childPerm, off, len, some w.nextProtector, true⟩
-        (∀ nodes', ListRel (PrunedStepRel w parentTag isWrite off len step) w.nodes nodes' →
-          ∃ tbm' alloc',
-            TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (ptrTypeOfParamKind kind info) true
-              (!attrs.rustcNoWritable) lookup =
-              .ok (ThinPointer.widen { ptr.thin_pointer with provenance := some (⟨(id : Int)⟩, childPath) }
-                ptr.metadata, tbm',
-                { protectors := frameExtra.protectors ++ [(⟨(id : Int)⟩, childPath)] }) ∧
-            tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
-            (TreeBorrowsMemory.wfLive tbm → TreeBorrowsMemory.wfLive tbm') ∧
-            (∃ mc, nodeAt alloc'.extra.root childPath = some mc ∧ mc.«protected» = expectedProt ∧
-              ∀ b, b < alloc.data.length → (b < off ∨ off + len ≤ b) →
-                mc.permissions[b]? = some (.Prot (.Reserved false false))) ∧
-            (∀ q m, nodeAt alloc.extra.root q = some m →
-              ∃ m', nodeAt alloc'.extra.root q = some m' ∧ m'.«protected» = m.«protected» ∧
-                ∀ b, b < off ∨ off + len ≤ b → m'.permissions[b]? = m.permissions[b]?) ∧
-            TreeSimInvMulti off len emb'
-              { w with
-                nodes := childNodeW :: nodes'
-                activeProtectors := w.nextProtector :: w.activeProtectors
-                nextTag := w.nextTag + 1
-                nextProtector := w.nextProtector + 1 } alloc'.extra.root) ∧
-        ((∀ nodes', ¬ ListRel (PrunedStepRel w parentTag isWrite off len step) w.nodes nodes') →
-          ∃ msg, TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (ptrTypeOfParamKind kind info) true
-            (!attrs.rustcNoWritable) lookup = .error (.ub msg)) := by
-    intro isWrite k pInit pAfter childPerm step hinitK hchildTr hmpInit hchildP hchildNoIM hstep hnpr hnew
-    let s : Gen.ReborrowSettings :=
-      { inside := List.replicate len pInit, outside := .Prot (.Reserved false false),
-        «protected» := expectedProt }
-    have hmpOut : Permission.matches_protector s.outside s.«protected» = true := by
-      simp [s, Permission.matches_protector, hProtYes]
-    have hmpIn : ∀ p ∈ s.inside, Permission.matches_protector p s.«protected» = true := by
-      intro p hp; rw [List.eq_of_mem_replicate hp]; exact hmpInit
-    have hsLen : s.inside.length = len := List.length_replicate
-    obtain ⟨root1, hadd, hreb⟩ := tbm_reborrow_eq tbm ptr.thin_pointer s frameExtra id
-      (emb parentTag) alloc pNode off hprov halloc hlive hoff (by rw [hsLen]; exact hbound)
-      hpNode hmpOut hmpIn
-    let childPerms := reborrowChildPerms alloc.data.length off s.outside s.inside
-    let childNodeMR : Gen.Node := ⟨[], childPerms, expectedProt⟩
-    obtain ⟨root1', hadd', hchildAt1, hexist1, hsurj1⟩ :=
-      node_add_node_spec alloc.extra.root pNode childNodeMR (emb parentTag) hpNode rfl
-    rw [hadd] at hadd'; cases hadd'
-    have hchildPermSpec := a1_reborrowChildPerms_spec alloc.data.length off s.outside s.inside
-      (by rw [hsLen]; exact hbound)
-    have hretagEq : TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (ptrTypeOfParamKind kind info)
-        true (!attrs.rustcNoWritable) lookup =
-        (TreeBorrowsMemory.reborrowInitAccess childPath ⟨off⟩ 0 s.inside root1 >>= fun root2 =>
-          pure (ThinPointer.widen { ptr.thin_pointer with provenance := some (⟨(id : Int)⟩, childPath) }
-              ptr.metadata,
-            { tbm with mem := { tbm.mem with allocations := (tbm.mem.allocations.set id
-              { alloc with extra := { root := root2 } }) } },
-            { protectors := frameExtra.protectors ++ [(⟨(id : Int)⟩, childPath)] })) := by
-      unfold TreeBorrowsMemory.retag_ptr
-      rw [hnew]
-      dsimp only [s, childPath] at hreb ⊢
-      simp only [bind, Except.bind, hreb, hProtYes, ↓reduceIte]
-      cases TreeBorrowsMemory.reborrowInitAccess (emb parentTag ++ [(pNode.children.length : Int)])
-        ⟨off⟩ 0 (List.replicate len pInit) root1 <;> rfl
-    have hpr : ∀ n ∈ w.nodes, ∀ n', PrunedStepRel w parentTag isWrite off len step n n' →
-        step (locOf (some (emb parentTag)) (emb n.tag)) n = .ok n' := by
-      intro n hn n' hrel
-      rcases hrel with ⟨hc, hs⟩ | ⟨hc, hp, hEq⟩ | ⟨hc, _, hs⟩
-      · rw [← hloc n hn, hc]; exact hs
-      · rw [← hloc n hn, hc, hEq]; exact hnpr n hn hp
-      · rw [← hloc n hn, hc]; exact hs
-    have hrp : ∀ n ∈ w.nodes, ∀ n', step (locOf (some (emb parentTag)) (emb n.tag)) n = .ok n' →
-        PrunedStepRel w parentTag isWrite off len step n n' := by
-      intro n hn n' hs
-      cases hl : locOf (some (emb parentTag)) (emb n.tag) with
-      | true => rw [hl] at hs; exact Or.inl ⟨by rw [hloc n hn, hl], hs⟩
-      | false =>
-        rw [hl] at hs
-        cases hp : isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag) isWrite off
-            len n with
-        | false => exact Or.inr (Or.inr ⟨by rw [hloc n hn, hl], hp, hs⟩)
-        | true =>
-          rw [hnpr n hn hp] at hs; cases hs
-          exact Or.inr (Or.inl ⟨by rw [hloc n hn, hl], hp, rfl⟩)
-    have hidlt : id < tbm.mem.allocations.length := (List.getElem?_eq_some_iff.mp halloc).1
-    constructor
-    · intro nodes' hrel
-      have hpoint : ∀ q m1, nodeAt root1 q = some m1 → ∀ i < s.inside.length, ∀ pm,
-          s.inside[i]? = some pm → ∀ k', Permission.init_access pm = some k' →
-            ∃ p p', m1.permissions[off + 0 + i]? = some p ∧
-              Permission.transition p k' (locRel (some childPath) q) = .ok p' := by
-        intro q m1 hm1 i hi pm hpm k' hk'
-        have hpmEq : pm = pInit := List.eq_of_mem_replicate (List.mem_of_getElem? hpm)
-        rw [hpmEq, hinitK] at hk'; cases hk'
-        rw [Nat.add_zero]
-        rcases hsurj1 q m1 hm1 with ⟨rfl, rfl⟩ | ⟨m0, hm0, hps0, _⟩
-        · have hget : childPerms[off + i]? = some pInit := by
-            rw [hchildPermSpec.2.1 (off + i) (by omega) (by omega)]
-            have e : off + i - off = i := by omega
-            rw [e]; exact nwsr_getElem?_replicate_lt (by rw [hsLen] at hi; exact hi)
-          have hlocR : locRel (some childPath) childPath = .Local := by
-            unfold locRel; rw [hlocChildSelf]; rfl
-          rw [hlocR]; exact ⟨pInit, pAfter, hget, hchildTr⟩
-        · obtain ⟨n, hn, hemb, hnod⟩ := hmr q m0 hm0
-          have hlocEq : locRel (some childPath) q =
-              nodeRelToMiniRust (locOf (some (emb parentTag)) (emb n.tag)) := by
-            unfold locRel nodeRelToMiniRust; rw [hlocChild q m0 hm0, hemb]
-          cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
-          | true =>
-            simp only [hov, ↓reduceIte] at hnod
-            obtain ⟨_, p, hp, hwin⟩ := hnod
-            obtain ⟨n', _, hnn'⟩ := hrel.exists_of_mem_left hn
-            have hs := hpr n hn n' hnn'
-            obtain ⟨p0, hp0, hok, _⟩ := (hstep n hn).1 hov (locOf (some (emb parentTag)) (emb n.tag))
-            rw [hp] at hp0; cases hp0
-            obtain ⟨_, _, _, _, _, _, _, p', htr, _⟩ := hok n' hs
-            rw [hps0, hlocEq]
-            exact ⟨p, p', hwin (off + i) (by omega) (by rw [hsLen] at hi; omega), htr⟩
-          | false =>
-            simp only [hov, Bool.false_eq_true, ↓reduceIte] at hnod
-            have hfor : locOf (some (emb parentTag)) (emb n.tag) = false := hdisjForeign n hn hov
-            obtain ⟨p, hpb, hpas⟩ := hnod.2 (off + i) (by omega) (by rw [hsLen] at hi; omega)
-            obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p k hpas
-            rw [hps0, hlocEq, hfor]
-            exact ⟨p, p', hpb, htr⟩
-      obtain ⟨root2, hinitRun, hinitPost⟩ :=
-        reborrowInitAccess_ok_of_pointwise childPath off s.inside 0 root1 hpoint
-      have hretagOk : TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (ptrTypeOfParamKind kind info)
-          true (!attrs.rustcNoWritable) lookup =
-          .ok (ThinPointer.widen { ptr.thin_pointer with provenance := some (⟨(id : Int)⟩, childPath) }
-              ptr.metadata,
-            { tbm with mem := { tbm.mem with allocations := (tbm.mem.allocations.set id
-              { alloc with extra := { root := root2 } }) } },
-            { protectors := frameExtra.protectors ++ [(⟨(id : Int)⟩, childPath)] }) := by
-        rw [hretagEq, hinitRun]; rfl
-      obtain ⟨mc2, hmc2, hmc2Prot, _, hmc2Out, hmc2In⟩ := (hinitPost childPath).2 childNodeMR hchildAt1
-      have hmcOutSpec : ∀ b, b < alloc.data.length → (b < off ∨ off + len ≤ b) →
-          mc2.permissions[b]? = some (.Prot (.Reserved false false)) := by
-        intro b hblt hout
-        have hout' : b < off + 0 ∨ off + 0 + s.inside.length ≤ b := by
-          rw [Nat.add_zero, hsLen]; exact hout
-        rw [hmc2Out b hout']
-        exact hchildPermSpec.2.2.1 b hblt (by rw [hsLen]; exact hout)
-      have holdFrame : ∀ q m, nodeAt alloc.extra.root q = some m →
-          ∃ m', nodeAt root2 q = some m' ∧ m'.«protected» = m.«protected» ∧
-            ∀ b, b < off ∨ off + len ≤ b → m'.permissions[b]? = m.permissions[b]? := by
-        intro q m hm
-        obtain ⟨m1, hm1, hm1Ps, hm1Prot⟩ := hexist1 q m hm
-        obtain ⟨m2, hm2, hm2Prot, _, hm2Out, _⟩ := (hinitPost q).2 m1 hm1
-        refine ⟨m2, hm2, hm2Prot.trans hm1Prot, fun b hout => ?_⟩
-        rw [hm2Out b (by rw [Nat.add_zero, hsLen]; exact hout), hm1Ps]
-      refine ⟨_, _, hretagOk, List.getElem?_set_self hidlt, hlive,
-        fun hwf => TreeBorrowsMemory.retag_ptr_wfLive hwf hretagOk,
-        ⟨mc2, hmc2, hmc2Prot, hmcOutSpec⟩, holdFrame, ?_⟩
-      let childNodeW : TreeTagNode :=
-        ⟨w.nextTag, some parentTag, childPerm, off, len, some w.nextProtector, true⟩
-      have hnodeOld : ∀ n' ∈ nodes', ∃ n ∈ w.nodes, n'.tag = n.tag ∧ n'.tag ≠ w.nextTag ∧
-          n'.isProtected (w.nextProtector :: w.activeProtectors) = n.isProtected w.activeProtectors ∧
-          n'.rangeOffset = n.rangeOffset ∧ n'.rangeLen = n.rangeLen ∧
-          (n'.isProtected (w.nextProtector :: w.activeProtectors) = true → n'.perm ≠ .reservedIM) ∧
-          (n'.isProtected (w.nextProtector :: w.activeProtectors) = true → n'.perm = .unique →
-            n'.accessed = true) ∧
-          ∃ m2, nodeAt root2 (emb' n'.tag) = some m2 ∧
-            if rangesOverlap off len n'.rangeOffset n'.rangeLen = true then
-              NodeWindowRel (w.nextProtector :: w.activeProtectors) off len n' m2
-            else
-              Protected.yes m2.«protected» = n'.isProtected (w.nextProtector :: w.activeProtectors) ∧
-              ∀ b, off ≤ b → b < off + len →
-                ∃ p, m2.permissions[b]? = some p ∧ permIsForeignPassive p = true := by
-        intro n' hn'
-        obtain ⟨n, hn, hnn'⟩ := hrel.exists_of_mem_right hn'
-        have hs := hpr n hn n' hnn'
-        obtain ⟨m0, hm0, hnod⟩ := hinv.nodes n hn
-        obtain ⟨m1, hm1, hm1Ps, hm1Prot⟩ := hexist1 (emb n.tag) m0 hm0
-        obtain ⟨m2, hm2, hm2Prot, _, _, hm2In⟩ := (hinitPost (emb n.tag)).2 m1 hm1
-        have hlocEq : locRel (some childPath) (emb n.tag) =
-            nodeRelToMiniRust (locOf (some (emb parentTag)) (emb n.tag)) := by
-          unfold locRel nodeRelToMiniRust; rw [hlocChild (emb n.tag) m0 hm0]
-        cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
-        | true =>
-          simp only [hov, ↓reduceIte] at hnod
-          obtain ⟨hprot0, p, hp, hwin0⟩ := hnod
-          obtain ⟨p0, hp0, hok, _⟩ := (hstep n hn).1 hov (locOf (some (emb parentTag)) (emb n.tag))
-          rw [hp] at hp0; cases hp0
-          obtain ⟨htagEq, hprotField, hpe, hro, hrl, hIM, hUA, p', htr, hp'⟩ := hok n' hs
-          have hprotNew : n'.isProtected (w.nextProtector :: w.activeProtectors) =
-              n.isProtected w.activeProtectors := by
-            rw [a1_isProtected_cons_ne n' w.nextProtector w.activeProtectors
-              (hprotField ▸ hfreshProt n hn)]
-            exact hpe
-          have htagNe : n'.tag ≠ w.nextTag := htagEq ▸ hfreshTag n hn
-          have hemb'Eq : emb' n'.tag = emb n.tag := by
-            unfold emb' extendEmb; simp only [htagNe, ↓reduceIte]; exact congrArg emb htagEq
-          refine ⟨n, hn, htagEq, htagNe, hprotNew, hro, hrl,
-            fun hp'' => hIM (hpe.trans (hprotNew.symm.trans hp'')),
-            fun hp'' => hUA (hpe.trans (hprotNew.symm.trans hp'')),
-            m2, by rw [hemb'Eq]; exact hm2, ?_⟩
-          rw [hro, hrl]; simp only [hov, ↓reduceIte]
-          refine ⟨by rw [hm2Prot, hm1Prot, hprot0, hprotNew], p', by rw [hprotNew]; exact hp', ?_⟩
-          intro b hb1 hb2
-          have hi : b - off < s.inside.length := by rw [hsLen]; omega
-          have hpm : s.inside[b - off]? = some pInit := nwsr_getElem?_replicate_lt (by rw [hsLen] at hi; exact hi)
-          have hm1Get : m1.permissions[off + 0 + (b - off)]? = some p := by
-            rw [hm1Ps, Nat.add_zero]; have e : off + (b - off) = b := by omega
-            rw [e]; exact hwin0 b hb1 hb2
-          have hstepB := hm2In (b - off) hi pInit hpm p hm1Get
-          rw [hinitK] at hstepB
-          obtain ⟨p'', htr'', hm2Get⟩ := hstepB
-          rw [hlocEq, htr] at htr''; cases htr''
-          have e : off + 0 + (b - off) = b := by omega
-          rw [e] at hm2Get; exact hm2Get
-        | false =>
-          simp only [hov, Bool.false_eq_true, ↓reduceIte] at hnod
-          have hstay := (hstep n hn).2 hov (locOf (some (emb parentTag)) (emb n.tag))
-          rw [hstay] at hs
-          have hn'Eq : n' = n := by cases hs; rfl
-          rw [hn'Eq]
-          have hprotNew : n.isProtected (w.nextProtector :: w.activeProtectors) =
-              n.isProtected w.activeProtectors :=
-            a1_isProtected_cons_ne n w.nextProtector w.activeProtectors (hfreshProt n hn)
-          have htagNe : n.tag ≠ w.nextTag := hfreshTag n hn
-          have hemb'Eq : emb' n.tag = emb n.tag := by
-            unfold emb' extendEmb; simp only [htagNe, ↓reduceIte]
-          have hfor : locOf (some (emb parentTag)) (emb n.tag) = false := hdisjForeign n hn hov
-          refine ⟨n, hn, rfl, htagNe, hprotNew, rfl, rfl,
-            fun hp'' => hinv.noProtIM n hn (hprotNew.symm.trans hp''),
-            fun hp'' => hinv.protUniqAcc n hn (hprotNew.symm.trans hp''),
-            m2, by rw [hemb'Eq]; exact hm2, ?_⟩
-          simp only [hov, Bool.false_eq_true, ↓reduceIte]
-          refine ⟨by rw [hm2Prot, hm1Prot, hnod.1, hprotNew], fun b hb1 hb2 => ?_⟩
-          have hi : b - off < s.inside.length := by rw [hsLen]; omega
-          have hpm : s.inside[b - off]? = some pInit := nwsr_getElem?_replicate_lt (by rw [hsLen] at hi; exact hi)
-          obtain ⟨p, hpb, hpas⟩ := hnod.2 b hb1 hb2
-          have hm1Get : m1.permissions[off + 0 + (b - off)]? = some p := by
-            rw [hm1Ps, Nat.add_zero]; have e : off + (b - off) = b := by omega
-            rw [e]; exact hpb
-          have hstepB := hm2In (b - off) hi pInit hpm p hm1Get
-          rw [hinitK] at hstepB
-          obtain ⟨p'', htr'', hm2Get⟩ := hstepB
-          rw [hlocEq, hfor] at htr''
-          obtain ⟨p', htr', hpas'⟩ := permission_isForeignPassive_preserved p k hpas
-          change Permission.transition p k .Foreign = .ok p'' at htr''
-          rw [htr'] at htr''; cases htr''
-          have e : off + 0 + (b - off) = b := by omega
-          rw [e] at hm2Get
-          exact ⟨p'', hm2Get, hpas'⟩
-      have hchildProtW : childNodeW.isProtected (w.nextProtector :: w.activeProtectors) = true := by
-        simp [childNodeW, TreeTagNode.isProtected]
-      have hemb'Child : emb' childNodeW.tag = childPath := by
-        unfold emb' extendEmb childNodeW; simp
-      refine ⟨?_, ?_, ?_, ?_⟩
-      · intro n' hn'
-        rcases List.mem_cons.mp hn' with rfl | hn''
-        · refine ⟨mc2, by rw [hemb'Child]; exact hmc2, ?_⟩
-          have hovSelf : rangesOverlap off len off len = true :=
-            a1_rangesOverlap_self hlen
-          simp only [hovSelf, ↓reduceIte]
-          refine ⟨by rw [hmc2Prot, hProtYes, hchildProtW], pAfter, by rw [hchildProtW]; exact hchildP, ?_⟩
-          intro b hb1 hb2
-          have hi : b - off < s.inside.length := by rw [hsLen]; omega
-          have hpm : s.inside[b - off]? = some pInit := nwsr_getElem?_replicate_lt (by rw [hsLen] at hi; exact hi)
-          have hget1 : childNodeMR.permissions[off + 0 + (b - off)]? = some pInit := by
-            rw [Nat.add_zero]; have e : off + (b - off) = b := by omega
-            rw [e, hchildPermSpec.2.1 b hb1 (by rw [hsLen]; exact hb2)]; exact hpm
-          have hstepB := hmc2In (b - off) hi pInit hpm pInit hget1
-          rw [hinitK] at hstepB
-          obtain ⟨p'', htr'', hmc2Get⟩ := hstepB
-          have hlocR : locRel (some childPath) childPath = .Local := by
-            unfold locRel; rw [hlocChildSelf]; rfl
-          rw [hlocR, hchildTr] at htr''; cases htr''
-          have e : off + 0 + (b - off) = b := by omega
-          rw [e] at hmc2Get; exact hmc2Get
-        · obtain ⟨_, _, _, _, _, _, _, _, _, m2, hm2, hrel2⟩ := hnodeOld n' hn''
-          exact ⟨m2, hm2, hrel2⟩
-      · intro q m2 hq2
-        cases hq1 : nodeAt root1 q with
-        | none => rw [(hinitPost q).1 hq1] at hq2; cases hq2
-        | some m1 =>
-          rcases hsurj1 q m1 hq1 with ⟨rfl, _⟩ | ⟨m0, hm0, _, _⟩
-          · exact ⟨childNodeW, List.mem_cons_self .., hemb'Child⟩
-          · obtain ⟨n, hn, hemb⟩ := hinv.surj q m0 hm0
-            obtain ⟨n', hn', hnn'⟩ := hrel.exists_of_mem_left hn
-            have hs := hpr n hn n' hnn'
-            have htagEq : n'.tag = n.tag := by
-              cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
-              | true =>
-                obtain ⟨_, _, hok, _⟩ := (hstep n hn).1 hov (locOf (some (emb parentTag)) (emb n.tag))
-                exact (hok n' hs).1
-              | false =>
-                rw [(hstep n hn).2 hov (locOf (some (emb parentTag)) (emb n.tag))] at hs
-                cases hs; rfl
-            have hne : n'.tag ≠ w.nextTag := htagEq ▸ hfreshTag n hn
-            refine ⟨n', List.mem_cons_of_mem _ hn', ?_⟩
-            unfold emb' extendEmb; simp only [hne, ↓reduceIte]; rw [htagEq, hemb]
-      · intro n' hn' hp''
-        rcases List.mem_cons.mp hn' with rfl | hn''
-        · exact hchildNoIM
-        · obtain ⟨_, _, _, _, _, _, _, hIM, _⟩ := hnodeOld n' hn''; exact hIM hp''
-      · intro n' hn' hp'' hu
-        rcases List.mem_cons.mp hn' with rfl | hn''
-        · rfl
-        · obtain ⟨_, _, _, _, _, _, _, _, hUA, _⟩ := hnodeOld n' hn''; exact hUA hp'' hu
-    · intro hno
-      rw [hretagEq]
-      cases hrun : TreeBorrowsMemory.reborrowInitAccess childPath ⟨off⟩ 0 s.inside root1 with
-      | ok root2 =>
-        exfalso
-        have hall : ∀ n ∈ w.nodes, ∃ n', PrunedStepRel w parentTag isWrite off len step n n' := by
-          intro n hn
-          cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
-          | false =>
-            exact ⟨n, hrp n hn n ((hstep n hn).2 hov (locOf (some (emb parentTag)) (emb n.tag)))⟩
-          | true =>
-            obtain ⟨m0, hm0, hnod⟩ := hinv.nodes n hn
-            simp only [hov, ↓reduceIte] at hnod
-            obtain ⟨_, p, hp, hwin0⟩ := hnod
-            obtain ⟨m1, hm1, hm1Ps, _⟩ := hexist1 (emb n.tag) m0 hm0
-            have hpm0 : s.inside[0]? = some pInit := nwsr_getElem?_replicate_lt hlen
-            obtain ⟨q0, q0', hq0, htr0⟩ := reborrowInitAccess_ok_inv childPath off s.inside 0 root1
-              root2 hrun (emb n.tag) m1 hm1 0 (by rw [hsLen]; exact hlen) pInit hpm0 k hinitK
-            rw [hm1Ps, Nat.add_zero, hwin0 off (Nat.le_refl _) (by omega)] at hq0; cases hq0
-            obtain ⟨p0, hp0, _, herr⟩ := (hstep n hn).1 hov (locOf (some (emb parentTag)) (emb n.tag))
-            rw [hp] at hp0; cases hp0
-            cases hs : step (locOf (some (emb parentTag)) (emb n.tag)) n with
-            | ok n' => exact ⟨n', hrp n hn n' hs⟩
-            | error e =>
-              obtain ⟨msg, hmsg⟩ := herr e hs
-              have hlocEq : locRel (some childPath) (emb n.tag) =
-                  nodeRelToMiniRust (locOf (some (emb parentTag)) (emb n.tag)) := by
-                unfold locRel nodeRelToMiniRust; rw [hlocChild (emb n.tag) m0 hm0]
-              rw [hlocEq] at htr0; rw [htr0] at hmsg; cases hmsg
-        obtain ⟨nodes', hrel⟩ := nwsr_listRel_of_forall w.nodes hall
-        exact hno nodes' hrel
-      | error e =>
-        have hlenRoot1 : ∀ q m1, nodeAt root1 q = some m1 → off + 0 + s.inside.length ≤ m1.permissions.length := by
-          intro q m1 hm1
-          rcases hsurj1 q m1 hm1 with ⟨rfl, rfl⟩ | ⟨m0, hm0, hps0, _⟩
-          · show off + 0 + s.inside.length ≤ childPerms.length
-            rw [hchildPermSpec.1, Nat.add_zero, hsLen]; exact hbound
-          · obtain ⟨n, _, _, hnod⟩ := hmr q m0 hm0
-            cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
-            | true =>
-              simp only [hov, ↓reduceIte] at hnod
-              obtain ⟨_, _, _, hwin0⟩ := hnod
-              have hlt := (List.getElem?_eq_some_iff.mp (hwin0 (off + len - 1) (by omega) (by omega))).1
-              rw [hps0, Nat.add_zero, hsLen]; omega
-            | false =>
-              simp only [hov, Bool.false_eq_true, ↓reduceIte] at hnod
-              obtain ⟨_, hlast, _⟩ := hnod.2 (off + len - 1) (by omega) (by omega)
-              have hlt := (List.getElem?_eq_some_iff.mp hlast).1
-              rw [hps0, Nat.add_zero, hsLen]; omega
-        obtain ⟨msg, hmsg⟩ := reborrowInitAccess_error_is_ub childPath off s.inside 0 root1 e
-          hlenRoot1 hrun
-        exact ⟨msg, by rw [hmsg]; rfl⟩
-  dsimp only
-  cases hpv : selectFnEntryPolicy facts kind attrs with
-  | skipRetag => exact absurd hpv hpolNotSkip
-  | rustcNoWritable =>
-    have hnew' : ReborrowSettings.new lookup ptr (ptrTypeOfParamKind kind info) true tbm.params
-        (!attrs.rustcNoWritable) =
-        .ok (some (Gen.ReborrowSettings.mk
-          (List.replicate len (.Prot (.Reserved false false)))
-          (.Prot (.Reserved false false)) expectedProt)) := by
-      have h1 := hsettings; rw [hpv, hmaskLen] at h1; exact h1
-    have hnpr' : ∀ n ∈ w.nodes, isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag)
-        false off len n = true → stepNodeOnRangeRead w.activeProtectors false off len n = .ok n := by
-      intro n hn hp; have := hnoprune n hn; rw [hpv] at this; exact nwsr_foreignStepInert_read (this hp)
-    have hmpInit : Permission.matches_protector (.Prot (.Reserved false false)) expectedProt = true := by
-      simp [Permission.matches_protector, hProtYes]
-    have hstepR : ∀ n ∈ w.nodes, a2_NodeStepSimMulti w.activeProtectors off len .Read
-        (fun isLoc m => stepNodeOnRangeRead w.activeProtectors isLoc off len m) n := by
-      intro n hn
-      refine ⟨fun hov isLocal => ?_, fun hdisj _ => by unfold stepNodeOnRangeRead; simp only [hdisj, Bool.not_false, ↓reduceIte]⟩
-      obtain ⟨p, hp, hok, herr⟩ := stepNodeOnRangeRead_simulates_permission_transition
-        w.activeProtectors isLocal off len n hov (hinv.noProtIM n hn) (hinv.protUniqAcc n hn)
-      refine ⟨p, hp, fun n' hn' => ?_, herr⟩
-      obtain ⟨htag', hprot', hro, hrl, hIM', hUA'⟩ := nwsr_stepRead_meta _ isLocal off len n n' hn'
-      have hpe : n'.isProtected w.activeProtectors = n.isProtected w.activeProtectors := by
-        unfold TreeTagNode.isProtected; rw [hprot']
-      exact ⟨htag', hprot', hpe, hro, hrl, fun hp' him => hinv.noProtIM n hn (hpe ▸ hp') (hIM' him),
-        hUA' (hinv.protUniqAcc n hn), hok n' hn'⟩
-    obtain ⟨hfwd, hbwd⟩ := hcore false .Read (.Prot (.Reserved false false))
-      (.Prot (.Reserved true false)) (.reservedFrz false)
-      (fun isLoc m => stepNodeOnRangeRead w.activeProtectors isLoc off len m)
-      rfl rfl hmpInit rfl (by decide) hstepR hnpr' hnew'
-    refine ⟨?_, ?_, ?_⟩
-    · intro w' childTag hok
-      obtain ⟨_, nodes', hpair, hrel⟩ :=
-        (a1_execFnEntryMutRetagPrunedSourceOrder_rustcNoWritable_ok_iff w parentTag off len
-          requireInit hneLen (w', childTag)).mp hok
-      injection hpair with hw' _; rw [hw']; exact hfwd nodes' hrel
-    · intro e herr
-      apply hbwd; intro nodes' hrel
-      have hok := (a1_execFnEntryMutRetagPrunedSourceOrder_rustcNoWritable_ok_iff w parentTag off len
-        requireInit hneLen _).mpr ⟨⟨pn, hpn⟩, nodes', rfl, hrel⟩
-      rw [herr] at hok; cases hok
-    · intro r hret
-      cases he : execFnEntryMutRetagPrunedSourceOrder w parentTag off len .rustcNoWritable requireInit with
-      | ok res =>
-        rcases res with ⟨w', ct⟩
-        obtain ⟨_, nodes', hpair, hrel⟩ :=
-          (a1_execFnEntryMutRetagPrunedSourceOrder_rustcNoWritable_ok_iff w parentTag off len
-            requireInit hneLen (w', ct)).mp he
-        injection hpair with hw' _
-        have hfwd' := hfwd nodes' hrel; rw [← hw'] at hfwd'
-        obtain ⟨tbm', alloc', hret', hal', _, _, _, _, hinv'⟩ := hfwd'
-        rw [hret] at hret'; cases hret'
-        exact ⟨w', ct, rfl, rfl, rfl, alloc', hal', hinv'⟩
-      | error e =>
-        have hno : ∀ nodes', ¬ ListRel (PrunedStepRel w parentTag false off len
-            (fun isLoc m => stepNodeOnRangeRead w.activeProtectors isLoc off len m)) w.nodes nodes' := by
-          intro nodes' hrel
-          have hok := (a1_execFnEntryMutRetagPrunedSourceOrder_rustcNoWritable_ok_iff w parentTag off len
-            requireInit hneLen _).mpr ⟨⟨pn, hpn⟩, nodes', rfl, hrel⟩
-          rw [he] at hok; cases hok
-        obtain ⟨msg, hmsg⟩ := hbwd hno; rw [hret] at hmsg; cases hmsg
-  | writableChildWrite =>
-    obtain ⟨hro, hreq⟩ := hwritableGates hpv
-    have hnew' : ReborrowSettings.new lookup ptr (ptrTypeOfParamKind kind info) true tbm.params
-        (!attrs.rustcNoWritable) =
-        .ok (some (Gen.ReborrowSettings.mk
-          (List.replicate len (.Prot .Unique))
-          (.Prot (.Reserved false false)) expectedProt)) := by
-      have h1 := hsettings; rw [hpv, hmaskLen] at h1; exact h1
-    have hnpr' : ∀ n ∈ w.nodes, isPrunedForeignNode w.nodes (ancestorPathTags w.nodes parentTag)
-        true off len n = true → stepNodeOnRangeWrite w.activeProtectors false off len n = .ok n := by
-      intro n hn hp; have := hnoprune n hn; rw [hpv] at this; exact nwsr_foreignStepInert_write (this hp)
-    have hmpInit : Permission.matches_protector (.Prot .Unique) expectedProt = true := by
-      simp [Permission.matches_protector, hProtYes]
-    have hstepW : ∀ n ∈ w.nodes, a2_NodeStepSimMulti w.activeProtectors off len .Write
-        (fun isLoc m => stepNodeOnRangeWrite w.activeProtectors isLoc off len m) n := by
-      intro n hn
-      refine ⟨fun hov isLocal => ?_, fun hdisj _ => by unfold stepNodeOnRangeWrite; simp only [hdisj, Bool.not_false, ↓reduceIte]⟩
-      obtain ⟨p, hp, hok, herr⟩ := stepNodeOnRangeWrite_simulates_permission_transition
-        w.activeProtectors isLocal off len n hov (hinv.noProtIM n hn) (hinv.protUniqAcc n hn)
-      refine ⟨p, hp, fun n' hn' => ?_, herr⟩
-      obtain ⟨htag', hprot', hro', hrl, hIM', hUA'⟩ := nwsr_stepWrite_meta _ isLocal off len n n' hn'
-      have hpe : n'.isProtected w.activeProtectors = n.isProtected w.activeProtectors := by
-        unfold TreeTagNode.isProtected; rw [hprot']
-      exact ⟨htag', hprot', hpe, hro', hrl, fun hp' him => hinv.noProtIM n hn (hpe ▸ hp') (hIM' him),
-        hUA' (hinv.protUniqAcc n hn), hok n' hn'⟩
-    obtain ⟨hfwd, hbwd⟩ := hcore true .Write (.Prot .Unique) (.Prot .Unique) .unique
-      (fun isLoc m => stepNodeOnRangeWrite w.activeProtectors isLoc off len m)
-      rfl rfl hmpInit rfl (by decide) hstepW hnpr' hnew'
-    refine ⟨?_, ?_, ?_⟩
-    · intro w' childTag hok
-      obtain ⟨_, _, _, nodes', hpair, hrel⟩ :=
-        (a1_execFnEntryMutRetagPrunedSourceOrder_writableChildWrite_ok_iff w parentTag off len
-          requireInit hneLen (w', childTag)).mp hok
-      injection hpair with hw' _; rw [hw']; exact hfwd nodes' hrel
-    · intro e herr
-      apply hbwd; intro nodes' hrel
-      have hok := (a1_execFnEntryMutRetagPrunedSourceOrder_writableChildWrite_ok_iff w parentTag off len
-        requireInit hneLen _).mpr ⟨hro, hreq, ⟨pn, hpn⟩, nodes', rfl, hrel⟩
-      rw [herr] at hok; cases hok
-    · intro r hret
-      cases he : execFnEntryMutRetagPrunedSourceOrder w parentTag off len .writableChildWrite requireInit with
-      | ok res =>
-        rcases res with ⟨w', ct⟩
-        obtain ⟨_, _, _, nodes', hpair, hrel⟩ :=
-          (a1_execFnEntryMutRetagPrunedSourceOrder_writableChildWrite_ok_iff w parentTag off len
-            requireInit hneLen (w', ct)).mp he
-        injection hpair with hw' _
-        have hfwd' := hfwd nodes' hrel; rw [← hw'] at hfwd'
-        obtain ⟨tbm', alloc', hret', hal', _, _, _, _, hinv'⟩ := hfwd'
-        rw [hret] at hret'; cases hret'
-        exact ⟨w', ct, rfl, rfl, rfl, alloc', hal', hinv'⟩
-      | error e =>
-        have hno : ∀ nodes', ¬ ListRel (PrunedStepRel w parentTag true off len
-            (fun isLoc m => stepNodeOnRangeWrite w.activeProtectors isLoc off len m)) w.nodes nodes' := by
-          intro nodes' hrel
-          have hok := (a1_execFnEntryMutRetagPrunedSourceOrder_writableChildWrite_ok_iff w parentTag off len
-            requireInit hneLen _).mpr ⟨hro, hreq, ⟨pn, hpn⟩, nodes', rfl, hrel⟩
-          rw [he] at hok; cases hok
-        obtain ⟨msg, hmsg⟩ := hbwd hno; rw [hret] at hmsg; cases hmsg
 
 /-- **Disjoint-window preservation of `TreeSimInvMulti` across `retag_ptr`**:
 retagging a new protected sub-slice node on `[off1, off1 + len1)` preserves
@@ -15066,806 +14876,6 @@ theorem treeSimInvMulti_retag_preserved_on_disjoint_window
       rw [hbytes b (hout2 b h1 h2)]
       exact hnod.2 b h1 h2
 
-/-- **Lifted multi-window `TreeBorrowsMemory.release_protector` simulation (`TreeSimInvMulti`)**:
-removes the universal `overlap` restriction of
-`tbm_release_protector_simulates_execFrameExitMiniRust_step` so protector releases
-on sub-slice windows `[off, off + len)` inside multi-slice borrow trees simulate
-`execFrameExitMiniRust` in lockstep, preserving `TreeSimInvMulti`, `wfLive`,
-other nodes' outside bytes, and producing `permIsForeignPassive` on the released
-node's outside bytes. -/
-theorem tbm_release_protector_simulates_execFrameExitMiniRust_step_multi
-    (tbm : Gen.TreeBorrowsMemory Gen.x86_64)
-    (id : Nat) (alloc : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra)
-    (off len : Nat) (hlen : 0 < len)
-    (emb : Nat → Gen.Path) (w : FnEntryBorrowWorld) (protectedTag protId : Nat) (pn : TreeTagNode)
-    (halloc : tbm.mem.allocations[id]? = some alloc) (hlive : alloc.live = true)
-    (hEqLen : ∀ q m, nodeAt alloc.extra.root q = some m → m.permissions.length = alloc.data.length)
-    (hinv : TreeSimInvMulti off len emb w alloc.extra.root)
-    (htagsNodup : (w.nodes.map (·.tag)).Nodup)
-    (hpn : findNode? w.nodes protectedTag = some pn)
-    (hpnProt : pn.protector = some protId)
-    (hactProt : w.activeProtectors.contains protId = true)
-    (hpnRange : pn.rangeOffset = off ∧ pn.rangeLen = len)
-    (hprotUnique : ∀ n ∈ w.nodes, n.tag ≠ protectedTag → n.protector ≠ some protId)
-    (hembInj : ∀ n ∈ w.nodes, emb n.tag = emb protectedTag → n.tag = protectedTag)
-    (hloc : ∀ n ∈ w.nodes,
-      (ancestorPathTags w.nodes protectedTag).contains n.tag =
-        locOf (some (emb protectedTag)) (emb n.tag))
-    (hancOv : ∀ n ∈ w.nodes,
-      (ancestorPathTags w.nodes protectedTag).contains n.tag = true →
-      rangesOverlap off len n.rangeOffset n.rangeLen = true)
-    (hdesc : ∀ n ∈ w.nodes,
-      isStrictDescendantOf w.nodes protectedTag n =
-        ((emb protectedTag).isPrefixOf (emb n.tag) && decide (n.tag ≠ protectedTag)))
-    (hpruneInert : ∀ n ∈ w.nodes, ∀ isWrite,
-      protectorEndAccessIsWriteMiniRust? pn = some isWrite →
-      isStrictDescendantOf w.nodes protectedTag n = false →
-      isPrunedForeignNode w.nodes (ancestorPathTags w.nodes protectedTag) isWrite off len n = true →
-      stepNodeOnRangeAccess w.activeProtectors isWrite false off len n = .ok n)
-    (hOutside : ∀ m, nodeAt alloc.extra.root (emb protectedTag) = some m →
-      OutsideNoProtectorAccess off len m) :
-    (∀ w', execFrameExitMiniRust w [(protectedTag, protId)] = .ok w' →
-      ∃ tbm' alloc',
-        TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb protectedTag) = .ok tbm' ∧
-        tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
-        alloc'.data.length = alloc.data.length ∧
-        (∀ q m, nodeAt alloc'.extra.root q = some m → m.permissions.length = alloc'.data.length) ∧
-        (TreeBorrowsMemory.wfLive tbm → TreeBorrowsMemory.wfLive tbm') ∧
-        ListRel NodeMetaRel w.nodes w'.nodes ∧
-        w'.activeProtectors = w.activeProtectors.filter (· != protId) ∧
-        TreeSimInvMulti off len emb w' alloc'.extra.root ∧
-        (∃ mt, nodeAt alloc'.extra.root (emb protectedTag) = some mt ∧ mt.«protected» = .No ∧
-          ∀ b, b < alloc.data.length → (b < off ∨ off + len ≤ b) →
-            ∃ p', mt.permissions[b]? = some p' ∧ permIsForeignPassive p' = true) ∧
-        (∀ q m, nodeAt alloc.extra.root q = some m → q ≠ emb protectedTag →
-          ∃ m', nodeAt alloc'.extra.root q = some m' ∧ m'.«protected» = m.«protected» ∧
-            (∀ b, b < off ∨ off + len ≤ b → m'.permissions[b]? = m.permissions[b]?) ∧
-            (∀ (b : Nat) (pp0 : Gen.PermissionProt) p',
-              m.permissions[b]? = some (Gen.Permission.Prot pp0) → m'.permissions[b]? = some p' →
-              ∃ pp', p' = Gen.Permission.Prot pp'))) ∧
-    (∀ e, execFrameExitMiniRust w [(protectedTag, protId)] = .error e →
-      ∃ msg, TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb protectedTag) = .error (.ub msg)) ∧
-    (∀ tbm', TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb protectedTag) = .ok tbm' →
-      ∃ w' alloc',
-        execFrameExitMiniRust w [(protectedTag, protId)] = .ok w' ∧
-        tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
-        TreeSimInvMulti off len emb w' alloc'.extra.root) := by
-  have hpnMemTag := mem_of_findNode?_eq_some hpn
-  have hpnMem : pn ∈ w.nodes := hpnMemTag.1
-  have hpnTag : pn.tag = protectedTag := hpnMemTag.2
-  have hpnOv : rangesOverlap off len pn.rangeOffset pn.rangeLen = true := by
-    rw [hpnRange.1, hpnRange.2]; exact a1_rangesOverlap_self hlen
-  have hpnIsProt : pn.isProtected w.activeProtectors = true := by
-    unfold TreeTagNode.isProtected; rw [hpnProt]
-    exact List.any_eq_true.mpr ⟨protId, List.contains_iff_mem.mp hactProt, beq_self_eq_true protId⟩
-  obtain ⟨tNode, htNode, htNod⟩ := hinv.nodes pn hpnMem
-  simp only [hpnOv, ↓reduceIte] at htNod
-  obtain ⟨htProt, pPn, hpPn, hwinPn⟩ := htNod
-  rw [hpnTag] at htNode
-  rw [hpnIsProt] at htProt hpPn
-  have hnoIMPn : pn.perm ≠ .reservedIM := hinv.noProtIM pn hpnMem hpnIsProt
-  have huniqPn : pn.perm = .unique → pn.accessed = true := hinv.protUniqAcc pn hpnMem hpnIsProt
-  obtain ⟨pPn', hunpPn, hpPn'⟩ := b1_unprotect_permToMiniRust pn pPn hpPn hnoIMPn huniqPn
-  have htOut := hOutside tNode htNode
-  have hallUnp : ∀ p ∈ tNode.permissions, ∃ y, Permission.unprotect p = .ok y := by
-    intro p hp
-    obtain ⟨b, hbLt, hbEq⟩ := List.getElem_of_mem hp
-    have hbGet : tNode.permissions[b]? = some p := by rw [List.getElem?_eq_getElem hbLt, hbEq]
-    rcases Decidable.em (off ≤ b ∧ b < off + len) with ⟨hb1, hb2⟩ | hout
-    · have h1 := hwinPn b hb1 hb2; rw [hbGet] at h1; cases h1; exact ⟨_, hunpPn⟩
-    · obtain ⟨p', hp'⟩ := htOut b p hbGet (b1_not_in_window hout); exact ⟨(p', none), hp'⟩
-  obtain ⟨pairs, hpairs, hpairsLen, hpairsGet⟩ :=
-    b1_list_mapM_ok_of_forall Permission.unprotect tNode.permissions hallUnp
-  let accesses := pairs.map Prod.snd
-  let unprotPerms := pairs.map Prod.fst
-  have haccLen : accesses.length = tNode.permissions.length := by
-    dsimp only [accesses]; rw [List.length_map, hpairsLen]
-  have hunpLen : unprotPerms.length = tNode.permissions.length := by
-    dsimp only [unprotPerms]; rw [List.length_map, hpairsLen]
-  have haccIn : ∀ b, off ≤ b → b < off + len →
-      accesses[b]? = some ((protectorEndAccessIsWriteMiniRust? pn).map (fun isW => if isW then .Write else .Read)) ∧
-      unprotPerms[b]? = some pPn' := by
-    intro b hb1 hb2
-    have hbGet := hwinPn b hb1 hb2
-    have hbLt : b < tNode.permissions.length := (List.getElem?_eq_some_iff.mp hbGet).1
-    obtain ⟨x, y, hx, hy, hfx⟩ := hpairsGet b hbLt
-    rw [hbGet] at hx; cases hx
-    rw [hunpPn] at hfx; cases hfx
-    dsimp only [accesses, unprotPerms]; rw [List.getElem?_map, List.getElem?_map, hy]; exact ⟨rfl, rfl⟩
-  have haccOut : ∀ b, b < off ∨ off + len ≤ b → b < accesses.length →
-      accesses[b]? = some none := by
-    intro b hout hblt
-    rw [haccLen] at hblt
-    obtain ⟨x, y, hx, hy, hfx⟩ := hpairsGet b hblt
-    obtain ⟨p', hp'⟩ := htOut b x hx hout
-    rw [hp'] at hfx; cases hfx
-    dsimp only [accesses]; rw [List.getElem?_map, hy]; rfl
-  have hunpPassive : ∀ b, b < alloc.data.length →
-      ∃ p', unprotPerms[b]? = some p' ∧ permIsForeignPassive p' = true := by
-    intro b hblt
-    have hbltT : b < tNode.permissions.length := by rw [hEqLen _ tNode htNode]; exact hblt
-    obtain ⟨x, y, _, hy, hfx⟩ := hpairsGet b hbltT
-    cases x with
-    | Unprot _ => cases hfx
-    | Prot pp =>
-      unfold Permission.unprotect at hfx
-      cases hfx
-      exact ⟨.Unprot (PermissionProt.unprotect pp).1, by dsimp only [unprotPerms]; rw [List.getElem?_map, hy]; rfl, rfl⟩
-  obtain ⟨root1, _, hsuf1, hother1, hrelEq⟩ :=
-    tbm_release_protector_eq tbm id (emb protectedTag) alloc tNode pairs halloc hlive htNode htProt hpairs
-  have hroot1AtTarget : nodeAt root1 (emb protectedTag) = some { tNode with permissions := unprotPerms } := by
-    have h1 := hsuf1 []; rw [List.append_nil] at h1; exact h1
-  have hroot1Other : ∀ q, q ≠ emb protectedTag →
-      (nodeAt alloc.extra.root q = none → nodeAt root1 q = none) ∧
-      (∀ m, nodeAt alloc.extra.root q = some m →
-        ∃ m1, nodeAt root1 q = some m1 ∧ m1.permissions = m.permissions ∧ m1.«protected» = m.«protected») := by
-    intro q hqne
-    cases hpre : (emb protectedTag).isPrefixOf q with
-    | false =>
-      have ho := hother1 q hpre
-      exact ⟨ho.1, fun m hm => by obtain ⟨m1, hm1, hp1, hp2, _⟩ := ho.2 m hm; exact ⟨m1, hm1, hp1, hp2⟩⟩
-    | true =>
-      obtain ⟨suf, rfl⟩ := a1_isPrefixOf_eq_append _ _ hpre
-      have hsufNe : suf ≠ [] := fun h => hqne (by rw [h, List.append_nil])
-      have hsame : nodeAt root1 (emb protectedTag ++ suf) = nodeAt alloc.extra.root (emb protectedTag ++ suf) := by
-        rw [hsuf1 suf, a1_nodeAt_append, htNode]
-        cases suf with
-        | nil => exact absurd rfl hsufNe
-        | cons a as => rfl
-      exact ⟨fun h => by rw [hsame, h], fun m hm => ⟨m, by rw [hsame, hm], rfl, rfl⟩⟩
-  have hroot1EqLen : ∀ q m1, nodeAt root1 q = some m1 → m1.permissions.length = alloc.data.length := by
-    intro q m1 hm1
-    rcases Decidable.em (q = emb protectedTag) with rfl | hqne
-    · rw [hroot1AtTarget] at hm1; cases hm1; exact hunpLen.trans (hEqLen _ tNode htNode)
-    · cases hm0 : nodeAt alloc.extra.root q with
-      | none => rw [(hroot1Other q hqne).1 hm0] at hm1; cases hm1
-      | some m0 =>
-        obtain ⟨m1', hm1', hps, _⟩ := (hroot1Other q hqne).2 m0 hm0
-        rw [hm1'] at hm1; cases hm1; rw [hps]; exact hEqLen q m0 hm0
-  have haccEqData : accesses.length = alloc.data.length := haccLen.trans (hEqLen _ tNode htNode)
-  have hboundWindow : off + len ≤ alloc.data.length := by
-    have hlast := hwinPn (off + len - 1) (by omega) (by omega)
-    have hlt := (List.getElem?_eq_some_iff.mp hlast).1
-    rw [hEqLen _ tNode htNode] at hlt; omega
-  have hmr : ∀ q m, nodeAt alloc.extra.root q = some m → ∃ n ∈ w.nodes, emb n.tag = q ∧
-      (if rangesOverlap off len n.rangeOffset n.rangeLen = true then
-        NodeWindowRel w.activeProtectors off len n m
-       else
-        Protected.yes m.«protected» = n.isProtected w.activeProtectors ∧
-        ∀ b, off ≤ b → b < off + len → ∃ p, m.permissions[b]? = some p ∧ permIsForeignPassive p = true) := by
-    intro q m hm
-    obtain ⟨n, hn, hemb⟩ := hinv.surj q m hm
-    obtain ⟨m', hm', hnod⟩ := hinv.nodes n hn
-    rw [hemb, hm] at hm'; cases hm'
-    exact ⟨n, hn, hemb, hnod⟩
-  have hidlt : id < tbm.mem.allocations.length := (List.getElem?_eq_some_iff.mp halloc).1
-  have hpostEqLen : ∀ root2,
-      (∀ q, (nodeAt root1 q = none → nodeAt root2 q = none) ∧
-        (∀ m1, nodeAt root1 q = some m1 → ∃ m2, nodeAt root2 q = some m2 ∧ ReleasePost (some (emb protectedTag)) accesses q m1 m2)) →
-      ∀ q m2, nodeAt root2 q = some m2 → m2.permissions.length = alloc.data.length := by
-    intro root2 hpost2 q m2 hm2
-    cases hm1 : nodeAt root1 q with
-    | none => rw [(hpost2 q).1 hm1] at hm2; cases hm2
-    | some m1 =>
-      obtain ⟨m2', hm2', hrel⟩ := (hpost2 q).2 m1 hm1
-      rw [hm2'] at hm2; cases hm2
-      have hl1 := hroot1EqLen q m1 hm1
-      unfold ReleasePost at hrel
-      rcases Decidable.em (emb protectedTag = q) with rfl | hne
-      · simp only [↓reduceIte] at hrel; rw [hrel.2]; exact hl1
-      · simp only [hne, ↓reduceIte] at hrel
-        cases hpre : (emb protectedTag).isPrefixOf q with
-        | true => simp only [hpre, ↓reduceIte] at hrel; rw [hrel]; exact hl1
-        | false => simp only [hpre, Bool.false_eq_true, ↓reduceIte] at hrel; exact hrel.2.1.trans hl1
-  have hpostTarget : ∀ root2,
-      (∀ q, (nodeAt root1 q = none → nodeAt root2 q = none) ∧
-        (∀ m1, nodeAt root1 q = some m1 → ∃ m2, nodeAt root2 q = some m2 ∧ ReleasePost (some (emb protectedTag)) accesses q m1 m2)) →
-      ∃ mt, nodeAt root2 (emb protectedTag) = some mt ∧ mt.«protected» = .No ∧
-        ∀ b, b < alloc.data.length → (b < off ∨ off + len ≤ b) →
-          ∃ p', mt.permissions[b]? = some p' ∧ permIsForeignPassive p' = true := by
-    intro root2 hpost2
-    obtain ⟨mt, hmt, hrel⟩ := (hpost2 (emb protectedTag)).2 _ hroot1AtTarget
-    unfold ReleasePost at hrel; simp only [↓reduceIte] at hrel
-    exact ⟨mt, hmt, hrel.1, fun b hblt _ => by rw [hrel.2]; exact hunpPassive b hblt⟩
-  have hpostOutside : ∀ root2,
-      (∀ q, (nodeAt root1 q = none → nodeAt root2 q = none) ∧
-        (∀ m1, nodeAt root1 q = some m1 → ∃ m2, nodeAt root2 q = some m2 ∧ ReleasePost (some (emb protectedTag)) accesses q m1 m2)) →
-      ∀ q m, nodeAt alloc.extra.root q = some m → q ≠ emb protectedTag →
-        ∃ m2, nodeAt root2 q = some m2 ∧ m2.«protected» = m.«protected» ∧
-          (∀ b, b < off ∨ off + len ≤ b → m2.permissions[b]? = m.permissions[b]?) ∧
-          (∀ (b : Nat) (pp0 : Gen.PermissionProt) p',
-            m.permissions[b]? = some (Gen.Permission.Prot pp0) → m2.permissions[b]? = some p' →
-            ∃ pp', p' = Gen.Permission.Prot pp') := by
-    intro root2 hpost2 q m hm hqne
-    obtain ⟨m1, hm1, hm1Ps, hm1Prot⟩ := (hroot1Other q hqne).2 m hm
-    obtain ⟨m2, hm2, hrel⟩ := (hpost2 q).2 m1 hm1
-    unfold ReleasePost at hrel
-    have hne' : emb protectedTag ≠ q := hqne.symm
-    simp only [hne', ↓reduceIte] at hrel
-    cases hpre : (emb protectedTag).isPrefixOf q with
-    | true =>
-      simp only [hpre, ↓reduceIte] at hrel
-      refine ⟨m2, hm2, by rw [hrel, hm1Prot], fun b _ => by rw [hrel, hm1Ps], fun b pp0 p' h0 h2 => ?_⟩
-      rw [hrel, hm1Ps, h0] at h2; cases h2; exact ⟨pp0, rfl⟩
-    | false =>
-      simp only [hpre, Bool.false_eq_true, ↓reduceIte] at hrel
-      refine ⟨m2, hm2, hrel.1.trans hm1Prot, fun b hb => ?_, fun b pp0 p' h0 h2 => ?_⟩
-      · rcases Decidable.em (b < accesses.length) with hblt | hbge
-        · have hstep := hrel.2.2.2 b hblt
-          rw [haccOut b hb hblt] at hstep; rw [hstep, hm1Ps]
-        · rw [hrel.2.2.1 b (by omega), hm1Ps]
-      · rcases Decidable.em (b < accesses.length) with hblt | hbge
-        · have hstep := hrel.2.2.2 b hblt
-          cases ha : accesses[b]? with
-          | none => exact False.elim (Nat.not_le_of_gt hblt (List.getElem?_eq_none_iff.mp ha))
-          | some ak =>
-            cases ak with
-            | none => rw [ha] at hstep; rw [hstep, hm1Ps, h0] at h2; cases h2; exact ⟨pp0, rfl⟩
-            | some k =>
-              rw [ha] at hstep
-              obtain ⟨p2, htr, hp2⟩ := hstep (Gen.Permission.Prot pp0) (by rw [hm1Ps]; exact h0)
-              rw [h2] at hp2; cases hp2
-              unfold Permission.transition at htr
-              obtain ⟨pp', _, hok⟩ := nwsr_bind_ok htr
-              cases hok; exact ⟨pp', rfl⟩
-        · rw [hrel.2.2.1 b (by omega), hm1Ps, h0] at h2; cases h2; exact ⟨pp0, rfl⟩
-  have hdisjForeign : ∀ n ∈ w.nodes, rangesOverlap off len n.rangeOffset n.rangeLen = false →
-      locOf (some (emb protectedTag)) (emb n.tag) = false := by
-    intro n hn hdisj
-    cases hl : locOf (some (emb protectedTag)) (emb n.tag) with
-    | false => rfl
-    | true =>
-      have hov := hancOv n hn (by rw [hloc n hn, hl])
-      rw [hov] at hdisj; cases hdisj
-  cases hkind : protectorEndAccessIsWriteMiniRust? pn with
-  | none =>
-    have hallNone : ∀ i < accesses.length, accesses[i]? = some none := by
-      intro i hi
-      rcases Decidable.em (off ≤ i ∧ i < off + len) with ⟨hi1, hi2⟩ | hout
-      · have h1 := (haccIn i hi1 hi2).1; rw [hkind] at h1; exact h1
-      · exact haccOut i (b1_not_in_window hout) hi
-    have hpoint : ∀ q m1, nodeAt root1 q = some m1 → (emb protectedTag).isPrefixOf q = false →
-        ∀ i < accesses.length, ∀ k, accesses[i]? = some (some k) →
-          ∃ p p', m1.permissions[i]? = some p ∧ Permission.transition p k (locRel (some (emb protectedTag)) q) = .ok p' := by
-      intro _ _ _ _ i hi k hk; rw [hallNone i hi] at hk; cases hk
-    obtain ⟨root2, hrel2, hpost2⟩ :=
-      node_release_protector_ok_of_pointwise root1 (some (emb protectedTag)) accesses hpoint
-    have htbmOk : TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb protectedTag) =
-        .ok { tbm with mem := { tbm.mem with allocations := (tbm.mem.allocations.set id { alloc with extra := { root := root2 } }) } } := by
-      rw [hrelEq, hrel2]; rfl
-    have hworldOk : execFrameExitMiniRust w [(protectedTag, protId)] = .ok (releaseProtector w protId) := by
-      simp [execFrameExitMiniRust, execFrameExitSequential, execProtectorEndAccessFor, hpn, hkind]
-    have hinv2 : TreeSimInvMulti off len emb (releaseProtector w protId) root2 := by
-      refine ⟨?_, ?_, ?_, ?_⟩
-      · intro n hn
-        obtain ⟨m0, hm0, hnod0⟩ := hinv.nodes n hn
-        rcases Decidable.em (n.tag = protectedTag) with htagEq | htagNe
-        · have hneq : n = pn := b1_eq_of_mem_of_findNode?_of_nodup w.nodes protectedTag n pn htagsNodup hn htagEq hpn
-          subst n
-          obtain ⟨m2, hm2, hrel⟩ := (hpost2 (emb protectedTag)).2 _ hroot1AtTarget
-          unfold ReleasePost at hrel; simp only [↓reduceIte] at hrel
-          have hisP : pn.isProtected (w.activeProtectors.filter (· != protId)) = false :=
-            b1_isProtected_releaseProtector_self pn protId w.activeProtectors hpnProt
-          refine ⟨m2, by rw [hpnTag]; exact hm2, ?_⟩
-          simp only [hpnOv, ↓reduceIte]
-          refine ⟨?_, pPn', ?_, fun b hb1 hb2 => by rw [hrel.2]; exact (haccIn b hb1 hb2).2⟩
-          · change Protected.yes m2.«protected» = pn.isProtected (w.activeProtectors.filter (· != protId))
-            rw [hrel.1, hisP]; rfl
-          · change permToMiniRust (pn.isProtected (w.activeProtectors.filter (· != protId))) pn.accessed pn.perm = some pPn'
-            rw [hisP]; exact hpPn'
-        · have hqne : emb n.tag ≠ emb protectedTag := fun h => htagNe (hembInj n hn h)
-          obtain ⟨m1, hm1, hm1Ps, hm1Prot⟩ := (hroot1Other (emb n.tag) hqne).2 m0 hm0
-          obtain ⟨m2, hm2, hrel⟩ := (hpost2 (emb n.tag)).2 m1 hm1
-          have hisP : n.isProtected (w.activeProtectors.filter (· != protId)) = n.isProtected w.activeProtectors :=
-            b1_isProtected_releaseProtector_other n protId w.activeProtectors (hprotUnique n hn htagNe)
-          unfold ReleasePost at hrel
-          have hne' : emb protectedTag ≠ emb n.tag := hqne.symm
-          simp only [hne', ↓reduceIte] at hrel
-          have hpsSame : ∀ b, off ≤ b → b < off + len → m2.permissions[b]? = m0.permissions[b]? := by
-            intro b hb1 hb2
-            cases hpre : (emb protectedTag).isPrefixOf (emb n.tag) with
-            | true => simp only [hpre, ↓reduceIte] at hrel; rw [hrel, hm1Ps]
-            | false =>
-              simp only [hpre, Bool.false_eq_true, ↓reduceIte] at hrel
-              have hstep := hrel.2.2.2 b (by rw [haccEqData]; omega)
-              rw [hallNone b (by rw [haccEqData]; omega)] at hstep; rw [hstep, hm1Ps]
-          have hprotSame : m2.«protected» = m0.«protected» := by
-            cases hpre : (emb protectedTag).isPrefixOf (emb n.tag) with
-            | true => simp only [hpre, ↓reduceIte] at hrel; rw [hrel, hm1Prot]
-            | false => simp only [hpre, Bool.false_eq_true, ↓reduceIte] at hrel; rw [hrel.1, hm1Prot]
-          refine ⟨m2, hm2, ?_⟩
-          cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
-          | true =>
-            simp only [hov, ↓reduceIte] at hnod0 ⊢
-            obtain ⟨hprot0, p, hp, hwin0⟩ := hnod0
-            refine ⟨?_, p, ?_, fun b hb1 hb2 => by rw [hpsSame b hb1 hb2, hwin0 b hb1 hb2]⟩
-            · change Protected.yes m2.«protected» = n.isProtected (w.activeProtectors.filter (· != protId))
-              rw [hisP, hprotSame]; exact hprot0
-            · change permToMiniRust (n.isProtected (w.activeProtectors.filter (· != protId))) n.accessed n.perm = some p
-              rw [hisP]; exact hp
-          | false =>
-            simp only [hov, Bool.false_eq_true, ↓reduceIte] at hnod0 ⊢
-            refine ⟨?_, fun b hb1 hb2 => by rw [hpsSame b hb1 hb2]; exact hnod0.2 b hb1 hb2⟩
-            change Protected.yes m2.«protected» = n.isProtected (w.activeProtectors.filter (· != protId))
-            rw [hisP, hprotSame]; exact hnod0.1
-      · intro q m2 hm2
-        cases hm1 : nodeAt root1 q with
-        | none => rw [(hpost2 q).1 hm1] at hm2; cases hm2
-        | some m1 =>
-          rcases Decidable.em (q = emb protectedTag) with rfl | hqne
-          · exact ⟨pn, hpnMem, by rw [hpnTag]⟩
-          · cases hm0 : nodeAt alloc.extra.root q with
-            | none => rw [(hroot1Other q hqne).1 hm0] at hm1; cases hm1
-            | some m0 => exact hinv.surj q m0 hm0
-      · intro n hn hp'
-        rcases Decidable.em (n.tag = protectedTag) with htagEq | htagNe
-        · have hneq := b1_eq_of_mem_of_findNode?_of_nodup w.nodes protectedTag n pn htagsNodup hn htagEq hpn
-          subst n; have hisP := b1_isProtected_releaseProtector_self pn protId w.activeProtectors hpnProt
-          change pn.isProtected (w.activeProtectors.filter (· != protId)) = true at hp'
-          rw [hisP] at hp'; cases hp'
-        · have hisP := b1_isProtected_releaseProtector_other n protId w.activeProtectors (hprotUnique n hn htagNe)
-          change n.isProtected (w.activeProtectors.filter (· != protId)) = true at hp'
-          rw [hisP] at hp'; exact hinv.noProtIM n hn hp'
-      · intro n hn hp' hu
-        rcases Decidable.em (n.tag = protectedTag) with htagEq | htagNe
-        · have hneq := b1_eq_of_mem_of_findNode?_of_nodup w.nodes protectedTag n pn htagsNodup hn htagEq hpn
-          subst n; have hisP := b1_isProtected_releaseProtector_self pn protId w.activeProtectors hpnProt
-          change pn.isProtected (w.activeProtectors.filter (· != protId)) = true at hp'
-          rw [hisP] at hp'; cases hp'
-        · have hisP := b1_isProtected_releaseProtector_other n protId w.activeProtectors (hprotUnique n hn htagNe)
-          change n.isProtected (w.activeProtectors.filter (· != protId)) = true at hp'
-          rw [hisP] at hp'; exact hinv.protUniqAcc n hn hp' hu
-    have hmetaRefl : ∀ xs : List TreeTagNode, ListRel NodeMetaRel xs xs := by
-      intro xs; induction xs with | nil => exact .nil | cons x tl ih => exact .cons (NodeMetaRel.refl x) ih
-    refine ⟨?_, ?_, ?_⟩
-    · intro w' hw'; rw [hworldOk] at hw'; cases hw'
-      exact ⟨_, _, htbmOk, List.getElem?_set_self hidlt, hlive, rfl,
-        hpostEqLen root2 hpost2, fun hwf => tbm_release_protector_wfLive_choiceFree hwf htbmOk,
-        hmetaRefl w.nodes, rfl, hinv2, hpostTarget root2 hpost2, hpostOutside root2 hpost2⟩
-    · intro e he; rw [hworldOk] at he; cases he
-    · intro tbm' htbm'; rw [htbmOk] at htbm'; cases htbm'
-      exact ⟨releaseProtector w protId, _, hworldOk, List.getElem?_set_self hidlt, hlive, hinv2⟩
-  | some isWrite =>
-    let k : Gen.AccessKind := if isWrite then .Write else .Read
-    have hneLen : len ≠ 0 := by omega
-    have hstepSim : ∀ n ∈ w.nodes, a2_NodeStepSimMulti w.activeProtectors off len k
-        (fun isLoc m => stepNodeOnRangeAccess w.activeProtectors isWrite isLoc off len m) n := by
-      intro n hn
-      cases isWrite with
-      | false =>
-        refine ⟨fun hov isLocal => ?_, fun hdisj _ => by unfold stepNodeOnRangeAccess stepNodeOnRangeRead; simp only [Bool.false_eq_true, hdisj, Bool.not_false, ↓reduceIte]⟩
-        obtain ⟨p, hp, hok, herr⟩ := stepNodeOnRangeRead_simulates_permission_transition
-          w.activeProtectors isLocal off len n hov (hinv.noProtIM n hn) (hinv.protUniqAcc n hn)
-        refine ⟨p, hp, fun n' hn' => ?_, herr⟩
-        have hn'' : stepNodeOnRangeRead w.activeProtectors isLocal off len n = .ok n' := hn'
-        obtain ⟨htag', hprot', hro, hrl, hIM', hUA'⟩ := nwsr_stepRead_meta _ isLocal off len n n' hn''
-        have hpe : n'.isProtected w.activeProtectors = n.isProtected w.activeProtectors := by
-          unfold TreeTagNode.isProtected; rw [hprot']
-        exact ⟨htag', hprot', hpe, hro, hrl, fun hp' him => hinv.noProtIM n hn (hpe ▸ hp') (hIM' him),
-          hUA' (hinv.protUniqAcc n hn), hok n' hn''⟩
-      | true =>
-        refine ⟨fun hov isLocal => ?_, fun hdisj _ => by unfold stepNodeOnRangeAccess stepNodeOnRangeWrite; simp only [hdisj, Bool.not_false, ↓reduceIte]⟩
-        obtain ⟨p, hp, hok, herr⟩ := stepNodeOnRangeWrite_simulates_permission_transition
-          w.activeProtectors isLocal off len n hov (hinv.noProtIM n hn) (hinv.protUniqAcc n hn)
-        refine ⟨p, hp, fun n' hn' => ?_, herr⟩
-        have hn'' : stepNodeOnRangeWrite w.activeProtectors isLocal off len n = .ok n' := hn'
-        obtain ⟨htag', hprot', hro, hrl, hIM', hUA'⟩ := nwsr_stepWrite_meta _ isLocal off len n n' hn''
-        have hpe : n'.isProtected w.activeProtectors = n.isProtected w.activeProtectors := by
-          unfold TreeTagNode.isProtected; rw [hprot']
-        exact ⟨htag', hprot', hpe, hro, hrl, fun hp' him => hinv.noProtIM n hn (hpe ▸ hp') (hIM' him),
-          hUA' (hinv.protUniqAcc n hn), hok n' hn''⟩
-    have hworldEq : execFrameExitMiniRust w [(protectedTag, protId)] =
-        (match execProtectorEndAccess w protectedTag isWrite off len with
-        | .error e => .error e
-        | .ok w1 => .ok (releaseProtector w1 protId)) := by
-      unfold execFrameExitMiniRust execFrameExitSequential execProtectorEndAccessFor
-      simp only [hpn, hkind, hpnRange.1, hpnRange.2]
-      cases execProtectorEndAccess w protectedTag isWrite off len <;> rfl
-    have haccChar : ∀ i < accesses.length,
-        accesses[i]? = some (if off ≤ i ∧ i < off + len then some k else none) := by
-      intro i hi
-      rcases Decidable.em (off ≤ i ∧ i < off + len) with ⟨hi1, hi2⟩ | hout
-      · simp only [hi1, hi2, and_self, ↓reduceIte]; have h1 := (haccIn i hi1 hi2).1; rw [hkind] at h1; exact h1
-      · simp only [hout, ↓reduceIte]; exact haccOut i (b1_not_in_window hout) hi
-    have hrelToStep : ∀ n ∈ w.nodes, ∀ n',
-        ProtectorEndStepRel w protectedTag isWrite off len n n' →
-        (emb protectedTag).isPrefixOf (emb n.tag) = false →
-        stepNodeOnRangeAccess w.activeProtectors isWrite (locOf (some (emb protectedTag)) (emb n.tag)) off len n = .ok n' := by
-      intro n hn n' hrel hnotDesc
-      have hdescF : isStrictDescendantOf w.nodes protectedTag n = false := by
-        rw [hdesc n hn, hnotDesc]; rfl
-      rcases hrel with ⟨ha, hs⟩ | ⟨ha, hsk, hEq⟩ | ⟨ha, _, _, hs⟩
-      · rw [← hloc n hn, ha]; exact hs
-      · subst n'; rcases hsk with hd | hp
-        · rw [hdescF] at hd; cases hd
-        · rw [← hloc n hn, ha]; exact hpruneInert n hn isWrite hkind hdescF hp
-      · rw [← hloc n hn, ha]; exact hs
-    have hstepToRel : ∀ n ∈ w.nodes,
-        (∀ n', (emb protectedTag).isPrefixOf (emb n.tag) = false →
-          stepNodeOnRangeAccess w.activeProtectors isWrite (locOf (some (emb protectedTag)) (emb n.tag)) off len n = .ok n' →
-          ProtectorEndStepRel w protectedTag isWrite off len n n') := by
-      intro n hn n' hnotDesc hs
-      have hdescF : isStrictDescendantOf w.nodes protectedTag n = false := by
-        rw [hdesc n hn, hnotDesc]; rfl
-      cases hl : locOf (some (emb protectedTag)) (emb n.tag) with
-      | true => rw [hl] at hs; exact Or.inl ⟨by rw [hloc n hn, hl], hs⟩
-      | false =>
-        rw [hl] at hs
-        cases hp : isPrunedForeignNode w.nodes (ancestorPathTags w.nodes protectedTag) isWrite off len n with
-        | true =>
-          have hsame := hpruneInert n hn isWrite hkind hdescF hp
-          rw [hsame] at hs; cases hs
-          exact Or.inr (Or.inl ⟨by rw [hloc n hn, hl], Or.inr hp, rfl⟩)
-        | false =>
-          exact Or.inr (Or.inr ⟨by rw [hloc n hn, hl], hdescF, hp, hs⟩)
-    have hfwd : ∀ nodes', ListRel (ProtectorEndStepRel w protectedTag isWrite off len) w.nodes nodes' →
-        ∃ tbm' alloc',
-          TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb protectedTag) = .ok tbm' ∧
-          tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
-          alloc'.data.length = alloc.data.length ∧
-          (∀ q m, nodeAt alloc'.extra.root q = some m → m.permissions.length = alloc'.data.length) ∧
-          (TreeBorrowsMemory.wfLive tbm → TreeBorrowsMemory.wfLive tbm') ∧
-          ListRel NodeMetaRel w.nodes nodes' ∧
-          TreeSimInvMulti off len emb (releaseProtector { w with nodes := nodes' } protId) alloc'.extra.root ∧
-          (∃ mt, nodeAt alloc'.extra.root (emb protectedTag) = some mt ∧ mt.«protected» = .No ∧
-            ∀ b, b < alloc.data.length → (b < off ∨ off + len ≤ b) →
-              ∃ p', mt.permissions[b]? = some p' ∧ permIsForeignPassive p' = true) ∧
-          (∀ q m, nodeAt alloc.extra.root q = some m → q ≠ emb protectedTag →
-            ∃ m', nodeAt alloc'.extra.root q = some m' ∧ m'.«protected» = m.«protected» ∧
-              (∀ b, b < off ∨ off + len ≤ b → m'.permissions[b]? = m.permissions[b]?) ∧
-              (∀ (b : Nat) (pp0 : Gen.PermissionProt) p',
-                m.permissions[b]? = some (Gen.Permission.Prot pp0) → m'.permissions[b]? = some p' →
-                ∃ pp', p' = Gen.Permission.Prot pp')) := by
-      intro nodes' hrel
-      have hpoint : ∀ q m1, nodeAt root1 q = some m1 → (emb protectedTag).isPrefixOf q = false →
-          ∀ i < accesses.length, ∀ k', accesses[i]? = some (some k') →
-            ∃ p p', m1.permissions[i]? = some p ∧
-              Permission.transition p k' (locRel (some (emb protectedTag)) q) = .ok p' := by
-        intro q m1 hm1 hnotPre i hi k' hk'
-        have hqne : q ≠ emb protectedTag := fun h => by rw [h, b1_isPrefixOf_refl] at hnotPre; cases hnotPre
-        have hci := haccChar i hi; rw [hk'] at hci
-        rcases Decidable.em (off ≤ i ∧ i < off + len) with ⟨hi1, hi2⟩ | hout
-        · simp only [hi1, hi2, and_self, ↓reduceIte] at hci; cases hci
-          cases hm0 : nodeAt alloc.extra.root q with
-          | none => rw [(hroot1Other q hqne).1 hm0] at hm1; cases hm1
-          | some m0 =>
-            obtain ⟨m1', hm1', hm1Ps, _⟩ := (hroot1Other q hqne).2 m0 hm0
-            rw [hm1'] at hm1; cases hm1
-            obtain ⟨n, hn, hemb, hnod⟩ := hmr q m0 hm0
-            have hlocEq : locRel (some (emb protectedTag)) q =
-                nodeRelToMiniRust (locOf (some (emb protectedTag)) (emb n.tag)) := by
-              unfold locRel nodeRelToMiniRust; rw [hemb]
-            cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
-            | true =>
-              simp only [hov, ↓reduceIte] at hnod
-              obtain ⟨_, p, hp, hwin0⟩ := hnod
-              obtain ⟨n', _, hnn'⟩ := hrel.exists_of_mem_left hn
-              have hs := hrelToStep n hn n' hnn' (by rw [hemb]; exact hnotPre)
-              obtain ⟨p0, hp0, hok, _⟩ := (hstepSim n hn).1 hov (locOf (some (emb protectedTag)) (emb n.tag))
-              rw [hp] at hp0; cases hp0
-              obtain ⟨_, _, _, _, _, _, _, p', htr, _⟩ := hok n' hs
-              rw [hm1Ps, hlocEq]; exact ⟨p, p', hwin0 i hi1 hi2, htr⟩
-            | false =>
-              simp only [hov, Bool.false_eq_true, ↓reduceIte] at hnod
-              have hfor := hdisjForeign n hn hov
-              obtain ⟨p, hpb, hpas⟩ := hnod.2 i hi1 hi2
-              obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p k hpas
-              rw [hm1Ps, hlocEq, hfor]; exact ⟨p, p', hpb, htr⟩
-        · simp only [hout, ↓reduceIte] at hci; cases hci
-      obtain ⟨root2, hrel2, hpost2⟩ :=
-        node_release_protector_ok_of_pointwise root1 (some (emb protectedTag)) accesses hpoint
-      have htbmOk : TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb protectedTag) =
-          .ok { tbm with mem := { tbm.mem with allocations := (tbm.mem.allocations.set id { alloc with extra := { root := root2 } }) } } := by
-        rw [hrelEq, hrel2]; rfl
-      have hmeta : ListRel NodeMetaRel w.nodes nodes' :=
-        ListRel.imp (fun _ _ h => ProtectorEndStepRel.nodeMetaRel h) hrel
-      have hinv2 : TreeSimInvMulti off len emb (releaseProtector { w with nodes := nodes' } protId) root2 := by
-        refine ⟨?_, ?_, ?_, ?_⟩
-        · intro n' hn'
-          obtain ⟨n, hn, hnn'⟩ := hrel.exists_of_mem_right hn'
-          have hnm := ProtectorEndStepRel.nodeMetaRel hnn'
-          obtain ⟨m0, hm0, hnod0⟩ := hinv.nodes n hn
-          rcases Decidable.em (n.tag = protectedTag) with htagEq | htagNe
-          · have hneq := b1_eq_of_mem_of_findNode?_of_nodup w.nodes protectedTag n pn htagsNodup hn htagEq hpn
-            subst n
-            have hn'Eq : n' = pn := by
-              rcases hnn' with ⟨_, hs⟩ | ⟨_, _, hEq⟩ | ⟨ha, _, _, _⟩
-              · rw [b1_protectorEnd_self_invariant_miniRust w.activeProtectors off len pn isWrite hkind huniqPn] at hs
-                cases hs; rfl
-              · exact hEq
-              · have hself : (ancestorPathTags w.nodes protectedTag).contains pn.tag = true := by
-                  rw [hloc pn hpnMem, hpnTag, locOf_some_eq_isPrefixOf, b1_isPrefixOf_refl]
-                rw [hself] at ha; cases ha
-            subst n'
-            obtain ⟨m2, hm2, hr2⟩ := (hpost2 (emb protectedTag)).2 _ hroot1AtTarget
-            unfold ReleasePost at hr2; simp only [↓reduceIte] at hr2
-            have hisP : pn.isProtected (w.activeProtectors.filter (· != protId)) = false :=
-              b1_isProtected_releaseProtector_self pn protId w.activeProtectors hpnProt
-            refine ⟨m2, by rw [hpnTag]; exact hm2, ?_⟩
-            simp only [hpnOv, ↓reduceIte]
-            refine ⟨?_, pPn', ?_, fun b hb1 hb2 => by rw [hr2.2]; exact (haccIn b hb1 hb2).2⟩
-            · change Protected.yes m2.«protected» = pn.isProtected (w.activeProtectors.filter (· != protId))
-              rw [hr2.1, hisP]; rfl
-            · change permToMiniRust (pn.isProtected (w.activeProtectors.filter (· != protId))) pn.accessed pn.perm = some pPn'
-              rw [hisP]; exact hpPn'
-          · have hqne : emb n.tag ≠ emb protectedTag := fun h => htagNe (hembInj n hn h)
-            have hprotNe : n'.protector ≠ some protId := hnm.2.2.1.symm ▸ hprotUnique n hn htagNe
-            have hisP : n'.isProtected (w.activeProtectors.filter (· != protId)) = n'.isProtected w.activeProtectors :=
-              b1_isProtected_releaseProtector_other n' protId w.activeProtectors hprotNe
-            obtain ⟨m1, hm1, hm1Ps, hm1Prot⟩ := (hroot1Other (emb n.tag) hqne).2 m0 hm0
-            obtain ⟨m2, hm2, hr2⟩ := (hpost2 (emb n.tag)).2 m1 hm1
-            unfold ReleasePost at hr2
-            have hne' : emb protectedTag ≠ emb n.tag := hqne.symm
-            simp only [hne', ↓reduceIte] at hr2
-            cases hpre : (emb protectedTag).isPrefixOf (emb n.tag) with
-            | true =>
-              simp only [hpre, ↓reduceIte] at hr2
-              have hdescT : isStrictDescendantOf w.nodes protectedTag n = true := by
-                rw [hdesc n hn, hpre, decide_eq_true htagNe]; rfl
-              have hn'Eq : n' = n := by
-                rcases hnn' with ⟨ha, _⟩ | ⟨_, _, hEq⟩ | ⟨_, hdescF, _, _⟩
-                · have hnotPre : (emb n.tag).isPrefixOf (emb protectedTag) = true := by
-                    rw [← locOf_some_eq_isPrefixOf, ← hloc n hn]; exact ha
-                  exact absurd (a2_isPrefixOf_antisymm hpre hnotPre).symm hqne
-                · exact hEq
-                · rw [hdescT] at hdescF; cases hdescF
-              subst n'
-              refine ⟨m2, hm2, ?_⟩
-              cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
-              | true =>
-                simp only [hov, ↓reduceIte] at hnod0 ⊢
-                obtain ⟨hprot0, p, hp, hwin0⟩ := hnod0
-                refine ⟨?_, p, ?_, fun b hb1 hb2 => by rw [hr2, hm1Ps]; exact hwin0 b hb1 hb2⟩
-                · change Protected.yes m2.«protected» = n.isProtected (w.activeProtectors.filter (· != protId))
-                  rw [hisP, hr2, hm1Prot]; exact hprot0
-                · change permToMiniRust (n.isProtected (w.activeProtectors.filter (· != protId))) n.accessed n.perm = some p
-                  rw [hisP]; exact hp
-              | false =>
-                simp only [hov, Bool.false_eq_true, ↓reduceIte] at hnod0 ⊢
-                refine ⟨?_, fun b hb1 hb2 => by rw [hr2, hm1Ps]; exact hnod0.2 b hb1 hb2⟩
-                change Protected.yes m2.«protected» = n.isProtected (w.activeProtectors.filter (· != protId))
-                rw [hisP, hr2, hm1Prot]; exact hnod0.1
-            | false =>
-              simp only [hpre, Bool.false_eq_true, ↓reduceIte] at hr2
-              have hs := hrelToStep n hn n' hnn' hpre
-              have hlocEq : locRel (some (emb protectedTag)) (emb n.tag) =
-                  nodeRelToMiniRust (locOf (some (emb protectedTag)) (emb n.tag)) := rfl
-              cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
-              | true =>
-                simp only [hov, ↓reduceIte] at hnod0
-                obtain ⟨hprot0, p, hp, hwin0⟩ := hnod0
-                obtain ⟨p0, hp0, hok, _⟩ := (hstepSim n hn).1 hov (locOf (some (emb protectedTag)) (emb n.tag))
-                rw [hp] at hp0; cases hp0
-                obtain ⟨htag', _, hpe, hro, hrl, _, _, p', htr, hp'⟩ := hok n' hs
-                refine ⟨m2, by rw [htag']; exact hm2, ?_⟩
-                rw [hro, hrl]; simp only [hov, ↓reduceIte]
-                refine ⟨?_, p', ?_, ?_⟩
-                · change Protected.yes m2.«protected» = n'.isProtected (w.activeProtectors.filter (· != protId))
-                  rw [hisP, hpe, hr2.1, hm1Prot]; exact hprot0
-                · change permToMiniRust (n'.isProtected (w.activeProtectors.filter (· != protId))) n'.accessed n'.perm = some p'
-                  rw [hisP, hpe]; exact hp'
-                · intro b hb1 hb2
-                  have hsb := hr2.2.2.2 b (by rw [haccEqData]; omega)
-                  rw [haccChar b (by rw [haccEqData]; omega)] at hsb
-                  simp only [hb1, hb2, and_self, ↓reduceIte] at hsb
-                  obtain ⟨p2, htr1, hp2⟩ := hsb p (by rw [hm1Ps]; exact hwin0 b hb1 hb2)
-                  rw [hlocEq, htr] at htr1; cases htr1
-                  exact hp2
-              | false =>
-                simp only [hov, Bool.false_eq_true, ↓reduceIte] at hnod0
-                have hstay := (hstepSim n hn).2 hov (locOf (some (emb protectedTag)) (emb n.tag))
-                dsimp only at hstay
-                rw [hstay] at hs
-                have hn'Eq : n' = n := by cases hs; rfl
-                subst n'
-                have hfor := hdisjForeign n hn hov
-                refine ⟨m2, hm2, ?_⟩
-                simp only [hov, Bool.false_eq_true, ↓reduceIte]
-                refine ⟨?_, fun b hb1 hb2 => ?_⟩
-                · change Protected.yes m2.«protected» = n.isProtected (w.activeProtectors.filter (· != protId))
-                  rw [hisP, hr2.1, hm1Prot]; exact hnod0.1
-                · have hsb := hr2.2.2.2 b (by rw [haccEqData]; omega)
-                  rw [haccChar b (by rw [haccEqData]; omega)] at hsb
-                  simp only [hb1, hb2, and_self, ↓reduceIte] at hsb
-                  obtain ⟨p0, hpb0, hpas0⟩ := hnod0.2 b hb1 hb2
-                  obtain ⟨p2, htr1, hp2⟩ := hsb p0 (by rw [hm1Ps]; exact hpb0)
-                  rw [hlocEq, hfor] at htr1
-                  obtain ⟨p3, htr3, hpas3⟩ := permission_isForeignPassive_preserved p0 k hpas0
-                  change Permission.transition p0 k .Foreign = .ok p2 at htr1
-                  rw [htr3] at htr1; cases htr1
-                  exact ⟨p2, hp2, hpas3⟩
-        · intro q m2 hm2
-          cases hm1 : nodeAt root1 q with
-          | none => rw [(hpost2 q).1 hm1] at hm2; cases hm2
-          | some m1 =>
-            rcases Decidable.em (q = emb protectedTag) with rfl | hqne
-            · obtain ⟨n', hn', hnn'⟩ := hrel.exists_of_mem_left hpnMem
-              exact ⟨n', hn', by rw [(ProtectorEndStepRel.nodeMetaRel hnn').1, hpnTag]⟩
-            · cases hm0 : nodeAt alloc.extra.root q with
-              | none => rw [(hroot1Other q hqne).1 hm0] at hm1; cases hm1
-              | some m0 =>
-                obtain ⟨n, hn, hemb⟩ := hinv.surj q m0 hm0
-                obtain ⟨n', hn', hnn'⟩ := hrel.exists_of_mem_left hn
-                exact ⟨n', hn', by rw [(ProtectorEndStepRel.nodeMetaRel hnn').1, hemb]⟩
-        · intro n' hn' hp''
-          obtain ⟨n, hn, hnn'⟩ := hrel.exists_of_mem_right hn'
-          have hnm := ProtectorEndStepRel.nodeMetaRel hnn'
-          rcases Decidable.em (n.tag = protectedTag) with htagEq | htagNe
-          · have hneq := b1_eq_of_mem_of_findNode?_of_nodup w.nodes protectedTag n pn htagsNodup hn htagEq hpn
-            subst n
-            have hisP : n'.isProtected (w.activeProtectors.filter (· != protId)) = false :=
-              b1_isProtected_releaseProtector_self n' protId w.activeProtectors (hnm.2.2.1.trans hpnProt)
-            change n'.isProtected (w.activeProtectors.filter (· != protId)) = true at hp''
-            rw [hisP] at hp''; cases hp''
-          · have hprotNe : n'.protector ≠ some protId := hnm.2.2.1.symm ▸ hprotUnique n hn htagNe
-            have hisP := b1_isProtected_releaseProtector_other n' protId w.activeProtectors hprotNe
-            change n'.isProtected (w.activeProtectors.filter (· != protId)) = true at hp''
-            rw [hisP] at hp''
-            cases hpre : (emb protectedTag).isPrefixOf (emb n.tag) with
-            | true =>
-              have hdescT : isStrictDescendantOf w.nodes protectedTag n = true := by
-                rw [hdesc n hn, hpre, decide_eq_true htagNe]; rfl
-              have hqne : emb n.tag ≠ emb protectedTag := fun h => htagNe (hembInj n hn h)
-              have hn'Eq : n' = n := by
-                rcases hnn' with ⟨ha, _⟩ | ⟨_, _, hEq⟩ | ⟨_, hdescF, _, _⟩
-                · have hnotPre : (emb n.tag).isPrefixOf (emb protectedTag) = true := by
-                    rw [← locOf_some_eq_isPrefixOf, ← hloc n hn]; exact ha
-                  exact absurd (a2_isPrefixOf_antisymm hpre hnotPre).symm hqne
-                · exact hEq
-                · rw [hdescT] at hdescF; cases hdescF
-              subst n'; exact hinv.noProtIM n hn hp''
-            | false =>
-              have hs := hrelToStep n hn n' hnn' hpre
-              cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
-              | true =>
-                obtain ⟨_, _, hok, _⟩ := (hstepSim n hn).1 hov (locOf (some (emb protectedTag)) (emb n.tag))
-                exact (hok n' hs).2.2.2.2.2.1 hp''
-              | false =>
-                have hstay := (hstepSim n hn).2 hov (locOf (some (emb protectedTag)) (emb n.tag))
-                dsimp only at hstay
-                rw [hstay] at hs
-                cases hs; exact hinv.noProtIM n' hn hp''
-        · intro n' hn' hp'' hu
-          obtain ⟨n, hn, hnn'⟩ := hrel.exists_of_mem_right hn'
-          have hnm := ProtectorEndStepRel.nodeMetaRel hnn'
-          rcases Decidable.em (n.tag = protectedTag) with htagEq | htagNe
-          · have hneq := b1_eq_of_mem_of_findNode?_of_nodup w.nodes protectedTag n pn htagsNodup hn htagEq hpn
-            subst n
-            have hisP : n'.isProtected (w.activeProtectors.filter (· != protId)) = false :=
-              b1_isProtected_releaseProtector_self n' protId w.activeProtectors (hnm.2.2.1.trans hpnProt)
-            change n'.isProtected (w.activeProtectors.filter (· != protId)) = true at hp''
-            rw [hisP] at hp''; cases hp''
-          · have hprotNe : n'.protector ≠ some protId := hnm.2.2.1.symm ▸ hprotUnique n hn htagNe
-            have hisP := b1_isProtected_releaseProtector_other n' protId w.activeProtectors hprotNe
-            change n'.isProtected (w.activeProtectors.filter (· != protId)) = true at hp''
-            rw [hisP] at hp''
-            cases hpre : (emb protectedTag).isPrefixOf (emb n.tag) with
-            | true =>
-              have hdescT : isStrictDescendantOf w.nodes protectedTag n = true := by
-                rw [hdesc n hn, hpre, decide_eq_true htagNe]; rfl
-              have hqne : emb n.tag ≠ emb protectedTag := fun h => htagNe (hembInj n hn h)
-              have hn'Eq : n' = n := by
-                rcases hnn' with ⟨ha, _⟩ | ⟨_, _, hEq⟩ | ⟨_, hdescF, _, _⟩
-                · have hnotPre : (emb n.tag).isPrefixOf (emb protectedTag) = true := by
-                    rw [← locOf_some_eq_isPrefixOf, ← hloc n hn]; exact ha
-                  exact absurd (a2_isPrefixOf_antisymm hpre hnotPre).symm hqne
-                · exact hEq
-                · rw [hdescT] at hdescF; cases hdescF
-              subst n'; exact hinv.protUniqAcc n hn hp'' hu
-            | false =>
-              have hs := hrelToStep n hn n' hnn' hpre
-              cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
-              | true =>
-                obtain ⟨_, _, hok, _⟩ := (hstepSim n hn).1 hov (locOf (some (emb protectedTag)) (emb n.tag))
-                exact (hok n' hs).2.2.2.2.2.2.1 hp'' hu
-              | false =>
-                have hstay := (hstepSim n hn).2 hov (locOf (some (emb protectedTag)) (emb n.tag))
-                dsimp only at hstay
-                rw [hstay] at hs
-                cases hs; exact hinv.protUniqAcc n' hn hp'' hu
-      exact ⟨_, _, htbmOk, List.getElem?_set_self hidlt, hlive, rfl,
-        hpostEqLen root2 hpost2, fun hwf => tbm_release_protector_wfLive_choiceFree hwf htbmOk,
-        hmeta, hinv2, hpostTarget root2 hpost2, hpostOutside root2 hpost2⟩
-    have hbwd : (∀ nodes', ¬ ListRel (ProtectorEndStepRel w protectedTag isWrite off len) w.nodes nodes') →
-        ∃ msg, TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb protectedTag) = .error (.ub msg) := by
-      intro hno
-      rw [hrelEq]
-      cases hrun : Node.release_protector root1 (some (emb protectedTag)) accesses with
-      | ok root2 =>
-        exfalso
-        have hall : ∀ n ∈ w.nodes, ∃ n', ProtectorEndStepRel w protectedTag isWrite off len n n' := by
-          intro n hn
-          rcases Decidable.em (n.tag = protectedTag) with htagEq | htagNe
-          · have hneq := b1_eq_of_mem_of_findNode?_of_nodup w.nodes protectedTag n pn htagsNodup hn htagEq hpn
-            subst n
-            have hself : (ancestorPathTags w.nodes protectedTag).contains pn.tag = true := by
-              rw [hloc pn hpnMem, hpnTag, locOf_some_eq_isPrefixOf, b1_isPrefixOf_refl]
-            exact ⟨pn, Or.inl ⟨hself, b1_protectorEnd_self_invariant_miniRust w.activeProtectors off len pn isWrite hkind huniqPn⟩⟩
-          · cases hpre : (emb protectedTag).isPrefixOf (emb n.tag) with
-            | true =>
-              have hqne : emb n.tag ≠ emb protectedTag := fun h => htagNe (hembInj n hn h)
-              have hnotAnc : (ancestorPathTags w.nodes protectedTag).contains n.tag = false := by
-                rw [hloc n hn, locOf_some_eq_isPrefixOf]
-                cases h2 : (emb n.tag).isPrefixOf (emb protectedTag) with
-                | false => rfl
-                | true =>
-                  exact absurd (a2_isPrefixOf_antisymm hpre h2).symm hqne
-              have hdescT : isStrictDescendantOf w.nodes protectedTag n = true := by
-                rw [hdesc n hn, hpre, decide_eq_true htagNe]; rfl
-              exact ⟨n, Or.inr (Or.inl ⟨hnotAnc, Or.inl hdescT, rfl⟩)⟩
-            | false =>
-              cases hov : rangesOverlap off len n.rangeOffset n.rangeLen with
-              | false =>
-                exact ⟨n, hstepToRel n hn n hpre ((hstepSim n hn).2 hov (locOf (some (emb protectedTag)) (emb n.tag)))⟩
-              | true =>
-                have hqne : emb n.tag ≠ emb protectedTag := fun h => htagNe (hembInj n hn h)
-                obtain ⟨m0, hm0, hnod0⟩ := hinv.nodes n hn
-                simp only [hov, ↓reduceIte] at hnod0
-                obtain ⟨_, p, hp, hwin0⟩ := hnod0
-                obtain ⟨m1, hm1, hm1Ps, _⟩ := (hroot1Other (emb n.tag) hqne).2 m0 hm0
-                have hoffAcc : off < accesses.length := by rw [haccEqData]; omega
-                have haccOff : accesses[off]? = some (some k) := by
-                  rw [haccChar off hoffAcc]
-                  have h1 : off ≤ off ∧ off < off + len := ⟨Nat.le_refl _, by omega⟩
-                  simp only [h1, and_self, ↓reduceIte]
-                obtain ⟨q0, q0', hq0, htr0⟩ := node_release_protector_ok_inv root1 root2
-                  (some (emb protectedTag)) accesses hrun (emb n.tag) m1 hm1 hpre off hoffAcc k haccOff
-                rw [hm1Ps, hwin0 off (Nat.le_refl _) (by omega)] at hq0; cases hq0
-                obtain ⟨p0, hp0, _, herr⟩ := (hstepSim n hn).1 hov (locOf (some (emb protectedTag)) (emb n.tag))
-                rw [hp] at hp0; cases hp0
-                cases hs : stepNodeOnRangeAccess w.activeProtectors isWrite
-                    (locOf (some (emb protectedTag)) (emb n.tag)) off len n with
-                | ok n' => exact ⟨n', hstepToRel n hn n' hpre hs⟩
-                | error e =>
-                  obtain ⟨msg, hmsg⟩ := herr e hs
-                  have hlocEq : locRel (some (emb protectedTag)) (emb n.tag) =
-                      nodeRelToMiniRust (locOf (some (emb protectedTag)) (emb n.tag)) := rfl
-                  rw [hlocEq] at htr0; rw [htr0] at hmsg; cases hmsg
-        obtain ⟨nodes', hrel⟩ := nwsr_listRel_of_forall w.nodes hall
-        exact hno nodes' hrel
-      | error e =>
-        obtain ⟨msg, hmsg⟩ := node_release_protector_error_is_ub root1 (some (emb protectedTag))
-          accesses e (fun q m1 hm1 => by rw [haccEqData, hroot1EqLen q m1 hm1]; exact Nat.le_refl _) hrun
-        exact ⟨msg, by rw [hmsg]; rfl⟩
-    refine ⟨?_, ?_, ?_⟩
-    · intro w' hw'
-      rw [hworldEq] at hw'
-      cases hpe : execProtectorEndAccess w protectedTag isWrite off len with
-      | error _ => rw [hpe] at hw'; cases hw'
-      | ok w1 =>
-        rw [hpe] at hw'; cases hw'
-        obtain ⟨_, nodes', hw1, hrel⟩ := (execProtectorEndAccess_ok_iff w w1 protectedTag isWrite off len hneLen).mp hpe
-        subst hw1
-        obtain ⟨tbm', alloc', h1, h2, h3, h4, h5, h6, h7, h8, h9, h10⟩ := hfwd nodes' hrel
-        exact ⟨tbm', alloc', h1, h2, h3, h4, h5, h6, h7, rfl, h8, h9, h10⟩
-    · intro e herr
-      rw [hworldEq] at herr
-      apply hbwd; intro nodes' hrel
-      have hok := (execProtectorEndAccess_ok_iff w { w with nodes := nodes' } protectedTag isWrite off len hneLen).mpr
-        ⟨⟨pn, hpn⟩, nodes', rfl, hrel⟩
-      rw [hok] at herr; cases herr
-    · intro tbm' htbm'
-      cases hw : execFrameExitMiniRust w [(protectedTag, protId)] with
-      | ok w' =>
-        rw [hworldEq] at hw
-        cases hpe : execProtectorEndAccess w protectedTag isWrite off len with
-        | error _ => rw [hpe] at hw; cases hw
-        | ok w1 =>
-          rw [hpe] at hw; cases hw
-          obtain ⟨_, nodes', hw1, hrel⟩ := (execProtectorEndAccess_ok_iff w w1 protectedTag isWrite off len hneLen).mp hpe
-          subst hw1
-          obtain ⟨tbm'', alloc', h1, h2, h3, _, _, _, _, h8, _, _⟩ := hfwd nodes' hrel
-          rw [htbm'] at h1; cases h1
-          exact ⟨releaseProtector { w with nodes := nodes' } protId, alloc', rfl, h2, h3, h8⟩
-      | error e =>
-        have hno : ∀ nodes', ¬ ListRel (ProtectorEndStepRel w protectedTag isWrite off len) w.nodes nodes' := by
-          intro nodes' hrel
-          have hok := (execProtectorEndAccess_ok_iff w { w with nodes := nodes' } protectedTag isWrite off len hneLen).mpr
-            ⟨⟨pn, hpn⟩, nodes', rfl, hrel⟩
-          rw [hworldEq, hok] at hw; cases hw
-        obtain ⟨msg, hmsg⟩ := hbwd hno
-        rw [htbm'] at hmsg; cases hmsg
-
 /-- **Disjoint-window preservation of `TreeSimInvMulti` across `release_protector`**:
 releasing protector `(protectedTag, protId)` covering `[off1, off1 + len1)`
 preserves `TreeSimInvMulti` on EVERY disjoint window `[off2, off2 + len2)` (every
@@ -15930,208 +14940,6 @@ theorem treeSimInvMulti_release_preserved_on_disjoint_window
       refine ⟨by rw [hprotM, hnod.1, ← hpe], fun b h1 h2 => ?_⟩
       rw [hbytes b (hout2 b h1 h2)]
       exact hnod.2 b h1 h2
-
-/-- **Multi-entry `TreeBorrowsMemory.end_call` simulation under `TreeSimInvMulti`**
-(single window `[off, off + len)` inside a multi-slice borrow tree of arbitrary depth). -/
-theorem tbm_end_call_simulates_execFrameExitMiniRust_multi :
-    ∀ (frame : List (Nat × Nat))
-      (tbm : Gen.TreeBorrowsMemory Gen.x86_64)
-      (id : Nat) (alloc : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra)
-      (off len : Nat), 0 < len →
-      ∀ (emb : Nat → Gen.Path) (w : FnEntryBorrowWorld),
-      tbm.mem.allocations[id]? = some alloc →
-      alloc.live = true →
-      (∀ q m, nodeAt alloc.extra.root q = some m → m.permissions.length = alloc.data.length) →
-      TreeSimInvMulti off len emb w alloc.extra.root →
-      (w.nodes.map (·.tag)).Nodup →
-      (frame.map Prod.snd).Nodup →
-      (∀ tp ∈ frame, ∃ pn, findNode? w.nodes tp.1 = some pn ∧
-        pn.protector = some tp.2 ∧ w.activeProtectors.contains tp.2 = true ∧
-        pn.rangeOffset = off ∧ pn.rangeLen = len) →
-      (∀ tp ∈ frame, ∀ n ∈ w.nodes, n.tag ≠ tp.1 → n.protector ≠ some tp.2) →
-      (∀ tp ∈ frame, ∀ n ∈ w.nodes, emb n.tag = emb tp.1 → n.tag = tp.1) →
-      (∀ tp ∈ frame, ∀ n ∈ w.nodes,
-        (ancestorPathTags w.nodes tp.1).contains n.tag = locOf (some (emb tp.1)) (emb n.tag)) →
-      (∀ tp ∈ frame, ∀ n ∈ w.nodes,
-        (ancestorPathTags w.nodes tp.1).contains n.tag = true →
-        rangesOverlap off len n.rangeOffset n.rangeLen = true) →
-      (∀ tp ∈ frame, ∀ n ∈ w.nodes,
-        isStrictDescendantOf w.nodes tp.1 n =
-          ((emb tp.1).isPrefixOf (emb n.tag) && decide (n.tag ≠ tp.1))) →
-      FrameExitPruneInert off len w frame →
-      (∀ tp ∈ frame, ∀ m, nodeAt alloc.extra.root (emb tp.1) = some m →
-        OutsideNoProtectorAccess off len m) →
-      let extra : Gen.TreeBorrowsFrameExtra := ⟨frame.map (fun tp => (⟨(id : Int)⟩, emb tp.1))⟩
-      (∀ w', execFrameExitMiniRust w frame = .ok w' →
-        ∃ tbm' alloc',
-          TreeBorrowsMemory.end_call tbm extra = .ok tbm' ∧
-          tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
-          (TreeBorrowsMemory.wfLive tbm → TreeBorrowsMemory.wfLive tbm') ∧
-          TreeSimInvMulti off len emb w' alloc'.extra.root) ∧
-      (∀ e, execFrameExitMiniRust w frame = .error e →
-        ∃ msg, TreeBorrowsMemory.end_call tbm extra = .error (.ub msg)) ∧
-      (∀ tbm', TreeBorrowsMemory.end_call tbm extra = .ok tbm' →
-        ∃ w' alloc',
-          execFrameExitMiniRust w frame = .ok w' ∧
-          tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
-          TreeSimInvMulti off len emb w' alloc'.extra.root)
-  | [] => by
-    intro tbm id alloc off len _ emb w halloc hlive _ hinv _ _ _ _ _ _ _ _ _ _
-    exact ⟨fun w' hw' => by cases hw'; exact ⟨tbm, alloc, rfl, halloc, hlive, fun h => h, hinv⟩,
-      fun e he => (by cases he),
-      fun tbm' htbm' => by cases htbm'; exact ⟨w, alloc, rfl, halloc, hlive, hinv⟩⟩
-  | (t, p) :: rest => by
-    intro tbm id alloc off len hlen emb w halloc hlive hEqLen hinv htagsNodup hframeNodup
-      hframeNodes hprotUnique hembInj hloc hancOv hdesc hprune hOutside
-    rw [List.map_cons, List.nodup_cons] at hframeNodup
-    obtain ⟨pn, hpn, hpnProt, hactProt, hpnOff, hpnLen⟩ := hframeNodes (t, p) (List.mem_cons_self ..)
-    obtain ⟨hpruneHead, hpruneTail⟩ := hprune
-    have hpruneInert : ∀ n ∈ w.nodes, ∀ isWrite,
-        protectorEndAccessIsWriteMiniRust? pn = some isWrite →
-        isStrictDescendantOf w.nodes t n = false →
-        isPrunedForeignNode w.nodes (ancestorPathTags w.nodes t) isWrite off len n = true →
-        stepNodeOnRangeAccess w.activeProtectors isWrite false off len n = .ok n := by
-      rw [hpn] at hpruneHead; exact hpruneHead
-    obtain ⟨hstepOk, hstepErr, hstepBack⟩ :=
-      tbm_release_protector_simulates_execFrameExitMiniRust_step_multi
-        tbm id alloc off len hlen emb w t p pn halloc hlive hEqLen hinv htagsNodup
-        hpn hpnProt hactProt ⟨hpnOff, hpnLen⟩
-        (hprotUnique (t, p) (List.mem_cons_self ..))
-        (hembInj (t, p) (List.mem_cons_self ..))
-        (hloc (t, p) (List.mem_cons_self ..))
-        (hancOv (t, p) (List.mem_cons_self ..))
-        (hdesc (t, p) (List.mem_cons_self ..))
-        hpruneInert (hOutside (t, p) (List.mem_cons_self ..))
-    have hconsWorld : execFrameExitMiniRust w ((t, p) :: rest) =
-        (match execFrameExitMiniRust w [(t, p)] with
-        | .error e => .error e
-        | .ok w1 => execFrameExitMiniRust w1 rest) := by
-      cases h : execProtectorEndAccessFor protectorEndAccessIsWriteMiniRust? w t <;>
-        simp [execFrameExitMiniRust, execFrameExitSequential, h]
-    have hconsTbm :
-        TreeBorrowsMemory.end_call tbm ⟨(((t, p) :: rest).map (fun tp => (⟨(id : Int)⟩, emb tp.1)))⟩ =
-        (TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb t) >>= fun tbm1 =>
-          TreeBorrowsMemory.end_call tbm1 ⟨rest.map (fun tp => (⟨(id : Int)⟩, emb tp.1))⟩) := by
-      unfold TreeBorrowsMemory.end_call; simp only [List.map_cons, List.foldlM_cons]
-    have hihOfStep : ∀ w1, execFrameExitMiniRust w [(t, p)] = .ok w1 →
-        ∃ (tbm1 : Gen.TreeBorrowsMemory Gen.x86_64)
-          (alloc1 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra),
-          TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb t) = .ok tbm1 ∧
-          (TreeBorrowsMemory.wfLive tbm → TreeBorrowsMemory.wfLive tbm1) ∧
-          (∀ w', execFrameExitMiniRust w1 rest = .ok w' →
-            ∃ tbm' alloc',
-              TreeBorrowsMemory.end_call tbm1 ⟨rest.map (fun tp => (⟨(id : Int)⟩, emb tp.1))⟩ = .ok tbm' ∧
-              tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
-              (TreeBorrowsMemory.wfLive tbm1 → TreeBorrowsMemory.wfLive tbm') ∧
-              TreeSimInvMulti off len emb w' alloc'.extra.root) ∧
-          (∀ e, execFrameExitMiniRust w1 rest = .error e →
-            ∃ msg, TreeBorrowsMemory.end_call tbm1 ⟨rest.map (fun tp => (⟨(id : Int)⟩, emb tp.1))⟩ = .error (.ub msg)) ∧
-          (∀ tbm', TreeBorrowsMemory.end_call tbm1 ⟨rest.map (fun tp => (⟨(id : Int)⟩, emb tp.1))⟩ = .ok tbm' →
-            ∃ w' alloc',
-              execFrameExitMiniRust w1 rest = .ok w' ∧
-              tbm'.mem.allocations[id]? = some alloc' ∧ alloc'.live = true ∧
-              TreeSimInvMulti off len emb w' alloc'.extra.root) := by
-      intro w1 hw1
-      obtain ⟨tbm1, alloc1, hrel1, halloc1, hlive1, _, hEqLen1, hwf1, hmeta1, hact1, hinv1, _, hout1⟩ :=
-        hstepOk w1 hw1
-      have htags1 : (w1.nodes.map (·.tag)).Nodup := by
-        rw [ListRel.nodeMetaRel_map_tag_eq hmeta1]; exact htagsNodup
-      have hfnRest : ∀ tp ∈ rest, ∃ pn1, findNode? w1.nodes tp.1 = some pn1 ∧
-          pn1.protector = some tp.2 ∧ w1.activeProtectors.contains tp.2 = true ∧
-          pn1.rangeOffset = off ∧ pn1.rangeLen = len := by
-        intro tp htp
-        obtain ⟨pn0, hpn0, hp0, ha0, ho0, hl0⟩ := hframeNodes tp (List.mem_cons_of_mem _ htp)
-        obtain ⟨pn1, hpn1, hnm⟩ := (b1_listRel_nodeMetaRel_findNode? hmeta1 tp.1).2 pn0 hpn0
-        have hpNe : tp.2 ≠ p := fun h => hframeNodup.1 (h ▸ List.mem_map.mpr ⟨tp, htp, rfl⟩)
-        have hact1' : w1.activeProtectors.contains tp.2 = true := by
-          rw [hact1]; apply List.contains_iff_mem.mpr
-          exact List.mem_filter.mpr ⟨List.contains_iff_mem.mp ha0, by simp [bne, hpNe]⟩
-        exact ⟨pn1, hpn1, hnm.2.2.1.trans hp0, hact1', hnm.2.2.2.1.trans ho0, hnm.2.2.2.2.1.trans hl0⟩
-      have hpu1 : ∀ tp ∈ rest, ∀ n1 ∈ w1.nodes, n1.tag ≠ tp.1 → n1.protector ≠ some tp.2 := by
-        intro tp htp n1 hn1 hne
-        obtain ⟨n0, hn0, hnm⟩ := hmeta1.exists_of_mem_right hn1
-        rw [hnm.2.2.1]
-        exact hprotUnique tp (List.mem_cons_of_mem _ htp) n0 hn0 (by rw [← hnm.1]; exact hne)
-      have hemb1 : ∀ tp ∈ rest, ∀ n1 ∈ w1.nodes, emb n1.tag = emb tp.1 → n1.tag = tp.1 := by
-        intro tp htp n1 hn1 heq
-        obtain ⟨n0, hn0, hnm⟩ := hmeta1.exists_of_mem_right hn1
-        rw [hnm.1] at heq ⊢
-        exact hembInj tp (List.mem_cons_of_mem _ htp) n0 hn0 heq
-      have hloc1 : ∀ tp ∈ rest, ∀ n1 ∈ w1.nodes,
-          (ancestorPathTags w1.nodes tp.1).contains n1.tag = locOf (some (emb tp.1)) (emb n1.tag) := by
-        intro tp htp n1 hn1
-        obtain ⟨n0, hn0, hnm⟩ := hmeta1.exists_of_mem_right hn1
-        rw [b1_listRel_nodeMetaRel_ancestorPathTags hmeta1 tp.1, hnm.1]
-        exact hloc tp (List.mem_cons_of_mem _ htp) n0 hn0
-      have hancOv1 : ∀ tp ∈ rest, ∀ n1 ∈ w1.nodes,
-          (ancestorPathTags w1.nodes tp.1).contains n1.tag = true →
-          rangesOverlap off len n1.rangeOffset n1.rangeLen = true := by
-        intro tp htp n1 hn1 hanc
-        obtain ⟨n0, hn0, hnm⟩ := hmeta1.exists_of_mem_right hn1
-        rw [b1_listRel_nodeMetaRel_ancestorPathTags hmeta1 tp.1, hnm.1] at hanc
-        rw [hnm.2.2.2.1, hnm.2.2.2.2.1]
-        exact hancOv tp (List.mem_cons_of_mem _ htp) n0 hn0 hanc
-      have hdesc1 : ∀ tp ∈ rest, ∀ n1 ∈ w1.nodes,
-          isStrictDescendantOf w1.nodes tp.1 n1 =
-            ((emb tp.1).isPrefixOf (emb n1.tag) && decide (n1.tag ≠ tp.1)) := by
-        intro tp htp n1 hn1
-        obtain ⟨n0, hn0, hnm⟩ := hmeta1.exists_of_mem_right hn1
-        rw [b1_listRel_nodeMetaRel_isStrictDescendantOf hmeta1 tp.1 hnm, hnm.1]
-        exact hdesc tp (List.mem_cons_of_mem _ htp) n0 hn0
-      have houtRest : ∀ tp ∈ rest, ∀ m1, nodeAt alloc1.extra.root (emb tp.1) = some m1 →
-          OutsideNoProtectorAccess off len m1 := by
-        intro tp htp m1 hm1 b p0 hp0 hb
-        obtain ⟨pn0, hpn0, hp0', _, _, _⟩ := hframeNodes tp (List.mem_cons_of_mem _ htp)
-        have htpMem := (mem_of_findNode?_eq_some hpn0).1
-        have htpTag := (mem_of_findNode?_eq_some hpn0).2
-        have hneTag : tp.1 ≠ t := by
-          intro hEq
-          have heqPn := b1_eq_of_mem_of_findNode?_of_nodup w.nodes t pn0 pn htagsNodup htpMem (htpTag.trans hEq) hpn
-          subst heqPn; rw [hpnProt] at hp0'; cases hp0'
-          exact hframeNodup.1 (List.mem_map.mpr ⟨tp, htp, rfl⟩)
-        have hneEmb : emb tp.1 ≠ emb t := fun h => hneTag (by
-          have h1 := hembInj (t, p) (List.mem_cons_self ..) pn0 htpMem (by rw [htpTag]; exact h)
-          rw [htpTag] at h1; exact h1)
-        obtain ⟨m0, hm0, _⟩ := hinv.nodes pn0 htpMem
-        rw [htpTag] at hm0
-        obtain ⟨m1', hm1', _, hsame, _⟩ := hout1 (emb tp.1) m0 hm0 hneEmb
-        rw [hm1'] at hm1; cases hm1
-        rw [hsame b hb] at hp0
-        exact hOutside tp (List.mem_cons_of_mem _ htp) m0 hm0 b p0 hp0 hb
-      obtain ⟨hr1, hr2, hr3⟩ := tbm_end_call_simulates_execFrameExitMiniRust_multi rest
-        tbm1 id alloc1 off len hlen emb w1 halloc1 hlive1 hEqLen1 hinv1 htags1 hframeNodup.2
-        hfnRest hpu1 hemb1 hloc1 hancOv1 hdesc1 (hpruneTail w1 hw1) houtRest
-      exact ⟨tbm1, alloc1, hrel1, hwf1, hr1, hr2, hr3⟩
-    refine ⟨?_, ?_, ?_⟩
-    · intro w' hw'
-      rw [hconsWorld] at hw'
-      cases hw1 : execFrameExitMiniRust w [(t, p)] with
-      | error _ => rw [hw1] at hw'; cases hw'
-      | ok w1 =>
-        rw [hw1] at hw'
-        obtain ⟨tbm1, _, hrel1, hwf1, hr1, _, _⟩ := hihOfStep w1 hw1
-        obtain ⟨tbm', alloc', hend', halloc', hlive', hwf2, hinv'⟩ := hr1 w' hw'
-        exact ⟨tbm', alloc', by rw [hconsTbm, hrel1]; exact hend', halloc', hlive',
-          fun h => hwf2 (hwf1 h), hinv'⟩
-    · intro e he
-      rw [hconsWorld] at he
-      cases hw1 : execFrameExitMiniRust w [(t, p)] with
-      | error e1 =>
-        obtain ⟨msg, hmsg⟩ := hstepErr e1 hw1
-        exact ⟨msg, by rw [hconsTbm, hmsg]; rfl⟩
-      | ok w1 =>
-        rw [hw1] at he
-        obtain ⟨tbm1, _, hrel1, _, _, hr2, _⟩ := hihOfStep w1 hw1
-        obtain ⟨msg, hmsg⟩ := hr2 e he
-        exact ⟨msg, by rw [hconsTbm, hrel1]; exact hmsg⟩
-    · intro tbm' htbm'
-      rw [hconsTbm] at htbm'
-      obtain ⟨tbm1, hrel1, hend'⟩ := nwsr_bind_ok htbm'
-      obtain ⟨w1, _, hw1, _, _, _⟩ := hstepBack tbm1 hrel1
-      obtain ⟨tbm1', _, hrel1', _, _, _, hr3⟩ := hihOfStep w1 hw1
-      rw [hrel1'] at hrel1; cases hrel1
-      obtain ⟨w', alloc', hw', halloc', hlive', hinv'⟩ := hr3 tbm' hend'
-      exact ⟨w', alloc', by rw [hconsWorld, hw1]; exact hw', halloc', hlive', hinv'⟩
 
 /-- **Disjoint-window two-entry `TreeBorrowsMemory.end_call` simulation**:
 lifts the single-window restriction of `tbm_end_call_simulates_execFrameExitMiniRust_of_pruneInert`
@@ -16500,6 +15308,1394 @@ private theorem a2_reborrow_slice_step
       · rw [hmc] at hm'; cases hm'; exact Or.inl ⟨rfl, rfl⟩
       · exact Or.inr ⟨m0, hm0⟩
 
+private theorem a3_nestedSplit_writable_contrast
+    (tbm : Gen.TreeBorrowsMemory Gen.x86_64) (htbmParams : tbm.params = ⟨true⟩)
+    (id : Nat) (alloc : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra)
+    (N : Nat) (hNlen : alloc.data.length = N)
+    (halloc : tbm.mem.allocations[id]? = some alloc) (hlive : alloc.live = true)
+    (pPath qs : Gen.Path) (pNode sNode : Gen.Node)
+    (hpNode : nodeAt alloc.extra.root pPath = some pNode)
+    (hsNode : nodeAt alloc.extra.root qs = some sNode)
+    (hforS : locOf (some pPath) qs = false)
+    (hancP : ∀ q m, nodeAt alloc.extra.root q = some m → locOf (some pPath) q = true →
+      ∀ b < N, m.permissions[b]? = some (.Unprot .Unique))
+    (hforPassive : ∀ q m, nodeAt alloc.extra.root q = some m → locOf (some pPath) q = false →
+      ∀ b < N, ∃ p, m.permissions[b]? = some p ∧ permIsForeignPassive p = true)
+    (hsFrozen : ∀ b < N, sNode.permissions[b]? = some (.Unprot .Frozen))
+    (alOuter : Nat) (lookup : Gen.ThinPointer Gen.TreeBorrowsProvenance → Interp Gen.VTable) :
+    ∃ outerPtrW tbmW feOuterW allocW sW,
+      TreeBorrowsMemory.retag_ptr tbm TreeBorrowsMemory.new_call
+          (ThinPointer.widen { addr := alloc.addr, provenance := some (⟨(id : Int)⟩, pPath) } none)
+          (.Ref .Mutable (slicePointeeInfoMR N alOuter)) true true lookup =
+        .ok (outerPtrW, tbmW, feOuterW) ∧
+      tbmW.mem.allocations[id]? = some allocW ∧
+      nodeAt allocW.extra.root qs = some sW ∧
+      (∀ b < N, sW.permissions[b]? = some (.Unprot .Disabled)) ∧
+      (∀ (oR lR alR : Nat), 0 < lR → oR + lR ≤ N →
+        Align.is_aligned ⟨alR⟩ (alloc.addr + (oR : Int)) = true →
+        ∀ res, TreeBorrowsMemory.load tbmW
+          { addr := alloc.addr + (oR : Int), provenance := some (⟨(id : Int)⟩, qs) }
+          ⟨lR⟩ ⟨alR⟩ ≠ .ok res) := by
+  have hidlt : id < tbm.mem.allocations.length := (List.getElem?_eq_some_iff.mp halloc).1
+  have hpointW : ∀ q m, nodeAt alloc.extra.root q = some m → ∀ b, 0 ≤ b → b < 0 + N →
+      ∃ p p', m.permissions[b]? = some p ∧
+        Permission.transition p .Write (locRel (some pPath) q) = .ok p' := by
+    intro q m hm b _ hb
+    unfold locRel
+    cases hl : locOf (some pPath) q with
+    | true => exact ⟨.Unprot .Unique, .Unprot .Unique, hancP q m hm hl b (by omega), rfl⟩
+    | false =>
+      obtain ⟨p, hpb, hpas⟩ := hforPassive q m hm hl b (by omega)
+      obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p .Write hpas
+      exact ⟨p, p', hpb, htr⟩
+  obtain ⟨rootW, _, hretW, _, _, _, _, _, _, holdW, _⟩ := a2_reborrow_slice_step tbm
+    TreeBorrowsMemory.new_call id pPath alloc pNode 0 N alOuter true lookup htbmParams halloc
+    hlive hpNode (by omega) hpointW
+  have haddr0 : alloc.addr + ((0 : Nat) : Int) = alloc.addr := Int.add_zero alloc.addr
+  rw [haddr0] at hretW
+  obtain ⟨sW, hsW, _, _, _, hsWIn⟩ := holdW qs sNode hsNode
+  have hsWDis : ∀ b < N, sW.permissions[b]? = some (.Unprot .Disabled) := by
+    intro b hb
+    obtain ⟨p', htr', hp'⟩ := hsWIn b (Nat.zero_le b) (by omega) (.Unprot .Frozen) (hsFrozen b hb)
+    have hlf : locRel (some pPath) qs = .Foreign := by unfold locRel; rw [hforS]; rfl
+    rw [hlf] at htr'; cases htr'; exact hp'
+  refine ⟨_, _, _, { alloc with extra := { root := rootW } }, sW, hretW,
+    List.getElem?_set_self hidlt, hsW, hsWDis, ?_⟩
+  intro oR lR alR hlR hbdR halR res hld
+  rw [tbm_load_eq_node_access _ _ lR ⟨alR⟩ id qs { alloc with extra := { root := rootW } } oR
+    rfl (List.getElem?_set_self hidlt) hlive halR (a2_int_add_sub_cancel alloc.addr _) (by omega)
+    (by rw [hNlen]; exact hbdR)] at hld
+  obtain ⟨r', hacc', _⟩ := nwsr_bind_ok hld
+  exact node_access_read_through_disabled_fails rootW qs sW oR oR lR hsW
+    (hsWDis oR (by omega)) (Nat.le_refl _) (by omega) r' hacc'
+
+private theorem a3_isPrefixOf_trans : ∀ (x y z : Gen.Path),
+    x.isPrefixOf y = true → y.isPrefixOf z = true → x.isPrefixOf z = true
+  | [], _, _, _, _ => rfl
+  | a :: tl, [], _, hxy, _ => by cases hxy
+  | a :: tl, _ :: ytl, [], _, hyz => by cases hyz
+  | a :: tl, b :: ytl, c :: ztl, hxy, hyz => by
+    simp only [List.isPrefixOf, Bool.and_eq_true, a1_int_beq_iff] at hxy hyz ⊢
+    exact ⟨hxy.1.trans hyz.1, a3_isPrefixOf_trans tl ytl ztl hxy.2 hyz.2⟩
+
+private theorem a3_nestedSplit_retags
+    (tbm : Gen.TreeBorrowsMemory Gen.x86_64) (hwf : TreeBorrowsMemory.wfLive tbm)
+    (htbmParams : tbm.params = ⟨true⟩)
+    (id : Nat) (alloc : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra)
+    (N : Nat) (hNlen : alloc.data.length = N)
+    (halloc : tbm.mem.allocations[id]? = some alloc) (hlive : alloc.live = true)
+    (pPath qs : Gen.Path) (pNode sNode : Gen.Node)
+    (hpNode : nodeAt alloc.extra.root pPath = some pNode)
+    (hsNode : nodeAt alloc.extra.root qs = some sNode)
+    (hforS : locOf (some pPath) qs = false)
+    (hancP : ∀ q m, nodeAt alloc.extra.root q = some m → locOf (some pPath) q = true →
+      ∀ b < N, m.permissions[b]? = some (.Unprot .Unique))
+    (hforPassive : ∀ q m, nodeAt alloc.extra.root q = some m → locOf (some pPath) q = false →
+      ∀ b < N, ∃ p, m.permissions[b]? = some p ∧ permIsForeignPassive p = true)
+    (hsFrozen : ∀ b < N, sNode.permissions[b]? = some (.Unprot .Frozen))
+    (off1 len1 off2 len2 : Nat)
+    (hdisj : off1 + len1 ≤ off2 ∨ off2 + len2 ≤ off1)
+    (hbound1 : off1 + len1 ≤ N) (hbound2 : off2 + len2 ≤ N)
+    (alOuter al1 al2 : Nat) (fnIw1 fnIw2 : Bool)
+    (lookup : Gen.ThinPointer Gen.TreeBorrowsProvenance → Interp Gen.VTable) :
+    let outerPtrIn : Gen.Pointer Gen.TreeBorrowsProvenance :=
+      ThinPointer.widen { addr := alloc.addr, provenance := some (⟨(id : Int)⟩, pPath) } none
+    ∃ outerPath aPath bPath root3 tbm1 tbm2 tbm3 alloc3 mOuter3 mA3 mB3,
+      let outerPtr : Gen.Pointer Gen.TreeBorrowsProvenance :=
+        ThinPointer.widen { addr := alloc.addr, provenance := some (⟨(id : Int)⟩, outerPath) } none
+      let aPtr : Gen.Pointer Gen.TreeBorrowsProvenance :=
+        ThinPointer.widen { addr := alloc.addr + (off1 : Int), provenance := some (⟨(id : Int)⟩, aPath) } none
+      let bPtr : Gen.Pointer Gen.TreeBorrowsProvenance :=
+        ThinPointer.widen { addr := alloc.addr + (off2 : Int), provenance := some (⟨(id : Int)⟩, bPath) } none
+      TreeBorrowsMemory.retag_ptr tbm TreeBorrowsMemory.new_call outerPtrIn
+          (.Ref .Mutable (slicePointeeInfoMR N alOuter)) true false lookup =
+        .ok (outerPtr, tbm1, { protectors := [(⟨(id : Int)⟩, outerPath)] }) ∧
+      TreeBorrowsMemory.retag_ptr tbm1 TreeBorrowsMemory.new_call
+          (ThinPointer.widen { outerPtr.thin_pointer with addr := alloc.addr + (off1 : Int) } none)
+          (.Ref .Mutable (slicePointeeInfoMR len1 al1)) true fnIw1 lookup =
+        .ok (aPtr, tbm2, { protectors := [(⟨(id : Int)⟩, aPath)] }) ∧
+      TreeBorrowsMemory.retag_ptr tbm2 { protectors := [(⟨(id : Int)⟩, aPath)] }
+          (ThinPointer.widen { outerPtr.thin_pointer with addr := alloc.addr + (off2 : Int) } none)
+          (.Ref .Mutable (slicePointeeInfoMR len2 al2)) true fnIw2 lookup =
+        .ok (bPtr, tbm3, { protectors := [(⟨(id : Int)⟩, aPath), (⟨(id : Int)⟩, bPath)] }) ∧
+      TreeBorrowsMemory.wfLive tbm3 ∧
+      tbm3.mem.allocations[id]? = some alloc3 ∧
+      alloc3.addr = alloc.addr ∧ alloc3.live = true ∧ alloc3.data.length = N ∧
+      alloc3.extra.root = root3 ∧
+      outerPath.isPrefixOf aPath = true ∧ outerPath.isPrefixOf bPath = true ∧
+      outerPath ≠ aPath ∧ outerPath ≠ bPath ∧ aPath ≠ bPath ∧
+      locOf (some aPath) bPath = false ∧ locOf (some bPath) aPath = false ∧
+      locOf (some outerPath) aPath = false ∧ locOf (some outerPath) bPath = false ∧
+      (∀ q m0, nodeAt alloc.extra.root q = some m0 →
+        q ≠ outerPath ∧ q ≠ aPath ∧ q ≠ bPath ∧
+        outerPath.isPrefixOf q = false ∧ aPath.isPrefixOf q = false ∧ bPath.isPrefixOf q = false ∧
+        locOf (some outerPath) q = locOf (some pPath) q ∧
+        locOf (some aPath) q = locOf (some pPath) q ∧
+        locOf (some bPath) q = locOf (some pPath) q) ∧
+      nodeAt root3 outerPath = some mOuter3 ∧ mOuter3.«protected» = .Strong ∧ mOuter3.permissions.length = N ∧
+      nodeAt root3 aPath = some mA3 ∧ mA3.«protected» = .Strong ∧ mA3.permissions.length = N ∧
+      nodeAt root3 bPath = some mB3 ∧ mB3.«protected» = .Strong ∧ mB3.permissions.length = N ∧
+      (∀ b < N, mOuter3.permissions[b]? = some
+        (if off1 ≤ b ∧ b < off1 + len1 then (if fnIw1 then .Prot .Unique else .Prot (.Reserved true false))
+         else if off2 ≤ b ∧ b < off2 + len2 then (if fnIw2 then .Prot .Unique else .Prot (.Reserved true false))
+         else .Prot (.Reserved true false))) ∧
+      (∀ b < N, mA3.permissions[b]? = some
+        (if off1 ≤ b ∧ b < off1 + len1 then (if fnIw1 then .Prot .Unique else .Prot (.Reserved true false))
+         else if off2 ≤ b ∧ b < off2 + len2 then (if fnIw2 then .Prot .Disabled else .Prot (.Reserved false true))
+         else .Prot (.Reserved false false))) ∧
+      (∀ b, off2 ≤ b → b < off2 + len2 →
+        mB3.permissions[b]? = some (if fnIw2 then .Prot .Unique else .Prot (.Reserved true false))) ∧
+      (∀ b < N, (b < off2 ∨ off2 + len2 ≤ b) → mB3.permissions[b]? = some (.Prot (.Reserved false false))) ∧
+      (∀ q m0, nodeAt alloc.extra.root q = some m0 →
+        ∃ m3, nodeAt root3 q = some m3 ∧
+          (locOf (some pPath) q = true → ∀ b < N, m3.permissions[b]? = some (.Unprot .Unique)) ∧
+          (locOf (some pPath) q = false → ∀ b < N, ∃ p, m3.permissions[b]? = some p ∧ permIsForeignPassive p = true) ∧
+          (q = qs →
+            (∀ b < N, (b < off1 ∨ off1 + len1 ≤ b) → (b < off2 ∨ off2 + len2 ≤ b) →
+              m3.permissions[b]? = some (.Unprot .Frozen)) ∧
+            (∀ b < N, m3.permissions[b]? = some (.Unprot .Frozen) ∨ m3.permissions[b]? = some (.Unprot .Disabled)))) ∧
+      (∀ q m3, nodeAt root3 q = some m3 →
+        (q = bPath ∧ m3 = mB3) ∨ (q = aPath ∧ m3 = mA3) ∨ (q = outerPath ∧ m3 = mOuter3) ∨
+        ∃ m0, nodeAt alloc.extra.root q = some m0) := by
+  dsimp only
+  have hidlt : id < tbm.mem.allocations.length := (List.getElem?_eq_some_iff.mp halloc).1
+  have hpoint0 : ∀ q m, nodeAt alloc.extra.root q = some m → ∀ b, 0 ≤ b → b < 0 + N →
+      ∃ p p', m.permissions[b]? = some p ∧
+        Permission.transition p .Read (locRel (some pPath) q) = .ok p' := by
+    intro q m hm b _ hb
+    unfold locRel
+    cases hl : locOf (some pPath) q with
+    | true => exact ⟨.Unprot .Unique, .Unprot .Unique, hancP q m hm hl b (by omega), rfl⟩
+    | false =>
+      obtain ⟨p, hpb, hpas⟩ := hforPassive q m hm hl b (by omega)
+      obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p .Read hpas
+      exact ⟨p, p', hpb, htr⟩
+  let outerPath := pPath ++ [(pNode.children.length : Int)]
+  obtain ⟨root1, mOuter1, hret1, hwf1Imp, hOuterAt1, hOuterProt1, hOuterLen1, hOuterIn1, _, hold1, hsurj1⟩ :=
+    a2_reborrow_slice_step tbm TreeBorrowsMemory.new_call id pPath alloc pNode 0 N alOuter false lookup
+      htbmParams halloc hlive hpNode (by omega) hpoint0
+  have haddr0 : alloc.addr + ((0 : Nat) : Int) = alloc.addr := Int.add_zero alloc.addr
+  rw [haddr0] at hret1
+  let alloc1 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra := { alloc with extra := { root := root1 } }
+  let tbm1 : Gen.TreeBorrowsMemory Gen.x86_64 :=
+    { tbm with mem := { tbm.mem with allocations := tbm.mem.allocations.set id alloc1 } }
+  have hwf1 : TreeBorrowsMemory.wfLive tbm1 := hwf1Imp hwf
+  have halloc1 : tbm1.mem.allocations[id]? = some alloc1 := List.getElem?_set_self hidlt
+  have hlocOuter : ∀ q m, nodeAt alloc.extra.root q = some m →
+      locOf (some outerPath) q = locOf (some pPath) q :=
+    fun q m hm => locOf_childPath_eq_parentPath alloc.extra.root pPath q pNode m hpNode hm
+  have hroot1Anc : ∀ q m, nodeAt alloc.extra.root q = some m → locOf (some pPath) q = true →
+      ∃ m1, nodeAt root1 q = some m1 ∧ ∀ b < N, m1.permissions[b]? = some (.Unprot .Unique) := by
+    intro q m hm hl
+    obtain ⟨m1, hm1, _, _, _, hm1In⟩ := hold1 q m hm
+    refine ⟨m1, hm1, fun b hb => ?_⟩
+    obtain ⟨p', htr, hp'⟩ := hm1In b (Nat.zero_le b) (by omega) (.Unprot .Unique) (hancP q m hm hl b hb)
+    have hll : locRel (some pPath) q = .Local := by unfold locRel; rw [hl]; rfl
+    rw [hll] at htr; cases htr; exact hp'
+  have hroot1For : ∀ q m, nodeAt alloc.extra.root q = some m → locOf (some pPath) q = false →
+      ∃ m1, nodeAt root1 q = some m1 ∧
+        ∀ b < N, ∃ p, m1.permissions[b]? = some p ∧ permIsForeignPassive p = true := by
+    intro q m hm hl
+    obtain ⟨m1, hm1, _, _, _, hm1In⟩ := hold1 q m hm
+    refine ⟨m1, hm1, fun b hb => ?_⟩
+    obtain ⟨p, hpb, hpas⟩ := hforPassive q m hm hl b hb
+    obtain ⟨p', htr, hp'⟩ := hm1In b (Nat.zero_le b) (by omega) p hpb
+    have hlf : locRel (some pPath) q = .Foreign := by unfold locRel; rw [hl]; rfl
+    rw [hlf] at htr
+    simp only [Bool.false_eq_true, ↓reduceIte] at htr
+    obtain ⟨p'', htr'', hpas'⟩ := permission_isForeignPassive_preserved p .Read hpas
+    rw [htr''] at htr; cases htr; exact ⟨p', hp', hpas'⟩
+  have hroot1S : ∃ s1, nodeAt root1 qs = some s1 ∧ ∀ b < N, s1.permissions[b]? = some (.Unprot .Frozen) := by
+    obtain ⟨s1, hs1, _, _, _, hs1In⟩ := hold1 qs sNode hsNode
+    refine ⟨s1, hs1, fun b hb => ?_⟩
+    obtain ⟨p', htr, hp'⟩ := hs1In b (Nat.zero_le b) (by omega) (.Unprot .Frozen) (hsFrozen b hb)
+    have hlf : locRel (some pPath) qs = .Foreign := by unfold locRel; rw [hforS]; rfl
+    rw [hlf] at htr; cases htr; exact hp'
+  let aPath := outerPath ++ [(mOuter1.children.length : Int)]
+  have hpoint1 : ∀ q m1, nodeAt root1 q = some m1 → ∀ b, off1 ≤ b → b < off1 + len1 →
+      ∃ p p', m1.permissions[b]? = some p ∧
+        Permission.transition p (if fnIw1 then .Write else .Read) (locRel (some outerPath) q) = .ok p' := by
+    intro q m1 hm1 b hb1 hb2
+    rcases hsurj1 q m1 hm1 with ⟨rfl, rfl⟩ | ⟨m0, hm0⟩
+    · have hll : locRel (some outerPath) outerPath = .Local := by
+        unfold locRel; rw [locOf_some_eq_isPrefixOf, b1_isPrefixOf_refl]; rfl
+      rw [hll]; cases fnIw1 <;> exact ⟨.Prot (.Reserved true false), _, hOuterIn1 b (Nat.zero_le b) (by omega), rfl⟩
+    · unfold locRel; rw [hlocOuter q m0 hm0]
+      cases hl : locOf (some pPath) q with
+      | true =>
+        obtain ⟨m1', hm1', hm1U⟩ := hroot1Anc q m0 hm0 hl
+        rw [hm1'] at hm1; cases hm1
+        cases fnIw1 <;> exact ⟨.Unprot .Unique, .Unprot .Unique, hm1U b (by omega), rfl⟩
+      | false =>
+        obtain ⟨m1', hm1', hm1P⟩ := hroot1For q m0 hm0 hl
+        rw [hm1'] at hm1; cases hm1
+        obtain ⟨p, hpb, hpas⟩ := hm1P b (by omega)
+        obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p _ hpas
+        exact ⟨p, p', hpb, htr⟩
+  obtain ⟨root2, mA2, hret2, hwf2Imp, hAAt2, hAProt2, hALen2, hAIn2, hAOut2, hold2, hsurj2⟩ :=
+    a2_reborrow_slice_step tbm1 TreeBorrowsMemory.new_call id outerPath alloc1 mOuter1
+      off1 len1 al1 fnIw1 lookup htbmParams halloc1 hlive hOuterAt1
+      (by change off1 + len1 ≤ alloc.data.length; omega) hpoint1
+  let alloc2 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra := { alloc1 with extra := { root := root2 } }
+  let tbm2 : Gen.TreeBorrowsMemory Gen.x86_64 :=
+    { tbm1 with mem := { tbm1.mem with allocations := tbm1.mem.allocations.set id alloc2 } }
+  have hwf2 : TreeBorrowsMemory.wfLive tbm2 := hwf2Imp hwf1
+  have halloc2 : tbm2.mem.allocations[id]? = some alloc2 :=
+    List.getElem?_set_self (by simp only [tbm1, List.length_set]; exact hidlt)
+  obtain ⟨mOuter2, hOuterAt2, hOuterProt2, hOuterLen2, hOuterOut2, hOuterIn2⟩ :=
+    hold2 outerPath mOuter1 hOuterAt1
+  let bPath := outerPath ++ [(mOuter2.children.length : Int)]
+  have hlocAOuter : locOf (some outerPath) aPath = false := by
+    rw [locOf_some_eq_isPrefixOf]; exact a2_isPrefixOf_append_one_false outerPath _
+  have hpoint2 : ∀ q m2, nodeAt root2 q = some m2 → ∀ b, off2 ≤ b → b < off2 + len2 →
+      ∃ p p', m2.permissions[b]? = some p ∧
+        Permission.transition p (if fnIw2 then .Write else .Read) (locRel (some outerPath) q) = .ok p' := by
+    intro q m2 hm2 b hb1 hb2
+    rcases hsurj2 q m2 hm2 with ⟨rfl, rfl⟩ | ⟨m1, hm1⟩
+    · have hlf : locRel (some outerPath) aPath = .Foreign := by unfold locRel; rw [hlocAOuter]; rfl
+      rw [hlf]
+      have houtA : b < off1 ∨ off1 + len1 ≤ b := by rcases hdisj with hd | hd <;> omega
+      cases fnIw2 <;> exact ⟨.Prot (.Reserved false false), _, hAOut2 b (by change b < alloc.data.length; omega) houtA, rfl⟩
+    · rcases hsurj1 q m1 hm1 with ⟨rfl, rfl⟩ | ⟨m0, hm0⟩
+      · rw [hOuterAt2] at hm2; cases hm2
+        have hll : locRel (some outerPath) outerPath = .Local := by
+          unfold locRel; rw [locOf_some_eq_isPrefixOf, b1_isPrefixOf_refl]; rfl
+        rw [hll]
+        have houtO : b < off1 ∨ off1 + len1 ≤ b := by rcases hdisj with hd | hd <;> omega
+        have hg : mOuter2.permissions[b]? = some (.Prot (.Reserved true false)) := by
+          rw [hOuterOut2 b houtO]; exact hOuterIn1 b (Nat.zero_le b) (by omega)
+        cases fnIw2 <;> exact ⟨.Prot (.Reserved true false), _, hg, rfl⟩
+      · unfold locRel; rw [hlocOuter q m0 hm0]
+        obtain ⟨m2', hm2', _, _, hm2Out, _⟩ := hold2 q m1 hm1
+        rw [hm2'] at hm2; cases hm2
+        have houtQ : b < off1 ∨ off1 + len1 ≤ b := by rcases hdisj with hd | hd <;> omega
+        cases hl : locOf (some pPath) q with
+        | true =>
+          obtain ⟨m1', hm1', hm1U⟩ := hroot1Anc q m0 hm0 hl
+          rw [hm1'] at hm1; cases hm1; rw [hm2Out b houtQ]
+          cases fnIw2 <;> exact ⟨.Unprot .Unique, .Unprot .Unique, hm1U b (by omega), rfl⟩
+        | false =>
+          obtain ⟨m1', hm1', hm1P⟩ := hroot1For q m0 hm0 hl
+          rw [hm1'] at hm1; cases hm1
+          obtain ⟨p, hpb, hpas⟩ := hm1P b (by omega)
+          obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p _ hpas
+          rw [hm2Out b houtQ]; exact ⟨p, p', hpb, htr⟩
+  obtain ⟨root3, mB3, hret3, hwf3Imp, hBAt3, hBProt3, hBLen3, hBIn3, hBOut3, hold3, hsurj3⟩ :=
+    a2_reborrow_slice_step tbm2 { protectors := [(⟨(id : Int)⟩, aPath)] } id outerPath alloc2 mOuter2
+      off2 len2 al2 fnIw2 lookup htbmParams halloc2 hlive hOuterAt2
+      (by change off2 + len2 ≤ alloc.data.length; omega) hpoint2
+  let alloc3 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra := { alloc2 with extra := { root := root3 } }
+  let tbm3 : Gen.TreeBorrowsMemory Gen.x86_64 :=
+    { tbm2 with mem := { tbm2.mem with allocations := tbm2.mem.allocations.set id alloc3 } }
+  have hwf3 : TreeBorrowsMemory.wfLive tbm3 := hwf3Imp hwf2
+  have halloc3 : tbm3.mem.allocations[id]? = some alloc3 :=
+    List.getElem?_set_self (by simp only [tbm2, tbm1, List.length_set]; exact hidlt)
+  have hlocBOuter : locOf (some outerPath) bPath = false := by
+    rw [locOf_some_eq_isPrefixOf]; exact a2_isPrefixOf_append_one_false outerPath _
+  have hABNe : aPath ≠ bPath := fun hEq => by
+    have hnone := a2_nodeAt_fresh_child_none root2 mOuter2 outerPath hOuterAt2
+    change nodeAt root2 bPath = none at hnone; rw [← hEq, hAAt2] at hnone; cases hnone
+  have hOutNeA : outerPath ≠ aPath := fun h => by
+    have hl := congrArg List.length h
+    simp only [aPath, List.length_append, List.length_cons, List.length_nil] at hl; omega
+  have hOutNeB : outerPath ≠ bPath := fun h => by
+    have hl := congrArg List.length h
+    simp only [bPath, List.length_append, List.length_cons, List.length_nil] at hl; omega
+  have hlocAB : locOf (some aPath) bPath = false := by
+    rw [locOf_some_eq_isPrefixOf]
+    cases hp : bPath.isPrefixOf aPath with
+    | false => rfl
+    | true =>
+      exact absurd (a2_isPrefixOf_eq_of_length_eq hp (by
+        simp only [aPath, bPath, List.length_append, List.length_cons, List.length_nil])).symm hABNe
+  have hlocBA : locOf (some bPath) aPath = false := by
+    rw [locOf_some_eq_isPrefixOf]
+    cases hp : aPath.isPrefixOf bPath with
+    | false => rfl
+    | true =>
+      exact absurd (a2_isPrefixOf_eq_of_length_eq hp (by
+        simp only [aPath, bPath, List.length_append, List.length_cons, List.length_nil])) hABNe
+  obtain ⟨mOuter3, hOuterAt3, hOuterProt3, hOuterLen3, hOuterOut3, hOuterIn3⟩ :=
+    hold3 outerPath mOuter2 hOuterAt2
+  obtain ⟨mA3, hAAt3, hAProt3, hALen3, hAOut3, hAIn3⟩ := hold3 aPath mA2 hAAt2
+  refine ⟨outerPath, aPath, bPath, root3, tbm1, tbm2, tbm3, alloc3, mOuter3, mA3, mB3,
+    hret1, hret2, hret3, hwf3, halloc3, rfl, hlive, hNlen, rfl,
+    a1_isPrefixOf_append_right outerPath _, a1_isPrefixOf_append_right outerPath _,
+    hOutNeA, hOutNeB, hABNe, hlocAB, hlocBA, hlocAOuter, hlocBOuter, ?_,
+    hOuterAt3, hOuterProt3.trans (hOuterProt2.trans hOuterProt1),
+    hOuterLen3.trans (hOuterLen2.trans (hOuterLen1.trans hNlen)),
+    hAAt3, hAProt3.trans hAProt2, hALen3.trans (hALen2.trans hNlen),
+    hBAt3, hBProt3, hBLen3.trans hNlen, ?_, ?_, hBIn3,
+    fun b hb => hBOut3 b (by change b < alloc.data.length; omega), ?_, ?_⟩
+  · intro q m0 hm0
+    obtain ⟨m1, hm1, _⟩ := hold1 q m0 hm0
+    obtain ⟨m2, hm2, _⟩ := hold2 q m1 hm1
+    have hqNeO : q ≠ outerPath := fun h => by
+      subst h; rw [a2_nodeAt_fresh_child_none alloc.extra.root pNode pPath hpNode] at hm0; cases hm0
+    have hqNeA : q ≠ aPath := fun h => by
+      subst h; rw [a2_nodeAt_fresh_child_none root1 mOuter1 outerPath hOuterAt1] at hm1; cases hm1
+    have hqNeB : q ≠ bPath := fun h => by
+      subst h; rw [a2_nodeAt_fresh_child_none root2 mOuter2 outerPath hOuterAt2] at hm2; cases hm2
+    exact ⟨hqNeO, hqNeA, hqNeB,
+      a2_not_isPrefixOf_of_nodeAt_none alloc.extra.root outerPath q m0
+        (a2_nodeAt_fresh_child_none alloc.extra.root pNode pPath hpNode) hm0,
+      a2_not_isPrefixOf_of_nodeAt_none root1 aPath q m1
+        (a2_nodeAt_fresh_child_none root1 mOuter1 outerPath hOuterAt1) hm1,
+      a2_not_isPrefixOf_of_nodeAt_none root2 bPath q m2
+        (a2_nodeAt_fresh_child_none root2 mOuter2 outerPath hOuterAt2) hm2,
+      hlocOuter q m0 hm0,
+      (locOf_childPath_eq_parentPath root1 outerPath q mOuter1 m1 hOuterAt1 hm1).trans (hlocOuter q m0 hm0),
+      (locOf_childPath_eq_parentPath root2 outerPath q mOuter2 m2 hOuterAt2 hm2).trans (hlocOuter q m0 hm0)⟩
+  · intro b hb
+    rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hnot1
+    · simp only [h1, h2, and_self, ↓reduceIte]
+      rw [hOuterOut3 b (by rcases hdisj with hd | hd <;> omega)]
+      obtain ⟨p', htr', hp'⟩ := hOuterIn2 b h1 h2 _ (hOuterIn1 b (Nat.zero_le b) (by omega))
+      have hll : locRel (some outerPath) outerPath = .Local := by
+        unfold locRel; rw [locOf_some_eq_isPrefixOf, b1_isPrefixOf_refl]; rfl
+      rw [hll] at htr'; cases fnIw1 <;> (cases htr'; exact hp')
+    · simp only [hnot1, ↓reduceIte]
+      have hm2b : mOuter2.permissions[b]? = some (.Prot (.Reserved true false)) := by
+        rw [hOuterOut2 b (b1_not_in_window hnot1)]; exact hOuterIn1 b (Nat.zero_le b) (by omega)
+      rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hnot2
+      · simp only [h1, h2, and_self, ↓reduceIte]
+        obtain ⟨p', htr', hp'⟩ := hOuterIn3 b h1 h2 _ hm2b
+        have hll : locRel (some outerPath) outerPath = .Local := by
+          unfold locRel; rw [locOf_some_eq_isPrefixOf, b1_isPrefixOf_refl]; rfl
+        rw [hll] at htr'; cases fnIw2 <;> (cases htr'; exact hp')
+      · simp only [hnot2, ↓reduceIte]; rw [hOuterOut3 b (b1_not_in_window hnot2), hm2b]
+  · intro b hb
+    rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hnot1
+    · simp only [h1, h2, and_self, ↓reduceIte]
+      rw [hAOut3 b (by rcases hdisj with hd | hd <;> omega)]; exact hAIn2 b h1 h2
+    · simp only [hnot1, ↓reduceIte]
+      have hm2b := hAOut2 b (by change b < alloc.data.length; omega) (b1_not_in_window hnot1)
+      rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hnot2
+      · simp only [h1, h2, and_self, ↓reduceIte]
+        obtain ⟨p', htr', hp'⟩ := hAIn3 b h1 h2 _ hm2b
+        have hlf : locRel (some outerPath) aPath = .Foreign := by unfold locRel; rw [hlocAOuter]; rfl
+        rw [hlf] at htr'; cases fnIw2 <;> (cases htr'; exact hp')
+      · simp only [hnot2, ↓reduceIte]; rw [hAOut3 b (b1_not_in_window hnot2), hm2b]
+  · intro q m0 hm0
+    obtain ⟨m1, hm1, _⟩ := hold1 q m0 hm0
+    obtain ⟨m2, hm2, _, _, hm2Out, hm2In⟩ := hold2 q m1 hm1
+    obtain ⟨m3, hm3, _, _, hm3Out, hm3In⟩ := hold3 q m2 hm2
+    refine ⟨m3, hm3, ?_, ?_, ?_⟩
+    · intro hl b hb
+      obtain ⟨m1', hm1', hm1U⟩ := hroot1Anc q m0 hm0 hl
+      rw [hm1'] at hm1; cases hm1
+      have hll : locRel (some outerPath) q = .Local := by unfold locRel; rw [hlocOuter q m0 hm0, hl]; rfl
+      have hm2b : m2.permissions[b]? = some (.Unprot .Unique) := by
+        rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hnot1
+        · obtain ⟨p', htr', hp'⟩ := hm2In b h1 h2 _ (hm1U b hb)
+          rw [hll] at htr'; cases fnIw1 <;> (cases htr'; exact hp')
+        · rw [hm2Out b (b1_not_in_window hnot1)]; exact hm1U b hb
+      rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hnot2
+      · obtain ⟨p', htr', hp'⟩ := hm3In b h1 h2 _ hm2b
+        rw [hll] at htr'; cases fnIw2 <;> (cases htr'; exact hp')
+      · rw [hm3Out b (b1_not_in_window hnot2)]; exact hm2b
+    · intro hl b hb
+      obtain ⟨m1', hm1', hm1P⟩ := hroot1For q m0 hm0 hl
+      rw [hm1'] at hm1; cases hm1
+      have hlf : locRel (some outerPath) q = .Foreign := by unfold locRel; rw [hlocOuter q m0 hm0, hl]; rfl
+      have hm2b : ∃ p, m2.permissions[b]? = some p ∧ permIsForeignPassive p = true := by
+        obtain ⟨p, hpb, hpas⟩ := hm1P b hb
+        rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hnot1
+        · obtain ⟨p', htr', hp'⟩ := hm2In b h1 h2 p hpb
+          rw [hlf] at htr'
+          obtain ⟨p'', htr'', hpas'⟩ := permission_isForeignPassive_preserved p _ hpas
+          rw [htr''] at htr'; cases htr'; exact ⟨p', hp', hpas'⟩
+        · rw [hm2Out b (b1_not_in_window hnot1)]; exact ⟨p, hpb, hpas⟩
+      obtain ⟨p2, hp2b, hpas2⟩ := hm2b
+      rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hnot2
+      · obtain ⟨p', htr', hp'⟩ := hm3In b h1 h2 p2 hp2b
+        rw [hlf] at htr'
+        obtain ⟨p'', htr'', hpas'⟩ := permission_isForeignPassive_preserved p2 _ hpas2
+        rw [htr''] at htr'; cases htr'; exact ⟨p', hp', hpas'⟩
+      · rw [hm3Out b (b1_not_in_window hnot2)]; exact ⟨p2, hp2b, hpas2⟩
+    · intro hqs; subst q
+      obtain ⟨s1, hs1, hs1F⟩ := hroot1S
+      rw [hs1] at hm1; cases hm1
+      have hlfO : locRel (some outerPath) qs = .Foreign := by
+        unfold locRel; rw [hlocOuter qs m0 hm0, hforS]; rfl
+      refine ⟨fun b hb ho1 ho2 => by rw [hm3Out b ho2, hm2Out b ho1]; exact hs1F b hb, fun b hb => ?_⟩
+      have hm2F : m2.permissions[b]? = some (.Unprot .Frozen) ∨ m2.permissions[b]? = some (.Unprot .Disabled) := by
+        rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hn1
+        · obtain ⟨p', htr, hp'⟩ := hm2In b h1 h2 _ (hs1F b hb)
+          rw [hlfO] at htr; cases fnIw1 <;> (cases htr; simp [hp'])
+        · rw [hm2Out b (b1_not_in_window hn1)]; exact Or.inl (hs1F b hb)
+      rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hn2
+      · rcases hm2F with hf | hd
+        · obtain ⟨p', htr, hp'⟩ := hm3In b h1 h2 _ hf
+          rw [hlfO] at htr; cases fnIw2 <;> (cases htr; simp [hp'])
+        · obtain ⟨p', htr, hp'⟩ := hm3In b h1 h2 _ hd
+          rw [hlfO] at htr; cases fnIw2 <;> (cases htr; exact Or.inr hp')
+      · rw [hm3Out b (b1_not_in_window hn2)]; exact hm2F
+  · intro q m3 hm3
+    rcases hsurj3 q m3 hm3 with ⟨rfl, rfl⟩ | ⟨m2, hm2⟩
+    · exact Or.inl ⟨rfl, rfl⟩
+    · rcases hsurj2 q m2 hm2 with ⟨rfl, rfl⟩ | ⟨m1, hm1⟩
+      · rw [hAAt3] at hm3; cases hm3; exact Or.inr (Or.inl ⟨rfl, rfl⟩)
+      · rcases hsurj1 q m1 hm1 with ⟨rfl, rfl⟩ | ⟨m0, hm0⟩
+        · rw [hOuterAt3] at hm3; cases hm3; exact Or.inr (Or.inr (Or.inl ⟨rfl, rfl⟩))
+        · exact Or.inr (Or.inr (Or.inr ⟨m0, hm0⟩))
+
+private theorem a3_nestedSplit_stores
+    (tbm3 : Gen.TreeBorrowsMemory Gen.x86_64) (hwf3 : TreeBorrowsMemory.wfLive tbm3)
+    (id : Nat) (alloc0 alloc3 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra)
+    (N : Nat) (halloc3 : tbm3.mem.allocations[id]? = some alloc3)
+    (haddr3 : alloc3.addr = alloc0.addr) (hlive3 : alloc3.live = true) (hdata3Len : alloc3.data.length = N)
+    (pPath qs outerPath aPath bPath : Gen.Path)
+    (mOuter3 mA3 mB3 : Gen.Node)
+    (hforS : locOf (some pPath) qs = false)
+    (hPreOA : outerPath.isPrefixOf aPath = true) (hPreOB : outerPath.isPrefixOf bPath = true)
+    (hlocAB : locOf (some aPath) bPath = false) (hlocBA : locOf (some bPath) aPath = false)
+    (hOldPath : ∀ q m0, nodeAt alloc0.extra.root q = some m0 →
+      locOf (some aPath) q = locOf (some pPath) q ∧ locOf (some bPath) q = locOf (some pPath) q)
+    (hOuterAt3 : nodeAt alloc3.extra.root outerPath = some mOuter3) (hOuterProt3 : mOuter3.«protected» = .Strong)
+    (hOuterLen3 : mOuter3.permissions.length = N)
+    (hAAt3 : nodeAt alloc3.extra.root aPath = some mA3) (hAProt3 : mA3.«protected» = .Strong)
+    (hALen3 : mA3.permissions.length = N)
+    (hBAt3 : nodeAt alloc3.extra.root bPath = some mB3) (hBProt3 : mB3.«protected» = .Strong)
+    (hBLen3 : mB3.permissions.length = N)
+    (off1 len1 off2 len2 : Nat) (hlen1 : 0 < len1) (hlen2 : 0 < len2)
+    (hdisj : off1 + len1 ≤ off2 ∨ off2 + len2 ≤ off1)
+    (hbound1 : off1 + len1 ≤ N) (hbound2 : off2 + len2 ≤ N)
+    (wBytes1 wBytes2 : List (Gen.AbstractByte Gen.TreeBorrowsProvenance))
+    (hw1 : wBytes1.length = len1) (hw2 : wBytes2.length = len2)
+    (al1 al2 : Nat)
+    (hal1 : Align.is_aligned ⟨al1⟩ (alloc0.addr + (off1 : Int)) = true)
+    (hal2 : Align.is_aligned ⟨al2⟩ (alloc0.addr + (off2 : Int)) = true)
+    (fnIw1 fnIw2 : Bool)
+    (hOuter3Spec : ∀ b < N, mOuter3.permissions[b]? = some
+      (if off1 ≤ b ∧ b < off1 + len1 then (if fnIw1 then .Prot .Unique else .Prot (.Reserved true false))
+       else if off2 ≤ b ∧ b < off2 + len2 then (if fnIw2 then .Prot .Unique else .Prot (.Reserved true false))
+       else .Prot (.Reserved true false)))
+    (hA3Spec : ∀ b < N, mA3.permissions[b]? = some
+      (if off1 ≤ b ∧ b < off1 + len1 then (if fnIw1 then .Prot .Unique else .Prot (.Reserved true false))
+       else if off2 ≤ b ∧ b < off2 + len2 then (if fnIw2 then .Prot .Disabled else .Prot (.Reserved false true))
+       else .Prot (.Reserved false false)))
+    (hBIn3 : ∀ b, off2 ≤ b → b < off2 + len2 →
+      mB3.permissions[b]? = some (if fnIw2 then .Prot .Unique else .Prot (.Reserved true false)))
+    (hBOut3 : ∀ b < N, (b < off2 ∨ off2 + len2 ≤ b) → mB3.permissions[b]? = some (.Prot (.Reserved false false)))
+    (hroot3Old : ∀ q m0, nodeAt alloc0.extra.root q = some m0 →
+      ∃ m3, nodeAt alloc3.extra.root q = some m3 ∧
+        (locOf (some pPath) q = true → ∀ b < N, m3.permissions[b]? = some (.Unprot .Unique)) ∧
+        (locOf (some pPath) q = false → ∀ b < N, ∃ p, m3.permissions[b]? = some p ∧ permIsForeignPassive p = true) ∧
+        (q = qs →
+          (∀ b < N, (b < off1 ∨ off1 + len1 ≤ b) → (b < off2 ∨ off2 + len2 ≤ b) →
+            m3.permissions[b]? = some (.Unprot .Frozen)) ∧
+          (∀ b < N, m3.permissions[b]? = some (.Unprot .Frozen) ∨ m3.permissions[b]? = some (.Unprot .Disabled))))
+    (hsurj3All : ∀ q m3, nodeAt alloc3.extra.root q = some m3 →
+      (q = bPath ∧ m3 = mB3) ∨ (q = aPath ∧ m3 = mA3) ∨ (q = outerPath ∧ m3 = mOuter3) ∨
+      ∃ m0, nodeAt alloc0.extra.root q = some m0) :
+    ∃ tbm4 tbm5 alloc5 mA5 mB5 mOuter5,
+      TreeBorrowsMemory.store tbm3
+          { addr := alloc0.addr + (off1 : Int), provenance := some (⟨(id : Int)⟩, aPath) } wBytes1 ⟨al1⟩ = .ok tbm4 ∧
+      TreeBorrowsMemory.store tbm4
+          { addr := alloc0.addr + (off2 : Int), provenance := some (⟨(id : Int)⟩, bPath) } wBytes2 ⟨al2⟩ = .ok tbm5 ∧
+      TreeBorrowsMemory.wfLive tbm5 ∧
+      tbm5.mem.allocations[id]? = some alloc5 ∧
+      alloc5.addr = alloc0.addr ∧ alloc5.live = true ∧ alloc5.data.length = N ∧
+      nodeAt alloc5.extra.root aPath = some mA5 ∧ mA5.«protected» = .Strong ∧ mA5.permissions.length = N ∧
+      nodeAt alloc5.extra.root bPath = some mB5 ∧ mB5.«protected» = .Strong ∧ mB5.permissions.length = N ∧
+      nodeAt alloc5.extra.root outerPath = some mOuter5 ∧ mOuter5.«protected» = .Strong ∧ mOuter5.permissions.length = N ∧
+      (∀ b < N, mA5.permissions[b]? = some
+        (if off1 ≤ b ∧ b < off1 + len1 then .Prot .Unique
+         else if off2 ≤ b ∧ b < off2 + len2 then .Prot .Disabled else .Prot (.Reserved false false))) ∧
+      (∀ b < N, mB5.permissions[b]? = some
+        (if off1 ≤ b ∧ b < off1 + len1 then .Prot .Disabled
+         else if off2 ≤ b ∧ b < off2 + len2 then .Prot .Unique else .Prot (.Reserved false false))) ∧
+      (∀ b < N, mOuter5.permissions[b]? = some
+        (if (off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2) then .Prot .Unique
+         else .Prot (.Reserved true false))) ∧
+      (∀ q m0, nodeAt alloc0.extra.root q = some m0 →
+        ∃ m5, nodeAt alloc5.extra.root q = some m5 ∧
+          (locOf (some pPath) q = true → ∀ b < N, m5.permissions[b]? = some (.Unprot .Unique)) ∧
+          (locOf (some pPath) q = false → ∀ b < N, ∃ p, m5.permissions[b]? = some p ∧ permIsForeignPassive p = true) ∧
+          (q = qs →
+            (∀ b < N, (b < off1 ∨ off1 + len1 ≤ b) → (b < off2 ∨ off2 + len2 ≤ b) →
+              m5.permissions[b]? = some (.Unprot .Frozen)) ∧
+            (∀ b, ((off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2)) →
+              m5.permissions[b]? = some (.Unprot .Disabled)))) ∧
+      (∀ q m5, nodeAt alloc5.extra.root q = some m5 → ∃ m3, nodeAt alloc3.extra.root q = some m3) := by
+  have hidlt3 : id < tbm3.mem.allocations.length := (List.getElem?_eq_some_iff.mp halloc3).1
+  have hlocOuterInA : locOf (some aPath) outerPath = true := by rw [locOf_some_eq_isPrefixOf]; exact hPreOA
+  have hlocOuterInB : locOf (some bPath) outerPath = true := by rw [locOf_some_eq_isPrefixOf]; exact hPreOB
+  have hInW2 : ∀ b, off2 ≤ b → b < off2 + len2 → ¬ (off1 ≤ b ∧ b < off1 + len1) := by
+    intro b h1 h2 ⟨h3, h4⟩; rcases hdisj with hd | hd <;> omega
+  have hacc1Point : ∀ q m3, nodeAt alloc3.extra.root q = some m3 →
+      ∃ ps', Node.transitionRange (locRel (some aPath) q) .Write off1 len1 m3.permissions = .ok ps' := by
+    intro q m3 hm3
+    obtain ⟨ps', hrun, _⟩ := transitionRange_ok_of_pointwise (locRel (some aPath) q) .Write len1 off1
+      m3.permissions (fun b hb1 hb2 => by
+        rcases hsurj3All q m3 hm3 with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨m0, hm0⟩
+        · have hlf : locRel (some aPath) q = .Foreign := by unfold locRel; rw [hlocAB]; rfl
+          rw [hlf]; exact ⟨.Prot (.Reserved false false), .Prot .Disabled,
+            hBOut3 b (by omega) (by rcases hdisj with hd | hd <;> omega), rfl⟩
+        · have hll : locRel (some q) q = .Local := by
+            unfold locRel; rw [locOf_some_eq_isPrefixOf, b1_isPrefixOf_refl]; rfl
+          rw [hll]; have hg := hA3Spec b (by omega); simp only [hb1, hb2, and_self, ↓reduceIte] at hg
+          cases fnIw1 <;> exact ⟨_, .Prot .Unique, hg, rfl⟩
+        · have hll : locRel (some aPath) q = .Local := by unfold locRel; rw [hlocOuterInA]; rfl
+          rw [hll]; have hg := hOuter3Spec b (by omega); simp only [hb1, hb2, and_self, ↓reduceIte] at hg
+          cases fnIw1 <;> exact ⟨_, .Prot .Unique, hg, rfl⟩
+        · obtain ⟨m3', hm3', hU, hP, _⟩ := hroot3Old q m0 hm0
+          rw [hm3'] at hm3; cases hm3
+          unfold locRel; rw [(hOldPath q m0 hm0).1]
+          cases hl : locOf (some pPath) q with
+          | true => exact ⟨.Unprot .Unique, .Unprot .Unique, hU hl b (by omega), rfl⟩
+          | false =>
+            obtain ⟨p, hpb, hpas⟩ := hP hl b (by omega)
+            obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p .Write hpas
+            exact ⟨p, p', hpb, htr⟩)
+    exact ⟨ps', hrun⟩
+  obtain ⟨root4, hacc4, hpost4⟩ := node_access_ok_of_pointwise .Write off1 len1 alloc3.extra.root (some aPath) hacc1Point
+  have hstore1Eq := tbm_store_eq_node_access tbm3
+    { addr := alloc0.addr + (off1 : Int), provenance := some (⟨(id : Int)⟩, aPath) }
+    wBytes1 ⟨al1⟩ id aPath alloc3 off1 rfl halloc3 hlive3 hal1
+    (by rw [haddr3]; exact a2_int_add_sub_cancel alloc0.addr _) (by omega) (by rw [hw1, hdata3Len]; exact hbound1)
+  let alloc4 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
+    { alloc3 with
+      data := alloc3.data.take off1 ++ wBytes1 ++ alloc3.data.drop (off1 + wBytes1.length),
+      extra := { root := root4 } }
+  let tbm4 : Gen.TreeBorrowsMemory Gen.x86_64 :=
+    { tbm3 with mem := { tbm3.mem with allocations := tbm3.mem.allocations.set id alloc4 } }
+  have hstore1 : TreeBorrowsMemory.store tbm3
+      { addr := alloc0.addr + (off1 : Int), provenance := some (⟨(id : Int)⟩, aPath) } wBytes1 ⟨al1⟩ = .ok tbm4 := by
+    rw [hstore1Eq, hw1, hacc4]; simp only [tbm4, alloc4, hw1, bind, Except.bind, pure, Except.pure]
+  have hwf4 : TreeBorrowsMemory.wfLive tbm4 := TreeBorrowsMemory.store_wfLive hwf3 hstore1
+  have halloc4 : tbm4.mem.allocations[id]? = some alloc4 := List.getElem?_set_self hidlt3
+  have hdata4Len : alloc4.data.length = N := by
+    simp only [alloc4, List.length_append, List.length_take, List.length_drop, hw1, hdata3Len]; omega
+  have hacc2Point : ∀ q m4, nodeAt root4 q = some m4 →
+      ∃ ps', Node.transitionRange (locRel (some bPath) q) .Write off2 len2 m4.permissions = .ok ps' := by
+    intro q m4 hm4
+    cases hm3 : nodeAt alloc3.extra.root q with
+    | none => rw [(hpost4 q).2 hm3] at hm4; cases hm4
+    | some m3 =>
+      obtain ⟨m4', hm4', _, htr4⟩ := (hpost4 q).1 m3 hm3
+      rw [hm4'] at hm4; cases hm4
+      obtain ⟨_, hout4, _⟩ := c1_transitionRange_ok_full _ .Write off1 len1 m3.permissions m4.permissions htr4
+      obtain ⟨ps', hrun, _⟩ := transitionRange_ok_of_pointwise (locRel (some bPath) q) .Write len2 off2
+        m4.permissions (fun b hb1 hb2 => by
+          rw [hout4 b (by rcases hdisj with hd | hd <;> omega)]
+          rcases hsurj3All q m3 hm3 with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨m0, hm0⟩
+          · have hll : locRel (some q) q = .Local := by
+              unfold locRel; rw [locOf_some_eq_isPrefixOf, b1_isPrefixOf_refl]; rfl
+            rw [hll]; cases fnIw2 <;> exact ⟨_, .Prot .Unique, hBIn3 b hb1 hb2, rfl⟩
+          · have hlf : locRel (some bPath) q = .Foreign := by unfold locRel; rw [hlocBA]; rfl
+            rw [hlf]; have hg := hA3Spec b (by omega); have hn1 := hInW2 b hb1 hb2
+            simp only [hn1, hb1, hb2, and_self, ↓reduceIte] at hg
+            cases fnIw2 <;> exact ⟨_, .Prot .Disabled, hg, rfl⟩
+          · have hll : locRel (some bPath) q = .Local := by unfold locRel; rw [hlocOuterInB]; rfl
+            rw [hll]; have hg := hOuter3Spec b (by omega); have hn1 := hInW2 b hb1 hb2
+            simp only [hn1, hb1, hb2, and_self, ↓reduceIte] at hg
+            cases fnIw2 <;> exact ⟨_, .Prot .Unique, hg, rfl⟩
+          · obtain ⟨m3', hm3', hU, hP, _⟩ := hroot3Old q m0 hm0
+            rw [hm3'] at hm3; cases hm3
+            unfold locRel; rw [(hOldPath q m0 hm0).2]
+            cases hl : locOf (some pPath) q with
+            | true => exact ⟨.Unprot .Unique, .Unprot .Unique, hU hl b (by omega), rfl⟩
+            | false =>
+              obtain ⟨p, hpb, hpas⟩ := hP hl b (by omega)
+              obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p .Write hpas
+              exact ⟨p, p', hpb, htr⟩)
+      exact ⟨ps', hrun⟩
+  obtain ⟨root5, hacc5, hpost5⟩ := node_access_ok_of_pointwise .Write off2 len2 root4 (some bPath) hacc2Point
+  have hstore2Eq := tbm_store_eq_node_access tbm4
+    { addr := alloc0.addr + (off2 : Int), provenance := some (⟨(id : Int)⟩, bPath) }
+    wBytes2 ⟨al2⟩ id bPath alloc4 off2 rfl halloc4 hlive3 hal2
+    (by dsimp only [alloc4]; rw [haddr3]; exact a2_int_add_sub_cancel alloc0.addr _)
+    (by omega) (by rw [hw2, hdata4Len]; exact hbound2)
+  let alloc5 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
+    { alloc4 with
+      data := alloc4.data.take off2 ++ wBytes2 ++ alloc4.data.drop (off2 + wBytes2.length),
+      extra := { root := root5 } }
+  let tbm5 : Gen.TreeBorrowsMemory Gen.x86_64 :=
+    { tbm4 with mem := { tbm4.mem with allocations := tbm4.mem.allocations.set id alloc5 } }
+  have hstore2 : TreeBorrowsMemory.store tbm4
+      { addr := alloc0.addr + (off2 : Int), provenance := some (⟨(id : Int)⟩, bPath) } wBytes2 ⟨al2⟩ = .ok tbm5 := by
+    rw [hstore2Eq, hw2, hacc5]; simp only [tbm5, alloc5, hw2, bind, Except.bind, pure, Except.pure]
+  have hwf5 : TreeBorrowsMemory.wfLive tbm5 := TreeBorrowsMemory.store_wfLive hwf4 hstore2
+  have halloc5 : tbm5.mem.allocations[id]? = some alloc5 :=
+    List.getElem?_set_self (by simp only [tbm4, List.length_set]; exact hidlt3)
+  have hdata5Len : alloc5.data.length = N := by
+    simp only [alloc5, List.length_append, List.length_take, List.length_drop, hw2, hdata4Len]; omega
+  have hroot5Of3 : ∀ q m3, nodeAt alloc3.extra.root q = some m3 →
+      ∃ m5, nodeAt root5 q = some m5 ∧ m5.«protected» = m3.«protected» ∧
+        m5.permissions.length = m3.permissions.length ∧
+        (∀ b, (b < off1 ∨ off1 + len1 ≤ b) → (b < off2 ∨ off2 + len2 ≤ b) → m5.permissions[b]? = m3.permissions[b]?) ∧
+        (∀ b, off1 ≤ b → b < off1 + len1 → ∀ p, m3.permissions[b]? = some p →
+          ∃ p', Permission.transition p .Write (locRel (some aPath) q) = .ok p' ∧ m5.permissions[b]? = some p') ∧
+        (∀ b, off2 ≤ b → b < off2 + len2 → ∀ p, m3.permissions[b]? = some p →
+          ∃ p', Permission.transition p .Write (locRel (some bPath) q) = .ok p' ∧ m5.permissions[b]? = some p') := by
+    intro q m3 hm3
+    obtain ⟨m4, hm4, hp4, htr4⟩ := (hpost4 q).1 m3 hm3
+    obtain ⟨m5, hm5, hp5, htr5⟩ := (hpost5 q).1 m4 hm4
+    obtain ⟨hl4, ho4, hi4⟩ := c1_transitionRange_ok_full _ .Write off1 len1 m3.permissions m4.permissions htr4
+    obtain ⟨hl5, ho5, hi5⟩ := c1_transitionRange_ok_full _ .Write off2 len2 m4.permissions m5.permissions htr5
+    refine ⟨m5, hm5, hp5.trans hp4, hl5.trans hl4, fun b h1 h2 => by rw [ho5 b h2, ho4 b h1],
+      fun b h1 h2 p hpb => ?_, fun b h1 h2 p hpb => ?_⟩
+    · rw [ho5 b (by rcases hdisj with hd | hd <;> omega)]
+      obtain ⟨p0, p', hp0, hst, hp'⟩ := hi4 b h1 h2; rw [hpb] at hp0; cases hp0; exact ⟨p', hst, hp'⟩
+    · obtain ⟨p0, p', hp0, hst, hp'⟩ := hi5 b h1 h2
+      rw [ho4 b (by rcases hdisj with hd | hd <;> omega), hpb] at hp0; cases hp0; exact ⟨p', hst, hp'⟩
+  obtain ⟨mA5, hAAt5, hAProt5, hALen5, hAOut5, hAIn15, hAIn25⟩ := hroot5Of3 aPath mA3 hAAt3
+  obtain ⟨mB5, hBAt5, hBProt5, hBLen5, hBOut5, hBIn15, hBIn25⟩ := hroot5Of3 bPath mB3 hBAt3
+  obtain ⟨mOuter5, hOuterAt5, hOuterProt5, hOuterLen5, hOuterOut5, hOuterIn15, hOuterIn25⟩ :=
+    hroot5Of3 outerPath mOuter3 hOuterAt3
+  refine ⟨tbm4, tbm5, alloc5, mA5, mB5, mOuter5, hstore1, hstore2, hwf5, halloc5,
+    haddr3, hlive3, hdata5Len,
+    hAAt5, hAProt5.trans hAProt3, hALen5.trans hALen3,
+    hBAt5, hBProt5.trans hBProt3, hBLen5.trans hBLen3,
+    hOuterAt5, hOuterProt5.trans hOuterProt3, hOuterLen5.trans hOuterLen3, ?_, ?_, ?_, ?_, ?_⟩
+  · intro b hb
+    rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hn1
+    · simp only [h1, h2, and_self, ↓reduceIte]
+      have hg := hA3Spec b hb; simp only [h1, h2, and_self, ↓reduceIte] at hg
+      obtain ⟨p', htr, hp'⟩ := hAIn15 b h1 h2 _ hg
+      have hll : locRel (some aPath) aPath = .Local := by unfold locRel; rw [locOf_some_eq_isPrefixOf, b1_isPrefixOf_refl]; rfl
+      rw [hll] at htr; cases fnIw1 <;> (cases htr; exact hp')
+    · simp only [hn1, ↓reduceIte]
+      rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hn2
+      · simp only [h1, h2, and_self, ↓reduceIte]
+        have hg := hA3Spec b hb; simp only [hn1, h1, h2, and_self, ↓reduceIte] at hg
+        obtain ⟨p', htr, hp'⟩ := hAIn25 b h1 h2 _ hg
+        have hlf : locRel (some bPath) aPath = .Foreign := by unfold locRel; rw [hlocBA]; rfl
+        rw [hlf] at htr; cases fnIw2 <;> (cases htr; exact hp')
+      · simp only [hn2, ↓reduceIte]
+        rw [hAOut5 b (b1_not_in_window hn1) (b1_not_in_window hn2)]
+        have hg := hA3Spec b hb; simp only [hn1, hn2, ↓reduceIte] at hg; exact hg
+  · intro b hb
+    rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hn1
+    · simp only [h1, h2, and_self, ↓reduceIte]
+      obtain ⟨p', htr, hp'⟩ := hBIn15 b h1 h2 _ (hBOut3 b hb (by rcases hdisj with hd | hd <;> omega))
+      have hlf : locRel (some aPath) bPath = .Foreign := by unfold locRel; rw [hlocAB]; rfl
+      rw [hlf] at htr; cases htr; exact hp'
+    · simp only [hn1, ↓reduceIte]
+      rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hn2
+      · simp only [h1, h2, and_self, ↓reduceIte]
+        obtain ⟨p', htr, hp'⟩ := hBIn25 b h1 h2 _ (hBIn3 b h1 h2)
+        have hll : locRel (some bPath) bPath = .Local := by unfold locRel; rw [locOf_some_eq_isPrefixOf, b1_isPrefixOf_refl]; rfl
+        rw [hll] at htr; cases fnIw2 <;> (cases htr; exact hp')
+      · simp only [hn2, ↓reduceIte]
+        rw [hBOut5 b (b1_not_in_window hn1) (b1_not_in_window hn2)]
+        exact hBOut3 b hb (b1_not_in_window hn2)
+  · intro b hb
+    rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hn1
+    · have hor : (off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2) := Or.inl ⟨h1, h2⟩
+      simp only [hor, ↓reduceIte]
+      have hg := hOuter3Spec b hb; simp only [h1, h2, and_self, ↓reduceIte] at hg
+      obtain ⟨p', htr, hp'⟩ := hOuterIn15 b h1 h2 _ hg
+      have hll : locRel (some aPath) outerPath = .Local := by unfold locRel; rw [hlocOuterInA]; rfl
+      rw [hll] at htr; cases fnIw1 <;> (cases htr; exact hp')
+    · rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hn2
+      · have hor : (off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2) := Or.inr ⟨h1, h2⟩
+        simp only [hor, ↓reduceIte]
+        have hg := hOuter3Spec b hb; simp only [hn1, h1, h2, and_self, ↓reduceIte] at hg
+        obtain ⟨p', htr, hp'⟩ := hOuterIn25 b h1 h2 _ hg
+        have hll : locRel (some bPath) outerPath = .Local := by unfold locRel; rw [hlocOuterInB]; rfl
+        rw [hll] at htr; cases fnIw2 <;> (cases htr; exact hp')
+      · have hnor : ¬ ((off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2)) := fun h => h.elim hn1 hn2
+        simp only [hnor, ↓reduceIte]
+        rw [hOuterOut5 b (b1_not_in_window hn1) (b1_not_in_window hn2)]
+        have hg := hOuter3Spec b hb; simp only [hn1, hn2, ↓reduceIte] at hg; exact hg
+  · intro q m0 hm0
+    obtain ⟨m3, hm3, hU3, hP3, hS3⟩ := hroot3Old q m0 hm0
+    obtain ⟨m5, hm5, _, _, hOut5, hIn15, hIn25⟩ := hroot5Of3 q m3 hm3
+    refine ⟨m5, hm5, ?_, ?_, ?_⟩
+    · intro hl b hb
+      rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hn1
+      · obtain ⟨p', htr, hp'⟩ := hIn15 b h1 h2 _ (hU3 hl b hb)
+        have hll : locRel (some aPath) q = .Local := by unfold locRel; rw [(hOldPath q m0 hm0).1, hl]; rfl
+        rw [hll] at htr; cases htr; exact hp'
+      · rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hn2
+        · obtain ⟨p', htr, hp'⟩ := hIn25 b h1 h2 _ (hU3 hl b hb)
+          have hll : locRel (some bPath) q = .Local := by unfold locRel; rw [(hOldPath q m0 hm0).2, hl]; rfl
+          rw [hll] at htr; cases htr; exact hp'
+        · rw [hOut5 b (b1_not_in_window hn1) (b1_not_in_window hn2)]; exact hU3 hl b hb
+    · intro hl b hb
+      obtain ⟨p3, hp3, hpas3⟩ := hP3 hl b hb
+      rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hn1
+      · obtain ⟨p', htr, hp'⟩ := hIn15 b h1 h2 p3 hp3
+        have hlf : locRel (some aPath) q = .Foreign := by unfold locRel; rw [(hOldPath q m0 hm0).1, hl]; rfl
+        rw [hlf] at htr
+        obtain ⟨p'', htr'', hpas'⟩ := permission_isForeignPassive_preserved p3 .Write hpas3
+        rw [htr''] at htr; cases htr; exact ⟨p', hp', hpas'⟩
+      · rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hn2
+        · obtain ⟨p', htr, hp'⟩ := hIn25 b h1 h2 p3 hp3
+          have hlf : locRel (some bPath) q = .Foreign := by unfold locRel; rw [(hOldPath q m0 hm0).2, hl]; rfl
+          rw [hlf] at htr
+          obtain ⟨p'', htr'', hpas'⟩ := permission_isForeignPassive_preserved p3 .Write hpas3
+          rw [htr''] at htr; cases htr; exact ⟨p', hp', hpas'⟩
+        · rw [hOut5 b (b1_not_in_window hn1) (b1_not_in_window hn2)]; exact ⟨p3, hp3, hpas3⟩
+    · intro hqs; subst q
+      obtain ⟨hSF3, hSD3⟩ := hS3 rfl
+      refine ⟨fun b hb ho1 ho2 => by rw [hOut5 b ho1 ho2]; exact hSF3 b hb ho1 ho2, fun b hor => ?_⟩
+      have hbN : b < N := by rcases hor with ⟨_, _⟩ | ⟨_, _⟩ <;> omega
+      rcases hor with ⟨h1, h2⟩ | ⟨h1, h2⟩
+      · rcases hSD3 b hbN with hf | hd
+        · obtain ⟨p', htr, hp'⟩ := hIn15 b h1 h2 _ hf
+          have hlf : locRel (some aPath) qs = .Foreign := by unfold locRel; rw [(hOldPath qs m0 hm0).1, hforS]; rfl
+          rw [hlf] at htr; cases htr; exact hp'
+        · obtain ⟨p', htr, hp'⟩ := hIn15 b h1 h2 _ hd
+          have hlf : locRel (some aPath) qs = .Foreign := by unfold locRel; rw [(hOldPath qs m0 hm0).1, hforS]; rfl
+          rw [hlf] at htr; cases htr; exact hp'
+      · rcases hSD3 b hbN with hf | hd
+        · obtain ⟨p', htr, hp'⟩ := hIn25 b h1 h2 _ hf
+          have hlf : locRel (some bPath) qs = .Foreign := by unfold locRel; rw [(hOldPath qs m0 hm0).2, hforS]; rfl
+          rw [hlf] at htr; cases htr; exact hp'
+        · obtain ⟨p', htr, hp'⟩ := hIn25 b h1 h2 _ hd
+          have hlf : locRel (some bPath) qs = .Foreign := by unfold locRel; rw [(hOldPath qs m0 hm0).2, hforS]; rfl
+          rw [hlf] at htr; cases htr; exact hp'
+  · intro q m5 hm5
+    cases hm4 : nodeAt root4 q with
+    | none => rw [(hpost5 q).2 hm4] at hm5; cases hm5
+    | some m4 =>
+      cases hm3 : nodeAt alloc3.extra.root q with
+      | none => rw [(hpost4 q).2 hm3] at hm4; cases hm4
+      | some m3 => exact ⟨m3, rfl⟩
+
+/-- Shared single-leaf protector release lemma for nested `split_at_mut` (used symmetrically
+for BOTH `aPath` and `bPath`, and in BOTH forward and reverse inner `end_call` order). -/
+private theorem a3_nestedSplit_releaseLeaf
+    (tbm : Gen.TreeBorrowsMemory Gen.x86_64) (hwf : TreeBorrowsMemory.wfLive tbm)
+    (id : Nat) (alloc : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra)
+    (N : Nat) (halloc : tbm.mem.allocations[id]? = some alloc) (hlive : alloc.live = true)
+    (xPath : Gen.Path) (mX : Gen.Node)
+    (hXAt : nodeAt alloc.extra.root xPath = some mX) (hXProt : mX.«protected» = .Strong)
+    (hXLen : mX.permissions.length = N) (offX lenX : Nat) (hboundX : offX + lenX ≤ N)
+    (hXSpec : ∀ b < N,
+      (offX ≤ b ∧ b < offX + lenX → mX.permissions[b]? = some (.Prot .Unique)) ∧
+      ((b < offX ∨ offX + lenX ≤ b) →
+        mX.permissions[b]? = some (.Prot .Disabled) ∨ mX.permissions[b]? = some (.Prot (.Reserved false false))))
+    (hnotPreX : ∀ q m, nodeAt alloc.extra.root q = some m → q ≠ xPath → xPath.isPrefixOf q = false)
+    (hpointX : ∀ q m, nodeAt alloc.extra.root q = some m → q ≠ xPath →
+      ∀ b, offX ≤ b → b < offX + lenX →
+        ∃ p p', m.permissions[b]? = some p ∧ Permission.transition p .Write (locRel (some xPath) q) = .ok p') :
+    ∃ tbm' alloc' mX',
+      TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, xPath) = .ok tbm' ∧
+      TreeBorrowsMemory.wfLive tbm' ∧
+      tbm'.mem.allocations[id]? = some alloc' ∧
+      alloc'.addr = alloc.addr ∧ alloc'.live = true ∧ alloc'.data.length = alloc.data.length ∧
+      nodeAt alloc'.extra.root xPath = some mX' ∧ mX'.«protected» = .No ∧
+      (∀ b < N, ∃ u, mX'.permissions[b]? = some (.Unprot u) ∧
+        (mX.permissions[b]? = some (.Prot .Disabled) → u = .Disabled)) ∧
+      (∀ q m, nodeAt alloc.extra.root q = some m → q ≠ xPath →
+        ∃ m', nodeAt alloc'.extra.root q = some m' ∧ m'.«protected» = m.«protected» ∧
+          m'.permissions.length = m.permissions.length ∧
+          (∀ b, b < offX ∨ offX + lenX ≤ b → m'.permissions[b]? = m.permissions[b]?) ∧
+          (∀ b, offX ≤ b → b < offX + lenX → ∀ p, m.permissions[b]? = some p →
+            ∃ p', Permission.transition p .Write (locRel (some xPath) q) = .ok p' ∧ m'.permissions[b]? = some p')) ∧
+      (∀ q m', nodeAt alloc'.extra.root q = some m' → ∃ m, nodeAt alloc.extra.root q = some m) := by
+  have hidlt : id < tbm.mem.allocations.length := (List.getElem?_eq_some_iff.mp halloc).1
+  obtain ⟨pairs, hpairs, hpairsLen, hpairsGet⟩ :=
+    b1_list_mapM_ok_of_forall Permission.unprotect mX.permissions (fun p hp => by
+      obtain ⟨b, hbLt, hbEq⟩ := List.getElem_of_mem hp
+      have hg : mX.permissions[b]? = some p := by rw [List.getElem?_eq_getElem hbLt, hbEq]
+      rcases Decidable.em (offX ≤ b ∧ b < offX + lenX) with h1 | hn1
+      · rw [(hXSpec b (by omega)).1 h1] at hg; cases hg; exact ⟨_, rfl⟩
+      · rcases (hXSpec b (by omega)).2 (b1_not_in_window hn1) with h | h <;> (rw [h] at hg; cases hg; exact ⟨_, rfl⟩))
+  obtain ⟨rootA, _, hsufA, hotherA, hrelEq⟩ :=
+    tbm_release_protector_eq tbm id xPath alloc mX pairs halloc hlive hXAt (by rw [hXProt]; rfl) hpairs
+  have haccX : ∀ i < (pairs.map Prod.snd).length,
+      (pairs.map Prod.snd)[i]? = some (if offX ≤ i ∧ i < offX + lenX then some .Write else none) := by
+    intro i hi
+    rw [List.length_map, hpairsLen] at hi
+    obtain ⟨x, y, hx, hy, hfx⟩ := hpairsGet i hi
+    rw [List.getElem?_map, hy]
+    rcases Decidable.em (offX ≤ i ∧ i < offX + lenX) with h1 | hn1
+    · rw [(hXSpec i (by omega)).1 h1] at hx; cases hx
+      simp only [h1]; cases hfx; rfl
+    · simp only [hn1, ↓reduceIte]
+      rcases (hXSpec i (by omega)).2 (b1_not_in_window hn1) with h | h <;> (rw [h] at hx; cases hx; cases hfx; rfl)
+  have hpointRel : ∀ q m1, nodeAt rootA q = some m1 → xPath.isPrefixOf q = false →
+      ∀ i < (pairs.map Prod.snd).length, ∀ k', (pairs.map Prod.snd)[i]? = some (some k') →
+        ∃ p p', m1.permissions[i]? = some p ∧ Permission.transition p k' (locRel (some xPath) q) = .ok p' := by
+    intro q m1 hm1 hnotPre i hi k' hk'
+    have hci := haccX i hi; rw [hk'] at hci
+    rcases Decidable.em (offX ≤ i ∧ i < offX + lenX) with ⟨h1, h2⟩ | hn1
+    · simp only [h1, h2, and_self, ↓reduceIte] at hci; cases hci
+      cases hm : nodeAt alloc.extra.root q with
+      | none => rw [(hotherA q hnotPre).1 hm] at hm1; cases hm1
+      | some m =>
+        obtain ⟨m1', hm1', hm1Ps, _⟩ := (hotherA q hnotPre).2 m hm
+        rw [hm1'] at hm1; cases hm1; rw [hm1Ps]
+        have hqne : q ≠ xPath := fun h => by subst h; rw [b1_isPrefixOf_refl] at hnotPre; cases hnotPre
+        exact hpointX q m hm hqne i h1 h2
+    · simp only [hn1, ↓reduceIte] at hci; cases hci
+  obtain ⟨rootB, hrel2, hpostRel⟩ :=
+    node_release_protector_ok_of_pointwise rootA (some xPath) (pairs.map Prod.snd) hpointRel
+  let alloc' : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra := { alloc with extra := { root := rootB } }
+  let tbm' : Gen.TreeBorrowsMemory Gen.x86_64 :=
+    { tbm with mem := { tbm.mem with allocations := tbm.mem.allocations.set id alloc' } }
+  have hrelOk : TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, xPath) = .ok tbm' := by
+    rw [hrelEq, hrel2]; rfl
+  have h1s := hsufA []; rw [List.append_nil] at h1s
+  obtain ⟨mX', hmX', hrelX⟩ := (hpostRel xPath).2 _ h1s
+  unfold ReleasePost at hrelX; simp only [↓reduceIte] at hrelX
+  refine ⟨tbm', alloc', mX', hrelOk, tbm_release_protector_wfLive_choiceFree hwf hrelOk,
+    List.getElem?_set_self hidlt, rfl, hlive, rfl, hmX', hrelX.1, ?_, ?_, ?_⟩
+  · intro b hb
+    rw [hrelX.2]
+    obtain ⟨x, y, hx, hy, hfx⟩ := hpairsGet b (by omega)
+    rcases Decidable.em (offX ≤ b ∧ b < offX + lenX) with h1 | hn1
+    · rw [(hXSpec b hb).1 h1] at hx; cases hx; cases hfx
+      exact ⟨.Unique, by rw [List.getElem?_map, hy]; rfl, fun h => by rw [(hXSpec b hb).1 h1] at h; cases h⟩
+    · rcases (hXSpec b hb).2 (b1_not_in_window hn1) with h | h
+      · rw [h] at hx; cases hx; cases hfx
+        exact ⟨.Disabled, by rw [List.getElem?_map, hy]; rfl, fun _ => rfl⟩
+      · rw [h] at hx; cases hx; cases hfx
+        exact ⟨.Reserved, by rw [List.getElem?_map, hy]; rfl, fun h2 => by rw [h] at h2; cases h2⟩
+  · intro q m hm hqne
+    have hnp := hnotPreX q m hm hqne
+    obtain ⟨m1, hm1, hm1Ps, hm1Prot, _⟩ := (hotherA q hnp).2 m hm
+    obtain ⟨m', hm', hrel⟩ := (hpostRel q).2 m1 hm1
+    unfold ReleasePost at hrel
+    have hneS : xPath ≠ q := hqne.symm
+    simp only [hneS, hnp, Bool.false_eq_true, ↓reduceIte] at hrel
+    refine ⟨m', hm', hrel.1.trans hm1Prot, hrel.2.1.trans (by rw [hm1Ps]), fun b hout => ?_, fun b h1 h2 p hpb => ?_⟩
+    · rcases Decidable.em (b < (pairs.map Prod.snd).length) with hblt | hbge
+      · have hs := hrel.2.2.2 b hblt; rw [haccX b hblt] at hs
+        have hn : ¬ (offX ≤ b ∧ b < offX + lenX) := fun ⟨a, c⟩ => by omega
+        simp only [hn, ↓reduceIte] at hs; rw [hs, hm1Ps]
+      · rw [hrel.2.2.1 b (by omega), hm1Ps]
+    · have hblt : b < (pairs.map Prod.snd).length := by rw [List.length_map, hpairsLen, hXLen]; omega
+      have hs := hrel.2.2.2 b hblt; rw [haccX b hblt] at hs
+      simp only [h1, h2, and_self, ↓reduceIte] at hs
+      exact hs p (by rw [hm1Ps]; exact hpb)
+  · intro q m' hm'
+    cases hm1 : nodeAt rootA q with
+    | none => rw [(hpostRel q).1 hm1] at hm'; cases hm'
+    | some m1 =>
+      rcases Decidable.em (q = xPath) with rfl | hqne
+      · exact ⟨mX, hXAt⟩
+      · cases hm : nodeAt alloc.extra.root q with
+        | none =>
+          have hnp : xPath.isPrefixOf q = false := by
+            cases hp : xPath.isPrefixOf q with
+            | false => rfl
+            | true =>
+              obtain ⟨suf, rfl⟩ := a1_isPrefixOf_eq_append xPath q hp
+              cases suf with
+              | nil => exact absurd (List.append_nil xPath) hqne
+              | cons c cs =>
+                have h1 := hsufA (c :: cs); rw [h1] at hm1
+                have h2 : nodeAt alloc.extra.root (xPath ++ (c :: cs)) = nodeAt mX (c :: cs) := by
+                  rw [a1_nodeAt_append, hXAt]; rfl
+                rw [h2] at hm; change nodeAt mX (c :: cs) = some m1 at hm1
+                rw [hm] at hm1; cases hm1
+          rw [(hotherA q hnp).1 hm] at hm1; cases hm1
+        | some m => exact ⟨m, rfl⟩
+
+/-- Symmetric two-leaf inner `end_call` lemma: releases leaf `xPath` (on `WX`) then leaf
+`yPath` (on `WY`), returning the final `root6` invariants for BOTH forward `(aPath, bPath)`
+and reverse `(bPath, aPath)` protector-release order. -/
+private theorem a3_nestedSplit_innerEndCall_ordered
+    (tbm5 : Gen.TreeBorrowsMemory Gen.x86_64) (hwf5 : TreeBorrowsMemory.wfLive tbm5)
+    (id : Nat) (alloc0 alloc5 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra)
+    (N : Nat) (halloc5 : tbm5.mem.allocations[id]? = some alloc5)
+    (hlive5 : alloc5.live = true) (hdata5Len : alloc5.data.length = N)
+    (pPath qs outerPath xPath yPath : Gen.Path)
+    (mX5 mY5 mOuter5 : Gen.Node)
+    (hforS : locOf (some pPath) qs = false)
+    (hPreOX : outerPath.isPrefixOf xPath = true) (hPreOY : outerPath.isPrefixOf yPath = true)
+    (hOutNeX : outerPath ≠ xPath) (hOutNeY : outerPath ≠ yPath) (hXYNe : xPath ≠ yPath)
+    (hlocXY : locOf (some xPath) yPath = false) (hlocYX : locOf (some yPath) xPath = false)
+    (hlocOX : locOf (some outerPath) xPath = false) (hlocOY : locOf (some outerPath) yPath = false)
+    (hOldPath : ∀ q m0, nodeAt alloc0.extra.root q = some m0 →
+      q ≠ xPath ∧ q ≠ yPath ∧
+      xPath.isPrefixOf q = false ∧ yPath.isPrefixOf q = false ∧
+      locOf (some xPath) q = locOf (some pPath) q ∧ locOf (some yPath) q = locOf (some pPath) q)
+    (hXAt5 : nodeAt alloc5.extra.root xPath = some mX5) (hXProt5 : mX5.«protected» = .Strong) (hXLen5 : mX5.permissions.length = N)
+    (hYAt5 : nodeAt alloc5.extra.root yPath = some mY5) (hYProt5 : mY5.«protected» = .Strong) (hYLen5 : mY5.permissions.length = N)
+    (hOuterAt5 : nodeAt alloc5.extra.root outerPath = some mOuter5) (hOuterProt5 : mOuter5.«protected» = .Strong)
+    (hOuterLen5 : mOuter5.permissions.length = N)
+    (offX lenX offY lenY : Nat) (hdisj : offX + lenX ≤ offY ∨ offY + lenY ≤ offX)
+    (hboundX : offX + lenX ≤ N) (hboundY : offY + lenY ≤ N)
+    (hX5Spec : ∀ b < N, mX5.permissions[b]? = some
+      (if offX ≤ b ∧ b < offX + lenX then .Prot .Unique
+       else if offY ≤ b ∧ b < offY + lenY then .Prot .Disabled else .Prot (.Reserved false false)))
+    (hY5Spec : ∀ b < N, mY5.permissions[b]? = some
+      (if offX ≤ b ∧ b < offX + lenX then .Prot .Disabled
+       else if offY ≤ b ∧ b < offY + lenY then .Prot .Unique else .Prot (.Reserved false false)))
+    (hOuter5Spec : ∀ b < N, mOuter5.permissions[b]? = some
+      (if (offX ≤ b ∧ b < offX + lenX) ∨ (offY ≤ b ∧ b < offY + lenY) then .Prot .Unique
+       else .Prot (.Reserved true false)))
+    (hroot5Old : ∀ q m0, nodeAt alloc0.extra.root q = some m0 →
+      ∃ m5, nodeAt alloc5.extra.root q = some m5 ∧
+        (locOf (some pPath) q = true → ∀ b < N, m5.permissions[b]? = some (.Unprot .Unique)) ∧
+        (locOf (some pPath) q = false → ∀ b < N, ∃ p, m5.permissions[b]? = some p ∧ permIsForeignPassive p = true) ∧
+        (q = qs →
+          (∀ b < N, (b < offX ∨ offX + lenX ≤ b) → (b < offY ∨ offY + lenY ≤ b) →
+            m5.permissions[b]? = some (.Unprot .Frozen)) ∧
+          (∀ b, ((offX ≤ b ∧ b < offX + lenX) ∨ (offY ≤ b ∧ b < offY + lenY)) →
+            m5.permissions[b]? = some (.Unprot .Disabled))))
+    (hsurj5All : ∀ q m5, nodeAt alloc5.extra.root q = some m5 →
+      q = yPath ∨ q = xPath ∨ q = outerPath ∨ ∃ m0, nodeAt alloc0.extra.root q = some m0) :
+    ∃ tbm6 alloc6 mOuter6,
+      TreeBorrowsMemory.end_call tbm5 { protectors := [(⟨(id : Int)⟩, xPath), (⟨(id : Int)⟩, yPath)] } = .ok tbm6 ∧
+      TreeBorrowsMemory.wfLive tbm6 ∧
+      tbm6.mem.allocations[id]? = some alloc6 ∧
+      alloc6.addr = alloc5.addr ∧ alloc6.live = true ∧ alloc6.data.length = N ∧
+      nodeAt alloc6.extra.root outerPath = some mOuter6 ∧ mOuter6.«protected» = .Strong ∧ mOuter6.permissions.length = N ∧
+      (∀ b < N, mOuter6.permissions[b]? = mOuter5.permissions[b]?) ∧
+      (∀ mX6, nodeAt alloc6.extra.root xPath = some mX6 → mX6.«protected» = .No) ∧
+      (∀ mY6, nodeAt alloc6.extra.root yPath = some mY6 → mY6.«protected» = .No) ∧
+      (∀ q m0, nodeAt alloc0.extra.root q = some m0 →
+        ∃ m6, nodeAt alloc6.extra.root q = some m6 ∧
+          (locOf (some pPath) q = true → ∀ b < N, m6.permissions[b]? = some (.Unprot .Unique)) ∧
+          (locOf (some pPath) q = false → ∀ b < N, ∃ p, m6.permissions[b]? = some p ∧ permIsForeignPassive p = true) ∧
+          (q = qs →
+            (∀ b < N, (b < offX ∨ offX + lenX ≤ b) → (b < offY ∨ offY + lenY ≤ b) →
+              m6.permissions[b]? = some (.Unprot .Frozen)) ∧
+            (∀ b, ((offX ≤ b ∧ b < offX + lenX) ∨ (offY ≤ b ∧ b < offY + lenY)) →
+              m6.permissions[b]? = some (.Unprot .Disabled)))) ∧
+      (∀ q m6, nodeAt alloc6.extra.root q = some m6 →
+        q = yPath ∨ q = xPath ∨ q = outerPath ∨ ∃ m0, nodeAt alloc0.extra.root q = some m0) := by
+  have hlocOuterInX : locOf (some xPath) outerPath = true := by rw [locOf_some_eq_isPrefixOf]; exact hPreOX
+  have hlocOuterInY : locOf (some yPath) outerPath = true := by rw [locOf_some_eq_isPrefixOf]; exact hPreOY
+  have hnotPreX : ∀ q m5, nodeAt alloc5.extra.root q = some m5 → q ≠ xPath → xPath.isPrefixOf q = false := by
+    intro q m5 hm5 hqne
+    rcases hsurj5All q m5 hm5 with rfl | rfl | rfl | ⟨m0, hm0⟩
+    · rw [← locOf_some_eq_isPrefixOf]; exact hlocYX
+    · exact absurd rfl hqne
+    · rw [← locOf_some_eq_isPrefixOf]; exact hlocOX
+    · exact (hOldPath q m0 hm0).2.2.1
+  have hpointX : ∀ q m5, nodeAt alloc5.extra.root q = some m5 → q ≠ xPath →
+      ∀ b, offX ≤ b → b < offX + lenX →
+        ∃ p p', m5.permissions[b]? = some p ∧ Permission.transition p .Write (locRel (some xPath) q) = .ok p' := by
+    intro q m5 hm5 hqne b h1 h2
+    rcases hsurj5All q m5 hm5 with rfl | rfl | rfl | ⟨m0, hm0⟩
+    · rw [hYAt5] at hm5; cases hm5
+      have hlf : locRel (some xPath) q = .Foreign := by unfold locRel; rw [hlocXY]; rfl
+      rw [hlf]; have hg := hY5Spec b (by omega); simp only [h1, h2, and_self, ↓reduceIte] at hg
+      exact ⟨.Prot .Disabled, .Prot .Disabled, hg, rfl⟩
+    · exact absurd rfl hqne
+    · rw [hOuterAt5] at hm5; cases hm5
+      have hll : locRel (some xPath) q = .Local := by unfold locRel; rw [hlocOuterInX]; rfl
+      rw [hll]; have hg := hOuter5Spec b (by omega)
+      have hor : (offX ≤ b ∧ b < offX + lenX) ∨ (offY ≤ b ∧ b < offY + lenY) := Or.inl ⟨h1, h2⟩
+      simp only [hor, ↓reduceIte] at hg; exact ⟨.Prot .Unique, .Prot .Unique, hg, rfl⟩
+    · obtain ⟨m5', hm5', hU5, hP5, _⟩ := hroot5Old q m0 hm0
+      rw [hm5'] at hm5; cases hm5
+      unfold locRel; rw [(hOldPath q m0 hm0).2.2.2.2.1]
+      cases hl : locOf (some pPath) q with
+      | true => exact ⟨.Unprot .Unique, .Unprot .Unique, hU5 hl b (by omega), rfl⟩
+      | false =>
+        obtain ⟨p, hpb, hpas⟩ := hP5 hl b (by omega)
+        obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p .Write hpas
+        exact ⟨p, p', hpb, htr⟩
+  obtain ⟨tbm5b, alloc5b, mX5b, hrelX, hwf5b, halloc5b, haddr5b, hlive5b, hlen5b,
+      hXAt5b, hXProt5b, hX5bU, h5bOther, hsurj5b⟩ :=
+    a3_nestedSplit_releaseLeaf tbm5 hwf5 id alloc5 N halloc5 hlive5 xPath mX5 hXAt5 hXProt5 hXLen5
+      offX lenX hboundX (fun b hb => ⟨fun h => by rw [hX5Spec b hb]; simp [h], fun hout => by
+        rw [hX5Spec b hb]
+        have hn : ¬ (offX ≤ b ∧ b < offX + lenX) := fun ⟨_, _⟩ => by omega
+        simp only [hn, ↓reduceIte]; split <;> simp⟩) hnotPreX hpointX
+  obtain ⟨mY5b, hYAt5b, hYProt5b, hYLen5b, hYOut5b, hYIn5b⟩ := h5bOther yPath mY5 hYAt5 hXYNe.symm
+  have hY5bSpec : ∀ b < N, mY5b.permissions[b]? = mY5.permissions[b]? := by
+    intro b hb
+    rcases Decidable.em (offX ≤ b ∧ b < offX + lenX) with ⟨h1, h2⟩ | hn1
+    · have hg := hY5Spec b hb; simp only [h1, h2, and_self, ↓reduceIte] at hg
+      obtain ⟨p', htr, hp'⟩ := hYIn5b b h1 h2 _ hg
+      have hlf : locRel (some xPath) yPath = .Foreign := by unfold locRel; rw [hlocXY]; rfl
+      rw [hlf] at htr; cases htr; rw [hp', hg]
+    · exact hYOut5b b (b1_not_in_window hn1)
+  have hnotPreY : ∀ q m5b, nodeAt alloc5b.extra.root q = some m5b → q ≠ yPath → yPath.isPrefixOf q = false := by
+    intro q m5b hm5b hqne
+    obtain ⟨m5, hm5⟩ := hsurj5b q m5b hm5b
+    rcases hsurj5All q m5 hm5 with rfl | rfl | rfl | ⟨m0, hm0⟩
+    · exact absurd rfl hqne
+    · rw [← locOf_some_eq_isPrefixOf]; exact hlocXY
+    · rw [← locOf_some_eq_isPrefixOf]; exact hlocOY
+    · exact (hOldPath q m0 hm0).2.2.2.1
+  have hpointY : ∀ q m5b, nodeAt alloc5b.extra.root q = some m5b → q ≠ yPath →
+      ∀ b, offY ≤ b → b < offY + lenY →
+        ∃ p p', m5b.permissions[b]? = some p ∧ Permission.transition p .Write (locRel (some yPath) q) = .ok p' := by
+    intro q m5b hm5b hqne b h1 h2
+    obtain ⟨m5, hm5⟩ := hsurj5b q m5b hm5b
+    rcases hsurj5All q m5 hm5 with rfl | rfl | rfl | ⟨m0, hm0⟩
+    · exact absurd rfl hqne
+    · rw [hXAt5b] at hm5b; cases hm5b
+      obtain ⟨u, hu, huDis⟩ := hX5bU b (by omega)
+      have hn1 : ¬ (offX ≤ b ∧ b < offX + lenX) := fun ⟨_, _⟩ => by rcases hdisj with hd | hd <;> omega
+      have hxd : mX5.permissions[b]? = some (.Prot .Disabled) := by
+        rw [hX5Spec b (by omega)]; simp only [hn1, h1, h2, and_self, ↓reduceIte]
+      rw [huDis hxd] at hu
+      have hlf : locRel (some yPath) q = .Foreign := by unfold locRel; rw [hlocYX]; rfl
+      rw [hlf]; exact ⟨.Unprot .Disabled, .Unprot .Disabled, hu, rfl⟩
+    · obtain ⟨mO5b, hmO5b, _, _, hOOut5b, _⟩ := h5bOther q mOuter5 hOuterAt5 hOutNeX
+      rw [hmO5b] at hm5b; cases hm5b
+      rw [hOOut5b b (by rcases hdisj with hd | hd <;> omega)]
+      have hll : locRel (some yPath) q = .Local := by unfold locRel; rw [hlocOuterInY]; rfl
+      rw [hll]; have hg := hOuter5Spec b (by omega)
+      have hor : (offX ≤ b ∧ b < offX + lenX) ∨ (offY ≤ b ∧ b < offY + lenY) := Or.inr ⟨h1, h2⟩
+      simp only [hor, ↓reduceIte] at hg; exact ⟨.Prot .Unique, .Prot .Unique, hg, rfl⟩
+    · obtain ⟨m5', hm5', hU5, hP5, _⟩ := hroot5Old q m0 hm0
+      rw [hm5'] at hm5; cases hm5
+      obtain ⟨m5b', hm5b', _, _, hOut5b, _⟩ := h5bOther q m5 hm5' (hOldPath q m0 hm0).1
+      rw [hm5b'] at hm5b; cases hm5b
+      rw [hOut5b b (by rcases hdisj with hd | hd <;> omega)]
+      unfold locRel; rw [(hOldPath q m0 hm0).2.2.2.2.2]
+      cases hl : locOf (some pPath) q with
+      | true => exact ⟨.Unprot .Unique, .Unprot .Unique, hU5 hl b (by omega), rfl⟩
+      | false =>
+        obtain ⟨p, hpb, hpas⟩ := hP5 hl b (by omega)
+        obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p .Write hpas
+        exact ⟨p, p', hpb, htr⟩
+  obtain ⟨tbm6, alloc6, mY6, hrelY, hwf6, halloc6, haddr6, hlive6, hlen6,
+      hYAt6, hYProt6, _, h6Other, hsurj6⟩ :=
+    a3_nestedSplit_releaseLeaf tbm5b hwf5b id alloc5b N halloc5b hlive5b yPath mY5b hYAt5b
+      (hYProt5b.trans hYProt5) (hYLen5b.trans hYLen5) offY lenY hboundY
+      (fun b hb => ⟨fun h => by
+        rw [hY5bSpec b hb, hY5Spec b hb]
+        have hn : ¬ (offX ≤ b ∧ b < offX + lenX) := fun ⟨_, _⟩ => by rcases hdisj with hd | hd <;> omega
+        simp [hn, h], fun hout => by
+        rw [hY5bSpec b hb, hY5Spec b hb]
+        have hn : ¬ (offY ≤ b ∧ b < offY + lenY) := fun ⟨_, _⟩ => by omega
+        split <;> simp⟩) hnotPreY hpointY
+  obtain ⟨mO5b, hOAt5b, hOProt5b, hOLen5b, hOOut5b, hOIn5b⟩ := h5bOther outerPath mOuter5 hOuterAt5 hOutNeX
+  obtain ⟨mOuter6, hOuterAt6, hOuterProt6, hOuterLen6, hOOut6, hOIn6⟩ := h6Other outerPath mO5b hOAt5b hOutNeY
+  obtain ⟨mX6, hXAt6, hXProt6, _, _, _⟩ := h6Other xPath mX5b hXAt5b hXYNe
+  have hendOk : TreeBorrowsMemory.end_call tbm5
+      { protectors := [(⟨(id : Int)⟩, xPath), (⟨(id : Int)⟩, yPath)] } = .ok tbm6 := by
+    unfold TreeBorrowsMemory.end_call
+    simp only [List.foldlM_cons, List.foldlM_nil, bind, Except.bind, hrelX, hrelY, pure, Except.pure]
+  refine ⟨tbm6, alloc6, mOuter6, hendOk, hwf6, halloc6, haddr6.trans haddr5b, hlive6,
+    hlen6.trans (hlen5b.trans hdata5Len), hOuterAt6, hOuterProt6.trans (hOProt5b.trans hOuterProt5),
+    hOuterLen6.trans (hOLen5b.trans hOuterLen5), ?_,
+    fun m h => by rw [hXAt6] at h; cases h; exact hXProt6.trans hXProt5b,
+    fun m h => by rw [hYAt6] at h; cases h; exact hYProt6, ?_, ?_⟩
+  · intro b hb
+    rcases Decidable.em (offY ≤ b ∧ b < offY + lenY) with ⟨h1, h2⟩ | hn2
+    · have hm5bEq : mO5b.permissions[b]? = some (.Prot .Unique) := by
+        rw [hOOut5b b (by rcases hdisj with hd | hd <;> omega), hOuter5Spec b hb]
+        have hor : (offX ≤ b ∧ b < offX + lenX) ∨ (offY ≤ b ∧ b < offY + lenY) := Or.inr ⟨h1, h2⟩
+        simp only [hor, ↓reduceIte]
+      obtain ⟨p', htr, hp'⟩ := hOIn6 b h1 h2 _ hm5bEq
+      have hll : locRel (some yPath) outerPath = .Local := by unfold locRel; rw [hlocOuterInY]; rfl
+      rw [hll] at htr; cases htr; rw [hp', hOuter5Spec b hb]
+      have hor : (offX ≤ b ∧ b < offX + lenX) ∨ (offY ≤ b ∧ b < offY + lenY) := Or.inr ⟨h1, h2⟩
+      simp only [hor, ↓reduceIte]
+    · rw [hOOut6 b (b1_not_in_window hn2)]
+      rcases Decidable.em (offX ≤ b ∧ b < offX + lenX) with ⟨h1, h2⟩ | hn1
+      · have hg := hOuter5Spec b hb
+        have hor : (offX ≤ b ∧ b < offX + lenX) ∨ (offY ≤ b ∧ b < offY + lenY) := Or.inl ⟨h1, h2⟩
+        simp only [hor, ↓reduceIte] at hg
+        obtain ⟨p', htr, hp'⟩ := hOIn5b b h1 h2 _ hg
+        have hll : locRel (some xPath) outerPath = .Local := by unfold locRel; rw [hlocOuterInX]; rfl
+        rw [hll] at htr; cases htr; rw [hp', hg]
+      · exact hOOut5b b (b1_not_in_window hn1)
+  · intro q m0 hm0
+    obtain ⟨m5, hm5, hU5, hP5, hS5⟩ := hroot5Old q m0 hm0
+    obtain ⟨m5b, hm5b, _, _, hOut5b, hIn5b⟩ := h5bOther q m5 hm5 (hOldPath q m0 hm0).1
+    obtain ⟨m6, hm6, _, _, hOut6, hIn6⟩ := h6Other q m5b hm5b (hOldPath q m0 hm0).2.1
+    refine ⟨m6, hm6, ?_, ?_, ?_⟩
+    · intro hl b hb
+      have hm5bU : m5b.permissions[b]? = some (.Unprot .Unique) := by
+        rcases Decidable.em (offX ≤ b ∧ b < offX + lenX) with ⟨h1, h2⟩ | hn1
+        · obtain ⟨p', htr, hp'⟩ := hIn5b b h1 h2 _ (hU5 hl b hb)
+          have hll : locRel (some xPath) q = .Local := by unfold locRel; rw [(hOldPath q m0 hm0).2.2.2.2.1, hl]; rfl
+          rw [hll] at htr; cases htr; exact hp'
+        · rw [hOut5b b (b1_not_in_window hn1)]; exact hU5 hl b hb
+      rcases Decidable.em (offY ≤ b ∧ b < offY + lenY) with ⟨h1, h2⟩ | hn2
+      · obtain ⟨p', htr, hp'⟩ := hIn6 b h1 h2 _ hm5bU
+        have hll : locRel (some yPath) q = .Local := by unfold locRel; rw [(hOldPath q m0 hm0).2.2.2.2.2, hl]; rfl
+        rw [hll] at htr; cases htr; exact hp'
+      · rw [hOut6 b (b1_not_in_window hn2)]; exact hm5bU
+    · intro hl b hb
+      have hm5bP : ∃ p, m5b.permissions[b]? = some p ∧ permIsForeignPassive p = true := by
+        obtain ⟨p5, hp5, hpas5⟩ := hP5 hl b hb
+        rcases Decidable.em (offX ≤ b ∧ b < offX + lenX) with ⟨h1, h2⟩ | hn1
+        · obtain ⟨p', htr, hp'⟩ := hIn5b b h1 h2 p5 hp5
+          have hlf : locRel (some xPath) q = .Foreign := by unfold locRel; rw [(hOldPath q m0 hm0).2.2.2.2.1, hl]; rfl
+          rw [hlf] at htr
+          obtain ⟨p'', htr'', hpas'⟩ := permission_isForeignPassive_preserved p5 .Write hpas5
+          rw [htr''] at htr; cases htr; exact ⟨p', hp', hpas'⟩
+        · rw [hOut5b b (b1_not_in_window hn1)]; exact ⟨p5, hp5, hpas5⟩
+      obtain ⟨p5b, hp5b, hpas5b⟩ := hm5bP
+      rcases Decidable.em (offY ≤ b ∧ b < offY + lenY) with ⟨h1, h2⟩ | hn2
+      · obtain ⟨p', htr, hp'⟩ := hIn6 b h1 h2 p5b hp5b
+        have hlf : locRel (some yPath) q = .Foreign := by unfold locRel; rw [(hOldPath q m0 hm0).2.2.2.2.2, hl]; rfl
+        rw [hlf] at htr
+        obtain ⟨p'', htr'', hpas'⟩ := permission_isForeignPassive_preserved p5b .Write hpas5b
+        rw [htr''] at htr; cases htr; exact ⟨p', hp', hpas'⟩
+      · rw [hOut6 b (b1_not_in_window hn2)]; exact ⟨p5b, hp5b, hpas5b⟩
+    · intro hqs; subst q
+      obtain ⟨hSF5, hSD5⟩ := hS5 rfl
+      refine ⟨fun b hb ho1 ho2 => by rw [hOut6 b ho2, hOut5b b ho1]; exact hSF5 b hb ho1 ho2, fun b hor => ?_⟩
+      rcases hor with ⟨h1, h2⟩ | ⟨h1, h2⟩
+      · rw [hOut6 b (by rcases hdisj with hd | hd <;> omega)]
+        obtain ⟨p', htr, hp'⟩ := hIn5b b h1 h2 _ (hSD5 b (Or.inl ⟨h1, h2⟩))
+        have hlf : locRel (some xPath) qs = .Foreign := by unfold locRel; rw [(hOldPath qs m0 hm0).2.2.2.2.1, hforS]; rfl
+        rw [hlf] at htr; cases htr; exact hp'
+      · have hm5bD : m5b.permissions[b]? = some (.Unprot .Disabled) := by
+          rw [hOut5b b (by rcases hdisj with hd | hd <;> omega)]; exact hSD5 b (Or.inr ⟨h1, h2⟩)
+        obtain ⟨p', htr, hp'⟩ := hIn6 b h1 h2 _ hm5bD
+        have hlf : locRel (some yPath) qs = .Foreign := by unfold locRel; rw [(hOldPath qs m0 hm0).2.2.2.2.2, hforS]; rfl
+        rw [hlf] at htr; cases htr; exact hp'
+  · intro q m6 hm6
+    obtain ⟨m5b, hm5b⟩ := hsurj6 q m6 hm6
+    obtain ⟨m5, hm5⟩ := hsurj5b q m5b hm5b
+    exact hsurj5All q m5 hm5
+
+private theorem a3_nestedSplit_outerEndCall_and_reads
+    (tbm6 : Gen.TreeBorrowsMemory Gen.x86_64) (hwf6 : TreeBorrowsMemory.wfLive tbm6)
+    (id : Nat) (alloc0 alloc6 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra)
+    (N : Nat) (halloc6 : tbm6.mem.allocations[id]? = some alloc6)
+    (haddr6 : alloc6.addr = alloc0.addr) (hlive6 : alloc6.live = true) (hdata6Len : alloc6.data.length = N)
+    (pPath qs outerPath aPath bPath : Gen.Path) (sNode mOuter6 : Gen.Node)
+    (hsNode : nodeAt alloc0.extra.root qs = some sNode)
+    (hforS : locOf (some pPath) qs = false)
+    (hancS : ∀ q m, nodeAt alloc0.extra.root q = some m → locOf (some qs) q = true →
+      q = qs ∨ locOf (some pPath) q = true)
+    (hPreOA : outerPath.isPrefixOf aPath = true) (hPreOB : outerPath.isPrefixOf bPath = true)
+    (hOutNeA : outerPath ≠ aPath) (hOutNeB : outerPath ≠ bPath)
+    (hOldPath : ∀ q m0, nodeAt alloc0.extra.root q = some m0 →
+      q ≠ outerPath ∧ outerPath.isPrefixOf q = false ∧ locOf (some outerPath) q = locOf (some pPath) q)
+    (hOuterAt6 : nodeAt alloc6.extra.root outerPath = some mOuter6)
+    (hOuterProt6 : mOuter6.«protected» = .Strong) (hOuterLen6 : mOuter6.permissions.length = N)
+    (off1 len1 off2 len2 : Nat) (hbound1 : off1 + len1 ≤ N) (hbound2 : off2 + len2 ≤ N)
+    (hOuter6Spec : ∀ b < N, mOuter6.permissions[b]? = some
+      (if (off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2) then .Prot .Unique
+       else .Prot (.Reserved true false)))
+    (hA6Unprot : ∀ m, nodeAt alloc6.extra.root aPath = some m → m.«protected» = .No)
+    (hB6Unprot : ∀ m, nodeAt alloc6.extra.root bPath = some m → m.«protected» = .No)
+    (hroot6Old : ∀ q m0, nodeAt alloc0.extra.root q = some m0 →
+      ∃ m6, nodeAt alloc6.extra.root q = some m6 ∧
+        (locOf (some pPath) q = true → ∀ b < N, m6.permissions[b]? = some (.Unprot .Unique)) ∧
+        (locOf (some pPath) q = false → ∀ b < N, ∃ p, m6.permissions[b]? = some p ∧ permIsForeignPassive p = true) ∧
+        (q = qs →
+          (∀ b < N, (b < off1 ∨ off1 + len1 ≤ b) → (b < off2 ∨ off2 + len2 ≤ b) →
+            m6.permissions[b]? = some (.Unprot .Frozen)) ∧
+          (∀ b, ((off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2)) →
+            m6.permissions[b]? = some (.Unprot .Disabled))))
+    (hsurj6All : ∀ q m6, nodeAt alloc6.extra.root q = some m6 →
+      q = bPath ∨ q = aPath ∨ q = outerPath ∨ ∃ m0, nodeAt alloc0.extra.root q = some m0) :
+    ∃ tbm7 alloc7 sFinal,
+      TreeBorrowsMemory.end_call tbm6 { protectors := [(⟨(id : Int)⟩, outerPath)] } = .ok tbm7 ∧
+      TreeBorrowsMemory.wfLive tbm7 ∧
+      tbm7.mem.allocations[id]? = some alloc7 ∧
+      nodeAt alloc7.extra.root qs = some sFinal ∧
+      (∀ b < N, (b < off1 ∨ off1 + len1 ≤ b) → (b < off2 ∨ off2 + len2 ≤ b) →
+        sFinal.permissions[b]? = some (.Unprot .Frozen)) ∧
+      (∀ b, ((off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2)) →
+        sFinal.permissions[b]? = some (.Unprot .Disabled)) ∧
+      (∀ (oR lR alR : Nat), 0 < lR → oR + lR ≤ N →
+        (oR + lR ≤ off1 ∨ off1 + len1 ≤ oR) → (oR + lR ≤ off2 ∨ off2 + len2 ≤ oR) →
+        Align.is_aligned ⟨alR⟩ (alloc0.addr + (oR : Int)) = true →
+        ∃ bytes tbmR, TreeBorrowsMemory.load tbm7
+          { addr := alloc0.addr + (oR : Int), provenance := some (⟨(id : Int)⟩, qs) }
+          ⟨lR⟩ ⟨alR⟩ = .ok (bytes, tbmR)) ∧
+      (∀ (oR lR alR : Nat) (b : Nat),
+        ((off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2)) →
+        oR ≤ b → b < oR + lR → lR ≠ 0 → oR + lR ≤ N →
+        Align.is_aligned ⟨alR⟩ (alloc0.addr + (oR : Int)) = true →
+        ∀ res, TreeBorrowsMemory.load tbm7
+          { addr := alloc0.addr + (oR : Int), provenance := some (⟨(id : Int)⟩, qs) }
+          ⟨lR⟩ ⟨alR⟩ ≠ .ok res) := by
+  have hidlt6 : id < tbm6.mem.allocations.length := (List.getElem?_eq_some_iff.mp halloc6).1
+  obtain ⟨pairsO, hpairsO, hpairsOLen, hpairsOGet⟩ :=
+    b1_list_mapM_ok_of_forall Permission.unprotect mOuter6.permissions (fun p hp => by
+      obtain ⟨b, hbLt, hbEq⟩ := List.getElem_of_mem hp
+      have hg : mOuter6.permissions[b]? = some p := by rw [List.getElem?_eq_getElem hbLt, hbEq]
+      rw [hOuter6Spec b (by omega)] at hg; cases hg; split <;> exact ⟨_, rfl⟩)
+  obtain ⟨root7a, _, hsuf7a, hother7a, hrelOEq⟩ :=
+    tbm_release_protector_eq tbm6 id outerPath alloc6 mOuter6 pairsO halloc6 hlive6 hOuterAt6
+      (by rw [hOuterProt6]; rfl) hpairsO
+  have haccO : ∀ i < (pairsO.map Prod.snd).length,
+      (pairsO.map Prod.snd)[i]? = some (some
+        (if (off1 ≤ i ∧ i < off1 + len1) ∨ (off2 ≤ i ∧ i < off2 + len2) then .Write else .Read)) := by
+    intro i hi
+    rw [List.length_map, hpairsOLen] at hi
+    obtain ⟨x, y, hx, hy, hfx⟩ := hpairsOGet i hi
+    rw [hOuter6Spec i (by omega)] at hx; cases hx
+    rw [List.getElem?_map, hy]
+    by_cases hor : (off1 ≤ i ∧ i < off1 + len1) ∨ (off2 ≤ i ∧ i < off2 + len2)
+    · simp only [hor, ↓reduceIte] at hfx ⊢; cases hfx; rfl
+    · simp only [hor, ↓reduceIte] at hfx ⊢; cases hfx; rfl
+  have hpointRelO : ∀ q m1, nodeAt root7a q = some m1 → outerPath.isPrefixOf q = false →
+      ∀ i < (pairsO.map Prod.snd).length, ∀ k', (pairsO.map Prod.snd)[i]? = some (some k') →
+        ∃ p p', m1.permissions[i]? = some p ∧ Permission.transition p k' (locRel (some outerPath) q) = .ok p' := by
+    intro q m1 hm1 hnotPre i hi k' hk'
+    have hci := haccO i hi; rw [hk'] at hci; cases hci
+    have hiN : i < N := by rw [List.length_map, hpairsOLen, hOuterLen6] at hi; exact hi
+    cases hm6 : nodeAt alloc6.extra.root q with
+    | none => rw [(hother7a q hnotPre).1 hm6] at hm1; cases hm1
+    | some m6 =>
+      obtain ⟨m1', hm1', hm1Ps, _⟩ := (hother7a q hnotPre).2 m6 hm6
+      rw [hm1'] at hm1; cases hm1; rw [hm1Ps]
+      rcases hsurj6All q m6 hm6 with rfl | rfl | rfl | ⟨m0, hm0⟩
+      · rw [hPreOB] at hnotPre; cases hnotPre
+      · rw [hPreOA] at hnotPre; cases hnotPre
+      · rw [b1_isPrefixOf_refl] at hnotPre; cases hnotPre
+      · obtain ⟨m6', hm6', hU6, hP6, _⟩ := hroot6Old q m0 hm0
+        rw [hm6'] at hm6; cases hm6
+        unfold locRel; rw [(hOldPath q m0 hm0).2.2]
+        cases hl : locOf (some pPath) q with
+        | true => split <;> exact ⟨.Unprot .Unique, .Unprot .Unique, hU6 hl i hiN, rfl⟩
+        | false =>
+          obtain ⟨p, hpb, hpas⟩ := hP6 hl i hiN
+          obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p _ hpas
+          exact ⟨p, p', hpb, htr⟩
+  obtain ⟨root7, hrelO2, hpostRelO⟩ :=
+    node_release_protector_ok_of_pointwise root7a (some outerPath) (pairsO.map Prod.snd) hpointRelO
+  let alloc7 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra := { alloc6 with extra := { root := root7 } }
+  let tbm7 : Gen.TreeBorrowsMemory Gen.x86_64 :=
+    { tbm6 with mem := { tbm6.mem with allocations := tbm6.mem.allocations.set id alloc7 } }
+  have hrelOOk : TreeBorrowsMemory.release_protector tbm6 (⟨(id : Int)⟩, outerPath) = .ok tbm7 := by
+    rw [hrelOEq, hrelO2]; rfl
+  have hwf7 : TreeBorrowsMemory.wfLive tbm7 := tbm_release_protector_wfLive_choiceFree hwf6 hrelOOk
+  have halloc7 : tbm7.mem.allocations[id]? = some alloc7 := List.getElem?_set_self hidlt6
+  have hendOuter : TreeBorrowsMemory.end_call tbm6 { protectors := [(⟨(id : Int)⟩, outerPath)] } = .ok tbm7 := by
+    unfold TreeBorrowsMemory.end_call
+    simp only [List.foldlM_cons, List.foldlM_nil, bind, Except.bind, hrelOOk, pure, Except.pure]
+  obtain ⟨s6, hs6, _, _, hS6⟩ := hroot6Old qs sNode hsNode
+  obtain ⟨hSF6, hSD6⟩ := hS6 rfl
+  have hnotPreOS := (hOldPath qs sNode hsNode).2.1
+  obtain ⟨s7a, hs7a, hs7aPs, _, _⟩ := (hother7a qs hnotPreOS).2 s6 hs6
+  obtain ⟨sFinal, hsFinal, hsRelO⟩ := (hpostRelO qs).2 s7a hs7a
+  have hneOS : outerPath ≠ qs := (hOldPath qs sNode hsNode).1.symm
+  unfold ReleasePost at hsRelO
+  simp only [hneOS, hnotPreOS, Bool.false_eq_true, ↓reduceIte] at hsRelO
+  have hsFinalFrz : ∀ b < N, (b < off1 ∨ off1 + len1 ≤ b) → (b < off2 ∨ off2 + len2 ≤ b) →
+      sFinal.permissions[b]? = some (.Unprot .Frozen) := by
+    intro b hb ho1 ho2
+    have hblt : b < (pairsO.map Prod.snd).length := by rw [List.length_map, hpairsOLen, hOuterLen6]; exact hb
+    have hsb := hsRelO.2.2.2 b hblt; rw [haccO b hblt] at hsb
+    have hnor : ¬ ((off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2)) := by omega
+    simp only [hnor, ↓reduceIte] at hsb
+    obtain ⟨p', htr, hp'⟩ := hsb (.Unprot .Frozen) (by rw [hs7aPs]; exact hSF6 b hb ho1 ho2)
+    have hlf : locRel (some outerPath) qs = .Foreign := by unfold locRel; rw [(hOldPath qs sNode hsNode).2.2, hforS]; rfl
+    rw [hlf] at htr; cases htr; exact hp'
+  have hsFinalDis : ∀ b, ((off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2)) →
+      sFinal.permissions[b]? = some (.Unprot .Disabled) := by
+    intro b hor
+    have hbN : b < N := by rcases hor with ⟨_, _⟩ | ⟨_, _⟩ <;> omega
+    have hblt : b < (pairsO.map Prod.snd).length := by rw [List.length_map, hpairsOLen, hOuterLen6]; exact hbN
+    have hsb := hsRelO.2.2.2 b hblt; rw [haccO b hblt] at hsb
+    simp only [hor, ↓reduceIte] at hsb
+    obtain ⟨p', htr, hp'⟩ := hsb (.Unprot .Disabled) (by rw [hs7aPs]; exact hSD6 b hor)
+    have hlf : locRel (some outerPath) qs = .Foreign := by unfold locRel; rw [(hOldPath qs sNode hsNode).2.2, hforS]; rfl
+    rw [hlf] at htr; cases htr; exact hp'
+  refine ⟨tbm7, alloc7, sFinal, hendOuter, hwf7, halloc7, hsFinal, hsFinalFrz, hsFinalDis, ?_, ?_⟩
+  · intro oR lR alR hlR hbdR hd1 hd2 halR
+    have hpointRd : ∀ q m7, nodeAt root7 q = some m7 →
+        ∃ ps', Node.transitionRange (locRel (some qs) q) .Read oR lR m7.permissions = .ok ps' := by
+      intro q m7 hm7
+      obtain ⟨ps', hrun, _⟩ := transitionRange_ok_of_pointwise (locRel (some qs) q) .Read lR oR
+        m7.permissions (fun b hb1 hb2 => by
+          have hbN : b < N := by omega
+          have ho1 : b < off1 ∨ off1 + len1 ≤ b := by rcases hd1 with hd | hd <;> omega
+          have ho2 : b < off2 ∨ off2 + len2 ≤ b := by rcases hd2 with hd | hd <;> omega
+          have hwf7Root : Node.wf alloc7.data.length root7 := hwf7 alloc7 (List.mem_of_getElem? halloc7) hlive6
+          have hm7Wf := c1_nodeWf_len_and_prot alloc7.data.length m7
+            (c1_nodeWf_nodeAt root7 alloc7.data.length hwf7Root q m7 hm7)
+          have hblt7 : b < m7.permissions.length := by rw [hm7Wf.1]; change b < alloc6.data.length; omega
+          cases hm1 : nodeAt root7a q with
+          | none => rw [(hpostRelO q).1 hm1] at hm7; cases hm7
+          | some m1 =>
+            rcases Decidable.em (outerPath.isPrefixOf q = true) with hpreO | hnotPreO
+            · have hqForS : locOf (some qs) q = false := by
+                rw [locOf_some_eq_isPrefixOf]
+                cases hqsPre : q.isPrefixOf qs with
+                | false => rfl
+                | true => rw [a3_isPrefixOf_trans outerPath q qs hpreO hqsPre] at hnotPreOS; cases hnotPreOS
+              have hm7Unprot : m7.«protected» = .No := by
+                rcases Decidable.em (q = outerPath) with rfl | hqNeO
+                · have h1 := hsuf7a []; rw [List.append_nil] at h1
+                  obtain ⟨m7', hm7', hr⟩ := (hpostRelO q).2 _ h1
+                  rw [hm7'] at hm7; cases hm7; unfold ReleasePost at hr; simp only [↓reduceIte] at hr; exact hr.1
+                · obtain ⟨m7', hm7', hr⟩ := (hpostRelO q).2 m1 hm1
+                  rw [hm7'] at hm7; cases hm7; unfold ReleasePost at hr
+                  have hneS' : outerPath ≠ q := Ne.symm hqNeO
+                  simp only [hneS', hpreO, ↓reduceIte] at hr; subst hr
+                  obtain ⟨suf, rfl⟩ := a1_isPrefixOf_eq_append outerPath q hpreO
+                  cases suf with
+                  | nil => exact absurd (List.append_nil outerPath) hqNeO
+                  | cons c cs =>
+                    have hm6q : nodeAt alloc6.extra.root (outerPath ++ (c :: cs)) = some m7 := by
+                      rw [a1_nodeAt_append, hOuterAt6]; rw [hsuf7a (c :: cs)] at hm1; exact hm1
+                    rcases hsurj6All _ m7 hm6q with hEqB | hEqA | hEqO | ⟨m0, hm0⟩
+                    · exact hB6Unprot m7 (hEqB ▸ hm6q)
+                    · exact hA6Unprot m7 (hEqA ▸ hm6q)
+                    · exact absurd hEqO hqNeO
+                    · rw [(hOldPath _ m0 hm0).2.1] at hpreO; cases hpreO
+              obtain ⟨p, hpb⟩ : ∃ p, m7.permissions[b]? = some p := ⟨m7.permissions[b], List.getElem?_eq_getElem hblt7⟩
+              have hmp := hm7Wf.2 p (List.mem_of_getElem? hpb)
+              rw [hm7Unprot] at hmp
+              have hlf : locRel (some qs) q = .Foreign := by unfold locRel; rw [hqForS]; rfl
+              rw [hlf]
+              cases p with
+              | Prot _ => cases hmp
+              | Unprot u => cases u <;> exact ⟨_, _, hpb, rfl⟩
+            · have hnpF : outerPath.isPrefixOf q = false := Bool.eq_false_iff.mpr hnotPreO
+              cases hm6 : nodeAt alloc6.extra.root q with
+              | none => rw [(hother7a q hnpF).1 hm6] at hm1; cases hm1
+              | some m6 =>
+                obtain ⟨m1', hm1', hm1Ps, _⟩ := (hother7a q hnpF).2 m6 hm6
+                rw [hm1'] at hm1; cases hm1
+                rcases hsurj6All q m6 hm6 with rfl | rfl | rfl | ⟨m0, hm0⟩
+                · rw [hPreOB] at hnpF; cases hnpF
+                · rw [hPreOA] at hnpF; cases hnpF
+                · rw [b1_isPrefixOf_refl] at hnpF; cases hnpF
+                · obtain ⟨m6', hm6', hU6, hP6, _⟩ := hroot6Old q m0 hm0
+                  rw [hm6'] at hm6; cases hm6
+                  obtain ⟨m7', hm7', hrO⟩ := (hpostRelO q).2 m1 hm1'
+                  rw [hm7'] at hm7; cases hm7
+                  unfold ReleasePost at hrO
+                  have hneOq : outerPath ≠ q := (hOldPath q m0 hm0).1.symm
+                  simp only [hneOq, hnpF, Bool.false_eq_true, ↓reduceIte] at hrO
+                  have hbltO : b < (pairsO.map Prod.snd).length := by rw [List.length_map, hpairsOLen, hOuterLen6]; exact hbN
+                  have hsb := hrO.2.2.2 b hbltO; rw [haccO b hbltO] at hsb
+                  have hnor : ¬ ((off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2)) := by omega
+                  simp only [hnor, ↓reduceIte] at hsb
+                  unfold locRel
+                  cases hlS : locOf (some qs) q with
+                  | true =>
+                    rcases hancS q m0 hm0 hlS with rfl | hlP
+                    · rw [hsFinal] at hm7'; cases hm7'
+                      exact ⟨.Unprot .Frozen, .Unprot .Frozen, hsFinalFrz b hbN ho1 ho2, rfl⟩
+                    · obtain ⟨p7, htrO, hp7⟩ := hsb (.Unprot .Unique) (by rw [hm1Ps]; exact hU6 hlP b hbN)
+                      have hllO : locRel (some outerPath) q = .Local := by
+                        unfold locRel; rw [(hOldPath q m0 hm0).2.2, hlP]; rfl
+                      rw [hllO] at htrO; cases htrO; exact ⟨.Unprot .Unique, .Unprot .Unique, hp7, rfl⟩
+                  | false =>
+                    cases hlP : locOf (some pPath) q with
+                    | true =>
+                      obtain ⟨p7, htrO, hp7⟩ := hsb (.Unprot .Unique) (by rw [hm1Ps]; exact hU6 hlP b hbN)
+                      have hllO : locRel (some outerPath) q = .Local := by
+                        unfold locRel; rw [(hOldPath q m0 hm0).2.2, hlP]; rfl
+                      rw [hllO] at htrO; cases htrO; exact ⟨.Unprot .Unique, .Unprot .Frozen, hp7, rfl⟩
+                    | false =>
+                      obtain ⟨p6, hp6, hpas6⟩ := hP6 hlP b hbN
+                      obtain ⟨p7, htrO, hp7⟩ := hsb p6 (by rw [hm1Ps]; exact hp6)
+                      have hlfO : locRel (some outerPath) q = .Foreign := by
+                        unfold locRel; rw [(hOldPath q m0 hm0).2.2, hlP]; rfl
+                      rw [hlfO] at htrO
+                      obtain ⟨p7', htr7', hpas7⟩ := permission_isForeignPassive_preserved p6 .Read hpas6
+                      rw [htr7'] at htrO; cases htrO
+                      obtain ⟨p8, htr8, _⟩ := permission_isForeignPassive_preserved p7 .Read hpas7
+                      exact ⟨p7, p8, hp7, htr8⟩)
+      exact ⟨ps', hrun⟩
+    obtain ⟨rootR, haccR, _⟩ := node_access_ok_of_pointwise .Read oR lR root7 (some qs) hpointRd
+    have hldEq := tbm_load_eq_node_access tbm7
+      { addr := alloc0.addr + (oR : Int), provenance := some (⟨(id : Int)⟩, qs) } lR ⟨alR⟩ id qs alloc7 oR
+      rfl halloc7 hlive6 halR
+      (by dsimp only [alloc7]; rw [haddr6]; exact a2_int_add_sub_cancel alloc0.addr _)
+      (by omega) (by change oR + lR ≤ alloc6.data.length; omega)
+    rw [hldEq, haccR]; exact ⟨_, _, rfl⟩
+  · intro oR lR alR b hor h1 h2 hlR hbdR halR res hld
+    rw [tbm_load_eq_node_access tbm7 _ lR ⟨alR⟩ id qs alloc7 oR
+      rfl halloc7 hlive6 halR
+      (by dsimp only [alloc7]; rw [haddr6]; exact a2_int_add_sub_cancel alloc0.addr _)
+      hlR (by change oR + lR ≤ alloc6.data.length; omega)] at hld
+    obtain ⟨r', hacc', _⟩ := nwsr_bind_ok hld
+    exact node_access_read_through_disabled_fails root7 qs sFinal b oR lR hsFinal
+      (hsFinalDis b hor) h1 h2 r' hacc'
+
 /-- **Symbolic nested `split_at_mut` theorem on real `TreeBorrowsMemory` for
 ARBITRARY slice length `N`, ARBITRARY disjoint sub-slices `[off1, off1 + len1)`
 and `[off2, off2 + len2)`, ARBITRARY inner policies `fnIw1` / `fnIw2`, AND
@@ -16514,8 +16710,9 @@ q = qs ∨ locOf (some pPath) q = true`), and ANY surrounding foreign nodes hold
    outer `#[rustc_no_writable]` `FnEntry` retag on `[0, N)` → nested sub-slice 1
    `FnEntry` retag on `[off1, off1 + len1)` (policy `fnIw1`) → nested sub-slice 2
    `FnEntry` retag on `[off2, off2 + len2)` (policy `fnIw2`) → store `wBytes1` →
-   store `wBytes2` → inner `end_call` → outer `end_call` all succeed, preserving
-   `TreeBorrowsMemory.wfLive` at every step;
+   store `wBytes2` → inner `end_call` (in BOTH forward AND reverse protector release
+   order!) → outer `end_call` all succeed, preserving `TreeBorrowsMemory.wfLive` at
+   every step;
 2. **Exact byte-precise post-exit sibling reader classification**:
    - on EVERY unwritten byte `b < N` outside `[off1, off1 + len1) ∪ [off2, off2 + len2)`,
      the sibling `qs` STILL holds `.Unprot .Frozen`, and EVERY aligned
@@ -16572,6 +16769,8 @@ theorem tbm_nestedSplitAtMut_symbolic
       TreeBorrowsMemory.store tbm3 aPtr.thin_pointer wBytes1 ⟨al1⟩ = .ok tbm4 ∧
       TreeBorrowsMemory.store tbm4 bPtr.thin_pointer wBytes2 ⟨al2⟩ = .ok tbm5 ∧
       TreeBorrowsMemory.end_call tbm5 feInner2 = .ok tbm6 ∧
+      (∃ tbm6Rev, TreeBorrowsMemory.end_call tbm5 { protectors := feInner2.protectors.reverse } = .ok tbm6Rev ∧
+        TreeBorrowsMemory.wfLive tbm6Rev) ∧
       TreeBorrowsMemory.end_call tbm6 feOuter = .ok tbm7 ∧
       TreeBorrowsMemory.wfLive tbm7 ∧
       tbm7.mem.allocations[id]? = some alloc7 ∧
@@ -16606,1318 +16805,86 @@ theorem tbm_nestedSplitAtMut_symbolic
           { addr := alloc.addr + (oR : Int), provenance := some (⟨(id : Int)⟩, qs) }
           ⟨lR⟩ ⟨alR⟩ ≠ .ok res)) := by
   dsimp only
-  have hidlt : id < tbm.mem.allocations.length := (List.getElem?_eq_some_iff.mp halloc).1
-  have hwfRoot0 : Node.wf alloc.data.length alloc.extra.root :=
-    hwf alloc (List.mem_of_getElem? halloc) hlive
-  have hEqLen0 : ∀ q m, nodeAt alloc.extra.root q = some m → m.permissions.length = N := fun q m hm =>
-    (c1_nodeWf_len_and_prot alloc.data.length m
-      (c1_nodeWf_nodeAt alloc.extra.root alloc.data.length hwfRoot0 q m hm)).1.trans hNlen
-  have hInW1 : ∀ b, off1 ≤ b → b < off1 + len1 → ¬ (off2 ≤ b ∧ b < off2 + len2) := by
-    intro b h1 h2 ⟨h3, h4⟩; rcases hdisj with hd | hd <;> omega
-  have hInW2 : ∀ b, off2 ≤ b → b < off2 + len2 → ¬ (off1 ≤ b ∧ b < off1 + len1) := by
-    intro b h1 h2 ⟨h3, h4⟩; rcases hdisj with hd | hd <;> omega
-  -- Helper: pointwise step for pre-existing nodes of `alloc.extra.root` under any access through `pPath`
-  have hpoint0 : ∀ (k : Gen.AccessKind) q m, nodeAt alloc.extra.root q = some m →
-      ∀ b, b < N → ∃ p p', m.permissions[b]? = some p ∧
-        Permission.transition p k (locRel (some pPath) q) = .ok p' := by
-    intro k q m hm b hb
-    unfold locRel
-    cases hl : locOf (some pPath) q with
-    | true =>
-      have hu := hancP q m hm hl b hb
-      cases k <;> exact ⟨.Unprot .Unique, .Unprot .Unique, hu, rfl⟩
-    | false =>
-      obtain ⟨p, hpb, hpas⟩ := hforPassive q m hm hl b hb
-      obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p k hpas
-      exact ⟨p, p', hpb, htr⟩
-  -- Contrast branch (standard writable outer retag)
-  have hwritable : ∃ outerPtrW tbmW feOuterW allocW sW,
-      TreeBorrowsMemory.retag_ptr tbm TreeBorrowsMemory.new_call
-          (ThinPointer.widen { addr := alloc.addr, provenance := some (⟨(id : Int)⟩, pPath) } none)
-          (.Ref .Mutable (slicePointeeInfoMR N alOuter)) true true lookup =
-        .ok (outerPtrW, tbmW, feOuterW) ∧
-      tbmW.mem.allocations[id]? = some allocW ∧
-      nodeAt allocW.extra.root qs = some sW ∧
-      (∀ b < N, sW.permissions[b]? = some (.Unprot .Disabled)) ∧
-      (∀ (oR lR alR : Nat), 0 < lR → oR + lR ≤ N →
-        Align.is_aligned ⟨alR⟩ (alloc.addr + (oR : Int)) = true →
-        ∀ res, TreeBorrowsMemory.load tbmW
-          { addr := alloc.addr + (oR : Int), provenance := some (⟨(id : Int)⟩, qs) }
-          ⟨lR⟩ ⟨alR⟩ ≠ .ok res) := by
-    obtain ⟨rootW, _, hretW, _, _, _, _, _, _, holdW, _⟩ := a2_reborrow_slice_step tbm
-      TreeBorrowsMemory.new_call id pPath alloc pNode 0 N alOuter true lookup htbmParams halloc
-      hlive hpNode (by omega) (fun q m hm b _ hb2 => hpoint0 .Write q m hm b (by omega))
-    have haddr0 : alloc.addr + ((0 : Nat) : Int) = alloc.addr := Int.add_zero alloc.addr
-    rw [haddr0] at hretW
-    obtain ⟨sW, hsW, _, _, _, hsWIn⟩ := holdW qs sNode hsNode
-    have hsWDis : ∀ b < N, sW.permissions[b]? = some (.Unprot .Disabled) := by
-      intro b hb
-      obtain ⟨p', htr', hp'⟩ := hsWIn b (Nat.zero_le b) (by omega) (.Unprot .Frozen) (hsFrozen b hb)
-      have hlf : locRel (some pPath) qs = .Foreign := by unfold locRel; rw [hforS]; rfl
-      rw [hlf] at htr'; cases htr'; exact hp'
-    refine ⟨_, _, _, { alloc with extra := { root := rootW } }, sW, hretW,
-      List.getElem?_set_self hidlt, hsW, hsWDis, ?_⟩
-    intro oR lR alR hlR hbdR halR res hld
-    rw [tbm_load_eq_node_access _ _ lR ⟨alR⟩ id qs { alloc with extra := { root := rootW } } oR
-      rfl (List.getElem?_set_self hidlt) hlive halR (a2_int_add_sub_cancel alloc.addr _) (by omega)
-      (by rw [hNlen]; exact hbdR)] at hld
-    obtain ⟨r', hacc', _⟩ := nwsr_bind_ok hld
-    exact node_access_read_through_disabled_fails rootW qs sW oR oR lR hsW
-      (hsWDis oR (by omega)) (Nat.le_refl _) (by omega) r' hacc'
-  refine ⟨?_, hwritable⟩
-  -- Step 1: Outer #[rustc_no_writable] FnEntry retag on [0, N) through pPath
-  let outerPath := pPath ++ [(pNode.children.length : Int)]
-  obtain ⟨root1, mOuter1, hret1, hwf1Imp, hOuterAt1, hOuterProt1, hOuterLen1, hOuterIn1, _, hold1, hsurj1⟩ :=
-    a2_reborrow_slice_step tbm TreeBorrowsMemory.new_call id pPath alloc pNode 0 N alOuter false lookup
-      htbmParams halloc hlive hpNode (by omega) (fun q m hm b _ hb2 => hpoint0 .Read q m hm b (by omega))
-  have haddr0 : alloc.addr + ((0 : Nat) : Int) = alloc.addr := Int.add_zero alloc.addr
-  rw [haddr0] at hret1
-  let alloc1 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra := { alloc with extra := { root := root1 } }
-  let tbm1 : Gen.TreeBorrowsMemory Gen.x86_64 :=
-    { tbm with mem := { tbm.mem with allocations := tbm.mem.allocations.set id alloc1 } }
-  have hwf1 : TreeBorrowsMemory.wfLive tbm1 := hwf1Imp hwf
-  have halloc1 : tbm1.mem.allocations[id]? = some alloc1 := List.getElem?_set_self hidlt
-  have hlocOuter : ∀ q m, nodeAt alloc.extra.root q = some m →
-      locOf (some outerPath) q = locOf (some pPath) q :=
-    fun q m hm => locOf_childPath_eq_parentPath alloc.extra.root pPath q pNode m hpNode hm
-  have hOuterNeOld : ∀ q m, nodeAt alloc.extra.root q = some m → q ≠ outerPath := by
-    intro q m hm hEq; subst hEq
-    rw [a2_nodeAt_fresh_child_none alloc.extra.root pNode pPath hpNode] at hm; cases hm
-  -- Properties of root1
-  have hroot1Anc : ∀ q m, nodeAt alloc.extra.root q = some m → locOf (some pPath) q = true →
-      ∃ m1, nodeAt root1 q = some m1 ∧ ∀ b < N, m1.permissions[b]? = some (.Unprot .Unique) := by
-    intro q m hm hl
-    obtain ⟨m1, hm1, _, _, _, hm1In⟩ := hold1 q m hm
-    refine ⟨m1, hm1, fun b hb => ?_⟩
-    obtain ⟨p', htr, hp'⟩ := hm1In b (Nat.zero_le b) (by omega) (.Unprot .Unique) (hancP q m hm hl b hb)
-    have hll : locRel (some pPath) q = .Local := by unfold locRel; rw [hl]; rfl
-    rw [hll] at htr; cases htr; exact hp'
-  have hroot1For : ∀ q m, nodeAt alloc.extra.root q = some m → locOf (some pPath) q = false →
-      ∃ m1, nodeAt root1 q = some m1 ∧
-        ∀ b < N, ∃ p, m1.permissions[b]? = some p ∧ permIsForeignPassive p = true := by
-    intro q m hm hl
-    obtain ⟨m1, hm1, _, _, _, hm1In⟩ := hold1 q m hm
-    refine ⟨m1, hm1, fun b hb => ?_⟩
-    obtain ⟨p, hpb, hpas⟩ := hforPassive q m hm hl b hb
-    obtain ⟨p', htr, hp'⟩ := hm1In b (Nat.zero_le b) (by omega) p hpb
-    have hlf : locRel (some pPath) q = .Foreign := by unfold locRel; rw [hl]; rfl
-    rw [hlf] at htr
-    change Permission.transition p .Read .Foreign = .ok p' at htr
-    obtain ⟨p'', htr'', hpas'⟩ := permission_isForeignPassive_preserved p .Read hpas
-    rw [htr''] at htr; cases htr; exact ⟨p', hp', hpas'⟩
-  have hroot1S : ∃ s1, nodeAt root1 qs = some s1 ∧ ∀ b < N, s1.permissions[b]? = some (.Unprot .Frozen) := by
-    obtain ⟨s1, hs1, _, _, _, hs1In⟩ := hold1 qs sNode hsNode
-    refine ⟨s1, hs1, fun b hb => ?_⟩
-    obtain ⟨p', htr, hp'⟩ := hs1In b (Nat.zero_le b) (by omega) (.Unprot .Frozen) (hsFrozen b hb)
-    have hlf : locRel (some pPath) qs = .Foreign := by unfold locRel; rw [hforS]; rfl
-    rw [hlf] at htr; cases htr; exact hp'
-  -- Step 2: Nested inner sub-slice 1 FnEntry retag on [off1, off1 + len1) through outerPath
-  let aPath := outerPath ++ [(mOuter1.children.length : Int)]
-  have hpoint1 : ∀ q m1, nodeAt root1 q = some m1 → ∀ b, off1 ≤ b → b < off1 + len1 →
-      ∃ p p', m1.permissions[b]? = some p ∧
-        Permission.transition p (if fnIw1 then .Write else .Read) (locRel (some outerPath) q) = .ok p' := by
-    intro q m1 hm1 b hb1 hb2
-    rcases hsurj1 q m1 hm1 with ⟨rfl, rfl⟩ | ⟨m0, hm0⟩
-    · have hll : locRel (some outerPath) outerPath = .Local := by
-        unfold locRel; rw [locOf_some_eq_isPrefixOf, b1_isPrefixOf_refl]; rfl
-      rw [hll]
-      have hg := hOuterIn1 b (Nat.zero_le b) (by omega)
-      cases fnIw1 <;> exact ⟨.Prot (.Reserved true false), _, hg, rfl⟩
-    · unfold locRel; rw [hlocOuter q m0 hm0]
-      cases hl : locOf (some pPath) q with
-      | true =>
-        obtain ⟨m1', hm1', hm1U⟩ := hroot1Anc q m0 hm0 hl
-        rw [hm1'] at hm1; cases hm1
-        cases fnIw1 <;> exact ⟨.Unprot .Unique, .Unprot .Unique, hm1U b (by omega), rfl⟩
-      | false =>
-        obtain ⟨m1', hm1', hm1P⟩ := hroot1For q m0 hm0 hl
-        rw [hm1'] at hm1; cases hm1
-        obtain ⟨p, hpb, hpas⟩ := hm1P b (by omega)
-        obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p _ hpas
-        exact ⟨p, p', hpb, htr⟩
-  obtain ⟨root2, mA2, hret2, hwf2Imp, hAAt2, hAProt2, hALen2, hAIn2, hAOut2, hold2, hsurj2⟩ :=
-    a2_reborrow_slice_step tbm1 TreeBorrowsMemory.new_call id outerPath alloc1 mOuter1
-      off1 len1 al1 fnIw1 lookup htbmParams halloc1 hlive hOuterAt1
-      (by change off1 + len1 ≤ alloc.data.length; omega) hpoint1
-  let alloc2 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra := { alloc1 with extra := { root := root2 } }
-  let tbm2 : Gen.TreeBorrowsMemory Gen.x86_64 :=
-    { tbm1 with mem := { tbm1.mem with allocations := tbm1.mem.allocations.set id alloc2 } }
-  have hwf2 : TreeBorrowsMemory.wfLive tbm2 := hwf2Imp hwf1
-  have halloc2 : tbm2.mem.allocations[id]? = some alloc2 :=
-    List.getElem?_set_self (by simp only [tbm1, List.length_set]; exact hidlt)
-  obtain ⟨mOuter2, hOuterAt2, hOuterProt2, hOuterLen2, hOuterOut2, hOuterIn2⟩ :=
-    hold2 outerPath mOuter1 hOuterAt1
-  -- Step 3: Nested inner sub-slice 2 FnEntry retag on [off2, off2 + len2) through outerPath
-  let bPath := outerPath ++ [(mOuter2.children.length : Int)]
-  have hlocAOuter : locOf (some outerPath) aPath = false := by
-    rw [locOf_some_eq_isPrefixOf]; exact a2_isPrefixOf_append_one_false outerPath _
-  have hpoint2 : ∀ q m2, nodeAt root2 q = some m2 → ∀ b, off2 ≤ b → b < off2 + len2 →
-      ∃ p p', m2.permissions[b]? = some p ∧
-        Permission.transition p (if fnIw2 then .Write else .Read) (locRel (some outerPath) q) = .ok p' := by
-    intro q m2 hm2 b hb1 hb2
-    rcases hsurj2 q m2 hm2 with ⟨rfl, rfl⟩ | ⟨m1, hm1⟩
-    · have hlf : locRel (some outerPath) aPath = .Foreign := by unfold locRel; rw [hlocAOuter]; rfl
-      rw [hlf]
-      have houtA : b < off1 ∨ off1 + len1 ≤ b := by rcases hdisj with hd | hd <;> omega
-      have hg := hAOut2 b (by change b < alloc.data.length; omega) houtA
-      cases fnIw2 <;> exact ⟨.Prot (.Reserved false false), _, hg, rfl⟩
-    · rcases hsurj1 q m1 hm1 with ⟨rfl, rfl⟩ | ⟨m0, hm0⟩
-      · rw [hOuterAt2] at hm2; cases hm2
-        have hll : locRel (some outerPath) outerPath = .Local := by
-          unfold locRel; rw [locOf_some_eq_isPrefixOf, b1_isPrefixOf_refl]; rfl
-        rw [hll]
-        have houtO : b < off1 ∨ off1 + len1 ≤ b := by rcases hdisj with hd | hd <;> omega
-        have hg : mOuter2.permissions[b]? = some (.Prot (.Reserved true false)) := by
-          rw [hOuterOut2 b houtO]; exact hOuterIn1 b (Nat.zero_le b) (by omega)
-        cases fnIw2 <;> exact ⟨.Prot (.Reserved true false), _, hg, rfl⟩
-      · unfold locRel; rw [hlocOuter q m0 hm0]
-        obtain ⟨m2', hm2', _, _, hm2Out, _⟩ := hold2 q m1 hm1
-        rw [hm2'] at hm2; cases hm2
-        have houtQ : b < off1 ∨ off1 + len1 ≤ b := by rcases hdisj with hd | hd <;> omega
-        cases hl : locOf (some pPath) q with
-        | true =>
-          obtain ⟨m1', hm1', hm1U⟩ := hroot1Anc q m0 hm0 hl
-          rw [hm1'] at hm1; cases hm1
-          rw [hm2Out b houtQ]
-          cases fnIw2 <;> exact ⟨.Unprot .Unique, .Unprot .Unique, hm1U b (by omega), rfl⟩
-        | false =>
-          obtain ⟨m1', hm1', hm1P⟩ := hroot1For q m0 hm0 hl
-          rw [hm1'] at hm1; cases hm1
-          obtain ⟨p, hpb, hpas⟩ := hm1P b (by omega)
-          obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p _ hpas
-          rw [hm2Out b houtQ]; exact ⟨p, p', hpb, htr⟩
-  obtain ⟨root3, mB3, hret3, hwf3Imp, hBAt3, hBProt3, hBLen3, hBIn3, hBOut3, hold3, hsurj3⟩ :=
-    a2_reborrow_slice_step tbm2 { protectors := [(⟨(id : Int)⟩, aPath)] } id outerPath alloc2 mOuter2
-      off2 len2 al2 fnIw2 lookup htbmParams halloc2 hlive hOuterAt2
-      (by change off2 + len2 ≤ alloc.data.length; omega) hpoint2
-  let alloc3 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra := { alloc2 with extra := { root := root3 } }
-  let tbm3 : Gen.TreeBorrowsMemory Gen.x86_64 :=
-    { tbm2 with mem := { tbm2.mem with allocations := tbm2.mem.allocations.set id alloc3 } }
-  have hwf3 : TreeBorrowsMemory.wfLive tbm3 := hwf3Imp hwf2
-  have halloc3 : tbm3.mem.allocations[id]? = some alloc3 :=
-    List.getElem?_set_self (by simp only [tbm2, tbm1, List.length_set]; exact hidlt)
-  -- Path relationships in root3
-  have hlocBOuter : locOf (some outerPath) bPath = false := by
-    rw [locOf_some_eq_isPrefixOf]; exact a2_isPrefixOf_append_one_false outerPath _
-  have hABNe : aPath ≠ bPath := by
-    intro hEq
-    have hnone := a2_nodeAt_fresh_child_none root2 mOuter2 outerPath hOuterAt2
-    change nodeAt root2 bPath = none at hnone
-    rw [← hEq, hAAt2] at hnone; cases hnone
-  have hlocAB : locOf (some aPath) bPath = false := by
-    rw [locOf_some_eq_isPrefixOf]
-    cases hp : bPath.isPrefixOf aPath with
-    | false => rfl
-    | true =>
-      have hlenEq : bPath.length = aPath.length := by simp [aPath, bPath]
-      exact absurd (a2_isPrefixOf_eq_of_length_eq hp hlenEq).symm hABNe
-  have hlocBA : locOf (some bPath) aPath = false := by
-    rw [locOf_some_eq_isPrefixOf]
-    cases hp : aPath.isPrefixOf bPath with
-    | false => rfl
-    | true =>
-      have hlenEq : aPath.length = bPath.length := by simp [aPath, bPath]
-      exact absurd (a2_isPrefixOf_eq_of_length_eq hp hlenEq) hABNe
-  have hlocAOfOld : ∀ q m, nodeAt alloc.extra.root q = some m →
-      locOf (some aPath) q = locOf (some pPath) q := by
-    intro q m hm
-    obtain ⟨m1, hm1, _⟩ := hold1 q m hm
-    rw [locOf_childPath_eq_parentPath root1 outerPath q mOuter1 m1 hOuterAt1 hm1, hlocOuter q m hm]
-  have hlocBOfOld : ∀ q m, nodeAt alloc.extra.root q = some m →
-      locOf (some bPath) q = locOf (some pPath) q := by
-    intro q m hm
-    obtain ⟨m1, hm1, _⟩ := hold1 q m hm
-    obtain ⟨m2, hm2, _⟩ := hold2 q m1 hm1
-    rw [locOf_childPath_eq_parentPath root2 outerPath q mOuter2 m2 hOuterAt2 hm2, hlocOuter q m hm]
-  have hlocOuterInA : locOf (some aPath) outerPath = true := by
-    rw [locOf_some_eq_isPrefixOf]; exact a1_isPrefixOf_append_right outerPath _
-  have hlocOuterInB : locOf (some bPath) outerPath = true := by
-    rw [locOf_some_eq_isPrefixOf]; exact a1_isPrefixOf_append_right outerPath _
-  -- Summarize root3 nodes cleanly!
-  obtain ⟨mOuter3, hOuterAt3, hOuterProt3, hOuterLen3, hOuterOut3, hOuterIn3⟩ :=
-    hold3 outerPath mOuter2 hOuterAt2
-  obtain ⟨mA3, hAAt3, hAProt3, hALen3, hAOut3, hAIn3⟩ := hold3 aPath mA2 hAAt2
-  have hOuter3Spec : ∀ b < N,
-      mOuter3.permissions[b]? = some
-        (if off1 ≤ b ∧ b < off1 + len1 then (if fnIw1 then .Prot .Unique else .Prot (.Reserved true false))
-         else if off2 ≤ b ∧ b < off2 + len2 then (if fnIw2 then .Prot .Unique else .Prot (.Reserved true false))
-         else .Prot (.Reserved true false)) := by
-    intro b hb
-    rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hnot1
-    · simp only [h1, h2, and_self, ↓reduceIte]
-      have hout2 : b < off2 ∨ off2 + len2 ≤ b := by rcases hdisj with hd | hd <;> omega
-      rw [hOuterOut3 b hout2]
-      obtain ⟨p', htr', hp'⟩ := hOuterIn2 b h1 h2 (.Prot (.Reserved true false)) (hOuterIn1 b (Nat.zero_le b) (by omega))
-      have hll : locRel (some outerPath) outerPath = .Local := by
-        unfold locRel; rw [locOf_some_eq_isPrefixOf, b1_isPrefixOf_refl]; rfl
-      rw [hll] at htr'; cases fnIw1 <;> (cases htr'; exact hp')
-    · simp only [hnot1, ↓reduceIte]
-      have hout1 : b < off1 ∨ off1 + len1 ≤ b := b1_not_in_window hnot1
-      have hm2b : mOuter2.permissions[b]? = some (.Prot (.Reserved true false)) := by
-        rw [hOuterOut2 b hout1]; exact hOuterIn1 b (Nat.zero_le b) (by omega)
-      rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hnot2
-      · simp only [h1, h2, and_self, ↓reduceIte]
-        obtain ⟨p', htr', hp'⟩ := hOuterIn3 b h1 h2 (.Prot (.Reserved true false)) hm2b
-        have hll : locRel (some outerPath) outerPath = .Local := by
-          unfold locRel; rw [locOf_some_eq_isPrefixOf, b1_isPrefixOf_refl]; rfl
-        rw [hll] at htr'; cases fnIw2 <;> (cases htr'; exact hp')
-      · simp only [hnot2, ↓reduceIte]
-        rw [hOuterOut3 b (b1_not_in_window hnot2), hm2b]
-  have hA3Spec : ∀ b < N,
-      mA3.permissions[b]? = some
-        (if off1 ≤ b ∧ b < off1 + len1 then (if fnIw1 then .Prot .Unique else .Prot (.Reserved true false))
-         else if off2 ≤ b ∧ b < off2 + len2 then (if fnIw2 then .Prot .Disabled else .Prot (.Reserved false true))
-         else .Prot (.Reserved false false)) := by
-    intro b hb
-    rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hnot1
-    · simp only [h1, h2, and_self, ↓reduceIte]
-      have hout2 : b < off2 ∨ off2 + len2 ≤ b := by rcases hdisj with hd | hd <;> omega
-      rw [hAOut3 b hout2]; exact hAIn2 b h1 h2
-    · simp only [hnot1, ↓reduceIte]
-      have hout1 : b < off1 ∨ off1 + len1 ≤ b := b1_not_in_window hnot1
-      have hm2b : mA2.permissions[b]? = some (.Prot (.Reserved false false)) :=
-        hAOut2 b (by change b < alloc.data.length; omega) hout1
-      rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hnot2
-      · simp only [h1, h2, and_self, ↓reduceIte]
-        obtain ⟨p', htr', hp'⟩ := hAIn3 b h1 h2 (.Prot (.Reserved false false)) hm2b
-        have hlf : locRel (some outerPath) aPath = .Foreign := by unfold locRel; rw [hlocAOuter]; rfl
-        rw [hlf] at htr'; cases fnIw2 <;> (cases htr'; exact hp')
-      · simp only [hnot2, ↓reduceIte]
-        rw [hAOut3 b (b1_not_in_window hnot2), hm2b]
-  have hroot3Old : ∀ q m0, nodeAt alloc.extra.root q = some m0 →
-      ∃ m3, nodeAt root3 q = some m3 ∧
-        (locOf (some pPath) q = true → ∀ b < N, m3.permissions[b]? = some (.Unprot .Unique)) ∧
-        (locOf (some pPath) q = false → ∀ b < N, ∃ p, m3.permissions[b]? = some p ∧ permIsForeignPassive p = true) ∧
-        (q = qs → ∀ b < N, (b < off1 ∨ off1 + len1 ≤ b) → (b < off2 ∨ off2 + len2 ≤ b) →
-          m3.permissions[b]? = some (.Unprot .Frozen)) := by
-    intro q m0 hm0
-    obtain ⟨m1, hm1, _⟩ := hold1 q m0 hm0
-    obtain ⟨m2, hm2, _, _, hm2Out, hm2In⟩ := hold2 q m1 hm1
-    obtain ⟨m3, hm3, _, _, hm3Out, hm3In⟩ := hold3 q m2 hm2
-    refine ⟨m3, hm3, ?_, ?_, ?_⟩
-    · intro hl b hb
-      obtain ⟨m1', hm1', hm1U⟩ := hroot1Anc q m0 hm0 hl
-      rw [hm1'] at hm1; cases hm1
-      have hll : locRel (some outerPath) q = .Local := by unfold locRel; rw [hlocOuter q m0 hm0, hl]; rfl
-      have hm2b : m2.permissions[b]? = some (.Unprot .Unique) := by
-        rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hnot1
-        · obtain ⟨p', htr', hp'⟩ := hm2In b h1 h2 (.Unprot .Unique) (hm1U b hb)
-          rw [hll] at htr'; cases fnIw1 <;> (cases htr'; exact hp')
-        · rw [hm2Out b (b1_not_in_window hnot1)]; exact hm1U b hb
-      rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hnot2
-      · obtain ⟨p', htr', hp'⟩ := hm3In b h1 h2 (.Unprot .Unique) hm2b
-        rw [hll] at htr'; cases fnIw2 <;> (cases htr'; exact hp')
-      · rw [hm3Out b (b1_not_in_window hnot2)]; exact hm2b
-    · intro hl b hb
-      obtain ⟨m1', hm1', hm1P⟩ := hroot1For q m0 hm0 hl
-      rw [hm1'] at hm1; cases hm1
-      have hlf : locRel (some outerPath) q = .Foreign := by unfold locRel; rw [hlocOuter q m0 hm0, hl]; rfl
-      have hm2b : ∃ p, m2.permissions[b]? = some p ∧ permIsForeignPassive p = true := by
-        obtain ⟨p, hpb, hpas⟩ := hm1P b hb
-        rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hnot1
-        · obtain ⟨p', htr', hp'⟩ := hm2In b h1 h2 p hpb
-          rw [hlf] at htr'
-          obtain ⟨p'', htr'', hpas'⟩ := permission_isForeignPassive_preserved p _ hpas
-          rw [htr''] at htr'; cases htr'; exact ⟨p', hp', hpas'⟩
-        · rw [hm2Out b (b1_not_in_window hnot1)]; exact ⟨p, hpb, hpas⟩
-      obtain ⟨p2, hp2b, hpas2⟩ := hm2b
-      rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hnot2
-      · obtain ⟨p', htr', hp'⟩ := hm3In b h1 h2 p2 hp2b
-        rw [hlf] at htr'
-        obtain ⟨p'', htr'', hpas'⟩ := permission_isForeignPassive_preserved p2 _ hpas2
-        rw [htr''] at htr'; cases htr'; exact ⟨p', hp', hpas'⟩
-      · rw [hm3Out b (b1_not_in_window hnot2)]; exact ⟨p2, hp2b, hpas2⟩
-    · intro hqs b hb hout1 hout2
-      subst hqs
-      obtain ⟨s1, hs1, hs1F⟩ := hroot1S
-      rw [hs1] at hm1; cases hm1
-      rw [hm3Out b hout2, hm2Out b hout1]; exact hs1F b hb
-  -- Classify every path in root3
-  have hsurj3All : ∀ q m3, nodeAt root3 q = some m3 →
-      (q = bPath ∧ m3 = mB3) ∨ (q = aPath ∧ m3 = mA3) ∨ (q = outerPath ∧ m3 = mOuter3) ∨
-      ∃ m0, nodeAt alloc.extra.root q = some m0 := by
-    intro q m3 hm3
-    rcases hsurj3 q m3 hm3 with ⟨rfl, rfl⟩ | ⟨m2, hm2⟩
-    · exact Or.inl ⟨rfl, rfl⟩
-    · rcases hsurj2 q m2 hm2 with ⟨rfl, rfl⟩ | ⟨m1, hm1⟩
-      · rw [hAAt3] at hm3; cases hm3; exact Or.inr (Or.inl ⟨rfl, rfl⟩)
-      · rcases hsurj1 q m1 hm1 with ⟨rfl, rfl⟩ | ⟨m0, hm0⟩
-        · rw [hOuterAt3] at hm3; cases hm3; exact Or.inr (Or.inr (Or.inl ⟨rfl, rfl⟩))
-        · exact Or.inr (Or.inr (Or.inr ⟨m0, hm0⟩))
-  -- Step 4: Store wBytes1 through aPath on [off1, off1 + len1)
-  have hacc1Point : ∀ q m3, nodeAt root3 q = some m3 →
-      ∃ ps', Node.transitionRange (locRel (some aPath) q) .Write off1 len1 m3.permissions = .ok ps' := by
-    intro q m3 hm3
-    obtain ⟨ps', hrun, _⟩ := transitionRange_ok_of_pointwise (locRel (some aPath) q) .Write len1 off1
-      m3.permissions (fun b hb1 hb2 => by
-        rcases hsurj3All q m3 hm3 with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨m0, hm0⟩
-        · have hlf : locRel (some aPath) bPath = .Foreign := by unfold locRel; rw [hlocAB]; rfl
-          rw [hlf]; exact ⟨.Prot (.Reserved false false), .Prot .Disabled,
-            hBOut3 b (by change b < alloc.data.length; omega) (by rcases hdisj with hd | hd <;> omega), rfl⟩
-        · have hll : locRel (some aPath) aPath = .Local := by
-            unfold locRel; rw [locOf_some_eq_isPrefixOf, b1_isPrefixOf_refl]; rfl
-          rw [hll]
-          have hg := hA3Spec b (by omega); simp only [hb1, hb2, and_self, ↓reduceIte] at hg
-          cases fnIw1 <;> exact ⟨_, .Prot .Unique, hg, rfl⟩
-        · have hll : locRel (some aPath) outerPath = .Local := by unfold locRel; rw [hlocOuterInA]; rfl
-          rw [hll]
-          have hg := hOuter3Spec b (by omega); simp only [hb1, hb2, and_self, ↓reduceIte] at hg
-          cases fnIw1 <;> exact ⟨_, .Prot .Unique, hg, rfl⟩
-        · obtain ⟨m3', hm3', hU, hP, _⟩ := hroot3Old q m0 hm0
-          rw [hm3'] at hm3; cases hm3
-          unfold locRel; rw [hlocAOfOld q m0 hm0]
-          cases hl : locOf (some pPath) q with
-          | true => exact ⟨.Unprot .Unique, .Unprot .Unique, hU hl b (by omega), rfl⟩
-          | false =>
-            obtain ⟨p, hpb, hpas⟩ := hP hl b (by omega)
-            obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p .Write hpas
-            exact ⟨p, p', hpb, htr⟩)
-    exact ⟨ps', hrun⟩
-  obtain ⟨root4, hacc4, hpost4⟩ := node_access_ok_of_pointwise .Write off1 len1 root3 (some aPath) hacc1Point
-  have hstore1Eq := tbm_store_eq_node_access tbm3
-    { addr := alloc.addr + (off1 : Int), provenance := some (⟨(id : Int)⟩, aPath) }
-    wBytes1 ⟨al1⟩ id aPath alloc3 off1 rfl halloc3 hlive hal1 (a2_int_add_sub_cancel alloc.addr _) (by omega)
-    (by rw [hw1]; change off1 + len1 ≤ alloc.data.length; omega)
-  let alloc4 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
-    { alloc3 with
-      data := alloc3.data.take off1 ++ wBytes1 ++ alloc3.data.drop (off1 + wBytes1.length)
-      extra := { root := root4 } }
-  let tbm4 : Gen.TreeBorrowsMemory Gen.x86_64 :=
-    { tbm3 with mem := { tbm3.mem with allocations := tbm3.mem.allocations.set id alloc4 } }
-  have hstore1 : TreeBorrowsMemory.store tbm3
-      { addr := alloc.addr + (off1 : Int), provenance := some (⟨(id : Int)⟩, aPath) }
-      wBytes1 ⟨al1⟩ = .ok tbm4 := by
-    rw [hstore1Eq, hw1, hacc4]
-    simp only [tbm4, alloc4, hw1, bind, Except.bind, pure, Except.pure]
-  have hwf4 : TreeBorrowsMemory.wfLive tbm4 := TreeBorrowsMemory.store_wfLive hwf3 hstore1
-  have halloc4 : tbm4.mem.allocations[id]? = some alloc4 :=
-    List.getElem?_set_self (by simp only [tbm3, tbm2, tbm1, List.length_set]; exact hidlt)
-  have hdata4Len : alloc4.data.length = N := by
-    simp only [alloc4, alloc3, alloc2, alloc1, List.length_append, List.length_take, List.length_drop,
-      hw1, hNlen]; omega
-  -- Step 5: Store wBytes2 through bPath on [off2, off2 + len2)
-  have hacc2Point : ∀ q m4, nodeAt root4 q = some m4 →
-      ∃ ps', Node.transitionRange (locRel (some bPath) q) .Write off2 len2 m4.permissions = .ok ps' := by
-    intro q m4 hm4
-    cases hm3 : nodeAt root3 q with
-    | none => rw [(hpost4 q).2 hm3] at hm4; cases hm4
-    | some m3 =>
-      obtain ⟨m4', hm4', _, htr4⟩ := (hpost4 q).1 m3 hm3
-      rw [hm4'] at hm4; cases hm4
-      obtain ⟨_, hout4, _⟩ := c1_transitionRange_ok_full _ .Write off1 len1 m3.permissions m4.permissions htr4
-      obtain ⟨ps', hrun, _⟩ := transitionRange_ok_of_pointwise (locRel (some bPath) q) .Write len2 off2
-        m4.permissions (fun b hb1 hb2 => by
-          have hout1b : b < off1 ∨ off1 + len1 ≤ b := by rcases hdisj with hd | hd <;> omega
-          rw [hout4 b hout1b]
-          rcases hsurj3All q m3 hm3 with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨m0, hm0⟩
-          · have hll : locRel (some bPath) bPath = .Local := by
-              unfold locRel; rw [locOf_some_eq_isPrefixOf, b1_isPrefixOf_refl]; rfl
-            rw [hll]; have hg := hBIn3 b hb1 hb2
-            cases fnIw2 <;> exact ⟨_, .Prot .Unique, hg, rfl⟩
-          · have hlf : locRel (some bPath) aPath = .Foreign := by unfold locRel; rw [hlocBA]; rfl
-            rw [hlf]
-            have hg := hA3Spec b (by omega); have hn1 := hInW2 b hb1 hb2
-            simp only [hn1, hb1, hb2, and_self, ↓reduceIte] at hg
-            cases fnIw2 <;> exact ⟨_, .Prot .Disabled, hg, rfl⟩
-          · have hll : locRel (some bPath) outerPath = .Local := by unfold locRel; rw [hlocOuterInB]; rfl
-            rw [hll]
-            have hg := hOuter3Spec b (by omega); have hn1 := hInW2 b hb1 hb2
-            simp only [hn1, hb1, hb2, and_self, ↓reduceIte] at hg
-            cases fnIw2 <;> exact ⟨_, .Prot .Unique, hg, rfl⟩
-          · obtain ⟨m3', hm3', hU, hP, _⟩ := hroot3Old q m0 hm0
-            rw [hm3'] at hm3; cases hm3
-            unfold locRel; rw [hlocBOfOld q m0 hm0]
-            cases hl : locOf (some pPath) q with
-            | true => exact ⟨.Unprot .Unique, .Unprot .Unique, hU hl b (by omega), rfl⟩
-            | false =>
-              obtain ⟨p, hpb, hpas⟩ := hP hl b (by omega)
-              obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p .Write hpas
-              exact ⟨p, p', hpb, htr⟩)
-      exact ⟨ps', hrun⟩
-  obtain ⟨root5, hacc5, hpost5⟩ := node_access_ok_of_pointwise .Write off2 len2 root4 (some bPath) hacc2Point
-  have hstore2Eq := tbm_store_eq_node_access tbm4
-    { addr := alloc.addr + (off2 : Int), provenance := some (⟨(id : Int)⟩, bPath) }
-    wBytes2 ⟨al2⟩ id bPath alloc4 off2 rfl halloc4 hlive hal2 (a2_int_add_sub_cancel alloc.addr _) (by omega)
-    (by rw [hw2, hdata4Len]; exact hbound2)
-  let alloc5 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
-    { alloc4 with
-      data := alloc4.data.take off2 ++ wBytes2 ++ alloc4.data.drop (off2 + wBytes2.length)
-      extra := { root := root5 } }
-  let tbm5 : Gen.TreeBorrowsMemory Gen.x86_64 :=
-    { tbm4 with mem := { tbm4.mem with allocations := tbm4.mem.allocations.set id alloc5 } }
-  have hstore2 : TreeBorrowsMemory.store tbm4
-      { addr := alloc.addr + (off2 : Int), provenance := some (⟨(id : Int)⟩, bPath) }
-      wBytes2 ⟨al2⟩ = .ok tbm5 := by
-    rw [hstore2Eq, hw2, hacc5]
-    simp only [tbm5, alloc5, hw2, bind, Except.bind, pure, Except.pure]
-  have hwf5 : TreeBorrowsMemory.wfLive tbm5 := TreeBorrowsMemory.store_wfLive hwf4 hstore2
-  have halloc5 : tbm5.mem.allocations[id]? = some alloc5 :=
-    List.getElem?_set_self (by simp only [tbm4, tbm3, tbm2, tbm1, List.length_set]; exact hidlt)
-  have hdata5Len : alloc5.data.length = N := by
-    simp only [alloc5, List.length_append, List.length_take, List.length_drop, hw2, hdata4Len]; omega
-  -- Helper: compute exact root5 permissions from root3 via hpost4 + hpost5
-  have hroot5Of3 : ∀ q m3, nodeAt root3 q = some m3 →
-      ∃ m5, nodeAt root5 q = some m5 ∧ m5.«protected» = m3.«protected» ∧
-        m5.permissions.length = m3.permissions.length ∧
-        (∀ b, (b < off1 ∨ off1 + len1 ≤ b) → (b < off2 ∨ off2 + len2 ≤ b) →
-          m5.permissions[b]? = m3.permissions[b]?) ∧
-        (∀ b, off1 ≤ b → b < off1 + len1 → ∀ p, m3.permissions[b]? = some p →
-          ∃ p', Permission.transition p .Write (locRel (some aPath) q) = .ok p' ∧ m5.permissions[b]? = some p') ∧
-        (∀ b, off2 ≤ b → b < off2 + len2 → ∀ p, m3.permissions[b]? = some p →
-          ∃ p', Permission.transition p .Write (locRel (some bPath) q) = .ok p' ∧ m5.permissions[b]? = some p') := by
-    intro q m3 hm3
-    obtain ⟨m4, hm4, hp4, htr4⟩ := (hpost4 q).1 m3 hm3
-    obtain ⟨m5, hm5, hp5, htr5⟩ := (hpost5 q).1 m4 hm4
-    obtain ⟨hl4, ho4, hi4⟩ := c1_transitionRange_ok_full _ .Write off1 len1 m3.permissions m4.permissions htr4
-    obtain ⟨hl5, ho5, hi5⟩ := c1_transitionRange_ok_full _ .Write off2 len2 m4.permissions m5.permissions htr5
-    refine ⟨m5, hm5, hp5.trans hp4, hl5.trans hl4, fun b h1 h2 => by rw [ho5 b h2, ho4 b h1],
-      fun b h1 h2 p hpb => ?_, fun b h1 h2 p hpb => ?_⟩
-    · have hout2 : b < off2 ∨ off2 + len2 ≤ b := by rcases hdisj with hd | hd <;> omega
-      rw [ho5 b hout2]
-      obtain ⟨p0, p', hp0, hst, hp'⟩ := hi4 b h1 h2
-      rw [hpb] at hp0; cases hp0; exact ⟨p', hst, hp'⟩
-    · have hout1 : b < off1 ∨ off1 + len1 ≤ b := by rcases hdisj with hd | hd <;> omega
-      obtain ⟨p0, p', hp0, hst, hp'⟩ := hi5 b h1 h2
-      rw [ho4 b hout1, hpb] at hp0; cases hp0; exact ⟨p', hst, hp'⟩
-  have hsurj5 : ∀ q m5, nodeAt root5 q = some m5 → ∃ m3, nodeAt root3 q = some m3 := by
-    intro q m5 hm5
-    cases hm4 : nodeAt root4 q with
-    | none => rw [(hpost5 q).2 hm4] at hm5; cases hm5
-    | some m4 =>
-      cases hm3 : nodeAt root3 q with
-      | none => rw [(hpost4 q).2 hm3] at hm4; cases hm4
-      | some m3 => exact ⟨m3, rfl⟩
-  -- Exact permissions of mA5, mB5, mOuter5, and old nodes in root5
-  obtain ⟨mA5, hAAt5, hAProt5, hALen5, hAOut5, hAIn15, hAIn25⟩ := hroot5Of3 aPath mA3 hAAt3
-  obtain ⟨mB5, hBAt5, hBProt5, hBLen5, hBOut5, hBIn15, hBIn25⟩ := hroot5Of3 bPath mB3 hBAt3
-  obtain ⟨mOuter5, hOuterAt5, hOuterProt5, hOuterLen5, hOuterOut5, hOuterIn15, hOuterIn25⟩ :=
-    hroot5Of3 outerPath mOuter3 hOuterAt3
-  have hA5Spec : ∀ b < N, mA5.permissions[b]? = some
-      (if off1 ≤ b ∧ b < off1 + len1 then .Prot .Unique
-       else if off2 ≤ b ∧ b < off2 + len2 then .Prot .Disabled
-       else .Prot (.Reserved false false)) := by
-    intro b hb
-    rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hn1
-    · simp only [h1, h2, and_self, ↓reduceIte]
-      have hg := hA3Spec b hb; simp only [h1, h2, and_self, ↓reduceIte] at hg
-      obtain ⟨p', htr, hp'⟩ := hAIn15 b h1 h2 _ hg
-      have hll : locRel (some aPath) aPath = .Local := by unfold locRel; rw [locOf_some_eq_isPrefixOf, b1_isPrefixOf_refl]; rfl
-      rw [hll] at htr; cases fnIw1 <;> (cases htr; exact hp')
-    · simp only [hn1, ↓reduceIte]
-      rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hn2
-      · simp only [h1, h2, and_self, ↓reduceIte]
-        have hg := hA3Spec b hb; simp only [hn1, h1, h2, and_self, ↓reduceIte] at hg
-        obtain ⟨p', htr, hp'⟩ := hAIn25 b h1 h2 _ hg
-        have hlf : locRel (some bPath) aPath = .Foreign := by unfold locRel; rw [hlocBA]; rfl
-        rw [hlf] at htr; cases fnIw2 <;> (cases htr; exact hp')
-      · simp only [hn2, ↓reduceIte]
-        rw [hAOut5 b (b1_not_in_window hn1) (b1_not_in_window hn2)]
-        have hg := hA3Spec b hb; simp only [hn1, hn2, ↓reduceIte] at hg; exact hg
-  have hB5Spec : ∀ b < N, mB5.permissions[b]? = some
-      (if off1 ≤ b ∧ b < off1 + len1 then .Prot .Disabled
-       else if off2 ≤ b ∧ b < off2 + len2 then .Prot .Unique
-       else .Prot (.Reserved false false)) := by
-    intro b hb
-    rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hn1
-    · simp only [h1, h2, and_self, ↓reduceIte]
-      have hg := hBOut3 b (by change b < alloc.data.length; omega) (by rcases hdisj with hd | hd <;> omega)
-      obtain ⟨p', htr, hp'⟩ := hBIn15 b h1 h2 _ hg
-      have hlf : locRel (some aPath) bPath = .Foreign := by unfold locRel; rw [hlocAB]; rfl
-      rw [hlf] at htr; cases htr; exact hp'
-    · simp only [hn1, ↓reduceIte]
-      rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hn2
-      · simp only [h1, h2, and_self, ↓reduceIte]
-        obtain ⟨p', htr, hp'⟩ := hBIn25 b h1 h2 _ (hBIn3 b h1 h2)
-        have hll : locRel (some bPath) bPath = .Local := by unfold locRel; rw [locOf_some_eq_isPrefixOf, b1_isPrefixOf_refl]; rfl
-        rw [hll] at htr; cases fnIw2 <;> (cases htr; exact hp')
-      · simp only [hn2, ↓reduceIte]
-        rw [hBOut5 b (b1_not_in_window hn1) (b1_not_in_window hn2)]
-        exact hBOut3 b (by change b < alloc.data.length; omega) (b1_not_in_window hn2)
-  have hOuter5Spec : ∀ b < N, mOuter5.permissions[b]? = some
-      (if (off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2) then .Prot .Unique
-       else .Prot (.Reserved true false)) := by
-    intro b hb
-    rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hn1
-    · have hor : (off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2) := Or.inl ⟨h1, h2⟩
-      simp only [hor, ↓reduceIte]
-      have hg := hOuter3Spec b hb; simp only [h1, h2, and_self, ↓reduceIte] at hg
-      obtain ⟨p', htr, hp'⟩ := hOuterIn15 b h1 h2 _ hg
-      have hll : locRel (some aPath) outerPath = .Local := by unfold locRel; rw [hlocOuterInA]; rfl
-      rw [hll] at htr; cases fnIw1 <;> (cases htr; exact hp')
-    · rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hn2
-      · have hor : (off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2) := Or.inr ⟨h1, h2⟩
-        simp only [hor, ↓reduceIte]
-        have hg := hOuter3Spec b hb; simp only [hn1, h1, h2, and_self, ↓reduceIte] at hg
-        obtain ⟨p', htr, hp'⟩ := hOuterIn25 b h1 h2 _ hg
-        have hll : locRel (some bPath) outerPath = .Local := by unfold locRel; rw [hlocOuterInB]; rfl
-        rw [hll] at htr; cases fnIw2 <;> (cases htr; exact hp')
-      · have hnor : ¬ ((off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2)) := fun h => h.elim hn1 hn2
-        simp only [hnor, ↓reduceIte]
-        rw [hOuterOut5 b (b1_not_in_window hn1) (b1_not_in_window hn2)]
-        have hg := hOuter3Spec b hb; simp only [hn1, hn2, ↓reduceIte] at hg; exact hg
-  -- Step 6: Inner end_call: release aPath then bPath
-  -- 6a: release aPath
-  have hA5LenN : mA5.permissions.length = N := by rw [hALen5, hALen3, hALen2, hNlen]
-  obtain ⟨pairsA, hpairsA, hpairsALen, hpairsAGet⟩ :=
-    b1_list_mapM_ok_of_forall Permission.unprotect mA5.permissions (fun p hp => by
-      obtain ⟨b, hbLt, hbEq⟩ := List.getElem_of_mem hp
-      have hg : mA5.permissions[b]? = some p := by rw [List.getElem?_eq_getElem hbLt, hbEq]
-      rw [hA5Spec b (by omega)] at hg; cases hg
-      by_cases h1 : off1 ≤ b ∧ b < off1 + len1
-      · simp only [h1]; exact ⟨_, rfl⟩
-      · simp only [h1]
-        by_cases h2 : off2 ≤ b ∧ b < off2 + len2
-        · simp only [h2]; exact ⟨_, rfl⟩
-        · simp only [h2]; exact ⟨_, rfl⟩)
-  obtain ⟨root5a, _, hsuf5a, hother5a, hrelAEq⟩ :=
-    tbm_release_protector_eq tbm5 id aPath alloc5 mA5 pairsA halloc5 hlive hAAt5
-      (by rw [hAProt5, hAProt3, hAProt2]; rfl) hpairsA
-  have haccA : ∀ i < (pairsA.map Prod.snd).length,
-      (pairsA.map Prod.snd)[i]? = some (if off1 ≤ i ∧ i < off1 + len1 then some .Write else none) := by
-    intro i hi
-    rw [List.length_map, hpairsALen] at hi
-    obtain ⟨x, y, hx, hy, hfx⟩ := hpairsAGet i hi
-    rw [hA5Spec i (by omega)] at hx; cases hx
-    rw [List.getElem?_map, hy]
-    rcases Decidable.em (off1 ≤ i ∧ i < off1 + len1) with ⟨h1, h2⟩ | hn1
-    · simp only [h1, h2, and_self, ↓reduceIte] at hfx ⊢; cases hfx; rfl
-    · simp only [hn1, ↓reduceIte] at hfx ⊢
-      rcases Decidable.em (off2 ≤ i ∧ i < off2 + len2) with ⟨h1, h2⟩ | hn2
-      · simp only [h1, h2, and_self, ↓reduceIte] at hfx; cases hfx; rfl
-      · simp only [hn2, ↓reduceIte] at hfx; cases hfx; rfl
-  have hnotPreA : ∀ q m5, nodeAt root5 q = some m5 → q ≠ aPath → aPath.isPrefixOf q = false := by
-    intro q m5 hm5 hqne
-    obtain ⟨m3, hm3⟩ := hsurj5 q m5 hm5
+  refine ⟨?_, a3_nestedSplit_writable_contrast tbm htbmParams id alloc N hNlen halloc hlive
+    pPath qs pNode sNode hpNode hsNode hforS hancP hforPassive hsFrozen alOuter lookup⟩
+  obtain ⟨outerPath, aPath, bPath, root3, tbm1, tbm2, tbm3, alloc3, mOuter3, mA3, mB3,
+      hret1, hret2, hret3, hwf3, halloc3, haddr3, hlive3, hdata3Len, hroot3Eq,
+      hPreOA, hPreOB, hOutNeA, hOutNeB, hABNe, hlocAB, hlocBA, hlocOA, hlocOB, hOldPath,
+      hOuterAt3, hOuterProt3, hOuterLen3, hAAt3, hAProt3, hALen3, hBAt3, hBProt3, hBLen3,
+      hOuter3Spec, hA3Spec, hBIn3, hBOut3, hroot3Old, hsurj3All⟩ :=
+    a3_nestedSplit_retags tbm hwf htbmParams id alloc N hNlen halloc hlive pPath qs pNode sNode
+      hpNode hsNode hforS hancP hforPassive hsFrozen off1 len1 off2 len2 hdisj hbound1 hbound2
+      alOuter al1 al2 fnIw1 fnIw2 lookup
+  rw [← hroot3Eq] at hOuterAt3 hAAt3 hBAt3 hroot3Old hsurj3All
+  obtain ⟨tbm4, tbm5, alloc5, mA5, mB5, mOuter5, hstore1, hstore2, hwf5, halloc5,
+      haddr5, hlive5, hdata5Len, hAAt5, hAProt5, hALen5, hBAt5, hBProt5, hBLen5,
+      hOuterAt5, hOuterProt5, hOuterLen5, hA5Spec, hB5Spec, hOuter5Spec, hroot5Old, hsurj5⟩ :=
+    a3_nestedSplit_stores tbm3 hwf3 id alloc alloc3 N halloc3 haddr3 hlive3 hdata3Len
+      pPath qs outerPath aPath bPath mOuter3 mA3 mB3 hforS hPreOA hPreOB hlocAB hlocBA
+      (fun q m0 hm0 => ⟨(hOldPath q m0 hm0).2.2.2.2.2.2.2.1, (hOldPath q m0 hm0).2.2.2.2.2.2.2.2⟩)
+      hOuterAt3 hOuterProt3 hOuterLen3 hAAt3 hAProt3 hALen3 hBAt3 hBProt3 hBLen3
+      off1 len1 off2 len2 hlen1 hlen2 hdisj hbound1 hbound2 wBytes1 wBytes2 hw1 hw2 al1 al2
+      hal1 hal2 fnIw1 fnIw2 hOuter3Spec hA3Spec hBIn3 hBOut3 hroot3Old hsurj3All
+  have hsurj5All : ∀ q m5, nodeAt alloc5.extra.root q = some m5 →
+      q = bPath ∨ q = aPath ∨ q = outerPath ∨ ∃ m0, nodeAt alloc.extra.root q = some m0 := by
+    intro q m5 hm5; obtain ⟨m3, hm3⟩ := hsurj5 q m5 hm5
     rcases hsurj3All q m3 hm3 with ⟨rfl, _⟩ | ⟨rfl, _⟩ | ⟨rfl, _⟩ | ⟨m0, hm0⟩
-    · rw [← locOf_some_eq_isPrefixOf]; exact hlocBA
-    · exact absurd rfl hqne
-    · exact a2_isPrefixOf_append_one_false outerPath _
-    · obtain ⟨m1, hm1, _⟩ := hold1 q m0 hm0
-      exact a2_not_isPrefixOf_of_nodeAt_none root1 aPath q m1
-        (a2_nodeAt_fresh_child_none root1 mOuter1 outerPath hOuterAt1) hm1
-  have hroot5Old : ∀ q m0, nodeAt alloc.extra.root q = some m0 →
-      ∃ m5, nodeAt root5 q = some m5 ∧
-        (locOf (some pPath) q = true → ∀ b < N, m5.permissions[b]? = some (.Unprot .Unique)) ∧
-        (locOf (some pPath) q = false → ∀ b < N, ∃ p, m5.permissions[b]? = some p ∧ permIsForeignPassive p = true) ∧
-        (q = qs →
-          (∀ b < N, (b < off1 ∨ off1 + len1 ≤ b) → (b < off2 ∨ off2 + len2 ≤ b) →
-            m5.permissions[b]? = some (.Unprot .Frozen)) ∧
-          (∀ b, ((off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2)) →
-            m5.permissions[b]? = some (.Unprot .Disabled))) := by
-    intro q m0 hm0
-    obtain ⟨m3, hm3, hU3, hP3, hS3⟩ := hroot3Old q m0 hm0
-    obtain ⟨m5, hm5, _, _, hOut5, hIn15, hIn25⟩ := hroot5Of3 q m3 hm3
-    refine ⟨m5, hm5, ?_, ?_, ?_⟩
-    · intro hl b hb
-      rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hn1
-      · obtain ⟨p', htr, hp'⟩ := hIn15 b h1 h2 _ (hU3 hl b hb)
-        have hll : locRel (some aPath) q = .Local := by unfold locRel; rw [hlocAOfOld q m0 hm0, hl]; rfl
-        rw [hll] at htr; cases htr; exact hp'
-      · rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hn2
-        · obtain ⟨p', htr, hp'⟩ := hIn25 b h1 h2 _ (hU3 hl b hb)
-          have hll : locRel (some bPath) q = .Local := by unfold locRel; rw [hlocBOfOld q m0 hm0, hl]; rfl
-          rw [hll] at htr; cases htr; exact hp'
-        · rw [hOut5 b (b1_not_in_window hn1) (b1_not_in_window hn2)]; exact hU3 hl b hb
-    · intro hl b hb
-      obtain ⟨p3, hp3, hpas3⟩ := hP3 hl b hb
-      rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hn1
-      · obtain ⟨p', htr, hp'⟩ := hIn15 b h1 h2 p3 hp3
-        have hlf : locRel (some aPath) q = .Foreign := by unfold locRel; rw [hlocAOfOld q m0 hm0, hl]; rfl
-        rw [hlf] at htr
-        obtain ⟨p'', htr'', hpas'⟩ := permission_isForeignPassive_preserved p3 .Write hpas3
-        rw [htr''] at htr; cases htr; exact ⟨p', hp', hpas'⟩
-      · rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hn2
-        · obtain ⟨p', htr, hp'⟩ := hIn25 b h1 h2 p3 hp3
-          have hlf : locRel (some bPath) q = .Foreign := by unfold locRel; rw [hlocBOfOld q m0 hm0, hl]; rfl
-          rw [hlf] at htr
-          obtain ⟨p'', htr'', hpas'⟩ := permission_isForeignPassive_preserved p3 .Write hpas3
-          rw [htr''] at htr; cases htr; exact ⟨p', hp', hpas'⟩
-        · rw [hOut5 b (b1_not_in_window hn1) (b1_not_in_window hn2)]; exact ⟨p3, hp3, hpas3⟩
-    · intro hqs; subst q
-      refine ⟨fun b hb ho1 ho2 => by rw [hOut5 b ho1 ho2]; exact hS3 rfl b hb ho1 ho2, fun b hor => ?_⟩
-      -- On `qs`, `m3` held `.Unprot .Frozen` or `.Unprot .Disabled` on W1/W2 (via `hforS` + `hsFrozen`), and `.Unprot` foreign write always gives `.Unprot .Disabled`!
-      have hbN : b < N := by rcases hor with ⟨_, _⟩ | ⟨_, _⟩ <;> omega
-      have hqs3 : m3.permissions[b]? = some (.Unprot .Frozen) ∨ m3.permissions[b]? = some (.Unprot .Disabled) := by
-        obtain ⟨s1, hs1, hs1F⟩ := hroot1S
-        obtain ⟨m1, hm1, _⟩ := hold1 qs m0 hm0
-        rw [hsNode] at hm0; cases hm0
-        rw [hs1] at hm1; cases hm1
-        obtain ⟨m2, hm2, _, _, hm2Out, hm2In⟩ := hold2 qs s1 hs1
-        obtain ⟨m3', hm3', _, _, hm3Out, hm3In⟩ := hold3 qs m2 hm2
-        rw [hm3'] at hm3; cases hm3
-        have hlfO : locRel (some outerPath) qs = .Foreign := by
-          unfold locRel; rw [hlocOuter qs sNode hsNode, hforS]; rfl
-        have hm2F : m2.permissions[b]? = some (.Unprot .Frozen) ∨ m2.permissions[b]? = some (.Unprot .Disabled) := by
-          rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hn1
-          · obtain ⟨p', htr, hp'⟩ := hm2In b h1 h2 _ (hs1F b hbN)
-            rw [hlfO] at htr; cases fnIw1 <;> (cases htr; simp [hp'])
-          · rw [hm2Out b (b1_not_in_window hn1)]; exact Or.inl (hs1F b hbN)
-        rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hn2
-        · rcases hm2F with hf | hd
-          · obtain ⟨p', htr, hp'⟩ := hm3In b h1 h2 _ hf
-            rw [hlfO] at htr; cases fnIw2 <;> (cases htr; simp [hp'])
-          · obtain ⟨p', htr, hp'⟩ := hm3In b h1 h2 _ hd
-            rw [hlfO] at htr; cases fnIw2 <;> (cases htr; exact Or.inr hp')
-        · rw [hm3Out b (b1_not_in_window hn2)]; exact hm2F
-      rcases hor with ⟨h1, h2⟩ | ⟨h1, h2⟩
-      · rcases hqs3 with hf | hd
-        · obtain ⟨p', htr, hp'⟩ := hIn15 b h1 h2 _ hf
-          have hlf : locRel (some aPath) qs = .Foreign := by unfold locRel; rw [hlocAOfOld qs m0 hm0, hforS]; rfl
-          rw [hlf] at htr; cases htr; exact hp'
-        · obtain ⟨p', htr, hp'⟩ := hIn15 b h1 h2 _ hd
-          have hlf : locRel (some aPath) qs = .Foreign := by unfold locRel; rw [hlocAOfOld qs m0 hm0, hforS]; rfl
-          rw [hlf] at htr; cases htr; exact hp'
-      · rcases hqs3 with hf | hd
-        · obtain ⟨p', htr, hp'⟩ := hIn25 b h1 h2 _ hf
-          have hlf : locRel (some bPath) qs = .Foreign := by unfold locRel; rw [hlocBOfOld qs m0 hm0, hforS]; rfl
-          rw [hlf] at htr; cases htr; exact hp'
-        · obtain ⟨p', htr, hp'⟩ := hIn25 b h1 h2 _ hd
-          have hlf : locRel (some bPath) qs = .Foreign := by unfold locRel; rw [hlocBOfOld qs m0 hm0, hforS]; rfl
-          rw [hlf] at htr; cases htr; exact hp'
-  -- Run release_protector for aPath
-  have hpointRelA : ∀ q m1, nodeAt root5a q = some m1 → aPath.isPrefixOf q = false →
-      ∀ i < (pairsA.map Prod.snd).length, ∀ k', (pairsA.map Prod.snd)[i]? = some (some k') →
-        ∃ p p', m1.permissions[i]? = some p ∧ Permission.transition p k' (locRel (some aPath) q) = .ok p' := by
-    intro q m1 hm1 hnotPre i hi k' hk'
-    have hci := haccA i hi; rw [hk'] at hci
-    rcases Decidable.em (off1 ≤ i ∧ i < off1 + len1) with ⟨h1, h2⟩ | hn1
-    · simp only [h1, h2, and_self, ↓reduceIte] at hci; cases hci
-      cases hm5 : nodeAt root5 q with
-      | none => rw [(hother5a q hnotPre).1 hm5] at hm1; cases hm1
-      | some m5 =>
-        obtain ⟨m1', hm1', hm1Ps, _⟩ := (hother5a q hnotPre).2 m5 hm5
-        rw [hm1'] at hm1; cases hm1; rw [hm1Ps]
-        obtain ⟨m3, hm3⟩ := hsurj5 q m5 hm5
-        rcases hsurj3All q m3 hm3 with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨m0, hm0⟩
-        · rw [hBAt5] at hm5; cases hm5
-          have hlf : locRel (some aPath) bPath = .Foreign := by unfold locRel; rw [hlocAB]; rfl
-          rw [hlf]; have hg := hB5Spec i (by omega); simp only [h1, h2, and_self, ↓reduceIte] at hg
-          exact ⟨.Prot .Disabled, .Prot .Disabled, hg, rfl⟩
-        · rw [b1_isPrefixOf_refl] at hnotPre; cases hnotPre
-        · rw [hOuterAt5] at hm5; cases hm5
-          have hll : locRel (some aPath) outerPath = .Local := by unfold locRel; rw [hlocOuterInA]; rfl
-          rw [hll]; have hg := hOuter5Spec i (by omega)
-          have hor : (off1 ≤ i ∧ i < off1 + len1) ∨ (off2 ≤ i ∧ i < off2 + len2) := Or.inl ⟨h1, h2⟩
-          simp only [hor, ↓reduceIte] at hg
-          exact ⟨.Prot .Unique, .Prot .Unique, hg, rfl⟩
-        · obtain ⟨m5', hm5', hU5, hP5, _⟩ := hroot5Old q m0 hm0
-          rw [hm5'] at hm5; cases hm5
-          unfold locRel; rw [hlocAOfOld q m0 hm0]
-          cases hl : locOf (some pPath) q with
-          | true => exact ⟨.Unprot .Unique, .Unprot .Unique, hU5 hl i (by omega), rfl⟩
-          | false =>
-            obtain ⟨p, hpb, hpas⟩ := hP5 hl i (by omega)
-            obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p .Write hpas
-            exact ⟨p, p', hpb, htr⟩
-    · simp only [hn1, ↓reduceIte] at hci; cases hci
-  obtain ⟨root5b, hrelA2, hpostRelA⟩ :=
-    node_release_protector_ok_of_pointwise root5a (some aPath) (pairsA.map Prod.snd) hpointRelA
-  let alloc5b : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra := { alloc5 with extra := { root := root5b } }
-  let tbm5b : Gen.TreeBorrowsMemory Gen.x86_64 :=
-    { tbm5 with mem := { tbm5.mem with allocations := tbm5.mem.allocations.set id alloc5b } }
-  have hrelAOk : TreeBorrowsMemory.release_protector tbm5 (⟨(id : Int)⟩, aPath) = .ok tbm5b := by
-    rw [hrelAEq, hrelA2]; rfl
-  have hwf5b : TreeBorrowsMemory.wfLive tbm5b := tbm_release_protector_wfLive_choiceFree hwf5 hrelAOk
-  have halloc5b : tbm5b.mem.allocations[id]? = some alloc5b :=
-    List.getElem?_set_self (by simp only [tbm5, tbm4, tbm3, tbm2, tbm1, List.length_set]; exact hidlt)
-  -- Helper: relate root5b nodes back to root5 (all non-aPath nodes unchanged outside W1!)
-  have hroot5bOther : ∀ q m5, nodeAt root5 q = some m5 → q ≠ aPath →
-      ∃ m5b, nodeAt root5b q = some m5b ∧ m5b.«protected» = m5.«protected» ∧
-        m5b.permissions.length = m5.permissions.length ∧
-        (∀ b, b < off1 ∨ off1 + len1 ≤ b → m5b.permissions[b]? = m5.permissions[b]?) ∧
-        (∀ b, off1 ≤ b → b < off1 + len1 → ∀ p, m5.permissions[b]? = some p →
-          ∃ p', Permission.transition p .Write (locRel (some aPath) q) = .ok p' ∧ m5b.permissions[b]? = some p') := by
-    intro q m5 hm5 hqne
-    have hnp := hnotPreA q m5 hm5 hqne
-    obtain ⟨m1, hm1, hm1Ps, hm1Prot, _⟩ := (hother5a q hnp).2 m5 hm5
-    obtain ⟨m5b, hm5b, hrel⟩ := (hpostRelA q).2 m1 hm1
-    unfold ReleasePost at hrel
-    have hneS : aPath ≠ q := hqne.symm
-    simp only [hneS, hnp, Bool.false_eq_true, ↓reduceIte] at hrel
-    refine ⟨m5b, hm5b, hrel.1.trans hm1Prot, hrel.2.1.trans (by rw [hm1Ps]), fun b hout => ?_, fun b h1 h2 p hpb => ?_⟩
-    · rcases Decidable.em (b < (pairsA.map Prod.snd).length) with hblt | hbge
-      · have hs := hrel.2.2.2 b hblt
-        rw [haccA b hblt] at hs
-        have hn1 : ¬ (off1 ≤ b ∧ b < off1 + len1) := fun ⟨a, c⟩ => by omega
-        simp only [hn1, ↓reduceIte] at hs; rw [hs, hm1Ps]
-      · rw [hrel.2.2.1 b (by omega), hm1Ps]
-    · have hblt : b < (pairsA.map Prod.snd).length := by rw [List.length_map, hpairsALen, hA5LenN]; omega
-      have hs := hrel.2.2.2 b hblt
-      rw [haccA b hblt] at hs; simp only [h1, h2, and_self, ↓reduceIte] at hs
-      exact hs p (by rw [hm1Ps]; exact hpb)
-  -- Also characterize aPath in root5b (unprotected, all .Unprot!)
-  have hroot5bA : ∃ mA5b, nodeAt root5b aPath = some mA5b ∧ mA5b.«protected» = .No ∧
-      ∀ b < N, ∃ u, mA5b.permissions[b]? = some (.Unprot u) ∧
-        (off2 ≤ b → b < off2 + len2 → u = .Disabled) := by
-    have h1 := hsuf5a []; rw [List.append_nil] at h1
-    obtain ⟨mA5b, hmA5b, hrel⟩ := (hpostRelA aPath).2 _ h1
-    unfold ReleasePost at hrel; simp only [↓reduceIte] at hrel
-    refine ⟨mA5b, hmA5b, hrel.1, fun b hb => ?_⟩
-    rw [hrel.2]
-    obtain ⟨x, y, hx, hy, hfx⟩ := hpairsAGet b (by rw [hA5LenN]; exact hb)
-    rw [hA5Spec b hb] at hx; cases hx
-    rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1', h2'⟩ | hn1
-    · simp only [h1', h2', and_self, ↓reduceIte] at hfx; cases hfx
-      exact ⟨.Unique, by rw [List.getElem?_map, hy]; rfl, fun h3 h4 => absurd ⟨h3, h4⟩ (hInW1 b h1' h2')⟩
-    · simp only [hn1, ↓reduceIte] at hfx
-      rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h3, h4⟩ | hn2
-      · simp only [h3, h4, and_self, ↓reduceIte] at hfx; cases hfx
-        exact ⟨.Disabled, by rw [List.getElem?_map, hy]; rfl, fun _ _ => rfl⟩
-      · simp only [hn2, ↓reduceIte] at hfx; cases hfx
-        exact ⟨.Reserved, by rw [List.getElem?_map, hy]; rfl, fun h3 h4 => absurd ⟨h3, h4⟩ hn2⟩
-  have hsurj5b : ∀ q m5b, nodeAt root5b q = some m5b → ∃ m5, nodeAt root5 q = some m5 := by
-    intro q m5b hm5b
-    cases hm1 : nodeAt root5a q with
-    | none => rw [(hpostRelA q).1 hm1] at hm5b; cases hm5b
-    | some m1 =>
-      rcases Decidable.em (q = aPath) with rfl | hqne
-      · exact ⟨mA5, hAAt5⟩
-      · cases hm5 : nodeAt root5 q with
-        | none =>
-          have hnp : aPath.isPrefixOf q = false := by
-            -- If aPath were a prefix of q, q = aPath ++ suf (suf ≠ []), so nodeAt root5a q = nodeAt mA5 suf = nodeAt root5 q = none, contradiction!
-            cases hp : aPath.isPrefixOf q with
-            | false => rfl
-            | true =>
-              obtain ⟨suf, rfl⟩ := a1_isPrefixOf_eq_append aPath q hp
-              cases suf with
-              | nil => exact absurd (List.append_nil aPath) hqne
-              | cons c cs =>
-                have h1 := hsuf5a (c :: cs); rw [h1] at hm1
-                have h2 : nodeAt root5 (aPath ++ (c :: cs)) = nodeAt mA5 (c :: cs) := by
-                  rw [a1_nodeAt_append, hAAt5]; rfl
-                rw [h2] at hm5; change nodeAt mA5 (c :: cs) = some m1 at hm1
-                rw [hm5] at hm1; cases hm1
-          rw [(hother5a q hnp).1 hm5] at hm1; cases hm1
-        | some m5 => exact ⟨m5, rfl⟩
-  -- 6b: release bPath
-  obtain ⟨mB5b, hBAt5b, hBProt5b, hBLen5b, hBOut5b, hBIn5b⟩ := hroot5bOther bPath mB5 hBAt5 hABNe.symm
-  have hB5bSpec : ∀ b < N, mB5b.permissions[b]? = mB5.permissions[b]? := by
-    intro b hb
-    rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hn1
-    · have hg := hB5Spec b hb; simp only [h1, h2, and_self, ↓reduceIte] at hg
-      obtain ⟨p', htr, hp'⟩ := hBIn5b b h1 h2 _ hg
-      have hlf : locRel (some aPath) bPath = .Foreign := by unfold locRel; rw [hlocAB]; rfl
-      rw [hlf] at htr; cases htr; rw [hp', hg]
-    · exact hBOut5b b (b1_not_in_window hn1)
-  have hB5bLenN : mB5b.permissions.length = N := by rw [hBLen5b, hBLen5, hBLen3, hNlen]
-  obtain ⟨pairsB, hpairsB, hpairsBLen, hpairsBGet⟩ :=
-    b1_list_mapM_ok_of_forall Permission.unprotect mB5b.permissions (fun p hp => by
-      obtain ⟨b, hbLt, hbEq⟩ := List.getElem_of_mem hp
-      have hg : mB5b.permissions[b]? = some p := by rw [List.getElem?_eq_getElem hbLt, hbEq]
-      rw [hB5bSpec b (by omega), hB5Spec b (by omega)] at hg; cases hg
-      by_cases h1 : off1 ≤ b ∧ b < off1 + len1
-      · simp only [h1]; exact ⟨_, rfl⟩
-      · simp only [h1]
-        by_cases h2 : off2 ≤ b ∧ b < off2 + len2
-        · simp only [h2]; exact ⟨_, rfl⟩
-        · simp only [h2]; exact ⟨_, rfl⟩)
-  obtain ⟨root6a, _, hsuf6a, hother6a, hrelBEq⟩ :=
-    tbm_release_protector_eq tbm5b id bPath alloc5b mB5b pairsB halloc5b hlive hBAt5b
-      (by rw [hBProt5b, hBProt5, hBProt3]; rfl) hpairsB
-  have haccB : ∀ i < (pairsB.map Prod.snd).length,
-      (pairsB.map Prod.snd)[i]? = some (if off2 ≤ i ∧ i < off2 + len2 then some .Write else none) := by
-    intro i hi
-    rw [List.length_map, hpairsBLen] at hi
-    obtain ⟨x, y, hx, hy, hfx⟩ := hpairsBGet i hi
-    rw [hB5bSpec i (by omega), hB5Spec i (by omega)] at hx; cases hx
-    rw [List.getElem?_map, hy]
-    rcases Decidable.em (off2 ≤ i ∧ i < off2 + len2) with ⟨h1, h2⟩ | hn2
-    · have hn1 := hInW2 i h1 h2
-      simp only [hn1, h1, h2, and_self, ↓reduceIte] at hfx ⊢; cases hfx; rfl
-    · simp only [hn2, ↓reduceIte] at hfx ⊢
-      rcases Decidable.em (off1 ≤ i ∧ i < off1 + len1) with ⟨h1, h2⟩ | hn1
-      · simp only [h1, h2, and_self, ↓reduceIte] at hfx; cases hfx; rfl
-      · simp only [hn1, ↓reduceIte] at hfx; cases hfx; rfl
-  have hnotPreB : ∀ q m5b, nodeAt root5b q = some m5b → q ≠ bPath → bPath.isPrefixOf q = false := by
-    intro q m5b hm5b hqne
-    obtain ⟨m5, hm5⟩ := hsurj5b q m5b hm5b
-    obtain ⟨m3, hm3⟩ := hsurj5 q m5 hm5
-    rcases hsurj3All q m3 hm3 with ⟨rfl, _⟩ | ⟨rfl, _⟩ | ⟨rfl, _⟩ | ⟨m0, hm0⟩
-    · exact absurd rfl hqne
-    · rw [← locOf_some_eq_isPrefixOf]; exact hlocAB
-    · exact a2_isPrefixOf_append_one_false outerPath _
-    · obtain ⟨m1, hm1, _⟩ := hold1 q m0 hm0
-      obtain ⟨m2, hm2, _⟩ := hold2 q m1 hm1
-      exact a2_not_isPrefixOf_of_nodeAt_none root2 bPath q m2
-        (a2_nodeAt_fresh_child_none root2 mOuter2 outerPath hOuterAt2) hm2
-  have hpointRelB : ∀ q m1, nodeAt root6a q = some m1 → bPath.isPrefixOf q = false →
-      ∀ i < (pairsB.map Prod.snd).length, ∀ k', (pairsB.map Prod.snd)[i]? = some (some k') →
-        ∃ p p', m1.permissions[i]? = some p ∧ Permission.transition p k' (locRel (some bPath) q) = .ok p' := by
-    intro q m1 hm1 hnotPre i hi k' hk'
-    have hci := haccB i hi; rw [hk'] at hci
-    rcases Decidable.em (off2 ≤ i ∧ i < off2 + len2) with ⟨h1, h2⟩ | hn2
-    · simp only [h1, h2, and_self, ↓reduceIte] at hci; cases hci
-      cases hm5b : nodeAt root5b q with
-      | none => rw [(hother6a q hnotPre).1 hm5b] at hm1; cases hm1
-      | some m5b =>
-        obtain ⟨m1', hm1', hm1Ps, _⟩ := (hother6a q hnotPre).2 m5b hm5b
-        rw [hm1'] at hm1; cases hm1; rw [hm1Ps]
-        obtain ⟨m5, hm5⟩ := hsurj5b q m5b hm5b
-        obtain ⟨m3, hm3⟩ := hsurj5 q m5 hm5
-        rcases hsurj3All q m3 hm3 with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨m0, hm0⟩
-        · rw [b1_isPrefixOf_refl] at hnotPre; cases hnotPre
-        · obtain ⟨mA5b', hmA5b', _, hA5bU⟩ := hroot5bA
-          rw [hmA5b'] at hm5b; cases hm5b
-          obtain ⟨u, hu, huDis⟩ := hA5bU i (by omega)
-          rw [huDis h1 h2] at hu
-          have hlf : locRel (some bPath) aPath = .Foreign := by unfold locRel; rw [hlocBA]; rfl
-          rw [hlf]; exact ⟨.Unprot .Disabled, .Unprot .Disabled, hu, rfl⟩
-        · have hOutNeA : outerPath ≠ aPath := fun h => by
-            have hlen := congrArg List.length h
-            simp only [aPath, List.length_append, List.length_singleton] at hlen
-            exact Nat.ne_of_lt (Nat.lt_succ_self outerPath.length) hlen
-          obtain ⟨mO5b, hmO5b, _, _, hOOut5b, _⟩ := hroot5bOther outerPath mOuter5 hOuterAt5 hOutNeA
-          rw [hmO5b] at hm5b; cases hm5b
-          have hout1i : i < off1 ∨ off1 + len1 ≤ i := by rcases hdisj with hd | hd <;> omega
-          rw [hOOut5b i hout1i]
-          have hll : locRel (some bPath) outerPath = .Local := by unfold locRel; rw [hlocOuterInB]; rfl
-          rw [hll]; have hg := hOuter5Spec i (by omega)
-          have hor : (off1 ≤ i ∧ i < off1 + len1) ∨ (off2 ≤ i ∧ i < off2 + len2) := Or.inr ⟨h1, h2⟩
-          simp only [hor, ↓reduceIte] at hg
-          exact ⟨.Prot .Unique, .Prot .Unique, hg, rfl⟩
-        · have hqNeA : q ≠ aPath := fun h => by
-            subst h; obtain ⟨m1q, hm1q, _⟩ := hold1 aPath m0 hm0
-            rw [a2_nodeAt_fresh_child_none root1 mOuter1 outerPath hOuterAt1] at hm1q; cases hm1q
-          obtain ⟨m5', hm5', hU5, hP5, _⟩ := hroot5Old q m0 hm0
-          rw [hm5'] at hm5; cases hm5
-          obtain ⟨m5b', hm5b', _, _, hOut5b, _⟩ := hroot5bOther q m5 hm5' hqNeA
-          rw [hm5b'] at hm5b; cases hm5b
-          have hout1i : i < off1 ∨ off1 + len1 ≤ i := by rcases hdisj with hd | hd <;> omega
-          rw [hOut5b i hout1i]
-          unfold locRel; rw [hlocBOfOld q m0 hm0]
-          cases hl : locOf (some pPath) q with
-          | true => exact ⟨.Unprot .Unique, .Unprot .Unique, hU5 hl i (by omega), rfl⟩
-          | false =>
-            obtain ⟨p, hpb, hpas⟩ := hP5 hl i (by omega)
-            obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p .Write hpas
-            exact ⟨p, p', hpb, htr⟩
-    · simp only [hn2, ↓reduceIte] at hci; cases hci
-  obtain ⟨root6, hrelB2, hpostRelB⟩ :=
-    node_release_protector_ok_of_pointwise root6a (some bPath) (pairsB.map Prod.snd) hpointRelB
-  let alloc6 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra := { alloc5b with extra := { root := root6 } }
-  let tbm6 : Gen.TreeBorrowsMemory Gen.x86_64 :=
-    { tbm5b with mem := { tbm5b.mem with allocations := tbm5b.mem.allocations.set id alloc6 } }
-  have hrelBOk : TreeBorrowsMemory.release_protector tbm5b (⟨(id : Int)⟩, bPath) = .ok tbm6 := by
-    rw [hrelBEq, hrelB2]; rfl
-  have hwf6 : TreeBorrowsMemory.wfLive tbm6 := tbm_release_protector_wfLive_choiceFree hwf5b hrelBOk
-  have halloc6 : tbm6.mem.allocations[id]? = some alloc6 :=
-    List.getElem?_set_self (by simp only [tbm5b, tbm5, tbm4, tbm3, tbm2, tbm1, List.length_set]; exact hidlt)
-  have hendInner : TreeBorrowsMemory.end_call tbm5
-      { protectors := [(⟨(id : Int)⟩, aPath), (⟨(id : Int)⟩, bPath)] } = .ok tbm6 := by
-    unfold TreeBorrowsMemory.end_call
-    simp only [List.foldlM_cons, List.foldlM_nil, bind, Except.bind, hrelAOk, hrelBOk, pure, Except.pure]
-  -- Helper: relate root6 nodes back to root5b for q ≠ bPath
-  have hroot6Other : ∀ q m5b, nodeAt root5b q = some m5b → q ≠ bPath →
-      ∃ m6, nodeAt root6 q = some m6 ∧ m6.«protected» = m5b.«protected» ∧
-        m6.permissions.length = m5b.permissions.length ∧
-        (∀ b, b < off2 ∨ off2 + len2 ≤ b → m6.permissions[b]? = m5b.permissions[b]?) ∧
-        (∀ b, off2 ≤ b → b < off2 + len2 → ∀ p, m5b.permissions[b]? = some p →
-          ∃ p', Permission.transition p .Write (locRel (some bPath) q) = .ok p' ∧ m6.permissions[b]? = some p') := by
-    intro q m5b hm5b hqne
-    have hnp := hnotPreB q m5b hm5b hqne
-    obtain ⟨m1, hm1, hm1Ps, hm1Prot, _⟩ := (hother6a q hnp).2 m5b hm5b
-    obtain ⟨m6, hm6, hrel⟩ := (hpostRelB q).2 m1 hm1
-    unfold ReleasePost at hrel
-    have hneS : bPath ≠ q := hqne.symm
-    simp only [hneS, hnp, Bool.false_eq_true, ↓reduceIte] at hrel
-    refine ⟨m6, hm6, hrel.1.trans hm1Prot, hrel.2.1.trans (by rw [hm1Ps]), fun b hout => ?_, fun b h1 h2 p hpb => ?_⟩
-    · rcases Decidable.em (b < (pairsB.map Prod.snd).length) with hblt | hbge
-      · have hs := hrel.2.2.2 b hblt
-        rw [haccB b hblt] at hs
-        have hn2 : ¬ (off2 ≤ b ∧ b < off2 + len2) := fun ⟨a, c⟩ => by omega
-        simp only [hn2, ↓reduceIte] at hs; rw [hs, hm1Ps]
-      · rw [hrel.2.2.1 b (by omega), hm1Ps]
-    · have hblt : b < (pairsB.map Prod.snd).length := by rw [List.length_map, hpairsBLen, hB5bLenN]; omega
-      have hs := hrel.2.2.2 b hblt
-      rw [haccB b hblt] at hs; simp only [h1, h2, and_self, ↓reduceIte] at hs
-      exact hs p (by rw [hm1Ps]; exact hpb)
-  -- Step 7: Outer end_call: release outerPath (skips strict descendants aPath, bPath; Read on unwritten bytes, Write on W1 ∪ W2!)
-  have hOutNeA : outerPath ≠ aPath := fun h => by
-    have hlen := congrArg List.length h
-    simp only [aPath, List.length_append, List.length_singleton] at hlen
-    exact Nat.ne_of_lt (Nat.lt_succ_self outerPath.length) hlen
-  have hOutNeB : outerPath ≠ bPath := fun h => by
-    have hlen := congrArg List.length h
-    simp only [bPath, List.length_append, List.length_singleton] at hlen
-    exact Nat.ne_of_lt (Nat.lt_succ_self outerPath.length) hlen
-  obtain ⟨mO5b, hOAt5b, hOProt5b, hOLen5b, hOOut5b, hOIn5b⟩ := hroot5bOther outerPath mOuter5 hOuterAt5 hOutNeA
-  obtain ⟨mOuter6, hOuterAt6, hOuterProt6, hOuterLen6, hOOut6, hOIn6⟩ := hroot6Other outerPath mO5b hOAt5b hOutNeB
-  have hOuter6Spec : ∀ b < N, mOuter6.permissions[b]? = mOuter5.permissions[b]? := by
-    intro b hb
-    rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hn2
-    · have hout1 : b < off1 ∨ off1 + len1 ≤ b := by rcases hdisj with hd | hd <;> omega
-      have hm5bEq : mO5b.permissions[b]? = some (.Prot .Unique) := by
-        rw [hOOut5b b hout1, hOuter5Spec b hb]
-        have hor : (off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2) := Or.inr ⟨h1, h2⟩
-        simp only [hor, ↓reduceIte]
-      obtain ⟨p', htr, hp'⟩ := hOIn6 b h1 h2 _ hm5bEq
-      have hll : locRel (some bPath) outerPath = .Local := by unfold locRel; rw [hlocOuterInB]; rfl
-      rw [hll] at htr; cases htr; rw [hp', hOuter5Spec b hb]
-      have hor : (off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2) := Or.inr ⟨h1, h2⟩
-      simp only [hor, ↓reduceIte]
-    · rw [hOOut6 b (b1_not_in_window hn2)]
-      rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hn1
-      · have hg := hOuter5Spec b hb
-        have hor : (off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2) := Or.inl ⟨h1, h2⟩
-        simp only [hor, ↓reduceIte] at hg
-        obtain ⟨p', htr, hp'⟩ := hOIn5b b h1 h2 _ hg
-        have hll : locRel (some aPath) outerPath = .Local := by unfold locRel; rw [hlocOuterInA]; rfl
-        rw [hll] at htr; cases htr; rw [hp', hg]
-      · exact hOOut5b b (b1_not_in_window hn1)
-  have hOuter6LenN : mOuter6.permissions.length = N := by
-    rw [hOuterLen6, hOLen5b, hOuterLen5, hOuterLen3, hOuterLen2, hOuterLen1, hNlen]
-  obtain ⟨pairsO, hpairsO, hpairsOLen, hpairsOGet⟩ :=
-    b1_list_mapM_ok_of_forall Permission.unprotect mOuter6.permissions (fun p hp => by
-      obtain ⟨b, hbLt, hbEq⟩ := List.getElem_of_mem hp
-      have hg : mOuter6.permissions[b]? = some p := by rw [List.getElem?_eq_getElem hbLt, hbEq]
-      rw [hOuter6Spec b (by omega), hOuter5Spec b (by omega)] at hg; cases hg
-      split <;> exact ⟨_, rfl⟩)
-  obtain ⟨root7a, _, hsuf7a, hother7a, hrelOEq⟩ :=
-    tbm_release_protector_eq tbm6 id outerPath alloc6 mOuter6 pairsO halloc6 hlive hOuterAt6
-      (by rw [hOuterProt6, hOProt5b, hOuterProt5, hOuterProt3, hOuterProt2, hOuterProt1]; rfl) hpairsO
-  have haccO : ∀ i < (pairsO.map Prod.snd).length,
-      (pairsO.map Prod.snd)[i]? = some (some
-        (if (off1 ≤ i ∧ i < off1 + len1) ∨ (off2 ≤ i ∧ i < off2 + len2) then .Write else .Read)) := by
-    intro i hi
-    rw [List.length_map, hpairsOLen] at hi
-    obtain ⟨x, y, hx, hy, hfx⟩ := hpairsOGet i hi
-    rw [hOuter6Spec i (by omega), hOuter5Spec i (by omega)] at hx; cases hx
-    rw [List.getElem?_map, hy]
-    by_cases hor : (off1 ≤ i ∧ i < off1 + len1) ∨ (off2 ≤ i ∧ i < off2 + len2)
-    · simp only [hor, ↓reduceIte] at hfx ⊢; cases hfx; rfl
-    · simp only [hor, ↓reduceIte] at hfx ⊢; cases hfx; rfl
-  have hsurj6 : ∀ q m6, nodeAt root6 q = some m6 → ∃ m5b, nodeAt root5b q = some m5b := by
-    intro q m6 hm6
-    cases hm1 : nodeAt root6a q with
-    | none => rw [(hpostRelB q).1 hm1] at hm6; cases hm6
-    | some m1 =>
-      rcases Decidable.em (q = bPath) with rfl | hqne
-      · exact ⟨mB5b, hBAt5b⟩
-      · cases hm5b : nodeAt root5b q with
-        | none =>
-          have hnp : bPath.isPrefixOf q = false := by
-            cases hp : bPath.isPrefixOf q with
-            | false => rfl
-            | true =>
-              obtain ⟨suf, rfl⟩ := a1_isPrefixOf_eq_append bPath q hp
-              cases suf with
-              | nil => exact absurd (List.append_nil bPath) hqne
-              | cons c cs =>
-                have h1 := hsuf6a (c :: cs); rw [h1] at hm1
-                have h2 : nodeAt root5b (bPath ++ (c :: cs)) = nodeAt mB5b (c :: cs) := by
-                  rw [a1_nodeAt_append, hBAt5b]; rfl
-                rw [h2] at hm5b; change nodeAt mB5b (c :: cs) = some m1 at hm1
-                rw [hm5b] at hm1; cases hm1
-          rw [(hother6a q hnp).1 hm5b] at hm1; cases hm1
-        | some m5b => exact ⟨m5b, rfl⟩
-  -- Summarize old nodes in root6
-  have hroot6Old : ∀ q m0, nodeAt alloc.extra.root q = some m0 →
-      ∃ m6, nodeAt root6 q = some m6 ∧
-        (locOf (some pPath) q = true → ∀ b < N, m6.permissions[b]? = some (.Unprot .Unique)) ∧
-        (locOf (some pPath) q = false → ∀ b < N, ∃ p, m6.permissions[b]? = some p ∧ permIsForeignPassive p = true) ∧
-        (q = qs →
-          (∀ b < N, (b < off1 ∨ off1 + len1 ≤ b) → (b < off2 ∨ off2 + len2 ≤ b) →
-            m6.permissions[b]? = some (.Unprot .Frozen)) ∧
-          (∀ b, ((off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2)) →
-            m6.permissions[b]? = some (.Unprot .Disabled))) := by
-    intro q m0 hm0
-    have hqNeA : q ≠ aPath := fun h => by
-      subst h; obtain ⟨m1q, hm1q, _⟩ := hold1 aPath m0 hm0
-      rw [a2_nodeAt_fresh_child_none root1 mOuter1 outerPath hOuterAt1] at hm1q; cases hm1q
-    have hqNeB : q ≠ bPath := fun h => by
-      subst h; obtain ⟨m1q, hm1q, _⟩ := hold1 bPath m0 hm0
-      obtain ⟨m2q, hm2q, _⟩ := hold2 bPath m1q hm1q
-      rw [a2_nodeAt_fresh_child_none root2 mOuter2 outerPath hOuterAt2] at hm2q; cases hm2q
-    obtain ⟨m5, hm5, hU5, hP5, hS5⟩ := hroot5Old q m0 hm0
-    obtain ⟨m5b, hm5b, _, _, hOut5b, hIn5b⟩ := hroot5bOther q m5 hm5 hqNeA
-    obtain ⟨m6, hm6, _, _, hOut6, hIn6⟩ := hroot6Other q m5b hm5b hqNeB
-    refine ⟨m6, hm6, ?_, ?_, ?_⟩
-    · intro hl b hb
-      have hm5bU : m5b.permissions[b]? = some (.Unprot .Unique) := by
-        rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hn1
-        · obtain ⟨p', htr, hp'⟩ := hIn5b b h1 h2 _ (hU5 hl b hb)
-          have hll : locRel (some aPath) q = .Local := by unfold locRel; rw [hlocAOfOld q m0 hm0, hl]; rfl
-          rw [hll] at htr; cases htr; exact hp'
-        · rw [hOut5b b (b1_not_in_window hn1)]; exact hU5 hl b hb
-      rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hn2
-      · obtain ⟨p', htr, hp'⟩ := hIn6 b h1 h2 _ hm5bU
-        have hll : locRel (some bPath) q = .Local := by unfold locRel; rw [hlocBOfOld q m0 hm0, hl]; rfl
-        rw [hll] at htr; cases htr; exact hp'
-      · rw [hOut6 b (b1_not_in_window hn2)]; exact hm5bU
-    · intro hl b hb
-      have hm5bP : ∃ p, m5b.permissions[b]? = some p ∧ permIsForeignPassive p = true := by
-        obtain ⟨p5, hp5, hpas5⟩ := hP5 hl b hb
-        rcases Decidable.em (off1 ≤ b ∧ b < off1 + len1) with ⟨h1, h2⟩ | hn1
-        · obtain ⟨p', htr, hp'⟩ := hIn5b b h1 h2 p5 hp5
-          have hlf : locRel (some aPath) q = .Foreign := by unfold locRel; rw [hlocAOfOld q m0 hm0, hl]; rfl
-          rw [hlf] at htr
-          obtain ⟨p'', htr'', hpas'⟩ := permission_isForeignPassive_preserved p5 .Write hpas5
-          rw [htr''] at htr; cases htr; exact ⟨p', hp', hpas'⟩
-        · rw [hOut5b b (b1_not_in_window hn1)]; exact ⟨p5, hp5, hpas5⟩
-      obtain ⟨p5b, hp5b, hpas5b⟩ := hm5bP
-      rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with ⟨h1, h2⟩ | hn2
-      · obtain ⟨p', htr, hp'⟩ := hIn6 b h1 h2 p5b hp5b
-        have hlf : locRel (some bPath) q = .Foreign := by unfold locRel; rw [hlocBOfOld q m0 hm0, hl]; rfl
-        rw [hlf] at htr
-        obtain ⟨p'', htr'', hpas'⟩ := permission_isForeignPassive_preserved p5b .Write hpas5b
-        rw [htr''] at htr; cases htr; exact ⟨p', hp', hpas'⟩
-      · rw [hOut6 b (b1_not_in_window hn2)]; exact ⟨p5b, hp5b, hpas5b⟩
-    · intro hqs; subst q
-      obtain ⟨hSF5, hSD5⟩ := hS5 rfl
-      refine ⟨fun b hb ho1 ho2 => by rw [hOut6 b ho2, hOut5b b ho1]; exact hSF5 b hb ho1 ho2, fun b hor => ?_⟩
-      rcases hor with ⟨h1, h2⟩ | ⟨h1, h2⟩
-      · have hout2 : b < off2 ∨ off2 + len2 ≤ b := by rcases hdisj with hd | hd <;> omega
-        rw [hOut6 b hout2]
-        obtain ⟨p', htr, hp'⟩ := hIn5b b h1 h2 _ (hSD5 b (Or.inl ⟨h1, h2⟩))
-        have hlf : locRel (some aPath) qs = .Foreign := by unfold locRel; rw [hlocAOfOld qs m0 hm0, hforS]; rfl
-        rw [hlf] at htr; cases htr; exact hp'
-      · have hout1 : b < off1 ∨ off1 + len1 ≤ b := by rcases hdisj with hd | hd <;> omega
-        have hm5bD : m5b.permissions[b]? = some (.Unprot .Disabled) := by
-          rw [hOut5b b hout1]; exact hSD5 b (Or.inr ⟨h1, h2⟩)
-        obtain ⟨p', htr, hp'⟩ := hIn6 b h1 h2 _ hm5bD
-        have hlf : locRel (some bPath) qs = .Foreign := by unfold locRel; rw [hlocBOfOld qs m0 hm0, hforS]; rfl
-        rw [hlf] at htr; cases htr; exact hp'
-  -- Run release_protector for outerPath
-  have hpointRelO : ∀ q m1, nodeAt root7a q = some m1 → outerPath.isPrefixOf q = false →
-      ∀ i < (pairsO.map Prod.snd).length, ∀ k', (pairsO.map Prod.snd)[i]? = some (some k') →
-        ∃ p p', m1.permissions[i]? = some p ∧ Permission.transition p k' (locRel (some outerPath) q) = .ok p' := by
-    intro q m1 hm1 hnotPre i hi k' hk'
-    have hci := haccO i hi; rw [hk'] at hci; cases hci
-    have hiN : i < N := by rw [List.length_map, hpairsOLen, hOuter6LenN] at hi; exact hi
-    cases hm6 : nodeAt root6 q with
-    | none => rw [(hother7a q hnotPre).1 hm6] at hm1; cases hm1
-    | some m6 =>
-      obtain ⟨m1', hm1', hm1Ps, _⟩ := (hother7a q hnotPre).2 m6 hm6
-      rw [hm1'] at hm1; cases hm1; rw [hm1Ps]
-      obtain ⟨m5b, hm5b⟩ := hsurj6 q m6 hm6
-      obtain ⟨m5, hm5⟩ := hsurj5b q m5b hm5b
-      obtain ⟨m3, hm3⟩ := hsurj5 q m5 hm5
-      rcases hsurj3All q m3 hm3 with ⟨rfl, _⟩ | ⟨rfl, _⟩ | ⟨rfl, _⟩ | ⟨m0, hm0⟩
-      · rw [a1_isPrefixOf_append_right outerPath _] at hnotPre; cases hnotPre
-      · rw [a1_isPrefixOf_append_right outerPath _] at hnotPre; cases hnotPre
-      · rw [b1_isPrefixOf_refl] at hnotPre; cases hnotPre
-      · obtain ⟨m6', hm6', hU6, hP6, _⟩ := hroot6Old q m0 hm0
-        rw [hm6'] at hm6; cases hm6
-        unfold locRel; rw [hlocOuter q m0 hm0]
-        cases hl : locOf (some pPath) q with
-        | true =>
-          have hu := hU6 hl i hiN
-          split <;> exact ⟨.Unprot .Unique, .Unprot .Unique, hu, rfl⟩
-        | false =>
-          obtain ⟨p, hpb, hpas⟩ := hP6 hl i hiN
-          obtain ⟨p', htr, _⟩ := permission_isForeignPassive_preserved p _ hpas
-          exact ⟨p, p', hpb, htr⟩
-  obtain ⟨root7, hrelO2, hpostRelO⟩ :=
-    node_release_protector_ok_of_pointwise root7a (some outerPath) (pairsO.map Prod.snd) hpointRelO
-  let alloc7 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra := { alloc6 with extra := { root := root7 } }
-  let tbm7 : Gen.TreeBorrowsMemory Gen.x86_64 :=
-    { tbm6 with mem := { tbm6.mem with allocations := tbm6.mem.allocations.set id alloc7 } }
-  have hrelOOk : TreeBorrowsMemory.release_protector tbm6 (⟨(id : Int)⟩, outerPath) = .ok tbm7 := by
-    rw [hrelOEq, hrelO2]; rfl
-  have hwf7 : TreeBorrowsMemory.wfLive tbm7 := tbm_release_protector_wfLive_choiceFree hwf6 hrelOOk
-  have halloc7 : tbm7.mem.allocations[id]? = some alloc7 :=
-    List.getElem?_set_self (by simp only [tbm6, tbm5b, tbm5, tbm4, tbm3, tbm2, tbm1, List.length_set]; exact hidlt)
-  have hendOuter : TreeBorrowsMemory.end_call tbm6 { protectors := [(⟨(id : Int)⟩, outerPath)] } = .ok tbm7 := by
-    unfold TreeBorrowsMemory.end_call
-    simp only [List.foldlM_cons, List.foldlM_nil, bind, Except.bind, hrelOOk, pure, Except.pure]
-  -- Step 8: Extract final permissions on sFinal (`qs`) and prove sibling load ok/ub!
-  have hnotPreOOfOld : ∀ q m0, nodeAt alloc.extra.root q = some m0 → outerPath.isPrefixOf q = false :=
-    fun q m0 hm0 => a2_not_isPrefixOf_of_nodeAt_none alloc.extra.root outerPath q m0
-      (a2_nodeAt_fresh_child_none alloc.extra.root pNode pPath hpNode) hm0
-  obtain ⟨s6, hs6, _, _, hS6⟩ := hroot6Old qs sNode hsNode
-  obtain ⟨hSF6, hSD6⟩ := hS6 rfl
-  have hnotPreOS := hnotPreOOfOld qs sNode hsNode
-  obtain ⟨s7a, hs7a, hs7aPs, _, _⟩ := (hother7a qs hnotPreOS).2 s6 hs6
-  obtain ⟨sFinal, hsFinal, hsRelO⟩ := (hpostRelO qs).2 s7a hs7a
-  have hneOS : outerPath ≠ qs := (hOuterNeOld qs sNode hsNode).symm
-  unfold ReleasePost at hsRelO
-  simp only [hneOS, hnotPreOS, Bool.false_eq_true, ↓reduceIte] at hsRelO
-  have hsFinalFrz : ∀ b < N, (b < off1 ∨ off1 + len1 ≤ b) → (b < off2 ∨ off2 + len2 ≤ b) →
-      sFinal.permissions[b]? = some (.Unprot .Frozen) := by
-    intro b hb ho1 ho2
-    have hblt : b < (pairsO.map Prod.snd).length := by rw [List.length_map, hpairsOLen, hOuter6LenN]; exact hb
-    have hsb := hsRelO.2.2.2 b hblt
-    rw [haccO b hblt] at hsb
-    have hnor : ¬ ((off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2)) := by omega
-    simp only [hnor, ↓reduceIte] at hsb
-    obtain ⟨p', htr, hp'⟩ := hsb (.Unprot .Frozen) (by rw [hs7aPs]; exact hSF6 b hb ho1 ho2)
-    have hlf : locRel (some outerPath) qs = .Foreign := by unfold locRel; rw [hlocOuter qs sNode hsNode, hforS]; rfl
-    rw [hlf] at htr; cases htr; exact hp'
-  have hsFinalDis : ∀ b, ((off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2)) →
-      sFinal.permissions[b]? = some (.Unprot .Disabled) := by
-    intro b hor
-    have hbN : b < N := by rcases hor with ⟨_, _⟩ | ⟨_, _⟩ <;> omega
-    have hblt : b < (pairsO.map Prod.snd).length := by rw [List.length_map, hpairsOLen, hOuter6LenN]; exact hbN
-    have hsb := hsRelO.2.2.2 b hblt
-    rw [haccO b hblt] at hsb
-    simp only [hor, ↓reduceIte] at hsb
-    obtain ⟨p', htr, hp'⟩ := hsb (.Unprot .Disabled) (by rw [hs7aPs]; exact hSD6 b hor)
-    have hlf : locRel (some outerPath) qs = .Foreign := by unfold locRel; rw [hlocOuter qs sNode hsNode, hforS]; rfl
-    rw [hlf] at htr; cases htr; exact hp'
-  -- Sibling load on any unwritten sub-window succeeds!
-  have hloadUnwrittenOk : ∀ (oR lR alR : Nat), 0 < lR → oR + lR ≤ N →
-      (oR + lR ≤ off1 ∨ off1 + len1 ≤ oR) → (oR + lR ≤ off2 ∨ off2 + len2 ≤ oR) →
-      Align.is_aligned ⟨alR⟩ (alloc.addr + (oR : Int)) = true →
-      ∃ bytes tbmR, TreeBorrowsMemory.load tbm7
-        { addr := alloc.addr + (oR : Int), provenance := some (⟨(id : Int)⟩, qs) }
-        ⟨lR⟩ ⟨alR⟩ = .ok (bytes, tbmR) := by
-    intro oR lR alR hlR hbdR hd1 hd2 halR
-    have hpointRd : ∀ q m7, nodeAt root7 q = some m7 →
-        ∃ ps', Node.transitionRange (locRel (some qs) q) .Read oR lR m7.permissions = .ok ps' := by
-      intro q m7 hm7
-      obtain ⟨ps', hrun, _⟩ := transitionRange_ok_of_pointwise (locRel (some qs) q) .Read lR oR
-        m7.permissions (fun b hb1 hb2 => by
-          have hbN : b < N := by omega
-          have ho1 : b < off1 ∨ off1 + len1 ≤ b := by rcases hd1 with hd | hd <;> omega
-          have ho2 : b < off2 ∨ off2 + len2 ≤ b := by rcases hd2 with hd | hd <;> omega
-          have hwf7Root : Node.wf alloc7.data.length root7 := hwf7 alloc7 (List.mem_of_getElem? halloc7) hlive
-          have hm7Wf := c1_nodeWf_len_and_prot alloc7.data.length m7
-            (c1_nodeWf_nodeAt root7 alloc7.data.length hwf7Root q m7 hm7)
-          have hblt7 : b < m7.permissions.length := by rw [hm7Wf.1]; change b < alloc5.data.length; omega
-          -- Every node in root7 is either aPath/bPath/outerPath (unprotected -> foreign read always ok) or old!
-          cases hm1 : nodeAt root7a q with
-          | none => rw [(hpostRelO q).1 hm1] at hm7; cases hm7
-          | some m1 =>
-            rcases Decidable.em (outerPath.isPrefixOf q = true) with hpreO | hnotPreO
-            · -- q is outerPath, aPath, or bPath: all are UNPROTECTED in root7 and FOREIGN to qs!
-              have hqForS : locOf (some qs) q = false := by
-                rw [locOf_some_eq_isPrefixOf]
-                cases hqsPre : q.isPrefixOf qs with
-                | false => rfl
-                | true =>
-                  -- If q is a prefix of qs and outerPath is a prefix of q, then outerPath is a prefix of qs, contradicting hnotPreOS!
-                  have htrans : ∀ (x y z : Gen.Path), x.isPrefixOf y = true → y.isPrefixOf z = true → x.isPrefixOf z = true := by
-                    intro x; induction x with
-                    | nil => intro _ _ _ _; rfl
-                    | cons a tl ih =>
-                      intro y z hxy hyz; cases y with
-                      | nil => cases hxy
-                      | cons b ytl =>
-                        cases z with
-                        | nil => cases hyz
-                        | cons c ztl =>
-                          simp only [List.isPrefixOf, Bool.and_eq_true, a1_int_beq_iff] at hxy hyz ⊢
-                          exact ⟨hxy.1.trans hyz.1, ih ytl ztl hxy.2 hyz.2⟩
-                  rw [htrans outerPath q qs hpreO hqsPre] at hnotPreOS; cases hnotPreOS
-              have hm7Unprot : m7.«protected» = .No := by
-                rcases Decidable.em (q = outerPath) with rfl | hqNeO
-                · have h1 := hsuf7a []; rw [List.append_nil] at h1
-                  obtain ⟨m7', hm7', hr⟩ := (hpostRelO outerPath).2 _ h1
-                  rw [hm7'] at hm7; cases hm7; unfold ReleasePost at hr; simp only [↓reduceIte] at hr; exact hr.1
-                · obtain ⟨m7', hm7', hr⟩ := (hpostRelO q).2 m1 hm1
-                  rw [hm7'] at hm7; cases hm7; unfold ReleasePost at hr
-                  have hneS' : outerPath ≠ q := Ne.symm hqNeO
-                  simp only [hneS', hpreO, ↓reduceIte] at hr; subst hr
-                  obtain ⟨suf, rfl⟩ := a1_isPrefixOf_eq_append outerPath q hpreO
-                  cases suf with
-                  | nil => exact absurd (List.append_nil outerPath) hqNeO
-                  | cons c cs =>
-                    have h1 := hsuf7a (c :: cs); rw [h1] at hm1
-                    have hm6q : nodeAt root6 (outerPath ++ (c :: cs)) = some m7 := by
-                      rw [a1_nodeAt_append, hOuterAt6]; exact hm1
-                    obtain ⟨m5b, hm5b⟩ := hsurj6 _ m7 hm6q
-                    obtain ⟨m5, hm5⟩ := hsurj5b _ m5b hm5b
-                    obtain ⟨m3, hm3⟩ := hsurj5 _ m5 hm5
-                    rcases hsurj3All _ m3 hm3 with ⟨hEqB, _⟩ | ⟨hEqA, _⟩ | ⟨hEqO, _⟩ | ⟨m0, hm0⟩
-                    · rw [hEqB] at hm6q
-                      have h1b := hsuf6a []; rw [List.append_nil] at h1b
-                      obtain ⟨mB6, hmB6, hrB⟩ := (hpostRelB bPath).2 _ h1b
-                      rw [hmB6] at hm6q; cases hm6q
-                      unfold ReleasePost at hrB; simp only [↓reduceIte] at hrB; exact hrB.1
-                    · rw [hEqA] at hm6q
-                      obtain ⟨mA5b, hmA5b, hA5bP, _⟩ := hroot5bA
-                      obtain ⟨mA6, hmA6, hA6P, _⟩ := hroot6Other aPath mA5b hmA5b hABNe
-                      rw [hmA6] at hm6q; cases hm6q; exact hA6P.trans hA5bP
-                    · exact absurd hEqO hqNeO
-                    · rw [hnotPreOOfOld _ m0 hm0] at hpreO; cases hpreO
-              obtain ⟨p, hpb⟩ : ∃ p, m7.permissions[b]? = some p := ⟨m7.permissions[b], List.getElem?_eq_getElem hblt7⟩
-              have hmp := hm7Wf.2 p (List.mem_of_getElem? hpb)
-              rw [hm7Unprot] at hmp
-              have hlf : locRel (some qs) q = .Foreign := by unfold locRel; rw [hqForS]; rfl
-              rw [hlf]
-              cases p with
-              | Prot _ => cases hmp
-              | Unprot u => cases u <;> exact ⟨_, _, hpb, rfl⟩
-            · have hnpF : outerPath.isPrefixOf q = false := Bool.eq_false_iff.mpr hnotPreO
-              cases hm6 : nodeAt root6 q with
-              | none => rw [(hother7a q hnpF).1 hm6] at hm1; cases hm1
-              | some m6 =>
-                obtain ⟨m1', hm1', hm1Ps, _⟩ := (hother7a q hnpF).2 m6 hm6
-                rw [hm1'] at hm1; cases hm1
-                obtain ⟨m5b, hm5b⟩ := hsurj6 q m6 hm6
-                obtain ⟨m5, hm5⟩ := hsurj5b q m5b hm5b
-                obtain ⟨m3, hm3⟩ := hsurj5 q m5 hm5
-                rcases hsurj3All q m3 hm3 with ⟨rfl, _⟩ | ⟨rfl, _⟩ | ⟨rfl, _⟩ | ⟨m0, hm0⟩
-                · rw [a1_isPrefixOf_append_right outerPath _] at hnpF; cases hnpF
-                · rw [a1_isPrefixOf_append_right outerPath _] at hnpF; cases hnpF
-                · rw [b1_isPrefixOf_refl] at hnpF; cases hnpF
-                · obtain ⟨m6', hm6', hU6, hP6, _⟩ := hroot6Old q m0 hm0
-                  rw [hm6'] at hm6; cases hm6
-                  obtain ⟨m7', hm7', hrO⟩ := (hpostRelO q).2 m1 hm1'
-                  rw [hm7'] at hm7; cases hm7
-                  unfold ReleasePost at hrO
-                  have hneOq : outerPath ≠ q := (hOuterNeOld q m0 hm0).symm
-                  simp only [hneOq, hnpF, Bool.false_eq_true, ↓reduceIte] at hrO
-                  have hbltO : b < (pairsO.map Prod.snd).length := by rw [List.length_map, hpairsOLen, hOuter6LenN]; exact hbN
-                  have hsb := hrO.2.2.2 b hbltO
-                  rw [haccO b hbltO] at hsb
-                  have hnor : ¬ ((off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2)) := by omega
-                  simp only [hnor, ↓reduceIte] at hsb
-                  unfold locRel
-                  cases hlS : locOf (some qs) q with
-                  | true =>
-                    rcases hancS q m0 hm0 hlS with rfl | hlP
-                    · rw [hsFinal] at hm7'; cases hm7'
-                      exact ⟨.Unprot .Frozen, .Unprot .Frozen, hsFinalFrz b hbN ho1 ho2, rfl⟩
-                    · obtain ⟨p7, htrO, hp7⟩ := hsb (.Unprot .Unique) (by rw [hm1Ps]; exact hU6 hlP b hbN)
-                      have hllO : locRel (some outerPath) q = .Local := by
-                        unfold locRel; rw [hlocOuter q m0 hm0, hlP]; rfl
-                      rw [hllO] at htrO; cases htrO
-                      exact ⟨.Unprot .Unique, .Unprot .Unique, hp7, rfl⟩
-                  | false =>
-                    cases hlP : locOf (some pPath) q with
-                    | true =>
-                      obtain ⟨p7, htrO, hp7⟩ := hsb (.Unprot .Unique) (by rw [hm1Ps]; exact hU6 hlP b hbN)
-                      have hllO : locRel (some outerPath) q = .Local := by
-                        unfold locRel; rw [hlocOuter q m0 hm0, hlP]; rfl
-                      rw [hllO] at htrO; cases htrO
-                      exact ⟨.Unprot .Unique, .Unprot .Frozen, hp7, rfl⟩
-                    | false =>
-                      obtain ⟨p6, hp6, hpas6⟩ := hP6 hlP b hbN
-                      obtain ⟨p7, htrO, hp7⟩ := hsb p6 (by rw [hm1Ps]; exact hp6)
-                      have hlfO : locRel (some outerPath) q = .Foreign := by
-                        unfold locRel; rw [hlocOuter q m0 hm0, hlP]; rfl
-                      rw [hlfO] at htrO
-                      obtain ⟨p7', htr7', hpas7⟩ := permission_isForeignPassive_preserved p6 .Read hpas6
-                      rw [htr7'] at htrO; cases htrO
-                      obtain ⟨p8, htr8, _⟩ := permission_isForeignPassive_preserved p7 .Read hpas7
-                      exact ⟨p7, p8, hp7, htr8⟩)
-      exact ⟨ps', hrun⟩
-    obtain ⟨rootR, haccR, _⟩ := node_access_ok_of_pointwise .Read oR lR root7 (some qs) hpointRd
-    have hldEq := tbm_load_eq_node_access tbm7
-      { addr := alloc.addr + (oR : Int), provenance := some (⟨(id : Int)⟩, qs) } lR ⟨alR⟩ id qs alloc7 oR
-      rfl halloc7 hlive halR (a2_int_add_sub_cancel alloc.addr _) (by omega)
-      (by change oR + lR ≤ alloc5.data.length; omega)
-    rw [hldEq, haccR]; exact ⟨_, _, rfl⟩
-  -- Sibling load touching any written byte fails!
-  have hloadWrittenUb : ∀ (oR lR alR : Nat) (b : Nat),
-      ((off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2)) →
-      oR ≤ b → b < oR + lR → lR ≠ 0 → oR + lR ≤ N →
-      Align.is_aligned ⟨alR⟩ (alloc.addr + (oR : Int)) = true →
-      ∀ res, TreeBorrowsMemory.load tbm7
-        { addr := alloc.addr + (oR : Int), provenance := some (⟨(id : Int)⟩, qs) }
-        ⟨lR⟩ ⟨alR⟩ ≠ .ok res := by
-    intro oR lR alR b hor h1 h2 hlR hbdR halR res hld
-    rw [tbm_load_eq_node_access tbm7 _ lR ⟨alR⟩ id qs alloc7 oR
-      rfl halloc7 hlive halR (a2_int_add_sub_cancel alloc.addr _) hlR
-      (by change oR + lR ≤ alloc5.data.length; omega)] at hld
-    obtain ⟨r', hacc', _⟩ := nwsr_bind_ok hld
-    exact node_access_read_through_disabled_fails root7 qs sFinal b oR lR hsFinal
-      (hsFinalDis b hor) h1 h2 r' hacc'
+    · exact Or.inl rfl
+    · exact Or.inr (Or.inl rfl)
+    · exact Or.inr (Or.inr (Or.inl rfl))
+    · exact Or.inr (Or.inr (Or.inr ⟨m0, hm0⟩))
+  obtain ⟨tbm6, alloc6, mOuter6, hendFwd, hwf6, halloc6, haddr6, hlive6, hdata6Len,
+      hOuterAt6, hOuterProt6, hOuterLen6, hOuter6Eq, hA6Unprot, hB6Unprot, hroot6Old, hsurj6All⟩ :=
+    a3_nestedSplit_innerEndCall_ordered tbm5 hwf5 id alloc alloc5 N halloc5 hlive5 hdata5Len
+      pPath qs outerPath aPath bPath mA5 mB5 mOuter5 hforS hPreOA hPreOB hOutNeA hOutNeB hABNe
+      hlocAB hlocBA hlocOA hlocOB
+      (fun q m0 hm0 => let h := hOldPath q m0 hm0
+        ⟨h.2.1, h.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.1, h.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2⟩)
+      hAAt5 hAProt5 hALen5 hBAt5 hBProt5 hBLen5 hOuterAt5 hOuterProt5 hOuterLen5
+      off1 len1 off2 len2 hdisj hbound1 hbound2 hA5Spec hB5Spec hOuter5Spec hroot5Old hsurj5All
+  obtain ⟨tbm6Rev, _, _, hendRev, hwf6Rev, _⟩ :=
+    a3_nestedSplit_innerEndCall_ordered tbm5 hwf5 id alloc alloc5 N halloc5 hlive5 hdata5Len
+      pPath qs outerPath bPath aPath mB5 mA5 mOuter5 hforS hPreOB hPreOA hOutNeB hOutNeA hABNe.symm
+      hlocBA hlocAB hlocOB hlocOA
+      (fun q m0 hm0 => let h := hOldPath q m0 hm0
+        ⟨h.2.2.1, h.2.1, h.2.2.2.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.2.2.2, h.2.2.2.2.2.2.2.1⟩)
+      hBAt5 hBProt5 hBLen5 hAAt5 hAProt5 hALen5 hOuterAt5 hOuterProt5 hOuterLen5
+      off2 len2 off1 len1 hdisj.symm hbound2 hbound1
+      (fun b hb => by
+        rw [hB5Spec b hb]
+        rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with h2 | hn2
+        · have hn1 : ¬ (off1 ≤ b ∧ b < off1 + len1) := fun ⟨_, _⟩ => by rcases hdisj with hd | hd <;> omega
+          simp [h2, hn1]
+        · simp [hn2])
+      (fun b hb => by
+        rw [hA5Spec b hb]
+        rcases Decidable.em (off2 ≤ b ∧ b < off2 + len2) with h2 | hn2
+        · have hn1 : ¬ (off1 ≤ b ∧ b < off1 + len1) := fun ⟨_, _⟩ => by rcases hdisj with hd | hd <;> omega
+          simp [h2, hn1]
+        · simp [hn2])
+      (fun b hb => by rw [hOuter5Spec b hb]; simp [or_comm])
+      (fun q m0 hm0 => by
+        obtain ⟨m5, hm5, hU, hP, hS⟩ := hroot5Old q m0 hm0
+        exact ⟨m5, hm5, hU, hP, fun hqs =>
+          let ⟨hF, hD⟩ := hS hqs
+          ⟨fun b hb ho2 ho1 => hF b hb ho1 ho2, fun b hor => hD b hor.symm⟩⟩)
+      (fun q m5 hm5 => by
+        rcases hsurj5All q m5 hm5 with h | h | h | h
+        · exact Or.inr (Or.inl h)
+        · exact Or.inl h
+        · exact Or.inr (Or.inr (Or.inl h))
+        · exact Or.inr (Or.inr (Or.inr h)))
+  obtain ⟨tbm7, alloc7, sFinal, hendOuter, hwf7, halloc7, hsFinal, hsFinalFrz, hsFinalDis,
+      hloadOk, hloadUb⟩ :=
+    a3_nestedSplit_outerEndCall_and_reads tbm6 hwf6 id alloc alloc6 N halloc6 (haddr6.trans haddr5)
+      hlive6 hdata6Len pPath qs outerPath aPath bPath sNode mOuter6 hsNode hforS hancS
+      hPreOA hPreOB hOutNeA hOutNeB
+      (fun q m0 hm0 => let h := hOldPath q m0 hm0; ⟨h.1, h.2.2.2.1, h.2.2.2.2.2.2.1⟩)
+      hOuterAt6 hOuterProt6 hOuterLen6 off1 len1 off2 len2 hbound1 hbound2
+      (fun b hb => (hOuter6Eq b hb).trans (hOuter5Spec b hb)) hA6Unprot hB6Unprot hroot6Old hsurj6All
   exact ⟨_, tbm1, _, _, tbm2, _, _, tbm3, _, tbm4, tbm5, tbm6, tbm7, alloc7, sFinal,
-    hret1, hret2, hret3, hstore1, hstore2, hendInner, hendOuter, hwf7, halloc7, hsFinal,
-    hsFinalFrz, hsFinalDis, hloadUnwrittenOk, hloadWrittenUb⟩
+    hret1, hret2, hret3, hstore1, hstore2, hendFwd, ⟨tbm6Rev, hendRev, hwf6Rev⟩, hendOuter,
+    hwf7, halloc7, hsFinal, hsFinalFrz, hsFinalDis, hloadOk, hloadUb⟩
 
 /-! ## Part 5: `#[rustc_no_writable]` Edge Cases on Real `TreeBorrowsMemory` Operations (`charon#1619` + `minirust#295`) -/
 
@@ -18393,11 +17360,55 @@ theorem tbm_nestedSplitAtMut_noWritable_vs_writable :
       some (.inr "Tree Borrows: local read of Disabled reference") ∧
     (∃ tbm', tbmNestedSplitAtMutTrace true 1 = .ok tbm' ∧ TreeBorrowsMemory.wfLive tbm') ∧
     tbmNestedSplitAtMutSiblingRead true 1 2 2 =
-      some (.inr "Tree Borrows: local read of Disabled reference") :=
-  ⟨tbm_trace_ok_and_wfLive_of_bool (by decide +kernel),
-   by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
-   by decide +kernel, by decide +kernel, by decide +kernel,
-   tbm_trace_ok_and_wfLive_of_bool (by decide +kernel), by decide +kernel⟩
+      some (.inr "Tree Borrows: local read of Disabled reference") := by
+  let rd (tbm : Gen.TreeBorrowsMemory Gen.x86_64) (off : Int) (len : Nat) :=
+    tbBytesOutcome (TreeBorrowsMemory.load tbm { addr := 256 + off, provenance := some (⟨0⟩, [0]) } ⟨len⟩ ⟨1⟩ >>=
+      fun r => pure r.1)
+  have hrdEq : ∀ fnIw st tbm' off len, tbmNestedSplitAtMutTrace fnIw st = .ok tbm' →
+      tbmNestedSplitAtMutSiblingRead fnIw st off len = rd tbm' off len := by
+    intro fnIw st tbm' off len ht
+    unfold tbmNestedSplitAtMutSiblingRead; rw [ht]; rfl
+  have hf1 : (match tbmNestedSplitAtMutTrace false 1 with
+      | .ok tbm =>
+        tbmWfLiveBool tbm &&
+        decide (rd tbm 2 2 = some (.inl [some 0, some 0])) &&
+        decide (rd tbm 6 2 = some (.inl [some 0, some 0])) &&
+        decide (rd tbm 0 2 = some (.inr "Tree Borrows: local read of Disabled reference")) &&
+        decide (rd tbm 4 2 = some (.inr "Tree Borrows: local read of Disabled reference"))
+      | .error _ => false) = true := by decide +kernel
+  have ht0 : (match tbmNestedSplitAtMutTrace true 0 with
+      | .ok tbm =>
+        decide (rd tbm 2 2 = some (.inr "Tree Borrows: local read of Disabled reference")) &&
+        decide (rd tbm 6 2 = some (.inr "Tree Borrows: local read of Disabled reference"))
+      | .error _ => false) = true := by decide +kernel
+  have ht1 : (match tbmNestedSplitAtMutTrace true 1 with
+      | .ok tbm =>
+        tbmWfLiveBool tbm &&
+        decide (rd tbm 2 2 = some (.inr "Tree Borrows: local read of Disabled reference"))
+      | .error _ => false) = true := by decide +kernel
+  cases h1 : tbmNestedSplitAtMutTrace false 1 with
+  | error _ => rw [h1] at hf1; cases hf1
+  | ok tbmF1 =>
+    rw [h1] at hf1
+    cases h2 : tbmNestedSplitAtMutTrace true 0 with
+    | error _ => rw [h2] at ht0; cases ht0
+    | ok tbmT0 =>
+      rw [h2] at ht0
+      cases h3 : tbmNestedSplitAtMutTrace true 1 with
+      | error _ => rw [h3] at ht1; cases ht1
+      | ok tbmT1 =>
+        rw [h3] at ht1
+        simp only [Bool.and_eq_true, decide_eq_true_eq] at hf1 ht0 ht1
+        exact ⟨⟨tbmF1, rfl, tbm_wfLive_of_bool tbmF1 hf1.1.1.1.1⟩,
+          (hrdEq false 1 tbmF1 2 2 h1).trans hf1.1.1.1.2,
+          (hrdEq false 1 tbmF1 6 2 h1).trans hf1.1.1.2,
+          (hrdEq false 1 tbmF1 0 2 h1).trans hf1.1.2,
+          (hrdEq false 1 tbmF1 4 2 h1).trans hf1.2,
+          by decide +kernel,
+          (hrdEq true 0 tbmT0 2 2 h2).trans ht0.1,
+          (hrdEq true 0 tbmT0 6 2 h2).trans ht0.2,
+          ⟨tbmT1, rfl, tbm_wfLive_of_bool tbmT1 ht1.1⟩,
+          (hrdEq true 1 tbmT1 2 2 h3).trans ht1.2⟩
 
 /-- **Anneal coarse-range world vs. MiniRust per-byte permissions on the
 `get_mut` slice pattern**: `sliceGetMutWorldTrace` agrees with
@@ -18724,9 +17735,10 @@ theorem machTB_protectedSibling_noWritable_vs_writable_e2e :
     machTopProtectorCount mWr 9 = some 1 ∧
     machStopOutcome mWr 10 =
       some (.ub "Tree Borrows: foreign write of protected Frozen reference which had a local read") :=
-  ⟨by decide +kernel, by decide +kernel,
+  let h := a3_machTB_retSnapshot_and_wfLive (by decide +kernel)
+  ⟨by decide +kernel, h.1,
    machTB_harnesses_initial_wfLive.2.2.2.1 _ _,
-   machTB_steps_ok_and_wfLive_of_bool (by decide +kernel),
+   h.2,
    by decide +kernel, by decide +kernel⟩
 
 /-! ### Part 5 Addition: End-to-End `MachTB` Witness for `Box<u32>` Weak vs. `&mut u32` / `&u32` Strong Deallocation -/
@@ -18822,10 +17834,10 @@ theorem machTB_box_weak_vs_mut_strong_dealloc_e2e :
       some (.ub "Tree Borrows: deallocating strongly protected allocation") ∧
     machStopOutcome mShr 8 =
       some (.ub "Tree Borrows: local write to protected Frozen reference") :=
-  ⟨by decide +kernel,
-   machTB_steps_ok_and_wfLive_of_bool (by decide +kernel),
-   by decide +kernel,
-   machTB_steps_ok_and_wfLive_of_bool (by decide +kernel),
+  let hNoWr := a3_machTB_retSnapshot_and_wfLive (by decide +kernel)
+  let hWr := a3_machTB_retSnapshot_and_wfLive (by decide +kernel)
+  ⟨hNoWr.1, hNoWr.2,
+   hWr.1, hWr.2,
    by decide +kernel,
    by decide +kernel,
    by decide +kernel⟩
@@ -20168,9 +19180,197 @@ theorem canary_endCall_lockstep_iff_and_end_call_bridge :
     (by decide +kernel) (by decide +kernel) (by decide +kernel) (by decide +kernel)
     houtDesc hwDesc
   have hlock := hiff.mpr hprDesc
-  obtain ⟨tbm', alloc', hend, hal, hinv'⟩ := endCallLockstepSim_end_call 0 8 strictDescExitEmb 0
+  obtain ⟨tbm', alloc', hend, hal, hinv', _⟩ := endCallLockstepSim_end_call 0 8 strictDescExitEmb 0
     [(1, 7)] strictDescExitWorld wDesc (mkTbmWithTree strictDescExitTreeMR) _ rfl hinvDesc hwDesc hlock
   exact ⟨hlock, wDesc, tbm', alloc', hwDesc, hend, hal, hinv'⟩
+
+/-- Embedding for the 4-node depth-2 multi-entry frame-exit witness:
+`0` (`[]`, root `.unique`) → `1` (`[0]`, protected `.frozen`, prot `10`) and
+`2` (`[1]`, unprotected `.frozen`) → `3` (`[1, 0]`, protected `.reservedFrz false`,
+prot `20`). -/
+def endCallOrderEmb : Nat → Gen.Path
+  | 0 => []
+  | 1 => [0]
+  | 2 => [1]
+  | 3 => [1, 0]
+  | _ => [99]
+
+/-- 4-node depth-2 `FnEntryBorrowWorld` on `[0, 8)` with active protectors
+`[10, 20]` on tags `1` and `3`, where node `2` (`.frozen`, unprotected) prunes
+its child `3` (`.reservedFrz false`, protected by `20`) on foreign reads. -/
+def endCallOrderWorld : FnEntryBorrowWorld where
+  nodes := [
+    ⟨0, none, .unique, 0, 8, none, true⟩,
+    ⟨1, some 0, .frozen, 0, 8, some 10, true⟩,
+    ⟨2, some 0, .frozen, 0, 8, none, true⟩,
+    ⟨3, some 2, .reservedFrz false, 0, 8, some 20, true⟩
+  ]
+  activeProtectors := [10, 20]
+  nextTag := 4
+  nextProtector := 21
+  allocReadOnly := false
+
+/-- Matching 4-node MiniRust `Gen.Node` for `endCallOrderWorld`. -/
+def endCallOrderTreeMR : Gen.Node :=
+  ⟨[⟨[], List.replicate 8 (.Prot (.Frozen true)), .Strong⟩,
+    ⟨[⟨[], List.replicate 8 (.Prot (.Reserved true false)), .Strong⟩],
+     List.replicate 8 (.Unprot .Frozen), .No⟩],
+   List.replicate 8 (.Unprot .Unique), .No⟩
+
+/-- **Sharpness, converse refutation, protector-release-order sensitivity, and
+genuine 2-entry lockstep witness for `tbm_end_call_lockstep_iff_pruneInert` &
+`endCallLockstepSim_end_call`** (zero hypotheses) on the SINGLE 4-node depth-2
+borrow tree `endCallOrderWorld` / `endCallOrderTreeMR`:
+1. **Order `[(1, 10), (3, 20)]` — Converse of `endCallLockstepSim_end_call` is
+   FALSE at `frame.length = 2`**: releasing `(1, 10)` first causes `2` (`.frozen`)
+   to prune `3` (protected `.reservedFrz false`) in Anneal while MiniRust latches
+   `had_foreign_read = true` on `3` — so `¬ FrameExitPruneInert` and
+   `¬ EndCallLockstepSim` (firing the negative direction of
+   `tbm_end_call_lockstep_iff_pruneInert`!). Yet releasing `(3, 20)` next invokes
+   `PermissionProt.unprotect (.Reserved true true) = (.Reserved, some .Read)`,
+   erasing the intermediate `had_foreign_read` divergence so BOTH
+   `execFrameExitMiniRust` and `TreeBorrowsMemory.end_call` succeed into a
+   `TreeSimInv`-related `wfLive` final tree!
+2. **Reversed order `[(3, 20), (1, 10)]` on the EXACT SAME world and tree —
+   `FrameExitPruneInert` and `EndCallLockstepSim` BOTH flip to `true`!**:
+   releasing `(3, 20)` first unprotects `3` into unprotected `.reservedFrz false`
+   (`.Unprot .Reserved`), for which foreign read is inert
+   (`PermissionUnprot.foreign_read .Reserved = pure .Reserved`), so step 2's
+   pruning of `3` by `2` IS inert! Fires the positive direction of
+   `tbm_end_call_lockstep_iff_pruneInert` AND `endCallLockstepSim_end_call` on
+   this genuine 2-entry frame, producing `end_call = .ok`, `TreeBorrowsMemory.wfLive`,
+   and `TreeSimInv`. -/
+theorem endCallLockstepSim_end_call_converse_false_and_order_sensitive :
+    let w := endCallOrderWorld
+    let t := mkTbmWithTree endCallOrderTreeMR
+    let frame13 : List (Nat × Nat) := [(1, 10), (3, 20)]
+    let frame31 : List (Nat × Nat) := [(3, 20), (1, 10)]
+    (¬ FrameExitPruneInert 0 8 w frame13) ∧
+    (¬ EndCallLockstepSim 0 8 endCallOrderEmb 0 w t frame13) ∧
+    (∃ w' tbm' alloc',
+      execFrameExitMiniRust w frame13 = .ok w' ∧
+      TreeBorrowsMemory.end_call t ⟨frame13.map (fun tp => (⟨((0 : Nat) : Int)⟩, endCallOrderEmb tp.1))⟩ = .ok tbm' ∧
+      tbm'.mem.allocations[0]? = some alloc' ∧
+      TreeBorrowsMemory.wfLive tbm' ∧
+      TreeSimInv 0 8 endCallOrderEmb w' alloc'.extra.root) ∧
+    (FrameExitPruneInert 0 8 w frame31 ∧
+      EndCallLockstepSim 0 8 endCallOrderEmb 0 w t frame31 ∧
+      ∃ wRev tbmRev allocRev,
+        execFrameExitMiniRust w frame31 = .ok wRev ∧
+        TreeBorrowsMemory.end_call t ⟨frame31.map (fun tp => (⟨((0 : Nat) : Int)⟩, endCallOrderEmb tp.1))⟩ = .ok tbmRev ∧
+        tbmRev.mem.allocations[0]? = some allocRev ∧
+        TreeBorrowsMemory.wfLive tbmRev ∧
+        TreeSimInv 0 8 endCallOrderEmb wRev allocRev.extra.root) := by
+  dsimp only
+  have hlenTree : ∀ q m, nodeAt endCallOrderTreeMR q = some m → m.permissions.length = 8 := by
+    intro q m hm
+    have hmem := nodeAt_mem_nodePaths endCallOrderTreeMR q m hm
+    have hps : nodePaths endCallOrderTreeMR = [[], [0], [1], [1, 0]] := rfl
+    rw [hps] at hmem; simp only [List.mem_cons, List.not_mem_nil, or_false] at hmem
+    rcases hmem with rfl | rfl | rfl | rfl <;> (cases hm; rfl)
+  have houtTree : ∀ (fr : List (Nat × Nat)) (tp : Nat × Nat), tp ∈ fr →
+      ∀ m, nodeAt endCallOrderTreeMR (endCallOrderEmb tp.1) = some m →
+        OutsideNoProtectorAccess 0 8 m := by
+    intro fr tp _ m hm b p hp hb
+    have hlt : b < m.permissions.length := (List.getElem?_eq_some_iff.mp hp).1
+    have h8 := hlenTree _ m hm; exfalso; omega
+  have hinv0 : TreeSimInv 0 8 endCallOrderEmb endCallOrderWorld endCallOrderTreeMR :=
+    treeSimInv_of_bool _ _ _ _ _ (by decide +kernel)
+  have hnotPr : ¬ FrameExitPruneInert 0 8 endCallOrderWorld [(1, 10), (3, 20)] := by
+    intro hpr
+    have hstep := hpr.1 ⟨3, some 2, .reservedFrz false, 0, 8, some 20, true⟩ (by decide)
+      false rfl (by decide +kernel) (by decide +kernel)
+    have heq : stepNodeOnRangeAccess endCallOrderWorld.activeProtectors false false 0 8
+        ⟨3, some 2, .reservedFrz false, 0, 8, some 20, true⟩ =
+        .ok ⟨3, some 2, .reservedFrz true, 0, 8, some 20, true⟩ := rfl
+    rw [heq] at hstep; cases hstep
+  have hconvChk : (match execFrameExitMiniRust endCallOrderWorld [(1, 10), (3, 20)],
+        TreeBorrowsMemory.end_call (mkTbmWithTree endCallOrderTreeMR)
+          ⟨([(1, 10), (3, 20)] : List (Nat × Nat)).map (fun tp => (⟨((0 : Nat) : Int)⟩, endCallOrderEmb tp.1))⟩ with
+      | .ok w', .ok tbm' =>
+        match tbm'.mem.allocations[0]? with
+        | some alloc' => tbmWfLiveBool tbm' && treeSimInvBool 0 8 endCallOrderEmb w' alloc'.extra.root
+        | none => false
+      | _, _ => false) = true := by decide +kernel
+  have hconv : ∃ w' tbm' alloc',
+      execFrameExitMiniRust endCallOrderWorld [(1, 10), (3, 20)] = .ok w' ∧
+      TreeBorrowsMemory.end_call (mkTbmWithTree endCallOrderTreeMR)
+        ⟨([(1, 10), (3, 20)] : List (Nat × Nat)).map (fun tp => (⟨((0 : Nat) : Int)⟩, endCallOrderEmb tp.1))⟩ = .ok tbm' ∧
+      tbm'.mem.allocations[0]? = some alloc' ∧
+      TreeBorrowsMemory.wfLive tbm' ∧
+      TreeSimInv 0 8 endCallOrderEmb w' alloc'.extra.root := by
+    cases hw : execFrameExitMiniRust endCallOrderWorld [(1, 10), (3, 20)] with
+    | error _ => rw [hw] at hconvChk; cases hconvChk
+    | ok w' =>
+      cases ht : TreeBorrowsMemory.end_call (mkTbmWithTree endCallOrderTreeMR)
+          ⟨([(1, 10), (3, 20)] : List (Nat × Nat)).map (fun tp => (⟨((0 : Nat) : Int)⟩, endCallOrderEmb tp.1))⟩ with
+      | error _ => rw [hw, ht] at hconvChk; cases hconvChk
+      | ok tbm' =>
+        rw [hw, ht] at hconvChk; dsimp only at hconvChk
+        cases ha : tbm'.mem.allocations[0]? with
+        | none => rw [ha] at hconvChk; cases hconvChk
+        | some alloc' =>
+          rw [ha] at hconvChk; dsimp only at hconvChk
+          have ⟨h1, h2⟩ := (Bool.and_eq_true _ _).mp hconvChk
+          exact ⟨w', tbm', alloc', rfl, rfl, ha, tbm_wfLive_of_bool tbm' h1,
+            treeSimInv_of_bool 0 8 endCallOrderEmb w' alloc'.extra.root h2⟩
+  rcases hconv with ⟨w13, tbm13, alloc13, hw13, ht13, hal13, hwf13, hinv13⟩
+  have hnotLock : ¬ EndCallLockstepSim 0 8 endCallOrderEmb 0 endCallOrderWorld
+      (mkTbmWithTree endCallOrderTreeMR) [(1, 10), (3, 20)] := by
+    intro hlock
+    exact hnotPr ((tbm_end_call_lockstep_iff_pruneInert [(1, 10), (3, 20)]
+      (mkTbmWithTree endCallOrderTreeMR) 0 _ 0 8 (by decide) endCallOrderEmb
+      endCallOrderWorld w13 rfl rfl hlenTree hinv0
+      (by decide +kernel) (by decide +kernel)
+      (by intro tp htp; simp only [List.mem_cons, List.not_mem_nil, or_false] at htp
+          rcases htp with rfl | rfl <;> exact ⟨_, rfl, rfl, rfl, rfl, rfl⟩)
+      (by decide +kernel) (by decide +kernel) (by decide +kernel) (by decide +kernel)
+      (houtTree [(1, 10), (3, 20)]) hw13).mp hlock)
+  have hpr31 : FrameExitPruneInert 0 8 endCallOrderWorld [(3, 20), (1, 10)] := by
+    constructor
+    · intro n hn isW hisW _ hpruned
+      cases hisW
+      rcases List.mem_cons.mp hn with rfl | hn
+      · cases hpruned
+      · rcases List.mem_cons.mp hn with rfl | hn
+        · cases hpruned
+        · rcases List.mem_cons.mp hn with rfl | hn
+          · cases hpruned
+          · rcases List.mem_cons.mp hn with rfl | hn
+            · cases hpruned
+            · cases hn
+    · intro w1 hw1
+      have hstep1 : execFrameExitMiniRust endCallOrderWorld [(3, 20)] =
+          .ok { endCallOrderWorld with activeProtectors := [10] } := rfl
+      rw [hstep1] at hw1; cases hw1
+      refine ⟨fun n hn isW hisW _ hpruned => ?_, fun _ _ => trivial⟩
+      cases hisW
+      rcases List.mem_cons.mp hn with rfl | hn
+      · cases hpruned
+      · rcases List.mem_cons.mp hn with rfl | hn
+        · cases hpruned
+        · rcases List.mem_cons.mp hn with rfl | hn
+          · cases hpruned
+          · rcases List.mem_cons.mp hn with rfl | hn
+            · rfl
+            · cases hn
+  have hw31 : execFrameExitMiniRust endCallOrderWorld [(3, 20), (1, 10)] =
+      .ok { endCallOrderWorld with activeProtectors := [] } := rfl
+  have hlock31 : EndCallLockstepSim 0 8 endCallOrderEmb 0 endCallOrderWorld
+      (mkTbmWithTree endCallOrderTreeMR) [(3, 20), (1, 10)] :=
+    (tbm_end_call_lockstep_iff_pruneInert [(3, 20), (1, 10)]
+      (mkTbmWithTree endCallOrderTreeMR) 0 _ 0 8 (by decide) endCallOrderEmb
+      endCallOrderWorld _ rfl rfl hlenTree hinv0
+      (by decide +kernel) (by decide +kernel)
+      (by intro tp htp; simp only [List.mem_cons, List.not_mem_nil, or_false] at htp
+          rcases htp with rfl | rfl <;> exact ⟨_, rfl, rfl, rfl, rfl, rfl⟩)
+      (by decide +kernel) (by decide +kernel) (by decide +kernel) (by decide +kernel)
+      (houtTree [(3, 20), (1, 10)]) hw31).mpr hpr31
+  obtain ⟨tbmRev, allocRev, hendRev, halRev, hinvRev, hwfRev⟩ := endCallLockstepSim_end_call 0 8 endCallOrderEmb 0
+    [(3, 20), (1, 10)] endCallOrderWorld _ (mkTbmWithTree endCallOrderTreeMR) _ rfl hinv0 hw31 hlock31
+  exact ⟨hnotPr, hnotLock, ⟨w13, tbm13, alloc13, hw13, ht13, hal13, hwf13, hinv13⟩,
+    hpr31, hlock31, _, tbmRev, allocRev, hw31, hendRev, halRev,
+    hwfRev (tbm_wfLive_of_bool _ (by decide +kernel)), hinvRev⟩
 
 /-- **Closed non-vacuity canary for lifted `TreeSimInvMulti` (`retag_ptr` +
 disjoint-window `end_call`) and symbolic nested `split_at_mut`** (zero hypotheses):
@@ -20235,6 +19435,8 @@ theorem canary_treeSimInvMulti_retag_endCall_and_nestedSplitAtMut_symbolic :
        TreeBorrowsMemory.store tbm3 aPtr.thin_pointer (List.replicate 3 (.Init 11 none)) ⟨1⟩ = .ok tbm4 ∧
        TreeBorrowsMemory.store tbm4 bPtr.thin_pointer (List.replicate 3 (.Init 22 none)) ⟨1⟩ = .ok tbm5 ∧
        TreeBorrowsMemory.end_call tbm5 feInner2 = .ok tbm6 ∧
+       (∃ tbm6Rev, TreeBorrowsMemory.end_call tbm5 { protectors := feInner2.protectors.reverse } = .ok tbm6Rev ∧
+         TreeBorrowsMemory.wfLive tbm6Rev) ∧
        TreeBorrowsMemory.end_call tbm6 feOuter = .ok tbm7 ∧
        TreeBorrowsMemory.wfLive tbm7 ∧
        tbm7.mem.allocations[0]? = some alloc7 ∧
@@ -20371,7 +19573,7 @@ theorem canary_treeSimInvMulti_retag_endCall_and_nestedSplitAtMut_symbolic :
     have hps : nodePaths root12 = [[], [0], [1]] := rfl
     rw [hps] at hmem; simp only [List.mem_cons, List.not_mem_nil, or_false] at hmem; exact hmem
   obtain ⟨⟨op, t1, feO, ap, t2, fe1, bp, t3, fe2, t4, t5, t6, t7, a7, sF,
-      hr1, hr2, hr3, hs1, hs2, he1, he2, hwf7, ha7, hsF, _, _, hldOk, hldUb⟩,
+      hr1, hr2, hr3, hs1, hs2, he1, ⟨t6R, he1R, hwf6R⟩, he2, hwf7, ha7, hsF, _, _, hldOk, hldUb⟩,
     ⟨opW, tW, feOW, aW, sW, hrW, haW, hsW, _, hldWUb⟩⟩ :=
     tbm_nestedSplitAtMut_symbolic tbm12 (tbm_wfLive_of_bool _ (by decide +kernel)) rfl
       0 _ 12 rfl rfl rfl [1] [0] _ _ rfl rfl rfl
@@ -20395,7 +19597,7 @@ theorem canary_treeSimInvMulti_retag_endCall_and_nestedSplitAtMut_symbolic :
     ⟨wEnd2, tbmE, allocE, hwEnd12, hendE, halE, hwfEImp (tbm_wfLive_of_bool _ (by decide +kernel)),
       hinvE04, hinvE44⟩,
     ⟨⟨op, t1, feO, ap, t2, fe1, bp, t3, fe2, t4, t5, t6, t7, a7, sF,
-        hr1, hr2, hr3, hs1, hs2, he1, he2, hwf7, ha7, hsF,
+        hr1, hr2, hr3, hs1, hs2, he1, ⟨t6R, he1R, hwf6R⟩, he2, hwf7, ha7, hsF,
         hldOk 4 2 1 (by decide) (by decide) (Or.inr (by decide)) (Or.inl (by decide)) (by decide),
         hldUb 1 3 1 1 (Or.inl ⟨by decide, by decide⟩) (by decide) (by decide) (by decide) (by decide) (by decide)⟩,
       ⟨opW, tW, feOW, aW, sW, hrW, haW, hsW,
@@ -21823,9 +21025,10 @@ theorem tbm_retag_ptr_ignores_alignment
   refine ⟨?_, ?_, ?_⟩ <;> rfl
 
 /-- `ReborrowSettings.new` on a sized, non-pinned safe pointer always yields
-`some settings` with one `inside` permission per pointee byte, an `outside`
-permission matching the protector, and a protector that is active exactly on
-function entry. -/
+`some settings` with one `inside` permission per pointee byte, exact protector
+strength (`Weak` for `Box`, `Strong` for `&`/`&mut` on `fnEntry`, else `No`),
+passive `outside` permissions (`prevents_deallocation = false` and `unprotect`
+access = `none`), and `fnIw`-invariance when `sz = 0`. -/
 private theorem b3_reborrowSettings_new_sized_safe
     (tbm : Gen.TreeBorrowsMemory Gen.x86_64) (ptr : Gen.Pointer Gen.TreeBorrowsProvenance)
     (pointee : Gen.PointeeInfo) (sz : Nat) (al : LibSpecr.Align)
@@ -21838,102 +21041,89 @@ private theorem b3_reborrowSettings_new_sized_safe
       (pointee.unpin = true ∧ (ptrType = .Ref .Mutable pointee ∨ ptrType = .Box pointee)))
     (fnEntry fnIw : Bool)
     (lookup : Gen.ThinPointer Gen.TreeBorrowsProvenance → Interp Gen.VTable) :
+    let prot : Gen.Protected :=
+      if fnEntry then (match ptrType with | .Box _ => .Weak | _ => .Strong) else .No
     ∃ settings,
       ReborrowSettings.new lookup ptr ptrType fnEntry tbm.params fnIw = .ok (some settings) ∧
       settings.inside.length = sz ∧
       Permission.matches_protector settings.outside settings.«protected» = true ∧
-      Protected.yes settings.«protected» = fnEntry := by
+      settings.«protected» = prot ∧
+      Protected.yes settings.«protected» = fnEntry ∧
+      (∀ pProt, settings.outside = .Prot pProt →
+        PermissionProt.prevents_deallocation pProt = false ∧ (PermissionProt.unprotect pProt).2 = none) ∧
+      (sz = 0 → ReborrowSettings.new lookup ptr ptrType fnEntry tbm.params fnIw =
+        ReborrowSettings.new lookup ptr ptrType fnEntry tbm.params (!fnIw)) := by
+  dsimp only
   have hmaskLen : mask.length = sz := a1_cellsToFreezeMask_length hmask
-  have hpermOk : ∀ (prot : Gen.Protected) (imp : Bool),
-      (imp = true → Protected.yes prot = true) →
+  let prot : Gen.Protected :=
+    if fnEntry then (match ptrType with | .Box _ => .Weak | _ => .Strong) else .No
+  have hyes : Protected.yes prot = fnEntry := by
+    rcases hptrTy with rfl | ⟨_, rfl | rfl⟩ <;> cases fnEntry <;> rfl
+  have hpermOk : ∀ (imp : Bool), (imp = true → Protected.yes prot = true) →
       ∀ (inside frozen : Bool), ∃ p, ReborrowSettings.perm ptrType prot imp inside frozen = .ok p := by
-    intro prot imp himp inside frozen
+    intro imp himp inside frozen
     rcases hptrTy with rfl | ⟨_, rfl | rfl⟩
     · unfold ReborrowSettings.perm; cases frozen <;> exact ⟨_, rfl⟩
     · unfold ReborrowSettings.perm
       cases himpIn : (imp && inside) with
       | false => exact ⟨_, rfl⟩
-      | true =>
-        have h1 : imp = true := (Bool.and_eq_true .. |>.mp himpIn).1
-        rw [himp h1]; exact ⟨_, rfl⟩
+      | true => rw [himp (Bool.and_eq_true .. |>.mp himpIn).1]; exact ⟨_, rfl⟩
     · unfold ReborrowSettings.perm
       cases himpIn : (imp && inside) with
       | false => exact ⟨_, rfl⟩
-      | true =>
-        have h1 : imp = true := (Bool.and_eq_true .. |>.mp himpIn).1
-        rw [himp h1]; exact ⟨_, rfl⟩
-  have hpermOut : ∀ (prot : Gen.Protected) (imp frozen : Bool), ∃ p,
+      | true => rw [himp (Bool.and_eq_true .. |>.mp himpIn).1]; exact ⟨_, rfl⟩
+  have hpermOut : ∀ (imp frozen : Bool), ∃ p,
       ReborrowSettings.perm ptrType prot imp false frozen = .ok p ∧
-      Permission.matches_protector p prot = true := by
-    intro prot imp frozen
-    rcases hptrTy with rfl | ⟨_, rfl | rfl⟩ <;> cases prot <;> cases imp <;> cases frozen <;>
-      exact ⟨_, rfl, rfl⟩
-  have hyesS : ∀ b : Bool, Protected.yes (if b then Gen.Protected.Strong else .No) = b := by
-    intro b; cases b <;> rfl
-  have hyesW : ∀ b : Bool, Protected.yes (if b then Gen.Protected.Weak else .No) = b := by
-    intro b; cases b <;> rfl
-  have hmapOk : ∀ (prot : Gen.Protected) (imp : Bool),
-      (imp = true → Protected.yes prot = true) →
+      Permission.matches_protector p prot = true ∧
+      (∀ pProt, p = .Prot pProt →
+        PermissionProt.prevents_deallocation pProt = false ∧ (PermissionProt.unprotect pProt).2 = none) := by
+    intro imp frozen
+    rcases hptrTy with rfl | ⟨_, rfl | rfl⟩ <;> cases fnEntry <;> cases imp <;> cases frozen <;>
+      refine ⟨_, rfl, rfl, fun _ hp => by cases hp <;> exact ⟨rfl, rfl⟩⟩
+  have hpermOutEq : ∀ (imp1 imp2 frozen : Bool),
+      ReborrowSettings.perm ptrType prot imp1 false frozen =
+      ReborrowSettings.perm ptrType prot imp2 false frozen := by
+    intro imp1 imp2 frozen
+    rcases hptrTy with rfl | ⟨_, rfl | rfl⟩ <;> cases fnEntry <;> cases imp1 <;> cases imp2 <;> cases frozen <;> rfl
+  have hmapOk : ∀ (imp : Bool), (imp = true → Protected.yes prot = true) →
       ∀ (bs : List Bool), ∃ ps,
         bs.mapM (fun frz => ReborrowSettings.perm ptrType prot imp true frz) = .ok ps ∧
         ps.length = bs.length := by
-    intro prot imp himp bs
+    intro imp himp bs
     induction bs with
     | nil => exact ⟨[], rfl, rfl⟩
     | cons b rest ih =>
-      obtain ⟨p, hp⟩ := hpermOk prot imp himp true b
+      obtain ⟨p, hp⟩ := hpermOk imp himp true b
       obtain ⟨ps, hps, hlen⟩ := ih
       exact ⟨p :: ps, by simp only [List.mapM_cons, hp, hps, bind, Except.bind, pure, Except.pure],
         by simp only [List.length_cons, hlen]⟩
-  have hprotYesImp : ∀ (prot : Gen.Protected),
-      (Protected.yes prot && tbm.params.implicit_writes && fnIw) = true → Protected.yes prot = true := by
-    intro prot h; simp only [Bool.and_eq_true] at h; exact h.1.1
-  rcases hptrTy with rfl | ⟨hunpin, rfl | rfl⟩
-  · let prot : Gen.Protected := if fnEntry then .Strong else .No
-    obtain ⟨ps, hps, hpsLen⟩ := hmapOk prot _ (hprotYesImp prot) mask
-    obtain ⟨pOut, hpOut, hpOutMp⟩ := hpermOut prot
-      (Protected.yes prot && tbm.params.implicit_writes && fnIw) pointee.freeze
-    refine ⟨{ inside := ps, outside := pOut, «protected» := prot }, ?_, hpsLen.trans hmaskLen,
-      hpOutMp, hyesS fnEntry⟩
-    unfold ReborrowSettings.new PtrType.safe_pointee
-    simp only [Bool.false_eq_true, ↓reduceIte, hcells, hlay, UnsafeCellStrategy.freeze_mask, hmask,
-      bind, Except.bind]
-    change (mask.mapM (fun freeze => ReborrowSettings.perm (.Ref .Immutable pointee) prot
-        (Protected.yes prot && tbm.params.implicit_writes && fnIw) true freeze) >>= fun inside =>
-      ReborrowSettings.perm (.Ref .Immutable pointee) prot
-        (Protected.yes prot && tbm.params.implicit_writes && fnIw) false pointee.freeze >>= fun outside =>
-      pure (some ({ inside := inside, outside := outside, «protected» := prot } : Gen.ReborrowSettings))) = _
-    rw [hps, hpOut]; rfl
-  · let prot : Gen.Protected := if fnEntry then .Strong else .No
-    obtain ⟨ps, hps, hpsLen⟩ := hmapOk prot _ (hprotYesImp prot) mask
-    obtain ⟨pOut, hpOut, hpOutMp⟩ := hpermOut prot
-      (Protected.yes prot && tbm.params.implicit_writes && fnIw) pointee.freeze
-    refine ⟨{ inside := ps, outside := pOut, «protected» := prot }, ?_, hpsLen.trans hmaskLen,
-      hpOutMp, hyesS fnEntry⟩
-    unfold ReborrowSettings.new PtrType.safe_pointee
-    simp only [hunpin, Bool.not_true, Bool.false_eq_true, ↓reduceIte, hcells, hlay,
-      UnsafeCellStrategy.freeze_mask, hmask, bind, Except.bind]
-    change (mask.mapM (fun freeze => ReborrowSettings.perm (.Ref .Mutable pointee) prot
-        (Protected.yes prot && tbm.params.implicit_writes && fnIw) true freeze) >>= fun inside =>
-      ReborrowSettings.perm (.Ref .Mutable pointee) prot
-        (Protected.yes prot && tbm.params.implicit_writes && fnIw) false pointee.freeze >>= fun outside =>
-      pure (some ({ inside := inside, outside := outside, «protected» := prot } : Gen.ReborrowSettings))) = _
-    rw [hps, hpOut]; rfl
-  · let prot : Gen.Protected := if fnEntry then .Weak else .No
-    obtain ⟨ps, hps, hpsLen⟩ := hmapOk prot _ (hprotYesImp prot) mask
-    obtain ⟨pOut, hpOut, hpOutMp⟩ := hpermOut prot
-      (Protected.yes prot && tbm.params.implicit_writes && fnIw) pointee.freeze
-    refine ⟨{ inside := ps, outside := pOut, «protected» := prot }, ?_, hpsLen.trans hmaskLen,
-      hpOutMp, hyesW fnEntry⟩
-    unfold ReborrowSettings.new PtrType.safe_pointee
-    simp only [hunpin, Bool.not_true, Bool.false_eq_true, ↓reduceIte, hcells, hlay,
-      UnsafeCellStrategy.freeze_mask, hmask, bind, Except.bind]
-    change (mask.mapM (fun freeze => ReborrowSettings.perm (.Box pointee) prot
-        (Protected.yes prot && tbm.params.implicit_writes && fnIw) true freeze) >>= fun inside =>
-      ReborrowSettings.perm (.Box pointee) prot
-        (Protected.yes prot && tbm.params.implicit_writes && fnIw) false pointee.freeze >>= fun outside =>
-      pure (some ({ inside := inside, outside := outside, «protected» := prot } : Gen.ReborrowSettings))) = _
-    rw [hps, hpOut]; rfl
+  have hprotYesImp : ∀ (b : Bool),
+      (Protected.yes prot && tbm.params.implicit_writes && b) = true → Protected.yes prot = true := by
+    intro b h; simp only [Bool.and_eq_true] at h; exact h.1.1
+  have hnewEq : ∀ (b : Bool),
+      ReborrowSettings.new lookup ptr ptrType fnEntry tbm.params b =
+        (mask.mapM (fun freeze => ReborrowSettings.perm ptrType prot
+            (Protected.yes prot && tbm.params.implicit_writes && b) true freeze) >>= fun inside =>
+          ReborrowSettings.perm ptrType prot
+            (Protected.yes prot && tbm.params.implicit_writes && b) false pointee.freeze >>= fun outside =>
+          pure (some ({ inside := inside, outside := outside, «protected» := prot } : Gen.ReborrowSettings))) := by
+    intro b
+    rcases hptrTy with rfl | ⟨hunpin, rfl | rfl⟩ <;>
+      · unfold ReborrowSettings.new PtrType.safe_pointee
+        simp only [Bool.false_eq_true, ↓reduceIte, hcells, hlay, UnsafeCellStrategy.freeze_mask, hmask,
+          bind, Except.bind]
+        try simp only [hunpin, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+        rfl
+  obtain ⟨ps, hps, hpsLen⟩ := hmapOk _ (hprotYesImp fnIw) mask
+  obtain ⟨pOut, hpOut, hpOutMp, hpOutPas⟩ := hpermOut
+    (Protected.yes prot && tbm.params.implicit_writes && fnIw) pointee.freeze
+  refine ⟨{ inside := ps, outside := pOut, «protected» := prot }, ?_, hpsLen.trans hmaskLen,
+    hpOutMp, rfl, hyes, hpOutPas, fun hsz0 => ?_⟩
+  · rw [hnewEq fnIw, hps, hpOut]; rfl
+  · obtain rfl : mask = [] := List.eq_nil_of_length_eq_zero (hmaskLen.trans hsz0)
+    rw [hnewEq fnIw, hnewEq (!fnIw)]
+    simp only [List.mapM_nil, pure, Except.pure, bind, Except.bind]
+    rw [hpermOutEq _ _ pointee.freeze]
 
 /-- **`TreeBorrowsMemory.retag_ptr` DOES enforce dereferenceability / bounds /
 liveness / provenance on EVERY non-ZST safe pointer**, including
@@ -21971,7 +21161,7 @@ theorem tbm_retag_ptr_safe_dereferenceable_ub
           ptr.thin_pointer.addr - alloc.addr + (sz : Int) > (alloc.data.length : Int)) →
         TreeBorrowsMemory.retag_ptr tbm frameExtra ptr ptrType fnEntry fnIw lookup =
           .error (.ub "dereferencing pointer outside the bounds of its allocation"))) := by
-  obtain ⟨settings, hnew, hsLen, _, _⟩ := b3_reborrowSettings_new_sized_safe tbm ptr pointee sz al
+  obtain ⟨settings, hnew, hsLen, _, _, _, _, _⟩ := b3_reborrowSettings_new_sized_safe tbm ptr pointee sz al
     cells mask hlay hcells hmask ptrType hptrTy fnEntry fnIw lookup
   refine ⟨fun hnone => ?_, fun id path alloc hprov halloc => ⟨fun hdead => ?_, fun hlive hoob => ?_⟩⟩
   · unfold TreeBorrowsMemory.retag_ptr
@@ -22104,6 +21294,8 @@ theorem tbm_retag_ptr_zst_safe_skips_dereferenceable
       (pointee.unpin = true ∧ (ptrType = .Ref .Mutable pointee ∨ ptrType = .Box pointee)))
     (fnEntry fnIw : Bool)
     (lookup : Gen.ThinPointer Gen.TreeBorrowsProvenance → Interp Gen.VTable) :
+    (TreeBorrowsMemory.retag_ptr tbm frameExtra ptr ptrType fnEntry fnIw lookup =
+      TreeBorrowsMemory.retag_ptr tbm frameExtra ptr ptrType fnEntry (!fnIw) lookup) ∧
     (ptr.thin_pointer.provenance = none →
       TreeBorrowsMemory.retag_ptr tbm frameExtra ptr ptrType fnEntry fnIw lookup =
         .ok (ptr, tbm, frameExtra)) ∧
@@ -22117,7 +21309,10 @@ theorem tbm_retag_ptr_zst_safe_skips_dereferenceable
       (alloc.addr ≤ ptr.thin_pointer.addr →
         ∀ pNode, nodeAt alloc.extra.root path = some pNode →
         ∃ outside prot root1,
+          prot = (if fnEntry then (match ptrType with | .Box _ => .Weak | _ => .Strong) else .No) ∧
           Protected.yes prot = fnEntry ∧
+          (∀ pProt, outside = .Prot pProt →
+            PermissionProt.prevents_deallocation pProt = false ∧ (PermissionProt.unprotect pProt).2 = none) ∧
           Node.add_node alloc.extra.root path
               ⟨[], List.replicate alloc.data.length outside, prot⟩ =
             .ok (path ++ [(pNode.children.length : Int)], root1) ∧
@@ -22131,10 +21326,11 @@ theorem tbm_retag_ptr_zst_safe_skips_dereferenceable
                 { protectors := frameExtra.protectors ++
                     [(⟨(id : Int)⟩, path ++ [(pNode.children.length : Int)])] }
               else frameExtra))) := by
-  obtain ⟨settings, hnew, hsLen, hmpOut, hyes⟩ := b3_reborrowSettings_new_sized_safe tbm ptr pointee 0
-    al cells mask hlay hcells hmask ptrType hptrTy fnEntry fnIw lookup
+  obtain ⟨settings, hnew, hsLen, hmpOut, hprotEq, hyes, houtPas, hfnIwEq⟩ :=
+    b3_reborrowSettings_new_sized_safe tbm ptr pointee 0
+      al cells mask hlay hcells hmask ptrType hptrTy fnEntry fnIw lookup
   obtain ⟨inside, outside, prot⟩ := settings
-  dsimp only at hsLen hmpOut hyes
+  dsimp only at hsLen hmpOut hprotEq hyes houtPas
   obtain rfl : inside = [] := List.eq_nil_of_length_eq_zero hsLen
   obtain ⟨hnoneR, hsomeR⟩ := b3_reborrow_zst tbm ptr.thin_pointer outside prot frameExtra hmpOut
   have hret : ∀ r, TreeBorrowsMemory.reborrow tbm ptr.thin_pointer
@@ -22146,11 +21342,12 @@ theorem tbm_retag_ptr_zst_safe_skips_dereferenceable
     unfold TreeBorrowsMemory.retag_ptr
     rw [hnew]
     rfl
-  refine ⟨fun hnone => ?_, fun id path alloc hprov halloc => ⟨fun hlt => ?_, fun hge pNode hpNode => ?_⟩⟩
+  refine ⟨by unfold TreeBorrowsMemory.retag_ptr; rw [hfnIwEq rfl],
+    fun hnone => ?_, fun id path alloc hprov halloc => ⟨fun hlt => ?_, fun hge pNode hpNode => ?_⟩⟩
   · rw [hret _ (hnoneR hnone)]; rfl
   · rw [hret _ ((hsomeR id path alloc hprov halloc).1 hlt)]; rfl
   · obtain ⟨root1, hadd, hreb⟩ := (hsomeR id path alloc hprov halloc).2 hge pNode hpNode
-    refine ⟨outside, prot, root1, hyes, hadd, ?_⟩
+    refine ⟨outside, prot, root1, hprotEq, hyes, houtPas, hadd, ?_⟩
     rw [hret _ hreb, ← hyes]; rfl
 
 private theorem a2_checkPtrM_safe_step {M : Type} [Gen.Memory M] [MemoryOps M]
@@ -22289,6 +21486,442 @@ theorem checkPtrM_tb_safe_vs_raw_boundary
             rw [ite_eq_right_iff.mpr (fun h => absurd h hsz)]
       obtain ⟨msg, hmsg⟩ := hderefUb
       exact h4 hnz hal hinh msg hmsg
+
+/-- **Exact bidirectional characterization of `checkPtrM` success for sized safe
+pointers** (`&T`, `&mut T`, `Box<T>` — covering `#[rustc_no_writable]`, standard
+`&mut`, static `&S`, ZSTs, and pinned `!unpin` pointers): `checkPtrM ptr ptrTy (some m)
+= .ok ()` holds **iff** `addr ≠ 0`, `Align.is_aligned al addr = true`,
+`pointee.inhabited = true`, and EITHER `sz = 0` OR `ptr` carries provenance into
+a live allocation with `[addr, addr + sz)` in bounds. -/
+theorem checkPtrM_tb_safe_ok_iff
+    (m : MachTB) (ptr : Gen.Pointer Gen.TreeBorrowsProvenance)
+    (hmeta : ptr.metadata = none)
+    (haddrBounds : inBounds ptr.thin_pointer.addr .Unsigned x86_64.PTR_SIZE = true)
+    (ptrTy : Gen.PtrType) (pointee : Gen.PointeeInfo) (sz : Nat) (al : LibSpecr.Align)
+    (hsafe : PtrType.safe_pointee ptrTy = some pointee)
+    (hlay : pointee.layout = .Sized ⟨sz⟩ al)
+    (hszBounds : inBounds (sz : Int) .Signed x86_64.PTR_SIZE = true) :
+    checkPtrM ptr ptrTy (some m) = .ok () ↔
+      ptr.thin_pointer.addr ≠ 0 ∧
+      Align.is_aligned al ptr.thin_pointer.addr = true ∧
+      pointee.inhabited = true ∧
+      (sz = 0 ∨
+        ∃ (id : Nat) (path : Gen.Path)
+          (alloc : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra),
+          ptr.thin_pointer.provenance = some (⟨(id : Int)⟩, path) ∧
+          m.mem.memory.mem.allocations[id]? = some alloc ∧
+          alloc.live = true ∧
+          alloc.addr ≤ ptr.thin_pointer.addr ∧
+          ptr.thin_pointer.addr - alloc.addr + (sz : Int) ≤ (alloc.data.length : Int)) := by
+  cases ptr with
+  | mk thin md =>
+    dsimp only at hmeta haddrBounds ⊢; subst hmeta
+    cases pointee with
+    | mk lay inh uc frz unp =>
+      dsimp only at hlay ⊢; subst hlay
+      have h1 : ∀ {α : Type} (a : Interp α) (x : α) (f : α → Interp Unit), a = .ok x → (a >>= f) = f x := by
+        intro α a x f ha; rw [ha]; rfl
+      have hensT : ∀ (b : Bool) (s : String), b = true → (ensureElseUb b s : Interp Unit) = .ok () := by
+        intro b s hb; rw [hb]; rfl
+      have hcsa : LayoutStrategy.compute_size_and_align (vtableLookupM m) (.Sized ⟨sz⟩ al) none = .ok (⟨sz⟩, al) := rfl
+      have hmetaOk : checkPtrMetadataM (Provenance := Gen.Memory.Provenance TBM) none .None = .ok () := rfl
+      have hstep : checkPtrM ⟨thin, none⟩ ptrTy (some m) =
+          (ensureElseUb (thin.addr != 0) "Value::Ptr: null safe pointer" >>= fun _ =>
+           ensureElseUb (Align.is_aligned al thin.addr) "Value::Ptr: unaligned safe pointer" >>= fun _ =>
+           ensureElseUb inh "Value::Ptr: safe pointer to uninhabited type" >>= fun _ =>
+           match ConcurrentMemory.dereferenceable m.mem thin ⟨sz⟩ with
+           | .ok () => pure ()
+           | .error (.ub _) => ub "Value::Ptr: non-dereferenceable safe pointer"
+           | .error e => .error e) := by
+        cases ptrTy with
+        | Raw _ | FnPtr | VTablePtr _ => cases hsafe
+        | Ref _ p | Box p =>
+          cases hsafe
+          unfold checkPtrM
+          rw [h1 _ () _ (hensT _ _ haddrBounds)]
+          dsimp only [PtrType.meta_kind, LayoutStrategy.meta_kind, PtrType.safe_pointee]
+          rw [h1 _ () _ hmetaOk, h1 _ (⟨sz⟩, al) _ hcsa, h1 _ () _ (hensT _ _ hszBounds)]
+          dsimp only; rfl
+      rw [hstep]
+      have hderefIff : ConcurrentMemory.dereferenceable m.mem thin ⟨sz⟩ = .ok () ↔
+          (sz = 0 ∨
+            ∃ (id : Nat) (path : Gen.Path)
+              (alloc : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra),
+              thin.provenance = some (⟨(id : Int)⟩, path) ∧
+              m.mem.memory.mem.allocations[id]? = some alloc ∧
+              alloc.live = true ∧
+              alloc.addr ≤ thin.addr ∧
+              thin.addr - alloc.addr + (sz : Int) ≤ (alloc.data.length : Int)) := by
+        unfold ConcurrentMemory.dereferenceable MemoryOps.dereferenceable
+        change TreeBorrowsMemory.dereferenceable m.mem.memory thin ⟨sz⟩ = .ok () ↔ _
+        unfold TreeBorrowsMemory.dereferenceable BasicMemory.check_ptr
+        by_cases hsz0 : sz = 0
+        · simp only [hsz0, ↓reduceIte, true_or, iff_true]; rfl
+        · simp only [hsz0, ↓reduceIte, false_or]
+          cases hprov : thin.provenance with
+          | none =>
+            simp only [bind, Except.bind, ub]
+            constructor
+            · intro h; cases h
+            · intro ⟨_, _, _, h, _⟩; cases h
+          | some pr =>
+            rcases pr with ⟨allocId, path⟩
+            simp only [bind, Except.bind]
+            unfold listIndex
+            by_cases hnn : 0 ≤ allocId._0
+            · simp only [hnn, ↓reduceIte]
+              cases ha : m.mem.memory.mem.allocations[allocId._0.toNat]? with
+              | none =>
+                simp only [specPanic]
+                constructor
+                · intro h; cases h
+                · intro ⟨id, p, alloc, hpeq, hal, _⟩
+                  cases hpeq; dsimp only at ha; simp only [Int.toNat_natCast] at ha; rw [hal] at ha; cases ha
+              | some alloc =>
+                simp only [pure, Except.pure]
+                cases hlv : alloc.live with
+                | false =>
+                  simp only [Bool.not_false, ↓reduceIte, ub]
+                  constructor
+                  · intro h; cases h
+                  · intro ⟨id, p, alloc', hpeq, hal, hlv', _⟩
+                    cases hpeq; dsimp only at ha; simp only [Int.toNat_natCast] at ha; rw [hal] at ha; cases ha
+                    rw [hlv] at hlv'; cases hlv'
+                | true =>
+                  simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte, Allocation.size]
+                  by_cases hbad : thin.addr - alloc.addr < 0 ∨
+                      thin.addr - alloc.addr + (sz : Int) > (alloc.data.length : Int)
+                  · simp only [hbad, ↓reduceIte, ub]
+                    constructor
+                    · intro h; cases h
+                    · intro ⟨id, p, alloc', hpeq, hal, _, hge, hle⟩
+                      cases hpeq; dsimp only at ha; simp only [Int.toNat_natCast] at ha; rw [hal] at ha; cases ha
+                      rcases hbad with hlt | hgt
+                      · exact False.elim (Int.not_lt.mpr (Int.sub_nonneg.mpr hge) hlt)
+                      · exact False.elim (Int.not_lt.mpr hle hgt)
+                  · simp only [hbad, ↓reduceIte]
+                    refine ⟨fun _ => ?_, fun _ => trivial⟩
+                    have hidEq : allocId = ⟨(allocId._0.toNat : Int)⟩ := by
+                      cases allocId; exact congrArg _ (Int.toNat_of_nonneg hnn).symm
+                    have h1 : ¬ (thin.addr - alloc.addr < 0) := fun h => hbad (Or.inl h)
+                    have h2 : ¬ (thin.addr - alloc.addr + (sz : Int) > (alloc.data.length : Int)) :=
+                      fun h => hbad (Or.inr h)
+                    exact ⟨allocId._0.toNat, path, alloc, by rw [← hidEq], ha, hlv,
+                      Int.sub_nonneg.mp (Int.not_lt.mp h1), Int.not_lt.mp h2⟩
+            · simp only [hnn, ↓reduceIte, specPanic]
+              constructor
+              · intro h; cases h
+              · intro ⟨id, _, _, hpeq, _⟩
+                cases hpeq; exact absurd (Int.natCast_nonneg id) hnn
+      constructor
+      · intro hok
+        cases hnz : (thin.addr != 0) with
+        | false => simp only [hnz, ensureElseUb, ub, bind, Except.bind] at hok; cases hok
+        | true =>
+          rw [h1 _ () _ (hensT _ _ hnz)] at hok
+          cases hal : Align.is_aligned al thin.addr with
+          | false => simp only [hal, ensureElseUb, ub, bind, Except.bind] at hok; cases hok
+          | true =>
+            rw [h1 _ () _ (hensT _ _ hal)] at hok
+            cases hinh : inh with
+            | false => simp only [hinh, ensureElseUb, ub, bind, Except.bind] at hok; cases hok
+            | true =>
+              rw [h1 _ () _ (hensT _ _ hinh)] at hok
+              cases hd : ConcurrentMemory.dereferenceable m.mem thin ⟨sz⟩ with
+              | ok u =>
+                cases u
+                exact ⟨bne_iff_ne.mp hnz, rfl, rfl, hderefIff.mp hd⟩
+              | error e =>
+                cases e <;> simp only [hd, ub] at hok <;> cases hok
+      · intro ⟨hnz, hal, hinh, hder⟩
+        rw [h1 _ () _ (hensT _ _ (bne_iff_ne.mpr hnz)),
+            h1 _ () _ (hensT _ _ hal),
+            h1 _ () _ (hensT _ _ hinh),
+            hderefIff.mpr hder]; rfl
+
+/-- Two `TreeBorrowsMemory` states have identical parameters, allocation counts,
+addresses, alignments, kinds, liveness flags, byte lengths, and Tree Borrows
+trees — differing ONLY in their pointee byte contents (`alloc.data`, e.g.,
+initialized bytes vs. all `.Uninit`). -/
+def TbmSameMetaDiffData (tbm1 tbm2 : Gen.TreeBorrowsMemory Gen.x86_64) : Prop :=
+  tbm1.params = tbm2.params ∧
+  tbm1.mem.allocations.length = tbm2.mem.allocations.length ∧
+  ∀ (i : Nat) (a1 a2 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra),
+    tbm1.mem.allocations[i]? = some a1 →
+    tbm2.mem.allocations[i]? = some a2 →
+    a1.data.length = a2.data.length ∧
+    a1.addr = a2.addr ∧ a1.align = a2.align ∧ a1.kind = a2.kind ∧
+    a1.live = a2.live ∧ a1.extra = a2.extra
+
+/-- **Pointee-byte irrelevance of `BasicMemory.check_ptr` &
+`TreeBorrowsMemory.retag_ptr`**: replacing the pointee byte contents of ANY
+allocations by ANY same-length byte lists (in particular, all `.Uninit` bytes)
+leaves `BasicMemory.check_ptr` identically equal and `TreeBorrowsMemory.retag_ptr`
+in exact lockstep (identical error, or identical returned pointer, identical
+protectors, identical Tree Borrows trees, and untouched original `.data`). -/
+theorem tbm_retag_ptr_pointee_data_irrelevant
+    (tbm1 tbm2 : Gen.TreeBorrowsMemory Gen.x86_64)
+    (hsame : TbmSameMetaDiffData tbm1 tbm2)
+    (frameExtra : Gen.TreeBorrowsFrameExtra)
+    (ptr : Gen.Pointer Gen.TreeBorrowsProvenance)
+    (ptrType : Gen.PtrType) (fnEntry fnIw : Bool)
+    (lookup : Gen.ThinPointer Gen.TreeBorrowsProvenance → Interp Gen.VTable) :
+    (∀ sz, BasicMemory.check_ptr tbm1.mem ptr.thin_pointer sz =
+      BasicMemory.check_ptr tbm2.mem ptr.thin_pointer sz) ∧
+    (∀ e, TreeBorrowsMemory.retag_ptr tbm1 frameExtra ptr ptrType fnEntry fnIw lookup = .error e ↔
+      TreeBorrowsMemory.retag_ptr tbm2 frameExtra ptr ptrType fnEntry fnIw lookup = .error e) ∧
+    (∀ p1 t1 fe1,
+      TreeBorrowsMemory.retag_ptr tbm1 frameExtra ptr ptrType fnEntry fnIw lookup = .ok (p1, t1, fe1) →
+      ∃ t2, TreeBorrowsMemory.retag_ptr tbm2 frameExtra ptr ptrType fnEntry fnIw lookup = .ok (p1, t2, fe1) ∧
+        TbmSameMetaDiffData t1 t2 ∧
+        (∀ (i : Nat) (a1 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra),
+          t1.mem.allocations[i]? = some a1 →
+          ∃ a0 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra,
+            tbm1.mem.allocations[i]? = some a0 ∧ a1.data = a0.data) ∧
+        (∀ (i : Nat) (a2 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra),
+          t2.mem.allocations[i]? = some a2 →
+          ∃ a0 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra,
+            tbm2.mem.allocations[i]? = some a0 ∧ a2.data = a0.data)) := by
+  have hlenAllocs := hsame.2.1
+  have hckEq : ∀ sz, BasicMemory.check_ptr tbm1.mem ptr.thin_pointer sz =
+      BasicMemory.check_ptr tbm2.mem ptr.thin_pointer sz := by
+    intro sz
+    unfold BasicMemory.check_ptr
+    by_cases hsz0 : sz.bytes = 0
+    · simp only [hsz0, ↓reduceIte]
+    · simp only [hsz0, ↓reduceIte]
+      cases hprov : ptr.thin_pointer.provenance with
+      | none => rfl
+      | some pr =>
+        rcases pr with ⟨allocId, path⟩
+        unfold listIndex
+        by_cases hnn : 0 ≤ allocId._0
+        · simp only [hnn, ↓reduceIte]
+          cases h1 : tbm1.mem.allocations[allocId._0.toNat]? with
+          | none =>
+            have hge : tbm1.mem.allocations.length ≤ allocId._0.toNat := List.getElem?_eq_none_iff.mp h1
+            have h2 : tbm2.mem.allocations[allocId._0.toNat]? = none :=
+              List.getElem?_eq_none (by omega)
+            rw [h2]
+          | some a1 =>
+            have hlt1 : allocId._0.toNat < tbm1.mem.allocations.length := (List.getElem?_eq_some_iff.mp h1).1
+            have hlt : allocId._0.toNat < tbm2.mem.allocations.length := by omega
+            obtain ⟨a2, h2⟩ : ∃ a2, tbm2.mem.allocations[allocId._0.toNat]? = some a2 :=
+              ⟨tbm2.mem.allocations[allocId._0.toNat], List.getElem?_eq_getElem hlt⟩
+            rw [h2]
+            obtain ⟨hlen, haddr, _, _, hlive, _⟩ := hsame.2.2 _ a1 a2 h1 h2
+            simp only [Allocation.size, pure, Except.pure, bind, Except.bind, hlen, haddr, hlive]; rfl
+        · simp only [hnn, ↓reduceIte]
+  have hcore :
+      (∀ e, TreeBorrowsMemory.retag_ptr tbm1 frameExtra ptr ptrType fnEntry fnIw lookup = .error e ↔
+        TreeBorrowsMemory.retag_ptr tbm2 frameExtra ptr ptrType fnEntry fnIw lookup = .error e) ∧
+      (∀ p1 t1 fe1,
+        TreeBorrowsMemory.retag_ptr tbm1 frameExtra ptr ptrType fnEntry fnIw lookup = .ok (p1, t1, fe1) →
+        ∃ t2, TreeBorrowsMemory.retag_ptr tbm2 frameExtra ptr ptrType fnEntry fnIw lookup = .ok (p1, t2, fe1) ∧
+          TbmSameMetaDiffData t1 t2 ∧
+          (∀ (i : Nat) (a1 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra),
+            t1.mem.allocations[i]? = some a1 →
+            ∃ a0 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra,
+              tbm1.mem.allocations[i]? = some a0 ∧ a1.data = a0.data) ∧
+          (∀ (i : Nat) (a2 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra),
+            t2.mem.allocations[i]? = some a2 →
+            ∃ a0 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra,
+              tbm2.mem.allocations[i]? = some a0 ∧ a2.data = a0.data)) := by
+    unfold TreeBorrowsMemory.retag_ptr
+    rw [hsame.1]
+    cases hnew : ReborrowSettings.new lookup ptr ptrType fnEntry tbm2.params fnIw with
+    | error e0 =>
+      exact ⟨fun _ => Iff.rfl, fun _ _ _ h => by cases h⟩
+    | ok optS =>
+      cases optS with
+      | none =>
+        dsimp only [bind, Except.bind, pure, Except.pure]
+        refine ⟨fun _ => Iff.intro (fun h => nomatch h) (fun h => nomatch h), fun p1 t1 fe1 h => ?_⟩
+        cases h
+        exact ⟨tbm2, rfl, hsame, fun _ a ha => ⟨a, ha, rfl⟩, fun _ a ha => ⟨a, ha, rfl⟩⟩
+      | some settings =>
+        dsimp only [bind, Except.bind]
+        unfold TreeBorrowsMemory.reborrow
+        dsimp only
+        rw [hckEq ⟨settings.inside.length⟩]
+        cases hck : BasicMemory.check_ptr tbm2.mem ptr.thin_pointer ⟨settings.inside.length⟩ with
+        | error e0 => exact ⟨fun _ => Iff.rfl, fun _ _ _ h => by cases h⟩
+        | ok _ =>
+          dsimp only [bind, Except.bind]
+          cases hprov : ptr.thin_pointer.provenance with
+          | none =>
+            dsimp only
+            by_cases hsz : settings.inside.length = 0
+            · simp only [ne_eq, hsz, not_true_eq_false, ↓reduceIte]
+              dsimp only [bind, Except.bind, pure, Except.pure]
+              refine ⟨fun _ => Iff.intro (fun h => nomatch h) (fun h => nomatch h), fun p1 t1 fe1 h => ?_⟩
+              cases h
+              exact ⟨tbm2, rfl, hsame, fun _ a ha => ⟨a, ha, rfl⟩, fun _ a ha => ⟨a, ha, rfl⟩⟩
+            · simp only [ne_eq, hsz, not_false_eq_true, ↓reduceIte]
+              dsimp only [specPanic, bind, Except.bind]
+              exact ⟨fun _ => trivial, fun _ _ _ h => by cases h⟩
+          | some pr =>
+            rcases pr with ⟨allocId, parentPath⟩
+            dsimp only
+            unfold listMutateAt listIndex listSet
+            by_cases hnn : 0 ≤ allocId._0
+            · simp only [hnn, true_and, ↓reduceIte]
+              let idx := allocId._0.toNat
+              cases h1 : tbm1.mem.allocations[idx]? with
+              | none =>
+                have hge : tbm1.mem.allocations.length ≤ idx := List.getElem?_eq_none_iff.mp h1
+                have h2 : tbm2.mem.allocations[idx]? = none := List.getElem?_eq_none (by omega)
+                simp only [idx] at h1 h2
+                rw [h2]
+                dsimp only [specPanic, bind, Except.bind]
+                exact ⟨fun _ => Iff.rfl, fun _ _ _ h => by cases h⟩
+              | some a1 =>
+                have hlt1 : idx < tbm1.mem.allocations.length := (List.getElem?_eq_some_iff.mp h1).1
+                have hlt2 : idx < tbm2.mem.allocations.length := by omega
+                obtain ⟨a2, h2⟩ : ∃ a2, tbm2.mem.allocations[idx]? = some a2 :=
+                  ⟨tbm2.mem.allocations[idx], List.getElem?_eq_getElem hlt2⟩
+                simp only [idx] at h1 h2 hlt1 hlt2
+                rw [h2]
+                dsimp only [bind, Except.bind, pure, Except.pure, Allocation.size]
+                obtain ⟨hlen, haddr, hal, hk, hlv, hex⟩ := hsame.2.2 idx a1 a2 h1 h2
+                rw [hlen, haddr, hex]
+                simp only [hlt1, hlt2, ↓reduceIte]
+                have hset : ∀ (r2 : Gen.Node),
+                    let t1 : Gen.TreeBorrowsMemory Gen.x86_64 :=
+                      { tbm1 with mem := { tbm1.mem with allocations :=
+                          (tbm1.mem.allocations.set allocId._0.toNat { a1 with addr := a2.addr, extra := { root := r2 } }) } }
+                    let t2 : Gen.TreeBorrowsMemory Gen.x86_64 :=
+                      { tbm2 with mem := { tbm2.mem with allocations :=
+                          (tbm2.mem.allocations.set allocId._0.toNat { a2 with extra := { root := r2 } }) } }
+                    TbmSameMetaDiffData t1 t2 ∧
+                    (∀ (i : Nat) (x1 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra),
+                      t1.mem.allocations[i]? = some x1 →
+                      ∃ a0, tbm1.mem.allocations[i]? = some a0 ∧ x1.data = a0.data) ∧
+                    (∀ (i : Nat) (x2 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra),
+                      t2.mem.allocations[i]? = some x2 →
+                      ∃ a0, tbm2.mem.allocations[i]? = some a0 ∧ x2.data = a0.data) := by
+                  intro r2
+                  refine ⟨⟨hsame.1, by simp only [List.length_set, hlenAllocs], fun i x1 x2 hx1 hx2 => ?_⟩,
+                    fun i x1 hx1 => ?_, fun i x2 hx2 => ?_⟩
+                  · by_cases hi : i = allocId._0.toNat
+                    · subst hi
+                      rw [List.getElem?_set_self hlt1] at hx1; cases hx1
+                      rw [List.getElem?_set_self hlt2] at hx2; cases hx2
+                      exact ⟨hlen, rfl, hal, hk, hlv, rfl⟩
+                    · rw [List.getElem?_set_ne (Ne.symm hi)] at hx1 hx2
+                      exact hsame.2.2 i x1 x2 hx1 hx2
+                  · by_cases hi : i = allocId._0.toNat
+                    · subst hi; rw [List.getElem?_set_self hlt1] at hx1; cases hx1; exact ⟨a1, h1, rfl⟩
+                    · rw [List.getElem?_set_ne (Ne.symm hi)] at hx1; exact ⟨x1, hx1, rfl⟩
+                  · by_cases hi : i = allocId._0.toNat
+                    · subst hi; rw [List.getElem?_set_self hlt2] at hx2; cases hx2; exact ⟨a2, h2, rfl⟩
+                    · rw [List.getElem?_set_ne (Ne.symm hi)] at hx2; exact ⟨x2, hx2, rfl⟩
+                cases hO : Size.from_bytes (ptr.thin_pointer.addr - a2.addr) with
+                | none =>
+                  dsimp only [specPanic]
+                  exact ⟨fun _ => Iff.rfl, fun _ _ _ h => by cases h⟩
+                | some o =>
+                  dsimp only
+                  by_cases hgt : settings.inside.length > 0
+                  · simp only [hgt, ↓reduceIte]
+                    cases hW : writeSubsliceAtIndex (List.replicate a2.data.length settings.outside)
+                        (o.bytes : Int) settings.inside with
+                    | error e0 => exact ⟨fun _ => Iff.rfl, fun _ _ _ h => by cases h⟩
+                    | ok ps =>
+                      dsimp only
+                      cases hmp : (ps.all fun x => Permission.matches_protector x settings.«protected») with
+                      | false =>
+                        simp only [Bool.not_false, ↓reduceIte, specPanic]
+                        exact ⟨fun _ => trivial, fun _ _ _ h => by cases h⟩
+                      | true =>
+                        simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+                        cases hAdd : Node.add_node a2.extra.root parentPath
+                            { children := [], permissions := ps, «protected» := settings.«protected» } with
+                        | error e0 => exact ⟨fun _ => Iff.rfl, fun _ _ _ h => by cases h⟩
+                        | ok pr =>
+                          rcases pr with ⟨cp, r1⟩; dsimp only
+                          cases hInit : TreeBorrowsMemory.reborrowInitAccess cp o 0 settings.inside r1 with
+                          | error e0 => exact ⟨fun _ => Iff.rfl, fun _ _ _ h => by cases h⟩
+                          | ok r2 =>
+                            dsimp only
+                            refine ⟨fun _ => Iff.intro (fun h => nomatch h) (fun h => nomatch h), fun p1 t1 fe1 h => ?_⟩
+                            cases h; exact ⟨_, rfl, hset r2⟩
+                  · simp only [hgt, ↓reduceIte]
+                    cases hmp : ((List.replicate a2.data.length settings.outside).all
+                        fun x => Permission.matches_protector x settings.«protected») with
+                    | false =>
+                      simp only [Bool.not_false, ↓reduceIte, specPanic]
+                      exact ⟨fun _ => trivial, fun _ _ _ h => by cases h⟩
+                    | true =>
+                      simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+                      cases hAdd : Node.add_node a2.extra.root parentPath
+                          { children := [], permissions := List.replicate a2.data.length settings.outside,
+                            «protected» := settings.«protected» } with
+                      | error e0 => exact ⟨fun _ => Iff.rfl, fun _ _ _ h => by cases h⟩
+                      | ok pr =>
+                        rcases pr with ⟨cp, r1⟩; dsimp only
+                        cases hInit : TreeBorrowsMemory.reborrowInitAccess cp o 0 settings.inside r1 with
+                        | error e0 => exact ⟨fun _ => Iff.rfl, fun _ _ _ h => by cases h⟩
+                        | ok r2 =>
+                          dsimp only
+                          refine ⟨fun _ => Iff.intro (fun h => nomatch h) (fun h => nomatch h), fun p1 t1 fe1 h => ?_⟩
+                          cases h; exact ⟨_, rfl, hset r2⟩
+            · simp only [hnn, ↓reduceIte]
+              dsimp only [specPanic, bind, Except.bind]
+              exact ⟨fun _ => Iff.rfl, fun _ _ _ h => by cases h⟩
+  exact ⟨hckEq, hcore.1, hcore.2⟩
+
+private theorem a3_list_mapM_dataM_none_of_uninit {Prov : Type} :
+    ∀ (bytes : List (Gen.AbstractByte Prov)),
+      .Uninit ∈ bytes → bytes.mapM AbstractByte.dataM = none
+  | [], h => by cases h
+  | b :: rest, h => by
+    rcases List.mem_cons.mp h with rfl | hrest
+    · simp only [List.mapM_cons, AbstractByte.dataM, bind, Option.bind]
+    · cases b with
+      | Uninit => simp only [List.mapM_cons, AbstractByte.dataM, bind, Option.bind]
+      | Init v p =>
+        rw [List.mapM_cons, AbstractByte.dataM]
+        dsimp only [bind, Option.bind]
+        rw [a3_list_mapM_dataM_none_of_uninit rest hrest]
+
+/-- **Uninitialized pointer-representation UB in `MachTB` `Statement.Validate`
+(for BOTH safe AND raw thin pointers)**: whenever the 8 pointer bytes loaded
+from `placeExpr` contain ANY `.Uninit` byte, `Type.decodeM` returns `.ok none`
+and `evalStatementM m (.Validate placeExpr fnEntry)` IMMEDIATELY raises
+`.error (.ub "load at type but the data in memory violates the language invariant")`
+— BEFORE `checkPtrM` and BEFORE `retag_ptr`, for BOTH safe pointers (`&T`,
+`&mut T`, `Box<T>`, including ZSTs and `#[rustc_no_writable]`) AND raw pointers
+(`PtrType.Raw .None`)! Contrast with `tbm_retag_ptr_pointee_data_irrelevant`:
+uninitialized bytes in the **pointee** are 100% ignored by `check_ptr` and
+`retag_ptr`, whereas ANY uninitialized byte in the **pointer itself** is UB. -/
+theorem evalStatementM_tb_validate_uninit_ptr_ub
+    (m m1 : MachTB) (placeExpr : Gen.PlaceExpr) (p : Gen.Place TBM)
+    (ptrTy : Gen.PtrType) (fnEntry : Bool)
+    (bytes : List (Gen.AbstractByte Gen.TreeBorrowsProvenance))
+    (cm2 : Gen.ConcurrentMemory TBM)
+    (hplace : evalPlaceM m placeExpr = .ok ((p, .Ptr ptrTy), m1))
+    (hplAlign : p.aligned = true)
+    (hmk : PtrType.meta_kind ptrTy = .None)
+    (hload : ConcurrentMemory.load m1.mem p.ptr.thin_pointer x86_64.PTR_SIZE ⟨1⟩ .None = .ok (bytes, cm2))
+    (hlen : bytes.length = x86_64.PTR_SIZE.bytes)
+    (huninit : .Uninit ∈ bytes) :
+    evalStatementM m (.Validate placeExpr fnEntry) =
+      .error (.ub "load at type but the data in memory violates the language invariant") := by
+  have hwp : PtrType.as_wide_pair ptrTy = none := by
+    unfold PtrType.as_wide_pair; rw [hmk]; rfl
+  have hdec : Type.decodeM (M := TBM) (.Ptr ptrTy) bytes = .ok none := by
+    unfold Type.decodeM
+    rw [hwp]
+    dsimp only [bind, Except.bind, decodePtrM]
+    simp only [hlen, ne_eq, not_true_eq_false, ↓reduceIte]
+    rw [a3_list_mapM_dataM_none_of_uninit bytes huninit]
+    rfl
+  dsimp only [evalStatementM]
+  rw [hplace]
+  simp only [bind, Except.bind, pure, Except.pure, placeLoadM, typedLoadM, Type.layout,
+    LayoutStrategy.expect_size, hplAlign, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+    hmk, hload, hdec, ub]
 
 /-- **Symbolic `MachTB` `Statement.Validate` boundary (safe pointer vs. raw
 pointer)**: lifts `checkPtrM_tb_safe_vs_raw_boundary` to the real MiniRust
@@ -23312,7 +22945,10 @@ theorem canary_retag_ptr_zst_dead_oob_and_specPanic :
     TreeBorrowsMemory.retag_ptr tbmD TreeBorrowsMemory.new_call (ptrAt 256) u8Ty true false
         nwsrVtableLookup = .error (.ub "dereferencing pointer to dead allocation") ∧
     (∃ r, TreeBorrowsMemory.retag_ptr tbmD TreeBorrowsMemory.new_call (ptrAt 256) zstTy true false
-        nwsrVtableLookup = .ok r ∧ r.2.2.protectors = [(⟨0⟩, [0])]) ∧
+        nwsrVtableLookup = .ok r ∧
+      TreeBorrowsMemory.retag_ptr tbmD TreeBorrowsMemory.new_call (ptrAt 256) zstTy true true
+        nwsrVtableLookup = .ok r ∧
+      r.2.2.protectors = [(⟨0⟩, [0])]) ∧
     (∃ r, TreeBorrowsMemory.retag_ptr tbmD TreeBorrowsMemory.new_call (ptrAt 100000) zstTy true false
         nwsrVtableLookup = .ok r ∧ r.2.2.protectors = [(⟨0⟩, [0])]) ∧
     TreeBorrowsMemory.retag_ptr tbmD TreeBorrowsMemory.new_call (ptrAt 255) zstTy true false
@@ -23334,16 +22970,337 @@ theorem canary_retag_ptr_zst_dead_oob_and_specPanic :
   · exact ((tbm_retag_ptr_safe_dereferenceable_ub _ TreeBorrowsMemory.new_call _
       (pointeeInfoOfFacts ⟨true, true, true⟩ 1 1 []) 1 ⟨1⟩ [] [true] rfl (by decide) rfl rfl
       _ (Or.inr ⟨rfl, Or.inl rfl⟩) true false nwsrVtableLookup).2 0 [] _ rfl rfl).1 rfl
-  · obtain ⟨_, _, _, _, _, hok⟩ := ((hz (ThinPointer.widen { addr := 256, provenance := some (⟨0⟩, []) }
-      none)).2 0 [] _ rfl rfl).2 (by decide) _ rfl
+  · have h256 := hz (ThinPointer.widen { addr := 256, provenance := some (⟨0⟩, []) } none)
+    obtain ⟨_, _, _, _, _, _, _, hok⟩ := (h256.2.2 0 [] _ rfl rfl).2 (by decide) _ rfl
+    exact ⟨_, hok, h256.1.symm.trans hok, rfl⟩
+  · obtain ⟨_, _, _, _, _, _, _, hok⟩ :=
+      ((hz (ThinPointer.widen { addr := 100000, provenance := some (⟨0⟩, []) } none)).2.2 0 [] _ rfl rfl).2
+        (by decide) _ rfl
     exact ⟨_, hok, rfl⟩
-  · obtain ⟨_, _, _, _, _, hok⟩ := ((hz (ThinPointer.widen { addr := 100000, provenance := some (⟨0⟩, []) }
-      none)).2 0 [] _ rfl rfl).2 (by decide) _ rfl
-    exact ⟨_, hok, rfl⟩
-  · exact ((hz (ThinPointer.widen { addr := 255, provenance := some (⟨0⟩, []) } none)).2 0 [] _ rfl
+  · exact ((hz (ThinPointer.widen { addr := 255, provenance := some (⟨0⟩, []) } none)).2.2 0 [] _ rfl
       rfl).1 (by decide)
-  · exact (hz (ThinPointer.widen { addr := 255, provenance := none } none)).1 rfl
+  · exact (hz (ThinPointer.widen { addr := 255, provenance := none } none)).2.1 rfl
   · rfl
+
+/-- Helper encoding a thin pointer into 8 `AbstractByte`s for `MachTB`
+`Statement.Validate` canaries. -/
+private def a3_encodeThinPtr (addr : Int) (prov : Option Gen.TreeBorrowsProvenance) :
+    List (Gen.AbstractByte Gen.TreeBorrowsProvenance) :=
+  match Endianness.encode x86_64.ENDIANNESS .Unsigned x86_64.PTR_SIZE addr with
+  | some bs => encodePtrBytesM (M := TBM) prov 0 bs
+  | none => []
+
+/-- Minimal 1-frame `MachTB` state whose allocation `0` is a 4-byte allocation
+at `[256, 260)` (`live := targetLive`, `data := targetData`) and whose allocation
+`1` is local `_1 : .Ptr ptrTy` at `[512, 520)` storing `ptrBytes`, positioned to
+execute `Statement.Validate (.Local (localName 1)) true` under
+`Function.implicit_writes := fnIw`. -/
+def mkValidateLocalMachTB (targetLive : Bool)
+    (targetData : List (Gen.AbstractByte Gen.TreeBorrowsProvenance))
+    (ptrTy : Gen.PtrType) (ptrBytes : List (Gen.AbstractByte Gen.TreeBorrowsProvenance))
+    (fnIw : Bool) : MachTB :=
+  let fn0 : Gen.Function := {
+    locals := ⟨[(localName 0, unitTyMR), (localName 1, .Ptr ptrTy)]⟩
+    args := []
+    ret := localName 0
+    calling_convention := .Rust
+    blocks := ⟨[(bbName 0, ⟨[.Validate (.Local (localName 1)) true], .Return, .Regular⟩)]⟩
+    start := bbName 0
+    implicit_writes := fnIw
+  }
+  let alloc0 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
+    { mkRootAllocTB targetData 256 4 .Global with live := targetLive }
+  let alloc1 : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
+    mkRootAllocTB ptrBytes 512 8 .Stack
+  let fr0 : Gen.StackFrame TBM := {
+    func := fn0
+    locals := ⟨[(localName 1, { addr := 512, provenance := some (⟨1⟩, []) })]⟩
+    stack_pop_action := .BackToCaller none none { addr := 512, provenance := some (⟨1⟩, []) }
+    next_block := bbName 0
+    next_stmt := 0
+    extra := TreeBorrowsMemory.new_call
+  }
+  { prog := { functions := ⟨[(fnName 0, fn0)]⟩, start := fnName 0, globals := ⟨[]⟩,
+              traits := ⟨[]⟩, vtables := ⟨[]⟩ }
+    mem := { memory := { params := ⟨true⟩, mem := { allocations := [alloc0, alloc1], _phantom := ⟨⟩ } },
+             accesses := [] }
+    intptrcast := ⟨⟨[]⟩⟩
+    threads := [{ stack := [fr0], state := .Enabled, unwind_payloads := [] }]
+    active_thread := 0
+    synchronized_threads := ⟨[]⟩
+    locks := []
+    global_ptrs := ⟨[]⟩
+    fn_ptrs := ⟨[]⟩
+    vtable_ptrs := ⟨[]⟩
+    stdout := ⟨[]⟩
+    stderr := ⟨[]⟩ }
+
+/-- **Closed `MachTB` `Statement.Validate` canary contrasting ZST alignment
+(`al = 1` vs. `al = 4`), reachable ZST `specPanic`, raw pointers, and
+uninitialized pointer vs. uninitialized pointee bytes** (zero hypotheses):
+1. ZST `&mut ()` (`al = 1`) to DEAD alloc `0` at `addr = 256` and past-the-end
+   `addr = 100000`: `evalStatementM` SUCCEEDS in `MachTB` and pushes protector `(0, [0])`;
+2. ZST `&mut ()` (`al = 1`) at `addr = 255` (below base `256`): passes `checkPtrM`
+   (by `checkPtrM_tb_safe_ok_iff`) and reaches `.error (.specPanic
+   "Offset::from_bytes(ptr.addr - allocation.addr).unwrap()")` in real `MachTB`!;
+3. ZST `&mut Align4Zst` (`al = 4`) at `addr = 255`: caught FIRST by `checkPtrM` as
+   `.error (.ub "Value::Ptr: unaligned safe pointer")`;
+4. ZST `&mut Align4Zst` (`al = 4`) at `addr = 252` (4-byte aligned, below base
+   `256`): passes `checkPtrM` and reaches `.error (.specPanic
+   "Offset::from_bytes(ptr.addr - allocation.addr).unwrap()")` in real `MachTB`!;
+5. Raw pointer `*const ()` (`PtrType.Raw .None`) at `addr = 255` (and at null `0`):
+   `evalStatementM` SUCCEEDS with `0` protectors pushed;
+6. Uninitialized pointer representation (`List.replicate 8 .Uninit` in `_1`):
+   raises `.error (.ub "load at type but the data in memory violates the language invariant")`
+   for BOTH safe `&mut ()` AND raw `*const ()` (firing `evalStatementM_tb_validate_uninit_ptr_ub`);
+7. Uninitialized pointee bytes (`List.replicate 4 .Uninit` in live alloc `0`) with
+   valid `&mut u32` in `_1`: `evalStatementM` SUCCEEDS under BOTH `#[rustc_no_writable]`
+   (`fnIw = false`) and standard (`fnIw = true`), preserving `MachTB.wfLive` and
+   leaving alloc `0`'s `.Uninit` bytes untouched (matching `tbm_retag_ptr_pointee_data_irrelevant`). -/
+theorem canary_machTB_validate_zst_align_uninit_and_specPanic :
+    let zstAl1 : Gen.PtrType := .Ref .Mutable (pointeeInfoOfFacts ⟨true, true, true⟩ 0 1 [])
+    let zstAl4 : Gen.PtrType := .Ref .Mutable (pointeeInfoOfFacts ⟨true, true, true⟩ 0 4 [])
+    let mutU32 : Gen.PtrType := .Ref .Mutable (pointeeInfoOfFacts ⟨true, true, true⟩ 4 4 [])
+    let rawTy : Gen.PtrType := .Raw .None
+    let stmt : Gen.Statement := .Validate (.Local (localName 1)) true
+    let mkDead := fun (ty : Gen.PtrType) (addr : Int) =>
+      mkValidateLocalMachTB false (tbU32Bytes 1) ty (a3_encodeThinPtr addr (some (⟨0⟩, []))) false
+    let mkUninitPtr := fun (ty : Gen.PtrType) =>
+      mkValidateLocalMachTB true (tbU32Bytes 1) ty (List.replicate 8 .Uninit) false
+    let mkUninitPointee := fun (fnIw : Bool) =>
+      mkValidateLocalMachTB true (List.replicate 4 .Uninit) mutU32
+        (a3_encodeThinPtr 256 (some (⟨0⟩, []))) fnIw
+    (∃ m', evalStatementM (mkDead zstAl1 256) stmt = .ok m' ∧
+      (m'.threads[0]?.bind (fun t => t.stack.getLast?)).map (·.extra.protectors) = some [(⟨0⟩, [0])]) ∧
+    (∃ m', evalStatementM (mkDead zstAl1 100000) stmt = .ok m' ∧
+      (m'.threads[0]?.bind (fun t => t.stack.getLast?)).map (·.extra.protectors) = some [(⟨0⟩, [0])]) ∧
+    evalStatementM (mkDead zstAl1 255) stmt =
+      .error (.specPanic "Offset::from_bytes(ptr.addr - allocation.addr).unwrap()") ∧
+    evalStatementM (mkDead zstAl4 255) stmt =
+      .error (.ub "Value::Ptr: unaligned safe pointer") ∧
+    evalStatementM (mkDead zstAl4 252) stmt =
+      .error (.specPanic "Offset::from_bytes(ptr.addr - allocation.addr).unwrap()") ∧
+    (∃ m', evalStatementM (mkDead rawTy 255) stmt = .ok m' ∧
+      (m'.threads[0]?.bind (fun t => t.stack.getLast?)).map (·.extra.protectors) = some []) ∧
+    (∃ m', evalStatementM (mkDead rawTy 0) stmt = .ok m' ∧
+      (m'.threads[0]?.bind (fun t => t.stack.getLast?)).map (·.extra.protectors) = some []) ∧
+    evalStatementM (mkUninitPtr zstAl1) stmt =
+      .error (.ub "load at type but the data in memory violates the language invariant") ∧
+    evalStatementM (mkUninitPtr rawTy) stmt =
+      .error (.ub "load at type but the data in memory violates the language invariant") ∧
+    (∃ m', evalStatementM (mkUninitPointee false) stmt = .ok m' ∧ MachTB.wfLive m' ∧
+      m'.mem.memory.mem.allocations[0]?.map (·.data) = some (List.replicate 4 .Uninit)) ∧
+    (∃ m', evalStatementM (mkUninitPointee true) stmt = .ok m' ∧ MachTB.wfLive m' ∧
+      m'.mem.memory.mem.allocations[0]?.map (·.data) = some (List.replicate 4 .Uninit)) := by
+  dsimp only
+  have hokProt : ∀ (m : MachTB) (expected : List (Gen.AllocId × Gen.Path)),
+      (match evalStatementM m (.Validate (.Local (localName 1)) true) with
+       | .ok m' => decide ((m'.threads[0]?.bind (fun t => t.stack.getLast?)).map (·.extra.protectors) = some expected)
+       | .error _ => false) = true →
+      ∃ m', evalStatementM m (.Validate (.Local (localName 1)) true) = .ok m' ∧
+        (m'.threads[0]?.bind (fun t => t.stack.getLast?)).map (·.extra.protectors) = some expected := by
+    intro m expected h
+    cases he : evalStatementM m (.Validate (.Local (localName 1)) true) with
+    | error _ => rw [he] at h; cases h
+    | ok m' => rw [he] at h; exact ⟨m', rfl, of_decide_eq_true h⟩
+  have hokUninit : ∀ (m : MachTB),
+      (match evalStatementM m (.Validate (.Local (localName 1)) true) with
+       | .ok m' => tbmWfLiveBool m'.mem.memory &&
+           decide (m'.mem.memory.mem.allocations[0]?.map (·.data) = some (List.replicate 4 .Uninit))
+       | .error _ => false) = true →
+      ∃ m', evalStatementM m (.Validate (.Local (localName 1)) true) = .ok m' ∧
+        MachTB.wfLive m' ∧
+        m'.mem.memory.mem.allocations[0]?.map (·.data) = some (List.replicate 4 .Uninit) := by
+    intro m h
+    cases he : evalStatementM m (.Validate (.Local (localName 1)) true) with
+    | error _ => rw [he] at h; cases h
+    | ok m' =>
+      rw [he] at h; have ⟨h1, h2⟩ := (Bool.and_eq_true _ _).mp h
+      exact ⟨m', rfl, machTB_wfLive_of_bool m' h1, of_decide_eq_true h2⟩
+  refine ⟨hokProt _ _ (by decide +kernel),
+    hokProt _ _ (by decide +kernel),
+    rfl,
+    rfl,
+    rfl,
+    hokProt _ _ (by decide +kernel),
+    hokProt _ _ (by decide +kernel),
+    ?_, ?_,
+    hokUninit _ (by decide +kernel),
+    hokUninit _ (by decide +kernel)⟩
+  · have hldChk : (match ConcurrentMemory.load
+        (mkValidateLocalMachTB true (tbU32Bytes 1)
+          (.Ref .Mutable (pointeeInfoOfFacts ⟨true, true, true⟩ 0 1 []))
+          (List.replicate 8 .Uninit) false).mem
+        { addr := 512, provenance := some (⟨1⟩, []) } x86_64.PTR_SIZE ⟨1⟩ .None with
+        | .ok (bs, _) => decide (bs = List.replicate 8 .Uninit)
+        | .error _ => false) = true := by decide +kernel
+    cases hld : ConcurrentMemory.load
+        (mkValidateLocalMachTB true (tbU32Bytes 1)
+          (.Ref .Mutable (pointeeInfoOfFacts ⟨true, true, true⟩ 0 1 []))
+          (List.replicate 8 .Uninit) false).mem
+        { addr := 512, provenance := some (⟨1⟩, []) } x86_64.PTR_SIZE ⟨1⟩ .None with
+    | error _ => rw [hld] at hldChk; cases hldChk
+    | ok pr =>
+      rcases pr with ⟨bs, cm2⟩; rw [hld] at hldChk
+      obtain rfl : bs = List.replicate 8 .Uninit := of_decide_eq_true hldChk
+      exact evalStatementM_tb_validate_uninit_ptr_ub _ _ _ _ _ true (List.replicate 8 .Uninit) cm2
+        rfl rfl rfl hld rfl (List.mem_replicate.mpr ⟨by decide, rfl⟩)
+  · have hldChk : (match ConcurrentMemory.load
+        (mkValidateLocalMachTB true (tbU32Bytes 1) (.Raw .None)
+          (List.replicate 8 .Uninit) false).mem
+        { addr := 512, provenance := some (⟨1⟩, []) } x86_64.PTR_SIZE ⟨1⟩ .None with
+        | .ok (bs, _) => decide (bs = List.replicate 8 .Uninit)
+        | .error _ => false) = true := by decide +kernel
+    cases hld : ConcurrentMemory.load
+        (mkValidateLocalMachTB true (tbU32Bytes 1) (.Raw .None)
+          (List.replicate 8 .Uninit) false).mem
+        { addr := 512, provenance := some (⟨1⟩, []) } x86_64.PTR_SIZE ⟨1⟩ .None with
+    | error _ => rw [hld] at hldChk; cases hldChk
+    | ok pr =>
+      rcases pr with ⟨bs, cm2⟩; rw [hld] at hldChk
+      obtain rfl : bs = List.replicate 8 .Uninit := of_decide_eq_true hldChk
+      exact evalStatementM_tb_validate_uninit_ptr_ub _ _ _ _ _ true (List.replicate 8 .Uninit) cm2
+        rfl rfl rfl hld rfl (List.mem_replicate.mpr ⟨by decide, rfl⟩)
+
+/-- Minimal `Trusted` `CapturedMir` body executing a single `.retag rk _1`
+against a global allocation `globals` (modeling `static S: u32` vs.
+`static mut S: u32`, `&raw const`/`&raw mut`, and ZST scalar retags in
+`Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn`). -/
+def mkStaticRetagMirBody (rk : RetagKind)
+    (local1Ty : Trusted.Rustc.V2026_06_01.MirAst.Ty)
+    (globals : List CapturedAllocation) : CapturedMir where
+  defPath := "no_writable_correspondence::static_retag_probe"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [
+    { mutability := .mut, ty := nwsrMirUnitTy, debugName := none },
+    { mutability := .mut, ty := local1Ty, debugName := none }
+  ]
+  basicBlocks := [{
+    statements := [{ kind := .retag rk { local_ := 1, projection := [] }, span := "witness" }]
+    terminator := { kind := .return_, span := "witness" }
+    isCleanup := false
+  }]
+  fnAbi := nwsrMirCalleeAbi
+  layouts := emptyLayoutTable
+  allocations := globals
+
+/-- 4-byte `Trusted` `CapturedAllocation` (`allocId = 1`, value `7u32`, align `4`)
+with configurable `mutability` (`.not` for Freeze `static`, `.mut` for `static mut`
+or `UnsafeCell` static). -/
+def staticRetagGlobalAlloc (mutability : Trusted.Rustc.V2026_06_01.MirAst.Mutability) :
+    CapturedAllocation where
+  allocId := 1
+  bytes := [some 7, some 0, some 0, some 0]
+  relocations := []
+  align := { bytes := 4 }
+  mutability := mutability
+
+/-- **Three-layer `charon#1620` static alignment (`Trusted.MirSemantics.stepMirFn` ↔
+`Theory` `ExtTreeMapAllocAndNoWritable` ↔ `MiniRustSpec` `TBM`/`MachTB`)**
+(zero hypotheses): unites `static` (`Freeze`), `static mut` (`&raw const`/`&raw mut`),
+`UnsafeCell` static, and ZST provenance-free scalar retags across all three layers:
+1. **`Trusted` `stepMirFn` (`checkGlobalRetag` / `.retag`)**:
+   - `.retag .raw` on `*const u32` (`&raw const STATIC`) and `*mut u32` (`&raw mut STATIC`)
+     succeeds unconditionally on BOTH `.not` (Freeze) and `.mut` (`static mut`) globals
+     while preserving local `_1`'s provenance;
+   - `.retag .default` on `&u32` succeeds on `.not` Freeze global;
+   - `.retag .default` on `&mut u32` FAILS with `.ub` on `.not` Freeze global,
+     SUCCEEDS on `.mut` `static mut` global when in-bounds (`offset = 0`), and
+     FAILS with `.ub` when out-of-bounds (`offset = 1`, `1 + 4 > 4`);
+   - `.retag .default` on ZST `&mut ()` with non-null provenance-free scalar `4`
+     SUCCEEDS, whereas null scalar `0` and non-ZST `&mut u32` scalar `4` FAIL with `.ub`;
+2. **`Theory` (`ExtTreeMapAllocAndNoWritable`)**:
+   - `staticAllocMutability` is `.not` for Freeze `staticShapeADesc` (rejecting writes
+     with `.readOnlyAlloc`) vs. `.mut` for `UnsafeCell` `staticShapeBDesc` (accepting
+     preserved writes with `.ok`);
+3. **`MiniRustSpec` `TBM`/`MachTB`**:
+   - `static mut S: u32` (`PtrType.Raw .None` on `.Global` allocation): `retag_ptr` is
+     a provenance-preserving no-op and `TreeBorrowsMemory.store` mutates the global from
+     `7` to `99` preserving `TreeBorrowsMemory.wfLive` — contrasting with preserved
+     `#1620` Freeze `static S: u32` (rejecting writes as `"Tree Borrows: local write of
+     Frozen reference"`) and `UnsafeCell` `static S: AtomicI32` (permitting interior-mutable
+     writes with `MachTB.wfLive`). -/
+theorem trusted_and_machTB_static_mut_vs_freeze_and_unsafeCell :
+    let rawConstU32 : Trusted.Rustc.V2026_06_01.MirAst.Ty := { kind := .rawPtr .not (.uint .u32), layoutIdx := 0 }
+    let rawMutU32 : Trusted.Rustc.V2026_06_01.MirAst.Ty := { kind := .rawPtr .mut (.uint .u32), layoutIdx := 0 }
+    let refMutZst : Trusted.Rustc.V2026_06_01.MirAst.Ty := { kind := .ref .mut (.tuple []), layoutIdx := 0 }
+    let gFrz := [staticRetagGlobalAlloc .not]
+    let gMut := [staticRetagGlobalAlloc .mut]
+    let p0 : Value := .ptr ⟨1, 0⟩ 8
+    let pOob : Value := .ptr ⟨1, 1⟩ 8
+    let bRawConst := mkStaticRetagMirBody .raw rawConstU32 gFrz
+    let bRawMut := mkStaticRetagMirBody .raw rawMutU32 gMut
+    let bShrFrz := mkStaticRetagMirBody .default nwsrMirRefSharedU32Ty gFrz
+    let bMutFrz := mkStaticRetagMirBody .default nwsrMirRefMutU32Ty gFrz
+    let bMutStatic := mkStaticRetagMirBody .default nwsrMirRefMutU32Ty gMut
+    let bZst := mkStaticRetagMirBody .default refMutZst []
+    (∃ s', stepMirFn bRawConst (initMachineState bRawConst [p0]) = .tau (.running s') ∧
+      s'.frame.locals[1]? = some (.init p0)) ∧
+    (∃ s', stepMirFn bRawMut (initMachineState bRawMut [p0]) = .tau (.running s') ∧
+      s'.frame.locals[1]? = some (.init p0)) ∧
+    (∃ s', stepMirFn bShrFrz (initMachineState bShrFrz [p0]) = .tau (.running s')) ∧
+    stepMirFn bMutFrz (initMachineState bMutFrz [p0]) = MirStepNode.fail .ub ∧
+    (∃ s', stepMirFn bMutStatic (initMachineState bMutStatic [p0]) = .tau (.running s')) ∧
+    stepMirFn bMutStatic (initMachineState bMutStatic [pOob]) = MirStepNode.fail .ub ∧
+    (∃ s', stepMirFn bZst (initMachineState bZst [.scalar ⟨4, 8⟩]) = .tau (.running s')) ∧
+    stepMirFn bZst (initMachineState bZst [.scalar ⟨0, 8⟩]) = MirStepNode.fail .ub ∧
+    stepMirFn bMutStatic (initMachineState bMutStatic [.scalar ⟨4, 8⟩]) = MirStepNode.fail .ub ∧
+    (staticAllocMutability staticShapeADesc = .not ∧
+      evalRawMutStaticWriteMiri staticShapeADesc (retagStaticPreservedAt staticShapeADesc 1 2) 0 1 = .readOnlyAlloc ∧
+      staticAllocMutability staticShapeBDesc = .mut ∧
+      evalRawMutStaticWriteMiri staticShapeBDesc (retagStaticPreservedAt staticShapeBDesc 1 2) 0 1 = .ok) ∧
+    (let tbm0 : Gen.TreeBorrowsMemory Gen.x86_64 :=
+       { params := ⟨true⟩, mem := { allocations := [mkRootAllocTB (tbU32Bytes 7) 256 4 .Global], _phantom := ⟨⟩ } }
+     let rawPtr : Gen.Pointer Gen.TreeBorrowsProvenance :=
+       ThinPointer.widen { addr := 256, provenance := some (⟨0⟩, []) } none
+     TreeBorrowsMemory.retag_ptr tbm0 TreeBorrowsMemory.new_call rawPtr (.Raw .None) false true nwsrVtableLookup =
+       .ok (rawPtr, tbm0, TreeBorrowsMemory.new_call) ∧
+     ∃ tbm1, TreeBorrowsMemory.store tbm0 rawPtr.thin_pointer (tbU32Bytes 99) ⟨4⟩ = .ok tbm1 ∧
+       TreeBorrowsMemory.wfLive tbm1 ∧
+       tbm1.mem.allocations[0]?.map (fun a => (a.kind, projDataBytesTB a.data)) =
+         some (.Global, [some 99, some 0, some 0, some 0])) ∧
+    (tbUnitOutcome (tbmStaticWriteTrace staticShapeADesc 4 (tbU32Bytes 7) true 0 (tbU32Bytes 99) 4) =
+      some (.inr "Tree Borrows: local write of Frozen reference") ∧
+     machRetSnapshot staticShapeBRepeatedWriteMachTB 8 =
+      some (some (true, [some 77, some 0, some 0, some 0]), [1]) ∧
+     (∃ m', Interp.stepsTB 8 staticShapeBRepeatedWriteMachTB = .ok m' ∧ MachTB.wfLive m')) := by
+  dsimp only
+  have hstChk : (match TreeBorrowsMemory.store
+        ({ params := ⟨true⟩, mem := { allocations := [mkRootAllocTB (tbU32Bytes 7) 256 4 .Global], _phantom := ⟨⟩ } } :
+          Gen.TreeBorrowsMemory Gen.x86_64)
+        { addr := 256, provenance := some (⟨0⟩, []) } (tbU32Bytes 99) ⟨4⟩ with
+      | .ok tbm1 => tbmWfLiveBool tbm1 &&
+          decide (tbm1.mem.allocations[0]?.map (fun a => (a.kind, projDataBytesTB a.data)) =
+            some (.Global, [some 99, some 0, some 0, some 0]))
+      | .error _ => false) = true := by decide +kernel
+  have hst : ∃ tbm1, TreeBorrowsMemory.store
+        ({ params := ⟨true⟩, mem := { allocations := [mkRootAllocTB (tbU32Bytes 7) 256 4 .Global], _phantom := ⟨⟩ } } :
+          Gen.TreeBorrowsMemory Gen.x86_64)
+        { addr := 256, provenance := some (⟨0⟩, []) } (tbU32Bytes 99) ⟨4⟩ = .ok tbm1 ∧
+      TreeBorrowsMemory.wfLive tbm1 ∧
+      tbm1.mem.allocations[0]?.map (fun a => (a.kind, projDataBytesTB a.data)) =
+        some (.Global, [some 99, some 0, some 0, some 0]) := by
+    cases hs : TreeBorrowsMemory.store
+        ({ params := ⟨true⟩, mem := { allocations := [mkRootAllocTB (tbU32Bytes 7) 256 4 .Global], _phantom := ⟨⟩ } } :
+          Gen.TreeBorrowsMemory Gen.x86_64)
+        { addr := 256, provenance := some (⟨0⟩, []) } (tbU32Bytes 99) ⟨4⟩ with
+    | error _ => rw [hs] at hstChk; cases hstChk
+    | ok tbm1 =>
+      rw [hs] at hstChk
+      have ⟨h1, h2⟩ := (Bool.and_eq_true _ _).mp hstChk
+      exact ⟨tbm1, rfl, tbm_wfLive_of_bool tbm1 h1, of_decide_eq_true h2⟩
+  exact ⟨⟨_, rfl, rfl⟩, ⟨_, rfl, rfl⟩, ⟨_, rfl⟩, rfl, ⟨_, rfl⟩, rfl,
+    ⟨_, rfl⟩, rfl, rfl,
+    ⟨staticShapeA_pureFreeze_correspondence.2.1,
+     rfl,
+     staticShapeB_pureUnsafeCell_correspondence.2.1,
+     staticShapeB_pureUnsafeCell_correspondence.2.2.2.1⟩,
+    ⟨rfl, hst⟩,
+    ⟨staticShapeA_pureFreeze_correspondence.2.2.2.2.2.2.1,
+     staticShapeB_pureUnsafeCell_correspondence.2.2.2.2.2.2.1,
+     staticShapeB_pureUnsafeCell_correspondence.2.2.2.2.2.2.2.2⟩⟩
 
 /-- **Closed non-vacuity canary for `tbm_deallocate_full_spec` &
 `evalIntrinsicM_tb_deallocate_post_state`** (zero hypotheses):
@@ -24691,16 +24648,46 @@ info: 'MiniRustSpec.NoWritableAndStaticRetag.canary_retag_alignment_and_deref_bo
 #print axioms MiniRustSpec.NoWritableAndStaticRetag.canary_retag_alignment_and_deref_boundary
 
 /--
-info: 'MiniRustSpec.NoWritableAndStaticRetag.endCallLockstepSim_end_call' depends on axioms: [propext]
+info: 'MiniRustSpec.NoWritableAndStaticRetag.endCallLockstepSim_end_call' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.NoWritableAndStaticRetag.endCallLockstepSim_end_call
+
+/--
+info: 'MiniRustSpec.NoWritableAndStaticRetag.endCallLockstepSim_singleton_iff_end_call' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.NoWritableAndStaticRetag.endCallLockstepSim_singleton_iff_end_call
+
+/--
+info: 'MiniRustSpec.NoWritableAndStaticRetag.endCallLockstepSim_end_call_converse_false_and_order_sensitive' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.NoWritableAndStaticRetag.endCallLockstepSim_end_call_converse_false_and_order_sensitive
 
 /--
 info: 'MiniRustSpec.NoWritableAndStaticRetag.tbm_retag_ptr_zst_safe_skips_dereferenceable' depends on axioms: [propext, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.NoWritableAndStaticRetag.tbm_retag_ptr_zst_safe_skips_dereferenceable
+
+/--
+info: 'MiniRustSpec.NoWritableAndStaticRetag.checkPtrM_tb_safe_ok_iff' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.NoWritableAndStaticRetag.checkPtrM_tb_safe_ok_iff
+
+/--
+info: 'MiniRustSpec.NoWritableAndStaticRetag.tbm_retag_ptr_pointee_data_irrelevant' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.NoWritableAndStaticRetag.tbm_retag_ptr_pointee_data_irrelevant
+
+/--
+info: 'MiniRustSpec.NoWritableAndStaticRetag.evalStatementM_tb_validate_uninit_ptr_ub' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.NoWritableAndStaticRetag.evalStatementM_tb_validate_uninit_ptr_ub
 
 /--
 info: 'MiniRustSpec.NoWritableAndStaticRetag.canary_endCall_lockstep_iff_and_end_call_bridge' depends on axioms: [propext, Quot.sound]
@@ -24713,6 +24700,18 @@ info: 'MiniRustSpec.NoWritableAndStaticRetag.canary_retag_ptr_zst_dead_oob_and_s
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.NoWritableAndStaticRetag.canary_retag_ptr_zst_dead_oob_and_specPanic
+
+/--
+info: 'MiniRustSpec.NoWritableAndStaticRetag.canary_machTB_validate_zst_align_uninit_and_specPanic' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.NoWritableAndStaticRetag.canary_machTB_validate_zst_align_uninit_and_specPanic
+
+/--
+info: 'MiniRustSpec.NoWritableAndStaticRetag.trusted_and_machTB_static_mut_vs_freeze_and_unsafeCell' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms MiniRustSpec.NoWritableAndStaticRetag.trusted_and_machTB_static_mut_vs_freeze_and_unsafeCell
 
 end AxiomGuards
 
