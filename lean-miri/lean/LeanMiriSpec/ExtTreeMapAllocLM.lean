@@ -81,6 +81,17 @@ simulation relations (`StateRelLM3_1`, `StateRelLM3_2`, `annealResolvePtr`,
   `addressTooClose`, recursive `childSession` (`validatePlace`), field-before-
   inhabited `(bool, !)` / `(u32, !)`, zero `fn()`, surrogate `char`, `O(1)`
   ZST-array `[(); usize::MAX]`, fail-closed fuel, and 16-byte nested wide refs.
+* **Part 2D** — strengthenings across Parts 1C, 1E, and 2: `KeyedStateRelLM3_*` ↔
+  `StateRelLM3_*` equivalences and `StateRelLM3_1` / `StateRelLM3_2` invariance under ANY `live`
+  permutation and ANY `dead` array (no distinct-key hypothesis); the deallocation data-race stage
+  (`MachineHooks.memoryRaceAccess`) against `machineDeallocHook` as one relational theorem over
+  every branch, and the exact two-sided race-table effect of `AllocationMachine.deallocate`
+  (`detachRaceClock`); `MachineHooks.beforeStackPopWithEnsure` for ARBITRARILY many protectors as a pure
+  release fold, with a whole-frame simulation against `execFrameExitMiri` lifted from any
+  per-release simulation; state/choice-polymorphic vtable reads (`VTableReadsWorldAt`), every
+  invalid vtable form beating every data-pointer check through `ValidityVisitor.validatePlace` for
+  both `recursive = false` and `recursive = true`, and the exact fail-closed wide-pointer boundary
+  of `annealValidityHooks`.
 * **Part 3** — closed (hypothesis-free) non-vacuity canaries across all parts.
 * **Part 4** — exhaustive `#guard_msgs in #print axioms` pins for every public
   theorem.
@@ -678,7 +689,7 @@ theorem ptrRel_checkPtrAccess_isOk_eq_keyed {allocMap : List AllocMapEntry}
   exact ⟨e, he, htag, checkPtrAccess_isOk_eq_keyed target _ size msg _ kw _ hres⟩
 
 /-- `resolveWithBase` instantiated at `mach.lookupBaseAddr` IS `annealResolvePtr mach`
-definitionally (`rfl`), removing the A0 stand-in gap. -/
+definitionally (`rfl`), so no stand-in resolver remains. -/
 theorem resolveWithBase_eq_annealResolvePtr (mach : AnnealMachine) :
     resolveWithBase mach.lookupBaseAddr = annealResolvePtr mach := rfl
 
@@ -3580,7 +3591,7 @@ private theorem filter_tag_eq_singleton {nodes : List TreeTagNode}
 fuel gap)**: on any rooted, dense-tag borrow tree, vendored `TraversalTree.traverse` under
 `.VisitChildrenOfAccessed` with the `foreignNodeSkipsSubtree` skip list produces the EXACT local
 path events followed by the EXACT foreign events of the theory's `foreignVisitScheduleNodes`
-(eliminating A0's one-step fuel gap completely). -/
+(eliminating the one-step fuel gap completely). -/
 theorem miri_traverse_eq_foreignVisitScheduleNodes {w : FnEntryBorrowWorld} {rootTag : Nat}
     (hwf : BorrowTreeRootedWF w rootTag) (hdense : DenseTags w.nodes)
     {start : TreeTagNode} (hstart : start ∈ w.nodes)
@@ -7262,6 +7273,1561 @@ theorem visit_nested_wideSafeRef_childSession {S C E F A Pad : Type}
     ptrImm target size align sc intVal addr rfl rfl hcl hrd hpt (Or.inr hcmOk) hsa hfrom htry haddr
   exact ⟨hmd.1, fun hlt hnn hinh hal => ((((hmd.2 hlt).2 hnn).2 hinh).2 hal)⟩
 
+/-! ## Part 2D. Round-1 counter-audit strengthenings
+
+Strengthenings of Parts 1C, 1E, and 2: two-way and hypothesis-minimal `StateRelLM3_*` liftings,
+the frame pop for arbitrarily many protectors with a whole-frame simulation against
+`execFrameExitMiri`, and state/choice-polymorphic vtable reads through the `validatePlace` driver
+with the exact `annealValidityHooks` boundary. -/
+
+/-! ### 2D.1 `KeyedStateRelLM3_*` ↔ `StateRelLM3_*` and direct `live` / `dead` permutation invariance -/
+
+/-- **Two-way characterization (`KeyedStateRelLM3_1` ↔ `StateRelLM3_1`)**: `KeyedStateRelLM3_1` is
+EXACTLY `StateRelLM3_1` together with the functional equation `kw = annealMachineToKeyed m.machine`;
+the keyed lifting adds no invariant beyond `StateRelLM3_1`. -/
+theorem keyedStateRelLM3_1_iff {body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir}
+    {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry}
+    {kw : KeyedAllocWorld} :
+    KeyedStateRelLM3_1 body s m allocMap kw ↔
+      StateRelLM3_1 body s m allocMap ∧ kw = annealMachineToKeyed m.machine :=
+  ⟨fun h => ⟨h.stateRel, h.keyed_eq⟩, fun h => ⟨h.1, h.2⟩⟩
+
+/-- **Two-way characterization (`KeyedStateRelLM3_2` ↔ `StateRelLM3_2`)**. -/
+theorem keyedStateRelLM3_2_iff {body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir}
+    {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry}
+    {kw : KeyedAllocWorld} :
+    KeyedStateRelLM3_2 body s m allocMap kw ↔
+      StateRelLM3_2 body s m allocMap ∧ kw = annealMachineToKeyed m.machine :=
+  ⟨fun h => ⟨h.stateRel, h.keyed_eq⟩, fun h => ⟨h.1, h.2⟩⟩
+
+/-- `StateRelLM3_1` holds iff SOME keyed lifting exists, and the keyed world of a lifting is unique:
+`StateRelLM3_1` and `∃! kw, KeyedStateRelLM3_1 … kw` are interchangeable. -/
+theorem stateRelLM3_1_iff_existsUnique_keyed
+    {body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir}
+    {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry} :
+    StateRelLM3_1 body s m allocMap ↔
+      ∃ kw, KeyedStateRelLM3_1 body s m allocMap kw ∧
+        ∀ kw', KeyedStateRelLM3_1 body s m allocMap kw' → kw' = kw :=
+  ⟨fun h => ⟨annealMachineToKeyed m.machine, ⟨h, rfl⟩, fun _ h' => h'.keyed_eq⟩,
+   fun ⟨_, h, _⟩ => h.stateRel⟩
+
+/-- `StateRelLM3_2` holds iff SOME keyed lifting exists, and the keyed world of a lifting is unique. -/
+theorem stateRelLM3_2_iff_existsUnique_keyed
+    {body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir}
+    {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry} :
+    StateRelLM3_2 body s m allocMap ↔
+      ∃ kw, KeyedStateRelLM3_2 body s m allocMap kw ∧
+        ∀ kw', KeyedStateRelLM3_2 body s m allocMap kw' → kw' = kw :=
+  ⟨fun h => ⟨annealMachineToKeyed m.machine, ⟨h, rfl⟩, fun _ h' => h'.keyed_eq⟩,
+   fun ⟨_, h, _⟩ => h.stateRel⟩
+
+/-- First-match lookup of ONE key is permutation-invariant as soon as that key's rows agree on their
+payload — no global distinct-key (`Nodup`) hypothesis. -/
+private theorem list_find?_eq_of_perm_keyUnique {α : Type}
+    {xs ys : List (Miri.Memory.AllocId × α)} (hperm : xs.Perm ys) (id : Miri.Memory.AllocId)
+    (huniq : ∀ a₁ a₂, (id, a₁) ∈ xs → (id, a₂) ∈ xs → a₁ = a₂) :
+    xs.find? (fun row => row.1 == id) = ys.find? (fun row => row.1 == id) := by
+  cases hx : xs.find? (fun row => row.1 == id) with
+  | none =>
+    cases hy : ys.find? (fun row => row.1 == id) with
+    | none => rfl
+    | some r =>
+      have hm := hperm.symm.subset (List.mem_of_find?_eq_some hy)
+      have hp := List.find?_some hy
+      have hnone := List.find?_eq_none.mp hx r hm
+      exact absurd hp hnone
+  | some r =>
+    cases hy : ys.find? (fun row => row.1 == id) with
+    | none =>
+      have hm := hperm.subset (List.mem_of_find?_eq_some hx)
+      have hp := List.find?_some hx
+      exact absurd hp (List.find?_eq_none.mp hy r hm)
+    | some r' =>
+      have h1 : r.1 = id := eq_of_beq (by simpa using List.find?_some hx)
+      have h2 : r'.1 = id := eq_of_beq (by simpa using List.find?_some hy)
+      have hm1 := List.mem_of_find?_eq_some hx
+      have hm2 := hperm.symm.subset (List.mem_of_find?_eq_some hy)
+      obtain ⟨k, a⟩ := r
+      obtain ⟨k', a'⟩ := r'
+      simp only at h1 h2
+      subst h1; subst h2
+      rw [huniq a a' hm1 hm2]
+
+/-- `AllocMapRel` transports along ANY `live` permutation and ANY replacement of `dead`. -/
+private theorem allocMapRel_of_livePerm
+    {body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir} {s : MachineState}
+    {m : AnnealStepState} {allocMap : List AllocMapEntry}
+    (halloc : AllocMapRel body s m allocMap)
+    (live' : Array (Miri.Memory.AllocId ×
+      Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+        Miri.Memory.MiriMemoryKind))
+    (dead' : Array Miri.Memory.DeadAllocation)
+    (hlivePerm : m.machine.memory.live.toList.Perm live'.toList) :
+    AllocMapRel body s
+      { m with machine := { m.machine with memory :=
+        { m.machine.memory with live := live', dead := dead' } } } allocMap :=
+  { tags_nodup := halloc.tags_nodup
+    local_to_alloc_unique := halloc.local_to_alloc_unique
+    alloc_to_local_injective := halloc.alloc_to_local_injective
+    target_decl := halloc.target_decl
+    base_addr_valid := halloc.base_addr_valid
+    borrow_sync := halloc.borrow_sync
+    live_key_unique := fun e he la₁ la₂ h1 h2 =>
+      halloc.live_key_unique e he la₁ la₂ (hlivePerm.symm.subset h1) (hlivePerm.symm.subset h2)
+    local_alloc_sync := fun tf' hfrEq e he => by
+      have hsync := halloc.local_alloc_sync tf' hfrEq e he
+      have hfindEq : live'.find? (fun x => x.1 == e.allocId) =
+          m.machine.memory.live.find? (fun x => x.1 == e.allocId) := by
+        rw [← Array.find?_toList, ← Array.find?_toList]
+        exact (list_find?_eq_of_perm_keyUnique hlivePerm e.allocId
+          (halloc.live_key_unique e he)).symm
+      refine ⟨fun slot hslot hne => ?_, fun hdead => ?_⟩
+      · rcases hsync.1 slot hslot hne with ⟨hloc, hsc, hdecl⟩
+        refine ⟨hloc, hsc, fun decl hd => ?_⟩
+        rcases hdecl decl hd with ⟨la, hfind, hk, ha, hsh⟩
+        exact ⟨la, by rw [hfindEq]; exact hfind, hk, ha, hsh⟩
+      · rw [hfindEq]; exact hsync.2 hdead }
+
+/-- **Direct `StateRelLM3_1` invariance, with no distinct-key hypothesis**: `StateRelLM3_1` itself
+(not a keyed projection of it) is preserved by ANY permutation of `m.machine.memory.live` — even
+with duplicate keys, because `AllocMapRel.live_key_unique` already makes the first-match lookup of
+every mapped allocation order-independent — and by ANY replacement of `m.machine.memory.dead`
+(the relation never reads tombstones). The `Nodup` and `MemoryStateGlobalsDistinct` hypotheses of
+`keyedStateRelLM3_1_liveDead_perm_invariant` are needed only for the equality of the KEYED world
+(`annealMachineToKeyed_eq_of_liveDead_perm`, `liveDuplicateKey_perm_separation_canary`). -/
+theorem stateRelLM3_1_livePerm_deadAny
+    {body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir} {s : MachineState}
+    {m : AnnealStepState} {allocMap : List AllocMapEntry}
+    (h : StateRelLM3_1 body s m allocMap)
+    (live' : Array (Miri.Memory.AllocId ×
+      Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+        Miri.Memory.MiriMemoryKind))
+    (dead' : Array Miri.Memory.DeadAllocation)
+    (hlivePerm : m.machine.memory.live.toList.Perm live'.toList) :
+    StateRelLM3_1 body s
+      { m with machine := { m.machine with memory :=
+        { m.machine.memory with live := live', dead := dead' } } } allocMap := by
+  rcases h with ⟨tf, hframes, hrc, hrp, hfr, hac, hcs, hap, hcl, hbor, halloc, hdisj⟩
+  exact .mk tf hframes hrc hrp
+    (hfr.of_live_base (fun e he => hlivePerm.subset he) (fun _ _ _ => rfl))
+    hac hcs hap hcl hbor (allocMapRel_of_livePerm halloc live' dead' hlivePerm) hdisj
+
+/-- **Direct `StateRelLM3_2` invariance, with no distinct-key hypothesis**: `StateRelLM3_2` is
+preserved by ANY permutation of `m.machine.memory.live` and ANY replacement of
+`m.machine.memory.dead`. -/
+theorem stateRelLM3_2_livePerm_deadAny
+    {body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir} {s : MachineState}
+    {m : AnnealStepState} {allocMap : List AllocMapEntry}
+    (h : StateRelLM3_2 body s m allocMap)
+    (live' : Array (Miri.Memory.AllocId ×
+      Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+        Miri.Memory.MiriMemoryKind))
+    (dead' : Array Miri.Memory.DeadAllocation)
+    (hlivePerm : m.machine.memory.live.toList.Perm live'.toList) :
+    StateRelLM3_2 body s
+      { m with machine := { m.machine with memory :=
+        { m.machine.memory with live := live', dead := dead' } } } allocMap := by
+  rcases h with ⟨tf, hframes, hrc, hrp, hfr, hac, hcs, hap, hcl, hbor, halloc, hdisj⟩
+  exact .mk tf hframes hrc hrp
+    (hfr.of_live_base (fun e he => hlivePerm.subset he) (fun _ _ _ => rfl))
+    hac hcs hap hcl hbor (allocMapRel_of_livePerm halloc live' dead' hlivePerm) hdisj
+
+/-- Two-way form of `stateRelLM3_1_livePerm_deadAny`: `StateRelLM3_1` cannot distinguish a machine
+from the same machine with permuted `live` rows and arbitrary `dead` rows. -/
+theorem stateRelLM3_1_livePerm_deadAny_iff
+    {body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir} {s : MachineState}
+    {m : AnnealStepState} {allocMap : List AllocMapEntry}
+    (live' : Array (Miri.Memory.AllocId ×
+      Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+        Miri.Memory.MiriMemoryKind))
+    (dead' : Array Miri.Memory.DeadAllocation)
+    (hlivePerm : m.machine.memory.live.toList.Perm live'.toList) :
+    StateRelLM3_1 body s m allocMap ↔
+      StateRelLM3_1 body s
+        { m with machine := { m.machine with memory :=
+          { m.machine.memory with live := live', dead := dead' } } } allocMap := by
+  refine ⟨fun h => stateRelLM3_1_livePerm_deadAny h live' dead' hlivePerm, fun h => ?_⟩
+  have h' := stateRelLM3_1_livePerm_deadAny h m.machine.memory.live m.machine.memory.dead
+    hlivePerm.symm
+  exact h'
+
+/-- Two-way form of `stateRelLM3_2_livePerm_deadAny`. -/
+theorem stateRelLM3_2_livePerm_deadAny_iff
+    {body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir} {s : MachineState}
+    {m : AnnealStepState} {allocMap : List AllocMapEntry}
+    (live' : Array (Miri.Memory.AllocId ×
+      Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+        Miri.Memory.MiriMemoryKind))
+    (dead' : Array Miri.Memory.DeadAllocation)
+    (hlivePerm : m.machine.memory.live.toList.Perm live'.toList) :
+    StateRelLM3_2 body s m allocMap ↔
+      StateRelLM3_2 body s
+        { m with machine := { m.machine with memory :=
+          { m.machine.memory with live := live', dead := dead' } } } allocMap := by
+  refine ⟨fun h => stateRelLM3_2_livePerm_deadAny h live' dead' hlivePerm, fun h => ?_⟩
+  have h' := stateRelLM3_2_livePerm_deadAny h m.machine.memory.live m.machine.memory.dead
+    hlivePerm.symm
+  exact h'
+
+
+
+/-- The keyed world of an `AnnealMachine` is invariant under distinct-key `live` / `dead`
+permutations with NO distinctness assumption on the (unchanged) compiler-global table: the
+`MemoryStateGlobalsDistinct` hypothesis of `memoryState_toKeyed_eq_of_perm` is needed only when the
+global rows themselves are permuted. -/
+theorem annealMachineToKeyed_eq_of_liveDead_perm (mach : AnnealMachine)
+    (live' : Array (Miri.Memory.AllocId ×
+      Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+        Miri.Memory.MiriMemoryKind))
+    (dead' : Array Miri.Memory.DeadAllocation)
+    (hlivePerm : mach.memory.live.toList.Perm live'.toList)
+    (hliveNd : (mach.memory.live.toList.map Prod.fst).Nodup)
+    (hdeadPerm : mach.memory.dead.toList.Perm dead'.toList)
+    (hdeadNd : (mach.memory.dead.toList.map fun d => d.allocId).Nodup) :
+    annealMachineToKeyed
+        { mach with memory := { mach.memory with live := live', dead := dead' } } =
+      annealMachineToKeyed mach := by
+  have r1 := allocWorldRel_memoryState annealRowProjection mach.memory
+  have r2 := allocWorldRel_memoryState annealRowProjection
+    { mach.memory with live := live', dead := dead' }
+  apply KeyedAllocWorld.ext
+  · rfl
+  · rfl
+  · intro _; rfl
+  · intro _; rfl
+  · intro id
+    show (memoryStateToKeyed annealRowProjection
+        { mach.memory with live := live', dead := dead' }).findLive? id =
+      (memoryStateToKeyed annealRowProjection mach.memory).findLive? id
+    rw [← r2.live_rel, ← r1.live_rel]
+    refine (linearFind?_eq_of_perm (hlivePerm.map _) ?_ id).symm
+    show ((mach.memory.live.toList.map fun row =>
+        (ofMiriAllocId row.1, liveEntryOfMiri annealRowProjection row.2)).map Prod.fst).Nodup
+    rw [List.map_map]
+    exact nodup_map_ofMiri mach.memory.live.toList (fun row => row.1) hliveNd
+  · intro id
+    show (memoryStateToKeyed annealRowProjection
+        { mach.memory with live := live', dead := dead' }).findDead? id =
+      (memoryStateToKeyed annealRowProjection mach.memory).findDead? id
+    rw [← r2.dead_rel, ← r1.dead_rel]
+    refine (linearFind?_eq_of_perm (hdeadPerm.map _) ?_ id).symm
+    show ((mach.memory.dead.toList.map fun d =>
+        (ofMiriAllocId d.allocId, deadEntryOfMiri d)).map Prod.fst).Nodup
+    rw [List.map_map]
+    exact nodup_map_ofMiri mach.memory.dead.toList (fun d => d.allocId) hdeadNd
+  · intro _; rfl
+
+/-- **Two-way `KeyedStateRelLM3_1` live/dead permutation invariance**, strengthening
+`keyedStateRelLM3_1_liveDead_perm_invariant` to an equivalence and dropping its
+`MemoryStateGlobalsDistinct` hypothesis. -/
+theorem keyedStateRelLM3_1_liveDead_perm_iff
+    {body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir} {s : MachineState}
+    {m : AnnealStepState} {allocMap : List AllocMapEntry} {kw : KeyedAllocWorld}
+    (live' : Array (Miri.Memory.AllocId ×
+      Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+        Miri.Memory.MiriMemoryKind))
+    (dead' : Array Miri.Memory.DeadAllocation)
+    (hlivePerm : m.machine.memory.live.toList.Perm live'.toList)
+    (hliveNd : (m.machine.memory.live.toList.map Prod.fst).Nodup)
+    (hdeadPerm : m.machine.memory.dead.toList.Perm dead'.toList)
+    (hdeadNd : (m.machine.memory.dead.toList.map fun d => d.allocId).Nodup) :
+    KeyedStateRelLM3_1 body s m allocMap kw ↔
+      KeyedStateRelLM3_1 body s
+        { m with machine := { m.machine with memory :=
+          { m.machine.memory with live := live', dead := dead' } } } allocMap kw := by
+  have hkw := annealMachineToKeyed_eq_of_liveDead_perm m.machine live' dead' hlivePerm hliveNd
+    hdeadPerm hdeadNd
+  rw [keyedStateRelLM3_1_iff, keyedStateRelLM3_1_iff,
+    ← stateRelLM3_1_livePerm_deadAny_iff live' dead' hlivePerm]
+  constructor
+  · rintro ⟨h, rfl⟩; exact ⟨h, hkw.symm⟩
+  · rintro ⟨h, rfl⟩; exact ⟨h, hkw⟩
+
+/-- **Two-way `KeyedStateRelLM3_2` live/dead permutation invariance**, strengthening
+`keyedStateRelLM3_2_liveDead_perm_invariant` to an equivalence and dropping its
+`MemoryStateGlobalsDistinct` hypothesis. -/
+theorem keyedStateRelLM3_2_liveDead_perm_iff
+    {body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir} {s : MachineState}
+    {m : AnnealStepState} {allocMap : List AllocMapEntry} {kw : KeyedAllocWorld}
+    (live' : Array (Miri.Memory.AllocId ×
+      Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+        Miri.Memory.MiriMemoryKind))
+    (dead' : Array Miri.Memory.DeadAllocation)
+    (hlivePerm : m.machine.memory.live.toList.Perm live'.toList)
+    (hliveNd : (m.machine.memory.live.toList.map Prod.fst).Nodup)
+    (hdeadPerm : m.machine.memory.dead.toList.Perm dead'.toList)
+    (hdeadNd : (m.machine.memory.dead.toList.map fun d => d.allocId).Nodup) :
+    KeyedStateRelLM3_2 body s m allocMap kw ↔
+      KeyedStateRelLM3_2 body s
+        { m with machine := { m.machine with memory :=
+          { m.machine.memory with live := live', dead := dead' } } } allocMap kw := by
+  have hkw := annealMachineToKeyed_eq_of_liveDead_perm m.machine live' dead' hlivePerm hliveNd
+    hdeadPerm hdeadNd
+  rw [keyedStateRelLM3_2_iff, keyedStateRelLM3_2_iff,
+    ← stateRelLM3_2_livePerm_deadAny_iff live' dead' hlivePerm]
+  constructor
+  · rintro ⟨h, rfl⟩; exact ⟨h, hkw.symm⟩
+  · rintro ⟨h, rfl⟩; exact ⟨h, hkw⟩
+
+/-! ### 2D.2 Deallocation data-race stage (one relational theorem for every branch) and the exact
+race-table effect of `AllocationMachine.deallocate` -/
+
+local macro "miriRaceSize" : term =>
+  `(miri_etm_private% Miri.Interpreter.MachineHooks Miri.Interpreter.MachineHooks.raceSize)
+
+/-- The theory `RaceDetectorMode` of a vendored machine: `.unconfigured` iff `dataRace = none`,
+otherwise `.configured global.raceDetecting`. -/
+def raceModeOfMachine {K User : Type}
+    (machine : Miri.Interpreter.MachineHooks.MachineState K User) : RaceDetectorMode :=
+  match machine.dataRace with
+  | none => .unconfigured
+  | some global => .configured global.raceDetecting
+
+/-- Outcome correspondence of the deallocation data-race stage (`MachineHooks.memoryRaceAccess`
+with `some .Deallocate`) against `machineDeallocHook`: success, the missing-vector-clock failure,
+and the data-race undefined behavior correspond one-to-one; nothing else is related. -/
+inductive DeallocRaceStageRel :
+    Except Miri.Interpreter.StepError Unit → Except String Unit → Prop
+  | ok : DeallocRaceStageRel (.ok ()) (.ok ())
+  | missingClock :
+    DeallocRaceStageRel (.error (.invalidProgram "allocation missing vector-clock extra"))
+      (.error "MissingVectorClockExtra")
+  | dataRace : DeallocRaceStageRel (.error (.undefinedBehavior "DataRace")) (.error "DataRace")
+
+/-- **Deallocation data-race stage, every branch in ONE relational statement**
+(`MachineHooks.memoryRaceAccess … (some .Deallocate)` vs `machineDeallocHook`). The theory inputs
+are DERIVED from the vendored machine — the mode is `raceModeOfMachine machine` and the clock
+option `clk?` is present exactly when the vendored vector clock is — instead of being unrelated
+parameters. The outcomes then correspond (`DeallocRaceStageRel`) on all branches:
+* detector unconfigured — no-op;
+* configured but vector clock missing — `MissingVectorClockExtra`, reported BEFORE the
+  `raceDetecting` gate;
+* `raceDetecting = false` — no-op without reading clocks;
+* detecting, zero-sized range — never a race (`writeNonAtomic_zeroSize_ok`), whatever the clocks;
+* detecting, nonzero range — a race exactly when `hasDeallocDataRace` holds, given the vector-clock
+  abstraction hypothesis that `VClockAlloc.writeNonAtomic` reports `.race` iff
+  `hasDeallocDataRace actor clk` (multi-reader clocks and the unlisted-thread zero fallback of
+  `DeallocActor.ofVClock` enter only through this hypothesis;
+  `nonAtomicWriteDetect_dealloc_writer_race_iff` discharges its single-cell writer case). -/
+theorem memoryRaceAccess_dealloc_rel_machineDeallocHook {K User : Type}
+    (machine : Miri.Interpreter.MachineHooks.MachineState K User)
+    (id : Miri.Memory.AllocId) (size : Miri.ABI.Size)
+    (actor : DeallocActor) (clk? : Option RaceClockEntry)
+    (hclk : clk?.isSome = (machine.raceAllocations.find? fun entry => entry.1 == id).isSome)
+    (hactive : ∀ global, machine.dataRace = some global → global.raceDetecting = true →
+      ∃ index clocks, global.activeThreadState machine.threads = .ok (index, clocks) ∧
+        ∀ row clk, machine.raceAllocations.find? (fun entry => entry.1 == id) = some row →
+          clk? = some clk → size.bytes ≠ 0 →
+          (row.2.writeNonAtomic ⟨miriRaceSize Miri.ABI.Size.ZERO, miriRaceSize size⟩ clocks index
+            .Deallocate).result = if hasDeallocDataRace actor clk then .race else .ok) :
+    DeallocRaceStageRel
+      (Miri.Interpreter.MachineHooks.memoryRaceAccess machine id ⟨Miri.ABI.Size.ZERO, size⟩
+        (some .Deallocate) .Read).2
+      (machineDeallocHook (raceModeOfMachine machine) actor .ok clk? size.bytes) := by
+  unfold Miri.Interpreter.MachineHooks.memoryRaceAccess raceModeOfMachine
+  cases hdr : machine.dataRace with
+  | none =>
+    simp only [Id.run, pure, Pure.pure]
+    exact .ok
+  | some global =>
+    cases hf : machine.raceAllocations.find? (fun entry => entry.1 == id) with
+    | none =>
+      rw [hf] at hclk
+      cases clk? with
+      | some _ => cases hclk
+      | none =>
+        simp only [Id.run, pure, Pure.pure, bind, Bind.bind]
+        exact .missingClock
+    | some row =>
+      rw [hf] at hclk
+      cases clk? with
+      | none => cases hclk
+      | some clk =>
+        cases hdet : global.raceDetecting with
+        | false =>
+          simp only [hdet, Id.run, pure, Pure.pure, bind, Bind.bind, Bool.not_false, ↓reduceIte]
+          exact .ok
+        | true =>
+          obtain ⟨index, clocks, hact, hres⟩ := hactive global hdr hdet
+          simp only [hdet, hact, Id.run, pure, Pure.pure, bind, Bind.bind, Bool.not_true,
+            Bool.false_eq_true, ↓reduceIte]
+          by_cases hz : size.bytes = 0
+          · obtain ⟨b⟩ := size
+            simp only at hz
+            subst hz
+            have h0 : (row.2.writeNonAtomic
+                ⟨miriRaceSize Miri.ABI.Size.ZERO, miriRaceSize ⟨0⟩⟩ clocks index
+                .Deallocate).result = .ok :=
+              (writeNonAtomic_zeroSize_ok row.2 clocks index (miriRaceSize Miri.ABI.Size.ZERO)
+                (Nat.zero_le _) actor clk).1
+            rw [h0]
+            exact .ok
+          · rw [hres row clk hf rfl hz]
+            have hnz : (size.bytes != 0) = true := bne_iff_ne.mpr hz
+            cases hr : hasDeallocDataRace actor clk with
+            | true =>
+              simp only [machineDeallocHook, hnz, hr, Bool.and_self, ↓reduceIte]
+              exact .dataRace
+            | false =>
+              simp only [machineDeallocHook, hr, Bool.and_false, Bool.false_eq_true, ↓reduceIte]
+              exact .ok
+
+/-- **Exact race-table effect of `AllocationMachine.deallocate` on BOTH branches
+(`detachRaceClock`)**: after the vendored machine deallocation — whether it succeeds or throws —
+the vector-clock table is the hook-state table with the detached allocation's clock removed when
+`deallocatePtrWith` detached an allocation (success AND every post-removal failure), and is the
+hook-state table UNCHANGED when nothing was detached (every pre-removal failure). This is the
+two-sided content of `KeyedAllocWorld.detachRaceClock`, strengthening
+`allocationMachine_deallocate_detaches_race_on_postRemoval` from "the detached clock is absent" to
+the exact post-state table. -/
+theorem allocationMachine_deallocate_raceAllocations_eq {K User Payload : Type}
+    [DecidableEq K]
+    (h : Miri.Interpreter.AllocationMachine.DeallocationHooks K User Payload)
+    (ptr : Miri.Memory.Pointer (Option Miri.Memory.Provenance))
+    (oldLayout : Option (Miri.ABI.Size × Miri.ABI.Align))
+    (kind : Miri.Memory.MemoryKind K)
+    (st : Miri.Interpreter.MachineHooks.State K User)
+    (hnoNative : ∀ id entry,
+      (Miri.Memory.MemoryLifecycle.deallocatePtrWith st.machine.memory ⟨st.machine, none⟩
+          ptr oldLayout kind
+          { synchronizeMemory := fun memory access =>
+              { access with machine := { access.machine with memory } }
+            resolvePointer := h.resolvePointer
+            beforeDeallocation := miriAllocMachCallback h }).detached = some (id, entry) →
+      entry.allocation.nativeBuffer = none) :
+    let res := Miri.Memory.MemoryLifecycle.deallocatePtrWith st.machine.memory ⟨st.machine, none⟩
+      ptr oldLayout kind
+      { synchronizeMemory := fun memory access =>
+          { access with machine := { access.machine with memory } }
+        resolvePointer := h.resolvePointer
+        beforeDeallocation := miriAllocMachCallback h }
+    let st' :=
+      match Miri.Interpreter.AllocationMachine.deallocate h ptr oldLayout kind st with
+      | .ok _ s => s
+      | .error _ s => s
+    st'.machine.raceAllocations =
+      match res.detached with
+      | some (id, _) => res.hooks.machine.raceAllocations.filter fun e => e.1 != id
+      | none => res.hooks.machine.raceAllocations := by
+  dsimp only
+  unfold Miri.Interpreter.AllocationMachine.deallocate
+  simp only [get, getThe, MonadStateOf.get, EStateM.get, bind, Bind.bind, EStateM.bind,
+    modify, pure, Pure.pure, throw, throwThe, MonadExceptOf.throw]
+  generalize Miri.Memory.MemoryLifecycle.deallocatePtrWith st.machine.memory ⟨st.machine, none⟩
+      ptr oldLayout kind
+      { synchronizeMemory := fun memory access =>
+          { access with machine := { access.machine with memory } }
+        resolvePointer := h.resolvePointer
+        beforeDeallocation := miriAllocMachCallback h } = res at hnoNative ⊢
+  cases hd : res.detached with
+  | none =>
+    cases res.outcome <;> rfl
+  | some pair =>
+    obtain ⟨id, entry⟩ := pair
+    have hnn := hnoNative id entry hd
+    simp only [hnn, Option.isSome_none, Bool.false_eq_true, ↓reduceIte]
+    cases res.outcome <;> rfl
+
+/-! ### 2D.3 N-ary frame pop: `beforeStackPopWithEnsure` as a release fold, and whole-frame
+simulation against `execFrameExitMiri` -/
+
+
+/-- Classification of one `BorrowTree.releaseProtector` status inside
+`MachineHooks.beforeStackPopWithEnsure`: `some none` = released (the loop continues),
+`some (some err)` = an implicit protector-end access failed and the frame pop throws `err`
+(`borrowAccessError`), `none` = an internal release-invariant status outside the specified domain. -/
+def stackPopReleaseErr :
+    Miri.TreeBorrows.BorrowTree.ProtectorReleaseStatus → Option (Option Miri.Interpreter.StepError)
+  | .Released => some none
+  | .AccessFailure _ status => some (some (miriBorrowAccessError status))
+  | _ => none
+
+/-- Memory after writing one released protector's tree back into its live allocation row
+(`MemoryState.setLiveAllocation`). -/
+def stackPopWriteBack {K : Type}
+    (mem : Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K)
+    (id : Miri.Memory.AllocId)
+    (entry : Miri.Memory.LocalAllocation Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K)
+    (tree : Miri.TreeBorrows.BorrowTree) :
+    Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K :=
+  { mem with live := (mem.live.filter fun r => r.1 != id).push (id, { entry with allocation := entry.allocation.setExtra tree }) }
+
+/-- Machine state with its memory replaced (the only component the release loop mutates). -/
+def stackPopWithMemory {K User : Type} (s : Miri.Interpreter.MachineHooks.State K User)
+    (mem : Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K) :
+    Miri.Interpreter.MachineHooks.State K User :=
+  { s with machine := { s.machine with memory := mem } }
+
+/-- Pure fold specification of the vendored frame-pop protector-release loop
+(`MachineHooks.beforeStackPopWithEnsure`): every release runs against the SAME protector set `pt`;
+the first failing release aborts with its (already committed) tree mutation. `none` = outside the
+specified domain (a protected allocation that is not live, or an internal release-invariant
+status). -/
+def stackPopReleaseAll {K : Type} (pt : Miri.TreeBorrows.ProtectedTags) :
+    List (Miri.Memory.AllocId × Miri.Memory.BorTag) →
+    Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K →
+    Option (Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K ×
+      Option Miri.Interpreter.StepError)
+  | [], mem => some (mem, none)
+  | (id, tag) :: rest, mem =>
+    match mem.live.find? (fun e => e.1 == id) with
+    | none => none
+    | some row =>
+      let rel := row.2.allocation.extra.releaseProtector tag pt
+      let mem' := stackPopWriteBack mem id row.2 rel.tree
+      match stackPopReleaseErr rel.status with
+      | some none => stackPopReleaseAll pt rest mem'
+      | some (some err) => some (mem', some err)
+      | none => none
+
+private theorem stackPop_forIn_eq {K User : Type}
+    (tracker : Miri.Interpreter.MachineHooks.BorrowState)
+    (body : (Miri.Memory.AllocId × Miri.Memory.BorTag) → PUnit →
+      Miri.Interpreter.MachineHooks.M K User (ForInStep PUnit))
+    (hbodyOk : ∀ (id : Miri.Memory.AllocId) (tag : Miri.Memory.BorTag)
+        (s : Miri.Interpreter.MachineHooks.State K User)
+        (entry : Miri.Memory.LocalAllocation Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K),
+      s.machine.borrowTracker = some tracker →
+      s.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry) →
+      stackPopReleaseErr
+        (entry.allocation.extra.releaseProtector tag tracker.global.protectedTags).status =
+          some none →
+      body (id, tag) PUnit.unit s = .ok (.yield PUnit.unit)
+        (stackPopWithMemory s (stackPopWriteBack s.machine.memory id entry
+          (entry.allocation.extra.releaseProtector tag tracker.global.protectedTags).tree)))
+    (hbodyErr : ∀ (id : Miri.Memory.AllocId) (tag : Miri.Memory.BorTag)
+        (s : Miri.Interpreter.MachineHooks.State K User)
+        (entry : Miri.Memory.LocalAllocation Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K)
+        (err : Miri.Interpreter.StepError),
+      s.machine.borrowTracker = some tracker →
+      s.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry) →
+      stackPopReleaseErr
+        (entry.allocation.extra.releaseProtector tag tracker.global.protectedTags).status =
+          some (some err) →
+      body (id, tag) PUnit.unit s = .error err
+        (stackPopWithMemory s (stackPopWriteBack s.machine.memory id entry
+          (entry.allocation.extra.releaseProtector tag tracker.global.protectedTags).tree)))
+    (xs : List (Miri.Memory.AllocId × Miri.Memory.BorTag)) :
+    ∀ (s : Miri.Interpreter.MachineHooks.State K User)
+      (mem' : Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K)
+      (res : Option Miri.Interpreter.StepError),
+      s.machine.borrowTracker = some tracker →
+      stackPopReleaseAll tracker.global.protectedTags xs s.machine.memory = some (mem', res) →
+      forIn (m := Miri.Interpreter.MachineHooks.M K User) xs PUnit.unit body s =
+        match res with
+        | none => .ok PUnit.unit (stackPopWithMemory s mem')
+        | some err => .error err (stackPopWithMemory s mem') := by
+  induction xs with
+  | nil =>
+    intro s mem' res _ hall
+    simp only [stackPopReleaseAll, Option.some.injEq, Prod.mk.injEq] at hall
+    obtain ⟨rfl, rfl⟩ := hall
+    rfl
+  | cons x rest ih =>
+    intro s mem' res hs hall
+    obtain ⟨id, tag⟩ := x
+    simp only [stackPopReleaseAll] at hall
+    cases hfind : s.machine.memory.live.find? (fun e => e.1 == id) with
+    | none => rw [hfind] at hall; cases hall
+    | some row =>
+      rw [hfind] at hall
+      obtain ⟨rid, entry⟩ := row
+      have hrid : rid = id := by
+        have hp := Array.find?_some hfind
+        exact eq_of_beq (by simpa using hp)
+      subst hrid
+      simp only at hall
+      rw [List.forIn_cons]
+      cases hE : stackPopReleaseErr
+          (entry.allocation.extra.releaseProtector tag tracker.global.protectedTags).status with
+      | none => rw [hE] at hall; cases hall
+      | some r =>
+        rw [hE] at hall
+        cases r with
+        | none =>
+          simp only at hall
+          refine (est_bind_ok _ _ _ _ _ (hbodyOk rid tag s entry hs hfind hE)).trans ?_
+          exact ih _ mem' res hs hall
+        | some err =>
+          simp only [Option.some.injEq, Prod.mk.injEq] at hall
+          obtain ⟨rfl, rfl⟩ := hall
+          exact est_bind_err _ _ _ _ _ (hbodyErr rid tag s entry err hs hfind hE)
+
+
+
+private theorem stackPop_bind_forIn_eq {K User : Type}
+    (tracker : Miri.Interpreter.MachineHooks.BorrowState)
+    (body : (Miri.Memory.AllocId × Miri.Memory.BorTag) → PUnit →
+      Miri.Interpreter.MachineHooks.M K User (ForInStep PUnit))
+    (rest : PUnit → Miri.Interpreter.MachineHooks.M K User Unit)
+    (hbodyOk : ∀ (id : Miri.Memory.AllocId) (tag : Miri.Memory.BorTag)
+        (s : Miri.Interpreter.MachineHooks.State K User)
+        (entry : Miri.Memory.LocalAllocation Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K),
+      s.machine.borrowTracker = some tracker →
+      s.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry) →
+      stackPopReleaseErr
+        (entry.allocation.extra.releaseProtector tag tracker.global.protectedTags).status =
+          some none →
+      body (id, tag) PUnit.unit s = .ok (.yield PUnit.unit)
+        (stackPopWithMemory s (stackPopWriteBack s.machine.memory id entry
+          (entry.allocation.extra.releaseProtector tag tracker.global.protectedTags).tree)))
+    (hbodyErr : ∀ (id : Miri.Memory.AllocId) (tag : Miri.Memory.BorTag)
+        (s : Miri.Interpreter.MachineHooks.State K User)
+        (entry : Miri.Memory.LocalAllocation Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K)
+        (err : Miri.Interpreter.StepError),
+      s.machine.borrowTracker = some tracker →
+      s.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry) →
+      stackPopReleaseErr
+        (entry.allocation.extra.releaseProtector tag tracker.global.protectedTags).status =
+          some (some err) →
+      body (id, tag) PUnit.unit s = .error err
+        (stackPopWithMemory s (stackPopWriteBack s.machine.memory id entry
+          (entry.allocation.extra.releaseProtector tag tracker.global.protectedTags).tree)))
+    (xs : List (Miri.Memory.AllocId × Miri.Memory.BorTag))
+    (s : Miri.Interpreter.MachineHooks.State K User)
+    (mem' : Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K)
+    (res : Option Miri.Interpreter.StepError)
+    (hs : s.machine.borrowTracker = some tracker)
+    (hall : stackPopReleaseAll tracker.global.protectedTags xs s.machine.memory =
+      some (mem', res)) :
+    (forIn (m := Miri.Interpreter.MachineHooks.M K User) xs PUnit.unit body >>= rest) s =
+      match res with
+      | none => rest PUnit.unit (stackPopWithMemory s mem')
+      | some err => .error err (stackPopWithMemory s mem') := by
+  have h := stackPop_forIn_eq tracker body hbodyOk hbodyErr xs s mem' res hs hall
+  cases res with
+  | none => exact est_bind_ok _ _ _ _ _ h
+  | some err => exact est_bind_err _ _ _ _ _ h
+
+/-- **N-ary frame pop: `MachineHooks.beforeStackPopWithEnsure` IS the release fold**, for a frame
+with ARBITRARILY many protectors (generalizing the two-protector
+`miri_beforeStackPopWithEnsure_retains_protectors_until_endCall`). Whenever the pure fold
+`stackPopReleaseAll` is defined on the frame's protector list:
+* every release in the frame runs against the SAME `tracker.global.protectedTags` — no protector is
+  popped between releases (pinned-Miri batch order, `execFrameExitMiri`);
+* the first failing release aborts the pop with its error, commits the partial tree mutations into
+  `memory`, and leaves `borrowTracker` untouched (`end_call` never runs);
+* `GlobalState.endCall` runs exactly once, only after ALL releases succeeded. -/
+theorem miri_beforeStackPopWithEnsure_eq_releaseAll
+    {K User : Type} [DecidableEq K]
+    (st : Miri.Interpreter.MachineHooks.State K User)
+    (tracker : Miri.Interpreter.MachineHooks.BorrowState)
+    (frame : Miri.Interpreter.Frame Miri.Memory.Provenance Miri.Interpreter.LocalLayout
+      Miri.Interpreter.MachineHooks.FrameExtra)
+    (prots : Array (Miri.Memory.AllocId × Miri.Memory.BorTag))
+    (htracker : st.machine.borrowTracker = some tracker)
+    (hframe : st.stack.currentFrame? = some frame)
+    (hbf : frame.extra.borrowTracker = some ⟨prots⟩) :
+    ∀ (mem' : Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K)
+      (res : Option Miri.Interpreter.StepError),
+      stackPopReleaseAll tracker.global.protectedTags prots.toList st.machine.memory =
+        some (mem', res) →
+      Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ()) st =
+        match res with
+        | none => .ok () { st with machine := { st.machine with
+            memory := mem'
+            borrowTracker := some { tracker with global := tracker.global.endCall ⟨prots⟩ } } }
+        | some err => .error err (stackPopWithMemory st mem') := by
+  intro mem' res hall
+  have hcur : Miri.Interpreter.MachineHooks.currentFrame st = .ok frame st := by
+    unfold Miri.Interpreter.MachineHooks.currentFrame
+    refine (est_bind_ok (get : Miri.Interpreter.MachineHooks.M K User _) _ st st st rfl).trans ?_
+    rw [hframe]; rfl
+  unfold Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure
+  refine (est_bind_ok (get : Miri.Interpreter.MachineHooks.M K User _) _ st st st rfl).trans ?_
+  rw [htracker]
+  simp only [Option.isSome_some, ↓reduceIte]
+  refine (est_bind_ok _ _ _ _ _ hcur).trans ?_
+  rw [hbf]
+  dsimp only
+  refine (est_bind_ok _ _ st st _ rfl).trans ?_
+  rw [← Array.forIn_toList]
+  refine (stackPop_bind_forIn_eq tracker _ _ ?_ ?_ prots.toList st mem' res htracker hall).trans ?_
+  · intro id tag s entry hs hfind hE
+    have hinfo : s.machine.memory.getAllocInfo id =
+        .ok ⟨entry.allocation.byteSize, entry.allocation.align, .liveData,
+             entry.allocation.mutability⟩ := by
+      unfold Miri.Memory.MemoryState.getAllocInfo
+      simp [hfind, pure, Except.pure]
+    have hset := Miri.Memory.MemoryState.setLiveAllocation_of_find s.machine.memory id entry
+      (entry.allocation.setExtra
+        (entry.allocation.extra.releaseProtector tag tracker.global.protectedTags).tree) hfind
+    have hstatus : (entry.allocation.extra.releaseProtector tag
+        tracker.global.protectedTags).status = .Released := by
+      cases hst : (entry.allocation.extra.releaseProtector tag
+          tracker.global.protectedTags).status <;>
+        simp [stackPopReleaseErr, hst] at hE
+      rfl
+    simp only [stackPopWithMemory, stackPopWriteBack, hs, hinfo, hfind, hset, hstatus,
+      beq_self_eq_true, ↓reduceIte,
+      get, getThe, MonadStateOf.get, EStateM.get,
+      modify, modifyGet, MonadStateOf.modifyGet, EStateM.modifyGet,
+      bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure]
+  · intro id tag s entry err hs hfind hE
+    have hinfo : s.machine.memory.getAllocInfo id =
+        .ok ⟨entry.allocation.byteSize, entry.allocation.align, .liveData,
+             entry.allocation.mutability⟩ := by
+      unfold Miri.Memory.MemoryState.getAllocInfo
+      simp [hfind, pure, Except.pure]
+    have hset := Miri.Memory.MemoryState.setLiveAllocation_of_find s.machine.memory id entry
+      (entry.allocation.setExtra
+        (entry.allocation.extra.releaseProtector tag tracker.global.protectedTags).tree) hfind
+    cases hst : (entry.allocation.extra.releaseProtector tag
+        tracker.global.protectedTags).status with
+    | AccessFailure r status =>
+      rw [hst] at hE
+      simp only [stackPopReleaseErr, Option.some.injEq] at hE
+      subst hE
+      simp only [stackPopWithMemory, stackPopWriteBack, hs, hinfo, hfind, hset, hst,
+        beq_self_eq_true, ↓reduceIte,
+        get, getThe, MonadStateOf.get, EStateM.get,
+        modify, modifyGet, MonadStateOf.modifyGet, EStateM.modifyGet,
+        bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure,
+        throw, throwThe, MonadExceptOf.throw, EStateM.throw]
+    | Released => rw [hst] at hE; simp [stackPopReleaseErr] at hE
+    | MissingTag _ => rw [hst] at hE; simp [stackPopReleaseErr] at hE
+    | RangeMapFailure _ => rw [hst] at hE; simp [stackPopReleaseErr] at hE
+    | LocationMapFailure _ => rw [hst] at hE; simp [stackPopReleaseErr] at hE
+    | ExposureUpdateFailure _ => rw [hst] at hE; simp [stackPopReleaseErr] at hE
+  · cases res with
+    | some err => rfl
+    | none =>
+      simp only [stackPopWithMemory, htracker,
+        get, getThe, MonadStateOf.get, EStateM.get, set, MonadStateOf.set, EStateM.set,
+        bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure]
+
+
+
+private theorem find?_filter_push_self {α : Type} (xs : Array (Miri.Memory.AllocId × α))
+    (id : Miri.Memory.AllocId) (v : α) :
+    ((xs.filter fun r => r.1 != id).push (id, v)).find? (fun e => e.1 == id) = some (id, v) := by
+  rw [← Array.find?_toList, Array.toList_push, List.find?_append, Array.toList_filter]
+  have hnone : (xs.toList.filter fun r => r.1 != id).find? (fun e => e.1 == id) = none := by
+    rw [List.find?_eq_none]
+    intro x hx
+    have hne := (List.mem_filter.mp hx).2
+    simpa [bne] using hne
+  rw [hnone]
+  simp
+
+/-- **Per-release simulation interface** between a vendored `BorrowTree` and a theory
+`FnEntryBorrowWorld`: `R` is a protector-release simulation for the protector set `pt` on the tags
+selected by `frameTag` when every vendored `BorrowTree.releaseProtector` step from `R`-related
+states is matched by the theory's implicit protector-end access
+(`execProtectorEndAccessFor protectorEndAccessIsWrite?`): both succeed into `R`-related states, or
+both fail. -/
+structure ProtectorReleaseSim (pt : Miri.TreeBorrows.ProtectedTags)
+    (frameTag : Miri.Memory.BorTag → Prop) (tagOf : Miri.Memory.BorTag → Nat)
+    (R : Miri.TreeBorrows.BorrowTree → FnEntryBorrowWorld → Prop) : Prop where
+  step : ∀ tree w tag, frameTag tag → R tree w →
+    match stackPopReleaseErr (tree.releaseProtector tag pt).status,
+        execProtectorEndAccessFor protectorEndAccessIsWrite? w (tagOf tag) with
+    | some none, .ok w' => R (tree.releaseProtector tag pt).tree w'
+    | some (some _), .error _ => True
+    | _, _ => False
+
+/-- **Fold lifting**: a per-release simulation lifts to the whole multi-tag release fold of one
+allocation, for ANY number of frame tags: `stackPopReleaseAll` and the theory's
+`execProtectorEndAccesses` (no protector popped in between) either both succeed with `R`-related
+final trees/worlds, or both fail. -/
+theorem stackPopReleaseAll_simulates_execProtectorEndAccesses {K : Type}
+    (pt : Miri.TreeBorrows.ProtectedTags)
+    (frameTag : Miri.Memory.BorTag → Prop) (tagOf : Miri.Memory.BorTag → Nat)
+    (R : Miri.TreeBorrows.BorrowTree → FnEntryBorrowWorld → Prop)
+    (hsim : ProtectorReleaseSim pt frameTag tagOf R)
+    (id : Miri.Memory.AllocId) (tags : List Miri.Memory.BorTag)
+    (htags : ∀ t ∈ tags, frameTag t) :
+    ∀ (mem : Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K)
+      (entry : Miri.Memory.LocalAllocation Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K)
+      (w : FnEntryBorrowWorld),
+      mem.live.find? (fun e => e.1 == id) = some (id, entry) →
+      R entry.allocation.extra w →
+      ∃ mem' res, stackPopReleaseAll pt (tags.map fun t => (id, t)) mem = some (mem', res) ∧
+        match res, execProtectorEndAccesses protectorEndAccessIsWrite? w (tags.map tagOf) with
+        | none, .ok w' =>
+          ∃ entry', mem'.live.find? (fun e => e.1 == id) = some (id, entry') ∧
+            R entry'.allocation.extra w'
+        | some _, .error _ => True
+        | _, _ => False := by
+  induction tags with
+  | nil =>
+    intro mem entry w hfind hR
+    exact ⟨mem, none, rfl, entry, hfind, hR⟩
+  | cons t rest ih =>
+    intro mem entry w hfind hR
+    have hstep := hsim.step entry.allocation.extra w t (htags t List.mem_cons_self) hR
+    have hunf : stackPopReleaseAll pt (((t :: rest).map fun t => (id, t))) mem =
+        match stackPopReleaseErr (entry.allocation.extra.releaseProtector t pt).status with
+        | some none => stackPopReleaseAll pt (rest.map fun t => (id, t))
+            (stackPopWriteBack mem id entry (entry.allocation.extra.releaseProtector t pt).tree)
+        | some (some err) => some (stackPopWriteBack mem id entry
+            (entry.allocation.extra.releaseProtector t pt).tree, some err)
+        | none => none := by
+      simp only [List.map_cons, stackPopReleaseAll, hfind]
+    have hexec : execProtectorEndAccesses protectorEndAccessIsWrite? w ((t :: rest).map tagOf) =
+        match execProtectorEndAccessFor protectorEndAccessIsWrite? w (tagOf t) with
+        | .error e => .error e
+        | .ok w' => execProtectorEndAccesses protectorEndAccessIsWrite? w' (rest.map tagOf) := by
+      simp only [List.map_cons, execProtectorEndAccesses]
+      cases execProtectorEndAccessFor protectorEndAccessIsWrite? w (tagOf t) <;> rfl
+    rw [hunf, hexec]
+    generalize entry.allocation.extra.releaseProtector t pt = rel at hstep ⊢
+    cases hE : stackPopReleaseErr rel.status with
+    | none =>
+      rw [hE] at hstep
+      cases hX : execProtectorEndAccessFor protectorEndAccessIsWrite? w (tagOf t) with
+      | error e => rw [hX] at hstep; exact False.elim hstep
+      | ok w1 => rw [hX] at hstep; exact False.elim hstep
+    | some r =>
+      rw [hE] at hstep
+      cases r with
+      | none =>
+        cases hX : execProtectorEndAccessFor protectorEndAccessIsWrite? w (tagOf t) with
+        | error e => rw [hX] at hstep; exact False.elim hstep
+        | ok w1 =>
+          rw [hX] at hstep
+          exact ih (fun t' ht' => htags t' (List.mem_cons_of_mem _ ht')) _ _ w1
+            (find?_filter_push_self mem.live id _) hstep
+      | some err =>
+        cases hX : execProtectorEndAccessFor protectorEndAccessIsWrite? w (tagOf t) with
+        | error e => exact ⟨_, _, rfl, trivial⟩
+        | ok w1 => rw [hX] at hstep; exact False.elim hstep
+
+
+
+/-- **Whole-frame relational simulation (`beforeStackPopWithEnsure` vs `execFrameExitMiri`)**: for
+a frame protecting ANY number of tags of one live allocation, every per-release simulation `R`
+(`ProtectorReleaseSim`) lifts to the complete vendored frame pop:
+* both sides succeed — the final vendored tree is `R`-related to the theory world reached by all
+  implicit accesses, the theory then pops every protector (`releaseProtectors`), and the vendored
+  machine runs `end_call` exactly once; or
+* both sides fail — and the vendored protector set is still the ORIGINAL one (no protector was
+  popped before the failure).
+Mixed outcomes are impossible. -/
+theorem miri_beforeStackPopWithEnsure_simulates_execFrameExitMiri
+    {K User : Type} [DecidableEq K]
+    (st : Miri.Interpreter.MachineHooks.State K User)
+    (tracker : Miri.Interpreter.MachineHooks.BorrowState)
+    (frame : Miri.Interpreter.Frame Miri.Memory.Provenance Miri.Interpreter.LocalLayout
+      Miri.Interpreter.MachineHooks.FrameExtra)
+    (id : Miri.Memory.AllocId) (tags : List Miri.Memory.BorTag)
+    (htracker : st.machine.borrowTracker = some tracker)
+    (hframe : st.stack.currentFrame? = some frame)
+    (hbf : frame.extra.borrowTracker = some ⟨(tags.map fun t => (id, t)).toArray⟩)
+    (frameTag : Miri.Memory.BorTag → Prop) (tagOf protOf : Miri.Memory.BorTag → Nat)
+    (R : Miri.TreeBorrows.BorrowTree → FnEntryBorrowWorld → Prop)
+    (hsim : ProtectorReleaseSim tracker.global.protectedTags frameTag tagOf R)
+    (htags : ∀ t ∈ tags, frameTag t)
+    (entry : Miri.Memory.LocalAllocation Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K)
+    (hlive : st.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry))
+    (w : FnEntryBorrowWorld) (hR : R entry.allocation.extra w) :
+    match Miri.Interpreter.MachineHooks.beforeStackPopWithEnsure (fun _ => pure ()) st,
+        execFrameExitMiri w (tags.map fun t => (tagOf t, protOf t)) with
+    | .ok () st', .ok w' =>
+      st'.machine.borrowTracker = some { tracker with
+        global := tracker.global.endCall ⟨(tags.map fun t => (id, t)).toArray⟩ } ∧
+      ∃ entry' w'', st'.machine.memory.live.find? (fun e => e.1 == id) = some (id, entry') ∧
+        R entry'.allocation.extra w'' ∧ w' = releaseProtectors w'' (tags.map protOf)
+    | .error _ st', .error _ => st'.machine.borrowTracker = some tracker
+    | _, _ => False := by
+  obtain ⟨mem', res, hall, hmatch⟩ :=
+    stackPopReleaseAll_simulates_execProtectorEndAccesses (K := K) tracker.global.protectedTags
+      frameTag tagOf R hsim id tags htags st.machine.memory entry w hlive hR
+  have hrun := miri_beforeStackPopWithEnsure_eq_releaseAll st tracker frame
+    (tags.map fun t => (id, t)).toArray htracker hframe hbf mem' res hall
+  have hexit : execFrameExitMiri w (tags.map fun t => (tagOf t, protOf t)) =
+      match execProtectorEndAccesses protectorEndAccessIsWrite? w (tags.map tagOf) with
+      | .error e => .error e
+      | .ok w' => .ok (releaseProtectors w' (tags.map protOf)) := by
+    unfold execFrameExitMiri
+    rw [List.map_map, List.map_map]
+    rfl
+  rw [hrun, hexit]
+  cases res with
+  | none =>
+    cases hX : execProtectorEndAccesses protectorEndAccessIsWrite? w (tags.map tagOf) with
+    | error e => rw [hX] at hmatch; exact False.elim hmatch
+    | ok w1 =>
+      rw [hX] at hmatch
+      obtain ⟨entry', hfind', hR'⟩ := hmatch
+      exact ⟨rfl, entry', w1, hfind', hR', rfl⟩
+  | some err =>
+    cases hX : execProtectorEndAccesses protectorEndAccessIsWrite? w (tags.map tagOf) with
+    | error e => exact htracker
+    | ok w1 => rw [hX] at hmatch; exact False.elim hmatch
+
+/-- The **no-implicit-access** simulation relation: every frame tag is present and unexposed in the
+vendored tree with no accessed non-`Cell` location, and its theory node has no protector-end access
+(`protectorEndAccessIsWrite? = none`). -/
+def NoAccessReleaseRel (frameTag : Miri.Memory.BorTag → Prop) (tagOf : Miri.Memory.BorTag → Nat)
+    (tree : Miri.TreeBorrows.BorrowTree) (w : FnEntryBorrowWorld) : Prop :=
+  ∀ tag, frameTag tag →
+    (∃ index node, tree.indexOfTag tag = some index ∧ tree.nodeAt index = some node ∧
+      node.isExposed = false ∧
+      ∀ pos (hvalid : pos < tree.locations.entries.size),
+        match tree.locations.entries[pos].data.perms.get index with
+        | none => True
+        | some st => st.accessed = false ∨ st.permission.associatedAccess = none) ∧
+    (∃ n, findNode? w.nodes (tagOf tag) = some n ∧ protectorEndAccessIsWrite? n = none)
+
+/-- **A discharged simulation instance**: `NoAccessReleaseRel` IS a protector-release simulation
+for every protector set (`miri_releaseProtector_noAccess_preserves_tree` on the vendored side,
+`execProtectorEndAccessFor … = .ok w` on the theory side). Hence
+`miri_beforeStackPopWithEnsure_simulates_execFrameExitMiri` applies unconditionally to every frame
+whose protected tags were never accessed (or are `Cell`). -/
+theorem noAccessReleaseSim (pt : Miri.TreeBorrows.ProtectedTags)
+    (frameTag : Miri.Memory.BorTag → Prop) (tagOf : Miri.Memory.BorTag → Nat) :
+    ProtectorReleaseSim pt frameTag tagOf (NoAccessReleaseRel frameTag tagOf) where
+  step := by
+    intro tree w tag ht hR
+    obtain ⟨⟨index, node, hidx, hnode, hexp, hno⟩, n, hfn, hk⟩ := hR tag ht
+    have hrel := miri_releaseProtector_noAccess_preserves_tree tree tag index node hidx hnode hexp
+      hno pt
+    have hexec : execProtectorEndAccessFor protectorEndAccessIsWrite? w (tagOf tag) = .ok w := by
+      unfold execProtectorEndAccessFor
+      rw [hfn]
+      simp only [hk]
+    rw [hrel, hexec]
+    exact hR
+
+
+
+/-- Single-protector frames: the release fold is exactly one classified release step. -/
+theorem stackPopReleaseAll_singleton {K : Type} (pt : Miri.TreeBorrows.ProtectedTags)
+    (id : Miri.Memory.AllocId) (tag : Miri.Memory.BorTag)
+    (mem : Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K)
+    (entry : Miri.Memory.LocalAllocation Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree K)
+    (hfind : mem.live.find? (fun e => e.1 == id) = some (id, entry)) :
+    stackPopReleaseAll pt [(id, tag)] mem =
+      match stackPopReleaseErr (entry.allocation.extra.releaseProtector tag pt).status with
+      | some none => some (stackPopWriteBack mem id entry
+          (entry.allocation.extra.releaseProtector tag pt).tree, none)
+      | some (some err) => some (stackPopWriteBack mem id entry
+          (entry.allocation.extra.releaseProtector tag pt).tree, some err)
+      | none => none := by
+  simp only [stackPopReleaseAll, hfind]
+
+/-! ### 2D.4 State- and choice-polymorphic vtable reads, invalid-vtable precedence through the
+`validatePlace` driver, and the `annealValidityHooks` wide-pointer boundary -/
+
+/-- World-backed `globalVTable` leaf: the `(concrete type, existential)` pair of a registered
+`.vtable` global, `none` for every other allocation (dead, live local, non-vtable global, or a
+`.vtable` global without registry metadata). -/
+def worldGlobalVTable (w : KeyedAllocWorld) (reg : VTableRegistry)
+    (dynCode : DynExistentialSpec → Nat) (id : Miri.Memory.AllocId) :
+    Option (Miri.MIR.TyId × Nat) :=
+  match w.findGlobal? (ofMiriAllocId id) with
+  | some g =>
+    if g.kind == .vtable then
+      match reg.allocToData.get? (ofMiriAllocId id) with
+      | some data => some (data.concreteTyCode, dynCode data.spec)
+      | none => none
+    else none
+  | none => none
+
+/-- **State/choice-polymorphic world reading**: the four vtable read leaves of `h` — for ANY state
+type `S` and choice type `C` — answer at `(c, st)` exactly as the world `(w, reg)` does and leave
+the state unchanged. `worldVTableReadHooks` (`Unit` state) and `worldVTableHooks` (any state)
+satisfy it; `annealValidityHooks` does not (`annealValidityHooks_not_readsWorld`). -/
+structure VTableReadsWorldAt {P S C : Type} (h : Miri.Interpreter.VTableReadHooks P S C)
+    (c : C) (st : S) (w : KeyedAllocWorld) (reg : VTableRegistry)
+    (resolve : Miri.Memory.Pointer (Option P) →
+      Except Miri.Interpreter.VTablePointerError (Miri.Memory.AllocId × Miri.ABI.Size))
+    (dynTable : Nat → DynExistentialSpec) (dynCode : DynExistentialSpec → Nat) : Prop where
+  resolvePointer : ∀ ptr, h.resolvePointer c ptr st = .ok (resolve ptr) st
+  globalVTable : ∀ id, h.globalVTable c id st = .ok (worldGlobalVTable w reg dynCode id) st
+  predicates : ∀ n, h.predicates c n st = .ok (specPredicates (dynTable n)) st
+  normalizePredicate : ∀ p, h.normalizePredicate c p st = .ok p.id st
+
+/-- The `Unit`-state hooks `worldVTableReadHooks` read the world. -/
+theorem worldVTableReadHooks_readsWorldAt (P : Type)
+    (w : KeyedAllocWorld) (reg : VTableRegistry)
+    (resolve : Miri.Memory.Pointer (Option P) →
+      Except Miri.Interpreter.VTablePointerError (Miri.Memory.AllocId × Miri.ABI.Size))
+    (dynTable : Nat → DynExistentialSpec) (dynCode : DynExistentialSpec → Nat)
+    (layoutOfTy : Miri.MIR.TyId →
+      Miri.Interpreter.RvalueM Unit (Miri.ABI.TyAndLayout Miri.MIR.TyId)) :
+    VTableReadsWorldAt (worldVTableReadHooks P w reg resolve dynTable dynCode layoutOfTy) () ()
+      w reg resolve dynTable dynCode where
+  resolvePointer := fun _ => rfl
+  globalVTable := fun id => by
+    unfold worldVTableReadHooks worldGlobalVTable
+    dsimp only
+    cases w.findGlobal? (ofMiriAllocId id) with
+    | none => rfl
+    | some g =>
+      cases hkind : (g.kind == .vtable) with
+      | false => simp only [hkind, Bool.false_eq_true, ↓reduceIte]; rfl
+      | true =>
+        simp only [hkind, ↓reduceIte]
+        cases reg.allocToData.get? (ofMiriAllocId id) <;> rfl
+  predicates := fun _ => rfl
+  normalizePredicate := fun _ => rfl
+
+private theorem checkForTypeRead_zip_loop_eq_at {S : Type} (st : S)
+    (step : Miri.Interpreter.VTablePredicate × Miri.Interpreter.VTablePredicate → Unit →
+      Miri.Interpreter.RvalueM S (ForInStep Unit))
+    (hstep : ∀ p u, step p u st =
+      if p.1.id != p.2.id then .error (.undefinedBehavior "InvalidVTableTrait") st
+      else .ok (.yield ()) st)
+    (xs ys : List Miri.Interpreter.VTablePredicate) (hlen : xs.length = ys.length) :
+    (forIn (m := Miri.Interpreter.RvalueM S) (xs.zip ys) () step) st =
+      if xs.map (·.id) == ys.map (·.id) then .ok () st
+      else .error (.undefinedBehavior "InvalidVTableTrait") st := by
+  induction xs generalizing ys with
+  | nil =>
+    cases ys with
+    | nil => rfl
+    | cons _ _ => cases hlen
+  | cons x xt ih =>
+    cases ys with
+    | nil => cases hlen
+    | cons y yt =>
+      have hlen' : xt.length = yt.length := Nat.succ.inj hlen
+      simp only [List.zip_cons_cons, List.forIn_cons, List.map_cons]
+      have hs := hstep (x, y) ()
+      by_cases hid : x.id = y.id
+      · have hbne : (x.id != y.id) = false := by simp [hid]
+        have hbeq : (x.id :: xt.map (·.id) == y.id :: yt.map (·.id)) =
+            (xt.map (·.id) == yt.map (·.id)) := by simp [hid]
+        rw [hbne] at hs
+        simp only [Bool.false_eq_true, ↓reduceIte] at hs
+        rw [hbeq]
+        refine (est_bind_ok _ _ _ _ _ hs).trans ?_
+        exact ih yt hlen'
+      · have hbne : (x.id != y.id) = true := bne_iff_ne.mpr hid
+        have hbeq : (x.id :: xt.map (·.id) == y.id :: yt.map (·.id)) = false := by
+          apply beq_false_of_ne
+          intro hEq; exact hid (List.cons.inj hEq).1
+        rw [hbne] at hs
+        simp only [↓reduceIte] at hs
+        rw [hbeq]
+        simp only [Bool.false_eq_true, ↓reduceIte]
+        exact est_bind_err _ _ _ _ _ hs
+
+/-- **State/choice-polymorphic `VTable.checkForTypeRead` correspondence**: generalizes
+`miri_checkForTypeRead_eq_vtableMatchesExpectedSpec` from the concrete `Unit`-state
+`specReadHooks` to ANY hooks (any state and choice types) whose `predicates` / `normalizePredicate`
+leaves read the specification table at the current state. -/
+theorem miri_checkForTypeRead_eq_vtableMatchesExpectedSpec_at {P S C : Type}
+    (h : Miri.Interpreter.VTableReadHooks P S C) (c : C) (st : S)
+    (dynTable : Nat → DynExistentialSpec) (actual expected : Nat)
+    (hpred : ∀ n, h.predicates c n st = .ok (specPredicates (dynTable n)) st)
+    (hnorm : ∀ p, h.normalizePredicate c p st = .ok p.id st)
+    (ha : PredsKeyInjective (dynTable actual).effectivePreds)
+    (he : PredsKeyInjective (dynTable expected).effectivePreds) :
+    Miri.Interpreter.VTable.checkForTypeRead h c actual expected st =
+      if vtableMatchesExpectedSpec (dynTable actual) (dynTable expected) then .ok () st
+      else .error (.undefinedBehavior "InvalidVTableTrait") st := by
+  let aList := miriSortedPredicates (specPredicates (dynTable actual))
+  let eList := miriSortedPredicates (specPredicates (dynTable expected))
+  have haId : aList.map (·.id) = canonicalNonAutoPredIds (dynTable actual).effectivePreds :=
+    miri_sortedPredicates_map_id_eq_canonical (dynTable actual).effectivePreds ha
+  have heId : eList.map (·.id) = canonicalNonAutoPredIds (dynTable expected).effectivePreds :=
+    miri_sortedPredicates_map_id_eq_canonical (dynTable expected).effectivePreds he
+  have hmatchEq : vtableMatchesExpectedSpec (dynTable actual) (dynTable expected) =
+      (aList.map (·.id) == eList.map (·.id)) := by
+    unfold vtableMatchesExpectedSpec; rw [haId, heId]
+  rw [hmatchEq]
+  unfold Miri.Interpreter.VTable.checkForTypeRead
+  refine (est_bind_ok _ _ _ _ _ (hpred actual)).trans ?_
+  refine (est_bind_ok _ _ _ _ _ (hpred expected)).trans ?_
+  by_cases hlen : aList.length = eList.length
+  · have hbne : (aList.length != eList.length) = false := by simp [hlen]
+    rw [show (aList.length != eList.length) = false from hbne]
+    rw [ite_f (by decide)]
+    have hforEq :
+        (forIn (m := Miri.Interpreter.RvalueM S) (aList.zip eList) () fun x _ =>
+          match x with
+          | (a, b) => do
+            let a ← h.normalizePredicate c a
+            let b ← h.normalizePredicate c b
+            if a != b then
+              (miri_etm_private% Miri.Interpreter.VTable Miri.Interpreter.VTable.ub) "InvalidVTableTrait"
+            pure (.yield ())) st =
+        if aList.map (·.id) == eList.map (·.id) then .ok () st
+        else .error (.undefinedBehavior "InvalidVTableTrait") st := by
+      refine checkForTypeRead_zip_loop_eq_at st _ ?_ aList eList hlen
+      intro ⟨a, b⟩ u
+      refine (est_bind_ok _ _ _ _ _ (hnorm a)).trans ?_
+      refine (est_bind_ok _ _ _ _ _ (hnorm b)).trans ?_
+      by_cases hne : a.id = b.id
+      · have hbne' : (a.id != b.id) = false := by simp [hne]
+        simp only [hbne', Bool.false_eq_true, ↓reduceIte]
+        rfl
+      · have hbne' : (a.id != b.id) = true := bne_iff_ne.mpr hne
+        simp only [hbne', ↓reduceIte]
+        rfl
+    cases heq : (aList.map (·.id) == eList.map (·.id)) with
+    | true =>
+      rw [heq] at hforEq
+      exact (est_bind_ok _ _ _ _ () hforEq).trans rfl
+    | false =>
+      rw [heq] at hforEq
+      exact est_bind_err _ _ _ _ _ hforEq
+  · have hbne : (aList.length != eList.length) = true := bne_iff_ne.mpr hlen
+    have hbeq : (aList.map (·.id) == eList.map (·.id)) = false := by
+      apply beq_false_of_ne
+      intro hEq
+      have hl := congrArg List.length hEq
+      simp at hl
+      exact hlen hl
+    rw [show (aList.length != eList.length) = true from hbne, hbeq, ite_t (by decide)]
+    exact est_bind_err _ _ _ _ _ rfl
+
+/-- **State/choice-polymorphic `VTable.getPtrVTableTypeRead` vs `validateVTableHalf`**: generalizes
+`miri_getPtrVTableTypeRead_eq_validateVTableHalf` to ANY world-reading hooks
+(`VTableReadsWorldAt`), and weakens its global round-trip hypothesis `∀ s, dynTable (dynCode s) = s`
+(an encoding of ALL existentials into `Nat`) to the round trip of the REGISTERED existentials only,
+which finite tables satisfy (`wideDyn_invalidVTable_validatePlace_canary`). -/
+theorem miri_getPtrVTableTypeRead_eq_validateVTableHalf_at {P S C : Type}
+    (h : Miri.Interpreter.VTableReadHooks P S C) (c : C) (st : S)
+    (w : KeyedAllocWorld) (reg : VTableRegistry)
+    (resolve : Miri.Memory.Pointer (Option P) →
+      Except Miri.Interpreter.VTablePointerError (Miri.Memory.AllocId × Miri.ABI.Size))
+    (dynTable : Nat → DynExistentialSpec) (dynCode : DynExistentialSpec → Nat)
+    (hw : VTableReadsWorldAt h c st w reg resolve dynTable dynCode)
+    (ptr : Miri.Memory.Pointer (Option P)) (vptr : VTablePtrVal) (expected : Nat)
+    (hdynRt : ∀ id data, reg.allocToData.get? id = some data →
+      dynTable (dynCode data.spec) = data.spec)
+    (hres : match vptr with
+      | .null => resolve ptr = .error .danglingInteger
+      | .danglingInt _ => resolve ptr = .error .danglingInteger
+      | .provenanced id off => resolve ptr = .ok (toMiriAllocId id, Miri.ABI.Size.ofBytes off))
+    (hinjExp : PredsKeyInjective (dynTable expected).effectivePreds)
+    (hinjReg : ∀ id data, reg.allocToData.get? id = some data →
+      PredsKeyInjective data.spec.effectivePreds) :
+    Miri.Interpreter.VTable.getPtrVTableTypeRead h c ptr (some expected) st =
+      match validateVTableHalf w reg vptr (dynTable expected) with
+      | .ok data => .ok data.concreteTyCode st
+      | .error (.invalidVTableTrait _ _) => .error (.undefinedBehavior "InvalidVTableTrait") st
+      | .error _ => .error (.undefinedBehavior "InvalidVTablePointer") st := by
+  unfold Miri.Interpreter.VTable.getPtrVTableTypeRead validateVTableHalf
+  cases vptr with
+  | null =>
+    refine (est_bind_ok _ _ _ _ _ (hw.resolvePointer ptr)).trans ?_
+    rw [hres]
+    exact est_bind_err _ _ _ _ _ rfl
+  | danglingInt addr =>
+    refine (est_bind_ok _ _ _ _ _ (hw.resolvePointer ptr)).trans ?_
+    rw [hres]
+    exact est_bind_err _ _ _ _ _ rfl
+  | provenanced id off =>
+    refine (est_bind_ok _ _ _ _ _ (hw.resolvePointer ptr)).trans ?_
+    rw [hres]
+    refine (est_bind_ok _ _ _ _ _ rfl).trans ?_
+    dsimp only
+    have hzero : (Miri.ABI.Size.ofBytes off != Miri.ABI.Size.ZERO) = (off != 0) := by
+      simp [Miri.ABI.Size.ofBytes, Miri.ABI.Size.ZERO, bne, BEq.beq]
+    rw [hzero]
+    cases hoff : (off != 0) with
+    | true =>
+      rw [ite_t (by decide)]
+      exact est_bind_err _ _ _ _ _ rfl
+    | false =>
+      rw [ite_f (by decide)]
+      have hgvEq : h.globalVTable c (toMiriAllocId id) st =
+            .ok (match w.findGlobal? id with
+              | some g =>
+                if g.kind == .vtable then
+                  match reg.allocToData.get? id with
+                  | some data => some (data.concreteTyCode, dynCode data.spec)
+                  | none => none
+                else none
+              | none => none) st := by
+        rw [hw.globalVTable (toMiriAllocId id)]
+        unfold worldGlobalVTable
+        rw [ofMiriAllocId_toMiriAllocId]
+      refine (est_bind_ok _ _ _ _ _ hgvEq).trans ?_
+      cases hg : w.findGlobal? id with
+      | none => rfl
+      | some g =>
+        cases hkind : (g.kind == .vtable) with
+        | false =>
+          have hne : (g.kind != .vtable) = true := by simp [bne, hkind]
+          simp only [hkind, hne, Bool.false_eq_true, ↓reduceIte]; rfl
+        | true =>
+          have hne : (g.kind != .vtable) = false := by simp [bne, hkind]
+          simp only [hkind, hne, Bool.false_eq_true, ↓reduceIte]
+          cases hdata : reg.allocToData.get? id with
+          | none => rfl
+          | some data =>
+            dsimp only
+            have hchk := miri_checkForTypeRead_eq_vtableMatchesExpectedSpec_at h c st dynTable
+              (dynCode data.spec) expected hw.predicates hw.normalizePredicate
+              (by rw [hdynRt id data hdata]; exact hinjReg id data hdata) hinjExp
+            rw [hdynRt id data hdata] at hchk
+            cases hmatch : vtableMatchesExpectedSpec data.spec (dynTable expected) with
+            | true =>
+              rw [hmatch] at hchk
+              simp only [↓reduceIte] at hchk
+              exact (est_bind_ok _ _ _ _ () hchk).trans rfl
+            | false =>
+              rw [hmatch] at hchk
+              simp only [Bool.false_eq_true, ↓reduceIte] at hchk
+              exact est_bind_err _ _ _ _ _ hchk
+
+
+/-- The vendored step error of a `validateVTableHalf` rejection: `InvalidVTableTrait` for a trait
+mismatch, `InvalidVTablePointer` for every other vtable-half rejection. -/
+def wideDynVTableErrToMiri : WideDynErr → Miri.Interpreter.StepError
+  | .invalidVTableTrait _ _ => .undefinedBehavior "InvalidVTableTrait"
+  | _ => .undefinedBehavior "InvalidVTablePointer"
+
+/-- Every vtable-half rejection is reported as undefined behavior. -/
+theorem wideDynVTableErrToMiri_isUB (e : WideDynErr) :
+    isUndefinedBehavior (wideDynVTableErrToMiri e) = true := by
+  cases e <;> rfl
+
+/-- **Every invalid vtable form beats every data-pointer check on `ValidityVisitor.visit`**, for
+ANY hooks whose vtable leaves read a world: if the vtable word of a safe wide `dyn` reference is
+rejected by `validateVTableHalf` (null, dangling integer, dead allocation, wrong global kind, live
+non-global allocation, trait mismatch, nonzero offset, missing metadata), `visit` fails with the
+corresponding undefined behavior. No hypothesis constrains `sizeAndAlign`, `checkPointerAccess`,
+`scalarMayBeNull`, `opsemInhabited`, `checkPointerAlignResult`, or the data pointer itself. -/
+theorem visit_wideDyn_invalidVTable_precedes_dataPtr_at {P S C E F A Pad : Type}
+    [Miri.Memory.PointerProvenance P] [DecidableEq P]
+    (h : Miri.Interpreter.ValidityVisitor.Hooks P S C E F A Pad) (c : C)
+    (fuel : Nat) (session : Miri.Interpreter.ValidityVisitor.Session P)
+    (place : Miri.Interpreter.RuntimePlace P) (st : S)
+    (mutBool : Bool) (expected : Nat)
+    (ptrImm : Miri.Interpreter.RvalueImmTy P) (target : Miri.Interpreter.MPlaceTy P)
+    (metaScalar : Miri.Memory.Scalar P) (vtPtr : Miri.Memory.Pointer (Option P))
+    (w : KeyedAllocWorld) (reg : VTableRegistry)
+    (resolve : Miri.Memory.Pointer (Option P) →
+      Except Miri.Interpreter.VTablePointerError (Miri.Memory.AllocId × Miri.ABI.Size))
+    (dynTable : Nat → DynExistentialSpec) (dynCode : DynExistentialSpec → Nat)
+    (vptr : VTablePtrVal) (e : WideDynErr)
+    (hreset : session.flags.resetProvenanceAndPadding = false)
+    (hcl : h.classify c place.layout.ty st = .ok (.reference mutBool) st)
+    (hrd : h.readImmediate c place .reference st = .ok ptrImm st)
+    (hpt : h.ptrToPlace c ptrImm st = .ok target st)
+    (htuns : target.layout.layout.isSized = false)
+    (hmt : h.metadataTail c target.layout.ty st = .ok (.dynamic expected) st)
+    (hunwrap : target.mplace.metadata.unwrapMeta = .ok metaScalar)
+    (htoptr : metaScalar.toPointer h.target.base = .ok vtPtr)
+    (hw : VTableReadsWorldAt h.vtable.readHooks c st w reg resolve dynTable dynCode)
+    (hdynRt : ∀ id data, reg.allocToData.get? id = some data →
+      dynTable (dynCode data.spec) = data.spec)
+    (hres : match vptr with
+      | .null => resolve vtPtr = .error .danglingInteger
+      | .danglingInt _ => resolve vtPtr = .error .danglingInteger
+      | .provenanced id off => resolve vtPtr = .ok (toMiriAllocId id, Miri.ABI.Size.ofBytes off))
+    (hinjExp : PredsKeyInjective (dynTable expected).effectivePreds)
+    (hinjReg : ∀ id data, reg.allocToData.get? id = some data →
+      PredsKeyInjective data.spec.effectivePreds)
+    (hbad : validateVTableHalf w reg vptr (dynTable expected) = .error e) :
+    Miri.Interpreter.ValidityVisitor.visit h c (fuel + 1) session place st =
+      .error (wideDynVTableErrToMiri e) st := by
+  have hvt := miri_getPtrVTableTypeRead_eq_validateVTableHalf_at h.vtable.readHooks c st w reg
+    resolve dynTable dynCode hw vtPtr vptr expected hdynRt hres hinjExp hinjReg
+  rw [hbad] at hvt
+  have hvt' : Miri.Interpreter.VTable.getPtrVTableType h.vtable c vtPtr (some expected) st =
+      .error (wideDynVTableErrToMiri e) st := by
+    cases e <;> exact hvt
+  exact visit_wideDyn_checkSafe_vtableBeforeDataUB h c fuel session place st mutBool expected
+    ptrImm target metaScalar vtPtr _ st hreset hcl hrd hpt htuns hmt hunwrap htoptr hvt'
+
+/-- A root `visit` failure propagates through the `validatePlace` driver for BOTH
+`recursive = false` and `recursive = true` (the recursive worklist loop is never entered), provided
+`withGhostValidation` propagates that failure. -/
+theorem validatePlace_error_of_root_visit_error {P S C E F A Pad : Type}
+    [Miri.Memory.PointerProvenance P] [DecidableEq P]
+    (h : Miri.Interpreter.ValidityVisitor.Hooks P S C E F A Pad) (c : C)
+    (fuel : Nat) (place : Miri.Interpreter.RuntimePlace P) (recursive : Bool)
+    (st st' : S) (name : String) (err : Miri.Interpreter.StepError)
+    (hname : h.typeName c place.layout.ty st = .ok name st)
+    (hghost : ∀ (x : Miri.Interpreter.ValidityVisitor.M S
+        (Miri.Interpreter.ValidityVisitor.Session P)),
+      x st = .error err st' → h.withGhostValidation x st = .error err st')
+    (hvisit : Miri.Interpreter.ValidityVisitor.visit h c fuel
+        { path := ⟨name, #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+          refTracking := if recursive then some .empty else none, dataBytes := none }
+        place st = .error err st') :
+    Miri.Interpreter.ValidityVisitor.validatePlace h c fuel place recursive false st =
+      .error err st' := by
+  unfold Miri.Interpreter.ValidityVisitor.validatePlace
+  refine (est_bind_ok _ _ _ _ _ hname).trans ?_
+  refine est_bind_err _ _ _ _ _ ?_
+  apply hghost
+  rw [ite_f (by decide)]
+  exact est_bind_err _ _ _ _ _ hvisit
+
+
+/-- **All invalid vtable forms beat every data-pointer check through the `validatePlace` driver,
+for BOTH `recursive = false` and `recursive = true`** (`lean-miri#82`), on ANY hooks — any state and
+choice types — whose vtable leaves read a world: the driver fails with the vtable undefined
+behavior whatever the data-pointer leaves would report (including double-null `&dyn Trait`). -/
+theorem validatePlace_wideDyn_invalidVTable_precedes_dataPtr_at {P S C E F A Pad : Type}
+    [Miri.Memory.PointerProvenance P] [DecidableEq P]
+    (h : Miri.Interpreter.ValidityVisitor.Hooks P S C E F A Pad) (c : C)
+    (fuel : Nat) (place : Miri.Interpreter.RuntimePlace P) (recursive : Bool) (st : S)
+    (name : String) (mutBool : Bool) (expected : Nat)
+    (ptrImm : Miri.Interpreter.RvalueImmTy P) (target : Miri.Interpreter.MPlaceTy P)
+    (metaScalar : Miri.Memory.Scalar P) (vtPtr : Miri.Memory.Pointer (Option P))
+    (w : KeyedAllocWorld) (reg : VTableRegistry)
+    (resolve : Miri.Memory.Pointer (Option P) →
+      Except Miri.Interpreter.VTablePointerError (Miri.Memory.AllocId × Miri.ABI.Size))
+    (dynTable : Nat → DynExistentialSpec) (dynCode : DynExistentialSpec → Nat)
+    (vptr : VTablePtrVal) (e : WideDynErr)
+    (hname : h.typeName c place.layout.ty st = .ok name st)
+    (hghost : ∀ (x : Miri.Interpreter.ValidityVisitor.M S
+        (Miri.Interpreter.ValidityVisitor.Session P)) err,
+      x st = .error err st → h.withGhostValidation x st = .error err st)
+    (hcl : h.classify c place.layout.ty st = .ok (.reference mutBool) st)
+    (hrd : h.readImmediate c place .reference st = .ok ptrImm st)
+    (hpt : h.ptrToPlace c ptrImm st = .ok target st)
+    (htuns : target.layout.layout.isSized = false)
+    (hmt : h.metadataTail c target.layout.ty st = .ok (.dynamic expected) st)
+    (hunwrap : target.mplace.metadata.unwrapMeta = .ok metaScalar)
+    (htoptr : metaScalar.toPointer h.target.base = .ok vtPtr)
+    (hw : VTableReadsWorldAt h.vtable.readHooks c st w reg resolve dynTable dynCode)
+    (hdynRt : ∀ id data, reg.allocToData.get? id = some data →
+      dynTable (dynCode data.spec) = data.spec)
+    (hres : match vptr with
+      | .null => resolve vtPtr = .error .danglingInteger
+      | .danglingInt _ => resolve vtPtr = .error .danglingInteger
+      | .provenanced id off => resolve vtPtr = .ok (toMiriAllocId id, Miri.ABI.Size.ofBytes off))
+    (hinjExp : PredsKeyInjective (dynTable expected).effectivePreds)
+    (hinjReg : ∀ id data, reg.allocToData.get? id = some data →
+      PredsKeyInjective data.spec.effectivePreds)
+    (hbad : validateVTableHalf w reg vptr (dynTable expected) = .error e) :
+    Miri.Interpreter.ValidityVisitor.validatePlace h c (fuel + 1) place recursive false st =
+        .error (wideDynVTableErrToMiri e) st ∧
+      isUndefinedBehavior (wideDynVTableErrToMiri e) = true := by
+  refine ⟨?_, wideDynVTableErrToMiri_isUB e⟩
+  exact validatePlace_error_of_root_visit_error h c (fuel + 1) place recursive st st name _ hname
+    (fun x hx => hghost x _ hx)
+    (visit_wideDyn_invalidVTable_precedes_dataPtr_at h c fuel _ place st mutBool expected ptrImm
+      target metaScalar vtPtr w reg resolve dynTable dynCode vptr e rfl hcl hrd hpt htuns hmt
+      hunwrap htoptr hw hdynRt hres hinjExp hinjReg hbad)
+
+/-- **Every invalid vtable form** fails `validateVTableHalf` on ANY world: the six forms `null`,
+`danglingInt`, `deadAlloc`, `wrongGlobalKind`, `nonGlobalLiveAlloc`, `traitMismatch`, plus the two
+remaining vendored rejections (nonzero offset into a vtable, `.vtable` global without registry
+metadata). -/
+theorem validateVTableHalf_invalidForms (w : KeyedAllocWorld) (reg : VTableRegistry)
+    (expected : DynExistentialSpec) :
+    validateVTableHalf w reg .null expected = .error .invalidVTableNull ∧
+    (∀ addr, validateVTableHalf w reg (.danglingInt addr) expected =
+      .error (.invalidVTableDanglingInt addr)) ∧
+    (∀ id d, w.findDead? id = some d → w.findGlobal? id = none →
+      validateVTableHalf w reg (.provenanced id 0) expected =
+        .error (.invalidVTableNotGlobalVTable id)) ∧
+    (∀ id g, w.findGlobal? id = some g → g.kind ≠ .vtable →
+      validateVTableHalf w reg (.provenanced id 0) expected =
+        .error (.invalidVTableNotGlobalVTable id)) ∧
+    (∀ id l, w.findLive? id = some l → w.findGlobal? id = none →
+      validateVTableHalf w reg (.provenanced id 0) expected =
+        .error (.invalidVTableNotGlobalVTable id)) ∧
+    (∀ id g data, w.findGlobal? id = some g → g.kind = .vtable →
+      reg.allocToData.get? id = some data →
+      vtableMatchesExpectedSpec data.spec expected = false →
+      validateVTableHalf w reg (.provenanced id 0) expected =
+        .error (.invalidVTableTrait data.spec expected)) ∧
+    (∀ id off, off ≠ 0 →
+      validateVTableHalf w reg (.provenanced id off) expected =
+        .error (.invalidVTableNonzeroOffset id off)) ∧
+    (∀ id g, w.findGlobal? id = some g → g.kind = .vtable →
+      reg.allocToData.get? id = none →
+      validateVTableHalf w reg (.provenanced id 0) expected =
+        .error (.invalidVTableMissingMetadata id)) := by
+  refine ⟨rfl, fun _ => rfl, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro id d _ hg
+    simp [validateVTableHalf, hg]
+  · intro id g hg hk
+    have hne : (g.kind != .vtable) = true := bne_iff_ne.mpr hk
+    simp [validateVTableHalf, hg, hne]
+  · intro id l _ hg
+    simp [validateVTableHalf, hg]
+  · intro id g data hg hk hd hm
+    have hne : (g.kind != .vtable) = false := by rw [hk]; rfl
+    simp [validateVTableHalf, hg, hne, hd, hm]
+  · intro id off hoff
+    have hne : (off != 0) = true := bne_iff_ne.mpr hoff
+    simp [validateVTableHalf, hne]
+  · intro id g hg hk hd
+    have hne : (g.kind != .vtable) = false := by rw [hk]; rfl
+    simp [validateVTableHalf, hg, hne, hd]
+
+/-- **`annealValidityHooks` cannot read ANY vtable**: `VTable.getPtrVTableType` through
+`RefLM3_2.annealValidityHooks` fails closed with `StepError.unsupported` — never accepting and
+never reporting undefined behavior — for every pointer and every expected trait. -/
+theorem annealValidityHooks_getPtrVTableType_failClosed (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (c : Trusted.Rustc.V2026_06_01.MirAst.Ty)
+    (ptr : Miri.Memory.Pointer (Option AnnealProv)) (expected : Option Nat)
+    (m : AnnealStepState) :
+    Miri.Interpreter.VTable.getPtrVTableType (annealValidityHooks layouts).vtable c ptr expected m =
+        .error (.unsupported "validity vtable: resolvePointer") m ∧
+      isUndefinedBehavior (.unsupported "validity vtable: resolvePointer") = false :=
+  ⟨rfl, rfl⟩
+
+/-- **Exact boundary**: `annealValidityHooks` reads NO vtable world, so the vtable-precedence
+theorems above apply to it only through an extension that replaces its fail-closed wide-pointer
+leaves (`annealWideDynHooks`). -/
+theorem annealValidityHooks_not_readsWorld (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (c : Trusted.Rustc.V2026_06_01.MirAst.Ty) (m : AnnealStepState)
+    (w : KeyedAllocWorld) (reg : VTableRegistry)
+    (resolve : Miri.Memory.Pointer (Option AnnealProv) →
+      Except Miri.Interpreter.VTablePointerError (Miri.Memory.AllocId × Miri.ABI.Size))
+    (dynTable : Nat → DynExistentialSpec) (dynCode : DynExistentialSpec → Nat) :
+    ¬ VTableReadsWorldAt (annealValidityHooks layouts).vtable.readHooks c m w reg resolve
+      dynTable dynCode := by
+  intro hw
+  have h := hw.predicates 0
+  cases h
+
+/-- Positive direction of the precedence: once the vtable half of a safe wide `dyn` reference is
+ACCEPTED, `visit` proceeds to the first data-pointer leaf (`sizeAndAlign`) and propagates its
+failure. -/
+theorem visit_wideDyn_validVTable_reaches_sizeAndAlign {P S C E F A Pad : Type}
+    [Miri.Memory.PointerProvenance P] [DecidableEq P]
+    (h : Miri.Interpreter.ValidityVisitor.Hooks P S C E F A Pad) (c : C)
+    (fuel : Nat) (session : Miri.Interpreter.ValidityVisitor.Session P)
+    (place : Miri.Interpreter.RuntimePlace P) (st st' : S)
+    (mutBool : Bool) (expected : Nat)
+    (ptrImm : Miri.Interpreter.RvalueImmTy P) (target : Miri.Interpreter.MPlaceTy P)
+    (metaScalar : Miri.Memory.Scalar P) (vtPtr : Miri.Memory.Pointer (Option P))
+    (ty : Miri.MIR.TyId) (err : Miri.Interpreter.StepError)
+    (hreset : session.flags.resetProvenanceAndPadding = false)
+    (hcl : h.classify c place.layout.ty st = .ok (.reference mutBool) st)
+    (hrd : h.readImmediate c place .reference st = .ok ptrImm st)
+    (hpt : h.ptrToPlace c ptrImm st = .ok target st)
+    (htuns : target.layout.layout.isSized = false)
+    (hmt : h.metadataTail c target.layout.ty st = .ok (.dynamic expected) st)
+    (hunwrap : target.mplace.metadata.unwrapMeta = .ok metaScalar)
+    (htoptr : metaScalar.toPointer h.target.base = .ok vtPtr)
+    (hvtOk : Miri.Interpreter.VTable.getPtrVTableType h.vtable c vtPtr (some expected) st =
+      .ok ty st)
+    (hsa : h.sizeAndAlign c target st = .error err st') :
+    Miri.Interpreter.ValidityVisitor.visit h c (fuel + 1) session place st = .error err st' := by
+  have hcm := checkMetadata_dynamic_eq h c target st expected metaScalar vtPtr hmt hunwrap htoptr
+  rw [hvtOk] at hcm
+  unfold Miri.Interpreter.ValidityVisitor.visit
+  refine (est_bind_ok _ _ _ _ _ hcl).trans ?_
+  refine est_bind_err _ _ _ _ _ ?_
+  with_unfolding_all
+    refine est_bind_err _ _ _ _ _ ?_
+    refine (est_bind_ok _ _ _ _ _ hrd).trans ?_
+    rw [hreset, ite_f (by decide)]
+    dsimp only
+    refine (est_bind_ok _ _ _ _ _ hpt).trans ?_
+    rw [htuns, Bool.not_false, ite_t (by decide)]
+    refine (est_bind_ok _ _ _ _ _ hcm).trans ?_
+    exact est_bind_err _ _ _ _ _ hsa
+
+/-- A failing `metadataTail` leaf aborts a safe reference to an unsized pointee BEFORE any vtable
+or data-pointer check. -/
+theorem visit_unsizedRef_metadataTail_error {P S C E F A Pad : Type}
+    [Miri.Memory.PointerProvenance P] [DecidableEq P]
+    (h : Miri.Interpreter.ValidityVisitor.Hooks P S C E F A Pad) (c : C)
+    (fuel : Nat) (session : Miri.Interpreter.ValidityVisitor.Session P)
+    (place : Miri.Interpreter.RuntimePlace P) (st st' : S)
+    (mutBool : Bool) (ptrImm : Miri.Interpreter.RvalueImmTy P)
+    (target : Miri.Interpreter.MPlaceTy P) (err : Miri.Interpreter.StepError)
+    (hreset : session.flags.resetProvenanceAndPadding = false)
+    (hcl : h.classify c place.layout.ty st = .ok (.reference mutBool) st)
+    (hrd : h.readImmediate c place .reference st = .ok ptrImm st)
+    (hpt : h.ptrToPlace c ptrImm st = .ok target st)
+    (htuns : target.layout.layout.isSized = false)
+    (hmt : h.metadataTail c target.layout.ty st = .error err st') :
+    Miri.Interpreter.ValidityVisitor.visit h c (fuel + 1) session place st = .error err st' := by
+  have hcm : (miri_etm_private% Miri.Interpreter.ValidityVisitor
+      Miri.Interpreter.ValidityVisitor.checkMetadata) h c target st = .error err st' := by
+    with_unfolding_all
+      exact est_bind_err _ _ _ _ _ hmt
+  unfold Miri.Interpreter.ValidityVisitor.visit
+  refine (est_bind_ok _ _ _ _ _ hcl).trans ?_
+  refine est_bind_err _ _ _ _ _ ?_
+  with_unfolding_all
+    refine est_bind_err _ _ _ _ _ ?_
+    refine (est_bind_ok _ _ _ _ _ hrd).trans ?_
+    rw [hreset, ite_f (by decide)]
+    dsimp only
+    refine (est_bind_ok _ _ _ _ _ hpt).trans ?_
+    rw [htuns, Bool.not_false, ite_t (by decide)]
+    exact est_bind_err _ _ _ _ _ hcm
+
+/-- **`annealValidityHooks` fail-closed boundary for safe references to unsized pointees**, for
+BOTH `recursive = false` and `recursive = true`: whenever its `ptrToPlace` yields an unsized
+pointee layout, `validatePlace` fails with `StepError.unsupported "validity metadataTail"`, which
+is NOT undefined behavior. `annealValidityHooks` therefore never reproduces a wide-`dyn` verdict
+of the theory — neither an acceptance nor a UB rejection. -/
+theorem annealValidityHooks_unsizedRef_validatePlace_failClosed
+    (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (c : Trusted.Rustc.V2026_06_01.MirAst.Ty) (fuel : Nat)
+    (place : Miri.Interpreter.RuntimePlace AnnealProv) (recursive : Bool) (m : AnnealStepState)
+    (mutBool : Bool) (ptrImm : Miri.Interpreter.RvalueImmTy AnnealProv)
+    (target : Miri.Interpreter.MPlaceTy AnnealProv)
+    (hcl : (annealValidityHooks layouts).classify c place.layout.ty m = .ok (.reference mutBool) m)
+    (hrd : (annealValidityHooks layouts).readImmediate c place .reference m = .ok ptrImm m)
+    (hpt : (annealValidityHooks layouts).ptrToPlace c ptrImm m = .ok target m)
+    (htuns : target.layout.layout.isSized = false) :
+    Miri.Interpreter.ValidityVisitor.validatePlace (annealValidityHooks layouts) c (fuel + 1)
+        place recursive false m = .error (.unsupported "validity metadataTail") m ∧
+      isUndefinedBehavior (.unsupported "validity metadataTail") = false := by
+  refine ⟨?_, rfl⟩
+  exact validatePlace_error_of_root_visit_error (annealValidityHooks layouts) c (fuel + 1) place
+    recursive m m "" _ rfl (fun _ hx => hx)
+    (visit_unsizedRef_metadataTail_error (annealValidityHooks layouts) c fuel _ place m m mutBool
+      ptrImm target _ rfl hcl hrd hpt htuns rfl)
+
+
+/-- State/choice-polymorphic world-backed `VTableHooks`: the four read leaves read the world for
+ANY state and choice types, and every other leaf fails closed. -/
+def worldVTableHooks (P S C : Type) (w : KeyedAllocWorld) (reg : VTableRegistry)
+    (resolve : Miri.Memory.Pointer (Option P) →
+      Except Miri.Interpreter.VTablePointerError (Miri.Memory.AllocId × Miri.ABI.Size))
+    (dynTable : Nat → DynExistentialSpec) (dynCode : DynExistentialSpec → Nat) :
+    Miri.Interpreter.VTableHooks P S C Unit Unit where
+  target := annealTargetDataLayout
+  isDynamic := fun _ _ => throw (.unsupported "worldVTableHooks: isDynamic")
+  memoryOffset := fun _ _ _ _ _ => throw (.unsupported "worldVTableHooks: memoryOffset")
+  resolvePointer := fun _ ptr => pure (resolve ptr)
+  globalVTable := fun _ id => pure (worldGlobalVTable w reg dynCode id)
+  globalFunction := fun _ _ => throw (.unsupported "worldVTableHooks: globalFunction")
+  predicates := fun _ n => pure (specPredicates (dynTable n))
+  normalizePredicate := fun _ p => pure p.id
+  layoutOf := fun _ _ => throw (.unsupported "worldVTableHooks: layoutOf")
+  eraseAndAnonymize := fun _ _ _ => throw (.unsupported "worldVTableHooks: eraseAndAnonymize")
+  ensureMonomorphicType := fun _ _ => throw (.unsupported "worldVTableHooks: ensureMonomorphicType")
+  ensureMonomorphicDyn := fun _ _ => throw (.unsupported "worldVTableHooks: ensureMonomorphicDyn")
+  globalSalt := fun _ => throw (.unsupported "worldVTableHooks: globalSalt")
+  reserveVTable := fun _ _ _ _ => throw (.unsupported "worldVTableHooks: reserveVTable")
+  globalRootPointer := fun _ _ => throw (.unsupported "worldVTableHooks: globalRootPointer")
+  entries := fun _ _ _ => throw (.unsupported "worldVTableHooks: entries")
+  assertVirtualInstanceMatches := fun _ _ _ _ _ =>
+    throw (.unsupported "worldVTableHooks: assertVirtualInstanceMatches")
+
+/-- `worldVTableHooks` reads the world at every state and choice, so `VTableReadsWorldAt` is
+satisfiable at arbitrary state and choice types. -/
+theorem worldVTableHooks_readsWorldAt (P S C : Type) (w : KeyedAllocWorld) (reg : VTableRegistry)
+    (resolve : Miri.Memory.Pointer (Option P) →
+      Except Miri.Interpreter.VTablePointerError (Miri.Memory.AllocId × Miri.ABI.Size))
+    (dynTable : Nat → DynExistentialSpec) (dynCode : DynExistentialSpec → Nat) (c : C) (st : S) :
+    VTableReadsWorldAt (worldVTableHooks P S C w reg resolve dynTable dynCode).readHooks c st
+      w reg resolve dynTable dynCode :=
+  ⟨fun _ => rfl, fun _ => rfl, fun _ => rfl, fun _ => rfl⟩
+
+/-- `RefLM3_2.annealValidityHooks` with its fail-closed wide-pointer leaves (`vtable`,
+`metadataTail`) and its pointer-reading leaves (`classify`, `readImmediate`, `ptrToPlace`)
+replaced; every data-pointer leaf (`checkPointerAccess`, `scalarMayBeNull`, `opsemInhabited`,
+`checkPointerAlignResult`, `sizeAndAlign`), `typeName`, and `withGhostValidation` remain those of
+`annealValidityHooks`. -/
+def annealWideDynHooks (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (vt : Miri.Interpreter.VTableHooks AnnealProv AnnealStepState
+      Trusted.Rustc.V2026_06_01.MirAst.Ty Unit Unit)
+    (ptrImm : Miri.Interpreter.RvalueImmTy AnnealProv)
+    (target : Miri.Interpreter.MPlaceTy AnnealProv) (expected : Nat) :
+    Miri.Interpreter.ValidityVisitor.Hooks AnnealProv AnnealStepState
+      Trusted.Rustc.V2026_06_01.MirAst.Ty Unit Unit Unit Unit :=
+  { annealValidityHooks layouts with
+    vtable := vt
+    classify := fun _ _ => pure (.reference false)
+    readImmediate := fun _ _ _ => pure ptrImm
+    ptrToPlace := fun _ _ => pure target
+    metadataTail := fun _ _ => pure (.dynamic expected) }
+
 /-! ## Part 3. Closed non-vacuity canaries -/
 
 /-- Canary resolver: the provenance is the allocation identifier and the
@@ -7489,11 +9055,10 @@ theorem rowsPermutation_canary :
     rfl
 
 /-- Real vendored `Miri.Memory.MemoryState` lifecycle canary (`lean-miri#73`):
-reserving `AllocId 1` from `MemoryState.empty`, inserting a live 4-byte stack
-allocation, observing `isAllocLive = true` via `memoryState_isAllocLive_eq_keyed`,
-checking `deallocErrOfMiri_toMiri` unconditionally on `.layoutMismatch`,
-observing duplicate-global `hasFunctionPointer` precedence, and observing
-`memoryRaceAccess_unconfigured`. -/
+reserving `AllocId 1` from `MemoryState.empty`, observing `isAllocLive = true` for a live stack
+allocation both on the vendored state (`memoryState_isAllocLive_eq_keyed`) and on its keyed world,
+checking `deallocErrOfMiri_toMiri` unconditionally on `.layoutMismatch`, and observing
+`isAllocLive = false` on the empty state. -/
 theorem memoryState_lifecycle_canary :
     let proj : RowProjection Miri.Memory.Provenance Unit Unit :=
       ⟨fun _ => .heap, fun _ => [], fun _ => []⟩
@@ -7782,6 +9347,309 @@ theorem validityMachine_null_canary :
   exact ⟨validityMachine_scalarMayBeNull_eq ⟨⟨0⟩, none⟩ st,
     validityMachine_scalarMayBeNull_eq ⟨⟨0⟩, some prov⟩ st,
     validityMachine_scalarMayBeNull_eq ⟨⟨8⟩, some prov⟩ st⟩
+
+/-- **Tightness of the `live` distinct-key hypothesis for the KEYED world** (closed canary):
+swapping two `live` rows that share one `AllocId` (`.stack` first vs `.machine` first) is a
+permutation, yet it changes the first-match keyed entry and therefore the whole `KeyedAllocWorld`.
+The distinct-key hypothesis of `annealMachineToKeyed_eq_of_liveDead_perm` is thus exact, while
+`stateRelLM3_1_livePerm_deadAny` shows `StateRelLM3_1` itself needs none. -/
+theorem liveDuplicateKey_perm_separation_canary :
+    let proj : RowProjection Miri.Memory.Provenance Unit Unit :=
+      ⟨fun _ => .heap, fun _ => [], fun _ => []⟩
+    let id1 : Miri.Memory.AllocId := ⟨1, by decide⟩
+    let la1 : Miri.Memory.LocalAllocation Miri.Memory.Provenance Unit Unit :=
+      ⟨.stack, baseRetagAllocation⟩
+    let la2 : Miri.Memory.LocalAllocation Miri.Memory.Provenance Unit Unit :=
+      ⟨.machine (), baseRetagAllocation⟩
+    let rows₁ : MiriAllocRows Miri.Memory.Provenance Unit Unit :=
+      { nextAllocId := 2, issued := #[id1], live := #[(id1, la1), (id1, la2)] }
+    let rows₂ : MiriAllocRows Miri.Memory.Provenance Unit Unit :=
+      { nextAllocId := 2, issued := #[id1], live := #[(id1, la2), (id1, la1)] }
+    rows₁.live.toList.Perm rows₂.live.toList ∧
+    ((rows₁.toKeyed proj).findLive? (ofMiriAllocId id1)).map (·.kind) = some .stack ∧
+    ((rows₂.toKeyed proj).findLive? (ofMiriAllocId id1)).map (·.kind) = some .heap ∧
+    rows₁.toKeyed proj ≠ rows₂.toKeyed proj := by
+  intro proj id1 la1 la2 rows₁ rows₂
+  have h1 : ((rows₁.toKeyed proj).findLive? (ofMiriAllocId id1)).map (·.kind) = some .stack := by
+    rw [toKeyed_findLive?]; rfl
+  have h2 : ((rows₂.toKeyed proj).findLive? (ofMiriAllocId id1)).map (·.kind) = some .heap := by
+    rw [toKeyed_findLive?]; rfl
+  refine ⟨List.Perm.swap _ _ [], h1, h2, fun heq => ?_⟩
+  rw [heq, h2] at h1
+  cases h1
+
+/-- **Closed deallocation data-race stage canary** on real vendored machines:
+1. `DeallocRaceStageRel` discriminates outcomes (a vendored success is never related to a theory
+   data race, nor a vendored data race to a theory success);
+2. without a race detector the stage relates to `machineDeallocHook .unconfigured`;
+3. with a configured detector whose `raceDetecting` is `false` and NO vector clock for the
+   allocation, both sides report the missing clock — BEFORE the `raceDetecting` gate. -/
+theorem deallocRaceStage_canary :
+    let machine : Miri.Interpreter.MachineHooks.MachineState Unit Unit :=
+      { memory := Miri.Memory.MemoryState.empty
+        borrowTracker := none
+        dataRace := none
+        threads := Miri.Concurrency.ThreadManager.initial true
+        raceAllocations := #[]
+        allocationSpans := #[]
+        user := () }
+    let configured : Miri.Interpreter.MachineHooks.MachineState Unit Unit :=
+      { machine with dataRace := some (Miri.Concurrency.GlobalState.initial false false) }
+    let id1 : Miri.Memory.AllocId := ⟨1, by decide⟩
+    let actor : DeallocActor := DeallocActor.ofVClock 0 []
+    ¬ DeallocRaceStageRel (.ok ()) (.error "DataRace") ∧
+    ¬ DeallocRaceStageRel (.error (.undefinedBehavior "DataRace")) (.ok ()) ∧
+    raceModeOfMachine machine = .unconfigured ∧
+    DeallocRaceStageRel
+      (Miri.Interpreter.MachineHooks.memoryRaceAccess machine id1 ⟨Miri.ABI.Size.ZERO, ⟨8⟩⟩
+        (some .Deallocate) .Read).2
+      (machineDeallocHook .unconfigured actor .ok none 8) ∧
+    raceModeOfMachine configured = .configured false ∧
+    DeallocRaceStageRel
+      (Miri.Interpreter.MachineHooks.memoryRaceAccess configured id1 ⟨Miri.ABI.Size.ZERO, ⟨8⟩⟩
+        (some .Deallocate) .Read).2
+      (machineDeallocHook (.configured false) actor .ok none 8) ∧
+    machineDeallocHook (.configured false) actor .ok none 8 =
+      .error "MissingVectorClockExtra" := by
+  intro machine configured id1 actor
+  refine ⟨?_, ?_, rfl, ?_, rfl, ?_, rfl⟩
+  · intro h; cases h
+  · intro h; cases h
+  · exact memoryRaceAccess_dealloc_rel_machineDeallocHook machine id1 ⟨8⟩ actor none rfl
+      (fun _ h => by cases h)
+  · exact memoryRaceAccess_dealloc_rel_machineDeallocHook configured id1 ⟨8⟩ actor none rfl
+      (fun g hg hdet => by
+        cases hg
+        exact absurd hdet (by decide))
+
+/-- **Closed frame-pop release-fold canary on a real vendored `BorrowTree`**
+(`releaseProtectorSimTree` inside `liveTreeMemory`): the fold succeeds when the co-protected tag is
+a strict descendant, fails with a protector-end access error when the co-protected tag is a
+sibling (pinned-Miri batch order), and is undefined for an allocation that is not live. -/
+theorem stackPopReleaseAll_canary :
+    let t2 : Miri.Memory.BorTag := ⟨2, by decide⟩
+    let t3 : Miri.Memory.BorTag := ⟨3, by decide⟩
+    let t4 : Miri.Memory.BorTag := ⟨4, by decide⟩
+    let mem := liveTreeMemory releaseProtectorSimTree
+    (∃ mem', stackPopReleaseAll ⟨#[(t2, .StrongProtector), (t4, .StrongProtector)]⟩
+      [(retagTestAllocId, t2)] mem = some (mem', none)) ∧
+    (∃ mem' err, stackPopReleaseAll ⟨#[(t2, .StrongProtector), (t3, .StrongProtector)]⟩
+      [(retagTestAllocId, t2)] mem = some (mem', some err)) ∧
+    stackPopReleaseAll ⟨#[]⟩ [((⟨9, by decide⟩ : Miri.Memory.AllocId), t2)] mem = none := by
+  intro t2 t3 t4 mem
+  have hsep := miri_releaseProtector_skipChildren_and_siblingConflict
+  have hfind : mem.live.find? (fun e => e.1 == retagTestAllocId) =
+      some (retagTestAllocId,
+        { kind := .stack, allocation := liveTreeAllocation releaseProtectorSimTree }) := rfl
+  refine ⟨?_, ?_, ?_⟩
+  · rw [stackPopReleaseAll_singleton _ _ _ _ _ hfind]
+    have h1 : stackPopReleaseErr (releaseProtectorSimTree.releaseProtector t2
+        ⟨#[(t2, .StrongProtector), (t4, .StrongProtector)]⟩).status = some none := by
+      rw [hsep.1]; rfl
+    exact ⟨_, by
+      show (match stackPopReleaseErr (releaseProtectorSimTree.releaseProtector t2
+          ⟨#[(t2, .StrongProtector), (t4, .StrongProtector)]⟩).status with
+        | some none => _ | some (some err) => _ | none => _) = _
+      rw [h1]⟩
+  · rw [stackPopReleaseAll_singleton _ _ _ _ _ hfind]
+    have h2 : ∃ err, stackPopReleaseErr (releaseProtectorSimTree.releaseProtector t2
+        ⟨#[(t2, .StrongProtector), (t3, .StrongProtector)]⟩).status = some (some err) := by
+      have hs := hsep.2.2.2.1
+      cases hst : (releaseProtectorSimTree.releaseProtector t2
+          ⟨#[(t2, .StrongProtector), (t3, .StrongProtector)]⟩).status with
+      | AccessFailure r status => exact ⟨_, rfl⟩
+      | Released => rw [hst] at hs; cases hs
+      | MissingTag _ => rw [hst] at hs; cases hs
+      | RangeMapFailure _ => rw [hst] at hs; cases hs
+      | LocationMapFailure _ => rw [hst] at hs; cases hs
+      | ExposureUpdateFailure _ => rw [hst] at hs; cases hs
+    obtain ⟨err, h2⟩ := h2
+    exact ⟨_, err, by
+      show (match stackPopReleaseErr (releaseProtectorSimTree.releaseProtector t2
+          ⟨#[(t2, .StrongProtector), (t3, .StrongProtector)]⟩).status with
+        | some none => _ | some (some err) => _ | none => _) = _
+      rw [h2]⟩
+  · rfl
+
+/-- Canary resolver for vtable words. -/
+def canaryWideResolve (p : Miri.Memory.Pointer (Option AnnealProv)) :
+    Except Miri.Interpreter.VTablePointerError (Miri.Memory.AllocId × Miri.ABI.Size) :=
+  match p.provenance with
+  | some (.concrete id _) => .ok (id, p.offset)
+  | _ => .error .danglingInteger
+
+/-- Canary unsized pointee layout. -/
+def canaryUnsizedLayout : Miri.Interpreter.LocalLayout :=
+  ⟨0, { zstLayoutData with backendRepr := .Memory (sized := false) }⟩
+
+/-- Canary wide place: NULL data pointer, vtable word `vtWord`. -/
+def canaryWideTarget (vtWord : Miri.Memory.Scalar AnnealProv) :
+    Miri.Interpreter.MPlaceTy AnnealProv :=
+  ⟨⟨⟨Miri.ABI.Size.ZERO, none⟩, .metadata vtWord, none⟩, canaryUnsizedLayout⟩
+
+/-- Canary world: `1` a `.vtable` global, `2` a tombstone, `3` a `.function` global, `4` a live heap
+allocation. -/
+def canaryWideWorld : KeyedAllocWorld :=
+  ((((KeyedAllocWorld.empty.registerGlobal ⟨1, by decide⟩ ⟨.vtable, 24, 3, .not, []⟩).registerGlobal
+    ⟨3, by decide⟩ ⟨.function, 0, 0, .not, []⟩).insertLive ⟨4, by decide⟩
+      ⟨8, 3, .heap, .mut, []⟩).insertDead ⟨2, by decide⟩ ⟨8, 3⟩)
+
+/-- Canary registry: vtable `1` implements `dyn Trait7 + Send` for concrete type code `42`. -/
+def canaryWideReg : VTableRegistry :=
+  { VTableRegistry.empty with
+    allocToData := VTableRegistry.empty.allocToData.insert ⟨1, by decide⟩
+      ⟨.uint 8, 42, none, 16, 3, canarySpecTable 2, []⟩ }
+
+/-- Canary encoding of the existentials of `canarySpecTable`. -/
+def canaryWideDynCode (s : DynExistentialSpec) : Nat :=
+  if s == canarySpecTable 0 then 0
+  else if s == canarySpecTable 1 then 1
+  else if s == canarySpecTable 2 then 2
+  else if s == canarySpecTable 3 then 3
+  else 4
+
+
+private theorem canaryWideReg_get? (id : MiriAllocId) (data : VTableData)
+    (h : canaryWideReg.allocToData.get? id = some data) :
+    id = ⟨1, by decide⟩ ∧ data.spec = canarySpecTable 2 := by
+  unfold canaryWideReg at h
+  dsimp only at h
+  by_cases hid : id = ⟨1, by decide⟩
+  · subst hid
+    rw [ExtTreeMap0.get?_insert_self] at h
+    injection h with h
+    subst h
+    exact ⟨rfl, rfl⟩
+  · rw [ExtTreeMap0.get?_insert_ne _ _ hid] at h
+    cases h
+
+private theorem canaryWide_predsKeyInjective (n : Nat) :
+    PredsKeyInjective (canarySpecTable n).effectivePreds := by
+  have h : ∀ k : Nat, PredsKeyInjective (canarySpecTable k).effectivePreds := by
+    intro k
+    match k with
+    | 0 => intro p hp q hq; revert p q; decide
+    | 1 => intro p hp q hq; revert p q; decide
+    | 2 => intro p hp q hq; revert p q; decide
+    | 3 => intro p hp q hq; revert p q; decide
+    | k + 4 =>
+      have hk : canarySpecTable (k + 4) = ⟨some 8, AutoTraitSet.empty, []⟩ := rfl
+      rw [hk]
+      intro p hp q hq; revert p q; decide
+  exact h n
+
+/-- Canary hooks: `annealValidityHooks` data-pointer leaves + world-backed vtable leaves. -/
+def canaryWideHooks (vtWord : Miri.Memory.Scalar AnnealProv) (expected : Nat) :
+    Miri.Interpreter.ValidityVisitor.Hooks AnnealProv AnnealStepState
+      Trusted.Rustc.V2026_06_01.MirAst.Ty Unit Unit Unit Unit :=
+  annealWideDynHooks emptyLayoutTable
+    (worldVTableHooks AnnealProv AnnealStepState Trusted.Rustc.V2026_06_01.MirAst.Ty
+      canaryWideWorld canaryWideReg canaryWideResolve canarySpecTable canaryWideDynCode)
+    ⟨.uninit, canaryUnsizedLayout⟩ (canaryWideTarget vtWord) expected
+
+private theorem canaryWide_run (m : AnnealStepState) (recursive : Bool)
+    (vtWord : Miri.Memory.Scalar AnnealProv) (expected : Nat)
+    (vtPtr : Miri.Memory.Pointer (Option AnnealProv)) (vptr : VTablePtrVal) (e : WideDynErr)
+    (htoptr : vtWord.toPointer annealTargetDataLayout = .ok vtPtr)
+    (hres : match vptr with
+      | .null => canaryWideResolve vtPtr = .error .danglingInteger
+      | .danglingInt _ => canaryWideResolve vtPtr = .error .danglingInteger
+      | .provenanced id off =>
+        canaryWideResolve vtPtr = .ok (toMiriAllocId id, Miri.ABI.Size.ofBytes off))
+    (hbad : validateVTableHalf canaryWideWorld canaryWideReg vptr (canarySpecTable expected) =
+      .error e) :
+    Miri.Interpreter.ValidityVisitor.validatePlace (canaryWideHooks vtWord expected)
+        { kind := .tuple .nil, layoutIdx := 0 } 1
+        ⟨.memory ⟨⟨Miri.ABI.Size.ZERO, none⟩, .none, none⟩, canaryUnsizedLayout⟩
+        recursive false m = .error (wideDynVTableErrToMiri e) m :=
+  (validatePlace_wideDyn_invalidVTable_precedes_dataPtr_at (canaryWideHooks vtWord expected)
+    { kind := .tuple .nil, layoutIdx := 0 } 0
+    ⟨.memory ⟨⟨Miri.ABI.Size.ZERO, none⟩, .none, none⟩, canaryUnsizedLayout⟩ recursive m ""
+    false expected ⟨.uninit, canaryUnsizedLayout⟩ (canaryWideTarget vtWord) vtWord vtPtr
+    canaryWideWorld canaryWideReg canaryWideResolve canarySpecTable canaryWideDynCode vptr e
+    rfl (fun _ _ hx => hx) rfl rfl rfl rfl rfl rfl htoptr
+    (worldVTableHooks_readsWorldAt _ _ _ _ _ _ _ _ _ _)
+    (fun id data hd => by rw [(canaryWideReg_get? id data hd).2]; decide)
+    hres (canaryWide_predsKeyInjective expected)
+    (fun id data hd => by
+      rw [(canaryWideReg_get? id data hd).2]; exact canaryWide_predsKeyInjective 2)
+    hbad).1
+
+/-- **Closed wide-`dyn` vtable-before-data canary on the vendored `validatePlace` driver**
+(`lean-miri#82`), for EVERY machine state and BOTH `recursive = false` and `recursive = true`. The
+data pointer is null in every case, and every data-pointer leaf is the real
+`RefLM3_2.annealValidityHooks` leaf:
+1. double-null `&dyn Trait7` (`null` vtable word) — `InvalidVTablePointer`;
+2. dangling integer vtable word — `InvalidVTablePointer`;
+3. vtable word pointing to a dead allocation — `InvalidVTablePointer`;
+4. vtable word pointing to a `.function` global (wrong global kind) — `InvalidVTablePointer`;
+5. vtable word pointing to a live heap allocation — `InvalidVTablePointer`;
+6. `dyn Trait7 + Send` vtable for an expected `dyn Trait8` — `InvalidVTableTrait`;
+and the valid vtable is accepted by the vtable stage (`.ok 42`) — so the six rejections are not
+vacuous — after which the driver reaches the first data-pointer leaf, where the stock
+`annealValidityHooks.sizeAndAlign` fails closed (`unsupported`, not undefined behavior). -/
+theorem wideDyn_invalidVTable_validatePlace_canary (m : AnnealStepState) (recursive : Bool) :
+    let intWord : UInt64 → Miri.Memory.Scalar AnnealProv := fun a =>
+      Miri.Memory.Scalar.fromScalarInt (Miri.Memory.ScalarInt.ofUInt64 a)
+    let ptrWord : Miri.Memory.AllocId → Miri.Memory.Scalar AnnealProv := fun id =>
+      Miri.Memory.Scalar.fromPointer annealTargetDataLayout ⟨⟨0⟩, .concrete id ⟨1, by decide⟩⟩
+    let run := fun (vtWord : Miri.Memory.Scalar AnnealProv) (expected : Nat) =>
+      Miri.Interpreter.ValidityVisitor.validatePlace (canaryWideHooks vtWord expected)
+        { kind := .tuple .nil, layoutIdx := 0 } 1
+        ⟨.memory ⟨⟨Miri.ABI.Size.ZERO, none⟩, .none, none⟩, canaryUnsizedLayout⟩
+        recursive false m
+    run (intWord 0) 3 = .error (.undefinedBehavior "InvalidVTablePointer") m ∧
+    run (intWord 4096) 3 = .error (.undefinedBehavior "InvalidVTablePointer") m ∧
+    run (ptrWord ⟨2, by decide⟩) 3 = .error (.undefinedBehavior "InvalidVTablePointer") m ∧
+    run (ptrWord ⟨3, by decide⟩) 3 = .error (.undefinedBehavior "InvalidVTablePointer") m ∧
+    run (ptrWord ⟨4, by decide⟩) 3 = .error (.undefinedBehavior "InvalidVTablePointer") m ∧
+    run (ptrWord ⟨1, by decide⟩) 4 = .error (.undefinedBehavior "InvalidVTableTrait") m ∧
+    Miri.Interpreter.VTable.getPtrVTableType (canaryWideHooks (ptrWord ⟨1, by decide⟩) 3).vtable
+      { kind := .tuple .nil, layoutIdx := 0 }
+      ⟨⟨0⟩, some (.concrete ⟨1, by decide⟩ ⟨1, by decide⟩)⟩ (some 3) m = .ok 42 m ∧
+    run (ptrWord ⟨1, by decide⟩) 3 = .error (.unsupported "validity of an unsized pointee") m := by
+  intro intWord ptrWord run
+  have hvalid : Miri.Interpreter.VTable.getPtrVTableType
+      (canaryWideHooks (ptrWord ⟨1, by decide⟩) 3).vtable
+      ({ kind := .tuple .nil, layoutIdx := 0 } : Trusted.Rustc.V2026_06_01.MirAst.Ty)
+      ⟨⟨0⟩, some (.concrete ⟨1, by decide⟩ ⟨1, by decide⟩)⟩ (some 3) m = .ok 42 m :=
+    miri_getPtrVTableTypeRead_eq_validateVTableHalf_at
+      (canaryWideHooks (ptrWord ⟨1, by decide⟩) 3).vtable.readHooks
+      ({ kind := .tuple .nil, layoutIdx := 0 } : Trusted.Rustc.V2026_06_01.MirAst.Ty) m
+      canaryWideWorld canaryWideReg canaryWideResolve canarySpecTable canaryWideDynCode
+      (worldVTableHooks_readsWorldAt _ _ _ _ _ _ _ _ _ _)
+      ⟨⟨0⟩, some (.concrete ⟨1, by decide⟩ ⟨1, by decide⟩)⟩ (.provenanced ⟨1, by decide⟩ 0) 3
+      (fun id data hd => by rw [(canaryWideReg_get? id data hd).2]; decide)
+      rfl (canaryWide_predsKeyInjective 3)
+      (fun id data hd => by
+        rw [(canaryWideReg_get? id data hd).2]; exact canaryWide_predsKeyInjective 2)
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, hvalid, ?_⟩
+  · exact canaryWide_run m recursive (intWord 0) 3 ⟨⟨0⟩, none⟩ .null .invalidVTableNull
+      (by decide) rfl rfl
+  · exact canaryWide_run m recursive (intWord 4096) 3 ⟨⟨4096⟩, none⟩ (.danglingInt 4096)
+      (.invalidVTableDanglingInt 4096) (by decide) rfl rfl
+  · exact canaryWide_run m recursive (ptrWord ⟨2, by decide⟩) 3
+      ⟨⟨0⟩, some (.concrete ⟨2, by decide⟩ ⟨1, by decide⟩)⟩ (.provenanced ⟨2, by decide⟩ 0)
+      (.invalidVTableNotGlobalVTable ⟨2, by decide⟩) (by decide) rfl rfl
+  · exact canaryWide_run m recursive (ptrWord ⟨3, by decide⟩) 3
+      ⟨⟨0⟩, some (.concrete ⟨3, by decide⟩ ⟨1, by decide⟩)⟩ (.provenanced ⟨3, by decide⟩ 0)
+      (.invalidVTableNotGlobalVTable ⟨3, by decide⟩) (by decide) rfl rfl
+  · exact canaryWide_run m recursive (ptrWord ⟨4, by decide⟩) 3
+      ⟨⟨0⟩, some (.concrete ⟨4, by decide⟩ ⟨1, by decide⟩)⟩ (.provenanced ⟨4, by decide⟩ 0)
+      (.invalidVTableNotGlobalVTable ⟨4, by decide⟩) (by decide) rfl rfl
+  · exact canaryWide_run m recursive (ptrWord ⟨1, by decide⟩) 4
+      ⟨⟨0⟩, some (.concrete ⟨1, by decide⟩ ⟨1, by decide⟩)⟩ (.provenanced ⟨1, by decide⟩ 0)
+      (.invalidVTableTrait (canarySpecTable 2) (canarySpecTable 4)) (by decide) rfl rfl
+  · exact validatePlace_error_of_root_visit_error (canaryWideHooks (ptrWord ⟨1, by decide⟩) 3)
+      { kind := .tuple .nil, layoutIdx := 0 } 1
+      ⟨.memory ⟨⟨Miri.ABI.Size.ZERO, none⟩, .none, none⟩, canaryUnsizedLayout⟩ recursive m m "" _
+      rfl (fun _ hx => hx)
+      (visit_wideDyn_validVTable_reaches_sizeAndAlign
+        (canaryWideHooks (ptrWord ⟨1, by decide⟩) 3) { kind := .tuple .nil, layoutIdx := 0 } 0 _
+        ⟨.memory ⟨⟨Miri.ABI.Size.ZERO, none⟩, .none, none⟩, canaryUnsizedLayout⟩ m m false 3
+        ⟨.uninit, canaryUnsizedLayout⟩ (canaryWideTarget (ptrWord ⟨1, by decide⟩))
+        (ptrWord ⟨1, by decide⟩) ⟨⟨0⟩, some (.concrete ⟨1, by decide⟩ ⟨1, by decide⟩)⟩ 42 _
+        rfl rfl rfl rfl rfl rfl rfl (by decide) hvalid rfl)
 
 /-! ## Part 4. Axiom pins
 
@@ -8533,12 +10401,82 @@ depends on axioms: [propext, Quot.sound]
 #guard_msgs (whitespace := lax) in
 #print axioms sized_fastPath_char_and_wideDyn_canary
 
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.worldVTableReadHooks_readsWorldAt'
+depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms worldVTableReadHooks_readsWorldAt
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.miri_checkForTypeRead_eq_vtableMatchesExpectedSpec_at'
+depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms miri_checkForTypeRead_eq_vtableMatchesExpectedSpec_at
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.miri_getPtrVTableTypeRead_eq_validateVTableHalf_at'
+depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms miri_getPtrVTableTypeRead_eq_validateVTableHalf_at
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.wideDynVTableErrToMiri_isUB'
+depends on axioms: [propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wideDynVTableErrToMiri_isUB
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.visit_wideDyn_invalidVTable_precedes_dataPtr_at'
+depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms visit_wideDyn_invalidVTable_precedes_dataPtr_at
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.validateVTableHalf_invalidForms'
+depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms validateVTableHalf_invalidForms
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.visit_wideDyn_validVTable_reaches_sizeAndAlign'
+depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms visit_wideDyn_validVTable_reaches_sizeAndAlign
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.visit_unsizedRef_metadataTail_error'
+depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms visit_unsizedRef_metadataTail_error
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.worldVTableHooks_readsWorldAt'
+depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms worldVTableHooks_readsWorldAt
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.liveDuplicateKey_perm_separation_canary'
+depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms liveDuplicateKey_perm_separation_canary
+
 /-! ### 4B. Vendored stateful bridge theorems (at most `propext`, `Classical.choice`, `Quot.sound`)
 
-The statements of these 46 theorems directly mention vendored `Miri.*` or
+The statements of these 72 theorems directly mention vendored `Miri.*` or
 `LeanMiriSpec.*` stateful definitions (`MemoryState`, `KeyedArray`,
 `AnnealMachine` / `annealResolvePtr`, `StateRelLM3_1` / `StateRelLM3_2`,
-`BorrowTree.releaseProtector`, `beforeStackPopWithEnsure`,
+`BorrowTree.releaseProtector`, `beforeStackPopWithEnsure`, `MachineHooks.MachineState`,
 `VTableMachine.reserve`, `ValidityMachine`, `annealValidityHooks`,
 `ValidityVisitor.validatePlace`) whose own types/definitions inherit
 `Classical.choice` from `Std.HashMap` / `KeyedArray` (recorded in Part 4C),
@@ -8866,12 +10804,194 @@ depends on axioms: [propext, Classical.choice, Quot.sound]
 #guard_msgs (whitespace := lax) in
 #print axioms validityMachine_null_canary
 
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.keyedStateRelLM3_1_iff'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms keyedStateRelLM3_1_iff
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.keyedStateRelLM3_2_iff'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms keyedStateRelLM3_2_iff
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.stateRelLM3_1_iff_existsUnique_keyed'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms stateRelLM3_1_iff_existsUnique_keyed
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.stateRelLM3_2_iff_existsUnique_keyed'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms stateRelLM3_2_iff_existsUnique_keyed
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.stateRelLM3_1_livePerm_deadAny'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms stateRelLM3_1_livePerm_deadAny
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.stateRelLM3_2_livePerm_deadAny'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms stateRelLM3_2_livePerm_deadAny
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.stateRelLM3_1_livePerm_deadAny_iff'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms stateRelLM3_1_livePerm_deadAny_iff
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.stateRelLM3_2_livePerm_deadAny_iff'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms stateRelLM3_2_livePerm_deadAny_iff
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.annealMachineToKeyed_eq_of_liveDead_perm'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms annealMachineToKeyed_eq_of_liveDead_perm
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.keyedStateRelLM3_1_liveDead_perm_iff'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms keyedStateRelLM3_1_liveDead_perm_iff
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.keyedStateRelLM3_2_liveDead_perm_iff'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms keyedStateRelLM3_2_liveDead_perm_iff
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.memoryRaceAccess_dealloc_rel_machineDeallocHook'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms memoryRaceAccess_dealloc_rel_machineDeallocHook
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.allocationMachine_deallocate_raceAllocations_eq'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms allocationMachine_deallocate_raceAllocations_eq
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.miri_beforeStackPopWithEnsure_eq_releaseAll'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms miri_beforeStackPopWithEnsure_eq_releaseAll
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.stackPopReleaseAll_simulates_execProtectorEndAccesses'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms stackPopReleaseAll_simulates_execProtectorEndAccesses
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.miri_beforeStackPopWithEnsure_simulates_execFrameExitMiri'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms miri_beforeStackPopWithEnsure_simulates_execFrameExitMiri
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.noAccessReleaseSim'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms noAccessReleaseSim
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.stackPopReleaseAll_singleton'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms stackPopReleaseAll_singleton
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.validatePlace_error_of_root_visit_error'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms validatePlace_error_of_root_visit_error
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.validatePlace_wideDyn_invalidVTable_precedes_dataPtr_at'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms validatePlace_wideDyn_invalidVTable_precedes_dataPtr_at
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.annealValidityHooks_getPtrVTableType_failClosed'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms annealValidityHooks_getPtrVTableType_failClosed
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.annealValidityHooks_not_readsWorld'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms annealValidityHooks_not_readsWorld
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.annealValidityHooks_unsizedRef_validatePlace_failClosed'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms annealValidityHooks_unsizedRef_validatePlace_failClosed
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.deallocRaceStage_canary'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms deallocRaceStage_canary
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.stackPopReleaseAll_canary'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms stackPopReleaseAll_canary
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.wideDyn_invalidVTable_validatePlace_canary'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms wideDyn_invalidVTable_validatePlace_canary
+
 /-! ### 4C. Origin of `Classical.choice` in vendored `Miri.*` / `LeanMiriSpec.*` constants
 
-These pins document why the 46 vendored-state bridge theorems in Part 4B inherit
+These pins document why the 72 vendored-state bridge theorems in Part 4B inherit
 `Classical.choice` solely from the types/definitions of vendored `Miri.*` and
 pre-existing `LeanMiriSpec.*` constants (`Std.HashMap` / `KeyedArray`), while
-all 104 choice-free theorems in Part 4A remain strictly free of `Classical.choice`. -/
+all 114 choice-free theorems in Part 4A remain strictly free of `Classical.choice`. -/
 
 /--
 info: 'Std.HashMap'
