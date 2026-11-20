@@ -869,6 +869,8 @@ inductive Prog : Type where
   | indexOob
   /-- Read through a wide reference disabled by a parent write. -/
   | disabledDeref
+  /-- Non-dereferencing `ptr::metadata` on a disabled wide pointer. -/
+  | disabledMetadata
   deriving DecidableEq
 
 /-- Corpus queries: the wide pointer's length and the index operand. -/
@@ -906,7 +908,7 @@ def allMrModes : List (MrMem × Regime) :=
 /-- All programs. -/
 def allProgs : List Prog :=
   [.metadata, .placeLen, .indexRead, .reborrow, .sizeOfVal, .roundTrip,
-    .indexOob, .disabledDeref]
+    .indexOob, .disabledDeref, .disabledMetadata]
 
 /-- All queries. -/
 def allQueries : List Query := [.inBounds, .oobIndex, .oobLen, .tooBig]
@@ -1127,6 +1129,9 @@ def annealVerdict (r : Regime) (p : Prog) (q : Query) (_c : Unit) :
   | .indexOob => runVerdict wideSliceIdxOobMir 30 wideSliceIdxOobS0
   | .disabledDeref =>
     runVerdict wideSliceDisabledDerefUbMir 30 wideSliceDisabledDerefUbS0
+  | .disabledMetadata =>
+    runVerdict wideSliceMetadataAfterParentWriteMir 30
+      wideSliceMetadataAfterParentWriteS0
 
 /-! ### B.3 MiniRust: `MiniRustSpec` on the corpus -/
 
@@ -1134,6 +1139,7 @@ section MiniRust
 
 open MiniRustSpec MiniRustSpec.Gen MiniRustSpec.LibSpecr
 open MiniRustSpec.Interp MiniRustSpec.Correspondence
+open MiniRustSpec.Correspondence.Witness
 open MiniRustSpec.Correspondence.WideSliceDst
 open MiniRustSpec.Correspondence.RefWitness
 
@@ -1241,6 +1247,77 @@ def machVerdictTB : Interp MachTB → Option (Verdict Nat)
   | .error (.unsupported _) => some .unsupported
   | .error _ => none
 
+/-- Companion MiniRust function to `wideSliceDisabledDerefUbFn`: activates
+`_4`'s borrow, copies it to a raw wide pointer `_7`, disables its borrow tag
+by overwriting `_2`, and then extracts `ptr::metadata(_7)` without
+dereferencing memory, returning `4` under both `BasicMemory` and
+`TreeBorrowsMemory`. -/
+def disabledMetadataFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32),
+    (localName 2, .Array (.Int u32) 4),
+    (localName 3, .Ptr (.Ref .Mutable arrU32_4PointeeInfo)),
+    (localName 4, .Ptr (sliceRefPtrType .mut ⟨4⟩ ⟨4⟩)),
+    (localName 5, .Int IntType.usize_ty),
+    (localName 6, mrWidePairTupleTy),
+    (localName 7, .Ptr (.Raw .ElementCount))]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2), .StorageLive (localName 3),
+      .StorageLive (localName 4), .StorageLive (localName 5),
+      .StorageLive (localName 6), .StorageLive (localName 7),
+      .Assign (.Local (localName 2))
+        (.Tuple [.Constant (.Int 10) (.Int u32),
+                 .Constant (.Int 20) (.Int u32),
+                 .Constant (.Int 30) (.Int u32),
+                 .Constant (.Int 40) (.Int u32)]
+          (.Array (.Int u32) 4)),
+      .Assign (.Local (localName 3))
+        (.AddrOf (.Local (localName 2))
+          (.Ref .Mutable arrU32_4PointeeInfo)),
+      .Assign (.Local (localName 4))
+        (.UnOp (.Cast (.Transmute (.Ptr (sliceRefPtrType .mut ⟨4⟩ ⟨4⟩))))
+          (.Tuple [.UnOp (.Cast (.Transmute (.Ptr (.Raw .None))))
+                     (.Load (.Local (localName 3))),
+                   .Constant (.Int 4) (.Int IntType.usize_ty)]
+            mrWidePairTupleTy)),
+      .Assign (.Local (localName 5))
+        (.Constant (.Int 0) (.Int IntType.usize_ty)),
+      .Assign
+        (.Index (.Deref (.Load (.Local (localName 4))) (.Slice (.Int u32)))
+          (.Load (.Local (localName 5))))
+        (.Constant (.Int 77) (.Int u32)),
+      .Assign (.Local (localName 7))
+        (.UnOp (.Cast (.Transmute (.Ptr (.Raw .ElementCount))))
+          (.Load (.Local (localName 4)))),
+      .Assign (.Local (localName 2))
+        (.Tuple [.Constant (.Int 1) (.Int u32),
+                 .Constant (.Int 2) (.Int u32),
+                 .Constant (.Int 3) (.Int u32),
+                 .Constant (.Int 4) (.Int u32)]
+          (.Array (.Int u32) 4)),
+      .Assign (.Local (localName 6))
+        (.UnOp (.Cast (.Transmute mrWidePairTupleTy))
+          (.Load (.Local (localName 7)))),
+      .Assign (.Local (localName 5))
+        (.Load (.Field (.Local (localName 6)) 1)),
+      .Assign (.Local (localName 0))
+        (.UnOp (.Cast (.IntToInt u32)) (.Load (.Local (localName 5))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+/-- Initial `BasicMemory` machine for `disabledMetadataFn`. -/
+def disabledMetadataMInit : Mach :=
+  machine wideSliceMetadataAfterParentWriteMir disabledMetadataFn
+    wideSliceMetadataAfterParentWriteS0.frame.locals disabledMetadataFn.start
+
+/-- Initial `TreeBorrowsMemory` machine for `disabledMetadataFn`. -/
+def disabledMetadataTBInit : MachTB := liftMachToTB disabledMetadataMInit
+
 /-- Verdict of MiniRust on each corpus key. Programs outside the MiniRust
 fragment of this corpus have no run. -/
 def mrVerdict (m : MrMem × Regime) (p : Prog) (q : Query) (_c : Unit) :
@@ -1260,6 +1337,10 @@ def mrVerdict (m : MrMem × Regime) (p : Prog) (q : Query) (_c : Unit) :
     machVerdict (Interp.steps 13 wideSliceDisabledDerefUbMInit)
   | .disabledDeref, .treeBorrows =>
     machVerdictTB (Interp.stepsTB 12 wideSliceDisabledDerefUbTBInit)
+  | .disabledMetadata, .basic =>
+    machVerdict (Interp.steps 18 disabledMetadataMInit)
+  | .disabledMetadata, .treeBorrows =>
+    machVerdictTB (Interp.stepsTB 18 disabledMetadataTBInit)
   | _, _ => none
 
 end MiniRust
@@ -1277,6 +1358,7 @@ def gateMR (m : MrMem × Regime) (p : Prog) (q : Query) : Bool :=
   | .indexOob => decide (m.2 = .raw ∧ q = .inBounds)
   | .disabledDeref =>
     decide (m.1 = .treeBorrows ∧ m.2 = .raw ∧ q = .inBounds)
+  | .disabledMetadata => decide (m.2 = .raw ∧ q = .inBounds)
   | _ => false
 
 /-! ### B.4 LeanMiri: reference table of the vendored `Miri` interpreter
@@ -1348,7 +1430,7 @@ def sideMR : Side Regime (MrMem × Regime) Prog Query Unit Nat (Nat × Nat)
   faultProg := .reborrow
   faultQuery := .tooBig
   faultChoice := ()
-  flip := some ((.basic, .raw), (.basic, .safe), .reborrow, .tooBig, ())
+  flip := some ((.basic, .safe), (.basic, .raw), .reborrow, .tooBig, ())
 
 /-- The LeanMiri side over an arbitrary presentation `verdictLM` of the
 LeanMiri authority. -/
@@ -1367,7 +1449,7 @@ def sideLM (verdictLM : Regime → Prog → Query → Unit → Option (Verdict N
   faultProg := .reborrow
   faultQuery := .tooBig
   faultChoice := ()
-  flip := some (.raw, .safe, .reborrow, .tooBig, ())
+  flip := some (.safe, .raw, .reborrow, .tooBig, ())
 
 /-- Kernel-evaluated certificate of the MiniRust side. -/
 theorem sideMR_check : sideMR.check model = true := by decide +kernel
@@ -1853,17 +1935,186 @@ def lmModeWitness_with
     ModeSensitivityWitness ((sideLM verdictLM).rel model) :=
   ((sideLM verdictLM).flipW model h).get rfl
 
-/-- The witness separates the raw and safe regimes at `tooBig`, and the
+/-- The witness separates the safe and raw regimes at `tooBig`, and the
 regimes are genuinely different modes. -/
 theorem lmModeWitness_spec_with
     (h : (sideLM verdictLM).check model = true) :
-    (lmModeWitness_with verdictLM h).m₁ = .raw ∧
-      (lmModeWitness_with verdictLM h).m₂ = .safe ∧
+    (lmModeWitness_with verdictLM h).m₁ = .safe ∧
+      (lmModeWitness_with verdictLM h).m₂ = .raw ∧
       (lmModeWitness_with verdictLM h).p = .reborrow ∧
       (lmModeWitness_with verdictLM h).q = .tooBig ∧
       (lmModeWitness_with verdictLM h).m₁ ≠
         (lmModeWitness_with verdictLM h).m₂ :=
   ⟨rfl, rfl, rfl, rfl, (lmModeWitness_with verdictLM h).mode_ne⟩
+
+/-- The mode-sensitivity witness of the MiniRust side (`safe` vs `raw` at
+`tooBig`) is a genuine fault flip (`IsFaultFlip`): the safe reborrow faults
+`.undefined`, whereas the raw reborrow returns `2^61`. -/
+theorem mrModeWitness_isFaultFlip :
+    ∀ ms, (sideMR.flipW model sideMR_check) = some ms → ms.IsFaultFlip := by
+  intro ms hms
+  have hms' : ms = (sideMR.flipW model sideMR_check).get rfl := by
+    have : some ms = some ((sideMR.flipW model sideMR_check).get rfl) :=
+      hms.symm
+    exact Option.some.inj this
+  subst hms'
+  obtain ⟨oa, orr, ha, hr, hc, hna, hnr⟩ :=
+    ((sideMR.flipW model sideMR_check).get rfl).flips
+  refine ⟨oa, orr, ha, hr, hc, hna, hnr, .undefined, ?_⟩
+  have hA : outcome? (annealVerdict .safe .reborrow .tooBig ()) =
+      some (.fault .undefined) :=
+    congrArg outcome?
+      (by decide +kernel :
+        annealVerdict .safe .reborrow .tooBig () = some .undefinedBehavior)
+  exact Option.some.inj (ha.symm.trans hA)
+
+/-- The mode-sensitivity witness of the LeanMiri side is likewise a genuine
+fault flip (`IsFaultFlip`), for every certified presentation. -/
+theorem lmModeWitness_isFaultFlip_with
+    (h : (sideLM verdictLM).check model = true) :
+    ∀ ms, ((sideLM verdictLM).flipW model h) = some ms → ms.IsFaultFlip := by
+  intro ms hms
+  have hms' : ms = lmModeWitness_with verdictLM h := by
+    have : some ms = some (lmModeWitness_with verdictLM h) := hms.symm
+    exact Option.some.inj this
+  subst hms'
+  obtain ⟨oa, orr, ha, hr, hc, hna, hnr⟩ :=
+    (lmModeWitness_with verdictLM h).flips
+  refine ⟨oa, orr, ha, hr, hc, hna, hnr, .undefined, ?_⟩
+  have hA : outcome? (annealVerdict .safe .reborrow .tooBig ()) =
+      some (.fault .undefined) :=
+    congrArg outcome?
+      (by decide +kernel :
+        annealVerdict .safe .reborrow .tooBig () = some .undefinedBehavior)
+  exact Option.some.inj (ha.symm.trans hA)
+
+/-- Identity front model over the wide-slice corpus (with `CodecLaws.id Nat`)
+for non-vacuous fault-flip-preserving vertical and transitive composition. -/
+def frontModel : Model Regime Prog Query Unit Nat Nat where
+  evalA := annealVerdict
+  codec := CodecLaws.id Nat
+  progs := allProgs
+  queries := allQueries
+  choices := [()]
+  progs_complete := model.progs_complete
+  queries_complete := model.queries_complete
+  choices_complete := model.choices_complete
+
+/-- Machine-level view of the front model on the MiniRust modes. -/
+def frontSideMR :
+    Side Regime (MrMem × Regime) Prog Query Unit Nat Nat where
+  toAnneal := sideMR.toAnneal
+  gate := gateMR
+  verdictR := fun m p q c => annealVerdict m.2 p q c
+  rep := fun r => r
+  modes := sideMR.modes
+  modes_complete := sideMR.modes_complete
+  wMode := sideMR.wMode
+  okProg := sideMR.okProg
+  okQuery := sideMR.okQuery
+  okChoice := sideMR.okChoice
+  faultProg := sideMR.faultProg
+  faultQuery := sideMR.faultQuery
+  faultChoice := sideMR.faultChoice
+  flip := sideMR.flip
+
+/-- Machine-level view of the front model on the LeanMiri modes. -/
+def frontSideLM : Side Regime Regime Prog Query Unit Nat Nat where
+  toAnneal := fun m => m
+  gate := gateLM
+  verdictR := annealVerdict
+  rep := fun r => r
+  modes := allRegimes
+  modes_complete := fun m => by cases m <;> decide
+  wMode := .safe
+  okProg := .reborrow
+  okQuery := .inBounds
+  okChoice := ()
+  faultProg := .reborrow
+  faultQuery := .tooBig
+  faultChoice := ()
+  flip := some (.safe, .raw, .reborrow, .tooBig, ())
+
+/-- Certificate of the front MiniRust view. -/
+theorem frontSideMR_check : frontSideMR.check frontModel = true := by
+  decide +kernel
+
+/-- Certificate of the front LeanMiri view. -/
+theorem frontSideLM_check : frontSideLM.check frontModel = true := by
+  decide +kernel
+
+/-- Front bundle of the wide-slice corpus. -/
+def frontBundle :
+    DualCorrespondenceBundle Regime Prog Query Nat Unit Nat
+      (MrMem × Regime) Unit Nat Unit Regime Unit Nat Unit :=
+  Corpus.bundle frontModel frontSideMR frontSideLM frontSideMR_check
+    frontSideLM_check
+
+/-- **Fault-flip-preserving vertical composition** (`compPreserveFaultMode`):
+transports BOTH genuine `some ms` fault-flip witnesses (`safe` vs `raw` at
+`tooBig`) WITHOUT using `ReverseTotal` on either authority. -/
+def faultFlipComp_with
+    (h : (sideLM verdictLM).check model = true) :
+    DualCorrespondenceBundle Regime Prog Query Nat Unit (Nat × Nat)
+      (MrMem × Regime) Unit Nat Unit Regime Unit Nat Unit :=
+  (bundleWith verdictLM h).compPreserveFaultMode (CodecLaws.id Nat)
+    frontBundle.mrSim frontBundle.lmSim
+    (fun _ _ _ _ _ => Iff.rfl) (fun _ _ _ _ _ => Iff.rfl)
+    (fun _ _ _ hg => hg) (fun _ _ _ hg => hg)
+    (fun _ _ hr => hr) (fun _ _ hr => hr)
+    mrModeWitness_isFaultFlip (lmModeWitness_isFaultFlip_with verdictLM h)
+    frontBundle.toAnnealMR frontBundle.toAnnealLM frontBundle.ExecAnneal
+    frontBundle.anneal_exec_coherent
+
+/-- **Fault-flip-preserving transitive composition**
+(`transPreserveFaultMode`): transports both genuine fault-flip witnesses
+across `frontBundle` without `ReverseTotal`. -/
+def faultFlipTrans_with
+    (h : (sideLM verdictLM).check model = true) :
+    DualCorrespondenceBundle Regime Prog Query Nat Unit (Nat × Nat)
+      (MrMem × Regime) Unit Nat Unit Regime Unit Nat Unit :=
+  frontBundle.transPreserveFaultMode (bundleWith verdictLM h)
+    (fun _ _ _ _ _ => Iff.rfl) (fun _ _ _ _ _ => Iff.rfl)
+    (fun _ _ _ hg => hg) (fun _ _ _ hg => hg)
+    (fun _ => rfl) (fun _ => rfl)
+    mrModeWitness_isFaultFlip (lmModeWitness_isFaultFlip_with verdictLM h)
+
+/-- **Non-vacuous mixed-transport vertical composition**
+(`compPreserveModeMixed`): transports MiniRust's genuine `some` fault-flip
+witness via `.faultFlip` (no `ReverseTotal`) and LeanMiri's genuine `some`
+mode witness via `.reverseTotal`. -/
+def mixedComp_with
+    (h : (sideLM verdictLM).check model = true) :
+    DualCorrespondenceBundle Regime Prog Query Nat Unit (Nat × Nat)
+      (MrMem × Regime) Unit Nat Unit Regime Unit Nat Unit :=
+  (bundleWith verdictLM h).compPreserveModeMixed (CodecLaws.id Nat)
+    frontBundle.mrSim frontBundle.lmSim
+    (fun _ _ _ _ _ => Iff.rfl) (fun _ _ _ _ _ => Iff.rfl)
+    (fun _ _ _ hg => hg) (fun _ _ _ hg => hg)
+    (fun _ _ hr => hr) (fun _ _ hr => hr)
+    (.faultFlip mrModeWitness_isFaultFlip)
+    (.reverseTotal
+      (frontSideLM.reverseTotal frontModel
+        (Bool.and_eq_true _ _ ▸ frontSideLM_check).1)
+      (fun _ _ _ _ _ => rfl))
+    frontBundle.toAnnealMR frontBundle.toAnnealLM frontBundle.ExecAnneal
+    frontBundle.anneal_exec_coherent
+
+/-- Both authorities retain genuine (`isSome = true`) mode-sensitivity
+witnesses through `compPreserveFaultMode`, `transPreserveFaultMode`, and
+non-vacuous `compPreserveModeMixed`. -/
+theorem faultFlipComp_modeSensitive_with
+    (h : (sideLM verdictLM).check model = true) :
+    (faultFlipComp_with verdictLM h).mrFlip.modeSensitivity?.isSome = true ∧
+      (faultFlipComp_with verdictLM h).lmFlip.modeSensitivity?.isSome =
+        true ∧
+      (faultFlipTrans_with verdictLM h).mrFlip.modeSensitivity?.isSome =
+        true ∧
+      (faultFlipTrans_with verdictLM h).lmFlip.modeSensitivity?.isSome =
+        true ∧
+      (mixedComp_with verdictLM h).mrFlip.modeSensitivity?.isSome = true ∧
+      (mixedComp_with verdictLM h).lmFlip.modeSensitivity?.isSome = true :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- Neither model is mode-invariant on the LeanMiri side. -/
 theorem lm_not_mode_invariant_with
@@ -1957,6 +2208,30 @@ the MiniRust side at `TreeBorrowsMemory`. -/
 def mrDisabledDerefFault : FaultEquivWitness (sideMR.rel model) :=
   sideMR.faultAt model sideMR_sim (.treeBorrows, .raw) .disabledDeref
     .inBounds () rfl (by decide +kernel)
+
+/-- Non-dereferencing `ptr::metadata` on the same parent-write-disabled wide
+pointer: a positive witness on the MiniRust side at `TreeBorrowsMemory`,
+contrasting directly with `mrDisabledDerefFault`. -/
+def mrDisabledMetadataPositive : PositiveWitness (sideMR.rel model) :=
+  sideMR.positiveAt model sideMR_sim (.treeBorrows, .raw) .disabledMetadata
+    .inBounds () rfl (by decide +kernel) (by decide +kernel)
+
+/-- Direct contrast on a Tree Borrows `Disabled` wide pointer: dereferencing
+it is UB in both Anneal and MiniRust (`TreeBorrowsMemory`), whereas
+non-dereferencing `ptr::metadata` succeeds returning `4` in Anneal,
+`BasicMemory`, and `TreeBorrowsMemory`. -/
+theorem disabledDeref_vs_disabledMetadata_contrast :
+    annealVerdict .raw .disabledDeref .inBounds () =
+        some .undefinedBehavior ∧
+      mrVerdict (.treeBorrows, .raw) .disabledDeref .inBounds () =
+        some .undefinedBehavior ∧
+      annealVerdict .raw .disabledMetadata .inBounds () =
+        some (.returns 4) ∧
+      mrVerdict (.treeBorrows, .raw) .disabledMetadata .inBounds () =
+        some (.returns 4) ∧
+      mrVerdict (.basic, .raw) .disabledMetadata .inBounds () =
+        some (.returns 4) := by
+  decide +kernel
 
 /-- The `from_raw_parts` / `to_raw_parts` / `ptr::metadata` round trip: a
 positive witness on the MiniRust side at `TreeBorrowsMemory`. -/
@@ -2328,10 +2603,14 @@ inductive Prog : Type where
   | f32ToI32
   /-- `_0 = copy _1 as f32 (IntToFloat)`, `_1 : i32`. -/
   | i32ToF32
-  /-- `_0 = copy _1 as i32 (Transmute)`, `_1 : u32`: the bit carrier. -/
+  /-- `_0 = copy _1 as i32 (Transmute)`, `_1 : u32`: 32-bit bit carrier. -/
   | bitsU32ToI32
+  /-- `_0 = copy _1 as i64 (Transmute)`, `_1 : u64`: 64-bit bit carrier. -/
+  | bitsU64ToI64
   /-- `_0 = copy _1 as f32 (FloatToFloat)`, `_1 : f16`. -/
   | f16ToF32
+  /-- `_0 = copy _1 as f32 (FloatToFloat)`, `_1 : f128`. -/
+  | f128ToF32
   /-- A `FloatToInt` cast whose source local is uninitialized. -/
   | uninitCast
   deriving DecidableEq
@@ -2369,8 +2648,8 @@ def allModes : List NanMode := [.deterministic, .nondeterministic]
 
 /-- All programs. -/
 def allProgs : List Prog :=
-  [.f32ToF64, .f64ToF32, .f32ToI32, .i32ToF32, .bitsU32ToI32, .f16ToF32,
-    .uninitCast]
+  [.f32ToF64, .f64ToF32, .f32ToI32, .i32ToF32, .bitsU32ToI32, .bitsU64ToI64,
+    .f16ToF32, .f128ToF32, .uninitCast]
 
 /-- All queries. -/
 def allQueries : List Query :=
@@ -2387,19 +2666,23 @@ def Query.bits32 : Query → Nat
   | .negInfinity => 0xff800000
   | .threeBillion => 0x4f32d05e
 
-/-- The query as an `f64` bit pattern. -/
+/-- The query as an `f64` (equivalently `u64` / `i64`) bit pattern; the NaN
+payloads carry bit `29` (`0x20000000`), which survives the 29-bit narrowing
+shift to `f32` so narrowing preserves a non-canonical quiet payload and all
+six signaling-NaN candidates. -/
 def Query.bits64 : Query → Nat
   | .onePointFive => 0x3ff8000000000000
-  | .quietNaN => 0x7ff8000000000001
-  | .signalingNaN => 0x7ff0000000000001
+  | .quietNaN => 0x7ff8000020000000
+  | .signalingNaN => 0x7ff0000020000000
   | .negInfinity => 0xfff0000000000000
   | .threeBillion => 0x41e65a0bc0000000
 
 /-- Source bit pattern of a program on a query. -/
 def srcBits (p : Prog) (q : Query) : Nat :=
   match p with
-  | .f64ToF32 => q.bits64
+  | .f64ToF32 | .bitsU64ToI64 => q.bits64
   | .f16ToF32 => 0x3e00
+  | .f128ToF32 => 0x3fff8000000000000000000000000000
   | _ => q.bits32
 
 /-- Source and target formats of the float-to-float programs. -/
@@ -2425,8 +2708,12 @@ def castShape : Prog → Ty × Nat × Ty × CastKind
     (scalarTy (.int .i32), 4, scalarTy (.float .f32), .intToFloat)
   | .bitsU32ToI32 =>
     (scalarTy (.uint .u32), 4, scalarTy (.int .i32), .transmute)
+  | .bitsU64ToI64 =>
+    (scalarTy (.uint .u64), 8, scalarTy (.int .i64), .transmute)
   | .f16ToF32 =>
     (scalarTy (.float .f16), 2, scalarTy (.float .f32), .floatToFloat)
+  | .f128ToF32 =>
+    (scalarTy (.float .f128), 16, scalarTy (.float .f32), .floatToFloat)
   | .uninitCast =>
     (WideSlice.usizeTy, 8, WideSlice.usizeTy, .floatToInt)
 
@@ -2497,11 +2784,20 @@ open MiniRustSpec MiniRustSpec.Gen MiniRustSpec.LibSpecr
 open MiniRustSpec.Interp MiniRustSpec.Correspondence
 open MiniRustSpec.Correspondence.Witness
 
-/-- Verdict of a MiniRust computation returning a 32-bit integer value,
+/-- MiniRust 64-bit unsigned integer type (`u64`). -/
+def u64It : Gen.IntType := ⟨.Unsigned, ⟨8⟩⟩
+
+/-- MiniRust 64-bit signed integer type (`i64`). -/
+def i64It : Gen.IntType := ⟨.Signed, ⟨8⟩⟩
+
+/-- MiniRust 8-bit unsigned integer type (`u8`). -/
+def u8It : Gen.IntType := ⟨.Unsigned, ⟨1⟩⟩
+
+/-- Verdict of a MiniRust computation returning a `w`-bit integer value,
 as its two's-complement bit pattern. -/
-def carrierVerdict {M : Type} [Memory M] :
+def carrierVerdictW {M : Type} [Memory M] (mod : Nat) :
     Interp (Gen.Value M) → Option (Verdict Nat)
-  | .ok (.Int i) => some (.returns (i % 4294967296).toNat)
+  | .ok (.Int i) => some (.returns (i % mod).toNat)
   | .ok _ => none
   | .error (.ub _) => some .undefinedBehavior
   | .error (.unsupported _) => some .unsupported
@@ -2513,20 +2809,29 @@ def uninitLoadVerdict : Interp (Option Val) → Option (Verdict Nat)
   | .ok none => some .undefinedBehavior
   | _ => none
 
-/-- Verdict of MiniRust on each corpus key: the bit carrier is transmuted
-(`u32` to `i32`) in the chosen memory model, the uninitialized load is
-undefined behavior, and every float cast is rejected by the translation
-(`translateRvalue`), which is the fail-closed `unsupported` verdict. -/
+/-- Verdict of MiniRust on each corpus key: the 32-bit and 64-bit carriers
+are transmuted (`u32` to `i32`, `u64` to `i64`) in the chosen memory model,
+the uninitialized load is undefined behavior, and every float cast is
+rejected by the translation (`translateRvalue`), which is the fail-closed
+`unsupported` verdict. -/
 def mrVerdict (mem : WideSlice.MrMem) (p : Prog) (q : Query) (_c : Pick) :
     Option (Verdict Nat) :=
   match p, mem with
   | .bitsU32ToI32, .basic =>
-    carrierVerdict (M := BM)
+    carrierVerdictW (M := BM) 4294967296
       (Interp.transmute (.Int (Int.ofNat q.bits32)) (.Int u32) (.Int i32))
   | .bitsU32ToI32, .treeBorrows =>
-    carrierVerdict (M := TBM)
+    carrierVerdictW (M := TBM) 4294967296
       (transmuteM (M := TBM) (.Int (Int.ofNat q.bits32)) (.Int u32)
         (.Int i32))
+  | .bitsU64ToI64, .basic =>
+    carrierVerdictW (M := BM) 18446744073709551616
+      (Interp.transmute (.Int (Int.ofNat q.bits64)) (.Int u64It)
+        (.Int i64It))
+  | .bitsU64ToI64, .treeBorrows =>
+    carrierVerdictW (M := TBM) 18446744073709551616
+      (transmuteM (M := TBM) (.Int (Int.ofNat q.bits64)) (.Int u64It)
+        (.Int i64It))
   | .uninitCast, _ =>
     uninitLoadVerdict
       (Type.decode (.Int ⟨.Unsigned, ⟨8⟩⟩) (List.replicate 8 .Uninit))
@@ -2538,15 +2843,17 @@ def mrVerdict (mem : WideSlice.MrMem) (p : Prog) (q : Query) (_c : Pick) :
 
 end MiniRust
 
-/-- MiniRust fragment: the bit carrier, the uninitialized load, and the
-`f16` cast that both sides reject. The `f32` / `f64` casts are excluded:
-MiniRust has no float type, so its verdict there is `unsupported` while
-Anneal returns (`gateMR_exclusion_is_tight`). -/
+/-- MiniRust fragment: the 32-bit and 64-bit carriers, the uninitialized
+load, and the `f16` / `f128` casts that both sides reject. The `f32` / `f64`
+casts are excluded: MiniRust has no float type, so its verdict there is
+`unsupported` while Anneal returns (`gateMR_exclusion_is_tight`). -/
 def gateMR (_m : WideSlice.MrMem) (p : Prog) (q : Query) : Bool :=
   match p with
   | .bitsU32ToI32 => true
+  | .bitsU64ToI64 => true
   | .uninitCast => decide (q = .onePointFive)
   | .f16ToF32 => decide (q = .onePointFive)
+  | .f128ToF32 => decide (q = .onePointFive)
   | _ => false
 
 /-! ### C.5 LeanMiri: the reference specification on the corpus -/
@@ -2578,15 +2885,19 @@ def lmReference (mode : NanMode) (p : Prog) (q : Query) (c : Pick) :
       Verdict.returns
   | .bitsU32ToI32 =>
     some (.returns (twosComplement 32 (signedOfBits 32 q.bits32)))
+  | .bitsU64ToI64 =>
+    some (.returns (twosComplement 64 (signedOfBits 64 q.bits64)))
   | .uninitCast => some .undefinedBehavior
   | .f16ToF32 => none
+  | .f128ToF32 => none
 
-/-- LeanMiri fragment: every `f32` / `f64` cast, the bit carrier, and the
-uninitialized-source cast. The `f16` cast is excluded: the vendored engine
-converts `binary16`, where Anneal fails closed. -/
+/-- LeanMiri fragment: every `f32` / `f64` cast, the 32-bit and 64-bit
+carriers, and the uninitialized-source cast. The `f16` and `f128` casts are
+excluded: the vendored engine converts `binary16` and `binary128`, where
+Anneal fails closed (proved tight in the cross-root kernel bridge). -/
 def gateLM (_m : NanMode) (p : Prog) (q : Query) : Bool :=
   match p with
-  | .f16ToF32 => false
+  | .f16ToF32 | .f128ToF32 => false
   | .uninitCast => decide (q = .onePointFive)
   | _ => true
 
@@ -2674,7 +2985,8 @@ def bundle :
 (the uninitialized-source cast at one query only). -/
 def lmKeys : List (NanMode × Prog × Query × Pick) :=
   allModes.flatMap fun m =>
-    ([Prog.f32ToF64, .f64ToF32, .f32ToI32, .i32ToF32, .bitsU32ToI32].flatMap
+    ([Prog.f32ToF64, .f64ToF32, .f32ToI32, .i32ToF32, .bitsU32ToI32,
+        .bitsU64ToI64].flatMap
       fun p => allQueries.flatMap fun q => allPicks.map fun c =>
         (m, p, q, c)) ++
     allPicks.map fun c => (m, .uninitCast, .onePointFive, c)
@@ -2687,19 +2999,18 @@ def lmReferenceAt (k : NanMode × Prog × Query × Pick) :
 /-- Diagnostic of the vendored interpreter on the uninitialized source. -/
 def lmUninitMessage : String := "read of uninitialized local"
 
-/-- The LeanMiri authority assembled from engine-typed observation
-functions: `widenObs bits flag pick` / `narrowObs bits flag pick` convert
-`f32` to `f64` / `f64` to `f32` and then adjust a NaN result under the
-given `floatNondeterministic` flag and oracle pick; `toIntObs`,
-`fromIntObs`, and `carrierObs` are the saturating float-to-`i32` cast, the
-`i32`-to-`f32` cast, and the signed reading of a 32-bit scalar;
-`uninitObs body` is one interpreter step of the uninitialized-source cast;
-`ret32` / `ret64` / `retInt` / `ubObs` embed expected results. -/
+/-- The LeanMiri authority assembled from `Cast.cast` and `Step.step`
+observation functions: `widenObs bits flag pick` / `narrowObs bits flag pick`
+run `FloatToFloat` under the `floatNondeterministic` flag and oracle pick;
+`toIntObs`, `fromIntObs`, `carrier32Obs`, and `carrier64Obs` run `FloatToInt`,
+`IntToFloat`, and 32/64-bit `Transmute` directly on raw bit patterns;
+`uninitObs body` steps the uninitialized-source cast; `ret32` / `ret64` /
+`ubObs` embed expected 4-byte scalars, 8-byte scalars, and diagnostics. -/
 def authorityOf (Obs : Type) (decEq : DecidableEq Obs)
     (widenObs narrowObs : Nat → Bool → Nat → Obs)
-    (toIntObs : Nat → Obs) (fromIntObs : Int → Obs) (carrierObs : Nat → Obs)
+    (toIntObs fromIntObs carrier32Obs carrier64Obs : Nat → Obs)
     (uninitObs : CapturedMir → Obs) (ret32 ret64 : Nat → Obs)
-    (retInt : Int → Obs) (ubObs : String → Obs) :
+    (ubObs : String → Obs) :
     ObsAuthority (NanMode × Prog × Query × Pick) Nat where
   Obs := Obs
   decEq := decEq
@@ -2709,17 +3020,16 @@ def authorityOf (Obs : Type) (decEq : DecidableEq Obs)
       | .f32ToF64 => widenObs k.2.2.1.bits32 k.1.flag k.2.2.2.toNat
       | .f64ToF32 => narrowObs k.2.2.1.bits64 k.1.flag k.2.2.2.toNat
       | .f32ToI32 => toIntObs k.2.2.1.bits32
-      | .i32ToF32 => fromIntObs (signedOfBits 32 k.2.2.1.bits32)
-      | .bitsU32ToI32 => carrierObs k.2.2.1.bits32
+      | .i32ToF32 => fromIntObs k.2.2.1.bits32
+      | .bitsU32ToI32 => carrier32Obs k.2.2.1.bits32
+      | .bitsU64ToI64 => carrier64Obs k.2.2.1.bits64
       | _ => uninitObs uninitCastBody)
   denote := lmKeys.filterMap fun k =>
     match lmReferenceAt k with
     | some (.returns n) =>
       some (.returns n,
         match k.2.1 with
-        | .f32ToF64 => ret64 n
-        | .f32ToI32 => retInt (signedOfBits 32 n)
-        | .bitsU32ToI32 => retInt (signedOfBits 32 n)
+        | .f32ToF64 | .bitsU64ToI64 => ret64 n
         | _ => ret32 n)
     | some .undefinedBehavior =>
       some (.undefinedBehavior, ubObs lmUninitMessage)
@@ -2784,17 +3094,39 @@ theorem nanChoices_candidates :
         some [0x7ff8000000000000] := by
   decide +kernel
 
+/-- Narrowing `nanChoices` (`f64 → f32`): because `bits64` puts the NaN
+payload in bit `29` (`0x20000000`), it survives the 29-bit narrowing shift
+to yield four distinct quiet-NaN candidates, six distinct signaling-NaN
+candidates, and a genuine deterministic-vs-nondeterministic mode flip. -/
+theorem nanChoices_narrowing_candidates :
+    Ref.nanChoices .binary32 [(.binary64, 0x7ff8000020000000)] true =
+        some [0x7fc00000, 0xffc00000, 0x7fc00001, 0xffc00001] ∧
+      Ref.nanChoices .binary32 [(.binary64, 0x7ff0000020000000)] true =
+        some [0x7fc00000, 0xffc00000, 0x7fc00001, 0xffc00001,
+          0x7f800001, 0xff800001] ∧
+      Ref.nanChoices .binary32 [(.binary64, 0x7ff0000020000000)] false =
+        some [0x7fc00000] ∧
+      annealVerdict .deterministic .f64ToF32 .quietNaN .p2 =
+        some (.returns 0x7fc00000) ∧
+      annealVerdict .nondeterministic .f64ToF32 .quietNaN .p2 =
+        some (.returns 0x7fc00001) := by
+  decide +kernel
+
 /-- The trusted machine's deterministic NaN is the payload-preserving
-candidate: oracle pick `2` of the nondeterministic mode. -/
+candidate: oracle pick `2` of the nondeterministic mode, for both widening
+and narrowing NaN casts. -/
 theorem trusted_nan_is_candidate_two :
     trustedVerdict .f32ToF64 .quietNaN =
         some (.returns 0x7ff8000020000000) ∧
+      trustedVerdict .f64ToF32 .quietNaN = some (.returns 0x7fc00001) ∧
       annealVerdict .nondeterministic .f32ToF64 .quietNaN .p2 =
         trustedVerdict .f32ToF64 .quietNaN ∧
       annealVerdict .nondeterministic .f32ToF64 .signalingNaN .p2 =
         trustedVerdict .f32ToF64 .signalingNaN ∧
       annealVerdict .nondeterministic .f64ToF32 .quietNaN .p2 =
-        trustedVerdict .f64ToF32 .quietNaN := by
+        trustedVerdict .f64ToF32 .quietNaN ∧
+      annealVerdict .nondeterministic .f64ToF32 .signalingNaN .p2 =
+        trustedVerdict .f64ToF32 .signalingNaN := by
   decide +kernel
 
 /-- Deterministic mode canonicalizes every NaN result to the preferred
@@ -2818,7 +3150,8 @@ theorem nondeterministic_signaling_outcomes :
         some (.returns 0xfff0000020000000)] := by
   decide +kernel
 
-/-- The machine-level verdicts are the trusted cast functions. -/
+/-- The machine-level verdicts are the trusted cast functions, including
+both 32-bit and 64-bit `evalByteCast` bit carriers. -/
 theorem trusted_matches_cast_functions (q : Query) :
     trustedVerdict .f32ToI32 q =
         some (.returns
@@ -2830,14 +3163,99 @@ theorem trusted_matches_cast_functions (q : Query) :
       trustedVerdict .f32ToF64 q =
         some (.returns
           (evalFloatToFloatRoundTiesToEven .binary32 .binary64 q.bits32)) ∧
-      trustedVerdict .bitsU32ToI32 q = some (.returns q.bits32) := by
+      trustedVerdict .f64ToF32 q =
+        some (.returns
+          (evalFloatToFloatRoundTiesToEven .binary64 .binary32 q.bits64)) ∧
+      trustedVerdict .bitsU32ToI32 q = some (.returns q.bits32) ∧
+      trustedVerdict .bitsU64ToI64 q = some (.returns q.bits64) := by
   cases q <;> decide +kernel
 
-/-- Fail-closed boundaries of the trusted machine. -/
+/-- Little-endian `[u8; 4]` value in Anneal (non-recursive). -/
+def annealLeBytes4 (bits : Nat) : List Value :=
+  [.scalar ⟨bits % 256, 1⟩, .scalar ⟨(bits / 256) % 256, 1⟩,
+   .scalar ⟨(bits / 65536) % 256, 1⟩, .scalar ⟨(bits / 16777216) % 256, 1⟩]
+
+/-- Little-endian `[u8; 8]` value in Anneal (non-recursive). -/
+def annealLeBytes8 (bits : Nat) : List Value :=
+  annealLeBytes4 bits ++ annealLeBytes4 (bits / 4294967296)
+
+/-- Byte-array layout `[u8; n]` for Anneal `evalByteCast`. -/
+def byteArrayLayout (n : Nat) : TypeLayout :=
+  { size := { bytes := n }
+    align := { bytes := 1 }
+    backendRepr := .memory
+    fields := .array { bytes := 1 } n
+    variants := .single 0
+    isUninhabited := false }
+
+/-- Primitive scalar layout of `n` bytes with primitive kind `p`. -/
+def floatPrimLayout (n : Nat) (p : PrimitiveKind) : TypeLayout :=
+  { size := { bytes := n }
+    align := { bytes := n }
+    backendRepr :=
+      .scalar (.initialized p { start := 0, end_ := 2 ^ (8 * n) - 1 })
+    fields := .primitive
+    variants := .single 0
+    isUninhabited := false }
+
+/-- Layout table carrying `f32` (1), `f64` (2), `[u8; 4]` (3), `[u8; 8]` (4). -/
+def byteCarrierLayouts : LayoutTable :=
+  { pointerBits := 64
+    isLittleEndian := true
+    entries :=
+      [WideSlice.primLayout 4, floatPrimLayout 4 (.float 32),
+       floatPrimLayout 8 (.float 64), byteArrayLayout 4,
+       byteArrayLayout 8] }
+
+/-- Direct `evalByteCast` witness on IEEE-754 bit carriers: `f32 ↔ [u8; 4]`
+and `f64 ↔ [u8; 8]` preserve quiet and signaling NaN bit patterns verbatim. -/
+theorem trusted_evalByteCast_byte_carriers :
+    let f32Ty : Ty := { kind := .float .f32, layoutIdx := 1 }
+    let f64Ty : Ty := { kind := .float .f64, layoutIdx := 2 }
+    let b4Ty : Ty := { kind := .array (.uint .u8) 4, layoutIdx := 3 }
+    let b8Ty : Ty := { kind := .array (.uint .u8) 8, layoutIdx := 4 }
+    let d4 := [{ mutability := .mut, ty := b4Ty, debugName := none },
+      { mutability := .not, ty := f32Ty, debugName := none }]
+    let d4Rev := [{ mutability := .mut, ty := f32Ty, debugName := none },
+      { mutability := .not, ty := b4Ty, debugName := none }]
+    let d8 := [{ mutability := .mut, ty := b8Ty, debugName := none },
+      { mutability := .not, ty := f64Ty, debugName := none }]
+    let d8Rev := [{ mutability := .mut, ty := f64Ty, debugName := none },
+      { mutability := .not, ty := b8Ty, debugName := none }]
+    let q32 := Query.quietNaN.bits32
+    let s64 := Query.signalingNaN.bits64
+    evalByteCast [.uninit, .init (.scalar ⟨q32, 4⟩)] (.copy ⟨1, []⟩) b4Ty
+        emptyMemory d4 byteCarrierLayouts =
+      .ok (.aggregate 0 (annealLeBytes4 q32))
+        [.uninit, .init (.scalar ⟨q32, 4⟩)] emptyMemory ∧
+    evalByteCast [.uninit, .init (.aggregate 0 (annealLeBytes4 q32))]
+        (.copy ⟨1, []⟩) f32Ty emptyMemory d4Rev byteCarrierLayouts =
+      .ok (.scalar ⟨q32, 4⟩)
+        [.uninit, .init (.aggregate 0 (annealLeBytes4 q32))]
+        emptyMemory ∧
+    evalByteCast [.uninit, .init (.scalar ⟨s64, 8⟩)] (.copy ⟨1, []⟩) b8Ty
+        emptyMemory d8 byteCarrierLayouts =
+      .ok (.aggregate 0 (annealLeBytes8 s64))
+        [.uninit, .init (.scalar ⟨s64, 8⟩)] emptyMemory ∧
+    evalByteCast [.uninit, .init (.aggregate 0 (annealLeBytes8 s64))]
+        (.copy ⟨1, []⟩) f64Ty emptyMemory d8Rev byteCarrierLayouts =
+      .ok (.scalar ⟨s64, 8⟩)
+        [.uninit, .init (.aggregate 0 (annealLeBytes8 s64))]
+        emptyMemory :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- Fail-closed boundaries of the trusted machine (`f16`, `f128`, uninit). -/
 theorem trusted_fail_closed :
     trustedVerdict .f16ToF32 .onePointFive = some .unsupported ∧
+      trustedVerdict .f128ToF32 .onePointFive = some .unsupported ∧
       trustedVerdict .uninitCast .onePointFive = some .undefinedBehavior := by
   decide +kernel
+
+/-- Second fail-closed `unsupported` fault-equivalence witness on MiniRust:
+`f128 → f32` fails closed in both Anneal and MiniRust translation. -/
+def mrF128Fault : FaultEquivWitness (sideMR.rel model) :=
+  sideMR.faultAt model sideMR_sim .treeBorrows .f128ToF32 .onePointFive .p0
+    rfl (by decide +kernel)
 
 /-- Saturation and NaN handling of the float-to-`i32` cast: `NaN ↦ 0`,
 `-∞ ↦ i32::MIN`, `3.0e9 ↦ i32::MAX`. -/
@@ -2862,31 +3280,151 @@ theorem gateMR_exclusion_is_tight :
 
 section MiniRust
 
-open MiniRustSpec MiniRustSpec.Correspondence
+open MiniRustSpec MiniRustSpec.Gen MiniRustSpec.LibSpecr
+open MiniRustSpec.Interp MiniRustSpec.Correspondence
+open MiniRustSpec.Correspondence.Witness
+open MiniRustSpec.Correspondence.RefWitness
 
-/-- The translation gate: float types, float-cast rvalues, and float-cast
-bodies are rejected; the integer carrier is accepted. -/
+/-- Little-endian `[u8; 4]` tuple value in MiniRust (`Memory M`,
+non-recursive). -/
+def mrLeBytes4 {M : Type} [Memory M] (bits : Nat) : List (Gen.Value M) :=
+  [.Int (Int.ofNat (bits % 256)),
+   .Int (Int.ofNat ((bits / 256) % 256)),
+   .Int (Int.ofNat ((bits / 65536) % 256)),
+   .Int (Int.ofNat ((bits / 16777216) % 256))]
+
+/-- Little-endian `[u8; 8]` tuple value in MiniRust (`Memory M`,
+non-recursive). -/
+def mrLeBytes8 {M : Type} [Memory M] (bits : Nat) : List (Gen.Value M) :=
+  mrLeBytes4 bits ++ mrLeBytes4 (bits / 4294967296)
+
+/-- Little-endian `Nat` byte list of length 4. -/
+def leNatBytes4 (bits : Nat) : List Nat :=
+  [bits % 256, (bits / 256) % 256, (bits / 65536) % 256,
+   (bits / 16777216) % 256]
+
+/-- Little-endian `Nat` byte list of length 8. -/
+def leNatBytes8 (bits : Nat) : List Nat :=
+  leNatBytes4 bits ++ leNatBytes4 (bits / 4294967296)
+
+/-- Extract byte values from a decoded MiniRust tuple of integer bytes. -/
+def mrTupleBytes? : Interp (Option Val) → Option (List Nat)
+  | .ok (some (.Tuple vs)) =>
+    vs.mapM fun v => match v with | .Int i => some i.toNat | _ => none
+  | _ => none
+
+/-- The translation gate: `f16`/`f32`/`f64`/`f128` types and float-cast
+bodies are rejected; 32-bit and 64-bit integer carriers are accepted. -/
 theorem translation_gate :
-    (translateTy (t := scalarTy (.float .f32))).isNone = true ∧
+    (translateTy (t := scalarTy (.float .f16))).isNone = true ∧
+      (translateTy (t := scalarTy (.float .f32))).isNone = true ∧
       (translateTy (t := scalarTy (.float .f64))).isNone = true ∧
+      (translateTy (t := scalarTy (.float .f128))).isNone = true ∧
       (translateFn (castBody .f32ToF64)).isNone = true ∧
       (translateFn (castBody .f32ToI32)).isNone = true ∧
+      (translateFn (castBody .f16ToF32)).isNone = true ∧
+      (translateFn (castBody .f128ToF32)).isNone = true ∧
       (translateRvalue (layouts := ⟨64, true, []⟩)
         (decls := castDecls .bitsU32ToI32) (targetTy := none)
-        (castRvalue .bitsU32ToI32)).isSome = true := by
+        (castRvalue .bitsU32ToI32)).isSome = true ∧
+      (translateRvalue (layouts := ⟨64, true, []⟩)
+        (decls := castDecls .bitsU64ToI64) (targetTy := none)
+        (castRvalue .bitsU64ToI64)).isSome = true := by
   decide +kernel
+
+/-- MiniRust `Type.encode`, `Type.decode`, `Interp.transmute`, and
+`transmuteM` (`BasicMemory` and `TreeBorrowsMemory`) preserve IEEE-754
+32-bit and 64-bit NaN bit patterns across `u32`/`i32`/`[u8; 4]` and
+`u64`/`i64`/`[u8; 8]`. -/
+theorem mr_byte_carrier_encode_decode_transmute :
+    let q32 := Query.quietNaN.bits32
+    let s64 := Query.signalingNaN.bits64
+    let b4Ty : Gen.Type := .Array (.Int u8It) 4
+    let b8Ty : Gen.Type := .Array (.Int u8It) 8
+    mrTupleBytes?
+        (Type.encode (.Int u32) (.Int (Int.ofNat q32)) >>= Type.decode b4Ty) =
+        some (leNatBytes4 q32) ∧
+      mrTupleBytes?
+        (Type.encode (.Int u64It) (.Int (Int.ofNat s64)) >>=
+          Type.decode b8Ty) =
+        some (leNatBytes8 s64) ∧
+      carrierVerdictW (M := BM) 4294967296
+        (Interp.transmute (.Tuple (mrLeBytes4 (M := BM) q32)) b4Ty
+          (.Int i32)) = some (.returns q32) ∧
+      carrierVerdictW (M := TBM) 4294967296
+        (transmuteM (M := TBM) (.Tuple (mrLeBytes4 (M := TBM) q32)) b4Ty
+          (.Int i32)) = some (.returns q32) ∧
+      carrierVerdictW (M := BM) 18446744073709551616
+        (Interp.transmute (.Tuple (mrLeBytes8 (M := BM) s64)) b8Ty
+          (.Int i64It)) = some (.returns s64) ∧
+      carrierVerdictW (M := TBM) 18446744073709551616
+        (transmuteM (M := TBM) (.Tuple (mrLeBytes8 (M := TBM) s64)) b8Ty
+          (.Int i64It)) = some (.returns s64) := by
+  decide +kernel
+
+/-- One-argument 32-bit carrier body `fn(x: u32) -> i32 { transmute(x) }`. -/
+def carrier32Body : CapturedMir :=
+  { castBody .bitsU32ToI32 with
+    defPath := "float_cast::carrier_u32_i32"
+    argCount := 1
+    fnAbi := WideSlice.fnAbiOf 4 }
+
+/-- One-argument 64-bit carrier body `fn(x: u64) -> i64 { transmute(x) }`. -/
+def carrier64Body : CapturedMir :=
+  { castBody .bitsU64ToI64 with
+    defPath := "float_cast::carrier_u64_i64"
+    argCount := 1
+    fnAbi := WideSlice.fnAbiOf 8 }
+
+/-- Eight-byte caller context for 64-bit MiniRust carrier machine runs. -/
+def ctx8 : Ctx :=
+  { ctx0 with
+    base :=
+      [{ retAlloc with data := List.replicate 8 .Uninit, align := ⟨8⟩ }] }
+
+/-- Whole-program `translateFn`, `Interp.steps` (`BasicMemory`), and
+`Interp.stepsTB` (`TreeBorrowsMemory`) runs on both 32-bit and 64-bit float
+bit carriers agree with Anneal `stepMirFn` on quiet-NaN bit patterns. -/
+theorem mr_carrier_steps_three_way :
+    let q32 := Query.quietNaN.bits32
+    let q64 := Query.quietNaN.bits64
+    let s32 := initMachineState carrier32Body [.scalar ⟨q32, 4⟩]
+    let s64 := initMachineState carrier64Body [.scalar ⟨q64, 8⟩]
+    (match translateFn carrier32Body with
+     | some fn32 =>
+       let m0 := machine carrier32Body fn32 s32.frame.locals fn32.start
+       WideSlice.runVerdict carrier32Body 10 s32 = some (.returns q32) ∧
+         WideSlice.machVerdict (Interp.steps 3 m0) = some (.returns q32) ∧
+         WideSlice.machVerdictTB (Interp.stepsTB 3 (liftMachToTB m0)) =
+           some (.returns q32)
+     | none => False) ∧
+    (match translateFn carrier64Body with
+     | some fn64 =>
+       let m0 := machineWithCtx ctx8 carrier64Body fn64 s64.frame.locals
+         fn64.start
+       WideSlice.runVerdict carrier64Body 10 s64 = some (.returns q64) ∧
+         WideSlice.machVerdict (Interp.steps 3 m0) = some (.returns q64) ∧
+         WideSlice.machVerdictTB (Interp.stepsTB 3 (liftMachToTB m0)) =
+           some (.returns q64)
+     | none => False) :=
+  ⟨⟨rfl, rfl, rfl⟩, ⟨rfl, rfl, rfl⟩⟩
 
 end MiniRust
 
 /-! #### Vertical composition: the function-level front model -/
 
-/-- Verdict of the function-level trusted cast (`evalFloatCast` on a
-scalar, without the machine); the carrier preserves its bits and the
-uninitialized operand read is undefined behavior. -/
+/-- Verdict of the function-level trusted cast (`evalFloatCast` for numeric
+float casts and `evalByteCast` for 32/64-bit bit-carrier transmutes, without
+the machine); the uninitialized operand read is undefined behavior. -/
 def frontBase (p : Prog) (q : Query) : Option (Verdict Nat) :=
   match p with
   | .uninitCast => some .undefinedBehavior
-  | .bitsU32ToI32 => some (.returns q.bits32)
+  | .bitsU32ToI32 | .bitsU64ToI64 =>
+    match evalByteCast (castInit p q).frame.locals (.copy ⟨1, []⟩)
+        (castShape p).2.2.1 emptyMemory (castDecls p) emptyLayoutTable with
+    | .ok (.scalar sc) _ _ => some (.returns sc.bits)
+    | .ub => some .undefinedBehavior
+    | _ => some .unsupported
   | _ =>
     match evalFloatCast (castShape p).2.2.2 (some (castShape p).1)
       (castShape p).2.2.1 emptyLayoutTable
@@ -2999,8 +3537,8 @@ theorem lm_uninit_faults_with (h : (sideLM verdictLM).check model = true) :
   exact ⟨c, Side.verdict_of_execR model (sideLM verdictLM)
     (v := .undefinedBehavior) hc⟩
 
-/-- **Cross-authority normal equivalence** at the NaN bit carrier: the
-quiet-NaN pattern is carried unchanged by both authorities. -/
+/-- **Cross-authority normal equivalence** at the 32-bit NaN bit carrier:
+the quiet-NaN pattern is carried unchanged by both authorities. -/
 theorem carrier_normal_equiv_with
     (h : (sideLM verdictLM).check model = true) (a : Nat) :
     (∃ c r, (sideMR.rel model).ExecR .basic .bitsU32ToI32 .quietNaN c
@@ -3011,6 +3549,23 @@ theorem carrier_normal_equiv_with
   (((bundleWith verdictLM h).crossAuthorityNormalEquiv
     (mMR := .basic) (mLM := .deterministic) (p := .bitsU32ToI32)
     (q := .quietNaN) rfl rfl rfl
+    (sideMR.reverseTotal model sideMR_sim)
+    ((sideLM verdictLM).reverseTotal model (sideLM_sim_with verdictLM h))).1
+    a).2.2
+
+/-- **Cross-authority normal equivalence** at the 64-bit NaN bit carrier:
+the 64-bit signaling-NaN pattern is carried unchanged by both authorities
+(`TreeBorrowsMemory` on MiniRust vs LeanMiri `Cast.cast .Transmute`). -/
+theorem carrier64_normal_equiv_with
+    (h : (sideLM verdictLM).check model = true) (a : Nat) :
+    (∃ c r, (sideMR.rel model).ExecR .treeBorrows .bitsU64ToI64 .signalingNaN
+        c (.normal r) ∧ halves r = halvesCodec.encode a) ↔
+      (∃ c r, ((sideLM verdictLM).rel model).ExecR .deterministic
+        .bitsU64ToI64 .signalingNaN c (.normal r) ∧
+        halves r = halvesCodec.encode a) :=
+  (((bundleWith verdictLM h).crossAuthorityNormalEquiv
+    (mMR := .treeBorrows) (mLM := .deterministic) (p := .bitsU64ToI64)
+    (q := .signalingNaN) rfl rfl rfl
     (sideMR.reverseTotal model sideMR_sim)
     ((sideLM verdictLM).reverseTotal model (sideLM_sim_with verdictLM h))).1
     a).2.2
@@ -10215,18 +10770,22 @@ fresh kernel environment, replays the surface declarations of this file
 that the cross-root declarations depend on, and then submits to the kernel:
 
 * the two authorities built over the vendored interpreter itself
-  (`Step.step` under the wide-slice hooks; `FloatBits.convert`,
-  `FloatBits.nanChoices`, `FloatOps.adjustNaN`, `FloatBits.toInteger`,
-  `FloatBits.fromInteger`);
+  (`Step.step` under the wide-slice hooks; `Cast.cast` with real
+  `CastHooks` / `FloatOpsHooks` for `FloatToFloat`, `FloatToInt`,
+  `IntToFloat`, and 32/64-bit `Transmute`, plus `Step.step` for
+  uninitialized-source UB);
 * the proofs that these interpreters compute exactly the reference tables
-  `WideSlice.lmReference` and `FloatCast.lmReference`, and that they pass
-  the certificates of the LeanMiri sides;
-* every bundle and every `*_with` theorem instantiated at them;
+  `WideSlice.lmReference` and `FloatCast.lmReference`, pass the LeanMiri
+  side certificates, and convert `binary16` / `binary128` via `Cast.cast`
+  (proving `FloatCast.gateLM`'s exclusions tight);
+* every bundle (12 cross-root bundles) and every `*_with` theorem
+  instantiated at them;
 * the equalities of the Anneal fixtures of this file with the fixtures of
   the LeanMiri correspondence module.
 
-Forged declarations are submitted to scratch copies of the environment and
-must be rejected, and every accepted declaration is inspected. -/
+Forged declarations across both families are submitted to scratch copies of
+the environment and must be rejected, and every accepted declaration is
+inspected. -/
 
 open Lean Meta Elab Command in
 run_cmd do
@@ -10252,26 +10811,43 @@ run_cmd do
   let act : CoreM (Nat × Nat × Nat × Nat) := do
     -- 1. Replay the closure of the surface declarations used below.
     let wsWith : Array Name :=
-      #[`lm_safe_tooBig_faults_with, `lm_raw_tooBig_returns_with,
-        `safe_tooBig_fault_equiv_with, `inBounds_reborrow_threeWay_with,
-        `raw_metadata_wellFormed_with, `raw_tooBig_normal_equiv_with,
-        `claims_with, `productiveBoth_with, `modeSensitive_with,
-        `lmModeWitness_spec_with, `detBundle_spec_with]
-    let wsDefs : Array Name := #[`bundleWith, `detBundleWith]
+      #[`safe_tooBig_fault_equiv_with, `lm_safe_tooBig_faults_with,
+        `inBounds_reborrow_threeWay_with, `inBounds_reborrow_rep_with,
+        `no_unwind_with, `raw_metadata_wellFormed_with,
+        `raw_tooBig_normal_equiv_with, `lm_raw_tooBig_returns_with,
+        `raw_tooBig_diverge_equiv_with, `raw_tooBig_unwind_iff_with,
+        `projectPositive_with, `projectFault_with,
+        `anneal_not_constant_with, `claims_with, `productiveBoth_with,
+        `productivity_transfer_with,
+        `productiveBoth_of_recorded_reverse_with, `lmModeWitness_spec_with,
+        `lmModeWitness_isFaultFlip_with, `faultFlipComp_modeSensitive_with,
+        `lm_not_mode_invariant_with, `modeSensitive_with,
+        `lmFlip_guard_with, `lmIndexOob_not_wellFormed_with,
+        `lmSizeOfVal_wellFormed_with, `detBundle_spec_with,
+        `detBundle_productiveAnneal_with, `detBundle_exact_with]
+    let wsDefs : Array Name :=
+      #[`bundleWith, `detBundleWith, `faultFlipComp_with,
+        `faultFlipTrans_with, `mixedComp_with]
     let fcWith : Array Name :=
-      #[`lm_uninit_faults_with, `carrier_normal_equiv_with,
+      #[`uninit_fault_equiv_with, `lm_uninit_faults_with,
+        `carrier_normal_equiv_with, `carrier64_normal_equiv_with,
         `lmModeWitness_spec_with, `productiveBoth_with,
-        `frontTrans_productiveBoth_with, `frontCompMixed_modeSensitive_with,
-        `boolModes_modeSensitive_with, `gatedBundle_productiveBoth_with]
+        `frontTrans_codec_with, `frontTrans_productiveBoth_with,
+        `frontComp_productive_with, `frontCompMixed_modeSensitive_with,
+        `boolModes_productive_with, `boolModes_modeSensitive_with,
+        `nondetOnly_productive_with, `tightenCodec_with,
+        `gatedBundle_productiveBoth_with]
     let fcDefs : Array Name :=
-      #[`bundleWith, `frontTrans_with, `frontCompMixed_with,
-        `boolModes_with, `gatedBundleWith]
+      #[`bundleWith, `frontTrans_with, `frontComp_with,
+        `frontCompMixed_with, `boolModes_with, `nondetOnly_with,
+        `gatedBundleWith]
     let mut roots : Array Name :=
       #[ns ++ `WideSlice.authorityOf, ns ++ `WideSlice.checkOf,
         ns ++ `WideSlice.matchesReference_sound, ns ++ `Corpus.pairObs,
         ns ++ `WideSlice.frameInit, ns ++ `WideSlice.sizeOfValInit,
         ns ++ `FloatCast.authorityOf, ns ++ `FloatCast.checkOf,
-        ns ++ `FloatCast.matchesReference_sound]
+        ns ++ `FloatCast.matchesReference_sound,
+        ns ++ `FloatCast.empty_schedule_is_vacuous]
     for n in wsWith ++ wsDefs do roots := roots.push (ns ++ `WideSlice ++ n)
     for n in fcWith ++ fcDefs do roots := roots.push (ns ++ `FloatCast ++ n)
     let mut pending : Array Name := #[]
@@ -10466,101 +11042,283 @@ run_cmd do
       (eqTrue (mkApp (mkConst (ns ++ `WideSlice.checkOf)) miriC)) reflTrue
     added := added ++ #[ns ++ `CrossRoot.WideSlice.miri_matches,
       ns ++ `CrossRoot.WideSlice.miri_check]
-    -- 3. FloatCast Miri authority
-    let fbTy := mkConst (mi ++ `FloatBits)
-    let intTy := mkConst ``Int
-    let optFb ← MetaM.run' <| mkAppM ``Option #[fbTy]
-    let optInt ← MetaM.run' <| mkAppM ``Option #[intTy]
-    let stepRes ← MetaM.run' <| mkAppM ``Except #[stepErr, mkConst ``Bool]
-    let optStep ← MetaM.run' <| mkAppM ``Option #[stepRes]
-    let fcTail ← MetaM.run' <| mkAppM ``Prod #[optInt, optStep]
-    let fcObsTy ← MetaM.run' <| mkAppM ``Prod #[optFb, fcTail]
-    let decOptFb ← MetaM.run' <| mkAppOptM ``Option.instDecidableEq
-      #[some fbTy, some (mkConst (mi ++ `instDecidableEqFloatBits))]
-    let decOptInt ← MetaM.run' <| mkAppOptM ``Option.instDecidableEq
-      #[some intTy, some (mkConst ``Int.instDecidableEq)]
-    let decStepRes ← MetaM.run' <|
-      mkAppOptM `Miri.ABI.instDecidableEqExcept_miri
-        #[some stepErr, some (mkConst ``Bool),
-          some (mkConst (mi ++ `instDecidableEqStepError)),
-          some (mkConst ``instDecidableEqBool)]
-    let decOptStep ← MetaM.run' <| mkAppOptM ``Option.instDecidableEq
-      #[some stepRes, some decStepRes]
-    let decFcTail ← MetaM.run' <| mkAppOptM ``instDecidableEqProd
-      #[some optInt, some optStep, some decOptInt, some decOptStep]
-    let decFcObs ← MetaM.run' <| mkAppOptM ``instDecidableEqProd
-      #[some optFb, some fcTail, some decOptFb, some decFcTail]
-    let fcAuth ← MetaM.run' do
-      let noneOf (ty : Expr) : MetaM Expr := mkAppOptM ``Option.none #[some ty]
-      let pack (fb int step : Expr) : MetaM Expr := do
-        mkAppM ``Prod.mk #[fb, ← mkAppM ``Prod.mk #[int, step]]
-      let fmt32 := mkConst (mi ++ `FloatFormat.binary32)
-      let fmt64 := mkConst (mi ++ `FloatFormat.binary64)
-      let bitsOf (fmt n : Expr) : MetaM Expr := do
-        mkAppM (mi ++ `FloatBits.mk)
-          #[fmt, ← mkAppM ``BitVec.ofNat #[mkNatLit 128, n]]
+    -- 3. FloatCast Miri authority over `Miri.Interpreter.Cast.cast`
+    let immTy ← MetaM.run' <| mkAppM (mi ++ `Immediate) #[prov]
+    let castS ← MetaM.run' <| mkAppM ``Option #[immTy]
+    let fcObsTy ← MetaM.run' <| mkAppM ``Except #[stepErr, castS]
+    let decImm ← MetaM.run' <| mkAppOptM (mi ++ `instDecidableEqImmediate)
+      #[some prov, some (mkConst `Miri.Memory.instDecidableEqProvenance)]
+    let decCastS ← MetaM.run' <| mkAppOptM ``Option.instDecidableEq
+      #[some immTy, some decImm]
+    let decFcObs ← MetaM.run' <| mkAppOptM `Miri.ABI.instDecidableEqExcept_miri
+      #[some stepErr, some castS,
+        some (mkConst (mi ++ `instDecidableEqStepError)), some decCastS]
+    let (fcRunCast, fcRet32, fcRet64, fcUbObs, fcUninitObs) ← MetaM.run' do
+      let boolTy := mkConst ``Bool
+      let unitTy := mkConst ``Unit
+      let tyIdTy := mkConst `Miri.MIR.TyId
+      let defIdTy := mkConst `Miri.MIR.DefId
+      let u64Ty := mkConst ``UInt64
+      let intKindTy := mkConst `Miri.MIR.IntegerKind
+      let fmtTy := mkConst (mi ++ `FloatFormat)
+      let fbTy := mkConst (mi ++ `FloatBits)
+      let castInfoTy := mkConst (mi ++ `CastTypeInfo)
+      let castKindTy := mkConst `Miri.MIR.CastKind
+      let layoutTy ← mkAppM `Miri.ABI.TyAndLayout #[tyIdTy]
+      let opTy ← mkAppM (mi ++ `OpTy) #[prov]
+      let rvImmTy ← mkAppM (mi ++ `RvalueImmTy) #[prov]
+      let optProv ← mkAppM ``Option #[prov]
+      let ptrOptTy ← mkAppM `Miri.Memory.Pointer #[optProv]
+      let arrGArg ← mkAppM ``Array #[mkConst `Miri.MIR.GenericArg]
+      let callInstTy := mkConst (mi ++ `CallInstance)
+      let optCallInst ← mkAppM ``Option #[callInstTy]
+      let optTyId ← mkAppM ``Option #[tyIdTy]
+      let optNat ← mkAppM ``Option #[natTy]
+      let prodTyId ← mkAppM ``Prod #[tyIdTy, tyIdTy]
+      let vtEntry ← mkAppM (mi ++ `VTableEntry) #[callInstTy]
+      let arrVtEntry ← mkAppM ``Array #[vtEntry]
+      let layDataTy := mkConst `Miri.ABI.LayoutData
+      let empLay :=
+        mkConst ``Trusted.Rustc.V2026_06_01.MirSemantics.emptyLayoutTable
+      let pureM (aTy val : Expr) : MetaM Expr :=
+        mkAppOptM ``EStateM.pure #[some stepErr, some castS, some aTy, some val]
+      let leaf (name : String) (aTy : Expr) : MetaM Expr :=
+        mkAppOptM (lm ++ `annealUnsupportedLeaf)
+          #[some castS, some aTy, some (mkStrLit name)]
+      let layOf (t : Expr) : MetaM Expr :=
+        mkAppM (lm ++ `layoutOfEncodedTyId) #[t, empLay]
+      let switchNat (t : Expr) (cases : List (Nat × Expr)) (dflt : Expr) :
+          MetaM Expr :=
+        cases.foldrM (fun (k, rhs) acc => do
+          let condB ← mkAppM ``Nat.beq #[t, mkNatLit k]
+          mkAppM ``cond #[condB, rhs, acc]) dflt
+      let scOfInt (si : Expr) : MetaM Expr :=
+        mkAppOptM `Miri.Memory.Scalar.fromScalarInt #[some prov, some si]
+      let sc32 (n : Expr) : MetaM Expr := do
+        scOfInt (← mkAppM `Miri.Memory.ScalarInt.ofUInt32
+          #[← mkAppM ``UInt32.ofNat #[n]])
+      let sc64 (n : Expr) : MetaM Expr := do
+        scOfInt (← mkAppM `Miri.Memory.ScalarInt.ofUInt64
+          #[← mkAppM ``UInt64.ofNat #[n]])
+      let sc16 (n : Expr) : MetaM Expr := do
+        scOfInt (← mkAppM `Miri.Memory.ScalarInt.ofUInt16
+          #[← mkAppM ``UInt16.ofNat #[n]])
+      let sc128 (n : Expr) : MetaM Expr := do
+        scOfInt (← mkAppM `Miri.Memory.ScalarInt.ofUInt128
+          #[← mkAppM ``BitVec.ofNat #[mkNatLit 128, n]])
       let hooksOf (flag : Expr) : MetaM Expr := do
-        let tyId := mkConst `Miri.MIR.TyId
-        let leaf (name : String) (resTy : Expr) : MetaM Expr :=
-          mkAppOptM (lm ++ `annealUnsupportedLeaf)
-            #[some stateTy, some resTy, some (mkStrLit name)]
         let kindOf ← withLocalDeclD `c natTy fun c =>
-          withLocalDeclD `t tyId fun t => do
-            mkLambdaFVars #[c, t]
-              (← leaf "integerKindOf" (mkConst `Miri.MIR.IntegerKind))
+          withLocalDeclD `t tyIdTy fun t => do
+            let body ← switchNat t
+              [(12, ← pureM intKindTy (mkConst `Miri.MIR.IntegerKind.i32)),
+               (13, ← pureM intKindTy (mkConst `Miri.MIR.IntegerKind.i64)),
+               (22, ← pureM intKindTy (mkConst `Miri.MIR.IntegerKind.u32)),
+               (23, ← pureM intKindTy (mkConst `Miri.MIR.IntegerKind.u64))]
+              (← leaf "integerKindOf" intKindTy)
+            mkLambdaFVars #[c, t] body
         let formatOf ← withLocalDeclD `c natTy fun c =>
-          withLocalDeclD `t tyId fun t => do
-            mkLambdaFVars #[c, t]
-              (← leaf "formatOf" (mkConst (mi ++ `FloatFormat)))
-        let layoutTy ← mkAppM `Miri.ABI.TyAndLayout #[tyId]
-        let boolLayout ← withLocalDeclD `c natTy fun c => do
-          mkLambdaFVars #[c] (← leaf "boolLayout" layoutTy)
+          withLocalDeclD `t tyIdTy fun t => do
+            let body ← switchNat t
+              [(30, ← pureM fmtTy (mkConst (mi ++ `FloatFormat.binary16))),
+               (31, ← pureM fmtTy (mkConst (mi ++ `FloatFormat.binary32))),
+               (32, ← pureM fmtTy (mkConst (mi ++ `FloatFormat.binary64))),
+               (33, ← pureM fmtTy (mkConst (mi ++ `FloatFormat.binary128)))]
+              (← leaf "formatOf" fmtTy)
+            mkLambdaFVars #[c, t] body
+        let boolLay ← withLocalDeclD `c natTy fun c => do
+          mkLambdaFVars #[c] (← pureM layoutTy (← layOf (mkNatLit 1)))
         let fbList ← mkAppM ``List #[fbTy]
         let choose ← withLocalDeclD `c natTy fun c =>
           withLocalDeclD `cands fbList fun cands => do
             let idx ← mkAppM ``Nat.mod #[c, ← mkAppM ``List.length #[cands]]
-            mkLambdaFVars #[c, cands]
-              (← mkAppOptM ``EStateM.pure
-                #[some stepErr, some stateTy, some natTy, some idx])
-        mkAppOptM (mi ++ `FloatOpsHooks.mk)
-          #[some prov, some stateTy, some natTy, some kindOf, some formatOf,
-            some boolLayout, some flag, some choose]
-      let convObs (src dst : Expr) : MetaM Expr :=
+            mkLambdaFVars #[c, cands] (← pureM natTy idx)
+        let floatHooks ← mkAppOptM (mi ++ `FloatOpsHooks.mk)
+          #[some prov, some castS, some natTy, some kindOf, some formatOf,
+            some boolLay, some flag, some choose]
+        let typeInfo ← withLocalDeclD `c natTy fun c =>
+          withLocalDeclD `t tyIdTy fun t => do
+            let flt (f : Name) : MetaM Expr := do
+              pureM castInfoTy
+                (← mkAppM (mi ++ `CastTypeInfo.floating) #[mkConst (mi ++ f)])
+            let intI (k : Name) : MetaM Expr := do
+              pureM castInfoTy
+                (← mkAppM (mi ++ `CastTypeInfo.integer)
+                  #[mkConst (`Miri.MIR.IntegerKind ++ k)])
+            let body ← switchNat t
+              [(30, ← flt `FloatFormat.binary16),
+               (31, ← flt `FloatFormat.binary32),
+               (32, ← flt `FloatFormat.binary64),
+               (33, ← flt `FloatFormat.binary128),
+               (12, ← intI `i32), (13, ← intI `i64),
+               (22, ← intI `u32), (23, ← intI `u64)]
+              (← leaf "typeInfo" castInfoTy)
+            mkLambdaFVars #[c, t] body
+        let layoutOf ← withLocalDeclD `c natTy fun c =>
+          withLocalDeclD `t tyIdTy fun t => do
+            mkLambdaFVars #[c, t] (← pureM layoutTy (← layOf t))
+        let destLayout ← withLocalDeclD `v layoutTy fun v =>
+          mkLambdaFVars #[v] v
+        let opTyOperand ← mkAppM (mi ++ `Operand) #[prov]
+        let readImm ← withLocalDeclD `c natTy fun c =>
+          withLocalDeclD `op opTy fun op => do
+            let opField ← mkAppM (mi ++ `OpTy.op) #[op]
+            let layField ← mkAppM (mi ++ `OpTy.layout) #[op]
+            let retM ← mkAppM (mi ++ `RvalueM) #[castS, rvImmTy]
+            let motive ← withLocalDeclD `_o opTyOperand fun o =>
+              mkLambdaFVars #[o] retM
+            let onImm ← withLocalDeclD `imm immTy fun imm => do
+              let r ← mkAppM (mi ++ `RvalueImmTy.mk) #[imm, layField]
+              mkLambdaFVars #[imm] (← pureM rvImmTy r)
+            let mpTy ← mkAppM (mi ++ `MemPlace) #[prov]
+            let onInd ← withLocalDeclD `_mp mpTy fun mp => do
+              mkLambdaFVars #[mp] (← leaf "readImmediate" rvImmTy)
+            let body ← mkAppOptM (mi ++ `Operand.casesOn)
+              #[some prov, some motive, some opField, some onImm, some onInd]
+            mkLambdaFVars #[c, op] body
+        let writeImm ← withLocalDeclD `c natTy fun c =>
+          withLocalDeclD `imm immTy fun imm =>
+          withLocalDeclD `v layoutTy fun v =>
+          withLocalDeclD `_st castS fun st => do
+            let someImm ← mkAppOptM ``Option.some #[some immTy, some imm]
+            let res ← mkAppOptM ``EStateM.Result.ok
+              #[some stepErr, some castS, some unitTy,
+                some (mkConst ``Unit.unit), some someImm]
+            mkLambdaFVars #[c, imm, v, st] res
+        let copyTrans ← withLocalDeclD `c natTy fun c =>
+          withLocalDeclD `op opTy fun op =>
+          withLocalDeclD `v layoutTy fun v =>
+          withLocalDeclD `st castS fun st => do
+            let opField ← mkAppM (mi ++ `OpTy.op) #[op]
+            let resTy ← mkAppM ``EStateM.Result #[stepErr, castS, unitTy]
+            let motive ← withLocalDeclD `_o opTyOperand fun o =>
+              mkLambdaFVars #[o] resTy
+            let onImm ← withLocalDeclD `imm immTy fun imm => do
+              let someImm ← mkAppOptM ``Option.some #[some immTy, some imm]
+              let okR ← mkAppOptM ``EStateM.Result.ok
+                #[some stepErr, some castS, some unitTy,
+                  some (mkConst ``Unit.unit), some someImm]
+              mkLambdaFVars #[imm] okR
+            let mpTy ← mkAppM (mi ++ `MemPlace) #[prov]
+            let onInd ← withLocalDeclD `_mp mpTy fun mp => do
+              let err ← mkAppM (mi ++ `StepError.unsupported)
+                #[mkStrLit "copyAllowTransmute"]
+              let errR ← mkAppOptM ``EStateM.Result.error
+                #[some stepErr, some castS, some unitTy, some err, some st]
+              mkLambdaFVars #[mp] errR
+            let body ← mkAppOptM (mi ++ `Operand.casesOn)
+              #[some prov, some motive, some opField, some onImm, some onInd]
+            mkLambdaFVars #[c, op, v, st] body
+        let fn2 (t1 t2 aTy : Expr) (name : String) : MetaM Expr :=
+          withLocalDeclD `_1 t1 fun x1 => withLocalDeclD `_2 t2 fun x2 => do
+            mkLambdaFVars #[x1, x2] (← leaf name aTy)
+        let fn3 (t1 t2 t3 aTy : Expr) (name : String) : MetaM Expr :=
+          withLocalDeclD `_1 t1 fun x1 => withLocalDeclD `_2 t2 fun x2 =>
+          withLocalDeclD `_3 t3 fun x3 => do
+            mkLambdaFVars #[x1, x2, x3] (← leaf name aTy)
+        let fn4 (t1 t2 t3 t4 aTy : Expr) (name : String) : MetaM Expr :=
+          withLocalDeclD `_1 t1 fun x1 => withLocalDeclD `_2 t2 fun x2 =>
+          withLocalDeclD `_3 t3 fun x3 => withLocalDeclD `_4 t4 fun x4 => do
+            mkLambdaFVars #[x1, x2, x3, x4] (← leaf name aTy)
+        let enf ← withLocalDeclD `_c natTy fun c =>
+          withLocalDeclD `_l layoutTy fun l => do
+            mkLambdaFVars #[c, l] (← pureM boolTy (mkConst ``Bool.true))
+        let usizeL ← withLocalDeclD `_c natTy fun c => do
+          mkLambdaFVars #[c] (← pureM layoutTy (← layOf (mkNatLit 25)))
+        let ensMono ← withLocalDeclD `_c natTy fun c =>
+          withLocalDeclD `_t tyIdTy fun t => do
+            mkLambdaFVars #[c, t] (← pureM unitTy (mkConst ``Unit.unit))
+        let reqNoBv ← withLocalDeclD `_c natTy fun c =>
+          withLocalDeclD `_a arrGArg fun a => do
+            mkLambdaFVars #[c, a] (← pureM unitTy (mkConst ``Unit.unit))
+        let valAbi ← withLocalDeclD `_i immTy fun i =>
+          withLocalDeclD `_l layDataTy fun l => do
+            let err ← mkAppM (mi ++ `StepError.unsupported)
+              #[mkStrLit "validateImmediateABI"]
+            mkLambdaFVars #[i, l]
+              (← mkAppOptM ``Except.error
+                #[some stepErr, some unitTy, some err])
+        mkAppOptM (mi ++ `CastHooks.mk)
+          #[some prov, some castS, some natTy, some layoutTy,
+            some (mkConst (lm ++ `annealTargetDataLayout)),
+            some typeInfo, some layoutOf, some destLayout,
+            some readImm, some writeImm,
+            some (← fn3 natTy ptrOptTy layoutTy unitTy "writePointer"),
+            some enf, some enf,
+            some (← fn4 natTy layoutTy boolTy boolTy unitTy "validatePlace"),
+            some (← fn2 natTy opTy unitTy "derefPointer"),
+            some (← fn2 natTy ptrOptTy unitTy "checkFunctionPointer"),
+            some (← fn2 natTy prov unitTy "exposeProvenance"),
+            some (← fn2 natTy u64Ty ptrOptTy "pointerFromExposedAddress"),
+            some usizeL, some floatHooks, some ensMono, some reqNoBv,
+            some (← fn3 natTy defIdTy arrGArg optCallInst "resolveFunction"),
+            some (← fn3 natTy defIdTy arrGArg callInstTy "resolveClosure"),
+            some (← fn2 natTy callInstTy ptrOptTy "functionPointer"),
+            some (← fn3 natTy tyIdTy boolTy optTyId "builtinDeref"),
+            some (← fn2 natTy tyIdTy layoutTy "boxLayout"),
+            some valAbi, some copyTrans,
+            some (← fn4 natTy opTy layoutTy boolTy unitTy "copyNoValidate"),
+            some (← fn3 natTy opTy natTy opTy "projectRead"),
+            some (← fn3 natTy layoutTy natTy layoutTy "projectWrite"),
+            some (← fn3 natTy layoutTy natTy layoutTy "fieldLayout"),
+            some (← fn3 natTy tyIdTy tyIdTy prodTyId "lockstepTails"),
+            some (← fn3 natTy ptrOptTy optNat tyIdTy "vtableType"),
+            some (← fn3 natTy tyIdTy natTy ptrOptTy "vtablePointer"),
+            some (← fn2 natTy natTy optNat "principal"),
+            some (← fn3 natTy optNat tyIdTy arrVtEntry "vtableEntries"),
+            some (← fn3 natTy tyIdTy tyIdTy optNat "supertraitSlot"),
+            some (← fn2 natTy natTy natTy "eraseSelfTraitRef"),
+            some (← fn2 natTy natTy optNat "normalizePrincipal")]
+      let runCast ← withLocalDeclD `flag boolTy fun flag =>
+        withLocalDeclD `pick natTy fun pick =>
+        withLocalDeclD `srcTyId tyIdTy fun srcTyId =>
+        withLocalDeclD `dstTyId tyIdTy fun dstTyId =>
+        withLocalDeclD `kind castKindTy fun kind =>
         withLocalDeclD `bits natTy fun bits =>
-        withLocalDeclD `flag (mkConst ``Bool) fun flag =>
-        withLocalDeclD `pick natTy fun pick => do
-          let input ← bitsOf src bits
-          let conv ← mkAppM ``Except.toOption
-            #[← mkAppM (mi ++ `FloatBits.convert) #[input, dst]]
-          let adjust ← withLocalDeclD `r fbTy fun r => do
-            let inputs ← mkListLit fbTy [input]
-            let m ← mkAppM (mi ++ `FloatOps.adjustNaN)
-              #[← hooksOf flag, pick, r, inputs]
-            mkLambdaFVars #[r]
-              (← mkAppM ``EStateM.run'
-                #[m, mkConst (lw ++ `wideSlicePipelineInitMiri)])
-          let res ← mkAppM ``Option.bind #[conv, adjust]
-          mkLambdaFVars #[bits, flag, pick]
-            (← pack res (← noneOf intTy) (← noneOf stepRes))
-      let widenObs ← convObs fmt32 fmt64
-      let narrowObs ← convObs fmt64 fmt32
-      let toIntObs ← withLocalDeclD `bits natTy fun bits => do
-        let r ← mkAppM ``Except.toOption
-          #[← mkAppM (mi ++ `FloatBits.toInteger)
-            #[← bitsOf fmt32 bits, mkNatLit 32, mkConst ``Bool.true]]
-        mkLambdaFVars #[bits] (← pack (← noneOf fbTy) r (← noneOf stepRes))
-      let fromIntObs ← withLocalDeclD `v intTy fun v => do
-        let r ← mkAppM ``Except.toOption
-          #[← mkAppM (mi ++ `FloatBits.fromInteger) #[fmt32, v]]
-        mkLambdaFVars #[v] (← pack r (← noneOf intTy) (← noneOf stepRes))
-      let carrierObs ← withLocalDeclD `bits natTy fun bits => do
-        let sc ← mkAppM `Miri.Memory.ScalarInt.ofUInt32
-          #[← mkAppM ``UInt32.ofNat #[bits]]
-        let size ← mkAppM `Miri.ABI.Size.ofBytes
-          #[← mkAppM ``UInt64.ofNat #[mkNatLit 4]]
-        let r ← mkAppM ``Except.toOption
-          #[← mkAppM `Miri.Memory.ScalarInt.toInt #[sc, size]]
-        mkLambdaFVars #[bits] (← pack (← noneOf fbTy) r (← noneOf stepRes))
+        withLocalDeclD `srcBytes natTy fun srcBytes => do
+          let sc ← switchNat srcBytes
+            [(2, ← sc16 bits), (4, ← sc32 bits), (8, ← sc64 bits)]
+            (← sc128 bits)
+          let imm ← mkAppM (mi ++ `Immediate.scalar) #[sc]
+          let op ← mkAppM (mi ++ `Operand.immediate) #[imm]
+          let srcOp ← mkAppM (mi ++ `OpTy.mk) #[op, ← layOf srcTyId]
+          let dstLay ← layOf dstTyId
+          let actCast ← mkAppOptM (mi ++ `Cast.cast)
+            #[some prov, some castS, some natTy, some layoutTy,
+              some (mkConst `Miri.Memory.instPointerProvenanceProvenance),
+              some (← hooksOf flag), some pick, some (mkNatLit 8),
+              some srcOp, some kind, some dstTyId, some dstLay]
+          let initS ← mkAppOptM ``Option.none #[some immTy]
+          let runRes ← mkAppM ``EStateM.run #[actCast, initS]
+          let resTy ← mkAppM ``EStateM.Result #[stepErr, castS, unitTy]
+          let motive ← withLocalDeclD `_r resTy fun r =>
+            mkLambdaFVars #[r] fcObsTy
+          let onOk ← withLocalDeclD `_u unitTy fun u =>
+            withLocalDeclD `st castS fun st => do
+              mkLambdaFVars #[u, st]
+                (← mkAppOptM ``Except.ok #[some stepErr, some castS, some st])
+          let onErr ← withLocalDeclD `e stepErr fun e =>
+            withLocalDeclD `_st castS fun st => do
+              mkLambdaFVars #[e, st]
+                (← mkAppOptM ``Except.error
+                  #[some stepErr, some castS, some e])
+          let obs ← mkAppOptM ``EStateM.Result.casesOn
+            #[some stepErr, some castS, some unitTy, some motive,
+              some runRes, some onOk, some onErr]
+          mkLambdaFVars
+            #[flag, pick, srcTyId, dstTyId, kind, bits, srcBytes] obs
+      let okSc (mkSc : Expr → MetaM Expr) : MetaM Expr :=
+        withLocalDeclD `n natTy fun n => do
+          let imm ← mkAppM (mi ++ `Immediate.scalar) #[← mkSc n]
+          let someImm ← mkAppOptM ``Option.some #[some immTy, some imm]
+          mkLambdaFVars #[n]
+            (← mkAppOptM ``Except.ok
+              #[some stepErr, some castS, some someImm])
+      let ret32 ← okSc sc32
+      let ret64 ← okSc sc64
+      let ubObs ← withLocalDeclD `s (mkConst ``String) fun s => do
+        let err ← mkAppM (mi ++ `StepError.undefinedBehavior) #[s]
+        mkLambdaFVars #[s]
+          (← mkAppOptM ``Except.error #[some stepErr, some castS, some err])
       let uninitObs ← withLocalDeclD `b capMir fun b => do
         let hooks ← mkAppM (lm ++ `annealStepHooksWideSlice)
           #[← mkAppM ``Trusted.Rustc.V2026_06_01.MirAst.CapturedMir.localDecls
@@ -10574,36 +11332,47 @@ run_cmd do
             ← mkAppM ``UInt64.ofNat #[mkNatLit 1],
             mkConst (lw ++ `sampleArrU32Machine)]
         let r ← mkAppM (mi ++ `Step.step) #[hooks, mkConst ``Unit.unit, init]
-        let res ← mkAppM ``Option.some #[← mkAppM ``Prod.snd #[r]]
-        mkLambdaFVars #[b] (← pack (← noneOf fbTy) (← noneOf intTy) res)
-      let retFloat (fmt : Expr) : MetaM Expr :=
-        withLocalDeclD `n natTy fun n => do
-          let v ← mkAppM ``Option.some #[← bitsOf fmt n]
-          mkLambdaFVars #[n] (← pack v (← noneOf intTy) (← noneOf stepRes))
-      let ret32 ← retFloat fmt32
-      let ret64 ← retFloat fmt64
-      let retInt ← withLocalDeclD `v intTy fun v => do
-        let r ← mkAppM ``Option.some #[v]
-        mkLambdaFVars #[v] (← pack (← noneOf fbTy) r (← noneOf stepRes))
-      let ubObs ← withLocalDeclD `s (mkConst ``String) fun s => do
-        let err ← mkAppM (mi ++ `StepError.undefinedBehavior) #[s]
-        let res ← mkAppM ``Option.some
-          #[← mkAppOptM ``Except.error
-            #[some stepErr, some (mkConst ``Bool), some err]]
-        mkLambdaFVars #[s] (← pack (← noneOf fbTy) (← noneOf intTy) res)
+        let noneImm ← mkAppOptM ``Option.none #[some immTy]
+        let toObs ← withLocalDeclD `_b boolTy fun bb =>
+          mkLambdaFVars #[bb] noneImm
+        let mapped ← mkAppM ``Except.map #[toObs, ← mkAppM ``Prod.snd #[r]]
+        mkLambdaFVars #[b] mapped
+      return (runCast, ret32, ret64, ubObs, uninitObs)
+    let fcRunCastName := ns ++ `CrossRoot.FloatCast.runCast
+    let _ ← addDef fcRunCastName fcRunCast
+    added := added.push fcRunCastName
+    let fcRunCastC := mkConst fcRunCastName
+    let mkFcAuth (invertFlag : Bool) : MetaM Expr := do
+      let boolTy := mkConst ``Bool
+      let flagOf (f : Expr) : MetaM Expr :=
+        if invertFlag then mkAppM ``Bool.not #[f] else pure f
+      let f2fObs (srcId dstId srcB : Nat) : MetaM Expr :=
+        withLocalDeclD `bits natTy fun bits =>
+        withLocalDeclD `flag boolTy fun flag =>
+        withLocalDeclD `pick natTy fun pick => do
+          let e ← mkAppM fcRunCastName
+            #[← flagOf flag, pick, mkNatLit srcId, mkNatLit dstId,
+              mkConst `Miri.MIR.CastKind.FloatToFloat, bits, mkNatLit srcB]
+          mkLambdaFVars #[bits, flag, pick] e
+      let simpleObs (srcId dstId srcB : Nat) (k : Name) : MetaM Expr :=
+        withLocalDeclD `bits natTy fun bits => do
+          let e ← mkAppM fcRunCastName
+            #[mkConst ``Bool.false, mkNatLit 0, mkNatLit srcId,
+              mkNatLit dstId, mkConst (`Miri.MIR.CastKind ++ k), bits,
+              mkNatLit srcB]
+          mkLambdaFVars #[bits] e
+      let widenObs ← f2fObs 31 32 4
+      let narrowObs ← f2fObs 32 31 8
+      let toIntObs ← simpleObs 31 12 4 `FloatToInt
+      let fromIntObs ← simpleObs 12 31 4 `IntToFloat
+      let carrier32Obs ← simpleObs 22 12 4 `Transmute
+      let carrier64Obs ← simpleObs 23 13 8 `Transmute
       mkAppM (ns ++ `FloatCast.authorityOf)
         #[fcObsTy, decFcObs, widenObs, narrowObs, toIntObs, fromIntObs,
-          carrierObs, uninitObs, ret32, ret64, retInt, ubObs]
-    let fcAuthTy ← MetaM.run' <| inferType fcAuth
+          carrier32Obs, carrier64Obs, fcUninitObs, fcRet32, fcRet64, fcUbObs]
+    let fcAuth ← MetaM.run' <| mkFcAuth false
     let fcMiriName := ns ++ `CrossRoot.FloatCast.miri
-    let fdv : DefinitionVal :=
-      { name := fcMiriName
-        levelParams := []
-        type := fcAuthTy
-        value := fcAuth
-        hints := .regular 0
-        safety := .safe }
-    addDecl (.defnDecl fdv)
+    let _ ← addDef fcMiriName fcAuth
     let fcMiriC := mkConst fcMiriName
     addThm (ns ++ `CrossRoot.FloatCast.miri_matches)
       (eqTrue (mkApp (mkConst (ns ++ `FloatCast.matchesReference)) fcMiriC))
@@ -10612,6 +11381,26 @@ run_cmd do
       (eqTrue (mkApp (mkConst (ns ++ `FloatCast.checkOf)) fcMiriC)) reflTrue
     added := added ++ #[fcMiriName, ns ++ `CrossRoot.FloatCast.miri_matches,
       ns ++ `CrossRoot.FloatCast.miri_check]
+    -- Tightness of `FloatCast.gateLM` against `Miri.Interpreter.Cast.cast`:
+    -- vendored `Cast.cast` converts `1.5f16` (`0x3e00`) and `1.5f128`
+    -- (`0x3fff8000000000000000000000000000`) cleanly to `1.5f32`
+    -- (`0x3fc00000`), where Anneal fails closed `.unsupported`.
+    let (f16Ty, f16Pf, f128Ty, f128Pf) ← MetaM.run' do
+      let expected := mkApp fcRet32 (mkNatLit 0x3fc00000)
+      let f16Call := mkAppN fcRunCastC
+        #[mkConst ``Bool.false, mkNatLit 0, mkNatLit 30, mkNatLit 31,
+          mkConst `Miri.MIR.CastKind.FloatToFloat, mkNatLit 0x3e00,
+          mkNatLit 2]
+      let f128Call := mkAppN fcRunCastC
+        #[mkConst ``Bool.false, mkNatLit 0, mkNatLit 33, mkNatLit 31,
+          mkConst `Miri.MIR.CastKind.FloatToFloat,
+          mkNatLit 0x3fff8000000000000000000000000000, mkNatLit 16]
+      return (← mkEq f16Call expected, ← mkEqRefl expected,
+        ← mkEq f128Call expected, ← mkEqRefl expected)
+    addThm (ns ++ `CrossRoot.FloatCast.f16_gateLM_tight) f16Ty f16Pf
+    addThm (ns ++ `CrossRoot.FloatCast.f128_gateLM_tight) f128Ty f128Pf
+    added := added ++ #[ns ++ `CrossRoot.FloatCast.f16_gateLM_tight,
+      ns ++ `CrossRoot.FloatCast.f128_gateLM_tight]
     -- 4. Bundles and theorems over the vendored interpreter: every
     -- `*_with` declaration instantiated at the cross-root authority.
     let mut bundleCount : Nat := 0
@@ -10642,6 +11431,12 @@ run_cmd do
           throwError "cross-root: {name} does not mention the authority"
         addThm name ty value
         added := added.push name
+    let fcVacName := ns ++ `CrossRoot.FloatCast.empty_schedule_is_vacuous
+    let fcVacVal := mkApp
+      (mkConst (ns ++ `FloatCast.empty_schedule_is_vacuous))
+      (mkApp (mkConst (ns ++ `FloatCast.verdictOf)) fcMiriC)
+    addThm fcVacName (← MetaM.run' <| inferType fcVacVal) fcVacVal
+    added := added.push fcVacName
     -- 5. Fixture locks: the Anneal fixtures of this file are the fixtures
     -- of the LeanMiri correspondence module.
     let lockEq (name : Name) (lhs rhs : Expr) (xs : Array Expr) :
@@ -10684,7 +11479,7 @@ run_cmd do
       addThm name ty pf
       added := added.push name
     -- 6. Negative self-tests on scratch copies of the environment: the
-    -- kernel must reject each forged declaration.
+    -- kernel must reject each forged declaration across both families.
     let saved ← getEnv
     let rejects (d : Declaration) : CoreM Bool := do
       let r ← try addDecl d; pure false catch _ => pure true
@@ -10694,6 +11489,14 @@ run_cmd do
     let forgedAuth ← MetaM.run' <| mkAppM (ns ++ `WideSlice.authorityOf)
       #[obsTy, decObs, wsFrameObs, wsSizeObs, wsRetU32, wsRetU32, wsRetWide,
         wsUbObs]
+    let forgedFcAuth ← MetaM.run' <| mkFcAuth true
+    let (forgedF16Ty, forgedF16Pf) ← MetaM.run' do
+      let bad := mkApp fcRet32 (mkNatLit 0x3f800000)
+      let f16Call := mkAppN fcRunCastC
+        #[mkConst ``Bool.false, mkNatLit 0, mkNatLit 30, mkNatLit 31,
+          mkConst `Miri.MIR.CastKind.FloatToFloat, mkNatLit 0x3e00,
+          mkNatLit 2]
+      return (← mkEq f16Call bad, ← mkEqRefl bad)
     let forged : List (String × Declaration) :=
       [("ill-typed theorem", .thmDecl
           { name := ns ++ `CrossRoot.forged.zeroEqOne
@@ -10707,20 +11510,20 @@ run_cmd do
             value := boolTrue
             hints := .regular 0
             safety := .safe }),
-       ("negated certificate", .thmDecl
+       ("negated WideSlice certificate", .thmDecl
           { name := ns ++ `CrossRoot.forged.checkFalse
             levelParams := []
             type := mkApp3 (mkConst ``Eq [1]) (mkConst ``Bool)
               (mkApp (mkConst (ns ++ `WideSlice.checkOf)) miriC) boolFalse
             value := mkApp2 (mkConst ``Eq.refl [1]) (mkConst ``Bool)
               boolFalse }),
-       ("certificate of a forged authority", .thmDecl
+       ("certificate of a forged WideSlice authority", .thmDecl
           { name := ns ++ `CrossRoot.forged.forgedCheck
             levelParams := []
             type := eqTrue
               (mkApp (mkConst (ns ++ `WideSlice.checkOf)) forgedAuth)
             value := reflTrue }),
-       ("agreement of a forged authority", .thmDecl
+       ("agreement of a forged WideSlice authority", .thmDecl
           { name := ns ++ `CrossRoot.forged.forgedMatches
             levelParams := []
             type := eqTrue
@@ -10733,7 +11536,32 @@ run_cmd do
             type := mkApp3 (mkConst ``Eq [1]) capMir (ws `metadataBody)
               (lwc `wideSliceSingleLenBody)
             value := mkApp2 (mkConst ``Eq.refl [1]) capMir
-              (ws `metadataBody) })]
+              (ws `metadataBody) }),
+       ("negated FloatCast certificate", .thmDecl
+          { name := ns ++ `CrossRoot.forged.fcCheckFalse
+            levelParams := []
+            type := mkApp3 (mkConst ``Eq [1]) (mkConst ``Bool)
+              (mkApp (mkConst (ns ++ `FloatCast.checkOf)) fcMiriC) boolFalse
+            value := mkApp2 (mkConst ``Eq.refl [1]) (mkConst ``Bool)
+              boolFalse }),
+       ("mode-inverted FloatCast authority certificate", .thmDecl
+          { name := ns ++ `CrossRoot.forged.fcInvertedCheck
+            levelParams := []
+            type := eqTrue
+              (mkApp (mkConst (ns ++ `FloatCast.checkOf)) forgedFcAuth)
+            value := reflTrue }),
+       ("mode-inverted FloatCast authority agreement", .thmDecl
+          { name := ns ++ `CrossRoot.forged.fcInvertedMatches
+            levelParams := []
+            type := eqTrue
+              (mkApp (mkConst (ns ++ `FloatCast.matchesReference))
+                forgedFcAuth)
+            value := reflTrue }),
+       ("wrong f16 Cast.cast result", .thmDecl
+          { name := ns ++ `CrossRoot.forged.fcWrongF16
+            levelParams := []
+            type := forgedF16Ty
+            value := forgedF16Pf })]
     let mut rejected : Nat := 0
     for (what, d) in forged do
       unless ← rejects d do
@@ -10756,16 +11584,20 @@ run_cmd do
         unless a == ``propext || a == ``Classical.choice ||
             a == ``Quot.sound do
           throwError "cross-root: {n} depends on the axiom {a}"
-    -- The authorities really run the vendored interpreter.
+    -- The authorities (and `runCast` directly, independently of `Step.step`)
+    -- genuinely run the vendored interpreter and `Miri.Interpreter.Cast.cast`.
     for (auth, needed) in
         [(miriName,
           [mi ++ `Step.step, mi ++ `Cast.cast,
             lm ++ `annealStepHooksWideSlice]),
-         (fcMiriName,
-          [mi ++ `FloatBits.nanChoices, mi ++ `FloatBits.preferredNaN,
+         (fcRunCastName,
+          [mi ++ `Cast.cast, mi ++ `Cast.castFromIntLike,
+            mi ++ `FloatOps.readBits, mi ++ `FloatOps.adjustNaN,
+            mi ++ `FloatBits.nanChoices, mi ++ `FloatBits.preferredNaN,
             mi ++ `FloatBits.convert, mi ++ `FloatBits.decode,
-            mi ++ `FloatBits.toInteger, mi ++ `FloatBits.fromInteger,
-            mi ++ `FloatOps.adjustNaN, mi ++ `Cast.cast, mi ++ `Step.step])]
+            mi ++ `FloatBits.toInteger, mi ++ `FloatBits.fromInteger]),
+         (fcMiriName,
+          [fcRunCastName, mi ++ `Cast.cast, mi ++ `Step.step])]
         do
       let mut reach : NameSet := {}
       let mut todo : Array Name := #[auth]
@@ -10788,8 +11620,10 @@ run_cmd do
       maxHeartbeats := 0 }
   let ((replayed, added, bundles, rejected), _) ←
     liftCoreM <| (act.toIO ctx { env := baseEnv })
-  unless replayed ≥ 400 && added ≥ 40 && bundles = 7 && rejected = 6 do
-    throwError "cross-root: unexpected counts"
+  unless replayed ≥ 400 && added ≥ 65 && bundles = 12 && rejected = 10 do
+    throwError "cross-root: unexpected counts \
+      (replayed={replayed}, added={added}, bundles={bundles}, \
+      rejected={rejected})"
   logInfo m!"cross-root kernel bridge: replayed {replayed} surface \
     declarations, added {added} cross-root declarations ({bundles} \
     bundles), rejected {rejected} forged declarations"
@@ -10798,10 +11632,11 @@ run_cmd do
 
 Fail-closed audit of both modules under test and of every declaration of
 this file: only kernel-checked safe definitions, theorems, and inductive
-types (nothing opaque, postulated, or outside the safe fragment), axiom
-closures within `[propext, Quot.sound]`, the declaration-count floors of
-both modules, and transitive reachability of every public theorem of both
-modules from the declarations of this file, with no exemption list. -/
+types (nothing opaque, postulated, or outside the safe fragment), no
+trivial `True` theorems, no stray declarations outside the test namespace,
+axiom closures within `[propext, Quot.sound]`, the declaration-count floors
+of both modules, and transitive reachability of every public theorem of
+both modules from the declarations of this file, with no exemption list. -/
 
 open Lean Elab Command in
 run_cmd do
@@ -10830,6 +11665,11 @@ run_cmd do
     | .recInfo v => v.isUnsafe
     | .thmInfo _ => false
     | .quotInfo _ => false
+  -- Trivial `: True` theorem detector.
+  let isTrivialThm (ci : ConstantInfo) : Bool :=
+    match ci with
+    | .thmInfo v => v.type.isConstOf ``True
+    | _ => false
   -- Transitive closure of the used-constant relation.
   let closure (start : Array Name) : NameSet := Id.run do
     let mut seen : NameSet := {}
@@ -10843,16 +11683,36 @@ run_cmd do
         for d in ci.getUsedConstantsAsSet do
           if !seen.contains d then stack := stack.push d
     return seen
-  -- 1. Declarations of this file.
+  -- 1. Every declaration added by this file (`env.constants.map₂`).
   let mut roots : Array Name := #[]
+  let mut lazyEqs : Array Name := #[]
   for (n, ci) in env.constants.map₂.toList do
     if testNs.isPrefixOf n then
       if rejected ci then
         throwError "audit: test declaration {n} is not a safe definition"
+      if isTrivialThm ci then
+        throwError "audit: test theorem {n} has trivial type `True`"
       roots := roots.push n
+    else if !n.isInternal then
+      -- Lean lazily synthesizes equational lemmas (`*.eq_*` / `*.eq_def`)
+      -- for imported definitions on demand in `map₂`; reject anything else.
+      let leaf := match n with | .str _ s => s | _ => ""
+      let isLazyEq :=
+        (match ci with | .thmInfo _ => true | _ => false) &&
+        (leaf.startsWith "eq_" || leaf == "eq_def")
+      unless isLazyEq do
+        throwError "audit: stray top-level declaration {n} outside {testNs}"
+      lazyEqs := lazyEqs.push n
+    else
+      -- Even internal declarations outside `testNs` (except Lean's transient
+      -- `_eval` / `_private` command runners) must stay safe.
+      let s := n.toString
+      unless s.startsWith "_eval" || s.startsWith "_private" do
+        if rejected ci then
+          throwError "audit: non-safe auxiliary declaration {n}"
   unless roots.size ≥ 1500 do
     throwError "audit: only {roots.size} test declarations"
-  let testAxioms ← scanAxioms roots
+  let testAxioms ← scanAxioms (roots ++ lazyEqs)
   unless constructive testAxioms do
     throwError "audit: test declarations use the axioms {testAxioms}"
   let reached := closure roots
@@ -10895,6 +11755,11 @@ run_cmd do
     unless rejected ci do
       throwError "audit self-test: a non-safe definition was not detected"
   | none => throwError "audit self-test: `unsafeCast` is missing"
+  match env.find? ``trivial with
+  | some ci =>
+    unless isTrivialThm ci do
+      throwError "audit self-test: trivial `: True` theorem was not detected"
+  | none => throwError "audit self-test: `trivial` is missing"
   unless (closure #[]).isEmpty do
     throwError "audit self-test: the empty closure is not empty"
   let bundleOnly := closure <| roots.filter fun n =>
