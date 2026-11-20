@@ -34564,7 +34564,7 @@ theorem rawPtrLoadAction_volatile_addr_unsupported {requiresAlign : Bool}
     (hAligned :
       rawPtrTargetAligned? cs locals' decls layouts
         (match requiresAlign with | true => align | false => 1) (.addr addr) .outside = some true)
-    (hInh : tyIsUninhabited layouts elemTy = false)
+    (hInh : rawPtrTyIsUninhabited layouts elemTy = false)
     (hSize : Nat.beq size 0 = false) :
     rawPtrLoadAction true requiresAlign borrows globals cs ap target decls layouts argOps
         [.scalar ⟨addr, layoutPointerBytes layouts⟩] locals' = .fault .unsupported := by
@@ -34586,7 +34586,7 @@ theorem rawPtrStoreAction_volatile_addr_unsupported {requiresAlign : Bool}
     (hAligned :
       rawPtrTargetAligned? cs locals' decls layouts
         (match requiresAlign with | true => align | false => 1) (.addr addr) .outside = some true)
-    (hInh : tyIsUninhabited layouts elemTy = false)
+    (hInh : rawPtrTyIsUninhabited layouts elemTy = false)
     (hVal : rawPtrStoreValueFault? layouts elemTy val = none)
     (hSize : Nat.beq size 0 = false) :
     rawPtrStoreAction true requiresAlign borrows globals cs cl ap target decls layouts argOps
@@ -34609,7 +34609,7 @@ theorem rawPtrAccessAction_volatile_zst_addr {requiresAlign : Bool}
     (hAligned :
       rawPtrTargetAligned? cs locals' decls layouts
         (match requiresAlign with | true => align | false => 1) (.addr addr) .outside = some true)
-    (hInh : tyIsUninhabited layouts elemTy = false)
+    (hInh : rawPtrTyIsUninhabited layouts elemTy = false)
     (hZst : rawPtrZstValue? layouts elemTy = some zstVal)
     (hVal : rawPtrStoreValueFault? layouts elemTy val = none) :
     rawPtrLoadAction true requiresAlign borrows globals cs ap target decls layouts argOps
@@ -34636,7 +34636,7 @@ theorem rawPtrLoadAction_uninhabited_ub {isVolatile requiresAlign : Bool}
     (hAligned :
       rawPtrTargetAligned? cs locals' decls layouts
         (match requiresAlign with | true => align | false => 1) (.addr addr) .outside = some true)
-    (hInh : tyIsUninhabited layouts elemTy = true) :
+    (hInh : rawPtrTyIsUninhabited layouts elemTy = true) :
     rawPtrLoadAction isVolatile requiresAlign borrows globals cs ap target decls layouts argOps
         [.scalar ⟨addr, layoutPointerBytes layouts⟩] locals' = .fault .ub := by
   cases requiresAlign <;>
@@ -34657,7 +34657,7 @@ theorem rawPtrStoreAction_uninhabited_ub {isVolatile requiresAlign : Bool}
     (hAligned :
       rawPtrTargetAligned? cs locals' decls layouts
         (match requiresAlign with | true => align | false => 1) (.addr addr) .outside = some true)
-    (hInh : tyIsUninhabited layouts elemTy = true) :
+    (hInh : rawPtrTyIsUninhabited layouts elemTy = true) :
     rawPtrStoreAction isVolatile requiresAlign borrows globals cs cl ap target decls layouts argOps
         [.scalar ⟨addr, layoutPointerBytes layouts⟩, val] locals' = .fault .ub := by
   cases requiresAlign <;>
@@ -34711,7 +34711,7 @@ theorem rawPtrLoadAction_nonvolatile_addr_ub
     {argOps : List Operand} {locals' : List LocalSlot} {addr : Nat}
     {elemTy : Ty} {size align : Nat}
     (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
-    (hInh : tyIsUninhabited layouts elemTy = false)
+    (hInh : rawPtrTyIsUninhabited layouts elemTy = false)
     (hSize : Nat.beq size 0 = false) :
     rawPtrLoadAction false false borrows globals cs ap target decls layouts argOps
         [.scalar ⟨addr, layoutPointerBytes layouts⟩] locals' = .fault .ub := by

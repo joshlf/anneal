@@ -18956,7 +18956,7 @@ private theorem rawPtrLoadAction_callerBodies
             cases Bool.and (Bool.not isVolatile) (rawPtrArgIsNull srcArg) with
             | true => trivial
             | false =>
-              cases tyIsUninhabited layouts elemTy with
+              cases rawPtrTyIsUninhabited layouts elemTy with
               | true => trivial
               | false =>
                 cases Nat.beq size 0 with
@@ -18973,7 +18973,7 @@ private theorem rawPtrLoadAction_callerBodies
                     | false => trivial
                     | true =>
                       dsimp only
-                      cases globalAllocSliceToAbstractBytes alloc ptr.offsetBytes size with
+                      cases rawPtrGlobalSliceBytes? (layoutPointerBytes layouts) alloc ptr.offsetBytes size with
                       | none => trivial
                       | some bs =>
                         dsimp only
@@ -19023,7 +19023,7 @@ private theorem rawPtrStoreAction_callerBodies
             cases Bool.and (Bool.not isVolatile) (rawPtrArgIsNull dstArg) with
             | true => trivial
             | false =>
-              cases tyIsUninhabited layouts elemTy with
+              cases rawPtrTyIsUninhabited layouts elemTy with
               | true => trivial
               | false =>
                 cases rawPtrStoreValueFault? layouts elemTy val with

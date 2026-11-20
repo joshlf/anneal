@@ -143,10 +143,15 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   rawPtrTargetAligned? RawPtrStackTarget resolveRawPtrStackTarget
   rawPtrUninitFault rawPtrBytesAllPlainInit rawPtrBytesAnyUninit
   rawPtrBytesAnyProv rawPtrBytesUniformProv rawPtrDecodeFault
-  rawPtrIntByteWidth rawPtrFloatByteWidth rawPtrAllValuesValid?
+  rawPtrIntByteWidth rawPtrFloatByteWidth rawPtrTyIsUninhabited
+  rawPtrOptBoolAnd rawPtrThinPtrValid? rawPtrWidePtrValid?
+  rawPtrScalarLayoutValid? rawPtrLayoutFieldsValid? rawPtrLayoutArrayElemsValid?
+  rawPtrLayoutValValid? rawPtrAllValuesValid?
   rawPtrTupleFieldsValid? rawPtrValueValid? rawPtrEncodeValue?
-  RawPtrLoadResult rawPtrDecodeThinPtr rawPtrDecodeBytes loadRawPtrStackValue
-  rawPtrTreeBorrowPermEq RawPtrBorrowResult rawPtrEntryOverlapsAccess
+  RawPtrLoadResult rawPtrDecodeThinPtr rawPtrGlobalSliceBytes?
+  rawPtrDecodeBytes loadRawPtrStackValue
+  rawPtrTreeBorrowPermEq RawPtrBorrowResult
+  rawPtrProjsDisjointAux rawPtrProjsDisjoint? rawPtrEntryOverlapsAccess
   rawPtrBorrowStepList borrowsAfterRawPtrAccess borrowsAfterRawPtrCopy
   rawPtrZstValue? RawPtrCallAction finishRawPtrCallAction
   rawPtrLoadAction evalRawPtrLoadCall rawPtrStoreValueFault?

@@ -3568,8 +3568,321 @@ def rawPtrFloatByteWidth : FloatTy → Nat
   | .f128 => 16
 
 /--
-Check a validity predicate `check` on every element value of an array at element
-type `elemTy`.
+Determine whether `ty` is uninhabited for a raw-pointer memory access without
+allowing a synthesized `layoutIdx = 0` on a primitive scalar, pointer, tuple, or
+array to inherit `layouts.entries[0].isUninhabited`:
+- structural uninhabitedness (`rigidTyIsUninhabited 16 ty.kind`: `.never`,
+  `Infallible`, `UnsafeCell<!>`, tuples/arrays containing uninhabited elements)
+  is always uninhabited;
+- primitive scalars (`.bool`, `.char`, `.int`, `.uint`, `.float`), pointers
+  (`.rawPtr`, `.ref`, `.fnPtr`), `()`, function items (`.fnDef`), and empty
+  arrays (`.array _ 0`) are always inhabited regardless of `layouts.entries[0]`;
+- `.adt` and `.closure` consult `layouts[ty.layoutIdx].isUninhabited` only when
+  `layoutValidForResolvedAdt ty.layoutIdx l` trusts the entry;
+- non-empty `.tuple` and `.array` consult `layouts[ty.layoutIdx].isUninhabited`
+  only when `ty.layoutIdx` is resolved (`isUnresolvedLayoutIdx = false`) and the
+  entry's `FieldsShape` / `Variants` matches the tuple or array shape.
+
+Reference (The Rust Reference, "Never type"):
+<https://doc.rust-lang.org/1.98.0/reference/types/never.html>
+
+> "The never type ! is a type with no values, representing the result of computations that never complete."
+
+Reference (The Rust Reference, "Behavior considered undefined — Invalid
+values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
+-/
+@[reducible]
+def rawPtrTyIsUninhabited (layouts : LayoutTable) (ty : Ty) : Bool :=
+  match rigidTyIsUninhabited 16 ty.kind with
+  | true => true
+  | false =>
+    match ty.kind with
+    | .adt _ _ | .closure _ _ =>
+      match LayoutTable.lookup layouts ty.layoutIdx with
+      | .some l =>
+        match layoutValidForResolvedAdt ty.layoutIdx l with
+        | true => l.isUninhabited
+        | false => false
+      | .none => false
+    | .tuple (k :: ks) =>
+      match
+        isUnresolvedLayoutIdx layouts ty.layoutIdx,
+        LayoutTable.lookup layouts ty.layoutIdx
+      with
+      | false, .some l =>
+        match l.variants, l.fields with
+        | .single 0, .arbitrary _ _ =>
+          match Nat.beq (length l.fieldLayouts) (length (k :: ks)) with
+          | true => l.isUninhabited
+          | false => false
+        | _, _ => false
+      | _, _ => false
+    | .array _ (.succ n) =>
+      match
+        isUnresolvedLayoutIdx layouts ty.layoutIdx,
+        LayoutTable.lookup layouts ty.layoutIdx
+      with
+      | false, .some l =>
+        match l.fields with
+        | .array _ count =>
+          match Nat.beq count (.succ n) with
+          | true => l.isUninhabited
+          | false => false
+        | _ => false
+      | _, _ => false
+    | _ => false
+
+/--
+Three-valued conjunction for fuel-bounded raw-pointer validity checks:
+`.some false` (definite invalidity / UB) dominates `.none` (fuel exhaustion /
+undecidable), and `.some true` holds only when both sides are `.some true`.
+
+Reference (The Rust Reference, "Behavior considered undefined — Invalid
+values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
+-/
+@[reducible]
+def rawPtrOptBoolAnd : Option Bool → Option Bool → Option Bool
+  | .some false, _ => .some false
+  | _, .some false => .some false
+  | .some true, .some true => .some true
+  | _, _ => .none
+
+/--
+Test whether `v` is a valid thin pointer value of width `ptrBytes`, rejecting
+null when `nonNull = true` (references and function pointers).
+
+Reference (The Rust Reference, "Behavior considered undefined — Invalid
+values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
+-/
+@[reducible]
+def rawPtrThinPtrValid? (ptrBytes : Nat) (nonNull : Bool) (v : Value) : Bool :=
+  match rawPtrArgOfValue? ptrBytes v with
+  | .some arg =>
+    match nonNull with
+    | true => Bool.not (rawPtrArgIsNull arg)
+    | false => true
+  | .none => false
+
+/--
+Test whether `v` is a valid wide pointer value (`.aggregate 0 [dataVal,
+metaVal]`) with a `ptrBytes`-wide thin data pointer and valid wide-pointer
+metadata (`isValidWidePtrMetaVal`), rejecting a null data pointer when
+`nonNull = true`.
+
+Reference (The Rust Reference, "Behavior considered undefined — Invalid
+values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
+-/
+@[reducible]
+def rawPtrWidePtrValid? (ptrBytes : Nat) (nonNull : Bool) (v : Value) : Bool :=
+  match v with
+  | .aggregate 0 (dataVal :: metaVal :: .nil) =>
+    match rawPtrArgOfValue? ptrBytes dataVal with
+    | .some arg =>
+      Bool.and
+        (match nonNull with
+         | true => Bool.not (rawPtrArgIsNull arg)
+         | false => true)
+        (isValidWidePtrMetaVal metaVal)
+    | .none => false
+  | _ => false
+
+/--
+Check a runtime `Value` `v` against a `ScalarLayout` `s` of byte width
+`sizeBytes`: enforces byte width and `wrappingRangeContains vr` on `.initialized`
+scalars (plus `isValidCharCode` on `char`'s `[0..=0x10FFFF]` 4-byte range and
+null exclusion on `.pointer _` scalars when `0 ∉ vr`), while `.union _` permits
+any initialized scalar or pointer representation.
+
+Reference (`compiler/rustc_abi/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1539-L1559>
+
+> "pub enum Scalar {
+>     Initialized {
+>         value: Primitive,
+>
+>         /// Inclusive wrap-around range of valid values, that is, if
+>         /// start > end, it represents `start..=MAX`, followed by `0..=end`.
+>         ///
+>         /// That is, for an i8 primitive, a range of `254..=2` means following
+>         /// sequence:
+>         ///
+>         ///    254 (-2), 255 (-1), 0, 1, 2
+>         ///
+>         /// This is intended specifically to mirror LLVM's `!range` metadata,
+>         /// semantics.
+>         valid_range: WrappingRange,
+>     },
+>     Union {
+>         /// Even for unions, we need to use the correct registers for the kind of
+>         /// values inside the union, so we keep the `Primitive` type around. We
+>         ///also use it to compute the size of the scalar.
+>         /// However, unions never have niches and even allow undef/uninit,
+>         /// so there is no valid_range.
+>         value: Primitive,
+>     },
+> }"
+-/
+@[reducible]
+def rawPtrScalarLayoutValid? (s : ScalarLayout) (sizeBytes : Nat) (v : Value) : Bool :=
+  match s with
+  | .union _ => true
+  | .initialized (.pointer _) vr =>
+    match v with
+    | .scalar sc =>
+      Bool.and (Nat.beq sc.sizeBytes sizeBytes) (wrappingRangeContains vr sc.bits)
+    | .ptr p pSz =>
+      Bool.and
+        (Nat.beq pSz sizeBytes)
+        (match Bool.and (Nat.beq p.allocId 0) (Nat.beq p.offsetBytes 0) with
+         | true => wrappingRangeContains vr 0
+         | false => true)
+    | _ => false
+  | .initialized _ vr =>
+    match v with
+    | .scalar sc =>
+      Bool.and
+        (Nat.beq sc.sizeBytes sizeBytes)
+        (Bool.and
+          (wrappingRangeContains vr sc.bits)
+          (match
+             Bool.and
+               (Nat.beq sc.sizeBytes 4)
+               (Bool.and (Nat.beq vr.start 0) (Nat.beq vr.end_ 0x10FFFF))
+           with
+           | true => isValidCharCode sc.bits
+           | false => true))
+    | _ => false
+
+/--
+Check a layout-directed validity predicate `check` pairwise across `fieldLayouts`
+and runtime field values `fields`, combining outcomes with `rawPtrOptBoolAnd` so
+any definite invalidity dominates fuel exhaustion.
+
+Reference (The Rust Reference, "Behavior considered undefined — Invalid
+values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
+-/
+@[reducible]
+def rawPtrLayoutFieldsValid?
+    (check : LayoutIdx → Value → Option Bool) :
+    List LayoutIdx → List Value → Option Bool
+  | .nil, .nil => .some true
+  | fl :: fls, v :: vs =>
+    rawPtrOptBoolAnd (check fl v) (rawPtrLayoutFieldsValid? check fls vs)
+  | _, _ => .some false
+
+/--
+Check a layout-directed validity predicate `check` on every element of an array
+at element layout index `elemFlIdx`, combining outcomes with `rawPtrOptBoolAnd`.
+
+Reference (The Rust Reference, "Behavior considered undefined — Invalid
+values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
+-/
+@[reducible]
+def rawPtrLayoutArrayElemsValid?
+    (check : LayoutIdx → Value → Option Bool)
+    (elemFlIdx : LayoutIdx) :
+    List Value → Option Bool
+  | .nil => .some true
+  | v :: vs =>
+    rawPtrOptBoolAnd (check elemFlIdx v) (rawPtrLayoutArrayElemsValid? check elemFlIdx vs)
+
+/--
+Fuel-bounded layout-directed validity check of a field value `v` inside an ADT
+against its compiler-captured `TypeLayout` at `lIdx` in `layouts`: returns
+`.some true` (valid), `.some false` (invalid -> `.ub`), or `.none` (fuel
+exhausted -> `.unsupported`). Validates uninhabited layouts, ZST shapes,
+primitive scalar valid ranges (including `bool`, `char`, `NonZero*`, `NonNull*`),
+and recursively validates single-variant `.arbitrary` and `.array` fields.
+
+Reference (The Rust Reference, "Behavior considered undefined — Invalid
+values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
+
+Modeling choice: union layouts, multi-variant enum layouts, and structs without
+captured `fieldLayouts` return `.some true` so valid unions and enums are never
+falsely rejected; fuel exhaustion returns `.none` (fail closed `.unsupported`).
+-/
+def rawPtrLayoutValValid? : Nat → LayoutTable → LayoutIdx → Value → Option Bool
+  | .zero, _, _, _ => .none
+  | .succ fuel', layouts, lIdx, v =>
+    match LayoutTable.lookup layouts lIdx with
+    | .none => .some true
+    | .some l =>
+      match l.isUninhabited with
+      | true => .some false
+      | false =>
+        match Nat.beq l.size.bytes 0 with
+        | true =>
+          match v with
+          | .unit | .aggregate _ _ => .some true
+          | _ => .some false
+        | false =>
+          match l.fields, l.variants with
+          | .primitive, _ =>
+            match l.backendRepr with
+            | .scalar s => .some (rawPtrScalarLayoutValid? s l.size.bytes v)
+            | _ => .some true
+          | .arbitrary _ _, .single expectedVar =>
+            match v with
+            | .aggregate varIdx fields =>
+              match Nat.beq varIdx expectedVar with
+              | false => .some false
+              | true =>
+                match Nat.beq (length l.fieldLayouts) (length fields) with
+                | true =>
+                  rawPtrLayoutFieldsValid?
+                    (rawPtrLayoutValValid? fuel' layouts)
+                    l.fieldLayouts
+                    fields
+                | false => .some true
+            | _ => .some false
+          | .array _ count, .single 0 =>
+            match v with
+            | .aggregate 0 elems =>
+              match Nat.beq (length elems) count with
+              | false => .some false
+              | true =>
+                match l.fieldLayouts with
+                | elemFlIdx :: _ =>
+                  rawPtrLayoutArrayElemsValid?
+                    (rawPtrLayoutValValid? fuel' layouts)
+                    elemFlIdx
+                    elems
+                | .nil => .some true
+            | _ => .some false
+          | _, _ => .some true
+
+/--
+Check a three-valued validity predicate `check` on every element value of an
+array at element type `elemTy`, combining outcomes with `rawPtrOptBoolAnd`.
 
 Reference (The Rust Reference, "Behavior considered undefined — Invalid
 values"):
@@ -3580,18 +3893,17 @@ values"):
 -/
 @[reducible]
 def rawPtrAllValuesValid?
-    (check : Ty → Value → Bool)
+    (check : Ty → Value → Option Bool)
     (elemTy : Ty) :
-    List Value → Bool
-  | .nil => true
+    List Value → Option Bool
+  | .nil => .some true
   | v :: vs =>
-    match check elemTy v with
-    | true => rawPtrAllValuesValid? check elemTy vs
-    | false => false
+    rawPtrOptBoolAnd (check elemTy v) (rawPtrAllValuesValid? check elemTy vs)
 
 /--
-Check a validity predicate `check` elementwise across tuple field types `ks`,
-optional layout indices `fls`, and runtime field values `vs`.
+Check a three-valued validity predicate `check` elementwise across tuple field
+types `ks`, optional layout indices `fls`, and runtime field values `vs`,
+combining outcomes with `rawPtrOptBoolAnd`.
 
 Reference (The Rust Reference, "Behavior considered undefined — Invalid
 values"):
@@ -3602,27 +3914,29 @@ values"):
 -/
 @[reducible]
 def rawPtrTupleFieldsValid?
-    (check : Ty → Value → Bool)
+    (check : Ty → Value → Option Bool)
     (layouts : LayoutTable) :
-    List RigidTy → List LayoutIdx → List Value → Bool
-  | .nil, _, .nil => true
+    List RigidTy → List LayoutIdx → List Value → Option Bool
+  | .nil, _, .nil => .some true
   | k :: ks, fl :: fls, v :: vs =>
-    match check { kind := k, layoutIdx := fl } v with
-    | true => rawPtrTupleFieldsValid? check layouts ks fls vs
-    | false => false
+    rawPtrOptBoolAnd
+      (check { kind := k, layoutIdx := fl } v)
+      (rawPtrTupleFieldsValid? check layouts ks fls vs)
   | k :: ks, .nil, v :: vs =>
-    match check { kind := k, layoutIdx := synthKindLayoutIdx layouts k } v with
-    | true => rawPtrTupleFieldsValid? check layouts ks .nil vs
-    | false => false
-  | _, _, _ => false
+    rawPtrOptBoolAnd
+      (check { kind := k, layoutIdx := synthKindLayoutIdx layouts k } v)
+      (rawPtrTupleFieldsValid? check layouts ks .nil vs)
+  | _, _, _ => .some false
 
 /--
 Fuel-bounded structural validity check of runtime `Value` `v` against static
-type `ty` for raw-pointer loads and stores: rejects uninhabited types (`.never`
-or `tyIsUninhabited`), invalid `bool` / `char` bit patterns, scalar width
-mismatches, null references and function pointers, and invalid elements inside
-tuples and fixed-length arrays, as well as ABI-mismatched value shapes (such as
-a scalar passed at `()` or an aggregate type).
+type `ty` for raw-pointer loads and stores: returns `.some true` (valid),
+`.some false` (definitely invalid -> `.ub`), or `.none` (fuel exhausted ->
+fail-closed `.unsupported`). Rejects uninhabited types (`rawPtrTyIsUninhabited`),
+invalid `bool` / `char` bit patterns, scalar width mismatches, null references
+and function pointers, invalid elements inside tuples, fixed-length arrays, and
+single-variant ADTs with captured `fieldLayouts`, as well as ABI-mismatched
+value shapes (while supporting wide pointers to custom DSTs).
 
 Reference (The Rust Reference, "Behavior considered undefined — Invalid
 values"):
@@ -3652,98 +3966,137 @@ Reference (`compiler/rustc_middle/src/mir/interpret/value.rs` at commit
 >     Indirect { alloc_id: AllocId, offset: Size },
 > }"
 
-Modeling choice: ADTs whose `TypeLayout` fixes a single variant require matching
-variant index, while multi-variant enums and unions are accepted at aggregate
-shape so valid enums and unions are never falsely rejected.
+Modeling choice: single-variant ADTs with captured `fieldLayouts` validate
+matching variant indices and field values recursively (`rawPtrLayoutValValid?`),
+while multi-variant enums and unions are accepted at aggregate shape so valid
+enums and unions are never falsely rejected.
 
 Modeling choice: `evalConstValue` evaluates every `ConstValue.zeroSized`
 constant to `Value.unit`, whatever its zero-sized type, so `Value.unit` is a
 valid value of a tuple or array type that is zero-sized (structurally, by
-`isZeroSizedUnitElemTy`, or by a resolved `TypeLayout` of size `0`) and of an
-ADT whose resolved `TypeLayout` has size `0`. It is rejected at a tuple or array
-type that is not known to be zero-sized.
+`isZeroSizedUnitElemTy`, or by a resolved shape-matching `TypeLayout` of size
+`0`) and of an ADT whose trusted `TypeLayout` has size `0`. It is rejected at a
+tuple or array type that is not known to be zero-sized.
 
 Modeling choice: an ADT is checked against the `TypeLayout` at its layout index
 only when `layoutValidForResolvedAdt` accepts that entry for an ADT, which is
-the test `tyByteSizeAndAlignAux` applies before it sizes one. That trusts
-`layouts.entries[0]` when it has the shape of an ADT layout, and does not trust
-a primitive entry of non-zero size there, where the synthesized index `0` of an
-ADT collides with the layout of an unrelated scalar. An ADT with no trusted
-entry is accepted at every `Value.aggregate`, `Value.unit`, `Value.scalar`, and
-`Value.ptr` shape rather than checked against an unrelated entry.
+the test `tyByteSizeAndAlignAux` applies before it sizes one. Non-empty tuples
+and arrays adopt `layouts[ty.layoutIdx]` only when `isUnresolvedLayoutIdx =
+false` and the entry's `FieldsShape` matches the tuple or array shape. Pointers
+and references to `.adt`/`.closure`/`.param` pointees accept wide-pointer shapes
+whenever `ty`'s layout has size `2 * ptrBytes` or is unresolved (still rejecting
+null references in both thin and wide shapes), so custom-DST wide pointers are
+never falsely rejected. Fuel exhaustion returns `.none` (fail closed
+`.unsupported`) rather than silently accepting unvalidated nested values.
 -/
-def rawPtrValueValid? : Nat → LayoutTable → Ty → Value → Bool
-  | .zero, _, _, _ => true
+def rawPtrValueValid? : Nat → LayoutTable → Ty → Value → Option Bool
+  | .zero, _, _, _ => .none
   | .succ fuel', layouts, ty, v =>
     let ptrBytes := layoutPointerBytes layouts
-    match tyIsUninhabited layouts ty with
-    | true => false
+    match rawPtrTyIsUninhabited layouts ty with
+    | true => .some false
     | false =>
       match ty.kind with
-      | .never => false
+      | .never => .some false
       | .bool =>
-        match v with
-        | .scalar sc => Bool.and (Nat.beq sc.sizeBytes 1) (Nat.ble sc.bits 1)
-        | _ => false
+        .some
+          (match v with
+           | .scalar sc => Bool.and (Nat.beq sc.sizeBytes 1) (Nat.ble sc.bits 1)
+           | _ => false)
       | .char =>
-        match v with
-        | .scalar sc => Bool.and (Nat.beq sc.sizeBytes 4) (isValidCharCode sc.bits)
-        | _ => false
+        .some
+          (match v with
+           | .scalar sc => Bool.and (Nat.beq sc.sizeBytes 4) (isValidCharCode sc.bits)
+           | _ => false)
       | .int w =>
-        match rawPtrIntByteWidth ptrBytes (.int w), v with
-        | .some expected, .scalar sc => Nat.beq sc.sizeBytes expected
-        | _, _ => false
+        .some
+          (match rawPtrIntByteWidth ptrBytes (.int w), v with
+           | .some expected, .scalar sc => Nat.beq sc.sizeBytes expected
+           | _, _ => false)
       | .uint w =>
-        match rawPtrIntByteWidth ptrBytes (.uint w), v with
-        | .some expected, .scalar sc => Nat.beq sc.sizeBytes expected
-        | _, _ => false
+        .some
+          (match rawPtrIntByteWidth ptrBytes (.uint w), v with
+           | .some expected, .scalar sc => Nat.beq sc.sizeBytes expected
+           | _, _ => false)
       | .float fk =>
-        match v with
-        | .scalar sc => Nat.beq sc.sizeBytes (rawPtrFloatByteWidth fk)
-        | _ => false
+        .some
+          (match v with
+           | .scalar sc => Nat.beq sc.sizeBytes (rawPtrFloatByteWidth fk)
+           | _ => false)
       | .rawPtr _ pointee =>
-        match pointee with
-        | .slice _ | .str | .dynamic _ =>
-          match v with
-          | .aggregate 0 (dataVal :: metaVal :: .nil) =>
-            Bool.and
-              (match rawPtrArgOfValue? ptrBytes dataVal with
-               | .some _ => true
-               | .none => false)
-              (isValidWidePtrMetaVal metaVal)
-          | _ => false
-        | _ =>
-          match rawPtrArgOfValue? ptrBytes v with
-          | .some _ => true
-          | .none => false
+        .some
+          (match isUnsizedRigidTy 8 pointee with
+           | true => rawPtrWidePtrValid? ptrBytes false v
+           | false =>
+             match pointee with
+             | .adt _ _ | .closure _ _ | .param _ _ =>
+               match
+                 isUnresolvedLayoutIdx layouts ty.layoutIdx,
+                 LayoutTable.lookup layouts ty.layoutIdx
+               with
+               | false, .some l =>
+                 match Nat.beq l.size.bytes (Nat.mul 2 ptrBytes) with
+                 | true => rawPtrWidePtrValid? ptrBytes false v
+                 | false =>
+                   match Nat.beq l.size.bytes ptrBytes with
+                   | true => rawPtrThinPtrValid? ptrBytes false v
+                   | false =>
+                     Bool.or
+                       (rawPtrThinPtrValid? ptrBytes false v)
+                       (rawPtrWidePtrValid? ptrBytes false v)
+               | _, _ =>
+                 Bool.or
+                   (rawPtrThinPtrValid? ptrBytes false v)
+                   (rawPtrWidePtrValid? ptrBytes false v)
+             | _ => rawPtrThinPtrValid? ptrBytes false v)
       | .ref _ pointee =>
-        match pointee with
-        | .slice _ | .str | .dynamic _ =>
-          match v with
-          | .aggregate 0 (dataVal :: metaVal :: .nil) =>
-            match rawPtrArgOfValue? ptrBytes dataVal with
-            | .some arg =>
-              Bool.and (Bool.not (rawPtrArgIsNull arg)) (isValidWidePtrMetaVal metaVal)
-            | .none => false
-          | _ => false
-        | _ =>
-          match rawPtrArgOfValue? ptrBytes v with
-          | .some arg => Bool.not (rawPtrArgIsNull arg)
-          | .none => false
-      | .fnPtr _ _ _ _ =>
-        match rawPtrArgOfValue? ptrBytes v with
-        | .some arg => Bool.not (rawPtrArgIsNull arg)
-        | .none => false
+        .some
+          (match isUnsizedRigidTy 8 pointee with
+           | true => rawPtrWidePtrValid? ptrBytes true v
+           | false =>
+             match pointee with
+             | .adt _ _ | .closure _ _ | .param _ _ =>
+               match
+                 isUnresolvedLayoutIdx layouts ty.layoutIdx,
+                 LayoutTable.lookup layouts ty.layoutIdx
+               with
+               | false, .some l =>
+                 match Nat.beq l.size.bytes (Nat.mul 2 ptrBytes) with
+                 | true => rawPtrWidePtrValid? ptrBytes true v
+                 | false =>
+                   match Nat.beq l.size.bytes ptrBytes with
+                   | true => rawPtrThinPtrValid? ptrBytes true v
+                   | false =>
+                     Bool.or
+                       (rawPtrThinPtrValid? ptrBytes true v)
+                       (rawPtrWidePtrValid? ptrBytes true v)
+               | _, _ =>
+                 Bool.or
+                   (rawPtrThinPtrValid? ptrBytes true v)
+                   (rawPtrWidePtrValid? ptrBytes true v)
+             | _ => rawPtrThinPtrValid? ptrBytes true v)
+      | .fnPtr _ _ _ _ => .some (rawPtrThinPtrValid? ptrBytes true v)
       | .tuple .nil | .fnDef _ _ =>
-        match v with
-        | .unit => true
-        | .aggregate 0 .nil => true
-        | _ => false
+        .some
+          (match v with
+           | .unit => true
+           | .aggregate 0 .nil => true
+           | _ => false)
       | .tuple (k :: ks) =>
+        let trustedTupleLayout : Option TypeLayout :=
+          match
+            isUnresolvedLayoutIdx layouts ty.layoutIdx,
+            LayoutTable.lookup layouts ty.layoutIdx
+          with
+          | false, .some l =>
+            match l.variants, l.fields with
+            | .single 0, .arbitrary _ _ => .some l
+            | _, _ => .none
+          | _, _ => .none
         match v with
         | .aggregate 0 fields =>
           let fieldLays : List LayoutIdx :=
-            match LayoutTable.lookup layouts ty.layoutIdx with
+            match trustedTupleLayout with
             | .some l =>
               match Nat.beq (length l.fieldLayouts) (length (k :: ks)) with
               | true => l.fieldLayouts
@@ -3751,41 +4104,52 @@ def rawPtrValueValid? : Nat → LayoutTable → Ty → Value → Bool
             | .none => .nil
           rawPtrTupleFieldsValid? (rawPtrValueValid? fuel' layouts) layouts (k :: ks) fieldLays fields
         | .unit =>
-          Bool.or
-            (isZeroSizedUnitElemTy 8 ty.kind)
-            (match
-               isUnresolvedLayoutIdx layouts ty.layoutIdx,
-               LayoutTable.lookup layouts ty.layoutIdx
-             with
-             | false, .some l => Nat.beq l.size.bytes 0
-             | _, _ => false)
-        | _ => false
+          .some
+            (Bool.or
+              (isZeroSizedUnitElemTy 8 ty.kind)
+              (match trustedTupleLayout with
+               | .some l => Nat.beq l.size.bytes 0
+               | .none => false))
+        | _ => .some false
       | .array _ .zero =>
-        match v with
-        | .aggregate 0 .nil => true
-        | .unit => true
-        | _ => false
+        .some
+          (match v with
+           | .aggregate 0 .nil => true
+           | .unit => true
+           | _ => false)
       | .array elemK (.succ n) =>
+        let trustedArrayLayout : Option TypeLayout :=
+          match
+            isUnresolvedLayoutIdx layouts ty.layoutIdx,
+            LayoutTable.lookup layouts ty.layoutIdx
+          with
+          | false, .some l =>
+            match l.fields with
+            | .array _ count =>
+              match Nat.beq count (.succ n) with
+              | true => .some l
+              | false => .none
+            | _ => .none
+          | _, _ => .none
         match v with
         | .aggregate 0 elems =>
           let elemLayIdx : LayoutIdx :=
-            match LayoutTable.lookup layouts ty.layoutIdx with
+            match trustedArrayLayout with
             | .some { fieldLayouts := flIdx :: _, .. } => flIdx
             | _ => synthKindLayoutIdx layouts elemK
-          Bool.and
-            (Nat.beq (length elems) (.succ n))
-            (rawPtrAllValuesValid? (rawPtrValueValid? fuel' layouts)
-              { kind := elemK, layoutIdx := elemLayIdx } elems)
+          match Nat.beq (length elems) (.succ n) with
+          | false => .some false
+          | true =>
+            rawPtrAllValuesValid? (rawPtrValueValid? fuel' layouts)
+              { kind := elemK, layoutIdx := elemLayIdx } elems
         | .unit =>
-          Bool.or
-            (isZeroSizedUnitElemTy 8 ty.kind)
-            (match
-               isUnresolvedLayoutIdx layouts ty.layoutIdx,
-               LayoutTable.lookup layouts ty.layoutIdx
-             with
-             | false, .some l => Nat.beq l.size.bytes 0
-             | _, _ => false)
-        | _ => false
+          .some
+            (Bool.or
+              (isZeroSizedUnitElemTy 8 ty.kind)
+              (match trustedArrayLayout with
+               | .some l => Nat.beq l.size.bytes 0
+               | .none => false))
+        | _ => .some false
       | .adt _ _ =>
         let layoutOpt : Option TypeLayout :=
           match LayoutTable.lookup layouts ty.layoutIdx with
@@ -3795,35 +4159,69 @@ def rawPtrValueValid? : Nat → LayoutTable → Ty → Value → Bool
             | false => .none
           | .none => .none
         match v with
-        | .aggregate varIdx _ =>
+        | .aggregate varIdx fields =>
           match layoutOpt with
-          | .some { variants := .single expectedVar, .. } => Nat.beq varIdx expectedVar
-          | _ => true
+          | .some l =>
+            match l.variants with
+            | .single expectedVar =>
+              match Nat.beq varIdx expectedVar with
+              | false => .some false
+              | true =>
+                match l.fields with
+                | .arbitrary _ _ =>
+                  match Nat.beq (length l.fieldLayouts) (length fields) with
+                  | true =>
+                    rawPtrLayoutFieldsValid?
+                      (rawPtrLayoutValValid? fuel' layouts)
+                      l.fieldLayouts
+                      fields
+                  | false => .some true
+                | .array _ count =>
+                  match Nat.beq (length fields) count with
+                  | false => .some false
+                  | true =>
+                    match l.fieldLayouts with
+                    | elemFlIdx :: _ =>
+                      rawPtrLayoutArrayElemsValid?
+                        (rawPtrLayoutValValid? fuel' layouts)
+                        elemFlIdx
+                        fields
+                    | .nil => .some true
+                | _ => .some true
+            | _ => .some true
+          | .none => .some true
         | .unit =>
-          match layoutOpt with
-          | .some l => Nat.beq l.size.bytes 0
-          | .none => true
+          .some
+            (match layoutOpt with
+             | .some l => Nat.beq l.size.bytes 0
+             | .none => true)
         | .scalar sc =>
-          match layoutOpt with
-          | .some { fields := .primitive, size := sz, backendRepr := .scalar (.initialized _ vr), .. } =>
-            Bool.and (Nat.beq sc.sizeBytes sz.bytes) (wrappingRangeContains vr sc.bits)
-          | .some { fields := .primitive, size := sz, .. } => Nat.beq sc.sizeBytes sz.bytes
-          | .some _ => false
-          | .none => true
-        | .ptr _ pSz =>
-          match layoutOpt with
-          | .some { fields := .primitive, size := sz, .. } => Nat.beq pSz sz.bytes
-          | .some _ => false
-          | .none => true
-        | _ => false
-      | _ => true
+          .some
+            (match layoutOpt with
+             | .some { fields := .primitive, size := sz, backendRepr := .scalar s, .. } =>
+               rawPtrScalarLayoutValid? s sz.bytes (.scalar sc)
+             | .some { fields := .primitive, size := sz, .. } => Nat.beq sc.sizeBytes sz.bytes
+             | .some _ => false
+             | .none => true)
+        | .ptr p pSz =>
+          .some
+            (match layoutOpt with
+             | .some { fields := .primitive, size := sz, backendRepr := .scalar s, .. } =>
+               rawPtrScalarLayoutValid? s sz.bytes (.ptr p pSz)
+             | .some { fields := .primitive, size := sz, .. } => Nat.beq pSz sz.bytes
+             | .some _ => false
+             | .none => true)
+        | _ => .some false
+      | _ => .some true
 
 /--
-Encode the value `v` of a place of type `ty` to its byte representation, as
-`decodeSubValueAtByteOffset?` does: scalars and thin pointers by their untyped
-little-endian encoding, and aggregates by `encodeTypedValueToBytes` at the
-layout-faithful type `resolveFaithfulAggregateTy?` finds (else `.none`). A
-`Value.unit` occupies no bytes, and `Value.uninit` has no byte encoding here.
+Encode the value `v` of a place of type `ty` to its byte representation on a
+little-endian target (`layouts.isLittleEndian = true`, returning `.none` on
+big-endian targets so byte order is never silently swapped): scalars and thin
+pointers by their untyped little-endian encoding, and aggregates by
+`encodeTypedValueToBytes` at the layout-faithful type
+`resolveFaithfulAggregateTy?` finds (else `.none`). A `Value.unit` occupies no
+bytes, and `Value.uninit` has no byte encoding here.
 
 Reference (The Rust Reference, "Type Layout"):
 <https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
@@ -3834,17 +4232,22 @@ Reference (The Rust Reference, "Type Layout"):
 def rawPtrEncodeValue?
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
-    (ty : Ty) :
-    Value → Option (List AbstractByte)
-  | .unit => .some .nil
-  | .scalar sc => encodeUntypedValueToBytes defaultCodecFuel (.scalar sc)
-  | .ptr p sz => encodeUntypedValueToBytes defaultCodecFuel (.ptr p sz)
-  | .aggregate varIdx fields =>
-    match resolveFaithfulAggregateTy? localDecls layouts ty varIdx fields with
-    | .some resolvedTy =>
-      encodeTypedValueToBytes layouts resolvedTy (.aggregate varIdx fields)
-    | .none => .none
-  | .uninit => .none
+    (ty : Ty)
+    (v : Value) :
+    Option (List AbstractByte) :=
+  match layouts.isLittleEndian with
+  | false => .none
+  | true =>
+    match v with
+    | .unit => .some .nil
+    | .scalar sc => encodeUntypedValueToBytes defaultCodecFuel (.scalar sc)
+    | .ptr p sz => encodeUntypedValueToBytes defaultCodecFuel (.ptr p sz)
+    | .aggregate varIdx fields =>
+      match resolveFaithfulAggregateTy? localDecls layouts ty varIdx fields with
+      | .some resolvedTy =>
+        encodeTypedValueToBytes layouts resolvedTy (.aggregate varIdx fields)
+      | .none => .none
+    | .uninit => .none
 
 /--
 Outcome of loading a typed value through a tracked raw pointer
@@ -3932,17 +4335,47 @@ def rawPtrDecodeThinPtr
       | _ => .fault .unsupported
 
 /--
+Extract `len` `AbstractByte`s starting at `offset` from a captured global
+allocation `alloc` on a target with `ptrBytes`-wide pointers: delegates to
+`globalAllocSliceToAbstractBytes`, failing closed (`.none`) if `alloc` carries
+relocations on a non-64-bit target (`ptrBytes ≠ 8`), because `Bytes.lean`'s
+relocation lookup spans 8 bytes per relocation.
+
+Reference (`compiler/rustc_middle/src/mir/interpret/allocation.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/interpret/allocation.rs#L53-L63>
+
+> "pub struct Allocation<Prov = AllocId, Extra = (), Bytes = Box<[u8]>>"
+-/
+@[reducible]
+def rawPtrGlobalSliceBytes?
+    (ptrBytes : Nat)
+    (alloc : CapturedAllocation)
+    (offset len : Nat) :
+    Option (List AbstractByte) :=
+  match alloc.relocations, Nat.beq ptrBytes 8 with
+  | _ :: _, false => .none
+  | _, _ => globalAllocSliceToAbstractBytes alloc offset len
+
+/--
 Decode `bytes` at `elemTy` for a raw-pointer load from either a stack local or
-a captured global allocation:
+a captured global allocation on a little-endian target (`isLittleEndian = true`;
+big-endian targets fail closed with `.unsupported` so bytes are never silently
+swapped):
 - thin pointers use `rawPtrDecodeThinPtr` (preserving provenance/tag and never
   forging an `allocId` from plain integer bytes);
+- `usize` / `isize` decode directly at `ptrBytes = layoutPointerBytes
+  bodyLayouts` (supporting both 32-bit and 64-bit targets without falsely
+  faulting on 4-byte `usize`/`isize`);
 - non-thin-pointer types fail closed with `.unsupported` whenever any byte
   carries pointer provenance (reading pointer bytes as integers or byte arrays
   depends on the pointer's runtime address and must never return an invented
   `0`);
 - all other byte sequences decode via `decodeTypedValueFromBytes`, checking
-  initialization (`valueContainsUninit`) and structural validity
-  (`rawPtrValueValid?`) and classifying decode failure via `rawPtrDecodeFault`.
+  initialization (`valueContainsUninit`) and three-valued structural validity
+  (`rawPtrValueValid?`: `.some true` -> `.ok`, `.some false` -> `.fault .ub`,
+  `.none` -> `.fault .unsupported`) and classifying decode failure via
+  `rawPtrDecodeFault`.
 
 Reference (The Rust Reference, "Behavior considered undefined — Invalid
 values"):
@@ -3958,21 +4391,54 @@ def rawPtrDecodeBytes
     (elemTy : Ty)
     (bytes : List AbstractByte) :
     RawPtrLoadResult :=
-  match isThinPtrKind elemTy.kind with
-  | true => rawPtrDecodeThinPtr (layoutPointerBytes bodyLayouts) elemTy.kind bytes
-  | false =>
-    match rawPtrBytesAnyProv bytes with
-    | true => .fault .unsupported
+  match bodyLayouts.isLittleEndian with
+  | false => .fault .unsupported
+  | true =>
+    let ptrBytes := layoutPointerBytes bodyLayouts
+    match isThinPtrKind elemTy.kind with
+    | true => rawPtrDecodeThinPtr ptrBytes elemTy.kind bytes
     | false =>
-      match decodeTypedValueFromBytes defaultCodecFuel bodyLayouts elemTy bytes with
-      | .none => .fault (rawPtrDecodeFault elemTy.kind bytes)
-      | .some v =>
-        match valueContainsUninit v with
-        | true => .fault (rawPtrUninitFault elemTy.kind)
+      match elemTy.kind with
+      | .uint .usize =>
+        match Nat.beq (length bytes) ptrBytes with
+        | false => .fault .unsupported
+        | true =>
+          match rawPtrBytesAnyUninit bytes with
+          | true => .fault .ub
+          | false =>
+            match rawPtrBytesAnyProv bytes with
+            | true => .fault .unsupported
+            | false =>
+              match decodeScalarBytes bytes false with
+              | .some (sv, _) => .ok (.scalar sv)
+              | .none => .fault .unsupported
+      | .int .isize =>
+        match Nat.beq (length bytes) ptrBytes with
+        | false => .fault .unsupported
+        | true =>
+          match rawPtrBytesAnyUninit bytes with
+          | true => .fault .ub
+          | false =>
+            match rawPtrBytesAnyProv bytes with
+            | true => .fault .unsupported
+            | false =>
+              match decodeScalarBytes bytes true with
+              | .some (sv, _) => .ok (.scalar sv)
+              | .none => .fault .unsupported
+      | _ =>
+        match rawPtrBytesAnyProv bytes with
+        | true => .fault .unsupported
         | false =>
-          match rawPtrValueValid? 16 bodyLayouts elemTy v with
-          | true => .ok v
-          | false => .fault .ub
+          match decodeTypedValueFromBytes defaultCodecFuel bodyLayouts elemTy bytes with
+          | .none => .fault (rawPtrDecodeFault elemTy.kind bytes)
+          | .some v =>
+            match valueContainsUninit v with
+            | true => .fault (rawPtrUninitFault elemTy.kind)
+            | false =>
+              match rawPtrValueValid? 16 bodyLayouts elemTy v with
+              | .some true => .ok v
+              | .some false => .fault .ub
+              | .none => .fault .unsupported
 
 /--
 Load a value of type `elemTy` (of `accessBytes > 0` bytes) at byte offset
@@ -3990,8 +4456,8 @@ local has slot `slot` in owning-frame slots `targetLocals` (as resolved by
   accessed bytes are sliced out, and they are decoded at `elemTy`
   (`rawPtrDecodeBytes`): a load at an interior byte offset or at another type.
 - The loaded value must be fully initialized (`valueContainsUninit`, else
-  `rawPtrUninitFault`) and valid for `elemTy` (`rawPtrValueValid?`, else
-  `.ub`).
+  `rawPtrUninitFault`) and valid for `elemTy` (`rawPtrValueValid?`:
+  `.some false` -> `.ub`, `.none` -> `.unsupported`).
 
 Reference (`core::ptr::read_unaligned` documentation,
 `library/core/src/ptr/mod.rs` at commit
@@ -4056,8 +4522,9 @@ def loadRawPtrStackValue
         | true => .fault (rawPtrUninitFault elemTy.kind)
         | false =>
           match rawPtrValueValid? 16 bodyLayouts elemTy baseVal with
-          | true => .ok baseVal
-          | false => .fault .ub
+          | .some true => .ok baseVal
+          | .some false => .fault .ub
+          | .none => .fault .unsupported
       | false =>
         match rawPtrEncodeValue? targetDecls targetLayouts placeTy baseVal with
         | .none => .fault .unsupported
@@ -4108,6 +4575,105 @@ inductive RawPtrBorrowResult : Type where
   | fault (kind : FailureKind) : RawPtrBorrowResult
 
 /--
+Type-aware structural disjointness witness for two normalized projection chains
+starting from container type `curTyOpt` inside a single local: returns `true`
+only when the projections diverge at:
+- distinct `.constantIndex` / `.subslice` positions (`fromEnd = false`) of the
+  same sequence; or
+- distinct `.field` indices of a provably non-union product type (a `.tuple`, or
+  an `.adt`/`.closure` whose trusted `TypeLayout` has `variants = .single _` and
+  `fields = .arbitrary _ _`).
+
+Never claims that two fields of a `union`, two fields of an unresolved ADT, or
+two `.downcast` enum variants are disjoint, so fallback overlap checks never
+miss aliasing or `copy_nonoverlapping` UB when byte-offset resolution fails (for
+example due to an inner dynamic `.index` projection).
+
+Reference (The Rust Reference, "Union types"):
+<https://doc.rust-lang.org/1.98.0/reference/items/unions.html#reading-and-writing-union-fields>
+
+> "Unions have no notion of an \"active field\". Instead, every union access
+> just interprets the storage as the type of the field used for the access.
+> Reading a union field reads the bits of the union at the field's type."
+-/
+def rawPtrProjsDisjointAux
+    (decls : List LocalDecl)
+    (layouts : LayoutTable) :
+    Option Ty → List ProjectionElem → List ProjectionElem → Bool
+  | .some curTy, .field idxA fieldTyA :: restA, .field idxB _ :: restB =>
+    match Nat.beq idxA idxB with
+    | true =>
+      rawPtrProjsDisjointAux
+        decls
+        layouts
+        (resolveProjectedTyResolved decls layouts curTy (.field idxA fieldTyA :: .nil))
+        restA
+        restB
+    | false =>
+      match curTy.kind with
+      | .tuple _ => true
+      | .adt _ _ | .closure _ _ =>
+        match LayoutTable.lookup layouts curTy.layoutIdx with
+        | .some l =>
+          match layoutValidForResolvedAdt curTy.layoutIdx l, l.variants, l.fields with
+          | true, .single _, .arbitrary _ _ => true
+          | _, _, _ => false
+        | .none => false
+      | _ => false
+  | curTyOpt,
+    .constantIndex offA _ false :: restA,
+    .constantIndex offB _ false :: restB =>
+    match Nat.beq offA offB with
+    | true =>
+      let nextTyOpt : Option Ty :=
+        match curTyOpt with
+        | .some curTy =>
+          resolveProjectedTyResolved decls layouts curTy (.constantIndex offA 0 false :: .nil)
+        | .none => .none
+      rawPtrProjsDisjointAux decls layouts nextTyOpt restA restB
+    | false => true
+  | curTyOpt,
+    .subslice fromA toA false :: restA,
+    .subslice fromB toB false :: restB =>
+    match Bool.or (Nat.ble toA fromB) (Nat.ble toB fromA) with
+    | true => true
+    | false =>
+      match Bool.and (Nat.beq fromA fromB) (Nat.beq toA toB) with
+      | true => rawPtrProjsDisjointAux decls layouts curTyOpt restA restB
+      | false => false
+  | _, .subslice fromA toA false :: _, .constantIndex idxB _ false :: _ =>
+    Bool.or (Bool.not (Nat.ble fromA idxB)) (Nat.ble toA idxB)
+  | _, .constantIndex idxA _ false :: _, .subslice fromB toB false :: _ =>
+    Bool.or (Bool.not (Nat.ble fromB idxA)) (Nat.ble toB idxA)
+  | _, _, _ => false
+
+/--
+Test whether two projection chains `projA` and `projB` within a root local of
+type `rootTy` are provably byte-disjoint (`rawPtrProjsDisjointAux` after
+stripping transparent projections and normalizing nested subslices).
+
+Reference (The Rust Reference, "Union types"):
+<https://doc.rust-lang.org/1.98.0/reference/items/unions.html#reading-and-writing-union-fields>
+
+> "Unions have no notion of an \"active field\". Instead, every union access
+> just interprets the storage as the type of the field used for the access.
+> Reading a union field reads the bits of the union at the field's type."
+-/
+@[reducible]
+def rawPtrProjsDisjoint?
+    (decls : List LocalDecl)
+    (layouts : LayoutTable)
+    (rootTy : Ty)
+    (projA projB : List ProjectionElem) :
+    Bool :=
+  rawPtrProjsDisjointAux
+    decls
+    layouts
+    (.some rootTy)
+    (normalizeSubsliceProjections (stripTransparentProjections projA))
+    (normalizeSubsliceProjections (stripTransparentProjections projB))
+
+/--
 Decide whether foreign borrow entry `b` on the same `(targetFrameDepth,
 targetLocal)` overlaps a raw-pointer access of `accessBytes > 0` bytes at
 `offsetBytes` inside `entry.targetProjection` (of byte size `placeSize`):
@@ -4119,11 +4685,11 @@ within the root local (or `b.rangeLen ≠ 0`), overlap is decided on those byte
 ranges, so disjoint sibling/child borrows of a strict sub-range access are never
 falsely invalidated or flagged as protector UB, and borrows of places that share
 bytes without sharing a projection path (two fields of a `union`, or fields of
-two enum variants) are treated as overlapping. Only when a byte range cannot be
-computed does the decision fall back to the structural `projectionsOverlap`:
-structurally disjoint places are disjoint, and structurally overlapping places
-overlap a whole-place access (`offsetBytes = 0`, `accessBytes = placeSize`) and
-are undecidable for a strict sub-range access.
+two enum variants) are treated as overlapping. When a byte range cannot be
+computed, disjointness is concluded only via the type-aware
+`rawPtrProjsDisjoint?` (never treating union fields or enum variants as
+disjoint), structural overlap on a whole-place access yields `.some true`, and
+every other case returns `.none` (fail closed `.unsupported`).
 
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
@@ -4132,7 +4698,8 @@ Reference (The Rust Reference, "Behavior considered undefined"):
 
 Modeling choice: byte-interval overlap resolution uses Anneal's
 `projectionChainByteOffset?` and `tyByteSize` helpers and returns `.none` (fail
-closed when the transition matters) if either interval cannot be computed.
+closed when the transition matters) if neither byte intervals nor type-aware
+structural disjointness can decide the pair.
 -/
 def rawPtrEntryOverlapsAccess
     (targetDecls : List LocalDecl)
@@ -4181,10 +4748,10 @@ def rawPtrEntryOverlapsAccess
     | .some entryBase, .some bBase, .some bSize =>
       .some (byteRangesOverlapBool (Nat.add entryBase offsetBytes) accessBytes bBase bSize)
     | _, _, _ =>
-      match projectionsOverlap b.targetProjection entry.targetProjection with
-      | false => .some false
-      | true =>
-        match fullPlace with
+      match rawPtrProjsDisjoint? targetDecls targetLayouts rootTy b.targetProjection entry.targetProjection with
+      | true => .some false
+      | false =>
+        match Bool.and fullPlace (projectionsOverlap b.targetProjection entry.targetProjection) with
         | true => .some true
         | false => .none
   | false, _ =>
@@ -4591,7 +5158,7 @@ Checks, in order:
    undecidable alignment is unsupported.
 3. A non-volatile load through a null pointer is `.ub`, even when `T` is
    zero-sized: a null pointer is never valid for reads.
-4. An uninhabited `T` (`tyIsUninhabited`) is `.ub`: the load would produce a
+4. An uninhabited `T` (`rawPtrTyIsUninhabited`) is `.ub`: the load would produce a
    value of a type that has none.
 5. A zero-sized `T` reads no memory: the result is the unique value of `T`
    (`rawPtrZstValue?`), and no Tree Borrows access happens.
@@ -4774,7 +5341,7 @@ def rawPtrLoadAction
           match Bool.and (Bool.not isVolatile) (rawPtrArgIsNull srcArg) with
           | true => .fault .ub
           | false =>
-            match tyIsUninhabited bodyLayouts elemTy with
+            match rawPtrTyIsUninhabited bodyLayouts elemTy with
             | true => .fault .ub
             | false =>
               match Nat.beq size 0 with
@@ -4793,7 +5360,7 @@ def rawPtrLoadAction
                   match Nat.ble (Nat.add ptr.offsetBytes size) (length alloc.bytes) with
                   | false => .fault .ub
                   | true =>
-                    match globalAllocSliceToAbstractBytes alloc ptr.offsetBytes size with
+                    match rawPtrGlobalSliceBytes? ptrBytes alloc ptr.offsetBytes size with
                     | .none => .fault .unsupported
                     | .some absBytes =>
                       match rawPtrDecodeBytes bodyLayouts elemTy absBytes with
@@ -4930,8 +5497,9 @@ def rawPtrStoreValueFault?
   | true => .some (rawPtrUninitFault elemTy.kind)
   | false =>
     match rawPtrValueValid? 16 bodyLayouts elemTy val with
-    | true => .none
-    | false => .some .ub
+    | .some true => .none
+    | .some false => .some .ub
+    | .none => .some .unsupported
 
 /--
 Outcome of storing a typed value through a tracked raw pointer
@@ -4978,21 +5546,24 @@ def rawPtrDecodeAggregate?
     (oldVal : Value)
     (bytes : List AbstractByte) :
     Option Value :=
-  match rawPtrBytesAnyProv bytes with
-  | true => .none
-  | false =>
-    match oldVal with
-    | .aggregate varIdx fields =>
-      match resolveFaithfulAggregateTy? localDecls layouts ty varIdx fields with
-      | .some resolvedTy =>
-        match decodeTypedValueFromBytes defaultCodecFuel layouts resolvedTy bytes with
-        | .some newVal =>
-          match rawPtrValueValid? 16 layouts resolvedTy newVal with
-          | true => .some newVal
-          | false => .none
+  match layouts.isLittleEndian with
+  | false => .none
+  | true =>
+    match rawPtrBytesAnyProv bytes with
+    | true => .none
+    | false =>
+      match oldVal with
+      | .aggregate varIdx fields =>
+        match resolveFaithfulAggregateTy? localDecls layouts ty varIdx fields with
+        | .some resolvedTy =>
+          match decodeTypedValueFromBytes defaultCodecFuel layouts resolvedTy bytes with
+          | .some newVal =>
+            match rawPtrValueValid? 16 layouts resolvedTy newVal with
+            | .some true => .some newVal
+            | _ => .none
+          | .none => .none
         | .none => .none
-      | .none => .none
-    | _ => .none
+      | _ => .none
 
 /--
 Splice `patchBytes` at byte offset `offsetBytes` into the existing value
@@ -5027,52 +5598,55 @@ def rawPtrSpliceBytesIntoPlace?
     (offsetBytes : Nat)
     (patchBytes : List AbstractByte) :
     Option Value :=
-  let ptrBytes := layoutPointerBytes targetLayouts
-  match oldVal with
-  | .uninit => .none
-  | .unit =>
-    match Bool.and (Nat.beq offsetBytes 0) (Nat.beq (length patchBytes) 0) with
-    | true => .some .unit
-    | false => .none
-  | .scalar oldSc =>
-    let oldBytes := encodeLittleEndianBytes oldSc.bits oldSc.sizeBytes .none
-    match writeAbstractBytesAt oldBytes offsetBytes patchBytes with
-    | .none => .none
-    | .some mergedBytes =>
-      match isThinPtrKind placeTy.kind with
+  match targetLayouts.isLittleEndian with
+  | false => .none
+  | true =>
+    let ptrBytes := layoutPointerBytes targetLayouts
+    match oldVal with
+    | .uninit => .none
+    | .unit =>
+      match Bool.and (Nat.beq offsetBytes 0) (Nat.beq (length patchBytes) 0) with
+      | true => .some .unit
+      | false => .none
+    | .scalar oldSc =>
+      let oldBytes := encodeLittleEndianBytes oldSc.bits oldSc.sizeBytes .none
+      match writeAbstractBytesAt oldBytes offsetBytes patchBytes with
+      | .none => .none
+      | .some mergedBytes =>
+        match isThinPtrKind placeTy.kind with
+        | true =>
+          match rawPtrDecodeThinPtr ptrBytes placeTy.kind mergedBytes with
+          | .ok v => .some v
+          | .fault _ => .none
+        | false =>
+          match rawPtrBytesAllPlainInit mergedBytes, decodeLittleEndianBytes mergedBytes with
+          | true, .some (mergedBits, _) =>
+            let cand : Value := .scalar ⟨mergedBits, oldSc.sizeBytes⟩
+            match rawPtrValueValid? 16 targetLayouts placeTy cand with
+            | .some true => .some cand
+            | _ => .none
+          | _, _ => .none
+    | .ptr _ pSz =>
+      match Nat.beq pSz ptrBytes with
+      | false => .none
       | true =>
-        match rawPtrDecodeThinPtr ptrBytes placeTy.kind mergedBytes with
-        | .ok v => .some v
-        | .fault _ => .none
-      | false =>
-        match rawPtrBytesAllPlainInit mergedBytes, decodeLittleEndianBytes mergedBytes with
-        | true, .some (mergedBits, _) =>
-          let cand : Value := .scalar ⟨mergedBits, oldSc.sizeBytes⟩
-          match rawPtrValueValid? 16 targetLayouts placeTy cand with
-          | true => .some cand
-          | false => .none
-        | _, _ => .none
-  | .ptr _ pSz =>
-    match Nat.beq pSz ptrBytes with
-    | false => .none
-    | true =>
-      match encodeUntypedValueToBytes defaultCodecFuel oldVal with
+        match encodeUntypedValueToBytes defaultCodecFuel oldVal with
+        | .none => .none
+        | .some oldBytes =>
+          match writeAbstractBytesAt oldBytes offsetBytes patchBytes with
+          | .none => .none
+          | .some mergedBytes =>
+            match rawPtrDecodeThinPtr ptrBytes placeTy.kind mergedBytes with
+            | .ok v => .some v
+            | .fault _ => .none
+    | .aggregate _ _ =>
+      match rawPtrEncodeValue? targetDecls targetLayouts placeTy oldVal with
       | .none => .none
       | .some oldBytes =>
         match writeAbstractBytesAt oldBytes offsetBytes patchBytes with
         | .none => .none
         | .some mergedBytes =>
-          match rawPtrDecodeThinPtr ptrBytes placeTy.kind mergedBytes with
-          | .ok v => .some v
-          | .fault _ => .none
-  | .aggregate _ _ =>
-    match rawPtrEncodeValue? targetDecls targetLayouts placeTy oldVal with
-    | .none => .none
-    | .some oldBytes =>
-      match writeAbstractBytesAt oldBytes offsetBytes patchBytes with
-      | .none => .none
-      | .some mergedBytes =>
-        rawPtrDecodeAggregate? targetDecls targetLayouts placeTy oldVal mergedBytes
+          rawPtrDecodeAggregate? targetDecls targetLayouts placeTy oldVal mergedBytes
 
 /--
 Splice `patchBytes` at byte offset `offsetBytes` into the target place of
@@ -5275,7 +5849,7 @@ Checks, in order:
    undecidable alignment is unsupported.
 3. A non-volatile store through a null pointer is `.ub`, even when `T` is
    zero-sized: a null pointer is never valid for writes.
-4. An uninhabited `T` (`tyIsUninhabited`) is `.ub`, even when `T` is
+4. An uninhabited `T` (`rawPtrTyIsUninhabited`) is `.ub`, even when `T` is
    zero-sized: passing a value of an uninhabited type is immediate UB.
 5. `val` must be a storable value of `T` (`rawPtrStoreValueFault?`).
 6. A zero-sized `T` writes no memory, and no Tree Borrows access happens.
@@ -5455,7 +6029,7 @@ def rawPtrStoreAction
           match Bool.and (Bool.not isVolatile) (rawPtrArgIsNull dstArg) with
           | true => .fault .ub
           | false =>
-            match tyIsUninhabited bodyLayouts elemTy with
+            match rawPtrTyIsUninhabited bodyLayouts elemTy with
             | true => .fault .ub
             | false =>
               match rawPtrStoreValueFault? bodyLayouts elemTy val with
@@ -5754,9 +6328,12 @@ def volatileCopyStackAction
             | true => .some .ub
             | false => .none
           | _, _ =>
-            match projectionsOverlap srcEntry.targetProjection dstEntry.targetProjection with
-            | false => .none
-            | true => .some .unsupported
+            match
+              rawPtrProjsDisjoint?
+                srcDecls srcLayouts srcRootTy srcEntry.targetProjection dstEntry.targetProjection
+            with
+            | true => .none
+            | false => .some .unsupported
       match overlapFault with
       | .some kind => .fault kind
       | .none =>

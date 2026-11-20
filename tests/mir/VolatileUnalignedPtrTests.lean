@@ -818,16 +818,194 @@ synthesized index `0` does not adopt (checking against it reported an eight-byte
 invalid before `[adv ep1-A1]`), and an out-of-range index has no entry. A resolved primitive
 wrapper (`NonZeroU32`) keeps its size and valid-range checks. -/
 theorem adt_validity_trusts_layout_entries_sizing_trusts :
-    rawPtrValueValid? 16 tblAdtFirst tyPairStructAt0 (.aggregate 0 [u32Val 1, u32Val 2]) = true ∧
-    rawPtrValueValid? 16 tblAdtFirst tyPairStructAt0 (.aggregate 1 [u32Val 1, u32Val 2]) = false ∧
-    rawPtrValueValid? 16 tblAdtFirst tyPairStructAt0 .unit = false ∧
-    rawPtrValueValid? 16 tblAdtFirst tyPairStructAt0 (u32Val 1) = false ∧
-    rawPtrValueValid? 16 tbl ⟨.adt "Wrapper64" [], 0⟩ (usizeVal 5) = true ∧
-    rawPtrValueValid? 16 tbl ⟨.adt "Wrapper64" [], 99⟩ (usizeVal 5) = true ∧
-    rawPtrValueValid? 16 tbl tyNonZeroU32 (u32Val 0) = false ∧
-    rawPtrValueValid? 16 tbl tyNonZeroU32 (u32Val 7) = true ∧
-    rawPtrValueValid? 16 tbl tyNonZeroU32 (usizeVal 7) = false :=
+    rawPtrValueValid? 16 tblAdtFirst tyPairStructAt0 (.aggregate 0 [u32Val 1, u32Val 2]) = .some true ∧
+    rawPtrValueValid? 16 tblAdtFirst tyPairStructAt0 (.aggregate 1 [u32Val 1, u32Val 2]) = .some false ∧
+    rawPtrValueValid? 16 tblAdtFirst tyPairStructAt0 .unit = .some false ∧
+    rawPtrValueValid? 16 tblAdtFirst tyPairStructAt0 (u32Val 1) = .some false ∧
+    rawPtrValueValid? 16 tbl ⟨.adt "Wrapper64" [], 0⟩ (usizeVal 5) = .some true ∧
+    rawPtrValueValid? 16 tbl ⟨.adt "Wrapper64" [], 99⟩ (usizeVal 5) = .some true ∧
+    rawPtrValueValid? 16 tbl tyNonZeroU32 (u32Val 0) = .some false ∧
+    rawPtrValueValid? 16 tbl tyNonZeroU32 (u32Val 7) = .some true ∧
+    rawPtrValueValid? 16 tbl tyNonZeroU32 (usizeVal 7) = .some false :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-! ## 12. `[adv ep1-B2]` regressions: uninhabited entry 0, fuel, DST wide ptrs, struct fields, fallback overlap, 32-bit/BE -/
+
+private def tblNeverFirst : LayoutTable :=
+  { pointerBits := 64,
+    isLittleEndian := true,
+    entries := [
+      lNever,            -- 0 (uninhabited entry at index 0!)
+      lU32               -- 1
+    ] }
+
+/-- Having an uninhabited layout (`lNever`) at `layouts.entries[0]` must NEVER cause a synthesized
+`layoutIdx = 0` primitive scalar (`u32`) to be treated as uninhabited (was a false `.ub` before
+`[adv ep1-B2]`), while `!` itself remains `.ub`. -/
+theorem never_at_layout0_does_not_ub_primitive_store_or_load :
+    rawPtrTyIsUninhabited tblNeverFirst ⟨.uint .u32, 0⟩ = false ∧
+    rawPtrTyIsUninhabited tblNeverFirst ⟨.never, 0⟩ = true ∧
+    rawPtrStoreAction true true [] [] [] [] []
+      (tgtWith "core::intrinsics::volatile_store" ⟨.uint .u32, 0⟩)
+      [mkDecl tyUnit] tblNeverFirst [] [usizeVal 0x1000, u32Val 7] [.uninit] =
+      .fault .unsupported ∧
+    rawPtrLoadAction true true [] [] [] []
+      (tgtWith "core::intrinsics::volatile_load" ⟨.uint .u32, 0⟩)
+      [mkDecl tyUnit] tblNeverFirst [] [usizeVal 0x1000] [.uninit] =
+      .fault .unsupported ∧
+    rawPtrLoadAction true true [] [] [] []
+      (tgtWith "core::intrinsics::volatile_load" ⟨.never, 0⟩)
+      [mkDecl tyUnit] tblNeverFirst [] [usizeVal 0x1000] [.uninit] =
+      .fault .ub :=
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Fuel exhaustion in `rawPtrValueValid?` returns `.none` (fail-closed `.unsupported`, never
+unsound `true`), while a definite invalidity (`.some false`) dominates `.none`. -/
+theorem rawPtrValueValid_fuel_zero_fails_closed :
+    rawPtrValueValid? 0 tbl tyU32 (u32Val 1) = .none ∧
+    rawPtrOptBoolAnd .none (.some false) = .some false ∧
+    rawPtrOptBoolAnd (.some false) .none = .some false ∧
+    rawPtrOptBoolAnd .none (.some true) = .none :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+private def lBadPairAt0 : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨4⟩,
+    backendRepr := .memory,
+    fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [1, 1] }
+
+private def tblBadFieldsAt0 : LayoutTable :=
+  { pointerBits := 64,
+    isLittleEndian := true,
+    entries := [
+      lBadPairAt0,       -- 0 (struct whose fieldLayouts point to lNever!)
+      lNever             -- 1
+    ] }
+
+/-- Non-empty tuples and arrays at unresolved `layoutIdx = 0` must NEVER adopt `entries[0]`'s
+`fieldLayouts` (which caused false `.ub` when `entries[0]` pointed to an uninhabited or mismatched
+field layout before `[adv ep1-B2]`). -/
+theorem tuple_and_array_reject_untrusted_layout0_fields :
+    rawPtrValueValid? 16 tblBadFieldsAt0 ⟨.array (.uint .u32) 2, 0⟩
+      (.aggregate 0 [u32Val 1, u32Val 2]) = .some true ∧
+    rawPtrValueValid? 16 tblBadFieldsAt0 ⟨.tuple [.uint .u32, .uint .u32], 0⟩
+      (.aggregate 0 [u32Val 1, u32Val 2]) = .some true :=
+  ⟨rfl, rfl⟩
+
+private def lWidePtr : TypeLayout :=
+  { size := ⟨16⟩, align := ⟨8⟩,
+    backendRepr := .scalarPair
+      (.initialized (.pointer 0) ⟨0, 0xFFFFFFFFFFFFFFFF⟩)
+      (.initialized (.int 64 false) ⟨0, 0xFFFFFFFFFFFFFFFF⟩),
+    fields := .arbitrary [⟨0⟩, ⟨8⟩] [0, 1], variants := .single 0, isUninhabited := false }
+
+private def lHasBool : TypeLayout :=
+  { size := ⟨1⟩, align := ⟨1⟩,
+    backendRepr := .memory,
+    fields := .arbitrary [⟨0⟩] [0], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [3] }
+
+private def lNonNullPtr : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩,
+    backendRepr := .scalar (.initialized (.pointer 0) ⟨1, 0xFFFFFFFFFFFFFFFF⟩),
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+private def tblB2 : LayoutTable :=
+  { pointerBits := 64,
+    isLittleEndian := true,
+    entries := [
+      lU8,               -- 0
+      lU32,              -- 1
+      lU64,              -- 2
+      lBool,             -- 3
+      lWidePtr,          -- 4
+      lHasBool,          -- 5
+      lNonNullPtr        -- 6
+    ] }
+
+/-- Wide pointers to unsized tuples `(u32, [u8])` and custom DST ADTs (`*const MyDst` / `&MyDst`)
+are accepted (no false `.ub`), while null references remain `.some false` (`.ub`). -/
+theorem custom_dst_wide_ptr_validity :
+    let wideNonNull := Value.aggregate 0 [ptrVal 10 0, usizeVal 4]
+    let wideNull := Value.aggregate 0 [usizeVal 0, usizeVal 4]
+    let tyPtrUnsizedTuple : Ty := ⟨.rawPtr .not (.tuple [.uint .u32, .slice (.uint .u8)]), 4⟩
+    let tyPtrCustomDst : Ty := ⟨.rawPtr .not (.adt "MyDst" []), 4⟩
+    let tyRefCustomDst : Ty := ⟨.ref .not (.adt "MyDst" []), 4⟩
+    let tyPtrUnresAdt : Ty := ⟨.rawPtr .not (.adt "UnresDst" []), 99⟩
+    let tyRefUnresAdt : Ty := ⟨.ref .not (.adt "UnresDst" []), 99⟩
+    rawPtrValueValid? 16 tblB2 tyPtrUnsizedTuple wideNonNull = .some true ∧
+    rawPtrValueValid? 16 tblB2 tyPtrCustomDst wideNonNull = .some true ∧
+    rawPtrValueValid? 16 tblB2 tyRefCustomDst wideNonNull = .some true ∧
+    rawPtrValueValid? 16 tblB2 tyRefCustomDst wideNull = .some false ∧
+    rawPtrValueValid? 16 tblB2 tyPtrUnresAdt wideNonNull = .some true ∧
+    rawPtrValueValid? 16 tblB2 tyPtrUnresAdt (ptrVal 10 0) = .some true ∧
+    rawPtrValueValid? 16 tblB2 tyRefUnresAdt wideNull = .some false ∧
+    rawPtrValueValid? 16 tblB2 tyRefUnresAdt (usizeVal 0) = .some false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Single-variant ADTs recursively validate `fieldLayouts` (rejecting `HasBool { b: 2 }` with
+`.ub`), and `NonNull<T>` primitive-pointer ADTs reject null `Value.ptr ⟨0, 0⟩ 8` too. -/
+theorem struct_field_recursive_validity_and_nonnull :
+    let tyHasBool : Ty := ⟨.adt "HasBool" [], 5⟩
+    let tyNonNull : Ty := ⟨.adt "NonNullU32" [], 6⟩
+    rawPtrValueValid? 16 tblB2 tyHasBool (.aggregate 0 [u8Val 1]) = .some true ∧
+    rawPtrValueValid? 16 tblB2 tyHasBool (.aggregate 0 [u8Val 2]) = .some false ∧
+    rawPtrValueValid? 16 tblB2 tyNonNull (ptrVal 10 0) = .some true ∧
+    rawPtrValueValid? 16 tblB2 tyNonNull (ptrVal 0 0) = .some false ∧
+    rawPtrValueValid? 16 tblB2 tyNonNull (usizeVal 0) = .some false :=
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-- When byte-offset resolution fails (e.g. an inner `.index` projection or `.downcast` enum
+variants), the fallback overlap check NEVER claims two union fields or two enum variants are
+disjoint (returns `.none` -> `.unsupported`), while distinct fields of a non-union struct/tuple
+remain provably disjoint (`.some false`). -/
+theorem union_and_enum_fallback_overlap_not_disjoint :
+    let unionFieldAIdx : BorrowEntry :=
+      { tag := 92, targetLocal := 1, targetProjection := [.field 0 tyU32, .index 2], perm := .active,
+        targetFrameDepth := 0, allocDead := false }
+    let unionFieldB : BorrowEntry :=
+      { tag := 93, targetLocal := 1, targetProjection := [.field 1 tyArrU8_3], perm := .frozen,
+        targetFrameDepth := 0, allocDead := false }
+    let enumVarA : BorrowEntry :=
+      { tag := 94, targetLocal := 1, targetProjection := [.downcast "A" 0, .field 0 tyU32],
+        perm := .active, targetFrameDepth := 0, allocDead := false }
+    let enumVarB : BorrowEntry :=
+      { tag := 95, targetLocal := 1, targetProjection := [.downcast "B" 1, .field 0 tyU32],
+        perm := .frozen, targetFrameDepth := 0, allocDead := false }
+    let tyOpaqueEnum : Ty := ⟨.adt "MyEnum" [], 99⟩
+    let tupleField0Idx : BorrowEntry :=
+      { tag := 96, targetLocal := 1, targetProjection := [.field 0 tyU32, .index 2], perm := .active,
+        targetFrameDepth := 0, allocDead := false }
+    let tupleField1 : BorrowEntry :=
+      { tag := 97, targetLocal := 1, targetProjection := [.field 1 tyU32], perm := .frozen,
+        targetFrameDepth := 0, allocDead := false }
+    projectionsOverlap enumVarB.targetProjection enumVarA.targetProjection = false ∧
+    rawPtrEntryOverlapsAccess [mkDecl tyUnit, mkDecl tyUnionU32Arr3] tbl tyUnionU32Arr3 .none
+      unionFieldAIdx 0 4 4 unionFieldB = .none ∧
+    rawPtrEntryOverlapsAccess [mkDecl tyUnit, mkDecl tyOpaqueEnum] tbl tyOpaqueEnum .none
+      enumVarA 0 4 4 enumVarB = .none ∧
+    rawPtrEntryOverlapsAccess [mkDecl tyUnit, mkDecl tyPairU32] tbl tyPairU32 .none
+      tupleField0Idx 0 4 4 tupleField1 = .some false :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+private def tbl32 : LayoutTable :=
+  { pointerBits := 32,
+    isLittleEndian := true,
+    entries := [lU8, lU32] }
+
+private def tblBigEndian : LayoutTable :=
+  { pointerBits := 64,
+    isLittleEndian := false,
+    entries := [lU8, lU32] }
+
+/-- 32-bit `usize` decodes 4 bytes cleanly without false `.ub`, and big-endian targets fail closed
+on byte-level decode/splice instead of silently byte-swapping. -/
+theorem decode_32bit_usize_and_big_endian_fail_closed :
+    let bs4 : List AbstractByte := [.init 0x78 .none, .init 0x56 .none, .init 0x34 .none, .init 0x12 .none]
+    rawPtrDecodeBytes tbl32 ⟨.uint .usize, 1⟩ bs4 = .ok (u32Val 0x12345678) ∧
+    rawPtrDecodeBytes tblBigEndian tyU32 bs4 = .fault .unsupported ∧
+    rawPtrSpliceBytesIntoPlace? [mkDecl tyU32] tblBigEndian tyU32 (u32Val 0) 0 bs4 = .none :=
+  ⟨rfl, rfl, rfl⟩
 
 /-- info: 'Anneal.Mir.VolatileUnalignedPtrTests.read_unaligned_offset1_u32_ok' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
@@ -856,5 +1034,17 @@ theorem adt_validity_trusts_layout_entries_sizing_trusts :
 /-- info: 'Anneal.Mir.VolatileUnalignedPtrTests.adt_validity_trusts_layout_entries_sizing_trusts' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms adt_validity_trusts_layout_entries_sizing_trusts
+
+/-- info: 'Anneal.Mir.VolatileUnalignedPtrTests.never_at_layout0_does_not_ub_primitive_store_or_load' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms never_at_layout0_does_not_ub_primitive_store_or_load
+
+/-- info: 'Anneal.Mir.VolatileUnalignedPtrTests.custom_dst_wide_ptr_validity' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms custom_dst_wide_ptr_validity
+
+/-- info: 'Anneal.Mir.VolatileUnalignedPtrTests.union_and_enum_fallback_overlap_not_disjoint' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms union_and_enum_fallback_overlap_not_disjoint
 
 end Anneal.Mir.VolatileUnalignedPtrTests
