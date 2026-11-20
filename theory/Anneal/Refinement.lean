@@ -1579,6 +1579,19 @@ def OutcomeSet.mapGap {Gap' : Type uG'} (f : Gap₁ → Gap')
     (S : OutcomeSet Fault₁ Gap₁ Val₁) : OutcomeSet Fault₁ Gap' Val₁ :=
   fun o' => ∃ o, S o ∧ o.mapGap f = o'
 
+theorem OutcomeSet.neverGap_mapGap_iff {Gap' : Type uG'} (f : Gap₁ → Gap')
+    {S : OutcomeSet Fault₁ Gap₁ Val₁} :
+    NeverGap (OutcomeSet.mapGap f S) ↔ NeverGap S := by
+  constructor
+  · intro h o ho
+    cases o with
+    | ok _ | fault _ => exact trivial
+    | gap g => exact h ⟨.gap g, ho, rfl⟩
+  · rintro h _ ⟨o, ho, rfl⟩
+    cases o with
+    | ok _ | fault _ => exact trivial
+    | gap g => exact h ho
+
 theorem OutcomeSetEquiv.mapGap_congr {Gap : Type uG} {Gap' : Type uG'}
     (f : Gap → Gap')
     {S₁ : OutcomeSet Fault₁ Gap Val₁} {S₂ : OutcomeSet Fault₂ Gap Val₂}
@@ -2093,6 +2106,20 @@ theorem ContextEquiv.neverGap_iff (h : ContextEquiv rVal rFault sem₁ sem₂)
     (q : Query) : NeverGap (sem₁ q) ↔ NeverGap (sem₂ q) :=
   (h q).neverGap_iff
 
+theorem ContextEquivOn.mapGap_congr {Gap' : Type uG'} (f : Gap → Gap')
+    (h : ContextEquivOn pre rVal rFault sem₁ sem₂) :
+    ContextEquivOn pre rVal rFault
+      (fun q => OutcomeSet.mapGap f (sem₁ q))
+      (fun q => OutcomeSet.mapGap f (sem₂ q)) :=
+  fun q hq => (h q hq).mapGap_congr f
+
+theorem ContextEquiv.mapGap_congr {Gap' : Type uG'} (f : Gap → Gap')
+    (h : ContextEquiv rVal rFault sem₁ sem₂) :
+    ContextEquiv rVal rFault
+      (fun q => OutcomeSet.mapGap f (sem₁ q))
+      (fun q => OutcomeSet.mapGap f (sem₂ q)) :=
+  fun q => (h q).mapGap_congr f
+
 theorem ContextEquiv.mapGap_iff_of_injective {Gap' : Type uG'} {f : Gap → Gap'}
     (hinj : ∀ g₁ g₂, f g₁ = f g₂ → g₁ = g₂) :
     ContextEquiv rVal rFault
@@ -2517,6 +2544,16 @@ def OutcomeSet.toPartial (isUB : Fault₁ → Prop) (S : OutcomeSet Fault₁ Gap
     Partial (OutcomeSet Fault₁ Gap Val₁) where
   defined := OutcomeSet.Defined isUB S
   val _ := S
+
+theorem OutcomeSet.defined_mapGap_iff {Gap' : Type uG'} (f : Gap → Gap')
+    {S : OutcomeSet Fault₁ Gap Val₁} :
+    OutcomeSet.Defined isUB₁ (OutcomeSet.mapGap f S) ↔ OutcomeSet.Defined isUB₁ S := by
+  rw [OutcomeSet.defined_iff, OutcomeSet.defined_iff, OutcomeSet.neverGap_mapGap_iff]
+  refine ⟨fun ⟨hg, hf⟩ => ⟨hg, fun e he => hf ⟨.fault e, he, rfl⟩⟩,
+    fun ⟨hg, hf⟩ => ⟨hg, fun e ⟨o, ho, hmap⟩ => ?_⟩⟩
+  cases o with
+  | ok _ | gap _ => cases hmap
+  | fault e' => cases OutcomeWithGap.fault.inj hmap; exact hf ho
 
 /-- Layer 1A `Semantics` of a program family with gap-aware semantics `sem`. -/
 def gapSemantics {Prog : Type uP} (isUB : Fault₁ → Prop)
