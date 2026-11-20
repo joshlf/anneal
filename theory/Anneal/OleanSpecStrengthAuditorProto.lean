@@ -7,8 +7,11 @@ import Lean.Compiler.ImplementedByAttr
 import Lean.Compiler.ExternAttr
 import Lean.Compiler.CSimpAttr
 import Lean.Compiler.IR.CompilerM
+import Lean.Compiler.LCNF.Main
 import Lean.Compiler.LCNF.Passes
 import Lean.Compiler.LCNF.Simp.ConstantFold
+import Lean.Meta.Constructions.CasesOn
+import Lean.Meta.Constructions.SparseCasesOn
 import Trusted.VerificationResult
 
 /-!
@@ -20,8 +23,10 @@ directly inside Lean `v4.34.1` with zero external Python source-text regex scann
 1. **Compiled `.olean` / `.olean.private` `MetaM` Environment Auditor**:
    Inspects compiled Lean `v4.34.1` module environments (`OLeanLevel.private`,
    `env.setExporting false`, `env.checked.get`, `Lean.collectAxioms`, and compiler
-   override attribute and extension tables `@[implemented_by]`, `@[extern]`, `@[csimp]`,
-   `@[init]`, `@[export]`, `@[cpass]`, and custom LCNF constant folders) across
+   override attribute and extension tables (`@[implemented_by]`, `@[extern]`, `@[csimp]`,
+   `@[init]`, `@[export]`, `@[cpass]`, custom LCNF constant folders, and compiler-intrinsic
+   eliminator tags `auxRecExt` `casesOn`, `sparseCasesOnExt`, and `noConfusionExt`) plus
+   compiled IR and separate-compilation postponed-IR records across
    the full kernel constant graph (`ci.type`, `ci.value? (allowOpaque := true)`,
    recursor `rules`, inductive `ctors`, constructor `induct`, mutual `all`, `.proj`
    struct references, and `Nat`/`String` literals).
@@ -63,9 +68,11 @@ structure AuditPolicy where
       `Lean.ofReduceNat`, `._native.`) are permitted. -/
   allowProvisionalNative : Bool := false
   /-- Whether compiler override attributes (`@[implemented_by]`, `@[extern]`,
-      `@[csimp]`, `@[init]`, `@[export]`) are forbidden on non-stdlib declarations in the
-      closure, and whether custom compiler passes (`@[cpass]`) and custom LCNF constant
-      folders are forbidden in the compilation pipeline of the modules behind it. -/
+      `@[csimp]`, `@[init]`, `@[export]`) and forged compiler-intrinsic tags
+      (`auxRecExt` `casesOn`, `sparseCasesOnExt`, `noConfusionExt`) are forbidden on
+      declarations in the closure, and whether custom compiler passes (`@[cpass]`) and
+      custom LCNF constant folders are forbidden in the compilation pipeline of the
+      modules behind it. -/
   checkCompilerOverrides : Bool := true
   /-- Whether a Lean `v4.34.1` `module`-system `.olean` (`ModuleData.isModule = true`)
       must have a companion `.olean.private` artifact on disk. -/
@@ -510,6 +517,7 @@ def isCodegenUnsafeRec (env : Environment) (modName? : Option Name) (ci : Consta
                   | .str _ "_unsafe_rec" => true
                   | _ => false
               | none => false
+            originModule? env ci.name == modName? &&
             originModule? env parent == modName? &&
             ci.type == parentCi.type &&
             ci.levelParams == parentCi.levelParams &&
@@ -600,6 +608,12 @@ structure CSimpIndex where
       reordered, including by a metaprogram that edited the extension state directly
       and left no registration behind. -/
   livePipelineDrift : Array String := #[]
+  /-- Non-toolchain declarations whose compilation was postponed to `leanir`
+      (`Lean.Compiler.LCNF.postponedCompileDeclsExt`, saved in `.olean.private`).
+      In separate-compilation mode (`-Dcompiler.postponeCompile=true`), `.olean.private`
+      carries no `impureSigExt` entry and `.olean` carries no IR `extern` stub, so this
+      set tells the IR walk when a missing IR body means `.ir` was not loaded. -/
+  postponedDecls : NameSet := {}
 
 /-- Order-sensitive structural fingerprint of a pass pipeline: for every pass its list
     (base, mono, mono after lambda lifting, impure), name, occurrence, and phases. Pass
@@ -613,13 +627,14 @@ private def passManagerFingerprint (m : Lean.Compiler.LCNF.PassManager) :
 
 /-- Build `CSimpIndex` across all imported modules and the live local state, including
     closed-scope `@[scoped csimp]` entries recorded in `StateStack.newEntries` and
-    `StateStack.scopedEntries`, `@[cpass]` pass installers, and custom constant folders.
+    `StateStack.scopedEntries`, `@[cpass]` pass installers, custom constant folders,
+    and postponed separate-compilation declarations.
 
-    A `@[csimp]` entry of the live state is exempt only when the exact triple
-    `(fromDeclName, toDeclName, thmName)` is stored in the entries of an imported stdlib
-    module. Exempting by the origin of `thmName` alone would let a metaprogram register
-    `victim ↦ evil` under the name of any stdlib theorem (`Nat.add_comm`): `CSimp.add`
-    validates the lemma's statement, adding an entry to the extension directly does not.
+    A `@[csimp]` entry of the live state is exempt only when the map key equals
+    `ent.fromDeclName` AND the exact triple `(fromDeclName, toDeclName, thmName)` is
+    stored in the entries of an imported stdlib module. Exempting by `thmName` alone
+    or ignoring the map key in `st.map` would let a metaprogram redirect `victim` under
+    a genuine stdlib entry (because `CSimp.replaceConstant?` indexes `st.map` by key).
 
     Pass installers and constant folders have no toolchain exemption at all: the pinned
     toolchain registers none in its own modules. -/
@@ -644,17 +659,34 @@ def buildCSimpIndex (privEnv : Environment) : CSimpIndex := Id.run do
       (tAcc.insert ent.thmName, mAcc.insert ent.fromDeclName (ent.toDeclName, ent.thmName))
     else
       (tAcc, mAcc)
-  -- 1. Live active state (global, local, and currently open scoped entries).
-  let st := Lean.Compiler.CSimp.ext.getState privEnv
-  thmNames := st.thmNames.fold (init := thmNames) fun acc thm =>
-    if !stdlibThms.contains thm then acc.insert thm else acc
-  let (t1, m1) := st.map.fold (init := (thmNames, fromToThm)) fun (tAcc, mAcc) _ ent =>
-    addEntry tAcc mAcc ent
-  thmNames := t1
-  fromToThm := m1
+  let addMapEntry (tAcc : NameSet) (mAcc : Std.HashMap Name (Name × Name))
+      (mapKey : Name) (ent : Lean.Compiler.CSimp.Entry) :
+      NameSet × Std.HashMap Name (Name × Name) :=
+    if mapKey == ent.fromDeclName &&
+        stdlibTriples.contains (mapKey, ent.toDeclName, ent.thmName) then
+      (tAcc, mAcc)
+    else
+      let tAcc' := tAcc.insert ent.thmName
+      let mAcc' := mAcc.insert mapKey (ent.toDeclName, ent.thmName)
+      if mapKey != ent.fromDeclName &&
+          !stdlibTriples.contains (ent.fromDeclName, ent.toDeclName, ent.thmName) then
+        (tAcc', mAcc'.insert ent.fromDeclName (ent.toDeclName, ent.thmName))
+      else
+        (tAcc', mAcc')
+  -- 1. Live active state across ALL frames of `StateStack.stateStack` (global, local,
+  --    and open scoped entries), keying `fromToThm` by the actual `SMap` key used by
+  --    `CSimp.replaceConstant?`.
+  let stack := Lean.Compiler.CSimp.ext.ext.getState privEnv
+  for frame in stack.stateStack do
+    let st := frame.state
+    thmNames := st.thmNames.fold (init := thmNames) fun acc thm =>
+      if !stdlibThms.contains thm then acc.insert thm else acc
+    let (t1, m1) := st.map.fold (init := (thmNames, fromToThm)) fun (tAcc, mAcc) k ent =>
+      addMapEntry tAcc mAcc k ent
+    thmNames := t1
+    fromToThm := m1
   -- 2. Live `StateStack` `newEntries` & `scopedEntries` (catches closed-scope
   --    `@[scoped csimp]` entries whose namespace ended before auditing!).
-  let stack := Lean.Compiler.CSimp.ext.ext.getState privEnv
   for raw in stack.newEntries do
     let ent := match raw with
       | .global e => e
@@ -669,6 +701,7 @@ def buildCSimpIndex (privEnv : Environment) : CSimpIndex := Id.run do
   -- 3. Raw imported module entries (works even under `loadExts := false`!).
   let mut cpassEntries : Array (Option Nat × Name) := #[]
   let mut folderEntries : Array (Option Nat × Name × Name) := #[]
+  let mut postponedDecls : NameSet := {}
   for h : modIdx in [:mods.size] do
     let modName := mods[modIdx].module
     if !isStdlibMod modName then
@@ -679,10 +712,16 @@ def buildCSimpIndex (privEnv : Environment) : CSimpIndex := Id.run do
           | .scoped _ e => e
         thmNames := thmNames.insert ent.thmName
         fromToThm := fromToThm.insert ent.fromDeclName (ent.toDeclName, ent.thmName)
+    if !(isStdlibMod modName || isLeanCompilerMod modName) then
+      for pe in Lean.Compiler.LCNF.postponedCompileDeclsExt.getModuleEntries privEnv modIdx do
+        for d in pe.declNames do
+          postponedDecls := postponedDecls.insert d
     for inst in Lean.Compiler.LCNF.passManagerExt.getModuleEntries privEnv modIdx do
       cpassEntries := cpassEntries.push (some modIdx, inst)
     for fe in Lean.Compiler.LCNF.Simp.ConstantFold.folderExt.getModuleEntries privEnv modIdx do
       folderEntries := folderEntries.push (some modIdx, fe.declName, fe.folderDeclName)
+  for (d, _) in Lean.Compiler.LCNF.postponedCompileDeclsExt.getState privEnv do
+    postponedDecls := postponedDecls.insert d
   -- 4. Live compiler pipeline of the module being elaborated. Every registration made
   --    there counts, whatever name it was made under: the entry is what changes the
   --    pipeline, and a metaprogram can add one naming any existing constant.
@@ -717,7 +756,7 @@ def buildCSimpIndex (privEnv : Environment) : CSimpIndex := Id.run do
     livePipelineDrift := livePipelineDrift.push
       s!"live LCNF pass pipeline has {liveFp.size} passes in an order or with names that differ from the {builtinFp.size} built-in ones"
   return { thmNames, fromToThm, cpassEntries, folderEntries, cpassInstallers, folderDecls,
-           folderTargets, livePipelineDrift }
+           folderTargets, livePipelineDrift, postponedDecls }
 
 /-- Pure `MonadEnv` runner allowing `Lean.collectAxioms` to run directly on any
     `Environment` value (in pure code, `IO`, or `MetaM`) with `env.setExporting false`. -/
@@ -860,9 +899,313 @@ def detectPartialOrUnsafeRec (privEnv : Environment) (n : Name) (ci : ConstantIn
       | none => none
     | _ => none
 
+/-- Strip leading `.lam` binders (and `.mdata` wrappers), returning `(numBinders, body)`. -/
+private def stripLeadingLams (e : Expr) : Nat × Expr :=
+  go 0 e
+where
+  go (n : Nat) : Expr → Nat × Expr
+    | .lam _ _ b _ => go (n + 1) b
+    | .mdata _ b => go n b
+    | e => (n, e)
+
+/-- Collect the domain types of all leading `.forallE` binders (ignoring `.mdata`). -/
+private def collectForallDomains (e : Expr) : Array Expr :=
+  go #[] e
+where
+  go (acc : Array Expr) : Expr → Array Expr
+    | .forallE _ d b _ => go (acc.push d) b
+    | .mdata _ b => go acc b
+    | _ => acc
+
+/-- Unwrap an `id P e` expected-type hint emitted by `Lean.Meta.mkExpectedTypeHint`. -/
+private def unwrapIdTypeHint (e : Expr) : Expr :=
+  let e := e.consumeMData
+  if e.getAppFn.isConstOf ``id && e.getAppArgs.size == 2 then
+    e.getAppArgs[1]!.consumeMData
+  else
+    e
+
+/-- Unwrap nested `Eq.ndrec` / `Eq.rec` / `HEq.ndrec` / `HEq.rec` layers around the core
+    `casesOn` body of `<Ind>.noConfusion`. -/
+private def unwrapNoConfusionEqRec (e : Expr) (fuel : Nat := 64) : Expr :=
+  match fuel with
+  | 0 => e
+  | fuel + 1 =>
+    let (_, b) := stripLeadingLams e
+    let b := unwrapIdTypeHint b
+    let fn := b.getAppFn
+    let args := b.getAppArgs
+    if (fn.isConstOf ``Eq.ndrec || fn.isConstOf ``Eq.rec ||
+        fn.isConstOf ``HEq.ndrec || fn.isConstOf ``HEq.rec) && args.size >= 4 then
+      unwrapNoConfusionEqRec args[3]! fuel
+    else
+      b
+
+/-- Verify that a declaration tagged as `isCasesOnRecursor` (`auxRecExt` + `casesOn`
+    suffix) matches Lean's own kernel `casesOn` generator (`Lean.mkCasesOnImp`)
+    bit-for-bit (`levelParams`, `type`, `value`) and lives in the inductive's module.
+    Prevents a metaprogram from tagging an arbitrary definition with `markAuxRecursor`
+    so `ToLCNF.visitCases` compiles a case split that contradicts the kernel body. -/
+private def isGenuineCasesOnDecl (privEnv : Environment) (n : Name) (ci : ConstantInfo) : Bool :=
+  match n, ci with
+  | .str indName "casesOn", .defnInfo dv =>
+    originModule? privEnv indName == originModule? privEnv n &&
+    match Lean.mkCasesOnImp privEnv.checked.get indName with
+    | .ok (.defnDecl expected) =>
+      dv.levelParams == expected.levelParams &&
+      dv.type == expected.type &&
+      dv.value == expected.value
+    | _ => false
+  | _, _ => false
+
+/-- Verify that `<Ind>.ctorElim` in `indName`'s module is built directly from the verified
+    `<Ind>.casesOn` with the exact arity and equality-proof argument expected by
+    `Lean.Meta.Constructions.CtorElim`. -/
+private def isGenuineCtorElimDecl (privEnv : Environment) (indName : Name) (iv : InductiveVal) :
+    Bool :=
+  let ctorElimName := indName.str "ctorElim"
+  match privEnv.checked.get.find? ctorElimName with
+  | some (.defnInfo dv) =>
+    if originModule? privEnv ctorElimName != originModule? privEnv indName then false
+    else
+      let (nLams, body) := stripLeadingLams dv.value
+      let expectedLams := iv.numParams + 1 + 1 + iv.numIndices + 1 + 1 + 1
+      let fn := body.getAppFn
+      let args := body.getAppArgs
+      let casesOnName := indName.str "casesOn"
+      let altStart := iv.numParams + 1 + iv.numIndices + 1
+      if nLams != expectedLams || !fn.isConstOf casesOnName then false
+      else if args.size != altStart + iv.numCtors + 1 then false
+      else
+        match privEnv.checked.get.find? casesOnName with
+        | some casesCi =>
+          isGenuineCasesOnDecl privEnv casesOnName casesCi &&
+          args.back! == .bvar 1 &&
+          Id.run do
+            for i in [:iv.numCtors] do
+              let (altLams, altBody) := stripLeadingLams args[altStart + i]!
+              if altLams == 0 then return false
+              let aFn := altBody.getAppFn
+              let aArgs := altBody.getAppArgs
+              -- Generated alt shape: `(@PULift.down _ _ (@Eq.ndrec _ _ _ k _ h_i)) z_0 ... z_{k-1}`
+              if !aFn.isConstOf ``PULift.down || aArgs.size != altLams + 1 then return false
+              let eqRec := aArgs[1]!.consumeMData
+              if !(eqRec.getAppFn.isConstOf ``Eq.ndrec && eqRec.getAppArgs.size == 6 &&
+                  eqRec.getAppArgs[3]! == .bvar altLams && eqRec.getAppArgs[5]! == .bvar 0) then
+                return false
+              for fIdx in [:altLams - 1] do
+                if aArgs[2 + fIdx]! != .bvar (altLams - 1 - fIdx) then return false
+            return true
+        | none => false
+  | _ => false
+
+/-- Verify that `<Ind>.ctorIdx` (for a multi-constructor inductive) dispatches via the
+    verified `<Ind>.casesOn` and returns exact constructor index literals `0 .. numCtors-1`. -/
+private def isGenuineCtorIdxDecl (privEnv : Environment) (indName : Name) (iv : InductiveVal) :
+    Bool :=
+  let ctorIdxName := indName.str "ctorIdx"
+  match privEnv.checked.get.find? ctorIdxName with
+  | some (.defnInfo dv) =>
+    if originModule? privEnv ctorIdxName != originModule? privEnv indName then false
+    else if iv.numCtors == 1 then
+      let (nLams, body) := stripLeadingLams dv.value
+      nLams == iv.numParams + iv.numIndices + 1 && body == .lit (.natVal 0)
+    else
+      let (nLams, body) := stripLeadingLams dv.value
+      let casesOnName := indName.str "casesOn"
+      let args := body.getAppArgs
+      let altStart := iv.numParams + 1 + iv.numIndices + 1
+      if nLams != iv.numParams + iv.numIndices + 1 || !body.getAppFn.isConstOf casesOnName then false
+      else if args.size != altStart + iv.numCtors || args[iv.numParams + 1 + iv.numIndices]! != .bvar 0 then false
+      else
+        match privEnv.checked.get.find? casesOnName with
+        | some casesCi =>
+          isGenuineCasesOnDecl privEnv casesOnName casesCi &&
+          Id.run do
+            for i in [:iv.numCtors] do
+              if (stripLeadingLams args[altStart + i]!).2 != .lit (.natVal i) then
+                return false
+            return true
+        | none => false
+  | _ => false
+
+/-- Verify that a declaration tagged in `sparseCasesOnExt` (`Lean.isSparseCasesOn`) is
+    either a genuine per-constructor eliminator `<Ctor>.elim` (`CtorElim.lean`) or a
+    genuine match-compiler sparse eliminator (`SparseCasesOn.lean`) whose kernel body
+    agrees constructor-for-constructor with `dv.type` (the shape `ToLCNF.visitCases`
+    compiles from). -/
+private def isGenuineSparseCasesOnDecl (privEnv : Environment) (n : Name) (ci : ConstantInfo) :
+    Bool :=
+  let kenv := privEnv.checked.get
+  match ci with
+  | .defnInfo dv =>
+    match n with
+    | .str ctorName "elim" =>
+      match kenv.find? ctorName with
+      | some (.ctorInfo cv) =>
+        match kenv.find? cv.induct with
+        | some (.inductInfo iv) =>
+          if originModule? privEnv ctorName != originModule? privEnv n then false
+          else if !isGenuineCtorElimDecl privEnv cv.induct iv then false
+          else
+            let doms := collectForallDomains dv.type
+            let (nLams, body) := stripLeadingLams dv.value
+            let expectedLams := iv.numParams + 1 + iv.numIndices + 1 + 1 + 1
+            let fn := body.getAppFn
+            let args := body.getAppArgs
+            let ctorElimName := cv.induct.str "ctorElim"
+            let altConcl := (doms.back?.getD (.bvar 0)).getForallBody
+            doms.size == expectedLams &&
+            altConcl.isApp && altConcl.appArg!.getAppFn.isConstOf ctorName &&
+            nLams == expectedLams &&
+            fn.isConstOf ctorElimName &&
+            args.size == iv.numParams + 1 + 1 + iv.numIndices + 1 + 1 + 1 &&
+            args[iv.numParams + 1]! == .lit (.natVal cv.cidx) &&
+            args.back!.isAppOf ``PULift.up &&
+            args.back!.appArg! == .bvar 0
+        | _ => false
+      | _ => false
+    | _ =>
+      match Lean.Meta.getSparseCasesOnInfoCore privEnv n with
+      | none => false
+      | some sinfo =>
+        match kenv.find? sinfo.indName, kenv.find? (sinfo.indName.str "rec") with
+        | some (.inductInfo iv), some (.recInfo rv) =>
+          let doms := collectForallDomains dv.type
+          let (nLams, body) := stripLeadingLams dv.value
+          let nMinors := sinfo.insterestingCtors.size
+          let expectedLams := iv.numParams + 1 + iv.numIndices + 1 + nMinors
+          let minorStart := iv.numParams + 1 + iv.numIndices + 1
+          let recName := sinfo.indName.str "rec"
+          let fn := body.getAppFn
+          let args := body.getAppArgs
+          let majorIdx := rv.getMajorIdx
+          if doms.size != expectedLams + 1 then false
+          else if nLams != expectedLams || !fn.isConstOf recName || args.size != majorIdx + 1 then false
+          else if args[majorIdx]! != .bvar nMinors then false
+          else Id.run do
+            -- Cross-check `sinfo.insterestingCtors` against `dv.type` itself (which is
+            -- what `ToLCNF.visitCases` reads), so swapped metadata cannot fool the check.
+            let mut seenInteresting : NameSet := {}
+            for j in [:nMinors] do
+              let ic := sinfo.insterestingCtors[j]!
+              if seenInteresting.contains ic then return false
+              seenInteresting := seenInteresting.insert ic
+              let mConcl := doms[minorStart + j]!.getForallBody
+              if !mConcl.isApp || !mConcl.appArg!.getAppFn.isConstOf ic then
+                return false
+            let catchAllConcl := doms[minorStart + nMinors]!.getForallBody
+            if !catchAllConcl.isApp || !catchAllConcl.appArg!.isBVar then
+              return false
+            for ctor in iv.ctors do
+              let some rule := rv.rules.find? (·.ctor == ctor) | return false
+              let (rl, rb) := stripLeadingLams rule.rhs
+              let .bvar bIdx := rb.getAppFn | return false
+              if rl ≤ bIdx then return false
+              let minorPos := rl - 1 - bIdx
+              if minorPos < rv.numParams + rv.numMotives || minorPos >= majorIdx then return false
+              let minorExpr := args[minorPos]!
+              let (mLams, mBody) := stripLeadingLams minorExpr
+              let mFn := mBody.getAppFn
+              match sinfo.insterestingCtors.idxOf? ctor with
+              | some j =>
+                if mLams < rule.nfields then return false
+                if mFn != .bvar (nMinors - 1 - j + mLams) then return false
+                let mArgs := mBody.getAppArgs
+                if mArgs.size != rule.nfields then return false
+                for fIdx in [:rule.nfields] do
+                  if mArgs[fIdx]! != .bvar (mLams - 1 - fIdx) then return false
+              | none =>
+                if mLams ≤ rule.nfields || mFn != .bvar 0 then return false
+            return true
+        | _, _ => false
+  | _ => false
+
+/-- Verify a `.regular` `noConfusionExt` declaration (`<Ind>.noConfusion`). -/
+private def isGenuineNoConfusionRegularDecl (privEnv : Environment) (n : Name) (ci : ConstantInfo) :
+    Bool :=
+  let kenv := privEnv.checked.get
+  match ci with
+  | .defnInfo dv =>
+    match Lean.getNoConfusionInfo privEnv n with
+    | .regular arity lhsPos rhsPos =>
+      match n with
+      | .str indName "noConfusion" =>
+        match kenv.find? indName with
+        | some (.inductInfo iv) =>
+          if originModule? privEnv indName != originModule? privEnv n then false
+          else
+            let isEnum := iv.numParams == 0 && iv.numIndices == 0 && arity == 4 && lhsPos == 1 && rhsPos == 2
+            let expArity := 1 + 3 * (iv.numParams + iv.numIndices + 1)
+            let expLhs := 1 + iv.numParams + iv.numIndices
+            let expRhs := 1 + 2 * iv.numParams + 2 * iv.numIndices + 1
+            let isCore := arity == expArity && lhsPos == expLhs && rhsPos == expRhs
+            let enumBodyOk :=
+              isEnum &&
+              let (nLams, body) := stripLeadingLams dv.value
+              if iv.numCtors == 1 then
+                nLams == 5 && body == .bvar 0
+              else
+                nLams == 4 &&
+                body.getAppFn.isConstOf ``noConfusionEnum &&
+                body.getAppArgs.size == 8 &&
+                body.getAppArgs[3]!.isConstOf (indName.str "ctorIdx") &&
+                isGenuineCtorIdxDecl privEnv indName iv
+            let coreBodyOk :=
+              isCore &&
+              let coreBody := unwrapNoConfusionEqRec dv.value
+              let casesOnName := indName.str "casesOn"
+              let cArgs := coreBody.getAppArgs
+              let altStart := iv.numParams + 1 + iv.numIndices + 1
+              match kenv.find? casesOnName with
+              | some casesCi =>
+                coreBody.getAppFn.isConstOf casesOnName &&
+                cArgs.size == altStart + iv.numCtors &&
+                isGenuineCasesOnDecl privEnv casesOnName casesCi &&
+                Id.run do
+                  for i in [:iv.numCtors] do
+                    let (_, altBody) := stripLeadingLams cArgs[altStart + i]!
+                    if altBody.getAppFn != .bvar 0 then return false
+                  return true
+              | none => false
+            enumBodyOk || coreBodyOk
+        | _ => false
+      | _ => false
+    | _ => false
+  | _ => false
+
+/-- Verify that a declaration tagged in `noConfusionExt` (`Lean.isNoConfusion`) is a genuine
+    inductive or per-constructor `noConfusion` eliminator matching its kernel definition. -/
+private def isGenuineNoConfusionDecl (privEnv : Environment) (n : Name) (ci : ConstantInfo) : Bool :=
+  let kenv := privEnv.checked.get
+  match Lean.getNoConfusionInfo privEnv n with
+  | .regular .. => isGenuineNoConfusionRegularDecl privEnv n ci
+  | .perCtor arity fields =>
+    match n, ci with
+    | .str ctorName "noConfusion", .defnInfo dv =>
+      match kenv.find? ctorName with
+      | some (.ctorInfo cv) =>
+        if originModule? privEnv ctorName != originModule? privEnv n then false
+        else if fields > cv.numFields then false
+        else
+          let (nLams, rawBody) := stripLeadingLams dv.value
+          let body := unwrapIdTypeHint rawBody
+          let indNoConf := cv.induct.str "noConfusion"
+          match kenv.find? indNoConf with
+          | some indNoConfCi =>
+            nLams == arity + 1 &&
+            body.getAppFn.isConstOf indNoConf &&
+            body.getAppArgs.back! == .bvar 0 &&
+            Lean.isNoConfusion privEnv indNoConf &&
+            isGenuineNoConfusionRegularDecl privEnv indNoConf indNoConfCi
+          | none => false
+      | _ => false
+    | _, _ => false
+
 /-- Check compiler override attributes (`@[implemented_by]`, `@[extern]`, `@[csimp]`,
-    `@[init]` / `@[builtin_init]`, `@[export]`, `@[cpass]`) and custom constant-folder
-    registrations affecting declaration `n`.
+    `@[init]` / `@[builtin_init]`, `@[export]`, `@[cpass]`), custom constant-folder
+    registrations, and compiler-intrinsic tag extensions (`auxRecExt` `casesOn`,
+    `sparseCasesOnExt`, `noConfusionExt`) affecting declaration `n`.
 
     Attributes *attached to* `n` are skipped only when `n` itself lives in the toolchain
     stdlib. `@[csimp]` redirections are different: the theorem may live in an untrusted
@@ -909,6 +1252,33 @@ def checkCompilerOverridesOnDecl (privEnv : Environment) (csimpIdx : CSimpIndex)
     if csimpIdx.folderDecls.contains n then
       vs := vs.push (.compilerOverrideAttribute target n "constant_fold"
         "declaration is registered as a custom LCNF constant folder")
+    -- Compiler-intrinsic tags (`auxRecExt` `casesOn`, `sparseCasesOnExt`, `noConfusionExt`):
+    -- `ToLCNF.visitApp` ignores the kernel definition of any tagged declaration and synthesizes
+    -- compiled code directly from its type or extension metadata. Because both
+    -- `TagDeclarationExtension.isTagged` and `MapDeclarationExtension.find?` look up `n`
+    -- strictly in `n`'s own defining module, imported stdlib declarations cannot be tagged
+    -- from a downstream module; only non-stdlib declarations need structural validation.
+    if Lean.isCasesOnRecursor privEnv n then
+      let ok := match privEnv.checked.get.find? n with
+        | some ci => isGenuineCasesOnDecl privEnv n ci
+        | none => false
+      if !ok then
+        vs := vs.push (.compilerOverrideAttribute target n "casesOn_tag"
+          "declaration carries auxRecExt casesOn compiler tag without matching kernel-generated casesOn")
+    if Lean.isSparseCasesOn privEnv n then
+      let ok := match privEnv.checked.get.find? n with
+        | some ci => isGenuineSparseCasesOnDecl privEnv n ci
+        | none => false
+      if !ok then
+        vs := vs.push (.compilerOverrideAttribute target n "sparse_casesOn_tag"
+          "declaration carries sparseCasesOnExt compiler tag without matching genuine sparse/ctor eliminator")
+    if Lean.isNoConfusion privEnv n then
+      let ok := match privEnv.checked.get.find? n with
+        | some ci => isGenuineNoConfusionDecl privEnv n ci
+        | none => false
+      if !ok then
+        vs := vs.push (.compilerOverrideAttribute target n "noConfusion_tag"
+          "declaration carries noConfusionExt compiler tag without matching genuine noConfusion eliminator")
   if let some (toDecl, thmName) := csimpIdx.fromToThm[n]? then
     vs := vs.push (.compilerOverrideAttribute target n "csimp_target"
       s!"replaced in compiled code by {toDecl} via @[csimp] {thmName}")
@@ -1056,16 +1426,21 @@ private def collectIRCalleesForDecl (privEnv : Environment) (csimpIdx : CSimpInd
     let curMod? := originModule? privEnv cur
     match Lean.IR.findEnvDecl privEnv cur with
     | none =>
-      -- The compiler records the signature of every function it generates code for
-      -- (`impureSigExt`, kept in full at `OLeanLevel.private`), but a `module` file's
-      -- bodies live in its `.ir` companion and the `.olean` parts hold nothing at all
-      -- for a `private` function. A signature without a body therefore means the
-      -- compiled code exists but was not loaded: nothing can be concluded about it.
-      if !(curMod?.any isToolchainMod) &&
-          (Lean.Compiler.LCNF.getSigCore? privEnv Lean.Compiler.LCNF.impureSigExt cur).isSome then
+      -- The compiler records either the impure signature (`impureSigExt`) / LCNF bodies
+      -- (`baseExt`, `monoExt`) or, under separate compilation (`-Dcompiler.postponeCompile=true`),
+      -- a postponed compilation entry (`postponedCompileDeclsExt`, saved in `.olean.private`).
+      -- A `module` file's IR bodies live in `.ir`, and `.olean` holds nothing for `private`
+      -- functions (nor for postponed `public` functions). Any of those records without an IR
+      -- body therefore means compiled code exists or was scheduled but was not loaded.
+      let hasCompiledRecord :=
+        (Lean.Compiler.LCNF.getSigCore? privEnv Lean.Compiler.LCNF.impureSigExt cur).isSome ||
+        csimpIdx.postponedDecls.contains cur ||
+        (Lean.Compiler.LCNF.getDeclCore? privEnv Lean.Compiler.LCNF.baseExt cur).isSome ||
+        (Lean.Compiler.LCNF.getDeclCore? privEnv Lean.Compiler.LCNF.monoExt cur).isSome
+      if !(curMod?.any isToolchainMod) && hasCompiledRecord then
         vs := pushUniqueViolation vs
           (.environmentLoadFailed
-            s!"compiled IR of module {curMod?.getD .anonymous} was not loaded (declarations with a compiled signature have no IR body); the .ir companion artifact is missing")
+            s!"compiled IR of module {curMod?.getD .anonymous} was not loaded (declaration {cur} has a compiled signature/LCNF/postponed-compile record but no IR body); the .ir companion artifact is missing")
     | some irDecl =>
       let (callees, isExt, exhausted) := irDeclCallees irDecl
       if exhausted then
@@ -1094,7 +1469,7 @@ private def collectIRCalleesForDecl (privEnv : Environment) (csimpIdx : CSimpInd
           if !fIsTool || csimpIdx.fromToThm.contains f || fHasNonStdSibling then
             let f' := match f with
               | .str owner "_unsafe_rec" =>
-                if isCodegenUnsafeRec privEnv (originModule? privEnv owner) fCi then owner else f
+                if isCodegenUnsafeRec privEnv fMod? fCi then owner else f
               | _ => f
             kernelCallees := kernelCallees.push f'
         | none =>
@@ -1406,7 +1781,7 @@ def auditDeclsInEnvPure (env : Environment) (targets : Array Name)
                     (.unsafeDeclaration rootTarget recName recMod?)
                 let recOvs := checkCompilerOverridesOnDecl privEnv csimpIdx rootTarget recName
                 violations := recOvs.foldl pushUniqueViolation violations
-                if !isCodegenUnsafeRec privEnv modName? recCi then
+                if !isCodegenUnsafeRec privEnv recMod? recCi then
                   violations := pushUniqueViolation violations
                     (.compilerOverrideAttribute rootTarget n "unsafe_rec_sibling"
                       s!"compiled code for {n} is taken from sibling {recName}, which is not an equation-compiler companion ({constantInfoKind recCi}, partial={recCi.isPartial}, unsafe={recCi.isUnsafe})")
@@ -1419,7 +1794,7 @@ def auditDeclsInEnvPure (env : Environment) (targets : Array Name)
                       | .str owner "_unsafe_rec" =>
                         match kenv.find? d with
                         | some dCi =>
-                          if isCodegenUnsafeRec privEnv (originModule? privEnv owner) dCi then owner else d
+                          if isCodegenUnsafeRec privEnv (originModule? privEnv d) dCi then owner else d
                         | none => d
                       | _ => d
                     if !visited.contains d' then
@@ -1996,7 +2371,10 @@ def auditLoadedModulesIO
             inventoryViolations := pushUniqueViolation inventoryViolations
               (.environmentLoadFailed s!"inventoried constant {ci.name} missing from kernel env in {m.module}")
           | some stored =>
-            unless stored.type == ci.type && stored.value? true == ci.value? true do
+            unless stored.type == ci.type && stored.value? true == ci.value? true &&
+                stored.levelParams == ci.levelParams && stored.isUnsafe == ci.isUnsafe &&
+                stored.isPartial == ci.isPartial &&
+                constantInfoKind stored == constantInfoKind ci do
               inventoryViolations := pushUniqueViolation inventoryViolations
                 (.environmentLoadFailed s!"stored kernel declaration differs from module inventory for {ci.name} in {m.module}")
     if !inventoryViolations.isEmpty then
@@ -2681,105 +3059,139 @@ private def quotHeadStep (c : Name) (args : Array Expr) (q : Expr) (qNormal : Bo
 /-- Weak head normalizer over kernel terms that may contain loose bound variables
     (stripping `.mdata`, zeta-reducing `.letE`, beta-reducing `.lam` applications,
     reducing `.proj` of constructors, unfolding `.defnInfo` constants, and firing
-    recursor (ι) and quotient computation rules up to `fuel`).
+    recursor (ι) and quotient computation rules), threaded through a single **global**
+    step budget `fuel` so nested projections/recursors can never trigger exponential
+    step blowup (strictly $O(\text{fuel})$ total steps, total with `termination_by fuel`).
 
-    Returns the term it stopped at together with a flag that is `true` only when that
-    term is *certainly* a kernel weak-head normal form: its head is a variable, a sort, a
-    binder, a `Nat` literal, an axiom, an `opaque` constant, a type former, a
+    Returns `(term, certainWhnf, ⟨rem, hRem⟩)` where `certainWhnf` is `true` only when
+    `term` is *certainly* a kernel weak-head normal form: its head is a variable, a sort,
+    a binder, a `Nat` literal, an axiom, a non-native `opaque` constant, a type former, a
     constructor, or a projection / recursor / quotient application stuck on such a term.
-    The flag is `false` whenever the kernel might still reduce what this function gave up
-    on (exhausted fuel, a theorem it does not unfold, a `String` literal it does not
-    expand, an ill-formed application), which is what lets callers tell "irreducible"
-    from "undecided" and fail closed on the latter. -/
-private def headNormalize (kenv : Kernel.Environment) (e : Expr) (fuel : Nat := 32) :
-    Expr × Bool :=
+    `certainWhnf` is `false` whenever the kernel might still reduce what this function
+    gave up on (exhausted budget, `Lean.reduceBool` / `Lean.reduceNat` which are opaque
+    constants reduced natively by the kernel, a theorem it does not unfold, a `String`
+    literal it does not expand, or an ill-formed application), letting callers fail
+    closed on undecided terms. -/
+private def headNormalizeBudget (kenv : Kernel.Environment) (e : Expr) (fuel : Nat) :
+    Expr × Bool × { rem : Nat // rem ≤ fuel } :=
   match fuel with
-  | 0 => (e, false)
+  | 0 => (e, false, ⟨0, Nat.le_refl 0⟩)
   | fuel + 1 =>
+    let liftRem (r : { rem : Nat // rem ≤ fuel }) : { rem : Nat // rem ≤ fuel + 1 } :=
+      ⟨r.1, Nat.le_trans r.2 (Nat.le_succ _)⟩
+    let stepHere : { rem : Nat // rem ≤ fuel + 1 } := ⟨fuel, Nat.le_succ _⟩
     match e with
-    | .mdata _ inner => headNormalize kenv inner fuel
-    | .letE _ _ val body _ => headNormalize kenv (body.instantiate1 val) fuel
+    | .mdata _ inner =>
+      let (r, n, rem) := headNormalizeBudget kenv inner fuel
+      (r, n, liftRem rem)
+    | .letE _ _ val body _ =>
+      let (r, n, rem) := headNormalizeBudget kenv (body.instantiate1 val) fuel
+      (r, n, liftRem rem)
     | .proj structName idx s =>
-      let (s', sNormal) := headNormalize kenv s fuel
+      let (s', sNormal, ⟨rem1, hRem1⟩) := headNormalizeBudget kenv s fuel
       match s'.getAppFn with
       | .const ctorName _ =>
         match kenv.find? ctorName with
         | some (.ctorInfo cinfo) =>
           let sArgs := s'.getAppArgs
           if cinfo.induct == structName && cinfo.numParams + idx < sArgs.size then
-            headNormalize kenv sArgs[cinfo.numParams + idx]! fuel
-          else (e, false)
-        | _ => (e, sNormal)
-      | .lit _ => (e, false)
-      | _ => (e, sNormal)
+            let (r, n, ⟨rem2, hRem2⟩) := headNormalizeBudget kenv sArgs[cinfo.numParams + idx]! rem1
+            (r, n, ⟨rem2, Nat.le_trans hRem2 (Nat.le_trans hRem1 (Nat.le_succ _))⟩)
+          else (e, false, ⟨rem1, Nat.le_trans hRem1 (Nat.le_succ _)⟩)
+        | _ => (e, sNormal, ⟨rem1, Nat.le_trans hRem1 (Nat.le_succ _)⟩)
+      | .lit _ => (e, false, ⟨rem1, Nat.le_trans hRem1 (Nat.le_succ _)⟩)
+      | _ => (e, sNormal, ⟨rem1, Nat.le_trans hRem1 (Nat.le_succ _)⟩)
     | _ =>
       let fn := e.getAppFn
       let args := e.getAppArgs
       match fn with
-      | .mdata _ inner => headNormalize kenv (mkAppN inner args) fuel
+      | .mdata _ inner =>
+        let (r, n, rem) := headNormalizeBudget kenv (mkAppN inner args) fuel
+        (r, n, liftRem rem)
       | .lam .. =>
-        if args.isEmpty then (e, true) else headNormalize kenv (fn.beta args) fuel
+        if args.isEmpty then (e, true, stepHere)
+        else
+          let (r, n, rem) := headNormalizeBudget kenv (fn.beta args) fuel
+          (r, n, liftRem rem)
       | .letE _ _ val body _ =>
-        headNormalize kenv (mkAppN (body.instantiate1 val) args) fuel
+        let (r, n, rem) := headNormalizeBudget kenv (mkAppN (body.instantiate1 val) args) fuel
+        (r, n, liftRem rem)
       | .proj structName idx s =>
-        let (s', sNormal) := headNormalize kenv s fuel
+        let (s', sNormal, ⟨rem1, hRem1⟩) := headNormalizeBudget kenv s fuel
         match s'.getAppFn with
         | .const ctorName _ =>
           match kenv.find? ctorName with
           | some (.ctorInfo cinfo) =>
             let sArgs := s'.getAppArgs
             if cinfo.induct == structName && cinfo.numParams + idx < sArgs.size then
-              headNormalize kenv (mkAppN sArgs[cinfo.numParams + idx]! args) fuel
-            else (e, false)
-          | _ => (e, sNormal)
-        | .lit _ => (e, false)
-        | _ => (e, sNormal)
+              let (r, n, ⟨rem2, hRem2⟩) :=
+                headNormalizeBudget kenv (mkAppN sArgs[cinfo.numParams + idx]! args) rem1
+              (r, n, ⟨rem2, Nat.le_trans hRem2 (Nat.le_trans hRem1 (Nat.le_succ _))⟩)
+            else (e, false, ⟨rem1, Nat.le_trans hRem1 (Nat.le_succ _)⟩)
+          | _ => (e, sNormal, ⟨rem1, Nat.le_trans hRem1 (Nat.le_succ _)⟩)
+        | .lit _ => (e, false, ⟨rem1, Nat.le_trans hRem1 (Nat.le_succ _)⟩)
+        | _ => (e, sNormal, ⟨rem1, Nat.le_trans hRem1 (Nat.le_succ _)⟩)
       | .const c lvls =>
-        match kenv.find? c with
-        | some (.defnInfo v) =>
-          if v.levelParams.length == lvls.length then
-            headNormalize kenv ((v.value.instantiateLevelParams v.levelParams lvls).beta args) fuel
-          else (e, false)
-        | some (.recInfo v) =>
-          let (major, majorNormal) :=
-            headNormalize kenv (args[v.getMajorIdx]?.getD (.bvar 0)) fuel
-          match iotaHeadStep kenv v lvls args major majorNormal with
-          | .reduced e' => headNormalize kenv e' fuel
-          | .stuck => (e, true)
-          | .unknown => (e, false)
-        | some (.quotInfo _) =>
-          let (q, qNormal) := headNormalize kenv (args[quotMkPos c]?.getD (.bvar 0)) fuel
-          match quotHeadStep c args q qNormal with
-          | .reduced e' => headNormalize kenv e' fuel
-          | .stuck => (e, true)
-          | .unknown => (e, false)
-        | some (.thmInfo _) => (e, false)
-        | some _ => (e, true)
-        | none => (e, false)
-      | .bvar _ | .fvar _ | .sort _ | .forallE .. | .lit (.natVal _) => (e, true)
-      | _ => (e, false)
+        if c == ``Lean.reduceBool || c == ``Lean.reduceNat then
+          -- Kernel `reduce_native` reduces these `.opaqueInfo` constants via compiled code,
+          -- so they are NOT stuck in kernel WHNF; mark undecided to fail closed.
+          (e, false, stepHere)
+        else
+          match kenv.find? c with
+          | some (.defnInfo v) =>
+            if v.levelParams.length == lvls.length then
+              let (r, n, rem) :=
+                headNormalizeBudget kenv ((v.value.instantiateLevelParams v.levelParams lvls).beta args) fuel
+              (r, n, liftRem rem)
+            else (e, false, stepHere)
+          | some (.recInfo v) =>
+            let (major, majorNormal, ⟨rem1, hRem1⟩) :=
+              headNormalizeBudget kenv (args[v.getMajorIdx]?.getD (.bvar 0)) fuel
+            match iotaHeadStep kenv v lvls args major majorNormal with
+            | .reduced e' =>
+              let (r, n, ⟨rem2, hRem2⟩) := headNormalizeBudget kenv e' rem1
+              (r, n, ⟨rem2, Nat.le_trans hRem2 (Nat.le_trans hRem1 (Nat.le_succ _))⟩)
+            | .stuck => (e, true, ⟨rem1, Nat.le_trans hRem1 (Nat.le_succ _)⟩)
+            | .unknown => (e, false, ⟨rem1, Nat.le_trans hRem1 (Nat.le_succ _)⟩)
+          | some (.quotInfo _) =>
+            let (q, qNormal, ⟨rem1, hRem1⟩) :=
+              headNormalizeBudget kenv (args[quotMkPos c]?.getD (.bvar 0)) fuel
+            match quotHeadStep c args q qNormal with
+            | .reduced e' =>
+              let (r, n, ⟨rem2, hRem2⟩) := headNormalizeBudget kenv e' rem1
+              (r, n, ⟨rem2, Nat.le_trans hRem2 (Nat.le_trans hRem1 (Nat.le_succ _))⟩)
+            | .stuck => (e, true, ⟨rem1, Nat.le_trans hRem1 (Nat.le_succ _)⟩)
+            | .unknown => (e, false, ⟨rem1, Nat.le_trans hRem1 (Nat.le_succ _)⟩)
+          | some (.thmInfo _) => (e, false, stepHere)
+          | some _ => (e, true, stepHere)
+          | none => (e, false, stepHere)
+      | .bvar _ | .fvar _ | .sort _ | .forallE .. | .lit (.natVal _) => (e, true, stepHere)
+      | _ => (e, false, stepHere)
+termination_by fuel
+decreasing_by all_goals (try omega)
 
-/-- Weakly normalize an extracted `defId` argument expression (`headNormalize`) so
+/-- Weakly normalize an extracted `defId` argument expression (`headNormalizeBudget`) so
     wrapped string literals resolve cleanly. A term that cannot be normalized further is
     returned as is, and callers treat a non-literal result as a potential match. -/
-private def normalizeDefIdArg (kenv : Kernel.Environment) (e : Expr) (fuel : Nat := 32) : Expr :=
-  (headNormalize kenv e fuel).1
+private def normalizeDefIdArg (kenv : Kernel.Environment) (e : Expr) (fuel : Nat := 128) : Expr :=
+  (headNormalizeBudget kenv e fuel).1
 
 /-- Pure structural normalizer for testing whether `ty` concludes in `specClass <arg>`
     (stripping `∀` telescopes via `getForallBody` without consuming fuel, stripping
     `.mdata`, zeta-reducing `.letE`, beta-reducing `.lam`, reducing `.proj` of
     constructors, delta-unfolding `.defnInfo` heads, and firing recursor (ι) and
-    quotient computation rules up to `fuel`).
+    quotient computation rules), sharing a single **global** step budget `fuel` with
+    `headNormalizeBudget` (strictly $O(\text{fuel})$ total steps, total with
+    `termination_by fuel`).
 
     Returns `.fuelExhausted` (fail-closed) whenever it stops at a head it cannot prove
-    irreducible: when `fuel` runs out here or inside the nested `headNormalize`, at a
-    projection of a term that did not normalize to a constructor application, and at a
-    recursor or quotient application whose major premise it could not resolve.
-    `.notMatched` is reserved for heads the kernel itself is stuck on (a variable, an
-    axiom, an `opaque` constant, a type former, or a projection / recursor / quotient
-    application stuck on such a term). -/
+    irreducible: when the global step budget runs out here or inside `headNormalizeBudget`,
+    at a projection of a term that did not normalize to a constructor application, at a
+    `Lean.reduceBool` / `Lean.reduceNat` term, or at a recursor or quotient application
+    whose major premise it could not resolve. `.notMatched` is reserved for heads the
+    kernel itself is stuck on. -/
 private def specClassConclusionMatch (kenv : Kernel.Environment) (specClass : Name) (ty : Expr)
-    (fuel : Nat := 64) : SpecConclusionMatch :=
+    (fuel : Nat := 256) : SpecConclusionMatch :=
   match fuel with
   | 0 => .fuelExhausted
   | fuel + 1 =>
@@ -2789,7 +3201,7 @@ private def specClassConclusionMatch (kenv : Kernel.Environment) (specClass : Na
     | .letE _ _ val body _ =>
       specClassConclusionMatch kenv specClass (body.instantiate1 val) fuel
     | .proj structName idx s =>
-      let (s', sNormal) := headNormalize kenv s fuel
+      let (s', sNormal, ⟨rem, _hRem⟩) := headNormalizeBudget kenv s fuel
       let unresolved : SpecConclusionMatch := if sNormal then .notMatched else .fuelExhausted
       match s'.getAppFn with
       | .const ctorName _ =>
@@ -2797,7 +3209,7 @@ private def specClassConclusionMatch (kenv : Kernel.Environment) (specClass : Na
         | some (.ctorInfo cinfo) =>
           let sArgs := s'.getAppArgs
           if cinfo.induct == structName && cinfo.numParams + idx < sArgs.size then
-            specClassConclusionMatch kenv specClass sArgs[cinfo.numParams + idx]! fuel
+            specClassConclusionMatch kenv specClass sArgs[cinfo.numParams + idx]! rem
           else .fuelExhausted
         | _ => unresolved
       | .lit _ => .fuelExhausted
@@ -2814,7 +3226,7 @@ private def specClassConclusionMatch (kenv : Kernel.Environment) (specClass : Na
       | .letE _ _ val body _ =>
         specClassConclusionMatch kenv specClass (mkAppN (body.instantiate1 val) args) fuel
       | .proj structName idx s =>
-        let (s', sNormal) := headNormalize kenv s fuel
+        let (s', sNormal, ⟨rem, _hRem⟩) := headNormalizeBudget kenv s fuel
         let unresolved : SpecConclusionMatch := if sNormal then .notMatched else .fuelExhausted
         match s'.getAppFn with
         | .const ctorName _ =>
@@ -2822,7 +3234,7 @@ private def specClassConclusionMatch (kenv : Kernel.Environment) (specClass : Na
           | some (.ctorInfo cinfo) =>
             let sArgs := s'.getAppArgs
             if cinfo.induct == structName && cinfo.numParams + idx < sArgs.size then
-              specClassConclusionMatch kenv specClass (mkAppN sArgs[cinfo.numParams + idx]! args) fuel
+              specClassConclusionMatch kenv specClass (mkAppN sArgs[cinfo.numParams + idx]! args) rem
             else .fuelExhausted
           | _ => unresolved
         | .lit _ => .fuelExhausted
@@ -2838,26 +3250,29 @@ private def specClassConclusionMatch (kenv : Kernel.Environment) (specClass : Na
                 ((v.value.instantiateLevelParams v.levelParams lvls).beta args) fuel
             else .fuelExhausted
           | some (.recInfo v) =>
-            let (major, majorNormal) :=
-              headNormalize kenv (args[v.getMajorIdx]?.getD (.bvar 0)) fuel
+            let (major, majorNormal, ⟨rem, _hRem⟩) :=
+              headNormalizeBudget kenv (args[v.getMajorIdx]?.getD (.bvar 0)) fuel
             match iotaHeadStep kenv v lvls args major majorNormal with
-            | .reduced ty' => specClassConclusionMatch kenv specClass ty' fuel
+            | .reduced ty' => specClassConclusionMatch kenv specClass ty' rem
             | .stuck => .notMatched
             | .unknown => .fuelExhausted
           | some (.quotInfo _) =>
-            let (q, qNormal) := headNormalize kenv (args[quotMkPos c]?.getD (.bvar 0)) fuel
+            let (q, qNormal, ⟨rem, _hRem⟩) :=
+              headNormalizeBudget kenv (args[quotMkPos c]?.getD (.bvar 0)) fuel
             match quotHeadStep c args q qNormal with
-            | .reduced ty' => specClassConclusionMatch kenv specClass ty' fuel
+            | .reduced ty' => specClassConclusionMatch kenv specClass ty' rem
             | .stuck => .notMatched
             | .unknown => .fuelExhausted
           | none => .fuelExhausted
           | _ => .notMatched
       | _ => .notMatched
+termination_by fuel
+decreasing_by all_goals (try omega)
 
 /-- Compatibility wrapper returning `some arg` when `ty` concludes in `specClass arg`
     (or `some (.bvar 0)` on fuel exhaustion so callers fail closed). -/
 def specClassConclusionArg? (kenv : Kernel.Environment) (specClass : Name) (ty : Expr)
-    (fuel : Nat := 64) : Option Expr :=
+    (fuel : Nat := 256) : Option Expr :=
   match specClassConclusionMatch kenv specClass ty fuel with
   | .matched arg => some arg
   | .fuelExhausted => some (.bvar 0)
@@ -2970,26 +3385,39 @@ def specInstanceCandidates (privEnv : Environment) (specClass : Name) (defId : S
   return found.qsort Name.lt
 
 /-- Run a `MetaM` check so that nothing the caller did before, and nothing in the
-    caller's context, can steer `Meta.whnf`, `Meta.isDefEq`, or `Meta.synthInstance?`
-    away from the kernel's view of the environment:
+    caller's context, caches, exporting flag, or options, can steer `Meta.whnf`,
+    `Meta.isDefEq`, or `Meta.synthInstance?` away from the kernel's view of the
+    environment:
 
+    - fresh `Core.State.cache`: `Core.instantiateValueLevelParams` caches unfolded bodies
+      by `Name` alone (not keyed by environment); clearing and restoring it ensures a
+      stale `Core` cache entry can never spoof `Meta.whnf`;
+    - `Lean.withoutExporting`: forces `env.setExporting false` inside `MetaM` so private
+      and non-`@[expose]` definitions in `module` environments remain visible to
+      `Meta.whnf` and `Meta.synthInstance?`;
     - `Meta.withFreshCache`: the `whnf` / `inferType` / `synthInstance` / `defEq` caches
-      are keyed neither by `Meta.smartUnfolding` nor by the environment, so an entry
-      computed earlier in the same `MetaM` run (with smart unfolding on, or against a
-      different environment) would otherwise be replayed inside the gate;
+      are keyed neither by `Meta.smartUnfolding` nor by the environment;
     - a default `Meta.Context`: the caller's `Meta.Config` (`zeta := false`,
       `iota := false`, `proj := .no`, a reducible transparency, ...), its
-      `customCanUnfoldPredicate?`, local context, and local instances can each hide a
-      reduction the kernel performs, or supply an instance the environment lacks;
-    - `Meta.withNewMCtxDepth`: metavariables of the caller become read-only, so no
-      definitional-equality test in the gate can be satisfied by assigning one;
-    - `Lean.Meta.smartUnfolding := false`: hand-written `<name>._sunfold` sibling
-      constants are never consulted. -/
-private def withKernelFaithfulMeta (act : MetaM α) : MetaM α :=
-  Meta.withFreshCache <|
-    withReader (fun _ => ({} : Meta.Context)) <|
-      Meta.withNewMCtxDepth <|
-        withOptions (fun opts => Lean.Meta.smartUnfolding.set opts false) act
+      `customCanUnfoldPredicate?`, local context, and local instances cannot hide a
+      reduction or supply a spurious local instance;
+    - `Meta.withNewMCtxDepth`: metavariables of the caller become read-only;
+    - clean `Options` with `Lean.Meta.smartUnfolding := false`: resets caller options to
+      defaults (preserving only a generous `maxHeartbeats`) and disables `_sunfold`. -/
+private def withKernelFaithfulMeta (act : MetaM α) : MetaM α := do
+  let savedCoreCache := (← getThe Core.State).cache
+  modifyThe Core.State fun s => { s with cache := {} }
+  try
+    Lean.withoutExporting <|
+      Meta.withFreshCache <|
+        withReader (fun _ => ({} : Meta.Context)) <|
+          Meta.withNewMCtxDepth <|
+            withOptions (fun opts =>
+              let base := Lean.Meta.smartUnfolding.set ({} : Options) false
+              let hb := Lean.maxHeartbeats.get opts
+              if hb == 0 || hb > 200000 then Lean.maxHeartbeats.set base hb else base) act
+  finally
+    modifyThe Core.State fun s => { s with cache := savedCoreCache }
 
 /-- Choose a fresh throw-away name under `prefixName` guaranteed absent from `privEnv`. -/
 private def freshKernelCheckName (privEnv : Environment) (prefixName : Name) (tag : String) : Name := Id.run do
@@ -3088,7 +3516,32 @@ def specInstanceCandidatesMeta (specClass : Name) (defId : String) : MetaM (Arra
                 | Expr.lit (Literal.strVal s) => return (s == defId)
                 | _ => return true
               else
-                return false
+                -- Lean `v4.34.1`'s `Meta.whnf` `reduceNative?` returns `OfNat.ofNat ...`
+                -- for `Lean.reduceNat` without re-normalizing, leaving
+                -- `Nat.rec ... (Lean.reduceNat c)` stuck in `Meta.whnf` even though Lean's
+                -- kernel reduces `reduce_native` directly to a `Nat` literal and accepts
+                -- the declaration! Cross-check stuck recursor/quotient/projection heads
+                -- with our pure certainty-tracking normalizer (which marks `Lean.reduceBool`
+                -- / `Lean.reduceNat` undecided and fails closed).
+                let isPotentiallyStuckHead :=
+                  match body with
+                  | .proj .. => true
+                  | _ =>
+                    match body.getAppFn with
+                    | .const c _ =>
+                      c == ``Lean.reduceBool || c == ``Lean.reduceNat ||
+                      match kenv.find? c with
+                      | some (.recInfo _) | some (.quotInfo _) => true
+                      | _ => false
+                    | _ => false
+                if isPotentiallyStuckHead then
+                  match specClassConclusionMatch kenv specClass body with
+                  | .matched (.lit (.strVal s)) => return (s == defId)
+                  | .matched _ => return true
+                  | .fuelExhausted => return true
+                  | .notMatched => return false
+                else
+                  return false
         catch _ =>
           -- Fail closed if reduction throws (e.g. heartbeat/recursion limit).
           pure true

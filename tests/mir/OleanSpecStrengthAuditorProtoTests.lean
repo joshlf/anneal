@@ -23,8 +23,13 @@ Exercises `Anneal.OleanSpecStrengthAuditorProto` across:
   shadowed specification certificates, vacuous kills on unimplementable inputs, missing
   `.olean.server` parts, empty target sets, fuel exhaustion, custom compiler passes and
   constant folders, warm or caller-configured `MetaM` state, unbound expected
-  specifications, recursor- and quotient-typed instances, and `private` compiled code
-  whose `.ir` companion is missing
+  specifications, recursor- and quotient-typed instances, `private` compiled code
+  whose `.ir` companion is missing, `CSimp.ext` map-key mismatches, forged compiler-intrinsic
+  eliminator tags (`auxRecExt` `casesOn`, `sparseCasesOnExt`, `noConfusionExt`),
+  `Core.State.cache` poisoning / `withExporting` / hostile caller options, cross-module
+  partial self-recursive `_unsafe_rec` siblings, `Lean.reduceBool` / `Lean.reduceNat` and
+  `Lean.reduceNat` and exponential-branching types in the pure instance scanner, and
+  separate-compilation (`-Dcompiler.postponeCompile=true`) `module` files missing `.ir`
 
 This test file itself contains zero `sorry`, zero custom axioms, zero warnings,
 and cleans up every `/tmp/` directory in `try ... finally`.
@@ -2203,6 +2208,364 @@ run_cmd do
     , s!"B4_hb_ordinary_threshold_is_unchanged: {clampKernelHeartbeatThreshold 310 == 310}"
     , s!"B4_hb_huge_budget_is_clamped: {huge == top}" ])
 
+/-! ## Pass A4 Hardening Regressions: `CSimp` Map-Key Mismatch, Compiler-Intrinsic Tags (`casesOn` / `sparseCasesOn` / `noConfusion`), `Core.State.cache` Poisoning, Cross-Module `_unsafe_rec`, `reduceBool`/`reduceNat`, and Linear Budget -/
+
+/--
+info: A4_1a_csimp_map_key_mismatch_strict: rejected [compilerOverrideAttribute]
+A4_1a_csimp_map_key_mismatch_provisional: rejected [compilerOverrideAttribute]
+A4_1a_csimp_map_key_mismatch_ambient: rejected [compilerOverrideAttribute]
+A4_1b_csimp_map_key_mismatch_stdlib_target: rejected [compilerOverrideAttribute]
+A4_2a_fake_casesOn_tag_strict: rejected [compilerOverrideAttribute]
+A4_2a_fake_casesOn_tag_provisional: rejected [compilerOverrideAttribute]
+A4_2a_fake_casesOn_tag_ambient: rejected [compilerOverrideAttribute]
+A4_2b_fake_sparseCasesOn_tag_strict: rejected [compilerOverrideAttribute]
+A4_2b_fake_sparseCasesOn_tag_provisional: rejected [compilerOverrideAttribute]
+A4_2b_fake_sparseCasesOn_tag_ambient: rejected [compilerOverrideAttribute]
+A4_2c_fake_noConfusion_tag_strict: rejected [compilerOverrideAttribute]
+A4_2c_fake_noConfusion_tag_provisional: rejected [compilerOverrideAttribute]
+A4_2c_fake_noConfusion_tag_ambient: rejected [compilerOverrideAttribute]
+A4_2d_forged_ctor_elim_tag: rejected [compilerOverrideAttribute]
+A4_2e_forged_regular_noConfusion_tag: rejected [compilerOverrideAttribute]
+A4_2f_overwritten_user_noConfusion_info: rejected [compilerOverrideAttribute]
+A4_2g_forged_casesOn_suffix_tag: rejected [compilerOverrideAttribute]
+A4_2h_genuine_inductive_eliminators_control: ok []
+A4_4a_cross_module_partial_self_rec_stdlib_strict: rejected [compilerOverrideAttribute]
+A4_4b_cross_module_partial_self_rec_stdlib_ambient: rejected [compilerOverrideAttribute]
+A4_4c_same_module_genuine_rec_control: ok []
+-/
+#guard_msgs in
+run_cmd do
+  let strict : AuditPolicy := { checkStatementOrigin := false }
+  let prov : AuditPolicy := { checkStatementOrigin := false, allowProvisionalNative := true }
+  let amb : AuditPolicy := { checkStatementOrigin := false, forbidAmbientModuleOverrides := true }
+  let mut lines : List String := []
+  let need (label : String) (found : Bool) : CommandElabM Unit :=
+    unless found do throwError "{label}: the expected compiler-override violation is missing"
+  let slowDef (name : String) : String :=
+    s!"def {name} : Nat → Bool\n  | 0 => true\n  | n + 1 => {name} n\n"
+
+  -- A4-1: `CSimp.replaceConstant?` indexes `st.map` by map key while ignoring
+  -- `ent.fromDeclName`. Storing a genuine stdlib triple `(List.map, List.mapTR,
+  -- List.map_eq_mapTR)` under a different map key redirected `a4CsVictim` (and
+  -- `List.reverse`) while inheriting the stdlib triple exemption.
+  let env1a ← elabInSandbox <|
+    "open Lean\n" ++
+    slowDef "a4Slow1" ++
+    "@[noinline] def a4CsVictim.{u, v} {α : Type u} {β : Type v} (_ : α → β) (_ : List α) : List β := []\n" ++
+    "run_cmd modifyEnv fun env => Lean.Compiler.CSimp.ext.modifyState env fun st =>\n" ++
+    "  { st with map := st.map.insert `a4CsVictim { fromDeclName := ``List.map, toDeclName := ``List.mapTR, thmName := ``List.map_eq_mapTR } }\n" ++
+    "def a4CsCaller : List Nat := a4CsVictim (· + 1) [1, 2]\n" ++
+    "theorem a4CsKernel : a4CsCaller = [] := rfl\n" ++
+    "theorem a4CsNative : (a4Slow1 2000000 && (a4CsCaller == [2, 3])) = true := by native_decide\n"
+  let v1aStrict ← liftIO <| auditDeclsInEnvIO env1a #[`a4CsKernel] strict
+  let v1aProv ← liftIO <| auditDeclsInEnvIO env1a #[`a4CsNative] prov
+  let v1aAmb ← liftIO <| auditDeclsInEnvIO env1a #[`a4CsKernel] amb
+  need "A4_1a_strict" (hasOverrideViolation v1aStrict `a4CsVictim "csimp_target")
+  need "A4_1a_prov" (hasOverrideViolation v1aProv `a4CsVictim "csimp_target")
+  need "A4_1a_amb" (hasOverrideViolation v1aAmb `a4CsVictim "csimp_target")
+  let env1b ← elabInSandbox <|
+    "open Lean\n" ++
+    "run_cmd modifyEnv fun env => Lean.Compiler.CSimp.ext.modifyState env fun st =>\n" ++
+    "  { st with map := st.map.insert ``List.reverse { fromDeclName := ``List.map, toDeclName := ``List.mapTR, thmName := ``List.map_eq_mapTR } }\n" ++
+    "theorem a4RevThm : List.reverse [1, 2] = [2, 1] := rfl\n"
+  let v1b ← liftIO <| auditDeclsInEnvIO env1b #[`a4RevThm] strict
+  need "A4_1b" (hasOverrideViolation v1b ``List.reverse "csimp_target")
+  lines := lines ++
+    [ formatVerdictTags "A4_1a_csimp_map_key_mismatch_strict" v1aStrict
+    , formatVerdictTags "A4_1a_csimp_map_key_mismatch_provisional" v1aProv
+    , formatVerdictTags "A4_1a_csimp_map_key_mismatch_ambient" v1aAmb
+    , formatVerdictTags "A4_1b_csimp_map_key_mismatch_stdlib_target" v1b ]
+
+  -- A4-2a/b/c: compiler-intrinsic eliminator tags (`auxRecExt` `casesOn`,
+  -- `sparseCasesOnExt`, `noConfusionExt`). `ToLCNF.visitApp` ignores the kernel body of
+  -- any tagged declaration and synthesizes compiled code from its type or extension
+  -- metadata, making kernel (`= 1`) and compiled `native_decide` (`== 1000` / `== 999`)
+  -- disagree with zero attributes or overrides.
+  let env2a ← elabInSandbox <|
+    "open Lean\n" ++
+    slowDef "a4Slow2a" ++
+    "def A4Fake.casesOn {motive : Bool → Sort u} (t : Bool) (hTrue : motive true) (hDef : motive t) : motive t := hDef\n" ++
+    "run_cmd modifyEnv fun env => Lean.markAuxRecursor env `A4Fake.casesOn\n" ++
+    "@[noinline] def a4CasesCaller (b : Bool) : Nat := A4Fake.casesOn (motive := fun _ => Nat) b 1000 1\n" ++
+    "theorem a4CasesKernel : a4CasesCaller true = 1 := rfl\n" ++
+    "theorem a4CasesNative : (a4Slow2a 2000000 && (a4CasesCaller true == 1000)) = true := by native_decide\n"
+  let v2aStrict ← liftIO <| auditDeclsInEnvIO env2a #[`a4CasesKernel] strict
+  let v2aProv ← liftIO <| auditDeclsInEnvIO env2a #[`a4CasesNative] prov
+  let v2aAmb ← liftIO <| auditDeclsInEnvIO env2a #[`a4CasesKernel] amb
+  need "A4_2a_strict" (hasOverrideViolation v2aStrict `A4Fake.casesOn "casesOn_tag")
+  need "A4_2a_prov" (hasOverrideViolation v2aProv `A4Fake.casesOn "casesOn_tag")
+  need "A4_2a_amb" (hasOverrideViolation v2aAmb `A4Fake.casesOn "casesOn_tag")
+
+  let env2b ← elabInSandbox <|
+    "open Lean\n" ++
+    slowDef "a4Slow2b" ++
+    "def a4SparseFake {motive : Bool → Sort u} (t : Bool) (hTrue : motive true) (hDef : motive t) : motive t := hDef\n" ++
+    "run_cmd modifyEnv fun env => Lean.markSparseCasesOn env `a4SparseFake\n" ++
+    "@[noinline] def a4SparseCaller (b : Bool) : Nat := a4SparseFake (motive := fun _ => Nat) b 1000 1\n" ++
+    "theorem a4SparseKernel : a4SparseCaller true = 1 := rfl\n" ++
+    "theorem a4SparseNative : (a4Slow2b 2000000 && (a4SparseCaller true == 1000)) = true := by native_decide\n"
+  let v2bStrict ← liftIO <| auditDeclsInEnvIO env2b #[`a4SparseKernel] strict
+  let v2bProv ← liftIO <| auditDeclsInEnvIO env2b #[`a4SparseNative] prov
+  let v2bAmb ← liftIO <| auditDeclsInEnvIO env2b #[`a4SparseKernel] amb
+  need "A4_2b_strict" (hasOverrideViolation v2bStrict `a4SparseFake "sparse_casesOn_tag")
+  need "A4_2b_prov" (hasOverrideViolation v2bProv `a4SparseFake "sparse_casesOn_tag")
+  need "A4_2b_amb" (hasOverrideViolation v2bAmb `a4SparseFake "sparse_casesOn_tag")
+
+  let env2c ← elabInSandbox <|
+    "open Lean\n" ++
+    slowDef "a4Slow2c" ++
+    "def a4NoConfFake (a b : Nat) : Nat := a\n" ++
+    "run_cmd modifyEnv fun env => Lean.markNoConfusion env `a4NoConfFake (.perCtor 1 0)\n" ++
+    "@[noinline] def a4NoConfCaller : Nat := a4NoConfFake 1 999\n" ++
+    "theorem a4NoConfKernel : a4NoConfCaller = 1 := rfl\n" ++
+    "theorem a4NoConfNative : (a4Slow2c 2000000 && (a4NoConfCaller == 999)) = true := by native_decide\n"
+  let v2cStrict ← liftIO <| auditDeclsInEnvIO env2c #[`a4NoConfKernel] strict
+  let v2cProv ← liftIO <| auditDeclsInEnvIO env2c #[`a4NoConfNative] prov
+  let v2cAmb ← liftIO <| auditDeclsInEnvIO env2c #[`a4NoConfKernel] amb
+  need "A4_2c_strict" (hasOverrideViolation v2cStrict `a4NoConfFake "noConfusion_tag")
+  need "A4_2c_prov" (hasOverrideViolation v2cProv `a4NoConfFake "noConfusion_tag")
+  need "A4_2c_amb" (hasOverrideViolation v2cAmb `a4NoConfFake "noConfusion_tag")
+
+  -- A4-2d: forged `<Ctor>.elim` carrying `markSparseCasesOn` whose body ignores the constructor.
+  let env2d ← elabInSandbox <|
+    "open Lean\n" ++
+    "inductive A4PairTag where | a (x : Nat) | b (y : Nat)\n" ++
+    "def A4PairTag.a.elimFake (x : Nat) : Nat := x\n" ++
+    "run_cmd modifyEnv fun env => Lean.markSparseCasesOn env `A4PairTag.a.elimFake\n" ++
+    "theorem a4ElimFakeThm : A4PairTag.a.elimFake 1 = 1 := rfl\n"
+  let v2d ← liftIO <| auditDeclsInEnvIO env2d #[`a4ElimFakeThm] strict
+  need "A4_2d" (hasOverrideViolation v2d `A4PairTag.a.elimFake "sparse_casesOn_tag")
+
+  -- A4-2e/f/g: forged `.regular` `noConfusion`, overwritten `NoConfusionInfo` on a genuine
+  -- same-module inductive, and forged `casesOn_1` suffix tag.
+  let env2e ← elabInSandbox <|
+    "open Lean\n" ++
+    "def A4FakeNc.noConfusion (a b : Nat) : Nat := a\n" ++
+    "run_cmd modifyEnv fun env => Lean.markNoConfusion env `A4FakeNc.noConfusion (.regular 4 1 2)\n" ++
+    "theorem a4RegNcThm : A4FakeNc.noConfusion 1 2 = 1 := rfl\n"
+  let v2e ← liftIO <| auditDeclsInEnvIO env2e #[`a4RegNcThm] strict
+  need "A4_2e" (hasOverrideViolation v2e `A4FakeNc.noConfusion "noConfusion_tag")
+
+  let env2f ← elabInSandbox <|
+    "open Lean\n" ++
+    "inductive A4OverNc where | a | b\n" ++
+    "run_cmd modifyEnv fun env => Lean.markNoConfusion env `A4OverNc.noConfusion (.perCtor 1 0)\n" ++
+    "theorem a4OverNcThm (h : A4OverNc.a = A4OverNc.b) : False := A4OverNc.noConfusion h\n"
+  let v2f ← liftIO <| auditDeclsInEnvIO env2f #[`a4OverNcThm] strict
+  need "A4_2f" (hasOverrideViolation v2f `A4OverNc.noConfusion "noConfusion_tag")
+
+  let env2g ← elabInSandbox <|
+    "open Lean\n" ++
+    "def A4FakeMut.casesOn_1 {motive : Bool → Sort u} (t : Bool) (hTrue : motive true) (hDef : motive t) : motive t := hDef\n" ++
+    "run_cmd modifyEnv fun env => Lean.markAuxRecursor env `A4FakeMut.casesOn_1\n" ++
+    "theorem a4MutCasesThm : A4FakeMut.casesOn_1 (motive := fun _ => Nat) true 1000 1 = 1 := rfl\n"
+  let v2g ← liftIO <| auditDeclsInEnvIO env2g #[`a4MutCasesThm] strict
+  need "A4_2g" (hasOverrideViolation v2g `A4FakeMut.casesOn_1 "casesOn_tag")
+
+  -- A4-2h: positive control exercising genuine user `casesOn`, `.elim`, `_sparseCasesOn`,
+  -- `noConfusion`, and per-constructor `noConfusion` in both strict and ambient modes.
+  let env2h ← elabInSandbox <|
+    "inductive A4Color where\n" ++
+    "  | red\n" ++
+    "  | green (n : Nat)\n" ++
+    "  | blue (a b : Nat)\n" ++
+    "  | yellow\n" ++
+    "def a4ColorScore (c : A4Color) : Nat :=\n" ++
+    "  match c with\n" ++
+    "  | .green n => n\n" ++
+    "  | _ => 0\n" ++
+    "theorem a4ColorDisjoint (h : A4Color.red = A4Color.yellow) : False := A4Color.noConfusion h\n" ++
+    "theorem a4ColorInj (h : A4Color.green 1 = A4Color.green 2) : 1 = 2 := A4Color.green.noConfusion h id\n" ++
+    "theorem a4ColorControl : a4ColorScore (.green 7) = 7 := rfl\n"
+  let v2hStrict ← liftIO <| auditDeclsInEnvIO env2h #[`a4ColorControl, `a4ColorDisjoint, `a4ColorInj] strict
+  let v2hAmb ← liftIO <| auditDeclsInEnvIO env2h #[`a4ColorControl, `a4ColorDisjoint, `a4ColorInj] amb
+  liftIO <| assertAuditOk "A4_2h_genuine_inductive_eliminators_control_strict" v2hStrict
+  liftIO <| assertAuditOk "A4_2h_genuine_inductive_eliminators_control_ambient" v2hAmb
+
+  -- A4-4: cross-module partial self-recursive `_unsafe_rec` sibling on a stdlib function
+  -- (`Bool.xor._unsafe_rec` declared in the local module). Previously the closure walk
+  -- passed the parent's `modName?` instead of `recMod?` to `isCodegenUnsafeRec`, making
+  -- `originModule? env parent == modName?` tautologically `true` in strict mode.
+  let env4a ← elabInSandbox <|
+    "open Lean in\n" ++
+    "run_cmd do\n" ++
+    "  let env ← getEnv\n" ++
+    "  let some pci := env.checked.get.find? ``Bool.xor | throwError \"missing Bool.xor\"\n" ++
+    "  let recName := ``Bool.xor |>.str \"_unsafe_rec\"\n" ++
+    "  let boolTy := mkConst ``Bool\n" ++
+    "  let body := mkLambda `a .default boolTy <| mkLambda `b .default boolTy <|\n" ++
+    "    mkApp4 (mkConst ``Bool.casesOn [Level.succ Level.zero])\n" ++
+    "      (mkLambda `x .default boolTy boolTy) (mkConst ``Bool.false)\n" ++
+    "      (mkConst ``Bool.true) (mkApp2 (mkConst recName) (mkBVar 1) (mkBVar 0))\n" ++
+    "  let defn : DefinitionVal := { name := recName, levelParams := pci.levelParams, type := pci.type, value := body, hints := .opaque, safety := .partial, all := [recName] }\n" ++
+    "  match env.addDeclCore 0 512 (Declaration.mutualDefnDecl [defn]) none with\n" ++
+    "  | .error _ => throwError \"addDeclCore failed\"\n" ++
+    "  | .ok env' => setEnv env'\n" ++
+    "theorem a4XorThm : Bool.xor true true = false := rfl\n"
+  let v4aStrict ← liftIO <| auditDeclsInEnvIO env4a #[`a4XorThm] strict
+  let v4aAmb ← liftIO <| auditDeclsInEnvIO env4a #[`a4XorThm] amb
+  need "A4_4a_strict" (hasOverrideViolation v4aStrict ``Bool.xor "unsafe_rec_sibling")
+  need "A4_4b_ambient" (hasOverrideViolation v4aAmb ``Bool.xor "unsafe_rec_sibling")
+
+  let env4c ← elabInSandbox <|
+    "def a4RecCtrl : Nat → Nat\n  | 0 => 0\n  | n + 1 => a4RecCtrl n + 1\n" ++
+    "theorem a4RecCtrlThm : a4RecCtrl 3 = 3 := rfl\n"
+  let v4c ← liftIO <| auditDeclsInEnvIO env4c #[`a4RecCtrlThm] strict
+  liftIO <| assertAuditOk "A4_4c_same_module_genuine_rec_control" v4c
+
+  lines := lines ++
+    [ formatVerdictTags "A4_2a_fake_casesOn_tag_strict" v2aStrict
+    , formatVerdictTags "A4_2a_fake_casesOn_tag_provisional" v2aProv
+    , formatVerdictTags "A4_2a_fake_casesOn_tag_ambient" v2aAmb
+    , formatVerdictTags "A4_2b_fake_sparseCasesOn_tag_strict" v2bStrict
+    , formatVerdictTags "A4_2b_fake_sparseCasesOn_tag_provisional" v2bProv
+    , formatVerdictTags "A4_2b_fake_sparseCasesOn_tag_ambient" v2bAmb
+    , formatVerdictTags "A4_2c_fake_noConfusion_tag_strict" v2cStrict
+    , formatVerdictTags "A4_2c_fake_noConfusion_tag_provisional" v2cProv
+    , formatVerdictTags "A4_2c_fake_noConfusion_tag_ambient" v2cAmb
+    , formatVerdictTags "A4_2d_forged_ctor_elim_tag" v2d
+    , formatVerdictTags "A4_2e_forged_regular_noConfusion_tag" v2e
+    , formatVerdictTags "A4_2f_overwritten_user_noConfusion_info" v2f
+    , formatVerdictTags "A4_2g_forged_casesOn_suffix_tag" v2g
+    , formatVerdictTags "A4_2h_genuine_inductive_eliminators_control" v2hAmb
+    , formatVerdictTags "A4_4a_cross_module_partial_self_rec_stdlib_strict" v4aStrict
+    , formatVerdictTags "A4_4b_cross_module_partial_self_rec_stdlib_ambient" v4aAmb
+    , formatVerdictTags "A4_4c_same_module_genuine_rec_control" v4c ]
+  logInfo (String.intercalate "\n" lines)
+
+/--
+info: A4_3a_core_cache_instLevelValue_poisoning: rejected [specInstanceAmbiguous]
+A4_3b_withExporting_private_alias: rejected [specInstanceAmbiguous]
+A4_3c_hostile_caller_options_control: ok []
+A4_5a_reduceBool_pure_scanner: pure=#[a4RbStrong, a4RbWeak] meta=#[a4RbStrong, a4RbWeak]
+A4_5b_reduceNat_kernel_meta_asymmetry: pure=#[a4RnKernelWeak, a4RnStrong] meta=#[a4RnKernelWeak, a4RnStrong] gate: rejected [specInstanceAmbiguous]
+A4_7_exponential_branching_type_linear_budget: listed=true fast=true
+-/
+#guard_msgs in
+run_cmd do
+  let mut lines : List String := []
+  let header := "open Trusted.VerificationResult Anneal.OleanSpecStrengthAuditorProto\n"
+  let strongInst (name defId : String) : String :=
+    s!"instance {name} : ItemSpec \"{defId}\" := \{ pre := fxfsVmoSubslicePre, post := fxfsVmoSubslicePost }\n"
+  let certInst (name defId : String) : String :=
+    s!"instance {name} : ItemMultiMutantCert \"{defId}\" := \{ cert := fxfsVmoSubsliceMultiCert }\n"
+
+  -- A4-3a: `Core.State.cache.instLevelValue` is keyed by `Name` alone and is NOT cleared by
+  -- `Meta.withFreshCache`. A stale entry for an alias hid a weak shadowing instance from
+  -- `specInstanceCandidatesMeta`.
+  let env3a ← elabInSandbox <|
+    header ++
+    "abbrev a4CoreCacheAlias : Type 1 := ItemSpec \"proto::a4cc\"\n" ++
+    "instance a4CCWeak : a4CoreCacheAlias := { pre := fun _ => True }\n" ++
+    strongInst "a4CCStrong" "proto::a4cc" ++ certInst "a4CCCert" "proto::a4cc"
+  let v3a ← withSandboxEnv env3a do
+    let savedCoreCache := (← getThe Core.State).cache
+    try
+      modifyThe Core.State fun s =>
+        { s with cache := { s.cache with
+            instLevelValue := s.cache.instLevelValue.insert `a4CoreCacheAlias
+              ([], mkConst ``PUnit [Level.succ (Level.succ Level.zero)]) } }
+      auditItemSpecStrengthBySynth "proto::a4cc"
+    finally
+      modifyThe Core.State fun s => { s with cache := savedCoreCache }
+  liftIO <| assertRejectedWithTag "A4_3a_core_cache_instLevelValue_poisoning" v3a "specInstanceAmbiguous"
+
+  -- A4-3b: caller invoking gate under `Lean.withExporting (isExporting := true)` with a
+  -- `private` alias hiding a weak shadowing instance.
+  let env3b ← elabInSandbox <|
+    header ++
+    "private abbrev a4PrivAlias : Type 1 := ItemSpec \"proto::a4exp\"\n" ++
+    "instance a4ExpWeak : a4PrivAlias := { pre := fun _ => True }\n" ++
+    strongInst "a4ExpStrong" "proto::a4exp" ++ certInst "a4ExpCert" "proto::a4exp"
+  let v3b ← withSandboxEnv env3b do
+    Lean.withExporting (isExporting := true) <|
+      auditItemSpecStrengthBySynth "proto::a4exp"
+  liftIO <| assertRejectedWithTag "A4_3b_withExporting_private_alias" v3b "specInstanceAmbiguous"
+
+  -- A4-3c: hostile caller `Options` (`synthInstance.maxHeartbeats := 1`) reset to defaults
+  -- inside `withKernelFaithfulMeta` so a genuine unique spec still passes.
+  let env3c ← elabInSandbox <|
+    header ++ strongInst "a4OptStrong" "proto::a4opt" ++ certInst "a4OptCert" "proto::a4opt"
+  let v3c ← withSandboxEnv env3c do
+    withOptions (fun opts => opts.set `synthInstance.maxHeartbeats (1 : Nat)) <|
+      auditItemSpecStrengthBySynth "proto::a4opt"
+  liftIO <| assertAuditOk "A4_3c_hostile_caller_options_control" v3c
+
+  -- A4-5a/b: `Lean.reduceBool` and `Lean.reduceNat` are `.opaqueInfo` in `Init.Core` yet
+  -- reduce natively in Lean's kernel (`reduce_native`). The pure normalizer must treat
+  -- them as undecided (fail-closed) rather than certainly stuck.
+  let env5a ← elabInSandbox <|
+    header ++
+    "def a4RbFlag : Bool := true\n" ++
+    "set_option linter.deprecated false in\n" ++
+    "def a4RbWeak : Bool.rec (motive := fun _ => Type 1) PUnit (ItemSpec \"proto::a4rb\") (Lean.reduceBool a4RbFlag) :=\n" ++
+    "  { pre := fun _ => True }\n" ++
+    "def a4RbStrong : ItemSpec \"proto::a4rb\" := { pre := fxfsVmoSubslicePre, post := fxfsVmoSubslicePost }\n"
+  let pure5a := specInstanceCandidates (env5a.setExporting false) ``ItemSpec "proto::a4rb"
+  let meta5a ← withSandboxEnv env5a <| specInstanceCandidatesMeta ``ItemSpec "proto::a4rb"
+
+  -- A4-5b: Lean `v4.34.1`'s `Meta.whnf` `reduceNative?` returns `OfNat.ofNat ...` for
+  -- `Lean.reduceNat` without re-normalizing, leaving `Nat.rec ... (Lean.reduceNat a4RnVal)`
+  -- stuck in `Meta.whnf`, whereas Lean's kernel reduces `reduce_native` directly to `.lit 0`
+  -- and accepts `a4RnKernelWeak` as a valid `ItemSpec "proto::a4rn"`. Both the pure scanner
+  -- AND `specInstanceCandidatesMeta` / `auditItemSpecStrengthBySynth` must catch it.
+  let env5b ← elabInSandbox <|
+    header ++
+    "def a4RnVal : Nat := 0\n" ++
+    "open Lean in\n" ++
+    "run_cmd do\n" ++
+    "  let env ← getEnv\n" ++
+    "  let specTy := mkApp (mkConst ``ItemSpec) (mkStrLit \"proto::a4rn\")\n" ++
+    "  let punitTy := mkConst ``PUnit [Level.succ (Level.succ Level.zero)]\n" ++
+    "  let natTy := mkConst ``Nat\n" ++
+    "  let rnExpr := mkApp (mkConst ``Lean.reduceNat) (mkConst `a4RnVal)\n" ++
+    "  let recTy := mkApp4 (mkConst ``Nat.rec [Level.succ (Level.succ (Level.succ Level.zero))])\n" ++
+    "    (mkLambda `n .default natTy (.sort (Level.succ (Level.succ Level.zero))))\n" ++
+    "    specTy\n" ++
+    "    (mkLambda `n .default natTy (mkLambda `ih .default (.sort (Level.succ (Level.succ Level.zero))) punitTy))\n" ++
+    "    rnExpr\n" ++
+    "  let instVal := mkApp3 (mkConst ``ItemSpec.mk) (mkStrLit \"proto::a4rn\")\n" ++
+    "    (mkConst ``fxfsVmoSubslicePre) (mkConst ``fxfsVmoSubslicePost)\n" ++
+    "  let decl := Declaration.defnDecl {\n" ++
+    "    name := `a4RnKernelWeak, levelParams := [], type := recTy, value := instVal,\n" ++
+    "    hints := .regular 0, safety := .safe }\n" ++
+    "  match env.addDeclCore 0 512 decl none with\n" ++
+    "  | .error _ => throwError \"kernel unexpectedly rejected a4RnKernelWeak\"\n" ++
+    "  | .ok env' => setEnv env'\n" ++
+    strongInst "a4RnStrong" "proto::a4rn" ++ certInst "a4RnCert" "proto::a4rn"
+  let pure5b := specInstanceCandidates (env5b.setExporting false) ``ItemSpec "proto::a4rn"
+  let meta5b ← withSandboxEnv env5b <| specInstanceCandidatesMeta ``ItemSpec "proto::a4rn"
+  let gate5b ← withSandboxEnv env5b <| auditItemSpecStrengthBySynth "proto::a4rn"
+  liftIO <| assertRejectedWithTag "A4_5b_reduceNat_gate" gate5b "specInstanceAmbiguous"
+
+  -- A4-7 (closes B4 Residual #12): 26-deep binary-branching recursor chain (`2^26 > 67M`
+  -- steps under per-branch fuel). With a single global step budget `headNormalizeBudget`
+  -- bounds total work linearly (O(fuel)), finishing instantaneously and failing closed.
+  let mut expDefs := "def a4Exp0 : Bool := true\n"
+  for i in [1:27] do
+    expDefs := expDefs ++ s!"noncomputable def a4Exp{i} : Bool := Bool.rec a4Exp{i - 1} a4Exp{i - 1} a4Exp{i - 1}\n"
+  let env7 ← elabInSandbox <|
+    header ++ expDefs ++
+    "noncomputable def a4ExpWeak : Bool.rec (motive := fun _ => Type 1) PUnit (ItemSpec \"proto::a4exp26\") a4Exp26 :=\n" ++
+    "  { pre := fun _ => True }\n"
+  let t0 ← liftIO IO.monoNanosNow
+  let pure7 := specInstanceCandidates (env7.setExporting false) ``ItemSpec "proto::a4exp26"
+  let t1 ← liftIO IO.monoNanosNow
+  let elapsedMs := (t1 - t0) / 1000000
+  let listed7 : Bool := pure7.contains `a4ExpWeak
+  let fast7 : Bool := decide (elapsedMs < 2000)
+  unless listed7 && fast7 do
+    throwError "A4_7 failed: listed={listed7}, elapsedMs={elapsedMs}, pure7={pure7}"
+
+  lines := lines ++
+    [ formatVerdictTags "A4_3a_core_cache_instLevelValue_poisoning" v3a
+    , formatVerdictTags "A4_3b_withExporting_private_alias" v3b
+    , formatVerdictTags "A4_3c_hostile_caller_options_control" v3c
+    , s!"A4_5a_reduceBool_pure_scanner: pure={pure5a} meta={meta5a}"
+    , s!"A4_5b_reduceNat_kernel_meta_asymmetry: pure={pure5b} meta={meta5b} {formatVerdictTags "gate" gate5b}"
+    , s!"A4_7_exponential_branching_type_linear_budget: listed={listed7} fast={fast7}" ]
+  logInfo (String.intercalate "\n" lines)
+
 /-! ### Type-Level Refutations for Discriminating Kills and Deterministic Specifications -/
 
 /-- A specification that is satisfiable at input `0` but unimplementable everywhere else.
@@ -3075,6 +3438,121 @@ tmp_clean=true
 #guard_msgs in
 run_cmd do
   let summary ← liftIO runDiskB4Regressions
+  logInfo summary
+
+/-! ## Pass A4 On-Disk Regressions: Separate-Compilation (`-Dcompiler.postponeCompile=true`) Missing `.ir` -/
+
+/-- Compile a temporary `.lean` file with extra `lean` CLI arguments (such as
+    `-Dcompiler.postponeCompile=true`). -/
+def compileTempModuleWithArgs (rootDir leanPath oleanPath : System.FilePath)
+    (extraArgs : Array String) : IO Unit := do
+  let leanBin := (← Lean.getBuildDir) / "bin" / "lean"
+  let out ← IO.Process.output {
+    cmd := leanBin.toString
+    args := extraArgs ++ #["-R", rootDir.toString, "-o", oleanPath.toString, leanPath.toString]
+  }
+  unless out.exitCode == 0 do
+    throw <| IO.userError
+      s!"lean compilation failed for {leanPath} (exit {out.exitCode}):\n{out.stdout}\n{out.stderr}"
+
+/-- On-disk regression for pass A4 (`A4-6`): compiling a `module` file in separate-compilation
+    mode (`-Dcompiler.postponeCompile=true`) records pending declarations in
+    `postponedCompileDeclsExt` (inside `.olean.private`) while emitting NO `impureSigExt`
+    entries, NO IR `extern` stubs, and NO `.ir` / `.ir.sig` files until `leanir` runs.
+    Uses `Init.Prelude` only and deletes its `/tmp/` directory in `finally`. -/
+def runDiskA4Regressions : IO String := do
+  let pid ← IO.Process.getPID
+  let ns ← IO.monoNanosNow
+  let tmpDir : System.FilePath := s!"/tmp/anneal_olean_proto_a4_{pid}_{ns}"
+  IO.FS.createDirAll tmpDir
+  let body : IO (Array String) := do
+    let mut lines : Array String := #[]
+    let pol : AuditPolicy := { checkStatementOrigin := false }
+    let ppOlean := tmpDir / "ProtoDiskPostponed.olean"
+    IO.FS.writeFile (tmpDir / "ProtoDiskPostponed.lean") <|
+      "module\n" ++
+      "prelude\n" ++
+      "public import Init.Prelude\n" ++
+      "unsafe def ppEvil (a b : Nat) : Nat := Nat.succ (Nat.add a b)\n" ++
+      "@[noinline, implemented_by ppEvil] def ppAdd (a b : Nat) : Nat := Nat.add a b\n" ++
+      "section\n" ++
+      "@[local csimp] theorem ppRedir : Eq Nat.add ppAdd := Eq.refl Nat.add\n" ++
+      "public def ppPublicCaller (a b : Nat) : Nat := Nat.add a b\n" ++
+      "def ppPrivCaller (a b : Nat) : Nat := Nat.add a b\n" ++
+      "end\n" ++
+      "public theorem ppPublicClaim :\n" ++
+      "    Eq (ppPublicCaller Nat.zero Nat.zero) (ppPublicCaller Nat.zero Nat.zero) := Eq.refl _\n" ++
+      "theorem ppPrivClaim :\n" ++
+      "    Eq (ppPrivCaller Nat.zero Nat.zero) (ppPrivCaller Nat.zero Nat.zero) := Eq.refl _\n"
+    compileTempModuleWithArgs tmpDir (tmpDir / "ProtoDiskPostponed.lean") ppOlean
+      #["-Dcompiler.postponeCompile=true"]
+    let ppPrivClaim := Lean.mkPrivateNameCore `ProtoDiskPostponed `ppPrivClaim
+    let ppPrivCaller := Lean.mkPrivateNameCore `ProtoDiskPostponed `ppPrivCaller
+    -- Theorem-only control compiled with `-Dcompiler.postponeCompile=true` (no user compiled defs).
+    let thmOnlyOlean := tmpDir / "ProtoDiskPostponedThmOnly.olean"
+    IO.FS.writeFile (tmpDir / "ProtoDiskPostponedThmOnly.lean") <|
+      "module\n" ++
+      "prelude\n" ++
+      "public import Init.Prelude\n" ++
+      "public theorem ppThmOnlyClaim : Eq Nat.zero Nat.zero := Eq.refl _\n"
+    compileTempModuleWithArgs tmpDir (tmpDir / "ProtoDiskPostponedThmOnly.lean") thmOnlyOlean
+      #["-Dcompiler.postponeCompile=true"]
+
+    -- Confirm the separate-compilation artifact shape: `.olean` + `.olean.private` exist,
+    -- `.ir` + `.ir.sig` do not, and `impureSigExt` is empty for both callers.
+    if (← (ppOlean.withExtension "ir").pathExists) || (← (ppOlean.withExtension "ir.sig").pathExists) then
+      throw <| IO.userError "expected -Dcompiler.postponeCompile=true to omit .ir and .ir.sig"
+    let postEnv ← withExtraSearchPaths [tmpDir] do
+      Lean.importModules #[{ module := `ProtoDiskPostponed }, { module := `ProtoDiskPostponedThmOnly }] {}
+        (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := OLeanLevel.private)
+    let privPost := postEnv.setExporting false
+    unless (Lean.Compiler.LCNF.getSigCore? privPost Lean.Compiler.LCNF.impureSigExt `ppPublicCaller).isNone &&
+        (Lean.Compiler.LCNF.getSigCore? privPost Lean.Compiler.LCNF.impureSigExt ppPrivCaller).isNone &&
+        (Lean.IR.findEnvDecl privPost `ppPublicCaller).isNone &&
+        (Lean.IR.findEnvDecl privPost ppPrivCaller).isNone do
+      throw <| IO.userError "expected postponed module to have neither impureSigExt nor IR decls"
+
+    let vPurePub := auditDeclsInEnvPure postEnv #[`ppPublicClaim] pol
+    let vPurePriv := auditDeclsInEnvPure postEnv #[ppPrivClaim] pol
+    let vPureThmOnly := auditDeclsInEnvPure postEnv #[`ppThmOnlyClaim] pol
+    assertRejectedWithTag "A4_6a_postponed_public_pure_auditor" vPurePub "environmentLoadFailed"
+    assertRejectedWithTag "A4_6b_postponed_private_pure_auditor" vPurePriv "environmentLoadFailed"
+    assertAuditOk "A4_6e_postponed_thm_only_pure_control" vPureThmOnly
+
+    let loadedLenient ← loadOrThrow "A4_6_lenient_load" #[`ProtoDiskPostponed]
+      { pol with requirePrivateOleanForModuleSystem := false } [tmpDir]
+    let vLenientPub ← auditLoadedModulesIO loadedLenient pol (explicitTargets? := some #[`ppPublicClaim])
+    let vLenientPriv ← auditLoadedModulesIO loadedLenient pol (explicitTargets? := some #[ppPrivClaim])
+    assertRejectedWithTag "A4_6c_postponed_public_lenient_load_strict_audit" vLenientPub "environmentLoadFailed"
+    assertRejectedWithTag "A4_6d_postponed_private_lenient_load_strict_audit" vLenientPriv "environmentLoadFailed"
+
+    let vEndToEnd ← auditCompiledModulesIO #[`ProtoDiskPostponed] pol
+      (explicitTargets? := some #[`ppPublicClaim]) (extraSearchPaths := [tmpDir])
+    assertRejectedWithTag "A4_6f_postponed_end_to_end_missing_ir" vEndToEnd "missingPrivateArtifact"
+
+    lines := lines.push (formatVerdictTags "A4_6a_postponed_public_pure_auditor" vPurePub)
+    lines := lines.push (formatVerdictTags "A4_6b_postponed_private_pure_auditor" vPurePriv)
+    lines := lines.push (formatVerdictTags "A4_6c_postponed_public_lenient_load_strict_audit" vLenientPub)
+    lines := lines.push (formatVerdictTags "A4_6d_postponed_private_lenient_load_strict_audit" vLenientPriv)
+    lines := lines.push (formatVerdictTags "A4_6e_postponed_thm_only_pure_control" vPureThmOnly)
+    lines := lines.push (formatVerdictTags "A4_6f_postponed_end_to_end_missing_ir" vEndToEnd)
+    return lines
+  let lines ← try body finally IO.FS.removeDirAll tmpDir
+  let clean := !(← tmpDir.pathExists)
+  return String.intercalate "\n" (lines.push s!"tmp_clean={clean}").toList
+
+/--
+info: A4_6a_postponed_public_pure_auditor: rejected [environmentLoadFailed]
+A4_6b_postponed_private_pure_auditor: rejected [environmentLoadFailed]
+A4_6c_postponed_public_lenient_load_strict_audit: rejected [environmentLoadFailed]
+A4_6d_postponed_private_lenient_load_strict_audit: rejected [environmentLoadFailed]
+A4_6e_postponed_thm_only_pure_control: ok []
+A4_6f_postponed_end_to_end_missing_ir: rejected [missingPrivateArtifact]
+tmp_clean=true
+-/
+#guard_msgs in
+run_cmd do
+  let summary ← liftIO runDiskA4Regressions
   logInfo summary
 
 /-! ## Real Compiled `.olean` Zero-FP Audits & Measured Latency Benchmarks -/
