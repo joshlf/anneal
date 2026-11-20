@@ -16,7 +16,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import update_root_manifest as manifest
+# Let `python3 -m unittest ci/test_update_root_manifest.py` (run from the
+# repository root) import the sibling module, as `unittest discover -s ci` does.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import update_root_manifest as manifest  # noqa: E402
 
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent

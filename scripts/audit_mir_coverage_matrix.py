@@ -121,14 +121,14 @@ RUSTC_VARIANTS_FOLDED_ONTO_CONSTRUCTORS: tuple[dict[str, Any], ...] = (
 LINTRINSIC_FILE = "theory/Anneal/Mir/AdtAndControl.lean"
 # Combined syntactic surface = the Stage-A "Total Denominator" column of the nightly report:
 #     94  Trusted.MirAst constructors        (`anneal_mir_ast.total_variants`, (a) above)
-#   + 30  Stage-1 `LIntrinsicOp` constructors (`stage1_lowered_lintrinsic_op_variants`)
+#   + 37  Stage-1 `LIntrinsicOp` constructors (`stage1_lowered_lintrinsic_op_variants`)
 #   + 250 MiniRust spec items                 (`minirust_authority.spec_items_total`,
 #                                              `minirust/coverage.json` items_by_kind)
 #   + 608 vendored LeanMiri `Miri.*` files    (`lean_miri_authority.vendored_miri_files`)
-#   = 982, comfortably above the >= 231 surface expected by the Episode 2 brief. The floor is
+#   = 989, comfortably above the >= 231 surface expected by the Episode 2 brief. The floor is
 # the current value, so a silently collapsed denominator (e.g. a missing `coverage.json`)
 # fails the audit; lower it only together with an intentional surface change.
-COMBINED_SURFACE_FLOOR = 982
+COMBINED_SURFACE_FLOOR = 989
 COMBINED_SURFACE_BRIEF_EXPECTATION = 231
 
 # ---------------------------------------------------------------------------

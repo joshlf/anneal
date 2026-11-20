@@ -2833,6 +2833,68 @@ theorem lookupCallee_nil
   unfold lookupCallee
   rw [resolveCalleeBodyAndArgs?_nil]
 
+/-- `defPath` is one of the four `core::ptr` raw-pointer access functions
+(`core::ptr::{read_unaligned, write_unaligned, read_volatile, write_volatile}`) that `Trusted`'s
+`evalTerminator` evaluates inline when a direct call to it has no linked callee body
+(`evalUnlinkedPtrAccessCall?`). Such a call is not an external call, so the modular call rules
+below (which step a call as `MirStepNode.extCall`) exclude these four paths. -/
+def isUnlinkedPtrAccessDefPath (defPath : DefPath) : Bool :=
+  stringEq defPath "core::ptr::read_unaligned" ||
+    stringEq defPath "core::ptr::write_unaligned" ||
+    stringEq defPath "core::ptr::read_volatile" ||
+    stringEq defPath "core::ptr::write_volatile"
+
+/-- Componentwise form of `isUnlinkedPtrAccessDefPath defPath = false`. -/
+theorem isUnlinkedPtrAccessDefPath_eq_false_iff {defPath : DefPath} :
+    isUnlinkedPtrAccessDefPath defPath = false ↔
+      stringEq defPath "core::ptr::read_unaligned" = false ∧
+      stringEq defPath "core::ptr::write_unaligned" = false ∧
+      stringEq defPath "core::ptr::read_volatile" = false ∧
+      stringEq defPath "core::ptr::write_volatile" = false := by
+  unfold isUnlinkedPtrAccessDefPath
+  cases stringEq defPath "core::ptr::read_unaligned" <;>
+    cases stringEq defPath "core::ptr::write_unaligned" <;>
+    cases stringEq defPath "core::ptr::read_volatile" <;>
+    cases stringEq defPath "core::ptr::write_volatile" <;> decide
+
+/-- `evalUnlinkedPtrAccessCall?` evaluates a call inline exactly when its `DefPath` is one of the
+four unlinked `core::ptr` raw-pointer access functions; on every other `DefPath` it is `none`. -/
+theorem evalUnlinkedPtrAccessCall?_eq_none_of_not_ptrAccess
+    (s : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (h : isUnlinkedPtrAccessDefPath target.defPath = false) :
+    evalUnlinkedPtrAccessCall? s target bodyLocalDecls bodyLayouts argOps argVals locals'
+      destination targetBb = none := by
+  obtain ⟨h1, h2, h3, h4⟩ := isUnlinkedPtrAccessDefPath_eq_false_iff.mp h
+  simp only [evalUnlinkedPtrAccessCall?, h1, h2, h3, h4]
+
+/-- `evalUnlinkedPtrAccessCall?` evaluates every call to one of the four unlinked `core::ptr`
+raw-pointer access functions inline. -/
+theorem evalUnlinkedPtrAccessCall?_isSome_of_ptrAccess
+    (s : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (h : isUnlinkedPtrAccessDefPath target.defPath = true) :
+    (evalUnlinkedPtrAccessCall? s target bodyLocalDecls bodyLayouts argOps argVals locals'
+      destination targetBb).isSome = true := by
+  unfold isUnlinkedPtrAccessDefPath at h
+  unfold evalUnlinkedPtrAccessCall?
+  cases h1 : stringEq target.defPath "core::ptr::read_unaligned" with
+  | true => rfl
+  | false =>
+    cases h2 : stringEq target.defPath "core::ptr::write_unaligned" with
+    | true => rfl
+    | false =>
+      cases h3 : stringEq target.defPath "core::ptr::read_volatile" with
+      | true => rfl
+      | false =>
+        cases h4 : stringEq target.defPath "core::ptr::write_volatile" with
+        | true => rfl
+        | false =>
+          rw [h1, h2, h3, h4] at h
+          exact absurd h (by decide)
+
 /--
 Compositional 1-step modular call rule (`PureMirModularConverges.call_modular`,
 `FF-2.2` Section 2 & 4):
@@ -2918,7 +2980,8 @@ theorem PureMirModularConverges.call_modular
           writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv ∧
           PureMirModularConverges contract body callees
             { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
-    (h_not_intrinsic : classifyRustIntrinsic? defPath = none := by decide) :
+    (h_not_intrinsic : classifyRustIntrinsic? defPath = none := by decide)
+    (h_not_ptr_access : isUnlinkedPtrAccessDefPath defPath = false := by decide) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   intro m hm
   have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
@@ -2963,6 +3026,9 @@ theorem PureMirModularConverges.call_modular
       rw [h_not_exact]
       dsimp only [evalDirectRustIntrinsic?]
       rw [h_not_intrinsic]
+      obtain ⟨hP1, hP2, hP3, hP4⟩ :=
+        isUnlinkedPtrAccessDefPath_eq_false_iff.mp h_not_ptr_access
+      simp only [evalUnlinkedPtrAccessCall?, hP1, hP2, hP3, hP4]
   rw [h_step_eq]
   dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map, mirModularWP,
     MirCallContract.toCallContract]
@@ -3043,7 +3109,8 @@ theorem PureMirModularConverges.call_poly_external_spec
               sidecarBody extraPre extraPost)
             body callees
             { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
-    (h_not_intrinsic : classifyRustIntrinsic? targetDefPath = none := by decide) :
+    (h_not_intrinsic : classifyRustIntrinsic? targetDefPath = none := by decide)
+    (h_not_ptr_access : isUnlinkedPtrAccessDefPath targetDefPath = false := by decide) :
     PureMirModularConverges
       (polyExternalSpecCallContract targetDefPath expectedTypeArgs
         sidecarBody extraPre extraPost)
@@ -3063,6 +3130,7 @@ theorem PureMirModularConverges.call_poly_external_spec
       · rw [hp.1.2.1, hm.2.2.1])
     h_after
     h_not_intrinsic
+    h_not_ptr_access
   rcases h_unwind with hu | hu | h_nu
   · exact Or.inl hu
   · exact Or.inr (Or.inl hu)
@@ -3121,7 +3189,8 @@ theorem PureMirModularConverges.call_external_spec
             (externalSpecCallContract targetDefPath sidecarBody extraPre extraPost)
             body callees
             { bb := targetBb, stmtIdx := 0, env := updatedEnv } post tr')
-    (h_not_intrinsic : classifyRustIntrinsic? targetDefPath = none := by decide) :
+    (h_not_intrinsic : classifyRustIntrinsic? targetDefPath = none := by decide)
+    (h_not_ptr_access : isUnlinkedPtrAccessDefPath targetDefPath = false := by decide) :
     PureMirModularConverges
       (externalSpecCallContract targetDefPath sidecarBody extraPre extraPost)
       body callees ps post traitImpls := by
@@ -3168,6 +3237,9 @@ theorem PureMirModularConverges.call_external_spec
       rw [h_not_exact]
       dsimp only [evalDirectRustIntrinsic?]
       rw [h_not_intrinsic]
+      obtain ⟨hP1, hP2, hP3, hP4⟩ :=
+        isUnlinkedPtrAccessDefPath_eq_false_iff.mp h_not_ptr_access
+      simp only [evalUnlinkedPtrAccessCall?, hP1, hP2, hP3, hP4]
   rw [h_step_eq]
   dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map, mirModularWP,
     MirCallContract.toCallContract]
@@ -3252,7 +3324,8 @@ theorem PureMirModularConverges.call_intrinsic
         (pureRustIntrinsicContract pointerBytes ubChecksEnabled rtEval)
         body callees
         { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
-    (h_not_intrinsic : classifyRustIntrinsic? defPath = none := by decide) :
+    (h_not_intrinsic : classifyRustIntrinsic? defPath = none := by decide)
+    (h_not_ptr_access : isUnlinkedPtrAccessDefPath defPath = false := by decide) :
     PureMirModularConverges
       (pureRustIntrinsicContract pointerBytes ubChecksEnabled rtEval)
       body callees ps post traitImpls := by
@@ -3275,6 +3348,7 @@ theorem PureMirModularConverges.call_intrinsic
       subst h_eq
       exact ⟨updatedEnv, h_wr, h_after⟩)
     h_not_intrinsic
+    h_not_ptr_access
 
 /--
 1-step modular call rule parameterized by a subsumed sub-contract `subContract`
@@ -3357,7 +3431,8 @@ theorem PureMirModularConverges.call_modular_sub
           writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv ∧
           PureMirModularConverges contract body callees
             { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
-    (h_not_intrinsic : classifyRustIntrinsic? defPath = none := by decide) :
+    (h_not_intrinsic : classifyRustIntrinsic? defPath = none := by decide)
+    (h_not_ptr_access : isUnlinkedPtrAccessDefPath defPath = false := by decide) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   refine PureMirModularConverges.call_modular
     h_phase h_bb h_end h_term h_dst_pure h_args_pure h_def h_args h_lookup
@@ -3371,6 +3446,7 @@ theorem PureMirModularConverges.call_modular_sub
       h_panic_stack m panicMem hm ((h_sub _ (h_contract_pre m hm)).2 _ hp))
     h_after
     h_not_intrinsic
+    h_not_ptr_access
   rcases h_contract_panic with hu | hu | h_np
   · exact Or.inl hu
   · exact Or.inr (Or.inl hu)
@@ -3432,7 +3508,8 @@ theorem PureMirModularConverges.call_poly_external_spec_sub
           writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv ∧
           PureMirModularConverges contract body callees
             { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
-    (h_not_intrinsic : classifyRustIntrinsic? targetDefPath = none := by decide) :
+    (h_not_intrinsic : classifyRustIntrinsic? targetDefPath = none := by decide)
+    (h_not_ptr_access : isUnlinkedPtrAccessDefPath targetDefPath = false := by decide) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   refine PureMirModularConverges.call_modular_sub h_sub
     h_phase h_bb h_end h_term h_dst_pure h_args_pure h_def h_args
@@ -3449,6 +3526,7 @@ theorem PureMirModularConverges.call_poly_external_spec_sub
       · rw [hp.1.2.1, hm.2.2.1])
     h_after
     h_not_intrinsic
+    h_not_ptr_access
   rcases h_unwind with hu | hu | h_nu
   · exact Or.inl hu
   · exact Or.inr (Or.inl hu)
@@ -3510,7 +3588,8 @@ theorem PureMirModularConverges.call_external_spec_sub
           writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv ∧
           PureMirModularConverges contract body callees
             { bb := targetBb, stmtIdx := 0, env := updatedEnv } post tr')
-    (h_not_intrinsic : classifyRustIntrinsic? targetDefPath = none := by decide) :
+    (h_not_intrinsic : classifyRustIntrinsic? targetDefPath = none := by decide)
+    (h_not_ptr_access : isUnlinkedPtrAccessDefPath targetDefPath = false := by decide) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   intro m hm
   have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
@@ -3555,6 +3634,9 @@ theorem PureMirModularConverges.call_external_spec_sub
       rw [h_not_exact]
       dsimp only [evalDirectRustIntrinsic?]
       rw [h_not_intrinsic]
+      obtain ⟨hP1, hP2, hP3, hP4⟩ :=
+        isUnlinkedPtrAccessDefPath_eq_false_iff.mp h_not_ptr_access
+      simp only [evalUnlinkedPtrAccessCall?, hP1, hP2, hP3, hP4]
   rw [h_step_eq]
   dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map, mirModularWP,
     MirCallContract.toCallContract]
@@ -3653,7 +3735,8 @@ theorem PureMirModularConverges.call_intrinsic_sub
     (h_after :
       PureMirModularConverges contract body callees
         { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
-    (h_not_intrinsic : classifyRustIntrinsic? defPath = none := by decide) :
+    (h_not_intrinsic : classifyRustIntrinsic? defPath = none := by decide)
+    (h_not_ptr_access : isUnlinkedPtrAccessDefPath defPath = false := by decide) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   refine PureMirModularConverges.call_modular_sub
     (calleePost := (· = retVal))
@@ -3674,6 +3757,7 @@ theorem PureMirModularConverges.call_intrinsic_sub
       subst h_eq
       exact ⟨updatedEnv, h_wr, h_after⟩)
     h_not_intrinsic
+    h_not_ptr_access
 
 theorem bswapLoop_eq_pureBswapLoop (n b a : Nat) :
     bswapLoop n b a = pureBswapLoop n b a := by
@@ -3726,7 +3810,7 @@ theorem evalDirectRustIntrinsic_bswap_u32
       decls layouts argOps [.scalar ⟨v, 4⟩] locals' dst targetBb unwind =
     some (writeIntrinsicReturn s locals' dst targetBb (.scalar ⟨pureBswapLoop 4 v 0, 4⟩)) := by
   rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ (rk := .bswap) rfl (by rintro ⟨⟩) (by rintro ⟨⟩)
-    (by rintro ⟨⟩)]
+    (by rintro ⟨⟩) rfl]
   change some (writeIntrinsicScalarResult s locals' dst targetBb (evalBswap ⟨v, 4⟩)) = _
   rw [evalBswap_u32_eq hv]
 
@@ -3741,7 +3825,7 @@ theorem evalDirectRustIntrinsic_ctpop_u32
       decls layouts argOps [.scalar ⟨v, 4⟩] locals' dst targetBb unwind =
     some (writeIntrinsicReturn s locals' dst targetBb (.scalar ⟨pureCtpopLoop 32 v, 4⟩)) := by
   rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ (rk := .ctpop) rfl (by rintro ⟨⟩) (by rintro ⟨⟩)
-    (by rintro ⟨⟩)]
+    (by rintro ⟨⟩) rfl]
   change some (writeIntrinsicScalarResult s locals' dst targetBb (evalCtpop ⟨v, 4⟩)) = _
   rw [evalCtpop_u32_eq hv]
 
@@ -8125,6 +8209,10 @@ theorem PureMirModularConverges.call_modular_resolved
     (h_not_intrinsic :
       resolvedTarget.isIndirect = true ∨
       classifyRustIntrinsic? resolvedTarget.defPath = none := by
+      first | exact Or.inr (by decide) | exact Or.inl (by decide))
+    (h_not_ptr_access :
+      resolvedTarget.isIndirect = true ∨
+      isUnlinkedPtrAccessDefPath resolvedTarget.defPath = false := by
       first | exact Or.inr (by decide) | exact Or.inl (by decide)) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   intro m hm
@@ -8177,8 +8265,13 @@ theorem PureMirModularConverges.call_modular_resolved
         rcases h_not_intrinsic with h_ind_t | h_ni
         · rw [h_ind] at h_ind_t
           exact False.elim (Bool.false_ne_true h_ind_t)
-        · dsimp only [evalDirectRustIntrinsic?]
-          rw [h_ni]
+        · rcases h_not_ptr_access with h_ind_t | h_np
+          · rw [h_ind] at h_ind_t
+            exact False.elim (Bool.false_ne_true h_ind_t)
+          · dsimp only [evalDirectRustIntrinsic?]
+            rw [h_ni]
+            obtain ⟨hP1, hP2, hP3, hP4⟩ := isUnlinkedPtrAccessDefPath_eq_false_iff.mp h_np
+            simp only [evalUnlinkedPtrAccessCall?, hP1, hP2, hP3, hP4]
   rw [h_step_eq]
   dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map, mirModularWP,
     MirCallContract.toCallContract]
@@ -8281,7 +8374,8 @@ theorem PureMirModularConverges.call_poly_external_spec_pureTarget
           writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv ∧
           PureMirModularConverges contract body callees
             { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
-    (h_not_intrinsic : classifyRustIntrinsic? targetDefPath = none := by decide) :
+    (h_not_intrinsic : classifyRustIntrinsic? targetDefPath = none := by decide)
+    (h_not_ptr_access : isUnlinkedPtrAccessDefPath targetDefPath = false := by decide) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   have h_rt := resolvePureCalleeTarget_ok_target h_res_pure
   subst h_rt
@@ -8305,6 +8399,7 @@ theorem PureMirModularConverges.call_poly_external_spec_pureTarget
       · rw [hp.1.2.1, hm.2.2.1])
     h_after
     (Or.inr h_not_intrinsic)
+    (Or.inr h_not_ptr_access)
   rcases h_unwind with hu | hu | h_nu | ⟨cleanupBb, h_cl, h_clean_wp⟩
   · exact Or.inl hu
   · exact Or.inr (Or.inl hu)
@@ -8374,7 +8469,8 @@ theorem PureMirModularConverges.call_intrinsic_pureTarget
     (h_after :
       PureMirModularConverges contract body callees
         { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
-    (h_not_intrinsic : classifyRustIntrinsic? defPath = none := by decide) :
+    (h_not_intrinsic : classifyRustIntrinsic? defPath = none := by decide)
+    (h_not_ptr_access : isUnlinkedPtrAccessDefPath defPath = false := by decide) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   have h_rt := resolvePureCalleeTarget_ok_target h_res_pure
   subst h_rt
@@ -8403,6 +8499,7 @@ theorem PureMirModularConverges.call_intrinsic_pureTarget
       subst h_eq
       exact ⟨updatedEnv, h_wr, h_after⟩)
     (Or.inr h_not_intrinsic)
+    (Or.inr h_not_ptr_access)
 
 /--
 1-step inline `core::intrinsics::exact_div` call rule supporting both constant
@@ -16059,16 +16156,23 @@ theorem evalTerminator_return_withCallees (c₂ : CalleeEnv) (s : MachineState) 
          subst_vars
          rfl))
 
+/-- A direct call whose `DefPath` is neither a compiler intrinsic
+(`classifyRustIntrinsic? target.defPath = none`) nor one of the four unlinked `core::ptr`
+raw-pointer access functions (`isUnlinkedPtrAccessDefPath target.defPath = false`) is not evaluated
+inline by `evalDirectRustIntrinsic?`. -/
 theorem evalDirectRustIntrinsic?_eq_none_of_classify {s : MachineState}
     {currentBody : Option CapturedMir} {target : ResolvedCallTarget}
     {bodyLocalDecls : List LocalDecl} {bodyLayouts : LayoutTable} {argOps : List Operand}
     {argVals : List Value} {locals' : List LocalSlot} {destination : Place}
     {targetBb : BasicBlockIdx} {unwind : UnwindAction}
-    (h : classifyRustIntrinsic? target.defPath = none) :
+    (h : classifyRustIntrinsic? target.defPath = none)
+    (h_ptr : isUnlinkedPtrAccessDefPath target.defPath = false) :
     evalDirectRustIntrinsic? s currentBody target bodyLocalDecls bodyLayouts argOps argVals
       locals' destination targetBb unwind = none := by
   unfold evalDirectRustIntrinsic?
   rw [h]
+  exact evalUnlinkedPtrAccessCall?_eq_none_of_not_ptrAccess s target bodyLocalDecls bodyLayouts
+    argOps argVals locals' destination targetBb h_ptr
 
 theorem writeIntrinsicReturn_withCalleeCtx
     (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
@@ -16378,6 +16482,341 @@ theorem evalWriteBytesCall_withCallees
       locals' destination targetBb,
     MirStepNode.mapMem_comp, MirStepNode.mapMem_comp, Memory.withCallees_comp_withCalleeCtx]
 
+/-! ### Raw-pointer memory access calls under callee-context replacement
+
+The volatile memory intrinsics (`evalVolatileMemIntrinsicCall`) and the unlinked `core::ptr`
+raw-pointer access functions (`evalUnlinkedPtrAccessCall?`) never consult `Memory.callees`,
+`Memory.activeCallee`, or `Memory.traitImpls`: they commute with `Memory.withCalleeCtx`. -/
+
+private theorem finishRawPtrCallAction_withCalleeCtx
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
+    (s : MachineState) (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) (act : RawPtrCallAction) :
+    finishRawPtrCallAction (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
+        locals' destination targetBb act =
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
+        (finishRawPtrCallAction s locals' destination targetBb act) := by
+  cases act with
+  | fault kind => rfl
+  | ret retVal =>
+    exact writeIntrinsicReturn_withCalleeCtx c ac ti s locals' destination targetBb retVal
+  | retBorrows borrows' retVal =>
+    exact writeIntrinsicReturn_withCalleeCtx c ac ti
+      { s with memory := { s.memory with borrows := borrows' } }
+      locals' destination targetBb retVal
+  | retStack borrows' locals₄ callStack' callerLocals' retVal =>
+    exact writeIntrinsicReturn_withCalleeCtx c ac ti
+      { s with
+        memory :=
+          { s.memory with
+            borrows := borrows'
+            callStack := callStack'
+            callerLocals := callerLocals' } }
+      locals₄ destination targetBb retVal
+
+/-- A step function that commutes with every `Memory.withCalleeCtx` replacement fixes its own
+callee context. -/
+private theorem calleeCtx_preserved_of_withCalleeCtx {f : MachineState → MirStepNode}
+    (h : ∀ (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
+        (s : MachineState),
+      f (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s) =
+        MirStepNode.mapMem (Memory.withCalleeCtx c ac ti) (f s))
+    (s : MachineState) :
+    f s =
+      MirStepNode.mapMem
+        (Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.traitImpls)
+        (f s) := by
+  have h' := h s.memory.callees s.memory.activeCallee s.memory.traitImpls s
+  rw [MachineState.withCalleeCtx_self] at h'
+  exact h'
+
+/-- A step function that commutes with every `Memory.withCalleeCtx` replacement commutes with
+`Memory.withCallees`. -/
+private theorem withCallees_of_withCalleeCtx {f : MachineState → MirStepNode}
+    (h : ∀ (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
+        (s : MachineState),
+      f (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s) =
+        MirStepNode.mapMem (Memory.withCalleeCtx c ac ti) (f s))
+    (c₂ : CalleeEnv) (s : MachineState) :
+    f (MachineState.mapMem (Memory.withCallees c₂) s) =
+      MirStepNode.mapMem (Memory.withCallees c₂) (f s) := by
+  have hp := calleeCtx_preserved_of_withCalleeCtx h s
+  rw [MachineState.withCallees_eq_withCalleeCtx, h _ _ _ s]
+  calc MirStepNode.mapMem
+          (Memory.withCalleeCtx c₂ s.memory.activeCallee s.memory.traitImpls) (f s)
+      _ = MirStepNode.mapMem
+            (Memory.withCalleeCtx c₂ s.memory.activeCallee s.memory.traitImpls)
+            (MirStepNode.mapMem
+              (Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.traitImpls)
+              (f s)) := congrArg _ hp
+      _ = MirStepNode.mapMem (Memory.withCallees c₂)
+            (MirStepNode.mapMem
+              (Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.traitImpls)
+              (f s)) := by
+        rw [MirStepNode.mapMem_comp, MirStepNode.mapMem_comp,
+          Memory.withCallees_comp_withCalleeCtx]
+      _ = MirStepNode.mapMem (Memory.withCallees c₂) (f s) := (congrArg _ hp).symm
+
+theorem evalRawPtrLoadCall_withCalleeCtx
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
+    (isVolatile requiresAlign : Bool) (s : MachineState) (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    evalRawPtrLoadCall isVolatile requiresAlign
+        (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
+        target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb =
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
+        (evalRawPtrLoadCall isVolatile requiresAlign s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb) := by
+  unfold evalRawPtrLoadCall
+  exact finishRawPtrCallAction_withCalleeCtx c ac ti s locals' destination targetBb _
+
+theorem evalRawPtrLoadCall_calleeCtx_preserved
+    (isVolatile requiresAlign : Bool) (s : MachineState) (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    evalRawPtrLoadCall isVolatile requiresAlign s target bodyLocalDecls bodyLayouts
+        argOps argVals locals' destination targetBb =
+      MirStepNode.mapMem
+        (Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.traitImpls)
+        (evalRawPtrLoadCall isVolatile requiresAlign s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb) :=
+  calleeCtx_preserved_of_withCalleeCtx
+    (f := fun s => evalRawPtrLoadCall isVolatile requiresAlign s target bodyLocalDecls
+      bodyLayouts argOps argVals locals' destination targetBb)
+    (fun c ac ti s => evalRawPtrLoadCall_withCalleeCtx c ac ti isVolatile requiresAlign s target
+      bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb) s
+
+theorem evalRawPtrLoadCall_withCallees
+    (c₂ : CalleeEnv) (isVolatile requiresAlign : Bool) (s : MachineState)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) :
+    evalRawPtrLoadCall isVolatile requiresAlign (MachineState.mapMem (Memory.withCallees c₂) s)
+        target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb =
+      MirStepNode.mapMem (Memory.withCallees c₂)
+        (evalRawPtrLoadCall isVolatile requiresAlign s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb) :=
+  withCallees_of_withCalleeCtx
+    (f := fun s => evalRawPtrLoadCall isVolatile requiresAlign s target bodyLocalDecls
+      bodyLayouts argOps argVals locals' destination targetBb)
+    (fun c ac ti s => evalRawPtrLoadCall_withCalleeCtx c ac ti isVolatile requiresAlign s target
+      bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb) c₂ s
+
+theorem evalRawPtrStoreCall_withCalleeCtx
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
+    (isVolatile requiresAlign : Bool) (s : MachineState) (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    evalRawPtrStoreCall isVolatile requiresAlign
+        (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
+        target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb =
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
+        (evalRawPtrStoreCall isVolatile requiresAlign s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb) := by
+  unfold evalRawPtrStoreCall
+  exact finishRawPtrCallAction_withCalleeCtx c ac ti s locals' destination targetBb _
+
+theorem evalRawPtrStoreCall_calleeCtx_preserved
+    (isVolatile requiresAlign : Bool) (s : MachineState) (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    evalRawPtrStoreCall isVolatile requiresAlign s target bodyLocalDecls bodyLayouts
+        argOps argVals locals' destination targetBb =
+      MirStepNode.mapMem
+        (Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.traitImpls)
+        (evalRawPtrStoreCall isVolatile requiresAlign s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb) :=
+  calleeCtx_preserved_of_withCalleeCtx
+    (f := fun s => evalRawPtrStoreCall isVolatile requiresAlign s target bodyLocalDecls
+      bodyLayouts argOps argVals locals' destination targetBb)
+    (fun c ac ti s => evalRawPtrStoreCall_withCalleeCtx c ac ti isVolatile requiresAlign s target
+      bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb) s
+
+theorem evalRawPtrStoreCall_withCallees
+    (c₂ : CalleeEnv) (isVolatile requiresAlign : Bool) (s : MachineState)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) :
+    evalRawPtrStoreCall isVolatile requiresAlign (MachineState.mapMem (Memory.withCallees c₂) s)
+        target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb =
+      MirStepNode.mapMem (Memory.withCallees c₂)
+        (evalRawPtrStoreCall isVolatile requiresAlign s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb) :=
+  withCallees_of_withCalleeCtx
+    (f := fun s => evalRawPtrStoreCall isVolatile requiresAlign s target bodyLocalDecls
+      bodyLayouts argOps argVals locals' destination targetBb)
+    (fun c ac ti s => evalRawPtrStoreCall_withCalleeCtx c ac ti isVolatile requiresAlign s target
+      bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb) c₂ s
+
+theorem evalVolatileCopyMemoryCall_withCalleeCtx
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
+    (nonOverlapping : Bool) (s : MachineState) (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    evalVolatileCopyMemoryCall nonOverlapping
+        (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
+        target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb =
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
+        (evalVolatileCopyMemoryCall nonOverlapping s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb) := by
+  unfold evalVolatileCopyMemoryCall
+  have hPlan :
+      volatileCopyPlan nonOverlapping
+        (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s).memory.borrows
+        (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s).memory.globals
+        (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s).memory.callStack
+        target bodyLocalDecls bodyLayouts argOps argVals locals' =
+      volatileCopyPlan nonOverlapping s.memory.borrows s.memory.globals s.memory.callStack
+        target bodyLocalDecls bodyLayouts argOps argVals locals' := rfl
+  rw [hPlan]
+  cases volatileCopyPlan nonOverlapping s.memory.borrows s.memory.globals s.memory.callStack
+      target bodyLocalDecls bodyLayouts argOps argVals locals' with
+  | fault kind => rfl
+  | noCopy =>
+    exact writeIntrinsicReturn_withCalleeCtx c ac ti s locals' destination targetBb .unit
+  | nonOverlapping srcOp dstOp srcVal dstVal count =>
+    dsimp only
+    rw [evalCopyNonOverlappingWithCount_withCalleeCtx c ac ti s srcOp dstOp bodyLocalDecls
+      bodyLayouts srcVal dstVal count locals']
+    exact finishMemIntrinsicCall_mapMem_withCalleeCtx c ac ti s _ destination targetBb
+  | withinLocal srcPtr dstPtr srcEntry dstEntry byteCount =>
+    exact finishRawPtrCallAction_withCalleeCtx c ac ti s locals' destination targetBb _
+
+theorem evalVolatileSetMemoryCall_withCalleeCtx
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
+    (s : MachineState) (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    evalVolatileSetMemoryCall (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
+        target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb =
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
+        (evalVolatileSetMemoryCall s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb) := by
+  unfold evalVolatileSetMemoryCall
+  have hPlan :
+      volatileSetPlan
+        (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s).memory.borrows
+        (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s).memory.globals
+        (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s).memory.callStack
+        target bodyLocalDecls bodyLayouts argOps argVals locals' =
+      volatileSetPlan s.memory.borrows s.memory.globals s.memory.callStack
+        target bodyLocalDecls bodyLayouts argOps argVals locals' := rfl
+  rw [hPlan]
+  cases volatileSetPlan s.memory.borrows s.memory.globals s.memory.callStack
+      target bodyLocalDecls bodyLayouts argOps argVals locals' with
+  | fault kind => rfl
+  | noWrite =>
+    exact writeIntrinsicReturn_withCalleeCtx c ac ti s locals' destination targetBb .unit
+  | writeBytes =>
+    exact evalWriteBytesCall_withCalleeCtx c ac ti s target bodyLocalDecls bodyLayouts argOps
+      argVals locals' destination targetBb
+
+/-- **Volatile memory intrinsics commute with callee-context replacement.** -/
+theorem evalVolatileMemIntrinsicCall_withCalleeCtx
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
+    (kind : RustIntrinsicKind) (s : MachineState) (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    evalVolatileMemIntrinsicCall kind (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
+        target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb =
+      MirStepNode.mapMem (Memory.withCalleeCtx c ac ti)
+        (evalVolatileMemIntrinsicCall kind s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb) := by
+  cases kind with
+  | unalignedVolatileLoad | volatileLoad =>
+    exact evalRawPtrLoadCall_withCalleeCtx c ac ti _ _ s target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb
+  | unalignedVolatileStore | volatileStore =>
+    exact evalRawPtrStoreCall_withCalleeCtx c ac ti _ _ s target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb
+  | volatileCopyNonOverlappingMemory | volatileCopyMemory =>
+    exact evalVolatileCopyMemoryCall_withCalleeCtx c ac ti _ s target bodyLocalDecls
+      bodyLayouts argOps argVals locals' destination targetBb
+  | volatileSetMemory =>
+    exact evalVolatileSetMemoryCall_withCalleeCtx c ac ti s target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb
+  | _ => rfl
+
+theorem evalVolatileMemIntrinsicCall_calleeCtx_preserved
+    (kind : RustIntrinsicKind) (s : MachineState) (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    evalVolatileMemIntrinsicCall kind s target bodyLocalDecls bodyLayouts
+        argOps argVals locals' destination targetBb =
+      MirStepNode.mapMem
+        (Memory.withCalleeCtx s.memory.callees s.memory.activeCallee s.memory.traitImpls)
+        (evalVolatileMemIntrinsicCall kind s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb) :=
+  calleeCtx_preserved_of_withCalleeCtx
+    (f := fun s => evalVolatileMemIntrinsicCall kind s target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb)
+    (fun c ac ti s => evalVolatileMemIntrinsicCall_withCalleeCtx c ac ti kind s target
+      bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb) s
+
+theorem evalVolatileMemIntrinsicCall_withCallees
+    (c₂ : CalleeEnv) (kind : RustIntrinsicKind) (s : MachineState)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) :
+    evalVolatileMemIntrinsicCall kind (MachineState.mapMem (Memory.withCallees c₂) s)
+        target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb =
+      MirStepNode.mapMem (Memory.withCallees c₂)
+        (evalVolatileMemIntrinsicCall kind s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb) :=
+  withCallees_of_withCalleeCtx
+    (f := fun s => evalVolatileMemIntrinsicCall kind s target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb)
+    (fun c ac ti s => evalVolatileMemIntrinsicCall_withCalleeCtx c ac ti kind s target
+      bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb) c₂ s
+
+/-- **Unlinked `core::ptr` raw-pointer access calls commute with `Memory.withCallees`.** -/
+theorem evalUnlinkedPtrAccessCall?_withCallees
+    (c₂ : CalleeEnv) (s : MachineState) (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) :
+    evalUnlinkedPtrAccessCall? (MachineState.mapMem (Memory.withCallees c₂) s)
+        target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb =
+      (evalUnlinkedPtrAccessCall? s target bodyLocalDecls bodyLayouts argOps argVals
+        locals' destination targetBb).map (MirStepNode.mapMem (Memory.withCallees c₂)) := by
+  unfold evalUnlinkedPtrAccessCall?
+  cases stringEq target.defPath "core::ptr::read_unaligned" with
+  | true =>
+    exact congrArg some
+      (evalRawPtrLoadCall_withCallees c₂ _ _ s target bodyLocalDecls bodyLayouts argOps
+        argVals locals' destination targetBb)
+  | false =>
+    dsimp only
+    cases stringEq target.defPath "core::ptr::write_unaligned" with
+    | true =>
+      exact congrArg some
+        (evalRawPtrStoreCall_withCallees c₂ _ _ s target bodyLocalDecls bodyLayouts argOps
+          argVals locals' destination targetBb)
+    | false =>
+      dsimp only
+      cases stringEq target.defPath "core::ptr::read_volatile" with
+      | true =>
+        exact congrArg some
+          (evalRawPtrLoadCall_withCallees c₂ _ _ s target bodyLocalDecls bodyLayouts argOps
+            argVals locals' destination targetBb)
+      | false =>
+        dsimp only
+        cases stringEq target.defPath "core::ptr::write_volatile" with
+        | true =>
+          exact congrArg some
+            (evalRawPtrStoreCall_withCallees c₂ _ _ s target bodyLocalDecls bodyLayouts argOps
+              argVals locals' destination targetBb)
+        | false => rfl
+
 theorem evalDirectRustIntrinsic?_withCallees_of_nonSelect (c₂ : CalleeEnv)
     (s : MachineState) (currentBody : Option CapturedMir) (target : ResolvedCallTarget)
     (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
@@ -16390,7 +16829,9 @@ theorem evalDirectRustIntrinsic?_withCallees_of_nonSelect (c₂ : CalleeEnv)
         locals' destination targetBb unwind).map (MirStepNode.mapMem (Memory.withCallees c₂)) := by
   unfold evalDirectRustIntrinsic?
   cases h_cl : classifyRustIntrinsic? target.defPath with
-  | none => rfl
+  | none =>
+    exact evalUnlinkedPtrAccessCall?_withCallees c₂ s target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb
   | some kind =>
     rw [h_cl] at h
     cases kind with
@@ -16404,6 +16845,12 @@ theorem evalDirectRustIntrinsic?_withCallees_of_nonSelect (c₂ : CalleeEnv)
       dsimp only [Option.map]
       exact congrArg some
         (evalWriteBytesCall_withCallees c₂ s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb)
+    | unalignedVolatileLoad | unalignedVolatileStore | volatileLoad | volatileStore
+    | volatileCopyNonOverlappingMemory | volatileCopyMemory | volatileSetMemory =>
+      dsimp only [Option.map]
+      exact congrArg some
+        (evalVolatileMemIntrinsicCall_withCallees c₂ _ s target bodyLocalDecls bodyLayouts
           argOps argVals locals' destination targetBb)
     | _ =>
       dsimp only [Option.map]
@@ -18408,6 +18855,160 @@ theorem evalWriteBytesCall_callerBodies (s : MachineState) (target : ResolvedCal
       (commitWriteBytesDstPlaceWrite_callerBodies s dstPlace dstTag locals' newVal
         bodyLocalDecls bodyLayouts)
 
+/-! ### Raw-pointer memory access calls keep every saved caller body -/
+
+/-- The call stack a raw-pointer access action installs keeps every saved caller body of `cs`. -/
+private def rawPtrCallActionCallerBodies (cs : List SavedCallerFrame) : RawPtrCallAction → Prop
+  | .retStack _ _ callStack' _ _ => CallerBodiesEq cs callStack'
+  | _ => True
+
+private theorem finishRawPtrCallAction_callerBodies (s : MachineState) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) (act : RawPtrCallAction)
+    (h_act : rawPtrCallActionCallerBodies s.memory.callStack act) :
+    NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack)
+      (finishRawPtrCallAction s locals' destination targetBb act) := by
+  cases act with
+  | fault kind => exact ns_fail
+  | ret retVal => exact writeIntrinsicReturn_callerBodies s locals' destination targetBb retVal
+  | retBorrows borrows' retVal =>
+    exact writeIntrinsicReturn_callerBodies
+      { s with memory := { s.memory with borrows := borrows' } }
+      locals' destination targetBb retVal
+  | retStack borrows' locals₄ callStack' callerLocals' retVal =>
+    exact NodeSuccs.mono (fun _ hs'' => CallerBodiesEq.trans h_act hs'')
+      (writeIntrinsicReturn_callerBodies
+        { s with
+          memory :=
+            { s.memory with
+              borrows := borrows'
+              callStack := callStack'
+              callerLocals := callerLocals' } }
+        locals₄ destination targetBb retVal)
+
+private theorem rawPtrLoadAction_callerBodies
+    {isVolatile requiresAlign : Bool} {borrows : List BorrowEntry}
+    {globals : List CapturedAllocation} {cs : List SavedCallerFrame} {ap : List Nat}
+    {target : ResolvedCallTarget} {decls : List LocalDecl} {layouts : LayoutTable}
+    {argOps : List Operand} {argVals : List Value} {locals' : List LocalSlot} :
+    rawPtrCallActionCallerBodies cs
+      (rawPtrLoadAction isVolatile requiresAlign borrows globals cs ap target decls layouts argOps
+        argVals locals') := by
+  unfold rawPtrLoadAction
+  dsimp only
+  repeat' split
+  all_goals exact True.intro
+
+private theorem rawPtrStoreAction_callerBodies
+    {isVolatile requiresAlign : Bool} {borrows : List BorrowEntry}
+    {globals : List CapturedAllocation} {cs : List SavedCallerFrame} {cl : List LocalSlot}
+    {ap : List Nat}
+    {target : ResolvedCallTarget} {decls : List LocalDecl} {layouts : LayoutTable}
+    {argOps : List Operand} {argVals : List Value} {locals' : List LocalSlot} :
+    rawPtrCallActionCallerBodies cs
+      (rawPtrStoreAction isVolatile requiresAlign borrows globals cs cl ap target decls layouts
+        argOps argVals locals') := by
+  unfold rawPtrStoreAction
+  dsimp only
+  repeat' split
+  all_goals first
+    | exact True.intro
+    | exact writeFrameLocalSlot_callerBodies (by assumption)
+
+private theorem volatileCopyWithinLocalAction_callerBodies
+    {borrows : List BorrowEntry} {cs : List SavedCallerFrame} {cl : List LocalSlot}
+    {ap : List Nat} {decls : List LocalDecl} {layouts : LayoutTable} {locals' : List LocalSlot}
+    {srcPtr dstPtr : ProvenancePtr} {srcEntry dstEntry : BorrowEntry} {byteCount : Nat} :
+    rawPtrCallActionCallerBodies cs
+      (volatileCopyWithinLocalAction borrows cs cl ap decls layouts locals' srcPtr dstPtr srcEntry
+        dstEntry byteCount) := by
+  unfold volatileCopyWithinLocalAction
+  dsimp only
+  repeat' split
+  all_goals first
+    | exact True.intro
+    | exact writeFrameLocalSlot_callerBodies (by assumption)
+
+theorem evalRawPtrLoadCall_callerBodies (isVolatile requiresAlign : Bool) (s : MachineState)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) :
+    NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack)
+      (evalRawPtrLoadCall isVolatile requiresAlign s target bodyLocalDecls bodyLayouts argOps
+        argVals locals' destination targetBb) := by
+  unfold evalRawPtrLoadCall
+  exact finishRawPtrCallAction_callerBodies s locals' destination targetBb _
+    rawPtrLoadAction_callerBodies
+
+theorem evalRawPtrStoreCall_callerBodies (isVolatile requiresAlign : Bool) (s : MachineState)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) :
+    NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack)
+      (evalRawPtrStoreCall isVolatile requiresAlign s target bodyLocalDecls bodyLayouts argOps
+        argVals locals' destination targetBb) := by
+  unfold evalRawPtrStoreCall
+  exact finishRawPtrCallAction_callerBodies s locals' destination targetBb _
+    rawPtrStoreAction_callerBodies
+
+theorem evalVolatileCopyMemoryCall_callerBodies (nonOverlapping : Bool) (s : MachineState)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) :
+    NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack)
+      (evalVolatileCopyMemoryCall nonOverlapping s target bodyLocalDecls bodyLayouts argOps
+        argVals locals' destination targetBb) := by
+  unfold evalVolatileCopyMemoryCall
+  cases volatileCopyPlan nonOverlapping s.memory.borrows s.memory.globals s.memory.callStack
+      target bodyLocalDecls bodyLayouts argOps argVals locals' with
+  | fault _ => exact ns_fail
+  | noCopy => exact writeIntrinsicReturn_callerBodies s locals' destination targetBb .unit
+  | nonOverlapping srcOp dstOp srcVal dstVal count =>
+    exact finishMemIntrinsicCall_callerBodies s _ destination targetBb
+      (evalCopyNonOverlappingWithCount_callerBodies s srcOp dstOp bodyLocalDecls bodyLayouts
+        srcVal dstVal count locals')
+  | withinLocal srcPtr dstPtr srcEntry dstEntry byteCount =>
+    exact finishRawPtrCallAction_callerBodies s locals' destination targetBb _
+      volatileCopyWithinLocalAction_callerBodies
+
+theorem evalVolatileSetMemoryCall_callerBodies (s : MachineState)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) :
+    NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack)
+      (evalVolatileSetMemoryCall s target bodyLocalDecls bodyLayouts argOps argVals locals'
+        destination targetBb) := by
+  unfold evalVolatileSetMemoryCall
+  cases volatileSetPlan s.memory.borrows s.memory.globals s.memory.callStack
+      target bodyLocalDecls bodyLayouts argOps argVals locals' with
+  | fault _ => exact ns_fail
+  | noWrite => exact writeIntrinsicReturn_callerBodies s locals' destination targetBb .unit
+  | writeBytes =>
+    exact evalWriteBytesCall_callerBodies s target bodyLocalDecls bodyLayouts argOps argVals
+      locals' destination targetBb
+
+/-- **Volatile memory intrinsics keep every saved caller body.** -/
+theorem evalVolatileMemIntrinsicCall_callerBodies (kind : RustIntrinsicKind) (s : MachineState)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) :
+    NodeSuccs (fun s' => CallerBodiesEq s.memory.callStack s'.memory.callStack)
+      (evalVolatileMemIntrinsicCall kind s target bodyLocalDecls bodyLayouts argOps argVals
+        locals' destination targetBb) := by
+  cases kind with
+  | unalignedVolatileLoad | volatileLoad =>
+    exact evalRawPtrLoadCall_callerBodies _ _ s target bodyLocalDecls bodyLayouts argOps
+      argVals locals' destination targetBb
+  | unalignedVolatileStore | volatileStore =>
+    exact evalRawPtrStoreCall_callerBodies _ _ s target bodyLocalDecls bodyLayouts argOps
+      argVals locals' destination targetBb
+  | volatileCopyNonOverlappingMemory | volatileCopyMemory =>
+    exact evalVolatileCopyMemoryCall_callerBodies _ s target bodyLocalDecls bodyLayouts argOps
+      argVals locals' destination targetBb
+  | volatileSetMemory =>
+    exact evalVolatileSetMemoryCall_callerBodies s target bodyLocalDecls bodyLayouts argOps
+      argVals locals' destination targetBb
+  | _ => exact ns_unsupported
+
 theorem NodeSuccs.and {P Q : MachineState → Prop} {n : MirStepNode}
     (hP : NodeSuccs P n) (hQ : NodeSuccs Q n) : NodeSuccs (fun s => P s ∧ Q s) n := by
   cases n with
@@ -18634,7 +19235,25 @@ theorem nodeSuccs_evalDirectRustIntrinsic?_of_nonSelect {cone : List DefPath}
        | none => fallback) := by
   unfold evalDirectRustIntrinsic?
   cases h_k : classifyRustIntrinsic? target.defPath with
-  | none => exact h_fb
+  | none =>
+    dsimp only
+    cases h_p : evalUnlinkedPtrAccessCall? s target bodyLocalDecls bodyLayouts argOps argVals
+        locals' destination targetBb with
+    | none => exact h_fb
+    | some stepNode =>
+      rcases evalUnlinkedPtrAccessCall?_eq_some s target bodyLocalDecls bodyLayouts argOps
+          argVals locals' destination targetBb stepNode h_p with
+        ⟨isVolatile, requiresAlign, rfl, _⟩ | ⟨isVolatile, requiresAlign, rfl, _⟩
+      · exact nodeSuccs_closedInv_of_ctx h_inv
+          (evalRawPtrLoadCall_calleeCtx_preserved isVolatile requiresAlign s target
+            bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb)
+          (evalRawPtrLoadCall_callerBodies isVolatile requiresAlign s target bodyLocalDecls
+            bodyLayouts argOps argVals locals' destination targetBb)
+      · exact nodeSuccs_closedInv_of_ctx h_inv
+          (evalRawPtrStoreCall_calleeCtx_preserved isVolatile requiresAlign s target
+            bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb)
+          (evalRawPtrStoreCall_callerBodies isVolatile requiresAlign s target bodyLocalDecls
+            bodyLayouts argOps argVals locals' destination targetBb)
   | some kind =>
     rw [h_k] at h_cl
     have h_step : ∀ (k : RustIntrinsicKind),
@@ -18660,6 +19279,13 @@ theorem nodeSuccs_evalDirectRustIntrinsic?_of_nonSelect {cone : List DefPath}
         (evalWriteBytesCall_calleeCtx_preserved s target bodyLocalDecls bodyLayouts
           argOps argVals locals' destination targetBb)
         (evalWriteBytesCall_callerBodies s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb)
+    | unalignedVolatileLoad | unalignedVolatileStore | volatileLoad | volatileStore
+    | volatileCopyNonOverlappingMemory | volatileCopyMemory | volatileSetMemory =>
+      exact nodeSuccs_closedInv_of_ctx h_inv
+        (evalVolatileMemIntrinsicCall_calleeCtx_preserved _ s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb)
+        (evalVolatileMemIntrinsicCall_callerBodies _ s target bodyLocalDecls bodyLayouts
           argOps argVals locals' destination targetBb)
     | _ => exact h_step _
 
@@ -19784,7 +20410,25 @@ theorem nodeSuccs_evalDirectRustIntrinsic?_poly {cone : List DefPath}
        | none => fallback) := by
   unfold evalDirectRustIntrinsic?
   cases h_k : classifyRustIntrinsic? target.defPath with
-  | none => exact h_fb
+  | none =>
+    dsimp only
+    cases h_p : evalUnlinkedPtrAccessCall? s target bodyLocalDecls bodyLayouts argOps argVals
+        locals' destination targetBb with
+    | none => exact h_fb
+    | some stepNode =>
+      rcases evalUnlinkedPtrAccessCall?_eq_some s target bodyLocalDecls bodyLayouts argOps
+          argVals locals' destination targetBb stepNode h_p with
+        ⟨isVolatile, requiresAlign, rfl, _⟩ | ⟨isVolatile, requiresAlign, rfl, _⟩
+      · exact nodeSuccs_closedInvPoly_of_ctx h_inv
+          (evalRawPtrLoadCall_calleeCtx_preserved isVolatile requiresAlign s target
+            bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb)
+          (evalRawPtrLoadCall_callerBodies isVolatile requiresAlign s target bodyLocalDecls
+            bodyLayouts argOps argVals locals' destination targetBb)
+      · exact nodeSuccs_closedInvPoly_of_ctx h_inv
+          (evalRawPtrStoreCall_calleeCtx_preserved isVolatile requiresAlign s target
+            bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb)
+          (evalRawPtrStoreCall_callerBodies isVolatile requiresAlign s target bodyLocalDecls
+            bodyLayouts argOps argVals locals' destination targetBb)
   | some kind =>
     rw [h_k] at h_cl
     have h_step : ∀ (k : RustIntrinsicKind),
@@ -19810,6 +20454,13 @@ theorem nodeSuccs_evalDirectRustIntrinsic?_poly {cone : List DefPath}
         (evalWriteBytesCall_calleeCtx_preserved s target bodyLocalDecls bodyLayouts
           argOps argVals locals' destination targetBb)
         (evalWriteBytesCall_callerBodies s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb)
+    | unalignedVolatileLoad | unalignedVolatileStore | volatileLoad | volatileStore
+    | volatileCopyNonOverlappingMemory | volatileCopyMemory | volatileSetMemory =>
+      exact nodeSuccs_closedInvPoly_of_ctx h_inv
+        (evalVolatileMemIntrinsicCall_calleeCtx_preserved _ s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb)
+        (evalVolatileMemIntrinsicCall_callerBodies _ s target bodyLocalDecls bodyLayouts
           argOps argVals locals' destination targetBb)
     | _ => exact h_step _
 
@@ -21292,7 +21943,8 @@ theorem evalTerminator_call_nonSelectIntrinsic (s : MachineState) (cur : Capture
         { defPath := defPath, typeArgs := typeArgs, fnSig := none, isIndirect := false } = false)
     (hKind : classifyRustIntrinsic? defPath = some kind)
     (hNonSelect : isNonSelectIntrinsicOpt (some kind) = true)
-    (hNotMem : kind ≠ .copyNonOverlapping ∧ kind ≠ .writeBytes := by constructor <;> intro h <;> cases h) :
+    (hNotMem : kind ≠ .copyNonOverlapping ∧ kind ≠ .writeBytes := by constructor <;> intro h <;> cases h)
+    (hNotVolatile : isVolatileMemIntrinsicKind kind = false := by rfl) :
     evalTerminator s
       { kind := .call func argOps destination (some targetBb) unwind, span := span }
       (some cur) =
@@ -21316,6 +21968,9 @@ theorem evalTerminator_call_nonSelectIntrinsic (s : MachineState) (cur : Capture
   | constEvalSelect => cases hNonSelect
   | copyNonOverlapping => exact False.elim (hNotMem.1 rfl)
   | writeBytes => exact False.elim (hNotMem.2 rfl)
+  | unalignedVolatileLoad | unalignedVolatileStore | volatileLoad | volatileStore
+  | volatileCopyNonOverlappingMemory | volatileCopyMemory | volatileSetMemory =>
+    exact absurd hNotVolatile (by decide)
   | _ => rfl
 
 /-- One-step `stepMirFn` / `mirStep` / `wpMirBounded` / `WpConverges` bridge from any
@@ -21823,7 +22478,8 @@ theorem stepMirFn_call_nonSelectIntrinsic {body cur : CapturedMir} {s : MachineS
         { defPath := defPath, typeArgs := typeArgs, fnSig := none, isIndirect := false } = false)
     (hKind : classifyRustIntrinsic? defPath = some kind)
     (hNonSelect : isNonSelectIntrinsicOpt (some kind) = true)
-    (hNotMem : kind ≠ .copyNonOverlapping ∧ kind ≠ .writeBytes := by constructor <;> intro h <;> cases h) :
+    (hNotMem : kind ≠ .copyNonOverlapping ∧ kind ≠ .writeBytes := by constructor <;> intro h <;> cases h)
+    (hNotVolatile : isVolatileMemIntrinsicKind kind = false := by rfl) :
     stepMirFn body s =
       evalNonSelectIntrinsicCall kind s
         { defPath := defPath, typeArgs := typeArgs, fnSig := none, isIndirect := false }
@@ -21831,7 +22487,7 @@ theorem stepMirFn_call_nonSelectIntrinsic {body cur : CapturedMir} {s : MachineS
   rw [stepMirFn_frame_term_constructive hCur hPhase hBb hEnd, hTerm]
   exact evalTerminator_call_nonSelectIntrinsic s cur func argOps destination targetBb unwind span
     defPath typeArgs kind argVals locals' hCallee hArgs hNoOverride hNoExact hKind hNonSelect
-    hNotMem
+    hNotMem hNotVolatile
 
 /-- A `MirStepNode.fail fk` trusted step is a `mirStep` `.fault`. -/
 theorem mirStep_of_stepMirFn_fail {body : CapturedMir} {s : MachineState} {fk : FailureKind}
@@ -21868,11 +22524,12 @@ theorem mirStep_call_nonSelectIntrinsic_fail {body cur : CapturedMir} {s : Machi
         { defPath := defPath, typeArgs := typeArgs, fnSig := none, isIndirect := false }
         cur.localDecls cur.layouts argOps argVals locals' destination targetBb =
       MirStepNode.fail fk)
-    (hNotMem : kind ≠ .copyNonOverlapping ∧ kind ≠ .writeBytes := by constructor <;> intro h <;> cases h) :
+    (hNotMem : kind ≠ .copyNonOverlapping ∧ kind ≠ .writeBytes := by constructor <;> intro h <;> cases h)
+    (hNotVolatile : isVolatileMemIntrinsicKind kind = false := by rfl) :
     stepMirFn body s = MirStepNode.fail fk ∧ mirStep body s = .fault := by
   have hStep : stepMirFn body s = MirStepNode.fail fk :=
     (stepMirFn_call_nonSelectIntrinsic hCur hPhase hBb hEnd hTerm hCallee hArgs hNoOverride
-      hNoExact hKind hNonSelect hNotMem).trans hFail
+      hNoExact hKind hNonSelect hNotMem hNotVolatile).trans hFail
   exact ⟨hStep, mirStep_of_stepMirFn_fail hStep⟩
 
 /-- **`mirStep_call_nonSelectIntrinsic_write_local`**: an intrinsic-level return write
@@ -21909,7 +22566,8 @@ theorem mirStep_call_nonSelectIntrinsic_write_local {body cur : CapturedMir} {s 
     (hSlot : get? locals' dstLoc = some slot)
     (hLive : slotLive slot = true)
     (hSet : set? locals' dstLoc (.init retVal) = some updatedLocals)
-    (hNotMem : kind ≠ .copyNonOverlapping ∧ kind ≠ .writeBytes := by constructor <;> intro h <;> cases h) :
+    (hNotMem : kind ≠ .copyNonOverlapping ∧ kind ≠ .writeBytes := by constructor <;> intro h <;> cases h)
+    (hNotVolatile : isVolatileMemIntrinsicKind kind = false := by rfl) :
     let s' : MachineState :=
       { frame := { s.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
         memory :=
@@ -21923,7 +22581,7 @@ theorem mirStep_call_nonSelectIntrinsic_write_local {body cur : CapturedMir} {s 
   intro s'
   have hStep : stepMirFn body s = MirStepNode.step s' := by
     rw [stepMirFn_call_nonSelectIntrinsic hCur hPhase hBb hEnd hTerm hCallee hArgs hNoOverride
-      hNoExact hKind hNonSelect hNotMem, hEval,
+      hNoExact hKind hNonSelect hNotMem hNotVolatile, hEval,
       writeIntrinsicReturn_local s locals' updatedLocals dstLoc slot targetBb retVal hSlot hLive
         hSet]
   obtain ⟨hMir, hWp, hConv⟩ := mirStep_and_wp_of_stepMirFn_step hStep

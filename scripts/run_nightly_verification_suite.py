@@ -255,7 +255,14 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             ("floatToInt", "proved_corresponding"),
             ("intToFloat", "proved_corresponding"),
             ("floatToFloat", "proved_corresponding"),
-            ("fnPtrToPtr", "unsupported_fail_closed"),
+            # `CastKind.fnPtrToPtr` is evaluated by `evalFnPtrToPtr`
+            # (`trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Places.lean`) with a
+            # two-sided refinement in `theory/Anneal/Mir/Cast.lean`
+            # (`evalRvalue_cast_fnPtrToPtr_eq` and its `.ok` / `.ub` lemmas) and
+            # kernel-checked tests in `tests/mir/WidePtrSliceFnPtrTests.lean` and
+            # `tests/mir/SymbolicEvalTests.lean`; there is not yet a MiniRustSpec /
+            # LeanMiriSpec step-simulation theorem for it.
+            ("fnPtrToPtr", "supported_and_tested"),
         ],
     },
     {

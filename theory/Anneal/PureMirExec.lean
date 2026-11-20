@@ -283,6 +283,600 @@ theorem evalWriteBytesCall_pushBaseStack_of_noCallWP
     rw [h_nil, h_fk] at h_st
     exact False.elim h_st
 
+/-- With no Tree Borrows entries, no raw pointer is a tracked stack pointer. -/
+theorem classifyRawPtrTarget_borrows_nil (globals : List CapturedAllocation) (arg : RawPtrArg) :
+    classifyRawPtrTarget [] globals arg = .outside ∨
+      classifyRawPtrTarget [] globals arg = .untracked ∨
+      ∃ ptr alloc, classifyRawPtrTarget [] globals arg = .global ptr alloc := by
+  cases arg with
+  | addr a => exact Or.inl rfl
+  | prov ptr =>
+    dsimp only [classifyRawPtrTarget, lookupBorrow]
+    cases lookupGlobalAlloc globals ptr.allocId with
+    | some alloc => exact Or.inr (Or.inr ⟨ptr, alloc, rfl⟩)
+    | none =>
+      dsimp only
+      cases Nat.beq ptr.allocId 0
+      · exact Or.inr (Or.inl rfl)
+      · exact Or.inl rfl
+
+/-- Off the stack, the alignment of a raw pointer does not depend on the call stack. -/
+theorem rawPtrTargetAligned?_of_not_stack
+    (cs cs' : List SavedCallerFrame) (locals' : List LocalSlot) (decls : List LocalDecl)
+    (layouts : LayoutTable) (reqAlign : Nat) (arg : RawPtrArg) (tgt : RawPtrTarget)
+    (h : tgt = .outside ∨ tgt = .untracked ∨ ∃ ptr alloc, tgt = .global ptr alloc) :
+    rawPtrTargetAligned? cs locals' decls layouts reqAlign arg tgt =
+      rawPtrTargetAligned? cs' locals' decls layouts reqAlign arg tgt := by
+  rcases h with rfl | rfl | ⟨ptr, alloc, rfl⟩ <;> rfl
+
+/-- Completing a raw-pointer access action commutes with `MachineState.pushBaseStack` over an
+empty base stack on every successful (call-free) step. -/
+theorem finishRawPtrCallAction_pushBaseStack_nil_of_noCallWP
+    (calleeBody : CapturedMir) (ms : MachineState) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) (act : RawPtrCallAction)
+    {Q : MirExecState → Prop} {P : Value → Memory → Prop}
+    (h_st :
+      evalNodeNoCallWP Q (mirNormalPost P)
+        (finishRawPtrCallAction ms locals' destination targetBb act)) :
+    ∃ nextSt : MachineState,
+      finishRawPtrCallAction ms locals' destination targetBb act = MirStepNode.step nextSt ∧
+      finishRawPtrCallAction (MachineState.pushBaseStack calleeBody [] ms) locals' destination
+          targetBb act =
+        MirStepNode.step (MachineState.pushBaseStack calleeBody [] nextSt) := by
+  cases act with
+  | fault kind => exact False.elim h_st
+  | ret retVal =>
+    exact writeIntrinsicReturn_pushBaseStack_of_noCallWP calleeBody [] ms locals' destination
+      targetBb retVal h_st (Or.inl rfl)
+  | retBorrows borrows' retVal =>
+    exact writeIntrinsicReturn_pushBaseStack_of_noCallWP calleeBody []
+      { ms with memory := { ms.memory with borrows := borrows' } } locals' destination targetBb
+      retVal h_st (Or.inl rfl)
+  | retStack borrows' locals₄ callStack' callerLocals' retVal =>
+    exact writeIntrinsicReturn_pushBaseStack_of_noCallWP calleeBody []
+      { ms with
+        memory :=
+          { ms.memory with
+            borrows := borrows'
+            callStack := callStack'
+            callerLocals := callerLocals' } }
+      locals₄ destination targetBb retVal h_st (Or.inl rfl)
+
+/-- With no Tree Borrows entries, a raw-pointer load faults or returns without touching memory,
+independently of the call stack. -/
+theorem rawPtrLoadAction_borrows_nil
+    (isVolatile requiresAlign : Bool) (globals : List CapturedAllocation)
+    (cs cs' : List SavedCallerFrame) (ap : List Nat) (target : ResolvedCallTarget)
+    (decls : List LocalDecl) (layouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot) :
+    rawPtrLoadAction isVolatile requiresAlign [] globals cs ap target decls layouts argOps argVals
+        locals' =
+      rawPtrLoadAction isVolatile requiresAlign [] globals cs' ap target decls layouts argOps
+        argVals locals' ∧
+    ((∃ kind, rawPtrLoadAction isVolatile requiresAlign [] globals cs ap target decls layouts
+        argOps argVals locals' = .fault kind) ∨
+      (∃ retVal, rawPtrLoadAction isVolatile requiresAlign [] globals cs ap target decls layouts
+        argOps argVals locals' = .ret retVal)) := by
+  unfold rawPtrLoadAction
+  rcases argVals with _ | ⟨srcVal, _ | ⟨_, _⟩⟩
+  · exact ⟨rfl, Or.inl ⟨_, rfl⟩⟩
+  · dsimp only
+    cases rawPtrArgOfValue? (layoutPointerBytes layouts) srcVal with
+    | none => exact ⟨rfl, Or.inl ⟨_, rfl⟩⟩
+    | some srcArg =>
+      dsimp only
+      cases resolveRawPtrElemLayout target decls layouts argOps with
+      | fault kind => exact ⟨rfl, Or.inl ⟨_, rfl⟩⟩
+      | ok elemTy size align =>
+        dsimp only
+        have h_tgt := classifyRawPtrTarget_borrows_nil globals srcArg
+        rw [rawPtrTargetAligned?_of_not_stack cs cs' _ _ _ _ _ _ h_tgt]
+        refine ⟨?_, ?_⟩
+        · rcases h_tgt with h | h | ⟨ptr, alloc, h⟩ <;> rw [h]
+        · rcases h_tgt with h | h | ⟨ptr, alloc, h⟩ <;> rw [h] <;> dsimp only <;>
+            repeat' (first
+              | exact Or.inl ⟨_, rfl⟩
+              | exact Or.inr ⟨_, rfl⟩
+              | split)
+  · exact ⟨rfl, Or.inl ⟨_, rfl⟩⟩
+
+/-- A raw-pointer load commutes with `MachineState.pushBaseStack` on every successful (call-free)
+step. -/
+theorem evalRawPtrLoadCall_pushBaseStack_of_noCallWP
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (isVolatile requiresAlign : Bool)
+    (ms : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    {Q : MirExecState → Prop} {P : Value → Memory → Prop}
+    (h_st :
+      evalNodeNoCallWP Q (mirNormalPost P)
+        (evalRawPtrLoadCall isVolatile requiresAlign ms target bodyLocalDecls bodyLayouts argOps
+          argVals locals' destination targetBb))
+    (h_bor : baseStack = [] ∨ ms.memory.borrows = []) :
+    ∃ nextSt : MachineState,
+      evalRawPtrLoadCall isVolatile requiresAlign ms target bodyLocalDecls bodyLayouts argOps
+          argVals locals' destination targetBb = MirStepNode.step nextSt ∧
+      evalRawPtrLoadCall isVolatile requiresAlign
+          (MachineState.pushBaseStack calleeBody baseStack ms) target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb =
+        MirStepNode.step (MachineState.pushBaseStack calleeBody baseStack nextSt) := by
+  rcases h_bor with rfl | h_nil
+  · exact finishRawPtrCallAction_pushBaseStack_nil_of_noCallWP calleeBody ms locals' destination
+      targetBb _ h_st
+  · unfold evalRawPtrLoadCall at h_st ⊢
+    have h_b : (MachineState.pushBaseStack calleeBody baseStack ms).memory.borrows = [] := h_nil
+    rw [h_b]
+    rw [h_nil] at h_st ⊢
+    obtain ⟨h_eq, h_c⟩ := rawPtrLoadAction_borrows_nil isVolatile requiresAlign ms.memory.globals
+      ms.memory.callStack (MachineState.pushBaseStack calleeBody baseStack ms).memory.callStack
+      ms.memory.activeProtectors target bodyLocalDecls bodyLayouts argOps argVals locals'
+    have h_eq' :
+        rawPtrLoadAction isVolatile requiresAlign []
+            (MachineState.pushBaseStack calleeBody baseStack ms).memory.globals
+            (MachineState.pushBaseStack calleeBody baseStack ms).memory.callStack
+            (MachineState.pushBaseStack calleeBody baseStack ms).memory.activeProtectors target
+            bodyLocalDecls bodyLayouts argOps argVals locals' =
+          rawPtrLoadAction isVolatile requiresAlign [] ms.memory.globals ms.memory.callStack
+            ms.memory.activeProtectors target bodyLocalDecls bodyLayouts argOps argVals locals' :=
+      h_eq.symm
+    rw [h_eq']
+    rcases h_c with ⟨kind, h_k⟩ | ⟨retVal, h_r⟩
+    · rw [h_k] at h_st; exact False.elim h_st
+    · rw [h_r] at h_st ⊢
+      exact writeIntrinsicReturn_pushBaseStack_of_noCallWP calleeBody baseStack ms locals'
+        destination targetBb retVal h_st (Or.inr h_nil)
+
+/-- With no Tree Borrows entries, a raw-pointer store faults or returns without touching memory,
+independently of the call stack. -/
+theorem rawPtrStoreAction_borrows_nil
+    (isVolatile requiresAlign : Bool) (globals : List CapturedAllocation)
+    (cs cs' : List SavedCallerFrame) (cl : List LocalSlot) (ap : List Nat)
+    (target : ResolvedCallTarget)
+    (decls : List LocalDecl) (layouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot) :
+    rawPtrStoreAction isVolatile requiresAlign [] globals cs cl ap target decls layouts argOps
+        argVals locals' =
+      rawPtrStoreAction isVolatile requiresAlign [] globals cs' cl ap target decls layouts argOps
+        argVals locals' ∧
+    ((∃ kind, rawPtrStoreAction isVolatile requiresAlign [] globals cs cl ap target decls layouts
+        argOps argVals locals' = .fault kind) ∨
+      (∃ retVal, rawPtrStoreAction isVolatile requiresAlign [] globals cs cl ap target decls
+        layouts argOps argVals locals' = .ret retVal)) := by
+  unfold rawPtrStoreAction
+  rcases argVals with _ | ⟨dstVal, _ | ⟨val, _ | ⟨_, _⟩⟩⟩
+  · exact ⟨rfl, Or.inl ⟨_, rfl⟩⟩
+  · exact ⟨rfl, Or.inl ⟨_, rfl⟩⟩
+  · dsimp only
+    cases rawPtrArgOfValue? (layoutPointerBytes layouts) dstVal with
+    | none => exact ⟨rfl, Or.inl ⟨_, rfl⟩⟩
+    | some dstArg =>
+      dsimp only
+      cases resolveRawPtrElemLayout target decls layouts argOps with
+      | fault kind => exact ⟨rfl, Or.inl ⟨_, rfl⟩⟩
+      | ok elemTy size align =>
+        dsimp only
+        have h_tgt := classifyRawPtrTarget_borrows_nil globals dstArg
+        rw [rawPtrTargetAligned?_of_not_stack cs cs' _ _ _ _ _ _ h_tgt]
+        refine ⟨?_, ?_⟩
+        · rcases h_tgt with h | h | ⟨ptr, alloc, h⟩ <;> rw [h]
+        · rcases h_tgt with h | h | ⟨ptr, alloc, h⟩ <;> rw [h] <;> dsimp only <;>
+            repeat' (first
+              | exact Or.inl ⟨_, rfl⟩
+              | exact Or.inr ⟨_, rfl⟩
+              | split)
+  · exact ⟨rfl, Or.inl ⟨_, rfl⟩⟩
+
+/-- A raw-pointer store commutes with `MachineState.pushBaseStack` on every successful (call-free)
+step. -/
+theorem evalRawPtrStoreCall_pushBaseStack_of_noCallWP
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (isVolatile requiresAlign : Bool)
+    (ms : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    {Q : MirExecState → Prop} {P : Value → Memory → Prop}
+    (h_st :
+      evalNodeNoCallWP Q (mirNormalPost P)
+        (evalRawPtrStoreCall isVolatile requiresAlign ms target bodyLocalDecls bodyLayouts argOps
+          argVals locals' destination targetBb))
+    (h_bor : baseStack = [] ∨ ms.memory.borrows = []) :
+    ∃ nextSt : MachineState,
+      evalRawPtrStoreCall isVolatile requiresAlign ms target bodyLocalDecls bodyLayouts argOps
+          argVals locals' destination targetBb = MirStepNode.step nextSt ∧
+      evalRawPtrStoreCall isVolatile requiresAlign
+          (MachineState.pushBaseStack calleeBody baseStack ms) target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb =
+        MirStepNode.step (MachineState.pushBaseStack calleeBody baseStack nextSt) := by
+  rcases h_bor with rfl | h_nil
+  · exact finishRawPtrCallAction_pushBaseStack_nil_of_noCallWP calleeBody ms locals' destination
+      targetBb _ h_st
+  · unfold evalRawPtrStoreCall at h_st ⊢
+    have h_b : (MachineState.pushBaseStack calleeBody baseStack ms).memory.borrows = [] := h_nil
+    rw [h_b]
+    rw [h_nil] at h_st ⊢
+    obtain ⟨h_eq, h_c⟩ := rawPtrStoreAction_borrows_nil isVolatile requiresAlign
+      ms.memory.globals ms.memory.callStack
+      (MachineState.pushBaseStack calleeBody baseStack ms).memory.callStack
+      ms.memory.callerLocals ms.memory.activeProtectors target bodyLocalDecls bodyLayouts argOps
+      argVals locals'
+    have h_eq' :
+        rawPtrStoreAction isVolatile requiresAlign []
+            (MachineState.pushBaseStack calleeBody baseStack ms).memory.globals
+            (MachineState.pushBaseStack calleeBody baseStack ms).memory.callStack
+            (MachineState.pushBaseStack calleeBody baseStack ms).memory.callerLocals
+            (MachineState.pushBaseStack calleeBody baseStack ms).memory.activeProtectors target
+            bodyLocalDecls bodyLayouts argOps argVals locals' =
+          rawPtrStoreAction isVolatile requiresAlign [] ms.memory.globals ms.memory.callStack
+            ms.memory.callerLocals ms.memory.activeProtectors target bodyLocalDecls bodyLayouts
+            argOps argVals locals' :=
+      h_eq.symm
+    rw [h_eq']
+    rcases h_c with ⟨kind, h_k⟩ | ⟨retVal, h_r⟩
+    · rw [h_k] at h_st; exact False.elim h_st
+    · rw [h_r] at h_st ⊢
+      exact writeIntrinsicReturn_pushBaseStack_of_noCallWP calleeBody baseStack ms locals'
+        destination targetBb retVal h_st (Or.inr h_nil)
+
+/-- With no Tree Borrows entries, a volatile copy faults or copies nothing, independently of the
+call stack. -/
+theorem volatileCopyPlan_borrows_nil
+    (nonOverlapping : Bool) (globals : List CapturedAllocation)
+    (cs cs' : List SavedCallerFrame) (target : ResolvedCallTarget)
+    (decls : List LocalDecl) (layouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot) :
+    volatileCopyPlan nonOverlapping [] globals cs target decls layouts argOps argVals locals' =
+      volatileCopyPlan nonOverlapping [] globals cs' target decls layouts argOps argVals locals' ∧
+    ((∃ kind, volatileCopyPlan nonOverlapping [] globals cs target decls layouts argOps argVals
+        locals' = .fault kind) ∨
+      volatileCopyPlan nonOverlapping [] globals cs target decls layouts argOps argVals locals' =
+        .noCopy) := by
+  unfold volatileCopyPlan
+  rcases argVals with
+    _ | ⟨dstVal, _ | ⟨srcVal, _ | ⟨_ | countSc | ⟨_, _⟩ | ⟨_, _⟩ | _, _ | ⟨_, _⟩⟩⟩⟩ <;>
+    try exact ⟨rfl, Or.inl ⟨_, rfl⟩⟩
+  dsimp only
+  cases Nat.beq countSc.sizeBytes (layoutPointerBytes layouts) with
+  | false => exact ⟨rfl, Or.inl ⟨_, rfl⟩⟩
+  | true =>
+    cases rawPtrArgOfValue? (layoutPointerBytes layouts) dstVal with
+    | none => exact ⟨rfl, Or.inl ⟨_, rfl⟩⟩
+    | some dstArg =>
+      cases rawPtrArgOfValue? (layoutPointerBytes layouts) srcVal with
+      | none => exact ⟨rfl, Or.inl ⟨_, rfl⟩⟩
+      | some srcArg =>
+        dsimp only
+        cases resolveRawPtrElemLayout target decls layouts argOps with
+        | fault kind => exact ⟨rfl, Or.inl ⟨_, rfl⟩⟩
+        | ok elemTy size align =>
+          dsimp only
+          cases Nat.ble (signedHalfModulus (layoutPointerBytes layouts))
+              (Nat.mul countSc.bits size) with
+          | true => exact ⟨rfl, Or.inl ⟨_, rfl⟩⟩
+          | false =>
+            dsimp only
+            have h_dst := classifyRawPtrTarget_borrows_nil globals dstArg
+            have h_src := classifyRawPtrTarget_borrows_nil globals srcArg
+            rw [rawPtrTargetAligned?_of_not_stack cs cs' _ _ _ _ dstArg _ h_dst,
+              rawPtrTargetAligned?_of_not_stack cs cs' _ _ _ _ srcArg _ h_src]
+            refine ⟨?_, ?_⟩
+            · rcases h_dst with h | h | ⟨ptr, alloc, h⟩ <;>
+                rcases h_src with h' | h' | ⟨ptr', alloc', h'⟩ <;> rw [h, h']
+            · rcases h_dst with h | h | ⟨ptr, alloc, h⟩ <;>
+                rcases h_src with h' | h' | ⟨ptr', alloc', h'⟩ <;> rw [h, h'] <;> dsimp only <;>
+                repeat' (first
+                  | exact Or.inl ⟨_, rfl⟩
+                  | exact Or.inr rfl
+                  | split)
+
+/-- A volatile copy commutes with `MachineState.pushBaseStack` on every successful (call-free)
+step. -/
+theorem evalVolatileCopyMemoryCall_pushBaseStack_of_noCallWP
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (nonOverlapping : Bool)
+    (ms : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    {Q : MirExecState → Prop} {P : Value → Memory → Prop}
+    (h_st :
+      evalNodeNoCallWP Q (mirNormalPost P)
+        (evalVolatileCopyMemoryCall nonOverlapping ms target bodyLocalDecls bodyLayouts argOps
+          argVals locals' destination targetBb))
+    (h_bor : baseStack = [] ∨ ms.memory.borrows = []) :
+    ∃ nextSt : MachineState,
+      evalVolatileCopyMemoryCall nonOverlapping ms target bodyLocalDecls bodyLayouts argOps
+          argVals locals' destination targetBb = MirStepNode.step nextSt ∧
+      evalVolatileCopyMemoryCall nonOverlapping
+          (MachineState.pushBaseStack calleeBody baseStack ms) target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb =
+        MirStepNode.step (MachineState.pushBaseStack calleeBody baseStack nextSt) := by
+  rcases h_bor with rfl | h_nil
+  · have h_plan :
+        volatileCopyPlan nonOverlapping
+            (MachineState.pushBaseStack calleeBody [] ms).memory.borrows
+            (MachineState.pushBaseStack calleeBody [] ms).memory.globals
+            (MachineState.pushBaseStack calleeBody [] ms).memory.callStack target bodyLocalDecls
+            bodyLayouts argOps argVals locals' =
+          volatileCopyPlan nonOverlapping ms.memory.borrows ms.memory.globals ms.memory.callStack
+            target bodyLocalDecls bodyLayouts argOps argVals locals' := rfl
+    unfold evalVolatileCopyMemoryCall at h_st ⊢
+    rw [h_plan]
+    cases h_p : volatileCopyPlan nonOverlapping ms.memory.borrows ms.memory.globals
+        ms.memory.callStack target bodyLocalDecls bodyLayouts argOps argVals locals' with
+    | fault kind => rw [h_p] at h_st; exact False.elim h_st
+    | noCopy =>
+      rw [h_p] at h_st
+      exact writeIntrinsicReturn_pushBaseStack_of_noCallWP calleeBody [] ms locals' destination
+        targetBb .unit h_st (Or.inl rfl)
+    | nonOverlapping srcOp dstOp srcVal dstVal count =>
+      rw [h_p] at h_st
+      dsimp only at h_st ⊢
+      rcases evalCopyNonOverlappingWithCount_isStmtNode ms srcOp dstOp bodyLocalDecls bodyLayouts
+          srcVal dstVal count locals' with ⟨s', hs'⟩ | ⟨fk, hf⟩ | hu
+      · rw [hs'] at h_st
+        rw [evalCopyNonOverlappingWithCount_pushBaseStack, hs']
+        exact writeIntrinsicReturn_pushBaseStack_of_noCallWP calleeBody []
+          { ms with memory := s'.memory } s'.frame.locals destination targetBb .unit h_st
+          (Or.inl rfl)
+      · rw [hf] at h_st; exact False.elim h_st
+      · rw [hu] at h_st; exact False.elim h_st
+    | withinLocal srcPtr dstPtr srcEntry dstEntry byteCount =>
+      rw [h_p] at h_st
+      exact finishRawPtrCallAction_pushBaseStack_nil_of_noCallWP calleeBody ms locals'
+        destination targetBb _ h_st
+  · unfold evalVolatileCopyMemoryCall at h_st ⊢
+    have h_b : (MachineState.pushBaseStack calleeBody baseStack ms).memory.borrows = [] := h_nil
+    rw [h_b]
+    rw [h_nil] at h_st ⊢
+    obtain ⟨h_eq, h_c⟩ := volatileCopyPlan_borrows_nil nonOverlapping ms.memory.globals
+      ms.memory.callStack (MachineState.pushBaseStack calleeBody baseStack ms).memory.callStack
+      target bodyLocalDecls bodyLayouts argOps argVals locals'
+    have h_eq' :
+        volatileCopyPlan nonOverlapping []
+            (MachineState.pushBaseStack calleeBody baseStack ms).memory.globals
+            (MachineState.pushBaseStack calleeBody baseStack ms).memory.callStack target
+            bodyLocalDecls bodyLayouts argOps argVals locals' =
+          volatileCopyPlan nonOverlapping [] ms.memory.globals ms.memory.callStack target
+            bodyLocalDecls bodyLayouts argOps argVals locals' :=
+      h_eq.symm
+    rw [h_eq']
+    rcases h_c with ⟨kind, h_k⟩ | h_r
+    · rw [h_k] at h_st; exact False.elim h_st
+    · rw [h_r] at h_st ⊢
+      exact writeIntrinsicReturn_pushBaseStack_of_noCallWP calleeBody baseStack ms locals'
+        destination targetBb .unit h_st (Or.inr h_nil)
+
+/-- With no Tree Borrows entries, a volatile set faults or writes nothing, independently of the
+call stack. -/
+theorem volatileSetPlan_borrows_nil
+    (globals : List CapturedAllocation)
+    (cs cs' : List SavedCallerFrame) (target : ResolvedCallTarget)
+    (decls : List LocalDecl) (layouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot) :
+    volatileSetPlan [] globals cs target decls layouts argOps argVals locals' =
+      volatileSetPlan [] globals cs' target decls layouts argOps argVals locals' ∧
+    ((∃ kind, volatileSetPlan [] globals cs target decls layouts argOps argVals locals' =
+        .fault kind) ∨
+      volatileSetPlan [] globals cs target decls layouts argOps argVals locals' = .noWrite) := by
+  unfold volatileSetPlan
+  rcases argVals with
+    _ | ⟨dstVal, _ | ⟨_ | valSc | ⟨_, _⟩ | ⟨_, _⟩ | _,
+      _ | ⟨_ | countSc | ⟨_, _⟩ | ⟨_, _⟩ | _, _ | ⟨_, _⟩⟩⟩⟩ <;>
+    try exact ⟨rfl, Or.inl ⟨_, rfl⟩⟩
+  dsimp only
+  cases Bool.and (Nat.beq valSc.sizeBytes 1)
+      (Bool.and (Nat.blt valSc.bits 256)
+        (Nat.beq countSc.sizeBytes (layoutPointerBytes layouts))) with
+  | false => exact ⟨rfl, Or.inl ⟨_, rfl⟩⟩
+  | true =>
+    cases rawPtrArgOfValue? (layoutPointerBytes layouts) dstVal with
+    | none => exact ⟨rfl, Or.inl ⟨_, rfl⟩⟩
+    | some dstArg =>
+      dsimp only
+      cases resolveRawPtrElemLayout target decls layouts argOps with
+      | fault kind => exact ⟨rfl, Or.inl ⟨_, rfl⟩⟩
+      | ok elemTy size align =>
+        dsimp only
+        cases Nat.ble (signedHalfModulus (layoutPointerBytes layouts))
+            (Nat.mul countSc.bits size) with
+        | true => exact ⟨rfl, Or.inl ⟨_, rfl⟩⟩
+        | false =>
+          dsimp only
+          have h_dst := classifyRawPtrTarget_borrows_nil globals dstArg
+          rw [rawPtrTargetAligned?_of_not_stack cs cs' _ _ _ _ dstArg _ h_dst]
+          refine ⟨?_, ?_⟩
+          · rcases h_dst with h | h | ⟨ptr, alloc, h⟩ <;> rw [h]
+          · rcases h_dst with h | h | ⟨ptr, alloc, h⟩ <;> rw [h] <;> dsimp only <;>
+              repeat' (first
+                | exact Or.inl ⟨_, rfl⟩
+                | exact Or.inr rfl
+                | split)
+
+/-- A volatile set commutes with `MachineState.pushBaseStack` on every successful (call-free)
+step. -/
+theorem evalVolatileSetMemoryCall_pushBaseStack_of_noCallWP
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (ms : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    {Q : MirExecState → Prop} {P : Value → Memory → Prop}
+    (h_st :
+      evalNodeNoCallWP Q (mirNormalPost P)
+        (evalVolatileSetMemoryCall ms target bodyLocalDecls bodyLayouts argOps argVals locals'
+          destination targetBb))
+    (h_bor : baseStack = [] ∨ ms.memory.borrows = []) :
+    ∃ nextSt : MachineState,
+      evalVolatileSetMemoryCall ms target bodyLocalDecls bodyLayouts argOps argVals locals'
+          destination targetBb = MirStepNode.step nextSt ∧
+      evalVolatileSetMemoryCall (MachineState.pushBaseStack calleeBody baseStack ms) target
+          bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb =
+        MirStepNode.step (MachineState.pushBaseStack calleeBody baseStack nextSt) := by
+  rcases h_bor with rfl | h_nil
+  · have h_plan :
+        volatileSetPlan (MachineState.pushBaseStack calleeBody [] ms).memory.borrows
+            (MachineState.pushBaseStack calleeBody [] ms).memory.globals
+            (MachineState.pushBaseStack calleeBody [] ms).memory.callStack target bodyLocalDecls
+            bodyLayouts argOps argVals locals' =
+          volatileSetPlan ms.memory.borrows ms.memory.globals ms.memory.callStack target
+            bodyLocalDecls bodyLayouts argOps argVals locals' := rfl
+    unfold evalVolatileSetMemoryCall at h_st ⊢
+    rw [h_plan]
+    cases h_p : volatileSetPlan ms.memory.borrows ms.memory.globals ms.memory.callStack target
+        bodyLocalDecls bodyLayouts argOps argVals locals' with
+    | fault kind => rw [h_p] at h_st; exact False.elim h_st
+    | noWrite =>
+      rw [h_p] at h_st
+      exact writeIntrinsicReturn_pushBaseStack_of_noCallWP calleeBody [] ms locals' destination
+        targetBb .unit h_st (Or.inl rfl)
+    | writeBytes =>
+      rw [h_p] at h_st
+      exact evalWriteBytesCall_pushBaseStack_of_noCallWP calleeBody [] ms target bodyLocalDecls
+        bodyLayouts argOps argVals locals' destination targetBb h_st (Or.inl rfl)
+  · unfold evalVolatileSetMemoryCall at h_st ⊢
+    have h_b : (MachineState.pushBaseStack calleeBody baseStack ms).memory.borrows = [] := h_nil
+    rw [h_b]
+    rw [h_nil] at h_st ⊢
+    obtain ⟨h_eq, h_c⟩ := volatileSetPlan_borrows_nil ms.memory.globals
+      ms.memory.callStack (MachineState.pushBaseStack calleeBody baseStack ms).memory.callStack
+      target bodyLocalDecls bodyLayouts argOps argVals locals'
+    have h_eq' :
+        volatileSetPlan []
+            (MachineState.pushBaseStack calleeBody baseStack ms).memory.globals
+            (MachineState.pushBaseStack calleeBody baseStack ms).memory.callStack target
+            bodyLocalDecls bodyLayouts argOps argVals locals' =
+          volatileSetPlan [] ms.memory.globals ms.memory.callStack target
+            bodyLocalDecls bodyLayouts argOps argVals locals' :=
+      h_eq.symm
+    rw [h_eq']
+    rcases h_c with ⟨kind, h_k⟩ | h_r
+    · rw [h_k] at h_st; exact False.elim h_st
+    · rw [h_r] at h_st ⊢
+      exact writeIntrinsicReturn_pushBaseStack_of_noCallWP calleeBody baseStack ms locals'
+        destination targetBb .unit h_st (Or.inr h_nil)
+
+/-- A volatile memory intrinsic commutes with `MachineState.pushBaseStack` on every successful
+(call-free) step. -/
+theorem evalVolatileMemIntrinsicCall_pushBaseStack_of_noCallWP
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (kind : RustIntrinsicKind)
+    (ms : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    {Q : MirExecState → Prop} {P : Value → Memory → Prop}
+    (h_st :
+      evalNodeNoCallWP Q (mirNormalPost P)
+        (evalVolatileMemIntrinsicCall kind ms target bodyLocalDecls bodyLayouts argOps argVals
+          locals' destination targetBb))
+    (h_bor : baseStack = [] ∨ ms.memory.borrows = []) :
+    ∃ nextSt : MachineState,
+      evalVolatileMemIntrinsicCall kind ms target bodyLocalDecls bodyLayouts argOps argVals
+          locals' destination targetBb = MirStepNode.step nextSt ∧
+      evalVolatileMemIntrinsicCall kind (MachineState.pushBaseStack calleeBody baseStack ms)
+          target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb =
+        MirStepNode.step (MachineState.pushBaseStack calleeBody baseStack nextSt) := by
+  cases kind <;>
+    first
+    | exact False.elim h_st
+    | exact evalRawPtrLoadCall_pushBaseStack_of_noCallWP calleeBody baseStack _ _ ms target
+        bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb h_st h_bor
+    | exact evalRawPtrStoreCall_pushBaseStack_of_noCallWP calleeBody baseStack _ _ ms target
+        bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb h_st h_bor
+    | exact evalVolatileCopyMemoryCall_pushBaseStack_of_noCallWP calleeBody baseStack _ ms target
+        bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb h_st h_bor
+    | exact evalVolatileSetMemoryCall_pushBaseStack_of_noCallWP calleeBody baseStack ms target
+        bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb h_st h_bor
+
+/-- A successful `evalUnlinkedPtrAccessCall?` is a raw-pointer load or store whose flags depend
+only on the callee's `DefPath`. -/
+theorem evalUnlinkedPtrAccessCall?_eq_some
+    (ms : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (stepNode : MirStepNode)
+    (h_di :
+      evalUnlinkedPtrAccessCall? ms target bodyLocalDecls bodyLayouts argOps argVals locals'
+        destination targetBb = some stepNode) :
+    (∃ isVolatile requiresAlign,
+      stepNode =
+        evalRawPtrLoadCall isVolatile requiresAlign ms target bodyLocalDecls bodyLayouts argOps
+          argVals locals' destination targetBb ∧
+      ∀ ms' : MachineState,
+        evalUnlinkedPtrAccessCall? ms' target bodyLocalDecls bodyLayouts argOps argVals locals'
+            destination targetBb =
+          some
+            (evalRawPtrLoadCall isVolatile requiresAlign ms' target bodyLocalDecls bodyLayouts
+              argOps argVals locals' destination targetBb)) ∨
+    (∃ isVolatile requiresAlign,
+      stepNode =
+        evalRawPtrStoreCall isVolatile requiresAlign ms target bodyLocalDecls bodyLayouts argOps
+          argVals locals' destination targetBb ∧
+      ∀ ms' : MachineState,
+        evalUnlinkedPtrAccessCall? ms' target bodyLocalDecls bodyLayouts argOps argVals locals'
+            destination targetBb =
+          some
+            (evalRawPtrStoreCall isVolatile requiresAlign ms' target bodyLocalDecls bodyLayouts
+              argOps argVals locals' destination targetBb)) := by
+  unfold evalUnlinkedPtrAccessCall? at h_di ⊢
+  cases h1 : stringEq target.defPath "core::ptr::read_unaligned" with
+  | true =>
+    rw [h1] at h_di
+    exact Or.inl ⟨false, false, (Option.some.inj h_di).symm, fun _ => rfl⟩
+  | false =>
+    rw [h1] at h_di
+    dsimp only at h_di ⊢
+    cases h2 : stringEq target.defPath "core::ptr::write_unaligned" with
+    | true =>
+      rw [h2] at h_di
+      exact Or.inr ⟨false, false, (Option.some.inj h_di).symm, fun _ => rfl⟩
+    | false =>
+      rw [h2] at h_di
+      dsimp only at h_di ⊢
+      cases h3 : stringEq target.defPath "core::ptr::read_volatile" with
+      | true =>
+        rw [h3] at h_di
+        exact Or.inl ⟨true, true, (Option.some.inj h_di).symm, fun _ => rfl⟩
+      | false =>
+        rw [h3] at h_di
+        dsimp only at h_di ⊢
+        cases h4 : stringEq target.defPath "core::ptr::write_volatile" with
+        | true =>
+          rw [h4] at h_di
+          exact Or.inr ⟨true, true, (Option.some.inj h_di).symm, fun _ => rfl⟩
+        | false =>
+          rw [h4] at h_di
+          cases h_di
+
+/-- An unlinked `core::ptr` raw-pointer access commutes with `MachineState.pushBaseStack` on
+every successful (call-free) step. -/
+theorem evalUnlinkedPtrAccessCall?_pushBaseStack_of_noCallWP
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (ms : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (stepNode : MirStepNode)
+    {Q : MirExecState → Prop} {P : Value → Memory → Prop}
+    (h_di :
+      evalUnlinkedPtrAccessCall? ms target bodyLocalDecls bodyLayouts argOps argVals locals'
+        destination targetBb = some stepNode)
+    (h_st : evalNodeNoCallWP Q (mirNormalPost P) stepNode)
+    (h_bor : baseStack = [] ∨ ms.memory.borrows = []) :
+    ∃ nextSt : MachineState,
+      stepNode = MirStepNode.step nextSt ∧
+      evalUnlinkedPtrAccessCall? (MachineState.pushBaseStack calleeBody baseStack ms) target
+          bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb =
+        some (MirStepNode.step (MachineState.pushBaseStack calleeBody baseStack nextSt)) := by
+  rcases evalUnlinkedPtrAccessCall?_eq_some ms target bodyLocalDecls bodyLayouts argOps argVals
+      locals' destination targetBb stepNode h_di with
+    ⟨isVolatile, requiresAlign, rfl, h_all⟩ | ⟨isVolatile, requiresAlign, rfl, h_all⟩
+  · obtain ⟨nextSt, h1, h2⟩ := evalRawPtrLoadCall_pushBaseStack_of_noCallWP calleeBody baseStack
+      isVolatile requiresAlign ms target bodyLocalDecls bodyLayouts argOps argVals locals'
+      destination targetBb h_st h_bor
+    exact ⟨nextSt, h1, (h_all _).trans (congrArg some h2)⟩
+  · obtain ⟨nextSt, h1, h2⟩ := evalRawPtrStoreCall_pushBaseStack_of_noCallWP calleeBody baseStack
+      isVolatile requiresAlign ms target bodyLocalDecls bodyLayouts argOps argVals locals'
+      destination targetBb h_st h_bor
+    exact ⟨nextSt, h1, (h_all _).trans (congrArg some h2)⟩
+
 @[reducible]
 def selectTupleTyOpt : List RigidTy → Option RigidTy
   | firstTy :: _ => some firstTy
@@ -394,7 +988,8 @@ theorem evalDirectRustIntrinsic?_nonSelect
     (h_cl : classifyRustIntrinsic? target.defPath = some rk)
     (h_ne : rk ≠ .constEvalSelect)
     (h_nc : rk ≠ .copyNonOverlapping)
-    (h_nw : rk ≠ .writeBytes) :
+    (h_nw : rk ≠ .writeBytes)
+    (h_nv : isVolatileMemIntrinsicKind rk = false) :
     evalDirectRustIntrinsic? s currentBody target bodyLocalDecls bodyLayouts
       argOps argVals locals' destination targetBb unwind =
     some (evalNonSelectIntrinsicCall rk s target bodyLocalDecls bodyLayouts
@@ -407,6 +1002,42 @@ theorem evalDirectRustIntrinsic?_nonSelect
     | exact False.elim (h_nc rfl)
     | exact False.elim (h_nw rfl)
     | rfl
+    | cases h_nv
+
+/-- A direct call to a volatile memory intrinsic (`isVolatileMemIntrinsicKind`) is dispatched to
+`evalVolatileMemIntrinsicCall`. -/
+theorem evalDirectRustIntrinsic?_volatileMem
+    (s : MachineState) (currentBody : Option CapturedMir)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction)
+    {rk : RustIntrinsicKind}
+    (h_cl : classifyRustIntrinsic? target.defPath = some rk)
+    (h_vm : isVolatileMemIntrinsicKind rk = true) :
+    evalDirectRustIntrinsic? s currentBody target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb unwind =
+    some (evalVolatileMemIntrinsicCall rk s target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb) := by
+  unfold evalDirectRustIntrinsic?
+  rw [h_cl]
+  cases rk <;> first | rfl | cases h_vm
+
+/-- A direct call to a non-intrinsic `DefPath` reaches the unlinked `core::ptr` raw-pointer access
+dispatch (`evalUnlinkedPtrAccessCall?`). -/
+theorem evalDirectRustIntrinsic?_none
+    (s : MachineState) (currentBody : Option CapturedMir)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction)
+    (h_cl : classifyRustIntrinsic? target.defPath = none) :
+    evalDirectRustIntrinsic? s currentBody target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb unwind =
+    evalUnlinkedPtrAccessCall? s target bodyLocalDecls bodyLayouts argOps argVals locals'
+      destination targetBb := by
+  unfold evalDirectRustIntrinsic?
+  rw [h_cl]
 
 theorem evalDirectRustIntrinsic?_copyNonOverlapping
     (s : MachineState) (currentBody : Option CapturedMir)
@@ -458,9 +1089,10 @@ theorem evalDirectRustIntrinsic?_pushBaseStack_of_noCallWP
         some (MirStepNode.step (MachineState.pushBaseStack calleeBody baseStack nextSt)) := by
   cases h_cl : classifyRustIntrinsic? target.defPath with
   | none =>
-    unfold evalDirectRustIntrinsic? at h_di
-    rw [h_cl] at h_di
-    cases h_di
+    rw [evalDirectRustIntrinsic?_none _ _ _ _ _ _ _ _ _ _ _ h_cl] at h_di ⊢
+    exact evalUnlinkedPtrAccessCall?_pushBaseStack_of_noCallWP calleeBody baseStack ms target
+      curBody.localDecls curBody.layouts argOps argVals locals' destination targetBb stepNode
+      h_di h_st h_bor
   | some rk =>
     by_cases h_cs : rk = .constEvalSelect
     · subst h_cs
@@ -626,7 +1258,19 @@ theorem evalDirectRustIntrinsic?_pushBaseStack_of_noCallWP
             curBody.localDecls curBody.layouts argOps argVals locals' destination targetBb
             h_st h_bor with ⟨nextSt, h1, h2⟩
         exact ⟨nextSt, h1, congrArg some h2⟩
-      rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ h_cl h_cs h_cn h_wb] at h_di ⊢
+      by_cases h_vm : isVolatileMemIntrinsicKind rk = true
+      · rw [evalDirectRustIntrinsic?_volatileMem _ _ _ _ _ _ _ _ _ _ _ h_cl h_vm] at h_di ⊢
+        injection h_di with h_sn
+        subst h_sn
+        rcases evalVolatileMemIntrinsicCall_pushBaseStack_of_noCallWP calleeBody baseStack rk ms
+            target curBody.localDecls curBody.layouts argOps argVals locals' destination targetBb
+            h_st h_bor with ⟨nextSt, h1, h2⟩
+        exact ⟨nextSt, h1, congrArg some h2⟩
+      have h_nv : isVolatileMemIntrinsicKind rk = false := by
+        cases h_b : isVolatileMemIntrinsicKind rk
+        · rfl
+        · exact absurd h_b h_vm
+      rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ h_cl h_cs h_cn h_wb h_nv] at h_di ⊢
       injection h_di with h_sn
       subst h_sn
       rcases evalNonSelectIntrinsicCall_pushBaseStack_of_noCallWP calleeBody
@@ -2987,6 +3631,255 @@ private theorem evalWriteBytesCall_borrows_ne_nil_of_noCallWP
     · rw [hf] at h_st; exact False.elim h_st
     · rw [hu] at h_st; exact False.elim h_st
 
+private theorem borrowsAfterRawPtrRead_ne_nil
+    {bs bs' : List BorrowEntry} {ap : List Nat} {p : ProvenancePtr} {e : BorrowEntry}
+    (h : bs ≠ [])
+    (hok : borrowsAfterRawPtrRead bs ap p e = some bs') :
+    bs' ≠ [] := by
+  unfold borrowsAfterRawPtrRead at hok
+  rcases bs with _ | ⟨b1, _ | ⟨b2, br⟩⟩
+  · exact False.elim (h rfl)
+  · rw [← Option.some.inj hok]; nofun
+  · dsimp only at hok
+    have h1 := opt_guard_eq_some hok
+    rw [← Option.some.inj h1]
+    exact freezeTreeBorrowsOnReadAtProj_ne_nil (by nofun)
+
+/-- The Tree Borrows state a raw-pointer access action installs is non-empty. -/
+private def rawPtrCallActionBorrowsNeNil : RawPtrCallAction → Prop
+  | .retBorrows borrows' _ => borrows' ≠ []
+  | .retStack borrows' _ _ _ _ => borrows' ≠ []
+  | _ => True
+
+private theorem finishRawPtrCallAction_borrows_ne_nil_of_noCallWP
+    (ms : MachineState) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) (act : RawPtrCallAction)
+    {Q : MirExecState → Prop} {R : MirOutcome → Prop}
+    (h_ne : ms.memory.borrows ≠ [])
+    (h_act : rawPtrCallActionBorrowsNeNil act)
+    (h_st : evalNodeNoCallWP Q R (finishRawPtrCallAction ms locals' destination targetBb act)) :
+    ∃ nextSt : MachineState,
+      finishRawPtrCallAction ms locals' destination targetBb act = MirStepNode.step nextSt ∧
+      nextSt.memory.borrows ≠ [] := by
+  cases act with
+  | fault kind => exact False.elim h_st
+  | ret retVal =>
+    exact writeIntrinsicReturn_borrows_ne_nil_of_noCallWP ms locals' destination targetBb retVal
+      h_ne h_st
+  | retBorrows borrows' retVal =>
+    exact writeIntrinsicReturn_borrows_ne_nil_of_noCallWP
+      { ms with memory := { ms.memory with borrows := borrows' } } locals' destination targetBb
+      retVal h_act h_st
+  | retStack borrows' locals₄ callStack' callerLocals' retVal =>
+    exact writeIntrinsicReturn_borrows_ne_nil_of_noCallWP
+      { ms with
+        memory :=
+          { ms.memory with
+            borrows := borrows'
+            callStack := callStack'
+            callerLocals := callerLocals' } }
+      locals₄ destination targetBb retVal h_act h_st
+
+private theorem rawPtrLoadAction_borrowsNeNil
+    {isVolatile requiresAlign : Bool} {borrows : List BorrowEntry}
+    {globals : List CapturedAllocation} {cs : List SavedCallerFrame} {ap : List Nat}
+    {target : ResolvedCallTarget} {decls : List LocalDecl} {layouts : LayoutTable}
+    {argOps : List Operand} {argVals : List Value} {locals' : List LocalSlot}
+    (h_ne : borrows ≠ []) :
+    rawPtrCallActionBorrowsNeNil
+      (rawPtrLoadAction isVolatile requiresAlign borrows globals cs ap target decls layouts argOps
+        argVals locals') := by
+  unfold rawPtrLoadAction
+  dsimp only
+  repeat' split
+  all_goals first
+    | exact True.intro
+    | exact borrowsAfterRawPtrRead_ne_nil h_ne (by assumption)
+
+private theorem rawPtrStoreAction_borrowsNeNil
+    {isVolatile requiresAlign : Bool} {borrows : List BorrowEntry}
+    {globals : List CapturedAllocation} {cs : List SavedCallerFrame} {cl : List LocalSlot}
+    {ap : List Nat}
+    {target : ResolvedCallTarget} {decls : List LocalDecl} {layouts : LayoutTable}
+    {argOps : List Operand} {argVals : List Value} {locals' : List LocalSlot}
+    (h_ne : borrows ≠ []) :
+    rawPtrCallActionBorrowsNeNil
+      (rawPtrStoreAction isVolatile requiresAlign borrows globals cs cl ap target decls layouts
+        argOps argVals locals') := by
+  unfold rawPtrStoreAction
+  dsimp only
+  repeat' split
+  all_goals first
+    | exact True.intro
+    | exact borrowsAfterWriteBytes_ne_nil h_ne (by assumption)
+
+private theorem volatileCopyWithinLocalAction_borrowsNeNil
+    {borrows : List BorrowEntry} {cs : List SavedCallerFrame} {cl : List LocalSlot}
+    {ap : List Nat} {decls : List LocalDecl} {layouts : LayoutTable} {locals' : List LocalSlot}
+    {srcPtr dstPtr : ProvenancePtr} {srcEntry dstEntry : BorrowEntry} {byteCount : Nat}
+    (h_ne : borrows ≠ []) :
+    rawPtrCallActionBorrowsNeNil
+      (volatileCopyWithinLocalAction borrows cs cl ap decls layouts locals' srcPtr dstPtr srcEntry
+        dstEntry byteCount) := by
+  unfold volatileCopyWithinLocalAction
+  dsimp only
+  repeat' split
+  all_goals first
+    | exact True.intro
+    | exact borrowsAfterCopySingleDirect_ne_nil h_ne (by assumption)
+
+private theorem evalRawPtrLoadCall_borrows_ne_nil_of_noCallWP
+    (isVolatile requiresAlign : Bool)
+    (ms : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    {Q : MirExecState → Prop} {P : Value → Memory → Prop}
+    (h_ne : ms.memory.borrows ≠ [])
+    (h_st :
+      evalNodeNoCallWP Q (mirNormalPost P)
+        (evalRawPtrLoadCall isVolatile requiresAlign ms target bodyLocalDecls bodyLayouts argOps
+          argVals locals' destination targetBb)) :
+    ∃ nextSt : MachineState,
+      evalRawPtrLoadCall isVolatile requiresAlign ms target bodyLocalDecls bodyLayouts argOps
+          argVals locals' destination targetBb = MirStepNode.step nextSt ∧
+      nextSt.memory.borrows ≠ [] :=
+  finishRawPtrCallAction_borrows_ne_nil_of_noCallWP ms locals' destination targetBb _ h_ne
+    (rawPtrLoadAction_borrowsNeNil h_ne) h_st
+
+private theorem evalRawPtrStoreCall_borrows_ne_nil_of_noCallWP
+    (isVolatile requiresAlign : Bool)
+    (ms : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    {Q : MirExecState → Prop} {P : Value → Memory → Prop}
+    (h_ne : ms.memory.borrows ≠ [])
+    (h_st :
+      evalNodeNoCallWP Q (mirNormalPost P)
+        (evalRawPtrStoreCall isVolatile requiresAlign ms target bodyLocalDecls bodyLayouts argOps
+          argVals locals' destination targetBb)) :
+    ∃ nextSt : MachineState,
+      evalRawPtrStoreCall isVolatile requiresAlign ms target bodyLocalDecls bodyLayouts argOps
+          argVals locals' destination targetBb = MirStepNode.step nextSt ∧
+      nextSt.memory.borrows ≠ [] :=
+  finishRawPtrCallAction_borrows_ne_nil_of_noCallWP ms locals' destination targetBb _ h_ne
+    (rawPtrStoreAction_borrowsNeNil h_ne) h_st
+
+private theorem evalVolatileCopyMemoryCall_borrows_ne_nil_of_noCallWP
+    (nonOverlapping : Bool)
+    (ms : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    {Q : MirExecState → Prop} {P : Value → Memory → Prop}
+    (h_ne : ms.memory.borrows ≠ [])
+    (h_st :
+      evalNodeNoCallWP Q (mirNormalPost P)
+        (evalVolatileCopyMemoryCall nonOverlapping ms target bodyLocalDecls bodyLayouts argOps
+          argVals locals' destination targetBb)) :
+    ∃ nextSt : MachineState,
+      evalVolatileCopyMemoryCall nonOverlapping ms target bodyLocalDecls bodyLayouts argOps
+          argVals locals' destination targetBb = MirStepNode.step nextSt ∧
+      nextSt.memory.borrows ≠ [] := by
+  unfold evalVolatileCopyMemoryCall at h_st ⊢
+  cases h_p : volatileCopyPlan nonOverlapping ms.memory.borrows ms.memory.globals
+      ms.memory.callStack target bodyLocalDecls bodyLayouts argOps argVals locals' with
+  | fault kind => rw [h_p] at h_st; exact False.elim h_st
+  | noCopy =>
+    rw [h_p] at h_st
+    exact writeIntrinsicReturn_borrows_ne_nil_of_noCallWP ms locals' destination targetBb .unit
+      h_ne h_st
+  | nonOverlapping srcOp dstOp srcVal dstVal count =>
+    rw [h_p] at h_st
+    dsimp only at h_st ⊢
+    have h_sn := evalCopyNonOverlappingWithCount_ne_nil (src := srcOp) (dst := dstOp)
+      (ld := bodyLocalDecls) (ly := bodyLayouts) (sv := srcVal) (dv := dstVal)
+      (cnt := count) (l3 := locals') h_ne
+    rcases evalCopyNonOverlappingWithCount_isStmtNode ms srcOp dstOp bodyLocalDecls bodyLayouts
+        srcVal dstVal count locals' with ⟨s', hs'⟩ | ⟨fk, hf⟩ | hu
+    · rw [hs'] at h_st ⊢
+      exact writeIntrinsicReturn_borrows_ne_nil_of_noCallWP { ms with memory := s'.memory }
+        s'.frame.locals destination targetBb .unit (h_sn s' hs') h_st
+    · rw [hf] at h_st; exact False.elim h_st
+    · rw [hu] at h_st; exact False.elim h_st
+  | withinLocal srcPtr dstPtr srcEntry dstEntry byteCount =>
+    rw [h_p] at h_st
+    exact finishRawPtrCallAction_borrows_ne_nil_of_noCallWP ms locals' destination targetBb _
+      h_ne (volatileCopyWithinLocalAction_borrowsNeNil h_ne) h_st
+
+private theorem evalVolatileSetMemoryCall_borrows_ne_nil_of_noCallWP
+    (ms : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    {Q : MirExecState → Prop} {P : Value → Memory → Prop}
+    (h_ne : ms.memory.borrows ≠ [])
+    (h_st :
+      evalNodeNoCallWP Q (mirNormalPost P)
+        (evalVolatileSetMemoryCall ms target bodyLocalDecls bodyLayouts argOps argVals locals'
+          destination targetBb)) :
+    ∃ nextSt : MachineState,
+      evalVolatileSetMemoryCall ms target bodyLocalDecls bodyLayouts argOps argVals locals'
+          destination targetBb = MirStepNode.step nextSt ∧
+      nextSt.memory.borrows ≠ [] := by
+  unfold evalVolatileSetMemoryCall at h_st ⊢
+  cases h_p : volatileSetPlan ms.memory.borrows ms.memory.globals ms.memory.callStack target
+      bodyLocalDecls bodyLayouts argOps argVals locals' with
+  | fault kind => rw [h_p] at h_st; exact False.elim h_st
+  | noWrite =>
+    rw [h_p] at h_st
+    exact writeIntrinsicReturn_borrows_ne_nil_of_noCallWP ms locals' destination targetBb .unit
+      h_ne h_st
+  | writeBytes =>
+    rw [h_p] at h_st
+    exact evalWriteBytesCall_borrows_ne_nil_of_noCallWP ms target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb h_ne h_st
+
+private theorem evalVolatileMemIntrinsicCall_borrows_ne_nil_of_noCallWP
+    (kind : RustIntrinsicKind)
+    (ms : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    {Q : MirExecState → Prop} {P : Value → Memory → Prop}
+    (h_ne : ms.memory.borrows ≠ [])
+    (h_st :
+      evalNodeNoCallWP Q (mirNormalPost P)
+        (evalVolatileMemIntrinsicCall kind ms target bodyLocalDecls bodyLayouts argOps argVals
+          locals' destination targetBb)) :
+    ∃ nextSt : MachineState,
+      evalVolatileMemIntrinsicCall kind ms target bodyLocalDecls bodyLayouts argOps argVals
+          locals' destination targetBb = MirStepNode.step nextSt ∧
+      nextSt.memory.borrows ≠ [] := by
+  cases kind <;>
+    first
+    | exact False.elim h_st
+    | exact evalRawPtrLoadCall_borrows_ne_nil_of_noCallWP _ _ ms target bodyLocalDecls
+        bodyLayouts argOps argVals locals' destination targetBb h_ne h_st
+    | exact evalRawPtrStoreCall_borrows_ne_nil_of_noCallWP _ _ ms target bodyLocalDecls
+        bodyLayouts argOps argVals locals' destination targetBb h_ne h_st
+    | exact evalVolatileCopyMemoryCall_borrows_ne_nil_of_noCallWP _ ms target bodyLocalDecls
+        bodyLayouts argOps argVals locals' destination targetBb h_ne h_st
+    | exact evalVolatileSetMemoryCall_borrows_ne_nil_of_noCallWP ms target bodyLocalDecls
+        bodyLayouts argOps argVals locals' destination targetBb h_ne h_st
+
+private theorem evalUnlinkedPtrAccessCall?_borrows_ne_nil_of_noCallWP
+    (ms : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (stepNode : MirStepNode)
+    {Q : MirExecState → Prop} {P : Value → Memory → Prop}
+    (h_ne : ms.memory.borrows ≠ [])
+    (h_di :
+      evalUnlinkedPtrAccessCall? ms target bodyLocalDecls bodyLayouts argOps argVals locals'
+        destination targetBb = some stepNode)
+    (h_st : evalNodeNoCallWP Q (mirNormalPost P) stepNode) :
+    ∃ nextSt : MachineState,
+      stepNode = MirStepNode.step nextSt ∧ nextSt.memory.borrows ≠ [] := by
+  rcases evalUnlinkedPtrAccessCall?_eq_some ms target bodyLocalDecls bodyLayouts argOps argVals
+      locals' destination targetBb stepNode h_di with
+    ⟨isVolatile, requiresAlign, rfl, _⟩ | ⟨isVolatile, requiresAlign, rfl, _⟩
+  · exact evalRawPtrLoadCall_borrows_ne_nil_of_noCallWP isVolatile requiresAlign ms target
+      bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb h_ne h_st
+  · exact evalRawPtrStoreCall_borrows_ne_nil_of_noCallWP isVolatile requiresAlign ms target
+      bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb h_ne h_st
+
 private theorem evalDirectRustIntrinsic?_borrows_ne_nil_of_noCallWP
     (ms : MachineState) (curBody : CapturedMir)
     (target : ResolvedCallTarget) (argOps : List Operand)
@@ -3004,7 +3897,9 @@ private theorem evalDirectRustIntrinsic?_borrows_ne_nil_of_noCallWP
       stepNode = MirStepNode.step nextSt ∧ nextSt.memory.borrows ≠ [] := by
   cases h_cl : classifyRustIntrinsic? target.defPath with
   | none =>
-    unfold evalDirectRustIntrinsic? at h_di; rw [h_cl] at h_di; cases h_di
+    rw [evalDirectRustIntrinsic?_none _ _ _ _ _ _ _ _ _ _ _ h_cl] at h_di
+    exact evalUnlinkedPtrAccessCall?_borrows_ne_nil_of_noCallWP ms target curBody.localDecls
+      curBody.layouts argOps argVals locals' destination targetBb stepNode h_ne h_di h_st
   | some rk =>
     by_cases h_cs : rk = .constEvalSelect
     · subst h_cs
@@ -3119,7 +4014,16 @@ private theorem evalDirectRustIntrinsic?_borrows_ne_nil_of_noCallWP
         injection h_di with h_sn; subst h_sn
         exact evalWriteBytesCall_borrows_ne_nil_of_noCallWP ms target curBody.localDecls
           curBody.layouts argOps argVals locals' destination targetBb h_ne h_st
-      rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ h_cl h_cs h_cn h_wb] at h_di
+      by_cases h_vm : isVolatileMemIntrinsicKind rk = true
+      · rw [evalDirectRustIntrinsic?_volatileMem _ _ _ _ _ _ _ _ _ _ _ h_cl h_vm] at h_di
+        injection h_di with h_sn; subst h_sn
+        exact evalVolatileMemIntrinsicCall_borrows_ne_nil_of_noCallWP rk ms target
+          curBody.localDecls curBody.layouts argOps argVals locals' destination targetBb h_ne h_st
+      have h_nv : isVolatileMemIntrinsicKind rk = false := by
+        cases h_b : isVolatileMemIntrinsicKind rk
+        · rfl
+        · exact absurd h_b h_vm
+      rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ h_cl h_cs h_cn h_wb h_nv] at h_di
       injection h_di with h_sn; subst h_sn
       exact evalNonSelectIntrinsicCall_borrows_ne_nil_of_noCallWP
         rk ms target curBody.localDecls curBody.layouts argOps argVals locals' destination targetBb h_ne h_st
@@ -4416,6 +5320,99 @@ theorem extCallAbortsProp_evalWriteBytesCall
     exact extCallAbortsProp_finishMemIntrinsicCall _ _ _ _
       (commitWriteBytesDstPlaceWrite_isStmtNode _ _ _ _ _ _ _)
 
+theorem extCallAbortsProp_finishRawPtrCallAction
+    (s : MachineState) (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) (act : RawPtrCallAction) :
+    extCallAbortsProp (finishRawPtrCallAction s locals' destination targetBb act) := by
+  cases act with
+  | fault _ => trivial
+  | ret _ => exact extCallAbortsProp_writeIntrinsicReturn _ _ _ _ _
+  | retBorrows _ _ => exact extCallAbortsProp_writeIntrinsicReturn _ _ _ _ _
+  | retStack _ _ _ _ _ => exact extCallAbortsProp_writeIntrinsicReturn _ _ _ _ _
+
+theorem extCallAbortsProp_evalRawPtrLoadCall
+    (isVolatile requiresAlign : Bool)
+    (s : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx) :
+    extCallAbortsProp
+      (evalRawPtrLoadCall isVolatile requiresAlign s target bodyLocalDecls bodyLayouts argOps
+        argVals locals' destination targetBb) :=
+  extCallAbortsProp_finishRawPtrCallAction _ _ _ _ _
+
+theorem extCallAbortsProp_evalRawPtrStoreCall
+    (isVolatile requiresAlign : Bool)
+    (s : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx) :
+    extCallAbortsProp
+      (evalRawPtrStoreCall isVolatile requiresAlign s target bodyLocalDecls bodyLayouts argOps
+        argVals locals' destination targetBb) :=
+  extCallAbortsProp_finishRawPtrCallAction _ _ _ _ _
+
+theorem extCallAbortsProp_evalVolatileCopyMemoryCall
+    (nonOverlapping : Bool)
+    (s : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx) :
+    extCallAbortsProp
+      (evalVolatileCopyMemoryCall nonOverlapping s target bodyLocalDecls bodyLayouts argOps
+        argVals locals' destination targetBb) := by
+  unfold evalVolatileCopyMemoryCall
+  cases volatileCopyPlan nonOverlapping s.memory.borrows s.memory.globals s.memory.callStack
+      target bodyLocalDecls bodyLayouts argOps argVals locals' with
+  | fault _ => trivial
+  | noCopy => exact extCallAbortsProp_writeIntrinsicReturn _ _ _ _ _
+  | nonOverlapping _ _ _ _ _ =>
+    exact extCallAbortsProp_finishMemIntrinsicCall _ _ _ _
+      (evalCopyNonOverlappingWithCount_isStmtNode _ _ _ _ _ _ _ _ _)
+  | withinLocal _ _ _ _ _ => exact extCallAbortsProp_finishRawPtrCallAction _ _ _ _ _
+
+theorem extCallAbortsProp_evalVolatileSetMemoryCall
+    (s : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx) :
+    extCallAbortsProp
+      (evalVolatileSetMemoryCall s target bodyLocalDecls bodyLayouts argOps argVals locals'
+        destination targetBb) := by
+  unfold evalVolatileSetMemoryCall
+  cases volatileSetPlan s.memory.borrows s.memory.globals s.memory.callStack target
+      bodyLocalDecls bodyLayouts argOps argVals locals' with
+  | fault _ => trivial
+  | noWrite => exact extCallAbortsProp_writeIntrinsicReturn _ _ _ _ _
+  | writeBytes => exact extCallAbortsProp_evalWriteBytesCall _ _ _ _ _ _ _ _ _
+
+theorem extCallAbortsProp_evalVolatileMemIntrinsicCall
+    (kind : RustIntrinsicKind)
+    (s : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx) :
+    extCallAbortsProp
+      (evalVolatileMemIntrinsicCall kind s target bodyLocalDecls bodyLayouts argOps argVals
+        locals' destination targetBb) := by
+  cases kind <;>
+    first
+    | trivial
+    | exact extCallAbortsProp_evalRawPtrLoadCall _ _ _ _ _ _ _ _ _ _ _
+    | exact extCallAbortsProp_evalRawPtrStoreCall _ _ _ _ _ _ _ _ _ _ _
+    | exact extCallAbortsProp_evalVolatileCopyMemoryCall _ _ _ _ _ _ _ _ _ _
+    | exact extCallAbortsProp_evalVolatileSetMemoryCall _ _ _ _ _ _ _ _ _
+
+theorem extCallAbortsProp_evalUnlinkedPtrAccessCall?
+    (s : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (stepNode : MirStepNode)
+    (h_di :
+      evalUnlinkedPtrAccessCall? s target bodyLocalDecls bodyLayouts argOps argVals locals'
+        destination targetBb = some stepNode) :
+    extCallAbortsProp stepNode := by
+  rcases evalUnlinkedPtrAccessCall?_eq_some s target bodyLocalDecls bodyLayouts argOps argVals
+      locals' destination targetBb stepNode h_di with
+    ⟨isVolatile, requiresAlign, rfl, _⟩ | ⟨isVolatile, requiresAlign, rfl, _⟩
+  · exact extCallAbortsProp_evalRawPtrLoadCall _ _ _ _ _ _ _ _ _ _ _
+  · exact extCallAbortsProp_evalRawPtrStoreCall _ _ _ _ _ _ _ _ _ _ _
+
 theorem extCallAbortsProp_evalDirectRustIntrinsic?
     (s : MachineState) (currentBody : Option CapturedMir)
     (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
@@ -4429,9 +5426,9 @@ theorem extCallAbortsProp_evalDirectRustIntrinsic?
     extCallAbortsProp stepNode := by
   cases h_cl : classifyRustIntrinsic? target.defPath with
   | none =>
-    unfold evalDirectRustIntrinsic? at h_di
-    rw [h_cl] at h_di
-    cases h_di
+    rw [evalDirectRustIntrinsic?_none _ _ _ _ _ _ _ _ _ _ _ h_cl] at h_di
+    exact extCallAbortsProp_evalUnlinkedPtrAccessCall? s target bodyLocalDecls bodyLayouts argOps
+      argVals locals' destination targetBb stepNode h_di
   | some rk =>
     by_cases h_cs : rk = .constEvalSelect
     · subst h_cs
@@ -4532,7 +5529,17 @@ theorem extCallAbortsProp_evalDirectRustIntrinsic?
         subst h_sn
         exact extCallAbortsProp_evalWriteBytesCall s target bodyLocalDecls bodyLayouts
           argOps argVals locals' destination targetBb
-      rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ h_cl h_cs h_cn h_wb] at h_di
+      by_cases h_vm : isVolatileMemIntrinsicKind rk = true
+      · rw [evalDirectRustIntrinsic?_volatileMem _ _ _ _ _ _ _ _ _ _ _ h_cl h_vm] at h_di
+        injection h_di with h_sn
+        subst h_sn
+        exact extCallAbortsProp_evalVolatileMemIntrinsicCall rk s target bodyLocalDecls
+          bodyLayouts argOps argVals locals' destination targetBb
+      have h_nv : isVolatileMemIntrinsicKind rk = false := by
+        cases h_b : isVolatileMemIntrinsicKind rk
+        · rfl
+        · exact absurd h_b h_vm
+      rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ h_cl h_cs h_cn h_wb h_nv] at h_di
       injection h_di with h_sn
       subst h_sn
       exact extCallAbortsProp_evalNonSelectIntrinsicCall rk s target

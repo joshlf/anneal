@@ -1384,12 +1384,13 @@ theorem evalLoweredTerminator_diverging_intrinsics_correspondence (m : Mach)
 
 /-- **Axiom-audit hook for Episode 2's `.call`, `LIntrinsicOp`, and `LCallTable` multi-callee model
 (`call_intrinsic_audit_closure`)**: references every Episode 2 theorem of
-`Anneal.Mir.AdtAndControl` (Section 3b `.call` refinement + Sections 5a–5i: `LIntrinsicOp`,
+`Anneal.Mir.AdtAndControl` (Section 3b `.call` refinement + Sections 5a–5j: `LIntrinsicOp`,
 `LCallTarget`, `V2026_06_01` adapter and its Episode 1 parity, UB / fault parity,
 `abort`/`panicUnwind`, call-form `write_bytes` / `copy_nonoverlapping`, projected and
 `PartialShell` call destinations, `LCallTable` multi-frame linked-callee refinement with
-depth-limit, abort-propagation, unwinding, and cross-frame isolation lemmas, and the concrete
-non-vacuity Witness Suites 1–10), ensuring `MiniRustSpec.Audit`'s `[DEINIT-AUDIT]` and
+depth-limit, abort-propagation, unwinding, and cross-frame isolation lemmas, the concrete
+non-vacuity Witness Suites 1–10, and the volatile and unaligned raw-pointer memory accesses of
+Section 5j), ensuring `MiniRustSpec.Audit`'s `[DEINIT-AUDIT]` and
 `#assert_all_minirustspec_standard_axioms` verify standard-axiom purity (`sorry_free=true`, zero
 `Lean.ofReduceBool`) across all of them transitively. The symbolic `MiniRustSpec` bridges built on
 these theorems (`abort`, `unreachable_unchecked`, `*_nonzero` vs `Assume`, two-sided success
@@ -1515,14 +1516,41 @@ theorem call_intrinsic_audit_closure : True :=
   let _ := @Anneal.Mir.AdtAndControl.unwindLCallStack_cleanup_exact
   let _ := @Anneal.Mir.AdtAndControl.stepMirFn_multi_deinit_projected_trustedRun
   let _ := @Anneal.Mir.AdtAndControl.witness_diverging_proj_move_cleanup_and_protectors
+  -- `[adv ep1-A0]` Sections 5f and 5j: the seven volatile memory intrinsics and unlinked
+  -- `core::ptr::{read_unaligned, write_unaligned, read_volatile, write_volatile}` calls
+  -- (adapter rows, exact `Trusted` dispatch, and alignment / null / zero-sized / uninhabited /
+  -- outside-allocation / `(dst, src, count)` corner cases).
+  let _ := @Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01_eq_ep1_of_not_volatile
+  let _ := @Anneal.Mir.AdtAndControl.unlinkedPtrAccess_stringEq_false_of_lowered
+  let _ := @Anneal.Mir.AdtAndControl.classifyRustIntrinsic_volatile_defPath
+  let _ := @Anneal.Mir.AdtAndControl.classifyRustIntrinsic_eq_volatileIntrinsic_iff
+  let _ := @Anneal.Mir.AdtAndControl.stringEq_exactDiv_false_of_classifyRustIntrinsic
+  let _ := @Anneal.Mir.AdtAndControl.evalTerminator_call_volatileMemIntrinsic_eq
+  let _ := @Anneal.Mir.AdtAndControl.evalVolatileMemIntrinsicCall_eq
+  let _ := @Anneal.Mir.AdtAndControl.evalUnlinkedPtrAccessCall?_literals
+  let _ := @Anneal.Mir.AdtAndControl.evalUnlinkedPtrAccessCall?_eq_some_defPath
+  let _ := @Anneal.Mir.AdtAndControl.evalTerminator_call_unlinkedPtrAccess_eq
+  let _ := @Anneal.Mir.AdtAndControl.rawPtrAccessAction_bad_arity_ub
+  let _ := @Anneal.Mir.AdtAndControl.rawPtrAccessAction_misaligned_addr_ub
+  let _ := @Anneal.Mir.AdtAndControl.rawPtrLoadAction_volatile_addr_unsupported
+  let _ := @Anneal.Mir.AdtAndControl.rawPtrStoreAction_volatile_addr_unsupported
+  let _ := @Anneal.Mir.AdtAndControl.rawPtrAccessAction_volatile_zst_addr
+  let _ := @Anneal.Mir.AdtAndControl.rawPtrLoadAction_uninhabited_ub
+  let _ := @Anneal.Mir.AdtAndControl.rawPtrAccessAction_nonvolatile_null_ub
+  let _ := @Anneal.Mir.AdtAndControl.rawPtrLoadAction_nonvolatile_addr_ub
+  let _ := @Anneal.Mir.AdtAndControl.volatileCopyPlan_stack_dst_src_order
+  let _ := @Anneal.Mir.AdtAndControl.volatileCopySetPlan_zero_bytes
+  let _ := @Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01_volatileIntrinsics
+  let _ := @Anneal.Mir.AdtAndControl.evalTerminator_call_loweredVolatileIntrinsic_eq
+  let _ := @Anneal.Mir.AdtAndControl.evalLoweredIntrinsicCall_volatile_none
   trivial
 
 /-- **Residual axiom-audit hook for the rest of `Anneal.Mir.AdtAndControl`
 (`adt_control_residual_audit_closure`, `[adv ep2-B4]`)**: references every public,
 user-declared theorem of `Anneal.Mir.AdtAndControl` that neither `subplace_audit_closure`,
-`call_intrinsic_audit_closure`, nor any other `MiniRustSpec` declaration reaches (192 theorems of the
+`call_intrinsic_audit_closure`, nor any other `MiniRustSpec` declaration reaches (300 theorems of the
 scalar-validity, ADT layout, place, `Deinit` / `Retag`, and lowered-CFG layers that predate
-Episode 2). With those closures it puts **all 607** public theorems of `Anneal.Mir.AdtAndControl`
+Episode 2). With those closures it puts **all 751** public theorems of `Anneal.Mir.AdtAndControl`
 inside the dependency closure whose axioms `MiniRustSpec.Audit` checks, which
 `#assert_adt_control_audit_coverage` (`[ADT-AUDIT-COVERAGE]`) re-verifies mechanically. -/
 theorem adt_control_residual_audit_closure : True :=

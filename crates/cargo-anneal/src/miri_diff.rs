@@ -1830,8 +1830,10 @@ pub fn stage_miri_diff_workspace(
 /// `Trusted.Rustc.V2026_06_01.MirSemantics.Terminators` models inline without
 /// emitting an external `MirCallE` interaction (`isUnwindingPanicDefPath`,
 /// `isAbortingPanicDefPath`, `isUnreachableCallTarget`,
-/// `isDirectExactDivTarget`, and `classifyRustIntrinsic?` other than
-/// `const_eval_select`, whose runtime target may be unlinked).
+/// `isDirectExactDivTarget`, `classifyRustIntrinsic?` other than
+/// `const_eval_select`, whose runtime target may be unlinked, and the
+/// `core::ptr` raw-pointer access functions of `evalUnlinkedPtrAccessCall?`,
+/// which `Terminators` evaluates inline when no body is linked for them).
 ///
 /// `Terminators` handles a direct call to a panic, abort, or unreachable entry
 /// point inline only when the call diverges (`target = .none`), which is how
@@ -1911,6 +1913,18 @@ const TRUSTED_INLINE_CALL_DEF_PATHS: &[&str] = &[
     "core::intrinsics::align_of_val",
     "core::intrinsics::copy_nonoverlapping",
     "core::intrinsics::write_bytes",
+    "core::intrinsics::unaligned_volatile_load",
+    "core::intrinsics::unaligned_volatile_store",
+    "core::intrinsics::volatile_load",
+    "core::intrinsics::volatile_store",
+    "core::intrinsics::volatile_copy_nonoverlapping_memory",
+    "core::intrinsics::volatile_copy_memory",
+    "core::intrinsics::volatile_set_memory",
+    // `evalUnlinkedPtrAccessCall?`
+    "core::ptr::read_unaligned",
+    "core::ptr::write_unaligned",
+    "core::ptr::read_volatile",
+    "core::ptr::write_volatile",
 ];
 
 /// Return `true` when `def_id` is one of [`TRUSTED_INLINE_CALL_DEF_PATHS`].
@@ -2642,7 +2656,8 @@ mod tests {
     }
 
     /// Collect the string literal compared by each `stringEq` call inside the
-    /// body of each Lean definition `def <name> ` in `lean_src`.
+    /// body of each Lean definition `def <name>` in `lean_src` (the name is
+    /// followed by a space or a line break).
     ///
     /// A body ends at the first later line that starts in column 0, which is
     /// where the next top-level command, attribute, or doc comment begins. A
@@ -2650,9 +2665,11 @@ mod tests {
     fn trusted_string_eq_literals(lean_src: &str, names: &[&str]) -> BTreeSet<String> {
         let mut literals = BTreeSet::new();
         for name in names {
-            let pat = format!("def {name} ");
+            let pat = format!("def {name}");
             let start = lean_src
-                .find(&pat)
+                .match_indices(&pat)
+                .map(|(start, _)| start)
+                .find(|start| lean_src[start + pat.len()..].starts_with(char::is_whitespace))
                 .unwrap_or_else(|| panic!("missing `{pat}` in Terminators.lean"));
             let after_header = &lean_src[start + pat.len()..];
             let mut end = after_header.len();
@@ -2721,6 +2738,7 @@ def isLastTarget (defPath : DefPath) : Bool :=
                 "isUnreachableCallTarget",
                 "isDirectExactDivTarget",
                 "classifyRustIntrinsic?",
+                "evalUnlinkedPtrAccessCall?",
             ],
         );
         // `const_eval_select` dispatches to a runtime target that may itself be

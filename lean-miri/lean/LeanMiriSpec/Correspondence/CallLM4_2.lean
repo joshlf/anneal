@@ -1996,9 +1996,12 @@ theorem evalTerminator_stage1_exactDiv_call
 /-! ## 2b. Stage-1 boundary: intrinsics Stage-1 does not evaluate inline
 
 Stage-1 `evalTerminator` evaluates an unlinked direct call inline only when it is
-`exact_div` or `classifyRustIntrinsic?` (`Terminators.lean:898`) recognizes its
-`DefPath`; every other unlinked direct call becomes an external call
-(`MirStepNode.extCall`, an interaction with the environment). In particular
+`exact_div`, `classifyRustIntrinsic?` (`Terminators.lean:898`) recognizes its
+`DefPath`, or it is one of the four `core::ptr` raw-pointer access functions of
+`evalUnlinkedPtrAccessCall?` (`core::ptr::{read_unaligned, write_unaligned,
+read_volatile, write_volatile}`); every other unlinked direct call becomes an
+external call (`MirStepNode.extCall`, an interaction with the environment). In
+particular
 Stage-1 does **not** execute `rotate_left`, `rotate_right`, `wrapping_offset`,
 or the `std::intrinsics::*` aliases, which the pre-Stage-1 reference model
 `evalTerminatorLM4_2` and `lean-miri` (through `annealCallHooks`) execute inline.
@@ -2006,8 +2009,10 @@ or the `std::intrinsics::*` aliases, which the pre-Stage-1 reference model
 Stage-1 executes inline with its own `evalWriteBytesCall`.) -/
 
 /-- **Stage-1 external-call boundary**: Stage-1 `evalTerminator` on an unlinked
-direct call whose `DefPath` is neither `exact_div` nor recognized by
-`classifyRustIntrinsic?` evaluates the arguments and emits
+direct call whose `DefPath` is neither `exact_div`, nor recognized by
+`classifyRustIntrinsic?`, nor one of the four `core::ptr` raw-pointer access
+functions that Stage-1 evaluates inline when unlinked
+(`evalUnlinkedPtrAccessCall?`) evaluates the arguments and emits
 `MirStepNode.extCall` (or reports the arguments' undefined behavior). -/
 theorem evalTerminator_stage1_unclassified_call_extCall
     {s : MachineState} {body : CapturedMir} {term : Terminator}
@@ -2016,6 +2021,11 @@ theorem evalTerminator_stage1_unclassified_call_extCall
     {defPath : DefPath} {typeArgs : List RigidTy}
     (hcls : classifyRustIntrinsic? defPath = none)
     (hexact : stringEq defPath "core::intrinsics::exact_div" = false)
+    (hptr :
+      stringEq defPath "core::ptr::read_unaligned" = false ∧
+      stringEq defPath "core::ptr::write_unaligned" = false ∧
+      stringEq defPath "core::ptr::read_volatile" = false ∧
+      stringEq defPath "core::ptr::write_volatile" = false)
     (hterm : term.kind = .call (.constant c) argOps destination (some targetBb) unwind)
     (hc : c.ty.kind = .fnDef defPath typeArgs)
     (hcallee : lookupCallee s.memory.callees body.layouts defPath typeArgs
@@ -2040,6 +2050,8 @@ theorem evalTerminator_stage1_unclassified_call_extCall
     rw [hexact]
     dsimp only [evalDirectRustIntrinsic?]
     rw [hcls]
+    obtain ⟨hP1, hP2, hP3, hP4⟩ := hptr
+    simp only [evalUnlinkedPtrAccessCall?, hP1, hP2, hP3, hP4]
   | ub => rfl
   | unsupported => rfl
 
@@ -2055,6 +2067,17 @@ theorem AnnealIntrinsic.stage1Unmodeled_classify {k : AnnealIntrinsic}
     classifyRustIntrinsic? k.defPath = none ∧
       stringEq k.defPath "core::intrinsics::exact_div" = false := by
   cases k <;> first | exact absurd hk (by decide) | exact ⟨rfl, rfl⟩
+
+/-- No `stage1Unmodeled` intrinsic is one of the four `core::ptr` raw-pointer
+access functions that Stage-1 evaluates inline when unlinked
+(`evalUnlinkedPtrAccessCall?`). -/
+theorem AnnealIntrinsic.stage1Unmodeled_not_ptrAccess {k : AnnealIntrinsic}
+    (hk : k.stage1Unmodeled = true) :
+    stringEq k.defPath "core::ptr::read_unaligned" = false ∧
+      stringEq k.defPath "core::ptr::write_unaligned" = false ∧
+      stringEq k.defPath "core::ptr::read_volatile" = false ∧
+      stringEq k.defPath "core::ptr::write_volatile" = false := by
+  cases k <;> first | exact absurd hk (by decide) | exact ⟨rfl, rfl, rfl, rfl⟩
 
 /-- Stage-1 `classifyRustIntrinsic?` recognizes neither `std::intrinsics::*` offset
 alias that `AnnealIntrinsic.ofDefPath?` maps to `arith_offset` /
@@ -2102,7 +2125,8 @@ theorem stepMirFn_stage1_unmodeled_intrinsic_extCall
   have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
   simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
   obtain ⟨hcls, hexact⟩ := AnnealIntrinsic.stage1Unmodeled_classify hk
-  exact evalTerminator_stage1_unclassified_call_extCall hcls hexact hterm hc hcallee
+  exact evalTerminator_stage1_unclassified_call_extCall hcls hexact
+    (AnnealIntrinsic.stage1Unmodeled_not_ptrAccess hk) hterm hc hcallee
 
 /-- The 12 `AnnealIntrinsic`s that Stage-1 `evalTerminator` evaluates inline
 (`exact_div`, `arith_offset`, `ctpop`, `ctlz`, `ctlz_nonzero`, `cttz`,
@@ -2155,9 +2179,11 @@ theorem stepMirFn_stage1_std_offset_alias_extCall
   simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
   rcases halias with rfl | rfl
   · obtain ⟨⟨hcls, hexact⟩, _⟩ := stage1_std_offset_aliases_unclassified
-    exact evalTerminator_stage1_unclassified_call_extCall hcls hexact hterm hc hcallee
+    exact evalTerminator_stage1_unclassified_call_extCall hcls hexact ⟨rfl, rfl, rfl, rfl⟩
+      hterm hc hcallee
   · obtain ⟨_, ⟨hcls, hexact⟩⟩ := stage1_std_offset_aliases_unclassified
-    exact evalTerminator_stage1_unclassified_call_extCall hcls hexact hterm hc hcallee
+    exact evalTerminator_stage1_unclassified_call_extCall hcls hexact ⟨rfl, rfl, rfl, rfl⟩
+      hterm hc hcallee
 
 /-! ## 3. `rotate_left` / `rotate_right`
 

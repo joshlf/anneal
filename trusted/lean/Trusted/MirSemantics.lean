@@ -137,7 +137,21 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   evalNonSelectIntrinsicCall isPtrPointeeIntrinsicKind
   withConstEvalSelectIntrinsicTypeArgs rigidTysToZeroSizedOps
   constEvalSelectTupleArgOps finishMemIntrinsicCall evalCopyNonOverlappingCall
-  WriteBytesAction writeBytesAction evalWriteBytesCall evalDirectRustIntrinsic?
+  WriteBytesAction writeBytesAction evalWriteBytesCall
+  RawPtrArg rawPtrArgOfValue? rawPtrArgIsNull RawPtrTarget classifyRawPtrTarget
+  RawPtrElemLayout resolveRawPtrElemLayout rawPtrTargetFrame?
+  rawPtrTargetAligned? RawPtrStackTarget resolveRawPtrStackTarget
+  rawPtrUninitFault rawPtrBytesAllPlainInit rawPtrBytesAnyUninit
+  rawPtrDecodeFault rawPtrEncodeValue? RawPtrLoadResult loadRawPtrStackValue
+  borrowsAfterRawPtrRead rawPtrZstValue? RawPtrCallAction
+  finishRawPtrCallAction rawPtrLoadAction evalRawPtrLoadCall
+  rawPtrStoreValueFault? RawPtrStoreResult storeRawPtrStackValue
+  rawPtrStoreAction evalRawPtrStoreCall rawPtrDecodeAggregate?
+  volatileCopyWithinLocalAction VolatileCopyPlan volatileCopyPlan
+  evalVolatileCopyMemoryCall VolatileSetPlan volatileSetPlan
+  evalVolatileSetMemoryCall isVolatileMemIntrinsicKind
+  evalVolatileMemIntrinsicCall
+  evalUnlinkedPtrAccessCall? evalDirectRustIntrinsic?
   isUnreachableCallTarget isAbortingPanicDefPath
   isUnwindingPanicDefPath evalTerminator
   initMachineState initMachineStateWithCallees

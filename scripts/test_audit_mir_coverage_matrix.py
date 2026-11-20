@@ -399,7 +399,7 @@ class ConstructorCensusTests(AuditFixtureTestCase):
         # not to the audit's parser, so the two counts disagree.
         self.edit(audit.LINTRINSIC_FILE, "inductive LIntrinsicOp : Type where\n", "inductive LIntrinsicOp : Type where | fma\n")
         report = self.run_checks()
-        self.assert_error(report, "a_surface_totals", "disagrees with the parsed 31")
+        self.assert_error(report, "a_surface_totals", "disagrees with the parsed 38")
 
 
 class ManifestTests(AuditFixtureTestCase):

@@ -23426,6 +23426,11 @@ example {s : MachineState} {body : CapturedMir} {term : Terminator}
     {defPath : DefPath} {typeArgs : List RigidTy}
     (hcls : classifyRustIntrinsic? defPath = none)
     (hexact : stringEq defPath "core::intrinsics::exact_div" = false)
+    (hptr :
+      stringEq defPath "core::ptr::read_unaligned" = false ∧
+      stringEq defPath "core::ptr::write_unaligned" = false ∧
+      stringEq defPath "core::ptr::read_volatile" = false ∧
+      stringEq defPath "core::ptr::write_volatile" = false)
     (hterm : term.kind = .call (.constant c) argOps destination (some targetBb) unwind)
     (hc : c.ty.kind = .fnDef defPath typeArgs)
     (hcallee : lookupCallee s.memory.callees body.layouts defPath typeArgs
@@ -23439,7 +23444,7 @@ example {s : MachineState} {body : CapturedMir} {term : Terminator}
           (resumeExternalCall s locals' destination targetBb unwind)
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported :=
-  evalTerminator_stage1_unclassified_call_extCall hcls hexact hterm hc hcallee
+  evalTerminator_stage1_unclassified_call_extCall hcls hexact hptr hterm hc hcallee
 
 example {body : CapturedMir} {s : MachineState}
     (hcal : s.memory.activeCallee = none)
@@ -23991,6 +23996,7 @@ open LeanMiriSpec.Correspondence in
   evalTerminator_stage1_wrappingAdd_call
   AnnealIntrinsic.stage1Unmodeled
   AnnealIntrinsic.stage1Unmodeled_classify
+  AnnealIntrinsic.stage1Unmodeled_not_ptrAccess
   AnnealIntrinsic.stage1Modeled
   AnnealIntrinsic.stage1Modeled_classify
   stage1_std_offset_aliases_unclassified

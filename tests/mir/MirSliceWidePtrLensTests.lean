@@ -1463,7 +1463,7 @@ theorem callee_sig_and_fnptr_bridges (s : MachineState) (p : Place) :
       (cone_agree "cone::helper1" (List.Mem.head _)),
    internFnPtr_withCalleeCtx [helper1Mir] none [] emptyMemory "cone::helper1" [] none,
    isNonSelectIntrinsicOpt_of_eq_none rfl,
-   evalDirectRustIntrinsic?_eq_none_of_classify rfl⟩
+   evalDirectRustIntrinsic?_eq_none_of_classify rfl rfl⟩
 
 /-- Inline compiler intrinsic caller (`core::intrinsics::ub_checks`,
 `classifyRustIntrinsic? = some .ubChecks`) narrowed to an *empty* callee table `c₂ = []`

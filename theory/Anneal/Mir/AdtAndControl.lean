@@ -327,11 +327,11 @@ and relates it to `Trusted.Rustc.V2026_06_01.MirSemantics`:
    `V2026_06_01` adapter, multi-callee `LCallTable` CFG execution, and Witness Suites 1–10**
    (`ws-mir-lower-inline-intrinsics-and-multi-callee-cfg` Episode 2,
    `crates/anneal-mir/src/{ir.rs,rustc_v2026_06_01.rs,lower/intrinsic.rs,lower/cfg.rs}`):
-   - Syntax-version-independent `LIntrinsicOp` (30 variants) and `LCallTarget`, coupled to
+   - Syntax-version-independent `LIntrinsicOp` (37 variants) and `LCallTarget`, coupled to
      `Trusted.Rustc.V2026_06_01` via the thin adapter `lowerIntrinsicKind_V2026_06_01` /
-     `lowerCallTarget_V2026_06_01`, with exact Episode 1 table parity
-     (`lowerIntrinsicKind_V2026_06_01_eq_ep1Table`) and `Trusted` inline-dispatch characterization
-     (`trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind`).
+     `lowerCallTarget_V2026_06_01`, with exact Episode 1 table parity extended by the seven
+     volatile memory intrinsics (`lowerIntrinsicKind_V2026_06_01_eq_ep1Table`) and `Trusted`
+     inline-dispatch characterization (`trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind`).
    - Value-returning, call-form memory (`copyNonOverlapping`, `writeBytes`), and diverging
      (`unreachableUnchecked`, `abort`, `panicUnwind`) intrinsic evaluation (`evalLIntrinsicValue`,
      `evalLoweredIntrinsicCall`) lifted into single-step and multi-step lowered-CFG refinement
@@ -348,6 +348,12 @@ and relates it to `Trusted.Rustc.V2026_06_01.MirSemantics`:
      (`witness_value_returning_intrinsics_run`, `witness_ub_fault_parity`,
      `witness_diverging_abort_vs_panicUnwind`, `witness_two_deep_linked_callees_and_unwind`,
      ..., `witness_diverging_proj_move_cleanup_and_protectors`).
+   - Volatile and unaligned raw-pointer memory accesses (Section 5j): exact `Trusted` dispatch of
+     the seven volatile memory intrinsics (`evalTerminator_call_volatileMemIntrinsic_eq`) and of
+     unlinked `core::ptr::{read_unaligned, write_unaligned, read_volatile, write_volatile}` calls
+     (`evalTerminator_call_unlinkedPtrAccess_eq`), with their alignment, null, zero-sized,
+     uninhabited, outside-allocation, and `(dst, src, count)` argument-order corner cases. The
+     lowered evaluator fails closed on the volatile ops (`evalLoweredIntrinsicCall_volatile_none`).
 -/
 
 /-! ## Section 1: `ScalarValidRange` Niches -/
@@ -14903,6 +14909,13 @@ inductive LIntrinsicOp : Type where
   | alignOfVal
   | copyNonOverlapping
   | writeBytes
+  | unalignedVolatileLoad
+  | unalignedVolatileStore
+  | volatileLoad
+  | volatileStore
+  | volatileCopyNonOverlappingMemory
+  | volatileCopyMemory
+  | volatileSetMemory
   | unreachableUnchecked
   | abort
   | panicUnwind
@@ -14915,9 +14928,9 @@ inductive LCallTarget : Type where
   | inlineIntrinsic (op : LIntrinsicOp) (typeArgs : List RigidTy := []) : LCallTarget
   | callee (sym : String) (typeArgs : List RigidTy := []) : LCallTarget
 
-/-- Map a value-returning `Trusted.Rustc.V2026_06_01.MirSemantics.RustIntrinsicKind` (handled by
-`evalNonSelectIntrinsicCall`; every variant except `constEvalSelect` and the call-form memory
-intrinsics `copyNonOverlapping` / `writeBytes`) to its corresponding `LIntrinsicOp`. -/
+/-- Map a value-returning `Trusted.Rustc.V2026_06_01.MirSemantics.RustIntrinsicKind` (every
+variant except `constEvalSelect`, the call-form memory intrinsics `copyNonOverlapping` /
+`writeBytes`, and the seven volatile memory intrinsics) to its corresponding `LIntrinsicOp`. -/
 @[reducible]
 def LIntrinsicOp.fromRustIntrinsicKind? : RustIntrinsicKind → Option LIntrinsicOp
   | .ubChecks => some .ubChecks
@@ -14947,6 +14960,13 @@ def LIntrinsicOp.fromRustIntrinsicKind? : RustIntrinsicKind → Option LIntrinsi
   | .constEvalSelect => none
   | .copyNonOverlapping => none
   | .writeBytes => none
+  | .unalignedVolatileLoad => none
+  | .unalignedVolatileStore => none
+  | .volatileLoad => none
+  | .volatileStore => none
+  | .volatileCopyNonOverlappingMemory => none
+  | .volatileCopyMemory => none
+  | .volatileSetMemory => none
 
 /-- Map a value-returning `LIntrinsicOp` handled by `evalNonSelectIntrinsicCall` to its
 `RustIntrinsicKind` counterpart. -/
@@ -14983,7 +15003,12 @@ kinds through `fromRustIntrinsicKind?`, and the call forms of the memory intrins
 `core::intrinsics::copy_nonoverlapping` and `core::intrinsics::write_bytes` (the last two rows of
 `RUST_INTRINSIC_DEF_PATHS_V2026_06_01` in `crates/anneal-mir/src/rustc_v2026_06_01.rs`), which
 `Terminators.lean` dispatches inline with the statement's `copy_nonoverlapping` semantics
-(`evalCopyNonOverlappingCall`) and its `write_bytes` semantics (`evalWriteBytesCall`).
+(`evalCopyNonOverlappingCall`) and its `write_bytes` semantics (`evalWriteBytesCall`), and the
+seven volatile memory intrinsics (`core::intrinsics::{unaligned_volatile_load,
+unaligned_volatile_store, volatile_load, volatile_store, volatile_copy_nonoverlapping_memory,
+volatile_copy_memory, volatile_set_memory}`), which `Terminators.lean` dispatches inline through
+`evalNonSelectIntrinsicCall` (`evalRawPtrLoadCall`, `evalRawPtrStoreCall`,
+`evalVolatileCopyMemoryCall`, `evalVolatileSetMemoryCall`).
 
 `[adv ep2-B1]`: exactly like Episode 1's adapter, only the canonical `core::intrinsics::*`
 spellings are recognized (`classifyRustIntrinsic?`). `rustc` prints a re-exported item
@@ -14996,6 +15021,13 @@ def LIntrinsicOp.ofRustIntrinsicKind? (kind : RustIntrinsicKind) : Option LIntri
   match kind with
   | .copyNonOverlapping => some .copyNonOverlapping
   | .writeBytes => some .writeBytes
+  | .unalignedVolatileLoad => some .unalignedVolatileLoad
+  | .unalignedVolatileStore => some .unalignedVolatileStore
+  | .volatileLoad => some .volatileLoad
+  | .volatileStore => some .volatileStore
+  | .volatileCopyNonOverlappingMemory => some .volatileCopyNonOverlappingMemory
+  | .volatileCopyMemory => some .volatileCopyMemory
+  | .volatileSetMemory => some .volatileSetMemory
   | _ => LIntrinsicOp.fromRustIntrinsicKind? kind
 
 private theorem LIntrinsicOp.ofRustIntrinsicKind?_of_fromRustIntrinsicKind?
@@ -15288,7 +15320,9 @@ def evalLIntrinsicValue (op : LIntrinsicOp) (typeArgs : List RigidTy)
         | _ => none
       | none => none
     | _ => none
-  | .copyNonOverlapping | .writeBytes | .unreachableUnchecked | .abort | .panicUnwind => none
+  | .copyNonOverlapping | .writeBytes | .unalignedVolatileLoad | .unalignedVolatileStore
+  | .volatileLoad | .volatileStore | .volatileCopyNonOverlappingMemory | .volatileCopyMemory
+  | .volatileSetMemory | .unreachableUnchecked | .abort | .panicUnwind => none
 
 /-- The environment of CFG evaluation: layouts and globals for constants, the boundary
 well-formedness check `check_value_well_formed` (with the inhabitedness of the return type
@@ -15380,13 +15414,20 @@ ill-formed unwind action (`[adv ep2-B1]`: `A0` skipped this check). Both `.abort
 in the diverging `target = .none` `.call` arm, while a hand-built non-diverging call (`target =
 .some _`) falls through to `MirStepNode.extCall` (whereas Episode 1's `cfg.rs` fires
 `IntrinsicOutcome::{Unreachable, Abort, Panic}` regardless of `target`); rejecting `target = some _`
-here (`none`) fails closed and strictly preserves single-step refinement against `Trusted`. -/
+here (`none`) fails closed and strictly preserves single-step refinement against `Trusted`.
+
+The seven volatile memory intrinsics (`.unalignedVolatileLoad` ... `.volatileSetMemory`) are
+rejected (`none`): the lowered frame has no raw-pointer memory model for them, and an Anneal error
+refines every Trusted step. `Trusted`'s exact semantics of each is characterized by
+`evalTerminator_call_volatileIntrinsic_eq` and its per-intrinsic corollaries. -/
 def evalLoweredIntrinsicCall (env : CfgEnv) (body : LBody) (bb : Nat) (inCleanup : Bool)
     (args : List Operand) (avs : List Value) (slots2 : List LocalSlotState)
     (destination : Place) (destTy : Ty) (target : Option Nat) (unwind : UnwindAction)
     (unwinding : Option Nat) (op : LIntrinsicOp) (typeArgs : List RigidTy) : Option CfgStep :=
   match op with
   | .unreachableUnchecked => none
+  | .unalignedVolatileLoad | .unalignedVolatileStore | .volatileLoad | .volatileStore
+  | .volatileCopyNonOverlappingMemory | .volatileCopyMemory | .volatileSetMemory => none
   | .abort =>
     if !unwindActionOk body inCleanup unwind then none else
     match target with
@@ -15632,8 +15673,8 @@ def LTerminator.toTrusted : LTerminator → TerminatorKind
 in `Trusted.Rustc.V2026_06_01.MirSemantics.evalTerminator` matches `LIntrinsicOp`: exactly the
 conditions under which `Trusted` dispatches the call inline as `op` (`isDirectExactDivTarget`,
 `classifyRustIntrinsic?` (including the call-form memory intrinsics `copy_nonoverlapping` /
-`write_bytes`), `isUnreachableCallTarget`, `isAbortingPanicDefPath`, `isUnwindingPanicDefPath`), with
-no exempted intrinsic. -/
+`write_bytes` and the seven volatile memory intrinsics), `isUnreachableCallTarget`,
+`isAbortingPanicDefPath`, `isUnwindingPanicDefPath`), with no exempted intrinsic. -/
 def trustedSupportsIntrinsicDefPath (defPath : DefPath) (op : LIntrinsicOp) : Prop :=
   match op with
   | .exactDiv =>
@@ -15660,6 +15701,27 @@ def trustedSupportsIntrinsicDefPath (defPath : DefPath) (op : LIntrinsicOp) : Pr
   | .writeBytes =>
     stringEq defPath "core::intrinsics::exact_div" = false ∧
       classifyRustIntrinsic? defPath = some .writeBytes
+  | .unalignedVolatileLoad =>
+    stringEq defPath "core::intrinsics::exact_div" = false ∧
+      classifyRustIntrinsic? defPath = some .unalignedVolatileLoad
+  | .unalignedVolatileStore =>
+    stringEq defPath "core::intrinsics::exact_div" = false ∧
+      classifyRustIntrinsic? defPath = some .unalignedVolatileStore
+  | .volatileLoad =>
+    stringEq defPath "core::intrinsics::exact_div" = false ∧
+      classifyRustIntrinsic? defPath = some .volatileLoad
+  | .volatileStore =>
+    stringEq defPath "core::intrinsics::exact_div" = false ∧
+      classifyRustIntrinsic? defPath = some .volatileStore
+  | .volatileCopyNonOverlappingMemory =>
+    stringEq defPath "core::intrinsics::exact_div" = false ∧
+      classifyRustIntrinsic? defPath = some .volatileCopyNonOverlappingMemory
+  | .volatileCopyMemory =>
+    stringEq defPath "core::intrinsics::exact_div" = false ∧
+      classifyRustIntrinsic? defPath = some .volatileCopyMemory
+  | .volatileSetMemory =>
+    stringEq defPath "core::intrinsics::exact_div" = false ∧
+      classifyRustIntrinsic? defPath = some .volatileSetMemory
   | _ =>
     ∃ kind, op.toRustIntrinsicKind? = some kind ∧
       stringEq defPath "core::intrinsics::exact_div" = false ∧
@@ -16429,7 +16491,9 @@ theorem evalLIntrinsicValue_refines_evalNonSelectIntrinsicCall
           localDecls layouts argOps :=
     resolveIntrinsicPointeeTy?_defPath_irrel _ _ _ _ _ rfl
   cases op with
-  | exactDiv | copyNonOverlapping | writeBytes | unreachableUnchecked | abort | panicUnwind =>
+  | exactDiv | copyNonOverlapping | writeBytes | unreachableUnchecked | abort | panicUnwind
+  | unalignedVolatileLoad | unalignedVolatileStore | volatileLoad | volatileStore
+  | volatileCopyNonOverlappingMemory | volatileCopyMemory | volatileSetMemory =>
     nomatch hKind
   | ctlz | ctlzNonzero | cttz | cttzNonzero | ctpop | bswap | bitreverse =>
     simp only [LIntrinsicOp.toRustIntrinsicKind?, Option.some.injEq] at hKind
@@ -16689,7 +16753,9 @@ theorem evalLIntrinsicValue_refines_evalNonSelectIntrinsicCall
 `classifyRustIntrinsic?` -> `evalNonSelectIntrinsicCall` in `Trusted`. -/
 private def LIntrinsicOp.isValueDirectIntrinsic : LIntrinsicOp → Bool
   | .unreachableUnchecked | .abort | .panicUnwind
-  | .copyNonOverlapping | .writeBytes | .exactDiv => false
+  | .copyNonOverlapping | .writeBytes | .exactDiv
+  | .unalignedVolatileLoad | .unalignedVolatileStore | .volatileLoad | .volatileStore
+  | .volatileCopyNonOverlappingMemory | .volatileCopyMemory | .volatileSetMemory => false
   | _ => true
 
 private theorem evalLoweredIntrinsicCall_of_isValueDirectIntrinsic
@@ -16868,6 +16934,9 @@ private theorem evalLoweredTerminator_call_refines_evalTerminator_aux
                       exact writeIntrinsicReturn_of_writePlaceState_ok hWr hWPV
           · cases op with
           | unreachableUnchecked =>
+            nomatch hBodyCall
+          | unalignedVolatileLoad | unalignedVolatileStore | volatileLoad | volatileStore
+          | volatileCopyNonOverlappingMemory | volatileCopyMemory | volatileSetMemory =>
             nomatch hBodyCall
           | copyNonOverlapping =>
             simp [evalLoweredIntrinsicCall, hCorr.memIntrinsicNone] at hBodyCall
@@ -18889,6 +18958,8 @@ theorem evalLoweredIntrinsicCall_goto_cleanup_invariant {env : CfgEnv} {body : L
   unfold evalLoweredIntrinsicCall at h
   cases op with
   | unreachableUnchecked => nomatch h
+  | unalignedVolatileLoad | unalignedVolatileStore | volatileLoad | volatileStore
+  | volatileCopyNonOverlappingMemory | volatileCopyMemory | volatileSetMemory => nomatch h
   | abort =>
     cases target <;> cases hU : unwindActionOk body inCleanup unwind <;> simp [hU] at h
   | panicUnwind =>
@@ -25914,6 +25985,9 @@ This section completes the Episode 2 formalization of `crates/anneal-mir`:
   per-projection `NoUninitExplosionOnProj`, the exact abort-site characterization,
   `slotsAfterArgs` / `restoreCallerProtectors` invariants, and cross-frame pointer isolation
   (5i, Witness Suite 10).
+- **Section 5j** (`[adv ep1-A0]` of `ep1-tcb-mir-semantics-unaligned-volatile-and-nullary`):
+  `Trusted`'s inline dispatch and corner cases of the seven volatile memory intrinsics and of
+  unlinked `core::ptr` raw-pointer access calls.
 
 Every public theorem of this module is in the axiom audit of `MiniRustSpec.Audit`
 (`call_intrinsic_audit_closure`, `subplace_audit_closure`, and
@@ -26023,7 +26097,9 @@ theorem lowerIntrinsicKind_V2026_06_01_of_classifyRustIntrinsic {defPath : DefPa
       ↓reduceIte]
     exact LIntrinsicOp.ofRustIntrinsicKind?_of_fromRustIntrinsicKind? hFrom
   · cases op with
-    | exactDiv | copyNonOverlapping | writeBytes | unreachableUnchecked | abort | panicUnwind =>
+    | exactDiv | copyNonOverlapping | writeBytes | unreachableUnchecked | abort | panicUnwind
+    | unalignedVolatileLoad | unalignedVolatileStore | volatileLoad | volatileStore
+    | volatileCopyNonOverlappingMemory | volatileCopyMemory | volatileSetMemory =>
       cases hTo
     | _ => exact ⟨kind, hTo, hNotCoreEx, hClass⟩
 
@@ -26057,7 +26133,7 @@ theorem lowerIntrinsicKind_V2026_06_01_abort_and_panic_targets :
   decide
 
 /--Executable `Bool` checker for `trustedSupportsIntrinsicDefPath`, enabling kernel `by decide`
-discharge of `trustedSupportsIntrinsicDefPath defPath op` across all 30 `LIntrinsicOp` variants. -/
+discharge of `trustedSupportsIntrinsicDefPath defPath op` across all 37 `LIntrinsicOp` variants. -/
 def checkTrustedSupportsIntrinsicDefPath (defPath : DefPath) (op : LIntrinsicOp) : Bool :=
   match op with
   | .exactDiv =>
@@ -26087,6 +26163,41 @@ def checkTrustedSupportsIntrinsicDefPath (defPath : DefPath) (op : LIntrinsicOp)
       (match classifyRustIntrinsic? defPath with
        | some .writeBytes => true
        | _ => false)
+  | .unalignedVolatileLoad =>
+    !stringEq defPath "core::intrinsics::exact_div" &&
+      (match classifyRustIntrinsic? defPath with
+       | some .unalignedVolatileLoad => true
+       | _ => false)
+  | .unalignedVolatileStore =>
+    !stringEq defPath "core::intrinsics::exact_div" &&
+      (match classifyRustIntrinsic? defPath with
+       | some .unalignedVolatileStore => true
+       | _ => false)
+  | .volatileLoad =>
+    !stringEq defPath "core::intrinsics::exact_div" &&
+      (match classifyRustIntrinsic? defPath with
+       | some .volatileLoad => true
+       | _ => false)
+  | .volatileStore =>
+    !stringEq defPath "core::intrinsics::exact_div" &&
+      (match classifyRustIntrinsic? defPath with
+       | some .volatileStore => true
+       | _ => false)
+  | .volatileCopyNonOverlappingMemory =>
+    !stringEq defPath "core::intrinsics::exact_div" &&
+      (match classifyRustIntrinsic? defPath with
+       | some .volatileCopyNonOverlappingMemory => true
+       | _ => false)
+  | .volatileCopyMemory =>
+    !stringEq defPath "core::intrinsics::exact_div" &&
+      (match classifyRustIntrinsic? defPath with
+       | some .volatileCopyMemory => true
+       | _ => false)
+  | .volatileSetMemory =>
+    !stringEq defPath "core::intrinsics::exact_div" &&
+      (match classifyRustIntrinsic? defPath with
+       | some .volatileSetMemory => true
+       | _ => false)
   | _ =>
     match classifyRustIntrinsic? defPath with
     | some kind =>
@@ -26105,6 +26216,48 @@ private theorem eq_some_of_match_writeBytes :
       (match x with | some .writeBytes => true | _ => false) = true →
       x = some .writeBytes
   | some .writeBytes, _ => rfl
+
+private theorem eq_some_of_match_unalignedVolatileLoad :
+    ∀ (x : Option RustIntrinsicKind),
+      (match x with | some .unalignedVolatileLoad => true | _ => false) = true →
+      x = some .unalignedVolatileLoad
+  | some .unalignedVolatileLoad, _ => rfl
+
+private theorem eq_some_of_match_unalignedVolatileStore :
+    ∀ (x : Option RustIntrinsicKind),
+      (match x with | some .unalignedVolatileStore => true | _ => false) = true →
+      x = some .unalignedVolatileStore
+  | some .unalignedVolatileStore, _ => rfl
+
+private theorem eq_some_of_match_volatileLoad :
+    ∀ (x : Option RustIntrinsicKind),
+      (match x with | some .volatileLoad => true | _ => false) = true →
+      x = some .volatileLoad
+  | some .volatileLoad, _ => rfl
+
+private theorem eq_some_of_match_volatileStore :
+    ∀ (x : Option RustIntrinsicKind),
+      (match x with | some .volatileStore => true | _ => false) = true →
+      x = some .volatileStore
+  | some .volatileStore, _ => rfl
+
+private theorem eq_some_of_match_volatileCopyNonOverlappingMemory :
+    ∀ (x : Option RustIntrinsicKind),
+      (match x with | some .volatileCopyNonOverlappingMemory => true | _ => false) = true →
+      x = some .volatileCopyNonOverlappingMemory
+  | some .volatileCopyNonOverlappingMemory, _ => rfl
+
+private theorem eq_some_of_match_volatileCopyMemory :
+    ∀ (x : Option RustIntrinsicKind),
+      (match x with | some .volatileCopyMemory => true | _ => false) = true →
+      x = some .volatileCopyMemory
+  | some .volatileCopyMemory, _ => rfl
+
+private theorem eq_some_of_match_volatileSetMemory :
+    ∀ (x : Option RustIntrinsicKind),
+      (match x with | some .volatileSetMemory => true | _ => false) = true →
+      x = some .volatileSetMemory
+  | some .volatileSetMemory, _ => rfl
 
 theorem trustedSupportsIntrinsicDefPath_of_check {defPath : DefPath} {op : LIntrinsicOp}
     (h : checkTrustedSupportsIntrinsicDefPath defPath op = true) :
@@ -26141,6 +26294,20 @@ theorem trustedSupportsIntrinsicDefPath_of_check {defPath : DefPath} {op : LIntr
       exact ⟨h.1, eq_some_of_match_copyNonOverlapping _ h.2⟩
     · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true'] at h
       exact ⟨h.1, eq_some_of_match_writeBytes _ h.2⟩
+    · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true'] at h
+      exact ⟨h.1, eq_some_of_match_unalignedVolatileLoad _ h.2⟩
+    · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true'] at h
+      exact ⟨h.1, eq_some_of_match_unalignedVolatileStore _ h.2⟩
+    · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true'] at h
+      exact ⟨h.1, eq_some_of_match_volatileLoad _ h.2⟩
+    · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true'] at h
+      exact ⟨h.1, eq_some_of_match_volatileStore _ h.2⟩
+    · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true'] at h
+      exact ⟨h.1, eq_some_of_match_volatileCopyNonOverlappingMemory _ h.2⟩
+    · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true'] at h
+      exact ⟨h.1, eq_some_of_match_volatileCopyMemory _ h.2⟩
+    · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true'] at h
+      exact ⟨h.1, eq_some_of_match_volatileSetMemory _ h.2⟩
     · simp only [checkTrustedSupportsIntrinsicDefPath, Bool.and_eq_true, Bool.not_eq_true',
         Option.isSome_eq_false_iff, Option.isNone_iff_eq_none] at h
       exact ⟨h.1.1, h.1.2, h.2⟩
@@ -28528,6 +28695,9 @@ theorem stepLoweredWithCallTable_refines_trusted
                                       { hCorr with block := rfl, stmt := rfl, slots := hRel3 }⟩
                         · cases op with
                           | unreachableUnchecked => nomatch hIntrEval
+                          | unalignedVolatileLoad | unalignedVolatileStore | volatileLoad | volatileStore
+                          | volatileCopyNonOverlappingMemory | volatileCopyMemory | volatileSetMemory =>
+                            nomatch hIntrEval
                           | copyNonOverlapping =>
                             simp [evalLoweredIntrinsicCall, hCorr.body.memIntrinsicNone] at hIntrEval
                           | writeBytes =>
@@ -29815,19 +29985,54 @@ def ep1LowerIntrinsicKind_V2026_06_01 (defPath : DefPath) : Option LIntrinsicOp 
     else if ep1UnwindingPanicDefPaths_V2026_06_01.any (stringEq defPath) then some .panicUnwind
     else none
 
-/-- Every `DefPath` literal either adapter compares against: Episode 1's four tables plus
-`core::intrinsics::const_eval_select` (classified by `classifyRustIntrinsic?` but lowered by
-neither adapter). -/
+/-- The seven volatile memory intrinsic rows `[adv ep1-A0]` adds to `Trusted`'s inline dispatch
+(`classifyRustIntrinsic?`) and to `lowerIntrinsicKind_V2026_06_01`, in `classifyRustIntrinsic?`'s
+order. They are not rows of `RUST_INTRINSIC_DEF_PATHS_V2026_06_01`
+(`crates/anneal-mir/src/rustc_v2026_06_01.rs`), whose lowering still treats these paths as ordinary
+callees. -/
+def volatileRustIntrinsicDefPaths_V2026_06_01 : List (DefPath × LIntrinsicOp) :=
+  [ ("core::intrinsics::unaligned_volatile_load", .unalignedVolatileLoad)
+  , ("core::intrinsics::unaligned_volatile_store", .unalignedVolatileStore)
+  , ("core::intrinsics::volatile_load", .volatileLoad)
+  , ("core::intrinsics::volatile_store", .volatileStore)
+  , ("core::intrinsics::volatile_copy_nonoverlapping_memory", .volatileCopyNonOverlappingMemory)
+  , ("core::intrinsics::volatile_copy_memory", .volatileCopyMemory)
+  , ("core::intrinsics::volatile_set_memory", .volatileSetMemory) ]
+
+/-- Episode 1's `lower_intrinsic_kind_v2026_06_01` (`ep1LowerIntrinsicKind_V2026_06_01`) extended
+with the volatile rows (`volatileRustIntrinsicDefPaths_V2026_06_01`): the first matching volatile
+row, else Episode 1's tables. The two tables share no `DefPath`. -/
+def ep1LowerIntrinsicKindWithVolatile_V2026_06_01 (defPath : DefPath) : Option LIntrinsicOp :=
+  match volatileRustIntrinsicDefPaths_V2026_06_01.find? (fun e => stringEq defPath e.1) with
+  | some e => some e.2
+  | none => ep1LowerIntrinsicKind_V2026_06_01 defPath
+
+/-- Every `DefPath` literal either adapter compares against: Episode 1's four tables, the volatile
+rows, and `core::intrinsics::const_eval_select` (classified by `classifyRustIntrinsic?` but lowered
+by neither adapter). -/
 def adapterLiteralDefPaths_V2026_06_01 : List DefPath :=
   ep1RustIntrinsicDefPaths_V2026_06_01.map Prod.fst ++ ep1UnreachableDefPaths_V2026_06_01 ++
     ep1AbortingPanicDefPaths_V2026_06_01 ++ ep1UnwindingPanicDefPaths_V2026_06_01 ++
-    ["core::intrinsics::const_eval_select"]
+    ["core::intrinsics::const_eval_select"] ++
+    volatileRustIntrinsicDefPaths_V2026_06_01.map Prod.fst
 
 set_option maxRecDepth 100000 in
 /-- The two adapters agree on every literal they compare against (kernel-checked). -/
 private theorem lowerIntrinsicKind_V2026_06_01_literal_parity :
     adapterLiteralDefPaths_V2026_06_01.all
-        (fun p => decide (lowerIntrinsicKind_V2026_06_01 p = ep1LowerIntrinsicKind_V2026_06_01 p)) =
+        (fun p => decide (lowerIntrinsicKind_V2026_06_01 p =
+          ep1LowerIntrinsicKindWithVolatile_V2026_06_01 p)) =
+      true := by
+  decide +kernel
+
+set_option maxRecDepth 100000 in
+/-- No literal either adapter compares against is one of the four `core::ptr` raw-pointer access
+functions `Trusted` evaluates inline when unlinked (`evalUnlinkedPtrAccessCall?`). -/
+private theorem adapterLiteralDefPaths_V2026_06_01_not_ptrAccess :
+    adapterLiteralDefPaths_V2026_06_01.all
+        (fun p =>
+          !stringEq p "core::ptr::read_unaligned" && !stringEq p "core::ptr::write_unaligned" &&
+            !stringEq p "core::ptr::read_volatile" && !stringEq p "core::ptr::write_volatile") =
       true := by
   decide +kernel
 
@@ -29836,29 +30041,60 @@ set_option maxHeartbeats 2000000 in
 private theorem lowerIntrinsicKind_V2026_06_01_off_literals {defPath : DefPath}
     (hMem : defPath ∉ adapterLiteralDefPaths_V2026_06_01) :
     lowerIntrinsicKind_V2026_06_01 defPath = none ∧
-      ep1LowerIntrinsicKind_V2026_06_01 defPath = none := by
+      ep1LowerIntrinsicKindWithVolatile_V2026_06_01 defPath = none := by
   simp only [adapterLiteralDefPaths_V2026_06_01, ep1RustIntrinsicDefPaths_V2026_06_01,
+    volatileRustIntrinsicDefPaths_V2026_06_01,
     ep1UnreachableDefPaths_V2026_06_01, ep1AbortingPanicDefPaths_V2026_06_01,
     ep1UnwindingPanicDefPaths_V2026_06_01, List.map_cons, List.map_nil, List.cons_append,
     List.nil_append, List.mem_cons, List.not_mem_nil, or_false, not_or] at hMem
-  simp [lowerIntrinsicKind_V2026_06_01, ep1LowerIntrinsicKind_V2026_06_01, classifyRustIntrinsic?,
+  simp [lowerIntrinsicKind_V2026_06_01, ep1LowerIntrinsicKindWithVolatile_V2026_06_01,
+    ep1LowerIntrinsicKind_V2026_06_01, classifyRustIntrinsic?,
     isUnreachableCallTarget, isAbortingPanicDefPath, isUnwindingPanicDefPath,
-    ep1RustIntrinsicDefPaths_V2026_06_01,
+    ep1RustIntrinsicDefPaths_V2026_06_01, volatileRustIntrinsicDefPaths_V2026_06_01,
     ep1UnreachableDefPaths_V2026_06_01, ep1AbortingPanicDefPaths_V2026_06_01,
     ep1UnwindingPanicDefPaths_V2026_06_01, stringEq_eq_decide, hMem]
 
 /-- **Episode 1 adapter parity (`lowerIntrinsicKind_V2026_06_01_eq_ep1Table`)**: for every
 `DefPath`, `lowerIntrinsicKind_V2026_06_01` is Episode 1's `lower_intrinsic_kind_v2026_06_01`
-(`ep1LowerIntrinsicKind_V2026_06_01`): it lowers exactly the 27 + 3 + 10 + 26 canonical paths of
-Episode 1's tables, to the same `LIntrinsicOp`s, and nothing else (`[adv ep2-B1]`: `A0`'s adapter
-also lowered `std::intrinsics::*` / `core::ptr::*` / `std::ptr::*` aliases). -/
+extended with the seven volatile memory intrinsic rows
+(`ep1LowerIntrinsicKindWithVolatile_V2026_06_01`): it lowers exactly the 27 + 3 + 10 + 26 canonical
+paths of Episode 1's tables and the 7 volatile paths, to the same `LIntrinsicOp`s, and nothing else
+(`[adv ep2-B1]`: `A0`'s adapter also lowered `std::intrinsics::*` / `core::ptr::*` / `std::ptr::*`
+aliases). `[adv ep1-A0]`: the volatile rows follow `Trusted`'s `classifyRustIntrinsic?`; off them
+the adapter is exactly Episode 1's (`lowerIntrinsicKind_V2026_06_01_eq_ep1_of_not_volatile`). -/
 theorem lowerIntrinsicKind_V2026_06_01_eq_ep1Table (defPath : DefPath) :
-    lowerIntrinsicKind_V2026_06_01 defPath = ep1LowerIntrinsicKind_V2026_06_01 defPath := by
+    lowerIntrinsicKind_V2026_06_01 defPath =
+      ep1LowerIntrinsicKindWithVolatile_V2026_06_01 defPath := by
   by_cases hMem : defPath ∈ adapterLiteralDefPaths_V2026_06_01
   · exact of_decide_eq_true (List.all_eq_true.mp lowerIntrinsicKind_V2026_06_01_literal_parity
       defPath hMem)
   · obtain ⟨h1, h2⟩ := lowerIntrinsicKind_V2026_06_01_off_literals hMem
     rw [h1, h2]
+
+/-- Off the seven volatile memory intrinsic paths, `lowerIntrinsicKind_V2026_06_01` is exactly
+Episode 1's `lower_intrinsic_kind_v2026_06_01` (`ep1LowerIntrinsicKind_V2026_06_01`). -/
+theorem lowerIntrinsicKind_V2026_06_01_eq_ep1_of_not_volatile {defPath : DefPath}
+    (hNotVol :
+      volatileRustIntrinsicDefPaths_V2026_06_01.find? (fun e => stringEq defPath e.1) = none) :
+    lowerIntrinsicKind_V2026_06_01 defPath = ep1LowerIntrinsicKind_V2026_06_01 defPath := by
+  rw [lowerIntrinsicKind_V2026_06_01_eq_ep1Table, ep1LowerIntrinsicKindWithVolatile_V2026_06_01,
+    hNotVol]
+
+/-- A `DefPath` the adapter lowers to an inline intrinsic is none of the four `core::ptr`
+raw-pointer access functions `Trusted` evaluates inline when unlinked
+(`evalUnlinkedPtrAccessCall?`). -/
+theorem unlinkedPtrAccess_stringEq_false_of_lowered {defPath : DefPath} {op : LIntrinsicOp}
+    (hLower : lowerIntrinsicKind_V2026_06_01 defPath = some op) :
+    stringEq defPath "core::ptr::read_unaligned" = false ∧
+      stringEq defPath "core::ptr::write_unaligned" = false ∧
+      stringEq defPath "core::ptr::read_volatile" = false ∧
+      stringEq defPath "core::ptr::write_volatile" = false := by
+  by_cases hMem : defPath ∈ adapterLiteralDefPaths_V2026_06_01
+  · have h := List.all_eq_true.mp adapterLiteralDefPaths_V2026_06_01_not_ptrAccess defPath hMem
+    simp only [Bool.and_eq_true, Bool.not_eq_true'] at h
+    exact ⟨h.1.1.1, h.1.1.2, h.1.2, h.2⟩
+  · rw [(lowerIntrinsicKind_V2026_06_01_off_literals hMem).1] at hLower
+    nomatch hLower
 
 /-- Unlike `A0`'s adapter, no `std::intrinsics::*` or `core::ptr::*` / `std::ptr::*` alias is
 lowered to an inline intrinsic (they are ordinary callees, as in Episode 1). -/
@@ -29922,6 +30158,11 @@ theorem trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind {defPath : DefPat
       obtain ⟨hEx, hCl⟩ := h
       simp only [lowerIntrinsicKind_V2026_06_01, hEx, hCl, Bool.false_eq_true, ↓reduceIte,
         LIntrinsicOp.ofRustIntrinsicKind?]
+    | unalignedVolatileLoad | unalignedVolatileStore | volatileLoad | volatileStore
+    | volatileCopyNonOverlappingMemory | volatileCopyMemory | volatileSetMemory =>
+      obtain ⟨hEx, hCl⟩ := h
+      simp only [lowerIntrinsicKind_V2026_06_01, hEx, hCl, Bool.false_eq_true, ↓reduceIte,
+        LIntrinsicOp.ofRustIntrinsicKind?]
     | exactDiv =>
       obtain ⟨hEx, _⟩ := h
       simp only [lowerIntrinsicKind_V2026_06_01, hEx, ↓reduceIte]
@@ -29954,21 +30195,35 @@ theorem trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind {defPath : DefPat
         simpa using hEx
       split at h
       · rename_i kind hCl
-        by_cases hMemK : kind = .copyNonOverlapping ∨ kind = .writeBytes
-        · rcases hMemK with rfl | rfl <;>
-            (simp only [LIntrinsicOp.ofRustIntrinsicKind?, Option.some.injEq] at h
-             subst h
-             exact ⟨hEx', hCl⟩)
+        by_cases hMemK :
+            kind = .copyNonOverlapping ∨ kind = .writeBytes ∨
+              isVolatileMemIntrinsicKind kind = true
+        · rcases hMemK with rfl | rfl | hVol
+          · simp only [LIntrinsicOp.ofRustIntrinsicKind?, Option.some.injEq] at h
+            subst h
+            exact ⟨hEx', hCl⟩
+          · simp only [LIntrinsicOp.ofRustIntrinsicKind?, Option.some.injEq] at h
+            subst h
+            exact ⟨hEx', hCl⟩
+          · cases kind <;>
+              first
+              | exact absurd hVol (by decide)
+              | (simp only [LIntrinsicOp.ofRustIntrinsicKind?, Option.some.injEq] at h
+                 subst h
+                 exact ⟨hEx', hCl⟩)
         · have hFrom : LIntrinsicOp.fromRustIntrinsicKind? kind = some op := by
             cases kind <;>
               first
               | exact h
               | exact (hMemK (Or.inl rfl)).elim
-              | exact (hMemK (Or.inr rfl)).elim
+              | exact (hMemK (Or.inr (Or.inl rfl))).elim
+              | exact (hMemK (Or.inr (Or.inr rfl))).elim
           have hTo := LIntrinsicOp.toRustIntrinsicKind_fromRustIntrinsicKind hFrom
           cases op with
           | exactDiv | copyNonOverlapping | writeBytes | unreachableUnchecked | abort
-          | panicUnwind =>
+          | panicUnwind
+          | unalignedVolatileLoad | unalignedVolatileStore | volatileLoad | volatileStore
+          | volatileCopyNonOverlappingMemory | volatileCopyMemory | volatileSetMemory =>
             nomatch hTo
           | _ => exact ⟨kind, hTo, hEx', hCl⟩
       · rename_i hCl
@@ -30579,7 +30834,9 @@ theorem evalLIntrinsicValue_none_trusted_fault
     · simp only [true_iff]; intro hab; rw [Nat.ble_eq_true_of_le hab] at h; nomatch h
     · simp only [Bool.true_eq_false, false_iff, Classical.not_not]; exact Nat.le_of_ble_eq_true h
   cases op with
-  | exactDiv | copyNonOverlapping | writeBytes | unreachableUnchecked | abort | panicUnwind =>
+  | exactDiv | copyNonOverlapping | writeBytes | unreachableUnchecked | abort | panicUnwind
+  | unalignedVolatileLoad | unalignedVolatileStore | volatileLoad | volatileStore
+  | volatileCopyNonOverlappingMemory | volatileCopyMemory | volatileSetMemory =>
     nomatch hKind
   | _ =>
     simp only [LIntrinsicOp.toRustIntrinsicKind?, Option.some.injEq] at hKind
@@ -31102,7 +31359,9 @@ def IntrinsicResolvedInBody (op : LIntrinsicOp) (typeArgs : List RigidTy)
     ∃ pt,
       resolveIntrinsicPointeeTy? t localDecls layouts argOps = some pt ∧
         AlignOfValPointeeResolved localDecls layouts pt
-  | .copyNonOverlapping | .writeBytes | .unreachableUnchecked | .abort | .panicUnwind => False
+  | .copyNonOverlapping | .writeBytes | .unalignedVolatileLoad | .unalignedVolatileStore
+  | .volatileLoad | .volatileStore | .volatileCopyNonOverlappingMemory | .volatileCopyMemory
+  | .volatileSetMemory | .unreachableUnchecked | .abort | .panicUnwind => False
 
 /-- **Exact `.ub` fault parity for resolved `evalNonSelectIntrinsicCall` intrinsics
 (`evalLIntrinsicValue_resolved_none_eq_ub`)**: strengthens `evalLIntrinsicValue_none_trusted_fault`
@@ -31135,7 +31394,9 @@ theorem evalLIntrinsicValue_resolved_none_eq_ub
         resolveIntrinsicPointeeTy? target localDecls layouts argOps :=
     (resolveIntrinsicPointeeTy?_defPath_irrel _ _ _ _ _ rfl).symm
   cases op with
-  | exactDiv | copyNonOverlapping | writeBytes | unreachableUnchecked | abort | panicUnwind =>
+  | exactDiv | copyNonOverlapping | writeBytes | unreachableUnchecked | abort | panicUnwind
+  | unalignedVolatileLoad | unalignedVolatileStore | volatileLoad | volatileStore
+  | volatileCopyNonOverlappingMemory | volatileCopyMemory | volatileSetMemory =>
     nomatch hKind
   | sizeOfVal =>
     simp only [LIntrinsicOp.toRustIntrinsicKind?, Option.some.injEq] at hKind
@@ -31480,10 +31741,11 @@ theorem evalLoweredTerminator_call_nonReturning_with_target_extCall
             (length args) decls lays =
             .ok { defPath := defPath, typeArgs := typeArgs, isIndirect := false } s.frame.locals :=
       fun _ _ => rfl
+    obtain ⟨hP1, hP2, hP3, hP4⟩ := unlinkedPtrAccess_stringEq_false_of_lowered hLower
     exact ⟨locals2, hTOps, by
       simp only [hT, LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
         hLayouts, hCorr.globals, hTOpsCS, hNoCallee, isDirectExactDivTarget, hNotEx,
-        evalDirectRustIntrinsic?, hNotRust]⟩
+        evalDirectRustIntrinsic?, hNotRust, evalUnlinkedPtrAccessCall?, hP1, hP2, hP3, hP4]⟩
 
 /-- **Target-presence boundary Part 2 (`evalLoweredTerminator_call_value_without_target_extCall`)**:
 a hand-built diverging (`target = none`) direct call to any of the 25 value-returning intrinsics is
@@ -33974,5 +34236,612 @@ theorem witness_diverging_proj_move_cleanup_and_protectors :
     exact ⟨hRej, hRejRet, hAcc,
       runLoweredWithCallTable_refines_trusted 8 stGlobalPtr sGlobalPtr witnessCrossPtrRootCm _
         hCorrC hAcc⟩
+
+/-! ### Section 5j: `[adv ep1-A0]` Volatile and Unaligned Raw-Pointer Memory Intrinsics
+
+`Trusted`'s `evalTerminator` evaluates the seven volatile memory intrinsics
+(`core::intrinsics::{unaligned_volatile_load, unaligned_volatile_store, volatile_load,
+volatile_store, volatile_copy_nonoverlapping_memory, volatile_copy_memory, volatile_set_memory}`)
+and direct unlinked calls to `core::ptr::{read_unaligned, write_unaligned, read_volatile,
+write_volatile}` inline (`evalVolatileMemIntrinsicCall`, `evalUnlinkedPtrAccessCall?`). This
+section characterizes that dispatch exactly and pins the corner cases of the raw-pointer access
+semantics (`rawPtrLoadAction`, `rawPtrStoreAction`, `volatileCopyPlan`, `volatileSetPlan`):
+- **Exact dispatch.** A direct, non-diverging, unlinked call to a volatile memory intrinsic is
+  `evalVolatileMemIntrinsicCall` on the evaluated arguments
+  (`evalTerminator_call_volatileMemIntrinsic_eq`, `evalVolatileMemIntrinsicCall_eq`), and one to an
+  unlinked `core::ptr` access function is `evalUnlinkedPtrAccessCall?`
+  (`evalTerminator_call_unlinkedPtrAccess_eq`, `evalUnlinkedPtrAccessCall?_literals`).
+- **Memory outside Rust allocations.** A volatile access through a pointer without provenance is
+  `.ub` when misaligned, a no-op when zero-sized, and otherwise unsupported: never a successful
+  step, and never `.ub` once aligned.
+- **Null.** A non-volatile `read_unaligned` / `write_unaligned` through a null pointer is `.ub`,
+  even for a zero-sized type.
+- **Argument order.** `volatile_copy_*` takes `(dst, src, count)`: for tracked stack pointers the
+  plan copies from the *second* argument to the *first*.
+- **Lowered dialect.** `lowerIntrinsicKind_V2026_06_01` lowers the seven canonical paths to their
+  `LIntrinsicOp` (`lowerIntrinsicKind_V2026_06_01_volatileIntrinsics`), and a lowered volatile op
+  names exactly the `Trusted` dispatch above
+  (`evalTerminator_call_loweredVolatileIntrinsic_eq`). The lowered evaluator itself does not
+  model raw-pointer memory accesses and fails closed on these ops
+  (`evalLoweredIntrinsicCall_volatile_none`), so the step refinement of Section 3b holds for
+  them without any exemption. -/
+
+/-- The canonical `core::intrinsics::*` `DefPath` of each volatile memory intrinsic kind (`none`
+for every other `RustIntrinsicKind`). -/
+def volatileIntrinsicDefPath? : RustIntrinsicKind → Option DefPath
+  | .unalignedVolatileLoad => some "core::intrinsics::unaligned_volatile_load"
+  | .unalignedVolatileStore => some "core::intrinsics::unaligned_volatile_store"
+  | .volatileLoad => some "core::intrinsics::volatile_load"
+  | .volatileStore => some "core::intrinsics::volatile_store"
+  | .volatileCopyNonOverlappingMemory =>
+    some "core::intrinsics::volatile_copy_nonoverlapping_memory"
+  | .volatileCopyMemory => some "core::intrinsics::volatile_copy_memory"
+  | .volatileSetMemory => some "core::intrinsics::volatile_set_memory"
+  | _ => none
+
+/-- A `DefPath` that `classifyRustIntrinsic?` classifies as a volatile memory intrinsic kind is that
+kind's canonical `core::intrinsics::*` path. -/
+theorem classifyRustIntrinsic_volatile_defPath {defPath : DefPath} {kind : RustIntrinsicKind}
+    (h : classifyRustIntrinsic? defPath = some kind)
+    (hVol : isVolatileMemIntrinsicKind kind = true) :
+    volatileIntrinsicDefPath? kind = some defPath := by
+  unfold classifyRustIntrinsic? at h
+  repeat' split at h
+  all_goals
+    first
+    | (cases h; done)
+    | (cases h; exact absurd hVol (by decide))
+    | (cases h; rename_i hEq; have hPath := stringEq_eq_true_iff.mp hEq; subst hPath; rfl)
+
+/-- `classifyRustIntrinsic?` names the seven volatile memory intrinsics exactly at their canonical
+`core::intrinsics::*` paths. -/
+theorem classifyRustIntrinsic_eq_volatileIntrinsic_iff {defPath : DefPath} :
+    (classifyRustIntrinsic? defPath = some .unalignedVolatileLoad ↔
+      defPath = "core::intrinsics::unaligned_volatile_load") ∧
+    (classifyRustIntrinsic? defPath = some .unalignedVolatileStore ↔
+      defPath = "core::intrinsics::unaligned_volatile_store") ∧
+    (classifyRustIntrinsic? defPath = some .volatileLoad ↔
+      defPath = "core::intrinsics::volatile_load") ∧
+    (classifyRustIntrinsic? defPath = some .volatileStore ↔
+      defPath = "core::intrinsics::volatile_store") ∧
+    (classifyRustIntrinsic? defPath = some .volatileCopyNonOverlappingMemory ↔
+      defPath = "core::intrinsics::volatile_copy_nonoverlapping_memory") ∧
+    (classifyRustIntrinsic? defPath = some .volatileCopyMemory ↔
+      defPath = "core::intrinsics::volatile_copy_memory") ∧
+    (classifyRustIntrinsic? defPath = some .volatileSetMemory ↔
+      defPath = "core::intrinsics::volatile_set_memory") :=
+  ⟨⟨fun h => (Option.some.inj (classifyRustIntrinsic_volatile_defPath h rfl)).symm,
+      fun h => by subst h; rfl⟩,
+    ⟨fun h => (Option.some.inj (classifyRustIntrinsic_volatile_defPath h rfl)).symm,
+      fun h => by subst h; rfl⟩,
+    ⟨fun h => (Option.some.inj (classifyRustIntrinsic_volatile_defPath h rfl)).symm,
+      fun h => by subst h; rfl⟩,
+    ⟨fun h => (Option.some.inj (classifyRustIntrinsic_volatile_defPath h rfl)).symm,
+      fun h => by subst h; rfl⟩,
+    ⟨fun h => (Option.some.inj (classifyRustIntrinsic_volatile_defPath h rfl)).symm,
+      fun h => by subst h; rfl⟩,
+    ⟨fun h => (Option.some.inj (classifyRustIntrinsic_volatile_defPath h rfl)).symm,
+      fun h => by subst h; rfl⟩,
+    ⟨fun h => (Option.some.inj (classifyRustIntrinsic_volatile_defPath h rfl)).symm,
+      fun h => by subst h; rfl⟩⟩
+
+/-- A `DefPath` classified by `classifyRustIntrinsic?` is not `core::intrinsics::exact_div`. -/
+theorem stringEq_exactDiv_false_of_classifyRustIntrinsic {defPath : DefPath}
+    {kind : RustIntrinsicKind} (hKind : classifyRustIntrinsic? defPath = some kind) :
+    stringEq defPath "core::intrinsics::exact_div" = false := by
+  cases hE : stringEq defPath "core::intrinsics::exact_div" with
+  | false => rfl
+  | true =>
+    rw [stringEq_eq_true_iff.mp hE] at hKind
+    have hNone : classifyRustIntrinsic? "core::intrinsics::exact_div" = none := rfl
+    rw [hNone] at hKind
+    nomatch hKind
+
+/-- **Exact Trusted semantics of the volatile memory intrinsics
+(`evalTerminator_call_volatileMemIntrinsic_eq`)**: a direct, non-diverging call
+(`target = some targetBb`) to a volatile memory intrinsic
+(`classifyRustIntrinsic? defPath = some kind` with `isVolatileMemIntrinsicKind kind = true`) with no
+linked callee body evaluates in `Trusted.evalTerminator` to exactly `evalVolatileMemIntrinsicCall`
+on the evaluated arguments. -/
+theorem evalTerminator_call_volatileMemIntrinsic_eq {s : MachineState} {cm : CapturedMir}
+    {defPath : DefPath} {typeArgs : List RigidTy} {layoutIdx : LayoutIdx}
+    {args : List Operand} {dest : Place} {targetBb : Nat} {u : UnwindAction} {span : String}
+    {argVals : List Value} {locals' : List LocalSlot} {kind : RustIntrinsicKind}
+    (hKind : classifyRustIntrinsic? defPath = some kind)
+    (hVol : isVolatileMemIntrinsicKind kind = true)
+    (hArgs : evalOperands s.frame.locals args s.memory.borrows s.memory.globals cm.layouts
+        s.memory.callerLocals [] s.memory.callStack = .ok argVals locals')
+    (hNoCallee :
+      lookupCallee s.memory.callees cm.layouts defPath typeArgs s.memory.traitImpls = none) :
+    evalTerminator s
+        ⟨.call (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩) args dest
+          (some targetBb) u, span⟩
+        (some cm) =
+      evalVolatileMemIntrinsicCall kind s
+        { defPath := defPath, typeArgs := typeArgs, isIndirect := false }
+        cm.localDecls cm.layouts args argVals locals' dest targetBb := by
+  have hNotEx := stringEq_exactDiv_false_of_classifyRustIntrinsic hKind
+  have hResTgt :
+      ∀ (decls : List LocalDecl) (lays : LayoutTable),
+        resolveCallTarget s (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩)
+          (length args) decls lays =
+          .ok { defPath := defPath, typeArgs := typeArgs, isIndirect := false } s.frame.locals :=
+    fun _ _ => rfl
+  cases kind with
+  | unalignedVolatileLoad | unalignedVolatileStore | volatileLoad | volatileStore
+  | volatileCopyNonOverlappingMemory | volatileCopyMemory | volatileSetMemory =>
+    simp only [evalTerminator, bodyLocalDeclsOf, hResTgt, hArgs, hNoCallee,
+      isDirectExactDivTarget, hNotEx, evalDirectRustIntrinsic?, hKind]
+  | _ => exact absurd hVol (by decide)
+
+/-- `evalVolatileMemIntrinsicCall` on each volatile memory intrinsic: loads and stores are volatile
+with required alignment `1` (`unaligned_*`) or `align_of::<T>()`,
+`volatile_copy_nonoverlapping_memory` is the non-overlapping copy and `volatile_copy_memory` the
+possibly overlapping one. -/
+theorem evalVolatileMemIntrinsicCall_eq (s : MachineState) (target : ResolvedCallTarget)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot) (dest : Place) (targetBb : BasicBlockIdx) :
+    evalVolatileMemIntrinsicCall .unalignedVolatileLoad s target localDecls layouts argOps argVals
+        locals' dest targetBb =
+      evalRawPtrLoadCall true false s target localDecls layouts argOps argVals locals' dest
+        targetBb ∧
+    evalVolatileMemIntrinsicCall .unalignedVolatileStore s target localDecls layouts argOps argVals
+        locals' dest targetBb =
+      evalRawPtrStoreCall true false s target localDecls layouts argOps argVals locals' dest
+        targetBb ∧
+    evalVolatileMemIntrinsicCall .volatileLoad s target localDecls layouts argOps argVals
+        locals' dest targetBb =
+      evalRawPtrLoadCall true true s target localDecls layouts argOps argVals locals' dest
+        targetBb ∧
+    evalVolatileMemIntrinsicCall .volatileStore s target localDecls layouts argOps argVals
+        locals' dest targetBb =
+      evalRawPtrStoreCall true true s target localDecls layouts argOps argVals locals' dest
+        targetBb ∧
+    evalVolatileMemIntrinsicCall .volatileCopyNonOverlappingMemory s target localDecls layouts
+        argOps argVals locals' dest targetBb =
+      evalVolatileCopyMemoryCall true s target localDecls layouts argOps argVals locals' dest
+        targetBb ∧
+    evalVolatileMemIntrinsicCall .volatileCopyMemory s target localDecls layouts argOps argVals
+        locals' dest targetBb =
+      evalVolatileCopyMemoryCall false s target localDecls layouts argOps argVals locals' dest
+        targetBb ∧
+    evalVolatileMemIntrinsicCall .volatileSetMemory s target localDecls layouts argOps argVals
+        locals' dest targetBb =
+      evalVolatileSetMemoryCall s target localDecls layouts argOps argVals locals' dest
+        targetBb :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `evalUnlinkedPtrAccessCall?` on the four `core::ptr` raw-pointer access functions:
+`read_unaligned` / `write_unaligned` are non-volatile with required alignment `1`, and
+`read_volatile` / `write_volatile` are volatile with required alignment `align_of::<T>()`. -/
+theorem evalUnlinkedPtrAccessCall?_literals (s : MachineState) (typeArgs : List RigidTy)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot) (dest : Place) (targetBb : BasicBlockIdx) :
+    evalUnlinkedPtrAccessCall? s
+        { defPath := "core::ptr::read_unaligned", typeArgs := typeArgs, isIndirect := false }
+        localDecls layouts argOps argVals locals' dest targetBb =
+      some (evalRawPtrLoadCall false false s
+        { defPath := "core::ptr::read_unaligned", typeArgs := typeArgs, isIndirect := false }
+        localDecls layouts argOps argVals locals' dest targetBb) ∧
+    evalUnlinkedPtrAccessCall? s
+        { defPath := "core::ptr::write_unaligned", typeArgs := typeArgs, isIndirect := false }
+        localDecls layouts argOps argVals locals' dest targetBb =
+      some (evalRawPtrStoreCall false false s
+        { defPath := "core::ptr::write_unaligned", typeArgs := typeArgs, isIndirect := false }
+        localDecls layouts argOps argVals locals' dest targetBb) ∧
+    evalUnlinkedPtrAccessCall? s
+        { defPath := "core::ptr::read_volatile", typeArgs := typeArgs, isIndirect := false }
+        localDecls layouts argOps argVals locals' dest targetBb =
+      some (evalRawPtrLoadCall true true s
+        { defPath := "core::ptr::read_volatile", typeArgs := typeArgs, isIndirect := false }
+        localDecls layouts argOps argVals locals' dest targetBb) ∧
+    evalUnlinkedPtrAccessCall? s
+        { defPath := "core::ptr::write_volatile", typeArgs := typeArgs, isIndirect := false }
+        localDecls layouts argOps argVals locals' dest targetBb =
+      some (evalRawPtrStoreCall true true s
+        { defPath := "core::ptr::write_volatile", typeArgs := typeArgs, isIndirect := false }
+        localDecls layouts argOps argVals locals' dest targetBb) :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- `evalUnlinkedPtrAccessCall?` recognizes exactly the four canonical `core::ptr` paths. -/
+theorem evalUnlinkedPtrAccessCall?_eq_some_defPath {s : MachineState}
+    {target : ResolvedCallTarget} {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {argOps : List Operand} {argVals : List Value} {locals' : List LocalSlot} {dest : Place}
+    {targetBb : BasicBlockIdx} {node : MirStepNode}
+    (h : evalUnlinkedPtrAccessCall? s target localDecls layouts argOps argVals locals' dest
+      targetBb = some node) :
+    target.defPath = "core::ptr::read_unaligned" ∨
+      target.defPath = "core::ptr::write_unaligned" ∨
+      target.defPath = "core::ptr::read_volatile" ∨
+      target.defPath = "core::ptr::write_volatile" := by
+  unfold evalUnlinkedPtrAccessCall? at h
+  cases h1 : stringEq target.defPath "core::ptr::read_unaligned" with
+  | true => exact Or.inl (stringEq_eq_true_iff.mp h1)
+  | false =>
+    rw [h1] at h
+    dsimp only at h
+    cases h2 : stringEq target.defPath "core::ptr::write_unaligned" with
+    | true => exact Or.inr (Or.inl (stringEq_eq_true_iff.mp h2))
+    | false =>
+      rw [h2] at h
+      dsimp only at h
+      cases h3 : stringEq target.defPath "core::ptr::read_volatile" with
+      | true => exact Or.inr (Or.inr (Or.inl (stringEq_eq_true_iff.mp h3)))
+      | false =>
+        rw [h3] at h
+        dsimp only at h
+        cases h4 : stringEq target.defPath "core::ptr::write_volatile" with
+        | true => exact Or.inr (Or.inr (Or.inr (stringEq_eq_true_iff.mp h4)))
+        | false =>
+          rw [h4] at h
+          nomatch h
+
+/-- **Exact Trusted semantics of unlinked `core::ptr` raw-pointer access calls
+(`evalTerminator_call_unlinkedPtrAccess_eq`)**: a direct, non-diverging call
+(`target = some targetBb`) with no linked callee body to a `DefPath` that
+`evalUnlinkedPtrAccessCall?` recognizes (`core::ptr::{read_unaligned, write_unaligned,
+read_volatile, write_volatile}`) evaluates in `Trusted.evalTerminator` to exactly that inline
+raw-pointer access, not to an external call. -/
+theorem evalTerminator_call_unlinkedPtrAccess_eq {s : MachineState} {cm : CapturedMir}
+    {defPath : DefPath} {typeArgs : List RigidTy} {layoutIdx : LayoutIdx}
+    {args : List Operand} {dest : Place} {targetBb : Nat} {u : UnwindAction} {span : String}
+    {argVals : List Value} {locals' : List LocalSlot} {node : MirStepNode}
+    (hPtr :
+      evalUnlinkedPtrAccessCall? s
+        { defPath := defPath, typeArgs := typeArgs, isIndirect := false }
+        cm.localDecls cm.layouts args argVals locals' dest targetBb = some node)
+    (hArgs : evalOperands s.frame.locals args s.memory.borrows s.memory.globals cm.layouts
+        s.memory.callerLocals [] s.memory.callStack = .ok argVals locals')
+    (hNoCallee :
+      lookupCallee s.memory.callees cm.layouts defPath typeArgs s.memory.traitImpls = none) :
+    evalTerminator s
+        ⟨.call (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩) args dest
+          (some targetBb) u, span⟩
+        (some cm) = node := by
+  have hPath := evalUnlinkedPtrAccessCall?_eq_some_defPath hPtr
+  have hFacts :
+      stringEq defPath "core::intrinsics::exact_div" = false ∧
+        classifyRustIntrinsic? defPath = none := by
+    rcases hPath with h | h | h | h <;> (dsimp only at h; subst h; exact ⟨by decide, rfl⟩)
+  have hResTgt :
+      ∀ (decls : List LocalDecl) (lays : LayoutTable),
+        resolveCallTarget s (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩)
+          (length args) decls lays =
+          .ok { defPath := defPath, typeArgs := typeArgs, isIndirect := false } s.frame.locals :=
+    fun _ _ => rfl
+  simp only [evalTerminator, bodyLocalDeclsOf, hResTgt, hArgs, hNoCallee, isDirectExactDivTarget,
+    hFacts.1, evalDirectRustIntrinsic?, hFacts.2, hPtr]
+
+/-- **Arity.** A raw-pointer load takes exactly one argument and a store exactly two; any other
+argument list is `.ub`. -/
+theorem rawPtrAccessAction_bad_arity_ub (isVolatile requiresAlign : Bool)
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (cs : List SavedCallerFrame) (cl : List LocalSlot) (ap : List Nat)
+    (target : ResolvedCallTarget) (decls : List LocalDecl) (layouts : LayoutTable)
+    (argOps : List Operand) (locals' : List LocalSlot) (v₁ v₂ v₃ : Value) :
+    rawPtrLoadAction isVolatile requiresAlign borrows globals cs ap target decls layouts argOps []
+        locals' = .fault .ub ∧
+    rawPtrLoadAction isVolatile requiresAlign borrows globals cs ap target decls layouts argOps
+        [v₁, v₂] locals' = .fault .ub ∧
+    rawPtrStoreAction isVolatile requiresAlign borrows globals cs cl ap target decls layouts
+        argOps [v₁] locals' = .fault .ub ∧
+    rawPtrStoreAction isVolatile requiresAlign borrows globals cs cl ap target decls layouts
+        argOps [v₁, v₂, v₃] locals' = .fault .ub :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- **Misaligned provenance-less pointer.** An access that requires alignment through a
+provenance-less address that is not a multiple of `align_of::<T>() > 1` is `.ub`, for a load and
+for a store, volatile or not, and whatever the size of `T` (even zero). -/
+theorem rawPtrAccessAction_misaligned_addr_ub {isVolatile : Bool}
+    {borrows : List BorrowEntry} {globals : List CapturedAllocation}
+    {cs : List SavedCallerFrame} {cl : List LocalSlot} {ap : List Nat}
+    {target : ResolvedCallTarget} {decls : List LocalDecl} {layouts : LayoutTable}
+    {argOps : List Operand} {locals' : List LocalSlot} {addr : Nat} {val : Value}
+    {elemTy : Ty} {size align : Nat}
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
+    (hAlign : Nat.ble align 1 = false)
+    (hMis : Nat.beq (Nat.mod addr align) 0 = false) :
+    rawPtrLoadAction isVolatile true borrows globals cs ap target decls layouts argOps
+        [.scalar ⟨addr, layoutPointerBytes layouts⟩] locals' = .fault .ub ∧
+    rawPtrStoreAction isVolatile true borrows globals cs cl ap target decls layouts argOps
+        [.scalar ⟨addr, layoutPointerBytes layouts⟩, val] locals' = .fault .ub := by
+  constructor
+  · simp only [rawPtrLoadAction, rawPtrArgOfValue?, Nat.beq_refl, hLay, rawPtrTargetAligned?,
+      hAlign, hMis]
+  · simp only [rawPtrStoreAction, rawPtrArgOfValue?, Nat.beq_refl, hLay, rawPtrTargetAligned?,
+      hAlign, hMis]
+
+/-- **Volatile load outside Rust allocations.** A volatile load of an inhabited, non-zero-sized `T`
+through an aligned provenance-less address (memory outside all Rust allocations, including
+address `0`) is unsupported: never a successful step and never `.ub`. -/
+theorem rawPtrLoadAction_volatile_addr_unsupported {requiresAlign : Bool}
+    {borrows : List BorrowEntry} {globals : List CapturedAllocation}
+    {cs : List SavedCallerFrame} {ap : List Nat}
+    {target : ResolvedCallTarget} {decls : List LocalDecl} {layouts : LayoutTable}
+    {argOps : List Operand} {locals' : List LocalSlot} {addr : Nat}
+    {elemTy : Ty} {size align : Nat}
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
+    (hAligned :
+      rawPtrTargetAligned? cs locals' decls layouts
+        (match requiresAlign with | true => align | false => 1) (.addr addr) .outside = some true)
+    (hInh : tyIsUninhabited layouts elemTy = false)
+    (hSize : Nat.beq size 0 = false) :
+    rawPtrLoadAction true requiresAlign borrows globals cs ap target decls layouts argOps
+        [.scalar ⟨addr, layoutPointerBytes layouts⟩] locals' = .fault .unsupported := by
+  cases requiresAlign <;>
+    (dsimp only at hAligned
+     simp only [rawPtrLoadAction, rawPtrArgOfValue?, Nat.beq_refl, hLay, classifyRawPtrTarget,
+       hAligned, Bool.not_true, Bool.and, hInh, hSize])
+
+/-- **Volatile store outside Rust allocations.** A volatile store of a storable value of a
+non-zero-sized `T` through an aligned provenance-less address is unsupported: never a successful
+step and never `.ub`. -/
+theorem rawPtrStoreAction_volatile_addr_unsupported {requiresAlign : Bool}
+    {borrows : List BorrowEntry} {globals : List CapturedAllocation}
+    {cs : List SavedCallerFrame} {cl : List LocalSlot} {ap : List Nat}
+    {target : ResolvedCallTarget} {decls : List LocalDecl} {layouts : LayoutTable}
+    {argOps : List Operand} {locals' : List LocalSlot} {addr : Nat} {val : Value}
+    {elemTy : Ty} {size align : Nat}
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
+    (hAligned :
+      rawPtrTargetAligned? cs locals' decls layouts
+        (match requiresAlign with | true => align | false => 1) (.addr addr) .outside = some true)
+    (hVal : rawPtrStoreValueFault? layouts elemTy size val = none)
+    (hSize : Nat.beq size 0 = false) :
+    rawPtrStoreAction true requiresAlign borrows globals cs cl ap target decls layouts argOps
+        [.scalar ⟨addr, layoutPointerBytes layouts⟩, val] locals' = .fault .unsupported := by
+  cases requiresAlign <;>
+    (dsimp only at hAligned
+     simp only [rawPtrStoreAction, rawPtrArgOfValue?, Nat.beq_refl, hLay, classifyRawPtrTarget,
+       hAligned, Bool.not_true, Bool.and, hVal, hSize])
+
+/-- **Zero-sized volatile access.** A volatile load of an inhabited zero-sized `T` through any
+aligned provenance-less address (including null) returns the unique value of `T` without touching
+memory, and a volatile store of a storable zero-sized value is a no-op. -/
+theorem rawPtrAccessAction_volatile_zst_addr {requiresAlign : Bool}
+    {borrows : List BorrowEntry} {globals : List CapturedAllocation}
+    {cs : List SavedCallerFrame} {cl : List LocalSlot} {ap : List Nat}
+    {target : ResolvedCallTarget} {decls : List LocalDecl} {layouts : LayoutTable}
+    {argOps : List Operand} {locals' : List LocalSlot} {addr : Nat} {val zstVal : Value}
+    {elemTy : Ty} {align : Nat}
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy 0 align)
+    (hAligned :
+      rawPtrTargetAligned? cs locals' decls layouts
+        (match requiresAlign with | true => align | false => 1) (.addr addr) .outside = some true)
+    (hInh : tyIsUninhabited layouts elemTy = false)
+    (hZst : rawPtrZstValue? layouts elemTy = some zstVal)
+    (hVal : rawPtrStoreValueFault? layouts elemTy 0 val = none) :
+    rawPtrLoadAction true requiresAlign borrows globals cs ap target decls layouts argOps
+        [.scalar ⟨addr, layoutPointerBytes layouts⟩] locals' = .ret zstVal ∧
+    rawPtrStoreAction true requiresAlign borrows globals cs cl ap target decls layouts argOps
+        [.scalar ⟨addr, layoutPointerBytes layouts⟩, val] locals' = .ret .unit := by
+  cases requiresAlign <;>
+    (dsimp only at hAligned
+     constructor
+     · simp only [rawPtrLoadAction, rawPtrArgOfValue?, Nat.beq_refl, hLay, classifyRawPtrTarget,
+         hAligned, Bool.not_true, Bool.and, hInh, hZst]
+     · simp only [rawPtrStoreAction, rawPtrArgOfValue?, Nat.beq_refl, hLay, classifyRawPtrTarget,
+         hAligned, Bool.not_true, Bool.and, hVal])
+
+/-- **Uninhabited load.** An aligned load of an uninhabited `T` is `.ub`, even when `T` is
+zero-sized and the access is volatile. -/
+theorem rawPtrLoadAction_uninhabited_ub {isVolatile requiresAlign : Bool}
+    {borrows : List BorrowEntry} {globals : List CapturedAllocation}
+    {cs : List SavedCallerFrame} {ap : List Nat}
+    {target : ResolvedCallTarget} {decls : List LocalDecl} {layouts : LayoutTable}
+    {argOps : List Operand} {locals' : List LocalSlot} {addr : Nat}
+    {elemTy : Ty} {size align : Nat}
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
+    (hAligned :
+      rawPtrTargetAligned? cs locals' decls layouts
+        (match requiresAlign with | true => align | false => 1) (.addr addr) .outside = some true)
+    (hInh : tyIsUninhabited layouts elemTy = true) :
+    rawPtrLoadAction isVolatile requiresAlign borrows globals cs ap target decls layouts argOps
+        [.scalar ⟨addr, layoutPointerBytes layouts⟩] locals' = .fault .ub := by
+  cases requiresAlign <;>
+    (dsimp only at hAligned
+     simp only [rawPtrLoadAction, rawPtrArgOfValue?, Nat.beq_refl, hLay, classifyRawPtrTarget,
+       hAligned, hInh]
+     cases Bool.and (Bool.not isVolatile) (rawPtrArgIsNull (.addr addr)) <;> rfl)
+
+/-- **Null `read_unaligned` / `write_unaligned`.** A non-volatile access through the null pointer
+is `.ub` whatever the size of `T` (even zero): a null pointer is never valid for reads or
+writes. -/
+theorem rawPtrAccessAction_nonvolatile_null_ub
+    {borrows : List BorrowEntry} {globals : List CapturedAllocation}
+    {cs : List SavedCallerFrame} {cl : List LocalSlot} {ap : List Nat}
+    {target : ResolvedCallTarget} {decls : List LocalDecl} {layouts : LayoutTable}
+    {argOps : List Operand} {locals' : List LocalSlot} {val : Value}
+    {elemTy : Ty} {size align : Nat}
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align) :
+    rawPtrLoadAction false false borrows globals cs ap target decls layouts argOps
+        [.scalar ⟨0, layoutPointerBytes layouts⟩] locals' = .fault .ub ∧
+    rawPtrStoreAction false false borrows globals cs cl ap target decls layouts argOps
+        [.scalar ⟨0, layoutPointerBytes layouts⟩, val] locals' = .fault .ub := by
+  constructor
+  · simp only [rawPtrLoadAction, rawPtrArgOfValue?, Nat.beq_refl, hLay, rawPtrTargetAligned?,
+      Nat.ble, rawPtrArgIsNull, Bool.not_false, Bool.and]
+  · simp only [rawPtrStoreAction, rawPtrArgOfValue?, Nat.beq_refl, hLay, rawPtrTargetAligned?,
+      Nat.ble, rawPtrArgIsNull, Bool.not_false, Bool.and]
+
+/-- **Dangling `read_unaligned`.** A non-volatile load of a non-zero-sized inhabited `T` through a
+non-null provenance-less address is `.ub`: the pointer is not dereferenceable for any byte. -/
+theorem rawPtrLoadAction_nonvolatile_addr_ub
+    {borrows : List BorrowEntry} {globals : List CapturedAllocation}
+    {cs : List SavedCallerFrame} {ap : List Nat}
+    {target : ResolvedCallTarget} {decls : List LocalDecl} {layouts : LayoutTable}
+    {argOps : List Operand} {locals' : List LocalSlot} {addr : Nat}
+    {elemTy : Ty} {size align : Nat}
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
+    (hInh : tyIsUninhabited layouts elemTy = false)
+    (hSize : Nat.beq size 0 = false) :
+    rawPtrLoadAction false false borrows globals cs ap target decls layouts argOps
+        [.scalar ⟨addr, layoutPointerBytes layouts⟩] locals' = .fault .ub := by
+  simp only [rawPtrLoadAction, rawPtrArgOfValue?, Nat.beq_refl, hLay, rawPtrTargetAligned?,
+    Nat.ble, rawPtrArgIsNull, Bool.not_false, Bool.and, hInh, hSize]
+  cases Nat.beq addr 0 <;> rfl
+
+/-- **`(dst, src, count)` argument order of the volatile copies.** For a non-empty volatile copy
+whose two pointers are aligned tracked stack pointers, the plan copies from the *second* argument
+(`src`) to the *first* (`dst`): the non-overlapping form, and the overlapping form across two
+different locals, are `copy_nonoverlapping(src, dst, count)` on the source and destination
+operands and values, and the overlapping form within one local copies from `src`'s place to
+`dst`'s. -/
+theorem volatileCopyPlan_stack_dst_src_order {nonOverlapping : Bool}
+    {borrows : List BorrowEntry} {globals : List CapturedAllocation}
+    {cs : List SavedCallerFrame}
+    {target : ResolvedCallTarget} {decls : List LocalDecl} {layouts : LayoutTable}
+    {dstOp srcOp cntOp : Operand} {locals' : List LocalSlot}
+    {dstPtr srcPtr : ProvenancePtr} {dstEntry srcEntry : BorrowEntry} {countSc : ScalarInt}
+    {elemTy : Ty} {size align : Nat}
+    (hCount : countSc.sizeBytes = layoutPointerBytes layouts)
+    (hLay :
+      resolveRawPtrElemLayout target decls layouts [dstOp, srcOp, cntOp] = .ok elemTy size align)
+    (hRange : Nat.ble (signedHalfModulus (layoutPointerBytes layouts)) (Nat.mul countSc.bits size) =
+      false)
+    (hDst : classifyRawPtrTarget borrows globals (.prov dstPtr) = .stack dstPtr dstEntry)
+    (hSrc : classifyRawPtrTarget borrows globals (.prov srcPtr) = .stack srcPtr srcEntry)
+    (hDstAl : rawPtrTargetAligned? cs locals' decls layouts align (.prov dstPtr)
+      (.stack dstPtr dstEntry) = some true)
+    (hSrcAl : rawPtrTargetAligned? cs locals' decls layouts align (.prov srcPtr)
+      (.stack srcPtr srcEntry) = some true)
+    (hNonZero : Nat.beq (Nat.mul countSc.bits size) 0 = false) :
+    volatileCopyPlan nonOverlapping borrows globals cs target decls layouts [dstOp, srcOp, cntOp]
+        [.ptr dstPtr (layoutPointerBytes layouts), .ptr srcPtr (layoutPointerBytes layouts),
+          .scalar countSc] locals' =
+      (match
+        Bool.or nonOverlapping
+          (Bool.not
+            (Bool.and (Nat.beq srcEntry.targetFrameDepth dstEntry.targetFrameDepth)
+              (Nat.beq srcEntry.targetLocal dstEntry.targetLocal)))
+      with
+      | true =>
+        .nonOverlapping srcOp dstOp (.ptr srcPtr (layoutPointerBytes layouts))
+          (.ptr dstPtr (layoutPointerBytes layouts)) countSc.bits
+      | false => .withinLocal srcPtr dstPtr srcEntry dstEntry (Nat.mul countSc.bits size)) := by
+  simp only [volatileCopyPlan, hCount, rawPtrArgOfValue?, Nat.beq_refl, hLay, hRange, hDst, hSrc,
+    hDstAl, hSrcAl, hNonZero]
+  cases Bool.or nonOverlapping
+    (Bool.not
+      (Bool.and (Nat.beq srcEntry.targetFrameDepth dstEntry.targetFrameDepth)
+        (Nat.beq srcEntry.targetLocal dstEntry.targetLocal))) <;> rfl
+
+/-- **Zero-length volatile copy and set.** A volatile copy or set of zero bytes
+(`count * size_of::<T>() = 0`) through aligned pointers copies and writes nothing, whatever the
+pointers point to (including memory outside all Rust allocations); a misaligned destination is
+`.ub` even then. -/
+theorem volatileCopySetPlan_zero_bytes {nonOverlapping : Bool}
+    {borrows : List BorrowEntry} {globals : List CapturedAllocation}
+    {cs : List SavedCallerFrame}
+    {target : ResolvedCallTarget} {decls : List LocalDecl} {layouts : LayoutTable}
+    {argOps : List Operand} {locals' : List LocalSlot}
+    {dstAddr srcAddr : Nat} {countSc : ScalarInt} {valBits : Nat}
+    {elemTy : Ty} {size align : Nat}
+    (hCount : countSc.sizeBytes = layoutPointerBytes layouts)
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
+    (hRange : Nat.ble (signedHalfModulus (layoutPointerBytes layouts)) (Nat.mul countSc.bits size) =
+      false)
+    (hZero : Nat.beq (Nat.mul countSc.bits size) 0 = true)
+    (hVal : Nat.blt valBits 256 = true) :
+    ((rawPtrTargetAligned? cs locals' decls layouts align (.addr dstAddr) .outside = some true →
+      rawPtrTargetAligned? cs locals' decls layouts align (.addr srcAddr) .outside = some true →
+      volatileCopyPlan nonOverlapping borrows globals cs target decls layouts argOps
+        [.scalar ⟨dstAddr, layoutPointerBytes layouts⟩,
+          .scalar ⟨srcAddr, layoutPointerBytes layouts⟩, .scalar countSc] locals' = .noCopy) ∧
+    (rawPtrTargetAligned? cs locals' decls layouts align (.addr dstAddr) .outside = some true →
+      volatileSetPlan borrows globals cs target decls layouts argOps
+        [.scalar ⟨dstAddr, layoutPointerBytes layouts⟩, .scalar ⟨valBits, 1⟩, .scalar countSc]
+        locals' = .noWrite)) ∧
+    (rawPtrTargetAligned? cs locals' decls layouts align (.addr dstAddr) .outside = some false →
+      volatileCopyPlan nonOverlapping borrows globals cs target decls layouts argOps
+        [.scalar ⟨dstAddr, layoutPointerBytes layouts⟩,
+          .scalar ⟨srcAddr, layoutPointerBytes layouts⟩, .scalar countSc] locals' = .fault .ub ∧
+      volatileSetPlan borrows globals cs target decls layouts argOps
+        [.scalar ⟨dstAddr, layoutPointerBytes layouts⟩, .scalar ⟨valBits, 1⟩, .scalar countSc]
+        locals' = .fault .ub) := by
+  refine ⟨⟨fun hDst hSrc => ?_, fun hDst => ?_⟩, fun hDst => ⟨?_, ?_⟩⟩
+  · simp only [volatileCopyPlan, hCount, rawPtrArgOfValue?, Nat.beq_refl, hLay, hRange,
+      classifyRawPtrTarget, hDst, hSrc, hZero]
+  · simp only [volatileSetPlan, hCount, rawPtrArgOfValue?, Nat.beq_refl, hLay, hRange,
+      classifyRawPtrTarget, hDst, hZero, hVal, Bool.and]
+  · simp only [volatileCopyPlan, hCount, rawPtrArgOfValue?, Nat.beq_refl, hLay, hRange,
+      classifyRawPtrTarget, hDst]
+  · simp only [volatileSetPlan, hCount, rawPtrArgOfValue?, Nat.beq_refl, hLay, hRange,
+      classifyRawPtrTarget, hDst, hVal, Bool.and]
+
+/-- The seven volatile memory intrinsic ops (`unaligned_volatile_load`, `unaligned_volatile_store`,
+`volatile_load`, `volatile_store`, `volatile_copy_nonoverlapping_memory`, `volatile_copy_memory`,
+`volatile_set_memory`). -/
+def LIntrinsicOp.isVolatileMem : LIntrinsicOp → Bool
+  | .unalignedVolatileLoad | .unalignedVolatileStore | .volatileLoad | .volatileStore
+  | .volatileCopyNonOverlappingMemory | .volatileCopyMemory | .volatileSetMemory => true
+  | _ => false
+
+/-- **Adapter and `Trusted` dispatch of the volatile memory intrinsics
+(`lowerIntrinsicKind_V2026_06_01_volatileIntrinsics`)**: every row `(defPath, op)` of
+`volatileRustIntrinsicDefPaths_V2026_06_01` lowers to `op`, `Trusted` dispatches `defPath` inline
+as `op` (`trustedSupportsIntrinsicDefPath`), and `op` is a volatile memory op. -/
+theorem lowerIntrinsicKind_V2026_06_01_volatileIntrinsics {defPath : DefPath} {op : LIntrinsicOp}
+    (hMem : (defPath, op) ∈ volatileRustIntrinsicDefPaths_V2026_06_01) :
+    lowerIntrinsicKind_V2026_06_01 defPath = some op ∧
+      trustedSupportsIntrinsicDefPath defPath op ∧ op.isVolatileMem = true := by
+  simp only [volatileRustIntrinsicDefPaths_V2026_06_01, List.mem_cons, List.not_mem_nil, or_false,
+    Prod.mk.injEq] at hMem
+  rcases hMem with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ |
+    ⟨rfl, rfl⟩
+  all_goals exact ⟨by decide, trustedSupportsIntrinsicDefPath_of_check (by decide), rfl⟩
+
+/-- **`Trusted` step of a lowered volatile memory intrinsic call
+(`evalTerminator_call_loweredVolatileIntrinsic_eq`)**: when `lowerIntrinsicKind_V2026_06_01`
+lowers `defPath` to a volatile memory op, `classifyRustIntrinsic?` names the corresponding
+volatile `RustIntrinsicKind`, and a direct, non-diverging, unlinked call to `defPath` evaluates in
+`Trusted.evalTerminator` to exactly `evalVolatileMemIntrinsicCall` on the evaluated arguments. -/
+theorem evalTerminator_call_loweredVolatileIntrinsic_eq {s : MachineState} {cm : CapturedMir}
+    {defPath : DefPath} {typeArgs : List RigidTy} {layoutIdx : LayoutIdx}
+    {args : List Operand} {dest : Place} {targetBb : Nat} {u : UnwindAction} {span : String}
+    {argVals : List Value} {locals' : List LocalSlot} {op : LIntrinsicOp}
+    (hLower : lowerIntrinsicKind_V2026_06_01 defPath = some op)
+    (hVol : op.isVolatileMem = true)
+    (hArgs : evalOperands s.frame.locals args s.memory.borrows s.memory.globals cm.layouts
+        s.memory.callerLocals [] s.memory.callStack = .ok argVals locals')
+    (hNoCallee :
+      lookupCallee s.memory.callees cm.layouts defPath typeArgs s.memory.traitImpls = none) :
+    ∃ kind,
+      classifyRustIntrinsic? defPath = some kind ∧
+      isVolatileMemIntrinsicKind kind = true ∧
+      LIntrinsicOp.ofRustIntrinsicKind? kind = some op ∧
+      evalTerminator s
+          ⟨.call (.constant ⟨⟨.fnDef defPath typeArgs, layoutIdx⟩, .zeroSized⟩) args dest
+            (some targetBb) u, span⟩
+          (some cm) =
+        evalVolatileMemIntrinsicCall kind s
+          { defPath := defPath, typeArgs := typeArgs, isIndirect := false }
+          cm.localDecls cm.layouts args argVals locals' dest targetBb := by
+  have hSup := trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind.mpr hLower
+  cases op with
+  | unalignedVolatileLoad | unalignedVolatileStore | volatileLoad | volatileStore
+  | volatileCopyNonOverlappingMemory | volatileCopyMemory | volatileSetMemory =>
+    obtain ⟨_, hCl⟩ := hSup
+    exact ⟨_, hCl, rfl, rfl,
+      evalTerminator_call_volatileMemIntrinsic_eq hCl rfl hArgs hNoCallee⟩
+  | _ => exact absurd hVol (by decide)
+
+/-- **The lowered evaluator fails closed on the volatile memory intrinsics
+(`evalLoweredIntrinsicCall_volatile_none`)**: `evalLoweredIntrinsicCall` takes no step on a
+volatile memory op, whatever the arguments, destination, and target. The lowered dialect does not
+model raw-pointer memory accesses, so it never claims a step that `Trusted` would have to match:
+the refinement of Section 3b holds for these ops without exempting them from
+`trustedSupportsIntrinsicDefPath`. -/
+theorem evalLoweredIntrinsicCall_volatile_none (env : CfgEnv) (body : LBody) (bb : Nat)
+    (inCleanup : Bool) (args : List Operand) (avs : List Value) (slots2 : List LocalSlotState)
+    (destination : Place) (destTy : Ty) (target : Option Nat) (unwind : UnwindAction)
+    (unwinding : Option Nat) (typeArgs : List RigidTy) {op : LIntrinsicOp}
+    (hVol : op.isVolatileMem = true) :
+    evalLoweredIntrinsicCall env body bb inCleanup args avs slots2 destination destTy target
+      unwind unwinding op typeArgs = none := by
+  cases op with
+  | unalignedVolatileLoad | unalignedVolatileStore | volatileLoad | volatileStore
+  | volatileCopyNonOverlappingMemory | volatileCopyMemory | volatileSetMemory => rfl
+  | _ => exact absurd hVol (by decide)
 
 end Anneal.Mir.AdtAndControl

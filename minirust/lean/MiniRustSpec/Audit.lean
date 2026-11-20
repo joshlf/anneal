@@ -5737,6 +5737,7 @@ open MiniRustSpec.Correspondence in
   evalLIntrinsic_sizeOfVal_alignOfVal_str_minirust_layout
   evalLoweredIntrinsicCall_target_none_minirust_ub
   lintrinsicOp_exhaustive_minirust_classification
+  lintrinsicOp_volatile_lowered_fail_closed
 
 /-! ## Projected `Deinit`, `Rvalue::Discriminant`, and the sub-place audit hook
 

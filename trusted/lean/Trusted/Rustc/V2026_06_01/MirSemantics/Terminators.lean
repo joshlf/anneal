@@ -1184,12 +1184,18 @@ def isDirectExactDivTarget (target : ResolvedCallTarget) : Bool :=
 Enumeration of `CallConv.rustIntrinsic` compiler intrinsics executed inline
 inside `core` (`BRIEF-1.3`).
 
-Every variant except `.constEvalSelect`, `.copyNonOverlapping`, and
-`.writeBytes` is value-returning: its result depends only on the argument
-values and is written to the call destination (`evalNonSelectIntrinsicCall`).
-`.copyNonOverlapping` and `.writeBytes` are the call forms of the memory
-intrinsics, which read and write memory through their pointer arguments and
-return `()` (`evalCopyNonOverlappingCall`, `evalWriteBytesCall`).
+Every variant except `.constEvalSelect` and the memory intrinsics is
+value-returning: its result depends only on the argument values and is written
+to the call destination (`evalNonSelectIntrinsicCall`). `.copyNonOverlapping`
+and `.writeBytes` are the call forms of the memory intrinsics, which read and
+write memory through their pointer arguments and return `()`
+(`evalCopyNonOverlappingCall`, `evalWriteBytesCall`). The seven volatile memory
+intrinsics (`.unalignedVolatileLoad`, `.unalignedVolatileStore`,
+`.volatileLoad`, `.volatileStore`, `.volatileCopyNonOverlappingMemory`,
+`.volatileCopyMemory`, `.volatileSetMemory`; `isVolatileMemIntrinsicKind`) load
+from or store to memory through their pointer arguments
+(`evalVolatileMemIntrinsicCall`: `evalRawPtrLoadCall`, `evalRawPtrStoreCall`,
+`evalVolatileCopyMemoryCall`, `evalVolatileSetMemoryCall`).
 
 Reference (`compiler/rustc_middle/src/ty/intrinsic.rs` and
 `library/core/src/intrinsics/mod.rs` at commit
@@ -1207,6 +1213,35 @@ Reference (`compiler/rustc_middle/src/ty/intrinsic.rs` and
 > "/// This is an accidentally-stable alias to [`ptr::write_bytes`]; use that instead.
 > ...
 > pub const unsafe fn write_bytes<T>(dst: *mut T, val: u8, count: usize);"
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, the volatile intrinsics):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L26-L31>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L956-L1022>
+
+> "//! # Volatiles
+> //!
+> //! The volatile intrinsics provide operations intended to act on I/O
+> //! memory, which are guaranteed to not be reordered by the compiler
+> //! across other volatile intrinsics. See [`read_volatile`][ptr::read_volatile]
+> //! and [`write_volatile`][ptr::write_volatile]."
+
+> "pub unsafe fn volatile_copy_nonoverlapping_memory<T>(dst: *mut T, src: *const T, count: usize);"
+
+> "pub unsafe fn volatile_copy_memory<T>(dst: *mut T, src: *const T, count: usize);"
+
+> "pub unsafe fn volatile_set_memory<T>(dst: *mut T, val: u8, count: usize);"
+
+> "pub unsafe fn volatile_load<T>(src: *const T) -> T;"
+
+> "pub unsafe fn volatile_store<T>(dst: *mut T, val: T);"
+
+> "pub unsafe fn unaligned_volatile_load<T>(src: *const T) -> T;"
+
+> "pub unsafe fn unaligned_volatile_store<T>(dst: *mut T, val: T);"
+
+Modeling choice: the guarantee that volatile operations are not reordered or
+elided concerns compilation; the model executes them as ordinary steps.
 -/
 inductive RustIntrinsicKind : Type where
   /-- `core::intrinsics::ub_checks` runtime UB-check enablement query. -/
@@ -1265,6 +1300,29 @@ inductive RustIntrinsicKind : Type where
   /-- `core::intrinsics::write_bytes` call form: set the bytes of `count`
   elements to a byte value (`evalWriteBytesCall`). -/
   | writeBytes : RustIntrinsicKind
+  /-- `core::intrinsics::unaligned_volatile_load`: volatile load through a
+  pointer that need not be aligned (`evalRawPtrLoadCall`). -/
+  | unalignedVolatileLoad : RustIntrinsicKind
+  /-- `core::intrinsics::unaligned_volatile_store`: volatile store through a
+  pointer that need not be aligned (`evalRawPtrStoreCall`). -/
+  | unalignedVolatileStore : RustIntrinsicKind
+  /-- `core::intrinsics::volatile_load`: volatile load through an aligned
+  pointer (`evalRawPtrLoadCall`). -/
+  | volatileLoad : RustIntrinsicKind
+  /-- `core::intrinsics::volatile_store`: volatile store through an aligned
+  pointer (`evalRawPtrStoreCall`). -/
+  | volatileStore : RustIntrinsicKind
+  /-- `core::intrinsics::volatile_copy_nonoverlapping_memory`: volatile copy of
+  `count` elements between non-overlapping regions, with arguments `(dst, src,
+  count)` (`evalVolatileCopyMemoryCall`). -/
+  | volatileCopyNonOverlappingMemory : RustIntrinsicKind
+  /-- `core::intrinsics::volatile_copy_memory`: volatile copy of `count`
+  elements between possibly overlapping regions, with arguments `(dst, src,
+  count)` (`evalVolatileCopyMemoryCall`). -/
+  | volatileCopyMemory : RustIntrinsicKind
+  /-- `core::intrinsics::volatile_set_memory`: volatile fill of `count`
+  elements with a byte value (`evalVolatileSetMemoryCall`). -/
+  | volatileSetMemory : RustIntrinsicKind
 
 /--
 Classify a canonical `DefPath` into a `RustIntrinsicKind` when it names one of
@@ -1286,6 +1344,31 @@ Reference (`library/core/src/intrinsics/mod.rs` at commit
 > // Note (intentionally not in the doc comment): `ptr::copy_nonoverlapping` adds some extra
 > // debug assertions; if you are writing compiler tests or code inside the standard library
 > // that wants to avoid those debug assertions, directly call this intrinsic instead."
+
+The seven volatile memory intrinsics are recognized at their canonical
+`core::intrinsics::*` paths. Their `core::ptr` counterparts
+(`core::ptr::read_volatile`, `core::ptr::write_volatile`,
+`core::ptr::read_unaligned`, `core::ptr::write_unaligned`) are ordinary
+functions and are not classified here (`evalUnlinkedPtrAccessCall?` models a
+direct call to one of them only when no body is linked).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L956-L1022>
+
+> "pub unsafe fn volatile_copy_nonoverlapping_memory<T>(dst: *mut T, src: *const T, count: usize);"
+
+> "pub unsafe fn volatile_copy_memory<T>(dst: *mut T, src: *const T, count: usize);"
+
+> "pub unsafe fn volatile_set_memory<T>(dst: *mut T, val: u8, count: usize);"
+
+> "pub unsafe fn volatile_load<T>(src: *const T) -> T;"
+
+> "pub unsafe fn volatile_store<T>(dst: *mut T, val: T);"
+
+> "pub unsafe fn unaligned_volatile_load<T>(src: *const T) -> T;"
+
+> "pub unsafe fn unaligned_volatile_store<T>(dst: *mut T, val: T);"
 -/
 @[reducible]
 def classifyRustIntrinsic? (defPath : DefPath) : Option RustIntrinsicKind :=
@@ -1369,7 +1452,28 @@ def classifyRustIntrinsic? (defPath : DefPath) : Option RustIntrinsicKind :=
                                                     | false =>
                                                       match stringEq defPath "core::intrinsics::write_bytes" with
                                                       | true => .some .writeBytes
-                                                      | false => .none
+                                                      | false =>
+                                                        match stringEq defPath "core::intrinsics::unaligned_volatile_load" with
+                                                        | true => .some .unalignedVolatileLoad
+                                                        | false =>
+                                                          match stringEq defPath "core::intrinsics::unaligned_volatile_store" with
+                                                          | true => .some .unalignedVolatileStore
+                                                          | false =>
+                                                            match stringEq defPath "core::intrinsics::volatile_load" with
+                                                            | true => .some .volatileLoad
+                                                            | false =>
+                                                              match stringEq defPath "core::intrinsics::volatile_store" with
+                                                              | true => .some .volatileStore
+                                                              | false =>
+                                                                match stringEq defPath "core::intrinsics::volatile_copy_nonoverlapping_memory" with
+                                                                | true => .some .volatileCopyNonOverlappingMemory
+                                                                | false =>
+                                                                  match stringEq defPath "core::intrinsics::volatile_copy_memory" with
+                                                                  | true => .some .volatileCopyMemory
+                                                                  | false =>
+                                                                    match stringEq defPath "core::intrinsics::volatile_set_memory" with
+                                                                    | true => .some .volatileSetMemory
+                                                                    | false => .none
 
 /--
 Return `.some true` for signed integer `RigidTy.int _`, `.some false` for
@@ -2084,629 +2188,11 @@ def writeIntrinsicScalarResult
   | .none => MirStepNode.fail .ub
 
 /--
-Evaluate a value-returning `RustIntrinsicKind` (all variants except
-`.constEvalSelect`, `.copyNonOverlapping`, and `.writeBytes`) from evaluated
-argument values `argVals`.
-
-`evalDirectRustIntrinsic?` dispatches the call-form memory intrinsics
-`.copyNonOverlapping` and `.writeBytes` to `evalCopyNonOverlappingCall` and
-`evalWriteBytesCall` before reaching this function. They reach it only as the
-runtime function of `core::intrinsics::const_eval_select`, where their
-memory effect is not modeled and the call is `MirStepNode.unsupported`.
-
-Malformed argument lists and values fault with `.ub`. An intrinsic whose result
-depends on the signedness of an integer type parameter steps to
-`MirStepNode.unsupported` when `resolveIntrinsicIsSigned` or
-`resolveIntrinsicShiftSigned` cannot determine it, rather than assuming an
-unsigned type.
-
-Reference (`library/core/src/intrinsics/mod.rs` at commit
-`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1-L80>
-
-> "Compiler intrinsics."
--/
-@[reducible]
-def evalNonSelectIntrinsicCall
-    (kind : RustIntrinsicKind)
-    (s : MachineState)
-    (target : ResolvedCallTarget)
-    (bodyLocalDecls : List LocalDecl)
-    (bodyLayouts : LayoutTable)
-    (argOps : List Operand)
-    (argVals : List Value)
-    (locals' : List LocalSlot)
-    (destination : Place)
-    (targetBb : BasicBlockIdx) :
-    MirStepNode :=
-  match kind with
-  | .ubChecks =>
-    match argVals with
-    | .nil => writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨1, 1⟩)
-    | _ => MirStepNode.fail .ub
-  | .arithOffset =>
-    match argVals with
-    | .ptr ptrVal ptrSz :: .scalar countSc :: .nil =>
-      match Nat.beq ptrSz 8 with
-      | false => MirStepNode.fail .ub
-      | true =>
-        match resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
-        | .some pointeeTy =>
-          match intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts pointeeTy with
-          | .some elemSz =>
-            match evalArithOffset ptrVal ptrSz countSc elemSz with
-            | .some retPtrVal =>
-              writeIntrinsicReturn s locals' destination targetBb (.ptr retPtrVal 8)
-            | .none => MirStepNode.fail .ub
-          | .none => intrinsicUnresolvedLayoutStep pointeeTy
-        | .none => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
-    | _ => MirStepNode.fail .ub
-  | .ctlz =>
-    match argVals with
-    | .scalar sc :: .nil =>
-      writeIntrinsicScalarResult s locals' destination targetBb (evalCtlz sc)
-    | _ => MirStepNode.fail .ub
-  | .ctlzNonzero =>
-    match argVals with
-    | .scalar sc :: .nil =>
-      writeIntrinsicScalarResult s locals' destination targetBb (evalCtlzNonzero sc)
-    | _ => MirStepNode.fail .ub
-  | .cttz =>
-    match argVals with
-    | .scalar sc :: .nil =>
-      writeIntrinsicScalarResult s locals' destination targetBb (evalCttz sc)
-    | _ => MirStepNode.fail .ub
-  | .cttzNonzero =>
-    match argVals with
-    | .scalar sc :: .nil =>
-      writeIntrinsicScalarResult s locals' destination targetBb (evalCttzNonzero sc)
-    | _ => MirStepNode.fail .ub
-  | .ctpop =>
-    match argVals with
-    | .scalar sc :: .nil =>
-      writeIntrinsicScalarResult s locals' destination targetBb (evalCtpop sc)
-    | _ => MirStepNode.fail .ub
-  | .bswap =>
-    match argVals with
-    | .scalar sc :: .nil =>
-      writeIntrinsicScalarResult s locals' destination targetBb (evalBswap sc)
-    | _ => MirStepNode.fail .ub
-  | .bitreverse =>
-    match argVals with
-    | .scalar sc :: .nil =>
-      writeIntrinsicScalarResult s locals' destination targetBb (evalBitreverse sc)
-    | _ => MirStepNode.fail .ub
-  | .wrappingAdd =>
-    match argVals with
-    | .scalar lhs :: .scalar rhs :: .nil =>
-      writeIntrinsicScalarResult s locals' destination targetBb (evalWrappingAdd lhs rhs)
-    | _ => MirStepNode.fail .ub
-  | .wrappingSub =>
-    match argVals with
-    | .scalar lhs :: .scalar rhs :: .nil =>
-      writeIntrinsicScalarResult s locals' destination targetBb (evalWrappingSub lhs rhs)
-    | _ => MirStepNode.fail .ub
-  | .wrappingMul =>
-    match argVals with
-    | .scalar lhs :: .scalar rhs :: .nil =>
-      writeIntrinsicScalarResult s locals' destination targetBb (evalWrappingMul lhs rhs)
-    | _ => MirStepNode.fail .ub
-  | .saturatingAdd =>
-    match argVals with
-    | .scalar lhs :: .scalar rhs :: .nil =>
-      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
-      | .some isSigned =>
-        writeIntrinsicScalarResult s locals' destination targetBb
-          (evalSaturatingAdd lhs rhs isSigned)
-      | .none => MirStepNode.unsupported
-    | _ => MirStepNode.fail .ub
-  | .saturatingSub =>
-    match argVals with
-    | .scalar lhs :: .scalar rhs :: .nil =>
-      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
-      | .some isSigned =>
-        writeIntrinsicScalarResult s locals' destination targetBb
-          (evalSaturatingSub lhs rhs isSigned)
-      | .none => MirStepNode.unsupported
-    | _ => MirStepNode.fail .ub
-  | .uncheckedShl =>
-    match argVals with
-    | .scalar lhs :: .scalar rhs :: .nil =>
-      match resolveIntrinsicShiftSigned target bodyLocalDecls bodyLayouts argOps with
-      | .some rhsSigned =>
-        writeIntrinsicScalarResult s locals' destination targetBb
-          (evalUncheckedShl lhs rhs rhsSigned)
-      | .none => MirStepNode.unsupported
-    | _ => MirStepNode.fail .ub
-  | .uncheckedShr =>
-    match argVals with
-    | .scalar lhs :: .scalar rhs :: .nil =>
-      match
-        resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps (sameRhsTy := false),
-        resolveIntrinsicShiftSigned target bodyLocalDecls bodyLayouts argOps
-      with
-      | .some lhsSigned, .some rhsSigned =>
-        writeIntrinsicScalarResult s locals' destination targetBb
-          (evalUncheckedShr lhs rhs lhsSigned rhsSigned)
-      | _, _ => MirStepNode.unsupported
-    | _ => MirStepNode.fail .ub
-  | .uncheckedAdd =>
-    match argVals with
-    | .scalar lhs :: .scalar rhs :: .nil =>
-      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
-      | .some isSigned =>
-        writeIntrinsicScalarResult s locals' destination targetBb
-          (evalUncheckedAdd lhs rhs isSigned)
-      | .none => MirStepNode.unsupported
-    | _ => MirStepNode.fail .ub
-  | .uncheckedSub =>
-    match argVals with
-    | .scalar lhs :: .scalar rhs :: .nil =>
-      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
-      | .some isSigned =>
-        writeIntrinsicScalarResult s locals' destination targetBb
-          (evalUncheckedSub lhs rhs isSigned)
-      | .none => MirStepNode.unsupported
-    | _ => MirStepNode.fail .ub
-  | .uncheckedMul =>
-    match argVals with
-    | .scalar lhs :: .scalar rhs :: .nil =>
-      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
-      | .some isSigned =>
-        writeIntrinsicScalarResult s locals' destination targetBb
-          (evalUncheckedMul lhs rhs isSigned)
-      | .none => MirStepNode.unsupported
-    | _ => MirStepNode.fail .ub
-  | .uncheckedDiv =>
-    match argVals with
-    | .scalar lhs :: .scalar rhs :: .nil =>
-      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
-      | .some isSigned =>
-        writeIntrinsicScalarResult s locals' destination targetBb
-          (evalUncheckedDiv lhs rhs isSigned)
-      | .none => MirStepNode.unsupported
-    | _ => MirStepNode.fail .ub
-  | .uncheckedRem =>
-    match argVals with
-    | .scalar lhs :: .scalar rhs :: .nil =>
-      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
-      | .some isSigned =>
-        writeIntrinsicScalarResult s locals' destination targetBb
-          (evalUncheckedRem lhs rhs isSigned)
-      | .none => MirStepNode.unsupported
-    | _ => MirStepNode.fail .ub
-  | .threeWayCompare =>
-    match argVals with
-    | .scalar lhs :: .scalar rhs :: .nil =>
-      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps (allowChar := true) with
-      | .some isSigned =>
-        writeIntrinsicScalarResult s locals' destination targetBb
-          (evalThreeWayCompare lhs rhs isSigned)
-      | .none => MirStepNode.unsupported
-    | _ => MirStepNode.fail .ub
-  | .sizeOfVal =>
-    match argVals with
-    | ptrArgVal :: .nil =>
-      match resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
-      | .some (.slice elemTy) =>
-        match ptrArgVal with
-        | .aggregate 0 (.ptr _ ptrSz :: .scalar lenSc :: .nil) =>
-          match Nat.beq ptrSz 8 with
-          | false => MirStepNode.fail .ub
-          | true =>
-            match intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts elemTy with
-            | .some elemSz =>
-              writeIntrinsicScalarResult s locals' destination targetBb
-                (evalSliceSizeOfVal elemSz lenSc)
-            | .none => intrinsicUnresolvedLayoutStep elemTy
-        | _ => MirStepNode.fail .ub
-      | .some .str =>
-        match ptrArgVal with
-        | .aggregate 0 (.ptr _ ptrSz :: .scalar lenSc :: .nil) =>
-          match Nat.beq ptrSz 8 with
-          | false => MirStepNode.fail .ub
-          | true =>
-            writeIntrinsicScalarResult s locals' destination targetBb
-              (evalSliceSizeOfVal 1 lenSc)
-        | _ => MirStepNode.fail .ub
-      -- The size of a `dyn Trait` value is read from its vtable, which the
-      -- model does not track; malformed non-wide pointers still fault with `.ub`.
-      | .some (.dynamic _) =>
-        match ptrArgVal with
-        | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
-          match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
-          | false => MirStepNode.fail .ub
-          | true => MirStepNode.unsupported
-        | _ => MirStepNode.fail .ub
-      | .some pointeeTy =>
-        match ptrArgVal with
-        | .ptr _ ptrSz =>
-          match Nat.beq ptrSz 8 with
-          | false => MirStepNode.fail .ub
-          | true =>
-            match intrinsicTailIsExtern 8 pointeeTy with
-            | true => MirStepNode.unsupported
-            | false =>
-              match intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts pointeeTy with
-              | .some sz =>
-                match Nat.ble (signedHalfModulus 8) sz with
-                | true => MirStepNode.fail .ub
-                | false =>
-                  writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨sz, 8⟩)
-              | .none => intrinsicUnresolvedLayoutStep pointeeTy
-        | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
-          match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
-          | false => MirStepNode.fail .ub
-          | true => intrinsicWidePointeeStep pointeeTy
-        | _ => MirStepNode.fail .ub
-      | .none =>
-        match isValidIntrinsicPtrArgVal ptrArgVal with
-        | false => MirStepNode.fail .ub
-        | true => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
-    | _ => MirStepNode.fail .ub
-  | .alignOfVal =>
-    match argVals with
-    | ptrArgVal :: .nil =>
-      match resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
-      -- `align_of_val` has the same safety conditions as `size_of_val`: the
-      -- slice's total size must fit in `isize` even though only the element
-      -- alignment is returned.
-      | .some (.slice elemTy) =>
-        match ptrArgVal with
-        | .aggregate 0 (.ptr _ ptrSz :: .scalar lenSc :: .nil) =>
-          match Nat.beq ptrSz 8 with
-          | false => MirStepNode.fail .ub
-          | true =>
-            match
-              intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts elemTy,
-              intrinsicRigidTyAlign bodyLocalDecls bodyLayouts elemTy
-            with
-            | .some elemSz, .some alignBytes =>
-              match evalSliceSizeOfVal elemSz lenSc with
-              | .some _ =>
-                writeIntrinsicReturn s locals' destination targetBb
-                  (.scalar ⟨alignBytes, 8⟩)
-              | .none => MirStepNode.fail .ub
-            | _, _ => intrinsicUnresolvedLayoutStep elemTy
-        | _ => MirStepNode.fail .ub
-      | .some .str =>
-        match ptrArgVal with
-        | .aggregate 0 (.ptr _ ptrSz :: .scalar lenSc :: .nil) =>
-          match Nat.beq ptrSz 8 with
-          | false => MirStepNode.fail .ub
-          | true =>
-            match evalSliceSizeOfVal 1 lenSc with
-            | .some _ =>
-              writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨1, 8⟩)
-            | .none => MirStepNode.fail .ub
-        | _ => MirStepNode.fail .ub
-      -- The alignment of a `dyn Trait` value is read from its vtable, which the
-      -- model does not track; malformed non-wide pointers still fault with `.ub`.
-      | .some (.dynamic _) =>
-        match ptrArgVal with
-        | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
-          match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
-          | false => MirStepNode.fail .ub
-          | true => MirStepNode.unsupported
-        | _ => MirStepNode.fail .ub
-      | .some pointeeTy =>
-        match ptrArgVal with
-        | .ptr _ ptrSz =>
-          match Nat.beq ptrSz 8 with
-          | false => MirStepNode.fail .ub
-          | true =>
-            match intrinsicTailIsExtern 8 pointeeTy with
-            | true => MirStepNode.unsupported
-            | false =>
-              match intrinsicRigidTyAlign bodyLocalDecls bodyLayouts pointeeTy with
-              | .some alignBytes =>
-                writeIntrinsicReturn s locals' destination targetBb
-                  (.scalar ⟨alignBytes, 8⟩)
-              | .none => intrinsicUnresolvedLayoutStep pointeeTy
-        | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
-          match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
-          | false => MirStepNode.fail .ub
-          | true => intrinsicWidePointeeStep pointeeTy
-        | _ => MirStepNode.fail .ub
-      | .none =>
-        match isValidIntrinsicPtrArgVal ptrArgVal with
-        | false => MirStepNode.fail .ub
-        | true => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
-    | _ => MirStepNode.fail .ub
-  | .copyNonOverlapping => MirStepNode.unsupported
-  | .writeBytes => MirStepNode.unsupported
-  | .constEvalSelect => MirStepNode.fail .ub
-
-/--
-Test whether `kind` is parameterized by the pointee type `T` of its first
-pointer argument (`arith_offset<T>`, `size_of_val<T>`, `align_of_val<T>`)
-rather than by the value type of its first argument.
-
-Reference (`library/core/src/intrinsics/mod.rs` at commit
-`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L899-L916>
-
-> "pub const unsafe fn arith_offset<T>(dst: *const T, offset: isize) -> *const T;"
--/
-@[reducible]
-def isPtrPointeeIntrinsicKind : RustIntrinsicKind → Bool
-  | .arithOffset => true
-  | .sizeOfVal => true
-  | .alignOfVal => true
-  | _ => false
-
-/--
-Supply type arguments for a runtime intrinsic target `rtTarget` of
-`const_eval_select` whose callee constant carries none (`rtTarget.typeArgs =
-[]`), using the element types `elemTys` of `const_eval_select`'s first type
-argument `ARG = .tuple elemTys`:
-- for `arith_offset`, `size_of_val`, and `align_of_val` (`isPtrPointee = true`),
-  the pointee `T` of the first element `*const T`, `*mut T`, or `&T`;
-- for the value intrinsics (`isPtrPointee = false`), `elemTys` itself.
-
-The bound `G: FnOnce<ARG, Output = RET>` makes `ARG` the tuple of the parameter
-types of `called_at_rt`. Each value intrinsic modeled here is generic exactly
-over the types of its leading parameters, in order (`T` of `exact_div(x: T, y:
-T)`, `T` and `U` of `unchecked_shl(x: T, y: U)`), and each pointer intrinsic is
-generic only over the pointee of its first parameter (`T` of
-`arith_offset(dst: *const T, offset: isize)`). These element types are
-therefore the instantiation that `rtTarget` omits; trailing extras, such as the
-second `T` of `exact_div`, are ignored by `resolveIntrinsicIsSigned`. Captured
-MIR always carries a callee's generic arguments, and `rustc` replaces every
-`const_eval_select` call with a direct call to `called_at_rt` before
-`optimized_mir` (`remap_mir_for_const_eval_select` in `inner_optimized_mir`), so
-this fallback only affects hand-built MIR.
-
-Reference (`library/core/src/intrinsics/mod.rs` at commit
-`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2400-L2408>
-
-> "#[rustc_intrinsic]
-> pub const fn const_eval_select<ARG: Tuple, F, G, RET>(
->     _arg: ARG,
->     _called_in_const: F,
->     _called_at_rt: G,
-> ) -> RET
-> where
->     G: FnOnce<ARG, Output = RET>,
->     F: const FnOnce<ARG, Output = RET>;"
-
-Reference (`library/core/src/intrinsics/mod.rs` at commit
-`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1962-L1971>
-
-> "pub const unsafe fn unchecked_shl<T: Copy, U: Copy>(x: T, y: U) -> T;"
-
-Reference (`compiler/rustc_mir_transform/src/lib.rs` at commit
-`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_mir_transform/src/lib.rs#L798-L799>
-
-> "    let body = tcx.mir_drops_elaborated_and_const_checked(did).steal();
->     let mut body = remap_mir_for_const_eval_select(tcx, body, hir::Constness::NotConst);"
--/
-@[reducible]
-def withConstEvalSelectIntrinsicTypeArgs
-    (rtTarget : ResolvedCallTarget)
-    (tupleTyOpt : Option RigidTy)
-    (isPtrPointee : Bool) :
-    ResolvedCallTarget :=
-  match rtTarget.typeArgs with
-  | _ :: _ => rtTarget
-  | .nil =>
-    match tupleTyOpt with
-    | .some (.tuple elemTys) =>
-      match isPtrPointee with
-      | false => { rtTarget with typeArgs := elemTys }
-      | true =>
-        match elemTys with
-        | .rawPtr _ pointeeTy :: _ => { rtTarget with typeArgs := pointeeTy :: .nil }
-        | .ref _ pointeeTy :: _ => { rtTarget with typeArgs := pointeeTy :: .nil }
-        | _ => rtTarget
-    | _ => rtTarget
-
-/--
-Construct synthetic zero-sized constant `Operand`s carrying the element types
-`elemTys` of a `const_eval_select` argument tuple `ARG = .tuple elemTys`.
-
-These operands exist only so that `operandTy` can type the runtime target's
-arguments during signedness and pointee resolution in
-`evalNonSelectIntrinsicCall`. They are never evaluated, and their `.zeroSized`
-values and `layoutIdx := 0` do not describe the runtime arguments, which come
-from the unpacked tuple value.
-
-Reference (`library/core/src/intrinsics/mod.rs` at commit
-`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2400-L2408>
-
-> "#[rustc_intrinsic]
-> pub const fn const_eval_select<ARG: Tuple, F, G, RET>(
->     _arg: ARG,
->     _called_in_const: F,
->     _called_at_rt: G,
-> ) -> RET"
--/
-@[reducible]
-def rigidTysToZeroSizedOps : List RigidTy → List Operand
-  | .nil => .nil
-  | ty :: rest =>
-    .constant { ty := { kind := ty, layoutIdx := 0 }, val := .zeroSized } ::
-      rigidTysToZeroSizedOps rest
-
-/--
-Extract synthetic argument `Operand`s from `const_eval_select`'s first type
-argument `tupleTyOpt` (`ARG = .tuple elemTys`), or `.nil` when `tupleTyOpt` is
-absent. Passing these operands to `evalNonSelectIntrinsicCall` ensures that
-`intrinsicMissingPointeeStep` observes the known first-argument type from `ARG`
-(and faults with `MirStepNode.fail .ub` when `ARG` passes a non-pointer type to
-`arith_offset`, `size_of_val`, or `align_of_val`).
-
-Reference (`library/core/src/intrinsics/mod.rs` at commit
-`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2400-L2408>
-
-> "#[rustc_intrinsic]
-> pub const fn const_eval_select<ARG: Tuple, F, G, RET>(
->     _arg: ARG,
->     _called_in_const: F,
->     _called_at_rt: G,
-> ) -> RET"
--/
-@[reducible]
-def constEvalSelectTupleArgOps : Option RigidTy → List Operand
-  | .some (.tuple elemTys) => rigidTysToZeroSizedOps elemTys
-  | _ => .nil
-
-/--
-Test whether `defPath` is an unreachable hint or intrinsic
-(`"core::hint::unreachable_unchecked"`, `"std::hint::unreachable_unchecked"`, or
-`"core::intrinsics::unreachable"`), reaching which is immediate undefined
-behavior (`MirStepNode.fail .ub`).
-
-Reference (`library/core/src/hint.rs` and `library/core/src/intrinsics/mod.rs`
-at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L373-L384>
-
-> "/// Informs the optimizer that this point in the code is not reachable,
-> /// enabling further optimizations.
-> ...
-> #[rustc_intrinsic]
-> pub const unsafe fn unreachable() -> !;"
--/
-@[simp]
-def isUnreachableCallTarget (defPath : DefPath) : Bool :=
-  Bool.or
-    (stringEq defPath "core::hint::unreachable_unchecked")
-    (Bool.or
-      (stringEq defPath "std::hint::unreachable_unchecked")
-      (stringEq defPath "core::intrinsics::unreachable"))
-
-/--
-Test whether `defPath` is a non-unwinding (aborting) panic or abort entrypoint
-in `core` (`"core::panicking::panic_nounwind"`,
-`"core::panicking::panic_nounwind_fmt"`,
-`"core::panicking::panic_nounwind_fmt::panic_impl"`,
-`"core::panicking::panic_nounwind_nobacktrace"`,
-`"core::panicking::panic_in_cleanup"`,
-`"core::panicking::panic_cannot_unwind"`,
-`"core::panicking::panic_misaligned_pointer_dereference"`,
-`"core::panicking::panic_null_pointer_dereference"`,
-`"core::panicking::panic_invalid_enum_construction"`, or
-`"core::intrinsics::abort"`).
-
-Reference (`library/core/src/panicking.rs` at commit
-`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/panicking.rs#L217-L226>
-
-> "/// Like `panic`, but without unwinding and track_caller to reduce the impact
-> /// on codesize on the caller.
-> ...
-> #[rustc_nounwind]
-> pub const fn panic_nounwind(expr: &'static str) -> !"
--/
-@[simp]
-def isAbortingPanicDefPath (defPath : DefPath) : Bool :=
-  Bool.or
-    (stringEq defPath "core::panicking::panic_nounwind")
-    (Bool.or
-      (stringEq defPath "core::panicking::panic_nounwind_fmt")
-      (Bool.or
-        (stringEq defPath "core::panicking::panic_nounwind_fmt::panic_impl")
-        (Bool.or
-          (stringEq defPath "core::panicking::panic_nounwind_nobacktrace")
-          (Bool.or
-            (stringEq defPath "core::panicking::panic_in_cleanup")
-            (Bool.or
-              (stringEq defPath "core::panicking::panic_cannot_unwind")
-              (Bool.or
-                (stringEq defPath "core::panicking::panic_misaligned_pointer_dereference")
-                (Bool.or
-                  (stringEq defPath "core::panicking::panic_null_pointer_dereference")
-                  (Bool.or
-                    (stringEq defPath "core::panicking::panic_invalid_enum_construction")
-                    (stringEq defPath "core::intrinsics::abort")))))))))
-
-/--
-Test whether `defPath` is a standard unwinding panic entrypoint in `core`
-(`"core::panicking::panic"`, `"core::panicking::panic_fmt"`,
-`"core::panicking::panic_fmt::panic_impl"`,
-`"core::panicking::const_panic_fmt"`,
-`"core::panicking::assert_failed"`, `"core::panicking::assert_failed_inner"`,
-`"core::panicking::assert_matches_failed"`,
-`"core::slice::index::slice_index_fail"`,
-`"core::panicking::panic_bounds_check"`, `"core::panicking::panic_explicit"`,
-`"core::panicking::panic_display"`, `"core::panicking::panic_str_2015"`,
-`"core::panicking::unreachable_display"`, `"core::option::unwrap_failed"`,
-`"core::option::expect_failed"`, `"core::result::unwrap_failed"`, or
-`"core::panicking::panic_const::*"`).
-
-Reference (`library/core/src/panicking.rs` and `library/core/src/slice/index.rs`
-at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/panicking.rs#L130-L138>
-
-> "/// The underlying implementation of core's `panic!` macro when no formatting
-> /// is used.
-> ...
-> #[track_caller]
-> pub const fn panic(expr: &'static str) -> !"
--/
-@[simp]
-def isUnwindingPanicDefPath (defPath : DefPath) : Bool :=
-  Bool.or
-    (stringEq defPath "core::panicking::panic")
-    (Bool.or
-      (stringEq defPath "core::panicking::panic_fmt")
-      (Bool.or
-        (stringEq defPath "core::panicking::panic_fmt::panic_impl")
-        (Bool.or
-          (stringEq defPath "core::panicking::const_panic_fmt")
-          (Bool.or
-            (stringEq defPath "core::panicking::assert_failed")
-            (Bool.or
-              (stringEq defPath "core::panicking::assert_failed_inner")
-              (Bool.or
-                (stringEq defPath "core::panicking::assert_matches_failed")
-                (Bool.or
-                  (stringEq defPath "core::slice::index::slice_index_fail")
-                  (Bool.or
-                    (stringEq defPath "core::panicking::panic_bounds_check")
-                    (Bool.or
-                      (stringEq defPath "core::panicking::panic_explicit")
-                      (Bool.or
-                        (stringEq defPath "core::panicking::panic_display")
-                        (Bool.or
-                          (stringEq defPath "core::panicking::panic_str_2015")
-                          (Bool.or
-                            (stringEq defPath "core::panicking::unreachable_display")
-                            (Bool.or
-                              (stringEq defPath "core::option::unwrap_failed")
-                              (Bool.or
-                                (stringEq defPath "core::option::expect_failed")
-                                (Bool.or
-                                  (stringEq defPath "core::result::unwrap_failed")
-                                  (Bool.or
-                                    (stringEq defPath "core::panicking::panic_const::panic_const_add_overflow")
-                                    (Bool.or
-                                      (stringEq defPath "core::panicking::panic_const::panic_const_sub_overflow")
-                                      (Bool.or
-                                        (stringEq defPath "core::panicking::panic_const::panic_const_mul_overflow")
-                                        (Bool.or
-                                          (stringEq defPath "core::panicking::panic_const::panic_const_div_overflow")
-                                          (Bool.or
-                                            (stringEq defPath "core::panicking::panic_const::panic_const_rem_overflow")
-                                            (Bool.or
-                                              (stringEq defPath "core::panicking::panic_const::panic_const_neg_overflow")
-                                              (Bool.or
-                                                (stringEq defPath "core::panicking::panic_const::panic_const_shr_overflow")
-                                                (Bool.or
-                                                  (stringEq defPath "core::panicking::panic_const::panic_const_shl_overflow")
-                                                  (Bool.or
-                                                    (stringEq defPath "core::panicking::panic_const::panic_const_div_by_zero")
-                                                    (stringEq defPath "core::panicking::panic_const::panic_const_rem_by_zero")))))))))))))))))))))))))
-
-/--
 Complete a call-form memory intrinsic (`RustIntrinsicKind.copyNonOverlapping`,
-`RustIntrinsicKind.writeBytes`) whose memory effect `node` was computed by the
-statement-level semantics: on `MirStepNode.step s'`, keep the frame
+`RustIntrinsicKind.writeBytes`, and the tracked stack case of
+`RustIntrinsicKind.volatileCopyNonOverlappingMemory` /
+`RustIntrinsicKind.volatileCopyMemory`) whose memory effect `node` was computed
+by the statement-level semantics: on `MirStepNode.step s'`, keep the frame
 locals and memory of `s'` and write the intrinsic's `()` return value
 (`Value.unit`) to `destination`, continuing at `targetBb`
 (`writeIntrinsicReturn`); faults and unsupported nodes propagate unchanged.
@@ -3364,21 +2850,3295 @@ def evalWriteBytesCall
       targetBb
 
 /--
-Dispatch a direct (`target.isIndirect = false`) call to a
-`CallConv.rustIntrinsic` compiler intrinsic in `evalTerminator` when
-`classifyRustIntrinsic? target.defPath` returns `.some kind`: the runtime
-dispatch of `const_eval_select`, the call-form memory intrinsics
-(`evalCopyNonOverlappingCall`, `evalWriteBytesCall`), or a value-returning
-intrinsic (`evalNonSelectIntrinsicCall`).
+Runtime shape of a thin raw-pointer argument (`*const T` / `*mut T` with
+`T: Sized`) of the raw-pointer memory accesses modeled inline
+(`evalRawPtrLoadCall`, `evalRawPtrStoreCall`, `evalVolatileCopyMemoryCall`,
+`evalVolatileSetMemoryCall`): a pointer value carrying a provenance slot
+(`Value.ptr ptr ptrBytes`), or a provenance-less address
+(`Value.scalar ⟨addr, ptrBytes⟩`, as produced by `ptr::null`,
+`ptr::without_provenance`, and unexposed integer-to-pointer casts).
 
-Returns `.none` when `target.defPath` is not an inline-modeled intrinsic so
-`evalTerminator` falls through to `MirStepNode.extCall`.
+Reference (`core::ptr::read_volatile` documentation,
+`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L2040-L2050>
+
+> "/// - Volatile operations, however, may also be used to access memory that is _outside_ of any Rust
+> ///   allocation. In this use-case, the pointer does *not* have to be [valid] for reads. This is
+> ///   typically used for CPU and peripheral registers that must be accessed via an I/O memory
+> ///   mapping, most commonly at fixed addresses reserved by the hardware. These often have special
+> ///   semantics associated to their manipulation, and cannot be used as general purpose memory.
+> ///   Here, any address value is possible, including 0 and [`usize::MAX`], so long as the semantics
+> ///   of such a read are well-defined by the target hardware. The provenance of the pointer is
+> ///   irrelevant, and it can be created with [`without_provenance`]. The access must not trap. It
+> ///   can cause side-effects, but those must not affect Rust-allocated memory in any way. This
+> ///   access is still not considered [atomic], and as such it cannot be used for inter-thread
+> ///   synchronization."
+
+Modeling choice: the two constructors are Anneal's two runtime representations
+of a thin pointer; the quoted passage only establishes that a pointer without
+provenance is a meaningful argument of a volatile access.
+-/
+inductive RawPtrArg : Type where
+  /-- A pointer value with provenance slot `ptr` (`Value.ptr ptr ptrBytes`). -/
+  | prov (ptr : ProvenancePtr) : RawPtrArg
+  /-- A provenance-less address `addr` (`Value.scalar ⟨addr, ptrBytes⟩`). -/
+  | addr (addr : Nat) : RawPtrArg
+
+/--
+Classify the evaluated value of a thin raw-pointer argument on a target whose
+pointers are `ptrBytes` wide: `Value.ptr ptr ptrBytes` is `.prov ptr`, and a
+`ptrBytes`-wide scalar is the provenance-less address `.addr bits`. Every other
+value (`.unit`, a wide-pointer aggregate, `.uninit`, or a pointer or scalar of
+another width) is not a thin pointer and yields `.none`, which callers turn
+into `MirStepNode.fail .ub`: the intrinsics modeled here take `*const T` /
+`*mut T` with `T: Sized`, so any other argument value is a call with an
+ABI-incompatible argument.
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html#r-dynamic-sized.pointer-types>
+
+> "Pointer types to DSTs are sized but have twice the size of pointers to sized
+> types
+>
+> * Pointers to slices and `str` also store the number of elements.
+> * Pointers to trait objects also store a pointer to a vtable."
+-/
+@[reducible]
+def rawPtrArgOfValue? (ptrBytes : Nat) : Value → Option RawPtrArg
+  | .ptr ptr sz =>
+    match Nat.beq sz ptrBytes with
+    | true => .some (.prov ptr)
+    | false => .none
+  | .scalar sc =>
+    match Nat.beq sc.sizeBytes ptrBytes with
+    | true => .some (.addr sc.bits)
+    | false => .none
+  | _ => .none
+
+/--
+Test whether a thin raw-pointer argument is the null pointer: the
+provenance-less address `0`, or a pointer value with `allocId = 0` (no
+provenance) at offset `0`.
+
+Reference (`core::ptr` module documentation, `library/core/src/ptr/mod.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L18-L20>
+
+> "//! * A [null] pointer is *never* valid for reads/writes.
+> //! * For memory accesses of [size zero][zst], *every* non-null pointer is valid for reads/writes.
+> //!   The following points are only concerned with non-zero-sized accesses."
+
+Modeling choice: `allocId = 0` is Anneal's encoding of a `Value.ptr` without
+provenance, whose `offsetBytes` is then its address.
+-/
+@[reducible]
+def rawPtrArgIsNull : RawPtrArg → Bool
+  | .prov ptr => Bool.and (Nat.beq ptr.allocId 0) (Nat.beq ptr.offsetBytes 0)
+  | .addr addr => Nat.beq addr 0
+
+/--
+What a thin raw-pointer argument points to, for a non-zero-sized access:
+- `.stack ptr entry`: a stack local tracked by the Tree Borrows entry `entry` of
+  the pointer's tag (memory inside a Rust allocation);
+- `.global ptr alloc`: the captured global allocation `alloc` (memory inside a
+  Rust allocation);
+- `.outside`: a pointer without provenance (a provenance-less address, or a
+  pointer value with `allocId = 0`), which is derived from no Rust allocation;
+- `.untracked`: a pointer whose provenance names an allocation the model does
+  not track (neither a borrow entry nor a captured global).
+
+Reference (`core::ptr` module documentation, `library/core/src/ptr/mod.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L21-L25>
+
+> "//! * For a pointer to be valid for reads/writes, it is necessary, but not always sufficient, that
+> //!   the pointer be *dereferenceable*. The [provenance] of the pointer is used to determine which
+> //!   [allocation] it is derived from; a pointer is dereferenceable if the memory range of the given
+> //!   size starting at the pointer is entirely contained within the bounds of that allocation. Note
+> //!   that in Rust, every (stack-allocated) variable is considered a separate allocation."
+
+Modeling choice: the split into tracked and untracked allocations is Anneal's.
+An `.untracked` pointer may be valid (for example heap memory returned by an
+external call), so accesses through it are unsupported rather than undefined
+behavior.
+-/
+inductive RawPtrTarget : Type where
+  /-- A stack local tracked by the borrow entry `entry` of `ptr`'s tag. -/
+  | stack (ptr : ProvenancePtr) (entry : BorrowEntry) : RawPtrTarget
+  /-- The captured global allocation `alloc`. -/
+  | global (ptr : ProvenancePtr) (alloc : CapturedAllocation) : RawPtrTarget
+  /-- A pointer without provenance: it is derived from no Rust allocation. -/
+  | outside : RawPtrTarget
+  /-- A pointer into an allocation the model does not track. -/
+  | untracked : RawPtrTarget
+
+/--
+Resolve what the thin raw-pointer argument `arg` points to (`RawPtrTarget`): a
+Tree Borrows entry for its tag in `borrows` (`lookupBorrow`) takes precedence
+over a captured global allocation in `globals` (`lookupGlobalAlloc`), as in
+`evalPlaceRead`; a pointer with neither is `.outside` when it has no provenance
+(`.addr _`, or `allocId = 0`) and `.untracked` otherwise.
+
+Reference (`core::ptr` module documentation, `library/core/src/ptr/mod.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L21-L25>
+
+> "//! * For a pointer to be valid for reads/writes, it is necessary, but not always sufficient, that
+> //!   the pointer be *dereferenceable*. The [provenance] of the pointer is used to determine which
+> //!   [allocation] it is derived from; a pointer is dereferenceable if the memory range of the given
+> //!   size starting at the pointer is entirely contained within the bounds of that allocation. Note
+> //!   that in Rust, every (stack-allocated) variable is considered a separate allocation."
+-/
+@[reducible]
+def classifyRawPtrTarget
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation) :
+    RawPtrArg → RawPtrTarget
+  | .addr _ => .outside
+  | .prov ptr =>
+    match lookupBorrow borrows ptr.tag with
+    | .some entry => .stack ptr entry
+    | .none =>
+      match lookupGlobalAlloc globals ptr.allocId with
+      | .some alloc => .global ptr alloc
+      | .none =>
+        match Nat.beq ptr.allocId 0 with
+        | true => .outside
+        | false => .untracked
+
+/--
+Element type `T`, `size_of::<T>()`, and `align_of::<T>()` of a raw-pointer
+memory access (`.ok`), or the fault with which the call steps when they cannot
+be determined (`.fault`).
+
+Reference (The Rust Reference, "Size and Alignment"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "A value of alignment n must only be stored at an address that is a multiple
+> of n."
+-/
+inductive RawPtrElemLayout : Type where
+  /-- The element type `elemTy` with its byte `size` and alignment `align`. -/
+  | ok (elemTy : Ty) (size align : Nat) : RawPtrElemLayout
+  /-- The call faults with `kind` (`.unsupported` when `T` is not resolved). -/
+  | fault (kind : FailureKind) : RawPtrElemLayout
+
+/--
+Resolve the element type `T` of a raw-pointer memory access `f::<T>(ptr, ..)`
+whose first parameter is `*const T` or `*mut T`, with its size and alignment
+(`intrinsicRigidTyByteSize`, `intrinsicRigidTyAlign`).
+
+`T` is the single type argument in `target.typeArgs`, or else the pointee type
+of the first argument operand (`operandPointeeTy`); with neither (or with more
+than one type argument, which none of these functions has) the call is
+unsupported. Every function dispatched here declares `T` without `?Sized`, so
+an unsized `T` (`isUnsizedRigidTy`) is an ill-typed call and faults with `.ub`;
+a sized `T` whose size or alignment the model cannot resolve (a generic or
+opaque type, or an ADT without a `LayoutTable` entry) is unsupported, as in
+`intrinsicUnresolvedLayoutStep`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L994-L1005>
+
+> "/// Performs a volatile load from the `src` pointer.
+> ///
+> /// The stabilized version of this intrinsic is [`core::ptr::read_volatile`].
+> #[rustc_intrinsic]
+> #[rustc_nounwind]
+> pub unsafe fn volatile_load<T>(src: *const T) -> T;
+> /// Performs a volatile store to the `dst` pointer.
+> ///
+> /// The stabilized version of this intrinsic is [`core::ptr::write_volatile`].
+> #[rustc_intrinsic]
+> #[rustc_nounwind]
+> pub unsafe fn volatile_store<T>(dst: *mut T, val: T);"
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+
+> "Most types have a fixed size that is known at compile time and implement the
+> trait `Sized`. A type with a size that is known only at run-time is called a
+> dynamically sized type (DST) or, informally, an unsized type."
+-/
+def resolveRawPtrElemLayout
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand) :
+    RawPtrElemLayout :=
+  let elemTyOpt : Option Ty :=
+    match target.typeArgs with
+    | elemKind :: .nil =>
+      .some { kind := elemKind, layoutIdx := synthKindLayoutIdx bodyLayouts elemKind }
+    | .nil =>
+      match argOps with
+      | ptrOp :: _ => operandPointeeTy bodyLocalDecls bodyLayouts ptrOp
+      | .nil => .none
+    | _ :: _ :: _ => .none
+  match elemTyOpt with
+  | .none => .fault .unsupported
+  | .some rawElemTy =>
+    let elemTy := resolveTyWithLocalDecls bodyLocalDecls bodyLayouts rawElemTy
+    match isUnsizedRigidTy 8 elemTy.kind with
+    | true => .fault .ub
+    | false =>
+      match
+        intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts elemTy.kind,
+        intrinsicRigidTyAlign bodyLocalDecls bodyLayouts elemTy.kind
+      with
+      | .some size, .some align => .ok elemTy size align
+      | _, _ => .fault .unsupported
+
+/--
+Frame-qualified slot, `LocalDecl`s, and `LayoutTable` of the local `loc` of the
+stack frame at depth `depth` of `callStack`: the active frame
+(`depth = length callStack`, slots `locals'`, declarations `bodyLocalDecls`) or
+a suspended caller frame (`savedFrameAtDepth?`, with its saved slots and its
+body's declarations).
+Returns `.none` when no such frame is live, when the frame has no slot `loc`,
+or when the target is a caller-owned referent slot of the root frame
+(`Memory.callerLocals`), whose declarations are not in scope; callers treat
+`.none` as unsupported.
+
+Reference (`core::ptr` module documentation, `library/core/src/ptr/mod.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L24-L25>
+
+> "//!   size starting at the pointer is entirely contained within the bounds of that allocation. Note
+> //!   that in Rust, every (stack-allocated) variable is considered a separate allocation."
+-/
+def rawPtrTargetFrame?
+    (callStack : List SavedCallerFrame)
+    (locals' : List LocalSlot)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (depth loc : Nat) :
+    Option (LocalSlot × List LocalDecl × LayoutTable) :=
+  match Nat.beq depth (length callStack) with
+  | true =>
+    match get? locals' loc with
+    | .some slot => .some (slot, bodyLocalDecls, bodyLayouts)
+    | .none => .none
+  | false =>
+    match savedFrameAtDepth? callStack depth with
+    | .some sf =>
+      match get? sf.frame.locals loc with
+      | .some slot => .some (slot, sf.callerBody.localDecls, sf.callerBody.layouts)
+      | .none => .none
+    | .none => .none
+
+/--
+Decide whether the thin raw-pointer argument `arg`, which points to `tgt`
+(`classifyRawPtrTarget`), is aligned to `reqAlign` bytes in every execution:
+`.some true` (aligned), `.some false` (misaligned: undefined behavior for an
+access that requires alignment), or `.none` (the model cannot decide; callers
+step to `MirStepNode.unsupported`).
+
+- `reqAlign ≤ 1` is always satisfied.
+- A provenance-less address is aligned iff it is a multiple of `reqAlign`; so
+  is the address `offsetBytes` of a pointer value without provenance
+  (`allocId = 0`).
+- A pointer tracked by a Tree Borrows entry is misaligned when its byte offset
+  is not a multiple of `reqAlign` (as `checkDerefAlign`) or when the address
+  `addr(entry.targetLocal, entry.targetProjection) + offsetBytes` is not
+  `reqAlign`-aligned in every placement of the target local
+  (`checkTargetPlaceAlignWalk`, which rejects pointers to misaligned fields of
+  `#[repr(packed)]` structs). It is aligned when, in addition, the target
+  place's type has a known alignment that is a multiple of `reqAlign`;
+  otherwise the result is `.none`.
+- A pointer into a captured global allocation is aligned iff its byte offset
+  is a multiple of `reqAlign` and the allocation's alignment is at least
+  `reqAlign` (as `checkGlobalAllocAlign`).
+- A pointer into an untracked allocation is misaligned when its byte offset is
+  not a multiple of `reqAlign` (some placement of an allocation of any
+  alignment puts that offset at a misaligned address) and otherwise `.none`.
+
+Reference (The Rust Reference, "Size and Alignment"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "A value of alignment n must only be stored at an address that is a multiple
+> of n."
+
+Reference (`core::ptr` module documentation, `library/core/src/ptr/mod.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L52-L59>
+
+> "//! ## Alignment
+> //!
+> //! Valid raw pointers as defined above are not necessarily properly aligned (where
+> //! "proper" alignment is defined by the pointee type, i.e., `*const T` must be
+> //! aligned to `align_of::<T>()`). However, most functions require their
+> //! arguments to be properly aligned, and will explicitly state
+> //! this requirement in their documentation. Notable exceptions to this are
+> //! [`read_unaligned`] and [`write_unaligned`]."
+
+Modeling choice: Rust's requirement is about the run-time address. Allocation
+addresses are chosen nondeterministically, so the model requires alignment in
+every placement of the allocation; a pointer that is misaligned in some
+placement makes some execution undefined.
+-/
+def rawPtrTargetAligned?
+    (callStack : List SavedCallerFrame)
+    (locals' : List LocalSlot)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (reqAlign : Nat)
+    (arg : RawPtrArg)
+    (tgt : RawPtrTarget) :
+    Option Bool :=
+  match Nat.ble reqAlign 1 with
+  | true => .some true
+  | false =>
+    match arg with
+    | .addr addr => .some (Nat.beq (Nat.mod addr reqAlign) 0)
+    | .prov ptr =>
+      match Nat.beq (Nat.mod ptr.offsetBytes reqAlign) 0 with
+      | false => .some false
+      | true =>
+        match tgt with
+        | .outside => .some true
+        | .untracked => .none
+        | .global _ alloc => .some (Nat.ble reqAlign alloc.align.bytes)
+        | .stack _ entry =>
+          match
+            rawPtrTargetFrame?
+              callStack
+              locals'
+              bodyLocalDecls
+              bodyLayouts
+              entry.targetFrameDepth
+              entry.targetLocal
+          with
+          | .none => .none
+          | .some (_, targetDecls, targetLayouts) =>
+            match get? targetDecls entry.targetLocal with
+            | .none => .none
+            | .some rootDecl =>
+              match
+                checkTargetPlaceAlignWalk
+                  targetDecls
+                  targetLayouts
+                  reqAlign
+                  ptr.offsetBytes
+                  (.some rootDecl.ty)
+                  .none
+                  .none
+                  entry.targetProjection
+              with
+              | false => .some false
+              | true =>
+                match
+                  placeTyResolved
+                    targetDecls
+                    targetLayouts
+                    { local_ := entry.targetLocal, projection := entry.targetProjection }
+                with
+                | .none => .none
+                | .some placeTy =>
+                  match intrinsicRigidTyAlign targetDecls targetLayouts placeTy.kind with
+                  | .none => .none
+                  | .some placeAlign =>
+                    match Nat.beq (Nat.mod placeAlign reqAlign) 0 with
+                    | true => .some true
+                    | false => .none
+
+/--
+Resolution of the stack place a tracked raw pointer accesses
+(`resolveRawPtrStackTarget`): the owning frame's `LocalDecl`s and
+`LayoutTable`, the type `placeTy` of the borrow entry's target place, and the
+target local's `slot` (`.ok`); or the fault with which the access steps
+(`.fault`).
+
+Reference (`core::ptr` module documentation, `library/core/src/ptr/mod.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L48-L50>
+
+> "//! We say that a pointer is "dangling" if it is not valid for any non-zero-sized accesses. This
+> //! means out-of-bounds pointers, pointers to freed memory, null pointers, and pointers created with
+> //! [`NonNull::dangling`] are all dangling."
+-/
+inductive RawPtrStackTarget : Type where
+  /-- The access is within the live target place of type `placeTy`. -/
+  | ok
+      (targetDecls : List LocalDecl)
+      (targetLayouts : LayoutTable)
+      (placeTy : Ty)
+      (slot : LocalSlot) :
+      RawPtrStackTarget
+  /-- The access faults with `kind`. -/
+  | fault (kind : FailureKind) : RawPtrStackTarget
+
+/--
+Resolve a non-zero-sized access of `accessBytes` bytes at byte offset
+`offsetBytes` through a raw pointer whose tag has the Tree Borrows entry
+`entry`, for a read (`isWrite = false`) or a write (`isWrite = true`).
+
+Checks, in order:
+1. A deallocated target (`entry.allocDead`) is `.ub`: the pointer is dangling.
+2. A `.disabled` tag, or a `.frozen` tag for a write, is `.ub` (the child
+   access is forbidden by Tree Borrows).
+3. A byte-ranged entry (`entry.rangeLen ≠ 0`) is unsupported.
+4. The target local must be a slot of a live frame with declarations in scope
+   (`rawPtrTargetFrame?`, else unsupported); a `.dead` slot is `.ub`.
+5. The type and size of the entry's target place must resolve (else
+   unsupported), and the accessed range `[offsetBytes, offsetBytes +
+   accessBytes)` must lie within that place. A range that leaves a whole local
+   (`entry.targetProjection = []`) leaves its allocation and is `.ub`; a range
+   that leaves a sub-place may still be inside the allocation, where the Tree
+   Borrows range of `entry` no longer covers it, so it is unsupported.
+
+Reference (`core::ptr` module documentation, `library/core/src/ptr/mod.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L21-L25>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L48-L50>
+
+> "//! * For a pointer to be valid for reads/writes, it is necessary, but not always sufficient, that
+> //!   the pointer be *dereferenceable*. The [provenance] of the pointer is used to determine which
+> //!   [allocation] it is derived from; a pointer is dereferenceable if the memory range of the given
+> //!   size starting at the pointer is entirely contained within the bounds of that allocation. Note
+> //!   that in Rust, every (stack-allocated) variable is considered a separate allocation."
+
+> "//! We say that a pointer is "dangling" if it is not valid for any non-zero-sized accesses. This
+> //! means out-of-bounds pointers, pointers to freed memory, null pointers, and pointers created with
+> //! [`NonNull::dangling`] are all dangling."
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+
+Modeling choice: restricting the access to the entry's target place
+(conditions 3 and 5) is Anneal's. It makes the Tree Borrows transitions of
+`borrowsAfterRawPtrRead` and `borrowsAfterWriteBytes`, which act on the whole
+target place, cover every accessed byte.
+-/
+def resolveRawPtrStackTarget
+    (callStack : List SavedCallerFrame)
+    (locals' : List LocalSlot)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (entry : BorrowEntry)
+    (offsetBytes accessBytes : Nat)
+    (isWrite : Bool) :
+    RawPtrStackTarget :=
+  match entry.allocDead with
+  | true => .fault .ub
+  | false =>
+    let permFault : Bool :=
+      match entry.perm, isWrite with
+      | .disabled, _ => true
+      | .frozen, true => true
+      | _, _ => false
+    match permFault with
+    | true => .fault .ub
+    | false =>
+      match Nat.beq entry.rangeLen 0 with
+      | false => .fault .unsupported
+      | true =>
+        match
+          rawPtrTargetFrame?
+            callStack
+            locals'
+            bodyLocalDecls
+            bodyLayouts
+            entry.targetFrameDepth
+            entry.targetLocal
+        with
+        | .none => .fault .unsupported
+        | .some (.dead, _, _) => .fault .ub
+        | .some (slot, targetDecls, targetLayouts) =>
+          match
+            placeTyResolved
+              targetDecls
+              targetLayouts
+              { local_ := entry.targetLocal, projection := entry.targetProjection }
+          with
+          | .none => .fault .unsupported
+          | .some placeTy =>
+            match tyByteSize targetDecls targetLayouts placeTy with
+            | .none => .fault .unsupported
+            | .some placeSize =>
+              match Nat.ble (Nat.add offsetBytes accessBytes) placeSize with
+              | true => .ok targetDecls targetLayouts placeTy slot
+              | false =>
+                match entry.targetProjection with
+                | .nil => .fault .ub
+                | _ :: _ => .fault .unsupported
+
+/--
+Fault of a typed load of `elemKind` that meets uninitialized memory: `.ub`
+when `elemKind` is a primitive scalar or thin pointer type, whose values are
+never uninitialized, and `.unsupported` for every other type (a `union` or a
+type with padding may legally hold uninitialized bytes, which the typed value
+representation cannot always express).
+
+Reference (The Rust Reference, "Behavior considered undefined — Invalid
+values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "Note: Uninitialized memory is also implicitly invalid for any type that has a restricted set of valid values. In other words, the only cases in which reading uninitialized memory is permitted are inside `union`s and in “padding” (the gaps between the fields of a type)."
+-/
+@[reducible]
+def rawPtrUninitFault (elemKind : RigidTy) : FailureKind :=
+  match Bool.or (isPrimitiveScalarKind elemKind) (isThinPtrKind elemKind) with
+  | true => .ub
+  | false => .unsupported
+
+/--
+Test whether every byte of `bytes` is initialized and carries no provenance.
+
+Reference (The Rust Reference, "Behavior considered undefined — Invalid
+values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
+-/
+@[reducible]
+def rawPtrBytesAllPlainInit : List AbstractByte → Bool
+  | .nil => true
+  | .init _ .none :: rest => rawPtrBytesAllPlainInit rest
+  | _ :: _ => false
+
+/--
+Test whether some byte of `bytes` is uninitialized.
+
+Reference (The Rust Reference, "Behavior considered undefined — Invalid
+values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "Note: Uninitialized memory is also implicitly invalid for any type that has a restricted set of valid values. In other words, the only cases in which reading uninitialized memory is permitted are inside `union`s and in “padding” (the gaps between the fields of a type)."
+-/
+@[reducible]
+def rawPtrBytesAnyUninit : List AbstractByte → Bool
+  | .nil => false
+  | .uninit :: _ => true
+  | .init _ _ :: rest => rawPtrBytesAnyUninit rest
+
+/--
+Fault of a typed load of `elemKind` whose bytes `bytes` do not decode
+(`decodeTypedValueFromBytes = .none`):
+- for a primitive scalar type, `.ub` when a byte is uninitialized or when every
+  byte is initialized without provenance (the bytes are then an invalid bit
+  pattern, such as `2` for `bool`), and `.unsupported` when a byte carries
+  pointer provenance (reading it at integer type is not undefined behavior,
+  but the result is not modeled);
+- for a thin pointer type, `.ub` when a byte is uninitialized and `.unsupported`
+  otherwise;
+- `.unsupported` for every other type, whose decoder is partial.
+
+Reference (The Rust Reference, "Behavior considered undefined — Invalid
+values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
+
+> "- A bool value must be false (0) or true (1)."
+
+> "Note: Uninitialized memory is also implicitly invalid for any type that has a restricted set of valid values. In other words, the only cases in which reading uninitialized memory is permitted are inside `union`s and in “padding” (the gaps between the fields of a type)."
+-/
+@[reducible]
+def rawPtrDecodeFault (elemKind : RigidTy) (bytes : List AbstractByte) : FailureKind :=
+  match isPrimitiveScalarKind elemKind with
+  | true =>
+    match Bool.or (rawPtrBytesAnyUninit bytes) (rawPtrBytesAllPlainInit bytes) with
+    | true => .ub
+    | false => .unsupported
+  | false =>
+    match Bool.and (isThinPtrKind elemKind) (rawPtrBytesAnyUninit bytes) with
+    | true => .ub
+    | false => .unsupported
+
+/--
+Encode the value `v` of a place of type `ty` to its byte representation, as
+`decodeSubValueAtByteOffset?` does: scalars and thin pointers by their untyped
+little-endian encoding, and aggregates by `encodeTypedValueToBytes` at the
+layout-faithful type `resolveFaithfulAggregateTy?` finds (else `.none`). A
+`Value.unit` occupies no bytes, and `Value.uninit` has no byte encoding here.
+
+Reference (The Rust Reference, "Type Layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "The size of a value is the offset in bytes between successive elements in an
+> array with that item type including alignment padding."
+-/
+def rawPtrEncodeValue?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (ty : Ty) :
+    Value → Option (List AbstractByte)
+  | .unit => .some .nil
+  | .scalar sc => encodeUntypedValueToBytes defaultCodecFuel (.scalar sc)
+  | .ptr p sz => encodeUntypedValueToBytes defaultCodecFuel (.ptr p sz)
+  | .aggregate varIdx fields =>
+    match resolveFaithfulAggregateTy? localDecls layouts ty varIdx fields with
+    | .some resolvedTy =>
+      encodeTypedValueToBytes layouts resolvedTy (.aggregate varIdx fields)
+    | .none => .none
+  | .uninit => .none
+
+/--
+Outcome of loading a typed value through a tracked raw pointer
+(`loadRawPtrStackValue`): the loaded value (`.ok`) or a fault (`.fault`).
+
+Reference (`core::ptr::read` documentation, `library/core/src/ptr/mod.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L1596>
+
+> "/// * `src` must point to a properly initialized value of type `T`."
+-/
+inductive RawPtrLoadResult : Type where
+  /-- The loaded value. -/
+  | ok (val : Value) : RawPtrLoadResult
+  /-- The load faults with `kind`. -/
+  | fault (kind : FailureKind) : RawPtrLoadResult
+
+/--
+Load a value of type `elemTy` (of `accessBytes > 0` bytes) at byte offset
+`offsetBytes` of the target place of `entry`, whose type is `placeTy` and whose
+local has slot `slot` (as resolved by `resolveRawPtrStackTarget`).
+
+- An uninitialized target local faults with `rawPtrUninitFault`.
+- When the access covers the target place exactly at its own type
+  (`offsetBytes = 0` and `placeTy` is `elemTy`), the value is the place's value
+  (`readProjectedForLocal`). This path does not depend on the place's address,
+  so it serves unaligned places such as a field of a `#[repr(packed)]` struct.
+- Otherwise the place's value is encoded to bytes (`rawPtrEncodeValue?`), the
+  accessed bytes are sliced out, and they are decoded at `elemTy`
+  (`decodeTypedValueFromBytes`): a load at an interior byte offset or at
+  another type. A place without a byte encoding is unsupported; bytes that do
+  not decode fault with `rawPtrDecodeFault`.
+- The loaded value must be fully initialized (`valueContainsUninit`, else
+  `rawPtrUninitFault`) and valid for `elemTy` (`validateValueForTy?`, else
+  `.ub`).
+
+Reference (`core::ptr::read_unaligned` documentation,
+`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L1737-L1748>
+
+> "/// Reads the value from `src` without moving it. This leaves the
+> /// memory in `src` unchanged.
+> ///
+> /// Unlike [`read`], `read_unaligned` works with unaligned pointers.
+> ///
+> /// # Safety
+> ///
+> /// Behavior is undefined if any of the following conditions are violated:
+> ///
+> /// * `src` must be [valid] for reads.
+> ///
+> /// * `src` must point to a properly initialized value of type `T`."
+
+Reference (The Rust Reference, "Behavior considered undefined — Invalid
+values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
+
+Modeling choice: the typed value representation and its byte codec are
+Anneal's. Shapes they cannot express are unsupported, never a successful load.
+-/
+def loadRawPtrStackValue
+    (locals' : List LocalSlot)
+    (bodyLayouts : LayoutTable)
+    (targetDecls : List LocalDecl)
+    (targetLayouts : LayoutTable)
+    (entry : BorrowEntry)
+    (offsetBytes accessBytes : Nat)
+    (placeTy elemTy : Ty)
+    (slot : LocalSlot) :
+    RawPtrLoadResult :=
+  match slot with
+  | .dead => .fault .ub
+  | .uninit => .fault (rawPtrUninitFault elemTy.kind)
+  | .init rootVal =>
+    let baseRes : ProjReadResult :=
+      match entry.targetProjection with
+      | .nil => .ok rootVal
+      | pHead :: pTail =>
+        readProjectedForLocal
+          locals'
+          targetDecls
+          targetLayouts
+          entry.targetLocal
+          rootVal
+          (pHead :: pTail)
+    match baseRes with
+    | .ub => .fault .ub
+    | .unsupported => .fault .unsupported
+    | .ok baseVal =>
+      let loaded : RawPtrLoadResult :=
+        match Bool.and (Nat.beq offsetBytes 0) (rigidTyEq placeTy.kind elemTy.kind) with
+        | true => .ok baseVal
+        | false =>
+          match rawPtrEncodeValue? targetDecls targetLayouts placeTy baseVal with
+          | .none => .fault .unsupported
+          | .some baseBytes =>
+            match sliceAbstractBytes baseBytes offsetBytes accessBytes with
+            | .none => .fault .unsupported
+            | .some accessed =>
+              match decodeTypedValueFromBytes defaultCodecFuel bodyLayouts elemTy accessed with
+              | .some v => .ok v
+              | .none => .fault (rawPtrDecodeFault elemTy.kind accessed)
+      match loaded with
+      | .fault kind => .fault kind
+      | .ok v =>
+        match valueContainsUninit v with
+        | true => .fault (rawPtrUninitFault elemTy.kind)
+        | false =>
+          match validateValueForTy? bodyLayouts (.some elemTy) v with
+          | true => .ok v
+          | false => .fault .ub
+
+/--
+Tree Borrows read check and transition for a load through the raw pointer `ptr`
+with entry `entry`, over the entry's whole target place: exactly the check and
+transition `evalUseRvalue` applies to the load `copy (*ptr)`
+(`derefReadTreeUB`, `freezeDerefReadBorrowsAt`). With two or more borrow
+entries, a read that is undefined behavior somewhere in the hierarchy
+(`hasTreeReadUB`) yields `.none`, and otherwise the foreign-read transition
+(`freezeTreeBorrowsOnReadAtProj`) is applied; with fewer entries the only entry
+is the reader's own, which a child read leaves unchanged.
+
+Reference (`core::ptr::read_volatile` documentation,
+`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L2032-L2038>
+
+> "/// - When a volatile operation is used for memory inside an [allocation], it behaves exactly like
+> ///   [`read`], except for the additional guarantee that it won't be elided or reordered (see
+> ///   above). This implies that the operation will actually access memory and not e.g. be lowered to
+> ///   reusing data from a previous read. Other than that, all the usual rules for memory accesses
+> ///   apply (including provenance).  In particular, just like in C, whether an operation is volatile
+> ///   has no bearing whatsoever on questions involving concurrent accesses from multiple threads.
+> ///   Volatile accesses behave exactly like non-atomic accesses in that regard."
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+
+Modeling choice: Tree Borrows is Anneal's aliasing model; the Reference does
+not fix the aliasing rules.
+-/
+def borrowsAfterRawPtrRead
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (ptr : ProvenancePtr)
+    (entry : BorrowEntry) :
+    Option (List BorrowEntry) :=
+  match borrows with
+  | b₁ :: b₂ :: restBorrows =>
+    let allBorrows := b₁ :: b₂ :: restBorrows
+    match
+      hasTreeReadUB
+        allBorrows
+        allBorrows
+        activeProtectors
+        entry.targetLocal
+        (.some ptr.tag)
+        entry.targetProjection
+        entry.rangeOffset
+        entry.rangeLen
+        entry.targetFrameDepth
+    with
+    | true => .none
+    | false =>
+      .some
+        (freezeTreeBorrowsOnReadAtProj
+          allBorrows
+          allBorrows
+          entry.targetLocal
+          (.some ptr.tag)
+          entry.targetProjection
+          entry.rangeOffset
+          entry.rangeLen
+          activeProtectors
+          entry.targetFrameDepth)
+  | _ => .some borrows
+
+/--
+Construct the unique value of the zero-sized type `elemTy`: `Value.unit` for
+the types `isZeroSizedUnitElemTy` represents by it (`()`, function items,
+zero-length arrays, and tuples and arrays of these), and otherwise the value
+`decodeTypedValueFromBytes` decodes from zero bytes (for example a fieldless
+struct). Returns `.none`, which callers treat as unsupported, when the codec
+has no value of `elemTy` over zero bytes.
+
+Reference (`core::ptr::read_volatile` documentation,
+`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L2052>
+
+> "/// Note that volatile memory operations where T is a zero-sized type are noops and may be ignored."
+
+Modeling choice: callers use this function only for an inhabited `elemTy` of
+size `0`, which has exactly one value; its `Value` representation is Anneal's.
+-/
+@[reducible]
+def rawPtrZstValue? (bodyLayouts : LayoutTable) (elemTy : Ty) : Option Value :=
+  match isZeroSizedUnitElemTy 8 elemTy.kind with
+  | true => .some .unit
+  | false => decodeTypedValueFromBytes defaultCodecFuel bodyLayouts elemTy .nil
+
+/--
+Outcome of the machine-state-independent part of a raw-pointer memory access
+call (`rawPtrLoadAction`, `rawPtrStoreAction`, `volatileCopyWithinLocalAction`),
+consumed by `finishRawPtrCallAction`:
+- `.fault kind`: the call faults (`FailureKind.unsupported` is the fail-closed
+  `MirStepNode.unsupported`);
+- `.ret retVal`: the call returns `retVal` and leaves memory unchanged (a
+  zero-sized access, or a load from a global allocation);
+- `.retBorrows borrows' retVal`: a load through a tracked stack pointer returns
+  `retVal` with the Tree Borrows state `borrows'`;
+- `.retStack borrows' locals₄ callStack' callerLocals' retVal`: a store through
+  a tracked stack pointer returns `retVal` with the Tree Borrows state
+  `borrows'` and the updated frame slots (`writeFrameLocalSlot`).
+
+Reference (`core::ptr::read_volatile` documentation,
+`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L2032-L2038>
+
+> "/// - When a volatile operation is used for memory inside an [allocation], it behaves exactly like
+> ///   [`read`], except for the additional guarantee that it won't be elided or reordered (see
+> ///   above). This implies that the operation will actually access memory and not e.g. be lowered to
+> ///   reusing data from a previous read. Other than that, all the usual rules for memory accesses
+> ///   apply (including provenance).  In particular, just like in C, whether an operation is volatile
+> ///   has no bearing whatsoever on questions involving concurrent accesses from multiple threads.
+> ///   Volatile accesses behave exactly like non-atomic accesses in that regard."
+
+Modeling choice: the split of a call into a state-independent action and its
+commit is Anneal's; the quoted passage establishes only that an access inside
+an allocation is an ordinary memory access.
+-/
+inductive RawPtrCallAction : Type where
+  /-- The call faults with `kind`. -/
+  | fault (kind : FailureKind) : RawPtrCallAction
+  /-- The call returns `retVal`; memory is unchanged. -/
+  | ret (retVal : Value) : RawPtrCallAction
+  /-- The call returns `retVal` with Tree Borrows state `borrows'`. -/
+  | retBorrows (borrows' : List BorrowEntry) (retVal : Value) : RawPtrCallAction
+  /-- The call returns `retVal` with Tree Borrows state `borrows'`, active-frame
+  slots `locals₄`, call stack `callStack'`, and caller referents
+  `callerLocals'`. -/
+  | retStack
+      (borrows' : List BorrowEntry)
+      (locals₄ : List LocalSlot)
+      (callStack' : List SavedCallerFrame)
+      (callerLocals' : List LocalSlot)
+      (retVal : Value) :
+      RawPtrCallAction
+
+/--
+Complete a raw-pointer memory access call from its `RawPtrCallAction`: fault,
+or install the action's memory components in `s` and write the returned value
+to `destination`, continuing at `targetBb` (`writeIntrinsicReturn`).
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L800-L814>
+
+> "Call {
+> ...
+>     destination: Place<'tcx>,
+> ...
+>     target: Option<BasicBlock>,"
+-/
+@[reducible]
+def finishRawPtrCallAction
+    (s : MachineState)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    RawPtrCallAction → MirStepNode
+  | .fault kind => MirStepNode.fail kind
+  | .ret retVal => writeIntrinsicReturn s locals' destination targetBb retVal
+  | .retBorrows borrows' retVal =>
+    writeIntrinsicReturn
+      { s with memory := { s.memory with borrows := borrows' } }
+      locals'
+      destination
+      targetBb
+      retVal
+  | .retStack borrows' locals₄ callStack' callerLocals' retVal =>
+    writeIntrinsicReturn
+      { s with
+        memory :=
+          { s.memory with
+            borrows := borrows'
+            callStack := callStack'
+            callerLocals := callerLocals' } }
+      locals₄
+      destination
+      targetBb
+      retVal
+
+/--
+Compute the `RawPtrCallAction` of a typed load `f::<T>(src) -> T` through the
+raw pointer `src`, from the Tree Borrows state `borrows`, the global allocations
+`globals`, the call stack `callStack`, the active protectors
+`activeProtectors`, and the active frame's slots `locals'`:
+- `isVolatile = true, requiresAlign = true`: `core::intrinsics::volatile_load`
+  and an unlinked `core::ptr::read_volatile`;
+- `isVolatile = true, requiresAlign = false`:
+  `core::intrinsics::unaligned_volatile_load`;
+- `isVolatile = false, requiresAlign = false`: an unlinked
+  `core::ptr::read_unaligned`.
+
+Checks, in order:
+1. The argument list must be one thin pointer (`rawPtrArgOfValue?`), else
+   `.ub`; `T` must resolve (`resolveRawPtrElemLayout`).
+2. Alignment (`rawPtrTargetAligned?`): `align_of::<T>()` when `requiresAlign`,
+   else `1`. A misaligned pointer is `.ub` even when `T` is zero-sized; an
+   undecidable alignment is unsupported.
+3. A non-volatile load through a null pointer is `.ub`, even when `T` is
+   zero-sized: a null pointer is never valid for reads.
+4. An uninhabited `T` (`tyIsUninhabited`) is `.ub`: the load would produce a
+   value of a type that has none.
+5. A zero-sized `T` reads no memory: the result is the unique value of `T`
+   (`rawPtrZstValue?`), and no Tree Borrows access happens.
+6. Otherwise (`size_of::<T>() > 0`), by `classifyRawPtrTarget`:
+   - `.outside` (no provenance): a non-volatile load is `.ub` (the pointer is
+     not dereferenceable for any byte); a volatile load may be a load from
+     memory outside all Rust allocations, whose result the hardware defines, so
+     it is unsupported.
+   - `.untracked`: unsupported.
+   - `.global`: a range past the end of the allocation is `.ub`; otherwise the
+     value is decoded from the allocation's bytes (`evalGlobalDerefRead`) and
+     must be initialized and valid for `T`.
+   - `.stack`: the target place is resolved and bounds-checked
+     (`resolveRawPtrStackTarget`), the value is loaded
+     (`loadRawPtrStackValue`), and the Tree Borrows read transition is applied
+     (`borrowsAfterRawPtrRead`).
+7. The action returns the loaded value; `evalRawPtrLoadCall` writes it to the
+   call destination (`finishRawPtrCallAction`).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L994-L999>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1007-L1014>
+
+> "/// Performs a volatile load from the `src` pointer.
+> ///
+> /// The stabilized version of this intrinsic is [`core::ptr::read_volatile`].
+> #[rustc_intrinsic]
+> #[rustc_nounwind]
+> pub unsafe fn volatile_load<T>(src: *const T) -> T;"
+
+> "/// Performs a volatile load from the `src` pointer
+> /// The pointer is not required to be aligned.
+> ///
+> /// This intrinsic does not have a stable counterpart.
+> #[rustc_intrinsic]
+> #[rustc_nounwind]
+> #[rustc_diagnostic_item = "intrinsics_unaligned_volatile_load"]
+> pub unsafe fn unaligned_volatile_load<T>(src: *const T) -> T;"
+
+Reference (`core::ptr::read_volatile` documentation,
+`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L2032-L2052>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L2079-L2090>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L2111-L2124>
+
+> "/// - When a volatile operation is used for memory inside an [allocation], it behaves exactly like
+> ///   [`read`], except for the additional guarantee that it won't be elided or reordered (see
+> ///   above). This implies that the operation will actually access memory and not e.g. be lowered to
+> ///   reusing data from a previous read. Other than that, all the usual rules for memory accesses
+> ///   apply (including provenance).  In particular, just like in C, whether an operation is volatile
+> ///   has no bearing whatsoever on questions involving concurrent accesses from multiple threads.
+> ///   Volatile accesses behave exactly like non-atomic accesses in that regard.
+> ///
+> /// - Volatile operations, however, may also be used to access memory that is _outside_ of any Rust
+> ///   allocation. In this use-case, the pointer does *not* have to be [valid] for reads. This is
+> ///   typically used for CPU and peripheral registers that must be accessed via an I/O memory
+> ///   mapping, most commonly at fixed addresses reserved by the hardware. These often have special
+> ///   semantics associated to their manipulation, and cannot be used as general purpose memory.
+> ///   Here, any address value is possible, including 0 and [`usize::MAX`], so long as the semantics
+> ///   of such a read are well-defined by the target hardware. The provenance of the pointer is
+> ///   irrelevant, and it can be created with [`without_provenance`]. The access must not trap. It
+> ///   can cause side-effects, but those must not affect Rust-allocated memory in any way. This
+> ///   access is still not considered [atomic], and as such it cannot be used for inter-thread
+> ///   synchronization.
+> ///
+> /// Note that volatile memory operations where T is a zero-sized type are noops and may be ignored."
+
+> "/// Behavior is undefined if any of the following conditions are violated:
+> ///
+> /// * `src` must be either [valid] for reads, or `T` must be a ZST, or `src` must point to memory
+> ///   outside of all Rust allocations and reading from that memory must:
+> ///   - not trap, and
+> ///   - not cause any memory inside a Rust allocation to be modified.
+> ///
+> /// * `src` must be properly aligned.
+> ///
+> /// * Reading from `src` must produce a properly initialized value of type `T`.
+> ///
+> /// Note that even if `T` has size `0`, the pointer must be properly aligned."
+
+> "pub unsafe fn read_volatile<T>(src: *const T) -> T {
+>     // SAFETY: the caller must uphold the safety contract for `volatile_load`.
+>     unsafe {
+>         ub_checks::assert_unsafe_precondition!(
+>             check_language_ub,
+>             "ptr::read_volatile requires that the pointer argument is aligned",
+>             (
+>                 addr: *const () = src as *const (),
+>                 align: usize = align_of::<T>(),
+>             ) => ub_checks::maybe_is_aligned(addr, align)
+>         );
+>         intrinsics::volatile_load(src)
+>     }
+> }"
+
+Reference (`core::ptr::read_unaligned` documentation,
+`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L1737-L1748>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L18-L20>
+
+> "/// Reads the value from `src` without moving it. This leaves the
+> /// memory in `src` unchanged.
+> ///
+> /// Unlike [`read`], `read_unaligned` works with unaligned pointers.
+> ///
+> /// # Safety
+> ///
+> /// Behavior is undefined if any of the following conditions are violated:
+> ///
+> /// * `src` must be [valid] for reads.
+> ///
+> /// * `src` must point to a properly initialized value of type `T`."
+
+> "//! * A [null] pointer is *never* valid for reads/writes.
+> //! * For memory accesses of [size zero][zst], *every* non-null pointer is valid for reads/writes.
+> //!   The following points are only concerned with non-zero-sized accesses."
+
+Reference (The Rust Reference, "Never type"):
+<https://doc.rust-lang.org/1.98.0/reference/types/never.html>
+
+> "The never type ! is a type with no values, representing the result of computations that never complete."
+
+Modeling choices and scope:
+- The documentation states the safety contract of `read_volatile` and
+  `read_unaligned`, and that `volatile_load` is the intrinsic behind
+  `read_volatile`. The contract of `unaligned_volatile_load` is taken to be
+  that of `volatile_load` without the alignment requirement, as its
+  documentation ("The pointer is not required to be aligned.") indicates.
+- A load from memory outside all Rust allocations is never executed: its
+  result is defined by the hardware, so every such load, and every load
+  through an untracked allocation, is unsupported. It is never reported as
+  undefined behavior once the pointer is aligned.
+- Volatile loads are modeled as silent steps; the guarantee that they are not
+  elided or reordered concerns compilation and is not modeled.
+- For an unlinked `core::ptr::read_volatile`, a misaligned pointer is `.ub`
+  although the function's `check_language_ub` precondition would abort when
+  UB checks are enabled; the abort is one behavior of the undefined call.
+- For an unlinked `core::ptr::read_unaligned`, the model applies the documented
+  contract (`src` valid for reads). The function's body copies
+  `size_of::<T>()` bytes with `copy_nonoverlapping`, so executing a linked body
+  can accept a null `src` when `T` is zero-sized; rejecting it here is the
+  stricter of the two.
+-/
+def rawPtrLoadAction
+    (isVolatile requiresAlign : Bool)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (callStack : List SavedCallerFrame)
+    (activeProtectors : List Nat)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot) :
+    RawPtrCallAction :=
+  let ptrBytes := layoutPointerBytes bodyLayouts
+  match argVals with
+  | srcVal :: .nil =>
+    match rawPtrArgOfValue? ptrBytes srcVal with
+    | .none => .fault .ub
+    | .some srcArg =>
+      match resolveRawPtrElemLayout target bodyLocalDecls bodyLayouts argOps with
+      | .fault kind => .fault kind
+      | .ok elemTy size align =>
+        let reqAlign : Nat :=
+          match requiresAlign with
+          | true => align
+          | false => 1
+        let srcTgt := classifyRawPtrTarget borrows globals srcArg
+        match
+          rawPtrTargetAligned? callStack locals' bodyLocalDecls bodyLayouts reqAlign srcArg srcTgt
+        with
+        | .some false => .fault .ub
+        | .none => .fault .unsupported
+        | .some true =>
+          match Bool.and (Bool.not isVolatile) (rawPtrArgIsNull srcArg) with
+          | true => .fault .ub
+          | false =>
+            match tyIsUninhabited bodyLayouts elemTy with
+            | true => .fault .ub
+            | false =>
+              match Nat.beq size 0 with
+              | true =>
+                match rawPtrZstValue? bodyLayouts elemTy with
+                | .some zstVal => .ret zstVal
+                | .none => .fault .unsupported
+              | false =>
+                match srcTgt with
+                | .outside =>
+                  match isVolatile with
+                  | true => .fault .unsupported
+                  | false => .fault .ub
+                | .untracked => .fault .unsupported
+                | .global ptr alloc =>
+                  match Nat.ble (Nat.add ptr.offsetBytes size) (length alloc.bytes) with
+                  | false => .fault .ub
+                  | true =>
+                    match
+                      evalGlobalDerefRead
+                        locals'
+                        alloc
+                        ptr.offsetBytes
+                        ptrBytes
+                        .nil
+                        bodyLayouts
+                        (.some elemTy)
+                    with
+                    | .ok v _ =>
+                      match valueContainsUninit v with
+                      | true => .fault (rawPtrUninitFault elemTy.kind)
+                      | false =>
+                        match validateValueForTy? bodyLayouts (.some elemTy) v with
+                        | true => .ret v
+                        | false => .fault .ub
+                    | .ub => .fault .ub
+                    | .unsupported => .fault .unsupported
+                | .stack ptr entry =>
+                  match
+                    resolveRawPtrStackTarget
+                      callStack
+                      locals'
+                      bodyLocalDecls
+                      bodyLayouts
+                      entry
+                      ptr.offsetBytes
+                      size
+                      false
+                  with
+                  | .fault kind => .fault kind
+                  | .ok targetDecls targetLayouts placeTy slot =>
+                    match
+                      loadRawPtrStackValue
+                        locals'
+                        bodyLayouts
+                        targetDecls
+                        targetLayouts
+                        entry
+                        ptr.offsetBytes
+                        size
+                        placeTy
+                        elemTy
+                        slot
+                    with
+                    | .fault kind => .fault kind
+                    | .ok v =>
+                      match borrowsAfterRawPtrRead borrows activeProtectors ptr entry with
+                      | .none => .fault .ub
+                      | .some borrows' => .retBorrows borrows' v
+  | _ => .fault .ub
+
+/--
+Evaluate a typed load `f::<T>(src) -> T` through the raw pointer `src`
+(`core::intrinsics::volatile_load`, `core::intrinsics::unaligned_volatile_load`,
+or an unlinked `core::ptr::read_volatile` / `core::ptr::read_unaligned`): the
+`RawPtrCallAction` of `rawPtrLoadAction` on the current memory, completed by
+`finishRawPtrCallAction` (fault, or write the loaded value to `destination` and
+continue at `targetBb`).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L994-L999>
+
+> "/// Performs a volatile load from the `src` pointer.
+> ///
+> /// The stabilized version of this intrinsic is [`core::ptr::read_volatile`].
+> #[rustc_intrinsic]
+> #[rustc_nounwind]
+> pub unsafe fn volatile_load<T>(src: *const T) -> T;"
+-/
+def evalRawPtrLoadCall
+    (isVolatile requiresAlign : Bool)
+    (s : MachineState)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    MirStepNode :=
+  finishRawPtrCallAction
+    s
+    locals'
+    destination
+    targetBb
+    (rawPtrLoadAction
+      isVolatile
+      requiresAlign
+      s.memory.borrows
+      s.memory.globals
+      s.memory.callStack
+      s.memory.activeProtectors
+      target
+      bodyLocalDecls
+      bodyLayouts
+      argOps
+      argVals
+      locals')
+
+/--
+Fault of storing the argument value `val` at type `elemTy` of `size` bytes, or
+`.none` when `val` is a storable value of `elemTy`:
+- a value containing `Value.uninit` faults with `rawPtrUninitFault`;
+- a value that is invalid for `elemTy` (`validateValueForTy?`) is `.ub`;
+- for a primitive scalar `elemTy`, a value that is not a scalar of exactly
+  `size` bytes is `.ub` (the call passes an ABI-incompatible argument).
+
+Reference (The Rust Reference, "Behavior considered undefined — Invalid
+values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
+
+> "- A bool value must be false (0) or true (1)."
+
+> "- A char value must not be a surrogate (i.e., must not be in the range
+> 0xD800..=0xDFFF) and must be equal to or less than char::MAX."
+-/
+def rawPtrStoreValueFault?
+    (bodyLayouts : LayoutTable)
+    (elemTy : Ty)
+    (size : Nat)
+    (val : Value) :
+    Option FailureKind :=
+  match valueContainsUninit val with
+  | true => .some (rawPtrUninitFault elemTy.kind)
+  | false =>
+    match validateValueForTy? bodyLayouts (.some elemTy) val with
+    | false => .some .ub
+    | true =>
+      match isPrimitiveScalarKind elemTy.kind, val with
+      | true, .scalar sc =>
+        match Nat.beq sc.sizeBytes size with
+        | true => .none
+        | false => .some .ub
+      | true, _ => .some .ub
+      | false, _ => .none
+
+/--
+Outcome of storing a typed value through a tracked raw pointer
+(`storeRawPtrStackValue`): the target local's new slot (`.ok`) or a fault
+(`.fault`).
+
+Reference (`core::ptr::write` documentation, `library/core/src/ptr/mod.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L1826-L1827>
+
+> "/// Overwrites a memory location with the given value without reading or
+> /// dropping the old value."
+-/
+inductive RawPtrStoreResult : Type where
+  /-- The target local's slot after the store. -/
+  | ok (slot' : LocalSlot) : RawPtrStoreResult
+  /-- The store faults with `kind`. -/
+  | fault (kind : FailureKind) : RawPtrStoreResult
+
+/--
+Store the value `val` of type `elemTy` at byte offset `offsetBytes` of the
+target place of `entry`, whose type is `placeTy` and whose local has slot
+`slot` (as resolved by `resolveRawPtrStackTarget`), returning the local's new
+slot.
+
+- When the store covers the target place exactly at its own type
+  (`offsetBytes = 0` and `placeTy` is `elemTy`), `val` replaces the place's
+  value (`writeProjectedForLocal`, or the whole slot for a whole local, which
+  may be uninitialized). This path does not depend on the place's address, so
+  it serves unaligned places such as a field of a `#[repr(packed)]` struct.
+- Otherwise (an interior byte offset or another type) the bytes of `val` are
+  spliced into the byte representation of the place's current value, which is
+  decoded back at the place's type (`spliceSubValueAtByteOffset?`). When the
+  place has no byte encoding, or the resulting bytes are not a valid value of
+  the place's type, the store is unsupported: the typed slot cannot hold them,
+  although the store itself is not undefined behavior.
+- A store into an uninitialized local other than a whole-local store is
+  unsupported.
+
+Reference (`core::ptr::write_unaligned` documentation,
+`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L1937-L1956>
+
+> "/// Overwrites a memory location with the given value without reading or
+> /// dropping the old value.
+> ///
+> /// Unlike [`write()`], the pointer may be unaligned.
+> ///
+> /// `write_unaligned` does not drop the contents of `dst`. This is safe, but it
+> /// could leak allocations or resources, so care should be taken not to overwrite
+> /// an object that should be dropped.
+> ///
+> /// Additionally, it does not drop `src`. Semantically, `src` is moved into the
+> /// location pointed to by `dst`.
+> ///
+> /// This is appropriate for initializing uninitialized memory, or overwriting
+> /// memory that has previously been read with [`read_unaligned`].
+> ///
+> /// # Safety
+> ///
+> /// Behavior is undefined if any of the following conditions are violated:
+> ///
+> /// * `dst` must be [valid] for writes."
+
+Modeling choice: the typed value representation and its byte codec are
+Anneal's. Shapes they cannot express are unsupported, never a successful store.
+-/
+def storeRawPtrStackValue
+    (locals' : List LocalSlot)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (targetDecls : List LocalDecl)
+    (targetLayouts : LayoutTable)
+    (entry : BorrowEntry)
+    (offsetBytes : Nat)
+    (placeTy elemTy : Ty)
+    (slot : LocalSlot)
+    (val : Value) :
+    RawPtrStoreResult :=
+  let isDirect : Bool :=
+    Bool.and (Nat.beq offsetBytes 0) (rigidTyEq placeTy.kind elemTy.kind)
+  match slot with
+  | .dead => .fault .ub
+  | .uninit =>
+    match isDirect, entry.targetProjection with
+    | true, .nil => .ok (.init val)
+    | _, _ => .fault .unsupported
+  | .init rootVal =>
+    let writeBack : Value → RawPtrStoreResult := fun newPlaceVal =>
+      match entry.targetProjection with
+      | .nil => .ok (.init newPlaceVal)
+      | pHead :: pTail =>
+        match
+          writeProjectedForLocal
+            locals'
+            targetDecls
+            targetLayouts
+            entry.targetLocal
+            rootVal
+            (pHead :: pTail)
+            newPlaceVal
+        with
+        | .ok rootVal' => .ok (.init rootVal')
+        | .ub => .fault .ub
+        | .unsupported => .fault .unsupported
+    match isDirect with
+    | true => writeBack val
+    | false =>
+      let oldRes : ProjReadResult :=
+        match entry.targetProjection with
+        | .nil => .ok rootVal
+        | pHead :: pTail =>
+          readProjectedForLocal
+            locals'
+            targetDecls
+            targetLayouts
+            entry.targetLocal
+            rootVal
+            (pHead :: pTail)
+      match oldRes with
+      | .ok oldVal =>
+        match
+          spliceSubValueAtByteOffset?
+            bodyLocalDecls
+            targetDecls
+            targetLayouts
+            (.some placeTy)
+            oldVal
+            offsetBytes
+            (.some elemTy)
+            val
+            bodyLayouts
+        with
+        | .some newPlaceVal => writeBack newPlaceVal
+        | .none => .fault .unsupported
+      | _ => .fault .unsupported
+
+/--
+Compute the `RawPtrCallAction` of a typed store `f::<T>(dst, val)` through the
+raw pointer `dst`, from the Tree Borrows state `borrows`, the global allocations
+`globals`, the call stack `callStack`, the root frame's caller referents
+`callerLocals`, the active protectors `activeProtectors`, and the active
+frame's slots `locals'`:
+- `isVolatile = true, requiresAlign = true`: `core::intrinsics::volatile_store`
+  and an unlinked `core::ptr::write_volatile`;
+- `isVolatile = true, requiresAlign = false`:
+  `core::intrinsics::unaligned_volatile_store`;
+- `isVolatile = false, requiresAlign = false`: an unlinked
+  `core::ptr::write_unaligned`.
+
+Checks, in order:
+1. The argument list must be a thin pointer (`rawPtrArgOfValue?`) and a value,
+   else `.ub`; `T` must resolve (`resolveRawPtrElemLayout`).
+2. Alignment (`rawPtrTargetAligned?`): `align_of::<T>()` when `requiresAlign`,
+   else `1`. A misaligned pointer is `.ub` even when `T` is zero-sized; an
+   undecidable alignment is unsupported.
+3. A non-volatile store through a null pointer is `.ub`, even when `T` is
+   zero-sized: a null pointer is never valid for writes.
+4. `val` must be a storable value of `T` (`rawPtrStoreValueFault?`).
+5. A zero-sized `T` writes no memory, and no Tree Borrows access happens.
+6. Otherwise (`size_of::<T>() > 0`), by `classifyRawPtrTarget`:
+   - `.outside` (no provenance): a non-volatile store is `.ub`; a volatile
+     store may be a store to memory outside all Rust allocations, whose effect
+     the hardware defines, so it is unsupported.
+   - `.untracked`: unsupported.
+   - `.global`: a store to an immutable allocation, or past the end of the
+     allocation, is `.ub`; a store to a mutable global is unsupported.
+   - `.stack`: the target place is resolved and bounds-checked
+     (`resolveRawPtrStackTarget`), the new slot is computed
+     (`storeRawPtrStackValue`), the Tree Borrows write check and transition are
+     applied (`borrowsAfterWriteBytes`: ancestor permissions, active
+     protectors, and invalidation of overlapping foreign borrows), and the slot
+     is committed to its frame (`writeFrameLocalSlot`).
+7. The action returns `()`; `evalRawPtrStoreCall` writes it to the call
+   destination (`finishRawPtrCallAction`).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1000-L1005>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1015-L1022>
+
+> "/// Performs a volatile store to the `dst` pointer.
+> ///
+> /// The stabilized version of this intrinsic is [`core::ptr::write_volatile`].
+> #[rustc_intrinsic]
+> #[rustc_nounwind]
+> pub unsafe fn volatile_store<T>(dst: *mut T, val: T);"
+
+> "/// Performs a volatile store to the `dst` pointer.
+> /// The pointer is not required to be aligned.
+> ///
+> /// This intrinsic does not have a stable counterpart.
+> #[rustc_intrinsic]
+> #[rustc_nounwind]
+> #[rustc_diagnostic_item = "intrinsics_unaligned_volatile_store"]
+> pub unsafe fn unaligned_volatile_store<T>(dst: *mut T, val: T);"
+
+Reference (`core::ptr::write_volatile` documentation,
+`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L2134-L2155>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L2182-L2191>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L2213-L2226>
+
+> "/// - When a volatile operation is used for memory inside an [allocation], it behaves exactly like
+> ///   [`write`][write()], except for the additional guarantee that it won't be elided or reordered
+> ///   (see above). This implies that the operation will actually access memory and not e.g. be
+> ///   lowered to a register access. Other than that, all the usual rules for memory accesses apply
+> ///   (including provenance). In particular, just like in C, whether an operation is volatile has no
+> ///   bearing whatsoever on questions involving concurrent access from multiple threads. Volatile
+> ///   accesses behave exactly like non-atomic accesses in that regard.
+> ///
+> /// - Volatile operations, however, may also be used to access memory that is _outside_ of any Rust
+> ///   allocation. In this use-case, the pointer does *not* have to be [valid] for writes. This is
+> ///   typically used for CPU and peripheral registers that must be accessed via an I/O memory
+> ///   mapping, most commonly at fixed addresses reserved by the hardware. These often have special
+> ///   semantics associated to their manipulation, and cannot be used as general purpose memory.
+> ///   Here, any address value is possible, including 0 and [`usize::MAX`], so long as the semantics
+> ///   of such a write are well-defined by the target hardware. The provenance of the pointer is
+> ///   irrelevant, and it can be created with [`without_provenance`]. The access must not trap. It
+> ///   can cause side-effects, but those must not affect Rust-allocated memory in any way. This
+> ///   access is still not considered [atomic], and as such it cannot be used for inter-thread
+> ///   synchronization.
+> ///
+> /// Note that volatile memory operations on zero-sized types (e.g., if a zero-sized type is passed
+> /// to `write_volatile`) are noops and may be ignored."
+
+> "/// Behavior is undefined if any of the following conditions are violated:
+> ///
+> /// * `dst` must be either [valid] for writes, or `T` must be a ZST, or `dst` must point to memory
+> ///   outside of all Rust allocations and writing to that memory must:
+> ///   - not trap, and
+> ///   - not cause any memory inside a Rust allocation to be modified.
+> ///
+> /// * `dst` must be properly aligned.
+> ///
+> /// Note that even if `T` has size `0`, the pointer must be properly aligned."
+
+> "pub unsafe fn write_volatile<T>(dst: *mut T, src: T) {
+>     // SAFETY: the caller must uphold the safety contract for `volatile_store`.
+>     unsafe {
+>         ub_checks::assert_unsafe_precondition!(
+>             check_language_ub,
+>             "ptr::write_volatile requires that the pointer argument is aligned",
+>             (
+>                 addr: *mut () = dst as *mut (),
+>                 align: usize = align_of::<T>(),
+>             ) => ub_checks::maybe_is_aligned(addr, align)
+>         );
+>         intrinsics::volatile_store(dst, src);
+>     }
+> }"
+
+Reference (`core::ptr::write_unaligned` documentation,
+`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L1952-L1956>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L18-L20>
+
+> "/// # Safety
+> ///
+> /// Behavior is undefined if any of the following conditions are violated:
+> ///
+> /// * `dst` must be [valid] for writes."
+
+> "//! * A [null] pointer is *never* valid for reads/writes.
+> //! * For memory accesses of [size zero][zst], *every* non-null pointer is valid for reads/writes.
+> //!   The following points are only concerned with non-zero-sized accesses."
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+
+Modeling choices and scope:
+- The documentation states the safety contract of `write_volatile` and
+  `write_unaligned`, and that `volatile_store` is the intrinsic behind
+  `write_volatile`. The contract of `unaligned_volatile_store` is taken to be
+  that of `volatile_store` without the alignment requirement, as its
+  documentation ("The pointer is not required to be aligned.") indicates.
+- A store to memory outside all Rust allocations is never executed: its effect
+  is defined by the hardware, so every such store, every store through an
+  untracked allocation, and every store to a mutable global is unsupported. It
+  is never reported as undefined behavior once the pointer is aligned.
+- Volatile stores are modeled as silent steps; the guarantee that they are not
+  elided or reordered concerns compilation and is not modeled.
+- For an unlinked `core::ptr::write_volatile`, a misaligned pointer is `.ub`
+  although the function's `check_language_ub` precondition would abort when
+  UB checks are enabled; the abort is one behavior of the undefined call.
+- For an unlinked `core::ptr::write_unaligned`, the model applies the
+  documented contract (`dst` valid for writes), which is stricter than
+  executing the function's body for a null `dst` and a zero-sized `T`.
+-/
+def rawPtrStoreAction
+    (isVolatile requiresAlign : Bool)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (callStack : List SavedCallerFrame)
+    (callerLocals : List LocalSlot)
+    (activeProtectors : List Nat)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot) :
+    RawPtrCallAction :=
+  let ptrBytes := layoutPointerBytes bodyLayouts
+  match argVals with
+  | dstVal :: val :: .nil =>
+    match rawPtrArgOfValue? ptrBytes dstVal with
+    | .none => .fault .ub
+    | .some dstArg =>
+      match resolveRawPtrElemLayout target bodyLocalDecls bodyLayouts argOps with
+      | .fault kind => .fault kind
+      | .ok elemTy size align =>
+        let reqAlign : Nat :=
+          match requiresAlign with
+          | true => align
+          | false => 1
+        let dstTgt := classifyRawPtrTarget borrows globals dstArg
+        match
+          rawPtrTargetAligned? callStack locals' bodyLocalDecls bodyLayouts reqAlign dstArg dstTgt
+        with
+        | .some false => .fault .ub
+        | .none => .fault .unsupported
+        | .some true =>
+          match Bool.and (Bool.not isVolatile) (rawPtrArgIsNull dstArg) with
+          | true => .fault .ub
+          | false =>
+            match rawPtrStoreValueFault? bodyLayouts elemTy size val with
+            | .some kind => .fault kind
+            | .none =>
+              match Nat.beq size 0 with
+              | true => .ret .unit
+              | false =>
+                match dstTgt with
+                | .outside =>
+                  match isVolatile with
+                  | true => .fault .unsupported
+                  | false => .fault .ub
+                | .untracked => .fault .unsupported
+                | .global ptr alloc =>
+                  match
+                    mutabilityEq alloc.mutability .not,
+                    Nat.ble (Nat.add ptr.offsetBytes size) (length alloc.bytes)
+                  with
+                  | false, true => .fault .unsupported
+                  | _, _ => .fault .ub
+                | .stack ptr entry =>
+                  match
+                    resolveRawPtrStackTarget
+                      callStack
+                      locals'
+                      bodyLocalDecls
+                      bodyLayouts
+                      entry
+                      ptr.offsetBytes
+                      size
+                      true
+                  with
+                  | .fault kind => .fault kind
+                  | .ok targetDecls targetLayouts placeTy slot =>
+                    match
+                      storeRawPtrStackValue
+                        locals'
+                        bodyLocalDecls
+                        bodyLayouts
+                        targetDecls
+                        targetLayouts
+                        entry
+                        ptr.offsetBytes
+                        placeTy
+                        elemTy
+                        slot
+                        val
+                    with
+                    | .fault kind => .fault kind
+                    | .ok slot' =>
+                      match borrowsAfterWriteBytes borrows activeProtectors ptr.tag entry with
+                      | .none => .fault .ub
+                      | .some borrows' =>
+                        match
+                          writeFrameLocalSlot
+                            locals'
+                            callStack
+                            callerLocals
+                            entry.targetFrameDepth
+                            entry.targetLocal
+                            slot'
+                        with
+                        | .none => .fault .unsupported
+                        | .some (locals₄, callStack', callerLocals') =>
+                          .retStack borrows' locals₄ callStack' callerLocals' .unit
+  | _ => .fault .ub
+
+/--
+Evaluate a typed store `f::<T>(dst, val)` through the raw pointer `dst`
+(`core::intrinsics::volatile_store`,
+`core::intrinsics::unaligned_volatile_store`, or an unlinked
+`core::ptr::write_volatile` / `core::ptr::write_unaligned`): the
+`RawPtrCallAction` of `rawPtrStoreAction` on the current memory, completed by
+`finishRawPtrCallAction` (fault, or install the updated memory, write `()` to
+`destination`, and continue at `targetBb`).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1000-L1005>
+
+> "/// Performs a volatile store to the `dst` pointer.
+> ///
+> /// The stabilized version of this intrinsic is [`core::ptr::write_volatile`].
+> #[rustc_intrinsic]
+> #[rustc_nounwind]
+> pub unsafe fn volatile_store<T>(dst: *mut T, val: T);"
+-/
+def evalRawPtrStoreCall
+    (isVolatile requiresAlign : Bool)
+    (s : MachineState)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    MirStepNode :=
+  finishRawPtrCallAction
+    s
+    locals'
+    destination
+    targetBb
+    (rawPtrStoreAction
+      isVolatile
+      requiresAlign
+      s.memory.borrows
+      s.memory.globals
+      s.memory.callStack
+      s.memory.callerLocals
+      s.memory.activeProtectors
+      target
+      bodyLocalDecls
+      bodyLayouts
+      argOps
+      argVals
+      locals')
+
+/--
+Decode the bytes `bytes` at the type `ty` of the aggregate value `oldVal` they
+replace: at the layout-faithful type `resolveFaithfulAggregateTy?` finds for
+`oldVal` (the type `rawPtrEncodeValue?` encodes it at). Returns `.none` for a
+non-aggregate `oldVal`, for an aggregate without a layout-faithful type, and
+for bytes that are not a valid value of that type.
+
+Reference (`core::ptr::copy` documentation, `library/core/src/ptr/mod.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L566-L567>
+
+> "/// The copy is "untyped" in the sense that data may be uninitialized or otherwise violate the
+> /// requirements of `T`. The initialization state is preserved exactly."
+
+Modeling choice: a typed slot holds only valid values of its type, so bytes
+that do not decode make the copy unsupported rather than undefined behavior.
+-/
+def rawPtrDecodeAggregate?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (ty : Ty)
+    (oldVal : Value)
+    (bytes : List AbstractByte) :
+    Option Value :=
+  match oldVal with
+  | .aggregate varIdx fields =>
+    match resolveFaithfulAggregateTy? localDecls layouts ty varIdx fields with
+    | .some resolvedTy =>
+      decodeTypedValueFromBytes defaultCodecFuel layouts resolvedTy bytes
+    | .none => .none
+  | _ => .none
+
+/--
+Compute the `RawPtrCallAction` of `volatile_copy_memory::<T>(dst, src, count)`
+for `byteCount = count * size_of::<T>() > 0` bytes when `src` and `dst` are
+tracked by the Tree Borrows entries `srcEntry` and `dstEntry` of the *same*
+stack local, where the two ranges may overlap.
+
+The source range is resolved for a read and the destination range for a write
+(`resolveRawPtrStackTarget`, each within its entry's target place). The
+local's value is encoded to bytes (`rawPtrEncodeValue?`), the source bytes are
+read first and then written at the destination (`sliceAbstractBytes`,
+`writeAbstractBytesAt`), and the result is decoded at the local's type
+(`rawPtrDecodeAggregate?`); the byte offsets of the two target places within
+the local come from `projectionChainByteOffset?`. The Tree Borrows
+read-then-write transition is `borrowsAfterCopySingleDirect`. Every shape the
+byte codec cannot express (a non-aggregate local, an uninitialized local, an
+unresolved place offset, or bytes that are not a valid value of the local's
+type) is unsupported.
+
+Reference (`core::ptr::copy` documentation, `library/core/src/ptr/mod.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L563-L567>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L575-L581>
+
+> "/// Copying takes place as if the bytes were copied from `src`
+> /// to a temporary array and then copied from the array to `dst`.
+> ///
+> /// The copy is "untyped" in the sense that data may be uninitialized or otherwise violate the
+> /// requirements of `T`. The initialization state is preserved exactly."
+
+> "/// * `src` must be [valid] for reads of `count * size_of::<T>()` bytes or that number must be 0.
+> ///
+> /// * `dst` must be [valid] for writes of `count * size_of::<T>()` bytes or that number must be 0,
+> ///   and `dst` must remain valid even when `src` is read for `count * size_of::<T>()` bytes. (This
+> ///   means if the memory ranges overlap, the `dst` pointer must not be invalidated by `src` reads.)
+> ///
+> /// * Both `src` and `dst` must be properly aligned."
+
+Modeling choice: `volatile_copy_memory` is documented only as the volatile
+`llvm.memmove` (see `evalVolatileCopyMemoryCall`); inside Rust allocations the
+model gives it the semantics of `core::ptr::copy`, the documented `memmove`.
+-/
+def volatileCopyWithinLocalAction
+    (borrows : List BorrowEntry)
+    (callStack : List SavedCallerFrame)
+    (callerLocals : List LocalSlot)
+    (activeProtectors : List Nat)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (locals' : List LocalSlot)
+    (srcPtr dstPtr : ProvenancePtr)
+    (srcEntry dstEntry : BorrowEntry)
+    (byteCount : Nat) :
+    RawPtrCallAction :=
+  match
+    resolveRawPtrStackTarget
+      callStack
+      locals'
+      bodyLocalDecls
+      bodyLayouts
+      srcEntry
+      srcPtr.offsetBytes
+      byteCount
+      false
+  with
+  | .fault kind => .fault kind
+  | .ok targetDecls targetLayouts _ slot =>
+    match
+      resolveRawPtrStackTarget
+        callStack
+        locals'
+        bodyLocalDecls
+        bodyLayouts
+        dstEntry
+        dstPtr.offsetBytes
+        byteCount
+        true
+    with
+    | .fault kind => .fault kind
+    | .ok _ _ _ _ =>
+      match slot, get? targetDecls srcEntry.targetLocal with
+      | .init rootVal, .some rootDecl =>
+        let rootTy := resolveTyWithLocalDecls targetDecls targetLayouts rootDecl.ty
+        match
+          projectionChainByteOffset?
+            targetLayouts
+            (.some rootDecl.ty)
+            (.some rootVal)
+            .none
+            0
+            targetDecls
+            (normalizeSubsliceProjections
+              (stripTransparentProjections srcEntry.targetProjection)),
+          projectionChainByteOffset?
+            targetLayouts
+            (.some rootDecl.ty)
+            (.some rootVal)
+            .none
+            0
+            targetDecls
+            (normalizeSubsliceProjections
+              (stripTransparentProjections dstEntry.targetProjection)),
+          rawPtrEncodeValue? targetDecls targetLayouts rootTy rootVal
+        with
+        | .some srcBase, .some dstBase, .some rootBytes =>
+          match
+            sliceAbstractBytes rootBytes (Nat.add srcBase srcPtr.offsetBytes) byteCount
+          with
+          | .none => .fault .unsupported
+          | .some copied =>
+            match
+              writeAbstractBytesAt rootBytes (Nat.add dstBase dstPtr.offsetBytes) copied
+            with
+            | .none => .fault .unsupported
+            | .some merged =>
+              match rawPtrDecodeAggregate? targetDecls targetLayouts rootTy rootVal merged with
+              | .none => .fault .unsupported
+              | .some rootVal' =>
+                match
+                  borrowsAfterCopySingleDirect
+                    borrows
+                    activeProtectors
+                    srcPtr
+                    dstPtr
+                    srcEntry
+                    dstEntry
+                with
+                | .none => .fault .ub
+                | .some borrows' =>
+                  match
+                    writeFrameLocalSlot
+                      locals'
+                      callStack
+                      callerLocals
+                      dstEntry.targetFrameDepth
+                      dstEntry.targetLocal
+                      (.init rootVal')
+                  with
+                  | .none => .fault .unsupported
+                  | .some (locals₄, callStack', callerLocals') =>
+                    .retStack borrows' locals₄ callStack' callerLocals' .unit
+        | _, _, _ => .fault .unsupported
+      | _, _ => .fault .unsupported
+
+/--
+Plan of a volatile copy call (`volatileCopyPlan`), executed by
+`evalVolatileCopyMemoryCall`:
+- `.fault kind`: the call faults;
+- `.noCopy`: no byte is copied (`count * size_of::<T>() = 0`);
+- `.nonOverlapping srcOp dstOp srcVal dstVal count`: the memory effect of
+  `copy_nonoverlapping::<T>(src, dst, count)` on the source and destination
+  operands and values (in `copy_nonoverlapping`'s order: source first);
+- `.withinLocal srcPtr dstPtr srcEntry dstEntry byteCount`: a possibly
+  overlapping copy of `byteCount` bytes within one stack local.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L969>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L979>
+
+> "pub unsafe fn volatile_copy_nonoverlapping_memory<T>(dst: *mut T, src: *const T, count: usize);"
+
+> "pub unsafe fn volatile_copy_memory<T>(dst: *mut T, src: *const T, count: usize);"
+-/
+inductive VolatileCopyPlan : Type where
+  /-- The call faults with `kind`. -/
+  | fault (kind : FailureKind) : VolatileCopyPlan
+  /-- Zero bytes are copied: memory is unchanged. -/
+  | noCopy : VolatileCopyPlan
+  /-- Copy `count` elements from `srcVal` to `dstVal` as
+  `copy_nonoverlapping(src, dst, count)`. -/
+  | nonOverlapping
+      (srcOp dstOp : Operand)
+      (srcVal dstVal : Value)
+      (count : Nat) :
+      VolatileCopyPlan
+  /-- Copy `byteCount` bytes within one stack local, from the place of
+  `srcEntry` to the place of `dstEntry`. -/
+  | withinLocal
+      (srcPtr dstPtr : ProvenancePtr)
+      (srcEntry dstEntry : BorrowEntry)
+      (byteCount : Nat) :
+      VolatileCopyPlan
+
+/--
+Plan a direct call `volatile_copy_nonoverlapping_memory::<T>(dst, src,
+count)` (`nonOverlapping = true`) or `volatile_copy_memory::<T>(dst, src,
+count)` (`nonOverlapping = false`) as a `VolatileCopyPlan`, which
+`evalVolatileCopyMemoryCall` executes. Both take the destination first: the
+argument order `(dst, src, count)` is the opposite of
+`copy_nonoverlapping(src, dst, count)`.
+
+Checks, in order:
+1. The argument list must be two thin pointers (`rawPtrArgOfValue?`) and a
+   `usize`-width scalar `count`, else `.ub`; `T` must resolve
+   (`resolveRawPtrElemLayout`).
+2. `count * size_of::<T>()` must not exceed `isize::MAX`, else `.ub`.
+3. Both `dst` and `src` must be aligned to `align_of::<T>()`
+   (`rawPtrTargetAligned?`): a misaligned pointer is `.ub` even when no byte is
+   copied, and an undecidable alignment is unsupported.
+4. Zero bytes (`count = 0` or a zero-sized `T`) leave memory unchanged.
+5. Otherwise both pointers must be tracked stack pointers
+   (`classifyRawPtrTarget`). A destination in an immutable global is `.ub`;
+   every other pointer that is not a tracked stack pointer (no provenance, an
+   untracked allocation, or a global) is unsupported, since a volatile copy
+   may access memory outside all Rust allocations.
+6. For tracked stack pointers, the non-overlapping form has the memory effect
+   of `copy_nonoverlapping::<T>(src, dst, count)`
+   (`evalCopyNonOverlappingWithCount`, on the `src` and `dst` operands and
+   values in that order), including its overlap check. The overlapping form
+   has the same effect when `src` and `dst` point into different stack locals
+   (different allocations cannot overlap), and otherwise copies within the
+   local, reading the source bytes first (`volatileCopyWithinLocalAction`).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L956-L979>
+
+> "/// Equivalent to the appropriate `llvm.memcpy.p0i8.0i8.*` intrinsic, with
+> /// a size of `count` * `size_of::<T>()` and an alignment of `align_of::<T>()`.
+> ///
+> /// This intrinsic does not have a stable counterpart.
+> /// # Safety
+> ///
+> /// The safety requirements are consistent with [`copy_nonoverlapping`]
+> /// while the read and write behaviors are volatile,
+> /// which means it will not be optimized out unless `_count` or `size_of::<T>()` is equal to zero.
+> ///
+> /// [`copy_nonoverlapping`]: ptr::copy_nonoverlapping
+> #[rustc_intrinsic]
+> #[rustc_nounwind]
+> pub unsafe fn volatile_copy_nonoverlapping_memory<T>(dst: *mut T, src: *const T, count: usize);
+> /// Equivalent to the appropriate `llvm.memmove.p0i8.0i8.*` intrinsic, with
+> /// a size of `count * size_of::<T>()` and an alignment of `align_of::<T>()`.
+> ///
+> /// The volatile parameter is set to `true`, so it will not be optimized out
+> /// unless size is equal to zero.
+> ///
+> /// This intrinsic does not have a stable counterpart.
+> #[rustc_intrinsic]
+> #[rustc_nounwind]
+> pub unsafe fn volatile_copy_memory<T>(dst: *mut T, src: *const T, count: usize);"
+
+Reference (`core::ptr::copy_nonoverlapping` documentation,
+`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L455-L465>
+
+> "/// Behavior is undefined if any of the following conditions are violated:
+> ///
+> /// * `src` must be [valid] for reads of `count * size_of::<T>()` bytes or that number must be 0.
+> ///
+> /// * `dst` must be [valid] for writes of `count * size_of::<T>()` bytes or that number must be 0.
+> ///
+> /// * Both `src` and `dst` must be properly aligned.
+> ///
+> /// * The region of memory beginning at `src` with a size of `count *
+> ///   size_of::<T>()` bytes must *not* overlap with the region of memory
+> ///   beginning at `dst` with the same size."
+
+Reference (`core::ptr::copy` documentation, `library/core/src/ptr/mod.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L588-L589>
+
+> "/// Note that even if the effectively copied size (`count * size_of::<T>()`) is
+> /// `0`, the pointers must be properly aligned."
+
+Modeling choices and scope:
+- `volatile_copy_nonoverlapping_memory` is documented to have the safety
+  requirements of `copy_nonoverlapping`. `volatile_copy_memory` is documented
+  only as the volatile `llvm.memmove`; the model gives it the requirements of
+  `core::ptr::copy`, the documented `memmove`.
+- The bound `count * size_of::<T>() <= isize::MAX` is checked for every
+  pointer: no Rust allocation is larger, and the model does not execute
+  copies outside Rust allocations.
+- The statement-level `copy_nonoverlapping` semantics steps over a zero-count
+  copy without checks; here the alignment of both pointers is checked first,
+  as documented.
+- Volatile copies are modeled as silent steps; the guarantee that they are not
+  optimized out concerns compilation and is not modeled.
+-/
+def volatileCopyPlan
+    (nonOverlapping : Bool)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (callStack : List SavedCallerFrame)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot) :
+    VolatileCopyPlan :=
+  let ptrBytes := layoutPointerBytes bodyLayouts
+  match argVals with
+  | dstVal :: srcVal :: .scalar countSc :: .nil =>
+    match
+      Nat.beq countSc.sizeBytes ptrBytes,
+      rawPtrArgOfValue? ptrBytes dstVal,
+      rawPtrArgOfValue? ptrBytes srcVal
+    with
+    | true, .some dstArg, .some srcArg =>
+      match resolveRawPtrElemLayout target bodyLocalDecls bodyLayouts argOps with
+      | .fault kind => .fault kind
+      | .ok _ size align =>
+        let byteCount := Nat.mul countSc.bits size
+        match Nat.ble (signedHalfModulus ptrBytes) byteCount with
+        | true => .fault .ub
+        | false =>
+          let dstTgt := classifyRawPtrTarget borrows globals dstArg
+          let srcTgt := classifyRawPtrTarget borrows globals srcArg
+          match
+            rawPtrTargetAligned? callStack locals' bodyLocalDecls bodyLayouts align dstArg dstTgt,
+            rawPtrTargetAligned? callStack locals' bodyLocalDecls bodyLayouts align srcArg srcTgt
+          with
+          | .some false, _ => .fault .ub
+          | _, .some false => .fault .ub
+          | .some true, .some true =>
+            match Nat.beq byteCount 0 with
+            | true => .noCopy
+            | false =>
+              match dstTgt, srcTgt with
+              | .stack dstPtr dstEntry, .stack srcPtr srcEntry =>
+                match argOps with
+                | dstOp :: srcOp :: _ =>
+                  match
+                    Bool.or
+                      nonOverlapping
+                      (Bool.not
+                        (Bool.and
+                          (Nat.beq srcEntry.targetFrameDepth dstEntry.targetFrameDepth)
+                          (Nat.beq srcEntry.targetLocal dstEntry.targetLocal)))
+                  with
+                  | true => .nonOverlapping srcOp dstOp srcVal dstVal countSc.bits
+                  | false => .withinLocal srcPtr dstPtr srcEntry dstEntry byteCount
+                | _ => .fault .unsupported
+              | .global _ dstAlloc, _ =>
+                match mutabilityEq dstAlloc.mutability .not with
+                | true => .fault .ub
+                | false => .fault .unsupported
+              | _, _ => .fault .unsupported
+          | _, _ => .fault .unsupported
+    | _, _, _ => .fault .ub
+  | _ => .fault .ub
+
+/--
+Evaluate a direct call `volatile_copy_nonoverlapping_memory::<T>(dst, src,
+count)` (`nonOverlapping = true`) or `volatile_copy_memory::<T>(dst, src,
+count)` (`nonOverlapping = false`) by executing its `VolatileCopyPlan`
+(`volatileCopyPlan` on the current memory):
+- `.fault`: fault;
+- `.noCopy`: write `()` to `destination` and continue at `targetBb`;
+- `.nonOverlapping`: the statement-level `copy_nonoverlapping` semantics
+  (`evalCopyNonOverlappingWithCount`, with the source operand and value first),
+  then `()` to `destination` (`finishMemIntrinsicCall`);
+- `.withinLocal`: `volatileCopyWithinLocalAction`, completed by
+  `finishRawPtrCallAction`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L969>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L979>
+
+> "pub unsafe fn volatile_copy_nonoverlapping_memory<T>(dst: *mut T, src: *const T, count: usize);"
+
+> "pub unsafe fn volatile_copy_memory<T>(dst: *mut T, src: *const T, count: usize);"
+-/
+def evalVolatileCopyMemoryCall
+    (nonOverlapping : Bool)
+    (s : MachineState)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    MirStepNode :=
+  match
+    volatileCopyPlan
+      nonOverlapping
+      s.memory.borrows
+      s.memory.globals
+      s.memory.callStack
+      target
+      bodyLocalDecls
+      bodyLayouts
+      argOps
+      argVals
+      locals'
+  with
+  | .fault kind => MirStepNode.fail kind
+  | .noCopy => writeIntrinsicReturn s locals' destination targetBb .unit
+  | .nonOverlapping srcOp dstOp srcVal dstVal count =>
+    finishMemIntrinsicCall
+      s
+      (evalCopyNonOverlappingWithCount
+        s
+        srcOp
+        dstOp
+        bodyLocalDecls
+        bodyLayouts
+        srcVal
+        dstVal
+        count
+        locals')
+      destination
+      targetBb
+  | .withinLocal srcPtr dstPtr srcEntry dstEntry byteCount =>
+    finishRawPtrCallAction
+      s
+      locals'
+      destination
+      targetBb
+      (volatileCopyWithinLocalAction
+        s.memory.borrows
+        s.memory.callStack
+        s.memory.callerLocals
+        s.memory.activeProtectors
+        bodyLocalDecls
+        bodyLayouts
+        locals'
+        srcPtr
+        dstPtr
+        srcEntry
+        dstEntry
+        byteCount)
+
+/--
+Plan of a `volatile_set_memory` call (`volatileSetPlan`), executed by
+`evalVolatileSetMemoryCall`: a fault (`.fault kind`), no memory effect
+(`.noWrite`, when `count * size_of::<T>() = 0`), or the memory effect of
+`write_bytes::<T>(dst, val, count)` through a tracked stack pointer
+(`.writeBytes`).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L986-L992>
+
+> "/// The safety requirements are consistent with [`write_bytes`] while the write behavior is volatile,
+> /// which means it will not be optimized out unless `_count` or `size_of::<T>()` is equal to zero.
+> ///
+> /// [`write_bytes`]: ptr::write_bytes
+> #[rustc_intrinsic]
+> #[rustc_nounwind]
+> pub unsafe fn volatile_set_memory<T>(dst: *mut T, val: u8, count: usize);"
+-/
+inductive VolatileSetPlan : Type where
+  /-- The call faults with `kind`. -/
+  | fault (kind : FailureKind) : VolatileSetPlan
+  /-- Zero bytes are written: memory is unchanged. -/
+  | noWrite : VolatileSetPlan
+  /-- The memory effect of `write_bytes::<T>(dst, val, count)`. -/
+  | writeBytes : VolatileSetPlan
+
+/--
+Plan a direct call `volatile_set_memory::<T>(dst, val, count)` as a
+`VolatileSetPlan`, which `evalVolatileSetMemoryCall` executes.
+
+Checks, in order:
+1. The argument list must be a thin pointer (`rawPtrArgOfValue?`), a `u8`
+   scalar `val`, and a `usize`-width scalar `count`, else `.ub`; `T` must
+   resolve (`resolveRawPtrElemLayout`).
+2. `count * size_of::<T>()` must not exceed `isize::MAX`, else `.ub`.
+3. `dst` must be aligned to `align_of::<T>()` (`rawPtrTargetAligned?`): a
+   misaligned pointer is `.ub` even when no byte is written, and an undecidable
+   alignment is unsupported.
+4. Zero bytes (`count = 0` or a zero-sized `T`) leave memory unchanged.
+5. Otherwise, by `classifyRawPtrTarget`: a tracked stack pointer has the
+   memory effect of `write_bytes::<T>(dst, val, count)` (`evalWriteBytesCall`);
+   a destination in an immutable global is `.ub`; every other pointer (no
+   provenance, an untracked allocation, or a mutable global) is unsupported,
+   since a volatile store may access memory outside all Rust allocations.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L980-L992>
+
+> "/// Equivalent to the appropriate `llvm.memset.p0i8.*` intrinsic, with a
+> /// size of `count * size_of::<T>()` and an alignment of `align_of::<T>()`.
+> ///
+> /// This intrinsic does not have a stable counterpart.
+> /// # Safety
+> ///
+> /// The safety requirements are consistent with [`write_bytes`] while the write behavior is volatile,
+> /// which means it will not be optimized out unless `_count` or `size_of::<T>()` is equal to zero.
+> ///
+> /// [`write_bytes`]: ptr::write_bytes
+> #[rustc_intrinsic]
+> #[rustc_nounwind]
+> pub unsafe fn volatile_set_memory<T>(dst: *mut T, val: u8, count: usize);"
+
+Reference (`core::ptr::write_bytes` documentation, `library/core/src/ptr/mod.rs`
+at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L656-L663>
+
+> "/// Behavior is undefined if any of the following conditions are violated:
+> ///
+> /// * `dst` must be [valid] for writes of `count * size_of::<T>()` bytes.
+> ///
+> /// * `dst` must be properly aligned.
+> ///
+> /// Note that even if the effectively copied size (`count * size_of::<T>()`) is
+> /// `0`, the pointer must be properly aligned."
+
+Modeling choices and scope:
+- A zero-byte volatile set is a no-op for every aligned pointer, including a
+  pointer without provenance; `evalWriteBytesCall` is consulted only for a
+  non-zero byte count through a tracked stack pointer, where it applies the
+  `write_bytes` checks of `writeBytesAction`.
+- Volatile stores are modeled as silent steps; the guarantee that they are not
+  optimized out concerns compilation and is not modeled.
+-/
+def volatileSetPlan
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (callStack : List SavedCallerFrame)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot) :
+    VolatileSetPlan :=
+  let ptrBytes := layoutPointerBytes bodyLayouts
+  match argVals with
+  | dstVal :: .scalar valSc :: .scalar countSc :: .nil =>
+    match
+      Bool.and (Nat.beq valSc.sizeBytes 1)
+        (Bool.and (Nat.blt valSc.bits 256) (Nat.beq countSc.sizeBytes ptrBytes)),
+      rawPtrArgOfValue? ptrBytes dstVal
+    with
+    | true, .some dstArg =>
+      match resolveRawPtrElemLayout target bodyLocalDecls bodyLayouts argOps with
+      | .fault kind => .fault kind
+      | .ok _ size align =>
+        let byteCount := Nat.mul countSc.bits size
+        match Nat.ble (signedHalfModulus ptrBytes) byteCount with
+        | true => .fault .ub
+        | false =>
+          let dstTgt := classifyRawPtrTarget borrows globals dstArg
+          match
+            rawPtrTargetAligned? callStack locals' bodyLocalDecls bodyLayouts align dstArg dstTgt
+          with
+          | .some false => .fault .ub
+          | .none => .fault .unsupported
+          | .some true =>
+            match Nat.beq byteCount 0 with
+            | true => .noWrite
+            | false =>
+              match dstTgt with
+              | .stack _ _ => .writeBytes
+              | .global _ dstAlloc =>
+                match mutabilityEq dstAlloc.mutability .not with
+                | true => .fault .ub
+                | false => .fault .unsupported
+              | .outside => .fault .unsupported
+              | .untracked => .fault .unsupported
+    | _, _ => .fault .ub
+  | _ => .fault .ub
+
+/--
+Evaluate a direct call `volatile_set_memory::<T>(dst, val, count)` by executing
+its `VolatileSetPlan` (`volatileSetPlan` on the current memory): fault, write
+`()` to `destination` without a memory effect, or evaluate the call as
+`write_bytes::<T>(dst, val, count)` (`evalWriteBytesCall`).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L986-L992>
+
+> "/// The safety requirements are consistent with [`write_bytes`] while the write behavior is volatile,
+> /// which means it will not be optimized out unless `_count` or `size_of::<T>()` is equal to zero.
+> ///
+> /// [`write_bytes`]: ptr::write_bytes
+> #[rustc_intrinsic]
+> #[rustc_nounwind]
+> pub unsafe fn volatile_set_memory<T>(dst: *mut T, val: u8, count: usize);"
+-/
+def evalVolatileSetMemoryCall
+    (s : MachineState)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    MirStepNode :=
+  match
+    volatileSetPlan
+      s.memory.borrows
+      s.memory.globals
+      s.memory.callStack
+      target
+      bodyLocalDecls
+      bodyLayouts
+      argOps
+      argVals
+      locals'
+  with
+  | .fault kind => MirStepNode.fail kind
+  | .noWrite => writeIntrinsicReturn s locals' destination targetBb .unit
+  | .writeBytes =>
+    evalWriteBytesCall
+      s
+      target
+      bodyLocalDecls
+      bodyLayouts
+      argOps
+      argVals
+      locals'
+      destination
+      targetBb
+
+/--
+Test whether `kind` is one of the seven volatile memory intrinsics
+(`core::intrinsics::{unaligned_volatile_load, unaligned_volatile_store,
+volatile_load, volatile_store, volatile_copy_nonoverlapping_memory,
+volatile_copy_memory, volatile_set_memory}`), which
+`evalDirectRustIntrinsic?` dispatches to `evalVolatileMemIntrinsicCall`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L26-L31>
+
+> "//! # Volatiles
+> //!
+> //! The volatile intrinsics provide operations intended to act on I/O
+> //! memory, which are guaranteed to not be reordered by the compiler
+> //! across other volatile intrinsics. See [`read_volatile`][ptr::read_volatile]
+> //! and [`write_volatile`][ptr::write_volatile]."
+-/
+@[reducible]
+def isVolatileMemIntrinsicKind : RustIntrinsicKind → Bool
+  | .unalignedVolatileLoad => true
+  | .unalignedVolatileStore => true
+  | .volatileLoad => true
+  | .volatileStore => true
+  | .volatileCopyNonOverlappingMemory => true
+  | .volatileCopyMemory => true
+  | .volatileSetMemory => true
+  | _ => false
+
+/--
+Evaluate a direct call to the volatile memory intrinsic `kind`
+(`isVolatileMemIntrinsicKind kind = true`) on evaluated arguments:
+- `unaligned_volatile_load` / `volatile_load`: `evalRawPtrLoadCall`, volatile,
+  with required alignment `1` / `align_of::<T>()`;
+- `unaligned_volatile_store` / `volatile_store`: `evalRawPtrStoreCall`,
+  volatile, with required alignment `1` / `align_of::<T>()`;
+- `volatile_copy_nonoverlapping_memory` / `volatile_copy_memory`:
+  `evalVolatileCopyMemoryCall`, non-overlapping / possibly overlapping;
+- `volatile_set_memory`: `evalVolatileSetMemoryCall`.
+
+Every other `kind` is `MirStepNode.unsupported`; `evalDirectRustIntrinsic?`
+never passes one.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L956-L1022>
+
+> "pub unsafe fn volatile_copy_nonoverlapping_memory<T>(dst: *mut T, src: *const T, count: usize);"
+
+> "pub unsafe fn volatile_copy_memory<T>(dst: *mut T, src: *const T, count: usize);"
+
+> "pub unsafe fn volatile_set_memory<T>(dst: *mut T, val: u8, count: usize);"
+
+> "pub unsafe fn volatile_load<T>(src: *const T) -> T;"
+
+> "pub unsafe fn volatile_store<T>(dst: *mut T, val: T);"
+
+> "/// Performs a volatile load from the `src` pointer
+> /// The pointer is not required to be aligned."
+
+> "/// Performs a volatile store to the `dst` pointer.
+> /// The pointer is not required to be aligned."
+-/
+@[reducible]
+def evalVolatileMemIntrinsicCall
+    (kind : RustIntrinsicKind)
+    (s : MachineState)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    MirStepNode :=
+  match kind with
+  | .unalignedVolatileLoad =>
+    evalRawPtrLoadCall true false s target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb
+  | .unalignedVolatileStore =>
+    evalRawPtrStoreCall true false s target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb
+  | .volatileLoad =>
+    evalRawPtrLoadCall true true s target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb
+  | .volatileStore =>
+    evalRawPtrStoreCall true true s target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb
+  | .volatileCopyNonOverlappingMemory =>
+    evalVolatileCopyMemoryCall true s target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb
+  | .volatileCopyMemory =>
+    evalVolatileCopyMemoryCall false s target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb
+  | .volatileSetMemory =>
+    evalVolatileSetMemoryCall s target bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb
+  | _ => MirStepNode.unsupported
+
+/--
+Evaluate a direct (`target.isIndirect = false`) call to one of the four
+`core::ptr` raw-pointer access functions when no body for it is linked in
+`Memory.callees`: `core::ptr::read_unaligned` and `core::ptr::write_unaligned`
+(non-volatile, alignment `1`), and `core::ptr::read_volatile` and
+`core::ptr::write_volatile` (volatile, alignment `align_of::<T>()`), with the
+semantics of `evalRawPtrLoadCall` and `evalRawPtrStoreCall`. Returns `.none`
+for every other `DefPath`, so the call remains an external call.
+
+When a body is linked, `evalTerminator` executes it instead (`lookupCallee`
+takes precedence): `read_volatile` and `write_volatile` call the
+`volatile_load` and `volatile_store` intrinsics, and `read_unaligned` and
+`write_unaligned` copy bytes with `copy_nonoverlapping`.
+
+Reference (`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L1812-L1824>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L2014-L2023>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L2111-L2124>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L2213-L2226>
+
+> "pub const unsafe fn read_unaligned<T>(src: *const T) -> T {
+>     let mut tmp = MaybeUninit::<T>::uninit();
+>     // SAFETY: the caller must guarantee that `src` is valid for reads.
+>     // `src` cannot overlap `tmp` because `tmp` was just allocated on
+>     // the stack as a separate allocation.
+>     //
+>     // Also, since we just wrote a valid value into `tmp`, it is guaranteed
+>     // to be properly initialized.
+>     unsafe {
+>         copy_nonoverlapping(src as *const u8, tmp.as_mut_ptr() as *mut u8, size_of::<T>());
+>         tmp.assume_init()
+>     }
+> }"
+
+> "pub const unsafe fn write_unaligned<T>(dst: *mut T, src: T) {
+>     // SAFETY: the caller must guarantee that `dst` is valid for writes.
+>     // `dst` cannot overlap `src` because the caller has mutable access
+>     // to `dst` while `src` is owned by this function.
+>     unsafe {
+>         copy_nonoverlapping((&raw const src) as *const u8, dst as *mut u8, size_of::<T>());
+>         // We are calling the intrinsic directly to avoid function calls in the generated code.
+>         intrinsics::forget(src);
+>     }
+> }"
+
+> "pub unsafe fn read_volatile<T>(src: *const T) -> T {
+>     // SAFETY: the caller must uphold the safety contract for `volatile_load`.
+>     unsafe {
+>         ub_checks::assert_unsafe_precondition!(
+>             check_language_ub,
+>             "ptr::read_volatile requires that the pointer argument is aligned",
+>             (
+>                 addr: *const () = src as *const (),
+>                 align: usize = align_of::<T>(),
+>             ) => ub_checks::maybe_is_aligned(addr, align)
+>         );
+>         intrinsics::volatile_load(src)
+>     }
+> }"
+
+> "pub unsafe fn write_volatile<T>(dst: *mut T, src: T) {
+>     // SAFETY: the caller must uphold the safety contract for `volatile_store`.
+>     unsafe {
+>         ub_checks::assert_unsafe_precondition!(
+>             check_language_ub,
+>             "ptr::write_volatile requires that the pointer argument is aligned",
+>             (
+>                 addr: *mut () = dst as *mut (),
+>                 align: usize = align_of::<T>(),
+>             ) => ub_checks::maybe_is_aligned(addr, align)
+>         );
+>         intrinsics::volatile_store(dst, src);
+>     }
+> }"
+
+Modeling choice: only the canonical `core::ptr::*` paths are recognized
+(`rustc` prints a re-exported `std::ptr::*` item by its defining crate's
+path). These functions are ordinary Rust functions, not intrinsics, so they are
+not `RustIntrinsicKind`s; modeling an unlinked call by the function's
+documented contract replaces an unconstrained external call.
+-/
+@[reducible]
+def evalUnlinkedPtrAccessCall?
+    (s : MachineState)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    Option MirStepNode :=
+  match stringEq target.defPath "core::ptr::read_unaligned" with
+  | true =>
+    .some
+      (evalRawPtrLoadCall false false s target bodyLocalDecls bodyLayouts argOps argVals
+        locals' destination targetBb)
+  | false =>
+    match stringEq target.defPath "core::ptr::write_unaligned" with
+    | true =>
+      .some
+        (evalRawPtrStoreCall false false s target bodyLocalDecls bodyLayouts argOps argVals
+          locals' destination targetBb)
+    | false =>
+      match stringEq target.defPath "core::ptr::read_volatile" with
+      | true =>
+        .some
+          (evalRawPtrLoadCall true true s target bodyLocalDecls bodyLayouts argOps argVals
+            locals' destination targetBb)
+      | false =>
+        match stringEq target.defPath "core::ptr::write_volatile" with
+        | true =>
+          .some
+            (evalRawPtrStoreCall true true s target bodyLocalDecls bodyLayouts argOps argVals
+              locals' destination targetBb)
+        | false => .none
+
+/--
+Evaluate a value-returning `RustIntrinsicKind` (all variants except
+`.constEvalSelect` and the memory intrinsics `.copyNonOverlapping`,
+`.writeBytes`, and the seven volatile memory intrinsics of
+`isVolatileMemIntrinsicKind`) from evaluated argument values `argVals`.
+
+`evalDirectRustIntrinsic?` dispatches the call-form memory intrinsics
+`.copyNonOverlapping` and `.writeBytes` to `evalCopyNonOverlappingCall` and
+`evalWriteBytesCall`, and the volatile memory intrinsics to
+`evalVolatileMemIntrinsicCall`, before reaching this function. The memory
+intrinsics reach it only as the runtime function of
+`core::intrinsics::const_eval_select`, where their memory effect is not modeled
+and the call is `MirStepNode.unsupported` (fail closed). Captured MIR never
+contains such a call: `rustc` replaces every `const_eval_select` call with a
+direct call to its runtime function before `optimized_mir`
+(`withConstEvalSelectIntrinsicTypeArgs`).
+
+Malformed argument lists and values fault with `.ub`. An intrinsic whose result
+depends on the signedness of an integer type parameter steps to
+`MirStepNode.unsupported` when `resolveIntrinsicIsSigned` or
+`resolveIntrinsicShiftSigned` cannot determine it, rather than assuming an
+unsigned type.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1-L80>
 
 > "Compiler intrinsics."
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, the volatile intrinsics):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L26-L31>
+
+> "//! # Volatiles
+> //!
+> //! The volatile intrinsics provide operations intended to act on I/O
+> //! memory, which are guaranteed to not be reordered by the compiler
+> //! across other volatile intrinsics. See [`read_volatile`][ptr::read_volatile]
+> //! and [`write_volatile`][ptr::write_volatile]."
+-/
+@[reducible]
+def evalNonSelectIntrinsicCall
+    (kind : RustIntrinsicKind)
+    (s : MachineState)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    MirStepNode :=
+  match kind with
+  | .ubChecks =>
+    match argVals with
+    | .nil => writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨1, 1⟩)
+    | _ => MirStepNode.fail .ub
+  | .arithOffset =>
+    match argVals with
+    | .ptr ptrVal ptrSz :: .scalar countSc :: .nil =>
+      match Nat.beq ptrSz 8 with
+      | false => MirStepNode.fail .ub
+      | true =>
+        match resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
+        | .some pointeeTy =>
+          match intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts pointeeTy with
+          | .some elemSz =>
+            match evalArithOffset ptrVal ptrSz countSc elemSz with
+            | .some retPtrVal =>
+              writeIntrinsicReturn s locals' destination targetBb (.ptr retPtrVal 8)
+            | .none => MirStepNode.fail .ub
+          | .none => intrinsicUnresolvedLayoutStep pointeeTy
+        | .none => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
+    | _ => MirStepNode.fail .ub
+  | .ctlz =>
+    match argVals with
+    | .scalar sc :: .nil =>
+      writeIntrinsicScalarResult s locals' destination targetBb (evalCtlz sc)
+    | _ => MirStepNode.fail .ub
+  | .ctlzNonzero =>
+    match argVals with
+    | .scalar sc :: .nil =>
+      writeIntrinsicScalarResult s locals' destination targetBb (evalCtlzNonzero sc)
+    | _ => MirStepNode.fail .ub
+  | .cttz =>
+    match argVals with
+    | .scalar sc :: .nil =>
+      writeIntrinsicScalarResult s locals' destination targetBb (evalCttz sc)
+    | _ => MirStepNode.fail .ub
+  | .cttzNonzero =>
+    match argVals with
+    | .scalar sc :: .nil =>
+      writeIntrinsicScalarResult s locals' destination targetBb (evalCttzNonzero sc)
+    | _ => MirStepNode.fail .ub
+  | .ctpop =>
+    match argVals with
+    | .scalar sc :: .nil =>
+      writeIntrinsicScalarResult s locals' destination targetBb (evalCtpop sc)
+    | _ => MirStepNode.fail .ub
+  | .bswap =>
+    match argVals with
+    | .scalar sc :: .nil =>
+      writeIntrinsicScalarResult s locals' destination targetBb (evalBswap sc)
+    | _ => MirStepNode.fail .ub
+  | .bitreverse =>
+    match argVals with
+    | .scalar sc :: .nil =>
+      writeIntrinsicScalarResult s locals' destination targetBb (evalBitreverse sc)
+    | _ => MirStepNode.fail .ub
+  | .wrappingAdd =>
+    match argVals with
+    | .scalar lhs :: .scalar rhs :: .nil =>
+      writeIntrinsicScalarResult s locals' destination targetBb (evalWrappingAdd lhs rhs)
+    | _ => MirStepNode.fail .ub
+  | .wrappingSub =>
+    match argVals with
+    | .scalar lhs :: .scalar rhs :: .nil =>
+      writeIntrinsicScalarResult s locals' destination targetBb (evalWrappingSub lhs rhs)
+    | _ => MirStepNode.fail .ub
+  | .wrappingMul =>
+    match argVals with
+    | .scalar lhs :: .scalar rhs :: .nil =>
+      writeIntrinsicScalarResult s locals' destination targetBb (evalWrappingMul lhs rhs)
+    | _ => MirStepNode.fail .ub
+  | .saturatingAdd =>
+    match argVals with
+    | .scalar lhs :: .scalar rhs :: .nil =>
+      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
+      | .some isSigned =>
+        writeIntrinsicScalarResult s locals' destination targetBb
+          (evalSaturatingAdd lhs rhs isSigned)
+      | .none => MirStepNode.unsupported
+    | _ => MirStepNode.fail .ub
+  | .saturatingSub =>
+    match argVals with
+    | .scalar lhs :: .scalar rhs :: .nil =>
+      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
+      | .some isSigned =>
+        writeIntrinsicScalarResult s locals' destination targetBb
+          (evalSaturatingSub lhs rhs isSigned)
+      | .none => MirStepNode.unsupported
+    | _ => MirStepNode.fail .ub
+  | .uncheckedShl =>
+    match argVals with
+    | .scalar lhs :: .scalar rhs :: .nil =>
+      match resolveIntrinsicShiftSigned target bodyLocalDecls bodyLayouts argOps with
+      | .some rhsSigned =>
+        writeIntrinsicScalarResult s locals' destination targetBb
+          (evalUncheckedShl lhs rhs rhsSigned)
+      | .none => MirStepNode.unsupported
+    | _ => MirStepNode.fail .ub
+  | .uncheckedShr =>
+    match argVals with
+    | .scalar lhs :: .scalar rhs :: .nil =>
+      match
+        resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps (sameRhsTy := false),
+        resolveIntrinsicShiftSigned target bodyLocalDecls bodyLayouts argOps
+      with
+      | .some lhsSigned, .some rhsSigned =>
+        writeIntrinsicScalarResult s locals' destination targetBb
+          (evalUncheckedShr lhs rhs lhsSigned rhsSigned)
+      | _, _ => MirStepNode.unsupported
+    | _ => MirStepNode.fail .ub
+  | .uncheckedAdd =>
+    match argVals with
+    | .scalar lhs :: .scalar rhs :: .nil =>
+      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
+      | .some isSigned =>
+        writeIntrinsicScalarResult s locals' destination targetBb
+          (evalUncheckedAdd lhs rhs isSigned)
+      | .none => MirStepNode.unsupported
+    | _ => MirStepNode.fail .ub
+  | .uncheckedSub =>
+    match argVals with
+    | .scalar lhs :: .scalar rhs :: .nil =>
+      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
+      | .some isSigned =>
+        writeIntrinsicScalarResult s locals' destination targetBb
+          (evalUncheckedSub lhs rhs isSigned)
+      | .none => MirStepNode.unsupported
+    | _ => MirStepNode.fail .ub
+  | .uncheckedMul =>
+    match argVals with
+    | .scalar lhs :: .scalar rhs :: .nil =>
+      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
+      | .some isSigned =>
+        writeIntrinsicScalarResult s locals' destination targetBb
+          (evalUncheckedMul lhs rhs isSigned)
+      | .none => MirStepNode.unsupported
+    | _ => MirStepNode.fail .ub
+  | .uncheckedDiv =>
+    match argVals with
+    | .scalar lhs :: .scalar rhs :: .nil =>
+      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
+      | .some isSigned =>
+        writeIntrinsicScalarResult s locals' destination targetBb
+          (evalUncheckedDiv lhs rhs isSigned)
+      | .none => MirStepNode.unsupported
+    | _ => MirStepNode.fail .ub
+  | .uncheckedRem =>
+    match argVals with
+    | .scalar lhs :: .scalar rhs :: .nil =>
+      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
+      | .some isSigned =>
+        writeIntrinsicScalarResult s locals' destination targetBb
+          (evalUncheckedRem lhs rhs isSigned)
+      | .none => MirStepNode.unsupported
+    | _ => MirStepNode.fail .ub
+  | .threeWayCompare =>
+    match argVals with
+    | .scalar lhs :: .scalar rhs :: .nil =>
+      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps (allowChar := true) with
+      | .some isSigned =>
+        writeIntrinsicScalarResult s locals' destination targetBb
+          (evalThreeWayCompare lhs rhs isSigned)
+      | .none => MirStepNode.unsupported
+    | _ => MirStepNode.fail .ub
+  | .sizeOfVal =>
+    match argVals with
+    | ptrArgVal :: .nil =>
+      match resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
+      | .some (.slice elemTy) =>
+        match ptrArgVal with
+        | .aggregate 0 (.ptr _ ptrSz :: .scalar lenSc :: .nil) =>
+          match Nat.beq ptrSz 8 with
+          | false => MirStepNode.fail .ub
+          | true =>
+            match intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts elemTy with
+            | .some elemSz =>
+              writeIntrinsicScalarResult s locals' destination targetBb
+                (evalSliceSizeOfVal elemSz lenSc)
+            | .none => intrinsicUnresolvedLayoutStep elemTy
+        | _ => MirStepNode.fail .ub
+      | .some .str =>
+        match ptrArgVal with
+        | .aggregate 0 (.ptr _ ptrSz :: .scalar lenSc :: .nil) =>
+          match Nat.beq ptrSz 8 with
+          | false => MirStepNode.fail .ub
+          | true =>
+            writeIntrinsicScalarResult s locals' destination targetBb
+              (evalSliceSizeOfVal 1 lenSc)
+        | _ => MirStepNode.fail .ub
+      -- The size of a `dyn Trait` value is read from its vtable, which the
+      -- model does not track; malformed non-wide pointers still fault with `.ub`.
+      | .some (.dynamic _) =>
+        match ptrArgVal with
+        | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
+          match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
+          | false => MirStepNode.fail .ub
+          | true => MirStepNode.unsupported
+        | _ => MirStepNode.fail .ub
+      | .some pointeeTy =>
+        match ptrArgVal with
+        | .ptr _ ptrSz =>
+          match Nat.beq ptrSz 8 with
+          | false => MirStepNode.fail .ub
+          | true =>
+            match intrinsicTailIsExtern 8 pointeeTy with
+            | true => MirStepNode.unsupported
+            | false =>
+              match intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts pointeeTy with
+              | .some sz =>
+                match Nat.ble (signedHalfModulus 8) sz with
+                | true => MirStepNode.fail .ub
+                | false =>
+                  writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨sz, 8⟩)
+              | .none => intrinsicUnresolvedLayoutStep pointeeTy
+        | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
+          match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
+          | false => MirStepNode.fail .ub
+          | true => intrinsicWidePointeeStep pointeeTy
+        | _ => MirStepNode.fail .ub
+      | .none =>
+        match isValidIntrinsicPtrArgVal ptrArgVal with
+        | false => MirStepNode.fail .ub
+        | true => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
+    | _ => MirStepNode.fail .ub
+  | .alignOfVal =>
+    match argVals with
+    | ptrArgVal :: .nil =>
+      match resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
+      -- `align_of_val` has the same safety conditions as `size_of_val`: the
+      -- slice's total size must fit in `isize` even though only the element
+      -- alignment is returned.
+      | .some (.slice elemTy) =>
+        match ptrArgVal with
+        | .aggregate 0 (.ptr _ ptrSz :: .scalar lenSc :: .nil) =>
+          match Nat.beq ptrSz 8 with
+          | false => MirStepNode.fail .ub
+          | true =>
+            match
+              intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts elemTy,
+              intrinsicRigidTyAlign bodyLocalDecls bodyLayouts elemTy
+            with
+            | .some elemSz, .some alignBytes =>
+              match evalSliceSizeOfVal elemSz lenSc with
+              | .some _ =>
+                writeIntrinsicReturn s locals' destination targetBb
+                  (.scalar ⟨alignBytes, 8⟩)
+              | .none => MirStepNode.fail .ub
+            | _, _ => intrinsicUnresolvedLayoutStep elemTy
+        | _ => MirStepNode.fail .ub
+      | .some .str =>
+        match ptrArgVal with
+        | .aggregate 0 (.ptr _ ptrSz :: .scalar lenSc :: .nil) =>
+          match Nat.beq ptrSz 8 with
+          | false => MirStepNode.fail .ub
+          | true =>
+            match evalSliceSizeOfVal 1 lenSc with
+            | .some _ =>
+              writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨1, 8⟩)
+            | .none => MirStepNode.fail .ub
+        | _ => MirStepNode.fail .ub
+      -- The alignment of a `dyn Trait` value is read from its vtable, which the
+      -- model does not track; malformed non-wide pointers still fault with `.ub`.
+      | .some (.dynamic _) =>
+        match ptrArgVal with
+        | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
+          match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
+          | false => MirStepNode.fail .ub
+          | true => MirStepNode.unsupported
+        | _ => MirStepNode.fail .ub
+      | .some pointeeTy =>
+        match ptrArgVal with
+        | .ptr _ ptrSz =>
+          match Nat.beq ptrSz 8 with
+          | false => MirStepNode.fail .ub
+          | true =>
+            match intrinsicTailIsExtern 8 pointeeTy with
+            | true => MirStepNode.unsupported
+            | false =>
+              match intrinsicRigidTyAlign bodyLocalDecls bodyLayouts pointeeTy with
+              | .some alignBytes =>
+                writeIntrinsicReturn s locals' destination targetBb
+                  (.scalar ⟨alignBytes, 8⟩)
+              | .none => intrinsicUnresolvedLayoutStep pointeeTy
+        | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
+          match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
+          | false => MirStepNode.fail .ub
+          | true => intrinsicWidePointeeStep pointeeTy
+        | _ => MirStepNode.fail .ub
+      | .none =>
+        match isValidIntrinsicPtrArgVal ptrArgVal with
+        | false => MirStepNode.fail .ub
+        | true => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
+    | _ => MirStepNode.fail .ub
+  | .copyNonOverlapping => MirStepNode.unsupported
+  | .writeBytes => MirStepNode.unsupported
+  | .unalignedVolatileLoad => MirStepNode.unsupported
+  | .unalignedVolatileStore => MirStepNode.unsupported
+  | .volatileLoad => MirStepNode.unsupported
+  | .volatileStore => MirStepNode.unsupported
+  | .volatileCopyNonOverlappingMemory => MirStepNode.unsupported
+  | .volatileCopyMemory => MirStepNode.unsupported
+  | .volatileSetMemory => MirStepNode.unsupported
+  | .constEvalSelect => MirStepNode.fail .ub
+
+/--
+Test whether `kind` is parameterized by the pointee type `T` of its first
+pointer argument (`arith_offset<T>`, `size_of_val<T>`, `align_of_val<T>`)
+rather than by the value type of its first argument.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L899-L916>
+
+> "pub const unsafe fn arith_offset<T>(dst: *const T, offset: isize) -> *const T;"
+-/
+@[reducible]
+def isPtrPointeeIntrinsicKind : RustIntrinsicKind → Bool
+  | .arithOffset => true
+  | .sizeOfVal => true
+  | .alignOfVal => true
+  | _ => false
+
+/--
+Supply type arguments for a runtime intrinsic target `rtTarget` of
+`const_eval_select` whose callee constant carries none (`rtTarget.typeArgs =
+[]`), using the element types `elemTys` of `const_eval_select`'s first type
+argument `ARG = .tuple elemTys`:
+- for `arith_offset`, `size_of_val`, and `align_of_val` (`isPtrPointee = true`),
+  the pointee `T` of the first element `*const T`, `*mut T`, or `&T`;
+- for the value intrinsics (`isPtrPointee = false`), `elemTys` itself.
+
+The bound `G: FnOnce<ARG, Output = RET>` makes `ARG` the tuple of the parameter
+types of `called_at_rt`. Each value intrinsic modeled here is generic exactly
+over the types of its leading parameters, in order (`T` of `exact_div(x: T, y:
+T)`, `T` and `U` of `unchecked_shl(x: T, y: U)`), and each pointer intrinsic is
+generic only over the pointee of its first parameter (`T` of
+`arith_offset(dst: *const T, offset: isize)`). These element types are
+therefore the instantiation that `rtTarget` omits; trailing extras, such as the
+second `T` of `exact_div`, are ignored by `resolveIntrinsicIsSigned`. Captured
+MIR always carries a callee's generic arguments, and `rustc` replaces every
+`const_eval_select` call with a direct call to `called_at_rt` before
+`optimized_mir` (`remap_mir_for_const_eval_select` in `inner_optimized_mir`), so
+this fallback only affects hand-built MIR.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2400-L2408>
+
+> "#[rustc_intrinsic]
+> pub const fn const_eval_select<ARG: Tuple, F, G, RET>(
+>     _arg: ARG,
+>     _called_in_const: F,
+>     _called_at_rt: G,
+> ) -> RET
+> where
+>     G: FnOnce<ARG, Output = RET>,
+>     F: const FnOnce<ARG, Output = RET>;"
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1962-L1971>
+
+> "pub const unsafe fn unchecked_shl<T: Copy, U: Copy>(x: T, y: U) -> T;"
+
+Reference (`compiler/rustc_mir_transform/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_mir_transform/src/lib.rs#L798-L799>
+
+> "    let body = tcx.mir_drops_elaborated_and_const_checked(did).steal();
+>     let mut body = remap_mir_for_const_eval_select(tcx, body, hir::Constness::NotConst);"
+-/
+@[reducible]
+def withConstEvalSelectIntrinsicTypeArgs
+    (rtTarget : ResolvedCallTarget)
+    (tupleTyOpt : Option RigidTy)
+    (isPtrPointee : Bool) :
+    ResolvedCallTarget :=
+  match rtTarget.typeArgs with
+  | _ :: _ => rtTarget
+  | .nil =>
+    match tupleTyOpt with
+    | .some (.tuple elemTys) =>
+      match isPtrPointee with
+      | false => { rtTarget with typeArgs := elemTys }
+      | true =>
+        match elemTys with
+        | .rawPtr _ pointeeTy :: _ => { rtTarget with typeArgs := pointeeTy :: .nil }
+        | .ref _ pointeeTy :: _ => { rtTarget with typeArgs := pointeeTy :: .nil }
+        | _ => rtTarget
+    | _ => rtTarget
+
+/--
+Construct synthetic zero-sized constant `Operand`s carrying the element types
+`elemTys` of a `const_eval_select` argument tuple `ARG = .tuple elemTys`.
+
+These operands exist only so that `operandTy` can type the runtime target's
+arguments during signedness and pointee resolution in
+`evalNonSelectIntrinsicCall`. They are never evaluated, and their `.zeroSized`
+values and `layoutIdx := 0` do not describe the runtime arguments, which come
+from the unpacked tuple value.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2400-L2408>
+
+> "#[rustc_intrinsic]
+> pub const fn const_eval_select<ARG: Tuple, F, G, RET>(
+>     _arg: ARG,
+>     _called_in_const: F,
+>     _called_at_rt: G,
+> ) -> RET"
+-/
+@[reducible]
+def rigidTysToZeroSizedOps : List RigidTy → List Operand
+  | .nil => .nil
+  | ty :: rest =>
+    .constant { ty := { kind := ty, layoutIdx := 0 }, val := .zeroSized } ::
+      rigidTysToZeroSizedOps rest
+
+/--
+Extract synthetic argument `Operand`s from `const_eval_select`'s first type
+argument `tupleTyOpt` (`ARG = .tuple elemTys`), or `.nil` when `tupleTyOpt` is
+absent. Passing these operands to `evalNonSelectIntrinsicCall` ensures that
+`intrinsicMissingPointeeStep` observes the known first-argument type from `ARG`
+(and faults with `MirStepNode.fail .ub` when `ARG` passes a non-pointer type to
+`arith_offset`, `size_of_val`, or `align_of_val`).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2400-L2408>
+
+> "#[rustc_intrinsic]
+> pub const fn const_eval_select<ARG: Tuple, F, G, RET>(
+>     _arg: ARG,
+>     _called_in_const: F,
+>     _called_at_rt: G,
+> ) -> RET"
+-/
+@[reducible]
+def constEvalSelectTupleArgOps : Option RigidTy → List Operand
+  | .some (.tuple elemTys) => rigidTysToZeroSizedOps elemTys
+  | _ => .nil
+
+/--
+Test whether `defPath` is an unreachable hint or intrinsic
+(`"core::hint::unreachable_unchecked"`, `"std::hint::unreachable_unchecked"`, or
+`"core::intrinsics::unreachable"`), reaching which is immediate undefined
+behavior (`MirStepNode.fail .ub`).
+
+Reference (`library/core/src/hint.rs` and `library/core/src/intrinsics/mod.rs`
+at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L373-L384>
+
+> "/// Informs the optimizer that this point in the code is not reachable,
+> /// enabling further optimizations.
+> ...
+> #[rustc_intrinsic]
+> pub const unsafe fn unreachable() -> !;"
+-/
+@[simp]
+def isUnreachableCallTarget (defPath : DefPath) : Bool :=
+  Bool.or
+    (stringEq defPath "core::hint::unreachable_unchecked")
+    (Bool.or
+      (stringEq defPath "std::hint::unreachable_unchecked")
+      (stringEq defPath "core::intrinsics::unreachable"))
+
+/--
+Test whether `defPath` is a non-unwinding (aborting) panic or abort entrypoint
+in `core` (`"core::panicking::panic_nounwind"`,
+`"core::panicking::panic_nounwind_fmt"`,
+`"core::panicking::panic_nounwind_fmt::panic_impl"`,
+`"core::panicking::panic_nounwind_nobacktrace"`,
+`"core::panicking::panic_in_cleanup"`,
+`"core::panicking::panic_cannot_unwind"`,
+`"core::panicking::panic_misaligned_pointer_dereference"`,
+`"core::panicking::panic_null_pointer_dereference"`,
+`"core::panicking::panic_invalid_enum_construction"`, or
+`"core::intrinsics::abort"`).
+
+Reference (`library/core/src/panicking.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/panicking.rs#L217-L226>
+
+> "/// Like `panic`, but without unwinding and track_caller to reduce the impact
+> /// on codesize on the caller.
+> ...
+> #[rustc_nounwind]
+> pub const fn panic_nounwind(expr: &'static str) -> !"
+-/
+@[simp]
+def isAbortingPanicDefPath (defPath : DefPath) : Bool :=
+  Bool.or
+    (stringEq defPath "core::panicking::panic_nounwind")
+    (Bool.or
+      (stringEq defPath "core::panicking::panic_nounwind_fmt")
+      (Bool.or
+        (stringEq defPath "core::panicking::panic_nounwind_fmt::panic_impl")
+        (Bool.or
+          (stringEq defPath "core::panicking::panic_nounwind_nobacktrace")
+          (Bool.or
+            (stringEq defPath "core::panicking::panic_in_cleanup")
+            (Bool.or
+              (stringEq defPath "core::panicking::panic_cannot_unwind")
+              (Bool.or
+                (stringEq defPath "core::panicking::panic_misaligned_pointer_dereference")
+                (Bool.or
+                  (stringEq defPath "core::panicking::panic_null_pointer_dereference")
+                  (Bool.or
+                    (stringEq defPath "core::panicking::panic_invalid_enum_construction")
+                    (stringEq defPath "core::intrinsics::abort")))))))))
+
+/--
+Test whether `defPath` is a standard unwinding panic entrypoint in `core`
+(`"core::panicking::panic"`, `"core::panicking::panic_fmt"`,
+`"core::panicking::panic_fmt::panic_impl"`,
+`"core::panicking::const_panic_fmt"`,
+`"core::panicking::assert_failed"`, `"core::panicking::assert_failed_inner"`,
+`"core::panicking::assert_matches_failed"`,
+`"core::slice::index::slice_index_fail"`,
+`"core::panicking::panic_bounds_check"`, `"core::panicking::panic_explicit"`,
+`"core::panicking::panic_display"`, `"core::panicking::panic_str_2015"`,
+`"core::panicking::unreachable_display"`, `"core::option::unwrap_failed"`,
+`"core::option::expect_failed"`, `"core::result::unwrap_failed"`, or
+`"core::panicking::panic_const::*"`).
+
+Reference (`library/core/src/panicking.rs` and `library/core/src/slice/index.rs`
+at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/panicking.rs#L130-L138>
+
+> "/// The underlying implementation of core's `panic!` macro when no formatting
+> /// is used.
+> ...
+> #[track_caller]
+> pub const fn panic(expr: &'static str) -> !"
+-/
+@[simp]
+def isUnwindingPanicDefPath (defPath : DefPath) : Bool :=
+  Bool.or
+    (stringEq defPath "core::panicking::panic")
+    (Bool.or
+      (stringEq defPath "core::panicking::panic_fmt")
+      (Bool.or
+        (stringEq defPath "core::panicking::panic_fmt::panic_impl")
+        (Bool.or
+          (stringEq defPath "core::panicking::const_panic_fmt")
+          (Bool.or
+            (stringEq defPath "core::panicking::assert_failed")
+            (Bool.or
+              (stringEq defPath "core::panicking::assert_failed_inner")
+              (Bool.or
+                (stringEq defPath "core::panicking::assert_matches_failed")
+                (Bool.or
+                  (stringEq defPath "core::slice::index::slice_index_fail")
+                  (Bool.or
+                    (stringEq defPath "core::panicking::panic_bounds_check")
+                    (Bool.or
+                      (stringEq defPath "core::panicking::panic_explicit")
+                      (Bool.or
+                        (stringEq defPath "core::panicking::panic_display")
+                        (Bool.or
+                          (stringEq defPath "core::panicking::panic_str_2015")
+                          (Bool.or
+                            (stringEq defPath "core::panicking::unreachable_display")
+                            (Bool.or
+                              (stringEq defPath "core::option::unwrap_failed")
+                              (Bool.or
+                                (stringEq defPath "core::option::expect_failed")
+                                (Bool.or
+                                  (stringEq defPath "core::result::unwrap_failed")
+                                  (Bool.or
+                                    (stringEq defPath "core::panicking::panic_const::panic_const_add_overflow")
+                                    (Bool.or
+                                      (stringEq defPath "core::panicking::panic_const::panic_const_sub_overflow")
+                                      (Bool.or
+                                        (stringEq defPath "core::panicking::panic_const::panic_const_mul_overflow")
+                                        (Bool.or
+                                          (stringEq defPath "core::panicking::panic_const::panic_const_div_overflow")
+                                          (Bool.or
+                                            (stringEq defPath "core::panicking::panic_const::panic_const_rem_overflow")
+                                            (Bool.or
+                                              (stringEq defPath "core::panicking::panic_const::panic_const_neg_overflow")
+                                              (Bool.or
+                                                (stringEq defPath "core::panicking::panic_const::panic_const_shr_overflow")
+                                                (Bool.or
+                                                  (stringEq defPath "core::panicking::panic_const::panic_const_shl_overflow")
+                                                  (Bool.or
+                                                    (stringEq defPath "core::panicking::panic_const::panic_const_div_by_zero")
+                                                    (stringEq defPath "core::panicking::panic_const::panic_const_rem_by_zero")))))))))))))))))))))))))
+
+/--
+Dispatch a direct (`target.isIndirect = false`) call to a
+`CallConv.rustIntrinsic` compiler intrinsic in `evalTerminator` when
+`classifyRustIntrinsic? target.defPath` returns `.some kind`: the runtime
+dispatch of `const_eval_select`, the call-form memory intrinsics
+(`evalCopyNonOverlappingCall`, `evalWriteBytesCall`), a volatile memory
+intrinsic (`isVolatileMemIntrinsicKind`, `evalVolatileMemIntrinsicCall`), or a
+value-returning intrinsic (`evalNonSelectIntrinsicCall`).
+
+When `target.defPath` is not an intrinsic, a direct call to one of the four
+`core::ptr` raw-pointer access functions without a linked body
+(`core::ptr::read_unaligned`, `core::ptr::write_unaligned`,
+`core::ptr::read_volatile`, `core::ptr::write_volatile`) is evaluated inline
+(`evalUnlinkedPtrAccessCall?`). `evalTerminator` consults this function only
+after `lookupCallee` found no body for the callee.
+
+Returns `.none` for every other `target.defPath`, so `evalTerminator` falls
+through to `MirStepNode.extCall`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1-L80>
+
+> "Compiler intrinsics."
+
+Reference (`core::ptr::read_volatile`, `library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L2111-L2124>
+
+> "pub unsafe fn read_volatile<T>(src: *const T) -> T {
+>     // SAFETY: the caller must uphold the safety contract for `volatile_load`.
+>     unsafe {
+>         ub_checks::assert_unsafe_precondition!(
+>             check_language_ub,
+>             "ptr::read_volatile requires that the pointer argument is aligned",
+>             (
+>                 addr: *const () = src as *const (),
+>                 align: usize = align_of::<T>(),
+>             ) => ub_checks::maybe_is_aligned(addr, align)
+>         );
+>         intrinsics::volatile_load(src)
+>     }
+> }"
 -/
 @[reducible]
 def evalDirectRustIntrinsic?
@@ -3395,7 +6155,17 @@ def evalDirectRustIntrinsic?
     (unwind : UnwindAction) :
     Option MirStepNode :=
   match classifyRustIntrinsic? target.defPath with
-  | .none => .none
+  | .none =>
+    evalUnlinkedPtrAccessCall?
+      s
+      target
+      bodyLocalDecls
+      bodyLayouts
+      argOps
+      argVals
+      locals'
+      destination
+      targetBb
   | .some .constEvalSelect =>
     .some
       (match argVals with
@@ -3523,6 +6293,97 @@ def evalDirectRustIntrinsic?
   | .some .writeBytes =>
     .some
       (evalWriteBytesCall
+        s
+        target
+        bodyLocalDecls
+        bodyLayouts
+        argOps
+        argVals
+        locals'
+        destination
+        targetBb)
+  | .some .unalignedVolatileLoad =>
+    .some
+      (evalVolatileMemIntrinsicCall
+        .unalignedVolatileLoad
+        s
+        target
+        bodyLocalDecls
+        bodyLayouts
+        argOps
+        argVals
+        locals'
+        destination
+        targetBb)
+  | .some .unalignedVolatileStore =>
+    .some
+      (evalVolatileMemIntrinsicCall
+        .unalignedVolatileStore
+        s
+        target
+        bodyLocalDecls
+        bodyLayouts
+        argOps
+        argVals
+        locals'
+        destination
+        targetBb)
+  | .some .volatileLoad =>
+    .some
+      (evalVolatileMemIntrinsicCall
+        .volatileLoad
+        s
+        target
+        bodyLocalDecls
+        bodyLayouts
+        argOps
+        argVals
+        locals'
+        destination
+        targetBb)
+  | .some .volatileStore =>
+    .some
+      (evalVolatileMemIntrinsicCall
+        .volatileStore
+        s
+        target
+        bodyLocalDecls
+        bodyLayouts
+        argOps
+        argVals
+        locals'
+        destination
+        targetBb)
+  | .some .volatileCopyNonOverlappingMemory =>
+    .some
+      (evalVolatileMemIntrinsicCall
+        .volatileCopyNonOverlappingMemory
+        s
+        target
+        bodyLocalDecls
+        bodyLayouts
+        argOps
+        argVals
+        locals'
+        destination
+        targetBb)
+  | .some .volatileCopyMemory =>
+    .some
+      (evalVolatileMemIntrinsicCall
+        .volatileCopyMemory
+        s
+        target
+        bodyLocalDecls
+        bodyLayouts
+        argOps
+        argVals
+        locals'
+        destination
+        targetBb)
+  | .some .volatileSetMemory =>
+    .some
+      (evalVolatileMemIntrinsicCall
+        .volatileSetMemory
         s
         target
         bodyLocalDecls

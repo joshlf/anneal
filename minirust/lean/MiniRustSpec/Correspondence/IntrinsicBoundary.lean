@@ -79,12 +79,14 @@ characterizations + `CountOnes` conservation, full value-level two-sided `some v
 `none ↔ .ub` parity, `saturating` `valOf` clamping, `three_way_compare::<char>`, `size_of_val` /
 `align_of_val` ↔ `Type.layout` & `LayoutStrategy.compute_size_and_align`, symbolic `panicUnwind`,
 and multi-byte / `char` / slice-layout negative controls). Section 10 (`[adv ep2-B4]` /
-`[adv ep2-A4]`) pins the remaining boundaries and closes all 30 `LIntrinsicOp` variants: MiniRust's
+`[adv ep2-A4]`) pins the remaining boundaries and closes all 37 `LIntrinsicOp` variants: MiniRust's
 executable spec rejects every unwinding terminator (`StartUnwind`, `StopUnwind`, `ResumeUnwind`) as
 `unsupported`, `RigidTy.str` wide pointers (`&str` / `*const str`) match `Type.layout (.Slice
 (.Int u8))`, missing `nextBlock = none` / `target = none` raises UB on value-returning intrinsics in
-both semantics, and `lintrinsicOp_exhaustive_minirust_classification` partitions all 30
-`LIntrinsicOp` constructors across their four verified correspondence regimes.
+both semantics, and `lintrinsicOp_exhaustive_minirust_classification` partitions all 37
+`LIntrinsicOp` constructors across their five correspondence regimes (the seven volatile memory
+intrinsics of `[adv ep1-A0]` are evaluated by `Trusted` only: the lowered evaluator fails closed on
+them, `lintrinsicOp_volatile_lowered_fail_closed`).
 -/
 
 namespace MiniRustSpec.Correspondence
@@ -2389,7 +2391,7 @@ theorem minirust_bitops_char_and_layout_negative_controls
 end AdvEp2A3
 
 /-! ## 10. `[adv ep2-B4]` / `[adv ep2-A4]` MiniRust unwinding boundary, `str` layout bridge,
-`target = none` UB boundary, and exhaustive 30-variant `LIntrinsicOp` classification -/
+`target = none` UB boundary, and exhaustive 37-variant `LIntrinsicOp` classification -/
 
 section AdvEp2B4
 
@@ -2520,6 +2522,13 @@ inductive LIntrinsicBridgeClass : Type where
   `Interp.evalTerminator` stops with `.unsupported` on `StartUnwind`/`StopUnwind`/`ResumeUnwind`) —
   1 variant (`panicUnwind`). -/
   | trustedOnlyUnwind
+  /-- `Trusted`-only volatile memory intrinsics (`unaligned_volatile_load`,
+  `unaligned_volatile_store`, `volatile_load`, `volatile_store`,
+  `volatile_copy_nonoverlapping_memory`, `volatile_copy_memory`, `volatile_set_memory`):
+  `Trusted.evalTerminator` evaluates them inline (`evalVolatileMemIntrinsicCall`, `AdtAndControl`
+  Section 5j), MiniRust's `IntrinsicOp` has no volatile memory access, and Anneal's lowered
+  evaluator fails closed on them (`lintrinsicOp_volatile_lowered_fail_closed`) — 7 variants. -/
+  | trustedOnlyVolatileMemory
   deriving DecidableEq, Repr
 
 /-- Map every `LIntrinsicOp` constructor to its `MiniRustSpec` correspondence regime. -/
@@ -2535,31 +2544,63 @@ def classifyLIntrinsicBridge : Anneal.Mir.AdtAndControl.LIntrinsicOp → LIntrin
   | .ctlz | .ctlzNonzero | .cttz | .cttzNonzero | .bitreverse => .symbolicBitAndFallback
   | .copyNonOverlapping | .writeBytes => .callFormMemory
   | .panicUnwind => .trustedOnlyUnwind
+  | .unalignedVolatileLoad | .unalignedVolatileStore | .volatileLoad | .volatileStore
+  | .volatileCopyNonOverlappingMemory | .volatileCopyMemory | .volatileSetMemory =>
+    .trustedOnlyVolatileMemory
 
-/-- Canonical duplicate-free enumeration of all 30 `LIntrinsicOp` constructors. -/
+/-- Canonical duplicate-free enumeration of all 37 `LIntrinsicOp` constructors. -/
 def allLIntrinsicOps : List Anneal.Mir.AdtAndControl.LIntrinsicOp :=
   [.ctlz, .ctlzNonzero, .cttz, .cttzNonzero, .ctpop, .bswap, .bitreverse, .exactDiv,
    .wrappingAdd, .wrappingSub, .wrappingMul, .saturatingAdd, .saturatingSub,
    .uncheckedAdd, .uncheckedSub, .uncheckedMul, .uncheckedDiv, .uncheckedRem,
    .uncheckedShl, .uncheckedShr, .threeWayCompare, .ubChecks, .arithOffset,
    .sizeOfVal, .alignOfVal, .copyNonOverlapping, .writeBytes,
+   .unalignedVolatileLoad, .unalignedVolatileStore, .volatileLoad, .volatileStore,
+   .volatileCopyNonOverlappingMemory, .volatileCopyMemory, .volatileSetMemory,
    .unreachableUnchecked, .abort, .panicUnwind]
 
-/-- **Exhaustive 30-variant `LIntrinsicOp` classification (`lintrinsicOp_exhaustive_minirust_classification`,
-`[adv ep2-A4]`)**: `allLIntrinsicOps` contains every `LIntrinsicOp` constructor without duplicates
-(`30` total), partitioned into `22` direct `Interp` operator/layout/diverging ops, `5` symbolic
-`leBits` / `Assume` / `IntrinsicFallback` ops, `2` call-form memory ops, and `1` `Trusted`-only
-unwinding panic op. -/
+/-- **Exhaustive 37-variant `LIntrinsicOp` classification (`lintrinsicOp_exhaustive_minirust_classification`,
+`[adv ep2-A4]`, extended by `[adv ep1-A0]`)**: `allLIntrinsicOps` contains every `LIntrinsicOp`
+constructor without duplicates (`37` total), partitioned into `22` direct `Interp`
+operator/layout/diverging ops, `5` symbolic `leBits` / `Assume` / `IntrinsicFallback` ops, `2`
+call-form memory ops, `1` `Trusted`-only unwinding panic op, and `7` `Trusted`-only volatile memory
+ops. -/
 theorem lintrinsicOp_exhaustive_minirust_classification :
-    allLIntrinsicOps.length = 30 ∧
+    allLIntrinsicOps.length = 37 ∧
     allLIntrinsicOps.Nodup ∧
     (∀ op : Anneal.Mir.AdtAndControl.LIntrinsicOp, op ∈ allLIntrinsicOps) ∧
     (allLIntrinsicOps.filter (classifyLIntrinsicBridge · == .interpDirect)).length = 22 ∧
     (allLIntrinsicOps.filter (classifyLIntrinsicBridge · == .symbolicBitAndFallback)).length = 5 ∧
     (allLIntrinsicOps.filter (classifyLIntrinsicBridge · == .callFormMemory)).length = 2 ∧
-    (allLIntrinsicOps.filter (classifyLIntrinsicBridge · == .trustedOnlyUnwind)).length = 1 := by
-  refine ⟨rfl, by decide +kernel, fun op => ?_, rfl, rfl, rfl, rfl⟩
+    (allLIntrinsicOps.filter (classifyLIntrinsicBridge · == .trustedOnlyUnwind)).length = 1 ∧
+    (allLIntrinsicOps.filter
+      (classifyLIntrinsicBridge · == .trustedOnlyVolatileMemory)).length = 7 := by
+  refine ⟨rfl, by decide +kernel, fun op => ?_, rfl, rfl, rfl, rfl, rfl⟩
   cases op <;> decide
+
+/-- **The lowered evaluator fails closed on exactly the `Trusted`-only volatile memory ops
+(`lintrinsicOp_volatile_lowered_fail_closed`, `[adv ep1-A0]`)**: an `LIntrinsicOp` is classified
+`.trustedOnlyVolatileMemory` iff it is a volatile memory op (`LIntrinsicOp.isVolatileMem`), and on
+every such op `Anneal.Mir.AdtAndControl.evalLoweredIntrinsicCall` takes no step, whatever the
+arguments, destination, and target block. The lowered dialect therefore never claims a
+volatile-access step that `Trusted`'s `evalVolatileMemIntrinsicCall` (or MiniRust, which has no
+volatile `IntrinsicOp`) would have to match. -/
+theorem lintrinsicOp_volatile_lowered_fail_closed
+    (op : Anneal.Mir.AdtAndControl.LIntrinsicOp) :
+    (classifyLIntrinsicBridge op = .trustedOnlyVolatileMemory ↔ op.isVolatileMem = true) ∧
+    (classifyLIntrinsicBridge op = .trustedOnlyVolatileMemory →
+      ∀ (env : Anneal.Mir.AdtAndControl.CfgEnv) (body : Anneal.Mir.AdtAndControl.LBody)
+        (bb : Nat) (inCleanup : Bool) (argOps : List Operand) (avs : List Value)
+        (slots2 : List Anneal.Mir.PlaceAndRvalue.LocalSlotState) (dest : Place) (destTy : Ty)
+        (target : Option Nat) (unwind : UnwindAction) (unwinding : Option Nat)
+        (typeArgs : List RigidTy),
+        Anneal.Mir.AdtAndControl.evalLoweredIntrinsicCall env body bb inCleanup argOps avs slots2
+          dest destTy target unwind unwinding op typeArgs = none) := by
+  refine ⟨by cases op <;> decide, fun hClass env body bb inCleanup argOps avs slots2 dest destTy
+    target unwind unwinding typeArgs => ?_⟩
+  exact Anneal.Mir.AdtAndControl.evalLoweredIntrinsicCall_volatile_none env body bb inCleanup
+    argOps avs slots2 dest destTy target unwind unwinding typeArgs
+    (by revert hClass; cases op <;> decide)
 
 end AdvEp2B4
 
