@@ -1933,13 +1933,19 @@ mod linux {
         })?;
         let mut cmd = Command::new(bwrap);
         cmd.env_clear().env("PATH", "/usr/bin:/bin");
+        // Note: `run_bwrap` calls `setsid()` in `pre_exec` (below) rather than
+        // passing `--new-session` to `bwrap`. Detaching the controlling
+        // terminal before `exec` gives the same TIOCSTI protection while
+        // keeping both outer `bwrap` and inner PID 1 in `PGID = bwrap_pid` so
+        // `kill(-bwrap_pid, SIGKILL)` atomically tears down the entire PID
+        // namespace on wall-clock timeout without relying on `--die-with-parent`
+        // alone.
         cmd.args([
             "--unshare-all",
             "--as-pid-1",
             "--cap-drop",
             "ALL",
             "--die-with-parent",
-            "--new-session",
             "--clearenv",
             "--size",
             "16777216",
@@ -2010,10 +2016,10 @@ mod linux {
         // SAFETY: `getpid()` has no preconditions.
         let parent_pid = unsafe { libc::getpid() };
         // SAFETY: `apply_process_hygiene` invokes strictly async-signal-safe
-        // libc syscalls (`setpgid`, `prctl`, `getppid`, `close_range`,
+        // libc syscalls (`setsid`, `prctl`, `getppid`, `close_range`,
         // `setrlimit`) with zero allocations or locks.
         unsafe {
-            cmd.pre_exec(move || apply_process_hygiene(parent_pid, false));
+            cmd.pre_exec(move || apply_process_hygiene(parent_pid, true));
         }
         spawn_and_wait_with_timeout(cmd, policy.timeout, "sandbox-bwrap")
     }
