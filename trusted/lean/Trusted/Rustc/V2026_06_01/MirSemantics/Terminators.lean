@@ -3704,10 +3704,10 @@ def rawPtrWidePtrValid? (ptrBytes : Nat) (nonNull : Bool) (v : Value) : Bool :=
 
 /--
 Check a runtime `Value` `v` against a `ScalarLayout` `s` of byte width
-`sizeBytes`: enforces byte width and `wrappingRangeContains vr` on `.initialized`
-scalars (plus `isValidCharCode` on `char`'s `[0..=0x10FFFF]` 4-byte range and
-null exclusion on `.pointer _` scalars when `0 ∉ vr`), while `.union _` permits
-any initialized scalar or pointer representation.
+`sizeBytes`: enforces byte width and `wrappingRangeContains vr` on
+`.initialized` scalars (plus `isValidCharCode` on `char`'s `[0..=0x10FFFF]`
+4-byte range and null exclusion on `.pointer _` scalars when `0 ∉ vr`), while
+`.union _` permits any initialized scalar or pointer representation.
 
 Reference (`compiler/rustc_abi/src/lib.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -3771,9 +3771,9 @@ def rawPtrScalarLayoutValid? (s : ScalarLayout) (sizeBytes : Nat) (v : Value) : 
     | _ => false
 
 /--
-Check a layout-directed validity predicate `check` pairwise across `fieldLayouts`
-and runtime field values `fields`, combining outcomes with `rawPtrOptBoolAnd` so
-any definite invalidity dominates fuel exhaustion.
+Check a layout-directed validity predicate `check` pairwise across
+`fieldLayouts` and runtime field values `fields`, combining outcomes with
+`rawPtrOptBoolAnd` so any definite invalidity dominates fuel exhaustion.
 
 Reference (The Rust Reference, "Behavior considered undefined — Invalid
 values"):
@@ -3816,8 +3816,9 @@ Fuel-bounded layout-directed validity check of a field value `v` inside an ADT
 against its compiler-captured `TypeLayout` at `lIdx` in `layouts`: returns
 `.some true` (valid), `.some false` (invalid -> `.ub`), or `.none` (fuel
 exhausted -> `.unsupported`). Validates uninhabited layouts, ZST shapes,
-primitive scalar valid ranges (including `bool`, `char`, `NonZero*`, `NonNull*`),
-and recursively validates single-variant `.arbitrary` and `.array` fields.
+primitive scalar valid ranges (including `bool`, `char`, `NonZero*`,
+`NonNull*`), and recursively validates single-variant `.arbitrary` and `.array`
+fields.
 
 Reference (The Rust Reference, "Behavior considered undefined — Invalid
 values"):
@@ -3829,6 +3830,24 @@ values"):
 Modeling choice: union layouts, multi-variant enum layouts, and structs without
 captured `fieldLayouts` return `.some true` so valid unions and enums are never
 falsely rejected; fuel exhaustion returns `.none` (fail closed `.unsupported`).
+
+Modeling choice: a single-variant struct layout whose `BackendRepr` is one
+scalar may hold that scalar itself (`Value.scalar` or `Value.ptr`) instead of a
+`Value.aggregate`, because `evalShallowInitBox` represents a `Box<T>` by its
+single data pointer. Such a value is checked against the scalar
+(`rawPtrScalarLayoutValid?`: width, valid range, and null exclusion); at any
+other struct layout it is invalid. A `Value.aggregate` at a
+`FieldsShape.primitive` layout (a wrapper ADT whose captured layout is that of
+its inner scalar) is accepted without inspecting its fields, as
+`rawPtrValueValid?` accepts it at the top level.
+
+Reference (`alloc::boxed` module documentation, `library/alloc/src/boxed.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/alloc/src/boxed.rs#L71-L73>
+
+> "//! So long as `T: Sized`, a `Box<T>` is guaranteed to be represented
+> //! as a single pointer and is also ABI-compatible with C pointers
+> //! (i.e. the C type `T*`)."
 -/
 def rawPtrLayoutValValid? : Nat → LayoutTable → LayoutIdx → Value → Option Bool
   | .zero, _, _, _ => .none
@@ -3847,9 +3866,10 @@ def rawPtrLayoutValValid? : Nat → LayoutTable → LayoutIdx → Value → Opti
         | false =>
           match l.fields, l.variants with
           | .primitive, _ =>
-            match l.backendRepr with
-            | .scalar s => .some (rawPtrScalarLayoutValid? s l.size.bytes v)
-            | _ => .some true
+            match l.backendRepr, v with
+            | .scalar _, .aggregate _ _ => .some true
+            | .scalar s, _ => .some (rawPtrScalarLayoutValid? s l.size.bytes v)
+            | _, _ => .some true
           | .arbitrary _ _, .single expectedVar =>
             match v with
             | .aggregate varIdx fields =>
@@ -3863,6 +3883,10 @@ def rawPtrLayoutValValid? : Nat → LayoutTable → LayoutIdx → Value → Opti
                     l.fieldLayouts
                     fields
                 | false => .some true
+            | .scalar _ | .ptr _ _ =>
+              match l.backendRepr with
+              | .scalar s => .some (rawPtrScalarLayoutValid? s l.size.bytes v)
+              | _ => .some false
             | _ => .some false
           | .array _ count, .single 0 =>
             match v with
@@ -3932,11 +3956,12 @@ def rawPtrTupleFieldsValid?
 Fuel-bounded structural validity check of runtime `Value` `v` against static
 type `ty` for raw-pointer loads and stores: returns `.some true` (valid),
 `.some false` (definitely invalid -> `.ub`), or `.none` (fuel exhausted ->
-fail-closed `.unsupported`). Rejects uninhabited types (`rawPtrTyIsUninhabited`),
-invalid `bool` / `char` bit patterns, scalar width mismatches, null references
-and function pointers, invalid elements inside tuples, fixed-length arrays, and
-single-variant ADTs with captured `fieldLayouts`, as well as ABI-mismatched
-value shapes (while supporting wide pointers to custom DSTs).
+fail-closed `.unsupported`). Rejects uninhabited types
+(`rawPtrTyIsUninhabited`), invalid `bool` / `char` bit patterns, scalar width
+mismatches, null references and function pointers, invalid elements inside
+tuples, fixed-length arrays, and single-variant ADTs with captured
+`fieldLayouts`, as well as ABI-mismatched value shapes (while supporting wide
+pointers to custom DSTs).
 
 Reference (The Rust Reference, "Behavior considered undefined — Invalid
 values"):
@@ -3988,6 +4013,23 @@ whenever `ty`'s layout has size `2 * ptrBytes` or is unresolved (still rejecting
 null references in both thin and wide shapes), so custom-DST wide pointers are
 never falsely rejected. Fuel exhaustion returns `.none` (fail closed
 `.unsupported`) rather than silently accepting unvalidated nested values.
+
+Modeling choice: an ADT value is normally a `Value.aggregate`, but
+`evalShallowInitBox` represents a `Box<T>` by its single data pointer, a bare
+`Value.ptr` at an ADT whose layout is a single-variant struct with one scalar as
+its `BackendRepr`. A `Value.scalar` or `Value.ptr` at such an ADT, or at a
+`FieldsShape.primitive` wrapper layout, is checked against that scalar
+(`rawPtrScalarLayoutValid?`: width, valid range, and null exclusion), so a
+non-null `Box<T>` is valid and a null one is not. At an ADT whose trusted layout
+is neither, a bare scalar or pointer is invalid.
+
+Reference (`alloc::boxed` module documentation, `library/alloc/src/boxed.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/alloc/src/boxed.rs#L71-L73>
+
+> "//! So long as `T: Sized`, a `Box<T>` is guaranteed to be represented
+> //! as a single pointer and is also ABI-compatible with C pointers
+> //! (i.e. the C type `T*`)."
 -/
 def rawPtrValueValid? : Nat → LayoutTable → Ty → Value → Option Bool
   | .zero, _, _, _ => .none
@@ -4201,6 +4243,10 @@ def rawPtrValueValid? : Nat → LayoutTable → Ty → Value → Option Bool
              | .some { fields := .primitive, size := sz, backendRepr := .scalar s, .. } =>
                rawPtrScalarLayoutValid? s sz.bytes (.scalar sc)
              | .some { fields := .primitive, size := sz, .. } => Nat.beq sc.sizeBytes sz.bytes
+             | .some
+                 { fields := .arbitrary _ _, variants := .single _, size := sz,
+                   backendRepr := .scalar s, .. } =>
+               rawPtrScalarLayoutValid? s sz.bytes (.scalar sc)
              | .some _ => false
              | .none => true)
         | .ptr p pSz =>
@@ -4209,6 +4255,10 @@ def rawPtrValueValid? : Nat → LayoutTable → Ty → Value → Option Bool
              | .some { fields := .primitive, size := sz, backendRepr := .scalar s, .. } =>
                rawPtrScalarLayoutValid? s sz.bytes (.ptr p pSz)
              | .some { fields := .primitive, size := sz, .. } => Nat.beq pSz sz.bytes
+             | .some
+                 { fields := .arbitrary _ _, variants := .single _, size := sz,
+                   backendRepr := .scalar s, .. } =>
+               rawPtrScalarLayoutValid? s sz.bytes (.ptr p pSz)
              | .some _ => false
              | .none => true)
         | _ => .some false
@@ -5158,8 +5208,8 @@ Checks, in order:
    undecidable alignment is unsupported.
 3. A non-volatile load through a null pointer is `.ub`, even when `T` is
    zero-sized: a null pointer is never valid for reads.
-4. An uninhabited `T` (`rawPtrTyIsUninhabited`) is `.ub`: the load would produce a
-   value of a type that has none.
+4. An uninhabited `T` (`rawPtrTyIsUninhabited`) is `.ub`: the load would produce
+   a value of a type that has none.
 5. A zero-sized `T` reads no memory: the result is the unique value of `T`
    (`rawPtrZstValue?`), and no Tree Borrows access happens.
 6. Otherwise (`size_of::<T>() > 0`), by `classifyRawPtrTarget`:

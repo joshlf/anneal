@@ -1007,6 +1007,106 @@ theorem decode_32bit_usize_and_big_endian_fail_closed :
     rawPtrSpliceBytesIntoPlace? [mkDecl tyU32] tblBigEndian tyU32 (u32Val 0) 0 bs4 = .none :=
   ⟨rfl, rfl, rfl⟩
 
+/-! ## 13. `[adv ep1-A2]` regressions: a `Box<T>` held as its data pointer -/
+
+/-- `Unique<u32>`: a struct of a non-null pointer and a zero-sized marker. -/
+private def lUniqueU32 : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩,
+    backendRepr := .scalar (.initialized (.pointer 0) ⟨1, 0xFFFFFFFFFFFFFFFF⟩),
+    fields := .arbitrary [⟨0⟩, ⟨8⟩] [0, 1], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [5, 6] }
+
+/-- `Box<u32>`: a struct of `Unique<u32>` and the zero-sized allocator, passed as one non-null
+pointer. Its `FieldsShape` is `.arbitrary`, not `.primitive`. -/
+private def lBoxU32 : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩,
+    backendRepr := .scalar (.initialized (.pointer 0) ⟨1, 0xFFFFFFFFFFFFFFFF⟩),
+    fields := .arbitrary [⟨0⟩, ⟨8⟩] [0, 1], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [21, 6] }
+
+/-- `struct HasBox { b: Box<u32>, n: u32 }`, passed in memory. -/
+private def lHasBox : TypeLayout :=
+  { size := ⟨16⟩, align := ⟨8⟩,
+    backendRepr := .memory,
+    fields := .arbitrary [⟨0⟩, ⟨8⟩] [0, 1], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [22, 1] }
+
+/-- `struct WrapsNonZero { nz: NonZeroU32 }`, whose field layout (`lNonZeroU32`, index 16) is
+the `FieldsShape.primitive` layout of the wrapper's inner scalar. -/
+private def lWrapsNonZero : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨4⟩,
+    backendRepr := .scalar (.initialized (.int 32 false) ⟨1, 0xFFFFFFFF⟩),
+    fields := .arbitrary [⟨0⟩] [0], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [16] }
+
+/-- `tbl` followed by `lUniqueU32` (21), `lBoxU32` (22), `lHasBox` (23), `lWrapsNonZero` (24). -/
+private def tblBox : LayoutTable :=
+  { tbl with entries := tbl.entries ++ [lUniqueU32, lBoxU32, lHasBox, lWrapsNonZero] }
+
+private def tyBoxU32 : Ty := ⟨.adt "alloc::boxed::Box" [.uint .u32], 22⟩
+private def tyHasBox : Ty := ⟨.adt "HasBox" [], 23⟩
+private def tyWrapsNonZero : Ty := ⟨.adt "WrapsNonZero" [], 24⟩
+
+private def boxEntry : BorrowEntry :=
+  { tag := 80, targetLocal := 1, targetProjection := [], perm := .active,
+    targetFrameDepth := 0, allocDead := false }
+
+/-- `evalShallowInitBox` represents a `Box<T>` by its bare data pointer. That `Value.ptr` is a
+valid `Box<u32>` (it was reported invalid, hence `.ub`, before `[adv ep1-A2]`, because the layout
+of `Box<u32>` is a struct), alone and as a struct field. A null box, a scalar of the wrong width,
+and a bare pointer at a struct passed in memory stay invalid. -/
+theorem box_held_as_data_pointer_is_valid :
+    rawPtrValueValid? 16 tblBox tyBoxU32 (ptrVal 10 0) = .some true ∧
+    rawPtrValueValid? 16 tblBox tyBoxU32 (ptrVal 0 0) = .some false ∧
+    rawPtrValueValid? 16 tblBox tyBoxU32 (usizeVal 0) = .some false ∧
+    rawPtrValueValid? 16 tblBox tyBoxU32 (u32Val 7) = .some false ∧
+    rawPtrValueValid? 16 tblBox tyHasBox (.aggregate 0 [ptrVal 10 0, u32Val 7]) = .some true ∧
+    rawPtrValueValid? 16 tblBox tyHasBox (.aggregate 0 [ptrVal 0 0, u32Val 7]) = .some false ∧
+    rawPtrValueValid? 16 tblBox tyHasBox (.aggregate 0 [u32Val 7, u32Val 7]) = .some false ∧
+    rawPtrValueValid? 16 tblBox tyHasBox (ptrVal 10 0) = .some false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `read_unaligned::<Box<u32>>` of a local holding a box returns the box, and
+`volatile_store::<Box<u32>>` stores one (both were a false `.ub` before `[adv ep1-A2]`). Loading
+or storing a null box is still `.ub`. -/
+theorem read_and_store_of_box_through_raw_pointer_ok :
+    rawPtrLoadAction false false [boxEntry] [] [] []
+      (tgtWith "core::ptr::read_unaligned" tyBoxU32)
+      [mkDecl tyBoxU32, mkDecl tyBoxU32] tblBox [] [ptrVal 80 0]
+      [.uninit, .init (ptrVal 10 0)] =
+      .retBorrows [boxEntry] (ptrVal 10 0) ∧
+    rawPtrLoadAction true true [boxEntry] [] [] []
+      (tgtWith "core::intrinsics::volatile_load" tyBoxU32)
+      [mkDecl tyBoxU32, mkDecl tyBoxU32] tblBox [] [ptrVal 80 0]
+      [.uninit, .init (ptrVal 0 0)] =
+      .fault .ub ∧
+    rawPtrStoreAction true true [boxEntry] [] [] [] []
+      (tgtWith "core::intrinsics::volatile_store" tyBoxU32)
+      [mkDecl tyUnit, mkDecl tyBoxU32] tblBox [] [ptrVal 80 0, ptrVal 10 0]
+      [.uninit, .init (ptrVal 11 0)] =
+      .retStack [boxEntry] [.uninit, .init (ptrVal 10 0)] [] [] .unit ∧
+    rawPtrStoreAction true true [boxEntry] [] [] [] []
+      (tgtWith "core::intrinsics::volatile_store" tyBoxU32)
+      [mkDecl tyUnit, mkDecl tyBoxU32] tblBox [] [ptrVal 80 0, ptrVal 0 0]
+      [.uninit, .init (ptrVal 11 0)] =
+      .fault .ub :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- A wrapper ADT whose captured layout is the `FieldsShape.primitive` layout of its inner scalar
+is valid as an aggregate on its own (`adt_validity_trusts_layout_entries_sizing_trusts`) and,
+since `[adv ep1-A2]`, also as a struct field; held as the bare scalar it is checked against the
+scalar's valid range at both levels. -/
+theorem aggregate_at_primitive_wrapper_field_is_valid :
+    rawPtrValueValid? 16 tblBox tyNonZeroU32 (.aggregate 0 [u32Val 5]) = .some true ∧
+    rawPtrValueValid? 16 tblBox tyWrapsNonZero (.aggregate 0 [.aggregate 0 [u32Val 5]]) =
+      .some true ∧
+    rawPtrValueValid? 16 tblBox tyWrapsNonZero (.aggregate 0 [u32Val 5]) = .some true ∧
+    rawPtrValueValid? 16 tblBox tyWrapsNonZero (.aggregate 0 [u32Val 0]) = .some false ∧
+    rawPtrValueValid? 16 tblBox tyWrapsNonZero (u32Val 5) = .some true ∧
+    rawPtrValueValid? 16 tblBox tyWrapsNonZero (u32Val 0) = .some false ∧
+    rawPtrValueValid? 16 tblBox tyWrapsNonZero (ptrVal 10 0) = .some false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 /-- info: 'Anneal.Mir.VolatileUnalignedPtrTests.read_unaligned_offset1_u32_ok' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms read_unaligned_offset1_u32_ok
@@ -1046,5 +1146,13 @@ theorem decode_32bit_usize_and_big_endian_fail_closed :
 /-- info: 'Anneal.Mir.VolatileUnalignedPtrTests.union_and_enum_fallback_overlap_not_disjoint' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms union_and_enum_fallback_overlap_not_disjoint
+
+/-- info: 'Anneal.Mir.VolatileUnalignedPtrTests.box_held_as_data_pointer_is_valid' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms box_held_as_data_pointer_is_valid
+
+/-- info: 'Anneal.Mir.VolatileUnalignedPtrTests.read_and_store_of_box_through_raw_pointer_ok' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms read_and_store_of_box_through_raw_pointer_ok
 
 end Anneal.Mir.VolatileUnalignedPtrTests
