@@ -58,7 +58,10 @@ compose calls sequentially and share a verified prefix between two suffix
 specifications.
 
 Every declaration is constructive: its axiom closure is contained in
-`[propext, Quot.sound]`.
+`[propext, Quot.sound]`. The recursive traversals and stage pipelines are
+`noncomputable` kernel definitions, evaluated by kernel reduction, so the
+module contains no compiler-only implementation twins of recursive
+definitions and every definition has safety `safe`.
 -/
 
 namespace Anneal.TreeBorrowsPruningAndFrameWp
@@ -69,6 +72,8 @@ open Trusted.Rustc.V2026_06_01.Layout
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 open Anneal.MirLiftCore
+
+noncomputable section
 
 /-! ## Part 1. Root-level foreign-subtree Tree Borrows pruning -/
 
@@ -95,21 +100,21 @@ def BorrowSubtree.children : BorrowSubtree → List BorrowSubtree
 
 mutual
 /-- Preorder flattening of a subtree into the trusted flat borrow table. -/
-def BorrowSubtree.toList : BorrowSubtree → List BorrowEntry
+noncomputable def BorrowSubtree.toList : BorrowSubtree → List BorrowEntry
   | .node root children => root :: BorrowForest.toList children
 /-- Preorder flattening of a forest into the trusted flat borrow table. -/
-def BorrowForest.toList : List BorrowSubtree → List BorrowEntry
+noncomputable def BorrowForest.toList : List BorrowSubtree → List BorrowEntry
   | [] => []
   | t :: ts => BorrowSubtree.toList t ++ BorrowForest.toList ts
 end
 
 mutual
 /-- Whether some entry of the subtree has provenance tag `tag`. -/
-def BorrowSubtree.containsTag : BorrowSubtree → Nat → Bool
+noncomputable def BorrowSubtree.containsTag : BorrowSubtree → Nat → Bool
   | .node root children, tag =>
     Nat.beq root.tag tag || BorrowForest.containsTag children tag
 /-- Whether some entry of the forest has provenance tag `tag`. -/
-def BorrowForest.containsTag : List BorrowSubtree → Nat → Bool
+noncomputable def BorrowForest.containsTag : List BorrowSubtree → Nat → Bool
   | [], _ => false
   | t :: ts, tag =>
     BorrowSubtree.containsTag t tag || BorrowForest.containsTag ts tag
@@ -238,11 +243,12 @@ mutual
 /--
 `P root children` holds at every node `node root children` of the subtree.
 -/
-def AllSubtrees (P : BorrowEntry → List BorrowSubtree → Prop) :
+noncomputable def AllSubtrees (P : BorrowEntry → List BorrowSubtree → Prop) :
     BorrowSubtree → Prop
   | .node root children => P root children ∧ AllSubtreesForest P children
 /-- `P root children` holds at every node of every subtree of the forest. -/
-def AllSubtreesForest (P : BorrowEntry → List BorrowSubtree → Prop) :
+noncomputable def AllSubtreesForest
+    (P : BorrowEntry → List BorrowSubtree → Prop) :
     List BorrowSubtree → Prop
   | [] => True
   | t :: ts => AllSubtrees P t ∧ AllSubtreesForest P ts
@@ -550,14 +556,14 @@ Pruned map over a subtree: when `skip root` holds the whole subtree is
 returned unchanged without visiting `children`; otherwise the root is updated
 by `upd` and the children are traversed.
 -/
-def pruneMapSubtree (skip : BorrowEntry → Bool)
+noncomputable def pruneMapSubtree (skip : BorrowEntry → Bool)
     (upd : BorrowEntry → BorrowEntry) : BorrowSubtree → BorrowSubtree
   | .node root children =>
     match skip root with
     | true => .node root children
     | false => .node (upd root) (pruneMapForest skip upd children)
 /-- Pruned map over a forest. -/
-def pruneMapForest (skip : BorrowEntry → Bool)
+noncomputable def pruneMapForest (skip : BorrowEntry → Bool)
     (upd : BorrowEntry → BorrowEntry) : List BorrowSubtree → List BorrowSubtree
   | [] => []
   | t :: ts => pruneMapSubtree skip upd t :: pruneMapForest skip upd ts
@@ -569,8 +575,8 @@ Pruned existential test over a subtree: when `skip root` holds the test is
 `false` without visiting `children`; otherwise the root is tested by `test`
 and, if that fails, the children are traversed.
 -/
-def pruneAnySubtree (skip : BorrowEntry → Bool) (test : BorrowEntry → Bool) :
-    BorrowSubtree → Bool
+noncomputable def pruneAnySubtree (skip : BorrowEntry → Bool)
+    (test : BorrowEntry → Bool) : BorrowSubtree → Bool
   | .node root children =>
     match skip root with
     | true => false
@@ -579,8 +585,8 @@ def pruneAnySubtree (skip : BorrowEntry → Bool) (test : BorrowEntry → Bool) 
       | true => true
       | false => pruneAnyForest skip test children
 /-- Pruned existential test over a forest. -/
-def pruneAnyForest (skip : BorrowEntry → Bool) (test : BorrowEntry → Bool) :
-    List BorrowSubtree → Bool
+noncomputable def pruneAnyForest (skip : BorrowEntry → Bool)
+    (test : BorrowEntry → Bool) : List BorrowSubtree → Bool
   | [] => false
   | t :: ts =>
     match pruneAnySubtree skip test t with
@@ -7079,7 +7085,7 @@ Stage 3 (register function-entry protectors) for the borrows `tags`, in
 order. With no protector to register the stage is `pure ()` (the 0-protector
 fast path).
 -/
-def prepRegisterProtectors : List Nat → FramePrepM Unit
+noncomputable def prepRegisterProtectors : List Nat → FramePrepM Unit
   | [] => pure ()
   | tag :: tags =>
     registerProtector tag >>= fun _ => prepRegisterProtectors tags
@@ -8209,7 +8215,7 @@ theorem stepMirFn_retag_fnEntry_any_zst {body cur : CapturedMir}
 /-- Multi-parameter Stage-3 unified reference retag sequence: runs
 `prepFnEntryRetagAny` in order across arbitrary mixed thin (`&T`/`&mut T`),
 fat (`&[T]`/`&mut [T]`), and ZST (`&()`) reference parameter locals. -/
-def prepFnEntryRetags (cur : CapturedMir) :
+noncomputable def prepFnEntryRetags (cur : CapturedMir) :
     List Local → FramePrepM Unit
   | [] => pure ()
   | loc :: locs =>
@@ -8228,7 +8234,7 @@ theorem prepFnEntryRetags_cons (cur : CapturedMir) (loc : Local)
 
 /-- Multi-parameter Stage-3 thin-reference retag sequence: runs
 `prepFnEntryRetagThin` in order across a list of reference parameter locals. -/
-def prepFnEntryRetagThins (cur : CapturedMir) :
+noncomputable def prepFnEntryRetagThins (cur : CapturedMir) :
     List Local → FramePrepM Unit
   | [] => pure ()
   | loc :: locs =>
@@ -8955,7 +8961,7 @@ def prepStep (body : CapturedMir) : FramePrepM Unit := fun s =>
   | _ => .error (FailReq.fail .unsupported) s
 
 /-- `n` trusted steps, as a frame-prep program. -/
-def prepSteps (body : CapturedMir) : Nat → FramePrepM Unit
+noncomputable def prepSteps (body : CapturedMir) : Nat → FramePrepM Unit
   | 0 => pure ()
   | n + 1 => prepStep body >>= fun _ => prepSteps body n
 
@@ -14065,5 +14071,7 @@ theorem twoArgWithDanglingEmptySlice_stepsTo :
   exact ⟨s3, hRun, hSt.1, hSt.2⟩
 
 end FramePrep
+
+end
 
 end Anneal.TreeBorrowsPruningAndFrameWp
