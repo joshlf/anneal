@@ -203,8 +203,9 @@ def annealEvalUnwrapChainOp (localDecls : List LocalDecl) (layouts : LayoutTable
       | _, _ =>
           let baseNorm : Miri.Interpreter.OpTy AnnealProv :=
             match base.layout.layout.fields, base.layout.layout.backendRepr, base.op with
-            | .Arbitrary offsets _, .ScalarPair (a := a) (b := b) (bOffset := bOff), .immediate (.scalarPair _ _) =>
-                { base with layout := { base.layout with layout := { base.layout.layout with backendRepr := .ScalarPair (a := a) (b := b) (bOffset := (offsets.find? (· != Miri.ABI.Size.ZERO)).getD bOff) } } }
+            | .Arbitrary _ _, .ScalarPair (a := a) (b := b) (bOffset := bOff), .immediate (.scalarPair _ _) =>
+                let alignedBOff := ((b.defaultAlign annealRuntimeDataLayout).toOption.bind (fun al => (bOff.alignTo al.abi).toOption)).getD bOff
+                { base with layout := { base.layout with layout := { base.layout.layout with backendRepr := .ScalarPair (a := a) (b := b) (bOffset := alignedBOff) } } }
             | _, _, _ => base
           match Miri.Interpreter.project cx baseNorm (.Field idx fTy) with
           | .ok next => annealEvalUnwrapChainOp localDecls layouts localId frame next rest
@@ -3697,14 +3698,16 @@ private def c10Zst1Layout : TypeLayout :=
 private def c10Clos3Layout : TypeLayout :=
   { size := { bytes := 16 }, align := { bytes := 8 }, backendRepr := .scalarPair (.initialized (.int 32 false) { start := 0, end_ := 0xFFFFFFFF }) (.initialized (.pointer 0) { start := 1, end_ := 0xFFFFFFFFFFFFFFFF }),
     variants := .single 0, fields := .arbitrary [{ bytes := 0 }, { bytes := 0 }, { bytes := 8 }] [0, 1, 2], fieldLayouts := .nil, isUninhabited := false }
-private def c10ExtLayouts : LayoutTable := { emptyLayoutTable with entries := [c10Zst1Layout, c10Clos3Layout] }
+private def c10ClosMidZstLayout : TypeLayout :=
+  { c10Clos3Layout with fields := .arbitrary [{ bytes := 0 }, { bytes := 4 }, { bytes := 8 }] [0, 1, 2] }
+private def c10ExtLayouts : LayoutTable := { emptyLayoutTable with entries := [c10Zst1Layout, c10Clos3Layout, c10ClosMidZstLayout] }
 private def c10Zst1ClosTy : Ty := { kind := .closure "c10_zst1" [.tuple .nil], layoutIdx := 0 }
 private def c10Cap3ClosTy : Ty := { kind := .closure "c10_cap3" [.tuple .nil, .uint .u32, .ref .not (.uint .u32)], layoutIdx := 1 }
-/-- **`C10` 1-Capture ZST & 3-Capture ZST-Prefix `ScalarPair` Field-Read
-Witness**: verifies lockstep `Trusted` and `Miri` `.Field` reads on a 1-capture
-ZST closure `|()| ()` (`.live (.immediate .uninit)` in Miri) and across all 3
-fields `((), u32, &u32)` of a ZST-prefix `ScalarPair` closure through vendored
-`Miri.Interpreter.project`. -/
+private def c10CapMidClosTy : Ty := { kind := .closure "c10_capmid" [.uint .u32, .tuple .nil, .ref .not (.uint .u32)], layoutIdx := 2 }
+/-- **`C10` 1-Capture ZST & 3-Capture ZST-Prefix/Mid `ScalarPair` Field-Read
+Witness**: verifies lockstep `Trusted` and `Miri` `.Field` reads on `|()| ()`,
+ZST-prefix `((), u32, &u32)` (`#[0, 0, 8]`), and middle-ZST `(u32, (), &u32)`
+(`#[0, 4, 8]`) closures through vendored `Miri.Interpreter.project`. -/
 theorem w_c10_zstCapture_and_zstPrefix_scalarPair_field_reads :
     let refMsc := Miri.Memory.Scalar.fromPointer annealTargetDataLayout ⟨Miri.ABI.Size.ofBytes c8Base, .concrete c8Aid .one⟩
     let bZ1 := mkEp2Body "c10_z1" [ep2UnitTy, c10Zst1ClosTy] [.assign ⟨0, .nil⟩ (.use (.copy ⟨1, [.field 0 ep2UnitTy]⟩))] c10ExtLayouts
@@ -3713,10 +3716,14 @@ theorem w_c10_zstCapture_and_zstPrefix_scalarPair_field_reads :
     let bC3 := mkEp2Body "c10_c3" [ep2UnitTy, ep2U32Ty, ep2RefU32Ty, c10Cap3ClosTy] [.assign ⟨0, .nil⟩ (.use (.copy ⟨3, [.field 0 ep2UnitTy]⟩)), .assign ⟨1, .nil⟩ (.use (.copy ⟨3, [.field 1 ep2U32Ty]⟩)), .assign ⟨2, .nil⟩ (.use (.move ⟨3, [.field 2 ep2RefU32Ty]⟩))] c10ExtLayouts
     let sC3 : MachineState := { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .uninit, .uninit, .init (.aggregate 0 [.unit, .scalar ⟨42, 4⟩, .ptr ⟨65536, 0⟩ 8])] }, memory := emptyMemory }
     let mC3 := mkEp2MiriState bC3 ep2UnitTy #[⟨.live (.immediate .uninit), some (translateTy ep2UnitTy c10ExtLayouts)⟩, ⟨.live (.immediate .uninit), some (translateTy ep2U32Ty c10ExtLayouts)⟩, ⟨.live (.immediate .uninit), some (translateTy ep2RefU32Ty c10ExtLayouts)⟩, ⟨.live (.immediate (.scalarPair (.fromScalarInt c10Msc42) refMsc)), some (translateTy c10Cap3ClosTy c10ExtLayouts)⟩] (mkEp2AddrMachine c8Aid c8Base)
+    let bMid := mkEp2Body "c10_mid" [ep2U32Ty, ep2UnitTy, ep2RefU32Ty, c10CapMidClosTy] [.assign ⟨0, .nil⟩ (.use (.copy ⟨3, [.field 0 ep2U32Ty]⟩)), .assign ⟨1, .nil⟩ (.use (.copy ⟨3, [.field 1 ep2UnitTy]⟩)), .assign ⟨2, .nil⟩ (.use (.move ⟨3, [.field 2 ep2RefU32Ty]⟩))] c10ExtLayouts
+    let sMid : MachineState := { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .uninit, .uninit, .init (.aggregate 0 [.scalar ⟨42, 4⟩, .unit, .ptr ⟨65536, 0⟩ 8])] }, memory := emptyMemory }
+    let mMid := mkEp2MiriState bMid ep2U32Ty #[⟨.live (.immediate .uninit), some (translateTy ep2U32Ty c10ExtLayouts)⟩, ⟨.live (.immediate .uninit), some (translateTy ep2UnitTy c10ExtLayouts)⟩, ⟨.live (.immediate .uninit), some (translateTy ep2RefU32Ty c10ExtLayouts)⟩, ⟨.live (.immediate (.scalarPair (.fromScalarInt c10Msc42) refMsc)), some (translateTy c10CapMidClosTy c10ExtLayouts)⟩] (mkEp2AddrMachine c8Aid c8Base)
     let rZ1 := Miri.Interpreter.Step.step (annealStepHooksUnwindFnPtrClosure bZ1) () mZ1
     let h3 := annealStepHooksUnwindFnPtrClosure bC3; let r0 := Miri.Interpreter.Step.step h3 () mC3; let r1 := Miri.Interpreter.Step.step h3 () r0.1; let r2 := Miri.Interpreter.Step.step h3 () r1.1
-    (∃ s', stepMirFn bZ1 sZ1 = .step s' ∧ get? s'.frame.locals 0 = some (.init .unit)) ∧ rZ1.2 = .ok true ∧ miriLocalVal? rZ1.1 0 = some (.live (.immediate .uninit)) ∧ (∃ s1 s2 s3, stepMirFn bC3 sC3 = .step s1 ∧ stepMirFn bC3 s1 = .step s2 ∧ stepMirFn bC3 s2 = .step s3 ∧ get? s3.frame.locals 0 = some (.init .unit) ∧ get? s3.frame.locals 1 = some (.init (.scalar ⟨42, 4⟩)) ∧ get? s3.frame.locals 2 = some (.init (.ptr ⟨65536, 0⟩ 8))) ∧ r0.2 = .ok true ∧ r1.2 = .ok true ∧ r2.2 = .ok true ∧ miriLocalVal? r2.1 0 = some (.live (.immediate .uninit)) ∧ miriLocalVal? r2.1 1 = some (.live (.immediate (.scalar (.fromScalarInt c10Msc42)))) ∧ miriLocalVal? r2.1 2 = some (.live (.immediate (.scalar refMsc))) := by
-  refine ⟨⟨_, rfl, rfl⟩, (by with_unfolding_all rfl), (by with_unfolding_all rfl), ⟨_, _, _, rfl, rfl, rfl, rfl, rfl, rfl⟩, (by with_unfolding_all rfl), (by with_unfolding_all rfl), (by with_unfolding_all rfl), (by with_unfolding_all rfl), (by with_unfolding_all rfl), (by with_unfolding_all rfl)⟩
+    let hM := annealStepHooksUnwindFnPtrClosure bMid; let q0 := Miri.Interpreter.Step.step hM () mMid; let q1 := Miri.Interpreter.Step.step hM () q0.1; let q2 := Miri.Interpreter.Step.step hM () q1.1
+    (∃ s', stepMirFn bZ1 sZ1 = .step s' ∧ get? s'.frame.locals 0 = some (.init .unit)) ∧ rZ1.2 = .ok true ∧ miriLocalVal? rZ1.1 0 = some (.live (.immediate .uninit)) ∧ (∃ s1 s2 s3, stepMirFn bC3 sC3 = .step s1 ∧ stepMirFn bC3 s1 = .step s2 ∧ stepMirFn bC3 s2 = .step s3 ∧ get? s3.frame.locals 0 = some (.init .unit) ∧ get? s3.frame.locals 1 = some (.init (.scalar ⟨42, 4⟩)) ∧ get? s3.frame.locals 2 = some (.init (.ptr ⟨65536, 0⟩ 8))) ∧ r0.2 = .ok true ∧ r1.2 = .ok true ∧ r2.2 = .ok true ∧ miriLocalVal? r2.1 0 = some (.live (.immediate .uninit)) ∧ miriLocalVal? r2.1 1 = some (.live (.immediate (.scalar (.fromScalarInt c10Msc42)))) ∧ miriLocalVal? r2.1 2 = some (.live (.immediate (.scalar refMsc))) ∧ (∃ s1 s2 s3, stepMirFn bMid sMid = .step s1 ∧ stepMirFn bMid s1 = .step s2 ∧ stepMirFn bMid s2 = .step s3 ∧ get? s3.frame.locals 0 = some (.init (.scalar ⟨42, 4⟩)) ∧ get? s3.frame.locals 1 = some (.init .unit) ∧ get? s3.frame.locals 2 = some (.init (.ptr ⟨65536, 0⟩ 8))) ∧ q0.2 = .ok true ∧ q1.2 = .ok true ∧ q2.2 = .ok true ∧ miriLocalVal? q2.1 0 = some (.live (.immediate (.scalar (.fromScalarInt c10Msc42)))) ∧ miriLocalVal? q2.1 1 = some (.live (.immediate .uninit)) ∧ miriLocalVal? q2.1 2 = some (.live (.immediate (.scalar refMsc))) := by
+  refine ⟨⟨_, rfl, rfl⟩, (by with_unfolding_all rfl), (by with_unfolding_all rfl), ⟨_, _, _, rfl, rfl, rfl, rfl, rfl, rfl⟩, (by with_unfolding_all rfl), (by with_unfolding_all rfl), (by with_unfolding_all rfl), (by with_unfolding_all rfl), (by with_unfolding_all rfl), (by with_unfolding_all rfl), ⟨_, _, _, rfl, rfl, rfl, rfl, rfl, rfl⟩, (by with_unfolding_all rfl), (by with_unfolding_all rfl), (by with_unfolding_all rfl), (by with_unfolding_all rfl), (by with_unfolding_all rfl), (by with_unfolding_all rfl)⟩
 /-- **`C10` Witness**: 0-capture ZST closure (live & `.dead`-destination UB),
 2-capture `[u32, &u32]` closure construction + `.Move` deinit + `.Copy`
 preservation + 3-step `.Field` read-back on BOTH Trusted and Miri (`alloc2`),
