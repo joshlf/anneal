@@ -212,10 +212,13 @@ mechanically generated MiniRust Tree Borrows specification (`MiniRustSpec.Gen`,
   `end_call` (including two-entry disjoint-window frames via
   `tbm_end_call_twoDisjointWindows_simulates_execFrameExitMiniRust`), while
   `tbm_nestedSplitAtMut_symbolic` proves the nested outer-`#[rustc_no_writable]`
-  → two sub-slice `retag_ptr`s → stores → inner `end_call` (in BOTH forward and
-  reverse protector release order!) → outer `end_call` → sibling-read pattern
-  symbolically for arbitrary slice length `N`, arbitrary disjoint sub-slices,
-  and arbitrary surrounding `wfLive` borrow trees.
+  → two sub-slice `retag_ptr`s → stores → inner `end_call` → outer `end_call` →
+  sibling-read pattern symbolically for arbitrary slice length `N`, arbitrary
+  disjoint sub-slices, and arbitrary surrounding `wfLive` borrow trees under BOTH
+  forward and reverse inner protector release orders (both completing outer
+  `end_call` with `wfLive` and the identical byte-precise sibling permissions and
+  `load` outcomes; literal post-inner-exit tree equality `tbm6Rev = tbm6` is not
+  asserted).
 - The access, retag, and frame-exit simulations assume that the Anneal ancestor
   set coincides with the MiniRust path-prefix relation (`hloc`) and that pinned
   Miri's `SkipSelfAndChildren` pruning is INERT on visited nodes: every pruned
@@ -223,9 +226,12 @@ mechanically generated MiniRust Tree Borrows specification (`MiniRustSpec.Gen`,
   `isStrictDescendantOf = false`) is unchanged by the foreign step it skips
   (`foreignStepInert`, `FrameExitPruneInert`). This condition is proved BOTH
   necessary and sufficient for exact post-state / step-by-step lockstep
-  agreement (`tree_read_or_write_simulates_node_access_iff_pruneInert`,
-  `tbm_release_protector_simulates_execFrameExitMiniRust_step_iff_pruneInert`,
-  `tbm_release_protector_diverges_of_not_pruneInert`,
+  agreement (`tree_read_or_write_simulates_node_access_iff_pruneInert` — needing
+  neither separate tag-existence nor read-only hypotheses beyond success of the
+  Anneal access, and fired in both directions by
+  `canary_pruneInert_deepTree_load_and_retag` and `pruneInert_necessary_separation`
+  — plus `tbm_release_protector_simulates_execFrameExitMiniRust_step_iff_pruneInert`,
+  `tbm_release_protector_diverges_of_not_pruneInert`, and
   `tbm_end_call_lockstep_iff_pruneInert`), with closed witnesses of both state
   divergence and UB-vs-OK outcome divergence when it fails. All four statements
   are relative to a SUCCESSFUL pruned Anneal step; `endCallLockstepSim_end_call`
@@ -245,15 +251,18 @@ mechanically generated MiniRust Tree Borrows specification (`MiniRustSpec.Gen`,
   `endCallLockstepSim_end_call` on a genuine 2-entry frame).
 - Alignment is never checked by `TreeBorrowsMemory.retag_ptr`; the `Ref` vs.
   `Raw` alignment contrast lives one layer up in `Statement::Validate`
-  (`checkPtrM_tb_safe_ok_iff`). In `MachTB`, `Statement::Validate` DOES reach
-  BOTH dead/past-the-end ZST success AND the below-base ZST spec panic (for
-  `al = 1` at `base - 1`, and for `al = 4` at `base - 4`, while `al = 4` at
-  `base - 1` is caught first by `checkPtrM`'s alignment UB), and rejects ANY
-  `.Uninit` byte in the 8-byte pointer itself for BOTH safe and raw pointers
-  while ignoring `.Uninit` pointee bytes
-  (`canary_machTB_validate_zst_align_uninit_and_specPanic`). The two symbolic
-  statements behind this boundary, `checkPtrM_tb_safe_ok_iff` (success side, both
-  the live-in-bounds and the `sz = 0` disjunct) and
+  (`checkPtrM_tb_safe_ok_iff`, `evalStatementM_tb_validate_safe_vs_raw_boundary`).
+  In `MachTB`, `Statement::Validate` DOES reach BOTH dead/past-the-end ZST
+  success AND the below-base ZST spec panic (for `al = 1` at `base - 1`, and for
+  `al = 4` at `base - 4`, while `al = 4` at `base - 1` is caught first by
+  `checkPtrM`'s alignment UB), reduces raw thin-pointer validation to a
+  `placeStoreM` no-op, and rejects ANY `.Uninit` byte in the 8-byte pointer
+  itself for BOTH safe and raw pointers while ignoring `.Uninit` pointee bytes
+  (`canary_machTB_validate_zst_align_uninit_and_specPanic`, which fires both
+  conjuncts of `evalStatementM_tb_validate_safe_vs_raw_boundary` and
+  `evalStatementM_tb_validate_uninit_ptr_ub` on closed `MachTB` states). The two
+  companion symbolic statements behind this boundary, `checkPtrM_tb_safe_ok_iff`
+  (success side, both the live-in-bounds and the `sz = 0` disjunct) and
   `tbm_retag_ptr_pointee_data_irrelevant` (on `.Init` vs. all-`.Uninit` memories),
   are fired on closed values by `canary_retag_alignment_and_deref_boundary`.
 - The `Trusted` connection covers BOTH `#[rustc_no_writable]` (run-level
@@ -4981,8 +4990,16 @@ private theorem nwsr_exists_ok_of_isOk {ε α : Type} {r : Except ε α} (h : r.
 2. a WRITE through the `.frozen` sibling fails on the Anneal side and is Tree
    Borrows UB on the MiniRust side;
 3. a WRITE through the parent succeeds on both sides, disabling the sibling in a
-   `TreeSimInv`-related pair of post-states. -/
+   `TreeSimInv`-related pair of post-states;
+4. the same WRITE lifted to real `TreeBorrowsMemory.store` via
+   `tbm_store_simulates_execWorldRangeWrite` succeeds into a live `TreeSimInv`-related
+   allocation (and the `.frozen` sibling store is MiniRust UB). -/
 theorem canary_tree_simulation_twoBranch :
+    let tbm0 : Gen.TreeBorrowsMemory Gen.x86_64 :=
+      { params := ⟨true⟩
+        mem := { allocations :=
+          [{ mkRootAllocTB (tbU32Bytes 1) 256 4 .Stack with
+             extra := { root := twoBranchTreeMR (.Unprot .Frozen) } }], _phantom := ⟨⟩ } }
     (∃ w' t', execWorldRangeRead (mkTwoBranchWorld .unique .frozen) 2 0 4 = .ok w' ∧
       Node.access (twoBranchTreeMR (.Unprot .Frozen)) (some [1]) .Read ⟨0⟩ ⟨4⟩ = .ok t' ∧
       TreeSimInv 0 4 twoBranchEmb w' t' ∧
@@ -4996,7 +5013,19 @@ theorem canary_tree_simulation_twoBranch :
       Node.access (twoBranchTreeMR (.Unprot .Frozen)) (some [0]) .Write ⟨0⟩ ⟨4⟩ = .ok t' ∧
       TreeSimInv 0 4 twoBranchEmb w' t' ∧
       (findNode? w'.nodes 2).map (·.perm) = some .disabled ∧
-      (nodeAt t' [1]).map (·.permissions) = some (List.replicate 4 (.Unprot .Disabled))) := by
+      (nodeAt t' [1]).map (·.permissions) = some (List.replicate 4 (.Unprot .Disabled))) ∧
+    (∃ w' tbm' alloc',
+      execWorldRangeWrite (mkTwoBranchWorld .unique .frozen) 1 0 4 = .ok w' ∧
+      TreeBorrowsMemory.store tbm0 { addr := 256, provenance := some (⟨0⟩, [0]) }
+        (tbU32Bytes 9) ⟨4⟩ = .ok tbm' ∧
+      tbm'.mem.allocations[0]? = some alloc' ∧ alloc'.live = true ∧
+      TreeSimInv 0 4 twoBranchEmb w' alloc'.extra.root) := by
+  dsimp only
+  let tbm0 : Gen.TreeBorrowsMemory Gen.x86_64 :=
+    { params := ⟨true⟩
+      mem := { allocations :=
+        [{ mkRootAllocTB (tbU32Bytes 1) 256 4 .Stack with
+           extra := { root := twoBranchTreeMR (.Unprot .Frozen) } }], _phantom := ⟨⟩ } }
   have hinv : TreeSimInv 0 4 twoBranchEmb (mkTwoBranchWorld .unique .frozen)
       (twoBranchTreeMR (.Unprot .Frozen)) :=
     treeSimInv_of_bool _ _ _ _ _ (by decide +kernel)
@@ -5009,7 +5038,11 @@ theorem canary_tree_simulation_twoBranch :
   obtain ⟨hw1, _, _⟩ := tree_write_simulates_node_access 0 4 (by decide) twoBranchEmb
     (mkTwoBranchWorld .unique .frozen) (twoBranchTreeMR (.Unprot .Frozen)) 1 hinv rfl
     ⟨_, rfl⟩ (by decide +kernel) (by decide +kernel)
-  refine ⟨?_, ⟨rfl, hw2 _ rfl⟩, ?_⟩
+  obtain ⟨hst1, _, _⟩ := tbm_store_simulates_execWorldRangeWrite tbm0
+    { addr := 256, provenance := some (⟨0⟩, [0]) } (tbU32Bytes 9) ⟨4⟩ 0 _ 0
+    twoBranchEmb (mkTwoBranchWorld .unique .frozen) 1 rfl rfl rfl (by decide) (by decide)
+    (by decide) (by decide) hinv rfl ⟨_, rfl⟩ (by decide +kernel) (by decide +kernel)
+  refine ⟨?_, ⟨rfl, hw2 _ rfl⟩, ?_, ?_⟩
   · obtain ⟨w', hw'⟩ := nwsr_exists_ok_of_isOk
       (r := execWorldRangeRead (mkTwoBranchWorld .unique .frozen) 2 0 4) (by decide +kernel)
     obtain ⟨t', hacc, hinv'⟩ := hr1 w' hw'
@@ -5040,6 +5073,10 @@ theorem canary_tree_simulation_twoBranch :
     rw [hw'] at hd1
     rw [hacc'] at hd2
     exact ⟨w', t', hw', hacc', hinv', Option.some.inj hd1, Option.some.inj hd2⟩
+  · obtain ⟨w', hw'⟩ := nwsr_exists_ok_of_isOk
+      (r := execWorldRangeWrite (mkTwoBranchWorld .unique .frozen) 1 0 4) (by decide +kernel)
+    obtain ⟨tbm', alloc', hst, ha', hlive', hinv'⟩ := hst1 w' hw'
+    exact ⟨w', tbm', alloc', hw', hst, ha', hlive', hinv'⟩
 
 /-! #### Whole-Tree Retag Helpers -/
 
@@ -10017,13 +10054,13 @@ theorem perm_transition_foreign_fixed_iff_stepNodeOnRangeAccess_inert
 whole-tree `Node.access`** (`Read` and `Write`): whenever the pruned Anneal
 world access succeeds (`execWorldRangeRead` / `execWorldRangeWrite = .ok w'`),
 MiniRust's unpruned `Node.access` succeeds into a `TreeSimInv`-related tree
-**iff** every pruned foreign node satisfies `foreignStepInert = true`. -/
+**iff** every pruned foreign node satisfies `foreignStepInert = true`.
+Note that `hwOk` already entails both `findNode? w.nodes tag ≠ none` and
+(for writes) `w.allocReadOnly = false`, so neither is assumed separately. -/
 theorem tree_read_or_write_simulates_node_access_iff_pruneInert
     (isWrite : Bool) (off len : Nat) (hlen : 0 < len) (emb : Nat → Gen.Path)
     (w w' : FnEntryBorrowWorld) (t : Gen.Node) (tag : Nat)
     (hinv : TreeSimInv off len emb w t)
-    (hro : isWrite = true → w.allocReadOnly = false)
-    (htag : ∃ n, findNode? w.nodes tag = some n)
     (hloc : ∀ n ∈ w.nodes,
       (ancestorPathTags w.nodes tag).contains n.tag = locOf (some (emb tag)) (emb n.tag))
     (hwOk : (if isWrite then execWorldRangeWrite w tag off len
@@ -10101,10 +10138,12 @@ theorem tree_read_or_write_simulates_node_access_iff_pruneInert
     cases isWrite with
     | false =>
       simp only [Bool.false_eq_true, ↓reduceIte] at hwOk ⊢
+      obtain ⟨htag, _, _, _⟩ := (execWorldRangeRead_ok_iff w w' tag off len hne).mp hwOk
       exact (tree_read_simulates_node_access off len hlen emb w t tag hinv htag hloc hnoprune).1 w' hwOk
     | true =>
       simp only [↓reduceIte] at hwOk ⊢
-      exact (tree_write_simulates_node_access off len hlen emb w t tag hinv (hro rfl) htag hloc hnoprune).1 w' hwOk
+      obtain ⟨hro, htag, _, _, _⟩ := (execWorldRangeWrite_ok_iff w w' tag off len hne).mp hwOk
+      exact (tree_write_simulates_node_access off len hlen emb w t tag hinv hro htag hloc hnoprune).1 w' hwOk
 
 /-- **Exact necessary-and-sufficient characterization of `FrameExitPruneInert` for
 single-step `TreeBorrowsMemory.release_protector` vs `execFrameExitMiniRust`**:
@@ -16719,14 +16758,17 @@ hold `.Unprot .Unique` on `[0, N)`, ANY pre-existing foreign `.Unprot .Frozen`
 sibling/cousin reader `qs` hanging off an ancestor of `pPath` (`locOf (some qs) q = true →
 q = qs ∨ locOf (some pPath) q = true`), and ANY surrounding foreign nodes holding
 `permIsForeignPassive` on `[0, N)`:
-1. **Nested `#[rustc_no_writable]` lifecycle succeeds symbolically**:
+1. **Nested `#[rustc_no_writable]` lifecycle succeeds symbolically under BOTH inner
+   protector release orders**:
    outer `#[rustc_no_writable]` `FnEntry` retag on `[0, N)` → nested sub-slice 1
    `FnEntry` retag on `[off1, off1 + len1)` (policy `fnIw1`) → nested sub-slice 2
    `FnEntry` retag on `[off2, off2 + len2)` (policy `fnIw2`) → store `wBytes1` →
    store `wBytes2` → inner `end_call` (in BOTH forward AND reverse protector release
    order!) → outer `end_call` all succeed, preserving `TreeBorrowsMemory.wfLive` at
    every step;
-2. **Exact byte-precise post-exit sibling reader classification**:
+2. **Exact byte-precise post-exit sibling reader classification (under BOTH forward
+   and reverse inner release orders; literal post-inner-exit tree equality
+   `tbm6Rev = tbm6` is not asserted)**:
    - on EVERY unwritten byte `b < N` outside `[off1, off1 + len1) ∪ [off2, off2 + len2)`,
      the sibling `qs` STILL holds `.Unprot .Frozen`, and EVERY aligned
      `TreeBorrowsMemory.load` through `qs` on any unwritten sub-window `[oR, oR + lR)`
@@ -16782,8 +16824,30 @@ theorem tbm_nestedSplitAtMut_symbolic
       TreeBorrowsMemory.store tbm3 aPtr.thin_pointer wBytes1 ⟨al1⟩ = .ok tbm4 ∧
       TreeBorrowsMemory.store tbm4 bPtr.thin_pointer wBytes2 ⟨al2⟩ = .ok tbm5 ∧
       TreeBorrowsMemory.end_call tbm5 feInner2 = .ok tbm6 ∧
-      (∃ tbm6Rev, TreeBorrowsMemory.end_call tbm5 { protectors := feInner2.protectors.reverse } = .ok tbm6Rev ∧
-        TreeBorrowsMemory.wfLive tbm6Rev) ∧
+      (∃ tbm6Rev tbm7Rev alloc7Rev sFinalRev,
+        TreeBorrowsMemory.end_call tbm5 { protectors := feInner2.protectors.reverse } = .ok tbm6Rev ∧
+        TreeBorrowsMemory.wfLive tbm6Rev ∧
+        TreeBorrowsMemory.end_call tbm6Rev feOuter = .ok tbm7Rev ∧
+        TreeBorrowsMemory.wfLive tbm7Rev ∧
+        tbm7Rev.mem.allocations[id]? = some alloc7Rev ∧
+        nodeAt alloc7Rev.extra.root qs = some sFinalRev ∧
+        (∀ b < N, (b < off1 ∨ off1 + len1 ≤ b) → (b < off2 ∨ off2 + len2 ≤ b) →
+          sFinalRev.permissions[b]? = some (.Unprot .Frozen)) ∧
+        (∀ b, ((off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2)) →
+          sFinalRev.permissions[b]? = some (.Unprot .Disabled)) ∧
+        (∀ (oR lR alR : Nat), 0 < lR → oR + lR ≤ N →
+          (oR + lR ≤ off1 ∨ off1 + len1 ≤ oR) → (oR + lR ≤ off2 ∨ off2 + len2 ≤ oR) →
+          Align.is_aligned ⟨alR⟩ (alloc.addr + (oR : Int)) = true →
+          ∃ bytes tbmR, TreeBorrowsMemory.load tbm7Rev
+            { addr := alloc.addr + (oR : Int), provenance := some (⟨(id : Int)⟩, qs) }
+            ⟨lR⟩ ⟨alR⟩ = .ok (bytes, tbmR)) ∧
+        (∀ (oR lR alR : Nat) (b : Nat),
+          ((off1 ≤ b ∧ b < off1 + len1) ∨ (off2 ≤ b ∧ b < off2 + len2)) →
+          oR ≤ b → b < oR + lR → lR ≠ 0 → oR + lR ≤ N →
+          Align.is_aligned ⟨alR⟩ (alloc.addr + (oR : Int)) = true →
+          ∀ res, TreeBorrowsMemory.load tbm7Rev
+            { addr := alloc.addr + (oR : Int), provenance := some (⟨(id : Int)⟩, qs) }
+            ⟨lR⟩ ⟨alR⟩ ≠ .ok res)) ∧
       TreeBorrowsMemory.end_call tbm6 feOuter = .ok tbm7 ∧
       TreeBorrowsMemory.wfLive tbm7 ∧
       tbm7.mem.allocations[id]? = some alloc7 ∧
@@ -16855,7 +16919,9 @@ theorem tbm_nestedSplitAtMut_symbolic
         ⟨h.2.1, h.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.1, h.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2⟩)
       hAAt5 hAProt5 hALen5 hBAt5 hBProt5 hBLen5 hOuterAt5 hOuterProt5 hOuterLen5
       off1 len1 off2 len2 hdisj hbound1 hbound2 hA5Spec hB5Spec hOuter5Spec hroot5Old hsurj5All
-  obtain ⟨tbm6Rev, _, _, hendRev, hwf6Rev, _⟩ :=
+  obtain ⟨tbm6Rev, alloc6Rev, mOuter6Rev, hendRev, hwf6Rev, halloc6Rev, haddr6Rev, hlive6Rev,
+      hdata6RevLen, hOuterAt6Rev, hOuterProt6Rev, hOuterLen6Rev, hOuter6RevEq,
+      hB6RevUnprot, hA6RevUnprot, hroot6RevOld, hsurj6RevAll⟩ :=
     a3_nestedSplit_innerEndCall_ordered tbm5 hwf5 id alloc alloc5 N halloc5 hlive5 hdata5Len
       pPath qs outerPath bPath aPath mB5 mA5 mOuter5 hforS hPreOB hPreOA hOutNeB hOutNeA hABNe.symm
       hlocBA hlocAB hlocOB hlocOA
@@ -16895,9 +16961,30 @@ theorem tbm_nestedSplitAtMut_symbolic
       (fun q m0 hm0 => let h := hOldPath q m0 hm0; ⟨h.1, h.2.2.2.1, h.2.2.2.2.2.2.1⟩)
       hOuterAt6 hOuterProt6 hOuterLen6 off1 len1 off2 len2 hbound1 hbound2
       (fun b hb => (hOuter6Eq b hb).trans (hOuter5Spec b hb)) hA6Unprot hB6Unprot hroot6Old hsurj6All
+  obtain ⟨tbm7Rev, alloc7Rev, sFinalRev, hendOuterRev, hwf7Rev, halloc7Rev, hsFinalRev,
+      hsFinalRevFrz, hsFinalRevDis, hloadOkRev, hloadUbRev⟩ :=
+    a3_nestedSplit_outerEndCall_and_reads tbm6Rev hwf6Rev id alloc alloc6Rev N halloc6Rev
+      (haddr6Rev.trans haddr5) hlive6Rev hdata6RevLen pPath qs outerPath aPath bPath sNode
+      mOuter6Rev hsNode hforS hancS hPreOA hPreOB hOutNeA hOutNeB
+      (fun q m0 hm0 => let h := hOldPath q m0 hm0; ⟨h.1, h.2.2.2.1, h.2.2.2.2.2.2.1⟩)
+      hOuterAt6Rev hOuterProt6Rev hOuterLen6Rev off1 len1 off2 len2 hbound1 hbound2
+      (fun b hb => (hOuter6RevEq b hb).trans (hOuter5Spec b hb)) hA6RevUnprot hB6RevUnprot
+      (fun q m0 hm0 => by
+        obtain ⟨m6, hm6, hU, hP, hS⟩ := hroot6RevOld q m0 hm0
+        exact ⟨m6, hm6, hU, hP, fun hqs =>
+          let ⟨hF, hD⟩ := hS hqs
+          ⟨fun b hb ho1 ho2 => hF b hb ho2 ho1, fun b hor => hD b hor.symm⟩⟩)
+      (fun q m6 hm6 => by
+        rcases hsurj6RevAll q m6 hm6 with h | h | h | h
+        · exact Or.inr (Or.inl h)
+        · exact Or.inl h
+        · exact Or.inr (Or.inr (Or.inl h))
+        · exact Or.inr (Or.inr (Or.inr h)))
   exact ⟨_, tbm1, _, _, tbm2, _, _, tbm3, _, tbm4, tbm5, tbm6, tbm7, alloc7, sFinal,
-    hret1, hret2, hret3, hstore1, hstore2, hendFwd, ⟨tbm6Rev, hendRev, hwf6Rev⟩, hendOuter,
-    hwf7, halloc7, hsFinal, hsFinalFrz, hsFinalDis, hloadOk, hloadUb⟩
+    hret1, hret2, hret3, hstore1, hstore2, hendFwd,
+    ⟨tbm6Rev, tbm7Rev, alloc7Rev, sFinalRev, hendRev, hwf6Rev, hendOuterRev, hwf7Rev,
+      halloc7Rev, hsFinalRev, hsFinalRevFrz, hsFinalRevDis, hloadOkRev, hloadUbRev⟩,
+    hendOuter, hwf7, halloc7, hsFinal, hsFinalFrz, hsFinalDis, hloadOk, hloadUb⟩
 
 /-! ## Part 5: `#[rustc_no_writable]` Edge Cases on Real `TreeBorrowsMemory` Operations (`charon#1619` + `minirust#295`) -/
 
@@ -18398,8 +18485,10 @@ or `#[rustc_no_writable]` `FnEntry` retag through node `2` (`[0, 0]`) makes
 Miri's `SkipSelfAndChildren` pruning ACTIVE — the `.frozen` sibling `4` skips its
 subtree, so node `5` is pruned and the former "no node is pruned" hypothesis is
 FALSE — yet pruning is inert (`foreignStepInert`), and
-1. `tbm_load_simulates_execWorldRangeRead` fires: `execWorldRangeRead` and the real
-   `TreeBorrowsMemory.load` both succeed into `TreeSimInv`-related states;
+1. `tbm_load_simulates_execWorldRangeRead` and the `←` direction of
+   `tree_read_or_write_simulates_node_access_iff_pruneInert` fire:
+   `execWorldRangeRead`, `Node.access`, and the real `TreeBorrowsMemory.load` all
+   succeed into the same `TreeSimInv`-related post-state;
 2. `tbm_retag_ptr_fnEntry_mutOrBox_simulates_world` fires: the Anneal retag and
    the real `TreeBorrowsMemory.retag_ptr` both succeed, minting the child
    `[0, 0, 1]` (tag `6`) at depth 3 with `TreeSimInv` preserved. -/
@@ -18428,7 +18517,8 @@ theorem canary_pruneInert_deepTree_load_and_retag :
   have hloc : ∀ n ∈ deepExitWorld.nodes,
       (ancestorPathTags deepExitWorld.nodes 2).contains n.tag =
         locOf (some (deepExitEmb 2)) (deepExitEmb n.tag) := by decide +kernel
-  -- 1. load
+  -- 1. load (firing both tbm_load_simulates_execWorldRangeRead and
+  --    tree_read_or_write_simulates_node_access_iff_pruneInert.mpr)
   obtain ⟨hloadOk, _, _⟩ := tbm_load_simulates_execWorldRangeRead
     (mkTbmWithTree deepExitTreeMR) (tbmTreePtr [0, 0]) 8 ⟨4⟩ 0 _ 0 deepExitEmb deepExitWorld 2
     rfl rfl rfl (by decide) (by decide) (by decide) (by decide) hinv ⟨_, rfl⟩ hloc
@@ -18439,7 +18529,20 @@ theorem canary_pruneInert_deepTree_load_and_retag :
     | ok w' => exact ⟨w', rfl⟩
     | error _ => rw [h] at hrdChk; cases hrdChk
   obtain ⟨wR, hwR⟩ := hrdW
-  obtain ⟨tbmR, allocR, hloadR, hallocR, _, hinvR⟩ := hloadOk wR hwR
+  obtain ⟨tbmR, allocR, hloadR, hallocR, _, _⟩ := hloadOk wR hwR
+  obtain ⟨tR, haccR, hinvR_iff⟩ :=
+    (tree_read_or_write_simulates_node_access_iff_pruneInert false 0 8 (by decide) deepExitEmb
+      deepExitWorld wR deepExitTreeMR 2 hinv hloc hwR).mpr (by decide +kernel)
+  have hinvR : TreeSimInv 0 8 deepExitEmb wR allocR.extra.root := by
+    have haccR' : Node.access deepExitTreeMR (some [0, 0]) .Read ⟨0⟩ ⟨8⟩ = .ok tR := haccR
+    have heq := tbm_load_eq_node_access (mkTbmWithTree deepExitTreeMR) (tbmTreePtr [0, 0]) 8 ⟨4⟩
+      0 [0, 0] _ 0 rfl rfl rfl (by decide) (by decide) (by decide) (by decide)
+    rw [heq] at hloadR
+    dsimp only [mkTbmWithTree] at hloadR
+    rw [haccR'] at hloadR
+    cases hloadR
+    cases hallocR
+    exact hinvR_iff
   -- 2. retag
   obtain ⟨pNode, hpNode, hretOk, _, _⟩ := tbm_retag_ptr_fnEntry_mutOrBox_simulates_world
     (mkTbmWithTree deepExitTreeMR) TreeBorrowsMemory.new_call
@@ -18506,8 +18609,9 @@ through node `1` makes pinned Miri prune the protected node `3` beneath the
 `.frozen` sibling (leaving it `.reservedFrz false`) while MiniRust applies the
 foreign read (`Reserved { had_foreign_read: true }`): the pruned step is NOT
 inert (`foreignStepInert = false`), BOTH accesses succeed, and the resulting
-states are NOT `TreeSimInv`-related. So the `hnoprune` hypothesis of the
-whole-tree simulations cannot be weakened further. -/
+states are NOT `TreeSimInv`-related (derived directly via the `→` direction of
+`tree_read_or_write_simulates_node_access_iff_pruneInert`). So the `hnoprune`
+hypothesis of the whole-tree simulations cannot be weakened further. -/
 theorem pruneInert_necessary_separation :
     TreeSimInv 0 8 pruneSeparationEmb pruneSeparationWorld
       (pruneSeparationTreeMR (.Prot (.Reserved true false))) ∧
@@ -18521,20 +18625,20 @@ theorem pruneInert_necessary_separation :
       .ok (pruneSeparationTreeMR (.Prot (.Reserved true true))) ∧
     ¬ TreeSimInv 0 8 pruneSeparationEmb pruneSeparationWorld
       (pruneSeparationTreeMR (.Prot (.Reserved true true))) := by
-  refine ⟨treeSimInv_of_bool _ _ _ _ _ (by decide +kernel), by decide +kernel, by decide +kernel,
-    rfl, rfl, fun h => ?_⟩
-  obtain ⟨m, hm, _, p, hp, hwin⟩ :=
-    h.nodes ⟨3, some 2, .reservedFrz false, 0, 8, some 9, true⟩ (by decide)
-  have hmEq : m = ⟨[], List.replicate 8 (.Prot (.Reserved true true)), .Strong⟩ := by
-    cases hm; rfl
-  subst hmEq
-  have hp' : some (Gen.Permission.Prot (.Reserved true false)) = some p := hp
-  cases hp'
-  have h0 := hwin 0 (by decide) (by decide)
-  have e0 : (List.replicate 8 (Gen.Permission.Prot (.Reserved true true)))[0]? =
-      some (.Prot (.Reserved true true)) := rfl
-  rw [e0] at h0
-  cases h0
+  have hinv0 : TreeSimInv 0 8 pruneSeparationEmb pruneSeparationWorld
+      (pruneSeparationTreeMR (.Prot (.Reserved true false))) :=
+    treeSimInv_of_bool _ _ _ _ _ (by decide +kernel)
+  have hpr : isPrunedForeignNode pruneSeparationWorld.nodes
+      (ancestorPathTags pruneSeparationWorld.nodes 1) false 0 8
+      ⟨3, some 2, .reservedFrz false, 0, 8, some 9, true⟩ = true := by decide +kernel
+  have hninert : foreignStepInert pruneSeparationWorld.activeProtectors false 0 8
+      ⟨3, some 2, .reservedFrz false, 0, 8, some 9, true⟩ = false := by decide +kernel
+  refine ⟨hinv0, hpr, hninert, rfl, rfl, fun hinv1 => ?_⟩
+  have hinert := (tree_read_or_write_simulates_node_access_iff_pruneInert false 0 8 (by decide)
+    pruneSeparationEmb pruneSeparationWorld pruneSeparationWorld
+    (pruneSeparationTreeMR (.Prot (.Reserved true false))) 1 hinv0 (by decide +kernel) rfl).mp
+    ⟨_, rfl, hinv1⟩ ⟨3, some 2, .reservedFrz false, 0, 8, some 9, true⟩ (by decide) hpr
+  rw [hninert] at hinert; cases hinert
 
 /-- Borrow tree of the deallocation-boundary canary: root `[]` (`Unprot Unique`)
 with a protected child `[0]` (`cPerm` on all 8 bytes, protector `cProt`) and an
@@ -18741,9 +18845,10 @@ def disjointTwoParamEmb : Nat → Gen.Path
   | 4 => [3]
   | _ => [99]
 
-/-- **Closed non-vacuity canary for `TreeSimInvMulti` vs. `B1`'s `TreeSimInv` on
-disjoint sub-slices (`disjointTwoParamWorld` ↔ `disjointTwoParamTreeMR`)**:
-1. Proves `B1`'s `TreeSimInv` is **UNSATISFIABLE** on ALL three windows
+/-- **Closed non-vacuity canary for `TreeSimInvMulti` vs. single-window `TreeSimInv` on
+disjoint sub-slices (`disjointTwoParamWorld` ↔ `disjointTwoParamTreeMR`) and
+`tbm_slice_disjoint_getMut_sound`**:
+1. Proves single-window `TreeSimInv` is **UNSATISFIABLE** on ALL three windows
    `[0, 4)`, `[4, 8)`, and `[0, 8)` (`¬ TreeSimInv 0 4 ...`, `¬ TreeSimInv 4 4 ...`,
    `¬ TreeSimInv 0 8 ...`);
 2. Proves `TreeSimInvMulti 0 4` AND `TreeSimInvMulti 4 4` **BOTH HOLD
@@ -18753,7 +18858,10 @@ disjoint sub-slices (`disjointTwoParamWorld` ↔ `disjointTwoParamTreeMR`)**:
    `TreeSimInvMulti 0 4` AND `TreeSimInvMulti 4 4` (via
    `treeSimInvMulti_preserved_on_disjoint_window`), and then fires
    `tbm_load_simulates_execWorldRangeRead_multi` on `[4, 8)` (succeeding through
-   half-1 sibling `4`) and on `[0, 4)` (raising UB through half-0 sibling `2`)! -/
+   half-1 sibling `4`) and on `[0, 4)` (raising UB through half-0 sibling `2`)!
+4. Fires `tbm_slice_disjoint_getMut_sound` on an 8-byte slice split into `[0, 4)`
+   and `[4, 8)`, witnessing disjoint sub-slice retags and store commutativity
+   (`tbmRootOf tbm12 0 = tbmRootOf tbm21 0`). -/
 theorem canary_treeSimInvMulti_disjoint_slices :
     ¬ TreeSimInv 0 4 disjointTwoParamEmb disjointTwoParamWorld disjointTwoParamTreeMR ∧
     ¬ TreeSimInv 4 4 disjointTwoParamEmb disjointTwoParamWorld disjointTwoParamTreeMR ∧
@@ -18773,7 +18881,31 @@ theorem canary_treeSimInvMulti_disjoint_slices :
         .ok ((alloc1.data.drop 4).take 4, tbm2) ∧
       tbm2.mem.allocations[0]? = some alloc2 ∧
       TreeSimInvMulti 4 4 disjointTwoParamEmb w2 alloc2.extra.root ∧
-      TreeBorrowsMemory.load tbm2 (tbmTreePtr [1]) ⟨4⟩ ⟨4⟩ = .error (.ub msg)) := by
+      TreeBorrowsMemory.load tbm2 (tbmTreePtr [1]) ⟨4⟩ ⟨4⟩ = .error (.ub msg)) ∧
+    (let tbm0 : Gen.TreeBorrowsMemory Gen.x86_64 :=
+       { params := ⟨true⟩
+         mem := { allocations := [mkRootAllocTB (tbU32Bytes 11 ++ tbU32Bytes 22) 256 4 .Stack],
+                  _phantom := ⟨⟩ } }
+     ∃ tbm1 tbm2 fe1 fe2 tbm12 tbm21,
+       TreeBorrowsMemory.retag_ptr tbm0 TreeBorrowsMemory.new_call
+           { thin_pointer := { addr := 256 + ((0 : Nat) : Int), provenance := some (⟨0⟩, []) }, metadata := none }
+           (.Ref .Mutable (slicePointeeInfoMR 4 4)) true false nwsrVtableLookup =
+         .ok ({ thin_pointer := { addr := 256 + ((0 : Nat) : Int), provenance := some (⟨0⟩, [0]) }, metadata := none },
+           tbm1, fe1) ∧
+       TreeBorrowsMemory.retag_ptr tbm1 fe1
+           { thin_pointer := { addr := 256 + ((4 : Nat) : Int), provenance := some (⟨0⟩, []) }, metadata := none }
+           (.Ref .Mutable (slicePointeeInfoMR 4 4)) true true nwsrVtableLookup =
+         .ok ({ thin_pointer := { addr := 256 + ((4 : Nat) : Int), provenance := some (⟨0⟩, [1]) }, metadata := none },
+           tbm2, fe2) ∧
+       (TreeBorrowsMemory.store tbm2
+           { addr := 256 + ((0 : Nat) : Int), provenance := some (⟨0⟩, [0]) } (tbU32Bytes 33) ⟨4⟩ >>=
+         fun t => TreeBorrowsMemory.store t
+           { addr := 256 + ((4 : Nat) : Int), provenance := some (⟨0⟩, [1]) } (tbU32Bytes 44) ⟨4⟩) = .ok tbm12 ∧
+       (TreeBorrowsMemory.store tbm2
+           { addr := 256 + ((4 : Nat) : Int), provenance := some (⟨0⟩, [1]) } (tbU32Bytes 44) ⟨4⟩ >>=
+         fun t => TreeBorrowsMemory.store t
+           { addr := 256 + ((0 : Nat) : Int), provenance := some (⟨0⟩, [0]) } (tbU32Bytes 33) ⟨4⟩) = .ok tbm21 ∧
+       tbmRootOf tbm12 0 = tbmRootOf tbm21 0) := by
   have hnot04 : ¬ TreeSimInv 0 4 disjointTwoParamEmb disjointTwoParamWorld disjointTwoParamTreeMR := by
     intro h
     have hov := h.overlap ⟨3, some 0, .reservedFrz false, 4, 4, some 11, true⟩ (by decide)
@@ -18805,7 +18937,14 @@ theorem canary_treeSimInvMulti_disjoint_slices :
   have hinv44 : TreeSimInvMulti 4 4 disjointTwoParamEmb disjointTwoParamWorld disjointTwoParamTreeMR :=
     treeSimInvMulti_of_bool 4 4 disjointTwoParamEmb disjointTwoParamWorld disjointTwoParamTreeMR
       (by decide +kernel)
-  refine ⟨hnot04, hnot44, hnot08, hinv04, hinv44, ?_⟩
+  have hgetMut :=
+    (tbm_slice_disjoint_getMut_sound (tbU32Bytes 11 ++ tbU32Bytes 22) 256 4 0 4 4 4
+      (by decide) (by decide) (by decide) (by decide)
+      (tbU32Bytes 33) (tbU32Bytes 44) rfl rfl 4 4 (by decide) (by decide)
+      nwsrVtableLookup).1 false true
+  refine ⟨hnot04, hnot44, hnot08, hinv04, hinv44, ?_, by
+    obtain ⟨tbm1, tbm2, fe1, fe2, tbm12, tbm21, _, _, hret1, hret2, _, _, h12, h21, hcomm, _⟩ := hgetMut
+    exact ⟨tbm1, tbm2, fe1, fe2, tbm12, tbm21, hret1, hret2, h12, h21, hcomm⟩⟩
   -- Execute write on [0, 4) through tag 1
   let w1 : FnEntryBorrowWorld :=
     { nodes := [
@@ -19408,10 +19547,11 @@ disjoint-window `end_call`) and symbolic nested `split_at_mut`** (zero hypothese
 3. Fires `tbm_nestedSplitAtMut_symbolic` on a 12-byte allocation with a depth-2
    surrounding tree (root `[]` → `.Frozen` sibling `[0]` + intermediate `.Unique`
    parent `[1]`) and disjoint sub-slices `[1, 4)` and `[6, 9)`: the nested
-   `#[rustc_no_writable]` lifecycle succeeds with `wfLive`, `[0]` reads the
-   unwritten gap `[4, 6)` and tail `[9, 12)` while `[1, 4)` and `[6, 9)` are
-   `Disabled`, whereas a standard outer `&mut [u8; 12]` disables `[0]` on all
-   12 bytes immediately at entry! -/
+   `#[rustc_no_writable]` lifecycle succeeds with `wfLive` under BOTH forward and
+   reverse inner protector release orders (both completing outer `end_call`), `[0]`
+   reads the unwritten gap `[4, 6)` while `[1, 4)` is `Disabled` under BOTH orders,
+   whereas a standard outer `&mut [u8; 12]` disables `[0]` on all 12 bytes
+   immediately at entry! -/
 theorem canary_treeSimInvMulti_retag_endCall_and_nestedSplitAtMut_symbolic :
     (∃ w' cT tbm' alloc',
       execFnEntryMutRetagPrunedSourceOrder disjointTwoParamWorld 1 0 4 .rustcNoWritable false =
@@ -19456,8 +19596,17 @@ theorem canary_treeSimInvMulti_retag_endCall_and_nestedSplitAtMut_symbolic :
        TreeBorrowsMemory.store tbm3 aPtr.thin_pointer (List.replicate 3 (.Init 11 none)) ⟨1⟩ = .ok tbm4 ∧
        TreeBorrowsMemory.store tbm4 bPtr.thin_pointer (List.replicate 3 (.Init 22 none)) ⟨1⟩ = .ok tbm5 ∧
        TreeBorrowsMemory.end_call tbm5 feInner2 = .ok tbm6 ∧
-       (∃ tbm6Rev, TreeBorrowsMemory.end_call tbm5 { protectors := feInner2.protectors.reverse } = .ok tbm6Rev ∧
-         TreeBorrowsMemory.wfLive tbm6Rev) ∧
+       (∃ tbm6Rev tbm7Rev alloc7Rev sFinalRev,
+         TreeBorrowsMemory.end_call tbm5 { protectors := feInner2.protectors.reverse } = .ok tbm6Rev ∧
+         TreeBorrowsMemory.wfLive tbm6Rev ∧
+         TreeBorrowsMemory.end_call tbm6Rev feOuter = .ok tbm7Rev ∧
+         TreeBorrowsMemory.wfLive tbm7Rev ∧
+         tbm7Rev.mem.allocations[0]? = some alloc7Rev ∧
+         nodeAt alloc7Rev.extra.root [0] = some sFinalRev ∧
+         (∃ bytes tbmR, TreeBorrowsMemory.load tbm7Rev
+           { addr := 260, provenance := some (⟨0⟩, [0]) } ⟨2⟩ ⟨1⟩ = .ok (bytes, tbmR)) ∧
+         (∀ res, TreeBorrowsMemory.load tbm7Rev
+           { addr := 257, provenance := some (⟨0⟩, [0]) } ⟨3⟩ ⟨1⟩ ≠ .ok res)) ∧
        TreeBorrowsMemory.end_call tbm6 feOuter = .ok tbm7 ∧
        TreeBorrowsMemory.wfLive tbm7 ∧
        tbm7.mem.allocations[0]? = some alloc7 ∧
@@ -19594,7 +19743,9 @@ theorem canary_treeSimInvMulti_retag_endCall_and_nestedSplitAtMut_symbolic :
     have hps : nodePaths root12 = [[], [0], [1]] := rfl
     rw [hps] at hmem; simp only [List.mem_cons, List.not_mem_nil, or_false] at hmem; exact hmem
   obtain ⟨⟨op, t1, feO, ap, t2, fe1, bp, t3, fe2, t4, t5, t6, t7, a7, sF,
-      hr1, hr2, hr3, hs1, hs2, he1, ⟨t6R, he1R, hwf6R⟩, he2, hwf7, ha7, hsF, _, _, hldOk, hldUb⟩,
+      hr1, hr2, hr3, hs1, hs2, he1,
+      ⟨t6R, t7R, a7R, sFR, he1R, hwf6R, he2R, hwf7R, ha7R, hsFR, _, _, hldOkR, hldUbR⟩,
+      he2, hwf7, ha7, hsF, _, _, hldOk, hldUb⟩,
     ⟨opW, tW, feOW, aW, sW, hrW, haW, hsW, _, hldWUb⟩⟩ :=
     tbm_nestedSplitAtMut_symbolic tbm12 (tbm_wfLive_of_bool _ (by decide +kernel)) rfl
       0 _ 12 rfl rfl rfl [1] [0] _ _ rfl rfl rfl
@@ -19618,7 +19769,11 @@ theorem canary_treeSimInvMulti_retag_endCall_and_nestedSplitAtMut_symbolic :
     ⟨wEnd2, tbmE, allocE, hwEnd12, hendE, halE, hwfEImp (tbm_wfLive_of_bool _ (by decide +kernel)),
       hinvE04, hinvE44⟩,
     ⟨⟨op, t1, feO, ap, t2, fe1, bp, t3, fe2, t4, t5, t6, t7, a7, sF,
-        hr1, hr2, hr3, hs1, hs2, he1, ⟨t6R, he1R, hwf6R⟩, he2, hwf7, ha7, hsF,
+        hr1, hr2, hr3, hs1, hs2, he1,
+        ⟨t6R, t7R, a7R, sFR, he1R, hwf6R, he2R, hwf7R, ha7R, hsFR,
+          hldOkR 4 2 1 (by decide) (by decide) (Or.inr (by decide)) (Or.inl (by decide)) (by decide),
+          hldUbR 1 3 1 1 (Or.inl ⟨by decide, by decide⟩) (by decide) (by decide) (by decide) (by decide) (by decide)⟩,
+        he2, hwf7, ha7, hsF,
         hldOk 4 2 1 (by decide) (by decide) (Or.inr (by decide)) (Or.inl (by decide)) (by decide),
         hldUb 1 3 1 1 (Or.inl ⟨by decide, by decide⟩) (by decide) (by decide) (by decide) (by decide) (by decide)⟩,
       ⟨opW, tW, feOW, aW, sW, hrW, haW, hsW,
@@ -20357,8 +20512,9 @@ theorem staticShapeE_zstUnsafeCell_any_offset_correspondence :
    by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel⟩
 
 /-- **Closed non-vacuity canary for the symbolic static-write theorems**
-(zero hypotheses): instantiating `tbm_staticPreserved_retag_ptr` and
-`tbm_staticRetagged_store_ok_iff_all_bytes_in_unsafeCell` on the reverse-offset,
+(zero hypotheses): instantiating `tbm_staticPreserved_retag_ptr`,
+`tbm_staticRetagged_store_ok_iff_all_bytes_in_unsafeCell`, and
+`tbm_staticPreserved_retag_then_store_iff` on the reverse-offset,
 zero-sized-cell-laden Shape (e) yields, on real `TreeBorrowsMemory.retag_ptr` and
 `TreeBorrowsMemory.store`:
 - the `AtomicI32` window `[4, 8)` is writable through the preserved tag;
@@ -20391,20 +20547,28 @@ theorem canary_part2_symbolic_static_write :
   obtain ⟨inside, hlen, hbytes, hretag⟩ :=
     tbm_staticPreserved_retag_ptr staticShapeEReverseDesc 4 staticShapeCInitBytes 256
       nwsrVtableLookup true (staticCellsValid_disjointInBounds _ hvalid) rfl
+  obtain ⟨tbm1, hret1, _, hiff1, _, _, _, _⟩ :=
+    tbm_staticPreserved_retag_then_store_iff staticShapeEReverseDesc hvalid 4 staticShapeCInitBytes
+      rfl 256 nwsrVtableLookup true 4 (tbU32Bytes 55) 4 (by decide) (by decide) (by decide)
+  have htbmEq : tbm1 = staticTbmRetagged staticShapeCInitBytes 256 4 inside := by
+    rw [hretag] at hret1; injection hret1 with h1; exact (congrArg (fun x => x.2.1) h1).symm
+  subst htbmEq
   refine ⟨inside, hretag, ?_, ?_, ?_, ?_⟩
-  · exact (tbm_staticRetagged_store_ok_iff_all_bytes_in_unsafeCell staticShapeEReverseDesc 4
-      staticShapeCInitBytes 256 inside hlen rfl hbytes 4 (tbU32Bytes 55) 4 (by decide)
-      (by decide) (by decide)).1.mpr
+  · obtain ⟨tbm2, hst, _⟩ := hiff1.mpr
       (nwsr_forall_window_of_all (byteInNonZeroUnsafeCell staticShapeEReverseDesc) 4 4
         (by decide +kernel))
+    exact ⟨tbm2, hst⟩
   · exact (tbm_staticRetagged_store_ok_iff_all_bytes_in_unsafeCell staticShapeEReverseDesc 4
       staticShapeCInitBytes 256 inside hlen rfl hbytes 3 (tbU8Bytes 9 ++ tbU8Bytes 9) 1
       (by decide) (by decide) (by decide)).2 ⟨3, Nat.le_refl _, by decide, by decide +kernel⟩
   · exact (tbm_staticRetagged_store_ok_iff_all_bytes_in_unsafeCell staticShapeEReverseDesc 4
       staticShapeCInitBytes 256 inside hlen rfl hbytes 0 (tbU8Bytes 9) 1 (by decide)
       (by decide) (by decide)).2 ⟨0, Nat.le_refl _, by decide, by decide +kernel⟩
-  · exact tbm_staticErased_store_always_ok staticShapeCInitBytes 256 4 0 (tbU8Bytes 9) 1
-      (by decide) (by decide) (by decide)
+  · obtain ⟨_, _, _, _, _, _, hE, _⟩ :=
+      tbm_staticPreserved_retag_then_store_iff staticShapeEReverseDesc hvalid 4
+        staticShapeCInitBytes rfl 256 nwsrVtableLookup true 0 (tbU8Bytes 9) 1 (by decide)
+        (by decide) (by decide)
+    exact hE
 
 /-! ### 6.4 Full-Domain Static Retag (`StaticCellsValid` ↔ `StaticTyDesc`) & Choice-Free Symbolic `MachTB.wfLive` Preservation -/
 
@@ -22651,8 +22815,9 @@ instantiates `tbm_staticPreserved_retag_then_store_full_iff` and
    Miri `.outOfBounds`) and Shape (a) (MiniRust OOB UB + Miri `.readOnlyAlloc`);
 3. in-bounds `Freeze` store `[0, 4)` on Shape (a) (MiniRust `"local write of Frozen reference"`
    + Miri `.readOnlyAlloc`), and valid/invalid stores `[4, 8)` / `[0, 1)` on Shape (e);
-4. symbolic `MachTB.wfLive` preservation via `machTB_staticAccess_steps_wfLive`
-   on Shape (e) preserved `AtomicI32` write (`n = 7`). -/
+4. symbolic `MachTB.wfLive` preservation via `machTB_harnesses_steps_wfLive`
+   (delegating to `machTB_staticAccess_steps_wfLive`) on Shape (e) preserved
+   `AtomicI32` write (`n = 7`). -/
 theorem canary_part6_fullDomain_and_symbolic_machTB_wfLive :
     (∃ tbmE tbmA,
       TreeBorrowsMemory.wfLive tbmE ∧
@@ -22733,8 +22898,8 @@ theorem canary_part6_fullDomain_and_symbolic_machTB_wfLive :
         staticShapeCInitBytes true 4 i32TyMR 55) with
     | error e => rw [hs] at hok; cases hok
     | ok m' =>
-      exact ⟨m', rfl, machTB_staticAccess_steps_wfLive staticShapeEReverseDesc staticShapeETyMR 4
-        staticShapeCInitBytes true 4 i32TyMR 55 7 m' hs⟩
+      exact ⟨m', rfl, machTB_harnesses_steps_wfLive.2.2.2.2.1 staticShapeEReverseDesc
+        staticShapeETyMR 4 staticShapeCInitBytes true 4 i32TyMR 55 7 m' hs⟩
 
 
 /-- **Closed non-vacuity canary for the alignment boundary** (zero hypotheses):
@@ -22811,8 +22976,9 @@ private def a2_mkSingleThreadMachTB (tbm : Gen.TreeBorrowsMemory Gen.x86_64) : M
 dereferenceability boundary** (`tbm_retag_ptr_raw_and_pinned_noop`,
 `tbm_retag_ptr_ignores_alignment`, `tbm_retag_ptr_safe_dereferenceable_ub`,
 `checkPtrM_tb_safe_vs_raw_boundary`, `checkPtrM_tb_safe_ok_iff`,
-`tbm_retag_ptr_pointee_data_irrelevant`,
-`evalStatementM_tb_validate_safe_vs_raw_boundary`; zero hypotheses):
+`tbm_retag_ptr_pointee_data_irrelevant`; zero hypotheses; the `Statement.Validate`
+layer `evalStatementM_tb_validate_safe_vs_raw_boundary` is fired in
+`canary_machTB_validate_zst_align_uninit_and_specPanic`):
 1. `#[rustc_no_writable]` `&mut u32` (`fnIw = false`, `fnEntry = true`):
    - aligned out-of-bounds pointer (`addr = 264`, 4-byte aligned, just past 8-byte alloc `[256, 264)`)
      is rejected at BOTH `TreeBorrowsMemory.retag_ptr`
@@ -23135,12 +23301,15 @@ uninitialized pointer vs. uninitialized pointee bytes** (zero hypotheses):
    item 4 of `canary_retag_alignment_and_deref_boundary`) and reaches `.error (.specPanic
    "Offset::from_bytes(ptr.addr - allocation.addr).unwrap()")` in real `MachTB`!;
 3. ZST `&mut Align4Zst` (`al = 4`) at `addr = 255`: caught FIRST by `checkPtrM` as
-   `.error (.ub "Value::Ptr: unaligned safe pointer")`;
+   `.error (.ub "Value::Ptr: unaligned safe pointer")` (firing the safe-pointer
+   UB conjunct of `evalStatementM_tb_validate_safe_vs_raw_boundary`);
 4. ZST `&mut Align4Zst` (`al = 4`) at `addr = 252` (4-byte aligned, below base
    `256`): passes `checkPtrM` and reaches `.error (.specPanic
    "Offset::from_bytes(ptr.addr - allocation.addr).unwrap()")` in real `MachTB`!;
 5. Raw pointer `*const ()` (`PtrType.Raw .None`) at `addr = 255` (and at null `0`):
-   `evalStatementM` SUCCEEDS with `0` protectors pushed;
+   `evalStatementM` reduces to a `placeStoreM` no-op (firing the raw-pointer
+   conjunct of `evalStatementM_tb_validate_safe_vs_raw_boundary`) and SUCCEEDS
+   with `0` protectors pushed;
 6. Uninitialized pointer representation (`List.replicate 8 .Uninit` in `_1`):
    raises `.error (.ub "load at type but the data in memory violates the language invariant")`
    for BOTH safe `&mut ()` AND raw `*const ()` (firing `evalStatementM_tb_validate_uninit_ptr_ub`);
@@ -23173,7 +23342,17 @@ theorem canary_machTB_validate_zst_align_uninit_and_specPanic :
       .error (.ub "Value::Ptr: unaligned safe pointer") ∧
     evalStatementM (mkDead zstAl4 252) stmt =
       .error (.specPanic "Offset::from_bytes(ptr.addr - allocation.addr).unwrap()") ∧
-    (∃ m', evalStatementM (mkDead rawTy 255) stmt = .ok m' ∧
+    (∃ cm2 m',
+      ConcurrentMemory.load (mkDead rawTy 255).mem
+        { addr := 512, provenance := some (⟨1⟩, []) } x86_64.PTR_SIZE ⟨1⟩ .None =
+        .ok (a3_encodeThinPtr 255 (some (⟨0⟩, [])), cm2) ∧
+      evalStatementM (mkDead rawTy 255) stmt =
+        placeStoreM { mkDead rawTy 255 with mem := cm2 }
+          { ptr := ThinPointer.widen { addr := 512, provenance := some (⟨1⟩, []) } none,
+            aligned := true }
+          (.Ptr (ThinPointer.widen { addr := 255, provenance := some (⟨0⟩, []) } none))
+          (.Ptr rawTy) ∧
+      evalStatementM (mkDead rawTy 255) stmt = .ok m' ∧
       (m'.threads[0]?.bind (fun t => t.stack.getLast?)).map (·.extra.protectors) = some []) ∧
     (∃ m', evalStatementM (mkDead rawTy 0) stmt = .ok m' ∧
       (m'.threads[0]?.bind (fun t => t.stack.getLast?)).map (·.extra.protectors) = some []) ∧
@@ -23213,13 +23392,61 @@ theorem canary_machTB_validate_zst_align_uninit_and_specPanic :
   refine ⟨hokProt _ _ (by decide +kernel),
     hokProt _ _ (by decide +kernel),
     rfl,
+    ?_,
     rfl,
-    rfl,
-    hokProt _ _ (by decide +kernel),
+    ?_,
     hokProt _ _ (by decide +kernel),
     ?_, ?_,
     hokUninit _ (by decide +kernel),
     hokUninit _ (by decide +kernel)⟩
+  · have hldChk : (match ConcurrentMemory.load
+        (mkValidateLocalMachTB false (tbU32Bytes 1)
+          (.Ref .Mutable (pointeeInfoOfFacts ⟨true, true, true⟩ 0 4 []))
+          (a3_encodeThinPtr 255 (some (⟨0⟩, []))) false).mem
+        { addr := 512, provenance := some (⟨1⟩, []) } x86_64.PTR_SIZE ⟨1⟩ .None with
+        | .ok (bs, _) => decide (bs = a3_encodeThinPtr 255 (some (⟨0⟩, [])))
+        | .error _ => false) = true := by decide +kernel
+    cases hld : ConcurrentMemory.load
+        (mkValidateLocalMachTB false (tbU32Bytes 1)
+          (.Ref .Mutable (pointeeInfoOfFacts ⟨true, true, true⟩ 0 4 []))
+          (a3_encodeThinPtr 255 (some (⟨0⟩, []))) false).mem
+        { addr := 512, provenance := some (⟨1⟩, []) } x86_64.PTR_SIZE ⟨1⟩ .None with
+    | error _ => rw [hld] at hldChk; cases hldChk
+    | ok pr =>
+      rcases pr with ⟨bs, cm2⟩; rw [hld] at hldChk
+      obtain rfl : bs = a3_encodeThinPtr 255 (some (⟨0⟩, [])) := of_decide_eq_true hldChk
+      exact (evalStatementM_tb_validate_safe_vs_raw_boundary _ _ _ _ _ true _ cm2
+        (ThinPointer.widen { addr := 255, provenance := some (⟨0⟩, []) } none)
+        rfl rfl rfl hld rfl).1 _
+        (((checkPtrM_tb_safe_vs_raw_boundary _ _ rfl (by decide)).2
+          (.Ref .Mutable (pointeeInfoOfFacts ⟨true, true, true⟩ 0 4 []))
+          (pointeeInfoOfFacts ⟨true, true, true⟩ 0 4 []) 0 ⟨4⟩ rfl rfl (by decide)).2.1
+          (by decide) (by decide))
+  · have hldChk : (match ConcurrentMemory.load
+        (mkValidateLocalMachTB false (tbU32Bytes 1) (.Raw .None)
+          (a3_encodeThinPtr 255 (some (⟨0⟩, []))) false).mem
+        { addr := 512, provenance := some (⟨1⟩, []) } x86_64.PTR_SIZE ⟨1⟩ .None with
+        | .ok (bs, _) => decide (bs = a3_encodeThinPtr 255 (some (⟨0⟩, [])))
+        | .error _ => false) = true := by decide +kernel
+    cases hld : ConcurrentMemory.load
+        (mkValidateLocalMachTB false (tbU32Bytes 1) (.Raw .None)
+          (a3_encodeThinPtr 255 (some (⟨0⟩, []))) false).mem
+        { addr := 512, provenance := some (⟨1⟩, []) } x86_64.PTR_SIZE ⟨1⟩ .None with
+    | error _ => rw [hld] at hldChk; cases hldChk
+    | ok pr =>
+      rcases pr with ⟨bs, cm2⟩; rw [hld] at hldChk
+      obtain rfl : bs = a3_encodeThinPtr 255 (some (⟨0⟩, [])) := of_decide_eq_true hldChk
+      let mRaw := mkValidateLocalMachTB false (tbU32Bytes 1) (.Raw .None)
+        (a3_encodeThinPtr 255 (some (⟨0⟩, []))) false
+      have hrawEq := (evalStatementM_tb_validate_safe_vs_raw_boundary mRaw mRaw
+        (.Local (localName 1))
+        { ptr := ThinPointer.widen { addr := 512, provenance := some (⟨1⟩, []) } none,
+          aligned := true }
+        (.Raw .None) true (a3_encodeThinPtr 255 (some (⟨0⟩, []))) cm2
+        (ThinPointer.widen { addr := 255, provenance := some (⟨0⟩, []) } none)
+        rfl rfl rfl hld rfl).2 rfl rfl (by decide) (by decide) _ _ rfl rfl
+      obtain ⟨m', hm', hpr⟩ := hokProt mRaw [] (by decide +kernel)
+      exact ⟨cm2, m', rfl, hrawEq, hm', hpr⟩
   · have hldChk : (match ConcurrentMemory.load
         (mkValidateLocalMachTB true (tbU32Bytes 1)
           (.Ref .Mutable (pointeeInfoOfFacts ⟨true, true, true⟩ 0 1 []))
