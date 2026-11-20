@@ -1553,7 +1553,7 @@ theorem call_intrinsic_audit_closure : True :=
 user-declared theorem of `Anneal.Mir.AdtAndControl` that neither `subplace_audit_closure`,
 `call_intrinsic_audit_closure`, nor any other `MiniRustSpec` declaration reaches (300 theorems of the
 scalar-validity, ADT layout, place, `Deinit` / `Retag`, and lowered-CFG layers that predate
-Episode 2). With those closures it puts **all 751** public theorems of `Anneal.Mir.AdtAndControl`
+Episode 2). With those closures it puts **every** public theorem of `Anneal.Mir.AdtAndControl`
 inside the dependency closure whose axioms `MiniRustSpec.Audit` checks, which
 `#assert_adt_control_audit_coverage` (`[ADT-AUDIT-COVERAGE]`) re-verifies mechanically. -/
 theorem adt_control_residual_audit_closure : True :=

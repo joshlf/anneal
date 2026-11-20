@@ -1512,6 +1512,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             "tests_mir_adt_and_control",
             "tests_mir_slice_wide_ptr_lens",
             "tests_mir_untested_variant_correspondence",
+            "tests_mir_volatile_unaligned_ptr",
             "lake_build_correspondence",
             "lake_build_minirust_spec",
             "lake_build_lean_miri_spec",
@@ -1567,7 +1568,8 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         self.assertEqual(len(suite._MIR_TEST_MODULE_FALLBACK), len(set(suite._MIR_TEST_MODULE_FALLBACK)))
         # The exact standalone `tests/mir` suites the nightly runs, including the
         # `Anneal.Mir.AdtAndControl` kernel-regression / axiom-pin suite, Episode 1's slice-lens
-        # witnesses and Episode 2's untested-variant correspondence suite.
+        # witnesses, Episode 2's untested-variant correspondence suite, and the kernel-checked
+        # volatile / unaligned raw-pointer access suite.
         self.assertEqual(
             sorted(rel for _step, rel in suite.MIR_STANDALONE_LEAN_TESTS),
             sorted(
@@ -1579,6 +1581,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     "AdtAndControlTests",
                     "MirSliceWidePtrLensTests",
                     "MirUntestedVariantCorrespondenceTests",
+                    "VolatileUnalignedPtrTests",
                 )
             ),
         )
@@ -1621,6 +1624,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             "tests_mir_adt_and_control": 300,
             "tests_mir_slice_wide_ptr_lens": 300,
             "tests_mir_untested_variant_correspondence": 300,
+            "tests_mir_volatile_unaligned_ptr": 300,
             "lake_build_correspondence": 900,
             "lake_build_minirust_spec": 1200,
             "lake_build_lean_miri_spec": 1800,

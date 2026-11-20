@@ -5232,6 +5232,7 @@ MIR_STANDALONE_LEAN_TESTS: tuple[tuple[str, str], ...] = (
     ("tests_mir_adt_and_control", "tests/mir/AdtAndControlTests.lean"),
     ("tests_mir_slice_wide_ptr_lens", "tests/mir/MirSliceWidePtrLensTests.lean"),
     ("tests_mir_untested_variant_correspondence", "tests/mir/MirUntestedVariantCorrespondenceTests.lean"),
+    ("tests_mir_volatile_unaligned_ptr", "tests/mir/VolatileUnalignedPtrTests.lean"),
 )
 CORE_THEORY_LIBS: tuple[str, ...] = ("Trusted", "Anneal", "MiniRust")
 _LOCAL_LEAN_LIB_FALLBACK: tuple[str, ...] = (
@@ -5255,6 +5256,7 @@ _MIR_TEST_MODULE_FALLBACK: tuple[str, ...] = (
     "Correspondence.V2026_06_01.L3_PlacesAndBasicMem",
     "Correspondence.V2026_06_01.L5_ControlAndCalls",
     "MiniRustSpec.Correspondence.Translate",
+    "Trusted.MirSemantics",
 )
 _LEAN_HEADER_TOKEN_RE = re.compile(r"(?:«[^»\n]*»|[^\s«])+")
 

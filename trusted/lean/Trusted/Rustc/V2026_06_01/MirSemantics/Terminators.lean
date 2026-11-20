@@ -3641,9 +3641,36 @@ Reference (The Rust Reference, "Never type"):
 
 > "The never type ! is a type with no values, representing the result of computations that never complete."
 
+Reference (`compiler/rustc_middle/src/mir/interpret/value.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/interpret/value.rs#L31-L65>
+
+> "pub enum ConstValue {
+>     ZeroSized,
+>     Scalar(Scalar),
+>     Slice { alloc_id: AllocId, meta: u64 },
+>     Indirect { alloc_id: AllocId, offset: Size },
+> }"
+
 Modeling choice: ADTs whose `TypeLayout` fixes a single variant require matching
 variant index, while multi-variant enums and unions are accepted at aggregate
 shape so valid enums and unions are never falsely rejected.
+
+Modeling choice: `evalConstValue` evaluates every `ConstValue.zeroSized`
+constant to `Value.unit`, whatever its zero-sized type, so `Value.unit` is a
+valid value of a tuple or array type that is zero-sized (structurally, by
+`isZeroSizedUnitElemTy`, or by a resolved `TypeLayout` of size `0`) and of an
+ADT whose resolved `TypeLayout` has size `0`. It is rejected at a tuple or array
+type that is not known to be zero-sized.
+
+Modeling choice: an ADT is checked against the `TypeLayout` at its layout index
+only when `layoutValidForResolvedAdt` accepts that entry for an ADT, which is
+the test `tyByteSizeAndAlignAux` applies before it sizes one. That trusts
+`layouts.entries[0]` when it has the shape of an ADT layout, and does not trust
+a primitive entry of non-zero size there, where the synthesized index `0` of an
+ADT collides with the layout of an unrelated scalar. An ADT with no trusted
+entry is accepted at every `Value.aggregate`, `Value.unit`, `Value.scalar`, and
+`Value.ptr` shape rather than checked against an unrelated entry.
 -/
 def rawPtrValueValid? : Nat → LayoutTable → Ty → Value → Bool
   | .zero, _, _, _ => true
@@ -3723,6 +3750,15 @@ def rawPtrValueValid? : Nat → LayoutTable → Ty → Value → Bool
               | false => .nil
             | .none => .nil
           rawPtrTupleFieldsValid? (rawPtrValueValid? fuel' layouts) layouts (k :: ks) fieldLays fields
+        | .unit =>
+          Bool.or
+            (isZeroSizedUnitElemTy 8 ty.kind)
+            (match
+               isUnresolvedLayoutIdx layouts ty.layoutIdx,
+               LayoutTable.lookup layouts ty.layoutIdx
+             with
+             | false, .some l => Nat.beq l.size.bytes 0
+             | _, _ => false)
         | _ => false
       | .array _ .zero =>
         match v with
@@ -3740,27 +3776,45 @@ def rawPtrValueValid? : Nat → LayoutTable → Ty → Value → Bool
             (Nat.beq (length elems) (.succ n))
             (rawPtrAllValuesValid? (rawPtrValueValid? fuel' layouts)
               { kind := elemK, layoutIdx := elemLayIdx } elems)
+        | .unit =>
+          Bool.or
+            (isZeroSizedUnitElemTy 8 ty.kind)
+            (match
+               isUnresolvedLayoutIdx layouts ty.layoutIdx,
+               LayoutTable.lookup layouts ty.layoutIdx
+             with
+             | false, .some l => Nat.beq l.size.bytes 0
+             | _, _ => false)
         | _ => false
       | .adt _ _ =>
+        let layoutOpt : Option TypeLayout :=
+          match LayoutTable.lookup layouts ty.layoutIdx with
+          | .some l =>
+            match layoutValidForResolvedAdt ty.layoutIdx l with
+            | true => .some l
+            | false => .none
+          | .none => .none
         match v with
         | .aggregate varIdx _ =>
-          match LayoutTable.lookup layouts ty.layoutIdx with
+          match layoutOpt with
           | .some { variants := .single expectedVar, .. } => Nat.beq varIdx expectedVar
           | _ => true
         | .unit =>
-          match LayoutTable.lookup layouts ty.layoutIdx with
+          match layoutOpt with
           | .some l => Nat.beq l.size.bytes 0
-          | .none => false
+          | .none => true
         | .scalar sc =>
-          match LayoutTable.lookup layouts ty.layoutIdx with
+          match layoutOpt with
           | .some { fields := .primitive, size := sz, backendRepr := .scalar (.initialized _ vr), .. } =>
             Bool.and (Nat.beq sc.sizeBytes sz.bytes) (wrappingRangeContains vr sc.bits)
           | .some { fields := .primitive, size := sz, .. } => Nat.beq sc.sizeBytes sz.bytes
-          | _ => false
+          | .some _ => false
+          | .none => true
         | .ptr _ pSz =>
-          match LayoutTable.lookup layouts ty.layoutIdx with
+          match layoutOpt with
           | .some { fields := .primitive, size := sz, .. } => Nat.beq pSz sz.bytes
-          | _ => false
+          | .some _ => false
+          | .none => true
         | _ => false
       | _ => true
 
@@ -4060,10 +4114,16 @@ targetLocal)` overlaps a raw-pointer access of `accessBytes > 0` bytes at
 `.some true` (definitely overlaps), `.some false` (definitely disjoint), or
 `.none` (byte range undecidable).
 
-When `accessBytes < placeSize` (a strict sub-range access through a container
-pointer) or `b.rangeLen ≠ 0`, both the accessed interval and `b`'s interval are
-resolved to byte ranges within the root local so disjoint sibling/child borrows
-are never falsely invalidated or flagged as protector UB.
+Whenever the accessed interval and `b`'s interval both resolve to byte ranges
+within the root local (or `b.rangeLen ≠ 0`), overlap is decided on those byte
+ranges, so disjoint sibling/child borrows of a strict sub-range access are never
+falsely invalidated or flagged as protector UB, and borrows of places that share
+bytes without sharing a projection path (two fields of a `union`, or fields of
+two enum variants) are treated as overlapping. Only when a byte range cannot be
+computed does the decision fall back to the structural `projectionsOverlap`:
+structurally disjoint places are disjoint, and structurally overlapping places
+overlap a whole-place access (`offsetBytes = 0`, `accessBytes = placeSize`) and
+are undecidable for a strict sub-range access.
 
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
@@ -4088,45 +4148,45 @@ def rawPtrEntryOverlapsAccess
   match Nat.beq b.rangeLen 0, b.targetProjection with
   | true, .nil => .some true
   | true, _ :: _ =>
-    match fullPlace with
-    | true => .some (projectionsOverlap b.targetProjection entry.targetProjection)
-    | false =>
+    let entryBaseOpt :=
+      projectionChainByteOffset?
+        targetLayouts
+        (.some rootTy)
+        rootValOpt
+        .none
+        0
+        targetDecls
+        (normalizeSubsliceProjections
+          (stripTransparentProjections entry.targetProjection))
+    let bBaseOpt :=
+      projectionChainByteOffset?
+        targetLayouts
+        (.some rootTy)
+        rootValOpt
+        .none
+        0
+        targetDecls
+        (normalizeSubsliceProjections
+          (stripTransparentProjections b.targetProjection))
+    let bSizeOpt : Option Nat :=
+      match
+        placeTyResolved
+          targetDecls
+          targetLayouts
+          { local_ := b.targetLocal, projection := b.targetProjection }
+      with
+      | .some bPlaceTy => tyByteSize targetDecls targetLayouts bPlaceTy
+      | .none => .none
+    match entryBaseOpt, bBaseOpt, bSizeOpt with
+    | .some entryBase, .some bBase, .some bSize =>
+      .some (byteRangesOverlapBool (Nat.add entryBase offsetBytes) accessBytes bBase bSize)
+    | _, _, _ =>
       match projectionsOverlap b.targetProjection entry.targetProjection with
       | false => .some false
       | true =>
-        let entryBaseOpt :=
-          projectionChainByteOffset?
-            targetLayouts
-            (.some rootTy)
-            rootValOpt
-            .none
-            0
-            targetDecls
-            (normalizeSubsliceProjections
-              (stripTransparentProjections entry.targetProjection))
-        let bBaseOpt :=
-          projectionChainByteOffset?
-            targetLayouts
-            (.some rootTy)
-            rootValOpt
-            .none
-            0
-            targetDecls
-            (normalizeSubsliceProjections
-              (stripTransparentProjections b.targetProjection))
-        let bSizeOpt : Option Nat :=
-          match
-            placeTyResolved
-              targetDecls
-              targetLayouts
-              { local_ := b.targetLocal, projection := b.targetProjection }
-          with
-          | .some bPlaceTy => tyByteSize targetDecls targetLayouts bPlaceTy
-          | .none => .none
-        match entryBaseOpt, bBaseOpt, bSizeOpt with
-        | .some entryBase, .some bBase, .some bSize =>
-          .some (byteRangesOverlapBool (Nat.add entryBase offsetBytes) accessBytes bBase bSize)
-        | _, _, _ => .none
+        match fullPlace with
+        | true => .some true
+        | false => .none
   | false, _ =>
     let entryBaseOpt :=
       projectionChainByteOffset?

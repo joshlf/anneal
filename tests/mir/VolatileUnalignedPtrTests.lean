@@ -1,16 +1,12 @@
--- Copyright 2026 The Fuchsia Authors
---
--- Licensed under the Apache License, Version 2.0 (the "License");
--- you may not use this file except in compliance with the License.
--- You may obtain a copy of the License at
---
---     http://www.apache.org/licenses/LICENSE-2.0
---
--- Unless required by applicable law or agreed to in writing, software
--- distributed under the License is distributed on an "AS IS" BASIS,
--- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
--- See the License for the specific language governing permissions and
--- limitations under the License.
+/-
+Copyright 2026 The Fuchsia Authors
+
+Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+<LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+This file may not be copied, modified, or distributed except according to
+those terms.
+-/
 
 import Trusted.MirSemantics
 
@@ -140,6 +136,20 @@ private def lPairUnit : TypeLayout :=
     fields := .arbitrary [⟨0⟩, ⟨0⟩] [0, 1], variants := .single 0, isUninhabited := false,
     fieldLayouts := [6, 6] }
 
+private def lU32AndPairUnit : TypeLayout :=
+  -- (u32, ((), ())): the zero-sized second field sits at offset 4.
+  { size := ⟨4⟩, align := ⟨4⟩,
+    backendRepr := .memory,
+    fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [1, 18] }
+
+private def lUnionU32Arr3 : TypeLayout :=
+  -- union U { a: u32, b: [u8; 3] }: both fields start at offset 0.
+  { size := ⟨4⟩, align := ⟨4⟩,
+    backendRepr := .memory,
+    fields := .union 2, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [1, 13] }
+
 private def tbl : LayoutTable :=
   { pointerBits := 64,
     isLittleEndian := true,
@@ -162,7 +172,9 @@ private def tbl : LayoutTable :=
       lPairBoolU8,       -- 15
       lNonZeroU32,       -- 16
       lArrU32_0,         -- 17
-      lPairUnit          -- 18
+      lPairUnit,         -- 18
+      lU32AndPairUnit,   -- 19
+      lUnionU32Arr3      -- 20
     ] }
 
 private def tyU8 : Ty := ⟨.uint .u8, 0⟩
@@ -188,6 +200,8 @@ private def tyPairBoolU8 : Ty := ⟨.tuple [.bool, .uint .u8], 15⟩
 private def tyNonZeroU32 : Ty := ⟨.adt "NonZeroU32" [], 16⟩
 private def tyArrU32_0 : Ty := ⟨.array (.uint .u32) 0, 17⟩
 private def tyPairUnit : Ty := ⟨.tuple [.tuple [], .tuple []], 18⟩
+private def tyU32AndPairUnit : Ty := ⟨.tuple [.uint .u32, .tuple [.tuple [], .tuple []]], 19⟩
+private def tyUnionU32Arr3 : Ty := ⟨.adt "UnionU32Arr3" [], 20⟩
 
 private def mkDecl (ty : Ty) : LocalDecl :=
   { mutability := .mut, ty := ty, debugName := .none }
@@ -709,6 +723,112 @@ theorem evalTerminator_volatile_set_memory_steps :
                               .init (ptrVal 71 0), .init (u8Val 0x5A), .init (usizeVal 4)] },
         memory := { borrows := borrows } } := rfl
 
+-- ============================================================================
+-- 10. `[adv ep1-A1]` regressions: zero-sized constants and byte-level union overlap
+-- ============================================================================
+
+/-- A zero-sized constant evaluates to `Value.unit` whatever its zero-sized type
+(`evalConstValue`), so storing `Value.unit` at the zero-sized tuple type `((), ())` or the
+zero-sized array type `[(); 3]` is a valid no-op (it was a false `.ub` before `[adv ep1-A1]`),
+exactly like the canonical value `.aggregate 0 [.unit, .unit]`; `Value.unit` at the
+non-zero-sized `(u32, u32)` and `[u8; 4]` stays `.ub`. -/
+theorem store_zero_sized_const_unit_at_zst_tuple_ok :
+    rawPtrStoreAction true true [] [] [] [] []
+      (tgtWith "core::intrinsics::volatile_store" tyPairUnit)
+      [mkDecl tyUnit] tbl [] [usizeVal 0x1000, .unit] [.uninit] = .ret .unit ∧
+    rawPtrStoreAction true true [] [] [] [] []
+      (tgtWith "core::intrinsics::volatile_store" tyPairUnit)
+      [mkDecl tyUnit] tbl [] [usizeVal 0x1000, .aggregate 0 [.unit, .unit]] [.uninit] =
+      .ret .unit ∧
+    rawPtrStoreAction true true [] [] [] [] []
+      (tgtWith "core::intrinsics::volatile_store" ⟨.array (.tuple []) 3, 0⟩)
+      [mkDecl tyUnit] tbl [] [usizeVal 0x1000, .unit] [.uninit] = .ret .unit ∧
+    rawPtrStoreAction true true [] [] [] [] []
+      (tgtWith "core::intrinsics::volatile_store" tyPairU32)
+      [mkDecl tyUnit, mkDecl tyPairU32] tbl [] [usizeVal 0x1000, .unit] [.uninit, .uninit] =
+      .fault .ub ∧
+    rawPtrStoreAction true true [] [] [] [] []
+      (tgtWith "core::intrinsics::volatile_store" tyArrU8_4)
+      [mkDecl tyUnit, mkDecl tyArrU8_4] tbl [] [usizeVal 0x1000, .unit] [.uninit, .uninit] =
+      .fault .ub :=
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+private def u32AndPairUnitEntry : BorrowEntry :=
+  { tag := 80, targetLocal := 1, targetProjection := [], perm := .active,
+    targetFrameDepth := 0, allocDead := false }
+
+/-- `volatile_load::<(u32, ((), ()))>` of a local whose zero-sized second field holds the
+`Value.unit` of a zero-sized constant returns the value (it was a false `.ub` before
+`[adv ep1-A1]`); an invalid first field is still rejected by shape. -/
+theorem volatile_load_tuple_with_zero_sized_const_field_ok :
+    rawPtrLoadAction true true [u32AndPairUnitEntry] [] [] []
+      (tgtWith "core::intrinsics::volatile_load" tyU32AndPairUnit)
+      [mkDecl tyU32AndPairUnit, mkDecl tyU32AndPairUnit] tbl [] [ptrVal 80 0]
+      [.uninit, .init (.aggregate 0 [u32Val 7, .unit])] =
+      .retBorrows [u32AndPairUnitEntry] (.aggregate 0 [u32Val 7, .unit]) ∧
+    rawPtrLoadAction true true [u32AndPairUnitEntry] [] [] []
+      (tgtWith "core::intrinsics::volatile_load" tyU32AndPairUnit)
+      [mkDecl tyU32AndPairUnit, mkDecl tyU32AndPairUnit] tbl [] [ptrVal 80 0]
+      [.uninit, .init (.aggregate 0 [u8Val 7, .unit])] =
+      .fault .ub :=
+  ⟨rfl, rfl⟩
+
+/-- Two fields of a `union` share their bytes without sharing a projection path
+(`projectionsOverlap` calls them disjoint). A raw-pointer access through a pointer to field `a`
+overlaps a borrow of field `b` by byte range, for a whole-place and for a strict sub-range
+access, while bytes past the end of `b`'s place stay disjoint. -/
+theorem union_sibling_fields_overlap_by_bytes :
+    let aEntry : BorrowEntry :=
+      { tag := 90, targetLocal := 1, targetProjection := [.field 0 tyU32], perm := .active,
+        targetFrameDepth := 0, allocDead := false }
+    let bEntry : BorrowEntry :=
+      { tag := 91, targetLocal := 1, targetProjection := [.field 1 tyArrU8_3], perm := .frozen,
+        targetFrameDepth := 0, allocDead := false }
+    let decls := [mkDecl tyUnit, mkDecl tyUnionU32Arr3]
+    projectionsOverlap bEntry.targetProjection aEntry.targetProjection = false ∧
+    rawPtrEntryOverlapsAccess decls tbl tyUnionU32Arr3 .none aEntry 0 4 4 bEntry = .some true ∧
+    rawPtrEntryOverlapsAccess decls tbl tyUnionU32Arr3 .none aEntry 1 2 4 bEntry = .some true ∧
+    rawPtrEntryOverlapsAccess decls tbl tyUnionU32Arr3 .none aEntry 3 1 4 bEntry = .some false :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-! ## 11. ADT validity trusts the layout entries that sizing trusts -/
+
+private def lPairStruct : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨4⟩,
+    backendRepr := .memory,
+    fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [1, 1] }
+
+/-- A table whose entry `0` is the layout of an ADT (`struct PairStruct(u32, u32)`). -/
+private def tblAdtFirst : LayoutTable :=
+  { pointerBits := 64,
+    isLittleEndian := true,
+    entries := [
+      lPairStruct,       -- 0
+      lU32               -- 1
+    ] }
+
+private def tyPairStructAt0 : Ty := ⟨.adt "PairStruct" [], 0⟩
+
+/-- `rawPtrValueValid?` checks an ADT against the layout entry at its index exactly when
+`layoutValidForResolvedAdt` accepts the entry, as sizing does. Entry `0` shaped like an ADT
+layout is trusted: a wrong variant index, `Value.unit` at a non-zero size, and a bare scalar
+are invalid there. Entry `0` of `tbl` is the scalar layout of `u8`, which an ADT at the
+synthesized index `0` does not adopt (checking against it reported an eight-byte scalar as
+invalid before `[adv ep1-A1]`), and an out-of-range index has no entry. A resolved primitive
+wrapper (`NonZeroU32`) keeps its size and valid-range checks. -/
+theorem adt_validity_trusts_layout_entries_sizing_trusts :
+    rawPtrValueValid? 16 tblAdtFirst tyPairStructAt0 (.aggregate 0 [u32Val 1, u32Val 2]) = true ∧
+    rawPtrValueValid? 16 tblAdtFirst tyPairStructAt0 (.aggregate 1 [u32Val 1, u32Val 2]) = false ∧
+    rawPtrValueValid? 16 tblAdtFirst tyPairStructAt0 .unit = false ∧
+    rawPtrValueValid? 16 tblAdtFirst tyPairStructAt0 (u32Val 1) = false ∧
+    rawPtrValueValid? 16 tbl ⟨.adt "Wrapper64" [], 0⟩ (usizeVal 5) = true ∧
+    rawPtrValueValid? 16 tbl ⟨.adt "Wrapper64" [], 99⟩ (usizeVal 5) = true ∧
+    rawPtrValueValid? 16 tbl tyNonZeroU32 (u32Val 0) = false ∧
+    rawPtrValueValid? 16 tbl tyNonZeroU32 (u32Val 7) = true ∧
+    rawPtrValueValid? 16 tbl tyNonZeroU32 (usizeVal 7) = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 /-- info: 'Anneal.Mir.VolatileUnalignedPtrTests.read_unaligned_offset1_u32_ok' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms read_unaligned_offset1_u32_ok
@@ -724,5 +844,17 @@ theorem evalTerminator_volatile_set_memory_steps :
 /-- info: 'Anneal.Mir.VolatileUnalignedPtrTests.evalTerminator_volatile_set_memory_steps' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms evalTerminator_volatile_set_memory_steps
+
+/-- info: 'Anneal.Mir.VolatileUnalignedPtrTests.store_zero_sized_const_unit_at_zst_tuple_ok' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms store_zero_sized_const_unit_at_zst_tuple_ok
+
+/-- info: 'Anneal.Mir.VolatileUnalignedPtrTests.union_sibling_fields_overlap_by_bytes' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms union_sibling_fields_overlap_by_bytes
+
+/-- info: 'Anneal.Mir.VolatileUnalignedPtrTests.adt_validity_trusts_layout_entries_sizing_trusts' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms adt_validity_trusts_layout_entries_sizing_trusts
 
 end Anneal.Mir.VolatileUnalignedPtrTests
