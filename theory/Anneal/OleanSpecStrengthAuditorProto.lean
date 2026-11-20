@@ -7,6 +7,8 @@ import Lean.Compiler.ImplementedByAttr
 import Lean.Compiler.ExternAttr
 import Lean.Compiler.CSimpAttr
 import Lean.Compiler.IR.CompilerM
+import Lean.Compiler.LCNF.Passes
+import Lean.Compiler.LCNF.Simp.ConstantFold
 import Trusted.VerificationResult
 
 /-!
@@ -18,7 +20,8 @@ directly inside Lean `v4.34.1` with zero external Python source-text regex scann
 1. **Compiled `.olean` / `.olean.private` `MetaM` Environment Auditor**:
    Inspects compiled Lean `v4.34.1` module environments (`OLeanLevel.private`,
    `env.setExporting false`, `env.checked.get`, `Lean.collectAxioms`, and compiler
-   override attribute tables `@[implemented_by]`, `@[extern]`, `@[csimp]`, `@[init]`) across
+   override attribute and extension tables `@[implemented_by]`, `@[extern]`, `@[csimp]`,
+   `@[init]`, `@[export]`, `@[cpass]`, and custom LCNF constant folders) across
    the full kernel constant graph (`ci.type`, `ci.value? (allowOpaque := true)`,
    recursor `rules`, inductive `ctors`, constructor `induct`, mutual `all`, `.proj`
    struct references, and `Nat`/`String` literals).
@@ -60,7 +63,9 @@ structure AuditPolicy where
       `Lean.ofReduceNat`, `._native.`) are permitted. -/
   allowProvisionalNative : Bool := false
   /-- Whether compiler override attributes (`@[implemented_by]`, `@[extern]`,
-      `@[csimp]`, `@[init]`) are forbidden on non-stdlib declarations in the closure. -/
+      `@[csimp]`, `@[init]`, `@[export]`) are forbidden on non-stdlib declarations in the
+      closure, and whether custom compiler passes (`@[cpass]`) and custom LCNF constant
+      folders are forbidden in the compilation pipeline of the modules behind it. -/
   checkCompilerOverrides : Bool := true
   /-- Whether a Lean `v4.34.1` `module`-system `.olean` (`ModuleData.isModule = true`)
       must have a companion `.olean.private` artifact on disk. -/
@@ -567,29 +572,82 @@ def declarationEdges (target : Name) (ci : ConstantInfo) : NameSet × Array Audi
   | _ => pure ()
   return (edges, violations)
 
-/-- Index of `@[csimp]` theorems and redirected `fromDeclName`s collected directly
-    from BOTH the live extension state AND raw `importedEntries` (so `@[csimp]` is
-    caught even when `.olean`s are loaded with `loadExts := false`!). -/
+/-- Index of compiler-level rewrite and pipeline extensions (`@[csimp]`, `@[cpass]`, and
+    custom LCNF constant folders) collected from BOTH the live extension state AND raw
+    `importedEntries` (so overrides are caught even when `.olean`s are loaded with
+    `loadExts := false`!). -/
 structure CSimpIndex where
   thmNames : NameSet := {}
   fromToThm : Std.HashMap Name (Name × Name) := {}
+  /-- `@[cpass]` pass-installer registrations (`Lean.Compiler.LCNF.passManagerExt`), each
+      paired with the index of the *registering* module (`none`: the module being
+      elaborated). A registration rewrites the compilation pipeline of the registering
+      module and of every module importing it, whichever module declares the installer
+      it names. -/
+  cpassEntries : Array (Option Nat × Name) := #[]
+  /-- Custom LCNF constant-folder registrations (`ConstantFold.folderExt`) as
+      `(registering module, folded declaration, folder declaration)`. The folder
+      declaration is `.anonymous` when only the live folder table mentions the target. -/
+  folderEntries : Array (Option Nat × Name × Name) := #[]
+  /-- Names registered as pass installers (declaration-level reporting). -/
+  cpassInstallers : NameSet := {}
+  /-- Names registered as constant folders (declaration-level reporting). -/
+  folderDecls : NameSet := {}
+  /-- Declarations whose calls a custom constant folder rewrites (`target ↦ folder`). -/
+  folderTargets : Std.HashMap Name Name := {}
+  /-- Ways in which the live pass pipeline of the module being elaborated differs from
+      the toolchain's built-in one. Non-empty whenever a pass was added, removed, or
+      reordered, including by a metaprogram that edited the extension state directly
+      and left no registration behind. -/
+  livePipelineDrift : Array String := #[]
 
-/-- Build `CSimpIndex` across all non-stdlib imported modules and the live local state,
-    including closed-scope `@[scoped csimp]` entries recorded in `StateStack.newEntries`
-    and `StateStack.scopedEntries`. -/
+/-- Order-sensitive structural fingerprint of a pass pipeline: for every pass its list
+    (base, mono, mono after lambda lifting, impure), name, occurrence, and phases. Pass
+    bodies are closures and cannot be compared, so a pass replaced under an unchanged
+    name is not visible here. -/
+private def passManagerFingerprint (m : Lean.Compiler.LCNF.PassManager) :
+    Array (Nat × Name × Nat × Nat × Nat) :=
+  let fp (slot : Nat) (ps : Array Lean.Compiler.LCNF.Pass) :=
+    ps.map fun p => (slot, p.name, p.occurrence, p.phase.toNat, p.phaseOut.toNat)
+  fp 0 m.basePasses ++ fp 1 m.monoPasses ++ fp 2 m.monoPassesNoLambda ++ fp 3 m.impurePasses
+
+/-- Build `CSimpIndex` across all imported modules and the live local state, including
+    closed-scope `@[scoped csimp]` entries recorded in `StateStack.newEntries` and
+    `StateStack.scopedEntries`, `@[cpass]` pass installers, and custom constant folders.
+
+    A `@[csimp]` entry of the live state is exempt only when the exact triple
+    `(fromDeclName, toDeclName, thmName)` is stored in the entries of an imported stdlib
+    module. Exempting by the origin of `thmName` alone would let a metaprogram register
+    `victim ↦ evil` under the name of any stdlib theorem (`Nat.add_comm`): `CSimp.add`
+    validates the lemma's statement, adding an entry to the extension directly does not.
+
+    Pass installers and constant folders have no toolchain exemption at all: the pinned
+    toolchain registers none in its own modules. -/
 def buildCSimpIndex (privEnv : Environment) : CSimpIndex := Id.run do
   let mut thmNames : NameSet := {}
   let mut fromToThm : Std.HashMap Name (Name × Name) := {}
+  let mods := privEnv.header.modules
+  -- 0. Redirections shipped by the toolchain stdlib itself.
+  let mut stdlibTriples : Std.HashSet (Name × Name × Name) := {}
+  let mut stdlibThms : NameSet := {}
+  for h : modIdx in [:mods.size] do
+    if isStdlibMod mods[modIdx].module then
+      for raw in Lean.Compiler.CSimp.ext.ext.getModuleEntries privEnv modIdx do
+        let ent := match raw with
+          | .global e => e
+          | .scoped _ e => e
+        stdlibTriples := stdlibTriples.insert (ent.fromDeclName, ent.toDeclName, ent.thmName)
+        stdlibThms := stdlibThms.insert ent.thmName
   let addEntry (tAcc : NameSet) (mAcc : Std.HashMap Name (Name × Name))
       (ent : Lean.Compiler.CSimp.Entry) : NameSet × Std.HashMap Name (Name × Name) :=
-    if !((originModule? privEnv ent.thmName).any isStdlibMod) then
+    if !stdlibTriples.contains (ent.fromDeclName, ent.toDeclName, ent.thmName) then
       (tAcc.insert ent.thmName, mAcc.insert ent.fromDeclName (ent.toDeclName, ent.thmName))
     else
       (tAcc, mAcc)
   -- 1. Live active state (global, local, and currently open scoped entries).
   let st := Lean.Compiler.CSimp.ext.getState privEnv
   thmNames := st.thmNames.fold (init := thmNames) fun acc thm =>
-    if !((originModule? privEnv thm).any isStdlibMod) then acc.insert thm else acc
+    if !stdlibThms.contains thm then acc.insert thm else acc
   let (t1, m1) := st.map.fold (init := (thmNames, fromToThm)) fun (tAcc, mAcc) _ ent =>
     addEntry tAcc mAcc ent
   thmNames := t1
@@ -609,7 +667,8 @@ def buildCSimpIndex (privEnv : Environment) : CSimpIndex := Id.run do
   thmNames := t2
   fromToThm := m2
   -- 3. Raw imported module entries (works even under `loadExts := false`!).
-  let mods := privEnv.header.modules
+  let mut cpassEntries : Array (Option Nat × Name) := #[]
+  let mut folderEntries : Array (Option Nat × Name × Name) := #[]
   for h : modIdx in [:mods.size] do
     let modName := mods[modIdx].module
     if !isStdlibMod modName then
@@ -620,7 +679,45 @@ def buildCSimpIndex (privEnv : Environment) : CSimpIndex := Id.run do
           | .scoped _ e => e
         thmNames := thmNames.insert ent.thmName
         fromToThm := fromToThm.insert ent.fromDeclName (ent.toDeclName, ent.thmName)
-  return { thmNames, fromToThm }
+    for inst in Lean.Compiler.LCNF.passManagerExt.getModuleEntries privEnv modIdx do
+      cpassEntries := cpassEntries.push (some modIdx, inst)
+    for fe in Lean.Compiler.LCNF.Simp.ConstantFold.folderExt.getModuleEntries privEnv modIdx do
+      folderEntries := folderEntries.push (some modIdx, fe.declName, fe.folderDeclName)
+  -- 4. Live compiler pipeline of the module being elaborated. Every registration made
+  --    there counts, whatever name it was made under: the entry is what changes the
+  --    pipeline, and a metaprogram can add one naming any existing constant.
+  let (liveInstallers, liveManager) := Lean.Compiler.LCNF.passManagerExt.getState privEnv
+  for inst in liveInstallers do
+    cpassEntries := cpassEntries.push (none, inst)
+  let (liveFolderEntries, liveFolders) :=
+    Lean.Compiler.LCNF.Simp.ConstantFold.folderExt.getState privEnv
+  for fe in liveFolderEntries do
+    folderEntries := folderEntries.push (none, fe.declName, fe.folderDeclName)
+  let mut cpassInstallers : NameSet := {}
+  let mut folderDecls : NameSet := {}
+  let mut folderTargets : Std.HashMap Name Name := {}
+  for (_, inst) in cpassEntries do
+    cpassInstallers := cpassInstallers.insert inst
+  for (_, target, folder) in folderEntries do
+    folderDecls := folderDecls.insert folder
+    folderTargets := folderTargets.insert target folder
+  -- A folder present in the live table without any registration behind it (the table
+  -- was edited directly) still rewrites every call of its target.
+  let builtinFolders := Lean.Compiler.LCNF.Simp.ConstantFold.builtinFolders
+  let unregistered := liveFolders.fold (init := (#[] : Array Name)) fun acc target _ =>
+    if builtinFolders.contains target || folderTargets.contains target then acc
+    else acc.push target
+  for target in unregistered.qsort Name.lt do
+    folderEntries := folderEntries.push (none, target, .anonymous)
+    folderTargets := folderTargets.insert target .anonymous
+  let mut livePipelineDrift : Array String := #[]
+  let liveFp := passManagerFingerprint liveManager
+  let builtinFp := passManagerFingerprint Lean.Compiler.LCNF.builtinPassManager
+  if liveFp != builtinFp then
+    livePipelineDrift := livePipelineDrift.push
+      s!"live LCNF pass pipeline has {liveFp.size} passes in an order or with names that differ from the {builtinFp.size} built-in ones"
+  return { thmNames, fromToThm, cpassEntries, folderEntries, cpassInstallers, folderDecls,
+           folderTargets, livePipelineDrift }
 
 /-- Pure `MonadEnv` runner allowing `Lean.collectAxioms` to run directly on any
     `Environment` value (in pure code, `IO`, or `MetaM`) with `env.setExporting false`. -/
@@ -764,7 +861,8 @@ def detectPartialOrUnsafeRec (privEnv : Environment) (n : Name) (ci : ConstantIn
     | _ => none
 
 /-- Check compiler override attributes (`@[implemented_by]`, `@[extern]`, `@[csimp]`,
-    `@[init]` / `@[builtin_init]`) affecting declaration `n`.
+    `@[init]` / `@[builtin_init]`, `@[export]`, `@[cpass]`) and custom constant-folder
+    registrations affecting declaration `n`.
 
     Attributes *attached to* `n` are skipped only when `n` itself lives in the toolchain
     stdlib. `@[csimp]` redirections are different: the theorem may live in an untrusted
@@ -805,9 +903,20 @@ def checkCompilerOverridesOnDecl (privEnv : Environment) (csimpIdx : CSimpIndex)
     if let some expSym := Lean.getExportNameFor? privEnv n then
       vs := vs.push (.compilerOverrideAttribute target n "export"
         s!"exported under unmangled C symbol {expSym}")
+    if csimpIdx.cpassInstallers.contains n then
+      vs := vs.push (.compilerOverrideAttribute target n "cpass"
+        "declaration is registered as a custom LCNF compiler pass installer (@[cpass])")
+    if csimpIdx.folderDecls.contains n then
+      vs := vs.push (.compilerOverrideAttribute target n "constant_fold"
+        "declaration is registered as a custom LCNF constant folder")
   if let some (toDecl, thmName) := csimpIdx.fromToThm[n]? then
     vs := vs.push (.compilerOverrideAttribute target n "csimp_target"
       s!"replaced in compiled code by {toDecl} via @[csimp] {thmName}")
+  -- Like a `@[csimp]` redirection, a constant folder may be registered in an untrusted
+  -- module for a stdlib function, so this lookup runs for every `n`.
+  if let some folder := csimpIdx.folderTargets[n]? then
+    vs := vs.push (.compilerOverrideAttribute target n "constant_fold_target"
+      s!"calls are rewritten in compiled code by custom constant folder {folder}")
   return vs
 
 /-- Graph-walk fuel for `privEnv`: `policy.fuelOverride?` when set, otherwise twice the
@@ -944,11 +1053,23 @@ private def collectIRCalleesForDecl (privEnv : Environment) (csimpIdx : CSimpInd
       return (kernelCallees, vs, irSeen)
     let cur := irStack.back!
     irStack := irStack.pop
-    if let some irDecl := Lean.IR.findEnvDecl privEnv cur then
+    let curMod? := originModule? privEnv cur
+    match Lean.IR.findEnvDecl privEnv cur with
+    | none =>
+      -- The compiler records the signature of every function it generates code for
+      -- (`impureSigExt`, kept in full at `OLeanLevel.private`), but a `module` file's
+      -- bodies live in its `.ir` companion and the `.olean` parts hold nothing at all
+      -- for a `private` function. A signature without a body therefore means the
+      -- compiled code exists but was not loaded: nothing can be concluded about it.
+      if !(curMod?.any isToolchainMod) &&
+          (Lean.Compiler.LCNF.getSigCore? privEnv Lean.Compiler.LCNF.impureSigExt cur).isSome then
+        vs := pushUniqueViolation vs
+          (.environmentLoadFailed
+            s!"compiled IR of module {curMod?.getD .anonymous} was not loaded (declarations with a compiled signature have no IR body); the .ir companion artifact is missing")
+    | some irDecl =>
       let (callees, isExt, exhausted) := irDeclCallees irDecl
       if exhausted then
         vs := pushUniqueViolation vs (.auditFuelExhausted rootTarget s!"IR body walk ({cur})")
-      let curMod? := originModule? privEnv cur
       if isExt && !(curMod?.any isToolchainMod) then
         if cur != startDecl then
           vs := pushUniqueViolation vs
@@ -999,25 +1120,14 @@ def csimpShape? (ty : Expr) : Option (Name × Name) :=
   | some (_, .const f us, .const g vs) => if us == vs then some (f, g) else none
   | _ => none
 
-/-- Scan all non-toolchain modules declaring any reached non-toolchain constant (and
-    their downward non-toolchain transitive imports, plus `kenv.constants.map₂` if any
-    local constant was reached) for ambient `unsafe` declarations, `@[implemented_by]`,
-    `@[extern]`, non-stdlib `@[csimp]`, or non-companion `_unsafe_rec` siblings.
-
-    Because `@[local csimp]` is erased when its `section` closes (leaving zero entries in
-    `CSimp.ext` on disk) and its target can be fully inlined into compiled IR, scanning
-    ambient non-toolchain modules closes the only way `@[local csimp]` can introduce a
-    compiled-vs.-kernel discrepancy.
-
-    Also returns every ambient constant whose type has the `@[csimp]` shape
-    (`csimpShape?`). A `@[local csimp]` lemma leaves no attribute entry behind, and its
-    replacement function may be an ordinary definition with no override of its own; the
-    redirection is then only as sound as the lemma's *proof*. Callers must therefore
-    audit those constants as roots, so that a lemma resting on `sorryAx` or a custom
-    axiom cannot silently rewrite compiled code. -/
-private def ambientModuleOverrideViolations (privEnv : Environment) (csimpIdx : CSimpIndex)
-    (repTarget : Name) (visited : NameSet) : Array AuditViolation × Array Name := Id.run do
-  let kenv := privEnv.checked.get
+/-- The non-toolchain modules whose compiled code the audited closure rests on: every
+    non-toolchain module declaring a constant of `visited`, the direct imports of the
+    module being elaborated when a local constant was reached, and the downward
+    non-toolchain transitive imports of all of those (a fixed point bounded by the number
+    of modules). Returns one flag per imported module and whether a local constant was
+    reached. -/
+private def activeModuleClosure (privEnv : Environment) (visited : NameSet) :
+    Array Bool × Bool := Id.run do
   let nMods := privEnv.header.moduleNames.size
   let mut modIdxMap : Std.HashMap Name Nat := {}
   for i in [:nMods] do
@@ -1049,6 +1159,29 @@ private def ambientModuleOverrideViolations (privEnv : Environment) (csimpIdx : 
                 activeMods := activeMods.set! j true
                 changed := true
     if !changed then break
+  return (activeMods, sawLocal)
+
+/-- Scan all non-toolchain modules declaring any reached non-toolchain constant (and
+    their downward non-toolchain transitive imports, plus `kenv.constants.map₂` if any
+    local constant was reached) for ambient `unsafe` declarations, `@[implemented_by]`,
+    `@[extern]`, non-stdlib `@[csimp]`, or non-companion `_unsafe_rec` siblings.
+
+    Because `@[local csimp]` is erased when its `section` closes (leaving zero entries in
+    `CSimp.ext` on disk) and its target can be fully inlined into compiled IR, scanning
+    ambient non-toolchain modules closes the only way `@[local csimp]` can introduce a
+    compiled-vs.-kernel discrepancy.
+
+    Also returns every ambient constant whose type has the `@[csimp]` shape
+    (`csimpShape?`). A `@[local csimp]` lemma leaves no attribute entry behind, and its
+    replacement function may be an ordinary definition with no override of its own; the
+    redirection is then only as sound as the lemma's *proof*. Callers must therefore
+    audit those constants as roots, so that a lemma resting on `sorryAx` or a custom
+    axiom cannot silently rewrite compiled code. -/
+private def ambientModuleOverrideViolations (privEnv : Environment) (csimpIdx : CSimpIndex)
+    (repTarget : Name) (visited : NameSet) : Array AuditViolation × Array Name := Id.run do
+  let kenv := privEnv.checked.get
+  let nMods := privEnv.header.moduleNames.size
+  let (activeMods, sawLocal) := activeModuleClosure privEnv visited
   let mut vs : Array AuditViolation := #[]
   let mut checked : NameSet := {}
   let mut ambientDecls : Array (Name × ConstantInfo) := #[]
@@ -1092,6 +1225,56 @@ private def ambientModuleOverrideViolations (privEnv : Environment) (csimpIdx : 
             (.compilerOverrideAttribute repTarget owner "ambient_unsafe_rec_sibling"
               s!"ambient non-companion _unsafe_rec sibling {d} in non-toolchain module closure")
   return (vs, lemmaRoots.qsort Name.lt)
+
+/-- Report every custom compiler pass (`@[cpass]`, `passManagerExt`) and custom LCNF
+    constant folder (`ConstantFold.folderExt`) that takes part in compiling the audited
+    closure.
+
+    Unlike an attribute, these registrations sit on no declaration of the closure: a pass
+    rewrites the code of *every* declaration compiled in the registering module and in
+    all of its importers, and a folder rewrites every call of its target there, leaving no
+    edge in kernel terms or in the compiled IR of the rewritten function. A registration
+    is therefore judged by the module that *holds* it, never by the module declaring the
+    name it mentions: it is active when its registering module is in
+    `activeModuleClosure` (or is the module being elaborated and a local constant was
+    reached). A registration held by a toolchain-named module is active as soon as any
+    non-toolchain code is, because the pinned toolchain itself registers none.
+
+    Costs one emptiness test when nothing is registered. -/
+private def activeCompilerPipelineViolations (privEnv : Environment) (csimpIdx : CSimpIndex)
+    (repTarget : Name) (visited : NameSet) : Array AuditViolation := Id.run do
+  if csimpIdx.cpassEntries.isEmpty && csimpIdx.folderEntries.isEmpty &&
+      csimpIdx.livePipelineDrift.isEmpty then
+    return #[]
+  let (activeMods, sawLocal) := activeModuleClosure privEnv visited
+  let anyActive := sawLocal || activeMods.any id
+  let registrarName (reg : Option Nat) : Name :=
+    match reg with
+    | none => privEnv.header.mainModule
+    | some i => (privEnv.header.moduleNames[i]?).getD .anonymous
+  let isActive (reg : Option Nat) : Bool :=
+    match reg with
+    | none => sawLocal
+    | some i =>
+      match privEnv.header.moduleNames[i]? with
+      | some m => if isToolchainMod m then anyActive else activeMods[i]?.getD true
+      | none => true
+  let mut vs : Array AuditViolation := #[]
+  for (reg, inst) in csimpIdx.cpassEntries.qsort (fun a b => Name.lt a.2 b.2) do
+    if isActive reg then
+      vs := pushUniqueViolation vs
+        (.compilerOverrideAttribute repTarget inst "cpass"
+          s!"custom LCNF compiler pass installer {inst} registered in module {registrarName reg} rewrites the compiled code of the audited closure")
+  for (reg, target, folder) in csimpIdx.folderEntries.qsort (fun a b => Name.lt a.2.1 b.2.1) do
+    if isActive reg then
+      vs := pushUniqueViolation vs
+        (.compilerOverrideAttribute repTarget target "constant_fold"
+          s!"custom LCNF constant folder {folder} for {target} registered in module {registrarName reg} rewrites the compiled code of the audited closure")
+  if sawLocal then
+    for drift in csimpIdx.livePipelineDrift do
+      vs := pushUniqueViolation vs
+        (.compilerOverrideAttribute repTarget privEnv.header.mainModule "compiler_pipeline" drift)
+  return vs
 
 /-- Audit a list of target declarations in a given `Environment` (pure total core,
     always inspecting `env.setExporting false` and `env.checked.get`).
@@ -1254,6 +1437,13 @@ def auditDeclsInEnvPure (env : Environment) (targets : Array Name)
       violations := pushUniqueViolation violations
         (.auditFuelExhausted (targets[0]?.getD .anonymous) "kernel dependency closure")
       break
+  -- Custom compiler passes and constant folders rewrite compiled code without sitting on
+  -- any declaration of the closure, so they are judged against the modules behind
+  -- everything reached (always, not only in ambient mode: one emptiness test when no
+  -- such registration exists).
+  if policy.checkCompilerOverrides && !targets.isEmpty then
+    let pipelineVs := activeCompilerPipelineViolations privEnv csimpIdx targets[0]! visited
+    violations := pipelineVs.foldl pushUniqueViolation violations
   -- Cross-check against `Lean.collectAxioms` in `env.setExporting false`.
   if policy.crossCheckCollectAxioms then
     if targets.size <= 32 then
@@ -1313,11 +1503,27 @@ private def freshRecheckName (privEnv : Environment) (axName : Name) (rhs : Bool
       return cand
   return base.str "_fallback"
 
+/-- Clamp an absolute kernel heartbeat threshold into `[1, USize.size - 1]`.
+
+    `Kernel.Environment.addDeclCore` takes its threshold as a `USize` and reads `0` as
+    "no limit". Converting an unclamped `Nat` would wrap a value that reaches
+    `USize.size` around to a small number or to `0`, silently lifting the limit. -/
+def clampKernelHeartbeatThreshold (threshold : Nat) : USize :=
+  USize.ofNat (max 1 (min threshold (USize.size - 1)))
+
+/-- Absolute per-thread heartbeat threshold for one kernel call: the thread's current
+    heartbeat counter plus `100 * budget`, clamped by `clampKernelHeartbeatThreshold`.
+    The kernel polls the threshold only at coarse intervals, so this bounds a runaway
+    check rather than metering it. -/
+def kernelHeartbeatThreshold (budget : Nat) : IO USize := do
+  return clampKernelHeartbeatThreshold ((← IO.getNumHeartbeats) + 100 * budget)
+
 /-- Ask the kernel whether the Bool expression `e` of the native-evaluation axiom
     `axName : e = true` reduces to `rhs`, by type-checking `Eq.refl rhs : e = rhs` as a
     throw-away theorem under a guaranteed-fresh name. `maxHeartbeats` is the kernel's
-    absolute per-thread heartbeat threshold; exceeding it (or any other kernel failure)
-    yields `false`. Nothing is added to `privEnv`. -/
+    absolute per-thread heartbeat threshold (clamped, so it is never read as "no
+    limit"); exceeding it (or any other kernel failure) yields `false`. Nothing is added
+    to `privEnv`. -/
 def kernelProvesNativeEq (privEnv : Environment) (axName : Name) (ci : ConstantInfo)
     (rhs : Bool) (maxHeartbeats : Nat) : Bool :=
   match ci.type with
@@ -1330,7 +1536,7 @@ def kernelProvesNativeEq (privEnv : Environment) (axName : Name) (ci : ConstantI
       type := mkApp3 (mkConst ``Eq [lvl]) boolTy e rhsExpr
       value := mkApp2 (mkConst ``Eq.refl [lvl]) boolTy rhsExpr
     }
-    match kenv.addDeclCore maxHeartbeats.toUSize 512 decl none with
+    match kenv.addDeclCore (clampKernelHeartbeatThreshold maxHeartbeats) 512 decl none with
     | .ok _ => true
     | .error _ => false
   | _ => false
@@ -1424,12 +1630,12 @@ def recheckProvisionalNativeIO (privEnv : Environment) (policy : AuditPolicy)
       -- literal is only a hint for which polarity to try first: if the kernel does not
       -- agree with it, the opposite polarity is tried before giving up, so a disagreement
       -- between the two evaluators can never by itself keep a false axiom provisional.
-      let thresholdFirst := (← IO.getNumHeartbeats) + 100 * budget
+      let thresholdFirst := (← kernelHeartbeatThreshold budget).toNat
       let kernelValue? : Option Bool ←
         if kernelProvesNativeEq privEnv ax ci metaValue thresholdFirst then
           pure (some metaValue)
         else
-          let thresholdSecond := (← IO.getNumHeartbeats) + 100 * budget
+          let thresholdSecond := (← kernelHeartbeatThreshold budget).toNat
           if kernelProvesNativeEq privEnv ax ci (!metaValue) thresholdSecond then
             pure (some (!metaValue))
           else
@@ -2381,63 +2587,197 @@ private inductive SpecConclusionMatch where
   | notMatched
   | fuelExhausted
 
-/-- Weakly normalize an extracted `defId` argument expression (stripping `.mdata`,
-    zeta-reducing `.letE`, beta-reducing `.lam` applications, reducing `.proj` of
-    constructors, and unfolding `.defnInfo` aliases up to `fuel`) so wrapped string
-    literals resolve cleanly. -/
-private def normalizeDefIdArg (kenv : Kernel.Environment) (e : Expr) (fuel : Nat := 32) : Expr :=
+/-- Outcome of trying to fire one kernel computation rule (ι for a recursor, the
+    computation rule of `Quot.lift` / `Quot.ind`) at the head of a term. -/
+private inductive HeadStep where
+  | reduced (e : Expr)
+  /-- The kernel itself can never reduce this head, whatever the bound variables are
+      instantiated with afterwards. -/
+  | stuck
+  /-- This weak normalizer cannot tell whether the kernel reduces the head further
+      (a literal it does not expand, a constant it does not unfold, exhausted fuel, an
+      ill-formed application). Callers must fail closed. -/
+  | unknown
+
+/-- The kernel's `is_structure_like`: exactly one constructor, no indices, not recursive. -/
+private def isStructureLikeInduct (kenv : Kernel.Environment) (ind : Name) : Bool :=
+  match kenv.find? ind with
+  | some (.inductInfo iv) => iv.ctors.length == 1 && iv.numIndices == 0 && !iv.isRec
+  | _ => false
+
+/-- One ι-step of the recursor `v` applied to `args`, following the kernel's
+    `inductive_reduce_rec`. `major` is the already weakly normalized major premise
+    `args[v.getMajorIdx]`, and `majorNormal` says whether that normal form is certainly a
+    kernel weak-head normal form (see `headNormalize`).
+
+    A recursor application is `rec params motives minors indices major extra`, and the
+    rule for constructor `c` rewrites it to `rhs params motives minors fields extra`:
+    the *indices* are dropped, and `fields` are the last `nfields` arguments of the
+    constructor application (for nested inductive types the constructor's parameter count
+    differs from the recursor's, so the fields cannot be located by `numParams`).
+
+    Like the kernel, a `Nat` literal major is first put in constructor form, a major of
+    a structure-like type that is not a constructor application is η-expanded into
+    projections, and a K-like recursor accepts any major. The kernel guards the last two
+    with a type test this normalizer cannot run; skipping it can only reduce a term the
+    kernel leaves stuck, which never hides a match. -/
+private def iotaHeadStep (kenv : Kernel.Environment) (v : RecursorVal) (lvls : List Level)
+    (args : Array Expr) (major : Expr) (majorNormal : Bool) : HeadStep :=
+  let majorIdx := v.getMajorIdx
+  if v.levelParams.length != lvls.length || args.size ≤ majorIdx then
+    .unknown
+  else
+    let firstIndexIdx := v.numParams + v.numMotives + v.numMinors
+    let fire (rule : RecursorRule) (fields : Array Expr) : HeadStep :=
+      let rhs := rule.rhs.instantiateLevelParams v.levelParams lvls
+      .reduced (mkAppN (rhs.beta (args.extract 0 firstIndexIdx ++ fields))
+        (args.extract (majorIdx + 1) args.size))
+    let major := match major with
+      | .lit (.natVal n) =>
+        if n == 0 then mkConst ``Nat.zero else mkApp (mkConst ``Nat.succ) (mkRawNatLit (n - 1))
+      | m => m
+    let majorArgs := major.getAppArgs
+    let ctorRule? : Option RecursorRule := match major.getAppFn with
+      | .const c _ => v.rules.find? (fun rule => rule.ctor == c)
+      | _ => none
+    match ctorRule? with
+    | some rule =>
+      if rule.nfields ≤ majorArgs.size then
+        fire rule (majorArgs.extract (majorArgs.size - rule.nfields) majorArgs.size)
+      else .unknown
+    | none =>
+      match v.rules with
+      | [] => .stuck
+      | [rule] =>
+        if v.k then
+          if rule.nfields == 0 then fire rule #[] else .unknown
+        else if isStructureLikeInduct kenv v.getMajorInduct then
+          fire rule ((Array.range rule.nfields).map fun i => Expr.proj v.getMajorInduct i major)
+        else if majorNormal then .stuck
+        else .unknown
+      | _ => if majorNormal then .stuck else .unknown
+
+/-- Position of the `Quot.mk` argument of a quotient constant (`0` when it has none). -/
+private def quotMkPos (c : Name) : Nat :=
+  if c == ``Quot.lift then 5 else if c == ``Quot.ind then 4 else 0
+
+/-- One step of the computation rule of `Quot.lift` (`Quot.lift f h (Quot.mk r a) ↦ f a`)
+    or `Quot.ind`, following the kernel's `quot_reduce_rec`. `q` is the already weakly
+    normalized argument at the `Quot.mk` position (`quotMkPos`), `qNormal` whether that
+    is certainly a kernel weak-head normal form. `Quot` and `Quot.mk` never reduce. -/
+private def quotHeadStep (c : Name) (args : Array Expr) (q : Expr) (qNormal : Bool) :
+    HeadStep :=
+  if c != ``Quot.lift && c != ``Quot.ind then .stuck
+  else if args.size ≤ quotMkPos c then .unknown
+  else
+    match q.getAppFn with
+    | .const ``Quot.mk _ =>
+      let qArgs := q.getAppArgs
+      if qArgs.size == 3 then
+        .reduced (mkAppN (mkApp args[3]! qArgs[2]!) (args.extract (quotMkPos c + 1) args.size))
+      else .unknown
+    | _ => if qNormal then .stuck else .unknown
+
+/-- Weak head normalizer over kernel terms that may contain loose bound variables
+    (stripping `.mdata`, zeta-reducing `.letE`, beta-reducing `.lam` applications,
+    reducing `.proj` of constructors, unfolding `.defnInfo` constants, and firing
+    recursor (ι) and quotient computation rules up to `fuel`).
+
+    Returns the term it stopped at together with a flag that is `true` only when that
+    term is *certainly* a kernel weak-head normal form: its head is a variable, a sort, a
+    binder, a `Nat` literal, an axiom, an `opaque` constant, a type former, a
+    constructor, or a projection / recursor / quotient application stuck on such a term.
+    The flag is `false` whenever the kernel might still reduce what this function gave up
+    on (exhausted fuel, a theorem it does not unfold, a `String` literal it does not
+    expand, an ill-formed application), which is what lets callers tell "irreducible"
+    from "undecided" and fail closed on the latter. -/
+private def headNormalize (kenv : Kernel.Environment) (e : Expr) (fuel : Nat := 32) :
+    Expr × Bool :=
   match fuel with
-  | 0 => e
+  | 0 => (e, false)
   | fuel + 1 =>
     match e with
-    | .mdata _ inner => normalizeDefIdArg kenv inner fuel
-    | .letE _ _ val body _ => normalizeDefIdArg kenv (body.instantiate1 val) fuel
+    | .mdata _ inner => headNormalize kenv inner fuel
+    | .letE _ _ val body _ => headNormalize kenv (body.instantiate1 val) fuel
     | .proj structName idx s =>
-      let s' := normalizeDefIdArg kenv s fuel
+      let (s', sNormal) := headNormalize kenv s fuel
       match s'.getAppFn with
       | .const ctorName _ =>
         match kenv.find? ctorName with
         | some (.ctorInfo cinfo) =>
           let sArgs := s'.getAppArgs
           if cinfo.induct == structName && cinfo.numParams + idx < sArgs.size then
-            normalizeDefIdArg kenv sArgs[cinfo.numParams + idx]! fuel
-          else e
-        | _ => e
-      | _ => e
+            headNormalize kenv sArgs[cinfo.numParams + idx]! fuel
+          else (e, false)
+        | _ => (e, sNormal)
+      | .lit _ => (e, false)
+      | _ => (e, sNormal)
     | _ =>
       let fn := e.getAppFn
       let args := e.getAppArgs
       match fn with
-      | .mdata _ inner => normalizeDefIdArg kenv (mkAppN inner args) fuel
-      | .lam .. => normalizeDefIdArg kenv (fn.beta args) fuel
-      | .letE _ _ val body _ => normalizeDefIdArg kenv (mkAppN (body.instantiate1 val) args) fuel
+      | .mdata _ inner => headNormalize kenv (mkAppN inner args) fuel
+      | .lam .. =>
+        if args.isEmpty then (e, true) else headNormalize kenv (fn.beta args) fuel
+      | .letE _ _ val body _ =>
+        headNormalize kenv (mkAppN (body.instantiate1 val) args) fuel
       | .proj structName idx s =>
-        let s' := normalizeDefIdArg kenv s fuel
+        let (s', sNormal) := headNormalize kenv s fuel
         match s'.getAppFn with
         | .const ctorName _ =>
           match kenv.find? ctorName with
           | some (.ctorInfo cinfo) =>
             let sArgs := s'.getAppArgs
             if cinfo.induct == structName && cinfo.numParams + idx < sArgs.size then
-              normalizeDefIdArg kenv (mkAppN sArgs[cinfo.numParams + idx]! args) fuel
-            else e
-          | _ => e
-        | _ => e
+              headNormalize kenv (mkAppN sArgs[cinfo.numParams + idx]! args) fuel
+            else (e, false)
+          | _ => (e, sNormal)
+        | .lit _ => (e, false)
+        | _ => (e, sNormal)
       | .const c lvls =>
         match kenv.find? c with
         | some (.defnInfo v) =>
           if v.levelParams.length == lvls.length then
-            normalizeDefIdArg kenv ((v.value.instantiateLevelParams v.levelParams lvls).beta args) fuel
-          else e
-        | _ => e
-      | _ => e
+            headNormalize kenv ((v.value.instantiateLevelParams v.levelParams lvls).beta args) fuel
+          else (e, false)
+        | some (.recInfo v) =>
+          let (major, majorNormal) :=
+            headNormalize kenv (args[v.getMajorIdx]?.getD (.bvar 0)) fuel
+          match iotaHeadStep kenv v lvls args major majorNormal with
+          | .reduced e' => headNormalize kenv e' fuel
+          | .stuck => (e, true)
+          | .unknown => (e, false)
+        | some (.quotInfo _) =>
+          let (q, qNormal) := headNormalize kenv (args[quotMkPos c]?.getD (.bvar 0)) fuel
+          match quotHeadStep c args q qNormal with
+          | .reduced e' => headNormalize kenv e' fuel
+          | .stuck => (e, true)
+          | .unknown => (e, false)
+        | some (.thmInfo _) => (e, false)
+        | some _ => (e, true)
+        | none => (e, false)
+      | .bvar _ | .fvar _ | .sort _ | .forallE .. | .lit (.natVal _) => (e, true)
+      | _ => (e, false)
+
+/-- Weakly normalize an extracted `defId` argument expression (`headNormalize`) so
+    wrapped string literals resolve cleanly. A term that cannot be normalized further is
+    returned as is, and callers treat a non-literal result as a potential match. -/
+private def normalizeDefIdArg (kenv : Kernel.Environment) (e : Expr) (fuel : Nat := 32) : Expr :=
+  (headNormalize kenv e fuel).1
 
 /-- Pure structural normalizer for testing whether `ty` concludes in `specClass <arg>`
     (stripping `∀` telescopes via `getForallBody` without consuming fuel, stripping
     `.mdata`, zeta-reducing `.letE`, beta-reducing `.lam`, reducing `.proj` of
-    constructors, and delta-unfolding `.defnInfo` heads up to `fuel`).
-    Returns `.fuelExhausted` (fail-closed) if `fuel` runs out before reaching a
-    non-reducible head. -/
+    constructors, delta-unfolding `.defnInfo` heads, and firing recursor (ι) and
+    quotient computation rules up to `fuel`).
+
+    Returns `.fuelExhausted` (fail-closed) whenever it stops at a head it cannot prove
+    irreducible: when `fuel` runs out here or inside the nested `headNormalize`, at a
+    projection of a term that did not normalize to a constructor application, and at a
+    recursor or quotient application whose major premise it could not resolve.
+    `.notMatched` is reserved for heads the kernel itself is stuck on (a variable, an
+    axiom, an `opaque` constant, a type former, or a projection / recursor / quotient
+    application stuck on such a term). -/
 private def specClassConclusionMatch (kenv : Kernel.Environment) (specClass : Name) (ty : Expr)
     (fuel : Nat := 64) : SpecConclusionMatch :=
   match fuel with
@@ -2449,7 +2789,8 @@ private def specClassConclusionMatch (kenv : Kernel.Environment) (specClass : Na
     | .letE _ _ val body _ =>
       specClassConclusionMatch kenv specClass (body.instantiate1 val) fuel
     | .proj structName idx s =>
-      let s' := normalizeDefIdArg kenv s fuel
+      let (s', sNormal) := headNormalize kenv s fuel
+      let unresolved : SpecConclusionMatch := if sNormal then .notMatched else .fuelExhausted
       match s'.getAppFn with
       | .const ctorName _ =>
         match kenv.find? ctorName with
@@ -2457,9 +2798,10 @@ private def specClassConclusionMatch (kenv : Kernel.Environment) (specClass : Na
           let sArgs := s'.getAppArgs
           if cinfo.induct == structName && cinfo.numParams + idx < sArgs.size then
             specClassConclusionMatch kenv specClass sArgs[cinfo.numParams + idx]! fuel
-          else .notMatched
-        | _ => .notMatched
-      | _ => .notMatched
+          else .fuelExhausted
+        | _ => unresolved
+      | .lit _ => .fuelExhausted
+      | _ => unresolved
     | _ =>
       let fn := ty.getAppFn
       let args := ty.getAppArgs
@@ -2467,11 +2809,13 @@ private def specClassConclusionMatch (kenv : Kernel.Environment) (specClass : Na
       | .mdata _ inner =>
         specClassConclusionMatch kenv specClass (mkAppN inner args) fuel
       | .lam .. =>
-        specClassConclusionMatch kenv specClass (fn.beta args) fuel
+        if args.isEmpty then .notMatched
+        else specClassConclusionMatch kenv specClass (fn.beta args) fuel
       | .letE _ _ val body _ =>
         specClassConclusionMatch kenv specClass (mkAppN (body.instantiate1 val) args) fuel
       | .proj structName idx s =>
-        let s' := normalizeDefIdArg kenv s fuel
+        let (s', sNormal) := headNormalize kenv s fuel
+        let unresolved : SpecConclusionMatch := if sNormal then .notMatched else .fuelExhausted
         match s'.getAppFn with
         | .const ctorName _ =>
           match kenv.find? ctorName with
@@ -2479,9 +2823,10 @@ private def specClassConclusionMatch (kenv : Kernel.Environment) (specClass : Na
             let sArgs := s'.getAppArgs
             if cinfo.induct == structName && cinfo.numParams + idx < sArgs.size then
               specClassConclusionMatch kenv specClass (mkAppN sArgs[cinfo.numParams + idx]! args) fuel
-            else .notMatched
-          | _ => .notMatched
-        | _ => .notMatched
+            else .fuelExhausted
+          | _ => unresolved
+        | .lit _ => .fuelExhausted
+        | _ => unresolved
       | .const c lvls =>
         if c == specClass then
           .matched (normalizeDefIdArg kenv (args[0]?.getD (.bvar 0)))
@@ -2491,7 +2836,21 @@ private def specClassConclusionMatch (kenv : Kernel.Environment) (specClass : Na
             if v.levelParams.length == lvls.length then
               specClassConclusionMatch kenv specClass
                 ((v.value.instantiateLevelParams v.levelParams lvls).beta args) fuel
-            else .notMatched
+            else .fuelExhausted
+          | some (.recInfo v) =>
+            let (major, majorNormal) :=
+              headNormalize kenv (args[v.getMajorIdx]?.getD (.bvar 0)) fuel
+            match iotaHeadStep kenv v lvls args major majorNormal with
+            | .reduced ty' => specClassConclusionMatch kenv specClass ty' fuel
+            | .stuck => .notMatched
+            | .unknown => .fuelExhausted
+          | some (.quotInfo _) =>
+            let (q, qNormal) := headNormalize kenv (args[quotMkPos c]?.getD (.bvar 0)) fuel
+            match quotHeadStep c args q qNormal with
+            | .reduced ty' => specClassConclusionMatch kenv specClass ty' fuel
+            | .stuck => .notMatched
+            | .unknown => .fuelExhausted
+          | none => .fuelExhausted
           | _ => .notMatched
       | _ => .notMatched
 
@@ -2580,8 +2939,9 @@ private def canFastSkipSpecCandidate (kenv : Kernel.Environment) (specClass : Na
 
 /-- Pure scan for all non-constructor constants in modules reaching `specClass` (plus
     local constants) whose type concludes (up to `getForallBody`, `.mdata`, `.letE`,
-    `.lam`, `.proj`, and `.defnInfo` unfolding) in `specClass "<defId>"`, or in
-    `specClass e` for a non-literal `e` (or exhausts fuel, fail-closed).
+    `.lam`, `.proj`, `.defnInfo` unfolding, and recursor / quotient computation rules) in
+    `specClass "<defId>"`, or in `specClass e` for a non-literal `e`, or at a head the
+    normalizer cannot prove irreducible (fail-closed).
 
     Scans the kernel environment rather than the instance table, so `attribute [-instance]`,
     plain non-`instance` `def`s, `let`/`lam`/`proj`-wrapped types, and alias chains
@@ -2609,11 +2969,27 @@ def specInstanceCandidates (privEnv : Environment) (specClass : Name) (defId : S
     | _ => pure ()
   return found.qsort Name.lt
 
-/-- Run a `MetaM` check with `Lean.Meta.smartUnfolding` disabled so hand-written
-    `<name>._sunfold` sibling constants can never steer `Meta.whnf`, `Meta.isDefEq`, or
-    `Meta.synthInstance?` away from the kernel's true definitions. -/
+/-- Run a `MetaM` check so that nothing the caller did before, and nothing in the
+    caller's context, can steer `Meta.whnf`, `Meta.isDefEq`, or `Meta.synthInstance?`
+    away from the kernel's view of the environment:
+
+    - `Meta.withFreshCache`: the `whnf` / `inferType` / `synthInstance` / `defEq` caches
+      are keyed neither by `Meta.smartUnfolding` nor by the environment, so an entry
+      computed earlier in the same `MetaM` run (with smart unfolding on, or against a
+      different environment) would otherwise be replayed inside the gate;
+    - a default `Meta.Context`: the caller's `Meta.Config` (`zeta := false`,
+      `iota := false`, `proj := .no`, a reducible transparency, ...), its
+      `customCanUnfoldPredicate?`, local context, and local instances can each hide a
+      reduction the kernel performs, or supply an instance the environment lacks;
+    - `Meta.withNewMCtxDepth`: metavariables of the caller become read-only, so no
+      definitional-equality test in the gate can be satisfied by assigning one;
+    - `Lean.Meta.smartUnfolding := false`: hand-written `<name>._sunfold` sibling
+      constants are never consulted. -/
 private def withKernelFaithfulMeta (act : MetaM α) : MetaM α :=
-  withOptions (fun opts => Lean.Meta.smartUnfolding.set opts false) act
+  Meta.withFreshCache <|
+    withReader (fun _ => ({} : Meta.Context)) <|
+      Meta.withNewMCtxDepth <|
+        withOptions (fun opts => Lean.Meta.smartUnfolding.set opts false) act
 
 /-- Choose a fresh throw-away name under `prefixName` guaranteed absent from `privEnv`. -/
 private def freshKernelCheckName (privEnv : Environment) (prefixName : Name) (tag : String) : Name := Id.run do
@@ -2630,14 +3006,20 @@ private def freshKernelCheckName (privEnv : Environment) (prefixName : Name) (ta
       return cand
   return base.str "_fallback"
 
+/-- Heartbeat budget (in the units of `kernelHeartbeatThreshold`) for one kernel
+    confirmation of a certificate binding, a claim type, or a category-coverage test. -/
+def kernelConfirmHeartbeats : Nat := 200000
+
 /-- Ask Lean's kernel directly whether closed term `val` has type `ty` (in `privEnv`),
-    without modifying `privEnv`. Used to make certificate binding and claim extraction
-    rest on the kernel alone rather than `MetaM` definitional equality. -/
+    without modifying `privEnv`, under a bounded heartbeat threshold (a timeout counts
+    as a rejection). Used to make certificate binding and claim extraction rest on the
+    kernel alone rather than `MetaM` definitional equality. -/
 private def kernelConfirmsHasType (privEnv : Environment) (label : Name)
-    (levelParams : List Name) (val ty : Expr) (isProp : Bool) : Bool :=
+    (levelParams : List Name) (val ty : Expr) (isProp : Bool)
+    (heartbeatBudget : Nat := kernelConfirmHeartbeats) : IO Bool := do
   if val.hasFVar || val.hasMVar || val.hasLooseBVars ||
      ty.hasFVar || ty.hasMVar || ty.hasLooseBVars then
-    false
+    return false
   else
     let fresh := freshKernelCheckName privEnv label "_kernel_type_check"
     let decl :=
@@ -2648,16 +3030,19 @@ private def kernelConfirmsHasType (privEnv : Environment) (label : Name)
           name := fresh, levelParams, type := ty, value := val,
           hints := .opaque, safety := .safe
         }
-    match privEnv.checked.get.addDeclCore 0 512 decl none with
-    | .ok _ => true
-    | .error _ => false
+    let threshold ← kernelHeartbeatThreshold heartbeatBudget
+    return match privEnv.checked.get.addDeclCore threshold 512 decl none with
+      | .ok _ => true
+      | .error _ => false
 
 /-- Ask Lean's kernel directly whether `boolExpr = Bool.true` holds by definitional
-    reduction (`Eq.refl true`), without modifying `privEnv`. -/
+    reduction (`Eq.refl true`), without modifying `privEnv`, under a bounded heartbeat
+    threshold (a timeout counts as a rejection). -/
 private def kernelConfirmsBoolTrue (privEnv : Environment) (label : Name)
-    (levelParams : List Name) (boolExpr : Expr) : Bool :=
+    (levelParams : List Name) (boolExpr : Expr)
+    (heartbeatBudget : Nat := kernelConfirmHeartbeats) : IO Bool := do
   if boolExpr.hasFVar || boolExpr.hasMVar || boolExpr.hasLooseBVars then
-    false
+    return false
   else
     let lvl := Level.succ Level.zero
     let boolTy := mkConst ``Bool
@@ -2668,9 +3053,10 @@ private def kernelConfirmsBoolTrue (privEnv : Environment) (label : Name)
       type := mkApp3 (mkConst ``Eq [lvl]) boolTy boolExpr trueE
       value := mkApp2 (mkConst ``Eq.refl [lvl]) boolTy trueE
     }
-    match privEnv.checked.get.addDeclCore 0 512 decl none with
-    | .ok _ => true
-    | .error _ => false
+    let threshold ← kernelHeartbeatThreshold heartbeatBudget
+    return match privEnv.checked.get.addDeclCore threshold 512 decl none with
+      | .ok _ => true
+      | .error _ => false
 
 /-- Full `MetaM` scan for all non-constructor constants in modules reaching `specClass`
     (plus local constants) whose type reduces under `withKernelFaithfulMeta` and
@@ -2753,18 +3139,38 @@ def resolveUniqueSpecInstance (specName : Name) (specClass : Name) (defId : Stri
     A certificate that cannot be tied to the specification under audit is worthless, so
     binding information is mandatory: direct certificates need *both* `expectedReq?` and
     `expectedEns?`; typeclass certificates need `expectedDefId?` and must mention the
-    unique specification instance for that `defId`. -/
+    unique specification instance for that `defId`.
+
+    Every expected expression must be *closed* once the caller's assigned metavariables
+    are substituted. An unassigned metavariable would unify with whatever the
+    certificate states (binding it to nothing), and a free variable cannot be handed to
+    the kernel; either is rejected before any definitional-equality test runs. -/
 private def checkCertBinding (privEnv : Environment) (specName certDecl : Name)
     (certCi : ConstantInfo) (ty : Expr)
     (expectedReq? expectedEns? : Option Expr) (expectedDefId? : Option String)
     (expectedEnvAssumed? : Option Expr := none) :
-    MetaM (Option AuditViolation) :=
+    MetaM (Option AuditViolation) := do
+  -- Substitute the caller's assignments while its metavariable context is still
+  -- writable; inside `withKernelFaithfulMeta` those metavariables are read-only.
+  let expectedReq? ← expectedReq?.mapM instantiateMVars
+  let expectedEns? ← expectedEns?.mapM instantiateMVars
+  let expectedEnvAssumed? ← expectedEnvAssumed?.mapM instantiateMVars
+  let isClosed (e : Expr) : Bool := !e.hasMVar && !e.hasFVar && !e.hasLooseBVars
   withKernelFaithfulMeta do
     let fn := ty.getAppFn
     let args := ty.getAppArgs
+    unless isClosed ty do
+      return some (.specStrengthCertInvalidType certDecl specName
+        "certificate type is not a closed expression")
     let tyStr := toString (← Meta.ppExpr ty)
     let invalid (msg : String) : AuditViolation :=
       .specStrengthCertInvalidType certDecl specName s!"{msg}: {tyStr}"
+    for (role, e?) in [("precondition", expectedReq?), ("postcondition", expectedEns?),
+        ("rely predicate (envAssumed)", expectedEnvAssumed?)] do
+      if let some e := e? then
+        unless isClosed e do
+          return some (invalid
+            s!"expected {role} is not a closed expression (it contains an unassigned metavariable, a free variable, or a loose bound variable), so it cannot bind a certificate")
     let some head := fn.constName?
       | return some (invalid "not a SpecStrengthCert type")
     let certLvls := fn.constLevels!
@@ -2772,7 +3178,7 @@ private def checkCertBinding (privEnv : Environment) (specName certDecl : Name)
     let confirmKernel (boundTy : Expr) : MetaM (Option AuditViolation) := do
       let boundTy ← instantiateMVars boundTy
       let isProp ← Meta.isProp boundTy
-      if kernelConfirmsHasType privEnv certDecl certCi.levelParams certVal boundTy isProp then
+      if (← kernelConfirmsHasType privEnv certDecl certCi.levelParams certVal boundTy isProp) then
         return none
       else
         return some (invalid "kernel rejected certificate binding against expected specification")
@@ -2861,7 +3267,12 @@ private def missingMutantCategories (privEnv : Environment) (certLabel : Name)
     for cat in required do
       let covers ← instantiateMVars (← Meta.mkAppM ``MultiMutantSpecCert.coversCategory #[multiExpr, cat.toExpr])
       let r ← Meta.whnf covers
-      if !r.isConstOf ``Bool.true || !kernelConfirmsBoolTrue privEnv certLabel levelParams covers then
+      let confirmed ←
+        if r.isConstOf ``Bool.true then
+          kernelConfirmsBoolTrue privEnv certLabel levelParams covers
+        else
+          pure false
+      if !confirmed then
         missing := missing.push cat.label
     return missing
 
@@ -3022,10 +3433,15 @@ def auditClaimSpecStrengthInEnv
         let notClaim (why : String) : AuditViolation :=
           .specStrengthCertInvalidType claimDecl claimDecl s!"{why}: {tyStr}"
         let claimVal := mkConst claimDecl (ci.levelParams.map mkLevelParam)
+        let claimConfirmed ←
+          if args.size != 1 then
+            pure false
+          else
+            kernelConfirmsHasType privEnv claimDecl ci.levelParams claimVal
+              (mkApp (mkConst head ty.getAppFn.constLevels!) args[0]!) true
         if args.size != 1 then
           reject #[notClaim "claim is not a supported VerificationResult"]
-        else if !kernelConfirmsHasType privEnv claimDecl ci.levelParams claimVal
-            (mkApp (mkConst head ty.getAppFn.constLevels!) args[0]!) true then
+        else if !claimConfirmed then
           reject #[notClaim "kernel rejected extracted VerificationResult claim type"]
         else if head == ``VerificationResult then
           let c := args[0]!
@@ -3103,7 +3519,8 @@ private def auditSpecStrengthBySynthCore
         | .ok constSet =>
           let env ← getEnv
           let privEnv := env.setExporting false
-          if !kernelConfirmsHasType privEnv specName [] certInst certTy false then
+          let certConfirmed ← kernelConfirmsHasType privEnv specName [] certInst certTy false
+          if !certConfirmed then
             reject #[.specStrengthCertInvalidType specName specName
               "kernel rejected synthesized certificate instance type"]
           else

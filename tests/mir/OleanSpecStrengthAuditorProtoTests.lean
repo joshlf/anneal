@@ -1,5 +1,7 @@
 import Lean.Elab.Frontend
 import Lean.Elab.Tactic.Basic
+import Lean.Compiler.LCNF.Passes
+import Lean.Compiler.LCNF.Simp.ConstantFold
 import Trusted.VerificationResult
 import Anneal.OleanSpecStrengthAuditorProto
 
@@ -19,7 +21,10 @@ Exercises `Anneal.OleanSpecStrengthAuditorProto` across:
   `propext`), compiler-override misclassification and stdlib `@[csimp]` redirection,
   in-process statement-origin laundering, toolchain module-name spoofing, unbound or
   shadowed specification certificates, vacuous kills on unimplementable inputs, missing
-  `.olean.server` parts, empty target sets, and fuel exhaustion
+  `.olean.server` parts, empty target sets, fuel exhaustion, custom compiler passes and
+  constant folders, warm or caller-configured `MetaM` state, unbound expected
+  specifications, recursor- and quotient-typed instances, and `private` compiled code
+  whose `.ir` companion is missing
 
 This test file itself contains zero `sorry`, zero custom axioms, zero warnings,
 and cleans up every `/tmp/` directory in `try ... finally`.
@@ -1705,6 +1710,499 @@ run_cmd do
     , formatVerdictTags "A3_12b_forged_ir_clean_ret_residual" v12b ]
   logInfo (String.intercalate "\n" lines)
 
+/-! ## Pass B4 Hardening Regressions: Compiler Pipeline Extensions, Warm `MetaM` State, Unbound Expected Specifications, Recursor-Typed Instances, Forged `csimp` Entries -/
+
+/-- Test-only command adding an entry straight to `Lean.Compiler.CSimp.ext`, the way a
+    hostile metaprogram can: `Lean.Compiler.CSimp.add` validates the lemma's statement,
+    the extension itself accepts any `(from, to, theorem)` triple. -/
+elab "proto_forge_csimp_entry " fromDecl:ident toDecl:ident thm:ident : command => do
+  modifyEnv fun env =>
+    Lean.Compiler.CSimp.ext.addEntry env
+      { fromDeclName := fromDecl.getId, toDeclName := toDecl.getId, thmName := thm.getId }
+
+/-- Test-only command recording a `@[cpass]` registration under an arbitrary name (the
+    pass manager itself is left as it is). -/
+elab "proto_forge_cpass_entry " installer:ident : command => do
+  modifyEnv fun env =>
+    let st := Lean.Compiler.LCNF.passManagerExt.getState env
+    Lean.Compiler.LCNF.passManagerExt.addEntry env (installer.getId, st.2)
+
+/-- Test-only command inserting a pass into the live pass manager without recording any
+    registration, as a metaprogram editing the extension state directly would. -/
+elab "proto_forge_pass_manager" : command => do
+  modifyEnv fun env =>
+    Lean.Compiler.LCNF.passManagerExt.modifyState env fun (installers, m) =>
+      (installers, { m with basePasses :=
+        #[m.basePasses[0]!, Lean.Compiler.LCNF.Pass.trace] ++
+          m.basePasses.extract 1 m.basePasses.size })
+
+/-- Test-only command recording a constant-folder registration for `target` that names an
+    arbitrary constant as its folder. -/
+elab "proto_forge_folder_entry " target:ident folder:ident : command => do
+  modifyEnv fun env =>
+    Lean.Compiler.LCNF.Simp.ConstantFold.folderExt.addEntry env
+      { declName := target.getId, folderDeclName := folder.getId, folder := fun _ => pure none }
+
+/-- Test-only command inserting a folder for `target` into the live folder table without
+    recording any registration. -/
+elab "proto_forge_folder_table " target:ident : command => do
+  modifyEnv fun env =>
+    Lean.Compiler.LCNF.Simp.ConstantFold.folderExt.modifyState env fun (entries, table) =>
+      (entries, table.insert target.getId (fun _ => pure none))
+
+/-- Whether `v` carries a `.compilerOverrideAttribute` of kind `kind` on `decl` whose
+    detail starts with `detailPrefix`. -/
+def hasOverrideViolation (v : AuditVerdict) (decl : Name) (kind : String)
+    (detailPrefix : String := "") : Bool :=
+  v.violations.any fun
+    | .compilerOverrideAttribute _ d k detail =>
+      d == decl && k == kind && detail.startsWith detailPrefix
+    | _ => false
+
+/--
+info: B4_1a_cpass_rewritten_callee_kernel_theorem: rejected [compilerOverrideAttribute]
+B4_1b_cpass_false_native_provisional: rejected [compilerOverrideAttribute]
+B4_1c_cpass_bystander_theorem_same_module: rejected [compilerOverrideAttribute]
+B4_1d_cpass_installer_reached: flagged at declaration level
+B4_1e_cpass_local_installer_imported_target_control: ok []
+B4_1f_cpass_entry_under_stdlib_name: rejected [compilerOverrideAttribute]
+B4_1g_pass_manager_edited_without_registration: rejected [compilerOverrideAttribute]
+B4_2a_folder_rewritten_callee_kernel_theorem: rejected [compilerOverrideAttribute]
+B4_2b_folder_false_native_provisional: rejected [compilerOverrideAttribute]
+B4_2c_folder_bystander_theorem_same_module: rejected [compilerOverrideAttribute]
+B4_2d_folder_entry_stdlib_target_and_folder_name: rejected [compilerOverrideAttribute]
+B4_2e_folder_table_edited_without_registration: rejected [compilerOverrideAttribute]
+B4_pipeline_clean_module_control: ok []
+-/
+#guard_msgs in
+run_cmd do
+  let strict : AuditPolicy := { checkStatementOrigin := false }
+  let prov : AuditPolicy := { checkStatementOrigin := false, allowProvisionalNative := true }
+  let mut lines : List String := []
+  let need (label : String) (found : Bool) : CommandElabM Unit :=
+    unless found do throwError "{label}: the expected compiler-override violation is missing"
+  let slowDef (name : String) : String :=
+    s!"def {name} : Nat → Bool\n  | 0 => true\n  | n + 1 => {name} n\n"
+
+  -- B4-1: `@[cpass]` installs a compiler pass that swaps the compiled body of one function
+  -- for another. The kernel still sees `b4PassVictim 1 = 1` while compiled code answers
+  -- `1000`, so `native_decide` proves a false statement (kept provisional by the slow
+  -- guard). No attribute sits on any declaration of either theorem's closure, and the
+  -- compiled IR of `b4PassVictim` contains no call to anything else.
+  let envPass ← elabInSandbox <|
+    "open Lean Compiler LCNF\n" ++
+    "@[noinline] def b4PassEvil (n : Nat) : Nat := n + 999\n" ++
+    "def b4EvilPass : Pass :=\n" ++
+    "  Pass.mkPerDeclaration `b4EvilPass .base fun decl => do\n" ++
+    "    if decl.name == `b4PassVictim then\n" ++
+    "      match (← getBaseDecl? `b4PassEvil) with\n" ++
+    "      | some evil => let evil ← evil.internalize; return { evil with name := decl.name }\n" ++
+    "      | none => return decl\n" ++
+    "    else return decl\n" ++
+    "@[cpass] def b4PassInstaller : PassInstaller :=\n" ++
+    "  PassInstaller.installAfter .base `init (fun _ => b4EvilPass)\n" ++
+    "@[noinline] def b4PassVictim (n : Nat) : Nat := n\n" ++
+    slowDef "b4PassSlow" ++
+    "theorem b4PassKernel : b4PassVictim 1 = 1 := rfl\n" ++
+    "theorem b4PassNative : (b4PassSlow 2000000 && (b4PassVictim 1 == 1000)) = true := by native_decide\n" ++
+    "theorem b4PassBystander : (2 : Nat) + 2 = 4 := rfl\n"
+  let vPassKernel ← liftIO <| auditDeclsInEnvIO envPass #[`b4PassKernel] strict
+  let vPassNative ← liftIO <| auditDeclsInEnvIO envPass #[`b4PassNative] prov
+  let vPassBystander ← liftIO <| auditDeclsInEnvIO envPass #[`b4PassBystander] strict
+  let vPassDirect ← liftIO <| auditDeclsInEnvIO envPass #[`b4PassInstaller] strict
+  -- Positive control: the registration lives in the module being elaborated, so it
+  -- cannot have touched the compiled code of an imported declaration.
+  let vPassImported ← liftIO <|
+    auditDeclsInEnvIO envPass #[``fxfsVmoSubslice_deterministic] strict
+  need "B4_1a" (hasOverrideViolation vPassKernel `b4PassInstaller "cpass")
+  need "B4_1b" (hasOverrideViolation vPassNative `b4PassInstaller "cpass")
+  need "B4_1c" (hasOverrideViolation vPassBystander `b4PassInstaller "cpass")
+  need "B4_1d" (hasOverrideViolation vPassDirect `b4PassInstaller "cpass" "declaration is registered")
+  liftIO <| assertAuditOk "B4_1e_cpass_local_installer_imported_target_control" vPassImported
+  lines := lines ++
+    [ formatVerdictTags "B4_1a_cpass_rewritten_callee_kernel_theorem" vPassKernel
+    , formatVerdictTags "B4_1b_cpass_false_native_provisional" vPassNative
+    , formatVerdictTags "B4_1c_cpass_bystander_theorem_same_module" vPassBystander
+    , "B4_1d_cpass_installer_reached: flagged at declaration level"
+    , formatVerdictTags "B4_1e_cpass_local_installer_imported_target_control" vPassImported ]
+
+  -- B4-1f: a registration is what changes the pipeline, whatever constant it names. An
+  -- entry recorded under a stdlib name must not inherit that name's exemption.
+  let envPassName ← elabInSandbox <|
+    "proto_forge_cpass_entry Nat.add\n" ++
+    "def b4PassNameFn (n : Nat) : Nat := n + 1\n" ++
+    "theorem b4PassNameThm : b4PassNameFn 1 = 2 := rfl\n"
+  let vPassName ← liftIO <| auditDeclsInEnvIO envPassName #[`b4PassNameThm] strict
+  need "B4_1f" (hasOverrideViolation vPassName ``Nat.add "cpass")
+  lines := lines ++ [formatVerdictTags "B4_1f_cpass_entry_under_stdlib_name" vPassName]
+
+  -- B4-1g: the pass manager edited in place, with no registration to find.
+  let envPassEdit ← elabInSandbox <|
+    "proto_forge_pass_manager\n" ++
+    "def b4PassEditFn (n : Nat) : Nat := n + 1\n" ++
+    "theorem b4PassEditThm : b4PassEditFn 1 = 2 := rfl\n"
+  let vPassEdit ← liftIO <| auditDeclsInEnvIO envPassEdit #[`b4PassEditThm] strict
+  need "B4_1g" (vPassEdit.violations.any fun
+    | .compilerOverrideAttribute _ _ k _ => k == "compiler_pipeline"
+    | _ => false)
+  lines := lines ++ [formatVerdictTags "B4_1g_pass_manager_edited_without_registration" vPassEdit]
+
+  -- B4-2: a custom LCNF constant folder rewrites every call of its target. The kernel
+  -- evaluates `b4FoldCaller` to `5`, compiled code to `999`.
+  let envFold ← elabInSandbox <|
+    "open Lean Compiler LCNF Simp ConstantFold\n" ++
+    "@[noinline] def b4FoldVictim (a b : Nat) : Nat := a + b\n" ++
+    "def b4EvilFolder : Folder := fun _ => return some (.lit (.nat 999))\n" ++
+    "run_cmd Lean.Elab.Command.liftCoreM (registerFolder `b4FoldVictim `b4EvilFolder)\n" ++
+    "def b4FoldCaller : Nat := b4FoldVictim 2 3\n" ++
+    slowDef "b4FoldSlow" ++
+    "theorem b4FoldKernel : b4FoldCaller = 5 := rfl\n" ++
+    "theorem b4FoldNative : (b4FoldSlow 2000000 && (b4FoldCaller == 999)) = true := by native_decide\n" ++
+    "theorem b4FoldBystander : (2 : Nat) + 2 = 4 := rfl\n"
+  let vFoldKernel ← liftIO <| auditDeclsInEnvIO envFold #[`b4FoldKernel] strict
+  let vFoldNative ← liftIO <| auditDeclsInEnvIO envFold #[`b4FoldNative] prov
+  let vFoldBystander ← liftIO <| auditDeclsInEnvIO envFold #[`b4FoldBystander] strict
+  need "B4_2a" (hasOverrideViolation vFoldKernel `b4FoldVictim "constant_fold_target")
+  need "B4_2b" (hasOverrideViolation vFoldNative `b4FoldVictim "constant_fold_target")
+  need "B4_2c" (hasOverrideViolation vFoldBystander `b4FoldVictim "constant_fold")
+  lines := lines ++
+    [ formatVerdictTags "B4_2a_folder_rewritten_callee_kernel_theorem" vFoldKernel
+    , formatVerdictTags "B4_2b_folder_false_native_provisional" vFoldNative
+    , formatVerdictTags "B4_2c_folder_bystander_theorem_same_module" vFoldBystander ]
+
+  -- B4-2d: a registration for a stdlib function, naming a stdlib constant as its folder.
+  let envFoldName ← elabInSandbox <|
+    "proto_forge_folder_entry Nat.succ Nat.add\n" ++
+    "theorem b4FoldNameThm : Nat.succ 1 = 2 := rfl\n"
+  let vFoldName ← liftIO <| auditDeclsInEnvIO envFoldName #[`b4FoldNameThm] strict
+  need "B4_2d" (hasOverrideViolation vFoldName ``Nat.succ "constant_fold_target")
+  lines := lines ++ [formatVerdictTags "B4_2d_folder_entry_stdlib_target_and_folder_name" vFoldName]
+
+  -- B4-2e: the live folder table edited in place, with no registration to find.
+  let envFoldEdit ← elabInSandbox <|
+    "proto_forge_folder_table b4FoldEditFn\n" ++
+    "def b4FoldEditFn (n : Nat) : Nat := n + 1\n" ++
+    "theorem b4FoldEditThm : b4FoldEditFn 1 = 2 := rfl\n"
+  let vFoldEdit ← liftIO <| auditDeclsInEnvIO envFoldEdit #[`b4FoldEditThm] strict
+  need "B4_2e" (hasOverrideViolation vFoldEdit `b4FoldEditFn "constant_fold_target")
+  lines := lines ++ [formatVerdictTags "B4_2e_folder_table_edited_without_registration" vFoldEdit]
+
+  -- Positive control: ordinary definitions compiled by the unmodified pipeline.
+  let envClean ← elabInSandbox <|
+    "@[noinline] def b4CleanFn (a b : Nat) : Nat := a + b\n" ++
+    "def b4CleanCaller : Nat := b4CleanFn 2 3\n" ++
+    "theorem b4CleanThm : b4CleanCaller = 5 := rfl\n"
+  let vClean ← liftIO <| auditDeclsInEnvIO envClean #[`b4CleanThm]
+    { strict with forbidAmbientModuleOverrides := true }
+  liftIO <| assertAuditOk "B4_pipeline_clean_module_control" vClean
+  lines := lines ++ [formatVerdictTags "B4_pipeline_clean_module_control" vClean]
+  logInfo (String.intercalate "\n" lines)
+
+/--
+info: B4_3a_warm_cache_smart_unfolding: rejected [specInstanceAmbiguous]
+B4_3b_warm_cache_other_environment: rejected [specInstanceAmbiguous]
+B4_4a_caller_config_zeta_off: rejected [specInstanceAmbiguous]
+B4_4b_caller_custom_unfold_predicate: rejected [specInstanceAmbiguous]
+B4_4c_caller_config_iota_off: rejected [specInstanceAmbiguous]
+B4_4d_caller_config_control: ok []
+B4_5a_unassigned_mvar_expected_direct: rejected [specStrengthCertInvalidType]
+B4_5b_unassigned_mvar_expected_modular: rejected [specStrengthCertInvalidType]
+B4_5c_mvar_under_binder_expected: rejected [specStrengthCertInvalidType]
+B4_5d_free_variable_expected: rejected [specStrengthCertInvalidType]
+B4_5e_assigned_mvar_expected_control: ok []
+-/
+#guard_msgs in
+run_cmd do
+  let mut lines : List String := []
+  let strongInst (name defId : String) : String :=
+    s!"instance {name} : ItemSpec \"{defId}\" := \{ pre := fxfsVmoSubslicePre, post := fxfsVmoSubslicePost }\n"
+  let certInst (name defId : String) : String :=
+    s!"instance {name} : ItemMultiMutantCert \"{defId}\" := \{ cert := fxfsVmoSubsliceMultiCert }\n"
+  let header := "open Trusted.VerificationResult Anneal.OleanSpecStrengthAuditorProto\n"
+
+  -- B4-3a: the `Meta` caches are not keyed by `smartUnfolding`. A caller that reduced the
+  -- alias once with smart unfolding on (any elaboration step does) left the `_sunfold`
+  -- answer behind, and the uniqueness scan replayed it: the weak instance stayed hidden.
+  let envSunfold ← elabInSandbox <|
+    header ++
+    "abbrev b4Hide (_ : Unit) : Type 1 := ItemSpec \"proto::b4sunfold\"\n" ++
+    "instance b4HideWeak : b4Hide () := { pre := fun _ => True }\n" ++
+    "def b4Hide._sunfold (_ : Unit) : Type 1 := PUnit.{2}\n" ++
+    strongInst "b4HideStrong" "proto::b4sunfold" ++ certInst "b4HideCert" "proto::b4sunfold"
+  let vWarm ← withSandboxEnv envSunfold do
+    let hidden := mkApp (mkConst `b4Hide) (mkConst ``Unit.unit)
+    let _ ← Meta.withTransparency .all <| Meta.whnf hidden
+    let _ ← Meta.whnf hidden
+    auditItemSpecStrengthBySynth "proto::b4sunfold"
+  liftIO <| assertRejectedWithTag "B4_3a_warm_cache_smart_unfolding" vWarm "specInstanceAmbiguous"
+  lines := lines ++ [formatVerdictTags "B4_3a_warm_cache_smart_unfolding" vWarm]
+
+  -- B4-3b: the caches are not keyed by the environment either. `MetaM`'s own `setEnv`
+  -- clears them, `CoreM`'s does not, so a driver that switches environments below
+  -- `MetaM` carried the first environment's reduction of an alias into the second,
+  -- where the same name means something else.
+  let envFirst ← elabInSandbox "abbrev b4EnvHide (_ : Unit) : Type 1 := PUnit.{2}\n"
+  let envSecond ← elabInSandbox <|
+    header ++
+    "abbrev b4EnvHide (_ : Unit) : Type 1 := ItemSpec \"proto::b4env\"\n" ++
+    "instance b4EnvWeak : b4EnvHide () := { pre := fun _ => True }\n" ++
+    strongInst "b4EnvStrong" "proto::b4env" ++ certInst "b4EnvCert" "proto::b4env"
+  let vOtherEnv ← withSandboxEnv envFirst do
+    let hidden := mkApp (mkConst `b4EnvHide) (mkConst ``Unit.unit)
+    let _ ← Meta.withTransparency .all <| Meta.whnf hidden
+    let _ ← Meta.whnf hidden
+    (setEnv envSecond : CoreM Unit)
+    auditItemSpecStrengthBySynth "proto::b4env"
+  liftIO <| assertRejectedWithTag "B4_3b_warm_cache_other_environment" vOtherEnv "specInstanceAmbiguous"
+  lines := lines ++ [formatVerdictTags "B4_3b_warm_cache_other_environment" vOtherEnv]
+
+  -- B4-4: the caller's `Meta.Config` and unfolding predicate decide what `Meta.whnf`
+  -- reduces. With `zeta := false` a `let`-wrapped instance type, with a custom predicate
+  -- an alias, and with `iota := false` a recursor-typed instance stayed hidden.
+  let envLet ← elabInSandbox <|
+    header ++
+    "instance b4LetWeak : (let T := ItemSpec \"proto::b4let\"; T) := { pre := fun _ => True }\n" ++
+    strongInst "b4LetStrong" "proto::b4let" ++ certInst "b4LetCert" "proto::b4let"
+  let vZeta ← withSandboxEnv envLet <|
+    Meta.withConfig (fun c => { c with zeta := false, zetaUnused := false }) <|
+      auditItemSpecStrengthBySynth "proto::b4let"
+  let envAlias ← elabInSandbox <|
+    header ++
+    "abbrev B4Alias : Type 1 := ItemSpec \"proto::b4alias\"\n" ++
+    "instance b4AliasWeak : B4Alias := { pre := fun _ => True }\n" ++
+    strongInst "b4AliasStrong" "proto::b4alias" ++ certInst "b4AliasCert" "proto::b4alias"
+  let vPred ← withSandboxEnv envAlias <|
+    Meta.withCanUnfoldPred (fun _ ci => pure (ci.name != `B4Alias)) <|
+      auditItemSpecStrengthBySynth "proto::b4alias"
+  let envIota ← elabInSandbox <|
+    header ++
+    "def b4IotaWeak : (Nat.rec (motive := fun _ => Type 1) (ItemSpec \"proto::b4iota\") (fun _ _ => PUnit) Nat.zero) :=\n" ++
+    "  { pre := fun _ => True }\n" ++
+    strongInst "b4IotaStrong" "proto::b4iota" ++ certInst "b4IotaCert" "proto::b4iota"
+  let vIota ← withSandboxEnv envIota <|
+    Meta.withConfig (fun c => { c with iota := false }) <|
+      auditItemSpecStrengthBySynth "proto::b4iota"
+  -- Positive control: the same hostile caller context around a specification with a
+  -- single instance changes nothing.
+  let envSingle ← elabInSandbox <|
+    header ++ strongInst "b4SingleStrong" "proto::b4single" ++ certInst "b4SingleCert" "proto::b4single"
+  let vSingle ← withSandboxEnv envSingle <|
+    Meta.withConfig (fun c => { c with zeta := false, zetaUnused := false, iota := false, proj := .no }) <|
+      Meta.withCanUnfoldPred (fun _ _ => pure false) <|
+        auditItemSpecStrengthBySynth "proto::b4single"
+  liftIO <| assertRejectedWithTag "B4_4a_caller_config_zeta_off" vZeta "specInstanceAmbiguous"
+  liftIO <| assertRejectedWithTag "B4_4b_caller_custom_unfold_predicate" vPred "specInstanceAmbiguous"
+  liftIO <| assertRejectedWithTag "B4_4c_caller_config_iota_off" vIota "specInstanceAmbiguous"
+  liftIO <| assertAuditOk "B4_4d_caller_config_control" vSingle
+  lines := lines ++
+    [ formatVerdictTags "B4_4a_caller_config_zeta_off" vZeta
+    , formatVerdictTags "B4_4b_caller_custom_unfold_predicate" vPred
+    , formatVerdictTags "B4_4c_caller_config_iota_off" vIota
+    , formatVerdictTags "B4_4d_caller_config_control" vSingle ]
+
+  -- B4-5: an expected specification containing an unassigned metavariable unified with
+  -- whatever the certificate states, so a certificate for the weak upper-bound-only
+  -- contrast specification "bound" to it (and likewise for a modular certificate).
+  let env ← getEnv
+  let vMvar ← withSandboxEnv env do
+    let m1 ← Meta.mkFreshExprMVar none
+    let m2 ← Meta.mkFreshExprMVar none
+    auditSpecStrengthCertInEnv `b4.unbound (some ``weakVmoSubsliceSingleCert)
+      (expectedReq? := some m1) (expectedEns? := some m2)
+  let vMvarModular ← withSandboxEnv env do
+    let m1 ← Meta.mkFreshExprMVar none
+    let m2 ← Meta.mkFreshExprMVar none
+    let m3 ← Meta.mkFreshExprMVar none
+    auditSpecStrengthCertInEnv `b4.unbound (some ``fuchsiaUsercopyCopyinModularDirectMultiCert)
+      (expectedReq? := some m1) (expectedEns? := some m2) (expectedEnvAssumed? := some m3)
+  -- The metavariable may sit under a binder of an otherwise concrete expression.
+  let vMvarBinder ← withSandboxEnv env do
+    let preTy ← Meta.inferType (mkConst ``fxfsVmoSubslicePre)
+    let hole ← Meta.mkFreshExprMVar preTy
+    let argTy := preTy.bindingDomain!
+    let req := mkLambda `args .default argTy (mkApp hole (mkBVar 0))
+    auditSpecStrengthCertInEnv `b4.unbound (some ``weakVmoSubsliceSingleCert)
+      (expectedReq? := some req) (expectedEns? := some (mkConst ``weak_vmo_subslice_upper_bound_only))
+  -- A free variable of the caller's local context is not a specification either.
+  let vFVar ← withSandboxEnv env do
+    let preTy ← Meta.inferType (mkConst ``fxfsVmoSubslicePre)
+    Meta.withLocalDeclD `h preTy fun h =>
+      auditSpecStrengthCertInEnv `b4.unbound (some ``fxfsVmoSubsliceMultiCert)
+        (expectedReq? := some h) (expectedEns? := some (mkConst ``fxfsVmoSubslicePost))
+  -- Positive control: a metavariable the caller already assigned is just its value.
+  let vAssigned ← withSandboxEnv env do
+    let m ← Meta.mkFreshExprMVar none
+    m.mvarId!.assign (mkConst ``fxfsVmoSubslicePre)
+    auditSpecStrengthCertInEnv `b4.bound (some ``fxfsVmoSubsliceMultiCert)
+      (expectedReq? := some m) (expectedEns? := some (mkConst ``fxfsVmoSubslicePost))
+  liftIO <| assertRejectedWithTag "B4_5a_unassigned_mvar_expected_direct" vMvar "specStrengthCertInvalidType"
+  liftIO <| assertRejectedWithTag "B4_5b_unassigned_mvar_expected_modular" vMvarModular "specStrengthCertInvalidType"
+  liftIO <| assertRejectedWithTag "B4_5c_mvar_under_binder_expected" vMvarBinder "specStrengthCertInvalidType"
+  liftIO <| assertRejectedWithTag "B4_5d_free_variable_expected" vFVar "specStrengthCertInvalidType"
+  liftIO <| assertAuditOk "B4_5e_assigned_mvar_expected_control" vAssigned
+  lines := lines ++
+    [ formatVerdictTags "B4_5a_unassigned_mvar_expected_direct" vMvar
+    , formatVerdictTags "B4_5b_unassigned_mvar_expected_modular" vMvarModular
+    , formatVerdictTags "B4_5c_mvar_under_binder_expected" vMvarBinder
+    , formatVerdictTags "B4_5d_free_variable_expected" vFVar
+    , formatVerdictTags "B4_5e_assigned_mvar_expected_control" vAssigned ]
+  logInfo (String.intercalate "\n" lines)
+
+/--
+info: B4_6a_recursor_typed: pure=#[b4RecStrong, b4RecWeak] meta=#[b4RecStrong, b4RecWeak]
+B4_6b_quotient_typed: pure=#[b4QuotStrong, b4QuotWeak] meta=#[b4QuotStrong, b4QuotWeak]
+B4_6c_projection_of_deep_alias: pure=#[b4DeepStrong, b4DeepWeak] meta=#[b4DeepStrong, b4DeepWeak]
+B4_6d_indexed_family_recursor: pure=#[b4IdxStrong, b4IdxWeak] meta=#[b4IdxStrong, b4IdxWeak]
+B4_6e_nested_inductive_recursor: pure=#[b4NestStrong, b4NestWeak] meta=#[b4NestStrong, b4NestWeak]
+B4_6f_k_like_recursor_theorem_major: pure=#[b4KStrong, b4KWeak] meta=#[b4KStrong, b4KWeak]
+B4_6g_structure_eta_opaque_major: pure=#[b4EtaStrong, b4EtaWeak] meta=#[b4EtaStrong, b4EtaWeak]
+B4_6h_recursor_stuck_on_variable_control: pure=#[b4VarStrong] meta=#[b4VarStrong]
+B4_6i_real_specifications_control: item=#[Anneal.OleanSpecStrengthAuditorProto.fxfsVmoSubsliceItemSpec] stateful=#[Anneal.OleanSpecStrengthAuditorProto.fuchsiaUsercopyCopyinStatefulSpec] modular=#[Anneal.OleanSpecStrengthAuditorProto.fuchsiaUsercopyCopyinModularSpec] absent=#[]
+-/
+#guard_msgs in
+run_cmd do
+  let mut lines : List String := []
+  let header := "open Trusted.VerificationResult Anneal.OleanSpecStrengthAuditorProto\n"
+  let strong (name defId : String) : String :=
+    s!"def {name} : ItemSpec \"{defId}\" := \{ pre := fxfsVmoSubslicePre, post := fxfsVmoSubslicePost }\n"
+  -- Run both scanners on `code` and report their candidate lists for `defId`.
+  let scan (label code defId : String) : CommandElabM String := do
+    let env' ← elabInSandbox (header ++ code)
+    let pureCands := specInstanceCandidates (env'.setExporting false) ``ItemSpec defId
+    let metaCands ← withSandboxEnv env' <| specInstanceCandidatesMeta ``ItemSpec defId
+    return s!"{label}: pure={pureCands} meta={metaCands}"
+
+  -- B4-6: the pure scanner stopped at recursor and quotient heads (`.notMatched`), and
+  -- silently gave up when its nested normalizer ran out of fuel under a projection.
+  lines := lines ++ [← scan "B4_6a_recursor_typed"
+    ("def b4RecWeak : (Nat.rec (motive := fun _ => Type 1) (ItemSpec \"proto::b4rec\") (fun _ _ => PUnit) Nat.zero) :=\n" ++
+     "  { pre := fun _ => True }\n" ++ strong "b4RecStrong" "proto::b4rec")
+    "proto::b4rec"]
+  lines := lines ++ [← scan "B4_6b_quotient_typed"
+    ("def b4QuotWeak : (Quot.lift (r := fun (_ _ : Unit) => True) (fun _ => ItemSpec \"proto::b4quot\") (fun _ _ _ => rfl) (Quot.mk _ ())) :=\n" ++
+     "  { pre := fun _ => True }\n" ++ strong "b4QuotStrong" "proto::b4quot")
+    "proto::b4quot"]
+  let mut chain := "def b4P0 : Type 1 × Nat := (ItemSpec \"proto::b4deep\", 0)\n"
+  for i in [1:71] do
+    chain := chain ++ s!"def b4P{i} : Type 1 × Nat := b4P{i - 1}\n"
+  lines := lines ++ [← scan "B4_6c_projection_of_deep_alias"
+    (chain ++ "def b4DeepWeak : b4P70.1 := { pre := fun _ => True }\n" ++ strong "b4DeepStrong" "proto::b4deep")
+    "proto::b4deep"]
+  -- An indexed family: the rule's right-hand side takes parameters, motives, minor
+  -- premises, and constructor fields, *not* the indices standing before the major
+  -- premise. Passing the index along binds the field `b` to `false` and the type
+  -- "reduces" to `PUnit`.
+  lines := lines ++ [← scan "B4_6d_indexed_family_recursor"
+    ("inductive B4Idx : Bool → Type where\n  | mk (b : Bool) : B4Idx false\n" ++
+     "def b4IdxWeak : (B4Idx.rec (motive := fun _ _ => Type 1) (fun b => Bool.rec (motive := fun _ => Type 1) PUnit (ItemSpec \"proto::b4idx\") b) (B4Idx.mk true)) :=\n" ++
+     "  { pre := fun _ => True }\n" ++ strong "b4IdxStrong" "proto::b4idx")
+    "proto::b4idx"]
+  -- A nested inductive type: the auxiliary recursor has no parameters while `List.cons`
+  -- has one, so constructor fields must be taken from the end of the major premise.
+  lines := lines ++ [← scan "B4_6e_nested_inductive_recursor"
+    ("inductive B4Tree : Type where\n  | node : List B4Tree → B4Tree\n" ++
+     "def b4NestWeak : (B4Tree.rec_1 (motive_1 := fun _ => Type 1) (motive_2 := fun _ => Type 1) (fun _ ih => ih) (ItemSpec \"proto::b4nest\") (fun _ _ _ ihTail => ihTail) [B4Tree.node []]) :=\n" ++
+     "  { pre := fun _ => True }\n" ++ strong "b4NestStrong" "proto::b4nest")
+    "proto::b4nest"]
+  -- A K-like recursor accepts a major premise that is not syntactically `Eq.refl`.
+  lines := lines ++ [← scan "B4_6f_k_like_recursor_theorem_major"
+    ("theorem b4KProof : (0 : Nat) = 0 := rfl\n" ++
+     "def b4KWeak : (@Eq.rec Nat 0 (fun _ _ => Type 1) (ItemSpec \"proto::b4k\") 0 b4KProof) :=\n" ++
+     "  { pre := fun _ => True }\n" ++ strong "b4KStrong" "proto::b4k")
+    "proto::b4k"]
+  -- A major premise of a structure-like type is η-expanded even when it is opaque.
+  lines := lines ++ [← scan "B4_6g_structure_eta_opaque_major"
+    ("opaque b4EtaUnit : PUnit.{1}\n" ++
+     "def b4EtaWeak : (PUnit.rec (motive := fun _ => Type 1) (ItemSpec \"proto::b4eta\") b4EtaUnit) :=\n" ++
+     "  { pre := fun _ => True }\n" ++ strong "b4EtaStrong" "proto::b4eta")
+    "proto::b4eta"]
+  -- Positive control: a recursor of a two-constructor family applied to a *variable* is
+  -- stuck for the kernel too, so it is no competing instance for either scanner.
+  lines := lines ++ [← scan "B4_6h_recursor_stuck_on_variable_control"
+    ("def b4VarFamily : (b : Bool) → Bool.rec (motive := fun _ => Type 1) (ItemSpec \"proto::b4var\") (ItemSpec \"proto::b4var\") b\n" ++
+     "  | false => { pre := fun _ => True }\n  | true => { pre := fun _ => True }\n" ++ strong "b4VarStrong" "proto::b4var")
+    "proto::b4var"]
+  -- Positive control on the real environment (every `Trusted.*` module, the prototype
+  -- module, and this file): exactly the genuine instances are candidates, and a `defId`
+  -- nobody specifies has none, i.e. no declaration anywhere trips a fail-closed branch.
+  let liveEnv := (← getEnv).setExporting false
+  let item := specInstanceCandidates liveEnv ``ItemSpec "fxfs_storage_boundary::vmo_subslice_bounds_valid"
+  let stateful := specInstanceCandidates liveEnv ``StatefulItemSpec "fuchsia_usercopy::usercopy_copyin_bracketed"
+  let modular := specInstanceCandidates liveEnv ``ModularItemSpec "fuchsia_usercopy::usercopy_copyin_bracketed"
+  let absent :=
+    specInstanceCandidates liveEnv ``ItemSpec "proto::b4_no_such_item" ++
+    specInstanceCandidates liveEnv ``StatefulItemSpec "proto::b4_no_such_item" ++
+    specInstanceCandidates liveEnv ``ModularItemSpec "proto::b4_no_such_item"
+  lines := lines ++
+    [s!"B4_6i_real_specifications_control: item={item} stateful={stateful} modular={modular} absent={absent}"]
+  logInfo (String.intercalate "\n" lines)
+
+/--
+info: B4_8a_csimp_entry_under_stdlib_theorem_name: rejected [compilerOverrideAttribute]
+B4_8b_csimp_entry_under_stdlib_csimp_lemma_name: rejected [compilerOverrideAttribute]
+B4_8c_csimp_stdlib_redirection_overwritten: rejected [compilerOverrideAttribute]
+B4_8d_csimp_genuine_stdlib_redirection_control: ok []
+-/
+#guard_msgs in
+run_cmd do
+  let strict : AuditPolicy := { checkStatementOrigin := false }
+  let mut lines : List String := []
+  -- B4-8: stdlib `@[csimp]` entries were exempted by the origin of the *theorem name*
+  -- alone. An entry `victim ↦ evil` recorded under `Nat.add_comm` (any stdlib theorem),
+  -- under the name of a genuine stdlib `@[csimp]` lemma, or replacing the genuine
+  -- redirection of `List.map` inherited that exemption.
+  let victimDefs :=
+    "def b4CsVictim (a b : Nat) : Nat := a + b\n" ++
+    "def b4CsEvil (_ _ : Nat) : Nat := 999\n" ++
+    "def b4CsCaller : Nat := b4CsVictim 2 3\n" ++
+    "theorem b4CsKernel : b4CsCaller = 5 := rfl\n"
+  let envSpoof ← elabInSandbox ("proto_forge_csimp_entry b4CsVictim b4CsEvil Nat.add_comm\n" ++ victimDefs)
+  let vSpoof ← liftIO <| auditDeclsInEnvIO envSpoof #[`b4CsKernel] strict
+  let envSpoofLemma ← elabInSandbox
+    ("proto_forge_csimp_entry b4CsVictim b4CsEvil List.map_eq_mapTR\n" ++ victimDefs)
+  let vSpoofLemma ← liftIO <| auditDeclsInEnvIO envSpoofLemma #[`b4CsKernel] strict
+  let mapUser :=
+    "def b4CsMapUser (xs : List Nat) : List Nat := List.map (· + 1) xs\n" ++
+    "theorem b4CsMapThm : b4CsMapUser [1] = [2] := rfl\n"
+  let envOverwrite ← elabInSandbox
+    ("def b4CsEvilMap (f : α → β) (_ : List α) : List β := []\n" ++
+     "proto_forge_csimp_entry List.map b4CsEvilMap List.map_eq_mapTR\n" ++ mapUser)
+  let vOverwrite ← liftIO <| auditDeclsInEnvIO envOverwrite #[`b4CsMapThm] strict
+  -- Positive control: the genuine stdlib redirection `List.map ↦ List.mapTR` is exempt.
+  let envGenuine ← elabInSandbox mapUser
+  let vGenuine ← liftIO <| auditDeclsInEnvIO envGenuine #[`b4CsMapThm] strict
+  unless hasOverrideViolation vSpoof `b4CsVictim "csimp_target" do
+    throwError "B4_8a: expected a csimp_target violation on b4CsVictim"
+  unless hasOverrideViolation vSpoofLemma `b4CsVictim "csimp_target" do
+    throwError "B4_8b: expected a csimp_target violation on b4CsVictim"
+  unless hasOverrideViolation vOverwrite ``List.map "csimp_target" do
+    throwError "B4_8c: expected a csimp_target violation on List.map"
+  liftIO <| assertAuditOk "B4_8d_csimp_genuine_stdlib_redirection_control" vGenuine
+  lines := lines ++
+    [ formatVerdictTags "B4_8a_csimp_entry_under_stdlib_theorem_name" vSpoof
+    , formatVerdictTags "B4_8b_csimp_entry_under_stdlib_csimp_lemma_name" vSpoofLemma
+    , formatVerdictTags "B4_8c_csimp_stdlib_redirection_overwritten" vOverwrite
+    , formatVerdictTags "B4_8d_csimp_genuine_stdlib_redirection_control" vGenuine ]
+  logInfo (String.intercalate "\n" lines)
+
+/--
+info: B4_hb_zero_threshold_is_never_unlimited: true
+B4_hb_overflowing_threshold_is_clamped: true
+B4_hb_ordinary_threshold_is_unchanged: true
+B4_hb_huge_budget_is_clamped: true
+-/
+#guard_msgs in
+run_cmd do
+  -- The kernel reads a heartbeat threshold of `0` as "no limit" and takes a `USize`, so
+  -- a threshold must be clamped before it is converted.
+  let top := USize.ofNat (USize.size - 1)
+  let huge ← liftIO <| kernelHeartbeatThreshold (USize.size * 4)
+  logInfo (String.intercalate "\n"
+    [ s!"B4_hb_zero_threshold_is_never_unlimited: {clampKernelHeartbeatThreshold 0 == 1}"
+    , s!"B4_hb_overflowing_threshold_is_clamped: {clampKernelHeartbeatThreshold USize.size == top && clampKernelHeartbeatThreshold (USize.size * 2 + 7) == top}"
+    , s!"B4_hb_ordinary_threshold_is_unchanged: {clampKernelHeartbeatThreshold 310 == 310}"
+    , s!"B4_hb_huge_budget_is_clamped: {huge == top}" ])
+
 /-! ### Type-Level Refutations for Discriminating Kills and Deterministic Specifications -/
 
 /-- A specification that is satisfiable at input `0` but unimplementable everywhere else.
@@ -2372,6 +2870,211 @@ tmp_clean=true
 #guard_msgs in
 run_cmd do
   let summary ← liftIO runDiskHardeningRegressions
+  logInfo summary
+
+/-! ## Pass B4 On-Disk Regressions: `private` Compiled Code Without `.ir`, Imported Compiler-Pipeline Registrations -/
+
+/-- Assemble a non-`module` `.olean` for `modName` in `dir` without running a compiler:
+    import `imports` at `OLeanLevel.private` (`loadExts := false`), add the theorem
+    `claimName : Nat.zero = Nat.zero`, apply `edit`, and save with `Lean.writeModule`.
+
+    `edit` records extension entries exactly as the corresponding attribute would write
+    them into the module. Compiling a real `@[cpass]` module would need the whole Lean
+    compiler library in the audited closure; a module assembled this way imports only
+    `Init.Prelude` (and siblings), so loading it back costs a few megabytes. -/
+def writeAssembledModule (dir : System.FilePath) (modName : Name) (imports : Array Name)
+    (claimName : Name) (edit : Environment → Environment := id) : IO Unit :=
+  withExtraSearchPaths [dir] do
+    let env ← Lean.importModules (imports.map fun m => ({ module := m } : Import)) {}
+      (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := OLeanLevel.private)
+    let env := env.setMainModule modName
+    let nat := mkConst ``Nat
+    let zero := mkConst ``Nat.zero
+    let lvl := Level.succ Level.zero
+    let decl := Declaration.thmDecl {
+      name := claimName, levelParams := []
+      type := mkApp3 (mkConst ``Eq [lvl]) nat zero zero
+      value := mkApp2 (mkConst ``Eq.refl [lvl]) nat zero }
+    match env.addDeclCore 0 512 decl none with
+    | .error _ => throw <| IO.userError s!"kernel rejected the assembled claim {claimName}"
+    | .ok env =>
+      Lean.writeModule (edit env) (Lean.modToFilePath dir modName "olean")
+
+/-- On-disk regressions for pass B4, against real Lean `v4.34.1` artifacts in a unique
+    `/tmp/` directory (deleted in `finally`). Every module imports `Init.Prelude` only. -/
+def runDiskB4Regressions : IO String := do
+  let pid ← IO.Process.getPID
+  let ns ← IO.monoNanosNow
+  let tmpDir : System.FilePath := s!"/tmp/anneal_olean_proto_b4_{pid}_{ns}"
+  IO.FS.createDirAll tmpDir
+  let body : IO (Array String) := do
+    let mut lines : Array String := #[]
+    let pol : AuditPolicy := { checkStatementOrigin := false }
+    let importPrivate (roots : Array Name) : IO Environment :=
+      withExtraSearchPaths [tmpDir] do
+        Lean.importModules (roots.map fun m => ({ module := m } : Import)) {}
+          (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := OLeanLevel.private)
+
+    -- B4-7: in a `module` file a `private` function has no entry at all in the `.olean`
+    --       parts (a public one has an opaque stub, which B3 detects); its compiled body
+    --       exists only in `.ir`. With `.ir` + `.ir.sig` gone the IR walk found nothing
+    --       to look at and reported `ok`, both for a caller importing by itself and for a
+    --       strict audit of modules loaded under a laxer policy.
+    let privOlean := tmpDir / "ProtoDiskPrivIr.olean"
+    IO.FS.writeFile (tmpDir / "ProtoDiskPrivIr.lean") <|
+      "module\n" ++
+      "prelude\n" ++
+      "public import Init.Prelude\n" ++
+      "unsafe def protoPrivEvil (a b : Nat) : Nat := Nat.succ (Nat.add a b)\n" ++
+      "@[noinline, implemented_by protoPrivEvil] def protoPrivAdd (a b : Nat) : Nat := Nat.add a b\n" ++
+      "section\n" ++
+      "@[local csimp] theorem protoPrivRedir : Eq Nat.add protoPrivAdd := Eq.refl Nat.add\n" ++
+      "def protoPrivCaller (a b : Nat) : Nat := Nat.add a b\n" ++
+      "end\n" ++
+      "theorem protoPrivClaim :\n" ++
+      "    Eq (protoPrivCaller Nat.zero Nat.zero) (protoPrivCaller Nat.zero Nat.zero) := Eq.refl _\n"
+    compileTempModuleToOlean tmpDir (tmpDir / "ProtoDiskPrivIr.lean") privOlean
+    let privClaim := Lean.mkPrivateNameCore `ProtoDiskPrivIr `protoPrivClaim
+    -- Positive control: the same shape with nothing to hide.
+    IO.FS.writeFile (tmpDir / "ProtoDiskPrivClean.lean") <|
+      "module\n" ++
+      "prelude\n" ++
+      "public import Init.Prelude\n" ++
+      "def protoCleanHelper (a b : Nat) : Nat := Nat.add a b\n" ++
+      "theorem protoCleanClaim :\n" ++
+      "    Eq (protoCleanHelper Nat.zero Nat.zero) (protoCleanHelper Nat.zero Nat.zero) := Eq.refl _\n"
+    compileTempModuleToOlean tmpDir (tmpDir / "ProtoDiskPrivClean.lean") (tmpDir / "ProtoDiskPrivClean.olean")
+    let cleanClaim := Lean.mkPrivateNameCore `ProtoDiskPrivClean `protoCleanClaim
+    -- A non-`module` neighbour, used below as a hiding place for the `.ir` files.
+    IO.FS.writeFile (tmpDir / "ProtoDiskPlain.lean") <|
+      "prelude\nimport Init.Prelude\ntheorem protoPlainClaim : Eq Nat.zero Nat.zero := Eq.refl _\n"
+    compileTempModuleToOlean tmpDir (tmpDir / "ProtoDiskPlain.lean") (tmpDir / "ProtoDiskPlain.olean")
+    let irSig := privOlean.withExtension "ir.sig"
+    let ir := privOlean.withExtension "ir"
+    unless (← irSig.pathExists) && (← ir.pathExists) do
+      throw <| IO.userError "expected .ir.sig and .ir to be emitted for module file"
+
+    let loadedPriv ← loadOrThrow "B4_7_load" #[`ProtoDiskPrivIr, `ProtoDiskPrivClean] pol [tmpDir]
+    let vPresent ← auditLoadedModulesIO loadedPriv pol (explicitTargets? := some #[privClaim])
+    let vCleanPresent ← auditLoadedModulesIO loadedPriv pol (explicitTargets? := some #[cleanClaim])
+    assertRejectedWithTag "B4_7a_private_function_ir_present" vPresent "unsafeDeclaration"
+    assertAuditOk "B4_7a_private_function_clean_module_control" vCleanPresent
+    lines := lines.push (formatVerdictTags "B4_7a_private_function_ir_present" vPresent)
+    lines := lines.push (formatVerdictTags "B4_7a_private_function_clean_module_control" vCleanPresent)
+
+    -- Move the two `.ir` files next to the non-`module` neighbour. Lean loads them there
+    -- without complaint and ignores their contents, so the environment holds exactly as
+    -- many compacted regions as before (counting regions proves nothing), while the
+    -- `module` file's own compiled code is gone.
+    let plainOlean := tmpDir / "ProtoDiskPlain.olean"
+    let regionCount (env : Environment) : Nat × Nat :=
+      ((env.setExporting false).header.regions.size,
+        (env.setExporting false).header.moduleData.foldl (init := 0) fun acc d =>
+          acc + (if d.isModule then 5 else 1))
+    let envIntact ← importPrivate #[`ProtoDiskPrivIr, `ProtoDiskPlain]
+    IO.FS.rename irSig (plainOlean.withExtension "ir.sig")
+    IO.FS.rename ir (plainOlean.withExtension "ir")
+    let envMoved ← importPrivate #[`ProtoDiskPrivIr, `ProtoDiskPlain]
+    let vMoved := auditDeclsInEnvPure envMoved #[privClaim] pol
+    assertRejectedWithTag "B4_7f_private_ir_moved_to_neighbour_module" vMoved "environmentLoadFailed"
+    unless regionCount envMoved == regionCount envIntact do
+      throw <| IO.userError
+        s!"expected moving the .ir files to keep the region count: {regionCount envIntact} vs {regionCount envMoved}"
+    lines := lines.push
+      (formatVerdictTags "B4_7f_private_ir_moved_to_neighbour_module" vMoved ++
+        s!" (regions loaded/expected: intact {regionCount envIntact}, moved {regionCount envMoved})")
+    IO.FS.removeFile (plainOlean.withExtension "ir.sig")
+    IO.FS.removeFile (plainOlean.withExtension "ir")
+
+    -- `.ir` + `.ir.sig` deleted.
+    let vPure := auditDeclsInEnvPure (← importPrivate #[`ProtoDiskPrivIr]) #[privClaim] pol
+    assertRejectedWithTag "B4_7e_private_ir_deleted_pure_auditor" vPure "environmentLoadFailed"
+    lines := lines.push (formatVerdictTags "B4_7e_private_ir_deleted_pure_auditor" vPure)
+    let loadedLenient ← loadOrThrow "B4_7c_load" #[`ProtoDiskPrivIr]
+      { pol with requirePrivateOleanForModuleSystem := false } [tmpDir]
+    let vLenient ← auditLoadedModulesIO loadedLenient pol (explicitTargets? := some #[privClaim])
+    assertRejectedWithTag "B4_7c_private_ir_deleted_lenient_load_strict_audit" vLenient "environmentLoadFailed"
+    lines := lines.push (formatVerdictTags "B4_7c_private_ir_deleted_lenient_load_strict_audit" vLenient)
+    let loadedNoOverrides ← loadOrThrow "B4_7d_load" #[`ProtoDiskPrivIr]
+      { pol with checkCompilerOverrides := false } [tmpDir]
+    let vNoOverrides ← auditLoadedModulesIO loadedNoOverrides pol
+      (explicitTargets? := some #[privClaim])
+    assertRejectedWithTag "B4_7d_private_ir_deleted_overrides_off_load_strict_audit" vNoOverrides "environmentLoadFailed"
+    lines := lines.push
+      (formatVerdictTags "B4_7d_private_ir_deleted_overrides_off_load_strict_audit" vNoOverrides)
+    let vEndToEnd ← auditCompiledModulesIO #[`ProtoDiskPrivIr] pol
+      (explicitTargets? := some #[privClaim]) (extraSearchPaths := [tmpDir])
+    assertRejectedWithTag "B4_7b_private_ir_deleted_end_to_end" vEndToEnd "missingPrivateArtifact"
+    lines := lines.push (formatVerdictTags "B4_7b_private_ir_deleted_end_to_end" vEndToEnd)
+
+    -- B4-1 / B4-2 (imported): pass-installer and constant-folder registrations stored in
+    --      imported modules, read back under `loadExts := false`. `Top` imports `Mid`,
+    --      which imports the two registering modules; no declaration of `Top`'s closure
+    --      lives in either of them. `Aside` is loaded in the same environment but imports
+    --      neither. The pass registration names a declaration of its own module (the
+    --      shape `@[cpass]` produces); the folder registration names constants that exist
+    --      nowhere (the shape only a metaprogram produces).
+    writeAssembledModule tmpDir `ProtoDiskPassLib #[`Init.Prelude] `protoPassLibClaim fun env =>
+      let st := Lean.Compiler.LCNF.passManagerExt.getState env
+      Lean.Compiler.LCNF.passManagerExt.addEntry env (`protoPassLibClaim, st.2)
+    writeAssembledModule tmpDir `ProtoDiskFoldLib #[`Init.Prelude] `protoFoldLibClaim fun env =>
+      Lean.Compiler.LCNF.Simp.ConstantFold.folderExt.addEntry env
+        { declName := `protoDiskFoldTarget, folderDeclName := `protoDiskFolder,
+          folder := fun _ => pure none }
+    writeAssembledModule tmpDir `ProtoDiskPipeMid #[`ProtoDiskPassLib, `ProtoDiskFoldLib]
+      `protoPipeMidClaim
+    writeAssembledModule tmpDir `ProtoDiskPipeTop #[`ProtoDiskPipeMid] `protoPipeTopClaim
+    writeAssembledModule tmpDir `ProtoDiskPipeAside #[`Init.Prelude] `protoPipeAsideClaim
+    let loadedPipe ← loadOrThrow "B4_pipeline_load"
+      #[`ProtoDiskPipeTop, `ProtoDiskPipeAside] pol [tmpDir]
+    let auditPipe (claim : Name) :=
+      auditLoadedModulesIO loadedPipe pol (explicitTargets? := some #[claim])
+    let vPassLib ← auditPipe `protoPassLibClaim
+    let vFoldLib ← auditPipe `protoFoldLibClaim
+    let vTop ← auditPipe `protoPipeTopClaim
+    let vAside ← auditPipe `protoPipeAsideClaim
+    let vWhole ← auditLoadedModulesIO loadedPipe pol (targetModules? := some #[`ProtoDiskPipeAside])
+    assertRejectedWithTag "B4_1h_disk_pass_registering_module" vPassLib "compilerOverrideAttribute"
+    assertRejectedWithTag "B4_2f_disk_folder_registering_module" vFoldLib "compilerOverrideAttribute"
+    assertRejectedWithTag "B4_1i_disk_pipeline_transitive_import" vTop "compilerOverrideAttribute"
+    assertAuditOk "B4_1j_disk_pipeline_unrelated_module_control" vAside
+    assertAuditOk "B4_1j_disk_pipeline_unrelated_module_control (module targets)" vWhole
+    unless hasOverrideViolation vPassLib `protoPassLibClaim "cpass" "declaration is registered" &&
+        hasOverrideViolation vPassLib `protoPassLibClaim "cpass" "custom LCNF compiler pass installer" &&
+        !hasOverrideViolation vPassLib `protoDiskFoldTarget "constant_fold" do
+      throw <| IO.userError s!"B4_1h: unexpected violations:\n{auditReportJson vPassLib |>.pretty}"
+    unless hasOverrideViolation vFoldLib `protoDiskFoldTarget "constant_fold" &&
+        !hasOverrideViolation vFoldLib `protoPassLibClaim "cpass" do
+      throw <| IO.userError s!"B4_2f: unexpected violations:\n{auditReportJson vFoldLib |>.pretty}"
+    unless hasOverrideViolation vTop `protoPassLibClaim "cpass" &&
+        hasOverrideViolation vTop `protoDiskFoldTarget "constant_fold" do
+      throw <| IO.userError s!"B4_1i: unexpected violations:\n{auditReportJson vTop |>.pretty}"
+    lines := lines.push (formatVerdictTags "B4_1h_disk_pass_registering_module" vPassLib)
+    lines := lines.push (formatVerdictTags "B4_2f_disk_folder_registering_module" vFoldLib)
+    lines := lines.push (formatVerdictTags "B4_1i_disk_pipeline_transitive_import" vTop)
+    lines := lines.push (formatVerdictTags "B4_1j_disk_pipeline_unrelated_module_control" vAside)
+    return lines
+  let lines ← try body finally IO.FS.removeDirAll tmpDir
+  let clean := !(← tmpDir.pathExists)
+  return String.intercalate "\n" (lines.push s!"tmp_clean={clean}").toList
+
+/--
+info: B4_7a_private_function_ir_present: rejected [unsafeDeclaration]
+B4_7a_private_function_clean_module_control: ok []
+B4_7f_private_ir_moved_to_neighbour_module: rejected [environmentLoadFailed] (regions loaded/expected: intact (11, 11), moved (11, 11))
+B4_7e_private_ir_deleted_pure_auditor: rejected [environmentLoadFailed]
+B4_7c_private_ir_deleted_lenient_load_strict_audit: rejected [environmentLoadFailed]
+B4_7d_private_ir_deleted_overrides_off_load_strict_audit: rejected [environmentLoadFailed]
+B4_7b_private_ir_deleted_end_to_end: rejected [missingPrivateArtifact]
+B4_1h_disk_pass_registering_module: rejected [compilerOverrideAttribute]
+B4_2f_disk_folder_registering_module: rejected [compilerOverrideAttribute]
+B4_1i_disk_pipeline_transitive_import: rejected [compilerOverrideAttribute]
+B4_1j_disk_pipeline_unrelated_module_control: ok []
+tmp_clean=true
+-/
+#guard_msgs in
+run_cmd do
+  let summary ← liftIO runDiskB4Regressions
   logInfo summary
 
 /-! ## Real Compiled `.olean` Zero-FP Audits & Measured Latency Benchmarks -/
