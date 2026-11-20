@@ -118,8 +118,9 @@ simulation relations (`StateRelLM3_1`, `StateRelLM3_2`, `annealResolvePtr`,
   `allocationMachine_deallocate_then_allocateStackRaw_noABA`);
   and nested `childSession` (`recursive = true`) vtable-before-data-UB precedence and `mayDangle` behavior
   through the full `ValidityVisitor.validatePlace` driver (direct `&(&dyn Trait)`, struct-wrapped
-  `&(S { f0: &dyn Trait, ... })`, `[T; N]` `Sized` array fast-paths incl. empty arrays of every element class,
-  and `[&dyn Trait; N]` / `&[&dyn Trait; N]` with the FIRST invalid vtable at an arbitrary element index).
+  `&(S { f0: &dyn Trait, ... })`, `[T; N]` `Sized` array fast-paths incl. empty arrays of every element class
+  (direct and behind safe references), and `[&dyn Trait; N]` / `&[&dyn Trait; N]` with the FIRST invalid vtable
+  at an arbitrary element index (both `recursive = false` and `recursive = true`).
 * **Part 3** — closed (hypothesis-free) non-vacuity canaries across all parts.
 * **Part 4** — exhaustive `#guard_msgs in #print axioms` pins for every public
   theorem.
@@ -18871,8 +18872,9 @@ produced from the previous one by a real vendored operation** (`lean-miri#73` ×
    whose protected trees are `BorrowTreeWorldRel`-related to theory worlds `worlds3` on which the
    theory's frame exit succeeds (`multiAllocEndAccessesPartial … = (worlds4, none)`):
 4. **Stage 3b (protected `AllocationMachine.deallocate`)**: under the hook environment with verdict
-   `.protectedDealloc`, deallocation FAILS, the failure state's keyed world is the theory's
-   `deallocateMachine … .protectedDealloc` world, and `id₁` — live before — is detached.
+   `.protectedDealloc`, deallocation FAILS with a related outcome (`DeallocMachineOutcomeRel`), the
+   failure state's keyed world is the theory's `deallocateMachine … .protectedDealloc` world, and
+   `id₁` — live before — is detached.
 5. **Stage 4 (`MachineHooks.beforeStackPopWithEnsure`)** SUCCEEDS with the explicit state `st4`
    (memory `mem4`, `endCall` applied); the keyed world is exactly unchanged; `id₁`'s row differs from
    `st3`'s only in its borrow tree; the high-water invariant and the cursor
@@ -18985,6 +18987,10 @@ theorem multiStep_alloc_storeLoad_retag_frameExit_dealloc_realloc_lifecycle
               ((machineToKeyed proj raceEntryOf st3.machine).deallocateMachine
                 (.provenanced (ofMiriAllocId id₁) 0) none .stack (raceModeOfMachine st3.machine)
                 actor .protectedDealloc).world ∧
+            DeallocMachineOutcomeRel deallocH (.error err3)
+              ((machineToKeyed proj raceEntryOf st3.machine).deallocateMachine
+                (.provenanced (ofMiriAllocId id₁) 0) none .stack (raceModeOfMachine st3.machine)
+                actor .protectedDealloc).outcome ∧
             (machineToKeyed proj raceEntryOf st3.machine).findLive? (ofMiriAllocId id₁) =
               some (liveEntryOfMiri proj ⟨.stack, a2.setExtra tree3⟩) ∧
             (machineToKeyed proj raceEntryOf dres3.machine).findLive? (ofMiriAllocId id₁) = none) ∧
@@ -19039,8 +19045,8 @@ theorem multiStep_alloc_storeLoad_retag_frameExit_dealloc_realloc_lifecycle
   have hfind3' : st3.machine.memory.live.find? (fun e => e.1 == id₁) =
       some (id₁, ⟨.stack, a2.setExtra tree3⟩) := by rw [hmem3]; exact hfind3
   refine ⟨fun env3 => ?_, ?_⟩
-  · obtain ⟨err3, dres3, hrun3, hkw3, _, hdet3⟩ := allocationMachine_deallocate_protected_fails_detached env3
-    refine ⟨err3, dres3, hrun3, hkw3, ?_, hdet3 _ rfl⟩
+  · obtain ⟨err3, dres3, hrun3, hkw3, hrel3, hdet3⟩ := allocationMachine_deallocate_protected_fails_detached env3
+    refine ⟨err3, dres3, hrun3, hkw3, hrel3, ?_, hdet3 _ rfl⟩
     show (memoryStateToKeyed proj st3.machine.memory _).findLive? (ofMiriAllocId id₁) = _
     rw [memoryStateToKeyed_findLive?_of_find, hfind3']; rfl
   · obtain ⟨mem4, res, hall, hmatch⟩ :=
@@ -20376,7 +20382,10 @@ for recursive validation (`recursive = true, reset = false`) of `&[T; 0]` / `&[!
    memory (zero-size `checkPointerAccess` passes, alignment check still runs!);
 4. Non-null dangling **aligned** `&[u32; 0]` / `&[f32; 0]` succeeds `.ok ()` via the numeric
    `size == Size.ZERO` fast-path WITHOUT calling `h.toOp` or `h.readBytes`;
-5. Non-null dangling **aligned** `&[!; 0]` (ZST empty array) succeeds `.ok ()`! -/
+5. Non-null dangling **aligned** `&[!; 0]` (ZST empty array) succeeds `.ok ()`!
+
+The non-numeric, non-ZST empty-array case behind a safe reference (`&[&dyn Trait; 0]`,
+`&[(u8, u16); 0]`) is proved in `validatePlace_ref_emptyArray_nonZst`. -/
 theorem validatePlace_ref_emptyArray_and_uninhabited {S C E F A Pad : Type}
     (h : Miri.Interpreter.ValidityVisitor.Hooks Miri.Memory.Provenance S C E F A Pad) (c : C)
     (fuel : Nat) (outerPlace : Miri.Interpreter.RuntimePlace Miri.Memory.Provenance) (st : S)
@@ -20579,6 +20588,66 @@ theorem validatePlace_ref_emptyArray_and_uninhabited {S C E F A Pad : Type}
     simp only [↓reduceIte, hdbg, Bool.false_eq_true]
     rfl
 
+private theorem visit_array_empty_nonZst_ok {P S C E F A Pad : Type}
+    [Miri.Memory.PointerProvenance P] [DecidableEq P]
+    (h : Miri.Interpreter.ValidityVisitor.Hooks P S C E F A Pad) (c : C)
+    (fuel : Nat) (session : Miri.Interpreter.ValidityVisitor.Session P)
+    (place : Miri.Interpreter.RuntimePlace P) (st : S)
+    (elemTy : Nat) (elemKind : Miri.Interpreter.ValidityVisitor.TypeKind)
+    (elemLayout fieldLayout : Miri.Interpreter.LocalLayout) (stride : Miri.ABI.Size)
+    (count : UInt64) (unitLo : Miri.Interpreter.LocalLayout)
+    (endPlace : Miri.Interpreter.RuntimePlace P)
+    (hctfe : session.ctfeMode = none)
+    (hdbg : h.debugAssertions = false)
+    (hcl : h.classify c place.layout.ty st = .ok (.sequence elemTy) st)
+    (hecl : h.classify c elemTy st = .ok elemKind st)
+    (hni : elemKind ≠ .integer) (hnf : elemKind ≠ .float)
+    (hlo : h.projection.layoutOf c elemTy st = .ok elemLayout st)
+    (hnonZst : elemLayout.layout.isZst = false)
+    (hfields : place.layout.layout.fields = .Array stride count)
+    (hlen : Miri.Interpreter.PlaceDynamic.length h.projection c place st = .ok 0 st)
+    (hfield : h.projection.field c place.layout 0 st = .ok fieldLayout st)
+    (hunit : h.unitLayout c st = .ok unitLo st)
+    (hendOff : Miri.Interpreter.PlaceDynamic.offsetWithMeta h.projection c place Miri.ABI.Size.ZERO
+      .inbounds .none unitLo st = .ok endPlace st)
+    (hinh : h.opsemInhabited c place.layout.ty st = .ok true st) :
+    Miri.Interpreter.ValidityVisitor.visit h c (fuel + 1) session place st = .ok session st := by
+  have hprim : (miri_etm_private% Miri.Interpreter.ValidityVisitor
+      Miri.Interpreter.ValidityVisitor.primitive) h c session place (.sequence elemTy) st = .ok none st := rfl
+  have hniB : (elemKind == .integer) = false := beq_false_of_ne hni
+  have hnfB : (elemKind == .float) = false := beq_false_of_ne hnf
+  have hsrEnd : miriVVSizeResult (stride.mul 0) st = .ok Miri.ABI.Size.ZERO st := by
+    rw [size_mul_zero]; rfl
+  unfold Miri.Interpreter.ValidityVisitor.visit
+  refine (est_bind_ok _ _ _ _ _ hcl).trans ?_
+  refine (est_bind_ok _ _ _ _ none hprim).trans ?_
+  dsimp only
+  rw [hctfe]
+  dsimp only
+  refine (est_bind_ok _ _ _ _ elemKind hecl).trans ?_
+  simp only [hniB, hnfB, Bool.or_self, Bool.false_eq_true, ↓reduceIte]
+  refine (est_bind_ok _ _ _ _ elemLayout hlo).trans ?_
+  simp only [hnonZst, Bool.false_eq_true, ↓reduceIte, hfields]
+  refine (est_bind_ok _ _ _ _ 0 hlen).trans ?_
+  refine (est_bind_ok _ _ _ _ fieldLayout hfield).trans ?_
+  refine (est_bind_ok _ _ _ _ Miri.ABI.Size.ZERO hsrEnd).trans ?_
+  refine (est_bind_ok _ _ _ _ unitLo hunit).trans ?_
+  refine (est_bind_ok _ _ _ _ endPlace hendOff).trans ?_
+  have hloop : ∀ (f : Nat → Miri.Interpreter.ValidityVisitor.Session P →
+        Miri.Interpreter.ValidityVisitor.M S (ForInStep (Miri.Interpreter.ValidityVisitor.Session P))),
+      (forIn [:UInt64.toNat 0] session f :
+        Miri.Interpreter.ValidityVisitor.M S (Miri.Interpreter.ValidityVisitor.Session P)) st =
+        .ok session st := by
+    intro f
+    have hzero : UInt64.toNat 0 = 0 := rfl
+    simp only [Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size, Nat.sub_zero,
+      Nat.add_sub_cancel, Nat.div_one, hzero, List.range'_zero, List.forIn_nil]
+    rfl
+  refine (est_bind_ok _ _ _ _ session (hloop _)).trans ?_
+  refine (est_bind_ok _ _ _ _ true hinh).trans ?_
+  simp only [↓reduceIte, hdbg, Bool.false_eq_true]
+  rfl
+
 /-- **Full `ValidityVisitor.validatePlace` direct EMPTY array `[T; 0]` with a NON-ZST or numeric
 element (`lean-miri#75`)**: for direct validation (`reset = false`, either `recursive` flag) of a
 place classified `.sequence elemTy` whose dynamic length is `0`:
@@ -20595,7 +20664,8 @@ place classified `.sequence elemTy` whose dynamic length is `0`:
 
 Scope: every hook result is assumed to leave the state unchanged and `withGhostValidation` is
 assumed transparent. The empty ZST-element case is part 2 of
-`validatePlace_array_sized_raw_and_direct`. -/
+`validatePlace_array_sized_raw_and_direct`, and the reference-wrapped non-ZST empty-array case
+(`&[&dyn Trait; 0]`, `&[(u8, u16); 0]`) is `validatePlace_ref_emptyArray_nonZst`. -/
 theorem validatePlace_array_empty_nonZst_and_numeric_direct {P S C E F A Pad : Type}
     [Miri.Memory.PointerProvenance P] [DecidableEq P]
     (h : Miri.Interpreter.ValidityVisitor.Hooks P S C E F A Pad) (c : C)
@@ -20633,41 +20703,9 @@ theorem validatePlace_array_empty_nonZst_and_numeric_direct {P S C E F A Pad : T
   · intro elemTy elemKind elemLayout fieldLayout stride count unitLo endPlace recursive
       hdbg hcl hecl hni hnf hlo hnonZst hfields hlen hfield hunit hendOff hinh
     apply (validatePlace_noTrack_eq h c (fuel + 1) place recursive st name hghost htn).2
-    let initSess : Miri.Interpreter.ValidityVisitor.Session P :=
-      { path := ⟨name, #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
-        refTracking := if recursive then some .empty else none, dataBytes := none }
-    have hprim : (miri_etm_private% Miri.Interpreter.ValidityVisitor
-        Miri.Interpreter.ValidityVisitor.primitive) h c initSess place (.sequence elemTy) st = .ok none st := rfl
-    have hniB : (elemKind == .integer) = false := beq_false_of_ne hni
-    have hnfB : (elemKind == .float) = false := beq_false_of_ne hnf
-    have hsrEnd : miriVVSizeResult (stride.mul 0) st = .ok Miri.ABI.Size.ZERO st := by
-      rw [size_mul_zero]; rfl
-    unfold Miri.Interpreter.ValidityVisitor.visit
-    refine (est_bind_ok _ _ _ _ _ hcl).trans ?_
-    refine (est_bind_ok _ _ _ _ none hprim).trans ?_
-    refine (est_bind_ok _ _ _ _ elemKind hecl).trans ?_
-    simp only [hniB, hnfB, Bool.or_self, Bool.false_eq_true, ↓reduceIte]
-    refine (est_bind_ok _ _ _ _ elemLayout hlo).trans ?_
-    simp only [hnonZst, Bool.false_eq_true, ↓reduceIte, hfields]
-    refine (est_bind_ok _ _ _ _ 0 hlen).trans ?_
-    refine (est_bind_ok _ _ _ _ fieldLayout hfield).trans ?_
-    refine (est_bind_ok _ _ _ _ Miri.ABI.Size.ZERO hsrEnd).trans ?_
-    refine (est_bind_ok _ _ _ _ unitLo hunit).trans ?_
-    refine (est_bind_ok _ _ _ _ endPlace hendOff).trans ?_
-    have hloop : ∀ (f : Nat → Miri.Interpreter.ValidityVisitor.Session P →
-          Miri.Interpreter.ValidityVisitor.M S (ForInStep (Miri.Interpreter.ValidityVisitor.Session P))),
-        (forIn [:UInt64.toNat 0] initSess f :
-          Miri.Interpreter.ValidityVisitor.M S (Miri.Interpreter.ValidityVisitor.Session P)) st =
-          .ok initSess st := by
-      intro f
-      have hzero : UInt64.toNat 0 = 0 := rfl
-      simp only [Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size, Nat.sub_zero,
-        Nat.add_sub_cancel, Nat.div_one, hzero, List.range'_zero, List.forIn_nil]
-      rfl
-    refine (est_bind_ok _ _ _ _ initSess (hloop _)).trans ?_
-    refine (est_bind_ok _ _ _ _ true hinh).trans ?_
-    simp only [↓reduceIte, hdbg, Bool.false_eq_true]
-    rfl
+    exact visit_array_empty_nonZst_ok h c fuel _ place st elemTy elemKind elemLayout fieldLayout
+      stride count unitLo endPlace rfl hdbg hcl hecl hni hnf hlo hnonZst hfields hlen hfield
+      hunit hendOff hinh
   · intro elemTy elemKind elemLayout recursive hcl hecl hnum hlen hlo
     apply (validatePlace_noTrack_eq h c (fuel + 1) place recursive st name hghost htn).2
     let initSess : Miri.Interpreter.ValidityVisitor.Session P :=
@@ -20687,6 +20725,90 @@ theorem validatePlace_array_empty_nonZst_and_numeric_direct {P S C E F A Pad : T
     refine (est_bind_ok _ _ _ _ 0 hlen).trans ?_
     refine (est_bind_ok _ _ _ _ elemLayout hlo).trans ?_
     refine (est_bind_ok _ _ _ _ Miri.ABI.Size.ZERO hsr).trans ?_
+    rfl
+
+/-- **Full `ValidityVisitor.validatePlace` recursive safe reference to EMPTY array `&[T; 0]` with a
+non-numeric, NON-ZST element (`lean-miri#75`)**: covers `&[&dyn Trait; 0]`, `&[(u8, u16); 0]`, etc.
+under recursive validation (`recursive = true, reset = false`):
+1. Null `&[T; 0]` fails `"null or maybe-null safe pointer"` before entering `childSession`;
+2. Non-null, inhabited, unaligned `&[T; 0]` fails `classifyPointerAlignmentError` before entering
+   `childSession`;
+3. Non-null, inhabited, aligned `&[T; 0]` tracks the pointee into `childSession`
+   (`path.push .deref`, `mayDangle = true`, `refTracking = none`), runs the `.Array stride count`
+   path (`projection.field`, `stride.mul 0 = Size.ZERO`, `unitLayout`, `.inbounds` end-offset,
+   0-iteration stride loop, `opsemInhabited`) and returns `.ok ()` (with `debugAssertions = false`).
+   No hypothesis constrains the projection, read, or visit of any element.
+
+Scope: every hook result is assumed to leave the state unchanged and `withGhostValidation` is
+assumed transparent. Numeric and ZST empty arrays behind safe references are covered by
+`validatePlace_ref_emptyArray_and_uninhabited`. -/
+theorem validatePlace_ref_emptyArray_nonZst {S C E F A Pad : Type}
+    (h : Miri.Interpreter.ValidityVisitor.Hooks Miri.Memory.Provenance S C E F A Pad) (c : C)
+    (fuel : Nat) (outerPlace : Miri.Interpreter.RuntimePlace Miri.Memory.Provenance) (st : S)
+    (name : String) (outerMut : Bool)
+    (outerImm : Miri.Interpreter.RvalueImmTy Miri.Memory.Provenance)
+    (outerTarget : Miri.Interpreter.MPlaceTy Miri.Memory.Provenance)
+    (outerSize : Miri.ABI.Size) (outerAlign : Miri.ABI.Align)
+    (outerSc : Miri.Memory.Scalar Miri.Memory.Provenance)
+    (hghost : ∀ {α : Type} (m : Miri.Interpreter.ValidityVisitor.M S α) (s : S),
+      h.withGhostValidation m s = m s)
+    (htn : h.typeName c outerPlace.layout.ty st = .ok name st)
+    (hdbg : h.debugAssertions = false)
+    (houterCl : h.classify c outerPlace.layout.ty st = .ok (.reference outerMut) st)
+    (houterRd : h.readImmediate c outerPlace .reference st = .ok outerImm st)
+    (houterPt : h.ptrToPlace c outerImm st = .ok outerTarget st)
+    (houterSized : outerTarget.layout.layout.isSized = true)
+    (houterSa : h.sizeAndAlign c outerTarget st = .ok (some (outerSize, outerAlign)) st)
+    (houterAcc : h.checkPointerAccess c outerTarget.mplace.ptr outerSize st = .ok (.ok ()) st)
+    (houterFrom : Miri.Memory.Scalar.fromMaybePointer h.target.base outerTarget.mplace.ptr = .ok outerSc) :
+    (h.scalarMayBeNull c outerSc st = .ok true st →
+      Miri.Interpreter.ValidityVisitor.validatePlace h c (fuel + 1) outerPlace true false st =
+        .error (.undefinedBehavior s!"validation{(⟨name, #[]⟩ : Miri.Memory.ValidationPath).render}: null or maybe-null safe pointer") st) ∧
+    (∀ (mis : Miri.Memory.Misalignment),
+      h.scalarMayBeNull c outerSc st = .ok false st →
+      h.opsemInhabited c outerTarget.layout.ty st = .ok true st →
+      h.checkPointerAlignResult c outerTarget.mplace.ptr outerAlign st = .ok (.error mis) st →
+      Miri.Interpreter.ValidityVisitor.validatePlace h c (fuel + 1) outerPlace true false st =
+        .error (Miri.Interpreter.ValidityVisitor.classifyPointerAlignmentError ⟨name, #[]⟩ (.reference outerMut) mis) st) ∧
+    (∀ (elemTy : Nat) (elemKind : Miri.Interpreter.ValidityVisitor.TypeKind)
+       (elemLayout fieldLayout : Miri.Interpreter.LocalLayout) (stride : Miri.ABI.Size)
+       (count : UInt64) (unitLo : Miri.Interpreter.LocalLayout)
+       (endPlace : Miri.Interpreter.RuntimePlace Miri.Memory.Provenance),
+      h.scalarMayBeNull c outerSc st = .ok false st →
+      h.opsemInhabited c outerTarget.layout.ty st = .ok true st →
+      h.checkPointerAlignResult c outerTarget.mplace.ptr outerAlign st = .ok (.ok ()) st →
+      h.classify c outerTarget.layout.ty st = .ok (.sequence elemTy) st →
+      h.classify c elemTy st = .ok elemKind st →
+      elemKind ≠ .integer → elemKind ≠ .float →
+      h.projection.layoutOf c elemTy st = .ok elemLayout st →
+      elemLayout.layout.isZst = false →
+      outerTarget.layout.layout.fields = .Array stride count →
+      Miri.Interpreter.PlaceDynamic.length h.projection c ⟨.memory outerTarget.mplace, outerTarget.layout⟩ st = .ok 0 st →
+      h.projection.field c outerTarget.layout 0 st = .ok fieldLayout st →
+      h.unitLayout c st = .ok unitLo st →
+      Miri.Interpreter.PlaceDynamic.offsetWithMeta h.projection c ⟨.memory outerTarget.mplace, outerTarget.layout⟩
+        Miri.ABI.Size.ZERO .inbounds .none unitLo st = .ok endPlace st →
+      Miri.Interpreter.ValidityVisitor.validatePlace h c (fuel + 1) outerPlace true false st = .ok () st) := by
+  have href := validatePlace_ref_emptyArray_and_uninhabited h c fuel outerPlace st name outerMut
+    outerImm outerTarget outerSize outerAlign outerSc hghost htn hdbg
+    houterCl houterRd houterPt houterSized houterSa houterAcc houterFrom
+  refine ⟨href.1, href.2.2.1, ?_⟩
+  intro elemTy elemKind elemLayout fieldLayout stride count unitLo endPlace
+    hnn hinh hal hseq hecl hni hnf hlo hnonZst hfields hlen hfield hunit hendOff
+  have hroot := (visit_root_tracks_pointee_for_childSession h c fuel ⟨name, #[]⟩ outerPlace st
+    outerMut outerImm outerTarget outerSize outerAlign outerSc
+    houterCl houterRd houterPt (Or.inl houterSized) houterSa houterAcc houterFrom hnn hinh hal).1
+  have hdrv := (validatePlace_recursive_oneTracked_eq h c fuel outerPlace st name
+    ⟨outerTarget.mplace, outerTarget.layout⟩ ((⟨name, #[]⟩ : Miri.Memory.ValidationPath).push .deref)
+    hghost htn hroot).2
+  let childSess : Miri.Interpreter.ValidityVisitor.Session Miri.Memory.Provenance :=
+    { path := (⟨name, #[]⟩ : Miri.Memory.ValidationPath).push .deref
+      flags := ⟨false, true⟩, ctfeMode := none, refTracking := none, dataBytes := none }
+  exact hdrv childSess st
+    (visit_array_empty_nonZst_ok h c fuel childSess
+      ⟨.memory outerTarget.mplace, outerTarget.layout⟩ st elemTy elemKind elemLayout fieldLayout
+      stride count unitLo endPlace rfl hdbg hseq hecl hni hnf hlo hnonZst hfields hlen hfield
+      hunit hendOff hinh)
     rfl
 
 private theorem est_forIn_range'_firstErr {ε σ β : Type}
@@ -21974,7 +22096,7 @@ theorem annealRowProjection_byteRetention_canary :
       #[0, 0, 0, 0] ⟨4⟩ Miri.Memory.ProvenanceMap.new (Miri.Memory.InitMask.new ⟨4⟩ false)
       Miri.ABI.Align.ONE .Mut () none
   have hfnz : (miri_etm_private% Miri.Memory.Allocation Miri.Memory.firstNonZero) #[0, 0, 0, 0] = none := by
-    decide +kernel
+    with_unfolding_all rfl
   have hU : Miri.Memory.Allocation.tryNew (Prov := AnnealProv) ⟨4⟩ Miri.ABI.Align.ONE .Uninit
       (fun sz _ => some (Array.replicate sz.bytes.toNat 0)) = .ok allocU := by
     unfold Miri.Memory.Allocation.tryNew
@@ -24996,6 +25118,94 @@ private def canaryArrayEmptyHooks :
       else pure .never
     opsemInhabited := fun _ _ => pure true }
 
+/-- Canary hooks for a safe reference `&[&dyn Trait7; 0]` (outer type `32` pointing to `outerAddr`
+with pointee type `33`, size `0`, align `8`): inherits ALL element-level tripwires from
+`canaryArrayEmptyHooks` (`.wrapping` element projection, `toOp`, `readBytes`, and `readImmediate` on
+every type other than the outer reference `32`). -/
+private def canaryRefArrayEmptyHooks (outerAddr : UInt64) :
+    Miri.Interpreter.ValidityVisitor.Hooks AnnealProv AnnealStepState
+      Trusted.Rustc.V2026_06_01.MirAst.Ty Unit Unit Unit Unit :=
+  { canaryArrayEmptyHooks with
+    classify := fun c ty =>
+      if ty == 32 then pure (.reference false) else canaryArrayEmptyHooks.classify c ty
+    readImmediate := fun _ place _ =>
+      if place.layout.ty == 32 then pure ⟨.uninit, ⟨32, zstLayoutData⟩⟩
+      else throw (.undefinedBehavior "readImmediate-must-not-run-on-empty-array")
+    ptrToPlace := fun _ _ => pure ⟨⟨⟨⟨outerAddr⟩, none⟩, .none, none⟩, arrWideDyn0Layout⟩
+    sizeAndAlign := fun _ _ => pure (some (Miri.ABI.Size.ZERO, Miri.ABI.Align.EIGHT))
+    checkPointerAccess := fun _ _ _ => pure (.ok ())
+    scalarMayBeNull := fun _ sc =>
+      match sc.tryToScalarInt with
+      | .ok (.integer si) => pure (si.data == 0)
+      | _ => pure true
+    checkPointerAlignResult := fun _ ptr align =>
+      if ptr.offset.bytes.toNat % (2 ^ align.pow2) == 0 then pure (.ok ())
+      else pure (.error ⟨⟨2⟩, align⟩) }
+
+private theorem visit_nonRec_safeRef_ok {P S C E F A Pad : Type}
+    [Miri.Memory.PointerProvenance P] [DecidableEq P]
+    (h : Miri.Interpreter.ValidityVisitor.Hooks P S C E F A Pad) (c : C)
+    (fuel : Nat) (path : Miri.Memory.ValidationPath)
+    (place : Miri.Interpreter.RuntimePlace P) (st : S)
+    (mutBool : Bool)
+    (ptrImm : Miri.Interpreter.RvalueImmTy P) (target : Miri.Interpreter.MPlaceTy P)
+    (size : Miri.ABI.Size) (align : Miri.ABI.Align) (sc : Miri.Memory.Scalar P)
+    (hcl : h.classify c place.layout.ty st = .ok (.reference mutBool) st)
+    (hrd : h.readImmediate c place .reference st = .ok ptrImm st)
+    (hpt : h.ptrToPlace c ptrImm st = .ok target st)
+    (hmetaOk : target.layout.layout.isSized = true ∨
+      (miri_etm_private% Miri.Interpreter.ValidityVisitor Miri.Interpreter.ValidityVisitor.checkMetadata)
+        h c target st = .ok () st)
+    (hsa : h.sizeAndAlign c target st = .ok (some (size, align)) st)
+    (hacc : h.checkPointerAccess c target.mplace.ptr size st = .ok (.ok ()) st)
+    (hfrom : Miri.Memory.Scalar.fromMaybePointer h.target.base target.mplace.ptr = .ok sc)
+    (hnn : h.scalarMayBeNull c sc st = .ok false st)
+    (hinh : h.opsemInhabited c target.layout.ty st = .ok true st)
+    (hal : h.checkPointerAlignResult c target.mplace.ptr align st = .ok (.ok ()) st) :
+    let nonRecSession : Miri.Interpreter.ValidityVisitor.Session P :=
+      { path, flags := ⟨false, false⟩, ctfeMode := none, refTracking := none, dataBytes := none }
+    Miri.Interpreter.ValidityVisitor.visit h c (fuel + 1) nonRecSession place st =
+      .ok nonRecSession st := by
+  intro nonRecSession
+  have hcs : (miri_etm_private% Miri.Interpreter.ValidityVisitor Miri.Interpreter.ValidityVisitor.checkSafe)
+      h c nonRecSession place place.layout.ty (.reference mutBool) st = .ok nonRecSession st := by
+    with_unfolding_all
+      refine (est_bind_ok _ _ _ _ _ hrd).trans ?_
+      rw [ite_f (by simp [nonRecSession])]
+      dsimp only
+      refine (est_bind_ok _ _ _ _ _ hpt).trans ?_
+      have hskipMeta : ∀ (k : Unit → Miri.Interpreter.ValidityVisitor.M S (Miri.Interpreter.ValidityVisitor.Session P)),
+          (if !target.layout.layout.isSized then
+            (miri_etm_private% Miri.Interpreter.ValidityVisitor Miri.Interpreter.ValidityVisitor.checkMetadata) h c target >>= k
+          else k ()) st = k () st := by
+        intro k
+        rcases hmetaOk with hs | hm
+        · rw [hs, Bool.not_true, ite_f (by decide)]
+        · cases hb : target.layout.layout.isSized with
+          | true => rw [Bool.not_true, ite_f (by decide)]
+          | false => rw [Bool.not_false, ite_t (by decide)]; exact est_bind_ok _ _ _ _ () hm
+      rw [hskipMeta]
+      refine (est_bind_ok _ _ _ _ _ hsa).trans ?_
+      rw [Option.getD_some, ite_t (by simp [nonRecSession])]
+      refine (est_bind_ok _ _ _ _ (.ok ()) hacc).trans ?_
+      dsimp only
+      rw [ite_f (by simp [nonRecSession])]
+      refine (est_bind_ok _ _ _ _ none rfl).trans ?_
+      dsimp only
+      rw [ite_f (by simp [nonRecSession])]
+      refine (est_bind_ok _ _ _ _ sc (by rw [hfrom]; rfl)).trans ?_
+      refine (est_bind_ok _ _ _ _ false hnn).trans ?_
+      refine (est_bind_ok _ _ _ _ true hinh).trans ?_
+      refine (est_bind_ok _ _ st st () (by simp [Miri.Interpreter.ValidityVisitor.mapPointerAlignmentOutcome, hal])).trans ?_
+      rfl
+  unfold Miri.Interpreter.ValidityVisitor.visit
+  refine (est_bind_ok _ _ _ _ _ hcl).trans ?_
+  have hprim : (miri_etm_private% Miri.Interpreter.ValidityVisitor Miri.Interpreter.ValidityVisitor.primitive)
+      h c nonRecSession place (.reference mutBool) st = .ok (some nonRecSession) st := by
+    with_unfolding_all
+      exact (est_bind_ok _ _ _ _ _ hcs).trans rfl
+  exact (est_bind_ok _ _ _ _ _ hprim).trans rfl
+
 /-- Canary hooks for `[&dyn Trait7; 2]` (type `31`, stride `16`, placed at address `32`) and
 `&[&dyn Trait7; 2]` (type `32`) that DISTINGUISH the two element addresses: `readImmediate` tags
 the element at address `48` (element `1`), and `ptrToPlace` resolves element `0` to data address
@@ -25123,26 +25333,32 @@ private theorem visit_array_nonZst_elem0_projectionErr {P S C E F A Pad : Type}
    `toOp` and `readBytes` all throw: no element operation is reached. Control: under the SAME
    hooks the 2-element `[&dyn Trait7; 2]` fails with the `.wrapping` element-projection tripwire
    `"element-projection-must-not-run-on-empty-array"`;
-2. Direct EMPTY numeric `[u32; 0]` succeeds `.ok () m` for both `recursive` flags under the same
+2. Recursive safe reference to EMPTY non-ZST `&[&dyn Trait7; 0]` (`canaryRefArrayEmptyHooks`,
+   inheriting every element tripwire): aligned non-null (`addr = 32`, align `8`) succeeds `.ok () m`
+   through `childSession`, while null (`addr = 0`) fails `"null or maybe-null safe pointer"` and
+   misaligned (`addr = 4`, align `8`) fails `classifyPointerAlignmentError` before entering
+   `childSession`;
+3. Direct EMPTY numeric `[u32; 0]` succeeds `.ok () m` for both `recursive` flags under the same
    hooks. Control: the 2-element `[u32; 2]` fails with the tripwire
    `"toOp-must-not-run-on-empty-array"`;
-3. Direct `[&dyn Trait7; 2]` (validated with `recursive = true`) whose element `0` carries the
-   VALID `Trait7` vtable and an accessible, aligned, non-null data address, and whose element `1`
-   carries an invalid vtable, fails with exactly element `1`'s vtable error:
+4. Direct `[&dyn Trait7; 2]` (for BOTH `recursive = true` and `recursive = false`) whose element
+   `0` carries the VALID `Trait7` vtable and an accessible, aligned, non-null data address, and
+   whose element `1` carries an invalid vtable, fails with exactly element `1`'s vtable error:
    `"InvalidVTablePointer"` for a null vtable word and for the valid vtable allocation at offset
    `4`, and `"InvalidVTableTrait"` when element `1` carries the SAME word that element `0`
    accepted but expects a different principal trait. Element `1`'s data pointer is null and
    `checkPointerAccess` throws on it, so neither data-pointer failure is the reported result;
-4. Contrast: when element `0`'s vtable word is null and element `1` would fail with
-   `"InvalidVTableTrait"`, the result is element `0`'s `"InvalidVTablePointer"` (the FIRST invalid
-   vtable wins);
-5. Recursive `&[&dyn Trait7; 2]`: the same element-`1` failures (null word, trait mismatch) and the
+5. Contrast (for BOTH `recursive = true` and `recursive = false`): when element `0`'s vtable word
+   is null and element `1` would fail with `"InvalidVTableTrait"`, the result is element `0`'s
+   `"InvalidVTablePointer"` (the FIRST invalid vtable wins);
+6. Recursive `&[&dyn Trait7; 2]`: the same element-`1` failures (null word, trait mismatch) and the
    same element-`0` contrast through the tracked `childSession`.
 
-Items 3 and 5 instantiate `validatePlace_array_wideDyn_firstInvalidVTable_precedes` and
+Items 1 and 3 instantiate both parts of `validatePlace_array_empty_nonZst_and_numeric_direct`;
+item 2 instantiates all 3 parts of `validatePlace_ref_emptyArray_nonZst`; items 4 and 6 instantiate
+`validatePlace_array_wideDyn_firstInvalidVTable_precedes` (both `recursive` values) and
 `validatePlace_ref_array_wideDyn_firstInvalidVTable_precedes` at `k = 1` (element `0`'s successful
-validation discharges their prefix hypotheses); items 1 and 2 instantiate both parts of
-`validatePlace_array_empty_nonZst_and_numeric_direct`. -/
+validation discharges their prefix hypotheses). -/
 theorem array_empty_and_firstInvalidVTable_index1_canary (m : AnnealStepState) :
     let intWord : UInt64 → Miri.Memory.Scalar AnnealProv := fun a =>
       Miri.Memory.Scalar.fromScalarInt (Miri.Memory.ScalarInt.ofUInt64 a)
@@ -25156,37 +25372,57 @@ theorem array_empty_and_firstInvalidVTable_index1_canary (m : AnnealStepState) :
     let vtMis4 := ptrWordOff ⟨1, by decide⟩ 4
     let runEmpty := fun place recBool =>
       Miri.Interpreter.ValidityVisitor.validatePlace canaryArrayEmptyHooks tyDummy 1 place recBool false m
-    let runIdx := fun vt0 vt1 expected0 expected1 place =>
+    let runRefEmpty := fun outerAddr =>
+      Miri.Interpreter.ValidityVisitor.validatePlace (canaryRefArrayEmptyHooks outerAddr) tyDummy 1
+        (mkPlace ⟨32, zstLayoutData⟩) true false m
+    let runIdx := fun vt0 vt1 expected0 expected1 place recBool =>
       Miri.Interpreter.ValidityVisitor.validatePlace
-        (canaryArrayIdxHooks vt0 vt1 expected0 expected1) tyDummy 2 place true false m
+        (canaryArrayIdxHooks vt0 vt1 expected0 expected1) tyDummy 2 place recBool false m
     -- (1) Direct EMPTY `[&dyn Trait7; 0]` (non-numeric, non-ZST element):
     runEmpty (mkPlace arrWideDyn0Layout) false = .ok () m ∧
     runEmpty (mkPlace arrWideDyn0Layout) true = .ok () m ∧
     runEmpty (mkPlace arrWideDyn2Layout) false =
       .error (.undefinedBehavior "element-projection-must-not-run-on-empty-array") m ∧
-    -- (2) Direct EMPTY numeric `[u32; 0]`:
+    -- (2) Recursive `&[&dyn Trait7; 0]` (non-numeric, non-ZST element behind safe ref):
+    runRefEmpty 32 = .ok () m ∧
+    runRefEmpty 0 = .error (.undefinedBehavior "validation: null or maybe-null safe pointer") m ∧
+    runRefEmpty 4 = .error (Miri.Interpreter.ValidityVisitor.classifyPointerAlignmentError
+      ⟨"", #[]⟩ (.reference false) ⟨⟨2⟩, Miri.ABI.Align.EIGHT⟩) m ∧
+    -- (3) Direct EMPTY numeric `[u32; 0]`:
     runEmpty (mkPlace arrU32ZeroLayout) false = .ok () m ∧
     runEmpty (mkPlace arrU32ZeroLayout) true = .ok () m ∧
     runEmpty (mkPlace arrU32TwoLayout) false =
       .error (.undefinedBehavior "toOp-must-not-run-on-empty-array") m ∧
-    -- (3) Direct `[&dyn Trait7; 2]`: element `0` valid, element `1` invalid:
-    runIdx vtValid vtNull 3 3 (mkPlace arrWideDyn2Layout) =
+    -- (4) Direct `[&dyn Trait7; 2]` (`recursive = true` AND `recursive = false`), element `1` invalid:
+    runIdx vtValid vtNull 3 3 (mkPlace arrWideDyn2Layout) true =
       .error (.undefinedBehavior "InvalidVTablePointer") m ∧
-    runIdx vtValid vtMis4 3 3 (mkPlace arrWideDyn2Layout) =
+    runIdx vtValid vtMis4 3 3 (mkPlace arrWideDyn2Layout) true =
       .error (.undefinedBehavior "InvalidVTablePointer") m ∧
-    runIdx vtValid vtValid 3 4 (mkPlace arrWideDyn2Layout) =
+    runIdx vtValid vtValid 3 4 (mkPlace arrWideDyn2Layout) true =
       .error (.undefinedBehavior "InvalidVTableTrait") m ∧
-    -- (4) Contrast: element `0` ALSO invalid, with a different error than element `1`:
-    runIdx vtNull vtValid 3 4 (mkPlace arrWideDyn2Layout) =
+    runIdx vtValid vtNull 3 3 (mkPlace arrWideDyn2Layout) false =
       .error (.undefinedBehavior "InvalidVTablePointer") m ∧
-    -- (5) Recursive `&[&dyn Trait7; 2]`:
-    runIdx vtValid vtNull 3 3 (mkPlace ⟨32, zstLayoutData⟩) =
+    runIdx vtValid vtMis4 3 3 (mkPlace arrWideDyn2Layout) false =
       .error (.undefinedBehavior "InvalidVTablePointer") m ∧
-    runIdx vtValid vtValid 3 4 (mkPlace ⟨32, zstLayoutData⟩) =
+    runIdx vtValid vtValid 3 4 (mkPlace arrWideDyn2Layout) false =
       .error (.undefinedBehavior "InvalidVTableTrait") m ∧
-    runIdx vtNull vtValid 3 4 (mkPlace ⟨32, zstLayoutData⟩) =
+    -- (5) Contrast (`recursive = true` AND `recursive = false`): element `0` ALSO invalid:
+    runIdx vtNull vtValid 3 4 (mkPlace arrWideDyn2Layout) true =
+      .error (.undefinedBehavior "InvalidVTablePointer") m ∧
+    runIdx vtNull vtValid 3 4 (mkPlace arrWideDyn2Layout) false =
+      .error (.undefinedBehavior "InvalidVTablePointer") m ∧
+    -- (6) Recursive `&[&dyn Trait7; 2]`:
+    runIdx vtValid vtNull 3 3 (mkPlace ⟨32, zstLayoutData⟩) true =
+      .error (.undefinedBehavior "InvalidVTablePointer") m ∧
+    runIdx vtValid vtValid 3 4 (mkPlace ⟨32, zstLayoutData⟩) true =
+      .error (.undefinedBehavior "InvalidVTableTrait") m ∧
+    runIdx vtNull vtValid 3 4 (mkPlace ⟨32, zstLayoutData⟩) true =
       .error (.undefinedBehavior "InvalidVTablePointer") m := by
-  intro intWord ptrWordOff tyDummy mkPlace vtValid vtNull vtMis4 runEmpty runIdx
+  intro intWord ptrWordOff tyDummy mkPlace vtValid vtNull vtMis4 runEmpty runRefEmpty runIdx
+  have hfrom0 : Miri.Memory.Scalar.fromMaybePointer annealTargetDataLayout
+      (⟨⟨0⟩, none⟩ : Miri.Memory.Pointer (Option AnnealProv)) = .ok (intWord 0) := by decide
+  have hfrom4 : Miri.Memory.Scalar.fromMaybePointer annealTargetDataLayout
+      (⟨⟨4⟩, none⟩ : Miri.Memory.Pointer (Option AnnealProv)) = .ok (intWord 4) := by decide
   have hfrom32 : Miri.Memory.Scalar.fromMaybePointer annealTargetDataLayout
       (⟨⟨32⟩, none⟩ : Miri.Memory.Pointer (Option AnnealProv)) = .ok (intWord 32) := by decide
   have hfrom64 : Miri.Memory.Scalar.fromMaybePointer annealTargetDataLayout
@@ -25249,7 +25485,7 @@ theorem array_empty_and_firstInvalidVTable_index1_canary (m : AnnealStepState) :
       ⟨⟨⟨⟨64⟩, none⟩, .metadata vt0, none⟩, canaryNestedUnsizedLayout⟩ m e0 vt0 vtPtr0 rfl rfl htp0
     rw [hok0] at hcm
     exact hcm
-  -- Direct `[&dyn Trait7; 2]`, `k = 1`: element `0` validates (and is tracked), element `1` fails.
+  -- Direct `[&dyn Trait7; 2]`, `k = 1`, `recursive = true`: element `0` validates (tracked), element `1` fails.
   have hDir1 : ∀ (vt0 vt1 : Miri.Memory.Scalar AnnealProv) (e0 e1 : Nat)
       (vtPtr0 vtPtr1 : Miri.Memory.Pointer (Option AnnealProv)) (ty0 : Nat)
       (err : Miri.Interpreter.StepError),
@@ -25259,7 +25495,7 @@ theorem array_empty_and_firstInvalidVTable_index1_canary (m : AnnealStepState) :
       vt1.toPointer annealTargetDataLayout = .ok vtPtr1 →
       Miri.Interpreter.VTable.getPtrVTableType
         (canaryArrayIdxHooks vt0 vt1 e0 e1).vtable tyDummy vtPtr1 (some e1) m = .error err m →
-      runIdx vt0 vt1 e0 e1 (mkPlace arrWideDyn2Layout) = .error err m := by
+      runIdx vt0 vt1 e0 e1 (mkPlace arrWideDyn2Layout) true = .error err m := by
     intro vt0 vt1 e0 e1 vtPtr0 vtPtr1 ty0 err htp0 hok0 htp1 herr1
     let initSess : Miri.Interpreter.ValidityVisitor.Session AnnealProv :=
       { path := ⟨"", #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
@@ -25290,16 +25526,57 @@ theorem array_empty_and_firstInvalidVTable_index1_canary (m : AnnealStepState) :
         exact ⟨Miri.ABI.Size.ZERO, _, _, rfl, rfl, hel0, rfl, fun h => absurd h (by decide)⟩)
       (fun _ hs => hs.1)
       rfl rfl rfl rfl rfl rfl rfl rfl htp1 herr1
-  -- Direct `[&dyn Trait7; 2]`, `k = 0`: element `0` fails.
-  have hDir0 : ∀ (vt0 vt1 : Miri.Memory.Scalar AnnealProv) (e0 e1 : Nat)
+  -- Direct `[&dyn Trait7; 2]`, `k = 1`, `recursive = false` (`refTracking = none`): element `0` validates, element `1` fails.
+  have hDir1NR : ∀ (vt0 vt1 : Miri.Memory.Scalar AnnealProv) (e0 e1 : Nat)
+      (vtPtr0 vtPtr1 : Miri.Memory.Pointer (Option AnnealProv)) (ty0 : Nat)
+      (err : Miri.Interpreter.StepError),
+      vt0.toPointer annealTargetDataLayout = .ok vtPtr0 →
+      Miri.Interpreter.VTable.getPtrVTableType
+        (canaryArrayIdxHooks vt0 vt1 e0 e1).vtable tyDummy vtPtr0 (some e0) m = .ok ty0 m →
+      vt1.toPointer annealTargetDataLayout = .ok vtPtr1 →
+      Miri.Interpreter.VTable.getPtrVTableType
+        (canaryArrayIdxHooks vt0 vt1 e0 e1).vtable tyDummy vtPtr1 (some e1) m = .error err m →
+      runIdx vt0 vt1 e0 e1 (mkPlace arrWideDyn2Layout) false = .error err m := by
+    intro vt0 vt1 e0 e1 vtPtr0 vtPtr1 ty0 err htp0 hok0 htp1 herr1
+    let initSessNR : Miri.Interpreter.ValidityVisitor.Session AnnealProv :=
+      { path := ⟨"", #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+        refTracking := none, dataBytes := none }
+    have hel0 := visit_nonRec_safeRef_ok
+      (canaryArrayIdxHooks vt0 vt1 e0 e1) tyDummy 0
+      ((⟨"", #[]⟩ : Miri.Memory.ValidationPath).push (.arrayElem 0))
+      ⟨.memory ⟨⟨⟨32⟩, none⟩, .none, none⟩, canaryNestedWideRefLayout⟩ m false
+      ⟨.uninit, canaryNestedWideRefLayout⟩
+      ⟨⟨⟨⟨64⟩, none⟩, .metadata vt0, none⟩, canaryNestedUnsizedLayout⟩
+      ⟨16⟩ Miri.ABI.Align.EIGHT (intWord 64)
+      rfl rfl rfl (Or.inr (hmeta0 vt0 vt1 e0 e1 vtPtr0 ty0 htp0 hok0)) rfl rfl hfrom64 rfl rfl
+      (hal64 vt0 vt1 e0 e1)
+    exact validatePlace_array_wideDyn_firstInvalidVTable_precedes
+      (canaryArrayIdxHooks vt0 vt1 e0 e1) tyDummy 0 (mkPlace arrWideDyn2Layout) false m ""
+      1 (.reference false) canaryNestedWideRefLayout canaryNestedWideRefLayout ⟨16⟩ 2 2 ⟨32⟩
+      arrUnitLayout ⟨.memory ⟨⟨⟨64⟩, none⟩, .none, none⟩, arrUnitLayout⟩
+      1 ⟨16⟩ ⟨.memory ⟨⟨⟨48⟩, none⟩, .none, none⟩, canaryNestedWideRefLayout⟩
+      (fun _ s => s = initSessNR)
+      false e1 ⟨.uninit, ⟨34, zstLayoutData⟩⟩
+      ⟨⟨⟨⟨0⟩, none⟩, .metadata vt1, none⟩, canaryIdxUnsizedLayout1⟩
+      vt1 vtPtr1 err m (fun _ _ => rfl) rfl rfl rfl (by decide) (by decide) rfl rfl rfl rfl
+      (by decide) rfl rfl rfl rfl
+      rfl
+      (fun i hi sess hs => by
+        obtain rfl : i = 0 := by omega
+        obtain rfl : sess = initSessNR := hs
+        exact ⟨Miri.ABI.Size.ZERO, _, _, rfl, rfl, hel0, rfl⟩)
+      (fun _ hs => by rw [hs])
+      rfl rfl rfl rfl rfl rfl rfl rfl htp1 herr1
+  -- Direct `[&dyn Trait7; 2]`, `k = 0` (either `recursive` flag): element `0` fails.
+  have hDir0 : ∀ (recBool : Bool) (vt0 vt1 : Miri.Memory.Scalar AnnealProv) (e0 e1 : Nat)
       (vtPtr0 : Miri.Memory.Pointer (Option AnnealProv)) (err : Miri.Interpreter.StepError),
       vt0.toPointer annealTargetDataLayout = .ok vtPtr0 →
       Miri.Interpreter.VTable.getPtrVTableType
         (canaryArrayIdxHooks vt0 vt1 e0 e1).vtable tyDummy vtPtr0 (some e0) m = .error err m →
-      runIdx vt0 vt1 e0 e1 (mkPlace arrWideDyn2Layout) = .error err m :=
-    fun vt0 vt1 e0 e1 vtPtr0 err htp0 herr0 =>
+      runIdx vt0 vt1 e0 e1 (mkPlace arrWideDyn2Layout) recBool = .error err m :=
+    fun recBool vt0 vt1 e0 e1 vtPtr0 err htp0 herr0 =>
       validatePlace_array_wideDyn_invalidVTable_precedes_dataPtr
-        (canaryArrayIdxHooks vt0 vt1 e0 e1) tyDummy 0 (mkPlace arrWideDyn2Layout) true m ""
+        (canaryArrayIdxHooks vt0 vt1 e0 e1) tyDummy 0 (mkPlace arrWideDyn2Layout) recBool m ""
         1 (.reference false) canaryNestedWideRefLayout ⟨16⟩ 2 2 ⟨32⟩ arrUnitLayout
         ⟨.memory ⟨⟨⟨64⟩, none⟩, .none, none⟩, arrUnitLayout⟩
         ⟨.memory ⟨⟨⟨32⟩, none⟩, .none, none⟩, canaryNestedWideRefLayout⟩
@@ -25317,7 +25594,7 @@ theorem array_empty_and_firstInvalidVTable_index1_canary (m : AnnealStepState) :
       vt1.toPointer annealTargetDataLayout = .ok vtPtr1 →
       Miri.Interpreter.VTable.getPtrVTableType
         (canaryArrayIdxHooks vt0 vt1 e0 e1).vtable tyDummy vtPtr1 (some e1) m = .error err m →
-      runIdx vt0 vt1 e0 e1 (mkPlace ⟨32, zstLayoutData⟩) = .error err m := by
+      runIdx vt0 vt1 e0 e1 (mkPlace ⟨32, zstLayoutData⟩) true = .error err m := by
     intro vt0 vt1 e0 e1 vtPtr0 vtPtr1 ty0 err htp0 hok0 htp1 herr1
     let childSess : Miri.Interpreter.ValidityVisitor.Session AnnealProv :=
       { path := (⟨"", #[]⟩ : Miri.Memory.ValidationPath).push .deref, flags := ⟨false, true⟩,
@@ -25357,7 +25634,7 @@ theorem array_empty_and_firstInvalidVTable_index1_canary (m : AnnealStepState) :
       vt0.toPointer annealTargetDataLayout = .ok vtPtr0 →
       Miri.Interpreter.VTable.getPtrVTableType
         (canaryArrayIdxHooks vt0 vt1 e0 e1).vtable tyDummy vtPtr0 (some e0) m = .error err m →
-      runIdx vt0 vt1 e0 e1 (mkPlace ⟨32, zstLayoutData⟩) = .error err m :=
+      runIdx vt0 vt1 e0 e1 (mkPlace ⟨32, zstLayoutData⟩) true = .error err m :=
     fun vt0 vt1 e0 e1 vtPtr0 err htp0 herr0 =>
       validatePlace_ref_array_wideDyn_invalidVTable_precedes_dataPtr
         (canaryArrayIdxHooks vt0 vt1 e0 e1) tyDummy 0 (mkPlace ⟨32, zstLayoutData⟩) m ""
@@ -25402,6 +25679,33 @@ theorem array_empty_and_firstInvalidVTable_index1_canary (m : AnnealStepState) :
       canaryNestedWideRefLayout ⟨16⟩ 0 arrUnitLayout
       ⟨.memory ⟨⟨⟨32⟩, none⟩, .none, none⟩, arrUnitLayout⟩ recBool
       rfl rfl rfl (by decide) (by decide) rfl rfl rfl rfl rfl rfl rfl rfl
+  have hRefEmptyBase := fun (outerAddr : UInt64) (sc : Miri.Memory.Scalar AnnealProv)
+      (hfr : Miri.Memory.Scalar.fromMaybePointer annealTargetDataLayout ⟨⟨outerAddr⟩, none⟩ = .ok sc) =>
+    validatePlace_ref_emptyArray_nonZst (canaryRefArrayEmptyHooks outerAddr) tyDummy 0
+      (mkPlace ⟨32, zstLayoutData⟩) m "" false ⟨.uninit, ⟨32, zstLayoutData⟩⟩
+      ⟨⟨⟨⟨outerAddr⟩, none⟩, .none, none⟩, arrWideDyn0Layout⟩ Miri.ABI.Size.ZERO Miri.ABI.Align.EIGHT sc
+      (fun _ _ => rfl) rfl rfl rfl rfl rfl rfl rfl rfl hfr
+  have hRefEmpty32 : runRefEmpty 32 = .ok () m := by
+    have hal32 : (canaryRefArrayEmptyHooks 32).checkPointerAlignResult tyDummy
+        (⟨⟨32⟩, none⟩ : Miri.Memory.Pointer (Option AnnealProv)) Miri.ABI.Align.EIGHT m = .ok (.ok ()) m := by
+      have hmod : ((32 : UInt64).toNat % (2 ^ Miri.ABI.Align.EIGHT.pow2) == 0) = true := by decide
+      simp only [canaryRefArrayEmptyHooks, hmod, ↓reduceIte]; rfl
+    exact (hRefEmptyBase 32 (intWord 32) hfrom32).2.2 1 (.reference false) canaryNestedWideRefLayout
+      canaryNestedWideRefLayout ⟨16⟩ 0 arrUnitLayout
+      ⟨.memory ⟨⟨⟨32⟩, none⟩, .none, none⟩, arrUnitLayout⟩
+      rfl rfl hal32 rfl rfl (by decide) (by decide) rfl rfl rfl rfl rfl rfl rfl
+  have hRefEmpty0 : runRefEmpty 0 =
+      .error (.undefinedBehavior "validation: null or maybe-null safe pointer") m :=
+    (hRefEmptyBase 0 (intWord 0) hfrom0).1 rfl
+  have hRefEmpty4 : runRefEmpty 4 =
+      .error (Miri.Interpreter.ValidityVisitor.classifyPointerAlignmentError
+        ⟨"", #[]⟩ (.reference false) ⟨⟨2⟩, Miri.ABI.Align.EIGHT⟩) m := by
+    have hal4 : (canaryRefArrayEmptyHooks 4).checkPointerAlignResult tyDummy
+        (⟨⟨4⟩, none⟩ : Miri.Memory.Pointer (Option AnnealProv)) Miri.ABI.Align.EIGHT m =
+        .ok (.error ⟨⟨2⟩, Miri.ABI.Align.EIGHT⟩) m := by
+      have hmod : ((4 : UInt64).toNat % (2 ^ Miri.ABI.Align.EIGHT.pow2) == 0) = false := by decide
+      simp only [canaryRefArrayEmptyHooks, hmod, Bool.false_eq_true, ↓reduceIte]; rfl
+    exact (hRefEmptyBase 4 (intWord 4) hfrom4).2.1 ⟨⟨2⟩, Miri.ABI.Align.EIGHT⟩ rfl rfl hal4
   have hEmptyU32 : ∀ recBool, runEmpty (mkPlace arrU32ZeroLayout) recBool = .ok () m :=
     fun recBool => (hEmpty arrU32ZeroLayout).2 26 .integer arrU32Layout recBool
       rfl rfl (Or.inl rfl) rfl rfl
@@ -25418,12 +25722,17 @@ theorem array_empty_and_firstInvalidVTable_index1_canary (m : AnnealStepState) :
       .error (.undefinedBehavior "toOp-must-not-run-on-empty-array") m :=
     (validatePlace_noTrack_eq canaryArrayEmptyHooks tyDummy 1 (mkPlace arrU32TwoLayout) false m ""
       (fun _ _ => rfl) rfl).1 _ m rfl
-  refine ⟨hEmptyDyn false, hEmptyDyn true, hTripDyn, hEmptyU32 false, hEmptyU32 true, hTripU32,
-    ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  refine ⟨hEmptyDyn false, hEmptyDyn true, hTripDyn, hRefEmpty32, hRefEmpty0, hRefEmpty4,
+    hEmptyU32 false, hEmptyU32 true, hTripU32,
+    ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · exact hDir1 vtValid vtNull 3 3 _ _ 42 _ hvtValidPtr (hOk3 _ _ 3) hvtNullPtr (hNull3 _ _ 3 3)
   · exact hDir1 vtValid vtMis4 3 3 _ _ 42 _ hvtValidPtr (hOk3 _ _ 3) hvtMisPtr (hMis3 _ _ 3 3)
   · exact hDir1 vtValid vtValid 3 4 _ _ 42 _ hvtValidPtr (hOk3 _ _ 4) hvtValidPtr (hWrong4 _ _ 3 4)
-  · exact hDir0 vtNull vtValid 3 4 _ _ hvtNullPtr (hNull3 _ _ 3 4)
+  · exact hDir1NR vtValid vtNull 3 3 _ _ 42 _ hvtValidPtr (hOk3 _ _ 3) hvtNullPtr (hNull3 _ _ 3 3)
+  · exact hDir1NR vtValid vtMis4 3 3 _ _ 42 _ hvtValidPtr (hOk3 _ _ 3) hvtMisPtr (hMis3 _ _ 3 3)
+  · exact hDir1NR vtValid vtValid 3 4 _ _ 42 _ hvtValidPtr (hOk3 _ _ 4) hvtValidPtr (hWrong4 _ _ 3 4)
+  · exact hDir0 true vtNull vtValid 3 4 _ _ hvtNullPtr (hNull3 _ _ 3 4)
+  · exact hDir0 false vtNull vtValid 3 4 _ _ hvtNullPtr (hNull3 _ _ 3 4)
   · exact hRef1 vtValid vtNull 3 3 _ _ 42 _ hvtValidPtr (hOk3 _ _ 3) hvtNullPtr (hNull3 _ _ 3 3)
   · exact hRef1 vtValid vtValid 3 4 _ _ 42 _ hvtValidPtr (hOk3 _ _ 4) hvtValidPtr (hWrong4 _ _ 3 4)
   · exact hRef0 vtNull vtValid 3 4 _ _ hvtNullPtr (hNull3 _ _ 3 4)
@@ -26362,7 +26671,7 @@ depends on axioms: [propext]
 
 /-! ### 4B. Vendored stateful bridge theorems (at most `propext`, `Classical.choice`, `Quot.sound`)
 
-The statements of these 101 theorems directly mention vendored `Miri.*` or
+The statements of these 115 theorems directly mention vendored `Miri.*` or
 `LeanMiriSpec.*` stateful definitions (`MemoryState`, `KeyedArray`,
 `AnnealMachine` / `annealResolvePtr`, `StateRelLM3_1` / `StateRelLM3_2`,
 `BorrowTree.releaseProtector`, `beforeStackPopWithEnsure`, `MachineHooks.MachineState`,
@@ -27126,6 +27435,13 @@ depends on axioms: [propext, Classical.choice, Quot.sound]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms validatePlace_array_empty_nonZst_and_numeric_direct
+
+/--
+info: 'LeanMiriSpec.ExtTreeMapAllocLM.validatePlace_ref_emptyArray_nonZst'
+depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms validatePlace_ref_emptyArray_nonZst
 
 /--
 info: 'LeanMiriSpec.ExtTreeMapAllocLM.validatePlace_array_wideDyn_firstInvalidVTable_precedes'
