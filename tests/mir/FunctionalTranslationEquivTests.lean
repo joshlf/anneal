@@ -4957,6 +4957,1132 @@ theorem constructiveTotal_obsErasedRefines_ubException_and_indexed_cover_transfe
 
 end CallContractCanaries
 
+/-! ### Part 5J: Offset Function-Pointer Remap, Nondeterministic `externalSpecCallContract` Modular Transfer, and Cross-`callees` Certificate Transfer -/
+
+section B4HardeningCanaries
+
+open Trusted.ITree
+
+/-- Thin raw pointer type `*const u8` (layout-free byte stride `1` for `BinOp.offset`). -/
+@[reducible] def u8ConstRawPtrMirTy : Ty :=
+  { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }
+
+/-- Signed 64-bit `isize` constant operand for `BinOp.offset`. -/
+@[reducible] def isizeConstOp (n : Nat) : Operand :=
+  .constant { ty := { kind := .int .isize, layoutIdx := 0 }, val := .scalar (.int { bits := n, sizeBytes := 8 }) }
+
+/--
+Standalone callee that reifies `fn_twenty` (`allocId = 65536`), casts via
+`CastKind.fnPtrToPtr` to `*const u8`, and offsets by `+4` bytes via
+`BinOp.offset`, returning `.ptr { allocId := 65536, offsetBytes := 4, tag := 0 } 8`.
+-/
+def extReturnTwentyOffsetRawPtrBody : CapturedMir :=
+  mkMirBody "test::ext_ret_twenty_offset_raw_ptr" 1
+    [mkDecl .mut u8ConstRawPtrMirTy, mkDecl .not u32MirTy,
+     mkDecl .mut u32FnPtrMirTy, mkDecl .mut u8ConstRawPtrMirTy]
+    [ { statements :=
+          [mkStmt (.storageLive 2),
+           mkStmt (.assign (locPlace 2)
+             (.cast (.pointerCoercion "ReifyFnPointer")
+               (fnItemOp "test::fn_twenty") u32FnPtrMirTy)),
+           mkStmt (.storageLive 3),
+           mkStmt (.assign (locPlace 3)
+             (.cast .fnPtrToPtr (.copy (locPlace 2)) u8ConstRawPtrMirTy)),
+           mkStmt (.assign (locPlace 0)
+             (.binaryOp .offset (.copy (locPlace 3)) (isizeConstOp 4)))]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+/--
+Caller holding caller function pointer `fp = fn_ten` (`allocId = 65536`), invoking
+standalone `ext_ret_twenty_offset_raw_ptr(x)` to get an offset raw pointer
+derived from `fn_twenty`, calling `fp(x)` AFTERWARDS, and returning the
+offset raw pointer.
+-/
+def callerFnTenAndExtOffsetBody : CapturedMir :=
+  mkMirBody "test::caller_fnten_and_ext_offset" 1
+    [mkDecl .mut u8ConstRawPtrMirTy, mkDecl .not u32MirTy,
+     mkDecl .mut u32FnPtrMirTy, mkDecl .mut u8ConstRawPtrMirTy,
+     mkDecl .mut u32MirTy]
+    [ { statements :=
+          [mkStmt (.storageLive 2),
+           mkStmt (.assign (locPlace 2)
+             (.cast (.pointerCoercion "ReifyFnPointer")
+               (fnItemOp "test::fn_ten") u32FnPtrMirTy)),
+           mkStmt (.storageLive 3)]
+        terminator := mkTerm
+          (.call (fnItemOp "test::ext_ret_twenty_offset_raw_ptr") [.copy (locPlace 1)]
+            (locPlace 3) (some 1) .continue_)
+        isCleanup := false },
+      { statements := [mkStmt (.storageLive 4)]
+        terminator := mkTerm
+          (.call (.copy (locPlace 2)) [.copy (locPlace 1)]
+            (locPlace 4) (some 2) .continue_)
+        isCleanup := false },
+      { statements :=
+          [mkStmt (.assign (locPlace 0) (.use (.copy (locPlace 3))))]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+def safeOffsetFnPtrStandaloneEnv : MirCallEnv :=
+  MirCallEnv.ofStandaloneBody fnPtrCallees 10 (fun dp =>
+    if dp == "test::ext_ret_twenty_offset_raw_ptr" then some extReturnTwentyOffsetRawPtrBody
+    else none)
+
+/--
+Offset function-pointer remap canary:
+1. Standalone `extReturnTwentyOffsetRawPtrBody` (`ReifyFnPointer fn_twenty ->
+   CastKind.fnPtrToPtr -> BinOp.offset 4`) genuinely produces
+   `.ptr { allocId := 65536, offsetBytes := 4, tag := 0 } 8`;
+2. `Value.remapFnPtrAllocIds [(65536, 65537)]` remaps that offset pointer to
+   `allocId := 65537` (proving `offsetBytes != 0` pointers are NOT skipped!);
+3. Full caller execution `callerFnTenAndExtOffsetBody` under
+   `MirCallEnv.ofStandaloneBody` returns `.ptr { allocId := 65537, offsetBytes := 4, tag := 0 } 8`,
+   keeping caller `65536 ↦ fn_ten` unshadowed AND re-interning `65537 ↦ fn_twenty`!
+-/
+theorem standalone_offset_fnPtr_remap_and_multi_reify :
+    let offsetPtr : ProvenancePtr := { allocId := 65536, offsetBytes := 4 }
+    let remappedPtr : ProvenancePtr := { allocId := 65537, offsetBytes := 4 }
+    (runMirWithGap MirCallEnv.unresolved fnPtrCallees extReturnTwentyOffsetRawPtrBody 10
+        [.scalar ⟨5, 4⟩]).map Prod.fst = .ok (.ptr offsetPtr 8) ∧
+      Value.remapFnPtrAllocIds [(65536, 65537)] (.ptr offsetPtr 8) = .ptr remappedPtr 8 ∧
+      Value.remapFnPtrAllocIds [(65536, 65537)] (.ptr offsetPtr 8) ≠ .ptr offsetPtr 8 ∧
+      (runMirWithGap safeOffsetFnPtrStandaloneEnv fnPtrCallees callerFnTenAndExtOffsetBody 25
+          [.scalar ⟨5, 4⟩]).map
+          (fun r => (r.1,
+            (lookupFnPtr r.2.fnPtrs 65536).map FnPtrEntry.defPath,
+            (lookupFnPtr r.2.fnPtrs 65537).map FnPtrEntry.defPath)) =
+        .ok (.ptr remappedPtr 8, some "test::fn_ten", some "test::fn_twenty") := by
+  dsimp only
+  let extMem : Memory :=
+    { (initMachineStateWithCallees extReturnTwentyOffsetRawPtrBody [.scalar ⟨5, 4⟩] fnPtrCallees).memory with
+      fnPtrs := [{ allocId := 65536, defPath := "test::fn_twenty", typeArgs := [], fnSig := some u32FnPtrMirTy.kind }] }
+  have hExt : runMirWithGap MirCallEnv.unresolved fnPtrCallees extReturnTwentyOffsetRawPtrBody 10
+      [.scalar ⟨5, 4⟩] = .ok (.ptr { allocId := 65536, offsetBytes := 4 } 8, extMem) := rfl
+  have h1 : (runMirWithGap MirCallEnv.unresolved fnPtrCallees extReturnTwentyOffsetRawPtrBody 10
+      [.scalar ⟨5, 4⟩]).map Prod.fst = .ok (.ptr { allocId := 65536, offsetBytes := 4 } 8) := by
+    rw [hExt]; rfl
+  have h4 : (runMirWithGap safeOffsetFnPtrStandaloneEnv fnPtrCallees callerFnTenAndExtOffsetBody 25
+      [.scalar ⟨5, 4⟩]).map
+      (fun r => (r.1,
+        (lookupFnPtr r.2.fnPtrs 65536).map FnPtrEntry.defPath,
+        (lookupFnPtr r.2.fnPtrs 65537).map FnPtrEntry.defPath)) =
+      .ok (.ptr { allocId := 65537, offsetBytes := 4 } 8, some "test::fn_ten", some "test::fn_twenty") := by
+    let m0 := (initMachineStateWithCallees callerFnTenAndExtOffsetBody [.scalar ⟨5, 4⟩] fnPtrCallees).memory
+    let m2 : Memory :=
+      { m0 with fnPtrs := [{ allocId := 65536, defPath := "test::fn_ten", typeArgs := [], fnSig := some u32FnPtrMirTy.kind }] }
+    let m4 : Memory :=
+      { m0 with fnPtrs :=
+        [{ allocId := 65537, defPath := "test::fn_twenty", typeArgs := [], fnSig := some u32FnPtrMirTy.kind },
+         { allocId := 65536, defPath := "test::fn_ten", typeArgs := [], fnSig := some u32FnPtrMirTy.kind }] }
+    let fpTen : Value := .ptr { allocId := 65536, offsetBytes := 0 } 8
+    let ptrOff : Value := .ptr { allocId := 65537, offsetBytes := 4 } 8
+    let s1 : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 1, locals := [.uninit, .init (.scalar ⟨5, 4⟩), .uninit, .dead, .dead] }, memory := m0 }
+    let s2 : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 2, locals := [.uninit, .init (.scalar ⟨5, 4⟩), .init fpTen, .dead, .dead] }, memory := m2 }
+    let s3 : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 3, locals := [.uninit, .init (.scalar ⟨5, 4⟩), .init fpTen, .uninit, .dead] }, memory := m2 }
+    let s4 : MachineState :=
+      { frame := { blockIdx := 1, stmtIdx := 0, locals := [.uninit, .init (.scalar ⟨5, 4⟩), .init fpTen, .init ptrOff, .dead] }, memory := m4 }
+    let req3 : MirCallReq :=
+      { defPath := "test::ext_ret_twenty_offset_raw_ptr", typeArgs := [], args := [.scalar ⟨5, 4⟩], memory := m2 }
+    let k3 : MirCallAns → MirSiteState := fun ans =>
+      mirNextSiteState callerFnTenAndExtOffsetBody (.running s3)
+        (resumeExternalCall s3 s3.frame.locals (locPlace 3) 1 .continue_ ans)
+    have hStep1 : mirSiteGapStep safeOffsetFnPtrStandaloneEnv callerFnTenAndExtOffsetBody
+        (mirSiteOfExec callerFnTenAndExtOffsetBody (.running
+          (initMachineStateWithCallees callerFnTenAndExtOffsetBody [.scalar ⟨5, 4⟩] fnPtrCallees))) =
+        .next (.running s1) := rfl
+    have hStep2 : mirSiteGapStep safeOffsetFnPtrStandaloneEnv callerFnTenAndExtOffsetBody (.running s1) =
+        .next (.running s2) := rfl
+    have hStep3 : mirSiteGapStep safeOffsetFnPtrStandaloneEnv callerFnTenAndExtOffsetBody (.running s2) =
+        .next (.running s3) := rfl
+    have hSite3 : stepMirSiteState callerFnTenAndExtOffsetBody (.running s3) =
+        .vis (.inr (.inr (.call req3))) k3 := rfl
+    have hEnv3 : safeOffsetFnPtrStandaloneEnv req3 = .ok (.returned ptrOff m4) := by
+      have hLookup : (if req3.defPath == "test::ext_ret_twenty_offset_raw_ptr" then
+          some extReturnTwentyOffsetRawPtrBody else none) =
+          some extReturnTwentyOffsetRawPtrBody := rfl
+      unfold safeOffsetFnPtrStandaloneEnv Anneal.Pass.MirCallEnv.ofStandaloneBody
+        Anneal.Pass.MirCallEnv.ofStandaloneOutcome
+      dsimp only
+      rw [hLookup]
+      dsimp only
+      rw [hExt]
+      rfl
+    have hCall : mirSiteGapStep safeOffsetFnPtrStandaloneEnv callerFnTenAndExtOffsetBody (.running s3) =
+        .next (.running s4) := by
+      unfold mirSiteGapStep Anneal.Pass.gapStep
+      rw [hSite3]
+      dsimp only [Anneal.Pass.mirGapHandle, Anneal.Pass.MirCallEnv.seal]
+      rw [hEnv3]
+      rfl
+    unfold runMirWithGap runMirStepsWithGap runMirSiteStepsWithGap
+    rw [Anneal.Pass.runGapSteps_succ_of_next _ hStep1]
+    rw [Anneal.Pass.runGapSteps_succ_of_next _ hStep2]
+    rw [Anneal.Pass.runGapSteps_succ_of_next _ hStep3]
+    rw [Anneal.Pass.runGapSteps_succ_of_next _ hCall]
+    rfl
+  exact ⟨h1, rfl, (fun h => by cases h), h4⟩
+
+/-- Sidecar signature body for unwinding `#[external_spec] fn ext_nondet(x: u32) -> u32`. -/
+def nondetSidecarBody : CapturedMir :=
+  { mkMirBody "test::ext_nondet" 1
+      [mkDecl .mut u32MirTy, mkDecl .not u32MirTy]
+      [returnBlock] with
+    fnAbi := { defaultFnAbi with canUnwind := true } }
+
+/-- Genuine kernel `externalSpecCallContract` allowing nondeterministic `u32`, unwinds, and aborts. -/
+def extNondetSpecContract : Trusted.VerificationResult.MirCallContract :=
+  Trusted.VerificationResult.externalSpecCallContract "test::ext_nondet" nondetSidecarBody
+
+/-- Linked helper `fn mask_bit(y: u32) -> u32 { y % 2 }` called after external call. -/
+def maskBitHelperBody : CapturedMir :=
+  mkMirBody "test::mask_bit" 1
+    [mkDecl .mut u32MirTy, mkDecl .not u32MirTy]
+    [ { statements :=
+          [mkStmt (.assign (locPlace 0)
+            (.binaryOp .rem (.copy (locPlace 1)) (u32ConstOp 2)))]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+/-- Cleanup block forwarding unwinding panics via `TerminatorKind.unwindResume`. -/
+def resumeCleanupBlock : BasicBlockData :=
+  { statements := [], terminator := mkTerm .unwindResume, isCleanup := true }
+
+/--
+Baseline unwinding modular caller:
+`let p = x % 256; let y = ext_nondet(p); mask_bit(y)`.
+-/
+def extSpecBaseCallerBody : CapturedMir :=
+  mkMirBody "test::ext_spec_base_caller" 1
+    [mkDecl .mut u32MirTy, mkDecl .not u32MirTy,
+     mkDecl .mut u32MirTy, mkDecl .mut u32MirTy]
+    [ { statements :=
+          [mkStmt (.storageLive 2),
+           mkStmt (.assign (locPlace 2)
+             (.binaryOp .rem (.copy (locPlace 1)) (u32ConstOp 256))),
+           mkStmt (.storageLive 3)]
+        terminator := mkTerm
+          (.call (fnItemOp "test::ext_nondet") [.copy (locPlace 2)]
+            (locPlace 3) (some 1) (.cleanup 3))
+        isCleanup := false },
+      { statements := []
+        terminator := mkTerm
+          (.call (fnItemOp "test::mask_bit") [.copy (locPlace 3)]
+            (locPlace 0) (some 2) .continue_)
+        isCleanup := false },
+      { statements := []
+        terminator := mkTerm .return_
+        isCleanup := false },
+      resumeCleanupBlock ]
+
+/--
+Refactored caller using extra pre-call temporaries and inlining `mask_bit` after
+`ext_nondet`: `let t = x % 256; let p = t; let y = ext_nondet(p); let r = y % 2; r`.
+-/
+def extSpecRefactoredCallerBody : CapturedMir :=
+  mkMirBody "test::ext_spec_refactored_caller" 1
+    [mkDecl .mut u32MirTy, mkDecl .not u32MirTy,
+     mkDecl .mut u32MirTy, mkDecl .mut u32MirTy, mkDecl .mut u32MirTy]
+    [ { statements :=
+          [mkStmt (.storageLive 2),
+           mkStmt (.storageLive 4),
+           mkStmt (.assign (locPlace 4)
+             (.binaryOp .rem (.copy (locPlace 1)) (u32ConstOp 256))),
+           mkStmt (.assign (locPlace 2) (.use (.copy (locPlace 4)))),
+           mkStmt (.storageLive 3)]
+        terminator := mkTerm
+          (.call (fnItemOp "test::ext_nondet") [.copy (locPlace 2)]
+            (locPlace 3) (some 1) (.cleanup 2))
+        isCleanup := false },
+      { statements :=
+          [mkStmt (.assign (locPlace 4)
+             (.binaryOp .rem (.copy (locPlace 3)) (u32ConstOp 2))),
+           mkStmt (.assign (locPlace 0) (.use (.copy (locPlace 4))))]
+        terminator := mkTerm .return_
+        isCleanup := false },
+      resumeCleanupBlock ]
+
+/--
+Nondeterministic `.tau` + `MirObsE`-emitting `ExternalCallHandler` witness for
+`extNondetSpecContract` (returns `(x + 3) : u32` after a `.tau` and `MirObs.event 1`).
+-/
+def nondetObsHandler : Trusted.VerificationResult.ExternalCallHandler :=
+  fun req =>
+    .tau (ITree.emit (MirObs.event 1) >>= fun _ =>
+      match req.args with
+      | .scalar ⟨x, 4⟩ :: _ =>
+        .ret (.returned (.scalar ⟨wrapScalarBits (x + 3) (scalarModulus 4), 4⟩) req.memory)
+      | _ => .ret .aborted)
+
+/-- Purely panicking handler witness admitted by `extNondetSpecContract.holdsOn` (`canUnwind = true`). -/
+def panicHandler : Trusted.VerificationResult.ExternalCallHandler :=
+  fun req => .ret (.panicked req.memory)
+
+private theorem tauEmitRet_safe_and_ret
+    (obs : MirObs) (ans : MirCallAns) :
+    let t : ITree Trusted.VerificationResult.MirClosedEffect MirCallAns :=
+      .tau (ITree.emit obs >>= fun _ => ITree.ret ans)
+    TreeSafe t ∧ ∀ tr ans', ReachesRet t tr ans' → ans' = ans := by
+  dsimp only
+  let sTau : ITree Trusted.VerificationResult.MirClosedEffect MirCallAns :=
+    .tau (ITree.emit obs >>= fun _ => ITree.ret ans)
+  let sEmit : ITree Trusted.VerificationResult.MirClosedEffect MirCallAns :=
+    ITree.emit obs >>= fun _ => ITree.ret ans
+  let sRet : ITree Trusted.VerificationResult.MirClosedEffect MirCallAns :=
+    ITree.ret ans
+  have hsEmitObs : sEmit.observe =
+      .vis (Subeffect.injReq (Sub := ObsE MirObs)
+        (Sup := Trusted.VerificationResult.MirClosedEffect) (ObsReq.emit obs))
+        (fun _ => ITree.ret ans) := by
+    change (ITree.vis (E := Trusted.VerificationResult.MirClosedEffect)
+      (Subeffect.injReq (Sub := ObsE MirObs)
+        (Sup := Trusted.VerificationResult.MirClosedEffect) (ObsReq.emit obs))
+      (fun _ => ITree.ret PUnit.unit) >>= fun _ => ITree.ret ans).observe = _
+    rw [Anneal.ITree.vis_bind, ITree.observe_vis]
+    congr; funext _; exact Anneal.ITree.ret_bind _ _
+  have hInvReaches : ∀ {u : ITree Trusted.VerificationResult.MirClosedEffect MirCallAns} {tr w},
+      Reaches u tr w → (u = sTau ∨ u = sEmit ∨ u = sRet) →
+      (w = sTau ∨ w = sEmit ∨ w = sRet) := by
+    intro u tr w hr
+    induction hr with
+    | refl => exact fun h => h
+    | tau htau _ ih =>
+      rintro (rfl | rfl | rfl)
+      · rw [ITree.observe_tau] at htau; injection htau with hn; exact ih (Or.inr (Or.inl hn.symm))
+      · rw [hsEmitObs] at htau; cases htau
+      · rw [ITree.observe_ret] at htau; cases htau
+    | vis hv _ o _ ih =>
+      rintro (rfl | rfl | rfl)
+      · rw [ITree.observe_tau] at hv; cases hv
+      · rw [hsEmitObs] at hv
+        injection hv with hij hkj
+        cases hij
+        have hk := congrFun (eq_of_heq hkj) o
+        exact ih (Or.inr (Or.inr hk.symm))
+      · rw [ITree.observe_ret] at hv; cases hv
+  have hInvTau : ∀ {a b : ITree Trusted.VerificationResult.MirClosedEffect MirCallAns},
+      TauStar a b → (a = sTau ∨ a = sEmit ∨ a = sRet) →
+      (b = sTau ∨ b = sEmit ∨ b = sRet) := by
+    intro a b hts
+    induction hts with
+    | refl => exact fun h => h
+    | step htau _ ih =>
+      rintro (rfl | rfl | rfl)
+      · rw [ITree.observe_tau] at htau; injection htau with hn; exact ih (Or.inr (Or.inl hn.symm))
+      · rw [hsEmitObs] at htau; cases htau
+      · rw [ITree.observe_ret] at htau; cases htau
+  refine ⟨fun tr u hru ⟨u', _, _, hts, hvu', hfi⟩ => ?_, fun tr ans' ⟨u, hru, hur⟩ => ?_⟩
+  · rcases hInvTau hts (hInvReaches hru (Or.inl rfl)) with rfl | rfl | rfl
+    · rw [ITree.observe_tau] at hvu'; cases hvu'
+    · rw [hsEmitObs] at hvu'
+      injection hvu' with hij _
+      cases hij
+      exact hfi
+    · rw [ITree.observe_ret] at hvu'; cases hvu'
+  · rcases hInvReaches hru (Or.inl rfl) with rfl | rfl | rfl
+    · rw [ITree.observe_tau] at hur; cases hur
+    · rw [hsEmitObs] at hur; cases hur
+    · rw [ITree.observe_ret] at hur; injection hur with heq; exact heq.symm
+
+private theorem retVal_eq_u32_of_matches_nondetSidecar {v : Value}
+    (hv : Trusted.VerificationResult.retMatchesCalleeReturnTy nondetSidecarBody v) :
+    ∃ y : Nat, y < scalarModulus 4 ∧ v = .scalar ⟨y, 4⟩ :=
+  hv
+
+private theorem extSpecCallPair_steps_aux
+    (x : Nat) (memInit : Memory) (_hx : x < scalarModulus 4)
+    (hAct : memInit.activeCallee = none) (hStk : memInit.callStack = [])
+    (hCal : memInit.callees = [maskBitHelperBody]) (hBor : memInit.borrows = [])
+    (hProt : memInit.activeProtectors = []) :
+    let st10 := mirSiteOfExec extSpecBaseCallerBody (.running {
+      frame := {
+        blockIdx := 0, stmtIdx := 0,
+        locals := initLocals extSpecBaseCallerBody [.scalar ⟨x, 4⟩] },
+      memory := memInit })
+    let st20 := mirSiteOfExec extSpecRefactoredCallerBody (.running {
+      frame := {
+        blockIdx := 0, stmtIdx := 0,
+        locals := initLocals extSpecRefactoredCallerBody [.scalar ⟨x, 4⟩] },
+      memory := memInit })
+    ∃ (st11 st21 : MirSiteState) (req : MirCallReq) (k1 k2 : MirCallAns → MirSiteState),
+      GapReach (mirSiteGapStep MirCallEnv.unresolved extSpecBaseCallerBody) 3 st10 st11 ∧
+      GapReach (mirSiteGapStep MirCallEnv.unresolved extSpecRefactoredCallerBody) 5 st20 st21 ∧
+      req.defPath = "test::ext_nondet" ∧
+      req.args = [.scalar ⟨wrapScalarBits (x % 256) (scalarModulus 4), 4⟩] ∧
+      req.memory = memInit ∧
+      stepMirSiteState extSpecBaseCallerBody st11 = .vis (.inr (.inr (.call req))) k1 ∧
+      stepMirSiteState extSpecRefactoredCallerBody st21 = .vis (.inr (.inr (.call req))) k2 ∧
+      k1 .aborted = .halted .abort ∧
+      k2 .aborted = .halted .abort ∧
+      (∀ memAfter : Memory, memAfter.activeCallee = none → memAfter.callStack = [] →
+        stepMirSiteState extSpecBaseCallerBody (k1 (.panicked memAfter)) = .ret .panic ∧
+        stepMirSiteState extSpecRefactoredCallerBody (k2 (.panicked memAfter)) = .ret .panic) ∧
+      (∀ (y : Nat) (memAfter : Memory),
+        memAfter.activeCallee = none → memAfter.callStack = [] →
+        memAfter.callees = [maskBitHelperBody] → memAfter.activeProtectors = [] →
+        ∃ t1 t2 mem1' mem2',
+          GapReach (mirSiteGapStep MirCallEnv.unresolved extSpecBaseCallerBody) 3
+            (k1 (.returned (.scalar ⟨y, 4⟩) memAfter)) (.running t1) ∧
+          stepMirSiteState extSpecBaseCallerBody (.running t1) =
+            .ret (.normal (.scalar ⟨y % 2, 4⟩, mem1')) ∧
+          GapReach (mirSiteGapStep MirCallEnv.unresolved extSpecRefactoredCallerBody) 2
+            (k2 (.returned (.scalar ⟨y, 4⟩) memAfter)) (.running t2) ∧
+          stepMirSiteState extSpecRefactoredCallerBody (.running t2) =
+            .ret (.normal (.scalar ⟨y % 2, 4⟩, mem2'))) := by
+  rcases memInit with ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
+    activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩
+  dsimp only at hAct hStk hCal hBor hProt
+  subst hAct hStk hCal hBor hProt
+  let m0 : Memory :=
+    { nextAllocId, globals, borrows := [], nextTag, callees := [maskBitHelperBody],
+      traitImpls, callStack := [], activeCallee := none, activeProtectors := [],
+      nextProtector, callerLocals, fnPtrs, exposedAllocIds }
+  let xVal : Value := .scalar ⟨x, 4⟩
+  let xMasked : Nat := wrapScalarBits (x % 256) (scalarModulus 4)
+  let xMaskVal : Value := .scalar ⟨xMasked, 4⟩
+  let s1_0 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .init xVal, .dead, .dead] },
+      memory := m0 }
+  let s1_1 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 1, locals := [.uninit, .init xVal, .uninit, .dead] },
+      memory := m0 }
+  let s1_2 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 2, locals := [.uninit, .init xVal, .init xMaskVal, .dead] },
+      memory := m0 }
+  let s1_3 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 3, locals := [.uninit, .init xVal, .init xMaskVal, .uninit] },
+      memory := m0 }
+  let s2_0 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .init xVal, .dead, .dead, .dead] },
+      memory := m0 }
+  let s2_1 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 1, locals := [.uninit, .init xVal, .uninit, .dead, .dead] },
+      memory := m0 }
+  let s2_2 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 2, locals := [.uninit, .init xVal, .uninit, .dead, .uninit] },
+      memory := m0 }
+  let s2_3 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 3, locals := [.uninit, .init xVal, .uninit, .dead, .init xMaskVal] },
+      memory := m0 }
+  let s2_4 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 4, locals := [.uninit, .init xVal, .init xMaskVal, .dead, .init xMaskVal] },
+      memory := m0 }
+  let s2_5 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 5, locals := [.uninit, .init xVal, .init xMaskVal, .uninit, .init xMaskVal] },
+      memory := m0 }
+  let req : MirCallReq :=
+    { defPath := "test::ext_nondet", typeArgs := [], args := [xMaskVal], memory := m0 }
+  let k1 : MirCallAns → MirSiteState := fun ans =>
+    mirNextSiteState extSpecBaseCallerBody (.running s1_3)
+      (resumeExternalCall s1_3 s1_3.frame.locals (locPlace 3) 1 (.cleanup 3) ans)
+  let k2 : MirCallAns → MirSiteState := fun ans =>
+    mirNextSiteState extSpecRefactoredCallerBody (.running s2_5)
+      (resumeExternalCall s2_5 s2_5.frame.locals (locPlace 3) 1 (.cleanup 2) ans)
+  have hb1 : mirSiteGapStep MirCallEnv.unresolved extSpecBaseCallerBody (.running s1_0) =
+      .next (.running s1_1) := rfl
+  have hb2 : mirSiteGapStep MirCallEnv.unresolved extSpecBaseCallerBody (.running s1_1) =
+      .next (.running s1_2) := rfl
+  have hb3 : mirSiteGapStep MirCallEnv.unresolved extSpecBaseCallerBody (.running s1_2) =
+      .next (.running s1_3) := rfl
+  have hr1 : GapReach (mirSiteGapStep MirCallEnv.unresolved extSpecBaseCallerBody) 3
+      (.running s1_0) (.running s1_3) :=
+    .step hb1 (.step hb2 (.step hb3 (.refl _)))
+  have hf1 : mirSiteGapStep MirCallEnv.unresolved extSpecRefactoredCallerBody (.running s2_0) =
+      .next (.running s2_1) := rfl
+  have hf2 : mirSiteGapStep MirCallEnv.unresolved extSpecRefactoredCallerBody (.running s2_1) =
+      .next (.running s2_2) := rfl
+  have hf3 : mirSiteGapStep MirCallEnv.unresolved extSpecRefactoredCallerBody (.running s2_2) =
+      .next (.running s2_3) := rfl
+  have hf4 : mirSiteGapStep MirCallEnv.unresolved extSpecRefactoredCallerBody (.running s2_3) =
+      .next (.running s2_4) := rfl
+  have hf5 : mirSiteGapStep MirCallEnv.unresolved extSpecRefactoredCallerBody (.running s2_4) =
+      .next (.running s2_5) := rfl
+  have hr2 : GapReach (mirSiteGapStep MirCallEnv.unresolved extSpecRefactoredCallerBody) 5
+      (.running s2_0) (.running s2_5) :=
+    .step hf1 (.step hf2 (.step hf3 (.step hf4 (.step hf5 (.refl _)))))
+  have hCall1 : stepMirSiteState extSpecBaseCallerBody (.running s1_3) =
+      .vis (.inr (.inr (.call req))) k1 := rfl
+  have hCall2 : stepMirSiteState extSpecRefactoredCallerBody (.running s2_5) =
+      .vis (.inr (.inr (.call req))) k2 := rfl
+  refine ⟨.running s1_3, .running s2_5, req, k1, k2,
+    hr1, hr2, rfl, rfl, rfl, hCall1, hCall2, rfl, rfl, ?_, ?_⟩
+  · intro memAfter hAct' hStk'
+    rcases memAfter with ⟨na', g', b', nt', cal', ti', cs', ac', ap', np', cl', fp', ea'⟩
+    dsimp only at hAct' hStk'; subst hAct' hStk'
+    exact ⟨rfl, rfl⟩
+  · intro y memAfter hAct' hStk' hCal' hProt'
+    rcases memAfter with ⟨na', g', b', nt', cal', ti', cs', ac', ap', np', cl', fp', ea'⟩
+    dsimp only at hAct' hStk' hCal' hProt'
+    subst hAct' hStk' hCal' hProt'
+    let mA0 : Memory :=
+      { nextAllocId := na', globals := g', borrows := b', nextTag := nt',
+        callees := [maskBitHelperBody], traitImpls := ti', callStack := [],
+        activeCallee := none, activeProtectors := [], nextProtector := np',
+        callerLocals := cl', fnPtrs := fp', exposedAllocIds := ea' }
+    let yVal : Value := .scalar ⟨y, 4⟩
+    let yBit : Nat := wrapScalarBits (y % 2) (scalarModulus 4)
+    let yBitVal : Value := .scalar ⟨yBit, 4⟩
+    -- Base caller post-call states (calls `mask_bit` and returns `yBit`)
+    let bor1a := (invalidateDirectDestWriteBorrows mA0 s1_3.frame.locals (locPlace 3)).borrows
+    let m1a : Memory := { mA0 with borrows := bor1a }
+    let l1a : List LocalSlot := [.uninit, .init xVal, .init xMaskVal, .init yVal]
+    let st1a : MachineState := { frame := { blockIdx := 1, stmtIdx := 0, locals := l1a }, memory := m1a }
+    let st1b : MachineState :=
+      pushCalleeFrame st1a extSpecBaseCallerBody l1a (locPlace 0) 2
+        maskBitHelperBody [yVal] .continue_
+    let m1c : Memory :=
+      { st1b.memory with
+        borrows := invalidateConflictingBorrows st1b.memory.borrows 0 .none 1 }
+    let st1c : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 1, locals := [.init yBitVal, .init yVal] },
+        memory := m1c }
+    let callerMem1d : Memory :=
+      { m1c with
+        borrows := disableFrameBorrows m1c.borrows 1 2
+        callStack := []
+        activeCallee := some extSpecBaseCallerBody
+        activeProtectors := [] }
+    let m1d : Memory :=
+      { callerMem1d with
+        borrows := invalidateConflictingBorrows callerMem1d.borrows 0 .none 0 }
+    let l1d : List LocalSlot := [.init yBitVal, .init xVal, .init xMaskVal, .init yVal]
+    let st1d : MachineState :=
+      { frame := { blockIdx := 2, stmtIdx := 0, locals := l1d }, memory := m1d }
+    let mem1' : Memory := { m1d with borrows := disableFrameBorrows m1d.borrows 0 4 }
+    have hk1Ret : k1 (.returned yVal mA0) = .running st1a := rfl
+    have hg1_1 : mirSiteGapStep MirCallEnv.unresolved extSpecBaseCallerBody (.running st1a) =
+        .next (.running st1b) := rfl
+    have hg1_2 : mirSiteGapStep MirCallEnv.unresolved extSpecBaseCallerBody (.running st1b) =
+        .next (.running st1c) := rfl
+    have hFrameNil : ∀ (bs : List BorrowEntry) (d n : Nat),
+        hasFrameDeallocProtectorConflict bs [] d n = false := fun bs d n => by
+      cases bs <;> rfl
+    have hProtWriteNil : ∀ (bs : List BorrowEntry) (tl : Local) (wt : Option Nat)
+        (wp : List ProjectionElem) (off len d : Nat),
+        hasProtectedWriteConflict bs .nil tl wt wp off len d = false := by
+      intro bs tl wt wp off len d
+      induction bs with
+      | nil => rfl
+      | cons _ _ ih =>
+        unfold hasProtectedWriteConflict
+        rw [isBorrowProtected_nil]
+        simp only [Bool.and_false, Bool.false_and]
+        exact ih
+    have hStep1c : stepMirSiteState extSpecBaseCallerBody (.running st1c) =
+        .tau (.running st1d) := by
+      dsimp only [stepMirSiteState, stepMirState, stepMirFn, evalTerminator, st1c]
+      change ITreeF.map (mirNextSiteState extSpecBaseCallerBody (.running st1c))
+        (match hasFrameDeallocProtectorConflict m1c.borrows [] 1 2 with
+         | true => MirStepNode.fail .ub
+         | false =>
+           match writeReturnDestination l1a callerMem1d (locPlace 0) yBitVal
+               extSpecBaseCallerBody.localDecls extSpecBaseCallerBody.layouts with
+           | .ok updatedCallerLocals mem' =>
+             MirStepNode.step {
+               frame := { blockIdx := 2, stmtIdx := 0, locals := updatedCallerLocals },
+               memory := mem' }
+           | .ub => MirStepNode.fail .ub
+           | .unsupported => MirStepNode.unsupported) = _
+      rw [hFrameNil]
+      dsimp only
+      unfold writeReturnDestination
+      dsimp only [callerMem1d]
+      rw [hProtWriteNil]
+      rfl
+    have hg1_3 : mirSiteGapStep MirCallEnv.unresolved extSpecBaseCallerBody (.running st1c) =
+        .next (.running st1d) := by
+      unfold mirSiteGapStep Anneal.Pass.gapStep
+      rw [hStep1c]
+    have hs1_4 : stepMirSiteState extSpecBaseCallerBody (.running st1d) =
+        .ret (.normal (yBitVal, mem1')) := by
+      change ITreeF.map (mirNextSiteState extSpecBaseCallerBody (.running st1d))
+        (match hasFrameDeallocProtectorConflict m1d.borrows [] 0 4 with
+         | true => MirStepNode.fail .ub
+         | false => MirStepNode.retNormal yBitVal mem1') = _
+      rw [hFrameNil]; rfl
+    -- Refactored caller post-call states (inlined `y % 2` via `_4`)
+    let bor2a := (invalidateDirectDestWriteBorrows mA0 s2_5.frame.locals (locPlace 3)).borrows
+    let m2a : Memory := { mA0 with borrows := bor2a }
+    let l2a : List LocalSlot := [.uninit, .init xVal, .init xMaskVal, .init yVal, .init xMaskVal]
+    let st2a : MachineState := { frame := { blockIdx := 1, stmtIdx := 0, locals := l2a }, memory := m2a }
+    let m2b : Memory := { m2a with borrows := invalidateConflictingBorrows m2a.borrows 4 .none 0 }
+    let l2b : List LocalSlot := [.uninit, .init xVal, .init xMaskVal, .init yVal, .init yBitVal]
+    let st2b : MachineState := { frame := { blockIdx := 1, stmtIdx := 1, locals := l2b }, memory := m2b }
+    let m2c : Memory := { m2b with borrows := invalidateConflictingBorrows m2b.borrows 0 .none 0 }
+    let l2c : List LocalSlot := [.init yBitVal, .init xVal, .init xMaskVal, .init yVal, .init yBitVal]
+    let st2c : MachineState := { frame := { blockIdx := 1, stmtIdx := 2, locals := l2c }, memory := m2c }
+    let mem2' : Memory := { m2c with borrows := disableFrameBorrows m2c.borrows 0 5 }
+    have hk2Ret : k2 (.returned yVal mA0) = .running st2a := rfl
+    have hg2_1 : mirSiteGapStep MirCallEnv.unresolved extSpecRefactoredCallerBody (.running st2a) =
+        .next (.running st2b) := rfl
+    have hg2_2 : mirSiteGapStep MirCallEnv.unresolved extSpecRefactoredCallerBody (.running st2b) =
+        .next (.running st2c) := rfl
+    have hs2_3 : stepMirSiteState extSpecRefactoredCallerBody (.running st2c) =
+        .ret (.normal (yBitVal, mem2')) := by
+      change ITreeF.map (mirNextSiteState extSpecRefactoredCallerBody (.running st2c))
+        (match hasFrameDeallocProtectorConflict m2c.borrows [] 0 5 with
+         | true => MirStepNode.fail .ub
+         | false => MirStepNode.retNormal yBitVal mem2') = _
+      rw [hFrameNil]; rfl
+    have hyMod : yBit = y % 2 :=
+      (wrapScalarBits_eq_mod (y % 2) (scalarModulus 4)).trans
+        (Nat.mod_eq_of_lt (Nat.lt_trans (Nat.mod_lt y (by decide)) (by decide)))
+    refine ⟨st1d, st2c, mem1', mem2', ?_, ?_, ?_, ?_⟩
+    · rw [hk1Ret]
+      exact .step hg1_1 (.step hg1_2 (.step hg1_3 (.refl _)))
+    · dsimp only [yBitVal] at hs1_4
+      rw [hyMod] at hs1_4
+      exact hs1_4
+    · rw [hk2Ret]
+      exact .step hg2_1 (.step hg2_2 (.refl _))
+    · dsimp only [yBitVal] at hs2_3
+      rw [hyMod] at hs2_3
+      exact hs2_3
+
+/--
+Nondeterministic `externalSpecCallContract` modular transfer canary (`0` `Classical.choice`):
+1. **Negative canary against deterministic uniqueness**: for **every** valid
+   `req` satisfying `extNondetSpecContract.pre req`, there is NO unique `ans`
+   satisfying `∀ ans', extNondetSpecContract.post req ans' → ans' = ans` (so any transfer
+   lemma requiring deterministic postconditions is provably unusable here!);
+2. Both `nondetObsHandler` (returning `.returned` after `.tau` + `MirObs.event`) and
+   `panicHandler` (returning `.panicked req.memory`) satisfy `extNondetSpecContract.holdsOn`; and
+3. `ModularVerificationResult.of_stutter` + `ModularStepNodeRel.of_callContract`
+   constructively transfers a kernel `ModularVerificationResult` with
+   `envAssumed := extNondetSpecContract.holdsOn` across pre-call local refactoring
+   and post-call helper inlining (`maskBitHelperBody`, allowing arbitrary `mem.globals`,
+   `mem.fnPtrs`, `mem.nextTag`/`nextAllocId`/`nextProtector`, AND arbitrary post-call
+   `memAfter` including arbitrary `memAfter.borrows` from the external callee!).
+-/
+theorem externalSpecCallContract_nondet_modular_transfer :
+    let extPre : List Value → Memory → Prop :=
+      fun args mem =>
+        (∃ x : Nat, x < scalarModulus 4 ∧ args = [.scalar ⟨x, 4⟩]) ∧
+        mem.activeCallee = none ∧ mem.callStack = [] ∧
+        mem.borrows = [] ∧ mem.activeProtectors = []
+    let extPost : List Value → Memory → Value → Memory → Prop :=
+      fun _ _ ret _ => ∃ k : Nat, k < 2 ∧ ret = .scalar ⟨k, 4⟩
+    (∀ req : MirCallReq, extNondetSpecContract.pre req →
+      ¬ ∃ ans, ∀ ans', extNondetSpecContract.post req ans' → ans' = ans) ∧
+      extNondetSpecContract.holdsOn nondetObsHandler ∧
+      extNondetSpecContract.holdsOn panicHandler ∧
+      Nonempty (Trusted.VerificationResult.ModularVerificationResult
+        { body := extSpecRefactoredCallerBody
+          envAssumed := extNondetSpecContract.holdsOn
+          pre := extPre, post := extPost, callees := [maskBitHelperBody] }) := by
+  dsimp only
+  let extPre : List Value → Memory → Prop :=
+    fun args mem =>
+      (∃ x : Nat, x < scalarModulus 4 ∧ args = [.scalar ⟨x, 4⟩]) ∧
+      mem.activeCallee = none ∧ mem.callStack = [] ∧
+      mem.borrows = [] ∧ mem.activeProtectors = []
+  let extPost : List Value → Memory → Value → Memory → Prop :=
+    fun _ _ ret _ => ∃ k : Nat, k < 2 ∧ ret = .scalar ⟨k, 4⟩
+  have hNoUniq : ∀ req : MirCallReq, extNondetSpecContract.pre req →
+      ¬ ∃ ans, ∀ ans', extNondetSpecContract.post req ans' → ans' = ans := by
+    intro req _ ⟨ans, huniq⟩
+    have hAb : (.aborted : MirCallAns) = ans := huniq .aborted trivial
+    have hPa : (.panicked req.memory : MirCallAns) = ans :=
+      huniq (.panicked req.memory) (Memory.callFramePreserved_refl req.memory)
+    have hNe : (.aborted : MirCallAns) = .panicked req.memory := hAb.trans hPa.symm
+    cases hNe
+  have hObsHolds : extNondetSpecContract.holdsOn nondetObsHandler := by
+    rintro req ⟨_, hLen, hArgTys, _⟩
+    cases hArgs : req.args with
+    | nil => rw [hArgs] at hLen; cases hLen
+    | cons v vs =>
+      cases vs with
+      | cons _ _ => rw [hArgs] at hLen; cases hLen
+      | nil =>
+        rw [hArgs] at hArgTys
+        rcases hArgTys.1 with ⟨bits, hbits, rfl⟩
+        have hBody : nondetObsHandler req =
+            .tau (ITree.emit (MirObs.event 1) >>= fun _ =>
+              ITree.ret (.returned (.scalar ⟨wrapScalarBits (bits + 3) (scalarModulus 4), 4⟩)
+                req.memory)) := by
+          unfold nondetObsHandler; rw [hArgs]; rfl
+        rw [hBody]
+        obtain ⟨hs, hret⟩ := tauEmitRet_safe_and_ret (MirObs.event 1)
+          (.returned (.scalar ⟨wrapScalarBits (bits + 3) (scalarModulus 4), 4⟩) req.memory)
+        refine ⟨hs, fun tr ans hrr => ?_⟩
+        rw [hret tr ans hrr]
+        refine ⟨Memory.callFramePreserved_refl req.memory,
+          ⟨wrapScalarBits (bits + 3) (scalarModulus 4),
+            wrapScalarBits_eq_mod (bits + 3) (scalarModulus 4) ▸ Nat.mod_lt _ (by decide),
+            rfl⟩, trivial⟩
+  have hPanicHolds : extNondetSpecContract.holdsOn panicHandler := by
+    intro req _
+    unfold panicHandler
+    have hRet : ∀ {s₀ u : ITree Trusted.VerificationResult.MirClosedEffect MirCallAns} {tr},
+        Reaches s₀ tr u → s₀ = ITree.ret (.panicked req.memory) → u = ITree.ret (.panicked req.memory) := by
+      intro s₀ u tr hr
+      induction hr with
+      | refl => exact fun h => h
+      | tau ht _ _ => intro h; rw [h, ITree.observe_ret] at ht; cases ht
+      | vis hv _ _ _ _ => intro h; rw [h, ITree.observe_ret] at hv; cases hv
+    refine ⟨fun tr u hru ⟨u', _, _, hts, hvu', _⟩ => ?_, fun tr ans ⟨u, hru, hur⟩ => ?_⟩
+    · have hu := hRet hru rfl
+      subst hu
+      cases hts with
+      | refl => rw [ITree.observe_ret] at hvu'; cases hvu'
+      | step ht _ => rw [ITree.observe_ret] at ht; cases ht
+    · rw [hRet hru rfl, ITree.observe_ret] at hur
+      injection hur with heq
+      rw [← heq]
+      exact Memory.callFramePreserved_refl req.memory
+  have hBaseCert : Trusted.VerificationResult.ModularVerificationResult
+      { body := extSpecBaseCallerBody
+        envAssumed := extNondetSpecContract.holdsOn
+        pre := extPre, post := extPost, callees := [maskBitHelperBody] } := by
+    constructor
+    intro h hHolds args mem hPre
+    rcases hPre with ⟨⟨x, hx, rfl⟩, hAct, hStk, hBor, hProt⟩
+    let memInit := { mem with callees := [maskBitHelperBody], traitImpls := [] }
+    obtain ⟨st11, st21, req, k1, k2, hr1, hr2, hDefP, hReqArgs, hReqMem, hCall1, hCall2,
+        hk1Ab, hk2Ab, hkPanic, hkRet⟩ :=
+      extSpecCallPair_steps_aux x memInit hx hAct hStk rfl hBor hProt
+    have hReqPre : extNondetSpecContract.pre req := by
+      refine ⟨hDefP, ?_, ?_, trivial⟩
+      · rw [hReqArgs]; rfl
+      · rw [hReqArgs]
+        exact ⟨⟨_, wrapScalarBits_eq_mod (x % 256) (scalarModulus 4) ▸ Nat.mod_lt _ (by decide), rfl⟩,
+          trivial⟩
+    let s₀ : MachineState :=
+      { frame := {
+          blockIdx := 0, stmtIdx := 0,
+          locals := initLocals extSpecBaseCallerBody [.scalar ⟨x, 4⟩] },
+        memory := memInit }
+    have hs₀ : s₀ = Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+        extSpecBaseCallerBody [.scalar ⟨x, 4⟩] mem [maskBitHelperBody] := rfl
+    have hTreeEq : Trusted.VerificationResult.mirHandledTreeWithCallees
+          extSpecBaseCallerBody [.scalar ⟨x, 4⟩] mem [maskBitHelperBody] h =
+        mirHandlerInterp h extSpecBaseCallerBody (mirSiteOfExec extSpecBaseCallerBody (.running s₀)) := by
+      change ITree.interp _ (mirTree extSpecBaseCallerBody
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          extSpecBaseCallerBody [.scalar ⟨x, 4⟩] mem [maskBitHelperBody])) = _
+      rw [← hs₀, ← cofix_stepMirSiteState_eq_mirTree extSpecBaseCallerBody s₀]; rfl
+    have hBehEq : closedMirGapBehaviors
+          (Trusted.VerificationResult.mirHandledTreeWithCallees
+            extSpecBaseCallerBody [.scalar ⟨x, 4⟩] mem [maskBitHelperBody] h) =
+        OutcomeSet.bind (closedCallGapBehaviors (h req))
+          (fun ans => closedMirGapBehaviors (mirHandlerInterp h extSpecBaseCallerBody (k1 ans))) := by
+      rw [hTreeEq, mirHandlerInterp_eq_of_gapReach h hr1]
+      exact mirHandlerInterp_call_eq_bind h hCall1
+    have hAnsOk : ∀ ans, extNondetSpecContract.post req ans →
+        OutcomeSet.Defined ExecFault.isUB
+          (closedMirGapBehaviors (mirHandlerInterp h extSpecBaseCallerBody (k1 ans))) ∧
+        ∀ v m',
+          closedMirGapBehaviors (mirHandlerInterp h extSpecBaseCallerBody (k1 ans)) (.ok (v, m')) →
+            extPost [.scalar ⟨x, 4⟩] mem v m' := by
+      intro ans hpost
+      cases ans with
+      | aborted =>
+        rw [hk1Ab, closedMirGapBehaviors_of_retStep (h := h) (body := extSpecBaseCallerBody)
+          (t := .halted .abort) (out := .abort) rfl]
+        exact ⟨fun o ho => by subst ho; exact fun h₀ => h₀, fun v m' ho => by cases ho⟩
+      | panicked memAfter =>
+        obtain ⟨_, hStk', hAct', _, _⟩ := hpost
+        rw [hReqMem] at hStk' hAct'
+        have hRetP := (hkPanic memAfter (hAct'.trans hAct) (hStk'.trans hStk)).1
+        rw [closedMirGapBehaviors_of_retStep hRetP]
+        exact ⟨fun o ho => by subst ho; exact fun h₀ => h₀, fun v m' ho => by cases ho⟩
+      | returned retVal memAfter =>
+        obtain ⟨⟨hCal', hStk', hAct', hProt', _⟩, hTy, _⟩ := hpost
+        rw [hReqMem] at hCal' hStk' hAct' hProt'
+        obtain ⟨y, _, rfl⟩ := retVal_eq_u32_of_matches_nondetSidecar hTy
+        obtain ⟨t1, _, mem1', _, hGr1, hRet1, _, _⟩ :=
+          hkRet y memAfter (hAct'.trans hAct) (hStk'.trans hStk) hCal' (hProt'.trans hProt)
+        rw [mirHandlerInterp_eq_of_gapReach h hGr1, closedMirGapBehaviors_of_retStep hRet1]
+        refine ⟨fun o ho => by subst ho; exact trivial, fun v m' ho => ?_⟩
+        cases OutcomeWithGap.ok.inj ho
+        exact ⟨y % 2, Nat.mod_lt y (by decide), rfl⟩
+    have hCallSafe : ∀ m, closedCallGapBehaviors (h req) m →
+        ∃ ans, m = .ok ans ∧ extNondetSpecContract.post req ans := by
+      rintro m ⟨hne, fu, hru⟩
+      obtain ⟨ans, rfl⟩ := closedCall_treeSafe_is_ok fu (h req) (hHolds req hReqPre).1 hru hne
+      obtain ⟨tr_u, hrr_u⟩ := closedCall_ok_reachesRet fu (h req) hru
+      exact ⟨ans, rfl, (hHolds req hReqPre).2 tr_u ans hrr_u⟩
+    have hDef : OutcomeSet.Defined ExecFault.isUB
+        (closedMirGapBehaviors (Trusted.VerificationResult.mirHandledTreeWithCallees
+          extSpecBaseCallerBody [.scalar ⟨x, 4⟩] mem [maskBitHelperBody] h)) := by
+      rw [hBehEq]
+      exact OutcomeSet.defined_bind_iff.mpr
+        ⟨fun m hm => by obtain ⟨ans, rfl, _⟩ := hCallSafe m hm; exact trivial,
+         fun ans hm => by
+           obtain ⟨ans', hEq, hpost⟩ := hCallSafe (.ok ans) hm
+           cases OutcomeWithGap.ok.inj hEq
+           exact (hAnsOk ans hpost).1⟩
+    refine ⟨(closedMirTree_safe_iff_defined _).mpr hDef, fun outPair hrr _ retVal mem' hout => ?_⟩
+    rcases outPair with ⟨tr, out⟩
+    dsimp only at hout; subst hout
+    have hm := (closedMirTree_reachesRet_iff_of_defined hDef (.normal (retVal, mem'))).mp ⟨tr, hrr⟩
+    rw [hBehEq] at hm
+    obtain ⟨m, hmCall, hmCont⟩ := hm
+    obtain ⟨ans, rfl, hpost⟩ := hCallSafe m hmCall
+    exact (hAnsOk ans hpost).2 retVal mem' hmCont
+  have hTransferred : Trusted.VerificationResult.ModularVerificationResult
+      { body := extSpecRefactoredCallerBody
+        envAssumed := extNondetSpecContract.holdsOn
+        pre := extPre, post := extPost, callees := [maskBitHelperBody] } := by
+    refine ModularVerificationResult.of_stutter (rVal := fun r₁ r₂ : MirReturn => r₁.1 = r₂.1)
+      ?_ (fun _ _ v₁ _ v₂ _ _ hrv hp => by obtain ⟨k, hk, rfl⟩ := hp; exact ⟨k, hk, hrv.symm⟩)
+      hBaseCert
+    intro h hHolds args mem hPre
+    rcases hPre with ⟨⟨x, hx, rfl⟩, hAct, hStk, hBor, hProt⟩
+    let memInit := { mem with callees := [maskBitHelperBody], traitImpls := [] }
+    obtain ⟨st11, st21, req, k1, k2, hr1, hr2, hDefP, hReqArgs, hReqMem, hCall1, hCall2,
+        hk1Ab, hk2Ab, hkPanic, hkRet⟩ :=
+      extSpecCallPair_steps_aux x memInit hx hAct hStk rfl hBor hProt
+    have hReqPre : extNondetSpecContract.pre req := by
+      refine ⟨hDefP, ?_, ?_, trivial⟩
+      · rw [hReqArgs]; rfl
+      · rw [hReqArgs]
+        exact ⟨⟨_, wrapScalarBits_eq_mod (x % 256) (scalarModulus 4) ▸ Nat.mod_lt _ (by decide), rfl⟩,
+          trivial⟩
+    let R : MirSiteState → MirSiteState → Prop := fun a b =>
+      (a = mirSiteOfExec extSpecBaseCallerBody (.running
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            extSpecBaseCallerBody [.scalar ⟨x, 4⟩] mem [maskBitHelperBody])) ∧
+       b = mirSiteOfExec extSpecRefactoredCallerBody (.running
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            extSpecRefactoredCallerBody [.scalar ⟨x, 4⟩] mem [maskBitHelperBody]))) ∨
+      (∃ ans, extNondetSpecContract.post req ans ∧ a = k1 ans ∧ b = k2 ans)
+    refine ⟨R, Or.inl ⟨rfl, rfl⟩, ?_⟩
+    rintro a b (⟨rfl, rfl⟩ | ⟨ans, hpost, rfl, rfl⟩)
+    · refine ⟨3, 5, st11, st21, hr1, hr2, ?_⟩
+      rw [hCall1, hCall2]
+      exact ModularStepNodeRel.of_callContract hHolds hReqPre
+        (fun ans hp => Or.inr ⟨ans, hp, rfl, rfl⟩)
+    · cases ans with
+      | aborted =>
+        rw [hk1Ab, hk2Ab]
+        exact ⟨0, 0, .halted .abort, .halted .abort, .refl _, .refl _, ModularStepNodeRel.abort⟩
+      | panicked memAfter =>
+        obtain ⟨_, hStk', hAct', _, _⟩ := hpost
+        rw [hReqMem] at hStk' hAct'
+        obtain ⟨hp1, hp2⟩ := hkPanic memAfter (hAct'.trans hAct) (hStk'.trans hStk)
+        refine ⟨0, 0, k1 (.panicked memAfter), k2 (.panicked memAfter), .refl _, .refl _, ?_⟩
+        rw [hp1, hp2]
+        exact ModularStepNodeRel.panic
+      | returned retVal memAfter =>
+        obtain ⟨⟨hCal', hStk', hAct', hProt', _⟩, hTy, _⟩ := hpost
+        rw [hReqMem] at hCal' hStk' hAct' hProt'
+        obtain ⟨y, _, rfl⟩ := retVal_eq_u32_of_matches_nondetSidecar hTy
+        obtain ⟨t1, t2, _, _, hGr1, hRet1, hGr2, hRet2⟩ :=
+          hkRet y memAfter (hAct'.trans hAct) (hStk'.trans hStk) hCal' (hProt'.trans hProt)
+        refine ⟨3, 2, .running t1, .running t2, hGr1, hGr2, ?_⟩
+        rw [hRet1, hRet2]
+        exact ModularStepNodeRel.normal rfl
+  exact ⟨hNoUniq, hObsHolds, hPanicHolds, ⟨hTransferred⟩⟩
+
+/-- Helper body for cross-callee inlining certificate tests: `fn add_self(x: u32) -> u32 { x + x }`. -/
+def addSelfHelperBody : CapturedMir :=
+  mkMirBody "test::add_self" 1
+    [mkDecl .mut u32MirTy, mkDecl .not u32MirTy]
+    [ { statements :=
+          [mkStmt (.assign (locPlace 0)
+            (.binaryOp .add (.copy (locPlace 1)) (.copy (locPlace 1))))]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+def inlinableBranchingBody : CapturedMir :=
+  mkMirBody "test::inlinable_branching" 2
+    [mkDecl .mut u32MirTy, mkDecl .not boolMirTy, mkDecl .not u32MirTy]
+    [ flagSwitchBlock,
+      helperCallBlock "test::add_self",
+      helperCallBlock "test::unmodeled_helper",
+      returnBlock ]
+
+def inlinedRefactoredBody : CapturedMir :=
+  callerRefactoredBody
+
+/--
+Cross-`callees` helper-inlining transfer canary (`callees₁ ≠ callees₂`):
+transfers `VerificationResult.of_contextEquiv_callees`,
+`StatefulVerificationResult.of_contextEquiv_callees`,
+`UbExceptionVerificationResult.of_contextEquiv_callees`, and
+`mirConstructiveTotalHolds_of_contextEquiv_callees` from `inlinableBranchingBody`
+(`callees₁ = [addSelfHelperBody, unsupportedHelperBody]`) to `inlinedRefactoredBody`
+(`callees₂ = [unsupportedHelperBody]`, removing `addSelfHelperBody` from `callees₂`!)
+with shared `.unsupported "test::unmodeled_helper"` gaps outside `stPre`.
+-/
+theorem callees_mismatch_inlining_verificationResult_and_ubException :
+    let callees₁ : List CapturedMir := [addSelfHelperBody, unsupportedHelperBody]
+    let callees₂ : List CapturedMir := [unsupportedHelperBody]
+    let valPre : List Value → Prop :=
+      fun args => ∃ x, x + x < 4294967296 ∧ args = callerArgs (true, x)
+    let valPost : List Value → Value → Prop :=
+      fun args ret => ∃ x, args = callerArgs (true, x) ∧ ret = .scalar ⟨x + x, 4⟩
+    let stPre : List Value → Memory → Prop :=
+      fun args mem => ∃ x, x + x < 4294967296 ∧ args = callerArgs (true, x) ∧ mem = linkedMemory
+    let fullPre : List Value → Memory → Prop :=
+      fun args mem => ∃ b x, x + x < 4294967296 ∧ args = callerArgs (b, x) ∧ mem = linkedMemory
+    let stPost : List Value → Memory → Value → Memory → Prop :=
+      fun args _ ret _ => ∃ b x, args = callerArgs (b, x) ∧ ret = .scalar ⟨x + x, 4⟩
+    callees₁ ≠ callees₂ ∧
+      Nonempty (Trusted.VerificationResult.VerificationResult
+        { body := inlinedRefactoredBody, pre := valPre, post := valPost, callees := callees₂ }) ∧
+      Nonempty (Trusted.VerificationResult.StatefulVerificationResult
+        { body := inlinedRefactoredBody, pre := stPre, post := stPost, callees := callees₂ }) ∧
+      Nonempty (Trusted.VerificationResult.UbExceptionVerificationResult
+        { body := inlinedRefactoredBody, pre := fullPre, strictSafetyPre := stPre,
+          post := stPost, callees := callees₂ }) ∧
+      MirConstructiveTotalHolds callees₂ inlinedRefactoredBody stPre stPost := by
+  dsimp only
+  let callees₁ : List CapturedMir := [addSelfHelperBody, unsupportedHelperBody]
+  let callees₂ : List CapturedMir := [unsupportedHelperBody]
+  let valPre : List Value → Prop :=
+    fun args => ∃ x, x + x < 4294967296 ∧ args = callerArgs (true, x)
+  let valPost : List Value → Value → Prop :=
+    fun args ret => ∃ x, args = callerArgs (true, x) ∧ ret = .scalar ⟨x + x, 4⟩
+  let stPre : List Value → Memory → Prop :=
+    fun args mem => ∃ x, x + x < 4294967296 ∧ args = callerArgs (true, x) ∧ mem = linkedMemory
+  let fullPre : List Value → Memory → Prop :=
+    fun args mem => ∃ b x, x + x < 4294967296 ∧ args = callerArgs (b, x) ∧ mem = linkedMemory
+  let stPost : List Value → Memory → Value → Memory → Prop :=
+    fun args _ ret _ => ∃ b x, args = callerArgs (b, x) ∧ ret = .scalar ⟨x + x, 4⟩
+  have hNeCallees : callees₁ ≠ callees₂ := by
+    intro h
+    have := congrArg List.length h
+    cases this
+  have hClosedFull : ∀ args mem, fullPre args mem → ∀ site,
+      ¬ mirStatefulGapBehaviors MirCallEnv.unresolved callees₁ inlinableBranchingBody
+          (args, mem) (.gap (.unresolved site)) := by
+    rintro _ _ ⟨b, x, _, rfl, rfl⟩ site hm
+    dsimp only [mirStatefulGapBehaviors] at hm
+    cases b with
+    | true =>
+      let st₁ := mirSiteOfExec inlinableBranchingBody (.running
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          inlinableBranchingBody (callerArgs (true, x)) linkedMemory callees₁))
+      let retMem₁ : Memory := {
+        linkedMemory with
+        callees := callees₁, traitImpls := [],
+        activeCallee := some inlinableBranchingBody }
+      have h₁ : runGapSteps (mirSiteGapStep MirCallEnv.unresolved inlinableBranchingBody) 6 st₁ =
+          .ok (.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩, retMem₁) := rfl
+      have heq := (gapBehaviors_iff_of_run _ (ne_outOfFuel_of_eq h₁ (fun h₀ => by cases h₀))
+        (.gap (.unresolved site))).mp hm
+      rw [h₁] at heq; cases heq
+    | false =>
+      let st₁ := mirSiteOfExec inlinableBranchingBody (.running
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          inlinableBranchingBody (callerArgs (false, x)) linkedMemory callees₁))
+      have h₁ : runGapSteps (mirSiteGapStep MirCallEnv.unresolved inlinableBranchingBody) 4 st₁ =
+          .gap (.unsupported "test::unmodeled_helper") := rfl
+      have heq := (gapBehaviors_iff_of_run _ (ne_outOfFuel_of_eq h₁ (fun h₀ => by cases h₀))
+        (.gap (.unresolved site))).mp hm
+      rw [h₁] at heq; cases heq
+  have hClosedVal : ∀ args, valPre args → ∀ site,
+      ¬ mirGapBehaviors MirCallEnv.unresolved callees₁ inlinableBranchingBody args
+          (.gap (.unresolved site)) := by
+    rintro _ ⟨x, _, rfl⟩ site hm
+    let valMem₁ : Memory :=
+      { (initMachineStateWithCallees inlinableBranchingBody [] callees₁).memory with
+        activeCallee := some inlinableBranchingBody }
+    have h₁ : runMirWithGap MirCallEnv.unresolved callees₁ inlinableBranchingBody 6
+        (callerArgs (true, x)) =
+        .ok (.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩, valMem₁) := rfl
+    have heq := (mirGapBehaviors_iff_of_run
+      (ne_outOfFuel_of_eq h₁ (fun h₀ => by cases h₀)) _).mp hm
+    rw [h₁] at heq; cases heq
+  have hValEq : ContextEquivOn valPre (fun r₁ r₂ : MirReturn => r₁.1 = r₂.1) (· = ·)
+      (mirGapBehaviors MirCallEnv.unresolved callees₁ inlinableBranchingBody)
+      (mirGapBehaviors MirCallEnv.unresolved callees₂ inlinedRefactoredBody) := by
+    rintro _ ⟨x, _, rfl⟩
+    let valMem₁ : Memory :=
+      { (initMachineStateWithCallees inlinableBranchingBody [] callees₁).memory with
+        activeCallee := some inlinableBranchingBody }
+    have h₁ : runMirWithGap MirCallEnv.unresolved callees₁ inlinableBranchingBody 6
+        (callerArgs (true, x)) =
+        .ok (.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩, valMem₁) := rfl
+    have h₂ : runMirWithGap MirCallEnv.unresolved callees₂ inlinedRefactoredBody 5
+        (callerArgs (true, x)) =
+        .ok (.scalar ⟨wrapScalarBits (x * 2) (scalarModulus 4), 4⟩,
+          (initMachineStateWithCallees inlinedRefactoredBody [] callees₂).memory) := rfl
+    refine mirGapBehaviors_equiv_of_runs (fuel₂ := 5)
+      (ne_outOfFuel_of_eq h₁ (fun h₀ => by cases h₀)) ?_
+    rw [h₁, h₂, Nat.mul_two]
+    exact (rfl : Value.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩ = _)
+  have hStEqFull : ContextEquivOn (fun q => fullPre q.1 q.2)
+      (fun r₁ r₂ : MirReturn => r₁.1 = r₂.1) (· = ·)
+      (mirStatefulGapBehaviors MirCallEnv.unresolved callees₁ inlinableBranchingBody)
+      (mirStatefulGapBehaviors MirCallEnv.unresolved callees₂ inlinedRefactoredBody) := by
+    rintro ⟨args, mem⟩ ⟨b, x, _, rfl, rfl⟩
+    dsimp only [mirStatefulGapBehaviors]
+    cases b with
+    | true =>
+      let st₁ := mirSiteOfExec inlinableBranchingBody (.running
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          inlinableBranchingBody (callerArgs (true, x)) linkedMemory callees₁))
+      let st₂ := mirSiteOfExec inlinedRefactoredBody (.running
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          inlinedRefactoredBody (callerArgs (true, x)) linkedMemory callees₂))
+      let retMem₁ : Memory := {
+        linkedMemory with
+        callees := callees₁, traitImpls := [],
+        activeCallee := some inlinableBranchingBody }
+      let retMem₂ : Memory :=
+        { linkedMemory with callees := callees₂, traitImpls := [] }
+      have h₁ : runGapSteps (mirSiteGapStep MirCallEnv.unresolved inlinableBranchingBody) 6 st₁ =
+          .ok (.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩, retMem₁) := rfl
+      have h₂ : runGapSteps (mirSiteGapStep MirCallEnv.unresolved inlinedRefactoredBody) 5 st₂ =
+          .ok (.scalar ⟨wrapScalarBits (x * 2) (scalarModulus 4), 4⟩, retMem₂) := rfl
+      refine gapBehaviors_equiv_of_runs (fuel₂ := 5)
+        (ne_outOfFuel_of_eq h₁ (fun h₀ => by cases h₀)) ?_
+      rw [h₁, h₂, Nat.mul_two]
+      exact (rfl : Value.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩ = _)
+    | false =>
+      let st₁ := mirSiteOfExec inlinableBranchingBody (.running
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          inlinableBranchingBody (callerArgs (false, x)) linkedMemory callees₁))
+      let st₂ := mirSiteOfExec inlinedRefactoredBody (.running
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          inlinedRefactoredBody (callerArgs (false, x)) linkedMemory callees₂))
+      have h₁ : runGapSteps (mirSiteGapStep MirCallEnv.unresolved inlinableBranchingBody) 4 st₁ =
+          .gap (.unsupported "test::unmodeled_helper") := rfl
+      have h₂ : runGapSteps (mirSiteGapStep MirCallEnv.unresolved inlinedRefactoredBody) 5 st₂ =
+          .gap (.unsupported "test::unmodeled_helper") := rfl
+      refine gapBehaviors_equiv_of_runs (fuel₂ := 5)
+        (ne_outOfFuel_of_eq h₁ (fun h₀ => by cases h₀)) ?_
+      rw [h₁, h₂]
+      exact (rfl : GapTag.unsupported "test::unmodeled_helper" = _)
+  have valBase : Trusted.VerificationResult.VerificationResult
+      { body := inlinableBranchingBody, pre := valPre, post := valPost, callees := callees₁ } :=
+    { proof := by
+        rintro _ ⟨x, hx, rfl⟩
+        let valMem₁ : Memory :=
+          { (initMachineStateWithCallees inlinableBranchingBody [] callees₁).memory with
+            activeCallee := some inlinableBranchingBody }
+        have hrun : runMirWithGap MirCallEnv.unresolved callees₁ inlinableBranchingBody 6
+            (callerArgs (true, x)) =
+            classifyOutcome (.normal (.scalar ⟨x + x, 4⟩, valMem₁)) := by
+          have h₀ : runMirWithGap MirCallEnv.unresolved callees₁ inlinableBranchingBody 6
+              (callerArgs (true, x)) =
+              .ok (.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩, valMem₁) := rfl
+          rw [h₀, wrapScalarBits_of_lt (show x + x < scalarModulus 4 from hx)]; rfl
+        obtain ⟨hs, _, huniq⟩ := mirTree_adequate_of_defined hrun
+        refine ⟨hs, fun outPair hrr _ retVal mem' hout => ?_⟩
+        rcases outPair with ⟨tr, out⟩
+        dsimp only at hout; subst hout
+        have heq := huniq tr (.normal (retVal, mem')) hrr
+        injection heq with hp; injection hp with hrv _
+        exact ⟨x, rfl, hrv⟩ }
+  have totalBase : MirConstructiveTotalHolds callees₁ inlinableBranchingBody stPre stPost := by
+    rintro _ _ ⟨x, hx, rfl, rfl⟩
+    let st₁ := mirSiteOfExec inlinableBranchingBody (.running
+      (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+        inlinableBranchingBody (callerArgs (true, x)) linkedMemory callees₁))
+    let retMem₁ : Memory := {
+      linkedMemory with
+      callees := callees₁, traitImpls := [],
+      activeCallee := some inlinableBranchingBody }
+    have h₁ : runGapSteps (mirSiteGapStep MirCallEnv.unresolved inlinableBranchingBody) 6 st₁ =
+        classifyOutcome (.normal (.scalar ⟨x + x, 4⟩, retMem₁)) := by
+      have h₀ : runGapSteps (mirSiteGapStep MirCallEnv.unresolved inlinableBranchingBody) 6 st₁ =
+          .ok (.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩, retMem₁) := rfl
+      rw [h₀, wrapScalarBits_of_lt (show x + x < scalarModulus 4 from hx)]; rfl
+    have hm₁ : mirStatefulGapBehaviors MirCallEnv.unresolved callees₁ inlinableBranchingBody
+        (callerArgs (true, x), linkedMemory)
+        (classifyOutcome (.normal (.scalar ⟨x + x, 4⟩, retMem₁))) :=
+      ⟨classifyOutcome_ne_outOfFuel _, 6, h₁⟩
+    have hDef : OutcomeSet.Defined ExecFault.isUB
+        (mirStatefulGapBehaviors MirCallEnv.unresolved callees₁ inlinableBranchingBody
+          (callerArgs (true, x), linkedMemory)) :=
+      fun o ho => by
+        have heq := (gapBehaviors_iff_of_run _ (ne_outOfFuel_of_eq h₁ (fun h₀ => by cases h₀)) o).mp ho
+        rw [h₁] at heq; subst heq; exact trivial
+    have hProd := mirTree_productive_of_terminates_closed
+      (hClosedFull _ _ ⟨true, x, hx, rfl, rfl⟩) ⟨_, hm₁⟩
+    have hs : TreeSafe (Trusted.VerificationResult.mirStatefulTreeWithCallees
+        inlinableBranchingBody (callerArgs (true, x)) linkedMemory callees₁) := by
+      change TreeSafe (mirTree inlinableBranchingBody _)
+      rw [← cofix_stepMirSiteState_eq_mirTree]
+      exact treeSafe_of_gapBehaviors_defined
+        mirHandled_not_fault (mirGapHandle_ne_outOfFuel MirCallEnv.unresolved)
+        mirGapHandle_unresolved_subsingleton (mirGapHandle_noDefFault MirCallEnv.unresolved) hDef
+    obtain ⟨tr₀, hrr₀⟩ := (mirReachesRet_iff_of_closed
+      (hClosedFull _ _ ⟨true, x, hx, rfl, rfl⟩) (.normal (.scalar ⟨x + x, 4⟩, retMem₁))).mpr hm₁
+    refine ⟨hs, hProd, ⟨tr₀, _, hrr₀⟩, fun tr out hrr => ?_⟩
+    have hm := (mirReachesRet_iff_of_closed
+      (hClosedFull _ _ ⟨true, x, hx, rfl, rfl⟩) out).mp ⟨tr, hrr⟩
+    have heq := (gapBehaviors_iff_of_run _ (ne_outOfFuel_of_eq h₁ (fun h₀ => by cases h₀)) _).mp hm
+    rw [h₁] at heq
+    exact ⟨_, _, classifyOutcome_injective heq, ⟨true, x, rfl, rfl⟩⟩
+  have stBase : Trusted.VerificationResult.StatefulVerificationResult
+      { body := inlinableBranchingBody, pre := stPre, post := stPost, callees := callees₁ } :=
+    { proof := by
+        rintro _ _ ⟨x, hx, rfl, rfl⟩
+        obtain ⟨hs, _, _, hret⟩ := totalBase _ _ ⟨x, hx, rfl, rfl⟩
+        refine ⟨hs, fun outPair hrr _ retVal mem' hout => ?_⟩
+        rcases outPair with ⟨tr, out⟩
+        dsimp only at hout; subst hout
+        obtain ⟨_, _, heq, hp⟩ := hret tr (.normal (retVal, mem')) hrr
+        injection heq with hpair; injection hpair with hrv _; subst hrv; exact hp }
+  have ubExBase : Trusted.VerificationResult.UbExceptionVerificationResult
+      { body := inlinableBranchingBody, pre := fullPre, strictSafetyPre := stPre,
+        post := stPost, callees := callees₁ } :=
+    { proof := by
+        refine ⟨?_, ?_⟩
+        · rintro _ _ ⟨_, ⟨x, hx, rfl, rfl⟩⟩
+          obtain ⟨hs, _, _, hret⟩ := totalBase _ _ ⟨x, hx, rfl, rfl⟩
+          refine ⟨hs, fun outPair hrr _ retVal mem' hout => ?_⟩
+          rcases outPair with ⟨tr, out⟩
+          dsimp only at hout; subst hout
+          obtain ⟨_, _, heq, hp⟩ := hret tr (.normal (retVal, mem')) hrr
+          injection heq with hpair; injection hpair with hrv _; subst hrv; exact hp
+        rintro _ _ ⟨b, x, hx, rfl, rfl⟩ tr retVal mem' hrr
+        have hm := (mirReachesRet_iff_of_closed
+          (hClosedFull _ _ ⟨b, x, hx, rfl, rfl⟩) (.normal (retVal, mem'))).mp ⟨tr, hrr⟩
+        dsimp only [mirStatefulGapBehaviors] at hm
+        cases b with
+        | true =>
+          let st₁ := mirSiteOfExec inlinableBranchingBody (.running
+            (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+              inlinableBranchingBody (callerArgs (true, x)) linkedMemory callees₁))
+          let retMem₁ : Memory := {
+            linkedMemory with
+            callees := callees₁, traitImpls := [],
+            activeCallee := some inlinableBranchingBody }
+          have h₁ : runGapSteps (mirSiteGapStep MirCallEnv.unresolved inlinableBranchingBody) 6 st₁ =
+              .ok (.scalar ⟨x + x, 4⟩, retMem₁) := by
+            have h₀ : runGapSteps (mirSiteGapStep MirCallEnv.unresolved inlinableBranchingBody) 6 st₁ =
+                .ok (.scalar ⟨wrapScalarBits (x + x) (scalarModulus 4), 4⟩, retMem₁) := rfl
+            rw [h₀, wrapScalarBits_of_lt (show x + x < scalarModulus 4 from hx)]
+          have heq := (gapBehaviors_iff_of_run _ (ne_outOfFuel_of_eq h₁ (fun h₀ => by cases h₀))
+            (.ok (retVal, mem'))).mp hm
+          rw [h₁] at heq
+          exact ⟨true, x, rfl, congrArg Prod.fst (OutcomeWithGap.ok.inj heq)⟩
+        | false =>
+          let st₁ := mirSiteOfExec inlinableBranchingBody (.running
+            (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+              inlinableBranchingBody (callerArgs (false, x)) linkedMemory callees₁))
+          have h₁ : runGapSteps (mirSiteGapStep MirCallEnv.unresolved inlinableBranchingBody) 4 st₁ =
+              .gap (.unsupported "test::unmodeled_helper") := rfl
+          have heq := (gapBehaviors_iff_of_run _ (ne_outOfFuel_of_eq h₁ (fun h₀ => by cases h₀))
+            (.ok (retVal, mem'))).mp hm
+          rw [h₁] at heq; cases heq }
+  have hPostValEq : ∀ args mem v₁ m₁ v₂ m₂,
+      fullPre args mem → v₁ = v₂ → stPost args mem v₁ m₁ → stPost args mem v₂ m₂ := by
+    rintro _ _ _ _ _ _ _ hrv ⟨b, x, rfl, rfl⟩
+    exact ⟨b, x, rfl, hrv.symm⟩
+  refine ⟨hNeCallees,
+    ⟨VerificationResult.of_contextEquiv_callees hValEq hClosedVal valBase⟩,
+    ⟨StatefulVerificationResult.of_contextEquiv_callees
+      (fun q ⟨x, hx⟩ => hStEqFull q ⟨true, x, hx⟩)
+      (fun args mem v₁ m₁ v₂ m₂ ⟨x, hx⟩ => hPostValEq args mem v₁ m₁ v₂ m₂ ⟨true, x, hx⟩)
+      (fun args mem ⟨x, hx⟩ => hClosedFull args mem ⟨true, x, hx⟩) stBase⟩,
+    ⟨UbExceptionVerificationResult.of_contextEquiv_callees hStEqFull hPostValEq hClosedFull ubExBase⟩,
+    mirConstructiveTotalHolds_of_contextEquiv_callees
+      (fun q ⟨x, hx⟩ => hStEqFull q ⟨true, x, hx⟩)
+      (fun args mem v₁ m₁ v₂ m₂ ⟨x, hx⟩ => hPostValEq args mem v₁ m₁ v₂ m₂ ⟨true, x, hx⟩)
+      (fun args mem ⟨x, hx⟩ => hClosedFull args mem ⟨true, x, hx⟩) totalBase⟩
+
+end B4HardeningCanaries
+
 end GapPreservingCanaries
 
 end Anneal.FunctionalTranslationEquivTests
