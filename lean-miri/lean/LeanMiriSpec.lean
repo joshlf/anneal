@@ -58,6 +58,7 @@ import LeanMiriSpec.Correspondence.WitLM4_2
 import LeanMiriSpec.Correspondence.Safety
 import LeanMiriSpec.Correspondence.MiriDiffWitnesses
 import LeanMiriSpec.Correspondence.WideSliceDstLM
+import LeanMiriSpec.UnwindSetDiscrAndFnPtrLM
 import LeanMiriSpec.Audit
 
 /-!
@@ -469,6 +470,15 @@ import LeanMiriSpec.Audit
   `DIV-LM-PLACE-LEN-BORROW-BOUNDS`, `DIV-LM-RAW-SLICE-PARTIAL-OOB-LEN-INDEX`,
   `DIV-LM-ZERO-BYTE-DANGLING-REBORROW`, and
   `DIV-LM-CONSTANT-INDEX-NAT-SUB-SATURATION`).
+* `LeanMiriSpec.UnwindSetDiscrAndFnPtrLM`: conservative step-hook overlay
+  (`annealStepHooksUnwindFnPtrClosure`, `step_overlay_eq_base_of_free`),
+  two-sided `stepMirFn` vs. `Miri.Interpreter.Step.step` simulations, and
+  execution/UB/divergence witnesses for `SetDiscriminant`, `unwindResume`,
+  `unwindTerminate`, `coverage`, `backwardIncompatibleDropHint`, `fnPtrToPtr`,
+  `subtype` (scalars, thin/wide pointers, `dyn Trait`, range newtypes), all 5
+  non-`Unsize` `pointerCoercion`s (`ReifyFnPointer`, `ClosureFnPointer`,
+  `UnsafeFnPointer`, `MutToConstPointer`, `ArrayToPointer`),
+  `unwrapUnsafeBinder`, and `AggregateKind.closure`.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).
