@@ -231,7 +231,9 @@ mechanically generated MiniRust Tree Borrows specification (`MiniRustSpec.Gen`,
   are relative to a SUCCESSFUL pruned Anneal step; `endCallLockstepSim_end_call`
   connects `EndCallLockstepSim` to `TreeBorrowsMemory.end_call` (preserving
   `TreeBorrowsMemory.wfLive` choice-free). For singleton frames (`frame.length
-  = 1`) the converse IS an exact `↔` (`endCallLockstepSim_singleton_iff_end_call`),
+  = 1`) the converse IS an exact `↔` (`endCallLockstepSim_singleton_iff_end_call`,
+  which needs no hypothesis beyond success of the Anneal exit and is fired in both
+  directions by `canary_endCall_lockstep_iff_and_end_call_bridge`),
   whereas for `frame.length ≥ 2` the converse is strictly FALSE and BOTH
   `FrameExitPruneInert` and `EndCallLockstepSim` are protector-release-order
   sensitive on the EXACT SAME 4-node borrow tree
@@ -249,15 +251,21 @@ mechanically generated MiniRust Tree Borrows specification (`MiniRustSpec.Gen`,
   `base - 1` is caught first by `checkPtrM`'s alignment UB), and rejects ANY
   `.Uninit` byte in the 8-byte pointer itself for BOTH safe and raw pointers
   while ignoring `.Uninit` pointee bytes
-  (`canary_machTB_validate_zst_align_uninit_and_specPanic`).
+  (`canary_machTB_validate_zst_align_uninit_and_specPanic`). The two symbolic
+  statements behind this boundary, `checkPtrM_tb_safe_ok_iff` (success side, both
+  the live-in-bounds and the `sz = 0` disjunct) and
+  `tbm_retag_ptr_pointee_data_irrelevant` (on `.Init` vs. all-`.Uninit` memories),
+  are fired on closed values by `canary_retag_alignment_and_deref_boundary`.
 - The `Trusted` connection covers BOTH `#[rustc_no_writable]` (run-level
   all-fuel coincidence of `stepMirFnWithParamMap` with `stepMirFn` under an
   all-`rustcNoWritable` map; `writableChildWrite` runs through the Anneal-side
   adapter, and `MachTB` / `Trusted` runs are related by observable outcomes)
-  AND `charon#1620` global/static retags (`trusted_and_machTB_static_mut_vs_freeze_and_unsafeCell`:
-  `.retag .raw` provenance-preserving no-op on `&raw const`/`&raw mut` globals,
-  `.retag .default` `&u32` vs. `&mut u32` on `.not` Freeze vs. `.mut` `static mut`
-  globals, and ZST provenance-free non-null vs. null scalar retags).
+  AND `charon#1620` global/static retags (`trusted_and_machTB_static_mut_vs_freeze_and_unsafeCell`,
+  a conjunction of closed per-layer witnesses rather than a translation theorem:
+  `.retag .raw` as a provenance-preserving step for `&raw const` on a `.not` Freeze
+  global and `&raw mut` on a `.mut` `static mut` global, `.retag .default` `&u32`
+  vs. `&mut u32` on `.not` Freeze vs. `.mut` `static mut` globals, and ZST
+  provenance-free non-null vs. null scalar retags).
 - Symbolic `MachTB.wfLive` preservation across arbitrary `stepsTB n` executions
   is proved choice-free in Section 6.4 (`stepsTB_wfLive_choiceFree`,
   `machTB_staticAccess_steps_wfLive`, `machTB_harnesses_steps_wfLive`): it is a
@@ -10611,7 +10619,11 @@ theorem endCallLockstepSim_end_call (off len : Nat) (emb : Nat → Gen.Path) (id
 /-- **Exact bidirectional characterization for singleton frames (`frame = [(t, p)]`)**:
 on a 1-entry frame where `execFrameExitMiniRust w [(t, p)] = .ok w'`,
 `EndCallLockstepSim` is EQUIVALENT (`↔`) to `TreeBorrowsMemory.end_call` succeeding
-into a `TreeSimInv`-related final tree. Together with
+into a `TreeSimInv`-related final tree. The equivalence is an unfolding of the
+one-step `TreeBorrowsMemory.end_call` fold, so it needs NO hypothesis on the
+initial pair beyond success of the Anneal exit (in particular neither an initial
+`TreeSimInv` nor existence of allocation `id`: when allocation `id` is absent,
+both sides are simply false together). Together with
 `endCallLockstepSim_end_call_converse_false_and_order_sensitive`, this pinpoints
 `frame.length ≥ 2` as the exact threshold where final-state agreement decouples
 from step-by-step lockstep simulation. -/
@@ -10619,9 +10631,6 @@ theorem endCallLockstepSim_singleton_iff_end_call
     (off len : Nat) (emb : Nat → Gen.Path) (id : Nat)
     (t p : Nat) (w w' : FnEntryBorrowWorld)
     (tbm : Gen.TreeBorrowsMemory Gen.x86_64)
-    (alloc : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra)
-    (halloc : tbm.mem.allocations[id]? = some alloc)
-    (hinv : TreeSimInv off len emb w alloc.extra.root)
     (hw : execFrameExitMiniRust w [(t, p)] = .ok w') :
     EndCallLockstepSim off len emb id w tbm [(t, p)] ↔
       ∃ tbm' alloc',
@@ -10630,9 +10639,13 @@ theorem endCallLockstepSim_singleton_iff_end_call
         TreeSimInv off len emb w' alloc'.extra.root := by
   constructor
   · intro hlock
-    obtain ⟨tbm', alloc', hend, hal, hinv', _⟩ :=
-      endCallLockstepSim_end_call off len emb id [(t, p)] w w' tbm alloc halloc hinv hw hlock
-    exact ⟨tbm', alloc', hend, hal, hinv'⟩
+    obtain ⟨tbm1, alloc1, hrel1, hal1, hinv1, _⟩ := hlock w' hw
+    refine ⟨tbm1, alloc1, ?_, hal1, hinv1⟩
+    unfold TreeBorrowsMemory.end_call
+    simp only [List.foldlM_cons, List.foldlM_nil, bind, Except.bind, pure, Except.pure]
+    cases hr : TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb t) with
+    | error e => rw [hr] at hrel1; cases hrel1
+    | ok t1 => rw [hr] at hrel1; cases hrel1; rfl
   · intro ⟨tbm', alloc', hend, hal, hinv'⟩ w1 hw1
     rw [hw] at hw1; cases hw1
     have hrel : TreeBorrowsMemory.release_protector tbm (⟨(id : Int)⟩, emb t) = .ok tbm' := by
@@ -19144,7 +19157,10 @@ theorem canary_endCall_strictDescendant_and_divergence :
    direction, so the lockstep predicate HOLDS on a concrete depth-3 borrow tree;
 2. the bridge then turns that lockstep fact into a successful real
    `TreeBorrowsMemory.end_call` whose final tree is `TreeSimInv`-related to the
-   Anneal post-exit world. -/
+   Anneal post-exit world;
+3. `endCallLockstepSim_singleton_iff_end_call` fires in BOTH directions on this
+   genuine singleton frame (lockstep ⟹ `end_call` success ⟹ lockstep), so its
+   single hypothesis and both sides of its `↔` are jointly satisfiable. -/
 theorem canary_endCall_lockstep_iff_and_end_call_bridge :
     EndCallLockstepSim 0 8 strictDescExitEmb 0 strictDescExitWorld
       (mkTbmWithTree strictDescExitTreeMR) [(1, 7)] ∧
@@ -19182,7 +19198,9 @@ theorem canary_endCall_lockstep_iff_and_end_call_bridge :
   have hlock := hiff.mpr hprDesc
   obtain ⟨tbm', alloc', hend, hal, hinv', _⟩ := endCallLockstepSim_end_call 0 8 strictDescExitEmb 0
     [(1, 7)] strictDescExitWorld wDesc (mkTbmWithTree strictDescExitTreeMR) _ rfl hinvDesc hwDesc hlock
-  exact ⟨hlock, wDesc, tbm', alloc', hwDesc, hend, hal, hinv'⟩
+  have hsingle := endCallLockstepSim_singleton_iff_end_call 0 8 strictDescExitEmb 0 1 7
+    strictDescExitWorld wDesc (mkTbmWithTree strictDescExitTreeMR) hwDesc
+  exact ⟨hsingle.mpr (hsingle.mp hlock), wDesc, tbm', alloc', hwDesc, hend, hal, hinv'⟩
 
 /-- Embedding for the 4-node depth-2 multi-entry frame-exit witness:
 `0` (`[]`, root `.unique`) → `1` (`[0]`, protected `.frozen`, prot `10`) and
@@ -19220,7 +19238,9 @@ def endCallOrderTreeMR : Gen.Node :=
 /-- **Sharpness, converse refutation, protector-release-order sensitivity, and
 genuine 2-entry lockstep witness for `tbm_end_call_lockstep_iff_pruneInert` &
 `endCallLockstepSim_end_call`** (zero hypotheses) on the SINGLE 4-node depth-2
-borrow tree `endCallOrderWorld` / `endCallOrderTreeMR`:
+borrow tree `endCallOrderWorld` / `endCallOrderTreeMR`, whose initial pair IS
+`TreeSimInv`-related (first conjunct — so every premise of the refuted converse
+holds and the refutation is not vacuous):
 1. **Order `[(1, 10), (3, 20)]` — Converse of `endCallLockstepSim_end_call` is
    FALSE at `frame.length = 2`**: releasing `(1, 10)` first causes `2` (`.frozen`)
    to prune `3` (protected `.reservedFrz false`) in Anneal while MiniRust latches
@@ -19245,6 +19265,7 @@ theorem endCallLockstepSim_end_call_converse_false_and_order_sensitive :
     let t := mkTbmWithTree endCallOrderTreeMR
     let frame13 : List (Nat × Nat) := [(1, 10), (3, 20)]
     let frame31 : List (Nat × Nat) := [(3, 20), (1, 10)]
+    TreeSimInv 0 8 endCallOrderEmb w endCallOrderTreeMR ∧
     (¬ FrameExitPruneInert 0 8 w frame13) ∧
     (¬ EndCallLockstepSim 0 8 endCallOrderEmb 0 w t frame13) ∧
     (∃ w' tbm' alloc',
@@ -19368,7 +19389,7 @@ theorem endCallLockstepSim_end_call_converse_false_and_order_sensitive :
       (houtTree [(3, 20), (1, 10)]) hw31).mpr hpr31
   obtain ⟨tbmRev, allocRev, hendRev, halRev, hinvRev, hwfRev⟩ := endCallLockstepSim_end_call 0 8 endCallOrderEmb 0
     [(3, 20), (1, 10)] endCallOrderWorld _ (mkTbmWithTree endCallOrderTreeMR) _ rfl hinv0 hw31 hlock31
-  exact ⟨hnotPr, hnotLock, ⟨w13, tbm13, alloc13, hw13, ht13, hal13, hwf13, hinv13⟩,
+  exact ⟨hinv0, hnotPr, hnotLock, ⟨w13, tbm13, alloc13, hw13, ht13, hal13, hwf13, hinv13⟩,
     hpr31, hlock31, _, tbmRev, allocRev, hw31, hendRev, halRev,
     hwfRev (tbm_wfLive_of_bool _ (by decide +kernel)), hinvRev⟩
 
@@ -22789,7 +22810,8 @@ private def a2_mkSingleThreadMachTB (tbm : Gen.TreeBorrowsMemory Gen.x86_64) : M
 /-- **Closed non-vacuity canary for the two-layer retag alignment &
 dereferenceability boundary** (`tbm_retag_ptr_raw_and_pinned_noop`,
 `tbm_retag_ptr_ignores_alignment`, `tbm_retag_ptr_safe_dereferenceable_ub`,
-`checkPtrM_tb_safe_vs_raw_boundary`,
+`checkPtrM_tb_safe_vs_raw_boundary`, `checkPtrM_tb_safe_ok_iff`,
+`tbm_retag_ptr_pointee_data_irrelevant`,
 `evalStatementM_tb_validate_safe_vs_raw_boundary`; zero hypotheses):
 1. `#[rustc_no_writable]` `&mut u32` (`fnIw = false`, `fnEntry = true`):
    - aligned out-of-bounds pointer (`addr = 264`, 4-byte aligned, just past 8-byte alloc `[256, 264)`)
@@ -22809,7 +22831,17 @@ dereferenceability boundary** (`tbm_retag_ptr_raw_and_pinned_noop`,
      rejects misaligned in-bounds at `checkPtrM`;
    - erased `Raw .None` accepts null (`addr = 0`), misaligned (`addr = 257`),
      and OOB (`addr = 264`) unconditionally at BOTH `TreeBorrowsMemory.retag_ptr`
-     AND `checkPtrM`! -/
+     AND `checkPtrM`!
+4. Success side of `checkPtrM_tb_safe_ok_iff` (fired through its `←` direction, so
+   all of its hypotheses and its right-hand side are jointly satisfiable): an
+   aligned in-bounds `&mut u32` (`addr = 256`) via the live-in-bounds disjunct, and
+   an `al = 1` ZST `&mut ()` one byte BELOW the base (`addr = 255`) via the
+   `sz = 0` disjunct, both pass `checkPtrM`.
+5. `tbm_retag_ptr_pointee_data_irrelevant` on two memories that genuinely differ
+   (`.Init` bytes vs. eight `.Uninit` bytes, related by `TbmSameMetaDiffData`): the
+   `#[rustc_no_writable]` `FnEntry` retag of the same `&mut u32` succeeds on both
+   with the identical returned pointer and protector list, into post-states that
+   are again `TbmSameMetaDiffData`-related. -/
 theorem canary_retag_alignment_and_deref_boundary :
     let tbm8 : Gen.TreeBorrowsMemory Gen.x86_64 :=
       { params := ⟨true⟩
@@ -22826,6 +22858,15 @@ theorem canary_retag_alignment_and_deref_boundary :
       ThinPointer.widen { addr := 257, provenance := some (⟨0⟩, []) } none
     let ptrNull : Gen.Pointer Gen.TreeBorrowsProvenance :=
       ThinPointer.widen { addr := 0, provenance := none } none
+    let ptrOk : Gen.Pointer Gen.TreeBorrowsProvenance :=
+      ThinPointer.widen { addr := 256, provenance := some (⟨0⟩, []) } none
+    let ptrBelow : Gen.Pointer Gen.TreeBorrowsProvenance :=
+      ThinPointer.widen { addr := 255, provenance := some (⟨0⟩, []) } none
+    let zstAl1Ty : Gen.PtrType := .Ref .Mutable (pointeeInfoOfFacts ⟨true, true, true⟩ 0 1 [])
+    let tbm8Uninit : Gen.TreeBorrowsMemory Gen.x86_64 :=
+      { params := ⟨true⟩
+        mem := { allocations := [mkRootAllocTB (List.replicate 8 .Uninit) 256 4 .Global],
+                 _phantom := ⟨⟩ } }
     -- 1. #[rustc_no_writable] &mut u32: OOB fails both; misaligned passes retag_ptr (ignoring align), fails checkPtrM
     TreeBorrowsMemory.retag_ptr tbm8 TreeBorrowsMemory.new_call ptrOob mutU32Ty true false
         nwsrVtableLookup =
@@ -22853,12 +22894,32 @@ theorem canary_retag_alignment_and_deref_boundary :
         nwsrVtableLookup = .ok (ptrNull, tbm8, TreeBorrowsMemory.new_call) ∧
     checkPtrM ptrNull (.Raw .None) (some m0) = .ok () ∧
     checkPtrM ptrMis (.Raw .None) (some m0) = .ok () ∧
-    checkPtrM ptrOob (.Raw .None) (some m0) = .ok () := by
+    checkPtrM ptrOob (.Raw .None) (some m0) = .ok () ∧
+    -- 4. Success side of checkPtrM_tb_safe_ok_iff: aligned in-bounds &mut u32, and ZST &mut () below the base
+    checkPtrM ptrOk mutU32Ty (some m0) = .ok () ∧
+    checkPtrM ptrBelow zstAl1Ty (some m0) = .ok () ∧
+    -- 5. Initialized vs. all-Uninit pointee bytes retag in exact lockstep
+    TbmSameMetaDiffData tbm8 tbm8Uninit ∧
+    (∃ p t1 t2 fe,
+      TreeBorrowsMemory.retag_ptr tbm8 TreeBorrowsMemory.new_call ptrOk mutU32Ty true false
+        nwsrVtableLookup = .ok (p, t1, fe) ∧
+      TreeBorrowsMemory.retag_ptr tbm8Uninit TreeBorrowsMemory.new_call ptrOk mutU32Ty true false
+        nwsrVtableLookup = .ok (p, t2, fe) ∧
+      TbmSameMetaDiffData t1 t2) := by
   dsimp only
   let tbm8 : Gen.TreeBorrowsMemory Gen.x86_64 :=
     { params := ⟨true⟩
       mem := { allocations := [mkRootAllocTB (tbU32Bytes 1 ++ tbU32Bytes 2) 256 4 .Global],
                _phantom := ⟨⟩ } }
+  let tbm8Uninit : Gen.TreeBorrowsMemory Gen.x86_64 :=
+    { params := ⟨true⟩
+      mem := { allocations := [mkRootAllocTB (List.replicate 8 .Uninit) 256 4 .Global],
+               _phantom := ⟨⟩ } }
+  let ptrOk : Gen.Pointer Gen.TreeBorrowsProvenance :=
+    ThinPointer.widen { addr := 256, provenance := some (⟨0⟩, []) } none
+  let ptrBelow : Gen.Pointer Gen.TreeBorrowsProvenance :=
+    ThinPointer.widen { addr := 255, provenance := some (⟨0⟩, []) } none
+  let zstAl1Ty : Gen.PtrType := .Ref .Mutable (pointeeInfoOfFacts ⟨true, true, true⟩ 0 1 [])
   let m0 : MachTB := a2_mkSingleThreadMachTB tbm8
   let mutU32Ty : Gen.PtrType := .Ref .Mutable (pointeeInfoOfFacts ⟨true, true, true⟩ 4 4 [])
   let mutU32Al1Ty : Gen.PtrType := .Ref .Mutable (pointeeInfoOfFacts ⟨true, true, true⟩ 4 1 [])
@@ -22919,7 +22980,36 @@ theorem canary_retag_alignment_and_deref_boundary :
     cases h : TreeBorrowsMemory.retag_ptr tbm8 TreeBorrowsMemory.new_call ptrMis zstAl4Ty true false
         nwsrVtableLookup with
     | ok r => exact ⟨r, rfl⟩ | error _ => rw [h] at h5chk; cases h5chk
-  exact ⟨h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12⟩
+  have h13 : checkPtrM ptrOk mutU32Ty (some m0) = .ok () :=
+    (checkPtrM_tb_safe_ok_iff m0 ptrOk rfl (by decide) mutU32Ty
+      (pointeeInfoOfFacts ⟨true, true, true⟩ 4 4 []) 4 ⟨4⟩ rfl rfl (by decide)).mpr
+      ⟨by decide, by decide, rfl, Or.inr ⟨0, [], _, rfl, rfl, rfl, by decide, by decide⟩⟩
+  have h14 : checkPtrM ptrBelow zstAl1Ty (some m0) = .ok () :=
+    (checkPtrM_tb_safe_ok_iff m0 ptrBelow rfl (by decide) zstAl1Ty
+      (pointeeInfoOfFacts ⟨true, true, true⟩ 0 1 []) 0 ⟨1⟩ rfl rfl (by decide)).mpr
+      ⟨by decide, by decide, rfl, Or.inl rfl⟩
+  have h15 : TbmSameMetaDiffData tbm8 tbm8Uninit := by
+    refine ⟨rfl, rfl, fun i a1 a2 h1 h2 => ?_⟩
+    cases i with
+    | zero => cases h1; cases h2; exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+    | succ _ => cases h1
+  have h16chk : (TreeBorrowsMemory.retag_ptr tbm8 TreeBorrowsMemory.new_call ptrOk mutU32Ty true false
+      nwsrVtableLookup).isOk = true := by decide +kernel
+  have h16 : ∃ p t1 t2 fe,
+      TreeBorrowsMemory.retag_ptr tbm8 TreeBorrowsMemory.new_call ptrOk mutU32Ty true false
+        nwsrVtableLookup = .ok (p, t1, fe) ∧
+      TreeBorrowsMemory.retag_ptr tbm8Uninit TreeBorrowsMemory.new_call ptrOk mutU32Ty true false
+        nwsrVtableLookup = .ok (p, t2, fe) ∧
+      TbmSameMetaDiffData t1 t2 := by
+    cases h : TreeBorrowsMemory.retag_ptr tbm8 TreeBorrowsMemory.new_call ptrOk mutU32Ty true false
+        nwsrVtableLookup with
+    | error _ => rw [h] at h16chk; cases h16chk
+    | ok r =>
+      obtain ⟨p, t1, fe⟩ := r
+      obtain ⟨t2, hr2, hs, _⟩ := (tbm_retag_ptr_pointee_data_irrelevant tbm8 tbm8Uninit h15
+        TreeBorrowsMemory.new_call ptrOk mutU32Ty true false nwsrVtableLookup).2.2 p t1 fe h
+      exact ⟨p, t1, t2, fe, rfl, hr2, hs⟩
+  exact ⟨h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15, h16⟩
 
 /-- **Closed non-vacuity canary for `tbm_retag_ptr_zst_safe_skips_dereferenceable`**
 (zero hypotheses) on a DEAD 4-byte allocation at `[256, 260)`, contrasting a
@@ -23041,7 +23131,8 @@ uninitialized pointer vs. uninitialized pointee bytes** (zero hypotheses):
 1. ZST `&mut ()` (`al = 1`) to DEAD alloc `0` at `addr = 256` and past-the-end
    `addr = 100000`: `evalStatementM` SUCCEEDS in `MachTB` and pushes protector `(0, [0])`;
 2. ZST `&mut ()` (`al = 1`) at `addr = 255` (below base `256`): passes `checkPtrM`
-   (by `checkPtrM_tb_safe_ok_iff`) and reaches `.error (.specPanic
+   (the `sz = 0` disjunct of `checkPtrM_tb_safe_ok_iff`, fired in closed form by
+   item 4 of `canary_retag_alignment_and_deref_boundary`) and reaches `.error (.specPanic
    "Offset::from_bytes(ptr.addr - allocation.addr).unwrap()")` in real `MachTB`!;
 3. ZST `&mut Align4Zst` (`al = 4`) at `addr = 255`: caught FIRST by `checkPtrM` as
    `.error (.ub "Value::Ptr: unaligned safe pointer")`;
@@ -23056,7 +23147,9 @@ uninitialized pointer vs. uninitialized pointee bytes** (zero hypotheses):
 7. Uninitialized pointee bytes (`List.replicate 4 .Uninit` in live alloc `0`) with
    valid `&mut u32` in `_1`: `evalStatementM` SUCCEEDS under BOTH `#[rustc_no_writable]`
    (`fnIw = false`) and standard (`fnIw = true`), preserving `MachTB.wfLive` and
-   leaving alloc `0`'s `.Uninit` bytes untouched (matching `tbm_retag_ptr_pointee_data_irrelevant`). -/
+   leaving alloc `0`'s `.Uninit` bytes untouched (the `MachTB`-level counterpart of
+   `tbm_retag_ptr_pointee_data_irrelevant`, which is itself fired in closed form by
+   item 5 of `canary_retag_alignment_and_deref_boundary`). -/
 theorem canary_machTB_validate_zst_align_uninit_and_specPanic :
     let zstAl1 : Gen.PtrType := .Ref .Mutable (pointeeInfoOfFacts ⟨true, true, true⟩ 0 1 [])
     let zstAl4 : Gen.PtrType := .Ref .Mutable (pointeeInfoOfFacts ⟨true, true, true⟩ 0 4 [])
@@ -23199,12 +23292,16 @@ def staticRetagGlobalAlloc (mutability : Trusted.Rustc.V2026_06_01.MirAst.Mutabi
 
 /-- **Three-layer `charon#1620` static alignment (`Trusted.MirSemantics.stepMirFn` ↔
 `Theory` `ExtTreeMapAllocAndNoWritable` ↔ `MiniRustSpec` `TBM`/`MachTB`)**
-(zero hypotheses): unites `static` (`Freeze`), `static mut` (`&raw const`/`&raw mut`),
-`UnsafeCell` static, and ZST provenance-free scalar retags across all three layers:
+(zero hypotheses): places `static` (`Freeze`), `static mut` (`&raw const`/`&raw mut`),
+`UnsafeCell` static, and ZST provenance-free scalar retags side by side across all
+three layers. This is a conjunction of closed per-layer witnesses on corresponding
+programs; no translation relation between the layers' programs is claimed here:
 1. **`Trusted` `stepMirFn` (`checkGlobalRetag` / `.retag`)**:
-   - `.retag .raw` on `*const u32` (`&raw const STATIC`) and `*mut u32` (`&raw mut STATIC`)
-     succeeds unconditionally on BOTH `.not` (Freeze) and `.mut` (`static mut`) globals
-     while preserving local `_1`'s provenance;
+   - `.retag .raw` on `*const u32` (`&raw const STATIC`) against a `.not` (Freeze)
+     global, and on `*mut u32` (`&raw mut STATIC`) against a `.mut` (`static mut`)
+     global, each steps successfully at the in-bounds pointer (`offset = 0`)
+     while preserving local `_1`'s provenance (the cross pairings and
+     out-of-bounds raw retags are not exercised by this witness);
    - `.retag .default` on `&u32` succeeds on `.not` Freeze global;
    - `.retag .default` on `&mut u32` FAILS with `.ub` on `.not` Freeze global,
      SUCCEEDS on `.mut` `static mut` global when in-bounds (`offset = 0`), and
@@ -24654,7 +24751,7 @@ info: 'MiniRustSpec.NoWritableAndStaticRetag.endCallLockstepSim_end_call' depend
 #print axioms MiniRustSpec.NoWritableAndStaticRetag.endCallLockstepSim_end_call
 
 /--
-info: 'MiniRustSpec.NoWritableAndStaticRetag.endCallLockstepSim_singleton_iff_end_call' depends on axioms: [propext, Quot.sound]
+info: 'MiniRustSpec.NoWritableAndStaticRetag.endCallLockstepSim_singleton_iff_end_call' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.NoWritableAndStaticRetag.endCallLockstepSim_singleton_iff_end_call
