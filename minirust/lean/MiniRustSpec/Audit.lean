@@ -7874,6 +7874,8 @@ MiniRust on `Mach` and `MachTB`). -/
   NullaryFnPtrBridge.wit_fnPtrToPtr_body_reachRet
   NullaryFnPtrBridge.wit_fnPtrToPtr_data_body_not_noUB
   NullaryFnPtrBridge.wit_fnFromPtrM_and_divergence
+  NullaryFnPtrBridge.wit_tableAlignWf
+  NullaryFnPtrBridge.wit_alignOf_wf_ok_iff_instance
 
 namespace NullaryFnPtrBridgeStatementPins
 

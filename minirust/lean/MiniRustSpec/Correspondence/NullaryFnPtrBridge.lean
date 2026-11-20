@@ -3551,6 +3551,26 @@ theorem sizeOf_unsupported_without_decl :
   obtain ⟨h1, _, _⟩ := h 8 4 rfl
   cases h1
 
+/-- **Non-vacuity of `TableAlignWf`** (`[adv ep2-A1]`): the witness layout table satisfies the
+alignment well-formedness hypothesis of `translateTy_align_wf` and
+`nullaryOp_alignOf_wf_ok_iff`. -/
+theorem wit_tableAlignWf : TableAlignWf aLayouts := by
+  unfold TableAlignWf
+  decide +kernel
+
+/-- **`nullaryOp_alignOf_wf_ok_iff` on the witness table** (`[adv ep2-A1]`): its layout-table
+hypotheses (`pointerBits = 64`, `TableAlignWf`, `DeclLayoutCoherent`) are discharged for the
+padded tuple, so for whatever MiniRust type `translateTy` assigns to it, `AlignOf` returns `al`
+exactly when that type's `Type::layout` has alignment `al` and a valid size. -/
+theorem wit_alignOf_wf_ok_iff_instance (mrTy : Gen.Type)
+    (hTr : translateTy aLayouts aTupTy = some mrTy) (al : Nat) :
+    evalRvalue [] (.nullaryOp .alignOf aTupTy) emptyMemory aDecls aLayouts =
+        .ok (.scalar ⟨al, 8⟩) [] emptyMemory ↔
+      ∃ sz, Interp.Type.layout mrTy = .ok (.Sized ⟨sz⟩ ⟨al⟩) ∧
+        x86_64.valid_size ⟨sz⟩ = true :=
+  nullaryOp_alignOf_wf_ok_iff [] aTupTy emptyMemory aDecls aLayouts mrTy rfl wit_tableAlignWf hTr
+    wit_declLayoutCoherent.1 al
+
 /-! ### End-to-end witnesses on `CapturedMir` bodies
 
 The rvalues above inside whole MIR bodies, run through Trusted's coinductive machine semantics
