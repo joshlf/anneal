@@ -1449,6 +1449,196 @@ theorem invalidateConflictingBorrows_root_depth_mem
         ih (fun x hx => h0 x (List.mem_cons_of_mem _ hx)) e' hrest
       exact ⟨hd, e₀, List.mem_cons_of_mem _ he₀, ht, hp, hpar⟩
 
+theorem updateBorrowPermAtProj_preserves_meta
+    (e : BorrowEntry) (targetLocal : Local) (writerTag : Option Nat)
+    (writeProj : List ProjectionElem) (off len depth : Nat) :
+    let e' := updateBorrowPermAtProj e targetLocal writerTag writeProj off len depth
+    e'.tag = e.tag ∧ e'.protector = e.protector ∧
+      e'.parentTag = e.parentTag ∧ e'.targetFrameDepth = e.targetFrameDepth := by
+  dsimp only []
+  unfold updateBorrowPermAtProj
+  cases Bool.and (Nat.beq e.targetFrameDepth depth) (Nat.beq e.targetLocal targetLocal) with
+  | false => exact ⟨rfl, rfl, rfl, rfl⟩
+  | true =>
+    cases treeBorrowWriterRelatedness e writerTag with
+    | localAccess =>
+      unfold applyTreeBorrowTransition
+      cases treeBorrowNodeAccess .write .localAccess e.perm false <;>
+        exact ⟨rfl, rfl, rfl, rfl⟩
+    | foreignAccess =>
+      cases borrowEntryOverlapsWrite e writeProj off len with
+      | false => exact ⟨rfl, rfl, rfl, rfl⟩
+      | true =>
+        unfold applyTreeBorrowTransition
+        cases treeBorrowNodeAccess .write .foreignAccess e.perm false <;>
+          exact ⟨rfl, rfl, rfl, rfl⟩
+
+theorem invalidateConflictingBorrowsAtProj_succ_depth_eq
+    {borrows : List BorrowEntry} (h0 : ∀ e ∈ borrows, e.targetFrameDepth = 0)
+    (targetLocal : Local) (writerTag : Option Nat)
+    (writeProj : List ProjectionElem) (off len d : Nat) :
+    invalidateConflictingBorrowsAtProj borrows targetLocal writerTag writeProj off len (d + 1) =
+      borrows := by
+  induction borrows with
+  | nil => rfl
+  | cons e rest ih =>
+    have he0 := h0 e List.mem_cons_self
+    unfold invalidateConflictingBorrowsAtProj updateBorrowPermAtProj
+    rw [he0]
+    have hbeq : Nat.beq 0 (d + 1) = false := rfl
+    rw [hbeq, Bool.false_and]
+    dsimp only []
+    rw [ih (fun e' he' => h0 e' (List.mem_cons_of_mem _ he'))]
+
+theorem invalidateConflictingBorrowsAtProj_map_tag
+    (borrows : List BorrowEntry) (targetLocal : Local) (writerTag : Option Nat)
+    (writeProj : List ProjectionElem) (off len depth : Nat) :
+    (invalidateConflictingBorrowsAtProj borrows targetLocal writerTag writeProj off len depth).map
+        BorrowEntry.tag =
+      borrows.map BorrowEntry.tag := by
+  induction borrows with
+  | nil => rfl
+  | cons e rest ih =>
+    simp only [invalidateConflictingBorrowsAtProj, List.map_cons,
+      (updateBorrowPermAtProj_preserves_meta e targetLocal writerTag writeProj off len depth).1, ih]
+
+theorem invalidateConflictingBorrowsAtProj_root_depth_mem
+    {borrows : List BorrowEntry} (h0 : ∀ e ∈ borrows, e.targetFrameDepth = 0)
+    (targetLocal : Local) (writerTag : Option Nat)
+    (writeProj : List ProjectionElem) (off len depth : Nat) :
+    ∀ e' ∈ invalidateConflictingBorrowsAtProj borrows targetLocal writerTag writeProj off len depth,
+      e'.targetFrameDepth = 0 ∧
+      ∃ e ∈ borrows, e'.tag = e.tag ∧ e'.protector = e.protector ∧ e'.parentTag = e.parentTag := by
+  induction borrows with
+  | nil => intro _ h; cases h
+  | cons e rest ih =>
+    intro e' he'
+    simp only [invalidateConflictingBorrowsAtProj, List.mem_cons] at he'
+    rcases he' with rfl | hrest
+    · obtain ⟨ht, hp, hpar, hd⟩ :=
+        updateBorrowPermAtProj_preserves_meta e targetLocal writerTag writeProj off len depth
+      exact ⟨hd.trans (h0 e List.mem_cons_self), e, List.mem_cons_self, ht, hp, hpar⟩
+    · obtain ⟨hd, e₀, he₀, ht, hp, hpar⟩ :=
+        ih (fun x hx => h0 x (List.mem_cons_of_mem _ hx)) e' hrest
+      exact ⟨hd, e₀, List.mem_cons_of_mem _ he₀, ht, hp, hpar⟩
+
+theorem dropLocal_borrows_invariants
+    {borrows : List BorrowEntry} {activeProtectors : List Nat}
+    {nextProtector : Nat} {callStack : List SavedCallerFrame}
+    {bt : Option Miri.Interpreter.MachineHooks.BorrowState}
+    (hbfv : BorrowsFrameStackValid borrows activeProtectors callStack)
+    (htb : TreeBorrowsRel borrows activeProtectors (basedNormalTree borrows activeProtectors))
+    (hvalid : ActiveProtectorsValid borrows activeProtectors)
+    (hcid_bor : ∀ e ∈ borrows, ∀ cid, e.protector = some cid → cid < nextProtector)
+    (hbt : BorrowTrackerStackRel borrows activeProtectors callStack bt)
+    (localId : Local) :
+    let borrows' := invalidateConflictingBorrows borrows localId .none (length callStack)
+    (∀ pH pT, activeProtectors = pH :: pT →
+      hasProtectedWriteConflict borrows (pH :: pT) localId .none .nil 0 0 (length callStack) = false) ∧
+    TreeBorrowsRel borrows' activeProtectors (basedNormalTree borrows' activeProtectors) ∧
+    ActiveProtectorsValid borrows' activeProtectors ∧
+    (∀ e ∈ borrows', ∀ cid, e.protector = some cid → cid < nextProtector) ∧
+    BorrowTrackerStackRel borrows' activeProtectors callStack bt ∧
+    BorrowsFrameStackValid borrows' activeProtectors callStack := by
+  dsimp only []
+  cases callStack with
+  | nil =>
+    have hap : activeProtectors = [] := hbfv.root_protectors_nil rfl
+    subst hap
+    have hlen_nil : length ([] : List SavedCallerFrame) = 0 := rfl
+    rw [hlen_nil]
+    have hmem_inv := invalidateConflictingBorrows_root_depth_mem hbfv.root_depth localId .none 0
+    have hnodup' :
+        ((invalidateConflictingBorrows borrows localId .none 0).map BorrowEntry.tag).Nodup := by
+      rw [invalidateConflictingBorrows_map_tag]
+      exact htb.tags_unique
+    refine ⟨(fun _ _ h => nomatch h),
+      basedNormalTree_rel _ _ hnodup',
+      ActiveProtectorsValid.nil _,
+      (fun e' he' cid hp => by
+        obtain ⟨_, e, he, _, hprot_eq, _⟩ := hmem_inv e' he'
+        exact hcid_bor e he cid (hprot_eq ▸ hp)),
+      ?_,
+      ⟨(fun e' he' => (hmem_inv e' he').1), (fun _ => rfl), (fun _ h => nomatch h)⟩⟩
+    cases hbt with
+    | root _ _ hspec =>
+      refine .root _ _ fun tracker htr e' he' => ?_
+      obtain ⟨_, e, he, htag_eq, hprot_eq, _⟩ := hmem_inv e' he'
+      have hs := hspec tracker htr e he
+      rw [htag_eq]
+      have hp_eq : isBorrowProtected [] e' = isBorrowProtected [] e := by
+        unfold isBorrowProtected; rw [hprot_eq]
+      rw [hp_eq]
+      exact hs
+  | cons c₀ cs =>
+    have hlen_eq : length (c₀ :: cs) = length cs + 1 := rfl
+    rw [hlen_eq]
+    have hinv_eq := invalidateConflictingBorrows_succ_depth_eq hbfv.root_depth localId .none (length cs)
+    rw [hinv_eq]
+    exact ⟨fun pH pT _ =>
+        hasProtectedWriteConflict_succ_depth_eq_false hbfv.root_depth (pH :: pT) localId .none .nil 0 0 (length cs),
+      htb, hvalid, hcid_bor, hbt, hbfv⟩
+
+theorem dropLocalAtProj_borrows_invariants
+    {borrows : List BorrowEntry} {activeProtectors : List Nat}
+    {nextProtector : Nat} {callStack : List SavedCallerFrame}
+    {bt : Option Miri.Interpreter.MachineHooks.BorrowState}
+    (hbfv : BorrowsFrameStackValid borrows activeProtectors callStack)
+    (htb : TreeBorrowsRel borrows activeProtectors (basedNormalTree borrows activeProtectors))
+    (hvalid : ActiveProtectorsValid borrows activeProtectors)
+    (hcid_bor : ∀ e ∈ borrows, ∀ cid, e.protector = some cid → cid < nextProtector)
+    (hbt : BorrowTrackerStackRel borrows activeProtectors callStack bt)
+    (localId : Local) (writeProj : List ProjectionElem) :
+    let borrows' := invalidateConflictingBorrowsAtProj borrows localId .none writeProj 0 0 (length callStack)
+    (∀ pH pT, activeProtectors = pH :: pT →
+      hasProtectedWriteConflict borrows (pH :: pT) localId .none writeProj 0 0 (length callStack) = false) ∧
+    TreeBorrowsRel borrows' activeProtectors (basedNormalTree borrows' activeProtectors) ∧
+    ActiveProtectorsValid borrows' activeProtectors ∧
+    (∀ e ∈ borrows', ∀ cid, e.protector = some cid → cid < nextProtector) ∧
+    BorrowTrackerStackRel borrows' activeProtectors callStack bt ∧
+    BorrowsFrameStackValid borrows' activeProtectors callStack := by
+  dsimp only []
+  cases callStack with
+  | nil =>
+    have hap : activeProtectors = [] := hbfv.root_protectors_nil rfl
+    subst hap
+    have hlen_nil : length ([] : List SavedCallerFrame) = 0 := rfl
+    rw [hlen_nil]
+    have hmem_inv :=
+      invalidateConflictingBorrowsAtProj_root_depth_mem hbfv.root_depth localId .none writeProj 0 0 0
+    have hnodup' :
+        ((invalidateConflictingBorrowsAtProj borrows localId .none writeProj 0 0 0).map
+          BorrowEntry.tag).Nodup := by
+      rw [invalidateConflictingBorrowsAtProj_map_tag]
+      exact htb.tags_unique
+    refine ⟨(fun _ _ h => nomatch h),
+      basedNormalTree_rel _ _ hnodup',
+      ActiveProtectorsValid.nil _,
+      (fun e' he' cid hp => by
+        obtain ⟨_, e, he, _, hprot_eq, _⟩ := hmem_inv e' he'
+        exact hcid_bor e he cid (hprot_eq ▸ hp)),
+      ?_,
+      ⟨(fun e' he' => (hmem_inv e' he').1), (fun _ => rfl), (fun _ h => nomatch h)⟩⟩
+    cases hbt with
+    | root _ _ hspec =>
+      refine .root _ _ fun tracker htr e' he' => ?_
+      obtain ⟨_, e, he, htag_eq, hprot_eq, _⟩ := hmem_inv e' he'
+      have hs := hspec tracker htr e he
+      rw [htag_eq]
+      have hp_eq : isBorrowProtected [] e' = isBorrowProtected [] e := by
+        unfold isBorrowProtected; rw [hprot_eq]
+      rw [hp_eq]
+      exact hs
+  | cons c₀ cs =>
+    have hlen_eq : length (c₀ :: cs) = length cs + 1 := rfl
+    rw [hlen_eq]
+    have hinv_eq :=
+      invalidateConflictingBorrowsAtProj_succ_depth_eq hbfv.root_depth localId .none writeProj 0 0 (length cs)
+    rw [hinv_eq]
+    exact ⟨fun pH pT _ =>
+        hasProtectedWriteConflict_succ_depth_eq_false hbfv.root_depth (pH :: pT) localId .none writeProj 0 0 (length cs),
+      htb, hvalid, hcid_bor, hbt, hbfv⟩
+
 /-- Complete Stage-1 `writeReturnDestination` & invariant-preservation bundle on
 returning from `cf :: restStack` into an unprojected non-dead caller local
 `cf.destination = ⟨destIdx, .nil⟩` under `BorrowsFrameStackValid`. -/
@@ -2694,16 +2884,18 @@ def annealControlHooksLM4_1
   advances to `(target, 0)` via `ControlFlow.goToBlock target state` without
   deinitializing `localId`.
 
-Notes on Stage-1 `Trusted` vs. canonical `lean-miri`:
-* (`H3`) on an *unprojected* drop `place = ⟨localId, .nil⟩`, Stage-1 `Trusted`
+Notes on `Trusted` vs. canonical `lean-miri`:
+* (`H3`) on an *unprojected* drop `place = ⟨localId, .nil⟩`, `Trusted`
   deinitializes `localId` to `.uninit` whereas canonical `lean-miri` with
   `dropGlue = none` leaves `localId`'s value intact (certified in
   `canonical_drop_no_glue_preserves_local_divergence` and
   `step_terminator_drop_canonical_no_glue_step_divergence`);
-* on a *projected* drop of an uninitialized root local, Stage-1 `Trusted`
-  faults (`Terminators.lean:3066`: the root slot must be `.init`), whereas
-  canonical `lean-miri` (and this hook) only evaluates the place and jumps
-  (certified in `step_terminator_drop_projected_uninit_divergence`). -/
+* on a *projected* drop of an uninitialized root local, both `Trusted` and
+  canonical `lean-miri` (and this hook) evaluate the place tail and jump without
+  faulting (`step_terminator_drop_projected_simulation`), whereas on an
+  initialized 2-field aggregate `Trusted` deinitializes the dropped field to
+  `Value.uninit` while canonical no-glue `lean-miri` leaves `.scalarPair` intact
+  (certified in `step_terminator_drop_projected_init_no_glue_divergence`). -/
 def annealEvalDropLM4_1
     (place : Miri.MIR.Place)
     (target : Miri.MIR.BasicBlockId)

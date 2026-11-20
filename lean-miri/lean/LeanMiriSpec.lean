@@ -304,7 +304,7 @@ import LeanMiriSpec.Audit
   `ReifyFnPointer` simulations (`step_terminator_unreachable_ub_simulation`,
   `step_terminator_drop_noop_simulation`,
   `step_terminator_drop_projected_simulation`,
-  `step_terminator_drop_projected_uninit_divergence`,
+  `step_terminator_drop_projected_init_no_glue_divergence`,
   `canonical_drop_no_glue_preserves_local_divergence`,
   `step_terminator_drop_canonical_no_glue_step_divergence`,
   `step_terminator_return_root_simulation`,
@@ -378,8 +378,9 @@ import LeanMiriSpec.Audit
   `call_intrinsic_arithOffset_stage1_scalar_ptr_divergence`) and, over the
   pre-Stage-1 reference model only, `call_intrinsic_offset_simulation` (`LM-4.2`).
 * `LeanMiriSpec.Correspondence.WriteBytesLM4_2`: `write_bytes` simulation and
-  Tree Borrows divergence over the pre-Stage-1 reference model only (Stage-1 turns
-  `write_bytes` into an external call) (`LM-4.2`).
+  Tree Borrows divergence over the pre-Stage-1 reference model only (Stage-1
+  executes `write_bytes` with its own, more restrictive `evalWriteBytesCall`)
+  (`LM-4.2`).
 * `LeanMiriSpec.Correspondence.CopyLM4_2`: `NonDivergingIntrinsic.CopyNonOverlapping`
   Stage-1 bridge (`stepMirFn_copyNonOverlapping_stage1_eq_lm4_2`), Stage-1
   lockstep simulation (`step_intrinsic_copyNonOverlapping_stage1_simulation_explicit`,
@@ -444,9 +445,9 @@ import LeanMiriSpec.Audit
   `w5_unwind_root_panic_vs_ub_divergence`, `w5_indirect_fnPtr_call_returns`,
   `w5_panic_explicit_macro_extCall_boundary`), and
   intrinsics (`w6_copy_nonoverlapping_full_bytes_returns`,
-  `w6_copy_nonoverlapping_rawPtr_tyId80_boundary`, and the Stage-1 external-call
-  boundary of `write_bytes` and `rotate_left`: `w6_write_bytes_extCall_boundary`,
-  `w6_write_bytes_read_extCall_divergence`, `w6_write_bytes_oob_extCall_divergence`,
+  `w6_copy_nonoverlapping_rawPtr_tyId80_boundary`, the inline `write_bytes`
+  agreements `w6_write_bytes_inline_lockstep`, `w6_write_bytes_read_returns`, and
+  `w6_write_bytes_oob_ub`, and the Stage-1 external-call boundary of `rotate_left`,
   `w6_rotate_left_extCall_boundary`) (`LM-4.3`).
 * `LeanMiriSpec.Correspondence.WideSliceDstLM`: wide-slice DST correspondence
   (`*const [T]`, `*mut [T]`, `&[T]`, `&mut [T]`, `*const str`, `*mut str`, `&str`,

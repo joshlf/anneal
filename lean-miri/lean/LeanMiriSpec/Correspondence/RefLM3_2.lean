@@ -3681,7 +3681,8 @@ theorem validatePlace_enum_discriminant_simulation
     (fuel dFuel : Nat)
     {m : AnnealStepState}
     {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
-    (hframes : m.stack.frames = #[tf]) {idx : Nat} (hlt : idx < tf.locals.size) :
+    (hframes : m.stack.frames = #[tf]) {idx : Nat} (hlt : idx < tf.locals.size)
+    (hdiscr : tl.variantDiscriminants = .nil := by rfl) :
     let place : Miri.Interpreter.RuntimePlace AnnealProv :=
       ⟨.local 0 idx none tf.localsIdentity, translateTy enumTy layouts⟩
     ((tf.locals[idx]'hlt).value = .dead →
@@ -3835,7 +3836,7 @@ theorem validatePlace_enum_discriminant_simulation
     have hdec_un : decodeValueFromBytes (dFuel + 1) layouts enumTy [.uninit] = none := by
       unfold decodeValueFromBytes
       rw [hk, hlook]; dsimp only []
-      rw [hinh, hsz1, hvars, hfields]
+      rw [hinh, hsz1, hvars, hfields, hdiscr]
       rfl
     exact ⟨hvp.2 _ _ hvisit_err, hdec_un⟩
   · have hcan := hrel.canonical
@@ -3899,7 +3900,7 @@ theorem validatePlace_enum_discriminant_simulation
            | _ => none) := by
       unfold decodeValueFromBytes
       rw [hk, hlook]; dsimp only []
-      rw [hinh, hsz1, hvars, hfields]
+      rw [hinh, hsz1, hvars, hfields, hdiscr]
       rfl
     have hdiscr :
         Miri.Interpreter.Discriminant.readDiscriminant

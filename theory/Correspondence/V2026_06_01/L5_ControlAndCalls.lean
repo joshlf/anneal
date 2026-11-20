@@ -822,6 +822,7 @@ theorem mir_evalTerminator_return_root_and_caller
     (s : MachineState) (span : String) (currentBody : Option CapturedMir) :
     (∀ retVal : Value,
       get? s.frame.locals 0 = .some (.init retVal) →
+      valueContainsUninit retVal = false →
       s.memory.callStack = .nil →
       hasFrameDeallocProtectorConflict
           s.memory.borrows s.memory.activeProtectors 0 (length s.frame.locals) = false →
@@ -832,6 +833,7 @@ theorem mir_evalTerminator_return_root_and_caller
     (∀ (retVal : Value) (caller : SavedCallerFrame) (restStack : List SavedCallerFrame)
        (updatedCallerLocals : List LocalSlot) (mem' : Memory),
       get? s.frame.locals 0 = .some (.init retVal) →
+      valueContainsUninit retVal = false →
       s.memory.callStack = caller :: restStack →
       hasFrameDeallocProtectorConflict
           s.memory.borrows
@@ -883,23 +885,28 @@ theorem mir_evalTerminator_return_root_and_caller
           (length s.memory.callStack)
           (length s.frame.locals) = true →
       evalTerminator s ⟨.return_, span⟩ currentBody = MirStepNode.fail .ub) ∧
+    (∀ retVal : Value,
+      get? s.frame.locals 0 = .some (.init retVal) →
+      valueContainsUninit retVal = true →
+      evalTerminator s ⟨.return_, span⟩ currentBody = MirStepNode.fail .ub) ∧
     (get? s.frame.locals 0 = .some .uninit →
       evalTerminator s ⟨.return_, span⟩ currentBody = MirStepNode.fail .ub) ∧
     (get? s.frame.locals 0 = .some .dead →
       evalTerminator s ⟨.return_, span⟩ currentBody = MirStepNode.fail .ub) := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
-  · intro retVal hRet hStack hNoConflict
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro retVal hRet hInit hStack hNoConflict
     have hDepth : length s.memory.callStack = 0 := by
       rw [hStack]
       rfl
     simp only [evalTerminator, hRet, hDepth, hNoConflict]
     rw [hStack]
-  · intro retVal caller restStack updatedCallerLocals mem' hRet hStack hNoConflict hDiv hProt
+    simp only [hInit]
+  · intro retVal caller restStack updatedCallerLocals mem' hRet hInit hStack hNoConflict hDiv hProt
       hWrite
     refine ⟨?_, rfl⟩
     simp only [evalTerminator, hRet, hNoConflict]
     rw [hStack] at hWrite ⊢
-    simp only [hDiv, restoreCallerProtectors, hProt, hWrite]
+    simp only [hDiv, hInit, restoreCallerProtectors, hProt, hWrite]
   · intro retVal caller restStack hRet hStack hDiv
     simp only [evalTerminator, hRet]
     rw [hStack]
@@ -907,6 +914,16 @@ theorem mir_evalTerminator_return_root_and_caller
     split <;> rfl
   · intro retVal hRet hConflict
     simp only [evalTerminator, hRet, hConflict]
+  · intro retVal hRet hUninitVal
+    simp only [evalTerminator, hRet]
+    cases hConf : hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+        (length s.memory.callStack) (length s.frame.locals) with
+    | true => simp
+    | false =>
+      cases hStack : s.memory.callStack with
+      | nil => simp [hUninitVal]
+      | cons caller restStack =>
+        cases hDiv : caller.isDiverging <;> simp [hDiv, hUninitVal]
   · intro hUninit
     simp [evalTerminator, hUninit]
   · intro hDead
@@ -2517,9 +2534,10 @@ theorem mir_evalTerminator_ub_checks_intrinsic_corresponds
       evalNonSelectIntrinsicCall, writeIntrinsicReturn,
       writePlaceValue, get?, set?]
   · unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
-      readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
-      evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
+    cases hInit : valueContainsUninit argVal <;>
+      simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+        readProjectedValue, hInit, emptyMemory, get?, isDirectExactDivTarget,
+        evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
 
 /--
 **Theorem L5.20 (`mir_evalTerminator_const_eval_select_intrinsic_corresponds`)**:
@@ -2560,7 +2578,9 @@ theorem mir_evalTerminator_const_eval_select_intrinsic_corresponds
     (hPath0 : calleeBody0.defPath = "core::rt_callee_0")
     (hArgs0 : calleeBody0.argCount = 0)
     (hConv0 : calleeBody0.fnAbi.conv = .rust)
-    (hParams0 : calleeBody0.typeParamCount = 0 := by rfl) :
+    (hParams0 : calleeBody0.typeParamCount = 0 := by rfl)
+    (hv1 : valueContainsUninit v1 = false := by rfl)
+    (hv2 : valueContainsUninit v2 = false := by rfl) :
     let dest : Place := { local_ := 0, projection := .nil }
     let constFnOp : Operand :=
       .constant { ty := { kind := .fnDef "core::ct_callee" .nil, layoutIdx := 0 }, val := .zeroSized }
@@ -2680,7 +2700,8 @@ theorem mir_evalTerminator_const_eval_select_intrinsic_corresponds
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, rfl, rfl, rfl, rfl, rfl, rfl⟩
   · unfold evalTerminator mkIntrinsicCallTerm
     simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
-      readProjectedValue, evalConstValue, emptyMemory, get?, lookupCallee,
+      readProjectedValue, valueContainsUninit, valueListContainsUninit, hv1, hv2,
+      evalConstValue, emptyMemory, get?, lookupCallee,
       resolveCalleeBodyAndArgs?, findCallee?, checkCalleeTargetCompatible,
       hFindSel2, hFindSel0, isDirectExactDivTarget, evalDirectRustIntrinsic?,
       hKind, hEx, unpackConstEvalSelectArgs?, resolveConstEvalSelectTarget?,
@@ -2724,7 +2745,8 @@ theorem mir_evalTerminator_const_eval_select_intrinsic_corresponds
       hKind, hEx]
   · unfold evalTerminator mkIntrinsicCallTerm
     simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
-      readProjectedValue, evalConstValue, get?, lookupCallee,
+      readProjectedValue, valueContainsUninit, valueListContainsUninit, hv1, hv2,
+      evalConstValue, get?, lookupCallee,
       resolveCalleeBodyAndArgs?, findCallee?, checkCalleeTargetCompatible,
       hFindSel2, hFindSel0, isDirectExactDivTarget, evalDirectRustIntrinsic?,
       hKind, hEx, unpackConstEvalSelectArgs?, resolveConstEvalSelectTarget?,
@@ -4617,6 +4639,62 @@ theorem mir_evalTerminator_missing_pointee_ub_and_rhs_signedness_corresponds
 
 /-! ## DIFF-C: `copy_nonoverlapping` Over Uninitialized and Initialized Union Bytes -/
 
+mutual
+  private def valueBoolEq : Value → Value → Bool
+    | .unit, .unit => true
+    | .scalar a, .scalar b => a.bits == b.bits && a.sizeBytes == b.sizeBytes
+    | .ptr p1 s1, .ptr p2 s2 => p1.allocId == p2.allocId && p1.offsetBytes == p2.offsetBytes && s1 == s2
+    | .aggregate v1 fs1, .aggregate v2 fs2 => v1 == v2 && valueListBoolEq fs1 fs2
+    | .uninit, .uninit => true
+    | _, _ => false
+
+  private def valueListBoolEq : List Value → List Value → Bool
+    | [], [] => true
+    | x :: xs, y :: ys => valueBoolEq x y && valueListBoolEq xs ys
+    | _, _ => false
+end
+
+mutual
+  private theorem valueBoolEq_iff : ∀ (x y : Value), valueBoolEq x y = true ↔ x = y
+    | .unit, .unit => by simp [valueBoolEq]
+    | .scalar ⟨b1, s1⟩, .scalar ⟨b2, s2⟩ => by simp [valueBoolEq]
+    | .ptr ⟨a1, o1⟩ s1, .ptr ⟨a2, o2⟩ s2 => by simp [valueBoolEq]
+    | .aggregate v1 fs1, .aggregate v2 fs2 => by
+      simp [valueBoolEq, valueListBoolEq_iff fs1 fs2]
+    | .uninit, .uninit => by simp [valueBoolEq]
+    | .unit, .scalar _ | .unit, .ptr _ _ | .unit, .aggregate _ _ | .unit, .uninit
+    | .scalar _, .unit | .scalar _, .ptr _ _ | .scalar _, .aggregate _ _ | .scalar _, .uninit
+    | .ptr _ _, .unit | .ptr _ _, .scalar _ | .ptr _ _, .aggregate _ _ | .ptr _ _, .uninit
+    | .aggregate _ _, .unit | .aggregate _ _, .scalar _ | .aggregate _ _, .ptr _ _ | .aggregate _ _, .uninit
+    | .uninit, .unit | .uninit, .scalar _ | .uninit, .ptr _ _ | .uninit, .aggregate _ _ => by
+      simp [valueBoolEq]
+
+  private theorem valueListBoolEq_iff : ∀ (xs ys : List Value), valueListBoolEq xs ys = true ↔ xs = ys
+    | [], [] => by simp [valueListBoolEq]
+    | x :: xs, y :: ys => by simp [valueListBoolEq, valueBoolEq_iff x y, valueListBoolEq_iff xs ys]
+    | [], _ :: _ | _ :: _, [] => by simp [valueListBoolEq]
+end
+
+private def localSlotBoolEq : LocalSlot → LocalSlot → Bool
+  | .dead, .dead => true
+  | .uninit, .uninit => true
+  | .init x, .init y => valueBoolEq x y
+  | _, _ => false
+
+private theorem localSlotBoolEq_iff : ∀ (x y : LocalSlot), localSlotBoolEq x y = true ↔ x = y
+  | .dead, .dead | .uninit, .uninit => by simp [localSlotBoolEq]
+  | .init x, .init y => by simp [localSlotBoolEq, valueBoolEq_iff]
+  | .dead, .uninit | .dead, .init _ | .uninit, .dead | .uninit, .init _
+  | .init _, .dead | .init _, .uninit => by simp [localSlotBoolEq]
+
+local instance : DecidableEq Value := fun x y =>
+  if h : valueBoolEq x y = true then isTrue ((valueBoolEq_iff x y).mp h)
+  else isFalse (fun heq => h ((valueBoolEq_iff x y).mpr heq))
+
+local instance : DecidableEq LocalSlot := fun x y =>
+  if h : localSlotBoolEq x y = true then isTrue ((localSlotBoolEq_iff x y).mp h)
+  else isFalse (fun heq => h ((localSlotBoolEq_iff x y).mpr heq))
+
 section DiffCUnionCopyConfirmation
 
 open Trusted.Effect
@@ -4710,7 +4788,7 @@ theorem confirm_finding_0002_bb0_copy_nonoverlapping_resets_dst :
       (diffCStepN 27 diffCFinding0002Body
         (.running (initMachineState diffCFinding0002Body []))) =
       .some (0, 27, .some (.init (.aggregate 0 [.aggregate 0 []]))) := by
-  rfl
+  decide +kernel
 
 /-- Kernel confirmation (1b): exact reproduction of `finding_0002`
 (`pass_copy_nonoverlapping_uninit_bytes_to_uninit__b2_c8`) — execution steps
@@ -4720,7 +4798,7 @@ theorem confirm_finding_0002_ub_at_bb1_read :
     diffCProbeBounded 64 diffCFinding0002Body
       (.running (initMachineState diffCFinding0002Body [])) =
       .some (.some .ub, "src/lib.rs:1458:10: 1458:22", .none) := by
-  rfl
+  decide +kernel
 
 /-- MIR body where `src` (`_1: Uninit<[u8; 4]>`) is initialized to `[1, 2, 3, 4]`
 and copied via `(&raw const src.value) as *const u8` into uninitialized `dst`
@@ -4841,7 +4919,7 @@ theorem confirm_copy_nonoverlapping_init_union_bytes_to_uninit :
     diffCProbeBounded 32 diffCInitUnionToUninitBody
       (.running (initMachineState diffCInitUnionToUninitBody [])) =
       .some (.none, "none", .some (.scalar ⟨1, 1⟩)) := by
-  exact ⟨rfl, rfl⟩
+  exact ⟨by decide +kernel, by decide +kernel⟩
 
 /-- Kernel confirmation (2b): even when `dst`'s borrow carries a `.subslice 0 4 false`
 projection while `dst` holds uninitialized union state `Value.aggregate 0 [.aggregate 0 []]`,
@@ -5077,7 +5155,7 @@ theorem stmt_div_storage_revive_dangling_read_is_ub :
     diffCProbeBounded 16 stmtDivReviveReadBody
       (.running (initMachineState stmtDivReviveReadBody [])) =
       .some (.some .ub, "stmt5: _0 = copy (*_2)", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D2` implicit-deallocation regression: calling `StorageLive(_1)` on an
 already-allocated local `_1` (without an intervening `StorageDead(_1)`)
@@ -5104,7 +5182,7 @@ theorem stmt_div_storage_live_implicit_dealloc_dangling_read_is_ub :
     diffCProbeBounded 16 stmtDivReviveWithoutDeadBody
       (.running (initMachineState stmtDivReviveWithoutDeadBody [])) =
       .some (.some .ub, "_0 = copy (*_2)", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D2` read-after-revive regression through a two-phase mutable borrow, whose
 `.reserved` Tree Borrows tag survives the direct write `_1 = 20`:
@@ -5131,7 +5209,7 @@ theorem stmt_div_storage_revive_two_phase_read_is_ub :
     diffCProbeBounded 16 stmtDivReviveTwoPhaseReadBody
       (.running (initMachineState stmtDivReviveTwoPhaseReadBody [])) =
       .some (.some .ub, "_0 = copy *_2", .none) := by
-  rfl
+  decide +kernel
 
 /-- Captured global allocation with identifier `1` holding the `u64` value `42`.
 `anneal-rustc-capture` numbers captured global allocations from `1`, the same
@@ -5171,7 +5249,7 @@ theorem stmt_div_storage_dead_global_alias_read_is_ub :
     diffCProbeBounded 16 stmtDivDeadGlobalAliasReadBody
       (.running (initMachineState stmtDivDeadGlobalAliasReadBody [])) =
       .some (.some .ub, "_0 = copy *_2", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D14a-storage` tag/global aliasing body: reborrow through the dangling
 pointer, then read through the reborrow:
@@ -5201,7 +5279,7 @@ theorem stmt_div_storage_dead_global_alias_reborrow_is_ub :
     diffCProbeBounded 16 stmtDivDeadGlobalAliasReborrowBody
       (.running (initMachineState stmtDivDeadGlobalAliasReborrowBody [])) =
       .some (.some .ub, "_3 = &*_2", .none) := by
-  rfl
+  decide +kernel
 
 /-- Positive control for the aliasing regressions: a pointer to the captured
 global `stmtDivGlobal1` reads its `42` when no stack borrow shares its
@@ -5225,7 +5303,7 @@ theorem stmt_div_global_read_ok :
     diffCProbeBounded 16 stmtDivGlobalReadOkBody
       (.running (initMachineState stmtDivGlobalReadOkBody [])) =
       .some (.none, "none", .some (.scalar ⟨42, 8⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `D2` (`wit_lm3_1_anneal_storage_revive_divergence`): write and read through a
 raw pointer after its pointee's storage has ended and restarted:
@@ -5251,7 +5329,7 @@ theorem stmt_div_storage_revive_write_is_ub :
     diffCProbeBounded 16 stmtDivReviveBody
       (.running (initMachineState stmtDivReviveBody [])) =
       .some (.some .ub, "*_2 = 7", .none) := by
-  rfl
+  decide +kernel
 
 /-- Positive control for `D2`: a pointer freshly minted after `StorageLive(_1)`
 revives `_1` still reads and writes the new storage:
@@ -5279,7 +5357,7 @@ theorem stmt_div_storage_revive_fresh_pointer_ok :
     diffCProbeBounded 16 stmtDivReviveFreshBody
       (.running (initMachineState stmtDivReviveFreshBody [])) =
       .some (.none, "none", .some (.scalar ⟨7, 8⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `D14a-storage` (`evalRvalue_reborrow_dangling_divergence`): reborrow a shared
 reference through a raw pointer whose pointee was killed by `StorageDead`:
@@ -5306,7 +5384,7 @@ theorem stmt_div_storage_dead_reborrow_is_ub :
     diffCProbeBounded 16 stmtDivDanglingReborrowBody
       (.running (initMachineState stmtDivDanglingReborrowBody [])) =
       .some (.some .ub, "_3 = &*_2", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D9` (`step_placeMention_deref_uninit_divergence`): mention a dereference of
 an uninitialized raw-pointer local:
@@ -5326,7 +5404,7 @@ theorem stmt_div_placeMention_deref_uninit_is_ub :
     diffCProbeBounded 8 stmtDivPlaceMentionDerefUninitBody
       (.running (initMachineState stmtDivPlaceMentionDerefUninitBody [])) =
       .some (.some .ub, "PlaceMention(*_1)", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D9` index regression body: mention `_1[_2]` with an uninitialized index:
 ```text
@@ -5350,7 +5428,7 @@ theorem stmt_div_placeMention_index_uninit_is_ub :
     diffCProbeBounded 8 stmtDivPlaceMentionIndexUninitBody
       (.running (initMachineState stmtDivPlaceMentionIndexUninitBody [])) =
       .some (.some .ub, "PlaceMention(_1[_2])", .none) := by
-  rfl
+  decide +kernel
 
 /-- Positive control for `D9`: mentioning an uninitialized local without
 projections (`let _ = x;` on a live local) and mentioning an initialized index
@@ -5377,7 +5455,7 @@ theorem stmt_div_placeMention_defined_ok :
     diffCProbeBounded 16 stmtDivPlaceMentionOkBody
       (.running (initMachineState stmtDivPlaceMentionOkBody [])) =
       .some (.none, "none", .some (.scalar ⟨5, 8⟩)) := by
-  rfl
+  decide +kernel
 
 /-- Machine state at `StorageDead(_1)` in which `_1` is borrowed by a tag
 carrying function-entry protector `protId`, with active protectors `prots`. -/
@@ -5460,7 +5538,7 @@ theorem stmt_div_storage_dead_retag_is_ub :
     diffCProbeBounded 16 stmtDivDeadGlobalAliasRetagBody
       (.running (initMachineState stmtDivDeadGlobalAliasRetagBody [])) =
       .some (.some .ub, "Retag(_2)", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D2` `copy_nonoverlapping` source after `StorageDead` + `StorageLive`
 revival: copying 1 element out of the revived and re-initialized `_1` through
@@ -5496,7 +5574,7 @@ theorem stmt_div_storage_revive_copy_nonoverlapping_is_ub :
     diffCProbeBounded 20 stmtDivReviveCopySrcBody
       (.running (initMachineState stmtDivReviveCopySrcBody [])) =
       .some (.some .ub, "copy_nonoverlapping(src=_2, dst=_3, 1)", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D2` `copy_nonoverlapping` destination after `StorageDead` + `StorageLive`
 revival: copying 1 element into the revived `_1` through the raw pointer `_2`
@@ -5532,7 +5610,7 @@ theorem stmt_div_storage_revive_copy_nonoverlapping_dst_is_ub :
     diffCProbeBounded 20 stmtDivReviveCopyDstBody
       (.running (initMachineState stmtDivReviveCopyDstBody [])) =
       .some (.some .ub, "copy_nonoverlapping(src=_3, dst=_2, 1)", .none) := by
-  rfl
+  decide +kernel
 
 /-- Positive control for `D9` + `D2` (`rustc_middle/src/mir/syntax.rs`:
 "`let _ = *ptr;` is fine even if the pointer is dangling"): mentioning `*_2` via
@@ -5558,7 +5636,7 @@ theorem stmt_div_placeMention_deref_dangling_ok :
     diffCProbeBounded 16 stmtDivPlaceMentionDanglingPtrOkBody
       (.running (initMachineState stmtDivPlaceMentionDanglingPtrOkBody [])) =
       .some (.none, "none", .some (.scalar ⟨99, 8⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `D2` transitive child-reborrow revival regression: reborrowing a mutable
 reference `_3 = &mut *_2` (`parentTag = .some 1`, `targetLocal = 1`, initialized
@@ -5595,7 +5673,7 @@ theorem stmt_div_storage_revive_child_reborrow_read_is_ub :
     diffCProbeBounded 20 stmtDivReviveChildReborrowReadBody
       (.running (initMachineState stmtDivReviveChildReborrowReadBody [])) =
       .some (.some .ub, "_0 = copy *_3", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D2` pointer-offset (`BinOp.offset`) after `StorageDead` + `StorageLive`
 revival: offsetting the raw pointer `_2 = &raw mut _1` minted before
@@ -5633,7 +5711,7 @@ theorem stmt_div_storage_revive_ptr_offset_is_ub :
     diffCProbeBounded 16 stmtDivRevivePtrOffsetBody
       (.running (initMachineState stmtDivRevivePtrOffsetBody [])) =
       .some (.some .ub, "_3 = Offset(_2, 1)", .none) := by
-  rfl
+  decide +kernel
 
 /-- Two-variant enum `enum E { A(u64), B(u64) }` used by the `SetDiscriminant`
 regression body (`SetDiscriminant` is only well-formed on enums). -/
@@ -5673,7 +5751,7 @@ theorem stmt_div_storage_revive_set_discriminant_is_ub :
     diffCProbeBounded 16 stmtDivReviveSetDiscrBody
       (.running (initMachineState stmtDivReviveSetDiscrBody [])) =
       .some (.some .ub, "SetDiscriminant(*_2, 1)", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D9` compound deref-plus-uninitialized-index regression: mentioning
 `(*_2)[_3]` when the root pointer `_2 = &raw const _1` is initialized (so the
@@ -5705,7 +5783,7 @@ theorem stmt_div_placeMention_deref_index_uninit_is_ub :
     diffCProbeBounded 16 stmtDivPlaceMentionDerefIndexUninitBody
       (.running (initMachineState stmtDivPlaceMentionDerefIndexUninitBody [])) =
       .some (.some .ub, "PlaceMention((*_2)[_3])", .none) := by
-  rfl
+  decide +kernel
 
 end StatementDivergenceRegressions
 
@@ -5720,18 +5798,63 @@ section UninitAggregateFieldWrites
 
 open Trusted.Effect
 
+/-- `LayoutTable` for Section 7 (`UninitAggregateFieldWrites`) ADT/union regression bodies:
+`0 = u64`, `1 = u32`, `2 = union U { f0: u32, f1: u32 }`,
+`3 = union UPair { pair: (u32, u32), raw: u64 }`, `4 = struct S { a: u64, b: u64 }`,
+`5 = struct Outer { a: S, b: S }`, `6 = struct PairOfUnions { a: U, b: U }`,
+`7 = (u32, u32)`, `8 = &U / &mut U`. -/
+private def stmtDivAdtLayouts : LayoutTable :=
+  { pointerBits := 64,
+    isLittleEndian := true,
+    entries := [
+      { size := { bytes := 8 }, align := { bytes := 8 },
+        backendRepr := .scalar (.initialized (.int 64 false) { start := 0, end_ := 18446744073709551615 }),
+        fields := .primitive, variants := .single 0, isUninhabited := false },
+      { size := { bytes := 4 }, align := { bytes := 4 },
+        backendRepr := .scalar (.initialized (.int 32 false) { start := 0, end_ := 4294967295 }),
+        fields := .primitive, variants := .single 0, isUninhabited := false },
+      { size := { bytes := 8 }, align := { bytes := 4 },
+        backendRepr := .memory, fields := .union 2, variants := .single 0,
+        isUninhabited := false },
+      { size := { bytes := 8 }, align := { bytes := 8 },
+        backendRepr := .memory, fields := .union 2, variants := .single 0,
+        isUninhabited := false },
+      { size := { bytes := 16 }, align := { bytes := 8 },
+        backendRepr := .memory, fields := .arbitrary [{ bytes := 0 }, { bytes := 8 }] [0, 1],
+        variants := .single 0, isUninhabited := false, fieldLayouts := [0, 0] },
+      { size := { bytes := 32 }, align := { bytes := 8 },
+        backendRepr := .memory, fields := .arbitrary [{ bytes := 0 }, { bytes := 16 }] [0, 1],
+        variants := .single 0, isUninhabited := false, fieldLayouts := [4, 4] },
+      { size := { bytes := 16 }, align := { bytes := 4 },
+        backendRepr := .memory, fields := .arbitrary [{ bytes := 0 }, { bytes := 8 }] [0, 1],
+        variants := .single 0, isUninhabited := false, fieldLayouts := [2, 2] },
+      { size := { bytes := 8 }, align := { bytes := 4 },
+        backendRepr := .memory, fields := .arbitrary [{ bytes := 0 }, { bytes := 4 }] [0, 1],
+        variants := .single 0, isUninhabited := false },
+      { size := { bytes := 8 }, align := { bytes := 8 },
+        backendRepr := .scalar (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 }),
+        fields := .primitive, variants := .single 0, isUninhabited := false }
+    ] }
+
+private def stmtDivAdtBody (name : String) (decls : List LocalDecl)
+    (stmts : List Statement) : CapturedMir :=
+  { stmtDivBody name decls stmts with layouts := stmtDivAdtLayouts }
+
 /-- `u32` local type used by the union field regression body. -/
-private def stmtDivU32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+private def stmtDivU32Ty : Ty := { kind := .uint .u32, layoutIdx := 1 }
 
 /-- `u32` constant operand. -/
 private def stmtDivConstU32 (n : Nat) : Operand :=
   .constant ⟨stmtDivU32Ty, .scalar (.int ⟨n, 4⟩)⟩
 
 /-- `union U { f0: u32, f1: u32 }`. -/
-private def stmtDivUnionTy : Ty := { kind := .adt "stmt_div::U" [], layoutIdx := 0 }
+private def stmtDivUnionTy : Ty := { kind := .adt "stmt_div::U" [], layoutIdx := 2 }
+
+/-- `union UPair { pair: (u32, u32), raw: u64 }`. -/
+private def stmtDivUnionPairTy : Ty := { kind := .adt "stmt_div::UPair" [], layoutIdx := 3 }
 
 /-- `struct S { a: u64, b: u64 }`. -/
-private def stmtDivStructTy : Ty := { kind := .adt "stmt_div::S" [], layoutIdx := 0 }
+private def stmtDivStructTy : Ty := { kind := .adt "stmt_div::S" [], layoutIdx := 4 }
 
 /-- `(u64, u64)`. -/
 private def stmtDivPairTy : Ty := { kind := .tuple [.uint .u64, .uint .u64], layoutIdx := 0 }
@@ -5742,7 +5865,7 @@ of an uninitialized union local and read it back:
 StorageLive(_1); _1.f0 = const 42_u32; _0 = copy (_1.f0); return
 ``` -/
 private def stmtDivUnionFieldInitBody : CapturedMir :=
-  stmtDivBody "stmt_div::union_field_write_into_uninit"
+  stmtDivAdtBody "stmt_div::union_field_write_into_uninit"
     [stmtDivDecl stmtDivU32Ty, stmtDivDecl stmtDivUnionTy]
     [ { kind := .storageLive 1, span := "live _1" },
       { kind := .assign ⟨1, [.field 0 stmtDivU32Ty]⟩ (.use (stmtDivConstU32 42)),
@@ -5756,7 +5879,7 @@ theorem stmt_div_assign_uninit_union_field_ok :
     diffCProbeBounded 16 stmtDivUnionFieldInitBody
       (.running (initMachineState stmtDivUnionFieldInitBody [])) =
       .some (.none, "none", .some (.scalar ⟨42, 4⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `D13b` struct variant: initialize both fields of an uninitialized struct
 local out of declaration order and read the first one back:
@@ -5764,7 +5887,7 @@ local out of declaration order and read the first one back:
 StorageLive(_1); _1.b = const 7_u64; _1.a = const 5_u64; _0 = copy (_1.a); return
 ``` -/
 private def stmtDivStructFieldInitBody : CapturedMir :=
-  stmtDivBody "stmt_div::struct_fields_written_out_of_order_into_uninit"
+  stmtDivAdtBody "stmt_div::struct_fields_written_out_of_order_into_uninit"
     [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivStructTy]
     [ { kind := .storageLive 1, span := "live _1" },
       { kind := .assign ⟨1, [.field 1 stmtDivU64Ty]⟩ (.use (stmtDivConstU64 7)),
@@ -5780,7 +5903,7 @@ theorem stmt_div_assign_uninit_struct_fields_ok :
     diffCProbeBounded 16 stmtDivStructFieldInitBody
       (.running (initMachineState stmtDivStructFieldInitBody [])) =
       .some (.none, "none", .some (.scalar ⟨5, 8⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `D13b` tuple variant: initialize both fields of an uninitialized pair local
 and read the second one back:
@@ -5804,15 +5927,15 @@ theorem stmt_div_assign_uninit_tuple_fields_ok :
     diffCProbeBounded 16 stmtDivPairFieldInitBody
       (.running (initMachineState stmtDivPairFieldInitBody [])) =
       .some (.none, "none", .some (.scalar ⟨4, 8⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `struct Outer { a: S, b: S }` with two nested struct fields. -/
 private def stmtDivOuterStructTy : Ty :=
-  { kind := .adt "stmt_div::Outer" [], layoutIdx := 0 }
+  { kind := .adt "stmt_div::Outer" [], layoutIdx := 5 }
 
 /-- `(u32, u32)` pair type used inside a union field. -/
 private def stmtDivU32PairTy : Ty :=
-  { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 0 }
+  { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 7 }
 
 /-- `D13b` nested aggregate regression (reverse field order): initialize all
 four leaf fields of an uninitialized `Outer { a: S, b: S }` local in reverse
@@ -5827,7 +5950,7 @@ Without `ensureNestedFieldShells`, `_1.b.b = 40` faulted with `.ub` against the
 flat shell `.aggregate 0 []`, and `_1.a.b = 20` faulted against the `.unit`
 padding left at field `0` by `setOrExtendFields`. -/
 private def stmtDivNestedStructRevInitBody : CapturedMir :=
-  stmtDivBody "stmt_div::nested_struct_fields_reverse_order_into_uninit"
+  stmtDivAdtBody "stmt_div::nested_struct_fields_reverse_order_into_uninit"
     [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivOuterStructTy]
     [ { kind := .storageLive 1, span := "live _1" },
       { kind := .assign ⟨1, [.field 1 stmtDivStructTy, .field 1 stmtDivU64Ty]⟩
@@ -5850,7 +5973,7 @@ theorem stmt_div_assign_uninit_nested_struct_rev_ok :
     diffCProbeBounded 16 stmtDivNestedStructRevInitBody
       (.running (initMachineState stmtDivNestedStructRevInitBody [])) =
       .some (.none, "none", .some (.scalar ⟨10, 8⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `D13b` nested aggregate regression (forward field order): initialize all
 four leaf fields of an uninitialized `Outer { a: S, b: S }` local in declaration
@@ -5865,7 +5988,7 @@ Without `ensureNestedFieldShells`, `(_1.a).a = 10` collapsed `.field 0` onto
 `.unit` in `writeProjectedValue` (storing a bare scalar `10` at `_1.a`), causing
 the second statement `(_1.a).b = 20` to fault with `.ub`. -/
 private def stmtDivNestedStructFwdInitBody : CapturedMir :=
-  stmtDivBody "stmt_div::nested_struct_fields_forward_order_into_uninit"
+  stmtDivAdtBody "stmt_div::nested_struct_fields_forward_order_into_uninit"
     [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivOuterStructTy]
     [ { kind := .storageLive 1, span := "live _1" },
       { kind := .assign ⟨1, [.field 0 stmtDivStructTy, .field 0 stmtDivU64Ty]⟩
@@ -5888,7 +6011,7 @@ theorem stmt_div_assign_uninit_nested_struct_fwd_ok :
     diffCProbeBounded 16 stmtDivNestedStructFwdInitBody
       (.running (initMachineState stmtDivNestedStructFwdInitBody [])) =
       .some (.none, "none", .some (.scalar ⟨40, 8⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `D13b` union with nested tuple field (`union U { pair: (u32, u32), raw: u64 }`):
 initialize both elements of `_1.pair` on an uninitialized union local and read
@@ -5898,8 +6021,8 @@ StorageLive(_1); (_1.pair).1 = const 99_u32; (_1.pair).0 = const 77_u32;
 _0 = copy ((_1.pair).1); return
 ``` -/
 private def stmtDivUnionNestedPairInitBody : CapturedMir :=
-  stmtDivBody "stmt_div::union_nested_pair_field_write_into_uninit"
-    [stmtDivDecl stmtDivU32Ty, stmtDivDecl stmtDivUnionTy]
+  stmtDivAdtBody "stmt_div::union_nested_pair_field_write_into_uninit"
+    [stmtDivDecl stmtDivU32Ty, stmtDivDecl stmtDivUnionPairTy]
     [ { kind := .storageLive 1, span := "live _1" },
       { kind := .assign ⟨1, [.field 0 stmtDivU32PairTy, .field 1 stmtDivU32Ty]⟩
           (.use (stmtDivConstU32 99)),
@@ -5915,12 +6038,12 @@ theorem stmt_div_assign_uninit_union_nested_pair_ok :
     diffCProbeBounded 16 stmtDivUnionNestedPairInitBody
       (.running (initMachineState stmtDivUnionNestedPairInitBody [])) =
       .some (.none, "none", .some (.scalar ⟨99, 4⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `D13b` nested aggregate regression with transparent `.opaqueCast` and
 `.unwrapUnsafeBinder` wrappers: initialize `(_1.b as S).b = 40` on an
 uninitialized `Outer { a: S, b: S }` local and then initialize
-`(unwrap_unsafe_binder(_1.a)).b = 20` into the `.unit`-padded sibling slot at
+`(unwrap_unsafe_binder(_1.a)).b = 20` into the `.uninit`-padded sibling slot at
 `_1.a`, reading `(_1.a).b` back:
 ```text
 StorageLive(_1);
@@ -5933,7 +6056,7 @@ Without stripping transparent projections in `ensureNestedFieldShells` and
 intermediate `.opaqueCast` / `.unwrapUnsafeBinder` hid the trailing `.field`
 projection. -/
 private def stmtDivNestedOpaqueCastInitBody : CapturedMir :=
-  stmtDivBody "stmt_div::nested_struct_fields_with_transparent_projections"
+  stmtDivAdtBody "stmt_div::nested_struct_fields_with_transparent_projections"
     [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivOuterStructTy]
     [ { kind := .storageLive 1, span := "live _1" },
       { kind := .assign ⟨1, [.field 1 stmtDivStructTy, .opaqueCast stmtDivStructTy, .field 1 stmtDivU64Ty]⟩
@@ -5950,7 +6073,7 @@ theorem stmt_div_assign_uninit_nested_opaque_cast_field_ok :
     diffCProbeBounded 16 stmtDivNestedOpaqueCastInitBody
       (.running (initMachineState stmtDivNestedOpaqueCastInitBody [])) =
       .some (.none, "none", .some (.scalar ⟨20, 8⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `((u64, u64), u64)` nested tuple type. -/
 private def stmtDivNestedTupleTy : Ty :=
@@ -5984,20 +6107,20 @@ theorem stmt_div_assign_uninit_nested_tuple_fields_ok :
     diffCProbeBounded 16 stmtDivNestedTupleInitBody
       (.running (initMachineState stmtDivNestedTupleInitBody [])) =
       .some (.none, "none", .some (.scalar ⟨66, 8⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `&U` shared reference type to `union U`. -/
 private def stmtDivRefUnionTy : Ty :=
-  { kind := .ref .not (.adt "stmt_div::U" []), layoutIdx := 0 }
+  { kind := .ref .not (.adt "stmt_div::U" []), layoutIdx := 8 }
 
 /-- `&mut U` mutable reference type to `union U`. -/
 private def stmtDivRefMutUnionTy : Ty :=
-  { kind := .ref .mut (.adt "stmt_div::U" []), layoutIdx := 0 }
+  { kind := .ref .mut (.adt "stmt_div::U" []), layoutIdx := 8 }
 
 /-- `struct PairOfUnions { a: U, b: U }` containing two union fields (valid
 while uninitialized in Rust, Miri, and MiniRust). -/
 private def stmtDivPairOfUnionsTy : Ty :=
-  { kind := .adt "stmt_div::PairOfUnions" [], layoutIdx := 0 }
+  { kind := .adt "stmt_div::PairOfUnions" [], layoutIdx := 6 }
 
 /-- `D13b` Tree Borrows invalidation regression on an uninitialized union field
 write: taking a shared reference `_2 = &_1` to an uninitialized `Freeze` union
@@ -6013,7 +6136,7 @@ StorageLive(_1); StorageLive(_2); _2 = &_1; _1.f0 = const 42_u32;
 _0 = copy ((*_2).f0); return
 ``` -/
 private def stmtDivUninitUnionInvalidatesSharedRefBody : CapturedMir :=
-  stmtDivBody "stmt_div::uninit_union_field_write_invalidates_shared_ref"
+  stmtDivAdtBody "stmt_div::uninit_union_field_write_invalidates_shared_ref"
     [stmtDivDecl stmtDivU32Ty, stmtDivDecl stmtDivUnionTy, stmtDivDecl stmtDivRefUnionTy]
     [ { kind := .storageLive 1, span := "live _1" },
       { kind := .storageLive 2, span := "live _2" },
@@ -6028,7 +6151,7 @@ theorem stmt_div_assign_uninit_union_field_invalidates_shared_ref_ub :
     diffCProbeBounded 16 stmtDivUninitUnionInvalidatesSharedRefBody
       (.running (initMachineState stmtDivUninitUnionInvalidatesSharedRefBody [])) =
       .some (.some .ub, "_0 = copy (*_2).f0", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D13b` projection-aware borrow preservation on an uninitialized sibling
 field write: taking `_2 = &mut (_1.a)` on an uninitialized
@@ -6045,7 +6168,7 @@ _3.f0 = const 10_u32; _2 = &mut (_1.a); (_1.b).f0 = const 20_u32;
 (*_2) = move _3; _0 = copy ((_1.a).f0); return
 ``` -/
 private def stmtDivUninitSiblingPreservesMutRefBody : CapturedMir :=
-  stmtDivBody "stmt_div::uninit_sibling_union_field_write_preserves_mut_ref"
+  stmtDivAdtBody "stmt_div::uninit_sibling_union_field_write_preserves_mut_ref"
     [stmtDivDecl stmtDivU32Ty, stmtDivDecl stmtDivPairOfUnionsTy,
       stmtDivDecl stmtDivRefMutUnionTy, stmtDivDecl stmtDivUnionTy]
     [ { kind := .storageLive 1, span := "live _1" },
@@ -6068,7 +6191,7 @@ theorem stmt_div_assign_uninit_sibling_union_field_preserves_mut_ref_ok :
     diffCProbeBounded 16 stmtDivUninitSiblingPreservesMutRefBody
       (.running (initMachineState stmtDivUninitSiblingPreservesMutRefBody [])) =
       .some (.none, "none", .some (.scalar ⟨10, 4⟩)) := by
-  rfl
+  decide +kernel
 
 /-- `D13b` overlapping-field complement of
 `stmt_div_assign_uninit_sibling_union_field_preserves_mut_ref_ok`: the same body
@@ -6088,7 +6211,7 @@ _3.f0 = const 10_u32; _2 = &mut (_1.a); (_1.a).f0 = const 20_u32;
 (*_2) = move _3; _0 = copy ((_1.a).f0); return
 ``` -/
 private def stmtDivUninitOverlapDisablesMutRefBody : CapturedMir :=
-  stmtDivBody "stmt_div::uninit_overlapping_union_field_write_disables_mut_ref"
+  stmtDivAdtBody "stmt_div::uninit_overlapping_union_field_write_disables_mut_ref"
     [stmtDivDecl stmtDivU32Ty, stmtDivDecl stmtDivPairOfUnionsTy,
       stmtDivDecl stmtDivRefMutUnionTy, stmtDivDecl stmtDivUnionTy]
     [ { kind := .storageLive 1, span := "live _1" },
@@ -6111,20 +6234,18 @@ theorem stmt_div_assign_uninit_overlapping_nested_field_write_disables_mut_ref_u
     diffCProbeBounded 16 stmtDivUninitOverlapDisablesMutRefBody
       (.running (initMachineState stmtDivUninitOverlapDisablesMutRefBody [])) =
       .some (.some .ub, "(*_2) = move _3", .none) := by
-  rfl
+  decide +kernel
 
-/-- Known `D13b` limitation, pinned so that a future fix is noticed: after an
-out-of-order write that initializes only field `b` of an uninitialized struct
-local, reading the never-written field `a` returns the `.unit` padding that
-`setOrExtendFields` (`Places.lean`) inserted below `b`, instead of faulting as
-MiniRust and Miri do for a read of uninitialized memory. Closing this gap needs
-an uninitialized-field representation in `Value` (or a typed-copy validity
-check), both outside the `Statements.lean` scope:
+/-- Closed `D13b` unwritten-lower-field soundness witness: after an out-of-order
+write that initializes only field `b` of an uninitialized struct local,
+`uninitContainerFieldShell?` (`Places.lean`) populates field `a` below `b` with
+`Value.uninit`, so reading the never-written field `a` faults with `.ub` just as
+MiniRust and Miri do for a read of uninitialized memory:
 ```text
 StorageLive(_1); _1.b = const 7_u64; _0 = copy (_1.a); return
 ``` -/
 private def stmtDivUnwrittenLowerFieldBody : CapturedMir :=
-  stmtDivBody "stmt_div::struct_read_of_unwritten_lower_field"
+  stmtDivAdtBody "stmt_div::struct_read_of_unwritten_lower_field"
     [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivStructTy]
     [ { kind := .storageLive 1, span := "live _1" },
       { kind := .assign ⟨1, [.field 1 stmtDivU64Ty]⟩ (.use (stmtDivConstU64 7)),
@@ -6132,12 +6253,12 @@ private def stmtDivUnwrittenLowerFieldBody : CapturedMir :=
       { kind := .assign ⟨0, []⟩ (.use (.copy ⟨1, [.field 0 stmtDivU64Ty]⟩)),
         span := "_0 = copy _1.a" } ]
 
-/-- Known `D13b` limitation witness: the body returns the `.unit` padding. -/
+/-- Closed `D13b` witness: reading unwritten field `a` faults with `.ub`. -/
 theorem stmt_div_known_limitation_unwritten_lower_field_reads_unit :
     diffCProbeBounded 16 stmtDivUnwrittenLowerFieldBody
       (.running (initMachineState stmtDivUnwrittenLowerFieldBody [])) =
-      .some (.none, "none", .some .unit) := by
-  rfl
+      .some (.some .ub, "_0 = copy _1.a", .none) := by
+  decide +kernel
 
 /-- `D13b` array-field scope-boundary witness
 (`evalStmt_assign_uninit_array_field_elem_ub`): writing element `_2` of the
@@ -6152,7 +6273,7 @@ array would fill the unwritten element `(_1.arr)[1]` with a `.unit` placeholder
 that a later `copy (_1.arr)[1]` would return instead of faulting on the
 uninitialized element. -/
 private def stmtDivUnionArrayFieldElemBody : CapturedMir :=
-  stmtDivBody "stmt_div::union_array_field_elem_write_into_uninit_is_ub"
+  stmtDivAdtBody "stmt_div::union_array_field_elem_write_into_uninit_is_ub"
     [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivUnionTy, stmtDivDecl stmtDivUsizeTy]
     [ { kind := .storageLive 1, span := "live _1" },
       { kind := .storageLive 2, span := "live _2" },
@@ -6168,7 +6289,7 @@ theorem stmt_div_assign_uninit_array_field_elem_is_ub :
     diffCProbeBounded 16 stmtDivUnionArrayFieldElemBody
       (.running (initMachineState stmtDivUnionArrayFieldElemBody [])) =
       .some (.some .ub, "(_1.arr)[_2] = 11", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D13b` scope-boundary witness (`evalStmt_assign_uninit_non_aggregate_ub`):
 writing an array element `_1[_2] = const 10_u64` into an uninitialized array
@@ -6197,7 +6318,7 @@ theorem stmt_div_assign_uninit_array_index_is_ub :
     diffCProbeBounded 16 stmtDivUninitArrayIndexWriteBody
       (.running (initMachineState stmtDivUninitArrayIndexWriteBody [])) =
       .some (.some .ub, "_1[_2] = 10", .none) := by
-  rfl
+  decide +kernel
 
 /-- `D13b` scope-boundary witness (`evalStmt_assign_uninit_non_aggregate_ub`):
 writing an enum variant field `((_1 as Variant#0).0) = const 10_u64` into an
@@ -6222,50 +6343,48 @@ theorem stmt_div_assign_uninit_downcast_is_ub :
     diffCProbeBounded 16 stmtDivUninitDowncastWriteBody
       (.running (initMachineState stmtDivUninitDowncastWriteBody [])) =
       .some (.some .ub, "((_1 as A).0) = 10", .none) := by
-  rfl
+  decide +kernel
 
 /-- **Theorem L5.24 (`mir_uninit_aggregate_field_write_characterizations`)**:
-Consolidates the `Statements.lean` universal characterizations for `D13b`
+Consolidates the `Statements.lean` universal characterizations for `D13b` / `F1`
 (`ensureNestedFieldShells`, `fieldShellChainPopulated`, `uninitFieldWriteShell?`,
 and `evalStmt` on projected writes into live uninitialized and initialized locals):
-1. `ensureNestedFieldShells` is the identity on any single-element projection
-   list (`ensureNestedFieldShells_singleton`) and on any root whose intermediate
-   field slots along the written chain are populated
+1. `ensureNestedFieldShells` returns `.some` unchanged on any single-element
+   projection list (`ensureNestedFieldShells_singleton`) and on any root whose
+   intermediate field slots along the written chain are populated
    (`ensureNestedFieldShells_eq_self_of_populated`,
-   `writeProjectedValue_ensureNestedFieldShells_of_populated`,
-   `evalStmt_assign_init_projected_step`), while materializing inner aggregate
-   shells when writing into an unpopulated (`.none` or `.some .unit`) outer
-   field slot of an already-initialized aggregate
-   (`evalStmt_assign_init_unpopulated_nested_field_ok`).
-2. `uninitFieldWriteShell?` returns `.some (.aggregate 0 .nil)` for single-level
-   field projections on `.adt` and `.tuple` locals (`uninitFieldWriteShell?_field_adt`,
-   `uninitFieldWriteShell?_field_tuple`) and `.none` for non-field projection
-   heads or non-aggregate root types (`uninitFieldWriteShell?_eq_none_of_not_field`,
+   `evalStmt_assign_init_projected_step`).
+2. `uninitFieldWriteShell?` returns `.some (.aggregate 0 .nil)` for in-bounds
+   union fields (`uninitFieldWriteShell?_field_union`), arity-padded
+   `Value.uninit` shells `.some (.aggregate 0 (replicateValue arity .uninit))` for
+   in-bounds struct and tuple fields (`uninitFieldWriteShell?_field_struct`,
+   `uninitFieldWriteShell?_field_tuple`), and `.none` for non-field projection
+   heads, non-aggregate root types, or out-of-bounds/unresolved roots
+   (`uninitFieldWriteShell?_eq_none_of_not_field`,
    `uninitFieldWriteShell?_eq_none_of_non_aggregate_ty`,
-   `uninitFieldWriteShell?_eq_none_iff`).
+   `uninitFieldWriteShell?_eq_none_of_nil`).
 3. `evalStmt` initializes `.uninit` struct, union, tuple, and nested aggregate
-   locals when `writeProjectedValue` succeeds and no active protector conflicts
+   locals with arity-padded `Value.uninit` sibling slots when `writeProjectedForLocal`
+   succeeds and no active protector conflicts
    (`evalStmt_assign_uninit_aggregate_field_step`,
-   `evalStmt_assign_uninit_union_field_ok`,
+   `evalStmt_assign_uninit_struct_field_ok`,
    `evalStmt_assign_uninit_tuple_field_ok`,
-   `evalStmt_assign_uninit_nested_field_ok`), and faults with
-   `MirStepNode.fail .ub` when a protected borrow conflicts
+   `evalStmt_assign_uninit_nested_field_ok`,
+   `evalStmt_assign_uninit_pair_partial_vs_full_copy`,
+   `evalStmt_assign_uninit_nested_pair_partial_vs_full_copy`), invalidates
+   conflicting borrows and faults on active protectors during `Deinit`
+   (`evalStmt_deinit_projected_borrow_invalidation_and_protector_ub`), and faults
+   with `MirStepNode.fail .ub` when a protected borrow conflicts
    (`evalStmt_assign_uninit_aggregate_field_protected_conflict_ub`), when the
    write goes through a never-written array field or non-field sub-projection
    (`evalStmt_assign_uninit_array_field_elem_ub`,
    `evalStmt_assign_uninit_field_non_field_subproj_ub`), or when no aggregate
-   shell applies (`evalStmt_assign_uninit_non_aggregate_ub`).
-Direct writes to a local of the active frame check protector conflicts against,
-and invalidate, only the borrows of that frame-qualified local, i.e. at depth
-`length mem₁.callStack` (the trailing `0 0 (length mem₁.callStack)` arguments of
-`hasProtectedWriteConflict` / `invalidateConflictingBorrowsAtProj`). -/
+   shell applies (`evalStmt_assign_uninit_non_aggregate_ub`). -/
 theorem mir_uninit_aggregate_field_write_characterizations
     (s : MachineState)
     (dstLoc idxLocal : Local)
-    (variantIdx : VariantIdx)
-    (fields : List Value)
     (fieldIdx innerIdx : FieldIdx)
-    (outerTy fieldTy : Ty)
+    (rootTy outerTy fieldTy : Ty)
     (elemKind : RigidTy)
     (count arrLayoutIdx : Nat)
     (proj nextProj : ProjectionElem)
@@ -6275,7 +6394,10 @@ theorem mir_uninit_aggregate_field_write_characterizations
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
     (defPath : DefPath)
-    (args tupleFields : List RigidTy)
+    (args tupleFields innerFields : List RigidTy)
+    (l : TypeLayout)
+    (offsets : List Trusted.Rustc.V2026_06_01.Layout.Size)
+    (memOrder : List Nat)
     (layoutIdx : Nat)
     (val rootVal : Value)
     (locals₁ : List LocalSlot)
@@ -6284,13 +6406,10 @@ theorem mir_uninit_aggregate_field_write_characterizations
     (locals₂ : List LocalSlot)
     (protHead : Nat)
     (protTail : List Nat) :
-    ensureNestedFieldShells val [proj] = val ∧
+    ensureNestedFieldShells val [proj] localDecls layouts (.some rootTy) = .some val ∧
     (fieldShellChainPopulated rootVal (proj :: rest) = true →
-      ensureNestedFieldShells rootVal (proj :: rest) = rootVal) ∧
-    (fieldShellChainPopulated rootVal (proj :: rest) = true →
-      writeProjectedValue locals₁ (ensureNestedFieldShells rootVal (proj :: rest))
-        (proj :: rest) val =
-        writeProjectedValue locals₁ rootVal (proj :: rest) val) ∧
+      ensureNestedFieldShells rootVal (proj :: rest) localDecls layouts (.some rootTy) =
+        .some rootVal) ∧
     (proj ≠ .deref →
       evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
       get? locals₁ dstLoc = .some (.init rootVal) →
@@ -6311,37 +6430,29 @@ theorem mir_uninit_aggregate_field_write_characterizations
                 invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
                   (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
                     (proj :: rest)) 0 0 (length mem₁.callStack) })) ∧
-    (let projs : List ProjectionElem := [.field fieldIdx outerTy, .field innerIdx fieldTy];
-      evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
-      get? locals₁ dstLoc = .some (.init (.aggregate variantIdx fields)) →
-      ((∃ innerDefPath innerArgs, outerTy.kind = .adt innerDefPath innerArgs) ∨
-       (∃ innerFields, outerTy.kind = .tuple innerFields)) →
-      (get? fields fieldIdx = .none ∨ get? fields fieldIdx = .some .unit) →
-      set? locals₁ dstLoc
-        (.init
-          (.aggregate variantIdx
-            (setOrExtendFields fields fieldIdx
-              (.aggregate 0 (setOrExtendFields .nil innerIdx val))))) =
-        .some locals₂ →
-      mem₁.activeProtectors = .nil →
-      placeTouchesUnion localDecls layouts { local_ := dstLoc, projection := projs } = false →
-      evalStmt s ⟨.assign ⟨dstLoc, projs⟩ rv, span⟩ localDecls layouts =
-        MirStepNode.step
-          (advanceStmt s locals₂
-            { mem₁ with
-              borrows :=
-                invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
-                  (match resolveBorrowProjectionElems locals₁ projs with
-                   | .some rp => rp
-                   | .none => projs) 0 0 (length mem₁.callStack) })) ∧
-    (placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
-        .some { kind := .adt defPath args, layoutIdx := layoutIdx } →
+    (placeTy localDecls layouts { local_ := dstLoc, projection := .nil } = .some rootTy →
+      (resolveTyWithLocalDecls localDecls layouts rootTy).kind = .adt defPath args →
+      LayoutTable.lookup layouts
+        (resolveTyWithLocalDecls localDecls layouts rootTy).layoutIdx = .some l →
+      l.fields = .union count →
+      fieldIdx < count →
       uninitFieldWriteShell? localDecls layouts dstLoc (.field fieldIdx fieldTy) =
         .some (.aggregate 0 .nil)) ∧
+    (placeTy localDecls layouts { local_ := dstLoc, projection := .nil } = .some rootTy →
+      (resolveTyWithLocalDecls localDecls layouts rootTy).kind = .adt defPath args →
+      LayoutTable.lookup layouts
+        (resolveTyWithLocalDecls localDecls layouts rootTy).layoutIdx = .some l →
+      l.isUninhabited = false →
+      l.variants = .single 0 →
+      l.fields = .arbitrary offsets memOrder →
+      fieldIdx < length offsets →
+      uninitFieldWriteShell? localDecls layouts dstLoc (.field fieldIdx fieldTy) =
+        .some (.aggregate 0 (replicateValue (length offsets) .uninit))) ∧
     (placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
         .some { kind := .tuple tupleFields, layoutIdx := layoutIdx } →
+      fieldIdx < length tupleFields →
       uninitFieldWriteShell? localDecls layouts dstLoc (.field fieldIdx fieldTy) =
-        .some (.aggregate 0 .nil)) ∧
+        .some (.aggregate 0 (replicateValue (length tupleFields) .uninit))) ∧
     ((∀ (fIdx : FieldIdx) (fTy : Ty), proj ≠ .field fIdx fTy) →
       uninitFieldWriteShell? localDecls layouts dstLoc proj rest = .none) ∧
     ((∀ (dp : DefPath) (as_ : List RigidTy) (lIdx : Nat),
@@ -6350,9 +6461,12 @@ theorem mir_uninit_aggregate_field_write_characterizations
       (∀ (fs : List RigidTy) (lIdx : Nat),
         placeTy localDecls layouts { local_ := dstLoc, projection := .nil } ≠
           .some { kind := .tuple fs, layoutIdx := lIdx }) →
+      (∀ (dp : DefPath) (caps : List RigidTy) (lIdx : Nat),
+        placeTy localDecls layouts { local_ := dstLoc, projection := .nil } ≠
+          .some { kind := .closure dp caps, layoutIdx := lIdx }) →
       uninitFieldWriteShell? localDecls layouts dstLoc proj rest = .none) ∧
-    (uninitFieldWriteShell? localDecls layouts dstLoc proj rest = .none ↔
-      uninitFieldWriteShell? localDecls layouts dstLoc proj .nil = .none) ∧
+    (uninitFieldWriteShell? localDecls layouts dstLoc proj .nil = .none →
+      uninitFieldWriteShell? localDecls layouts dstLoc proj rest = .none) ∧
     (evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
       get? locals₁ dstLoc = .some .uninit →
       uninitFieldWriteShell? localDecls layouts dstLoc (.field fieldIdx fieldTy) rest =
@@ -6369,9 +6483,16 @@ theorem mir_uninit_aggregate_field_write_characterizations
         localDecls layouts = MirStepNode.fail .ub) ∧
     (evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
       get? locals₁ dstLoc = .some .uninit →
-      placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
-        .some { kind := .adt defPath args, layoutIdx := layoutIdx } →
-      set? locals₁ dstLoc (.init (.aggregate 0 (setOrExtendFields .nil fieldIdx val))) =
+      placeTy localDecls layouts { local_ := dstLoc, projection := .nil } = .some rootTy →
+      (resolveTyWithLocalDecls localDecls layouts rootTy).kind = .adt defPath args →
+      LayoutTable.lookup layouts
+        (resolveTyWithLocalDecls localDecls layouts rootTy).layoutIdx = .some l →
+      l.isUninhabited = false →
+      l.variants = .single 0 →
+      l.fields = .arbitrary offsets memOrder →
+      fieldIdx < length offsets →
+      set? locals₁ dstLoc
+        (.init (.aggregate 0 ((replicateValue (length offsets) .uninit).set fieldIdx val))) =
         .some locals₂ →
       mem₁.activeProtectors = .nil →
       placeTouchesUnion localDecls layouts
@@ -6390,7 +6511,9 @@ theorem mir_uninit_aggregate_field_write_characterizations
       get? locals₁ dstLoc = .some .uninit →
       placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
         .some { kind := .tuple tupleFields, layoutIdx := layoutIdx } →
-      set? locals₁ dstLoc (.init (.aggregate 0 (setOrExtendFields .nil fieldIdx val))) =
+      fieldIdx < length tupleFields →
+      set? locals₁ dstLoc
+        (.init (.aggregate 0 ((replicateValue (length tupleFields) .uninit).set fieldIdx val))) =
         .some locals₂ →
       mem₁.activeProtectors = .nil →
       evalStmt s ⟨.assign ⟨dstLoc, .field fieldIdx fieldTy :: .nil⟩ rv, span⟩
@@ -6406,19 +6529,16 @@ theorem mir_uninit_aggregate_field_write_characterizations
     (let projs : List ProjectionElem := [.field fieldIdx outerTy, .field innerIdx fieldTy];
       evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
       get? locals₁ dstLoc = .some .uninit →
-      ((∃ dp as_ lIdx,
-          placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
-            .some { kind := .adt dp as_, layoutIdx := lIdx }) ∨
-       (∃ tfs lIdx,
-          placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
-            .some { kind := .tuple tfs, layoutIdx := lIdx })) →
-      ((∃ innerDefPath innerArgs, outerTy.kind = .adt innerDefPath innerArgs) ∨
-       (∃ innerFields, outerTy.kind = .tuple innerFields)) →
+      placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
+        .some { kind := .tuple tupleFields, layoutIdx := layoutIdx } →
+      outerTy.kind = .tuple innerFields →
+      fieldIdx < length tupleFields →
+      innerIdx < length innerFields →
       set? locals₁ dstLoc
         (.init
           (.aggregate 0
-            (setOrExtendFields .nil fieldIdx
-              (.aggregate 0 (setOrExtendFields .nil innerIdx val))))) =
+            ((replicateValue (length tupleFields) .uninit).set fieldIdx
+              (.aggregate 0 ((replicateValue (length innerFields) .uninit).set innerIdx val))))) =
         .some locals₂ →
       mem₁.activeProtectors = .nil →
       placeTouchesUnion localDecls layouts { local_ := dstLoc, projection := projs } = false →
@@ -6457,34 +6577,34 @@ theorem mir_uninit_aggregate_field_write_characterizations
       uninitFieldWriteShell? localDecls layouts dstLoc proj = .none →
       evalStmt s ⟨.assign ⟨dstLoc, proj :: rest⟩ rv, span⟩ localDecls layouts =
         MirStepNode.fail .ub) := by
-  refine ⟨ensureNestedFieldShells_singleton val proj,
-    ensureNestedFieldShells_eq_self_of_populated (proj :: rest) rootVal,
-    writeProjectedValue_ensureNestedFieldShells_of_populated locals₁ rootVal (proj :: rest) val,
+  refine ⟨ensureNestedFieldShells_singleton val proj localDecls layouts (.some rootTy),
+    ensureNestedFieldShells_eq_self_of_populated (proj :: rest) rootVal localDecls layouts
+      (.some rootTy),
     evalStmt_assign_init_projected_step s dstLoc proj rest rv span localDecls layouts
       val rootVal rootVal' locals₁ locals₂ mem₁,
-    fun hRv hInit hOuterAgg hSlot hSet hProt hNoUnion =>
-      evalStmt_assign_init_unpopulated_nested_field_ok s dstLoc variantIdx fields
-        fieldIdx innerIdx outerTy fieldTy rv span localDecls layouts val locals₁ locals₂ mem₁
-        hRv hInit hOuterAgg hSlot hSet hProt hNoUnion,
-    uninitFieldWriteShell?_field_adt localDecls layouts dstLoc fieldIdx fieldTy
-      defPath args layoutIdx,
+    uninitFieldWriteShell?_field_union localDecls layouts dstLoc fieldIdx fieldTy
+      rootTy defPath args l count,
+    uninitFieldWriteShell?_field_struct localDecls layouts dstLoc fieldIdx fieldTy
+      rootTy defPath args l offsets memOrder,
     uninitFieldWriteShell?_field_tuple localDecls layouts dstLoc fieldIdx fieldTy
       tupleFields layoutIdx,
     uninitFieldWriteShell?_eq_none_of_not_field localDecls layouts dstLoc proj rest,
-    uninitFieldWriteShell?_eq_none_of_non_aggregate_ty localDecls layouts dstLoc proj rest,
-    uninitFieldWriteShell?_eq_none_iff localDecls layouts dstLoc proj rest,
+    fun hNA hNT hNC =>
+      uninitFieldWriteShell?_eq_none_of_non_aggregate_ty localDecls layouts dstLoc proj rest
+        hNA hNT hNC,
+    uninitFieldWriteShell?_eq_none_of_nil localDecls layouts dstLoc proj rest,
     evalStmt_assign_uninit_aggregate_field_protected_conflict_ub s dstLoc fieldIdx fieldTy
       rest rv span localDecls layouts val locals₁ mem₁ shell rootVal' locals₂ protHead protTail,
-    fun hRv hUninit hTy hSet hProt hNoUnion =>
-      evalStmt_assign_uninit_union_field_ok s dstLoc fieldIdx fieldTy rv span localDecls layouts
-        defPath args layoutIdx val locals₁ mem₁ locals₂
-        hRv hUninit hTy hSet hProt hNoUnion,
+    fun hRv hUninit hTy hKind hLook hInhab hVar hFields hLt hSet hProt hNoUnion =>
+      evalStmt_assign_uninit_struct_field_ok s dstLoc fieldIdx fieldTy rv span localDecls layouts
+        rootTy defPath args l offsets memOrder val locals₁ mem₁ locals₂
+        hRv hUninit hTy hKind hLook hInhab hVar hFields hLt hSet hProt hNoUnion,
     evalStmt_assign_uninit_tuple_field_ok s dstLoc fieldIdx fieldTy rv span localDecls layouts
       tupleFields layoutIdx val locals₁ mem₁ locals₂,
-    fun hRv hUninit hRootAgg hOuterAgg hSet hProt hNoUnion =>
+    fun hRv hUninit hTy hOuterKind hOuterLt hInnerLt hSet hProt hNoUnion =>
       evalStmt_assign_uninit_nested_field_ok s dstLoc fieldIdx innerIdx outerTy fieldTy rv span
-        localDecls layouts val locals₁ mem₁ locals₂
-        hRv hUninit hRootAgg hOuterAgg hSet hProt hNoUnion,
+        localDecls layouts tupleFields innerFields layoutIdx val locals₁ mem₁ locals₂
+        hRv hUninit hTy hOuterKind hOuterLt hInnerLt hSet hProt hNoUnion,
     evalStmt_assign_uninit_array_field_elem_ub s dstLoc idxLocal fieldIdx elemKind count
       arrLayoutIdx rest rv span localDecls layouts val locals₁ mem₁,
     evalStmt_assign_uninit_field_non_field_subproj_ub s dstLoc fieldIdx fieldTy nextProj
@@ -6545,8 +6665,7 @@ theorem stmt_assign_union_field_sibling_borrow_invalidation_and_protector_ub
       tyIsZeroSized writeTy = false →
       evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
       get? locals₁ dstLoc = .some (.init rootVal) →
-      writeProjectedForLocal locals₁ localDecls layouts dstLoc
-        (ensureNestedFieldShells rootVal (.field writeIdx writeTy :: .nil))
+      writeProjectedForLocal locals₁ localDecls layouts dstLoc rootVal
         (.field writeIdx writeTy :: .nil) val = .ok rootVal' →
       set? locals₁ dstLoc (.init rootVal') = .some locals₂ →
       (perm = .active ∨ perm = .frozen) →

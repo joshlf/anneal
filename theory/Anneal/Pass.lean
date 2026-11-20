@@ -2643,29 +2643,35 @@ def Memory.isFnPtrPtr (mem : Memory) (p : ProvenancePtr) : Bool :=
   | .none, .none, .some _ => true
   | _, _, _ => false
 
-mutual
-/-- Structural pointer-`AllocId` remapper on `Value` (`Value.rec`, 1-step iota reduction). -/
+/-- Default aggregate nesting bound for `Value` pointer-`AllocId` remapping (matching `defaultTyEqFuel`). -/
+def defaultValueRemapFuel : Nat := 64
+
+/-- Fuel-indexed pointer-`AllocId` remapper on `Value` (`@Nat.rec` + `List.map`, zero `brecOn`/`._f`). -/
+def Value.remapPtrAllocIdsFuel (pred : ProvenancePtr → Bool)
+    (remap : List (AllocId × AllocId)) : Nat → Value → Value :=
+  @Nat.rec (fun _ => Value → Value)
+    (fun v => v)
+    (fun _ step v =>
+      match v with
+      | .unit => .unit
+      | .scalar s => .scalar s
+      | .ptr p sz =>
+        if pred p then
+          .ptr { p with allocId := lookupAllocRemap remap p.allocId } sz
+        else
+          .ptr p sz
+      | .aggregate var fs => .aggregate var (fs.map step)
+      | .uninit => .uninit)
+
+/-- Structural pointer-`AllocId` remapper on `Value`. -/
 def Value.remapPtrAllocIdsWhere (pred : ProvenancePtr → Bool)
-    (remap : List (AllocId × AllocId)) : Value → Value
-  | .unit => .unit
-  | .scalar s => .scalar s
-  | .ptr p sz =>
-    if pred p then
-      .ptr { p with allocId := lookupAllocRemap remap p.allocId } sz
-    else
-      .ptr p sz
-  | .aggregate v fs => .aggregate v (Value.remapPtrAllocIdsWhereList pred remap fs)
-termination_by structural v => v
+    (remap : List (AllocId × AllocId)) (v : Value) : Value :=
+  Value.remapPtrAllocIdsFuel pred remap defaultValueRemapFuel v
 
 /-- Structural pointer-`AllocId` remapper on `List Value`. -/
 def Value.remapPtrAllocIdsWhereList (pred : ProvenancePtr → Bool)
-    (remap : List (AllocId × AllocId)) : List Value → List Value
-  | [] => []
-  | x :: xs =>
-    Value.remapPtrAllocIdsWhere pred remap x ::
-      Value.remapPtrAllocIdsWhereList pred remap xs
-termination_by structural xs => xs
-end
+    (remap : List (AllocId × AllocId)) (fs : List Value) : List Value :=
+  fs.map (Value.remapPtrAllocIdsFuel pred remap defaultValueRemapFuel)
 
 /--
 Remap synthetic function-pointer `AllocId`s (`isFnPtrAllocId p.allocId`) inside
@@ -2684,6 +2690,7 @@ def Value.remapFnPtrAllocIds (remap : List (AllocId × AllocId)) : Value → Val
   | .aggregate var fs =>
     if remap.isEmpty then .aggregate var fs
     else .aggregate var (Value.remapPtrAllocIdsWhereList (fun p => isFnPtrAllocId p.allocId) remap fs)
+  | .uninit => .uninit
 
 /--
 Remap function-pointer `AllocId`s inside a callee-returned `Value` using
@@ -2702,6 +2709,7 @@ def Value.remapReturnedFnPtrs (after : Memory) (remap : List (AllocId × AllocId
   | .aggregate var fs =>
     if remap.isEmpty then .aggregate var fs
     else .aggregate var (Value.remapPtrAllocIdsWhereList (Memory.isFnPtrPtr after) remap fs)
+  | .uninit => .uninit
 
 /--
 Restore the caller's suspended frame metadata (`callees`, `traitImpls`,

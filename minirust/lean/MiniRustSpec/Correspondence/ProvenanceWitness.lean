@@ -8,6 +8,7 @@ This file may not be copied, modified, or distributed except according to
 those terms.
 -/
 
+import Lean
 import MiniRustSpec.Correspondence.TbWitness
 import MiniRustSpec.Correspondence.Provenance
 
@@ -82,6 +83,42 @@ open MiniRustSpec.Correspondence.Witness
 open MiniRustSpec.Correspondence.PointerWitness
 open MiniRustSpec.Correspondence.RefWitness
 open MiniRustSpec.Correspondence.TbWitness
+
+local elab "kernel_rfl" : tactic => do
+  let mvarId ← Lean.Elab.Tactic.getMainGoal
+  let tgt ← Lean.MVarId.getType' mvarId
+  let some (ty, lhs, _) := tgt.eq? | Lean.Meta.throwTacticEx `kernel_rfl mvarId "expected equality goal"
+  let u ← Lean.Meta.getLevel ty
+  mvarId.assign (Lean.mkApp2 (Lean.mkConst ``Eq.refl [u]) ty lhs)
+  Lean.Elab.Tactic.replaceMainGoal []
+
+private theorem runA_isSome_noUB (body : CapturedMir) (fuel : Nat) (s : MachineState)
+    (h : (runA body fuel s).isSome = true) : MirNoUBTree (mirTree body s) := by
+  cases hr : runA body fuel s with
+  | none => rw [hr] at h; cases h
+  | some p => exact runA_noUB body fuel s p.1 p.2 hr
+
+private theorem runA_exists_mem_sound (body : CapturedMir) (fuel : Nat) (s : MachineState)
+    (tr : List (Event MirEffect)) (v : Value)
+    (h : (runA body fuel s).map (fun (tr', o) =>
+      match o with
+      | .normal (v', _) => some (tr', v')
+      | _ => none) = some (some (tr, v))) :
+    ∃ mem, ReachesRet (mirTree body s) tr (.normal (v, mem)) := by
+  cases hr : runA body fuel s with
+  | none => rw [hr] at h; cases h
+  | some p =>
+    rcases p with ⟨tr', o⟩
+    cases o with
+    | normal vm =>
+      rcases vm with ⟨v', mem⟩
+      rw [hr] at h
+      injection h with h1
+      injection h1 with h2
+      injection h2 with htr hv
+      cases htr; cases hv
+      exact ⟨mem, runA_sound body fuel s _ _ hr⟩
+    | _ => rw [hr] at h; cases h
 
 /-! ## 1. Pass A1's extended fragment and its counterexamples -/
 
@@ -189,7 +226,7 @@ theorem int2ptrForgedTag_notInFragmentWithIntrinsics :
 theorem int2ptrForgedTag_anneal_ub :
     ∃ tr u, Reaches (mirTree int2ptrForgedTag
       (initMachineState int2ptrForgedTag [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u :=
-  faultsA_sound int2ptrForgedTag 30 _ (by decide)
+  faultsA_sound int2ptrForgedTag 30 _ (by kernel_rfl)
 
 theorem int2ptrForgedTag_minirust_direct :
     stopAfterIntr int2ptrForgedTag [.scalar ⟨5, 4⟩] 6 =
@@ -275,7 +312,7 @@ theorem int2ptrRawRoundTripOk_anneal_ret :
     ∃ mem, ReachesRet (mirTree int2ptrRawRoundTripOk
       (initMachineState int2ptrRawRoundTripOk [.scalar ⟨5, 4⟩])) []
       (.normal (.scalar ⟨77, 4⟩, mem)) :=
-  ⟨_, runA_sound int2ptrRawRoundTripOk 30 _ _ _ rfl⟩
+  runA_exists_mem_sound int2ptrRawRoundTripOk 30 _ _ _ (by kernel_rfl)
 
 /-- `_2 = &raw mut _1; _3 = expose(_2); _4 = with_exposed(_3); *_4 = 77; *_4`
 lies in the corrected fragment and returns `77` on Anneal, `Mach`, and `MachTB`. -/
@@ -311,7 +348,7 @@ theorem int2ptrRawRoundTripOk_annealExposeRoundTripOk :
     AnnealExposeRoundTripOk int2ptrRawRoundTripOk int2ptrRawRoundTripOkPreExposeState
       ⟨1, 0⟩ (canonicalLocalAddr 1 0) :=
   AnnealExposeRoundTripOk.of_borrows (entry := rawPtrEntry 1 .mut (local_ 1)) (pointeeIt := u32)
-    (by decide) (by decide) (.head _) (by decide) (by decide) (by decide)
+    (by decide +kernel) (by decide +kernel) (.head _) (by decide +kernel) (by decide +kernel) (by decide +kernel)
     rfl rfl rfl
     ⟨(fun h => by cases h), fun h => absurd rfl h⟩
     (fun b hb hexp _ => by
@@ -343,14 +380,14 @@ theorem exposeCompetingDisabledParent_annealExposeRoundTripOk :
     AnnealExposeRoundTripOk int2ptrRawRoundTripOk exposeCompetingDisabledParentState
       ⟨2, 0⟩ (canonicalLocalAddr 1 0) :=
   AnnealExposeRoundTripOk.of_borrows (entry := rawPtrEntry 2 .mut (local_ 1)) (pointeeIt := u32)
-    (by decide) (by decide) (.head _) (by decide) (by decide) (by decide)
+    (by decide +kernel) (by decide +kernel) (.head _) (by decide +kernel) (by decide +kernel) (by decide +kernel)
     rfl rfl rfl
     ⟨(fun h => by cases h), fun h => absurd rfl h⟩
     (fun b hb _ hne => by
       rcases List.mem_cons.mp hb with rfl | hb_tl
       · exact absurd rfl hne
       · rcases List.mem_singleton.mp hb_tl with rfl
-        exact .inl (by decide))
+        exact .inl (by decide +kernel))
 
 /-- Proper sub-place `[u32; 2]` array-element expose-and-reconstruct round-trip
 (`_2 = &raw mut (_1[1 of 2]); _3 = expose(_2); _4 = with_exposed(_3); *_4 = 77; _1[0] + _1[1]`):
@@ -381,7 +418,7 @@ theorem int2ptrArraySubPlaceRoundTripOk_anneal_ret :
       (initMachineState int2ptrArraySubPlaceRoundTripOk
         [.aggregate 0 [.scalar ⟨5, 4⟩, .scalar ⟨9, 4⟩]])) []
       (.normal (.scalar ⟨82, 4⟩, mem)) :=
-  ⟨_, runA_sound int2ptrArraySubPlaceRoundTripOk 30 _ _ _ rfl⟩
+  runA_exists_mem_sound int2ptrArraySubPlaceRoundTripOk 30 _ _ _ (by kernel_rfl)
 
 theorem int2ptrArraySubPlaceRoundTripOk_three_way :
     inFragmentWithIntrinsics int2ptrArraySubPlaceRoundTripOk = true ∧
@@ -420,10 +457,10 @@ theorem int2ptrArraySubPlaceRoundTripOk_annealExposeRoundTripOk :
       ⟨1, 0⟩ (canonicalLocalAddr 1 4) :=
   AnnealExposeRoundTripOk.of_borrows
     (entry := rawPtrEntry 1 .mut (placeConstIdx 1 1 2 false)) (pointeeIt := u32)
-    (by decide) (by decide) (.head _) (by decide) (by decide) (by decide)
+    (by decide +kernel) (by decide +kernel) (.head _) (by decide +kernel) (by decide +kernel) (by decide +kernel)
     rfl rfl rfl
     ⟨(fun h => by cases h), fun _ =>
-      ⟨by decide, arrU32_2Decl, .aggregate 0 [.scalar ⟨5, 4⟩, .scalar ⟨9, 4⟩],
+      ⟨by decide +kernel, arrU32_2Decl, .aggregate 0 [.scalar ⟨5, 4⟩, .scalar ⟨9, 4⟩],
        rfl, rfl, ⟨rfl, by simp [ElemOk]⟩⟩⟩
     (fun b hb hexp _ => by
       simp [int2ptrArraySubPlacePreExposeState, initMachineState,
@@ -455,7 +492,7 @@ theorem int2ptrArraySubPlaceRoundTripOk_hsub_static :
 theorem int2ptrUnexposedDerefUb_anneal_ub :
     ∃ tr u, Reaches (mirTree int2ptrUnexposedDerefUb
       (initMachineState int2ptrUnexposedDerefUb [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u :=
-  faultsA_sound int2ptrUnexposedDerefUb 30 _ (by decide)
+  faultsA_sound int2ptrUnexposedDerefUb 30 _ (by kernel_rfl)
 
 /-- With nothing exposed, `with_exposed_provenance(256)` predicts `None`
 (`int2ptrProvenance_eq_none_iff`, the only admissible choice), so the read is UB
@@ -561,7 +598,7 @@ theorem int2ptrAdjacentArgsAmbiguous_anneal_ret :
     ∃ mem, ReachesRet (mirTree int2ptrAdjacentArgsAmbiguous
       (initMachineState int2ptrAdjacentArgsAmbiguous [.scalar ⟨7, 4⟩, .scalar ⟨9, 4⟩])) []
       (.normal (.scalar ⟨9, 4⟩, mem)) :=
-  ⟨_, runA_sound int2ptrAdjacentArgsAmbiguous 40 _ _ _ rfl⟩
+  runA_exists_mem_sound int2ptrAdjacentArgsAmbiguous 40 _ _ _ (by kernel_rfl)
 
 theorem int2ptrAdjacentArgsAmbiguous_minirust_direct :
     stopAfterIntrCtx ctxAdj int2ptrAdjacentArgsAmbiguous [.scalar ⟨7, 4⟩, .scalar ⟨9, 4⟩] 11 =
@@ -632,11 +669,11 @@ theorem exposePriorOtherLocal_annealExposeRoundTripOk :
     AnnealExposeRoundTripOk int2ptrAdjacentArgsAmbiguous exposePriorOtherLocalState
       ⟨2, 0⟩ (canonicalLocalAddr 2 0) :=
   AnnealExposeRoundTripOk.of_borrows (entry := rawPtrEntry 2 .not (local_ 2)) (pointeeIt := u32)
-    (by decide) (by decide) (.tail _ (.head _)) (by decide) (by decide) (by decide)
+    (by decide +kernel) (by decide +kernel) (.tail _ (.head _)) (by decide +kernel) (by decide +kernel) (by decide +kernel)
     rfl rfl rfl
     ⟨(fun h => by cases h), fun h => absurd rfl h⟩
     (NoCompetingExposedBorrow.of_borrows_distinct
-      (by decide) rfl rfl (fun h => absurd rfl h)
+      (by decide +kernel) rfl rfl (fun h => absurd rfl h)
       (fun b hb _ hne _ => by
         rcases List.mem_cons.mp hb with rfl | hb_tl
         · exact absurd rfl hne
@@ -648,7 +685,7 @@ theorem exposePriorOtherLocal_annealExposeRoundTripOk :
         rcases List.mem_cons.mp hb with rfl | hb_tl
         · exact absurd rfl hne
         · rcases List.mem_singleton.mp hb_tl with rfl
-          exact .inl (by decide)))
+          exact .inl (by decide +kernel)))
 
 /-! ### `int2ptrDeadAllocUb`: the cast after deallocation -/
 
@@ -688,7 +725,7 @@ theorem int2ptrAfterStorageDeadUb_notInFragmentWithIntrinsics :
 theorem int2ptrAfterStorageDeadUb_anneal_ub :
     ∃ tr u, Reaches (mirTree int2ptrAfterStorageDeadUb
       (initMachineState int2ptrAfterStorageDeadUb [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u :=
-  faultsA_sound int2ptrAfterStorageDeadUb 30 _ (by decide)
+  faultsA_sound int2ptrAfterStorageDeadUb 30 _ (by kernel_rfl)
 
 theorem int2ptrAfterStorageDeadUb_minirust_direct :
     stopAfterIntr int2ptrAfterStorageDeadUb [.scalar ⟨5, 4⟩] 11 =
@@ -725,7 +762,7 @@ theorem int2ptrDeadAllocDerefUb_inFragmentWithIntrinsicsA1 :
 theorem int2ptrDeadAllocDerefUb_anneal_ub :
     ∃ tr u, Reaches (mirTree int2ptrDeadAllocDerefUb
       (initMachineState int2ptrDeadAllocDerefUb [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u :=
-  faultsA_sound int2ptrDeadAllocDerefUb 30 _ (by decide)
+  faultsA_sound int2ptrDeadAllocDerefUb 30 _ (by kernel_rfl)
 
 theorem int2ptrDeadAllocDerefUb_three_way :
     (∃ tr u, Reaches (mirTree int2ptrDeadAllocDerefUb
@@ -743,7 +780,7 @@ theorem int2ptrMultiAllocBoundaryUnsupported_notInFragmentWithIntrinsics :
 theorem int2ptrMultiAllocBoundaryUnsupported_anneal_ub :
     ∃ tr u, Reaches (mirTree int2ptrMultiAllocBoundaryUnsupported
       (initMachineState int2ptrMultiAllocBoundaryUnsupported [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u :=
-  faultsA_sound int2ptrMultiAllocBoundaryUnsupported 40 _ (by decide)
+  faultsA_sound int2ptrMultiAllocBoundaryUnsupported 40 _ (by kernel_rfl)
 
 /-- Pass A1 never ran this body: the forged address `1024` lies in neither
 exposed allocation, so both MiniRust machines stop with `Stop.unsupported`
@@ -844,7 +881,7 @@ theorem int2ptrAfterStorageDeadTwoExposed_three_way :
       stopAfterIntrTB int2ptrAfterStorageDeadTwoExposed [.scalar ⟨5, 4⟩] 14 =
         some (.unsupported
           "int2ptr: multiple exposed allocations and none contains the address (angelic choice)") :=
-  ⟨by decide +kernel, faultsA_sound int2ptrAfterStorageDeadTwoExposed 40 _ (by decide),
+  ⟨by decide +kernel, faultsA_sound int2ptrAfterStorageDeadTwoExposed 40 _ (by kernel_rfl),
     by decide +kernel, by decide +kernel⟩
 
 /-! ## 5. `inFragmentWithIntrinsics` vs. `singleExposeSiteOk` on `Mach` vs. `MachTB` (Pass A2) -/
@@ -1277,7 +1314,7 @@ theorem assumeReborrowExposeRoundTrip_anneal_ret :
     ∃ mem, ReachesRet (mirTree assumeReborrowExposeRoundTrip
       (initMachineState assumeReborrowExposeRoundTrip [.scalar ⟨5, 4⟩])) []
       (.normal (.scalar ⟨99, 4⟩, mem)) :=
-  ⟨_, runA_sound assumeReborrowExposeRoundTrip 35 _ _ _ rfl⟩
+  runA_exists_mem_sound assumeReborrowExposeRoundTrip 35 _ _ _ (by kernel_rfl)
 
 theorem assumeReborrowExposeRoundTrip_minirust_direct :
     retAfterIntr assumeReborrowExposeRoundTrip [.scalar ⟨5, 4⟩] 18 =
@@ -1324,7 +1361,7 @@ theorem assumeReborrowFalseUb_inFragmentWithIntrinsics :
 theorem assumeReborrowFalseUb_anneal_ub :
     ∃ tr u, Reaches (mirTree assumeReborrowFalseUb
       (initMachineState assumeReborrowFalseUb [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u :=
-  faultsA_sound assumeReborrowFalseUb 25 _ (by decide)
+  faultsA_sound assumeReborrowFalseUb 25 _ (by kernel_rfl)
 
 theorem assumeReborrowFalseUb_minirust_direct :
     stopAfterIntr assumeReborrowFalseUb [.scalar ⟨5, 4⟩] 11 =
@@ -1522,7 +1559,7 @@ theorem callRefMutProtected_anneal_ret :
       tr (.normal (.scalar ⟨84, 4⟩, mem))) ∧
     MirNoUBTree
       (mirCallTreeWithCallees callerRefMutProtectedMir [.scalar ⟨5, 4⟩] [calleeAdd37RefMutMir]) :=
-  ⟨by decide +kernel, runsToScalar_sound (fuel := 25) (by decide)⟩
+  ⟨by decide +kernel, runsToScalar_sound (fuel := 25) (by decide +kernel)⟩
 
 /-- Multi-frame `Call` passing `&mut u32` with function-entry `Validate` (`fn_entry = true`)
 succeeds on both `Mach` (`BasicMemory`) and `MachTB` (`TreeBorrowsMemory`),
@@ -1871,7 +1908,7 @@ theorem callCrossFrameExpose_anneal_ret :
       tr (.normal (.scalar ⟨88, 4⟩, mem))) ∧
     MirNoUBTree
       (mirCallTreeWithCallees callerCrossFrameExposeMir [.scalar ⟨5, 4⟩] [calleeExposePtrMir]) :=
-  runsToScalar_sound (fuel := 30) (by decide)
+  runsToScalar_sound (fuel := 30) (by decide +kernel)
 
 /-- Exposing a pointer in a callee frame (`PointerExposeProvenance`) and
 reconstructing it in the caller frame (`PointerWithExposedProvenance`) after
@@ -2184,7 +2221,7 @@ theorem callerRawPtrRetagFnEntry_anneal_ub :
       (mirCallTreeWithCallees callerRawPtrRetagFnEntryMir [.scalar ⟨5, 4⟩, .scalar ⟨9, 4⟩]
         [calleeRawPtrRetagFnEntryMir])
       tr u ∧ FaultNow u :=
-  faultsA_sound callerRawPtrRetagFnEntryMir 25 _ (by decide)
+  faultsA_sound callerRawPtrRetagFnEntryMir 25 _ (by kernel_rfl)
 
 theorem callerRawPtrRetagFnEntry_B3_divergence :
     progInFragmentWithIntrinsicsB3 callerRawPtrRetagFnEntryMir [calleeRawPtrRetagFnEntryMir] = true ∧
@@ -2272,7 +2309,7 @@ theorem callerRefMutSilentWrongLocal_anneal_ret :
     MirNoUBTree
       (mirCallTreeWithCallees callerRefMutSilentWrongLocalMir [.scalar ⟨5, 4⟩]
         [calleeReadRefWithLocalMir]) :=
-  runsToScalar_sound (fuel := 25) (by decide)
+  runsToScalar_sound (fuel := 25) (by decide +kernel)
 
 theorem callerRefMutSilentWrongLocal_simulation :
     progInFragmentWithIntrinsicsB3 callerRefMutSilentWrongLocalMir [calleeReadRefWithLocalMir] = true ∧
@@ -2368,7 +2405,7 @@ theorem callerBorrowAcrossScalarCall_anneal_ret :
     MirNoUBTree
       (mirCallTreeWithCallees callerBorrowAcrossScalarCallMir [.scalar ⟨5, 4⟩]
         [calleeScalarAssignLocal1Mir]) :=
-  runsToScalar_sound (fuel := 25) (by decide)
+  runsToScalar_sound (fuel := 25) (by decide +kernel)
 
 theorem callerBorrowAcrossScalarCall_simulation :
     ptrAliasingOk callerBorrowAcrossScalarCallMir = true ∧
@@ -2499,7 +2536,7 @@ theorem callerBorrowExposeAndScalarCall_anneal_92 :
     MirNoUBTree
       (mirCallTreeWithCallees callerBorrowExposeAndScalarCallMir [.scalar ⟨5, 4⟩]
         [calleeBorrowAssumeAddMir]) :=
-  runsToScalar_sound (fuel := 80) (by decide)
+  runsToScalar_sound (fuel := 80) (by decide +kernel)
 
 theorem callerBorrowExposeAndScalarCall_three_way :
     progInFragment callerBorrowExposeAndScalarCallMir [calleeBorrowAssumeAddMir] = false ∧
@@ -2641,7 +2678,7 @@ theorem callerPrePostCallExpose_anneal_42 :
     MirNoUBTree
       (mirCallTreeWithCallees callerPrePostCallExposeMir [.scalar ⟨5, 4⟩]
         [calleeScalarAssignLocal1Mir]) :=
-  runsToScalar_sound (fuel := 60) (by decide)
+  runsToScalar_sound (fuel := 60) (by decide +kernel)
 
 /-- Pass B4 multi-function Tree Borrows exposure divergence:
 `callerPrePostCallExposeMir` + `calleeScalarAssignLocal1Mir` is accepted by
@@ -2754,7 +2791,7 @@ theorem callerLoopCallExposeCallee_anneal_79 :
     MirNoUBTree
       (mirCallTreeWithCallees callerLoopCallExposeCalleeMir [.scalar ⟨5, 4⟩]
         [calleeBorrowAssumeAddMir]) :=
-  runsToScalar_sound (fuel := 120) (by decide)
+  runsToScalar_sound (fuel := 120) (by decide +kernel)
 
 /-- Positive 3-way cyclic-loop multi-call stack-reuse witness (MR-4.3 Pass A4):
 `callerLoopCallExposeCalleeMir` (`isAcyclicCfg = false`) calling
@@ -2870,7 +2907,7 @@ theorem shadowedUsizeLayoutDivergence_anneal_ub :
     ∃ tr u, Reaches (mirTree shadowedUsizeLayoutDivergence
       (initMachineState shadowedUsizeLayoutDivergence
         [.aggregate 0 [.scalar ⟨5, 8⟩, .scalar ⟨9, 8⟩]])) tr u ∧ FaultNow u :=
-  faultsA_sound shadowedUsizeLayoutDivergence 30 _ (by decide)
+  faultsA_sound shadowedUsizeLayoutDivergence 30 _ (by kernel_rfl)
 
 theorem shadowedUsizeLayoutDivergence_three_way :
     provCastFlowOk shadowedUsizeLayoutDivergence = true ∧
@@ -2921,7 +2958,7 @@ theorem transmuteExposedAddrToRawPtrDerefUb_notInFragmentWithIntrinsics :
 theorem transmuteExposedAddrToRawPtrDerefUb_anneal_ub :
     ∃ tr u, Reaches (mirTree transmuteExposedAddrToRawPtrDerefUb
       (initMachineState transmuteExposedAddrToRawPtrDerefUb [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u :=
-  faultsA_sound transmuteExposedAddrToRawPtrDerefUb 30 _ (by decide)
+  faultsA_sound transmuteExposedAddrToRawPtrDerefUb 30 _ (by kernel_rfl)
 
 theorem transmuteExposedAddrToRawPtrDerefUb_three_way :
     inFragmentWithIntrinsics transmuteExposedAddrToRawPtrDerefUb = false ∧

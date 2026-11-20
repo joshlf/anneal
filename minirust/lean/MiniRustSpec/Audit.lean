@@ -1458,7 +1458,7 @@ open MiniRustSpec.Correspondence.Witness in
   storageDeadRet_minirust_panics
   projectedDeinit_rejected
   projectedDeinit_translate
-  projectedDeinit_anneal_ret
+  projectedDeinit_anneal_ub
   projectedDeinit_minirust_ub
   projAssignMoveReuse_movesOk
   sameRvalueMoveReuse_movesOk
@@ -2591,7 +2591,7 @@ open MiniRustSpec.Correspondence.Witness in
   storageDeadRet_minirust_panics
   projectedDeinit_rejected
   projectedDeinit_translate
-  projectedDeinit_anneal_ret
+  projectedDeinit_anneal_ub
   projectedDeinit_minirust_ub
   projAssignMoveReuse_movesOk
   sameRvalueMoveReuse_movesOk
@@ -5649,9 +5649,8 @@ open MiniRustSpec.Correspondence in
 
 open MiniRustSpec.Correspondence in
 #check_theorem_deps "[WITNESS-AUDIT]"
-  bdNullaryOp_unsupported
-  bdUbChecks_step
-  bdUbChecks_not_noUB
+  bdNullaryOp_ubChecks_contractChecks
+  bdUbChecks_anneal_ret
   bdNullaryOp_translateRvalue
   bdUbChecks_rejected
   bdCopy0_anneal_ret
@@ -5667,7 +5666,7 @@ open MiniRustSpec.Correspondence in
   bdOffset_rejected
   bdArithOffset_anneal_ret
   bdMirCallReq_fields
-  bdWriteBytes_extCall
+  bdWriteBytes_untracked_unsupported
   bdRawEq_extCall
   bdColdPath_extCall
   bdCtpop_anneal_ret
@@ -5686,7 +5685,7 @@ open MiniRustSpec.Correspondence in
   bdCtpop_inline
   bdExactDiv_inline
   exactDivHandler_iff_minirust
-  bdWriteBytes_unhandled_fault
+  bdWriteBytes_untracked_not_noUB
   bdUbChecksCall_anneal_ret
   bdUbChecksCall_handled
   bdUnreach_anneal_ub
@@ -5857,10 +5856,10 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge
   statementOk_retag_proj
   evalStmt_retag_scalar_ub
   evalStmt_retag_scalar_noop
-  evalStmt_deinit_proj_keeps
+  evalStmt_deinit_proj_deinits
   paddedDeinitRead_not_inFragment
   paddedDeinitRead_translate
-  paddedDeinitRead_anneal_ret
+  paddedDeinitRead_anneal_ub
   paddedDeinitRead_minirust_ub
   paddedRetagRead_not_inFragment
   paddedRetagRead_translate
@@ -5902,7 +5901,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge
   paddedDeinitSiblingRetagReinit_anneal_ret
   paddedDeinitSiblingRetagReinit_minirust_ret_from_start
   paddedDeinitRetagHole_not_inFragmentD
-  paddedDeinitRetagHole_diverges
+  paddedDeinitRetagHole_both_ub
   deinitSiblingReinit_inFragmentD
   deinitSiblingReinit_minirust_ret_from_start
   deinitSiblingReinit_minirust_noUB
@@ -5947,10 +5946,10 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.DeinitBridge
   paddedDeinitBinOpDivZero_minirust_ub_direct
   paddedDeinitHoleBinOp_not_inFragmentD
   paddedDeinitHoleBinOp_translate
-  paddedDeinitHoleBinOp_diverges
+  paddedDeinitHoleBinOp_both_ub
   paddedDeinitHoleCastRead_not_inFragmentD
   paddedDeinitHoleCastRead_translate
-  paddedDeinitHoleCastRead_diverges
+  paddedDeinitHoleCastRead_both_ub
   ctxPadded3_ok_u32_u32
   deinitSiblingBinOpWindowReinit_inFragmentD
   deinitSiblingBinOpWindowReinit_not_inFragment
@@ -7009,6 +7008,7 @@ example
     (∀ elemVal,
       idx < len →
       Trusted.Sequence.get? elems (rawElemOffset + baseIdx + idx) = some elemVal →
+      valueContainsUninit elemVal = false →
       validateValueForTy? emptyLayoutTable
         (placeTyResolved localDecls emptyLayoutTable ⟨sIdx, [.deref, .index idxLocal]⟩) elemVal = true →
       evalPlaceRead locals ⟨sIdx, [.deref, .index idxLocal]⟩ mem.borrows mem.globals
@@ -7119,6 +7119,7 @@ example
       minLen ≤ len →
       ((fromEnd = false ∧ offset < minLen) ∨ (fromEnd = true ∧ 1 ≤ offset ∧ offset ≤ minLen)) →
       Trusted.Sequence.get? elems (rawElemOffset + baseIdx + idx) = some elemVal →
+      valueContainsUninit elemVal = false →
       projOk decls len (.constantIndex offset minLen fromEnd) = true ∧
       readProjectedValue locals (.aggregate 0 window) [.constantIndex offset minLen fromEnd] =
         .ok elemVal) ∧
@@ -7127,6 +7128,7 @@ example
       minLen ≤ len →
       len < offset →
       Trusted.Sequence.get? elems (rawElemOffset + baseIdx) = some elem0 →
+      valueContainsUninit elem0 = false →
       projOk decls len (.constantIndex offset minLen true) = false ∧
       readProjectedValue locals (.aggregate 0 window) [.constantIndex offset minLen true] =
         .ok elem0) :=

@@ -11260,6 +11260,7 @@ private theorem stepMirFn_rawPtr_cmp_copy_eq
   have hop₁ : evalOperand s.frame.locals (.copy ⟨lhsIdx, .nil⟩) s.memory.borrows s.memory.globals
       body.layouts s.memory.callerLocals body.localDecls = .ok v₁ s.frame.locals := by
     unfold evalOperand readProjectedValue; dsimp only []; rw [hlhs]
+    rcases hv₁ with rfl | ⟨p₁, rfl, _⟩ <;> rfl
   have hop₂ : evalOperand s.frame.locals (.copy ⟨rhsIdx, .nil⟩) s.memory.borrows s.memory.globals
       body.layouts s.memory.callerLocals body.localDecls = .ok (.ptr p₂ 8) s.frame.locals := by
     unfold evalOperand readProjectedValue; dsimp only []; rw [hrhs]

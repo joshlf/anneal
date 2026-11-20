@@ -2578,6 +2578,7 @@ theorem evalPlaceRead_index_wideSlice_borrowBacked_two_sided_simulation
     (∀ elemVal elemMp,
       idxSc.bits < lenSc.bits →
       get? elems (rawElemOffset + baseIdx + idxSc.bits) = some elemVal →
+      valueContainsUninit elemVal = false →
       validateValueForTy? layouts
         (placeTyResolved localDecls layouts ⟨sIdx, [.deref, .index idxLocal]⟩) elemVal = true →
       elemLay.size.bytes.toNat * idxSc.bits < 2 ^ 63 →
@@ -2631,7 +2632,7 @@ theorem evalPlaceRead_index_wideSlice_borrowBacked_two_sided_simulation
         simp only [evalPlaceRead, evalSliceFatPtrDerefRead, hsl_slot, hpointeeTy, hptrBytes,
           hlen_sz, halign_deref, hborrow, hp, hslot, halign_target, hbacking, hsz_opt, hoff,
           hrem_ble, readProjectedValue, hidx_slot, hget_none, Nat.beq_refl, Bool.and_self]
-  · intro elemVal elemMp hlt_idx hget_elem hvalid hmul_lt hsized hproj_off
+  · intro elemVal elemMp hlt_idx hget_elem hno_uninit hvalid hmul_lt hsized hproj_off
     have hget_some :
         get? (takeValues lenSc.bits (dropValues (Nat.add rawElemOffset baseIdx) elems))
           idxSc.bits = some elemVal := by
@@ -2649,7 +2650,8 @@ theorem evalPlaceRead_index_wideSlice_borrowBacked_two_sided_simulation
         all_goals
           simp only [evalPlaceRead, evalSliceFatPtrDerefRead, hsl_slot, hpointeeTy, hptrBytes,
             hlen_sz, halign_deref, hborrow, hp, hslot, halign_target, hbacking, hsz_opt, hoff,
-            hrem_ble, readProjectedValue, hidx_slot, hget_some, hvalid, Nat.beq_refl, Bool.and_self]
+            hrem_ble, readProjectedValue, hidx_slot, hget_some, hno_uninit, hvalid, Nat.beq_refl,
+            Bool.and_self]
     · have hsliceOrStr :
           (slicePointeeTyId elemId == strPointeeTyId ||
             (2100 ≤ slicePointeeTyId elemId && slicePointeeTyId elemId < 2200)) = true := by
@@ -2784,6 +2786,7 @@ theorem placeDynamic_constantIndex_wideSlice_two_sided_simulation
       minLen ≤ lenSc.bits →
       ((fromEnd = false ∧ offset < minLen) ∨ (fromEnd = true ∧ 1 ≤ offset ∧ offset ≤ minLen)) →
       get? elems (rawElemOffset + baseIdx + idx) = some elemVal →
+      valueContainsUninit elemVal = false →
       readProjectedValue locals (.aggregate 0 window) [.constantIndex offset minLen fromEnd] =
         .ok elemVal ∧
       Miri.Interpreter.PlaceDynamic.constantIndex
@@ -2822,7 +2825,10 @@ theorem placeDynamic_constantIndex_wideSlice_two_sided_simulation
         match Nat.ble m (length fs) with
         | true =>
           match get? fs (if fe then Nat.sub (length fs) o else o) with
-          | some elemVal => .ok elemVal
+          | some elemVal =>
+            match valueContainsUninit elemVal with
+            | false => .ok elemVal
+            | true => .ub
           | none => .ub
         | false => .ub := by
     intro fs o m fe
@@ -2841,7 +2847,7 @@ theorem placeDynamic_constantIndex_wideSlice_two_sided_simulation
       rw [EStateM.bind_eq_ok hlen_eval]
       simp only [hU64Lt, ↓reduceIte]
       rfl
-  · intro elemVal hMinLe hWf hGetElem
+  · intro elemVal hMinLe hWf hGetElem hNoUninit
     have hBleT : Nat.ble minLen (length window) = true := by
       rw [hWinLen, Nat.ble_eq]
       exact hMinLe
@@ -2861,12 +2867,12 @@ theorem placeDynamic_constantIndex_wideSlice_two_sided_simulation
     · rcases hWf with ⟨rfl, _⟩ | ⟨rfl, _, _⟩
       · simp only [idx, Bool.false_eq_true, ↓reduceIte] at hWinGet
         rw [hRpv, hBleT]
-        simp only [Bool.false_eq_true, ↓reduceIte, hWinGet]
+        simp only [Bool.false_eq_true, ↓reduceIte, hWinGet, hNoUninit]
       · simp only [idx, ↓reduceIte] at hWinGet
         have hSubEq : Nat.sub (length window) offset = lenSc.bits - offset := by
           rw [hWinLen]; rfl
         rw [hRpv, hBleT]
-        simp only [↓reduceIte, hSubEq, hWinGet]
+        simp only [↓reduceIte, hSubEq, hWinGet, hNoUninit]
     · unfold Miri.Interpreter.PlaceDynamic.constantIndex
       rw [EStateM.bind_eq_ok hlen_eval]
       simp only [hNotLtMin, ↓reduceIte]

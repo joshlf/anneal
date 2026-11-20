@@ -529,6 +529,14 @@ structure TypeLayout : Type where
       `decodeValueFromBytes` checks to enforce per-field `ScalarLayout`
       bit-validity ranges across multi-field structs. -/
   fieldLayouts : List Nat := .nil
+  /-- Optional per-variant machine discriminant bit patterns (masked to the tag
+      scalar's bit width) in variant-index order `0 .. variants.length - 1` for
+      multi-variant enums (`VariantsShape.multiple`). When empty (`.nil`),
+      variants use the default contiguous discriminants `0 .. variants.length - 1`;
+      when populated, `variantDiscriminants[varIdx]` gives the exact unsigned tag
+      bit pattern assigned to variant `varIdx` (including explicit positive,
+      sparse, `u128`, or two's-complement negative `#[repr(iN)]` discriminants). -/
+  variantDiscriminants : List Nat := .nil
 
 /--
 Check structural well-formedness of a `TypeLayout` entry: `l.align` must be a

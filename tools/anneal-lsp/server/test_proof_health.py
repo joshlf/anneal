@@ -5416,12 +5416,18 @@ class TestEpisode2ProjectionAndRewriteOrderHazards(unittest.TestCase):
         self.assertEqual(proof_health.scan_lean_file(EPISODE1_ADT_AND_CONTROL), [])
         adv = proof_health.scan_lean_file(EPISODE1_ADT_AND_CONTROL, include_advisories=True)
         self.assertEqual(
-            [(f.rule, f.line) for f in adv],
+            [f.rule for f in adv],
             [
-                (proof_health.RULE_TRY_RW_HYP_BEFORE_TARGET, 26879),
-                (proof_health.RULE_TRY_RW_HYP_BEFORE_TARGET, 26880),
+                proof_health.RULE_TRY_RW_HYP_BEFORE_TARGET,
+                proof_health.RULE_TRY_RW_HYP_BEFORE_TARGET,
             ],
         )
+        self.assertEqual(adv[1].line, adv[0].line + 1)
+        adt_lines = EPISODE1_ADT_AND_CONTROL.read_text(encoding="utf-8").splitlines()
+        for finding in adv:
+            src_line = adt_lines[finding.line - 1]
+            self.assertIn("try rw", src_line)
+            self.assertIn("⊢", src_line)
         # Subsequent default scan must still return `[]` (no cache cross-talk).
         self.assertEqual(proof_health.scan_lean_file(EPISODE1_ADT_AND_CONTROL), [])
 

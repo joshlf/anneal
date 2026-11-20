@@ -12030,7 +12030,7 @@ theorem evalReturn_caller_spec {callerBody calleeBody : CapturedMir}
       cases retVal with
       | aggregate v fs =>
         exact False.elim (not_slotOk_aggregate rfl v fs hvOk)
-      | unit | ptr =>
+      | unit | ptr | uninit =>
         simp [SlotOk] at hvOk
       | scalar scNew =>
         obtain ⟨hscNewSz, hscNewLt⟩ := hvOk
@@ -12106,7 +12106,7 @@ theorem evalReturn_caller_spec {callerBody calleeBody : CapturedMir}
       cases retVal with
       | aggregate v fs =>
         exact False.elim (not_slotOk_aggregate rfl v fs hvOk)
-      | unit | ptr =>
+      | unit | ptr | uninit =>
         simp [SlotOk] at hvOk
       | scalar scNew =>
         obtain ⟨hscNewSz, hscNewLt⟩ := hvOk

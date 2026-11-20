@@ -45,11 +45,15 @@ correspondence-local copy of the **pre-Stage-1** (`origin/sup/lm-0` at
 (`Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn`) does **not** implement them:
 
 * Stage-1 `classifyRustIntrinsic?` (`Terminators.lean:898`) recognizes none of
-  `write_bytes`, `rotate_left`, `rotate_right`, `wrapping_offset`, or the
+  `rotate_left`, `rotate_right`, `wrapping_offset`, or the
   `std::intrinsics::*` aliases, so Stage-1 turns an unlinked call to any of them
   into an external call (`MirStepNode.extCall`,
   `evalTerminator_stage1_unclassified_call_extCall`), whereas
-  `evalTerminatorLM4_2` executes them inline;
+  `evalTerminatorLM4_2` executes them inline; Stage-1 executes `write_bytes`
+  inline with its own `Trusted.Rustc.V2026_06_01.MirSemantics.evalWriteBytesCall`
+  (single-element primitive writes at offset `0`, `.ub` past the end of a whole
+  local, `.unsupported` on untracked pointers and other shapes), which is not
+  `evalWriteBytesCall` below;
 * Stage-1 `evalCopyNonOverlapping` (`Statements.lean:1739`) differs from
   `evalCopyNonOverlappingLM4_2` (no alignment check when `count = 0`, no bounds
   check on distinct-local multi-element copies, same-tag ranges always treated
@@ -161,8 +165,8 @@ def repeatByteBits (byte : Nat) : Nat → Nat
 
 /-- Evaluate `core::intrinsics::write_bytes::<T>(dst, val, count)` on the
 evaluated arguments `dstVal`, `val`, and `count` (pre-Stage-1 reference model
-only: Stage-1 `Trusted` has no `write_bytes` evaluator and turns the call into
-`MirStepNode.extCall`, `evalTerminator_stage1_unclassified_call_extCall`). -/
+only: Stage-1 `Trusted` evaluates the call with its own, more restrictive
+`Trusted.Rustc.V2026_06_01.MirSemantics.evalWriteBytesCall`). -/
 def evalWriteBytesCall
     (s : MachineState)
     (dstOp : Operand)
@@ -383,8 +387,10 @@ def evalInlineIntrinsicCall?
 /-- Pre-Stage-1 reference terminator evaluator (**not** Stage-1 `evalTerminator`):
 on an unlinked direct call it runs `evalInlineIntrinsicCall?`, executing
 `rotate_left`, `rotate_right`, `write_bytes`, and the `wrapping_offset` /
-`std::intrinsics::*` aliases inline, all of which Stage-1 `evalTerminator` turns
-into `MirStepNode.extCall` (`evalTerminator_stage1_unclassified_call_extCall`). -/
+`std::intrinsics::*` aliases inline; Stage-1 `evalTerminator` turns all of them
+except `write_bytes` into `MirStepNode.extCall`
+(`evalTerminator_stage1_unclassified_call_extCall`) and evaluates `write_bytes`
+with its own `Trusted.Rustc.V2026_06_01.MirSemantics.evalWriteBytesCall`. -/
 def evalTerminatorLM4_2
     (s : MachineState)
     (term : Terminator)
@@ -1993,10 +1999,11 @@ Stage-1 `evalTerminator` evaluates an unlinked direct call inline only when it i
 `exact_div` or `classifyRustIntrinsic?` (`Terminators.lean:898`) recognizes its
 `DefPath`; every other unlinked direct call becomes an external call
 (`MirStepNode.extCall`, an interaction with the environment). In particular
-Stage-1 does **not** execute `write_bytes`, `rotate_left`, `rotate_right`,
-`wrapping_offset`, or the `std::intrinsics::*` aliases, which the pre-Stage-1
-reference model `evalTerminatorLM4_2` and `lean-miri` (through
-`annealCallHooks`) execute inline. -/
+Stage-1 does **not** execute `rotate_left`, `rotate_right`, `wrapping_offset`,
+or the `std::intrinsics::*` aliases, which the pre-Stage-1 reference model
+`evalTerminatorLM4_2` and `lean-miri` (through `annealCallHooks`) execute inline.
+(`classifyRustIntrinsic?` recognizes `core::intrinsics::write_bytes`, which
+Stage-1 executes inline with its own `evalWriteBytesCall`.) -/
 
 /-- **Stage-1 external-call boundary**: Stage-1 `evalTerminator` on an unlinked
 direct call whose `DefPath` is neither `exact_div` nor recognized by
@@ -2037,9 +2044,9 @@ theorem evalTerminator_stage1_unclassified_call_extCall
   | unsupported => rfl
 
 /-- The `AnnealIntrinsic`s that Stage-1 `evalTerminator` does not evaluate inline
-(`write_bytes`, `rotate_left`, `rotate_right`, `wrapping_offset`). -/
+(`rotate_left`, `rotate_right`, `wrapping_offset`). -/
 def AnnealIntrinsic.stage1Unmodeled : AnnealIntrinsic → Bool
-  | .writeBytes | .rotateLeft | .rotateRight | .wrappingOffset => true
+  | .rotateLeft | .rotateRight | .wrappingOffset => true
   | _ => false
 
 /-- Stage-1 `classifyRustIntrinsic?` recognizes no `stage1Unmodeled` intrinsic. -/
@@ -2061,11 +2068,11 @@ theorem stage1_std_offset_aliases_unclassified :
 
 /-- **`stepMirFn_stage1_unmodeled_intrinsic_extCall` (`LM-4.2`, Stage-1
 boundary)**: one real Stage-1 `stepMirFn` step at an unlinked call of
-`write_bytes`, `rotate_left`, `rotate_right`, or `wrapping_offset` is an external
-call (`MirStepNode.extCall`) after argument evaluation. Stage-1 therefore never
-takes the inline step that `stepMirFnLM4_2` and `lean-miri` take, so the
-`write_bytes` / `rotate` / `wrapping_offset` simulation theorems over
-`stepMirFnLM4_2` do not transfer to Stage-1. -/
+`rotate_left`, `rotate_right`, or `wrapping_offset` is an external call
+(`MirStepNode.extCall`) after argument evaluation. Stage-1 therefore never takes
+the inline step that `stepMirFnLM4_2` and `lean-miri` take, so the `rotate` /
+`wrapping_offset` simulation theorems over `stepMirFnLM4_2` do not transfer to
+Stage-1. -/
 theorem stepMirFn_stage1_unmodeled_intrinsic_extCall
     {body : CapturedMir} {s : MachineState}
     (hcal : s.memory.activeCallee = none)
@@ -2097,9 +2104,10 @@ theorem stepMirFn_stage1_unmodeled_intrinsic_extCall
   obtain ⟨hcls, hexact⟩ := AnnealIntrinsic.stage1Unmodeled_classify hk
   exact evalTerminator_stage1_unclassified_call_extCall hcls hexact hterm hc hcallee
 
-/-- The 11 `AnnealIntrinsic`s that Stage-1 `evalTerminator` evaluates inline
+/-- The 12 `AnnealIntrinsic`s that Stage-1 `evalTerminator` evaluates inline
 (`exact_div`, `arith_offset`, `ctpop`, `ctlz`, `ctlz_nonzero`, `cttz`,
-`cttz_nonzero`, `bswap`, `bitreverse`, `saturating_add`, `saturating_sub`). -/
+`cttz_nonzero`, `bswap`, `bitreverse`, `saturating_add`, `saturating_sub`,
+`write_bytes`). -/
 def AnnealIntrinsic.stage1Modeled (k : AnnealIntrinsic) : Bool :=
   !k.stage1Unmodeled
 
@@ -2436,6 +2444,11 @@ Stage-1 `classifyRustIntrinsic?` (`Terminators.lean:898`) recognizes 15 addition
   `lean-miri`'s `Intrinsics.eval` (`Intrinsics.lean:535-537`) returns `false` so
   they enter their MIR fallback bodies;
 * `ub_checks`, `const_eval_select`, `size_of_val`, and `align_of_val`.
+
+(Stage-1 also executes the call form of `core::intrinsics::copy_nonoverlapping`
+inline, which `rustc`'s `LowerIntrinsics` pass normally rewrites into the
+`NonDivergingIntrinsic::CopyNonOverlapping` statement; it is not an
+`AnnealIntrinsic` either.)
 
 Because `AnnealIntrinsic.ofDefPath?` returns `none` on each of these paths,
 `translateCalleeOperand` translates the callee constant as a generic zero-sized

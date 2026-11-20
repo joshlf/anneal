@@ -3515,6 +3515,33 @@ and whose remaining `n - 1` sibling slots hold `.unit`, matching both
 def unionSlotFields (n f : Nat) (v : Value) : List Value :=
   appendValueList (replicateValue f .unit) (v :: replicateValue (Nat.sub n (.succ f)) .unit)
 
+private theorem valueListContainsUninit_replicateValue_unit :
+    ∀ k : Nat, valueListContainsUninit (replicateValue k .unit) = false
+  | 0 => rfl
+  | k + 1 => by
+    dsimp only [replicateValue, valueListContainsUninit, valueContainsUninit]
+    exact valueListContainsUninit_replicateValue_unit k
+
+private theorem valueListContainsUninit_appendValueList :
+    ∀ (xs ys : List Value),
+      valueListContainsUninit xs = false →
+      valueListContainsUninit ys = false →
+      valueListContainsUninit (appendValueList xs ys) = false
+  | [], ys, _, hy => hy
+  | x :: xs, ys, hx, hy => by
+    dsimp only [appendValueList, valueListContainsUninit] at hx ⊢
+    cases hvc : valueContainsUninit x <;> rw [hvc] at hx
+    · exact valueListContainsUninit_appendValueList xs ys hx hy
+    · cases hx
+
+theorem valueContainsUninit_unionSlotFields_scalar (n f : Nat) (sc : MirAst.ScalarInt) :
+    valueContainsUninit (.aggregate 0 (unionSlotFields n f (.scalar sc))) = false := by
+  dsimp only [valueContainsUninit, unionSlotFields]
+  refine valueListContainsUninit_appendValueList _ _
+    (valueListContainsUninit_replicateValue_unit f) ?_
+  dsimp only [valueListContainsUninit, valueContainsUninit]
+  exact valueListContainsUninit_replicateValue_unit (Nat.sub n (.succ f))
+
 /-- A union of `S ∈ {1, 2, 4, 8, 16}` bytes: its `lean-miri` layout has
 `FieldsShape.Union` with at least one field, size `S`, an alignment that
 `Align.fromBytes` accepts, `uTy.layoutIdx ∈ (0, 900)` (so `100 + uTy.layoutIdx < 1000`

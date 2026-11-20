@@ -109,9 +109,33 @@ private theorem readProjectedValue_index
       match get? locals idxLocal with
       | .some (.init (.scalar sc)) =>
         match get? fields sc.bits with
-        | .some elemVal => .ok elemVal
+        | .some elemVal =>
+          match valueContainsUninit elemVal with
+          | false => .ok elemVal
+          | true => .ub
         | .none => .ub
       | _ => .ub := rfl
+
+private theorem valueContainsUninit_scalar (sc : ScalarInt) :
+    valueContainsUninit (.scalar sc) = false := rfl
+
+private theorem valueContainsUninit_aggregate (v : Nat) (fs : List Value) :
+    valueContainsUninit (.aggregate v fs) = valueListContainsUninit fs := rfl
+
+private theorem valueListContainsUninit_nil :
+    valueListContainsUninit .nil = false := rfl
+
+private theorem valueListContainsUninit_cons (v : Value) (vs : List Value) :
+    valueListContainsUninit (v :: vs) =
+      (match valueContainsUninit v with
+       | true => true
+       | false => valueListContainsUninit vs) := rfl
+
+private theorem valueListContainsUninit_map_u32 (elems : List Nat) :
+    valueListContainsUninit (elems.map (fun x => Value.scalar ⟨x, 4⟩)) = false := by
+  induction elems with
+  | nil => rfl
+  | cons _ tl ih => exact ih
 
 /--
 `runMirTauToBlock` unfolding that keeps the continuation folded until the step
@@ -384,7 +408,9 @@ private theorem fastSliceSum_h_body
       | dsimp only [runMirTauToBlock_succ, tauThen_tau, fastSliceSumMkState, fastSliceSumBody,
           encodeU32Slice, optSlot, stepMirFn, MirStepNode.step, evalStmt,
           advanceStmt, evalRvalue, evalOperand, evalConstValue, readProjectedValue,
-          readProjectedValue_index, evalPlaceWrite, operandIsSigned, operandTy, placeTy,
+          readProjectedValue_index, valueContainsUninit_scalar, valueContainsUninit_aggregate,
+          valueListContainsUninit_nil, valueListContainsUninit_cons,
+          evalPlaceWrite, operandIsSigned, operandTy, placeTy,
           tyIsSigned, evalTerminator, applyUnwindAction, Option.getD, GetElem?.getElem?,
           List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq,
           instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or,
@@ -453,8 +479,20 @@ theorem dwp_fastSliceSumBody_trace
     }
     memory := emptyMemory }
 
+private theorem evalPlaceLen_encodeU32Slice
+    (elems : List Nat) (locals : List LocalSlot)
+    (h1 : get? locals 1 = .some (.init (encodeU32Slice elems))) :
+    evalPlaceLen locals (locPlace 1) emptyMemory safeSliceSumBody.localDecls emptyLayoutTable =
+      .ok (.scalar ⟨(elems.map (fun x => Value.scalar ⟨x, 4⟩)).length, 8⟩) locals emptyMemory := by
+  unfold evalPlaceLen evalPlaceRead locPlace safeSliceSumBody mkMirBody u32ArrayMirTy
+  rw [h1]
+  dsimp only [placeTy, resolveProjectedTy, splitLastDeref?, get?, GetElem?.getElem?,
+    List.get?Internal, encodeU32Slice, readProjectedValue]
+  rw [valueContainsUninit_aggregate, valueListContainsUninit_map_u32]
+  rfl
+
 /--
-`bb2` `Len(_1)` step by `rfl` (sparing `dsimp` the `evalPlaceLen` unfolding); the
+`bb2` `Len(_1)` step by `evalPlaceLen_encodeU32Slice` + `rfl`; the
 slice length is left as `(elems.map _).length` for `List.length_map`.
 -/
 private theorem safeSliceSum_bb2_len_step (elems : List Nat) (n i : Nat)
@@ -467,7 +505,21 @@ private theorem safeSliceSum_bb2_len_step (elems : List Nat) (n i : Nat)
                 (safeSliceSumMkState elems n 2 i (some (.scalar ⟨1, 1⟩)) rest).frame.locals.set 6
                   (.init (.scalar ⟨(elems.map (fun x => Value.scalar ⟨x, 4⟩)).length, 8⟩)) }
           memory := emptyMemory }) := by
-  rcases rest with _ | ⟨_, _, _, _, _⟩ <;> rfl
+  rcases rest with _ | ⟨_, _, _, _, _⟩ <;>
+    (change
+       (match
+          evalPlaceLen
+            (safeSliceSumMkState elems n 2 i (some (.scalar ⟨1, 1⟩)) _).frame.locals
+            (locPlace 1)
+            emptyMemory
+            safeSliceSumBody.localDecls
+            emptyLayoutTable
+        with
+        | .ok val locals₁ mem₁ => _
+        | .ub => _
+        | .unsupported => _) = _
+     rw [evalPlaceLen_encodeU32Slice elems _ rfl]
+     rfl)
 
 private theorem safeSliceSum_header_switch_raw
     (elems : List Nat) (n i : Nat) (o5 : Option Value)
@@ -500,7 +552,9 @@ private theorem safeSliceSum_h_body
       | dsimp only [runMirTauToBlock_succ, tauThen_tau, safeSliceSumMkState, safeSliceSumBody,
           encodeU32Slice, Option.map, optSlot, stepMirFn, MirStepNode.step, evalStmt,
           advanceStmt, evalRvalue, evalOperand, evalConstValue, readProjectedValue,
-          readProjectedValue_index, evalPlaceWrite, operandIsSigned, operandTy, placeTy,
+          readProjectedValue_index, valueContainsUninit_scalar, valueContainsUninit_aggregate,
+          valueListContainsUninit_nil, valueListContainsUninit_cons,
+          evalPlaceWrite, operandIsSigned, operandTy, placeTy,
           tyIsSigned, evalTerminator, applyUnwindAction, Option.getD, GetElem?.getElem?,
           List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq,
           instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or,
@@ -2096,6 +2150,7 @@ private theorem incHelperSummary_eq_refactored (dp : DefPath) (args : List Value
     | unit => rfl
     | ptr _ _ => rfl
     | aggregate _ _ => rfl
+    | uninit => rfl
 
 /--
 Full modular composition canary:
@@ -4001,6 +4056,351 @@ def safeFnPtrStandaloneEnv : MirCallEnv :=
     else if dp == "test::ext_ret_twenty_fp" then some extReturnTwentyFpBody
     else none)
 
+private def eTen65536_5I : FnPtrEntry :=
+  { allocId := 65536, defPath := "test::fn_ten", typeArgs := [], fnSig := some u32FnPtrMirTy.kind }
+
+private def eTwenty65536_5I : FnPtrEntry :=
+  { allocId := 65536, defPath := "test::fn_twenty", typeArgs := [], fnSig := some u32FnPtrMirTy.kind }
+
+private def eTwenty65537_5I : FnPtrEntry :=
+  { allocId := 65537, defPath := "test::fn_twenty", typeArgs := [], fnSig := some u32FnPtrMirTy.kind }
+
+private def fpTenVal_5I : Value := .ptr { allocId := 65536, offsetBytes := 0 } 8
+
+private def fpTwenty65537Val_5I : Value := .ptr { allocId := 65537, offsetBytes := 0 } 8
+
+private theorem extReifyTwenty_run_5I (x : Nat) :
+    runMirWithGap MirCallEnv.unresolved fnPtrCallees extReifyTwentyBody 6 [.scalar ⟨x, 4⟩] =
+      .ok (.scalar ⟨wrapScalarBits (x + 1) (scalarModulus 4), 4⟩,
+        { (initMachineStateWithCallees extReifyTwentyBody [] fnPtrCallees).memory with
+          fnPtrs := [eTwenty65536_5I] }) := rfl
+
+private theorem mirGapBehaviors_equiv_of_map_fst_ok_5I
+    {env : MirCallEnv} {callees : List CapturedMir}
+    {b₁ b₂ : CapturedMir} {f₁ f₂ : Nat} {args₁ args₂ : List Value} {v : Value}
+    (hm₁ : (runMirWithGap env callees b₁ f₁ args₁).map Prod.fst = .ok v)
+    (hm₂ : (runMirWithGap env callees b₂ f₂ args₂).map Prod.fst = .ok v) :
+    OutcomeSetEquiv (GapEqErr (fun r₁ r₂ : MirReturn => r₁.1 = r₂.1) (· = ·))
+      (mirGapBehaviors env callees b₁ args₁)
+      (mirGapBehaviors env callees b₂ args₂) := by
+  refine mirGapBehaviors_equiv_of_runs (fuel₁ := f₁) (fuel₂ := f₂) ?_ ?_
+  · intro h₀; rw [h₀] at hm₁; cases hm₁
+  · cases ho₁ : runMirWithGap env callees b₁ f₁ args₁ with
+    | ok r₁ =>
+      cases ho₂ : runMirWithGap env callees b₂ f₂ args₂ with
+      | ok r₂ =>
+        rw [ho₁] at hm₁; rw [ho₂] at hm₂
+        exact (OutcomeWithGap.ok.inj hm₁).trans (OutcomeWithGap.ok.inj hm₂).symm
+      | fault _ => rw [ho₂] at hm₂; cases hm₂
+      | gap _ => rw [ho₂] at hm₂; cases hm₂
+    | fault _ => rw [ho₁] at hm₁; cases hm₁
+    | gap _ => rw [ho₁] at hm₁; cases hm₁
+
+private theorem mirGapBehaviors_not_equiv_of_map_fst_ok_ne_5I
+    {env : MirCallEnv} {callees : List CapturedMir}
+    {b₁ b₂ : CapturedMir} {f₁ f₂ : Nat} {args₁ args₂ : List Value} {v₁ v₂ : Value}
+    (hm₁ : (runMirWithGap env callees b₁ f₁ args₁).map Prod.fst = .ok v₁)
+    (hm₂ : (runMirWithGap env callees b₂ f₂ args₂).map Prod.fst = .ok v₂)
+    (hne : v₁ ≠ v₂) :
+    ¬ OutcomeSetEquiv (GapEqErr (fun r₁ r₂ : MirReturn => r₁.1 = r₂.1) (· = ·))
+      (mirGapBehaviors env callees b₁ args₁)
+      (mirGapBehaviors env callees b₂ args₂) := by
+  intro hEq
+  have hne₁ : runMirWithGap env callees b₁ f₁ args₁ ≠ .gap .outOfFuel := by
+    intro h₀; rw [h₀] at hm₁; cases hm₁
+  have hne₂ : runMirWithGap env callees b₂ f₂ args₂ ≠ .gap .outOfFuel := by
+    intro h₀; rw [h₀] at hm₂; cases hm₂
+  have hrel := (mirGapBehaviors_equiv_iff_of_runs hne₁ hne₂).mp hEq
+  cases ho₁ : runMirWithGap env callees b₁ f₁ args₁ with
+  | ok r₁ =>
+    cases ho₂ : runMirWithGap env callees b₂ f₂ args₂ with
+    | ok r₂ =>
+      rw [ho₁] at hm₁; rw [ho₂] at hm₂; rw [ho₁, ho₂] at hrel
+      exact hne ((OutcomeWithGap.ok.inj hm₁).symm.trans (Eq.trans hrel (OutcomeWithGap.ok.inj hm₂)))
+    | fault _ => rw [ho₂] at hm₂; cases hm₂
+    | gap _ => rw [ho₂] at hm₂; cases hm₂
+  | fault _ => rw [ho₁] at hm₁; cases hm₁
+  | gap _ => rw [ho₁] at hm₁; cases hm₁
+
+private theorem fnPtrAcross_safe_map_5I (x : Nat) :
+    (runMirWithGap safeFnPtrStandaloneEnv fnPtrCallees fnPtrAcrossExtCallBody 15
+      [.scalar ⟨x, 4⟩]).map Prod.fst =
+      .ok (.scalar ⟨wrapScalarBits
+        (wrapScalarBits (x + 1) (scalarModulus 4) + wrapScalarBits (x + 10) (scalarModulus 4))
+        (scalarModulus 4), 4⟩) := by
+  let m0 := (initMachineStateWithCallees fnPtrAcrossExtCallBody [] fnPtrCallees).memory
+  let mTen : Memory := { m0 with fnPtrs := [eTen65536_5I] }
+  let mBoth : Memory := { m0 with fnPtrs := [eTwenty65537_5I, eTen65536_5I] }
+  let s1 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 1, locals := [.uninit, .init (.scalar ⟨x, 4⟩), .uninit, .dead, .dead] }, memory := m0 }
+  let s2 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 2, locals := [.uninit, .init (.scalar ⟨x, 4⟩), .init fpTenVal_5I, .dead, .dead] }, memory := mTen }
+  let s3 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 3, locals := [.uninit, .init (.scalar ⟨x, 4⟩), .init fpTenVal_5I, .uninit, .dead] }, memory := mTen }
+  let s4 : MachineState :=
+    { frame := { blockIdx := 1, stmtIdx := 0, locals := [.uninit, .init (.scalar ⟨x, 4⟩), .init fpTenVal_5I, .init (.scalar ⟨wrapScalarBits (x + 1) (scalarModulus 4), 4⟩), .dead] }, memory := mBoth }
+  let req3 : MirCallReq :=
+    { defPath := "test::ext_reify_twenty", typeArgs := [], args := [.scalar ⟨x, 4⟩], memory := mTen }
+  let k3 : MirCallAns → MirSiteState := fun ans =>
+    mirNextSiteState fnPtrAcrossExtCallBody (.running s3)
+      (resumeExternalCall s3 s3.frame.locals (locPlace 3) 1 .continue_ ans)
+  have hStep1 : mirSiteGapStep safeFnPtrStandaloneEnv fnPtrAcrossExtCallBody
+      (mirSiteOfExec fnPtrAcrossExtCallBody (.running
+        (initMachineStateWithCallees fnPtrAcrossExtCallBody [.scalar ⟨x, 4⟩] fnPtrCallees))) =
+      .next (.running s1) := rfl
+  have hStep2 : mirSiteGapStep safeFnPtrStandaloneEnv fnPtrAcrossExtCallBody (.running s1) =
+      .next (.running s2) := rfl
+  have hStep3 : mirSiteGapStep safeFnPtrStandaloneEnv fnPtrAcrossExtCallBody (.running s2) =
+      .next (.running s3) := rfl
+  have hSite3 : stepMirSiteState fnPtrAcrossExtCallBody (.running s3) =
+      .vis (.inr (.inr (.call req3))) k3 := rfl
+  have hEnv3 : safeFnPtrStandaloneEnv req3 =
+      .ok (.returned (.scalar ⟨wrapScalarBits (x + 1) (scalarModulus 4), 4⟩) mBoth) := by
+    have hLookup : (if req3.defPath == "test::ext_reify_twenty" then some extReifyTwentyBody
+        else if req3.defPath == "test::ext_ret_twenty_fp" then some extReturnTwentyFpBody else none) =
+        some extReifyTwentyBody := rfl
+    unfold safeFnPtrStandaloneEnv Anneal.Pass.MirCallEnv.ofStandaloneBody
+      Anneal.Pass.MirCallEnv.ofStandaloneOutcome
+    dsimp only
+    rw [hLookup]
+    dsimp only
+    rw [extReifyTwenty_run_5I x]
+    rfl
+  have hCall : mirSiteGapStep safeFnPtrStandaloneEnv fnPtrAcrossExtCallBody (.running s3) =
+      .next (.running s4) := by
+    unfold mirSiteGapStep Anneal.Pass.gapStep
+    rw [hSite3]
+    dsimp only [Anneal.Pass.mirGapHandle, Anneal.Pass.MirCallEnv.seal]
+    rw [hEnv3]
+    rfl
+  have hTail :
+      (Anneal.Pass.runGapSteps (mirSiteGapStep safeFnPtrStandaloneEnv fnPtrAcrossExtCallBody) 11 (.running s4)).map Prod.fst =
+        .ok (.scalar ⟨wrapScalarBits
+          (wrapScalarBits (x + 1) (scalarModulus 4) + wrapScalarBits (x + 10) (scalarModulus 4))
+          (scalarModulus 4), 4⟩) := rfl
+  have hChain : runMirWithGap safeFnPtrStandaloneEnv fnPtrCallees fnPtrAcrossExtCallBody 15 [.scalar ⟨x, 4⟩] =
+      Anneal.Pass.runGapSteps (mirSiteGapStep safeFnPtrStandaloneEnv fnPtrAcrossExtCallBody) 11 (.running s4) :=
+    (Anneal.Pass.runGapSteps_succ_of_next (fuel := 14) _ hStep1).trans
+      ((Anneal.Pass.runGapSteps_succ_of_next (fuel := 13) _ hStep2).trans
+        ((Anneal.Pass.runGapSteps_succ_of_next (fuel := 12) _ hStep3).trans
+          (Anneal.Pass.runGapSteps_succ_of_next (fuel := 11) _ hCall)))
+  exact (congrArg (OutcomeWithGap.map Prod.fst) hChain).trans hTail
+
+private theorem fnPtrAfter_safe_map_5I (x : Nat) :
+    (runMirWithGap safeFnPtrStandaloneEnv fnPtrCallees fnPtrAfterExtCallBody 15
+      [.scalar ⟨x, 4⟩]).map Prod.fst =
+      .ok (.scalar ⟨wrapScalarBits
+        (wrapScalarBits (x + 1) (scalarModulus 4) + wrapScalarBits (x + 10) (scalarModulus 4))
+        (scalarModulus 4), 4⟩) := by
+  let m0 := (initMachineStateWithCallees fnPtrAfterExtCallBody [] fnPtrCallees).memory
+  let mTwenty : Memory := { m0 with fnPtrs := [eTwenty65536_5I] }
+  let a1 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 1, locals := [.uninit, .init (.scalar ⟨x, 4⟩), .dead, .uninit, .dead] }, memory := m0 }
+  let a2 : MachineState :=
+    { frame := { blockIdx := 1, stmtIdx := 0, locals := [.uninit, .init (.scalar ⟨x, 4⟩), .dead, .init (.scalar ⟨wrapScalarBits (x + 1) (scalarModulus 4), 4⟩), .dead] }, memory := mTwenty }
+  let req1 : MirCallReq :=
+    { defPath := "test::ext_reify_twenty", typeArgs := [], args := [.scalar ⟨x, 4⟩], memory := m0 }
+  let k1 : MirCallAns → MirSiteState := fun ans =>
+    mirNextSiteState fnPtrAfterExtCallBody (.running a1)
+      (resumeExternalCall a1 a1.frame.locals (locPlace 3) 1 .continue_ ans)
+  have hStep1 : mirSiteGapStep safeFnPtrStandaloneEnv fnPtrAfterExtCallBody
+      (mirSiteOfExec fnPtrAfterExtCallBody (.running
+        (initMachineStateWithCallees fnPtrAfterExtCallBody [.scalar ⟨x, 4⟩] fnPtrCallees))) =
+      .next (.running a1) := rfl
+  have hSite1 : stepMirSiteState fnPtrAfterExtCallBody (.running a1) =
+      .vis (.inr (.inr (.call req1))) k1 := rfl
+  have hEnv1 : safeFnPtrStandaloneEnv req1 =
+      .ok (.returned (.scalar ⟨wrapScalarBits (x + 1) (scalarModulus 4), 4⟩) mTwenty) := by
+    have hLookup : (if req1.defPath == "test::ext_reify_twenty" then some extReifyTwentyBody
+        else if req1.defPath == "test::ext_ret_twenty_fp" then some extReturnTwentyFpBody else none) =
+        some extReifyTwentyBody := rfl
+    unfold safeFnPtrStandaloneEnv Anneal.Pass.MirCallEnv.ofStandaloneBody
+      Anneal.Pass.MirCallEnv.ofStandaloneOutcome
+    dsimp only
+    rw [hLookup]
+    dsimp only
+    rw [extReifyTwenty_run_5I x]
+    rfl
+  have hCall : mirSiteGapStep safeFnPtrStandaloneEnv fnPtrAfterExtCallBody (.running a1) =
+      .next (.running a2) := by
+    unfold mirSiteGapStep Anneal.Pass.gapStep
+    rw [hSite1]
+    dsimp only [Anneal.Pass.mirGapHandle, Anneal.Pass.MirCallEnv.seal]
+    rw [hEnv1]
+    rfl
+  have hTail :
+      (Anneal.Pass.runGapSteps (mirSiteGapStep safeFnPtrStandaloneEnv fnPtrAfterExtCallBody) 13 (.running a2)).map Prod.fst =
+        .ok (.scalar ⟨wrapScalarBits
+          (wrapScalarBits (x + 1) (scalarModulus 4) + wrapScalarBits (x + 10) (scalarModulus 4))
+          (scalarModulus 4), 4⟩) := rfl
+  have hChain : runMirWithGap safeFnPtrStandaloneEnv fnPtrCallees fnPtrAfterExtCallBody 15 [.scalar ⟨x, 4⟩] =
+      Anneal.Pass.runGapSteps (mirSiteGapStep safeFnPtrStandaloneEnv fnPtrAfterExtCallBody) 13 (.running a2) :=
+    (Anneal.Pass.runGapSteps_succ_of_next (fuel := 14) _ hStep1).trans
+      (Anneal.Pass.runGapSteps_succ_of_next (fuel := 13) _ hCall)
+  exact (congrArg (OutcomeWithGap.map Prod.fst) hChain).trans hTail
+
+private theorem callBothFnPtrs_safe_run_5I :
+    (runMirWithGap safeFnPtrStandaloneEnv fnPtrCallees callBothFnPtrsBody 20
+      [.scalar ⟨5, 4⟩]).map Prod.fst = .ok (.scalar ⟨40, 4⟩) := by
+  have hExtRetFp :
+      runMirWithGap MirCallEnv.unresolved fnPtrCallees extReturnTwentyFpBody 6 [.scalar ⟨5, 4⟩] =
+        .ok (fpTenVal_5I,
+          { (initMachineStateWithCallees extReturnTwentyFpBody [] fnPtrCallees).memory with
+            fnPtrs := [eTwenty65536_5I] }) := rfl
+  let m0 := (initMachineStateWithCallees callBothFnPtrsBody [] fnPtrCallees).memory
+  let mTen : Memory := { m0 with fnPtrs := [eTen65536_5I] }
+  let mBoth : Memory := { m0 with fnPtrs := [eTwenty65537_5I, eTen65536_5I] }
+  let b1 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 1, locals := [.uninit, .init (.scalar ⟨5, 4⟩), .uninit, .dead, .dead, .dead] }, memory := m0 }
+  let b2 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 2, locals := [.uninit, .init (.scalar ⟨5, 4⟩), .init fpTenVal_5I, .dead, .dead, .dead] }, memory := mTen }
+  let b3 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 3, locals := [.uninit, .init (.scalar ⟨5, 4⟩), .init fpTenVal_5I, .uninit, .dead, .dead] }, memory := mTen }
+  let b4 : MachineState :=
+    { frame := { blockIdx := 1, stmtIdx := 0, locals := [.uninit, .init (.scalar ⟨5, 4⟩), .init fpTenVal_5I, .init fpTwenty65537Val_5I, .dead, .dead] }, memory := mBoth }
+  let req3 : MirCallReq :=
+    { defPath := "test::ext_ret_twenty_fp", typeArgs := [], args := [.scalar ⟨5, 4⟩], memory := mTen }
+  let k3 : MirCallAns → MirSiteState := fun ans =>
+    mirNextSiteState callBothFnPtrsBody (.running b3)
+      (resumeExternalCall b3 b3.frame.locals (locPlace 3) 1 .continue_ ans)
+  have hStep1 : mirSiteGapStep safeFnPtrStandaloneEnv callBothFnPtrsBody
+      (mirSiteOfExec callBothFnPtrsBody (.running
+        (initMachineStateWithCallees callBothFnPtrsBody [.scalar ⟨5, 4⟩] fnPtrCallees))) =
+      .next (.running b1) := rfl
+  have hStep2 : mirSiteGapStep safeFnPtrStandaloneEnv callBothFnPtrsBody (.running b1) =
+      .next (.running b2) := rfl
+  have hStep3 : mirSiteGapStep safeFnPtrStandaloneEnv callBothFnPtrsBody (.running b2) =
+      .next (.running b3) := rfl
+  have hSite3 : stepMirSiteState callBothFnPtrsBody (.running b3) =
+      .vis (.inr (.inr (.call req3))) k3 := rfl
+  have hEnv3 : safeFnPtrStandaloneEnv req3 = .ok (.returned fpTwenty65537Val_5I mBoth) := by
+    have hLookup : (if req3.defPath == "test::ext_reify_twenty" then some extReifyTwentyBody
+        else if req3.defPath == "test::ext_ret_twenty_fp" then some extReturnTwentyFpBody else none) =
+        some extReturnTwentyFpBody := rfl
+    unfold safeFnPtrStandaloneEnv Anneal.Pass.MirCallEnv.ofStandaloneBody
+      Anneal.Pass.MirCallEnv.ofStandaloneOutcome
+    dsimp only
+    rw [hLookup]
+    dsimp only
+    rw [hExtRetFp]
+    rfl
+  have hCall : mirSiteGapStep safeFnPtrStandaloneEnv callBothFnPtrsBody (.running b3) =
+      .next (.running b4) := by
+    unfold mirSiteGapStep Anneal.Pass.gapStep
+    rw [hSite3]
+    dsimp only [Anneal.Pass.mirGapHandle, Anneal.Pass.MirCallEnv.seal]
+    rw [hEnv3]
+    rfl
+  have hTail :
+      (Anneal.Pass.runGapSteps (mirSiteGapStep safeFnPtrStandaloneEnv callBothFnPtrsBody) 16 (.running b4)).map Prod.fst =
+        .ok (.scalar ⟨40, 4⟩) := rfl
+  have hChain : runMirWithGap safeFnPtrStandaloneEnv fnPtrCallees callBothFnPtrsBody 20 [.scalar ⟨5, 4⟩] =
+      Anneal.Pass.runGapSteps (mirSiteGapStep safeFnPtrStandaloneEnv callBothFnPtrsBody) 16 (.running b4) :=
+    (Anneal.Pass.runGapSteps_succ_of_next (fuel := 19) _ hStep1).trans
+      ((Anneal.Pass.runGapSteps_succ_of_next (fuel := 18) _ hStep2).trans
+        ((Anneal.Pass.runGapSteps_succ_of_next (fuel := 17) _ hStep3).trans
+          (Anneal.Pass.runGapSteps_succ_of_next (fuel := 16) _ hCall)))
+  exact (congrArg (OutcomeWithGap.map Prod.fst) hChain).trans hTail
+
+private theorem fnPtrAcross_buggy_map_5I :
+    (runMirWithGap buggyPrependFnPtrEnv fnPtrCallees fnPtrAcrossExtCallBody 15
+      [.scalar ⟨5, 4⟩]).map Prod.fst = .ok (.scalar ⟨31, 4⟩) := by
+  let m0 := (initMachineStateWithCallees fnPtrAcrossExtCallBody [] fnPtrCallees).memory
+  let mTen : Memory := { m0 with fnPtrs := [eTen65536_5I] }
+  let mShadowed : Memory := { m0 with fnPtrs := [eTwenty65536_5I, eTen65536_5I] }
+  let s1 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 1, locals := [.uninit, .init (.scalar ⟨5, 4⟩), .uninit, .dead, .dead] }, memory := m0 }
+  let s2 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 2, locals := [.uninit, .init (.scalar ⟨5, 4⟩), .init fpTenVal_5I, .dead, .dead] }, memory := mTen }
+  let s3 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 3, locals := [.uninit, .init (.scalar ⟨5, 4⟩), .init fpTenVal_5I, .uninit, .dead] }, memory := mTen }
+  let s4 : MachineState :=
+    { frame := { blockIdx := 1, stmtIdx := 0, locals := [.uninit, .init (.scalar ⟨5, 4⟩), .init fpTenVal_5I, .init (.scalar ⟨wrapScalarBits (5 + 1) (scalarModulus 4), 4⟩), .dead] }, memory := mShadowed }
+  let req3 : MirCallReq :=
+    { defPath := "test::ext_reify_twenty", typeArgs := [], args := [.scalar ⟨5, 4⟩], memory := mTen }
+  let k3 : MirCallAns → MirSiteState := fun ans =>
+    mirNextSiteState fnPtrAcrossExtCallBody (.running s3)
+      (resumeExternalCall s3 s3.frame.locals (locPlace 3) 1 .continue_ ans)
+  have hStep1 : mirSiteGapStep buggyPrependFnPtrEnv fnPtrAcrossExtCallBody
+      (mirSiteOfExec fnPtrAcrossExtCallBody (.running
+        (initMachineStateWithCallees fnPtrAcrossExtCallBody [.scalar ⟨5, 4⟩] fnPtrCallees))) =
+      .next (.running s1) := rfl
+  have hStep2 : mirSiteGapStep buggyPrependFnPtrEnv fnPtrAcrossExtCallBody (.running s1) =
+      .next (.running s2) := rfl
+  have hStep3 : mirSiteGapStep buggyPrependFnPtrEnv fnPtrAcrossExtCallBody (.running s2) =
+      .next (.running s3) := rfl
+  have hSite3 : stepMirSiteState fnPtrAcrossExtCallBody (.running s3) =
+      .vis (.inr (.inr (.call req3))) k3 := rfl
+  have hEnv3 : buggyPrependFnPtrEnv req3 =
+      .ok (.returned (.scalar ⟨wrapScalarBits (5 + 1) (scalarModulus 4), 4⟩) mShadowed) := by
+    have hIf : (req3.defPath == "test::ext_reify_twenty") = true := rfl
+    unfold buggyPrependFnPtrEnv
+    rw [hIf]
+    dsimp only
+    rw [extReifyTwenty_run_5I 5]
+    rfl
+  have hCall : mirSiteGapStep buggyPrependFnPtrEnv fnPtrAcrossExtCallBody (.running s3) =
+      .next (.running s4) := by
+    unfold mirSiteGapStep Anneal.Pass.gapStep
+    rw [hSite3]
+    dsimp only [Anneal.Pass.mirGapHandle, Anneal.Pass.MirCallEnv.seal]
+    rw [hEnv3]
+    rfl
+  have hTail :
+      (Anneal.Pass.runGapSteps (mirSiteGapStep buggyPrependFnPtrEnv fnPtrAcrossExtCallBody) 11 (.running s4)).map Prod.fst =
+        .ok (.scalar ⟨31, 4⟩) := rfl
+  have hChain : runMirWithGap buggyPrependFnPtrEnv fnPtrCallees fnPtrAcrossExtCallBody 15 [.scalar ⟨5, 4⟩] =
+      Anneal.Pass.runGapSteps (mirSiteGapStep buggyPrependFnPtrEnv fnPtrAcrossExtCallBody) 11 (.running s4) :=
+    (Anneal.Pass.runGapSteps_succ_of_next (fuel := 14) _ hStep1).trans
+      ((Anneal.Pass.runGapSteps_succ_of_next (fuel := 13) _ hStep2).trans
+        ((Anneal.Pass.runGapSteps_succ_of_next (fuel := 12) _ hStep3).trans
+          (Anneal.Pass.runGapSteps_succ_of_next (fuel := 11) _ hCall)))
+  exact (congrArg (OutcomeWithGap.map Prod.fst) hChain).trans hTail
+
+private theorem fnPtrAfter_buggy_map_5I :
+    (runMirWithGap buggyPrependFnPtrEnv fnPtrCallees fnPtrAfterExtCallBody 15
+      [.scalar ⟨5, 4⟩]).map Prod.fst = .ok (.scalar ⟨21, 4⟩) := by
+  let m0 := (initMachineStateWithCallees fnPtrAfterExtCallBody [] fnPtrCallees).memory
+  let mTwenty : Memory := { m0 with fnPtrs := [eTwenty65536_5I] }
+  let a1 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 1, locals := [.uninit, .init (.scalar ⟨5, 4⟩), .dead, .uninit, .dead] }, memory := m0 }
+  let a2 : MachineState :=
+    { frame := { blockIdx := 1, stmtIdx := 0, locals := [.uninit, .init (.scalar ⟨5, 4⟩), .dead, .init (.scalar ⟨wrapScalarBits (5 + 1) (scalarModulus 4), 4⟩), .dead] }, memory := mTwenty }
+  let req1 : MirCallReq :=
+    { defPath := "test::ext_reify_twenty", typeArgs := [], args := [.scalar ⟨5, 4⟩], memory := m0 }
+  let k1 : MirCallAns → MirSiteState := fun ans =>
+    mirNextSiteState fnPtrAfterExtCallBody (.running a1)
+      (resumeExternalCall a1 a1.frame.locals (locPlace 3) 1 .continue_ ans)
+  have hStep1 : mirSiteGapStep buggyPrependFnPtrEnv fnPtrAfterExtCallBody
+      (mirSiteOfExec fnPtrAfterExtCallBody (.running
+        (initMachineStateWithCallees fnPtrAfterExtCallBody [.scalar ⟨5, 4⟩] fnPtrCallees))) =
+      .next (.running a1) := rfl
+  have hSite1 : stepMirSiteState fnPtrAfterExtCallBody (.running a1) =
+      .vis (.inr (.inr (.call req1))) k1 := rfl
+  have hEnv1 : buggyPrependFnPtrEnv req1 =
+      .ok (.returned (.scalar ⟨wrapScalarBits (5 + 1) (scalarModulus 4), 4⟩) mTwenty) := by
+    have hIf : (req1.defPath == "test::ext_reify_twenty") = true := rfl
+    unfold buggyPrependFnPtrEnv
+    rw [hIf]
+    dsimp only
+    rw [extReifyTwenty_run_5I 5]
+    rfl
+  have hCall : mirSiteGapStep buggyPrependFnPtrEnv fnPtrAfterExtCallBody (.running a1) =
+      .next (.running a2) := by
+    unfold mirSiteGapStep Anneal.Pass.gapStep
+    rw [hSite1]
+    dsimp only [Anneal.Pass.mirGapHandle, Anneal.Pass.MirCallEnv.seal]
+    rw [hEnv1]
+    rfl
+  have hTail :
+      (Anneal.Pass.runGapSteps (mirSiteGapStep buggyPrependFnPtrEnv fnPtrAfterExtCallBody) 13 (.running a2)).map Prod.fst =
+        .ok (.scalar ⟨21, 4⟩) := rfl
+  have hChain : runMirWithGap buggyPrependFnPtrEnv fnPtrCallees fnPtrAfterExtCallBody 15 [.scalar ⟨5, 4⟩] =
+      Anneal.Pass.runGapSteps (mirSiteGapStep buggyPrependFnPtrEnv fnPtrAfterExtCallBody) 13 (.running a2) :=
+    (Anneal.Pass.runGapSteps_succ_of_next (fuel := 14) _ hStep1).trans
+      (Anneal.Pass.runGapSteps_succ_of_next (fuel := 13) _ hCall)
+  exact (congrArg (OutcomeWithGap.map Prod.fst) hChain).trans hTail
+
 /--
 Function-pointer head-shadowing vs collision-free re-interning & remapping canary:
 1. Under `buggyPrependFnPtrEnv`, `fnPtrAcrossExtCallBody` on `x = 5` returns `31`
@@ -4040,73 +4440,30 @@ theorem standalone_fnPtr_shadowing_vs_reintern_and_remap :
         lookupFnPtr before.fnPtrs id = some e →
           lookupFnPtr (Memory.preserveCallerMemory before after).fnPtrs id = some e ∧
           lookupFnPtr (Memory.restoreCallerFrame before after).fnPtrs id = some e) := by
-  have hBug1 :
-      (runMirWithGap buggyPrependFnPtrEnv fnPtrCallees fnPtrAcrossExtCallBody 15
-        [.scalar ⟨5, 4⟩]).map Prod.fst = .ok (.scalar ⟨31, 4⟩) := rfl
-  have hBug2 :
-      (runMirWithGap buggyPrependFnPtrEnv fnPtrCallees fnPtrAfterExtCallBody 15
-        [.scalar ⟨5, 4⟩]).map Prod.fst = .ok (.scalar ⟨21, 4⟩) := rfl
+  have hVal21 :
+      Value.scalar ⟨wrapScalarBits
+        (wrapScalarBits (5 + 1) (scalarModulus 4) + wrapScalarBits (5 + 10) (scalarModulus 4))
+        (scalarModulus 4), 4⟩ =
+        .scalar ⟨21, 4⟩ := rfl
   have hNotCtx : ¬ ContextEquiv (fun r₁ r₂ : MirReturn => r₁.1 = r₂.1) (· = ·)
       (fun x : Nat =>
         mirGapBehaviors buggyPrependFnPtrEnv fnPtrCallees fnPtrAcrossExtCallBody [.scalar ⟨x, 4⟩])
       (fun x : Nat =>
         mirGapBehaviors buggyPrependFnPtrEnv fnPtrCallees fnPtrAfterExtCallBody [.scalar ⟨x, 4⟩]) := by
     intro hEq
-    have hne₁ : runMirWithGap buggyPrependFnPtrEnv fnPtrCallees fnPtrAcrossExtCallBody 15
-        [.scalar ⟨5, 4⟩] ≠ .gap .outOfFuel := by
-      intro h₀; rw [h₀] at hBug1; cases hBug1
-    have hne₂ : runMirWithGap buggyPrependFnPtrEnv fnPtrCallees fnPtrAfterExtCallBody 15
-        [.scalar ⟨5, 4⟩] ≠ .gap .outOfFuel := by
-      intro h₀; rw [h₀] at hBug2; cases hBug2
-    have hrel := (mirGapBehaviors_equiv_iff_of_runs hne₁ hne₂).mp (hEq 5)
-    cases ho₁ : runMirWithGap buggyPrependFnPtrEnv fnPtrCallees fnPtrAcrossExtCallBody 15
-        [.scalar ⟨5, 4⟩] with
-    | ok r₁ =>
-      cases ho₂ : runMirWithGap buggyPrependFnPtrEnv fnPtrCallees fnPtrAfterExtCallBody 15
-          [.scalar ⟨5, 4⟩] with
-      | ok r₂ =>
-        rw [ho₁] at hBug1; rw [ho₂] at hBug2; rw [ho₁, ho₂] at hrel
-        have hv : Value.scalar ⟨31, 4⟩ = Value.scalar ⟨21, 4⟩ :=
-          (OutcomeWithGap.ok.inj hBug1).symm.trans (Eq.trans hrel
-            (OutcomeWithGap.ok.inj hBug2))
-        cases hv
-      | fault _ => rw [ho₂] at hBug2; cases hBug2
-      | gap _ => rw [ho₂] at hBug2; cases hBug2
-    | fault _ => rw [ho₁] at hBug1; cases hBug1
-    | gap _ => rw [ho₁] at hBug1; cases hBug1
+    exact mirGapBehaviors_not_equiv_of_map_fst_ok_ne_5I
+      fnPtrAcross_buggy_map_5I fnPtrAfter_buggy_map_5I (fun h => by cases h) (hEq 5)
   have hSafeCtx : ContextEquiv (fun r₁ r₂ : MirReturn => r₁.1 = r₂.1) (· = ·)
       (fun x : Nat =>
         mirGapBehaviors safeFnPtrStandaloneEnv fnPtrCallees fnPtrAcrossExtCallBody [.scalar ⟨x, 4⟩])
       (fun x : Nat =>
-        mirGapBehaviors safeFnPtrStandaloneEnv fnPtrCallees fnPtrAfterExtCallBody [.scalar ⟨x, 4⟩]) := by
-    intro x
-    have hm₁ : (runMirWithGap safeFnPtrStandaloneEnv fnPtrCallees fnPtrAcrossExtCallBody 15
-        [.scalar ⟨x, 4⟩]).map Prod.fst =
-        .ok (.scalar ⟨wrapScalarBits
-          (wrapScalarBits (x + 1) (scalarModulus 4) + wrapScalarBits (x + 10) (scalarModulus 4))
-          (scalarModulus 4), 4⟩) := rfl
-    have hm₂ : (runMirWithGap safeFnPtrStandaloneEnv fnPtrCallees fnPtrAfterExtCallBody 15
-        [.scalar ⟨x, 4⟩]).map Prod.fst =
-        .ok (.scalar ⟨wrapScalarBits
-          (wrapScalarBits (x + 1) (scalarModulus 4) + wrapScalarBits (x + 10) (scalarModulus 4))
-          (scalarModulus 4), 4⟩) := rfl
-    have hne₁ : runMirWithGap safeFnPtrStandaloneEnv fnPtrCallees fnPtrAcrossExtCallBody 15
-        [.scalar ⟨x, 4⟩] ≠ .gap .outOfFuel := by
-      intro h₀; rw [h₀] at hm₁; cases hm₁
-    refine mirGapBehaviors_equiv_of_runs (fuel₂ := 15) hne₁ ?_
-    cases ho₁ : runMirWithGap safeFnPtrStandaloneEnv fnPtrCallees fnPtrAcrossExtCallBody 15
-        [.scalar ⟨x, 4⟩] with
-    | ok r₁ =>
-      cases ho₂ : runMirWithGap safeFnPtrStandaloneEnv fnPtrCallees fnPtrAfterExtCallBody 15
-          [.scalar ⟨x, 4⟩] with
-      | ok r₂ =>
-        rw [ho₁] at hm₁; rw [ho₂] at hm₂
-        exact (OutcomeWithGap.ok.inj hm₁).trans (OutcomeWithGap.ok.inj hm₂).symm
-      | fault _ => rw [ho₂] at hm₂; cases hm₂
-      | gap _ => rw [ho₂] at hm₂; cases hm₂
-    | fault _ => rw [ho₁] at hm₁; cases hm₁
-    | gap _ => rw [ho₁] at hm₁; cases hm₁
-  exact ⟨hBug1, hBug2, hNotCtx, rfl, rfl, hSafeCtx, rfl,
+        mirGapBehaviors safeFnPtrStandaloneEnv fnPtrCallees fnPtrAfterExtCallBody [.scalar ⟨x, 4⟩]) :=
+    fun x => mirGapBehaviors_equiv_of_map_fst_ok_5I (fnPtrAcross_safe_map_5I x) (fnPtrAfter_safe_map_5I x)
+  exact ⟨fnPtrAcross_buggy_map_5I, fnPtrAfter_buggy_map_5I, hNotCtx,
+    (fnPtrAcross_safe_map_5I 5).trans (congrArg OutcomeWithGap.ok hVal21),
+    (fnPtrAfter_safe_map_5I 5).trans (congrArg OutcomeWithGap.ok hVal21),
+    hSafeCtx,
+    callBothFnPtrs_safe_run_5I,
     fun _ after _ _ h =>
       ⟨Memory.lookupFnPtr_preserveCallerMemory_of_some h,
        Memory.lookupFnPtr_restoreCallerFrame_of_some h⟩⟩
@@ -4319,6 +4676,7 @@ theorem callContract_holdsOn_modular_transfer_and_non_env_handlers :
           | unit => rw [ha] at hp; cases hp
           | ptr _ _ => rw [ha] at hp; cases hp
           | aggregate _ _ => rw [ha] at hp; cases hp
+          | uninit => rw [ha] at hp; cases hp
           | scalar sc =>
             rcases sc with ⟨y, sz⟩
             rw [ha] at hp
@@ -5118,12 +5476,19 @@ theorem standalone_offset_fnPtr_remap_and_multi_reify :
       dsimp only [Anneal.Pass.mirGapHandle, Anneal.Pass.MirCallEnv.seal]
       rw [hEnv3]
       rfl
-    unfold runMirWithGap runMirStepsWithGap runMirSiteStepsWithGap
-    rw [Anneal.Pass.runGapSteps_succ_of_next _ hStep1]
-    rw [Anneal.Pass.runGapSteps_succ_of_next _ hStep2]
-    rw [Anneal.Pass.runGapSteps_succ_of_next _ hStep3]
-    rw [Anneal.Pass.runGapSteps_succ_of_next _ hCall]
-    rfl
+    have hTail :
+        (Anneal.Pass.runGapSteps (mirSiteGapStep safeOffsetFnPtrStandaloneEnv callerFnTenAndExtOffsetBody) 21 (.running s4)).map
+          (fun r => (r.1,
+            (lookupFnPtr r.2.fnPtrs 65536).map FnPtrEntry.defPath,
+            (lookupFnPtr r.2.fnPtrs 65537).map FnPtrEntry.defPath)) =
+          .ok (.ptr { allocId := 65537, offsetBytes := 4 } 8, some "test::fn_ten", some "test::fn_twenty") := rfl
+    have hChain : runMirWithGap safeOffsetFnPtrStandaloneEnv fnPtrCallees callerFnTenAndExtOffsetBody 25 [.scalar ⟨5, 4⟩] =
+        Anneal.Pass.runGapSteps (mirSiteGapStep safeOffsetFnPtrStandaloneEnv callerFnTenAndExtOffsetBody) 21 (.running s4) :=
+      (Anneal.Pass.runGapSteps_succ_of_next (fuel := 24) _ hStep1).trans
+        ((Anneal.Pass.runGapSteps_succ_of_next (fuel := 23) _ hStep2).trans
+          ((Anneal.Pass.runGapSteps_succ_of_next (fuel := 22) _ hStep3).trans
+            (Anneal.Pass.runGapSteps_succ_of_next (fuel := 21) _ hCall)))
+    exact (congrArg (OutcomeWithGap.map _) hChain).trans hTail
   exact ⟨h1, rfl, (fun h => by cases h), h4⟩
 
 /-- Sidecar signature body for unwinding `#[external_spec] fn ext_nondet(x: u32) -> u32`. -/
@@ -6131,6 +6496,54 @@ def statefulNonContigFnPtrEnv : MirCallEnv :=
     else
       .gap (.unresolved req.defPath))
 
+private theorem statefulNonContig_callBoth_run_5K :
+    (runMirWithGap statefulNonContigFnPtrEnv fnPtrCallees callBothFnPtrsBody 20
+      [.scalar ⟨5, 4⟩]).map Prod.fst = .ok (.scalar ⟨40, 4⟩) := by
+  let m0 := (initMachineStateWithCallees callBothFnPtrsBody [] fnPtrCallees).memory
+  let mTen : Memory := { m0 with fnPtrs := [eTen65536_5I] }
+  let mBoth : Memory := { m0 with fnPtrs := [eTwenty65537_5I, eTen65536_5I] }
+  let b1 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 1, locals := [.uninit, .init (.scalar ⟨5, 4⟩), .uninit, .dead, .dead, .dead] }, memory := m0 }
+  let b2 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 2, locals := [.uninit, .init (.scalar ⟨5, 4⟩), .init fpTenVal_5I, .dead, .dead, .dead] }, memory := mTen }
+  let b3 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 3, locals := [.uninit, .init (.scalar ⟨5, 4⟩), .init fpTenVal_5I, .uninit, .dead, .dead] }, memory := mTen }
+  let b4 : MachineState :=
+    { frame := { blockIdx := 1, stmtIdx := 0, locals := [.uninit, .init (.scalar ⟨5, 4⟩), .init fpTenVal_5I, .init fpTwenty65537Val_5I, .dead, .dead] }, memory := mBoth }
+  let req3 : MirCallReq :=
+    { defPath := "test::ext_ret_twenty_fp", typeArgs := [], args := [.scalar ⟨5, 4⟩], memory := mTen }
+  let k3 : MirCallAns → MirSiteState := fun ans =>
+    mirNextSiteState callBothFnPtrsBody (.running b3)
+      (resumeExternalCall b3 b3.frame.locals (locPlace 3) 1 .continue_ ans)
+  have hStep1 : mirSiteGapStep statefulNonContigFnPtrEnv callBothFnPtrsBody
+      (mirSiteOfExec callBothFnPtrsBody (.running
+        (initMachineStateWithCallees callBothFnPtrsBody [.scalar ⟨5, 4⟩] fnPtrCallees))) =
+      .next (.running b1) := rfl
+  have hStep2 : mirSiteGapStep statefulNonContigFnPtrEnv callBothFnPtrsBody (.running b1) =
+      .next (.running b2) := rfl
+  have hStep3 : mirSiteGapStep statefulNonContigFnPtrEnv callBothFnPtrsBody (.running b2) =
+      .next (.running b3) := rfl
+  have hSite3 : stepMirSiteState callBothFnPtrsBody (.running b3) =
+      .vis (.inr (.inr (.call req3))) k3 := rfl
+  have hEnv3 : statefulNonContigFnPtrEnv req3 = .ok (.returned fpTwenty65537Val_5I mBoth) := rfl
+  have hCall : mirSiteGapStep statefulNonContigFnPtrEnv callBothFnPtrsBody (.running b3) =
+      .next (.running b4) := by
+    unfold mirSiteGapStep Anneal.Pass.gapStep
+    rw [hSite3]
+    dsimp only [Anneal.Pass.mirGapHandle, Anneal.Pass.MirCallEnv.seal]
+    rw [hEnv3]
+    rfl
+  have hTail :
+      (Anneal.Pass.runGapSteps (mirSiteGapStep statefulNonContigFnPtrEnv callBothFnPtrsBody) 16 (.running b4)).map Prod.fst =
+        .ok (.scalar ⟨40, 4⟩) := rfl
+  have hChain : runMirWithGap statefulNonContigFnPtrEnv fnPtrCallees callBothFnPtrsBody 20 [.scalar ⟨5, 4⟩] =
+      Anneal.Pass.runGapSteps (mirSiteGapStep statefulNonContigFnPtrEnv callBothFnPtrsBody) 16 (.running b4) :=
+    (Anneal.Pass.runGapSteps_succ_of_next (fuel := 19) _ hStep1).trans
+      ((Anneal.Pass.runGapSteps_succ_of_next (fuel := 18) _ hStep2).trans
+        ((Anneal.Pass.runGapSteps_succ_of_next (fuel := 17) _ hStep3).trans
+          (Anneal.Pass.runGapSteps_succ_of_next (fuel := 16) _ hCall)))
+  exact (congrArg (OutcomeWithGap.map Prod.fst) hChain).trans hTail
+
 /--
 Global `AllocId` collision & stateful returned-`fnPtr` remapping canary:
 1. **Negative canary on bare `Value.remapFnPtrAllocIds`**: when a callee has a
@@ -6173,7 +6586,7 @@ theorem global_allocId_collision_and_stateful_fnPtr_remap :
         .ptr { allocId := 65537, offsetBytes := 0 } 8 ∧
       (runMirWithGap statefulNonContigFnPtrEnv fnPtrCallees callBothFnPtrsBody 20
           [.scalar ⟨5, 4⟩]).map Prod.fst = .ok (.scalar ⟨40, 4⟩) := by
-  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, statefulNonContig_callBoth_run_5K⟩
 
 /-- Modular caller invoking external `ext_nondet(x)` and then inline `helper(y)`. -/
 def extThenInlineHelperBody (name : DefPath) (helper : DefPath) : CapturedMir :=

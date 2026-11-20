@@ -105,13 +105,19 @@ private theorem wbEvalOperand_copy_local_eq (locals : List LocalSlot) (idx : Loc
     (callerLocals : List LocalSlot) :
     evalOperand locals (.copy ⟨idx, .nil⟩) borrows globals ly callerLocals =
       match get? locals idx with
-      | some (.init v) => .ok v locals
+      | some (.init v) =>
+        match valueContainsUninit v with
+        | false => .ok v locals
+        | true => .ub
       | _ => .ub := by
-  unfold evalOperand
+  unfold evalOperand readProjectedValue
   dsimp only
   cases get? locals idx with
   | none => rfl
-  | some slot => cases slot <;> rfl
+  | some slot =>
+    cases slot with
+    | dead | uninit => rfl
+    | init v => dsimp only; cases valueContainsUninit v <;> rfl
 
 /-- Repeating a byte `b < 256` across `n` bytes yields a canonical `n`-byte
 unsigned integer. -/
@@ -1698,9 +1704,8 @@ private theorem writeBytesScalarVal?_of_evalOperand_ok
       | dead => rw [hslot] at heval; cases heval
       | uninit => rw [hslot] at heval; cases heval
       | init v =>
-        rw [hslot] at heval
-        injection heval with hv _
-        subst hv
+        rw [hslot] at heval; dsimp only [] at heval
+        cases hvc : valueContainsUninit v <;> rw [hvc] at heval <;> cases heval
         exact ⟨by simp [writeBytesScalarVal?, hslot], Or.inr ⟨idx, rfl, hslot⟩⟩
 
 /-- Computable post-step `allocMap'` for

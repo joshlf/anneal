@@ -43,8 +43,9 @@ Every test in [`corpus/src/lib.rs`](corpus/src/lib.rs) is a self-contained,
      `verifyModularSafePanicMirBounded`. Its `StatefulClaim` is false, because
      the claim lets the external call return a memory with a corrupted call
      frame on which the caller can fault. The certificate instead assumes only
-     that every external call returns or unwinds to the caller's call frame
-     (`callFramePreserved`), or aborts, and certifies that under that
+     that every external call returns an initialized value
+     (`valueContainsUninit retVal = false`) or unwinds to the caller's call
+     frame (`callFramePreserved`), or aborts, and certifies that under that
      assumption execution never faults and never returns normally. The
      statement spells out that frame-preserving contract with `Trusted.*`
      constants only.
