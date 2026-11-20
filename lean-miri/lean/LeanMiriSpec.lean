@@ -478,7 +478,9 @@ import LeanMiriSpec.Audit
   `subtype` (scalars, thin/wide pointers, `dyn Trait`, range newtypes), all 5
   non-`Unsize` `pointerCoercion`s (`ReifyFnPointer`, `ClosureFnPointer`,
   `UnsafeFnPointer`, `MutToConstPointer`, `ArrayToPointer`),
-  `unwrapUnsafeBinder`, and `AggregateKind.closure`.
+  `unwrapUnsafeBinder`, and `AggregateKind.closure`; the Trusted strict checks
+  the overlay does not enforce, and both sides' binder-read validity verdicts,
+  are pinned by `w_ep2_strictCheck_and_validity`.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).

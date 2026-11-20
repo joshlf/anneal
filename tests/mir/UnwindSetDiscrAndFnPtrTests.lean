@@ -112,6 +112,97 @@ theorem mr_full_unwind_and_setDiscriminant_pipeline :
   ⟨ok_of_map_toOption (by decide +kernel),
    ok_stepsTB_wfLive (by decide +kernel)⟩
 
+/-! ## §1b. Fault Injection on the Unwind & `SetDiscriminant` Pipeline -/
+
+/-- Single-point mutations of `mrFullUnwindSetDiscrMach`: `calleeUnwind` is the
+unwind block the caller registered for the callee frame, `skipStart` replaces
+the callee's `StartUnwind` by a plain `Goto` (so no payload is ever pushed), and
+`tag` is the discriminant written by the caller's `SetDiscriminant`. -/
+def mrUnwindFaultMach (calleeUnwind : Option Gen.BbName) (skipStart : Bool)
+    (tag : Int) : Mach :=
+  let calleeFn := mkMrFn
+    [(localName 0, unitType), (localName 1, refTy .mut u32)]
+    [localName 1] (localName 0)
+    [(bbName 0, ⟨[.Validate (.Local (localName 1)) true],
+        if skipStart then .Goto (bbName 1)
+        else .StartUnwind (.Constant (.PointerWithoutProvenance 4096)
+          thinRawPtrTy) (bbName 1), .Regular⟩),
+     (bbName 1, ⟨[], .ResumeUnwind, .Cleanup⟩)]
+  let callerFn := mkMrFn
+    [(localName 0, twoVarEnumMrTy)] [] (localName 0)
+    [(bbName 0, ⟨[], .Goto (bbName 1), .Regular⟩),
+     (bbName 1, ⟨[], .StopUnwind (bbName 2), .Cleanup⟩),
+     (bbName 2, ⟨[.SetDiscriminant (.Local (localName 0)) tag],
+        .Return, .Regular⟩)]
+  let callerFr := mkRootFrame callerFn
+    [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) })]
+  let calleeFr : Frame :=
+    { func := calleeFn
+      locals := ⟨[(localName 1, { addr := 256, provenance := some (⟨1⟩, ()) })]⟩
+      stack_pop_action := .BackToCaller (some (bbName 0)) calleeUnwind
+        dummyRetPtr
+      next_block := bbName 0
+      next_stmt := 0
+      extra := () }
+  mkMrMach (mkMrProg [(fnName 0, callerFn), (fnName 1, calleeFn)])
+    [mkStackAlloc 128 c1LocalInitBytes 4,
+     mkStackAlloc 256 (ptrBytes 128 (some (⟨0⟩, ()))) 8]
+    [callerFr, calleeFr]
+
+/-- Root frame whose only block executes `ResumeUnwind`. -/
+def mrRootResumeUnwindMach : Mach :=
+  let fn := mkMrFn [] [] (localName 0)
+    [(bbName 0, ⟨[], .ResumeUnwind, .Cleanup⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)]) [] [mkRootFrame fn []]
+
+/-- Negative counterpart of `mr_full_unwind_and_setDiscriminant_pipeline` on
+both `Mach` and `MachTB`. The unmutated instance IS the positive machine;
+each mutation runs its fault-free prefix (pinned by the surviving stack depth
+and payload count) and then faults at the mutated step: a callee frame
+without a registered unwind block (`ResumeUnwind` UB at step `3`), unwinding
+without `StartUnwind` (`StopUnwind` empty-payload UB at step `4`), and an
+out-of-range discriminant (`SetDiscriminant` `specPanic` at step `5`). A root
+frame executing `ResumeUnwind` is UB, the MiniRust half of the root-frame
+divergence whose Trusted half (`.retOutcome .panic`) is in §3. -/
+theorem mr_unwind_and_setDiscriminant_fault_injection :
+    mrUnwindFaultMach (some (bbName 1)) false 1 = mrFullUnwindSetDiscrMach ∧
+    (∃ m2, Interp.steps 2 (mrUnwindFaultMach none false 1) = .ok m2 ∧
+      m2.threads[0]?.map (fun t =>
+        (t.stack.length, t.unwind_payloads.length)) = some (2, 1)) ∧
+    Interp.steps 3 (mrUnwindFaultMach none false 1) = .error (.ub
+      "unwinding from a function where the caller did not specify an unwind_block") ∧
+    Interp.stepsTB 3 (liftMachToTB (mrUnwindFaultMach none false 1)) = .error (.ub
+      "unwinding from a function where the caller did not specify an unwind_block") ∧
+    (∃ m3, Interp.steps 3 (mrUnwindFaultMach (some (bbName 1)) true 1) = .ok m3 ∧
+      m3.threads[0]?.map (fun t =>
+        (t.stack.length, t.unwind_payloads.length)) = some (1, 0)) ∧
+    Interp.steps 4 (mrUnwindFaultMach (some (bbName 1)) true 1) =
+      .error (.ub "StopUnwind: the payload stack is empty") ∧
+    Interp.stepsTB 4 (liftMachToTB (mrUnwindFaultMach (some (bbName 1)) true 1)) =
+      .error (.ub "StopUnwind: the payload stack is empty") ∧
+    (∃ m4, Interp.steps 4 (mrUnwindFaultMach (some (bbName 1)) false 2) = .ok m4 ∧
+      m4.threads[0]?.map (fun t =>
+        (t.stack.length, t.unwind_payloads.length)) = some (1, 0)) ∧
+    Interp.steps 5 (mrUnwindFaultMach (some (bbName 1)) false 2) =
+      .error (.specPanic "setting an invalid discriminant (2)") ∧
+    Interp.stepsTB 5 (liftMachToTB (mrUnwindFaultMach (some (bbName 1)) false 2)) =
+      .error (.specPanic "setting an invalid discriminant (2)") ∧
+    Interp.step mrRootResumeUnwindMach = .error (.ub
+      "the function at the bottom of the stack must not unwind") ∧
+    Interp.stepTB (liftMachToTB mrRootResumeUnwindMach) = .error (.ub
+      "the function at the bottom of the stack must not unwind") :=
+  ⟨rfl, ok_of_map_toOption (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel),
+   eq_error_specPanic_of_interpSpecPanic (by decide +kernel),
+   eq_error_specPanic_of_interpSpecPanic (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
+
 /-! ## §2 (`C1`): `StatementKind.setDiscriminant` Round-Trip & Niche Checks -/
 
 /-- Fresh `CapturedMir` enum body toggling discriminant `0 → 1 → 0` on `_1`,
@@ -352,10 +443,10 @@ theorem test_c4_c5_stuttering_and_placeMention_contrast :
     · exact .coverage
     · exact .dropHint _
   have hChain := erasedNoopStmt_chain_stuttering (c4c5NoopChainMir false) bb0
-    c3AbortMach noops [mkSt (.storageDead 1)]
+    noops [mkSt (.storageDead 1)]
     [mkSt (.assign (locPlace 0) (.use (constU32 63)))]
     c4c5DeadState hAll rfl rfl rfl rfl
-  exact ⟨⟨hChain.1, (hChain.2.1 2).1⟩, rfl, rfl,
+  exact ⟨⟨hChain.1, (hChain.2 2).1⟩, rfl, rfl,
     translateStatement_coverage_none [] dummySpan emptyLayoutTable,
     translateStatement_backwardIncompatibleDropHint_none [] (locPlace 1)
       dummySpan emptyLayoutTable⟩
@@ -425,8 +516,9 @@ def c7SubtypeWideSliceMir : CapturedMir :=
 non-fn-alloc UB, `subtype` (`NonZeroU8`, `bool`, pointer-to-`usize` UB, wide
 slice), explicit `unsafeFnPointer_trusted_unsupported_divergence` propositions
 (Trusted `.unsupported`/`.ub` vs. MiniRust `Mach`/`MachTB` `Transmute`),
-capturing-closure & disabled-borrow `ArrayToPointer` UB, `"ClosureFnPointer"`
-tag variants, and `translateRvalue = none` boundaries. -/
+disabled-borrow `ArrayToPointer` UB, `"ClosureFnPointer"` tag variants, and
+`translateRvalue = none` boundaries (capturing-closure and strict-check UB
+live in `test_c1_c8_c9_strict_check_and_validity_ub_suite`). -/
 theorem test_c6_c7_c8_coercions_fnPtrToPtr_and_subtype_suite :
     (match runA c6c7c8CompositeMir 24 (initMachineState c6c7c8CompositeMir []) with
      | some ([], .normal (vRet, memEnd)) =>
@@ -634,6 +726,56 @@ theorem test_c9_c10_binder_and_closure_suite :
      (.Local (localName 1))).1,
    translateRvalue_closure_none emptyLayoutTable [] none "tests::cap_cl" []⟩
 
+/-! ## §6b. Strict-Check & Validity Fault Cases (`C1`, `C8.2`, `C9`) -/
+
+/-- `_0 = copy (_1 as unwrap_binder<ty>)` reading `_1 : srcTy` at `ty`. -/
+def c9BinderValidityMir (ty srcTy : MirAst.Ty) : CapturedMir :=
+  mkMirBody "tests::c9_binder_validity" [mkDecl ty, mkDecl srcTy] 1
+    [mkBb [mkSt (.assign (locPlace 0)
+      (.use (.copy (locPlace 1 [.unwrapUnsafeBinder ty]))))] .return_]
+
+/-- Fault cases the positive suites leave implicit, each paired with a passing
+control so no conjunct holds vacuously: `C1` `setDiscriminant` on a `.dead`
+enum local; `C8.2` `ClosureFnPointer` on a capturing closure, on a
+safety-tag/target mismatch (both directions), and on a `rust-intrinsic` ABI
+target (control: `(Unsafe)` and bare tags intern `fnPtrAllocBase`); and `C9`
+`unwrapUnsafeBinder` reads of bytes invalid at the inner type (`bool` byte
+`2`; control: byte `1`). -/
+theorem test_c1_c8_c9_strict_check_and_validity_ub_suite :
+    stepMirFn c1ToggleEnumMir
+      { frame := { blockIdx := 0, stmtIdx := 2,
+                   locals := [.uninit, .dead, .uninit, .uninit] },
+        memory := (initMachineState c1ToggleEnumMir []).memory } =
+      MirStepNode.fail .ub ∧
+    (let mem := (initMachineState c6FnPtrToPtrMir []).memory
+     let zstTy := closureZstMirTy "tests::zst_cl"
+     let zst : List LocalSlot := [.uninit, .init (.aggregate 0 [])]
+     let cl (tag : String) (dst clTy : MirAst.Ty) (locs : List LocalSlot) :=
+       evalRvalue locs
+         (.cast (.pointerCoercion tag) (.copy (locPlace 1)) dst) mem
+         [mkDecl dst, mkDecl clTy] emptyLayoutTable
+     let interned (tag : String) (dst : MirAst.Ty) : Prop :=
+       match cl tag dst zstTy zst with
+       | .ok (.ptr p 8) _ mem' =>
+         p = { allocId := fnPtrAllocBase, offsetBytes := 0 } ∧
+         length mem'.fnPtrs = 1
+       | _ => False
+     cl "ClosureFnPointer(Safe)" fnPtrSafeU32MirTy
+       (closureCapMirTy "tests::cap_cl")
+       [.uninit, .init (.aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨0, 8⟩])] = .ub ∧
+     cl "ClosureFnPointer(Safe)" fnPtrUnsafeU32MirTy zstTy zst = .ub ∧
+     cl "ClosureFnPointer(Unsafe)" fnPtrSafeU32MirTy zstTy zst = .ub ∧
+     cl "ClosureFnPointer(Safe)" fnPtrIntrinsicU32MirTy zstTy zst = .ub ∧
+     interned "ClosureFnPointer(Unsafe)" fnPtrUnsafeU32MirTy ∧
+     interned "ClosureFnPointer" fnPtrSafeU32MirTy) ∧
+    runAVal (c9BinderValidityMir boolMirTy u8MirTy) 4
+      (initMachineState (c9BinderValidityMir boolMirTy u8MirTy)
+        [.scalar ⟨1, 1⟩]) = some (.scalar ⟨1, 1⟩) ∧
+    stepMirFn (c9BinderValidityMir boolMirTy u8MirTy)
+      (initMachineState (c9BinderValidityMir boolMirTy u8MirTy)
+        [.scalar ⟨2, 1⟩]) = MirStepNode.fail .ub :=
+  ⟨rfl, ⟨rfl, rfl, rfl, rfl, ⟨rfl, rfl⟩, ⟨rfl, rfl⟩⟩, rfl, rfl⟩
+
 /-! ## §7. Bounded Axiom & Semantic-Reachability Audit -/
 
 section Audit
@@ -671,18 +813,23 @@ private def boundedReachable (env : Environment) (seeds : Array Lean.Name)
    `MiniRustSpec.UnwindSetDiscrAndFnPtrMR` uses only standard axioms
    (`propext`, `Quot.sound`, `Classical.choice`) with zero `sorryAx`,
    `Lean.ofReduceBool`, or `Lean.trustCompiler`.
-2. Bounded constant reachability from the `C1..C10` anchor manifest reaches all
-   ground operational definitions in `Trusted.Rustc.V2026_06_01.MirSemantics`
-   and `MiniRustSpec.Interp`. -/
+2. Bounded constant reachability from the local test theorems ALONE (not the
+   imported `MiniRustSpec.UnwindSetDiscrAndFnPtrMR` anchors, which would
+   satisfy it regardless of what this file tests) reaches all ground
+   operational definitions in `Trusted.Rustc.V2026_06_01.MirSemantics` and
+   `MiniRustSpec.Interp`. -/
 elab "#audit_unwind_setdiscr_fnptr_tests" : command => do
   let env ← getEnv
-  let anchors : Array Lean.Name := #[
+  let localTests : Array Lean.Name := #[
     ``mr_full_unwind_and_setDiscriminant_pipeline,
+    ``mr_unwind_and_setDiscriminant_fault_injection,
     ``test_c1_setDiscriminant_suite,
     ``test_c2_c3_unwind_resume_and_terminate_suite,
     ``test_c4_c5_stuttering_and_placeMention_contrast,
     ``test_c6_c7_c8_coercions_fnPtrToPtr_and_subtype_suite,
     ``test_c9_c10_binder_and_closure_suite,
+    ``test_c1_c8_c9_strict_check_and_validity_ub_suite]
+  let anchors : Array Lean.Name := localTests ++ #[
     ``setDiscriminant_twoVar_coupled_lockstep_and_wfLive,
     ``setDiscriminant_discriminant_readback_and_invalid_divergence,
     ``c1_setDiscriminant_local_three_way_witness,
@@ -753,10 +900,10 @@ elab "#audit_unwind_setdiscr_fnptr_tests" : command => do
   ]
   let targetSet := requiredTargets.foldl (fun s n => s.insert n)
     ({} : Lean.NameSet)
-  let reached := boundedReachable env anchors targetSet 12000
+  let reached := boundedReachable env localTests targetSet 12000
   for req in requiredTargets do
     unless reached.contains req do
-      throwError "reachability audit failed: {req} not reached from C1..C10"
+      throwError "reachability audit failed: {req} not reached from local tests"
   logInfo m!"[UNWIND-SETDISCR-FNPTR-TESTS] local_decls={localCount} anchors={anchors.size} reached={reached.size}/{requiredTargets.size} axioms=standard_only ok=true"
 
 #audit_unwind_setdiscr_fnptr_tests

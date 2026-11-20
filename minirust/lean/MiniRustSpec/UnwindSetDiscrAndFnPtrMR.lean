@@ -33,12 +33,14 @@ Operational correspondence between Anneal's trusted MIR semantics
 3. **`C3` (`TerminatorKind.unwindTerminate`)**: lockstep `.abort` simulation
    against `buildAbort` (`IntrinsicOp.Abort`, `Stop.abort`) on `Mach` and
    `MachTB`, plus the `translateTerminator = none` boundary.
-4. **`C4` (`StatementKind.coverage`)**: stuttering PC-advance equivalence
-   (`1` Trusted `stepMirFn` step ↔ `0` MiniRust steps on `Mach` and `MachTB`)
-   plus the `translateStatement = none` boundary.
+4. **`C4` (`StatementKind.coverage`)**: Trusted stuttering PC-advance law
+   (`stepMirFn`/`mirTree` `.tau` with unchanged locals and memory), concrete
+   erased-program witnesses on `Mach` and `MachTB`, and the
+   `translateStatement = none` boundary.
 5. **`C5` (`StatementKind.backwardIncompatibleDropHint`)**: unconditional
-   stuttering PC-advance equivalence (never reading or faulting even on dead or
-   uninitialized places) plus the `translateStatement = none` boundary.
+   Trusted stuttering PC-advance law (never reading or faulting even on dead
+   or uninitialized places), concrete erased-program witnesses on `Mach` and
+   `MachTB`, and the `translateStatement = none` boundary.
 6. **`C6` (`CastKind.fnPtrToPtr`)**: `evalFnPtrToPtr` ↔ MiniRust
    `CastOp.Transmute (.Ptr (.Raw .None))` on `Mach` and `MachTB` preserving
    function-pointer provenance, dead/uninit UB equivalence, and exact
@@ -1828,20 +1830,20 @@ theorem c3_unwindTerminate_three_way_witness : stepMirFn c3UnwindTerminateMir (i
 `Translate.translateStatement` returns `none` on `StatementKind.coverage`. -/
 theorem translateStatement_coverage_none (decls : List MirAst.LocalDecl) (span : String) (layouts : LayoutTable) :
     translateStatement decls { kind := .coverage, span := span } layouts = none := rfl
-/-- **C4 Universal `stepMirFn` & `mirTree` Stuttering Equivalence
-(`coverage_stuttering_step`)**: `minimize` drops `StatementKind::Coverage`
-(`0` MiniRust statements emitted). -/
+/-- **C4 Universal `stepMirFn` & `mirTree` Stuttering Law
+(`coverage_stuttering_step`)**: Trusted-only; the MiniRust side runs the
+erased program (`c4_coverage_stuttering_three_way_witness`). -/
 theorem coverage_stuttering_step (body : CapturedMir) (bb : BasicBlockData)
-    (s : MachineState) (span : String) (decls : List MirAst.LocalDecl) (layouts : LayoutTable) (m : Mach) (mtb : MachTB)
+    (s : MachineState) (span : String) (decls : List MirAst.LocalDecl) (layouts : LayoutTable)
     (hPhase : (s.memory.activeCallee.getD body).phase = .runtimePostCleanup) (hBb : get? (s.memory.activeCallee.getD body).basicBlocks s.frame.blockIdx = some bb)
     (hSt : get? bb.statements s.frame.stmtIdx = some { kind := .coverage, span := span }) :
     evalStmt s { kind := .coverage, span := span } decls layouts = MirStepNode.step (advanceStmt s s.frame.locals) ∧
     stepMirFn body s = .tau (.running (advanceStmt s s.frame.locals)) ∧
     (mirTree body s).observe = .tau (mirTree body (advanceStmt s s.frame.locals)) ∧ (advanceStmt s s.frame.locals).frame.locals = s.frame.locals ∧
-    (advanceStmt s s.frame.locals).memory = s.memory ∧ Interp.steps 0 m = .ok m ∧ Interp.stepsTB 0 mtb = .ok mtb := by
+    (advanceStmt s s.frame.locals).memory = s.memory := by
   have hStep : stepMirFn body s = .tau (.running (advanceStmt s s.frame.locals)) := by
     unfold stepMirFn; simp only [hPhase, hBb, hSt, evalStmt, MirStepNode.step]
-  exact ⟨rfl, hStep, by rw [mirTree_observe, hStep]; rfl, rfl, rfl, rfl, rfl⟩
+  exact ⟨rfl, hStep, by rw [mirTree_observe, hStep]; rfl, rfl, rfl⟩
 def c4CoverageMir : MirAst.CapturedMir := mkMirBody "ep2::c4_coverage" [mkDecl u32MirTy] 0 [mkBb [mkSt .coverage, mkSt (.assign (locPlace 0) (.use (constU32 17)))] .return_]
 def c4ErasedMir : MirAst.CapturedMir := mkMirBody "ep2::c4_erased" [mkDecl u32MirTy] 0 [mkBb [mkSt (.assign (locPlace 0) (.use (constU32 17)))] .return_]
 theorem c4_coverage_stuttering_three_way_witness :
@@ -1866,25 +1868,20 @@ Equivalence**: `evalStmt`, `stepMirFn`, and `mirTree` on
 `.backwardIncompatibleDropHint p` unconditionally advance `stmtIdx` via a
 silent `.tau` transition with identical `locals` and `memory` without ever
 reading, dereferencing, or checking `p` (even on `.dead`, `.uninit`, or OOB
-places), matching `0` MiniRust steps on `Mach` and `MachTB`. -/
+places). Trusted-only: the MiniRust side runs the erased program. -/
 theorem backwardIncompatibleDropHint_stuttering_step (body : CapturedMir) (bb : BasicBlockData) (s : MachineState) (p : MirAst.Place) (span : String)
-    (decls : List MirAst.LocalDecl) (layouts : LayoutTable) (m : Mach) (mtb : MachTB) (hPhase : (s.memory.activeCallee.getD body).phase = .runtimePostCleanup)
+    (decls : List MirAst.LocalDecl) (layouts : LayoutTable) (hPhase : (s.memory.activeCallee.getD body).phase = .runtimePostCleanup)
     (hBb : get? (s.memory.activeCallee.getD body).basicBlocks s.frame.blockIdx = some bb) (hSt : get? bb.statements s.frame.stmtIdx =
       some { kind := .backwardIncompatibleDropHint p, span := span }) :
     evalStmt s { kind := .backwardIncompatibleDropHint p, span := span } decls layouts = MirStepNode.step (advanceStmt s s.frame.locals) ∧
     stepMirFn body s = .tau (.running (advanceStmt s s.frame.locals)) ∧
     (mirTree body s).observe = .tau (mirTree body (advanceStmt s s.frame.locals)) ∧ (advanceStmt s s.frame.locals).frame.locals = s.frame.locals ∧
-    (advanceStmt s s.frame.locals).memory = s.memory ∧ Interp.steps 0 m = .ok m ∧ Interp.stepsTB 0 mtb = .ok mtb := by
+    (advanceStmt s s.frame.locals).memory = s.memory := by
   have hStep : stepMirFn body s = .tau (.running (advanceStmt s s.frame.locals)) := by
     unfold stepMirFn; simp only [hPhase, hBb, hSt, evalStmt, MirStepNode.step]
-  exact ⟨rfl, hStep, by rw [mirTree_observe, hStep]; rfl, rfl, rfl, rfl, rfl⟩
-/-- **C4 + C5 Multi-Statement Trace Stuttering Composition
-(`erasedNoopStmt_chain_stuttering`)**: Any contiguous sequence `noops` of
-`.coverage` and `.backwardIncompatibleDropHint` statements steps in
-`noops.length` silent `.tau` steps (`TauSteps`) with identical `locals` and
-`memory`, preserves `runA` and `faultsA` traces identically (`runA body (fuel
-+ noops.length) s = runA body fuel s'`), and matches `0` MiniRust steps
-(`stepsM 0 m = .ok m`) across `Mach` and `MachTB`! -/
+  exact ⟨rfl, hStep, by rw [mirTree_observe, hStep]; rfl, rfl, rfl⟩
+/-- Statement kinds with no MiniRust counterpart (`.coverage` and
+`.backwardIncompatibleDropHint`). -/
 inductive IsErasedNoopStmt : MirAst.StatementKind → Prop
   | coverage : IsErasedNoopStmt .coverage
   | dropHint (p : MirAst.Place) : IsErasedNoopStmt (.backwardIncompatibleDropHint p)
@@ -1905,19 +1902,24 @@ private theorem get?_append_mid {α : Type} : ∀ (pre : List α) (x : α) (rest
 private theorem seq_length_snoc {α : Type} : ∀ (xs : List α) (x : α), length (xs ++ [x]) = length xs + 1
   | [], _ => rfl
   | _ :: rs, x => congrArg (· + 1) (seq_length_snoc rs x)
-theorem erasedNoopStmt_chain_stuttering {M : Type} [Gen.Memory M] [MemoryOps M] (body : CapturedMir) (bb : BasicBlockData) (m : Machine M) :
+/-- **C4 + C5 Multi-Statement Trace Stuttering Composition
+(`erasedNoopStmt_chain_stuttering`)**: Any contiguous `noops` sequence of
+`IsErasedNoopStmt` statements takes `noops.length` silent `.tau` steps
+(`TauSteps`) changing only `stmtIdx`, and `runA`/`faultsA` are invariant
+(`runA body (fuel + noops.length) s = runA body fuel s'`). Trusted-only. -/
+theorem erasedNoopStmt_chain_stuttering (body : CapturedMir) (bb : BasicBlockData) :
     ∀ (noops pre post : List MirAst.Statement) (s : MachineState), (∀ st ∈ noops, IsErasedNoopStmt st.kind) → (s.memory.activeCallee.getD body).phase = .runtimePostCleanup →
       get? (s.memory.activeCallee.getD body).basicBlocks s.frame.blockIdx = some bb → bb.statements = pre ++ noops ++ post → s.frame.stmtIdx = length pre →
       let sAfter : MachineState := { s with frame := { s.frame with stmtIdx := length pre + noops.length } }
       TauSteps body noops.length s sAfter ∧ (∀ fuel, runA body (fuel + noops.length) s = runA body fuel sAfter ∧
-        faultsA body (fuel + noops.length) s = faultsA body fuel sAfter) ∧ stepsM 0 m = .ok m := by
+        faultsA body (fuel + noops.length) s = faultsA body fuel sAfter) := by
   intro noops; induction noops with
   | nil =>
     intro pre post s _ _ _ _ hIdx sAfter
     have hs : sAfter = s := by
       dsimp only [sAfter, List.length_nil]
       cases s with | mk fr mem => cases fr; simp at hIdx; subst hIdx; rfl
-    rw [hs]; exact ⟨.zero s, fun _ => ⟨rfl, rfl⟩, rfl⟩
+    rw [hs]; exact ⟨.zero s, fun _ => ⟨rfl, rfl⟩⟩
   | cons st rest ih =>
     intro pre post s hAll hPhase hBb hStmts hIdx
     have hStKind := hAll st (List.mem_cons_self ..)
@@ -1932,7 +1934,7 @@ theorem erasedNoopStmt_chain_stuttering {M : Type} [Gen.Memory M] [MemoryOps M] 
       simp only [pre1, List.append_assoc, List.singleton_append, hStmts]
     have hIdx1 : (advanceStmt s s.frame.locals).frame.stmtIdx = length pre1 := by
       simp only [advanceStmt, hIdx, pre1, seq_length_snoc]
-    obtain ⟨hTauRest, _, _⟩ := ih pre1 post (advanceStmt s s.frame.locals) hRestKind hPhase hBb hStmts1 hIdx1
+    obtain ⟨hTauRest, _⟩ := ih pre1 post (advanceStmt s s.frame.locals) hRestKind hPhase hBb hStmts1 hIdx1
     have hAfterEq : { advanceStmt s s.frame.locals with
         frame := { (advanceStmt s s.frame.locals).frame with stmtIdx := length pre1 + rest.length } } =
         { s with frame := { s.frame with stmtIdx := length pre + (st :: rest).length } } := by
@@ -1943,7 +1945,7 @@ theorem erasedNoopStmt_chain_stuttering {M : Type} [Gen.Memory M] [MemoryOps M] 
     rw [hAfterEq] at hTauRest
     have hFull : TauSteps body (st :: rest).length s { s with frame := { s.frame with stmtIdx := length pre + (st :: rest).length } } :=
       .step hStep1 hTauRest
-    exact ⟨hFull, hFull.runA_and_faultsA, rfl⟩
+    exact ⟨hFull, hFull.runA_and_faultsA⟩
 def c5DropHintMir : MirAst.CapturedMir := mkMirBody "ep2::c5_drop_hint" [mkDecl u32MirTy, mkDecl rawMutU32MirTy] 0
     [mkBb [mkSt (.storageDead 1), mkSt .coverage, mkSt (.backwardIncompatibleDropHint (locPlace 1 [.deref])),
            mkSt (.backwardIncompatibleDropHint (locPlace 99)), mkSt (.backwardIncompatibleDropHint (locPlace 0)), mkSt (.assign (locPlace 0) (.use (constU32 23)))] .return_]
