@@ -51,6 +51,40 @@ theorem SlotsOk.slotOk {layouts : Layout.LayoutTable} {decls : List LocalDecl}
     SlotOk (.Int it) slot :=
   hslots.slotOk_scalar hd hs (scalarTypeOf_int hit)
 
+theorem slotOk_valueContainsUninit {T : Gen.Type} {v : Value} (h : SlotOk T (.init v)) :
+    valueContainsUninit v = false := by
+  match v, h with
+  | .scalar _, _ => rfl
+  | .aggregate 0 [.scalar _, .scalar _], _ => rfl
+
+theorem valueListContainsUninit_of_elemOk {elemIt : Gen.IntType} {elems : List Value}
+    (h : ∀ e ∈ elems, ElemOk elemIt e) :
+    valueListContainsUninit elems = false := by
+  induction elems with
+  | nil => rfl
+  | cons x xs ih =>
+    have hx := h x List.mem_cons_self
+    cases x with
+    | scalar _ => exact ih (fun y hy => h y (List.mem_cons_of_mem _ hy))
+    | _ => exact False.elim hx
+
+theorem declSlotOk_valueContainsUninit {d : LocalDecl} {v : Value} {layouts : Layout.LayoutTable}
+    (h : DeclSlotOk d (.init v) layouts) :
+    valueContainsUninit v = false := by
+  unfold DeclSlotOk at h
+  split at h
+  · exact slotOk_valueContainsUninit h
+  · dsimp only at h
+    split at h
+    · split at h
+      · exact valueListContainsUninit_of_elemOk h.2
+      · exact False.elim h
+    · split at h
+      · exact TupleSpec.valueContainsUninit_of_valOk h.2
+      · split at h
+        · obtain ⟨_, rfl⟩ := h; rfl
+        · exact slotOk_valueContainsUninit h
+
 theorem elemTyOf_of_arrayTypeOf {t : MirAst.Ty} {elemIt : Gen.IntType} {count : Nat}
     (h : arrayTypeOf t = some (elemIt, count)) :
     ∃ elemTy, MirSemantics.elemTyOf t = some elemTy ∧ intTypeOf elemTy = some elemIt := by
@@ -73,7 +107,8 @@ theorem readProjectedValue_proj (decls : List LocalDecl) (locals : List LocalSlo
     (proj : ProjectionElem) (hproj : projOk decls count proj = true) :
     (∀ idx, projIdx locals count proj = some idx →
       ∃ v, elems[idx]? = some v ∧
-        readProjectedValue locals (.aggregate 0 elems) [proj] = .ok v) ∧
+        (valueContainsUninit v = false →
+          readProjectedValue locals (.aggregate 0 elems) [proj] = .ok v)) ∧
     (projIdx locals count proj = none →
       readProjectedValue locals (.aggregate 0 elems) [proj] = .ub) := by
   match proj, hproj with
@@ -95,7 +130,7 @@ theorem readProjectedValue_proj (decls : List LocalDecl) (locals : List LocalSlo
             simp [hlt] at hidx
             subst hidx
             exact ⟨elems[sc.bits], List.getElem?_eq_getElem hlt',
-              by simp [List.getElem?_eq_getElem hlt', readProjectedValue]⟩
+              fun hv => by simp [List.getElem?_eq_getElem hlt', readProjectedValue, hv]⟩
           · have hge : elems.length ≤ sc.bits := by omega
             simp [hlt, List.getElem?_eq_none hge]
         | _ => simp
@@ -112,7 +147,7 @@ theorem readProjectedValue_proj (decls : List LocalDecl) (locals : List LocalSlo
         simp [hlt] at hidx
         subst hidx
         exact ⟨elems[offset], List.getElem?_eq_getElem hlt',
-          by simp [List.getElem?_eq_getElem hlt', readProjectedValue]⟩
+          fun hv => by simp [List.getElem?_eq_getElem hlt', readProjectedValue, hv]⟩
       · have hge : elems.length ≤ offset := by omega
         simp [hlt, List.getElem?_eq_none hge]
     · by_cases hlt : count - offset < count
@@ -121,7 +156,7 @@ theorem readProjectedValue_proj (decls : List LocalDecl) (locals : List LocalSlo
         simp [hlt] at hidx
         subst hidx
         exact ⟨elems[count - offset], List.getElem?_eq_getElem hlt',
-          by simp [List.getElem?_eq_getElem hlt', readProjectedValue]⟩
+          fun hv => by simp [List.getElem?_eq_getElem hlt', readProjectedValue, hv]⟩
       · have hge : elems.length ≤ count - offset := by omega
         simp [hlt, List.getElem?_eq_none hge]
 
@@ -647,7 +682,7 @@ theorem evalOperand_array_proj {layouts : Layout.LayoutTable} (decls : List Loca
             simp [hv] at hb
             subst hb
             rw [evalOperand_copy_nonDeref locals ⟨j, [proj]⟩ hnd borrows globals layouts callerLocals decls hnu]
-            simp [get?, hs, hrv, ← hsz]
+            simp [get?, hs, hrv rfl, ← hsz]
           | _ => exact False.elim hvok
 
 /-- Evaluating a fragment operand of fragment type `T` (stored like `it`) in
@@ -3011,7 +3046,8 @@ theorem evalPlaceLen_array_local {locals : List LocalSlot} {mem : MirSemantics.M
     {decls : List LocalDecl} {layouts : Layout.LayoutTable} {j : Nat} {d : LocalDecl}
     {elemKind : MirAst.RigidTy} {n : Nat} {elems : List Value}
     (hd : decls[j]? = some d) (hk : d.ty.kind = .array elemKind n)
-    (hs : locals[j]? = some (.init (.aggregate 0 elems))) :
+    (hs : locals[j]? = some (.init (.aggregate 0 elems)))
+    (hinit : valueListContainsUninit elems = false) :
     evalPlaceLen locals ⟨j, []⟩ mem decls layouts =
       .ok (.scalar ⟨elems.length, MirSemantics.layoutPointerBytes layouts⟩) locals mem := by
   have hpt : MirSemantics.placeTy decls layouts ⟨j, []⟩ = some d.ty := by
@@ -3021,7 +3057,8 @@ theorem evalPlaceLen_array_local {locals : List LocalSlot} {mem : MirSemantics.M
   obtain ⟨kind, lidx⟩ := T
   dsimp only at hk
   subst hk
-  simp [MirSemantics.evalPlaceRead, MirSemantics.validateValueForTy?, hpt, get?, hs, length]
+  simp [MirSemantics.evalPlaceRead, MirSemantics.validateValueForTy?, readProjectedValue,
+    valueContainsUninit, hinit, hpt, get?, hs, length]
 
 theorem evalOperand_callStack_of_nonDeref (locals : List LocalSlot) (op : Operand)
     (hnd : opDeref op = false) (borrows : List BorrowEntry)
@@ -3245,12 +3282,21 @@ theorem evalRvalue_use_deref_ok {locals : List LocalSlot} {op : Operand}
         dsimp only at hd hf
         simp [hd, hf]
 
-/-- `Rvalue.wrapUnsafeBinder op ty` evaluates identically to `Rvalue.use op`. -/
+/-- `Rvalue.wrapUnsafeBinder op ty` into a transparent binder type (neither a single-field binder
+struct, `binderStructLayout? = none`, nor a type resolved to a layout whose scalar validity range is
+checked, `resolvedTyLayout? = none`) evaluates identically to `Rvalue.use op`. -/
 theorem evalRvalue_wrapUnsafeBinder_eq_use (locals : List LocalSlot) (op : Operand)
     (ty : MirAst.Ty) (mem : MirSemantics.Memory) (decls : List LocalDecl)
-    (layouts : Layout.LayoutTable) :
+    (layouts : Layout.LayoutTable)
+    (hBinder : Trusted.Rustc.V2026_06_01.MirSemantics.binderStructLayout? decls layouts ty = none)
+    (hRange : Trusted.Rustc.V2026_06_01.MirSemantics.resolvedTyLayout? decls layouts ty = none) :
     evalRvalue locals (.wrapUnsafeBinder op ty) mem decls layouts =
-      evalRvalue locals (.use op) mem decls layouts := rfl
+      evalRvalue locals (.use op) mem decls layouts := by
+  show Trusted.Rustc.V2026_06_01.MirSemantics.evalWrapUnsafeBinder locals op ty mem decls layouts =
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalUseRvalue locals op mem decls layouts
+  unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalWrapUnsafeBinder
+  rw [hBinder, hRange]
+  cases Trusted.Rustc.V2026_06_01.MirSemantics.evalUseRvalue locals op mem decls layouts <;> rfl
 
 /-! ### Dereference reads: Tree Borrows foreign-read freezing
 
@@ -3543,7 +3589,7 @@ theorem derefReadTreeUB_false_of_ancestors_live (locals : List LocalSlot) (ptrLo
             ptrVal.tag (MirSemantics.appendProjections readerEntry.targetProjection restProj)
             readerEntry.rangeOffset readerEntry.rangeLen readerEntry.targetFrameDepth
             (hlive ptrVal sz hloc)
-      | unit | scalar _ | aggregate _ _ => rfl
+      | unit | uninit | scalar _ | aggregate _ _ => rfl
 
 /-- `validateLoadedValue` reads only the operand's place type, which `copy` and
 `move` share. -/
@@ -3916,13 +3962,13 @@ theorem evalRvalue_frag {layouts : Layout.LayoutTable} (decls : List LocalDecl) 
           ha] at hslot
         rw [hv] at hs
         match v, hslot with
-        | .aggregate 0 elems, ⟨hlen, _⟩ =>
+        | .aggregate 0 elems, ⟨hlen, he⟩ =>
           refine ⟨fun r hr => ?_, fun hnone => by simp [rvBits, hd, ha] at hnone⟩
           simp [rvBits, hd, ha] at hr
           subst hr
           obtain ⟨ek, hk⟩ := arrayTypeOf_kind ha
           show evalPlaceLen locals ⟨j, []⟩ mem decls layouts = _
-          rw [evalPlaceLen_array_local hd hk hs, hptr, hlen]
+          rw [evalPlaceLen_array_local hd hk hs (valueListContainsUninit_of_elemOk he), hptr, hlen]
           rfl
   | .discriminant ⟨j, []⟩, hok =>
     simp only [rvalueOk, Bool.and_eq_true, decide_eq_true_eq] at hok
@@ -3936,14 +3982,28 @@ theorem evalRvalue_frag {layouts : Layout.LayoutTable} (decls : List LocalDecl) 
         operandOkO_T (by
           simp only [operandOkO, operandIsOrdering, hd, hord, Bool.and_true, decide_eq_true_eq]
           exact hj)
-      obtain ⟨hsome, hnone⟩ := evalOperand_fragT decls locals hslots hn .ordering
-        (.copy ⟨j, []⟩) hokT mem.borrows mem.globals mem.callerLocals
-      refine ⟨fun r hr => ?_, fun hr => ?_⟩
-      · have hb := (validBits_ordering r).mp
-          (opBits_valid decls locals hslots .ordering (.copy ⟨j, []⟩) hokT r hr)
-        simp only [evalRvalue, hsome r hr]
+      obtain ⟨_, hty⟩ := hokT
+      simp only [operandType, hd, Option.bind_eq_bind, Option.bind_some] at hty
+      have hjl : j < locals.length := by rw [hn]; exact hj
+      have hs : locals[j]? = some locals[j] := by simp [hjl]
+      have hslot := hslots.slotOk_scalar hd hs hty
+      generalize locals[j] = slot at hs hslot
+      match slot, hslot with
+      | .dead, _ => simp [rvBits, opBits, evalRvalue, get?, hs]
+      | .uninit, _ => simp [rvBits, opBits, evalRvalue, get?, hs]
+      | .init (.scalar sc), hsc =>
+        have hsz : sc.sizeBytes = 1 := hsc.1.trans FragTy.ordering.tyBytes
+        have hb := (validBits_ordering sc.bits).mp hsc.2
+        refine ⟨fun r hr => ?_, fun hnone => by simp [rvBits, opBits, hs] at hnone⟩
+        simp [rvBits, opBits, hs] at hr
+        subst hr
+        rcases sc with ⟨bits, sz⟩
+        dsimp only at hsz hb
+        subst hsz
+        simp only [evalRvalue, get?, hs]
         exact evalPlaceDiscriminant_ordering hd hord hlay hb locals mem
-      · simp only [evalRvalue, hnone hr]
+      | .init (.aggregate 0 [.scalar _, .scalar _]), ⟨_, htyT, _⟩ =>
+        cases FragTy.ordering; simp [orderingTy, tupleIntOfTy] at htyT
 
 theorem evalOperands_frag {layouts : Layout.LayoutTable} (decls : List LocalDecl) (locals : List LocalSlot)
     (hslots : SlotsOk layouts decls locals) (hn : locals.length = decls.length)
@@ -4025,12 +4085,14 @@ theorem evalRvalue_array_frag {layouts : Layout.LayoutTable} (decls : List Local
       match slot, hslot with
       | .dead, _ => simp [arrayRvElems, evalRvalue, evalOperand, get?, hs]
       | .uninit, _ => simp [arrayRvElems, evalRvalue, evalOperand, get?, hs]
-      | .init (.aggregate 0 elems), ⟨_, _⟩ =>
+      | .init (.aggregate 0 elems), ⟨_, he⟩ =>
         refine ⟨fun ys hys => ?_, fun hnone => by simp [arrayRvElems, hs] at hnone⟩
         simp [arrayRvElems, hs] at hys
         subst hys
         obtain ⟨ek, hk⟩ := arrayTypeOf_kind hty
-        exact evalRvalue_use_ok (by simp [evalOperand, get?, hs, readProjectedValue])
+        have hElemsInit := valueListContainsUninit_of_elemOk he
+        exact evalRvalue_use_ok
+          (by simp [evalOperand, get?, hs, readProjectedValue, valueContainsUninit, hElemsInit])
           (validateLoadedValue_of_operandTy (ty := d.ty)
             (by simp [MirSemantics.operandTy, MirSemantics.placeTy, get?, hd,
               MirSemantics.resolveProjectedTy])
@@ -4958,6 +5020,21 @@ theorem invalidateConflictingBorrowsAtProj_of_ne (borrows : List BorrowEntry) (l
     simp [invalidateConflictingBorrowsAtProj, updateBorrowPermAtProj, hne,
       ih (fun e he => h e (.tail _ he))]
 
+theorem hasProtectedWriteConflict_of_ne (borrows : List BorrowEntry)
+    (activeProtectors : List Nat) (loc : Local) (writerTag : Option Nat)
+    (writeProj : List ProjectionElem) (writeRangeOff : Nat := 0) (writeRangeLen : Nat := 0)
+    (h : ∀ e ∈ borrows, e.targetLocal ≠ loc) :
+    ∀ (targetFrameDepth : Nat),
+      hasProtectedWriteConflict borrows activeProtectors loc writerTag writeProj
+        writeRangeOff writeRangeLen targetFrameDepth = false := by
+  intro targetFrameDepth
+  induction borrows with
+  | nil => rfl
+  | cons entry rest ih =>
+    have hne : Nat.beq entry.targetLocal loc = false := by
+      rw [nat_beq_eq_decide, decide_eq_false (h entry (.head _))]
+    simp [hasProtectedWriteConflict, hne, ih (fun e he => h e (.tail _ he))]
+
 /-- A successful fragment field-path write (`writeFieldPath`) traverses only
 present, non-`.unit` intermediate aggregate fields, so the projected
 assignment's `D13b` shell materialization (`ensureNestedFieldShells`) leaves the
@@ -5047,17 +5124,19 @@ theorem fieldShellChainPopulated_of_readFieldPath :
 
 /-- Any well-formed `TupleSpec` root value (`rootSpec.valOk rootVal = true`) has
 every intermediate field shell along a valid `resolveFieldPath` already populated,
-so `ensureNestedFieldShells rootVal projs = rootVal` even before `writeFieldPath`
-is evaluated. -/
+so `ensureNestedFieldShells` returns `.some rootVal` unchanged even before
+`writeFieldPath` is evaluated. -/
 theorem fieldShellChainPopulated_of_resolveFieldPath {layouts : Layout.LayoutTable}
     {rootSpec leafSpec : TupleSpec} {projs : List ProjectionElem} {totalOff : Nat} {rootVal : Value}
     (hwf : rootSpec.wf = true) (hval : rootSpec.valOk rootVal = true)
     (hres : resolveFieldPath layouts rootSpec projs = some (totalOff, leafSpec)) :
     fieldShellChainPopulated rootVal projs = true ∧
-    ensureNestedFieldShells rootVal projs = rootVal := by
+    ∀ (decls : List LocalDecl) (lt : Layout.LayoutTable) (curTyOpt : Option MirAst.Ty),
+      ensureNestedFieldShells rootVal projs decls lt curTyOpt = .some rootVal := by
   obtain ⟨leafVal, hread, _, _, _⟩ := resolveFieldPath_read hwf hval hres
   have hpop := fieldShellChainPopulated_of_readFieldPath projs rootVal leafVal hread
-  exact ⟨hpop, ensureNestedFieldShells_eq_self_of_populated _ _ hpop⟩
+  exact ⟨hpop, fun decls lt curTyOpt =>
+    ensureNestedFieldShells_eq_self_of_populated _ _ decls lt curTyOpt hpop⟩
 
 /-- Anneal's assignment to a live local `_i` from an rvalue that evaluates to
 a scalar (or to UB). -/
@@ -5296,8 +5375,10 @@ theorem evalStmt_assign_tuple (s : MachineState) (decls : List LocalDecl) (layou
       cases p with
       | field idx fieldTy =>
         have hw := hwsem s.frame.locals
-        have hshell := ensureNestedFieldShells_eq_self_of_populated _ _
-          (fieldShellChainPopulated_of_writeFieldPath _ _ _ _ hwpath)
+        have hshell : ∀ curTyOpt, ensureNestedFieldShells rootVal (.field idx fieldTy :: rest) decls layouts curTyOpt =
+            .some rootVal :=
+          fun curTyOpt => ensureNestedFieldShells_eq_self_of_populated _ _ decls layouts curTyOpt
+            (fieldShellChainPopulated_of_writeFieldPath _ _ _ _ hwpath)
         have hinv : ∀ pr d, invalidateConflictingBorrowsAtProj s.memory.borrows i .none pr 0 0 d =
             s.memory.borrows :=
           fun pr d => invalidateConflictingBorrowsAtProj_of_ne s.memory.borrows i .none pr 0 0 hbor d
@@ -5325,7 +5406,7 @@ theorem placeTouchesUnion_false_of_writeFieldPath_slotOk {layouts : Layout.Layou
   generalize decls[i] = d at hd
   have hslot := hslots i d (.init rootVal) hd hsl
   cases rootVal with
-  | scalar _ | ptr _ _ | unit => simp [writeFieldPath] at hwpath
+  | scalar _ | ptr _ _ | unit | uninit => simp [writeFieldPath] at hwpath
   | aggregate vi vals =>
     cases vi with
     | succ _ => simp [writeFieldPath] at hwpath
@@ -5348,16 +5429,16 @@ theorem placeTouchesUnion_false_of_writeFieldPath_slotOk {layouts : Layout.Layou
             rw [htyOf] at hslot
             rcases scalarTypeOf_cases hT with ⟨_, rfl⟩ | ⟨_, _, rfl⟩ | ⟨_, rfl⟩ | ⟨tupIt, htup, rfl⟩
             · rcases vals with _ | ⟨v0, _ | ⟨v1, _ | _⟩⟩ <;>
-                (try rcases v0 with _ | _ | _ | _) <;>
-                (try rcases v1 with _ | _ | _ | _) <;>
+                (try cases v0) <;>
+                (try cases v1) <;>
                 simp [SlotOk, tupleIntOfTy] at hslot
             · rcases vals with _ | ⟨v0, _ | ⟨v1, _ | _⟩⟩ <;>
-                (try rcases v0 with _ | _ | _ | _) <;>
-                (try rcases v1 with _ | _ | _ | _) <;>
+                (try cases v0) <;>
+                (try cases v1) <;>
                 simp [SlotOk, tupleIntOfTy] at hslot
             · rcases vals with _ | ⟨v0, _ | ⟨v1, _ | _⟩⟩ <;>
-                (try rcases v0 with _ | _ | _ | _) <;>
-                (try rcases v1 with _ | _ | _ | _) <;>
+                (try cases v0) <;>
+                (try cases v1) <;>
                 simp [SlotOk, orderingTy, tupleIntOfTy] at hslot
             · rcases vals with _ | ⟨v0, _ | ⟨v1, _ | _⟩⟩
               · simp [SlotOk] at hslot
@@ -5376,7 +5457,7 @@ theorem placeTouchesUnion_false_of_writeFieldPath_slotOk {layouts : Layout.Layou
                     exact placeTouchesUnion_field_of_intBoolTupleOf decls layouts hd htup idx fieldTy
                   | _ => simp [SlotOk] at hslot
                 | _ => simp [SlotOk] at hslot
-              · rcases v0 with _ | _ | _ | _ <;> rcases v1 with _ | _ | _ | _ <;>
+              · cases v0 <;> cases v1 <;>
                   simp [SlotOk] at hslot
           | false =>
             rw [hsc] at hslot
@@ -5456,8 +5537,8 @@ theorem placeTouchesUnion_false_of_writeFieldPath_slotOk {layouts : Layout.Layou
                           | _ => rw [hk] at hbx; cases hbx
                         | none => rfl
                   rcases vals with _ | ⟨v0, _ | ⟨v1, _ | _⟩⟩ <;>
-                    (try rcases v0 with _ | _ | _ | _) <;>
-                    (try rcases v1 with _ | _ | _ | _) <;>
+                    (try cases v0) <;>
+                    (try cases v1) <;>
                     simp [SlotOk, htupNone] at hslot
 
 theorem evalStmt_assign_field_scalar (s : MachineState) (decls : List LocalDecl) (layouts : Layout.LayoutTable)
@@ -5491,8 +5572,10 @@ theorem evalStmt_assign_field_scalar (s : MachineState) (decls : List LocalDecl)
   refine ⟨fun r newRootVal hr hwpath hwsem => ?_, fun hnone => ?_⟩
   · have hnu := placeTouchesUnion_false_of_writeFieldPath_slotOk hslots hi hsl hwpath
     have hw := hwsem s.frame.locals
-    have hshell := ensureNestedFieldShells_eq_self_of_populated _ _
-      (fieldShellChainPopulated_of_writeFieldPath _ _ _ _ hwpath)
+    have hshell : ∀ curTyOpt, ensureNestedFieldShells rootVal (.field idx fieldTy :: rest) decls layouts curTyOpt =
+        .some rootVal :=
+      fun curTyOpt => ensureNestedFieldShells_eq_self_of_populated _ _ decls layouts curTyOpt
+        (fieldShellChainPopulated_of_writeFieldPath _ _ _ _ hwpath)
     have hinv : ∀ pr d, invalidateConflictingBorrowsAtProj s.memory.borrows i .none pr 0 0 d =
         s.memory.borrows :=
       fun pr d => invalidateConflictingBorrowsAtProj_of_ne s.memory.borrows i .none pr 0 0 hbor d
@@ -5791,22 +5874,43 @@ theorem evalStmt_storageDead_nil_borrows (s : MachineState) (decls : List LocalD
       .tau (.running (advanceStmt s (s.frame.locals.set i .dead))) :=
   evalStmt_storageDead s decls layouts i span hi (by rw [hbor]; intro _ h; cases h)
 
-/-- Anneal's `Deinit(_i)` of a root local: the slot of a live local becomes
-`.uninit`; a dead local is UB. -/
+/-- Anneal's `Deinit(_i)` of a root local that no borrow targets: the slot of a
+live local becomes `.uninit` with unchanged memory; a dead local is UB. -/
 theorem evalStmt_deinit (s : MachineState) (decls : List LocalDecl)
-    (layouts : Layout.LayoutTable) (i : Nat) (span : String) (hi : i < s.frame.locals.length) :
+    (layouts : Layout.LayoutTable) (i : Nat) (span : String) (hi : i < s.frame.locals.length)
+    (hbor : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i) :
     (s.frame.locals[i]? ≠ some .dead →
       evalStmt s ⟨.deinit ⟨i, []⟩, span⟩ decls layouts =
         .tau (.running (advanceStmt s (s.frame.locals.set i .uninit)))) ∧
     (s.frame.locals[i]? = some .dead →
       evalStmt s ⟨.deinit ⟨i, []⟩, span⟩ decls layouts = MirStepNode.fail .ub) := by
   have hs : s.frame.locals[i]? = some s.frame.locals[i] := by simp [hi]
+  have hinv := invalidateConflictingBorrows_of_ne s.memory.borrows i .none hbor
+    (length s.memory.callStack)
   refine ⟨fun hlive => ?_, fun hdead => ?_⟩
   · simp only [evalStmt, get?, hs]
     cases hsl : s.frame.locals[i] with
     | dead => rw [hsl] at hs; exact absurd hs hlive
-    | uninit => simp [set?, hi, MirStepNode.step]
-    | init v => simp [set?, hi, MirStepNode.step]
+    | uninit =>
+      cases hp : s.memory.activeProtectors with
+      | nil =>
+        simp [set?, hi, hinv, MirStepNode.step, advanceStmt, memory_mk_nil_prot s.memory hp]
+      | cons p0 ps0 =>
+        have hconf := hasProtectedWriteConflict_of_ne s.memory.borrows (p0 :: ps0) i .none .nil 0 0
+          hbor (length s.memory.callStack)
+        have hmem : { s.memory with borrows := s.memory.borrows, activeProtectors := p0 :: ps0 } = s.memory := by
+          rw [← hp]
+        simp [set?, hi, hconf, hinv, MirStepNode.step, advanceStmt, hmem]
+    | init v =>
+      cases hp : s.memory.activeProtectors with
+      | nil =>
+        simp [set?, hi, hinv, MirStepNode.step, advanceStmt, memory_mk_nil_prot s.memory hp]
+      | cons p0 ps0 =>
+        have hconf := hasProtectedWriteConflict_of_ne s.memory.borrows (p0 :: ps0) i .none .nil 0 0
+          hbor (length s.memory.callStack)
+        have hmem : { s.memory with borrows := s.memory.borrows, activeProtectors := p0 :: ps0 } = s.memory := by
+          rw [← hp]
+        simp [set?, hi, hconf, hinv, MirStepNode.step, advanceStmt, hmem]
   · simp [evalStmt, get?, hdead]
 
 /-- Anneal's `PlaceMention` of a place based on a dead local is UB. -/
@@ -5999,6 +6103,7 @@ theorem readProjectedValue_allFields_frame (L L' : List LocalSlot) (v : Value)
       cases idx with
       | zero => simp only [readProjectedValue]; exact ih .unit hf
       | succ _ => rfl
+    | uninit => rfl
 
 theorem readProjectedValue_simpleProj_frame (L L' : List LocalSlot) (j : Nat) (v : Value)
     (projs : List ProjectionElem) (hs : simpleProj projs = true)
@@ -6072,15 +6177,16 @@ theorem readProjectedValueUnionAware_allFields_frame (L L' : List LocalSlot)
       allFields projs = true →
       MirSemantics.readProjectedValueUnionAware L' decls layouts v baseTy projs =
         MirSemantics.readProjectedValueUnionAware L decls layouts v baseTy projs
-  | [], _, _, _ => rfl
+  | [], v, _, _ => by
+    cases v <;> simp only [MirSemantics.readProjectedValueUnionAware]
   | p :: rest, v, baseTy, hf => by
     cases p <;> simp [allFields] at hf
     rename_i idx fieldTy
-    unfold MirSemantics.readProjectedValueUnionAware
-    rw [resolveUnionSubProjIndices_allFields L' hf, resolveUnionSubProjIndices_allFields L hf]
     have ih := fun v' ty' =>
       readProjectedValueUnionAware_allFields_frame L L' decls layouts rest v' ty' hf
-    repeat (first | rfl | apply ih | split | dsimp only)
+    cases v <;> simp only [MirSemantics.readProjectedValueUnionAware] <;>
+      try rw [resolveUnionSubProjIndices_allFields L' hf, resolveUnionSubProjIndices_allFields L hf]
+    all_goals repeat (first | rfl | apply ih | split | dsimp only)
 
 /-- Reading a fragment operand's `copy` form depends only on the slots of the
 locals it reads, and returns the slots unchanged. -/
@@ -6108,7 +6214,9 @@ theorem evalOperand_copy_frame (L L' : List LocalSlot) (op : Operand) (hs : simp
       | some slot =>
         cases slot with
         | dead | uninit => rfl
-        | init rootVal => rfl
+        | init rootVal =>
+          dsimp only [readProjectedValue]
+          cases valueContainsUninit rootVal <;> rfl
     | cons hd tl =>
       cases hd with
       | field idx ty =>
@@ -6238,7 +6346,7 @@ theorem evalOperand_move (locals : List LocalSlot) (op : Operand) (hs : simpleOp
         cases s with
         | dead => rfl
         | uninit => rfl
-        | init v => simp [hjl, readProjectedValue, opWithLocals]
+        | init v => cases h : valueContainsUninit v <;> simp [hjl, readProjectedValue, h, opWithLocals]
     | cons hd tl =>
       have hsp : simpleProj (hd :: tl) = true := hs
       have hnd := simpleProj_nonDeref hsp
@@ -6280,6 +6388,12 @@ theorem evalUnaryNot_locals (sc : ScalarInt) (ty : Option Ty) (L L' : List Local
 
 theorem operandTy_copyOp (decls : List LocalDecl) (layouts : Layout.LayoutTable) (op : Operand) :
     operandTy decls layouts (copyOp op) = operandTy decls layouts op := by
+  cases op <;> rfl
+
+private theorem resolveByteCastSrcTyAndSize_copyOp
+    (decls : List LocalDecl) (layouts : Layout.LayoutTable) (op : Operand) (srcTy : Ty) :
+    MirSemantics.resolveByteCastSrcTyAndSize decls layouts (copyOp op) srcTy =
+      MirSemantics.resolveByteCastSrcTyAndSize decls layouts op srcTy := by
   cases op <;> rfl
 
 theorem operandIsSigned_copyOp (decls : List LocalDecl) (layouts : Layout.LayoutTable)
@@ -6713,6 +6827,7 @@ theorem readProjectedValue_congr_scalar {L L' : List LocalSlot}
         cases idx with
         | zero => exact ih .unit
         | succ _ => rfl
+      | uninit => rfl
     | downcast _ variantIdx =>
       cases v with
       | aggregate actualVariant fields =>
@@ -7127,11 +7242,11 @@ theorem evalPlaceRead_of_nonDeref (locals : List LocalSlot) (p : Place)
     have hty : MirSemantics.placeTy decls layouts ⟨j, []⟩ =
         MirSemantics.placeTyResolved decls layouts ⟨j, []⟩ := by
       cases get? decls j <;> rfl
-    have hr : ∀ v, MirSemantics.readProjectedForLocal locals decls layouts j v [] = .ok v := by
+    have hr : ∀ v, MirSemantics.readProjectedForLocal locals decls layouts j v [] =
+        readProjectedValue locals v [] := by
       intro v
       unfold MirSemantics.readProjectedForLocal
       rw [placeTouchesUnion_nil_proj]
-      rfl
     unfold MirSemantics.evalPlaceRead
     dsimp only
     cases get? locals j with
@@ -7386,13 +7501,28 @@ theorem evalRvalue_move (locals : List LocalSlot) (rv : Rvalue) (hk : moveKind r
       mem.borrows mem.globals layouts mem.callerLocals decls mem.callStack
     have hpost : opPost locals (.copy p) = locals := rfl
     simp only [evalRvalue, copyRv, rvPost, opsPost, rvOperands, List.foldl, hpost]
-    cases hc : evalOperand locals (.copy p) mem.borrows mem.globals layouts mem.callerLocals
-        decls mem.callStack with
-    | ok v L1 =>
-      rw [opResult_locals hcopy hc]
-      exact evalPlaceDiscriminant_locals v locals mem p decls layouts
-    | ub => rfl
-    | unsupported => rfl
+    rcases p with ⟨j, projs⟩
+    cases projs with
+    | nil =>
+      dsimp only
+      cases get? locals j with
+      | none => rfl
+      | some sl =>
+        cases sl with
+        | dead | uninit => rfl
+        | init val =>
+          cases val <;> first
+            | rfl
+            | exact evalPlaceDiscriminant_locals _ locals mem ⟨j, []⟩ decls layouts
+    | cons hd tl =>
+      dsimp only
+      cases hc : evalOperand locals (.copy ⟨j, hd :: tl⟩) mem.borrows mem.globals layouts
+          mem.callerLocals decls mem.callStack with
+      | ok v L1 =>
+        rw [opResult_locals hcopy hc]
+        exact evalPlaceDiscriminant_locals v locals mem ⟨j, hd :: tl⟩ decls layouts
+      | ub => rfl
+      | unsupported => rfl
   | .unaryOp .not op, _, _ =>
     obtain ⟨hs, _⟩ := hspec op (by simp [rvOperands])
     simp only [evalRvalue, copyRv, rvPost, opsPost, rvOperands, List.foldl]
@@ -7496,6 +7626,7 @@ theorem evalRvalue_move (locals : List LocalSlot) (rv : Rvalue) (hk : moveKind r
               rcases rf with _ | ⟨_, _ | ⟨_, _ | _⟩⟩ <;>
               cases Nat.beq lv 0 <;> cases Nat.beq rv 0 <;> rfl
           | _ => exact evalWidePtrAggregateRelBinOp_frame hframe
+        | .uninit, _ | .scalar _, .uninit | .ptr _ _, .uninit | .aggregate _ _, .uninit
         | .unit, _ | .scalar _, .unit | .ptr _ _, .unit | .aggregate _ _, .unit
         | .scalar _, .aggregate _ _ | .ptr _ _, .aggregate _ _
         | .aggregate _ _, .scalar _ | .aggregate _ _, .ptr _ _ => rfl
@@ -7545,20 +7676,21 @@ theorem evalRvalue_move (locals : List LocalSlot) (rv : Rvalue) (hk : moveKind r
       | aggregate idx fields =>
         rcases fields with _ | ⟨e1, _ | ⟨e2, _ | ⟨e3, rest⟩⟩⟩ <;>
           rcases idx with _ | idx <;>
-          (try rcases e1 with _ | _ | _ | _) <;>
-          (try rcases e2 with _ | _ | _ | _) <;>
+          (try rcases e1 with _ | _ | _ | _ | _) <;>
+          (try rcases e2 with _ | _ | _ | _ | _) <;>
           first
           | rfl
           | (simp only []
              repeat' (first | (simp only []) | split)
              all_goals first | rfl | exact hframe' _ _ _ _ (by simp_all) | simp_all)
-      | unit => rfl
+      | unit | uninit => rfl
     | ub => rfl
     | unsupported => rfl
   | .cast .transmute op ty, _, _ =>
     obtain ⟨hs, _⟩ := hspec op (by simp [rvOperands])
     simp only [evalRvalue, evalByteCast, copyRv, rvPost, opsPost, rvOperands, List.foldl]
     rw [evalOperand_move locals op hs _ _ _ _ decls, operandTy_copyOp]
+    simp only [resolveByteCastSrcTyAndSize_copyOp]
     cases evalOperand locals (copyOp op) mem.borrows mem.globals layouts mem.callerLocals decls
         mem.callStack with
     | ok v L1 =>
@@ -8021,9 +8153,10 @@ theorem evalCallOperand_spec {decls : List LocalDecl} {locals : List LocalSlot}
     | uninit => simp
     | init v0 =>
       rw [hsl] at hslot
+      have hv0Init := slotOk_valueContainsUninit hslot
       refine ⟨fun v hv => ?_, fun hn' => by simp at hn'⟩
       simp at hv; subst hv
-      exact ⟨by simp [readProjectedValue], hpdT ▸ hslot, hn, hslots⟩
+      exact ⟨by simp [readProjectedValue, hv0Init], hpdT ▸ hslot, hn, hslots⟩
   · have hjl : j < locals.length := by rw [hn]; exact hj
     obtain ⟨d, hd⟩ : ∃ d, decls[j]? = some d := ⟨_, List.getElem?_eq_getElem hj⟩
     obtain ⟨_, _, ⟨T, hT1, hT2⟩, _⟩ := sameFragmentTy_spec (hsame d hd)
@@ -8037,9 +8170,10 @@ theorem evalCallOperand_spec {decls : List LocalDecl} {locals : List LocalSlot}
     | uninit => simp
     | init v0 =>
       rw [hsl] at hslot
+      have hv0Init := slotOk_valueContainsUninit hslot
       refine ⟨fun v hv => ?_, fun hn' => by simp at hn'⟩
       simp at hv; subst hv
-      exact ⟨by simp [set?, hjl], hpdT ▸ hslot, by simp [hn], hslots.set_uninit j⟩
+      exact ⟨by simp [readProjectedValue, hv0Init, set?, hjl], hpdT ▸ hslot, by simp [hn], hslots.set_uninit j⟩
   · have hjl : j < locals.length := by rw [hn]; exact hj
     obtain ⟨d, hd⟩ : ∃ d, decls[j]? = some d := ⟨_, List.getElem?_eq_getElem hj⟩
     have hdTup := htup d hd
@@ -8307,6 +8441,7 @@ theorem evalTerminator_return_caller_anneal {s : MachineState} {curBody callerBo
     (hdest : CallerDestRel callerBody callerCtx savedCaller.frame.locals callerView callerLm
       calleeRetDecl calleeBase calleeRetPtr savedCaller.destination) :
     (∀ retVal, s.frame.locals[0]? = some (.init retVal) →
+      valueContainsUninit retVal = false →
       MirSemantics.evalTerminator s ⟨.return_, span⟩ (some curBody) =
         .tau (.running {
           frame := {
@@ -8325,7 +8460,7 @@ theorem evalTerminator_return_caller_anneal {s : MachineState} {curBody callerBo
     ((s.frame.locals[0]? = some .uninit ∨ s.frame.locals[0]? = some .dead ∨
         s.frame.locals[0]? = none) →
       MirSemantics.evalTerminator s ⟨.return_, span⟩ (some curBody) = MirStepNode.fail .ub) := by
-  refine ⟨fun retVal h0 => ?_, fun hub => ?_⟩
+  refine ⟨fun retVal h0 hinit => ?_, fun hub => ?_⟩
   · subst hcallerEq
     have hw := writeReturnDestination_callDest hdest {
       s.memory with
@@ -8338,7 +8473,7 @@ theorem evalTerminator_return_caller_anneal {s : MachineState} {curBody callerBo
         MirSemantics.hasFrameDeallocProtectorConflict [] prots d n = false := by
       intro prots _ _; cases prots <;> rfl
     unfold MirSemantics.evalTerminator
-    simp only [get?, h0, hstack, hdiv, hbor, hdealloc,
+    simp only [get?, h0, hinit, hstack, hdiv, hbor, hdealloc,
       MirSemantics.disableFrameBorrows,
       MirSemantics.restoreCallerProtectors, hprotNone, hcalleeProts, hw, MirStepNode.step]
   · rcases hub with h | h | h <;> simp [MirSemantics.evalTerminator, get?, h]

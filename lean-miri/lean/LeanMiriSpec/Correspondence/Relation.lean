@@ -136,6 +136,14 @@ inductive ImmediateRel (ty : Ty) (layouts : LayoutTable) :
 
 namespace ImmediateRel
 
+/-- Any `Value` related by `ImmediateRel` is free of `Value.uninit`. -/
+theorem valueContainsUninit_eq_false
+    {ty : Ty} {layouts : LayoutTable} {v : Value}
+    {imm : Miri.Interpreter.Immediate AnnealProv}
+    (h : ImmediateRel ty layouts v imm) :
+    valueContainsUninit v = false := by
+  cases h <;> rfl
+
 /-- Inversion lemma: any `ImmediateRel` at a primitive scalar type (`bool`, `char`,
 `int`, or `uint`) is a single scalar (`ImmediateRel.scalar`). -/
 theorem of_primitive_scalar

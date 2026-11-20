@@ -1132,7 +1132,8 @@ theorem evalRvalue_transmute_ptr (locals : List LocalSlot) (p : Nat) (castTy : M
     have hlenEq : Nat.beq (Trusted.Sequence.length bs) 8 = true := by
       have : Trusted.Sequence.length bs = bs.length := rfl
       simp [this, hlen]
-    simp [evalRvalue, evalByteCast, evalOperand, get?, hpv, readProjectedValue,
+    simp [evalRvalue, evalByteCast, MirSemantics.resolveByteCastSrcTyAndSize,
+      evalOperand, get?, hpv, readProjectedValue,
       hszDst, hopTy, hszSrc, henc, hlenEq, hdec]
   · rcases hu with hu | hu <;>
       simp [evalRvalue, evalByteCast, evalOperand, get?, hu]
@@ -3157,7 +3158,7 @@ theorem derefWriteTreeUB_false_of_ancestors_writable (locals : List LocalSlot)
             exact treeBorrowChainChildAccessUBAux_write_false _ entry.parentTag
               (fun pTag hp anc hmem hanc =>
                 hw ptrVal sz hloc anc hmem (IsBorrowAncestorOrSelf.step hlk hp hanc))
-        | unit | scalar _ | aggregate _ _ => rfl
+        | unit | uninit | scalar _ | aggregate _ _ => rfl
 
 /-- Concrete meaning of `PtrLocalState` for local `p` at runtime slots `view`
 and Anneal borrow table `borrows`:

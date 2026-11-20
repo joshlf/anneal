@@ -740,6 +740,13 @@ structure ValidEnumLayout (ty : Ty) (layouts : LayoutTable) (tagBytes : Nat)
               (translateTy ty layouts).layout.size.bytes.toNat
               (vars[v]'(by omega))
               (variants[v]'hv)
+  raw_shapes_ok :
+    ∀ tl rawTag rawShapes,
+      layouts.lookup ty.layoutIdx = some tl →
+      tl.variants = .multiple rawTag 0 rawShapes →
+      ∀ v (hv : v < rawShapes.length),
+        (∃ offs ord, rawShapes[v]'hv = .arbitrary offs ord) ∨
+        rawShapes[v]'hv = .primitive
 
 namespace ValidEnumLayout
 
@@ -828,8 +835,8 @@ offset `0`:
   - `get? fieldVals i = some (.scalar sc_i)` and the field slice
     `[f_i.offset, f_i.offset + f_i.size)` is initialized and reads back
     `msc_i` (`ScalarRel sc_i msc_i`), or
-  - `get? fieldVals i = none` (e.g. a trailing field after `SetDiscriminant`
-    switches from a narrower variant to a wider variant) and at least one byte
+  - `get? fieldVals i = none` or `get? fieldVals i = some .uninit` (e.g. an
+    unpopulated payload field after `SetDiscriminant`) and at least one byte
     in `[f_i.offset, f_i.offset + f_i.size)` is uninitialized in `words`, so
     reading field `i` of `v_act` raises UB in both Anneal and `lean-miri`. -/
 inductive EnumMemRel
@@ -899,7 +906,7 @@ inductive EnumMemRel
             localAlloc.allocation.readScalar annealTargetDataLayout
               (Miri.Memory.allocRange f.offset f.fieldLayout.size) false =
               .ok (.fromScalarInt msc)) ∨
-          (get? fieldVals i = none ∧
+          ((get? fieldVals i = none ∨ get? fieldVals i = some .uninit) ∧
             ∃ b,
               f.offset.bytes.toNat ≤ b ∧
               b < f.offset.bytes.toNat + f.fieldLayout.size.bytes.toNat ∧

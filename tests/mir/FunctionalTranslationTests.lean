@@ -789,6 +789,14 @@ private def advanceCursorMutPreSwitchRawState
           [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .reservedFrz false }]
         nextTag := 2 } }
 
+private theorem runMirToBinarySwitch_step
+    {fuel : Nat} {body : CapturedMir} {s s' : MachineState}
+    (h_sw : inspectBinarySwitch body s = none := by rfl)
+    (h_st : stepMirFn body s = .tau (.running s') := by rfl) :
+    runMirToBinarySwitch (fuel + 1) body s = runMirToBinarySwitch fuel body s' := by
+  (conv => lhs; unfold runMirToBinarySwitch)
+  rw [h_sw, h_st]
+
 private theorem advanceCursorMut_bb0_switch
     (c : FrameCursor) {delta : Nat} (h_add_lt : c.pos + delta < 4294967296) :
     runMirToBinarySwitch 8 advanceCursorMutMirBody
@@ -798,10 +806,25 @@ private theorem advanceCursorMut_bb0_switch
             (Nat.ble (c.pos + delta) c.len).toNat,
             advanceCursorMutPreSwitchState c delta 1,
             advanceCursorMutPreSwitchState c delta 2) := by
+  let mkS (idx : Nat) (locs : List LocalSlot) (mem : Memory := emptyMemory) : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := idx, locals := locs }, memory := mem }
+  let vC := LocalSlot.init (frameCursorCodec.encode c)
+  let vD := LocalSlot.init (.scalar ⟨delta, 4⟩)
+  let s1 := mkS 1 [.uninit, vC, vD, .uninit, .dead, .dead, .dead]
+  let s2 := mkS 2 [.uninit, vC, vD, .uninit, .uninit, .dead, .dead]
+  let s3 := mkS 3 [.uninit, vC, vD, .uninit, .uninit, .uninit, .dead]
+  let s4 := mkS 4 [.uninit, vC, vD, .uninit, .uninit, .uninit, .uninit]
+  let s5 := mkS 5 [.uninit, vC, vD, .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .uninit, .uninit, .uninit]
+    { emptyMemory with
+      borrows := [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .reservedFrz false }]
+      nextTag := 2 }
+  rw [runMirToBinarySwitch_step (s' := s1),
+      runMirToBinarySwitch_step (s' := s2),
+      runMirToBinarySwitch_step (s' := s3),
+      runMirToBinarySwitch_step (s' := s4),
+      runMirToBinarySwitch_step (s' := s5)]
   have h_raw :
-      runMirToBinarySwitch 8 advanceCursorMutMirBody
-        (initMachineStateWithMemory advanceCursorMutMirBody
-          [frameCursorCodec.encode c, .scalar ⟨delta, 4⟩] emptyMemory) =
+      runMirToBinarySwitch 3 advanceCursorMutMirBody s5 =
         let sumVal := wrapScalarBits (c.pos.add delta) (scalarModulus 4)
         let cmpSc := boolToScalar (Nat.ble sumVal c.len)
         some (!cmpSc.bits.beq 0, cmpSc.bits,

@@ -40,8 +40,12 @@ pub mod mutators_miri;
 pub mod shrink;
 
 pub use input_gen::{
-    EnumVariantLayout, EnvScheduleGenerator, EnvStrategy, FieldLayout, LayoutAwareByteBuilder,
-    LayoutSpec, MirInputDictionary, MirObsPathKey, MirObsPathSet, PaddingFillPattern, ScalarLayout,
+    EnumVariantLayout, EnvScheduleGenerator, EnvScheduledWriteStep, EnvStrategy, FieldLayout,
+    LayoutAwareByteBuilder, LayoutSpec, MirInputDictionary, MirObsPathKey, MirObsPathSet,
+    PaddingFillPattern, ScalarLayout, SpecBatchVerificationReport, SpecContractAssertion,
+    SpecContractOracleProbe, SpecExecPhase, SpecExternalCallee, SpecParamBinding,
+    SpecPostconditionVerdict, SpecViolationKind, UnderExplorationReason, WriteChainCoverageBound,
+    WriteChainStep, verify_spec_postcondition_against_schedule,
 };
 pub use instrument::{
     EnvAction, EnvSchedule, FromScheduleBytes, RecordedEvent, RecordedOutcome, RecordedRawTrace,

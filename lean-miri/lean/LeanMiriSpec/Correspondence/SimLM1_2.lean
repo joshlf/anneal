@@ -1129,7 +1129,7 @@ theorem evalOperand_scalar_simulation_opTy
         exact .uninit _
       · have ha : evalOperand af.locals (.copy ⟨idx, .nil⟩) .nil globals body.layouts .nil body.localDecls =
             .ok v af.locals := by
-          simp [evalOperand, readProjectedValue, hslot]
+          simp [evalOperand, readProjectedValue, hslot, himmRel.valueContainsUninit_eq_false]
         rw [ha, annealEvalOperand_copy_live hframes hlt_mf hdecl hmls_eq hcache]
         exact .ok v af.locals
           (cacheFrameLocalLayout topFrame idx hlt_mf (translateTy decl.ty body.layouts)) imm

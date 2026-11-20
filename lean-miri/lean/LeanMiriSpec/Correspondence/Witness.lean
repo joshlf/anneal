@@ -258,13 +258,13 @@ machines report undefined behavior at `_0 = Div(copy _1, const 0_u8)`. -/
 theorem divByZero_ub_agrees :
     (annealRun 0 2 (annealInit 0)).map (annealStepIsUB 0) = some true ∧
     (miriRun 0 2 (miriInit 0)).map (miriStepIsUB 0) = some true := by
-  decide
+  decide +kernel
 
 /-- With divisor `2`, both machines run the four statements and return `3`. -/
 theorem div_returns_agree :
     (annealRun 2 4 (annealInit 2)).bind (annealStepReturnsU8 2) = some 3 ∧
     (miriRun 2 4 (miriInit 2)).bind (miriStepReturnsU8 2) = some 3 := by
-  decide
+  decide +kernel
 
 /-- Multi-step fuel-bounded bisimulation (`run_wellTypedBody_bisim`) instantiated
 on `divBody` across arbitrary `fuel` steps, reaching `Div` UB at `fuel = 3`
@@ -506,7 +506,7 @@ both `runAnnealBounded` and `runMiriBounded` report undefined behavior at step 4
 theorem signedDiv_intMinNegOne_ub_agrees :
     annealOutcomeIsUB (runAnnealBounded (signedDivBody 255) 4 (annealSignedDivInit 255)) = true ∧
     miriOutcomeIsUB (runMiriBounded (signedDivBody 255) 4 (miriSignedDivInit 255)) = true := by
-  decide
+  decide +kernel
 
 /-- Signed `(-128_i8) / 2_i8`: across `bb0 -> goto bb1 -> return`, both machines
 return `192` (`-64_i8` in two's complement) at step 6. -/
@@ -515,7 +515,7 @@ theorem signedDiv_returns_agree :
         (runAnnealBounded (signedDivBody 2) 6 (annealSignedDivInit 2)) = some 192 ∧
     miriOutcomeScalarBits 1
         (runMiriBounded (signedDivBody 2) 6 (miriSignedDivInit 2)) = some 192 := by
-  decide
+  decide +kernel
 
 
 /-! ## Non-vacuity witnesses for `MemPlaceRel` & `LocalRel.indirect` (`AnnealMachine`) -/
@@ -770,7 +770,7 @@ behavior at step 4. -/
 theorem unreachable_ub_agrees :
     annealOutcomeIsUB (runAnnealBounded unreachableBody 4 annealUnreachableInit) = true ∧
     miriOutcomeIsUB (runMiriBounded unreachableBody 4 miriUnreachableInit) = true := by
-  decide
+  decide +kernel
 
 /-! ## Unicode `char` constant & copy witness -/
 
@@ -887,7 +887,7 @@ preserving `isValidCharCode` through `ImmediateRel.scalar`. -/
 theorem charCopy_returns_agree :
     annealOutcomeScalarBits 4 (runAnnealBounded charCopyBody 5 annealCharInit) = some 0x03BB ∧
     miriOutcomeScalarBits 4 (runMiriBounded charCopyBody 5 miriCharInit) = some 0x03BB := by
-  decide
+  decide +kernel
 
 /-! ## Heterogeneous `ShlUnchecked` (`u8 << i16`) witness (normal shift & OOB / negative UB) -/
 
@@ -1028,7 +1028,7 @@ theorem shiftUnchecked_witness_agrees :
     miriOutcomeIsUB (runMiriBounded (shiftUncheckedBody 8) 3 (miriShiftUncheckedInit 8)) = true ∧
     annealOutcomeIsUB (runAnnealBounded (shiftUncheckedBody 0xFFFF) 3 (annealShiftUncheckedInit 0xFFFF)) = true ∧
     miriOutcomeIsUB (runMiriBounded (shiftUncheckedBody 0xFFFF) 3 (miriShiftUncheckedInit 0xFFFF)) = true := by
-  decide
+  decide +kernel
 
 /-! ## `StatementKind.nop` + `BinOp.addUnchecked` witness (normal sum & overflow UB) -/
 
@@ -1159,7 +1159,7 @@ theorem addUncheckedNop_witness_agrees :
       some 242 ∧
     annealOutcomeIsUB (runAnnealBounded (addUncheckedNopBody 100) 4 (annealAddUncheckedNopInit 100)) = true ∧
     miriOutcomeIsUB (runMiriBounded (addUncheckedNopBody 100) 4 (miriAddUncheckedNopInit 100)) = true := by
-  decide
+  decide +kernel
 
 /-! ## Phase 2 Hook Fidelity Witnesses (`annealCastHooks` & `annealTerminatorHooks`) -/
 
@@ -1402,6 +1402,6 @@ in 6 steps on both machines without triggering undefined behavior. -/
 theorem unaryBitwise_returns_agree :
     annealOutcomeScalarBits 1 (runAnnealBounded unaryBitwiseBody 6 annealUnaryBitwiseInit) = some 0x2A ∧
     miriOutcomeScalarBits 1 (runMiriBounded unaryBitwiseBody 6 miriUnaryBitwiseInit) = some 0x2A := by
-  decide
+  decide +kernel
 
 end LeanMiriSpec.Correspondence.Witness

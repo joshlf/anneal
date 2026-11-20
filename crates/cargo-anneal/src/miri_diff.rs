@@ -1172,7 +1172,7 @@ fn push_modular_panic_claim(
          {indent}    pre := fun _ => True\n\
          {indent}    post := fun req ans =>\n\
          {indent}      match ans with\n\
-         {indent}      | .returned _ memAfter => callFramePreserved req.memory memAfter\n\
+         {indent}      | .returned retVal memAfter => And (valueContainsUninit retVal = false) (callFramePreserved req.memory memAfter)\n\
          {indent}      | .panicked memAfter => callFramePreserved req.memory memAfter\n\
          {indent}      | .aborted => True\n\
          {indent}  }}\n\
@@ -1909,6 +1909,8 @@ const TRUSTED_INLINE_CALL_DEF_PATHS: &[&str] = &[
     "core::intrinsics::three_way_compare",
     "core::intrinsics::size_of_val",
     "core::intrinsics::align_of_val",
+    "core::intrinsics::copy_nonoverlapping",
+    "core::intrinsics::write_bytes",
 ];
 
 /// Return `true` when `def_id` is one of [`TRUSTED_INLINE_CALL_DEF_PATHS`].
@@ -2408,7 +2410,7 @@ mod tests {
                         pre := fun _ => True\n        \
                         post := fun req ans =>\n          \
                           match ans with\n          \
-                          | .returned _ memAfter => callFramePreserved req.memory memAfter\n          \
+                          | .returned retVal memAfter => And (valueContainsUninit retVal = false) (callFramePreserved req.memory memAfter)\n          \
                           | .panicked memAfter => callFramePreserved req.memory memAfter\n          \
                           | .aborted => True\n      \
                         }";

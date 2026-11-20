@@ -283,10 +283,9 @@ theorem test_c1_setDiscriminant_suite :
      runAVal (optMir 0) 5
        (initMachineState (optMir 0) [.aggregate 1 [.scalar ⟨7, 1⟩]]) =
        some (.scalar ⟨0, 8⟩) ∧
-     (match stepMirFn (optMir 2)
-              (initMachineState (optMir 2) [.aggregate 1 [.scalar ⟨7, 1⟩]]) with
-      | .tau (.running s1) => stepMirFn (optMir 2) s1 = MirStepNode.fail .ub
-      | _ => False) ∧
+     stepMirFn (optMir 2)
+       (initMachineState (optMir 2) [.aggregate 1 [.scalar ⟨7, 1⟩]]) =
+       MirStepNode.fail .ub ∧
      Interp.step (optMach 2) =
        .error (.specPanic "setting an invalid discriminant (2)") ∧
      Interp.stepTB (liftMachToTB (optMach 2)) =
@@ -512,6 +511,13 @@ def c7SubtypeWideSliceMir : CapturedMir :=
     [mkBb [mkSt (.assign (locPlace 0)
       (.cast .subtype (.copy (locPlace 1)) rawConstSliceU32MirTy))] .return_]
 
+private def extractScalarAndFnPtrs? {E : Type}
+    (r : Option (List E × MirOutcome)) : Option (Nat × Nat × Nat) :=
+  match r with
+  | some ([], .normal (.scalar sc, memEnd)) =>
+    some (sc.bits, sc.sizeBytes, length memEnd.fnPtrs)
+  | _ => none
+
 /-- Exercises `C6..C8` composite pipeline, `fnPtrToPtr` nonzero-offset &
 non-fn-alloc UB, `subtype` (`NonZeroU8`, `bool`, pointer-to-`usize` UB, wide
 slice), explicit `unsafeFnPointer_trusted_unsupported_divergence` propositions
@@ -608,7 +614,7 @@ theorem test_c6_c7_c8_coercions_fnPtrToPtr_and_subtype_suite :
     emptyLayoutTable { allocId := fnPtrAllocBase, offsetBytes := 0 } 4096
     (by decide) (some (⟨0⟩, ())) (some (⟨0⟩, [])) none none rfl
     "CustomUnknownCoercion"
-  exact ⟨⟨rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+  refine ⟨?_, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
     ⟨hDiv.1 rfl rfl rfl rfl, hDiv.2.1, rfl, hDiv.2.2.1, hDiv.2.2.2.2.1,
      hDiv.2.2.2.2.2.1, hDiv.2.2.2.2.2.2⟩,
     rfl,
@@ -618,6 +624,30 @@ theorem test_c6_c7_c8_coercions_fnPtrToPtr_and_subtype_suite :
       rawConstU32MirTy,
     translateRvalue_pointerCoercion_none emptyLayoutTable [] none
       "ClosureFnPointer(Unsafe)" (.copy (locPlace 1)) fnPtrUnsafeU32MirTy⟩
+  have h : extractScalarAndFnPtrs?
+      (runA c6c7c8CompositeMir 24 (initMachineState c6c7c8CompositeMir [])) =
+      some (64, 4, 1) := by decide +kernel
+  generalize runA c6c7c8CompositeMir 24 (initMachineState c6c7c8CompositeMir []) = res at h ⊢
+  cases res with
+  | none => cases h
+  | some p =>
+    rcases p with ⟨effs, out⟩
+    cases effs with
+    | cons _ _ => cases h
+    | nil =>
+      cases out with
+      | normal rm =>
+        rcases rm with ⟨v, m⟩
+        cases v with
+        | scalar sc =>
+          cases sc
+          dsimp only [extractScalarAndFnPtrs?] at h
+          injection h with h'
+          injection h' with h1 h2
+          injection h2 with h2a h3
+          exact ⟨by rw [h1, h2a], h3⟩
+        | _ => cases h
+      | _ => cases h
 
 /-! ## §6 (`C9` & `C10`): `unwrapUnsafeBinder` + `AggregateKind.closure` -/
 

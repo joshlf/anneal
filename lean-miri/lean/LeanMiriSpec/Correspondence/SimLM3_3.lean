@@ -607,11 +607,33 @@ theorem sim_lm3_3_retag_uninhabited_ref_ub_step
     (huninhab : rigidTyIsUninhabited 16 pointee = true) :
     stepMirFn (retagPointeeRefBody rk mutability pointee)
       (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub := by
-  change
-    (match rigidTyIsUninhabited 16 pointee with
-     | true => MirStepNode.fail .ub
-     | false => _) = .fail .ub
-  rw [huninhab]
+  cases val with
+  | uninit => rfl
+  | aggregate v fs =>
+    change
+      (match
+         match
+           match valueListContainsUninit fs with
+           | false => ProjReadResult.ok (Value.aggregate v fs)
+           | true => ProjReadResult.ub with
+         | .ok v' => PlaceReadResult.ok v' [.uninit, .init .unit, .init (Value.aggregate v fs)]
+         | .ub => PlaceReadResult.ub
+         | .unsupported => PlaceReadResult.unsupported with
+       | .ok _ _ =>
+         match rigidTyIsUninhabited 16 pointee with
+         | true => MirStepNode.fail .ub
+         | false => _
+       | .ub => MirStepNode.fail .ub
+       | .unsupported => MirStepNode.fail .unsupported) = .fail .ub
+    cases valueListContainsUninit fs
+    · dsimp only []; rw [huninhab]
+    · rfl
+  | _ =>
+    change
+      (match rigidTyIsUninhabited 16 pointee with
+       | true => MirStepNode.fail .ub
+       | false => _) = .fail .ub
+    rw [huninhab]
 
 /-- **`sim_lm3_3_retag_inhabited_never_container_zst_step`**: in contrast to
 `sim_lm3_3_retag_uninhabited_ref_ub_step` on `!` and `[!; 1]`, zero-sized
@@ -1045,7 +1067,7 @@ theorem sim_lm3_3_interpreter_deref_write_step
         | uninit => exact sameAllocSkeleton_actAllocEntry_symm treeMap
         | init v =>
           cases v with
-          | unit => exact sameAllocSkeleton_actAllocEntry_symm treeMap
+          | unit | uninit => exact sameAllocSkeleton_actAllocEntry_symm treeMap
           | scalar _ => exact sameAllocSkeleton_actAllocEntry_symm treeMap
           | aggregate _ _ => exact sameAllocSkeleton_actAllocEntry_symm treeMap
           | ptr ptrVal sz =>
@@ -1109,9 +1131,10 @@ theorem sim_lm3_3_interpreter_deref_write_step
             cases sl with
             | dead => cases hop_res
             | uninit => cases hop_res
-            | init _ =>
+            | init v_op =>
               simp only [readProjectedValue] at hop_res
-              injection hop_res with _ hl; exact hl.symm
+              cases hvc : valueContainsUninit v_op <;> rw [hvc] at hop_res <;> cases hop_res
+              rfl
       subst hloc₁_eq
       obtain ⟨slot_r, mls_r, _, _, hslot_r, hmls_r, _, hloc_r⟩ := hfr.lookup_local hdecl_ref
       have hslot_r_s : get? s.frame.locals refIdx = some slot_r := hslot_r

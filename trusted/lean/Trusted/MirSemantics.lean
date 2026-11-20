@@ -20,7 +20,7 @@ Reference (The Rust Reference, "Behavior considered undefined"):
 -/
 
 export Trusted.Rustc.V2026_06_01.MirSemantics (
-  MirObs Value LocalSlot StackFrame TreeBorrowPerm LocalIdx BorrowEntry
+  MirObs Value valueContainsUninit valueListContainsUninit LocalSlot StackFrame TreeBorrowPerm LocalIdx BorrowEntry
   SavedCallerFrame Memory emptyMemory MachineState
   currentFrameDepth frameIndexOfDepth savedFrameAtDepth? activeFrameSlot?
   foreignFrameSlot? readFrameLocalSlot ForeignFrameTarget foreignFrameTarget?
@@ -61,7 +61,8 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   encodeUntypedValueToBytes encodeFieldsAtOffsetsWith encodeSeqFieldsWith
   encodeUnionFieldsWith
   decodeFieldsAtOffsetsWith decodeFieldsBySpan decodeSeqFieldsWith
-  defaultCodecFuel encodeValueToBytes decodeValueFromBytes lookupBorrow
+  defaultCodecFuel findDiscriminantVariantIdx? resolveEnumVariantIdxByTag
+  resolveEnumDiscriminantForVariant encodeValueToBytes decodeValueFromBytes lookupBorrow
   updateBorrowPerm invalidateConflictingBorrows
   isBorrowDescendantOrSelfAux isBorrowDescendantOrSelf
   resolveTreeBorrowWriterTag updateBorrowPermTreeAtProj
@@ -69,9 +70,13 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   freezeTreeBorrowsOnReadAtProj freezeDerefReadBorrowsAt
   hasProtectedTreeWriteConflict lookupGlobalAlloc
   readLittleEndianBytes readGlobalScalar tyScalarBytes evalConstValue
-  dropValues takeValues extractSubslice readProjectedValue
+  dropValues takeValues extractSubslice readProjectedValue readContainerProjectedValue
   appendValueList replaceSubslice
   setOrExtendFields writeProjectedValue
+  projListHasDeref resolveFieldStepTy resolveArrayStepTy
+  nonUnionAggregateArity? uninitContainerFieldShell? enumVariantPayloadArity?
+  padFieldsToArity deinitTailOk deinitProjectedValue deinitProjectedForLocal
+  allOffsetsAtLeast allVariantFieldsAfterTag enumLayoutHasDisjointDirectTag
   sliceConstElemKind isScalarCompatibleProj uintRigidTyOfStride
   inferValueByteSizeAux inferElemListByteStride exactByteDivAux byteOffsetToElemIdx?
   splitLastConstantIndex? readSliceBackingAggregate? splitLastSubslice? endsWithSubslice needsThinPtrElemResolution
@@ -79,7 +84,9 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   evalGlobalDerefRead evalSliceFatPtrDerefRead evalPlaceRead
   evalOperand evalOperands
   extractDerefPtrVal? resolveDerefWriteFullProj writeSliceFatPtrTargetValue
-  writePlaceValue derefWriteTreeUB evalByteCast
+  writePlaceValue derefWriteTreeUB layoutValidForAdt layoutValidForResolvedAdt
+  resolveByteCastSrcTyAndSize evalByteCast
+  evalNullaryOp evalUseRvalue evalShallowInitBox evalWrapUnsafeBinder
   unsizeArrayToSliceSpec? evalUnsizeCoercion deriveStackElemThinPtr
   resolveBorrowProjectionElems rigidTyIsFreeze tyIsFreeze placeIsFreeze
   rigidTyIsZeroSized tyIsZeroSized placeIsZeroSized
@@ -103,7 +110,8 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   evalCopyNonOverlappingWithCount evalCopyNonOverlapping
   preventsDeallocation copyEntriesTargetActiveFrame
   borrowsAfterCopySingleDirect evalForeignFrameCopySingleDirect
-  setDiscriminantUninitDeclOk
+  setDiscriminantUninitDeclOk setDiscriminantUninitPayload?
+  padSetDiscriminantInitFields?
   evalSetDiscriminantLocal derefTargetsSuspendedFrame FrameWriteResult
   foreignFrameDerefWrite evalForeignFrameDerefWrite
   evalSetDiscriminantDerefWrite
@@ -128,7 +136,8 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   writeIntrinsicReturn writeIntrinsicScalarResult
   evalNonSelectIntrinsicCall isPtrPointeeIntrinsicKind
   withConstEvalSelectIntrinsicTypeArgs rigidTysToZeroSizedOps
-  constEvalSelectTupleArgOps evalDirectRustIntrinsic?
+  constEvalSelectTupleArgOps finishMemIntrinsicCall evalCopyNonOverlappingCall
+  WriteBytesAction writeBytesAction evalWriteBytesCall evalDirectRustIntrinsic?
   isUnreachableCallTarget isAbortingPanicDefPath
   isUnwindingPanicDefPath evalTerminator
   initMachineState initMachineStateWithCallees

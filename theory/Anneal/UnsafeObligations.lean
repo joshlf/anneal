@@ -195,6 +195,18 @@ theorem evalLoadRawPtr_of_obligations
   rcases hTb with ⟨mem', hStep⟩
   exact ⟨mem', by simp [evalLoadRawPtr, checkAlignedBool_of_alignedPtr hAlign, hStep, hLive]⟩
 
+@[simp]
+theorem readProjectedValue_nil_of_no_uninit
+    (locals : List LocalSlot) {v : Value}
+    (hInit : valueContainsUninit v = false) :
+    readProjectedValue locals v [] = .ok v := by
+  cases v with
+  | unit | scalar _ | ptr _ _ => rfl
+  | uninit => nomatch hInit
+  | aggregate varIdx fields =>
+    dsimp only [valueContainsUninit] at hInit
+    simp [readProjectedValue, hInit]
+
 theorem evalOperand_deref_of_obligations
     (mem : Memory) (locals : List LocalValue) (ptrLocal : Local)
     (rp : RawPtrVal) (sz : Nat) (entry : BorrowEntry) (v : Value)
@@ -202,13 +214,14 @@ theorem evalOperand_deref_of_obligations
     (hLookup : lookupBorrow mem.borrows rp.toProvenancePtr.tag = some entry)
     (hNotDis : entry.perm ≠ .disabled)
     (hProj : entry.targetProjection = [])
-    (hTarget : get? locals entry.targetLocal = some (.init v)) :
+    (hTarget : get? locals entry.targetLocal = some (.init v))
+    (hInit : valueContainsUninit v = false := by rfl) :
     evalOperand
       locals (.copy { local_ := ptrLocal, projection := [.deref] })
       mem.borrows mem.globals = .ok v locals := by
   unfold evalOperand
   simp only [hPtr, hLookup, hProj]
-  cases hPerm : entry.perm <;> simp_all [readProjectedValue]
+  cases hPerm : entry.perm <;> simp_all
 
 theorem evalStoreRawPtr_of_obligations
     (mem : Memory) (locals locals' : List LocalValue) (rp : RawPtrVal)
@@ -355,7 +368,8 @@ theorem evalCopyNonOverlapping_one_of_obligations
       set? s.frame.locals dstEntry.targetLocal (.init copiedVal) =
         some locals')
     (hFrame :
-      copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry = true) :
+      copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry = true)
+    (hCopiedInit : valueContainsUninit copiedVal = false := by rfl) :
     evalCopyNonOverlapping s srcOp dstOp countOp =
       MirStepNode.step
         (advanceStmt s locals'
@@ -373,7 +387,7 @@ theorem evalCopyNonOverlapping_one_of_obligations
     evalCopyNonOverlappingPermOk evalCopySingleDirect writePlaceValue
   simp [hSrc, hDst, hCnt, hSrcLookup, hDstLookup, hSrcPerm, hDstPerm,
         hSrcZero, hDstZero, hTagNe, hLocNe, hSrcVal, hSrcProj, hSrcPt,
-        hDstProj, hDstVal, hWrite, hFrame, readProjectedValue]
+        hDstProj, hDstVal, hWrite, hFrame, hCopiedInit]
 
 /-! ## 3. Slice-Split, Unaligned Raw-Pointer, and Array-to-Slice Obligations -/
 

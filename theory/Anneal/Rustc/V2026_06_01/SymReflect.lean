@@ -221,7 +221,10 @@ theorem set?_concretizeSymSlots_concrete
 
 /-- Pure field projection reader independent of `locals`. -/
 def readProjectedPure : Value → List ProjectionElem → Option Value
-  | val, .nil => .some val
+  | val, .nil =>
+    match valueContainsUninit val with
+    | false => .some val
+    | true => .none
   | .aggregate _ fields, .field idx _ :: rest =>
     match get? fields idx with
     | .some fieldVal => readProjectedPure fieldVal rest
@@ -234,9 +237,13 @@ theorem readProjectedPure_sound
       readProjectedPure val proj = .some res →
       readProjectedValue locals val proj = .ok res
   | val, .nil, res, h => by
-    injection h with hEq
-    subst hEq
-    rfl
+    dsimp only [readProjectedPure] at h
+    dsimp only [readProjectedValue]
+    cases hU : valueContainsUninit val <;> rw [hU] at h
+    · injection h with hEq
+      subst hEq
+      rfl
+    · nomatch h
   | .aggregate _ fields, .field idx _ :: rest, res, h => by
     dsimp only [readProjectedPure] at h
     dsimp only [readProjectedValue]
@@ -247,6 +254,7 @@ theorem readProjectedPure_sound
     | some fieldVal =>
       rw [hGet] at h
       exact readProjectedPure_sound locals fieldVal rest res h
+  | .uninit, .field _ _ :: _, _, h => nomatch h
   | .unit, .field _ _ :: _, _, h => nomatch h
   | .scalar _, .field _ _ :: _, _, h => nomatch h
   | .ptr _ _, .field _ _ :: _, _, h => nomatch h
@@ -315,9 +323,15 @@ def evalSymPlaceCopy
   | .deref :: _ => .none
   | .nil =>
     match get? slots p.local_ with
-    | .some (.concrete (.init rootVal)) => .some (.concrete rootVal)
+    | .some (.concrete (.init rootVal)) =>
+      match valueContainsUninit rootVal with
+      | false => .some (.concrete rootVal)
+      | true => .none
     | .some (.symArg idx) => .some (.symArg idx)
-    | .some (.symPair0 v0 idx) => .some (.symPair0 v0 idx)
+    | .some (.symPair0 v0 idx) =>
+      match valueContainsUninit v0 with
+      | false => .some (.symPair0 v0 idx)
+      | true => .none
     | _ => .none
   | proj :: rest =>
     match placeTouchesUnion localDecls layouts p with
@@ -330,7 +344,10 @@ def evalSymPlaceCopy
         | .none => .none
       | .some (.symPair0 v0 idx) =>
         match proj, rest with
-        | .field .zero _, .nil => .some (.symGuarded v0 idx)
+        | .field .zero _, .nil =>
+          match valueContainsUninit v0 with
+          | false => .some (.symGuarded v0 idx)
+          | true => .none
         | .field (.succ .zero) _, .nil => .some (.symArg idx)
         | _, _ => .none
       | _ => .none
@@ -345,11 +362,17 @@ def concretizeSymReadResult
   | .concrete v => .ok v (concretizeSymSlots args slots')
   | .symArg idx =>
     match get? args idx with
-    | .some v => .ok v (concretizeSymSlots args slots')
+    | .some v =>
+      match valueContainsUninit v with
+      | false => .ok v (concretizeSymSlots args slots')
+      | true => .ub
     | .none => .ub
   | .symPair0 v0 idx =>
     match get? args idx with
-    | .some v1 => .ok (.aggregate 0 (v0 :: v1 :: .nil)) (concretizeSymSlots args slots')
+    | .some v1 =>
+      match valueContainsUninit v1 with
+      | false => .ok (.aggregate 0 (v0 :: v1 :: .nil)) (concretizeSymSlots args slots')
+      | true => .ub
     | .none => .ub
   | .symGuarded v0 idx =>
     match get? args idx with
@@ -388,25 +411,40 @@ theorem evalSymPlaceCopy_sound_copy
         | symArg idx =>
           injection h with hEq
           subst hEq
-          dsimp only [concretizeSymSlot, concretizeSymReadResult]
+          dsimp only [concretizeSymSlot, concretizeSymReadResult, readProjectedValue]
           cases get? args idx with
           | none => rfl
-          | some v => rfl
+          | some v => dsimp only; cases valueContainsUninit v <;> rfl
         | symPair0 v0 idx =>
-          injection h with hEq
-          subst hEq
-          dsimp only [concretizeSymSlot, concretizeSymReadResult]
-          cases get? args idx with
-          | none => rfl
-          | some v => rfl
+          dsimp only at h
+          cases hU0 : valueContainsUninit v0 with
+          | true => rw [hU0] at h; nomatch h
+          | false =>
+            rw [hU0] at h
+            injection h with hEq
+            subst hEq
+            dsimp only [concretizeSymSlot, concretizeSymReadResult, readProjectedValue]
+            cases get? args idx with
+            | none => rfl
+            | some v =>
+              dsimp only [valueContainsUninit, valueListContainsUninit]
+              rw [hU0]
+              dsimp only
+              cases valueContainsUninit v <;> rfl
         | concrete cSlot =>
           cases cSlot with
           | dead => nomatch h
           | uninit => nomatch h
           | init rootVal =>
-            injection h with hEq
-            subst hEq
-            rfl
+            dsimp only at h
+            cases hU : valueContainsUninit rootVal with
+            | true => rw [hU] at h; nomatch h
+            | false =>
+              rw [hU] at h
+              injection h with hEq
+              subst hEq
+              dsimp only [concretizeSymSlot, concretizeSymReadResult, readProjectedValue]
+              rw [hU]
     | cons pHead pTail =>
       cases hHead : pHead with
       | deref =>
@@ -439,15 +477,21 @@ theorem evalSymPlaceCopy_sound_copy
                 cases pTail with
                 | cons _ _ => nomatch h
                 | nil =>
-                  injection h with hEq
-                  subst hEq
-                  dsimp only [concretizeSymSlot, concretizeSymReadResult]
-                  cases get? args idx with
-                  | none => rfl
-                  | some _ =>
-                    dsimp only
-                    rw [hUnion]
-                    rfl
+                  dsimp only at h
+                  cases hU0 : valueContainsUninit v0 with
+                  | true => rw [hU0] at h; nomatch h
+                  | false =>
+                    rw [hU0] at h
+                    injection h with hEq
+                    subst hEq
+                    dsimp only [concretizeSymSlot, concretizeSymReadResult]
+                    cases get? args idx with
+                    | none => rfl
+                    | some _ =>
+                      dsimp only [readProjectedValue, get?, List.getElem?_cons_zero]
+                      rw [hUnion]
+                      dsimp only [readProjectedValue, get?, List.getElem?_cons_zero]
+                      rw [hU0]
               | succ fIdx' =>
                 cases fIdx' with
                 | zero =>
@@ -459,10 +503,11 @@ theorem evalSymPlaceCopy_sound_copy
                     dsimp only [concretizeSymSlot, concretizeSymReadResult]
                     cases get? args idx with
                     | none => rfl
-                    | some _ =>
-                      dsimp only
+                    | some v =>
+                      dsimp only [readProjectedValue, get?, List.getElem?_cons_succ, List.getElem?_cons_zero]
                       rw [hUnion]
-                      rfl
+                      dsimp only [readProjectedValue, get?, List.getElem?_cons_succ, List.getElem?_cons_zero]
+                      cases valueContainsUninit v <;> rfl
                 | succ _ => nomatch h
             | concrete cSlot =>
               cases cSlot with
@@ -550,17 +595,23 @@ def evalSymOperand
     | .nil =>
       match get? slots p.local_ with
       | .some (.concrete (.init rootVal)) =>
-        match set? slots p.local_ (.concrete .uninit) with
-        | .some slots' => .some (.concrete rootVal, slots')
-        | .none => .none
+        match valueContainsUninit rootVal with
+        | false =>
+          match set? slots p.local_ (.concrete .uninit) with
+          | .some slots' => .some (.concrete rootVal, slots')
+          | .none => .none
+        | true => .none
       | .some (.symArg idx) =>
         match set? slots p.local_ (.concrete .uninit) with
         | .some slots' => .some (.symArg idx, slots')
         | .none => .none
       | .some (.symPair0 v0 idx) =>
-        match set? slots p.local_ (.concrete .uninit) with
-        | .some slots' => .some (.symPair0 v0 idx, slots')
-        | .none => .none
+        match valueContainsUninit v0 with
+        | false =>
+          match set? slots p.local_ (.concrete .uninit) with
+          | .some slots' => .some (.symPair0 v0 idx, slots')
+          | .none => .none
+        | true => .none
       | _ => .none
     | _ :: _ =>
       match evalSymPlaceCopy slots p borrows localDecls layouts with
@@ -628,35 +679,19 @@ theorem evalSymOperand_sound
               injection hPair with hSv hSlots
               subst hSv
               subst hSlots
-              dsimp only [concretizeSymSlot, concretizeSymReadResult]
+              dsimp only [concretizeSymSlot, concretizeSymReadResult, readProjectedValue]
               cases get? args idx with
               | none => rfl
               | some v =>
                 dsimp only
                 rw [set?_concretizeSymSlots_concrete args .uninit slots loc, hSet]
+                cases valueContainsUninit v <;> rfl
           | symPair0 v0 idx =>
             dsimp only at h
-            cases hSet : set? slots loc (.concrete .uninit) with
-            | none =>
-              rw [hSet] at h
-              nomatch h
-            | some slots1 =>
-              rw [hSet] at h
-              injection h with hPair
-              injection hPair with hSv hSlots
-              subst hSv
-              subst hSlots
-              dsimp only [concretizeSymSlot, concretizeSymReadResult]
-              cases get? args idx with
-              | none => rfl
-              | some v =>
-                dsimp only
-                rw [set?_concretizeSymSlots_concrete args .uninit slots loc, hSet]
-          | concrete cSlot =>
-            cases cSlot with
-            | dead => nomatch h
-            | uninit => nomatch h
-            | init rootVal =>
+            cases hU0 : valueContainsUninit v0 with
+            | true => rw [hU0] at h; nomatch h
+            | false =>
+              rw [hU0] at h
               dsimp only at h
               cases hSet : set? slots loc (.concrete .uninit) with
               | none =>
@@ -668,8 +703,37 @@ theorem evalSymOperand_sound
                 injection hPair with hSv hSlots
                 subst hSv
                 subst hSlots
-                dsimp only [concretizeSymSlot, concretizeSymReadResult]
-                rw [set?_concretizeSymSlots_concrete args .uninit slots loc, hSet]
+                dsimp only [concretizeSymSlot, concretizeSymReadResult, readProjectedValue]
+                cases get? args idx with
+                | none => rfl
+                | some v =>
+                  dsimp only [valueContainsUninit, valueListContainsUninit]
+                  rw [hU0, set?_concretizeSymSlots_concrete args .uninit slots loc, hSet]
+                  dsimp only
+                  cases valueContainsUninit v <;> rfl
+          | concrete cSlot =>
+            cases cSlot with
+            | dead => nomatch h
+            | uninit => nomatch h
+            | init rootVal =>
+              dsimp only at h
+              cases hU : valueContainsUninit rootVal with
+              | true => rw [hU] at h; nomatch h
+              | false =>
+                rw [hU] at h
+                dsimp only at h
+                cases hSet : set? slots loc (.concrete .uninit) with
+                | none =>
+                  rw [hSet] at h
+                  nomatch h
+                | some slots1 =>
+                  rw [hSet] at h
+                  injection h with hPair
+                  injection hPair with hSv hSlots
+                  subst hSv
+                  subst hSlots
+                  dsimp only [concretizeSymSlot, concretizeSymReadResult, readProjectedValue]
+                  rw [hU, set?_concretizeSymSlots_concrete args .uninit slots loc, hSet]
       | cons pHead pTail =>
         dsimp only [evalSymOperand] at h
         rw [evalOperand_move_cons_eq_copy]
@@ -1372,11 +1436,17 @@ def concretizeSymRvalueResult
   | .concrete v => .ok v (concretizeSymSlots args slots') mem'
   | .symArg idx =>
     match get? args idx with
-    | .some v => .ok v (concretizeSymSlots args slots') mem'
+    | .some v =>
+      match valueContainsUninit v with
+      | false => .ok v (concretizeSymSlots args slots') mem'
+      | true => .ub
     | .none => .ub
   | .symPair0 v0 idx =>
     match get? args idx with
-    | .some v1 => .ok (.aggregate 0 (v0 :: v1 :: .nil)) (concretizeSymSlots args slots') mem'
+    | .some v1 =>
+      match valueContainsUninit v1 with
+      | false => .ok (.aggregate 0 (v0 :: v1 :: .nil)) (concretizeSymSlots args slots') mem'
+      | true => .ub
     | .none => .ub
   | .symGuarded v0 idx =>
     match get? args idx with
@@ -1395,9 +1465,14 @@ theorem concretizeSymReadResult_to_rvalue
       concretizeSymRvalueResult args sv0 s1 mem' := by
   cases sv0 with
   | concrete _ => rfl
-  | symArg idx | symPair0 _ idx | symGuarded _ idx =>
+  | symGuarded _ idx =>
     dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
     cases get? args idx <;> rfl
+  | symArg idx | symPair0 _ idx =>
+    dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
+    cases get? args idx with
+    | none => rfl
+    | some v => dsimp only; cases valueContainsUninit v <;> rfl
 
 theorem concretizeSymReadResult_to_rvalue_valid
     (args : List Value)
@@ -1436,7 +1511,7 @@ theorem concretizeSymReadResult_to_rvalue_valid
             | scalar sc =>
               dsimp only
               exact hValid
-            | unit | ptr _ _ | aggregate _ _ =>
+            | uninit | unit | ptr _ _ | aggregate _ _ =>
               nomatch hValid
           | char =>
             rw [hTy] at hValid; dsimp only at hValid
@@ -1444,7 +1519,7 @@ theorem concretizeSymReadResult_to_rvalue_valid
             | scalar sc =>
               dsimp only
               exact hValid
-            | unit | ptr _ _ | aggregate _ _ =>
+            | uninit | unit | ptr _ _ | aggregate _ _ =>
               nomatch hValid
           | _ => rfl
       | move p =>
@@ -1461,7 +1536,7 @@ theorem concretizeSymReadResult_to_rvalue_valid
             | scalar sc =>
               dsimp only
               exact hValid
-            | unit | ptr _ _ | aggregate _ _ =>
+            | uninit | unit | ptr _ _ | aggregate _ _ =>
               nomatch hValid
           | char =>
             rw [hTy] at hValid; dsimp only at hValid
@@ -1469,62 +1544,92 @@ theorem concretizeSymReadResult_to_rvalue_valid
             | scalar sc =>
               dsimp only
               exact hValid
-            | unit | ptr _ _ | aggregate _ _ =>
+            | uninit | unit | ptr _ _ | aggregate _ _ =>
               nomatch hValid
           | _ => rfl
     rw [hVal]
   | symArg idx =>
     dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
     cases op with
-    | constant _ => cases get? args idx <;> rfl
+    | constant _ =>
+      cases get? args idx with
+      | none => rfl
+      | some v => dsimp only; cases valueContainsUninit v <;> rfl
     | copy p =>
       dsimp only [validateLoadedValue]
       dsimp only [symValidateLoadedValue] at hValid
       cases hTy : operandTy localDecls layouts (.copy p) with
-      | none => cases get? args idx <;> rfl
+      | none =>
+        cases get? args idx with
+        | none => rfl
+        | some v => dsimp only; cases valueContainsUninit v <;> rfl
       | some ty =>
         cases ty with | mk kind layoutIdx =>
         cases kind with
         | bool => rw [hTy] at hValid; dsimp only at hValid; nomatch hValid
         | char => rw [hTy] at hValid; dsimp only at hValid; nomatch hValid
-        | _ => cases get? args idx <;> rfl
+        | _ =>
+          cases get? args idx with
+          | none => rfl
+          | some v => dsimp only; cases valueContainsUninit v <;> rfl
     | move p =>
       dsimp only [validateLoadedValue]
       dsimp only [symValidateLoadedValue] at hValid
       cases hTy : operandTy localDecls layouts (.move p) with
-      | none => cases get? args idx <;> rfl
+      | none =>
+        cases get? args idx with
+        | none => rfl
+        | some v => dsimp only; cases valueContainsUninit v <;> rfl
       | some ty =>
         cases ty with | mk kind layoutIdx =>
         cases kind with
         | bool => rw [hTy] at hValid; dsimp only at hValid; nomatch hValid
         | char => rw [hTy] at hValid; dsimp only at hValid; nomatch hValid
-        | _ => cases get? args idx <;> rfl
+        | _ =>
+          cases get? args idx with
+          | none => rfl
+          | some v => dsimp only; cases valueContainsUninit v <;> rfl
   | symPair0 v0 idx =>
     dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
     cases op with
-    | constant _ => cases get? args idx <;> rfl
+    | constant _ =>
+      cases get? args idx with
+      | none => rfl
+      | some v => dsimp only; cases valueContainsUninit v <;> rfl
     | copy p =>
       dsimp only [validateLoadedValue]
       dsimp only [symValidateLoadedValue] at hValid
       cases hTy : operandTy localDecls layouts (.copy p) with
-      | none => cases get? args idx <;> rfl
+      | none =>
+        cases get? args idx with
+        | none => rfl
+        | some v => dsimp only; cases valueContainsUninit v <;> rfl
       | some ty =>
         cases ty with | mk kind layoutIdx =>
         cases kind with
         | bool => rw [hTy] at hValid; dsimp only at hValid; nomatch hValid
         | char => rw [hTy] at hValid; dsimp only at hValid; nomatch hValid
-        | _ => cases get? args idx <;> rfl
+        | _ =>
+          cases get? args idx with
+          | none => rfl
+          | some v => dsimp only; cases valueContainsUninit v <;> rfl
     | move p =>
       dsimp only [validateLoadedValue]
       dsimp only [symValidateLoadedValue] at hValid
       cases hTy : operandTy localDecls layouts (.move p) with
-      | none => cases get? args idx <;> rfl
+      | none =>
+        cases get? args idx with
+        | none => rfl
+        | some v => dsimp only; cases valueContainsUninit v <;> rfl
       | some ty =>
         cases ty with | mk kind layoutIdx =>
         cases kind with
         | bool => rw [hTy] at hValid; dsimp only at hValid; nomatch hValid
         | char => rw [hTy] at hValid; dsimp only at hValid; nomatch hValid
-        | _ => cases get? args idx <;> rfl
+        | _ =>
+          cases get? args idx with
+          | none => rfl
+          | some v => dsimp only; cases valueContainsUninit v <;> rfl
   | symGuarded v0 idx =>
     dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
     have hVal : validateLoadedValue layouts localDecls op v0 = true := by
@@ -1544,7 +1649,7 @@ theorem concretizeSymReadResult_to_rvalue_valid
             | scalar sc =>
               dsimp only
               exact hValid
-            | unit | ptr _ _ | aggregate _ _ =>
+            | uninit | unit | ptr _ _ | aggregate _ _ =>
               nomatch hValid
           | char =>
             rw [hTy] at hValid; dsimp only at hValid
@@ -1552,7 +1657,7 @@ theorem concretizeSymReadResult_to_rvalue_valid
             | scalar sc =>
               dsimp only
               exact hValid
-            | unit | ptr _ _ | aggregate _ _ =>
+            | uninit | unit | ptr _ _ | aggregate _ _ =>
               nomatch hValid
           | _ => rfl
       | move p =>
@@ -1569,7 +1674,7 @@ theorem concretizeSymReadResult_to_rvalue_valid
             | scalar sc =>
               dsimp only
               exact hValid
-            | unit | ptr _ _ | aggregate _ _ =>
+            | uninit | unit | ptr _ _ | aggregate _ _ =>
               nomatch hValid
           | char =>
             rw [hTy] at hValid; dsimp only at hValid
@@ -1577,7 +1682,7 @@ theorem concretizeSymReadResult_to_rvalue_valid
             | scalar sc =>
               dsimp only
               exact hValid
-            | unit | ptr _ _ | aggregate _ _ =>
+            | uninit | unit | ptr _ _ | aggregate _ _ =>
               nomatch hValid
           | _ => rfl
     cases get? args idx with
@@ -1820,7 +1925,7 @@ theorem evalSymRvalueConcrete_sound
         | symArg _ | symPair0 _ _ | symGuarded _ _ => nomatch h
         | concrete v1 =>
           cases v1 with
-          | unit | ptr _ _ | aggregate _ _ => nomatch h
+          | uninit | unit | ptr _ _ | aggregate _ _ => nomatch h
           | scalar lhs =>
             dsimp only at h
             rw [evalSymOperand_sound args slots lhsOp mem.borrows mem.globals layouts (.concrete (.scalar lhs)) slots1 hLhs]
@@ -1837,7 +1942,7 @@ theorem evalSymRvalueConcrete_sound
                 | symArg _ | symPair0 _ _ | symGuarded _ _ => nomatch h
                 | concrete v2 =>
                   cases v2 with
-                  | unit | ptr _ _ | aggregate _ _ => nomatch h
+                  | uninit | unit | ptr _ _ | aggregate _ _ => nomatch h
                   | scalar rhs =>
                     dsimp only at h
                     rw [evalSymOperand_sound args slots1 rhsOp mem.borrows mem.globals layouts (.concrete (.scalar rhs)) slots2 hRhs]
@@ -1924,7 +2029,9 @@ theorem evalSymRvalueConcrete_sound
                           rw [evalSymOperand_sound args slots1 op1 mem.borrows mem.globals layouts (.symArg idx) slots2 hOp1]
                           dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
                           rw [memory_eta mem]
-                          cases get? args idx <;> rfl
+                          cases get? args idx with
+                          | none => rfl
+                          | some v1 => dsimp only; cases valueContainsUninit v1 <;> rfl
     | adt _ variantIdx activeField =>
       cases activeField with
       | some _ => nomatch h
@@ -1997,6 +2104,68 @@ theorem concretizeSymState_initSymState
   dsimp only [concretizeSymState, initSymState, initMachineState, concretizeSymMemory]
   rw [concretizeSymSlots_initSymSlots args body.localDecls body.argCount h_len]
 
+@[reducible]
+def strictSymSlot : SymSlot → Option SymSlot
+  | .concrete .dead => .some (.concrete .dead)
+  | .concrete .uninit => .some (.concrete .uninit)
+  | .concrete (.init v) =>
+    match strictValue 8 v with
+    | .some v' => .some (.concrete (.init v'))
+    | .none => .none
+  | .symArg idx =>
+    match strictBits 16 idx with
+    | .some idx' => .some (.symArg idx')
+    | .none => .none
+  | .symPair0 v0 idx =>
+    match strictValue 8 v0, strictBits 16 idx with
+    | .some v0', .some idx' => .some (.symPair0 v0' idx')
+    | _, _ => .none
+
+theorem strictSymSlot_eq : ∀ (s : SymSlot), strictSymSlot s = .some s
+  | .concrete .dead => rfl
+  | .concrete .uninit => rfl
+  | .concrete (.init v) => by
+    dsimp only [strictSymSlot]
+    rw [strictValue_eq 8 v]
+  | .symArg idx => by
+    dsimp only [strictSymSlot]
+    rw [strictBits_eq 16 idx]
+  | .symPair0 v0 idx => by
+    dsimp only [strictSymSlot]
+    rw [strictValue_eq 8 v0, strictBits_eq 16 idx]
+
+@[reducible]
+def strictSymState (st : SymState) : SymState :=
+  match strictBits 16 st.blockIdx, strictBits 16 st.stmtIdx, strictBits 16 st.nextTag with
+  | .some bIdx, .some sIdx, .some nTag =>
+    match mapStrictList strictSymSlot st.slots, strictBorrows st.borrows with
+    | .some slots', .some borrows' =>
+      { blockIdx := bIdx
+        stmtIdx := sIdx
+        slots := slots'
+        borrows := borrows'
+        nextTag := nTag }
+    | _, _ => st
+  | _, _, _ => st
+
+@[simp]
+theorem strictSymState_eq (st : SymState) : strictSymState st = st := by
+  cases st
+  unfold strictSymState
+  dsimp only
+  rw [strictBits_eq, strictBits_eq, strictBits_eq,
+      mapStrictList_eq strictSymSlot strictSymSlot_eq,
+      strictBorrows_eq]
+
+@[reducible]
+def strictSymStatePeriodic (_fuel : Nat) (st : SymState) : SymState :=
+  strictSymState st
+
+@[simp]
+theorem strictSymStatePeriodic_eq (fuel : Nat) (st : SymState) :
+    strictSymStatePeriodic fuel st = st :=
+  strictSymState_eq st
+
 /-- Symbolic counterpart of `placeIndexLocalsInit`: every `.index idxLocal`
 projection in `proj` names a concrete initialized scalar slot of `slots`. -/
 def symPlaceIndexLocalsInit (slots : List SymSlot) : List ProjectionElem → Bool
@@ -2046,6 +2215,7 @@ theorem symPlaceIndexLocalsInit_concretize
           | init v =>
             cases v with
             | scalar sc => intro h; exact ih h
+            | uninit => intro h; nomatch h
             | unit => intro h; nomatch h
             | ptr _ _ => intro h; nomatch h
             | aggregate _ _ => intro h; nomatch h
@@ -2155,7 +2325,14 @@ def symStepTermConcrete
       | .some (.concrete .dead) => .none
       | .some _ =>
         match set? st.slots place.local_ (.concrete .uninit) with
-        | .some slots' => .some { st with blockIdx := target, stmtIdx := 0, slots := slots' }
+        | .some slots' =>
+          .some {
+            st with
+            blockIdx := target
+            stmtIdx := 0
+            slots := slots'
+            borrows := invalidateConflictingBorrows st.borrows place.local_ .none
+          }
         | .none => .none
     | _ :: _ => .none
   | .switchInt discr targets =>
@@ -2362,14 +2539,18 @@ theorem symStepStmtConcrete_sound
                         | none => exact Or.inr rfl
                         | some val =>
                           dsimp only
-                          rw [get?_concretizeSymSlots args slots1 dstLoc, hGet]
-                          have hSetSym := set?_concretizeSymSlots args (.symArg valIdx) slots1 dstLoc
-                          dsimp only [concretizeSymSlot] at hSetSym
-                          rw [hArgVal, hSet] at hSetSym
-                          rw [hSetSym]
-                          dsimp only
-                          rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
-                            (rw [hSlot]; exact Or.inl rfl)
+                          cases hU : valueContainsUninit val with
+                          | true => exact Or.inr rfl
+                          | false =>
+                            dsimp only
+                            rw [get?_concretizeSymSlots args slots1 dstLoc, hGet]
+                            have hSetSym := set?_concretizeSymSlots args (.symArg valIdx) slots1 dstLoc
+                            dsimp only [concretizeSymSlot] at hSetSym
+                            rw [hArgVal, hSet] at hSetSym
+                            rw [hSetSym]
+                            dsimp only
+                            rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
+                              (rw [hSlot]; exact Or.inl rfl)
                     | symPair0 v0 valIdx =>
                       dsimp only at hOk
                       cases hSet : set? slots1 dstLoc (.symPair0 v0 valIdx) with
@@ -2385,14 +2566,18 @@ theorem symStepStmtConcrete_sound
                         | none => exact Or.inr rfl
                         | some val =>
                           dsimp only
-                          rw [get?_concretizeSymSlots args slots1 dstLoc, hGet]
-                          have hSetSym := set?_concretizeSymSlots args (.symPair0 v0 valIdx) slots1 dstLoc
-                          dsimp only [concretizeSymSlot] at hSetSym
-                          rw [hArgVal, hSet] at hSetSym
-                          rw [hSetSym]
-                          dsimp only
-                          rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
-                            (rw [hSlot]; exact Or.inl rfl)
+                          cases hU : valueContainsUninit val with
+                          | true => exact Or.inr rfl
+                          | false =>
+                            dsimp only
+                            rw [get?_concretizeSymSlots args slots1 dstLoc, hGet]
+                            have hSetSym := set?_concretizeSymSlots args (.symPair0 v0 valIdx) slots1 dstLoc
+                            dsimp only [concretizeSymSlot] at hSetSym
+                            rw [hArgVal, hSet] at hSetSym
+                            rw [hSetSym]
+                            dsimp only
+                            rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
+                              (rw [hSlot]; exact Or.inl rfl)
                     | symGuarded v0 valIdx =>
                       dsimp only at hOk
                       cases hSet : set? slots1 dstLoc (.concrete (.init v0)) with
@@ -2440,7 +2625,7 @@ theorem symStepTermConcrete_sound
         | cons _ _ => nomatch h
         | nil =>
           dsimp only [symStepTermConcrete] at h
-          dsimp only [evalTerminator, concretizeSymState]
+          dsimp only [evalTerminator, concretizeSymState, concretizeSymMemory]
           rw [get?_concretizeSymSlots args st.slots loc]
           cases hGet : get? st.slots loc with
           | none =>
@@ -2477,7 +2662,7 @@ theorem symStepTermConcrete_sound
           | symArg _ | symPair0 _ _ | symGuarded _ _ => nomatch h
           | concrete v =>
             cases v with
-            | unit | ptr _ _ | aggregate _ _ => nomatch h
+            | uninit | unit | ptr _ _ | aggregate _ _ => nomatch h
             | scalar sc =>
               injection h with hEq
               subst hEq
@@ -2501,7 +2686,7 @@ theorem symStepTermConcrete_sound
           | symArg _ | symPair0 _ _ | symGuarded _ _ => nomatch h
           | concrete v =>
             cases v with
-            | unit | ptr _ _ | aggregate _ _ => nomatch h
+            | uninit | unit | ptr _ _ | aggregate _ _ => nomatch h
             | scalar sc =>
               cases expected with
               | false =>
@@ -2782,7 +2967,7 @@ theorem symIsReturnFalse_sound
                   | dead | uninit => nomatch h
                   | init retVal =>
                     cases retVal with
-                    | unit | ptr _ _ | aggregate _ _ => nomatch h
+                    | uninit | unit | ptr _ _ | aggregate _ _ => nomatch h
                     | scalar sc =>
                       cases sc with
                       | mk bits sz =>
@@ -2808,7 +2993,7 @@ def checkSymReturnsFalse : Nat → CapturedMir → SymState → Bool
   | .zero, _, _ => false
   | .succ fuel, body, st =>
     match symStepConcrete body st with
-    | .some st' => checkSymReturnsFalse fuel body st'
+    | .some st' => checkSymReturnsFalse fuel body (strictSymStatePeriodic fuel st')
     | .none => symIsReturnFalse body st
 
 theorem checkSymReturnsFalse_sound :
@@ -2822,6 +3007,7 @@ theorem checkSymReturnsFalse_sound :
     cases hStep : symStepConcrete body st with
     | some st' =>
       rw [hStep] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       exact checkSymReturnsFalse_sound
         fuel body args st' hCheck
         (symStepConcrete_sound fuel body args st st' hStep hHold)
@@ -3255,7 +3441,7 @@ theorem symExtractPinEq_branch_sound
                               | symArg _ | symPair0 _ _ | symGuarded _ _ => nomatch hExt
                               | concrete v2 =>
                                 cases v2 with
-                                | unit | ptr _ _ | aggregate _ _ => nomatch hExt
+                                | uninit | unit | ptr _ _ | aggregate _ _ => nomatch hExt
                                 | scalar sc0 =>
                                   dsimp only at hExt
                                   dsimp only [concretizeSymReadResult] at hHold
@@ -3266,52 +3452,59 @@ theorem symExtractPinEq_branch_sound
                                   | some vArg0 =>
                                     rw [hArg0] at hHold
                                     dsimp only at hHold
-                                    rw [evalSymOperand_sound
-                                      args slots1 rhsOp st.borrows body.allocations body.layouts
-                                      (.concrete (.scalar sc0)) slots2 hRhs] at hHold
-                                    dsimp only [concretizeSymReadResult] at hHold
-                                    cases vArg0 with
-                                    | unit | aggregate _ _ =>
+                                    cases hU0 : valueContainsUninit vArg0 with
+                                    | true =>
+                                      rw [hU0] at hHold
                                       exact False.elim hHold
-                                    | ptr _ _ =>
-                                      dsimp only [isPtrRelationalBinOp] at hHold
-                                      rw [hPtrTy] at hHold
-                                      exact False.elim hHold
-                                    | scalar actualSc =>
-                                      dsimp only [evalScalarBinOp] at hHold
-                                      cases hActSz0 : Nat.beq actualSc.sizeBytes 0 with
-                                      | true =>
-                                        rw [hActSz0] at hHold
+                                    | false =>
+                                      rw [hU0] at hHold
+                                      dsimp only at hHold
+                                      rw [evalSymOperand_sound
+                                        args slots1 rhsOp st.borrows body.allocations body.layouts
+                                        (.concrete (.scalar sc0)) slots2 hRhs] at hHold
+                                      dsimp only [concretizeSymReadResult] at hHold
+                                      cases vArg0 with
+                                      | uninit | unit | aggregate _ _ =>
                                         exact False.elim hHold
-                                      | false =>
-                                        rw [hActSz0] at hHold
-                                        dsimp only at hHold
-                                        cases hSzEq : Nat.beq actualSc.sizeBytes sc0.sizeBytes with
-                                        | false =>
-                                          rw [hSzEq] at hHold
-                                          exact False.elim hHold
+                                      | ptr _ _ =>
+                                        dsimp only [isPtrRelationalBinOp] at hHold
+                                        rw [hPtrTy] at hHold
+                                        exact False.elim hHold
+                                      | scalar actualSc =>
+                                        dsimp only [evalScalarBinOp] at hHold
+                                        cases hActSz0 : Nat.beq actualSc.sizeBytes 0 with
                                         | true =>
-                                          rw [hSzEq] at hHold
+                                          rw [hActSz0] at hHold
+                                          exact False.elim hHold
+                                        | false =>
+                                          rw [hActSz0] at hHold
                                           dsimp only at hHold
-                                          have ⟨hIdxEq, hScOutEq, hBranch⟩ :=
-                                            symFinishPinEq_branch_ok_sound
-                                              fuel body args st dstLoc slots2 idx0 sc0
-                                              idx expectedSc stTrue stFalse
-                                              (Nat.beq actualSc.bits sc0.bits)
-                                              hExt hHold
-                                          cases hBranch with
-                                          | inr hFalseHold => exact Or.inr hFalseHold
-                                          | inl hTruePair =>
-                                            have hScEq : actualSc = sc0 :=
-                                              scalarInt_eq_of_parts
-                                                (Nat.eq_of_beq_eq_true hTruePair.1)
-                                                (Nat.eq_of_beq_eq_true hSzEq)
-                                            rw [hIdxEq, hScOutEq]
-                                            rw [← hScEq]
-                                            exact Or.inl ⟨hArg0, hTruePair.2 (by rw [← hScEq]; exact hArg0)⟩
+                                          cases hSzEq : Nat.beq actualSc.sizeBytes sc0.sizeBytes with
+                                          | false =>
+                                            rw [hSzEq] at hHold
+                                            exact False.elim hHold
+                                          | true =>
+                                            rw [hSzEq] at hHold
+                                            dsimp only at hHold
+                                            have ⟨hIdxEq, hScOutEq, hBranch⟩ :=
+                                              symFinishPinEq_branch_ok_sound
+                                                fuel body args st dstLoc slots2 idx0 sc0
+                                                idx expectedSc stTrue stFalse
+                                                (Nat.beq actualSc.bits sc0.bits)
+                                                hExt hHold
+                                            cases hBranch with
+                                            | inr hFalseHold => exact Or.inr hFalseHold
+                                            | inl hTruePair =>
+                                              have hScEq : actualSc = sc0 :=
+                                                scalarInt_eq_of_parts
+                                                  (Nat.eq_of_beq_eq_true hTruePair.1)
+                                                  (Nat.eq_of_beq_eq_true hSzEq)
+                                              rw [hIdxEq, hScOutEq]
+                                              rw [← hScEq]
+                                              exact Or.inl ⟨hArg0, hTruePair.2 (by rw [← hScEq]; exact hArg0)⟩
                             | concrete v1 =>
                               cases v1 with
-                              | unit | ptr _ _ | aggregate _ _ => nomatch hExt
+                              | uninit | unit | ptr _ _ | aggregate _ _ => nomatch hExt
                               | scalar sc0 =>
                                 cases sv2 with
                                 | concrete _ | symPair0 _ _ | symGuarded _ _ => nomatch hExt
@@ -3329,18 +3522,25 @@ theorem symExtractPinEq_branch_sound
                                   | some vArg0 =>
                                     rw [hArg0] at hHold
                                     dsimp only at hHold
-                                    cases vArg0 with
-                                    | unit | aggregate _ _ =>
+                                    cases hU0 : valueContainsUninit vArg0 with
+                                    | true =>
+                                      rw [hU0] at hHold
                                       exact False.elim hHold
-                                    | ptr _ _ =>
-                                      dsimp only [isPtrRelationalBinOp] at hHold
-                                      rw [hPtrTy] at hHold
-                                      exact False.elim hHold
-                                    | scalar actualSc =>
-                                      dsimp only [evalScalarBinOp] at hHold
-                                      rw [symFinishPinEq_expSz0_false hExt] at hHold
+                                    | false =>
+                                      rw [hU0] at hHold
                                       dsimp only at hHold
-                                      cases hSzEq : Nat.beq sc0.sizeBytes actualSc.sizeBytes with
+                                      cases vArg0 with
+                                      | uninit | unit | aggregate _ _ =>
+                                        exact False.elim hHold
+                                      | ptr _ _ =>
+                                        dsimp only [isPtrRelationalBinOp] at hHold
+                                        rw [hPtrTy] at hHold
+                                        exact False.elim hHold
+                                      | scalar actualSc =>
+                                        dsimp only [evalScalarBinOp] at hHold
+                                        rw [symFinishPinEq_expSz0_false hExt] at hHold
+                                        dsimp only at hHold
+                                        cases hSzEq : Nat.beq sc0.sizeBytes actualSc.sizeBytes with
                                       | false =>
                                         rw [hSzEq] at hHold
                                         exact False.elim hHold
@@ -3458,10 +3658,10 @@ def extractValueScalarSlice0? (v : Value) (targetBytes : Nat) : Option ScalarInt
           match isHomogeneousUntypedFields (.scalar sc :: fRest) with
           | true => extractScalarSlice? sc 0 targetBytes
           | false => .none
-        | .unit | .ptr _ _ | .aggregate _ _ => .none
+        | .uninit | .unit | .ptr _ _ | .aggregate _ _ => .none
       | .nil => .none
     | .succ _ => .none
-  | .unit | .ptr _ _ => .none
+  | .uninit | .unit | .ptr _ _ => .none
 
 theorem extractValueScalarSlice0?_scalar_self
     (sc : ScalarInt)
@@ -3826,6 +4026,8 @@ theorem decodeSubValueAtByteOffset?_nonagg_uint_eq_none
   rw [tyByteSize_uint_of_resolved localDecls layouts uKind rpIdx hRes]
   dsimp only
   cases v with
+  | uninit =>
+    rfl
   | unit =>
     cases uKind <;> rfl
   | scalar sc =>
@@ -3970,6 +4172,7 @@ theorem resolveStackThinPtrTargetProjWithResidual?_nil_nonagg_of_uint
     normalizeAdjacentSubslices, endsWithSubslice, startsWithArrayOrSliceProj]
   rw [hTarget, tyScalarBytes_uint uKind rpIdx]
   cases targetRootVal with
+  | uninit => rfl
   | unit => rfl
   | scalar _ => rfl
   | ptr _ _ => rfl
@@ -4158,6 +4361,8 @@ theorem resolveStackThinPtrTargetProjWithResidual?_nil_agg_of_uint
       | false => rfl
       | true =>
         cases f0 with
+        | uninit =>
+          cases fRest <;> nomatch hHom
         | unit => rfl
         | scalar _ => rfl
         | ptr _ _ => rfl
@@ -4345,6 +4550,12 @@ theorem evalStackThinPtrTypedDerefRead_uint_eq
                   dsimp only [readProjectedForLocal, placeTouchesUnion, readProjectedValue]
                   rw [← hOffEq]
                   cases targetRootVal with
+                  | uninit =>
+                    rw [resolveStackThinPtrTargetProjWithResidual?_nil_nonagg_of_uint
+                      locals .uninit entry ptrVal (d :: ds) layouts uKind rpIdx tIdx
+                      (.some (uintBytesOfKind uKind)) hTProj hOff hT rfl]
+                    dsimp (config := { zetaHave := true }) only [readProjectedForLocal,
+                      placeTouchesUnion, readProjectedValue, extractValueScalarSlice0?]
                   | unit =>
                     rw [resolveStackThinPtrTargetProjWithResidual?_nil_nonagg_of_uint
                       locals .unit entry ptrVal (d :: ds) layouts uKind rpIdx tIdx
@@ -4418,6 +4629,7 @@ theorem evalStackThinPtrTypedDerefRead_uint_eq
                           dsimp (config := { zetaHave := true }) only
                           rw [hOffEq, hDecAggNone]
                           cases f0 with
+                          | uninit => rfl
                           | unit => rfl
                           | ptr _ _ => rfl
                           | aggregate _ _ => rfl
@@ -4430,22 +4642,27 @@ theorem evalStackThinPtrTypedDerefRead_uint_eq
                           rw [hUnion0False, hSubT, hOffEq, hDecAggNone]
                           have hRead0 :
                               readProjectedValue locals (.aggregate .zero (f0 :: fRest))
-                                [.constantIndex 0 0 false] = .ok f0 := rfl
+                                [.constantIndex 0 0 false] =
+                                match valueContainsUninit f0 with
+                                | false => .ok f0
+                                | true => .ub := rfl
                           rw [hRead0]
                           dsimp (config := { zetaHave := true }) only [Nat.beq]
                           cases f0 with
+                          | uninit =>
+                            cases fRest <;> nomatch hHom
                           | unit =>
-                            dsimp (config := { zetaHave := true }) only [extractValueScalarSlice0?]
+                            dsimp (config := { zetaHave := true }) only [extractValueScalarSlice0?, valueContainsUninit]
                             rw [decodeSubValueAtByteOffset?_nonagg_uint_eq_none
                               (d :: ds) layouts .none uKind rpIdx .unit hREffEq rfl rfl]
                           | ptr p sz =>
-                            dsimp (config := { zetaHave := true }) only [extractValueScalarSlice0?]
+                            dsimp (config := { zetaHave := true }) only [extractValueScalarSlice0?, valueContainsUninit]
                             rw [decodeSubValueAtByteOffset?_nonagg_uint_eq_none
                               (d :: ds) layouts .none uKind rpIdx (.ptr p sz) hREffEq rfl rfl]
                           | aggregate _ _ =>
                             cases fRest <;> nomatch hHom
                           | scalar sc =>
-                            dsimp (config := { zetaHave := true }) only [extractValueScalarSlice0?]
+                            dsimp (config := { zetaHave := true }) only [extractValueScalarSlice0?, valueContainsUninit]
                             rw [hHom]
                             dsimp (config := { zetaHave := true }) only [Nat.beq, Bool.and]
                             cases hBeq : Nat.beq (uintBytesOfKind uKind) sc.sizeBytes with
@@ -4763,13 +4980,13 @@ theorem evalRvalue_use_copy_deref_ok_of_ptr
           dsimp only at hValid
           cases loadedVal with
           | scalar sc => exact hValid
-          | unit | ptr _ _ | aggregate _ _ => nomatch hValid
+          | uninit | unit | ptr _ _ | aggregate _ _ => nomatch hValid
         | char =>
           rw [hTy] at hValid
           dsimp only at hValid
           cases loadedVal with
           | scalar sc => exact hValid
-          | unit | ptr _ _ | aggregate _ _ => nomatch hValid
+          | uninit | unit | ptr _ _ | aggregate _ _ => nomatch hValid
         | _ => rfl
   rw [hVal]
   dsimp only
@@ -4889,7 +5106,7 @@ theorem extractValueScalarSlice0?_sizeBytes
     (h : extractValueScalarSlice0? v targetBytes = .some sc) :
     sc.sizeBytes = targetBytes := by
   cases v with
-  | unit | ptr _ _ => nomatch h
+  | uninit | unit | ptr _ _ => nomatch h
   | scalar s =>
     exact extractScalarSlice?_sizeBytes s 0 targetBytes sc h
   | aggregate varIdx fields =>
@@ -4900,7 +5117,7 @@ theorem extractValueScalarSlice0?_sizeBytes
       | nil => nomatch h
       | cons f0 fRest =>
         cases f0 with
-        | unit | ptr _ _ | aggregate _ _ => nomatch h
+        | uninit | unit | ptr _ _ | aggregate _ _ => nomatch h
         | scalar s =>
           dsimp only [extractValueScalarSlice0?] at h
           cases hHom : isHomogeneousUntypedFields (.scalar s :: fRest) with
@@ -5037,7 +5254,7 @@ theorem symStepStmtConcreteDeref_sound
                           | dead | uninit => nomatch h
                           | init ptrRootVal =>
                             cases ptrRootVal with
-                            | unit | scalar _ | aggregate _ _ => nomatch h
+                            | uninit | unit | scalar _ | aggregate _ _ => nomatch h
                             | ptr ptrVal ptrSz =>
                               dsimp only at h
                               cases hBorrow : lookupBorrow st.borrows ptrVal.tag with
@@ -5087,7 +5304,7 @@ theorem symStepStmtConcreteDeref_sound
                                           | dead | uninit => nomatch h
                                           | init tVal =>
                                             cases tVal with
-                                            | unit | ptr _ _ | aggregate _ _ => nomatch h
+                                            | uninit | unit | ptr _ _ | aggregate _ _ => nomatch h
                                             | scalar sc =>
                                               dsimp only at h ⊢
                                               cases hCtx : checkConcreteScalarDerefCtx body.localDecls body.layouts ptrLoc entry ptrVal sc with
@@ -5123,7 +5340,7 @@ theorem symStepStmtConcreteDeref_sound
                                               | dead | uninit => nomatch h
                                               | init tVal =>
                                                 cases tVal with
-                                                | unit | scalar _ | ptr _ _ => nomatch h
+                                                | uninit | unit | scalar _ | ptr _ _ => nomatch h
                                                 | aggregate varIdx fields =>
                                                   cases varIdx with
                                                   | succ _ => nomatch h
@@ -5140,7 +5357,7 @@ theorem symStepStmtConcreteDeref_sound
                                                         rw [hPtr8] at h
                                                         have hFValEq : fVal = .ptr fPtr 8 := by
                                                           cases fVal with
-                                                          | unit | scalar _ | aggregate _ _ => nomatch hPtr8
+                                                          | uninit | unit | scalar _ | aggregate _ _ => nomatch hPtr8
                                                           | ptr p sz =>
                                                             dsimp only [isPtr8Value] at hPtr8
                                                             cases hSz8 : Nat.beq sz 8 with
@@ -5271,7 +5488,7 @@ def checkSymReturnsFalseExt : Nat → CapturedMir → SymState → Bool
   | .zero, _, _ => false
   | .succ fuel, body, st =>
     match symStepConcreteExt body st with
-    | .some st' => checkSymReturnsFalseExt fuel body st'
+    | .some st' => checkSymReturnsFalseExt fuel body (strictSymStatePeriodic fuel st')
     | .none => symIsReturnFalse body st
 
 theorem checkSymReturnsFalseExt_sound :
@@ -5285,6 +5502,7 @@ theorem checkSymReturnsFalseExt_sound :
     cases hStep : symStepConcreteExt body st with
     | some st' =>
       rw [hStep] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       exact checkSymReturnsFalseExt_sound
         fuel body args st' hCheck
         (symStepConcreteExt_sound fuel body args st st' hStep hHold)
@@ -5406,7 +5624,7 @@ theorem symMatchDerefSymArgLoad_evalStmt
                             | dead | uninit => nomatch hMatch
                             | init ptrRootVal =>
                               cases ptrRootVal with
-                              | unit | scalar _ | aggregate _ _ => nomatch hMatch
+                              | uninit | unit | scalar _ | aggregate _ _ => nomatch hMatch
                               | ptr ptrVal ptrSz =>
                                 dsimp only at hMatch
                                 cases hBorrow : lookupBorrow st.borrows ptrVal.tag with
@@ -6118,7 +6336,7 @@ def checkSymPinsLoopDirect : Nat → CapturedMir → SymState → List (Nat × S
   | .zero, _, _, _ :: _ => false
   | .succ fuel, body, st, p :: ps =>
     match symStepConcrete body st with
-    | .some st' => checkSymPinsLoopDirect fuel body st' (p :: ps)
+    | .some st' => checkSymPinsLoopDirect fuel body (strictSymStatePeriodic fuel st') (p :: ps)
     | .none =>
       match symExtractPinEq body st with
       | .some (idx, sc, stTrue, stFalse) =>
@@ -6146,6 +6364,7 @@ theorem checkSymPinsLoopDirect_sound :
     cases hStep : symStepConcrete body st with
     | some st' =>
       rw [hStep] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       exact checkSymPinsLoopDirect_sound
         fuel body args st' (p :: ps) hCheck
         (symStepConcrete_sound fuel body args st st' hStep hHold)
@@ -6395,14 +6614,14 @@ theorem symExtractPinEq_expSz0_false
                             | symArg _ | symPair0 _ _ | symGuarded _ _ => nomatch hExt
                             | concrete v2 =>
                               cases v2 with
-                              | unit | ptr _ _ | aggregate _ _ => nomatch hExt
+                              | uninit | unit | ptr _ _ | aggregate _ _ => nomatch hExt
                               | scalar sc0 =>
                                 dsimp only at hExt
                                 rw [symFinishPinEq_scOut_eq hExt]
                                 exact symFinishPinEq_expSz0_false hExt
                           | concrete v1 =>
                             cases v1 with
-                            | unit | ptr _ _ | aggregate _ _ => nomatch hExt
+                            | uninit | unit | ptr _ _ | aggregate _ _ => nomatch hExt
                             | scalar sc0 =>
                               cases sv2 with
                               | concrete _ | symPair0 _ _ | symGuarded _ _ => nomatch hExt
@@ -6422,7 +6641,7 @@ def checkSymPinsLoop : Nat → CapturedMir → SymState → List (Nat × ScalarI
   | .zero, _, _, _ :: _ => false
   | .succ fuel, body, st, p :: ps =>
     match symStepConcreteExt body st with
-    | .some st' => checkSymPinsLoop fuel body st' (p :: ps)
+    | .some st' => checkSymPinsLoop fuel body (strictSymStatePeriodic fuel st') (p :: ps)
     | .none =>
       match symExtractPinEq body st with
       | .some (idx, sc, stTrue, stFalse) =>
@@ -6462,6 +6681,7 @@ theorem checkSymPinsLoop_sound :
     cases hStep : symStepConcreteExt body st with
     | some st' =>
       rw [hStep] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       exact checkSymPinsLoop_sound
         fuel body args st' (p :: ps) hCheck
         (symStepConcreteExt_sound fuel body args st st' hStep hHold)
@@ -6641,12 +6861,12 @@ def collectSymPinsLoop :
   | .zero, _, _ => .nil
   | .succ fuel, body, st =>
     match symStepConcreteExt body st with
-    | .some st' => collectSymPinsLoop fuel body st'
+    | .some st' => collectSymPinsLoop fuel body (strictSymStatePeriodic fuel st')
     | .none =>
       match symExtractPinEq body st with
       | .some (idx, sc, stTrue, stFalse) =>
         match checkSymReturnsFalseExt fuel body stFalse with
-        | true => (idx, sc) :: collectSymPinsLoop fuel body stTrue
+        | true => (idx, sc) :: collectSymPinsLoop fuel body (strictSymState stTrue)
         | false => .nil
       | .none =>
         match symExtractDerefSlicePinEq body st with
@@ -6655,11 +6875,11 @@ def collectSymPinsLoop :
           | .zero => .nil
           | .succ fuel' =>
             match checkSymReturnsFalseExt fuel' body stFalse with
-            | true => (idx, sc) :: collectSymPinsLoop fuel' body stTrue
+            | true => (idx, sc) :: collectSymPinsLoop fuel' body (strictSymState stTrue)
             | false => .nil
         | .none =>
           match symStepDerefSymArgAny body st with
-          | .some st' => collectSymPinsLoop fuel body st'
+          | .some st' => collectSymPinsLoop fuel body (strictSymState st')
           | .none => .nil
 
 /-- Look up the `ScalarInt` pinned for argument index `idx` in `pins`. -/
@@ -6865,6 +7085,7 @@ theorem scalar_of_valueMatchesTyAndLayout_uintWidth
           rcases Bool.and_eq_true_iff.1 hDecl with ⟨_, hLayW⟩
           have hW : layout.size.bytes = width := Nat.eq_of_beq_eq_true hLayW
           cases v with
+          | uninit => exact False.elim hMatch
           | unit => exact False.elim hMatch.2.2
           | ptr _ _ => exact False.elim hMatch.2.2
           | aggregate _ _ => exact False.elim hMatch.2.2
@@ -7071,19 +7292,19 @@ def checkSymPinsExtLoop
   | .zero, _, _, _ :: _ => false
   | .succ fuel, body, st, p :: ps =>
     match symStepConcreteExt body st with
-    | .some st' => checkSymPinsExtLoop expected fuel body st' (p :: ps)
+    | .some st' => checkSymPinsExtLoop expected fuel body (strictSymStatePeriodic fuel st') (p :: ps)
     | .none =>
       match symExtractPinEq body st with
       | .some (idx, sc, stTrue, stFalse) =>
-        match checkSymReturnsFalseExt fuel body stFalse with
+        match checkSymReturnsFalseExt fuel body (strictSymStatePeriodic fuel stFalse) with
         | false => false
         | true =>
           match removeScalarPin idx sc (p :: ps) with
-          | .some pins' => checkSymPinsExtLoop expected fuel body stTrue pins'
-          | .none => checkSymPinsExtLoop expected fuel body stTrue (p :: ps)
+          | .some pins' => checkSymPinsExtLoop expected fuel body (strictSymStatePeriodic fuel stTrue) pins'
+          | .none => checkSymPinsExtLoop expected fuel body (strictSymStatePeriodic fuel stTrue) (p :: ps)
       | .none =>
         match symStepDerefSymArgWithExpected body st expected with
-        | .some st' => checkSymPinsExtLoop expected fuel body st' (p :: ps)
+        | .some st' => checkSymPinsExtLoop expected fuel body (strictSymStatePeriodic fuel st') (p :: ps)
         | .none => false
 
 theorem checkSymPinsExtLoop_sound
@@ -7104,6 +7325,7 @@ theorem checkSymPinsExtLoop_sound
     cases hStep : symStepConcreteExt body st with
     | some st' =>
       rw [hStep] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       exact checkSymPinsExtLoop_sound expected
         fuel body args st' (p :: ps) hWidths hCheck
         (symStepConcreteExt_sound fuel body args st st' hStep hHold)
@@ -7114,6 +7336,7 @@ theorem checkSymPinsExtLoop_sound
         rw [hExt] at hCheck
         rcases tup with ⟨idx, sc, stTrue, stFalse⟩
         dsimp only at hCheck
+        rw [strictSymStatePeriodic_eq] at hCheck
         cases hFalse : checkSymReturnsFalseExt fuel body stFalse with
         | false => rw [hFalse] at hCheck; nomatch hCheck
         | true =>
@@ -7128,11 +7351,13 @@ theorem checkSymPinsExtLoop_sound
           cases hRem : removeScalarPin idx sc (p :: ps) with
           | some pins' =>
             rw [hRem] at hCheck
+            (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
             have hRestHold :=
               checkSymPinsExtLoop_sound expected fuel body args stTrue pins' hWidths hCheck hHoldTrue
             exact allScalarPinsHold_of_removeScalarPin args idx sc hPinIdx (p :: ps) pins' hRem hRestHold
           | none =>
             rw [hRem] at hCheck
+            (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
             exact checkSymPinsExtLoop_sound expected fuel body args stTrue (p :: ps) hWidths hCheck hHoldTrue
       | none =>
         rw [hExt] at hCheck
@@ -7140,6 +7365,7 @@ theorem checkSymPinsExtLoop_sound
         | none => rw [hDeref] at hCheck; nomatch hCheck
         | some st' =>
           rw [hDeref] at hCheck
+          (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
           exact checkSymPinsExtLoop_sound expected
             fuel body args st' (p :: ps) hWidths hCheck
             (symStepDerefSymArgWithExpected_hold_sound fuel body args st st' expected hWidths hDeref hHold)
@@ -7287,9 +7513,9 @@ def checkMirRustPinnedSpecOptWithCallees
     match fuel with
     | 0 => false
     | fuel' + 1 =>
-      match stepMirState subjectBody st with
+      match stepMirStatePeriodic fuel' subjectBody st with
       | .ret (.normal (retVal, _)) =>
-        checkOptMirBoolBounded specFuel optEnsBody (args ++ [retVal])
+        checkOptMirBoolBounded specFuel optEnsBody (args ++ [strictValueTop retVal])
       | .ret .panic => false
       | .ret .abort => false
       | .tau st' => loop fuel' st'
@@ -7343,6 +7569,7 @@ theorem wpMirBounded_normal_of_checkMirRustPinnedSpecOptWithCallees
   | succ fuel' ih =>
     intro st h
     unfold checkMirRustPinnedSpecOptWithCallees.loop at h
+    rw [stepMirStatePeriodic_eq] at h
     unfold wpCoalBounded
     cases h_step : stepMirState subjectBody st with
     | ret out =>
@@ -7350,6 +7577,7 @@ theorem wpMirBounded_normal_of_checkMirRustPinnedSpecOptWithCallees
       cases out with
       | normal p =>
         rcases p with ⟨rv, m⟩
+        simp only [strictValueTop_eq] at h
         exact ⟨rv, m, rfl,
           optMirBoolPredicateHolds_of_checkBounded
             specFuel optEnsBody (args ++ [rv]) h⟩
@@ -7629,10 +7857,10 @@ def checkMirRustPinnedSpecOptWithSpecCallees
     match fuel with
     | 0 => false
     | fuel' + 1 =>
-      match stepMirState subjectBody st with
+      match stepMirStatePeriodic fuel' subjectBody st with
       | .ret (.normal (retVal, _)) =>
         checkOptMirBoolWithCalleesBounded
-          specFuel optEnsBody specCallees (args ++ [retVal])
+          specFuel optEnsBody specCallees (args ++ [strictValueTop retVal])
       | .ret .panic => false
       | .ret .abort => false
       | .tau st' => loop fuel' st'
@@ -7676,6 +7904,7 @@ theorem wpMirBounded_normal_of_checkMirRustPinnedSpecOptWithSpecCallees
   | succ fuel' ih =>
     intro st h
     unfold checkMirRustPinnedSpecOptWithSpecCallees.loop at h
+    rw [stepMirStatePeriodic_eq] at h
     unfold wpCoalBounded
     cases h_step : stepMirState subjectBody st with
     | ret out =>
@@ -7683,6 +7912,7 @@ theorem wpMirBounded_normal_of_checkMirRustPinnedSpecOptWithSpecCallees
       cases out with
       | normal p =>
         rcases p with ⟨rv, m⟩
+        simp only [strictValueTop_eq] at h
         exact ⟨rv, m, rfl,
           optMirBoolPredicateHoldsWithCallees_of_checkBounded
             specFuel optEnsBody specCallees (args ++ [rv]) h⟩
@@ -8143,7 +8373,7 @@ theorem symExtractUpperBound1_sound
                                   | symArg _ | symPair0 _ _ | symGuarded _ _ => nomatch hExt
                                   | concrete v2 =>
                                     cases v2 with
-                                    | unit | ptr _ _ | aggregate _ _ => nomatch hExt
+                                    | uninit | unit | ptr _ _ | aggregate _ _ => nomatch hExt
                                     | scalar sc0 =>
                                       dsimp only at hExt
                                       let tightSc : ScalarInt := {
@@ -8177,21 +8407,28 @@ theorem symExtractUpperBound1_sound
                                               | some vArg0 =>
                                                 rw [hArg0] at hHold
                                                 dsimp only at hHold
-                                                rw [evalSymOperand_sound
-                                                  args slots1 rhsOp st.borrows body.allocations body.layouts
-                                                  (.concrete (.scalar sc0)) slots2 hRhs] at hHold
-                                                dsimp only [concretizeSymReadResult] at hHold
-                                                cases vArg0 with
-                                                | unit | aggregate _ _ =>
+                                                cases hU0 : valueContainsUninit vArg0 with
+                                                | true =>
+                                                  rw [hU0] at hHold
                                                   exact False.elim hHold
-                                                | ptr _ _ =>
-                                                  cases op with
-                                                  | eq | lt | le =>
-                                                    dsimp only [isPtrRelationalBinOp] at hHold
-                                                    rw [hPtrTy] at hHold
+                                                | false =>
+                                                  rw [hU0] at hHold
+                                                  dsimp only at hHold
+                                                  rw [evalSymOperand_sound
+                                                    args slots1 rhsOp st.borrows body.allocations body.layouts
+                                                    (.concrete (.scalar sc0)) slots2 hRhs] at hHold
+                                                  dsimp only [concretizeSymReadResult] at hHold
+                                                  cases vArg0 with
+                                                  | uninit | unit | aggregate _ _ =>
                                                     exact False.elim hHold
-                                                  | _ => nomatch hOp
-                                                | scalar actualSc =>
+                                                  | ptr _ _ =>
+                                                    cases op with
+                                                    | eq | lt | le =>
+                                                      dsimp only [isPtrRelationalBinOp] at hHold
+                                                      rw [hPtrTy] at hHold
+                                                      exact False.elim hHold
+                                                    | _ => nomatch hOp
+                                                  | scalar actualSc =>
                                                   have hNotOff : op = .le ∨ op = .lt ∨ op = .eq := by
                                                     cases op <;> simp_all [isUnsignedUpperBoundOp]
                                                   rcases hNotOff with rfl | rfl | rfl <;> (
@@ -8256,7 +8493,7 @@ def extractMirUpperBound1Loop : Nat → CapturedMir → SymState → Option Scal
   | .zero, _, _ => .none
   | .succ fuel, body, st =>
     match symStepConcreteExt body st with
-    | .some st' => extractMirUpperBound1Loop fuel body st'
+    | .some st' => extractMirUpperBound1Loop fuel body (strictSymStatePeriodic fuel st')
     | .none =>
       match symExtractUpperBound1 body st with
       | .some (boundSc, stFalse) =>
@@ -8265,7 +8502,7 @@ def extractMirUpperBound1Loop : Nat → CapturedMir → SymState → Option Scal
         | false => .none
       | .none =>
         match symStepDerefSymArgAny body st with
-        | .some st' => extractMirUpperBound1Loop fuel body st'
+        | .some st' => extractMirUpperBound1Loop fuel body (strictSymState st')
         | .none => .none
 
 /-- Extract the 1-argument unsigned upper bound `boundSc` from `reqBody`. -/
@@ -8278,7 +8515,7 @@ def checkSymUpperBound1LoopDirect :
   | .zero, _, _, _ => false
   | .succ fuel, body, st, boundSc =>
     match symStepConcreteExt body st with
-    | .some st' => checkSymUpperBound1LoopDirect fuel body st' boundSc
+    | .some st' => checkSymUpperBound1LoopDirect fuel body (strictSymStatePeriodic fuel st') boundSc
     | .none =>
       match symExtractUpperBound1 body st with
       | .some (scOut, stFalse) =>
@@ -8306,6 +8543,7 @@ theorem checkSymUpperBound1LoopDirect_sound :
     cases hStep : symStepConcreteExt body st with
     | some st' =>
       rw [hStep] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       exact checkSymUpperBound1LoopDirect_sound
         fuel body args st' boundSc hCheck
         (symStepConcreteExt_sound fuel body args st st' hStep hHold)
@@ -8348,7 +8586,7 @@ def checkSymUpperBound1Loop :
   | .zero, _, _, _ => false
   | .succ fuel, body, st, boundSc =>
     match symStepConcreteExt body st with
-    | .some st' => checkSymUpperBound1Loop fuel body st' boundSc
+    | .some st' => checkSymUpperBound1Loop fuel body (strictSymStatePeriodic fuel st') boundSc
     | .none =>
       match symExtractUpperBound1 body st with
       | .some (scOut, stFalse) =>
@@ -8356,10 +8594,10 @@ def checkSymUpperBound1Loop :
           (Bool.and
             (Nat.beq scOut.bits boundSc.bits)
             (Nat.beq scOut.sizeBytes boundSc.sizeBytes))
-          (checkSymReturnsFalseExt fuel body stFalse)
+          (checkSymReturnsFalseExt fuel body (strictSymStatePeriodic fuel stFalse))
       | .none =>
         match symStepDerefSymArg body st 0 boundSc.sizeBytes with
-        | .some st' => checkSymUpperBound1Loop fuel body st' boundSc
+        | .some st' => checkSymUpperBound1Loop fuel body (strictSymStatePeriodic fuel st') boundSc
         | .none => false
 
 theorem checkSymUpperBound1Loop_sound :
@@ -8380,6 +8618,7 @@ theorem checkSymUpperBound1Loop_sound :
     cases hStep : symStepConcreteExt body st with
     | some st' =>
       rw [hStep] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       exact checkSymUpperBound1Loop_sound
         fuel body args st' boundSc hCheck hArg0
         (symStepConcreteExt_sound fuel body args st st' hStep hHold)
@@ -8404,6 +8643,7 @@ theorem checkSymUpperBound1Loop_sound :
             | true =>
               rw [hSzEq] at hCheck
               dsimp only [Bool.and] at hCheck
+              rw [strictSymStatePeriodic_eq] at hCheck
               have hScEq : scOut = boundSc :=
                 scalarInt_eq_of_parts
                   (Nat.eq_of_beq_eq_true hBitsEq)
@@ -8419,6 +8659,7 @@ theorem checkSymUpperBound1Loop_sound :
           nomatch hCheck
         | some st' =>
           rw [hDeref] at hCheck
+          (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
           rcases hArg0 with ⟨b0, hb0⟩
           exact checkSymUpperBound1Loop_sound
             fuel body args st' boundSc hCheck ⟨b0, hb0⟩
@@ -8574,7 +8815,7 @@ def checkMirReturnsFalseExecBounded
   match fuel with
   | 0 => false
   | fuel' + 1 =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel' body st with
     | .ret (.normal (.scalar { bits := 0, sizeBytes := 1 }, _)) => true
     | .ret _ => false
     | .tau st' => checkMirReturnsFalseExecBounded fuel' body st'
@@ -8602,6 +8843,7 @@ private theorem not_dwlp_of_checkMirReturnsFalseExecBounded
   | zero => nomatch h_false
   | succ fuel' ih =>
     unfold checkMirReturnsFalseExecBounded at h_false
+    rw [stepMirStatePeriodic_eq] at h_false
     rw [DWLP.unfold_eq, ITree.observe_cofix] at h_dwlp
     cases h_step : stepMirState body st with
     | ret out =>
@@ -9301,12 +9543,70 @@ def symStepStmtInBounds
     | .none => false
   | _ => true
 
+theorem valueListContainsUninit_of_allFlatValuesOfSize (sz : Nat) :
+    ∀ (xs : List Value),
+      allFlatValuesOfSize sz xs = true →
+      valueListContainsUninit xs = false
+  | .nil, _ => rfl
+  | x :: rest, h => by
+    cases x with
+    | uninit => nomatch h
+    | aggregate _ _ => nomatch h
+    | unit => nomatch h
+    | scalar sc =>
+      dsimp only [allFlatValuesOfSize, flatValueByteSize?] at h
+      cases hSz : Nat.beq sz sc.sizeBytes with
+      | false => rw [hSz] at h; nomatch h
+      | true =>
+        rw [hSz] at h
+        exact valueListContainsUninit_of_allFlatValuesOfSize sz rest h
+    | ptr _ pSz =>
+      dsimp only [allFlatValuesOfSize, flatValueByteSize?] at h
+      cases hSz : Nat.beq sz pSz with
+      | false => rw [hSz] at h; nomatch h
+      | true =>
+        rw [hSz] at h
+        exact valueListContainsUninit_of_allFlatValuesOfSize sz rest h
+
+theorem valueContainsUninit_of_extractValueScalarSlice0?
+    {v : Value} {targetBytes : Nat} {sc : ScalarInt}
+    (h : extractValueScalarSlice0? v targetBytes = .some sc) :
+    valueContainsUninit v = false := by
+  cases v with
+  | uninit | unit | ptr _ _ => nomatch h
+  | scalar _ => rfl
+  | aggregate varIdx fields =>
+    cases varIdx with
+    | succ _ => nomatch h
+    | zero =>
+      cases fields with
+      | nil => nomatch h
+      | cons f0 fRest =>
+        cases f0 with
+        | uninit | unit | ptr _ _ | aggregate _ _ => nomatch h
+        | scalar s0 =>
+          dsimp only [extractValueScalarSlice0?] at h
+          cases hHom : isHomogeneousUntypedFields (.scalar s0 :: fRest) with
+          | false => rw [hHom] at h; nomatch h
+          | true =>
+            dsimp only [valueContainsUninit, valueListContainsUninit, Bool.false_or]
+            cases fRest with
+            | nil => rfl
+            | cons f1 rest2 =>
+              dsimp only [isHomogeneousUntypedFields, flatValueByteSize?] at hHom
+              cases hBle : Nat.ble 1 s0.sizeBytes with
+              | false => rw [hBle] at hHom; nomatch hHom
+              | true =>
+                rw [hBle] at hHom
+                exact valueListContainsUninit_of_allFlatValuesOfSize s0.sizeBytes (f1 :: rest2) hHom
+
 theorem symStepStmtConcrete_step_of_inBounds
     (body : CapturedMir)
     (args : List Value)
     (st st' : SymState)
     (stmt : Statement)
     (hLen : length args = body.argCount)
+    (hArgsInit : ∀ idx w, get? args idx = .some w → valueContainsUninit w = false)
     (hInB : symStepStmtInBounds body.argCount body.localDecls body.layouts st stmt = true)
     (h : symStepStmtConcrete body.localDecls body.layouts st stmt = .some st') :
     evalStmt (concretizeSymState body args st) stmt body.localDecls body.layouts =
@@ -9472,6 +9772,8 @@ theorem symStepStmtConcrete_step_of_inBounds
                           nomatch hSome
                         | some val =>
                           dsimp only
+                          rw [hArgsInit valIdx val hArgVal]
+                          dsimp only
                           rw [get?_concretizeSymSlots args slots1 dstLoc, hGet]
                           have hSetSym := set?_concretizeSymSlots args (.symArg valIdx) slots1 dstLoc
                           dsimp only [concretizeSymSlot] at hSetSym
@@ -9497,6 +9799,8 @@ theorem symStepStmtConcrete_step_of_inBounds
                           rw [hArgVal] at hSome
                           nomatch hSome
                         | some val =>
+                          dsimp only
+                          rw [hArgsInit valIdx val hArgVal]
                           dsimp only
                           rw [get?_concretizeSymSlots args slots1 dstLoc, hGet]
                           have hSetSym := set?_concretizeSymSlots args (.symPair0 v0 valIdx) slots1 dstLoc
@@ -9556,6 +9860,7 @@ theorem symStepConcreteInBounds_true_sound
     (args : List Value)
     (st st' : SymState)
     (hLen : length args = body.argCount)
+    (hArgsInit : ∀ idx w, get? args idx = .some w → valueContainsUninit w = false)
     (h : symStepConcreteInBounds body st = .some st')
     (hTrue : evalMirBoolTrueBounded fuel body (concretizeSymState body args st')) :
     evalMirBoolTrueBounded (.succ fuel) body (concretizeSymState body args st) := by
@@ -9589,7 +9894,7 @@ theorem symStepConcreteInBounds_true_sound
           rw [hInB] at h
           dsimp only at h
           rw [stepMirFn_concretize_stmt body args st bb stmt hNotOther hBb hStmt]
-          rw [symStepStmtConcrete_step_of_inBounds body args st st' stmt hLen hInB h]
+          rw [symStepStmtConcrete_step_of_inBounds body args st st' stmt hLen hArgsInit hInB h]
           exact hTrue
       | none =>
         rw [hStmt] at h
@@ -9692,7 +9997,7 @@ theorem symIsReturnTrue_sound
                   | dead | uninit => nomatch h
                   | init retVal =>
                     cases retVal with
-                    | unit | ptr _ _ | aggregate _ _ => nomatch h
+                    | uninit | unit | ptr _ _ | aggregate _ _ => nomatch h
                     | scalar sc =>
                       cases sc with
                       | mk bits sz =>
@@ -9744,34 +10049,37 @@ def checkSymReturnsTrue : Nat → CapturedMir → SymState → Bool
   | .zero, _, _ => false
   | .succ fuel, body, st =>
     match symStepConcreteInBounds body st with
-    | .some st' => checkSymReturnsTrue fuel body st'
+    | .some st' => checkSymReturnsTrue fuel body (strictSymStatePeriodic fuel st')
     | .none =>
       match symStepConcreteDeref body st with
-      | .some st' => checkSymReturnsTrue fuel body st'
+      | .some st' => checkSymReturnsTrue fuel body (strictSymStatePeriodic fuel st')
       | .none => symIsReturnTrue body st
 
 theorem checkSymReturnsTrue_sound :
     ∀ (fuel : Nat) (body : CapturedMir) (args : List Value) (st : SymState),
       length args = body.argCount →
+      (∀ idx w, get? args idx = .some w → valueContainsUninit w = false) →
       checkSymReturnsTrue fuel body st = true →
       evalMirBoolTrueBounded fuel body (concretizeSymState body args st)
-  | .zero, _, _, _, _, hCheck => nomatch hCheck
-  | .succ fuel, body, args, st, hLen, hCheck => by
+  | .zero, _, _, _, _, _, hCheck => nomatch hCheck
+  | .succ fuel, body, args, st, hLen, hArgsInit, hCheck => by
     dsimp only [checkSymReturnsTrue] at hCheck
     cases hStep : symStepConcreteInBounds body st with
     | some st' =>
       rw [hStep] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       exact symStepConcreteInBounds_true_sound
-        fuel body args st st' hLen hStep
-        (checkSymReturnsTrue_sound fuel body args st' hLen hCheck)
+        fuel body args st st' hLen hArgsInit hStep
+        (checkSymReturnsTrue_sound fuel body args st' hLen hArgsInit hCheck)
     | none =>
       rw [hStep] at hCheck
       cases hDeref : symStepConcreteDeref body st with
       | some st' =>
         rw [hDeref] at hCheck
+        (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
         exact symStepConcreteDeref_true_sound
           fuel body args st st' hDeref
-          (checkSymReturnsTrue_sound fuel body args st' hLen hCheck)
+          (checkSymReturnsTrue_sound fuel body args st' hLen hArgsInit hCheck)
       | none =>
         rw [hDeref] at hCheck
         exact symIsReturnTrue_sound fuel body args st hCheck
@@ -9965,6 +10273,7 @@ theorem symExtractEnsuresUpperBound1_sound
     (stTrue : SymState)
     (r : Nat)
     (hLen : length args = body.argCount)
+    (hArgsInit : ∀ idx w, get? args idx = .some w → valueContainsUninit w = false)
     (hExt : symExtractEnsuresUpperBound1 body st = .some (boundSc, stTrue))
     (hTrue : checkSymReturnsTrue fuel body stTrue = true)
     (hArg1 : get? args 1 = .some (.scalar { bits := r, sizeBytes := boundSc.sizeBytes }))
@@ -10038,7 +10347,7 @@ theorem symExtractEnsuresUpperBound1_sound
                                 | symArg _ | symPair0 _ _ | symGuarded _ _ => nomatch hExt
                                 | concrete v2 =>
                                   cases v2 with
-                                  | unit | ptr _ _ | aggregate _ _ => nomatch hExt
+                                  | uninit | unit | ptr _ _ | aggregate _ _ => nomatch hExt
                                   | scalar sc0 =>
                                     dsimp only at hExt
                                     cases hOp : isUnsignedEnsuresUpperOp op sc0.bits with
@@ -10068,7 +10377,7 @@ theorem symExtractEnsuresUpperBound1_sound
                                             symFinishEnsTrue_ok_sound
                                               fuel body args st dstLoc slots2 tightSc boundSc stTrue
                                               hExt
-                                              (checkSymReturnsTrue_sound fuel body args stTrue hLen hTrue)
+                                              (checkSymReturnsTrue_sound fuel body args stTrue hLen hArgsInit hTrue)
                                           subst hScEq
                                           rw [evalStmt_assign_nil_eq]
                                           dsimp only [evalRvalue, concretizeSymState, concretizeSymMemory]
@@ -10077,7 +10386,7 @@ theorem symExtractEnsuresUpperBound1_sound
                                             (.symArg 1) slots1 hLhs]
                                           dsimp only [concretizeSymReadResult]
                                           rw [hArg1]
-                                          dsimp only
+                                          dsimp only [valueContainsUninit]
                                           rw [evalSymOperand_sound
                                             args slots1 rhsOp st.borrows body.allocations body.layouts
                                             (.concrete (.scalar sc0)) slots2 hRhs]
@@ -10117,10 +10426,10 @@ def checkSymEnsuresUpperBound1Loop :
   | .zero, _, _, _ => false
   | .succ fuel, body, st, boundSc =>
     match symStepConcreteInBounds body st with
-    | .some st' => checkSymEnsuresUpperBound1Loop fuel body st' boundSc
+    | .some st' => checkSymEnsuresUpperBound1Loop fuel body (strictSymStatePeriodic fuel st') boundSc
     | .none =>
       match symStepConcreteDeref body st with
-      | .some st' => checkSymEnsuresUpperBound1Loop fuel body st' boundSc
+      | .some st' => checkSymEnsuresUpperBound1Loop fuel body (strictSymStatePeriodic fuel st') boundSc
       | .none =>
         match symExtractEnsuresUpperBound1 body st with
         | .some (scOut, stTrue) =>
@@ -10128,10 +10437,10 @@ def checkSymEnsuresUpperBound1Loop :
             (Bool.and
               (Nat.beq scOut.bits boundSc.bits)
               (Nat.beq scOut.sizeBytes boundSc.sizeBytes))
-            (checkSymReturnsTrue fuel body stTrue)
+            (checkSymReturnsTrue fuel body (strictSymStatePeriodic fuel stTrue))
         | .none =>
           match symStepDerefSymArg body st 1 boundSc.sizeBytes with
-          | .some st' => checkSymEnsuresUpperBound1Loop fuel body st' boundSc
+          | .some st' => checkSymEnsuresUpperBound1Loop fuel body (strictSymStatePeriodic fuel st') boundSc
           | .none => false
 
 theorem checkSymEnsuresUpperBound1Loop_sound :
@@ -10142,29 +10451,32 @@ theorem checkSymEnsuresUpperBound1Loop_sound :
       (boundSc : ScalarInt)
       (r : Nat),
       length args = body.argCount →
+      (∀ idx w, get? args idx = .some w → valueContainsUninit w = false) →
       checkSymEnsuresUpperBound1Loop fuel body st boundSc = true →
       get? args 1 = .some (.scalar { bits := r, sizeBytes := boundSc.sizeBytes }) →
       r ≤ boundSc.bits →
       evalMirBoolTrueBounded fuel body (concretizeSymState body args st)
-  | .zero, _, _, _, _, _, _, hCheck, _, _ => nomatch hCheck
-  | .succ fuel, body, args, st, boundSc, r, hLen, hCheck, hArg1, hBle => by
+  | .zero, _, _, _, _, _, _, _, hCheck, _, _ => nomatch hCheck
+  | .succ fuel, body, args, st, boundSc, r, hLen, hArgsInit, hCheck, hArg1, hBle => by
     dsimp only [checkSymEnsuresUpperBound1Loop] at hCheck
     cases hStep : symStepConcreteInBounds body st with
     | some st' =>
       rw [hStep] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       exact symStepConcreteInBounds_true_sound
-        fuel body args st st' hLen hStep
+        fuel body args st st' hLen hArgsInit hStep
         (checkSymEnsuresUpperBound1Loop_sound
-          fuel body args st' boundSc r hLen hCheck hArg1 hBle)
+          fuel body args st' boundSc r hLen hArgsInit hCheck hArg1 hBle)
     | none =>
       rw [hStep] at hCheck
       cases hDeref : symStepConcreteDeref body st with
       | some st' =>
         rw [hDeref] at hCheck
+        (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
         exact symStepConcreteDeref_true_sound
           fuel body args st st' hDeref
           (checkSymEnsuresUpperBound1Loop_sound
-            fuel body args st' boundSc r hLen hCheck hArg1 hBle)
+            fuel body args st' boundSc r hLen hArgsInit hCheck hArg1 hBle)
       | none =>
         rw [hDeref] at hCheck
         cases hExt : symExtractEnsuresUpperBound1 body st with
@@ -10176,10 +10488,11 @@ theorem checkSymEnsuresUpperBound1Loop_sound :
             nomatch hCheck
           | some st' =>
             rw [hDerefSym] at hCheck
+            (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
             exact symStepDerefSymArg_true_sound
               fuel body args st st' 1 boundSc.sizeBytes r hArg1 hDerefSym
               (checkSymEnsuresUpperBound1Loop_sound
-                fuel body args st' boundSc r hLen hCheck hArg1 hBle)
+                fuel body args st' boundSc r hLen hArgsInit hCheck hArg1 hBle)
         | some pair =>
           rw [hExt] at hCheck
           cases pair with
@@ -10198,13 +10511,14 @@ theorem checkSymEnsuresUpperBound1Loop_sound :
               | true =>
                 rw [hSzEq] at hCheck
                 dsimp only [Bool.and] at hCheck
+                rw [strictSymStatePeriodic_eq] at hCheck
                 have hScEq : scOut = boundSc :=
                   scalarInt_eq_of_parts
                     (Nat.eq_of_beq_eq_true hBitsEq)
                     (Nat.eq_of_beq_eq_true hSzEq)
                 subst hScEq
                 exact symExtractEnsuresUpperBound1_sound
-                  fuel body args st scOut stTrue r hLen hExt hCheck hArg1 hBle
+                  fuel body args st scOut stTrue r hLen hArgsInit hExt hCheck hArg1 hBle
 
 /-- Check that `ensBody` is a 2-argument predicate `[x, ret]` satisfied whenever
 `ret` has `sizeBytes = boundSc.sizeBytes` and `bits ≤ boundSc.bits`. -/
@@ -10224,7 +10538,8 @@ theorem checkMirEnsuresUpperBound1_sound
     (v0 : Value)
     (r : Nat)
     (h_check : checkMirEnsuresUpperBound1 fuel ensBody boundSc = true)
-    (h_ble : r ≤ boundSc.bits) :
+    (h_ble : r ≤ boundSc.bits)
+    (hV0 : valueContainsUninit v0 = false := by rfl) :
     MirBoolPredicateHolds
       ensBody
       [v0, .scalar { bits := r, sizeBytes := boundSc.sizeBytes }] := by
@@ -10239,10 +10554,23 @@ theorem checkMirEnsuresUpperBound1_sound
     let args : List Value := [v0, .scalar { bits := r, sizeBytes := boundSc.sizeBytes }]
     have hLen : length args = ensBody.argCount :=
       Eq.symm (Nat.eq_of_beq_eq_true hArg2)
+    have hArgsInit : ∀ idx w, get? args idx = .some w → valueContainsUninit w = false := by
+      intro idx w hGet
+      cases idx with
+      | zero =>
+        injection hGet with hEq
+        rw [← hEq]
+        exact hV0
+      | succ idx1 =>
+        cases idx1 with
+        | zero =>
+          injection hGet with hEq
+          rw [← hEq]
+        | succ _ => nomatch hGet
     apply mirBoolPredicateHolds_of_evalMirBoolTrueBounded fuel ensBody args
     rw [← concretizeSymState_initSymState ensBody args hLen]
     exact checkSymEnsuresUpperBound1Loop_sound
-      fuel ensBody args (initSymState ensBody) boundSc r hLen h_check rfl h_ble
+      fuel ensBody args (initSymState ensBody) boundSc r hLen hArgsInit h_check rfl h_ble
 
 /-- Fast AST scan for the first unsigned upper-bound constant comparison in `stmts`. -/
 def peekStmtsUpperBound : List Statement → Option ScalarInt
@@ -10305,7 +10633,8 @@ theorem optMirBoolPredicateHolds_of_symOptEnsuresUpperPost
     (v0 retVal : Value)
     (mem' : Memory)
     (h_ens_check : checkOptMirEnsuresUpperBound1 specFuel optEnsBody = true)
-    (h_post : symOptEnsuresUpperPost optEnsBody retVal mem') :
+    (h_post : symOptEnsuresUpperPost optEnsBody retVal mem')
+    (hV0 : valueContainsUninit v0 = false := by rfl) :
     OptMirBoolPredicateHolds optEnsBody [v0, retVal] := by
   cases optEnsBody with
   | none => exact True.intro
@@ -10313,14 +10642,14 @@ theorem optMirBoolPredicateHolds_of_symOptEnsuresUpperPost
     dsimp only [checkOptMirEnsuresUpperBound1] at h_ens_check
     dsimp only [symOptEnsuresUpperPost] at h_post
     cases retVal with
-    | unit | ptr _ _ | aggregate _ _ => exact False.elim h_post
+    | uninit | unit | ptr _ _ | aggregate _ _ => exact False.elim h_post
     | scalar retSc =>
       rcases retSc with ⟨rBits, rSz⟩
       rcases h_post with ⟨hSz, hBle⟩
       dsimp only at hSz hBle
       subst hSz
       exact checkMirEnsuresUpperBound1_sound
-        specFuel ensBody (peekMirUpperBound ensBody) v0 rBits h_ens_check hBle
+        specFuel ensBody (peekMirUpperBound ensBody) v0 rBits h_ens_check hBle hV0
 
 /-- Closed-term checker that `reqBody` and `optEnsBody` are valid 1-argument
 unsigned upper-bound companions for `subjectBody`. -/
@@ -10653,11 +10982,11 @@ def checkSymSinglePinExtLoop :
   | .zero, _, _, _, _ => false
   | .succ fuel, body, st, expectedIdx, expectedSc =>
     match symStepConcreteExt body st with
-    | .some st' => checkSymSinglePinExtLoop fuel body st' expectedIdx expectedSc
+    | .some st' => checkSymSinglePinExtLoop fuel body (strictSymStatePeriodic fuel st') expectedIdx expectedSc
     | .none =>
       match symExtractPinEq body st with
       | .some (idx, sc, stTrue, stFalse) =>
-        match checkSymReturnsFalseExt fuel body stFalse with
+        match checkSymReturnsFalseExt fuel body (strictSymStatePeriodic fuel stFalse) with
         | false => false
         | true =>
           match Nat.beq idx expectedIdx with
@@ -10665,10 +10994,10 @@ def checkSymSinglePinExtLoop :
             Bool.and
               (Nat.beq sc.bits expectedSc.bits)
               (Nat.beq sc.sizeBytes expectedSc.sizeBytes)
-          | false => checkSymSinglePinExtLoop fuel body stTrue expectedIdx expectedSc
+          | false => checkSymSinglePinExtLoop fuel body (strictSymStatePeriodic fuel stTrue) expectedIdx expectedSc
       | .none =>
         match symStepDerefSymArg body st expectedIdx expectedSc.sizeBytes with
-        | .some st' => checkSymSinglePinExtLoop fuel body st' expectedIdx expectedSc
+        | .some st' => checkSymSinglePinExtLoop fuel body (strictSymStatePeriodic fuel st') expectedIdx expectedSc
         | .none => false
 
 theorem checkSymSinglePinExtLoop_sound :
@@ -10688,6 +11017,7 @@ theorem checkSymSinglePinExtLoop_sound :
     cases hStep : symStepConcreteExt body st with
     | some st' =>
       rw [hStep] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       exact checkSymSinglePinExtLoop_sound
         fuel body args st' expectedIdx expectedSc hCheck hArg
         (symStepConcreteExt_sound fuel body args st st' hStep hHold)
@@ -10698,6 +11028,7 @@ theorem checkSymSinglePinExtLoop_sound :
         rw [hExt] at hCheck
         rcases tup with ⟨idx, sc, stTrue, stFalse⟩
         dsimp only at hCheck
+        rw [strictSymStatePeriodic_eq] at hCheck
         cases hFalse : checkSymReturnsFalseExt fuel body stFalse with
         | false => rw [hFalse] at hCheck; nomatch hCheck
         | true =>
@@ -10721,6 +11052,7 @@ theorem checkSymSinglePinExtLoop_sound :
             exact hPinIdx
           | false =>
             rw [hIdxEq] at hCheck
+            (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
             exact checkSymSinglePinExtLoop_sound
               fuel body args stTrue expectedIdx expectedSc hCheck hArg hHoldTrue
       | none =>
@@ -10729,6 +11061,7 @@ theorem checkSymSinglePinExtLoop_sound :
         | none => rw [hDeref] at hCheck; nomatch hCheck
         | some st' =>
           rw [hDeref] at hCheck
+          (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
           rcases hArg with ⟨b0, hb0⟩
           exact checkSymSinglePinExtLoop_sound
             fuel body args st' expectedIdx expectedSc hCheck ⟨b0, hb0⟩
@@ -10875,7 +11208,7 @@ def checkMirRustModularPinnedSpecLoop
     Nat → MirExecState → Bool
   | 0, _ => false
   | fuel' + 1, st =>
-    match stepMirState subjectBody st with
+    match stepMirStatePeriodic fuel' subjectBody st with
     | .ret out =>
       match out with
       | .normal (retVal, _) =>
@@ -10988,6 +11321,7 @@ theorem wpMirModularBounded_of_checkMirRustModularPinnedSpec
   | succ fuel' ih =>
     intro st h
     unfold checkMirRustModularPinnedSpecLoop at h
+    rw [stepMirStatePeriodic_eq] at h
     unfold wpCoalBounded
     cases h_step : stepMirState subjectBody st with
     | ret out =>
@@ -11488,10 +11822,10 @@ def checkSymSliceBoolTrueBounded : Nat → CapturedMir → ScalarInt → SymStat
   | .zero, _, _, _ => false
   | .succ fuel, body, expectedSc, st =>
     match symStepConcreteInBounds body st with
-    | .some st' => checkSymSliceBoolTrueBounded fuel body expectedSc st'
+    | .some st' => checkSymSliceBoolTrueBounded fuel body expectedSc (strictSymStatePeriodic fuel st')
     | .none =>
       match symStepConcreteDeref body st with
-      | .some st' => checkSymSliceBoolTrueBounded fuel body expectedSc st'
+      | .some st' => checkSymSliceBoolTrueBounded fuel body expectedSc (strictSymStatePeriodic fuel st')
       | .none =>
         match symStepDerefLoadSlice body st expectedSc with
         | .some st' => checkSymSliceBoolTrueBounded fuel body expectedSc st'
@@ -11511,17 +11845,29 @@ theorem checkSymSliceBoolTrueBounded_sound :
   | .succ fuel, body, v, expectedSc, st, hArgCount, hSlice, hCheck => by
     dsimp only [checkSymSliceBoolTrueBounded] at hCheck
     have hLen : length [v, v] = body.argCount := Eq.symm hArgCount
+    have hVInit : valueContainsUninit v = false :=
+      valueContainsUninit_of_extractValueScalarSlice0? hSlice
+    have hArgsInit : ∀ idx w, get? [v, v] idx = .some w → valueContainsUninit w = false := by
+      intro idx w hGet
+      cases idx with
+      | zero => injection hGet with hEq; rw [← hEq]; exact hVInit
+      | succ idx1 =>
+        cases idx1 with
+        | zero => injection hGet with hEq; rw [← hEq]; exact hVInit
+        | succ _ => nomatch hGet
     cases hStep1 : symStepConcreteInBounds body st with
     | some st' =>
       rw [hStep1] at hCheck
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
       exact symStepConcreteInBounds_true_sound
-        fuel body [v, v] st st' hLen hStep1
+        fuel body [v, v] st st' hLen hArgsInit hStep1
         (checkSymSliceBoolTrueBounded_sound fuel body v expectedSc st' hArgCount hSlice hCheck)
     | none =>
       rw [hStep1] at hCheck
       cases hStep2 : symStepConcreteDeref body st with
       | some st' =>
         rw [hStep2] at hCheck
+        (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
         exact symStepConcreteDeref_true_sound
           fuel body [v, v] st st' hStep2
           (checkSymSliceBoolTrueBounded_sound fuel body v expectedSc st' hArgCount hSlice hCheck)
@@ -11564,7 +11910,7 @@ def checkSymReturnsSymArg0 : Nat → CapturedMir → SymState → Bool
   | .zero, _, _ => false
   | .succ fuel, body, st =>
     match symStepConcreteInBounds body st with
-    | .some st' => checkSymReturnsSymArg0 fuel body st'
+    | .some st' => checkSymReturnsSymArg0 fuel body (strictSymStatePeriodic fuel st')
     | .none => symIsReturnSymArg0 body st
 
 theorem wpCoalBounded_of_symIsReturnSymArg0
@@ -11574,7 +11920,8 @@ theorem wpCoalBounded_of_symIsReturnSymArg0
     (st : SymState)
     (P : Value → Prop)
     (hRet : symIsReturnSymArg0 body st = true)
-    (hP : P v) :
+    (hP : P v)
+    (hVInit : valueContainsUninit v = false := by rfl) :
     wpCoalBounded (.succ fuel) mirDefaultWP (stepMirState body)
       (fun out _ => ∀ retVal mem', out = .normal (retVal, mem') → P retVal)
       (.running (concretizeSymState body [v] st)) PUnit.unit := by
@@ -11624,7 +11971,9 @@ theorem wpCoalBounded_of_symIsReturnSymArg0
                   | succ _ => nomatch hRet
                   | zero =>
                     rw [hasFrameDeallocProtectorConflict.eq_1]
-                    dsimp only [concretizeSymSlot, get?, MirStepNode.retNormal, mirDefaultWP]
+                    dsimp only [concretizeSymSlot, get?, List.getElem?_cons_zero]
+                    rw [hVInit]
+                    dsimp only [MirStepNode.retNormal, mirDefaultWP]
                     intro retVal mem' hOut
                     injection hOut with hPair
                     injection hPair with hRv _
@@ -11639,22 +11988,29 @@ theorem wpCoalBounded_of_checkSymReturnsSymArg0 :
       (st : SymState)
       (P : Value → Prop),
       body.argCount = 1 →
+      valueContainsUninit v = false →
       checkSymReturnsSymArg0 fuel body st = true →
       P v →
       wpCoalBounded fuel mirDefaultWP (stepMirState body)
         (fun out _ => ∀ retVal mem', out = .normal (retVal, mem') → P retVal)
         (.running (concretizeSymState body [v] st)) PUnit.unit
-  | .zero, _, _, _, _, _, hCheck, _ => nomatch hCheck
-  | .succ fuel, body, v, st, P, hArg1, hCheck, hP => by
+  | .zero, _, _, _, _, _, _, hCheck, _ => nomatch hCheck
+  | .succ fuel, body, v, st, P, hArg1, hVInit, hCheck, hP => by
     dsimp only [checkSymReturnsSymArg0] at hCheck
     have hLen : length [v] = body.argCount := Eq.symm hArg1
+    have hArgsInit : ∀ idx w, get? [v] idx = .some w → valueContainsUninit w = false := by
+      intro idx w hGet
+      cases idx with
+      | zero => injection hGet with hEq; rw [← hEq]; exact hVInit
+      | succ _ => nomatch hGet
     cases hStep : symStepConcreteInBounds body st with
     | none =>
       rw [hStep] at hCheck
-      exact wpCoalBounded_of_symIsReturnSymArg0 fuel body v st P hCheck hP
+      exact wpCoalBounded_of_symIsReturnSymArg0 fuel body v st P hCheck hP hVInit
     | some st' =>
       rw [hStep] at hCheck
-      have hRec := wpCoalBounded_of_checkSymReturnsSymArg0 fuel body v st' P hArg1 hCheck hP
+      (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
+      have hRec := wpCoalBounded_of_checkSymReturnsSymArg0 fuel body v st' P hArg1 hVInit hCheck hP
       dsimp only [symStepConcreteInBounds] at hStep
       unfold wpCoalBounded stepMirState
       dsimp only
@@ -11680,7 +12036,7 @@ theorem wpCoalBounded_of_checkSymReturnsSymArg0 :
               rw [hInB] at hStep
               dsimp only at hStep
               rw [stepMirFn_concretize_stmt body [v] st bb stmt hNotOther hBb hStmt]
-              rw [symStepStmtConcrete_step_of_inBounds body [v] st st' stmt hLen hInB hStep]
+              rw [symStepStmtConcrete_step_of_inBounds body [v] st st' stmt hLen hArgsInit hInB hStep]
               exact hRec
           | none =>
             rw [hStmt] at hStep
@@ -11849,7 +12205,9 @@ theorem dischargeRustEqScalar1
         rw [← concretizeSymState_initSymState c.body [v0] hSubjLen]
         exact wpCoalBounded_of_checkSymReturnsSymArg0
           subjectFuel c.body v0 (initSymState c.body) (fun rv => c.post [v0] rv)
-          (Nat.eq_of_beq_eq_true hSubjArg1) hSubjRet0 hPostV0
+          (Nat.eq_of_beq_eq_true hSubjArg1)
+          (valueContainsUninit_of_extractValueScalarSlice0? hSlice0)
+          hSubjRet0 hPostV0
   | false =>
     change OptArgsTypedForSubject
       (Bool.or

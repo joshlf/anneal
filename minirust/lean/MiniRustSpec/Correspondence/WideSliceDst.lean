@@ -8,6 +8,7 @@ This file may not be copied, modified, or distributed except according to
 those terms.
 -/
 
+import Lean
 import MiniRustSpec.Correspondence.TbWitness
 import MiniRustSpec.Correspondence.ProvenanceWitness
 import MiniRustSpec.Correspondence.IntrinsicFallback
@@ -102,6 +103,42 @@ open MiniRustSpec.Correspondence.Witness
 open MiniRustSpec.Correspondence.PointerWitness
 open MiniRustSpec.Correspondence.RefWitness
 open MiniRustSpec.Correspondence.TbWitness
+
+local elab "kernel_rfl" : tactic => do
+  let mvarId ← Lean.Elab.Tactic.getMainGoal
+  let tgt ← Lean.MVarId.getType' mvarId
+  let some (ty, lhs, _) := tgt.eq? | Lean.Meta.throwTacticEx `kernel_rfl mvarId "expected equality goal"
+  let u ← Lean.Meta.getLevel ty
+  mvarId.assign (Lean.mkApp2 (Lean.mkConst ``Eq.refl [u]) ty lhs)
+  Lean.Elab.Tactic.replaceMainGoal []
+
+private theorem runA_isSome_noUB (body : CapturedMir) (fuel : Nat) (s : MachineState)
+    (h : (runA body fuel s).isSome = true) : MirNoUBTree (mirTree body s) := by
+  cases hr : runA body fuel s with
+  | none => rw [hr] at h; cases h
+  | some p => exact runA_noUB body fuel s p.1 p.2 hr
+
+private theorem runA_exists_mem_sound (body : CapturedMir) (fuel : Nat) (s : MachineState)
+    (tr : List (Event MirEffect)) (v : MirSemantics.Value)
+    (h : (runA body fuel s).map (fun (tr', o) =>
+      match o with
+      | .normal (v', _) => some (tr', v')
+      | _ => none) = some (some (tr, v))) :
+    ∃ mem, ReachesRet (mirTree body s) tr (.normal (v, mem)) := by
+  cases hr : runA body fuel s with
+  | none => rw [hr] at h; cases h
+  | some p =>
+    rcases p with ⟨tr', o⟩
+    cases o with
+    | normal vm =>
+      rcases vm with ⟨v', mem⟩
+      rw [hr] at h
+      injection h with h1
+      injection h1 with h2
+      injection h2 with htr hv
+      cases htr; cases hv
+      exact ⟨mem, runA_sound body fuel s _ _ hr⟩
+    | _ => rw [hr] at h; cases h
 
 /-! ## 1. Wide-Slice Value, Layout, Encoding & Metadata Correspondence -/
 
@@ -1050,6 +1087,7 @@ theorem evalPlaceRead_index_wide_slice_borrowBacked_lockstep
     (∀ elemVal,
       idx < len →
       get? elems (rawElemOffset + baseIdx + idx) = some elemVal →
+      valueContainsUninit elemVal = false →
       validateValueForTy? emptyLayoutTable
         (placeTyResolved localDecls emptyLayoutTable ⟨sIdx, [.deref, .index idxLocal]⟩) elemVal = true →
       evalPlaceRead locals ⟨sIdx, [.deref, .index idxLocal]⟩ mem.borrows mem.globals
@@ -1088,7 +1126,7 @@ theorem evalPlaceRead_index_wide_slice_borrowBacked_lockstep
           hSlSlot, hPointeeTy, hAlignDeref, hBorrow, hp, hSlot, hAlignTarget,
           hBacking, hSzOpt, hOff, hRemBle, readProjectedValue, hIdxSlot, hGetNone,
           Nat.beq_refl, Bool.and_self]
-  · intro elemVal hLt hGetElem hValid
+  · intro elemVal hLt hGetElem hNoUninit hValid
     have hGetSome :
         get? (takeValues len (dropValues (Nat.add rawElemOffset baseIdx) elems)) idx =
           some elemVal := by
@@ -1106,7 +1144,7 @@ theorem evalPlaceRead_index_wide_slice_borrowBacked_lockstep
       all_goals
         simp only [evalPlaceRead, evalSliceFatPtrDerefRead, annealWidePtrVal, hPtr8,
           hSlSlot, hPointeeTy, hAlignDeref, hBorrow, hp, hSlot, hAlignTarget,
-          hBacking, hSzOpt, hOff, hRemBle, readProjectedValue, hIdxSlot, hGetSome, hValid,
+          hBacking, hSzOpt, hOff, hRemBle, readProjectedValue, hIdxSlot, hGetSome, hNoUninit, hValid,
           Nat.beq_refl, Bool.and_self]
 
 /-- **Symbolic null rejection vs. zero-byte (`len = 0` & ZST `elemSz = 0`) reborrow divergence
@@ -1436,6 +1474,7 @@ theorem readProjectedValue_constantIndex_wide_slice_and_saturation
       minLen ≤ len →
       ((fromEnd = false ∧ offset < minLen) ∨ (fromEnd = true ∧ 1 ≤ offset ∧ offset ≤ minLen)) →
       get? elems (rawElemOffset + baseIdx + idx) = some elemVal →
+      valueContainsUninit elemVal = false →
       projOk decls len (.constantIndex offset minLen fromEnd) = true ∧
       readProjectedValue locals (.aggregate 0 window) [.constantIndex offset minLen fromEnd] =
         .ok elemVal) ∧
@@ -1445,6 +1484,7 @@ theorem readProjectedValue_constantIndex_wide_slice_and_saturation
       minLen ≤ len →
       len < offset →
       get? elems (rawElemOffset + baseIdx) = some elem0 →
+      valueContainsUninit elem0 = false →
       projOk decls len (.constantIndex offset minLen true) = false ∧
       readProjectedValue locals (.aggregate 0 window) [.constantIndex offset minLen true] =
         .ok elem0) := by
@@ -1454,7 +1494,10 @@ theorem readProjectedValue_constantIndex_wide_slice_and_saturation
         match Nat.ble m (length fs) with
         | true =>
           match get? fs (if fe then Nat.sub (length fs) o else o) with
-          | some elemVal => .ok elemVal
+          | some elemVal =>
+            match valueContainsUninit elemVal with
+            | false => .ok elemVal
+            | true => .ub
           | none => .ub
         | false => .ub := by
     intro fs o m fe
@@ -1472,7 +1515,7 @@ theorem readProjectedValue_constantIndex_wide_slice_and_saturation
     refine ⟨?_, ?_⟩
     · rw [hRpv, hBleF]
     · simp only [projOk, hDecF, Bool.false_and]
-  · intro elemVal hMinLe hWf hGetElem
+  · intro elemVal hMinLe hWf hGetElem hNoUninit
     have hBleT : Nat.ble minLen (length window) = true := by
       rw [hWinLen, Nat.ble_eq]
       exact hMinLe
@@ -1492,7 +1535,7 @@ theorem readProjectedValue_constantIndex_wide_slice_and_saturation
       refine ⟨hProjOk, ?_⟩
       simp only [idx, Bool.false_eq_true, ↓reduceIte] at hWinGet
       rw [hRpv, hBleT]
-      simp only [Bool.false_eq_true, ↓reduceIte, hWinGet]
+      simp only [Bool.false_eq_true, ↓reduceIte, hWinGet, hNoUninit]
     · have hOff263 : decide (offset < 2 ^ 63) = true :=
         decide_eq_true (Nat.lt_of_le_of_lt (Nat.le_trans hoff hMinLe) hLenLt)
       have hRange : decide (1 ≤ offset ∧ offset ≤ len) = true :=
@@ -1503,8 +1546,8 @@ theorem readProjectedValue_constantIndex_wide_slice_and_saturation
       simp only [idx, ↓reduceIte] at hWinGet
       have hSubEq : Nat.sub (length window) offset = len - offset := by rw [hWinLen]; rfl
       rw [hRpv, hBleT]
-      simp only [↓reduceIte, hSubEq, hWinGet]
-  · intro elem0 hPos hMinLe hGt hGet0
+      simp only [↓reduceIte, hSubEq, hWinGet, hNoUninit]
+  · intro elem0 hPos hMinLe hGt hGet0 hNoUninit0
     have hBleT : Nat.ble minLen (length window) = true := by
       rw [hWinLen, Nat.ble_eq]
       exact hMinLe
@@ -1523,7 +1566,7 @@ theorem readProjectedValue_constantIndex_wide_slice_and_saturation
     · unfold projOk
       simp only [↓reduceIte, hDecRangeF, Bool.and_false]
     · rw [hRpv, hBleT]
-      simp only [↓reduceIte, hSub0, hWinGet0]
+      simp only [↓reduceIte, hSub0, hWinGet0, hNoUninit0]
 
 /-! ## 5. Concrete Multi-Way Execution Witnesses & Negative/Divergence Canaries -/
 
@@ -1681,8 +1724,8 @@ theorem wideSliceFromRawPartsMetadataRoundTrip_three_way :
           ({ retAlloc := m.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB))
              stackDepths := m.threads.map (·.stack.length) } : TBRetOutcome)) =
       tbRetU32 46 := by
-  refine ⟨⟨_, runA_sound wideRawPartsMir 40 _ _ _ rfl⟩,
-    runA_noUB wideRawPartsMir 40 _ _ _ rfl,
+  refine ⟨runA_exists_mem_sound wideRawPartsMir 40 _ _ _ (by kernel_rfl),
+    runA_isSome_noUB wideRawPartsMir 40 _ (by decide +kernel),
     by decide +kernel,
     by decide +kernel⟩
 
@@ -1855,11 +1898,11 @@ theorem wideSliceIndexReadWriteAndOobUb_three_way :
     (∃ tr u, Reaches (mirTree wideSliceIdxOobMir wideSliceIdxOobS0) tr u ∧ FaultNow u) ∧
     stopAfterM wideSliceIdxOobMInit 10 = some (.ub "access to out-of-bounds index") ∧
     stopAfterTB wideSliceIdxOobTBInit 10 = some (.ub "access to out-of-bounds index") := by
-  refine ⟨⟨_, runA_sound wideSliceIdxReadWriteMir 40 _ _ _ rfl⟩,
-    runA_noUB wideSliceIdxReadWriteMir 40 _ _ _ rfl,
+  refine ⟨runA_exists_mem_sound wideSliceIdxReadWriteMir 40 _ _ _ (by kernel_rfl),
+    runA_isSome_noUB wideSliceIdxReadWriteMir 40 _ (by decide +kernel),
     by decide +kernel,
     by decide +kernel,
-    faultsA_sound wideSliceIdxOobMir 30 _ rfl,
+    faultsA_sound wideSliceIdxOobMir 30 _ (by decide +kernel),
     by decide +kernel,
     by decide +kernel⟩
 
@@ -1984,10 +2027,10 @@ theorem wideSliceTreeBorrowsDisabledVsMetadataOk_three_way :
       (.normal (.scalar ⟨4, 4⟩, mem))) ∧
     MirNoUBTree
       (mirTree wideSliceMetadataAfterParentWriteMir wideSliceMetadataAfterParentWriteS0) := by
-  refine ⟨faultsA_sound wideSliceDisabledDerefUbMir 30 _ rfl,
+  refine ⟨faultsA_sound wideSliceDisabledDerefUbMir 30 _ (by decide +kernel),
     by decide +kernel,
-    ⟨_, runA_sound wideSliceMetadataAfterParentWriteMir 30 _ _ _ rfl⟩,
-    runA_noUB wideSliceMetadataAfterParentWriteMir 30 _ _ _ rfl⟩
+    runA_exists_mem_sound wideSliceMetadataAfterParentWriteMir 30 _ _ _ (by kernel_rfl),
+    runA_isSome_noUB wideSliceMetadataAfterParentWriteMir 30 _ (by decide +kernel)⟩
 
 /-- **Witness 4 (`wideSliceSizeAndAlignOfVal_u32_str_empty_zst_witnesses`)**:
 Concrete ground-truth agreement between Anneal (`mirTree` returning `(size_of_val + align_of_val) as u32`)
@@ -2159,10 +2202,10 @@ theorem wideSliceSizeAndAlignOfVal_u32_str_empty_zst_witnesses :
     computeSize wideRawPartsMInit (.Slice ⟨0⟩ ⟨1⟩) (some (.ElementCount 1000)) = .ok ⟨0⟩ ∧
     computeAlign wideRawPartsMInit (.Slice ⟨0⟩ ⟨1⟩) (some (.ElementCount 1000)) = .ok ⟨1⟩ := by
   intro u32SlMir emptySlMir zstSlMir strMir
-  exact ⟨⟨_, runA_sound u32SlMir 16 _ _ _ rfl⟩, rfl, rfl,
-    ⟨_, runA_sound strMir 16 _ _ _ rfl⟩, rfl, rfl,
-    ⟨_, runA_sound emptySlMir 16 _ _ _ rfl⟩, rfl, rfl,
-    ⟨_, runA_sound zstSlMir 16 _ _ _ rfl⟩, rfl, rfl⟩
+  exact ⟨runA_exists_mem_sound u32SlMir 16 _ _ _ (by kernel_rfl), rfl, rfl,
+    runA_exists_mem_sound strMir 16 _ _ _ (by kernel_rfl), rfl, rfl,
+    runA_exists_mem_sound emptySlMir 16 _ _ _ (by kernel_rfl), rfl, rfl,
+    runA_exists_mem_sound zstSlMir 16 _ _ _ (by kernel_rfl), rfl, rfl⟩
 
 /-- **`checkPtr` symbolic agreement on provenance-free empty safe slice references (`&[T]`, `len = 0`)**:
 When `len = 0`, total byte size is `0 * elemSz = 0 ≤ isize::MAX`, so for any non-null aligned
@@ -2596,10 +2639,10 @@ theorem wideSliceParentWrite_aliasingDivergence_and_metadata_three_way :
           ({ retAlloc := m.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB))
              stackDepths := m.threads.map (·.stack.length) } : TBRetOutcome)) =
       tbRetU32 4 := by
-  refine ⟨faultsA_sound wideSliceDisabledDerefUbMir 30 _ rfl,
+  refine ⟨faultsA_sound wideSliceDisabledDerefUbMir 30 _ (by decide +kernel),
     by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
-    ⟨_, runA_sound wideSliceMetadataAfterParentWriteMir 30 _ _ _ rfl⟩,
-    runA_noUB wideSliceMetadataAfterParentWriteMir 30 _ _ _ rfl,
+    runA_exists_mem_sound wideSliceMetadataAfterParentWriteMir 30 _ _ _ (by kernel_rfl),
+    runA_isSome_noUB wideSliceMetadataAfterParentWriteMir 30 _ (by decide +kernel),
     by decide +kernel, by decide +kernel⟩
 
 /-! ## 7. Relational Pointer Correspondence (`WideSliceThinPtrRel`, `WideSliceValRel`) & `translateStatement` Grounding

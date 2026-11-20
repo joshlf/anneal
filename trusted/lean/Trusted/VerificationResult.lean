@@ -736,6 +736,7 @@ Validate an untyped interior field `Value` when neither `adtArgs` nor
 @[reducible, simp]
 def valueMatchesUntypedField : Nat → Value → Prop
   | 0, _ => False
+  | _ + 1, .uninit => False
   | _ + 1, .unit => True
   | _ + 1, .scalar sv =>
     0 < sv.sizeBytes ∧ sv.bits < 2 ^ (sv.sizeBytes * 8)
@@ -894,6 +895,7 @@ def valueMatchesLayoutOnly :
     Nat → CapturedMir → Option TypeLayout → LayoutIdx → Value → Memory → Prop
   | 0, _, _, _, _, _ => False
   | _ + 1, _, .none, _, _, _ => False
+  | _ + 1, _, .some _, _, .uninit, _ => False
   | _ + 1, _, .some layout, _, .unit, _ =>
     layout.isUninhabited = false ∧
       sigIsParamPlaceholder layout = false ∧
@@ -1129,6 +1131,7 @@ def valueMatchesRigidTyAndLayout :
   | fuel' + 1, _, kind, .none, _, val, _ =>
     sigWorklistHasTypeParam 8 (kind :: .nil) = false ∧
       valueMatchesUntypedField fuel' val
+  | _ + 1, _, _, .some _, _, .uninit, _ => False
   | _ + 1, body, kind, .some layout, layoutIdx, .unit, _ =>
     layout.isUninhabited = false ∧
       sigIsParamPlaceholder layout = false ∧
@@ -2374,17 +2377,18 @@ def valueValidForRigidTy :
           | true => False
           | false =>
             match Nat.beq layout.size.bytes 0, v with
+            | _, .uninit => False
             | false, .unit => False
-            | _, _ => True
-        | .none => True
-      | .none => True
-  | _ + 1, _, _, .param _ _, _ => True
-  | _ + 1, _, _, .alias _ _, _ => True
-  | _ + 1, _, _, .slice _, _ => True
-  | _ + 1, _, _, .str, _ => True
-  | _ + 1, _, _, .dynamic _, _ => True
-  | _ + 1, _, _, .foreign _, _ => True
-  | _ + 1, _, _, .other _, _ => True
+            | _, _ => valueContainsUninit v = false
+        | .none => valueContainsUninit v = false
+      | .none => valueContainsUninit v = false
+  | _ + 1, _, _, .param _ _, v => valueContainsUninit v = false
+  | _ + 1, _, _, .alias _ _, v => valueContainsUninit v = false
+  | _ + 1, _, _, .slice _, v => valueContainsUninit v = false
+  | _ + 1, _, _, .str, v => valueContainsUninit v = false
+  | _ + 1, _, _, .dynamic _, v => valueContainsUninit v = false
+  | _ + 1, _, _, .foreign _, v => valueContainsUninit v = false
+  | _ + 1, _, _, .other _, v => valueContainsUninit v = false
 
 /--
 Well-typed runtime `Value` validity predicate against a captured MIR `Ty` and

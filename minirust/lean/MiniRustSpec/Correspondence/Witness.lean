@@ -8,6 +8,7 @@ This file may not be copied, modified, or distributed except according to
 those terms.
 -/
 
+import Lean
 import MiniRustSpec.Correspondence.Run
 import MiniRustSpec.Correspondence.DeinitWindow
 
@@ -257,6 +258,20 @@ open MiniRustSpec.LibSpecr
 open MiniRustSpec.Interp
 open MiniRustSpec.Correspondence
 
+local elab "kernel_rfl" : tactic => do
+  let mvarId ← Lean.Elab.Tactic.getMainGoal
+  let tgt ← Lean.MVarId.getType' mvarId
+  let some (ty, lhs, _) := tgt.eq? | Lean.Meta.throwTacticEx `kernel_rfl mvarId "expected equality goal"
+  let u ← Lean.Meta.getLevel ty
+  mvarId.assign (Lean.mkApp2 (Lean.mkConst ``Eq.refl [u]) ty lhs)
+  Lean.Elab.Tactic.replaceMainGoal []
+
+private theorem runA_isSome_noUB (body : CapturedMir) (fuel : Nat) (s : MachineState)
+    (h : (runA body fuel s).isSome = true) : MirNoUBTree (mirTree body s) := by
+  cases hr : runA body fuel s with
+  | none => rw [hr] at h; cases h
+  | some p => exact runA_noUB body fuel s p.1 p.2 hr
+
 /-! ## MIR building blocks -/
 
 def u32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
@@ -424,7 +439,7 @@ def sumTo : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem sumTo_inFragment : inFragment sumTo = true := by decide
+theorem sumTo_inFragment : inFragment sumTo = true := by decide +kernel
 
 def u32 : Gen.IntType := ⟨.Unsigned, ⟨4⟩⟩
 
@@ -542,7 +557,7 @@ theorem sumTo_init_step : Interp.step sumToMInit = .ok sumToM0 := rfl
 relation into the relation at `bb0` (`step_start`). -/
 theorem sumTo_rel : StateRel sumTo sumToFn ctx0 sumToS0 sumToM0 := by
   obtain ⟨m0, hm0, hrel⟩ := step_start sumTo_inFragment sumTo_translate
-    (initMachineState_startRel sumTo_inFragment ctx0 (ctx0_ok2 rfl) [.scalar ⟨3, 4⟩] (by decide)
+    (initMachineState_startRel sumTo_inFragment ctx0 (ctx0_ok2 rfl) [.scalar ⟨3, 4⟩] (by decide +kernel)
       sumToMInit rfl rfl rfl)
   have h : Interp.steps (initLen sumTo) sumToMInit = .ok sumToM0 := rfl
   rw [h] at hm0
@@ -557,11 +572,11 @@ def sumToTrace : List (Event MirEffect) :=
 /-- Anneal's semantics of `sum_to(3)` returns `6` (computed by the kernel). -/
 theorem sumTo_anneal_ret :
     ReachesRet (mirTree sumTo sumToS0) sumToTrace (.normal (.scalar ⟨6, 4⟩, sumToS0.memory)) :=
-  runA_sound sumTo 20 _ _ _ rfl
+  runA_sound sumTo 20 _ _ _ (by kernel_rfl)
 
 /-- Anneal's interaction tree for `sum_to(3)` is UB-free (`MirNoUBTree`). -/
 theorem sumTo_noUB : MirNoUBTree (mirCallTree sumTo [.scalar ⟨3, 4⟩]) :=
-  runA_noUB sumTo 20 _ _ _ rfl
+  runA_isSome_noUB sumTo 20 _ (by kernel_rfl)
 
 /-- Therefore MiniRust, started from the related machine, performs a return
 whose return place holds the little-endian bytes of `6u32`. -/
@@ -595,7 +610,7 @@ theorem sumTo_minirust_ret_from_start :
       m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret sumTo_inFragment sumTo_translate ctx0 (ctx0_ok2 rfl) [.scalar ⟨3, 4⟩]
-      (by decide) sumToMInit rfl rfl rfl sumTo_anneal_ret
+      (by decide +kernel) sumToMInit rfl rfl rfl sumTo_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [sumTo] at hd; subst hd
   simp [retPtr, ctx0] at hp
@@ -625,7 +640,7 @@ def retUninit : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem retUninit_inFragment : inFragment retUninit = true := by decide
+theorem retUninit_inFragment : inFragment retUninit = true := by decide +kernel
 
 def retUninitFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32)]⟩
@@ -646,7 +661,7 @@ def retUninitMInit : Mach := machine retUninit retUninitFn retUninitS0.frame.loc
 
 theorem retUninit_rel : StateRel retUninit retUninitFn ctx0 retUninitS0 retUninitM0 := by
   obtain ⟨m0, hm0, hrel⟩ := step_start retUninit_inFragment retUninit_translate
-    (initMachineState_startRel retUninit_inFragment ctx0 (ctx0_ok1 rfl) [] (by decide)
+    (initMachineState_startRel retUninit_inFragment ctx0 (ctx0_ok1 rfl) [] (by decide +kernel)
       retUninitMInit rfl rfl rfl)
   have h : Interp.steps (initLen retUninit) retUninitMInit = .ok retUninitM0 := rfl
   rw [h] at hm0
@@ -655,7 +670,7 @@ theorem retUninit_rel : StateRel retUninit retUninitFn ctx0 retUninitS0 retUnini
 
 /-- Anneal's semantics of `ret_uninit()` faults (computed by the kernel). -/
 theorem retUninit_anneal_ub : ∃ tr u, Reaches (mirTree retUninit retUninitS0) tr u ∧ FaultNow u :=
-  faultsA_sound retUninit 1 _ (by decide)
+  faultsA_sound retUninit 1 _ (by decide +kernel)
 
 /-- Therefore MiniRust raises UB. -/
 theorem retUninit_minirust_ub : ∃ (n : Nat) (msg : String), Interp.steps n retUninitM0 = .error (.ub msg) := by
@@ -673,7 +688,7 @@ theorem retUninit_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n retUninitMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := retUninit_anneal_ub
   exact mirCall_ub retUninit_inFragment retUninit_translate ctx0 (ctx0_ok1 rfl) []
-    (by decide) retUninitMInit rfl rfl rfl hr hf
+    (by decide +kernel) retUninitMInit rfl rfl rfl hr hf
 
 /-! ## `PlaceMention`, `UnaryOp(Neg)`, and `Unreachable` -/
 
@@ -698,7 +713,7 @@ def negMention : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem negMention_inFragment : inFragment negMention = true := by decide
+theorem negMention_inFragment : inFragment negMention = true := by decide +kernel
 
 def negMentionFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32)]⟩
@@ -724,7 +739,7 @@ def negMention5MInit : Mach := machine negMention negMentionFn negMention5S0.fra
 theorem negMention5_startRel :
     StartRel negMention negMentionFn ctx0 negMention5S0 negMention5MInit :=
   initMachineState_startRel negMention_inFragment ctx0 (ctx0_ok2 rfl) [.scalar ⟨5, 4⟩]
-    (by decide) negMention5MInit rfl rfl rfl
+    (by decide +kernel) negMention5MInit rfl rfl rfl
 
 def negMention5Trace : List (Event MirEffect) :=
   [⟨.inr (.inl (.emit (.event 5))), PUnit.unit⟩]
@@ -732,7 +747,7 @@ def negMention5Trace : List (Event MirEffect) :=
 theorem negMention5_anneal_ret :
     ReachesRet (mirTree negMention negMention5S0) negMention5Trace
       (.normal (.scalar ⟨4294967291, 4⟩, negMention5S0.memory)) :=
-  runA_sound negMention 10 _ _ _ rfl
+  runA_sound negMention 10 _ _ _ (by kernel_rfl)
 
 theorem negMention5_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n negMention5MInit = .ok m' ∧
@@ -761,11 +776,11 @@ def negMention0MInit : Mach := machine negMention negMentionFn negMention0S0.fra
 theorem negMention0_startRel :
     StartRel negMention negMentionFn ctx0 negMention0S0 negMention0MInit :=
   initMachineState_startRel negMention_inFragment ctx0 (ctx0_ok2 rfl) [.scalar ⟨0, 4⟩]
-    (by decide) negMention0MInit rfl rfl rfl
+    (by decide +kernel) negMention0MInit rfl rfl rfl
 
 theorem negMention0_anneal_ub :
     ∃ tr u, Reaches (mirTree negMention negMention0S0) tr u ∧ FaultNow u :=
-  faultsA_sound negMention 10 _ (by decide)
+  faultsA_sound negMention 10 _ (by decide +kernel)
 
 theorem negMention0_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n negMention0MInit = .error (.ub msg) := by
@@ -858,7 +873,7 @@ def signedEdge : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem signedEdge_inFragment : inFragment signedEdge = true := by decide
+theorem signedEdge_inFragment : inFragment signedEdge = true := by decide +kernel
 
 def signedEdgeFn : Gen.Function where
   locals := ⟨[(localName 0, .Int i8), (localName 1, .Int i8)]⟩
@@ -898,10 +913,10 @@ def signedEdgeMinTrace : List (Event MirEffect) :=
 theorem signedEdgeMin_anneal_ret :
     ReachesRet (mirCallTree signedEdge [.scalar ⟨128, 1⟩]) signedEdgeMinTrace
       (.normal (.scalar ⟨127, 1⟩, signedEdgeMinS0.memory)) :=
-  runA_sound signedEdge 10 _ _ _ rfl
+  runA_sound signedEdge 10 _ _ _ (by kernel_rfl)
 
 theorem signedEdgeMin_noUB : MirNoUBTree (mirCallTree signedEdge [.scalar ⟨128, 1⟩]) :=
-  runA_noUB signedEdge 10 _ _ _ rfl
+  runA_isSome_noUB signedEdge 10 _ (by kernel_rfl)
 
 theorem signedEdgeMin_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n signedEdgeMinMInit = .ok m' ∧
@@ -909,7 +924,7 @@ theorem signedEdgeMin_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret signedEdge_inFragment signedEdge_translate ctxI8 (ctxI8_ok2 rfl)
-      [.scalar ⟨128, 1⟩] (by decide) signedEdgeMinMInit rfl rfl rfl signedEdgeMin_anneal_ret
+      [.scalar ⟨128, 1⟩] (by decide +kernel) signedEdgeMinMInit rfl rfl rfl signedEdgeMin_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [signedEdge] at hd; subst hd
   simp [retPtr, ctxI8] at hp
@@ -928,7 +943,7 @@ theorem signedEdgeMin_minirust_noUB {n : Nat} {e : Stop}
       ReturnRel signedEdge ctxI8 s' v mRet ∧
       ReachesRet (mirCallTree signedEdge [.scalar ⟨128, 1⟩]) tr (.normal (v, mem)) :=
   mirCall_noUB signedEdge_inFragment signedEdge_translate ctxI8 (ctxI8_ok2 rfl)
-    [.scalar ⟨128, 1⟩] (by decide) signedEdgeMinMInit rfl rfl rfl signedEdgeMin_noUB herr
+    [.scalar ⟨128, 1⟩] (by decide +kernel) signedEdgeMinMInit rfl rfl rfl signedEdgeMin_noUB herr
 
 theorem signedEdgeMin_minirust_direct :
     (Interp.steps 5 signedEdgeMinMInit).toOption.map
@@ -947,7 +962,7 @@ def signedEdgeOneTrace : List (Event MirEffect) :=
 theorem signedEdgeOne_anneal_ret :
     ReachesRet (mirCallTree signedEdge [.scalar ⟨1, 1⟩]) signedEdgeOneTrace
       (.normal (.scalar ⟨2, 1⟩, signedEdgeOneS0.memory)) :=
-  runA_sound signedEdge 10 _ _ _ rfl
+  runA_sound signedEdge 10 _ _ _ (by kernel_rfl)
 
 theorem signedEdgeOne_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n signedEdgeOneMInit = .ok m' ∧
@@ -955,7 +970,7 @@ theorem signedEdgeOne_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret signedEdge_inFragment signedEdge_translate ctxI8 (ctxI8_ok2 rfl)
-      [.scalar ⟨1, 1⟩] (by decide) signedEdgeOneMInit rfl rfl rfl signedEdgeOne_anneal_ret
+      [.scalar ⟨1, 1⟩] (by decide +kernel) signedEdgeOneMInit rfl rfl rfl signedEdgeOne_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [signedEdge] at hd; subst hd
   simp [retPtr, ctxI8] at hp
@@ -1028,7 +1043,7 @@ def castBitNot : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem castBitNot_inFragment : inFragment castBitNot = true := by decide
+theorem castBitNot_inFragment : inFragment castBitNot = true := by decide +kernel
 
 def castBitNotFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int i8)]⟩
@@ -1061,10 +1076,10 @@ def castBitNot4Trace : List (Event MirEffect) :=
 theorem castBitNot4_anneal_ret :
     ReachesRet (mirCallTree castBitNot [.scalar ⟨4, 1⟩]) castBitNot4Trace
       (.normal (.scalar ⟨4, 4⟩, castBitNot4S0.memory)) :=
-  runA_sound castBitNot 10 _ _ _ rfl
+  runA_sound castBitNot 10 _ _ _ (by kernel_rfl)
 
 theorem castBitNot4_noUB : MirNoUBTree (mirCallTree castBitNot [.scalar ⟨4, 1⟩]) :=
-  runA_noUB castBitNot 10 _ _ _ rfl
+  runA_isSome_noUB castBitNot 10 _ (by kernel_rfl)
 
 theorem castBitNot4_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n castBitNot4MInit = .ok m' ∧
@@ -1072,7 +1087,7 @@ theorem castBitNot4_minirust_ret_from_start :
       m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret castBitNot_inFragment castBitNot_translate ctx0 (ctx0_ok_u32_i8 rfl)
-      [.scalar ⟨4, 1⟩] (by decide) castBitNot4MInit rfl rfl rfl castBitNot4_anneal_ret
+      [.scalar ⟨4, 1⟩] (by decide +kernel) castBitNot4MInit rfl rfl rfl castBitNot4_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [castBitNot] at hd; subst hd
   simp [retPtr, ctx0] at hp
@@ -1101,7 +1116,7 @@ def spinLoop : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem spinLoop_inFragment : inFragment spinLoop = true := by decide
+theorem spinLoop_inFragment : inFragment spinLoop = true := by decide +kernel
 
 def spinLoopFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32)]⟩
@@ -1136,7 +1151,7 @@ theorem spinLoop_diverges (tr : List (Event MirEffect)) (o : MirOutcome) :
 theorem spinLoop_minirust_steps_ok (n : Nat) :
     ∃ m', Interp.steps n spinLoopMInit = .ok m' :=
   mirCall_diverges_steps_ok spinLoop_inFragment spinLoop_translate ctx0 (ctx0_ok1 rfl) []
-    (by decide) spinLoopMInit rfl rfl rfl spinLoop_noUB spinLoop_diverges n
+    (by decide +kernel) spinLoopMInit rfl rfl rfl spinLoop_noUB spinLoop_diverges n
 
 /-- Stronger lockstep divergence witness via `mirCall_diverges_rel`: for every
 `n : Nat`, `initLen spinLoop + n` MiniRust steps from `f.start` stay in `StateRel` with an
@@ -1146,7 +1161,7 @@ theorem spinLoop_minirust_diverges_rel (n : Nat) :
       StateRel spinLoop spinLoopFn ctx0 s' m' ∧
       Reaches (mirCallTree spinLoop []) tr (mirTree spinLoop s') :=
   mirCall_diverges_rel spinLoop_inFragment spinLoop_translate ctx0 (ctx0_ok1 rfl) []
-    (by decide) spinLoopMInit rfl rfl rfl spinLoop_noUB spinLoop_diverges n
+    (by decide +kernel) spinLoopMInit rfl rfl rfl spinLoop_noUB spinLoop_diverges n
 
 /-! ## Signed `Div` and `Rem` (truncation toward zero and all 4 UB conditions) -/
 
@@ -1200,7 +1215,7 @@ def divRemI8 : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem divRemI8_inFragment : inFragment divRemI8 = true := by decide
+theorem divRemI8_inFragment : inFragment divRemI8 = true := by decide +kernel
 
 def divRemI8Fn : Gen.Function where
   locals := ⟨[(localName 0, .Int i8), (localName 1, .Int i8), (localName 2, .Int i8)]⟩
@@ -1236,10 +1251,10 @@ def divRemNeg7Trace : List (Event MirEffect) :=
 theorem divRemNeg7_anneal_ret :
     ReachesRet (mirCallTree divRemI8 [.scalar ⟨249, 1⟩, .scalar ⟨3, 1⟩]) divRemNeg7Trace
       (.normal (.scalar ⟨255, 1⟩, divRemNeg7S0.memory)) :=
-  runA_sound divRemI8 10 _ _ _ rfl
+  runA_sound divRemI8 10 _ _ _ (by kernel_rfl)
 
 theorem divRemNeg7_noUB : MirNoUBTree (mirCallTree divRemI8 [.scalar ⟨249, 1⟩, .scalar ⟨3, 1⟩]) :=
-  runA_noUB divRemI8 10 _ _ _ rfl
+  runA_isSome_noUB divRemI8 10 _ (by kernel_rfl)
 
 theorem divRemNeg7_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n divRemNeg7MInit = .ok m' ∧
@@ -1247,7 +1262,7 @@ theorem divRemNeg7_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8_3 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret divRemI8_inFragment divRemI8_translate ctxI8_3 (ctxI8_ok3 rfl)
-      [.scalar ⟨249, 1⟩, .scalar ⟨3, 1⟩] (by decide) divRemNeg7MInit rfl rfl rfl divRemNeg7_anneal_ret
+      [.scalar ⟨249, 1⟩, .scalar ⟨3, 1⟩] (by decide +kernel) divRemNeg7MInit rfl rfl rfl divRemNeg7_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [divRemI8] at hd; subst hd
   simp [retPtr, ctxI8_3] at hp
@@ -1273,7 +1288,7 @@ def divRemMinOneTrace : List (Event MirEffect) :=
 theorem divRemMinOne_anneal_ret :
     ReachesRet (mirCallTree divRemI8 [.scalar ⟨128, 1⟩, .scalar ⟨1, 1⟩]) divRemMinOneTrace
       (.normal (.scalar ⟨128, 1⟩, divRemMinOneS0.memory)) :=
-  runA_sound divRemI8 10 _ _ _ rfl
+  runA_sound divRemI8 10 _ _ _ (by kernel_rfl)
 
 theorem divRemMinOne_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n divRemMinOneMInit = .ok m' ∧
@@ -1281,7 +1296,7 @@ theorem divRemMinOne_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8_3 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret divRemI8_inFragment divRemI8_translate ctxI8_3 (ctxI8_ok3 rfl)
-      [.scalar ⟨128, 1⟩, .scalar ⟨1, 1⟩] (by decide) divRemMinOneMInit rfl rfl rfl divRemMinOne_anneal_ret
+      [.scalar ⟨128, 1⟩, .scalar ⟨1, 1⟩] (by decide +kernel) divRemMinOneMInit rfl rfl rfl divRemMinOne_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [divRemI8] at hd; subst hd
   simp [retPtr, ctxI8_3] at hp
@@ -1304,13 +1319,13 @@ def divByZeroMInit : Mach :=
 
 theorem divByZero_anneal_ub :
     ∃ tr u, Reaches (mirCallTree divRemI8 [.scalar ⟨249, 1⟩, .scalar ⟨0, 1⟩]) tr u ∧ FaultNow u :=
-  faultsA_sound divRemI8 5 _ (by decide)
+  faultsA_sound divRemI8 5 _ (by decide +kernel)
 
 theorem divByZero_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n divByZeroMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := divByZero_anneal_ub
   exact mirCall_ub divRemI8_inFragment divRemI8_translate ctxI8_3 (ctxI8_ok3 rfl)
-    [.scalar ⟨249, 1⟩, .scalar ⟨0, 1⟩] (by decide) divByZeroMInit rfl rfl rfl hr hf
+    [.scalar ⟨249, 1⟩, .scalar ⟨0, 1⟩] (by decide +kernel) divByZeroMInit rfl rfl rfl hr hf
 
 theorem divByZero_minirust_direct :
     Interp.steps 2 divByZeroMInit = .error (.ub "division by zero") := rfl
@@ -1325,7 +1340,7 @@ theorem divByZero_converse_error :
       ReturnRel divRemI8 ctxI8_3 s' v mRet ∧
       ReachesRet (mirCallTree divRemI8 [.scalar ⟨249, 1⟩, .scalar ⟨0, 1⟩]) tr (.normal (v, mem))) :=
   mirCall_steps_error divRemI8_inFragment divRemI8_translate ctxI8_3 (ctxI8_ok3 rfl)
-    [.scalar ⟨249, 1⟩, .scalar ⟨0, 1⟩] (by decide) divByZeroMInit rfl rfl rfl
+    [.scalar ⟨249, 1⟩, .scalar ⟨0, 1⟩] (by decide +kernel) divByZeroMInit rfl rfl rfl
     divByZero_minirust_direct
 
 /-- Signed division overflow UB (`i8::MIN / -1`, bits `128` and `255`). -/
@@ -1335,13 +1350,13 @@ def divMinNeg1MInit : Mach :=
 
 theorem divMinNeg1_anneal_ub :
     ∃ tr u, Reaches (mirCallTree divRemI8 [.scalar ⟨128, 1⟩, .scalar ⟨255, 1⟩]) tr u ∧ FaultNow u :=
-  faultsA_sound divRemI8 5 _ (by decide)
+  faultsA_sound divRemI8 5 _ (by decide +kernel)
 
 theorem divMinNeg1_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n divMinNeg1MInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := divMinNeg1_anneal_ub
   exact mirCall_ub divRemI8_inFragment divRemI8_translate ctxI8_3 (ctxI8_ok3 rfl)
-    [.scalar ⟨128, 1⟩, .scalar ⟨255, 1⟩] (by decide) divMinNeg1MInit rfl rfl rfl hr hf
+    [.scalar ⟨128, 1⟩, .scalar ⟨255, 1⟩] (by decide +kernel) divMinNeg1MInit rfl rfl rfl hr hf
 
 theorem divMinNeg1_minirust_direct :
     Interp.steps 2 divMinNeg1MInit = .error (.ub "overflow in division") := rfl
@@ -1362,7 +1377,7 @@ def remOnlyI8 : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem remOnlyI8_inFragment : inFragment remOnlyI8 = true := by decide
+theorem remOnlyI8_inFragment : inFragment remOnlyI8 = true := by decide +kernel
 
 def remOnlyI8Fn : Gen.Function where
   locals := ⟨[(localName 0, .Int i8), (localName 1, .Int i8), (localName 2, .Int i8)]⟩
@@ -1386,13 +1401,13 @@ def remByZeroMInit : Mach :=
 
 theorem remByZero_anneal_ub :
     ∃ tr u, Reaches (mirCallTree remOnlyI8 [.scalar ⟨249, 1⟩, .scalar ⟨0, 1⟩]) tr u ∧ FaultNow u :=
-  faultsA_sound remOnlyI8 5 _ (by decide)
+  faultsA_sound remOnlyI8 5 _ (by decide +kernel)
 
 theorem remByZero_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n remByZeroMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := remByZero_anneal_ub
   exact mirCall_ub remOnlyI8_inFragment remOnlyI8_translate ctxI8_3 (ctxI8_ok3 rfl)
-    [.scalar ⟨249, 1⟩, .scalar ⟨0, 1⟩] (by decide) remByZeroMInit rfl rfl rfl hr hf
+    [.scalar ⟨249, 1⟩, .scalar ⟨0, 1⟩] (by decide +kernel) remByZeroMInit rfl rfl rfl hr hf
 
 theorem remByZero_minirust_direct :
     Interp.steps 2 remByZeroMInit = .error (.ub "modulus of remainder is zero") := rfl
@@ -1403,13 +1418,13 @@ def remMinNeg1MInit : Mach :=
 
 theorem remMinNeg1_anneal_ub :
     ∃ tr u, Reaches (mirCallTree remOnlyI8 [.scalar ⟨128, 1⟩, .scalar ⟨255, 1⟩]) tr u ∧ FaultNow u :=
-  faultsA_sound remOnlyI8 5 _ (by decide)
+  faultsA_sound remOnlyI8 5 _ (by decide +kernel)
 
 theorem remMinNeg1_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n remMinNeg1MInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := remMinNeg1_anneal_ub
   exact mirCall_ub remOnlyI8_inFragment remOnlyI8_translate ctxI8_3 (ctxI8_ok3 rfl)
-    [.scalar ⟨128, 1⟩, .scalar ⟨255, 1⟩] (by decide) remMinNeg1MInit rfl rfl rfl hr hf
+    [.scalar ⟨128, 1⟩, .scalar ⟨255, 1⟩] (by decide +kernel) remMinNeg1MInit rfl rfl rfl hr hf
 
 theorem remMinNeg1_minirust_direct :
     Interp.steps 2 remMinNeg1MInit = .error (.ub "overflow in remainder") := rfl
@@ -1442,7 +1457,7 @@ def uncheckedArithI8 : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem uncheckedArithI8_inFragment : inFragment uncheckedArithI8 = true := by decide
+theorem uncheckedArithI8_inFragment : inFragment uncheckedArithI8 = true := by decide +kernel
 
 def uncheckedArithI8Fn : Gen.Function where
   locals := ⟨[(localName 0, .Int i8), (localName 1, .Int i8), (localName 2, .Int i8)]⟩
@@ -1473,11 +1488,11 @@ def uncheckedOkMInit : Mach :=
 theorem uncheckedOk_anneal_ret :
     ReachesRet (mirCallTree uncheckedArithI8 [.scalar ⟨64, 1⟩, .scalar ⟨254, 1⟩]) []
       (.normal (.scalar ⟨1, 1⟩, uncheckedOkS0.memory)) :=
-  runA_sound uncheckedArithI8 10 _ _ _ rfl
+  runA_sound uncheckedArithI8 10 _ _ _ (by kernel_rfl)
 
 theorem uncheckedOk_noUB :
     MirNoUBTree (mirCallTree uncheckedArithI8 [.scalar ⟨64, 1⟩, .scalar ⟨254, 1⟩]) :=
-  runA_noUB uncheckedArithI8 10 _ _ _ rfl
+  runA_isSome_noUB uncheckedArithI8 10 _ (by kernel_rfl)
 
 theorem uncheckedOk_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n uncheckedOkMInit = .ok m' ∧
@@ -1485,7 +1500,7 @@ theorem uncheckedOk_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8_3 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret uncheckedArithI8_inFragment uncheckedArithI8_translate ctxI8_3 (ctxI8_ok3 rfl)
-      [.scalar ⟨64, 1⟩, .scalar ⟨254, 1⟩] (by decide) uncheckedOkMInit rfl rfl rfl uncheckedOk_anneal_ret
+      [.scalar ⟨64, 1⟩, .scalar ⟨254, 1⟩] (by decide +kernel) uncheckedOkMInit rfl rfl rfl uncheckedOk_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [uncheckedArithI8] at hd; subst hd
   simp [retPtr, ctxI8_3] at hp
@@ -1507,13 +1522,13 @@ def uncheckedMulUbMInit : Mach :=
 
 theorem uncheckedMulUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTree uncheckedArithI8 [.scalar ⟨192, 1⟩, .scalar ⟨254, 1⟩]) tr u ∧ FaultNow u :=
-  faultsA_sound uncheckedArithI8 5 _ (by decide)
+  faultsA_sound uncheckedArithI8 5 _ (by decide +kernel)
 
 theorem uncheckedMulUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n uncheckedMulUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := uncheckedMulUb_anneal_ub
   exact mirCall_ub uncheckedArithI8_inFragment uncheckedArithI8_translate ctxI8_3 (ctxI8_ok3 rfl)
-    [.scalar ⟨192, 1⟩, .scalar ⟨254, 1⟩] (by decide) uncheckedMulUbMInit rfl rfl rfl hr hf
+    [.scalar ⟨192, 1⟩, .scalar ⟨254, 1⟩] (by decide +kernel) uncheckedMulUbMInit rfl rfl rfl hr hf
 
 theorem uncheckedMulUb_minirust_direct :
     Interp.steps 2 uncheckedMulUbMInit = .error (.ub "overflow in unchecked mul") := rfl
@@ -1526,13 +1541,13 @@ def uncheckedSubUbMInit : Mach :=
 
 theorem uncheckedSubUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTree uncheckedArithI8 [.scalar ⟨192, 1⟩, .scalar ⟨2, 1⟩]) tr u ∧ FaultNow u :=
-  faultsA_sound uncheckedArithI8 5 _ (by decide)
+  faultsA_sound uncheckedArithI8 5 _ (by decide +kernel)
 
 theorem uncheckedSubUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n uncheckedSubUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := uncheckedSubUb_anneal_ub
   exact mirCall_ub uncheckedArithI8_inFragment uncheckedArithI8_translate ctxI8_3 (ctxI8_ok3 rfl)
-    [.scalar ⟨192, 1⟩, .scalar ⟨2, 1⟩] (by decide) uncheckedSubUbMInit rfl rfl rfl hr hf
+    [.scalar ⟨192, 1⟩, .scalar ⟨2, 1⟩] (by decide +kernel) uncheckedSubUbMInit rfl rfl rfl hr hf
 
 theorem uncheckedSubUb_minirust_direct :
     Interp.steps 3 uncheckedSubUbMInit = .error (.ub "overflow in unchecked sub") := rfl
@@ -1545,13 +1560,13 @@ def uncheckedAddUbMInit : Mach :=
 
 theorem uncheckedAddUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTree uncheckedArithI8 [.scalar ⟨10, 1⟩, .scalar ⟨2, 1⟩]) tr u ∧ FaultNow u :=
-  faultsA_sound uncheckedArithI8 5 _ (by decide)
+  faultsA_sound uncheckedArithI8 5 _ (by decide +kernel)
 
 theorem uncheckedAddUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n uncheckedAddUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := uncheckedAddUb_anneal_ub
   exact mirCall_ub uncheckedArithI8_inFragment uncheckedArithI8_translate ctxI8_3 (ctxI8_ok3 rfl)
-    [.scalar ⟨10, 1⟩, .scalar ⟨2, 1⟩] (by decide) uncheckedAddUbMInit rfl rfl rfl hr hf
+    [.scalar ⟨10, 1⟩, .scalar ⟨2, 1⟩] (by decide +kernel) uncheckedAddUbMInit rfl rfl rfl hr hf
 
 theorem uncheckedAddUb_minirust_direct :
     Interp.steps 4 uncheckedAddUbMInit = .error (.ub "overflow in unchecked add") := rfl
@@ -1568,7 +1583,7 @@ theorem uncheckedAddUb_outcome (n : Nat) :
     (∃ msg, Interp.steps (initLen uncheckedArithI8 + n) uncheckedAddUbMInit = .error (.ub msg) ∧
       ∃ tr u, Reaches (mirCallTree uncheckedArithI8 [.scalar ⟨10, 1⟩, .scalar ⟨2, 1⟩]) tr u ∧ FaultNow u) :=
   mirCall_outcome uncheckedArithI8_inFragment uncheckedArithI8_translate ctxI8_3 (ctxI8_ok3 rfl)
-    [.scalar ⟨10, 1⟩, .scalar ⟨2, 1⟩] (by decide) uncheckedAddUbMInit rfl rfl rfl n
+    [.scalar ⟨10, 1⟩, .scalar ⟨2, 1⟩] (by decide +kernel) uncheckedAddUbMInit rfl rfl rfl n
 
 /-! ## Observable-step diverging loop (`branchSpinLoop`) -/
 
@@ -1599,7 +1614,7 @@ def branchSpinLoop : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem branchSpinLoop_inFragment : inFragment branchSpinLoop = true := by decide
+theorem branchSpinLoop_inFragment : inFragment branchSpinLoop = true := by decide +kernel
 
 def branchSpinLoopFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32)]⟩
@@ -1642,7 +1657,7 @@ theorem branchSpinLoop1_minirust_diverges_rel (n : Nat) :
       StateRel branchSpinLoop branchSpinLoopFn ctx0 s' m' ∧
       Reaches (mirCallTree branchSpinLoop [.scalar ⟨1, 4⟩]) tr (mirTree branchSpinLoop s') :=
   mirCall_diverges_rel branchSpinLoop_inFragment branchSpinLoop_translate ctx0 (ctx0_ok2 rfl)
-    [.scalar ⟨1, 4⟩] (by decide) branchSpinLoop1MInit rfl rfl rfl
+    [.scalar ⟨1, 4⟩] (by decide +kernel) branchSpinLoop1MInit rfl rfl rfl
     branchSpinLoop1_noUB branchSpinLoop1_diverges n
 
 /-! ## Wrapping and unchecked shifts (`Shl`, `Shr`, `ShlUnchecked`, `ShrUnchecked`) -/
@@ -1675,7 +1690,7 @@ def shiftI8 : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem shiftI8_inFragment : inFragment shiftI8 = true := by decide
+theorem shiftI8_inFragment : inFragment shiftI8 = true := by decide +kernel
 
 def shiftI8Fn : Gen.Function where
   locals := ⟨[(localName 0, .Int i8), (localName 1, .Int i8), (localName 2, .Int i8)]⟩
@@ -1711,11 +1726,11 @@ def shiftOkMInit : Mach :=
 theorem shiftOk_anneal_ret :
     ReachesRet (mirCallTree shiftI8 [.scalar ⟨192, 1⟩, .scalar ⟨3, 1⟩]) []
       (.normal (.scalar ⟨224, 1⟩, shiftOkS0.memory)) :=
-  runA_sound shiftI8 10 _ _ _ rfl
+  runA_sound shiftI8 10 _ _ _ (by kernel_rfl)
 
 theorem shiftOk_noUB :
     MirNoUBTree (mirCallTree shiftI8 [.scalar ⟨192, 1⟩, .scalar ⟨3, 1⟩]) :=
-  runA_noUB shiftI8 10 _ _ _ rfl
+  runA_isSome_noUB shiftI8 10 _ (by kernel_rfl)
 
 theorem shiftOk_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n shiftOkMInit = .ok m' ∧
@@ -1723,7 +1738,7 @@ theorem shiftOk_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8_3 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret shiftI8_inFragment shiftI8_translate ctxI8_3 (ctxI8_ok3 rfl)
-      [.scalar ⟨192, 1⟩, .scalar ⟨3, 1⟩] (by decide) shiftOkMInit rfl rfl rfl shiftOk_anneal_ret
+      [.scalar ⟨192, 1⟩, .scalar ⟨3, 1⟩] (by decide +kernel) shiftOkMInit rfl rfl rfl shiftOk_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [shiftI8] at hd; subst hd
   simp [retPtr, ctxI8_3] at hp
@@ -1745,13 +1760,13 @@ def shrUncheckedGe8UbMInit : Mach :=
 
 theorem shrUncheckedGe8Ub_anneal_ub :
     ∃ tr u, Reaches (mirCallTree shiftI8 [.scalar ⟨192, 1⟩, .scalar ⟨8, 1⟩]) tr u ∧ FaultNow u :=
-  faultsA_sound shiftI8 6 _ (by decide)
+  faultsA_sound shiftI8 6 _ (by decide +kernel)
 
 theorem shrUncheckedGe8Ub_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n shrUncheckedGe8UbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := shrUncheckedGe8Ub_anneal_ub
   exact mirCall_ub shiftI8_inFragment shiftI8_translate ctxI8_3 (ctxI8_ok3 rfl)
-    [.scalar ⟨192, 1⟩, .scalar ⟨8, 1⟩] (by decide) shrUncheckedGe8UbMInit rfl rfl rfl hr hf
+    [.scalar ⟨192, 1⟩, .scalar ⟨8, 1⟩] (by decide +kernel) shrUncheckedGe8UbMInit rfl rfl rfl hr hf
 
 theorem shrUncheckedGe8Ub_minirust_direct :
     Interp.steps 4 shrUncheckedGe8UbMInit = .error (.ub "overflow in unchecked shift") := rfl
@@ -1763,13 +1778,13 @@ def shrUncheckedNegUbMInit : Mach :=
 
 theorem shrUncheckedNegUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTree shiftI8 [.scalar ⟨192, 1⟩, .scalar ⟨255, 1⟩]) tr u ∧ FaultNow u :=
-  faultsA_sound shiftI8 6 _ (by decide)
+  faultsA_sound shiftI8 6 _ (by decide +kernel)
 
 theorem shrUncheckedNegUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n shrUncheckedNegUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := shrUncheckedNegUb_anneal_ub
   exact mirCall_ub shiftI8_inFragment shiftI8_translate ctxI8_3 (ctxI8_ok3 rfl)
-    [.scalar ⟨192, 1⟩, .scalar ⟨255, 1⟩] (by decide) shrUncheckedNegUbMInit rfl rfl rfl hr hf
+    [.scalar ⟨192, 1⟩, .scalar ⟨255, 1⟩] (by decide +kernel) shrUncheckedNegUbMInit rfl rfl rfl hr hf
 
 theorem shrUncheckedNegUb_minirust_direct :
     Interp.steps 4 shrUncheckedNegUbMInit = .error (.ub "overflow in unchecked shift") := rfl
@@ -1791,7 +1806,7 @@ def shlUncheckedI8 : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem shlUncheckedI8_inFragment : inFragment shlUncheckedI8 = true := by decide
+theorem shlUncheckedI8_inFragment : inFragment shlUncheckedI8 = true := by decide +kernel
 
 def shlUncheckedI8Fn : Gen.Function where
   locals := ⟨[(localName 0, .Int i8), (localName 1, .Int i8), (localName 2, .Int i8)]⟩
@@ -1815,13 +1830,13 @@ def shlUncheckedGe8UbMInit : Mach :=
 
 theorem shlUncheckedGe8Ub_anneal_ub :
     ∃ tr u, Reaches (mirCallTree shlUncheckedI8 [.scalar ⟨1, 1⟩, .scalar ⟨8, 1⟩]) tr u ∧ FaultNow u :=
-  faultsA_sound shlUncheckedI8 5 _ (by decide)
+  faultsA_sound shlUncheckedI8 5 _ (by decide +kernel)
 
 theorem shlUncheckedGe8Ub_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n shlUncheckedGe8UbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := shlUncheckedGe8Ub_anneal_ub
   exact mirCall_ub shlUncheckedI8_inFragment shlUncheckedI8_translate ctxI8_3 (ctxI8_ok3 rfl)
-    [.scalar ⟨1, 1⟩, .scalar ⟨8, 1⟩] (by decide) shlUncheckedGe8UbMInit rfl rfl rfl hr hf
+    [.scalar ⟨1, 1⟩, .scalar ⟨8, 1⟩] (by decide +kernel) shlUncheckedGe8UbMInit rfl rfl rfl hr hf
 
 theorem shlUncheckedGe8Ub_minirust_direct :
     Interp.steps 2 shlUncheckedGe8UbMInit = .error (.ub "overflow in unchecked shift") := rfl
@@ -1832,13 +1847,13 @@ def shlUncheckedNegUbMInit : Mach :=
 
 theorem shlUncheckedNegUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTree shlUncheckedI8 [.scalar ⟨1, 1⟩, .scalar ⟨255, 1⟩]) tr u ∧ FaultNow u :=
-  faultsA_sound shlUncheckedI8 5 _ (by decide)
+  faultsA_sound shlUncheckedI8 5 _ (by decide +kernel)
 
 theorem shlUncheckedNegUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n shlUncheckedNegUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := shlUncheckedNegUb_anneal_ub
   exact mirCall_ub shlUncheckedI8_inFragment shlUncheckedI8_translate ctxI8_3 (ctxI8_ok3 rfl)
-    [.scalar ⟨1, 1⟩, .scalar ⟨255, 1⟩] (by decide) shlUncheckedNegUbMInit rfl rfl rfl hr hf
+    [.scalar ⟨1, 1⟩, .scalar ⟨255, 1⟩] (by decide +kernel) shlUncheckedNegUbMInit rfl rfl rfl hr hf
 
 theorem shlUncheckedNegUb_minirust_direct :
     Interp.steps 2 shlUncheckedNegUbMInit = .error (.ub "overflow in unchecked shift") := rfl
@@ -1872,7 +1887,7 @@ def bitwiseI8 : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem bitwiseI8_inFragment : inFragment bitwiseI8 = true := by decide
+theorem bitwiseI8_inFragment : inFragment bitwiseI8 = true := by decide +kernel
 
 def bitwiseI8Fn : Gen.Function where
   locals := ⟨[(localName 0, .Int i8), (localName 1, .Int i8), (localName 2, .Int i8)]⟩
@@ -1906,11 +1921,11 @@ def bitwiseNegMInit : Mach :=
 theorem bitwiseNeg_anneal_ret :
     ReachesRet (mirCallTree bitwiseI8 [.scalar ⟨170, 1⟩, .scalar ⟨241, 1⟩]) []
       (.normal (.scalar ⟨96, 1⟩, bitwiseNegS0.memory)) :=
-  runA_sound bitwiseI8 10 _ _ _ rfl
+  runA_sound bitwiseI8 10 _ _ _ (by kernel_rfl)
 
 theorem bitwiseNeg_noUB :
     MirNoUBTree (mirCallTree bitwiseI8 [.scalar ⟨170, 1⟩, .scalar ⟨241, 1⟩]) :=
-  runA_noUB bitwiseI8 10 _ _ _ rfl
+  runA_isSome_noUB bitwiseI8 10 _ (by kernel_rfl)
 
 theorem bitwiseNeg_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n bitwiseNegMInit = .ok m' ∧
@@ -1918,7 +1933,7 @@ theorem bitwiseNeg_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8_3 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret bitwiseI8_inFragment bitwiseI8_translate ctxI8_3 (ctxI8_ok3 rfl)
-      [.scalar ⟨170, 1⟩, .scalar ⟨241, 1⟩] (by decide) bitwiseNegMInit rfl rfl rfl bitwiseNeg_anneal_ret
+      [.scalar ⟨170, 1⟩, .scalar ⟨241, 1⟩] (by decide +kernel) bitwiseNegMInit rfl rfl rfl bitwiseNeg_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [bitwiseI8] at hd; subst hd
   simp [retPtr, ctxI8_3] at hp
@@ -2009,7 +2024,7 @@ def heteroShiftSwitch : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem heteroShiftSwitch_inFragment : inFragment heteroShiftSwitch = true := by decide
+theorem heteroShiftSwitch_inFragment : inFragment heteroShiftSwitch = true := by decide +kernel
 
 def heteroShiftSwitchFn : Gen.Function where
   locals := ⟨[(localName 0, .Int i8), (localName 1, .Int i8), (localName 2, .Int i32)]⟩
@@ -2054,11 +2069,11 @@ def heteroShiftOkTrace : List (Event MirEffect) :=
 theorem heteroShiftOk_anneal_ret :
     ReachesRet (mirCallTree heteroShiftSwitch [.scalar ⟨192, 1⟩, .scalar ⟨3, 4⟩])
       heteroShiftOkTrace (.normal (.scalar ⟨224, 1⟩, heteroShiftOkS0.memory)) :=
-  runA_sound heteroShiftSwitch 10 _ _ _ rfl
+  runA_sound heteroShiftSwitch 10 _ _ _ (by kernel_rfl)
 
 theorem heteroShiftOk_noUB :
     MirNoUBTree (mirCallTree heteroShiftSwitch [.scalar ⟨192, 1⟩, .scalar ⟨3, 4⟩]) :=
-  runA_noUB heteroShiftSwitch 10 _ _ _ rfl
+  runA_isSome_noUB heteroShiftSwitch 10 _ (by kernel_rfl)
 
 theorem heteroShiftOk_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n heteroShiftOkMInit = .ok m' ∧
@@ -2066,7 +2081,7 @@ theorem heteroShiftOk_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8_3 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret heteroShiftSwitch_inFragment heteroShiftSwitch_translate ctxI8_3
-      (ctxI8_ok_hetero rfl) [.scalar ⟨192, 1⟩, .scalar ⟨3, 4⟩] (by decide)
+      (ctxI8_ok_hetero rfl) [.scalar ⟨192, 1⟩, .scalar ⟨3, 4⟩] (by decide +kernel)
       heteroShiftOkMInit rfl rfl rfl heteroShiftOk_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [heteroShiftSwitch] at hd; subst hd
@@ -2095,13 +2110,13 @@ theorem heteroShrGe8Ub_anneal_ub :
     ∃ tr u,
       Reaches (mirCallTree heteroShiftSwitch [.scalar ⟨192, 1⟩, .scalar ⟨8, 4⟩]) tr u ∧
       FaultNow u :=
-  faultsA_sound heteroShiftSwitch 8 _ (by decide)
+  faultsA_sound heteroShiftSwitch 8 _ (by decide +kernel)
 
 theorem heteroShrGe8Ub_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n heteroShrGe8UbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := heteroShrGe8Ub_anneal_ub
   exact mirCall_ub heteroShiftSwitch_inFragment heteroShiftSwitch_translate ctxI8_3
-    (ctxI8_ok_hetero rfl) [.scalar ⟨192, 1⟩, .scalar ⟨8, 4⟩] (by decide)
+    (ctxI8_ok_hetero rfl) [.scalar ⟨192, 1⟩, .scalar ⟨8, 4⟩] (by decide +kernel)
     heteroShrGe8UbMInit rfl rfl rfl hr hf
 
 theorem heteroShrGe8Ub_minirust_direct :
@@ -2119,13 +2134,13 @@ theorem heteroShrNegUb_anneal_ub :
     ∃ tr u,
       Reaches (mirCallTree heteroShiftSwitch [.scalar ⟨192, 1⟩, .scalar ⟨4294967295, 4⟩]) tr u ∧
       FaultNow u :=
-  faultsA_sound heteroShiftSwitch 8 _ (by decide)
+  faultsA_sound heteroShiftSwitch 8 _ (by decide +kernel)
 
 theorem heteroShrNegUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n heteroShrNegUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := heteroShrNegUb_anneal_ub
   exact mirCall_ub heteroShiftSwitch_inFragment heteroShiftSwitch_translate ctxI8_3
-    (ctxI8_ok_hetero rfl) [.scalar ⟨192, 1⟩, .scalar ⟨4294967295, 4⟩] (by decide)
+    (ctxI8_ok_hetero rfl) [.scalar ⟨192, 1⟩, .scalar ⟨4294967295, 4⟩] (by decide +kernel)
     heteroShrNegUbMInit rfl rfl rfl hr hf
 
 theorem heteroShrNegUb_minirust_direct :
@@ -2186,7 +2201,7 @@ def uninitOperandUb : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem uninitOperandUb_inFragment : inFragment uninitOperandUb = true := by decide
+theorem uninitOperandUb_inFragment : inFragment uninitOperandUb = true := by decide +kernel
 
 def uninitOperandUbFn : Gen.Function where
   locals := ⟨[(localName 0, .Int i8), (localName 1, .Int i8)]⟩
@@ -2221,13 +2236,13 @@ def uninitBinOpUbMInit : Mach :=
 
 theorem uninitBinOpUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTree uninitOperandUb [.scalar ⟨0, 1⟩]) tr u ∧ FaultNow u :=
-  faultsA_sound uninitOperandUb 6 _ (by decide)
+  faultsA_sound uninitOperandUb 6 _ (by decide +kernel)
 
 theorem uninitBinOpUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n uninitBinOpUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := uninitBinOpUb_anneal_ub
   exact mirCall_ub uninitOperandUb_inFragment uninitOperandUb_translate ctxI8 (ctxI8_ok2 rfl)
-    [.scalar ⟨0, 1⟩] (by decide) uninitBinOpUbMInit rfl rfl rfl hr hf
+    [.scalar ⟨0, 1⟩] (by decide +kernel) uninitBinOpUbMInit rfl rfl rfl hr hf
 
 theorem uninitBinOpUb_minirust_direct :
     Interp.steps 3 uninitBinOpUbMInit =
@@ -2241,13 +2256,13 @@ def uninitUnOpUbMInit : Mach :=
 
 theorem uninitUnOpUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTree uninitOperandUb [.scalar ⟨1, 1⟩]) tr u ∧ FaultNow u :=
-  faultsA_sound uninitOperandUb 6 _ (by decide)
+  faultsA_sound uninitOperandUb 6 _ (by decide +kernel)
 
 theorem uninitUnOpUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n uninitUnOpUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := uninitUnOpUb_anneal_ub
   exact mirCall_ub uninitOperandUb_inFragment uninitOperandUb_translate ctxI8 (ctxI8_ok2 rfl)
-    [.scalar ⟨1, 1⟩] (by decide) uninitUnOpUbMInit rfl rfl rfl hr hf
+    [.scalar ⟨1, 1⟩] (by decide +kernel) uninitUnOpUbMInit rfl rfl rfl hr hf
 
 theorem uninitUnOpUb_minirust_direct :
     Interp.steps 3 uninitUnOpUbMInit =
@@ -2261,13 +2276,13 @@ def uninitSwitchUbMInit : Mach :=
 
 theorem uninitSwitchUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTree uninitOperandUb [.scalar ⟨2, 1⟩]) tr u ∧ FaultNow u :=
-  faultsA_sound uninitOperandUb 6 _ (by decide)
+  faultsA_sound uninitOperandUb 6 _ (by decide +kernel)
 
 theorem uninitSwitchUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n uninitSwitchUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := uninitSwitchUb_anneal_ub
   exact mirCall_ub uninitOperandUb_inFragment uninitOperandUb_translate ctxI8 (ctxI8_ok2 rfl)
-    [.scalar ⟨2, 1⟩] (by decide) uninitSwitchUbMInit rfl rfl rfl hr hf
+    [.scalar ⟨2, 1⟩] (by decide +kernel) uninitSwitchUbMInit rfl rfl rfl hr hf
 
 theorem uninitSwitchUb_minirust_direct :
     Interp.steps 3 uninitSwitchUbMInit =
@@ -2280,7 +2295,7 @@ theorem uninitSwitchUb_converse_error :
       ReturnRel uninitOperandUb ctxI8 s' v mRet ∧
       ReachesRet (mirCallTree uninitOperandUb [.scalar ⟨2, 1⟩]) tr (.normal (v, mem))) :=
   mirCall_steps_error uninitOperandUb_inFragment uninitOperandUb_translate ctxI8 (ctxI8_ok2 rfl)
-    [.scalar ⟨2, 1⟩] (by decide) uninitSwitchUbMInit rfl rfl rfl uninitSwitchUb_minirust_direct
+    [.scalar ⟨2, 1⟩] (by decide +kernel) uninitSwitchUbMInit rfl rfl rfl uninitSwitchUb_minirust_direct
 
 /-! ## Booleans: comparisons, `!`, `switchInt` on `bool`, and `bool` returns -/
 
@@ -2364,7 +2379,7 @@ def cmpNotSwitch : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem cmpNotSwitch_inFragment : inFragment cmpNotSwitch = true := by decide
+theorem cmpNotSwitch_inFragment : inFragment cmpNotSwitch = true := by decide +kernel
 
 /-- The MiniRust function `minimize` produces for `cmpNotSwitch`, spelled out:
 the comparisons are `BinOp::Rel`, `!b` is `build::not` (a transmute of
@@ -2417,10 +2432,10 @@ kernel. -/
 theorem cmpNotNeg1_anneal_ret :
     ReachesRet (mirCallTree cmpNotSwitch cmpNotNeg1Args) cmpNotNeg1Trace
       (.normal (.scalar ⟨255, 1⟩, cmpNotNeg1S0.memory)) :=
-  runA_sound cmpNotSwitch 20 _ _ _ rfl
+  runA_sound cmpNotSwitch 20 _ _ _ (by kernel_rfl)
 
 theorem cmpNotNeg1_noUB : MirNoUBTree (mirCallTree cmpNotSwitch cmpNotNeg1Args) :=
-  runA_noUB cmpNotSwitch 20 _ _ _ rfl
+  runA_isSome_noUB cmpNotSwitch 20 _ (by kernel_rfl)
 
 /-- Therefore (by `mirCall_ret`) MiniRust, started at `minimize`'s entry
 block, returns the bytes of `-1i8` to the caller. -/
@@ -2430,7 +2445,7 @@ theorem cmpNotNeg1_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8_4 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret cmpNotSwitch_inFragment cmpNotSwitch_translate ctxI8_4 (ctxI8_ok_cmpNot rfl)
-      cmpNotNeg1Args (by decide) cmpNotNeg1MInit rfl rfl rfl cmpNotNeg1_anneal_ret
+      cmpNotNeg1Args (by decide +kernel) cmpNotNeg1MInit rfl rfl rfl cmpNotNeg1_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [cmpNotSwitch] at hd; subst hd
   simp [retPtr, ctxI8_4] at hp
@@ -2458,10 +2473,10 @@ def cmpNot3MInit : Mach :=
 theorem cmpNot3_anneal_ret :
     ReachesRet (mirCallTree cmpNotSwitch cmpNot3Args) [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
       (.normal (.scalar ⟨2, 1⟩, cmpNot3S0.memory)) :=
-  runA_sound cmpNotSwitch 20 _ _ _ rfl
+  runA_sound cmpNotSwitch 20 _ _ _ (by kernel_rfl)
 
 theorem cmpNot3_noUB : MirNoUBTree (mirCallTree cmpNotSwitch cmpNot3Args) :=
-  runA_noUB cmpNotSwitch 20 _ _ _ rfl
+  runA_isSome_noUB cmpNotSwitch 20 _ (by kernel_rfl)
 
 theorem cmpNot3_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n cmpNot3MInit = .ok m' ∧
@@ -2469,7 +2484,7 @@ theorem cmpNot3_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8_4 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret cmpNotSwitch_inFragment cmpNotSwitch_translate ctxI8_4 (ctxI8_ok_cmpNot rfl)
-      cmpNot3Args (by decide) cmpNot3MInit rfl rfl rfl cmpNot3_anneal_ret
+      cmpNot3Args (by decide +kernel) cmpNot3MInit rfl rfl rfl cmpNot3_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [cmpNotSwitch] at hd; subst hd
   simp [retPtr, ctxI8_4] at hp
@@ -2538,7 +2553,7 @@ def leNeGe : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem leNeGe_inFragment : inFragment leNeGe = true := by decide
+theorem leNeGe_inFragment : inFragment leNeGe = true := by decide +kernel
 
 def leNeGeFn : Gen.Function where
   locals := ⟨[(localName 0, .Bool), (localName 1, .Int u8), (localName 2, .Int u8)]⟩
@@ -2575,10 +2590,10 @@ def leNeGe250MInit : Mach :=
 theorem leNeGe250_anneal_ret :
     ReachesRet (mirCallTree leNeGe leNeGe250Args) [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
       (.normal (.scalar ⟨1, 1⟩, leNeGe250S0.memory)) :=
-  runA_sound leNeGe 10 _ _ _ rfl
+  runA_sound leNeGe 10 _ _ _ (by kernel_rfl)
 
 theorem leNeGe250_noUB : MirNoUBTree (mirCallTree leNeGe leNeGe250Args) :=
-  runA_noUB leNeGe 10 _ _ _ rfl
+  runA_isSome_noUB leNeGe 10 _ (by kernel_rfl)
 
 theorem leNeGe250_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n leNeGe250MInit = .ok m' ∧
@@ -2586,7 +2601,7 @@ theorem leNeGe250_minirust_ret_from_start :
       m'.threads = [thread1 ctxBool [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret leNeGe_inFragment leNeGe_translate ctxBool (ctxBool_ok rfl)
-      leNeGe250Args (by decide) leNeGe250MInit rfl rfl rfl leNeGe250_anneal_ret
+      leNeGe250Args (by decide +kernel) leNeGe250MInit rfl rfl rfl leNeGe250_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [leNeGe] at hd; subst hd
   simp [retPtr, ctxBool] at hp
@@ -2612,10 +2627,10 @@ def leNeGe5MInit : Mach :=
 theorem leNeGe5_anneal_ret :
     ReachesRet (mirCallTree leNeGe leNeGe5Args) [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
       (.normal (.scalar ⟨0, 1⟩, leNeGe5S0.memory)) :=
-  runA_sound leNeGe 10 _ _ _ rfl
+  runA_sound leNeGe 10 _ _ _ (by kernel_rfl)
 
 theorem leNeGe5_noUB : MirNoUBTree (mirCallTree leNeGe leNeGe5Args) :=
-  runA_noUB leNeGe 10 _ _ _ rfl
+  runA_isSome_noUB leNeGe 10 _ (by kernel_rfl)
 
 theorem leNeGe5_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n leNeGe5MInit = .ok m' ∧
@@ -2623,7 +2638,7 @@ theorem leNeGe5_minirust_ret_from_start :
       m'.threads = [thread1 ctxBool [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret leNeGe_inFragment leNeGe_translate ctxBool (ctxBool_ok rfl)
-      leNeGe5Args (by decide) leNeGe5MInit rfl rfl rfl leNeGe5_anneal_ret
+      leNeGe5Args (by decide +kernel) leNeGe5MInit rfl rfl rfl leNeGe5_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [leNeGe] at hd; subst hd
   simp [retPtr, ctxBool] at hp
@@ -2689,7 +2704,7 @@ def boolCastI8 : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem boolCastI8_inFragment : inFragment boolCastI8 = true := by decide
+theorem boolCastI8_inFragment : inFragment boolCastI8 = true := by decide +kernel
 
 def boolCastI8Fn : Gen.Function where
   locals := ⟨[(localName 0, .Int i8), (localName 1, .Bool)]⟩
@@ -2734,10 +2749,10 @@ def boolCastTrueMInit : Mach :=
 theorem boolCastTrue_anneal_ret :
     ReachesRet (mirCallTree boolCastI8 boolCastTrueArgs) [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
       (.normal (.scalar ⟨1, 1⟩, boolCastTrueS0.memory)) :=
-  runA_sound boolCastI8 15 _ _ _ rfl
+  runA_sound boolCastI8 15 _ _ _ (by kernel_rfl)
 
 theorem boolCastTrue_noUB : MirNoUBTree (mirCallTree boolCastI8 boolCastTrueArgs) :=
-  runA_noUB boolCastI8 15 _ _ _ rfl
+  runA_isSome_noUB boolCastI8 15 _ (by kernel_rfl)
 
 theorem boolCastTrue_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n boolCastTrueMInit = .ok m' ∧
@@ -2745,7 +2760,7 @@ theorem boolCastTrue_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret boolCastI8_inFragment boolCastI8_translate ctxI8 (ctxI8_ok_boolCast rfl)
-      boolCastTrueArgs (by decide) boolCastTrueMInit rfl rfl rfl boolCastTrue_anneal_ret
+      boolCastTrueArgs (by decide +kernel) boolCastTrueMInit rfl rfl rfl boolCastTrue_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [boolCastI8] at hd; subst hd
   simp [retPtr, ctxI8] at hp
@@ -2770,10 +2785,10 @@ def boolCastFalseMInit : Mach :=
 theorem boolCastFalse_anneal_ret :
     ReachesRet (mirCallTree boolCastI8 boolCastFalseArgs) [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
       (.normal (.scalar ⟨0, 1⟩, boolCastFalseS0.memory)) :=
-  runA_sound boolCastI8 15 _ _ _ rfl
+  runA_sound boolCastI8 15 _ _ _ (by kernel_rfl)
 
 theorem boolCastFalse_noUB : MirNoUBTree (mirCallTree boolCastI8 boolCastFalseArgs) :=
-  runA_noUB boolCastI8 15 _ _ _ rfl
+  runA_isSome_noUB boolCastI8 15 _ (by kernel_rfl)
 
 theorem boolCastFalse_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n boolCastFalseMInit = .ok m' ∧
@@ -2781,7 +2796,7 @@ theorem boolCastFalse_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret boolCastI8_inFragment boolCastI8_translate ctxI8 (ctxI8_ok_boolCast rfl)
-      boolCastFalseArgs (by decide) boolCastFalseMInit rfl rfl rfl boolCastFalse_anneal_ret
+      boolCastFalseArgs (by decide +kernel) boolCastFalseMInit rfl rfl rfl boolCastFalse_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [boolCastI8] at hd; subst hd
   simp [retPtr, ctxI8] at hp
@@ -2820,7 +2835,7 @@ def uninitBool : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem uninitBool_inFragment : inFragment uninitBool = true := by decide
+theorem uninitBool_inFragment : inFragment uninitBool = true := by decide +kernel
 
 def uninitBoolFn : Gen.Function where
   locals := ⟨[(localName 0, .Bool)]⟩
@@ -2859,13 +2874,13 @@ theorem ctxBool_ok1 {body : CapturedMir} (h : body.localDecls = [boolDecl]) : Ct
 
 theorem uninitBool_anneal_ub :
     ∃ tr u, Reaches (mirCallTree uninitBool []) tr u ∧ FaultNow u :=
-  faultsA_sound uninitBool 3 _ (by decide)
+  faultsA_sound uninitBool 3 _ (by decide +kernel)
 
 theorem uninitBool_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n uninitBoolMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := uninitBool_anneal_ub
   exact mirCall_ub uninitBool_inFragment uninitBool_translate ctxBool (ctxBool_ok1 rfl) []
-    (by decide) uninitBoolMInit rfl rfl rfl hr hf
+    (by decide +kernel) uninitBoolMInit rfl rfl rfl hr hf
 
 set_option maxRecDepth 8192 in
 theorem uninitBool_minirust_direct :
@@ -2888,7 +2903,7 @@ def uninitBoolNot : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem uninitBoolNot_inFragment : inFragment uninitBoolNot = true := by decide
+theorem uninitBoolNot_inFragment : inFragment uninitBoolNot = true := by decide +kernel
 
 def uninitBoolNotFn : Gen.Function where
   locals := ⟨[(localName 0, .Bool)]⟩
@@ -2914,13 +2929,13 @@ def uninitBoolNotMInit : Mach :=
 
 theorem uninitBoolNot_anneal_ub :
     ∃ tr u, Reaches (mirCallTree uninitBoolNot []) tr u ∧ FaultNow u :=
-  faultsA_sound uninitBoolNot 3 _ (by decide)
+  faultsA_sound uninitBoolNot 3 _ (by decide +kernel)
 
 theorem uninitBoolNot_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n uninitBoolNotMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := uninitBoolNot_anneal_ub
   exact mirCall_ub uninitBoolNot_inFragment uninitBoolNot_translate ctxBool (ctxBool_ok1 rfl) []
-    (by decide) uninitBoolNotMInit rfl rfl rfl hr hf
+    (by decide +kernel) uninitBoolNotMInit rfl rfl rfl hr hf
 
 set_option maxRecDepth 8192 in
 theorem uninitBoolNot_minirust_direct :
@@ -2943,7 +2958,7 @@ def uninitBoolRel : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem uninitBoolRel_inFragment : inFragment uninitBoolRel = true := by decide
+theorem uninitBoolRel_inFragment : inFragment uninitBoolRel = true := by decide +kernel
 
 def uninitBoolRelFn : Gen.Function where
   locals := ⟨[(localName 0, .Bool)]⟩
@@ -2967,13 +2982,13 @@ def uninitBoolRelMInit : Mach :=
 
 theorem uninitBoolRel_anneal_ub :
     ∃ tr u, Reaches (mirCallTree uninitBoolRel []) tr u ∧ FaultNow u :=
-  faultsA_sound uninitBoolRel 3 _ (by decide)
+  faultsA_sound uninitBoolRel 3 _ (by decide +kernel)
 
 theorem uninitBoolRel_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n uninitBoolRelMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := uninitBoolRel_anneal_ub
   exact mirCall_ub uninitBoolRel_inFragment uninitBoolRel_translate ctxBool (ctxBool_ok1 rfl) []
-    (by decide) uninitBoolRelMInit rfl rfl rfl hr hf
+    (by decide +kernel) uninitBoolRelMInit rfl rfl rfl hr hf
 
 set_option maxRecDepth 8192 in
 theorem uninitBoolRel_minirust_direct :
@@ -3038,7 +3053,7 @@ def cmpSel : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem cmpSel_inFragment : inFragment cmpSel = true := by decide
+theorem cmpSel_inFragment : inFragment cmpSel = true := by decide +kernel
 
 /-- The MiniRust function `minimize` produces for `cmpSel`, spelled out: the
 return place has type `orderingTy`, each `Cmp` is
@@ -3080,10 +3095,10 @@ def cmpSelLessMInit : Mach :=
 theorem cmpSelLess_anneal_ret :
     ReachesRet (mirCallTree cmpSel cmpSelLessArgs) [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
       (.normal (.scalar ⟨255, 1⟩, cmpSelLessS0.memory)) :=
-  runA_sound cmpSel 10 _ _ _ rfl
+  runA_sound cmpSel 10 _ _ _ (by kernel_rfl)
 
 theorem cmpSelLess_noUB : MirNoUBTree (mirCallTree cmpSel cmpSelLessArgs) :=
-  runA_noUB cmpSel 10 _ _ _ rfl
+  runA_isSome_noUB cmpSel 10 _ (by kernel_rfl)
 
 theorem cmpSelLess_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n cmpSelLessMInit = .ok m' ∧
@@ -3091,7 +3106,7 @@ theorem cmpSelLess_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8_4 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret cmpSel_inFragment cmpSel_translate ctxI8_4 (ctxI8_ok_cmpSel rfl)
-      cmpSelLessArgs (by decide) cmpSelLessMInit rfl rfl rfl cmpSelLess_anneal_ret
+      cmpSelLessArgs (by decide +kernel) cmpSelLessMInit rfl rfl rfl cmpSelLess_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [cmpSel] at hd; subst hd
   simp [retPtr, ctxI8_4] at hp
@@ -3116,10 +3131,10 @@ def cmpSelEqualMInit : Mach :=
 theorem cmpSelEqual_anneal_ret :
     ReachesRet (mirCallTree cmpSel cmpSelEqualArgs) [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
       (.normal (.scalar ⟨0, 1⟩, cmpSelEqualS0.memory)) :=
-  runA_sound cmpSel 10 _ _ _ rfl
+  runA_sound cmpSel 10 _ _ _ (by kernel_rfl)
 
 theorem cmpSelEqual_noUB : MirNoUBTree (mirCallTree cmpSel cmpSelEqualArgs) :=
-  runA_noUB cmpSel 10 _ _ _ rfl
+  runA_isSome_noUB cmpSel 10 _ (by kernel_rfl)
 
 theorem cmpSelEqual_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n cmpSelEqualMInit = .ok m' ∧
@@ -3127,7 +3142,7 @@ theorem cmpSelEqual_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8_4 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret cmpSel_inFragment cmpSel_translate ctxI8_4 (ctxI8_ok_cmpSel rfl)
-      cmpSelEqualArgs (by decide) cmpSelEqualMInit rfl rfl rfl cmpSelEqual_anneal_ret
+      cmpSelEqualArgs (by decide +kernel) cmpSelEqualMInit rfl rfl rfl cmpSelEqual_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [cmpSel] at hd; subst hd
   simp [retPtr, ctxI8_4] at hp
@@ -3152,10 +3167,10 @@ def cmpSelGreaterMInit : Mach :=
 theorem cmpSelGreater_anneal_ret :
     ReachesRet (mirCallTree cmpSel cmpSelGreaterArgs) [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
       (.normal (.scalar ⟨1, 1⟩, cmpSelGreaterS0.memory)) :=
-  runA_sound cmpSel 10 _ _ _ rfl
+  runA_sound cmpSel 10 _ _ _ (by kernel_rfl)
 
 theorem cmpSelGreater_noUB : MirNoUBTree (mirCallTree cmpSel cmpSelGreaterArgs) :=
-  runA_noUB cmpSel 10 _ _ _ rfl
+  runA_isSome_noUB cmpSel 10 _ (by kernel_rfl)
 
 theorem cmpSelGreater_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n cmpSelGreaterMInit = .ok m' ∧
@@ -3163,7 +3178,7 @@ theorem cmpSelGreater_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8_4 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret cmpSel_inFragment cmpSel_translate ctxI8_4 (ctxI8_ok_cmpSel rfl)
-      cmpSelGreaterArgs (by decide) cmpSelGreaterMInit rfl rfl rfl cmpSelGreater_anneal_ret
+      cmpSelGreaterArgs (by decide +kernel) cmpSelGreaterMInit rfl rfl rfl cmpSelGreater_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [cmpSel] at hd; subst hd
   simp [retPtr, ctxI8_4] at hp
@@ -3198,7 +3213,7 @@ def uninitOrdering : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem uninitOrdering_inFragment : inFragment uninitOrdering = true := by decide
+theorem uninitOrdering_inFragment : inFragment uninitOrdering = true := by decide +kernel
 
 def uninitOrderingFn : Gen.Function where
   locals := ⟨[(localName 0, orderingTy)]⟩
@@ -3230,13 +3245,13 @@ def uninitOrderingMInit : Mach :=
 
 theorem uninitOrdering_anneal_ub :
     ∃ tr u, Reaches (mirCallTree uninitOrdering []) tr u ∧ FaultNow u :=
-  faultsA_sound uninitOrdering 3 _ (by decide)
+  faultsA_sound uninitOrdering 3 _ (by decide +kernel)
 
 theorem uninitOrdering_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n uninitOrderingMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := uninitOrdering_anneal_ub
   exact mirCall_ub uninitOrdering_inFragment uninitOrdering_translate ctxBool
-    (ctxBool_ok_ordering rfl) [] (by decide) uninitOrderingMInit rfl rfl rfl hr hf
+    (ctxBool_ok_ordering rfl) [] (by decide +kernel) uninitOrderingMInit rfl rfl rfl hr hf
 
 set_option maxRecDepth 8192 in
 theorem uninitOrdering_minirust_direct :
@@ -3299,7 +3314,7 @@ def boolBitOrdUse : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem boolBitOrdUse_inFragment : inFragment boolBitOrdUse = true := by decide
+theorem boolBitOrdUse_inFragment : inFragment boolBitOrdUse = true := by decide +kernel
 
 def boolBitOrdUseFn : Gen.Function where
   locals := ⟨[(localName 0, orderingTy), (localName 1, .Bool), (localName 2, .Int u8),
@@ -3350,10 +3365,10 @@ theorem boolBitOrdUseCmp_anneal_ret :
     ReachesRet (mirCallTree boolBitOrdUse boolBitOrdUseCmpArgs)
       [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
       (.normal (.scalar ⟨1, 1⟩, boolBitOrdUseCmpS0.memory)) :=
-  runA_sound boolBitOrdUse 15 _ _ _ rfl
+  runA_sound boolBitOrdUse 15 _ _ _ (by kernel_rfl)
 
 theorem boolBitOrdUseCmp_noUB : MirNoUBTree (mirCallTree boolBitOrdUse boolBitOrdUseCmpArgs) :=
-  runA_noUB boolBitOrdUse 15 _ _ _ rfl
+  runA_isSome_noUB boolBitOrdUse 15 _ (by kernel_rfl)
 
 theorem boolBitOrdUseCmp_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n boolBitOrdUseCmpMInit = .ok m' ∧
@@ -3361,7 +3376,7 @@ theorem boolBitOrdUseCmp_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8_4 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret boolBitOrdUse_inFragment boolBitOrdUse_translate ctxI8_4
-      (ctxI8_ok_boolBitOrdUse rfl) boolBitOrdUseCmpArgs (by decide) boolBitOrdUseCmpMInit
+      (ctxI8_ok_boolBitOrdUse rfl) boolBitOrdUseCmpArgs (by decide +kernel) boolBitOrdUseCmpMInit
       rfl rfl rfl boolBitOrdUseCmp_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [boolBitOrdUse] at hd; subst hd
@@ -3390,10 +3405,10 @@ theorem boolBitOrdUseCopy_anneal_ret :
     ReachesRet (mirCallTree boolBitOrdUse boolBitOrdUseCopyArgs)
       [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
       (.normal (.scalar ⟨255, 1⟩, boolBitOrdUseCopyS0.memory)) :=
-  runA_sound boolBitOrdUse 15 _ _ _ rfl
+  runA_sound boolBitOrdUse 15 _ _ _ (by kernel_rfl)
 
 theorem boolBitOrdUseCopy_noUB : MirNoUBTree (mirCallTree boolBitOrdUse boolBitOrdUseCopyArgs) :=
-  runA_noUB boolBitOrdUse 15 _ _ _ rfl
+  runA_isSome_noUB boolBitOrdUse 15 _ (by kernel_rfl)
 
 theorem boolBitOrdUseCopy_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n boolBitOrdUseCopyMInit = .ok m' ∧
@@ -3401,7 +3416,7 @@ theorem boolBitOrdUseCopy_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8_4 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret boolBitOrdUse_inFragment boolBitOrdUse_translate ctxI8_4
-      (ctxI8_ok_boolBitOrdUse rfl) boolBitOrdUseCopyArgs (by decide) boolBitOrdUseCopyMInit
+      (ctxI8_ok_boolBitOrdUse rfl) boolBitOrdUseCopyArgs (by decide +kernel) boolBitOrdUseCopyMInit
       rfl rfl rfl boolBitOrdUseCopy_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [boolBitOrdUse] at hd; subst hd
@@ -3434,7 +3449,7 @@ def uninitBoolBitAnd : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem uninitBoolBitAnd_inFragment : inFragment uninitBoolBitAnd = true := by decide
+theorem uninitBoolBitAnd_inFragment : inFragment uninitBoolBitAnd = true := by decide +kernel
 
 def uninitBoolBitAndFn : Gen.Function where
   locals := ⟨[(localName 0, .Bool)]⟩
@@ -3459,13 +3474,13 @@ def uninitBoolBitAndMInit : Mach :=
 
 theorem uninitBoolBitAnd_anneal_ub :
     ∃ tr u, Reaches (mirCallTree uninitBoolBitAnd []) tr u ∧ FaultNow u :=
-  faultsA_sound uninitBoolBitAnd 3 _ (by decide)
+  faultsA_sound uninitBoolBitAnd 3 _ (by decide +kernel)
 
 theorem uninitBoolBitAnd_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n uninitBoolBitAndMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := uninitBoolBitAnd_anneal_ub
   exact mirCall_ub uninitBoolBitAnd_inFragment uninitBoolBitAnd_translate ctxBool (ctxBool_ok1 rfl) []
-    (by decide) uninitBoolBitAndMInit rfl rfl rfl hr hf
+    (by decide +kernel) uninitBoolBitAndMInit rfl rfl rfl hr hf
 
 set_option maxRecDepth 8192 in
 theorem uninitBoolBitAnd_minirust_direct :
@@ -3490,7 +3505,7 @@ def uninitBoolBitOrRhs : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem uninitBoolBitOrRhs_inFragment : inFragment uninitBoolBitOrRhs = true := by decide
+theorem uninitBoolBitOrRhs_inFragment : inFragment uninitBoolBitOrRhs = true := by decide +kernel
 
 def uninitBoolBitOrRhsFn : Gen.Function where
   locals := ⟨[(localName 0, .Bool)]⟩
@@ -3515,13 +3530,13 @@ def uninitBoolBitOrRhsMInit : Mach :=
 
 theorem uninitBoolBitOrRhs_anneal_ub :
     ∃ tr u, Reaches (mirCallTree uninitBoolBitOrRhs []) tr u ∧ FaultNow u :=
-  faultsA_sound uninitBoolBitOrRhs 3 _ (by decide)
+  faultsA_sound uninitBoolBitOrRhs 3 _ (by decide +kernel)
 
 theorem uninitBoolBitOrRhs_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n uninitBoolBitOrRhsMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := uninitBoolBitOrRhs_anneal_ub
   exact mirCall_ub uninitBoolBitOrRhs_inFragment uninitBoolBitOrRhs_translate ctxBool (ctxBool_ok1 rfl) []
-    (by decide) uninitBoolBitOrRhsMInit rfl rfl rfl hr hf
+    (by decide +kernel) uninitBoolBitOrRhsMInit rfl rfl rfl hr hf
 
 set_option maxRecDepth 8192 in
 theorem uninitBoolBitOrRhs_minirust_direct :
@@ -3830,7 +3845,7 @@ def checkedArithI8 : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem checkedArithI8_inFragment : inFragment checkedArithI8 = true := by decide
+theorem checkedArithI8_inFragment : inFragment checkedArithI8 = true := by decide +kernel
 
 def checkedArithI8Fn : Gen.Function where
   locals := ⟨[(localName 0, .Int i8), (localName 1, .Int i8), (localName 2, .Int i8),
@@ -3901,10 +3916,10 @@ def checkedArithOkTrace : List (Event MirEffect) :=
 theorem checkedArithOk_anneal_ret :
     ReachesRet (mirCallTree checkedArithI8 checkedArithOkArgs) checkedArithOkTrace
       (.normal (.scalar ⟨98, 1⟩, checkedArithOkS0.memory)) :=
-  runA_sound checkedArithI8 20 _ _ _ rfl
+  runA_sound checkedArithI8 20 _ _ _ (by kernel_rfl)
 
 theorem checkedArithOk_noUB : MirNoUBTree (mirCallTree checkedArithI8 checkedArithOkArgs) :=
-  runA_noUB checkedArithI8 20 _ _ _ rfl
+  runA_isSome_noUB checkedArithI8 20 _ (by kernel_rfl)
 
 theorem checkedArithOk_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n checkedArithOkMInit = .ok m' ∧
@@ -3912,7 +3927,7 @@ theorem checkedArithOk_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8_5 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret checkedArithI8_inFragment checkedArithI8_translate ctxI8_5
-      (ctxI8_ok_checkedArith rfl) checkedArithOkArgs (by decide) checkedArithOkMInit
+      (ctxI8_ok_checkedArith rfl) checkedArithOkArgs (by decide +kernel) checkedArithOkMInit
       rfl rfl rfl checkedArithOk_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [checkedArithI8] at hd; subst hd
@@ -3943,10 +3958,10 @@ theorem checkedArithAddOv_anneal_ret :
     ReachesRet (mirCallTree checkedArithI8 checkedArithAddOvArgs)
       [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
       (.normal (.scalar ⟨128, 1⟩, checkedArithAddOvS0.memory)) :=
-  runA_sound checkedArithI8 20 _ _ _ rfl
+  runA_sound checkedArithI8 20 _ _ _ (by kernel_rfl)
 
 theorem checkedArithAddOv_noUB : MirNoUBTree (mirCallTree checkedArithI8 checkedArithAddOvArgs) :=
-  runA_noUB checkedArithI8 20 _ _ _ rfl
+  runA_isSome_noUB checkedArithI8 20 _ (by kernel_rfl)
 
 theorem checkedArithAddOv_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n checkedArithAddOvMInit = .ok m' ∧
@@ -3954,7 +3969,7 @@ theorem checkedArithAddOv_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8_5 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret checkedArithI8_inFragment checkedArithI8_translate ctxI8_5
-      (ctxI8_ok_checkedArith rfl) checkedArithAddOvArgs (by decide) checkedArithAddOvMInit
+      (ctxI8_ok_checkedArith rfl) checkedArithAddOvArgs (by decide +kernel) checkedArithAddOvMInit
       rfl rfl rfl checkedArithAddOv_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [checkedArithI8] at hd; subst hd
@@ -3988,10 +4003,10 @@ def checkedArithSubOvTrace : List (Event MirEffect) :=
 theorem checkedArithSubOv_anneal_ret :
     ReachesRet (mirCallTree checkedArithI8 checkedArithSubOvArgs) checkedArithSubOvTrace
       (.normal (.scalar ⟨127, 1⟩, checkedArithSubOvS0.memory)) :=
-  runA_sound checkedArithI8 20 _ _ _ rfl
+  runA_sound checkedArithI8 20 _ _ _ (by kernel_rfl)
 
 theorem checkedArithSubOv_noUB : MirNoUBTree (mirCallTree checkedArithI8 checkedArithSubOvArgs) :=
-  runA_noUB checkedArithI8 20 _ _ _ rfl
+  runA_isSome_noUB checkedArithI8 20 _ (by kernel_rfl)
 
 theorem checkedArithSubOv_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n checkedArithSubOvMInit = .ok m' ∧
@@ -3999,7 +4014,7 @@ theorem checkedArithSubOv_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8_5 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret checkedArithI8_inFragment checkedArithI8_translate ctxI8_5
-      (ctxI8_ok_checkedArith rfl) checkedArithSubOvArgs (by decide) checkedArithSubOvMInit
+      (ctxI8_ok_checkedArith rfl) checkedArithSubOvArgs (by decide +kernel) checkedArithSubOvMInit
       rfl rfl rfl checkedArithSubOv_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [checkedArithI8] at hd; subst hd
@@ -4033,10 +4048,10 @@ def checkedArithMulOvTrace : List (Event MirEffect) :=
 theorem checkedArithMulOv_anneal_ret :
     ReachesRet (mirCallTree checkedArithI8 checkedArithMulOvArgs) checkedArithMulOvTrace
       (.normal (.scalar ⟨128, 1⟩, checkedArithMulOvS0.memory)) :=
-  runA_sound checkedArithI8 20 _ _ _ rfl
+  runA_sound checkedArithI8 20 _ _ _ (by kernel_rfl)
 
 theorem checkedArithMulOv_noUB : MirNoUBTree (mirCallTree checkedArithI8 checkedArithMulOvArgs) :=
-  runA_noUB checkedArithI8 20 _ _ _ rfl
+  runA_isSome_noUB checkedArithI8 20 _ (by kernel_rfl)
 
 theorem checkedArithMulOv_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n checkedArithMulOvMInit = .ok m' ∧
@@ -4044,7 +4059,7 @@ theorem checkedArithMulOv_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8_5 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret checkedArithI8_inFragment checkedArithI8_translate ctxI8_5
-      (ctxI8_ok_checkedArith rfl) checkedArithMulOvArgs (by decide) checkedArithMulOvMInit
+      (ctxI8_ok_checkedArith rfl) checkedArithMulOvArgs (by decide +kernel) checkedArithMulOvMInit
       rfl rfl rfl checkedArithMulOv_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [checkedArithI8] at hd; subst hd
@@ -4144,7 +4159,7 @@ def checkedTupleU32 : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem checkedTupleU32_inFragment : inFragment checkedTupleU32 = true := by decide
+theorem checkedTupleU32_inFragment : inFragment checkedTupleU32 = true := by decide +kernel
 
 def checkedTupleU32Fn : Gen.Function where
   locals := ⟨[(localName 0, intBoolTupleTy u32), (localName 1, .Int u32), (localName 2, .Int u32)]⟩
@@ -4199,11 +4214,11 @@ theorem checkedTupleUnderAddOv_anneal_ret :
     ReachesRet (mirCallTree checkedTupleU32 checkedTupleUnderAddOvArgs)
       [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
       (.normal (.aggregate 0 [.scalar ⟨0, 4⟩, .scalar ⟨1, 1⟩], checkedTupleUnderAddOvS0.memory)) :=
-  runA_sound checkedTupleU32 15 _ _ _ rfl
+  runA_sound checkedTupleU32 15 _ _ _ (by kernel_rfl)
 
 theorem checkedTupleUnderAddOv_noUB :
     MirNoUBTree (mirCallTree checkedTupleU32 checkedTupleUnderAddOvArgs) :=
-  runA_noUB checkedTupleU32 15 _ _ _ rfl
+  runA_isSome_noUB checkedTupleU32 15 _ (by kernel_rfl)
 
 theorem checkedTupleUnderAddOv_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n checkedTupleUnderAddOvMInit = .ok m' ∧
@@ -4211,7 +4226,7 @@ theorem checkedTupleUnderAddOv_minirust_ret_from_start :
       m'.threads = [thread1 ctxTupleU32 [{ callerFrameTupleU32 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret checkedTupleU32_inFragment checkedTupleU32_translate ctxTupleU32
-      (ctxTupleU32_ok rfl) checkedTupleUnderAddOvArgs (by decide) checkedTupleUnderAddOvMInit
+      (ctxTupleU32_ok rfl) checkedTupleUnderAddOvArgs (by decide +kernel) checkedTupleUnderAddOvMInit
       rfl rfl rfl checkedTupleUnderAddOv_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [checkedTupleU32] at hd; subst hd
@@ -4243,11 +4258,11 @@ theorem checkedTupleMulOv_anneal_ret :
     ReachesRet (mirCallTree checkedTupleU32 checkedTupleMulOvArgs)
       [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
       (.normal (.aggregate 0 [.scalar ⟨0, 4⟩, .scalar ⟨1, 1⟩], checkedTupleMulOvS0.memory)) :=
-  runA_sound checkedTupleU32 15 _ _ _ rfl
+  runA_sound checkedTupleU32 15 _ _ _ (by kernel_rfl)
 
 theorem checkedTupleMulOv_noUB :
     MirNoUBTree (mirCallTree checkedTupleU32 checkedTupleMulOvArgs) :=
-  runA_noUB checkedTupleU32 15 _ _ _ rfl
+  runA_isSome_noUB checkedTupleU32 15 _ (by kernel_rfl)
 
 theorem checkedTupleMulOv_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n checkedTupleMulOvMInit = .ok m' ∧
@@ -4255,7 +4270,7 @@ theorem checkedTupleMulOv_minirust_ret_from_start :
       m'.threads = [thread1 ctxTupleU32 [{ callerFrameTupleU32 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret checkedTupleU32_inFragment checkedTupleU32_translate ctxTupleU32
-      (ctxTupleU32_ok rfl) checkedTupleMulOvArgs (by decide) checkedTupleMulOvMInit
+      (ctxTupleU32_ok rfl) checkedTupleMulOvArgs (by decide +kernel) checkedTupleMulOvMInit
       rfl rfl rfl checkedTupleMulOv_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [checkedTupleU32] at hd; subst hd
@@ -4285,11 +4300,11 @@ theorem checkedTupleOk_anneal_ret :
     ReachesRet (mirCallTree checkedTupleU32 checkedTupleOkArgs)
       [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
       (.normal (.aggregate 0 [.scalar ⟨21, 4⟩, .scalar ⟨0, 1⟩], checkedTupleOkS0.memory)) :=
-  runA_sound checkedTupleU32 15 _ _ _ rfl
+  runA_sound checkedTupleU32 15 _ _ _ (by kernel_rfl)
 
 theorem checkedTupleOk_noUB :
     MirNoUBTree (mirCallTree checkedTupleU32 checkedTupleOkArgs) :=
-  runA_noUB checkedTupleU32 15 _ _ _ rfl
+  runA_isSome_noUB checkedTupleU32 15 _ (by kernel_rfl)
 
 theorem checkedTupleOk_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n checkedTupleOkMInit = .ok m' ∧
@@ -4297,7 +4312,7 @@ theorem checkedTupleOk_minirust_ret_from_start :
       m'.threads = [thread1 ctxTupleU32 [{ callerFrameTupleU32 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret checkedTupleU32_inFragment checkedTupleU32_translate ctxTupleU32
-      (ctxTupleU32_ok rfl) checkedTupleOkArgs (by decide) checkedTupleOkMInit
+      (ctxTupleU32_ok rfl) checkedTupleOkArgs (by decide +kernel) checkedTupleOkMInit
       rfl rfl rfl checkedTupleOk_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [checkedTupleU32] at hd; subst hd
@@ -4346,7 +4361,7 @@ def uninitTupleField0 : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem uninitTupleField0_inFragment : inFragment uninitTupleField0 = true := by decide
+theorem uninitTupleField0_inFragment : inFragment uninitTupleField0 = true := by decide +kernel
 
 def uninitTupleField0Fn : Gen.Function where
   locals := ⟨[(localName 0, intBoolTupleTy u32)]⟩
@@ -4373,13 +4388,13 @@ def uninitTupleField0MInit : Mach :=
 
 theorem uninitTupleField0_anneal_ub :
     ∃ tr u, Reaches (mirCallTree uninitTupleField0 []) tr u ∧ FaultNow u :=
-  faultsA_sound uninitTupleField0 3 _ (by decide)
+  faultsA_sound uninitTupleField0 3 _ (by decide +kernel)
 
 theorem uninitTupleField0_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n uninitTupleField0MInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := uninitTupleField0_anneal_ub
   exact mirCall_ub uninitTupleField0_inFragment uninitTupleField0_translate ctxTupleU32
-    (ctxTupleU32_ok1 rfl) [] (by decide) uninitTupleField0MInit rfl rfl rfl hr hf
+    (ctxTupleU32_ok1 rfl) [] (by decide +kernel) uninitTupleField0MInit rfl rfl rfl hr hf
 
 set_option maxRecDepth 8192 in
 theorem uninitTupleField0_minirust_direct :
@@ -4393,7 +4408,7 @@ theorem uninitTupleField0_converse_error :
       ReturnRel uninitTupleField0 ctxTupleU32 s' v mRet ∧
       ReachesRet (mirCallTree uninitTupleField0 []) tr (.normal (v, mem))) :=
   mirCall_steps_error uninitTupleField0_inFragment uninitTupleField0_translate ctxTupleU32
-    (ctxTupleU32_ok1 rfl) [] (by decide) uninitTupleField0MInit rfl rfl rfl
+    (ctxTupleU32_ok1 rfl) [] (by decide +kernel) uninitTupleField0MInit rfl rfl rfl
     uninitTupleField0_minirust_direct
 
 /-- MIR of `fn uninit_tuple_field1() -> (u32, bool)` whose entry block switches
@@ -4414,7 +4429,7 @@ def uninitTupleField1 : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem uninitTupleField1_inFragment : inFragment uninitTupleField1 = true := by decide
+theorem uninitTupleField1_inFragment : inFragment uninitTupleField1 = true := by decide +kernel
 
 def uninitTupleField1Fn : Gen.Function where
   locals := ⟨[(localName 0, intBoolTupleTy u32)]⟩
@@ -4441,13 +4456,13 @@ def uninitTupleField1MInit : Mach :=
 
 theorem uninitTupleField1_anneal_ub :
     ∃ tr u, Reaches (mirCallTree uninitTupleField1 []) tr u ∧ FaultNow u :=
-  faultsA_sound uninitTupleField1 3 _ (by decide)
+  faultsA_sound uninitTupleField1 3 _ (by decide +kernel)
 
 theorem uninitTupleField1_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n uninitTupleField1MInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := uninitTupleField1_anneal_ub
   exact mirCall_ub uninitTupleField1_inFragment uninitTupleField1_translate ctxTupleU32
-    (ctxTupleU32_ok1 rfl) [] (by decide) uninitTupleField1MInit rfl rfl rfl hr hf
+    (ctxTupleU32_ok1 rfl) [] (by decide +kernel) uninitTupleField1MInit rfl rfl rfl hr hf
 
 set_option maxRecDepth 8192 in
 theorem uninitTupleField1_minirust_direct :
@@ -4466,7 +4481,7 @@ theorem uninitTupleField1_outcome (n : Nat) :
     (∃ msg, Interp.steps (initLen uninitTupleField1 + n) uninitTupleField1MInit = .error (.ub msg) ∧
       ∃ tr u, Reaches (mirCallTree uninitTupleField1 []) tr u ∧ FaultNow u) :=
   mirCall_outcome uninitTupleField1_inFragment uninitTupleField1_translate ctxTupleU32
-    (ctxTupleU32_ok1 rfl) [] (by decide) uninitTupleField1MInit rfl rfl rfl n
+    (ctxTupleU32_ok1 rfl) [] (by decide +kernel) uninitTupleField1MInit rfl rfl rfl n
 
 /-! ### Ground truth for `IntType::with_overflow`, `BinOpIntWithOverflow`, `ValueExpr::Tuple`, and `PlaceExpr::Field` -/
 
@@ -4704,10 +4719,10 @@ def tempMove : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem tempMove_inFragment : inFragment tempMove = true := by decide
+theorem tempMove_inFragment : inFragment tempMove = true := by decide +kernel
 
 /-- `_4` is the only temporary without storage markers. -/
-theorem tempMove_alwaysLive : alwaysStorageLiveLocals tempMove = [4] := by decide
+theorem tempMove_alwaysLive : alwaysStorageLiveLocals tempMove = [4] := by decide +kernel
 
 /-- The MiniRust function `minimize` produces for `tempMove`, spelled out:
 `move` operands translate like `copy` operands (`Load`), and the init block
@@ -4755,7 +4770,7 @@ theorem ctx0_ok_tempMove : CtxOk tempMove ctx0 where
   ret := by
     intro d hd
     simp [tempMove] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 /-! ### `temp_move(3)`: `y == 8`, returns `100` -/
 
@@ -4764,17 +4779,17 @@ def tempMove3MInit : Mach := machine tempMove tempMoveFn tempMove3S0.frame.local
 
 /-- The init block takes two MiniRust steps: `StorageLive(_4)` and
 `Goto(bb0)`. -/
-theorem tempMove_initLen : initLen tempMove = 2 := by decide
+theorem tempMove_initLen : initLen tempMove = 2 := by decide +kernel
 
 def tempMove3Trace : List (Event MirEffect) := [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
 
 theorem tempMove3_anneal_ret :
     ReachesRet (mirTree tempMove tempMove3S0) tempMove3Trace
       (.normal (.scalar ⟨100, 4⟩, tempMove3S0.memory)) :=
-  runA_sound tempMove 30 _ _ _ rfl
+  runA_sound tempMove 30 _ _ _ (by kernel_rfl)
 
 theorem tempMove3_noUB : MirNoUBTree (mirCallTree tempMove [.scalar ⟨3, 4⟩]) :=
-  runA_noUB tempMove 30 _ _ _ rfl
+  runA_isSome_noUB tempMove 30 _ (by kernel_rfl)
 
 theorem tempMove3_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n tempMove3MInit = .ok m' ∧
@@ -4782,7 +4797,7 @@ theorem tempMove3_minirust_ret_from_start :
       m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret tempMove_inFragment tempMove_translate ctx0 ctx0_ok_tempMove [.scalar ⟨3, 4⟩]
-      (by decide) tempMove3MInit rfl rfl rfl tempMove3_anneal_ret
+      (by decide +kernel) tempMove3MInit rfl rfl rfl tempMove3_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [tempMove] at hd; subst hd
   simp [retPtr, ctx0] at hp
@@ -4816,10 +4831,10 @@ def tempMove2Trace : List (Event MirEffect) := [⟨.inr (.inl (.emit (.event 0))
 theorem tempMove2_anneal_ret :
     ReachesRet (mirTree tempMove tempMove2S0) tempMove2Trace
       (.normal (.scalar ⟨6, 4⟩, tempMove2S0.memory)) :=
-  runA_sound tempMove 30 _ _ _ rfl
+  runA_sound tempMove 30 _ _ _ (by kernel_rfl)
 
 theorem tempMove2_noUB : MirNoUBTree (mirCallTree tempMove [.scalar ⟨2, 4⟩]) :=
-  runA_noUB tempMove 30 _ _ _ rfl
+  runA_isSome_noUB tempMove 30 _ (by kernel_rfl)
 
 theorem tempMove3_progress (n : Nat) :
     (∃ s' m' tr, Interp.steps (initLen tempMove + n) tempMove3MInit = .ok m' ∧
@@ -4830,7 +4845,7 @@ theorem tempMove3_progress (n : Nat) :
       ReturnRel tempMove ctx0 s' v mRet ∧
       ReachesRet (mirCallTree tempMove [.scalar ⟨3, 4⟩]) tr (.normal (v, mem))) :=
   mirCall_progress tempMove_inFragment tempMove_translate ctx0 ctx0_ok_tempMove [.scalar ⟨3, 4⟩]
-    (by decide) tempMove3MInit rfl rfl rfl tempMove3_noUB n
+    (by decide +kernel) tempMove3MInit rfl rfl rfl tempMove3_noUB n
 
 theorem tempMove2_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n tempMove2MInit = .ok m' ∧
@@ -4838,7 +4853,7 @@ theorem tempMove2_minirust_ret_from_start :
       m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret tempMove_inFragment tempMove_translate ctx0 ctx0_ok_tempMove [.scalar ⟨2, 4⟩]
-      (by decide) tempMove2MInit rfl rfl rfl tempMove2_anneal_ret
+      (by decide +kernel) tempMove2MInit rfl rfl rfl tempMove2_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [tempMove] at hd; subst hd
   simp [retPtr, ctx0] at hp
@@ -4877,7 +4892,7 @@ def deadRead : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem deadRead_inFragment : inFragment deadRead = true := by decide
+theorem deadRead_inFragment : inFragment deadRead = true := by decide +kernel
 
 def deadReadFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32)]⟩
@@ -4900,13 +4915,13 @@ def deadReadS0 : MachineState := initMachineState deadRead []
 def deadReadMInit : Mach := machine deadRead deadReadFn deadReadS0.frame.locals deadReadFn.start
 
 theorem deadRead_anneal_ub : ∃ tr u, Reaches (mirTree deadRead deadReadS0) tr u ∧ FaultNow u :=
-  faultsA_sound deadRead 10 _ (by decide)
+  faultsA_sound deadRead 10 _ (by decide +kernel)
 
 theorem deadRead_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n deadReadMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := deadRead_anneal_ub
   exact mirCall_ub deadRead_inFragment deadRead_translate ctx0 (ctx0_ok2 rfl) []
-    (by decide) deadReadMInit rfl rfl rfl hr hf
+    (by decide +kernel) deadReadMInit rfl rfl rfl hr hf
 
 /-- Direct computation: the fifth MiniRust step (the init block's `Goto`, then
 three statements) raises the UB of loading a dead local. -/
@@ -4931,7 +4946,7 @@ theorem deadRead_converse_error :
       ReturnRel deadRead ctx0 s' v mRet ∧
       ReachesRet (mirCallTree deadRead []) tr (.normal (v, mem))) :=
   mirCall_steps_error deadRead_inFragment deadRead_translate ctx0 (ctx0_ok2 rfl) []
-    (by decide) deadReadMInit rfl rfl rfl deadRead_steps5_ub
+    (by decide +kernel) deadReadMInit rfl rfl rfl deadRead_steps5_ub
 
 theorem deadRead_outcome (n : Nat) :
     (∃ s' m' tr, Interp.steps (initLen deadRead + n) deadReadMInit = .ok m' ∧
@@ -4944,7 +4959,7 @@ theorem deadRead_outcome (n : Nat) :
     (∃ msg, Interp.steps (initLen deadRead + n) deadReadMInit = .error (.ub msg) ∧
       ∃ tr u, Reaches (mirCallTree deadRead []) tr u ∧ FaultNow u) :=
   mirCall_outcome deadRead_inFragment deadRead_translate ctx0 (ctx0_ok2 rfl) []
-    (by decide) deadReadMInit rfl rfl rfl n
+    (by decide +kernel) deadReadMInit rfl rfl rfl n
 
 /-! ### A body that `movesOk` rejects -/
 
@@ -4971,9 +4986,9 @@ def moveReuse : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem moveReuse_movesOk : movesOk moveReuse = false := by decide
+theorem moveReuse_movesOk : movesOk moveReuse = false := by decide +kernel
 
-theorem moveReuse_not_inFragment : inFragment moveReuse = false := by decide
+theorem moveReuse_not_inFragment : inFragment moveReuse = false := by decide +kernel
 
 /-- The two models indeed disagree on `moveReuse(7)`: Anneal faults, while
 MiniRust's run of the translated body returns `7`. -/
@@ -4999,7 +5014,7 @@ def moveReuse7S0 : MachineState := initMachineState moveReuse [.scalar ⟨7, 4�
 
 theorem moveReuse7_anneal_ub :
     ∃ tr u, Reaches (mirTree moveReuse moveReuse7S0) tr u ∧ FaultNow u :=
-  faultsA_sound moveReuse 10 _ (by decide)
+  faultsA_sound moveReuse 10 _ (by decide +kernel)
 
 theorem moveReuse7_minirust_direct :
     (Interp.steps 7 (machine moveReuse moveReuseFn moveReuse7S0.frame.locals
@@ -5066,14 +5081,14 @@ def crossBlockMove : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem crossBlockMove_inFragment : inFragment crossBlockMove = true := by decide
+theorem crossBlockMove_inFragment : inFragment crossBlockMove = true := by decide +kernel
 
 /-- Forward CFG dataflow `movedAtEntry` for `crossBlockMove`: `bb0` starts with
 `[]`, while `bb1`, `bb2`, and `bb3` have `[1]` moved out on entry (`_3` is
 initialized in `bb0`, moved in `bb1`, and re-allocated/initialized in `bb1`
 before reaching `bb2`). -/
 theorem crossBlockMove_movedAtEntry :
-    [0, 1, 2, 3].map (movedAtEntry crossBlockMove) = [[], [1], [1], [1]] := by decide
+    [0, 1, 2, 3].map (movedAtEntry crossBlockMove) = [[], [1], [1], [1]] := by decide +kernel
 
 def crossBlockMoveFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32),
@@ -5126,7 +5141,7 @@ theorem ctx0_ok_crossBlockMove : CtxOk crossBlockMove ctx0 where
   ret := by
     intro d hd
     simp [crossBlockMove] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 def crossBlockMove20S0 : MachineState := initMachineState crossBlockMove [.scalar ⟨20, 4⟩]
 def crossBlockMove20MInit : Mach :=
@@ -5136,10 +5151,10 @@ theorem crossBlockMove20_anneal_ret :
     ReachesRet (mirTree crossBlockMove crossBlockMove20S0)
       [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
       (.normal (.scalar ⟨35, 4⟩, crossBlockMove20S0.memory)) :=
-  runA_sound crossBlockMove 30 _ _ _ rfl
+  runA_sound crossBlockMove 30 _ _ _ (by kernel_rfl)
 
 theorem crossBlockMove20_noUB : MirNoUBTree (mirCallTree crossBlockMove [.scalar ⟨20, 4⟩]) :=
-  runA_noUB crossBlockMove 30 _ _ _ rfl
+  runA_isSome_noUB crossBlockMove 30 _ (by kernel_rfl)
 
 theorem crossBlockMove20_progress (n : Nat) :
     (∃ s' m' tr, Interp.steps (initLen crossBlockMove + n) crossBlockMove20MInit = .ok m' ∧
@@ -5150,7 +5165,7 @@ theorem crossBlockMove20_progress (n : Nat) :
       ReturnRel crossBlockMove ctx0 s' v mRet ∧
       ReachesRet (mirCallTree crossBlockMove [.scalar ⟨20, 4⟩]) tr (.normal (v, mem))) :=
   mirCall_progress crossBlockMove_inFragment crossBlockMove_translate ctx0 ctx0_ok_crossBlockMove
-    [.scalar ⟨20, 4⟩] (by decide) crossBlockMove20MInit rfl rfl rfl crossBlockMove20_noUB n
+    [.scalar ⟨20, 4⟩] (by decide +kernel) crossBlockMove20MInit rfl rfl rfl crossBlockMove20_noUB n
 
 theorem crossBlockMove20_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n crossBlockMove20MInit = .ok m' ∧
@@ -5158,7 +5173,7 @@ theorem crossBlockMove20_minirust_ret_from_start :
       m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret crossBlockMove_inFragment crossBlockMove_translate ctx0 ctx0_ok_crossBlockMove
-      [.scalar ⟨20, 4⟩] (by decide) crossBlockMove20MInit rfl rfl rfl crossBlockMove20_anneal_ret
+      [.scalar ⟨20, 4⟩] (by decide +kernel) crossBlockMove20MInit rfl rfl rfl crossBlockMove20_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [crossBlockMove] at hd; subst hd
   simp [retPtr, ctx0] at hp
@@ -5185,11 +5200,11 @@ theorem crossBlockMoveOv_anneal_ret :
     ReachesRet (mirTree crossBlockMove crossBlockMoveOvS0)
       [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
       (.normal (.scalar ⟨0, 4⟩, crossBlockMoveOvS0.memory)) :=
-  runA_sound crossBlockMove 30 _ _ _ rfl
+  runA_sound crossBlockMove 30 _ _ _ (by kernel_rfl)
 
 theorem crossBlockMoveOv_noUB :
     MirNoUBTree (mirCallTree crossBlockMove [.scalar ⟨4294967290, 4⟩]) :=
-  runA_noUB crossBlockMove 30 _ _ _ rfl
+  runA_isSome_noUB crossBlockMove 30 _ (by kernel_rfl)
 
 theorem crossBlockMoveOv_progress (n : Nat) :
     (∃ s' m' tr, Interp.steps (initLen crossBlockMove + n) crossBlockMoveOvMInit = .ok m' ∧
@@ -5200,7 +5215,7 @@ theorem crossBlockMoveOv_progress (n : Nat) :
       ReturnRel crossBlockMove ctx0 s' v mRet ∧
       ReachesRet (mirCallTree crossBlockMove [.scalar ⟨4294967290, 4⟩]) tr (.normal (v, mem))) :=
   mirCall_progress crossBlockMove_inFragment crossBlockMove_translate ctx0 ctx0_ok_crossBlockMove
-    [.scalar ⟨4294967290, 4⟩] (by decide) crossBlockMoveOvMInit rfl rfl rfl crossBlockMoveOv_noUB n
+    [.scalar ⟨4294967290, 4⟩] (by decide +kernel) crossBlockMoveOvMInit rfl rfl rfl crossBlockMoveOv_noUB n
 
 theorem crossBlockMoveOv_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n crossBlockMoveOvMInit = .ok m' ∧
@@ -5208,7 +5223,7 @@ theorem crossBlockMoveOv_minirust_ret_from_start :
       m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret crossBlockMove_inFragment crossBlockMove_translate ctx0 ctx0_ok_crossBlockMove
-      [.scalar ⟨4294967290, 4⟩] (by decide) crossBlockMoveOvMInit rfl rfl rfl
+      [.scalar ⟨4294967290, 4⟩] (by decide +kernel) crossBlockMoveOvMInit rfl rfl rfl
       crossBlockMoveOv_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [crossBlockMove] at hd; subst hd
@@ -5249,7 +5264,7 @@ def crossBlockMoveReuse : CapturedMir where
 
 theorem crossBlockMoveReuse_movesOk :
     movedAtEntry crossBlockMoveReuse 1 = [1] ∧ movesOk crossBlockMoveReuse = false ∧
-    inFragment crossBlockMoveReuse = false := by decide
+    inFragment crossBlockMoveReuse = false := by decide +kernel
 
 /-! ### A body that `mentionsOk` rejects (`alwaysStorageLiveLocals` gap) -/
 
@@ -5277,7 +5292,7 @@ def unmarkedTempAssign : CapturedMir where
 theorem unmarkedTempAssign_rejected :
     alwaysStorageLiveLocals unmarkedTempAssign = [1] ∧
     mentionsOk unmarkedTempAssign = false ∧
-    inFragment unmarkedTempAssign = false := by decide
+    inFragment unmarkedTempAssign = false := by decide +kernel
 
 def unmarkedTempAssignFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32)]⟩
@@ -5300,7 +5315,7 @@ def unmarkedTempAssignS0 : MachineState := initMachineState unmarkedTempAssign [
 
 theorem unmarkedTempAssign_anneal_ub :
     ∃ tr u, Reaches (mirTree unmarkedTempAssign unmarkedTempAssignS0) tr u ∧ FaultNow u :=
-  faultsA_sound unmarkedTempAssign 10 _ (by decide)
+  faultsA_sound unmarkedTempAssign 10 _ (by decide +kernel)
 
 theorem unmarkedTempAssign_minirust_direct :
     (Interp.steps 5 (machine unmarkedTempAssign unmarkedTempAssignFn
@@ -5426,11 +5441,11 @@ def loopTempMove : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem loopTempMove_inFragment : inFragment loopTempMove = true := by decide
+theorem loopTempMove_inFragment : inFragment loopTempMove = true := by decide +kernel
 
-theorem loopTempMove_alwaysLive : alwaysStorageLiveLocals loopTempMove = [4, 5] := by decide
+theorem loopTempMove_alwaysLive : alwaysStorageLiveLocals loopTempMove = [4, 5] := by decide +kernel
 
-theorem loopTempMove_initLen : initLen loopTempMove = 3 := by decide
+theorem loopTempMove_initLen : initLen loopTempMove = 3 := by decide +kernel
 
 /-- Pass 1 of `iterMovedEntries` records `2` at `bb1` from the back-edge
 `bb2 → bb1` (`[[], [2], [3], [3]]`), and Pass 2 propagates `2` from `bb1` into
@@ -5438,7 +5453,7 @@ theorem loopTempMove_initLen : initLen loopTempMove = 3 := by decide
 theorem loopTempMove_movedAtEntry_multiPass :
     iterMovedEntries 1 loopTempMove.basicBlocks [] = [[], [2], [3], [3]] ∧
     iterMovedEntries 2 loopTempMove.basicBlocks [] = [[], [2], [2, 3], [2, 3]] ∧
-    [0, 1, 2, 3].map (movedAtEntry loopTempMove) = [[], [2], [2, 3], [2, 3]] := by decide
+    [0, 1, 2, 3].map (movedAtEntry loopTempMove) = [[], [2], [2, 3], [2, 3]] := by decide +kernel
 
 def loopTempMoveFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32), (localName 2, .Int u32),
@@ -5488,7 +5503,7 @@ theorem ctx0_ok_loopTempMove : CtxOk loopTempMove ctx0 where
   ret := by
     intro d hd
     simp [loopTempMove] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 def loopTempMove3S0 : MachineState := initMachineState loopTempMove [.scalar ⟨3, 4⟩]
 def loopTempMove3MInit : Mach :=
@@ -5500,10 +5515,10 @@ def loopTempMove3Trace : List (Event MirEffect) :=
 theorem loopTempMove3_anneal_ret :
     ReachesRet (mirTree loopTempMove loopTempMove3S0) loopTempMove3Trace
       (.normal (.scalar ⟨6, 4⟩, loopTempMove3S0.memory)) :=
-  runA_sound loopTempMove 50 _ _ _ rfl
+  runA_sound loopTempMove 50 _ _ _ (by kernel_rfl)
 
 theorem loopTempMove3_noUB : MirNoUBTree (mirCallTree loopTempMove [.scalar ⟨3, 4⟩]) :=
-  runA_noUB loopTempMove 50 _ _ _ rfl
+  runA_isSome_noUB loopTempMove 50 _ (by kernel_rfl)
 
 theorem loopTempMove3_progress (n : Nat) :
     (∃ s' m' tr, Interp.steps (initLen loopTempMove + n) loopTempMove3MInit = .ok m' ∧
@@ -5514,7 +5529,7 @@ theorem loopTempMove3_progress (n : Nat) :
       ReturnRel loopTempMove ctx0 s' v mRet ∧
       ReachesRet (mirCallTree loopTempMove [.scalar ⟨3, 4⟩]) tr (.normal (v, mem))) :=
   mirCall_progress loopTempMove_inFragment loopTempMove_translate ctx0 ctx0_ok_loopTempMove
-    [.scalar ⟨3, 4⟩] (by decide) loopTempMove3MInit rfl rfl rfl loopTempMove3_noUB n
+    [.scalar ⟨3, 4⟩] (by decide +kernel) loopTempMove3MInit rfl rfl rfl loopTempMove3_noUB n
 
 theorem loopTempMove3_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n loopTempMove3MInit = .ok m' ∧
@@ -5522,7 +5537,7 @@ theorem loopTempMove3_minirust_ret_from_start :
       m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret loopTempMove_inFragment loopTempMove_translate ctx0 ctx0_ok_loopTempMove
-      [.scalar ⟨3, 4⟩] (by decide) loopTempMove3MInit rfl rfl rfl loopTempMove3_anneal_ret
+      [.scalar ⟨3, 4⟩] (by decide +kernel) loopTempMove3MInit rfl rfl rfl loopTempMove3_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [loopTempMove] at hd; subst hd
   simp [retPtr, ctx0] at hp
@@ -5547,10 +5562,10 @@ theorem loopTempMove0_anneal_ret :
     ReachesRet (mirTree loopTempMove loopTempMove0S0)
       [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
       (.normal (.scalar ⟨0, 4⟩, loopTempMove0S0.memory)) :=
-  runA_sound loopTempMove 20 _ _ _ rfl
+  runA_sound loopTempMove 20 _ _ _ (by kernel_rfl)
 
 theorem loopTempMove0_noUB : MirNoUBTree (mirCallTree loopTempMove [.scalar ⟨0, 4⟩]) :=
-  runA_noUB loopTempMove 20 _ _ _ rfl
+  runA_isSome_noUB loopTempMove 20 _ (by kernel_rfl)
 
 theorem loopTempMove0_progress (n : Nat) :
     (∃ s' m' tr, Interp.steps (initLen loopTempMove + n) loopTempMove0MInit = .ok m' ∧
@@ -5561,7 +5576,7 @@ theorem loopTempMove0_progress (n : Nat) :
       ReturnRel loopTempMove ctx0 s' v mRet ∧
       ReachesRet (mirCallTree loopTempMove [.scalar ⟨0, 4⟩]) tr (.normal (v, mem))) :=
   mirCall_progress loopTempMove_inFragment loopTempMove_translate ctx0 ctx0_ok_loopTempMove
-    [.scalar ⟨0, 4⟩] (by decide) loopTempMove0MInit rfl rfl rfl loopTempMove0_noUB n
+    [.scalar ⟨0, 4⟩] (by decide +kernel) loopTempMove0MInit rfl rfl rfl loopTempMove0_noUB n
 
 theorem loopTempMove0_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n loopTempMove0MInit = .ok m' ∧
@@ -5569,7 +5584,7 @@ theorem loopTempMove0_minirust_ret_from_start :
       m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret loopTempMove_inFragment loopTempMove_translate ctx0 ctx0_ok_loopTempMove
-      [.scalar ⟨0, 4⟩] (by decide) loopTempMove0MInit rfl rfl rfl loopTempMove0_anneal_ret
+      [.scalar ⟨0, 4⟩] (by decide +kernel) loopTempMove0MInit rfl rfl rfl loopTempMove0_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [loopTempMove] at hd; subst hd
   simp [retPtr, ctx0] at hp
@@ -5624,7 +5639,7 @@ theorem loopBackEdgeReuse_movesOk :
     (iterMovedEntries 1 loopBackEdgeReuse.basicBlocks []).getD 3 [] = [] ∧
     movedAtEntry loopBackEdgeReuse 3 = [2] ∧
     movesOk loopBackEdgeReuse = false ∧
-    inFragment loopBackEdgeReuse = false := by decide
+    inFragment loopBackEdgeReuse = false := by decide +kernel
 
 def loopBackEdgeReuseFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32), (localName 2, .Int u32)]⟩
@@ -5657,7 +5672,7 @@ def loopBackEdgeReuse1S0 : MachineState := initMachineState loopBackEdgeReuse [.
 
 theorem loopBackEdgeReuse1_anneal_ub :
     ∃ tr u, Reaches (mirTree loopBackEdgeReuse loopBackEdgeReuse1S0) tr u ∧ FaultNow u :=
-  faultsA_sound loopBackEdgeReuse 20 _ (by decide)
+  faultsA_sound loopBackEdgeReuse 20 _ (by decide +kernel)
 
 theorem loopBackEdgeReuse1_minirust_direct :
     (Interp.steps 12 (machine loopBackEdgeReuse loopBackEdgeReuseFn
@@ -5685,7 +5700,7 @@ def deadAssign : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem deadAssign_inFragment : inFragment deadAssign = true := by decide
+theorem deadAssign_inFragment : inFragment deadAssign = true := by decide +kernel
 
 def deadAssignFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32)]⟩
@@ -5707,13 +5722,13 @@ def deadAssignS0 : MachineState := initMachineState deadAssign []
 def deadAssignMInit : Mach := machine deadAssign deadAssignFn deadAssignS0.frame.locals deadAssignFn.start
 
 theorem deadAssign_anneal_ub : ∃ tr u, Reaches (mirTree deadAssign deadAssignS0) tr u ∧ FaultNow u :=
-  faultsA_sound deadAssign 10 _ (by decide)
+  faultsA_sound deadAssign 10 _ (by decide +kernel)
 
 theorem deadAssign_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n deadAssignMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := deadAssign_anneal_ub
   exact mirCall_ub deadAssign_inFragment deadAssign_translate ctx0 (ctx0_ok2 rfl) []
-    (by decide) deadAssignMInit rfl rfl rfl hr hf
+    (by decide +kernel) deadAssignMInit rfl rfl rfl hr hf
 
 theorem deadAssign_minirust_direct :
     (match Interp.steps 4 deadAssignMInit with
@@ -5736,7 +5751,7 @@ theorem deadAssign_converse_error :
       ReturnRel deadAssign ctx0 s' v mRet ∧
       ReachesRet (mirCallTree deadAssign []) tr (.normal (v, mem))) :=
   mirCall_steps_error deadAssign_inFragment deadAssign_translate ctx0 (ctx0_ok2 rfl) []
-    (by decide) deadAssignMInit rfl rfl rfl deadAssign_steps4_ub
+    (by decide +kernel) deadAssignMInit rfl rfl rfl deadAssign_steps4_ub
 
 theorem deadAssign_outcome (n : Nat) :
     (∃ s' m' tr, Interp.steps (initLen deadAssign + n) deadAssignMInit = .ok m' ∧
@@ -5749,7 +5764,7 @@ theorem deadAssign_outcome (n : Nat) :
     (∃ msg, Interp.steps (initLen deadAssign + n) deadAssignMInit = .error (.ub msg) ∧
       ∃ tr u, Reaches (mirCallTree deadAssign []) tr u ∧ FaultNow u) :=
   mirCall_outcome deadAssign_inFragment deadAssign_translate ctx0 (ctx0_ok2 rfl) []
-    (by decide) deadAssignMInit rfl rfl rfl n
+    (by decide +kernel) deadAssignMInit rfl rfl rfl n
 
 /-- `Deinit(_1)` after `StorageDead(_1)` raises UB in both models. -/
 def deadDeinit : CapturedMir where
@@ -5769,7 +5784,7 @@ def deadDeinit : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem deadDeinit_inFragment : inFragment deadDeinit = true := by decide
+theorem deadDeinit_inFragment : inFragment deadDeinit = true := by decide +kernel
 
 def deadDeinitFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32)]⟩
@@ -5792,13 +5807,13 @@ def deadDeinitS0 : MachineState := initMachineState deadDeinit []
 def deadDeinitMInit : Mach := machine deadDeinit deadDeinitFn deadDeinitS0.frame.locals deadDeinitFn.start
 
 theorem deadDeinit_anneal_ub : ∃ tr u, Reaches (mirTree deadDeinit deadDeinitS0) tr u ∧ FaultNow u :=
-  faultsA_sound deadDeinit 10 _ (by decide)
+  faultsA_sound deadDeinit 10 _ (by decide +kernel)
 
 theorem deadDeinit_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n deadDeinitMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := deadDeinit_anneal_ub
   exact mirCall_ub deadDeinit_inFragment deadDeinit_translate ctx0 (ctx0_ok2 rfl) []
-    (by decide) deadDeinitMInit rfl rfl rfl hr hf
+    (by decide +kernel) deadDeinitMInit rfl rfl rfl hr hf
 
 theorem deadDeinit_minirust_direct :
     (match Interp.steps 5 deadDeinitMInit with
@@ -5821,7 +5836,7 @@ theorem deadDeinit_converse_error :
       ReturnRel deadDeinit ctx0 s' v mRet ∧
       ReachesRet (mirCallTree deadDeinit []) tr (.normal (v, mem))) :=
   mirCall_steps_error deadDeinit_inFragment deadDeinit_translate ctx0 (ctx0_ok2 rfl) []
-    (by decide) deadDeinitMInit rfl rfl rfl deadDeinit_steps5_ub
+    (by decide +kernel) deadDeinitMInit rfl rfl rfl deadDeinit_steps5_ub
 
 theorem deadDeinit_outcome (n : Nat) :
     (∃ s' m' tr, Interp.steps (initLen deadDeinit + n) deadDeinitMInit = .ok m' ∧
@@ -5834,7 +5849,7 @@ theorem deadDeinit_outcome (n : Nat) :
     (∃ msg, Interp.steps (initLen deadDeinit + n) deadDeinitMInit = .error (.ub msg) ∧
       ∃ tr u, Reaches (mirCallTree deadDeinit []) tr u ∧ FaultNow u) :=
   mirCall_outcome deadDeinit_inFragment deadDeinit_translate ctx0 (ctx0_ok2 rfl) []
-    (by decide) deadDeinitMInit rfl rfl rfl n
+    (by decide +kernel) deadDeinitMInit rfl rfl rfl n
 
 /-- Projected `PlaceMention(_1.0)` on `_1: (u32, bool)` after `StorageDead(_1)`
 raises UB in both models. -/
@@ -5867,7 +5882,7 @@ def deadPlaceMention : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem deadPlaceMention_inFragment : inFragment deadPlaceMention = true := by decide
+theorem deadPlaceMention_inFragment : inFragment deadPlaceMention = true := by decide +kernel
 
 def deadPlaceMentionFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, intBoolTupleTy u32)]⟩
@@ -5893,13 +5908,13 @@ def deadPlaceMentionMInit : Mach :=
 
 theorem deadPlaceMention_anneal_ub :
     ∃ tr u, Reaches (mirTree deadPlaceMention deadPlaceMentionS0) tr u ∧ FaultNow u :=
-  faultsA_sound deadPlaceMention 10 _ (by decide)
+  faultsA_sound deadPlaceMention 10 _ (by decide +kernel)
 
 theorem deadPlaceMention_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n deadPlaceMentionMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := deadPlaceMention_anneal_ub
   exact mirCall_ub deadPlaceMention_inFragment deadPlaceMention_translate ctx0
-    (ctx0_ok_u32_tuple rfl) [] (by decide) deadPlaceMentionMInit rfl rfl rfl hr hf
+    (ctx0_ok_u32_tuple rfl) [] (by decide +kernel) deadPlaceMentionMInit rfl rfl rfl hr hf
 
 theorem deadPlaceMention_minirust_direct :
     (match Interp.steps 4 deadPlaceMentionMInit with
@@ -5922,7 +5937,7 @@ theorem deadPlaceMention_converse_error :
       ReturnRel deadPlaceMention ctx0 s' v mRet ∧
       ReachesRet (mirCallTree deadPlaceMention []) tr (.normal (v, mem))) :=
   mirCall_steps_error deadPlaceMention_inFragment deadPlaceMention_translate ctx0
-    (ctx0_ok_u32_tuple rfl) [] (by decide) deadPlaceMentionMInit rfl rfl rfl
+    (ctx0_ok_u32_tuple rfl) [] (by decide +kernel) deadPlaceMentionMInit rfl rfl rfl
     deadPlaceMention_steps4_ub
 
 theorem deadPlaceMention_outcome (n : Nat) :
@@ -5936,7 +5951,7 @@ theorem deadPlaceMention_outcome (n : Nat) :
     (∃ msg, Interp.steps (initLen deadPlaceMention + n) deadPlaceMentionMInit = .error (.ub msg) ∧
       ∃ tr u, Reaches (mirCallTree deadPlaceMention []) tr u ∧ FaultNow u) :=
   mirCall_outcome deadPlaceMention_inFragment deadPlaceMention_translate ctx0
-    (ctx0_ok_u32_tuple rfl) [] (by decide) deadPlaceMentionMInit rfl rfl rfl n
+    (ctx0_ok_u32_tuple rfl) [] (by decide +kernel) deadPlaceMentionMInit rfl rfl rfl n
 
 /-! ### Boundary counterexamples (`storageDeadOk`, `Deinit`, `stmtMoved`,
 `readsOk`, `termReadsOk`) -/
@@ -5959,7 +5974,7 @@ def storageDeadRet : CapturedMir where
   allocations := []
 
 theorem storageDeadRet_rejected :
-    storageDeadOk storageDeadRet = false ∧ inFragment storageDeadRet = false := by decide
+    storageDeadOk storageDeadRet = false ∧ inFragment storageDeadRet = false := by decide +kernel
 
 def storageDeadRetFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32)]⟩
@@ -5979,7 +5994,7 @@ def storageDeadRetS0 : MachineState := initMachineState storageDeadRet []
 
 theorem storageDeadRet_anneal_ub :
     ∃ tr u, Reaches (mirTree storageDeadRet storageDeadRetS0) tr u ∧ FaultNow u :=
-  faultsA_sound storageDeadRet 5 _ (by decide)
+  faultsA_sound storageDeadRet 5 _ (by decide +kernel)
 
 theorem storageDeadRet_minirust_panics :
     (match Interp.steps 3 (machine storageDeadRet storageDeadRetFn storageDeadRetS0.frame.locals
@@ -5990,9 +6005,9 @@ theorem storageDeadRet_minirust_panics :
   decide +kernel
 
 /-- `Deinit(_1.0); _0 = copy (_1.0); return` on `_1: (u32, bool)` is rejected by
-`statementOk`: Anneal's projected `Deinit` checks `_1.0` and leaves `_1`
-initialized (returning `42`), whereas MiniRust overwrites `_1.0` with `Uninit`
-bytes so the subsequent load raises UB. -/
+`statementOk`: both Anneal's projected `Deinit` (`Value.uninit` in `_1.0`) and
+MiniRust (`Uninit` bytes in `_1.0`) deinitialize `_1.0` so the subsequent load
+raises UB. -/
 def projectedDeinit : CapturedMir where
   defPath := "witness::projected_deinit"
   phase := .runtimePostCleanup
@@ -6010,7 +6025,7 @@ def projectedDeinit : CapturedMir where
 
 theorem projectedDeinit_rejected :
     statementOk projectedDeinit.localDecls (mkStmt (.deinit (field0U32 1))) = false ∧
-    inFragment projectedDeinit = false := by decide
+    inFragment projectedDeinit = false := by decide +kernel
 
 def projectedDeinitFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, intBoolTupleTy u32)]⟩
@@ -6032,10 +6047,9 @@ theorem projectedDeinit_translate :
 def projectedDeinitArgs : List Value := [.aggregate 0 [.scalar ⟨42, 4⟩, .scalar ⟨1, 1⟩]]
 def projectedDeinitS0 : MachineState := initMachineState projectedDeinit projectedDeinitArgs
 
-theorem projectedDeinit_anneal_ret :
-    ReachesRet (mirTree projectedDeinit projectedDeinitS0) []
-      (.normal (.scalar ⟨42, 4⟩, projectedDeinitS0.memory)) :=
-  runA_sound projectedDeinit 10 _ _ _ rfl
+theorem projectedDeinit_anneal_ub :
+    ∃ tr u, Reaches (mirTree projectedDeinit projectedDeinitS0) tr u ∧ FaultNow u :=
+  faultsA_sound projectedDeinit 10 projectedDeinitS0 (by kernel_rfl)
 
 theorem projectedDeinit_minirust_ub :
     (match Interp.steps 3 (machine projectedDeinit projectedDeinitFn projectedDeinitS0.frame.locals
@@ -6064,7 +6078,7 @@ def projAssignMoveReuse : CapturedMir where
   allocations := []
 
 theorem projAssignMoveReuse_movesOk :
-    movesOk projAssignMoveReuse = false ∧ inFragment projAssignMoveReuse = false := by decide
+    movesOk projAssignMoveReuse = false ∧ inFragment projAssignMoveReuse = false := by decide +kernel
 
 /-- `_0 = BinaryOp(Add, move _1, copy _1); return` for `fn(u32) -> u32`:
 `readsOk` threads `moveOut` left-to-right across the operands of a single
@@ -6089,7 +6103,7 @@ def sameRvalueMoveReuse : CapturedMir where
 theorem sameRvalueMoveReuse_movesOk :
     readsOk [] (rvOperands (.binaryOp .add (.move (local_ 1)) (.copy (local_ 1)))) = false ∧
     movesOk sameRvalueMoveReuse = false ∧
-    inFragment sameRvalueMoveReuse = false := by decide
+    inFragment sameRvalueMoveReuse = false := by decide +kernel
 
 def sameRvalueMoveReuseFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32)]⟩
@@ -6112,7 +6126,7 @@ def sameRvalueMoveReuse5S0 : MachineState := initMachineState sameRvalueMoveReus
 
 theorem sameRvalueMoveReuse5_anneal_ub :
     ∃ tr u, Reaches (mirTree sameRvalueMoveReuse sameRvalueMoveReuse5S0) tr u ∧ FaultNow u :=
-  faultsA_sound sameRvalueMoveReuse 5 _ (by decide)
+  faultsA_sound sameRvalueMoveReuse 5 _ (by decide +kernel)
 
 theorem sameRvalueMoveReuse5_minirust_direct :
     (Interp.steps 3 (machine sameRvalueMoveReuse sameRvalueMoveReuseFn
@@ -6147,7 +6161,7 @@ def moveRetPlace : CapturedMir where
 theorem moveRetPlace_movesOk :
     termReadsOk [0] (mkTerm .return_) = false ∧
     movesOk moveRetPlace = false ∧
-    inFragment moveRetPlace = false := by decide
+    inFragment moveRetPlace = false := by decide +kernel
 
 def moveRetPlaceFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32)]⟩
@@ -6171,7 +6185,7 @@ def moveRetPlaceS0 : MachineState := initMachineState moveRetPlace []
 
 theorem moveRetPlace_anneal_ub :
     ∃ tr u, Reaches (mirTree moveRetPlace moveRetPlaceS0) tr u ∧ FaultNow u :=
-  faultsA_sound moveRetPlace 10 _ (by decide)
+  faultsA_sound moveRetPlace 10 _ (by decide +kernel)
 
 theorem moveRetPlace_minirust_direct :
     (Interp.steps 6 (machine moveRetPlace moveRetPlaceFn
@@ -6211,7 +6225,7 @@ def storageLiveArgRet : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem storageLiveArgRet_inFragment : inFragment storageLiveArgRet = true := by decide
+theorem storageLiveArgRet_inFragment : inFragment storageLiveArgRet = true := by decide +kernel
 
 def storageLiveArgRetFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32), (localName 2, .Int u32)]⟩
@@ -6260,11 +6274,11 @@ def storageLiveArgRet5MInit : Mach :=
 theorem storageLiveArgRet5_anneal_ret :
     ReachesRet (mirTree storageLiveArgRet storageLiveArgRet5S0) []
       (.normal (.scalar ⟨30, 4⟩, storageLiveArgRet5S0.memory)) :=
-  runA_sound storageLiveArgRet 20 _ _ _ rfl
+  runA_sound storageLiveArgRet 20 _ _ _ (by kernel_rfl)
 
 theorem storageLiveArgRet5_noUB :
     MirNoUBTree (mirCallTree storageLiveArgRet [.scalar ⟨5, 4⟩]) :=
-  runA_noUB storageLiveArgRet 20 _ _ _ rfl
+  runA_isSome_noUB storageLiveArgRet 20 _ (by kernel_rfl)
 
 theorem storageLiveArgRet5_progress (n : Nat) :
     (∃ s' m' tr, Interp.steps (initLen storageLiveArgRet + n) storageLiveArgRet5MInit = .ok m' ∧
@@ -6276,7 +6290,7 @@ theorem storageLiveArgRet5_progress (n : Nat) :
       ReturnRel storageLiveArgRet ctx0 s' v mRet ∧
       ReachesRet (mirCallTree storageLiveArgRet [.scalar ⟨5, 4⟩]) tr (.normal (v, mem))) :=
   mirCall_progress storageLiveArgRet_inFragment storageLiveArgRet_translate ctx0
-    (ctx0_ok_u32_3 rfl) [.scalar ⟨5, 4⟩] (by decide) storageLiveArgRet5MInit
+    (ctx0_ok_u32_3 rfl) [.scalar ⟨5, 4⟩] (by decide +kernel) storageLiveArgRet5MInit
     rfl rfl rfl storageLiveArgRet5_noUB n
 
 theorem storageLiveArgRet5_minirust_ret_from_start :
@@ -6285,7 +6299,7 @@ theorem storageLiveArgRet5_minirust_ret_from_start :
       m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret storageLiveArgRet_inFragment storageLiveArgRet_translate ctx0
-      (ctx0_ok_u32_3 rfl) [.scalar ⟨5, 4⟩] (by decide) storageLiveArgRet5MInit
+      (ctx0_ok_u32_3 rfl) [.scalar ⟨5, 4⟩] (by decide +kernel) storageLiveArgRet5MInit
       rfl rfl rfl storageLiveArgRet5_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [storageLiveArgRet] at hd; subst hd
@@ -6328,7 +6342,7 @@ def storageDeadArg : CapturedMir where
 theorem storageDeadArg_rejected :
     statementOk storageDeadArg.localDecls (mkStmt (.storageDead 1)) = true ∧
     storageDeadOk storageDeadArg = false ∧
-    inFragment storageDeadArg = false := by decide
+    inFragment storageDeadArg = false := by decide +kernel
 
 def storageDeadArgFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32)]⟩
@@ -6353,7 +6367,7 @@ def storageDeadArg5S0 : MachineState :=
 theorem storageDeadArg5_anneal_ret :
     ReachesRet (mirTree storageDeadArg storageDeadArg5S0) []
       (.normal (.scalar ⟨5, 4⟩, storageDeadArg5S0.memory)) :=
-  runA_sound storageDeadArg 10 _ _ _ rfl
+  runA_sound storageDeadArg 10 _ _ _ (by kernel_rfl)
 
 theorem storageDeadArg5_minirust_direct :
     (Interp.steps 4 (machine storageDeadArg storageDeadArgFn
@@ -6386,7 +6400,7 @@ def storageDeadArgReadAfter : CapturedMir where
 
 theorem storageDeadArgReadAfter_rejected :
     storageDeadOk storageDeadArgReadAfter = false ∧
-    inFragment storageDeadArgReadAfter = false := by decide
+    inFragment storageDeadArgReadAfter = false := by decide +kernel
 
 def storageDeadArgReadAfterFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32)]⟩
@@ -6411,7 +6425,7 @@ def storageDeadArgReadAfter5S0 : MachineState :=
 theorem storageDeadArgReadAfter5_anneal_ub :
     ∃ tr u, Reaches (mirTree storageDeadArgReadAfter storageDeadArgReadAfter5S0) tr u ∧
       FaultNow u :=
-  faultsA_sound storageDeadArgReadAfter 10 _ (by decide)
+  faultsA_sound storageDeadArgReadAfter 10 _ (by decide +kernel)
 
 theorem storageDeadArgReadAfter5_minirust_ub :
     (match Interp.steps 3 (machine storageDeadArgReadAfter storageDeadArgReadAfterFn
@@ -6476,10 +6490,10 @@ def diamondMoveJoin : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem diamondMoveJoin_inFragment : inFragment diamondMoveJoin = true := by decide
+theorem diamondMoveJoin_inFragment : inFragment diamondMoveJoin = true := by decide +kernel
 
 theorem diamondMoveJoin_movedAtEntry :
-    [0, 1, 2, 3].map (movedAtEntry diamondMoveJoin) = [[], [1], [1], [1, 2]] := by decide
+    [0, 1, 2, 3].map (movedAtEntry diamondMoveJoin) = [[], [1], [1], [1, 2]] := by decide +kernel
 
 def diamondMoveJoinFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Bool),
@@ -6522,11 +6536,11 @@ theorem diamondMoveJoinTrue_anneal_ret :
     ReachesRet (mirTree diamondMoveJoin diamondMoveJoinTrueS0)
       [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
       (.normal (.scalar ⟨8, 4⟩, diamondMoveJoinTrueS0.memory)) :=
-  runA_sound diamondMoveJoin 20 _ _ _ rfl
+  runA_sound diamondMoveJoin 20 _ _ _ (by kernel_rfl)
 
 theorem diamondMoveJoinTrue_noUB :
     MirNoUBTree (mirCallTree diamondMoveJoin diamondMoveJoinTrueArgs) :=
-  runA_noUB diamondMoveJoin 20 _ _ _ rfl
+  runA_isSome_noUB diamondMoveJoin 20 _ (by kernel_rfl)
 
 theorem diamondMoveJoinTrue_progress (n : Nat) :
     (∃ s' m' tr, Interp.steps (initLen diamondMoveJoin + n) diamondMoveJoinTrueMInit = .ok m' ∧
@@ -6539,7 +6553,7 @@ theorem diamondMoveJoinTrue_progress (n : Nat) :
       ReachesRet (mirCallTree diamondMoveJoin diamondMoveJoinTrueArgs) tr
         (.normal (v, mem))) :=
   mirCall_progress diamondMoveJoin_inFragment diamondMoveJoin_translate ctx0_2
-    (ctx0_2_ok_bool_u32 rfl) diamondMoveJoinTrueArgs (by decide)
+    (ctx0_2_ok_bool_u32 rfl) diamondMoveJoinTrueArgs (by decide +kernel)
     diamondMoveJoinTrueMInit rfl rfl rfl diamondMoveJoinTrue_noUB n
 
 theorem diamondMoveJoinTrue_minirust_ret_from_start :
@@ -6548,7 +6562,7 @@ theorem diamondMoveJoinTrue_minirust_ret_from_start :
       m'.threads = [thread1 ctx0_2 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret diamondMoveJoin_inFragment diamondMoveJoin_translate ctx0_2
-      (ctx0_2_ok_bool_u32 rfl) diamondMoveJoinTrueArgs (by decide)
+      (ctx0_2_ok_bool_u32 rfl) diamondMoveJoinTrueArgs (by decide +kernel)
       diamondMoveJoinTrueMInit rfl rfl rfl diamondMoveJoinTrue_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [diamondMoveJoin] at hd; subst hd
@@ -6576,11 +6590,11 @@ theorem diamondMoveJoinFalse_anneal_ret :
     ReachesRet (mirTree diamondMoveJoin diamondMoveJoinFalseS0)
       [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
       (.normal (.scalar ⟨14, 4⟩, diamondMoveJoinFalseS0.memory)) :=
-  runA_sound diamondMoveJoin 20 _ _ _ rfl
+  runA_sound diamondMoveJoin 20 _ _ _ (by kernel_rfl)
 
 theorem diamondMoveJoinFalse_noUB :
     MirNoUBTree (mirCallTree diamondMoveJoin diamondMoveJoinFalseArgs) :=
-  runA_noUB diamondMoveJoin 20 _ _ _ rfl
+  runA_isSome_noUB diamondMoveJoin 20 _ (by kernel_rfl)
 
 theorem diamondMoveJoinFalse_progress (n : Nat) :
     (∃ s' m' tr, Interp.steps (initLen diamondMoveJoin + n) diamondMoveJoinFalseMInit = .ok m' ∧
@@ -6593,7 +6607,7 @@ theorem diamondMoveJoinFalse_progress (n : Nat) :
       ReachesRet (mirCallTree diamondMoveJoin diamondMoveJoinFalseArgs) tr
         (.normal (v, mem))) :=
   mirCall_progress diamondMoveJoin_inFragment diamondMoveJoin_translate ctx0_2
-    (ctx0_2_ok_bool_u32 rfl) diamondMoveJoinFalseArgs (by decide)
+    (ctx0_2_ok_bool_u32 rfl) diamondMoveJoinFalseArgs (by decide +kernel)
     diamondMoveJoinFalseMInit rfl rfl rfl diamondMoveJoinFalse_noUB n
 
 theorem diamondMoveJoinFalse_minirust_ret_from_start :
@@ -6602,7 +6616,7 @@ theorem diamondMoveJoinFalse_minirust_ret_from_start :
       m'.threads = [thread1 ctx0_2 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret diamondMoveJoin_inFragment diamondMoveJoin_translate ctx0_2
-      (ctx0_2_ok_bool_u32 rfl) diamondMoveJoinFalseArgs (by decide)
+      (ctx0_2_ok_bool_u32 rfl) diamondMoveJoinFalseArgs (by decide +kernel)
       diamondMoveJoinFalseMInit rfl rfl rfl diamondMoveJoinFalse_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [diamondMoveJoin] at hd; subst hd
@@ -6653,7 +6667,7 @@ def diamondHalfMoveReuse : CapturedMir where
 theorem diamondHalfMoveReuse_movesOk :
     [0, 1, 2, 3].map (movedAtEntry diamondHalfMoveReuse) = [[], [], [], [2]] ∧
     movesOk diamondHalfMoveReuse = false ∧
-    inFragment diamondHalfMoveReuse = false := by decide
+    inFragment diamondHalfMoveReuse = false := by decide +kernel
 
 def diamondHalfMoveReuseFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Bool),
@@ -6687,7 +6701,7 @@ def diamondHalfMoveReuseFalseS0 : MachineState :=
 theorem diamondHalfMoveReuseFalse_anneal_ub :
     ∃ tr u, Reaches (mirTree diamondHalfMoveReuse diamondHalfMoveReuseFalseS0) tr u ∧
       FaultNow u :=
-  faultsA_sound diamondHalfMoveReuse 15 _ (by decide)
+  faultsA_sound diamondHalfMoveReuse 15 _ (by decide +kernel)
 
 theorem diamondHalfMoveReuseFalse_minirust_direct :
     (Interp.steps 8 (machineWithCtx ctx0_2 diamondHalfMoveReuse diamondHalfMoveReuseFn
@@ -6752,7 +6766,7 @@ def tupleAggCastMove : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem tupleAggCastMove_inFragment : inFragment tupleAggCastMove = true := by decide
+theorem tupleAggCastMove_inFragment : inFragment tupleAggCastMove = true := by decide +kernel
 
 /-- `CtxOk.addrs` constrains only `_0` and the arguments (`i ≤ body.argCount`),
 so unaligned (`257`) or `≥ 2^32` (`2^40`) trailing entries in `ctx.addrs` at
@@ -6768,7 +6782,7 @@ theorem ctx0_ok_trailing_temp_addrs :
     | _ + 2, hi, _ => simp [tupleAggCastMove] at hi
   ret := by
     intro d hd; simp [tupleAggCastMove] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 def tupleAggCastMoveFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int i8), (localName 2, .Int i8),
@@ -6814,11 +6828,11 @@ def tupleAggCastMoveNeg5MInit : Mach :=
 theorem tupleAggCastMoveNeg5_anneal_ret :
     ReachesRet (mirTree tupleAggCastMove tupleAggCastMoveNeg5S0) []
       (.normal (.scalar ⟨5, 4⟩, tupleAggCastMoveNeg5S0.memory)) :=
-  runA_sound tupleAggCastMove 25 _ _ _ rfl
+  runA_sound tupleAggCastMove 25 _ _ _ (by kernel_rfl)
 
 theorem tupleAggCastMoveNeg5_noUB :
     MirNoUBTree (mirCallTree tupleAggCastMove tupleAggCastMoveNeg5Args) :=
-  runA_noUB tupleAggCastMove 25 _ _ _ rfl
+  runA_isSome_noUB tupleAggCastMove 25 _ (by kernel_rfl)
 
 theorem tupleAggCastMoveNeg5_progress (n : Nat) :
     (∃ s' m' tr, Interp.steps (initLen tupleAggCastMove + n) tupleAggCastMoveNeg5MInit = .ok m' ∧
@@ -6831,7 +6845,7 @@ theorem tupleAggCastMoveNeg5_progress (n : Nat) :
       ReachesRet (mirCallTree tupleAggCastMove tupleAggCastMoveNeg5Args) tr
         (.normal (v, mem))) :=
   mirCall_progress tupleAggCastMove_inFragment tupleAggCastMove_translate ctx0_tupleAggCastMove
-    (ctx0_ok_tupleAggCastMove rfl) tupleAggCastMoveNeg5Args (by decide)
+    (ctx0_ok_tupleAggCastMove rfl) tupleAggCastMoveNeg5Args (by decide +kernel)
     tupleAggCastMoveNeg5MInit rfl rfl rfl tupleAggCastMoveNeg5_noUB n
 
 theorem tupleAggCastMoveNeg5_minirust_ret_from_start :
@@ -6841,7 +6855,7 @@ theorem tupleAggCastMoveNeg5_minirust_ret_from_start :
         [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret tupleAggCastMove_inFragment tupleAggCastMove_translate ctx0_tupleAggCastMove
-      (ctx0_ok_tupleAggCastMove rfl) tupleAggCastMoveNeg5Args (by decide)
+      (ctx0_ok_tupleAggCastMove rfl) tupleAggCastMoveNeg5Args (by decide +kernel)
       tupleAggCastMoveNeg5MInit rfl rfl rfl tupleAggCastMoveNeg5_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [tupleAggCastMove] at hd; subst hd
@@ -6896,7 +6910,7 @@ def projFieldMoveReuse : CapturedMir where
 
 theorem projFieldMoveReuse_movesOk :
     movesOk projFieldMoveReuse = false ∧
-    inFragment projFieldMoveReuse = false := by decide
+    inFragment projFieldMoveReuse = false := by decide +kernel
 
 def projFieldMoveReuseFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32), (localName 2, .Bool),
@@ -6929,7 +6943,7 @@ def projFieldMoveReuseS0 : MachineState :=
 theorem projFieldMoveReuse_anneal_ub :
     ∃ tr u, Reaches (mirTree projFieldMoveReuse projFieldMoveReuseS0) tr u ∧
       FaultNow u :=
-  faultsA_sound projFieldMoveReuse 15 _ (by decide)
+  faultsA_sound projFieldMoveReuse 15 _ (by decide +kernel)
 
 theorem projFieldMoveReuse_minirust_direct :
     (Interp.steps 9 (machineWithCtx ctx0_tupleAggCastMove projFieldMoveReuse projFieldMoveReuseFn
@@ -6994,13 +7008,13 @@ theorem ctxI8_ok_ordBoolCastTempMove : CtxOk ordBoolCastTempMove ctxI8_4 where
     | _ + 4, hi, _ => simp [ordBoolCastTempMove] at hi
   ret := by
     intro d hd; simp [ordBoolCastTempMove] at hd; subst hd
-    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
-theorem ordBoolCastTempMove_inFragment : inFragment ordBoolCastTempMove = true := by decide
+theorem ordBoolCastTempMove_inFragment : inFragment ordBoolCastTempMove = true := by decide +kernel
 
 theorem ordBoolCastTempMove_movedAtEntry :
     [0, 1, 2, 3].map (movedAtEntry ordBoolCastTempMove) =
-      [[], [3, 4], [3, 4], [3, 1, 2]] := by decide
+      [[], [3, 4], [3, 4], [3, 1, 2]] := by decide +kernel
 
 /-- Concrete Park-induction witness for `movesOk_of_preFixedPoint` using a
 strictly over-approximating inductive pre-fixed point `[[5], [3, 4, 5],
@@ -7009,7 +7023,7 @@ the least fixed point `movedAtEntry`). -/
 theorem ordBoolCastTempMove_movesOk_by_preFixedPoint :
     movesOk ordBoolCastTempMove = true := by
   let cert : List (List Nat) := [[5], [3, 4, 5], [3, 4, 5], [1, 2, 3]]
-  apply movesOk_of_preFixedPoint (by decide) (by decide) cert
+  apply movesOk_of_preFixedPoint (by decide +kernel) (by decide +kernel) cert
   · intro src dst bb hbb hdst htgt j hj
     have hsrc : src < 4 := by
       have := (List.getElem?_eq_some_iff.mp hbb).1
@@ -7075,11 +7089,11 @@ theorem ordBoolCastTempMoveTrue_anneal_ret :
     ReachesRet (mirCallTree ordBoolCastTempMove ordBoolCastTempMoveTrueArgs)
       [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
       (.normal (.scalar ⟨255, 1⟩, ordBoolCastTempMoveTrueS0.memory)) :=
-  runA_sound ordBoolCastTempMove 20 _ _ _ rfl
+  runA_sound ordBoolCastTempMove 20 _ _ _ (by kernel_rfl)
 
 theorem ordBoolCastTempMoveTrue_noUB :
     MirNoUBTree (mirCallTree ordBoolCastTempMove ordBoolCastTempMoveTrueArgs) :=
-  runA_noUB ordBoolCastTempMove 20 _ _ _ rfl
+  runA_isSome_noUB ordBoolCastTempMove 20 _ (by kernel_rfl)
 
 theorem ordBoolCastTempMoveTrue_progress (n : Nat) :
     (∃ s' m' tr,
@@ -7093,7 +7107,7 @@ theorem ordBoolCastTempMoveTrue_progress (n : Nat) :
       ReachesRet (mirCallTree ordBoolCastTempMove ordBoolCastTempMoveTrueArgs) tr
         (.normal (v, mem))) :=
   mirCall_progress ordBoolCastTempMove_inFragment ordBoolCastTempMove_translate ctxI8_4
-    ctxI8_ok_ordBoolCastTempMove ordBoolCastTempMoveTrueArgs (by decide)
+    ctxI8_ok_ordBoolCastTempMove ordBoolCastTempMoveTrueArgs (by decide +kernel)
     ordBoolCastTempMoveTrueMInit rfl rfl rfl ordBoolCastTempMoveTrue_noUB n
 
 theorem ordBoolCastTempMoveTrue_minirust_ret_from_start :
@@ -7103,7 +7117,7 @@ theorem ordBoolCastTempMoveTrue_minirust_ret_from_start :
         [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret ordBoolCastTempMove_inFragment ordBoolCastTempMove_translate ctxI8_4
-      ctxI8_ok_ordBoolCastTempMove ordBoolCastTempMoveTrueArgs (by decide)
+      ctxI8_ok_ordBoolCastTempMove ordBoolCastTempMoveTrueArgs (by decide +kernel)
       ordBoolCastTempMoveTrueMInit rfl rfl rfl ordBoolCastTempMoveTrue_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [ordBoolCastTempMove] at hd; subst hd
@@ -7138,11 +7152,11 @@ theorem ordBoolCastTempMoveFalse_anneal_ret :
     ReachesRet (mirCallTree ordBoolCastTempMove ordBoolCastTempMoveFalseArgs)
       [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
       (.normal (.scalar ⟨1, 1⟩, ordBoolCastTempMoveFalseS0.memory)) :=
-  runA_sound ordBoolCastTempMove 20 _ _ _ rfl
+  runA_sound ordBoolCastTempMove 20 _ _ _ (by kernel_rfl)
 
 theorem ordBoolCastTempMoveFalse_noUB :
     MirNoUBTree (mirCallTree ordBoolCastTempMove ordBoolCastTempMoveFalseArgs) :=
-  runA_noUB ordBoolCastTempMove 20 _ _ _ rfl
+  runA_isSome_noUB ordBoolCastTempMove 20 _ (by kernel_rfl)
 
 theorem ordBoolCastTempMoveFalse_progress (n : Nat) :
     (∃ s' m' tr,
@@ -7156,7 +7170,7 @@ theorem ordBoolCastTempMoveFalse_progress (n : Nat) :
       ReachesRet (mirCallTree ordBoolCastTempMove ordBoolCastTempMoveFalseArgs) tr
         (.normal (v, mem))) :=
   mirCall_progress ordBoolCastTempMove_inFragment ordBoolCastTempMove_translate ctxI8_4
-    ctxI8_ok_ordBoolCastTempMove ordBoolCastTempMoveFalseArgs (by decide)
+    ctxI8_ok_ordBoolCastTempMove ordBoolCastTempMoveFalseArgs (by decide +kernel)
     ordBoolCastTempMoveFalseMInit rfl rfl rfl ordBoolCastTempMoveFalse_noUB n
 
 theorem ordBoolCastTempMoveFalse_minirust_ret_from_start :
@@ -7166,7 +7180,7 @@ theorem ordBoolCastTempMoveFalse_minirust_ret_from_start :
         [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret ordBoolCastTempMove_inFragment ordBoolCastTempMove_translate ctxI8_4
-      ctxI8_ok_ordBoolCastTempMove ordBoolCastTempMoveFalseArgs (by decide)
+      ctxI8_ok_ordBoolCastTempMove ordBoolCastTempMoveFalseArgs (by decide +kernel)
       ordBoolCastTempMoveFalseMInit rfl rfl rfl ordBoolCastTempMoveFalse_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [ordBoolCastTempMove] at hd; subst hd
@@ -7323,7 +7337,7 @@ def callerMain : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem callerCallee_inFragment : progInFragment callerMain [calleePair] = true := by decide
+theorem callerCallee_inFragment : progInFragment callerMain [calleePair] = true := by decide +kernel
 
 theorem calleePair_initLen : initLen calleePair = 2 := rfl
 
@@ -7410,7 +7424,7 @@ theorem ctxCallerMain_ok : CtxOk callerMain ctxCallerMain where
     | _ + 3, hi, _ => simp [callerMain] at hi
   ret := by
     intro d hd; simp [callerMain] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 /-- Non-overflow call `(20u32, 5u32)`: `AddWithOverflow(20, 5) = (25, false)`,
 `calleePair(20, (25, false)) = 25 + 7 = 32`, and `callerMain` returns
@@ -7429,11 +7443,11 @@ theorem callerCallee20_anneal_ret :
       [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
       (.normal (.scalar ⟨52, 4⟩,
         { callerCallee20S0.memory with activeCallee := some callerMain })) :=
-  runA_sound callerMain 25 _ _ _ rfl
+  runA_sound callerMain 25 _ _ _ (by kernel_rfl)
 
 theorem callerCallee20_noUB :
     MirNoUBTree (mirCallTreeWithCallees callerMain callerCallee20Args [calleePair]) :=
-  runA_noUB callerMain 25 _ _ _ rfl
+  runA_isSome_noUB callerMain 25 _ (by kernel_rfl)
 
 theorem callerCallee20_progress (n : Nat) :
     (∃ d s' m0 m' tr, Interp.steps (initLen callerMain + n) callerCallee20MInit = .ok m0 ∧
@@ -7447,8 +7461,8 @@ theorem callerCallee20_progress (n : Nat) :
       ReachesRet (mirCallTreeWithCallees callerMain callerCallee20Args [calleePair]) tr
         (.normal (v, mem))) :=
   mirCallWithCallees_progress callerCallee_inFragment callerCallee_translate
-    callerMain_translateInProg ctxCallerMain ctxCallerMain_ok callerCallee20Args (by decide)
-    callerCallee20MInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    callerMain_translateInProg ctxCallerMain ctxCallerMain_ok callerCallee20Args (by decide +kernel)
+    callerCallee20MInit (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl
     callerCallee20_noUB n
 
 theorem callerCallee20_progress_any (n : Nat) :
@@ -7463,8 +7477,8 @@ theorem callerCallee20_progress_any (n : Nat) :
       ReachesRet (mirCallTreeWithCallees callerMain callerCallee20Args [calleePair]) tr
         (.normal (v, mem))) :=
   mirCallWithCallees_progress_any callerCallee_inFragment callerCallee_translate
-    callerMain_translateInProg ctxCallerMain ctxCallerMain_ok callerCallee20Args (by decide)
-    callerCallee20MInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    callerMain_translateInProg ctxCallerMain ctxCallerMain_ok callerCallee20Args (by decide +kernel)
+    callerCallee20MInit (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl
     callerCallee20_noUB n
 
 theorem callerCallee20_outcome_any (n : Nat) :
@@ -7482,8 +7496,8 @@ theorem callerCallee20_outcome_any (n : Nat) :
       ∃ tr u, Reaches (mirCallTreeWithCallees callerMain callerCallee20Args [calleePair]) tr u ∧
         FaultNow u) :=
   mirCallWithCallees_outcome_any callerCallee_inFragment callerCallee_translate
-    callerMain_translateInProg ctxCallerMain ctxCallerMain_ok callerCallee20Args (by decide)
-    callerCallee20MInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl n
+    callerMain_translateInProg ctxCallerMain ctxCallerMain_ok callerCallee20Args (by decide +kernel)
+    callerCallee20MInit (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl n
 
 theorem callerCallee20_minirust_ret :
     ∃ (n : Nat) (m' : Mach), Interp.steps n callerCallee20MInit = .ok m' ∧
@@ -7492,8 +7506,8 @@ theorem callerCallee20_minirust_ret :
         [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCallWithCallees_ret callerCallee_inFragment callerCallee_translate
-      callerMain_translateInProg ctxCallerMain ctxCallerMain_ok callerCallee20Args (by decide)
-      callerCallee20MInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      callerMain_translateInProg ctxCallerMain ctxCallerMain_ok callerCallee20Args (by decide +kernel)
+      callerCallee20MInit (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl
       callerCallee20_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [callerMain] at hd; subst hd
@@ -7539,11 +7553,11 @@ theorem callerCalleeOv_anneal_ret :
       [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
       (.normal (.scalar ⟨4294967287, 4⟩,
         { callerCalleeOvS0.memory with activeCallee := some callerMain })) :=
-  runA_sound callerMain 25 _ _ _ rfl
+  runA_sound callerMain 25 _ _ _ (by kernel_rfl)
 
 theorem callerCalleeOv_noUB :
     MirNoUBTree (mirCallTreeWithCallees callerMain callerCalleeOvArgs [calleePair]) :=
-  runA_noUB callerMain 25 _ _ _ rfl
+  runA_isSome_noUB callerMain 25 _ (by kernel_rfl)
 
 theorem callerCalleeOv_minirust_ret :
     ∃ (n : Nat) (m' : Mach), Interp.steps n callerCalleeOvMInit = .ok m' ∧
@@ -7553,8 +7567,8 @@ theorem callerCalleeOv_minirust_ret :
         [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCallWithCallees_ret callerCallee_inFragment callerCallee_translate
-      callerMain_translateInProg ctxCallerMain ctxCallerMain_ok callerCalleeOvArgs (by decide)
-      callerCalleeOvMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      callerMain_translateInProg ctxCallerMain ctxCallerMain_ok callerCalleeOvArgs (by decide +kernel)
+      callerCalleeOvMInit (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl
       callerCalleeOv_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [callerMain] at hd; subst hd
@@ -7631,7 +7645,7 @@ def projDestCaller : CapturedMir where
   allocations := []
 
 theorem projDestCaller_inFragment :
-    progInFragment projDestCaller [negI8Callee, flipBoolCallee] = true := by decide
+    progInFragment projDestCaller [negI8Callee, flipBoolCallee] = true := by decide +kernel
 
 def retAllocTupleI8 : Gen.Allocation :=
   { data := List.replicate 2 .Uninit, addr := 64, align := ⟨1⟩, kind := .Stack, live := true,
@@ -7663,7 +7677,7 @@ theorem ctxProjDest_ok : CtxOk projDestCaller ctxProjDest where
     | _ + 2, hi, _ => simp [projDestCaller] at hi
   ret := by
     intro d hd; simp [projDestCaller] at hd; subst hd
-    exact ⟨0, retAllocTupleI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAllocTupleI8, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 def projDestProg : Gen.Program :=
   (translateProg projDestCaller [negI8Callee, flipBoolCallee]).getD emptyProg
@@ -7697,12 +7711,12 @@ theorem projDest127_anneal_ret :
       (mirCallTreeWithCallees projDestCaller projDest127Args [negI8Callee, flipBoolCallee]) []
       (.normal (.aggregate 0 [.scalar ⟨129, 1⟩, .scalar ⟨0, 1⟩],
         { projDest127S0.memory with activeCallee := some projDestCaller })) :=
-  runA_sound projDestCaller 25 _ _ _ rfl
+  runA_sound projDestCaller 25 _ _ _ (by kernel_rfl)
 
 theorem projDest127_noUB :
     MirNoUBTree
       (mirCallTreeWithCallees projDestCaller projDest127Args [negI8Callee, flipBoolCallee]) :=
-  runA_noUB projDestCaller 25 _ _ _ rfl
+  runA_isSome_noUB projDestCaller 25 _ (by kernel_rfl)
 
 theorem projDest127_minirust_ret :
     ∃ (n : Nat) (m' : Mach), Interp.steps n projDest127MInit = .ok m' ∧
@@ -7712,8 +7726,8 @@ theorem projDest127_minirust_ret :
         [{ callerFrameTupleI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCallWithCallees_ret projDestCaller_inFragment projDest_translate
-      projDestCaller_translateInProg ctxProjDest ctxProjDest_ok projDest127Args (by decide)
-      projDest127MInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      projDestCaller_translateInProg ctxProjDest ctxProjDest_ok projDest127Args (by decide +kernel)
+      projDest127MInit (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl
       projDest127_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [projDestCaller] at hd; subst hd
@@ -7782,7 +7796,7 @@ def chainEntry : CapturedMir where
   allocations := []
 
 theorem chain3_inFragment :
-    progInFragment chainEntry [chainMid, chainLeaf] = true := by decide
+    progInFragment chainEntry [chainMid, chainLeaf] = true := by decide +kernel
 
 theorem chain3_maxStackLocals :
     maxStackLocals chainEntry [chainMid, chainLeaf] = some 8 := rfl
@@ -7800,7 +7814,7 @@ theorem ctxChainEntry_ok : CtxOk chainEntry ctxChainEntry where
     | _ + 2, hi, _ => simp [chainEntry] at hi
   ret := by
     intro d hd; simp [chainEntry] at hd; subst hd
-    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 def chain3Prog : Gen.Program :=
   (translateProg chainEntry [chainMid, chainLeaf]).getD emptyProg
@@ -7831,11 +7845,11 @@ theorem chainNeg5_anneal_ret :
     ReachesRet (mirCallTreeWithCallees chainEntry chainNeg5Args [chainMid, chainLeaf]) []
       (.normal (.scalar ⟨255, 1⟩,
         { chainNeg5S0.memory with activeCallee := some chainEntry })) :=
-  runA_sound chainEntry 25 _ _ _ rfl
+  runA_sound chainEntry 25 _ _ _ (by kernel_rfl)
 
 theorem chainNeg5_noUB :
     MirNoUBTree (mirCallTreeWithCallees chainEntry chainNeg5Args [chainMid, chainLeaf]) :=
-  runA_noUB chainEntry 25 _ _ _ rfl
+  runA_isSome_noUB chainEntry 25 _ (by kernel_rfl)
 
 theorem chainNeg5_minirust_ret :
     ∃ (n : Nat) (m' : Mach), Interp.steps n chainNeg5MInit = .ok m' ∧
@@ -7844,8 +7858,8 @@ theorem chainNeg5_minirust_ret :
         [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCallWithCallees_ret chain3_inFragment chain3_translate
-      chainEntry_translateInProg ctxChainEntry ctxChainEntry_ok chainNeg5Args (by decide)
-      chainNeg5MInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      chainEntry_translateInProg ctxChainEntry ctxChainEntry_ok chainNeg5Args (by decide +kernel)
+      chainNeg5MInit (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl
       chainNeg5_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [chainEntry] at hd; subst hd
@@ -7905,7 +7919,7 @@ def callArgUbCaller : CapturedMir where
   allocations := []
 
 theorem callArgUb_inFragment :
-    progInFragment callArgUbCaller [idU32Callee] = true := by decide
+    progInFragment callArgUbCaller [idU32Callee] = true := by decide +kernel
 
 def ctxCallArgUb : Ctx :=
   ctxWithFns callerFrame retAlloc 2 [128]
@@ -7919,7 +7933,7 @@ theorem ctxCallArgUb_ok : CtxOk callArgUbCaller ctxCallArgUb where
     | _ + 1, hi, _ => simp [callArgUbCaller] at hi
   ret := by
     intro d hd; simp [callArgUbCaller] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 def callArgUbProg : Gen.Program :=
   (translateProg callArgUbCaller [idU32Callee]).getD emptyProg
@@ -7943,14 +7957,14 @@ def callArgUbMInit : Mach :=
 
 theorem callArgUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTreeWithCallees callArgUbCaller [] [idU32Callee]) tr u ∧ FaultNow u :=
-  faultsA_sound callArgUbCaller 5 _ (by decide)
+  faultsA_sound callArgUbCaller 5 _ (by decide +kernel)
 
 theorem callArgUb_minirust_ub :
     ∃ (n : Nat) (msg : String), Interp.steps n callArgUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := callArgUb_anneal_ub
   exact mirCallWithCallees_ub callArgUb_inFragment callArgUb_translate
-    callArgUbCaller_translateInProg ctxCallArgUb ctxCallArgUb_ok [] (by decide)
-    callArgUbMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+    callArgUbCaller_translateInProg ctxCallArgUb ctxCallArgUb_ok [] (by decide +kernel)
+    callArgUbMInit (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl hr hf
 
 theorem callArgUb_minirust_direct :
     Interp.steps 3 callArgUbMInit =
@@ -7967,8 +7981,8 @@ theorem callArgUb_converse_error :
       ReachesRet (mirCallTreeWithCallees callArgUbCaller [] [idU32Callee]) tr
         (.normal (v, mem))) :=
   mirCallWithCallees_steps_error callArgUb_inFragment callArgUb_translate
-    callArgUbCaller_translateInProg ctxCallArgUb ctxCallArgUb_ok [] (by decide)
-    callArgUbMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    callArgUbCaller_translateInProg ctxCallArgUb ctxCallArgUb_ok [] (by decide +kernel)
+    callArgUbMInit (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl
     callArgUb_minirust_direct
 
 theorem callArgUb_outcome :
@@ -7986,8 +8000,8 @@ theorem callArgUb_outcome :
       ∃ tr u, Reaches (mirCallTreeWithCallees callArgUbCaller [] [idU32Callee]) tr u ∧
         FaultNow u) :=
   mirCallWithCallees_outcome callArgUb_inFragment callArgUb_translate
-    callArgUbCaller_translateInProg ctxCallArgUb ctxCallArgUb_ok [] (by decide)
-    callArgUbMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl 1
+    callArgUbCaller_translateInProg ctxCallArgUb ctxCallArgUb_ok [] (by decide +kernel)
+    callArgUbMInit (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl 1
 
 /-- Callee faulting with division-by-zero inside a pushed stack frame. -/
 def divTenI8Callee : CapturedMir where
@@ -8021,7 +8035,7 @@ def calleeDivZeroCaller : CapturedMir where
   allocations := []
 
 theorem calleeDivZero_inFragment :
-    progInFragment calleeDivZeroCaller [divTenI8Callee] = true := by decide
+    progInFragment calleeDivZeroCaller [divTenI8Callee] = true := by decide +kernel
 
 def ctxCalleeDivZero : Ctx :=
   ctxWithFns callerFrameI8 retAllocI8 2 [128, 256]
@@ -8036,7 +8050,7 @@ theorem ctxCalleeDivZero_ok : CtxOk calleeDivZeroCaller ctxCalleeDivZero where
     | _ + 2, hi, _ => simp [calleeDivZeroCaller] at hi
   ret := by
     intro d hd; simp [calleeDivZeroCaller] at hd; subst hd
-    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 def calleeDivZeroProg : Gen.Program :=
   (translateProg calleeDivZeroCaller [divTenI8Callee]).getD emptyProg
@@ -8065,14 +8079,14 @@ theorem calleeDivZero_anneal_ub :
     ∃ tr u, Reaches
       (mirCallTreeWithCallees calleeDivZeroCaller calleeDivZeroArgs [divTenI8Callee]) tr u ∧
       FaultNow u :=
-  faultsA_sound calleeDivZeroCaller 10 _ (by decide)
+  faultsA_sound calleeDivZeroCaller 10 _ (by decide +kernel)
 
 theorem calleeDivZero_minirust_ub :
     ∃ (n : Nat) (msg : String), Interp.steps n calleeDivZeroMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := calleeDivZero_anneal_ub
   exact mirCallWithCallees_ub calleeDivZero_inFragment calleeDivZero_translate
     calleeDivZeroCaller_translateInProg ctxCalleeDivZero ctxCalleeDivZero_ok calleeDivZeroArgs
-    (by decide) calleeDivZeroMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+    (by decide +kernel) calleeDivZeroMInit (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl hr hf
 
 theorem calleeDivZero_minirust_direct :
     Interp.steps 4 calleeDivZeroMInit = .error (.ub "division by zero") :=
@@ -8089,7 +8103,7 @@ theorem calleeDivZero_converse_error :
         tr (.normal (v, mem))) :=
   mirCallWithCallees_steps_error calleeDivZero_inFragment calleeDivZero_translate
     calleeDivZeroCaller_translateInProg ctxCalleeDivZero ctxCalleeDivZero_ok calleeDivZeroArgs
-    (by decide) calleeDivZeroMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    (by decide +kernel) calleeDivZeroMInit (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl
     calleeDivZero_minirust_direct
 
 /-! ### Diverging multi-function call loop (`callSpinCaller` calling `idU32Callee`) -/
@@ -8117,7 +8131,7 @@ def callSpinCaller : CapturedMir where
   allocations := []
 
 theorem callSpin_inFragment :
-    progInFragment callSpinCaller [idU32Callee] = true := by decide
+    progInFragment callSpinCaller [idU32Callee] = true := by decide +kernel
 
 def ctxCallSpin : Ctx :=
   ctxWithFns callerFrame retAlloc 2 [128, 256]
@@ -8132,7 +8146,7 @@ theorem ctxCallSpin_ok : CtxOk callSpinCaller ctxCallSpin where
     | _ + 2, hi, _ => simp [callSpinCaller] at hi
   ret := by
     intro d hd; simp [callSpinCaller] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 def callSpinProg : Gen.Program :=
   (translateProg callSpinCaller [idU32Callee]).getD emptyProg
@@ -8205,8 +8219,8 @@ theorem callSpin_noRet (tr : List (Event MirEffect)) (o : MirOutcome) :
 theorem callSpin_minirust_diverges (n : Nat) :
     ∃ m', Interp.steps n callSpinMInit = .ok m' :=
   mirCallWithCallees_diverges_steps_ok callSpin_inFragment callSpin_translate
-    callSpinCaller_translateInProg ctxCallSpin ctxCallSpin_ok callSpinArgs (by decide)
-    callSpinMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    callSpinCaller_translateInProg ctxCallSpin ctxCallSpin_ok callSpinArgs (by decide +kernel)
+    callSpinMInit (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl
     callSpin_noUB callSpin_noRet n
 
 theorem callSpin_minirust_diverges_rel (n : Nat) :
@@ -8216,8 +8230,8 @@ theorem callSpin_minirust_diverges_rel (n : Nat) :
       Reaches (mirCallTreeWithCallees callSpinCaller callSpinArgs [idU32Callee]) tr
         (mirTree callSpinCaller s') :=
   mirCallWithCallees_diverges_rel callSpin_inFragment callSpin_translate
-    callSpinCaller_translateInProg ctxCallSpin ctxCallSpin_ok callSpinArgs (by decide)
-    callSpinMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    callSpinCaller_translateInProg ctxCallSpin ctxCallSpin_ok callSpinArgs (by decide +kernel)
+    callSpinMInit (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl
     callSpin_noUB callSpin_noRet n
 
 /-! ### Soundness-boundary counterexamples (`progInFragment = false`) -/
@@ -8244,10 +8258,10 @@ def callDestArgAlias : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem callDestArgAlias_movesOk : movesOk callDestArgAlias = false := by decide
+theorem callDestArgAlias_movesOk : movesOk callDestArgAlias = false := by decide +kernel
 
 theorem callDestArgAlias_rejected :
-    progInFragment callDestArgAlias [idU32Callee] = false := by decide
+    progInFragment callDestArgAlias [idU32Callee] = false := by decide +kernel
 
 def callDestArgAliasProg : Gen.Program :=
   (translateProg callDestArgAlias [idU32Callee]).getD emptyProg
@@ -8269,7 +8283,7 @@ theorem callDestArgAlias_anneal_ret :
     ReachesRet (mirCallTreeWithCallees callDestArgAlias [.scalar ⟨7, 4⟩] [idU32Callee]) []
       (.normal (.scalar ⟨7, 4⟩,
         { callDestArgAliasS0.memory with activeCallee := some callDestArgAlias })) :=
-  runA_sound callDestArgAlias 10 _ _ _ rfl
+  runA_sound callDestArgAlias 10 _ _ _ (by kernel_rfl)
 
 theorem callDestArgAlias_minirust_ub :
     Interp.steps 2 callDestArgAliasMInit =
@@ -8300,7 +8314,7 @@ def callProjMoveReuse : CapturedMir where
   allocations := []
 
 theorem callProjMoveReuse_rejected :
-    progInFragment callProjMoveReuse [idU32Callee] = false := by decide
+    progInFragment callProjMoveReuse [idU32Callee] = false := by decide +kernel
 
 def callProjMoveReuseProg : Gen.Program :=
   (translateProg callProjMoveReuse [idU32Callee]).getD emptyProg
@@ -8325,7 +8339,7 @@ theorem callProjMoveReuse_anneal_ret :
       (mirCallTreeWithCallees callProjMoveReuse callProjMoveReuseArgs [idU32Callee]) []
       (.normal (.scalar ⟨9, 4⟩,
         { callProjMoveReuseS0.memory with activeCallee := some callProjMoveReuse })) :=
-  runA_sound callProjMoveReuse 10 _ _ _ rfl
+  runA_sound callProjMoveReuse 10 _ _ _ (by kernel_rfl)
 
 theorem callProjMoveReuse_minirust_ub :
     Interp.steps 7 callProjMoveReuseMInit =
@@ -8356,12 +8370,12 @@ def callMoveReuse : CapturedMir where
   allocations := []
 
 theorem callMoveReuse_inFragment :
-    progInFragment callMoveReuse [idU32Callee] = true := by decide
+    progInFragment callMoveReuse [idU32Callee] = true := by decide +kernel
 
 theorem callMoveReuse_anneal_ub :
     ∃ tr u, Reaches
       (mirCallTreeWithCallees callMoveReuse [.scalar ⟨7, 4⟩] [idU32Callee]) tr u ∧ FaultNow u :=
-  faultsA_sound callMoveReuse 10 _ (by decide)
+  faultsA_sound callMoveReuse 10 _ (by decide +kernel)
 
 def callMoveReuseProg : Gen.Program :=
   (translateProg callMoveReuse [idU32Callee]).getD emptyProg
@@ -8391,15 +8405,15 @@ theorem ctxCallMoveReuse_ok : CtxOk callMoveReuse ctxCallSpin where
     | _ + 2, hi, _ => simp [callMoveReuse] at hi
   ret := by
     intro d hd; simp [callMoveReuse] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 theorem callMoveReuse_minirust_ub :
     ∃ (n : Nat) (msg : String), Interp.steps n callMoveReuseMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := callMoveReuse_anneal_ub
   exact mirCallWithCallees_ub callMoveReuse_inFragment callMoveReuse_translate
     callMoveReuse_translateInProg ctxCallSpin ctxCallMoveReuse_ok
-    [.scalar ⟨7, 4⟩] (by decide) callMoveReuseMInit
-    (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+    [.scalar ⟨7, 4⟩] (by decide +kernel) callMoveReuseMInit
+    (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl hr hf
 
 theorem callMoveReuse_minirust_direct :
     Interp.steps 7 callMoveReuseMInit =
@@ -8418,8 +8432,8 @@ theorem callMoveReuse_converse_error :
         (.normal (v, mem))) :=
   mirCallWithCallees_steps_error callMoveReuse_inFragment callMoveReuse_translate
     callMoveReuse_translateInProg ctxCallSpin ctxCallMoveReuse_ok
-    [.scalar ⟨7, 4⟩] (by decide) callMoveReuseMInit
-    (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    [.scalar ⟨7, 4⟩] (by decide +kernel) callMoveReuseMInit
+    (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl
     callMoveReuse_minirust_direct
 
 /-- Root-destination call re-initialization (`StorageLive(_2); _2 = move _1;
@@ -8449,7 +8463,7 @@ def moveReinitByCall : CapturedMir where
   allocations := []
 
 theorem moveReinitByCall_inFragment :
-    progInFragment moveReinitByCall [idU32Callee] = true := by decide
+    progInFragment moveReinitByCall [idU32Callee] = true := by decide +kernel
 
 def moveReinitByCallProg : Gen.Program :=
   (translateProg moveReinitByCall [idU32Callee]).getD emptyProg
@@ -8481,13 +8495,13 @@ theorem ctxMoveReinitByCall_ok : CtxOk moveReinitByCall ctxCallSpin where
     | _ + 2, hi, _ => simp [moveReinitByCall] at hi
   ret := by
     intro d hd; simp [moveReinitByCall] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 theorem moveReinitByCall_anneal_ret :
     ReachesRet (mirCallTreeWithCallees moveReinitByCall [.scalar ⟨55, 4⟩] [idU32Callee]) []
       (.normal (.scalar ⟨55, 4⟩,
         { moveReinitByCallS0.memory with activeCallee := some moveReinitByCall })) :=
-  runA_sound moveReinitByCall 20 _ _ _ rfl
+  runA_sound moveReinitByCall 20 _ _ _ (by kernel_rfl)
 
 theorem moveReinitByCall_minirust_ret :
     ∃ (n : Nat) (m' : Mach), Interp.steps n moveReinitByCallMInit = .ok m' ∧
@@ -8497,8 +8511,8 @@ theorem moveReinitByCall_minirust_ret :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCallWithCallees_ret moveReinitByCall_inFragment moveReinitByCall_translate
       moveReinitByCall_translateInProg ctxCallSpin ctxMoveReinitByCall_ok
-      [.scalar ⟨55, 4⟩] (by decide) moveReinitByCallMInit
-      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      [.scalar ⟨55, 4⟩] (by decide +kernel) moveReinitByCallMInit
+      (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl
       moveReinitByCall_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [moveReinitByCall] at hd; subst hd
@@ -8557,7 +8571,7 @@ def condCallMoveJoin : CapturedMir where
   allocations := []
 
 theorem condCallMoveJoin_inFragment :
-    progInFragment condCallMoveJoin [idU32Callee] = true := by decide
+    progInFragment condCallMoveJoin [idU32Callee] = true := by decide +kernel
 
 def condCallMoveJoinProg : Gen.Program :=
   (translateProg condCallMoveJoin [idU32Callee]).getD emptyProg
@@ -8583,7 +8597,7 @@ theorem ctxCondCallMoveJoin_ok : CtxOk condCallMoveJoin ctxCallerMain where
     | _ + 3, hi, _ => simp [condCallMoveJoin] at hi
   ret := by
     intro d hd; simp [condCallMoveJoin] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 def condCallMoveJoin1Args : List Value := [.scalar ⟨1, 4⟩, .scalar ⟨42, 4⟩]
 
@@ -8600,7 +8614,7 @@ theorem condCallMoveJoin1_anneal_ret :
         ⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
       (.normal (.scalar ⟨42, 4⟩,
         { condCallMoveJoin1S0.memory with activeCallee := some condCallMoveJoin })) :=
-  runA_sound condCallMoveJoin 25 _ _ _ rfl
+  runA_sound condCallMoveJoin 25 _ _ _ (by kernel_rfl)
 
 theorem condCallMoveJoin1_minirust_ret :
     ∃ (n : Nat) (m' : Mach), Interp.steps n condCallMoveJoin1MInit = .ok m' ∧
@@ -8610,8 +8624,8 @@ theorem condCallMoveJoin1_minirust_ret :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCallWithCallees_ret condCallMoveJoin_inFragment condCallMoveJoin_translate
       condCallMoveJoin_translateInProg ctxCallerMain ctxCondCallMoveJoin_ok
-      condCallMoveJoin1Args (by decide) condCallMoveJoin1MInit
-      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      condCallMoveJoin1Args (by decide +kernel) condCallMoveJoin1MInit
+      (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl
       condCallMoveJoin1_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [condCallMoveJoin] at hd; subst hd
@@ -8636,7 +8650,7 @@ theorem condCallMoveJoin0_anneal_ret :
       [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩,
         ⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
       (.normal (.scalar ⟨99, 4⟩, condCallMoveJoin0S0.memory)) :=
-  runA_sound condCallMoveJoin 25 _ _ _ rfl
+  runA_sound condCallMoveJoin 25 _ _ _ (by kernel_rfl)
 
 theorem condCallMoveJoin0_minirust_ret :
     ∃ (n : Nat) (m' : Mach), Interp.steps n condCallMoveJoin0MInit = .ok m' ∧
@@ -8646,8 +8660,8 @@ theorem condCallMoveJoin0_minirust_ret :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCallWithCallees_ret condCallMoveJoin_inFragment condCallMoveJoin_translate
       condCallMoveJoin_translateInProg ctxCallerMain ctxCondCallMoveJoin_ok
-      condCallMoveJoin0Args (by decide) condCallMoveJoin0MInit
-      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      condCallMoveJoin0Args (by decide +kernel) condCallMoveJoin0MInit
+      (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl
       condCallMoveJoin0_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [condCallMoveJoin] at hd; subst hd
@@ -8690,10 +8704,10 @@ def stmtMoveThenCallArg : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem stmtMoveThenCallArg_movesOk : movesOk stmtMoveThenCallArg = false := by decide
+theorem stmtMoveThenCallArg_movesOk : movesOk stmtMoveThenCallArg = false := by decide +kernel
 
 theorem stmtMoveThenCallArg_rejected :
-    progInFragment stmtMoveThenCallArg [idU32Callee] = false := by decide
+    progInFragment stmtMoveThenCallArg [idU32Callee] = false := by decide +kernel
 
 /-- Counterexample 4: mutual recursion `recCycleA -> recCycleB -> recCycleA` is
 rejected by `maxStackLocals = none` (`progInFragment = false`). -/
@@ -8733,7 +8747,7 @@ theorem recCycle_maxStackLocals :
     maxStackLocals recCycleA [recCycleB, recCycleA] = none := rfl
 
 theorem recCycle_rejected :
-    progInFragment recCycleA [recCycleB, recCycleA] = false := by decide
+    progInFragment recCycleA [recCycleB, recCycleA] = false := by decide +kernel
 
 /-! ### Ground-truth `Interp` unit checks for `MR-4.1` spec items -/
 
@@ -8922,7 +8936,7 @@ theorem cAbiCallee_conv :
   ⟨rfl, rfl, rfl⟩
 
 theorem cAbi_inFragment :
-    progInFragment cAbiCaller [cAbiCallee] = true := by decide
+    progInFragment cAbiCaller [cAbiCallee] = true := by decide +kernel
 
 def cAbiProg : Gen.Program :=
   (translateProg cAbiCaller [cAbiCallee]).getD emptyProg
@@ -8946,7 +8960,7 @@ theorem ctxCAbiCaller_ok : CtxOk cAbiCaller ctxCallSpin where
     | _ + 2, hi, _ => simp [cAbiCaller] at hi
   ret := by
     intro d hd; simp [cAbiCaller] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 def cAbi32Args : List Value := [.scalar ⟨32, 4⟩]
 
@@ -8961,11 +8975,11 @@ theorem cAbi32_anneal_ret :
     ReachesRet (mirCallTreeWithCallees cAbiCaller cAbi32Args [cAbiCallee]) []
       (.normal (.scalar ⟨42, 4⟩,
         { cAbi32S0.memory with activeCallee := some cAbiCaller })) :=
-  runA_sound cAbiCaller 20 _ _ _ rfl
+  runA_sound cAbiCaller 20 _ _ _ (by kernel_rfl)
 
 theorem cAbi32_noUB :
     MirNoUBTree (mirCallTreeWithCallees cAbiCaller cAbi32Args [cAbiCallee]) :=
-  runA_noUB cAbiCaller 20 _ _ _ rfl
+  runA_isSome_noUB cAbiCaller 20 _ (by kernel_rfl)
 
 theorem cAbi32_minirust_ret :
     ∃ (n : Nat) (m' : Mach), Interp.steps n cAbi32MInit = .ok m' ∧
@@ -8975,8 +8989,8 @@ theorem cAbi32_minirust_ret :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCallWithCallees_ret cAbi_inFragment cAbi_translate
       cAbiCaller_translateInProg ctxCallSpin ctxCAbiCaller_ok
-      cAbi32Args (by decide) cAbi32MInit
-      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      cAbi32Args (by decide +kernel) cAbi32MInit
+      (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl
       cAbi32_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [cAbiCaller] at hd; subst hd
@@ -9035,7 +9049,7 @@ theorem badCallConv_rejected :
         [.copy (local_ 1)] (local_ 0) (some 1) .continue_)) = false ∧
     progInFragment badCallConvCaller [badCallConvCallee] = false ∧
     translateProg badCallConvCaller [badCallConvCallee] = none :=
-  ⟨rfl, rfl, rfl, by decide, rfl, by decide, by decide, by decide, rfl⟩
+  ⟨rfl, rfl, rfl, by decide +kernel, rfl, by decide +kernel, by decide +kernel, by decide +kernel, rfl⟩
 
 /-- Dead return place
 (`StorageLive(_2); StorageDead(_2); _2 = idU32Callee(copy _1)`):
@@ -9068,8 +9082,7 @@ def deadCallDestCaller : CapturedMir where
 theorem deadCallDest_rejected :
     callDestOk deadCallDestCaller.localDecls (mustLiveBefore deadCallDestCaller 0 2)
       (tupleInitBefore deadCallDestCaller 0 2) u32Decl (local_ 2) = false ∧
-    progInFragment deadCallDestCaller [idU32Callee] = false := by
-  decide
+    progInFragment deadCallDestCaller [idU32Callee] = false := by decide +kernel
 
 def deadCallDestProg : Gen.Program :=
   (translateProg deadCallDestCaller [idU32Callee]).getD emptyProg
@@ -9091,7 +9104,7 @@ theorem deadCallDest_anneal_ub :
     ∃ tr u, Reaches
       (mirCallTreeWithCallees deadCallDestCaller [.scalar ⟨7, 4⟩] [idU32Callee]) tr u ∧
       FaultNow u :=
-  faultsA_sound deadCallDestCaller 10 _ (by decide)
+  faultsA_sound deadCallDestCaller 10 _ (by decide +kernel)
 
 theorem deadCallDest_minirust_ub_before_callee :
     Interp.steps 4 deadCallDestMInit =
@@ -9134,8 +9147,7 @@ theorem uninitProjCallDest_rejected :
     (tupleInitBefore uninitProjCallDestCaller 0 1).contains 2 = false ∧
     callDestOk uninitProjCallDestCaller.localDecls (mustLiveBefore uninitProjCallDestCaller 0 1)
       (tupleInitBefore uninitProjCallDestCaller 0 1) i8Decl (field0I8 2) = false ∧
-    progInFragment uninitProjCallDestCaller [negI8Callee] = false := by
-  decide
+    progInFragment uninitProjCallDestCaller [negI8Callee] = false := by decide +kernel
 
 def uninitProjCallDestProg : Gen.Program :=
   (translateProg uninitProjCallDestCaller [negI8Callee]).getD emptyProg
@@ -9161,7 +9173,7 @@ theorem uninitProjCallDest_anneal_ret :
     MirNoUBTree
       (mirCallTreeWithCallees uninitProjCallDestCaller [.scalar ⟨5, 1⟩] [negI8Callee]) :=
   ⟨⟨_, runA_sound uninitProjCallDestCaller 15 _ _ _ rfl⟩,
-    runA_noUB uninitProjCallDestCaller 15 _ _ _ rfl⟩
+    runA_isSome_noUB uninitProjCallDestCaller 15 _ (by kernel_rfl)⟩
 
 theorem uninitProjCallDest_minirust_ret :
     (Interp.steps 9 uninitProjCallDestMInit).toOption.map
@@ -9233,8 +9245,7 @@ def diamondCallEntry : CapturedMir where
   allocations := []
 
 theorem diamondCall_inFragment :
-    progInFragment diamondCallEntry [diamondMidA, diamondMidB, cAbiCallee] = true := by
-  decide
+    progInFragment diamondCallEntry [diamondMidA, diamondMidB, cAbiCallee] = true := by decide +kernel
 
 theorem diamondCall_maxStackLocals :
     maxStackLocals diamondCallEntry [diamondMidA, diamondMidB, cAbiCallee] = some 9 := rfl
@@ -9252,7 +9263,7 @@ theorem ctxDiamondCall_ok : CtxOk diamondCallEntry ctxDiamondCall where
     | _ + 2, hi, _ => simp [diamondCallEntry] at hi
   ret := by
     intro d hd; simp [diamondCallEntry] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 def diamondCallProg : Gen.Program :=
   (translateProg diamondCallEntry [diamondMidA, diamondMidB, cAbiCallee]).getD emptyProg
@@ -9285,13 +9296,13 @@ theorem diamondCall5_anneal_ret :
         [diamondMidA, diamondMidB, cAbiCallee]) []
       (.normal (.scalar ⟨31, 4⟩,
         { diamondCall5S0.memory with activeCallee := some diamondCallEntry })) :=
-  runA_sound diamondCallEntry 35 _ _ _ rfl
+  runA_sound diamondCallEntry 35 _ _ _ (by kernel_rfl)
 
 theorem diamondCall5_noUB :
     MirNoUBTree
       (mirCallTreeWithCallees diamondCallEntry diamondCall5Args
         [diamondMidA, diamondMidB, cAbiCallee]) :=
-  runA_noUB diamondCallEntry 35 _ _ _ rfl
+  runA_isSome_noUB diamondCallEntry 35 _ (by kernel_rfl)
 
 theorem diamondCall5_minirust_ret :
     ∃ (n : Nat) (m' : Mach), Interp.steps n diamondCall5MInit = .ok m' ∧
@@ -9301,8 +9312,8 @@ theorem diamondCall5_minirust_ret :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCallWithCallees_ret diamondCall_inFragment diamondCall_translate
       diamondCallEntry_translateInProg ctxDiamondCall ctxDiamondCall_ok
-      diamondCall5Args (by decide) diamondCall5MInit
-      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      diamondCall5Args (by decide +kernel) diamondCall5MInit
+      (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl
       diamondCall5_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [diamondCallEntry] at hd; subst hd
@@ -9384,7 +9395,7 @@ MiniRust's `prepare_for_inplace_passing` uninitializes `_1` before the argument
 load. -/
 theorem callDestArgAlias_noUB :
     MirNoUBTree (mirCallTreeWithCallees callDestArgAlias [.scalar ⟨7, 4⟩] [idU32Callee]) :=
-  runA_noUB callDestArgAlias 10 _ _ _ rfl
+  runA_isSome_noUB callDestArgAlias 10 _ (by kernel_rfl)
 
 theorem callDestArgAlias_noUB_transfer_fails :
     MirNoUBTree (mirCallTreeWithCallees callDestArgAlias [.scalar ⟨7, 4⟩] [idU32Callee]) ∧
@@ -9404,7 +9415,7 @@ refutes the conclusion of `mirCallWithCallees_noUB` (at `n = 7`). -/
 theorem callProjMoveReuse_noUB :
     MirNoUBTree
       (mirCallTreeWithCallees callProjMoveReuse callProjMoveReuseArgs [idU32Callee]) :=
-  runA_noUB callProjMoveReuse 10 _ _ _ rfl
+  runA_isSome_noUB callProjMoveReuse 10 _ (by kernel_rfl)
 
 theorem callProjMoveReuse_noUB_transfer_fails :
     MirNoUBTree
@@ -9472,7 +9483,7 @@ def liveCallDestSpinCaller : CapturedMir where
   allocations := []
 
 theorem liveCallDestSpin_inFragment :
-    progInFragment liveCallDestSpinCaller [spinU32Callee] = true := by decide
+    progInFragment liveCallDestSpinCaller [spinU32Callee] = true := by decide +kernel
 
 def liveCallDestSpinProg : Gen.Program :=
   (translateProg liveCallDestSpinCaller [spinU32Callee]).getD emptyProg
@@ -9507,7 +9518,7 @@ theorem ctxLiveCallDestSpin_ok : CtxOk liveCallDestSpinCaller ctxCallSpin where
     | _ + 2, hi, _ => simp [liveCallDestSpinCaller] at hi
   ret := by
     intro d hd; simp [liveCallDestSpinCaller] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 private def nextLiveSpinState (s : MachineState) : MachineState :=
   match stepMirFn liveCallDestSpinCaller s with
@@ -9545,7 +9556,7 @@ theorem liveCallDestSpin_minirust_diverges (n : Nat) :
     ∃ m', Interp.steps n liveCallDestSpinMInit = .ok m' :=
   mirCallWithCallees_diverges_steps_ok liveCallDestSpin_inFragment liveCallDestSpin_translate
     liveCallDestSpin_translateInProg ctxCallSpin ctxLiveCallDestSpin_ok callDestSpinArgs
-    (by decide) liveCallDestSpinMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    (by decide +kernel) liveCallDestSpinMInit (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl
     liveCallDestSpin_noUB liveCallDestSpin_noRet n
 
 theorem liveCallDestSpin_minirust_diverges_rel (n : Nat) :
@@ -9557,7 +9568,7 @@ theorem liveCallDestSpin_minirust_diverges_rel (n : Nat) :
         tr (mirTree liveCallDestSpinCaller s') :=
   mirCallWithCallees_diverges_rel liveCallDestSpin_inFragment liveCallDestSpin_translate
     liveCallDestSpin_translateInProg ctxCallSpin ctxLiveCallDestSpin_ok callDestSpinArgs
-    (by decide) liveCallDestSpinMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    (by decide +kernel) liveCallDestSpinMInit (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl
     liveCallDestSpin_noUB liveCallDestSpin_noRet n
 
 theorem liveCallDestSpin_depth3_step20 :
@@ -9597,8 +9608,7 @@ theorem deadCallDestSpin_rejected :
     movesOk deadCallDestSpinCaller = true ∧ mentionsOk deadCallDestSpinCaller = true ∧
     storageDeadOk deadCallDestSpinCaller = true ∧ livenessOk deadCallDestSpinCaller = true ∧
     tupleInitOk deadCallDestSpinCaller = true ∧
-    progInFragment deadCallDestSpinCaller [spinU32Callee] = false := by
-  decide
+    progInFragment deadCallDestSpinCaller [spinU32Callee] = false := by decide +kernel
 
 def deadCallDestSpinProg : Gen.Program :=
   (translateProg deadCallDestSpinCaller [spinU32Callee]).getD emptyProg
@@ -9624,7 +9634,7 @@ theorem ctxDeadCallDestSpin_ok : CtxOk deadCallDestSpinCaller ctxCallSpin where
     | _ + 2, hi, _ => simp [deadCallDestSpinCaller] at hi
   ret := by
     intro d hd; simp [deadCallDestSpinCaller] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 /-- Every hypothesis of `mirCallWithCallees_noUB` other than `hfrag` holds for
 `deadCallDestSpinCaller` (the remaining `hthreads`, `hactive`, and `hallocs`
@@ -9637,7 +9647,7 @@ theorem deadCallDestSpin_hyps :
     argsOk deadCallDestSpinCaller callDestSpinArgs = true ∧
     ProgEnvOk deadCallDestSpinProg (fnNameMap deadCallDestSpinCaller [spinU32Callee])
       deadCallDestSpinMInit :=
-  ⟨rfl, rfl, ctxDeadCallDestSpin_ok, by decide, progEnvOk_fnPtrMap rfl rfl (by decide)⟩
+  ⟨rfl, rfl, ctxDeadCallDestSpin_ok, by decide +kernel, progEnvOk_fnPtrMap rfl rfl (by decide +kernel)⟩
 
 private def nextDeadSpinState (s : MachineState) : MachineState :=
   match stepMirFn deadCallDestSpinCaller s with
@@ -9731,8 +9741,7 @@ def abiArgMismatchCaller : CapturedMir where
 
 theorem abiArgMismatch_rejected :
     callArgsOk abiArgMismatchCaller.layouts abiArgMismatchCaller.localDecls [i8Decl] [.copy (local_ 1)] = false ∧
-    progInFragment abiArgMismatchCaller [idI8Callee] = false := by
-  decide
+    progInFragment abiArgMismatchCaller [idI8Callee] = false := by decide +kernel
 
 def abiArgMismatchProg : Gen.Program :=
   (translateProg abiArgMismatchCaller [idI8Callee]).getD emptyProg
@@ -9757,11 +9766,11 @@ theorem abiArgMismatch_anneal_ret :
     ReachesRet (mirCallTreeWithCallees abiArgMismatchCaller abiArgMismatchArgs [idI8Callee]) []
       (.normal (.scalar ⟨7, 4⟩,
         { abiArgMismatchS0.memory with activeCallee := some abiArgMismatchCaller })) :=
-  runA_sound abiArgMismatchCaller 10 _ _ _ rfl
+  runA_sound abiArgMismatchCaller 10 _ _ _ (by kernel_rfl)
 
 theorem abiArgMismatch_noUB :
     MirNoUBTree (mirCallTreeWithCallees abiArgMismatchCaller abiArgMismatchArgs [idI8Callee]) :=
-  runA_noUB abiArgMismatchCaller 10 _ _ _ rfl
+  runA_isSome_noUB abiArgMismatchCaller 10 _ (by kernel_rfl)
 
 theorem abiArgMismatch_minirust_ub :
     Interp.steps 2 abiArgMismatchMInit =
@@ -9808,8 +9817,7 @@ def abiRetMismatchCaller : CapturedMir where
 theorem abiRetMismatch_rejected :
     callDestOk abiRetMismatchCaller.localDecls (mustLiveBefore abiRetMismatchCaller 0 0)
       (tupleInitBefore abiRetMismatchCaller 0 0) i8Decl (local_ 0) = false ∧
-    progInFragment abiRetMismatchCaller [idI8Callee] = false := by
-  decide
+    progInFragment abiRetMismatchCaller [idI8Callee] = false := by decide +kernel
 
 def abiRetMismatchProg : Gen.Program :=
   (translateProg abiRetMismatchCaller [idI8Callee]).getD emptyProg
@@ -9834,11 +9842,11 @@ theorem abiRetMismatch_anneal_ret :
     ReachesRet (mirCallTreeWithCallees abiRetMismatchCaller abiRetMismatchArgs [idI8Callee]) []
       (.normal (.scalar ⟨5, 1⟩,
         { abiRetMismatchS0.memory with activeCallee := some abiRetMismatchCaller })) :=
-  runA_sound abiRetMismatchCaller 10 _ _ _ rfl
+  runA_sound abiRetMismatchCaller 10 _ _ _ (by kernel_rfl)
 
 theorem abiRetMismatch_noUB :
     MirNoUBTree (mirCallTreeWithCallees abiRetMismatchCaller abiRetMismatchArgs [idI8Callee]) :=
-  runA_noUB abiRetMismatchCaller 10 _ _ _ rfl
+  runA_isSome_noUB abiRetMismatchCaller 10 _ (by kernel_rfl)
 
 theorem abiRetMismatch_minirust_ub :
     Interp.steps 2 abiRetMismatchMInit =
@@ -9899,8 +9907,7 @@ theorem argCountMismatch_rejected :
     callTerminatorOk [const5Callee] argCountMismatchCaller 0
       (mkTerm (.call (fnDefOp "witness::const5_callee") [] (local_ 0) (some 1) .continue_)) =
       false ∧
-    progInFragment argCountMismatchCaller [const5Callee] = false := by
-  decide
+    progInFragment argCountMismatchCaller [const5Callee] = false := by decide +kernel
 
 def argCountMismatchProg : Gen.Program :=
   (translateProg argCountMismatchCaller [const5Callee]).getD emptyProg
@@ -9923,11 +9930,11 @@ theorem argCountMismatch_anneal_ret :
     ReachesRet (mirCallTreeWithCallees argCountMismatchCaller [] [const5Callee]) []
       (.normal (.scalar ⟨5, 4⟩,
         { argCountMismatchS0.memory with activeCallee := some argCountMismatchCaller })) :=
-  runA_sound argCountMismatchCaller 10 _ _ _ rfl
+  runA_sound argCountMismatchCaller 10 _ _ _ (by kernel_rfl)
 
 theorem argCountMismatch_noUB :
     MirNoUBTree (mirCallTreeWithCallees argCountMismatchCaller [] [const5Callee]) :=
-  runA_noUB argCountMismatchCaller 10 _ _ _ rfl
+  runA_isSome_noUB argCountMismatchCaller 10 _ (by kernel_rfl)
 
 theorem argCountMismatch_minirust_ub :
     Interp.steps 2 argCountMismatchMInit =
@@ -9981,7 +9988,7 @@ theorem stmtMoveThenCallArg_anneal_ub :
     ∃ tr u, Reaches
       (mirCallTreeWithCallees stmtMoveThenCallArg stmtMoveThenCallArgArgs [idU32Callee]) tr u ∧
       FaultNow u :=
-  faultsA_sound stmtMoveThenCallArg 10 _ (by decide)
+  faultsA_sound stmtMoveThenCallArg 10 _ (by decide +kernel)
 
 theorem stmtMoveThenCallArg_minirust_ret :
     (Interp.steps 8 stmtMoveThenCallArgMInit).toOption.map
@@ -10036,7 +10043,7 @@ def calleeRetUninitCaller : CapturedMir where
   allocations := []
 
 theorem calleeRetUninit_inFragment :
-    progInFragment calleeRetUninitCaller [retUninitCallee] = true := by decide
+    progInFragment calleeRetUninitCaller [retUninitCallee] = true := by decide +kernel
 
 def calleeRetUninitProg : Gen.Program :=
   (translateProg calleeRetUninitCaller [retUninitCallee]).getD emptyProg
@@ -10070,20 +10077,20 @@ theorem ctxCalleeRetUninit_ok : CtxOk calleeRetUninitCaller ctxCallSpin where
     | _ + 2, hi, _ => simp [calleeRetUninitCaller] at hi
   ret := by
     intro d hd; simp [calleeRetUninitCaller] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 theorem calleeRetUninit_anneal_ub :
     ∃ tr u, Reaches
       (mirCallTreeWithCallees calleeRetUninitCaller calleeRetUninitArgs [retUninitCallee]) tr u ∧
       FaultNow u :=
-  faultsA_sound calleeRetUninitCaller 10 _ (by decide)
+  faultsA_sound calleeRetUninitCaller 10 _ (by decide +kernel)
 
 theorem calleeRetUninit_minirust_ub :
     ∃ (n : Nat) (msg : String), Interp.steps n calleeRetUninitMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := calleeRetUninit_anneal_ub
   exact mirCallWithCallees_ub calleeRetUninit_inFragment calleeRetUninit_translate
     calleeRetUninit_translateInProg ctxCallSpin ctxCalleeRetUninit_ok calleeRetUninitArgs
-    (by decide) calleeRetUninitMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+    (by decide +kernel) calleeRetUninitMInit (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl hr hf
 
 /-- The callee-`Return` fault is localized (`mirCallWithCallees_ub_rel`):
 MiniRust reaches in `n` steps a machine still `MultiStateRel`-related to Anneal,
@@ -10103,7 +10110,7 @@ theorem calleeRetUninit_minirust_ub_rel :
   obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩ :=
     mirCallWithCallees_ub_rel calleeRetUninit_inFragment calleeRetUninit_translate
       calleeRetUninit_translateInProg ctxCallSpin ctxCalleeRetUninit_ok calleeRetUninitArgs
-      (by decide) calleeRetUninitMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+      (by decide +kernel) calleeRetUninitMInit (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl hr hf
   exact ⟨n, sLast, mLast, msg, hsteps, hrel, fun _ _ => hrel.not_returnRel, hstep, hsteps1, hno⟩
 
 theorem calleeRetUninit_minirust_direct :
@@ -10123,7 +10130,7 @@ theorem calleeRetUninit_converse_error :
         [retUninitCallee]) tr (.normal (v, mem))) :=
   mirCallWithCallees_steps_error calleeRetUninit_inFragment calleeRetUninit_translate
     calleeRetUninit_translateInProg ctxCallSpin ctxCalleeRetUninit_ok calleeRetUninitArgs
-    (by decide) calleeRetUninitMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    (by decide +kernel) calleeRetUninitMInit (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl
     calleeRetUninit_minirust_direct
 
 /-! ### Pass `B4`: localized single-body and multi-function UB witnesses, and
@@ -10142,7 +10149,7 @@ theorem retUninit_minirust_ub_rel_from_start :
         ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
   obtain ⟨tr, u, hr, hf⟩ := retUninit_anneal_ub
   exact mirCall_ub_rel retUninit_inFragment retUninit_translate ctx0 (ctx0_ok1 rfl) []
-    (by decide) retUninitMInit rfl rfl rfl hr hf
+    (by decide +kernel) retUninitMInit rfl rfl rfl hr hf
 
 /-- Single-body localized UB from `f.start` (`run_ub_rel_from_start`) on
 `negMention` with input `0` (branching into `Terminator::Unreachable`). -/
@@ -10173,7 +10180,7 @@ theorem calleeDivZero_minirust_ub_rel :
   obtain ⟨tr, u, hr, hf⟩ := calleeDivZero_anneal_ub
   exact mirCallWithCallees_ub_rel calleeDivZero_inFragment calleeDivZero_translate
     calleeDivZeroCaller_translateInProg ctxCalleeDivZero ctxCalleeDivZero_ok calleeDivZeroArgs
-    (by decide) calleeDivZeroMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+    (by decide +kernel) calleeDivZeroMInit (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl hr hf
 
 /-- Multi-function localized UB (`mirCallWithCallees_ub_rel`) on
 `callArgUbCaller` faulting during call-argument evaluation. -/
@@ -10187,8 +10194,8 @@ theorem callArgUb_minirust_ub_rel :
         ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
   obtain ⟨tr, u, hr, hf⟩ := callArgUb_anneal_ub
   exact mirCallWithCallees_ub_rel callArgUb_inFragment callArgUb_translate
-    callArgUbCaller_translateInProg ctxCallArgUb ctxCallArgUb_ok [] (by decide)
-    callArgUbMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+    callArgUbCaller_translateInProg ctxCallArgUb ctxCallArgUb_ok [] (by decide +kernel)
+    callArgUbMInit (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl hr hf
 
 /-- Multi-function localized UB (`mirCallWithCallees_ub_rel`) on
 `callMoveReuse` faulting in caller `bb1` after a completed callee return. -/
@@ -10203,8 +10210,8 @@ theorem callMoveReuse_minirust_ub_rel :
   obtain ⟨tr, u, hr, hf⟩ := callMoveReuse_anneal_ub
   exact mirCallWithCallees_ub_rel callMoveReuse_inFragment callMoveReuse_translate
     callMoveReuse_translateInProg ctxCallSpin ctxCallMoveReuse_ok
-    [.scalar ⟨7, 4⟩] (by decide) callMoveReuseMInit
-    (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+    [.scalar ⟨7, 4⟩] (by decide +kernel) callMoveReuseMInit
+    (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl hr hf
 
 /-- Unconditional fixed-point stabilization of `iterLiveEntries` and
 `livenessOk_eq_true` on `projDestCaller` and `deadCallDestSpinCaller`. -/
@@ -10221,10 +10228,10 @@ theorem projDestCaller_liveness_stabilizes :
        (iterLiveEntries fuel deadCallDestSpinCaller (initLiveEntries deadCallDestSpinCaller)) =
      iterLiveEntries fuel deadCallDestSpinCaller (initLiveEntries deadCallDestSpinCaller)) ∧
     livenessOk deadCallDestSpinCaller = true :=
-  ⟨iterLiveEntries_stabilizes (body := projDestCaller) (by decide),
-   livenessOk_eq_true (body := projDestCaller) (by decide),
-   iterLiveEntries_stabilizes (body := deadCallDestSpinCaller) (by decide),
-   livenessOk_eq_true (body := deadCallDestSpinCaller) (by decide)⟩
+  ⟨iterLiveEntries_stabilizes (body := projDestCaller) (by decide +kernel),
+   livenessOk_eq_true (body := projDestCaller) (by decide +kernel),
+   iterLiveEntries_stabilizes (body := deadCallDestSpinCaller) (by decide +kernel),
+   livenessOk_eq_true (body := deadCallDestSpinCaller) (by decide +kernel)⟩
 
 /-- Unconditional fixed-point stabilization of `iterTupleInitEntries` and
 `tupleInitOk_eq_true` on `projDestCaller` and `uninitProjCallDestCaller`. -/
@@ -10255,7 +10262,7 @@ theorem projDestCaller_liveAtEntry_greatest {dst : Nat}
     ∀ i ∈ ([[0, 1], [0, 1], [0, 1, 2]] : List (List Nat)).getD dst [],
       i ∈ liveAtEntry projDestCaller dst :=
   liveAtEntry_greatest
-    (by decide)
+    (by decide +kernel)
     (fun d hd hne i hi => by
       have hd' : d < 3 := by simpa [projDestCaller] using hd
       revert i hi
@@ -10278,7 +10285,7 @@ theorem projDestCaller_tupleInitAtEntry_greatest {dst : Nat}
     ∀ i ∈ ([[], [0], [0]] : List (List Nat)).getD dst [],
       i ∈ tupleInitAtEntry projDestCaller dst :=
   tupleInitAtEntry_greatest
-    (by decide)
+    (by decide +kernel)
     (fun d hd hne i hi => by
       have hd' : d < 3 := by simpa [projDestCaller] using hd
       revert i hi
@@ -10627,7 +10634,7 @@ theorem assumeSub_translateInProg :
 /-- `progInFragment` (`progStatementOk`) admits `Assume` statements and connects
 their split-block translation (`SegPc`, `SegChain`) to the multi-function
 correspondence theorems. -/
-theorem assumeSub_inFragment : progInFragment assumeSub [] = true := by decide
+theorem assumeSub_inFragment : progInFragment assumeSub [] = true := by decide +kernel
 
 def ctxAssumeSub : Ctx := ctxWithFns callerFrame retAlloc 1 [128, 256, 384]
 
@@ -10642,7 +10649,7 @@ theorem ctxAssumeSub_ok : CtxOk assumeSub ctxAssumeSub where
     | _ + 3, hi, _ => simp [assumeSub] at hi
   ret := by
     intro d hd; simp [assumeSub] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 def assumeSubArgs (x : Nat) (b : Bool) : List Value :=
   [.scalar ⟨x, 4⟩, .scalar ⟨if b then 1 else 0, 1⟩]
@@ -10682,7 +10689,7 @@ theorem assumeSub20_anneal_ret :
     (∃ tr mem, ReachesRet (mirCallTreeWithCallees assumeSub (assumeSubArgs 20 true) []) tr
       (.normal (.scalar ⟨19, 4⟩, mem))) ∧
     MirNoUBTree (mirCallTreeWithCallees assumeSub (assumeSubArgs 20 true) []) :=
-  runsToScalar_sound (fuel := 10) (by decide)
+  runsToScalar_sound (fuel := 10) (by decide +kernel)
 
 /-- End-to-end correspondence transfer (`mirCallWithCallees_ret`) for
 `assume_sub(20, true)` across two `Assume` block splits in one MIR basic block. -/
@@ -10695,8 +10702,8 @@ theorem assumeSub20_minirust_ret :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCallWithCallees_ret assumeSub_inFragment assumeSub_translate
       assumeSub_translateInProg ctxAssumeSub ctxAssumeSub_ok
-      (assumeSubArgs 20 true) (by decide) (assumeSubMInit 20 true)
-      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hanneal
+      (assumeSubArgs 20 true) (by decide +kernel) (assumeSubMInit 20 true)
+      (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl hanneal
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [assumeSub] at hd; subst hd
   simp [retPtr, ctxAssumeSub, ctxWithFns] at hp
@@ -10735,7 +10742,7 @@ root return. -/
 theorem assumeSubFalse_anneal_ub :
     ∃ tr u, Reaches (mirCallTreeWithCallees assumeSub (assumeSubArgs 20 false) []) tr u ∧
       FaultNow u :=
-  faultsA_sound assumeSub 5 _ (by decide)
+  faultsA_sound assumeSub 5 _ (by decide +kernel)
 
 theorem assumeSubFalse_minirust_ub_rel :
     ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
@@ -10749,8 +10756,8 @@ theorem assumeSubFalse_minirust_ub_rel :
   obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩ :=
     mirCallWithCallees_ub_rel assumeSub_inFragment assumeSub_translate
       assumeSub_translateInProg ctxAssumeSub ctxAssumeSub_ok
-      (assumeSubArgs 20 false) (by decide) (assumeSubMInit 20 false)
-      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+      (assumeSubArgs 20 false) (by decide +kernel) (assumeSubMInit 20 false)
+      (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl hr hf
   exact ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩
 
 /-- Direct confirmation on `b = false`: Anneal's first step is `MirStepNode.fail .ub`,
@@ -10807,7 +10814,7 @@ def assumeTupleCallCaller : CapturedMir where
   allocations := []
 
 theorem assumeTupleCall_inFragment :
-    progInFragment assumeTupleCallCaller [idU32Callee] = true := by decide
+    progInFragment assumeTupleCallCaller [idU32Callee] = true := by decide +kernel
 
 def assumeTupleCallProg : Gen.Program :=
   (translateProg assumeTupleCallCaller [idU32Callee]).getD emptyProg
@@ -10833,7 +10840,7 @@ theorem ctxAssumeTupleCall_ok : CtxOk assumeTupleCallCaller ctxCallSpin where
     | _ + 2, hi, _ => simp [assumeTupleCallCaller] at hi
   ret := by
     intro d hd; simp [assumeTupleCallCaller] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 def assumeTupleCallMInit (x : Nat) : Mach :=
   multiMachineWithCtx ctxCallSpin assumeTupleCallProg 2 assumeTupleCallCaller assumeTupleCallFn
@@ -10844,7 +10851,7 @@ theorem assumeTupleCall10_anneal_ret :
     (∃ tr mem, ReachesRet (mirCallTreeWithCallees assumeTupleCallCaller [.scalar ⟨10, 4⟩] [idU32Callee]) tr
       (.normal (.scalar ⟨15, 4⟩, mem))) ∧
     MirNoUBTree (mirCallTreeWithCallees assumeTupleCallCaller [.scalar ⟨10, 4⟩] [idU32Callee]) :=
-  runsToScalar_sound (fuel := 15) (by decide)
+  runsToScalar_sound (fuel := 15) (by decide +kernel)
 
 theorem assumeTupleCall10_minirust_ret :
     ∃ (n : Nat) (m' : Mach), Interp.steps n (assumeTupleCallMInit 10) = .ok m' ∧
@@ -10855,8 +10862,8 @@ theorem assumeTupleCall10_minirust_ret :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCallWithCallees_ret assumeTupleCall_inFragment assumeTupleCall_translate
       assumeTupleCall_translateInProg ctxCallSpin ctxAssumeTupleCall_ok
-      [.scalar ⟨10, 4⟩] (by decide) (assumeTupleCallMInit 10)
-      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hanneal
+      [.scalar ⟨10, 4⟩] (by decide +kernel) (assumeTupleCallMInit 10)
+      (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl hanneal
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [assumeTupleCallCaller] at hd; subst hd
   simp [retPtr, ctxCallSpin, ctxWithFns] at hp
@@ -10870,7 +10877,7 @@ theorem assumeTupleCallOv_anneal_ub :
     ∃ tr u, Reaches
       (mirCallTreeWithCallees assumeTupleCallCaller [.scalar ⟨4294967295, 4⟩] [idU32Callee]) tr u ∧
       FaultNow u :=
-  faultsA_sound assumeTupleCallCaller 10 _ (by decide)
+  faultsA_sound assumeTupleCallCaller 10 _ (by decide +kernel)
 
 theorem assumeTupleCallOv_minirust_ub_rel :
     ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
@@ -10884,8 +10891,8 @@ theorem assumeTupleCallOv_minirust_ub_rel :
   obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩ :=
     mirCallWithCallees_ub_rel assumeTupleCall_inFragment assumeTupleCall_translate
       assumeTupleCall_translateInProg ctxCallSpin ctxAssumeTupleCall_ok
-      [.scalar ⟨4294967295, 4⟩] (by decide) (assumeTupleCallMInit 4294967295)
-      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+      [.scalar ⟨4294967295, 4⟩] (by decide +kernel) (assumeTupleCallMInit 4294967295)
+      (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl hr hf
   exact ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩
 
  
@@ -10946,7 +10953,7 @@ def assumeMultiFrameCaller : CapturedMir where
   allocations := []
 
 theorem assumeMultiFrame_inFragment :
-    progInFragment assumeMultiFrameCaller [assumeChainCallee] = true := by decide
+    progInFragment assumeMultiFrameCaller [assumeChainCallee] = true := by decide +kernel
 
 def assumeMultiFrameProg : Gen.Program :=
   (translateProg assumeMultiFrameCaller [assumeChainCallee]).getD emptyProg
@@ -10977,12 +10984,12 @@ theorem assumeMultiFrame_prog_wf :
 theorem assumeMultiFrame_func_wf_caller :
     funcCfgWf assumeMultiFrameFn = true :=
   translateFnInProg_funcCfgWf (callees := [assumeChainCallee])
-    (by decide) assumeMultiFrame_translateInProg
+    (by decide +kernel) assumeMultiFrame_translateInProg
 
 theorem assumeMultiFrame_func_wf_callee :
     funcCfgWf assumeChainCalleeFn = true :=
   translateFnInProg_funcCfgWf (callees := [assumeChainCallee])
-    (by decide) assumeChainCallee_translateInProg
+    (by decide +kernel) assumeChainCallee_translateInProg
 
 theorem ctxAssumeMultiFrame_ok : CtxOk assumeMultiFrameCaller ctxCallerMain where
   baseLow := by unfold BaseLow; decide
@@ -10995,7 +11002,7 @@ theorem ctxAssumeMultiFrame_ok : CtxOk assumeMultiFrameCaller ctxCallerMain wher
     | _ + 3, hi, _ => simp [assumeMultiFrameCaller] at hi
   ret := by
     intro d hd; simp [assumeMultiFrameCaller] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 def assumeMultiFrameArgs (x : Nat) (postOk : Bool) : List Value :=
   [.scalar ⟨x, 4⟩, .scalar ⟨if postOk then 1 else 0, 1⟩]
@@ -11016,7 +11023,7 @@ theorem assumeMultiFrame5_anneal_ret :
     MirNoUBTree
       (mirCallTreeWithCallees assumeMultiFrameCaller (assumeMultiFrameArgs 5 true)
         [assumeChainCallee]) :=
-  runsToScalar_sound (fuel := 25) (by decide)
+  runsToScalar_sound (fuel := 25) (by decide +kernel)
 
 theorem assumeMultiFrame5_minirust_ret :
     ∃ (n : Nat) (m' : Mach), Interp.steps n (assumeMultiFrameMInit 5 true) = .ok m' ∧
@@ -11027,8 +11034,8 @@ theorem assumeMultiFrame5_minirust_ret :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCallWithCallees_ret assumeMultiFrame_inFragment assumeMultiFrame_translate
       assumeMultiFrame_translateInProg ctxCallerMain ctxAssumeMultiFrame_ok
-      (assumeMultiFrameArgs 5 true) (by decide) (assumeMultiFrameMInit 5 true)
-      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hanneal
+      (assumeMultiFrameArgs 5 true) (by decide +kernel) (assumeMultiFrameMInit 5 true)
+      (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl hanneal
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [assumeMultiFrameCaller] at hd; subst hd
   simp [retPtr, ctxCallerMain, ctxWithFns] at hp
@@ -11045,7 +11052,7 @@ theorem assumeMultiFramePreUb_anneal_ub :
       (mirCallTreeWithCallees assumeMultiFrameCaller (assumeMultiFrameArgs 100 true)
         [assumeChainCallee]) tr u ∧
       FaultNow u :=
-  faultsA_sound assumeMultiFrameCaller 10 _ (by decide)
+  faultsA_sound assumeMultiFrameCaller 10 _ (by decide +kernel)
 
 theorem assumeMultiFramePreUb_minirust_ub_rel :
     ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
@@ -11060,8 +11067,8 @@ theorem assumeMultiFramePreUb_minirust_ub_rel :
   obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩ :=
     mirCallWithCallees_ub_rel assumeMultiFrame_inFragment assumeMultiFrame_translate
       assumeMultiFrame_translateInProg ctxCallerMain ctxAssumeMultiFrame_ok
-      (assumeMultiFrameArgs 100 true) (by decide) (assumeMultiFrameMInit 100 true)
-      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+      (assumeMultiFrameArgs 100 true) (by decide +kernel) (assumeMultiFrameMInit 100 true)
+      (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl hr hf
   exact ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩
 
 /-- `(10, true)` passes the caller's pre-call `Assume` and the callee's first
@@ -11072,7 +11079,7 @@ theorem assumeMultiFrameCalleeSeg2Ub_anneal_ub :
       (mirCallTreeWithCallees assumeMultiFrameCaller (assumeMultiFrameArgs 10 true)
         [assumeChainCallee]) tr u ∧
       FaultNow u :=
-  faultsA_sound assumeMultiFrameCaller 20 _ (by decide)
+  faultsA_sound assumeMultiFrameCaller 20 _ (by decide +kernel)
 
 theorem assumeMultiFrameCalleeSeg2Ub_minirust_ub_rel :
     ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
@@ -11087,8 +11094,8 @@ theorem assumeMultiFrameCalleeSeg2Ub_minirust_ub_rel :
   obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩ :=
     mirCallWithCallees_ub_rel assumeMultiFrame_inFragment assumeMultiFrame_translate
       assumeMultiFrame_translateInProg ctxCallerMain ctxAssumeMultiFrame_ok
-      (assumeMultiFrameArgs 10 true) (by decide) (assumeMultiFrameMInit 10 true)
-      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+      (assumeMultiFrameArgs 10 true) (by decide +kernel) (assumeMultiFrameMInit 10 true)
+      (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl hr hf
   exact ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩
 
 /-- `(5, false)` completes `assumeChainCallee(5) == 6` across all three callee
@@ -11098,7 +11105,7 @@ theorem assumeMultiFramePostUb_anneal_ub :
       (mirCallTreeWithCallees assumeMultiFrameCaller (assumeMultiFrameArgs 5 false)
         [assumeChainCallee]) tr u ∧
       FaultNow u :=
-  faultsA_sound assumeMultiFrameCaller 25 _ (by decide)
+  faultsA_sound assumeMultiFrameCaller 25 _ (by decide +kernel)
 
 theorem assumeMultiFramePostUb_minirust_ub_rel :
     ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
@@ -11113,8 +11120,8 @@ theorem assumeMultiFramePostUb_minirust_ub_rel :
   obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩ :=
     mirCallWithCallees_ub_rel assumeMultiFrame_inFragment assumeMultiFrame_translate
       assumeMultiFrame_translateInProg ctxCallerMain ctxAssumeMultiFrame_ok
-      (assumeMultiFrameArgs 5 false) (by decide) (assumeMultiFrameMInit 5 false)
-      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+      (assumeMultiFrameArgs 5 false) (by decide +kernel) (assumeMultiFrameMInit 5 false)
+      (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl hr hf
   exact ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩
 
 /-- Necessity witness for `livenessOk` on `StatementKind.intrinsic (.assume op)`:
@@ -11139,7 +11146,7 @@ def assumeDeadLocal : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem assumeDeadLocal_inFragment : progInFragment assumeDeadLocal [] = true := by decide
+theorem assumeDeadLocal_inFragment : progInFragment assumeDeadLocal [] = true := by decide +kernel
 
 def assumeDeadLocalProg : Gen.Program := (translateProg assumeDeadLocal []).getD emptyProg
 
@@ -11161,7 +11168,7 @@ theorem ctxAssumeDeadLocal_ok : CtxOk assumeDeadLocal ctxCallSpin where
     | _ + 2, hi, _ => simp [assumeDeadLocal] at hi
   ret := by
     intro d hd; simp [assumeDeadLocal] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 def assumeDeadLocalMInit : Mach :=
   multiMachineWithCtx ctxCallSpin assumeDeadLocalProg 1 assumeDeadLocal assumeDeadLocalFn
@@ -11171,7 +11178,7 @@ def assumeDeadLocalMInit : Mach :=
 theorem assumeDeadLocal_anneal_ub :
     ∃ tr u, Reaches (mirCallTreeWithCallees assumeDeadLocal [.scalar ⟨7, 4⟩] []) tr u ∧
       FaultNow u :=
-  faultsA_sound assumeDeadLocal 6 _ (by decide)
+  faultsA_sound assumeDeadLocal 6 _ (by decide +kernel)
 
 theorem assumeDeadLocal_minirust_ub_rel :
     ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
@@ -11185,8 +11192,8 @@ theorem assumeDeadLocal_minirust_ub_rel :
   obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩ :=
     mirCallWithCallees_ub_rel assumeDeadLocal_inFragment assumeDeadLocal_translate
       assumeDeadLocal_translateInProg ctxCallSpin ctxAssumeDeadLocal_ok
-      [.scalar ⟨7, 4⟩] (by decide) assumeDeadLocalMInit
-      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+      [.scalar ⟨7, 4⟩] (by decide +kernel) assumeDeadLocalMInit
+      (progEnvOk_fnPtrMap rfl rfl (by decide +kernel)) rfl rfl rfl hr hf
   exact ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩
 
 /-- Necessity of `stmtMoved` on `Assume` (`Assume(move _2); _0 = copy _1; _3 = copy _2`):
@@ -11215,7 +11222,7 @@ def assumeMoveReuse : CapturedMir where
 
 theorem assumeMoveReuse_rejected :
     movesOk assumeMoveReuse = false ∧ progInFragment assumeMoveReuse [] = false :=
-  ⟨by decide, by decide⟩
+  ⟨by decide +kernel, by decide +kernel⟩
 
 def assumeMoveReuseProg : Gen.Program := (translateProg assumeMoveReuse []).getD emptyProg
 
@@ -11233,7 +11240,7 @@ theorem assumeMoveReuse_diverges :
     (Interp.steps 7 assumeMoveReuseMInit).toOption.map
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAlloc with data := scalarBytes u32 7 }, [1]) :=
-  ⟨faultsA_sound assumeMoveReuse 6 _ (by decide), by decide +kernel⟩
+  ⟨faultsA_sound assumeMoveReuse 6 _ (by decide +kernel), by decide +kernel⟩
 
 /-- Necessity of `stmtReadsOk` on `Assume` (`_3 = move _2; Assume(copy _2)`):
 moving `_2` in a prior statement leaves stale `true` bytes in MiniRust's local
@@ -11260,7 +11267,7 @@ def assumeAfterMove : CapturedMir where
 
 theorem assumeAfterMove_rejected :
     movesOk assumeAfterMove = false ∧ progInFragment assumeAfterMove [] = false :=
-  ⟨by decide, by decide⟩
+  ⟨by decide +kernel, by decide +kernel⟩
 
 def assumeAfterMoveProg : Gen.Program := (translateProg assumeAfterMove []).getD emptyProg
 
@@ -11278,7 +11285,7 @@ theorem assumeAfterMove_diverges :
     (Interp.steps 7 assumeAfterMoveMInit).toOption.map
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAlloc with data := scalarBytes u32 7 }, [1]) :=
-  ⟨faultsA_sound assumeAfterMove 6 _ (by decide), by decide +kernel⟩
+  ⟨faultsA_sound assumeAfterMove 6 _ (by decide +kernel), by decide +kernel⟩
 
 /-! ## Homogeneous arrays (`Type::Array`), `Repeat`, `Len`, and `Index`/`ConstantIndex` projections -/
 
@@ -11389,7 +11396,7 @@ def arrayOpsI8 : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem arrayOpsI8_inFragment : inFragment arrayOpsI8 = true := by decide
+theorem arrayOpsI8_inFragment : inFragment arrayOpsI8 = true := by decide +kernel
 
 def arrayOpsI8Fn : Gen.Function where
   locals := ⟨[
@@ -11461,11 +11468,11 @@ def arrayOpsOkMInit : Mach :=
 theorem arrayOpsOk_anneal_ret :
     ReachesRet (mirCallTree arrayOpsI8 arrayOpsOkArgs) []
       (.normal (.scalar ⟨40, 1⟩, arrayOpsOkS0.memory)) :=
-  runA_sound arrayOpsI8 16 _ _ _ rfl
+  runA_sound arrayOpsI8 16 _ _ _ (by kernel_rfl)
 
 theorem arrayOpsOk_noUB :
     MirNoUBTree (mirCallTree arrayOpsI8 arrayOpsOkArgs) :=
-  runA_noUB arrayOpsI8 16 _ _ _ rfl
+  runA_isSome_noUB arrayOpsI8 16 _ (by kernel_rfl)
 
 theorem arrayOpsOk_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n arrayOpsOkMInit = .ok m' ∧
@@ -11473,7 +11480,7 @@ theorem arrayOpsOk_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8_6 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret arrayOpsI8_inFragment arrayOpsI8_translate ctxI8_6
-      (ctxI8_ok_arrayOps rfl) arrayOpsOkArgs (by decide)
+      (ctxI8_ok_arrayOps rfl) arrayOpsOkArgs (by decide +kernel)
       arrayOpsOkMInit rfl rfl rfl arrayOpsOk_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [arrayOpsI8] at hd; subst hd
@@ -11526,13 +11533,13 @@ def arrayOpsOobMInit : Mach :=
 
 theorem arrayOpsOob_anneal_ub :
     ∃ tr u, Reaches (mirCallTree arrayOpsI8 arrayOpsOobArgs) tr u ∧ FaultNow u :=
-  faultsA_sound arrayOpsI8 8 _ (by decide)
+  faultsA_sound arrayOpsI8 8 _ (by decide +kernel)
 
 theorem arrayOpsOob_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n arrayOpsOobMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := arrayOpsOob_anneal_ub
   exact mirCall_ub arrayOpsI8_inFragment arrayOpsI8_translate ctxI8_6
-    (ctxI8_ok_arrayOps rfl) arrayOpsOobArgs (by decide)
+    (ctxI8_ok_arrayOps rfl) arrayOpsOobArgs (by decide +kernel)
     arrayOpsOobMInit rfl rfl rfl hr hf
 
 theorem arrayOpsOob_minirust_direct :
@@ -11545,7 +11552,7 @@ theorem arrayOpsOob_converse_error :
       ReturnRel arrayOpsI8 ctxI8_6 s' v mRet ∧
       ReachesRet (mirCallTree arrayOpsI8 arrayOpsOobArgs) tr (.normal (v, mem))) :=
   mirCall_steps_error arrayOpsI8_inFragment arrayOpsI8_translate ctxI8_6
-    (ctxI8_ok_arrayOps rfl) arrayOpsOobArgs (by decide)
+    (ctxI8_ok_arrayOps rfl) arrayOpsOobArgs (by decide +kernel)
     arrayOpsOobMInit rfl rfl rfl arrayOpsOob_minirust_direct
 
 /-! ## Signed index local (`i8`), negative index UB (`idx < 0`), and in-place write UB -/
@@ -11587,7 +11594,7 @@ def arraySignedIdxI8 : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem arraySignedIdxI8_inFragment : inFragment arraySignedIdxI8 = true := by decide
+theorem arraySignedIdxI8_inFragment : inFragment arraySignedIdxI8 = true := by decide +kernel
 
 def arraySignedIdxI8Fn : Gen.Function where
   locals := ⟨[(localName 0, .Int i8), (localName 1, .Array (.Int i8) 2), (localName 2, .Int i8)]⟩
@@ -11619,7 +11626,7 @@ def arraySignedIdxOkMInit : Mach :=
 theorem arraySignedIdxOk_anneal_ret :
     ReachesRet (mirCallTree arraySignedIdxI8 [initArrI8_2, .scalar ⟨1, 1⟩]) []
       (.normal (.scalar ⟨99, 1⟩, arraySignedIdxOkS0.memory)) :=
-  runA_sound arraySignedIdxI8 8 _ _ _ rfl
+  runA_sound arraySignedIdxI8 8 _ _ _ (by kernel_rfl)
 
 theorem arraySignedIdxOk_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n arraySignedIdxOkMInit = .ok m' ∧
@@ -11627,7 +11634,7 @@ theorem arraySignedIdxOk_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8_3 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret arraySignedIdxI8_inFragment arraySignedIdxI8_translate ctxI8_3
-      (ctxI8_ok_arraySignedIdx rfl) [initArrI8_2, .scalar ⟨1, 1⟩] (by decide)
+      (ctxI8_ok_arraySignedIdx rfl) [initArrI8_2, .scalar ⟨1, 1⟩] (by decide +kernel)
       arraySignedIdxOkMInit rfl rfl rfl arraySignedIdxOk_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [arraySignedIdxI8] at hd; subst hd
@@ -11655,13 +11662,13 @@ theorem arraySignedNegUb_anneal_ub :
     ∃ tr u,
       Reaches (mirCallTree arraySignedIdxI8 [initArrI8_2, .scalar ⟨255, 1⟩]) tr u ∧
       FaultNow u :=
-  faultsA_sound arraySignedIdxI8 6 _ (by decide)
+  faultsA_sound arraySignedIdxI8 6 _ (by decide +kernel)
 
 theorem arraySignedNegUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n arraySignedNegUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := arraySignedNegUb_anneal_ub
   exact mirCall_ub arraySignedIdxI8_inFragment arraySignedIdxI8_translate ctxI8_3
-    (ctxI8_ok_arraySignedIdx rfl) [initArrI8_2, .scalar ⟨255, 1⟩] (by decide)
+    (ctxI8_ok_arraySignedIdx rfl) [initArrI8_2, .scalar ⟨255, 1⟩] (by decide +kernel)
     arraySignedNegUbMInit rfl rfl rfl hr hf
 
 theorem arraySignedNegUb_minirust_direct :
@@ -11679,13 +11686,13 @@ theorem arraySignedOobUb_anneal_ub :
     ∃ tr u,
       Reaches (mirCallTree arraySignedIdxI8 [initArrI8_2, .scalar ⟨2, 1⟩]) tr u ∧
       FaultNow u :=
-  faultsA_sound arraySignedIdxI8 6 _ (by decide)
+  faultsA_sound arraySignedIdxI8 6 _ (by decide +kernel)
 
 theorem arraySignedOobUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n arraySignedOobUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := arraySignedOobUb_anneal_ub
   exact mirCall_ub arraySignedIdxI8_inFragment arraySignedIdxI8_translate ctxI8_3
-    (ctxI8_ok_arraySignedIdx rfl) [initArrI8_2, .scalar ⟨2, 1⟩] (by decide)
+    (ctxI8_ok_arraySignedIdx rfl) [initArrI8_2, .scalar ⟨2, 1⟩] (by decide +kernel)
     arraySignedOobUbMInit rfl rfl rfl hr hf
 
 theorem arraySignedOobUb_minirust_direct :
@@ -11747,7 +11754,7 @@ def zeroArrayI8 : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem zeroArrayI8_inFragment : inFragment zeroArrayI8 = true := by decide
+theorem zeroArrayI8_inFragment : inFragment zeroArrayI8 = true := by decide +kernel
 
 def zeroArrayI8Fn : Gen.Function where
   locals := ⟨[
@@ -11794,11 +11801,11 @@ def zeroArrayOkTrace : List (Event MirEffect) :=
 theorem zeroArrayOk_anneal_ret :
     ReachesRet (mirCallTree zeroArrayI8 [initArrI8_0, .scalar ⟨0, 8⟩])
       zeroArrayOkTrace (.normal (.scalar ⟨0, 1⟩, zeroArrayOkS0.memory)) :=
-  runA_sound zeroArrayI8 12 _ _ _ rfl
+  runA_sound zeroArrayI8 12 _ _ _ (by kernel_rfl)
 
 theorem zeroArrayOk_noUB :
     MirNoUBTree (mirCallTree zeroArrayI8 [initArrI8_0, .scalar ⟨0, 8⟩]) :=
-  runA_noUB zeroArrayI8 12 _ _ _ rfl
+  runA_isSome_noUB zeroArrayI8 12 _ (by kernel_rfl)
 
 theorem zeroArrayOk_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n zeroArrayOkMInit = .ok m' ∧
@@ -11806,7 +11813,7 @@ theorem zeroArrayOk_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8_3 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret zeroArrayI8_inFragment zeroArrayI8_translate ctxI8_3
-      (ctxI8_ok_zeroArray rfl) [initArrI8_0, .scalar ⟨0, 8⟩] (by decide)
+      (ctxI8_ok_zeroArray rfl) [initArrI8_0, .scalar ⟨0, 8⟩] (by decide +kernel)
       zeroArrayOkMInit rfl rfl rfl zeroArrayOk_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [zeroArrayI8] at hd; subst hd
@@ -11834,13 +11841,13 @@ theorem zeroArrayIdxUb_anneal_ub :
     ∃ tr u,
       Reaches (mirCallTree zeroArrayI8 [initArrI8_0, .scalar ⟨1, 8⟩]) tr u ∧
       FaultNow u :=
-  faultsA_sound zeroArrayI8 10 _ (by decide)
+  faultsA_sound zeroArrayI8 10 _ (by decide +kernel)
 
 theorem zeroArrayIdxUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n zeroArrayIdxUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := zeroArrayIdxUb_anneal_ub
   exact mirCall_ub zeroArrayI8_inFragment zeroArrayI8_translate ctxI8_3
-    (ctxI8_ok_zeroArray rfl) [initArrI8_0, .scalar ⟨1, 8⟩] (by decide)
+    (ctxI8_ok_zeroArray rfl) [initArrI8_0, .scalar ⟨1, 8⟩] (by decide +kernel)
     zeroArrayIdxUbMInit rfl rfl rfl hr hf
 
 theorem zeroArrayIdxUb_minirust_direct :
@@ -11887,7 +11894,7 @@ def arrayUninitIdxI8 : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem arrayUninitIdxI8_inFragment : inFragment arrayUninitIdxI8 = true := by decide
+theorem arrayUninitIdxI8_inFragment : inFragment arrayUninitIdxI8 = true := by decide +kernel
 
 def arrayUninitIdxI8Fn : Gen.Function where
   locals := ⟨[(localName 0, .Int i8), (localName 1, .Array (.Int i8) 2)]⟩
@@ -11915,13 +11922,13 @@ def arrayUninitIdxMInit : Mach :=
 
 theorem arrayUninitIdx_anneal_ub :
     ∃ tr u, Reaches (mirCallTree arrayUninitIdxI8 [initArrI8_2]) tr u ∧ FaultNow u :=
-  faultsA_sound arrayUninitIdxI8 6 _ (by decide)
+  faultsA_sound arrayUninitIdxI8 6 _ (by decide +kernel)
 
 theorem arrayUninitIdx_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n arrayUninitIdxMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := arrayUninitIdx_anneal_ub
   exact mirCall_ub arrayUninitIdxI8_inFragment arrayUninitIdxI8_translate ctxI8
-    (ctxI8_ok_arrayUninitIdx rfl) [initArrI8_2] (by decide)
+    (ctxI8_ok_arrayUninitIdx rfl) [initArrI8_2] (by decide +kernel)
     arrayUninitIdxMInit rfl rfl rfl hr hf
 
 /-- The UB is the failed `Load` of the uninitialized index operand, not the
@@ -11981,7 +11988,7 @@ def arrayU32Idx : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem arrayU32Idx_inFragment : inFragment arrayU32Idx = true := by decide
+theorem arrayU32Idx_inFragment : inFragment arrayU32Idx = true := by decide +kernel
 
 def arrayU32IdxFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Array (.Int u32) 3),
@@ -12017,11 +12024,11 @@ def arrayU32IdxOkMInit : Mach :=
 theorem arrayU32IdxOk_anneal_ret :
     ReachesRet (mirCallTree arrayU32Idx [initArrU32_3, .scalar ⟨2, 8⟩]) []
       (.normal (.scalar ⟨0x0403020b, 4⟩, arrayU32IdxOkS0.memory)) :=
-  runA_sound arrayU32Idx 8 _ _ _ rfl
+  runA_sound arrayU32Idx 8 _ _ _ (by kernel_rfl)
 
 theorem arrayU32IdxOk_noUB :
     MirNoUBTree (mirCallTree arrayU32Idx [initArrU32_3, .scalar ⟨2, 8⟩]) :=
-  runA_noUB arrayU32Idx 8 _ _ _ rfl
+  runA_isSome_noUB arrayU32Idx 8 _ (by kernel_rfl)
 
 theorem arrayU32IdxOk_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n arrayU32IdxOkMInit = .ok m' ∧
@@ -12029,7 +12036,7 @@ theorem arrayU32IdxOk_minirust_ret_from_start :
       m'.threads = [thread1 ctxU32_3 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret arrayU32Idx_inFragment arrayU32Idx_translate ctxU32_3
-      (ctxU32_ok_arrayU32Idx rfl) [initArrU32_3, .scalar ⟨2, 8⟩] (by decide)
+      (ctxU32_ok_arrayU32Idx rfl) [initArrU32_3, .scalar ⟨2, 8⟩] (by decide +kernel)
       arrayU32IdxOkMInit rfl rfl rfl arrayU32IdxOk_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [arrayU32Idx] at hd; subst hd
@@ -12067,13 +12074,13 @@ def arrayU32IdxOobMInit : Mach :=
 theorem arrayU32IdxOob_anneal_ub :
     ∃ tr u, Reaches (mirCallTree arrayU32Idx [initArrU32_3, .scalar ⟨3, 8⟩]) tr u ∧
       FaultNow u :=
-  faultsA_sound arrayU32Idx 6 _ (by decide)
+  faultsA_sound arrayU32Idx 6 _ (by decide +kernel)
 
 theorem arrayU32IdxOob_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n arrayU32IdxOobMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := arrayU32IdxOob_anneal_ub
   exact mirCall_ub arrayU32Idx_inFragment arrayU32Idx_translate ctxU32_3
-    (ctxU32_ok_arrayU32Idx rfl) [initArrU32_3, .scalar ⟨3, 8⟩] (by decide)
+    (ctxU32_ok_arrayU32Idx rfl) [initArrU32_3, .scalar ⟨3, 8⟩] (by decide +kernel)
     arrayU32IdxOobMInit rfl rfl rfl hr hf
 
 theorem arrayU32IdxOob_minirust_direct :
@@ -12100,7 +12107,7 @@ def arrayConstIdxOobI8 : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem arrayConstIdxOobI8_inFragment : inFragment arrayConstIdxOobI8 = true := by decide
+theorem arrayConstIdxOobI8_inFragment : inFragment arrayConstIdxOobI8 = true := by decide +kernel
 
 def arrayConstIdxOobI8Fn : Gen.Function where
   locals := ⟨[(localName 0, .Int i8), (localName 1, .Array (.Int i8) 2)]⟩
@@ -12127,13 +12134,13 @@ def arrayConstIdxOobMInit : Mach :=
 
 theorem arrayConstIdxOob_anneal_ub :
     ∃ tr u, Reaches (mirCallTree arrayConstIdxOobI8 [initArrI8_2]) tr u ∧ FaultNow u :=
-  faultsA_sound arrayConstIdxOobI8 6 _ (by decide)
+  faultsA_sound arrayConstIdxOobI8 6 _ (by decide +kernel)
 
 theorem arrayConstIdxOob_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n arrayConstIdxOobMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := arrayConstIdxOob_anneal_ub
   exact mirCall_ub arrayConstIdxOobI8_inFragment arrayConstIdxOobI8_translate ctxI8
-    (ctxI8_ok_arrayUninitIdx rfl) [initArrI8_2] (by decide)
+    (ctxI8_ok_arrayUninitIdx rfl) [initArrI8_2] (by decide +kernel)
     arrayConstIdxOobMInit rfl rfl rfl hr hf
 
 theorem arrayConstIdxOob_minirust_direct :
@@ -12252,7 +12259,7 @@ def arrayComposeI8 : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem arrayComposeI8_inFragment : inFragment arrayComposeI8 = true := by decide
+theorem arrayComposeI8_inFragment : inFragment arrayComposeI8 = true := by decide +kernel
 
 def arrayComposeI8Fn : Gen.Function where
   locals := ⟨[
@@ -12332,11 +12339,11 @@ def arrayComposeOkTrace : List (Event MirEffect) :=
 theorem arrayComposeOk_anneal_ret :
     ReachesRet (mirCallTree arrayComposeI8 [initArrCompose10_20, .scalar ⟨0, 8⟩])
       arrayComposeOkTrace (.normal (.scalar ⟨236, 1⟩, arrayComposeOkS0.memory)) :=
-  runA_sound arrayComposeI8 12 _ _ _ rfl
+  runA_sound arrayComposeI8 12 _ _ _ (by kernel_rfl)
 
 theorem arrayComposeOk_noUB :
     MirNoUBTree (mirCallTree arrayComposeI8 [initArrCompose10_20, .scalar ⟨0, 8⟩]) :=
-  runA_noUB arrayComposeI8 12 _ _ _ rfl
+  runA_isSome_noUB arrayComposeI8 12 _ (by kernel_rfl)
 
 theorem arrayComposeOk_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n arrayComposeOkMInit = .ok m' ∧
@@ -12344,7 +12351,7 @@ theorem arrayComposeOk_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8_3 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret arrayComposeI8_inFragment arrayComposeI8_translate ctxI8_3
-      (ctxI8_ok_arrayCompose rfl) [initArrCompose10_20, .scalar ⟨0, 8⟩] (by decide)
+      (ctxI8_ok_arrayCompose rfl) [initArrCompose10_20, .scalar ⟨0, 8⟩] (by decide +kernel)
       arrayComposeOkMInit rfl rfl rfl arrayComposeOk_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [arrayComposeI8] at hd; subst hd
@@ -12373,13 +12380,13 @@ theorem arrayComposeAggUb_anneal_ub :
     ∃ tr u,
       Reaches (mirCallTree arrayComposeI8 [initArrCompose10_20, .scalar ⟨1, 8⟩]) tr u ∧
       FaultNow u :=
-  faultsA_sound arrayComposeI8 8 _ (by decide)
+  faultsA_sound arrayComposeI8 8 _ (by decide +kernel)
 
 theorem arrayComposeAggUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n arrayComposeAggUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := arrayComposeAggUb_anneal_ub
   exact mirCall_ub arrayComposeI8_inFragment arrayComposeI8_translate ctxI8_3
-    (ctxI8_ok_arrayCompose rfl) [initArrCompose10_20, .scalar ⟨1, 8⟩] (by decide)
+    (ctxI8_ok_arrayCompose rfl) [initArrCompose10_20, .scalar ⟨1, 8⟩] (by decide +kernel)
     arrayComposeAggUbMInit rfl rfl rfl hr hf
 
 theorem arrayComposeAggUb_minirust_direct :
@@ -12401,13 +12408,13 @@ theorem arrayComposeRepeatUb_anneal_ub :
     ∃ tr u,
       Reaches (mirCallTree arrayComposeI8 [initArrCompose30_20, .scalar ⟨0, 8⟩]) tr u ∧
       FaultNow u :=
-  faultsA_sound arrayComposeI8 8 _ (by decide)
+  faultsA_sound arrayComposeI8 8 _ (by decide +kernel)
 
 theorem arrayComposeRepeatUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n arrayComposeRepeatUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := arrayComposeRepeatUb_anneal_ub
   exact mirCall_ub arrayComposeI8_inFragment arrayComposeI8_translate ctxI8_3
-    (ctxI8_ok_arrayCompose rfl) [initArrCompose30_20, .scalar ⟨0, 8⟩] (by decide)
+    (ctxI8_ok_arrayCompose rfl) [initArrCompose30_20, .scalar ⟨0, 8⟩] (by decide +kernel)
     arrayComposeRepeatUbMInit rfl rfl rfl hr hf
 
 theorem arrayComposeRepeatUb_minirust_direct :
@@ -12430,13 +12437,13 @@ theorem arrayComposeRhsUb_anneal_ub :
     ∃ tr u,
       Reaches (mirCallTree arrayComposeI8 [initArrCompose40_20, .scalar ⟨0, 8⟩]) tr u ∧
       FaultNow u :=
-  faultsA_sound arrayComposeI8 8 _ (by decide)
+  faultsA_sound arrayComposeI8 8 _ (by decide +kernel)
 
 theorem arrayComposeRhsUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n arrayComposeRhsUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := arrayComposeRhsUb_anneal_ub
   exact mirCall_ub arrayComposeI8_inFragment arrayComposeI8_translate ctxI8_3
-    (ctxI8_ok_arrayCompose rfl) [initArrCompose40_20, .scalar ⟨0, 8⟩] (by decide)
+    (ctxI8_ok_arrayCompose rfl) [initArrCompose40_20, .scalar ⟨0, 8⟩] (by decide +kernel)
     arrayComposeRhsUbMInit rfl rfl rfl hr hf
 
 theorem arrayComposeRhsUb_minirust_direct :
@@ -12458,13 +12465,13 @@ theorem arrayComposeBothUb_anneal_ub :
     ∃ tr u,
       Reaches (mirCallTree arrayComposeI8 [initArrCompose50_20, .scalar ⟨0, 8⟩]) tr u ∧
       FaultNow u :=
-  faultsA_sound arrayComposeI8 8 _ (by decide)
+  faultsA_sound arrayComposeI8 8 _ (by decide +kernel)
 
 theorem arrayComposeBothUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n arrayComposeBothUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := arrayComposeBothUb_anneal_ub
   exact mirCall_ub arrayComposeI8_inFragment arrayComposeI8_translate ctxI8_3
-    (ctxI8_ok_arrayCompose rfl) [initArrCompose50_20, .scalar ⟨0, 8⟩] (by decide)
+    (ctxI8_ok_arrayCompose rfl) [initArrCompose50_20, .scalar ⟨0, 8⟩] (by decide +kernel)
     arrayComposeBothUbMInit rfl rfl rfl hr hf
 
 theorem arrayComposeBothUb_minirust_direct :
@@ -12483,13 +12490,13 @@ theorem arrayComposeSwitchOobUb_anneal_ub :
     ∃ tr u,
       Reaches (mirCallTree arrayComposeI8 [initArrCompose10_20, .scalar ⟨2, 8⟩]) tr u ∧
       FaultNow u :=
-  faultsA_sound arrayComposeI8 6 _ (by decide)
+  faultsA_sound arrayComposeI8 6 _ (by decide +kernel)
 
 theorem arrayComposeSwitchOobUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n arrayComposeSwitchOobUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := arrayComposeSwitchOobUb_anneal_ub
   exact mirCall_ub arrayComposeI8_inFragment arrayComposeI8_translate ctxI8_3
-    (ctxI8_ok_arrayCompose rfl) [initArrCompose10_20, .scalar ⟨2, 8⟩] (by decide)
+    (ctxI8_ok_arrayCompose rfl) [initArrCompose10_20, .scalar ⟨2, 8⟩] (by decide +kernel)
     arrayComposeSwitchOobUbMInit rfl rfl rfl hr hf
 
 theorem arrayComposeSwitchOobUb_minirust_direct :
@@ -12553,7 +12560,7 @@ theorem ctxPadded3_ok {body : CapturedMir}
     | _ + 3, hd => simp at hd
   ret := by
     intro d hd; rw [h] at hd; rw [hlay]; simp at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 /-- MIR (`Runtime(PostCleanup)`) of
 ```rust
@@ -12597,7 +12604,7 @@ def paddedStructOps : CapturedMir where
   layouts := paddedLayouts
   allocations := []
 
-theorem paddedStructOps_inFragment : inFragment paddedStructOps = true := by decide
+theorem paddedStructOps_inFragment : inFragment paddedStructOps = true := by decide +kernel
 
 def paddedStructOpsFn : Gen.Function where
   locals := ⟨[
@@ -12648,11 +12655,11 @@ def paddedStructOkMInit : Mach :=
 theorem paddedStructOk_anneal_ret :
     ReachesRet (mirCallTree paddedStructOps paddedArgs) []
       (.normal (.scalar ⟨0x04030218, 4⟩, paddedStructOkS0.memory)) :=
-  runA_sound paddedStructOps 10 _ _ _ rfl
+  runA_sound paddedStructOps 10 _ _ _ (by kernel_rfl)
 
 theorem paddedStructOk_noUB :
     MirNoUBTree (mirCallTree paddedStructOps paddedArgs) :=
-  runA_noUB paddedStructOps 10 _ _ _ rfl
+  runA_isSome_noUB paddedStructOps 10 _ (by kernel_rfl)
 
 theorem paddedStructOk_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n paddedStructOkMInit = .ok m' ∧
@@ -12660,7 +12667,7 @@ theorem paddedStructOk_minirust_ret_from_start :
       m'.threads = [thread1 ctxPadded3 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret paddedStructOps_inFragment paddedStructOps_translate ctxPadded3
-      (ctxPadded3_ok rfl rfl) paddedArgs (by decide)
+      (ctxPadded3_ok rfl rfl) paddedArgs (by decide +kernel)
       paddedStructOkMInit rfl rfl rfl paddedStructOk_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [paddedStructOps] at hd; subst hd
@@ -12721,7 +12728,7 @@ theorem paddedStructOk_minirust_noUB {n : Nat} {e : Stop}
       ReturnRel paddedStructOps ctxPadded3 s' v mRet ∧
       ReachesRet (mirCallTree paddedStructOps paddedArgs) tr (.normal (v, mem)) :=
   mirCall_noUB paddedStructOps_inFragment paddedStructOps_translate ctxPadded3
-    (ctxPadded3_ok rfl rfl) paddedArgs (by decide) paddedStructOkMInit rfl rfl rfl
+    (ctxPadded3_ok rfl rfl) paddedArgs (by decide +kernel) paddedStructOkMInit rfl rfl rfl
     paddedStructOk_noUB herr
 
 theorem paddedStructOk_minirust_progress (n : Nat) :
@@ -12733,7 +12740,7 @@ theorem paddedStructOk_minirust_progress (n : Nat) :
       ReachesRet (mirCallTree paddedStructOps paddedArgs) tr (.normal (v, mem))) :=
   by simpa only [show initLen paddedStructOps = 1 from rfl, Nat.add_comm 1 n] using
     mirCall_progress paddedStructOps_inFragment paddedStructOps_translate ctxPadded3
-      (ctxPadded3_ok rfl rfl) paddedArgs (by decide) paddedStructOkMInit rfl rfl rfl
+      (ctxPadded3_ok rfl rfl) paddedArgs (by decide +kernel) paddedStructOkMInit rfl rfl rfl
       paddedStructOk_noUB n
 
 /-! ## Nested padded tuples `((u8, u32), u16, ())`, zero-sized `()`, nested `Field` projections (`_4.0.1`), and tuple UB paths -/
@@ -12800,7 +12807,7 @@ theorem ctxNested5_ok {body : CapturedMir}
     | _ + 5, hd => simp at hd
   ret := by
     intro d hd; rw [h] at hd; rw [hlay]; simp at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 def fnAbiNested : FnAbi :=
   { args := [{ layout := u32Layout, mode := .direct },
@@ -12881,7 +12888,7 @@ def nestedTupleOps : CapturedMir where
   layouts := nestedLayouts
   allocations := []
 
-theorem nestedTupleOps_inFragment : inFragment nestedTupleOps = true := by decide
+theorem nestedTupleOps_inFragment : inFragment nestedTupleOps = true := by decide +kernel
 
 def nestedTupleOpsFn : Gen.Function where
   locals := ⟨[
@@ -12964,11 +12971,11 @@ def nestedTupleOkTrace : List (Event MirEffect) :=
 theorem nestedTupleOk_anneal_ret :
     ReachesRet (mirCallTree nestedTupleOps (nestedArgs 0)) nestedTupleOkTrace
       (.normal (.scalar ⟨51, 4⟩, nestedTupleOkS0.memory)) :=
-  runA_sound nestedTupleOps 20 _ _ _ rfl
+  runA_sound nestedTupleOps 20 _ _ _ (by kernel_rfl)
 
 theorem nestedTupleOk_noUB :
     MirNoUBTree (mirCallTree nestedTupleOps (nestedArgs 0)) :=
-  runA_noUB nestedTupleOps 20 _ _ _ rfl
+  runA_isSome_noUB nestedTupleOps 20 _ (by kernel_rfl)
 
 theorem nestedTupleOk_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n nestedTupleOkMInit = .ok m' ∧
@@ -12976,7 +12983,7 @@ theorem nestedTupleOk_minirust_ret_from_start :
       m'.threads = [thread1 ctxNested5 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
-      (ctxNested5_ok rfl rfl) (nestedArgs 0) (by decide)
+      (ctxNested5_ok rfl rfl) (nestedArgs 0) (by decide +kernel)
       nestedTupleOkMInit rfl rfl rfl nestedTupleOk_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [nestedTupleOps] at hd; subst hd
@@ -13045,7 +13052,7 @@ theorem nestedTupleOk_minirust_noUB {n : Nat} {e : Stop}
       ReturnRel nestedTupleOps ctxNested5 s' v mRet ∧
       ReachesRet (mirCallTree nestedTupleOps (nestedArgs 0)) tr (.normal (v, mem)) :=
   mirCall_noUB nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
-    (ctxNested5_ok rfl rfl) (nestedArgs 0) (by decide) nestedTupleOkMInit rfl rfl rfl
+    (ctxNested5_ok rfl rfl) (nestedArgs 0) (by decide +kernel) nestedTupleOkMInit rfl rfl rfl
     nestedTupleOk_noUB herr
 
 theorem nestedTupleOk_minirust_progress (n : Nat) :
@@ -13057,7 +13064,7 @@ theorem nestedTupleOk_minirust_progress (n : Nat) :
       ReachesRet (mirCallTree nestedTupleOps (nestedArgs 0)) tr (.normal (v, mem))) :=
   by simpa only [show initLen nestedTupleOps = 1 from rfl, Nat.add_comm 1 n] using
     mirCall_progress nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
-      (ctxNested5_ok rfl rfl) (nestedArgs 0) (by decide) nestedTupleOkMInit rfl rfl rfl
+      (ctxNested5_ok rfl rfl) (nestedArgs 0) (by decide +kernel) nestedTupleOkMInit rfl rfl rfl
       nestedTupleOk_noUB n
 
 /-- `_1 = 1u32`: branches to `bb2` and faults when `Aggregate(Tuple)` evaluates
@@ -13069,13 +13076,13 @@ def nestedTupleAggUbMInit : Mach :=
 
 theorem nestedTupleAggUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTree nestedTupleOps (nestedArgs 1)) tr u ∧ FaultNow u :=
-  faultsA_sound nestedTupleOps 8 _ (by decide)
+  faultsA_sound nestedTupleOps 8 _ (by decide +kernel)
 
 theorem nestedTupleAggUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n nestedTupleAggUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := nestedTupleAggUb_anneal_ub
   exact mirCall_ub nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
-    (ctxNested5_ok rfl rfl) (nestedArgs 1) (by decide)
+    (ctxNested5_ok rfl rfl) (nestedArgs 1) (by decide +kernel)
     nestedTupleAggUbMInit rfl rfl rfl hr hf
 
 theorem nestedTupleAggUb_minirust_direct :
@@ -13089,7 +13096,7 @@ theorem nestedTupleAggUb_converse_error :
       ReturnRel nestedTupleOps ctxNested5 s' v mRet ∧
       ReachesRet (mirCallTree nestedTupleOps (nestedArgs 1)) tr (.normal (v, mem))) :=
   mirCall_steps_error nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
-    (ctxNested5_ok rfl rfl) (nestedArgs 1) (by decide)
+    (ctxNested5_ok rfl rfl) (nestedArgs 1) (by decide +kernel)
     nestedTupleAggUbMInit rfl rfl rfl nestedTupleAggUb_minirust_direct
 
 /-- `_1 = 2u32`: branches to `bb3` and faults on division by zero in the RHS of
@@ -13101,13 +13108,13 @@ def nestedTupleFieldRhsUbMInit : Mach :=
 
 theorem nestedTupleFieldRhsUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTree nestedTupleOps (nestedArgs 2)) tr u ∧ FaultNow u :=
-  faultsA_sound nestedTupleOps 8 _ (by decide)
+  faultsA_sound nestedTupleOps 8 _ (by decide +kernel)
 
 theorem nestedTupleFieldRhsUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n nestedTupleFieldRhsUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := nestedTupleFieldRhsUb_anneal_ub
   exact mirCall_ub nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
-    (ctxNested5_ok rfl rfl) (nestedArgs 2) (by decide)
+    (ctxNested5_ok rfl rfl) (nestedArgs 2) (by decide +kernel)
     nestedTupleFieldRhsUbMInit rfl rfl rfl hr hf
 
 theorem nestedTupleFieldRhsUb_minirust_direct :
@@ -13120,7 +13127,7 @@ theorem nestedTupleFieldRhsUb_converse_error :
       ReturnRel nestedTupleOps ctxNested5 s' v mRet ∧
       ReachesRet (mirCallTree nestedTupleOps (nestedArgs 2)) tr (.normal (v, mem))) :=
   mirCall_steps_error nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
-    (ctxNested5_ok rfl rfl) (nestedArgs 2) (by decide)
+    (ctxNested5_ok rfl rfl) (nestedArgs 2) (by decide +kernel)
     nestedTupleFieldRhsUbMInit rfl rfl rfl nestedTupleFieldRhsUb_minirust_direct
 
 /-- `_1 = 3u32`: branches to `bb4` and faults when `_4.0 = Aggregate(Tuple, [copy _4.0.0, copy _0])`
@@ -13132,13 +13139,13 @@ def nestedTupleCopyUninitUbMInit : Mach :=
 
 theorem nestedTupleCopyUninitUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTree nestedTupleOps (nestedArgs 3)) tr u ∧ FaultNow u :=
-  faultsA_sound nestedTupleOps 8 _ (by decide)
+  faultsA_sound nestedTupleOps 8 _ (by decide +kernel)
 
 theorem nestedTupleCopyUninitUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n nestedTupleCopyUninitUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := nestedTupleCopyUninitUb_anneal_ub
   exact mirCall_ub nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
-    (ctxNested5_ok rfl rfl) (nestedArgs 3) (by decide)
+    (ctxNested5_ok rfl rfl) (nestedArgs 3) (by decide +kernel)
     nestedTupleCopyUninitUbMInit rfl rfl rfl hr hf
 
 theorem nestedTupleCopyUninitUb_minirust_direct :
@@ -13152,7 +13159,7 @@ theorem nestedTupleCopyUninitUb_converse_error :
       ReturnRel nestedTupleOps ctxNested5 s' v mRet ∧
       ReachesRet (mirCallTree nestedTupleOps (nestedArgs 3)) tr (.normal (v, mem))) :=
   mirCall_steps_error nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
-    (ctxNested5_ok rfl rfl) (nestedArgs 3) (by decide)
+    (ctxNested5_ok rfl rfl) (nestedArgs 3) (by decide +kernel)
     nestedTupleCopyUninitUbMInit rfl rfl rfl nestedTupleCopyUninitUb_minirust_direct
 
 def unsizedSliceTupleTy : Gen.Type :=
@@ -13277,7 +13284,7 @@ def cmpDiscrSwitch : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem cmpDiscrSwitch_inFragment : inFragment cmpDiscrSwitch = true := by decide
+theorem cmpDiscrSwitch_inFragment : inFragment cmpDiscrSwitch = true := by decide +kernel
 
 /-- The `Discriminant` statement is a fragment statement precisely through the
 `Rvalue::Discriminant` case of `rvalueOk` (an `i8` destination and an
@@ -13290,8 +13297,7 @@ theorem cmpDiscrSwitch_discriminant_statementOk :
       rvalueOk cmpDiscrSwitch.layouts cmpDiscrSwitch.localDecls u8
         (.discriminant (local_ 4)) = false ∧
       rvalueOk cmpDiscrSwitch.layouts cmpDiscrSwitch.localDecls IntType.I8
-        (.discriminant (local_ 5)) = false := by
-  decide
+        (.discriminant (local_ 5)) = false := by decide +kernel
 
 /-- **`Rvalue::Discriminant` is admitted only on unprojected `Ordering` locals
 (`rvalueOk_discriminant_nonOrdering`, `rvalueOk_discriminant_proj`)**: MiniRust's
@@ -13357,7 +13363,7 @@ theorem ctxI8_ok_cmpDiscrSwitch : CtxOk cmpDiscrSwitch ctxI8_4 where
     | _ + 4, hi, _ => simp [cmpDiscrSwitch] at hi
   ret := by
     intro d hd; simp [cmpDiscrSwitch] at hd; subst hd
-    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 /-- Input `(x, y) = (-1, 1)`: `(-1).cmp(&1)` is `Less`, whose discriminant is
 the `i8` `-1` (byte `255`), so the `SwitchInt` (which emits the event `255`,
@@ -13371,10 +13377,10 @@ def cmpDiscrLessMInit : Mach :=
 theorem cmpDiscrLess_anneal_ret :
     ReachesRet (mirCallTree cmpDiscrSwitch cmpDiscrLessArgs) [⟨.inr (.inl (.emit (.event 255))), PUnit.unit⟩]
       (.normal (.scalar ⟨246, 1⟩, cmpDiscrLessS0.memory)) :=
-  runA_sound cmpDiscrSwitch 20 _ _ _ rfl
+  runA_sound cmpDiscrSwitch 20 _ _ _ (by kernel_rfl)
 
 theorem cmpDiscrLess_noUB : MirNoUBTree (mirCallTree cmpDiscrSwitch cmpDiscrLessArgs) :=
-  runA_noUB cmpDiscrSwitch 20 _ _ _ rfl
+  runA_isSome_noUB cmpDiscrSwitch 20 _ (by kernel_rfl)
 
 /-- End to end, through the correspondence theorem (`mirCall_ret`): MiniRust
 returns the byte `246` as well. -/
@@ -13384,7 +13390,7 @@ theorem cmpDiscrLess_minirust_ret_from_start :
       m'.threads = [thread1 ctxI8_4 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret cmpDiscrSwitch_inFragment cmpDiscrSwitch_translate ctxI8_4 ctxI8_ok_cmpDiscrSwitch
-      cmpDiscrLessArgs (by decide) cmpDiscrLessMInit rfl rfl rfl cmpDiscrLess_anneal_ret
+      cmpDiscrLessArgs (by decide +kernel) cmpDiscrLessMInit rfl rfl rfl cmpDiscrLess_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [cmpDiscrSwitch] at hd; subst hd
   simp [retPtr, ctxI8_4] at hp
@@ -13409,7 +13415,7 @@ def cmpDiscrEqualS0 : MachineState := initMachineState cmpDiscrSwitch cmpDiscrEq
 theorem cmpDiscrEqual_anneal_ret :
     ReachesRet (mirCallTree cmpDiscrSwitch cmpDiscrEqualArgs) [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
       (.normal (.scalar ⟨0, 1⟩, cmpDiscrEqualS0.memory)) :=
-  runA_sound cmpDiscrSwitch 20 _ _ _ rfl
+  runA_sound cmpDiscrSwitch 20 _ _ _ (by kernel_rfl)
 
 /-- Input `(2, 1)`: `Greater`, discriminant `1`, the `otherwise` block `bb3`
 returns the discriminant itself. -/
@@ -13419,7 +13425,7 @@ def cmpDiscrGreaterS0 : MachineState := initMachineState cmpDiscrSwitch cmpDiscr
 theorem cmpDiscrGreater_anneal_ret :
     ReachesRet (mirCallTree cmpDiscrSwitch cmpDiscrGreaterArgs) [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
       (.normal (.scalar ⟨1, 1⟩, cmpDiscrGreaterS0.memory)) :=
-  runA_sound cmpDiscrSwitch 20 _ _ _ rfl
+  runA_sound cmpDiscrSwitch 20 _ _ _ (by kernel_rfl)
 
 def cmpDiscrGreaterMInit : Mach :=
   machineWithCtx ctxI8_4 cmpDiscrSwitch cmpDiscrSwitchFn cmpDiscrGreaterS0.frame.locals
@@ -13506,18 +13512,27 @@ theorem evalStmt_retag_scalar_noop (s : MachineState) (decls : List LocalDecl)
   · rename_i heq; rw [hTy] at heq; nomatch heq
   · rfl
 
-/-- Anneal's `Deinit` of a projected place whose root is initialized and whose
-projected value is readable keeps every slot (it steps to the next statement
-with the same `locals`), whereas MiniRust's `Statement::Deinit` overwrites the
-projected bytes with `Uninit` (`paddedDeinitRead_minirust_ub`). -/
-theorem evalStmt_deinit_proj_keeps (s : MachineState) (decls : List LocalDecl)
+/-- Anneal's `Deinit` of a projected place whose root is initialized evaluates
+`deinitProjectedForLocal` (overwriting the projected sub-place with
+`Value.uninit`, or faulting on union/deref/invalid paths) and updates local `i`,
+matching MiniRust's `Statement::Deinit` (`paddedDeinitRead_anneal_ub`,
+`paddedDeinitRead_minirust_ub`). -/
+theorem evalStmt_deinit_proj_deinits (s : MachineState) (decls : List LocalDecl)
     (layouts : LayoutTable) (i : Nat) (pe : ProjectionElem) (rest : List ProjectionElem)
-    (span : String) (rootVal v : Value)
+    (span : String) (rootVal rootVal' : Value) (newLocals : List LocalSlot)
     (hs : s.frame.locals[i]? = some (.init rootVal))
-    (hr : readProjectedValue s.frame.locals rootVal (pe :: rest) = .ok v) :
+    (hd : deinitProjectedForLocal s.frame.locals decls layouts i rootVal (pe :: rest) = .ok rootVal')
+    (hset : Trusted.Sequence.set? s.frame.locals i (.init rootVal') = some newLocals)
+    (hbor : s.memory.borrows = [] := by rfl)
+    (hprot : s.memory.activeProtectors = [] := by rfl) :
     evalStmt s ⟨.deinit ⟨i, pe :: rest⟩, span⟩ decls layouts =
-      MirStepNode.step (advanceStmt s s.frame.locals) := by
-  simp [evalStmt, Trusted.Sequence.get?, hs, hr]
+      MirStepNode.step (advanceStmt s newLocals) := by
+  cases pe with
+  | deref => simp [deinitProjectedForLocal] at hd
+  | _ =>
+    simp [evalStmt, Trusted.Sequence.get?, hs, hd, hset, hbor, hprot,
+      MirStepNode.step, advanceStmt]
+    cases hm : s.memory; simp_all
 
 /-- The ABI of a function with one `Padded(u8, u32, u16)` argument returning
 `u32`. -/
@@ -13573,8 +13588,7 @@ theorem paddedDeinitRead_not_inFragment :
     inFragment paddedDeinitRead = false ∧
       statementOk paddedDeinitRead.localDecls (mkStmt (.deinit (placeField 1 [(1, u32Ty)])))
         paddedDeinitRead.layouts = false ∧
-      inFragment paddedReadOnly = true := by
-  decide
+      inFragment paddedReadOnly = true := by decide +kernel
 
 /-- `minimize`'s translation, which `translateFn` still produces: the
 projected `Deinit` becomes MiniRust's `Statement::Deinit` of the field place. -/
@@ -13601,12 +13615,11 @@ def paddedDeinitReadMInit : Mach :=
   machineWithCtx ctxPadded2 paddedDeinitRead paddedDeinitReadFn paddedDeinitReadS0.frame.locals
     paddedDeinitReadFn.start
 
-/-- Anneal's projected `Deinit` keeps `_1` initialized: the function returns
-the old field `99` (computed by the kernel). -/
-theorem paddedDeinitRead_anneal_ret :
-    ReachesRet (mirCallTree paddedDeinitRead paddedDeinitReadArgs) []
-      (.normal (.scalar ⟨99, 4⟩, paddedDeinitReadS0.memory)) :=
-  runA_sound paddedDeinitRead 10 _ _ _ rfl
+/-- Anneal's projected `Deinit(_1.1)` marks `_1.1` as `Value.uninit`, so the
+subsequent load `copy _1.1` faults with UB (computed by the kernel). -/
+theorem paddedDeinitRead_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree paddedDeinitRead paddedDeinitReadArgs) tr u ∧ FaultNow u :=
+  faultsA_sound paddedDeinitRead 10 paddedDeinitReadS0 (by kernel_rfl)
 
 /-- MiniRust's `Deinit(_1.1)` overwrites exactly bytes `4..8` of `_1` with
 `Uninit` (keeping field `0`, field `2`, and the padding), and the following
@@ -13645,8 +13658,7 @@ def paddedRetagRead : CapturedMir where
 theorem paddedRetagRead_not_inFragment :
     inFragment paddedRetagRead = false ∧
       statementOk paddedRetagRead.localDecls (mkStmt (.retag .default (placeField 1 [(1, u32Ty)])))
-        paddedRetagRead.layouts = false := by
-  decide
+        paddedRetagRead.layouts = false := by decide +kernel
 
 def paddedRetagReadFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, paddedMiniRustTy)]⟩
@@ -13685,7 +13697,7 @@ the function returns the field `99` (computed by the kernel). -/
 theorem paddedRetagRead_anneal_noop :
     ReachesRet (mirCallTree paddedRetagRead paddedDeinitReadArgs) []
       (.normal (.scalar ⟨99, 4⟩, paddedRetagReadS0.memory)) :=
-  runA_sound paddedRetagRead 10 _ _ _ rfl
+  runA_sound paddedRetagRead 10 _ _ _ (by kernel_rfl)
 
 /-- MiniRust's `retag_val` is the identity on `Value::Int`
 ("(Value::Int(..) | Value::Bool(..) | Value::Union(..), _) => val"), so
@@ -13762,7 +13774,7 @@ def paddedDeinitSiblingReinit : CapturedMir where
   allocations := []
 
 theorem paddedDeinitSiblingReinit_not_inFragment :
-    inFragment paddedDeinitSiblingReinit = false := by decide
+    inFragment paddedDeinitSiblingReinit = false := by decide +kernel
 
 def paddedDeinitSiblingReinitFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, paddedMiniRustTy), (localName 2, .Int u32)]⟩
@@ -13799,12 +13811,12 @@ def paddedDeinitSiblingReinitMInit : Mach :=
 theorem paddedDeinitSiblingReinit_anneal_ret :
     ReachesRet (mirCallTree paddedDeinitSiblingReinit paddedDeinitReadArgs) []
       (.normal (.scalar ⟨42, 4⟩, paddedDeinitSiblingReinitS0.memory)) :=
-  runA_sound paddedDeinitSiblingReinit 12 _ _ _ rfl
+  runA_sound paddedDeinitSiblingReinit 12 _ _ _ (by kernel_rfl)
 
 /-- Anneal evaluation of `paddedDeinitSiblingReinit` has no UB. -/
 theorem paddedDeinitSiblingReinit_noUB :
     MirNoUBTree (mirCallTree paddedDeinitSiblingReinit paddedDeinitReadArgs) :=
-  runA_noUB paddedDeinitSiblingReinit 12 _ _ _ rfl
+  runA_isSome_noUB paddedDeinitSiblingReinit 12 _ (by kernel_rfl)
 
 /-- In MiniRust:
 1. After `Deinit(_1.1)` (`steps 3`), bytes `4..8` of `_1` are `Uninit` while
@@ -13875,10 +13887,10 @@ def deinitSiblingReinit : CapturedMir where
   allocations := []
 
 /-- The projected-`Deinit` fragment admits the body. -/
-theorem deinitSiblingReinit_inFragmentD : inFragmentD deinitSiblingReinit = true := by decide
+theorem deinitSiblingReinit_inFragmentD : inFragmentD deinitSiblingReinit = true := by decide +kernel
 
 /-- The old fragment rejects the body (`statementOk_deinit_proj`). -/
-theorem deinitSiblingReinit_not_inFragment : inFragment deinitSiblingReinit = false := by decide
+theorem deinitSiblingReinit_not_inFragment : inFragment deinitSiblingReinit = false := by decide +kernel
 
 /-- `minimize`'s translation: the projected `Deinit` becomes MiniRust's `Statement::Deinit`
 of the field place. -/
@@ -13919,15 +13931,14 @@ theorem ctxPadded2_ok_u8 {body : CapturedMir}
     | _ + 2, hi, _ => omega
   ret := by
     intro d hd; rw [h] at hd; rw [hlay]; simp at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 theorem deinitSiblingReinit_ctxOk : CtxOk deinitSiblingReinit ctxPadded2 :=
   ctxPadded2_ok_u8 rfl rfl rfl
 
 def deinitSiblingReinitArgs : List Value := [initPaddedStruct]
 
-theorem deinitSiblingReinit_argsOk : argsOk deinitSiblingReinit deinitSiblingReinitArgs = true := by
-  decide
+theorem deinitSiblingReinit_argsOk : argsOk deinitSiblingReinit deinitSiblingReinitArgs = true := by decide +kernel
 
 def deinitSiblingReinitS0 : MachineState :=
   initMachineState deinitSiblingReinit deinitSiblingReinitArgs
@@ -13958,12 +13969,12 @@ theorem deinitSiblingReinitMInit_allocs :
 theorem deinitSiblingReinit_anneal_ret :
     ReachesRet (mirCallTree deinitSiblingReinit deinitSiblingReinitArgs) []
       (.normal (.scalar ⟨42, 4⟩, deinitSiblingReinitS0.memory)) :=
-  runA_sound deinitSiblingReinit 12 _ _ _ rfl
+  runA_sound deinitSiblingReinit 12 _ _ _ (by kernel_rfl)
 
 /-- Anneal's execution has no UB. -/
 theorem deinitSiblingReinit_anneal_noUB :
     MirNoUBTree (mirCallTree deinitSiblingReinit deinitSiblingReinitArgs) :=
-  runA_noUB deinitSiblingReinit 12 _ _ _ rfl
+  runA_isSome_noUB deinitSiblingReinit 12 _ (by kernel_rfl)
 
 /-- The erased body (projected `Deinit` replaced by `PlaceMention`) is in the old fragment
 and Anneal returns the same `42` on it. -/
@@ -13971,7 +13982,7 @@ theorem deinitSiblingReinit_erased :
     inFragment (eraseDeinit deinitSiblingReinit) = true ∧
       ReachesRet (mirCallTree (eraseDeinit deinitSiblingReinit) deinitSiblingReinitArgs) []
         (.normal (.scalar ⟨42, 4⟩, deinitSiblingReinitS0.memory)) :=
-  ⟨by decide, runA_sound (eraseDeinit deinitSiblingReinit) 12 _ _ _ rfl⟩
+  ⟨by decide +kernel, runA_sound (eraseDeinit deinitSiblingReinit) 12 _ _ _ (by kernel_rfl)⟩
 
 /-- Running MiniRust directly from `f.start` (computed by the kernel):
 1. after `Deinit(_1.1)` (`steps 3`: init `Goto`, `StorageLive(_2)`, `Deinit`), bytes `4..8`
@@ -14029,8 +14040,7 @@ theorem deinitSiblingReinit_minirust_returnRel :
 where Anneal returns `99` and MiniRust is UB) is rejected by the window check alone. -/
 theorem paddedDeinitRead_not_inFragmentD :
     inFragment (eraseDeinit paddedDeinitRead) = true ∧
-      deinitWindowOk paddedDeinitRead = false ∧ inFragmentD paddedDeinitRead = false := by
-  decide
+      deinitWindowOk paddedDeinitRead = false ∧ inFragmentD paddedDeinitRead = false := by decide +kernel
 
 /-- `ctxPadded2` (callee `_0: u32` at `128`, `_1: Padded` at `256`) is well formed for a 2-local
 body with `[u32Decl, paddedStructDecl]`. -/
@@ -14046,7 +14056,7 @@ theorem ctxPadded2_ok_u32 {body : CapturedMir}
     | _ + 2, hi, _ => omega
   ret := by
     intro d hd; rw [h] at hd; rw [hlay]; simp at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 /-- **`paddedRetagRead` is admitted by `inFragmentD`**: `eraseDeinit` lowers projected `Retag(_1.1)`
 to `PlaceMention(_1.1)`, `deinitWindowOk` checks `deinitTargetOk` on `_1.1` (`u32`, `4 > 0` bytes),
@@ -14055,18 +14065,16 @@ and Stage-1 Anneal's no-op (`evalStmt_retag_field`) matches MiniRust's `Validate
 (`paddedRetagRead_not_inFragment`). -/
 theorem paddedRetagRead_inFragmentD :
     inFragment (eraseDeinit paddedRetagRead) = true ∧
-      deinitWindowOk paddedRetagRead = true ∧ inFragmentD paddedRetagRead = true := by
-  decide
+      deinitWindowOk paddedRetagRead = true ∧ inFragmentD paddedRetagRead = true := by decide +kernel
 
 theorem paddedRetagRead_ctxOk : CtxOk paddedRetagRead ctxPadded2 :=
   ctxPadded2_ok_u32 rfl rfl rfl
 
-theorem paddedRetagRead_argsOk : argsOk paddedRetagRead paddedDeinitReadArgs = true := by
-  decide
+theorem paddedRetagRead_argsOk : argsOk paddedRetagRead paddedDeinitReadArgs = true := by decide +kernel
 
 theorem paddedRetagRead_anneal_noUB :
     MirNoUBTree (mirCallTree paddedRetagRead paddedDeinitReadArgs) :=
-  runA_noUB paddedRetagRead 10 _ _ _ rfl
+  runA_isSome_noUB paddedRetagRead 10 _ (by kernel_rfl)
 
 /-- **End-to-end correspondence through `mirCall_ret_D` for `paddedRetagRead`**: Anneal's return of
 `99` (`paddedRetagRead_anneal_noop`) yields a MiniRust execution from `f.start` that pops the callee
@@ -14144,8 +14152,7 @@ theorem paddedDeinitSiblingRetagReinit_inFragmentD :
     siblingRetagOk paddedDeinitSiblingRetagReinit 1 [.field 1 u32Ty] [.field 0 u8TyW] = true ∧
       inFragment (eraseDeinit paddedDeinitSiblingRetagReinit) = true ∧
       deinitWindowOk paddedDeinitSiblingRetagReinit = true ∧
-      inFragmentD paddedDeinitSiblingRetagReinit = true := by
-  decide
+      inFragmentD paddedDeinitSiblingRetagReinit = true := by decide +kernel
 
 def paddedDeinitSiblingRetagReinitS0 : MachineState :=
   initMachineState paddedDeinitSiblingRetagReinit paddedDeinitReadArgs
@@ -14157,7 +14164,7 @@ def paddedDeinitSiblingRetagReinitMInit : Mach :=
 theorem paddedDeinitSiblingRetagReinit_anneal_ret :
     ReachesRet (mirCallTree paddedDeinitSiblingRetagReinit paddedDeinitReadArgs) []
       (.normal (.scalar ⟨42, 4⟩, paddedDeinitSiblingRetagReinitS0.memory)) :=
-  runA_sound paddedDeinitSiblingRetagReinit 12 _ _ _ rfl
+  runA_sound paddedDeinitSiblingRetagReinit 12 _ _ _ (by kernel_rfl)
 
 /-- **End-to-end correspondence through `mirCall_ret_D` for disjoint sibling `Retag` inside an open
 `Deinit` hole (`paddedDeinitSiblingRetagReinit_minirust_ret_from_start`).** -/
@@ -14169,7 +14176,7 @@ theorem paddedDeinitSiblingRetagReinit_minirust_ret_from_start :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret_D paddedDeinitSiblingRetagReinit_inFragmentD.2.2.2
       paddedDeinitSiblingRetagReinit_translate ctxPadded2 (ctxPadded2_ok_u32 rfl rfl rfl)
-      paddedDeinitReadArgs (by decide) paddedDeinitSiblingRetagReinitMInit rfl rfl rfl
+      paddedDeinitReadArgs (by decide +kernel) paddedDeinitSiblingRetagReinitMInit rfl rfl rfl
       paddedDeinitSiblingRetagReinit_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [paddedDeinitSiblingRetagReinit] at hd; subst hd
@@ -14223,7 +14230,7 @@ theorem paddedDeinitRetagHole_not_inFragmentD :
       inFragment (eraseDeinit paddedDeinitRetagHole) = true ∧
       deinitWindowOk paddedDeinitRetagHole = false ∧
       inFragmentD paddedDeinitRetagHole = false :=
-  ⟨rfl, by decide, by decide, by decide, by decide⟩
+  ⟨rfl, by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel⟩
 
 def paddedDeinitRetagHoleS0 : MachineState :=
   initMachineState paddedDeinitRetagHole paddedDeinitReadArgs
@@ -14232,15 +14239,14 @@ def paddedDeinitRetagHoleMInit : Mach :=
   machineWithCtx ctxPadded2 paddedDeinitRetagHole paddedDeinitRetagHoleFn
     paddedDeinitRetagHoleS0.frame.locals paddedDeinitRetagHoleFn.start
 
-/-- **Overlapping `Retag(_1.1)` on an open `Deinit(_1.1)` hole diverges (`paddedDeinitRetagHole_diverges`)**:
-Stage-1 Anneal returns `42` (because `Deinit(_1.1)` keeps `_1` initialized and `Retag(_1.1)` is a
-no-op), whereas MiniRust's `Validate(_1.1)` at step `3` faults with UB loading the `Uninit` bytes
-`4..8`, justifying `siblingRetagOk`'s disjointness requirement. -/
-theorem paddedDeinitRetagHole_diverges :
-    ReachesRet (mirCallTree paddedDeinitRetagHole paddedDeinitReadArgs) []
-      (.normal (.scalar ⟨42, 4⟩, paddedDeinitRetagHoleS0.memory)) ∧
+/-- **Overlapping `Retag(_1.1)` on an open `Deinit(_1.1)` hole faults in both
+engines (`paddedDeinitRetagHole_both_ub`)**: Anneal's `Deinit(_1.1)` marks `_1.1`
+as `Value.uninit` so `Retag(_1.1)`'s operand read faults with UB, and MiniRust's
+`Validate(_1.1)` at step `3` faults with UB loading the `Uninit` bytes `4..8`. -/
+theorem paddedDeinitRetagHole_both_ub :
+    (∃ tr u, Reaches (mirCallTree paddedDeinitRetagHole paddedDeinitReadArgs) tr u ∧ FaultNow u) ∧
     ∃ msg, Interp.steps 3 paddedDeinitRetagHoleMInit = .error (.ub msg) :=
-  ⟨runA_sound paddedDeinitRetagHole 12 _ _ _ rfl, _, rfl⟩
+  ⟨faultsA_sound paddedDeinitRetagHole 12 paddedDeinitRetagHoleS0 (by kernel_rfl), _, rfl⟩
 
 /-- **The committed `paddedDeinitSiblingReinit` is admitted by `inFragmentD`** (its window
 check used to fail): its open-hole window is the sibling read through an integer cast
@@ -14251,8 +14257,7 @@ disjoint from the hole `4..8`) followed by the re-initialization `_1.1 = Add(cop
 theorem paddedDeinitSiblingReinit_inFragmentD :
     inFragment (eraseDeinit paddedDeinitSiblingReinit) = true ∧
       deinitWindowOk paddedDeinitSiblingReinit = true ∧
-      inFragmentD paddedDeinitSiblingReinit = true := by
-  decide
+      inFragmentD paddedDeinitSiblingReinit = true := by decide +kernel
 
 /-- The two window statements of `paddedDeinitSiblingReinit` pass exactly the new window rules,
 and the hole `(1, [.field 1 u32])` is open exactly before them. -/
@@ -14262,7 +14267,7 @@ theorem paddedDeinitSiblingReinit_window_rules :
       { ty := u32Ty, val := .scalar (.int ⟨35, 4⟩) } = true ∧
     (List.range 7).map (holeAt paddedDeinitSiblingReinit 0) =
       [none, none, some (1, [.field 1 u32Ty]), some (1, [.field 1 u32Ty]), none, none, none] :=
-  ⟨by decide, by decide, rfl⟩
+  ⟨by decide +kernel, by decide +kernel, rfl⟩
 
 /-- `ctxPadded3` (callee `_0: u32` at `128`, `_1: Padded` at `256`) is well formed for a body whose
 locals are `_0: u32`, the argument `_1: Padded`, and a `u32` temporary `_2` (temporaries get no
@@ -14279,14 +14284,13 @@ theorem ctxPadded3_ok_u32 {body : CapturedMir}
     | _ + 2, hi, _ => omega
   ret := by
     intro d hd; rw [h] at hd; rw [hlay]; simp at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 theorem paddedDeinitSiblingReinit_ctxOk : CtxOk paddedDeinitSiblingReinit ctxPadded3 :=
   ctxPadded3_ok_u32 rfl rfl rfl
 
 theorem paddedDeinitSiblingReinit_argsOk :
-    argsOk paddedDeinitSiblingReinit paddedDeinitReadArgs = true := by
-  decide
+    argsOk paddedDeinitSiblingReinit paddedDeinitReadArgs = true := by decide +kernel
 
 /-- **End to end through `mirCall_ret_D` for `paddedDeinitSiblingReinit` (`castSiblingReadOk` and
 `reinitBinOpOk`).** Anneal's return of `42` (`paddedDeinitSiblingReinit_anneal_ret`) gives, by the
@@ -14389,7 +14393,7 @@ theorem ctxPadded2_ok_u8_u32 {body : CapturedMir}
     | _ + 2, hi, _ => omega
   ret := by
     intro d hd; rw [h] at hd; rw [hlay]; simp at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 /-- MIR of a body exercising `reinitCopyOk` (`_1.1 = copy _3`) and live sibling-read consumption:
 ```rust
@@ -14431,11 +14435,9 @@ def deinitSiblingCopyReinit : CapturedMir where
   layouts := paddedLayouts
   allocations := []
 
-theorem deinitSiblingCopyReinit_inFragmentD : inFragmentD deinitSiblingCopyReinit = true := by
-  decide
+theorem deinitSiblingCopyReinit_inFragmentD : inFragmentD deinitSiblingCopyReinit = true := by decide +kernel
 
-theorem deinitSiblingCopyReinit_not_inFragment : inFragment deinitSiblingCopyReinit = false := by
-  decide
+theorem deinitSiblingCopyReinit_not_inFragment : inFragment deinitSiblingCopyReinit = false := by decide +kernel
 
 def deinitSiblingCopyReinitFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, paddedMiniRustTy),
@@ -14472,7 +14474,7 @@ theorem deinitSiblingCopyReinit_ctxOk : CtxOk deinitSiblingCopyReinit ctxPadded2
 def deinitSiblingCopyReinitArgs : List Value := [initPaddedStruct]
 
 theorem deinitSiblingCopyReinit_argsOk :
-    argsOk deinitSiblingCopyReinit deinitSiblingCopyReinitArgs = true := by decide
+    argsOk deinitSiblingCopyReinit deinitSiblingCopyReinitArgs = true := by decide +kernel
 
 def deinitSiblingCopyReinitS0 : MachineState :=
   initMachineState deinitSiblingCopyReinit deinitSiblingCopyReinitArgs
@@ -14484,11 +14486,11 @@ def deinitSiblingCopyReinitMInit : Mach :=
 theorem deinitSiblingCopyReinit_anneal_ret :
     ReachesRet (mirCallTree deinitSiblingCopyReinit deinitSiblingCopyReinitArgs) []
       (.normal (.scalar ⟨107, 4⟩, deinitSiblingCopyReinitS0.memory)) :=
-  runA_sound deinitSiblingCopyReinit 16 _ _ _ rfl
+  runA_sound deinitSiblingCopyReinit 16 _ _ _ (by kernel_rfl)
 
 theorem deinitSiblingCopyReinit_anneal_noUB :
     MirNoUBTree (mirCallTree deinitSiblingCopyReinit deinitSiblingCopyReinitArgs) :=
-  runA_noUB deinitSiblingCopyReinit 16 _ _ _ rfl
+  runA_isSome_noUB deinitSiblingCopyReinit 16 _ (by kernel_rfl)
 
 /-- **End-to-end return through `mirCall_ret_D` for `deinitSiblingCopyReinit` (`reinitCopyOk` and
 live sibling read).** Anneal's return of `107` (`100 + 7`) gives a MiniRust run from `f.start` that
@@ -14543,7 +14545,7 @@ def deinitSiblingReinitUb : CapturedMir where
   layouts := paddedLayouts
   allocations := []
 
-theorem deinitSiblingReinitUb_inFragmentD : inFragmentD deinitSiblingReinitUb = true := by decide
+theorem deinitSiblingReinitUb_inFragmentD : inFragmentD deinitSiblingReinitUb = true := by decide +kernel
 
 def deinitSiblingReinitUbFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, paddedMiniRustTy),
@@ -14581,7 +14583,7 @@ def deinitSiblingReinitUbMInit : Mach :=
 theorem deinitSiblingReinitUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTree deinitSiblingReinitUb deinitSiblingReinitArgs) tr u ∧
       FaultNow u :=
-  faultsA_sound deinitSiblingReinitUb 12 _ (by decide)
+  faultsA_sound deinitSiblingReinitUb 12 deinitSiblingReinitUbS0 (by kernel_rfl)
 
 /-- **End-to-end UB transfer through `mirCall_ub_D`.** Since `mirCallTree deinitSiblingReinitUb`
 faults with UB (`deinitSiblingReinitUb_anneal_ub`), MiniRust started at `f.start` raises UB after
@@ -14590,7 +14592,7 @@ theorem deinitSiblingReinitUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n deinitSiblingReinitUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := deinitSiblingReinitUb_anneal_ub
   exact mirCall_ub_D deinitSiblingReinitUb_inFragmentD deinitSiblingReinitUb_translate ctxPadded2
-    deinitSiblingReinitUb_ctxOk deinitSiblingReinitArgs (by decide)
+    deinitSiblingReinitUb_ctxOk deinitSiblingReinitArgs (by decide +kernel)
     deinitSiblingReinitUbMInit rfl rfl rfl hr hf
 
 /-- `ctxPadded2` is well formed for a body whose locals are `_0: u32`, `_1: Padded`, `_2: u8`,
@@ -14607,7 +14609,7 @@ theorem ctxPadded2_ok_u8_u32_u32 {body : CapturedMir}
     | _ + 2, hi, _ => omega
   ret := by
     intro d hd; rw [h] at hd; rw [hlay]; simp at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 /-- MIR of a 4-statement open-hole window exercising `siblingReadOk`, `localCopyWindowOk`, and
 `reinitCopyOk` together:
@@ -14655,11 +14657,9 @@ def deinitSiblingRelayReinit : CapturedMir where
   layouts := paddedLayouts
   allocations := []
 
-theorem deinitSiblingRelayReinit_inFragmentD : inFragmentD deinitSiblingRelayReinit = true := by
-  decide
+theorem deinitSiblingRelayReinit_inFragmentD : inFragmentD deinitSiblingRelayReinit = true := by decide +kernel
 
-theorem deinitSiblingRelayReinit_not_inFragment : inFragment deinitSiblingRelayReinit = false := by
-  decide
+theorem deinitSiblingRelayReinit_not_inFragment : inFragment deinitSiblingRelayReinit = false := by decide +kernel
 
 def deinitSiblingRelayReinitFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, paddedMiniRustTy),
@@ -14699,7 +14699,7 @@ theorem deinitSiblingRelayReinit_ctxOk : CtxOk deinitSiblingRelayReinit ctxPadde
 def deinitSiblingRelayReinitArgs : List Value := [initPaddedStruct]
 
 theorem deinitSiblingRelayReinit_argsOk :
-    argsOk deinitSiblingRelayReinit deinitSiblingRelayReinitArgs = true := by decide
+    argsOk deinitSiblingRelayReinit deinitSiblingRelayReinitArgs = true := by decide +kernel
 
 def deinitSiblingRelayReinitS0 : MachineState :=
   initMachineState deinitSiblingRelayReinit deinitSiblingRelayReinitArgs
@@ -14711,11 +14711,11 @@ def deinitSiblingRelayReinitMInit : Mach :=
 theorem deinitSiblingRelayReinit_anneal_ret :
     ReachesRet (mirCallTree deinitSiblingRelayReinit deinitSiblingRelayReinitArgs) []
       (.normal (.scalar ⟨107, 4⟩, deinitSiblingRelayReinitS0.memory)) :=
-  runA_sound deinitSiblingRelayReinit 19 _ _ _ rfl
+  runA_sound deinitSiblingRelayReinit 19 _ _ _ (by kernel_rfl)
 
 theorem deinitSiblingRelayReinit_anneal_noUB :
     MirNoUBTree (mirCallTree deinitSiblingRelayReinit deinitSiblingRelayReinitArgs) :=
-  runA_noUB deinitSiblingRelayReinit 19 _ _ _ rfl
+  runA_isSome_noUB deinitSiblingRelayReinit 19 _ (by kernel_rfl)
 
 /-- The hole `(1, [.field 1 u32])` stays open across the 3-statement window (`_2 = copy _1.0`,
 `_4 = copy _3`, `_1.1 = copy _4` at indices `5`, `6`, `7`) and closes at index `8`. -/
@@ -14796,8 +14796,7 @@ def paddedDeinitBinOpDivZero : CapturedMir where
   layouts := paddedLayouts
   allocations := []
 
-theorem paddedDeinitBinOpDivZero_inFragmentD : inFragmentD paddedDeinitBinOpDivZero = true := by
-  decide
+theorem paddedDeinitBinOpDivZero_inFragmentD : inFragmentD paddedDeinitBinOpDivZero = true := by decide +kernel
 
 def paddedDeinitBinOpDivZeroFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, paddedMiniRustTy), (localName 2, .Int u32)]⟩
@@ -14833,7 +14832,7 @@ def paddedDeinitBinOpDivZeroMInit : Mach :=
 theorem paddedDeinitBinOpDivZero_anneal_ub :
     ∃ tr u, Reaches (mirCallTree paddedDeinitBinOpDivZero paddedDeinitReadArgs) tr u ∧
       FaultNow u :=
-  faultsA_sound paddedDeinitBinOpDivZero 12 _ (by decide)
+  faultsA_sound paddedDeinitBinOpDivZero 12 paddedDeinitBinOpDivZeroS0 (by kernel_rfl)
 
 /-- **End-to-end UB transfer through `mirCall_ub_D` for a `BinOp` re-initialization of the hole.**
 Since Anneal faults (`paddedDeinitBinOpDivZero_anneal_ub`), MiniRust started at `f.start` raises UB
@@ -14842,7 +14841,7 @@ theorem paddedDeinitBinOpDivZero_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n paddedDeinitBinOpDivZeroMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := paddedDeinitBinOpDivZero_anneal_ub
   exact mirCall_ub_D paddedDeinitBinOpDivZero_inFragmentD paddedDeinitBinOpDivZero_translate
-    ctxPadded3 (ctxPadded3_ok_u32 rfl rfl rfl) paddedDeinitReadArgs (by decide)
+    ctxPadded3 (ctxPadded3_ok_u32 rfl rfl rfl) paddedDeinitReadArgs (by decide +kernel)
     paddedDeinitBinOpDivZeroMInit rfl rfl rfl hr hf
 
 /-- The direct MiniRust run agrees: the fifth step (init `Goto`, `StorageLive(_2)`, `Deinit`, the
@@ -14880,8 +14879,7 @@ def paddedDeinitHoleBinOp : CapturedMir where
 a bare local `copy _q` with `q ≠ t`) does not apply and the window check alone rejects the body. -/
 theorem paddedDeinitHoleBinOp_not_inFragmentD :
     inFragment (eraseDeinit paddedDeinitHoleBinOp) = true ∧
-      deinitWindowOk paddedDeinitHoleBinOp = false ∧ inFragmentD paddedDeinitHoleBinOp = false := by
-  decide
+      deinitWindowOk paddedDeinitHoleBinOp = false ∧ inFragmentD paddedDeinitHoleBinOp = false := by decide +kernel
 
 def paddedDeinitHoleBinOpFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, paddedMiniRustTy)]⟩
@@ -14910,14 +14908,14 @@ def paddedDeinitHoleBinOpMInit : Mach :=
   machineWithCtx ctxPadded2 paddedDeinitHoleBinOp paddedDeinitHoleBinOpFn
     paddedDeinitHoleBinOpS0.frame.locals paddedDeinitHoleBinOpFn.start
 
-/-- The divergence the window check prevents (computed by the kernel): Anneal's projected `Deinit`
-keeps `_1.1 = 99`, so Anneal returns `100`, whereas MiniRust's `BinOp` loads the `Uninit` hole and
-the third step (init `Goto`, `Deinit`, the re-initialization) is UB. -/
-theorem paddedDeinitHoleBinOp_diverges :
-    ReachesRet (mirCallTree paddedDeinitHoleBinOp paddedDeinitReadArgs) []
-        (.normal (.scalar ⟨100, 4⟩, paddedDeinitHoleBinOpS0.memory)) ∧
+/-- Both Anneal and MiniRust fault with UB when the `BinOp` re-initialization
+reads the open `Deinit(_1.1)` hole (`paddedDeinitHoleBinOp_both_ub`, computed by
+the kernel): Anneal's `copy _1.1` faults on `Value.uninit`, and MiniRust's
+`BinOp` loads the `Uninit` hole at step `3`. -/
+theorem paddedDeinitHoleBinOp_both_ub :
+    (∃ tr u, Reaches (mirCallTree paddedDeinitHoleBinOp paddedDeinitReadArgs) tr u ∧ FaultNow u) ∧
       ∃ msg, Interp.steps 3 paddedDeinitHoleBinOpMInit = .error (.ub msg) :=
-  ⟨runA_sound paddedDeinitHoleBinOp 10 _ _ _ rfl, _, rfl⟩
+  ⟨faultsA_sound paddedDeinitHoleBinOp 10 paddedDeinitHoleBinOpS0 (by kernel_rfl), _, rfl⟩
 
 /-- MIR of
 ```rust
@@ -14955,8 +14953,7 @@ theorem paddedDeinitHoleCastRead_not_inFragmentD :
       castSiblingReadOk paddedDeinitHoleCastRead 1 2 [.field 1 u32Ty] [.field 1 u32Ty] u32Ty =
         false ∧
       deinitWindowOk paddedDeinitHoleCastRead = false ∧
-      inFragmentD paddedDeinitHoleCastRead = false := by
-  decide
+      inFragmentD paddedDeinitHoleCastRead = false := by decide +kernel
 
 def paddedDeinitHoleCastReadFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, paddedMiniRustTy), (localName 2, .Int u32)]⟩
@@ -14987,14 +14984,14 @@ def paddedDeinitHoleCastReadMInit : Mach :=
   machineWithCtx ctxPadded3 paddedDeinitHoleCastRead paddedDeinitHoleCastReadFn
     paddedDeinitHoleCastReadS0.frame.locals paddedDeinitHoleCastReadFn.start
 
-/-- The divergence the disjointness check prevents (computed by the kernel): Anneal reads the stale
-`_1.1 = 99` through the cast and returns `99`, whereas MiniRust's cast loads the `Uninit` hole and
-the fourth step (init `Goto`, `StorageLive(_2)`, `Deinit`, the cast read) is UB. -/
-theorem paddedDeinitHoleCastRead_diverges :
-    ReachesRet (mirCallTree paddedDeinitHoleCastRead paddedDeinitReadArgs) []
-        (.normal (.scalar ⟨99, 4⟩, paddedDeinitHoleCastReadS0.memory)) ∧
+/-- Both Anneal and MiniRust fault with UB when an integer cast reads the open
+`Deinit(_1.1)` hole (`paddedDeinitHoleCastRead_both_ub`, computed by the kernel):
+Anneal's `copy _1.1` faults on `Value.uninit`, and MiniRust's cast loads the
+`Uninit` hole at step `4`. -/
+theorem paddedDeinitHoleCastRead_both_ub :
+    (∃ tr u, Reaches (mirCallTree paddedDeinitHoleCastRead paddedDeinitReadArgs) tr u ∧ FaultNow u) ∧
       ∃ msg, Interp.steps 4 paddedDeinitHoleCastReadMInit = .error (.ub msg) :=
-  ⟨runA_sound paddedDeinitHoleCastRead 12 _ _ _ rfl, _, rfl⟩
+  ⟨faultsA_sound paddedDeinitHoleCastRead 12 paddedDeinitHoleCastReadS0 (by kernel_rfl), _, rfl⟩
 
 /-- `ctxPadded3` is well formed for a body whose locals are `_0: u32`, `_1: Padded`, `_2: u32`,
 and `_3: u32` (with `argCount = 1`). -/
@@ -15010,7 +15007,7 @@ theorem ctxPadded3_ok_u32_u32 {body : CapturedMir}
     | _ + 2, hi, _ => omega
   ret := by
     intro d hd; rw [h] at hd; rw [hlay]; simp at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 /-- MIR of a 3-statement open-hole window exercising `castSiblingReadOk`, `binOpWindowOk`
 (a hole-independent integer binary operation into a temporary local while the hole stays open), and
@@ -15049,10 +15046,10 @@ def deinitSiblingBinOpWindowReinit : CapturedMir where
   allocations := []
 
 theorem deinitSiblingBinOpWindowReinit_inFragmentD :
-    inFragmentD deinitSiblingBinOpWindowReinit = true := by decide
+    inFragmentD deinitSiblingBinOpWindowReinit = true := by decide +kernel
 
 theorem deinitSiblingBinOpWindowReinit_not_inFragment :
-    inFragment deinitSiblingBinOpWindowReinit = false := by decide
+    inFragment deinitSiblingBinOpWindowReinit = false := by decide +kernel
 
 theorem deinitSiblingBinOpWindowReinit_window_rules :
     castSiblingReadOk deinitSiblingBinOpWindowReinit 1 2 [.field 1 u32Ty] [.field 0 u8TyW]
@@ -15065,7 +15062,7 @@ theorem deinitSiblingBinOpWindowReinit_window_rules :
       [none, none, none,
        some (1, [.field 1 u32Ty]), some (1, [.field 1 u32Ty]), some (1, [.field 1 u32Ty]),
        none, none, none, none] :=
-  ⟨by decide, by decide, by decide, rfl⟩
+  ⟨by decide +kernel, by decide +kernel, by decide +kernel, rfl⟩
 
 def deinitSiblingBinOpWindowReinitFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, paddedMiniRustTy),
@@ -15099,7 +15096,7 @@ theorem deinitSiblingBinOpWindowReinit_ctxOk : CtxOk deinitSiblingBinOpWindowRei
   ctxPadded3_ok_u32_u32 rfl rfl rfl
 
 theorem deinitSiblingBinOpWindowReinit_argsOk :
-    argsOk deinitSiblingBinOpWindowReinit paddedDeinitReadArgs = true := by decide
+    argsOk deinitSiblingBinOpWindowReinit paddedDeinitReadArgs = true := by decide +kernel
 
 def deinitSiblingBinOpWindowReinitS0 : MachineState :=
   initMachineState deinitSiblingBinOpWindowReinit paddedDeinitReadArgs
@@ -15111,11 +15108,11 @@ def deinitSiblingBinOpWindowReinitMInit : Mach :=
 theorem deinitSiblingBinOpWindowReinit_anneal_ret :
     ReachesRet (mirCallTree deinitSiblingBinOpWindowReinit paddedDeinitReadArgs) []
       (.normal (.scalar ⟨42, 4⟩, deinitSiblingBinOpWindowReinitS0.memory)) :=
-  runA_sound deinitSiblingBinOpWindowReinit 14 _ _ _ rfl
+  runA_sound deinitSiblingBinOpWindowReinit 14 _ _ _ (by kernel_rfl)
 
 theorem deinitSiblingBinOpWindowReinit_anneal_noUB :
     MirNoUBTree (mirCallTree deinitSiblingBinOpWindowReinit paddedDeinitReadArgs) :=
-  runA_noUB deinitSiblingBinOpWindowReinit 14 _ _ _ rfl
+  runA_isSome_noUB deinitSiblingBinOpWindowReinit 14 _ (by kernel_rfl)
 
 /-- **End-to-end return through `mirCall_ret_D` for `deinitSiblingBinOpWindowReinit`
 (`castSiblingReadOk` + `binOpWindowOk` + `reinitBinOpOk`).** Anneal's return of `42` (`7 + 10 + 25`)

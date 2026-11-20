@@ -1982,6 +1982,7 @@ def uint (layouts : LayoutTable) (w : UintTy) (idx : LayoutIdx) :
       case unit => nomatch hEnc
       case ptr => nomatch hEnc
       case aggregate => nomatch hEnc
+      case uninit => nomatch hEnc
       case scalar sv =>
         cases hEq : Nat.beq sv.sizeBytes sz <;> rw [hEq] at hEnc
         · nomatch hEnc
@@ -2089,6 +2090,7 @@ def int (layouts : LayoutTable) (w : IntTy) (idx : LayoutIdx) :
       case unit => nomatch hEnc
       case ptr => nomatch hEnc
       case aggregate => nomatch hEnc
+      case uninit => nomatch hEnc
       case scalar sv =>
         cases hEq : Nat.beq sv.sizeBytes sz <;> rw [hEq] at hEnc
         · nomatch hEnc
@@ -2208,6 +2210,7 @@ def primitiveNicheAdtNonPtr
     case unit => nomatch hEnc
     case ptr => nomatch hEnc
     case aggregate => nomatch hEnc
+    case uninit => nomatch hEnc
     case scalar sv =>
       cases hEq : Nat.beq sv.sizeBytes l.size.bytes <;> rw [hEq] at hEnc
       · nomatch hEnc
@@ -2346,6 +2349,7 @@ def uintArray (layouts : LayoutTable) (w : UintTy) (k : Nat) (hk : 0 < k) (idx :
       case unit => nomatch hEnc
       case scalar => nomatch hEnc
       case ptr => nomatch hEnc
+      case uninit => nomatch hEnc
       case aggregate varIdx elems =>
         cases varIdx with
         | succ _ => nomatch hEnc
@@ -2408,6 +2412,7 @@ def uintArray (layouts : LayoutTable) (w : UintTy) (k : Nat) (hk : 0 < k) (idx :
                       case unit => nomatch hHead
                       case ptr => nomatch hHead
                       case aggregate => nomatch hHead
+                      case uninit => nomatch hHead
                       case scalar sv =>
                         cases hSvEq : Nat.beq sv.sizeBytes sz <;> rw [hSvEq] at hHead
                         · nomatch hHead
@@ -2523,6 +2528,7 @@ def uintPairTuple (layouts : LayoutTable) (w₁ w₂ : UintTy) (idx : LayoutIdx)
       case unit => nomatch hEnc
       case scalar => nomatch hEnc
       case ptr => nomatch hEnc
+      case uninit => nomatch hEnc
       case aggregate varIdx fs =>
         cases varIdx with
         | succ _ => nomatch hEnc
@@ -2562,6 +2568,7 @@ def uintPairTuple (layouts : LayoutTable) (w₁ w₂ : UintTy) (idx : LayoutIdx)
                     case unit => nomatch hE₁
                     case ptr => nomatch hE₁
                     case aggregate => nomatch hE₁
+                    case uninit => nomatch hE₁
                     case scalar sv₁ =>
                       cases hS₁ : Nat.beq sv₁.sizeBytes sz₁ <;> rw [hS₁] at hE₁
                       · nomatch hE₁
@@ -2569,6 +2576,7 @@ def uintPairTuple (layouts : LayoutTable) (w₁ w₂ : UintTy) (idx : LayoutIdx)
                         case unit => nomatch hE₂
                         case ptr => nomatch hE₂
                         case aggregate => nomatch hE₂
+                        case uninit => nomatch hE₂
                         case scalar sv₂ =>
                           cases hS₂ : Nat.beq sv₂.sizeBytes sz₂ <;> rw [hS₂] at hE₂
                           · nomatch hE₂
@@ -2794,6 +2802,7 @@ def paddedSingleElemTuple (layouts : LayoutTable) (w : UintTy) (padBytes : Nat)
       case unit => nomatch hEnc
       case scalar => nomatch hEnc
       case ptr => nomatch hEnc
+      case uninit => nomatch hEnc
       case aggregate varIdx fs =>
         cases varIdx with
         | succ _ => nomatch hEnc
@@ -2831,6 +2840,7 @@ def paddedSingleElemTuple (layouts : LayoutTable) (w : UintTy) (padBytes : Nat)
                 case unit => nomatch hE₁
                 case ptr => nomatch hE₁
                 case aggregate => nomatch hE₁
+                case uninit => nomatch hE₁
                 case scalar sv₁ =>
                   cases hS₁ : Nat.beq sv₁.sizeBytes (uintByteSize w) <;> rw [hS₁] at hE₁
                   · nomatch hE₁
@@ -3007,6 +3017,7 @@ def uintPairArbitraryTuple (layouts : LayoutTable) (w₁ w₂ : UintTy)
       case unit => nomatch hEnc
       case scalar => nomatch hEnc
       case ptr => nomatch hEnc
+      case uninit => nomatch hEnc
       case aggregate varIdx fs =>
         cases varIdx with
         | succ _ => nomatch hEnc
@@ -3048,6 +3059,7 @@ def uintPairArbitraryTuple (layouts : LayoutTable) (w₁ w₂ : UintTy)
                   case unit => nomatch hE₁
                   case ptr => nomatch hE₁
                   case aggregate => nomatch hE₁
+                  case uninit => nomatch hE₁
                   case scalar sv₁ =>
                     cases hS₁ : Nat.beq sv₁.sizeBytes (uintByteSize w₁) <;> rw [hS₁] at hE₁
                     · nomatch hE₁
@@ -3089,6 +3101,7 @@ def uintPairArbitraryTuple (layouts : LayoutTable) (w₁ w₂ : UintTy)
                         case unit => nomatch hE₂
                         case ptr => nomatch hE₂
                         case aggregate => nomatch hE₂
+                        case uninit => nomatch hE₂
                         case scalar sv₂ =>
                           cases hS₂ : Nat.beq sv₂.sizeBytes (uintByteSize w₂) <;> rw [hS₂] at hE₂
                           · nomatch hE₂
@@ -3489,7 +3502,8 @@ def fieldlessEnum {ε : Type}
         t < 2 ^ (8 * sz) →
         wrappingRangeContains validRange t = true →
         Trusted.Sequence.get? variantShapes t = some varShape →
-        ∃ e : ε, toTag e = t) :
+        ∃ e : ε, toTag e = t)
+    (hNoDiscr : l.variantDiscriminants = [] := by rfl) :
     MirValueCodec layouts { kind := .adt defPath args, layoutIdx := idx } ε sz where
   codec := FixedByteCodec.enumRepr sz hNz toTag ofTag hRound hBounds
   toValue := fun e => .aggregate (toTag e) []
@@ -3526,7 +3540,7 @@ def fieldlessEnum {ε : Type}
     rw [hFields, hScalarWidth, hGetVar]
     dsimp only
     have hGet0 : Trusted.Sequence.get? ([{ bytes := 0 }] : List Size) 0 = some { bytes := 0 } := rfl
-    rw [hGet0, hSize]
+    rw [hGet0, hNoDiscr, hSize]
     dsimp only
     unfold encodeScalarBytes
     have hBeq0 : Nat.beq sz 0 = false := nat_beq_eq_false_of_ne (by omega)
@@ -3575,7 +3589,7 @@ def fieldlessEnum {ε : Type}
     rw [show defaultCodecFuel = 15 + 1 from rfl,
         decodeValueFromBytes_adt_multiple_enum_scalarLayout 15 layouts defPath args idx l
           (.initialized (.int bitsWidth signed) validRange) variantShapes memoryOrder
-          hLookup hInhab hVar hFields hScalarWidth]
+          hLookup hInhab hVar hFields hScalarWidth bs hNoDiscr]
     have hLenDef : Trusted.Sequence.length bs = bs.length := rfl
     rw [hLenDef, hSize]
     let enumC := FixedByteCodec.enumRepr sz hNz toTag ofTag hRound hBounds
@@ -3763,6 +3777,7 @@ def encodeUntypedValueFuelFree : Value → Option (List AbstractByte)
   | .unit => some []
   | .scalar sv => encodeScalarBytes sv none
   | .ptr p sz => encodeScalarBytes ⟨p.offsetBytes, sz⟩ (some (p.allocId, p.tag))
+  | .uninit => none
   | .aggregate _ fields =>
     fields.attach.foldr
       (fun ⟨f, _⟩ accOpt =>
@@ -3818,6 +3833,9 @@ theorem encodeUntypedValueToBytes_eq_some_imp_fuelFree
     | ptr p sz =>
       rw [encodeUntypedValueFuelFree]
       exact hEnc
+    | uninit =>
+      rw [encodeUntypedValueFuelFree]
+      exact hEnc
     | aggregate varIdx fields =>
       rw [encodeUntypedValueFuelFree]
       unfold encodeUntypedValueToBytes at hEnc
@@ -3851,7 +3869,7 @@ theorem encodeUntypedValueToBytes_eq_some_imp_fuelFree
 
 /-- Fuel-free aggregate nesting depth of a `Value` (`0` on leaves, `1 + max field depth` on `.aggregate`). -/
 def valueAggregateDepth : Value → Nat
-  | .unit | .scalar _ | .ptr _ _ => 0
+  | .unit | .scalar _ | .ptr _ _ | .uninit => 0
   | .aggregate _ fields =>
     1 + fields.attach.foldr (fun ⟨f, _⟩ acc => Nat.max (valueAggregateDepth f) acc) 0
 termination_by v => sizeOf v
@@ -3893,6 +3911,7 @@ theorem encodeUntypedValueToBytes_eq_fuelFree_of_depth_lt
     | unit => rw [encodeUntypedValueFuelFree]
     | scalar _ => rw [encodeUntypedValueFuelFree]
     | ptr _ _ => rw [encodeUntypedValueFuelFree]
+    | uninit => rw [encodeUntypedValueFuelFree]
     | aggregate varIdx fields =>
       rw [valueAggregateDepth] at hLt
       have hMaxLt :
@@ -3938,7 +3957,7 @@ theorem encodeUntypedValueToBytes_eq_fuelFree_of_depth_lt
 
 /-- Fuel-free node count on `Value` using `sizeOf_lt_of_mem_aggregate_fields`. -/
 def valueNodeCount : Value → Nat
-  | .unit | .scalar _ | .ptr _ _ => 1
+  | .unit | .scalar _ | .ptr _ _ | .uninit => 1
   | .aggregate _ fields =>
     1 + fields.attach.foldl (fun acc ⟨f, _⟩ => acc + valueNodeCount f) 0
 termination_by v => sizeOf v
@@ -8016,6 +8035,7 @@ def uint (layouts : LayoutTable) (w : UintTy) :
     case unit => nomatch hEnc
     case ptr => nomatch hEnc
     case aggregate => nomatch hEnc
+    case uninit => nomatch hEnc
     case scalar sv =>
       cases hEq : Nat.beq sv.sizeBytes (MirValueCodec.uintByteSize w) <;> rw [hEq] at hEnc
       · nomatch hEnc
@@ -8048,6 +8068,7 @@ def int (layouts : LayoutTable) (w : IntTy) :
     case unit => nomatch hEnc
     case ptr => nomatch hEnc
     case aggregate => nomatch hEnc
+    case uninit => nomatch hEnc
     case scalar sv =>
       cases hEq : Nat.beq sv.sizeBytes (MirValueCodec.intByteSize w) <;> rw [hEq] at hEnc
       · nomatch hEnc
@@ -8232,6 +8253,7 @@ def unit (layouts : LayoutTable) : TupleFieldCodec layouts (.tuple []) FixedByte
       exact hBs.symm
     case scalar => nomatch hEnc
     case ptr => nomatch hEnc
+    case uninit => nomatch hEnc
     case aggregate varIdx fs =>
       match varIdx, fs, hEnc with
       | 0, [], hEnc =>
@@ -8325,6 +8347,7 @@ def bool (layouts : LayoutTable) : TupleFieldCodec layouts .bool FixedByteCodec.
     case unit => nomatch hEnc
     case ptr => nomatch hEnc
     case aggregate => nomatch hEnc
+    case uninit => nomatch hEnc
     case scalar sv =>
       cases hSz : Nat.beq sv.sizeBytes 1 <;> rw [hSz] at hEnc
       · nomatch hEnc
@@ -8422,6 +8445,7 @@ def u8ListFixed (layouts : LayoutTable) (k : Nat) :
         exact ⟨⟨[], rfl⟩, hBs.symm⟩
       case scalar => nomatch hEnc
       case ptr => nomatch hEnc
+      case uninit => nomatch hEnc
       case aggregate varIdx vals =>
         cases varIdx with
         | succ _ => nomatch hEnc
@@ -8440,6 +8464,7 @@ def u8ListFixed (layouts : LayoutTable) (k : Nat) :
       case unit => nomatch hEnc
       case scalar => nomatch hEnc
       case ptr => nomatch hEnc
+      case uninit => nomatch hEnc
       case aggregate varIdx elems =>
         cases varIdx with
         | succ _ => nomatch hEnc
@@ -8635,6 +8660,7 @@ theorem ofPlacedCodecSpine_encode_witness
   case unit => nomatch hEnc
   case scalar => nomatch hEnc
   case ptr => nomatch hEnc
+  case uninit => nomatch hEnc
   case aggregate varIdx vals =>
     cases varIdx with
     | succ _ => nomatch hEnc
@@ -9730,6 +9756,7 @@ theorem adtOfPlacedCodecSpine_encode_witness
     case unit => nomatch hEnc
     case scalar => nomatch hEnc
     case ptr => nomatch hEnc
+    case uninit => nomatch hEnc
     case aggregate vIdx vals =>
       cases hCond1 : Bool.and (Nat.beq vIdx varIdx)
           (Nat.beq
@@ -11502,14 +11529,15 @@ def mirValueCodec (spec : CompactEnumSpec)
         t < 2 ^ (8 * spec.tagByteWidth) →
         wrappingRangeContains validRange t = true →
         Trusted.Sequence.get? variantShapes t = some varShape →
-        ∃ v : CompactEnumVal spec, v.toTag = t) :
+        ∃ v : CompactEnumVal spec, v.toTag = t)
+    (hNoDiscr : l.variantDiscriminants = [] := by rfl) :
     MirValueCodec layouts { kind := .adt defPath args, layoutIdx := idx }
       (CompactEnumVal spec) spec.tagByteWidth :=
   MirValueCodec.fieldlessEnum
     layouts defPath args idx l spec.tagByteWidth bitsWidth signed validRange
     variantShapes memoryOrder toTag (ofTagNat spec)
     (ofTagNat_toTag spec) (toTag_lt spec) spec.tagByteWidth_pos
-    hLookup hInhab hSize hVar hFields hWidth hAllFieldless hTagValid hTagComplete
+    hLookup hInhab hSize hVar hFields hWidth hAllFieldless hTagValid hTagComplete hNoDiscr
 
 end CompactEnumVal
 

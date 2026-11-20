@@ -156,6 +156,14 @@ def mkRootFrame (fn : Gen.Function) (locs : List (Gen.LocalName × Ptr)) (nextBb
 /-- Extract the return value of a clean event-free `runA` execution. -/
 def runAVal (body : CapturedMir) (fuel : Nat) (s : MachineState) : Option MirSemantics.Value :=
   match runA body fuel s with | some ([], .normal (v, _)) => some v | _ => none
+def valAsPtr? : Option MirSemantics.Value → Option (Nat × Nat × Nat)
+  | some (.ptr p sz) => some (p.allocId, p.offsetBytes, sz) | _ => none
+def valAsScalar? : Option MirSemantics.Value → Option (Nat × Nat)
+  | some (.scalar sc) => some (sc.bits, sc.sizeBytes) | _ => none
+theorem eq_some_ptr_of_valAsPtr {o : Option MirSemantics.Value} {a b sz : Nat} (h : valAsPtr? o = some (a, b, sz)) : o = some (.ptr ⟨a, b⟩ sz) := by
+  cases o with | none => cases h | some v => cases v with | ptr p s => cases p; simp [valAsPtr?] at h; rcases h with ⟨rfl, rfl, rfl⟩; rfl | _ => cases h
+theorem eq_some_scalar_of_valAsScalar {o : Option MirSemantics.Value} {b sz : Nat} (h : valAsScalar? o = some (b, sz)) : o = some (.scalar ⟨b, sz⟩) := by
+  cases o with | none => cases h | some v => cases v with | scalar sc => cases sc; simp [valAsScalar?] at h; rcases h with ⟨rfl, rfl⟩; rfl | _ => cases h
 /-- Decidable UB-message projection for `Interp α`. -/
 def interpUbMsg {α : Type} : Interp α → Option String
   | .error (.ub msg) => some msg | _ => none
@@ -687,11 +695,12 @@ advances `stmtIdx` by 1, and invalidates conflicting borrows of `loc`. -/
 theorem trusted_setDiscriminant_local_preserves_payload (s : MachineState) (loc oldVar newVar : Nat) (fields : List MirSemantics.Value)
     (locals' : List LocalSlot) (span : String) (decls : List MirAst.LocalDecl) (layouts : LayoutTable)
     (hget : get? s.frame.locals loc = some (.init (.aggregate oldVar fields)))
+    (hpad : padSetDiscriminantInitFields? decls layouts (locPlace loc) newVar fields = some fields)
     (hset : set? s.frame.locals loc (.init (.aggregate newVar fields)) = some locals') (hprot : s.memory.activeProtectors = []) :
     evalStmt s { kind := .setDiscriminant (locPlace loc) newVar, span := span } decls layouts =
       MirStepNode.step (advanceStmt s locals' { s.memory with
             borrows := invalidateConflictingBorrows s.memory.borrows loc .none (length s.memory.callStack) }) := by
-  simp only [evalStmt, locPlace, hget, evalSetDiscriminantLocal, hset, hprot]
+  simp only [locPlace] at hpad ⊢; simp only [evalStmt, hget, hpad, evalSetDiscriminantLocal, hset, hprot]
 /-- **C1 Trusted Active-Protector Conflict UB & Field-Projected
 `SetDiscriminant` Law (`trusted_setDiscriminant_protector_and_field_proj`)**:
 (1) Non-empty `activeProtectors` on a whole local faults with `.fail .ub`
@@ -705,6 +714,7 @@ theorem trusted_setDiscriminant_protector_and_field_proj (s : MachineState) (loc
     let p : MirAst.Place := ⟨loc, .field idx fty :: rest⟩
     let resProj := resolveBorrowWriteLocalProj decls layouts locals₁ loc (.field idx fty :: rest)
     (get? s.frame.locals loc = some (.init (.aggregate oldVar fields)) →
+      padSetDiscriminantInitFields? decls layouts (locPlace loc) newVar fields = some fields →
       set? s.frame.locals loc (.init (.aggregate newVar fields)) = some locals' → s.memory.activeProtectors = ph :: pt →
       (hasProtectedWriteConflict s.memory.borrows (ph :: pt) loc .none [] 0 0 depth = true →
         evalStmt s { kind := .setDiscriminant (locPlace loc) newVar, span := span } decls layouts = MirStepNode.fail .ub) ∧
@@ -712,6 +722,7 @@ theorem trusted_setDiscriminant_protector_and_field_proj (s : MachineState) (loc
         evalStmt s { kind := .setDiscriminant (locPlace loc) newVar, span := span } decls layouts = MirStepNode.step (advanceStmt s locals'
             { s.memory with borrows := invalidateConflictingBorrows s.memory.borrows loc .none depth }))) ∧
     (evalOperand s.frame.locals (.copy p) s.memory.borrows s.memory.globals layouts s.memory.callerLocals decls s.memory.callStack = .ok (.aggregate oldVar fields) locals₁ →
+      padSetDiscriminantInitFields? decls layouts p newVar fields = some fields →
       (hasProtectedWriteConflict s.memory.borrows s.memory.activeProtectors loc .none resProj
           0 0 depth = true → evalStmt s { kind := .setDiscriminant p newVar, span := span } decls layouts = MirStepNode.fail .ub) ∧
       (hasProtectedWriteConflict s.memory.borrows s.memory.activeProtectors loc .none resProj 0 0 depth = false →
@@ -721,13 +732,14 @@ theorem trusted_setDiscriminant_protector_and_field_proj (s : MachineState) (loc
               borrows := invalidateConflictingBorrowsAtProj s.memory.borrows loc .none resProj 0 0 depth }))) := by
   intro depth p resProj
   refine ⟨?_, ?_⟩
-  · intro hget hset hprot
+  · intro hget hpad hset hprot
+    simp only [locPlace] at hpad ⊢
     constructor <;> intro hConf <;>
-      simp only [evalStmt, locPlace, hget, evalSetDiscriminantLocal, hset, hprot, depth, hConf]
-  · intro hOp
+      simp only [evalStmt, hget, hpad, evalSetDiscriminantLocal, hset, hprot, depth, hConf]
+  · intro hOp hpad
     refine ⟨?_, ?_⟩
-    · intro hConf; simp only [evalStmt, p, hOp, depth, resProj, hConf]
-    · intro hNoConf hWr; simp only [evalStmt, p, hOp, depth, resProj, hNoConf, hWr]
+    · intro hConf; simp only [p] at hOp hpad ⊢; simp only [evalStmt, hOp, hpad, depth, resProj, hConf]
+    · intro hNoConf hWr; simp only [p] at hOp hpad hWr ⊢; simp only [evalStmt, hOp, hpad, depth, resProj, hNoConf, hWr]
 /-- **C1 Trusted Dead/OOB Local UB Law
 (`trusted_setDiscriminant_dead_or_oob_ub`)**: Executing
 `StatementKind.setDiscriminant ⟨loc, []⟩ v` on a `.dead` or out-of-bounds
@@ -738,15 +750,21 @@ theorem trusted_setDiscriminant_dead_or_oob_ub (s : MachineState) (loc v : Nat) 
   rcases hdead with h | h <;> simp [evalStmt, locPlace, h]
 /-- **C1 Trusted `.uninit` Shell Behavior
 (`setDiscriminant_uninit_shell_behavior`)**: On an `.uninit` whole local
-`loc`, `evalStmt` delegates to `evalSetDiscriminantLocal s loc newVar .nil`
-when `setDiscriminantUninitDeclOk decls loc = true` (enum/ADT declaration)
-and returns `.unsupported` otherwise. -/
+`loc`, `evalStmt` computes `setDiscriminantUninitPayload?` and delegates to
+`evalSetDiscriminantLocal s loc newVar uninitFields` when
+`setDiscriminantUninitDeclOk decls loc = true`, and returns `.unsupported`
+otherwise. -/
 theorem setDiscriminant_uninit_shell_behavior (s : MachineState) (loc newVar : Nat) (span : String)
     (decls : List MirAst.LocalDecl) (layouts : LayoutTable) (huninit : get? s.frame.locals loc = some .uninit) :
-    (setDiscriminantUninitDeclOk decls loc = true → evalStmt s { kind := .setDiscriminant (locPlace loc) newVar, span := span } decls layouts =
-        evalSetDiscriminantLocal s loc newVar .nil) ∧ (setDiscriminantUninitDeclOk decls loc = false →
+    (∀ uninitFields, setDiscriminantUninitDeclOk decls loc = true →
+      setDiscriminantUninitPayload? decls layouts loc newVar = some uninitFields →
+      evalStmt s { kind := .setDiscriminant (locPlace loc) newVar, span := span } decls layouts =
+        evalSetDiscriminantLocal s loc newVar uninitFields) ∧
+    (setDiscriminantUninitDeclOk decls loc = false →
       evalStmt s { kind := .setDiscriminant (locPlace loc) newVar, span := span } decls layouts = MirStepNode.unsupported) := by
-  constructor <;> intro h <;> simp [evalStmt, locPlace, huninit, h]
+  refine ⟨fun uninitFields h hPay => ?_, fun h => ?_⟩
+  · simp [evalStmt, locPlace, huninit, h, hPay]
+  · simp [evalStmt, locPlace, huninit, h]
 /-- **C1 MiniRust Polymorphic Dead-Local & Misaligned-Pointer UB Laws**
 across BOTH `BasicMemory` (`Mach`) and `TreeBorrowsMemory` (`MachTB`). -/
 theorem minirust_setDiscriminantM_dead_local_ub {M : Type} [Gen.Memory M] [MemoryOps M]
@@ -884,6 +902,7 @@ theorem trusted_setDiscriminant_deref_step_and_ub (s : MachineState) (ptrLoc old
     (decls : List MirAst.LocalDecl) (layouts : LayoutTable) :
     let p : MirAst.Place := ⟨ptrLoc, .deref :: rest⟩
     (evalOperand s.frame.locals (.copy p) s.memory.borrows s.memory.globals layouts s.memory.callerLocals decls s.memory.callStack = .ok (.aggregate oldVar fields) locals₁ →
+      padSetDiscriminantInitFields? decls layouts p newVar fields = some fields →
       evalStmt s { kind := .setDiscriminant p newVar, span := span } decls layouts = evalSetDiscriminantDerefWrite s locals₁ p rest (.aggregate newVar fields) decls layouts) ∧
     (evalPlaceWrite locals₁ s.memory.borrows p (.aggregate newVar fields) s.memory.activeProtectors decls layouts s.memory.callStack = .ok locals₂ →
       derefWriteTreeUB locals₁ s.memory.borrows p = false → derefWriteUnionProtectorUB decls layouts locals₁ s.memory.borrows
@@ -891,13 +910,15 @@ theorem trusted_setDiscriminant_deref_step_and_ub (s : MachineState) (ptrLoc old
       evalSetDiscriminantDerefWrite s locals₁ p rest (.aggregate newVar fields) decls layouts =
         MirStepNode.step (advanceStmt s locals₂ { s.memory with
               borrows := invalidateDerefWriteBorrowsWithLayouts decls layouts locals₁ s.memory.borrows p rest s.memory.callStack })) ∧
-    (∀ ptrVal sz entry, evalOperand s.frame.locals (.copy ⟨ptrLoc, [.deref]⟩) s.memory.borrows s.memory.globals
+    (∀ ptrVal sz entry uninitFields, evalOperand s.frame.locals (.copy ⟨ptrLoc, [.deref]⟩) s.memory.borrows s.memory.globals
         layouts s.memory.callerLocals decls s.memory.callStack = .ub → get? s.frame.locals ptrLoc = some (.init (.ptr ptrVal sz)) →
       lookupBorrow s.memory.borrows ptrVal.tag = some entry → entry.perm = .active →
       entry.targetProjection = [] → ptrVal.offsetBytes = 0 → activeFrameSlot? s.frame.locals s.memory.callStack entry.targetFrameDepth
         entry.targetLocal = some .uninit → placeTyResolved decls layouts ⟨ptrLoc, [.deref]⟩ = some twoVarMirTy →
-      setDiscriminantUninitDeclOk decls entry.targetLocal = true → evalStmt s { kind := .setDiscriminant ⟨ptrLoc, [.deref]⟩ newVar, span := span } decls layouts =
-        evalSetDiscriminantDerefWrite s s.frame.locals ⟨ptrLoc, [.deref]⟩ [] (.aggregate newVar []) decls layouts) ∧
+      setDiscriminantUninitDeclOk decls entry.targetLocal = true →
+      setDiscriminantUninitPayload? decls layouts entry.targetLocal newVar = some uninitFields →
+      evalStmt s { kind := .setDiscriminant ⟨ptrLoc, [.deref]⟩ newVar, span := span } decls layouts =
+        evalSetDiscriminantDerefWrite s s.frame.locals ⟨ptrLoc, [.deref]⟩ [] (.aggregate newVar uninitFields) decls layouts) ∧
     (∀ sc, evalOperand s.frame.locals (.copy p) s.memory.borrows s.memory.globals layouts s.memory.callerLocals decls s.memory.callStack = .ok (.scalar sc) locals₁ →
       evalStmt s { kind := .setDiscriminant p newVar, span := span } decls layouts = MirStepNode.fail .ub) ∧
     (∀ ptrVal sz, evalOperand s.frame.locals (.copy ⟨ptrLoc, [.deref]⟩) s.memory.borrows s.memory.globals layouts s.memory.callerLocals decls s.memory.callStack = .ub →
@@ -905,11 +926,11 @@ theorem trusted_setDiscriminant_deref_step_and_ub (s : MachineState) (ptrLoc old
       evalStmt s { kind := .setDiscriminant ⟨ptrLoc, [.deref]⟩ newVar, span := span } decls layouts = MirStepNode.fail .ub) := by
   intro p
   refine ⟨?_, ?_, ?_, ?_, ?_⟩
-  · intro hOp; simp only [evalStmt, p, hOp]
+  · intro hOp hPad; simp only [p] at hOp hPad ⊢; simp only [evalStmt, hOp, hPad]
   · intro hWr hTree hUnion
     unfold evalSetDiscriminantDerefWrite; simp only [hWr, hTree, hUnion, Bool.or_self]
-  · intro ptrVal sz entry hUb hSlot hB hPerm hProj hOff hAct hPtTy hDeclOk
-    simp only [evalStmt, hUb, hSlot, hB, hPerm, hProj, hOff, Nat.beq_refl, hAct, hPtTy, twoVarMirTy, hDeclOk, Bool.and_self]
+  · intro ptrVal sz entry uninitFields hUb hSlot hB hPerm hProj hOff hAct hPtTy hDeclOk hPay
+    simp only [evalStmt, hUb, hSlot, hB, hPerm, hProj, hOff, Nat.beq_refl, hAct, hPtTy, twoVarMirTy, hDeclOk, Bool.and_self, hPay]
   · intro sc hOp; simp only [evalStmt, p, hOp]
   · intro ptrVal sz hUb hSlot hNoB; simp only [evalStmt, hUb, hSlot, hNoB]
 /-- **C1 Coupled Two-Sided Step Simulation, Symmetric Byte-Level Payload
@@ -931,6 +952,7 @@ theorem setDiscriminant_twoVar_coupled_lockstep_and_wfLive (s : MachineState) (l
     (oldByteTB0 : AbstractByte TreeBorrowsProvenance) (payloadTailTB : List (AbstractByte TreeBorrowsProvenance))
     (allocsTB' : List (Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra)) (htag : tag = 0 ∨ tag = 1)
     (hget : get? s.frame.locals loc = some (.init (.aggregate oldVar fields)))
+    (hpad : padSetDiscriminantInitFields? decls layouts (locPlace loc) tag fields = some fields)
     (hset : set? s.frame.locals loc (.init (.aggregate tag fields)) = some locals') (hprot : s.memory.activeProtectors = [])
     (hpBM : evalPlaceM mBM dst = .ok ((placeBM, twoVarEnumMrTy), mBM1)) (halBM : placeBM.aligned = true)
     (hoffBM : ptrOffsetInboundsM mBM1 placeBM.ptr.thin_pointer 0 = .ok ptrBM0) (hChkBM : BM.check_ptr mBM1.mem.memory ptrBM0 ⟨1⟩ = .ok (some (idBM, (), ⟨0⟩)))
@@ -983,7 +1005,7 @@ theorem setDiscriminant_twoVar_coupled_lockstep_and_wfLive (s : MachineState) (l
   have hTB : evalStatementM mTB (.SetDiscriminant dst (Int.ofNat tag)) = .ok { mTB1 with mem := cmTB' } :=
     minirust_setDiscriminantM_twoVar_tagStore mTB mTB1 dst placeTB tag htag hpTB halTB ptrTB0 hoffTB cmTB' hStoreTB
   refine ⟨trusted_setDiscriminant_local_preserves_payload s loc oldVar tag fields locals'
-            span decls layouts hget hset hprot, ?_, hTB, evalStatementM_tb_wfLive hwfTB hTB, fun bits hBits p1 p2 p3 q1 q2 q3 hpBM' hpTB' => ?_⟩
+            span decls layouts hget hpad hset hprot, ?_, hTB, evalStatementM_tb_wfLive hwfTB hTB, fun bits hBits p1 p2 p3 q1 q2 q3 hpBM' hpTB' => ?_⟩
   · rw [← evalStatementM_bm_eq]; exact hBM
   · subst hpBM'; subst hpTB'
     exact ⟨decodeM_twoVarEnumMrTy tag bits htag hBits p1 p2 p3, decodeM_twoVarEnumMrTy tag bits htag hBits q1 q2 q3⟩
@@ -1014,15 +1036,15 @@ theorem c1_setDiscriminant_local_three_way_witness :
       (m1.mem.memory.mem.allocations[1]?.map (fun a => a.data.map projByteTB), m1.threads[0]?.bind (fun t => t.stack[0]?.map (·.next_stmt))) =
       (some (c1LocalExpectedBytes.map (projByteTB ∘ liftByteTB)), some 1)) := ⟨⟨rfl, rfl⟩, ok_of_map_toOption (by decide +kernel), ok_stepTB_wfLive (by decide +kernel)⟩
 /-- **C1 Post-`SetDiscriminant` `Rvalue.discriminant` Read-Back &
-Invalid-Variant Divergence
+Invalid-Variant Fault-Kind Divergence
 (`setDiscriminant_discriminant_readback_and_invalid_divergence`)**: (1) Both
-`twoVarMirLayout` (`0, 1` with 1 field) and `optionNonZeroU8MirLayout` (`0`
-with 0 fields, `1` with 1 field) satisfy `layoutMatchesAggregateVariant`, and
-`Rvalue.discriminant` reads back `.scalar ⟨tag, 8⟩` for `tag ∈ {0, 1}`. (2) On
-out-of-range `2 ≤ badTag`, Trusted `evalStmt` steps eagerly to `.aggregate
-badTag fields` and faults with `.ub` on `Rvalue.discriminant`, whereas
-MiniRust `evalSetDiscriminantM` (`Mach` & `MachTB`) immediately raises
-`specPanic` at `SetDiscriminant`. -/
+`twoVarMirLayout` (`0, 1` with 1 field, disjoint direct tag) and
+`optionNonZeroU8MirLayout` (`0` with 0 fields, `1` with 1 field) satisfy
+`layoutMatchesAggregateVariant`, and `Rvalue.discriminant` reads back `.scalar
+⟨tag, 8⟩` for `tag ∈ {0, 1}`. (2) On out-of-range `2 ≤ badTag`, Trusted
+`evalStmt` faults with `.fail .ub` at `SetDiscriminant` (and `Rvalue.discriminant`
+also faults `.ub`), whereas MiniRust `evalSetDiscriminantM` (`Mach` & `MachTB`)
+raises `specPanic` at `SetDiscriminant`. -/
 theorem setDiscriminant_discriminant_readback_and_invalid_divergence {M : Type} [Gen.Memory M] [MemoryOps M]
     (s : MachineState) (oldVar tag badTag : Nat) (fields : List MirSemantics.Value) (locals' : List LocalSlot) (mem : MirSemantics.Memory) (span : String)
     (m m1 : Machine M) (dst : Gen.PlaceExpr) (place : Gen.Place M) :
@@ -1032,12 +1054,11 @@ theorem setDiscriminant_discriminant_readback_and_invalid_divergence {M : Type} 
     layoutMatchesAggregateVariant optionNonZeroU8MirLayout 0 0 = true ∧ layoutMatchesAggregateVariant optionNonZeroU8MirLayout 1 1 = true ∧
     ((tag = 0 ∨ tag = 1) → get? locals' 1 = some (.init (.aggregate tag fields)) →
       evalRvalue locals' (.discriminant (locPlace 1)) mem declsTwo twoVarLayouts = .ok (.scalar ⟨tag, 8⟩) locals' mem ∧
-      evalRvalue locals' (.discriminant (locPlace 1)) mem declsOpt optionNonZeroU8Layouts = .ok (.scalar ⟨tag, 8⟩) locals' mem) ∧
+      (valueListContainsUninit fields = false →
+        evalRvalue locals' (.discriminant (locPlace 1)) mem declsOpt optionNonZeroU8Layouts = .ok (.scalar ⟨tag, 8⟩) locals' mem)) ∧
     (2 ≤ badTag → get? s.frame.locals 1 = some (.init (.aggregate oldVar fields)) →
-      set? s.frame.locals 1 (.init (.aggregate badTag fields)) = some locals' → s.memory.activeProtectors = [] → get? locals' 1 = some (.init (.aggregate badTag fields)) →
-      evalStmt s { kind := .setDiscriminant (locPlace 1) badTag, span := span } declsOpt optionNonZeroU8Layouts =
-        MirStepNode.step (advanceStmt s locals' { s.memory with
-          borrows := invalidateConflictingBorrows s.memory.borrows 1 .none (length s.memory.callStack) }) ∧
+      get? locals' 1 = some (.init (.aggregate badTag fields)) →
+      evalStmt s { kind := .setDiscriminant (locPlace 1) badTag, span := span } declsOpt optionNonZeroU8Layouts = MirStepNode.fail .ub ∧
       evalRvalue locals' (.discriminant (locPlace 1)) mem declsTwo twoVarLayouts = .ub ∧
       evalRvalue locals' (.discriminant (locPlace 1)) mem declsOpt optionNonZeroU8Layouts = .ub ∧
       (evalPlaceM m dst = .ok ((place, optionNonZeroU8MrTy), m1) → place.aligned = true →
@@ -1045,11 +1066,17 @@ theorem setDiscriminant_discriminant_readback_and_invalid_divergence {M : Type} 
   intro declsTwo declsOpt
   refine ⟨rfl, rfl, rfl, rfl, ?_, ?_⟩
   · intro hTag hGet; rcases hTag with rfl | rfl <;>
-      exact ⟨by unfold evalRvalue evalOperand; simp only [locPlace, hGet]; rfl,
-             by unfold evalRvalue evalOperand; simp only [locPlace, hGet]; rfl⟩
-  · intro hGe hGet0 hSet hProt hGet'
+      exact ⟨by unfold evalRvalue evalOperand evalPlaceDiscriminant; simp only [locPlace, hGet, readProjectedValue]; cases valueListContainsUninit fields <;> rfl,
+             fun hInit => by unfold evalRvalue evalOperand evalPlaceDiscriminant; simp only [locPlace, hGet, readProjectedValue, hInit]; rfl⟩
+  · intro hGe hGet0 hGet'
     have hBle : Nat.ble (Nat.succ badTag) 2 = false := by
       cases badTag with | zero => exact absurd hGe (by decide) | succ k => cases k with | zero => exact absurd hGe (by decide) | succ _ => rfl
+    have hPadNone : padSetDiscriminantInitFields? declsOpt optionNonZeroU8Layouts (locPlace 1) badTag fields = none := by
+      cases badTag with
+      | zero => exact absurd hGe (by decide)
+      | succ k => cases k with
+        | zero => exact absurd hGe (by decide)
+        | succ _ => rfl
     have hMiss : mapGet optionNonZeroU8Variants (Int.ofNat badTag) = none := by
       cases badTag with
       | zero => exact absurd hGe (by decide)
@@ -1059,23 +1086,26 @@ theorem setDiscriminant_discriminant_readback_and_invalid_divergence {M : Type} 
           have hNe0 : (0 : Int) ≠ ↑k2 + 1 + 1 := by omega
           have hNe1 : (1 : Int) ≠ ↑k2 + 1 + 1 := by omega
           simp [optionNonZeroU8Variants, mapGet, hNe0, hNe1]
-    refine ⟨trusted_setDiscriminant_local_preserves_payload s 1 oldVar badTag fields locals' span declsOpt optionNonZeroU8Layouts hGet0 hSet hProt,
+    refine ⟨by simp only [locPlace] at hPadNone ⊢; simp only [evalStmt, hGet0, hPadNone],
       ?_, ?_, fun hp hal => (minirust_setDiscriminantM_wf_panic m m1 dst place (Int.ofNat badTag)).1 _ _ _ _ _ hp hal hMiss⟩
     · have hPt1 : placeTyResolved declsTwo twoVarLayouts (locPlace 1) = some twoVarMirTy := rfl
       have hLk1 : LayoutTable.lookup twoVarLayouts twoVarMirTy.layoutIdx = some twoVarMirLayout := rfl
+      have hDisj1 : enumLayoutHasDisjointDirectTag twoVarMirLayout = true := rfl
       unfold evalRvalue evalOperand evalPlaceDiscriminant
-      simp only [hPt1, hLk1]; simp only [locPlace, hGet', readProjectedValue, twoVarMirTy, twoVarMirLayout, length, List.length, hBle]
+      simp only [hPt1, hLk1, hDisj1, locPlace, hGet', readProjectedValue]
+      cases valueListContainsUninit fields <;> simp only [twoVarMirTy, twoVarMirLayout, length, List.length, hBle] <;> rfl
     · have hPt2 : placeTyResolved declsOpt optionNonZeroU8Layouts (locPlace 1) = some optionNonZeroU8MirTy := rfl
       have hLk2 : LayoutTable.lookup optionNonZeroU8Layouts optionNonZeroU8MirTy.layoutIdx = some optionNonZeroU8MirLayout := rfl
+      have hDisj2 : enumLayoutHasDisjointDirectTag optionNonZeroU8MirLayout = false := rfl
       unfold evalRvalue evalOperand evalPlaceDiscriminant
-      simp only [hPt2, hLk2]; simp only [locPlace, hGet', readProjectedValue, optionNonZeroU8MirTy, optionNonZeroU8MirLayout, length, List.length, hBle]
+      simp only [hPt2, hLk2, hDisj2, locPlace, hGet', readProjectedValue]
+      cases valueListContainsUninit fields <;> simp only [optionNonZeroU8MirTy, optionNonZeroU8MirLayout, length, List.length, hBle] <;> rfl
 /-- Concrete niche-encoded `Option<NonZeroU8>` `SetDiscriminant` 3-way witness
 across genuine `optionNonZeroU8MirTy` (`optionNonZeroU8Layouts`), `Mach`, and
 `MachTB` (with `MachTB.wfLive`): setting `Some` (`1`, empty `tagger = []`)
 performs zero memory writes preserving `[.Init 7 none]` and reads discriminant
 `1`, setting `None` (`0`) writes `[.Init 0 none]` and reads discriminant `0`,
-and out-of-range `2` steps then faults `.ub` on `Rvalue.discriminant` in
-Trusted vs. immediate `SetDiscriminant` `.specPanic` in MiniRust. -/
+and out-of-range `2` faults `.ub` in Trusted vs. `.specPanic` in MiniRust. -/
 theorem c1_niche_optionNonZeroU8_three_way_witness :
     let optMir (tag : Nat) := mkMirBody "ep2::c1_niche_opt" [mkDecl u64MirTy, mkDecl optionNonZeroU8MirTy] 1
       [mkBb [mkSt (.setDiscriminant (locPlace 1) tag), mkSt (.assign (locPlace 0) (.discriminant (locPlace 1)))] .return_] optionNonZeroU8Layouts
@@ -1096,8 +1126,7 @@ theorem c1_niche_optionNonZeroU8_three_way_witness :
     (∃ m2, Interp.stepsTB 2 (liftMachToTB (optMach 0)) = .ok m2 ∧ MachTB.wfLive m2 ∧
       (m2.mem.memory.mem.allocations[1]?.map (fun a => a.data.map projByteTB),
        m2.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB)) = (some [.initNoProv 0], some [.initNoProv 0])) ∧
-    (match stepMirFn (optMir 2) (initMachineState (optMir 2) [.aggregate 1 [.scalar ⟨7, 1⟩]]) with
-     | .tau (.running s1) => stepMirFn (optMir 2) s1 = MirStepNode.fail .ub | _ => False) ∧
+    stepMirFn (optMir 2) (initMachineState (optMir 2) [.aggregate 1 [.scalar ⟨7, 1⟩]]) = MirStepNode.fail .ub ∧
     Interp.step (optMach 2) = .error (.specPanic "setting an invalid discriminant (2)") ∧
     Interp.stepTB (liftMachToTB (optMach 2)) = .error (.specPanic "setting an invalid discriminant (2)") :=
   ⟨rfl, ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel), rfl, ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
@@ -1134,7 +1163,7 @@ theorem c1_setDiscriminant_uninit_shell_witness :
       { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .uninit] },
         memory := (initMachineState c1SetDiscrLocalMir []).memory }
     (match stepMirFn c1SetDiscrLocalMir s0 with
-     | .tau (.running s1) => get? s1.frame.locals 1 = some (.init (.aggregate 1 [])) | _ => False) ∧
+     | .tau (.running s1) => get? s1.frame.locals 1 = some (.init (.aggregate 1 [.uninit])) | _ => False) ∧
     (∃ m1, Interp.step c1UninitMach = .ok m1 ∧ m1.mem.memory.allocations[1]?.map (·.data) = some (.Init 1 none :: List.replicate 7 .Uninit)) ∧
     Type.decode twoVarEnumMrTy (.Init 1 none :: List.replicate 7 .Uninit) = .ok none ∧
     Type.decodeM (M := TBM) twoVarEnumMrTy (.Init 1 none :: List.replicate 7 .Uninit) = .ok none ∧
@@ -2264,10 +2293,11 @@ theorem subtype_thinPtr_and_u32_coupled_lockstep (locals locals' : List LocalSlo
     have hDec : decodeTypedValueFromBytes defaultCodecFuel emptyLayoutTable rawConstU32MirTy
         (encodeLittleEndianBytes p.offsetBytes 8 (some (p.allocId, p.tag))) = some (.ptr p 8) :=
       hDecAux _ hLen (by rw [decodeLittleEndianBytes_encode, Nat.mod_eq_of_lt h256]; rfl) (abstractBytesAllProvAux_encode p.allocId p.tag (Nat.div p.offsetBytes 256) 7)
-    have hResS : resolveTyWithLocalDecls declsPtr emptyLayoutTable rawMutU32MirTy = rawMutU32MirTy := rfl
     have hResD : resolveTyWithLocalDecls declsPtr emptyLayoutTable rawConstU32MirTy = rawConstU32MirTy := rfl
+    have hDstSz : tyByteSize declsPtr emptyLayoutTable rawConstU32MirTy = some 8 := rfl
+    have hSrcSz : resolveByteCastSrcTyAndSize declsPtr emptyLayoutTable op rawMutU32MirTy = some (rawMutU32MirTy, 8) := rfl
     show evalByteCast locals op rawConstU32MirTy mem declsPtr emptyLayoutTable = _
-    unfold evalByteCast; simp only [hOp, hSrcTy, hResS, hResD, hEnc, hLen, hDec]; rfl
+    unfold evalByteCast; simp only [hOp, hResD, hDstSz, hSrcTy, hSrcSz, Nat.beq_refl, hEnc, hLen, hDec]
   · intro hOp hSrcTy
     refine ⟨?_, transmuteM_u32_to_i32 bits hBits mBM, transmuteM_u32_to_i32 bits hBits mTB⟩
     have hEnc : encodeByteCastSourceBytes emptyLayoutTable u32MirTy (.scalar ⟨bits, 4⟩) = some (encodeLittleEndianBytes bits 4 none) := rfl
@@ -2280,12 +2310,18 @@ theorem subtype_thinPtr_and_u32_coupled_lockstep (locals locals' : List LocalSlo
         (encodeLittleEndianBytes bits 4 none) = some (.scalar ⟨bits, 4⟩) :=
       hDecAux _ hLen (by
         rw [decodeLittleEndianBytes_encode, show 256 ^ 4 = 2 ^ 32 by decide, Nat.mod_eq_of_lt h256]; rfl)
+    have hResD : resolveTyWithLocalDecls declsInt emptyLayoutTable i32MirTy = i32MirTy := rfl
+    have hDstSz : tyByteSize declsInt emptyLayoutTable i32MirTy = some 4 := rfl
+    have hSrcSz : resolveByteCastSrcTyAndSize declsInt emptyLayoutTable op u32MirTy = some (u32MirTy, 4) := rfl
     show evalByteCast locals op i32MirTy mem declsInt emptyLayoutTable = _
-    unfold evalByteCast; simp only [hOp, hSrcTy, hEnc, hLen, hDec, declsInt, resolveTyWithLocalDecls, tyByteSize, Nat.beq_refl]; rfl
+    unfold evalByteCast; simp only [hOp, hResD, hDstSz, hSrcTy, hSrcSz, Nat.beq_refl, hEnc, hLen, hDec]
   · intro hb01 hOp hSrcTy
+    have hResD : resolveTyWithLocalDecls declsBool emptyLayoutTable boolMirTy = boolMirTy := rfl
+    have hDstSz : tyByteSize declsBool emptyLayoutTable boolMirTy = some 1 := rfl
+    have hSrcSz : resolveByteCastSrcTyAndSize declsBool emptyLayoutTable op u8MirTy = some (u8MirTy, 1) := rfl
     rcases hb01 with rfl | rfl <;> (
       refine ⟨?_, rfl, rfl⟩; show evalByteCast locals op boolMirTy mem declsBool emptyLayoutTable = _
-      unfold evalByteCast; simp only [hOp, hSrcTy]; rfl)
+      unfold evalByteCast; simp only [hOp, hResD, hDstSz, hSrcTy, hSrcSz]; rfl)
   · intro hGe hOp hSrcTy
     refine ⟨?_, (transmuteM_u8_to_bool b hb mBM).2.2 hGe, (transmuteM_u8_to_bool b hb mTB).2.2 hGe⟩
     have hB : (UInt8.ofNat b).toBitVec.toNat = b := by
@@ -2300,12 +2336,18 @@ theorem subtype_thinPtr_and_u32_coupled_lockstep (locals locals' : List LocalSlo
       | succ k => cases k with | zero => exact absurd hGe (by decide) | succ _ => rfl
     have hEnc : encodeByteCastSourceBytes emptyLayoutTable u8MirTy (.scalar ⟨b, 1⟩) = some (encodeLittleEndianBytes b 1 none) := rfl
     have hLen : length (encodeLittleEndianBytes b 1 none) = 1 := rfl
+    have hResD : resolveTyWithLocalDecls declsBool emptyLayoutTable boolMirTy = boolMirTy := rfl
+    have hDstSz : tyByteSize declsBool emptyLayoutTable boolMirTy = some 1 := rfl
+    have hSrcSz : resolveByteCastSrcTyAndSize declsBool emptyLayoutTable op u8MirTy = some (u8MirTy, 1) := rfl
     show evalByteCast locals op boolMirTy mem declsBool emptyLayoutTable = .ub
-    unfold evalByteCast; simp only [hOp, hSrcTy, hEnc, hLen, hDec, declsBool, resolveTyWithLocalDecls, tyByteSize, Nat.beq_refl]; rfl
+    unfold evalByteCast; simp only [hOp, hResD, hDstSz, hSrcTy, hSrcSz, Nat.beq_refl, hEnc, hLen, hDec]
   · intro hOp hSrcTy
+    have hResD : resolveTyWithLocalDecls declsNz nonZeroU8Layouts nonZeroU8MirTy = nonZeroU8MirTy := rfl
+    have hDstSz : tyByteSize declsNz nonZeroU8Layouts nonZeroU8MirTy = some 1 := rfl
+    have hSrcSz : resolveByteCastSrcTyAndSize declsNz nonZeroU8Layouts op u8MirTy = some (u8MirTy, 1) := rfl
     refine ⟨?_, rfl, rfl⟩
     show evalByteCast locals op nonZeroU8MirTy mem declsNz nonZeroU8Layouts = .ub
-    unfold evalByteCast; simp only [hOp, hSrcTy]; rfl
+    unfold evalByteCast; simp only [hOp, hResD, hDstSz, hSrcTy, hSrcSz]; rfl
   · intro h1 hOp hSrcTy
     refine ⟨?_, (transmuteM_u8_to_nonZeroU8 b hb mBM).2 h1, (transmuteM_u8_to_nonZeroU8 b hb mTB).2 h1⟩
     have hLe1 : Nat.ble 1 b = true := Nat.ble_eq.mpr h1
@@ -2329,10 +2371,11 @@ theorem subtype_thinPtr_and_u32_coupled_lockstep (locals locals' : List LocalSlo
       rw [hSc]
     have hEnc : encodeByteCastSourceBytes nonZeroU8Layouts u8MirTy (.scalar ⟨b, 1⟩) = some (encodeLittleEndianBytes b 1 none) := rfl
     have hLen : length (encodeLittleEndianBytes b 1 none) = 1 := rfl
-    have hResS : resolveTyWithLocalDecls declsNz nonZeroU8Layouts u8MirTy = u8MirTy := rfl
     have hResD : resolveTyWithLocalDecls declsNz nonZeroU8Layouts nonZeroU8MirTy = nonZeroU8MirTy := rfl
+    have hDstSz : tyByteSize declsNz nonZeroU8Layouts nonZeroU8MirTy = some 1 := rfl
+    have hSrcSz : resolveByteCastSrcTyAndSize declsNz nonZeroU8Layouts op u8MirTy = some (u8MirTy, 1) := rfl
     show evalByteCast locals op nonZeroU8MirTy mem declsNz nonZeroU8Layouts = _
-    unfold evalByteCast; simp only [hOp, hSrcTy, hResS, hResD, hEnc, hLen, hDec]; rfl
+    unfold evalByteCast; simp only [hOp, hResD, hDstSz, hSrcTy, hSrcSz, Nat.beq_refl, hEnc, hLen, hDec]
 /-- **C7 Size-Mismatch Boundary (`subtype_size_mismatch_boundary_M`)**: On
 mismatched sizes (`u32` 4 bytes → `u8` 1 byte), Trusted `evalByteCast`
 returns `.unsupported`, MiniRust `evalCastOpM (.Transmute u8MrTy)` faults
@@ -2346,8 +2389,11 @@ theorem subtype_size_mismatch_boundary_M {M : Type} [Gen.Memory M] [MemoryOps M]
     evalCastOpM (M := M) (.Transmute u8MrTy) (vM, u32MrTy) m = .error (.ub "transmute between types of different size") ∧
     transmuteM (M := M) vM u32MrTy u8MrTy m = .error (.specPanic "assertion failed: transmute between types of different size") := by
   intro decls; refine ⟨fun hOp hSrc => ?_, rfl, rfl⟩
+  have hResD : resolveTyWithLocalDecls decls emptyLayoutTable u8MirTy = u8MirTy := rfl
+  have hDstSz : tyByteSize decls emptyLayoutTable u8MirTy = some 1 := rfl
+  have hSrcSz : resolveByteCastSrcTyAndSize decls emptyLayoutTable op u32MirTy = some (u32MirTy, 4) := rfl
   show evalByteCast locals op u8MirTy mem decls emptyLayoutTable = .unsupported
-  unfold evalByteCast; simp only [hOp, hSrc]; rfl
+  unfold evalByteCast; simp only [hOp, hResD, hDstSz, hSrc, hSrcSz]
 def c7SubtypeU32ToI32Mir : MirAst.CapturedMir := mkMirBody "ep2::c7_subtype_u32_i32" [mkDecl i32MirTy, mkDecl u32MirTy] 1
     [mkBb [mkSt (.assign (locPlace 0) (.cast .subtype (.copy (locPlace 1)) i32MirTy))] .return_]
 def c7SubtypeU8ToBoolMir : MirAst.CapturedMir := mkMirBody "ep2::c7_subtype_u8_bool" [mkDecl boolMirTy, mkDecl u8MirTy] 1
@@ -2765,30 +2811,30 @@ theorem mutToConstPointer_all_shapes_and_ub (locals locals' : List LocalSlot) (o
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ⟨rfl, fun _ => rfl⟩⟩
   · intro hOp hTy; refine ⟨?_, evalCastOp_transmute_thinRawPtr_id addr hAddr provBM mBM,
       evalCastOpM_transmute_thinRawPtr_id (M := TBM) addr hAddr provTB mTB⟩
-    dsimp only [evalRvalue]; unfold evalReifyFnPointer; simp only [h1, h2, h3, h4, hL8, hOp, hTy, hSh0, Nat.beq_refl]
+    dsimp only [evalRvalue]; unfold evalReifyFnPointer; rw [h1]; dsimp only []; rw [h2]; dsimp only []; rw [h3]; dsimp only []; rw [h4]; dsimp only []; simp only [hL8, hOp, hTy, hSh0, Nat.beq_refl]
   · intro hOp hTy; dsimp only [evalRvalue]; unfold evalReifyFnPointer
-    simp only [h1, h2, h3, h4, hL8, hOp, hTy, hSh0, Nat.beq_refl]
+    rw [h1]; dsimp only []; rw [h2]; dsimp only []; rw [h3]; dsimp only []; rw [h4]; dsimp only []; simp only [hL8, hOp, hTy, hSh0, Nat.beq_refl]
   · intro hOp hTy; refine ⟨?_, evalCastOpM_transmute_wideSliceRawPtr_id (M := BM) addr len hAddr hLen provBM mBM,
       evalCastOpM_transmute_wideSliceRawPtr_id (M := TBM) addr len hAddr hLen provTB mTB⟩
-    dsimp only [evalRvalue]; unfold evalReifyFnPointer; simp only [h1, h2, h3, h4, hL8, hOp, hTy, hShS, annealWidePtrVal, Nat.beq_refl, Bool.and_self]
+    dsimp only [evalRvalue]; unfold evalReifyFnPointer; rw [h1]; dsimp only []; rw [h2]; dsimp only []; rw [h3]; dsimp only []; rw [h4]; dsimp only []; simp only [hL8, hOp, hTy, hShS, annealWidePtrVal, Nat.beq_refl, Bool.and_self]
   · intro hOp hTy; dsimp only [evalRvalue]; unfold evalReifyFnPointer
-    simp only [h1, h2, h3, h4, hL8, hOp, hTy, hShS, Nat.beq_refl, Bool.and_self]
+    rw [h1]; dsimp only []; rw [h2]; dsimp only []; rw [h3]; dsimp only []; rw [h4]; dsimp only []; simp only [hL8, hOp, hTy, hShS, Nat.beq_refl, Bool.and_self]
   · intro hOp hTy; dsimp only [evalRvalue]; unfold evalReifyFnPointer
-    simp only [h1, h2, h3, h4, hL8, hOp, hTy, hShD, Nat.beq_refl, Bool.and_self]
+    rw [h1]; dsimp only []; rw [h2]; dsimp only []; rw [h3]; dsimp only []; rw [h4]; dsimp only []; simp only [hL8, hOp, hTy, hShD, Nat.beq_refl, Bool.and_self]
   · intro hOp hTy; dsimp only [evalRvalue]; unfold evalReifyFnPointer
-    simp only [h1, h2, h3, h4, hL8, hOp, hTy, hShD, Nat.beq_refl, Bool.and_self]
+    rw [h1]; dsimp only []; rw [h2]; dsimp only []; rw [h3]; dsimp only []; rw [h4]; dsimp only []; simp only [hL8, hOp, hTy, hShD, Nat.beq_refl, Bool.and_self]
   · intro hOp; refine ⟨?_, rfl, rfl⟩
     have hShape : ∀ s, mutToConstTargetShape? s rawConstSliceU32MirTy ≠ some none := by
       intro s; cases s with | none => decide | some ty =>
         cases ty with | mk kind _ => cases kind <;> simp [mutToConstTargetShape?, rawConstSliceU32MirTy, isWideRawPtrTy] <;> split <;> simp
-    dsimp only [evalRvalue]; unfold evalReifyFnPointer; simp only [h1, h2, h3, h4, hL8, hOp]
+    dsimp only [evalRvalue]; unfold evalReifyFnPointer; rw [h1]; dsimp only []; rw [h2]; dsimp only []; rw [h3]; dsimp only []; rw [h4]; dsimp only []; simp only [hL8, hOp]
     cases hS : mutToConstTargetShape? (operandTy decls emptyLayoutTable op) rawConstSliceU32MirTy with
     | none => rfl | some o => cases o with | none => exact absurd hS (hShape _) | some _ => rfl
   · intro hOp; refine ⟨?_, rfl, rfl⟩
     have hShape : ∀ s b, mutToConstTargetShape? s rawConstU32MirTy ≠ some (some b) := by
       intro s b; cases s with | none => intro h; cases h | some ty =>
         cases ty with | mk kind _ => cases kind <;> simp [mutToConstTargetShape?, rawConstU32MirTy, isWideRawPtrTy] <;> split <;> simp
-    dsimp only [evalRvalue]; unfold evalReifyFnPointer; simp only [h1, h2, h3, h4, hL8, hOp, annealWidePtrVal, Nat.beq_refl, Bool.and_self]
+    dsimp only [evalRvalue]; unfold evalReifyFnPointer; rw [h1]; dsimp only []; rw [h2]; dsimp only []; rw [h3]; dsimp only []; rw [h4]; dsimp only []; simp only [hL8, hOp, annealWidePtrVal, Nat.beq_refl, Bool.and_self]
     cases hS : mutToConstTargetShape? (operandTy decls emptyLayoutTable op) rawConstU32MirTy with
     | none => rfl | some o => cases o with | none => rfl | some b => exact absurd hS (hShape _ b)
 private theorem exactByteDivAux_ge_acc : ∀ fuel rem stride acc k, exactByteDivAux fuel rem stride acc = some k → acc ≤ k
@@ -2870,42 +2916,43 @@ theorem arrayToPointer_global_stack_scalar_and_ub (locals locals' : List LocalSl
   · intro hOp hTy hNoB
     refine ⟨?_, evalCastOp_transmute_thinRawPtr_id addr hAddr provBM mBM, evalCastOpM_transmute_thinRawPtr_id (M := TBM) addr hAddr provTB mTB⟩
     show evalReifyFnPointer locals op rawMutU32MirTy mem decls emptyLayoutTable "ArrayToPointer" = _
-    unfold evalReifyFnPointer; simp only [h1, h2, h3, hL8, hOp, hTy, hArrOk, hNoB, Nat.beq_refl]
+    unfold evalReifyFnPointer; rw [h1]; dsimp only []; rw [h2]; dsimp only []; rw [h3]; dsimp only []; simp (config := { zeta := false, zetaDelta := false }) only [hL8, hOp, hTy, hArrOk, hNoB, Nat.beq_refl]
   · intro parentEntry hOp hTy hB
     refine ⟨?_, ?_, ?_, ?_⟩
     · show evalReifyFnPointer locals op rawMutU32MirTy mem decls emptyLayoutTable "ArrayToPointer" = _
-      unfold evalReifyFnPointer; simp only [h1, h2, h3, hL8, hOp, hTy, hArrOk, hB, Nat.beq_refl]
-    · intro hDis; unfold deriveStackElemThinPtr; simp [hDis]
+      unfold evalReifyFnPointer; rw [h1]; dsimp only []; rw [h2]; dsimp only []; rw [h3]; dsimp only []; simp (config := { zeta := false, zetaDelta := false }) only [hL8, hOp, hTy, hArrOk, hB, Nat.beq_refl]
+    · intro hDis; unfold deriveStackElemThinPtr; rw [hDis]
     · intro v0 v1 hLive hDepth hSlot
       have hAct : activeFrameSlot? locals' mem.callStack parentEntry.targetFrameDepth parentEntry.targetLocal =
           some (.init (.aggregate 0 [.scalar ⟨v0, 4⟩, .scalar ⟨v1, 4⟩])) := by
         cases hCs : mem.callStack <;> simp [activeFrameSlot?, hDepth, hCs, Nat.beq_refl, hSlot]
+      have hBack : readSliceBackingAggregate? locals' (.aggregate 0 [.scalar ⟨v0, 4⟩, .scalar ⟨v1, 4⟩]) [] 2 =
+          some ([], 0, [.scalar ⟨v0, 4⟩, .scalar ⟨v1, 4⟩]) := rfl
       have hStr : inferElemListByteStride [.scalar ⟨v0, 4⟩, .scalar ⟨v1, 4⟩] = 4 := rfl
+      have hLen2 : Trusted.Sequence.length ([MirSemantics.Value.scalar ⟨v0, 4⟩, .scalar ⟨v1, 4⟩]) = 2 := rfl
       refine ⟨?_, ?_, ?_⟩
       · intro hProj hOff; unfold deriveStackElemThinPtr
         cases hP : parentEntry.perm with
         | disabled => exact absurd hP hLive
-        | _ =>
-          simp only [hProj, hOff, hAct, stripTransparentProjections, normalizeSubsliceProjections,
-            readSliceBackingAggregate?, hStr, byteOffsetToElemIdx?, endsWithSubslice, Nat.add_zero, Nat.zero_add, Nat.ble, Nat.beq_refl]; rfl
+        | _ => rw [hAct]; dsimp only []; rw [hProj, hOff]; rfl
       · intro hProj hOff; unfold deriveStackElemThinPtr
-        cases hP : parentEntry.perm with | disabled => exact absurd hP hLive | _ => simp only [hProj, hOff, hAct]; rfl
-      · intro hProj hNe
-        have hBack : readSliceBackingAggregate? locals' (.aggregate 0 [.scalar ⟨v0, 4⟩, .scalar ⟨v1, 4⟩]) [] 2 =
-            some ([], 0, [.scalar ⟨v0, 4⟩, .scalar ⟨v1, 4⟩]) := rfl
-        have hLen2 : Trusted.Sequence.length ([MirSemantics.Value.scalar ⟨v0, 4⟩, .scalar ⟨v1, 4⟩]) = 2 := rfl
-        unfold deriveStackElemThinPtr
+        cases hP : parentEntry.perm with
+        | disabled => exact absurd hP hLive
+        | _ => rw [hAct]; dsimp only []; rw [hProj, hOff]; rfl
+      · intro hProj hNe; unfold deriveStackElemThinPtr
         cases hP : parentEntry.perm with
         | disabled => exact absurd hP hLive
         | _ =>
-          simp only [hProj, hAct, stripTransparentProjections, normalizeSubsliceProjections, hBack, hStr]
+          rw [hAct]; dsimp only []; rw [hProj]
+          dsimp only [stripTransparentProjections, normalizeSubsliceProjections]
+          rw [hBack]; dsimp only []; rw [hStr]
           cases hIdx : byteOffsetToElemIdx? p.offsetBytes 4 with
           | none => rfl
           | some k =>
             have hk := byteOffsetToElemIdx?_pos_of_ne_zero p.offsetBytes 4 k hNe hIdx
             have hBle : Nat.ble (Nat.add (Nat.add k 0) 2) 2 = false := by
               cases k with | zero => exact absurd hk (by decide) | succ _ => rfl
-            simp only [hLen2, hBle]
+            dsimp only []; rw [hLen2, hBle]
     · intro hLive hDepth hBadSlot; unfold deriveStackElemThinPtr
       cases hP : parentEntry.perm with
       | disabled => exact absurd hP hLive
@@ -2913,16 +2960,16 @@ theorem arrayToPointer_global_stack_scalar_and_ub (locals locals' : List LocalSl
         rcases hBadSlot with hU | hD
         · have hAct : activeFrameSlot? locals' mem.callStack parentEntry.targetFrameDepth parentEntry.targetLocal = some .uninit := by
             cases hCs : mem.callStack <;> simp [activeFrameSlot?, hDepth, hCs, Nat.beq_refl, hU]
-          simp only [hAct]
+          rw [hAct]
         · have hAct : activeFrameSlot? locals' mem.callStack parentEntry.targetFrameDepth parentEntry.targetLocal = some .dead := by
             cases hCs : mem.callStack <;> simp [activeFrameSlot?, hDepth, hCs, Nat.beq_refl, hD]
-          simp only [hAct]
+          rw [hAct]
   · intro hOp hTy
     show evalReifyFnPointer locals op rawMutU32MirTy mem decls emptyLayoutTable "ArrayToPointer" = _
-    unfold evalReifyFnPointer; simp only [h1, h2, h3, hL8, hOp, hTy, hArrOk, Nat.beq_refl]
+    unfold evalReifyFnPointer; rw [h1]; dsimp only []; rw [h2]; dsimp only []; rw [h3]; dsimp only []; simp (config := { zeta := false, zetaDelta := false }) only [hL8, hOp, hTy, hArrOk, Nat.beq_refl]
   · intro hOp hTy
     show evalReifyFnPointer locals op rawMutU32MirTy mem decls emptyLayoutTable "ArrayToPointer" = .ub
-    unfold evalReifyFnPointer; simp only [h1, h2, h3, hL8, hOp, hTy, hArrBad, Nat.beq_refl]
+    unfold evalReifyFnPointer; rw [h1]; dsimp only []; rw [h2]; dsimp only []; rw [h3]; dsimp only []; simp (config := { zeta := false, zetaDelta := false }) only [hL8, hOp, hTy, hArrBad, Nat.beq_refl]
 
 /-! ### C8 Concrete End-to-End Witnesses covering ALL 5 Coercion Kinds
 (`Mach` & `MachTB`) -/
@@ -2963,7 +3010,7 @@ theorem c8_all_five_pointer_coercions_three_way_witness : runAVal c8AllFiveMir 1
       ([3, 4, 5, 2].map (fun i => m7.mem.memory.mem.allocations[i]?.map (fun a => a.data.map projByteTB))) =
       [some ((ptrBytes 4096 (some (⟨0⟩, ()))).map (projByteTB ∘ liftByteTB)), some ((ptrBytes 8192 (some (⟨1⟩, ()))).map (projByteTB ∘ liftByteTB)),
        some ((ptrBytes 4096 (some (⟨0⟩, ()))).map (projByteTB ∘ liftByteTB)), some ((ptrBytes 640 (some (⟨6⟩, ()))).map (projByteTB ∘ liftByteTB))]) :=
-  ⟨rfl, ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel)⟩
+  ⟨eq_some_ptr_of_valAsPtr (by decide +kernel), ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel)⟩
 /-- Concrete C8 stack-borrow deref (`ArrayToPointer → MutToConstPointer →
 *_ptr`), `C10 → C8.2` `.aggregate 0 []` local closure-to-fn-ptr + cached
 `ReifyFnPointer` idempotence, indirect `Terminator.Call` round-trip / UB,
@@ -3040,7 +3087,7 @@ theorem c8_capturing_closure_wide_and_unknown_tag_witness :
     evalRvalue [.uninit, .init (.ptr { allocId := fnPtrAllocBase, offsetBytes := 0 } 8)] (.cast (.pointerCoercion "UnknownCoercion") (.copy (locPlace 1)) fnPtrUnsafeU32MirTy)
       mem0 [mkDecl fnPtrUnsafeU32MirTy, mkDecl fnPtrSafeU32MirTy] emptyLayoutTable = .unsupported := ⟨⟨rfl, rfl⟩,
    ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
-   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel), rfl,
+   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel), eq_some_scalar_of_valAsScalar (by decide +kernel),
    ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel), rfl, ok_of_map_toOption (by decide +kernel), ok_stepTB_wfLive (by decide +kernel),
    rfl, rfl, rfl, rfl, rfl⟩
 
@@ -3068,13 +3115,13 @@ theorem trusted_unwrapUnsafeBinder_transparent (locals : List LocalSlot) (loc : 
     splitLastDeref? (.unwrapUnsafeBinder innerTy :: rest) = splitLastDeref? rest ∧ splitLastDeref? [.deref, .unwrapUnsafeBinder innerTy] = some [] ∧
     splitLastDeref? [.unwrapUnsafeBinder innerTy, .deref] = some [] ∧ isScalarCompatibleProj (.unwrapUnsafeBinder innerTy :: rest) = isScalarCompatibleProj rest ∧
     stripTransparentProjections (.unwrapUnsafeBinder innerTy :: rest) = stripTransparentProjections rest ∧
-    (get? locals loc = some (.init val) → evalPlaceRead locals ⟨loc, [.unwrapUnsafeBinder innerTy]⟩ borrows globals = .ok val locals ∧
+    (get? locals loc = some (.init val) → valueContainsUninit val = false → evalPlaceRead locals ⟨loc, [.unwrapUnsafeBinder innerTy]⟩ borrows globals = .ok val locals ∧
       writePlaceValue locals borrows ⟨loc, [.unwrapUnsafeBinder innerTy]⟩ newVal = writePlaceValue locals borrows ⟨loc, []⟩ newVal ∧
       evalPlaceRead locals ⟨loc, [.unwrapUnsafeBinder innerTy, .deref]⟩ borrows globals = .unsupported ∧
       writePlaceValue locals borrows ⟨loc, [.unwrapUnsafeBinder innerTy, .deref]⟩ newVal = .unsupported) ∧
     (∀ ptrLoc ptrVal entry callStack, get? locals ptrLoc = some (.init (.ptr ptrVal 8)) →
       lookupBorrow borrows ptrVal.tag = some entry → entry.perm = .active → entry.targetProjection = [] → ptrVal.offsetBytes = 0 →
-      (activeFrameSlot? locals callStack entry.targetFrameDepth entry.targetLocal = some (.init val) →
+      (activeFrameSlot? locals callStack entry.targetFrameDepth entry.targetLocal = some (.init val) → valueContainsUninit val = false →
         writePlaceValue locals borrows ⟨ptrLoc, [.deref, .unwrapUnsafeBinder innerTy]⟩ newVal [] emptyLayoutTable callStack =
           writePlaceValue locals borrows ⟨ptrLoc, [.deref]⟩ newVal [] emptyLayoutTable callStack ∧
         evalPlaceRead locals ⟨ptrLoc, [.deref, .unwrapUnsafeBinder innerTy]⟩ borrows globals emptyLayoutTable [] [] callStack = .ok val locals) ∧
@@ -3087,9 +3134,9 @@ theorem trusted_unwrapUnsafeBinder_transparent (locals : List LocalSlot) (loc : 
       (ptrLoc = 0 → entry.targetLocal = 1 → activeFrameSlot? locals callStack entry.targetFrameDepth 1 = some (.init (.scalar ⟨2, 1⟩)) →
         evalPlaceRead locals ⟨0, [.deref, .unwrapUnsafeBinder boolMirTy]⟩ borrows globals emptyLayoutTable []
           [mkDecl { kind := .rawPtr .not boolMirTy.kind, layoutIdx := 0 }, mkDecl boolMirTy] callStack = .ub)) := by
-  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, ?_, ?_⟩
-  · intro hSlot
-    exact ⟨by unfold evalPlaceRead; dsimp only []; rw [hSlot]; rfl,
+  refine ⟨rfl, rfl, by cases val <;> cases rest <;> rfl, rfl, rfl, rfl, rfl, rfl, ?_, ?_⟩
+  · intro hSlot hValInit
+    exact ⟨by unfold evalPlaceRead; dsimp only []; rw [hSlot]; simp [readProjectedForLocal, readProjectedValue, placeTyResolved, get?, validateValueForTy?, hValInit],
            by unfold writePlaceValue; dsimp only []; rw [hSlot]; rfl,
            by unfold evalPlaceRead; dsimp only []; rw [hSlot]; rfl,
            by unfold writePlaceValue; dsimp only []; rw [hSlot]; rfl⟩
@@ -3100,13 +3147,14 @@ theorem trusted_unwrapUnsafeBinder_transparent (locals : List LocalSlot) (loc : 
     rcases ptrVal with ⟨aid, off⟩; rcases entry with ⟨eTag, tLoc, tProj, ePerm, rOff, rLen, eProt, pTag, tDepth, aDead⟩
     dsimp only [] at hPerm hTProj hOff; subst hPerm; subst hTProj; subst hOff
     refine ⟨?_, ?_, ?_⟩
-    · intro hAct; refine ⟨?_, ?_⟩
+    · intro hAct hValInit; refine ⟨?_, ?_⟩
       · unfold writePlaceValue
         simp only [hPtr, hB, needsThinPtrElemResolution, hAct, writeProjectedValue]
-      · unfold evalPlaceRead evalStackThinPtrTypedDerefRead
-        simp only [hPtr, hB, hAct, placeTyResolved, checkDerefAlign, checkTargetPlaceAlign, inferCallerTargetDecls, resolveStackThinPtrTargetProjWithResidual?,
+      · unfold evalPlaceRead; rw [hPtr]; dsimp only []; rw [hB]; dsimp only []; rw [hAct]
+        unfold evalStackThinPtrTypedDerefRead
+        simp only [placeTyResolved, checkDerefAlign, checkTargetPlaceAlign, inferCallerTargetDecls, resolveStackThinPtrTargetProjWithResidual?,
           startsWithArrayOrSliceProj, projHasSubslice, placeTouchesUnion, tyProjTouchesUnion, hUnion, resolveTyWithLocalDecls,
-          readProjectedForLocal, readProjectedValue, stripTransparentProjections, hNil]; rfl
+          readProjectedForLocal, readProjectedValue, stripTransparentProjections, hNil, hValInit]; rfl
     · intro bits newBits locals' hPL hTL hDepth hSlot1 hSet1
       dsimp only [] at hTL hDepth; subst hPL; subst hTL; subst hDepth
       have hAct : activeFrameSlot? locals callStack (length callStack) 1 = some (.init (.scalar ⟨bits, 4⟩)) := by
@@ -3117,21 +3165,20 @@ theorem trusted_unwrapUnsafeBinder_transparent (locals : List LocalSlot) (loc : 
             targetFrameDepth := length callStack, allocDead := aDead } = some locals := by
         cases callStack <;> simp [activeFrameTargetLocals?, activeFrameSlot?, Nat.beq_refl, hSlot1]
       refine ⟨?_, ?_, ?_⟩
-      · unfold evalPlaceRead evalStackThinPtrTypedDerefRead
-        simp only [hPtr, hB, hAct]; rfl
+      · unfold evalPlaceRead; rw [hPtr]; dsimp only []; rw [hB]; dsimp only []; rw [hAct]; rfl
       · unfold writePlaceValue
         simp only [hPtr, hB, needsThinPtrElemResolution, hTgt]; unfold writeStackThinPtrTypedDeref; simp only [hSlot1]
         change (match set? locals 1 (.init (.scalar ⟨newBits, 4⟩)) with
           | some l' => PlaceWriteResult.ok l' | none => .ub) = .ok locals'
         rw [hSet1]
       · unfold writePlaceValue
-        simp only [hPtr, hB, needsThinPtrElemResolution, hTgt]; unfold writeStackThinPtrTypedDeref; simp only [hSlot1]
+        simp only [hPtr, hB, needsThinPtrElemResolution, hTgt]; unfold writeStackThinPtrTypedDeref
         have hSpl : spliceScalarSlice? ⟨bits, 4⟩ 0 ⟨newBits, 4⟩ = some ⟨newBits, 4⟩ := rfl
         have hRd : readProjectedForLocal locals [mkDecl rawMutU32MirTy, mkDecl u32MirTy]
             emptyLayoutTable 1 (.scalar ⟨bits, 4⟩) [] = .ok (.scalar ⟨bits, 4⟩) := rfl
-        simp only [hRd, hSpl, hSet1]; rfl
+        simp only [hSlot1, hRd, hSpl, hSet1]; rfl
     · intro hPL hTL hAct
-      dsimp only [] at hTL; subst hPL; subst hTL; unfold evalPlaceRead evalStackThinPtrTypedDerefRead; simp only [hPtr, hB, hAct]; rfl
+      dsimp only [] at hTL; subst hPL; subst hTL; unfold evalPlaceRead; rw [hPtr]; dsimp only []; rw [hB]; dsimp only []; rw [hAct]; rfl
 /-- **C9 MiniRust Polymorphic Field-0 Wrapper Place & `Transmute` Identity
 (`Mach` & `MachTB`)**. -/
 theorem checkValueM_thinRawPtr_of_inBounds {M : Type} [Gen.Memory M] [MemoryOps M]
@@ -3242,7 +3289,7 @@ theorem unwrapUnsafeBinder_uninit_assign_and_move (s : MachineState) (dstLoc : N
       evalStmt s { kind := .assign (locPlace dstLoc (.unwrapUnsafeBinder innerMirTy :: rest)) rv, span := span } decls layouts =
         MirStepNode.fail .ub ∧ Interp.evalStatement mBM (.Assign (.Field base 0) src) = .ok mBMf ∧
       evalStatementM mTB (.Assign (.Field base 0) src) = .ok mTBf ∧ MachTB.wfLive mTBf) ∧
-    (get? locals1 dstLoc = some (.init val) → set? locals1 dstLoc .uninit = some localsUninit →
+    (get? locals1 dstLoc = some (.init val) → valueContainsUninit val = false → set? locals1 dstLoc .uninit = some localsUninit →
       placeTouchesUnion decls layouts (locPlace dstLoc [.unwrapUnsafeBinder innerMirTy]) = false →
       evalOperand locals1 (.copy (locPlace dstLoc [.unwrapUnsafeBinder innerMirTy]))
         mem1.borrows mem1.globals layouts mem1.callerLocals decls mem1.callStack = .ok val locals1 ∧
@@ -3259,10 +3306,10 @@ theorem unwrapUnsafeBinder_uninit_assign_and_move (s : MachineState) (dstLoc : N
       dsimp only [evalStatementM]; rw [hFTB, ok_bind, hvTB, ok_bind]; exact hstTB
     exact ⟨by simp only [evalStmt, hRv, locPlace, hUn, uninitFieldWriteShell?],
            by rw [← evalStatementM_bm_eq]; exact hBM, hTB, evalStatementM_tb_wfLive hwf hTB⟩
-  · intro hInit hSetU hNoU
-    exact ⟨by unfold evalOperand; simp only [locPlace, hInit, hNoU, readProjectedValue],
-           by unfold evalOperand; simp only [locPlace, hInit, hNoU, readProjectedValue],
-           by unfold evalOperand; simp only [locPlace, hInit, hSetU]⟩
+  · intro hInit hValInit hSetU hNoU
+    exact ⟨by unfold evalOperand; simp only [locPlace, hInit, hNoU, readProjectedValue, hValInit],
+           by unfold evalOperand; simp only [locPlace, hInit, hNoU, readProjectedValue, hValInit],
+           by unfold evalOperand; simp only [locPlace, hInit, readProjectedValue, hValInit, hSetU]⟩
 def c9BinderReadWriteMir : MirAst.CapturedMir := mkMirBody "ep2::c9_binder_rw"
     [mkDecl u32MirTy, mkDecl u32MirTy, mkDecl rawMutU32MirTy, mkDecl rawMutU32MirTy, mkDecl rawConstSliceU32MirTy] 1
     [mkBb [mkSt (.storageLive 2), mkSt (.storageLive 3), mkSt (.assign (locPlace 1 [.unwrapUnsafeBinder u32MirTy]) (.use (constU32 55))),
@@ -3321,7 +3368,7 @@ theorem c9_unwrapUnsafeBinder_three_way_len_and_ub_witness :
       { frame := { blockIdx := 0, stmtIdx := 2, locals := [.uninit, .dead, .uninit, .uninit, .uninit] },
         memory := sliceMem } = MirStepNode.fail .ub ∧
     Interp.step (c9BinderMach false) = .error (.ub "access to a dead local") ∧ Interp.stepTB (liftMachToTB (c9BinderMach false)) = .error (.ub "access to a dead local") :=
-  ⟨rfl, ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel), ok_of_map_toOption (by decide +kernel), ok_stepTB_wfLive (by decide +kernel),
+  ⟨eq_some_scalar_of_valAsScalar (by decide +kernel), ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel), ok_of_map_toOption (by decide +kernel), ok_stepTB_wfLive (by decide +kernel),
    rfl, ok_of_map_toOption (by decide +kernel), ok_stepTB_wfLive (by decide +kernel), rfl, rfl, rfl, rfl, rfl,
    eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
 
@@ -3463,6 +3510,7 @@ while OOB field `2` faults on read/`evalPlaceM` (`.ub` vs `specPanic`) and
 auto-extends in `writeProjectedValue`. -/
 theorem closure_cap_field_projection_lockstep_M {M : Type} [Gen.Memory M] [MemoryOps M] (locals : List LocalSlot) (v0 v0' v1 : MirSemantics.Value) (m m1 : Machine M)
     (base : Gen.PlaceExpr) (place : Gen.Place M) (ptr0 ptr8 : ThinPointer (Gen.Memory.Provenance M))
+    (hv0 : valueContainsUninit v0 = false) (hv1 : valueContainsUninit v1 = false)
     (hBase : evalPlaceM m base = .ok ((place, mrClosureCapTy), m1)) (hMeta : place.ptr.metadata = none)
     (hOff0 : ptrOffsetInboundsM m1 place.ptr.thin_pointer 0 = .ok ptr0) (hOff8 : ptrOffsetInboundsM m1 place.ptr.thin_pointer 8 = .ok ptr8) :
     readProjectedValue locals (.aggregate 0 [v0, v1]) [.field 0 u32MirTy] = .ok v0 ∧ readProjectedValue locals (.aggregate 0 [v0, v1]) [.field 1 rawConstU32MirTy] = .ok v1 ∧
@@ -3488,7 +3536,7 @@ theorem closure_cap_field_projection_lockstep_M {M : Type} [Gen.Memory M] [Memor
     have hLe0 : (!decide (({ bytes := 0 } : LibSpecr.Size).bytes ≤ (16 : Nat))) = false := rfl
     rw [hLe0, ite_eq_right_iff.mpr (fun hy : false = true => by cases hy)]
     rw [show ((0 : Nat) : Int) = 0 from rfl, hOff0, ok_bind]; rfl
-  refine ⟨rfl, rfl, rfl, rfl, rfl, hP0, ?_, ?_, fun m2 mf src mv0 hv hst => ?_⟩
+  refine ⟨by simp [readProjectedValue, get?, hv0], by simp [readProjectedValue, get?, hv1], rfl, rfl, rfl, hP0, ?_, ?_, fun m2 mf src mv0 hv hst => ?_⟩
   · unfold evalPlaceM; rw [hBase, ok_bind]; dsimp only [mrClosureCapTy, List.length]
     have hC1 : (0 : Int) ≤ 1 ∧ (1 : Int) < (2 : Nat) := by decide
     have hI1 : listIndex [(({ bytes := 0 } : LibSpecr.Size), u32MrTy), (⟨8⟩, thinRawPtrTy)] 1 "sized_fields[field]" = .ok (⟨8⟩, thinRawPtrTy) := rfl
@@ -3681,7 +3729,7 @@ theorem c10_closure_zst_capture_and_ub_three_way_witness :
     Interp.step (c10CapMach true false) = .error (.ub "load at type but the data in memory violates the language invariant") ∧
     Interp.stepTB (liftMachToTB (c10CapMach true false)) = .error (.ub "load at type but the data in memory violates the language invariant") :=
   ⟨rfl, ok_of_map_toOption (by decide +kernel), ok_stepTB_wfLive (by decide +kernel), rfl, ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
-   rfl, rfl, ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel), rfl,
+   eq_some_scalar_of_valAsScalar (by decide +kernel), eq_some_scalar_of_valAsScalar (by decide +kernel), ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel), rfl,
    eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel),
    rfl, eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
 

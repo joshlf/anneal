@@ -369,6 +369,16 @@ theorem lm23_validEnumLayout :
           | _ + 2, _ => omega
           | _, _ + 2 => omega
       | _ + 3 => omega
+  raw_shapes_ok := by
+    intro tl rawTag rawShapes hlook hvars v hv
+    have htl : tl = lm23EnumLayout := Option.some.inj hlook.symm
+    subst htl
+    injection hvars with _ _ hs
+    subst hs
+    have hv' : v < 3 := hv
+    match v with
+    | 0 | 1 | 2 => exact Or.inl ⟨_, _, rfl⟩
+    | _ + 3 => omega
 
 theorem lm23_env_valid :
     ∀ ty tb vs, lm23Env ty = some (tb, vs) →
@@ -1448,13 +1458,13 @@ def lm23Bb14S1 : MachineState :=
 
 def lm23Bb14S2 : MachineState :=
   { frame := { blockIdx := 14, stmtIdx := 2,
-               locals := [.uninit, .init (.aggregate 2 [.scalar ⟨42, 4⟩]),
+               locals := [.uninit, .init (.aggregate 2 [.scalar ⟨42, 4⟩, .uninit]),
                           .uninit, .uninit, .dead] }
     memory := (initMachineState lm23Body []).memory }
 
 def lm23Bb14S3 : MachineState :=
   { frame := { blockIdx := 14, stmtIdx := 3,
-               locals := [.uninit, .init (.aggregate 2 [.scalar ⟨42, 4⟩]),
+               locals := [.uninit, .init (.aggregate 2 [.scalar ⟨42, 4⟩, .uninit]),
                           .uninit, .init (.scalar ⟨42, 4⟩), .dead] }
     memory := (initMachineState lm23Body []).memory }
 
@@ -1500,7 +1510,7 @@ theorem wit_lm2_3_upcast_setDiscriminant_read_and_trailing_ub :
       have hi' : i < 2 := hi
       match i with
       | 0 => exact Or.inl ⟨by decide +revert, rfl⟩
-      | 1 => exact Or.inr ⟨rfl, 8, by decide +revert, by decide +revert, hu₁⟩
+      | 1 => exact Or.inr ⟨Or.inl rfl, 8, by decide +revert, by decide +revert, hu₁⟩
       | _ + 2 => omega)
   rw [lm23_bb14_a2] at hrel₂
   obtain ⟨m₂, hm₂, hst₂⟩ := stepRelLM2_3_inv_step hrel₂
@@ -1587,7 +1597,7 @@ def lm23Bb15S1 : MachineState :=
 
 def lm23Bb15S2 : MachineState :=
   { frame := { blockIdx := 15, stmtIdx := 2,
-               locals := [.uninit, .init (.aggregate 2 [.scalar ⟨42, 4⟩]),
+               locals := [.uninit, .init (.aggregate 2 [.scalar ⟨42, 4⟩, .uninit]),
                           .uninit, .uninit, .dead] }
     memory := (initMachineState lm23Body []).memory }
 
@@ -1697,7 +1707,7 @@ theorem wit_lm2_3_upcast_field_write_move_and_storage_lifecycle :
       have hi' : i < 2 := hi
       match i with
       | 0 => exact Or.inl ⟨by decide +revert, rfl⟩
-      | 1 => exact Or.inr ⟨rfl, 8, by decide +revert, by decide +revert, hu₁⟩
+      | 1 => exact Or.inr ⟨Or.inl rfl, 8, by decide +revert, by decide +revert, hu₁⟩
       | _ + 2 => omega)
   rw [lm23_bb15_a2] at hrel₂
   obtain ⟨m₂, hm₂, hst₂⟩ := stepRelLM2_3_inv_step hrel₂
@@ -1708,7 +1718,7 @@ theorem wit_lm2_3_upcast_field_write_move_and_storage_lifecycle :
     hst₂ lm23_phase lm23_env_valid rfl rfl rfl
     (dstDecl := lm23Decl lm23EnumTy) rfl rfl (by decide) (by decide) rfl
     (fun tf _ => lm23_constU64_wt 99 (by decide) tf)
-    (Or.inr ⟨[.scalar ⟨42, 4⟩], rfl, by decide⟩)
+    (Or.inr ⟨[.scalar ⟨42, 4⟩, .uninit], rfl, by decide⟩)
   dsimp only at hsim₃
   rcases hsim₃ with ⟨hrel₃, hpost₃⟩
   rw [lm23_bb15_a3] at hrel₃
@@ -2788,12 +2798,12 @@ def lm23SetDiscrRTInitMiri : AnnealStepState :=
 
 def lm23SetDiscrRTS1 : MachineState :=
   { frame := { blockIdx := 0, stmtIdx := 1,
-               locals := [.uninit, .init (.aggregate 1 .nil), .uninit, .uninit, .dead] }
+               locals := [.uninit, .init (.aggregate 1 [.uninit]), .uninit, .uninit, .dead] }
     memory := (initMachineState lm23Body []).memory }
 
 def lm23SetDiscrRTS2 : MachineState :=
   { frame := { blockIdx := 0, stmtIdx := 2,
-               locals := [.uninit, .init (.aggregate 1 .nil),
+               locals := [.uninit, .init (.aggregate 1 [.uninit]),
                           .init (.scalar ⟨1, 8⟩), .uninit, .dead] }
     memory := (initMachineState lm23Body []).memory }
 

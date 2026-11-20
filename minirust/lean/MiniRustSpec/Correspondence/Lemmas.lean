@@ -3026,6 +3026,36 @@ theorem TupleSpec.fieldsValOk_set {fields : List (Nat × TupleSpec)} {vals : Lis
         simp at hf
         simp [TupleSpec.fieldsValOk, hok.1, ih hok.2 hf]
 
+mutual
+theorem TupleSpec.valueContainsUninit_of_valOk :
+    ∀ {s : TupleSpec} {v : Value}, s.valOk v = true → MirSemantics.valueContainsUninit v = false
+  | .scalar _, .scalar _, _ => rfl
+  | .scalar _, .ptr _ _, h => by simp [TupleSpec.valOk] at h
+  | .scalar _, .aggregate _ _, h => by simp [TupleSpec.valOk] at h
+  | .scalar _, .unit, h => by simp [TupleSpec.valOk] at h
+  | .scalar _, .uninit, h => by simp [TupleSpec.valOk] at h
+  | .tuple _ _ _, .scalar _, h => by simp [TupleSpec.valOk] at h
+  | .tuple _ _ _, .ptr _ _, h => by simp [TupleSpec.valOk] at h
+  | .tuple fields _ _, .aggregate 0 vals, h => by
+    simp only [TupleSpec.valOk, Bool.and_eq_true] at h
+    exact TupleSpec.valueListContainsUninit_of_fieldsValOk h.2
+  | .tuple _ _ _, .aggregate (_ + 1) _, h => by simp [TupleSpec.valOk] at h
+  | .tuple _ _ _, .unit, h => by simp [TupleSpec.valOk] at h
+  | .tuple _ _ _, .uninit, h => by simp [TupleSpec.valOk] at h
+
+theorem TupleSpec.valueListContainsUninit_of_fieldsValOk :
+    ∀ {fields : List (Nat × TupleSpec)} {vals : List Value},
+      TupleSpec.fieldsValOk fields vals = true → MirSemantics.valueListContainsUninit vals = false
+  | [], [], _ => rfl
+  | [], _ :: _, h => by simp [TupleSpec.fieldsValOk] at h
+  | _ :: _, [], h => by simp [TupleSpec.fieldsValOk] at h
+  | (_, _) :: _, _ :: _, h => by
+    simp only [TupleSpec.fieldsValOk, Bool.and_eq_true] at h
+    simp [MirSemantics.valueListContainsUninit,
+      TupleSpec.valueContainsUninit_of_valOk h.1,
+      TupleSpec.valueListContainsUninit_of_fieldsValOk h.2]
+end
+
 theorem TupleSpec.fieldsWf_getElem? {size align : Nat} {fields : List (Nat × TupleSpec)}
     (hwf : TupleSpec.fieldsWf size align fields = true) {idx off : Nat} {fSpec : TupleSpec}
     (hf : fields[idx]? = some (off, fSpec)) :
@@ -3044,6 +3074,37 @@ theorem TupleSpec.fieldsWf_getElem? {size align : Nat} {fields : List (Nat × Tu
     | succ j =>
       simp at hf
       exact ih hrest hf
+
+theorem TupleSpec.fieldsWf_disjoint {size align : Nat} {fields : List (Nat × TupleSpec)}
+    (hwf : TupleSpec.fieldsWf size align fields = true)
+    {idx₁ idx₂ off₁ off₂ : Nat} {s₁ s₂ : TupleSpec}
+    (hf₁ : fields[idx₁]? = some (off₁, s₁))
+    (hf₂ : fields[idx₂]? = some (off₂, s₂))
+    (hne : idx₁ ≠ idx₂) :
+    off₁ + s₁.size ≤ off₂ ∨ off₂ + s₂.size ≤ off₁ := by
+  induction fields generalizing idx₁ idx₂ with
+  | nil => simp at hf₁
+  | cons p rest ih =>
+    obtain ⟨off0, s0⟩ := p
+    simp only [TupleSpec.fieldsWf, Bool.and_eq_true, decide_eq_true_eq, List.all_eq_true] at hwf
+    rcases hwf with ⟨⟨_, hdisj⟩, hrest⟩
+    cases idx₁ with
+    | zero =>
+      cases idx₂ with
+      | zero => exact absurd rfl hne
+      | succ j₂ =>
+        simp at hf₁ hf₂
+        rcases hf₁ with ⟨rfl, rfl⟩
+        exact hdisj (off₂, s₂) (List.mem_of_getElem? hf₂)
+    | succ j₁ =>
+      cases idx₂ with
+      | zero =>
+        simp at hf₁ hf₂
+        rcases hf₂ with ⟨rfl, rfl⟩
+        exact (hdisj (off₁, s₁) (List.mem_of_getElem? hf₁)).symm
+      | succ j₂ =>
+        simp at hf₁ hf₂
+        exact ih hrest hf₁ hf₂ (fun h => hne (congrArg Nat.succ h))
 
 /-- Traverse a chain of `.field` projections on an Anneal `Value`. -/
 def readFieldPath : Value → List ProjectionElem → Option Value
@@ -3124,7 +3185,8 @@ theorem resolveFieldPath_read {layouts : Layout.LayoutTable} {rootSpec leafSpec 
     simp [resolveFieldPath] at hres
     rcases hres with ⟨rfl, rfl⟩
     have hlen := TupleSpec.encodeVal_length rootSpec rootVal hwf
-    refine ⟨rootVal, rfl, hval, ?_, fun _ => rfl⟩
+    refine ⟨rootVal, rfl, hval, ?_,
+      fun _ => by simp [MirSemantics.readProjectedValue, TupleSpec.valueContainsUninit_of_valOk hval]⟩
     rw [List.drop_zero, ← hlen, List.take_length]
   | cons p rest ih =>
     cases rootSpec with
@@ -3175,6 +3237,14 @@ theorem resolveFieldPath_read {layouts : Layout.LayoutTable} {rootSpec leafSpec 
                 | _ => simp [TupleSpec.valOk] at hval
             · simp [heq] at hres
       | _ => simp [resolveFieldPath] at hres
+
+@[simp] theorem setOrExtendFields_of_lt :
+    ∀ (vals : List Value) (idx : Nat) (v : Value),
+      idx < vals.length → MirSemantics.setOrExtendFields vals idx v = vals.set idx v
+  | _ :: _, 0, _, _ => rfl
+  | _ :: xs, n + 1, v, h => by
+    simp only [List.length_cons] at h
+    simp [MirSemantics.setOrExtendFields, setOrExtendFields_of_lt xs n v (by omega)]
 
 theorem resolveFieldPath_write {layouts : Layout.LayoutTable} {rootSpec leafSpec : TupleSpec}
     {projs : List ProjectionElem} {totalOff : Nat} {rootVal newLeafVal : Value}

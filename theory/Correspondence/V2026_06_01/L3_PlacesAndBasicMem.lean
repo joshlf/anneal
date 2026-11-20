@@ -64,11 +64,15 @@ export MiniRust.Snapshots.S2026_05_Matched.Generated.Ops (
 /--
 **Theorem L3.1 (`mir_readProjectedValue_nil`)**:
 For EVERY local slot environment `locals : List LocalSlot` and EVERY value `v : Value`,
-Anneal's `readProjectedValue locals v []` returns `.ok v`.
+Anneal's `readProjectedValue locals v []` returns `.ok v` when `valueContainsUninit v = false`
+and faults with `.ub` when `valueContainsUninit v = true`.
 -/
 theorem mir_readProjectedValue_nil (locals : List LocalSlot) (v : Value) :
-    readProjectedValue locals v .nil = .ok v :=
-  rfl
+    (valueContainsUninit v = false → readProjectedValue locals v .nil = .ok v) ∧
+    (valueContainsUninit v = true → readProjectedValue locals v .nil = .ub) := by
+  constructor
+  · intro hInit; simp [readProjectedValue, hInit]
+  · intro hUninit; simp [readProjectedValue, hUninit]
 
 /--
 **Theorem L3.2 (`mir_writeProjectedValue_nil`)**:
@@ -130,7 +134,7 @@ theorem mir_writeProjectedValue_field_aggregate
       writeProjectedValue locals (.aggregate vIdx fields) (.field idx ty :: rest) newVal =
         .ok (.aggregate vIdx fields')) ∧
     (get? fields idx = none →
-      writeProjectedValue locals .unit rest newVal = .ok updatedFieldVal →
+      writeProjectedValue locals .uninit rest newVal = .ok updatedFieldVal →
       writeProjectedValue locals (.aggregate vIdx fields) (.field idx ty :: rest) newVal =
         .ok (.aggregate vIdx (setOrExtendFields fields idx updatedFieldVal))) := by
   constructor
@@ -147,7 +151,8 @@ tag resolves to a live (`.active`, `.reserved`, or `.frozen`) `BorrowEntry` targ
 local 1 returns `.ok targetVal locals`, whereas a `.disabled` borrow entry returns `.ub`.
 -/
 theorem mir_readPlace_deref_live_borrow
-    (tag : Nat) (targetVal : Value) :
+    (tag : Nat) (targetVal : Value)
+    (hInit : valueContainsUninit targetVal = false := by rfl) :
     let ptrVal : Value := .ptr { allocId := tag, offsetBytes := 0 } 8
     let locals : List LocalSlot := [.init ptrVal, .init targetVal]
     let activeEntry : BorrowEntry := {
@@ -166,7 +171,8 @@ theorem mir_readPlace_deref_live_borrow
       .ok targetVal locals ∧
     evalOperand locals (.copy { local_ := 0, projection := [.deref] }) [disabledEntry] = .ub := by
   constructor <;>
-    simp [evalOperand, lookupBorrow, get?, ProvenancePtr.tag, Nat.beq_refl, readProjectedValue]
+    simp [evalOperand, lookupBorrow, get?, ProvenancePtr.tag, Nat.beq_refl, readProjectedValue,
+      hInit]
 
 /--
 **Theorem L3.7 (`mir_writePlace_deref_disabled_and_frozen_is_ub`)**:
@@ -385,7 +391,8 @@ with `ProjReadResult.ok elemVal`.
 -/
 theorem mir_dynamic_index_borrow_after_storage_dead_corresponds
     (elems : List Value) (idxSc : ScalarVal) (elemVal : Value) (mem : Memory)
-    (h_in : get? elems idxSc.bits = some elemVal) :
+    (h_in : get? elems idxSc.bits = some elemVal)
+    (hInit : valueContainsUninit elemVal = false := by rfl) :
     let arrVal := Value.aggregate 0 elems
     let localsAtBorrow : List LocalSlot := [.init arrVal, .init (.scalar idxSc)]
     let expectedEntry : BorrowEntry := {
@@ -404,7 +411,7 @@ theorem mir_dynamic_index_borrow_after_storage_dead_corresponds
   · rfl
   · have h_ble0 : Nat.ble 0 (length elems) = true :=
       Nat.ble_eq.mpr (Nat.zero_le (length elems))
-    simp [readProjectedValue, h_ble0, h_in]
+    simp [readProjectedValue, h_ble0, h_in, hInit]
 
 /-! ## 2. MiniRust `BasicMemory` State Machine (`Generated.Ops`) & Algebraic Bisection -/
 
@@ -691,10 +698,10 @@ theorem mir_rvalue_len_array_and_slice_corresponds
       .ub := by
   refine ⟨rfl, ?_, ?_, rfl⟩
   · simp [evalRvalue, evalPlaceLen, placeTy, resolveProjectedTy,
-      layoutPointerBytes, evalPlaceRead, get?,
+      layoutPointerBytes, evalPlaceRead, readProjectedValue, get?,
       h_no_borrow, h_no_global, h_nonnull]
   · simp [evalRvalue, evalPlaceLen, placeTy, resolveProjectedTy,
-      evalPlaceRead, get?, lookupBorrow]
+      evalPlaceRead, readProjectedValue, get?, lookupBorrow]
 
 /--
 **Theorem L3.19 (`mir_evalConstValue_and_global_deref_read_corresponds`)**:
@@ -842,9 +849,12 @@ theorem mir_binop_offset_signed_scaled_and_bounds_corresponds
 **Theorem L3.21 (`mir_structural_completeness_brief_1_4_corresponds`)**:
 Universal characterization of the `BRIEF-1.4` structural completeness constructs:
 1. `StatementKind.backwardIncompatibleDropHint` steps as a no-op advancing `stmtIdx`;
-2. `ProjectionElem.unwrapUnsafeBinder` and `Rvalue.wrapUnsafeBinder` act as
-   transparent value identities in `readProjectedValue`, `writeProjectedValue`,
-   and `evalRvalue`;
+2. `ProjectionElem.unwrapUnsafeBinder` acts as a transparent value identity in
+   `readProjectedValue` and `writeProjectedValue`, and `Rvalue.wrapUnsafeBinder`
+   evaluates exactly like `Rvalue.use` when the binder type is neither a
+   single-field binder struct (`binderStructLayout? = none`) nor resolved to a
+   layout whose scalar validity range must be checked (`resolvedTyLayout? = none`;
+   see `evalWrapUnsafeBinder` for the other cases);
 3. `writeProjectedValue` on `ProjectionElem.subslice` splices in-bounds subslice
    aggregates and faults with `.ub` on length mismatch or out-of-bounds indices;
 4. `evalRvalue` evaluates `AggregateKind.closure` to `Value.aggregate 0 vals`;
@@ -858,12 +868,15 @@ theorem mir_structural_completeness_brief_1_4_corresponds
     (op : Operand) (mem : Memory) (localDecls : List LocalDecl)
     (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
     (closureDefPath : DefPath) (ops : List Operand)
-    (sc : ScalarVal) (ptrVal : ProvenancePtr) (ptrSz : Nat) :
+    (sc : ScalarVal) (ptrVal : ProvenancePtr) (ptrSz : Nat)
+    (hBinder : binderStructLayout? localDecls layouts binderTy = none)
+    (hRange : resolvedTyLayout? localDecls layouts binderTy = none) :
     let p0 : Place := { local_ := 0, projection := .nil }
     -- 1. StatementKind.backwardIncompatibleDropHint steps as a no-op
     evalStmt s { kind := .backwardIncompatibleDropHint dropPlace, span := span } =
       MirStepNode.step (advanceStmt s s.frame.locals) ∧
-    -- 2. ProjectionElem.unwrapUnsafeBinder and Rvalue.wrapUnsafeBinder are transparent identities
+    -- 2. ProjectionElem.unwrapUnsafeBinder is a transparent identity; Rvalue.wrapUnsafeBinder
+    -- into a transparent binder type evaluates like Rvalue.use
     readProjectedValue locals v (.unwrapUnsafeBinder binderTy :: rest) =
       readProjectedValue locals v rest ∧
     writeProjectedValue locals v (.unwrapUnsafeBinder binderTy :: rest) newVal =
@@ -891,7 +904,14 @@ theorem mir_structural_completeness_brief_1_4_corresponds
       .ok (.scalar ⟨0, 8⟩) [.init (.scalar sc)] mem ∧
     evalRvalue [.init (.ptr ptrVal ptrSz)] (.discriminant p0) mem localDecls layouts =
       .ok (.scalar ⟨0, 8⟩) [.init (.ptr ptrVal ptrSz)] mem := by
-  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  have hWrap : evalRvalue locals (.wrapUnsafeBinder op binderTy) mem localDecls layouts =
+      evalRvalue locals (.use op) mem localDecls layouts := by
+    show evalWrapUnsafeBinder locals op binderTy mem localDecls layouts =
+      evalUseRvalue locals op mem localDecls layouts
+    unfold evalWrapUnsafeBinder
+    rw [hBinder, hRange]
+    cases evalUseRvalue locals op mem localDecls layouts <;> rfl
+  exact ⟨rfl, rfl, rfl, hWrap, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /--
 **Theorem L3.22 (`mir_slice_fat_ptr_write_reborrow_retag_and_edge_cases_corresponds`)**:
@@ -911,7 +931,10 @@ Universal characterization of `B1` hardening for `BRIEF-1.4`:
    (`allocId = 0`) while rejecting non-zero offsets on unbacked pointers with `.none`.
 -/
 theorem mir_slice_fat_ptr_write_reborrow_retag_and_edge_cases_corresponds
-    (v0 v1 v2 w1 : Value) (binderTy : Ty) :
+    (v0 v1 v2 w1 : Value) (binderTy : Ty)
+    (hv0 : valueContainsUninit v0 = false := by rfl)
+    (hv1 : valueContainsUninit v1 = false := by rfl)
+    (hv2 : valueContainsUninit v2 = false := by rfl) :
     let alloc2 : CapturedAllocation := {
       allocId := 7
       bytes := [.some 10, .some 20]
@@ -961,7 +984,29 @@ theorem mir_slice_fat_ptr_write_reborrow_retag_and_edge_cases_corresponds
     evalBinOpOffset { allocId := 0, offsetBytes := 4 } 8 ⟨0, 8⟩ 4 (.some 0) =
       .some { allocId := 0, offsetBytes := 4 } ∧
     evalBinOpOffset { allocId := 0, offsetBytes := 4 } 8 ⟨1, 8⟩ 4 (.some 0) = .none := by
-  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  have hval : valueContainsUninit (.aggregate 0 [v0, v1, v2]) = false := by
+    simp [valueContainsUninit, valueListContainsUninit, hv0, hv1, hv2]
+  refine ⟨rfl, rfl, rfl, ?_, ?_, ?_, ?_, rfl, rfl, rfl, rfl⟩
+  · (conv => lhs; whnf)
+    simp only [writeSliceFatPtrTargetValue, readSliceBackingAggregate?,
+      normalizeSubsliceProjections, stripTransparentProjections,
+      splitLastConstantIndex?, readProjectedValue, hval]
+    rfl
+  · (conv => lhs; whnf)
+    simp only [writeSliceFatPtrTargetValue, readSliceBackingAggregate?,
+      normalizeSubsliceProjections, stripTransparentProjections,
+      splitLastConstantIndex?, readProjectedValue, hval]
+    rfl
+  · (conv => lhs; whnf)
+    simp only [readSliceBackingAggregate?,
+      normalizeSubsliceProjections, stripTransparentProjections,
+      splitLastConstantIndex?, readProjectedValue, hval]
+    rfl
+  · (conv => lhs; whnf)
+    simp only [readSliceBackingAggregate?,
+      normalizeSubsliceProjections, stripTransparentProjections,
+      splitLastConstantIndex?, readProjectedValue, hval]
+    rfl
 
 /--
 **Theorem L3.23 (`mir_subslice_disjoint_overlap_offset_borrow_and_unsize_mut_corresponds`)**:
@@ -2326,7 +2371,7 @@ theorem mir_diff_ab_captured_findings_reproduction_confirmed :
     probeExecBounded 256 diffAbFinding0001Body
       (.running (initMachineState diffAbFinding0001Body [])) =
       (.ub, "src/lib.rs:773:42: 773:69") := by
-  exact ⟨rfl, rfl, rfl⟩
+  decide +kernel
 
 end DiffAbCrossFieldAndOnePastEnd
 

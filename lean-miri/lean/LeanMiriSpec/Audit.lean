@@ -112,9 +112,9 @@ weakened theorem keeps its name:
   upgrades (`w3_deref_oob_ub`, `w3_deref_misaligned_ub`,
   `w4_invalid_bool_ref_read_ub`) and the Stage-1 boundary and divergence
   witnesses (`w1_tail_call_class_divergence`, `anneal_extCall_boundary`,
-  `w6_rotate_left_extCall_boundary`, `w6_write_bytes_extCall_boundary`,
-  `w6_write_bytes_oob_extCall_divergence`,
-  `w6_write_bytes_read_extCall_divergence`).
+  `w6_rotate_left_extCall_boundary`) and the inline `write_bytes` agreements
+  (`w6_write_bytes_inline_lockstep`, `w6_write_bytes_oob_ub`,
+  `w6_write_bytes_read_returns`).
 -/
 
 namespace LeanMiriSpec.Audit
@@ -16102,7 +16102,7 @@ example :
           ∀ i (hi : i < (variants[variantIdx]'hv_lt).length),
             (∃ (hi_act : i < (variants[v_act]'hv_act).length),
               (variants[variantIdx]'hv_lt)[i]'hi = (variants[v_act]'hv_act)[i]'hi_act) ∨
-            (get? fieldVals i = none ∧
+            ((get? fieldVals i = none ∨ get? fieldVals i = some .uninit) ∧
               ∃ b,
                 ((variants[variantIdx]'hv_lt)[i]'hi).offset.bytes.toNat ≤ b ∧
                 b < ((variants[variantIdx]'hv_lt)[i]'hi).offset.bytes.toNat +
@@ -16143,9 +16143,11 @@ example :
         stmt.kind = .setDiscriminant ⟨dstIdx, .nil⟩ variantIdx →
         get? body.localDecls dstIdx = some dstDecl →
         env dstDecl.ty = some (tagBytes, variants) →
-        variantIdx < variants.length →
+        (hv_lt : variantIdx < variants.length) →
         get? s.frame.locals dstIdx = some .uninit →
-        let s' := advanceStmt s (s.frame.locals.set dstIdx (.init (.aggregate variantIdx .nil)))
+        let s' := advanceStmt s
+          (s.frame.locals.set dstIdx
+            (.init (.aggregate variantIdx (replicateValue (variants[variantIdx]'hv_lt).length .uninit))))
         stepMirFn body s = .step s' ∧
         StepRelLM2_3 body env allocBudget m
           (stepMirFn body s)
@@ -16177,7 +16179,7 @@ example :
           ∀ i (hi : i < (variants[variantIdx]'hv_lt).length),
             (∃ (hi_act : i < (variants[v_act]'hv_act).length),
               (variants[variantIdx]'hv_lt)[i]'hi = (variants[v_act]'hv_act)[i]'hi_act) ∨
-            (get? fieldVals i = none ∧
+            ((get? fieldVals i = none ∨ get? fieldVals i = some .uninit) ∧
               ∃ b,
                 ((variants[variantIdx]'hv_lt)[i]'hi).offset.bytes.toNat ≤ b ∧
                 b < ((variants[variantIdx]'hv_lt)[i]'hi).offset.bytes.toNat +
@@ -16312,6 +16314,7 @@ example :
         (hj : j < (variants[v_act]'hv_act).length) →
         j < fieldVals.length →
         ((variants[variantIdx]'hv_lt)[fieldIdx]'hf_lt) = ((variants[v_act]'hv_act)[j]'hj) →
+        get? fieldVals j ≠ some .uninit →
         stepMirFn body s = .fail .ub ∧
         ∃ (sc : MirAst.ScalarInt) (m' : AnnealStepState),
           get? fieldVals j = some (.scalar sc) ∧
@@ -16576,6 +16579,9 @@ example :
         dstDecl.ty = srcDecl.ty →
         (get? s.frame.locals srcIdx = some .uninit →
           IsImmediateStepLocal m srcIdx) →
+        (∀ v_act fieldVals,
+          get? s.frame.locals srcIdx = some (.init (.aggregate v_act fieldVals)) →
+            valueListContainsUninit fieldVals = false) →
         let mRes :=
           Miri.Interpreter.Step.step
             (annealStepHooksLM2_3 body.localDecls body.layouts) () m
@@ -16779,6 +16785,9 @@ example :
         env decl.ty = some (tagBytes, variants) →
         (get? s.frame.locals idx = some .uninit →
           IsImmediateStepLocal m idx) →
+        (∀ v_act fieldVals,
+          get? s.frame.locals idx = some (.init (.aggregate v_act fieldVals)) →
+            valueListContainsUninit fieldVals = false) →
         let mRes :=
           Miri.Interpreter.Step.step
             (annealStepHooksLM2_3 body.localDecls body.layouts) () m
@@ -16898,6 +16907,7 @@ example :
         get? body.localDecls idx = some decl →
         env decl.ty = some (tagBytes, variants) →
         get? s.frame.locals idx = some (.init rootVal) →
+        valueContainsUninit rootVal = false →
         stepMirFn body s =
           MirStepNode.step
             (advanceStmt s (s.frame.locals.set idx (.init rootVal)) s.memory) ∧
@@ -17015,6 +17025,9 @@ example :
         env decl0.ty = some (tagBytes, variants) →
         (get? s.frame.locals 0 = some .uninit →
           IsImmediateStepLocal m 0) →
+        (∀ v_act fieldVals,
+          get? s.frame.locals 0 = some (.init (.aggregate v_act fieldVals)) →
+            valueListContainsUninit fieldVals = false) →
         StepRelEnumReturnLM2_3 body env m
           (stepMirFn body s)
           (Miri.Interpreter.Step.step
@@ -21238,7 +21251,7 @@ open LeanMiriSpec.Correspondence in
   step_terminator_drop_noop_simulation
   canonical_drop_no_glue_preserves_local_divergence
   step_terminator_drop_projected_simulation
-  step_terminator_drop_projected_uninit_divergence
+  step_terminator_drop_projected_init_no_glue_divergence
   step_terminator_drop_canonical_no_glue_step_divergence
   annealControlHooks_returnOperand_cleanup_live_back
   step_terminator_return_root_simulation
@@ -21681,14 +21694,22 @@ example
     (himm : ∀ tf, m.stack.frames.back? = some tf → IsImmediateFrameLocal tf localId)
     (hroot :
       get? s.frame.locals localId = some .dead ∨
-        ∃ sc₁ sc₂,
-          get? s.frame.locals localId = some (.init (.aggregate 0 [.scalar sc₁, .scalar sc₂]))) :
+        get? s.frame.locals localId = some .uninit)
+    (hShell :
+      (uninitContainerFieldShell?
+        (activeMirBody rootBody s).localDecls
+        (activeMirBody rootBody s).layouts
+        (resolveTyWithLocalDecls
+          (activeMirBody rootBody s).localDecls
+          (activeMirBody rootBody s).layouts
+          decl.ty)
+        fieldIdx).isSome = true) :
     StepRelMultiFrame rootBody m
       (stepMirFn rootBody s)
       (Miri.Interpreter.Step.step
         (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s) fnPtrs) () m) :=
   step_terminator_drop_projected_simulation
-    hstate hphase hbb hstmt_none hstmt_len hterm hdecl hfield himm hroot fnPtrs
+    hstate hphase hbb hstmt_none hstmt_len hterm hdecl hfield himm hroot fnPtrs hShell
 
 example
     {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
@@ -21697,7 +21718,7 @@ example
     (hphase : ∀ p, (activeMirBody rootBody s).phase ≠ .other p)
     {bb : BasicBlockData} {localId : Local} {fieldIdx : Nat} {fieldTy : Ty}
     {target : BasicBlockIdx} {unwind : MirAst.UnwindAction}
-    {decl : MirAst.LocalDecl}
+    {decl : MirAst.LocalDecl} {sc₁ sc₂ : MirAst.ScalarInt}
     (hbb : get? (activeMirBody rootBody s).basicBlocks s.frame.blockIdx = some bb)
     (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
     (hstmt_len : s.frame.stmtIdx = length bb.statements)
@@ -21705,17 +21726,27 @@ example
     (hdecl : get? (activeMirBody rootBody s).localDecls localId = some decl)
     (hfield : fieldIdx = 0 ∨ fieldIdx = 1)
     (himm : ∀ tf, m.stack.frames.back? = some tf → IsImmediateFrameLocal tf localId)
-    (huninit : get? s.frame.locals localId = some .uninit) :
-    stepMirFn rootBody s = .fail .ub ∧
-    ∃ m' tf',
+    (hpair : get? s.frame.locals localId = some (.init (.aggregate 0 [.scalar sc₁, .scalar sc₂])))
+    (hNoUnion : placeTouchesUnion (activeMirBody rootBody s).localDecls
+      (activeMirBody rootBody s).layouts ⟨localId, [.field fieldIdx fieldTy]⟩ = false) :
+    let deinitPair : Value :=
+      if fieldIdx = 0 then .aggregate 0 [.uninit, .scalar sc₂]
+      else .aggregate 0 [.scalar sc₁, .uninit]
+    (∃ s',
+      stepMirFn rootBody s = .step s' ∧
+      s'.frame.blockIdx = target ∧
+      get? s'.frame.locals localId = some (.init deinitPair) ∧
+      readProjectedValue s'.frame.locals deinitPair [.field fieldIdx fieldTy] = .ub) ∧
+    ∃ m' tf' msc₁ msc₂ lay,
       Miri.Interpreter.Step.step
         (annealStepHooksLM4_1 (activeMirBody rootBody s) s.memory.callees (annealPoppedFrameState s) fnPtrs) () m =
         (m', .ok true) ∧
       m'.stack.frames.back? = some tf' ∧
       tf'.location = .mir ⟨target, 0⟩ ∧
-      ∃ lay, tf'.locals[localId]? = some ⟨.live (.immediate .uninit), lay⟩ :=
-  step_terminator_drop_projected_uninit_divergence
-    hstate hphase hbb hstmt_none hstmt_len hterm hdecl hfield himm huninit fnPtrs
+      tf'.locals[localId]? =
+        some ⟨.live (.immediate (.scalarPair (.fromScalarInt msc₁) (.fromScalarInt msc₂))), lay⟩ :=
+  step_terminator_drop_projected_init_no_glue_divergence
+    hstate hphase hbb hstmt_none hstmt_len hterm hdecl hfield himm hpair hNoUnion fnPtrs
 
 example
     {rootBody : CapturedMir} {s : MachineState} {m : AnnealStepState}
@@ -23067,8 +23098,8 @@ example :
       stepMirFn b (ptr4AnnealPre b) = .step s₁ ∧
       Miri.Interpreter.Step.step hooks () (ptr4MiriPre b unitK) = (m₁, .ok true) ∧
       StateRelLM3_1 b s₁ m₁ [entry] ∧
-      stepMirFn b s₁ = ptr4Stage1ExtCall "core::intrinsics::write_bytes" u64K s₁
-        [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨1, 8⟩] ∧
+      (∃ sW, stepMirFn b s₁ = .step sW ∧
+        get? sW.frame.locals 1 = some (.init (.scalar ⟨0xABABABABABABABAB, 8⟩))) ∧
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
       ∃ s₂, StateRelLM3_1 b s₂ m₂ [entry] ∧
         get? s₂.frame.locals 1 = some (.init (.scalar ⟨0xABABABABABABABAB, 8⟩)) :=
@@ -23128,8 +23159,7 @@ example :
       stepMirFn b s₂ = .step s₃ ∧
       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
       StateRelLM3_1 b s₃ m₃ [entry] ∧
-      stepMirFn b s₃ = ptr4Stage1ExtCall "core::intrinsics::write_bytes" u8K s₃
-        [.ptr { allocId := 1, offsetBytes := 2 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨2, 8⟩] ∧
+      stepMirFn b s₃ = MirStepNode.unsupported ∧
       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
       (∃ s₄, StateRelLM3_1 b s₄ m₄ [entry] ∧
         get? s₄.frame.locals 1 = some (.init (.scalar ⟨0x00000000ABAB002A, 8⟩))) ∧
@@ -24967,7 +24997,7 @@ open LeanMiriSpec.Correspondence.Safety LeanMiriSpec.Correspondence.MiriDiffWitn
   protReady_rel
   w5_protector_release_returns
   w6_copy_nonoverlapping_disjoint_lockstep
-  w6_write_bytes_extCall_boundary
+  w6_write_bytes_inline_lockstep
   popOutcome
   PtrRetRel
   StepObsRelLM3_1.toLockstep
@@ -24988,11 +25018,11 @@ open LeanMiriSpec.Correspondence.Safety LeanMiriSpec.Correspondence.MiriDiffWitn
   w6_saturating_add_returns
   rotateLeftBody
   w6_rotate_left_extCall_boundary
-  w6_write_bytes_oob_extCall_divergence
+  w6_write_bytes_oob_ub
   retWriteBytesCall_preserves_imm
   retWriteBytesReadBody
   retWriteBytesRead_ref_trace
-  w6_write_bytes_read_extCall_divergence
+  w6_write_bytes_read_returns
   retCopy_copyStep_preserves_imm
   retCopyBody
   retCopy_trace
@@ -25277,59 +25307,39 @@ example :
 open Trusted.ITree LeanMiriSpec.Correspondence.Safety
   LeanMiriSpec.Correspondence.MiriDiffWitnesses in
 example :
-    ∃ m₁ m₂,
+    ∃ m₁ m₂ sW,
       AgreeReaches writeBytesEntryBody (annealMiriHooks writeBytesEntryBody)
         (initMachineState writeBytesEntryBody []) (wbAddrOfState writeBytesEntryBody)
         (miriEntryState writeBytesEntryBody) m₁ ∧
-      stepMirFn writeBytesEntryBody (wbAddrOfState writeBytesEntryBody) =
-        MirStepNode.extCall
-          { defPath := "core::intrinsics::write_bytes", typeArgs := [WitnessLM4_2.u64K]
-            args := [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨0xAB, 1⟩, .scalar ⟨1, 8⟩]
-            memory := (wbAddrOfState writeBytesEntryBody).memory }
-          (resumeExternalCall (wbAddrOfState writeBytesEntryBody)
-            (wbAddrOfState writeBytesEntryBody).frame.locals (WitnessLM4_2.local42 0) 2
-            .unreachable) ∧
+      stepMirFn writeBytesEntryBody (wbAddrOfState writeBytesEntryBody) = .step sW ∧
+      get? sW.frame.locals 1 = some (.init (.scalar ⟨0xABABABABABABABAB, 8⟩)) ∧
+      TreeSafe (mirCallTree writeBytesEntryBody []) ∧
       (∃ tr mem, ReachesRet (mirCallTree writeBytesEntryBody []) tr (.normal (.unit, mem))) ∧
-      MirReachesUB (mirCallTree writeBytesEntryBody []) ∧
-      ¬ TreeSafe (mirCallTree writeBytesEntryBody []) ∧
       (miriSystem (annealMiriHooks writeBytesEntryBody)).Reaches
         (miriEntryState writeBytesEntryBody) m₂ ∧
       ∃ s₂, StateRelLM3_1 writeBytesEntryBody s₂ m₂
           [rawPtrAllocMapEntry writeBytesEntryBody.localDecls writeBytesEntryBody.layouts .mut 1 1
             Witness.lm31AllocId1] ∧
         get? s₂.frame.locals 1 = some (.init (.scalar ⟨0xABABABABABABABAB, 8⟩)) :=
-  w6_write_bytes_extCall_boundary
+  w6_write_bytes_inline_lockstep
 
 open Trusted.ITree LeanMiriSpec.Correspondence.Safety
   LeanMiriSpec.Correspondence.MiriDiffWitnesses in
 example :
-    (∃ e, (miriSystem (annealMiriHooks retWriteBytesOobBody)).ReachesOutcome
-        (miriEntryState retWriteBytesOobBody) (.undefinedBehavior e)) ∧
-    ¬ (miriSystem (annealMiriHooks retWriteBytesOobBody)).Safe
-        (miriEntryState retWriteBytesOobBody) ∧
-    (∃ tr mem, ReachesRet (mirCallTree retWriteBytesOobBody []) tr
-        (.normal (.scalar ⟨42, 8⟩, mem))) ∧
-    MirReachesUB (mirCallTree retWriteBytesOobBody []) ∧
-    ¬ TreeSafe (mirCallTree retWriteBytesOobBody []) :=
-  w6_write_bytes_oob_extCall_divergence
+    AgreeUB retWriteBytesOobBody (annealMiriHooks retWriteBytesOobBody)
+      (initMachineState retWriteBytesOobBody []) (miriEntryState retWriteBytesOobBody) :=
+  w6_write_bytes_oob_ub
 
 open Trusted.ITree LeanMiriSpec.Correspondence.Safety
   LeanMiriSpec.Correspondence.MiriDiffWitnesses in
 example :
     ∃ (decl0 : MirAst.LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
-      (miriSystem (annealMiriHooks retWriteBytesReadBody)).Safe
-        (miriEntryState retWriteBytesReadBody) ∧
-      (miriSystem (annealMiriHooks retWriteBytesReadBody)).ReachesOutcome
-        (miriEntryState retWriteBytesReadBody) (.returned (.immediate imm0)) ∧
-      (miriSystem (annealMiriHooks retWriteBytesReadBody)).PartialCorrect
-        (miriEntryState retWriteBytesReadBody) (· = .immediate imm0) ∧
+      AgreeReturns retWriteBytesReadBody (annealMiriHooks retWriteBytesReadBody)
+        (initMachineState retWriteBytesReadBody []) (miriEntryState retWriteBytesReadBody)
+        (.scalar ⟨0xABABABABABABABAB, 8⟩) (.immediate imm0) ∧
       get? retWriteBytesReadBody.localDecls 0 = some decl0 ∧
-      ImmediateRel decl0.ty retWriteBytesReadBody.layouts (.scalar ⟨0xABABABABABABABAB, 8⟩) imm0 ∧
-      (∃ tr mem, ReachesRet (mirCallTree retWriteBytesReadBody []) tr
-        (.normal (.scalar ⟨42, 8⟩, mem))) ∧
-      MirReachesUB (mirCallTree retWriteBytesReadBody []) ∧
-      ¬ TreeSafe (mirCallTree retWriteBytesReadBody []) :=
-  w6_write_bytes_read_extCall_divergence
+      ImmediateRel decl0.ty retWriteBytesReadBody.layouts (.scalar ⟨0xABABABABABABABAB, 8⟩) imm0 :=
+  w6_write_bytes_read_returns
 
 /-! ### `LM-4.3` Stage-1 whole-program bridges: union returns, `LM-3.2` observations, unwinding -/
 
@@ -25347,7 +25357,10 @@ example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hdecl0 : get? body.localDecls 0 = some decl0)
     (hsz0 : (translateTy decl0.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO)
     (hnot_uninit_ind :
-      ¬ (get? s.frame.locals 0 = some .uninit ∧
+      ¬ ((get? s.frame.locals 0 = some .uninit ∨
+            ∃ retVal,
+              get? s.frame.locals 0 = some (.init retVal) ∧
+              valueContainsUninit retVal = true) ∧
           ∃ topFrame mp0 c0,
             m.stack.frames = #[topFrame] ∧
             topFrame.locals[0]? = some ⟨.live (.indirect mp0), c0⟩)) :
@@ -25477,7 +25490,10 @@ example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {decl0 : MirAst.LocalDecl} {S : Nat} (hdecl0 : get? body.localDecls 0 = some decl0)
     (hwt0 : WellTypedUnionTy body.layouts decl0.ty S)
     (hnot_uninit_ind :
-      ¬ (get? s.frame.locals 0 = some .uninit ∧
+      ¬ ((get? s.frame.locals 0 = some .uninit ∨
+            ∃ retVal,
+              get? s.frame.locals 0 = some (.init retVal) ∧
+              valueContainsUninit retVal = true) ∧
           ∃ topFrame mp0 c0,
             m.stack.frames = #[topFrame] ∧
             topFrame.locals[0]? = some ⟨.live (.indirect mp0), c0⟩)) :
@@ -26624,6 +26640,7 @@ example
     (∀ elemVal elemMp,
       idxSc.bits < lenSc.bits →
       get? elems (rawElemOffset + baseIdx + idxSc.bits) = some elemVal →
+      valueContainsUninit elemVal = false →
       validateValueForTy? layouts
         (placeTyResolved localDecls layouts ⟨sIdx, [.deref, .index idxLocal]⟩) elemVal = true →
       elemLay.size.bytes.toNat * idxSc.bits < 2 ^ 63 →
@@ -26946,6 +26963,7 @@ example
       minLen ≤ lenSc.bits →
       ((fromEnd = false ∧ offset < minLen) ∨ (fromEnd = true ∧ 1 ≤ offset ∧ offset ≤ minLen)) →
       get? elems (rawElemOffset + baseIdx + idx) = some elemVal →
+      valueContainsUninit elemVal = false →
       readProjectedValue locals (.aggregate 0 window) [.constantIndex offset minLen fromEnd] =
         .ok elemVal ∧
       Miri.Interpreter.PlaceDynamic.constantIndex

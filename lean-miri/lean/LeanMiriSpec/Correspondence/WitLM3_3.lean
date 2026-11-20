@@ -8,6 +8,7 @@ This file may not be copied, modified, or distributed except according to
 those terms.
 -/
 
+import Lean
 import LeanMiriSpec.Correspondence.SimLM3_3
 
 /-!
@@ -83,6 +84,28 @@ open Trusted.Rustc.V2026_06_01.MirSemantics
 open LeanMiriSpec.Correspondence
 open LeanMiriSpec.Correspondence.SimLM3_3
 
+local elab "kernel_rfl" : tactic => do
+  let mvarId ← Lean.Elab.Tactic.getMainGoal
+  let tgt ← Lean.MVarId.getType' mvarId
+  let some (ty, lhs, _) := tgt.eq? | Lean.Meta.throwTacticEx `kernel_rfl mvarId "expected equality goal"
+  let u ← Lean.Meta.getLevel ty
+  mvarId.assign (Lean.mkApp2 (Lean.mkConst ``Eq.refl [u]) ty lhs)
+  Lean.Elab.Tactic.replaceMainGoal []
+
+local elab "kernel_decide" : tactic => do
+  let mvarId ← Lean.Elab.Tactic.getMainGoal
+  let tgt ← Lean.MVarId.getType' mvarId
+  let inst ← Lean.Meta.synthInstance (Lean.mkApp (Lean.mkConst ``Decidable) tgt)
+  let decExpr := Lean.mkApp2 (Lean.mkConst ``decide) tgt inst
+  let eqProof := Lean.mkApp2 (Lean.mkConst ``Eq.refl [1]) (Lean.mkConst ``Bool) decExpr
+  mvarId.assign (Lean.mkApp3 (Lean.mkConst ``of_decide_eq_true) tgt inst eqProof)
+  Lean.Elab.Tactic.replaceMainGoal []
+
+private def nextSt (b : CapturedMir) (s : MachineState) : MachineState :=
+  match stepMirFn b s with
+  | .step s' => s'
+  | _ => s
+
 /-! ## (a) Multi-level reborrow hierarchy -/
 
 /-- ```text
@@ -149,9 +172,17 @@ theorem wit_lm3_3_reborrow_hierarchy_real_steps :
         (((basedNormalTree s₃.memory.borrows []).performAccess 1 .Write
           .VisitChildrenOfAccessed).tree.performAccess 2 .Read
           .VisitChildrenOfAccessed).tree := by
-  refine ⟨_, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
-    ⟨rfl, by decide, rfl, rfl, rfl⟩, by decide, ⟨by decide, by decide, rfl, rfl, rfl⟩,
-    by decide, ⟨by decide, by decide, rfl, rfl, rfl⟩⟩
+  let s₁ := nextSt bodyA initA
+  let s₂ := nextSt bodyA s₁
+  let s₃ := nextSt bodyA s₂
+  let s₄ := nextSt bodyA s₃
+  let s₅ := nextSt bodyA s₄
+  refine ⟨s₁, s₂, s₃, s₄, s₅, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    by kernel_rfl, by kernel_rfl,
+    ⟨by kernel_rfl, by kernel_decide, by kernel_rfl, by kernel_rfl, by kernel_rfl⟩,
+    by kernel_rfl, ⟨by kernel_rfl, by kernel_decide, by kernel_rfl, by kernel_rfl, by kernel_rfl⟩,
+    by kernel_rfl, ⟨by kernel_rfl, by kernel_decide, by kernel_rfl, by kernel_rfl, by kernel_rfl⟩⟩
 
 
 /-! ## (b) Protected `ReservedFrz` conflict -/
@@ -216,9 +247,16 @@ theorem wit_lm3_3_protected_conflict_ub_real_steps :
           .VisitChildrenOfAccessed).tree.performAccess 1 .Write
           .VisitChildrenOfAccessed).status =
         .TransitionError 1 (.ChildAccessForbidden (.ReservedFrz true)) := by
-  refine ⟨_, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
-    ⟨rfl, by decide, rfl, rfl, rfl⟩, by decide, ⟨by decide, by decide, rfl, rfl, rfl⟩,
-    by decide⟩
+  let s₁ := nextSt bodyB initBC
+  let s₂ := nextSt bodyB s₁
+  let s₃ := nextSt bodyB s₂
+  let s₄ := nextSt bodyB s₃
+  refine ⟨s₁, s₂, s₃, s₄, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    by kernel_rfl, by kernel_rfl,
+    ⟨by kernel_rfl, by kernel_decide, by kernel_rfl, by kernel_rfl, by kernel_rfl⟩,
+    by kernel_rfl, ⟨by kernel_rfl, by kernel_decide, by kernel_rfl, by kernel_rfl, by kernel_rfl⟩,
+    by kernel_rfl⟩
 
 /-! ## (c) Protected `Unique` foreign-read disable -/
 
@@ -262,8 +300,14 @@ theorem wit_lm3_3_protected_unique_foreign_read_ub_real_steps :
       ((basedNormalTree s₄.memory.borrows [1]).performAccess 0 .Read
           .VisitChildrenOfAccessed).status =
         .TransitionError 1 (.ProtectedDisabled .Unique) := by
-  refine ⟨_, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
-    ⟨rfl, by decide, rfl, rfl, rfl⟩, by decide⟩
+  let s₁ := nextSt bodyC initBC
+  let s₂ := nextSt bodyC s₁
+  let s₃ := nextSt bodyC s₂
+  let s₄ := nextSt bodyC s₃
+  refine ⟨s₁, s₂, s₃, s₄, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    ⟨by kernel_rfl, by kernel_decide, by kernel_rfl, by kernel_rfl, by kernel_rfl⟩,
+    by kernel_rfl⟩
 
 /-! ## (d) `&UnsafeCell<u32>` (`Cell`) vs. `&u32` (`Frozen`) -/
 
@@ -330,10 +374,19 @@ theorem wit_lm3_3_unsafe_cell_vs_freeze_real_steps :
           .VisitChildrenOfAccessed).tree.performAccess 1 .Read
           .VisitChildrenOfAccessed).status =
         .TransitionError 1 (.ChildAccessForbidden .Disabled)) := by
-  refine ⟨⟨_, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, by decide,
-      ⟨by decide, by decide, rfl, rfl, rfl⟩, by decide⟩,
-    ⟨_, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, by decide,
-      ⟨by decide, by decide, rfl, rfl, rfl⟩, by decide⟩⟩
+  let s₁ := nextSt (bodyD unsafeCellU32T) initD
+  let s₂ := nextSt (bodyD unsafeCellU32T) s₁
+  let s₃ := nextSt (bodyD unsafeCellU32T) s₂
+  let s₄ := nextSt (bodyD unsafeCellU32T) s₃
+  let t₁ := nextSt (bodyD u32T) initD
+  let t₂ := nextSt (bodyD u32T) t₁
+  let t₃ := nextSt (bodyD u32T) t₂
+  refine ⟨⟨s₁, s₂, s₃, s₄, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+      by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+      ⟨by kernel_rfl, by kernel_decide, by kernel_rfl, by kernel_rfl, by kernel_rfl⟩, by kernel_rfl⟩,
+    ⟨t₁, t₂, t₃, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+      by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+      ⟨by kernel_rfl, by kernel_decide, by kernel_rfl, by kernel_rfl, by kernel_rfl⟩, by kernel_rfl⟩⟩
 
 /-! ## (e) `&mut UnsafeCell<u32>` (`ReservedIM`) lifecycle vs. `Cell` -/
 
@@ -393,8 +446,15 @@ theorem wit_lm3_3_reservedIM_lifecycle_real_steps :
       ((basedNormalTree s₅.memory.borrows []).performAccess 1 .Read
           .VisitChildrenOfAccessed).status =
         .TransitionError 1 (.ChildAccessForbidden .Disabled) := by
-  refine ⟨_, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
-    rfl, rfl, rfl, by decide, ⟨by decide, by decide, rfl, rfl, rfl⟩, by decide⟩
+  let s₁ := nextSt bodyE initD
+  let s₂ := nextSt bodyE s₁
+  let s₃ := nextSt bodyE s₂
+  let s₄ := nextSt bodyE s₃
+  let s₅ := nextSt bodyE s₄
+  refine ⟨s₁, s₂, s₃, s₄, s₅, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    ⟨by kernel_rfl, by kernel_decide, by kernel_rfl, by kernel_rfl, by kernel_rfl⟩, by kernel_rfl⟩
 
 /-! ## (f) Shared deref reborrow `&(*_2)` of `UnsafeCell<u32>` (`Cell`) skips initial read -/
 
@@ -439,7 +499,14 @@ theorem wit_lm3_3_cell_reborrow_preserves_unique_real_steps :
       stepMirFn bodyF s₄ = .step s₅ ∧
       s₅.memory.borrows = [entry 3 .cell (some 1), entry 2 .unique, entry 1 .cell] ∧
       get? s₅.frame.locals 1 = some (.init (.scalar ⟨99, 4⟩)) := by
-  exact ⟨_, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  let s₁ := nextSt bodyF initF
+  let s₂ := nextSt bodyF s₁
+  let s₃ := nextSt bodyF s₂
+  let s₄ := nextSt bodyF s₃
+  let s₅ := nextSt bodyF s₄
+  exact ⟨s₁, s₂, s₃, s₄, s₅, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    by kernel_rfl⟩
 
 /-! ## (g) Protector release on `TerminatorKind.return_` allows conflicted `ReservedFrz true` activation -/
 
@@ -559,10 +626,19 @@ theorem wit_lm3_3_protector_release_on_return_real_steps :
       TreeBorrowsRel s₈.memory.borrows []
         ((basedNormalTree s₇.memory.borrows []).performAccess 0 .Write
           .VisitChildrenOfAccessed).tree := by
-  refine ⟨_, _, _, _, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
-    rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, ?_, ?_⟩
-  · decide
-  · exact ⟨by decide, by decide, rfl, rfl, rfl⟩
+  let s₁ := nextSt callerG initG
+  let s₂ := nextSt callerG s₁
+  let s₃ := nextSt callerG s₂
+  let s₄ := nextSt callerG s₃
+  let s₅ := nextSt callerG s₄
+  let s₆ := nextSt callerG s₅
+  let s₇ := nextSt callerG s₆
+  let s₈ := nextSt callerG s₇
+  refine ⟨s₁, s₂, s₃, s₄, s₅, s₆, s₇, s₈,
+    by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    by kernel_rfl, ⟨by kernel_rfl, by kernel_decide, by kernel_rfl, by kernel_rfl, by kernel_rfl⟩⟩
 
 /-! ## (h) Non-`fnEntry` reference retags (`Default`, `TwoPhase`) and `Raw` scalar pointer retag -/
 
@@ -624,8 +700,15 @@ theorem wit_lm3_3_non_fnEntry_retag_and_raw_retag_real_steps :
       TreeBorrowsRel s₅.memory.borrows []
         ((basedNormalTree s₄.memory.borrows []).performAccess 0 .Write
           .VisitChildrenOfAccessed).tree := by
-  refine ⟨_, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
-    rfl, rfl, rfl, by decide, ⟨by decide, by decide, rfl, rfl, rfl⟩⟩
+  let s₁ := nextSt bodyH initH
+  let s₂ := nextSt bodyH s₁
+  let s₃ := nextSt bodyH s₂
+  let s₄ := nextSt bodyH s₃
+  let s₅ := nextSt bodyH s₄
+  refine ⟨s₁, s₂, s₃, s₄, s₅, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    ⟨by kernel_rfl, by kernel_decide, by kernel_rfl, by kernel_rfl, by kernel_rfl⟩⟩
 
 /-! ## (i) Zero-sized `&()` retag skips initial read + provenance-free dangling `&()` -/
 
@@ -701,8 +784,17 @@ theorem wit_lm3_3_zst_retag_skips_read_and_dangling_scalar_real_steps :
       TreeBorrowsRel s₆.memory.borrows s₆.memory.activeProtectors
         (basedNormalTree s₆.memory.borrows s₆.memory.activeProtectors)) ∧
     stepMirFn bodyI initINullAt5 = .fail .ub := by
-  refine ⟨⟨_, _, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
-      rfl, rfl, rfl, rfl, ⟨by decide, by decide, rfl, rfl, rfl⟩⟩, rfl⟩
+  let s₁ := nextSt bodyI initI
+  let s₂ := nextSt bodyI s₁
+  let s₃ := nextSt bodyI s₂
+  let s₄ := nextSt bodyI s₃
+  let s₅ := nextSt bodyI s₄
+  let s₆ := nextSt bodyI s₅
+  refine ⟨⟨s₁, s₂, s₃, s₄, s₅, s₆, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+      by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+      by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+      ⟨by kernel_rfl, by kernel_decide, by kernel_rfl, by kernel_rfl, by kernel_rfl⟩⟩,
+    by kernel_rfl⟩
 
 /-! ## (j) Disjoint vs. overlapping sub-place projections (`&mut (_1.0)` vs. `&(_1.1)` / `&(_1.0)`) -/
 
@@ -810,8 +902,18 @@ theorem wit_lm3_3_subprojection_disjoint_vs_overlapping_real_steps :
          entryProj 2 .frozen [.field 0 u64T],
          entryProj 1 (.reservedFrz false) [.field 0 u64T]] ∧
       stepMirFn bodyJOverlap o₃ = .fail .ub) := by
-  refine ⟨⟨_, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩,
-    ⟨_, _, _, rfl, rfl, rfl, rfl, rfl⟩⟩
+  let s₁ := nextSt bodyJDisjoint initJ
+  let s₂ := nextSt bodyJDisjoint s₁
+  let s₃ := nextSt bodyJDisjoint s₂
+  let s₄ := nextSt bodyJDisjoint s₃
+  let s₅ := nextSt bodyJDisjoint s₄
+  let o₁ := nextSt bodyJOverlap initJ
+  let o₂ := nextSt bodyJOverlap o₁
+  let o₃ := nextSt bodyJOverlap o₂
+  refine ⟨⟨s₁, s₂, s₃, s₄, s₅, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+      by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+      by kernel_rfl, by kernel_rfl⟩,
+    ⟨o₁, o₂, o₃, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl⟩⟩
 
 /-! ## (k) ZST deref reborrow `&(*_3)` and `PhantomData<u64>` retag skip initial reads -/
 
@@ -885,8 +987,17 @@ theorem wit_lm3_3_zst_deref_reborrow_and_phantom_retag_real_steps :
       s₇.memory.activeProtectors = [2, 1] ∧
       TreeBorrowsRel s₇.memory.borrows s₇.memory.activeProtectors
         (basedNormalTree s₇.memory.borrows s₇.memory.activeProtectors) := by
-  refine ⟨_, _, _, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
-    rfl, rfl, ⟨by decide, by decide, rfl, rfl, rfl⟩⟩
+  let s₁ := nextSt bodyK initK
+  let s₂ := nextSt bodyK s₁
+  let s₃ := nextSt bodyK s₂
+  let s₄ := nextSt bodyK s₃
+  let s₅ := nextSt bodyK s₄
+  let s₆ := nextSt bodyK s₅
+  let s₇ := nextSt bodyK s₆
+  refine ⟨s₁, s₂, s₃, s₄, s₅, s₆, s₇, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    by kernel_rfl, by kernel_rfl,
+    ⟨by kernel_rfl, by kernel_decide, by kernel_rfl, by kernel_rfl, by kernel_rfl⟩⟩
 
 /-! ## (l) Uninhabited reference retag UB (`&!`, `&[!; 1]`) vs. inhabited `[!; 0]` / `PhantomData<!>` -/
 
@@ -959,8 +1070,13 @@ theorem wit_lm3_3_uninhabited_ref_retag_ub_vs_inhabited_never_zst_real_steps :
     stepMirFn bodyLNever (initLUninhabited true) = .fail .ub ∧
     stepMirFn bodyLNeverArr1 (initLUninhabited false) = .fail .ub ∧
     stepMirFn bodyLNeverArr1 (initLUninhabited true) = .fail .ub := by
-  refine ⟨⟨_, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
-    ⟨by decide, by decide, rfl, rfl, rfl⟩⟩, rfl, rfl, rfl, rfl⟩
+  let s₁ := nextSt bodyLInhabited initLInhabited
+  let s₂ := nextSt bodyLInhabited s₁
+  let s₃ := nextSt bodyLInhabited s₂
+  refine ⟨⟨s₁, s₂, s₃, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    ⟨by kernel_rfl, by kernel_decide, by kernel_rfl, by kernel_rfl, by kernel_rfl⟩⟩,
+    by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl⟩
 
 /-! ## (m) Protected `Cell` 3-level chain surviving under a `.disabled` root (`I-10` & `I-11`) -/
 
@@ -1036,10 +1152,19 @@ theorem wit_lm3_3_protected_cell_chain_under_disabled_root_real_steps :
       ((basedNormalTree s₆.memory.borrows [1]).performAccess 0 .Read
           .VisitChildrenOfAccessed).status =
         .TransitionError 2 (.ChildAccessForbidden .Disabled) := by
-  refine ⟨_, _, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, by decide,
-    rfl, rfl, rfl, by decide, by decide, ⟨by decide, by decide, rfl, rfl, rfl⟩,
-    rfl, rfl, by decide, ⟨by decide, by decide, rfl, rfl, rfl⟩,
-    rfl, by decide⟩
+  let s₁ := nextSt bodyM initM
+  let s₂ := nextSt bodyM s₁
+  let s₃ := nextSt bodyM s₂
+  let s₄ := nextSt bodyM s₃
+  let s₅ := nextSt bodyM s₄
+  let s₆ := nextSt bodyM s₅
+  refine ⟨s₁, s₂, s₃, s₄, s₅, s₆, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    ⟨by kernel_rfl, by kernel_decide, by kernel_rfl, by kernel_rfl, by kernel_rfl⟩,
+    by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    ⟨by kernel_rfl, by kernel_decide, by kernel_rfl, by kernel_rfl, by kernel_rfl⟩,
+    by kernel_rfl, by kernel_rfl⟩
 
 /-! ## (n) Transparent wrapper ZST (`UnsafeCell<()>`), `PhantomData<UnsafeCell<u32>>` `Freeze`, `Cell<u32>` `!Freeze`, and uninhabited `&UnsafeCell<!>` -/
 
@@ -1159,9 +1284,19 @@ theorem wit_lm3_3_wrapper_zst_freeze_and_uninhabited_cell_real_steps :
     stepMirFn bodyNUnsafeCellNever (initLUninhabited true) = .fail .ub ∧
     stepMirFn bodyNRefCellNever (initLUninhabited false) = .fail .ub ∧
     stepMirFn bodyNRefCellNever (initLUninhabited true) = .fail .ub := by
-  refine ⟨⟨_, _, _, _, _, _, _, _,
-    rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
-    ⟨by decide, by decide, rfl, rfl, rfl⟩⟩, rfl, rfl, rfl, rfl⟩
+  let s₁ := nextSt bodyN initN
+  let s₂ := nextSt bodyN s₁
+  let s₃ := nextSt bodyN s₂
+  let s₄ := nextSt bodyN s₃
+  let s₅ := nextSt bodyN s₄
+  let s₆ := nextSt bodyN s₅
+  let s₇ := nextSt bodyN s₆
+  let s₈ := nextSt bodyN s₇
+  refine ⟨⟨s₁, s₂, s₃, s₄, s₅, s₆, s₇, s₈,
+    by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+    ⟨by kernel_rfl, by kernel_decide, by kernel_rfl, by kernel_rfl, by kernel_rfl⟩⟩,
+    by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl⟩
 
 /-! ## (o) Stage-1 `StorageDead` / `StorageLive` Protected Local Borrow UB vs. Unprotected Local Borrow Disable -/
 
@@ -1239,8 +1374,15 @@ theorem wit_lm3_3_storageDead_protected_ub_vs_unprotected_disable_real_steps :
       ((basedNormalTree s₃.memory.borrows []).performAccess 0 .Read
         .VisitChildrenOfAccessed).status =
           .TransitionError 0 (.ChildAccessForbidden .Disabled)) := by
-  refine ⟨⟨_, _, rfl, rfl, rfl, rfl, rfl,
+  let p₁ := nextSt bodyOProtectedStorageDead initO
+  let p₂ := nextSt bodyOProtectedStorageDead p₁
+  let u₁ := nextSt bodyOUnprotectedStorageDead initO
+  let u₂ := nextSt bodyOUnprotectedStorageDead u₁
+  let u₃ := nextSt bodyOUnprotectedStorageDead u₂
+  refine ⟨⟨p₁, p₂, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
       (borrowTree_deallocateBorrowRange_simulation .foreignAccess (.reservedFrz false) true).1 rfl⟩,
-    ⟨_, _, _, rfl, rfl, rfl, rfl, rfl, rfl, ⟨by decide, by decide, rfl, rfl, rfl⟩, rfl, by decide⟩⟩
+    ⟨u₁, u₂, u₃, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl, by kernel_rfl,
+      by kernel_rfl, ⟨by kernel_rfl, by kernel_decide, by kernel_rfl, by kernel_rfl, by kernel_rfl⟩,
+      by kernel_rfl, by kernel_rfl⟩⟩
 
 end LeanMiriSpec.Correspondence.WitnessLM3_3

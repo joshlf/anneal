@@ -253,7 +253,7 @@ private theorem readProjectedValue_ne_unsupported_of_fields
     ∀ (projs : List ProjectionElem) (val : Value),
       (∀ p ∈ projs, ∃ fIdx fTy, p = .field fIdx fTy) →
       readProjectedValue locals val projs ≠ .unsupported
-  | [], _, _ => nofun
+  | [], val, _ => by dsimp [readProjectedValue]; cases valueContainsUninit val <;> nofun
   | p :: ps, val, hall => by
     obtain ⟨fIdx, fTy, rfl⟩ := hall p List.mem_cons_self
     have hall' : ∀ q ∈ ps, ∃ i t, q = .field i t :=
@@ -276,6 +276,7 @@ private theorem readProjectedValue_ne_unsupported_of_fields
       cases fIdx with
       | zero => exact readProjectedValue_ne_unsupported_of_fields locals ps .unit hall'
       | succ _ => nofun
+    | uninit => nofun
 
 theorem SyntacticFieldOperand.evalOperand_shape
     {locals : List LocalSlot} {op : MirAst.Operand}
@@ -310,9 +311,11 @@ theorem SyntacticFieldOperand.evalOperand_shape
       | uninit => exact ⟨nofun, fun _ _ hok => nomatch hok⟩
       | init rootVal =>
         dsimp only [readProjectedValue]
-        refine ⟨nofun, fun _ locals' hok => ?_⟩
-        injection hok with _ hloc; subst hloc
-        exact ⟨rfl, fun _ _ => rfl⟩
+        cases valueContainsUninit rootVal
+        · refine ⟨nofun, fun _ locals' hok => ?_⟩
+          injection hok with _ hloc; subst hloc
+          exact ⟨rfl, fun _ _ => rfl⟩
+        · exact ⟨nofun, fun _ _ hok => nomatch hok⟩
     | cons p0 ps =>
       obtain ⟨fIdx, fTy, rfl⟩ := hfields p0 List.mem_cons_self
       unfold evalOperand; dsimp only; rw [hget]
@@ -342,12 +345,14 @@ theorem SyntacticFieldOperand.evalOperand_shape
       | dead => exact ⟨nofun, fun _ _ hok => nomatch hok⟩
       | uninit => exact ⟨nofun, fun _ _ hok => nomatch hok⟩
       | init rootVal =>
-        dsimp only; rw [set?_eq_some_set hlt]
-        refine ⟨nofun, fun _ locals' hok => ?_⟩
-        injection hok with _ hloc; subst hloc
-        exact ⟨List.length_set, fun k hk => by
-          have hne : idx ≠ k := hk
-          simp [get?, List.getElem?_set_ne hne]⟩
+        dsimp only [readProjectedValue]; rw [set?_eq_some_set hlt]
+        cases valueContainsUninit rootVal
+        · refine ⟨nofun, fun _ locals' hok => ?_⟩
+          injection hok with _ hloc; subst hloc
+          exact ⟨List.length_set, fun k hk => by
+            have hne : idx ≠ k := hk
+            simp [get?, List.getElem?_set_ne hne]⟩
+        · exact ⟨nofun, fun _ _ hok => nomatch hok⟩
     | cons p0 ps =>
       obtain ⟨fIdx, fTy, rfl⟩ := hfields p0 List.mem_cons_self
       unfold evalOperand; dsimp only; rw [hget]
@@ -486,8 +491,8 @@ private theorem valueLeafBytes_ge_of_validPath
   induction hp with
   | single fields idx fty oldVal hget =>
     dsimp [readProjectedValue] at hr
-    rw [hget] at hr
-    injection hr with heq; subst heq
+    rw [hget] at hr; dsimp only at hr
+    cases hvc : valueContainsUninit oldVal <;> rw [hvc] at hr <;> cases hr
     exact valueLeafBytesList_ge_of_get? hget
   | cons fields idx fty rest subVal hget _ _ ih =>
     dsimp [readProjectedValue] at hr
@@ -505,7 +510,7 @@ theorem zeroScalarWrappedVal_of_noZeroByteLeaves
       ZeroScalarWrappedVal sc v projs
   | [], v, _, _, _, hr, _ => by
     dsimp [readProjectedValue] at hr
-    injection hr with heq; subst heq
+    cases hvc : valueContainsUninit v <;> rw [hvc] at hr <;> cases hr
     exact .bare
   | p0 :: rest, v, hnz, hvpath, hall, hr, hbytes => by
     obtain ⟨fty, rfl⟩ := hall p0 List.mem_cons_self
@@ -518,8 +523,8 @@ theorem zeroScalarWrappedVal_of_noZeroByteLeaves
       | cons subVal tl =>
         rw [get?_eq_getElem?, List.getElem?_cons_zero, Option.some.injEq] at hget
         subst hget
-        dsimp [readProjectedValue, get?] at hr
-        injection hr with hsc; subst hsc
+        simp only [readProjectedValue, get?, List.getElem?_cons_zero] at hr
+        cases hvc : valueContainsUninit subVal <;> rw [hvc] at hr <;> cases hr
         rcases hnz with ⟨_, htl⟩
         cases tl with
         | nil => exact .wrap_cons fty [] (.scalar sc) .bare
@@ -562,8 +567,8 @@ private theorem validPath_cons_inv {layouts : LayoutTable}
   cases hp with
   | single fields _ _ oldVal hget =>
     dsimp [readProjectedValue] at hr
-    rw [hget] at hr
-    injection hr with heq; subst heq
+    rw [hget] at hr; dsimp only at hr
+    cases hvc : valueContainsUninit oldVal <;> rw [hvc] at hr <;> cases hr
     exact ⟨fields, .scalar sc, rfl, hget, rfl, fun hne => False.elim (hne rfl), Nat.le_refl _⟩
   | cons fields _ _ _ subVal hget _ hsub =>
     dsimp [readProjectedValue] at hr
@@ -1092,6 +1097,15 @@ inductive LM2_2OperandValRel (env : StructTypeEnv) (layouts : LayoutTable) (ty :
       ImmediateStructRel ty layouts fields paths v imm →
       LM2_2OperandValRel env layouts ty v imm
 
+theorem LM2_2OperandValRel.valueContainsUninit_eq_false
+    {env : StructTypeEnv} {layouts : LayoutTable} {ty : Ty}
+    {v : Value} {imm : Miri.Interpreter.Immediate AnnealProv}
+    (h : LM2_2OperandValRel env layouts ty v imm) :
+    valueContainsUninit v = false := by
+  cases h with
+  | primScalar _ _ _ _ _ => rfl
+  | immStruct _ _ _ _ _ hsr => exact hsr.valueContainsUninit_eq_false
+
 theorem IsImmediateStructTy.env_eq
     {env : StructTypeEnv} {layouts : LayoutTable} {ty : Ty}
     {fields : List StructFieldDesc} {paths : List (List ProjectionElem)}
@@ -1376,7 +1390,7 @@ private theorem unprojected_live_finish
     have hpost : operandPostStaticEnv stEnv (.copy ⟨idx, []⟩) = stEnv := rfl
     rw [hmk, htr, hpost]
     have ha : evalOperand af.locals (.copy ⟨idx, []⟩) .nil globals body.layouts .nil =
-        .ok v af.locals := by simp [evalOperand, readProjectedValue, hslot]
+        .ok v af.locals := by simp [evalOperand, readProjectedValue, hslot, hvalRel.valueContainsUninit_eq_false]
     have hm : (annealEvalOperand body.localDecls body.layouts (.Copy ⟨idx, #[]⟩) known >>=
         annealReadImmediateLM2_2) m =
         .ok ⟨imm, translateTy decl.ty body.layouts⟩ { m with stack := ⟨#[tf_c]⟩ } := by
@@ -1420,7 +1434,7 @@ private theorem unprojected_live_finish
     let tf_d := deinitFrameLocal tf_c idx hlt_c
     have ha : evalOperand af.locals (.move ⟨idx, []⟩) .nil globals body.layouts .nil =
         .ok v (af.locals.set idx .uninit) := by
-      unfold evalOperand; dsimp only; rw [hslot]; dsimp only; rw [set?_eq_some_set hlt_af]
+      unfold evalOperand; dsimp only; rw [hslot]; dsimp only [readProjectedValue]; rw [hvalRel.valueContainsUninit_eq_false]; dsimp only; rw [set?_eq_some_set hlt_af]
     have hm : (annealEvalOperand body.localDecls body.layouts (.Move ⟨idx, #[]⟩) known >>=
         annealReadImmediateLM2_2) m =
         .ok ⟨imm, translateTy decl.ty body.layouts⟩ { m with stack := ⟨#[tf_d]⟩ } := by
@@ -4173,17 +4187,18 @@ private theorem StructMemPlaceRel.ensureNestedFieldShells_eq
     {fields : List StructFieldDesc} {paths : List (List ProjectionElem)}
     {rootVal : Value} {mp : Miri.Interpreter.MemPlace AnnealProv}
     (h : StructMemPlaceRel mach ty layouts fields paths rootVal mp)
+    (decls : List LocalDecl) (curTyOpt : Option Ty)
     {k : Nat} (hk : k < fields.length)
     {projs sfx : List ProjectionElem} (hne : projs ≠ [])
     (hp : paths[k]? = some (projs ++ sfx)) :
-    ensureNestedFieldShells rootVal projs = rootVal := by
+    ensureNestedFieldShells rootVal projs decls layouts curTyOpt = .some rootVal := by
   rcases h with ⟨_, _, _, _, _, _, hplen, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, hfields, _⟩
   obtain ⟨_, _, _, hvpath, _⟩ := hfields k hk
   have hk_p : k < paths.length := by rw [hplen]; exact hk
   rw [List.getElem?_eq_getElem hk_p] at hp
   injection hp with hp_eq
   rw [hp_eq] at hvpath
-  exact ensureNestedFieldShells_eq_self_of_populated projs rootVal
+  exact ensureNestedFieldShells_eq_self_of_populated projs rootVal decls layouts curTyOpt
     (hvpath.of_append hne).fieldShellChainPopulated_true
 
 theorem evalStatement_assign_use_lm2_2_eq
@@ -4554,9 +4569,11 @@ private theorem step_assign_nested_field_write_simulation_core
               MirStepNode.step (advanceStmt s (locals₁.set dstIdx (.init rootVal')) s.memory) := by
             unfold evalStmt; dsimp only
             rw [hev_rv]; dsimp only
-            rw [hdst_loc₁]; dsimp only [writeProjectedForLocal]
-            rw [hnot_union, hsmpr_init.ensureNestedFieldShells_eq hk (by nofun)
+            rw [hdst_loc₁]; dsimp only
+            rw [hsmpr_init.ensureNestedFieldShells_eq body.localDecls _ hk (by nofun)
               (sfx := []) (by simpa using hpath_eq)]
+            dsimp only [writeProjectedForLocal]
+            rw [hnot_union]
             have hwp : writeProjectedValue locals₁ rootVal (.field idx₀ fty₀ :: ps) (.scalar sc) =
                 .ok rootVal' := by rw [← hpk_eq]; exact hw_proj locals₁
             rw [hwp]; dsimp only
@@ -4646,9 +4663,11 @@ private theorem step_assign_nested_field_write_simulation_core
               MirStepNode.step (advanceStmt s (locals₁.set dstIdx (.init rootVal')) s.memory) := by
             unfold evalStmt; dsimp only
             rw [hev_rv]; dsimp only
-            rw [hdst_loc₁]; dsimp only [writeProjectedForLocal]
-            rw [hnot_union, hsmpr.ensureNestedFieldShells_eq hk (by nofun)
+            rw [hdst_loc₁]; dsimp only
+            rw [hsmpr.ensureNestedFieldShells_eq body.localDecls _ hk (by nofun)
               (sfx := []) (by simpa using hpath_eq)]
+            dsimp only [writeProjectedForLocal]
+            rw [hnot_union]
             have hwp : writeProjectedValue locals₁ rootVal (.field idx₀ fty₀ :: ps) (.scalar sc) =
                 .ok rootVal' := by rw [← hpk_eq]; exact hw_proj locals₁
             rw [hwp]; dsimp only
@@ -5017,9 +5036,11 @@ theorem step_assign_nested_substruct_write_simulation
                 MirStepNode.step (advanceStmt s (locals₁.set dstIdx (.init rootVal')) s.memory) := by
               unfold evalStmt; dsimp only
               rw [hev_rv]; dsimp only
-              rw [hdst_loc₁]; dsimp only [writeProjectedForLocal]
-              rw [hnot_union, hsmpr.ensureNestedFieldShells_eq hk₀ (by nofun)
+              rw [hdst_loc₁]; dsimp only
+              rw [hsmpr.ensureNestedFieldShells_eq body.localDecls _ hk₀ (by nofun)
                 (sfx := [.field 0 mid₀]) (by rw [List.getElem?_eq_getElem hk₀_p, hpath₀])]
+              dsimp only [writeProjectedForLocal]
+              rw [hnot_union]
               rw [hw_proj locals₁]; dsimp only
               rw [set?_eq_some_set hlt_loc₁, hprot, hbor]
               dsimp only [invalidateConflictingBorrowsAtProj]
@@ -5337,9 +5358,11 @@ theorem step_assign_nested_scalar_wrap_write_simulation
                   MirStepNode.step (advanceStmt s (locals₁.set dstIdx (.init rootVal')) s.memory) := by
                 unfold evalStmt; dsimp only
                 rw [hev_rv]; dsimp only
-                rw [hdst_loc₁]; dsimp only [writeProjectedForLocal]
-                rw [hnot_union, hsmpr_init.ensureNestedFieldShells_eq hk₀ (by nofun)
+                rw [hdst_loc₁]; dsimp only
+                rw [hsmpr_init.ensureNestedFieldShells_eq body.localDecls _ hk₀ (by nofun)
                   (sfx := [.field 0 mid₀]) (by rw [List.getElem?_eq_getElem hk₀_p, hpath₀])]
+                dsimp only [writeProjectedForLocal]
+                rw [hnot_union]
                 rw [hw_proj locals₁]; dsimp only
                 rw [set?_eq_some_set hlt_loc₁, hprot, hbor]
                 dsimp only [invalidateConflictingBorrowsAtProj]
@@ -5420,9 +5443,11 @@ theorem step_assign_nested_scalar_wrap_write_simulation
                   MirStepNode.step (advanceStmt s (locals₁.set dstIdx (.init rootVal')) s.memory) := by
                 unfold evalStmt; dsimp only
                 rw [hev_rv]; dsimp only
-                rw [hdst_loc₁]; dsimp only [writeProjectedForLocal]
-                rw [hnot_union, hsmpr.ensureNestedFieldShells_eq hk₀ (by nofun)
+                rw [hdst_loc₁]; dsimp only
+                rw [hsmpr.ensureNestedFieldShells_eq body.localDecls _ hk₀ (by nofun)
                   (sfx := [.field 0 mid₀]) (by rw [List.getElem?_eq_getElem hk₀_p, hpath₀])]
+                dsimp only [writeProjectedForLocal]
+                rw [hnot_union]
                 rw [hw_proj locals₁]; dsimp only
                 rw [set?_eq_some_set hlt_loc₁, hprot, hbor]
                 dsimp only [invalidateConflictingBorrowsAtProj]
@@ -6483,7 +6508,7 @@ theorem step_assign_use_memory_struct_lm2_2_simulation
             (m := { m with stack := ⟨#[tf₀]⟩ }) rfl hlt_src0 hsrc_decl hmls_s_eq hcache_s
           refine ⟨s.frame.locals, tf₁,
             by change evalOperand s.frame.locals (.copy ⟨srcIdx, .nil⟩) .nil s.memory.globals body.layouts .nil = _
-               simp [evalOperand, readProjectedValue, hslot_s],
+               simp [evalOperand, readProjectedValue, hslot_s, hagg_s.2.valueContainsUninit_eq_false],
             hm_c, hfr₀.cache_local_layout hsrc_decl hlt_src0,
             MemoryAllocDisjoint_cacheFrameLocalLayout hdisj₀ hlt_src0 _,
             rfl, rfl, rfl,
@@ -6526,7 +6551,7 @@ theorem step_assign_use_memory_struct_lm2_2_simulation
             (fun _ => .structUninitImm fields paths _ henv hc_some)
           refine ⟨s.frame.locals.set srcIdx .uninit, tf₁,
             by change evalOperand s.frame.locals (.move ⟨srcIdx, .nil⟩) .nil s.memory.globals body.layouts .nil = _
-               unfold evalOperand; dsimp only; rw [hslot_s]; dsimp only; rw [set?_eq_some_set hlt_src_af],
+               unfold evalOperand; dsimp only; rw [hslot_s]; dsimp only [readProjectedValue]; rw [hagg_s.2.valueContainsUninit_eq_false]; dsimp only; rw [set?_eq_some_set hlt_src_af],
             hm_m, hfr₁_exc.toFrameRel,
             MemoryAllocDisjoint_deinitFrameLocal
               (MemoryAllocDisjoint_cacheFrameLocalLayout hdisj₀ hlt_src0 _) hlt_c,
@@ -7027,7 +7052,7 @@ theorem step_assign_self_move_memory_struct_lm2_2_simulation
         rw [evalRvalue_use_nil_borrows _ _ _ hbor, hcaller]
         have hev_op : evalOperand s.frame.locals op .nil s.memory.globals body.layouts .nil body.localDecls =
             .ok rootVal locals₁ := by
-          unfold evalOperand; dsimp only [op]; rw [hslot0]; dsimp only
+          unfold evalOperand; dsimp only [op, mkPlaceOperand, readProjectedValue]; rw [hslot0]; dsimp only [readProjectedValue]; rw [hagg_s.2.valueContainsUninit_eq_false]; dsimp only
           rw [set?_eq_some_set hlt_af0]
         rw [hev_op]; dsimp only
         rw [show op = mkPlaceOperand true ⟨idx, .nil⟩ from rfl,
@@ -7140,6 +7165,11 @@ theorem step_assign_self_copy_memory_struct_divergence
     hframe.lookup_local hdecl
   rw [hslot] at hslot0
   injection hslot0 with hsl; subst hsl
+  have hroot_init : valueContainsUninit rootVal = false := by
+    cases hloc0 with
+    | base _ _ henv_none _ => rw [henv] at henv_none; cases henv_none
+    | structImm _ _ _ _ _ _ _ himm_s => exact himm_s.valueContainsUninit_eq_false
+    | structInd _ _ _ _ _ _ _ hsmpr_s => exact hsmpr_s.valueContainsUninit_eq_false
   have ha_ok :
       evalStmt s ⟨.assign ⟨idx, .nil⟩ (.use (.copy ⟨idx, .nil⟩)), span⟩
         body.localDecls body.layouts =
@@ -7148,7 +7178,7 @@ theorem step_assign_self_copy_memory_struct_divergence
     rw [evalRvalue_use_nil_borrows _ _ _ hbor, hcaller]
     have hev : evalOperand s.frame.locals (.copy ⟨idx, .nil⟩) .nil s.memory.globals
         body.layouts .nil body.localDecls = .ok rootVal s.frame.locals := by
-      simp [evalOperand, readProjectedValue, hslot]
+      simp [evalOperand, readProjectedValue, hroot_init, hslot]
     rw [hev]; dsimp only
     rw [show MirAst.Operand.copy ⟨idx, .nil⟩ = mkPlaceOperand false ⟨idx, .nil⟩ from rfl,
       validateLoadedValue_of_memory_repr hdecl hmem_repr]; dsimp only
@@ -7405,11 +7435,15 @@ private theorem evalStmt_assign_projected_step_location
           | ok rootVal' => exact finish_write locals₁ mem₁ rootVal'
       | init rootVal =>
         dsimp only
-        cases writeProjectedForLocal locals₁ body.localDecls body.layouts dstIdx
-            (ensureNestedFieldShells rootVal (.field idx₀ fty₀ :: ps))
-            (.field idx₀ fty₀ :: ps) val with
-        | ub | unsupported => intro h; cases h
-        | ok rootVal' => exact finish_write locals₁ mem₁ rootVal'
+        cases ensureNestedFieldShells rootVal (.field idx₀ fty₀ :: ps) body.localDecls body.layouts
+            (placeTy body.localDecls body.layouts { local_ := dstIdx, projection := .nil }) with
+        | none => intro h; cases h
+        | some rootValSh =>
+          dsimp only
+          cases writeProjectedForLocal locals₁ body.localDecls body.layouts dstIdx
+              rootValSh (.field idx₀ fty₀ :: ps) val with
+          | ub | unsupported => intro h; cases h
+          | ok rootVal' => exact finish_write locals₁ mem₁ rootVal'
 
 private theorem evalStmt_step_location_lm2_2
     {body : CapturedMir} {env : StructTypeEnv}
@@ -7720,7 +7754,10 @@ theorem step_terminator_return_lm2_2_simulation
       · rw [returnFromCurrentFrame_of_error annealControlHooks hframes hframe.body_eq
           hframe.location_eq hbb hcleanup (annealControlHooks_returnOperand_uninit hframes hget0)]
         exact StepRel.ub _ _
-      · rw [hmem_ret]
+      · dsimp only
+        rw [himmRel.valueContainsUninit_eq_false]
+        dsimp only
+        rw [hmem_ret]
         cases himmRel with
         | unit hzero =>
           exact False.elim (hsz0 hzero)
@@ -7863,6 +7900,9 @@ theorem step_terminator_return_struct_lm2_2_simulation
     · exact False.elim (hinit_env 0 h0_init hslot0)
     · exact False.elim (himm_env 0 h0_imm mp0 c0 hmls0)
   | structImm fs ps retVal imm0 _ henv _ himmRel =>
+    dsimp only
+    rw [himmRel.valueContainsUninit_eq_false]
+    dsimp only
     rw [hmem_ret]
     have hfp := henv0.symm.trans henv
     injection hfp with hfp'; injection hfp' with hfs hps; subst hfs hps
@@ -7879,6 +7919,9 @@ theorem step_terminator_return_struct_lm2_2_simulation
       (annealControlHooks_cleanupFrame_eq false topFrame _)]
     exact .retRootImm decl0 retVal imm0 s.memory _ hdecl0 hop0 himmRel rfl
   | structInd fs ps retVal mp0 _ henv _ hsmpr =>
+    dsimp only
+    rw [hsmpr.valueContainsUninit_eq_false]
+    dsimp only
     rw [hmem_ret]
     have hfp := henv0.symm.trans henv
     injection hfp with hfp'; injection hfp' with hfs hps; subst hfs hps
