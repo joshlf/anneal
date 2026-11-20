@@ -2059,7 +2059,7 @@ private theorem step_modular_tau
     (h_next : wpMirExecFrameAndTraitsModularSym contract fuel body (.running s') post) :
     wpMirExecFrameAndTraitsModularSym contract (fuel + 1) body (.running s) post := by
   unfold wpMirExecFrameAndTraitsModularSym
-  rw [evalSymNodeTreeFrameAndTraitsModular_eq, stepMirExecSymTree_eval]
+  rw [evalSymNodeTreeFrameAndTraitsModular_eq, stepMirExecFrameSymTree_eval]
   dsimp only [stepMirState]
   rw [h]
   exact h_next
@@ -2071,7 +2071,7 @@ private theorem step_modular_retNormal
     (h_next : post (.normal (v, m))) :
     wpMirExecFrameAndTraitsModularSym contract (fuel + 1) body (.running s) post := by
   unfold wpMirExecFrameAndTraitsModularSym
-  rw [evalSymNodeTreeFrameAndTraitsModular_eq, stepMirExecSymTree_eval]
+  rw [evalSymNodeTreeFrameAndTraitsModular_eq, stepMirExecFrameSymTree_eval]
   dsimp only [stepMirState]
   rw [h]
   exact h_next
@@ -4469,6 +4469,257 @@ theorem v26AddTwoRegsPinnedAuto_verified :
 theorem v26AddTwoRegsEq2U32_verified : VerificationResult v26AddTwoRegsClaim :=
   dischargeRustEq2U32FuelFree
     v26AddTwoRegsClaim v26AddTwoRegsReqMir v26AddTwoRegsEnsMir 10 20
+
+/-! ## 15. Frame-Restoring Modular `.return_` Over Symbolic Borrows (`evalTerminatorFrameSymTree`) -/
+
+/--
+Single-block body whose terminator returns `_0`, run from a state whose
+`_0` slot is already initialized.
+-/
+private def frameReturnMir : CapturedMir :=
+  mkMirBody "symbolic_eval_tests::frame_return" 0
+    [mkDecl .mut u32MirTy]
+    [{ statements := [], terminator := mkTerm .return_, isCleanup := false }]
+
+/-- No function-entry protector is active: no frame-deallocation conflict, for
+any symbolic `borrows`. -/
+theorem frameReturn_noProtectorConflict_without_protectors
+    (borrows : List BorrowEntry) (depth nLocals : Nat) :
+    hasFrameDeallocProtectorConflict borrows [] depth nLocals = false :=
+  hasFrameDeallocProtectorConflict_nil_activeProtectors borrows depth nLocals
+
+/--
+Regression for the post-external-call `.return_` of
+`crates/cargo-anneal/src/driver.rs`'s `caller_ffi_and_len` proof: with
+concrete frame fields but an arbitrary (symbolic) `mem.borrows`, a root
+`.return_` reduces by WHNF in `wpMirExecFrameModularSym` (so the continuation is
+closed by `exact`, without rewriting `hasFrameDeallocProtectorConflict`).
+-/
+theorem frameModularSym_return_reduces_over_symbolic_borrows
+    (contract : MirCallContract) (fuel : Nat) (retSc : ScalarVal) (mem : Memory)
+    (post : MirOutcome → Prop)
+    (h :
+      post
+        (.normal
+          (.scalar retSc,
+           { mem with
+             callStack := []
+             activeCallee := .none
+             activeProtectors := []
+             borrows := disableFrameBorrows mem.borrows 0 1 }))) :
+    wpMirExecFrameModularSym contract (fuel + 1) frameReturnMir
+      (.running
+        { frame := { blockIdx := 0, stmtIdx := 0, locals := [.init (.scalar retSc)] }
+          memory := { mem with callStack := [], activeCallee := .none, activeProtectors := [] } })
+      post :=
+  h
+
+/-- The same WHNF reduction holds for `wpMirExecFrameAndTraitsModularSym`. -/
+theorem frameAndTraitsModularSym_return_reduces_over_symbolic_borrows
+    (contract : MirCallContract) (fuel : Nat) (retSc : ScalarVal) (mem : Memory)
+    (post : MirOutcome → Prop)
+    (h :
+      post
+        (.normal
+          (.scalar retSc,
+           { mem with
+             callStack := []
+             activeCallee := .none
+             activeProtectors := []
+             borrows := disableFrameBorrows mem.borrows 0 1 }))) :
+    wpMirExecFrameAndTraitsModularSym contract (fuel + 1) frameReturnMir
+      (.running
+        { frame := { blockIdx := 0, stmtIdx := 0, locals := [.init (.scalar retSc)] }
+          memory := { mem with callStack := [], activeCallee := .none, activeProtectors := [] } })
+      post :=
+  h
+
+/--
+With an active protector, `.return_` keeps the trusted protector check:
+`evalTerminatorFrameSymTree` is `evalTerminator` itself, so a protected local
+borrow still faults.
+-/
+theorem frameReturn_active_protector_still_faults (retVal : Value) (mem : Memory) :
+    (stepMirExecFrameSymTree frameReturnMir
+      (.running
+        { frame := { blockIdx := 0, stmtIdx := 0, locals := [.init retVal] }
+          memory :=
+            { mem with
+              borrows :=
+                [{ tag := 1, targetLocal := 0, targetProjection := [], perm := .unique
+                   protector := .some 7 }]
+              callStack := []
+              activeCallee := .none
+              activeProtectors := [7] } })).eval =
+      MirStepNode.fail .ub :=
+  rfl
+
+/-- `fn frame_return_const() -> u32 { 7 }`: `_0 = const 7_u32; return`. -/
+private def frameReturnConstMir : CapturedMir :=
+  mkMirBody "symbolic_eval_tests::frame_return_const" 0
+    [mkDecl .mut u32MirTy]
+    [{ statements :=
+         [mkStmt (.assign { local_ := 0, projection := [] } (.use (u32ConstOperand 7)))]
+       terminator := mkTerm .return_
+       isCleanup := false }]
+
+/--
+A named `#[external_spec]` contract with `frameReturnConstMir` as its signature
+sidecar.
+-/
+private def frameReturnExtContract : MirCallContract :=
+  externalSpecCallContract "symbolic_eval_tests::ext_target" frameReturnConstMir
+    (fun _ => True) (fun _ _ => True)
+
+/--
+The `by rfl` auto-parameter `h_eq` of `verifyExternalSpecContractMirSym` accepts
+a named `MirCallContract` that unfolds to `externalSpecCallContract`.
+`frameReturnConstMir` makes no call; section 16 exercises real external calls.
+-/
+theorem frameReturnConst_namedExternalSpecContract_verified :
+    ModularVerificationResult
+      { body := frameReturnConstMir
+        envAssumed := frameReturnExtContract.holdsOn
+        pre := fun args mem =>
+          args = [] ∧ mem.callStack = [] ∧ mem.activeCallee = .none ∧ mem.activeProtectors = []
+        post := fun _ _ retVal _ => retVal = .scalar { bits := 7, sizeBytes := 4 } } := by
+  refine verifyExternalSpecContractMirSym frameReturnExtContract frameReturnConstMir _ _ 3 ?_
+  rintro args ⟨_, _, _, _, _, _, _, _, _, _, _, _, _⟩ ⟨rfl, rfl, rfl, rfl⟩
+  rintro retVal mem' h_out
+  cases h_out
+  rfl
+
+/-! ## 16. Modular Callers of `#[external_spec]` Targets (`verifyExternalSpecContractMirSym`, `verifyExternalSpecContractPairWithCalleesMirSym`) -/
+
+/--
+Signature sidecar for a nounwind (`extern "C"`) `fn(u32) -> u32` target, so
+`externalSpecCallContract` forbids `.panicked` answers.
+-/
+private def extU32SidecarMir (defPath : DefPath) : CapturedMir := {
+  mkMirBody defPath 1
+    [mkDecl .mut u32MirTy, mkDecl .not u32MirTy]
+    [{ statements := [], terminator := mkTerm .return_, isCleanup := false }] with
+  fnAbi := { defaultTestFnAbi with canUnwind := false }
+}
+
+/-- `ext_a` returns `7` for every argument. -/
+private def extAContract : MirCallContract :=
+  externalSpecCallContract "symbolic_eval_tests::ext_a"
+    (extU32SidecarMir "symbolic_eval_tests::ext_a")
+    (fun _ => True)
+    (fun _ ret => ret = .scalar { bits := 7, sizeBytes := 4 })
+
+/-- `ext_b` requires the argument `7` and returns `9`. -/
+private def extBContract : MirCallContract :=
+  externalSpecCallContract "symbolic_eval_tests::ext_b"
+    (extU32SidecarMir "symbolic_eval_tests::ext_b")
+    (fun args => args = [.scalar { bits := 7, sizeBytes := 4 }])
+    (fun _ ret => ret = .scalar { bits := 9, sizeBytes := 4 })
+
+/-- `fn call_a(x: u32) -> u32 { ext_a(x) }`. -/
+private def extCallAMir : CapturedMir :=
+  mkMirBody "symbolic_eval_tests::call_a" 1
+    [mkDecl .mut u32MirTy, mkDecl .not u32MirTy]
+    [ { statements := []
+        terminator :=
+          mkTerm (.call (fnConstOp "symbolic_eval_tests::ext_a")
+            [.copy { local_ := 1, projection := [] }]
+            { local_ := 0, projection := [] }
+            (.some 1)
+            .continue_)
+        isCleanup := false }
+    , { statements := [], terminator := mkTerm .return_, isCleanup := false } ]
+
+/--
+`fn call_b_of_a(x: u32) -> u32 { ext_b(ext_a(x)) }`: `_2 = ext_a(copy _1)`,
+then `_0 = ext_b(move _2)`.
+-/
+private def extCallBOfAMir : CapturedMir :=
+  mkMirBody "symbolic_eval_tests::call_b_of_a" 1
+    [mkDecl .mut u32MirTy, mkDecl .not u32MirTy, mkDecl .mut u32MirTy]
+    [ { statements := [mkStmt (.storageLive 2)]
+        terminator :=
+          mkTerm (.call (fnConstOp "symbolic_eval_tests::ext_a")
+            [.copy { local_ := 1, projection := [] }]
+            { local_ := 2, projection := [] }
+            (.some 1)
+            .continue_)
+        isCleanup := false }
+    , { statements := []
+        terminator :=
+          mkTerm (.call (fnConstOp "symbolic_eval_tests::ext_b")
+            [.move { local_ := 2, projection := [] }]
+            { local_ := 0, projection := [] }
+            (.some 2)
+            .continue_)
+        isCleanup := false }
+    , { statements := [mkStmt (.storageDead 2)]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+/--
+Precondition of the callers above: one `u32` argument and a root call frame
+with no linked callees, trait impls, saved callers, or active protectors.
+-/
+private def extCallerPre (args : List Value) (mem : Memory) : Prop :=
+  (∃ x, x < 4294967296 ∧ args = [.scalar { bits := x, sizeBytes := 4 }]) ∧
+    mem.callees = [] ∧ mem.traitImpls = [] ∧ mem.callStack = [] ∧
+    mem.activeCallee = .none ∧ mem.activeProtectors = []
+
+/--
+`verifyExternalSpecContractMirSym` through a real external call. `ext_a`
+returns an arbitrary `memAfter`; the frame-restoring WP restores the caller
+frame fields from the call site, so the `.return_` of `call_a` reduces by WHNF
+(`evalTerminatorFrameSymTree`) although `memAfter.borrows` stays symbolic. The
+result is `ext_a`'s `ensures` value.
+-/
+theorem extCallA_externalSpecContract_verified :
+    ModularVerificationResult
+      { body := extCallAMir
+        envAssumed := extAContract.holdsOn
+        pre := extCallerPre
+        post := fun _ _ retVal _ => retVal = .scalar { bits := 7, sizeBytes := 4 } } := by
+  refine verifyExternalSpecContractMirSym extAContract extCallAMir _ _ 4 ?_
+  rintro args ⟨_, _, _, _, _, _, _, _, _, _, _, _, _⟩ ⟨⟨x, hx, rfl⟩, rfl, rfl, rfl, rfl, rfl⟩
+  (conv => whnf)
+  refine ⟨⟨rfl, rfl, ⟨⟨x, hx, rfl⟩, trivial⟩, trivial⟩, ?_⟩
+  rintro (⟨retVal, memAfter⟩ | memAfter | _) h_post
+  · obtain ⟨_, _, rfl⟩ := h_post
+    rintro _ _ ⟨⟩
+    rfl
+  · exact False.elim h_post
+  · rintro _ _ ⟨⟩
+
+/--
+`verifyExternalSpecContractPairWithCalleesMirSym` for a caller of two
+`#[external_spec]` targets, under the conjunctive rely that `cargo anneal`
+renders for two abstracted callees. Each call site uses only its own contract:
+`ext_b`'s precondition follows from `ext_a`'s postcondition, and the result is
+`ext_b`'s `ensures` value.
+-/
+theorem extCallBOfA_externalSpecContractPair_verified :
+    ModularVerificationResult
+      { body := extCallBOfAMir
+        envAssumed := fun h => extAContract.holdsOn h ∧ extBContract.holdsOn h
+        pre := extCallerPre
+        post := fun _ _ retVal _ => retVal = .scalar { bits := 9, sizeBytes := 4 } } := by
+  refine verifyExternalSpecContractPairWithCalleesMirSym extAContract extBContract
+    extCallBOfAMir [] _ _ 6 ?_
+  rintro args ⟨_, _, _, _, _, _, _, _, _, _, _, _, _⟩ ⟨⟨x, hx, rfl⟩, rfl, rfl, rfl, rfl, rfl⟩
+  (conv => whnf)
+  refine ⟨Or.inl ⟨rfl, rfl, ⟨⟨x, hx, rfl⟩, trivial⟩, trivial⟩, ?_⟩
+  rintro (⟨v, memA⟩ | memA | _) ⟨_, h_a, _⟩
+  · obtain ⟨_, _, rfl⟩ := h_a ⟨rfl, rfl, ⟨⟨x, hx, rfl⟩, trivial⟩, trivial⟩
+    (conv => whnf)
+    refine ⟨Or.inr ⟨rfl, rfl, ⟨⟨7, by decide, rfl⟩, trivial⟩, rfl⟩, ?_⟩
+    rintro (⟨w, memB⟩ | memB | _) ⟨_, _, h_b⟩
+    · obtain ⟨_, _, rfl⟩ := h_b ⟨rfl, rfl, ⟨⟨7, by decide, rfl⟩, trivial⟩, rfl⟩
+      rintro _ _ ⟨⟩
+      rfl
+    · exact False.elim (h_b ⟨rfl, rfl, ⟨⟨7, by decide, rfl⟩, trivial⟩, rfl⟩)
+    · rintro _ _ ⟨⟩
+  · exact False.elim (h_a ⟨rfl, rfl, ⟨⟨x, hx, rfl⟩, trivial⟩, trivial⟩)
+  · rintro _ _ ⟨⟩
 
 end Anneal.Rustc.V2026_06_01.SymbolicEvalTests
 

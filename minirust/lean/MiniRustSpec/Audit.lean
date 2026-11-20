@@ -16,6 +16,7 @@ import MiniRustSpec.Correspondence.RefWitness
 import MiniRustSpec.Correspondence.TbWitness
 import MiniRustSpec.Correspondence.Provenance
 import MiniRustSpec.Correspondence.ProvenanceWitness
+import MiniRustSpec.Correspondence.WideSliceDst
 import MiniRustSpec.Correspondence.IntrinsicBoundary
 
 /-!
@@ -42,7 +43,9 @@ theorems and witnesses), `[TB-AUDIT]` (the MR-3.2 Tree Borrows `wf` /
 `wfLive` / `no_specPanic` invariants, dereference-`move` and pointer-to-pointer
 dereference-copy correspondence lemmas, and `Correspondence.TbWitness` 3-way
 witnesses), `[PROV-AUDIT]` (the MR-3.3 provenance-cast theorems and
-witnesses), or `[DEINIT-AUDIT]` (the projected-`Deinit` fragment `inFragmentD`
+witnesses), `[WIDE-SLICE-DST-AUDIT]` (the wide-slice and unsized DST
+pointer-metadata, layout, indexing, reborrowing, and divergence theorems and
+witnesses of `Correspondence.WideSliceDst`), or `[DEINIT-AUDIT]` (the projected-`Deinit` fragment `inFragmentD`
 of `Correspondence.DeinitWindow`, the `Rvalue::Discriminant` lowering, the
 sub-place audit hook `subplace_audit_closure` of `Correspondence.DeinitBridge`
 — the one `MiniRustSpec` module that imports `Anneal.Mir.AdtAndControl` — and
@@ -6123,6 +6126,1018 @@ example :
 end StatementPins
 
 end DivMrAuditPins
+
+section WideSliceDstAuditPins
+
+open Trusted.Effect
+open Trusted.ITree
+open Trusted.Rustc.V2026_06_01
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+open Trusted.Rustc.V2026_06_01.Layout
+open MiniRustSpec
+open MiniRustSpec.Gen
+open MiniRustSpec.LibSpecr
+open MiniRustSpec.Interp
+open MiniRustSpec.Correspondence
+open MiniRustSpec.Correspondence.Witness
+open MiniRustSpec.Correspondence.PointerWitness
+open MiniRustSpec.Correspondence.RefWitness
+open MiniRustSpec.Correspondence.TbWitness
+open MiniRustSpec.Correspondence.WideSliceDst
+
+#check_theorem_deps "[WIDE-SLICE-DST-AUDIT]"
+  mrWideRawPtr_as_wide_pair_eq
+  mrWidePtr_type_layout_eq
+  mrSlice_type_layout_eq
+  encodeWidePtr_eq_encode_widePairTuple
+  checkPtrMetadata_elementCount_iff_anneal_usize
+  ptrMetadata_wide_and_thin_lockstep
+  translateRvalue_cast_ptrToPtr_wide_to_thin_and_wide
+  ptrToPtr_wide_to_thin_and_wide_to_wide_lockstep
+  ptrToPtr_wide_to_thin_already_subslice_lockstep
+  aggregate_rawPtr_and_to_raw_parts_roundtrip_lockstep
+  sizeOfVal_and_alignOfVal_slice_lockstep
+  sizeOfVal_and_alignOfVal_str_empty_zst_lockstep
+  checkPtr_sliceRef_overflow_ub
+  checkPtr_sliceRef_empty_ok
+  evalRvalue_len_wide_slice_borrow_and_disabled_contrast
+  wideSliceFromRawPartsMetadataRoundTrip_three_way
+  wideSliceIndexReadWriteAndOobUb_three_way
+  wideSliceTreeBorrowsDisabledVsMetadataOk_three_way
+  wideSliceSizeAndAlignOfVal_u32_str_empty_zst_witnesses
+  wideSliceIsizeMaxBoundary_and_scalarAddrDivergence_canaries
+  compute_size_and_align_slice_eq
+  x86_64_valid_size_nat_eq
+  computeSize_computeAlign_slice_total
+  checkPtr_rawSlice_ok
+  sliceSizeOverflow_minirust_ub_locus
+  minirust_interp_metadata_unops_unsupported
+  div_rawSliceSizeOfVal_isizeMax_anneal_ub_vs_minirust_total
+  wideSliceParentWrite_aliasingDivergence_and_metadata_three_way
+  WideSliceThinPtrRel.of_ctxWithBorrows
+  WideSliceThinPtrRel.inBounds_addr
+  WideSliceValRel.checkPtr_rawSlice_ok
+  ptrMetadata_wideSliceValRel_lockstep
+  ptrToPtr_wideSliceValRel_global_to_from_raw_parts_roundtrip
+  ptrToPtr_wideSliceValRel_borrowBacked_subslice_and_retag
+  translatePlace_and_translateRvalue_wideSlice_boundary
+  wideSliceWitnesses_translateStatement_correspondence
+  WideSliceDst.dropValues_eq_drop
+  WideSliceDst.takeValues_eq_take
+  evalRvalue_len_and_frozen_mut_reborrow_wide_slice
+  minirust_evalPlace_index_rawSlice
+  evalPlaceRead_index_wide_slice_borrowBacked_lockstep
+  checkPtr_sliceRef_null_and_zeroByte_reborrow_divergence
+  writeProjectedValue_and_subslice_reborrow_wide_slice
+  readProjectedValue_constantIndex_wide_slice_and_saturation
+
+namespace WideSliceDstStatementPins
+
+example (mutbl : MirAst.Mutability) (elemSize : LibSpecr.Size)
+    (elemAlign : LibSpecr.Align) (freeze : Bool) :
+    PtrType.meta_kind (.Raw .ElementCount) = .ElementCount ∧
+    PtrType.meta_kind (sliceRefPtrType mutbl elemSize elemAlign freeze) = .ElementCount ∧
+    PtrType.as_wide_pair (.Raw .ElementCount) = some mrWidePairTupleTy ∧
+    PtrType.as_wide_pair (sliceRefPtrType mutbl elemSize elemAlign freeze) =
+      some mrWidePairTupleTy :=
+  mrWideRawPtr_as_wide_pair_eq mutbl elemSize elemAlign freeze
+
+example (mutbl : MirAst.Mutability) (elemSize : LibSpecr.Size)
+    (elemAlign : LibSpecr.Align) (freeze : Bool) :
+    Type.layout (.Ptr (.Raw .ElementCount)) = .ok (.Sized ⟨16⟩ ⟨8⟩) ∧
+    Type.layout (.Ptr (sliceRefPtrType mutbl elemSize elemAlign freeze)) = .ok (.Sized ⟨16⟩ ⟨8⟩) ∧
+    Type.layout mrWidePairTupleTy = .ok (.Sized ⟨16⟩ ⟨8⟩) ∧
+    2 * layoutPointerBytes emptyLayoutTable = 16 :=
+  mrWidePtr_type_layout_eq mutbl elemSize elemAlign freeze
+
+example :
+    let u8It : IntType := ⟨.Unsigned, ⟨1⟩⟩
+    Type.layout (.Slice (.Int u32)) = .ok (.Slice ⟨4⟩ ⟨4⟩) ∧
+    Type.layout (.Slice (.Int u8It)) = .ok (.Slice ⟨1⟩ ⟨1⟩) ∧
+    LayoutStrategy.is_sized (.Slice ⟨4⟩ ⟨4⟩) = false ∧
+    LayoutStrategy.is_sized (.Slice ⟨1⟩ ⟨1⟩) = false :=
+  mrSlice_type_layout_eq
+
+example (thin : Ptr) (len : Int)
+    (mutbl : MirAst.Mutability) (elemSize : LibSpecr.Size) (elemAlign : LibSpecr.Align)
+    (freeze : Bool) (bytes : List Byte) :
+    Type.encode (.Ptr (.Raw .ElementCount)) (mrWidePtrVal thin len) =
+      encodeWidePtr .ElementCount (ThinPointer.widen thin (some (.ElementCount len))) ∧
+    Type.encode (.Ptr (sliceRefPtrType mutbl elemSize elemAlign freeze))
+        (mrWidePtrVal thin len) =
+      encodeWidePtr .ElementCount (ThinPointer.widen thin (some (.ElementCount len))) ∧
+    Type.decode (.Ptr (.Raw .ElementCount)) bytes = decodeWidePtr .ElementCount bytes ∧
+    Type.decode (.Ptr (sliceRefPtrType mutbl elemSize elemAlign freeze)) bytes =
+      decodeWidePtr .ElementCount bytes ∧
+    (∀ thinBytes metaBytes,
+      encodePtr thin = .ok thinBytes →
+      thinBytes.length = 8 →
+      Type.encodeInt IntType.usize_ty (.Int len) = .ok metaBytes →
+      metaBytes.length = 8 →
+      encodeWidePtr .ElementCount (ThinPointer.widen thin (some (.ElementCount len))) =
+        .ok (thinBytes ++ metaBytes) ∧
+      Type.encode mrWidePairTupleTy (.Tuple [.Ptr (ThinPointer.widen thin none), .Int len]) =
+        .ok (thinBytes ++ metaBytes)) :=
+  encodeWidePtr_eq_encode_widePairTuple thin len mutbl elemSize elemAlign freeze bytes
+
+example (len : Nat) :
+    (checkPtrMetadata (some (.ElementCount (Int.ofNat len))) .ElementCount = .ok () ↔
+      len < scalarModulus 8) ∧
+    (scalarModulus 8 ≤ len →
+      checkPtrMetadata (some (.ElementCount (Int.ofNat len))) .ElementCount =
+        .error (.ub "Value::Int: invalid integer value")) ∧
+    checkPtrMetadata none .ElementCount = .error (.ub "Value::Ptr: invalid metadata") ∧
+    checkPtrMetadata (some (.ElementCount (Int.ofNat len))) .None =
+      .error (.ub "Value::Ptr: invalid metadata") :=
+  checkPtrMetadata_elementCount_iff_anneal_usize len
+
+example
+    (locals locals' : List LocalSlot) (wideOp scalarWideOp thinOp : Operand)
+    (mem : MirSemantics.Memory) (localDecls : List MirAst.LocalDecl)
+    (p : ProvenancePtr) (thin : Ptr) (addr len : Nat)
+    (hWideOp : evalOperand locals wideOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok (annealWidePtrVal p len 8) locals')
+    (hScalarTy : isNonWidePtrAggregateTy (operandTy localDecls emptyLayoutTable scalarWideOp) =
+      false)
+    (hLen : len < scalarModulus 8)
+    (hScalarOp : evalOperand locals scalarWideOp mem.borrows mem.globals emptyLayoutTable
+      mem.callerLocals localDecls mem.callStack = .ok (annealWideScalarPtrVal addr len 8) locals')
+    (hThinOp : evalOperand locals thinOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok (.ptr p 8) locals') :
+    (evalRvalue locals (.unaryOp .ptrMetadata wideOp) mem localDecls emptyLayoutTable =
+       .ok (.scalar ⟨len, 8⟩) locals' mem ∧
+     PointerMetaKind.encode_as_value .ElementCount
+         (ThinPointer.widen thin (some (.ElementCount (Int.ofNat len)))).metadata =
+       .ok (.Int (Int.ofNat len))) ∧
+    (evalRvalue locals (.unaryOp .ptrMetadata scalarWideOp) mem localDecls emptyLayoutTable =
+       .ok (.scalar ⟨len, 8⟩) locals' mem ∧
+     PointerMetaKind.encode_as_value .ElementCount (some (.ElementCount (Int.ofNat len))) =
+       .ok (.Int (Int.ofNat len))) ∧
+    (evalRvalue locals (.unaryOp .ptrMetadata thinOp) mem localDecls emptyLayoutTable =
+       .ok .unit locals' mem ∧
+     PointerMetaKind.encode_as_value .None none = .ok (.Tuple [])) :=
+  ptrMetadata_wide_and_thin_lockstep
+    locals locals' wideOp scalarWideOp thinOp mem localDecls p thin addr len
+    hWideOp hScalarTy hLen hScalarOp hThinOp
+
+example
+    (layouts : LayoutTable) (decls : List MirAst.LocalDecl) (i : Nat) (d : MirAst.LocalDecl)
+    (thinCastTy wideCastTy : Ty)
+    (hDecl : decls[i]? = some d)
+    (hSrcMeta : rawPtrMetaOf d.ty = some .ElementCount)
+    (hThinMeta : rawPtrMetaOf thinCastTy = some .None)
+    (hWideMeta : rawPtrMetaOf wideCastTy = some .ElementCount) :
+    translateRvalue layouts decls none (.cast .ptrToPtr (.copy (local_ i)) thinCastTy) =
+      some (.UnOp .GetThinPointer (.Load (.Local (localName i)))) ∧
+    translateRvalue layouts decls none (.cast .ptrToPtr (.copy (local_ i)) wideCastTy) =
+      some (.Load (.Local (localName i))) :=
+  translateRvalue_cast_ptrToPtr_wide_to_thin_and_wide
+    layouts decls i d thinCastTy wideCastTy hDecl hSrcMeta hThinMeta hWideMeta
+
+example
+    (locals locals' : List LocalSlot) (op : Operand) (thinTargetTy wideTargetTy : Ty)
+    (mem : MirSemantics.Memory) (localDecls : List MirAst.LocalDecl)
+    (p : ProvenancePtr) (len : Nat) (thin : Ptr)
+    (thinTB : ThinPointer TreeBorrowsProvenance) (ptrTy : PtrType)
+    (hThin : isThinRawPtrTy thinTargetTy = true)
+    (hNotThin : isThinRawPtrTy wideTargetTy = false)
+    (hWide : wideRawPtrIsDyn? wideTargetTy = some false)
+    (hOp : evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok (annealWidePtrVal p len 8) locals') :
+    ((lookupBorrow mem.borrows p.tag = none →
+        evalRvalue locals (.cast .ptrToPtr op thinTargetTy) mem localDecls emptyLayoutTable =
+          .ok (.ptr p 8) locals' mem) ∧
+     evalUnOp .GetThinPointer (mrWidePtrVal thin (Int.ofNat len), .Ptr ptrTy) =
+       .ok (.Ptr (ThinPointer.widen thin none), .Ptr (.Raw .None)) ∧
+     evalUnOpM (M := TBM) .GetThinPointer (mrWidePtrValM thinTB (Int.ofNat len), .Ptr ptrTy) =
+       .ok (.Ptr (ThinPointer.widen thinTB none), .Ptr (.Raw .None))) ∧
+    evalRvalue locals (.cast .ptrToPtr op wideTargetTy) mem localDecls emptyLayoutTable =
+      .ok (annealWidePtrVal p len 8) locals' mem :=
+  ptrToPtr_wide_to_thin_and_wide_to_wide_lockstep
+    locals locals' op thinTargetTy wideTargetTy mem localDecls p len thin thinTB ptrTy
+    hThin hNotThin hWide hOp
+
+example
+    (locals locals' : List LocalSlot) (op : Operand) (thinTargetTy : Ty)
+    (mem : MirSemantics.Memory) (localDecls : List MirAst.LocalDecl)
+    (p : ProvenancePtr) (len : Nat) (parentEntry : BorrowEntry) (rootVal : MirSemantics.Value)
+    (containerProj : List ProjectionElem) (baseIdx : Nat) (elems : List MirSemantics.Value)
+    (rawElemOffset : Nat) (thin : Ptr) (thinTB : ThinPointer TreeBorrowsProvenance)
+    (ptrTy : PtrType)
+    (hThin : isThinRawPtrTy thinTargetTy = true)
+    (hOp : evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok (annealWidePtrVal p len 8) locals')
+    (hBorrow : lookupBorrow mem.borrows p.tag = some parentEntry)
+    (hPerm : parentEntry.perm ≠ .disabled)
+    (hRoot : activeFrameSlot? locals' mem.callStack parentEntry.targetFrameDepth
+      parentEntry.targetLocal = some (.init rootVal))
+    (hRead : readSliceBackingAggregate? locals' rootVal
+      (normalizeSubsliceProjections (stripTransparentProjections parentEntry.targetProjection))
+      len = some (containerProj, baseIdx, elems))
+    (hOff : byteOffsetToElemIdx? p.offsetBytes (inferElemListByteStride elems) =
+      some rawElemOffset)
+    (hBound : Nat.ble (Nat.add (Nat.add rawElemOffset baseIdx) len) (Trusted.Sequence.length elems) = true)
+    (hAlready : Bool.and (endsWithSubslice containerProj)
+      (Bool.and (Nat.beq (Nat.add rawElemOffset baseIdx) 0) (Nat.beq len (Trusted.Sequence.length elems))) =
+        true) :
+    evalRvalue locals (.cast .ptrToPtr op thinTargetTy) mem localDecls emptyLayoutTable =
+      .ok (.ptr p 8) locals' mem ∧
+    evalUnOp .GetThinPointer (mrWidePtrVal thin (Int.ofNat len), .Ptr ptrTy) =
+      .ok (.Ptr (ThinPointer.widen thin none), .Ptr (.Raw .None)) ∧
+    evalUnOpM (M := TBM) .GetThinPointer (mrWidePtrValM thinTB (Int.ofNat len), .Ptr ptrTy) =
+      .ok (.Ptr (ThinPointer.widen thinTB none), .Ptr (.Raw .None)) :=
+  ptrToPtr_wide_to_thin_already_subslice_lockstep
+    locals locals' op thinTargetTy mem localDecls p len parentEntry rootVal
+    containerProj baseIdx elems rawElemOffset thin thinTB ptrTy
+    hThin hOp hBorrow hPerm hRoot hRead hOff hBound hAlready
+
+example
+    (locals locals₁ locals₂ : List LocalSlot) (pointeeTy : Ty) (mutability : MirAst.Mutability)
+    (dataOp metaOp : Operand) (mem : MirSemantics.Memory) (localDecls : List MirAst.LocalDecl)
+    (p : ProvenancePtr) (len : Nat) (thin : Ptr) (thinTB : ThinPointer TreeBorrowsProvenance)
+    (hWide : wideAggregatePointeeIsDyn? pointeeTy = some false)
+    (hData : evalOperand locals dataOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok (.ptr p 8) locals₁)
+    (hMeta : evalOperand locals₁ metaOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok (.scalar ⟨len, 8⟩) locals₂) :
+    evalRvalue locals (.aggregate (.rawPtr pointeeTy mutability) [dataOp, metaOp]) mem localDecls
+        emptyLayoutTable =
+      .ok (annealWidePtrVal p len 8) locals₂ mem ∧
+    (do
+      let (thinVal, _) ← evalUnOp .GetThinPointer
+        (mrWidePtrVal thin (Int.ofNat len), .Ptr (.Raw .ElementCount))
+      let metaVal ← PointerMetaKind.encode_as_value .ElementCount
+        (ThinPointer.widen thin (some (.ElementCount (Int.ofNat len)))).metadata
+      let decodedMeta ← PointerMetaKind.decode_value .ElementCount metaVal
+      match thinVal with
+      | .Ptr ⟨thin', none⟩ => pure (Gen.Value.Ptr (ThinPointer.widen thin' decodedMeta))
+      | _ => specPanic "expected thin pointer") =
+      .ok (mrWidePtrVal thin (Int.ofNat len)) ∧
+    (do
+      let (thinValTB, _) ← evalUnOpM (M := TBM) .GetThinPointer
+        (mrWidePtrValM thinTB (Int.ofNat len), .Ptr (.Raw .ElementCount))
+      match thinValTB with
+      | .Ptr ⟨thinTB', none⟩ => pure (mrWidePtrValM thinTB' (Int.ofNat len))
+      | _ => specPanic "expected thin pointer") =
+      .ok (mrWidePtrValM thinTB (Int.ofNat len)) :=
+  aggregate_rawPtr_and_to_raw_parts_roundtrip_lockstep
+    locals locals₁ locals₂ pointeeTy mutability dataOp metaOp mem localDecls p len thin thinTB
+    hWide hData hMeta
+
+example
+    (s : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List MirAst.LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (locals' : List LocalSlot)
+    (destination : MirAst.Place) (targetBb : BasicBlockIdx)
+    (elemTy : RigidTy) (elemSz elemAlign : Nat) (p : ProvenancePtr) (len : Nat)
+    (vtables : Ptr → Interp VTable)
+    (hPt : resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps =
+      some (.slice elemTy))
+    (hSz : intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts elemTy = some elemSz)
+    (hAlign : intrinsicRigidTyAlign bodyLocalDecls bodyLayouts elemTy = some elemAlign)
+    (hLen : len < scalarModulus 8) :
+    LayoutStrategy.compute_size_and_align vtables (.Slice ⟨elemSz⟩ ⟨elemAlign⟩)
+        (some (.ElementCount (Int.ofNat len))) =
+      .ok (⟨len * elemSz⟩, ⟨elemAlign⟩) ∧
+    x86_64.valid_size ⟨len * elemSz⟩ = decide (len * elemSz < signedHalfModulus 8) ∧
+    (len * elemSz < signedHalfModulus 8 →
+      x86_64.valid_size ⟨len * elemSz⟩ = true ∧
+      evalSliceSizeOfVal elemSz ⟨len, 8⟩ = some ⟨len * elemSz, 8⟩ ∧
+      evalNonSelectIntrinsicCall .sizeOfVal s target bodyLocalDecls bodyLayouts argOps
+          [annealWidePtrVal p len 8] locals' destination targetBb =
+        writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨len * elemSz, 8⟩) ∧
+      evalNonSelectIntrinsicCall .alignOfVal s target bodyLocalDecls bodyLayouts argOps
+          [annealWidePtrVal p len 8] locals' destination targetBb =
+        writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨elemAlign, 8⟩)) ∧
+    (signedHalfModulus 8 ≤ len * elemSz →
+      x86_64.valid_size ⟨len * elemSz⟩ = false ∧
+      evalSliceSizeOfVal elemSz ⟨len, 8⟩ = none ∧
+      evalNonSelectIntrinsicCall .sizeOfVal s target bodyLocalDecls bodyLayouts argOps
+          [annealWidePtrVal p len 8] locals' destination targetBb = MirStepNode.fail .ub ∧
+      evalNonSelectIntrinsicCall .alignOfVal s target bodyLocalDecls bodyLayouts argOps
+          [annealWidePtrVal p len 8] locals' destination targetBb = MirStepNode.fail .ub) :=
+  sizeOfVal_and_alignOfVal_slice_lockstep
+    s target bodyLocalDecls bodyLayouts argOps locals' destination targetBb
+    elemTy elemSz elemAlign p len vtables hPt hSz hAlign hLen
+
+example
+    (s : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List MirAst.LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (locals' : List LocalSlot)
+    (destination : MirAst.Place) (targetBb : BasicBlockIdx)
+    (p : ProvenancePtr) (len elemSz elemAlign : Nat) (vtables : Ptr → Interp VTable)
+    (hPtStr : resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps = some .str)
+    (hLen : len < scalarModulus 8) :
+    LayoutStrategy.compute_size_and_align vtables (.Slice ⟨1⟩ ⟨1⟩)
+        (some (.ElementCount (Int.ofNat len))) =
+      .ok (⟨len⟩, ⟨1⟩) ∧
+    (len < signedHalfModulus 8 →
+      evalNonSelectIntrinsicCall .sizeOfVal s target bodyLocalDecls bodyLayouts argOps
+          [annealWidePtrVal p len 8] locals' destination targetBb =
+        writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨len, 8⟩) ∧
+      evalNonSelectIntrinsicCall .alignOfVal s target bodyLocalDecls bodyLayouts argOps
+          [annealWidePtrVal p len 8] locals' destination targetBb =
+        writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨1, 8⟩)) ∧
+    (signedHalfModulus 8 ≤ len →
+      evalNonSelectIntrinsicCall .sizeOfVal s target bodyLocalDecls bodyLayouts argOps
+          [annealWidePtrVal p len 8] locals' destination targetBb = MirStepNode.fail .ub ∧
+      evalNonSelectIntrinsicCall .alignOfVal s target bodyLocalDecls bodyLayouts argOps
+          [annealWidePtrVal p len 8] locals' destination targetBb = MirStepNode.fail .ub) ∧
+    (evalSliceSizeOfVal elemSz ⟨0, 8⟩ = some ⟨0, 8⟩ ∧
+     LayoutStrategy.compute_size_and_align vtables (.Slice ⟨elemSz⟩ ⟨elemAlign⟩)
+         (some (.ElementCount 0)) =
+       .ok (⟨0⟩, ⟨elemAlign⟩)) ∧
+    (evalSliceSizeOfVal 0 ⟨len, 8⟩ = some ⟨0, 8⟩ ∧
+     LayoutStrategy.compute_size_and_align vtables (.Slice ⟨0⟩ ⟨elemAlign⟩)
+         (some (.ElementCount (Int.ofNat len))) =
+       .ok (⟨0⟩, ⟨elemAlign⟩)) :=
+  sizeOfVal_and_alignOfVal_str_empty_zst_lockstep
+    s target bodyLocalDecls bodyLayouts argOps locals' destination targetBb
+    p len elemSz elemAlign vtables hPtStr hLen
+
+example
+    (locals locals' : List LocalSlot) (place : MirAst.Place) (ptrOp : Operand)
+    (mem : MirSemantics.Memory) (localDecls : List MirAst.LocalDecl)
+    (initProj : List ProjectionElem) (elem : RigidTy) (lIdx : LayoutIdx)
+    (entry : BorrowEntry) (p : ProvenancePtr) (len : Nat)
+    (hTy : placeTy localDecls emptyLayoutTable place =
+      some { kind := .slice elem, layoutIdx := lIdx })
+    (hSplit : splitLastDeref? place.projection = some initProj)
+    (hRead : evalPlaceRead locals { local_ := place.local_, projection := initProj } mem.borrows
+      mem.globals emptyLayoutTable mem.callerLocals localDecls mem.callStack =
+        .ok (annealWidePtrVal p len 8) locals')
+    (hOp : evalOperand locals ptrOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok (annealWidePtrVal p len 8) locals')
+    (hBorrow : lookupBorrow mem.borrows p.tag = some entry)
+    (hDis : entry.perm = .disabled) :
+    evalRvalue locals (.len place) mem localDecls emptyLayoutTable = .ub ∧
+    evalRvalue locals (.unaryOp .ptrMetadata ptrOp) mem localDecls emptyLayoutTable =
+      .ok (.scalar ⟨len, 8⟩) locals' mem :=
+  evalRvalue_len_wide_slice_borrow_and_disabled_contrast
+    locals locals' place ptrOp mem localDecls initProj elem lIdx entry p len
+    hTy hSplit hRead hOp hBorrow hDis
+
+example (n : Nat) (xs : List MirSemantics.Value) : dropValues n xs = xs.drop n :=
+  WideSliceDst.dropValues_eq_drop n xs
+
+example (n : Nat) (xs : List MirSemantics.Value) : takeValues n xs = xs.take n :=
+  WideSliceDst.takeValues_eq_take n xs
+
+example
+    (thin : Ptr) (mutbl : MirAst.Mutability) (elemSz elemAlign : Nat) (freeze : Bool)
+    (len : Nat) (m : Option Mach)
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hLen : len < scalarModulus 8)
+    (hOverflow : x86_64.valid_size ⟨len * elemSz⟩ = false) :
+    checkPtr (ThinPointer.widen thin (some (.ElementCount (Int.ofNat len))))
+      (sliceRefPtrType mutbl ⟨elemSz⟩ ⟨elemAlign⟩ freeze) m =
+      .error (.ub "Value::Ptr: total size exeeds isize::MAX") :=
+  checkPtr_sliceRef_overflow_ub thin mutbl elemSz elemAlign freeze len m hAddr hLen hOverflow
+
+example
+    (thin : Ptr) (mutbl : MirAst.Mutability) (elemSz elemAlign : Nat) (freeze : Bool)
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hNonNull : (thin.addr != 0) = true)
+    (hAligned : Align.is_aligned ⟨elemAlign⟩ thin.addr = true) :
+    checkPtr (ThinPointer.widen thin (some (.ElementCount 0)))
+      (sliceRefPtrType mutbl ⟨elemSz⟩ ⟨elemAlign⟩ freeze) none = .ok () :=
+  checkPtr_sliceRef_empty_ok thin mutbl elemSz elemAlign freeze hAddr hNonNull hAligned
+
+example :
+    let u32SlMir := wideSliceSizeAlignMir (.uint .u32) 4
+    let emptySlMir := wideSliceSizeAlignMir (.uint .u32) 0
+    let zstSlMir := wideSliceSizeAlignMir (.tuple []) 1000
+    let strMir := wideStrSizeAlignMir 5
+    (∃ mem, ReachesRet (mirTree u32SlMir (initMachineState u32SlMir [.scalar ⟨0, 4⟩])) []
+      (.normal (.scalar ⟨20, 4⟩, mem))) ∧
+    computeSize wideRawPartsMInit (.Slice ⟨4⟩ ⟨4⟩) (some (.ElementCount 4)) = .ok ⟨16⟩ ∧
+    computeAlign wideRawPartsMInit (.Slice ⟨4⟩ ⟨4⟩) (some (.ElementCount 4)) = .ok ⟨4⟩ ∧
+    (∃ mem, ReachesRet (mirTree strMir (initMachineState strMir [.scalar ⟨0, 4⟩])) []
+      (.normal (.scalar ⟨6, 4⟩, mem))) ∧
+    computeSize wideRawPartsMInit (.Slice ⟨1⟩ ⟨1⟩) (some (.ElementCount 5)) = .ok ⟨5⟩ ∧
+    computeAlign wideRawPartsMInit (.Slice ⟨1⟩ ⟨1⟩) (some (.ElementCount 5)) = .ok ⟨1⟩ ∧
+    (∃ mem, ReachesRet (mirTree emptySlMir (initMachineState emptySlMir [.scalar ⟨0, 4⟩])) []
+      (.normal (.scalar ⟨4, 4⟩, mem))) ∧
+    computeSize wideRawPartsMInit (.Slice ⟨4⟩ ⟨4⟩) (some (.ElementCount 0)) = .ok ⟨0⟩ ∧
+    computeAlign wideRawPartsMInit (.Slice ⟨4⟩ ⟨4⟩) (some (.ElementCount 0)) = .ok ⟨4⟩ ∧
+    (∃ mem, ReachesRet (mirTree zstSlMir (initMachineState zstSlMir [.scalar ⟨0, 4⟩])) []
+      (.normal (.scalar ⟨1, 4⟩, mem))) ∧
+    computeSize wideRawPartsMInit (.Slice ⟨0⟩ ⟨1⟩) (some (.ElementCount 1000)) = .ok ⟨0⟩ ∧
+    computeAlign wideRawPartsMInit (.Slice ⟨0⟩ ⟨1⟩) (some (.ElementCount 1000)) = .ok ⟨1⟩ :=
+  wideSliceSizeAndAlignOfVal_u32_str_empty_zst_witnesses
+
+example :
+    evalSliceSizeOfVal 4 ⟨u32SliceMaxOkLen, 8⟩ = some ⟨u32SliceMaxOkLen * 4, 8⟩ ∧
+    x86_64.valid_size ⟨u32SliceMaxOkLen * 4⟩ = true ∧
+    evalSliceSizeOfVal 4 ⟨u32SliceOverflowLen, 8⟩ = none ∧
+    x86_64.valid_size ⟨u32SliceOverflowLen * 4⟩ = false ∧
+    (∃ tr u, Reaches
+      (mirTree u32SliceOverflowMir (initMachineState u32SliceOverflowMir [.scalar ⟨0, 4⟩])) tr u ∧
+      FaultNow u) ∧
+    checkPtr overflowingU32SlicePtr (sliceRefPtrType .not ⟨4⟩ ⟨4⟩) (some wideRawPartsMInit) =
+      .error (.ub "Value::Ptr: total size exeeds isize::MAX") ∧
+    checkPtr danglingEmptyU32SlicePtr (sliceRefPtrType .not ⟨4⟩ ⟨4⟩) none = .ok () ∧
+    evalNonSelectIntrinsicCall .sizeOfVal wideRawPartsS0 sizeOfValSliceU32Target
+        wideRawPartsMir.localDecls emptyLayoutTable [] [annealWideScalarPtrVal 4 0 8]
+        wideRawPartsS0.frame.locals (local_ 0) 1 =
+      MirStepNode.fail .ub ∧
+    evalNonSelectIntrinsicCall .alignOfVal wideRawPartsS0 alignOfValSliceU32Target
+        wideRawPartsMir.localDecls emptyLayoutTable [] [annealWideScalarPtrVal 4 0 8]
+        wideRawPartsS0.frame.locals (local_ 0) 1 =
+      MirStepNode.fail .ub :=
+  wideSliceIsizeMaxBoundary_and_scalarAddrDivergence_canaries
+
+example (lookup : Ptr → Interp VTable) (elemSz elemAlign len : Nat) :
+    LayoutStrategy.compute_size_and_align lookup (.Slice ⟨elemSz⟩ ⟨elemAlign⟩)
+        (some (.ElementCount (Int.ofNat len))) =
+      .ok (⟨len * elemSz⟩, ⟨elemAlign⟩) :=
+  compute_size_and_align_slice_eq lookup elemSz elemAlign len
+
+example (n : Nat) :
+    x86_64.valid_size ⟨n⟩ = decide (n < signedHalfModulus 8) :=
+  x86_64_valid_size_nat_eq n
+
+example (m : Mach) (elemSz elemAlign len : Nat) :
+    computeSize m (.Slice ⟨elemSz⟩ ⟨elemAlign⟩) (some (.ElementCount (Int.ofNat len))) =
+      .ok ⟨len * elemSz⟩ ∧
+    computeAlign m (.Slice ⟨elemSz⟩ ⟨elemAlign⟩) (some (.ElementCount (Int.ofNat len))) =
+      .ok ⟨elemAlign⟩ :=
+  computeSize_computeAlign_slice_total m elemSz elemAlign len
+
+example (thin : Ptr) (len : Nat) (m : Option Mach)
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hLen : len < scalarModulus 8) :
+    checkPtr (ThinPointer.widen thin (some (.ElementCount (Int.ofNat len)))) (.Raw .ElementCount)
+        m = .ok () :=
+  WideSliceDst.checkPtr_rawSlice_ok thin len m hAddr hLen
+
+example (sty ty : Gen.Type) (v : Val) (m : Option Mach)
+    (vTB : Gen.Value TBM) (mTB : Option MachTB) :
+    evalUnOp .GetMetadata (v, ty) m =
+      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" ∧
+    evalUnOp (.ComputeSize sty) (v, ty) m =
+      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" ∧
+    evalUnOp (.ComputeAlign sty) (v, ty) m =
+      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" ∧
+    evalUnOpM (M := TBM) .GetMetadata (vTB, ty) mTB =
+      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" ∧
+    evalUnOpM (M := TBM) (.ComputeSize sty) (vTB, ty) mTB =
+      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" ∧
+    evalUnOpM (M := TBM) (.ComputeAlign sty) (vTB, ty) mTB =
+      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" :=
+  minirust_interp_metadata_unops_unsupported sty ty v m vTB mTB
+
+example :
+    (∃ mem, ReachesRet (mirTree wideRawPartsMir wideRawPartsS0) []
+      (.normal (.scalar ⟨46, 4⟩, mem))) ∧
+    MirNoUBTree (mirTree wideRawPartsMir wideRawPartsS0) ∧
+    (Interp.steps 25 wideRawPartsMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 46 }, [1]) ∧
+    (Interp.stepsTB 25 wideRawPartsTBInit).toOption.map
+        (fun m =>
+          ({ retAlloc := m.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB))
+             stackDepths := m.threads.map (·.stack.length) } : TBRetOutcome)) =
+      tbRetU32 46 :=
+  wideSliceFromRawPartsMetadataRoundTrip_three_way
+
+example :
+    (∃ mem, ReachesRet (mirTree wideSliceIdxReadWriteMir wideSliceIdxReadWriteS0) []
+      (.normal (.scalar ⟨133, 4⟩, mem))) ∧
+    MirNoUBTree (mirTree wideSliceIdxReadWriteMir wideSliceIdxReadWriteS0) ∧
+    (Interp.steps 26 wideSliceIdxReadWriteMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 133 }, [1]) ∧
+    (Interp.stepsTB 26 wideSliceIdxReadWriteTBInit).toOption.map
+        (fun m =>
+          ({ retAlloc := m.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB))
+             stackDepths := m.threads.map (·.stack.length) } : TBRetOutcome)) =
+      tbRetU32 133 ∧
+    (∃ tr u, Reaches (mirTree wideSliceIdxOobMir wideSliceIdxOobS0) tr u ∧ FaultNow u) ∧
+    stopAfterM wideSliceIdxOobMInit 10 = some (.ub "access to out-of-bounds index") ∧
+    stopAfterTB wideSliceIdxOobTBInit 10 = some (.ub "access to out-of-bounds index") :=
+  wideSliceIndexReadWriteAndOobUb_three_way
+
+example :
+    (∃ tr u, Reaches (mirTree wideSliceDisabledDerefUbMir wideSliceDisabledDerefUbS0) tr u ∧
+      FaultNow u) ∧
+    stopAfterTB wideSliceDisabledDerefUbTBInit 12 =
+      some (.ub "Tree Borrows: local read of Disabled reference") ∧
+    (∃ mem, ReachesRet
+      (mirTree wideSliceMetadataAfterParentWriteMir wideSliceMetadataAfterParentWriteS0) []
+      (.normal (.scalar ⟨4, 4⟩, mem))) ∧
+    MirNoUBTree
+      (mirTree wideSliceMetadataAfterParentWriteMir wideSliceMetadataAfterParentWriteS0) :=
+  wideSliceTreeBorrowsDisabledVsMetadataOk_three_way
+
+/- MiniRust's `isize::MAX` UB is raised only by `check_ptr` on safe references; raw wide pointers
+and `compute_size` / `compute_align` are total. -/
+example (m : Mach) (thin : Ptr) (mutbl : MirAst.Mutability) (elemSz elemAlign : Nat)
+    (freeze : Bool) (len : Nat)
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hLen : len < scalarModulus 8)
+    (hOverflow : signedHalfModulus 8 ≤ len * elemSz) :
+    checkPtr (ThinPointer.widen thin (some (.ElementCount (Int.ofNat len))))
+        (sliceRefPtrType mutbl ⟨elemSz⟩ ⟨elemAlign⟩ freeze) (some m) =
+      .error (.ub "Value::Ptr: total size exeeds isize::MAX") ∧
+    checkPtr (ThinPointer.widen thin (some (.ElementCount (Int.ofNat len)))) (.Raw .ElementCount)
+        (some m) = .ok () ∧
+    computeSize m (.Slice ⟨elemSz⟩ ⟨elemAlign⟩) (some (.ElementCount (Int.ofNat len))) =
+      .ok ⟨len * elemSz⟩ ∧
+    computeAlign m (.Slice ⟨elemSz⟩ ⟨elemAlign⟩) (some (.ElementCount (Int.ofNat len))) =
+      .ok ⟨elemAlign⟩ :=
+  sliceSizeOverflow_minirust_ub_locus m thin mutbl elemSz elemAlign freeze len hAddr hLen hOverflow
+
+/- `DIV-MR-RAW-SLICE-SIZE-OF-VAL-ISIZE-MAX`. -/
+example :
+    (∃ tr u, Reaches
+      (mirTree u32SliceOverflowMir (initMachineState u32SliceOverflowMir [.scalar ⟨0, 4⟩])) tr u ∧
+      FaultNow u) ∧
+    computeSize wideRawPartsMInit (.Slice ⟨4⟩ ⟨4⟩)
+        (some (.ElementCount (Int.ofNat u32SliceOverflowLen))) = .ok ⟨2 ^ 63⟩ ∧
+    computeAlign wideRawPartsMInit (.Slice ⟨4⟩ ⟨4⟩)
+        (some (.ElementCount (Int.ofNat u32SliceOverflowLen))) = .ok ⟨4⟩ ∧
+    checkPtr overflowingU32SlicePtr (.Raw .ElementCount) (some wideRawPartsMInit) = .ok () ∧
+    checkPtr overflowingU32SlicePtr (sliceRefPtrType .not ⟨4⟩ ⟨4⟩) (some wideRawPartsMInit) =
+      .error (.ub "Value::Ptr: total size exeeds isize::MAX") ∧
+    evalRvalue [.uninit, .init (annealWideScalarPtrVal 4 0 8)]
+        (.unaryOp .ptrMetadata (.copy (local_ 1))) emptyMemory
+        [u32Decl, rawConstSliceU32Decl] emptyLayoutTable =
+      .ok (.scalar ⟨0, 8⟩) [.uninit, .init (annealWideScalarPtrVal 4 0 8)] emptyMemory ∧
+    PointerMetaKind.encode_as_value .ElementCount danglingEmptyU32SlicePtr.metadata =
+      .ok (.Int 0) ∧
+    evalRvalue [.uninit, .init (annealWideScalarPtrVal 4 0 8)]
+        (.cast .ptrToPtr (.copy (local_ 1)) rawConstUnitTy) emptyMemory
+        [u32Decl, rawConstSliceU32Decl] emptyLayoutTable =
+      .ok (.scalar ⟨4, 8⟩) [.uninit, .init (annealWideScalarPtrVal 4 0 8)] emptyMemory ∧
+    evalUnOp .GetThinPointer (Gen.Value.Ptr danglingEmptyU32SlicePtr, .Ptr (.Raw .ElementCount)) =
+      .ok (Gen.Value.Ptr (ThinPointer.widen { addr := 4, provenance := none } none),
+        .Ptr (.Raw .None)) :=
+  div_rawSliceSizeOfVal_isizeMax_anneal_ub_vs_minirust_total
+
+/- `DIV-MR-RAW-PARENT-WRITE-SB-VS-TB` plus the `Mach` / `MachTB` metadata agreement. -/
+example :
+    (∃ tr u, Reaches (mirTree wideSliceDisabledDerefUbMir wideSliceDisabledDerefUbS0) tr u ∧
+      FaultNow u) ∧
+    (Interp.steps 12 wideSliceRawParentWriteMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 1 }, [1]) ∧
+    (Interp.stepsTB 12 wideSliceRawParentWriteTBInit).toOption.map
+        (fun m =>
+          ({ retAlloc := m.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB))
+             stackDepths := m.threads.map (·.stack.length) } : TBRetOutcome)) =
+      tbRetU32 1 ∧
+    (Interp.steps 13 wideSliceDisabledDerefUbMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 1 }, [1]) ∧
+    stopAfterTB wideSliceDisabledDerefUbTBInit 12 =
+      some (.ub "Tree Borrows: local read of Disabled reference") ∧
+    (∃ mem, ReachesRet
+      (mirTree wideSliceMetadataAfterParentWriteMir wideSliceMetadataAfterParentWriteS0) []
+      (.normal (.scalar ⟨4, 4⟩, mem))) ∧
+    MirNoUBTree
+      (mirTree wideSliceMetadataAfterParentWriteMir wideSliceMetadataAfterParentWriteS0) ∧
+    (Interp.steps 14 wideSliceMetadataAfterParentWriteMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 4 }, [1]) ∧
+    (Interp.stepsTB 14 wideSliceMetadataAfterParentWriteTBInit).toOption.map
+        (fun m =>
+          ({ retAlloc := m.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB))
+             stackDepths := m.threads.map (·.stack.length) } : TBRetOutcome)) =
+      tbRetU32 4 :=
+  wideSliceParentWrite_aliasingDivergence_and_metadata_three_way
+
+example
+    (body : CapturedMir) (ctx : Ctx) (borrows : List BorrowEntry)
+    (p : ProvenancePtr) (e : BorrowEntry) (it : Gen.IntType) (relOff : Nat)
+    (hlookup : lookupBorrow borrows p.tag = some e)
+    (htspec : ptrTargetSpec body.layouts body.localDecls ⟨e.targetLocal, e.targetProjection⟩ =
+      some (it, relOff))
+    (haddr : (ctx.addrs.getD e.targetLocal 0 + (relOff : Int)).toNat + p.offsetBytes <
+      scalarModulus 8) :
+    let baseAddr := (ctx.addrs.getD e.targetLocal 0 + (relOff : Int)).toNat
+    let aid : Gen.AllocId := ⟨((ctx.base.length + e.targetLocal : Nat) : Int)⟩
+    WideSliceThinPtrRel (ctxWithBorrows body ctx borrows) p
+      { addr := ((baseAddr + p.offsetBytes : Nat) : Int), provenance := some (aid, ()) }
+      { addr := ((baseAddr + p.offsetBytes : Nat) : Int)
+        provenance := some (liftProvTB (aid, ())) }
+      [] :=
+  WideSliceThinPtrRel.of_ctxWithBorrows body ctx borrows p e it relOff hlookup htspec haddr
+
+example {ctx : Ctx} {p : ProvenancePtr}
+    {thin : Ptr} {thinTB : ThinPointer TreeBorrowsProvenance} {tbPath : Gen.Path}
+    (hrel : WideSliceThinPtrRel ctx p thin thinTB tbPath) :
+    inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true :=
+  WideSliceThinPtrRel.inBounds_addr hrel
+
+example {ctx : Ctx}
+    {v : MirSemantics.Value} {mrVal : Val} {mrValTB : Gen.Value TBM}
+    (hrel : WideSliceValRel ctx v mrVal mrValTB) (m : Option Mach) :
+    ∃ widePtr,
+      mrVal = .Ptr widePtr ∧
+      checkPtr widePtr (.Raw .ElementCount) m = .ok () :=
+  WideSliceValRel.checkPtr_rawSlice_ok hrel m
+
+example
+    {ctx : Ctx} {locals locals' : List LocalSlot} {op : Operand}
+    {mem : MirSemantics.Memory} {localDecls : List MirAst.LocalDecl}
+    {v : MirSemantics.Value} {mrVal : Val} {mrValTB : Gen.Value TBM}
+    (hNonWide : isNonWidePtrAggregateTy (operandTy localDecls emptyLayoutTable op) = false)
+    (hOp : evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok v locals')
+    (hrel : WideSliceValRel ctx v mrVal mrValTB) :
+    ∃ (len : Nat) (widePtr : Pointer Prov),
+      len < scalarModulus 8 ∧
+      mrVal = .Ptr widePtr ∧
+      evalRvalue locals (.unaryOp .ptrMetadata op) mem localDecls emptyLayoutTable =
+        .ok (.scalar ⟨len, 8⟩) locals' mem ∧
+      PointerMetaKind.encode_as_value .ElementCount widePtr.metadata =
+        .ok (.Int (Int.ofNat len)) :=
+  ptrMetadata_wideSliceValRel_lockstep hNonWide hOp hrel
+
+example
+    {ctx : Ctx} {tbPath : Gen.Path} (locals locals₁ : List LocalSlot)
+    (wideOp : Operand) (thinTargetTy wideTargetTy pointeeTy : Ty)
+    (mutability : MirAst.Mutability) (mem : MirSemantics.Memory) (localDecls : List MirAst.LocalDecl)
+    (p : ProvenancePtr) (len : Nat) (thin : Ptr)
+    (thinTB : ThinPointer TreeBorrowsProvenance) (ptrTy : PtrType)
+    (hptr : WideSliceThinPtrRel ctx p thin thinTB tbPath)
+    (hlen : len < scalarModulus 8)
+    (hNoBorrow : lookupBorrow mem.borrows p.tag = none)
+    (hThin : isThinRawPtrTy thinTargetTy = true)
+    (hNotThin : isThinRawPtrTy wideTargetTy = false)
+    (hWide : wideRawPtrIsDyn? wideTargetTy = some false)
+    (hWideAgg : wideAggregatePointeeIsDyn? pointeeTy = some false)
+    (hWideOp : evalOperand locals wideOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok (annealWidePtrVal p len 8) locals₁) :
+    WideSliceValRel ctx
+      (annealWidePtrVal p len 8)
+      (mrWidePtrVal thin (Int.ofNat len))
+      (mrWidePtrValM thinTB (Int.ofNat len)) ∧
+    evalRvalue locals (.cast .ptrToPtr wideOp wideTargetTy) mem localDecls emptyLayoutTable =
+      .ok (annealWidePtrVal p len 8) locals₁ mem ∧
+    evalUnOp .GetThinPointer (mrWidePtrVal thin (Int.ofNat len), .Ptr ptrTy) =
+      .ok (.Ptr (ThinPointer.widen thin none), .Ptr (.Raw .None)) ∧
+    evalUnOpM (M := TBM) .GetThinPointer (mrWidePtrValM thinTB (Int.ofNat len), .Ptr ptrTy) =
+      .ok (.Ptr (ThinPointer.widen thinTB none), .Ptr (.Raw .None)) ∧
+    ∃ thinVal metaVal,
+      evalRvalue locals (.cast .ptrToPtr wideOp thinTargetTy) mem localDecls emptyLayoutTable =
+        .ok thinVal locals₁ mem ∧
+      evalRvalue locals (.unaryOp .ptrMetadata wideOp) mem localDecls emptyLayoutTable =
+        .ok metaVal locals₁ mem ∧
+      thinVal = .ptr p 8 ∧
+      metaVal = .scalar ⟨len, 8⟩ ∧
+      WideSliceThinPtrRel ctx p thin thinTB tbPath ∧
+      evalRvalue [.init thinVal, .init metaVal]
+          (.aggregate (.rawPtr pointeeTy mutability) [.copy (local_ 0), .copy (local_ 1)])
+          mem [] emptyLayoutTable =
+        .ok (annealWidePtrVal p len 8) [.init thinVal, .init metaVal] mem :=
+  ptrToPtr_wideSliceValRel_global_to_from_raw_parts_roundtrip
+    locals locals₁ wideOp thinTargetTy wideTargetTy pointeeTy mutability
+    mem localDecls p len thin thinTB ptrTy hptr hlen hNoBorrow hThin hNotThin hWide hWideAgg
+    hWideOp
+
+example
+    (body : CapturedMir) (ctx : Ctx)
+    (locals locals₁ : List LocalSlot) (wideOp : Operand) (thinTargetTy pointeeTy : Ty)
+    (mutability : MirAst.Mutability) (mem : MirSemantics.Memory) (localDecls : List MirAst.LocalDecl)
+    (p : ProvenancePtr) (len : Nat) (parentEntry : BorrowEntry)
+    (it : Gen.IntType) (relOff : Nat) (rootVal : MirSemantics.Value)
+    (containerProj : List ProjectionElem) (baseIdx : Nat) (elems : List MirSemantics.Value)
+    (rawElemOffset : Nat) (ptrTy : PtrType)
+    (hlen : len < scalarModulus 8)
+    (hThin : isThinRawPtrTy thinTargetTy = true)
+    (hWideAgg : wideAggregatePointeeIsDyn? pointeeTy = some false)
+    (hWideOp : evalOperand locals wideOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals
+      localDecls mem.callStack = .ok (annealWidePtrVal p len 8) locals₁)
+    (hBorrow : lookupBorrow mem.borrows p.tag = some parentEntry)
+    (htspec : ptrTargetSpec body.layouts body.localDecls ⟨parentEntry.targetLocal, parentEntry.targetProjection⟩ =
+      some (it, relOff))
+    (haddr : (ctx.addrs.getD parentEntry.targetLocal 0 + (relOff : Int)).toNat + p.offsetBytes <
+      scalarModulus 8)
+    (hPerm : parentEntry.perm ≠ .disabled)
+    (hRoot : activeFrameSlot? locals₁ mem.callStack parentEntry.targetFrameDepth
+      parentEntry.targetLocal = some (.init rootVal))
+    (hRead : readSliceBackingAggregate? locals₁ rootVal
+      (normalizeSubsliceProjections (stripTransparentProjections parentEntry.targetProjection))
+      len = some (containerProj, baseIdx, elems))
+    (hOff : byteOffsetToElemIdx? p.offsetBytes (inferElemListByteStride elems) =
+      some rawElemOffset)
+    (hBound : Nat.ble (Nat.add (Nat.add rawElemOffset baseIdx) len) (Trusted.Sequence.length elems) = true) :
+    let baseAddr := (ctx.addrs.getD parentEntry.targetLocal 0 + (relOff : Int)).toNat
+    let aid : Gen.AllocId := ⟨((ctx.base.length + parentEntry.targetLocal : Nat) : Int)⟩
+    let thin : Ptr := { addr := ((baseAddr + p.offsetBytes : Nat) : Int), provenance := some (aid, ()) }
+    let thinTB : ThinPointer TreeBorrowsProvenance :=
+      { addr := ((baseAddr + p.offsetBytes : Nat) : Int), provenance := some (liftProvTB (aid, ())) }
+    let alreadySub :=
+      Bool.and (endsWithSubslice containerProj)
+        (Bool.and (Nat.beq (Nat.add rawElemOffset baseIdx) 0) (Nat.beq len (Trusted.Sequence.length elems)))
+    WideSliceThinPtrRel (ctxWithBorrows body ctx mem.borrows) p thin thinTB [] ∧
+    evalUnOp .GetThinPointer (mrWidePtrVal thin (Int.ofNat len), .Ptr ptrTy) =
+      .ok (.Ptr (ThinPointer.widen thin none), .Ptr (.Raw .None)) ∧
+    evalUnOpM (M := TBM) .GetThinPointer (mrWidePtrValM thinTB (Int.ofNat len), .Ptr ptrTy) =
+      .ok (.Ptr (ThinPointer.widen thinTB none), .Ptr (.Raw .None)) ∧
+    (alreadySub = true →
+      evalRvalue locals (.cast .ptrToPtr wideOp thinTargetTy) mem localDecls emptyLayoutTable =
+        .ok (.ptr p 8) locals₁ mem ∧
+      evalRvalue [.init (.ptr p 8), .init (.scalar ⟨len, 8⟩)]
+          (.aggregate (.rawPtr pointeeTy mutability) [.copy (local_ 0), .copy (local_ 1)])
+          mem [] emptyLayoutTable =
+        .ok (annealWidePtrVal p len 8) [.init (.ptr p 8), .init (.scalar ⟨len, 8⟩)] mem) ∧
+    (alreadySub = false →
+      ∃ mem',
+        mem'.nextTag = mem.nextTag + 1 ∧
+        evalRvalue locals (.cast .ptrToPtr wideOp thinTargetTy) mem localDecls emptyLayoutTable =
+          .ok (.ptr { allocId := mem.nextTag, offsetBytes := 0 } 8) locals₁ mem' ∧
+        evalRvalue [.init (.ptr { allocId := mem.nextTag, offsetBytes := 0 } 8),
+                    .init (.scalar ⟨len, 8⟩)]
+            (.aggregate (.rawPtr pointeeTy mutability) [.copy (local_ 0), .copy (local_ 1)])
+            mem' [] emptyLayoutTable =
+          .ok (annealWidePtrVal { allocId := mem.nextTag, offsetBytes := 0 } len 8)
+            [.init (.ptr { allocId := mem.nextTag, offsetBytes := 0 } 8),
+             .init (.scalar ⟨len, 8⟩)] mem') :=
+  ptrToPtr_wideSliceValRel_borrowBacked_subslice_and_retag
+    body ctx locals locals₁ wideOp thinTargetTy pointeeTy mutability mem localDecls
+    p len parentEntry it relOff rootVal containerProj baseIdx elems rawElemOffset ptrTy
+    hlen hThin hWideAgg hWideOp hBorrow htspec haddr hPerm hRoot hRead hOff hBound
+
+example :
+    let decls := wideRawPartsMir.localDecls
+    translatePlace decls { local_ := 8, projection := [.deref, .index 9] } = none ∧
+    translateRvalue emptyLayoutTable decls (some rawMutSliceU32Ty)
+      (.aggregate (.rawPtr sliceU32PointeeTy .mut) [.copy (local_ 3), WideSliceDst.constUsize 4]) = none ∧
+    translateRvalue emptyLayoutTable decls (some usizeMirTy)
+      (.unaryOp .ptrMetadata (.copy (local_ 5))) = none ∧
+    translateRvalue emptyLayoutTable decls (some usizeMirTy)
+      (.len (derefPlace 4)) = none :=
+  translatePlace_and_translateRvalue_wideSlice_boundary
+
+example :
+    let d1 := wideRawPartsMir.localDecls
+    let d2 := wideSliceIdxReadWriteMir.localDecls
+    translateStatement d1
+      (mkStmt (.assign (local_ 2)
+        (.aggregate (.array u32Ty) [.copy (local_ 1), constU32 20, constU32 30, constU32 40])))
+      emptyLayoutTable =
+      some (.Assign (.Local (localName 2))
+        (.Tuple [.Load (.Local (localName 1)), .Constant (.Int 20) (.Int u32),
+                 .Constant (.Int 30) (.Int u32), .Constant (.Int 40) (.Int u32)]
+          (.Array (.Int u32) 4))) ∧
+    translateStatement d1
+      (mkStmt (.assign (local_ 5) (.cast .ptrToPtr (.copy (local_ 4)) rawConstSliceU32Ty)))
+      emptyLayoutTable =
+      some (.Assign (.Local (localName 5)) (.Load (.Local (localName 4)))) ∧
+    translateStatement d1
+      (mkStmt (.assign (local_ 6) (.cast .ptrToPtr (.copy (local_ 5)) rawConstUnitTy)))
+      emptyLayoutTable =
+      some (.Assign (.Local (localName 6)) (.UnOp .GetThinPointer (.Load (.Local (localName 5))))) ∧
+    translateStatement d1 (mkStmt (.assign (local_ 9) (.use (WideSliceDst.constUsize 0)))) emptyLayoutTable =
+      some (.Assign (.Local (localName 9)) (.Constant (.Int 0) (.Int IntType.usize_ty))) ∧
+    translateStatement d1
+      (mkStmt (.assign (local_ 11) (.cast .intToInt (.copy (local_ 7)) u32Ty))) emptyLayoutTable =
+      some (.Assign (.Local (localName 11))
+        (.UnOp (.Cast (.IntToInt u32)) (.Load (.Local (localName 7))))) ∧
+    translateStatement d1
+      (mkStmt (.assign (local_ 0) (.binaryOp .add (.copy (local_ 10)) (.copy (local_ 11)))))
+      emptyLayoutTable =
+      some (.Assign (.Local (localName 0))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 10))) (.Load (.Local (localName 11))))) ∧
+    translateStatement d2 (mkStmt (.assign (local_ 5) (.use (WideSliceDst.constUsize 2)))) emptyLayoutTable =
+      some (.Assign (.Local (localName 5)) (.Constant (.Int 2) (.Int IntType.usize_ty))) ∧
+    translateStatement d2 (mkStmt (.assign (local_ 6) (.use (WideSliceDst.constUsize 1)))) emptyLayoutTable =
+      some (.Assign (.Local (localName 6)) (.Constant (.Int 1) (.Int IntType.usize_ty))) ∧
+    translateStatement d2
+      (mkStmt (.assign (local_ 10) (.cast .intToInt (.copy (local_ 9)) u32Ty))) emptyLayoutTable =
+      some (.Assign (.Local (localName 10))
+        (.UnOp (.Cast (.IntToInt u32)) (.Load (.Local (localName 9))))) :=
+  wideSliceWitnesses_translateStatement_correspondence
+
+example
+    (locals locals' : List LocalSlot) (mem : MirSemantics.Memory)
+    (localDecls : List MirAst.LocalDecl) (sIdx : Local) (elem : RigidTy) (lIdx : LayoutIdx)
+    (entry : BorrowEntry) (rootVal : MirSemantics.Value)
+    (containerProj : List ProjectionElem) (baseIdx rawElemOffset : Nat)
+    (elems : List MirSemantics.Value) (p : ProvenancePtr) (len : Nat)
+    (hTy : placeTy localDecls emptyLayoutTable ⟨sIdx, [.deref]⟩ =
+      some { kind := .slice elem, layoutIdx := lIdx })
+    (hRead : evalPlaceRead locals ⟨sIdx, []⟩ mem.borrows mem.globals emptyLayoutTable
+      mem.callerLocals localDecls mem.callStack = .ok (annealWidePtrVal p len 8) locals')
+    (hBorrow : lookupBorrow mem.borrows p.tag = some entry)
+    (hSlot : activeFrameSlot? locals' mem.callStack entry.targetFrameDepth entry.targetLocal =
+      some (.init rootVal))
+    (hBacking : readSliceBackingAggregate? locals' rootVal entry.targetProjection len
+      (tyByteSize localDecls emptyLayoutTable { kind := elem, layoutIdx := unresolvedLayoutIdx emptyLayoutTable }) =
+      some (containerProj, baseIdx, elems))
+    (hOff : byteOffsetToElemIdx? p.offsetBytes (inferElemListByteStride elems) = some rawElemOffset) :
+    (entry.perm ≠ .disabled → rawElemOffset + baseIdx + len ≤ elems.length →
+      evalRvalue locals (.len ⟨sIdx, [.deref]⟩) mem localDecls emptyLayoutTable =
+        .ok (.scalar ⟨len, 8⟩) locals' mem) ∧
+    (entry.perm ≠ .disabled → elems.length < rawElemOffset + baseIdx + len →
+      evalRvalue locals (.len ⟨sIdx, [.deref]⟩) mem localDecls emptyLayoutTable = .ub) ∧
+    (entry.perm = .frozen →
+      Trusted.Sequence.get? locals sIdx = some (.init (annealWidePtrVal p len 8)) →
+      evalRvalue locals (.ref (.mut false) ⟨sIdx, [.deref]⟩) mem localDecls emptyLayoutTable =
+        .ub) :=
+  evalRvalue_len_and_frozen_mut_reborrow_wide_slice
+    locals locals' mem localDecls sIdx elem lIdx entry rootVal containerProj baseIdx rawElemOffset
+    elems p len hTy hRead hBorrow hSlot hBacking hOff
+
+example
+    (m : Mach) (ptrExpr idxExpr : ValueExpr) (elemTy : Gen.Type)
+    (elemSz elemAlign : Nat) (thin : Ptr) (len idx : Nat)
+    (hElemLayout : Type.layout elemTy = .ok (.Sized ⟨elemSz⟩ ⟨elemAlign⟩))
+    (hPtrEval :
+      evalValue m ptrExpr =
+        .ok ((mrWidePtrVal thin (Int.ofNat len), .Ptr (.Raw .ElementCount)), m))
+    (hIdxEval :
+      evalValue m idxExpr =
+        .ok ((.Int (Int.ofNat idx), .Int IntType.usize_ty), m)) :
+    (len ≤ idx →
+      Interp.evalPlace m (.Index (.Deref ptrExpr (.Slice elemTy)) idxExpr) =
+        .error (.ub "access to out-of-bounds index")) ∧
+    (idx < len →
+      CM.signed_dereferenceable m.mem thin ((elemSz * idx : Nat) : Int) = .ok () →
+      inBounds ((elemSz * idx : Nat) : Int) .Signed x86_64.PTR_SIZE = true →
+      inBounds (thin.addr + ((elemSz * idx : Nat) : Int)) .Unsigned x86_64.PTR_SIZE = true →
+      Interp.evalPlace m (.Index (.Deref ptrExpr (.Slice elemTy)) idxExpr) =
+        .ok (({ ptr := ThinPointer.widen
+                  { thin with addr := thin.addr + ((elemSz * idx : Nat) : Int) } none
+                aligned := Align.is_aligned ⟨elemAlign⟩ thin.addr }, elemTy), m)) :=
+  minirust_evalPlace_index_rawSlice
+    m ptrExpr idxExpr elemTy elemSz elemAlign thin len idx hElemLayout hPtrEval hIdxEval
+
+example
+    (locals : List LocalSlot) (mem : MirSemantics.Memory)
+    (localDecls : List MirAst.LocalDecl) (sIdx idxLocal : Local)
+    (elemKind : RigidTy) (lIdx : LayoutIdx)
+    (p : ProvenancePtr) (len idx szIdx : Nat)
+    (entry : BorrowEntry) (rootVal : MirSemantics.Value)
+    (containerProj : List ProjectionElem) (baseIdx rawElemOffset : Nat)
+    (elems : List MirSemantics.Value)
+    (m : Mach) (ptrExpr idxExpr : ValueExpr) (elemTy : Gen.Type)
+    (elemSz elemAlign : Nat) (thin : Ptr)
+    (hPointeeTy : placeTyResolved localDecls emptyLayoutTable ⟨sIdx, [.deref]⟩ =
+      some { kind := .slice elemKind, layoutIdx := lIdx })
+    (hSlSlot : Trusted.Sequence.get? locals sIdx = some (.init (annealWidePtrVal p len 8)))
+    (hAlignDeref : checkDerefAlign localDecls emptyLayoutTable
+      (some { kind := .slice elemKind, layoutIdx := lIdx }) p.offsetBytes = true)
+    (hBorrow : lookupBorrow mem.borrows p.tag = some entry)
+    (hPerm : entry.perm ≠ .disabled)
+    (hSlot : activeFrameSlot? locals mem.callStack entry.targetFrameDepth entry.targetLocal =
+      some (.init rootVal))
+    (hAlignTarget : checkTargetPlaceAlign localDecls emptyLayoutTable
+      (some { kind := .slice elemKind, layoutIdx := lIdx })
+      entry p (some rootVal) emptyLayoutTable localDecls = true)
+    (hBacking : readSliceBackingAggregate? locals rootVal entry.targetProjection len
+      (rigidTyKindByteSize elemKind) = some (containerProj, baseIdx, elems))
+    (hOff : byteOffsetToElemIdx? p.offsetBytes
+      ((rigidTyKindByteSize elemKind).getD (inferElemListByteStride elems)) = some rawElemOffset)
+    (hInBacking : rawElemOffset + baseIdx + len ≤ elems.length)
+    (hIdxSlot : Trusted.Sequence.get? locals idxLocal = some (.init (.scalar ⟨idx, szIdx⟩)))
+    (hElemLayout : Type.layout elemTy = .ok (.Sized ⟨elemSz⟩ ⟨elemAlign⟩))
+    (hPtrEval :
+      evalValue m ptrExpr =
+        .ok ((mrWidePtrVal thin (Int.ofNat len), .Ptr (.Raw .ElementCount)), m))
+    (hIdxEval :
+      evalValue m idxExpr =
+        .ok ((.Int (Int.ofNat idx), .Int IntType.usize_ty), m)) :
+    (len ≤ idx →
+      evalPlaceRead locals ⟨sIdx, [.deref, .index idxLocal]⟩ mem.borrows mem.globals
+        emptyLayoutTable mem.callerLocals localDecls mem.callStack = .ub ∧
+      Interp.evalPlace m (.Index (.Deref ptrExpr (.Slice elemTy)) idxExpr) =
+        .error (.ub "access to out-of-bounds index")) ∧
+    (∀ elemVal,
+      idx < len →
+      Trusted.Sequence.get? elems (rawElemOffset + baseIdx + idx) = some elemVal →
+      valueContainsUninit elemVal = false →
+      validateValueForTy? emptyLayoutTable
+        (placeTyResolved localDecls emptyLayoutTable ⟨sIdx, [.deref, .index idxLocal]⟩) elemVal = true →
+      evalPlaceRead locals ⟨sIdx, [.deref, .index idxLocal]⟩ mem.borrows mem.globals
+        emptyLayoutTable mem.callerLocals localDecls mem.callStack = .ok elemVal locals ∧
+      (CM.signed_dereferenceable m.mem thin ((elemSz * idx : Nat) : Int) = .ok () →
+        inBounds ((elemSz * idx : Nat) : Int) .Signed x86_64.PTR_SIZE = true →
+        inBounds (thin.addr + ((elemSz * idx : Nat) : Int)) .Unsigned x86_64.PTR_SIZE = true →
+        Interp.evalPlace m (.Index (.Deref ptrExpr (.Slice elemTy)) idxExpr) =
+          .ok (({ ptr := ThinPointer.widen
+                    { thin with addr := thin.addr + ((elemSz * idx : Nat) : Int) } none
+                  aligned := Align.is_aligned ⟨elemAlign⟩ thin.addr }, elemTy), m))) :=
+  evalPlaceRead_index_wide_slice_borrowBacked_lockstep
+    locals mem localDecls sIdx idxLocal elemKind lIdx p len idx szIdx entry rootVal
+    containerProj baseIdx rawElemOffset elems m ptrExpr idxExpr elemTy elemSz elemAlign thin
+    hPointeeTy hSlSlot hAlignDeref hBorrow hPerm hSlot hAlignTarget hBacking hOff hInBacking
+    hIdxSlot hElemLayout hPtrEval hIdxEval
+
+example
+    (thin : Ptr) (prov : Option Prov) (mutbl : MirAst.Mutability)
+    (elemSz elemAlign addr len : Nat) (freeze : Bool) (m : Option Mach)
+    (pDang : ProvenancePtr)
+    (localsNullProv localsSc localsDangMut : List LocalSlot)
+    (localDecls : List MirAst.LocalDecl) (sIdx : Local)
+    (hLen : len < scalarModulus 8)
+    (hNullProvSlot :
+      Trusted.Sequence.get? localsNullProv sIdx =
+        some (.init (annealWidePtrVal { allocId := 0, offsetBytes := 0 } 0 8)))
+    (hScSlot :
+      Trusted.Sequence.get? localsSc sIdx =
+        some (.init (annealWideScalarPtrVal addr len 8)))
+    (hDangMutSlot :
+      Trusted.Sequence.get? localsDangMut sIdx =
+        some (.init (annealWidePtrVal pDang 0 8))) :
+    (x86_64.valid_size ⟨len * elemSz⟩ = true →
+      checkPtr (ThinPointer.widen { addr := 0, provenance := prov } (some (.ElementCount (Int.ofNat len))))
+        (sliceRefPtrType mutbl ⟨elemSz⟩ ⟨elemAlign⟩ freeze) m =
+        .error (.ub "Value::Ptr: null safe pointer")) ∧
+    evalRvalue localsNullProv (.ref .shared ⟨sIdx, [.deref]⟩) emptyMemory localDecls emptyLayoutTable = .ub ∧
+    evalRvalue localsSc (.ref .shared ⟨sIdx, [.deref]⟩) emptyMemory localDecls emptyLayoutTable = .ub ∧
+    evalRvalue localsDangMut (.ref (.mut false) ⟨sIdx, [.deref]⟩) emptyMemory localDecls emptyLayoutTable = .ub ∧
+    (inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true →
+      (thin.addr != 0) = true →
+      Align.is_aligned ⟨elemAlign⟩ thin.addr = true →
+      checkPtr (ThinPointer.widen thin (some (.ElementCount 0)))
+        (sliceRefPtrType mutbl ⟨elemSz⟩ ⟨elemAlign⟩ freeze) m = .ok () ∧
+      checkPtr (ThinPointer.widen thin (some (.ElementCount (Int.ofNat len))))
+        (sliceRefPtrType mutbl ⟨0⟩ ⟨elemAlign⟩ freeze) m = .ok ()) :=
+  checkPtr_sliceRef_null_and_zeroByte_reborrow_divergence
+    thin prov mutbl elemSz elemAlign addr len freeze m pDang
+    localsNullProv localsSc localsDangMut localDecls sIdx
+    hLen hNullProvSlot hScSlot hDangMutSlot
+
+example
+    (locals : List LocalSlot) (mem : MirSemantics.Memory)
+    (localDecls : List MirAst.LocalDecl) (idxLocal : Local)
+    (p : ProvenancePtr) (len idx szIdx fromIdx toIdx : Nat)
+    (perm : TreeBorrowPerm) (isMut : Bool) (elemKind : RigidTy)
+    (entry : BorrowEntry) (rootVal newVal : MirSemantics.Value)
+    (containerProj : List ProjectionElem) (baseIdx rawElemOffset : Nat)
+    (elems : List MirSemantics.Value)
+    (hIdxSlot : Trusted.Sequence.get? locals idxLocal = some (.init (.scalar ⟨idx, szIdx⟩)))
+    (hBorrow : lookupBorrow mem.borrows p.tag = some entry)
+    (hParentPerm : entry.perm = .active)
+    (hSlot : activeFrameSlot? locals mem.callStack entry.targetFrameDepth entry.targetLocal =
+      some (.init rootVal))
+    (hBacking : readSliceBackingAggregate? locals rootVal entry.targetProjection len
+      (tyByteSize .nil emptyLayoutTable { kind := elemKind, layoutIdx := 0 }) =
+      some (containerProj, baseIdx, elems))
+    (hOff : byteOffsetToElemIdx? p.offsetBytes (inferElemListByteStride elems) = some rawElemOffset)
+    (hInBacking : rawElemOffset + baseIdx + len ≤ elems.length) :
+    let window := takeValues len (dropValues (Nat.add rawElemOffset baseIdx) elems)
+    let slicePointeeTy : Ty := { kind := .slice elemKind, layoutIdx := 0 }
+    (len ≤ idx →
+      writeProjectedValue locals (.aggregate 0 window) [.index idxLocal] newVal = .ub) ∧
+    (∀ oldElem updatedWindow,
+      idx < len →
+      Trusted.Sequence.get? window idx = some oldElem →
+      Trusted.Sequence.set? window idx newVal = some updatedWindow →
+      writeProjectedValue locals (.aggregate 0 window) [.index idxLocal] newVal =
+        .ok (.aggregate 0 updatedWindow)) ∧
+    (len < fromIdx + toIdx →
+      evalSliceFatPtrDerefBorrow locals mem p 8 ⟨len, 8⟩ [.subslice fromIdx toIdx true]
+        perm isMut (some slicePointeeTy) emptyLayoutTable true localDecls none false = .ub) ∧
+    (fromIdx + toIdx ≤ len →
+      ∃ mem',
+        evalSliceFatPtrDerefBorrow locals mem p 8 ⟨len, 8⟩ [.subslice fromIdx toIdx true]
+          perm isMut (some slicePointeeTy) emptyLayoutTable true localDecls none false =
+          .ok (annealWidePtrVal { allocId := mem.nextTag, offsetBytes := 0 }
+                (len - toIdx - fromIdx) 8) locals mem' ∧
+        mem'.nextTag = mem.nextTag + 1) :=
+  writeProjectedValue_and_subslice_reborrow_wide_slice
+    locals mem localDecls idxLocal p len idx szIdx fromIdx toIdx perm isMut elemKind
+    entry rootVal newVal containerProj baseIdx rawElemOffset elems hIdxSlot hBorrow
+    hParentPerm hSlot hBacking hOff hInBacking
+
+example
+    (locals : List LocalSlot) (decls : List MirAst.LocalDecl)
+    (len offset minLen baseIdx rawElemOffset : Nat) (fromEnd : Bool)
+    (elems : List MirSemantics.Value)
+    (hInBacking : rawElemOffset + baseIdx + len ≤ elems.length)
+    (hLenLt : len < 2 ^ 63) :
+    let window := takeValues len (dropValues (Nat.add rawElemOffset baseIdx) elems)
+    let idx := if fromEnd then len - offset else offset
+    (len < minLen →
+      readProjectedValue locals (.aggregate 0 window) [.constantIndex offset minLen fromEnd] = .ub ∧
+      projOk decls len (.constantIndex offset minLen fromEnd) = false) ∧
+    (∀ elemVal,
+      minLen ≤ len →
+      ((fromEnd = false ∧ offset < minLen) ∨ (fromEnd = true ∧ 1 ≤ offset ∧ offset ≤ minLen)) →
+      Trusted.Sequence.get? elems (rawElemOffset + baseIdx + idx) = some elemVal →
+      valueContainsUninit elemVal = false →
+      projOk decls len (.constantIndex offset minLen fromEnd) = true ∧
+      readProjectedValue locals (.aggregate 0 window) [.constantIndex offset minLen fromEnd] =
+        .ok elemVal) ∧
+    (∀ elem0,
+      0 < len →
+      minLen ≤ len →
+      len < offset →
+      Trusted.Sequence.get? elems (rawElemOffset + baseIdx) = some elem0 →
+      valueContainsUninit elem0 = false →
+      projOk decls len (.constantIndex offset minLen true) = false ∧
+      readProjectedValue locals (.aggregate 0 window) [.constantIndex offset minLen true] =
+        .ok elem0) :=
+  readProjectedValue_constantIndex_wide_slice_and_saturation
+    locals decls len offset minLen baseIdx rawElemOffset fromEnd elems hInBacking hLenLt
+
+end WideSliceDstStatementPins
+
+end WideSliceDstAuditPins
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment — as well as every declaration

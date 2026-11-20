@@ -3651,7 +3651,7 @@ theorem evalRvalue_discriminant_simulation
           | .none => MirStepNode.fail .ub
         | .none => MirStepNode.fail .ub := by
       unfold evalStmt; rw [hkind]
-      simp only [evalRvalue, evalOperand, hbor, hcaller, hslot_s, readProjectedValue,
+      simp only [evalRvalue, hbor, hcaller, hslot_s,
         hvalid_enum.evalPlaceDiscriminant_eq hsrc_decl hv_act_lt,
         hprot, invalidateConflictingBorrows]
       cases get? s.frame.locals dstIdx with

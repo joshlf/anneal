@@ -1,6 +1,6 @@
 # Anneal Lean 4 & Rust Interactive LSP Tooling (`anneal-lean`)
 
-When working on Lean 4 (`*.lean`) files or Anneal Rust verification crates (`~/Projects/<ldap>/{anneal,anneal-private,zerocopy}`):
+When working on Lean 4 (`*.lean`) files or Anneal Rust verification crates:
 
 1. **Prefer Warm Lean 4 LSP MCP Tools (`anneal-lean_lsp`) Over Cold `lake env lean` Loops**:
    - Use `lean_goal` to inspect tactic goals (both *before* and *after* a line) and expected term types in ~12–25 ms without cold process startup.
@@ -8,6 +8,7 @@ When working on Lean 4 (`*.lean`) files or Anneal Rust verification crates (`~/P
    - Use `lean_hover`, `lean_definition`, `lean_outline`, and `lean_local_search` to inspect `Trusted.*`, `Anneal.*`, `Mir.*`, `Specs.*`, and `Obligations.*` declarations without reading entire large `.lean` files.
    - Use `anneal_audit_preview` to verify 0 compiler errors, 0 `sorry` tokens, `Anneal.*` statement-origin isolation, and kernel `#print axioms` in memory before running final end-to-end `cargo anneal agent-verify`.
    - Use `anneal_item_bridge`, `rust_diagnostics`, and `rust_symbols_and_def` to map between Rust items (`#[spec]`, `#[anneal_spec::...]`) and generated/authored Lean modules.
+   - In shell or subagent contexts without direct MCP access, call the `anneal-lsp` CLI (`server/anneal_lsp_cli.py`, connected to the same warm daemon socket) instead of cold `lake env lean` loops.
    - Load the `anneal-lsp` skill (alongside `anneal-prove`) for full interactive proving workflows.
 
 2. **Automatic Hook Feedback & Spec-Lock Enforcement**:

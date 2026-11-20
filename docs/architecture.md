@@ -81,6 +81,9 @@ For related context, see:
   meta-principles, correctness promise, and threat model.
 - [`docs/design.md`](design.md) for Anneal's end-to-end user workflow,
   library-centric verification model, and incremental adoption.
+- [`docs/mir-correspondence-strategy.md`](mir-correspondence-strategy.md) for
+  how $M_{\text{anneal}}$ is developed against $M_{\text{ref}}$ under locked CI
+  correspondence and fault-equivalence theorems.
 - [`docs/trust-model.md`](trust-model.md) for how `trusted/` and
   `trusted/audit/` enforce the boundary between `trusted/` and `theory/`.
 
@@ -453,6 +456,59 @@ checkers, and symbolic execution lemmas that prove
   temporaries on both branches canonicalize to `MirVal.uninit`, allowing
   `execNormal_join` to merge the branches and verify the suffix from the join
   block once.
+
+#### Why $M_{\text{anneal}}$ and lowering in `theory/` do not expand the TCB
+
+In a verified compiler (such as CompCert), a lowering pass translates a source
+program $S$ into a target program $T$ that will actually run on hardware; the
+compiler must prove that every behavior of $T$ is allowed by $S$.
+
+In a verification framework, the roles are reversed:
+
+- The captured MIR program $C$, evaluated under the reference semantics
+  $M_{\text{ref}}$ via $\tau_{\text{prog}}(C)$, is the ground-truth program
+  whose safety `Trusted.CrateTheorem` and `Trusted.UnitTheorem` ultimately
+  guarantee.
+- Anneal's verification MIR semantics $M_{\text{anneal}}$ (executing the same
+  unnormalized captured MIR program $C$) and the lowered program $A$ in
+  `theory/` are verification abstractions used to simplify reasoning.
+- Per-crate verification (`cargo anneal verify`) proves `Trusted.CrateTheorem`
+  or `Trusted.UnitTheorem` over $M_{\text{anneal}}$—either directly or via a
+  **backward simulation** linking $A$ to $M_{\text{anneal}}$—without loading
+  $M_{\text{ref}}$. Pass 2 repository CI correspondence certification separately
+  proves the universal **correspondence claims** (`CorrespondenceClaim` and
+  `FaultEquivalenceClaim` linking $M_{\text{anneal}}$ on $C$ to $M_{\text{ref}}$
+  on $\tau_{\text{prog}}(C)$;
+  [`docs/mir-correspondence-strategy.md`](mir-correspondence-strategy.md)).
+  Unconditionally across every program $C$ and input query $q$ (without gating
+  on fault-freedom in $M_{\text{anneal}}$), the combined locked contract
+  establishes a choice-coupled execution relation such that every valid
+  execution of $M_{\text{ref}}$ on $\tau_{\text{prog}}(C)$ (faulting or
+  non-faulting) has a choice-coupled valid execution of $M_{\text{anneal}}$ on
+  $C$ matching its fault classification (`undefined` vs. `unsupported`), finite
+  terminal outcome, or divergence, and every faulting execution of
+  $M_{\text{anneal}}$ on $C$ has a choice-coupled faulting execution of
+  $M_{\text{ref}}$ on $\tau_{\text{prog}}(C)$ with the exact same fault
+  classification (reducing to `CorrespondenceClaim` plus bidirectional
+  fault-reachability equivalence when both models are deterministic and
+  productive). Consequently, whenever $M_{\text{anneal}}$ on $C$ is fault-free
+  (all-prefix freedom from `undefined` (`UB`) and `unsupported`, as discharged
+  by `cargo anneal verify`), $M_{\text{ref}}$ on $\tau_{\text{prog}}(C)$ is
+  also all-prefix free from `undefined` and `unsupported`, and every finite
+  terminal outcome and diverging run of $M_{\text{ref}}$ on
+  $\tau_{\text{prog}}(C)$ is matched by $M_{\text{anneal}}$ on $C$ (and, when
+  lowered via backward simulation, by $A$).
+
+Because the Lean 4 kernel checks (1) the per-crate proof that the specification
+holds over $M_{\text{anneal}}$ (including the backward simulation linking $A$ to
+$M_{\text{anneal}}$ when lowered) and (2) the Pass 2 proof of
+`CorrespondenceClaim` and `FaultEquivalenceClaim` linking $M_{\text{anneal}}$ to
+$M_{\text{ref}}$, both $M_{\text{anneal}}$'s execution rules and the lowering
+passes are self-certifying. See [`docs/trust-model.md`](trust-model.md) for how
+Anneal's CI auditor (`anneal-audit`) ensures that `theory/` and `correspondence/`
+are pure and axiom-free so they cannot bypass the Lean kernel—the same staging
+and standalone `.olean` kernel-replay mechanism that Pass 2 applies to
+`correspondence/`.
 
 ## Repository layout
 

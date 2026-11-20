@@ -240,6 +240,24 @@ fn main() {
             print_u32(ub_copy_nonoverlapping_partial_overlap_array())
         }
 
+        // Category 10: Multi-element `copy_nonoverlapping` through whole-array pointer
+        // casts and raw-pointer reads of uninitialized struct padding
+        "pass_copy_nonoverlapping_multi_elem_array_pair" => {
+            print_u32(pass_copy_nonoverlapping_multi_elem_array_pair())
+        }
+        "ub_raw_ptr_read_uninit_struct_padding_kani5183" => {
+            print_u8(ub_raw_ptr_read_uninit_struct_padding_kani5183())
+        }
+
+        // Category 11: Local twins of the static-access probes, through a shared
+        // reborrow temporary
+        "pass_shared_temp_const_raw_ptr_read_and_freeze_retag" => {
+            print_u32(pass_shared_temp_const_raw_ptr_read_and_freeze_retag())
+        }
+        "ub_shared_temp_unsafe_cell_raw_const_cast_mut_write" => {
+            print_u32(ub_shared_temp_unsafe_cell_raw_const_cast_mut_write())
+        }
+
         other => {
             eprintln!("unknown test: {other}");
             std::process::exit(2);

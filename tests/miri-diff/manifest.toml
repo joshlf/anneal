@@ -840,3 +840,33 @@ upstream_path = "tests/fail/intrinsics/copy_overlapping.rs"
 miri_verdict = "ub"
 miri_ub_span = "src/lib.rs:1250:9"
 fuel = 128
+
+[[tests]]
+name = "pass_copy_nonoverlapping_multi_elem_array_pair"
+category = "intrinsics"
+upstream_path = "tests/pass/tree_borrows/copy-nonoverlapping.rs"
+miri_verdict = "pass:scalar:117:4"
+fuel = 128
+
+[[tests]]
+name = "ub_raw_ptr_read_uninit_struct_padding_kani5183"
+category = "uninit_and_padding"
+upstream_path = "tests/fail/uninit/padding-struct.rs"
+miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:1285:14"
+fuel = 128
+
+[[tests]]
+name = "pass_shared_temp_const_raw_ptr_read_and_freeze_retag"
+category = "tree_borrows"
+upstream_path = "tests/pass/tree_borrows/reborrow-is-read.rs"
+miri_verdict = "pass:scalar:8996:4"
+fuel = 128
+
+[[tests]]
+name = "ub_shared_temp_unsafe_cell_raw_const_cast_mut_write"
+category = "tree_borrows"
+upstream_path = "tests/fail/both_borrows/shr_frozen_violation1.rs"
+miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:1456:9"
+fuel = 128

@@ -70,11 +70,11 @@ uninterpreted external call.
 
 ## Corpus Coverage
 
-The corpus holds 108 tests: 50 `pass`, 12 `panic` (11 certified via
+The corpus holds 112 tests: 52 `pass`, 12 `panic` (11 certified via
 `verifySafePanicMirPointBounded` and `panic_explicit_macro` via
-`verifyModularSafePanicMirBounded`), and 46 `ub`, grouped into nine categories
+`verifyModularSafePanicMirBounded`), and 48 `ub`, grouped into eleven categories
 that `// Category N` comments in [`corpus/src/lib.rs`](corpus/src/lib.rs) mark.
-Anneal agrees with Miri on all 108 tests: `manifest.toml` records no open
+Anneal agrees with Miri on all 112 tests: `manifest.toml` records no open
 `known_anneal_bug` entry.
 Category 8 adds 12 tests covering layout-sensitive types and raw-pointer retags
 (`pass_option_some_niche_and_single_c_mut` exercises both niche encoding and
@@ -133,34 +133,24 @@ of a `Drop` impl. The call-chain tests therefore check reference passing,
 reborrow return, frame cleanup, and unwinding into cleanup landing pads, but
 not Anneal's `FnEntry` protector enforcement or `Drop::drop` calls.
 
-**Frame-relative pointer resolution.** A borrow entry's `targetLocal` is a
-local index into the *running* frame (`get? locals entry.targetLocal`, falling
-back to `memory.callerLocals`, which `pushCalleeFrame` never populates). Inside
-a callee, a reference or raw pointer to the caller's local `_k` therefore
-resolves to the callee's own local `_k`:
+**Frame-relative pointer resolution (fixed).** Before `DIV-MR-CALL-TARGET-LOCAL`
+and `DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL` were repaired (`86255c4698`), a
+borrow entry's `targetLocal` resolved against the *running* frame, so inside a
+callee a pointer to the caller's local `_k` reached the callee's own local
+`_k`. A borrow entry now also records the depth of the frame that owns
+`targetLocal`, and the former witnesses are pinned as exact agreements: a callee
+read through a raw pointer to `x` (`10`), a callee write through it (`11`), a
+callee write through a pointer argument that shares `x`'s local index (`9`), and
+a callee dereference of a reference argument (`fn f(r: &u32, bonus: u32) -> u32
+{ *r + bonus }` called as `f(&x, 1)`, `11`).
 
-- Silent wrong values (`wrong_value`, `value_mismatch`): when the caller's `x`
-  and a `u32` parameter `pad2` of the callee are both local `_3`, a callee read
-  through a raw pointer to `x` returns `pad2` (Anneal `200`, Miri `10`), and a
-  callee write through it lands in `pad2` and leaves `x` unchanged (Anneal `13`,
-  Miri `11`). When the caller's `x` and the callee's pointer argument `alias`
-  are both local `_1`, the callee's write through `alias` overwrites `alias`
-  itself and is lost the same way (Anneal `13`, Miri `9`).
-- False UB (`false_positive_ub`): a callee dereferencing a reference argument
-  (`fn f(r: &u32, bonus: u32) -> u32 { *r + bonus }` called as `f(&x, 1)`, with
-  `x` and `r` both local `_1`) reads its own 8-byte `r` as a `u32` and faults.
-- Missed UB (`missed_ub`, `unsound_missed_fault`): Miri reports a
-  `RetagKind::FnEntry` protector violation when a callee writes through `raw`
-  while `&*raw` (or `&mut *raw`) is one of its arguments. In Anneal the write
-  lands in the callee's local with `x`'s index (the pin pads the callee so that
-  local is a `u32`), never reaching `x` or its borrow tree; the MIR capture
-  also emits no `Retag(FnEntry)`, so no protector would exist anyway. When the
-  colliding local is instead an 8-byte reference whose `ScalarLayout` has
-  `validRange.end_ = u64::MAX`, the 4-byte write sends the Lean kernel's
-  `by rfl` confirmation into byte-level re-decoding, which exhausts memory.
-  Passing `&x` or `&mut x` directly agrees with Miri (both report UB at the
-  write), but only because creating `&x` freezes `raw` (see the next
-  paragraph), not because of a protector.
+One related gap remains (`missed_ub`, `unsound_missed_fault`): Miri reports a
+`RetagKind::FnEntry` protector violation when a callee writes through `raw`
+while `&*raw` (or `&mut *raw`) is one of its arguments. Anneal's write now
+reaches `x` (Anneal `11`), but the MIR capture emits no `Retag(FnEntry)`, so no
+protector exists to forbid it. Passing `&x` or `&mut x` directly agrees with
+Miri (both report UB at the write), but only because creating `&x` freezes
+`raw` (see the next paragraph), not because of a protector.
 
 **Raw-pointer sibling roots (no call needed).** `evalRvalueRawPtr` mints a
 separate root `BorrowEntry` (`perm = .active`) for `raw = &raw mut x`, while
@@ -174,7 +164,7 @@ tag and the write only disables `&x`:
   UB at the write.
 - In a callee: the caller holds `let _r = &x;` and passes `raw`, and the callee
   writes through it. Without `_r`, `raw` stays `.active` and the callee's write
-  is silently lost instead (the frame-relative item above).
+  reaches `x`, agreeing with Miri (the frame-relative item above).
 - After a call: `&x` is a call argument and the caller writes through `raw`
   once the callee has returned. This also reproduces with a callee whose only
   locals are `_0` and `_r`, so it does not depend on local-index collisions.
@@ -209,12 +199,93 @@ Category 9's `UnwindCleanupGuard` has an empty `drop`:
   [`miri_eval.rs`](../../crates/anneal-difftest/src/miri_eval.rs) pins the
   sub-place form (`probe_gap_move_subplace_reborrow_write`).
 
+Category 10 adds 2 tests:
+
+| Theme | Tests |
+| :--- | :--- |
+| Multi-element `copy_nonoverlapping` through whole-array pointer casts | `pass_copy_nonoverlapping_multi_elem_array_pair` (`[22, 99]` copied as 2 `u32` elements through `(&raw const src) as *const u32`, returning `22 ^ 99 = 117`) |
+| Raw-pointer reads of uninitialized struct padding (`model-checking/kani#5183`) | `ub_raw_ptr_read_uninit_struct_padding_kani5183` (byte offset `1` of `PaddedU8U32` read as `u8` through `(&raw const s) as *const u8` and `offset(base, 1isize)`) |
+
+Category 10 leaves out one construct on which Anneal currently disagrees with
+Miri: a multi-element `copy_nonoverlapping` between *element* sub-places,
+`copy_nonoverlapping(&raw const src[0], &raw mut dst[0], 2usize)`. Anneal
+copies only the first element through the `.constantIndex` sub-place pointer
+(`wrong_value`, `value_mismatch`; Anneal returns `22` where Miri returns `117`
+for `[22, 99]`), whereas the whole-array casts of
+`pass_copy_nonoverlapping_multi_elem_array_pair` copy both elements and agree.
+`semantic_mutant_probes_agree_live_and_known_provenance_gaps_stay_pinned` pins
+the element sub-place form (`probe_gap_subplace_multi_elem_copy`,
+kernel-confirmed) as a ratchet that fails once the gap is fixed, and the
+`subplace_multi_elem_copy_truncation` semantic mutant of
+`--self-check-mutants` replays a semantics that truncates the agreeing
+whole-array copy to one element (killed as `wrong_value`).
+
 `miri-difftest` confirms each divergence in the Lean kernel with
 `lean -M 4096`. When the batched confirmation fails, every divergence is
 re-confirmed on its own: an item that exhausts a resource (`-M`, heartbeats,
 recursion depth, the stack, or a signal) is reported with
 `kernel_confirmed = false`, and any other failure (a theorem the kernel
 rejects, or an elaboration error) still aborts the run.
+
+Category 11 adds 2 tests, which access a local through an explicit shared
+reborrow `tmp`, the form of the reference temporary behind every `static` access
+(`&raw const S.f` is `&raw const (*{&S}).f`; Charon PR #1620):
+
+| Theme | Tests |
+| :--- | :--- |
+| Reads through `&raw const` after a shared reborrow | `pass_shared_temp_const_raw_ptr_read_and_freeze_retag` (`&raw const (*tmp).b` of a `PairU32` is read before and after the reborrow `&*tmp`, returning `35 ^ 7 ^ (35 << 8) = 8996`) |
+| Writes to frozen bytes of a struct that contains an `UnsafeCell` | `ub_shared_temp_unsafe_cell_raw_const_cast_mut_write` (`tmp: &FreezeAndCell` freezes the bytes of `frozen`, so writing through `(&raw const (*tmp).frozen) as *mut u32` is UB) |
+
+### Category 11 engine gaps
+
+Category 11 also declares model items (`static`s and probes that a
+`__ANNEAL_MODEL_<name>` marker names), which are not manifest tests:
+`sync_miri_suite.py` and `mutators_miri.rs` skip every model-marked item.
+`campaign16_same_tag_disjoint_copy_and_static_retag_probes_verify_live` in
+[`miri_difftest_oracle.rs`](../../crates/anneal-difftest/tests/miri_difftest_oracle.rs)
+calls each probe live, pins Miri's verdict exactly, and pins Anneal's verdict to
+either the gap below (kernel-confirmed, with Anneal's UB at exactly the listed
+statement) or agreement with Miri:
+
+- Same-tag disjoint `copy_nonoverlapping` (Nightly Campaign #16:
+  `ub_copy_nonoverlapping_partial_overlap_array` with `offset(p, 1isize)`
+  perturbed to `offset(p, 2isize)`).
+  `pass_copy_nonoverlapping_same_tag_disjoint_array_halves` (Miri `30`, `&raw
+  mut arr[0]` on `[u32; 4]`, exercising `Statements.lean`'s `copyViaBytes`
+  same-tag guard),
+  `pass_copy_nonoverlapping_same_tag_disjoint_u8_array_halves` (Miri
+  `285803779`, `(&raw mut arr) as *mut u8` on `[u8; 8]`, directly entering
+  `Statements.lean`'s `sameContainer` array-slice branch and hitting `Nat.beq
+  srcPtr.tag dstPtr.tag`), and
+  `pass_copy_nonoverlapping_same_tag_disjoint_struct_fields` (Miri `44`, `&raw
+  mut pair.a` on `PairU32`) copy between disjoint parts of one local through two
+  pointers that share one tag. Both forward (`src < dst`) and backward (`dst <
+  src`) disjoint copies, plus whole-struct `(&raw mut pair) as *mut u32`, report
+  UB at the `copy_nonoverlapping` (`false_positive_ub`,
+  `sound_conservative_abstraction`), both when a candidate calls a probe and
+  when it runs the probe's body in the root frame. Zero-byte same-tag copies
+  (`count == 0` on `[u32; 4]` and `[u8; 8]`, plus `count == 1` on `()` in
+  `Statements.lean`'s `evalCopySingleDirect`) likewise report `false_positive_ub`,
+  whereas same-tag disjoint byte copies inside `OverlayU32` (`evalCopyUnionBytes`
+  via `rangesDisjoint`) and true same-tag overlaps on both `[u32; 4]` and
+  `[u8; 8]` agree with Miri today.
+- `static` accesses. Anneal reports UB at the first access to any `static`,
+  reads included. `pass_static_const_raw_ptr_read_and_freeze_retag` (Miri
+  `8996`) and an isolated `UnsafeCell` write to `STATIC_FREEZE_AND_CELL.cell`
+  (Miri `5379`) are `false_positive_ub`.
+  `ub_static_unsafe_cell_raw_const_cast_mut_write` (Miri: UB at the write to the
+  frozen field of `STATIC_FREEZE_AND_CELL`), a direct write to
+  `STATIC_FREEZE_AND_CELL.frozen` without touching `cell` first (Miri: Tree
+  Borrows UB `"is forbidden"` on the writable static allocation), and a write
+  through `(&raw const STATIC_FROZEN_PAIR.a) as *mut u32` (Miri: UB, because an
+  immutable `static` is read-only) are `ub_location_mismatch`
+  (`value_mismatch`): Anneal reports UB before Miri's write and never passes.
+- `UnsafeCell` fields. A write to the `UnsafeCell` field of a struct through a
+  shared reborrow of the struct, which Miri allows, is UB in Anneal
+  (`false_positive_ub`). The static UB probe writes its `cell` field this way
+  before its frozen write, so it agrees with Miri only once both this gap and
+  the `static` gap are fixed. Its manifest twin writes no `UnsafeCell` field
+  and agrees.
 
 ## Policy on `known_anneal_bug` Entries
 
@@ -245,7 +316,7 @@ rejects, or an elaboration error) still aborts the run.
 
 ### Summary of Open Anneal Bugs Exposed by the Suite
 
-The suite currently exposes no open Anneal bug: all 108 tests agree with Miri.
+The suite currently exposes no open Anneal bug: all 112 tests agree with Miri.
 
 ## Running the Suite
 

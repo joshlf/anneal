@@ -19,15 +19,16 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anneal_difftest::miri_eval::{
-    MiriEvalOptions, WitnessPolarity, classify_outcome_tags_polarity, divergence_class_slug,
-    evaluate_miri_batches, evaluate_miri_batches_with_options, reproduce_miri_finding,
-    witness_polarity_accounting_holds,
+    MiriEvalOptions, WitnessPolarity, classify_outcome_tags_polarity,
+    classify_verdict_witness_polarity, divergence_class_slug, evaluate_miri_batches,
+    evaluate_miri_batches_with_options, reproduce_miri_finding, witness_polarity_accounting_holds,
 };
 use anneal_difftest::mutators_miri::{
     ArithmeticCastMutator, BitValidityTransmuteMutator, DetRng, GeneratedMiriCandidate,
     MIRI_CORPUS_CRATE_HEADER, MIRI_CORPUS_MODULE_PREAMBLE, MiriAstMutator, MutationMode,
-    PlaceProjectionWrapper, TreeBorrowsRetagInterleaver, build_standalone_candidate_source,
-    generate_miri_batch, generate_miri_corpus_batch, reconstruct_miri_mutation_steps,
+    PlaceProjectionWrapper, RAW_MIRI_DIFF_CORPUS_RS, RawPtrOffsetMutator,
+    TreeBorrowsRetagInterleaver, build_standalone_candidate_source, generate_miri_batch,
+    generate_miri_corpus_batch, load_miri_diff_corpus_seeds, reconstruct_miri_mutation_steps,
     replay_miri_mutation_steps,
 };
 use cargo_anneal::{
@@ -153,11 +154,11 @@ data = json.loads(json_path.read_text())
 assert data["harness"] == "miri-difftest"
 assert data["oracle_comparison"] == "performed"
 assert data["mode"] == "identity"
-assert data["total_candidates"] == 108
-assert data["compiled_candidates"] == 108
+assert data["total_candidates"] == 112
+assert data["compiled_candidates"] == 112
 assert data["compile_failed_candidates"] == 0
-assert data["compared_candidates"] == 108
-assert data["agree_count"] == 108
+assert data["compared_candidates"] == 112
+assert data["agree_count"] == 112
 assert data["diverge_count"] == 0
 assert data["kernel_confirmed_divergences"] == 0
 assert data["not_compared_count"] == 0
@@ -397,26 +398,35 @@ assert d1["mutator_applications"] != d2["mutator_applications"], (
         String::from_utf8_lossy(&check_out.stderr)
     );
 
-    // Negative control: evaluate a candidate that writes a surrogate code point
-    // (0xD800) into a `char` local via `*mut u32` and loads it as `u32`,
-    // verifying finding bundle generation (`repro.rs`, `finding.json`,
-    // `SUMMARY.md`) and standalone `--reproduce` round-tripping.
+    // Negative control: evaluate an oracle-separated candidate whose divergence
+    // does not depend on any `trusted/` semantic gap, verifying finding bundle
+    // generation (`repro.rs`, `finding.json`, `SUMMARY.md`) and standalone
+    // `--reproduce` round-tripping. `ANNEAL_CAPTURE_DIR` is set for every
+    // `anneal-rustc-capture` compilation (the capture wrapper records nothing
+    // without it) and never for the plain `rustc` compilation of the Miri
+    // `.rlib` (`run_miri_oracle` removes any ambient value; the `--reproduce`
+    // run below passes one), so Anneal returns `2` (kernel-confirmed by `rfl`)
+    // while Miri reads an invalid `bool` (`missed_ub`). (The previous control,
+    // a surrogate `char` written through `*mut u32`, agrees since
+    // `DIV-LM-RAW-OVERWRITE-CHAR-COPY` was fixed; `cfg(miri)` cannot split the
+    // oracles because the `.rlib` is compiled without `--cfg miri`.)
     let root = repo_root();
-    let neg_fn = "\
-pub fn neg_ctrl_char_surrogate_via_ptr__b0_c0() -> u32 {
-    let mut c: char = 'a';
-    let p: *mut u32 = (&raw mut c) as *mut u32;
-    unsafe {
-        *p = 0xD800u32;
+    let neg_fn = r#"pub fn neg_ctrl_capture_split_invalid_bool__b0_c0() -> u32 {
+    const ANNEAL_CAPTURE: bool = option_env!("ANNEAL_CAPTURE_DIR").is_some();
+    if ANNEAL_CAPTURE {
+        2u32
+    } else {
+        let raw: u8 = 2u8;
+        let b: bool = unsafe { *(&raw const raw as *const bool) };
+        b as u32
     }
-    c as u32
 }
-";
+"#;
     let neg_cand = GeneratedMiriCandidate {
         id: 0,
         seed_index: 0,
-        seed_name: "ub_transmute_invalid_char_surrogate".to_string(),
-        fn_name: "neg_ctrl_char_surrogate_via_ptr__b0_c0".to_string(),
+        seed_name: "ub_transmute_invalid_bool_through_ptr".to_string(),
+        fn_name: "neg_ctrl_capture_split_invalid_bool__b0_c0".to_string(),
         seed_u64: 0xDEAD_BEEF,
         applied_mutators: vec!["BitValidityTransmuteMutator".to_string()],
         tracked_locals: Vec::new(),
@@ -468,8 +478,12 @@ pub fn neg_ctrl_char_surrogate_via_ptr__b0_c0() -> u32 {
     assert!(finding_json.contains("\"shrink_status\": \"skipped_replay_mismatch\""));
     assert!(finding_json.contains("\"executed_oracle_runs\": 0"));
 
+    // Pass an ambient `ANNEAL_CAPTURE_DIR` into the `--reproduce` subprocess to
+    // verify that `run_miri_oracle` strips `ANNEAL_CAPTURE_DIR` from the Miri
+    // `.rlib` and `miri` invocations and preserves the oracle split.
     let repro_json = dir.join("repro_neg.json");
     let repro_out = Command::new(bin)
+        .env("ANNEAL_CAPTURE_DIR", dir.join("ambient_capture_dir_leak"))
         .arg("--reproduce")
         .arg(repro_path)
         .arg("--output-json")
@@ -604,22 +618,31 @@ pub fn agree_helper_call__b0_c0() -> u32 {
         source: build_standalone_candidate_source(agree_fn),
     };
 
-    let div_fn = "\
-pub fn neg_ctrl_helper_call_surrogate__b0_c1() -> u32 {
+    // The diverging negative control steps through `helper_add_ten()` in both
+    // oracles, then splits them without relying on any `trusted/` semantic gap:
+    // `ANNEAL_CAPTURE_DIR` is set for every `anneal-rustc-capture` compilation and
+    // never for the plain `rustc` compilation of the Miri `.rlib` (from which
+    // `run_miri_oracle` removes any ambient value), so Anneal returns `base`
+    // (`10`, kernel-confirmed) while Miri reads an invalid `bool`
+    // (`missed_ub`). (A surrogate `char` written through `*mut u32` agrees
+    // since `DIV-LM-RAW-OVERWRITE-CHAR-COPY` was fixed.)
+    let div_fn = r#"pub fn neg_ctrl_helper_call_capture_split__b0_c1() -> u32 {
+    const ANNEAL_CAPTURE: bool = option_env!("ANNEAL_CAPTURE_DIR").is_some();
     let base: u32 = helper_add_ten();
-    let mut c: char = 'a';
-    let p: *mut u32 = (&raw mut c) as *mut u32;
-    unsafe {
-        *p = 0xD800u32;
+    if ANNEAL_CAPTURE {
+        base
+    } else {
+        let raw: u8 = 2u8;
+        let b: bool = unsafe { *(&raw const raw as *const bool) };
+        base + (b as u32)
     }
-    base + (c as u32)
 }
-";
+"#;
     let div_cand = GeneratedMiriCandidate {
         id: 1,
         seed_index: 0,
         seed_name: "pass_direct_fn_call".to_string(),
-        fn_name: "neg_ctrl_helper_call_surrogate__b0_c1".to_string(),
+        fn_name: "neg_ctrl_helper_call_capture_split__b0_c1".to_string(),
         seed_u64: 0x3333_4444,
         applied_mutators: vec!["BitValidityTransmuteMutator".to_string()],
         tracked_locals: Vec::new(),
@@ -655,7 +678,7 @@ pub fn neg_ctrl_helper_call_surrogate__b0_c1() -> u32 {
     assert_eq!(report.findings.len(), 1);
 
     let f = &report.findings[0];
-    assert_eq!(f.fn_name, "neg_ctrl_helper_call_surrogate__b0_c1");
+    assert_eq!(f.fn_name, "neg_ctrl_helper_call_capture_split__b0_c1");
     assert!(f.kernel_confirmed);
     assert!(
         f.kernel_confirm_theorems
@@ -2269,39 +2292,184 @@ pub fn early_ret_ep2_live(b_static: &'static [u8], flag: bool) -> u32 {
     assert!(repro_report.kernel_confirmed);
 }
 
-/// Seed whose unmutated program the live engine gets wrong: it writes the
-/// surrogate code point `0xD800` into a `char` through a `*mut u32` and loads it
-/// as `u32`. Miri reports the invalid `char`; Anneal returns `0xD800`
-/// (`missed_ub`). When the engine learns `char` validity, this test (like the
-/// negative control above) must switch to another divergent seed.
-const CHAR_SURROGATE_SEED: &str = "\
-pub fn seed_char_surrogate_via_ptr() -> u32 {
+/// `RawPtrOffsetMutator`'s `u8` read of the uninitialized padding byte at offset
+/// 1 of a `PaddedU8U32` through `(&raw const s) as *const u8` and
+/// `offset(base, 1isize)` (`model-checking/kani#5183`) compiles, faults in Miri on
+/// the uninitialized byte, and agrees with Anneal's strict UB at the same read;
+/// its `Pass` multi-element `copy_nonoverlapping` template (whole-array pointer
+/// casts) compiles and agrees on the returned value. The template's former
+/// element sub-place form (`&raw const __cp_src[0]`) stays a negative control: a
+/// kernel-confirmed `wrong_value` divergence (Anneal copies only the first
+/// element), so this test fails once `trusted/` fixes it and the restriction can
+/// be lifted.
+#[test]
+fn raw_ptr_offset_padding_read_and_whole_array_copy_templates_agree_with_miri() {
+    let dir = unique_temp_dir("raw_ptr_pad_templates");
+    let root = repo_root();
+    let padding = template_candidate(
+        0,
+        &RawPtrOffsetMutator,
+        MutationMode::Ub,
+        "let __raw_pad_base: *const u8 = (&raw const __raw_pad_s) as *const u8;",
+        &[],
+    );
+    assert!(
+        padding
+            .fn_source
+            .contains("let __raw_pad_byte: u8 = unsafe { *offset(__raw_pad_base, __raw_pad_step) };")
+            && padding.fn_source.contains("let __raw_pad_step: isize = 1isize;")
+            && padding.fn_source.contains("PaddedU8U32 {"),
+        "{}",
+        padding.fn_source
+    );
+    let copy = template_candidate(
+        1,
+        &RawPtrOffsetMutator,
+        MutationMode::Pass,
+        "let __src_p: *const u32 = (&raw const __cp_src) as *const u32;",
+        &[],
+    );
+    assert!(
+        copy.fn_source
+            .contains("copy_nonoverlapping(__src_p, __dst_p, 2usize);"),
+        "{}",
+        copy.fn_source
+    );
+    let neg_name = "neg_ctrl_raw_ptr_elem_subplace_copy__b0_c2";
+    let neg_source = format!(
+        "pub fn {neg_name}() -> u32 {{
+    let __cp_src: [u32; 2] = [22u32, 99u32];
+    let mut __cp_dst: [u32; 2] = [0u32, 0u32];
+    unsafe {{
+        let __src_p: *const u32 = &raw const __cp_src[0];
+        let __dst_p: *mut u32 = &raw mut __cp_dst[0];
+        copy_nonoverlapping(__src_p, __dst_p, 2usize);
+    }}
+    __cp_dst[0] ^ __cp_dst[1]
+}}
+"
+    );
+    let neg = handwritten_candidate(
+        2,
+        "raw_ptr_negative_control",
+        neg_name,
+        "RawPtrOffsetMutator",
+        &neg_source,
+    );
+    let findings_dir = dir.join("findings_raw_ptr_pad");
+    let report = evaluate_miri_batches(
+        "seeded",
+        0xE2_0002,
+        &[vec![padding, copy, neg]],
+        3,
+        Some(&findings_dir),
+        Some(&root),
+    )
+    .expect("evaluate RawPtrOffsetMutator template batch");
+    assert_eq!(report.compiled_candidates, 3, "{report:#?}");
+    assert_eq!(report.compared_candidates, 3, "{report:#?}");
+    let item = |name: &str| {
+        report
+            .item_reports
+            .iter()
+            .find(|r| r.name == name)
+            .unwrap_or_else(|| panic!("missing item report for `{name}`"))
+    };
+
+    let pad = item("ep2_template__b0_c0");
+    assert!(
+        matches!(pad.verdict, ComparisonVerdict::Agree)
+            && matches!(&pad.miri, MiriOutcome::Ub { message, .. }
+                if message.contains("uninitialized"))
+            && matches!(pad.anneal, AnnealOutcome::Ub { span: Some(_) }),
+        "the padding read must be UB on the uninitialized byte in Miri and strict UB at \
+         the same read in Anneal: verdict={:?} miri={:?} anneal={:?}",
+        pad.verdict,
+        pad.miri,
+        pad.anneal
+    );
+
+    let cp = item("ep2_template__b0_c1");
+    assert!(
+        matches!(cp.verdict, ComparisonVerdict::Agree)
+            && matches!(cp.miri, MiriOutcome::PassScalar { size_bytes: 4, .. }),
+        "the whole-array copy template must return normally and agree: verdict={:?} \
+         miri={:?} anneal={:?}",
+        cp.verdict,
+        cp.miri,
+        cp.anneal
+    );
+
+    let gap = item(neg_name);
+    assert!(
+        matches!(
+            gap.verdict,
+            ComparisonVerdict::Diverge(DivergenceKind::WrongValue { .. })
+        ) && gap.miri
+            == MiriOutcome::PassScalar {
+                bits: 117,
+                size_bytes: 4,
+            }
+            && gap.anneal
+                == AnnealOutcome::PassScalar {
+                    bits: 22,
+                    size_bytes: 4,
+                }
+            && gap.kernel_confirmed,
+        "the element sub-place copy gap changed (fixed?): verdict={:?} miri={:?} anneal={:?} \
+         kernel_confirmed={}; lift the `RawPtrOffsetMutator` copy-template restriction and \
+         update `probe_gap_subplace_multi_elem_copy` in `miri_eval.rs`",
+        gap.verdict,
+        gap.miri,
+        gap.anneal,
+        gap.kernel_confirmed
+    );
+    assert_eq!(report.agree_count, 2, "{:#?}", report.findings);
+    assert_eq!(report.diverge_count, 1, "{:#?}", report.findings);
+    assert_eq!(
+        report.findings.iter().map(|f| f.divergence_class.as_str()).collect::<Vec<_>>(),
+        vec!["wrong_value"]
+    );
+}
+
+/// Seed whose unmutated program diverges (`missed_ub`) independently of any
+/// `trusted/` semantic gap: it writes the surrogate code point `0xD800` into a
+/// `char` through a `*mut u32` and then branches on `ANNEAL_CAPTURE_DIR`, which
+/// is set for every `anneal-rustc-capture` compilation (the capture wrapper
+/// records nothing without it) and never for the plain `rustc` compilation of
+/// the Miri `.rlib`. Miri loads `c` as a `char` and reports the invalid value;
+/// Anneal loads the raw `u32` through `p` and returns `0xD800`. (Since
+/// `DIV-LM-RAW-OVERWRITE-CHAR-COPY` was fixed, Anneal itself rejects the
+/// surrogate `char` load, so an unsplit seed agrees with Miri.)
+const CHAR_SURROGATE_SEED: &str = r#"pub fn seed_char_surrogate_via_ptr() -> u32 {
+    const ANNEAL_CAPTURE: bool = option_env!("ANNEAL_CAPTURE_DIR").is_some();
     let mut c: char = 'a';
     let p: *mut u32 = (&raw mut c) as *mut u32;
     unsafe {
         *p = 0xD800u32;
     }
-    c as u32
+    if ANNEAL_CAPTURE { unsafe { *p } } else { c as u32 }
 }
-";
+"#;
 
 /// Seed whose unmutated program (`[]`) writes the valid code point `pair.a`
 /// (`0x0061`, `'a'`) and therefore agrees between Miri and Anneal, but diverges
 /// (`missed_ub`) when `PlaceProjectionWrapper` flips `pair.a` -> `pair.b`
-/// (`0xD800`). A multi-pass candidate containing that flip alongside other
-/// `Pass`/`PerturbAst` passes shrinks live from `k >= 2` down to the non-empty
-/// 1-minimal chain `["PlaceProjectionWrapper"]`.
-const CHAR_SURROGATE_ON_FIELD_FLIP_SEED: &str = "\
-pub fn seed_char_surrogate_on_field_flip() -> u32 {
+/// (`0xD800`), with the same `ANNEAL_CAPTURE_DIR` oracle split as
+/// `CHAR_SURROGATE_SEED`. A multi-pass candidate containing that flip alongside
+/// other `Pass`/`PerturbAst` passes shrinks live from `k >= 2` down to the
+/// non-empty 1-minimal chain `["PlaceProjectionWrapper"]`.
+const CHAR_SURROGATE_ON_FIELD_FLIP_SEED: &str = r#"pub fn seed_char_surrogate_on_field_flip() -> u32 {
+    const ANNEAL_CAPTURE: bool = option_env!("ANNEAL_CAPTURE_DIR").is_some();
     let pair: PairU32 = PairU32 { a: 0x0061u32, b: 0xD800u32 };
     let mut c: char = 'a';
     let p: *mut u32 = (&raw mut c) as *mut u32;
     unsafe {
         *p = pair.a;
     }
-    c as u32
+    if ANNEAL_CAPTURE { unsafe { *p } } else { c as u32 }
 }
-";
+"#;
 
 /// Live end-to-end shrinking in `evaluate_miri_batches_with_options`: mutated
 /// candidates of a divergent seed (`k -> 0`) and a mutator-triggered divergent
@@ -2477,34 +2645,24 @@ fn cat9_line_of(haystack: &str, needle: &str) -> u32 {
 /// classified by `WitnessPolarity`, and `witness_polarity_counts` satisfies the
 /// accounting identity.
 ///
-/// Frame-relative pointer resolution: `BorrowEntry.targetLocal` is an index
-/// into the *running* frame's locals (`get? locals entry.targetLocal`, falling
-/// back to `memory.callerLocals`, which `pushCalleeFrame` never populates), so
-/// inside a callee a pointer to the caller's local `_k` resolves to the
-/// callee's own local `_k`:
-/// - `cat9_gap_callee_raw_read_wrong_value` / `cat9_gap_callee_raw_write_wrong_value`
-///   (`wrong_value`, `value_mismatch`): with the caller's `x` and the callee's
-///   `u32` parameter `pad2` both at local `_3`, the callee reads `pad2` (`200`)
-///   instead of `x` (`10`), and its write lands in `pad2`, leaving `x`
-///   unchanged (Anneal `13` vs Miri `11`): silent wrong values.
-/// - `cat9_gap_callee_raw_write_collides_with_ptr_arg` (`wrong_value`,
-///   `value_mismatch`): the caller's `x` and the callee's pointer argument
-///   `alias` are both local `_1`, so the callee's write through `alias`
-///   overwrites `alias` itself and `x` stays `10` (Anneal `13` vs Miri `9`).
-/// - `cat9_gap_callee_deref_ref_arg` (`false_positive_ub`,
-///   `sound_conservative_abstraction`): `x` and the reference argument `r` are
-///   both local `_1`, so `*r` reads the callee's own 8-byte `r` as a `u32` and
-///   faults.
-/// - `cat9_gap_callee_raw_write_with_caller_borrow` (`false_positive_ub`): see
-///   the raw-pointer sibling roots below; without the caller's `&x` the
-///   callee's write proceeds but is misdirected into its own frame, as in
-///   `cat9_gap_callee_raw_write_collides_with_ptr_arg`.
-/// - `cat9_gap_fn_entry_protector_raw_reborrow_missed_ub` (`missed_ub`,
-///   `unsound_missed_fault`): Miri reports the `FnEntry` protector violation of
-///   writing through `raw` while `&*raw` is a protected argument; in Anneal the
-///   write lands in the callee's `_slot_pad` (local `_3`, like `x`), so it never
-///   reaches `x` or its borrow tree (and the capture emits no
-///   `Retag(FnEntry)`, so no protector exists either).
+/// Frame-relative pointer resolution (fixed by `DIV-MR-CALL-TARGET-LOCAL` and
+/// `DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL` in `86255c4698`): a borrow entry now
+/// records the depth of the frame owning `targetLocal`, so inside a callee a
+/// pointer to the caller's local `_k` resolves to the caller's `_k`, not the
+/// callee's own `_k`. The former gaps stay pinned as exact agreements:
+/// - `cat9_gap_callee_raw_read_wrong_value` (`10`) and
+///   `cat9_gap_callee_raw_write_wrong_value` (`11`): the caller's `x` and the
+///   callee's `u32` parameter `pad2` are both local `_3`.
+/// - `cat9_gap_callee_raw_write_collides_with_ptr_arg` (`9`): the caller's `x`
+///   and the callee's pointer argument `alias` are both local `_1`.
+/// - `cat9_gap_callee_deref_ref_arg` (`11`): `x` and the reference argument `r`
+///   are both local `_1`.
+///
+/// `cat9_gap_fn_entry_protector_raw_reborrow_missed_ub` (`missed_ub`,
+/// `unsound_missed_fault`) still diverges: Miri reports the `FnEntry` protector
+/// violation of writing through `raw` while `&*raw` is a protected argument.
+/// Anneal's write now reaches `x` (Anneal `11`), but the capture emits no
+/// `Retag(FnEntry)`, so no protector exists to forbid it.
 ///
 /// Raw-pointer sibling roots (no call needed): `&raw mut x` mints its own root
 /// borrow entry, and creating a later `&x` (a sibling root whose retag reads
@@ -2887,14 +3045,14 @@ pub fn cat9_gap_drop_impl_ub_missed() -> u32 {
 
     assert_eq!(report.total_candidates, 19);
     assert_eq!(report.compiled_candidates, 19);
-    assert_eq!(report.agree_count, 6, "agreements: {:?}", report.item_reports);
-    assert_eq!(report.diverge_count, 13, "divergences: {:?}", report.item_reports);
+    assert_eq!(report.agree_count, 10, "agreements: {:?}", report.item_reports);
+    assert_eq!(report.diverge_count, 9, "divergences: {:?}", report.item_reports);
     assert_eq!(report.not_compared_count, 0);
     assert!(witness_polarity_accounting_holds(&report));
     for (slug, expected) in [
         ("unsound_missed_fault", 4usize),
-        ("sound_conservative_abstraction", 5),
-        ("value_mismatch", 4),
+        ("sound_conservative_abstraction", 4),
+        ("value_mismatch", 1),
         ("harness_or_extraction_error", 0),
     ] {
         assert_eq!(
@@ -2904,8 +3062,8 @@ pub fn cat9_gap_drop_impl_ub_missed() -> u32 {
             report.witness_polarity_counts
         );
     }
-    assert_eq!(report.findings.len(), 13);
-    assert_eq!(report.kernel_confirmed_divergences, 13);
+    assert_eq!(report.findings.len(), 9);
+    assert_eq!(report.kernel_confirmed_divergences, 9);
     // With no shrinkable mutator chain, every finding reports its original
     // candidate, so each original item report is itself kernel-confirmed.
     for f in &report.findings {
@@ -2996,37 +3154,39 @@ pub fn cat9_gap_drop_impl_ub_missed() -> u32 {
     assert_eq!(
         prot_rep.anneal,
         AnnealOutcome::PassScalar {
-            bits: 13,
+            bits: 11,
             size_bytes: 4
-        }
+        },
+        "known Category 9 `FnEntry` protector gap changed (fixed?); update the pin and \
+         tests/miri-diff/README.md"
     );
 
-    // Frame-relative pointer resolution yields silent wrong values: the callee
-    // reads (and writes) its own `pad2` at local `_3` instead of the caller's
-    // `x` at local `_3`.
-    for (name, miri_bits, anneal_bits) in [
-        ("cat9_gap_callee_raw_read_wrong_value", 10u128, 200u128),
-        ("cat9_gap_callee_raw_write_wrong_value", 11, 13),
-        ("cat9_gap_callee_raw_write_collides_with_ptr_arg", 9, 13),
+    // Frame-relative pointer resolution agrees with Miri since
+    // `DIV-MR-CALL-TARGET-LOCAL` / `DIV-MR-CALLER-BORROW-ACROSS-SCALAR-CALL`: a
+    // callee access through a pointer to the caller's `x` reaches `x`, not the
+    // callee's local of the same index.
+    for (name, bits) in [
+        ("cat9_gap_callee_raw_read_wrong_value", 10u128),
+        ("cat9_gap_callee_raw_write_wrong_value", 11),
+        ("cat9_gap_callee_raw_write_collides_with_ptr_arg", 9),
+        ("cat9_gap_callee_deref_ref_arg", 11),
     ] {
-        let f = finding(name);
-        assert_eq!(f.divergence_class, "wrong_value", "`{name}`");
-        assert_eq!(f.witness_polarity, "value_mismatch", "`{name}`");
         let rep = item(name);
+        assert_eq!(rep.verdict, ComparisonVerdict::Agree, "`{name}` must agree");
         assert_eq!(
             (&rep.miri, &rep.anneal),
             (
                 &MiriOutcome::PassScalar {
-                    bits: miri_bits,
+                    bits,
                     size_bytes: 4
                 },
                 &AnnealOutcome::PassScalar {
-                    bits: anneal_bits,
+                    bits,
                     size_bytes: 4
                 }
             ),
-            "known Category 9 frame-relative pointer gap `{name}` changed (fixed?); update the \
-             pin and tests/miri-diff/README.md"
+            "fixed Category 9 frame-relative pointer case `{name}` regressed; see \
+             tests/miri-diff/README.md"
         );
     }
 
@@ -3034,7 +3194,6 @@ pub fn cat9_gap_drop_impl_ub_missed() -> u32 {
     // documented statement.
     for (name, miri_bits, ub_marker) in [
         ("cat9_in_scope_move_raw_read_conservative", 30u128, "let leaked: u32 = unsafe { *raw };"),
-        ("cat9_gap_callee_deref_ref_arg", 11, "    *r + bonus"),
         ("cat9_gap_callee_raw_write_with_caller_borrow", 10, "        *alias = 7u32;"),
         ("cat9_gap_post_return_raw_write_after_ref_arg", 10, "        *raw = 7u32 + seen;"),
         ("cat9_gap_raw_write_after_unused_shared_borrow", 11, "        *raw = 11u32;"),
@@ -3122,6 +3281,1253 @@ pub fn cat9_gap_drop_impl_ub_missed() -> u32 {
             },
             "known Category 9 `Drop` gap `{name}` changed (fixed?); update the pin and \
              tests/miri-diff/README.md"
+        );
+    }
+}
+
+/// 1-based line of the first line of `staged` that contains `needle` and follows
+/// the unique line that contains `header`.
+fn c16_line_after(staged: &str, header: &str, needle: &str) -> u32 {
+    let start = cat9_line_of(staged, header) as usize;
+    staged
+        .lines()
+        .enumerate()
+        .skip(start)
+        .find_map(|(i, l)| l.contains(needle).then_some(i as u32 + 1))
+        .unwrap_or_else(|| panic!("`{needle}` must follow `{header}` in the staged crate"))
+}
+
+/// Source of the corpus function `name` (attributes and doc comments dropped),
+/// renamed to `renamed`, so a candidate can run a corpus body in the root frame.
+fn c16_corpus_fn_renamed(name: &str, renamed: &str) -> String {
+    let file = syn::parse_file(RAW_MIRI_DIFF_CORPUS_RS).expect("corpus parses");
+    let mut func = file
+        .items
+        .into_iter()
+        .find_map(|item| match item {
+            syn::Item::Fn(f) if f.sig.ident == name => Some(f),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("tests/miri-diff/corpus/src/lib.rs must define `{name}`"));
+    func.attrs.clear();
+    func.sig.ident = syn::Ident::new(renamed, func.sig.ident.span());
+    prettyplease::unparse(&syn::File {
+        shebang: None,
+        attrs: Vec::new(),
+        items: vec![syn::Item::Fn(func)],
+    })
+}
+
+/// Campaign #16 same-tag disjoint `copy_nonoverlapping` probes, the static-access
+/// probes, and their local twins (Category 11 of `tests/miri-diff/corpus`), run
+/// live against Miri.
+///
+/// Miri's verdict is pinned exactly. Each Anneal gap is pinned to exactly two
+/// states (a ratchet: any third state, such as an unsound missed fault, a
+/// different value, a fault at a different statement, `NotCompared`, or a
+/// compile failure, fails this test):
+/// - the documented gap, kernel-confirmed, with Anneal's UB at exactly the
+///   documented statement, or
+/// - agreement with Miri, once Anneal is fixed.
+///
+/// Gaps (see "Category 11 engine gaps" in `tests/miri-diff/README.md`):
+/// - `pass_copy_nonoverlapping_same_tag_disjoint_{array_halves,struct_fields}`
+///   (called as intra-crate callees, and run in the root frame as renamed
+///   copies): `false_positive_ub` (`sound_conservative_abstraction`) at the
+///   `copy_nonoverlapping`, because `Statements.lean` checks
+///   `Nat.beq srcPtr.tag dstPtr.tag` before it compares the copied ranges.
+/// - `pass_static_const_raw_ptr_read_and_freeze_retag`: `false_positive_ub` at
+///   the first access to the `static` (Anneal reports UB at every access to a
+///   `static`, reads included).
+/// - `ub_static_unsafe_cell_raw_const_cast_mut_write` and the immutable-static
+///   write control: Miri reports UB at the write, and Anneal reports UB earlier,
+///   at the first access to the `static` (`ub_location_mismatch`,
+///   `value_mismatch`): never a pass.
+/// - `c16_gap_unsafe_cell_field_write_through_shared_temp`: a write to the
+///   `UnsafeCell` field of a local through a shared reborrow of the containing
+///   struct, which Miri allows, is UB in Anneal (`false_positive_ub`). It is the
+///   local twin of the `cell` write of the static UB probe, which therefore
+///   agrees only once both gaps are fixed.
+///
+/// Controls that must agree now: a true same-tag overlap (UB at the copy, so the
+/// copy pins cannot pass by dropping the overlap check), and the two Category
+/// 11 manifest seeds (the local twins of the static probes).
+#[test]
+fn campaign16_same_tag_disjoint_copy_and_static_retag_probes_verify_live() {
+    let dir = unique_temp_dir("campaign16");
+    let findings_dir = dir.join("findings");
+    let root = repo_root();
+
+    let seed_source = |name: &str| -> String {
+        load_miri_diff_corpus_seeds()
+            .into_iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("missing Category 11 manifest seed `{name}`"))
+            .fn_source
+    };
+    let named_sources: Vec<(String, String)> = vec![
+        (
+            "c16_call_array_halves".to_string(),
+            "pub fn c16_call_array_halves() -> u32 {\n    \
+             pass_copy_nonoverlapping_same_tag_disjoint_array_halves()\n}\n"
+                .to_string(),
+        ),
+        (
+            "c16_call_u8_array_halves".to_string(),
+            "pub fn c16_call_u8_array_halves() -> u32 {\n    \
+             pass_copy_nonoverlapping_same_tag_disjoint_u8_array_halves()\n}\n"
+                .to_string(),
+        ),
+        (
+            "c16_call_struct_fields".to_string(),
+            "pub fn c16_call_struct_fields() -> u32 {\n    \
+             pass_copy_nonoverlapping_same_tag_disjoint_struct_fields()\n}\n"
+                .to_string(),
+        ),
+        (
+            "c16_root_array_halves".to_string(),
+            c16_corpus_fn_renamed(
+                "pass_copy_nonoverlapping_same_tag_disjoint_array_halves",
+                "c16_root_array_halves",
+            ),
+        ),
+        (
+            "c16_root_u8_array_halves".to_string(),
+            c16_corpus_fn_renamed(
+                "pass_copy_nonoverlapping_same_tag_disjoint_u8_array_halves",
+                "c16_root_u8_array_halves",
+            ),
+        ),
+        (
+            "c16_root_struct_fields".to_string(),
+            c16_corpus_fn_renamed(
+                "pass_copy_nonoverlapping_same_tag_disjoint_struct_fields",
+                "c16_root_struct_fields",
+            ),
+        ),
+        (
+            "c16_reverse_u8_array_halves".to_string(),
+            r#"pub fn c16_reverse_u8_array_halves() -> u32 {
+    let mut arr: [u8; 8] = [3u8, 5u8, 9u8, 17u8, 33u8, 65u8, 129u8, 250u8];
+    let p: *mut u8 = (&raw mut arr) as *mut u8;
+    unsafe {
+        let src: *const u8 = offset(p, 4isize) as *const u8;
+        copy_nonoverlapping(src, p, 4usize);
+    }
+    (arr[0] as u32)
+        | ((arr[1] as u32) << 8u32)
+        | ((arr[2] as u32) << 16u32)
+        | ((arr[3] as u32) << 24u32)
+}
+"#
+            .to_string(),
+        ),
+        (
+            "c16_reverse_u32_array_halves".to_string(),
+            r#"pub fn c16_reverse_u32_array_halves() -> u32 {
+    let mut arr: [u32; 4] = [10u32, 20u32, 30u32, 40u32];
+    let p: *mut u32 = &raw mut arr[0];
+    unsafe {
+        let src: *const u32 = offset(p, 2isize) as *const u32;
+        copy_nonoverlapping(src, p, 2usize);
+    }
+    (arr[0] << 8u32) ^ arr[1]
+}
+"#
+            .to_string(),
+        ),
+        (
+            "c16_whole_struct_cast_fields".to_string(),
+            r#"pub fn c16_whole_struct_cast_fields() -> u32 {
+    let mut pair: PairU32 = PairU32 { a: 44u32, b: 33u32 };
+    let p: *mut u32 = (&raw mut pair) as *mut u32;
+    unsafe {
+        let dst: *mut u32 = offset(p, 1isize);
+        copy_nonoverlapping(p as *const u32, dst, 1usize);
+    }
+    (pair.a << 8u32) ^ pair.b
+}
+"#
+            .to_string(),
+        ),
+        (
+            "c16_reverse_struct_fields".to_string(),
+            r#"pub fn c16_reverse_struct_fields() -> u32 {
+    let mut pair: PairU32 = PairU32 { a: 44u32, b: 33u32 };
+    let p: *mut u32 = &raw mut pair.a;
+    unsafe {
+        let src: *const u32 = offset(p, 1isize) as *const u32;
+        copy_nonoverlapping(src, p, 1usize);
+    }
+    (pair.a << 8u32) ^ pair.b
+}
+"#
+            .to_string(),
+        ),
+        (
+            "c16_zero_count_u32_same_tag_copy".to_string(),
+            r#"pub fn c16_zero_count_u32_same_tag_copy() -> u32 {
+    let mut arr: [u32; 4] = [10u32, 20u32, 30u32, 40u32];
+    let p: *mut u32 = &raw mut arr[0];
+    unsafe {
+        copy_nonoverlapping(p as *const u32, p, 0usize);
+    }
+    arr[0] + arr[3]
+}
+"#
+            .to_string(),
+        ),
+        (
+            "c16_zero_count_u8_same_tag_copy".to_string(),
+            r#"pub fn c16_zero_count_u8_same_tag_copy() -> u32 {
+    let mut arr: [u8; 8] = [3u8, 5u8, 9u8, 17u8, 33u8, 65u8, 129u8, 250u8];
+    let p: *mut u8 = (&raw mut arr) as *mut u8;
+    unsafe {
+        copy_nonoverlapping(p as *const u8, p, 0usize);
+    }
+    (arr[0] as u32) + (arr[3] as u32) + 2u32
+}
+"#
+            .to_string(),
+        ),
+        (
+            "c16_zst_unit_single_direct_same_tag_copy".to_string(),
+            r#"pub fn c16_zst_unit_single_direct_same_tag_copy() -> u32 {
+    let mut z: () = ();
+    let p: *mut () = &raw mut z;
+    unsafe {
+        copy_nonoverlapping(p as *const (), p, 1usize);
+    }
+    77u32
+}
+"#
+            .to_string(),
+        ),
+        (
+            "c16_union_same_tag_disjoint_bytes_agree".to_string(),
+            r#"pub fn c16_union_same_tag_disjoint_bytes_agree() -> u32 {
+    let mut u: OverlayU32 = OverlayU32 {
+        bytes: [3u8, 5u8, 9u8, 17u8],
+    };
+    let p: *mut u8 = (&raw mut u.bytes) as *mut u8;
+    unsafe {
+        let dst: *mut u8 = offset(p, 2isize);
+        copy_nonoverlapping(p as *const u8, dst, 2usize);
+        u.word
+    }
+}
+"#
+            .to_string(),
+        ),
+        (
+            "c16_same_tag_overlap_control".to_string(),
+            r#"pub fn c16_same_tag_overlap_control() -> u32 {
+    let mut arr: [u32; 4] = [10u32, 20u32, 30u32, 40u32];
+    let p: *mut u32 = &raw mut arr[0];
+    unsafe {
+        let dst: *mut u32 = offset(p, 1isize);
+        copy_nonoverlapping(p as *const u32, dst, 2usize);
+    }
+    arr[2]
+}
+"#
+            .to_string(),
+        ),
+        (
+            "c16_same_tag_u8_overlap_control".to_string(),
+            r#"pub fn c16_same_tag_u8_overlap_control() -> u32 {
+    let mut arr: [u8; 8] = [1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8];
+    let p: *mut u8 = (&raw mut arr) as *mut u8;
+    unsafe {
+        let dst: *mut u8 = offset(p, 2isize);
+        copy_nonoverlapping(p as *const u8, dst, 4usize);
+    }
+    arr[2] as u32
+}
+"#
+            .to_string(),
+        ),
+        (
+            "c16_call_static_freeze_read".to_string(),
+            "pub fn c16_call_static_freeze_read() -> u32 {\n    \
+             pass_static_const_raw_ptr_read_and_freeze_retag()\n}\n"
+                .to_string(),
+        ),
+        (
+            "c16_static_unsafe_cell_only_write".to_string(),
+            r#"pub fn c16_static_unsafe_cell_only_write() -> u32 {
+    let cell: *mut u32 = (&raw const STATIC_FREEZE_AND_CELL.cell) as *const u32 as *mut u32;
+    unsafe {
+        *cell = 21u32;
+        (*cell << 8u32) ^ STATIC_FREEZE_AND_CELL.frozen
+    }
+}
+"#
+            .to_string(),
+        ),
+        (
+            "c16_call_static_cell_then_frozen_write".to_string(),
+            "pub fn c16_call_static_cell_then_frozen_write() -> u32 {\n    \
+             ub_static_unsafe_cell_raw_const_cast_mut_write()\n}\n"
+                .to_string(),
+        ),
+        (
+            "c16_static_freeze_and_cell_frozen_only_write".to_string(),
+            r#"pub fn c16_static_freeze_and_cell_frozen_only_write() -> u32 {
+    let frozen: *mut u32 = (&raw const STATIC_FREEZE_AND_CELL.frozen) as *mut u32;
+    unsafe {
+        *frozen = 21u32;
+        *frozen
+    }
+}
+"#
+            .to_string(),
+        ),
+        (
+            "c16_immutable_static_mut_write_control".to_string(),
+            r#"pub fn c16_immutable_static_mut_write_control() -> u32 {
+    let p: *mut u32 = (&raw const STATIC_FROZEN_PAIR.a) as *mut u32;
+    unsafe {
+        *p = 9u32;
+        *p
+    }
+}
+"#
+            .to_string(),
+        ),
+        (
+            "c16_gap_unsafe_cell_field_write_through_shared_temp".to_string(),
+            r#"pub fn c16_gap_unsafe_cell_field_write_through_shared_temp() -> u32 {
+    let local: FreezeAndCell = FreezeAndCell {
+        frozen: 3u32,
+        cell: unsafe { transmute::<u32, UnsafeCell<u32>>(12u32) },
+    };
+    let tmp: &FreezeAndCell = &local;
+    let cell: *mut u32 = (&raw const (*tmp).cell) as *const u32 as *mut u32;
+    unsafe {
+        *cell = 21u32;
+    }
+    let frozen: *const u32 = &raw const (*tmp).frozen;
+    unsafe { (*cell << 8u32) ^ *frozen }
+}
+"#
+            .to_string(),
+        ),
+        (
+            "pass_shared_temp_const_raw_ptr_read_and_freeze_retag".to_string(),
+            seed_source("pass_shared_temp_const_raw_ptr_read_and_freeze_retag"),
+        ),
+        (
+            "ub_shared_temp_unsafe_cell_raw_const_cast_mut_write".to_string(),
+            seed_source("ub_shared_temp_unsafe_cell_raw_const_cast_mut_write"),
+        ),
+    ];
+    let total_expected = named_sources.len();
+    assert_eq!(total_expected, 24);
+    let candidates: Vec<GeneratedMiriCandidate> = named_sources
+        .iter()
+        .enumerate()
+        .map(|(id, (name, fn_src))| GeneratedMiriCandidate {
+            id,
+            seed_index: id,
+            seed_name: name.clone(),
+            fn_name: name.clone(),
+            seed_u64: id as u64,
+            applied_mutators: Vec::new(),
+            tracked_locals: Vec::new(),
+            fn_source: fn_src.clone(),
+            source: build_standalone_candidate_source(fn_src),
+        })
+        .collect();
+    // The batch stages every candidate after the shared header and preamble,
+    // in order, exactly as `evaluate_miri_batches_with_options` does.
+    let mut staged = format!("{MIRI_CORPUS_CRATE_HEADER}\n{MIRI_CORPUS_MODULE_PREAMBLE}\n");
+    for cand in &candidates {
+        staged.push_str(cand.fn_source.trim());
+        staged.push_str("\n\n");
+    }
+
+    let options = MiriEvalOptions {
+        findings_dir: Some(findings_dir.clone()),
+        anneal_repo_root: Some(root.clone()),
+        shrink_seeds: None,
+    };
+    let report = evaluate_miri_batches_with_options(
+        "seeded",
+        0xC16_0001,
+        std::slice::from_ref(&candidates),
+        candidates.len(),
+        &options,
+    )
+    .expect("evaluate Campaign #16 / Category 11 live batch");
+    assert_eq!(report.total_candidates, total_expected);
+    assert_eq!(
+        report.compiled_candidates, total_expected,
+        "{:?}",
+        report.item_reports
+    );
+    assert_eq!(report.not_compared_count, 0, "{:?}", report.item_reports);
+    assert!(witness_polarity_accounting_holds(&report));
+
+    let item = |name: &str| {
+        report
+            .item_reports
+            .iter()
+            .find(|r| r.name == name)
+            .unwrap_or_else(|| panic!("missing item report `{name}`"))
+    };
+    let polarity = |name: &str| {
+        let rep = item(name);
+        classify_verdict_witness_polarity(&rep.miri, &rep.anneal, &rep.verdict)
+    };
+    let mut conservative_gaps = 0usize;
+    let mut location_gaps = 0usize;
+
+    // Same-tag disjoint copies across `copyViaBytes` (`&raw mut arr[0]` / `&raw mut
+    // pair.a`), `sameContainer` (`(&raw mut arr) as *mut u8` on `[u8; 8]`),
+    // whole-struct casts, and both forward (`src < dst`) and backward (`dst < src`)
+    // directions: Miri returns the copied value; Anneal reports UB at the
+    // `copy_nonoverlapping` or, once fixed, agrees.
+    let probe_header = |probe: &str| format!("pub fn {probe}() -> u32 {{");
+    for (name, header, bits, copy) in [
+        (
+            "c16_call_array_halves",
+            probe_header("pass_copy_nonoverlapping_same_tag_disjoint_array_halves"),
+            30u128,
+            "copy_nonoverlapping(p as *const u32, dst, 2usize);",
+        ),
+        (
+            "c16_call_u8_array_halves",
+            probe_header("pass_copy_nonoverlapping_same_tag_disjoint_u8_array_halves"),
+            285_803_779,
+            "copy_nonoverlapping(p as *const u8, dst, 4usize);",
+        ),
+        (
+            "c16_call_struct_fields",
+            probe_header("pass_copy_nonoverlapping_same_tag_disjoint_struct_fields"),
+            44,
+            "copy_nonoverlapping(p as *const u32, dst, 1usize);",
+        ),
+        (
+            "c16_root_array_halves",
+            probe_header("c16_root_array_halves"),
+            30,
+            "copy_nonoverlapping(p as *const u32, dst, 2usize);",
+        ),
+        (
+            "c16_root_u8_array_halves",
+            probe_header("c16_root_u8_array_halves"),
+            285_803_779,
+            "copy_nonoverlapping(p as *const u8, dst, 4usize);",
+        ),
+        (
+            "c16_root_struct_fields",
+            probe_header("c16_root_struct_fields"),
+            44,
+            "copy_nonoverlapping(p as *const u32, dst, 1usize);",
+        ),
+        (
+            "c16_reverse_u8_array_halves",
+            probe_header("c16_reverse_u8_array_halves"),
+            0xFA81_4121,
+            "copy_nonoverlapping(src, p, 4usize);",
+        ),
+        (
+            "c16_reverse_u32_array_halves",
+            probe_header("c16_reverse_u32_array_halves"),
+            7720,
+            "copy_nonoverlapping(src, p, 2usize);",
+        ),
+        (
+            "c16_whole_struct_cast_fields",
+            probe_header("c16_whole_struct_cast_fields"),
+            11308,
+            "copy_nonoverlapping(p as *const u32, dst, 1usize);",
+        ),
+        (
+            "c16_reverse_struct_fields",
+            probe_header("c16_reverse_struct_fields"),
+            8481,
+            "copy_nonoverlapping(src, p, 1usize);",
+        ),
+        (
+            "c16_zero_count_u32_same_tag_copy",
+            probe_header("c16_zero_count_u32_same_tag_copy"),
+            50,
+            "copy_nonoverlapping(p as *const u32, p, 0usize);",
+        ),
+        (
+            "c16_zero_count_u8_same_tag_copy",
+            probe_header("c16_zero_count_u8_same_tag_copy"),
+            22,
+            "copy_nonoverlapping(p as *const u8, p, 0usize);",
+        ),
+        (
+            "c16_zst_unit_single_direct_same_tag_copy",
+            probe_header("c16_zst_unit_single_direct_same_tag_copy"),
+            77,
+            "copy_nonoverlapping(p as *const (), p, 1usize);",
+        ),
+    ] {
+        let rep = item(name);
+        assert_eq!(
+            rep.miri,
+            MiriOutcome::PassScalar {
+                bits,
+                size_bytes: 4
+            },
+            "`{name}`: Miri must return the copied value"
+        );
+        let copy_line = c16_line_after(&staged, &header, copy);
+        match (&rep.anneal, polarity(name)) {
+            (
+                AnnealOutcome::Ub { span: Some(s) },
+                Some(WitnessPolarity::SoundConservativeAbstraction),
+            ) if s.start_line == copy_line
+                && matches!(
+                    rep.verdict,
+                    ComparisonVerdict::Diverge(DivergenceKind::FalsePositiveUb { .. })
+                )
+                && rep.kernel_confirmed =>
+            {
+                conservative_gaps += 1;
+            }
+            (
+                AnnealOutcome::PassScalar {
+                    bits: b,
+                    size_bytes: 4,
+                },
+                None,
+            ) if *b == bits && rep.verdict == ComparisonVerdict::Agree => {}
+            (anneal, pol) => panic!(
+                "`{name}` left both pinned states: expected Anneal UB at staged line \
+                 {copy_line} (`{copy}`, false_positive_ub, kernel-confirmed) or agreement \
+                 on `{bits}`, got anneal={anneal:?} verdict={:?} polarity={pol:?} \
+                 kernel_confirmed={}; update the pin and tests/miri-diff/README.md",
+                rep.verdict, rep.kernel_confirmed
+            ),
+        }
+    }
+
+    // True same-tag overlaps on both `[u32; 4]` (`copyViaBytes`) and `[u8; 8]`
+    // (`sameContainer`) must stay UB at the copy in both Miri and Anneal, so the
+    // pins above cannot hold because Anneal stopped checking overlap.
+    for (ctrl_name, copy_stmt) in [
+        (
+            "c16_same_tag_overlap_control",
+            "copy_nonoverlapping(p as *const u32, dst, 2usize);",
+        ),
+        (
+            "c16_same_tag_u8_overlap_control",
+            "copy_nonoverlapping(p as *const u8, dst, 4usize);",
+        ),
+    ] {
+        let overlap = item(ctrl_name);
+        let overlap_line = c16_line_after(&staged, &probe_header(ctrl_name), copy_stmt);
+        assert_eq!(overlap.verdict, ComparisonVerdict::Agree, "{overlap:?}");
+        assert!(
+            matches!(&overlap.miri, MiriOutcome::Ub { pos: Some(p), message }
+                if p.line == overlap_line && message.contains("overlapping"))
+                && matches!(&overlap.anneal, AnnealOutcome::Ub { span: Some(s) }
+                    if s.start_line == overlap_line),
+            "`{ctrl_name}` must be UB at staged line {overlap_line} in both: \
+             miri={:?} anneal={:?}",
+            overlap.miri,
+            overlap.anneal
+        );
+    }
+
+    // Union (`OverlayU32`) same-tag disjoint byte copy routes through
+    // `Statements.lean`'s `evalCopyUnionBytes` (`rangesDisjoint`) and already
+    // agrees live (`[3, 5, 3, 5]` -> `0x0503_0503 = 84_083_971`).
+    let union_copy = item("c16_union_same_tag_disjoint_bytes_agree");
+    assert_eq!(
+        union_copy.verdict,
+        ComparisonVerdict::Agree,
+        "{union_copy:?}"
+    );
+    assert_eq!(
+        (&union_copy.miri, &union_copy.anneal),
+        (
+            &MiriOutcome::PassScalar {
+                bits: 0x0503_0503,
+                size_bytes: 4
+            },
+            &AnnealOutcome::PassScalar {
+                bits: 0x0503_0503,
+                size_bytes: 4
+            }
+        )
+    );
+
+    // Static reads, isolated static `UnsafeCell` writes, and the local
+    // `UnsafeCell` field write: Miri returns normally; Anneal reports UB at one
+    // of the documented conservative gap statements or, once fixed, agrees.
+    let static_read_line = c16_line_after(
+        &staged,
+        &probe_header("pass_static_const_raw_ptr_read_and_freeze_retag"),
+        "let raw: *const u32 = &raw const STATIC_FROZEN_PAIR.b;",
+    );
+    let static_cell_only_access_line = c16_line_after(
+        &staged,
+        &probe_header("c16_static_unsafe_cell_only_write"),
+        "let cell: *mut u32 = (&raw const STATIC_FREEZE_AND_CELL.cell)",
+    );
+    let static_cell_only_write_line = c16_line_after(
+        &staged,
+        &probe_header("c16_static_unsafe_cell_only_write"),
+        "*cell = 21u32;",
+    );
+    let local_cell_write_line = c16_line_after(
+        &staged,
+        &probe_header("c16_gap_unsafe_cell_field_write_through_shared_temp"),
+        "*cell = 21u32;",
+    );
+    for (name, bits, allowed_gap_lines) in [
+        (
+            "c16_call_static_freeze_read",
+            8996u128,
+            vec![static_read_line],
+        ),
+        (
+            "c16_static_unsafe_cell_only_write",
+            5379,
+            vec![static_cell_only_access_line, static_cell_only_write_line],
+        ),
+        (
+            "c16_gap_unsafe_cell_field_write_through_shared_temp",
+            5379,
+            vec![local_cell_write_line],
+        ),
+    ] {
+        let rep = item(name);
+        assert_eq!(
+            rep.miri,
+            MiriOutcome::PassScalar {
+                bits,
+                size_bytes: 4
+            },
+            "`{name}`: Miri outcome changed"
+        );
+        match (&rep.anneal, polarity(name)) {
+            (
+                AnnealOutcome::Ub { span: Some(s) },
+                Some(WitnessPolarity::SoundConservativeAbstraction),
+            ) if allowed_gap_lines.contains(&s.start_line)
+                && matches!(
+                    rep.verdict,
+                    ComparisonVerdict::Diverge(DivergenceKind::FalsePositiveUb { .. })
+                )
+                && rep.kernel_confirmed =>
+            {
+                conservative_gaps += 1;
+            }
+            (
+                AnnealOutcome::PassScalar {
+                    bits: b,
+                    size_bytes: 4,
+                },
+                None,
+            ) if *b == bits && rep.verdict == ComparisonVerdict::Agree => {}
+            (anneal, pol) => panic!(
+                "`{name}` left its pinned states: expected Anneal UB at one of staged \
+                 lines {allowed_gap_lines:?} (false_positive_ub, kernel-confirmed) or \
+                 agreement on `{bits}`, got anneal={anneal:?} verdict={:?} polarity={pol:?} \
+                 kernel_confirmed={}; update the pin and tests/miri-diff/README.md",
+                rep.verdict, rep.kernel_confirmed
+            ),
+        }
+    }
+
+    // Static writes: Miri reports UB at the write (frozen bytes of the
+    // interior-mutable static, or the read-only immutable static). Anneal must
+    // report UB too, never a pass: today at the first access to the `static`
+    // (or at `*cell = 21u32;` in the compound probe if static access is fixed
+    // before the `UnsafeCell`-field shared-reborrow gap), and once fixed at the
+    // write itself.
+    let cell_probe = probe_header("ub_static_unsafe_cell_raw_const_cast_mut_write");
+    let frozen_only_probe = probe_header("c16_static_freeze_and_cell_frozen_only_write");
+    let immutable = probe_header("c16_immutable_static_mut_write_control");
+    let cell_probe_cell_write =
+        c16_line_after(&staged, cell_probe.as_str(), "*cell = 21u32;");
+    for (name, header, first_access, extra_pre_write_gap, write, miri_message) in [
+        (
+            "c16_call_static_cell_then_frozen_write",
+            cell_probe.as_str(),
+            "let cell: *mut u32 = (&raw const STATIC_FREEZE_AND_CELL.cell)",
+            Some(cell_probe_cell_write),
+            "*frozen = *cell;",
+            "is forbidden",
+        ),
+        (
+            "c16_static_freeze_and_cell_frozen_only_write",
+            frozen_only_probe.as_str(),
+            "let frozen: *mut u32 = (&raw const STATIC_FREEZE_AND_CELL.frozen) as *mut u32;",
+            None,
+            "*frozen = 21u32;",
+            "is forbidden",
+        ),
+        (
+            "c16_immutable_static_mut_write_control",
+            immutable.as_str(),
+            "let p: *mut u32 = (&raw const STATIC_FROZEN_PAIR.a) as *mut u32;",
+            None,
+            "*p = 9u32;",
+            "read-only",
+        ),
+    ] {
+        let rep = item(name);
+        let access_line = c16_line_after(&staged, header, first_access);
+        let write_line = c16_line_after(&staged, header, write);
+        assert!(
+            matches!(&rep.miri, MiriOutcome::Ub { pos: Some(p), message }
+                if p.line == write_line && message.contains(miri_message)),
+            "`{name}`: expected Miri UB (`{miri_message}`) at staged line {write_line}, got {:?}",
+            rep.miri
+        );
+        match (&rep.anneal, polarity(name)) {
+            (AnnealOutcome::Ub { span: Some(s) }, Some(WitnessPolarity::ValueMismatch))
+                if (s.start_line == access_line
+                    || extra_pre_write_gap == Some(s.start_line))
+                    && matches!(
+                        rep.verdict,
+                        ComparisonVerdict::Diverge(DivergenceKind::UbLocationMismatch { .. })
+                    )
+                    && rep.kernel_confirmed =>
+            {
+                location_gaps += 1;
+            }
+            (AnnealOutcome::Ub { span: Some(s) }, None)
+                if s.start_line == write_line && rep.verdict == ComparisonVerdict::Agree => {}
+            (anneal, pol) => panic!(
+                "`{name}` left its pinned states: expected Anneal UB at staged line \
+                 {access_line} (or {extra_pre_write_gap:?}, ub_location_mismatch, \
+                 kernel-confirmed) or agreement at line {write_line}, got anneal={anneal:?} \
+                 verdict={:?} polarity={pol:?} kernel_confirmed={}; update the pin and \
+                 tests/miri-diff/README.md",
+                rep.verdict, rep.kernel_confirmed
+            ),
+        }
+    }
+
+    // The Category 11 manifest seeds (local twins of the static probes) agree.
+    let twin_read = item("pass_shared_temp_const_raw_ptr_read_and_freeze_retag");
+    assert_eq!(twin_read.verdict, ComparisonVerdict::Agree, "{twin_read:?}");
+    assert_eq!(
+        (&twin_read.miri, &twin_read.anneal),
+        (
+            &MiriOutcome::PassScalar {
+                bits: 8996,
+                size_bytes: 4
+            },
+            &AnnealOutcome::PassScalar {
+                bits: 8996,
+                size_bytes: 4
+            }
+        )
+    );
+    let twin_write = item("ub_shared_temp_unsafe_cell_raw_const_cast_mut_write");
+    let twin_write_line = c16_line_after(
+        &staged,
+        &probe_header("ub_shared_temp_unsafe_cell_raw_const_cast_mut_write"),
+        "*frozen = 21u32;",
+    );
+    assert_eq!(
+        twin_write.verdict,
+        ComparisonVerdict::Agree,
+        "{twin_write:?}"
+    );
+    assert!(
+        matches!(&twin_write.miri, MiriOutcome::Ub { pos: Some(p), message }
+            if p.line == twin_write_line && message.contains("is forbidden"))
+            && matches!(&twin_write.anneal, AnnealOutcome::Ub { span: Some(s) }
+                if s.start_line == twin_write_line),
+        "the frozen-field write twin must be UB at staged line {twin_write_line} in both: \
+         miri={:?} anneal={:?}",
+        twin_write.miri,
+        twin_write.anneal
+    );
+
+    // Batch accounting: exactly the pinned gaps diverge, all kernel-confirmed,
+    // and none is an unsound missed fault.
+    let gaps = conservative_gaps + location_gaps;
+    eprintln!(
+        "Campaign #16 / Category 11 pins: {conservative_gaps} sound_conservative_abstraction \
+         gaps, {location_gaps} ub_location_mismatch gaps, {} agreements",
+        report.agree_count
+    );
+    assert_eq!(report.diverge_count, gaps, "{:?}", report.item_reports);
+    assert_eq!(
+        report.agree_count,
+        total_expected - gaps,
+        "{:?}",
+        report.item_reports
+    );
+    assert_eq!(report.kernel_confirmed_divergences, gaps);
+    for (slug, expected) in [
+        ("unsound_missed_fault", 0usize),
+        ("sound_conservative_abstraction", conservative_gaps),
+        ("value_mismatch", location_gaps),
+        ("harness_or_extraction_error", 0),
+    ] {
+        assert_eq!(
+            report.witness_polarity_counts.get(slug),
+            Some(&expected),
+            "witness_polarity_counts[{slug}]: {:?}",
+            report.witness_polarity_counts
+        );
+    }
+    assert_eq!(report.findings.len(), gaps);
+    for f in &report.findings {
+        assert!(
+            f.kernel_confirmed,
+            "finding `{}` must be kernel-confirmed",
+            f.fn_name
+        );
+        assert_eq!(
+            WitnessPolarity::from_str_slug(&f.witness_polarity),
+            classify_outcome_tags_polarity(
+                &f.miri_outcome_tag,
+                &f.anneal_outcome_tag,
+                Some(&f.divergence_class),
+            ),
+            "finding `{}` polarity disagrees with its tags",
+            f.fn_name
+        );
+        let repro = f
+            .repro_path
+            .as_ref()
+            .expect("each finding bundle must record repro_path");
+        assert!(repro.is_file(), "missing repro.rs at {}", repro.display());
+        assert!(
+            repro.with_file_name("finding.json").is_file()
+                && repro.with_file_name("SUMMARY.md").is_file(),
+            "incomplete finding bundle for `{}`",
+            f.fn_name
+        );
+        // Callee-reachability isolation in chunked `MiriOracleConfirm.lean`:
+        // unreached Category 9 helpers/Drop impls are never linked in any chunk,
+        // and each callee-wrapper finding links its called Category 11 model
+        // probe in its confirm chunk.
+        for unrelated in [
+            "helper_reborrow_",
+            "helper_shared_",
+            "helper_frozen_",
+            "helper_unwind_",
+            "UnwindCleanupGuard",
+        ] {
+            assert!(
+                !f.kernel_confirm_theorems.contains(unrelated),
+                "confirm module for `{}` linked unrelated Category 9 helper `{unrelated}`:\n{}",
+                f.fn_name,
+                f.kernel_confirm_theorems
+            );
+        }
+        let own_probe = match f.fn_name.as_str() {
+            "c16_call_array_halves" => {
+                Some("pass_copy_nonoverlapping_same_tag_disjoint_array_halves")
+            }
+            "c16_call_u8_array_halves" => {
+                Some("pass_copy_nonoverlapping_same_tag_disjoint_u8_array_halves")
+            }
+            "c16_call_struct_fields" => {
+                Some("pass_copy_nonoverlapping_same_tag_disjoint_struct_fields")
+            }
+            "c16_call_static_freeze_read" => {
+                Some("pass_static_const_raw_ptr_read_and_freeze_retag")
+            }
+            "c16_call_static_cell_then_frozen_write" => {
+                Some("ub_static_unsafe_cell_raw_const_cast_mut_write")
+            }
+            _ => None,
+        };
+        if let Some(probe) = own_probe {
+            assert!(
+                f.kernel_confirm_theorems.contains(probe),
+                "confirm chunk for `{}` failed to link its called model probe `{probe}`:\n{}",
+                f.fn_name,
+                f.kernel_confirm_theorems
+            );
+        }
+    }
+
+    // Round-trip `reproduce_miri_finding` (`--reproduce`) on both:
+    // 1. a generated finding bundle whose UB span lies inside a preamble model
+    //    probe (`c16_call_u8_array_halves`, when still open), and
+    // 2. a standalone minimal reproducer reusing a Category 11 probe name
+    //    (`pass_copy_nonoverlapping_same_tag_disjoint_array_halves`) WITHOUT any
+    //    `__ANNEAL_MODEL_*` marker.
+    if let Some(u8_finding) = report
+        .findings
+        .iter()
+        .find(|f| f.fn_name == "c16_call_u8_array_halves")
+    {
+        let repro_path = u8_finding.repro_path.as_deref().unwrap();
+        let repro_src = fs::read_to_string(repro_path).expect("read finding repro.rs");
+        let expected_repro_ub_line = c16_line_after(
+            &repro_src,
+            &probe_header("pass_copy_nonoverlapping_same_tag_disjoint_u8_array_halves"),
+            "copy_nonoverlapping(p as *const u8, dst, 4usize);",
+        );
+        let repro_rep = reproduce_miri_finding(repro_path, Some(&root))
+            .expect("reproduce_miri_finding on preamble-callee finding bundle");
+        assert_eq!(repro_rep.name, "c16_call_u8_array_halves");
+        assert_eq!(
+            repro_rep.miri,
+            MiriOutcome::PassScalar {
+                bits: 285_803_779,
+                size_bytes: 4
+            }
+        );
+        assert!(
+            matches!(
+                repro_rep.verdict,
+                ComparisonVerdict::Diverge(DivergenceKind::FalsePositiveUb { .. })
+            ),
+            "unexpected verdict on finding repro: {repro_rep:?}"
+        );
+        assert!(
+            matches!(
+                &repro_rep.anneal,
+                AnnealOutcome::Ub { span: Some(s) } if s.start_line == expected_repro_ub_line
+            ),
+            "expected Anneal UB at repro.rs line {expected_repro_ub_line}, got {:?}",
+            repro_rep.anneal
+        );
+        assert_eq!(
+            repro_rep.anneal.summary_tag(),
+            u8_finding.anneal_outcome_tag
+        );
+        assert!(repro_rep.kernel_confirmed);
+    }
+
+    let minimal_repro_path = dir.join("minimal_same_tag_probe.rs");
+    let minimal_repro_src = format!(
+        "{MIRI_CORPUS_CRATE_HEADER}\n\
+         use core::intrinsics::{{copy_nonoverlapping, offset}};\n\n{}",
+        c16_corpus_fn_renamed(
+            "pass_copy_nonoverlapping_same_tag_disjoint_array_halves",
+            "pass_copy_nonoverlapping_same_tag_disjoint_array_halves",
+        )
+    );
+    fs::write(&minimal_repro_path, &minimal_repro_src).expect("write minimal repro");
+    let minimal_rep = reproduce_miri_finding(&minimal_repro_path, Some(&root))
+        .expect("reproduce_miri_finding must accept unmarked standalone Category 11 probe name");
+    assert_eq!(
+        minimal_rep.name,
+        "pass_copy_nonoverlapping_same_tag_disjoint_array_halves"
+    );
+    assert_eq!(
+        minimal_rep.miri,
+        MiriOutcome::PassScalar {
+            bits: 30,
+            size_bytes: 4
+        }
+    );
+    match &minimal_rep.anneal {
+        AnnealOutcome::Ub { .. } => {
+            assert!(
+                matches!(
+                    minimal_rep.verdict,
+                    ComparisonVerdict::Diverge(DivergenceKind::FalsePositiveUb { .. })
+                ) && minimal_rep.kernel_confirmed,
+                "unexpected minimal repro verdict: {minimal_rep:?}"
+            );
+        }
+        AnnealOutcome::PassScalar {
+            bits: 30,
+            size_bytes: 4,
+        } => {
+            assert_eq!(minimal_rep.verdict, ComparisonVerdict::Agree);
+        }
+        other => panic!("unexpected minimal repro Anneal outcome: {other:?}"),
+    }
+
+    // Multi-candidate batch combining:
+    // (a) 2 mutated candidates from a multi-item seed carrying a local `struct`,
+    //     an UNMARKED non-integer-returning helper `fn`, and a trailing
+    //     `__ANNEAL_MODEL_*` helper (deduped at crate root without mutating
+    //     the unmarked helper),
+    // (b) a conflicting agreeing candidate redefining `C16LocalPair` +
+    //     `c16_unmarked_step` with incompatible fields/body (isolated into
+    //     `stage_ns_0`), and
+    // (c) a conflicting divergent candidate redefining `C16LocalPair` +
+    //     `c16_unmarked_step` whose UB fault occurs inside `stage_ns_1`'s local
+    //     helper (verifying `stage_ns_1` MIR extraction, kernel confirmation
+    //     helper linking, zero-drift `repro.rs` span translation, and standalone
+    //     `reproduce_miri_finding`).
+    let multi_item_seed = "\
+#[derive(Copy, Clone)]
+pub struct C16LocalPair {
+    pub a: u32,
+    pub b: u32,
+}
+fn c16_unmarked_step(pair: C16LocalPair) -> C16LocalPair {
+    C16LocalPair {
+        a: wrapping_add(pair.a, 1u32),
+        b: wrapping_add(pair.b, 2u32),
+    }
+}
+pub fn pass_c16_multi_item_seed() -> u32 {
+    let stepped = c16_unmarked_step(C16LocalPair { a: 18u32, b: 21u32 });
+    c16_local_model_sum(stepped)
+}
+pub const __ANNEAL_MODEL_c16_local_model_sum: &str = \"c16_local_model_sum\";
+pub fn c16_local_model_sum(pair: C16LocalPair) -> u32 {
+    wrapping_add(pair.a, pair.b)
+}
+";
+    let mut multi_batch = generate_miri_batch(&[multi_item_seed], 2, 0xC16_B201);
+    let conflict_agree_src = "\
+pub struct C16LocalPair {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+}
+fn c16_unmarked_step(triple: C16LocalPair) -> u32 {
+    wrapping_add(wrapping_add(triple.x, triple.y), triple.z)
+}
+pub fn pass_c16_conflicting_aux_agree() -> u32 {
+    c16_unmarked_step(C16LocalPair { x: 10u32, y: 20u32, z: 12u32 })
+}
+";
+    let conflict_div_src = "\
+pub struct C16LocalPair {
+    pub buf: [u32; 4],
+}
+fn c16_unmarked_step(mut box_arr: C16LocalPair) -> u32 {
+    unsafe {
+        let base: *mut u32 = &raw mut box_arr.buf as *mut u32;
+        let src: *const u32 = base as *const u32;
+        let dst: *mut u32 = offset(base as *const u32, 2isize) as *mut u32;
+        copy_nonoverlapping(src, dst, 2usize);
+    }
+    wrapping_add(box_arr.buf[2], box_arr.buf[3])
+}
+pub fn pass_c16_conflicting_aux_div() -> u32 {
+    c16_unmarked_step(C16LocalPair { buf: [7u32, 8u32, 0u32, 0u32] })
+}
+";
+    multi_batch.push(handwritten_candidate(
+        2,
+        "pass_c16_conflicting_aux_agree",
+        "pass_c16_conflicting_aux_agree",
+        "identity",
+        conflict_agree_src,
+    ));
+    let mut conflict_div_cand = handwritten_candidate(
+        3,
+        "pass_c16_conflicting_aux_div",
+        "pass_c16_conflicting_aux_div",
+        "identity",
+        conflict_div_src,
+    );
+    conflict_div_cand.applied_mutators.clear();
+    multi_batch.push(conflict_div_cand);
+
+    // (d) two candidates implementing conflicting inherent methods on preamble
+    //     `PairU32`, where candidate 4 also defines a private helper matching
+    //     candidate 5's entry name (`pass_c16_preamble_impl_b`), and candidate 5
+    //     defines both `pub struct pass_c16_preamble_impl_b` (`ty:` vs `val:`)
+    //     and a scoped `__ANNEAL_MODEL_*` helper inside isolated-preamble `stage_ns`.
+    let preamble_impl_a_src = "\
+impl PairU32 {
+    fn c16_pair_score(&self) -> u32 {
+        wrapping_add(self.a, self.b)
+    }
+}
+fn pass_c16_preamble_impl_b() -> u32 {
+    1u32
+}
+pub fn pass_c16_preamble_impl_a() -> u32 {
+    let p = PairU32 { a: 20u32, b: 21u32 };
+    wrapping_add(p.c16_pair_score(), pass_c16_preamble_impl_b())
+}
+";
+    let preamble_impl_b_src = "\
+use core::ptr::addr_of;
+pub(crate) struct pass_c16_preamble_impl_b {
+    pub extra: u32,
+}
+impl PairU32 {
+    fn c16_pair_score(&self) -> u32 {
+        wrapping_add(wrapping_add(self.a, self.b), 10u32)
+    }
+}
+pub const __ANNEAL_MODEL_c16_scoped_ns_model: &str = \"c16_scoped_ns_model\";
+pub fn c16_scoped_ns_model(x: u32) -> u32 {
+    wrapping_add(x, 2u32)
+}
+pub fn pass_c16_preamble_impl_b() -> u32 {
+    let local_s = pass_c16_preamble_impl_b { extra: 5u32 };
+    let p = PairU32 { a: 10u32, b: 15u32 };
+    let extra_val: u32 = unsafe { *addr_of!(local_s.extra) };
+    c16_scoped_ns_model(wrapping_add(p.c16_pair_score(), extra_val))
+}
+";
+    multi_batch.push(handwritten_candidate(
+        4,
+        "pass_c16_preamble_impl_a",
+        "pass_c16_preamble_impl_a",
+        "identity",
+        preamble_impl_a_src,
+    ));
+    multi_batch.push(handwritten_candidate(
+        5,
+        "pass_c16_preamble_impl_b",
+        "pass_c16_preamble_impl_b",
+        "identity",
+        preamble_impl_b_src,
+    ));
+
+    // (e) a divergent candidate calling a specialized `impl Uninit<C16SpecTag>`
+    //     inherent method (`stage_ns_<n>_stage_ns_<n>_Uninit_..._c16_spec_copy`),
+    //     proving live that `confirm_helper_module_suffixes` links specialized
+    //     `impl` methods in `MiriOracleConfirm.lean` (`rfl` kernel confirmation).
+    let specialized_impl_div_src = "\
+use core::mem::size_of;
+#[derive(Copy, Clone)]
+pub struct C16SpecTag;
+impl Uninit<C16SpecTag> {
+    fn c16_spec_copy(&self) -> u32 {
+        let mut buf: [u32; 4] = [9u32, 10u32, 0u32, 0u32];
+        unsafe {
+            let base: *mut u32 = &raw mut buf as *mut u32;
+            let dst: *mut u32 = offset(base as *const u32, 2isize) as *mut u32;
+            copy_nonoverlapping(base as *const u32, dst, 2usize);
+        }
+        wrapping_add(wrapping_add(buf[2], buf[3]), size_of::<C16SpecTag>() as u32)
+    }
+}
+pub fn pass_c16_specialized_impl_div() -> u32 {
+    let u: Uninit<C16SpecTag> = Uninit { value: C16SpecTag };
+    u.c16_spec_copy()
+}
+";
+    let mut spec_div_cand = handwritten_candidate(
+        6,
+        "pass_c16_specialized_impl_div",
+        "pass_c16_specialized_impl_div",
+        "identity",
+        specialized_impl_div_src,
+    );
+    spec_div_cand.applied_mutators.clear();
+    multi_batch.push(spec_div_cand);
+
+    let multi_findings_dir = dir.join("multi_item_findings");
+    let multi_report = evaluate_miri_batches_with_options(
+        "c16_multi_item_batch",
+        0xC16_B201,
+        &[multi_batch],
+        7,
+        &MiriEvalOptions {
+            findings_dir: Some(multi_findings_dir),
+            anneal_repo_root: Some(root.clone()),
+            shrink_seeds: Some(vec![multi_item_seed.to_string()]),
+        },
+    )
+    .expect("7-candidate unmarked + conflicting + specialized-impl batch must stage cleanly");
+    assert_eq!(multi_report.compiled_candidates, 7);
+    assert_eq!(multi_report.compile_failed_candidates, 0);
+    assert_eq!(multi_report.compared_candidates, 7);
+    assert_eq!(multi_report.not_compared_count, 0);
+    assert_eq!(
+        multi_report
+            .witness_polarity_counts
+            .get("unsound_missed_fault"),
+        Some(&0)
+    );
+    for (expected_name, expected_bits) in [
+        ("pass_c16_conflicting_aux_agree", 42u128),
+        ("pass_c16_preamble_impl_a", 42u128),
+        ("pass_c16_preamble_impl_b", 42u128),
+    ] {
+        let rep = multi_report
+            .item_reports
+            .iter()
+            .find(|r| r.name == expected_name)
+            .unwrap_or_else(|| panic!("missing report for {expected_name}"));
+        assert_eq!(rep.verdict, ComparisonVerdict::Agree, "{rep:?}");
+        assert_eq!(
+            rep.miri,
+            MiriOutcome::PassScalar {
+                bits: expected_bits,
+                size_bytes: 4
+            }
+        );
+    }
+
+    if let Some(ns_finding) = multi_report
+        .findings
+        .iter()
+        .find(|f| f.fn_name == "pass_c16_conflicting_aux_div")
+    {
+        assert_eq!(ns_finding.divergence_class, "false_positive_ub");
+        assert!(ns_finding.kernel_confirmed);
+        assert!(
+            ns_finding
+                .mir_neighborhood
+                .contains("def body : CapturedMir :="),
+            "stage_ns_1 MIR neighborhood must be extracted:\n{}",
+            ns_finding.mir_neighborhood
+        );
+        assert!(
+            ns_finding
+                .kernel_confirm_theorems
+                .contains("Mir.MiriDiffCorpus.stage_ns_1_c16_unmarked_step.body"),
+            "stage_ns_1 confirm module must link stage_ns_1 local helper:\n{}",
+            ns_finding.kernel_confirm_theorems
+        );
+        assert!(
+            !ns_finding
+                .kernel_confirm_theorems
+                .contains("Mir.MiriDiffCorpus.c16_unmarked_step.body"),
+            "stage_ns_1 confirm module must NOT leak shadowed crate-root helper:\n{}",
+            ns_finding.kernel_confirm_theorems
+        );
+        let ns_repro_path = ns_finding
+            .repro_path
+            .as_ref()
+            .expect("stage_ns_1 finding repro.rs");
+        let ns_repro_rep = reproduce_miri_finding(ns_repro_path, Some(&root))
+            .expect("reproduce stage_ns_1 finding standalone");
+        let ns_repro_anneal_tag = match &ns_repro_rep.anneal {
+            AnnealOutcome::Ub { span: Some(s) } => format!("ub@{}", s.display_short()),
+            other => other.summary_tag(),
+        };
+        assert_eq!(
+            ns_repro_anneal_tag, ns_finding.anneal_outcome_tag,
+            "stage_ns_1 translated UB span must match standalone repro.rs byte-for-byte"
+        );
+    }
+
+    if let Some(spec_finding) = multi_report
+        .findings
+        .iter()
+        .find(|f| f.fn_name == "pass_c16_specialized_impl_div")
+    {
+        assert_eq!(spec_finding.divergence_class, "false_positive_ub");
+        assert!(spec_finding.kernel_confirmed);
+        assert!(
+            spec_finding
+                .kernel_confirm_theorems
+                .contains("c16_spec_copy.body"),
+            "specialized impl Uninit<C16SpecTag>::c16_spec_copy must be linked in confirm:\n{}",
+            spec_finding.kernel_confirm_theorems
+        );
+        let spec_repro_path = spec_finding
+            .repro_path
+            .as_ref()
+            .expect("specialized impl finding repro.rs");
+        let spec_repro_rep = reproduce_miri_finding(spec_repro_path, Some(&root))
+            .expect("reproduce specialized impl finding standalone");
+        let spec_repro_tag = match &spec_repro_rep.anneal {
+            AnnealOutcome::Ub { span: Some(s) } => format!("ub@{}", s.display_short()),
+            other => other.summary_tag(),
+        };
+        assert_eq!(
+            spec_repro_tag, spec_finding.anneal_outcome_tag,
+            "specialized impl isolated-preamble UB span must match standalone repro.rs"
         );
     }
 }

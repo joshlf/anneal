@@ -85,7 +85,7 @@ const MUTATOR_NAMES: &[&str] = &[
 ];
 
 /// The only keys the runner writes to the ledger. It also preserves keys that
-/// are already present and not obsolete, such as labels added by the capsule
+/// are already present and not obsolete, such as labels added by an external
 /// launcher.
 const LEDGER_KEYS: &[&str] = &[
     "last_oracle_comparison",
@@ -211,18 +211,6 @@ fn write_executable(path: &Path, contents: &str) {
         .permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
     fs::set_permissions(path, perms).expect("chmod executable");
-}
-
-/// Writes a `remote-sync` stand-in that appends its arguments to `log` and exits
-/// with `status`.
-fn write_remote_sync_stub(path: &Path, log: &Path, status: i32) {
-    write_executable(
-        path,
-        &format!(
-            "#!/bin/sh\necho \"$@\" >> '{}'\nexit {status}\n",
-            log.display()
-        ),
-    );
 }
 
 /// Parses a JSON object file with Python's `json` module and returns its
@@ -641,10 +629,8 @@ fn assert_junit_xml_structure(
 }
 
 /// Runs the campaign runner in-process so that a test can replace module
-/// globals. `REMOTE_SYNC_BIN` always points at the stub given by the caller, so no
-/// test can reach real remote. `harness_summary=<json>` makes every harness
-/// return that summary instead of running. The remaining arguments are passed
-/// to the runner.
+/// globals. `harness_summary=<json>` makes every harness return that summary
+/// instead of running. The remaining arguments are passed to the runner.
 const RUNNER_DRIVER: &str = r#"
 import importlib.util, json, sys
 spec = importlib.util.spec_from_file_location("runner", sys.argv[1])
@@ -652,8 +638,7 @@ runner = importlib.util.module_from_spec(spec)
 # `dataclass` resolves annotations through `sys.modules[cls.__module__]`.
 sys.modules["runner"] = runner
 spec.loader.exec_module(runner)
-runner.REMOTE_SYNC_BIN = sys.argv[2]
-args = sys.argv[3:]
+args = sys.argv[2:]
 while args and "=" in args[0] and not args[0].startswith("--"):
     key, value = args.pop(0).split("=", 1)
     if key == "harness_summary":
@@ -666,7 +651,6 @@ sys.exit(runner.main())
 "#;
 
 fn run_campaign_driver(
-    remote_sync_stub: &Path,
     env_vars: &[(&str, &Path)],
     overrides: &[String],
     runner_args: &[&str],
@@ -677,7 +661,6 @@ fn run_campaign_driver(
     cmd.arg("-c")
         .arg(RUNNER_DRIVER)
         .arg(root.join("scripts/run_diff_test_campaign.py"))
-        .arg(remote_sync_stub)
         .args(overrides)
         .args(runner_args)
         .arg("--state-dir")
@@ -1270,13 +1253,10 @@ fn campaign_runner_reports_not_evaluated_and_fails() {
     let state_dir = dir.join("state-dir");
     let junit = dir.join("diff_test_report.xml");
     let junit_arg = junit.to_string_lossy().into_owned();
-    let remote_sync_log = dir.join("remote-sync.log");
-    let remote_sync = dir.join("remote_sync_must_not_run.sh");
-    write_remote_sync_stub(&remote_sync, &remote_sync_log, 1);
 
     fs::create_dir_all(state_dir.join("state")).expect("create state dir");
     // A ledger written by an earlier runner version, with distinct starting
-    // counts, obsolete evaluation keys, and a capsule-launcher label.
+    // counts, obsolete evaluation keys, and a custom launcher label.
     fs::write(
         state_dir.join("state/campaign_ledger.json"),
         r#"{"next_miri_seed": "0x11", "next_itree_seed": "0x22", "total_campaigns_run": 4,
@@ -1287,15 +1267,12 @@ fn campaign_runner_reports_not_evaluated_and_fails() {
     .expect("write ledger");
 
     let out = run_campaign_driver(
-        &remote_sync,
         &[],
         &[],
         &[
             "--profile",
             "smoke",
             "--compile-only",
-            "--remote-uri",
-            "",
             "--junit-xml",
             &junit_arg,
         ],
@@ -1308,10 +1285,6 @@ fn campaign_runner_reports_not_evaluated_and_fails() {
         "a campaign without oracle comparison must exit with status 3:\n\
          stdout:\n{stdout}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        !remote_sync_log.exists(),
-        "the runner invoked remote-sync without an remote URI"
     );
 
     let report = assert_state_dir_reports_and_files(&state_dir, "smoke");
@@ -1408,15 +1381,12 @@ fi
         std::env::var("PATH").unwrap_or_default()
     ));
     let out2 = run_campaign_driver(
-        &remote_sync,
         &[("PATH", &path_env)],
         &[],
         &[
             "--profile",
             "smoke",
             "--compile-only",
-            "--remote-uri",
-            "",
             "--junit-xml",
             &junit_arg,
         ],
@@ -1463,79 +1433,10 @@ fi
 }
 
 #[test]
-fn campaign_runner_syncs_remote_only_when_asked() {
-    let dir = unique_temp_dir("remote_sync");
-    let log = dir.join("remote-sync.log");
-    let stub = dir.join("remote_sync_stub.sh");
-    write_remote_sync_stub(&stub, &log, 0);
-
-    // Without `--remote-uri`, a run must not touch remote at all.
-    let out = run_campaign_driver(
-        &stub,
-        &[],
-        &[],
-        &["--profile", "smoke", "--compile-only"],
-        &dir.join("default"),
-    );
-    assert_eq!(
-        out.status.code(),
-        Some(3),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        !log.exists(),
-        "a run without --remote-uri invoked remote-sync:\n{}",
-        fs::read_to_string(&log).unwrap_or_default()
-    );
-
-    // Positive control: with `--remote-uri`, the stub must be invoked for the
-    // files this run wrote, but not for a stale report left in the state
-    // directory by an earlier run.
-    let explicit = dir.join("explicit");
-    fs::create_dir_all(explicit.join("reports")).expect("create reports dir");
-    fs::write(
-        explicit.join("reports/2026-01-01_quick_campaign_report.md"),
-        "stale\n",
-    )
-    .expect("write stale report");
-    let base = "/remote/teams/example/differential-testing";
-    let out = run_campaign_driver(
-        &stub,
-        &[],
-        &[],
-        &["--profile", "smoke", "--compile-only", "--remote-uri", base],
-        &explicit,
-    );
-    assert_eq!(
-        out.status.code(),
-        Some(3),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let calls = fs::read_to_string(&log).expect("remote-sync stub must have been invoked");
-    assert!(
-        calls.contains(&format!("{base}/state/campaign_ledger.json")),
-        "{calls}"
-    );
-    assert!(
-        calls.contains(&format!("{base}/reports/LATEST_REPORT.md")),
-        "{calls}"
-    );
-    assert!(
-        !calls.contains("2026-01-01_quick_campaign_report.md"),
-        "a stale report was uploaded:\n{calls}"
-    );
-}
-
-#[test]
 fn campaign_runner_rejects_oracle_claims_it_cannot_present() {
     let dir = unique_temp_dir("oracle_claim");
     let junit = dir.join("diff_test_report.xml");
     let junit_arg = junit.to_string_lossy().into_owned();
-    let remote_sync_log = dir.join("remote-sync.log");
-    let remote_sync = dir.join("remote_sync_must_not_run.sh");
-    write_remote_sync_stub(&remote_sync, &remote_sync_log, 1);
     let ledger =
         r#"{"next_miri_seed": "0x11", "next_itree_seed": "0x22", "total_campaigns_run": 4}"#;
 
@@ -1585,14 +1486,11 @@ fn campaign_runner_rejects_oracle_claims_it_cannot_present() {
         fs::create_dir_all(state_dir.join("state")).expect("create state dir");
         fs::write(state_dir.join("state/campaign_ledger.json"), ledger).expect("write ledger");
         let out = run_campaign_driver(
-            &remote_sync,
             &[],
             &[format!("harness_summary={summary}")],
             &[
                 "--profile",
                 "smoke",
-                "--remote-uri",
-                "",
                 "--junit-xml",
                 &junit_arg,
             ],
@@ -1625,14 +1523,11 @@ fn campaign_runner_rejects_oracle_claims_it_cannot_present() {
         fs::create_dir_all(state_dir.join("state")).expect("create state dir");
         fs::write(state_dir.join("state/campaign_ledger.json"), ledger).expect("write ledger");
         let out = run_campaign_driver(
-            &remote_sync,
             &[("PATH", &path_env)],
             &[],
             &[
                 "--profile",
                 "smoke",
-                "--remote-uri",
-                "",
                 "--junit-xml",
                 &junit_arg,
             ],
@@ -1646,9 +1541,2511 @@ fn campaign_runner_rejects_oracle_claims_it_cannot_present() {
         );
         assert_failed_run(&state_dir, "n/a", "n/a");
     }
+}
 
+fn compile_and_run_spec_harness(label: &str, source: &str) -> Vec<String> {
+    let dir = unique_temp_dir(label);
+    let src_path = dir.join("spec_harness.rs");
+    let bin_path = dir.join("spec_harness_bin");
+    fs::write(&src_path, source).expect("write spec harness source");
+
+    let compile_out = Command::new(resolve_rustc_bin())
+        .args([
+            "--edition=2024",
+            "-C",
+            "debug-assertions=on",
+            "-D",
+            "warnings",
+            "-o",
+        ])
+        .arg(&bin_path)
+        .arg(&src_path)
+        .output()
+        .expect("spawn rustc for executable spec harness");
     assert!(
-        !remote_sync_log.exists(),
-        "the runner invoked remote-sync without an remote URI"
+        compile_out.status.success(),
+        "rustc -D warnings failed for `{label}`:\n{}\nsource:\n{source}",
+        String::from_utf8_lossy(&compile_out.stderr)
+    );
+
+    let run_out = Command::new(&bin_path)
+        .output()
+        .expect("execute compiled spec harness");
+    assert!(
+        run_out.status.success(),
+        "compiled spec harness `{label}` exited non-zero:\n{}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    String::from_utf8_lossy(&run_out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+#[test]
+fn external_spec_postcondition_oracle_probe_compiles_strict_and_matches_native_execution() {
+    use anneal_difftest::{
+        SpecContractOracleProbe, SpecExternalCallee, SpecParamBinding, SpecPostconditionVerdict,
+    };
+
+    let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+    let counter_pair_layout = LayoutSpec::Struct {
+        name: "CounterPair".to_string(),
+        total_size: 12,
+        fields: vec![
+            FieldLayout {
+                name: "tag".to_string(),
+                offset: 0,
+                layout: LayoutSpec::Scalar(ScalarLayout::u8()),
+            },
+            FieldLayout {
+                name: "active".to_string(),
+                offset: 4,
+                layout: u32_layout.clone(),
+            },
+            FieldLayout {
+                name: "untouched".to_string(),
+                offset: 8,
+                layout: u32_layout.clone(),
+            },
+        ],
+    };
+
+    let probe = SpecContractOracleProbe::new(
+        "advance_counter_with_bonus",
+        vec![
+            SpecParamBinding::mut_ref("pair", "CounterPair", counter_pair_layout)
+                .with_frame_preserved_fields(["tag", "untouched"]),
+            SpecParamBinding::by_value("step", "u32", u32_layout.clone()),
+        ],
+        "u32",
+        u32_layout.clone(),
+        "let raw_bonus: u32 = ext_bonus(step);\n\
+         let capped_bonus: u32 = raw_bonus & 7u32;\n\
+         pair.active = pair.active + step + capped_bonus;\n\
+         pair.active",
+    )
+    .with_type_defs(
+        "#[repr(C)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub struct CounterPair { pub tag: u8, pub active: u32, pub untouched: u32 }",
+    )
+    .with_external_callee(SpecExternalCallee::new(
+        "ext_bonus",
+        ["u32"],
+        "u32",
+        u32_layout.clone(),
+    ))
+    .with_requires(
+        "bounded_inputs",
+        "step <= 16u32 && pair.active <= u32::MAX - 23u32",
+    )
+    .with_ensures("monotonic", "pair.active >= old(pair.active) + step")
+    .with_ensures(
+        "bounded_growth",
+        "result <= old(pair.active) + step + 7u32 && result == pair.active",
+    );
+
+    // 1. Standalone library module compiles cleanly under `rustc -D warnings` with zero `unsafe`.
+    let lib_src = probe
+        .synthesize_rust_probe()
+        .expect("synthesize standalone probe");
+    assert!(
+        !contains_unsafe_token(&lib_src),
+        "synthesized spec probe must not emit `unsafe`"
+    );
+    compile_module_with_rustc("ep2_sound_spec_lib", &["-D", "warnings"], &lib_src)
+        .expect("standalone spec probe compiles with -D warnings");
+
+    // 2. Non-vacuous certification across 48 dictionary-biased trials (0 panics).
+    let mut dict = MirInputDictionary::new();
+    dict.add_switch_int_literal(0, 32);
+    dict.add_switch_int_literal(8, 32);
+    dict.add_switch_int_literal(16, 32);
+    dict.add_switch_int_literal(u32::MAX as u128, 32);
+    let builder = LayoutAwareByteBuilder::new(&dict)
+        .with_dictionary_bias_pct(65)
+        .with_padding_pattern(PaddingFillPattern::AlternatingA55A);
+    let combined_layout = probe.combined_input_layout();
+    let sched_gen_clean = EnvScheduleGenerator::new(&dict)
+        .with_horizon_steps(2)
+        .with_panic_injection_pct(0)
+        .with_callee_return_layout("ext_bonus", u32_layout.clone());
+
+    let mut clean_trials: Vec<(Vec<u8>, Option<EnvSchedule>)> = Vec::with_capacity(48);
+    // Seed explicit valid + boundary-filtered trials first so both outcomes are guaranteed,
+    // followed by deterministic `Unstructured` fuzz trials with non-zero padding bytes.
+    let mut valid_seed = vec![0x55u8; 16];
+    valid_seed[0] = 3u8;
+    valid_seed[4..8].copy_from_slice(&100u32.to_le_bytes());
+    valid_seed[8..12].copy_from_slice(&999u32.to_le_bytes());
+    valid_seed[12..16].copy_from_slice(&12u32.to_le_bytes());
+    let mut u0 = Unstructured::new(&[0x21; 64]);
+    clean_trials.push((
+        valid_seed.clone(),
+        Some(sched_gen_clean.generate_schedule(&["ext_bonus"], &mut u0)),
+    ));
+
+    let mut filtered_seed = valid_seed.clone();
+    filtered_seed[12..16].copy_from_slice(&50u32.to_le_bytes());
+    let mut u1 = Unstructured::new(&[0x22; 64]);
+    clean_trials.push((
+        filtered_seed,
+        Some(sched_gen_clean.generate_schedule(&["ext_bonus"], &mut u1)),
+    ));
+
+    for seed in 0..46u8 {
+        let entropy: Vec<u8> = (0..96u8)
+            .map(|i| seed.wrapping_mul(37).wrapping_add(i.wrapping_mul(13)))
+            .collect();
+        let mut u = Unstructured::new(&entropy);
+        let arg_bytes = builder.build_bytes(&combined_layout, &mut u);
+        let sched = sched_gen_clean.generate_schedule(&["ext_bonus"], &mut u);
+        clean_trials.push((arg_bytes, Some(sched)));
+    }
+
+    let clean_report = probe
+        .verify_spec_postcondition_batch(&clean_trials)
+        .expect("verify clean batch");
+    assert!(
+        clean_report.is_sound_and_non_vacuous(),
+        "sound spec must pass non-vacuous certification: {clean_report:?}"
+    );
+    assert!(clean_report.vacuously_filtered_count >= 1);
+    assert!(clean_report.verified_hold_count >= 1);
+
+    // Append 4 scheduled-panic trials to verify exact 1-for-1 `HOLD`/`FILTERED`/`TRAP` parity
+    // between `verify_spec_postcondition_against_schedule` and native `rustc -D warnings`.
+    let mut parity_trials = clean_trials;
+    let panic_gen = EnvScheduleGenerator::new(&dict)
+        .with_horizon_steps(1)
+        .with_callee_return_layout("ext_bonus", u32_layout);
+    for seed in 0..4u8 {
+        let buf = [seed.wrapping_add(0x70); 64];
+        let mut u = Unstructured::new(&buf);
+        let mut arg = valid_seed.clone();
+        arg[12..16].copy_from_slice(&(seed as u32).to_le_bytes());
+        let mut p_sched = EnvSchedule::new();
+        panic_gen.apply_strategy(
+            &mut p_sched,
+            "ext_bonus",
+            &EnvStrategy::PanicOnCall(0),
+            &mut u,
+        );
+        parity_trials.push((arg, Some(p_sched)));
+    }
+
+    let parity_report = probe
+        .verify_spec_postcondition_batch(&parity_trials)
+        .expect("verify parity batch");
+    let exe_src = probe
+        .synthesize_rust_executable_harness_with_schedules(&parity_trials)
+        .expect("synthesize executable harness");
+    let native_lines = compile_and_run_spec_harness("ep2_sound_parity", &exe_src);
+    assert_eq!(native_lines.len(), parity_report.verdicts.len());
+    for (idx, (verdict, line)) in parity_report
+        .verdicts
+        .iter()
+        .zip(native_lines.iter())
+        .enumerate()
+    {
+        let expected_line = match verdict {
+            SpecPostconditionVerdict::VerifiedHold => format!("TRIAL:{idx}:HOLD"),
+            SpecPostconditionVerdict::VacuouslyFiltered { .. } => format!("TRIAL:{idx}:FILTERED"),
+            SpecPostconditionVerdict::PanicOrTrap { .. } => format!("TRIAL:{idx}:TRAP"),
+            other => panic!("unexpected verdict at trial {idx}: {other:?}"),
+        };
+        assert_eq!(line, &expected_line, "trial {idx} native vs oracle mismatch");
+    }
+}
+
+#[test]
+fn external_spec_oracle_kills_all_three_verus_unsound_spec_mutants() {
+    use anneal_difftest::{
+        SpecContractOracleProbe, SpecExecPhase, SpecParamBinding, SpecPostconditionVerdict,
+        SpecViolationKind,
+    };
+
+    let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+    let mut dict = MirInputDictionary::new();
+    dict.add_switch_int_literal(0, 32);
+    dict.add_switch_int_literal(1, 32);
+    dict.add_shift_const(32, 32);
+    dict.add_switch_int_literal(64, 32);
+    let builder = LayoutAwareByteBuilder::new(&dict)
+        .with_dictionary_bias_pct(85)
+        .with_padding_pattern(PaddingFillPattern::Fixed(0xFF));
+
+    let mut mutants_killed = 0usize;
+    let mut sound_controls_passed = 0usize;
+
+    // -------------------------------------------------------------------------
+    // Mutant 1 (Verus #2674-style off-by-one postcondition):
+    // `last_index(len)` returns `len - 1` for `len >= 1`, but the unsound spec
+    // asserts `ensures(result == len)` instead of `ensures(result == len - 1u32)`.
+    // -------------------------------------------------------------------------
+    let mutant1 = SpecContractOracleProbe::new(
+        "last_index_off_by_one_mutant",
+        vec![SpecParamBinding::by_value("len", "u32", u32_layout.clone())],
+        "u32",
+        u32_layout.clone(),
+        "len - 1u32",
+    )
+    .with_requires("non_empty", "len >= 1u32")
+    .with_ensures("wrong_upper_bound", "result == len");
+
+    let control1 = SpecContractOracleProbe::new(
+        "last_index_sound_control",
+        vec![SpecParamBinding::by_value("len", "u32", u32_layout.clone())],
+        "u32",
+        u32_layout.clone(),
+        "len - 1u32",
+    )
+    .with_requires("non_empty", "len >= 1u32")
+    .with_ensures("exact_last_index", "result == len - 1u32");
+
+    let mut trials1: Vec<(Vec<u8>, Option<EnvSchedule>)> = vec![
+        (0u32.to_le_bytes().to_vec(), None),
+        (1u32.to_le_bytes().to_vec(), None),
+        (8u32.to_le_bytes().to_vec(), None),
+    ];
+    for s in 0..16u8 {
+        let buf = [s.wrapping_mul(29).wrapping_add(3); 32];
+        let mut u = Unstructured::new(&buf);
+        trials1.push((builder.build_bytes(&mutant1.combined_input_layout(), &mut u), None));
+    }
+    let rep_m1 = mutant1
+        .verify_spec_postcondition_batch(&trials1)
+        .expect("eval mutant 1");
+    assert!(rep_m1.is_mutant_killed());
+    assert!(rep_m1.verdicts.iter().any(|v| matches!(
+        v,
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::EnsuresClause { label, .. },
+            ..
+        } if label == "wrong_upper_bound"
+    )));
+    let raw_trials1: Vec<Vec<u8>> = trials1.iter().map(|(b, _)| b.clone()).collect();
+    let lines_m1 = compile_and_run_spec_harness(
+        "ep2_mutant1_verus2674",
+        &mutant1
+            .synthesize_rust_executable_harness(&raw_trials1)
+            .expect("synth mutant 1"),
+    );
+    assert!(
+        lines_m1
+            .iter()
+            .any(|l| l.ends_with(":VIOLATION:wrong_upper_bound")),
+        "native compiled probe must kill Mutant 1: {lines_m1:?}"
+    );
+    mutants_killed += 1;
+    assert!(
+        control1
+            .verify_spec_postcondition_batch(&trials1)
+            .expect("eval control 1")
+            .is_sound_and_non_vacuous()
+    );
+    sound_controls_passed += 1;
+
+    // -------------------------------------------------------------------------
+    // Mutant 2 (Verus #2603-style omitted shift-width / overflow precondition):
+    // `shl_u32(val, shift)` omits `requires(shift < 32u32)` and shifts by an
+    // unbounded `shift: u32`, trapping on `shift >= 32` (`unchecked_shl` / debug `<<`).
+    // -------------------------------------------------------------------------
+    let mutant2 = SpecContractOracleProbe::new(
+        "shl_missing_shift_bound_mutant",
+        vec![
+            SpecParamBinding::by_value("val", "u32", u32_layout.clone()),
+            SpecParamBinding::by_value("shift", "u32", u32_layout.clone()),
+        ],
+        "u32",
+        u32_layout.clone(),
+        "val << shift",
+    )
+    .with_requires("val_bounded_only", "val <= 1024u32")
+    .with_ensures("non_zero_when_one", "val != 1u32 || result >= 1u32");
+
+    let control2 = SpecContractOracleProbe::new(
+        "shl_sound_control",
+        vec![
+            SpecParamBinding::by_value("val", "u32", u32_layout.clone()),
+            SpecParamBinding::by_value("shift", "u32", u32_layout.clone()),
+        ],
+        "u32",
+        u32_layout.clone(),
+        "val << shift",
+    )
+    .with_requires("val_and_shift_bounded", "val <= 1024u32 && shift < 20u32")
+    .with_ensures("non_zero_when_one", "val != 1u32 || result >= 1u32");
+
+    let mut trials2: Vec<(Vec<u8>, Option<EnvSchedule>)> = Vec::new();
+    for s in 0..32u8 {
+        let entropy: Vec<u8> = (0..64u8)
+            .map(|i| s.wrapping_mul(41).wrapping_add(i.wrapping_mul(7)))
+            .collect();
+        let mut u = Unstructured::new(&entropy);
+        trials2.push((builder.build_bytes(&mutant2.combined_input_layout(), &mut u), None));
+    }
+    // Ensure a concrete valid witness `(1, 4)` is also included for non-vacuity of `control2`.
+    let mut valid_shl = Vec::with_capacity(8);
+    valid_shl.extend_from_slice(&1u32.to_le_bytes());
+    valid_shl.extend_from_slice(&4u32.to_le_bytes());
+    trials2.push((valid_shl, None));
+
+    let rep_m2 = mutant2
+        .verify_spec_postcondition_batch(&trials2)
+        .expect("eval mutant 2");
+    assert!(rep_m2.is_mutant_killed());
+    assert!(rep_m2.verdicts.iter().any(|v| matches!(
+        v,
+        SpecPostconditionVerdict::PanicOrTrap {
+            phase: SpecExecPhase::Body,
+            ..
+        }
+    )));
+    let raw_trials2: Vec<Vec<u8>> = trials2.iter().map(|(b, _)| b.clone()).collect();
+    let lines_m2 = compile_and_run_spec_harness(
+        "ep2_mutant2_verus2603",
+        &mutant2
+            .synthesize_rust_executable_harness(&raw_trials2)
+            .expect("synth mutant 2"),
+    );
+    assert!(
+        lines_m2.iter().any(|l| l.ends_with(":TRAP")),
+        "native compiled probe must trap on Mutant 2 (`shift >= 32`): {lines_m2:?}"
+    );
+    mutants_killed += 1;
+    assert!(
+        control2
+            .verify_spec_postcondition_batch(&trials2)
+            .expect("eval control 2")
+            .is_sound_and_non_vacuous()
+    );
+    sound_controls_passed += 1;
+
+    // -------------------------------------------------------------------------
+    // Mutant 3 (Verus #2606-style `&mut` frame / `old(...)` mutation violation):
+    // `bump_active` promises `untouched` is framed (`post.untouched == old.untouched`)
+    // and `pair.active == old(pair.active) + delta`, but covertly mutates `pair.untouched`.
+    // -------------------------------------------------------------------------
+    let pair_layout = LayoutSpec::Struct {
+        name: "FramedAccount".to_string(),
+        total_size: 12,
+        fields: vec![
+            FieldLayout {
+                name: "flags".to_string(),
+                offset: 0,
+                layout: LayoutSpec::Scalar(ScalarLayout::u8()),
+            },
+            FieldLayout {
+                name: "active".to_string(),
+                offset: 4,
+                layout: u32_layout.clone(),
+            },
+            FieldLayout {
+                name: "untouched".to_string(),
+                offset: 8,
+                layout: u32_layout.clone(),
+            },
+        ],
+    };
+    let account_typedef = "#[repr(C)]\n\
+                           #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+                           pub struct FramedAccount { pub flags: u8, pub active: u32, pub untouched: u32 }";
+
+    let mutant3 = SpecContractOracleProbe::new(
+        "bump_account_frame_mutant",
+        vec![
+            SpecParamBinding::mut_ref("acct", "FramedAccount", pair_layout.clone())
+                .with_frame_preserved_fields(["flags", "untouched"]),
+            SpecParamBinding::by_value("delta", "u32", u32_layout.clone()),
+        ],
+        "u32",
+        u32_layout.clone(),
+        "acct.active = acct.active + delta;\n\
+         acct.untouched = acct.untouched.wrapping_add(1u32);\n\
+         acct.active",
+    )
+    .with_type_defs(account_typedef)
+    .with_requires(
+        "safe_bump",
+        "acct.active <= 100_000u32 && delta >= 1u32 && delta <= 1000u32",
+    )
+    .with_ensures("exact_bump", "acct.active == old(acct.active) + delta && result == acct.active");
+
+    let control3 = SpecContractOracleProbe::new(
+        "bump_account_sound_control",
+        vec![
+            SpecParamBinding::mut_ref("acct", "FramedAccount", pair_layout)
+                .with_frame_preserved_fields(["flags", "untouched"]),
+            SpecParamBinding::by_value("delta", "u32", u32_layout),
+        ],
+        "u32",
+        LayoutSpec::Scalar(ScalarLayout::u32()),
+        "acct.active = acct.active + delta;\n\
+         acct.active",
+    )
+    .with_type_defs(account_typedef)
+    .with_requires(
+        "safe_bump",
+        "acct.active <= 100_000u32 && delta >= 1u32 && delta <= 1000u32",
+    )
+    .with_ensures("exact_bump", "acct.active == old(acct.active) + delta && result == acct.active");
+
+    let mut valid_acct = vec![0xFFu8; 16];
+    valid_acct[0] = 7u8;
+    valid_acct[4..8].copy_from_slice(&250u32.to_le_bytes());
+    valid_acct[8..12].copy_from_slice(&42u32.to_le_bytes());
+    valid_acct[12..16].copy_from_slice(&15u32.to_le_bytes());
+    let mut trials3: Vec<(Vec<u8>, Option<EnvSchedule>)> = vec![(valid_acct, None)];
+    for s in 0..16u8 {
+        let buf = [s.wrapping_mul(19).wrapping_add(11); 48];
+        let mut u = Unstructured::new(&buf);
+        trials3.push((builder.build_bytes(&mutant3.combined_input_layout(), &mut u), None));
+    }
+
+    let rep_m3 = mutant3
+        .verify_spec_postcondition_batch(&trials3)
+        .expect("eval mutant 3");
+    assert!(rep_m3.is_mutant_killed());
+    assert!(rep_m3.verdicts.iter().any(|v| matches!(
+        v,
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::FrameCondition { param, field },
+            ..
+        } if param == "acct" && field == "untouched"
+    )));
+    let raw_trials3: Vec<Vec<u8>> = trials3.iter().map(|(b, _)| b.clone()).collect();
+    let lines_m3 = compile_and_run_spec_harness(
+        "ep2_mutant3_verus2606",
+        &mutant3
+            .synthesize_rust_executable_harness(&raw_trials3)
+            .expect("synth mutant 3"),
+    );
+    assert!(
+        lines_m3
+            .iter()
+            .any(|l| l.ends_with(":FRAME:acct.untouched")),
+        "native compiled probe must kill Mutant 3 frame violation: {lines_m3:?}"
+    );
+    mutants_killed += 1;
+    assert!(
+        control3
+            .verify_spec_postcondition_batch(&trials3)
+            .expect("eval control 3")
+            .is_sound_and_non_vacuous()
+    );
+    sound_controls_passed += 1;
+
+    assert_eq!(mutants_killed, 3, "all 3/3 Verus-style mutants must be killed");
+    assert_eq!(
+        sound_controls_passed, 3,
+        "all 3/3 sound control contracts must pass without false positives"
+    );
+}
+
+#[test]
+fn write_chain_coverage_bound_separates_depth_one_local_writes_from_scheduled_rmw_walks() {
+    use anneal_difftest::{
+        EnvScheduledWriteStep, UnderExplorationReason, WriteChainCoverageBound, WriteChainStep,
+    };
+
+    let mut dict = MirInputDictionary::new();
+    dict.add_switch_int_literal(1, 32);
+    dict.add_switch_int_literal(7, 32);
+    let builder = LayoutAwareByteBuilder::new(&dict);
+    let triple_u32 = LayoutSpec::Tuple {
+        total_size: 12,
+        elements: vec![
+            (0, LayoutSpec::Scalar(ScalarLayout::u32())),
+            (4, LayoutSpec::Scalar(ScalarLayout::u32())),
+            (8, LayoutSpec::Scalar(ScalarLayout::u32())),
+        ],
+    };
+    let mut u = Unstructured::new(&[0x5A; 128]);
+    let seed_bytes = builder.build_bytes(&triple_u32, &mut u);
+    assert_eq!(seed_bytes.len(), 12);
+
+    // 1. Repeated independent depth-1 writes (`x = c0; y = c1; z = c2; x = c3; y = c4; z = c5`)
+    //    do NOT sum to causal walk length `d = 3`.
+    let mut local_only = WriteChainCoverageBound::new(3, 3);
+    assert_eq!(local_only.min_walk_length(), 3);
+    assert!(local_only.random_walk_step_bound() >= 9);
+    for round in 0..2 {
+        for slot in ["x", "y", "z"] {
+            let _ = (round, &seed_bytes);
+            local_only.observe_step(&WriteChainStep::local_write(slot));
+        }
+    }
+    assert_eq!(local_only.max_observed_depth(), 1);
+    assert!(!local_only.is_depth_certified());
+    assert_eq!(
+        local_only.under_exploration_reason(),
+        Some(UnderExplorationReason::OnlyDepthOneLocalWrites {
+            steps_observed: 6,
+            distinct_slots_written: 3,
+            required_depth: 3,
+        })
+    );
+
+    // 2. Depth-2 chain followed by constant overwrite on `y` resets `y` to depth 1,
+    //    preventing `z := f(y)` from falsely reaching depth 3.
+    let mut overwrite_guard = WriteChainCoverageBound::new(3, 3);
+    overwrite_guard.observe_write_chain(&[
+        WriteChainStep::local_write("x"),
+        WriteChainStep::dependent_write("y", ["x"]),
+        WriteChainStep::local_write("y"),
+        WriteChainStep::dependent_write("z", ["y"]),
+    ]);
+    assert_eq!(overwrite_guard.current_slot_depth("y"), 1);
+    assert_eq!(overwrite_guard.current_slot_depth("z"), 2);
+    assert_eq!(overwrite_guard.max_observed_depth(), 2);
+    assert!(!overwrite_guard.is_depth_certified());
+    assert!(matches!(
+        overwrite_guard.under_exploration_reason(),
+        Some(UnderExplorationReason::InsufficientChainDepth {
+            max_observed_depth: 2,
+            required_depth: 3,
+            steps_observed: 4,
+            ..
+        })
+    ));
+
+    // 3. `EnvSchedule`-driven transitive RMW walk across 3 boundary steps:
+    //    - Gapped/panicking schedule (`PanicAtCall(1)`) fails certification with `BrokenEnvScheduleLink`.
+    //    - Complete non-panicking schedule (`ReturnBytes` of 4-byte `u32`) certifies `min_walk_length = 3`.
+    let planned_walk = vec![
+        EnvScheduledWriteStep::new("ext_rmw_hop", "x", std::iter::empty::<&str>()),
+        EnvScheduledWriteStep::new("ext_rmw_hop", "y", ["x"]),
+        EnvScheduledWriteStep::new("ext_rmw_hop", "z", ["y"]),
+    ];
+
+    let panic_sched_gen = EnvScheduleGenerator::new(&dict)
+        .with_horizon_steps(3)
+        .with_callee_return_layout("ext_rmw_hop", LayoutSpec::Scalar(ScalarLayout::u32()));
+    let mut broken_sched = EnvSchedule::new();
+    panic_sched_gen.apply_strategy(
+        &mut broken_sched,
+        "ext_rmw_hop",
+        &EnvStrategy::Constant(1u32.to_le_bytes().to_vec()),
+        &mut u,
+    );
+    broken_sched.set_callee_panic_on_call("ext_rmw_hop", 1);
+    let mut broken_walk = WriteChainCoverageBound::new(3, 3);
+    broken_walk.observe_env_schedule(&broken_sched, &planned_walk);
+    assert!(!broken_walk.is_depth_certified());
+    assert!(matches!(
+        broken_walk.under_exploration_reason(),
+        Some(UnderExplorationReason::BrokenEnvScheduleLink {
+            required_depth: 3,
+            broken_links: 1,
+            ..
+        })
+    ));
+
+    let valid_sched_gen = EnvScheduleGenerator::new(&dict)
+        .with_horizon_steps(3)
+        .with_panic_injection_pct(0)
+        .with_callee_return_layout("ext_rmw_hop", LayoutSpec::Scalar(ScalarLayout::u32()));
+    let complete_sched = valid_sched_gen.generate_schedule(&["ext_rmw_hop"], &mut u);
+    let mut certified_walk = WriteChainCoverageBound::new(3, 3);
+    let max_d = certified_walk.observe_env_schedule(&complete_sched, &planned_walk);
+    assert_eq!(max_d, 3);
+    assert!(certified_walk.is_depth_certified());
+    assert_eq!(certified_walk.under_exploration_reason(), None);
+}
+
+#[test]
+fn external_spec_oracle_lockstep_parity_on_lazy_old_padding_eq_mut_helpers_and_multi_callee_schedules()
+{
+    use anneal_difftest::{
+        SpecContractOracleProbe, SpecExternalCallee, SpecParamBinding, SpecPostconditionVerdict,
+        SpecViolationKind,
+    };
+
+    let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+    let state_layout = LayoutSpec::Struct {
+        name: "PaddedSlotBank".to_string(),
+        total_size: 20,
+        fields: vec![
+            FieldLayout {
+                name: "tag".to_string(),
+                offset: 0,
+                layout: LayoutSpec::Scalar(ScalarLayout::u8()),
+            },
+            FieldLayout {
+                name: "slots".to_string(),
+                offset: 4,
+                layout: LayoutSpec::Array {
+                    elem: Box::new(u32_layout.clone()),
+                    elem_stride: 4,
+                    len: 3,
+                },
+            },
+            FieldLayout {
+                name: "framed".to_string(),
+                offset: 16,
+                layout: u32_layout.clone(),
+            },
+        ],
+    };
+
+    // Exercises:
+    // 1. Short-circuit guarded `old(100u32 / denom)` (and Phase-3 FrameViolation priority
+    //    when `corrupt_frame == 1` even if `old(100u32 / denom)` would trap in Phase 4!),
+    // 2. Poison padding (`0xA5`) on `PaddedSlotBank` compared via `*bank == PaddedSlotBank { .. }`
+    //    and `..*bank` struct update,
+    // 3. `&mut` helper writeback (`add_capped(&mut bank.slots[idx], step)`), `/=`, `%=`,
+    //    and single-evaluation `bank.slots[ext_pick_slot() as usize] += 2u32`,
+    // 4. Multi-callee `EnvSchedule` (`ext_pick_slot` + `ext_tick`) with `global_panic_on_call`
+    //    AND 18 calls to `ext_tick` (exceeding any fixed 16-call horizon via `callee_defaults`).
+    let probe = SpecContractOracleProbe::new(
+        "stress_lockstep_parity",
+        vec![
+            SpecParamBinding::mut_ref("bank", "PaddedSlotBank", state_layout)
+                .with_frame_preserved_fields(["tag", "framed"]),
+            SpecParamBinding::by_value("denom", "u32", u32_layout.clone()),
+            SpecParamBinding::by_value("corrupt_frame", "u32", u32_layout.clone()),
+        ],
+        "u32",
+        u32_layout.clone(),
+        "let slot_idx: usize = (ext_pick_slot() & 1u32) as usize;\n\
+         add_capped(&mut bank.slots[slot_idx], 4u32);\n\
+         bank.slots[ext_pick_slot() as usize % 3usize] += 2u32;\n\
+         bank.slots[2] /= 2u32;\n\
+         bank.slots[1] %= 8u32;\n\
+         let mut iter: u32 = 0u32;\n\
+         let mut ticks: u32 = 0u32;\n\
+         while iter < 18u32 {\n    \
+             ticks = ticks.wrapping_add(ext_tick() & 3u32);\n    \
+             iter += 1u32;\n\
+         }\n\
+         if corrupt_frame == 1u32 {\n    \
+             bank.framed = bank.framed.wrapping_add(1u32);\n\
+         }\n\
+         *bank = PaddedSlotBank { slots: bank.slots, ..*bank };\n\
+         ticks",
+    )
+    .with_type_defs(
+        "#[repr(C)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub struct PaddedSlotBank { pub tag: u8, pub slots: [u32; 3], pub framed: u32 }\n\
+         pub fn add_capped(dst: &mut u32, delta: u32) {\n    \
+             *dst = dst.saturating_add(delta);\n\
+         }",
+    )
+    .with_external_callee(SpecExternalCallee::new(
+        "ext_pick_slot",
+        std::iter::empty::<&str>(),
+        "u32",
+        u32_layout.clone(),
+    ))
+    .with_external_callee(SpecExternalCallee::new(
+        "ext_tick",
+        std::iter::empty::<&str>(),
+        "u32",
+        u32_layout,
+    ))
+    .with_requires(
+        "slots_bounded",
+        "bank.slots[0] <= 1000u32 && bank.slots[1] <= 1000u32 && bank.slots[2] <= 1000u32",
+    )
+    .with_ensures(
+        "guarded_old_div",
+        "(corrupt_frame == 0u32 && denom == 0u32) || old(100u32 / denom) <= 100u32",
+    )
+    .with_ensures(
+        "padded_struct_reflexive_eq",
+        "*bank == PaddedSlotBank { tag: old(bank.tag), slots: bank.slots, framed: old(bank.framed) } && result <= 54u32",
+    );
+
+    let make_trial_bytes = |denom: u32, corrupt_frame: u32| -> Vec<u8> {
+        let mut raw = vec![0xA5u8; 28];
+        raw[0] = 4u8;
+        raw[4..8].copy_from_slice(&10u32.to_le_bytes());
+        raw[8..12].copy_from_slice(&19u32.to_le_bytes());
+        raw[12..16].copy_from_slice(&24u32.to_le_bytes());
+        raw[16..20].copy_from_slice(&555u32.to_le_bytes());
+        raw[20..24].copy_from_slice(&denom.to_le_bytes());
+        raw[24..28].copy_from_slice(&corrupt_frame.to_le_bytes());
+        raw
+    };
+
+    let mut base_sched = EnvSchedule::new()
+        .with_callee_return_size("ext_pick_slot", 4)
+        .with_callee_return_size("ext_tick", 4);
+    base_sched.push_callee_response("ext_pick_slot", 0u32.to_le_bytes().to_vec());
+    base_sched.push_callee_response("ext_pick_slot", 1u32.to_le_bytes().to_vec());
+    base_sched.set_callee_default("ext_tick", 1u32.to_le_bytes().to_vec());
+
+    // Trial 0: `denom == 0, corrupt_frame == 0` -> short-circuits `old(100 / denom)`,
+    // runs 18 `ext_tick` default calls + poison-padded struct equality -> `HOLD`.
+    let t0 = (make_trial_bytes(0, 0), Some(base_sched.clone()));
+
+    // Trial 1: `denom == 5, corrupt_frame == 0` -> evaluates `old(100 / 5) == 20 <= 100` -> `HOLD`.
+    let t1 = (make_trial_bytes(5, 0), Some(base_sched.clone()));
+
+    // Trial 2: `denom == 0, corrupt_frame == 1` -> Phase-3 `FrameViolation("bank.framed")`
+    // MUST fire BEFORE Phase-4 `old(100 / 0)` trap!
+    let t2 = (make_trial_bytes(0, 1), Some(base_sched.clone()));
+
+    // Trial 3: `denom == 0, corrupt_frame == 2` -> guard `(corrupt_frame == 0 && denom == 0)`
+    // is false, so Phase-4 `old(100 / 0)` executes and traps -> `TRAP`.
+    let t3 = (make_trial_bytes(0, 2), Some(base_sched.clone()));
+
+    // Trial 4: Multi-callee `global_panic_on_call = Some(2)` (call 0 = `ext_pick_slot`,
+    // call 1 = `ext_pick_slot`, call 2 = 1st `ext_tick`!) -> `TRAP` in both!
+    let mut global_panic_sched = base_sched;
+    global_panic_sched.set_panic_on_call(2);
+    let t4 = (make_trial_bytes(5, 0), Some(global_panic_sched));
+
+    let trials = vec![t0, t1, t2, t3, t4];
+    let report = probe
+        .verify_spec_postcondition_batch(&trials)
+        .expect("evaluate adversarial parity batch");
+
+    assert_eq!(report.verdicts[0], SpecPostconditionVerdict::VerifiedHold);
+    assert_eq!(report.verdicts[1], SpecPostconditionVerdict::VerifiedHold);
+    assert!(matches!(
+        &report.verdicts[2],
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::FrameCondition { param, field },
+            ..
+        } if param == "bank" && field == "framed"
+    ));
+    assert!(matches!(
+        &report.verdicts[3],
+        SpecPostconditionVerdict::PanicOrTrap { .. }
+    ));
+    assert!(matches!(
+        &report.verdicts[4],
+        SpecPostconditionVerdict::PanicOrTrap { .. }
+    ));
+
+    let exe_src = probe
+        .synthesize_rust_executable_harness_with_schedules(&trials)
+        .expect("synthesize adversarial parity harness");
+    assert!(!contains_unsafe_token(&exe_src));
+    let native_lines = compile_and_run_spec_harness("ep2_b1_lockstep_parity", &exe_src);
+    assert_eq!(
+        native_lines,
+        vec![
+            "TRIAL:0:HOLD",
+            "TRIAL:1:HOLD",
+            "TRIAL:2:FRAME:bank.framed",
+            "TRIAL:3:TRAP",
+            "TRIAL:4:TRAP",
+        ]
+    );
+}
+
+#[test]
+fn ep2_a1_lockstep_parity_on_diverging_returns_loops_old_ref_rewrites_and_prestepped_schedules() {
+    use anneal_difftest::{
+        SpecContractOracleProbe, SpecExternalCallee, SpecParamBinding, SpecPostconditionVerdict,
+    };
+
+    let u8_layout = LayoutSpec::Scalar(ScalarLayout::u8());
+    let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+    let pair_layout = LayoutSpec::Struct {
+        name: "ShortPair".to_string(),
+        total_size: 8,
+        fields: vec![
+            FieldLayout {
+                name: "x".to_string(),
+                offset: 0,
+                layout: u32_layout.clone(),
+            },
+            FieldLayout {
+                name: "framed".to_string(),
+                offset: 4,
+                layout: u32_layout.clone(),
+            },
+        ],
+    };
+
+    let probe = SpecContractOracleProbe::new(
+        "ep2_a1_control_and_schedule_probe",
+        vec![
+            SpecParamBinding::mut_ref("pair", "ShortPair", pair_layout)
+                .with_frame_preserved_fields(["framed"]),
+            SpecParamBinding::by_value("x", "u8", u8_layout),
+            SpecParamBinding::by_value("framed", "u32", u32_layout.clone()),
+        ],
+        "u32",
+        u32_layout.clone(),
+        "let ext_v: u32 = ext_hop();\n\
+         let () = if x == 0u8 {\n    \
+             early_bump(&mut (*pair).x, ext_v & 7u32);\n    \
+             return pair.x;\n\
+         } else {\n    \
+             ()\n\
+         };\n\
+         let next_x: u8 = x + if x == 255u8 { return pair.x; } else { 1u8 };\n\
+         x = next_x;\n\
+         let mut i: u32 = 0u32;\n\
+         let mut acc: u32 = 0u32;\n\
+         while i < 6u32 {\n    \
+             i += 1u32;\n    \
+             if i == 2u32 { continue; }\n    \
+             if i == 5u32 { break; }\n    \
+             acc += i;\n\
+         }\n\
+         let tag_bonus: u32 = loop {\n    \
+             break match x {\n        \
+                 2u8 | 3u8 => 9u32,\n        \
+                 n if n > 10u8 => n as u32,\n        \
+                 _ => 4u32,\n    \
+             };\n\
+         };\n\
+         pair.x = pair.x + acc + tag_bonus + (ext_v & 3u32) + (framed & 0u32);\n\
+         pair.x",
+    )
+    .with_type_defs(
+        "#[repr(C)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub struct ShortPair { pub x: u32, pub framed: u32 }\n\
+         pub fn read_pair_x(p: &ShortPair) -> u32 { p.x }\n\
+         pub fn early_bump(dst: &mut u32, add: u32) {\n    \
+             *dst += add;\n    \
+             let () = if *dst >= 1u32 { return; } else { () };\n    \
+             *dst += 500u32;\n\
+         }",
+    )
+    .with_external_callee(SpecExternalCallee::new(
+        "ext_hop",
+        std::iter::empty::<&str>(),
+        "u32",
+        u32_layout,
+    ))
+    .with_requires("bounded_x", "pair.x <= 1000u32")
+    .with_ensures(
+        "old_ref_shorthand_and_closure",
+        "old(read_pair_x(pair)) == old(pair.x) \
+         && old(ShortPair { x: 1u32, framed }).framed == framed \
+         && old((|x: u32| x + 1u32)(5u32)) == 6u32",
+    )
+    .with_ensures("monotonic", "result >= old(pair.x)");
+
+    let make_args = |px: u32, pframed: u32, x: u8, framed_arg: u32| -> Vec<u8> {
+        let mut b = Vec::with_capacity(13);
+        b.extend_from_slice(&px.to_le_bytes());
+        b.extend_from_slice(&pframed.to_le_bytes());
+        b.push(x);
+        b.extend_from_slice(&framed_arg.to_le_bytes());
+        b
+    };
+
+    let mut clean_sched = EnvSchedule::new().with_callee_return_size("ext_hop", 4);
+    clean_sched.set_callee_default("ext_hop", 5u32.to_le_bytes().to_vec());
+
+    // Pre-stepped schedule: consume call 0 beforehand so `callee_call_counts["ext_hop"] == 1`,
+    // and arm `set_callee_panic_on_call("ext_hop", 1)` — the VERY FIRST call inside the trial
+    // MUST panic in BOTH `verify_spec_postcondition_against_schedule` AND compiled `rustc`!
+    let mut prestepped_panic_sched = clean_sched.clone();
+    prestepped_panic_sched.set_callee_panic_on_call("ext_hop", 1);
+    let _ = prestepped_panic_sched.next_action("ext_hop", 0);
+
+    // Mismatched `callee_return_sizes` (`2` bytes vs `u32` 4 bytes) must ALSO trap in both!
+    let mut mismatched_size_sched = EnvSchedule::new();
+    mismatched_size_sched.push_callee_response("ext_hop", 5u32.to_le_bytes().to_vec());
+    mismatched_size_sched.register_callee_return_size("ext_hop", 2);
+
+    let trials = vec![
+        (make_args(10, 99, 0, 77), Some(clean_sched.clone())),
+        (make_args(10, 99, 255, 77), Some(clean_sched.clone())),
+        (make_args(10, 99, 1, 77), Some(clean_sched.clone())),
+        (make_args(10, 99, 25, 77), Some(clean_sched)),
+        (make_args(10, 99, 1, 77), Some(prestepped_panic_sched)),
+        (make_args(10, 99, 1, 77), Some(mismatched_size_sched)),
+    ];
+
+    let report = probe
+        .verify_spec_postcondition_batch(&trials)
+        .expect("verify ep2-A1 parity batch");
+    assert_eq!(report.verdicts[0], SpecPostconditionVerdict::VerifiedHold);
+    assert_eq!(report.verdicts[1], SpecPostconditionVerdict::VerifiedHold);
+    assert_eq!(report.verdicts[2], SpecPostconditionVerdict::VerifiedHold);
+    assert_eq!(report.verdicts[3], SpecPostconditionVerdict::VerifiedHold);
+    assert!(matches!(
+        &report.verdicts[4],
+        SpecPostconditionVerdict::PanicOrTrap { .. }
+    ));
+    assert!(matches!(
+        &report.verdicts[5],
+        SpecPostconditionVerdict::PanicOrTrap { .. }
+    ));
+
+    let exe_src = probe
+        .synthesize_rust_executable_harness_with_schedules(&trials)
+        .expect("synthesize ep2-A1 executable harness");
+    assert!(!contains_unsafe_token(&exe_src));
+    let native_lines = compile_and_run_spec_harness("ep2_a1_lockstep_parity", &exe_src);
+    assert_eq!(
+        native_lines,
+        vec![
+            "TRIAL:0:HOLD",
+            "TRIAL:1:HOLD",
+            "TRIAL:2:HOLD",
+            "TRIAL:3:HOLD",
+            "TRIAL:4:TRAP",
+            "TRIAL:5:TRAP",
+        ]
+    );
+}
+
+#[test]
+fn ep2_b2_lockstep_parity_on_old_match_shadowing_neg_patterns_enums_aliases_recursion_and_deep_prestep()
+{
+    use anneal_difftest::{
+        EnumVariantLayout, SpecContractOracleProbe, SpecExternalCallee, SpecParamBinding,
+        SpecPostconditionVerdict, SpecViolationKind,
+    };
+
+    let i32_layout = LayoutSpec::Scalar(ScalarLayout::i32());
+    let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+    let usize_layout = LayoutSpec::Scalar(ScalarLayout::unsigned(8));
+    let maybe_word_layout = LayoutSpec::Enum {
+        name: "MaybeWord".to_string(),
+        total_size: 8,
+        tag_offset: 0,
+        tag_size: 1,
+        variants: vec![
+            EnumVariantLayout {
+                name: "Empty".to_string(),
+                discriminant: 0,
+                payload_offset: 4,
+                payload: None,
+            },
+            EnumVariantLayout {
+                name: "Ready".to_string(),
+                discriminant: 1,
+                payload_offset: 4,
+                payload: Some(Box::new(u32_layout.clone())),
+            },
+        ],
+    };
+    let state_layout = LayoutSpec::Struct {
+        name: "EnumState".to_string(),
+        total_size: 24,
+        fields: vec![
+            FieldLayout {
+                name: "status".to_string(),
+                offset: 0,
+                layout: maybe_word_layout.clone(),
+            },
+            FieldLayout {
+                name: "cursor".to_string(),
+                offset: 8,
+                layout: usize_layout.clone(),
+            },
+            FieldLayout {
+                name: "active".to_string(),
+                offset: 16,
+                layout: u32_layout.clone(),
+            },
+        ],
+    };
+    let pair_usize_layout = LayoutSpec::Tuple {
+        total_size: 16,
+        elements: vec![(0, usize_layout.clone()), (8, usize_layout)],
+    };
+
+    // Exercises all 6 `ep2-B2` adversarial findings end-to-end against `rustc -D warnings`:
+    // 1. `old(match ... { x => ... })` & `old(if let MaybeWord::Ready(x) = ...)` shadowing `x: i32`,
+    // 2. Negative untyped `match` patterns (`-5 | -1`, `-4..=-2`), slice rest patterns, & `if let` chains,
+    // 3. Target self-recursion (`recursive_enum_probe(..., hops - 1)`),
+    // 4. `type Word = u32;`, `usize` struct/tuple/array literal synthesis (`(usize, usize)`),
+    // 5. Pre-stepped `EnvSchedule` > 256 calls (`300` pre-steps with `panic_on_call = 2` already passed
+    //    vs `panic_on_call = 300` firing on call 0 of the trial!),
+    // 6. `#[repr(C, u8)]` `Enum` inactive-payload poison frame safety vs real variant mutation (`FRAME`).
+    let probe = SpecContractOracleProbe::new(
+        "recursive_enum_probe",
+        vec![
+            SpecParamBinding::mut_ref("st", "EnumState", state_layout)
+                .with_frame_preserved_fields(["status", "cursor"]),
+            SpecParamBinding::by_value("x", "i32", i32_layout),
+            SpecParamBinding::by_value("hops", "Word", u32_layout.clone()),
+            SpecParamBinding::by_value("bounds", "(usize, usize)", pair_usize_layout),
+        ],
+        "Word",
+        u32_layout,
+        "if hops > 0u32 {\n    \
+             st.active = st.active + 1u32;\n    \
+             return recursive_enum_probe(st, x, hops - 1u32, bounds);\n\
+         }\n\
+         let ext_ev: MaybeWord = ext_poll(bounds.0);\n\
+         if x == -99i32 {\n    \
+             st.status = MaybeWord::Ready(77u32);\n\
+         } else if let MaybeWord::Empty = st.status {\n    \
+             st.status = MaybeWord::Empty;\n\
+         }\n\
+         let env_bonus: Word = match ext_ev {\n    \
+             MaybeWord::Empty => 1u32,\n    \
+             MaybeWord::Ready(v) => v & 7u32,\n\
+         };\n\
+         let pat_delta: Word = match x {\n    \
+             -5 | -1 => 9u32,\n    \
+             -4..=-2 => 4u32,\n    \
+             0..=8 => (x as Word) + 2u32,\n    \
+             _ => 0u32,\n\
+         };\n\
+         let window: [usize; 3] = [bounds.0, st.cursor, bounds.1];\n\
+         let win_bonus: Word = match window {\n    \
+             [lo, .., hi] if lo <= hi && hi <= 32usize => (hi - lo) as Word,\n    \
+             _ => 0u32,\n\
+         };\n\
+         st.active = st.active + env_bonus + pat_delta + win_bonus;\n\
+         st.active",
+    )
+    .with_type_defs(
+        "pub type Word = u32;\n\
+         #[repr(C, u8)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub enum MaybeWord { Empty = 0, Ready(Word) = 1 }\n\
+         #[repr(C)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub struct EnumState { pub status: MaybeWord, pub cursor: usize, pub active: Word }",
+    )
+    .with_external_callee(SpecExternalCallee::new(
+        "ext_poll",
+        ["usize"],
+        "MaybeWord",
+        maybe_word_layout,
+    ))
+    .with_requires(
+        "bounded",
+        "hops <= 3u32 && st.active <= 500u32 && st.cursor <= 16usize && bounds.0 <= 16usize && bounds.1 <= 16usize",
+    )
+    .with_ensures(
+        "shadowed_old_match_and_if_let",
+        "old(match st.active { x if x > 0u32 => x, _ => 0u32 }) == old(st.active) \
+         && old(if let MaybeWord::Ready(x) = st.status && x > 0u32 { x } else { 0u32 }) <= 1000u32",
+    )
+    .with_ensures("strict_progress", "result > old(st.active)");
+
+    let make_trial = |disc: u8, payload: u32, x: i32, hops: u32| -> Vec<u8> {
+        let mut b = vec![0xEEu8; 48];
+        b[0] = disc;
+        b[4..8].copy_from_slice(&payload.to_le_bytes());
+        b[8..16].copy_from_slice(&4u64.to_le_bytes()); // cursor = 4usize
+        b[16..20].copy_from_slice(&10u32.to_le_bytes()); // active = 10
+        b[24..28].copy_from_slice(&x.to_le_bytes());
+        b[28..32].copy_from_slice(&hops.to_le_bytes());
+        b[32..40].copy_from_slice(&2u64.to_le_bytes()); // bounds.0 = 2usize
+        b[40..48].copy_from_slice(&7u64.to_le_bytes()); // bounds.1 = 7usize
+        b
+    };
+
+    let mut ready_bytes = vec![0xCCu8; 8];
+    ready_bytes[0] = 1u8;
+    ready_bytes[4..8].copy_from_slice(&6u32.to_le_bytes());
+    let mut base_sched = EnvSchedule::new().with_callee_return_size("ext_poll", 8);
+    base_sched.set_callee_default("ext_poll", ready_bytes);
+
+    // Pre-stepped 300 times (> 256!) AFTER `panic_on_call = 2` already passed -> MUST HOLD, NOT TRAP!
+    let mut passed_panic_sched = base_sched.clone();
+    passed_panic_sched.set_callee_panic_on_call("ext_poll", 2);
+    for g in 0..300usize {
+        let _ = passed_panic_sched.next_action("ext_poll", g);
+    }
+
+    // Pre-stepped 300 times (> 256!) WITH `panic_on_call = 300` -> MUST TRAP on trial call 0!
+    let mut deep_active_panic_sched = base_sched.clone();
+    deep_active_panic_sched.set_callee_panic_on_call("ext_poll", 300);
+    for g in 0..300usize {
+        let _ = deep_active_panic_sched.next_action("ext_poll", g);
+    }
+
+    let trials = vec![
+        // Trial 0: `Empty` with `0xEE` poison in payload + `x = -5` + `hops = 2` + passed deep panic -> HOLD
+        (make_trial(0, 0xDEAD_BEEF, -5, 2), Some(passed_panic_sched)),
+        // Trial 1: `Ready(15)` + `x = -3` (negative range `-4..=-2`) + `hops = 1` -> HOLD
+        (make_trial(1, 15, -3, 1), Some(base_sched.clone())),
+        // Trial 2: `Empty` mutated to `Ready(77)` when `x == -99` -> FRAME:st.status
+        (make_trial(0, 0, -99, 0), Some(base_sched)),
+        // Trial 3: Pre-stepped 300 calls hitting `callee_panic_on_call = 300` -> TRAP
+        (make_trial(1, 9, 3, 0), Some(deep_active_panic_sched)),
+    ];
+
+    let report = probe
+        .verify_spec_postcondition_batch(&trials)
+        .expect("verify ep2-B2 parity batch");
+    assert_eq!(report.verdicts[0], SpecPostconditionVerdict::VerifiedHold);
+    assert_eq!(report.verdicts[1], SpecPostconditionVerdict::VerifiedHold);
+    assert!(matches!(
+        &report.verdicts[2],
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::FrameCondition { param, field },
+            ..
+        } if param == "st" && field == "status"
+    ));
+    assert!(matches!(
+        &report.verdicts[3],
+        SpecPostconditionVerdict::PanicOrTrap { .. }
+    ));
+
+    let exe_src = probe
+        .synthesize_rust_executable_harness_with_schedules(&trials)
+        .expect("synthesize ep2-B2 executable harness");
+    assert!(!contains_unsafe_token(&exe_src));
+    let native_lines = compile_and_run_spec_harness("ep2_b2_lockstep_parity", &exe_src);
+    assert_eq!(
+        native_lines,
+        vec![
+            "TRIAL:0:HOLD",
+            "TRIAL:1:HOLD",
+            "TRIAL:2:FRAME:st.status",
+            "TRIAL:3:TRAP",
+        ]
+    );
+}
+
+#[test]
+fn ep2_a2_lockstep_parity_on_for_loops_multifield_enums_const_patterns_let_else_nonzero_and_o1_panic()
+{
+    use anneal_difftest::{
+        EnumVariantLayout, SpecContractOracleProbe, SpecExternalCallee, SpecParamBinding,
+        SpecPostconditionVerdict, SpecViolationKind,
+    };
+
+    let i32_layout = LayoutSpec::Scalar(ScalarLayout::i32());
+    let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+    let nz_u32_layout =
+        LayoutSpec::Scalar(ScalarLayout::with_valid_range(4, false, 1, u32::MAX as u128));
+
+    let both_payload = LayoutSpec::Tuple {
+        total_size: 8,
+        elements: vec![(0, u32_layout.clone()), (4, u32_layout.clone())],
+    };
+    let move_payload = LayoutSpec::Struct {
+        name: "Move".to_string(),
+        total_size: 8,
+        fields: vec![
+            FieldLayout {
+                name: "dx".to_string(),
+                offset: 0,
+                layout: i32_layout.clone(),
+            },
+            FieldLayout {
+                name: "dy".to_string(),
+                offset: 4,
+                layout: i32_layout.clone(),
+            },
+        ],
+    };
+    let action_layout = LayoutSpec::Enum {
+        name: "TaggedAction".to_string(),
+        total_size: 12,
+        tag_offset: 0,
+        tag_size: 1,
+        variants: vec![
+            EnumVariantLayout {
+                name: "Idle".to_string(),
+                discriminant: 0,
+                payload_offset: 4,
+                payload: None,
+            },
+            EnumVariantLayout {
+                name: "Both".to_string(),
+                discriminant: 1,
+                payload_offset: 4,
+                payload: Some(Box::new(both_payload)),
+            },
+            EnumVariantLayout {
+                name: "Move".to_string(),
+                discriminant: 2,
+                payload_offset: 4,
+                payload: Some(Box::new(move_payload)),
+            },
+        ],
+    };
+    let state_layout = LayoutSpec::Struct {
+        name: "ActionState".to_string(),
+        total_size: 16,
+        fields: vec![
+            FieldLayout {
+                name: "act".to_string(),
+                offset: 0,
+                layout: action_layout.clone(),
+            },
+            FieldLayout {
+                name: "total".to_string(),
+                offset: 12,
+                layout: u32_layout.clone(),
+            },
+        ],
+    };
+
+    // Exercises all 7 `ep2-A2` findings end-to-end against `rustc -D warnings`:
+    // 1. `for` loops over half-open/closed ranges and `[T; N]` arrays (`for &item in &arr`),
+    // 2. Multi-field tuple-variant (`TaggedAction::Both(a, b)`) and struct-variant
+    //    (`TaggedAction::Move { dx, dy }`) literal synthesis (`rustc` E0061 fix) + evaluation,
+    // 3. Top-level `const MAGIC_KEY: Word = 42` in expressions AND `match` patterns
+    //    (proving `key != 42` does NOT silently bind `MAGIC_KEY` as a wildcard variable!)
+    //    + `type` aliases (`ActionAlias`, `StateAlias`) + `core::num::NonZeroU32` (`.get()`),
+    // 4. `let ... else` diverging statements in both body and `old(...)` + `[first, .., last]`
+    //    and `(lo, .., hi)` rest destructuring in `let` bindings,
+    // 5. `old(scratch_bump(st))` invoking an `&mut StateAlias` helper on an isolated scratch
+    //    clone without mutating `old(st.total)` or failing `rustc` borrow/type checking,
+    // 6. O(1) `remaining_calls_until_callee_panic` on `callee_panic_on_call = usize::MAX`
+    //    after `300` pre-steps (completing instantaneously with 1-for-1 native parity).
+    let probe = SpecContractOracleProbe::new(
+        "action_parity_probe",
+        vec![
+            SpecParamBinding::mut_ref("st", "StateAlias", state_layout)
+                .with_frame_preserved_fields(["act"]),
+            SpecParamBinding::by_value("key", "Word", u32_layout.clone()),
+            SpecParamBinding::by_value("scale", "core::num::NonZeroU32", nz_u32_layout),
+            SpecParamBinding::by_value("fallback", "i32", i32_layout),
+        ],
+        "Word",
+        u32_layout,
+        "if key == 999u32 {\n    \
+             st.act = ActionAlias::Move { dx: 1i32, dy: 2i32 };\n\
+         }\n\
+         let key_tag: Word = match key {\n    \
+             MAGIC_KEY => 40u32,\n    \
+             _ => 2u32,\n\
+         };\n\
+         let payload_sum: Word = match st.act {\n    \
+             ActionAlias::Both(a, b) => a + b,\n    \
+             ActionAlias::Move { dx, dy } => (dx.wrapping_abs() as u32) + (dy.wrapping_abs() as u32),\n    \
+             ActionAlias::Idle => {\n        \
+                 let ActionAlias::Both(v, ..) = st.act else {\n            \
+                     return st.total + (fallback as Word);\n        \
+                 };\n        \
+                 v\n    \
+             }\n\
+         };\n\
+         let mut acc: Word = 0u32;\n\
+         for step_i in 0u32..=2u32 {\n    \
+             acc += step_i;\n\
+         }\n\
+         let weights: [Word; 4] = [1, 2, 3, 4];\n\
+         let [w_first, .., w_last]: [Word; 4] = weights;\n\
+         let (tup_a, .., tup_b) = (w_first, 77u32, w_last);\n\
+         for &w in &weights {\n    \
+             acc += w;\n\
+         }\n\
+         let ext_ev: ActionAlias = ext_next_action(key);\n\
+         let ext_delta: Word = match ext_ev {\n    \
+             ActionAlias::Both(p, q) => p + q,\n    \
+             ActionAlias::Move { dx, dy } => (dx.saturating_abs() as u32) + (dy.saturating_abs() as u32),\n    \
+             ActionAlias::Idle => 0u32,\n\
+         };\n\
+         st.total = st.total + key_tag + payload_sum + acc + tup_a + tup_b + scale.get() + ext_delta;\n\
+         st.total",
+    )
+    .with_type_defs(
+        "pub type Word = u32;\n\
+         pub const MAGIC_KEY: Word = 42;\n\
+         #[repr(C, u8)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub enum TaggedAction {\n    \
+             Idle = 0,\n    \
+             Both(Word, Word) = 1,\n    \
+             Move { dx: i32, dy: i32 } = 2,\n\
+         }\n\
+         pub type ActionAlias = TaggedAction;\n\
+         #[repr(C)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub struct ActionState { pub act: TaggedAction, pub total: Word }\n\
+         pub type StateAlias = ActionState;\n\
+         pub fn scratch_bump(s: &mut StateAlias) -> Word {\n    \
+             s.total += 5u32;\n    \
+             s.total\n\
+         }",
+    )
+    .with_external_callee(SpecExternalCallee::new(
+        "ext_next_action",
+        ["Word"],
+        "ActionAlias",
+        action_layout,
+    ))
+    .with_requires(
+        "valid_domain",
+        "scale.get() <= 8u32 && fallback >= 0i32 && fallback <= 50i32",
+    )
+    .with_ensures(
+        "old_mut_scratch_and_const_discrimination",
+        "old(scratch_bump(st)) == old(st.total).wrapping_add(5u32) \
+         && old((|| { let ActionAlias::Both(v, _) = st.act else { return (fallback as u32) <= 50u32; }; v <= u32::MAX })()) \
+         && (key == MAGIC_KEY || key != 42u32)",
+    )
+    .with_ensures("strict_progress", "result > old(st.total)");
+
+    let make_trial =
+        |disc: u8, p0: i32, p1: i32, total: u32, key: u32, nz: u32, fallback: i32| -> Vec<u8> {
+            let mut b = vec![0xAAu8; 28];
+            b[0] = disc;
+            b[4..8].copy_from_slice(&p0.to_le_bytes());
+            b[8..12].copy_from_slice(&p1.to_le_bytes());
+            b[12..16].copy_from_slice(&total.to_le_bytes());
+            b[16..20].copy_from_slice(&key.to_le_bytes());
+            b[20..24].copy_from_slice(&nz.to_le_bytes());
+            b[24..28].copy_from_slice(&fallback.to_le_bytes());
+            b
+        };
+
+    let mut both_sched_bytes = vec![0xBBu8; 12];
+    both_sched_bytes[0] = 1u8; // Both(3, 4)
+    both_sched_bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
+    both_sched_bytes[8..12].copy_from_slice(&4u32.to_le_bytes());
+
+    let mut move_sched_bytes = vec![0xCCu8; 12];
+    move_sched_bytes[0] = 2u8; // Move { dx: -3, dy: 6 }
+    move_sched_bytes[4..8].copy_from_slice(&(-3i32).to_le_bytes());
+    move_sched_bytes[8..12].copy_from_slice(&6i32.to_le_bytes());
+
+    let mut sched_o1_max = EnvSchedule::new().with_callee_return_size("ext_next_action", 12);
+    sched_o1_max.push_callee_response("ext_next_action", move_sched_bytes);
+    sched_o1_max.set_callee_default("ext_next_action", both_sched_bytes.clone());
+    sched_o1_max.set_callee_panic_on_call("ext_next_action", usize::MAX);
+    for g in 0..300usize {
+        let _ = sched_o1_max.next_action("ext_next_action", g);
+    }
+
+    let mut base_sched = EnvSchedule::new().with_callee_return_size("ext_next_action", 12);
+    let mut move_q_bytes = vec![0xDDu8; 12];
+    move_q_bytes[0] = 2u8; // Move { dx: -4, dy: 5 } -> exercises struct-variant literal synthesis in schedule queue!
+    move_q_bytes[4..8].copy_from_slice(&(-4i32).to_le_bytes());
+    move_q_bytes[8..12].copy_from_slice(&5i32.to_le_bytes());
+    base_sched.push_callee_response("ext_next_action", move_q_bytes);
+    base_sched.set_callee_default("ext_next_action", both_sched_bytes);
+
+    let trials = vec![
+        // Trial 0: `Both(4, 6)` + `key = 7` (!= MAGIC_KEY) + O(1) `usize::MAX` panic after 300 pre-steps -> HOLD
+        (make_trial(1, 4, 6, 10, 7, 2, 5), Some(sched_o1_max)),
+        // Trial 1: `Move { dx: -2, dy: 8 }` + `key = 42` (== MAGIC_KEY) + queued `Move` struct-variant -> HOLD
+        (make_trial(2, -2, 8, 20, 42, 3, 11), Some(base_sched.clone())),
+        // Trial 2: `Idle` hits `let ... else { return st.total + 0; }` -> violates `strict_progress`!
+        (make_trial(0, 0, 0, 15, 7, 1, 0), Some(base_sched.clone())),
+        // Trial 3: `key == 999` mutates framed `st.act` -> FRAME:st.act
+        (make_trial(0, 0, 0, 15, 999, 1, 5), Some(base_sched.clone())),
+        // Trial 4: `total = u32::MAX - 1` overflows checked `+` in body -> TRAP
+        (make_trial(1, 5, 5, u32::MAX - 1, 42, 4, 1), Some(base_sched)),
+    ];
+
+    let report = probe
+        .verify_spec_postcondition_batch(&trials)
+        .expect("verify ep2-A2 parity batch");
+    assert_eq!(report.verdicts[0], SpecPostconditionVerdict::VerifiedHold);
+    assert_eq!(report.verdicts[1], SpecPostconditionVerdict::VerifiedHold);
+    assert!(matches!(
+        &report.verdicts[2],
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::EnsuresClause { label, .. },
+            ..
+        } if label == "strict_progress"
+    ));
+    assert!(matches!(
+        &report.verdicts[3],
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::FrameCondition { param, field },
+            ..
+        } if param == "st" && field == "act"
+    ));
+    assert!(matches!(
+        &report.verdicts[4],
+        SpecPostconditionVerdict::PanicOrTrap { .. }
+    ));
+
+    let exe_src = probe
+        .synthesize_rust_executable_harness_with_schedules(&trials)
+        .expect("synthesize ep2-A2 executable harness");
+    assert!(!contains_unsafe_token(&exe_src));
+    let native_lines = compile_and_run_spec_harness("ep2_a2_lockstep_parity", &exe_src);
+    assert_eq!(
+        native_lines,
+        vec![
+            "TRIAL:0:HOLD",
+            "TRIAL:1:HOLD",
+            "TRIAL:2:VIOLATION:strict_progress",
+            "TRIAL:3:FRAME:st.act",
+            "TRIAL:4:TRAP",
+        ]
+    );
+}
+
+#[test]
+fn ep2_b3_lockstep_parity_on_for_mut_writeback_nonzero_min_old_block_mut_pure_spec_and_qualified_schedules()
+{
+    use anneal_difftest::{
+        EnvScheduledWriteStep, SpecContractOracleProbe, SpecExecPhase, SpecExternalCallee,
+        SpecParamBinding, SpecPostconditionVerdict, SpecViolationKind, WriteChainCoverageBound,
+    };
+
+    let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+    let nz_u32_layout =
+        LayoutSpec::Scalar(ScalarLayout::with_valid_range(4, false, 1, u32::MAX as u128));
+    let lanes_layout = LayoutSpec::Array {
+        elem: Box::new(u32_layout.clone()),
+        elem_stride: 4,
+        len: 3,
+    };
+    let state_layout = LayoutSpec::Struct {
+        name: "LaneState".to_string(),
+        total_size: 20,
+        fields: vec![
+            FieldLayout {
+                name: "lanes".to_string(),
+                offset: 0,
+                layout: lanes_layout,
+            },
+            FieldLayout {
+                name: "total".to_string(),
+                offset: 12,
+                layout: u32_layout.clone(),
+            },
+            FieldLayout {
+                name: "framed".to_string(),
+                offset: 16,
+                layout: u32_layout.clone(),
+            },
+        ],
+    };
+
+    // Exercises all 6 `ep2-B3` adversarial findings in lockstep with `rustc -D warnings`:
+    // 1. `for slot in &mut st.lanes { *slot += 2u32; }` and `for (a, b) in &mut pairs { *a += *b; }`
+    //    write back in-place array mutations (while `for &mut mut c in &mut st.lanes` copies without writeback),
+    // 2. `NonZeroU32::MIN` (`1`, NOT `0`!) via both `NzWord::MIN` and 4-segment
+    //    `core::num::NonZeroU32::MIN` in expressions AND `match` patterns,
+    // 3. `requires` scratch `&mut` mutation isolation (`scratch_bump(st) >= 5u32` does NOT mutate
+    //    Phase-2 `st.total`) + `old({ st.total += 3u32; (scratch_bump)(st) })` sequential scratch mutations,
+    // 4. Impure external call `ext_read()` inside `ensures` (`poison_spec == 1u32`) traps (`TRAP`)
+    //    in BOTH `verify_spec_postcondition_against_schedule` AND compiled `rustc` (`__AnnealPureSpecGuard`),
+    // 5. Module-qualified `EnvSchedule` keys (`"sensor_mod::ext_read"`) for queue, default,
+    //    return-size validation, and pre-stepped `callee_panic_on_call`,
+    // 6. `WriteChainCoverageBound` unwind cutoff halting after `PanicOnCall(0)`.
+    let probe = SpecContractOracleProbe::new(
+        "ep2_b3_mut_loop_nonzero_parity",
+        vec![
+            SpecParamBinding::mut_ref("st", "LaneState", state_layout)
+                .with_frame_preserved_fields(["framed"]),
+            SpecParamBinding::by_value("scale", "NzWord", nz_u32_layout),
+            SpecParamBinding::by_value("poison_spec", "u32", u32_layout.clone()),
+        ],
+        "u32",
+        u32_layout.clone(),
+        "if poison_spec == 77u32 {\n    \
+             st.framed += 1u32;\n\
+         }\n\
+         for &mut mut copied_lane in &mut st.lanes {\n    \
+             copied_lane += 100u32;\n    \
+             let _ = copied_lane;\n\
+         }\n\
+         for slot in &mut st.lanes {\n    \
+             *slot += 2u32;\n    \
+             if *slot > 900u32 { break; }\n\
+         }\n\
+         let mut pairs: [(u32, u32); 2] = [(1u32, 2u32), (3u32, 4u32)];\n\
+         for (a, b) in &mut pairs {\n    \
+             *a += *b;\n\
+         }\n\
+         let nz_tag: u32 = match scale {\n    \
+             core::num::NonZeroU32::MIN => NzWord::MIN.get() + core::num::NonZeroU32::MIN.get(),\n    \
+             _ => scale.get(),\n\
+         };\n\
+         let max_check: u32 = match st.total {\n    \
+             core::primitive::u32::MAX => 0u32,\n    \
+             _ => 1u32,\n\
+         };\n\
+         let ext_v: u32 = ext_read();\n\
+         st.total = st.total + st.lanes[0] + st.lanes[1] + st.lanes[2] + pairs[0].0 + pairs[1].0 + nz_tag + max_check + ext_v;\n\
+         st.total",
+    )
+    .with_type_defs(
+        "pub type NzWord = core::num::NonZeroU32;\n\
+         #[repr(C)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub struct LaneState { pub lanes: [u32; 3], pub total: u32, pub framed: u32 }\n\
+         pub fn scratch_bump(s: &mut LaneState) -> u32 {\n    \
+             s.total += 5u32;\n    \
+             s.total\n\
+         }",
+    )
+    .with_external_callee(SpecExternalCallee::new(
+        "ext_read",
+        std::iter::empty::<&str>(),
+        "u32",
+        u32_layout,
+    ))
+    .with_requires(
+        "requires_scratch_isolated",
+        "st.total <= 500u32 && scratch_bump(st) >= 5u32 \
+         && st.lanes[0] <= 100u32 && st.lanes[1] <= 100u32 && st.lanes[2] <= 100u32 \
+         && scale.get() <= 10u32",
+    )
+    .with_ensures(
+        "old_block_mut_and_pure_ensures_guard",
+        "old({ st.total += 3u32; (scratch_bump)(st) }) == old(st.total) + 8u32 \
+         && st.lanes[0] == old(st.lanes[0]) + 2u32 \
+         && st.lanes[1] == old(st.lanes[1]) + 2u32 \
+         && st.lanes[2] == old(st.lanes[2]) + 2u32 \
+         && (poison_spec != 1u32 || ext_read() > 0u32)",
+    )
+    .with_ensures(
+        "exact_post_sum",
+        "poison_spec == 2u32 || (scale.get() == 1u32 && result == old(st.total) + old(st.lanes[0]) + old(st.lanes[1]) + old(st.lanes[2]) + 6u32 + 10u32 + 2u32 + 1u32 + 4u32) \
+         || (scale.get() > 1u32 && result > old(st.total))",
+    );
+
+    let make_trial = |l0: u32, l1: u32, l2: u32, total: u32, scale: u32, poison_spec: u32| -> Vec<u8> {
+        let mut b = Vec::with_capacity(28);
+        b.extend_from_slice(&l0.to_le_bytes());
+        b.extend_from_slice(&l1.to_le_bytes());
+        b.extend_from_slice(&l2.to_le_bytes());
+        b.extend_from_slice(&total.to_le_bytes());
+        b.extend_from_slice(&55u32.to_le_bytes()); // framed = 55
+        b.extend_from_slice(&scale.to_le_bytes());
+        b.extend_from_slice(&poison_spec.to_le_bytes());
+        b
+    };
+
+    let mut qual_sched = EnvSchedule::new().with_callee_return_size("sensor_mod::ext_read", 4);
+    qual_sched.push_callee_response("sensor_mod::ext_read", 4u32.to_le_bytes().to_vec());
+    qual_sched.set_callee_default("sensor_mod::ext_read", 4u32.to_le_bytes().to_vec());
+
+    let mut qual_panic_sched = qual_sched.clone();
+    qual_panic_sched.set_callee_panic_on_call("sensor_mod::ext_read", 1);
+    let _ = qual_panic_sched.next_action("sensor_mod::ext_read", 0); // 1 call served -> next panics!
+
+    let trials = vec![
+        // Trial 0: `scale = 1` (`NonZeroU32::MIN`), `poison_spec = 0`, module-qualified schedule -> HOLD
+        (make_trial(1, 2, 3, 10, 1, 0), Some(qual_sched.clone())),
+        // Trial 1: `scale = 20` fails `requires` (`scale.get() <= 10`) -> FILTERED
+        (make_trial(1, 2, 3, 10, 20, 0), Some(qual_sched.clone())),
+        // Trial 2: `poison_spec = 1` calls external `ext_read()` inside `ensures` -> TRAP in both!
+        (make_trial(1, 2, 3, 10, 1, 1), Some(qual_sched.clone())),
+        // Trial 3: `poison_spec = 77` mutates framed `st.framed` -> FRAME:st.framed
+        (make_trial(1, 2, 3, 10, 3, 77), Some(qual_sched.clone())),
+        // Trial 4: pre-stepped module-qualified `callee_panic_on_call("sensor_mod::ext_read", 1)` -> TRAP
+        (make_trial(1, 2, 3, 10, 3, 0), Some(qual_panic_sched)),
+        // Trial 5: queued `9u32` breaks `exact_post_sum` (expects `+ 4u32` when `scale == 1 && poison_spec == 0`) -> VIOLATION:exact_post_sum
+        (
+            make_trial(1, 2, 3, 10, 1, 0),
+            Some({
+                let mut bad_q = EnvSchedule::new().with_callee_return_size("sensor_mod::ext_read", 4);
+                bad_q.push_callee_response("sensor_mod::ext_read", 9u32.to_le_bytes().to_vec());
+                bad_q
+            }),
+        ),
+    ];
+
+    let report = probe
+        .verify_spec_postcondition_batch(&trials)
+        .expect("verify ep2-B3 parity batch");
+    assert_eq!(report.verdicts[0], SpecPostconditionVerdict::VerifiedHold);
+    assert!(matches!(
+        &report.verdicts[1],
+        SpecPostconditionVerdict::VacuouslyFiltered { .. }
+    ));
+    assert!(matches!(
+        &report.verdicts[2],
+        SpecPostconditionVerdict::PanicOrTrap {
+            phase: SpecExecPhase::Ensures,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &report.verdicts[3],
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::FrameCondition { param, field },
+            ..
+        } if param == "st" && field == "framed"
+    ));
+    assert!(matches!(
+        &report.verdicts[4],
+        SpecPostconditionVerdict::PanicOrTrap {
+            phase: SpecExecPhase::Body,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &report.verdicts[5],
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::EnsuresClause { label, .. },
+            ..
+        } if label == "exact_post_sum"
+    ));
+
+    let exe_src = probe
+        .synthesize_rust_executable_harness_with_schedules(&trials)
+        .expect("synthesize ep2-B3 executable harness");
+    assert!(!contains_unsafe_token(&exe_src));
+    let native_lines = compile_and_run_spec_harness("ep2_b3_lockstep_parity", &exe_src);
+    assert_eq!(
+        native_lines,
+        vec![
+            "TRIAL:0:HOLD",
+            "TRIAL:1:FILTERED",
+            "TRIAL:2:TRAP",
+            "TRIAL:3:FRAME:st.framed",
+            "TRIAL:4:TRAP",
+            "TRIAL:5:VIOLATION:exact_post_sum",
+        ]
+    );
+
+    // Module-qualified `EnvSchedule` keys (`"sensor_mod::ext_read"`) resolve in
+    // `WriteChainCoverageBound::observe_env_schedule_with_layouts` when planned steps
+    // reference short `"ext_read"`:
+    let mut walk_bound = WriteChainCoverageBound::new(2, 2);
+    assert_eq!(
+        walk_bound.observe_env_schedule_with_layouts(
+            &qual_sched,
+            &probe.external_callee_layout_map(),
+            &[
+                EnvScheduledWriteStep::new("ext_read", "s0", std::iter::empty::<&str>()),
+                EnvScheduledWriteStep::new("ext_read", "s1", ["s0"]),
+            ],
+        ),
+        2
+    );
+    assert_eq!(walk_bound.broken_env_links(), 0);
+    assert!(walk_bound.is_depth_certified());
+}
+
+#[test]
+fn ep2_a3_lockstep_parity_on_local_mut_aliases_mixed_sched_keys_old_refs_clause_isolation_and_self_paths()
+{
+    use anneal_difftest::{
+        EnumVariantLayout, EnvScheduledWriteStep, SpecContractOracleProbe, SpecExecPhase,
+        SpecExternalCallee, SpecParamBinding, SpecPostconditionVerdict, SpecViolationKind,
+        WriteChainCoverageBound,
+    };
+
+    let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+    let lanes_layout = LayoutSpec::Array {
+        elem: Box::new(u32_layout.clone()),
+        elem_stride: 4,
+        len: 3,
+    };
+    let delta_layout = LayoutSpec::Enum {
+        name: "MaybeDelta".to_string(),
+        total_size: 8,
+        tag_offset: 0,
+        tag_size: 1,
+        variants: vec![
+            EnumVariantLayout {
+                name: "Empty".to_string(),
+                discriminant: 0,
+                payload_offset: 4,
+                payload: None,
+            },
+            EnumVariantLayout {
+                name: "Add".to_string(),
+                discriminant: 1,
+                payload_offset: 4,
+                payload: Some(Box::new(u32_layout.clone())),
+            },
+        ],
+    };
+    let state_layout = LayoutSpec::Struct {
+        name: "AliasState".to_string(),
+        total_size: 20,
+        fields: vec![
+            FieldLayout {
+                name: "lanes".to_string(),
+                offset: 0,
+                layout: lanes_layout,
+            },
+            FieldLayout {
+                name: "total".to_string(),
+                offset: 12,
+                layout: u32_layout.clone(),
+            },
+            FieldLayout {
+                name: "framed".to_string(),
+                offset: 16,
+                layout: u32_layout.clone(),
+            },
+        ],
+    };
+
+    // Exercises all 6 `ep2-A3` fixes in lockstep against compiled `rustc --edition=2024 -D warnings`:
+    // 1. Local `&mut` place aliases (`let r = &mut st.total;`, tuple `(&mut a, &mut b)`,
+    //    rebinding `rebind_ref = &mut st.lanes[2];`, lexical shadowing, `for whole @ (_, b)`,
+    //    and `for &mut ref mut lane_ref`),
+    // 2. Action-first `resolve_sched_callee_key` when `callee_return_sizes` uses short `"ext_read"`
+    //    while `callee_queues` uses module-qualified `"sensor_mod::ext_read"` + cross-key size mismatch,
+    // 3. Reference-returning `old(&st.total) == old(read_total_ref(st))` alongside mutating
+    //    `old(self::scratch_bump(st))` + per-clause `requires[i]` / `ensures[i]` scratch isolation,
+    // 4. `self::` / `crate::` module-root paths across constants, enums, structs, aliases, and helpers,
+    // 5. `NonZeroU32` zero-payload validation against `ret_rust_ty` ONLY when invoked (not during staging!),
+    // 6. `WriteChainCoverageBound::observe_env_schedule_until_unwind_with_layouts` single-trial cutoff.
+    let probe = SpecContractOracleProbe::new(
+        "ep2_a3_alias_ref_and_sched_parity",
+        vec![
+            SpecParamBinding::mut_ref("st", "self::StateAlias", state_layout)
+                .with_frame_preserved_fields(["framed"]),
+            SpecParamBinding::by_value("mode", "u32", u32_layout.clone()),
+            SpecParamBinding::by_value("seed_delta", "self::MaybeDelta", delta_layout),
+        ],
+        "u32",
+        u32_layout.clone(),
+        "if mode == 77u32 {\n    \
+             let f_ref = &mut st.framed;\n    \
+             *f_ref += 1u32;\n\
+         }\n\
+         let r_tot = &mut st.total;\n\
+         *r_tot += 5u32;\n\
+         {\n    \
+             let r_tot: u32 = 999u32;\n    \
+             let _ = r_tot;\n\
+         }\n\
+         *r_tot += 1u32;\n\
+         let (l0_ref, tot_ref) = (&mut st.lanes[0], &mut st.total);\n\
+         *l0_ref += 2u32;\n\
+         *tot_ref += 3u32;\n\
+         let mut rebind_ref = &mut st.lanes[0];\n\
+         *rebind_ref += 1u32;\n\
+         rebind_ref = &mut st.lanes[2];\n\
+         *rebind_ref += 4u32;\n\
+         for &mut ref mut lane_ref in &mut st.lanes {\n    \
+             *lane_ref += 1u32;\n\
+         }\n\
+         let mut pairs: [(u32, u32); 2] = [(1u32, 2u32), (3u32, 4u32)];\n\
+         for whole @ &mut (a, _) in &mut pairs {\n    \
+             whole.1 += a;\n\
+         }\n\
+         for &mut (_, ref mut b) in &mut pairs {\n    \
+             *b += 10u32;\n\
+         }\n\
+         let d: crate::MaybeDelta = if mode == 0u32 {\n    \
+             crate::MaybeDelta::Empty\n\
+         } else {\n    \
+             self::MaybeDelta::Add(self::MAGIC_BONUS)\n\
+         };\n\
+         let seed_bonus: u32 = match seed_delta {\n    \
+             crate::MaybeDelta::Empty => 0u32,\n    \
+             self::MaybeDelta::Add(sv) => sv,\n\
+         };\n\
+         let bonus: u32 = match d {\n    \
+             self::MaybeDelta::Empty => seed_bonus,\n    \
+             crate::MaybeDelta::Add(v) => v + seed_bonus,\n\
+         };\n\
+         let ext_v: u32 = self::ext_read();\n\
+         let nz_extra: u32 = if mode == 2u32 { ext_nz().get() } else { 0u32 };\n\
+         st.total = st.total + st.lanes[0] + st.lanes[1] + st.lanes[2] + pairs[0].1 + pairs[1].1 + bonus + ext_v + nz_extra;\n\
+         st.total",
+    )
+    .with_type_defs(
+        "pub const MAGIC_BONUS: u32 = 7;\n\
+         #[repr(C, u8)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub enum MaybeDelta { Empty = 0, Add(u32) = 1 }\n\
+         #[repr(C)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub struct AliasState { pub lanes: [u32; 3], pub total: u32, pub framed: u32 }\n\
+         pub type StateAlias = AliasState;\n\
+         pub fn read_total_ref(s: &AliasState) -> &u32 { &s.total }\n\
+         pub fn scratch_bump(s: &mut AliasState) -> u32 {\n    \
+             s.total += 50u32;\n    \
+             s.total\n\
+         }",
+    )
+    .with_external_callee(SpecExternalCallee::new(
+        "ext_read",
+        std::iter::empty::<&str>(),
+        "u32",
+        u32_layout.clone(),
+    ))
+    .with_external_callee(SpecExternalCallee::new(
+        "ext_nz",
+        std::iter::empty::<&str>(),
+        "core::num::NonZeroU32",
+        u32_layout,
+    ))
+    .with_requires("req_scratch_0", "self::scratch_bump(st) == st.total")
+    .with_requires("req_isolated_1", "st.total <= 20u32")
+    .with_ensures(
+        "old_shared_refs_and_ens_scratch_0",
+        "old(&st.total) == old(read_total_ref(st)) \
+         && old(self::scratch_bump(st)) == old(st.total) + 50u32 \
+         && self::scratch_bump(st) == result + 50u32",
+    )
+    .with_ensures(
+        "ens_isolated_1",
+        "mode != 9u32 \
+         && st.total == result \
+         && st.lanes[0] == old(st.lanes[0]) + 4u32 \
+         && st.lanes[1] == old(st.lanes[1]) + 1u32 \
+         && st.lanes[2] == old(st.lanes[2]) + 5u32",
+    );
+
+    let make_trial = |total: u32, mode: u32| -> Vec<u8> {
+        let mut b = Vec::with_capacity(32);
+        b.extend_from_slice(&1u32.to_le_bytes()); // lanes[0] = 1
+        b.extend_from_slice(&2u32.to_le_bytes()); // lanes[1] = 2
+        b.extend_from_slice(&3u32.to_le_bytes()); // lanes[2] = 3
+        b.extend_from_slice(&total.to_le_bytes());
+        b.extend_from_slice(&88u32.to_le_bytes()); // framed = 88
+        b.extend_from_slice(&mode.to_le_bytes());
+        let mut delta_bytes = [0u8; 8];
+        delta_bytes[0] = 1u8; // MaybeDelta::Add(2)
+        delta_bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
+        b.extend_from_slice(&delta_bytes);
+        b
+    };
+
+    // Short `callee_return_sizes["ext_read"] = 4` + module-qualified `callee_queues["sensor_mod::ext_read"]`,
+    // plus `0u32` queued on `ext_nz` (`NonZeroU32` with plain `ScalarLayout::u32()`):
+    let mut mixed_sched = EnvSchedule::new().with_callee_return_size("ext_read", 4);
+    mixed_sched.push_callee_response("sensor_mod::ext_read", 9u32.to_le_bytes().to_vec());
+    mixed_sched.push_callee_response("ext_nz", 0u32.to_le_bytes().to_vec());
+
+    // Cross-key return-size mismatch (`callee_return_sizes["ext_read"] = 8` registered after pushing 4-byte `"sensor_mod::ext_read"`):
+    let mut bad_sz_sched = EnvSchedule::new();
+    bad_sz_sched.push_callee_response("sensor_mod::ext_read", 9u32.to_le_bytes().to_vec());
+    bad_sz_sched.push_callee_response("ext_nz", 3u32.to_le_bytes().to_vec());
+    bad_sz_sched.register_callee_return_size("ext_read", 8);
+
+    let trials = vec![
+        // Trial 0: `total = 10, mode = 1` -> `req_scratch_0` mutates only its own scratch, so `req_isolated_1`
+        // still sees `10 <= 20`, `ext_nz` (`0`) is NOT called, `ens_0` scratch does NOT pollute `ens_1` -> HOLD!
+        (make_trial(10, 1), Some(mixed_sched.clone())),
+        // Trial 1: `total = 25` fails `req_isolated_1` even with `0` staged in `ext_nz` -> FILTERED (no eager unwrap panic!)
+        (make_trial(25, 2), Some(mixed_sched.clone())),
+        // Trial 2: `total = 10, mode = 2` calls `ext_nz()` which pops invalid `0` for `NonZeroU32` -> TRAP!
+        (make_trial(10, 2), Some(mixed_sched.clone())),
+        // Trial 3: `total = 10, mode = 77` mutates framed `st.framed` via local `&mut` alias -> FRAME:st.framed!
+        (make_trial(10, 77), Some(mixed_sched.clone())),
+        // Trial 4: `total = 10, mode = 9` fails `ens_isolated_1` -> VIOLATION:ens_isolated_1!
+        (make_trial(10, 9), Some(mixed_sched.clone())),
+        // Trial 5: cross-key return-size mismatch (`ext_read` 8B vs `sensor_mod::ext_read` 4B) -> TRAP!
+        (make_trial(10, 0), Some(bad_sz_sched)),
+    ];
+
+    let report = probe
+        .verify_spec_postcondition_batch(&trials)
+        .expect("verify ep2-A3 parity batch");
+    assert_eq!(report.verdicts[0], SpecPostconditionVerdict::VerifiedHold);
+    assert!(matches!(
+        &report.verdicts[1],
+        SpecPostconditionVerdict::VacuouslyFiltered {
+            failed_requires_index: 1,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &report.verdicts[2],
+        SpecPostconditionVerdict::PanicOrTrap {
+            phase: SpecExecPhase::Body,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &report.verdicts[3],
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::FrameCondition { param, field },
+            ..
+        } if param == "st" && field == "framed"
+    ));
+    assert!(matches!(
+        &report.verdicts[4],
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::EnsuresClause {
+                clause_index: 1,
+                label,
+            },
+            ..
+        } if label == "ens_isolated_1"
+    ));
+    assert!(matches!(
+        &report.verdicts[5],
+        SpecPostconditionVerdict::PanicOrTrap {
+            phase: SpecExecPhase::Body,
+            ..
+        }
+    ));
+
+    let exe_src = probe
+        .synthesize_rust_executable_harness_with_schedules(&trials)
+        .expect("synthesize ep2-A3 executable harness");
+    assert!(!contains_unsafe_token(&exe_src));
+    let native_lines = compile_and_run_spec_harness("ep2_a3_lockstep_parity", &exe_src);
+    assert_eq!(
+        native_lines,
+        vec![
+            "TRIAL:0:HOLD",
+            "TRIAL:1:FILTERED",
+            "TRIAL:2:TRAP",
+            "TRIAL:3:FRAME:st.framed",
+            "TRIAL:4:VIOLATION:ens_isolated_1",
+            "TRIAL:5:TRAP",
+        ]
+    );
+
+    // Mixed short/qualified schedule keys ALSO certify `WriteChainCoverageBound`, whereas
+    // `observe_env_schedule_until_unwind_with_layouts` halts immediately on `PanicOnCall(0)`:
+    let mut mixed_walk = WriteChainCoverageBound::new(2, 2);
+    let mut two_hop_mixed = EnvSchedule::new().with_callee_return_size("ext_read", 4);
+    two_hop_mixed.set_callee_default("sensor_mod::ext_read", 9u32.to_le_bytes().to_vec());
+    assert_eq!(
+        mixed_walk.observe_env_schedule_until_unwind_with_layouts(
+            &two_hop_mixed,
+            &probe.external_callee_layout_map(),
+            &[
+                EnvScheduledWriteStep::new("ext_read", "s0", std::iter::empty::<&str>()),
+                EnvScheduledWriteStep::new("ext_read", "s1", ["s0"]),
+            ],
+        ),
+        2
+    );
+    assert!(mixed_walk.is_depth_certified());
+
+    let mut unwind_sched = two_hop_mixed.clone();
+    unwind_sched.set_panic_on_call(0);
+    let mut unwind_walk = WriteChainCoverageBound::new(2, 2);
+    assert_eq!(
+        unwind_walk.observe_env_schedule_until_unwind_with_layouts(
+            &unwind_sched,
+            &probe.external_callee_layout_map(),
+            &[
+                EnvScheduledWriteStep::new("ext_read", "s0", std::iter::empty::<&str>()),
+                EnvScheduledWriteStep::new("ext_read", "s1", std::iter::empty::<&str>()),
+                EnvScheduledWriteStep::new("ext_read", "s2", ["s1"]),
+            ],
+        ),
+        0
+    );
+    assert_eq!(unwind_walk.broken_env_links(), 1);
+    assert_eq!(unwind_walk.steps_observed(), 0);
+}
+
+#[test]
+fn ep2_b4_lockstep_parity_on_shadowed_aliases_mut_ret_helpers_match_mut_enums_and_old_proj_refs() {
+    use anneal_difftest::{
+        EnumVariantLayout, SpecContractOracleProbe, SpecExecPhase, SpecExternalCallee,
+        SpecParamBinding, SpecPostconditionVerdict, SpecViolationKind,
+    };
+
+    let u8_layout = LayoutSpec::Scalar(ScalarLayout::u8());
+    let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+    let bool_layout = LayoutSpec::Scalar(ScalarLayout::bool_layout());
+    let padded_item_layout = LayoutSpec::Struct {
+        name: "PaddedItem".to_string(),
+        total_size: 8,
+        fields: vec![
+            FieldLayout {
+                name: "tag".to_string(),
+                offset: 0,
+                layout: u8_layout,
+            },
+            FieldLayout {
+                name: "word".to_string(),
+                offset: 4,
+                layout: u32_layout.clone(),
+            },
+        ],
+    };
+    let framed_items_layout = LayoutSpec::Array {
+        elem: Box::new(padded_item_layout),
+        elem_stride: 8,
+        len: 2,
+    };
+    let lanes_layout = LayoutSpec::Array {
+        elem: Box::new(u32_layout.clone()),
+        elem_stride: 4,
+        len: 3,
+    };
+    let delta_layout = LayoutSpec::Enum {
+        name: "TaggedDelta".to_string(),
+        total_size: 12,
+        tag_offset: 0,
+        tag_size: 1,
+        variants: vec![
+            EnumVariantLayout {
+                name: "Empty".to_string(),
+                discriminant: 0,
+                payload_offset: 4,
+                payload: None,
+            },
+            EnumVariantLayout {
+                name: "Single".to_string(),
+                discriminant: 1,
+                payload_offset: 4,
+                payload: Some(Box::new(u32_layout.clone())),
+            },
+            EnumVariantLayout {
+                name: "Pair".to_string(),
+                discriminant: 2,
+                payload_offset: 4,
+                payload: Some(Box::new(LayoutSpec::Tuple {
+                    total_size: 8,
+                    elements: vec![(0, u32_layout.clone()), (4, u32_layout.clone())],
+                })),
+            },
+            EnumVariantLayout {
+                name: "Shift".to_string(),
+                discriminant: 3,
+                payload_offset: 4,
+                payload: Some(Box::new(LayoutSpec::Struct {
+                    name: "ShiftPayload".to_string(),
+                    total_size: 8,
+                    fields: vec![
+                        FieldLayout {
+                            name: "dx".to_string(),
+                            offset: 0,
+                            layout: u32_layout.clone(),
+                        },
+                        FieldLayout {
+                            name: "dy".to_string(),
+                            offset: 4,
+                            layout: u32_layout.clone(),
+                        },
+                    ],
+                })),
+            },
+        ],
+    };
+    let state_layout = LayoutSpec::Struct {
+        name: "B4ParityState".to_string(),
+        total_size: 44,
+        fields: vec![
+            FieldLayout {
+                name: "framed_items".to_string(),
+                offset: 0,
+                layout: framed_items_layout,
+            },
+            FieldLayout {
+                name: "lanes".to_string(),
+                offset: 16,
+                layout: lanes_layout,
+            },
+            FieldLayout {
+                name: "act".to_string(),
+                offset: 28,
+                layout: delta_layout,
+            },
+            FieldLayout {
+                name: "total".to_string(),
+                offset: 40,
+                layout: u32_layout.clone(),
+            },
+        ],
+    };
+
+    // Exercises all 5 `ep2-B4` findings in lockstep with `rustc --edition=2024 -D warnings`:
+    // 1. Framed strided `[PaddedItem; 2]` array with poisoned `0xA5` padding bytes preserved
+    //    across `coerce_value_to_syn_type`,
+    // 2. Evacuating shadowed variables targeted by live `&mut` aliases (`let r = &mut x; { let x = 999; *r += 5; }`,
+    //    `{ let x = &mut x; *x += 2; }`, `{ let st = &mut st.total; *st += 1; }`) + helper `mut dst: &mut u32`
+    //    rebound to `&mut scratch` without clobbering caller's `x`,
+    // 3. `old({ let _ = u32::max(st.total, 1u32); &st.total }) == old(&st.total)` (zero `E0515` false positive!)
+    //    alongside local-alias scratch mutation `old({ let r = st; r.total += 3u32; (scratch_bump)(r) })`,
+    // 4. Conditional `if` `&mut` place selection + `&mut`-returning helper `select_lane_mut(st, idx)`
+    //    (including early `return &mut s.lanes[0];`),
+    // 5. `match &mut st.act`, `if let ... = &mut st.act` (with NLL reassignment!), `while let`,
+    //    and `let B4ParityState { ref mut total, .. } = *st;`.
+    let probe = SpecContractOracleProbe::new(
+        "ep2_b4_parity_probe",
+        vec![
+            SpecParamBinding::mut_ref("st", "B4ParityState", state_layout)
+                .with_frame_preserved_fields(["framed_items"]),
+            SpecParamBinding::by_value("pick_first", "bool", bool_layout),
+            SpecParamBinding::by_value("mode", "u32", u32_layout.clone()),
+        ],
+        "u32",
+        u32_layout.clone(),
+        "if mode == 77u32 {\n    \
+             st.framed_items[1].word += 1u32;\n\
+         }\n\
+         let mut x: u32 = 10u32;\n\
+         let r = &mut x;\n\
+         {\n    \
+             let x: u32 = 999u32;\n    \
+             let _ = x;\n    \
+             *r += 5u32;\n\
+         }\n\
+         {\n    \
+             let x = &mut x;\n    \
+             *x += 2u32;\n\
+         }\n\
+         let mut scratch_slot: u32 = 50u32;\n\
+         let redir_out: u32 = redirect_helper(&mut x, &mut scratch_slot, true);\n\
+         assert!(redir_out == 150u32 && scratch_slot == 150u32);\n\
+         let chosen = if pick_first {\n    \
+             &mut st.lanes[0]\n\
+         } else {\n    \
+             select_lane_mut(st, 2usize)\n\
+         };\n\
+         *chosen += 10u32;\n\
+         *select_lane_mut(st, 1usize) += 4u32;\n\
+         while let TaggedDelta::Single(cnt) = &mut st.act {\n    \
+             if *cnt >= 3u32 { break; }\n    \
+             *cnt += 1u32;\n\
+         }\n\
+         match &mut st.act {\n    \
+             TaggedDelta::Single(v) => { *v += 5u32; }\n    \
+             TaggedDelta::Pair(a, b) => {\n        \
+                 *a += 1u32;\n        \
+                 *b += 2u32;\n    \
+             }\n    \
+             TaggedDelta::Shift { dx, dy } => {\n        \
+                 *dx += *dy;\n        \
+                 st.act = TaggedDelta::Single(*dx);\n    \
+             }\n    \
+             TaggedDelta::Empty => {}\n\
+         }\n\
+         if let TaggedDelta::Pair(ref mut a, b_copy) = st.act {\n    \
+             *a += b_copy;\n\
+         }\n\
+         let B4ParityState { ref mut total, .. } = *st;\n\
+         *total += x;\n\
+         let act_sum: u32 = match st.act {\n    \
+             TaggedDelta::Single(v) => v,\n    \
+             TaggedDelta::Pair(a, b) => a + b,\n    \
+             TaggedDelta::Shift { dx, dy } => dx + dy,\n    \
+             TaggedDelta::Empty => 0u32,\n\
+         };\n\
+         let ext_v: u32 = ext_step();\n\
+         {\n    \
+             let st = &mut st.total;\n    \
+             *st += act_sum + ext_v;\n\
+         }\n\
+         st.total + st.lanes[0] + st.lanes[1] + st.lanes[2]",
+    )
+    .with_type_defs(
+        "#[repr(C)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub struct PaddedItem { pub tag: u8, pub word: u32 }\n\
+         #[repr(C, u8)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub enum TaggedDelta {\n    \
+             Empty = 0,\n    \
+             Single(u32) = 1,\n    \
+             Pair(u32, u32) = 2,\n    \
+             Shift { dx: u32, dy: u32 } = 3,\n\
+         }\n\
+         #[repr(C)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub struct B4ParityState {\n    \
+             pub framed_items: [PaddedItem; 2],\n    \
+             pub lanes: [u32; 3],\n    \
+             pub act: TaggedDelta,\n    \
+             pub total: u32,\n\
+         }\n\
+         pub fn select_lane_mut(s: &mut B4ParityState, idx: usize) -> &mut u32 {\n    \
+             if idx == 0usize { return &mut s.lanes[0]; }\n    \
+             &mut s.lanes[idx]\n\
+         }\n\
+         pub fn redirect_helper<'a>(mut dst: &'a mut u32, fallback: &'a mut u32, redirect: bool) -> u32 {\n    \
+             if redirect { dst = fallback; }\n    \
+             *dst += 100u32;\n    \
+             *dst\n\
+         }\n\
+         pub fn by_val_total(s: B4ParityState) -> u32 { s.total }\n\
+         pub fn scratch_bump(s: &mut B4ParityState) -> u32 {\n    \
+             s.total += 7u32;\n    \
+             s.total\n\
+         }",
+    )
+    .with_external_callee(SpecExternalCallee::new(
+        "ext_step",
+        std::iter::empty::<&str>(),
+        "u32",
+        u32_layout,
+    ))
+    .with_requires(
+        "bounded_inputs",
+        "st.total <= 500u32 && st.lanes[0] <= 50u32 && st.lanes[1] <= 50u32 && st.lanes[2] <= 50u32",
+    )
+    .with_ensures(
+        "old_proj_ref_no_e0515_and_local_alias_mut",
+        "old({ let _ = u32::max(st.total, 1u32); let _ = by_val_total(*st); &st.total }) == old(&st.total) \
+         && old({ let r = st; r.total += 3u32; (scratch_bump)(r) }) == old(st.total) + 10u32",
+    )
+    .with_ensures(
+        "exact_post_check",
+        "mode != 9u32 \
+         && st.lanes[1] == old(st.lanes[1]) + 4u32 \
+         && ((pick_first && st.lanes[0] == old(st.lanes[0]) + 10u32 && st.lanes[2] == old(st.lanes[2])) \
+             || (!pick_first && st.lanes[2] == old(st.lanes[2]) + 10u32 && st.lanes[0] == old(st.lanes[0]))) \
+         && st.total >= old(st.total) + 17u32",
+    );
+
+    let make_trial = |disc: u8, p0: u32, p1: u32, total: u32, pick_first: bool, mode: u32| -> Vec<u8> {
+        let mut b = vec![0xA5u8; 49];
+        b[0] = 3u8;
+        b[4..8].copy_from_slice(&11u32.to_le_bytes());
+        b[8] = 5u8;
+        b[12..16].copy_from_slice(&22u32.to_le_bytes());
+        b[16..20].copy_from_slice(&1u32.to_le_bytes()); // lanes[0] = 1
+        b[20..24].copy_from_slice(&2u32.to_le_bytes()); // lanes[1] = 2
+        b[24..28].copy_from_slice(&3u32.to_le_bytes()); // lanes[2] = 3
+        b[28] = disc;
+        b[32..36].copy_from_slice(&p0.to_le_bytes());
+        b[36..40].copy_from_slice(&p1.to_le_bytes());
+        b[40..44].copy_from_slice(&total.to_le_bytes());
+        b[44] = u8::from(pick_first);
+        b[45..49].copy_from_slice(&mode.to_le_bytes());
+        b
+    };
+
+    let mut base_sched = EnvSchedule::new().with_callee_return_size("ext_step", 4);
+    base_sched.set_callee_default("ext_step", 6u32.to_le_bytes().to_vec());
+
+    let trials = vec![
+        // Trial 0: `Pair(4, 5)`, `pick_first = false` (`select_lane_mut(st, 2)`), `mode = 0` -> HOLD
+        (make_trial(2, 4, 5, 20, false, 0), Some(base_sched.clone())),
+        // Trial 1: `Single(1)` (`while let` bumps 1 -> 3, then `match &mut` bumps 3 -> 8), `pick_first = true` -> HOLD
+        (make_trial(1, 1, 0, 20, true, 0), Some(base_sched.clone())),
+        // Trial 2: `Shift { dx: 3, dy: 4 }` (`match &mut` mutates `*dx += *dy` -> 7, then NLL reassigns `st.act = Single(7)`!) -> HOLD
+        (make_trial(3, 3, 4, 20, false, 0), Some(base_sched.clone())),
+        // Trial 3: `total = 900` fails `requires` -> FILTERED
+        (make_trial(0, 0, 0, 900, true, 0), Some(base_sched.clone())),
+        // Trial 4: `mode = 77` mutates framed `st.framed_items[1].word` -> FRAME:st.framed_items
+        (make_trial(2, 4, 5, 20, true, 77), Some(base_sched.clone())),
+        // Trial 5: `mode = 9` fails `exact_post_check` -> VIOLATION:exact_post_check
+        (make_trial(2, 4, 5, 20, false, 9), Some(base_sched.clone())),
+        // Trial 6: scheduled panic on `ext_step` -> TRAP
+        (
+            make_trial(2, 4, 5, 20, false, 0),
+            Some(base_sched.with_panic_on_call(0)),
+        ),
+    ];
+
+    let report = probe
+        .verify_spec_postcondition_batch(&trials)
+        .expect("verify ep2-B4 parity batch");
+    assert_eq!(report.verdicts[0], SpecPostconditionVerdict::VerifiedHold);
+    assert_eq!(report.verdicts[1], SpecPostconditionVerdict::VerifiedHold);
+    assert_eq!(report.verdicts[2], SpecPostconditionVerdict::VerifiedHold);
+    assert!(matches!(
+        &report.verdicts[3],
+        SpecPostconditionVerdict::VacuouslyFiltered { .. }
+    ));
+    assert!(matches!(
+        &report.verdicts[4],
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::FrameCondition { param, field },
+            ..
+        } if param == "st" && field == "framed_items"
+    ));
+    assert!(matches!(
+        &report.verdicts[5],
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::EnsuresClause { label, .. },
+            ..
+        } if label == "exact_post_check"
+    ));
+    assert!(matches!(
+        &report.verdicts[6],
+        SpecPostconditionVerdict::PanicOrTrap {
+            phase: SpecExecPhase::Body,
+            ..
+        }
+    ));
+
+    let exe_src = probe
+        .synthesize_rust_executable_harness_with_schedules(&trials)
+        .expect("synthesize ep2-B4 executable harness");
+    assert!(!contains_unsafe_token(&exe_src));
+    let native_lines = compile_and_run_spec_harness("ep2_b4_lockstep_parity", &exe_src);
+    assert_eq!(
+        native_lines,
+        vec![
+            "TRIAL:0:HOLD",
+            "TRIAL:1:HOLD",
+            "TRIAL:2:HOLD",
+            "TRIAL:3:FILTERED",
+            "TRIAL:4:FRAME:st.framed_items",
+            "TRIAL:5:VIOLATION:exact_post_check",
+            "TRIAL:6:TRAP",
+        ]
+    );
+}
+
+#[test]
+fn ep2_a4_lockstep_parity_on_direct_mut_param_ergonomics_single_eval_ref_mut_and_by_val_old_refs() {
+    use anneal_difftest::{
+        EnumVariantLayout, SpecContractOracleProbe, SpecExecPhase, SpecExternalCallee,
+        SpecParamBinding, SpecPostconditionVerdict, SpecViolationKind,
+    };
+
+    let u32_layout = LayoutSpec::Scalar(ScalarLayout::u32());
+    let usize_layout = LayoutSpec::Scalar(ScalarLayout::unsigned(8));
+    let arr_layout = LayoutSpec::Array {
+        elem: Box::new(u32_layout.clone()),
+        elem_stride: 4,
+        len: 2,
+    };
+    let delta_layout = LayoutSpec::Enum {
+        name: "DirectDelta".to_string(),
+        total_size: 8,
+        tag_offset: 0,
+        tag_size: 1,
+        variants: vec![
+            EnumVariantLayout {
+                name: "Idle".to_string(),
+                discriminant: 0,
+                payload_offset: 4,
+                payload: None,
+            },
+            EnumVariantLayout {
+                name: "Step".to_string(),
+                discriminant: 1,
+                payload_offset: 4,
+                payload: Some(Box::new(u32_layout.clone())),
+            },
+        ],
+    };
+    let pair_layout = LayoutSpec::Struct {
+        name: "ValPair".to_string(),
+        total_size: 8,
+        fields: vec![
+            FieldLayout {
+                name: "a".to_string(),
+                offset: 0,
+                layout: u32_layout.clone(),
+            },
+            FieldLayout {
+                name: "b".to_string(),
+                offset: 4,
+                layout: u32_layout.clone(),
+            },
+        ],
+    };
+
+    // Exercises all `ep2-A4` convergence fixes in lockstep with `rustc --edition=2024 -D warnings`:
+    // 1. Direct `&mut` parameter ergonomics WITHOUT `&mut *` (`match act`, `for slot in arr` on a
+    //    dedicated `lanes: &mut [u32; 2]`, and `let moved_arr = arr; moved_arr[0] += 3;`),
+    // 2. Single-evaluation `let ref mut tmp_ext = ext_once();` against a 1-element `EnvSchedule`
+    //    queue (no default!) so double evaluation would panic with `PassThrough`,
+    // 3. Immediate OOB index trap on `let ref mut picked = arr[idx];`,
+    // 4. By-value parameter scratch mutability in `requires[i]` / `ensures[i]`, reference-returning
+    //    `old(&vp.a) == &vp.a` (zero `E0515`), and mutating `old({ vp.a += 7u32; vp.a })`.
+    let probe = SpecContractOracleProbe::new(
+        "ep2_a4_direct_mut_and_by_val_old_parity",
+        vec![
+            SpecParamBinding::mut_ref("arr", "[u32; 2]", arr_layout.clone()),
+            SpecParamBinding::mut_ref("lanes", "[u32; 2]", arr_layout),
+            SpecParamBinding::mut_ref("act", "DirectDelta", delta_layout),
+            SpecParamBinding::by_value("vp", "ValPair", pair_layout),
+            SpecParamBinding::by_value("idx", "usize", usize_layout),
+        ],
+        "u32",
+        u32_layout.clone(),
+        "let ref mut tmp_ext: u32 = ext_once();\n\
+         *tmp_ext += 5u32;\n\
+         let ref mut picked_elem: u32 = arr[idx];\n\
+         *picked_elem += 1u32;\n\
+         for slot in lanes {\n    \
+             *slot += 2u32;\n\
+         }\n\
+         match act {\n    \
+             DirectDelta::Step(dx) => { *dx += *tmp_ext; }\n    \
+             DirectDelta::Idle => {}\n\
+         }\n\
+         let moved_arr = arr;\n\
+         moved_arr[0] += 3u32;\n\
+         vp.b += 4u32;\n\
+         moved_arr[0] + moved_arr[1] + vp.a + vp.b",
+    )
+    .with_type_defs(
+        "#[repr(C, u8)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub enum DirectDelta { Idle = 0, Step(u32) = 1 }\n\
+         #[repr(C)]\n\
+         #[derive(Copy, Clone, Debug, PartialEq, Eq)]\n\
+         pub struct ValPair { pub a: u32, pub b: u32 }",
+    )
+    .with_external_callee(SpecExternalCallee::new(
+        "ext_once",
+        std::iter::empty::<&str>(),
+        "u32",
+        u32_layout,
+    ))
+    .with_requires(
+        "by_val_mut_scratch_req",
+        "{ vp.a += 1u32; vp.a <= 50u32 }",
+    )
+    .with_ensures(
+        "by_val_old_ref_and_mut_old",
+        "old(&vp.a) == &vp.a \
+         && old({ vp.a += 7u32; vp.a }) == old(vp.a) + 7u32 \
+         && { vp.b += 9u32; vp.b == old(vp.b) + 9u32 }",
+    )
+    .with_ensures(
+        "direct_mut_params_preserved",
+        "vp.a != 9u32 \
+         && lanes[0] == old(lanes[0]) + 2u32 \
+         && lanes[1] == old(lanes[1]) + 2u32 \
+         && match *act {\n    \
+             DirectDelta::Step(v) => v == 18u32,\n    \
+             DirectDelta::Idle => true,\n\
+         }",
+    );
+
+    let make_trial = |vpa: u32, idx: u64| -> Vec<u8> {
+        let mut b = Vec::with_capacity(40);
+        b.extend_from_slice(&10u32.to_le_bytes()); // arr[0] = 10
+        b.extend_from_slice(&20u32.to_le_bytes()); // arr[1] = 20
+        b.extend_from_slice(&3u32.to_le_bytes()); // lanes[0] = 3
+        b.extend_from_slice(&4u32.to_le_bytes()); // lanes[1] = 4
+        let mut act_b = [0u8; 8];
+        act_b[0] = 1u8; // DirectDelta::Step(4)
+        act_b[4..8].copy_from_slice(&4u32.to_le_bytes());
+        b.extend_from_slice(&act_b);
+        b.extend_from_slice(&vpa.to_le_bytes()); // vp.a
+        b.extend_from_slice(&6u32.to_le_bytes()); // vp.b = 6
+        b.extend_from_slice(&idx.to_le_bytes());
+        b
+    };
+
+    // Queue ONLY 1 response (`9u32`) with NO default so any double evaluation panics!
+    let mut single_q_sched = EnvSchedule::new().with_callee_return_size("ext_once", 4);
+    single_q_sched.push_callee_response("ext_once", 9u32.to_le_bytes().to_vec());
+
+    let trials = vec![
+        // Trial 0: `vpa = 5, idx = 0` -> `Step(4)` becomes `Step(4 + (9 + 5)) = Step(18)` -> HOLD!
+        (make_trial(5, 0), Some(single_q_sched.clone())),
+        // Trial 1: `vpa = 60` fails `requires` (`60 + 1 <= 50` false) -> FILTERED!
+        (make_trial(60, 0), Some(single_q_sched.clone())),
+        // Trial 2: `idx = 99` triggers OOB index in `let ref mut picked_elem = arr[idx];` -> TRAP!
+        (make_trial(5, 99), Some(single_q_sched.clone())),
+        // Trial 3: `vpa = 9` fails `direct_mut_params_preserved` (`vp.a != 9u32`) -> VIOLATION!
+        (make_trial(9, 1), Some(single_q_sched)),
+    ];
+
+    let report = probe
+        .verify_spec_postcondition_batch(&trials)
+        .expect("verify ep2-A4 parity batch");
+    assert_eq!(report.verdicts[0], SpecPostconditionVerdict::VerifiedHold);
+    assert!(matches!(
+        &report.verdicts[1],
+        SpecPostconditionVerdict::VacuouslyFiltered { .. }
+    ));
+    assert!(matches!(
+        &report.verdicts[2],
+        SpecPostconditionVerdict::PanicOrTrap {
+            phase: SpecExecPhase::Body,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &report.verdicts[3],
+        SpecPostconditionVerdict::PostconditionViolation {
+            kind: SpecViolationKind::EnsuresClause { label, .. },
+            ..
+        } if label == "direct_mut_params_preserved"
+    ));
+
+    let exe_src = probe
+        .synthesize_rust_executable_harness_with_schedules(&trials)
+        .expect("synthesize ep2-A4 executable harness");
+    assert!(!contains_unsafe_token(&exe_src));
+    let native_lines = compile_and_run_spec_harness("ep2_a4_lockstep_parity", &exe_src);
+    assert_eq!(
+        native_lines,
+        vec![
+            "TRIAL:0:HOLD",
+            "TRIAL:1:FILTERED",
+            "TRIAL:2:TRAP",
+            "TRIAL:3:VIOLATION:direct_mut_params_preserved",
+        ]
     );
 }

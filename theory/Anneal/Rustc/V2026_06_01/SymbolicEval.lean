@@ -1996,6 +1996,19 @@ theorem lookupSwitchTargetCont_eq
       k (lookupSwitchTarget val branches otherwise) := by
   rw [lookupSwitchTargetCont, SymTree.run_eq_eval, lookupSwitchTargetTree_eval]
 
+/--
+`hasFrameDeallocProtectorConflict` is `false` when no function-entry protector
+is active, for every (possibly symbolic) `borrows` list. The definition is
+structurally recursive on `borrows`, so its leading `activeProtectors = .nil`
+case only reduces by WHNF once `borrows` is a constructor application; this
+lemma discharges the case split on `borrows`.
+-/
+theorem hasFrameDeallocProtectorConflict_nil_activeProtectors
+    (borrows : List BorrowEntry)
+    (depth nLocals : Nat) :
+    hasFrameDeallocProtectorConflict borrows .nil depth nLocals = false := by
+  cases borrows <;> rfl
+
 /-- Decision-tree symbolic `evalTerminator`. -/
 def evalTerminatorSymTree
     (s : MachineState)
@@ -4325,6 +4338,190 @@ theorem evalSymNodeTreeFrameModular_eq
     · exact ih1
 
 /--
+Frame-aware symbolic `evalTerminator` decision tree for the frame-restoring
+modular WPs (`wpMirExecFrameModularSym` and
+`wpMirExecFrameAndTraitsModularSym`): when
+`s.memory.activeProtectors = .nil`, `.return_` skips
+`hasFrameDeallocProtectorConflict` (which is `false` then, by
+`hasFrameDeallocProtectorConflict_nil_activeProtectors`), so a return whose
+borrow list is symbolic (such as the post-call
+`invalidateDirectDestWriteBorrows` borrows) reduces by WHNF instead of blocking
+on `List.rec` over `borrows`. Every other case is `evalTerminatorSymTree`, and
+`evalTerminatorFrameSymTree_eval_eq` ties the `.nil`-protector branch to the
+trusted `.return_` transition, so it cannot drift from `evalTerminator`.
+-/
+def evalTerminatorFrameSymTree
+    (s : MachineState)
+    (term : Terminator)
+    (currentBody : CapturedMir) : SymTree MirStepNode :=
+  match term.kind with
+  | .return_ =>
+    .leaf
+      (match s.memory.activeProtectors with
+       | .nil =>
+         match get? s.frame.locals 0 with
+         | .some (.init retVal) =>
+           let depth := length s.memory.callStack
+           let nLocals := length s.frame.locals
+           let borrows₁ := disableFrameBorrows s.memory.borrows depth nLocals
+           match s.memory.callStack with
+           | .nil =>
+             match valueContainsUninit retVal with
+             | true => MirStepNode.fail .ub
+             | false => MirStepNode.retNormal retVal { s.memory with borrows := borrows₁ }
+           | caller :: restStack =>
+             match caller.isDiverging with
+             | true => MirStepNode.fail .ub
+             | false =>
+               match valueContainsUninit retVal with
+               | true => MirStepNode.fail .ub
+               | false =>
+                 let restoredProtectors := restoreCallerProtectors caller
+                 let callerMem : Memory := {
+                   s.memory with
+                   borrows := borrows₁
+                   callStack := restStack
+                   activeCallee := .some caller.callerBody
+                   activeProtectors := restoredProtectors
+                 }
+                 match
+                   writeReturnDestination
+                     caller.frame.locals
+                     callerMem
+                     caller.destination
+                     retVal
+                     caller.callerBody.localDecls
+                     caller.callerBody.layouts
+                 with
+                 | .ok updatedCallerLocals mem' =>
+                   MirStepNode.step {
+                     frame := {
+                       caller.frame with
+                       blockIdx := caller.returnTarget
+                       stmtIdx := 0
+                       locals := updatedCallerLocals
+                     }
+                     memory := mem'
+                   }
+                 | .ub => MirStepNode.fail .ub
+                 | .unsupported => MirStepNode.unsupported
+         | _ => MirStepNode.fail .ub
+       | _ :: _ => evalTerminator s term (some currentBody))
+  | _ => evalTerminatorSymTree s term currentBody
+
+/--
+`evalTerminatorFrameSymTree` and `evalTerminatorSymTree` denote the same
+`MirStepNode`: the `.return_` shortcut is taken only when no protector is
+active, where `hasFrameDeallocProtectorConflict` is `false`.
+-/
+theorem evalTerminatorFrameSymTree_eval_eq
+    (s : MachineState)
+    (term : Terminator)
+    (currentBody : CapturedMir) :
+    (evalTerminatorFrameSymTree s term currentBody).eval =
+      (evalTerminatorSymTree s term currentBody).eval := by
+  rcases term with ⟨kind, span⟩
+  cases kind with
+  | return_ =>
+    dsimp only [evalTerminatorFrameSymTree, evalTerminatorSymTree, evalTerminator]
+    cases s.memory.activeProtectors with
+    | nil =>
+      cases get? s.frame.locals 0 with
+      | none => rfl
+      | some slot =>
+        cases slot with
+        | uninit => rfl
+        | dead => rfl
+        | init retVal =>
+          dsimp only []
+          rw [hasFrameDeallocProtectorConflict_nil_activeProtectors]
+          rfl
+    | cons _ _ => rfl
+  | _ => rfl
+
+/--
+One-step decision-tree symbolic MIR transition from `MachineState` for the
+frame-restoring modular WPs: `stepMirSymTree` with terminators evaluated by
+`evalTerminatorFrameSymTree`.
+-/
+def stepMirFrameSymTree
+    (body : CapturedMir)
+    (s : MachineState) : SymTree MirStepNode :=
+  let currentBody := s.memory.activeCallee.getD body
+  match currentBody.phase with
+  | .other _ => .leaf MirStepNode.unsupported
+  | _ =>
+    match get? currentBody.basicBlocks s.frame.blockIdx with
+    | none => .leaf (MirStepNode.fail .ub)
+    | some bb =>
+      match get? bb.statements s.frame.stmtIdx with
+      | some stmt =>
+        evalStmtSymTree s stmt currentBody.localDecls currentBody.layouts
+      | none =>
+        if s.frame.stmtIdx == length bb.statements then
+          evalTerminatorFrameSymTree s bb.terminator currentBody
+        else
+          .leaf (MirStepNode.fail .ub)
+
+/-- `stepMirFrameSymTree` and `stepMirSymTree` denote the same `MirStepNode`. -/
+theorem stepMirFrameSymTree_eval_eq
+    (body : CapturedMir)
+    (s : MachineState) :
+    (stepMirFrameSymTree body s).eval = (stepMirSymTree body s).eval := by
+  dsimp only [stepMirFrameSymTree, stepMirSymTree]
+  cases (s.memory.activeCallee.getD body).phase with
+  | other _ => rfl
+  | _ =>
+    all_goals
+      dsimp only
+      cases get? (s.memory.activeCallee.getD body).basicBlocks s.frame.blockIdx with
+      | none => rfl
+      | some bb =>
+        dsimp only
+        cases get? bb.statements s.frame.stmtIdx with
+        | some _ => rfl
+        | none =>
+          dsimp only
+          split
+          · exact evalTerminatorFrameSymTree_eval_eq s bb.terminator _
+          · rfl
+
+/--
+One-step decision-tree symbolic MIR transition from `MirExecState` for the
+frame-restoring modular WPs (`stepMirExecSymTree` over `stepMirFrameSymTree`).
+-/
+def stepMirExecFrameSymTree
+    (body : CapturedMir)
+    (st : MirExecState) : SymTree MirStepNode :=
+  match st with
+  | .running s => stepMirFrameSymTree body s
+  | .halted out => .leaf (.ret out)
+  | .faulted fk => .leaf (MirStepNode.fail fk)
+
+/--
+`stepMirExecFrameSymTree` and `stepMirExecSymTree` denote the same
+`MirStepNode`.
+-/
+theorem stepMirExecFrameSymTree_eval_eq
+    (body : CapturedMir)
+    (st : MirExecState) :
+    (stepMirExecFrameSymTree body st).eval = (stepMirExecSymTree body st).eval := by
+  cases st with
+  | running s => exact stepMirFrameSymTree_eval_eq body s
+  | halted _ => rfl
+  | faulted _ => rfl
+
+/--
+`stepMirExecFrameSymTree` denotes the trusted one-step transition
+`stepMirState`.
+-/
+theorem stepMirExecFrameSymTree_eval
+    (body : CapturedMir)
+    (st : MirExecState) :
+    (stepMirExecFrameSymTree body st).eval = stepMirState body st := by
+  rw [stepMirExecFrameSymTree_eval_eq, stepMirExecSymTree_eval]
+
+/--
 Single-pass fuel-bounded frame-restoring modular symbolic WP over `MirExecState`.
 -/
 def wpMirExecFrameModularSym
@@ -4337,7 +4534,7 @@ def wpMirExecFrameModularSym
     evalSymNodeTreeFrameModular contract
       (fun st' => wpMirExecFrameModularSym contract fuel' body st' post)
       post
-      (stepMirExecSymTree body st)
+      (stepMirExecFrameSymTree body st)
 
 /--
 Single-pass fuel-bounded frame-restoring modular symbolic WP over `MachineState`.
@@ -4367,7 +4564,7 @@ theorem wpMirExecModularSym_of_wpMirExecFrameModularSym
   | succ fuel' ih =>
     unfold wpMirExecFrameModularSym at h
     unfold wpMirExecModularSym
-    rw [evalSymNodeTreeFrameModular_eq] at h
+    rw [evalSymNodeTreeFrameModular_eq, stepMirExecFrameSymTree_eval_eq] at h
     rw [evalSymNodeTreeModular_eq]
     cases h_ev : (stepMirExecSymTree body st).eval with
     | ret out =>
@@ -4525,6 +4722,243 @@ theorem verifyExternalSpecMirSym
   verifyExternalSpecWithCalleesMirSym
     targetDefPath sidecarBody extraPre extraPost body .nil pre post fuel h_wp
 
+/--
+Every `MirCallContract` definitionally equal to an `externalSpecCallContract`
+guarantees `ans.framePreserved req.memory` on every call answer `ans` permitted
+by its postcondition.
+-/
+theorem externalSpecContract_framePreserved
+    {targetDefPath : DefPath}
+    {sidecarBody : CapturedMir}
+    {extraPre : List Value → Prop}
+    {extraPost : List Value → Value → Prop}
+    (contract : MirCallContract)
+    (h_eq :
+      contract =
+        externalSpecCallContract targetDefPath sidecarBody extraPre extraPost := by rfl) :
+    ∀ (req : MirCallReq) (ans : MirCallAns),
+      contract.post req ans → ans.framePreserved req.memory := by
+  subst h_eq
+  exact externalSpecCallContract_framePreserved targetDefPath sidecarBody extraPre extraPost
+
+/--
+Discharge a `ModularVerificationResult` with linked `callees` for a caller
+invoking an `#[external_spec]` contract `contract` (definitionally equal to
+`externalSpecCallContract targetDefPath sidecarBody extraPre extraPost`), using
+frame-restoring `wpMirFrameModularSym` so post-call `resumeExternalCall` and
+`evalTerminator` `.return_` transitions reduce by WHNF without manual
+frame-preservation rewrites. The rely is the single `contract.holdsOn`; for a
+caller of two `#[external_spec]` targets, use
+`verifyExternalSpecContractPairWithCalleesMirSym`.
+-/
+theorem verifyExternalSpecContractWithCalleesMirSym
+    {targetDefPath : DefPath}
+    {sidecarBody : CapturedMir}
+    {extraPre : List Value → Prop}
+    {extraPost : List Value → Value → Prop}
+    (contract : MirCallContract)
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (args : List Value) (mem : Memory),
+        pre args mem →
+        wpMirFrameModularSym contract fuel body
+          (initMachineStateWithMemoryAndCallees body args mem callees)
+          (fun out =>
+            ∀ retVal mem', out = .normal (retVal, mem') →
+              post args mem retVal mem'))
+    (h_eq :
+      contract =
+        externalSpecCallContract targetDefPath sidecarBody extraPre extraPost := by rfl) :
+    ModularVerificationResult
+      { body := body
+        envAssumed := contract.holdsOn
+        pre := pre
+        post := post
+        callees := callees } :=
+  verifyModularFrameContractWithCalleesMirSym
+    contract
+    (externalSpecContract_framePreserved contract h_eq)
+    body callees pre post fuel h_wp
+
+/--
+Discharge a `ModularVerificationResult` without extra `callees` for a caller
+invoking an `#[external_spec]` contract `contract` (definitionally equal to
+`externalSpecCallContract targetDefPath sidecarBody extraPre extraPost`), using
+frame-restoring `wpMirFrameModularSym`.
+-/
+theorem verifyExternalSpecContractMirSym
+    {targetDefPath : DefPath}
+    {sidecarBody : CapturedMir}
+    {extraPre : List Value → Prop}
+    {extraPost : List Value → Value → Prop}
+    (contract : MirCallContract)
+    (body : CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (args : List Value) (mem : Memory),
+        pre args mem →
+        wpMirFrameModularSym contract fuel body
+          (initMachineStateWithMemory body args mem)
+          (fun out =>
+            ∀ retVal mem', out = .normal (retVal, mem') →
+              post args mem retVal mem'))
+    (h_eq :
+      contract =
+        externalSpecCallContract targetDefPath sidecarBody extraPre extraPost := by rfl) :
+    ModularVerificationResult
+      { body := body
+        envAssumed := contract.holdsOn
+        pre := pre
+        post := post } :=
+  verifyExternalSpecContractWithCalleesMirSym
+    contract body .nil pre post fuel h_wp h_eq
+
+/--
+`ModularVerificationResult` is antitone in the rely `envAssumed`: a result
+proven under `env` also holds under every `env'` that implies `env`, because
+`ModularClaim.holds` uses `envAssumed` only as a hypothesis. This restates a
+result proven under one combined contract (such as `bothCallContracts`) against
+the conjunction of per-callee contracts that `cargo anneal` renders in
+`defaultModularSpec.envAssumed`.
+-/
+theorem modularVerificationResult_of_envAssumed_imp
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    {env env' : ExternalCallHandler → Prop}
+    (h_imp : ∀ h, env' h → env h)
+    (h_res :
+      ModularVerificationResult
+        { body := body
+          envAssumed := env
+          pre := pre
+          post := post
+          callees := callees }) :
+    ModularVerificationResult
+      { body := body
+        envAssumed := env'
+        pre := pre
+        post := post
+        callees := callees } :=
+  ⟨fun h h_env => h_res.proof h (h_imp h h_env)⟩
+
+/--
+Rely contract for a caller that assumes both `c₁` and `c₂`: a request is
+permitted when either contract permits it, and an answer to a permitted request
+satisfies the postcondition of every contract that permits the request. A
+handler that implements both contracts implements this one
+(`bothCallContracts_holdsOn`).
+
+The postcondition repeats the disjunction of preconditions so that frame
+preservation transfers from `c₁` and `c₂` (`bothCallContracts_framePreserved`):
+without it, an answer to a request that neither contract permits would satisfy
+the postcondition vacuously and constrain nothing.
+-/
+def bothCallContracts (c₁ c₂ : MirCallContract) : MirCallContract where
+  pre req := c₁.pre req ∨ c₂.pre req
+  post req ans :=
+    (c₁.pre req ∨ c₂.pre req) ∧
+      (c₁.pre req → c₁.post req ans) ∧
+      (c₂.pre req → c₂.post req ans)
+
+/--
+A handler that implements both `c₁` and `c₂` implements
+`bothCallContracts c₁ c₂`.
+-/
+theorem bothCallContracts_holdsOn
+    {c₁ c₂ : MirCallContract} {h : ExternalCallHandler}
+    (h₁ : c₁.holdsOn h) (h₂ : c₂.holdsOn h) :
+    (bothCallContracts c₁ c₂).holdsOn h := by
+  intro req h_pre
+  refine ⟨?_, fun tr ans h_ret =>
+    ⟨h_pre,
+     fun hp₁ => (h₁ req hp₁).2 tr ans h_ret,
+     fun hp₂ => (h₂ req hp₂).2 tr ans h_ret⟩⟩
+  rcases h_pre with hp₁ | hp₂
+  · exact (h₁ req hp₁).1
+  · exact (h₂ req hp₂).1
+
+/--
+`bothCallContracts c₁ c₂` guarantees `ans.framePreserved req.memory` on every
+answer that its postcondition permits when `c₁` and `c₂` both do.
+-/
+theorem bothCallContracts_framePreserved
+    {c₁ c₂ : MirCallContract}
+    (hf₁ :
+      ∀ (req : MirCallReq) (ans : MirCallAns),
+        c₁.post req ans → ans.framePreserved req.memory)
+    (hf₂ :
+      ∀ (req : MirCallReq) (ans : MirCallAns),
+        c₂.post req ans → ans.framePreserved req.memory) :
+    ∀ (req : MirCallReq) (ans : MirCallAns),
+      (bothCallContracts c₁ c₂).post req ans → ans.framePreserved req.memory := by
+  rintro req ans ⟨hp₁ | hp₂, hi₁, hi₂⟩
+  · exact hf₁ req ans (hi₁ hp₁)
+  · exact hf₂ req ans (hi₂ hp₂)
+
+/--
+Discharge a `ModularVerificationResult` with linked `callees` for a caller
+invoking two `#[external_spec]` contracts `c₁` and `c₂` (each definitionally
+equal to an `externalSpecCallContract`) under the rely
+`fun h => c₁.holdsOn h ∧ c₂.holdsOn h`, which is the
+`defaultModularSpec.envAssumed` that `cargo anneal` renders for a caller with
+two abstracted callees.
+
+Symbolic evaluation runs frame-restoring `wpMirFrameModularSym` under
+`bothCallContracts c₁ c₂`. Each call site proves the precondition of its own
+contract (`Or.inl` or `Or.inr`) and obtains that contract's postcondition by
+applying the matching implication to the same precondition proof. For three or
+more contracts, nest `bothCallContracts` in
+`verifyModularFrameContractWithCalleesMirSym` and restate the result with
+`modularVerificationResult_of_envAssumed_imp`.
+-/
+theorem verifyExternalSpecContractPairWithCalleesMirSym
+    {targetDefPath₁ targetDefPath₂ : DefPath}
+    {sidecarBody₁ sidecarBody₂ : CapturedMir}
+    {extraPre₁ extraPre₂ : List Value → Prop}
+    {extraPost₁ extraPost₂ : List Value → Value → Prop}
+    (c₁ c₂ : MirCallContract)
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (args : List Value) (mem : Memory),
+        pre args mem →
+        wpMirFrameModularSym (bothCallContracts c₁ c₂) fuel body
+          (initMachineStateWithMemoryAndCallees body args mem callees)
+          (fun out =>
+            ∀ retVal mem', out = .normal (retVal, mem') →
+              post args mem retVal mem'))
+    (h_eq₁ :
+      c₁ =
+        externalSpecCallContract targetDefPath₁ sidecarBody₁ extraPre₁ extraPost₁ := by rfl)
+    (h_eq₂ :
+      c₂ =
+        externalSpecCallContract targetDefPath₂ sidecarBody₂ extraPre₂ extraPost₂ := by rfl) :
+    ModularVerificationResult
+      { body := body
+        envAssumed := fun h => c₁.holdsOn h ∧ c₂.holdsOn h
+        pre := pre
+        post := post
+        callees := callees } :=
+  modularVerificationResult_of_envAssumed_imp
+    (fun _ h_env => bothCallContracts_holdsOn h_env.1 h_env.2)
+    (verifyModularFrameContractWithCalleesMirSym
+      (bothCallContracts c₁ c₂)
+      (bothCallContracts_framePreserved
+        (externalSpecContract_framePreserved c₁ h_eq₁)
+        (externalSpecContract_framePreserved c₂ h_eq₂))
+      body callees pre post fuel h_wp)
+
 theorem restoreCallerMemoryFrame_eq_of_callFrameAndTraitsPreserved
     {before after : Memory}
     (h : callFrameAndTraitsPreserved before after) :
@@ -4672,7 +5106,7 @@ def wpMirExecFrameAndTraitsModularSym
     evalSymNodeTreeFrameAndTraitsModular contract
       (fun st' => wpMirExecFrameAndTraitsModularSym contract fuel' body st' post)
       post
-      (stepMirExecSymTree body st)
+      (stepMirExecFrameSymTree body st)
 
 /--
 Single-pass fuel-bounded frame-and-`traitImpls`-restoring modular symbolic WP
@@ -4703,7 +5137,7 @@ theorem wpMirExecModularSym_of_wpMirExecFrameAndTraitsModularSym
   | succ fuel' ih =>
     unfold wpMirExecFrameAndTraitsModularSym at h
     unfold wpMirExecModularSym
-    rw [evalSymNodeTreeFrameAndTraitsModular_eq] at h
+    rw [evalSymNodeTreeFrameAndTraitsModular_eq, stepMirExecFrameSymTree_eval_eq] at h
     rw [evalSymNodeTreeModular_eq]
     cases h_ev : (stepMirExecSymTree body st).eval with
     | ret out =>
@@ -6751,7 +7185,7 @@ theorem wpMirExecFrameModularSym_of_reachesModularSafePanicExecBounded
   | zero => nomatch h_check MirCallAnswerStream.unitEmpty (fun _ => rfl)
   | succ fuel ih =>
     unfold wpMirExecFrameModularSym
-    rw [evalSymNodeTreeFrameModular_eq, stepMirExecSymTree_eval]
+    rw [evalSymNodeTreeFrameModular_eq, stepMirExecFrameSymTree_eval]
     cases h_step : stepMirState body st with
     | ret out =>
       cases out with

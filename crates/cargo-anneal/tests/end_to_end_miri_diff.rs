@@ -134,7 +134,7 @@ fn miri_diff_manifest_validation_rejects_stale_bugs_and_bad_paths() {
         manifest.rustc_commit,
         "14210df0e27ccd7d9e6a05b8085cbd438e4bbc65"
     );
-    assert_eq!(manifest.tests.len(), 108);
+    assert_eq!(manifest.tests.len(), 112);
 
     // Every `known_anneal_bug` must have status == "open_bug" and diverge from
     // `miri_verdict` (either by tag or by `ub_location_mismatch`); none remain
@@ -429,17 +429,18 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
         rustc_wrapper: Some(wrapper_bin.clone()),
     };
 
-    let report = run_miri_diff_suite(&config).expect("108-test Miri differential suite must pass");
-    assert_eq!(report.total_tests, 108);
-    assert_eq!(report.verified_pass_count, 50);
+    let report = run_miri_diff_suite(&config).expect("112-test Miri differential suite must pass");
+    assert_eq!(report.total_tests, 112);
+    assert_eq!(report.verified_pass_count, 52);
     assert_eq!(report.verified_panic_count, 12);
-    assert_eq!(report.verified_strict_ub_count, 46);
+    assert_eq!(report.verified_strict_ub_count, 48);
     assert_eq!(report.ratcheted_known_bug_count, 0);
-    // 50 pass + 12 panic + 2 helper subjects (`helper_add_ten` and the empty
-    // `Drop::drop` of Category 9's `UnwindCleanupGuard`) = 64 certificate
-    // modules. Category 9's call-chain helpers are `__ANNEAL_MODEL_*` model
-    // items: linked as callees, never certified on their own.
-    assert_eq!(report.audited_certificate_modules.len(), 64);
+    // 52 pass + 12 panic + 2 helper subjects (`helper_add_ten` and the empty
+    // `Drop::drop` of Category 9's `UnwindCleanupGuard`) = 66 certificate
+    // modules. Category 9's call-chain helpers and Category 11's probes and
+    // `static`s are `__ANNEAL_MODEL_*` model items: never certified on their
+    // own.
+    assert_eq!(report.audited_certificate_modules.len(), 66);
     for helper in [
         "Verify.MiriDiffCorpus.helper_add_ten",
         "Verify.MiriDiffCorpus.UnwindCleanupGuard_as_core_ops_Drop_drop",
@@ -452,12 +453,21 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
     }
     assert!(
         !report.audited_certificate_modules.iter().any(|m| {
-            ["helper_reborrow", "helper_shared", "helper_frozen", "helper_unwind"]
-                .iter()
-                .any(|h| m.contains(h))
+            [
+                "helper_reborrow",
+                "helper_shared",
+                "helper_frozen",
+                "helper_unwind",
+                "same_tag_disjoint",
+                "pass_static_",
+                "ub_static_",
+                "STATIC_",
+            ]
+            .iter()
+            .any(|h| m.contains(h))
         }),
-        "model-marked call-chain helpers are linked as callees, never certified on \
-         their own: {:?}",
+        "model-marked helpers, probes, and statics are never certified on their own: \
+         {:?}",
         report.audited_certificate_modules
     );
     for module in [
@@ -468,6 +478,7 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
         "Verify.MiriDiffCorpus.panic_multi_callee_unwind_chain",
         "Verify.MiriDiffCorpus.pass_fn_entry_returns_reborrowed_child",
         "Verify.MiriDiffCorpus.panic_multi_callee_unwind_cleanup_guard",
+        "Verify.MiriDiffCorpus.pass_shared_temp_const_raw_ptr_read_and_freeze_retag",
     ] {
         assert!(
             report.audited_certificate_modules.iter().any(|m| m == module),
@@ -482,7 +493,7 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
     );
 
     let summary = render_miri_diff_report(&report);
-    assert!(summary.contains("Total corpus tests:              108"));
+    assert!(summary.contains("Total corpus tests:              112"));
     assert!(summary.contains("Verified `panic` (SafePanic):    12"));
     assert!(summary.contains("of which modular (frame rely): 1"));
     assert!(summary.contains("Open Anneal bugs (ratcheted):    0"));
@@ -567,17 +578,54 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
         "`helper_unwind_mid` must use `UnwindAction.continue_`:\n{unguarded_mir}"
     );
 
-    // Category 9's `copy_nonoverlapping` seeds lower to the inline MIR statement
+    // The Category 9 and Category 10 `copy_nonoverlapping` seeds lower to the
+    // inline MIR statement
     // `StatementKind.intrinsic (NonDivergingIntrinsic.copyNonOverlapping ...)`.
     for name in [
         "pass_intrinsics_write_bytes_copy_and_arith_offset",
         "ub_copy_nonoverlapping_partial_overlap_array",
+        "pass_copy_nonoverlapping_multi_elem_array_pair",
     ] {
         let mir = captured_mir(name);
         assert!(
             mir.contains("NonDivergingIntrinsic.copyNonOverlapping"),
             "`{name}` must lower to `NonDivergingIntrinsic.copyNonOverlapping`:\n{mir}"
         );
+    }
+
+    // Category 11's same-tag disjoint `copy_nonoverlapping` probes must mint
+    // exactly one raw borrow (`Rvalue.rawPtr` == 1, `Rvalue.ref` == 0), derive
+    // `dst` via `BinOp.offset`, and execute `NonDivergingIntrinsic.copyNonOverlapping`,
+    // mechanically guaranteeing `srcPtr.tag == dstPtr.tag`. Moreover, the `[u8; 8]`
+    // probe's single `Rvalue.rawPtr` must have `projection := List.nil` so it
+    // enters `Statements.lean`'s `sameContainer` array-slice branch directly.
+    for (name, expect_whole_local_raw_ptr) in [
+        ("pass_copy_nonoverlapping_same_tag_disjoint_array_halves", false),
+        ("pass_copy_nonoverlapping_same_tag_disjoint_u8_array_halves", true),
+        ("pass_copy_nonoverlapping_same_tag_disjoint_struct_fields", false),
+    ] {
+        let mir = captured_mir(name);
+        assert_eq!(
+            mir.matches("Rvalue.rawPtr ").count(),
+            1,
+            "`{name}` must mint exactly one `Rvalue.rawPtr` tag:\n{mir}"
+        );
+        assert_eq!(
+            mir.matches("Rvalue.ref ").count(),
+            0,
+            "`{name}` must not mint any `Rvalue.ref` tag:\n{mir}"
+        );
+        assert!(
+            mir.contains("BinOp.offset")
+                && mir.contains("NonDivergingIntrinsic.copyNonOverlapping"),
+            "`{name}` must lower `offset` + `copy_nonoverlapping` inline:\n{mir}"
+        );
+        if expect_whole_local_raw_ptr {
+            assert!(
+                mir.contains("Rvalue.rawPtr Mutability.mut { local_ := 1, projection := List.nil }"),
+                "`{name}` must take `&raw mut arr` with `projection := List.nil`:\n{mir}"
+            );
+        }
     }
 
     // Category 9's multi-callee `Verify` modules link their transitive helper

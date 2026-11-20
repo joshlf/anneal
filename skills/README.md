@@ -30,8 +30,6 @@ their historical import identifiers. Preserve local changes when updating.
 | [`anneal-prove`](anneal-prove/SKILL.md) | Repository-owned | Interactive and symbolic Lean 4 proof construction (`wpMirSym`, `runCfgSteps`, `SymReflect`, and kernel proof-scaling patterns) |
 | [`anneal-lsp`](anneal-lsp/SKILL.md) | Repository-owned | Warm `lake serve` LSP MCP workflow (`lean_goal`, `lean_multi_attempt`, `anneal_audit_preview`) and two-regime threshold heuristic |
 | [`anneal-doc-audit`](anneal-doc-audit/SKILL.md) | Repository-owned | CLI command, tutorial directive, and report output verification across `docs/` and `examples/` |
-| [`adversarial-rounds`](adversarial-rounds/SKILL.md) | Repository-owned | $N$-round adversarial implementation, critique, and repair between two randomly assigned frontier models (`Model X` and `Model Y`) over shared git worktree(s) |
-| [`hierarchical-supervision`](hierarchical-supervision/SKILL.md) | Repository-owned | Quota- and hardware-aware multi-tier supervisor + leaf orchestration (`<SUPERVISOR_MODEL>`, `P0`/`P1`/`P2` reserve floors, handoff-only model switching, and `anneal-lean-run` resource bounds) |
 | [`authorship-disclosure`](authorship-disclosure/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | `authorship_disclosure/` at `b563468a8148df117283494915cee5b6561cc47f`  ([matching public bytes](https://github.com/joshlf/skills/tree/6a63da89d7240b1083e56991ab3718fbe7862ae7/authorship_disclosure)) |
 | [`comment-guidelines`](comment-guidelines/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | `comment_guidelines/` at `b563468a8148df117283494915cee5b6561cc47f` |
 | [`commit-message`](commit-message/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | `commit-message/` at `b563468a8148df117283494915cee5b6561cc47f` |
@@ -42,10 +40,10 @@ their historical import identifiers. Preserve local changes when updating.
 | [`swarm-model-refinement`](swarm-model-refinement/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | `swarm-model-refinement/` at `3bf3f345b2916f8417306ba197f779b0b4429c1d` |
 | [`tech-lead`](tech-lead/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | `tech-lead/` at `3bf3f345b2916f8417306ba197f779b0b4429c1d` |
 | [`williams-style`](williams-style/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | `williams-style/` at `b563468a8148df117283494915cee5b6561cc47f` |
-| [`change-review`](change-review/SKILL.md) | Repository-owned | Complete-change local preflight and hosted review; [maintainer contract](../docs/review-policy-design.md) |
+| [`change-review`](change-review/SKILL.md) | Repository-owned | Local and hosted review workflow, risk sizing, pipelining, and receipts ([maintainer contract](../docs/review-policy-design.md)) |
 | [`architectural-design`](architectural-design/SKILL.md) | Repository-owned | End-to-end architectural design workflow for `joshlf/anneal` |
-| [`source-control`](source-control/SKILL.md) | Repository-owned | Adapted from [`google/zerocopy`'s Contributing Guide](https://github.com/google/zerocopy/discussions/1318) |
-| [`trust-review`](trust-review/SKILL.md) | Repository-owned | Derived from [`PRINCIPLES.md`](../PRINCIPLES.md) and [`docs/trust-model.md`](../docs/trust-model.md) |
+| [`source-control`](source-control/SKILL.md) | Repository-owned | Adapted from [`google/zerocopy`'s Contributing Guide](https://github.com/google/zerocopy/discussions/1318); commits, worker quarantine, publication, and stacks |
+| [`trust-review`](trust-review/SKILL.md) | Repository-owned | Derived from [`META_PRINCIPLES.md`](../META_PRINCIPLES.md), [`PRINCIPLES.md`](../PRINCIPLES.md), [`THREAT_MODEL.md`](../THREAT_MODEL.md), and [`docs/trust-model.md`](../docs/trust-model.md) |
 
 ## Local modifications
 
@@ -76,7 +74,6 @@ release. The following packages carry additional intentional local changes:
 Except for documented local modifications, keep vendored `joshlf/skills`
 packages unmodified so they can be updated cleanly from upstream; place
 Anneal-specific conventions in repository-owned files (`AGENTS.md`,
-`skills/adversarial-rounds/`, `skills/hierarchical-supervision/`,
 `skills/anneal-prove/`, `skills/anneal-lsp/`, `skills/anneal-doc-audit/`,
 `skills/architectural-design/`, `skills/change-review/`,
 `skills/source-control/`, and `skills/trust-review/`).

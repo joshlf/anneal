@@ -1019,7 +1019,7 @@ where
 }
 
 /// Upper bound (`1 year` in seconds) for `ANNEAL_MIRI_SETUP_TIMEOUT_SECS` and
-/// `ANNEAL_MIRI_SETUP_LOCK_TIMEOUT_SECS`, matching `run_capsule_diff_test.sh`
+/// `ANNEAL_MIRI_SETUP_LOCK_TIMEOUT_SECS`, bounding lock wait duration
 /// and preventing `Instant` / `flock -w` overflow on pathological inputs.
 const MAX_MIRI_SETUP_TIMEOUT_SECS: u64 = 31_536_000;
 
@@ -1090,25 +1090,7 @@ fn run_miri_setup(
     timeout: Duration,
 ) -> Result<(), String> {
     let setup = resolve_miri_setup_cargo(get_env)?;
-    let mut cmd = Command::new(&setup.cargo_bin);
-    if setup.pass_toolchain_arg {
-        cmd.arg(MIRI_SETUP_TOOLCHAIN_ARG);
-    }
-    cmd.args(["miri", "setup"]);
-    cmd.env("MIRI_SYSROOT", candidate);
-    if let Some(toolchain) = &setup.rustup_toolchain {
-        cmd.env("RUSTUP_TOOLCHAIN", toolchain);
-    }
-    if let Some(bin_dir) = &setup.prepend_path_dir {
-        let current_path = get_env("ANNEAL_CALLER_PATH")
-            .or_else(|| get_env("PATH"))
-            .unwrap_or_default();
-        let mut paths = vec![bin_dir.clone()];
-        paths.extend(env::split_paths(&current_path));
-        if let Ok(joined) = env::join_paths(paths) {
-            cmd.env("PATH", joined);
-        }
-    }
+    let cmd = build_miri_setup_command(&setup, candidate, get_env);
 
     let outcome = run_with_timeout(cmd, timeout).map_err(|err| {
         format!(
@@ -1139,6 +1121,46 @@ fn run_miri_setup(
             String::from_utf8_lossy(&stderr).trim()
         )),
     }
+}
+
+/// Builds the `cargo miri setup` command that provisions the Miri sysroot at
+/// `candidate`.
+///
+/// The sysroot belongs to the Miri reference toolchain, so the command drops an
+/// ambient `anneal-rustc-capture` configuration: `ANNEAL_CAPTURE_DIR` and
+/// `ANNEAL_CAPTURE_FILTER`, and the `RUSTC_WRAPPER` and
+/// `RUSTC_WORKSPACE_WRAPPER` variables through which Cargo would run a wrapper
+/// on the sysroot build's own crates (recording their units into an unrelated
+/// capture directory).
+fn build_miri_setup_command(
+    setup: &MiriSetupCommand,
+    candidate: &Path,
+    get_env: EnvLookup<'_>,
+) -> Command {
+    let mut cmd = Command::new(&setup.cargo_bin);
+    if setup.pass_toolchain_arg {
+        cmd.arg(MIRI_SETUP_TOOLCHAIN_ARG);
+    }
+    cmd.args(["miri", "setup"]);
+    cmd.env("MIRI_SYSROOT", candidate)
+        .env_remove(ANNEAL_CAPTURE_DIR_ENV)
+        .env_remove(ANNEAL_CAPTURE_FILTER_ENV)
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER");
+    if let Some(toolchain) = &setup.rustup_toolchain {
+        cmd.env("RUSTUP_TOOLCHAIN", toolchain);
+    }
+    if let Some(bin_dir) = &setup.prepend_path_dir {
+        let current_path = get_env("ANNEAL_CALLER_PATH")
+            .or_else(|| get_env("PATH"))
+            .unwrap_or_default();
+        let mut paths = vec![bin_dir.clone()];
+        paths.extend(env::split_paths(&current_path));
+        if let Ok(joined) = env::join_paths(paths) {
+            cmd.env("PATH", joined);
+        }
+    }
+    cmd
 }
 
 /// Result of [`run_with_timeout`].
@@ -1666,19 +1688,8 @@ pub fn run_miri_oracle(
         )
     })?;
 
-    let mut compile_cmd = Command::new(&config.toolchain.rustc_bin);
-    compile_cmd
-        .current_dir(&corpus_root)
-        .arg("--sysroot")
-        .arg(&config.toolchain.miri_sysroot)
-        .arg("--edition=2024")
-        .arg("--crate-type=lib")
-        .arg(format!("--crate-name={crate_name}"))
-        .arg("-Zalways-encode-mir");
-    for flag in expand_flag_tokens(&config.capture_rustflags) {
-        compile_cmd.arg(flag);
-    }
-    compile_cmd.arg("src/lib.rs").arg("-o").arg(&rlib_path);
+    let mut compile_cmd =
+        build_miri_rlib_compile_command(config, &corpus_root, &crate_name, &rlib_path);
 
     let compile_out = compile_cmd.output().map_err(|err| {
         let _ = fs::remove_dir_all(&scratch_dir);
@@ -1699,21 +1710,14 @@ pub fn run_miri_oracle(
 
     let mut outcomes = BTreeMap::new();
     for item in items {
-        let mut miri_cmd = Command::new(&config.toolchain.miri_bin);
-        miri_cmd
-            .current_dir(&corpus_root)
-            .arg("--sysroot")
-            .arg(&config.toolchain.miri_sysroot);
-        for flag in &config.miri_flags {
-            miri_cmd.arg(flag);
-        }
-        miri_cmd
-            .arg("-Zmiri-disable-isolation")
-            .arg("--edition=2024")
-            .arg(&driver_rs_path)
-            .arg("--extern")
-            .arg(format!("{crate_name}={}", rlib_path.display()))
-            .env("MIRI_ORACLE_ITEM", &item.name);
+        let mut miri_cmd = build_miri_item_command(
+            config,
+            &corpus_root,
+            &crate_name,
+            &driver_rs_path,
+            &rlib_path,
+            &item.name,
+        );
 
         let outcome = match miri_cmd.output() {
             Ok(output) => {
@@ -1738,6 +1742,77 @@ pub fn run_miri_oracle(
 
     let _ = fs::remove_dir_all(&scratch_dir);
     Ok(outcomes)
+}
+
+fn build_miri_rlib_compile_command(
+    config: &MiriOracleConfig,
+    corpus_root: &Path,
+    crate_name: &str,
+    rlib_path: &Path,
+) -> Command {
+    let mut compile_cmd = Command::new(&config.toolchain.rustc_bin);
+    compile_cmd
+        .current_dir(corpus_root)
+        .env_remove(ANNEAL_CAPTURE_DIR_ENV)
+        .env_remove(ANNEAL_CAPTURE_FILTER_ENV)
+        .arg("--sysroot")
+        .arg(&config.toolchain.miri_sysroot)
+        .arg("--edition=2024")
+        .arg("--crate-type=lib")
+        .arg(format!("--crate-name={crate_name}"))
+        .arg("-Zalways-encode-mir");
+    for flag in expand_flag_tokens(&config.capture_rustflags) {
+        compile_cmd.arg(flag);
+    }
+    compile_cmd.arg("src/lib.rs").arg("-o").arg(rlib_path);
+    compile_cmd
+}
+
+fn build_miri_item_command(
+    config: &MiriOracleConfig,
+    corpus_root: &Path,
+    crate_name: &str,
+    driver_rs_path: &Path,
+    rlib_path: &Path,
+    item_name: &str,
+) -> Command {
+    let mut miri_cmd = Command::new(&config.toolchain.miri_bin);
+    miri_cmd
+        .current_dir(corpus_root)
+        .env_remove(ANNEAL_CAPTURE_DIR_ENV)
+        .env_remove(ANNEAL_CAPTURE_FILTER_ENV)
+        .arg("--sysroot")
+        .arg(&config.toolchain.miri_sysroot);
+    for flag in &config.miri_flags {
+        miri_cmd.arg(flag);
+    }
+    miri_cmd
+        .arg("-Zmiri-disable-isolation")
+        .arg("--edition=2024")
+        .arg(driver_rs_path)
+        .arg("--extern")
+        .arg(format!("{crate_name}={}", rlib_path.display()))
+        .env("MIRI_ORACLE_ITEM", item_name);
+    miri_cmd
+}
+
+fn build_anneal_oracle_capture_command(
+    cargo_bin: &str,
+    corpus_root: &Path,
+    wrapper: &Path,
+    units_dir: &Path,
+    rustflags: &str,
+) -> Command {
+    let mut cmd = Command::new(cargo_bin);
+    cmd.current_dir(corpus_root)
+        .arg("check")
+        .arg("--lib")
+        .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
+        .env_remove("RUSTC_WRAPPER")
+        .env(ANNEAL_CAPTURE_DIR_ENV, units_dir)
+        .env("RUSTFLAGS", rustflags)
+        .env_remove(ANNEAL_CAPTURE_FILTER_ENV);
+    cmd
 }
 
 fn expand_flag_tokens(flags: &[String]) -> Vec<String> {
@@ -2070,19 +2145,19 @@ pub fn run_anneal_oracle(
     };
 
     let cargo_bin = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let mut cmd = Command::new(cargo_bin);
-    cmd.current_dir(&corpus_root);
-    cmd.arg("check").arg("--lib");
     let wrapper = resolve_rustc_wrapper(&driver_cfg);
     let rustflags = if config.capture_rustflags.is_empty() {
         DEFAULT_CAPTURE_RUSTFLAGS.join(" ")
     } else {
         config.capture_rustflags.join(" ")
     };
-    cmd.env("RUSTC_WORKSPACE_WRAPPER", wrapper);
-    cmd.env(ANNEAL_CAPTURE_DIR_ENV, &units_dir);
-    cmd.env("RUSTFLAGS", rustflags);
-    cmd.env_remove(ANNEAL_CAPTURE_FILTER_ENV);
+    let mut cmd = build_anneal_oracle_capture_command(
+        &cargo_bin,
+        &corpus_root,
+        &wrapper,
+        &units_dir,
+        &rustflags,
+    );
 
     let capture_out = cmd
         .output()
@@ -3480,5 +3555,105 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
             "process-environment mutation in cargo-anneal sources:\n{}",
             offenders.join("\n")
         );
+    }
+
+    #[test]
+    fn miri_oracle_commands_strip_anneal_capture_env_vars() {
+        let cfg = MiriOracleConfig {
+            corpus_root: PathBuf::from("/tmp/corpus"),
+            capture_rustflags: vec!["-Zmir-opt-level=0".to_string()],
+            miri_flags: vec!["-Zmiri-tree-borrows".to_string()],
+            toolchain: MiriToolchain {
+                rustc_bin: PathBuf::from("/usr/bin/rustc"),
+                miri_bin: PathBuf::from("/usr/bin/miri"),
+                miri_sysroot: PathBuf::from("/tmp/miri-sysroot"),
+            },
+        };
+        let compile_cmd = build_miri_rlib_compile_command(
+            &cfg,
+            Path::new("/tmp/corpus"),
+            "miri_diff_corpus",
+            Path::new("/tmp/scratch/libmiri_diff_corpus.rlib"),
+        );
+        let miri_cmd = build_miri_item_command(
+            &cfg,
+            Path::new("/tmp/corpus"),
+            "miri_diff_corpus",
+            Path::new("/tmp/scratch/miri_driver.rs"),
+            Path::new("/tmp/scratch/libmiri_diff_corpus.rlib"),
+            "cand_item",
+        );
+        for (label, cmd) in [("compile_cmd", &compile_cmd), ("miri_cmd", &miri_cmd)] {
+            let envs: BTreeMap<&OsStr, Option<&OsStr>> = cmd.get_envs().collect();
+            for removed in [ANNEAL_CAPTURE_DIR_ENV, ANNEAL_CAPTURE_FILTER_ENV] {
+                assert_eq!(
+                    envs.get(OsStr::new(removed)),
+                    Some(&None),
+                    "{label} must explicitly remove {removed}"
+                );
+            }
+        }
+
+        // `cargo miri setup` builds the Miri sysroot through Cargo, so it also
+        // drops the rustc wrappers; the setup-specific variables stay set.
+        let setup = MiriSetupCommand {
+            cargo_bin: PathBuf::from("/usr/bin/cargo"),
+            pass_toolchain_arg: false,
+            prepend_path_dir: Some(PathBuf::from("/opt/toolchain/bin")),
+            rustup_toolchain: Some("nightly-2026-06-01".to_string()),
+        };
+        let get_env = env_map(&[("PATH", OsStr::new("/usr/bin"))]);
+        let setup_cmd = build_miri_setup_command(&setup, Path::new("/tmp/miri-sysroot"), &get_env);
+        let envs: BTreeMap<&OsStr, Option<&OsStr>> = setup_cmd.get_envs().collect();
+        for removed in [
+            ANNEAL_CAPTURE_DIR_ENV,
+            ANNEAL_CAPTURE_FILTER_ENV,
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+        ] {
+            assert_eq!(
+                envs.get(OsStr::new(removed)),
+                Some(&None),
+                "setup_cmd must explicitly remove {removed}"
+            );
+        }
+        for (key, value) in [
+            ("MIRI_SYSROOT", "/tmp/miri-sysroot"),
+            ("RUSTUP_TOOLCHAIN", "nightly-2026-06-01"),
+            ("PATH", "/opt/toolchain/bin:/usr/bin"),
+        ] {
+            assert_eq!(
+                envs.get(OsStr::new(key)),
+                Some(&Some(OsStr::new(value))),
+                "setup_cmd must set {key}"
+            );
+        }
+
+        let capture_cmd = build_anneal_oracle_capture_command(
+            "/usr/bin/cargo",
+            Path::new("/tmp/corpus"),
+            Path::new("/opt/bin/anneal-rustc-capture"),
+            Path::new("/tmp/corpus/.anneal/capture/units"),
+            "-Zmir-opt-level=0",
+        );
+        let capture_envs: BTreeMap<&OsStr, Option<&OsStr>> = capture_cmd.get_envs().collect();
+        for removed in ["RUSTC_WRAPPER", ANNEAL_CAPTURE_FILTER_ENV] {
+            assert_eq!(
+                capture_envs.get(OsStr::new(removed)),
+                Some(&None),
+                "capture_cmd must explicitly remove {removed}"
+            );
+        }
+        for (key, value) in [
+            ("RUSTC_WORKSPACE_WRAPPER", "/opt/bin/anneal-rustc-capture"),
+            (ANNEAL_CAPTURE_DIR_ENV, "/tmp/corpus/.anneal/capture/units"),
+            ("RUSTFLAGS", "-Zmir-opt-level=0"),
+        ] {
+            assert_eq!(
+                capture_envs.get(OsStr::new(key)),
+                Some(&Some(OsStr::new(value))),
+                "capture_cmd must set {key}"
+            );
+        }
     }
 }
