@@ -466,6 +466,9 @@ private theorem collectChunks_single (iter next : InitChunkIter) (chunk : InitCh
   unfold InitMask.collectChunks
   have hfuel : iter.finish.bytes.toNat - iter.start.bytes.toNat + 1 =
       (iter.finish.bytes.toNat - iter.start.bytes.toNat - 1) + 1 + 1 := by omega
+  -- The fuel is stated with `lean-miri`'s private `sizeBytes`, which we cannot name; `erw` under
+  -- `with_unfolding_all` matches it up to unfolding. The same applies to the private
+  -- `collectChunksAux` worker, which `refine` exposes as the public `WellFounded.Nat.fix`.
   with_unfolding_all erw [hfuel]
   with_unfolding_all refine (WellFounded.Nat.fix_eq (α := (_ : InitChunkIter) ×' Nat)
     (motive := fun _ => Except InitMaskError (Array InitChunk)) _ _ ⟨iter, _⟩).trans ?_
@@ -747,6 +750,8 @@ private theorem set_range_words_bit_gen (words : Array UInt64) (bA rA bB rB : Na
             have h_out : ¬(bA * 64 + rA ≤ k * 64 + bit ∧ k * 64 + bit < bB * 64 + rB) := by omega
             rw [if_neg_eq h_out]
 
+/-- On a well-formed mask, `get` succeeds at every in-bounds byte index, for both the `.Lazy`
+and the `.Materialized` representation. -/
 theorem get_ok_of_wellFormed (mask : InitMask) (idx : Size)
     (valid : WellFormed mask) (inBounds : idx.bytes.toNat < mask.len.bytes.toNat) :
     ∃ b, mask.get idx = .ok b := by
@@ -768,6 +773,11 @@ theorem get_ok_of_wellFormed (mask : InitMask) (idx : Size)
       rw [Array.getElem?_eq_getElem h_ib]
       rfl
 
+/-- Pointwise characterization of `setRange`: after a successful nonempty in-bounds
+`mask.setRange range state = .ok updated`, every in-bounds byte in `[range.start, finish)` reads
+`state` and every other in-bounds byte reads its old value. Covers `.Lazy` and `.Materialized`
+masks, including the `.Lazy` → `.Materialized` transition and ranges crossing 64-bit word
+boundaries. -/
 theorem set_range_get (mask updated : InitMask) (range : AllocRange) (finish idx : Size)
     (state : Bool)
     (valid : WellFormed mask) (endpoint : range.endExclusive = .ok finish)
@@ -1319,6 +1329,9 @@ private theorem fromEndpoints_ok_of_le (a b : Size) (h : a.bytes.toNat ≤ b.byt
     simp [h_not_lt, Bind.bind, Except.bind, Except.mapError, Pure.pure, Except.pure]
   · simp [Size.ofBytes, UInt64.toNat_sub_of_le _ _ h_le]
 
+/-- For a nonempty in-bounds range of a well-formed mask, `isRangeInitialized` returns `.ok (.ok
+())` exactly when every byte of the range is initialized, and returns some uninitialized
+sub-range `.ok (.error bad)` whenever a byte of the range is uninitialized. -/
 theorem isRangeInitialized_nonempty_iff (mask : InitMask) (range : AllocRange) (finish : Size)
     (valid : WellFormed mask) (endpoint : range.endExclusive = .ok finish)
     (nonempty : range.start.bytes.toNat < finish.bytes.toNat)
@@ -1398,6 +1411,8 @@ theorem isRangeInitialized_nonempty_iff (mask : InitMask) (range : AllocRange) (
         · intro _
           exact ⟨bad, rfl⟩
 
+/-- Marking a nonempty in-bounds range initialized makes `isRangeInitialized` succeed on that
+range. -/
 theorem isRangeInitialized_after_setRange_true (mask updated : InitMask)
     (range : AllocRange) (finish : Size)
     (valid : WellFormed mask) (endpoint : range.endExclusive = .ok finish)
@@ -1414,6 +1429,8 @@ theorem isRangeInitialized_after_setRange_true (mask updated : InitMask)
   rw [set_range_get mask u range finish idx true valid endpoint nonempty inBounds h_idx_ib h_u]
   rw [if_pos_eq ⟨h_lo, h_hi⟩]
 
+/-- Frame rule: a `setRange` on one nonempty in-bounds range does not change whether a disjoint
+nonempty in-bounds range is fully initialized. -/
 theorem isRangeInitialized_frame (mask updated : InitMask)
     (writeRange queryRange : AllocRange) (writeFinish queryFinish : Size) (state : Bool)
     (valid : WellFormed mask)
@@ -1475,6 +1492,9 @@ private theorem endExclusive_size_eq (range : AllocRange) (finish : Size)
       rw [UInt64.toNat_sub_of_le _ _ h_le]
       simp [Size.ofBytes, UInt64.toNat_add, Nat.mod_eq_of_lt h_fits]
 
+/-- If every byte of a nonempty in-bounds range of a well-formed mask has the same
+initialization `state`, `prepareCopy` returns the single-run encoding `⟨state,
+#[range.size.bytes]⟩`. -/
 theorem prepareCopy_of_uniform (mask : InitMask) (range : AllocRange) (finish : Size) (state : Bool)
     (valid : WellFormed mask)
     (endpoint : range.endExclusive = .ok finish)
@@ -1555,6 +1575,9 @@ theorem prepareCopy_of_uniform (mask : InitMask) (range : AllocRange) (finish : 
   simp [List.forIn_cons, List.forIn_nil, h_chunk_range, h_chunk_isInit,
     Bind.bind, Except.bind, Pure.pure, Except.pure]
 
+/-- Applying a single-run copy encoding `⟨state, #[srcSize.bytes]⟩` `repeatCount` times starting
+at `destStart` is `setRange` of the whole span `allocRange destStart total` to `state`, where
+`Size.mul srcSize repeatCount = .ok total`. -/
 theorem applyCopy_singleton (destMask : InitMask) (destStart srcSize total : Size)
     (repeatCount : UInt64) (state : Bool)
     (nonzero : srcSize.bytes ≠ 0)
@@ -1670,11 +1693,14 @@ private theorem empty_range (range : AllocRange) (pointerSize finish : Size)
   unfold rangePtrsR rangeBytesR adjustedStart rangeEnd rangeEntries
   simp [new, positive, endEq, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure, Except.mapError]
 
+/-- The empty provenance map has no provenance in any non-overflowing range (for a nonzero
+pointer size). -/
 theorem rangeEmpty_new (range : AllocRange) (pointerSize finish : Size)
     (positive : pointerSize.bytes ≠ 0) (endEq : range.endExclusive = .ok finish) :
     (new (Prov := P)).rangeEmpty range pointerSize = .ok true :=
   empty_range range pointerSize finish positive endEq
 
+/-- Reading a pointer from the empty provenance map yields no provenance. -/
 theorem readPtr_new [DecidableEq P] [PointerProvenance P]
     (offset pointerSize finish : Size)
     (positive : pointerSize.bytes ≠ 0)
@@ -1685,6 +1711,7 @@ theorem readPtr_new [DecidableEq P] [PointerProvenance P]
   unfold rangePtrsR rangeBytesR adjustedStart rangeEnd rangeEntries new
   simp [positive, endEq, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure, Except.mapError]
 
+/-- Preparing a provenance copy from the empty provenance map yields the empty copy. -/
 theorem prepareCopy_new (range : AllocRange) (data : Array UInt8) (pointerSize finish : Size)
     (positive : pointerSize.bytes ≠ 0)
     (endEq : range.endExclusive = .ok finish) :
@@ -1753,6 +1780,7 @@ theorem prepareCopy_new (range : AllocRange) (data : Array UInt8) (pointerSize f
   · simp only [ge_iff_le, h_ge, ↓reduceIte]
     rfl
 
+/-- Applying the empty provenance copy leaves any provenance map unchanged. -/
 theorem applyCopy_empty (range : AllocRange) (repeatCount : UInt64) (pm : ProvenanceMap P) :
     applyCopy ⟨#[], #[]⟩ range repeatCount pm = .ok () pm := by
   unfold applyCopy
@@ -2376,59 +2404,78 @@ private theorem splice_extract_disjoint (raw data : Array UInt8) (wStart wFin qS
     have h_rhs := Array.getElem?_eq_getElem hi2
     exact Option.some.inj (h_lhs.symm.trans (h_comb.trans h_rhs))
 
+/-- `withExtra` preserves `byteSize`. -/
 theorem byteSize_withExtra (allocation : Allocation P Unit) (extra : E) :
     (allocation.withExtra extra).byteSize = allocation.byteSize := rfl
 
+/-- `withExtra` preserves the byte-storage length. -/
 theorem len_withExtra (allocation : Allocation P Unit) (extra : E) :
     (allocation.withExtra extra).len = allocation.len := rfl
 
+/-- `withExtra` preserves the alignment. -/
 theorem align_withExtra (allocation : Allocation P Unit) (extra : E) :
     (allocation.withExtra extra).align = allocation.align := rfl
 
+/-- `withExtra` preserves the mutability. -/
 theorem mutability_withExtra (allocation : Allocation P Unit) (extra : E) :
     (allocation.withExtra extra).mutability = allocation.mutability := rfl
 
+/-- `withExtra` preserves the provenance map. -/
 theorem provenanceMap_withExtra (allocation : Allocation P Unit) (extra : E) :
     (allocation.withExtra extra).provenanceMap = allocation.provenanceMap := rfl
 
+/-- `withExtra` preserves the initialization mask. -/
 theorem initializationMask_withExtra (allocation : Allocation P Unit) (extra : E) :
     (allocation.withExtra extra).initializationMask = allocation.initializationMask := rfl
 
+/-- `withExtra` does not affect `getBytesUnchecked`. -/
 theorem getBytesUnchecked_withExtra (allocation : Allocation P Unit) (extra : E) (range : AllocRange) :
     (allocation.withExtra extra).getBytesUnchecked range = allocation.getBytesUnchecked range := rfl
 
+/-- `mapExtra` preserves `byteSize`. -/
 theorem byteSize_mapExtra (allocation : Allocation P E) (f : E → E') :
     (allocation.mapExtra f).byteSize = allocation.byteSize := rfl
 
+/-- `mapExtra` preserves the byte-storage length. -/
 theorem len_mapExtra (allocation : Allocation P E) (f : E → E') :
     (allocation.mapExtra f).len = allocation.len := rfl
 
+/-- `mapExtra` preserves the alignment. -/
 theorem align_mapExtra (allocation : Allocation P E) (f : E → E') :
     (allocation.mapExtra f).align = allocation.align := rfl
 
+/-- `mapExtra` preserves the mutability. -/
 theorem mutability_mapExtra (allocation : Allocation P E) (f : E → E') :
     (allocation.mapExtra f).mutability = allocation.mutability := rfl
 
+/-- `mapExtra` preserves the provenance map. -/
 theorem provenanceMap_mapExtra (allocation : Allocation P E) (f : E → E') :
     (allocation.mapExtra f).provenanceMap = allocation.provenanceMap := rfl
 
+/-- `mapExtra` preserves the initialization mask. -/
 theorem initializationMask_mapExtra (allocation : Allocation P E) (f : E → E') :
     (allocation.mapExtra f).initializationMask = allocation.initializationMask := rfl
 
+/-- `mapExtra` does not affect `getBytesUnchecked`. -/
 theorem getBytesUnchecked_mapExtra (allocation : Allocation P E) (f : E → E') (range : AllocRange) :
     (allocation.mapExtra f).getBytesUnchecked range = allocation.getBytesUnchecked range := rfl
 
+/-- `mapExtra` does not affect `getBytesStripProvenance`. -/
 theorem getBytesStripProvenance_mapExtra [PointerProvenance P]
     (allocation : Allocation P E) (f : E → E') (layout : TargetDataLayout) (range : AllocRange) :
     (allocation.mapExtra f).getBytesStripProvenance layout range =
       allocation.getBytesStripProvenance layout range := rfl
 
+/-- `mapExtra` does not affect `readScalar`. -/
 theorem readScalar_mapExtra [DecidableEq P] [PointerProvenance P]
     (allocation : Allocation P E) (f : E → E') (layout : TargetDataLayout)
     (range : AllocRange) (readProvenance : Bool) :
     (allocation.mapExtra f).readScalar layout range readProvenance =
       allocation.readScalar layout range readProvenance := rfl
 
+/-- `writeBytes` commutes with `mapExtra`: running it on `allocation.mapExtra f` yields the same
+outcome as running it on `allocation`, with `mapExtra f` applied to the resulting state (on
+success and on error). -/
 theorem writeBytes_mapExtra (start : Size) (bytes : Array UInt8) (ptrSize : Size)
     (allocation : Allocation P E) (f : E → E') :
     Allocation.writeBytes start bytes ptrSize (allocation.mapExtra f) =
@@ -2476,6 +2523,9 @@ theorem writeBytes_mapExtra (start : Size) (bytes : Array UInt8) (ptrSize : Size
                     throwThe] <;>
                   rfl
 
+/-- `clearProvenance` commutes with `mapExtra`: running it on `allocation.mapExtra f` yields the
+same outcome as running it on `allocation`, with `mapExtra f` applied to the resulting state (on
+success and on error). -/
 theorem clearProvenance_mapExtra (range : AllocRange) (ptrSize : Size)
     (allocation : Allocation P E) (f : E → E') :
     Allocation.clearProvenance range ptrSize (allocation.mapExtra f) =
@@ -2501,6 +2551,9 @@ private theorem replicate_extract_zero (n start finish : Nat)
   · intro i hi1 hi2
     rw [Array.getElem_extract, Array.getElem_replicate, Array.getElem_replicate]
 
+/-- A successful `fromBytes` produces an allocation of exactly `bytes.size` bytes with the
+requested mutability, unit extra, no native buffer, empty provenance, and a well-formed fully
+initialized mask, whose in-bounds slices are the corresponding slices of `bytes`. -/
 theorem fromBytes_spec (bytes : Array UInt8) (align : Align) (mutability : Mutability)
     (alloc : Allocation P Unit)
     (created : Allocation.fromBytes bytes align mutability = .ok alloc) :
@@ -2537,6 +2590,9 @@ theorem fromBytes_spec (bytes : Array UInt8) (align : Align) (mutability : Mutab
           (by change _ ≤ sz.bytes.toNat; omega)
       · simp [h_eq] at created
 
+/-- `fromBytes` succeeds for every byte array that fits in `u64` once the alignment is
+normalized (`Align.bytes` and `Align.fromBytes` round-trip), with `byteSize = bytes.size` and
+the given alignment. -/
 theorem fromBytes_exists (bytes : Array UInt8) (align : Align) (alignmentBytes : UInt64)
     (mutability : Mutability)
     (h_bytes : Align.bytes align = .ok alignmentBytes)
@@ -2563,6 +2619,9 @@ theorem fromBytes_exists (bytes : Array UInt8) (align : Align) (alignmentBytes :
   unfold fromBytesR
   simp [h_ca, h_sfa, h_tonat, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
 
+/-- A successful `tryNew` with zeroed host storage produces a mutable allocation of `size` zero
+bytes with unit extra, no native buffer, empty provenance, and a well-formed mask that is
+`InitMask.new size false` for `.Uninit` and `InitMask.new size true` for `.Zero`. -/
 theorem tryNew_spec (size : Size) (align : Align) (init : AllocInit)
     (alloc : Allocation P Unit)
     (created : Allocation.tryNew size align init
@@ -2601,6 +2660,8 @@ theorem tryNew_spec (size : Size) (align : Align) (init : AllocInit)
     rw [checkedSlice_ok a0 range finish Array.size_replicate h_end h_lo h_fin]
     exact congrArg Except.ok (replicate_extract_zero size.bytes.toNat _ _ h_lo h_fin)
 
+/-- `tryNew` with zeroed host storage succeeds for every size once the alignment is normalized,
+with the given alignment. -/
 theorem tryNew_exists (size : Size) (align : Align) (alignmentBytes : UInt64) (init : AllocInit)
     (h_bytes : Align.bytes align = .ok alignmentBytes)
     (h_norm : Align.fromBytes alignmentBytes = .ok align) :
@@ -2615,6 +2676,8 @@ theorem tryNew_exists (size : Size) (align : Align) (alignmentBytes : UInt64) (i
   simp [tryNewR, checkedAlign, h_bytes, h_norm, firstNonZero_replicate,
     bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure, Except.mapError]
 
+/-- On a storage-consistent allocation, an in-bounds `getBytesUnchecked` succeeds and returns
+exactly `finish - start` bytes. -/
 theorem getBytesUnchecked_size (allocation : Allocation P E) (range : AllocRange) (finish : Size)
     (storage : allocation.len = allocation.byteSize.bytes.toNat)
     (endEq : range.endExclusive = .ok finish)
@@ -2629,6 +2692,8 @@ theorem getBytesUnchecked_size (allocation : Allocation P E) (range : AllocRange
     change finish.bytes.toNat ≤ allocation.len; omega
   simp [Array.size_extract, Nat.min_eq_left h_fin_raw]
 
+/-- Reading a sub-range equals extracting the corresponding sub-slice of the bytes read for an
+enclosing range. -/
 theorem getBytesUnchecked_subrange (allocation : Allocation P E)
     (rOuter rInner : AllocRange) (fOuter fInner : Size) (outerBytes : Array UInt8)
     (h_outer_end : rOuter.endExclusive = .ok fOuter)
@@ -2670,6 +2735,7 @@ theorem getBytesUnchecked_subrange (allocation : Allocation P E)
             rInner.start.bytes.toNat + i := by omega
         simp only [h_idx_eq]
 
+/-- Reading two adjacent ranges and concatenating the results equals reading their union. -/
 theorem getBytesUnchecked_split (allocation : Allocation P E)
     (r1 r2 r12 : AllocRange) (mid fin : Size) (b1 b2 : Array UInt8)
     (h_end1 : r1.endExclusive = .ok mid)
@@ -2946,6 +3012,8 @@ private theorem readTargetUInt_ofFn_mod (layout : TargetDataLayout) (n val : Nat
   rw [h_congr (List.range n) 0 (fun idx h => List.mem_range.mp h)]
   exact endian_digits_fold_mod layout.endian val n
 
+/-- If the range is not fully initialized, `getBytesStripProvenance` fails with
+`invalidUninitBytes`, reporting the uninitialized sub-range found by the mask. -/
 theorem getBytesStripProvenance_uninit_err [PointerProvenance P]
     (allocation : Allocation P E) (layout : TargetDataLayout)
     (range bad : AllocRange)
@@ -2956,6 +3024,8 @@ theorem getBytesStripProvenance_uninit_err [PointerProvenance P]
   unfold getBytesStripProvenanceR
   simp [h_uninit, bind, Bind.bind, Except.bind, Except.mapError, throw, MonadExceptOf.throw, throwThe]
 
+/-- If the range is initialized and either provenance offsets are addresses or the range carries
+no provenance, `getBytesStripProvenance` returns the raw bytes. -/
 theorem getBytesStripProvenance_ok [PointerProvenance P]
     (allocation : Allocation P E) (layout : TargetDataLayout) (range : AllocRange)
     (h_init : allocation.initializationMask.isRangeInitialized range = .ok (.ok ()))
@@ -2972,6 +3042,8 @@ theorem getBytesStripProvenance_ok [PointerProvenance P]
         Bool.eq_false_iff.mpr h_addr
       simp [h_init, h_addr_f, h_empty, bind, Bind.bind, Except.bind, Except.mapError]
 
+/-- If the range is not fully initialized, `readScalar` fails with `invalidUninitBytes`,
+reporting the uninitialized sub-range found by the mask. -/
 theorem readScalar_uninit_err [DecidableEq P] [PointerProvenance P]
     (allocation : Allocation P E) (layout : TargetDataLayout)
     (range bad : AllocRange) (readProvenance : Bool)
@@ -2982,6 +3054,9 @@ theorem readScalar_uninit_err [DecidableEq P] [PointerProvenance P]
   unfold readScalarR
   simp [h_uninit, bind, Bind.bind, Except.bind, Except.mapError, throw, MonadExceptOf.throw, throwThe]
 
+/-- An integer `readScalar` (without provenance) of an initialized range of at most 16 bytes
+that is provenance-free (or whose provenance offsets are addresses) decodes the stored bytes in
+the target endianness. -/
 theorem readScalar_int_of_bytes [DecidableEq P] [PointerProvenance P]
     (allocation : Allocation P E) (layout : TargetDataLayout)
     (range : AllocRange) (bytes : Array UInt8)
@@ -3009,6 +3084,9 @@ theorem readScalar_int_of_bytes [DecidableEq P] [PointerProvenance P]
         Bool.eq_false_iff.mpr h_addr
       simp [h_addr_f, h_empty]
 
+/-- Integer round trip: if an initialized, provenance-free (or address-offset) range of at most
+16 bytes holds the target-endian encoding of `bits`, and `bits` fits in the range, an integer
+`readScalar` returns `Scalar.fromUInt bits range.size`. -/
 theorem readScalar_int_roundtrip [DecidableEq P] [PointerProvenance P]
     (allocation : Allocation P E) (layout : TargetDataLayout)
     (range : AllocRange) (bits : U128)
@@ -3038,6 +3116,9 @@ theorem readScalar_int_roundtrip [DecidableEq P] [PointerProvenance P]
         Bool.eq_false_iff.mpr h_addr
       simp [h_addr_f, h_empty]
 
+/-- Pointer round trip: if an initialized pointer-sized range holds the target-endian encoding
+of `ptr.offset` and the provenance map reports `ptr.provenance` at its start, a
+provenance-reading `readScalar` returns `Scalar.fromPointer layout ptr`. -/
 theorem readScalar_ptr_roundtrip [DecidableEq P] [PointerProvenance P]
     (allocation : Allocation P E) (layout : TargetDataLayout)
     (range : AllocRange) (ptr : Pointer P)
@@ -3072,6 +3153,9 @@ theorem readScalar_ptr_roundtrip [DecidableEq P] [PointerProvenance P]
   rw [h_read]
   simp [h_ptr_sz, h_prov, h_bv_nat, h_not_gt, h_ptr_eta]
 
+/-- If an initialized pointer-sized range holds the target-endian encoding of `bits` and the
+provenance map reports no provenance at its start, a provenance-reading `readScalar` returns
+`Scalar.fromUInt bits range.size`. -/
 theorem readScalar_ptr_none_roundtrip [DecidableEq P] [PointerProvenance P]
     (allocation : Allocation P E) (layout : TargetDataLayout)
     (range : AllocRange) (bits : U128)
@@ -3096,6 +3180,11 @@ theorem readScalar_ptr_none_roundtrip [DecidableEq P] [PointerProvenance P]
   rw [h_read]
   simp [h_ptr_sz, h_prov]
 
+/-- Specification of an in-bounds, nonzero-width (at most 16-byte) `writeScalar` on a mutable,
+storage-consistent allocation with a well-formed mask: it succeeds; preserves size, length,
+mutability, alignment, extra and native buffer; marks exactly the written range initialized;
+installs the specified provenance map; stores the target-endian encoding of the integer bits or
+pointer offset; and leaves the bytes of every disjoint range unchanged. -/
 theorem writeScalar_spec (layout : TargetDataLayout)
     (allocation : Allocation P E) (range : AllocRange) (value : Scalar P)
     (converted : ScalarBitsOrPointer P) (cleared nextProvenance : ProvenanceMap P)
@@ -3250,6 +3339,8 @@ theorem writeScalar_spec (layout : TargetDataLayout)
         qRange.start.bytes.toNat qFin.bytes.toNat
         (by omega) h_wFin_raw h_qlo h_qfin_raw (by rw [dataSize]; omega) h_disj)
 
+/-- Writing an empty byte array at an in-bounds offset of a storage-consistent allocation is the
+identity. -/
 theorem writeBytes_zero_spec (start ptrSize : Size) (bytes : Array UInt8)
     (allocation : Allocation P E)
     (h_empty : bytes.size = 0)
@@ -3268,6 +3359,10 @@ theorem writeBytes_zero_spec (start ptrSize : Size) (bytes : Array UInt8)
   simp only [Id.run, bind, Bind.bind, pure, Pure.pure, h_slice]
   rfl
 
+/-- Specification of a nonempty in-bounds `writeBytes` on a mutable, storage-consistent
+allocation with a well-formed mask: it succeeds; preserves metadata; marks exactly the written
+range initialized; installs the specified (cleared) provenance map; the written range reads back
+`bytes`; and every disjoint range is unchanged. -/
 theorem writeBytes_spec (start ptrSize : Size) (bytes : Array UInt8)
     (allocation : Allocation P E) (nextProvenance : ProvenanceMap P)
     (h_nonempty : 0 < bytes.size)
@@ -3405,6 +3500,8 @@ theorem writeBytes_spec (start ptrSize : Size) (bytes : Array UInt8)
         (by omega) h_wFin_raw h_qlo h_qfin_raw (by omega)
         (by dsimp only [wStart, wFin]; omega))
 
+/-- `writeUninit` of an empty in-bounds range of a storage-consistent allocation is the
+identity. -/
 theorem writeUninit_zero_spec (range : AllocRange) (finish ptrSize : Size)
     (allocation : Allocation P E)
     (h_zero : range.size.bytes = 0)
@@ -3418,6 +3515,10 @@ theorem writeUninit_zero_spec (range : AllocRange) (finish ptrSize : Size)
   unfold writeUninitR
   simp [h_slice, h_zero, Id.run, pure, Pure.pure]
 
+/-- Specification of a nonempty in-bounds `writeUninit` on a mutable, storage-consistent
+allocation with a well-formed mask: it succeeds; preserves metadata; marks the range
+uninitialized (`setRange range false`); installs the specified (cleared) provenance map; and
+leaves every byte unchanged. -/
 theorem writeUninit_spec (range : AllocRange) (ptrSize : Size)
     (allocation : Allocation P E) (nextProvenance : ProvenanceMap P)
     (nonzero : range.size.bytes ≠ 0)
@@ -3474,6 +3575,11 @@ theorem writeUninit_spec (range : AllocRange) (ptrSize : Size)
   rw [h_clear_raw]
   rfl
 
+/-- Specification of `copyRepeatedly` from a fully initialized source range into a mutable,
+storage-consistent destination with a well-formed mask: it succeeds; the destination span holds
+`repeatCount` concatenated copies of the source bytes and is fully initialized; mask bits,
+`isRangeInitialized` results and bytes outside the span are unchanged; provenance is updated as
+specified; and destination metadata is preserved. -/
 theorem copyRepeatedly_initialized_spec
     (source state : Allocation P E)
     (sourceRange : AllocRange) (srcFinish destStart totalSize ptrSize : Size)
@@ -3827,6 +3933,9 @@ theorem copyRepeatedly_initialized_spec
         (by omega) h_wFin_raw h_qlo h_qfin_raw (by omega)
         (by dsimp only [wStart, wFin]; omega))
 
+/-- The one-copy specialization of `copyRepeatedly_initialized_spec` for `copy`: the destination
+range holds the source bytes and is fully initialized, with mask bits, `isRangeInitialized`
+results and bytes outside it unchanged. -/
 theorem copy_initialized_spec
     (source state : Allocation P E)
     (sourceRange : AllocRange) (srcFinish destStart ptrSize : Size)
