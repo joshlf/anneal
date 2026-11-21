@@ -460,10 +460,36 @@ def ptrPointeeMayBeUnsizedProto (pointee : RigidTy) : Bool :=
   ptrPointeeMayBeUnsizedAuxProto 8 pointee
 
 /--
+Whether `l` is a well-formed pointer `TypeLayout` on `layouts`: either a
+`ptrBytes`-byte thin `.primitive` layout or a `2 * ptrBytes`-byte wide
+two-field `.arbitrary [_, _] _` layout, with `align <= ptrBytes` and a single
+variant.
+-/
+@[reducible]
+def isConsistentPtrLayoutProto (layouts : LayoutTable) (l : TypeLayout) : Bool :=
+  let ptrBytes := layoutPointerBytes layouts
+  match l.variants, Nat.ble l.align.bytes ptrBytes with
+  | .single _, true =>
+    match Nat.beq l.size.bytes ptrBytes, l.fields with
+    | true, .primitive => true
+    | _, _ =>
+      match Nat.beq l.size.bytes (Nat.mul 2 ptrBytes), l.fields with
+      | true, .arbitrary (_ :: _ :: .nil) _ => true
+      | _, _ => false
+  | _, _ => false
+
+/--
 Byte size recorded by the compiler for a pointer to `pointee`: the
 `LayoutTable` size of the first local in `localDecls` whose type is
 `&pointee`, `&mut pointee`, `*const pointee` or `*mut pointee` (all four share
-one width), or `.none` when no such local carries a layout.
+one width) AND whose `layoutIdx` is a resolved non-zero index
+(`Bool.not (isUnresolvedLayoutIdx layouts decl.ty.layoutIdx)`) naming a
+consistent pointer layout (`isConsistentPtrLayoutProto`), or `.none` when no
+such local carries a valid resolved pointer layout.
+
+Rejecting `layoutIdx = 0` prevents an unresolved default pointer local from
+adopting `layouts.entries[0]` (often the return place's unrelated layout) and
+falsely confirming a custom-DST wide pointer as thin (or vice versa).
 -/
 @[reducible]
 def declPtrToPointeeByteSizeProto?
@@ -475,10 +501,13 @@ def declPtrToPointeeByteSizeProto?
     let hit : Option Nat :=
       match decl.ty.kind with
       | .ref _ p | .rawPtr _ p =>
-        match rigidTyEq p pointee with
+        match Bool.and (rigidTyEq p pointee) (Bool.not (isUnresolvedLayoutIdx layouts decl.ty.layoutIdx)) with
         | true =>
           match LayoutTable.lookup layouts decl.ty.layoutIdx with
-          | .some l => .some l.size.bytes
+          | .some l =>
+            match isConsistentPtrLayoutProto layouts l with
+            | true => .some l.size.bytes
+            | false => .none
           | .none => .none
         | false => .none
       | _ => .none
@@ -615,16 +644,22 @@ def exactRigidTyByteSizeProto?
 
 /--
 Whether `l`, the explicit `LayoutTable` entry named by a type's `layoutIdx`, is
-CONSISTENT with that type's kind: when the kind has a target-aware structural
-size (`exactRigidTyByteSizeProto?`), the entry must have exactly that size; a
-pointer kind whose width is not structurally known must have a 1- or 2-word
-entry; ADTs, closures, and tuples / arrays without a structural size (e.g.
-containing `usize` on a 32-bit table) are described by their entry alone.
-
-An inconsistent index would otherwise be trusted over the type it annotates.
-`Places.tyExactByteAlign?` applies the same rule (it uses the direct layout's
-alignment only when the entry's size equals the type's structural size), and
-`Bytes.rigidTyByteSize` consults the kind before the index for the same reason.
+CONSISTENT with that type's kind in BOTH size and structural shape:
+- When `exactRigidTyByteSizeProto?` knows a target-aware structural size `sz`,
+  `l.size.bytes` MUST equal `sz` (mismatch immediately returns `false`).
+- Primitives (`.bool`, `.char`, `.uint _`, `.int _`, `.float _`, `.fnPtr`) must
+  have `.single _` variants, `.primitive` fields, and `l.align.bytes <= sz`
+  (primitives never have `align > size`).
+- Zero-sized `.never` / `.fnDef` must have `size = 0` and `align = 1`.
+- Pointers (`.ref`, `.rawPtr`) must satisfy `isConsistentPtrLayoutProto` (1-word
+  `.primitive` or 2-word `.arbitrary [_, _] _` with `align <= ptrBytes`).
+- Arrays `.array _ n` must have `.array _ count` with `count == n` (rejecting
+  e.g. `[u8; 8]` mislabeled with `u64`'s 8-aligned `.primitive` entry).
+- Tuples `.tuple ks` must have `.single _` variants and `.arbitrary offsets _`
+  with `length offsets == length ks` (rejecting e.g. `(u8, u8, u8, u8)`
+  mislabeled with `u32`'s 4-aligned `.primitive` entry).
+- ADTs and closures must satisfy `layoutValidForAdt l` (or single-variant
+  inhabited `.primitive`, matching `Places.layoutValidForResolvedAdt`).
 -/
 @[reducible]
 def explicitLayoutConsistentProto
@@ -633,14 +668,37 @@ def explicitLayoutConsistentProto
     (kind : RigidTy)
     (l : TypeLayout) :
     Bool :=
-  let ptrBytes := layoutPointerBytes layouts
-  match exactRigidTyByteSizeProto? localDecls layouts kind with
-  | .some sz => Nat.beq sz l.size.bytes
-  | .none =>
+  let sizeOk : Bool :=
+    match exactRigidTyByteSizeProto? localDecls layouts kind with
+    | .some sz => Nat.beq sz l.size.bytes
+    | .none => true
+  match sizeOk with
+  | false => false
+  | true =>
     match kind with
+    | .bool | .char | .uint _ | .int _ | .float _ | .fnPtr _ _ _ _ =>
+      match exactRigidTyByteSizeProto? localDecls layouts kind, l.variants, l.fields with
+      | .some sz, .single _, .primitive => Nat.ble l.align.bytes sz
+      | _, _, _ => false
+    | .never | .fnDef _ _ =>
+      Bool.and (Nat.beq l.size.bytes 0) (Nat.beq l.align.bytes 1)
     | .ref _ _ | .rawPtr _ _ =>
-      Bool.or (Nat.beq l.size.bytes ptrBytes) (Nat.beq l.size.bytes (Nat.mul 2 ptrBytes))
-    | .adt _ _ | .closure _ _ | .tuple _ | .array _ _ => true
+      isConsistentPtrLayoutProto layouts l
+    | .array _ n =>
+      match l.fields with
+      | .array _ count => Nat.beq count n
+      | _ => false
+    | .tuple ks =>
+      match l.variants, l.fields with
+      | .single _, .arbitrary offsets _ => Nat.beq (length offsets) (length ks)
+      | _, _ => false
+    | .adt _ _ | .closure _ _ =>
+      match layoutValidForAdt l with
+      | true => true
+      | false =>
+        match l.isUninhabited, l.fields, l.variants with
+        | false, .primitive, .single _ => true
+        | _, _, _ => false
     | _ => false
 
 /--
@@ -677,6 +735,15 @@ def exactTyByteSizeProto?
         match rigidTyLayoutDeterminedProto localDecls layouts false 8 ty.kind with
         | false => .none
         | true => rigidTyByteSize layouts ty
+
+/-- Remove declarations whose `ty.kind` equals `k` so a rejected explicit layout cannot be re-adopted via `resolveTyWithLocalDecls`. -/
+@[reducible]
+def stripKindFromDeclsProto (k : RigidTy) : List LocalDecl → List LocalDecl
+  | .nil => .nil
+  | d :: rest =>
+    match rigidTyEq d.ty.kind k with
+    | true => stripKindFromDeclsProto k rest
+    | false => d :: stripKindFromDeclsProto k rest
 
 /--
 Target-aware exact root allocation alignment for a local `rootTy`:
@@ -720,7 +787,19 @@ def exactRootAllocAlignProto?
     | .none =>
       match rigidTyLayoutDeterminedProto localDecls layouts true 8 rTy.kind with
       | false => .none
-      | true => tyExactByteAlign? localDecls layouts rTy
+      | true =>
+        -- If `rTy.layoutIdx` was an explicit non-zero entry rejected above
+        -- (inconsistent shape/size or non-power-of-two align), strip BOTH the
+        -- index and matching `localDecls` entries so `Places.tyExactByteAlign?`
+        -- (which re-runs `resolveTyWithLocalDecls`) cannot re-adopt that
+        -- rejected entry.
+        match isUnresolvedLayoutIdx layouts rTy.layoutIdx with
+        | true => tyExactByteAlign? localDecls layouts rTy
+        | false =>
+          tyExactByteAlign?
+            (stripKindFromDeclsProto rTy.kind localDecls)
+            layouts
+            { rTy with layoutIdx := unresolvedLayoutIdx layouts }
 
 /--
 Test whether `ty` is a `FieldsShape.union` ADT in `localDecls` / `layouts`.
@@ -1530,6 +1609,9 @@ def encodeRawValueBytesProto :
     Nat → List LocalDecl → LayoutTable → Ty → Value → Option (List AbstractByte)
   | .zero, _, _, _, _ => .none
   | .succ fuel', localDecls, layouts, ty, v =>
+    match layouts.isLittleEndian with
+    | false => .none
+    | true =>
     let normTy := normalizeCodecTy ty
     match v with
     | .uninit =>
@@ -1726,6 +1808,9 @@ def decodeValueAtLayoutIdxProto :
     Nat → LayoutTable → Nat → List AbstractByte → Option Value
   | .zero, _, _, _ => .none
   | .succ fuel', layouts, lIdx, bytes =>
+    match layouts.isLittleEndian with
+    | false => .none
+    | true =>
     match LayoutTable.lookup layouts lIdx with
     | .none => .none
     | .some l =>
@@ -1805,6 +1890,9 @@ def decodePartialUninitValueProto :
     Nat → List LocalDecl → LayoutTable → Ty → List AbstractByte → Option Value
   | .zero, _, _, _, _ => .none
   | .succ fuel', localDecls, layouts, ty, bytes =>
+    match layouts.isLittleEndian with
+    | false => .none
+    | true =>
     let normTy := normalizeCodecTy ty
     match normTy.kind with
     | .adt _ _ | .closure _ _ =>
@@ -2874,137 +2962,148 @@ def evalRawEqProto
   match argVals with
   | aVal :: bVal :: .nil =>
     match resolveMemIntrinsicPointeeTyProto? target bodyLocalDecls bodyLayouts argOps with
-    | .none => MirStepNode.unsupported
+    | .none =>
+      match decodeThinPtrArgProto? ptrBytes aVal, decodeThinPtrArgProto? ptrBytes bVal with
+      | .some aArg, .some bArg =>
+        match Bool.or (isNullPtrArgProto s.memory aArg) (isNullPtrArgProto s.memory bArg) with
+        | true => MirStepNode.fail .ub
+        | false => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
+      | _, _ =>
+        match aVal, bVal with
+        | .aggregate 0 (_ :: _ :: .nil), _ | _, .aggregate 0 (_ :: _ :: .nil) =>
+          intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
+        | _, _ => MirStepNode.fail .ub
     | .some elemTy =>
-      match
-        Bool.or
-          (isUnsizedRigidTy 8 elemTy)
-          (Bool.not (rigidTyLayoutDeterminedProto bodyLocalDecls bodyLayouts true 8 elemTy))
-      with
+      match isUnsizedRigidTy 8 elemTy with
       | true => MirStepNode.unsupported
       | false =>
-        match
-          intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts elemTy,
-          intrinsicRigidTyAlign bodyLocalDecls bodyLayouts elemTy
-        with
-        | .some elemSize, .some elemAlign =>
-          let isizeMax := Nat.sub (signedHalfModulus ptrBytes) 1
-          match Nat.ble elemSize isizeMax with
+        match decodeThinPtrArgProto? ptrBytes aVal, decodeThinPtrArgProto? ptrBytes bVal with
+        | .none, _ | _, .none =>
+          match ptrPointeeMayBeUnsizedProto elemTy, aVal, bVal with
+          | true, .aggregate 0 (_ :: _ :: .nil), _ | true, _, .aggregate 0 (_ :: _ :: .nil) =>
+            MirStepNode.unsupported
+          | _, _, _ => MirStepNode.fail .ub
+        | .some aPtrArg, .some bPtrArg =>
+          -- Non-null `&T` and layout-inhabited `T` are mandatory for every sized `T`
+          -- (never masked by undetermined target size or unknown root alignment).
+          let nonNullOk :=
+            Bool.and
+              (Bool.not (isNullPtrArgProto s.memory aPtrArg))
+              (Bool.not (isNullPtrArgProto s.memory bPtrArg))
+          match nonNullOk with
           | false => MirStepNode.fail .ub
           | true =>
-            match
-              decodeThinPtrArgProto? ptrBytes aVal,
-              decodeThinPtrArgProto? ptrBytes bVal
-            with
-            | .some aPtrArg, .some bPtrArg =>
-              let nonNullOk :=
-                Bool.and
-                  (Bool.not (isNullPtrArgProto s.memory aPtrArg))
-                  (Bool.not (isNullPtrArgProto s.memory bPtrArg))
-              let isZero := Nat.beq elemSize 0
-              let preCheck : ProtoRes Unit :=
-                match nonNullOk with
-                | false => .ub
-                | true =>
-                  combineProtoResUnit
-                    (checkPtrArgAlignedProto s locals' bodyLocalDecls bodyLayouts aPtrArg elemAlign isZero)
-                    (checkPtrArgAlignedProto s locals' bodyLocalDecls bodyLayouts bPtrArg elemAlign isZero)
-              match preCheck with
-              | .ub => MirStepNode.fail .ub
-              | .unsupported => MirStepNode.unsupported
-              | .ok () =>
-                -- A `&T` argument whose pointee LAYOUT is uninhabited is an invalid
-                -- reference regardless of `size_of::<T>()`. (`T = &!` is layout-inhabited:
-                -- its `&&!` arguments are valid and their pointer bytes are compared.)
-                match isUninhabitedRigidTyProto bodyLocalDecls bodyLayouts 8 elemTy, isZero with
-                | true, _ => MirStepNode.fail .ub
-                | false, true =>
-                  writeIntrinsicReturnProto s locals' destination targetOpt (.scalar (boolToScalar true))
-                    bodyLocalDecls bodyLayouts
-                | false, false =>
-                  -- Read `a`:
-                  match resolveLiveMemEndpointProto s locals' s.memory.borrows bodyLocalDecls bodyLayouts aPtrArg with
-                  | .ub => MirStepNode.fail .ub
-                  | .unsupported => MirStepNode.unsupported
-                  | .ok aEp =>
-                    match endpointAccessCheckProto aEp elemSize with
+            match isUninhabitedRigidTyProto bodyLocalDecls bodyLayouts 8 elemTy with
+            | true => MirStepNode.fail .ub
+            | false =>
+              match rigidTyLayoutDeterminedProto bodyLocalDecls bodyLayouts true 8 elemTy with
+              | false => MirStepNode.unsupported
+              | true =>
+                match
+                  intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts elemTy,
+                  intrinsicRigidTyAlign bodyLocalDecls bodyLayouts elemTy
+                with
+                | .some elemSize, .some elemAlign =>
+                  let isizeMax := Nat.sub (signedHalfModulus ptrBytes) 1
+                  match Nat.ble elemSize isizeMax with
+                  | false => MirStepNode.fail .ub
+                  | true =>
+                    let isZero := Nat.beq elemSize 0
+                    let alignRes :=
+                      combineProtoResUnit
+                        (checkPtrArgAlignedProto s locals' bodyLocalDecls bodyLayouts aPtrArg elemAlign isZero)
+                        (checkPtrArgAlignedProto s locals' bodyLocalDecls bodyLayouts bPtrArg elemAlign isZero)
+                    match alignRes with
                     | .ub => MirStepNode.fail .ub
                     | .unsupported => MirStepNode.unsupported
                     | .ok () =>
-                      let borrows₁Opt : Option (List BorrowEntry) :=
-                        match aEp.borrowInfo? with
-                        | .none => .some s.memory.borrows
-                        | .some (aTag, aEntry) =>
-                          borrowsAfterReadAccessProto
-                            s.memory.borrows
-                            s.memory.activeProtectors
-                            aTag
-                            aEntry
-                            aEp.effOffset
-                            elemSize
-                            aEp.targetDecls
-                            aEp.targetLayouts
-                      match borrows₁Opt with
-                      | .none => MirStepNode.fail .ub
-                      | .some borrows₁ =>
-                        match readRootAbstractBytesProto aEp with
+                      match isZero with
+                      | true =>
+                        writeIntrinsicReturnProto s locals' destination targetOpt (.scalar (boolToScalar true))
+                          bodyLocalDecls bodyLayouts
+                      | false =>
+                        -- Read `a`:
+                        match resolveLiveMemEndpointProto s locals' s.memory.borrows bodyLocalDecls bodyLayouts aPtrArg with
                         | .ub => MirStepNode.fail .ub
                         | .unsupported => MirStepNode.unsupported
-                        | .ok aRootBytes =>
-                          match sliceAbstractBytes aRootBytes aEp.effOffset elemSize with
-                          | .none => MirStepNode.fail .ub
-                          | .some aAbsSlice =>
-                            match stripProvenanceBytesProto aAbsSlice with
-                            | .ub => MirStepNode.fail .ub
-                            | .unsupported => MirStepNode.unsupported
-                            | .ok aBytes =>
-                              -- Read `b` under `borrows₁`:
-                              match resolveLiveMemEndpointProto s locals' borrows₁ bodyLocalDecls bodyLayouts bPtrArg with
+                        | .ok aEp =>
+                          match endpointAccessCheckProto aEp elemSize with
+                          | .ub => MirStepNode.fail .ub
+                          | .unsupported => MirStepNode.unsupported
+                          | .ok () =>
+                            let borrows₁Opt : Option (List BorrowEntry) :=
+                              match aEp.borrowInfo? with
+                              | .none => .some s.memory.borrows
+                              | .some (aTag, aEntry) =>
+                                borrowsAfterReadAccessProto
+                                  s.memory.borrows
+                                  s.memory.activeProtectors
+                                  aTag
+                                  aEntry
+                                  aEp.effOffset
+                                  elemSize
+                                  aEp.targetDecls
+                                  aEp.targetLayouts
+                            match borrows₁Opt with
+                            | .none => MirStepNode.fail .ub
+                            | .some borrows₁ =>
+                              match readRootAbstractBytesProto aEp with
                               | .ub => MirStepNode.fail .ub
                               | .unsupported => MirStepNode.unsupported
-                              | .ok bEp =>
-                                match endpointAccessCheckProto bEp elemSize with
-                                | .ub => MirStepNode.fail .ub
-                                | .unsupported => MirStepNode.unsupported
-                                | .ok () =>
-                                  let borrows₂Opt : Option (List BorrowEntry) :=
-                                    match bEp.borrowInfo? with
-                                    | .none => .some borrows₁
-                                    | .some (bTag, bEntry) =>
-                                      borrowsAfterReadAccessProto
-                                        borrows₁
-                                        s.memory.activeProtectors
-                                        bTag
-                                        bEntry
-                                        bEp.effOffset
-                                        elemSize
-                                        bEp.targetDecls
-                                        bEp.targetLayouts
-                                  match borrows₂Opt with
-                                  | .none => MirStepNode.fail .ub
-                                  | .some borrows₂ =>
-                                    match readRootAbstractBytesProto bEp with
+                              | .ok aRootBytes =>
+                                match sliceAbstractBytes aRootBytes aEp.effOffset elemSize with
+                                | .none => MirStepNode.fail .ub
+                                | .some aAbsSlice =>
+                                  match stripProvenanceBytesProto aAbsSlice with
+                                  | .ub => MirStepNode.fail .ub
+                                  | .unsupported => MirStepNode.unsupported
+                                  | .ok aBytes =>
+                                    -- Read `b` under `borrows₁`:
+                                    match resolveLiveMemEndpointProto s locals' borrows₁ bodyLocalDecls bodyLayouts bPtrArg with
                                     | .ub => MirStepNode.fail .ub
                                     | .unsupported => MirStepNode.unsupported
-                                    | .ok bRootBytes =>
-                                      match sliceAbstractBytes bRootBytes bEp.effOffset elemSize with
-                                      | .none => MirStepNode.fail .ub
-                                      | .some bAbsSlice =>
-                                        match stripProvenanceBytesProto bAbsSlice with
-                                        | .ub => MirStepNode.fail .ub
-                                        | .unsupported => MirStepNode.unsupported
-                                        | .ok bBytes =>
-                                          let eq := u8ListEqProto aBytes bBytes
-                                          writeIntrinsicReturnProto
-                                            { s with memory := { s.memory with borrows := borrows₂ } }
-                                            locals'
-                                            destination
-                                            targetOpt
-                                            (.scalar (boolToScalar eq))
-                                            bodyLocalDecls
-                                            bodyLayouts
-            | _, _ => MirStepNode.fail .ub
-        | _, _ => MirStepNode.unsupported
+                                    | .ok bEp =>
+                                      match endpointAccessCheckProto bEp elemSize with
+                                      | .ub => MirStepNode.fail .ub
+                                      | .unsupported => MirStepNode.unsupported
+                                      | .ok () =>
+                                        let borrows₂Opt : Option (List BorrowEntry) :=
+                                          match bEp.borrowInfo? with
+                                          | .none => .some borrows₁
+                                          | .some (bTag, bEntry) =>
+                                            borrowsAfterReadAccessProto
+                                              borrows₁
+                                              s.memory.activeProtectors
+                                              bTag
+                                              bEntry
+                                              bEp.effOffset
+                                              elemSize
+                                              bEp.targetDecls
+                                              bEp.targetLayouts
+                                        match borrows₂Opt with
+                                        | .none => MirStepNode.fail .ub
+                                        | .some borrows₂ =>
+                                          match readRootAbstractBytesProto bEp with
+                                          | .ub => MirStepNode.fail .ub
+                                          | .unsupported => MirStepNode.unsupported
+                                          | .ok bRootBytes =>
+                                            match sliceAbstractBytes bRootBytes bEp.effOffset elemSize with
+                                            | .none => MirStepNode.fail .ub
+                                            | .some bAbsSlice =>
+                                              match stripProvenanceBytesProto bAbsSlice with
+                                              | .ub => MirStepNode.fail .ub
+                                              | .unsupported => MirStepNode.unsupported
+                                              | .ok bBytes =>
+                                                let eq := u8ListEqProto aBytes bBytes
+                                                writeIntrinsicReturnProto
+                                                  { s with memory := { s.memory with borrows := borrows₂ } }
+                                                  locals'
+                                                  destination
+                                                  targetOpt
+                                                  (.scalar (boolToScalar eq))
+                                                  bodyLocalDecls
+                                                  bodyLayouts
+                | _, _ => MirStepNode.unsupported
   | _ => MirStepNode.fail .ub
 
 /-! ## Section 10: Intrinsic 4 — `core::intrinsics::typed_swap_nonoverlapping` -/
@@ -3090,63 +3189,143 @@ def charShapedSurrogateProto (pk : PrimitiveKind) (validRange : WrappingRange) (
   | _ => false
 
 /--
-Validate a raw `AbstractByte` slice against a `ScalarLayout` descriptor
-(enforcing initialization and `validRange` for `.initialized`, while allowing
-arbitrary bytes for `.union`).
+Target-aware byte width of a `ScalarLayout` descriptor on `layouts`: pointer
+primitives take `layoutPointerBytes layouts` (instead of `Bytes.scalarLayoutByteWidth`'s
+hard-coded 8 bytes, which broke 32-bit `NonNull<u8>` validation and padding masks).
+-/
+@[reducible]
+def scalarLayoutTargetByteWidthProto (layouts : LayoutTable) : ScalarLayout → Option Nat
+  | .initialized (.pointer _) _ => .some (layoutPointerBytes layouts)
+  | .union (.pointer _) => .some (layoutPointerBytes layouts)
+  | sl => scalarLayoutByteWidth sl
 
-A non-pointer scalar (integer, float, `bool`, `char`, enum tag) whose bytes
-carry pointer provenance fails closed with `.unsupported`: a typed copy at a
-non-pointer type strips the provenance and leaves the absolute address bits
-(`Miri.Interpreter.Intrinsics.typedSwap` validates with provenance reset,
-`Intrinsics.lean:209-211`), and `MirSemantics` allocations have no concrete
-base address from which to compute those bits or to range-check them.
+/--
+Whether every byte in `bytes` is `.init _ (.some (aid, tag))` with the EXACT
+same provenance `(aid, tag)`. Distinguishes an intact tracked pointer from a
+fragmented or mixed-provenance byte slice (which `Bytes.mergeByteProvenance`
+would otherwise collapse into `.some (aid, tag)`).
+-/
+@[reducible]
+def allBytesSameProvProto (aid tag : Nat) : List AbstractByte → Bool
+  | .nil => true
+  | .init _ (.some (a, t)) :: rest =>
+    Bool.and (Bool.and (Nat.beq a aid) (Nat.beq t tag)) (allBytesSameProvProto aid tag rest)
+  | _ => false
 
-An in-range surrogate code point in a `char`-shaped scalar likewise fails
-closed with `.unsupported` (`charShapedSurrogateProto`): the layout cannot tell
-`char` (invalid) from a `u32` pattern type with the same range (valid).
+/-- Whether `r` covers ALL `sz`-byte bit patterns `[0, 2^(8 * sz) - 1]`. -/
+@[reducible]
+def validRangeCoversAllProto (sz : Nat) (r : WrappingRange) : Bool :=
+  Bool.and (Nat.beq r.start 0) (Nat.beq r.end_ (Nat.sub (scalarModulus sz) 1))
+
+/-- Whether `r` covers ALL non-zero `sz`-byte bit patterns `[1, 2^(8 * sz) - 1]`. -/
+@[reducible]
+def validRangeCoversAllNonNullProto (sz : Nat) (r : WrappingRange) : Bool :=
+  Bool.and (Nat.ble r.start 1) (Nat.beq r.end_ (Nat.sub (scalarModulus sz) 1))
+
+/--
+Validate a non-null pointer byte slice (`&T`, `fn(...)`, or `dyn` vtable) under
+`mem`:
+- Any `.uninit` byte (or empty slice) is `.ub`;
+- A fragmented or mixed-provenance slice (`allBytesSameProvProto = false`) fails
+  closed with `.unsupported` (a partial pointer strips provenance and could be
+  null);
+- Uniform real provenance is `.valid`; unbacked `allocId = 0` or plain bytes
+  reject `0` as `.ub` and accept non-zero as `.valid`.
+-/
+@[reducible]
+def validateNonNullPtrBytesProto
+    (mem : Memory)
+    (slice : List AbstractByte) :
+    TypedBytesValidityProto :=
+  match decodeScalarBytes slice false with
+  | .none => .ub
+  | .some (sv, prov) =>
+    match prov with
+    | .some (aid, tag) =>
+      match allBytesSameProvProto aid tag slice with
+      | false => .unsupported
+      | true =>
+        match isUnbackedZeroProvProto mem { allocId := aid, offsetBytes := sv.bits } with
+        | false => .valid
+        | true =>
+          match Nat.beq sv.bits 0 with
+          | true => .ub
+          | false => .valid
+    | .none =>
+      match Nat.beq sv.bits 0 with
+      | true => .ub
+      | false => .valid
+
+/--
+Validate a raw `AbstractByte` slice against a `ScalarLayout` descriptor on
+target `layouts` (enforcing target pointer width, little-endian byte order,
+initialization, uniform pointer provenance, and `validRange` for `.initialized`,
+while allowing arbitrary bytes for `.union`).
+
+- A non-pointer scalar whose bytes carry pointer provenance fails closed with
+  `.unsupported`.
+- A pointer scalar with fragmented/mixed provenance fails closed `.unsupported`
+  whenever `validRange` excludes any bit pattern (e.g. `NonNull`/`&T`).
+- A provenance-carrying pointer whose `validRange` is narrower than `[1, MAX]`
+  fails closed `.unsupported` (unknown symbolic base address).
+- An in-range surrogate code point in a `char`-shaped scalar fails closed with
+  `.unsupported` (`charShapedSurrogateProto`).
 -/
 @[reducible]
 def validateScalarLayoutBytesProto
+    (layouts : LayoutTable)
     (sl : ScalarLayout)
     (bytes : List AbstractByte)
     (mem : Memory := emptyMemory) :
     TypedBytesValidityProto :=
-  match sl with
-  | .union _ => .valid
-  | .initialized pk validRange =>
-    match scalarLayoutByteWidth sl with
-    | .none => .unsupported
-    | .some sz =>
-      match Nat.beq (length bytes) sz with
-      | false => .ub
-      | true =>
-        match decodeScalarBytes bytes false with
-        | .none => .ub
-        | .some (sv, prov) =>
-          match pk with
-          | .pointer _ =>
-            match prov with
-            | .some (aid, _) =>
-              match isUnbackedZeroProvProto mem { allocId := aid, offsetBytes := sv.bits } with
-              | false => .valid
-              | true =>
+  match layouts.isLittleEndian with
+  | false => .unsupported
+  | true =>
+    match sl with
+    | .union _ => .valid
+    | .initialized pk validRange =>
+      match scalarLayoutTargetByteWidthProto layouts sl with
+      | .none => .unsupported
+      | .some sz =>
+        match Nat.beq (length bytes) sz with
+        | false => .ub
+        | true =>
+          match decodeScalarBytes bytes false with
+          | .none => .ub
+          | .some (sv, prov) =>
+            match pk with
+            | .pointer _ =>
+              match prov with
+              | .some (aid, tag) =>
+                match allBytesSameProvProto aid tag bytes with
+                | false =>
+                  match validRangeCoversAllProto sz validRange with
+                  | true => .valid
+                  | false => .unsupported
+                | true =>
+                  match isUnbackedZeroProvProto mem { allocId := aid, offsetBytes := sv.bits } with
+                  | false =>
+                    match validRangeCoversAllNonNullProto sz validRange with
+                    | true => .valid
+                    | false => .unsupported
+                  | true =>
+                    match wrappingRangeContains validRange sv.bits with
+                    | true => .valid
+                    | false => .ub
+              | .none =>
                 match wrappingRangeContains validRange sv.bits with
                 | true => .valid
                 | false => .ub
-            | .none =>
-              match wrappingRangeContains validRange sv.bits with
-              | true => .valid
-              | false => .ub
-          | _ =>
-            match prov with
-            | .some _ => .unsupported
-            | .none =>
-              match wrappingRangeContains validRange sv.bits with
-              | true =>
-                match charShapedSurrogateProto pk validRange sv.bits with
-                | true => .unsupported
-                | false => .valid
-              | false => .ub
+            | _ =>
+              match prov with
+              | .some _ => .unsupported
+              | .none =>
+                match wrappingRangeContains validRange sv.bits with
+                | true =>
+                  match charShapedSurrogateProto pk validRange sv.bits with
+                  | true => .unsupported
+                  | false => .valid
+                | false => .ub
 
 /--
 Validate an integer or float scalar slice of byte width `sz`: every byte must be
@@ -3304,57 +3483,51 @@ def validateWideMetaBytesProto
     (metaSlice : List AbstractByte)
     (hasPrefixHeader : Bool := false) :
     TypedBytesValidityProto :=
-  let ptrBytes := layoutPointerBytes layouts
-  match decodeScalarBytes metaSlice false with
-  | .none => .ub
-  | .some (metaSv, metaProv) =>
+  match layouts.isLittleEndian with
+  | false => .unsupported
+  | true =>
+    let ptrBytes := layoutPointerBytes layouts
     match pointee with
-    | .dynamic _ =>
-      match metaProv with
-      | .some (aid, _) =>
-        match isUnbackedZeroProvProto mem { allocId := aid, offsetBytes := metaSv.bits } with
-        | false => .valid
-        | true =>
-          match Nat.beq metaSv.bits 0 with
-          | true => .ub
-          | false => .valid
-      | .none =>
-        match Nat.beq metaSv.bits 0 with
-        | true => .ub
-        | false => .valid
+    | .dynamic _ => validateNonNullPtrBytesProto mem metaSlice
     | .str =>
-      match metaProv with
-      | .some _ => .unsupported
-      | .none =>
-        match isRef with
-        | false => .valid
-        | true =>
-          let isizeMax := Nat.sub (signedHalfModulus ptrBytes) 1
-          match Nat.ble metaSv.bits isizeMax with
-          | false => .ub
+      match decodeScalarBytes metaSlice false with
+      | .none => .ub
+      | .some (metaSv, metaProv) =>
+        match metaProv with
+        | .some _ => .unsupported
+        | .none =>
+          match isRef with
+          | false => .valid
           | true =>
-            -- For tuple DSTs like `&(u8, str)`, prefix header + alignment
-            -- padding could still overflow `isize::MAX`: fail closed.
-            match hasPrefixHeader with
-            | false => .valid
-            | true => .unsupported
-    | .slice elem =>
-      match metaProv with
-      | .some _ => .unsupported
-      | .none =>
-        match isRef with
-        | false => .valid
-        | true =>
-          match exactRigidTyByteSizeProto? localDecls layouts elem with
-          | .none => .unsupported
-          | .some elemSz =>
             let isizeMax := Nat.sub (signedHalfModulus ptrBytes) 1
-            match Nat.ble (Nat.mul metaSv.bits elemSz) isizeMax with
+            match Nat.ble metaSv.bits isizeMax with
             | false => .ub
             | true =>
+              -- For tuple DSTs like `&(u8, str)`, prefix header + alignment
+              -- padding could still overflow `isize::MAX`: fail closed.
               match hasPrefixHeader with
               | false => .valid
               | true => .unsupported
+    | .slice elem =>
+      match decodeScalarBytes metaSlice false with
+      | .none => .ub
+      | .some (metaSv, metaProv) =>
+        match metaProv with
+        | .some _ => .unsupported
+        | .none =>
+          match isRef with
+          | false => .valid
+          | true =>
+            match exactRigidTyByteSizeProto? localDecls layouts elem with
+            | .none => .unsupported
+            | .some elemSz =>
+              let isizeMax := Nat.sub (signedHalfModulus ptrBytes) 1
+              match Nat.ble (Nat.mul metaSv.bits elemSz) isizeMax with
+              | false => .ub
+              | true =>
+                match hasPrefixHeader with
+                | false => .valid
+                | true => .unsupported
     | _ => .unsupported
 
 /--
@@ -3386,6 +3559,9 @@ def validateTypedBytesForLayoutIdxWithMemProto (mem : Memory) :
     Nat → LayoutTable → Nat → List AbstractByte → TypedBytesValidityProto
   | .zero, _, _, _ => .unsupported
   | .succ fuel', layouts, lIdx, bytes =>
+    match layouts.isLittleEndian with
+    | false => .unsupported
+    | true =>
     match LayoutTable.lookup layouts lIdx with
     | .none => .unsupported
     | .some l =>
@@ -3402,7 +3578,7 @@ def validateTypedBytesForLayoutIdxWithMemProto (mem : Memory) :
             | true => .valid
             | false =>
               match l.backendRepr with
-              | .scalar s0 => validateScalarLayoutBytesProto s0 bytes mem
+              | .scalar s0 => validateScalarLayoutBytesProto layouts s0 bytes mem
               | _ => .unsupported
           | .arbitrary .nil _ => .valid
           | .arbitrary offsets memIdx =>
@@ -3417,17 +3593,17 @@ def validateTypedBytesForLayoutIdxWithMemProto (mem : Memory) :
             | false =>
               match offsets, l.backendRepr with
               | off0 :: .nil, .scalar s0 =>
-                match scalarLayoutByteWidth s0 with
+                match scalarLayoutTargetByteWidthProto layouts s0 with
                 | .some sz0 =>
                   match sliceAbstractBytes bytes off0.bytes sz0 with
-                  | .some slice0 => validateScalarLayoutBytesProto s0 slice0 mem
+                  | .some slice0 => validateScalarLayoutBytesProto layouts s0 slice0 mem
                   | .none => .ub
                 | .none => .unsupported
               | off0 :: off1 :: .nil, .scalarPair s0 s1 =>
                 -- Verify exact `ScalarPair` separation (`firstOff = 0`,
                 -- `sz0 <= secondOff < sz0 + sz1`, `secondOff + sz1 <= size`)
                 -- so `{ nested_pair, trailing_zst }` structs fail closed.
-                match scalarLayoutByteWidth s0, scalarLayoutByteWidth s1 with
+                match scalarLayoutTargetByteWidthProto layouts s0, scalarLayoutTargetByteWidthProto layouts s1 with
                 | .some sz0, .some sz1 =>
                   match scalarPairOffsetsValidProto l.size.bytes off0 off1 memIdx sz0 sz1 with
                   | .none => .unsupported
@@ -3435,8 +3611,8 @@ def validateTypedBytesForLayoutIdxWithMemProto (mem : Memory) :
                     match sliceAbstractBytes bytes firstOff sz0, sliceAbstractBytes bytes secondOff sz1 with
                     | .some slice0, .some slice1 =>
                       combineTypedValidityProto
-                        (validateScalarLayoutBytesProto s0 slice0 mem)
-                        (validateScalarLayoutBytesProto s1 slice1 mem)
+                        (validateScalarLayoutBytesProto layouts s0 slice0 mem)
+                        (validateScalarLayoutBytesProto layouts s1 slice1 mem)
                     | _, _ => .ub
                 | _, _ => .unsupported
               | _, _ => .unsupported
@@ -3454,7 +3630,7 @@ def validateTypedBytesForLayoutIdxWithMemProto (mem : Memory) :
                 bytes
             | _ => .unsupported
         | .multiple tagLayout tagField _ =>
-          match l.fields, scalarLayoutByteWidth tagLayout with
+          match l.fields, scalarLayoutTargetByteWidthProto layouts tagLayout with
           | .arbitrary outerOffsets _, .some tagSz =>
             match get? outerOffsets tagField with
             | .none => .unsupported
@@ -3462,7 +3638,7 @@ def validateTypedBytesForLayoutIdxWithMemProto (mem : Memory) :
               match sliceAbstractBytes bytes tagOff.bytes tagSz with
               | .none => .ub
               | .some tagSlice =>
-                match validateScalarLayoutBytesProto tagLayout tagSlice mem with
+                match validateScalarLayoutBytesProto layouts tagLayout tagSlice mem with
                 | .ub => .ub
                 | .unsupported => .unsupported
                 | .valid =>
@@ -3488,6 +3664,12 @@ def validateTypedBytesWithMemProto (mem : Memory) :
     Nat → List LocalDecl → LayoutTable → RigidTy → List AbstractByte → TypedBytesValidityProto
   | .zero, _, _, _, _ => .unsupported
   | .succ fuel', localDecls, layouts, ty, bytes =>
+    match ty with
+    | .never => .ub
+    | _ =>
+    match layouts.isLittleEndian with
+    | false => .unsupported
+    | true =>
     match ty with
     | .never => .ub
     | .bool =>
@@ -3579,21 +3761,7 @@ def validateTypedBytesWithMemProto (mem : Memory) :
     | .ref _ pointee =>
       let ptrBytes := layoutPointerBytes layouts
       let checkNonNullDataSlice (dataSlice : List AbstractByte) : TypedBytesValidityProto :=
-        match decodeScalarBytes dataSlice false with
-        | .none => .ub
-        | .some (dataSv, prov) =>
-          match prov with
-          | .some (aid, _) =>
-            match isUnbackedZeroProvProto mem { allocId := aid, offsetBytes := dataSv.bits } with
-            | false => .valid
-            | true =>
-              match Nat.beq dataSv.bits 0 with
-              | true => .ub
-              | false => .valid
-          | .none =>
-            match Nat.beq dataSv.bits 0 with
-            | true => .ub
-            | false => .valid
+        validateNonNullPtrBytesProto mem dataSlice
       match knownWidePointeeTailProto? 8 pointee with
       | .some wideTail =>
         let hasHeader := match pointee with | .tuple _ => true | _ => false
@@ -3649,22 +3817,7 @@ def validateTypedBytesWithMemProto (mem : Memory) :
       let ptrBytes := layoutPointerBytes layouts
       match Nat.beq (length bytes) ptrBytes with
       | false => .ub
-      | true =>
-        match decodeScalarBytes bytes false with
-        | .none => .ub
-        | .some (sv, prov) =>
-          match prov with
-          | .some (aid, _) =>
-            match isUnbackedZeroProvProto mem { allocId := aid, offsetBytes := sv.bits } with
-            | false => .valid
-            | true =>
-              match Nat.beq sv.bits 0 with
-              | true => .ub
-              | false => .valid
-          | .none =>
-            match Nat.beq sv.bits 0 with
-            | true => .ub
-            | false => .valid
+      | true => validateNonNullPtrBytesProto mem bytes
     | .array elemKind n =>
       match Nat.beq n 0 with
       | true =>
@@ -3910,7 +4063,7 @@ def layoutDataMaskProto : Nat → LayoutTable → Nat → Option (List Bool)
           | false =>
             match l.backendRepr with
             | .scalar (.initialized pk validRange) =>
-              match scalarLayoutByteWidth (.initialized pk validRange) with
+              match scalarLayoutTargetByteWidthProto layouts (.initialized pk validRange) with
               | .some scalarBytes =>
                 match Nat.beq scalarBytes l.size.bytes with
                 | true => .some (replicateBoolProto true l.size.bytes)
@@ -3929,14 +4082,14 @@ def layoutDataMaskProto : Nat → LayoutTable → Nat → Option (List Bool)
           | false =>
             match offsets, l.backendRepr with
             | off0 :: .nil, .scalar (.initialized pk0 r0) =>
-              match scalarLayoutByteWidth (.initialized pk0 r0) with
+              match scalarLayoutTargetByteWidthProto layouts (.initialized pk0 r0) with
               | .some sz0 =>
                 orMaskAtOffsetProto (emptyDataMaskProto l.size.bytes) off0.bytes (replicateBoolProto true sz0)
               | .none => .none
             | off0 :: off1 :: .nil, .scalarPair (.initialized pk0 r0) (.initialized pk1 r1) =>
               match
-                scalarLayoutByteWidth (.initialized pk0 r0),
-                scalarLayoutByteWidth (.initialized pk1 r1)
+                scalarLayoutTargetByteWidthProto layouts (.initialized pk0 r0),
+                scalarLayoutTargetByteWidthProto layouts (.initialized pk1 r1)
               with
               | .some sz0, .some sz1 =>
                 match scalarPairOffsetsValidProto l.size.bytes off0 off1 memIdx sz0 sz1 with
@@ -3982,7 +4135,7 @@ def layoutDataMaskProto : Nat → LayoutTable → Nat → Option (List Bool)
                       elemFl.backendRepr
                     with
                     | true, .single _, .scalar (.initialized pk validRange) =>
-                      match scalarLayoutByteWidth (.initialized pk validRange) with
+                      match scalarLayoutTargetByteWidthProto layouts (.initialized pk validRange) with
                       | .some scalarBytes => Nat.beq scalarBytes elemFl.size.bytes
                       | .none => false
                     | _, _, _ => false
@@ -4182,213 +4335,225 @@ def evalTypedSwapNonOverlappingProto
   match argVals with
   | xVal :: yVal :: .nil =>
     match resolveMemIntrinsicPointeeTyProto? target bodyLocalDecls bodyLayouts argOps with
-    | .none => MirStepNode.unsupported
+    | .none =>
+      match decodeThinPtrArgProto? ptrBytes xVal, decodeThinPtrArgProto? ptrBytes yVal with
+      | .some xArg, .some yArg =>
+        match Bool.or (isNullPtrArgProto s.memory xArg) (isNullPtrArgProto s.memory yArg) with
+        | true => MirStepNode.fail .ub
+        | false => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
+      | _, _ =>
+        match xVal, yVal with
+        | .aggregate 0 (_ :: _ :: .nil), _ | _, .aggregate 0 (_ :: _ :: .nil) =>
+          intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
+        | _, _ => MirStepNode.fail .ub
     | .some elemTy =>
-      match
-        Bool.or
-          (isUnsizedRigidTy 8 elemTy)
-          (Bool.not (rigidTyLayoutDeterminedProto bodyLocalDecls bodyLayouts true 8 elemTy))
-      with
+      match isUnsizedRigidTy 8 elemTy with
       | true => MirStepNode.unsupported
       | false =>
-        match
-          intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts elemTy,
-          intrinsicRigidTyAlign bodyLocalDecls bodyLayouts elemTy
-        with
-        | .some elemSize, .some elemAlign =>
-          let isizeMax := Nat.sub (signedHalfModulus ptrBytes) 1
-          match Nat.ble elemSize isizeMax with
+        match decodeThinPtrArgProto? ptrBytes xVal, decodeThinPtrArgProto? ptrBytes yVal with
+        | .none, _ | _, .none =>
+          match ptrPointeeMayBeUnsizedProto elemTy, xVal, yVal with
+          | true, .aggregate 0 (_ :: _ :: .nil), _ | true, _, .aggregate 0 (_ :: _ :: .nil) =>
+            MirStepNode.unsupported
+          | _, _, _ => MirStepNode.fail .ub
+        | .some xPtrArg, .some yPtrArg =>
+          -- Non-null `*mut T` and layout-inhabited `T` are mandatory for every
+          -- sized `T` (never masked by undetermined target size or opaque root).
+          let nonNullOk :=
+            Bool.and
+              (Bool.not (isNullPtrArgProto s.memory xPtrArg))
+              (Bool.not (isNullPtrArgProto s.memory yPtrArg))
+          match nonNullOk with
           | false => MirStepNode.fail .ub
           | true =>
-            match
-              decodeThinPtrArgProto? ptrBytes xVal,
-              decodeThinPtrArgProto? ptrBytes yVal
-            with
-            | .some xPtrArg, .some yPtrArg =>
-              let nonNullOk :=
-                Bool.and
-                  (Bool.not (isNullPtrArgProto s.memory xPtrArg))
-                  (Bool.not (isNullPtrArgProto s.memory yPtrArg))
-              match nonNullOk with
-              | false => MirStepNode.fail .ub
+            match isUninhabitedRigidTyProto bodyLocalDecls bodyLayouts 8 elemTy with
+            | true => MirStepNode.fail .ub
+            | false =>
+              match rigidTyLayoutDeterminedProto bodyLocalDecls bodyLayouts true 8 elemTy with
+              | false => MirStepNode.unsupported
               | true =>
-                let isZero := Nat.beq elemSize 0
-                let alignRes :=
-                  combineProtoResUnit
-                    (checkPtrArgAlignedProto s locals' bodyLocalDecls bodyLayouts xPtrArg elemAlign isZero)
-                    (checkPtrArgAlignedProto s locals' bodyLocalDecls bodyLayouts yPtrArg elemAlign isZero)
-                match alignRes with
-                | .ub => MirStepNode.fail .ub
-                | .unsupported => MirStepNode.unsupported
-                | .ok () =>
-                  match isUninhabitedRigidTyProto bodyLocalDecls bodyLayouts 8 elemTy with
-                  | true => MirStepNode.fail .ub
-                  | false =>
-                    match isZero with
+                match
+                  intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts elemTy,
+                  intrinsicRigidTyAlign bodyLocalDecls bodyLayouts elemTy
+                with
+                | .some elemSize, .some elemAlign =>
+                  let isizeMax := Nat.sub (signedHalfModulus ptrBytes) 1
+                  match Nat.ble elemSize isizeMax with
+                  | false => MirStepNode.fail .ub
                   | true =>
-                    writeIntrinsicReturnProto s locals' destination targetOpt .unit
-                      bodyLocalDecls bodyLayouts
-                  | false =>
-                    -- Resolve both live writable endpoints:
-                    match
-                      resolveLiveMemEndpointProto s locals' s.memory.borrows bodyLocalDecls bodyLayouts xPtrArg,
-                      resolveLiveMemEndpointProto s locals' s.memory.borrows bodyLocalDecls bodyLayouts yPtrArg
-                    with
-                    | .ub, _ => MirStepNode.fail .ub
-                    | _, .ub => MirStepNode.fail .ub
-                    | .unsupported, _ => MirStepNode.unsupported
-                    | _, .unsupported => MirStepNode.unsupported
-                    | .ok xEp, .ok yEp =>
-                      let boundsAndWritable : ProtoRes Unit :=
-                        match Bool.and xEp.writable yEp.writable with
-                        | false => .ub
-                        | true =>
-                          combineProtoResUnit
-                            (endpointAccessCheckProto xEp elemSize)
-                            (endpointAccessCheckProto yEp elemSize)
-                      match boundsAndWritable with
-                      | .ub => MirStepNode.fail .ub
-                      | .unsupported => MirStepNode.unsupported
-                      | .ok () =>
-                        -- Container-first disjointness (allows same-tag disjoint ranges!):
-                        let disjointOk : Bool :=
-                          match decide (xEp.key = yEp.key) with
-                          | false => true
-                          | true => rangesDisjoint xEp.effOffset elemSize yEp.effOffset elemSize
-                        match disjointOk with
-                        | false => MirStepNode.fail .ub
-                        | true =>
-                          -- Tree Borrows ordering: read(x) -> read(y) -> write(x) -> write(y)
-                          let borrowsAfterXReadOpt : Option (List BorrowEntry) :=
-                            match xEp.borrowInfo? with
-                            | .none => .some s.memory.borrows
-                            | .some (xTag, xEntry) =>
-                              borrowsAfterReadAccessProto
-                                s.memory.borrows s.memory.activeProtectors
-                                xTag xEntry xEp.effOffset elemSize
-                                xEp.targetDecls xEp.targetLayouts
-                          match borrowsAfterXReadOpt with
-                          | .none => MirStepNode.fail .ub
-                          | .some borrows₁ =>
-                            let borrowsAfterYReadOpt : Option (List BorrowEntry) :=
-                              match yEp.borrowInfo? with
-                              | .none => .some borrows₁
-                              | .some (yTag, _) =>
-                                match lookupBorrow borrows₁ yTag with
-                                | .none => .none
-                                | .some yEntry₁ =>
-                                  borrowsAfterReadAccessProto
-                                    borrows₁ s.memory.activeProtectors
-                                    yTag yEntry₁ yEp.effOffset elemSize
-                                    yEp.targetDecls yEp.targetLayouts
-                            match borrowsAfterYReadOpt with
-                            | .none => MirStepNode.fail .ub
-                            | .some borrows₂ =>
-                              let borrowsAfterXWriteOpt : Option (List BorrowEntry) :=
+                    let isZero := Nat.beq elemSize 0
+                    let alignRes :=
+                      combineProtoResUnit
+                        (checkPtrArgAlignedProto s locals' bodyLocalDecls bodyLayouts xPtrArg elemAlign isZero)
+                        (checkPtrArgAlignedProto s locals' bodyLocalDecls bodyLayouts yPtrArg elemAlign isZero)
+                    match alignRes with
+                    | .ub => MirStepNode.fail .ub
+                    | .unsupported => MirStepNode.unsupported
+                    | .ok () =>
+                      match isZero with
+                      | true =>
+                        writeIntrinsicReturnProto s locals' destination targetOpt .unit
+                          bodyLocalDecls bodyLayouts
+                      | false =>
+                        -- Resolve both live writable endpoints:
+                        match
+                          resolveLiveMemEndpointProto s locals' s.memory.borrows bodyLocalDecls bodyLayouts xPtrArg,
+                          resolveLiveMemEndpointProto s locals' s.memory.borrows bodyLocalDecls bodyLayouts yPtrArg
+                        with
+                        | .ub, _ => MirStepNode.fail .ub
+                        | _, .ub => MirStepNode.fail .ub
+                        | .unsupported, _ => MirStepNode.unsupported
+                        | _, .unsupported => MirStepNode.unsupported
+                        | .ok xEp, .ok yEp =>
+                          let boundsAndWritable : ProtoRes Unit :=
+                            match Bool.and xEp.writable yEp.writable with
+                            | false => .ub
+                            | true =>
+                              combineProtoResUnit
+                                (endpointAccessCheckProto xEp elemSize)
+                                (endpointAccessCheckProto yEp elemSize)
+                          match boundsAndWritable with
+                          | .ub => MirStepNode.fail .ub
+                          | .unsupported => MirStepNode.unsupported
+                          | .ok () =>
+                            -- Container-first disjointness (allows same-tag disjoint ranges!):
+                            let disjointOk : Bool :=
+                              match decide (xEp.key = yEp.key) with
+                              | false => true
+                              | true => rangesDisjoint xEp.effOffset elemSize yEp.effOffset elemSize
+                            match disjointOk with
+                            | false => MirStepNode.fail .ub
+                            | true =>
+                              -- Tree Borrows ordering: read(x) -> read(y) -> write(x) -> write(y)
+                              let borrowsAfterXReadOpt : Option (List BorrowEntry) :=
                                 match xEp.borrowInfo? with
-                                | .none => .some borrows₂
-                                | .some (xTag, _) =>
-                                  match lookupBorrow borrows₂ xTag with
-                                  | .none => .none
-                                  | .some xEntry₂ =>
-                                    borrowsAfterWriteAccessProto
-                                      borrows₂ s.memory.activeProtectors
-                                      xTag xEntry₂ xEp.effOffset elemSize
-                                      xEp.targetDecls xEp.targetLayouts
-                              match borrowsAfterXWriteOpt with
+                                | .none => .some s.memory.borrows
+                                | .some (xTag, xEntry) =>
+                                  borrowsAfterReadAccessProto
+                                    s.memory.borrows s.memory.activeProtectors
+                                    xTag xEntry xEp.effOffset elemSize
+                                    xEp.targetDecls xEp.targetLayouts
+                              match borrowsAfterXReadOpt with
                               | .none => MirStepNode.fail .ub
-                              | .some borrows₃ =>
-                                let borrowsAfterYWriteOpt : Option (List BorrowEntry) :=
+                              | .some borrows₁ =>
+                                let borrowsAfterYReadOpt : Option (List BorrowEntry) :=
                                   match yEp.borrowInfo? with
-                                  | .none => .some borrows₃
+                                  | .none => .some borrows₁
                                   | .some (yTag, _) =>
-                                    match lookupBorrow borrows₃ yTag with
+                                    match lookupBorrow borrows₁ yTag with
                                     | .none => .none
-                                    | .some yEntry₃ =>
-                                      borrowsAfterWriteAccessProto
-                                        borrows₃ s.memory.activeProtectors
-                                        yTag yEntry₃ yEp.effOffset elemSize
+                                    | .some yEntry₁ =>
+                                      borrowsAfterReadAccessProto
+                                        borrows₁ s.memory.activeProtectors
+                                        yTag yEntry₁ yEp.effOffset elemSize
                                         yEp.targetDecls yEp.targetLayouts
-                                match borrowsAfterYWriteOpt with
+                                match borrowsAfterYReadOpt with
                                 | .none => MirStepNode.fail .ub
-                                | .some borrows₄ =>
-                                  -- Extract both byte slices and enforce typed validity:
-                                  match readRootAbstractBytesProto xEp, readRootAbstractBytesProto yEp with
-                                  | .ub, _ | _, .ub => MirStepNode.fail .ub
-                                  | .unsupported, _ | _, .unsupported => MirStepNode.unsupported
-                                  | .ok xRootBytes, .ok yRootBytes =>
-                                    match
-                                      sliceAbstractBytes xRootBytes xEp.effOffset elemSize,
-                                      sliceAbstractBytes yRootBytes yEp.effOffset elemSize
-                                    with
-                                    | .some xSlice, .some ySlice =>
-                                      let valCheck :=
-                                        combineTypedValidityProto
-                                          (validateTypedBytesProto defaultCodecFuel bodyLocalDecls bodyLayouts elemTy xSlice s.memory)
-                                          (validateTypedBytesProto defaultCodecFuel bodyLocalDecls bodyLayouts elemTy ySlice s.memory)
-                                      match valCheck with
-                                      | .ub => MirStepNode.fail .ub
-                                      | .unsupported => MirStepNode.unsupported
-                                      | .valid =>
-                                        -- Commit swapped bytes (same container vs distinct containers).
-                                        -- Each place receives the typed-copy image of the other value.
-                                        let commitRes :
-                                            ProtoRes (List LocalSlot × List SavedCallerFrame × List LocalSlot × List CapturedAllocation) :=
-                                          match
-                                            typedCopyStoredBytesProto bodyLocalDecls bodyLayouts elemTy xEp ySlice,
-                                            typedCopyStoredBytesProto bodyLocalDecls bodyLayouts elemTy yEp xSlice
-                                          with
-                                          | .some xNew, .some yNew =>
-                                            match decide (xEp.key = yEp.key) with
-                                            | true =>
-                                              match writeAbstractBytesAt xRootBytes xEp.effOffset xNew with
-                                              | .none => .ub
-                                              | .some buf1 =>
-                                                match writeAbstractBytesAt buf1 yEp.effOffset yNew with
-                                                | .none => .ub
-                                                | .some buf2 =>
-                                                  commitRootAbstractBytesProto
-                                                    locals' s.memory.callStack s.memory.callerLocals s.memory.globals
-                                                    ptrBytes xEp buf2
-                                            | false =>
-                                              match writeAbstractBytesAt xRootBytes xEp.effOffset xNew with
-                                              | .none => .ub
-                                              | .some xUpdated =>
-                                                match writeAbstractBytesAt yRootBytes yEp.effOffset yNew with
-                                                | .none => .ub
-                                                | .some yUpdated =>
-                                                  match
-                                                    commitRootAbstractBytesProto
-                                                      locals' s.memory.callStack s.memory.callerLocals s.memory.globals
-                                                      ptrBytes xEp xUpdated
-                                                  with
-                                                  | .ub => .ub
-                                                  | .unsupported => .unsupported
-                                                  | .ok (loc1, cs1, cl1, gl1) =>
-                                                    commitRootAbstractBytesProto
-                                                      loc1 cs1 cl1 gl1 ptrBytes yEp yUpdated
-                                          | _, _ => .unsupported
-                                        match commitRes with
-                                        | .ub => MirStepNode.fail .ub
-                                        | .unsupported => MirStepNode.unsupported
-                                        | .ok (locals₂, callStack', callerLocals', globals') =>
-                                          writeIntrinsicReturnProto
-                                            { s with
-                                              memory :=
-                                                { s.memory with
-                                                  borrows := borrows₄
-                                                  callStack := callStack'
-                                                  callerLocals := callerLocals'
-                                                  globals := globals' } }
-                                            locals₂
-                                            destination
-                                            targetOpt
-                                            .unit
-                                            bodyLocalDecls
-                                            bodyLayouts
-                                    | _, _ => MirStepNode.fail .ub
-            | _, _ => MirStepNode.fail .ub
-        | _, _ => MirStepNode.unsupported
+                                | .some borrows₂ =>
+                                  let borrowsAfterXWriteOpt : Option (List BorrowEntry) :=
+                                    match xEp.borrowInfo? with
+                                    | .none => .some borrows₂
+                                    | .some (xTag, _) =>
+                                      match lookupBorrow borrows₂ xTag with
+                                      | .none => .none
+                                      | .some xEntry₂ =>
+                                        borrowsAfterWriteAccessProto
+                                          borrows₂ s.memory.activeProtectors
+                                          xTag xEntry₂ xEp.effOffset elemSize
+                                          xEp.targetDecls xEp.targetLayouts
+                                  match borrowsAfterXWriteOpt with
+                                  | .none => MirStepNode.fail .ub
+                                  | .some borrows₃ =>
+                                    let borrowsAfterYWriteOpt : Option (List BorrowEntry) :=
+                                      match yEp.borrowInfo? with
+                                      | .none => .some borrows₃
+                                      | .some (yTag, _) =>
+                                        match lookupBorrow borrows₃ yTag with
+                                        | .none => .none
+                                        | .some yEntry₃ =>
+                                          borrowsAfterWriteAccessProto
+                                            borrows₃ s.memory.activeProtectors
+                                            yTag yEntry₃ yEp.effOffset elemSize
+                                            yEp.targetDecls yEp.targetLayouts
+                                    match borrowsAfterYWriteOpt with
+                                    | .none => MirStepNode.fail .ub
+                                    | .some borrows₄ =>
+                                      -- Extract both byte slices and enforce typed validity:
+                                      match readRootAbstractBytesProto xEp, readRootAbstractBytesProto yEp with
+                                      | .ub, _ | _, .ub => MirStepNode.fail .ub
+                                      | .unsupported, _ | _, .unsupported => MirStepNode.unsupported
+                                      | .ok xRootBytes, .ok yRootBytes =>
+                                        match
+                                          sliceAbstractBytes xRootBytes xEp.effOffset elemSize,
+                                          sliceAbstractBytes yRootBytes yEp.effOffset elemSize
+                                        with
+                                        | .some xSlice, .some ySlice =>
+                                          let valCheck :=
+                                            combineTypedValidityProto
+                                              (validateTypedBytesProto defaultCodecFuel bodyLocalDecls bodyLayouts elemTy xSlice s.memory)
+                                              (validateTypedBytesProto defaultCodecFuel bodyLocalDecls bodyLayouts elemTy ySlice s.memory)
+                                          match valCheck with
+                                          | .ub => MirStepNode.fail .ub
+                                          | .unsupported => MirStepNode.unsupported
+                                          | .valid =>
+                                            -- Commit swapped bytes (same container vs distinct containers).
+                                            -- Each place receives the typed-copy image of the other value.
+                                            let commitRes :
+                                                ProtoRes (List LocalSlot × List SavedCallerFrame × List LocalSlot × List CapturedAllocation) :=
+                                              match
+                                                typedCopyStoredBytesProto bodyLocalDecls bodyLayouts elemTy xEp ySlice,
+                                                typedCopyStoredBytesProto bodyLocalDecls bodyLayouts elemTy yEp xSlice
+                                              with
+                                              | .some xNew, .some yNew =>
+                                                match decide (xEp.key = yEp.key) with
+                                                | true =>
+                                                  match writeAbstractBytesAt xRootBytes xEp.effOffset xNew with
+                                                  | .none => .ub
+                                                  | .some buf1 =>
+                                                    match writeAbstractBytesAt buf1 yEp.effOffset yNew with
+                                                    | .none => .ub
+                                                    | .some buf2 =>
+                                                      commitRootAbstractBytesProto
+                                                        locals' s.memory.callStack s.memory.callerLocals s.memory.globals
+                                                        ptrBytes xEp buf2
+                                                | false =>
+                                                  match writeAbstractBytesAt xRootBytes xEp.effOffset xNew with
+                                                  | .none => .ub
+                                                  | .some xUpdated =>
+                                                    match writeAbstractBytesAt yRootBytes yEp.effOffset yNew with
+                                                    | .none => .ub
+                                                    | .some yUpdated =>
+                                                      match
+                                                        commitRootAbstractBytesProto
+                                                          locals' s.memory.callStack s.memory.callerLocals s.memory.globals
+                                                          ptrBytes xEp xUpdated
+                                                      with
+                                                      | .ub => .ub
+                                                      | .unsupported => .unsupported
+                                                      | .ok (loc1, cs1, cl1, gl1) =>
+                                                        commitRootAbstractBytesProto
+                                                          loc1 cs1 cl1 gl1 ptrBytes yEp yUpdated
+                                              | _, _ => .unsupported
+                                            match commitRes with
+                                            | .ub => MirStepNode.fail .ub
+                                            | .unsupported => MirStepNode.unsupported
+                                            | .ok (locals₂, callStack', callerLocals', globals') =>
+                                              writeIntrinsicReturnProto
+                                                { s with
+                                                  memory :=
+                                                    { s.memory with
+                                                      borrows := borrows₄
+                                                      callStack := callStack'
+                                                      callerLocals := callerLocals'
+                                                      globals := globals' } }
+                                                locals₂
+                                                destination
+                                                targetOpt
+                                                .unit
+                                                bodyLocalDecls
+                                                bodyLayouts
+                                        | _, _ => MirStepNode.fail .ub
+                | _, _ => MirStepNode.unsupported
   | _ => MirStepNode.fail .ub
 
 /-! ## Section 11: Intrinsics 5 & 6 — `ptr_offset_from` & `ptr_offset_from_unsigned` -/
@@ -5164,9 +5329,10 @@ def validateWideMetaValueProto
     | _ => .ub
   | _ => .unsupported
 
-/-- Validate a single scalar or pointer `Value` against a `ScalarLayout` descriptor. -/
+/-- Validate a single scalar or pointer `Value` against a `ScalarLayout` descriptor on `layouts`. -/
 @[reducible]
 def validateScalarLayoutValueProto
+    (layouts : LayoutTable)
     (mem : Memory)
     (sl : ScalarLayout)
     (v : Value) :
@@ -5174,7 +5340,7 @@ def validateScalarLayoutValueProto
   match sl with
   | .union _ => .valid
   | .initialized pk validRange =>
-    match scalarLayoutByteWidth sl with
+    match scalarLayoutTargetByteWidthProto layouts sl with
     | .none => .unsupported
     | .some sz =>
       match v with
@@ -5195,7 +5361,10 @@ def validateScalarLayoutValueProto
           match pk with
           | .pointer _ =>
             match isUnbackedZeroProvProto mem p with
-            | false => .valid
+            | false =>
+              match validRangeCoversAllNonNullProto sz validRange with
+              | true => .valid
+              | false => .unsupported
             | true =>
               match wrappingRangeContains validRange p.offsetBytes with
               | true => .valid
@@ -5210,13 +5379,14 @@ if the field value is an `.aggregate _ _` (e.g., a nested newtype wrapper
 -/
 @[reducible]
 def validateNoFieldLayoutScalarValueProto
+    (layouts : LayoutTable)
     (mem : Memory)
     (sl : ScalarLayout)
     (v : Value) :
     TypedBytesValidityProto :=
   match v with
   | .aggregate _ _ => .unsupported
-  | _ => validateScalarLayoutValueProto mem sl v
+  | _ => validateScalarLayoutValueProto layouts mem sl v
 
 /--
 Validate a structured `Value` against `LayoutTable` entry `lIdx` (driving ADT
@@ -5246,7 +5416,7 @@ def validateValueAtLayoutIdxProto (mem : Memory) :
               | _ => .ub
             | false =>
               match l.backendRepr with
-              | .scalar s0 => validateScalarLayoutValueProto mem s0 v
+              | .scalar s0 => validateScalarLayoutValueProto layouts mem s0 v
               | _ => .unsupported
           | .array _ count =>
             match v with
@@ -5282,9 +5452,9 @@ def validateValueAtLayoutIdxProto (mem : Memory) :
                 | false =>
                   match offsets, fieldVals, l.backendRepr with
                   | _ :: .nil, v0 :: .nil, .scalar s0 =>
-                    validateNoFieldLayoutScalarValueProto mem s0 v0
+                    validateNoFieldLayoutScalarValueProto layouts mem s0 v0
                   | off0 :: off1 :: .nil, v0 :: v1 :: .nil, .scalarPair s0 s1 =>
-                    match scalarLayoutByteWidth s0, scalarLayoutByteWidth s1 with
+                    match scalarLayoutTargetByteWidthProto layouts s0, scalarLayoutTargetByteWidthProto layouts s1 with
                     | .some sz0, .some sz1 =>
                       match scalarPairOffsetsValidProto l.size.bytes off0 off1 memIdx sz0 sz1 with
                       | .none => .unsupported
@@ -5292,12 +5462,12 @@ def validateValueAtLayoutIdxProto (mem : Memory) :
                         match memIdx with
                         | 0 :: 1 :: .nil =>
                           combineTypedValidityProto
-                            (validateNoFieldLayoutScalarValueProto mem s0 v0)
-                            (validateNoFieldLayoutScalarValueProto mem s1 v1)
+                            (validateNoFieldLayoutScalarValueProto layouts mem s0 v0)
+                            (validateNoFieldLayoutScalarValueProto layouts mem s1 v1)
                         | 1 :: 0 :: .nil =>
                           combineTypedValidityProto
-                            (validateNoFieldLayoutScalarValueProto mem s0 v1)
-                            (validateNoFieldLayoutScalarValueProto mem s1 v0)
+                            (validateNoFieldLayoutScalarValueProto layouts mem s0 v1)
+                            (validateNoFieldLayoutScalarValueProto layouts mem s1 v0)
                         | _ => .unsupported
                     | _, _ => .unsupported
                   | _, _, _ => .unsupported
@@ -7209,7 +7379,7 @@ theorem layoutDataMaskProto_scalar_array_exact
     (hStrideEq : elemFl.size.bytes = stride.bytes)
     (hTotal : count * stride.bytes = l.size.bytes)
     (hRepr : elemFl.backendRepr = .scalar (.initialized pk r))
-    (hWidth : scalarLayoutByteWidth (.initialized pk r) = .some elemFl.size.bytes) :
+    (hWidth : scalarLayoutTargetByteWidthProto layouts (.initialized pk r) = .some elemFl.size.bytes) :
     layoutDataMaskProto (fuel + 1) layouts lIdx = .some (replicateBoolProto true l.size.bytes) := by
   unfold layoutDataMaskProto
   rw [hLook]; dsimp only
@@ -7274,7 +7444,7 @@ theorem layoutDataMaskProto_array_union_no_fields_none
         (match Bool.and (Nat.beq elemFl.size.bytes stride.bytes) (Bool.not elemFl.isUninhabited),
           VariantsShape.single ev, BackendRepr.scalar (ScalarLayout.union pk) with
          | true, .single _, .scalar (.initialized pk validRange) =>
-           match scalarLayoutByteWidth (.initialized pk validRange) with
+           match scalarLayoutTargetByteWidthProto layouts (.initialized pk validRange) with
            | .some scalarBytes => Nat.beq scalarBytes elemFl.size.bytes
            | .none => false
          | _, _, _ => false) = false := by
@@ -7308,8 +7478,8 @@ theorem exactTyByteSizeProto?_rejects_inconsistent_explicit
   have hCons : explicitLayoutConsistentProto localDecls layouts ty.kind l = false := by
     unfold explicitLayoutConsistentProto
     dsimp only
-    rw [hStruct]
-    exact hNe
+    rw [hStruct]; dsimp only
+    rw [hNe]
   refine ⟨?_, hCons⟩
   unfold exactTyByteSizeProto?
   rw [hSized]
@@ -7317,6 +7487,121 @@ theorem exactTyByteSizeProto?_rejects_inconsistent_explicit
   rw [hRes, hLook]
   simp only [Bool.not_false]
   rw [hCons]
+
+/--
+**Unresolved `layoutIdx = 0` Pointer-Decl Rejection Theorem**:
+A `LocalDecl` whose `layoutIdx = 0` (the default unresolved index) NEVER causes
+`declPtrToPointeeByteSizeProto?` to adopt `layouts.entries[0]`: scanning skips
+it and continues identically on `rest`, preventing an unrelated `entries[0]`
+layout from confirming a custom-DST wide pointer as thin (or vice versa).
+-/
+theorem declPtrToPointeeByteSizeProto?_ignores_unresolved_zero
+    (layouts : LayoutTable) (pointee : RigidTy) (decl : LocalDecl) (rest : List LocalDecl)
+    (hZero : decl.ty.layoutIdx = 0) :
+    declPtrToPointeeByteSizeProto? layouts pointee (decl :: rest) =
+      declPtrToPointeeByteSizeProto? layouts pointee rest := by
+  have hUnres : isUnresolvedLayoutIdx layouts decl.ty.layoutIdx = true := by
+    unfold isUnresolvedLayoutIdx
+    rw [hZero]
+  rw [declPtrToPointeeByteSizeProto?]
+  cases decl.ty.kind with
+  | ref m p =>
+    dsimp only
+    rw [hUnres]
+    simp only [Bool.not_true, Bool.and_false]
+  | rawPtr m p =>
+    dsimp only
+    rw [hUnres]
+    simp only [Bool.not_true, Bool.and_false]
+  | _ => rfl
+
+/--
+**Shape Consistency Rejection Theorem (`explicitLayoutConsistentProto`)**:
+A `.primitive` `TypeLayout` entry `l` is NEVER consistent with any `.array elem n`
+or `.tuple ks` (for every `localDecls`, `layouts`, and `l`), closing the gap where
+e.g. `[u8; 8]` labeled with `u64`'s 8-aligned `.primitive` entry or `(u8, u8, u8, u8)`
+labeled with `u32`'s 4-aligned `.primitive` entry would inherit inflated alignment.
+-/
+theorem explicitLayoutConsistentProto_rejects_primitive_for_array_and_tuple
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (elem : RigidTy) (n : Nat)
+    (ks : List RigidTy) (l : TypeLayout)
+    (hPrim : l.fields = .primitive) :
+    explicitLayoutConsistentProto localDecls layouts (.array elem n) l = false ∧
+    explicitLayoutConsistentProto localDecls layouts (.tuple ks) l = false := by
+  refine ⟨?_, ?_⟩
+  · unfold explicitLayoutConsistentProto
+    dsimp only
+    cases exactRigidTyByteSizeProto? localDecls layouts (.array elem n) with
+    | none => dsimp only; rw [hPrim]
+    | some sz =>
+      dsimp only
+      cases Nat.beq sz l.size.bytes with
+      | false => rfl
+      | true => dsimp only; rw [hPrim]
+  · unfold explicitLayoutConsistentProto
+    dsimp only
+    cases exactRigidTyByteSizeProto? localDecls layouts (.tuple ks) with
+    | none => dsimp only; rw [hPrim]; cases l.variants <;> rfl
+    | some sz =>
+      dsimp only
+      cases Nat.beq sz l.size.bytes with
+      | false => rfl
+      | true => dsimp only; rw [hPrim]; cases l.variants <;> rfl
+
+/--
+**Fragmented-Provenance Non-Null Pointer Fail-Closed Theorem**:
+For ANY little-endian `LayoutTable` with pointer width `ptrBytes ≥ 2`, ANY
+non-null pointer `ScalarLayout` (`validRange.start = 1`), and ANY fragmented byte
+sequence whose first byte carries provenance `.some (aid, tag)` and whose second
+byte carries `.none` (followed by any `ptrBytes - 2` initialized bytes),
+`validateScalarLayoutBytesProto` fails closed with `.unsupported` (NEVER `.valid`),
+closing the `Bytes.mergeByteProvenance` partial-pointer bypass.
+-/
+theorem validateScalarLayoutBytesProto_partial_prov_nonnull_unsupported
+    (layouts : LayoutTable) (mem : Memory) (addrSpace aid tag : Nat)
+    (b0 b1 : UInt8) (tail : List AbstractByte) (rEnd : Nat)
+    (hLE : layouts.isLittleEndian = true)
+    (hLen : length (.init b0 (.some (aid, tag)) :: .init b1 .none :: tail) = layoutPointerBytes layouts)
+    (hDec : ∃ sv prov, decodeLittleEndianBytes tail = .some (sv, prov)) :
+    validateScalarLayoutBytesProto layouts
+      (.initialized (.pointer addrSpace) ⟨1, rEnd⟩)
+      (.init b0 (.some (aid, tag)) :: .init b1 .none :: tail) mem = .unsupported := by
+  rcases hDec with ⟨tailBits, tailProv, hTailDec⟩
+  unfold validateScalarLayoutBytesProto
+  rw [hLE]; dsimp only
+  have hLenBeq : Nat.beq (length (.init b0 (.some (aid, tag)) :: .init b1 .none :: tail))
+      (layoutPointerBytes layouts) = true := Nat.beq_eq.mpr hLen
+  rw [hLenBeq]; dsimp only
+  unfold decodeScalarBytes
+  dsimp only
+  have hPos : Nat.beq (length (.init b0 (.some (aid, tag)) :: .init b1 .none :: tail)) 0 = false := rfl
+  rw [hPos]; dsimp only
+  unfold decodeLittleEndianBytes
+  unfold decodeLittleEndianBytes
+  rw [hTailDec]; dsimp only
+  cases tailProv with
+  | none =>
+    unfold mergeByteProvenance
+    dsimp only
+    have hNotSame :
+        allBytesSameProvProto aid tag (.init b0 (.some (aid, tag)) :: .init b1 .none :: tail) = false := by
+      unfold allBytesSameProvProto
+      unfold allBytesSameProvProto
+      simp only [Bool.and_false]
+    rw [hNotSame]; dsimp only
+    unfold validRangeCoversAllProto
+    rfl
+  | some p =>
+    unfold mergeByteProvenance
+    dsimp only
+    have hNotSame :
+        allBytesSameProvProto aid tag (.init b0 (.some (aid, tag)) :: .init b1 .none :: tail) = false := by
+      unfold allBytesSameProvProto
+      unfold allBytesSameProvProto
+      simp only [Bool.and_false]
+    rw [hNotSame]; dsimp only
+    unfold validRangeCoversAllProto
+    rfl
 
 /--
 **`black_box` Preservation Theorem**:

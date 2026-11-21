@@ -2856,7 +2856,192 @@ theorem b4_universal_theorems_non_vacuous :
     { size := ⟨8⟩, align := ⟨4⟩, fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1], variants := .single 0,
       backendRepr := .memory, fieldLayouts := [5, 5], isUninhabited := false } 1 rfl rfl rfl rfl rfl
 
-/-! ## Section 19: Non-Vacuity Witnesses & Mechanical Standard-Axiom Gate -/
+/-! ## Section 19: Pass A4 Final Hardening & Soundness Witnesses -/
+
+/-- 19(a): structural-shape layout consistency (`explicitLayoutConsistentProto`) AND unresolved
+`layoutIdx = 0` pointer-declaration guard (`declPtrToPointeeByteSizeProto?`):
+- `[u8; 8]` mislabeled with `u64`'s 8-byte, 8-aligned `.primitive` entry (`size` matches, `fields`
+  mismatches!): `explicitLayoutConsistentProto = false`, `copy::<u64>` with `count = 0` faults `.ub`
+  (previously accepted by B4!), and `ptr_mask(p, !7)` fails closed `.unsupported`;
+- `(u8, u8, u8, u8)` mislabeled with `u32`'s 4-byte, 4-aligned `.primitive` entry: `copy::<u32>`
+  with `count = 0` faults `.ub` and `ptr_mask(p, !3)` fails closed `.unsupported`;
+- `u8` mislabeled with a malformed 1-byte, 4-aligned `.primitive` entry (`align > size`): rejected;
+- `{ kind := .ref .not packetK, layoutIdx := 0 }` (unresolved default `layoutIdx = 0`) when
+  `entries[0]` is an 8-byte `.primitive` scalar NEVER adopts `entries[0]`: `declPtrToPointeeByteSizeProto?`
+  returns `.none` (so `copy::<&Packet>` stays `.unsupported`), and skips straight to a subsequent
+  resolved `refPacketTy` (`size = 16`). -/
+theorem explicit_layout_shape_consistency_and_decl_ptr_zero_guard :
+    let lShape : LayoutTable :=
+      { pointerBits := 64
+        isLittleEndian := true
+        entries :=
+          [ -- idx 0: 8-byte `.primitive` (e.g. return place `u64` / `*const u8`)
+            { size := ⟨8⟩, align := ⟨8⟩, fields := .primitive, variants := .single 0,
+              backendRepr := .scalar (.initialized (.int 64 false) ⟨0, 18446744073709551615⟩), isUninhabited := false },
+            -- idx 1: 8-byte, 8-aligned `.primitive` (`u64`)
+            { size := ⟨8⟩, align := ⟨8⟩, fields := .primitive, variants := .single 0,
+              backendRepr := .scalar (.initialized (.int 64 false) ⟨0, 18446744073709551615⟩), isUninhabited := false },
+            -- idx 2: 4-byte, 4-aligned `.primitive` (`u32`)
+            { size := ⟨4⟩, align := ⟨4⟩, fields := .primitive, variants := .single 0,
+              backendRepr := .scalar (.initialized (.int 32 false) ⟨0, 4294967295⟩), isUninhabited := false },
+            -- idx 3: malformed 1-byte, 4-aligned `.primitive` (`align > size`)
+            { size := ⟨1⟩, align := ⟨4⟩, fields := .primitive, variants := .single 0,
+              backendRepr := .scalar (.initialized (.int 8 false) ⟨0, 255⟩), isUninhabited := false },
+            -- idx 4: 16-byte wide pointer (`&Packet`)
+            { size := ⟨16⟩, align := ⟨8⟩, fields := .arbitrary [⟨0⟩, ⟨8⟩] [0, 1], variants := .single 0,
+              backendRepr := .scalarPair (.initialized (.pointer 0) ⟨1, 18446744073709551615⟩)
+                (.initialized (.int 64 false) ⟨0, 18446744073709551615⟩), isUninhabited := false } ] }
+    let arrU8x8Bogus : Ty := { kind := .array (.uint .u8) 8, layoutIdx := 1 }
+    let tupU8x4Bogus : Ty := { kind := .tuple [.uint .u8, .uint .u8, .uint .u8, .uint .u8], layoutIdx := 2 }
+    let u8OverAlign : Ty := { kind := .uint .u8, layoutIdx := 3 }
+    let decls := [mkDecl unitTy, mkDecl arrU8x8Bogus, mkDecl tupU8x4Bogus, mkDecl u8OverAlign]
+    let locals : List LocalSlot := [.uninit, .init .unit, .init .unit, .init (mkU8 1)]
+    let b (t l : Nat) : BorrowEntry := { tag := t, targetLocal := l, targetProjection := [], perm := .unique }
+    let s := mkState locals [b 1 1, b 2 2, b 3 3]
+    let p (t : Nat) : Value := .ptr { allocId := t, offsetBytes := 0 } 8
+    let rArrCopyZero := evalCopyProto s (mkTarget "core::intrinsics::copy" [.uint .u64]) decls lShape []
+      [p 1, p 1, mkUsize 0] locals dstLocal0 (.some 1)
+    let rArrMask := evalPtrMaskProto s decls lShape [p 1, mkUsize 18446744073709551608] locals dstLocal0 (.some 1)
+    let rTupCopyZero := evalCopyProto s (mkTarget "core::intrinsics::copy" [.uint .u32]) decls lShape []
+      [p 2, p 2, mkUsize 0] locals dstLocal0 (.some 1)
+    let rTupMask := evalPtrMaskProto s decls lShape [p 2, mkUsize 18446744073709551612] locals dstLocal0 (.some 1)
+    let rU8OverCopy := evalCopyProto s (mkTarget "core::intrinsics::copy" [.uint .u32]) decls lShape []
+      [p 3, p 3, mkUsize 0] locals dstLocal0 (.some 1)
+    -- Unresolved `layoutIdx = 0` on `&Packet` when `entries[0]` is 8 bytes:
+    let refPktUnres : Ty := { kind := .ref .not packetK, layoutIdx := 0 }
+    let refPktWide : Ty := { kind := .ref .not packetK, layoutIdx := 4 }
+    let g16 : CapturedAllocation :=
+      { allocId := 90, bytes := List.replicate 16 (.some 1), relocations := [], align := ⟨8⟩, mutability := .mut }
+    let sg := mkState [.uninit] [] [] [g16]
+    let rPktCopyUnres := evalCopyProto sg (mkTarget "core::intrinsics::copy" [.ref .not packetK])
+      [mkDecl unitTy, mkDecl refPktUnres] lShape [] [p 90, p 90, mkUsize 1] [.uninit] dstLocal0 (.some 1)
+    isUbNode rArrCopyZero = true ∧
+    isUnsupportedNode rArrMask = true ∧
+    isUbNode rTupCopyZero = true ∧
+    isUnsupportedNode rTupMask = true ∧
+    isUbNode rU8OverCopy = true ∧
+    declPtrToPointeeByteSizeProto? lShape packetK [mkDecl refPktUnres] = .none ∧
+    declPtrToPointeeByteSizeProto? lShape packetK [mkDecl refPktUnres, mkDecl refPktWide] = .some 16 ∧
+    isUnsupportedNode rPktCopyUnres = true := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- 19(b): 32-bit `.pointer _` scalar width (`scalarLayoutTargetByteWidthProto`), fragmented
+provenance fail-closed (`allBytesSameProvProto`), restricted pointer `validRange` fail-closed
+(`validRangeCoversAllNonNullProto`), and big-endian `LayoutTable` fail-closed:
+- On 32-bit, `NonNull<u8>` (`size = 4`, `.pointer 0`, `1..=2^32-1`) validates 4-byte pointers as
+  `.valid` in BOTH bytes and `black_box`, rejects null as `.ub`, and builds a 8-byte data mask for
+  `[NonNull<u8>; 2]`;
+- Fragmented provenance (`[.init 0 (.some (1, 1))] ++ 7 * .init 0 .none`) fails closed `.unsupported`
+  in `NonNull<u8>`, `&u32`, `fn()`, and `*const dyn Trait` vtable (closing `mergeByteProvenance`
+  partial-pointer bypass), while raw `*const u8` stays `.valid`;
+- A restricted pointer `validRange = ⟨4, 16⟩` fails closed `.unsupported` on provenance pointers in
+  both byte and value validation;
+- Big-endian `LayoutTable` (`isLittleEndian = false`) fails closed on byte validation, encoding,
+  decoding, and stack `compare_bytes`. -/
+theorem target_ptr_width_scalar_layout_partial_prov_niche_and_big_endian :
+    let l32Ptr : LayoutTable :=
+      { pointerBits := 32
+        isLittleEndian := true
+        entries :=
+          [ { size := ⟨0⟩, align := ⟨1⟩, fields := .arbitrary [] [], variants := .single 0,
+              backendRepr := .memory, isUninhabited := false },
+            -- idx 1: 32-bit `NonNull<u8>` (size 4, align 4, `.pointer 0`, range 1..=u32::MAX)
+            { size := ⟨4⟩, align := ⟨4⟩, fields := .primitive, variants := .single 0,
+              backendRepr := .scalar (.initialized (.pointer 0) ⟨1, 4294967295⟩), isUninhabited := false },
+            -- idx 2: `[NonNull<u8>; 2]` on 32-bit (size 8)
+            { size := ⟨8⟩, align := ⟨4⟩, fields := .array ⟨4⟩ 2, variants := .single 0,
+              backendRepr := .memory, fieldLayouts := [1], isUninhabited := false },
+            -- idx 3: 32-bit restricted-range pointer (`validRange = 4..=16`)
+            { size := ⟨4⟩, align := ⟨4⟩, fields := .primitive, variants := .single 0,
+              backendRepr := .scalar (.initialized (.pointer 0) ⟨4, 16⟩), isUninhabited := false } ] }
+    let nn32Ty : Ty := { kind := .adt "core::ptr::NonNull" [.uint .u8], layoutIdx := 1 }
+    let niche32Ty : Ty := { kind := .adt "tests::NichePtr32" [], layoutIdx := 3 }
+    let mProv : Memory :=
+      { emptyMemory with borrows := [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .unique }] }
+    let validPtr4 : List AbstractByte := List.replicate 4 (.init 0 (.some (1, 1)))
+    let null4 : List AbstractByte := List.replicate 4 (.init 0 .none)
+    let frag8 : List AbstractByte := .init 0 (.some (1, 1)) :: List.replicate 7 (.init 0 .none)
+    let nonNull8 : List AbstractByte := [.init 1 .none] ++ List.replicate 7 (.init 0 .none)
+    let bb (L : LayoutTable) (decls : List LocalDecl) (ty : RigidTy) (v : Value) : MirStepNode :=
+      evalBlackBoxProto (mkState [.uninit] mProv.borrows) (mkTarget "core::intrinsics::black_box" [ty])
+        decls L [] [v] [.uninit] dstLocal0 (.some 1)
+    let beLayouts : LayoutTable := { pointerBits := 64, isLittleEndian := false, entries := protoLayouts.entries }
+    let sBe := mkState [.uninit, .init (mkU32 1)]
+      [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .unique }]
+    let rBeCmp := evalCompareBytesProto sBe [mkDecl i32Ty, mkDecl u32Ty] beLayouts
+      [.ptr { allocId := 1, offsetBytes := 0 } 8, .ptr { allocId := 1, offsetBytes := 0 } 8, mkUsize 4]
+      [.uninit, .init (mkU32 1)] dstLocal0 (.some 1)
+    validateTypedBytesForLayoutIdxProto 8 l32Ptr 1 validPtr4 mProv = .valid ∧
+    validateTypedBytesForLayoutIdxProto 8 l32Ptr 1 null4 mProv = .ub ∧
+    stepLocals? (bb l32Ptr [mkDecl unitTy, mkDecl nn32Ty] nn32Ty.kind (.ptr { allocId := 1, offsetBytes := 0 } 4)) =
+      .some [.init (.ptr { allocId := 1, offsetBytes := 0 } 4)] ∧
+    layoutDataMaskProto 8 l32Ptr 2 = .some [true, true, true, true, true, true, true, true] ∧
+    validateTypedBytesForLayoutIdxProto 8 exactLayouts 4 frag8 mProv = .unsupported ∧
+    validateTypedBytesProto 8 [] protoLayouts (.ref .not (.uint .u32)) frag8 mProv = .unsupported ∧
+    validateTypedBytesProto 8 [] protoLayouts (.fnPtr .nil (.tuple .nil) .safe .rust) frag8 mProv = .unsupported ∧
+    validateTypedBytesProto 8 [] protoLayouts (.rawPtr .not (.dynamic "tests::Trait")) (nonNull8 ++ frag8) mProv = .unsupported ∧
+    validateTypedBytesProto 8 [] protoLayouts (.rawPtr .not (.uint .u8)) frag8 mProv = .valid ∧
+    validateTypedBytesForLayoutIdxProto 8 l32Ptr 3 validPtr4 mProv = .unsupported ∧
+    isUnsupportedNode (bb l32Ptr [mkDecl unitTy, mkDecl niche32Ty] niche32Ty.kind (.ptr { allocId := 1, offsetBytes := 0 } 4)) = true ∧
+    validateTypedBytesProto 8 [] beLayouts (.uint .u32) (List.replicate 4 (.init 1 .none)) = .unsupported ∧
+    validateTypedBytesForLayoutIdxProto 8 beLayouts 1 (List.replicate 8 (.init 1 .none)) = .unsupported ∧
+    encodeRawValueBytesProto 8 [] beLayouts u32Ty (mkU32 1) = .none ∧
+    decodePartialUninitValueProto 8 [] beLayouts u32Ty (List.replicate 4 (.init 1 .none)) = .none ∧
+    isUnsupportedNode rBeCmp = true := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- 19(c): `raw_eq` and `typed_swap_nonoverlapping` reject null pointers, malformed non-pointer
+arguments, and uninhabited sized `T` as `.ub` even when `T` has undetermined layout size (`&Packet`,
+opaque ADT) or the pointer's root allocation alignment is undetermined. -/
+theorem raw_eq_and_typed_swap_null_malformed_uninhabited_not_masked :
+    let opaqueTy : Ty := { kind := .adt "tests::Opaque" [], layoutIdx := 99 }
+    let decls := [mkDecl boolTy, mkDecl opaqueTy]
+    let locals : List LocalSlot := [.uninit, .init .unit]
+    let b1 : BorrowEntry := { tag := 1, targetLocal := 1, targetProjection := [], perm := .unique }
+    let s := mkState locals [b1]
+    let p1 : Value := .ptr { allocId := 1, offsetBytes := 0 } 8
+    isUbNode (evalRawEqProto s (mkTarget "core::intrinsics::raw_eq" [.ref .not packetK])
+      decls dstLayouts [] [mkUsize 0, p1] locals dstLocal0 (.some 1)) = true ∧
+    isUbNode (evalTypedSwapNonOverlappingProto s (mkTarget "core::intrinsics::typed_swap_nonoverlapping" [.ref .not packetK])
+      [mkDecl unitTy, mkDecl opaqueTy] dstLayouts [] [mkUsize 0, p1] locals dstLocal0 (.some 1)) = true ∧
+    isUbNode (evalRawEqProto s (mkTarget "core::intrinsics::raw_eq" [opaqueTy.kind])
+      decls protoLayouts [] [.unit, p1] locals dstLocal0 (.some 1)) = true ∧
+    isUbNode (evalTypedSwapNonOverlappingProto s (mkTarget "core::intrinsics::typed_swap_nonoverlapping" [opaqueTy.kind])
+      [mkDecl unitTy, mkDecl opaqueTy] protoLayouts [] [.unit, p1] locals dstLocal0 (.some 1)) = true ∧
+    isUbNode (evalRawEqProto s (mkTarget "core::intrinsics::raw_eq" [.tuple [.uint .u32, .never]])
+      decls protoLayouts [] [p1, p1] locals dstLocal0 (.some 1)) = true ∧
+    isUbNode (evalTypedSwapNonOverlappingProto s (mkTarget "core::intrinsics::typed_swap_nonoverlapping" [.tuple [.uint .u32, .never]])
+      [mkDecl unitTy, mkDecl opaqueTy] protoLayouts [] [p1, p1] locals dstLocal0 (.some 1)) = true := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- 19(d): non-vacuity witnesses for all three pass-A4 universally quantified prototype theorems
+(`declPtrToPointeeByteSizeProto?_ignores_unresolved_zero`,
+`explicitLayoutConsistentProto_rejects_primitive_for_array_and_tuple`, and
+`validateScalarLayoutBytesProto_partial_prov_nonnull_unsupported`). -/
+theorem a4_universal_theorems_non_vacuous :
+    let u64Prim : TypeLayout :=
+      { size := ⟨8⟩, align := ⟨8⟩, fields := .primitive, variants := .single 0,
+        backendRepr := .scalar (.initialized (.int 64 false) ⟨0, 18446744073709551615⟩), isUninhabited := false }
+    let refPktZero : LocalDecl := mkDecl { kind := .ref .not packetK, layoutIdx := 0 }
+    declPtrToPointeeByteSizeProto? dstLayouts packetK [refPktZero, mkDecl refPacketTy] =
+      declPtrToPointeeByteSizeProto? dstLayouts packetK [mkDecl refPacketTy] ∧
+    (explicitLayoutConsistentProto [] protoLayouts (.array (.uint .u8) 8) u64Prim = false ∧
+      explicitLayoutConsistentProto [] protoLayouts (.tuple [.uint .u8, .uint .u8]) u64Prim = false) ∧
+    validateScalarLayoutBytesProto protoLayouts
+      (.initialized (.pointer 0) ⟨1, 18446744073709551615⟩)
+      (.init 0 (.some (1, 1)) :: .init 0 .none :: List.replicate 6 (.init 0 .none)) emptyMemory = .unsupported := by
+  refine ⟨?_, ?_, ?_⟩
+  · exact declPtrToPointeeByteSizeProto?_ignores_unresolved_zero dstLayouts packetK
+      (mkDecl { kind := .ref .not packetK, layoutIdx := 0 }) [mkDecl refPacketTy] rfl
+  · exact explicitLayoutConsistentProto_rejects_primitive_for_array_and_tuple [] protoLayouts
+      (.uint .u8) 8 [.uint .u8, .uint .u8]
+      { size := ⟨8⟩, align := ⟨8⟩, fields := .primitive, variants := .single 0,
+        backendRepr := .scalar (.initialized (.int 64 false) ⟨0, 18446744073709551615⟩), isUninhabited := false }
+      rfl
+  · exact validateScalarLayoutBytesProto_partial_prov_nonnull_unsupported protoLayouts emptyMemory
+      0 1 1 0 0 (List.replicate 6 (.init 0 .none)) 18446744073709551615 rfl rfl ⟨0, .none, rfl⟩
+
+/-! ## Section 20: Non-Vacuity Witnesses & Mechanical Standard-Axiom Gate -/
 
 /--
 Non-vacuity witness instantiating EVERY universally quantified theorem in
@@ -3072,6 +3257,10 @@ theorem all_proto_and_test_theorems :
   have _ := a3_universal_theorems_non_vacuous
   have _ := inconsistent_explicit_layout_index_not_trusted
   have _ := b4_universal_theorems_non_vacuous
+  have _ := explicit_layout_shape_consistency_and_decl_ptr_zero_guard
+  have _ := target_ptr_width_scalar_layout_partial_prov_niche_and_big_endian
+  have _ := raw_eq_and_typed_swap_null_malformed_uninhabited_not_masked
+  have _ := a4_universal_theorems_non_vacuous
   have _ := non_vacuity_all_quantified_theorems
   exact ⟨rfl, compareUnsignedBytesProto_eq_miriBytesCompareSpec, ptrMask_baseAddr_invariant,
     evalPtrOffsetFromDistanceProto_eq_miriSpec, misaligned_offset_has_misaligned_placement, trivial⟩
@@ -3223,6 +3412,10 @@ elab "#assert_proto_standard_axioms " ids:ident* : command => do
   a3_universal_theorems_non_vacuous
   inconsistent_explicit_layout_index_not_trusted
   b4_universal_theorems_non_vacuous
+  explicit_layout_shape_consistency_and_decl_ptr_zero_guard
+  target_ptr_width_scalar_layout_partial_prov_niche_and_big_endian
+  raw_eq_and_typed_swap_null_malformed_uninhabited_not_masked
+  a4_universal_theorems_non_vacuous
   non_vacuity_all_quantified_theorems
   all_proto_and_test_theorems
 
