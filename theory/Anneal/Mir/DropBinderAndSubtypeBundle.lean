@@ -1042,7 +1042,7 @@ theorem lm_modeSensitivity_present_with (lmAuth : Corpus.ObsAuthority Ep2Key Ep2
   rfl
 
 /-- Every per-variant bundle carries genuine `correspondenceClaim`, `faultEquivClaim`,
-and flip-direction guards (`mrFlip.verdict_flips`, `lmFlip.verdict_flips`) on BOTH
+and non-vacuous flip-direction guards (`okAgree`, `faultA`, `faultR`) on BOTH
 authorities (ruling out constant-outcome collapse for all 8 variants)! -/
 theorem variant_bundle_claims_with (v : Ep2Variant) (lmAuth : Corpus.ObsAuthority Ep2Key Ep2ObsVal)
     (hLM : lmVariantCheckOf v lmAuth = true) :
@@ -1052,11 +1052,27 @@ theorem variant_bundle_claims_with (v : Ep2Variant) (lmAuth : Corpus.ObsAuthorit
     CorrespondenceClaim B.lmRel ∧
     FaultEquivClaim B.lmRel ∧
     B.mrFlip.m = .basicMemory ∧
-    B.lmFlip.m = false :=
+    B.lmFlip.m = false ∧
+    (∃ a r, B.mrRel.ExecA B.mrFlip.m B.mrFlip.pOk B.mrFlip.qOk B.mrFlip.cOk (.normal a) ∧
+            B.mrRel.ExecR B.mrFlip.m B.mrFlip.pOk B.mrFlip.qOk B.mrFlip.cOk (.normal r) ∧
+            B.mrRel.RetRel a r) ∧
+    B.mrRel.ExecA B.mrFlip.m B.mrFlip.pFault B.mrFlip.qFault B.mrFlip.cFault (.fault B.mrFlip.kind) ∧
+    B.mrRel.ExecR B.mrFlip.m B.mrFlip.pFault B.mrFlip.qFault B.mrFlip.cFault (.fault B.mrFlip.kind) ∧
+    (∃ a r, B.lmRel.ExecA B.lmFlip.m B.lmFlip.pOk B.lmFlip.qOk B.lmFlip.cOk (.normal a) ∧
+            B.lmRel.ExecR B.lmFlip.m B.lmFlip.pOk B.lmFlip.qOk B.lmFlip.cOk (.normal r) ∧
+            B.lmRel.RetRel a r) ∧
+    B.lmRel.ExecA B.lmFlip.m B.lmFlip.pFault B.lmFlip.qFault B.lmFlip.cFault (.fault B.lmFlip.kind) ∧
+    B.lmRel.ExecR B.lmFlip.m B.lmFlip.pFault B.lmFlip.qFault B.lmFlip.cFault (.fault B.lmFlip.kind) :=
   ⟨(variantBundleWith v lmAuth hLM).mrSim.correspondenceClaim,
    (variantBundleWith v lmAuth hLM).mrSim.faultEquivClaim,
    (variantBundleWith v lmAuth hLM).lmSim.correspondenceClaim,
    (variantBundleWith v lmAuth hLM).lmSim.faultEquivClaim,
-   rfl, rfl⟩
+   rfl, rfl,
+   (variantBundleWith v lmAuth hLM).mrFlip.okAgree,
+   (variantBundleWith v lmAuth hLM).mrFlip.faultA,
+   (variantBundleWith v lmAuth hLM).mrFlip.faultR,
+   (variantBundleWith v lmAuth hLM).lmFlip.okAgree,
+   (variantBundleWith v lmAuth hLM).lmFlip.faultA,
+   (variantBundleWith v lmAuth hLM).lmFlip.faultR⟩
 
 end Anneal.Mir.DropBinderAndSubtypeBundle

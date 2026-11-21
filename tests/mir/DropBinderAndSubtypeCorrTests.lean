@@ -37,7 +37,7 @@ Verifies all 8 already-trusted MIR variants end-to-end across BOTH authorities:
    - closed unified `DualCorrespondenceBundle` + all 8 per-variant bundles,
    - instantiated `threeWayNormalAgreement`, `crossAuthorityFaultEquiv`,
      `exactBehaviorEq_both`, `lm_modeSensitivity_present`, and per-variant claims
-     + flip-direction guards (`mrFlip.verdict_flips`, `lmFlip.verdict_flips`),
+     + flip-direction guards (`mrFlip.{okAgree, faultA, faultR}`, `lmFlip.{okAgree, faultA, faultR}`),
    - **definitional `rfl` fixture locks** proving every `CapturedMir` fixture in
      `MiniRustSpec.DropBinderAndSubtypeMR` / `Anneal.Mir.DropBinderAndSubtypeBundle`
      is definitionally equal to the fixture executed in `LeanMiriSpec.DropBinderAndSubtypeLM`,

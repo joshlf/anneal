@@ -1579,13 +1579,13 @@ private theorem lmScalarUInt_7_eq_fromScalarInt :
     lmScalarUInt 7 4 = Miri.Memory.Scalar.fromScalarInt lmMsc7 := by
   decide +kernel
 
-private theorem runMiriSteps_v8ClosureCap_ok (protectedMode : Bool) :
+private theorem runMiriSteps_v8ClosureCap_ok (treeBorrows : Bool) :
     let mCapOk := mkV8ClosureCapState (.live (.immediate (.scalar (lmScalarUInt 7 4))))
-    (match runMiriSteps (annealStepHooksDropBinderSubtype v8ClosureCapMir protectedMode) 8 mCapOk with
+    (match runMiriSteps (annealStepHooksDropBinderSubtype v8ClosureCapMir treeBorrows) 8 mCapOk with
       | .ok (st', some (.live (.indirect mp))) => readIndirectPairU32Ptr st' mp
       | _ => none) = some (lmScalarUInt 7 4, lmPtrScalar lmAid1 lmBase1) := by
   intro mCapOk
-  let hooks := annealStepHooksDropBinderSubtype v8ClosureCapMir protectedMode
+  let hooks := annealStepHooksDropBinderSubtype v8ClosureCapMir treeBorrows
   let mach : AnnealMachine :=
     { memory := { AnnealMachine.empty.memory with live := #[(lmAid2, ⟨.stack, lmUninit16Alloc⟩)] },
       addresses := { AnnealMachine.empty.addresses with
@@ -1638,7 +1638,7 @@ private theorem runMiriSteps_v8ClosureCap_ok (protectedMode : Bool) :
       ({ stack := ⟨#[tf']⟩, machine := updateAllocMachine mach 0 lmAid2 .stack alloc2 }, .ok true) := by
     have hsame : Miri.Interpreter.Step.step hooks () mCapOk =
         Miri.Interpreter.Step.step (annealStepHooksUnwindFnPtrClosure v8ClosureCapMir) () mCapOk := by
-      cases protectedMode <;> rfl
+      cases treeBorrows <;> rfl
     rw [hsame]
     exact hm_step
   have htf_stack_eq :
@@ -1647,7 +1647,7 @@ private theorem runMiriSteps_v8ClosureCap_ok (protectedMode : Bool) :
       some (.stop false,
         .frameLocal 0 0 none (translateTyOverlay v8ClosureCapMirTy ep2ClosureCapLayouts) (.ofAllocationToken 0),
         3) := by
-    cases protectedMode <;> decide +kernel
+    cases treeBorrows <;> decide +kernel
   rw [hstep1_eq] at htf_stack_eq
   simp only [Array.getElem?_eq_getElem (show 0 < #[tf'].size from Nat.zero_lt_one),
              Array.getElem_singleton, Option.map_some] at htf_stack_eq
@@ -1717,7 +1717,7 @@ private theorem runMiriSteps_v8ClosureCap_ok (protectedMode : Bool) :
         rw [htm] at hterm_ret
         dsimp only at hterm_ret
         subst hterm_ret
-        cases protectedMode <;> (
+        cases treeBorrows <;> (
           dsimp only [hooks, annealStepHooksDropBinderSubtype, annealStepHooksUnwindFnPtrClosure,
                       annealStepHooksLM4_1, annealStepHooks, Miri.Interpreter.ControlFlow.evalTerminator,
                       Id.run, pure, Pure.pure]
@@ -2314,14 +2314,14 @@ theorem ep2LmObserve_drop_mode_sensitivity :
 (`variantIdx = 7, caseIdx = 1`) through vendored `Miri.Interpreter.Step.step`,
 `writeAggregate`, `Allocation.writeScalar` (`ProvenanceMap.insertPtr_new`), and
 `Allocation.readScalar ... true` (`ProvenanceMap.read_exact_pointer`). -/
-theorem ep2LmObserve_v8_cap (protectedMode : Bool) :
-    ep2LmObserve protectedMode 7 1 = lmObsClosureCap7_1 := by
-  have h := runMiriSteps_v8ClosureCap_ok protectedMode
+theorem ep2LmObserve_v8_cap (treeBorrows : Bool) :
+    ep2LmObserve treeBorrows 7 1 = lmObsClosureCap7_1 := by
+  have h := runMiriSteps_v8ClosureCap_ok treeBorrows
   dsimp only at h
-  change toLmObs (runMiriSteps (annealStepHooksDropBinderSubtype v8ClosureCapMir protectedMode) 8
+  change toLmObs (runMiriSteps (annealStepHooksDropBinderSubtype v8ClosureCapMir treeBorrows) 8
       (mkV8ClosureCapState (.live (.immediate (.scalar (lmScalarUInt 7 4)))))) = lmObsClosureCap7_1
   unfold toLmObs lmObsClosureCap7_1
-  cases hrun : runMiriSteps (annealStepHooksDropBinderSubtype v8ClosureCapMir protectedMode) 8
+  cases hrun : runMiriSteps (annealStepHooksDropBinderSubtype v8ClosureCapMir treeBorrows) 8
       (mkV8ClosureCapState (.live (.immediate (.scalar (lmScalarUInt 7 4))))) with
   | error e => rw [hrun] at h; cases h
   | ok pair =>
