@@ -8345,10 +8345,16 @@ theorem prepFnEntryRetagThin_preserves_meta {cur : CapturedMir} {loc : Local}
         | _ => cases h
 
 /--
-**Multi-parameter Stage-3 thin-reference stepping.** Any successful
-`prepFnEntryRetagThins cur locs` sequence whose per-local steps match
-`stepMirFn` (e.g. via `stepMirFn_retag_fnEntry_thinRef`) produces `length locs`
-trusted steps preserving `callStack`.
+**Multi-parameter Stage-3 thin-reference stepping (unindexed form).** A
+successful `prepFnEntryRetagThins cur locs` sequence produces `length locs`
+trusted steps preserving `callStack`, provided the per-local premise `hStep`
+holds. `hStep` constrains neither the statement index of `st` nor which
+parameter is retagged at which index, and `prepFnEntryRetagThin` does not read
+the statement index, so on a real callee block the premise already fails for a
+single parameter (the machine executes the next statement where the thin stage
+would retag the same local again). Only the empty parameter list discharges it
+in practice; use `prepFnEntryRetagThins_stepsTo_indexed` (or
+`prepFnEntryRetags_stepsTo`) for actual callees.
 -/
 theorem prepFnEntryRetagThins_stepsTo {body cur : CapturedMir} :
     ∀ (locs : List Local) {s s' : MachineState},
@@ -8640,9 +8646,9 @@ theorem stepMirFn_retag_fnEntry_any_ok {body cur : CapturedMir}
 
 /--
 **Statement-indexed multi-parameter Stage-3 stepping (`prepFnEntryRetags`).**
-Unlike `prepFnEntryRetagThins_stepsTo` (whose unindexed `loc ∈ locs` premise is
-unsatisfiable on 2+ parameters — see
-`prepFnEntryRetagThins_stepsTo_unindexed_premise_false_two_args`), `hStep`
+Unlike `prepFnEntryRetagThins_stepsTo` (whose unindexed `loc ∈ locs` premise
+fails on real callee blocks already for one parameter; the two-parameter case
+is `prepFnEntryRetagThins_stepsTo_unindexed_premise_false_two_args`), `hStep`
 tracks the exact statement offset `st.frame.stmtIdx = s.frame.stmtIdx + i` for
 `get? locs i = some loc`, discharging arbitrary multi-parameter mixed
 thin/fat/ZST reference retag sequences cleanly!

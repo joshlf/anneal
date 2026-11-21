@@ -2791,6 +2791,10 @@ inductive Prog : Type where
   | bitsU32ToI32
   /-- `_0 = copy _1 as i64 (Transmute)`, `_1 : u64`: 64-bit bit carrier. -/
   | bitsU64ToI64
+  /-- `_0 = copy _1 as u64 (FloatToInt)`, `_1 : f64`: unsigned saturation. -/
+  | f64ToU64
+  /-- `_0 = copy _1 as f64 (IntToFloat)`, `_1 : u64`: rounds above `2^53`. -/
+  | u64ToF64
   /-- `_0 = copy _1 as f32 (FloatToFloat)`, `_1 : f16`. -/
   | f16ToF32
   /-- `_0 = copy _1 as f32 (FloatToFloat)`, `_1 : f128`. -/
@@ -2833,7 +2837,7 @@ def allModes : List NanMode := [.deterministic, .nondeterministic]
 /-- All programs. -/
 def allProgs : List Prog :=
   [.f32ToF64, .f64ToF32, .f32ToI32, .i32ToF32, .bitsU32ToI32, .bitsU64ToI64,
-    .f16ToF32, .f128ToF32, .uninitCast]
+    .f64ToU64, .u64ToF64, .f16ToF32, .f128ToF32, .uninitCast]
 
 /-- All queries. -/
 def allQueries : List Query :=
@@ -2864,7 +2868,7 @@ def Query.bits64 : Query → Nat
 /-- Source bit pattern of a program on a query. -/
 def srcBits (p : Prog) (q : Query) : Nat :=
   match p with
-  | .f64ToF32 | .bitsU64ToI64 => q.bits64
+  | .f64ToF32 | .bitsU64ToI64 | .f64ToU64 | .u64ToF64 => q.bits64
   | .f16ToF32 => 0x3e00
   | .f128ToF32 => 0x3fff8000000000000000000000000000
   | _ => q.bits32
@@ -2894,6 +2898,10 @@ def castShape : Prog → Ty × Nat × Ty × CastKind
     (scalarTy (.uint .u32), 4, scalarTy (.int .i32), .transmute)
   | .bitsU64ToI64 =>
     (scalarTy (.uint .u64), 8, scalarTy (.int .i64), .transmute)
+  | .f64ToU64 =>
+    (scalarTy (.float .f64), 8, scalarTy (.uint .u64), .floatToInt)
+  | .u64ToF64 =>
+    (scalarTy (.uint .u64), 8, scalarTy (.float .f64), .intToFloat)
   | .f16ToF32 =>
     (scalarTy (.float .f16), 2, scalarTy (.float .f32), .floatToFloat)
   | .f128ToF32 =>
@@ -3071,6 +3079,11 @@ def lmReference (mode : NanMode) (p : Prog) (q : Query) (c : Pick) :
     some (.returns (twosComplement 32 (signedOfBits 32 q.bits32)))
   | .bitsU64ToI64 =>
     some (.returns (twosComplement 64 (signedOfBits 64 q.bits64)))
+  | .f64ToU64 =>
+    (Ref.toInteger .binary64 q.bits64 64 false).map fun i =>
+      Verdict.returns (twosComplement 64 i)
+  | .u64ToF64 =>
+    (Ref.fromInteger .binary64 (Int.ofNat q.bits64)).map Verdict.returns
   | .uninitCast => some .undefinedBehavior
   | .f16ToF32 => none
   | .f128ToF32 => none
@@ -3170,7 +3183,7 @@ def bundle :
 def lmKeys : List (NanMode × Prog × Query × Pick) :=
   allModes.flatMap fun m =>
     ([Prog.f32ToF64, .f64ToF32, .f32ToI32, .i32ToF32, .bitsU32ToI32,
-        .bitsU64ToI64].flatMap
+        .bitsU64ToI64, .f64ToU64, .u64ToF64].flatMap
       fun p => allQueries.flatMap fun q => allPicks.map fun c =>
         (m, p, q, c)) ++
     allPicks.map fun c => (m, .uninitCast, .onePointFive, c)
@@ -3185,7 +3198,7 @@ def lmUninitMessage : String := "read of uninitialized local"
 
 /-- Whether a program returns a 64-bit scalar. -/
 def returns64 : Prog → Bool
-  | .f32ToF64 | .bitsU64ToI64 => true
+  | .f32ToF64 | .bitsU64ToI64 | .f64ToU64 | .u64ToF64 => true
   | _ => false
 
 /-- The distinct normal returns of `lmReference` on the LeanMiri keys, with
@@ -3199,13 +3212,15 @@ def lmReturnDenotations : List (Nat × Bool) :=
 /-- The LeanMiri authority assembled from `Cast.cast` and `Step.step`
 observation functions: `widenObs bits flag pick` / `narrowObs bits flag pick`
 run `FloatToFloat` under the `floatNondeterministic` flag and oracle pick;
-`toIntObs`, `fromIntObs`, `carrier32Obs`, and `carrier64Obs` run `FloatToInt`,
-`IntToFloat`, and 32/64-bit `Transmute` directly on raw bit patterns;
+`toIntObs` / `toU64Obs`, `fromIntObs` / `fromU64Obs`, and `carrier32Obs` /
+`carrier64Obs` run `FloatToInt` (to `i32` / `u64`), `IntToFloat` (from `i32`
+/ `u64`), and 32/64-bit `Transmute` directly on raw bit patterns;
 `uninitObs body` steps the uninitialized-source cast; `ret32` / `ret64` /
 `ubObs` embed expected 4-byte scalars, 8-byte scalars, and diagnostics. -/
 def authorityOf (Obs : Type) (decEq : DecidableEq Obs)
     (widenObs narrowObs : Nat → Bool → Nat → Obs)
-    (toIntObs fromIntObs carrier32Obs carrier64Obs : Nat → Obs)
+    (toIntObs fromIntObs toU64Obs fromU64Obs carrier32Obs carrier64Obs :
+      Nat → Obs)
     (uninitObs : CapturedMir → Obs) (ret32 ret64 : Nat → Obs)
     (ubObs : String → Obs) :
     ObsAuthority (NanMode × Prog × Query × Pick) Nat where
@@ -3219,6 +3234,8 @@ def authorityOf (Obs : Type) (decEq : DecidableEq Obs)
     | .i32ToF32 => some (fromIntObs k.2.2.1.bits32)
     | .bitsU32ToI32 => some (carrier32Obs k.2.2.1.bits32)
     | .bitsU64ToI64 => some (carrier64Obs k.2.2.1.bits64)
+    | .f64ToU64 => some (toU64Obs k.2.2.1.bits64)
+    | .u64ToF64 => some (fromU64Obs k.2.2.1.bits64)
     | .uninitCast =>
       match k.2.2.1 with
       | .onePointFive => some (uninitObs uninitCastBody)
@@ -3457,6 +3474,27 @@ theorem f32ToI32_saturates :
     trustedVerdict .f32ToI32 .quietNaN = some (.returns 0) ∧
       trustedVerdict .f32ToI32 .negInfinity = some (.returns 0x80000000) ∧
       trustedVerdict .f32ToI32 .threeBillion = some (.returns 0x7fffffff) := by
+  decide +kernel
+
+/-- Unsigned 64-bit casts: `f64 as u64` truncates `1.5` to `1`, keeps
+`3.0e9`, and saturates `-∞` and NaN to `0`; `u64 as f64` converts the
+63-bit integers `0x3ff8000000000000` and `0x7ff8000020000000` (exact: their
+low ten bits are zero). The trusted machine agrees with the reference
+specification on every query. -/
+theorem u64_casts :
+    trustedVerdict .f64ToU64 .onePointFive = some (.returns 1) ∧
+      trustedVerdict .f64ToU64 .threeBillion = some (.returns 3000000000) ∧
+      trustedVerdict .f64ToU64 .negInfinity = some (.returns 0) ∧
+      trustedVerdict .f64ToU64 .quietNaN = some (.returns 0) ∧
+      trustedVerdict .u64ToF64 .onePointFive =
+        some (.returns 0x43cffc0000000000) ∧
+      trustedVerdict .u64ToF64 .quietNaN =
+        some (.returns 0x43dffe0000080000) ∧
+      allQueries.all (fun q =>
+        decide (trustedVerdict .f64ToU64 q =
+            lmReference .deterministic .f64ToU64 q .p0) &&
+          decide (trustedVerdict .u64ToF64 q =
+            lmReference .deterministic .u64ToF64 q .p0)) = true := by
   decide +kernel
 
 /-- MiniRust rejects every float cast in translation, so its verdict on
@@ -3763,6 +3801,57 @@ theorem carrier64_normal_equiv_with
     (sideMR.reverseTotal model sideMR_sim)
     ((sideLM verdictLM).reverseTotal model (sideLM_sim_with verdictLM h))).1
     a).2.2
+
+/-- On the LeanMiri fragment, a normal return of the Anneal model is the
+normal return of every certified LeanMiri presentation. -/
+theorem lm_returns_of_anneal_with
+    (h : (sideLM verdictLM).check model = true) {m : NanMode} {p : Prog}
+    {q : Query} {c : Pick} {n : Nat} (hg : gateLM m p q = true)
+    (hA : annealVerdict m p q c = some (.returns n)) :
+    verdictLM m p q c = some (.returns n) := by
+  obtain ⟨oa, orr, ha, hr, hc⟩ := couplesB_sound
+    ((sideLM verdictLM).simCheck_spec model (sideLM_sim_with verdictLM h)
+      m p q c hg)
+  have hA' : outcome? (annealVerdict m p q c) = some (.normal n) := by
+    rw [hA]; rfl
+  have hoa : oa = .normal n := Option.some.inj (ha.symm.trans hA')
+  subst hoa
+  obtain ⟨r, horr, hrep⟩ := hc.normal_anneal_to_ref n rfl
+  subst horr
+  have hrn : r = n := halvesCodec.encode_injective hrep
+  subst hrn
+  exact outcome?_injective hr
+
+/-- Unsigned saturating `f64 as u64` (`3.0e9 ↦ 3000000000`): a positive
+witness on the LeanMiri side. -/
+def lmU64Positive_with (h : (sideLM verdictLM).check model = true) :
+    PositiveWitness ((sideLM verdictLM).rel model) :=
+  (sideLM verdictLM).positiveAt model (sideLM_sim_with verdictLM h)
+    .deterministic .f64ToU64 .threeBillion .p0 rfl
+    (show isReturn
+        (annealVerdict .deterministic .f64ToU64 .threeBillion .p0) = true by
+      decide +kernel)
+    (show (allPicks.all fun c' =>
+        !isFaultV (annealVerdict .deterministic .f64ToU64 .threeBillion c'))
+        = true by
+      decide +kernel)
+
+/-- Every certified LeanMiri presentation is well-formed on `3.0e9 as u64`
+and saturates `NaN as u64` and `-∞ as u64` to `0`, and converts
+`0x7ff8000020000000 as f64` exactly. -/
+theorem lm_u64_casts_with (h : (sideLM verdictLM).check model = true) :
+    ((sideLM verdictLM).rel model).WellFormedRef .deterministic .f64ToU64
+        .threeBillion ∧
+      verdictLM .deterministic .f64ToU64 .quietNaN .p0 = some (.returns 0) ∧
+      verdictLM .nondeterministic .f64ToU64 .negInfinity .p3 =
+        some (.returns 0) ∧
+      verdictLM .deterministic .u64ToF64 .quietNaN .p0 =
+        some (.returns 0x43dffe0000080000) :=
+  ⟨(lmU64Positive_with verdictLM h).wellFormedRef
+      (bundleWith verdictLM h).lmSim,
+   lm_returns_of_anneal_with verdictLM h rfl (by decide +kernel),
+   lm_returns_of_anneal_with verdictLM h rfl (by decide +kernel),
+   lm_returns_of_anneal_with verdictLM h rfl (by decide +kernel)⟩
 
 /-- The mode-sensitivity witness of the LeanMiri side: the
 payload-preserving quiet NaN is reachable in nondeterministic mode only. -/
@@ -11261,7 +11350,7 @@ run_cmd do
       #[`bundleWith, `detBundleWith, `faultFlipComp_with,
         `faultFlipTrans_with, `mixedComp_with]
     let fcWith : Array Name :=
-      #[`uninit_fault_equiv_with, `lm_uninit_faults_with,
+      #[`uninit_fault_equiv_with, `lm_uninit_faults_with, `lm_u64_casts_with,
         `carrier_normal_equiv_with, `carrier64_normal_equiv_with,
         `lmModeWitness_spec_with, `productiveBoth_with,
         `frontTrans_codec_with, `frontTrans_productiveBoth_with,
@@ -11821,9 +11910,12 @@ run_cmd do
       let fromIntObs ← simpleObs 12 31 4 `IntToFloat
       let carrier32Obs ← simpleObs 22 12 4 `Transmute
       let carrier64Obs ← simpleObs 23 13 8 `Transmute
+      let toU64Obs ← simpleObs 32 23 8 `FloatToInt
+      let fromU64Obs ← simpleObs 23 32 8 `IntToFloat
       mkAppM (ns ++ `FloatCast.authorityOf)
         #[fcObsTy, decFcObs, widenObs, narrowObs, toIntObs, fromIntObs,
-          carrier32Obs, carrier64Obs, fcUninitObs, fcRet32, fcRet64, fcUbObs]
+          toU64Obs, fromU64Obs, carrier32Obs, carrier64Obs, fcUninitObs,
+          fcRet32, fcRet64, fcUbObs]
     let fcAuth ← MetaM.run' <| mkFcAuth false
     let fcMiriName := ns ++ `CrossRoot.FloatCast.miri
     let _ ← addDef fcMiriName fcAuth
@@ -12068,7 +12160,8 @@ run_cmd do
     let castIds : List (Name × Nat × Nat) :=
       [(`f32ToF64, 31, 32), (`f64ToF32, 32, 31), (`f32ToI32, 31, 12),
         (`i32ToF32, 12, 31), (`bitsU32ToI32, 22, 12),
-        (`bitsU64ToI64, 23, 13), (`f16ToF32, 30, 31), (`f128ToF32, 33, 31)]
+        (`bitsU64ToI64, 23, 13), (`f64ToU64, 32, 23), (`u64ToF64, 23, 32),
+        (`f16ToF32, 30, 31), (`f128ToF32, 33, 31)]
     let tyIdLock (prog : Name) (src dst : Nat)
         (widthOverride? : Option Nat := none) : MetaM (Expr × Expr) := do
       let shape := mkApp (mkConst (ns ++ `FloatCast.castShape))
