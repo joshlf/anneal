@@ -1642,9 +1642,9 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         ):
             expect_failure(lambda req=bad_req: ol2.audit_olean_request(req), 2, "olean-audit", needle)
         # Vectors V1–V7 end-to-end on compiled `.olean`s.
-        olean_module(ol2, "OlEp2V1", prelude_init + "theorem v1 : True := by sorry\n", ["Init"])
+        olean_module(ol2, "OlEp2V1", header + "theorem v1 : True := by sorry\n", ["Init.Core"])
         olean_reject(ol2, ["OlEp2V1"], "[sorryAxiomReached]")
-        olean_module(ol2, "OlEp2V2", prelude_init + "theorem v2 : True := sorryAx True false\n", ["Init"])
+        olean_module(ol2, "OlEp2V2", header + "theorem v2 : True := sorryAx True false\n", ["Init.Core"])
         olean_reject(ol2, ["OlEp2V2"], "[sorryAxiomReached]")
         olean_module(ol2, "OlEp2V3", prelude_init + (
             "axiom v3Cust : True\nprivate axiom v3Priv : True\n"
@@ -1652,13 +1652,10 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "def v3Tc : Bool := Lean.reduceBool true\n"), ["Init"])
         olean_reject(ol2, ["OlEp2V3"], "[unapprovedAxiom]", "v3Cust", "v3Priv", "[nativeDecideReached]")
         olean_module(ol2, "OlEp2V4", prelude_init + "theorem v4 : (1 + 1 == 2) = true := by native_decide\n", ["Init"])
-        olean_reject(ol2, ["OlEp2V4"], "[nativeDecideReached]")
-        olean_module(ol2, "OlEp2V5Bad", prelude_init + "partial def v5p (n : Nat) : Nat := v5p (n + 1)\n", ["Init"])
-        olean_reject(ol2, ["OlEp2V5Bad"], "[partialOrUnsafeRecDependency]")
+        olean_module(ol2, "OlEp2V5Bad", header + "partial def v5p (n : Nat) : Nat := v5p (n + 1)\n", ["Init.Core"])
         olean_module(ol2, "OlEp2V5Ok", prelude_init + (
             "def v5gcd : Nat → Nat → Nat\n  | 0, b => b\n  | a + 1, b => v5gcd (b % (a + 1)) (a + 1)\n"
             "termination_by a _ => a\ndecreasing_by exact Nat.mod_lt b (Nat.succ_pos a)\n"), ["Init"])
-        olean_accept(ol2, ["OlEp2V5Ok"])
         olean_module(ol2, "OlEp2V6", prelude_init + (
             "unsafe def v6u (n : Nat) : Nat := n\n"
             "def v6ib (n : Nat) : Nat := n + 1\n"
@@ -1668,16 +1665,19 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "def v6cs1 (a : Nat) : Nat := a\ndef v6cs2 (a : Nat) : Nat := a\n"
             "@[csimp] theorem v6cs : @v6cs1 = @v6cs2 := rfl\n"
             "initialize v6i : Bool ← pure true\n"), ["Init"])
-        olean_reject(ol2, ["OlEp2V6"], "[unsafeDeclaration]", "[compilerOverrideAttribute]",
-                     "implemented_by", "extern", "export", "csimp", "init")
-        olean_module(ol2, "OlEp2V7Th", prelude_init + "def Ep2ThProp : Prop := True\n", ["Init"])
+        olean_reject(ol2, ["OlEp2V4", "OlEp2V5Bad", "OlEp2V6"],
+                     "[nativeDecideReached]", "v4",
+                     "[partialOrUnsafeRecDependency]", "v5p",
+                     "[unsafeDeclaration]", "v6u",
+                     "[compilerOverrideAttribute]", "implemented_by", "extern", "export", "csimp", "init")
+        olean_module(ol2, "OlEp2V7Th", header + "def Ep2ThProp : Prop := True\n", ["Init.Core"])
         olean_module(ol2, "OlEp2V7Leak", "prelude\nimport OlEp2V7Th\ntheorem v7l : Ep2ThProp := True.intro\n",
                      ["OlEp2V7Th"])
         olean_module(ol2, "OlEp2V7Ok", "prelude\nimport OlEp2V7Th\n"
                      "theorem v7ok : True := (fun (_ : Ep2ThProp) => True.intro) True.intro\n", ["OlEp2V7Th"])
         olean_reject(ol2, ["OlEp2V7Th", "OlEp2V7Leak"], "[statementOriginLeak]", "v7l",
                      claimModules=["OlEp2V7Leak"], statementForbidden=["OlEp2V7Th"], statementUnfold=["OlEp2V7Leak"])
-        olean_accept(ol2, ["OlEp2V7Th", "OlEp2V7Ok"],
+        olean_accept(ol2, ["OlEp2V5Ok", "OlEp2V7Th", "OlEp2V7Ok"],
                      claimModules=["OlEp2V7Ok"], statementForbidden=["OlEp2V7Th"], statementUnfold=["OlEp2V7Ok"])
         done("Episode 2 constructive policy, --audit-olean validation, cache-key sensitivity, and V1-V7 compiled checks")
 
@@ -1918,7 +1918,9 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "instance subW : SubChain where pre := fun _ => False; post := fun _ _ => True\n"
             "instance subS : SubChain where pre := epPre; post := epPost\n"
             "def c_s3c := epMultiCert\ndef c_r7 := epMultiCert\ndef c_let := epMultiCert\n"
-            "def c_beta := epMultiCert\ndef c_proj := epMultiCert\ndef c_sub := epMultiCert\n")
+            "def c_beta := epMultiCert\ndef c_proj := epMultiCert\ndef c_sub := epMultiCert\n"
+            "def plainNoInst : ItemSpec \"ep2::plain_no_inst\" := { pre := epPre, post := epPost }\n"
+            "def c_plain := epMultiCert\n")
         olean_module(ol2, "OlEp2Shadow", shadow_src, ["Init", "OlEp2SpecClean"])
         shadow_mods = base_spec_mods + ["OlEp2SpecClean", "OlEp2Shadow"]
         olean_reject(ol2, shadow_mods,
@@ -1932,6 +1934,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                      "[specInstanceAmbiguous] c_beta",
                      "[specInstanceAmbiguous] c_proj",
                      "[specInstanceAmbiguous] SubChain.toItemSpec",
+                     "[specStrengthCertMissing] plainNoInst",
                      specStrengthChecks=[
                          {"kind": "claim", "claim": "s3VacClaim_ok", "cert": "epMultiCert"},
                          {"kind": "claim", "claim": "epClaim_ok", "cert": "s3WeakCert",
@@ -1944,7 +1947,21 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                          {"kind": "itemSynth", "defId": "ep2::beta", "cert": "c_beta"},
                          {"kind": "itemSynth", "defId": "ep2::proj", "cert": "c_proj"},
                          {"kind": "itemSynth", "defId": "ep2::sub", "cert": "c_sub"},
+                         {"kind": "itemSynth", "defId": "ep2::plain_no_inst", "cert": "c_plain"},
                      ])
+
+        # A1-3 (parameterized dependent-recursor / typeclass-gated shadow in compiled `.olean`).
+        olean_module(ol2, "OlEp2A13", (
+            "prelude\nimport Init\nimport OlEp2SpecClean\n"
+            "open Trusted.VerificationResult\n"
+            "instance a13S : ItemSpec \"ep2::a13\" where pre := epPre; post := epPost\n"
+            "class A13Flag where ok : Bool\n"
+            "instance : A13Flag where ok := true\n"
+            "def a13Cond [f : A13Flag] : Bool.rec (motive := fun _ => Type 1) PUnit (ItemSpec \"ep2::a13\") f.ok :=\n"
+            "  match f with | ⟨false⟩ => PUnit.unit | ⟨true⟩ => { pre := fun _ => False, post := fun _ _ => True }\n"),
+            ["Init", "OlEp2SpecClean"])
+        olean_reject(ol2, base_spec_mods + ["OlEp2SpecClean", "OlEp2A13"], "[specInstanceAmbiguous] epMultiCert",
+                     "a13Cond", specStrengthChecks=[{"kind": "itemSynth", "defId": "ep2::a13", "cert": "epMultiCert"}])
 
         # B1-1 (theorem-headed major premise). Lean's kernel δ-unfolds theorems exactly like
         # definitions; `Meta.whnf` never does. `thmWeak` needs no axiom and no native code, its type
@@ -2018,11 +2035,32 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                      "def rnVal : Nat := 0\ndef rnUse : Nat := Lean.reduceNat rnVal\n", ["Init"])
         olean_reject(ol2, ["OlEp2NativeNat"], "[nativeDecideReached] Lean.reduceBool", "kernel-native evaluator")
 
-        # B1-5 (specification-library provenance). The gate recognizes certificate types by their
-        # declaring module `Anneal.OleanSpecStrengthAuditor`; like `Trusted`, that module therefore
-        # comes from the checker's own compilation. An `--audit-olean` caller can neither supply nor
-        # name it (a caller-built one could declare `SpecStrengthCert` as a one-field structure), and
-        # `specStrengthChecks` are refused while the checker owns no compiled copy.
+        # A1-1 (duplicate reserved theorem copy native-evaluator RCE bypass of B1-4): when M1's
+        # clean `a1f.eq_1` shadows M2's evil `a1f.eq_1` in `env.find?`, `reachesNativeEvaluator`
+        # must still inspect M2's stored `declEdges` before `reservedTheoremCopyOk` runs the kernel.
+        olean_module(ol2, "OlEp2DupM0", "prelude\nimport Init\ndef a1f : Nat → Nat | 0 => 0 | n + 1 => n\n", ["Init"])
+        olean_module(ol2, "OlEp2DupM1", "prelude\nimport Init\nimport OlEp2DupM0\n"
+                     "theorem useDupM1 : a1f 0 = 0 := a1f.eq_1\n", ["Init", "OlEp2DupM0"])
+        olean_module(ol2, "OlEp2DupM2", (
+            "prelude\nimport Init\nimport Lean\nimport OlEp2DupM0\nimport OlEp2NativeImpl\nopen Lean\n"
+            "run_cmd Elab.Command.liftCoreM do\n"
+            "  let ty := mkApp3 (mkConst ``Eq [Level.one]) (mkConst ``Nat) (mkApp (mkConst ``a1f) (mkNatLit 0)) (mkNatLit 0)\n"
+            "  let trig := mkApp (mkConst ``Lean.reduceBool) (mkConst ``nativeFlag)\n"
+            "  let eqTrue := mkApp3 (mkConst ``Eq [Level.one]) (mkConst ``Bool) trig (mkConst ``Bool.true)\n"
+            "  let pfTrue := mkApp2 (mkConst ``Eq.refl [Level.one]) (mkConst ``Bool) (mkConst ``Bool.true)\n"
+            "  let val := Expr.letE `h eqTrue pfTrue (mkApp2 (mkConst ``Eq.refl [Level.one]) (mkConst ``Nat) (mkNatLit 0)) false\n"
+            "  addDecl (.thmDecl { name := `a1f.eq_1, levelParams := [], type := ty, value := val })\n"),
+            ["Init", "Lean", "OlEp2DupM0", "OlEp2NativeImpl"])
+        assert native_marker.exists(), "A1-1 duplicate-reserved canary is not live (compiler did not run it)"
+        native_marker.unlink()
+        # Load M2 before M1 so M1's clean `a1f.eq_1` wins in `env.find?`.
+        olean_reject(ol2, ["OlEp2NativeImpl", "OlEp2DupM0", "OlEp2DupM2", "OlEp2DupM1"],
+                     "[nativeDecideReached] Lean.reduceBool", "kernel-native evaluator",
+                     toolchainRoots=["Init", "Std", "Lean"])
+        assert not native_marker.exists(), "A1-1 duplicate reserved theorem executed audited code inside OleanEnvAuditor!"
+
+        # B1-5 & A1-5a/d (specification-library provenance & constructive `allowClassicalChoice=False`
+        # with checker-compiled `Trusted`).
         spec_lib_parts = ol2.artifacts[runner.SPEC_LIB_MODULE]
         for spec_spoof in (
             {"roots": ["OlEp2ConstructiveOk"], "modules": ["OlEp2ConstructiveOk", runner.SPEC_LIB_MODULE],
@@ -2034,6 +2072,8 @@ def self_test(checkout: Path, lean: Path | None) -> int:
              "constructiveModules": [runner.SPEC_LIB_MODULE]},
             {"roots": ["OlEp2ConstructiveOk"], "modules": ["OlEp2ConstructiveOk"], "artifacts": [],
              "graph": {runner.SPEC_LIB_MODULE: []}},
+            {"roots": [runner.SPEC_LIB_MODULE + ".Fake"], "modules": [runner.SPEC_LIB_MODULE + ".Fake"],
+             "artifacts": []},
         ):
             expect_failure(lambda req=spec_spoof: ol2.audit_olean_request(req), 1, "olean-audit",
                            "moduleProvenanceSpoofed", runner.SPEC_LIB_MODULE)
@@ -2043,11 +2083,17 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "specStrengthChecks": [{"kind": "claim", "claim": "epClaim_ok", "cert": "epMultiCert"}],
         }), 1, "olean-audit", "moduleProvenanceSpoofed", "checker's own compiled")
         # With a checker-owned library the request needs no mention of it: it joins the audit by
-        # itself, under the constructive policy, and the checks run against it. (The fixture stands
-        # in for `run()` + `compile_spec_library()`, which compile the real `Trusted` and library.)
+        # itself, under the constructive policy, and the checks run against it. Also verify `A1-5a`:
+        # when checker-compiled `Trusted` uses `Classical.choice`, `allowClassicalChoice=False`
+        # accepts a constructive caller and rejects a classical caller.
+        olean_module(ol2, "Trusted.Ep2ChoiceBase", prelude_init + (
+            "noncomputable def trustedChoiceBase : Nat := Classical.choice ⟨0⟩\n"), ["Init"])
+        olean_module(ol2, "OlEp2UsesTrustedChoice", "prelude\nimport Trusted.Ep2ChoiceBase\n"
+                     "noncomputable def badTransChoice : Nat := trustedChoiceBase\n", ["Trusted.Ep2ChoiceBase"])
         saved_modules = ol2.modules
         ol2.modules = {**saved_modules, "Trusted.Rustc.V2026_06_01.MirSemantics": "MirSemantics.lean",
-                       "Trusted.VerificationResult": "VerificationResult.lean"}
+                       "Trusted.VerificationResult": "VerificationResult.lean",
+                       "Trusted.Ep2ChoiceBase": "Ep2ChoiceBase.lean"}
         ol2.spec_lib_owned = True
         try:
             owned = ol2.audit_olean_request({
@@ -2056,6 +2102,17 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             })
             assert owned["specStrengthChecksPassed"] == len(clean_checks), owned
             assert owned["constructiveModulesChecked"] == 1 and runner.SPEC_LIB_MODULE in owned["modules"], owned
+            # A1-5a positive: constructive caller passes even though `Trusted.Ep2ChoiceBase` uses `Classical.choice`.
+            owned_c_ok = ol2.audit_olean_request({
+                "roots": ["OlEp2ConstructiveOk"], "modules": ["OlEp2ConstructiveOk"], "artifacts": [],
+                "allowClassicalChoice": False, "scope": "ep2-a15a-ok",
+            })
+            assert owned_c_ok["constructiveModulesChecked"] == 2, owned_c_ok
+            # A1-5a negative: caller transitively reaching `Trusted.Ep2ChoiceBase`'s `Classical.choice` is rejected.
+            expect_failure(lambda: ol2.audit_olean_request({
+                "roots": ["OlEp2UsesTrustedChoice"], "modules": ["OlEp2UsesTrustedChoice"], "artifacts": [],
+                "allowClassicalChoice": False, "scope": "ep2-a15a-bad",
+            }), 1, "olean-audit", "Classical.choice")
             # Ownership does not relax the rule: the caller still cannot name the library.
             expect_failure(lambda: ol2.audit_olean_request({
                 "roots": ["OlEp2SpecClean"], "modules": ["OlEp2SpecClean", runner.SPEC_LIB_MODULE],
@@ -2085,7 +2142,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         runner.make_tree_writable(ol2.checkout)
         shutil.rmtree(ol2.checkout)
         done("Episode 2 compiled spec-strength gates (V8/V9, 4 claim kinds, A1-4, A3-3 _sunfold, A1-2/S3 shadows, "
-             "B1-1 theorem-major, B1-4 native-evaluator canary, B1-5 spec-library provenance, A4-7)")
+             "B1-1 theorem-major, B1-4/A1-1 native-evaluator canaries, B1-5/A1-5 provenance & constructive, A1-3/A1-6, A4-7)")
     except BaseException as error:
         (suite / "failure.traceback").write_text(traceback.format_exc())
         print(f"SELF-TEST FAILED: {error}\nPreserved fixture sources/raw logs: {suite}", file=sys.stderr)

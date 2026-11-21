@@ -1088,6 +1088,53 @@ def b13GcdWeak : Nat.rec (motive := fun _ => Type 1) (ItemSpec "ep2::b13") (fun 
   -- every `defId`, including one nobody specifies, in the `MetaM` scanner as well.
   let m14 ← specInstanceCandidatesMeta `Trusted.VerificationResult.ItemSpec "ep2::b14_unrelated" 256
   IO.println s!"B1_4_native_evaluator_never_run: reduceBool={m14.contains ``a4RbWeak} reduceNat={m14.contains `a4RnKernelWeak} clean={!m14.contains ``b11ThmWeak && !m14.contains ``b13GcdWeak}"
+
+/-! ### Episode 2 `A1` regressions (`expected` native-evaluator guard, poly-sorry claim ordering,
+    parameterized dependent-recursor & higher-order shadows, `String.rec` literal major) -/
+
+-- A1-2b: universe-polymorphic `sorry` claim theorem reports `sorryAxiomReached`, not `specStrengthCertInvalidType`.
+theorem a12bPolySorryClaim.{u} : let _ := PUnit.{u}; VerificationResult ret10Claim := by sorry
+
+-- A1-3: parameterized dependent-recursor (typeclass-gated & Bool-gated) and higher-order type-family shadows.
+instance a13Strong : ItemSpec "ep2::a13" where pre := ret10Pre; post := ret10Post
+class A13Flag where ok : Bool
+instance : A13Flag where ok := true
+def a13CondShadow [f : A13Flag] : Bool.rec (motive := fun _ => Type 1) PUnit (ItemSpec "ep2::a13") f.ok :=
+  match f with | ⟨false⟩ => PUnit.unit | ⟨true⟩ => { pre := fun _ => False, post := fun _ _ => True }
+def a13BoolShadow (b : Bool) : Bool.rec (motive := fun _ => Type 1) PUnit (ItemSpec "ep2::a13") b :=
+  match b with | false => PUnit.unit | true => { pre := fun _ => False, post := fun _ _ => True }
+def a13HigherOrderShadow (F : Type 1 → Type 1) (x : F (ItemSpec "ep2::a13")) : F (ItemSpec "ep2::a13") := x
+def a13Cert : MultiMutantSpecCert a13Strong.pre a13Strong.post := ret10MultiCert
+
+-- A1-4: `String.rec` with a string literal major premise.
+instance a14StrStrong : ItemSpec "ep2::a14str" where pre := ret10Pre; post := ret10Post
+def a14StrRecWeak :
+    String.rec (motive := fun _ => Type 1)
+      (fun ba _ => match ba.data.size with | 5 => ItemSpec "ep2::a14str" | _ => PUnit)
+      "hello" :=
+  { pre := fun _ => False, post := fun _ _ => True }
+
+#eval show MetaM Unit from do
+  let env ← getEnv
+  -- A1-2a: live `expected` reaching `Lean.reduceBool` is rejected BEFORE any MetaM/kernel normalization.
+  let preTy := mkForall `_ .default (mkApp (mkConst ``List [Level.zero]) (mkConst ``Value)) (mkSort Level.zero)
+  let evilPre := mkApp4 (mkConst ``Bool.rec [Level.succ Level.zero])
+    (Expr.lam `_ (mkConst ``Bool) preTy .default)
+    (Expr.lam `_ (mkApp (mkConst ``List [Level.zero]) (mkConst ``Value)) (mkConst ``False) .default)
+    (mkConst ``ret10Pre)
+    (mkApp (mkConst ``Lean.reduceBool) (mkConst ``a4RbFlag))
+  IO.println (fmtTags "A1_2a_expected_native_rejected"
+    (← auditSpecStrengthCert ``ret10MultiCert (.direct evilPre (mkConst ``ret10Post))))
+  IO.println (fmtTags "A1_2b_poly_sorry_claim_reports_sorry"
+    (← auditClaimSpecStrength ``a12bPolySorryClaim ``ret10MultiCert))
+  let p13 := specInstanceCandidates env `Trusted.VerificationResult.ItemSpec "ep2::a13" 256
+  let m13 ← specInstanceCandidatesMeta `Trusted.VerificationResult.ItemSpec "ep2::a13" 256
+  IO.println s!"A1_3_dep_rec_shadow: pure={p13.contains ``a13CondShadow && p13.contains ``a13BoolShadow && p13.contains ``a13HigherOrderShadow} meta={m13.contains ``a13CondShadow && m13.contains ``a13BoolShadow && m13.contains ``a13HigherOrderShadow}"
+  IO.println (fmtTags "A1_3_dep_rec_synth_gate"
+    (← auditItemSpecStrengthBySynth .item "ep2::a13" ``a13Cert))
+  let p14 := specInstanceCandidates env `Trusted.VerificationResult.ItemSpec "ep2::a14str" 256
+  let m14s ← specInstanceCandidatesMeta `Trusted.VerificationResult.ItemSpec "ep2::a14str" 256
+  IO.println s!"A1_4_string_rec_literal: pure={p14.contains ``a14StrRecWeak} meta={m14s.contains ``a14StrRecWeak}"
 "##
 
 private def collectPartsJson (baseDir : System.FilePath) (modName : String) : IO Lean.Json := do
@@ -1262,6 +1309,11 @@ A4_7_exp_branching_linear_budget: listed=true fast=true
 B1_2_string_literal_projection: pure=true meta=true
 B1_3_kernel_nat_gmp_major: pure=true meta=true
 B1_4_native_evaluator_never_run: reduceBool=true reduceNat=true clean=true
+A1_2a_expected_native_rejected: #[nativeDecideReached]
+A1_2b_poly_sorry_claim_reports_sorry: #[sorryAxiomReached]
+A1_3_dep_rec_shadow: pure=true meta=true
+A1_3_dep_rec_synth_gate: #[specInstanceAmbiguous]
+A1_4_string_rec_literal: pure=true meta=true
 V7_statement_leak: ok=false statementOriginLeak=true
 V7_proof_only_ok: ok=true statementOriginLeak=false
 tmp_clean=true

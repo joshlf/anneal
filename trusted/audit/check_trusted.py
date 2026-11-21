@@ -1124,11 +1124,13 @@ class Checker:
             raise Failure(1, phase, f"[moduleProvenanceSpoofed] --audit-olean cannot supply or name Trusted modules "
                                     f"({', '.join(spoofed)}); they come from the checker's own compilation")
         # The certificate types the spec-strength gate recognizes live in `SPEC_LIB_MODULE`, and the
-        # auditor identifies them by that module name: a caller-supplied module of that name could
-        # declare `SpecStrengthCert` as a one-field structure and "certify" a vacuous claim.
-        if SPEC_LIB_MODULE in named:
-            raise Failure(1, phase, f"[moduleProvenanceSpoofed] --audit-olean cannot supply or name {SPEC_LIB_MODULE}; "
-                                    f"it comes from the checker's own compilation")
+        # auditor identifies them by that module name: a caller-supplied module of that name (or a
+        # submodule under it) could declare `SpecStrengthCert` as a one-field structure and
+        # "certify" a vacuous claim.
+        spec_spoofed = sorted({n for n in named if n == SPEC_LIB_MODULE or n.startswith(SPEC_LIB_MODULE + ".")})
+        if spec_spoofed:
+            raise Failure(1, phase, f"[moduleProvenanceSpoofed] --audit-olean cannot supply or name {SPEC_LIB_MODULE} "
+                                    f"({', '.join(spec_spoofed)}); it comes from the checker's own compilation")
         spec_lib_owned = bool(self.spec_lib_owned and SPEC_LIB_MODULE in self.artifacts)
         if spec_checks and not spec_lib_owned:
             raise Failure(1, phase, f"[moduleProvenanceSpoofed] specStrengthChecks need the checker's own compiled "
@@ -1160,6 +1162,17 @@ class Checker:
         # always under the constructive policy.
         compiled_own = [*compiled_trusted, *([SPEC_LIB_MODULE] if spec_lib_owned else [])]
         owned_constructive = [SPEC_LIB_MODULE] if spec_lib_owned else []
+        # When `Trusted` was compiled by this checker (`run()`), `Trusted` itself legitimately uses
+        # `Classical.choice`. Setting `allowClassicalChoice=False` on a caller request therefore
+        # enforces the constructive policy on all caller `modules` (including their full transitive
+        # dependency closure into `Trusted`), rather than rejecting unused `Classical.choice`
+        # declarations inside `Trusted` (`A1-5a`).
+        if not allow_classical and compiled_trusted:
+            effective_allow_classical = True
+            effective_constructive = list(dict.fromkeys([*request["modules"], *constructive_mods, *owned_constructive]))
+        else:
+            effective_allow_classical = allow_classical
+            effective_constructive = list(dict.fromkeys([*constructive_mods, *owned_constructive]))
         saved_artifacts = dict(self.artifacts)
         saved_expected = dict(self.expected_artifacts)
         saved_graph = dict(self.graph)
@@ -1185,8 +1198,8 @@ class Checker:
                 "olean-audit", scope=scope, roots=[*request["roots"], *compiled_own],
                 modules=[*request["modules"], *compiled_own],
                 graph=merged_graph,
-                allowClassicalChoice=allow_classical,
-                constructiveModules=[*constructive_mods, *owned_constructive],
+                allowClassicalChoice=effective_allow_classical,
+                constructiveModules=effective_constructive,
                 specStrengthChecks=spec_checks,
                 localAxiomModules=request.get("localAxiomModules", []),
                 claimModules=request.get("claimModules", []),
@@ -5869,9 +5882,11 @@ def _main() -> int:
             # Compile and audit `Trusted` from the checkout first: requests are audited against
             # the checker's own `Trusted` artifacts, never caller-supplied ones.
             olean_checker.run()
-            if isinstance(request, dict) and request.get("specStrengthChecks"):
-                # Spec-strength checks are judged against the checkout's own specification-strength
-                # library, compiled and audited here.
+            spec_lib_rel = next((p for m, p, _, _ in DOWNSTREAM_TARGETS if m == SPEC_LIB_MODULE), None)
+            has_checkout_spec_lib = spec_lib_rel is not None and (checkout / spec_lib_rel).is_file()
+            if (isinstance(request, dict) and request.get("specStrengthChecks")) or has_checkout_spec_lib:
+                # Spec-strength checks (and any caller importing `SPEC_LIB_MODULE`) are judged
+                # against the checkout's own specification-strength library, compiled and audited here.
                 olean_checker.compile_spec_library()
             verdict = olean_checker.audit_olean_request(request)
             olean_checker.freshness()

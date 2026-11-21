@@ -1569,6 +1569,10 @@ def reservedTheoremCopyOk (env : Environment) (n : Name) (stored ci : ConstantIn
   unless sv.type == cv.type && sv.levelParams == cv.levelParams && declIsClosed ci do return false
   -- Refuse circular self-proofs (`n` is already in `env`).
   if (exprEdges cv.value {}).contains n then return false
+  -- Defense-in-depth (`A1-1`): never hand a duplicate reserved theorem copy reaching a
+  -- kernel-native evaluator (`Lean.reduceBool` / `Lean.reduceNat`) to `kernelAccepts`.
+  let (nativeReach, _) := reachesNativeEvaluator env (declEdges ci).toArray {} (envConstantCount env + 64)
+  if nativeReach then return false
   kernelAccepts env cv.levelParams cv.type cv.value 100000
 
 /-- Compiler-override attributes on one declaration (lookups by defining module). -/
@@ -2420,7 +2424,8 @@ def strLitToOfList? : Expr → Option Expr
 /-- `Nat` functions the kernel evaluates natively (GMP) when their arguments are literals. -/
 def kernelNatAcceleratedOps : List Name :=
   [``Nat.add, ``Nat.sub, ``Nat.mul, ``Nat.div, ``Nat.mod, ``Nat.gcd, ``Nat.beq, ``Nat.ble,
-   ``Nat.land, ``Nat.lor, ``Nat.xor, ``Nat.shiftLeft, ``Nat.shiftRight, ``Nat.pow, ``Nat.log2]
+   ``Nat.bitwise, ``Nat.land, ``Nat.lor, ``Nat.xor, ``Nat.shiftLeft, ``Nat.shiftRight,
+   ``Nat.pow, ``Nat.log2]
 
 def isCtorOrLitHead (env : Environment) (e : Expr) : Bool :=
   match e.getAppFn with
@@ -2569,19 +2574,27 @@ public def headNormalizeBudget (env : Environment) (e : Expr) (fuel : Nat) : Hea
                   else
                     { expr := e, certainWhnf := false, rem := liftRem (Nat.le_refl _) majRes.rem }
                 | none =>
-                  let etaNext? : Option Expr := do
-                    guard (rv.levelParams.length == us.length)
-                    let [r] := rv.rules | none
-                    let .ctorInfo cv ← env.find? r.ctor | none
-                    let (iv, _) ← isStructureLikeInduct env cv.induct
-                    let fields := (Array.range r.nfields).map fun idx => Expr.proj iv.name idx majExpr
-                    return mkAppN (r.rhs.instantiateLevelParams rv.levelParams us) (pmm ++ fields ++ extra)
-                  match etaNext? with
-                  | some next =>
+                  match strLitToOfList? majRes.expr with
+                  | some ofList =>
+                    -- The kernel turns a string literal major premise into `String.ofList [..]`
+                    -- before applying recursor rules (`A1-4`).
+                    let nextArgs := args.set! majorIdx ofList
                     have : majRes.rem.1 < fuel' + 1 := Nat.lt_succ_of_le majRes.rem.2
-                    liftRes majRes.rem.2 (headNormalizeBudget env next majRes.rem.1)
+                    liftRes majRes.rem.2 (headNormalizeBudget env (mkAppN fn nextArgs) majRes.rem.1)
                   | none =>
-                    { expr := e, certainWhnf := majRes.certainWhnf, rem := liftRem (Nat.le_refl _) majRes.rem }
+                    let etaNext? : Option Expr := do
+                      guard (rv.levelParams.length == us.length)
+                      let [r] := rv.rules | none
+                      let .ctorInfo cv ← env.find? r.ctor | none
+                      let (iv, _) ← isStructureLikeInduct env cv.induct
+                      let fields := (Array.range r.nfields).map fun idx => Expr.proj iv.name idx majExpr
+                      return mkAppN (r.rhs.instantiateLevelParams rv.levelParams us) (pmm ++ fields ++ extra)
+                    match etaNext? with
+                    | some next =>
+                      have : majRes.rem.1 < fuel' + 1 := Nat.lt_succ_of_le majRes.rem.2
+                      liftRes majRes.rem.2 (headNormalizeBudget env next majRes.rem.1)
+                    | none =>
+                      { expr := e, certainWhnf := majRes.certainWhnf, rem := liftRem (Nat.le_refl _) majRes.rem }
             else
               { expr := e, certainWhnf := true, rem := ⟨fuel', Nat.le_succ _⟩ }
           | some (.quotInfo qv) =>
@@ -2628,11 +2641,19 @@ public inductive SpecClassMatch where
   | undecided
   deriving BEq, Repr
 
+/-- Whether an expression still mentions any constant that can transitively reach `specClass`. -/
+def exprCanReachSpecClass (specClass : Name) (reach? : Option NameSet) (e : Expr) : Bool :=
+  match reach? with
+  | some reach => e.getUsedConstants.any reach.contains
+  | none => e.getUsedConstants.contains specClass
+
 /-- Pure, total, global-linear-budget conclusion matcher for `specClass targetDefId`.
 Shares the single global budget `fuel` across `forallE` stripping, head normalization, and
-`defId` argument normalization. -/
+`defId` argument normalization. When the head is a stuck eliminator (`recInfo`/`quotInfo`),
+projection, or bound/free variable whose term can still reach `specClass`, instantiating a binder
+could reduce it to `specClass targetDefId`, so this returns `.undecided` (`A1-3`). -/
 def specClassConclusionMatchBudget (env : Environment) (specClass : Name) (targetDefId : String)
-    (e : Expr) (fuel : Nat) : SpecClassMatch :=
+    (e : Expr) (fuel : Nat) (reach? : Option NameSet := none) : SpecClassMatch :=
   match fuel with
   | 0 => .undecided
   | fuel' + 1 =>
@@ -2640,9 +2661,9 @@ def specClassConclusionMatchBudget (env : Environment) (specClass : Name) (targe
     match res.expr with
     | .forallE _ _ body _ =>
       if _ : res.rem.1 < fuel' + 1 then
-        specClassConclusionMatchBudget env specClass targetDefId body res.rem.1
+        specClassConclusionMatchBudget env specClass targetDefId body res.rem.1 reach?
       else
-        specClassConclusionMatchBudget env specClass targetDefId body fuel'
+        specClassConclusionMatchBudget env specClass targetDefId body fuel' reach?
     | e' =>
       if !res.certainWhnf then .undecided
       else
@@ -2656,13 +2677,22 @@ def specClassConclusionMatchBudget (env : Environment) (specClass : Name) (targe
               | .lit (.strVal s) => if s == targetDefId then .matched else .notMatched
               | _ => .undecided
             else .undecided
-          else .notMatched
+          else
+            let isElim := match env.find? c with
+              | some (.recInfo _) | some (.quotInfo _) => true
+              | _ => false
+            if isElim && exprCanReachSpecClass specClass reach? e' then
+              .undecided
+            else
+              .notMatched
+        | .proj _ _ _ | .bvar _ | .fvar _ =>
+          if exprCanReachSpecClass specClass reach? e' then .undecided else .notMatched
         | _ => .notMatched
 termination_by fuel
 
 public def specClassConclusionMatch (env : Environment) (specClass : Name) (targetDefId : String)
     (ty : Expr) (fuel : Nat := 256) : SpecClassMatch :=
-  specClassConclusionMatchBudget env specClass targetDefId ty fuel
+  specClassConclusionMatchBudget env specClass targetDefId ty fuel none
 
 /-- Module-reachability filter: indices of imported modules that transitively depend on `targetMod`. -/
 def reachingModuleIndices (env : Environment) (targetMod : Name) : Array Nat := Id.run do
@@ -2719,10 +2749,12 @@ def constsReachingSpecClass (env : Environment) (specClass : Name) (modIdxs : Ar
   if done then return some reach else return none
 
 /-- Collect candidate declarations (`.defnInfo`, `.opaqueInfo`, `.axiomInfo`) in modules that can
-reach `specClass` (plus live local constants in `env.constants.map₂`), excluding only Lean's
-compiler-generated `<SpecClass>.mk._flat_ctor` constructor wrapper in `specClass`'s own defining
-module and declarations whose type's transitive constant closure cannot mention `specClass`. -/
-def candidateDeclsForSpecClass (env : Environment) (specClass : Name) : Array (Name × ConstantInfo) := Id.run do
+reach `specClass` (plus live local constants in `env.constants.map₂`), along with the reverse-BFS
+`reach?` set, excluding only Lean's compiler-generated `<SpecClass>.mk._flat_ctor` constructor
+wrapper in `specClass`'s own defining module and declarations whose type's transitive constant
+closure cannot mention `specClass`. -/
+def candidateDeclsForSpecClassWithReach (env : Environment) (specClass : Name) :
+    Array (Name × ConstantInfo) × Option NameSet := Id.run do
   let specOrigin := origin? env specClass
   let flatCtorName := (specClass.str "mk").str "_flat_ctor"
   let modIdxs := match specOrigin with
@@ -2748,16 +2780,17 @@ def candidateDeclsForSpecClass (env : Environment) (specClass : Name) : Array (N
   for (n, ci) in env.constants.map₂.toList do
     if isEligible ci then
       out := out.push (n, ci)
-  return out
+  return (out, reach?)
 
 /-- Pure global-linear-budget uniqueness scan for `(specClass, targetDefId)`. -/
 public def specInstanceCandidates (env : Environment) (specClass : Name) (targetDefId : String)
     (fuel : Nat := 256) : Array Name := Id.run do
+  let (decls, reach?) := candidateDeclsForSpecClassWithReach env specClass
   let mut cands : Array Name := #[]
   let mut seen : NameSet := {}
-  for (n, ci) in candidateDeclsForSpecClass env specClass do
+  for (n, ci) in decls do
     if seen.contains n then continue
-    match specClassConclusionMatch env specClass targetDefId ci.type fuel with
+    match specClassConclusionMatchBudget env specClass targetDefId ci.type fuel reach? with
     | .matched | .undecided =>
       seen := seen.insert n
       cands := cands.push n
@@ -2771,13 +2804,15 @@ with `Meta.withTransparency .all`.
 (`getUnfoldableConst?` answers `none` for `.thm` at every transparency, so `Acc.rec … thm` is stuck
 where the kernel reduces it), and it leaves the result of `Lean.reduceNat` unnormalized (`A4-5b`).
 A "not the specification class" answer is therefore believed only when the kernel-faithful pure
-normalizer (`specClassConclusionMatch`) is certain of it as well, whatever head `Meta.whnf` stopped
-at. A type whose dependency closure reaches a kernel-native evaluator is never normalized at all
-(that would run audited code inside the auditor): it is a candidate. -/
+normalizer (`specClassConclusionMatchBudget`) is certain of it as well, whatever head `Meta.whnf`
+stopped at (including dependent stuck eliminators/projections/variables reaching `specClass`,
+`A1-3`). A type whose dependency closure reaches a kernel-native evaluator is never normalized at
+all (that would run audited code inside the auditor): it is a candidate. -/
 public def specInstanceCandidatesMeta (specClass : Name) (targetDefId : String) (fuel : Nat := 256) :
     MetaM (Array Name) :=
   withKernelFaithfulMeta do
     let env ← getEnv
+    let (decls, reach?) := candidateDeclsForSpecClassWithReach env specClass
     let nativeFuel := envConstantCount env + 64
     let (specNative, clean0) := reachesNativeEvaluator env #[specClass] {} nativeFuel
     let specIsProp ← if specNative then pure true else try
@@ -2786,7 +2821,7 @@ public def specInstanceCandidatesMeta (specClass : Name) (targetDefId : String) 
     let mut cands : Array Name := #[]
     let mut seen : NameSet := {}
     let mut clean : NameSet := clean0
-    for (n, ci) in candidateDeclsForSpecClass env specClass do
+    for (n, ci) in decls do
       if seen.contains n then continue
       let (native, clean') := reachesNativeEvaluator env ci.type.getUsedConstants clean nativeFuel
       clean := clean'
@@ -2808,7 +2843,7 @@ public def specInstanceCandidatesMeta (specClass : Name) (targetDefId : String) 
                 else
                   return true
               else
-                match specClassConclusionMatch env specClass targetDefId ci.type fuel with
+                match specClassConclusionMatchBudget env specClass targetDefId ci.type fuel reach? with
                 | .matched | .undecided => return true
                 | .notMatched => return false
         catch _ =>
@@ -2929,6 +2964,10 @@ public def auditDeclsForSpec (env : Environment) (ctx : SpecAuditCtx) (roots : A
         violations := vs; seenV := sv
       else if ci.isPartial then
         let (vs, sv) := addV "partialOrUnsafeRecDependency" n m "partial declaration reached" violations seenV
+        violations := vs; seenV := sv
+      if kernelNativeEvaluators.contains n then
+        let (vs, sv) := addV "nativeDecideReached" n m
+          "kernel-native evaluator (Lean.reduceBool / Lean.reduceNat) reached" violations seenV
         violations := vs; seenV := sv
       if let .opaqueInfo _ := ci then
         if let some sib := env.find? (n.str "_unsafe_rec") then
@@ -3063,13 +3102,20 @@ def auditSpecStrengthCertCore (ctx : SpecAuditCtx) (certName : Name) (expected :
     let certMod := (effectiveOrigin? env ctx certName).getD .anonymous
     let singleV (tag : String) (detail : String) : Array Violation :=
       #[{ tag, decl := certName, module := certMod, detail }]
-    -- Step 1: closedness of expected specification expressions (`B4-5`).
+    -- Step 1: closedness & native-evaluator pre-pass on expected specification expressions (`B4-5`, `A1-2a`).
     let expectedClosed := match expectedInst with
       | .direct req ens => isClosedExpr req && isClosedExpr ens
       | .modular envA pre post => isClosedExpr envA && isClosedExpr pre && isClosedExpr post
     unless expectedClosed do
       return singleV "specStrengthCertInvalidType"
         "expected specification expression is not closed (contains fvar, mvar, level mvar, or loose bvar)"
+    let expectedConsts : Array Name := match expectedInst with
+      | .direct req ens => req.getUsedConstants ++ ens.getUsedConstants
+      | .modular envA pre post => envA.getUsedConstants ++ pre.getUsedConstants ++ post.getUsedConstants
+    let (expNative, _) := reachesNativeEvaluator env expectedConsts {} (envConstantCount env + 64)
+    if expNative then
+      return singleV "nativeDecideReached"
+        "kernel-native evaluator (Lean.reduceBool / Lean.reduceNat) reachable from expected specification expression"
     -- Step 2: existence & constructive audit BEFORE coverage (`A1-4`).
     let some certCi := env.find? certName
       | return singleV "specStrengthCertMissing" s!"spec-strength certificate {certName} not found"
@@ -3230,12 +3276,14 @@ def auditClaimSpecStrengthCore (ctx : SpecAuditCtx) (thmName certName : Name)
     unless thmCi matches .thmInfo _ do
       return singleV "specStrengthCertInvalidType"
         s!"claim {thmName} must be a theorem (.thmInfo), got {kindOf thmCi}"
-    unless thmCi.levelParams.isEmpty do
-      return singleV "specStrengthCertInvalidType"
-        s!"claim theorem {thmName} must be monomorphic"
+    -- Audit the claim theorem BEFORE structural/levelParam checks (`A1-2b`, mirroring `B1-6`),
+    -- so a universe-polymorphic `sorry`/axiom/native claim is never masked as `specStrengthCertInvalidType`.
     let thmViolations := auditDeclsForSpec env ctx #[thmName] (constructive := false)
     if !thmViolations.isEmpty then
       return thmViolations
+    unless thmCi.levelParams.isEmpty do
+      return singleV "specStrengthCertInvalidType"
+        s!"claim theorem {thmName} must be monomorphic"
     let thmTy ← try Meta.withTransparency .all (Meta.whnf thmCi.type) catch _ => pure thmCi.type
     let .const headName [] := thmTy.getAppFn
       | return singleV "specStrengthCertInvalidType"
@@ -3291,12 +3339,26 @@ public def auditClaimSpecStrength (thmName certName : Name)
   let ctx := SpecAuditCtx.forLiveMeta (← getEnv) budget
   auditClaimSpecStrengthCore ctx thmName certName requiredCategories requireDeterministic requireInputSensitive
 
+/-- Check whether `declName` is registered as a `.global` `@[instance]` in serialized module
+extension entries (works even when `importModules` ran with `loadExts := false`, `A1-6`). -/
+def isGlobalInstanceRegistered (env : Environment) (declName : Name) : Bool := Id.run do
+  let target := mkConst declName []
+  for i in [0:env.header.modules.size] do
+    for e in Meta.instanceExtension.ext.getModuleEntries env i do
+      match e with
+      | .global ent =>
+        if ent.val == target || ent.globalName? == some declName then
+          return true
+      | .scoped _ _ => pure ()
+  return false
+
 /-- Unique-instance synthesis spec-strength gate (`R7`, `A1-2`, `S3a/b`, `B4-3/4/6`, `A3-3c`,
 `A4-3`, `A4-5`, `A4-7`):
 requires a globally unique candidate for `(specClass, defId)` across BOTH pure linear-budget
 `specInstanceCandidates` and kernel-faithful `specInstanceCandidatesMeta`, requires the resolved
-instance to be that bare zero-argument constant (rejecting instance chains `S3a/b`), confirms
-`soleCand : specClass defId` in Lean's kernel, and audits `certName` against its contract. -/
+instance to be that bare zero-argument constant (rejecting instance chains `S3a/b`) and registered
+as a global typeclass `@[instance]` (`A1-6`), confirms `soleCand : specClass defId` in Lean's
+kernel, and audits `certName` against its contract. -/
 def auditItemSpecStrengthBySynthCore (ctx : SpecAuditCtx) (kind : SpecClassKind)
     (defId : String) (certName : Name)
     (requiredCategories : Array String := #[])
@@ -3353,6 +3415,13 @@ def auditItemSpecStrengthBySynthCore (ctx : SpecAuditCtx) (kind : SpecClassKind)
         | _ =>
           return singleV "specInstanceAmbiguous" soleCand
             s!"synthesized instance for {specClass} \"{defId}\" is not a bare zero-argument constant (instance chain rejected)"
+    else if !ctx.allowLocalDecls then
+      -- In standalone `.olean` mode (`loadExts := false`), confirm `soleCand` is actually
+      -- registered as a `.global` `@[instance]` in serialized `Meta.instanceExtension` entries
+      -- so a plain non-instance `def` cannot pass `itemSynth` (`A1-6`).
+      unless isGlobalInstanceRegistered env soleCand do
+        return singleV "specStrengthCertMissing" soleCand
+          s!"sole candidate {soleCand} for {specClass} \"{defId}\" is not registered as a global @[instance]"
     -- Always confirm in Lean's kernel that the bare constant `soleCand` has type `specClass defId`
     -- (this also rejects instance-chain functions `S3a/b` even when `useSynthInstance := false`).
     let instKernOk ← liftM (m := IO)
@@ -3443,12 +3512,21 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
   if nonToolchain.isEmpty then
     report "noAuditTargets" .anonymous .anonymous "no non-toolchain modules to audit"
   -- Kernel-native evaluators: decide once, before anything is type checked or normalized,
-  -- whether in-process kernel / `MetaM` evaluation is safe on this environment.
+  -- whether in-process kernel / `MetaM` evaluation is safe on this environment. Seed directly
+  -- from `declEdges ci` of EVERY stored declaration in every non-toolchain module (not only
+  -- `env.find? ci.name`), so shadowed duplicate reserved-theorem copies cannot bypass `B1-4` (`A1-1`).
   let mut nativeRoots : Array Name := #[]
+  let mut nativeRootSet : NameSet := {}
   for m in nonToolchain do
     if let some i := modIdx[m]? then
       for ci in env.header.moduleData[i]!.constants do
-        nativeRoots := nativeRoots.push ci.name
+        unless nativeRootSet.contains ci.name do
+          nativeRootSet := nativeRootSet.insert ci.name
+          nativeRoots := nativeRoots.push ci.name
+        for d in declEdges ci do
+          unless nativeRootSet.contains d do
+            nativeRootSet := nativeRootSet.insert d
+            nativeRoots := nativeRoots.push d
   let (nativeReach, _) := reachesNativeEvaluator env nativeRoots {} (envConstantCount env + 64)
   if nativeReach then
     report "nativeDecideReached" ``Lean.reduceBool ((origin? env ``Lean.reduceBool).getD .anonymous)
