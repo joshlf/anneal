@@ -27,10 +27,14 @@ boundary / mode-sensitivity witnesses, and executable authority-typed
    `.BackwardIncompatibleDropHint` no-op (never faulting even on dead/uninit/OOB
    places) and subsequent dead-place read UB contrast.
 3. **`V3` (`TerminatorKind.drop`)** — whole-local drop, dead-local UB,
-   projected sub-place drop on indirect `(u32, u32)` via vendored
-   `Miri.Memory.Allocation.writeUninit` preserving sibling bytes, active
-   protector mode sensitivity (`protectedMode : Bool` checking
-   `borrowTracker.global.protectedTags`), cleanup-block unwind/post-drop
+   memory-backed whole-local and projected sub-place drop (layout-derived byte
+   ranges, allocation-relative offsets) via vendored
+   `Miri.Memory.Allocation.writeUninit` preserving sibling bytes, data-driven
+   Tree Borrows mode sensitivity (place-relative protector check on the dropped
+   allocation's vendored borrow tree against the vendored global protected-tag
+   table when `treeBorrows = true`, bridged to vendored
+   `BorrowTree.performBorrowAccessRange`),
+   cleanup-block unwind/post-drop
    transitions, and explicit witnessed characterization of post-elaboration
    no-glue drop deinit vs. canonical runtime-nop (`canonNoGlueDropHooks`).
 4. **`V4` (`Rvalue.shallowInitBox`)** — honest base-translation boundary
@@ -365,49 +369,155 @@ def annealRvalueHooksDropBinderSubtype (currentBody : CapturedMir) (fnPtrs : Lis
           Miri.Interpreter.Cast.cast (annealCastHooksUnwindFnPtrClosure currentBody fnPtrs) c 16 src .Transmute ty dest
       | _ => base.cast c src kind ty dest }
 
-/-- Deinitialize a projected field slice on an `.indirect` backing allocation via
-vendored `Miri.Memory.Allocation.writeUninit`, preserving sibling bytes verbatim,
-and check `borrowTracker.global.protectedTags` when `protectedMode = true`. -/
-def annealEvalDropOverlay (protectedMode : Bool) (place : Miri.MIR.Place)
+/-- Allocation-relative byte offset of absolute address `addr` inside allocation
+`aid`, read from the machine's vendored `AllocAddresses` base-address table
+(`none` if `aid` has no recorded base or `addr` lies below it). -/
+def ep2RelOffset? (mach : AnnealMachine) (aid : Miri.Memory.AllocId) (addr : UInt64) : Option UInt64 :=
+  match mach.addresses.baseAddr.find? (fun e => e.allocId == aid) with
+  | some e => if e.address ≤ addr then some (addr - e.address) else none
+  | none => none
+
+/-- Byte range `(offsetWithinLocal, size)` of field `idx` of local `localId`,
+derived (never hardcoded) from the local's vendored Miri layout
+(`FieldsShape.Arbitrary` offsets) and the Trusted static field type
+(`tuple` / `closure` component, sized by `MirSemantics.tyByteSize`). Fails closed
+(`none`) for any other shape. -/
+def ep2FieldByteRange? (decls : List LocalDecl) (layouts : LayoutTable) (localId : Nat)
+    (lay? : Option Miri.Interpreter.LocalLayout) (idx : Nat) : Option (UInt64 × Nat) :=
+  match lay?, get? decls localId with
+  | some lay, some decl =>
+    let fieldKind? : Option RigidTy :=
+      match decl.ty.kind with
+      | .tuple tys => get? tys idx
+      | .closure _ tys => get? tys idx
+      | _ => none
+    match lay.layout.fields, fieldKind? with
+    | .Arbitrary offs _, some fk =>
+      match offs[idx]?, tyByteSize decls layouts { kind := fk, layoutIdx := 0 } with
+      | some off, some sz => some (off.bytes, sz)
+      | _, _ => none
+    | _, _ => none
+  | _, _ => none
+
+/-- Place-relative Tree Borrows protector check for a drop (a write) through tag
+`tag` into an allocation whose vendored borrow tree is `tree`: conflict iff some
+OTHER tag registered in this allocation's tree (`tree.tagMapping`) carries a
+`StrongProtector` in the global vendored protected-tag table.
+
+Vendored `BorrowTree.performBorrowAccessRange` is not kernel-reducible, so it cannot
+drive the kernel-checked corpus; this check reads only vendored data (the dropped
+allocation's own tree and `GlobalState.protectedTags`), never a mode flag, and
+`ep2ProtectorConflict_agrees_with_vendored_tree_borrows` proves it returns exactly
+the verdict of `performBorrowAccessRange` on the vendored two-node witness tree. -/
+def ep2ProtectorConflict (protectedTags : Miri.TreeBorrows.ProtectedTags)
+    (tree : Miri.TreeBorrows.BorrowTree) (tag : Miri.Memory.BorTag) : Bool :=
+  tree.tagMapping.mapping.any (fun e => e.1 != tag && protectedTags.get e.1 == some .StrongProtector)
+
+/-- Bridge to vendored Tree Borrows: on `hooksTwoNodeTree .unique` (root
+`retagParentTag`, accessed `Unique` child `retagChildTag`) with the child protected
+iff `isProtected`, `ep2ProtectorConflict` for a write through the root tag reports a
+conflict exactly when unmodified vendored `BorrowTree.performBorrowAccessRange`
+(`.Write` over `[0, 8)`) fails to complete. -/
+theorem ep2ProtectorConflict_agrees_with_vendored_tree_borrows (isProtected : Bool) :
+    ep2ProtectorConflict (hooksForChildProtected isProtected).protectedTags
+        (hooksTwoNodeTree .unique) retagParentTag = isProtected ∧
+    (((hooksTwoNodeTree .unique).performBorrowAccessRange (.concrete retagParentTag)
+        Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8) .Write
+        (hooksForChildProtected isProtected).protectedTags .VisitChildrenOfAccessed).status = .Completed ↔
+      isProtected = false) := by
+  refine ⟨by cases isProtected <;> decide +kernel, ?_⟩
+  have h := (borrowTree_performBorrowAccessRange_simulation .write .foreignAccess .unique isProtected).1
+  refine h.trans ?_
+  cases isProtected <;> decide +kernel
+
+/-- Deinitialize `len` bytes at `relInLocal` inside the memory-backed local `mp`
+and jump to `target`:
+* the allocation-relative start is `mp`'s address minus the allocation's recorded
+  base address (`ep2RelOffset?`), so locals at non-zero offsets are handled;
+* when `treeBorrows = true` and the allocation carries a borrow tree and the
+  machine a borrow tracker, a protector conflict on the dropped allocation
+  (`ep2ProtectorConflict` against the global vendored protected-tag table) is UB;
+* the bytes are then cleared by unmodified vendored `Allocation.writeUninit`. -/
+def ep2DeinitIndirect (treeBorrows : Bool) (mp : Miri.Interpreter.MemPlace AnnealProv)
+    (relInLocal : UInt64) (len : Nat) (target : Miri.MIR.BasicBlockId)
+    (state : AnnealStepState) : Miri.Interpreter.StepResult AnnealStepState Unit :=
+  match mp.ptr.provenance with
+  | some (.concrete aid tag) =>
+    match state.machine.memory.live.findIdx? (fun e => e.1 == aid),
+          ep2RelOffset? state.machine aid mp.ptr.offset.bytes with
+    | some lIdx, some base =>
+      match state.machine.memory.live[lIdx]? with
+      | some (_, liveAlloc) =>
+        let start := Miri.ABI.Size.ofBytes (base + relInLocal)
+        let size := Miri.ABI.Size.ofBytes (UInt64.ofNat len)
+        let conflict : Bool :=
+          match treeBorrows, state.machine.borrowTracker, liveAlloc.allocation.extra with
+          | true, some bt, some tree => ep2ProtectorConflict bt.global.protectedTags tree tag
+          | _, _, _ => false
+        if conflict then
+          (state, .error (.undefinedBehavior "Tree Borrows write conflict on drop"))
+        else
+          match Miri.Memory.Allocation.writeUninit (Miri.Memory.allocRange start size)
+              (Miri.ABI.Size.ofBytes 8) liveAlloc.allocation with
+          | .ok () alloc' =>
+            let mach' := updateAllocMachine state.machine lIdx aid liveAlloc.kind alloc'
+            Miri.Interpreter.ControlFlow.goToBlock target { state with machine := mach' }
+          | .error _ _ => (state, .error (.undefinedBehavior "drop out of bounds"))
+      | none => (state, .error (.undefinedBehavior "drop on dangling allocation"))
+    | _, _ => (state, .error (.undefinedBehavior "drop on dangling allocation"))
+  | _ => (state, .error (.unsupported "drop without concrete provenance"))
+
+/-- Episode 2 `Drop` overlay. Memory-backed (`.indirect`) locals are deinitialized
+in memory (whole local: the local's full layout size; `[.Field idx _]`: the field's
+layout-derived byte range) through `ep2DeinitIndirect`, with the Tree Borrows
+write check enabled by `treeBorrows`. Every other case — no frame, dead local,
+immediate local (which has no memory and hence no borrow tree or protector),
+lookup errors — is delegated verbatim to `annealEvalDropLM4_1`. -/
+def annealEvalDropOverlay (decls : List LocalDecl) (layouts : LayoutTable)
+    (treeBorrows : Bool) (place : Miri.MIR.Place)
     (target : Miri.MIR.BasicBlockId) (unwind : Miri.MIR.UnwindAction)
     (state : AnnealStepState) : Miri.Interpreter.StepResult AnnealStepState Unit :=
-  let hasActiveProtector : Bool :=
-    match state.machine.borrowTracker with
-    | some bt =>
-      protectedMode && bt.global.protectedTags.entries.any (fun p => p.2 == .StrongProtector)
-    | none => false
-  if hasActiveProtector then
-    (state, .error (.undefinedBehavior "Tree Borrows protector conflict on drop"))
-  else if !place.projection.isEmpty then
-    match state.stack.currentFrame? with
-    | none => (state, .error (.stack .emptyStack))
-    | some frame =>
-      match frame.getLocal place.localId with
-      | .error e => (state, .error (.stack e))
-      | .ok ls =>
-        match ls.value, place.projection.toList with
-        | .dead, _ => (state, .error (.undefinedBehavior "drop of dead local"))
-        | .live (.indirect mp), [.Field idx _] =>
-          match mp.ptr.provenance with
-          | some (.concrete aid _) =>
-            match state.machine.memory.live.findIdx? (fun e => e.1 == aid) with
-            | some lIdx =>
-              match state.machine.memory.live[lIdx]? with
-              | some (_, liveAlloc) =>
-                let fieldOff := Miri.ABI.Size.ofBytes (UInt64.ofNat (idx * 4))
-                let range := Miri.Memory.allocRange fieldOff (Miri.ABI.Size.ofBytes 4)
-                match Miri.Memory.Allocation.writeUninit range (Miri.ABI.Size.ofBytes 8) liveAlloc.allocation with
-                | .ok () alloc' =>
-                  let mach' := updateAllocMachine state.machine lIdx aid liveAlloc.kind alloc'
-                  Miri.Interpreter.ControlFlow.goToBlock target { state with machine := mach' }
-                | .error _ _ =>
-                  (state, .error (.undefinedBehavior "projected drop out of bounds"))
-              | none => (state, .error (.undefinedBehavior "projected drop on dangling allocation"))
-            | none => (state, .error (.undefinedBehavior "projected drop on dangling allocation"))
-          | _ => (state, .error (.unsupported "projected drop without concrete provenance"))
-        | _, _ => annealEvalDropLM4_1 place target unwind state
-  else
-    annealEvalDropLM4_1 place target unwind state
+  match state.stack.currentFrame? with
+  | none => annealEvalDropLM4_1 place target unwind state
+  | some frame =>
+    match frame.getLocal place.localId with
+    | .ok { value := .live (.indirect mp), layout := lay? } =>
+      match place.projection.toList with
+      | [] =>
+        match lay? with
+        | some lay => ep2DeinitIndirect treeBorrows mp 0 lay.layout.size.bytes.toNat target state
+        | none => (state, .error (.unsupported "indirect drop without layout"))
+      | [.Field idx _] =>
+        match ep2FieldByteRange? decls layouts place.localId lay? idx with
+        | some (off, sz) => ep2DeinitIndirect treeBorrows mp off sz target state
+        | none => (state, .error (.unsupported "projected drop: field byte range not derivable"))
+      | _ => (state, .error (.unsupported "projected drop terminator"))
+    | _ => annealEvalDropLM4_1 place target unwind state
+
+/-- The Episode 2 drop overlay coincides with the base `annealEvalDropLM4_1`
+whenever the dropped local is not memory-backed. -/
+theorem annealEvalDropOverlay_eq_base_of_not_indirect (decls : List LocalDecl) (layouts : LayoutTable)
+    (treeBorrows : Bool) (place : Miri.MIR.Place) (target : Miri.MIR.BasicBlockId)
+    (unwind : Miri.MIR.UnwindAction) (state : AnnealStepState)
+    (h : ∀ frame, state.stack.currentFrame? = some frame →
+      ∀ mp lay?, frame.getLocal place.localId ≠ .ok ⟨.live (.indirect mp), lay?⟩) :
+    annealEvalDropOverlay decls layouts treeBorrows place target unwind state =
+      annealEvalDropLM4_1 place target unwind state := by
+  unfold annealEvalDropOverlay
+  cases hcf : state.stack.currentFrame? with
+  | none => rfl
+  | some frame =>
+    dsimp only
+    cases hgl : frame.getLocal place.localId with
+    | error _ => rfl
+    | ok ls =>
+      rcases ls with ⟨value, lay?⟩
+      cases value with
+      | dead => rfl
+      | live op =>
+        cases op with
+        | immediate _ => rfl
+        | indirect mp => exact absurd hgl (h frame hcf mp lay?)
 
 /-- Predicate detecting root-frame return places whose layout is a `ScalarPair`
 with a pointer second field (e.g., 2-capture closure `(u32, *const u32)`),
@@ -455,9 +565,11 @@ def annealCopyReturnEp2
 /-- Conservative `StepHooks` overlay extending `annealStepHooksUnwindFnPtrClosure`
 with Episode 2's `.WrapUnsafeBinder`, `.Aggregate (.RawPtr ..)`, `.Cast .Transmute`,
 `annealCopyReturnEp2` (for indirect pointer-`ScalarPair` returns), and
-`annealEvalDropOverlay` (parameterized by `protectedMode : Bool`). -/
+`annealEvalDropOverlay` (parameterized by `treeBorrows : Bool`, enabling the vendored
+Tree Borrows write-access check on memory-backed drops — the LeanMiri analogue of
+MiniRust's `BasicMemory` vs. `TreeBorrowsMemory` split). -/
 def annealStepHooksDropBinderSubtype (currentBody : CapturedMir)
-    (protectedMode : Bool := false)
+    (treeBorrows : Bool := false)
     (callees : List CapturedMir := .nil)
     (poppedFrame : Miri.TreeBorrows.FrameState := {})
     (fnPtrs : List FnPtrEntry := .nil) :
@@ -472,7 +584,8 @@ def annealStepHooksDropBinderSubtype (currentBody : CapturedMir)
     { termHooksBase with
       toControlHooks := ctrlHooksEp2
       drop := fun _ place target unwind st =>
-        annealEvalDropOverlay protectedMode place target unwind st }
+        annealEvalDropOverlay currentBody.localDecls currentBody.layouts treeBorrows
+          place target unwind st }
   { base with
     assign := fun choice place rvalue state =>
       if isDropBinderSubtypeAssign currentBody.localDecls place rvalue then
@@ -499,17 +612,21 @@ def canonNoGlueDropHooks (currentBody : CapturedMir) :
     terminator := fun choice term state =>
       Miri.Interpreter.ControlFlow.evalTerminator termHooks choice term state }
 
-/-- Syntactic predicate for bodies untouched by the Episode 2 overlay when
-`protectedMode = false`. -/
+/-- Syntactic predicate for statements untouched by the Episode 2 overlay. -/
 def stmtFreeOfEp2Overlay (localDecls : List LocalDecl) (stmt : Miri.MIR.Statement) : Prop :=
   match stmt.kind with
   | .Assign place rvalue =>
       isDropBinderSubtypeAssign localDecls place rvalue = false
   | _ => True
 
-def termFreeOfEp2Overlay (term : Miri.MIR.Terminator) : Prop :=
+/-- A terminator is untouched by the Episode 2 overlay in frame `frame` unless it
+drops a memory-backed (`.indirect`) local of that frame (projected drops of
+immediate locals, and drops in any `treeBorrows` mode, are all covered). -/
+def termFreeOfEp2Overlay
+    (frame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+    (term : Miri.MIR.Terminator) : Prop :=
   match term.kind with
-  | .Drop place .. => place.projection.isEmpty = true
+  | .Drop place .. => ∀ mp lay?, frame.getLocal place.localId ≠ .ok ⟨.live (.indirect mp), lay?⟩
   | _ => True
 
 private theorem returnFromCurrentFrame_congr_copyReturn
@@ -614,13 +731,15 @@ private theorem annealPopFrameLM4_1_frame_eq (pf : Miri.TreeBorrows.FrameState)
   exact hfr.symm
 
 /-- **Conservative Extension Theorem (`step_ep2_overlay_eq_unwind_of_free`)**:
-When `protectedMode = false`, the active frame is not returning an indirect
+For EVERY `treeBorrows` mode: when the active frame is not returning an indirect
 pointer-`ScalarPair` (`isPtrScalarPairReturnPlace frame.returnPlace = false`),
-and a body's statements and terminators avoid the new Episode 2 arms
+the body's statements avoid the new Episode 2 assignment arms
 (`.WrapUnsafeBinder`, `.Aggregate (.RawPtr ..)`, `.Cast .Transmute`,
-`.UnaryOp .PtrMetadata`, and projected `.Drop`), `Miri.Interpreter.Step.step` under
-`annealStepHooksDropBinderSubtype` is **identically equal** to `Miri.Interpreter.Step.step`
-under `annealStepHooksUnwindFnPtrClosure`! -/
+`.UnaryOp .PtrMetadata`), and its `.Drop` terminators only drop locals that are not
+memory-backed in the active frame (whole or projected, any protector state),
+`Miri.Interpreter.Step.step` under `annealStepHooksDropBinderSubtype` is
+**identically equal** to `Miri.Interpreter.Step.step` under
+`annealStepHooksUnwindFnPtrClosure`. -/
 theorem step_ep2_overlay_eq_unwind_of_free {currentBody : CapturedMir}
     {callees : List CapturedMir} {poppedFrame : Miri.TreeBorrows.FrameState}
     {fnPtrs : List FnPtrEntry} {state : AnnealStepState} (choice : Unit)
@@ -629,9 +748,9 @@ theorem step_ep2_overlay_eq_unwind_of_free {currentBody : CapturedMir}
     (hfree : ∀ frame, state.stack.currentFrame? = some frame →
       (∀ bb ∈ frame.body.basicBlocks.toList,
         (∀ stmt ∈ bb.statements.toList, stmtFreeOfEp2Overlay currentBody.localDecls stmt) ∧
-        termFreeOfEp2Overlay bb.terminator)) :
+        termFreeOfEp2Overlay frame bb.terminator)) (treeBorrows : Bool) :
     Miri.Interpreter.Step.step
-      (annealStepHooksDropBinderSubtype currentBody false callees poppedFrame fnPtrs) choice state =
+      (annealStepHooksDropBinderSubtype currentBody treeBorrows callees poppedFrame fnPtrs) choice state =
     Miri.Interpreter.Step.step
       (annealStepHooksUnwindFnPtrClosure currentBody callees poppedFrame fnPtrs) choice state := by
   unfold Miri.Interpreter.Step.step
@@ -678,9 +797,13 @@ theorem step_ep2_overlay_eq_unwind_of_free {currentBody : CapturedMir}
             cases asyncDrop with
             | some _ => rfl
             | none =>
-              dsimp only [annealEvalDropOverlay]
-              simp only [ht, Bool.not_true, Bool.false_eq_true, ↓reduceIte, Bool.false_and]
-              cases ((annealStepHooks currentBody.localDecls currentBody.layouts).beforeTerminator choice state).fst.machine.borrowTracker <;> rfl
+              have hbt : (annealStepHooks currentBody.localDecls currentBody.layouts).beforeTerminator
+                  choice state = (state, .ok ()) := rfl
+              rw [hbt]
+              dsimp only
+              rw [annealEvalDropOverlay_eq_base_of_not_indirect _ _ _ _ _ _ _
+                (fun fr hfr => by rw [hcf] at hfr; cases hfr; exact ht)]
+              rfl
           | Return =>
             have hretF := hret frame hcf
             dsimp only [annealStepHooksDropBinderSubtype, annealStepHooksUnwindFnPtrClosure,
@@ -839,19 +962,37 @@ private def mkPairU32IndirectState (body : CapturedMir) (a b : Nat) : AnnealStep
     #[⟨.live (.immediate .uninit), some (translateTyOverlay u32MirTy emptyLayoutTable)⟩,
       ⟨.live (.indirect mp), some pairLay⟩] mach
 
-/-- Initial Miri state for `v3DropProtectedMir` with an active `StrongProtector`
-tag installed in `borrowTracker.global.protectedTags` (mirroring Trusted
-`v3DropProtectedInitState` and MiniRust `Validate _ true`). -/
-private def mkProtectedDropMiriState : AnnealStepState :=
+/-- Two-node vendored Tree Borrows tree over the 4 bytes of a `u32` local: root
+`retagParentTag` (`Unique`) with an accessed `Unique` child `retagChildTag`
+(`hooksTwoNodeTree .unique`, restricted to `[0, 4)`). -/
+private def lmU32ChildTree : Miri.TreeBorrows.BorrowTree :=
+  { hooksTwoNodeTree .unique with
+    locations := Miri.DataStructures.DedupRangeMap.new (Miri.ABI.Size.ofBytes 4) (hooksLocTree .unique) }
+
+private def lmU32Alloc11 : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree) :=
+  match Miri.Memory.Allocation.fromBytes (Prov := AnnealProv) #[11, 0, 0, 0] lmAlign4 .Mut with
+  | .ok al => al.withExtra (some lmU32ChildTree)
+  | .error _ => lmUninit4Alloc
+
+/-- Initial Miri state in which `_1 : u32 = 11` is **memory-backed** at allocation
+`lmAid1` (base `256`) carrying `lmU32ChildTree`, and is accessed through the root tag
+`retagParentTag`. The borrow tracker's global protected-tag table protects the
+child `retagChildTag` with a `StrongProtector` iff `childProtected` (mirroring
+Trusted's protected `Unique` borrow entry on `_1` in `v3DropProtectedInitState` and
+MiniRust's `Validate _ true`). Whether the drop conflicts is decided entirely by
+vendored `BorrowTree.performBorrowAccessRange` on this data. -/
+private def mkTbDropMiriState (body : CapturedMir) (childProtected : Bool) : AnnealStepState :=
   let u32Lay := some (translateTyOverlay u32MirTy emptyLayoutTable)
-  let protGlobal : Miri.TreeBorrows.GlobalState :=
-    { protectedTags := { entries := #[(⟨1, by decide⟩, .StrongProtector)] } }
   let mach : AnnealMachine :=
-    { AnnealMachine.empty with
-      borrowTracker := some { global := protGlobal, retagMode := .Default } }
-  mkLmMiriState v3DropProtectedMir u32MirTy
-    #[⟨.live (.immediate .uninit), u32Lay⟩,
-      ⟨.live (.immediate (.scalar (lmScalarUInt 11 4))), u32Lay⟩] mach
+    { memory := { AnnealMachine.empty.memory with live := #[(lmAid1, ⟨.stack, lmU32Alloc11⟩)] },
+      addresses := { AnnealMachine.empty.addresses with baseAddr := #[⟨lmAid1, lmBase1⟩] },
+      borrowTracker := some
+        { global := { protectedTags := (hooksForChildProtected childProtected).protectedTags },
+          retagMode := .Default } }
+  let mp : Miri.Interpreter.MemPlace AnnealProv :=
+    ⟨⟨Miri.ABI.Size.ofBytes lmBase1, some (.concrete lmAid1 retagParentTag)⟩, .none, none⟩
+  mkLmMiriState body u32MirTy
+    #[⟨.live (.immediate .uninit), u32Lay⟩, ⟨.live (.indirect mp), u32Lay⟩] mach
 
 /-- **V3 (`TerminatorKind.drop`) Comprehensive Witness Suite**:
 1. Whole-local drop -> returns `42`;
@@ -859,8 +1000,12 @@ private def mkProtectedDropMiriState : AnnealStepState :=
    `Miri.Memory.Allocation.writeUninit`: reading surviving sibling `_1.1`
    returns `99`, while reading dropped `_1.0` faults UB (`uninitialized`)!
 3. Dead-local drop -> UB (`drop of dead local`);
-4. Active-protector mode sensitivity: `protectedMode = false` returns `42`,
-   `protectedMode = true` faults UB (`Tree Borrows protector conflict on drop`);
+4. Data-driven Tree Borrows mode sensitivity on a memory-backed `_1` whose
+   allocation's vendored borrow tree has a `Unique` child: with `treeBorrows = false`
+   the drop returns `42` even when the child is protected; with `treeBorrows = true`
+   it faults UB iff the child is protected in the vendored global protected-tag
+   table (unprotected control returns `42`); and the in-memory deinitialization
+   makes a post-drop read of `_1` UB;
 5. Explicit post-elaboration no-glue phase boundary: deinit drop (`annealStepHooksDropBinderSubtype`)
    faults UB on reading `_1` after `drop(_1)` (matching Trusted), whereas
    canonical no-glue `canonNoGlueDropHooks` returns `11`! -/
@@ -885,11 +1030,19 @@ theorem lm_v3_drop_comprehensive_witness :
     -- 3. Dead-local drop UB
     (runMiriSteps (annealStepHooksDropBinderSubtype v3DropDeadUbMir false) 8 mDead).map (·.2) =
       .error (.undefinedBehavior "drop of dead local") ∧
-    -- 4. Mode sensitivity: unprotected returns 42 vs. protected faults UB
-    (runMiriSteps (annealStepHooksDropBinderSubtype v3DropProtectedMir false) 8 mkProtectedDropMiriState).map (·.2) =
+    -- 4. Mode sensitivity decided by vendored Tree Borrows on the dropped allocation
+    (runMiriSteps (annealStepHooksDropBinderSubtype v3DropProtectedMir false) 8
+        (mkTbDropMiriState v3DropProtectedMir true)).map (·.2) =
       .ok (some (.live (.immediate (.scalar (lmScalarUInt 42 4))))) ∧
-    (runMiriSteps (annealStepHooksDropBinderSubtype v3DropProtectedMir true) 8 mkProtectedDropMiriState).map (·.2) =
-      .error (.undefinedBehavior "Tree Borrows protector conflict on drop") ∧
+    (runMiriSteps (annealStepHooksDropBinderSubtype v3DropProtectedMir true) 8
+        (mkTbDropMiriState v3DropProtectedMir true)).map (·.2) =
+      .error (.undefinedBehavior "Tree Borrows write conflict on drop") ∧
+    (runMiriSteps (annealStepHooksDropBinderSubtype v3DropProtectedMir true) 8
+        (mkTbDropMiriState v3DropProtectedMir false)).map (·.2) =
+      .ok (some (.live (.immediate (.scalar (lmScalarUInt 42 4))))) ∧
+    (match runMiriSteps (annealStepHooksDropBinderSubtype v3DropPostReadMir true) 8
+        (mkTbDropMiriState v3DropPostReadMir false) with
+      | .error (.undefinedBehavior _) => true | _ => false) = true ∧
     -- 5. Phase boundary: deinit drop faults UB on post-drop read vs. canonical no-glue returns 11
     (runMiriSteps (annealStepHooksDropBinderSubtype v3DropPostReadMir false) 8 mPost).map (·.2) =
       .error (.undefinedBehavior "read of uninitialized local") ∧
@@ -897,7 +1050,8 @@ theorem lm_v3_drop_comprehensive_witness :
       .ok (some (.live (.immediate (.scalar (lmScalarUInt 11 4))))) := by
   refine ⟨by decide +kernel, by decide +kernel, by decide +kernel,
           by decide +kernel, by decide +kernel, by decide +kernel,
-          by decide +kernel, by decide +kernel⟩
+          by decide +kernel, by decide +kernel, by decide +kernel,
+          by decide +kernel⟩
 
 /-- **V4 (`Rvalue.shallowInitBox`) Lowered Miri Body**: lowers `Rvalue.shallowInitBox op contentTy`
 to `Miri.MIR.Rvalue.Cast .Transmute (translateOperand op) (encodeTyId boxU32MirTy)`
@@ -1485,7 +1639,7 @@ def ep2LmObserve (protectedMode : Bool) (variantIdx : Nat) (caseIdx : Nat) : Ep2
         #[⟨.live (.immediate .uninit), u32Lay⟩, ⟨.live (.immediate (.scalar (lmScalarUInt 11 4))), u32Lay⟩])
   | 2, 3 =>
     toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v3DropProtectedMir protectedMode) 8
-      mkProtectedDropMiriState
+      (mkTbDropMiriState v3DropProtectedMir true)
   -- 3: shallowInitBox (lowered .Cast .Transmute on uninit pointee allocation)
   | 3, 0 | 3, 1 =>
     let mach : AnnealMachine :=

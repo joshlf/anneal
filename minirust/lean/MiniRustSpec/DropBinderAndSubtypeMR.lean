@@ -859,6 +859,59 @@ theorem minirust_deinit_step_and_wfLive {M : Type} [Gen.Memory M] [MemoryOps M]
   simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte, hLay, ok_bind,
     expect_size_sized, hDeinit, pure, Except.pure, bind, Except.bind]
 
+/-- **V3 `MachTB.wfLive` Preservation for `Deinit`**: on `TreeBorrowsMemory`, every
+successful `Statement.Deinit` step (the MiniRust image of Anneal's deinitializing
+`TerminatorKind.drop`) preserves `MachTB.wfLive`. -/
+theorem minirust_deinit_step_tb_wfLive
+    (m m1 : MachTB) (pe : Gen.PlaceExpr) (pl : Gen.Place TBM) (ty : Gen.Type)
+    (sz : LibSpecr.Size) (al : LibSpecr.Align) (cm' : ConcurrentMemory TBM)
+    (hwf : MachTB.wfLive m)
+    (hPl : evalPlaceM m pe = .ok ((pl, ty), m1))
+    (hAl : pl.aligned = true)
+    (hLay : Type.layout ty = .ok (.Sized sz al))
+    (hDeinit : ConcurrentMemory.deinit m1.mem pl.ptr.thin_pointer sz ⟨1⟩ = .ok cm') :
+    evalStatementM m (.Deinit pe) = .ok { m1 with mem := cm' } ∧
+    MachTB.wfLive { m1 with mem := cm' } :=
+  have h := minirust_deinit_step_and_wfLive (M := TBM) m m1 pe pl ty sz al cm' hPl hAl hLay hDeinit
+  ⟨h, evalStatementM_tb_wfLive hwf h⟩
+
+/-- **V3 Universal Coupled Whole-Local Drop Lockstep (`Mach` & `MachTB`, with
+`MachTB.wfLive`)**: for EVERY Trusted state whose dropped local `loc` is live and has
+no active protectors, `TerminatorKind.drop (locPlace loc) target unwind` deinitializes
+`loc` and jumps to `(target, 0)`; simultaneously, for EVERY `Mach` / `MachTB` whose
+place `pe` evaluates to a live aligned sized place, the MiniRust image
+`Statement.Deinit pe` succeeds on both memories (writing `Uninit` over the place) and
+preserves `MachTB.wfLive`. -/
+theorem v3_drop_whole_coupled_lockstep_and_wfLive (s : MachineState) (loc target : Nat)
+    (unwind : MirAst.UnwindAction) (span : String) (currentBody : Option CapturedMir)
+    (slot : LocalSlot) (locals' : List LocalSlot)
+    (hGet : get? s.frame.locals loc = some slot) (hNe : slot ≠ .dead)
+    (hSet : set? s.frame.locals loc .uninit = some locals')
+    (hProt : s.memory.activeProtectors = [])
+    (pe : Gen.PlaceExpr) (ty : Gen.Type) (sz : LibSpecr.Size) (al : LibSpecr.Align)
+    (hLay : Type.layout ty = .ok (.Sized sz al))
+    (mBM mBM1 : Mach) (plBM : Gen.Place BM) (cmBM : ConcurrentMemory BM)
+    (hPlBM : evalPlaceM mBM pe = .ok ((plBM, ty), mBM1)) (hAlBM : plBM.aligned = true)
+    (hDeBM : ConcurrentMemory.deinit mBM1.mem plBM.ptr.thin_pointer sz ⟨1⟩ = .ok cmBM)
+    (mTB mTB1 : MachTB) (plTB : Gen.Place TBM) (cmTB : ConcurrentMemory TBM)
+    (hwf : MachTB.wfLive mTB)
+    (hPlTB : evalPlaceM mTB pe = .ok ((plTB, ty), mTB1)) (hAlTB : plTB.aligned = true)
+    (hDeTB : ConcurrentMemory.deinit mTB1.mem plTB.ptr.thin_pointer sz ⟨1⟩ = .ok cmTB) :
+    MirSemantics.evalTerminator s { kind := .drop (locPlace loc) target unwind, span := span } currentBody =
+      MirStepNode.step {
+        s with
+        frame := { blockIdx := target, stmtIdx := 0, locals := locals' }
+        memory := { s.memory with
+          borrows := invalidateConflictingBorrows s.memory.borrows loc .none
+            (length s.memory.callStack) } } ∧
+    evalStatementM mBM (.Deinit pe) = .ok { mBM1 with mem := cmBM } ∧
+    evalStatementM mTB (.Deinit pe) = .ok { mTB1 with mem := cmTB } ∧
+    MachTB.wfLive { mTB1 with mem := cmTB } :=
+  have hTB := minirust_deinit_step_tb_wfLive mTB mTB1 pe plTB ty sz al cmTB hwf hPlTB hAlTB hLay hDeTB
+  ⟨(trusted_drop_universal_laws s loc target unwind span currentBody).2.1 slot locals' hGet hNe hSet hProt,
+   minirust_deinit_step_and_wfLive (M := BM) mBM mBM1 pe plBM ty sz al cmBM hPlBM hAlBM hLay hDeBM,
+   hTB.1, hTB.2⟩
+
 /-- V3 positive body: whole-local drop on `_1`, jump to `bb1`, assign `_0 = 42`, return. -/
 def v3DropWholeOkMir : CapturedMir :=
   mkMirBody "ep2::v3_drop_whole_ok" [mkDecl u32MirTy, mkDecl u32MirTy] 1
@@ -1169,6 +1222,87 @@ theorem v4_shallowInitBox_universal_sim (locals locals' : List LocalSlot) (op : 
       change Nat.beq sz 8 = false
       exact Bool.eq_false_iff.mpr (fun h => hNe (Nat.eq_of_beq_eq_true h))
     simp only [hUse, hTy, rawMutU8MirTy, hBeq]
+
+/-- **V4 Exhaustive Branch Characterization of `Rvalue.shallowInitBox`
+(`v4_shallowInitBox_exhaustive`)**: universally over EVERY operand, EVERY content
+type, EVERY local-decl list and EVERY layout table (not just `*mut u8` / `u32` /
+`emptyLayoutTable`):
+1. The result never depends on `contentTy` (the pointee type is never consulted, so
+   pointee memory is never read or written).
+2. A pointer value of exactly `layoutPointerBytes layouts` bytes from an operand of
+   ANY raw-pointer type `*mu T` is returned verbatim, with the operand's
+   `locals'`/`mem'` threading.
+3. The same holds when the operand type is unknown (`operandTy = none`), the only
+   other accepting branch of Trusted.
+4. A pointer of any other width is `.unsupported` (raw-pointer or unknown type).
+5. ANY operand type whose kind is not `.rawPtr` is `.unsupported`, whatever the value.
+6. ANY non-pointer value is `.unsupported`, whatever the operand type.
+7. Operand `.ub` / `.unsupported` propagate unchanged. -/
+theorem v4_shallowInitBox_exhaustive (locals : List LocalSlot) (op : MirAst.Operand)
+    (mem : MirSemantics.Memory) (decls : List MirAst.LocalDecl) (layouts : LayoutTable) :
+    (∀ c1 c2 : MirAst.Ty,
+      evalRvalue locals (.shallowInitBox op c1) mem decls layouts =
+        evalRvalue locals (.shallowInitBox op c2) mem decls layouts) ∧
+    (∀ contentTy mu t li p locals' mem',
+      evalUseRvalue locals op mem decls layouts = .ok (.ptr p (layoutPointerBytes layouts)) locals' mem' →
+      operandTy decls layouts op = some { kind := .rawPtr mu t, layoutIdx := li } →
+      evalRvalue locals (.shallowInitBox op contentTy) mem decls layouts =
+        .ok (.ptr p (layoutPointerBytes layouts)) locals' mem') ∧
+    (∀ contentTy p locals' mem',
+      evalUseRvalue locals op mem decls layouts = .ok (.ptr p (layoutPointerBytes layouts)) locals' mem' →
+      operandTy decls layouts op = none →
+      evalRvalue locals (.shallowInitBox op contentTy) mem decls layouts =
+        .ok (.ptr p (layoutPointerBytes layouts)) locals' mem') ∧
+    (∀ contentTy p sz locals' mem', sz ≠ layoutPointerBytes layouts →
+      evalUseRvalue locals op mem decls layouts = .ok (.ptr p sz) locals' mem' →
+      (operandTy decls layouts op = none ∨
+        ∃ mu t li, operandTy decls layouts op = some { kind := .rawPtr mu t, layoutIdx := li }) →
+      evalRvalue locals (.shallowInitBox op contentTy) mem decls layouts = .unsupported) ∧
+    (∀ contentTy (ty : MirAst.Ty) v locals' mem', (∀ mu t, ty.kind ≠ .rawPtr mu t) →
+      evalUseRvalue locals op mem decls layouts = .ok v locals' mem' →
+      operandTy decls layouts op = some ty →
+      evalRvalue locals (.shallowInitBox op contentTy) mem decls layouts = .unsupported) ∧
+    (∀ contentTy v locals' mem', (∀ p sz, v ≠ .ptr p sz) →
+      evalUseRvalue locals op mem decls layouts = .ok v locals' mem' →
+      evalRvalue locals (.shallowInitBox op contentTy) mem decls layouts = .unsupported) ∧
+    (∀ contentTy, evalUseRvalue locals op mem decls layouts = .ub →
+      evalRvalue locals (.shallowInitBox op contentTy) mem decls layouts = .ub) ∧
+    (∀ contentTy, evalUseRvalue locals op mem decls layouts = .unsupported →
+      evalRvalue locals (.shallowInitBox op contentTy) mem decls layouts = .unsupported) := by
+  have hBeqSelf : Nat.beq (layoutPointerBytes layouts) (layoutPointerBytes layouts) = true :=
+    Nat.beq_refl _
+  refine ⟨fun _ _ => rfl, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro contentTy mu t li p locals' mem' hUse hTy
+    show evalShallowInitBox locals op contentTy mem decls layouts = _
+    unfold evalShallowInitBox; simp only [hUse, hTy, hBeqSelf]
+  · intro contentTy p locals' mem' hUse hTy
+    show evalShallowInitBox locals op contentTy mem decls layouts = _
+    unfold evalShallowInitBox; simp only [hUse, hTy, hBeqSelf]
+  · intro contentTy p sz locals' mem' hNe hUse hTy
+    have hBeq : Nat.beq sz (layoutPointerBytes layouts) = false :=
+      Bool.eq_false_iff.mpr (fun h => hNe (Nat.eq_of_beq_eq_true h))
+    show evalShallowInitBox locals op contentTy mem decls layouts = _
+    unfold evalShallowInitBox
+    rcases hTy with hTy | ⟨mu, t, li, hTy⟩ <;> simp only [hUse, hTy, hBeq]
+  · intro contentTy ty v locals' mem' hKind hUse hTy
+    show evalShallowInitBox locals op contentTy mem decls layouts = _
+    unfold evalShallowInitBox
+    rcases ty with ⟨kind, li⟩
+    cases kind with
+    | rawPtr mu t => exact absurd rfl (hKind mu t)
+    | _ => simp only [hUse, hTy]
+  · intro contentTy v locals' mem' hV hUse
+    show evalShallowInitBox locals op contentTy mem decls layouts = _
+    unfold evalShallowInitBox
+    cases v with
+    | ptr p sz => exact absurd rfl (hV p sz)
+    | _ => simp only [hUse]; split <;> first | rfl | contradiction
+  · intro contentTy hUb
+    show evalShallowInitBox locals op contentTy mem decls layouts = _
+    unfold evalShallowInitBox; rw [hUb]
+  · intro contentTy hUns
+    show evalShallowInitBox locals op contentTy mem decls layouts = _
+    unfold evalShallowInitBox; rw [hUns]
 
 /-- V4 positive body: `shallowInitBox` on thin `*mut u8` operand `_1` -> `Box<u32>`. -/
 def v4ShallowInitBoxOkMir : CapturedMir :=
@@ -1780,9 +1914,60 @@ theorem v7_aggregateRawPtr_comprehensive_witness :
 
 /-! ## §8 (`V8`): `AggregateKind.closure` (`Mach` & `MachTB`) -/
 
-/-- **V8 Universal `AggregateKind.closure` Simulation & Concrete Witness Suite**:
-re-exports and packages `UnwindSetDiscrAndFnPtrMR`'s ZST and multi-capture left-to-right
-closure theorems across `Mach` and `MachTB`. -/
+/-- **V8 Universal `AggregateKind.closure` Coupled Simulation (`Mach` & `MachTB`)**:
+universally over EVERY capture list `ops` and EVERY MiniRust tuple image `es`:
+1. `n`-capture lockstep: Trusted `.aggregate (.closure dp) ops` returns
+   `.aggregate 0 vals` (length-preserving, `mem` untouched) exactly when MiniRust
+   `ValueExpr.Tuple es` returns `.Tuple mvals` on BOTH `Mach` and `MachTB`;
+2. left-to-right UB propagation at ANY index (prefix evaluated, first faulting
+   upvar faults both sides, suffix never evaluated);
+3. coupled `Assign` statement step with `MachTB.wfLive` preservation (re-exported
+   `closure_assign_coupled_lockstep_and_wfLive`). -/
+theorem v8_closure_universal_sim :
+    (∀ (locals locals' : List LocalSlot) (dp : DefPath) (ops : List MirAst.Operand)
+        (vals : List MirSemantics.Value) (mem : MirSemantics.Memory) (decls : List MirAst.LocalDecl)
+        (layouts : LayoutTable) (m m' : Mach) (es : List Gen.ValueExpr) (mvals : List Val)
+        (mrClTy : Gen.Type),
+      evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals decls mem.callStack =
+          .ok vals locals' → evalValuesM m es = .ok (mvals, m') →
+        vals.length = ops.length ∧ mvals.length = es.length ∧
+        evalRvalue locals (.aggregate (.closure dp) ops) mem decls layouts = .ok (.aggregate 0 vals) locals' mem ∧
+        evalValueM m (.Tuple es mrClTy) = .ok ((.Tuple mvals, mrClTy), m')) ∧
+    (∀ (locals locals' : List LocalSlot) (dp : DefPath) (ops : List MirAst.Operand)
+        (vals : List MirSemantics.Value) (mem : MirSemantics.Memory) (decls : List MirAst.LocalDecl)
+        (layouts : LayoutTable) (m m' : MachTB) (es : List Gen.ValueExpr) (mvals : List (Gen.Value TBM))
+        (mrClTy : Gen.Type),
+      evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals decls mem.callStack =
+          .ok vals locals' → evalValuesM m es = .ok (mvals, m') →
+        vals.length = ops.length ∧ mvals.length = es.length ∧
+        evalRvalue locals (.aggregate (.closure dp) ops) mem decls layouts = .ok (.aggregate 0 vals) locals' mem ∧
+        evalValueM m (.Tuple es mrClTy) = .ok ((.Tuple mvals, mrClTy), m')) ∧
+    (∀ (locals : List LocalSlot) (dp : DefPath) (mem : MirSemantics.Memory) (decls : List MirAst.LocalDecl)
+        (layouts : LayoutTable) (pre : List MirAst.Operand) (bad : MirAst.Operand) (suf : List MirAst.Operand)
+        (preVals : List MirSemantics.Value) (localsMid : List LocalSlot)
+        (m mMid : MachTB) (mpre : List Gen.ValueExpr) (mbad : Gen.ValueExpr) (msuf : List Gen.ValueExpr)
+        (mpreVals : List (Gen.Value TBM)) (msg : String) (mrClTy : Gen.Type),
+      evalOperands locals pre mem.borrows mem.globals layouts mem.callerLocals decls mem.callStack = .ok preVals localsMid →
+      evalOperand localsMid bad mem.borrows mem.globals layouts mem.callerLocals decls mem.callStack = .ub →
+      evalValuesM m mpre = .ok (mpreVals, mMid) → evalValueM mMid mbad = .error (.ub msg) →
+      evalRvalue locals (.aggregate (.closure dp) (pre ++ bad :: suf)) mem decls layouts = .ub ∧
+      evalValueM m (.Tuple (mpre ++ mbad :: msuf) mrClTy) = .error (.ub msg)) := by
+  refine ⟨?_, ?_, ?_⟩
+  · intro locals locals' dp ops vals mem decls layouts m m' es mvals mrClTy hOps hEs
+    exact (closure_n_capture_lockstep_M (M := BM) locals locals' dp ops vals mem decls layouts
+      m m' es mvals mrClTy).1 hOps hEs
+  · intro locals locals' dp ops vals mem decls layouts m m' es mvals mrClTy hOps hEs
+    exact (closure_n_capture_lockstep_M (M := TBM) locals locals' dp ops vals mem decls layouts
+      m m' es mvals mrClTy).1 hOps hEs
+  · intro locals dp mem decls layouts pre bad suf preVals localsMid m mMid mpre mbad msuf mpreVals msg mrClTy
+      hPre hBad hmPre hmBad
+    exact (closure_n_capture_lockstep_M (M := TBM) locals locals dp [] [] mem decls layouts
+      m m [] [] mrClTy).2 pre bad suf preVals localsMid mpre mbad msuf mpreVals mMid msg hPre hBad hmPre hmBad
+
+/-- V8 coupled `Assign` step re-export (`MachTB.wfLive` preserved). -/
+abbrev v8_closure_assign_coupled_lockstep_and_wfLive := @closure_assign_coupled_lockstep_and_wfLive
+
+/-- V8 concrete witness suite re-export (`Mach` & `MachTB`). -/
 abbrev v8_closure_comprehensive_witness := @c10_closure_zst_capture_and_ub_three_way_witness
 
 /-! ## §9. Canonical Executable MiniRust Corpus Observation Interface
