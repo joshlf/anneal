@@ -124,7 +124,8 @@ here.
   those types (`spec/lang/representation.md`); `Type::{layout, meta_kind}`
   across all nine `Type` variants together with `LayoutStrategy::meta_kind`,
   `PointerMetaKind::ty`, and `PtrType::{safe_pointee, meta_kind}`
-  (`spec/lang/types.md`, `spec/lang/representation.md`, `spec/mem/pointer.md`); `BasicMemory`'s `allocate`, `load`, `store`,
+  (`spec/lang/types.md`, `spec/lang/representation.md`,
+  `spec/mem/pointer.md`); `BasicMemory`'s `allocate`, `load`, `store`,
   `deallocate`, `dereferenceable`, `signed_dereferenceable`, `retag_ptr`,
   `leak_check`, and `check_ptr` (`spec/mem/basic.md`), wrapped by
   `ConcurrentMemory` (`spec/mem/concurrent.md`); and the full Tree Borrows
@@ -7911,10 +7912,57 @@ def evalCastOpM {M : Type} [Memory M] [MemoryOps M] (castOp : CastOp)
       let val ← transmuteM operand oldTy newTy m
       pure (val, newTy)
 
-/-- Polymorphic `Machine::eval_un_op` (`spec/lang/step/operators.md`); see `evalUnOp`
-for full upstream quotations of `UnOp::{Int, Cast, GetThinPointer, GetMetadata,
-ComputeSize, ComputeAlign}`. Vtable metadata (`PointerMetaKind::VTablePointer` /
-`PointerMeta::VTablePointer`) and `UnOp::VTableMethodLookup` fail closed with
+/-- Polymorphic `Machine::eval_un_op` (`spec/lang/step/operators.md`); see `evalUnOp`:
+> "fn eval_un_op(&self, UnOp::Int(op): UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
+>     let Type::Int(int_ty) = op_ty else { panic!(\"non-integer input to integer operation\") };
+>     let Value::Int(operand) = operand else { panic!(\"non-integer input to integer operation\") };
+>     let ret_ty = match op {
+>         IntUnOp::CountOnes => IntType { signed: Unsigned, size: Size::from_bytes(4).unwrap() },
+>         _ => int_ty,
+>     };
+>     let result = Value::Int(Self::eval_int_un_op(op, operand, int_ty)?);
+>     // Sanity-check that the result of `eval_int_un_op` is in-bounds.
+>     self.check_value(result, Type::Int(ret_ty))
+>         .expect(\"sanity check: result of UnOp::Int does not fit in the return type\");
+>     ret((result, Type::Int(ret_ty)))
+> }
+> ..
+> fn eval_un_op(&self, UnOp::Cast(cast_op): UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
+>     ret(self.eval_cast_op(cast_op, (operand, op_ty))?)
+> }"
+wide pointer operators (`GetThinPointer` and `GetMetadata`):
+> "fn eval_un_op(&self, UnOp::GetThinPointer: UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
+>     let Value::Ptr(ptr) = operand else { panic!(\"non-pointer GetThinPointer\") };
+>
+>     let thin_ptr = Pointer { metadata: None, ..ptr };
+>     let thin_ptr_ty = PtrType::Raw { meta_kind: PointerMetaKind::None };
+>     ret((Value::Ptr(thin_ptr), Type::Ptr(thin_ptr_ty)))
+> }
+>
+> fn eval_un_op(&self, UnOp::GetMetadata: UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
+>     let Value::Ptr(ptr) = operand else { panic!(\"non-pointer GetMetadata\") };
+>     let Type::Ptr(ptr_ty) = op_ty else { panic!(\"non-pointer GetMetadata\") };
+>
+>     let meta_value = ptr_ty.meta_kind().encode_as_value::<M>(ptr.metadata);
+>     let meta_ty = ptr_ty.meta_kind().ty::<M::T>();
+>     // O(1) sanity check
+>     self.check_value(meta_value, meta_ty).expect(\"GetMetadata: sanity check, returned meta is well-formed\");
+>     ret((meta_value, meta_ty))
+> }"
+and dynamic size and alignment computation (`ComputeSize` and `ComputeAlign`):
+> "fn eval_un_op(&self, UnOp::ComputeSize(ty): UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
+>     let meta = ty.meta_kind().decode_value::<M>(operand);
+>     let size = self.compute_size(ty.layout::<M::T>(), meta);
+>     ret((Value::Int(size.bytes()), Type::Int(IntType::usize_ty::<M::T>())))
+> }
+>
+> fn eval_un_op(&self, UnOp::ComputeAlign(ty): UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
+>     let meta = ty.meta_kind().decode_value::<M>(operand);
+>     let align = self.compute_align(ty.layout::<M::T>(), meta);
+>     ret((Value::Int(align.bytes()), Type::Int(IntType::usize_ty::<M::T>())))
+> }"
+Vtable metadata (`PointerMetaKind::VTablePointer` / `PointerMeta::VTablePointer`)
+and `UnOp::VTableMethodLookup` remain outside the fragment and fail closed with
 `Stop.unsupported`. -/
 def evalUnOpM {M : Type} [Memory M] [MemoryOps M] (op : UnOp) (arg : Value M × «Type»)
     (m : Option (Machine M) := none) : Interp (Value M × «Type») :=
@@ -8156,12 +8204,20 @@ def evalPtrOffsetFromM {M : Type} [Memory M] [MemoryOps M] (m : Machine M)
 
 mutual
 
-/-- Polymorphic `Machine::eval_place` (`spec/lang/step/expressions.md`); see `evalPlace`:
+/-- Polymorphic `Machine::eval_place` (`spec/lang/step/expressions.md`) across all
+five `PlaceExpr` variants; see `evalPlace`:
 > "let ty = self.cur_frame().func.locals[name];
 >  let Some(ptr) = self.cur_frame().locals.get(name) else {
 >      throw_ub!(\"access to a dead local\");
 >  };
->  ret((Place { ptr: ptr.widen(None), aligned: true }, ty))" -/
+>  ret((Place { ptr: ptr.widen(None), aligned: true }, ty))"
+and for `PlaceExpr::Downcast`, which keeps the root place (pointer and `aligned`
+flag) and only changes the type to the variant's:
+> "let var_ty = match ty {
+>      Type::Enum { variants, .. } => variants[discriminant].ty,
+>      _ => panic!(\"enum downcast on non-enum\"),
+>  };
+>  ret((root, var_ty))" -/
 def evalPlaceM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) :
     PlaceExpr → Interp ((Place M × «Type») × Machine M)
   | .Local name => do
@@ -8255,7 +8311,15 @@ accesses on the exact tag bytes visited by the discriminator):
 > "let lookup = self.vtable_lookup();
 > let ptr = self.mutate_cur_frame(|frame, mem| {
 >     mem.retag_ptr(&mut frame.extra, place.ptr, ptr_ty, /* fn_entry */ false, /* fn_implicit_writes */ true, lookup)
-> })?;" -/
+> })?;"
+> "let accessor = |idx: Offset, size: Size| {
+>     let ptr = self.ptr_offset_inbounds(place.ptr.thin_pointer, idx.bytes())?;
+>     // We have ensured that the place is aligned, so no alignment requirement here.
+>     self.mem.load(ptr, size, Align::ONE, Atomicity::None)
+> };
+> let Some(discriminant) = decode_discriminant::<M>(accessor, discriminator)? else {
+>     throw_ub!(\"ValueExpr::GetDiscriminant encountered invalid discriminant.\");
+> };" -/
 def evalValueM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) :
     ValueExpr → Interp ((Value M × «Type») × Machine M)
   | .Constant c ty => do pure ((← evalConstantM m c, ty), m)

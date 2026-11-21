@@ -7962,6 +7962,985 @@ theorem ep1_meta_unops_unsized_dst_and_errors_witness :
    ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩,
    ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩⟩
 
+/-! ### `[adv B1]` Universal laws: `decode_discriminant` fidelity, complete `GetDiscriminant` /
+`Union` characterizations, non-enum panics, error propagation, and no fabricated UB -/
+
+/-- Upstream's choice of the next discriminator in `decode_discriminant`
+(`spec/lang/representation.md`), stated exactly as upstream writes it
+(`children.iter().find_map(|((start, end), child)| if start <= val && val < end { Some(child) }
+else { None }).unwrap_or(fallback)`) rather than in the continuation-passing form that
+`decodeDiscriminantChildren[M]` uses to stay structurally recursive. -/
+def ep1NextDiscriminator (children : List ((Int × Int) × Gen.Discriminator))
+    (fallback : Gen.Discriminator) (val : Int) : Gen.Discriminator :=
+  ((children.find? (fun c => decide (c.1.1 ≤ val ∧ val < c.1.2))).map Prod.snd).getD fallback
+
+/-- **Transcription fidelity of `decode_discriminant`'s `Branch` arm**: the
+continuation-passing child scan `decodeDiscriminantChildrenM` (with the fallback
+continuation that `decodeDiscriminantM` supplies) is exactly upstream's `find_map` /
+`unwrap_or(fallback)` followed by the recursive `decode_discriminant` call, for every
+accessor and every threaded state. -/
+theorem ep1_decodeDiscriminantChildrenM_eq_find_map {M : Type} [Gen.Memory M] {σ : Type}
+    (accessor : σ → Gen.Offset → Size →
+      Interp (List (Gen.AbstractByte (Gen.Memory.Provenance M)) × σ))
+    (val : Int) (fallback : Gen.Discriminator) :
+    ∀ (children : List ((Int × Int) × Gen.Discriminator)) (s : σ),
+      decodeDiscriminantChildrenM (M := M) accessor val
+          (decodeDiscriminantM (M := M) accessor fallback) children s =
+        decodeDiscriminantM (M := M) accessor (ep1NextDiscriminator children fallback val) s
+  | [], s => by
+    unfold decodeDiscriminantChildrenM
+    rfl
+  | ((start, end_), child) :: rest, s => by
+    unfold decodeDiscriminantChildrenM
+    by_cases h : start ≤ val ∧ val < end_
+    · simp [h, ep1NextDiscriminator, List.find?]
+    · have ih := ep1_decodeDiscriminantChildrenM_eq_find_map accessor val fallback rest s
+      simp only [h, ↓reduceIte, ih]
+      simp [ep1NextDiscriminator, List.find?, h]
+
+/-- Same fidelity law for the `BasicMemory` transcription `decodeDiscriminantChildren`. -/
+theorem ep1_decodeDiscriminantChildren_eq_find_map {σ : Type}
+    (accessor : σ → Gen.Offset → Size → Interp (List Byte × σ))
+    (val : Int) (fallback : Gen.Discriminator) :
+    ∀ (children : List ((Int × Int) × Gen.Discriminator)) (s : σ),
+      decodeDiscriminantChildren accessor val (decodeDiscriminant accessor fallback) children s =
+        decodeDiscriminant accessor (ep1NextDiscriminator children fallback val) s
+  | [], s => by
+    unfold decodeDiscriminantChildren
+    rfl
+  | ((start, end_), child) :: rest, s => by
+    unfold decodeDiscriminantChildren
+    by_cases h : start ≤ val ∧ val < end_
+    · simp [h, ep1NextDiscriminator, List.find?]
+    · have ih := ep1_decodeDiscriminantChildren_eq_find_map accessor val fallback rest s
+      simp only [h, ↓reduceIte, ih]
+      simp [ep1NextDiscriminator, List.find?, h]
+
+/-- The body of `ValueExpr::GetDiscriminant` after the enum-type and alignment checks
+(`spec/lang/step/expressions.md`): `decode_discriminant` with the machine-threading accessor
+(`ptr_offset_inbounds` + `self.mem.load(ptr, size, Align::ONE, Atomicity::None)`) at place
+`rp`, then `throw_ub!` on `None`. -/
+def ep1GetDiscriminantCore {M : Type} [Gen.Memory M] [MemoryOps M]
+    (rp : Gen.Place M) (dty : Gen.IntType) (d : Gen.Discriminator) (m : Gen.Machine M) :
+    Interp ((Gen.Value M × Gen.Type) × Gen.Machine M) := do
+  let accessor := fun (m : Gen.Machine M) (idx : Gen.Offset) (size : Size) => do
+    let ptr ← ptrOffsetInboundsM m rp.ptr.thin_pointer (idx.bytes : Int)
+    let (bytes, cm) ← ConcurrentMemory.load m.mem ptr size ⟨1⟩ .None
+    pure (bytes, { m with mem := cm })
+  let (discrOpt, m) ← decodeDiscriminantM (M := M) accessor d m
+  match discrOpt with
+  | some discriminant => pure ((.Int discriminant, .Int dty), m)
+  | none => ub "ValueExpr::GetDiscriminant encountered invalid discriminant."
+
+/-- **Complete universal characterization of `ValueExpr::GetDiscriminant`** on every
+`Memory` `M`, every enum type, and every `Discriminator` tree (not only the memory-free
+`Known` / `Invalid` leaves):
+
+1. on an aligned enum place, `GetDiscriminant` is exactly `ep1GetDiscriminantCore` at the
+   machine returned by `eval_place`;
+2. a `Known` leaf returns its discriminant and an `Invalid` leaf is UB, neither touching
+   memory nor the machine;
+3. a `Branch` node performs **exactly one** `ptr_offset_inbounds` + `mem.load` of
+   `value_type.size` bytes at `offset` (with `Align::ONE`, `Atomicity::None`) on the
+   *current* machine, propagates either failure unchanged (so a dangling / out-of-bounds /
+   Tree-Borrows-forbidden tag read is whatever the memory model raises, i.e. UB), raises
+   UB when the tag bytes do not decode at `Type::Int(value_type)` (uninitialized tag), and
+   otherwise continues at upstream's `find_map` / `unwrap_or(fallback)` child on the
+   machine **updated by that load** (state threading). -/
+theorem ep1_evalValueM_getDiscriminant_complete_spec {M : Type} [Gen.Memory M] [MemoryOps M] :
+    (∀ (m m1 : Gen.Machine M) (place : Gen.PlaceExpr) (rp : Gen.Place M)
+        variants dty discr sz al,
+      evalPlaceM m place = .ok ((rp, .Enum variants dty discr sz al), m1) →
+      rp.aligned = true →
+      evalValueM m (.GetDiscriminant place) = ep1GetDiscriminantCore rp dty discr m1) ∧
+    (∀ (rp : Gen.Place M) dty d (m : Gen.Machine M),
+      ep1GetDiscriminantCore rp dty (.Known d) m = .ok ((.Int d, .Int dty), m)) ∧
+    (∀ (rp : Gen.Place M) dty (m : Gen.Machine M),
+      ep1GetDiscriminantCore rp dty .Invalid m =
+        ub "ValueExpr::GetDiscriminant encountered invalid discriminant.") ∧
+    (∀ (rp : Gen.Place M) dty off vt fallback children (m : Gen.Machine M),
+      ep1GetDiscriminantCore rp dty (.Branch off vt fallback ⟨children⟩) m = (do
+        let ptr ← ptrOffsetInboundsM m rp.ptr.thin_pointer (off.bytes : Int)
+        let (bytes, cm) ← ConcurrentMemory.load m.mem ptr vt.size ⟨1⟩ .None
+        match ← Type.decodeIntM (M := M) vt bytes with
+        | some (.Int tag) =>
+          ep1GetDiscriminantCore rp dty (ep1NextDiscriminator children fallback tag)
+            { m with mem := cm }
+        | _ => ub "ValueExpr::GetDiscriminant encountered invalid discriminant.")) := by
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · intro m m1 place rp variants dty discr sz al hp hal
+    simp only [evalValueM, hp, hal, ep1GetDiscriminantCore, bind, Except.bind,
+      Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+    rfl
+  · intro rp dty d m
+    simp [ep1GetDiscriminantCore, decodeDiscriminantM, bind, Except.bind, pure, Except.pure]
+  · intro rp dty m
+    simp [ep1GetDiscriminantCore, decodeDiscriminantM, ub, bind, Except.bind, pure, Except.pure]
+  · intro rp dty off vt fallback children m
+    simp only [ep1GetDiscriminantCore, decodeDiscriminantM, bind, Except.bind]
+    cases hptr : ptrOffsetInboundsM m rp.ptr.thin_pointer (off.bytes : Int) with
+    | error e => rfl
+    | ok ptr =>
+      dsimp only
+      cases hld : ConcurrentMemory.load m.mem ptr vt.size ⟨1⟩ .None with
+      | error e => rfl
+      | ok bc =>
+        obtain ⟨bytes, cm⟩ := bc
+        dsimp only [pure, Except.pure]
+        cases hdec : Type.decodeIntM (M := M) vt bytes with
+        | error e => rfl
+        | ok optv =>
+          dsimp only
+          cases optv with
+          | none => rfl
+          | some v =>
+            cases v with
+            | Int tag =>
+              dsimp only
+              rw [ep1_decodeDiscriminantChildrenM_eq_find_map]
+            | _ => rfl
+
+/-- **Complete universal characterization of `ValueExpr::Union`** on every `Memory` `M`:
+at a union type, `eval_value` is exactly upstream's sequence — `fields[field]`, the
+evaluation of `expr`, `expr_ty.encode(val)`, `write_subslice_at_index` into
+`size.bytes()` `Uninit` bytes — followed by the per-chunk `subslice_with_length` of
+`Type::decode` at `Union`. In particular neither `Type::decode`'s length check
+(`"decode of Type::Union with invalid length"`) nor upstream's `.unwrap()` can ever
+fire: `write_subslice_at_index` preserves the length `size.bytes()`, and `decode` at a
+union type never returns `None`. -/
+theorem ep1_evalValueM_union_complete_spec {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m : Gen.Machine M) (field : Int) (expr : Gen.ValueExpr)
+    (fields : List (Gen.Offset × Gen.Type)) (chunks : List (Gen.Offset × Size))
+    (sz : Size) (al : Align) :
+    evalValueM m (.Union field expr (.Union fields chunks sz al)) = (do
+      let (offset, exprTy) ← listIndex fields field "fields[field]"
+      let ((val, _), m) ← evalValueM m expr
+      let encoded ← Type.encodeM exprTy val
+      let data ← writeSubsliceAtIndex
+        (List.replicate sz.bytes (.Uninit : Gen.AbstractByte (Gen.Memory.Provenance M)))
+        (offset.bytes : Int) encoded
+      let chunkData ← chunks.mapM (fun (offset, chunkSize) =>
+        subsliceWithLength data offset.bytes chunkSize.bytes)
+      pure ((.Union chunkData, .Union fields chunks sz al), m)) := by
+  simp only [evalValueM, bind, Except.bind, pure, Except.pure]
+  cases hidx : listIndex fields field "fields[field]" with
+  | error e => rfl
+  | ok ofty =>
+    obtain ⟨offset, exprTy⟩ := ofty
+    dsimp only
+    cases hev : evalValueM m expr with
+    | error e => rfl
+    | ok vm =>
+      obtain ⟨⟨val, vty⟩, m1⟩ := vm
+      dsimp only
+      cases henc : Type.encodeM exprTy val with
+      | error e => rfl
+      | ok encoded =>
+        dsimp only
+        cases hws : writeSubsliceAtIndex
+            (List.replicate sz.bytes (.Uninit : Gen.AbstractByte (Gen.Memory.Provenance M)))
+            (offset.bytes : Int) encoded with
+        | error e => rfl
+        | ok data =>
+          dsimp only
+          have hlen : data.length = sz.bytes := by
+            rw [writeSubsliceAtIndex_length hws, List.length_replicate]
+          unfold Type.decodeM
+          simp only [hlen, ne_eq, not_true_eq_false, ↓reduceIte, bind, Except.bind, pure,
+            Except.pure]
+          cases hch : chunks.mapM (fun (x : Gen.Offset × Size) =>
+              subsliceWithLength data (x.1.bytes : Int) (x.2.bytes : Int)) with
+          | error e => rfl
+          | ok chunkData => rfl
+
+/-- **Type-mismatch spec panics and error propagation**, universally over every `Memory`
+`M` and every non-matching type (not only `Type::Int`):
+
+* `PlaceExpr::Downcast` and `ValueExpr::GetDiscriminant` on any non-enum place and
+  `ValueExpr::Union` at any non-union type are upstream's `panic!`s. The
+  `GetDiscriminant` panic precedes the misalignment check (it holds whatever
+  `rp.aligned` is), and the `Union` panic precedes the evaluation of `expr`.
+* A failing sub-evaluation (`eval_place(root)`, `eval_place(place)`, `eval_value(data)`,
+  `eval_value(expr)`) propagates unchanged, so UB of an operand is never masked. -/
+theorem ep1_evalM_type_mismatch_panics_and_error_propagation
+    {M : Type} [Gen.Memory M] [MemoryOps M] (m m1 : Gen.Machine M) :
+    (∀ root rp ty d, evalPlaceM m root = .ok ((rp, ty), m1) →
+      (∀ v dt dc s a, ty ≠ .Enum v dt dc s a) →
+      evalPlaceM m (.Downcast root d) = specPanic "enum downcast on non-enum") ∧
+    (∀ place rp ty, evalPlaceM m place = .ok ((rp, ty), m1) →
+      (∀ v dt dc s a, ty ≠ .Enum v dt dc s a) →
+      evalValueM m (.GetDiscriminant place) =
+        specPanic "ValueExpr::GetDiscriminant requires enum type") ∧
+    (∀ field expr ty, (∀ f c s a, ty ≠ .Union f c s a) →
+      evalValueM m (.Union field expr ty) = specPanic "ValueExpr::Union requires union type") ∧
+    (∀ root d e, evalPlaceM m root = .error e → evalPlaceM m (.Downcast root d) = .error e) ∧
+    (∀ place e, evalPlaceM m place = .error e →
+      evalValueM m (.GetDiscriminant place) = .error e) ∧
+    (∀ d data enumTy e, evalValueM m data = .error e →
+      evalValueM m (.Variant d data enumTy) = .error e) ∧
+    (∀ field expr fields chunks sz al off ety e,
+      listIndex fields field "fields[field]" = .ok (off, ety) →
+      evalValueM m expr = .error e →
+      evalValueM m (.Union field expr (.Union fields chunks sz al)) = .error e) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro root rp ty d hroot hne
+    cases ty with
+    | Enum v dt dc s a => exact absurd rfl (hne v dt dc s a)
+    | _ => simp [evalPlaceM, hroot, specPanic, bind, Except.bind]
+  · intro place rp ty hp hne
+    cases ty with
+    | Enum v dt dc s a => exact absurd rfl (hne v dt dc s a)
+    | _ => simp [evalValueM, hp, specPanic, bind, Except.bind]
+  · intro field expr ty hne
+    cases ty with
+    | Union f c s a => exact absurd rfl (hne f c s a)
+    | _ => simp [evalValueM, specPanic, bind, Except.bind]
+  · intro root d e hroot
+    simp [evalPlaceM, hroot, bind, Except.bind]
+  · intro place e hp
+    simp [evalValueM, hp, bind, Except.bind]
+  · intro d data enumTy e hd
+    simp [evalValueM, hd, bind, Except.bind]
+  · intro field expr fields chunks sz al off ety e hidx hev
+    simp [evalValueM, hidx, hev, bind, Except.bind, pure, Except.pure]
+
+/-- **Complete universal characterization of `UnOp::GetMetadata`** over every pointer
+type (`Raw`, `Ref`, `Box`, `FnPtr`, `VTablePtr`, through `PtrType::meta_kind`) and every
+metadata, on every `Memory` `M` and with or without a machine:
+
+* thin kind + no metadata returns `unit_value()` at `unit_type()`;
+* `ElementCount` kind + element count `c` returns `Value::Int(c)` at `usize` exactly when
+  `c` fits in a `usize`, and otherwise is upstream's failed O(1) sanity check
+  (`check_value(..).expect(..)`, a spec panic — never UB);
+* `VTablePointer` kind + vtable metadata is fail-closed `unsupported`;
+* every kind/metadata mismatch (all five) is upstream's `encode_as_value` panic, which
+  therefore takes precedence over the vtable fail-closed stop. -/
+theorem ep1_evalUnOpM_getMetadata_complete_spec {M : Type} [Gen.Memory M] [MemoryOps M]
+    (thin : Gen.ThinPointer (Gen.Memory.Provenance M)) (ptrTy : Gen.PtrType)
+    (m : Option (Gen.Machine M)) :
+    (PtrType.meta_kind ptrTy = .None →
+      evalUnOpM .GetMetadata (.Ptr ⟨thin, none⟩, .Ptr ptrTy) m = .ok (.Tuple [], unitType)) ∧
+    (∀ c, PtrType.meta_kind ptrTy = .ElementCount →
+      evalUnOpM .GetMetadata (.Ptr ⟨thin, some (.ElementCount c)⟩, .Ptr ptrTy) m =
+        match IntType.can_represent IntType.usize_ty c with
+        | true => .ok (.Int c, .Int IntType.usize_ty)
+        | false => specPanic "GetMetadata: sanity check, returned meta is well-formed") ∧
+    (∀ t p, PtrType.meta_kind ptrTy = .VTablePointer t →
+      evalUnOpM .GetMetadata (.Ptr ⟨thin, some (.VTablePointer p)⟩, .Ptr ptrTy) m =
+        unsupported "eval_un_op UnOp::GetMetadata for vtable pointer metadata") ∧
+    (∀ pm, PtrType.meta_kind ptrTy = .None →
+      evalUnOpM .GetMetadata (.Ptr ⟨thin, some pm⟩, .Ptr ptrTy) m =
+        specPanic "PointerMeta::encode_as_value called with invalid value") ∧
+    (PtrType.meta_kind ptrTy = .ElementCount →
+      evalUnOpM .GetMetadata (.Ptr ⟨thin, none⟩, .Ptr ptrTy) m =
+        specPanic "PointerMeta::encode_as_value called with invalid value") ∧
+    (∀ p, PtrType.meta_kind ptrTy = .ElementCount →
+      evalUnOpM .GetMetadata (.Ptr ⟨thin, some (.VTablePointer p)⟩, .Ptr ptrTy) m =
+        specPanic "PointerMeta::encode_as_value called with invalid value") ∧
+    (∀ t, PtrType.meta_kind ptrTy = .VTablePointer t →
+      evalUnOpM .GetMetadata (.Ptr ⟨thin, none⟩, .Ptr ptrTy) m =
+        specPanic "PointerMeta::encode_as_value called with invalid value") ∧
+    (∀ t c, PtrType.meta_kind ptrTy = .VTablePointer t →
+      evalUnOpM .GetMetadata (.Ptr ⟨thin, some (.ElementCount c)⟩, .Ptr ptrTy) m =
+        specPanic "PointerMeta::encode_as_value called with invalid value") := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro hk
+    have hCheck : checkValueM (M := M) (.Tuple []) unitType m = .ok () := by
+      rw [unitType, checkValueM]; rfl
+    rw [evalUnOpM]
+    simp only [hk, PointerMetaKind.encode_as_valueM, PointerMetaKind.ty, bind, Except.bind,
+      pure, Except.pure]
+    rw [hCheck]
+  · intro c hk
+    rw [evalUnOpM]
+    simp only [hk, PointerMetaKind.encode_as_valueM, PointerMetaKind.ty, bind, Except.bind,
+      pure, Except.pure]
+    cases hc : IntType.can_represent IntType.usize_ty c with
+    | true =>
+      have hCheck : checkValueM (M := M) (.Int c) (.Int IntType.usize_ty) m = .ok () := by
+        rw [checkValueM, ensureElseUb, hc]; rfl
+      rw [hCheck]
+    | false =>
+      have hCheck : checkValueM (M := M) (.Int c) (.Int IntType.usize_ty) m =
+          .error (.ub "Value::Int: invalid integer value") := by
+        rw [checkValueM, ensureElseUb, hc]; rfl
+      rw [hCheck]
+  · intro t p hk
+    simp [evalUnOpM, hk, PointerMetaKind.encode_as_valueM, bind, Except.bind, pure, Except.pure]
+  · intro pm hk
+    simp [evalUnOpM, hk, PointerMetaKind.encode_as_valueM, specPanic, bind, Except.bind]
+  · intro hk
+    simp [evalUnOpM, hk, PointerMetaKind.encode_as_valueM, specPanic, bind, Except.bind]
+  · intro p hk
+    simp [evalUnOpM, hk, PointerMetaKind.encode_as_valueM, specPanic, bind, Except.bind]
+  · intro t hk
+    simp [evalUnOpM, hk, PointerMetaKind.encode_as_valueM, specPanic, bind, Except.bind]
+  · intro t c hk
+    simp [evalUnOpM, hk, PointerMetaKind.encode_as_valueM, specPanic, bind, Except.bind]
+
+private theorem ep1_bind_error {α β : Type} {x : Interp α} {f : α → Interp β} {e : Stop}
+    (h : (x >>= f) = .error e) : x = .error e ∨ ∃ a, x = .ok a ∧ f a = .error e := by
+  cases hx : x with
+  | error e' =>
+    simp only [hx, bind, Except.bind] at h
+    cases h
+    exact Or.inl rfl
+  | ok a =>
+    simp only [hx, bind, Except.bind] at h
+    exact Or.inr ⟨a, rfl, h⟩
+
+private theorem ep1_map_error {α β : Type} {x : Interp α} {f : α → β} {e : Stop}
+    (h : (f <$> x) = .error e) : x = .error e := by
+  cases hx : x with
+  | error e' => simpa [hx, Functor.map, Except.map] using h
+  | ok a => simp [hx, Functor.map, Except.map] at h
+
+private theorem ep1_expect_size_error_is_specPanic {l : Gen.LayoutStrategy} {msg : String}
+    {e : Stop} (h : LayoutStrategy.expect_size l msg = .error e) : ∃ m, e = .specPanic m := by
+  cases l <;> simp [LayoutStrategy.expect_size, specPanic, pure, Except.pure] at h
+  all_goals exact ⟨_, h.symm⟩
+
+private theorem ep1_expect_align_error_is_specPanic {l : Gen.LayoutStrategy} {msg : String}
+    {e : Stop} (h : LayoutStrategy.expect_align l msg = .error e) : ∃ m, e = .specPanic m := by
+  cases l <;> simp [LayoutStrategy.expect_align, specPanic, pure, Except.pure] at h
+  all_goals exact ⟨_, h.symm⟩
+
+private theorem ep1_Size_mulInt_error_is_specPanic {s : Size} {n : Int} {e : Stop}
+    (h : Size.mulInt s n = .error e) : ∃ m, e = .specPanic m := by
+  unfold Size.mulInt at h
+  split at h
+  · simp [pure, Except.pure] at h
+  · simp [specPanic] at h; exact ⟨_, h.symm⟩
+
+/-- `Type::layout` fails only by a spec panic (`expect_size` / `expect_align` on an unsized
+element, a negative `Size * Int`, or a non-power-of-two integer size): it has no
+`throw_ub!`. -/
+theorem ep1_Type_layout_error_is_specPanic :
+    ∀ (ty : Gen.Type) (e : Stop), Type.layout ty = .error e → ∃ msg, e = .specPanic msg
+  | .Int t, e, h => by
+    unfold Type.layout at h
+    rcases ep1_bind_error h with ha | ⟨a, _, hp⟩
+    · unfold IntType.align at ha
+      split at ha
+      · simp [pure, Except.pure] at ha
+      · simp [specPanic] at ha; exact ⟨_, ha.symm⟩
+    · simp [pure, Except.pure] at hp
+  | .Bool, e, h => by simp [Type.layout, pure, Except.pure] at h
+  | .Ptr p, e, h => by
+    unfold Type.layout at h
+    split at h <;> simp [pure, Except.pure] at h
+  | .Union _ _ _ _, e, h => by simp [Type.layout, pure, Except.pure] at h
+  | .Enum _ _ _ _ _, e, h => by simp [Type.layout, pure, Except.pure] at h
+  | .Tuple _ _ none, e, h => by simp [Type.layout, pure, Except.pure] at h
+  | .Tuple _ head (some tail), e, h => by
+    unfold Type.layout at h
+    rcases ep1_bind_error h with ht | ⟨a, _, hp⟩
+    · exact ep1_Type_layout_error_is_specPanic tail e ht
+    · simp [pure, Except.pure] at hp
+  | .Array elem count, e, h => by
+    unfold Type.layout at h
+    rcases ep1_bind_error h with hl | ⟨el, _, h⟩
+    · exact ep1_Type_layout_error_is_specPanic elem e hl
+    · rcases ep1_bind_error h with hs | ⟨es, _, h⟩
+      · exact ep1_expect_size_error_is_specPanic hs
+      · rcases ep1_bind_error h with ha | ⟨ea, _, h⟩
+        · exact ep1_expect_align_error_is_specPanic ha
+        · rcases ep1_bind_error h with hm | ⟨sz, _, hp⟩
+          · exact ep1_Size_mulInt_error_is_specPanic hm
+          · simp [pure, Except.pure] at hp
+  | .Slice elem, e, h => by
+    unfold Type.layout at h
+    rcases ep1_bind_error h with hl | ⟨el, _, h⟩
+    · exact ep1_Type_layout_error_is_specPanic elem e hl
+    · rcases ep1_bind_error h with hs | ⟨es, _, h⟩
+      · exact ep1_expect_size_error_is_specPanic hs
+      · rcases ep1_bind_error h with hl2 | ⟨el2, _, h⟩
+        · exact ep1_Type_layout_error_is_specPanic elem e hl2
+        · rcases ep1_bind_error h with ha | ⟨ea, _, hp⟩
+          · exact ep1_expect_align_error_is_specPanic ha
+          · simp [pure, Except.pure] at hp
+  | .TraitObject _, e, h => by simp [Type.layout, pure, Except.pure] at h
+
+private theorem ep1_compute_size_and_align_nonVTable_error_is_specPanic {P : Type}
+    (vt : Gen.ThinPointer P → Interp Gen.VTable) :
+    ∀ (lay : Gen.LayoutStrategy) (pm : Option (Gen.PointerMeta P)) (e : Stop),
+      (∀ p, pm ≠ some (.VTablePointer p)) →
+      LayoutStrategy.compute_size_and_align vt lay pm = .error e → ∃ msg, e = .specPanic msg
+  | .Sized _ _, none, e, _, h => by
+    simp [LayoutStrategy.compute_size_and_align, pure, Except.pure] at h
+  | .Sized _ _, some _, e, _, h => by
+    simp [LayoutStrategy.compute_size_and_align, specPanic] at h; exact ⟨_, h.symm⟩
+  | .Slice _ _, none, e, _, h => by
+    simp [LayoutStrategy.compute_size_and_align, specPanic] at h; exact ⟨_, h.symm⟩
+  | .Slice elemSize _, some (.ElementCount count), e, _, h => by
+    unfold LayoutStrategy.compute_size_and_align at h
+    dsimp only at h
+    split at h
+    · simp [pure, Except.pure] at h
+    · simp [specPanic] at h; exact ⟨_, h.symm⟩
+  | .Slice _ _, some (.VTablePointer p), e, hn, _ => absurd rfl (hn p)
+  | .TraitObject _, none, e, _, h => by
+    simp [LayoutStrategy.compute_size_and_align, specPanic] at h; exact ⟨_, h.symm⟩
+  | .TraitObject _, some (.ElementCount _), e, _, h => by
+    simp [LayoutStrategy.compute_size_and_align, specPanic] at h; exact ⟨_, h.symm⟩
+  | .TraitObject _, some (.VTablePointer p), e, hn, _ => absurd rfl (hn p)
+  | .Tuple _ _, none, e, _, h => by
+    simp [LayoutStrategy.compute_size_and_align, specPanic] at h; exact ⟨_, h.symm⟩
+  | .Tuple head tail, some pm, e, hn, h => by
+    unfold LayoutStrategy.compute_size_and_align at h
+    rcases ep1_bind_error h with ht | ⟨r, _, hp⟩
+    · exact ep1_compute_size_and_align_nonVTable_error_is_specPanic vt tail (some pm) e hn ht
+    · simp [pure, Except.pure] at hp
+
+private theorem ep1_meta_layout_tail_error_is_specPanic {M : Type} [Gen.Memory M] {α : Type}
+    (proj : Size × Align → α) (k : α → Gen.Value M × Gen.Type) (what : String) (ty : Gen.Type)
+    (pm : Option (Gen.PointerMeta (Gen.Memory.Provenance M)))
+    (hn : ∀ p, pm ≠ some (.VTablePointer p)) (e : Stop)
+    (h : (do
+      let layout ← Type.layout ty
+      let x ← proj <$> LayoutStrategy.compute_size_and_align
+        (fun _ => (unsupported what : Interp Gen.VTable)) layout pm
+      (pure (k x) : Interp (Gen.Value M × Gen.Type))) = .error e) :
+    ∃ msg, e = .specPanic msg := by
+  rcases ep1_bind_error h with hl | ⟨lay, _, h⟩
+  · exact ep1_Type_layout_error_is_specPanic ty e hl
+  · rcases ep1_bind_error h with hc | ⟨x, _, hp⟩
+    · exact ep1_compute_size_and_align_nonVTable_error_is_specPanic _ lay pm e hn
+        (ep1_map_error hc)
+    · simp [pure, Except.pure] at hp
+
+/-- **No fabricated UB in the metadata operators.** Upstream's `eval_un_op` arms for
+`GetMetadata`, `ComputeSize`, and `ComputeAlign` contain no `throw_ub!` (only `panic!`s
+and `.expect(..)`), and `VTableMethodLookup` is outside the fragment. Accordingly, on
+every `Memory` `M`, every operand, and with or without a machine, each of these four
+operators either succeeds or stops with `Stop.specPanic` or `Stop.unsupported` — never
+`Stop.ub` (nor `abort`, `deadlock`, `machineStop`, or `memoryLeak`). -/
+theorem ep1_evalUnOpM_meta_unops_error_is_specPanic_or_unsupported
+    {M : Type} [Gen.Memory M] [MemoryOps M]
+    (ty : Gen.Type) (meth : Gen.TraitMethodName) (arg : Gen.Value M × Gen.Type)
+    (m : Option (Gen.Machine M)) (e : Stop) :
+    (evalUnOpM .GetMetadata arg m = .error e ∨
+     evalUnOpM (.ComputeSize ty) arg m = .error e ∨
+     evalUnOpM (.ComputeAlign ty) arg m = .error e ∨
+     evalUnOpM (.VTableMethodLookup meth) arg m = .error e) →
+    (∃ msg, e = .specPanic msg) ∨ (∃ msg, e = .unsupported msg) := by
+  obtain ⟨v, opTy⟩ := arg
+  have hDecode : ∀ (k : Gen.PointerMetaKind) (e' : Stop),
+      PointerMetaKind.decode_valueM (M := M) k v = .error e' → ∃ msg, e' = .specPanic msg := by
+    intro k e' h
+    unfold PointerMetaKind.decode_valueM at h
+    split at h <;> simp [specPanic, pure, Except.pure] at h
+    exact ⟨_, h.symm⟩
+  have hSize : ∀ (e' : Stop), evalUnOpM (.ComputeSize ty) (v, opTy) none = .error e' →
+      (∃ msg, e' = .specPanic msg) ∨ (∃ msg, e' = .unsupported msg) := by
+    intro e' h
+    unfold evalUnOpM at h
+    dsimp only at h
+    rcases ep1_bind_error h with hd | ⟨pm, _, h⟩
+    · exact Or.inl (hDecode _ _ hd)
+    · cases pm with
+      | none =>
+        exact Or.inl (ep1_meta_layout_tail_error_is_specPanic _ _ _ ty none
+          (fun _ hx => by cases hx) e' h)
+      | some mval =>
+        cases mval with
+        | VTablePointer p => cases h; exact Or.inr ⟨_, rfl⟩
+        | ElementCount c =>
+          exact Or.inl (ep1_meta_layout_tail_error_is_specPanic _ _ _ ty
+            (some (.ElementCount c)) (fun _ hx => by cases hx) e' h)
+  have hAlign : ∀ (e' : Stop), evalUnOpM (.ComputeAlign ty) (v, opTy) none = .error e' →
+      (∃ msg, e' = .specPanic msg) ∨ (∃ msg, e' = .unsupported msg) := by
+    intro e' h
+    unfold evalUnOpM at h
+    dsimp only at h
+    rcases ep1_bind_error h with hd | ⟨pm, _, h⟩
+    · exact Or.inl (hDecode _ _ hd)
+    · cases pm with
+      | none =>
+        exact Or.inl (ep1_meta_layout_tail_error_is_specPanic _ _ _ ty none
+          (fun _ hx => by cases hx) e' h)
+      | some mval =>
+        cases mval with
+        | VTablePointer p => cases h; exact Or.inr ⟨_, rfl⟩
+        | ElementCount c =>
+          exact Or.inl (ep1_meta_layout_tail_error_is_specPanic _ _ _ ty
+            (some (.ElementCount c)) (fun _ hx => by cases hx) e' h)
+  rintro (h | h | h | h)
+  · -- GetMetadata
+    have hPanic : ∀ (x : Interp (Gen.Value M × Gen.Type)),
+        x = specPanic "non-pointer GetMetadata" → x = .error e →
+        (∃ msg, e = .specPanic msg) ∨ (∃ msg, e = .unsupported msg) := by
+      intro x hx hxe
+      rw [hx] at hxe
+      simp [specPanic] at hxe
+      exact Or.inl ⟨_, hxe.symm⟩
+    cases v with
+    | Ptr ptr =>
+      cases opTy with
+      | Ptr ptrTy =>
+        unfold evalUnOpM at h
+        dsimp only at h
+        rcases ep1_bind_error h with hd | ⟨mv, _, h⟩
+        · unfold PointerMetaKind.encode_as_valueM at hd
+          split at hd <;> simp [specPanic, pure, Except.pure] at hd
+          exact Or.inl ⟨_, hd.symm⟩
+        · cases hk : PtrType.meta_kind ptrTy with
+          | VTablePointer t =>
+            rw [hk] at h
+            cases h
+            exact Or.inr ⟨_, rfl⟩
+          | None =>
+            rw [hk] at h
+            dsimp only at h
+            split at h
+            · simp [pure, Except.pure] at h
+            · cases h; exact Or.inr ⟨_, rfl⟩
+            · simp [specPanic] at h; exact Or.inl ⟨_, h.symm⟩
+          | ElementCount =>
+            rw [hk] at h
+            dsimp only at h
+            split at h
+            · simp [pure, Except.pure] at h
+            · cases h; exact Or.inr ⟨_, rfl⟩
+            · simp [specPanic] at h; exact Or.inl ⟨_, h.symm⟩
+      | _ => exact hPanic _ rfl h
+    | _ => exact hPanic _ rfl h
+  · cases m with
+    | none => exact hSize e h
+    | some mach =>
+      rw [(ep1_evalUnOpM_computeSize_computeAlign_mach_indep ty opTy v mach).1] at h
+      exact hSize e h
+  · cases m with
+    | none => exact hAlign e h
+    | some mach =>
+      rw [(ep1_evalUnOpM_computeSize_computeAlign_mach_indep ty opTy v mach).2] at h
+      exact hAlign e h
+  · simp [evalUnOpM, unsupported] at h
+    exact Or.inr ⟨_, h.symm⟩
+
+/-! ### `[adv B1]` Concrete edge-case witnesses -/
+
+/-- 8-byte align-4 enum whose `u8` tag lives at offset `4` (not `0`), with unit variants. -/
+private def ep1EnumTagAt4Ty : Gen.Type :=
+  let unitVar : Gen.Type := .Tuple [] ⟨⟨8⟩, ⟨4⟩, none⟩ none
+  let v0 : Gen.Variant := { ty := unitVar, tagger := ⟨[(⟨4⟩, (ep1U8, 0))]⟩ }
+  let v1 : Gen.Variant := { ty := unitVar, tagger := ⟨[(⟨4⟩, (ep1U8, 1))]⟩ }
+  .Enum ⟨[(0, v0), (1, v1)]⟩ ep1U8
+    (.Branch ⟨4⟩ ep1U8 .Invalid ⟨[((0, 1), .Known 0), ((1, 2), .Known 1)]⟩) ⟨8⟩ ⟨4⟩
+
+/-- 4-byte align-2 enum with a two-level discriminator: a *signed* `i8` tag at offset `0`;
+tag `-1` selects a second-level `u16` tag at offset `2` (bytes `[2..4)`), tag `0` is
+discriminant `0`, and every other first-level tag falls back to discriminant `7`. Byte `1`
+is read by no path. `GetDiscriminant` never consults `variants`, so they are left empty. -/
+private def ep1NestedEnumTy : Gen.Type :=
+  let inner : Gen.Discriminator :=
+    .Branch ⟨2⟩ ep1U16 .Invalid ⟨[((0x100, 0x200), .Known 1), ((0x200, 0x300), .Known 2)]⟩
+  let disc : Gen.Discriminator :=
+    .Branch ⟨0⟩ ⟨.Signed, ⟨1⟩⟩ (.Known 7) ⟨[((-1, 0), inner), ((0, 1), .Known 0)]⟩
+  .Enum ⟨[]⟩ ep1U8 disc ⟨4⟩ ⟨2⟩
+
+/-- **`GetDiscriminant` reads exactly the bytes the discriminator touches — in order, threading
+the machine — and nothing else** (multi-level discriminator, signed tag, fallback, data-race
+access log, dereferenceability), on both `Mach` and `MachTB`:
+
+1. two-level decode: first tag `-1` (`0xFF` at `i8`) then second tag `0x0150` gives
+   discriminant `1`, and the machine's access log records exactly the two tag loads
+   (`1` byte at `+0`, then `2` bytes at `+2`) in that order — byte `1` (uninitialized) is
+   never read;
+2. fallback: first tag `5` matches no child, so the result is the fallback discriminant `7`
+   after exactly one 1-byte load, although bytes `[1..4)` are uninitialized;
+3. second-level tag out of every child range (`0x0400`) reaches `Discriminator::Invalid`:
+   UB; an uninitialized second-level tag is UB too (after the first load succeeded);
+4. dereferenceability is required only for the bytes read: over a 2-byte allocation, the
+   fallback path (`+0` only) succeeds although the 4-byte enum is not dereferenceable (and
+   `Load` at the enum type is UB), whereas the two-level path's second load at `+2` is UB;
+5. a tag at offset `4` over a 4-byte allocation: `ptr_offset_inbounds(ptr, 4)` succeeds
+   (one-past-the-end) and the 1-byte load is out-of-bounds UB; through a pointer without
+   provenance the same read is UB in `ptr_offset_inbounds` itself. Every UB message is
+   pinned. -/
+theorem ep1_getDiscriminant_nested_tags_access_log_and_dereferenceability_witness :
+    let localTys : List (Gen.LocalName × Gen.Type) :=
+      [(⟨⟨0⟩⟩, ep1NestedEnumTy), (⟨⟨1⟩⟩, ep1NestedEnumTy), (⟨⟨2⟩⟩, ep1NestedEnumTy),
+       (⟨⟨3⟩⟩, ep1NestedEnumTy), (⟨⟨4⟩⟩, .Int ep1U16), (⟨⟨5⟩⟩, .Int ep1U16),
+       (⟨⟨6⟩⟩, .Int ep1U32)]
+    let mBM := ep1MachBM
+      [{ data := [.Init 0xFF none, .Uninit, .Init 0x50 none, .Init 0x01 none],
+         addr := 0x100, align := ⟨2⟩, kind := .Stack, live := true, extra := () },
+       { data := [.Init 5 none, .Uninit, .Uninit, .Uninit],
+         addr := 0x200, align := ⟨2⟩, kind := .Stack, live := true, extra := () },
+       { data := [.Init 0xFF none, .Uninit, .Init 0x00 none, .Init 0x04 none],
+         addr := 0x300, align := ⟨2⟩, kind := .Stack, live := true, extra := () },
+       { data := [.Init 0xFF none, .Uninit, .Uninit, .Init 0x01 none],
+         addr := 0x400, align := ⟨2⟩, kind := .Stack, live := true, extra := () },
+       { data := [.Init 0xFF none, .Init 0 none],
+         addr := 0x500, align := ⟨2⟩, kind := .Stack, live := true, extra := () },
+       { data := [.Init 5 none, .Init 0 none],
+         addr := 0x600, align := ⟨2⟩, kind := .Stack, live := true, extra := () },
+       { data := List.replicate 4 (.Init 1 none),
+         addr := 0x700, align := ⟨4⟩, kind := .Stack, live := true, extra := () }]
+      [(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩), (⟨⟨1⟩⟩, ⟨0x200, some (⟨1⟩, ())⟩),
+       (⟨⟨2⟩⟩, ⟨0x300, some (⟨2⟩, ())⟩), (⟨⟨3⟩⟩, ⟨0x400, some (⟨3⟩, ())⟩),
+       (⟨⟨4⟩⟩, ⟨0x500, some (⟨4⟩, ())⟩), (⟨⟨5⟩⟩, ⟨0x600, some (⟨5⟩, ())⟩),
+       (⟨⟨6⟩⟩, ⟨0x700, some (⟨6⟩, ())⟩)]
+      localTys
+    let mTB := liftMachToTB mBM
+    let viaRaw (l : Nat) (ty : Gen.Type) : Gen.PlaceExpr :=
+      .Deref (.AddrOf (.Local ⟨⟨l⟩⟩) (.Raw .None)) ty
+    let noProv (ty : Gen.Type) : Gen.PlaceExpr :=
+      .Deref (.Constant (.PointerWithoutProvenance 0x700) (.Ptr (.Raw .None))) ty
+    let invalidDiscrUb := "ValueExpr::GetDiscriminant encountered invalid discriminant."
+    let oobUb := "dereferencing pointer outside the bounds of its allocation"
+    let noProvUb := "dereferencing pointer without provenance"
+    -- 1. two-level decode + exact access log
+    (∃ m1, evalValue mBM (.GetDiscriminant (.Local ⟨⟨0⟩⟩)) = .ok ((.Int 1, .Int ep1U8), m1) ∧
+      m1.mem.accesses = [⟨.Load, .None, 0x100, ⟨1⟩⟩, ⟨.Load, .None, 0x102, ⟨2⟩⟩]) ∧
+    (∃ m1, evalValueM mTB (.GetDiscriminant (.Local ⟨⟨0⟩⟩)) = .ok ((.Int 1, .Int ep1U8), m1) ∧
+      m1.mem.accesses = [⟨.Load, .None, 0x100, ⟨1⟩⟩, ⟨.Load, .None, 0x102, ⟨2⟩⟩]) ∧
+    -- 2. fallback after exactly one load
+    (∃ m1, evalValue mBM (.GetDiscriminant (.Local ⟨⟨1⟩⟩)) = .ok ((.Int 7, .Int ep1U8), m1) ∧
+      m1.mem.accesses = [⟨.Load, .None, 0x200, ⟨1⟩⟩]) ∧
+    (∃ m1, evalValueM mTB (.GetDiscriminant (.Local ⟨⟨1⟩⟩)) = .ok ((.Int 7, .Int ep1U8), m1) ∧
+      m1.mem.accesses = [⟨.Load, .None, 0x200, ⟨1⟩⟩]) ∧
+    -- 3. second-level `Invalid` and uninitialized second-level tag: UB
+    (evalValue mBM (.GetDiscriminant (.Local ⟨⟨2⟩⟩)) = .error (.ub invalidDiscrUb) ∧
+     evalValueM mTB (.GetDiscriminant (.Local ⟨⟨2⟩⟩)) = .error (.ub invalidDiscrUb) ∧
+     evalValue mBM (.GetDiscriminant (.Local ⟨⟨3⟩⟩)) = .error (.ub invalidDiscrUb) ∧
+     evalValueM mTB (.GetDiscriminant (.Local ⟨⟨3⟩⟩)) = .error (.ub invalidDiscrUb)) ∧
+    -- 4. only the bytes read must be dereferenceable
+    ((∃ m1, evalValue mBM (.GetDiscriminant (viaRaw 5 ep1NestedEnumTy)) =
+        .ok ((.Int 7, .Int ep1U8), m1)) ∧
+     (∃ m1, evalValueM mTB (.GetDiscriminant (viaRaw 5 ep1NestedEnumTy)) =
+        .ok ((.Int 7, .Int ep1U8), m1)) ∧
+     evalValue mBM (.Load (viaRaw 5 ep1NestedEnumTy)) = .error (.ub oobUb) ∧
+     evalValueM mTB (.Load (viaRaw 5 ep1NestedEnumTy)) = .error (.ub oobUb) ∧
+     evalValue mBM (.GetDiscriminant (viaRaw 4 ep1NestedEnumTy)) = .error (.ub oobUb) ∧
+     evalValueM mTB (.GetDiscriminant (viaRaw 4 ep1NestedEnumTy)) = .error (.ub oobUb)) ∧
+    -- 5. tag at offset 4: out-of-bounds load UB vs. `ptr_offset_inbounds` UB
+    (evalValue mBM (.GetDiscriminant (viaRaw 6 ep1EnumTagAt4Ty)) = .error (.ub oobUb) ∧
+     evalValueM mTB (.GetDiscriminant (viaRaw 6 ep1EnumTagAt4Ty)) = .error (.ub oobUb) ∧
+     evalValue mBM (.GetDiscriminant (noProv ep1EnumTagAt4Ty)) = .error (.ub noProvUb) ∧
+     evalValueM mTB (.GetDiscriminant (noProv ep1EnumTagAt4Ty)) = .error (.ub noProvUb)) := by
+  intro localTys mBM mTB viaRaw noProv invalidDiscrUb oobUb noProvUb
+  exact ⟨⟨_, rfl, rfl⟩, ⟨_, rfl, rfl⟩, ⟨_, rfl, rfl⟩, ⟨_, rfl, rfl⟩,
+    ⟨rfl, rfl, rfl, rfl⟩,
+    ⟨⟨_, rfl⟩, ⟨_, rfl⟩, rfl, rfl, rfl, rfl⟩,
+    ⟨rfl, rfl, rfl, rfl⟩⟩
+
+/-- **Tree Borrows: a two-level `GetDiscriminant` skips the gap byte between its two tag
+reads.** Through a child tag (`[0]`) of the enum allocation:
+
+1. the child is `Frozen` on bytes `0`, `2`, `3` and `Disabled` on the gap byte `1`: the
+   two-level decode (1 byte at `+0`, 2 bytes at `+2`) succeeds on `MachTB`, because byte
+   `1` is never accessed, whereas a typed `Load` of the whole enum through the same child
+   is Tree Borrows UB;
+2. the child is `Disabled` on byte `3` (inside the second-level tag): the first tag read
+   succeeds and the second is Tree Borrows UB on `MachTB`, while `BasicMemory` (no
+   aliasing model) still returns discriminant `1`. -/
+theorem ep1_getDiscriminant_tree_borrows_nested_gap_byte_witness :
+    let enumBytes {P : Type} : List (Gen.AbstractByte P) :=
+      [.Init 0xFF none, .Init 0 none, .Init 0x50 none, .Init 0x01 none]
+    let localTys : List (Gen.LocalName × Gen.Type) :=
+      [(⟨⟨0⟩⟩, ep1NestedEnumTy), (⟨⟨1⟩⟩, .Ptr (.Raw .None))]
+    let ptrBytesBM : List Byte := encodePtrBytes (some (⟨0⟩, ())) 0 [0x00, 0x01, 0, 0, 0, 0, 0, 0]
+    let ptrBytesTB : List (Gen.AbstractByte Gen.TreeBorrowsProvenance) :=
+      encodePtrBytesM (M := TBM) (some (⟨0⟩, [0])) 0 [0x00, 0x01, 0, 0, 0, 0, 0, 0]
+    let mBM := ep1MachBM
+      [{ data := enumBytes, addr := 0x100, align := ⟨2⟩, kind := .Stack, live := true, extra := () },
+       { data := ptrBytesBM, addr := 0x200, align := ⟨8⟩, kind := .Stack, live := true, extra := () }]
+      [(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩), (⟨⟨1⟩⟩, ⟨0x200, some (⟨1⟩, ())⟩)]
+      localTys
+    let childGapDisabled : Gen.Node :=
+      { children := [],
+        permissions := [.Unprot .Frozen, .Unprot .Disabled, .Unprot .Frozen, .Unprot .Frozen],
+        «protected» := .No }
+    let childSecondTagDisabled : Gen.Node :=
+      { children := [],
+        permissions := [.Unprot .Frozen, .Unprot .Frozen, .Unprot .Frozen, .Unprot .Disabled],
+        «protected» := .No }
+    let mkTB (child : Gen.Node) : MachTB :=
+      ep1MachTB
+        [ep1AllocTB 0x100 2 enumBytes [child], ep1AllocTB 0x200 8 ptrBytesTB]
+        [(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, [])⟩), (⟨⟨1⟩⟩, ⟨0x200, some (⟨1⟩, [])⟩)]
+        localTys
+    let derefChildPlace : Gen.PlaceExpr := .Deref (.Load (.Local ⟨⟨1⟩⟩)) ep1NestedEnumTy
+    let tbDisabledUb := "Tree Borrows: local read of Disabled reference"
+    (∃ m1, evalValueM (mkTB childGapDisabled) (.GetDiscriminant derefChildPlace) =
+        .ok ((.Int 1, .Int ep1U8), m1) ∧
+      m1.mem.accesses.drop 1 = [⟨.Load, .None, 0x100, ⟨1⟩⟩, ⟨.Load, .None, 0x102, ⟨2⟩⟩]) ∧
+    evalValueM (mkTB childGapDisabled) (.Load derefChildPlace) = .error (.ub tbDisabledUb) ∧
+    evalValueM (mkTB childSecondTagDisabled) (.GetDiscriminant derefChildPlace) =
+      .error (.ub tbDisabledUb) ∧
+    (∃ m1, evalValue mBM (.GetDiscriminant derefChildPlace) = .ok ((.Int 1, .Int ep1U8), m1)) := by
+  intro enumBytes localTys ptrBytesBM ptrBytesTB mBM childGapDisabled childSecondTagDisabled
+    mkTB derefChildPlace tbDisabledUb
+  exact ⟨⟨_, rfl, rfl⟩, rfl, rfl, ⟨_, rfl⟩⟩
+
+/-- Kernel-checked reflexivity: closes `lhs = rhs` with `Eq.refl lhs`, leaving the
+definitional-equality check to the kernel (no native evaluation, no `Lean.ofReduceBool`). -/
+local elab "ep1_kernel_rfl" : tactic => do
+  let mvarId ← Lean.Elab.Tactic.getMainGoal
+  let tgt ← Lean.MVarId.getType' mvarId
+  let some (ty, lhs, _) := tgt.eq? |
+    Lean.Meta.throwTacticEx `ep1_kernel_rfl mvarId "expected equality goal"
+  let u ← Lean.Meta.getLevel ty
+  mvarId.assign (Lean.mkApp2 (Lean.mkConst ``Eq.refl [u]) ty lhs)
+  Lean.Elab.Tactic.replaceMainGoal []
+
+private theorem ep1_ok_of_map_fst {α μ : Type} {r : Interp (α × μ)} {a : α}
+    (h : Prod.fst <$> r = .ok a) : ∃ m, r = .ok (a, m) := by
+  cases hr : r with
+  | error e => simp [hr, Functor.map, Except.map] at h
+  | ok p =>
+    obtain ⟨a', m⟩ := p
+    simp only [hr, Functor.map, Except.map, Except.ok.injEq] at h
+    exact ⟨m, by rw [h]⟩
+
+/-- **End-to-end `UnOp::{GetMetadata, ComputeSize, ComputeAlign}` through `eval_value`** on a
+machine (the `some m` path of `eval_un_op`, after loading the operand pointer from memory),
+on both `Mach` and `MachTB`: a wide `*const [u32]` of length `3` and a thin pointer are
+loaded from locals; `GetMetadata` returns `3 : usize` resp. `()`, and feeding that metadata
+to `ComputeSize` / `ComputeAlign` yields `12` / `4` for `[u32]` (slice layout) and for
+`[u32; 3]` (sized layout). Metadata of the wrong kind for the type, and a non-pointer
+`GetMetadata` operand, are spec panics (never UB). -/
+theorem ep1_meta_unops_end_to_end_evalValue_witness :
+    let sliceTy : Gen.Type := .Slice (.Int ep1U32)
+    let arrTy : Gen.Type := .Array (.Int ep1U32) 3
+    let usize : Gen.Type := .Int IntType.usize_ty
+    let localTys : List (Gen.LocalName × Gen.Type) :=
+      [(⟨⟨0⟩⟩, arrTy), (⟨⟨1⟩⟩, .Ptr (.Raw .ElementCount)), (⟨⟨2⟩⟩, .Ptr (.Raw .None))]
+    let thinBytes : List Byte := encodePtrBytes (some (⟨0⟩, ())) 0 [0x00, 0x01, 0, 0, 0, 0, 0, 0]
+    let lenBytes : List Byte :=
+      [.Init 3 none, .Init 0 none, .Init 0 none, .Init 0 none,
+       .Init 0 none, .Init 0 none, .Init 0 none, .Init 0 none]
+    let mBM := ep1MachBM
+      [{ data := List.replicate 12 (.Init 0 none), addr := 0x100, align := ⟨4⟩, kind := .Stack,
+         live := true, extra := () },
+       { data := thinBytes ++ lenBytes, addr := 0x200, align := ⟨8⟩, kind := .Stack,
+         live := true, extra := () },
+       { data := thinBytes, addr := 0x300, align := ⟨8⟩, kind := .Stack,
+         live := true, extra := () }]
+      [(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩), (⟨⟨1⟩⟩, ⟨0x200, some (⟨1⟩, ())⟩),
+       (⟨⟨2⟩⟩, ⟨0x300, some (⟨2⟩, ())⟩)]
+      localTys
+    let mTB := liftMachToTB mBM
+    let wideMeta : Gen.ValueExpr := .UnOp .GetMetadata (.Load (.Local ⟨⟨1⟩⟩))
+    let thinMeta : Gen.ValueExpr := .UnOp .GetMetadata (.Load (.Local ⟨⟨2⟩⟩))
+    -- 1. Mach
+    ((∃ m1, evalValue mBM wideMeta = .ok ((.Int 3, usize), m1)) ∧
+     (∃ m1, evalValue mBM (.UnOp (.ComputeSize sliceTy) wideMeta) = .ok ((.Int 12, usize), m1)) ∧
+     (∃ m1, evalValue mBM (.UnOp (.ComputeAlign sliceTy) wideMeta) = .ok ((.Int 4, usize), m1)) ∧
+     (∃ m1, evalValue mBM thinMeta = .ok ((.Tuple [], unitType), m1)) ∧
+     (∃ m1, evalValue mBM (.UnOp (.ComputeSize arrTy) thinMeta) = .ok ((.Int 12, usize), m1)) ∧
+     (∃ m1, evalValue mBM (.UnOp (.ComputeAlign arrTy) thinMeta) = .ok ((.Int 4, usize), m1))) ∧
+    -- 2. MachTB
+    ((∃ m1, evalValueM mTB wideMeta = .ok ((.Int 3, usize), m1)) ∧
+     (∃ m1, evalValueM mTB (.UnOp (.ComputeSize sliceTy) wideMeta) = .ok ((.Int 12, usize), m1)) ∧
+     (∃ m1, evalValueM mTB (.UnOp (.ComputeAlign sliceTy) wideMeta) = .ok ((.Int 4, usize), m1)) ∧
+     (∃ m1, evalValueM mTB thinMeta = .ok ((.Tuple [], unitType), m1)) ∧
+     (∃ m1, evalValueM mTB (.UnOp (.ComputeSize arrTy) thinMeta) = .ok ((.Int 12, usize), m1)) ∧
+     (∃ m1, evalValueM mTB (.UnOp (.ComputeAlign arrTy) thinMeta) = .ok ((.Int 4, usize), m1))) ∧
+    -- 3. wrong metadata kind for the type and non-pointer operand: spec panics
+    (evalValue mBM (.UnOp (.ComputeSize sliceTy) thinMeta) =
+       specPanic "PointerMeta::decode_value called with invalid value" ∧
+     evalValueM mTB (.UnOp (.ComputeSize sliceTy) thinMeta) =
+       specPanic "PointerMeta::decode_value called with invalid value" ∧
+     evalValue mBM (.UnOp (.ComputeAlign arrTy) wideMeta) =
+       specPanic "PointerMeta::decode_value called with invalid value" ∧
+     evalValueM mTB (.UnOp (.ComputeAlign arrTy) wideMeta) =
+       specPanic "PointerMeta::decode_value called with invalid value" ∧
+     evalValue mBM (.UnOp .GetMetadata (.Load (.Local ⟨⟨0⟩⟩))) =
+       specPanic "non-pointer GetMetadata" ∧
+     evalValueM mTB (.UnOp .GetMetadata (.Load (.Local ⟨⟨0⟩⟩))) =
+       specPanic "non-pointer GetMetadata") := by
+  intro sliceTy arrTy usize localTys thinBytes lenBytes mBM mTB wideMeta thinMeta
+  refine ⟨⟨ep1_ok_of_map_fst ?_, ep1_ok_of_map_fst ?_, ep1_ok_of_map_fst ?_,
+      ep1_ok_of_map_fst ?_, ep1_ok_of_map_fst ?_, ep1_ok_of_map_fst ?_⟩,
+    ⟨ep1_ok_of_map_fst ?_, ep1_ok_of_map_fst ?_, ep1_ok_of_map_fst ?_,
+      ep1_ok_of_map_fst ?_, ep1_ok_of_map_fst ?_, ep1_ok_of_map_fst ?_⟩,
+    ⟨?_, ?_, ?_, ?_, ?_, ?_⟩⟩
+  all_goals ep1_kernel_rfl
+
+/-- **Ill-formed `ValueExpr::Variant` / `ValueExpr::Union` ASTs are spec panics, not UB**, on
+both `Mach` and `MachTB`:
+
+1. `ValueExpr::Variant` performs no check of its own (upstream just builds
+   `Value::Variant { discriminant, data }`), so an undeclared discriminant `9` evaluates
+   successfully; storing it is then upstream's failed
+   `assert!(self.check_value(val, ty).is_ok(), ..)` in `typed_store` — a spec panic, although
+   the inner `check_value` failure is a `throw_ub!`;
+2. `ValueExpr::Union` with a field whose encoding does not fit in the union
+   (`write_subslice_at_index` out of range) or whose operand value does not match the field
+   type (`expr_ty.encode(val)`) is a spec panic;
+3. UB of the operand of a well-indexed `Union` / of a `Variant` propagates as UB. -/
+theorem ep1_variant_union_ill_formed_ast_specPanic_witness :
+    let localTys : List (Gen.LocalName × Gen.Type) :=
+      [(⟨⟨0⟩⟩, ep1EnumTy), (⟨⟨1⟩⟩, .Int ep1U32)]
+    let mBM := ep1MachBM
+      [{ data := List.replicate 8 .Uninit, addr := 0x100, align := ⟨4⟩, kind := .Stack,
+         live := true, extra := () }]
+      [(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩)]
+      localTys
+    let mTB := liftMachToTB mBM
+    let badVariant : Gen.ValueExpr :=
+      .Variant 9 (.Tuple [] ep1Var0TupleTy) ep1EnumTy
+    let overflowUnionTy : Gen.Type := .Union [(⟨2⟩, .Int ep1U32)] [(⟨0⟩, ⟨4⟩)] ⟨4⟩ ⟨4⟩
+    let storePanic := "trying to store a value which is ill-formed for its type"
+    let deadLocalUb := "access to a dead local"
+    -- 1. undeclared discriminant: evaluates, then `typed_store` asserts
+    (evalValue mBM badVariant = .ok ((.Variant 9 (.Tuple []), ep1EnumTy), mBM) ∧
+     evalValueM mTB badVariant = .ok ((.Variant 9 (.Tuple []), ep1EnumTy), mTB) ∧
+     evalStatement mBM (.Assign (.Local ⟨⟨0⟩⟩) badVariant) = specPanic storePanic ∧
+     evalStatementM mTB (.Assign (.Local ⟨⟨0⟩⟩) badVariant) = specPanic storePanic) ∧
+    -- 2. `Union` field encoding out of range / operand of the wrong type
+    (evalValue mBM (.Union 0 (.Constant (.Int 1) (.Int ep1U32)) overflowUnionTy) =
+       specPanic "write_subslice_at_index out of range" ∧
+     evalValueM mTB (.Union 0 (.Constant (.Int 1) (.Int ep1U32)) overflowUnionTy) =
+       specPanic "write_subslice_at_index out of range" ∧
+     evalValue mBM (.Union 0 (.Constant (.Bool true) .Bool) ep1UnionTy) =
+       specPanic "encode: Type::Int with a non-Int value" ∧
+     evalValueM mTB (.Union 0 (.Constant (.Bool true) .Bool) ep1UnionTy) =
+       specPanic "encode: Type::Int with a non-Int value") ∧
+    -- 3. operand UB propagates
+    (evalValue mBM (.Union 0 (.Load (.Local ⟨⟨1⟩⟩)) ep1UnionTy) = .error (.ub deadLocalUb) ∧
+     evalValueM mTB (.Union 0 (.Load (.Local ⟨⟨1⟩⟩)) ep1UnionTy) = .error (.ub deadLocalUb) ∧
+     evalValue mBM (.Variant 1 (.Load (.Local ⟨⟨1⟩⟩)) ep1EnumTy) = .error (.ub deadLocalUb) ∧
+     evalValueM mTB (.Variant 1 (.Load (.Local ⟨⟨1⟩⟩)) ep1EnumTy) = .error (.ub deadLocalUb)) := by
+  intro localTys mBM mTB badVariant overflowUnionTy storePanic deadLocalUb
+  exact ⟨⟨rfl, rfl, rfl, rfl⟩, ⟨rfl, rfl, rfl, rfl⟩, ⟨rfl, rfl, rfl, rfl⟩⟩
+
+/-- A machine whose single local `_0 : orderingTy` (the correspondence's `Ordering` enum,
+`MiniRustSpec.Correspondence.orderingTy`) occupies the one byte `b`. -/
+private def ep1OrderingMach (b : Byte) : Mach :=
+  ep1MachBM
+    [{ data := [b], addr := 0x100, align := ⟨1⟩, kind := .Stack, live := true, extra := () }]
+    [(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩)]
+    [(⟨⟨0⟩⟩, orderingTy)]
+
+/-- The discriminant outcome of an evaluation at `IntType::I8`: `some (some i)` for success
+with `Value::Int(i)` at `i8`, `some none` for UB, and `none` for anything else (a spec
+panic, `unsupported`, or a result of another shape). -/
+private def ep1DiscrOutcome {M : Type} [Gen.Memory M] {μ : Type}
+    (r : Interp ((Gen.Value M × Gen.Type) × μ)) : Option (Option Int) :=
+  match r with
+  | .ok ((.Int i, .Int ⟨.Signed, ⟨1⟩⟩), _) => some (some i)
+  | .error (.ub _) => some none
+  | _ => none
+
+/-- **The executable `GetDiscriminant` validates the correspondence's `Rvalue::Discriminant`
+lowering and its hand-written model.** Before Episode 1 the interpreter had no
+`GetDiscriminant`, so `Correspondence.Translate` lowers `Rvalue::Discriminant` on an
+`Ordering` local to `orderingDiscrExpr (Load place)` and
+`orderingDiscrExpr_eq_getDiscriminant` could compare that lowering only with a
+*hand-written model* (`orderingGetDiscriminant`). On **every** byte an `Ordering` local can
+hold — the uninitialized byte and all 256 initialized bytes — the now-executable
+`eval_value(GetDiscriminant(_0))` on both `Mach` and `MachTB` has exactly the outcome of
+that model (`Int` of the tag at `i8`, or UB), and so does the lowering
+`eval_value(orderingDiscrExpr(Load(_0)))` on both machines. -/
+theorem ep1_getDiscriminant_ordering_agrees_with_model_and_lowering :
+    ((Gen.AbstractByte.Uninit :: (List.range 256).map (fun n => .Init (UInt8.ofNat n) none)).all
+      (fun (b : Byte) =>
+        let m := ep1OrderingMach b
+        let place : Gen.PlaceExpr := .Local ⟨⟨0⟩⟩
+        let model : Option (Option Int) :=
+          match orderingGetDiscriminant b with
+          | .ok d => some d
+          | .error _ => none
+        ep1DiscrOutcome (evalValue m (.GetDiscriminant place)) == model &&
+        ep1DiscrOutcome (evalValueM (liftMachToTB m) (.GetDiscriminant place)) == model &&
+        ep1DiscrOutcome (evalValue m (orderingDiscrExpr (.Load place))) == model &&
+        ep1DiscrOutcome (evalValueM (liftMachToTB m) (orderingDiscrExpr (.Load place))) == model))
+      = true ∧
+    (∃ m1, evalValue (ep1OrderingMach (.Init 255 none)) (.GetDiscriminant (.Local ⟨⟨0⟩⟩)) =
+      .ok ((.Int (-1), .Int IntType.I8), m1)) ∧
+    evalValue (ep1OrderingMach (.Init 2 none)) (.GetDiscriminant (.Local ⟨⟨0⟩⟩)) =
+      ub "ValueExpr::GetDiscriminant encountered invalid discriminant." ∧
+    evalValue (ep1OrderingMach .Uninit) (.GetDiscriminant (.Local ⟨⟨0⟩⟩)) =
+      ub "ValueExpr::GetDiscriminant encountered invalid discriminant." := by
+  refine ⟨by decide +kernel, ⟨_, rfl⟩, rfl, rfl⟩
+
+
+/-- **`Downcast`'s variant lookup is the representation relation's variant lookup.**
+`PlaceExpr::Downcast` types the place at `variants[discriminant].ty` through `mapIndex`
+(`Map::index`), whereas `Type::decode`, `Type::encode`, and `check_value` at an enum walk
+the association list themselves (`Type.decodeVariant[M]`, `Type.encodeVariant[M]`,
+`checkVariant[M]`). For every association list — including lists with shadowed duplicate
+keys, which `libspecr::Map` cannot hold but the Lean `Map` can — all four pick the same
+(first) entry for `discriminant`, on every `Memory` `M`:
+
+* if `variants.get(discriminant)` is `Some(var)`, then decoding, checking, and encoding the
+  enum at that discriminant are decoding, checking, and encoding at `var.ty` (the type
+  `Downcast` assigns to the place) followed, for `encode`, by `encode_discriminant` with
+  `var.tagger`;
+* if it is `None`, `Downcast` and `decode` / `encode` are the `Map::index` spec panic and
+  `check_value` is UB (`"Value::Variant: invalid discrimant"`).
+
+So a `Downcast` + `Field` projection addresses exactly the variant payload type that a
+`Load` / `Assign` of the whole enum uses. -/
+theorem ep1_downcast_variant_lookup_agrees_with_representation
+    {M : Type} [Gen.Memory M] [MemoryOps M] (d : Int) :
+    ∀ (variants : List (Int × Gen.Variant)),
+      (∀ var, mapGet (⟨variants⟩ : Map Int Gen.Variant) d = some var →
+        mapIndex (⟨variants⟩ : Map Int Gen.Variant) d "variants[discriminant]" = .ok var ∧
+        (∀ bytes, Type.decodeVariantM (M := M) variants d bytes = Type.decodeM var.ty bytes) ∧
+        (∀ data m, checkVariantM (M := M) variants d data m = checkValueM data var.ty m) ∧
+        (∀ data, Type.encodeVariantM (M := M) variants d data = (do
+          let bytes ← Type.encodeM var.ty data
+          encodeDiscriminantM (M := M)
+            (fun bytes offset valueBytes => writeSubsliceAtIndex bytes offset.bytes valueBytes)
+            var.tagger bytes))) ∧
+      (mapGet (⟨variants⟩ : Map Int Gen.Variant) d = none →
+        mapIndex (⟨variants⟩ : Map Int Gen.Variant) d "variants[discriminant]" =
+          specPanic "map index: missing key (variants[discriminant])" ∧
+        (∀ bytes, Type.decodeVariantM (M := M) variants d bytes =
+          specPanic "map index: missing key (variants[discriminant])") ∧
+        (∀ data m, checkVariantM (M := M) variants d data m =
+          ub "Value::Variant: invalid discrimant") ∧
+        (∀ data, Type.encodeVariantM (M := M) variants d data =
+          specPanic "map index: missing key (variants[discriminant])"))
+  | [] => by
+    refine ⟨fun var h => by simp [mapGet] at h, fun _ => ⟨rfl, fun _ => ?_, fun _ _ => ?_, fun _ => ?_⟩⟩
+    · unfold Type.decodeVariantM; rfl
+    · unfold checkVariantM; rfl
+    · unfold Type.encodeVariantM; rfl
+  | (d', ⟨ty, tagger⟩) :: rest => by
+    have ih := ep1_downcast_variant_lookup_agrees_with_representation (M := M) d rest
+    by_cases hd : d' = d
+    · subst hd
+      refine ⟨fun var h => ?_, fun h => by simp [mapGet] at h⟩
+      have hvar : var = ⟨ty, tagger⟩ := by
+        simp [mapGet] at h
+        exact h.symm
+      subst hvar
+      refine ⟨by simp [mapIndex, mapGet, pure, Except.pure], fun bytes => ?_, fun data m => ?_,
+        fun data => ?_⟩
+      · unfold Type.decodeVariantM; simp
+      · unfold checkVariantM; simp
+      · unfold Type.encodeVariantM; simp
+    · have hget : mapGet (⟨(d', ⟨ty, tagger⟩) :: rest⟩ : Map Int Gen.Variant) d =
+          mapGet (⟨rest⟩ : Map Int Gen.Variant) d := by
+        simp [mapGet, hd]
+      have hidx : mapIndex (⟨(d', ⟨ty, tagger⟩) :: rest⟩ : Map Int Gen.Variant) d
+            "variants[discriminant]" =
+          mapIndex (⟨rest⟩ : Map Int Gen.Variant) d "variants[discriminant]" := by
+        simp only [mapIndex, hget]
+      have hdec : ∀ bytes, Type.decodeVariantM (M := M) ((d', ⟨ty, tagger⟩) :: rest) d bytes =
+          Type.decodeVariantM (M := M) rest d bytes := by
+        intro bytes; rw [Type.decodeVariantM]; simp [hd]
+      have hchk : ∀ data m, checkVariantM (M := M) ((d', ⟨ty, tagger⟩) :: rest) d data m =
+          checkVariantM (M := M) rest d data m := by
+        intro data m; rw [checkVariantM]; simp [hd]
+      have henc : ∀ data, Type.encodeVariantM (M := M) ((d', ⟨ty, tagger⟩) :: rest) d data =
+          Type.encodeVariantM (M := M) rest d data := by
+        intro data; rw [Type.encodeVariantM]; simp [hd]
+      rw [hget, hidx]
+      refine ⟨fun var h => ?_, fun h => ?_⟩
+      · obtain ⟨h1, h2, h3, h4⟩ := ih.1 var h
+        exact ⟨h1, fun b => (hdec b).trans (h2 b), fun x m => (hchk x m).trans (h3 x m),
+          fun x => (henc x).trans (h4 x)⟩
+      · obtain ⟨h1, h2, h3, h4⟩ := ih.2 h
+        exact ⟨h1, fun b => (hdec b).trans (h2 b), fun x m => (hchk x m).trans (h3 x m),
+          fun x => (henc x).trans (h4 x)⟩
+
 #check_theorem_deps "[EP1-EXPR-AUDIT]"
   ep1_type_meta_kind_eq_layout_meta_kind
   ep1_evalUnOpM_computeSize_computeAlign_mach_indep
@@ -7972,6 +8951,20 @@ theorem ep1_meta_unops_unsized_dst_and_errors_witness :
   ep1_getDiscriminant_tree_borrows_read_access_witness
   ep1_union_construct_punning_and_errors_witness
   ep1_meta_unops_unsized_dst_and_errors_witness
+  ep1_decodeDiscriminantChildrenM_eq_find_map
+  ep1_decodeDiscriminantChildren_eq_find_map
+  ep1_evalValueM_getDiscriminant_complete_spec
+  ep1_evalValueM_union_complete_spec
+  ep1_evalM_type_mismatch_panics_and_error_propagation
+  ep1_evalUnOpM_getMetadata_complete_spec
+  ep1_Type_layout_error_is_specPanic
+  ep1_evalUnOpM_meta_unops_error_is_specPanic_or_unsupported
+  ep1_getDiscriminant_nested_tags_access_log_and_dereferenceability_witness
+  ep1_getDiscriminant_tree_borrows_nested_gap_byte_witness
+  ep1_meta_unops_end_to_end_evalValue_witness
+  ep1_variant_union_ill_formed_ast_specPanic_witness
+  ep1_getDiscriminant_ordering_agrees_with_model_and_lowering
+  ep1_downcast_variant_lookup_agrees_with_representation
 
 /-- Verify that every newly added or modified executable `Interp` definition in
 Episode 1 is strictly computable (`Classical.choice`-free, `sorryAx`-free, and

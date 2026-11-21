@@ -58,8 +58,10 @@ unsized DST pointer-metadata operations:
      (`sliceSizeOverflow_minirust_ub_locus`) and is strictly more restrictive (fail-closed, like
      Miri's `InvalidMeta(SliceTooBig)`) for raw `*const [T]` pointers
      (`div_rawSliceSizeOfVal_isizeMax_anneal_ub_vs_minirust_total`). The executable Lean
-     `MiniRustSpec.Interp` does not implement `GetMetadata` / `ComputeSize` / `ComputeAlign`
-     (`minirust_interp_metadata_unops_unsupported`), so the MiniRust side of those operations is
+     `MiniRustSpec.Interp` now implements `GetMetadata` / `ComputeSize` / `ComputeAlign` for thin
+     and slice `ElementCount` metadata (`minirust_interp_metadata_unops_exec_and_vtable_unsupported`,
+     which supersedes the former `minirust_interp_metadata_unops_unsupported` canary); the
+     witnesses below predate that support, so the MiniRust side of those operations is still
      stated against the spec functions they denote (`PointerMetaKind.encode_as_value`,
      `computeSize`, `computeAlign`) or lowered via `Transmute` to `mrWidePairTupleTy`.
 4. **Symbolic & Concrete `slice::from_raw_parts(_mut)` (`&*p` / `&mut *p`), `Rvalue.len (*s)`,
@@ -2036,7 +2038,8 @@ theorem wideSliceTreeBorrowsDisabledVsMetadataOk_three_way :
 Concrete ground-truth agreement between Anneal (`mirTree` returning `(size_of_val + align_of_val) as u32`)
 and MiniRust's `Machine::compute_size` / `compute_align` (`computeSize` / `computeAlign`, checking
 each individual component as the spec functions behind `UnOp::ComputeSize` / `ComputeAlign`, which
-the executable `Interp` leaves `unsupported` — see `minirust_interp_metadata_unops_unsupported`) on:
+the executable `Interp` now also evaluates on slice metadata — see
+`minirust_interp_metadata_unops_exec_and_vtable_unsupported`) on:
 1. `[u32]` (`len = 4`, `elemSz = 4`, `elemAlign = 4` $\mapsto$ `size = 16, align = 4`, Anneal sum `= 20`),
 2. `str` (`len = 5` $\mapsto$ `size = 5, align = 1`, Anneal sum `= 6`),
 3. empty `[u32]` (`len = 0` $\mapsto$ `size = 0, align = 4`, Anneal sum `= 4`), and
@@ -2708,8 +2711,8 @@ def wideSliceRawParentWriteMInit : Mach :=
 def wideSliceRawParentWriteTBInit : MachTB := liftMachToTB wideSliceRawParentWriteMInit
 
 /-- MiniRust translation of `wideSliceMetadataAfterParentWriteMir`, lowering
-`_5 = PtrMetadata(_4)` (no executable `UnOp::GetMetadata`) to `_6 = transmute(_4) :
-mrWidePairTupleTy; _5 = _6.1`. -/
+`_5 = PtrMetadata(_4)` (this witness predates the executable `UnOp::GetMetadata`) to
+`_6 = transmute(_4) : mrWidePairTupleTy; _5 = _6.1`. -/
 def wideSliceMetadataAfterParentWriteFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32),
     (localName 2, .Array (.Int u32) 4),
