@@ -578,6 +578,8 @@ run_cmd do
         `Miri.Interpreter.Cast.cast,
         `Miri.Interpreter.ControlFlow.evalTerminator,
         `Miri.Memory.Allocation.writeUninit,
+        `Miri.Memory.Allocation.setExtra,
+        `Miri.TreeBorrows.Tree.LocationState.performAccess,
         `LeanMiriSpec.DropBinderAndSubtypeLM.ep2LmObserve ]
     for req in requiredReach do
       unless reach.contains req do

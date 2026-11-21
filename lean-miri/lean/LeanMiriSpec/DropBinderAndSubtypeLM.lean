@@ -512,6 +512,15 @@ def ep2ApplyTreeBorrowsWrite (protectedTags : Miri.TreeBorrows.ProtectedTags)
           | .Success nextLs _ => some { acc with perms := acc.perms.insert otherIdx nextLs }
           | _ => none
         | none => some acc
+    let pushDedupSeg (out : Array (Miri.DataStructures.RangeMapSegment Miri.TreeBorrows.LocationTree))
+        (seg : Miri.DataStructures.RangeMapSegment Miri.TreeBorrows.LocationTree) :
+        Array (Miri.DataStructures.RangeMapSegment Miri.TreeBorrows.LocationTree) :=
+      match out.back? with
+      | some prev =>
+        if prev.range.stop == seg.range.start && prev.data == seg.data then
+          out.pop.push ⟨⟨prev.range.start, seg.range.stop⟩, prev.data⟩
+        else out.push seg
+      | none => out.push seg
     let stepSeg (out : Array (Miri.DataStructures.RangeMapSegment Miri.TreeBorrows.LocationTree))
         (seg : Miri.DataStructures.RangeMapSegment Miri.TreeBorrows.LocationTree) :
         Option (Array (Miri.DataStructures.RangeMapSegment Miri.TreeBorrows.LocationTree)) :=
@@ -521,19 +530,19 @@ def ep2ApplyTreeBorrowsWrite (protectedTags : Miri.TreeBorrows.ProtectedTags)
         match updateLocTree seg.data with
         | none => none
         | some lt' =>
-          if lt' = seg.data then some (out.push seg) else
+          if lt' = seg.data then some (pushDedupSeg out seg) else
           let oStart := max s0 startNat
           let oStop := min s1 endNat
           let out1 := if s0 < oStart then
-              out.push ⟨⟨seg.range.start, UInt64.ofNat oStart⟩, seg.data⟩
+              pushDedupSeg out ⟨⟨seg.range.start, UInt64.ofNat oStart⟩, seg.data⟩
             else out
-          let out2 := out1.push ⟨⟨UInt64.ofNat oStart, UInt64.ofNat oStop⟩, lt'⟩
+          let out2 := pushDedupSeg out1 ⟨⟨UInt64.ofNat oStart, UInt64.ofNat oStop⟩, lt'⟩
           let out3 := if oStop < s1 then
-              out2.push ⟨⟨UInt64.ofNat oStop, seg.range.stop⟩, seg.data⟩
+              pushDedupSeg out2 ⟨⟨UInt64.ofNat oStop, seg.range.stop⟩, seg.data⟩
             else out2
           some out3
       else
-        some (out.push seg)
+        some (pushDedupSeg out seg)
     (tree.locations.entries.foldlM stepSeg #[]).map fun entries' =>
       { tree with locations := { entries := entries' } }
 
@@ -629,18 +638,37 @@ theorem ep2ApplyTreeBorrowsWrite_zero_size_noop_and_persistence :
     ep2ApplyTreeBorrowsWrite {} (hooksTwoNodeTree .unique)
       retagParentTag (Miri.ABI.Size.ofBytes 4) Miri.ABI.Size.ZERO = some (hooksTwoNodeTree .unique) ∧
     ep2ApplyTreeBorrowsWrite {} lmU32ChildTree
-      retagChildTag Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4) = some lmU32ChildTree := by
-  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel⟩
+      retagChildTag Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4) = some lmU32ChildTree ∧
+    ep2ApplyTreeBorrowsWrite {} lmU32ChildTree
+      ⟨3, by decide⟩ Miri.ABI.Size.ZERO Miri.ABI.Size.ZERO = none := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel⟩
+
+/-- **Adjacent Segment Coalescing & `len` Overflow Guard Regressions (A3)**:
+1. Dropping `[0, 4)` then `[4, 8)` on 8-byte `hooksTwoNodeTree .unique` coalesces the
+   two newly-equal adjacent segments back into ONE canonical `[0, 8)` segment, matching
+   a single `[0, 8)` write identically (preserving `DedupRangeMap`'s dedup invariant);
+2. `ep2DeinitIndirect` guards `base.toNat + relInLocal.toNat + len ≥ 2 ^ 64`, so a
+   pathological `len = 2 ^ 64` faults `"drop offset overflow"` instead of wrapping
+   `UInt64.ofNat len` to `0` and silently becoming a no-op! -/
+theorem ep2ApplyTreeBorrowsWrite_coalesces_adjacent_segments :
+    (ep2ApplyTreeBorrowsWrite {} (hooksTwoNodeTree .unique) retagParentTag
+        Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4) >>= fun t1 =>
+      ep2ApplyTreeBorrowsWrite {} t1 retagParentTag
+        (Miri.ABI.Size.ofBytes 4) (Miri.ABI.Size.ofBytes 4)) =
+    ep2ApplyTreeBorrowsWrite {} (hooksTwoNodeTree .unique) retagParentTag
+      Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8) := by
+  decide +kernel
 
 /-- Deinitialize `len` bytes at `relInLocal` inside the memory-backed local `mp`
 and jump to `target`:
 * the allocation-relative start is `mp`'s address minus the allocation's recorded
-  base address (`ep2RelOffset?`), guarded against `UInt64` addition overflow;
+  base address (`ep2RelOffset?`), guarded against `UInt64` overflow of
+  `base + relInLocal + len` (preventing `UInt64.ofNat len` wraparound to `0`);
 * when `treeBorrows = true` and the allocation carries a borrow tree and the
   machine a borrow tracker, `ep2ApplyTreeBorrowsWrite` validates AND transitions
   the borrow tree on `[start, start + size)` through unmodified vendored
   `Miri.TreeBorrows.Tree.LocationState.performAccess`, writing the updated tree
-  back into the allocation's `extra` field;
+  back into the allocation's `extra` field via `Allocation.setExtra`;
 * the bytes are then cleared by unmodified vendored `Allocation.writeUninit`. -/
 def ep2DeinitIndirect (treeBorrows : Bool) (mp : Miri.Interpreter.MemPlace AnnealProv)
     (relInLocal : UInt64) (len : Nat) (target : Miri.MIR.BasicBlockId)
@@ -650,7 +678,7 @@ def ep2DeinitIndirect (treeBorrows : Bool) (mp : Miri.Interpreter.MemPlace Annea
     match state.machine.memory.live.findIdx? (fun e => e.1 == aid),
           ep2RelOffset? state.machine aid mp.ptr.offset.bytes with
     | some lIdx, some base =>
-      if base.toNat + relInLocal.toNat ≥ 2 ^ 64 then
+      if base.toNat + relInLocal.toNat + len ≥ 2 ^ 64 then
         (state, .error (.undefinedBehavior "drop offset overflow"))
       else
       match state.machine.memory.live[lIdx]? with
