@@ -178,9 +178,11 @@ stack/global/function allocation backing it).
 
 Reference (`library/core/src/ptr/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L19-L25>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L18-L20>
 
-> "//! * For memory accesses of [size zero][zst], *every* non-null pointer is valid for reads/writes."
+> "//! * A [null] pointer is *never* valid for reads/writes.
+> //! * For memory accesses of [size zero][zst], *every* non-null pointer is valid for reads/writes.
+> //!   The following points are only concerned with non-zero-sized accesses."
 -/
 @[reducible]
 def isNullPtrArgProto (mem : Memory) : PtrArgProto → Bool
@@ -708,15 +710,243 @@ def endpointRangeInBoundsProto (ep : ResolvedMemEndpointProto) (len : Nat) : Boo
     (Nat.ble (Nat.add ep.effOffset len) ep.accessUpper)
 
 /--
-Raw byte encoder for an arbitrary runtime `Value` at type `ty` that:
-1. Encodes `Value.uninit` as `replicateUninitBytes size` (preserving exact byte
-   width of uninitialized fields in partially initialized aggregates);
-2. Encodes raw scalar bit patterns even when a `bool` or `char` slot holds an
-   invalid bit pattern (so downstream typed validators such as
-   `typed_swap_nonoverlapping` observe the invalid byte and report `.ub` rather
-   than `.unsupported`);
-3. Preserves inter-field and trailing padding bytes of structs/tuples as
-   `AbstractByte.uninit`, and preserves pointer `(allocId, tag)` provenance.
+Test whether `v` is a leaf value whose untyped byte encoding
+(`encodeUntypedValueToBytes`) is exact: a zero-sized unit, a scalar, a thin
+pointer, or a field-less aggregate. The byte width of a leaf is intrinsic to
+the value, so no layout information is needed to place its bytes.
+-/
+@[reducible]
+def isLeafValueProto : Value → Bool
+  | .unit => true
+  | .scalar _ => true
+  | .ptr _ _ => true
+  | .aggregate _ .nil => true
+  | _ => false
+
+/-- Test whether every value in `vs` is a leaf (`isLeafValueProto`) or `Value.uninit`. -/
+@[reducible]
+def allLeafOrUninitValuesProto : List Value → Bool
+  | .nil => true
+  | .uninit :: rest => allLeafOrUninitValuesProto rest
+  | v :: rest =>
+    match isLeafValueProto v with
+    | true => allLeafOrUninitValuesProto rest
+    | false => false
+
+/--
+Test whether `vs` is array-shaped: every element is a `Value.scalar` or
+`Value.ptr` of the same byte width `sz`.
+-/
+@[reducible]
+def allSameSizeLeafValuesProto (sz : Nat) : List Value → Bool
+  | .nil => true
+  | .scalar sc :: rest =>
+    match Nat.beq sc.sizeBytes sz with
+    | true => allSameSizeLeafValuesProto sz rest
+    | false => false
+  | .ptr _ pSz :: rest =>
+    match Nat.beq pSz sz with
+    | true => allSameSizeLeafValuesProto sz rest
+    | false => false
+  | _ :: _ => false
+
+/--
+Test whether an untyped root value (a caller-owned referent with no `LocalDecl`)
+has a byte image determined by the value alone: a leaf, or an array-shaped
+aggregate of equal-width scalars / pointers (a byte or word buffer). Every other
+untyped aggregate could contain padding, reordered fields, or an enum tag, so
+its image is unknown.
+-/
+@[reducible]
+def untypedValueHasExactByteImageProto : Value → Bool
+  | .aggregate 0 (.scalar sc :: rest) => allSameSizeLeafValuesProto sc.sizeBytes rest
+  | .aggregate 0 (.ptr _ pSz :: rest) => allSameSizeLeafValuesProto pSz rest
+  | v => isLeafValueProto v
+
+/--
+Test whether every populated field value of a union has a byte image
+determined by the value alone (`untypedValueHasExactByteImageProto`: a leaf or
+an array-shaped buffer such as the `[u8; N]` payload of `MaybeUninit<[u8; N]>`),
+or is `Value.uninit`. Union fields all start at offset `0`, so such a field's
+bytes are placed exactly by `encodeUnionStorageBytes`; any other nested
+aggregate would be encoded without its padding.
+-/
+@[reducible]
+def allUnionFieldValuesExactProto : List Value → Bool
+  | .nil => true
+  | .uninit :: rest => allUnionFieldValuesExactProto rest
+  | v :: rest =>
+    match untypedValueHasExactByteImageProto v with
+    | true => allUnionFieldValuesExactProto rest
+    | false => false
+
+/--
+Higher-order at-offset field writer enforcing an EXACT byte length per field:
+field `i` (described by key `keys[i]`, a field type or a field layout index) is
+encoded by `encodeField`, must be exactly `fieldSize keys[i]` bytes long, and is
+written at `offsets[i]` into `buf`. Any unknown field size, length mismatch, or
+out-of-range write yields `.none`.
+
+`Bytes.encodeFieldsAtOffsetsWith` writes whatever byte list the field encoder
+returns, so a nested aggregate encoded without its padding is silently placed
+at the field offset; this helper rejects that.
+-/
+@[reducible]
+def encodeFieldsAtOffsetsExactWith {κ : Type}
+    (encodeField : κ → Value → Option (List AbstractByte))
+    (fieldSize : κ → Option Nat) :
+    List Size → List κ → List Value → List AbstractByte → Option (List AbstractByte)
+  | .nil, .nil, .nil, buf => .some buf
+  | off :: offRest, k :: kRest, fv :: fvRest, buf =>
+    match encodeField k fv, fieldSize k with
+    | .some fb, .some fSz =>
+      match Nat.beq (length fb) fSz with
+      | false => .none
+      | true =>
+        match writeAbstractBytesAt buf off.bytes fb with
+        | .none => .none
+        | .some buf' =>
+          encodeFieldsAtOffsetsExactWith encodeField fieldSize offRest kRest fvRest buf'
+    | _, _ => .none
+  | _, _, _, _ => .none
+
+/--
+At-offset writer for fields whose types and layouts are unknown: every field
+value must be a leaf (`isLeafValueProto`), whose byte width is intrinsic, and is
+written at its layout offset. A nested aggregate yields `.none`.
+-/
+@[reducible]
+def encodeLeafFieldsAtOffsetsProto :
+    List Size → List Value → List AbstractByte → Option (List AbstractByte)
+  | .nil, .nil, buf => .some buf
+  | off :: offRest, fv :: fvRest, buf =>
+    match isLeafValueProto fv with
+    | false => .none
+    | true =>
+      match encodeUntypedValueToBytes 2 fv with
+      | .none => .none
+      | .some fb =>
+        match writeAbstractBytesAt buf off.bytes fb with
+        | .none => .none
+        | .some buf' => encodeLeafFieldsAtOffsetsProto offRest fvRest buf'
+  | _, _, _ => .none
+
+/--
+Exact layout-directed byte encoder: encode `v` at `LayoutTable` entry `lIdx`,
+taking every field offset, element stride, and nested field layout from the
+table (`TypeLayout.fields` and `TypeLayout.fieldLayouts`), never from a guess.
+
+- `Value.uninit` encodes as `size` uninitialized bytes.
+- A primitive entry takes a leaf of exactly `size` bytes.
+- An array entry (`FieldsShape.array`) needs its element layout
+  (`fieldLayouts = [elemIdx]`) and encodes `count` elements of exactly `stride`
+  bytes each.
+- A struct-like entry (`FieldsShape.arbitrary`, single variant) writes each
+  field at its offset: by its field layout when `fieldLayouts` is recorded
+  (exact length enforced), else only when every field value is a leaf (this
+  covers a wide pointer's `(data, metadata)` pair).
+- A union entry takes `encodeUnionStorageBytes` when every populated field is a
+  leaf or an array-shaped buffer (`allUnionFieldValuesExactProto`; its fields
+  share offset `0`, and their widths are intrinsic).
+- Multi-variant enums and every unlisted shape yield `.none`: the caller fails
+  closed with `.unsupported` rather than fabricating a byte image.
+-/
+def encodeValueAtLayoutIdxProto :
+    Nat → LayoutTable → Nat → Value → Option (List AbstractByte)
+  | .zero, _, _, _ => .none
+  | .succ fuel', layouts, lIdx, v =>
+    match LayoutTable.lookup layouts lIdx with
+    | .none => .none
+    | .some l =>
+      match v with
+      | .uninit => .some (replicateUninitBytes l.size.bytes)
+      | _ =>
+        match l.variants with
+        | .single _ =>
+          let checkSize := fun (bsOpt : Option (List AbstractByte)) =>
+            match bsOpt with
+            | .some bs =>
+              match Nat.beq (length bs) l.size.bytes with
+              | true => .some bs
+              | false => .none
+            | .none => .none
+          match l.fields with
+          | .primitive =>
+            match isLeafValueProto v with
+            | true => checkSize (encodeUntypedValueToBytes 2 v)
+            | false => .none
+          | .union _ =>
+            match v with
+            | .aggregate _ fieldVals =>
+              match allUnionFieldValuesExactProto fieldVals with
+              | true => .some (encodeUnionStorageBytes layouts l.size.bytes .none fieldVals)
+              | false => .none
+            | _ => .none
+          | .array stride count =>
+            match v, l.fieldLayouts with
+            | .aggregate 0 elems, elemIdx :: .nil =>
+              match Nat.beq (length elems) count with
+              | false => .none
+              | true =>
+                checkSize
+                  (encodeListWith
+                    (encodeValueAtLayoutIdxProto fuel' layouts elemIdx)
+                    stride.bytes
+                    elems)
+            | _, _ => .none
+          | .arbitrary offsets _ =>
+            match v with
+            | .aggregate _ (fv :: fvRest) =>
+              let fieldVals := fv :: fvRest
+              match Nat.beq (length l.fieldLayouts) (length offsets) with
+              | true =>
+                encodeFieldsAtOffsetsExactWith
+                  (encodeValueAtLayoutIdxProto fuel' layouts)
+                  (fun fIdx =>
+                    match LayoutTable.lookup layouts fIdx with
+                    | .some fl => .some fl.size.bytes
+                    | .none => .none)
+                  offsets
+                  l.fieldLayouts
+                  fieldVals
+                  (replicateUninitBytes l.size.bytes)
+              | false =>
+                encodeLeafFieldsAtOffsetsProto
+                  offsets
+                  fieldVals
+                  (replicateUninitBytes l.size.bytes)
+            | .aggregate _ .nil | .unit =>
+              match offsets with
+              | .nil => .some (replicateUninitBytes l.size.bytes)
+              | _ :: _ => .none
+            | _ => .none
+        | _ => .none
+
+/--
+Exact raw byte encoder for a runtime `Value` at type `ty`: the result is either
+the precise byte image of `v` in memory or `.none` (callers fail closed with
+`.unsupported`). It never falls back to a sequential, padding-free guess.
+
+1. `Value.uninit` encodes as `replicateUninitBytes size` (preserving the exact
+   byte width of uninitialized fields in partially initialized aggregates).
+2. Scalar and pointer kinds use `Bytes.encodeValueToBytes`, plus the raw bytes
+   of a `bool` / `char` slot holding an invalid bit pattern (so typed validators
+   such as `typed_swap_nonoverlapping` observe the invalid byte and report
+   `.ub` rather than `.unsupported`).
+3. Arrays encode each element at the element type with its exact element size.
+4. Tuples require their `LayoutTable` entry and write every field at its layout
+   offset with its exact field size, leaving inter-field and trailing padding
+   as `AbstractByte.uninit`.
+5. ADTs and closures are encoded from their layout entry alone
+   (`encodeValueAtLayoutIdxProto`): their generic arguments are not their field
+   types. A multi-variant enum is delegated to `Bytes.encodeValueToBytes` only
+   when every payload value is a leaf.
+
+`Bytes.encodeValueToBytes` is deliberately not used for composite types: it
+encodes nested field types at `layoutIdx := 0`, treats an ADT's generic
+arguments as its field types, and encodes untyped nested aggregates back to
+back, so a nested padded struct (`struct Outer { inner: (u8, u32) }`) would be
+laid out without its padding.
 -/
 def encodeRawValueBytesProto :
     Nat → List LocalDecl → LayoutTable → Ty → Value → Option (List AbstractByte)
@@ -732,20 +962,10 @@ def encodeRawValueBytesProto :
         | .some sz => .some (replicateUninitBytes sz)
         | .none => .none
     | _ =>
-      match encodeValueToBytes fuel' layouts normTy v with
-      | .some bs => .some bs
-      | .none =>
-        match normTy.kind, v with
-        -- Preserve raw bytes of invalid `bool` / `char` scalars for raw reads & typed validation.
-        | .bool, .scalar sv =>
-          match Nat.beq sv.sizeBytes 1 with
-          | true => encodeScalarBytes sv .none
-          | false => .none
-        | .char, .scalar sv =>
-          match Nat.beq sv.sizeBytes 4 with
-          | true => encodeScalarBytes sv .none
-          | false => .none
-        | .array elemKind n, .aggregate 0 elems =>
+      match normTy.kind with
+      | .array elemKind n =>
+        match v with
+        | .aggregate 0 elems =>
           match Nat.beq (length elems) n with
           | false => .none
           | true =>
@@ -757,83 +977,87 @@ def encodeRawValueBytesProto :
                 (fun e => encodeRawValueBytesProto fuel' localDecls layouts elemTy e)
                 elemSz
                 elems
-        | .tuple (kHead :: kTail), .aggregate 0 fieldVals =>
-          let fieldKinds := kHead :: kTail
-          match Nat.beq (length fieldVals) (length fieldKinds) with
-          | false => .none
-          | true =>
-            let encodeTyped := fun (k : RigidTy) (fv : Value) =>
-              encodeRawValueBytesProto fuel' localDecls layouts
-                (resolveRigidTyWithDeclsProto localDecls layouts k) fv
-            match LayoutTable.lookup layouts normTy.layoutIdx with
-            | .some l =>
-              match l.fields with
-              | .arbitrary offsets _ =>
-                match Nat.beq (length offsets) (length fieldVals) with
-                | true =>
-                  encodeFieldsAtOffsetsWith
-                    encodeTyped
-                    (fun fv => encodeUntypedValueToBytes fuel' fv)
-                    offsets
-                    fieldKinds
-                    fieldVals
-                    (replicateUninitBytes l.size.bytes)
-                | false => encodeSeqFieldsWith encodeTyped fieldKinds fieldVals
-              | _ => encodeSeqFieldsWith encodeTyped fieldKinds fieldVals
-            | .none => encodeSeqFieldsWith encodeTyped fieldKinds fieldVals
-        | .adt _ args, .aggregate varIdx fieldVals =>
+        | _ => .none
+      | .tuple (kHead :: kTail) =>
+        let fieldKinds := kHead :: kTail
+        match v with
+        | .aggregate 0 fieldVals =>
           match LayoutTable.lookup layouts normTy.layoutIdx with
-          | .none => .none
           | .some l =>
-            match l.variants with
-            | .single expectedVar =>
-              match l.fields with
-              | .arbitrary offsets _ =>
-                match Bool.and (Nat.beq varIdx expectedVar) (Nat.beq (length offsets) (length fieldVals)) with
-                | false => .none
-                | true =>
-                  let fieldKinds :=
-                    match Nat.beq (length args) (length offsets) with
-                    | true => args
-                    | false => .nil
-                  let encodeTyped := fun (k : RigidTy) (fv : Value) =>
-                    encodeRawValueBytesProto fuel' localDecls layouts
-                      (resolveRigidTyWithDeclsProto localDecls layouts k) fv
-                  let encodeByFieldLayout :=
-                    let rec go : List Size → List Nat → List Value → List AbstractByte → Option (List AbstractByte)
-                      | .nil, _, .nil, buf => .some buf
-                      | off :: offRest, fls, fv :: fvRest, buf =>
-                        let fbOpt : Option (List AbstractByte) :=
-                          match fv, fls with
-                          | .uninit, fIdx :: _ =>
-                            match LayoutTable.lookup layouts fIdx with
-                            | .some fl => .some (replicateUninitBytes fl.size.bytes)
-                            | .none => .none
-                          | _, _ => encodeUntypedValueToBytes fuel' fv
-                        let nextFls := match fls with | _ :: rest => rest | .nil => .nil
-                        match fbOpt with
-                        | .none => .none
-                        | .some fb =>
-                          match writeAbstractBytesAt buf off.bytes fb with
-                          | .none => .none
-                          | .some buf' => go offRest nextFls fvRest buf'
-                      | _, _, _, _ => .none
-                    go offsets l.fieldLayouts fieldVals (replicateUninitBytes l.size.bytes)
-                  match fieldKinds with
-                  | _ :: _ =>
-                    encodeFieldsAtOffsetsWith
-                      encodeTyped
-                      (fun fv => encodeUntypedValueToBytes fuel' fv)
-                      offsets
-                      fieldKinds
-                      fieldVals
-                      (replicateUninitBytes l.size.bytes)
-                  | .nil => encodeByFieldLayout
-              | .union _ =>
-                encodeUnionStorageBytes layouts l.size.bytes .none fieldVals |> .some
-              | _ => .none
+            match l.fields with
+            | .arbitrary offsets _ =>
+              encodeFieldsAtOffsetsExactWith
+                (fun (k : RigidTy) (fv : Value) =>
+                  encodeRawValueBytesProto fuel' localDecls layouts
+                    (resolveRigidTyWithDeclsProto localDecls layouts k) fv)
+                (intrinsicRigidTyByteSize localDecls layouts)
+                offsets
+                fieldKinds
+                fieldVals
+                (replicateUninitBytes l.size.bytes)
             | _ => .none
-        | _, _ => .none
+          | .none => .none
+        | _ => .none
+      | .adt _ _ | .closure _ _ =>
+        match encodeValueAtLayoutIdxProto fuel' layouts normTy.layoutIdx v with
+        | .some bs => .some bs
+        | .none =>
+          match LayoutTable.lookup layouts normTy.layoutIdx, v with
+          | .some { variants := .multiple _ _ _, .. }, .aggregate _ payload =>
+            match allLeafOrUninitValuesProto payload with
+            | true => encodeValueToBytes fuel' layouts normTy v
+            | false => .none
+          | _, _ => .none
+      | _ =>
+        match encodeValueToBytes fuel' layouts normTy v with
+        | .some bs => .some bs
+        | .none =>
+          match normTy.kind, v with
+          -- Preserve raw bytes of invalid `bool` / `char` scalars for raw reads & typed validation.
+          | .bool, .scalar sv =>
+            match Nat.beq sv.sizeBytes 1 with
+            | true => encodeScalarBytes sv .none
+            | false => .none
+          | .char, .scalar sv =>
+            match Nat.beq sv.sizeBytes 4 with
+            | true => encodeScalarBytes sv .none
+            | false => .none
+          | _, _ => .none
+
+/-- Bytewise equality of two `AbstractByte`s (initialization, value, and provenance). -/
+@[reducible]
+def abstractByteEqProto : AbstractByte → AbstractByte → Bool
+  | .uninit, .uninit => true
+  | .init a pa, .init b pb =>
+    match Nat.beq a.toBitVec.toNat b.toBitVec.toNat with
+    | false => false
+    | true =>
+      match pa, pb with
+      | .none, .none => true
+      | .some (aId, aTag), .some (bId, bTag) => Bool.and (Nat.beq aId bId) (Nat.beq aTag bTag)
+      | _, _ => false
+  | _, _ => false
+
+/--
+`abstractBytesRefineProto stored intended`: `stored` is `intended` with zero or
+more bytes replaced by `AbstractByte.uninit`, and every other byte equal in
+value and provenance.
+
+Used to accept a decoded `Value` only when re-encoding it reproduces the bytes
+that were meant to be stored. Demoting a byte to `.uninit` is the one allowed
+difference (a structured `Value` cannot hold an initialized padding byte): it
+can only turn a later read of that byte into `.ub`, never change a result or
+make an invalid value valid.
+-/
+@[reducible]
+def abstractBytesRefineProto : List AbstractByte → List AbstractByte → Bool
+  | .nil, .nil => true
+  | .uninit :: sRest, _ :: iRest => abstractBytesRefineProto sRest iRest
+  | sByte :: sRest, iByte :: iRest =>
+    match abstractByteEqProto sByte iByte with
+    | true => abstractBytesRefineProto sRest iRest
+    | false => false
+  | _, _ => false
 
 /--
 Read the full abstract byte buffer of resolved endpoint `ep` (length
@@ -857,7 +1081,12 @@ def readRootAbstractBytesProto (ep : ResolvedMemEndpointProto) : ProtoRes (List 
             match rootVal with
             | .aggregate _ fs => fs
             | other => other :: .nil
-          .ok (encodeUnionStorageBytes ep.targetLayouts ep.allocSize .none unionFields)
+          -- Union fields share offset `0`; a populated field's bytes are exact
+          -- only when it is a leaf or an array-shaped buffer (any other nested
+          -- aggregate would be encoded untyped, without its padding).
+          match allUnionFieldValuesExactProto unionFields with
+          | true => .ok (encodeUnionStorageBytes ep.targetLayouts ep.allocSize .none unionFields)
+          | false => .unsupported
         | false =>
           match ep.rootTyOpt with
           | .some rTy =>
@@ -868,12 +1097,17 @@ def readRootAbstractBytesProto (ep : ResolvedMemEndpointProto) : ProtoRes (List 
               | false => .unsupported
             | .none => .unsupported
           | .none =>
-            match encodeUntypedValueToBytes defaultCodecFuel rootVal with
-            | .some bs =>
-              match Nat.beq (length bs) ep.allocSize with
-              | true => .ok bs
-              | false => .unsupported
-            | .none => .unsupported
+            -- Untyped caller-owned referent: only a leaf or an array-shaped
+            -- buffer has a byte image determined by the value alone.
+            match untypedValueHasExactByteImageProto rootVal with
+            | false => .unsupported
+            | true =>
+              match encodeUntypedValueToBytes defaultCodecFuel rootVal with
+              | .some bs =>
+                match Nat.beq (length bs) ep.allocSize with
+                | true => .ok bs
+                | false => .unsupported
+              | .none => .unsupported
       | .global _ => .unsupported
     | _ => .ub
 
@@ -993,6 +1227,17 @@ def updateGlobalAllocProto :
 Commit an updated root abstract byte buffer `updatedBytes` back to the backing
 storage of endpoint `ep`, updating either the owning stack/caller frame's
 `LocalSlot` or the mutable global allocation in `globals`.
+
+A stack local stores a structured `Value`, so the bytes are decoded at the
+local's declared type and the decoded value is accepted only when it
+**round-trips**: re-encoding it with the exact encoder
+(`encodeRawValueBytesProto`) must reproduce `updatedBytes`, up to bytes demoted
+to `.uninit` (`abstractBytesRefineProto`). A decode that would misplace a field,
+drop a pointer fragment's provenance, or strip provenance from an integer slot
+therefore fails closed with `.unsupported` instead of storing a value whose
+memory image differs from the bytes written. A union local whose decoded
+fields do not round-trip is reset to its uninitialized state, which refines
+every byte image.
 -/
 def commitRootAbstractBytesProto
     (locals : List LocalSlot)
@@ -1038,14 +1283,36 @@ def commitRootAbstractBytesProto
             match ep.rootTyOpt with
             | .some rTy => decodeValueFromBytes defaultCodecFuel ep.targetLayouts rTy updatedBytes
             | .none => .none
-          match decodedOpt with
-          | .some dv => .ok (.init dv)
-          | .none => .ok (.init (.aggregate uVar (resetUnionFields uFields)))
+          let decodedFields : List Value :=
+            match decodedOpt with
+            | .some (.aggregate _ fs) => fs
+            | .some other => other :: .nil
+            | .none => .nil
+          let roundTrips : Bool :=
+            match decodedOpt with
+            | .none => false
+            | .some _ =>
+              Bool.and
+                (allUnionFieldValuesExactProto decodedFields)
+                (abstractBytesRefineProto
+                  (encodeUnionStorageBytes ep.targetLayouts ep.allocSize .none decodedFields)
+                  updatedBytes)
+          match decodedOpt, roundTrips with
+          | .some dv, true => .ok (.init dv)
+          | _, _ => .ok (.init (.aggregate uVar (resetUnionFields uFields)))
         | false =>
           match ep.rootTyOpt with
           | .some rTy =>
             match decodePartialUninitValueProto defaultCodecFuel ep.targetDecls ep.targetLayouts rTy updatedBytes with
-            | .some dv => .ok (.init dv)
+            | .some dv =>
+              -- Round-trip guard: store `dv` only if its exact byte image is the
+              -- intended bytes (up to demoting bytes to `.uninit`).
+              match encodeRawValueBytesProto defaultCodecFuel ep.targetDecls ep.targetLayouts rTy dv with
+              | .some stored =>
+                match abstractBytesRefineProto stored updatedBytes with
+                | true => .ok (.init dv)
+                | false => .unsupported
+              | .none => .unsupported
             | .none => .unsupported
           | .none =>
             match ep.rootSlot? with
@@ -1140,11 +1407,16 @@ at `Miri/Interpreter/Intrinsics.lean:143-161` and `MemoryState.memCopyRepeatedly
 1. Validate argument shapes (`src`, `dst` thin pointers of width `ptrBytes`;
    `count` a `usize` scalar) and resolve sized `T` (`elemSize`, `elemAlign`).
 2. Overflow check: `elemSize * count <= isize::MAX` (else `.ub`).
-3. Pointer non-null and ABI alignment (`align_of::<T>()`) checks on BOTH `src`
-   and `dst` **even when `elemSize * count == 0`** (misaligned or null is `.ub`
-   even at 0 bytes; aligned non-null dangling pointers at 0 bytes succeed as a
-   no-op).
+3. ABI alignment (`align_of::<T>()`) checks on BOTH `src` and `dst` **even when
+   `elemSize * count == 0`** (a misaligned pointer is `.ub` even at 0 bytes).
 4. If `totalBytes == 0`: succeed without touching memory or borrow permissions.
+   No validity requirement applies to a zero-byte copy, so aligned dangling,
+   provenance-free, and null pointers all succeed as a no-op: the pinned
+   `ptr::copy` contract requires validity "or that number must be 0", and
+   `Miri.Memory.checkAndDerefPtr` (`Miri/Memory/Access.lean:134-150`) returns
+   `none` for a zero-sized access before resolving the pointer
+   (`zero_sized_check_skips_resolution`). A null pointer with `totalBytes > 0`
+   faults `.ub` in Phase A / Phase B (no live allocation backs it).
 5. **Phase A (Source Read & Snapshot)**: resolve live `src`, verify
    `[srcEffOff, srcEffOff + totalBytes)` in bounds, apply Tree Borrows read
    check and transition (`borrowsAfterReadAccessProto` -> `borrows₁`), and
@@ -1158,19 +1430,38 @@ at `Miri/Interpreter/Intrinsics.lean:143-161` and `MemoryState.memCopyRepeatedly
    `dst`'s root buffer (supporting arbitrary forward/backward/identical overlap
    without clobbering unread source bytes), and commit.
 
-Reference (`library/core/src/intrinsics/mod.rs` and `library/core/src/ptr/mod.rs`
-at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L3030-L3039>
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L318-L355>
+
+> "/// This is an accidentally-stable alias to [`ptr::copy`]; use that instead."
+> "pub const unsafe fn copy<T>(src: *const T, dst: *mut T, count: usize);"
+
+Reference (`core::ptr::copy` documentation, `library/core/src/ptr/mod.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L554-L589>
 
 > "/// Copies `count * size_of::<T>()` bytes from `src` to `dst`. The source
-> /// and destination may overlap.
-> ...
-> /// Behavior is undefined if any of the following conditions are violated:
-> /// * `src` must be valid for reads of `count * size_of::<T>()` bytes.
-> /// * `dst` must be valid for writes of `count * size_of::<T>()` bytes.
-> /// * Both `src` and `dst` must be properly aligned.
-> /// Note that even if `count` is `0`, the pointers must be non-null and properly aligned."
+> /// and destination may overlap."
+>
+> "/// Copying takes place as if the bytes were copied from `src`
+> /// to a temporary array and then copied from the array to `dst`.
+> ///
+> /// The copy is \"untyped\" in the sense that data may be uninitialized or otherwise violate the
+> /// requirements of `T`. The initialization state is preserved exactly."
+>
+> "/// Behavior is undefined if any of the following conditions are violated:
+> ///
+> /// * `src` must be [valid] for reads of `count * size_of::<T>()` bytes or that number must be 0.
+> ///
+> /// * `dst` must be [valid] for writes of `count * size_of::<T>()` bytes or that number must be 0,
+> ///   and `dst` must remain valid even when `src` is read for `count * size_of::<T>()` bytes. (This
+> ///   means if the memory ranges overlap, the `dst` pointer must not be invalidated by `src` reads.)
+> ///
+> /// * Both `src` and `dst` must be properly aligned."
+>
+> "/// Note that even if the effectively copied size (`count * size_of::<T>()`) is
+> /// `0`, the pointers must be properly aligned."
 -/
 def evalCopyMemoryProto
     (s : MachineState)
@@ -1204,15 +1495,13 @@ def evalCopyMemoryProto
           match Nat.ble totalBytes isizeMax with
           | false => MirStepNode.fail .ub
           | true =>
-            let ptrsValidAndAligned :=
+            -- Alignment is checked even for zero bytes; validity (including non-null)
+            -- is only required when `totalBytes > 0` ("or that number must be 0").
+            let ptrsAligned :=
               Bool.and
-                (Bool.not (isNullPtrArgProto s.memory srcPtrArg))
-                (Bool.and
-                  (Bool.not (isNullPtrArgProto s.memory dstPtrArg))
-                  (Bool.and
-                    (checkPtrArgAlignedProto s locals' bodyLocalDecls bodyLayouts srcPtrArg elemAlign)
-                    (checkPtrArgAlignedProto s locals' bodyLocalDecls bodyLayouts dstPtrArg elemAlign)))
-            match ptrsValidAndAligned with
+                (checkPtrArgAlignedProto s locals' bodyLocalDecls bodyLayouts srcPtrArg elemAlign)
+                (checkPtrArgAlignedProto s locals' bodyLocalDecls bodyLayouts dstPtrArg elemAlign)
+            match ptrsAligned with
             | false => MirStepNode.fail .ub
             | true =>
               match Nat.beq totalBytes 0 with
@@ -1388,6 +1677,14 @@ def hasUninitByteProto : List AbstractByte → Bool
   | .uninit :: _ => true
   | .init _ _ :: rest => hasUninitByteProto rest
 
+/-- Test whether any byte in `bs` is initialized and carries pointer provenance. -/
+@[reducible]
+def hasProvByteProto : List AbstractByte → Bool
+  | .nil => false
+  | .uninit :: rest => hasProvByteProto rest
+  | .init _ (.some _) :: _ => true
+  | .init _ .none :: rest => hasProvByteProto rest
+
 /--
 Extract concrete provenance-free `UInt8` values from an already-initialized byte
 list, returning `.none` if any byte carries `.some _` provenance.
@@ -1466,11 +1763,22 @@ def u8ListEqProto : List UInt8 → List UInt8 → Bool
 Evaluate `core::intrinsics::compare_bytes(left: *const u8, right: *const u8, bytes: usize) -> i32`.
 
 Exact semantics (aligned with `Miri/Interpreter/Intrinsics.lean:174-187, 427`):
-1. Validates `left`, `right` as thin non-null pointers of width `ptrBytes` and
-   `bytes` as a `usize` scalar with `bytes <= isize::MAX` (else `.ub`).
-2. When `bytes == 0`, writes `0 : i32` without dereferencing memory (aligned
-   non-null dangling pointers succeed; null pointers fault `.ub`).
-3. When `bytes > 0`:
+1. Validates `left`, `right` as thin pointers of width `ptrBytes` and `bytes` as
+   a `usize` scalar with `bytes <= isize::MAX` (else `.ub`: no allocation is
+   valid for reads of more bytes).
+2. Null `left` or `right` faults `.ub` for EVERY `bytes`, including `bytes == 0`:
+   the pinned contract requires both pointers to be "[valid] for reads of
+   `bytes` bytes", and a null pointer "is *never* valid for reads/writes".
+   This is the one point where the candidate is deliberately STRICTER than
+   `lean-miri`: `Miri.Memory.checkAndDerefPtr` (`Miri/Memory/Access.lean:134-150`)
+   returns `none` for every zero-sized access before resolving the pointer, so
+   `compareBytes` on a null pointer with `bytes == 0` returns `0` there. Miri
+   detects a subset of documented library UB; a trusted specification must not
+   accept an execution the pinned `core` contract declares undefined.
+3. When `bytes == 0` and both pointers are non-null, writes `0 : i32` without
+   dereferencing memory (dangling and provenance-free non-null pointers succeed:
+   "For memory accesses of [size zero][zst], *every* non-null pointer is valid").
+4. When `bytes > 0`:
    - Eagerly validates and reads ALL `bytes` from `left` (live, in bounds, Tree
      Borrows read -> `borrows₁`, full initialization + provenance check);
    - Eagerly validates and reads ALL `bytes` from `right` on `borrows₁` (live,
@@ -1479,19 +1787,33 @@ Exact semantics (aligned with `Miri/Interpreter/Intrinsics.lean:174-187, 427`):
    - Because BOTH full slices are read eagerly before comparing, an `.uninit` or
      out-of-bounds byte at index `k > 0` ALWAYS faults `.ub` even if byte `0`
      already differs!
-4. Compares the unsigned byte sequences lexicographically (`0..255`) and writes
+5. Compares the unsigned byte sequences lexicographically (`0..255`) and writes
    `-1 : i32`, `0 : i32`, or `1 : i32` to `destination` with `borrows := borrows₂`.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L3151-L3169>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2320-L2337>
 
 > "/// Lexicographically compare `[left, left + bytes)` and `[right, right + bytes)`
-> /// as unsigned bytes, returning negative if `left < right`, zero if `left == right`,
-> /// or positive if `left > right`.
+> /// as unsigned bytes, returning negative if `left` is less, zero if all the
+> /// bytes match, or positive if `left` is greater.
 > ///
-> /// Both `left` and `right` must be valid for reads of `bytes` bytes, and
-> /// the memory must be initialized."
+> /// This underlies things like `<[u8]>::cmp`, and will usually lower to `memcmp`.
+> ///
+> /// # Safety
+> ///
+> /// `left` and `right` must each be [valid] for reads of `bytes` bytes.
+> ///
+> /// Note that this applies to the whole range, not just until the first byte
+> /// that differs.  That allows optimizations that can read in large chunks."
+
+Reference (`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L18-L20>
+
+> "//! * A [null] pointer is *never* valid for reads/writes.
+> //! * For memory accesses of [size zero][zst], *every* non-null pointer is valid for reads/writes.
+> //!   The following points are only concerned with non-zero-sized accesses."
 -/
 def evalCompareBytesProto
     (s : MachineState)
@@ -1617,7 +1939,11 @@ and `MiniRustSpec.Interp.evalIntrinsic ... .RawEq`):
 1. Resolves pointee type `T`; rejects unsized or layout-unknown `T` fail-closed
    with `MirStepNode.unsupported` (matching Miri line 190 `invalid`).
 2. Validates `a` and `b` as thin non-null pointers of width `ptrBytes` aligned
-   to `align_of::<T>()` (misaligned or null -> `.ub`, even for ZSTs).
+   to `align_of::<T>()` (misaligned or null -> `.ub`, even for ZSTs). Both
+   arguments are references (`&T`), so non-null and alignment are validity
+   invariants of the argument values themselves; `Intrinsics.rawEq` only
+   re-checks alignment (line 193) because Miri validates `&T` operands when
+   they are passed.
 3. For ZST `T` (`size_of::<T>() == 0`), returns `true` (`ScalarInt ⟨1, 1⟩`).
 4. For `size_of::<T>() > 0`:
    - Reads ALL `size_of::<T>()` bytes from `a` (in-bounds, live, Tree Borrows
@@ -1631,11 +1957,27 @@ and `MiniRustSpec.Interp.evalIntrinsic ... .RawEq`):
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L3132-L3150>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2293-L2318>
 
-> "/// Compares the raw bytes of two values of type `T` for equality.
+> "/// Determines whether the raw bytes of the two values are equal."
+>
+> "/// Since this works by comparing the underlying bytes, the actual `T` is
+> /// not particularly important.  It will be used for its size and alignment,
+> /// but any validity restrictions will be ignored, not enforced.
 > ///
-> /// Behavior is undefined if `T` contains any uninitialized bytes (such as padding)."
+> /// # Safety
+> ///
+> /// It's UB to call this if any of the *bytes* in `*a` or `*b` are uninitialized.
+> /// Note that this is a stricter criterion than just the *values* being
+> /// fully-initialized: if `T` has padding, it's UB to call this intrinsic.
+> ///
+> /// At compile-time, it is furthermore UB to call this if any of the bytes
+> /// in `*a` or `*b` have provenance."
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "- A reference or `Box<T>` must be aligned and non-null, it cannot be dangling, and it must point to a valid value (in case of dynamically sized types, using the actual dynamic type of the pointee as determined by the metadata). Note that the last point (about pointing to a valid value) remains a subject of some debate."
 -/
 def evalRawEqProto
     (s : MachineState)
@@ -1801,6 +2143,13 @@ def combineTypedValidityProto :
 Validate a raw `AbstractByte` slice against a `ScalarLayout` descriptor
 (enforcing initialization and `validRange` for `.initialized`, while allowing
 arbitrary bytes for `.union`).
+
+A non-pointer scalar (integer, float, `bool`, `char`, enum tag) whose bytes
+carry pointer provenance fails closed with `.unsupported`: a typed copy at a
+non-pointer type strips the provenance and leaves the absolute address bits
+(`Miri.Interpreter.Intrinsics.typedSwap` validates with provenance reset,
+`Intrinsics.lean:209-211`), and `MirSemantics` allocations have no concrete
+base address from which to compute those bits or to range-check them.
 -/
 @[reducible]
 def validateScalarLayoutBytesProto
@@ -1828,9 +2177,29 @@ def validateScalarLayoutBytesProto
               | true => .valid
               | false => .ub
           | _ =>
-            match wrappingRangeContains validRange sv.bits with
-            | true => .valid
-            | false => .ub
+            match prov with
+            | .some _ => .unsupported
+            | .none =>
+              match wrappingRangeContains validRange sv.bits with
+              | true => .valid
+              | false => .ub
+
+/--
+Validate an integer or float scalar slice of byte width `sz`: every byte must be
+initialized (else `.ub`); bytes carrying pointer provenance fail closed with
+`.unsupported` (see `validateScalarLayoutBytesProto`).
+-/
+@[reducible]
+def validateInitNoProvScalarBytesProto
+    (sz : Nat)
+    (bytes : List AbstractByte) :
+    TypedBytesValidityProto :=
+  match Bool.and (Nat.beq (length bytes) sz) (Bool.not (hasUninitByteProto bytes)) with
+  | false => .ub
+  | true =>
+    match hasProvByteProto bytes with
+    | true => .unsupported
+    | false => .valid
 
 /-- Higher-order field validator by `fieldLayouts` so `validateTypedBytesForLayoutIdxProto` is purely structurally recursive on fuel. -/
 @[reducible]
@@ -1851,21 +2220,6 @@ def validateLayoutFieldsWith
           (checkOne fIdx fSlice)
           (validateLayoutFieldsWith layouts bytes checkOne offRest fRest)
   | _, _ => .unsupported
-
-/-- Validate `count` chunks of width `stride` contain no `.uninit` bytes. -/
-@[reducible]
-def validateArrayChunksUninitProto (stride : Nat) : Nat → List AbstractByte → TypedBytesValidityProto
-  | .zero, .nil => .valid
-  | .succ k, bs =>
-    match Nat.ble stride (length bs) with
-    | false => .ub
-    | true =>
-      let chunk := takeAbstractBytes stride bs
-      let rest := dropAbstractBytes stride bs
-      match hasUninitByteProto chunk with
-      | true => .ub
-      | false => validateArrayChunksUninitProto stride k rest
-  | _, _ => .ub
 
 /-- Higher-order array element chunk validator (structurally recursive on element count). -/
 @[reducible]
@@ -1934,9 +2288,12 @@ typed-copy + `validatePlace` checks at `Miri/Interpreter/Intrinsics.lean:205-212
 - `char` requires 4 initialized bytes forming a Unicode scalar value (`isValidCharCode`).
 - References `&T`/`&mut T` and `fn(...)` require initialized non-null pointer bytes.
 - Arrays, tuples, and structs validate every field at its layout offset while
-  **permitting `.uninit` padding bytes**.
+  **permitting `.uninit` padding bytes**. ADT field types are taken from the
+  ADT's `LayoutTable` entry (`fieldLayouts`), never from its generic arguments.
 - Unions (`FieldsShape.union`, e.g. `MaybeUninit<T>`) permit `.uninit` bytes.
-- Exotic ADTs without sufficient layout metadata fail closed with `.unsupported`.
+- Non-pointer scalars whose bytes carry pointer provenance, multi-variant
+  enums, and ADTs without sufficient layout metadata fail closed with
+  `.unsupported`.
 
 Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
@@ -1997,7 +2354,18 @@ def validateTypedBytesForLayoutIdxProto :
                 | _, _ => .unsupported
               | _, _ => .unsupported
           | .array stride count =>
-            validateArrayChunksUninitProto stride.bytes count bytes
+            -- Element validity (not mere initialization) decides array validity:
+            -- padding inside elements may be `.uninit`, while an initialized
+            -- element can still be invalid (`bool = 2`). Without the element
+            -- layout (`fieldLayouts = [elemIdx]`), fail closed.
+            match l.fieldLayouts with
+            | elemIdx :: .nil =>
+              validateArrayChunksWith
+                stride.bytes
+                (validateTypedBytesForLayoutIdxProto fuel' layouts elemIdx)
+                count
+                bytes
+            | _ => .unsupported
         | .multiple tagLayout tagField _ =>
           match l.fields, scalarLayoutByteWidth tagLayout with
           | .arbitrary outerOffsets _, .some tagSz =>
@@ -2031,42 +2399,36 @@ def validateTypedBytesProto :
     | .never => .ub
     | .bool =>
       match bytes with
-      | .init b _ :: .nil =>
+      | .init b .none :: .nil =>
         match Nat.ble b.toBitVec.toNat 1 with
         | true => .valid
         | false => .ub
+      | .init _ (.some _) :: .nil => .unsupported
       | _ => .ub
     | .char =>
       match Nat.beq (length bytes) 4 with
       | false => .ub
       | true =>
         match decodeScalarBytes bytes false with
-        | .some (sv, _) =>
+        | .some (sv, .none) =>
           match isValidCharCode sv.bits with
           | true => .valid
           | false => .ub
+        | .some (_, .some _) => .unsupported
         | .none => .ub
     | .uint w =>
       match intCastTargetBytes (.uint w) with
-      | .some sz =>
-        match Bool.and (Nat.beq (length bytes) sz) (Bool.not (hasUninitByteProto bytes)) with
-        | true => .valid
-        | false => .ub
+      | .some sz => validateInitNoProvScalarBytesProto sz bytes
       | .none => .unsupported
     | .int w =>
       match intCastTargetBytes (.int w) with
-      | .some sz =>
-        match Bool.and (Nat.beq (length bytes) sz) (Bool.not (hasUninitByteProto bytes)) with
-        | true => .valid
-        | false => .ub
+      | .some sz => validateInitNoProvScalarBytesProto sz bytes
       | .none => .unsupported
     | .float fk =>
       let sz :=
         match fk with
         | .f16 => 2 | .f32 => 4 | .f64 => 8 | .f128 => 16
-      match Bool.and (Nat.beq (length bytes) sz) (Bool.not (hasUninitByteProto bytes)) with
-      | true => .valid
-      | false => .ub
+      validateInitNoProvScalarBytesProto sz bytes
     | .tuple .nil | .fnDef _ _ =>
       match bytes with
       | .nil => .valid
@@ -2167,34 +2529,50 @@ def validateTypedBytesProto :
           (validateTypedBytesProto fuel' localDecls layouts)
           fieldKinds
           bytes
-    | .adt _ args =>
+    | .adt _ _ =>
+      -- Field types come from the ADT's layout entry (`fieldLayouts`), never from
+      -- its generic arguments: `struct W<T>(*const T)` has one generic argument
+      -- and one field, yet the field is a pointer, not a `T`.
       let resolved := resolveRigidTyWithDeclsProto localDecls layouts ty
-      match LayoutTable.lookup layouts resolved.layoutIdx with
-      | .none => .unsupported
-      | .some l =>
-        match Bool.or l.isUninhabited (Bool.not (Nat.beq (length bytes) l.size.bytes)) with
-        | true => .ub
-        | false =>
-          match l.variants with
-          | .empty => .ub
-          | .single _ =>
-            match l.fields with
-            | .union _ => .valid
-            | .arbitrary offsets _ =>
-              match Nat.beq (length args) (length offsets) with
-              | true =>
-                validateTypedFieldsAtOffsetsWith
-                  (intrinsicRigidTyByteSize localDecls layouts)
-                  bytes
-                  (validateTypedBytesProto fuel' localDecls layouts)
-                  offsets
-                  args
-              | false =>
-                validateTypedBytesForLayoutIdxProto fuel' layouts resolved.layoutIdx bytes
-            | _ => validateTypedBytesForLayoutIdxProto fuel' layouts resolved.layoutIdx bytes
-          | .multiple _ _ _ =>
-            validateTypedBytesForLayoutIdxProto fuel' layouts resolved.layoutIdx bytes
+      validateTypedBytesForLayoutIdxProto fuel' layouts resolved.layoutIdx bytes
     | _ => .unsupported
+
+/--
+The bytes that a typed copy of `slice` at type `ty` stores into endpoint `ep`.
+
+`Miri.Interpreter.Intrinsics.typedSwap` moves both values with typed copies and
+validates the destination with padding reset (`Intrinsics.lean:205-212`), so the
+padding bytes of the stored value are uninitialized whatever the source held.
+
+- A stack or caller local stores a structured `Value`, which has no padding
+  bytes: committing `slice` already yields uninitialized padding, so the slice
+  is stored as is.
+- A global allocation stores raw bytes, so the stored image is the exact
+  re-encoding of the value decoded from `slice` at `ty`: equal to `slice` on
+  every value byte and `.uninit` on padding. When the value cannot be decoded
+  and re-encoded exactly, the result is `.none` (callers fail closed with
+  `.unsupported`) rather than a raw copy that would keep padding initialized.
+-/
+def typedCopyStoredBytesProto
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (ty : RigidTy)
+    (ep : ResolvedMemEndpointProto)
+    (slice : List AbstractByte) :
+    Option (List AbstractByte) :=
+  match ep.globalAlloc? with
+  | .none => .some slice
+  | .some _ =>
+    let rTy := resolveRigidTyWithDeclsProto localDecls layouts ty
+    match decodePartialUninitValueProto defaultCodecFuel localDecls layouts rTy slice with
+    | .none => .none
+    | .some v =>
+      match encodeRawValueBytesProto defaultCodecFuel localDecls layouts rTy v with
+      | .some stored =>
+        match abstractBytesRefineProto stored slice with
+        | true => .some stored
+        | false => .none
+      | .none => .none
 
 /--
 Evaluate `core::intrinsics::typed_swap_nonoverlapping<T>(x: *mut T, y: *mut T)`.
@@ -2203,7 +2581,12 @@ Exact semantics (aligned with `Miri/Interpreter/Intrinsics.lean:199-214, 429`):
 1. Resolves pointee type `T`; rejects unsized or layout-unknown `T` fail-closed
    with `MirStepNode.unsupported`.
 2. Checks non-null and ABI alignment (`align_of::<T>()`) of both `x` and `y`
-   even when `size_of::<T>() == 0`.
+   even when `size_of::<T>() == 0`. Null is `.ub` for every `T` because the
+   pinned contract requires both pointers to be "[valid] for both reads and
+   writes" and a null pointer "is *never* valid for reads/writes". For ZST `T`
+   this is deliberately STRICTER than `lean-miri`, whose zero-sized
+   `copyOp` / `memCopy` accesses skip pointer resolution
+   (`Miri.Memory.checkAndDerefPtr`, `Miri/Memory/Access.lean:134-150`).
 3. For uninhabited `T` (`!` or empty ADT), faults `.fail .ub` even at size `0`.
 4. For inhabited ZST `T` (`size_of::<T>() == 0`), aligned non-null pointers
    succeed as a no-op (matching Miri `memCopy ... size=0 nonoverlapping=true`).
@@ -2220,21 +2603,44 @@ Exact semantics (aligned with `Miri/Interpreter/Intrinsics.lean:199-214, 429`):
      invalid `bool`/`char`, null `&T`, while allowing padding and unions).
    - **Tree Borrows ordering**: applies `read(x) -> read(y) -> write(x) -> write(y)`
      on the evolving borrow table so borrow conflicts fault `.fail .ub`.
+   - **Typed-copy images**: each place receives the typed-copy image of the
+     other value (`typedCopyStoredBytesProto`): padding bytes are stored
+     uninitialized (lines 205-212 validate with padding reset), also in global
+     allocations, which keep raw bytes.
    - **Atomic same-container commit**: when `xEp.key == yEp.key`, patches both
      disjoint spans into the shared root buffer before committing once; when
      `xEp.key != yEp.key`, commits `x` then `y`.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L3114-L3131>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2545-L2573>
 
-> "/// Swaps the values at two mutable locations of the same type, without
-> /// deinitializing either.
-> /// * Both `x` and `y` must be valid for both reads and writes.
+> "/// Non-overlapping *typed* swap of a single value.
+> ///
+> /// The codegen backends will replace this with a better implementation when
+> /// `T` is a simple type that can be loaded and stored as an immediate.
+> ///
+> /// The stabilized form of this intrinsic is [`crate::mem::swap`].
+> ///
+> /// # Safety
+> /// Behavior is undefined if any of the following conditions are violated:
+> ///
+> /// * Both `x` and `y` must be [valid] for both reads and writes.
+> ///
 > /// * Both `x` and `y` must be properly aligned.
-> /// * The region of memory beginning at `x` with a size of `size_of::<T>()` bytes
-> ///   must not overlap with the region of memory beginning at `y` with the same size.
-> /// * Both `*x` and `*y` must be valid values of type `T`."
+> ///
+> /// * The region of memory beginning at `x` must *not* overlap with the region of memory
+> ///   beginning at `y`.
+> ///
+> /// * The memory pointed by `x` and `y` must both contain values of type `T`."
+
+Reference (`library/core/src/ptr/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L18-L20>
+
+> "//! * A [null] pointer is *never* valid for reads/writes.
+> //! * For memory accesses of [size zero][zst], *every* non-null pointer is valid for reads/writes.
+> //!   The following points are only concerned with non-zero-sized accesses."
 -/
 def evalTypedSwapNonOverlappingProto
     (s : MachineState)
@@ -2384,37 +2790,44 @@ def evalTypedSwapNonOverlappingProto
                                       | .ub => MirStepNode.fail .ub
                                       | .unsupported => MirStepNode.unsupported
                                       | .valid =>
-                                        -- Commit swapped bytes (same container vs distinct containers):
+                                        -- Commit swapped bytes (same container vs distinct containers).
+                                        -- Each place receives the typed-copy image of the other value.
                                         let commitRes :
                                             ProtoRes (List LocalSlot × List SavedCallerFrame × List LocalSlot × List CapturedAllocation) :=
-                                          match decide (xEp.key = yEp.key) with
-                                          | true =>
-                                            match writeAbstractBytesAt xRootBytes xEp.effOffset ySlice with
-                                            | .none => .ub
-                                            | .some buf1 =>
-                                              match writeAbstractBytesAt buf1 yEp.effOffset xSlice with
+                                          match
+                                            typedCopyStoredBytesProto bodyLocalDecls bodyLayouts elemTy xEp ySlice,
+                                            typedCopyStoredBytesProto bodyLocalDecls bodyLayouts elemTy yEp xSlice
+                                          with
+                                          | .some xNew, .some yNew =>
+                                            match decide (xEp.key = yEp.key) with
+                                            | true =>
+                                              match writeAbstractBytesAt xRootBytes xEp.effOffset xNew with
                                               | .none => .ub
-                                              | .some buf2 =>
-                                                commitRootAbstractBytesProto
-                                                  locals' s.memory.callStack s.memory.callerLocals s.memory.globals
-                                                  ptrBytes xEp buf2
-                                          | false =>
-                                            match writeAbstractBytesAt xRootBytes xEp.effOffset ySlice with
-                                            | .none => .ub
-                                            | .some xUpdated =>
-                                              match writeAbstractBytesAt yRootBytes yEp.effOffset xSlice with
-                                              | .none => .ub
-                                              | .some yUpdated =>
-                                                match
+                                              | .some buf1 =>
+                                                match writeAbstractBytesAt buf1 yEp.effOffset yNew with
+                                                | .none => .ub
+                                                | .some buf2 =>
                                                   commitRootAbstractBytesProto
                                                     locals' s.memory.callStack s.memory.callerLocals s.memory.globals
-                                                    ptrBytes xEp xUpdated
-                                                with
-                                                | .ub => .ub
-                                                | .unsupported => .unsupported
-                                                | .ok (loc1, cs1, cl1, gl1) =>
-                                                  commitRootAbstractBytesProto
-                                                    loc1 cs1 cl1 gl1 ptrBytes yEp yUpdated
+                                                    ptrBytes xEp buf2
+                                            | false =>
+                                              match writeAbstractBytesAt xRootBytes xEp.effOffset xNew with
+                                              | .none => .ub
+                                              | .some xUpdated =>
+                                                match writeAbstractBytesAt yRootBytes yEp.effOffset yNew with
+                                                | .none => .ub
+                                                | .some yUpdated =>
+                                                  match
+                                                    commitRootAbstractBytesProto
+                                                      locals' s.memory.callStack s.memory.callerLocals s.memory.globals
+                                                      ptrBytes xEp xUpdated
+                                                  with
+                                                  | .ub => .ub
+                                                  | .unsupported => .unsupported
+                                                  | .ok (loc1, cs1, cl1, gl1) =>
+                                                    commitRootAbstractBytesProto
+                                                      loc1 cs1 cl1 gl1 ptrBytes yEp yUpdated
+                                          | _, _ => .unsupported
                                         match commitRes with
                                         | .ub => MirStepNode.fail .ub
                                         | .unsupported => MirStepNode.unsupported
@@ -2497,6 +2910,158 @@ def evalPtrOffsetFromDistanceProto
             .some ⟨Nat.sub modulus quotMag, ptrBytes⟩
 
 /--
+Test whether tracked pointer `p` is a provenance-free synthetic address: its
+`allocId` is `0` and neither a borrow tag `0` nor a global allocation `0`
+backs it (the `MirSemantics` encoding of an integer-derived pointer value kept
+in `Value.ptr` form; `recordExposedAllocId` likewise treats `allocId = 0` as
+"synthetic provenance-less addresses rather than a real allocation").
+-/
+@[reducible]
+def isUnbackedZeroProvProto (mem : Memory) (p : ProvenancePtr) : Bool :=
+  Bool.and (Nat.beq p.allocId 0)
+    (Bool.and
+      (match lookupBorrow mem.borrows 0 with | .none => true | .some _ => false)
+      (match lookupGlobalAlloc mem.globals 0 with | .none => true | .some _ => false))
+
+/--
+Normalize a thin pointer argument so that both encodings of a provenance-free
+address (`Value.scalar` bits and an unbacked `allocId = 0` `Value.ptr`) become
+`PtrArgProto.addr` of the address modulo `2^(8 * ptrBytes)`.
+-/
+@[reducible]
+def normalizePtrArgProto (mem : Memory) (ptrBytes : Nat) : PtrArgProto → PtrArgProto
+  | .addr bits => .addr bits
+  | .prov p =>
+    match isUnbackedZeroProvProto mem p with
+    | true => .addr (wrapScalarBits p.offsetBytes (scalarModulus ptrBytes))
+    | false => .prov p
+
+/--
+Root local `(frameDepth, localIdx)` of a tracked stack pointer `p` whose
+allocation is no longer live (`BorrowEntry.allocDead`, or a missing / dead
+`LocalSlot`), or `.none` when `p` has no borrow entry or its allocation is live.
+
+A dead tag does not record which storage generation of the local it belonged
+to (`StorageDead` followed by `StorageLive` reuses the same local index for a
+new allocation), so two distinct dead tags of one root may or may not denote
+the same allocation.
+-/
+@[reducible]
+def deadStackRootProto?
+    (s : MachineState)
+    (locals : List LocalSlot)
+    (p : ProvenancePtr) :
+    Option (Nat × LocalIdx) :=
+  match lookupBorrow s.memory.borrows p.tag with
+  | .none => .none
+  | .some entry =>
+    let isDead : Bool :=
+      match entry.allocDead with
+      | true => true
+      | false =>
+        match
+          readFrameLocalSlot
+            locals
+            s.memory.callStack
+            s.memory.callerLocals
+            entry.targetFrameDepth
+            entry.targetLocal
+        with
+        | .none => true
+        | .some .dead => true
+        | .some _ => false
+    match isDead with
+    | true => .some (entry.targetFrameDepth, entry.targetLocal)
+    | false => .none
+
+/--
+Same-allocation offset resolution for `ptr_offset_from` /
+`ptr_offset_from_unsigned`, 1-to-1 with the non-address-provenance branch of
+`Miri.Interpreter.Intrinsics.pointerOffsetFrom` (`Intrinsics.lean:223-232`)
+followed by its two directed `checkSignedAccess` calls (lines 250-262).
+
+Returns the pair of offsets `(ptrOff, originOff)` relative to a common base:
+
+- **Two provenance-free addresses** (line 228): the addresses themselves. Equal
+  addresses succeed (distance `0`: `checkSignedAccess _ 0` performs no
+  check); unequal addresses are `.ub` (no allocation backs the range).
+- **Mixed tracked / provenance-free** (line 232): `.ub`.
+- **The same tracked pointer** (identical provenance and offset): `(0, 0)`
+  WITHOUT any liveness or bounds requirement. Both arguments "point to the
+  same address", which the pinned `offset_from` contract accepts
+  unconditionally, and the distance-`0` `checkSignedAccess` calls skip pointer
+  resolution (`Miri.Memory.checkAndDerefPtr` returns `none` for size `0`), so a
+  dangling or out-of-bounds pointer compared with itself is not UB.
+- **Two tracked pointers into one live allocation** (`AllocKeyProto` equality,
+  line 229-231): equal effective offsets succeed without a bounds check (same
+  address again, even under distinct Tree Borrows tags); otherwise BOTH
+  endpoints must lie in `[0, allocSize]` (lines 250-262 check
+  `[origin, origin + distance]` and `[ptr, ptr - distance]`), else `.ub`.
+  Tree Borrows permissions are irrelevant: no memory is accessed.
+- **Different allocations** (line 230), or exactly one dead allocation: `.ub`.
+- **Two distinct dead tags of the same root local**: fail closed with
+  `.unsupported`. Within one storage generation they share an allocation
+  (distance `0` succeeds, non-zero distance is `.ub`); across generations they
+  do not (`.ub`); `BorrowEntry` does not record the generation
+  (`deadStackRootProto?`). Sharing a tag pins the generation, so the same dead
+  tag at two different offsets is `.ub`.
+- An undeterminable sub-place offset or root size is `.unsupported`.
+-/
+def resolvePtrOffsetFromOffsetsProto
+    (s : MachineState)
+    (locals : List LocalSlot)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (ptrArg originArg : PtrArgProto) :
+    ProtoRes (Nat × Nat) :=
+  let ptrBytes := layoutPointerBytes bodyLayouts
+  match
+    normalizePtrArgProto s.memory ptrBytes ptrArg,
+    normalizePtrArgProto s.memory ptrBytes originArg
+  with
+  | .addr aBits, .addr bBits =>
+    match Nat.beq aBits bBits with
+    | true => .ok (aBits, bBits)
+    | false => .ub
+  | .prov _, .addr _ => .ub
+  | .addr _, .prov _ => .ub
+  | .prov pPtr, .prov oPtr =>
+    match Bool.and (Nat.beq pPtr.allocId oPtr.allocId) (Nat.beq pPtr.offsetBytes oPtr.offsetBytes) with
+    | true => .ok (0, 0)
+    | false =>
+      match
+        resolveLiveMemEndpointProto s locals s.memory.borrows bodyLocalDecls bodyLayouts (.prov pPtr),
+        resolveLiveMemEndpointProto s locals s.memory.borrows bodyLocalDecls bodyLayouts (.prov oPtr)
+      with
+      | .ok pEp, .ok oEp =>
+        match decide (pEp.key = oEp.key) with
+        | false => .ub
+        | true =>
+          match Nat.beq pEp.effOffset oEp.effOffset with
+          | true => .ok (pEp.effOffset, oEp.effOffset)
+          | false =>
+            match
+              Bool.and
+                (Nat.ble pEp.effOffset pEp.allocSize)
+                (Nat.ble oEp.effOffset oEp.allocSize)
+            with
+            | true => .ok (pEp.effOffset, oEp.effOffset)
+            | false => .ub
+      | .ub, .ub =>
+        match Nat.beq pPtr.allocId oPtr.allocId with
+        | true => .ub
+        | false =>
+          match deadStackRootProto? s locals pPtr, deadStackRootProto? s locals oPtr with
+          | .some (pDepth, pLocal), .some (oDepth, oLocal) =>
+            match Bool.and (Nat.beq pDepth oDepth) (Nat.beq pLocal oLocal) with
+            | true => .unsupported
+            | false => .ub
+          | _, _ => .ub
+      | .ub, _ => .ub
+      | _, .ub => .ub
+      | _, _ => .unsupported
+
+/--
 Evaluate `core::intrinsics::ptr_offset_from<T>(ptr, origin) -> isize`
 (`unsigned = false`) and `core::intrinsics::ptr_offset_from_unsigned<T>(ptr, origin) -> usize`
 (`unsigned = true`).
@@ -2506,38 +3071,70 @@ and `MiniRustSpec.Interp.evalPtrOffsetFrom`):
 1. Resolves pointee type `T` and byte size `elemSize` (ZST `elemSize == 0` -> `.ub`;
    unsized -> `.ub`; unresolvable ADT -> `.unsupported`).
 2. Decodes `ptr` and `origin` as thin pointers of width `ptrBytes`.
-3. Same-allocation & directed in-bounds verification:
-   - **Two provenance-free integer pointers (`.addr a, .addr b`)**:
-     if `a == b` (zero distance, `Miri/Interpreter/Intrinsics.lean:228, 250, 260`
-     and `MiniRustSpec` `BM.check_ptr`), yields `0` (provided `elemSize > 0`);
-     if `a != b`, faults `.ub` (no backing live allocation for non-zero range).
-   - **Two provenance-carrying pointers**:
-     resolves both live allocations (ignoring Tree Borrows permission per
-     `DIV-LM-D6-OFFSET-DISABLED-TAG`, while rejecting `allocDead = true` or
-     `LocalSlot.dead`!). Requires:
-     - exact same allocation key (`ptrEp.key == originEp.key`);
-     - live allocation size `allocSize <= isize::MAX`;
-     - BOTH endpoints in bounds `[0, allocSize]` (inclusive of one-past-the-end!).
-     Cross-allocation pointers, dead allocations, mixed tracked/provenance-free
-     pointers, or out-of-bounds endpoints ALL fault `.fail .ub`!
+3. Same-allocation & directed in-bounds verification
+   (`resolvePtrOffsetFromOffsetsProto`, `Intrinsics.lean:223-232, 250-262`):
+   - two provenance-free integer pointers: equal addresses yield distance `0`,
+     unequal addresses fault `.ub`;
+   - the same tracked pointer (identical provenance and offset) yields distance
+     `0` even when dangling or out of bounds ("point to the same address");
+   - two tracked pointers must share one live allocation; a non-zero distance
+     additionally requires BOTH endpoints in `[0, allocSize]` (inclusive of
+     one-past-the-end);
+   - cross-allocation, mixed tracked/provenance-free, dead-allocation, and
+     out-of-bounds non-zero ranges ALL fault `.fail .ub`; two distinct dead
+     tags of one root local fail closed with `.unsupported`.
 4. Delegates range (`[-isize::MAX, isize::MAX]` signed, `[0, isize::MAX]`
    unsigned, rejecting `distance == isize::MIN` and unsigned underflow) and exact
    element-size divisibility to `evalPtrOffsetFromDistanceProto`.
 5. Leaves `s.memory` completely unchanged (pointer arithmetic performs no memory
    access and does not expose provenance).
 
-Reference (`library/core/src/intrinsics/mod.rs` and `library/core/src/ptr/const_ptr.rs`
-at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1185-L1250>
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2268-L2278>
 
-> "/// Calculates the offset from a pointer. The returned value is in units of `T`:
-> /// the distance in bytes divided by `size_of::<T>()`.
+> "/// See documentation of `<*const T>::offset_from` for details."
+> "pub const unsafe fn ptr_offset_from<T>(ptr: *const T, base: *const T) -> isize;"
+>
+> "/// See documentation of `<*const T>::offset_from_unsigned` for details."
+> "pub const unsafe fn ptr_offset_from_unsigned<T>(ptr: *const T, base: *const T) -> usize;"
+
+Reference (`<*const T>::offset_from` and `<*const T>::offset_from_unsigned`
+documentation, `library/core/src/ptr/const_ptr.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/const_ptr.rs#L527-L574>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/const_ptr.rs#L665-L679>
+
+> "/// Calculates the distance between two pointers within the same allocation. The returned value is in
+> /// units of T: the distance in bytes divided by `size_of::<T>()`."
+>
+> "/// If any of the following conditions are violated, the result is Undefined Behavior:
 > ///
-> /// * Both `ptr` and `origin` must be either in bounds or one byte past the end
-> ///   of the same allocated object.
-> /// * The distance between the pointers, in bytes, must be an exact multiple of
-> ///   the size of `T`.
-> /// * `size_of::<T>()` must be non-zero."
+> /// * `self` and `origin` must either
+> ///
+> ///   * point to the same address, or
+> ///   * both be [derived from][crate::ptr#provenance] a pointer to the same [allocation], and the memory range between
+> ///     the two pointers must be in bounds of that object. (See below for an example.)
+> ///
+> /// * The distance between the pointers, in bytes, must be an exact multiple
+> ///   of the size of `T`.
+> ///
+> /// As a consequence, the absolute distance between the pointers, in bytes, computed on
+> /// mathematical integers (without \"wrapping around\"), cannot overflow an `isize`. This is
+> /// implied by the in-bounds requirement, and the fact that no allocation can be larger
+> /// than `isize::MAX` bytes."
+>
+> "/// This function panics if `T` is a Zero-Sized Type (\"ZST\")."
+>
+> "/// - The distance between the pointers must be non-negative (`self >= origin`)
+> ///
+> /// - *All* the safety conditions of [`offset_from`](#method.offset_from)
+> ///   apply to this method as well; see it for the full details.
+> ///
+> /// Importantly, despite the return type of this method being able to represent
+> /// a larger offset, it's still *not permitted* to pass pointers which differ
+> /// by more than `isize::MAX` *bytes*.  As such, the result of this method will
+> /// always be less than or equal to `isize::MAX as usize`."
 -/
 def evalPtrOffsetFromProto
     (s : MachineState)
@@ -2570,52 +3167,7 @@ def evalPtrOffsetFromProto
           | true => MirStepNode.fail .ub
           | false =>
             let offsetsRes : ProtoRes (Nat × Nat) :=
-              match ptrArg, originArg with
-              | .addr aBits, .addr bBits =>
-                match Nat.beq aBits bBits with
-                | true => .ok (aBits, bBits)
-                | false => .ub
-              | .prov _, .addr _ => .ub
-              | .addr _, .prov _ => .ub
-              | .prov pPtr, .prov oPtr =>
-                -- Check provenance-free `allocId = 0` synthetic addresses (when not in borrows/globals):
-                let pIsUnbackedZero :=
-                  Bool.and (Nat.beq pPtr.allocId 0)
-                    (Bool.and
-                      (match lookupBorrow s.memory.borrows 0 with | .none => true | .some _ => false)
-                      (match lookupGlobalAlloc s.memory.globals 0 with | .none => true | .some _ => false))
-                let oIsUnbackedZero :=
-                  Bool.and (Nat.beq oPtr.allocId 0)
-                    (Bool.and
-                      (match lookupBorrow s.memory.borrows 0 with | .none => true | .some _ => false)
-                      (match lookupGlobalAlloc s.memory.globals 0 with | .none => true | .some _ => false))
-                match pIsUnbackedZero, oIsUnbackedZero with
-                | true, true =>
-                  match Nat.beq pPtr.offsetBytes oPtr.offsetBytes with
-                  | true => .ok (pPtr.offsetBytes, oPtr.offsetBytes)
-                  | false => .ub
-                | true, false => .ub
-                | false, true => .ub
-                | false, false =>
-                  match
-                    resolveLiveMemEndpointProto s locals' s.memory.borrows bodyLocalDecls bodyLayouts (.prov pPtr),
-                    resolveLiveMemEndpointProto s locals' s.memory.borrows bodyLocalDecls bodyLayouts (.prov oPtr)
-                  with
-                  | .ub, _ | _, .ub => .ub
-                  | .unsupported, _ | _, .unsupported => .unsupported
-                  | .ok pEp, .ok oEp =>
-                    let isizeMax := Nat.sub (signedHalfModulus ptrBytes) 1
-                    let sameLiveInBounds :=
-                      Bool.and
-                        (decide (pEp.key = oEp.key))
-                        (Bool.and
-                          (Nat.ble pEp.allocSize isizeMax)
-                          (Bool.and
-                            (Nat.ble pEp.effOffset pEp.allocSize)
-                            (Nat.ble oEp.effOffset oEp.allocSize)))
-                    match sameLiveInBounds with
-                    | false => .ub
-                    | true => .ok (pEp.effOffset, oEp.effOffset)
+              resolvePtrOffsetFromOffsetsProto s locals' bodyLocalDecls bodyLayouts ptrArg originArg
             match offsetsRes with
             | .ub => MirStepNode.fail .ub
             | .unsupported => MirStepNode.unsupported
@@ -2784,14 +3336,29 @@ Evaluate `core::intrinsics::ptr_mask<T>(ptr: *const T, mask: usize) -> *const T`
 Preserves `ProvenancePtr.allocId` and Tree Borrows `ProvenancePtr.tag` and
 NEVER modifies `s.memory.exposedAllocIds` (strict provenance, non-exposing).
 
-Reference (`library/core/src/intrinsics/mod.rs` and `library/core/src/ptr/const_ptr.rs`
-at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1252-L1275>
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L944-L954>
 
 > "/// Masks out bits of the pointer according to a mask.
 > ///
-> /// This is logically equivalent to `ptr.with_addr(ptr.addr() & mask)`.
-> /// If the resulting pointer is dereferenced, it retains the provenance of `ptr`."
+> /// Note that, unlike most intrinsics, this is safe to call;
+> /// it does not require an `unsafe` block.
+> /// Therefore, implementations must not require the user to uphold
+> /// any safety invariants.
+> ///
+> /// Consider using [`pointer::mask`] instead."
+
+Reference (`<*const T>::mask` documentation, `library/core/src/ptr/const_ptr.rs`
+at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/const_ptr.rs#L489-L494>
+
+> "/// Masks out bits of the pointer according to a mask.
+> ///
+> /// This is convenience for `ptr.map_addr(|a| a & mask)`.
+> ///
+> /// For non-`Sized` pointees this operation changes only the data pointer,
+> /// leaving the metadata untouched."
 -/
 def evalPtrMaskProto
     (s : MachineState)
@@ -2883,13 +3450,27 @@ Exact semantics (aligned with `Miri/Interpreter/Intrinsics.lean:441`
    place projection + Tree Borrows write + protector checks) and jumps to
    `targetOpt` (`.fail .ub` if `targetOpt = .none`).
 
-Reference (`library/core/src/intrinsics/mod.rs` and `library/core/src/hint.rs`
-at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2762-L2772>
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2339-L2345>
 
-> "/// An identity function that *hints* to the compiler to be maximally pessimistic
-> /// about what `black_box` could do.
-> pub const fn black_box<T>(dummy: T) -> T;"
+> "/// See documentation of [`std::hint::black_box`] for details."
+> "pub const fn black_box<T>(dummy: T) -> T;"
+
+Reference (`core::hint::black_box` documentation, `library/core/src/hint.rs` at
+commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/hint.rs#L315-L321>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/hint.rs#L486>
+
+> "/// An identity function that *__hints__* to the compiler to be maximally pessimistic about what
+> /// `black_box` could do.
+> ///
+> /// Unlike [`std::convert::identity`], a Rust compiler is encouraged to assume that `black_box` can
+> /// use `dummy` in any possible valid way that Rust code is allowed to without introducing undefined
+> /// behavior in the calling code. This property makes `black_box` useful for writing code in which
+> /// certain optimizations are not desired, such as benchmarks."
+>
+> "/// During constant evaluation, `black_box` is treated as a no-op."
 -/
 def evalBlackBoxProto
     (s : MachineState)
@@ -3492,6 +4073,467 @@ theorem evalPtrOffsetFromDistanceProto_isizeMin_ub
         decide_eq_false (fun h => hNotIn h.1)
       simp only [hDec]
   · rfl
+
+/--
+`LeanMiri` spec mirror of the distance computation and range checks of
+`Miri.Interpreter.Intrinsics.pointerOffsetFrom`
+(`lean-miri/vendor/Miri/Interpreter/Intrinsics.lean:239-249`) on two `usize`
+offsets `aOff`, `bOff` below `modulus = 2^(8 * ptrBytes)`:
+
+- line 239: `SubWithOverflow` on `usize` yields the wrapped difference
+  `value = (aOff - bOff) mod modulus` and `overflow = (aOff < bOff)`;
+- lines 242-244: `toTargetIsize` reinterprets `value` as a two's-complement
+  `isize` `distance`;
+- lines 245-248: when `overflow`, the unsigned intrinsic is UB, and the signed
+  intrinsic is UB if `distance >= 0` or `distance == isize::MIN`;
+- line 249: otherwise (no overflow) a negative `distance` is UB.
+
+Returns `some distance` when no check fails and `none` on UB.
+-/
+def miriPtrOffsetFromDistanceSpec (aOff bOff modulus : Nat) (unsigned : Bool) : Option Int :=
+  let value : Nat := (aOff + modulus - bOff) % modulus
+  let distance : Int :=
+    if value < modulus / 2 then (value : Int) else (value : Int) - (modulus : Int)
+  if aOff < bOff then
+    if unsigned = true then none
+    else if 0 ≤ distance ∨ distance = -((modulus / 2 : Nat) : Int) then none
+    else some distance
+  else if distance < 0 then none
+  else some distance
+
+/--
+The range-checked byte distance of `evalPtrOffsetFromDistanceProto`:
+`some (ptrOff - originOff)` when the mathematical difference lies in
+`[-isize::MAX, isize::MAX]` (signed) or `[0, isize::MAX]` (unsigned), else
+`none`.
+-/
+@[reducible]
+def ptrOffsetFromCheckedDistanceProto (ptrOff originOff ptrBytes : Nat) (unsigned : Bool) : Option Int :=
+  let distance : Int := Int.ofNat ptrOff - Int.ofNat originOff
+  let isizeMax : Int := Int.ofNat (Nat.sub (signedHalfModulus ptrBytes) 1)
+  let rangeOk : Bool :=
+    match unsigned with
+    | true => decide (0 ≤ distance ∧ distance ≤ isizeMax)
+    | false => decide (-isizeMax ≤ distance ∧ distance ≤ isizeMax)
+  match rangeOk with
+  | false => .none
+  | true => .some distance
+
+/-- For a non-zero byte width, `scalarModulus n = 2 * signedHalfModulus n` with a positive half. -/
+theorem scalarModulus_eq_two_mul_half (n : Nat) (hn : 0 < n) :
+    scalarModulus n = 2 * signedHalfModulus n ∧ 0 < signedHalfModulus n := by
+  cases n with
+  | zero => omega
+  | succ k =>
+    have h1 : 1 ≤ scalarModulus k := by
+      induction k with
+      | zero => decide
+      | succ j ih =>
+        change 1 ≤ 256 * scalarModulus j
+        omega
+    unfold signedHalfModulus
+    change 256 * scalarModulus k = 2 * ((256 * scalarModulus k) / 2) ∧ 0 < (256 * scalarModulus k) / 2
+    omega
+
+/--
+Core of `miriPtrOffsetFromDistanceSpec_eq_checkedDistanceProto` over an even
+modulus `2 * H`: the `SubWithOverflow` / `toTargetIsize` case analysis of
+`Intrinsics.lean:239-249` accepts exactly the mathematical differences in
+`[-(H - 1), H - 1]` (signed) or `[0, H - 1]` (unsigned) and returns that
+difference.
+-/
+theorem miriPtrOffsetFromDistanceSpec_core (a b H : Nat) (u : Bool)
+    (hH : 0 < H) (ha : a < 2 * H) (hb : b < 2 * H) :
+    miriPtrOffsetFromDistanceSpec a b (2 * H) u =
+      (match (match u with
+          | true => decide (0 ≤ (a : Int) - (b : Int) ∧ (a : Int) - (b : Int) ≤ ((H - 1 : Nat) : Int))
+          | false => decide (-((H - 1 : Nat) : Int) ≤ (a : Int) - (b : Int) ∧
+              (a : Int) - (b : Int) ≤ ((H - 1 : Nat) : Int))) with
+        | false => none
+        | true => some ((a : Int) - (b : Int))) := by
+  have hHalf : 2 * H / 2 = H := by omega
+  unfold miriPtrOffsetFromDistanceSpec
+  simp only [hHalf]
+  by_cases hLt : a < b
+  · have hVal : (a + 2 * H - b) % (2 * H) = a + 2 * H - b := Nat.mod_eq_of_lt (by omega)
+    have hCast : ((a + 2 * H - b : Nat) : Int) = (a : Int) - (b : Int) + 2 * (H : Int) := by omega
+    rw [hVal, ite_eq_left hLt]
+    cases u
+    · by_cases hSmall : a + 2 * H - b < H
+      · have hP : ¬ (-((H - 1 : Nat) : Int) ≤ (a : Int) - (b : Int) ∧
+            (a : Int) - (b : Int) ≤ ((H - 1 : Nat) : Int)) := by omega
+        rw [ite_eq_left hSmall, decide_eq_false hP]
+        have hNonneg : (0 : Int) ≤ ((a + 2 * H - b : Nat) : Int) := Int.natCast_nonneg _
+        simp [hNonneg]
+      · by_cases hMin : b - a = H
+        · have hP : ¬ (-((H - 1 : Nat) : Int) ≤ (a : Int) - (b : Int) ∧
+              (a : Int) - (b : Int) ≤ ((H - 1 : Nat) : Int)) := by omega
+          have hEq : ((a + 2 * H - b : Nat) : Int) - ((2 * H : Nat) : Int) = -((H : Nat) : Int) := by omega
+          rw [ite_eq_right hSmall, decide_eq_false hP, hEq]
+          simp
+        · have hP : (-((H - 1 : Nat) : Int) ≤ (a : Int) - (b : Int) ∧
+              (a : Int) - (b : Int) ≤ ((H - 1 : Nat) : Int)) := by omega
+          have hEq : ((a + 2 * H - b : Nat) : Int) - ((2 * H : Nat) : Int) = (a : Int) - (b : Int) := by omega
+          have hNeg : ¬ ((0 : Int) ≤ (a : Int) - (b : Int) ∨ (a : Int) - (b : Int) = -((H : Nat) : Int)) := by omega
+          rw [ite_eq_right hSmall, decide_eq_true hP, hEq, ite_eq_right hNeg]
+          simp
+    · have hP : ¬ (0 ≤ (a : Int) - (b : Int) ∧ (a : Int) - (b : Int) ≤ ((H - 1 : Nat) : Int)) := by omega
+      rw [decide_eq_false hP]
+      simp
+  · have hGe : b ≤ a := Nat.le_of_not_lt hLt
+    have hVal : (a + 2 * H - b) % (2 * H) = a - b := by
+      have h1 : a + 2 * H - b = (a - b) + 2 * H := by omega
+      rw [h1, Nat.add_mod_right, Nat.mod_eq_of_lt (by omega)]
+    have hCast : ((a - b : Nat) : Int) = (a : Int) - (b : Int) := by omega
+    rw [hVal, ite_eq_right hLt]
+    by_cases hSmall : a - b < H
+    · have hNotNeg : ¬ (((a - b : Nat) : Int) < 0) := by omega
+      rw [ite_eq_left hSmall, ite_eq_right hNotNeg, hCast]
+      cases u
+      · have hP : (-((H - 1 : Nat) : Int) ≤ (a : Int) - (b : Int) ∧
+            (a : Int) - (b : Int) ≤ ((H - 1 : Nat) : Int)) := by omega
+        rw [decide_eq_true hP]
+      · have hP : (0 ≤ (a : Int) - (b : Int) ∧ (a : Int) - (b : Int) ≤ ((H - 1 : Nat) : Int)) := by omega
+        rw [decide_eq_true hP]
+    · have hIsNeg : ((a - b : Nat) : Int) - ((2 * H : Nat) : Int) < 0 := by omega
+      rw [ite_eq_right hSmall, ite_eq_left hIsNeg]
+      cases u
+      · have hP : ¬ (-((H - 1 : Nat) : Int) ≤ (a : Int) - (b : Int) ∧
+            (a : Int) - (b : Int) ≤ ((H - 1 : Nat) : Int)) := by omega
+        rw [decide_eq_false hP]
+      · have hP : ¬ (0 ≤ (a : Int) - (b : Int) ∧ (a : Int) - (b : Int) ≤ ((H - 1 : Nat) : Int)) := by omega
+        rw [decide_eq_false hP]
+
+/--
+**`LeanMiri` Alignment Theorem (`ptr_offset_from` distance and range checks)**:
+for every pointer width `ptrBytes > 0` and all offsets below
+`2^(8 * ptrBytes)`, the wrapping `usize` subtraction, `isize` reinterpretation,
+and overflow / underflow / `isize::MIN` checks of `Intrinsics.lean:239-249`
+agree with the mathematical-integer range check of the prototype
+(`ptrOffsetFromCheckedDistanceProto`), for both the signed and the unsigned
+intrinsic.
+-/
+theorem miriPtrOffsetFromDistanceSpec_eq_checkedDistanceProto
+    (aOff bOff ptrBytes : Nat) (unsigned : Bool)
+    (hPtr : 0 < ptrBytes)
+    (hA : aOff < scalarModulus ptrBytes) (hB : bOff < scalarModulus ptrBytes) :
+    miriPtrOffsetFromDistanceSpec aOff bOff (scalarModulus ptrBytes) unsigned =
+      ptrOffsetFromCheckedDistanceProto aOff bOff ptrBytes unsigned := by
+  obtain ⟨hM, hH⟩ := scalarModulus_eq_two_mul_half ptrBytes hPtr
+  rw [hM] at hA hB ⊢
+  exact miriPtrOffsetFromDistanceSpec_core aOff bOff (signedHalfModulus ptrBytes) unsigned hH hA hB
+
+
+/--
+The exact-division tail of `evalPtrOffsetFromDistanceProto`: `none` unless
+`elemSize` divides `|distance|`; otherwise the quotient encoded as a `usize`
+(unsigned, or non-negative signed) or as a two's-complement `isize` (negative).
+-/
+@[reducible]
+def ptrOffsetFromExactDivProto (distance : Int) (elemSize ptrBytes : Nat) (unsigned : Bool) :
+    Option ScalarInt :=
+  let mag : Nat := distance.natAbs
+  match Nat.beq (Nat.mod mag elemSize) 0 with
+  | false => .none
+  | true =>
+    let quotMag : Nat := Nat.div mag elemSize
+    match unsigned with
+    | true => .some ⟨quotMag, ptrBytes⟩
+    | false =>
+      match decide (0 ≤ distance) with
+      | true => .some ⟨quotMag, ptrBytes⟩
+      | false => .some ⟨Nat.sub (scalarModulus ptrBytes) quotMag, ptrBytes⟩
+
+/--
+`evalPtrOffsetFromDistanceProto` factors as the ZST check, then the range check
+(`ptrOffsetFromCheckedDistanceProto`), then the exact division
+(`ptrOffsetFromExactDivProto`).
+-/
+theorem evalPtrOffsetFromDistanceProto_eq_checked_then_exactDiv (a b sz n : Nat) (u : Bool) :
+    evalPtrOffsetFromDistanceProto a b sz n u =
+      (match Nat.beq sz 0 with
+       | true => .none
+       | false =>
+         match ptrOffsetFromCheckedDistanceProto a b n u with
+         | .none => .none
+         | .some distance => ptrOffsetFromExactDivProto distance sz n u) := by
+  unfold evalPtrOffsetFromDistanceProto ptrOffsetFromCheckedDistanceProto ptrOffsetFromExactDivProto
+  cases Nat.beq sz 0
+  · dsimp only
+    cases u
+    · dsimp only
+      cases decide (-Int.ofNat (Nat.sub (signedHalfModulus n) 1) ≤ Int.ofNat a - Int.ofNat b ∧
+          Int.ofNat a - Int.ofNat b ≤ Int.ofNat (Nat.sub (signedHalfModulus n) 1)) <;> rfl
+    · dsimp only
+      cases decide (0 ≤ Int.ofNat a - Int.ofNat b ∧
+          Int.ofNat a - Int.ofNat b ≤ Int.ofNat (Nat.sub (signedHalfModulus n) 1)) <;> rfl
+  · rfl
+
+/--
+`LeanMiri` spec mirror of the final exact division of
+`Miri.Interpreter.Intrinsics.pointerOffsetFrom` (`Intrinsics.lean:263-273`,
+`IntegerArithmeticIntrinsic.exactDiv`) at the result layout (`isize` or
+`usize`, both `ptrBytes` wide): division by zero and a non-zero remainder are
+UB (`none`); otherwise the truncated quotient `distance / elemSize` is written
+as a `ptrBytes`-wide two's-complement scalar.
+-/
+def miriPtrOffsetFromExactDivSpec (distance : Int) (elemSize ptrBytes : Nat) : Option ScalarInt :=
+  if elemSize = 0 then none
+  else if distance.tmod (elemSize : Int) ≠ 0 then none
+  else
+    some ⟨((distance.tdiv (elemSize : Int)) % (scalarModulus ptrBytes : Int)).toNat, ptrBytes⟩
+
+/--
+**`LeanMiri` Alignment Theorem (`ptr_offset_from` exact division)**: on every
+in-range distance (non-negative for the unsigned intrinsic) and non-zero
+`elemSize`, the prototype's magnitude-based exact division agrees with the
+truncated signed division and remainder of `Intrinsics.lean:263-273`.
+-/
+theorem ptrOffsetFromExactDivProto_eq_miriSpec
+    (distance : Int) (elemSize ptrBytes : Nat) (unsigned : Bool)
+    (hSz : elemSize ≠ 0)
+    (hPtr : 0 < ptrBytes)
+    (hLo : -((signedHalfModulus ptrBytes - 1 : Nat) : Int) ≤ distance)
+    (hHi : distance ≤ ((signedHalfModulus ptrBytes - 1 : Nat) : Int))
+    (hUnsigned : unsigned = true → 0 ≤ distance) :
+    ptrOffsetFromExactDivProto distance elemSize ptrBytes unsigned =
+      miriPtrOffsetFromExactDivSpec distance elemSize ptrBytes := by
+  obtain ⟨hM, hH⟩ := scalarModulus_eq_two_mul_half ptrBytes hPtr
+  unfold ptrOffsetFromExactDivProto miriPtrOffsetFromExactDivSpec
+  rw [ite_eq_right hSz]
+  dsimp only
+  have hSzPos : 0 < elemSize := Nat.pos_of_ne_zero hSz
+  have hModIff : distance.tmod (elemSize : Int) = 0 ↔ distance.natAbs % elemSize = 0 := by
+    have h := Int.natAbs_tmod distance (elemSize : Int)
+    rw [Int.natAbs_natCast] at h
+    constructor
+    · intro h0; rw [← h, h0]; rfl
+    · intro h0; rw [h0] at h; exact Int.natAbs_eq_zero.mp h
+  by_cases hRem : distance.natAbs % elemSize = 0
+  · have hBeq : Nat.beq (Nat.mod distance.natAbs elemSize) 0 = true := Nat.beq_eq.mpr hRem
+    have hT : ¬ (distance.tmod (elemSize : Int) ≠ 0) := fun h => h (hModIff.mpr hRem)
+    rw [hBeq, ite_eq_right hT]
+    dsimp only
+    have hQLe : distance.natAbs / elemSize ≤ distance.natAbs := Nat.div_le_self _ _
+    rcases Int.natAbs_eq distance with hd | hd
+    · -- distance = ↑k ≥ 0
+      have hNonneg : 0 ≤ distance := by omega
+      have hQ : distance.tdiv (elemSize : Int) = ((distance.natAbs / elemSize : Nat) : Int) := by
+        conv => lhs; rw [hd]
+        exact (Int.ofNat_tdiv _ _).symm
+      have hEmod : ((distance.natAbs / elemSize : Nat) : Int) % (scalarModulus ptrBytes : Int) =
+          ((distance.natAbs / elemSize : Nat) : Int) :=
+        Int.emod_eq_of_lt (Int.natCast_nonneg _) (by omega)
+      rw [hQ, hEmod, Int.toNat_natCast]
+      cases unsigned
+      · rw [decide_eq_true hNonneg]; rfl
+      · rfl
+    · by_cases hZero : distance = 0
+      · subst hZero
+        cases unsigned <;> simp <;> exact Nat.zero_div elemSize
+      · -- distance = -↑k < 0
+        have hNeg : ¬ (0 ≤ distance) := by omega
+        have hU : unsigned = false := by
+          cases unsigned
+          · rfl
+          · exact absurd (hUnsigned rfl) hNeg
+        subst hU
+        have hQ : distance.tdiv (elemSize : Int) = -((distance.natAbs / elemSize : Nat) : Int) := by
+          conv => lhs; rw [hd]
+          rw [Int.neg_tdiv, ← Int.ofNat_tdiv]
+        have hMagPos : 0 < distance.natAbs := by omega
+        have hDvd : elemSize ∣ distance.natAbs := Nat.dvd_of_mod_eq_zero hRem
+        have hQPos : 0 < distance.natAbs / elemSize :=
+          Nat.div_pos (Nat.le_of_dvd hMagPos hDvd) hSzPos
+        have hEmod : (-((distance.natAbs / elemSize : Nat) : Int)) % (scalarModulus ptrBytes : Int) =
+            ((scalarModulus ptrBytes - distance.natAbs / elemSize : Nat) : Int) := by
+          have h1 : (-((distance.natAbs / elemSize : Nat) : Int)) % (scalarModulus ptrBytes : Int) =
+              (-((distance.natAbs / elemSize : Nat) : Int) + (scalarModulus ptrBytes : Int)) %
+                (scalarModulus ptrBytes : Int) := by
+            rw [Int.add_emod_right]
+          rw [h1]
+          have h2 : (-((distance.natAbs / elemSize : Nat) : Int) + (scalarModulus ptrBytes : Int)) =
+              ((scalarModulus ptrBytes - distance.natAbs / elemSize : Nat) : Int) := by omega
+          rw [h2]
+          exact Int.emod_eq_of_lt (Int.natCast_nonneg _) (by omega)
+        rw [hQ, hEmod, Int.toNat_natCast, decide_eq_false hNeg]
+        rfl
+  · have hBeq : Nat.beq (Nat.mod distance.natAbs elemSize) 0 = false := by
+      cases hb : Nat.beq (Nat.mod distance.natAbs elemSize) 0
+      · rfl
+      · exact absurd (Nat.beq_eq.mp hb) hRem
+    have hT : distance.tmod (elemSize : Int) ≠ 0 := fun h => hRem (hModIff.mp h)
+    rw [hBeq, ite_eq_left hT]
+
+
+/--
+A distance accepted by `ptrOffsetFromCheckedDistanceProto` lies in
+`[-isize::MAX, isize::MAX]`, and is non-negative for the unsigned intrinsic.
+-/
+theorem ptrOffsetFromCheckedDistanceProto_some_range (a b n : Nat) (u : Bool) (d : Int)
+    (h : ptrOffsetFromCheckedDistanceProto a b n u = .some d) :
+    -((signedHalfModulus n - 1 : Nat) : Int) ≤ d ∧
+      d ≤ ((signedHalfModulus n - 1 : Nat) : Int) ∧ (u = true → 0 ≤ d) := by
+  unfold ptrOffsetFromCheckedDistanceProto at h
+  cases u
+  · dsimp only at h
+    by_cases hP : (-Int.ofNat (Nat.sub (signedHalfModulus n) 1) ≤ Int.ofNat a - Int.ofNat b ∧
+        Int.ofNat a - Int.ofNat b ≤ Int.ofNat (Nat.sub (signedHalfModulus n) 1))
+    · rw [decide_eq_true hP] at h
+      cases h
+      exact ⟨hP.1, hP.2, fun hU => absurd hU (by decide)⟩
+    · rw [decide_eq_false hP] at h
+      cases h
+  · dsimp only at h
+    by_cases hP : (0 ≤ Int.ofNat a - Int.ofNat b ∧
+        Int.ofNat a - Int.ofNat b ≤ Int.ofNat (Nat.sub (signedHalfModulus n) 1))
+    · rw [decide_eq_true hP] at h
+      cases h
+      refine ⟨?_, hP.2, fun _ => hP.1⟩
+      have h0 := hP.1
+      have hNonneg : (0 : Int) ≤ ((signedHalfModulus n - 1 : Nat) : Int) := Int.natCast_nonneg _
+      omega
+    · rw [decide_eq_false hP] at h
+      cases h
+
+/--
+**`LeanMiri` Alignment Theorem (`ptr_offset_from` / `ptr_offset_from_unsigned`
+arithmetic, `Intrinsics.lean:239-249, 263-273`)**: for every pointer width
+`ptrBytes > 0`, all offsets below `2^(8 * ptrBytes)`, every pointee size
+(including the ZST size `0`), and both intrinsics, the prototype's pure
+distance kernel `evalPtrOffsetFromDistanceProto` returns exactly what the
+`lean-miri` computation returns: `SubWithOverflow` on `usize`, `isize`
+reinterpretation, the overflow / underflow / `isize::MIN` checks, then
+`exactDiv` by the pointee size (division by zero and inexact division are UB).
+-/
+theorem evalPtrOffsetFromDistanceProto_eq_miriSpec
+    (aOff bOff elemSize ptrBytes : Nat) (unsigned : Bool)
+    (hPtr : 0 < ptrBytes)
+    (hA : aOff < scalarModulus ptrBytes) (hB : bOff < scalarModulus ptrBytes) :
+    evalPtrOffsetFromDistanceProto aOff bOff elemSize ptrBytes unsigned =
+      (match miriPtrOffsetFromDistanceSpec aOff bOff (scalarModulus ptrBytes) unsigned with
+       | .none => .none
+       | .some distance => miriPtrOffsetFromExactDivSpec distance elemSize ptrBytes) := by
+  rw [evalPtrOffsetFromDistanceProto_eq_checked_then_exactDiv,
+    miriPtrOffsetFromDistanceSpec_eq_checkedDistanceProto aOff bOff ptrBytes unsigned hPtr hA hB]
+  cases hZ : Nat.beq elemSize 0
+  · have hSz : elemSize ≠ 0 := fun h0 => by rw [h0] at hZ; cases hZ
+    dsimp only
+    cases hC : ptrOffsetFromCheckedDistanceProto aOff bOff ptrBytes unsigned with
+    | none => rfl
+    | some distance =>
+      obtain ⟨hLo, hHi, hU⟩ :=
+        ptrOffsetFromCheckedDistanceProto_some_range aOff bOff ptrBytes unsigned distance hC
+      exact ptrOffsetFromExactDivProto_eq_miriSpec distance elemSize ptrBytes unsigned hSz hPtr hLo hHi hU
+  · have hSz : elemSize = 0 := Nat.beq_eq.mp hZ
+    dsimp only
+    cases hC : ptrOffsetFromCheckedDistanceProto aOff bOff ptrBytes unsigned with
+    | none => rfl
+    | some distance =>
+      unfold miriPtrOffsetFromExactDivSpec
+      dsimp only
+      rw [ite_eq_left hSz]
+
+/-- `abstractByteEqProto` is reflexive. -/
+theorem abstractByteEqProto_refl (b : AbstractByte) : abstractByteEqProto b b = true := by
+  cases b with
+  | uninit => rfl
+  | init v prov =>
+    have h : Nat.beq v.toBitVec.toNat v.toBitVec.toNat = true := Nat.beq_refl _
+    cases prov with
+    | none =>
+      change (match Nat.beq v.toBitVec.toNat v.toBitVec.toNat with
+        | false => false
+        | true => true) = true
+      rw [h]
+    | some p =>
+      obtain ⟨aId, aTag⟩ := p
+      change (match Nat.beq v.toBitVec.toNat v.toBitVec.toNat with
+        | false => false
+        | true => Bool.and (Nat.beq aId aId) (Nat.beq aTag aTag)) = true
+      rw [h, Nat.beq_refl, Nat.beq_refl]
+      rfl
+
+/--
+**Round-trip guard completeness on exact images**: every byte list refines
+itself, so `commitRootAbstractBytesProto` never rejects a decoded value whose
+exact re-encoding equals the bytes written.
+-/
+theorem abstractBytesRefineProto_refl :
+    ∀ bs : List AbstractByte, abstractBytesRefineProto bs bs = true
+  | [] => rfl
+  | .uninit :: rest => by
+    change abstractBytesRefineProto rest rest = true
+    exact abstractBytesRefineProto_refl rest
+  | .init v p :: rest => by
+    change (match abstractByteEqProto (.init v p) (.init v p) with
+      | true => abstractBytesRefineProto rest rest
+      | false => false) = true
+    rw [abstractByteEqProto_refl]
+    exact abstractBytesRefineProto_refl rest
+
+/--
+**`ptr_offset_from` Same-Address Theorem (offset resolution)**: in EVERY machine
+state, for EVERY tracked pointer `p` (live, dead, dangling, out of bounds, or
+of unknown provenance), comparing `p` with itself resolves to a pair of equal
+offsets, never to `.ub` or `.unsupported`. This is the "point to the same
+address" clause of the pinned `offset_from` contract and the distance-`0`
+`checkSignedAccess` no-op of `Intrinsics.lean:250-262`.
+-/
+theorem resolvePtrOffsetFromOffsetsProto_same_pointer
+    (s : MachineState) (locals : List LocalSlot) (decls : List LocalDecl) (layouts : LayoutTable)
+    (p : ProvenancePtr) :
+    ∃ off, resolvePtrOffsetFromOffsetsProto s locals decls layouts (.prov p) (.prov p) =
+      .ok (off, off) := by
+  unfold resolvePtrOffsetFromOffsetsProto normalizePtrArgProto
+  dsimp only
+  cases isUnbackedZeroProvProto s.memory p
+  · dsimp only
+    rw [Nat.beq_refl, Nat.beq_refl]
+    exact ⟨0, rfl⟩
+  · dsimp only
+    rw [Nat.beq_refl]
+    exact ⟨_, rfl⟩
+
+/--
+**`ptr_offset_from` Same-Address Theorem (distance kernel)**: equal offsets with
+a non-ZST pointee always yield element distance `0`, for both the signed and
+the unsigned intrinsic and every pointer width.
+-/
+theorem evalPtrOffsetFromDistanceProto_same_offset (off elemSize ptrBytes : Nat) (unsigned : Bool)
+    (hSz : elemSize ≠ 0) :
+    evalPtrOffsetFromDistanceProto off off elemSize ptrBytes unsigned = .some ⟨0, ptrBytes⟩ := by
+  have hZ : Nat.beq elemSize 0 = false := by
+    cases hb : Nat.beq elemSize 0
+    · rfl
+    · exact absurd (Nat.beq_eq.mp hb) hSz
+  have hNonneg : (0 : Int) ≤ Int.ofNat (Nat.sub (signedHalfModulus ptrBytes) 1) := Int.natCast_nonneg _
+  have hC : ptrOffsetFromCheckedDistanceProto off off ptrBytes unsigned = .some 0 := by
+    unfold ptrOffsetFromCheckedDistanceProto
+    dsimp only
+    rw [Int.sub_self]
+    cases unsigned
+    · have hP : (-Int.ofNat (Nat.sub (signedHalfModulus ptrBytes) 1) ≤ 0 ∧
+          (0 : Int) ≤ Int.ofNat (Nat.sub (signedHalfModulus ptrBytes) 1)) := ⟨by omega, hNonneg⟩
+      rw [decide_eq_true hP]
+    · have hP : ((0 : Int) ≤ 0 ∧ (0 : Int) ≤ Int.ofNat (Nat.sub (signedHalfModulus ptrBytes) 1)) :=
+        ⟨Int.le_refl 0, hNonneg⟩
+      rw [decide_eq_true hP]
+  rw [evalPtrOffsetFromDistanceProto_eq_checked_then_exactDiv, hZ]
+  dsimp only
+  rw [hC]
+  dsimp only
+  have hMod : Nat.beq (Nat.mod (Int.natAbs 0) elemSize) 0 = true := by
+    change Nat.beq (0 % elemSize) 0 = true
+    rw [Nat.zero_mod]
+    rfl
+  have hDiv : Nat.div (Int.natAbs 0) elemSize = 0 := Nat.zero_div elemSize
+  unfold ptrOffsetFromExactDivProto
+  dsimp only
+  rw [hMod]
+  dsimp only
+  rw [hDiv]
+  cases unsigned <;> rfl
 
 /--
 **`black_box` Preservation Theorem**:
