@@ -169,6 +169,53 @@ theorem matchesOn_sound [DecidableEq V]
   intro k hk
   exact of_decide_eq_true (List.all_eq_true.mp h k hk)
 
+/-- Boolean check that `A.denote` never assigns the same observation to two
+distinct verdicts (non-shadowing / injectivity on observations). -/
+def denoteConsistent [DecidableEq V] (A : ObsAuthority Key V) : Bool :=
+  A.denote.all fun d₁ =>
+    A.denote.all fun d₂ =>
+      !(@decide (d₁.2 = d₂.2) (A.decEq d₁.2 d₂.2)) || decide (d₁.1 = d₂.1)
+
+/-- If some element of `l` satisfies `p`, `l.find? p` returns an element of
+`l` satisfying `p`. -/
+theorem find?_of_mem_pred {α : Type} (p : α → Bool) :
+    ∀ {l : List α} {x : α}, x ∈ l → p x = true →
+      ∃ y, l.find? p = some y ∧ y ∈ l ∧ p y = true
+  | [], _, h, _ => by cases h
+  | a :: as, x, h, hp => by
+    unfold List.find?
+    cases ha : p a with
+    | true => exact ⟨a, rfl, List.mem_cons_self .., ha⟩
+    | false =>
+      cases h with
+      | head => rw [ha] at hp; cases hp
+      | tail _ hmem =>
+        obtain ⟨y, hy, hyl, hyp⟩ := find?_of_mem_pred p hmem hp
+        exact ⟨y, hy, List.mem_cons_of_mem _ hyl, hyp⟩
+
+/-- Consistency of `denote` certifies exact round-tripping: every `(v, o)`
+in `A.denote` decodes back to `some v` with no shadowing by an earlier
+entry. -/
+theorem denoteConsistent_sound [DecidableEq V] (A : ObsAuthority Key V)
+    (h : A.denoteConsistent = true) {v : Verdict V} {o : A.Obs}
+    (hm : (v, o) ∈ A.denote) : A.decode o = some v := by
+  let p : Verdict V × A.Obs → Bool :=
+    fun d => @decide (d.2 = o) (A.decEq d.2 o)
+  have hpo : p (v, o) = true :=
+    @decide_eq_true (o = o) (A.decEq o o) rfl
+  obtain ⟨y, hy, hyl, hyp⟩ := find?_of_mem_pred p hm hpo
+  have hyo : y.2 = o := @of_decide_eq_true (y.2 = o) (A.decEq y.2 o) hyp
+  have hall₁ := List.all_eq_true.mp h y hyl
+  have hall₂ := List.all_eq_true.mp hall₁ (v, o) hm
+  have hdec : @decide (y.2 = o) (A.decEq y.2 o) = true :=
+    @decide_eq_true (y.2 = o) (A.decEq y.2 o) hyo
+  rw [hdec] at hall₂
+  have hyv : y.1 = v := of_decide_eq_true hall₂
+  unfold decode
+  change (A.denote.find? p).map (fun d => d.1) = some v
+  rw [hy]
+  exact congrArg some hyv
+
 end ObsAuthority
 
 /-- Pair the value of an interpreter step result with an observation of
@@ -874,6 +921,9 @@ inductive Prog : Type where
   | disabledDeref
   /-- Non-dereferencing `ptr::metadata` on a disabled wide pointer. -/
   | disabledMetadata
+  /-- LeanMiri multi-step `from_raw_parts` / `ptr::metadata` / `to_raw_parts`
+  / `size_of_val` pipeline (`CastKind.ptrToPtr` + `AggregateKind.rawPtr`). -/
+  | pipeline
   deriving DecidableEq
 
 /-- Corpus queries: the wide pointer's length and the index operand. -/
@@ -911,7 +961,7 @@ def allMrModes : List (MrMem × Regime) :=
 /-- All programs. -/
 def allProgs : List Prog :=
   [.metadata, .placeLen, .indexRead, .reborrow, .sizeOfVal, .roundTrip,
-    .indexOob, .disabledDeref, .disabledMetadata]
+    .indexOob, .disabledDeref, .disabledMetadata, .pipeline]
 
 /-- All queries. -/
 def allQueries : List Query := [.inBounds, .oobIndex, .oobLen, .tooBig]
@@ -1063,6 +1113,63 @@ def sizeOfValBody : CapturedMir :=
     layouts := emptyLayoutTable
     allocations := [] }
 
+/-- `*const u32`. -/
+def rawU32Ty : Ty := { kind := .rawPtr .not (.uint .u32), layoutIdx := 0 }
+
+/-- Multi-step `from_raw_parts` → `ptr::metadata` → `to_raw_parts`
+(`CastKind.ptrToPtr`) → `from_raw_parts` → `size_of_val<[u32]>` → `Return`
+pipeline body, locked in the cross-root bridge to
+`LeanMiriSpec.Correspondence.WideSliceWitnesses.wideSlicePipelineBody`. -/
+def pipelineBody : CapturedMir :=
+  { defPath := "wide_slice_pipeline"
+    phase := .runtimePostCleanup
+    role := .subject
+    argCount := 0
+    localDecls :=
+      [ { mutability := .mut, ty := usizeTy, debugName := none }
+      , { mutability := .mut, ty := rawSliceU32Ty, debugName := none }
+      , { mutability := .not, ty := rawU32Ty, debugName := none }
+      , { mutability := .not, ty := usizeTy, debugName := none }
+      , { mutability := .mut, ty := usizeTy, debugName := none }
+      , { mutability := .mut, ty := rawU32Ty, debugName := none }
+      , { mutability := .mut, ty := rawSliceU32Ty, debugName := none } ]
+    basicBlocks :=
+      [ { statements :=
+            [ ⟨.assign ⟨1, []⟩ (.aggregate (.rawPtr sliceU32PointeeTy .not)
+                [.copy ⟨2, []⟩, .copy ⟨3, []⟩]), "s0"⟩
+            , ⟨.assign ⟨4, []⟩ (.unaryOp .ptrMetadata (.copy ⟨1, []⟩)), "s1"⟩
+            , ⟨.assign ⟨5, []⟩ (.cast .ptrToPtr (.copy ⟨1, []⟩) rawU32Ty),
+                "s2"⟩
+            , ⟨.assign ⟨6, []⟩ (.aggregate (.rawPtr sliceU32PointeeTy .not)
+                [.copy ⟨5, []⟩, .copy ⟨4, []⟩]), "s3"⟩ ]
+          terminator :=
+            ⟨.call
+              (.constant
+                { ty :=
+                    { kind :=
+                        .fnDef "core::intrinsics::size_of_val"
+                          [sliceU32PointeeTy.kind]
+                      layoutIdx := 0 }
+                  val := .zeroSized })
+              [.copy ⟨6, []⟩] ⟨0, []⟩ (some 1) .unreachable, "t0"⟩
+          isCleanup := false }
+      , { statements := []
+          terminator := ⟨.return_, "t1"⟩
+          isCleanup := false } ]
+    fnAbi := fnAbiOf 8
+    layouts := emptyLayoutTable
+    allocations := [] }
+
+/-- Initial state of `pipelineBody` with `_2 = ptr(1, 0)` and `_3 = 3`. -/
+def pipelineInit : MachineState :=
+  { frame :=
+      { blockIdx := 0
+        stmtIdx := 0
+        locals :=
+          [ .uninit, .uninit, .init (.ptr { allocId := 1, offsetBytes := 0 } 8)
+          , .init (.scalar ⟨3, 8⟩), .uninit, .uninit, .uninit ] }
+    memory := emptyMemory }
+
 /-- Initial state of `sizeOfValBody`. -/
 def sizeOfValInit (len : Nat) : MachineState :=
   { frame :=
@@ -1135,6 +1242,7 @@ def annealVerdict (r : Regime) (p : Prog) (q : Query) (_c : Unit) :
   | .disabledMetadata =>
     runVerdict wideSliceMetadataAfterParentWriteMir 30
       wideSliceMetadataAfterParentWriteS0
+  | .pipeline => runVerdict pipelineBody 10 pipelineInit
 
 /-! ### B.3 MiniRust: `MiniRustSpec` on the corpus -/
 
@@ -1385,20 +1493,22 @@ def lmReference (r : Regime) (p : Prog) (q : Query) (_c : Unit) :
   | .reborrow, .safe, _ => some .undefinedBehavior
   | .sizeOfVal, _, .tooBig => some .undefinedBehavior
   | .sizeOfVal, _, q => some (.returns (q.len * 4))
+  | .pipeline, .raw, .inBounds => some (.returns 12)
   | _, _, _ => none
 
 /-- LeanMiri fragment of the corpus. Excluded keys are the documented
 divergences `DIV-LM-PLACE-LEN-BORROW-BOUNDS` and
 `DIV-LM-RAW-SLICE-PARTIAL-OOB-LEN-INDEX` (Anneal checks the whole slice
-against its backing array before `Len` and indexing), and the machine
-programs that have no LeanMiri fixture. -/
-def gateLM (_r : Regime) (p : Prog) (q : Query) : Bool :=
+against its backing array before `Len` and indexing), and the MiniRust-only
+whole-program fixtures. -/
+def gateLM (r : Regime) (p : Prog) (q : Query) : Bool :=
   match p with
   | .metadata => true
   | .reborrow => true
   | .sizeOfVal => true
   | .placeLen => decide (q = .inBounds ∨ q = .oobIndex)
   | .indexRead => decide (q = .inBounds ∨ q = .oobIndex)
+  | .pipeline => decide (r = .raw ∧ q = .inBounds)
   | _ => false
 
 /-! ### B.5 Model, sides, and certificates -/
@@ -1479,12 +1589,14 @@ def bundle :
 
 /-! ### B.6 Presenting the LeanMiri authority by its own observations -/
 
-/-- LeanMiri corpus keys: every regime, LeanMiri program, and query
-(including the keys excluded from `gateLM`). -/
+/-- LeanMiri corpus keys: every regime, single-step LeanMiri program, and
+query (including keys excluded from `gateLM`), plus the multi-step
+`from_raw_parts`/`to_raw_parts` pipeline. -/
 def lmKeys : List (Regime × Prog × Query × Unit) :=
-  allRegimes.flatMap fun r =>
+  (allRegimes.flatMap fun r =>
     [Prog.metadata, .placeLen, .indexRead, .reborrow, .sizeOfVal].flatMap
-      fun p => allQueries.map fun q => (r, p, q, ())
+      fun p => allQueries.map fun q => (r, p, q, ())) ++
+  [(.raw, .pipeline, .inBounds, ())]
 
 /-- `lmReference` on a key. -/
 def lmReferenceAt (k : Regime × Prog × Query × Unit) :
@@ -1538,11 +1650,13 @@ def lmReturnDenotations : List (Nat × RetClass) :=
 /-- The LeanMiri authority assembled from interpreter-typed observation
 functions: `frameObs body retTy len idx` is one interpreter step of a frame
 program observing `_0`, `sizeObs body len` is one step of `size_of_val`,
+`pipelineObs` is the 5-step `from_raw_parts` / `ptr::metadata` /
+`to_raw_parts` / `size_of_val` pipeline observation of `_0`,
 `retUsize` / `retU32` / `retWide` embed an expected result as a `usize`,
 `u32`, or wide-pointer local, and `ubObs` embeds a diagnostic. -/
 def authorityOf (Obs : Type) (decEq : DecidableEq Obs)
     (frameObs : CapturedMir → Ty → Nat → Nat → Obs)
-    (sizeObs : CapturedMir → Nat → Obs)
+    (sizeObs : CapturedMir → Nat → Obs) (pipelineObs : Obs)
     (retUsize retU32 retWide : Nat → Obs) (ubObs : String → Obs) :
     ObsAuthority (Regime × Prog × Query × Unit) Nat where
   Obs := Obs
@@ -1553,6 +1667,10 @@ def authorityOf (Obs : Type) (decEq : DecidableEq Obs)
     | .metadata | .placeLen | .indexRead | .reborrow =>
       some (frameObs (lmBody k.1 k.2.1) (lmRetTy k.1 k.2.1) k.2.2.1.len
         k.2.2.1.idx)
+    | .pipeline =>
+      match k.1, k.2.2.1 with
+      | .raw, .inBounds => some pipelineObs
+      | _, _ => none
     | _ => none
   denote :=
     (lmReturnDenotations.map fun d =>
@@ -2227,6 +2345,44 @@ theorem lmSizeOfVal_wellFormed_with
    (lmSizeOfValPositive_with verdictLM h).wellFormedRef
     (bundleWith verdictLM h).lmSim⟩
 
+/-- Multi-step `from_raw_parts` / `ptr::metadata` / `to_raw_parts` /
+`size_of_val` pipeline: a third positive witness on the LeanMiri side,
+returning `12` in lockstep across Anneal and vendored `Miri`. -/
+def lmPipelinePositive_with
+    (h : (sideLM verdictLM).check model = true) :
+    PositiveWitness ((sideLM verdictLM).rel model) :=
+  (sideLM verdictLM).positiveAt model (sideLM_sim_with verdictLM h) .raw
+    .pipeline .inBounds () rfl
+    (show isReturn (annealVerdict .raw .pipeline .inBounds ()) = true by
+      decide +kernel)
+    (show ([()].all fun c' =>
+        !isFaultV (annealVerdict .raw .pipeline .inBounds c')) = true by
+      decide +kernel)
+
+/-- The multi-step pipeline is well-formed in the LeanMiri authority and
+returns `12`. -/
+theorem lmPipeline_wellFormed_with
+    (h : (sideLM verdictLM).check model = true) :
+    ((sideLM verdictLM).rel model).WellFormedRef .raw .pipeline .inBounds ∧
+      verdictLM .raw .pipeline .inBounds () = some (.returns 12) := by
+  refine ⟨(lmPipelinePositive_with verdictLM h).wellFormedRef
+      (bundleWith verdictLM h).lmSim, ?_⟩
+  have hcp := (sideLM verdictLM).simCheck_spec model
+    (sideLM_sim_with verdictLM h) .raw .pipeline .inBounds () rfl
+  obtain ⟨oa, orr, ha, hr, hc⟩ := couplesB_sound hcp
+  have ha12 : outcome? (annealVerdict .raw .pipeline .inBounds ()) =
+      some (.normal 12) :=
+    congrArg outcome?
+      (by decide +kernel :
+        annealVerdict .raw .pipeline .inBounds () = some (.returns 12))
+  have hoa : oa = .normal 12 := Option.some.inj (ha.symm.trans ha12)
+  subst hoa
+  obtain ⟨r, horr, hrep⟩ := hc.normal_anneal_to_ref 12 rfl
+  subst horr
+  have h12 : r = 12 := halvesCodec.encode_injective hrep
+  subst h12
+  exact outcome?_injective hr
+
 end Derived
 
 /-- Tree Borrows `Disabled` dereference: a fault-equivalence witness on
@@ -2417,6 +2573,7 @@ inductive Class : Type where
   | infinite
   /-- NaN with fraction `payload`. -/
   | nan (payload : Nat)
+  deriving DecidableEq
 
 /-- Decoded float: sign and class. -/
 structure Decoded : Type where
@@ -2424,6 +2581,7 @@ structure Decoded : Type where
   negative : Bool
   /-- Class. -/
   value : Class
+  deriving DecidableEq
 
 /-- Scale `n / d` by `2 ^ e`. -/
 def powScale (n d : Nat) (e : Int) : Nat × Nat :=
@@ -4233,10 +4391,14 @@ structure Engine : Type 1 where
   bits : B → Nat
   /-- Preferred NaN of a format. -/
   preferredNaN : F → B
+  /-- Decode a bit pattern (rejecting out-of-width encodings with `none`). -/
+  decode : B → Option Ref.Decoded
   /-- Float-to-float conversion. -/
   convert : B → F → Except E B
   /-- NaN candidates for a result format, inputs, and NaN mode. -/
   nanChoices : F → List B → Bool → Except E (List B)
+  /-- NaN adjustment under `floatNondeterministic` flag and oracle pick. -/
+  adjustNaN : Bool → Nat → B → List B → Option B
   /-- Saturating float-to-integer conversion. -/
   toInteger : B → Nat → Bool → Except E Int
   /-- Integer-to-float conversion. -/
@@ -4251,6 +4413,10 @@ def fmt : Ref.Fmt → G.F
   | .binary32 => G.f32
   | .binary64 => G.f64
 
+/-- Decoding on raw bits. -/
+def dec (src : Ref.Fmt) (b : Nat) : Option Ref.Decoded :=
+  G.decode (G.ofBits (G.fmt src) b)
+
 /-- Conversion on raw bits. -/
 def conv (src dst : Ref.Fmt) (b : Nat) : Option Nat :=
   (G.convert (G.ofBits (G.fmt src) b) (G.fmt dst)).toOption.map G.bits
@@ -4261,6 +4427,17 @@ def choices (src dst : Ref.Fmt) (b : Nat) (flag : Bool) :
   (G.nanChoices (G.fmt dst) [G.ofBits (G.fmt src) b] flag).toOption.map
     (List.map G.bits)
 
+/-- NaN adjustment on raw bits, for one input after conversion. -/
+def adj (flag : Bool) (pick : Nat) (src dst : Ref.Fmt) (valBits inpBits : Nat) :
+    Option Nat :=
+  (G.adjustNaN flag pick (G.ofBits (G.fmt dst) valBits)
+    [G.ofBits (G.fmt src) inpBits]).map G.bits
+
+/-- Converted bit pattern of `src → dst` (falling back to `0` only if
+conversion fails). -/
+def refConvBits (src dst : Ref.Fmt) (b : Nat) : Nat :=
+  (Ref.convert src dst b).getD 0
+
 /-- Saturating float-to-integer conversion on raw bits. -/
 def toInt (src : Ref.Fmt) (b w : Nat) (signed : Bool) : Option Int :=
   (G.toInteger (G.ofBits (G.fmt src) b) w signed).toOption
@@ -4269,10 +4446,21 @@ def toInt (src : Ref.Fmt) (b w : Nat) (signed : Bool) : Option Int :=
 def fromInt (dst : Ref.Fmt) (v : Int) : Option Nat :=
   (G.fromInteger (G.fmt dst) v).toOption.map G.bits
 
-/-- Agreement with `Ref` on the corpus input `q`: conversions in both
-directions, NaN candidates in both directions and both modes, saturating
-conversions to `i32` and `u64`, and conversions from `i32`. -/
+/-- Agreement of `adjustNaN` with `Ref.adjustNaN` across all oracle picks
+on `src → dst` for one input and NaN mode. -/
+def adjAgrees (flag : Bool) (src dst : Ref.Fmt) (b : Nat) : Bool :=
+  let v := refConvBits src dst b
+  allPicks.all fun c =>
+    decide (G.adj flag c.toNat src dst v b =
+      Ref.adjustNaN flag c.toNat dst v [(src, b)])
+
+/-- Agreement with `Ref` on the corpus input `q`: decoding, conversions in
+both directions, NaN candidates and `adjustNaN` in both directions, both
+modes, and all picks, saturating `toInteger` (`i32` and `u64`), and
+`fromInteger` (`i32 → f32` and `i32 → f64`). -/
 def agreesAt (q : Query) : Bool :=
+  decide (G.dec .binary32 q.bits32 = Ref.decode .binary32 q.bits32) &&
+  decide (G.dec .binary64 q.bits64 = Ref.decode .binary64 q.bits64) &&
   decide (G.conv .binary32 .binary64 q.bits32 =
     Ref.convert .binary32 .binary64 q.bits32) &&
   decide (G.conv .binary64 .binary32 q.bits64 =
@@ -4285,6 +4473,10 @@ def agreesAt (q : Query) : Bool :=
     Ref.nanChoices .binary32 [(.binary64, q.bits64)] true) &&
   decide (G.choices .binary64 .binary32 q.bits64 false =
     Ref.nanChoices .binary32 [(.binary64, q.bits64)] false) &&
+  G.adjAgrees true .binary32 .binary64 q.bits32 &&
+  G.adjAgrees false .binary32 .binary64 q.bits32 &&
+  G.adjAgrees true .binary64 .binary32 q.bits64 &&
+  G.adjAgrees false .binary64 .binary32 q.bits64 &&
   decide (G.toInt .binary32 q.bits32 32 true =
     Ref.toInteger .binary32 q.bits32 32 true) &&
   decide (G.toInt .binary64 q.bits64 64 false =
@@ -4294,19 +4486,27 @@ def agreesAt (q : Query) : Bool :=
   decide (G.fromInt .binary64 (signedOfBits 32 q.bits32) =
     Ref.fromInteger .binary64 (signedOfBits 32 q.bits32))
 
-/-- Agreement with `Ref` on every corpus input, and on the preferred NaNs
-of both formats. -/
+/-- Agreement with `Ref` on every corpus input, on both preferred NaNs, and
+on out-of-width decode rejection (`2^32` for `f32`, `2^64` for `f64`). -/
 def agrees : Bool :=
   decide (G.bits (G.preferredNaN G.f32) = Ref.preferredNaN .binary32) &&
   decide (G.bits (G.preferredNaN G.f64) = Ref.preferredNaN .binary64) &&
+  decide (G.dec .binary32 (2 ^ 32) = none) &&
+  decide (G.dec .binary64 (2 ^ 64) = none) &&
   allQueries.all G.agreesAt
 
-/-- `agrees` certifies the preferred NaNs and the NaN candidates of every
-corpus input in both directions and both modes. -/
+/-- `agrees` certifies every primitive checked by `agreesAt` and `agrees`
+(preferred NaNs, out-of-width decode rejection, `decode`, `convert`,
+`nanChoices`, `adjustNaN` across all picks, `toInteger`, and
+`fromInteger`), discarding none. -/
 theorem agrees_sound (h : G.agrees = true) :
     G.bits (G.preferredNaN G.f32) = Ref.preferredNaN .binary32 ∧
     G.bits (G.preferredNaN G.f64) = Ref.preferredNaN .binary64 ∧
-    ∀ (q : Query) (flag : Bool),
+    G.dec .binary32 (2 ^ 32) = none ∧
+    G.dec .binary64 (2 ^ 64) = none ∧
+    ∀ (q : Query) (flag : Bool) (c : Pick),
+      G.dec .binary32 q.bits32 = Ref.decode .binary32 q.bits32 ∧
+      G.dec .binary64 q.bits64 = Ref.decode .binary64 q.bits64 ∧
       G.conv .binary32 .binary64 q.bits32 =
         Ref.convert .binary32 .binary64 q.bits32 ∧
       G.conv .binary64 .binary32 q.bits64 =
@@ -4314,16 +4514,42 @@ theorem agrees_sound (h : G.agrees = true) :
       G.choices .binary32 .binary64 q.bits32 flag =
         Ref.nanChoices .binary64 [(.binary32, q.bits32)] flag ∧
       G.choices .binary64 .binary32 q.bits64 flag =
-        Ref.nanChoices .binary32 [(.binary64, q.bits64)] flag := by
+        Ref.nanChoices .binary32 [(.binary64, q.bits64)] flag ∧
+      G.adj flag c.toNat .binary32 .binary64
+          (refConvBits .binary32 .binary64 q.bits32) q.bits32 =
+        Ref.adjustNaN flag c.toNat .binary64
+          (refConvBits .binary32 .binary64 q.bits32)
+          [(.binary32, q.bits32)] ∧
+      G.adj flag c.toNat .binary64 .binary32
+          (refConvBits .binary64 .binary32 q.bits64) q.bits64 =
+        Ref.adjustNaN flag c.toNat .binary32
+          (refConvBits .binary64 .binary32 q.bits64)
+          [(.binary64, q.bits64)] ∧
+      G.toInt .binary32 q.bits32 32 true =
+        Ref.toInteger .binary32 q.bits32 32 true ∧
+      G.toInt .binary64 q.bits64 64 false =
+        Ref.toInteger .binary64 q.bits64 64 false ∧
+      G.fromInt .binary32 (signedOfBits 32 q.bits32) =
+        Ref.fromInteger .binary32 (signedOfBits 32 q.bits32) ∧
+      G.fromInt .binary64 (signedOfBits 32 q.bits32) =
+        Ref.fromInteger .binary64 (signedOfBits 32 q.bits32) := by
   simp only [agrees, Bool.and_eq_true, decide_eq_true_eq] at h
-  obtain ⟨⟨h32, h64⟩, hall⟩ := h
-  refine ⟨h32, h64, fun q flag => ?_⟩
+  obtain ⟨⟨⟨⟨h32, h64⟩, ho32⟩, ho64⟩, hall⟩ := h
+  refine ⟨h32, h64, ho32, ho64, fun q flag c => ?_⟩
   have hq := List.all_eq_true.mp hall q (by cases q <;> decide)
   simp only [agreesAt, Bool.and_eq_true, decide_eq_true_eq] at hq
-  obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨hc1, hc2⟩, ht1⟩, hf1⟩, ht2⟩, hf2⟩, _⟩, _⟩, _⟩, _⟩ := hq
+  obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨hd32, hd64⟩, hc1⟩, hc2⟩, ht1⟩, hf1⟩, ht2⟩, hf2⟩,
+    hat1⟩, haf1⟩, hat2⟩, haf2⟩, hti1⟩, hti2⟩, hfi1⟩, hfi2⟩ := hq
+  have hcMem : c ∈ allPicks := by cases c <;> decide
   cases flag
-  · exact ⟨hc1, hc2, hf1, hf2⟩
-  · exact ⟨hc1, hc2, ht1, ht2⟩
+  · exact ⟨hd32, hd64, hc1, hc2, hf1, hf2,
+      of_decide_eq_true (List.all_eq_true.mp haf1 c hcMem),
+      of_decide_eq_true (List.all_eq_true.mp haf2 c hcMem),
+      hti1, hti2, hfi1, hfi2⟩
+  · exact ⟨hd32, hd64, hc1, hc2, ht1, ht2,
+      of_decide_eq_true (List.all_eq_true.mp hat1 c hcMem),
+      of_decide_eq_true (List.all_eq_true.mp hat2 c hcMem),
+      hti1, hti2, hfi1, hfi2⟩
 
 end Engine
 
@@ -4338,6 +4564,7 @@ def refEngine : Engine where
   ofBits := fun f b => (f, b)
   bits := fun p => p.2
   preferredNaN := fun f => (f, Ref.preferredNaN f)
+  decode := fun p => Ref.decode p.1 p.2
   convert := fun p dst =>
     match Ref.convert p.1 dst p.2 with
     | some b => .ok (dst, b)
@@ -4346,6 +4573,8 @@ def refEngine : Engine where
     match Ref.nanChoices f inputs flag with
     | some l => .ok (l.map fun b => (f, b))
     | none => .error ()
+  adjustNaN := fun flag pick v inputs =>
+    (Ref.adjustNaN flag pick v.1 v.2 inputs).map fun b => (v.1, b)
   toInteger := fun p w signed =>
     match Ref.toInteger p.1 p.2 w signed with
     | some i => .ok i
@@ -11025,8 +11254,9 @@ run_cmd do
         `lmModeWitness_isFaultFlip_with, `faultFlipComp_modeSensitive_with,
         `lm_not_mode_invariant_with, `modeSensitive_with,
         `lmFlip_guard_with, `lmIndexOob_not_wellFormed_with,
-        `lmSizeOfVal_wellFormed_with, `detBundle_spec_with,
-        `detBundle_productiveAnneal_with, `detBundle_exact_with]
+        `lmSizeOfVal_wellFormed_with, `lmPipeline_wellFormed_with,
+        `detBundle_spec_with, `detBundle_productiveAnneal_with,
+        `detBundle_exact_with]
     let wsDefs : Array Name :=
       #[`bundleWith, `detBundleWith, `faultFlipComp_with,
         `faultFlipTrans_with, `mixedComp_with]
@@ -11046,7 +11276,10 @@ run_cmd do
     let mut roots : Array Name :=
       #[ns ++ `WideSlice.authorityOf, ns ++ `WideSlice.checkOf,
         ns ++ `WideSlice.matchesReference_sound, ns ++ `Corpus.pairObs,
+        ns ++ `Corpus.ObsAuthority.denoteConsistent,
+        ns ++ `Corpus.ObsAuthority.denoteConsistent_sound,
         ns ++ `WideSlice.frameInit, ns ++ `WideSlice.sizeOfValInit,
+        ns ++ `WideSlice.pipelineBody, ns ++ `WideSlice.pipelineInit,
         ns ++ `FloatCast.authorityOf, ns ++ `FloatCast.checkOf,
         ns ++ `FloatCast.matchesReference_sound,
         ns ++ `FloatCast.empty_schedule_is_vacuous,
@@ -11151,8 +11384,8 @@ run_cmd do
     let tyTy := mkConst ``Trusted.Rustc.V2026_06_01.MirAst.Ty
     let natTy := mkConst ``Nat
     let stateTy := mkConst (lm ++ `AnnealStepState)
-    let (wsAuth, wsFrameObs, wsSizeObs, wsRetU32, wsRetWide, wsUbObs) ←
-        MetaM.run' do
+    let (wsAuth, wsFrameObs, wsSizeObs, wsPipelineObs, wsRetU32, wsRetWide,
+        wsUbObs) ← MetaM.run' do
       let u64 (e : Expr) : MetaM Expr := mkAppM ``UInt64.ofNat #[e]
       let hooksOf (b : Expr) : MetaM Expr := do
         mkAppM (lm ++ `annealStepHooksWideSlice)
@@ -11189,6 +11422,10 @@ run_cmd do
           let r ← mkAppM (mi ++ `Step.step)
             #[← hooksOf b, mkConst ``Unit.unit, init]
           mkLambdaFVars #[b, len] (← observe r)
+      let pipeStep ← mkAppM (mi ++ `Step.step)
+        #[mkConst (lw ++ `wideSlicePipelineHooks), mkConst ``Unit.unit,
+          mkConst (lw ++ `wideSlicePipelineMiri4)]
+      let pipelineObs ← observe pipeStep
       let okWith (f : Expr → MetaM Expr) : MetaM Expr :=
         withLocalDeclD `n natTy fun n => do
           let pair ← mkAppM ``Prod.mk #[mkConst ``Bool.true, ← f n]
@@ -11204,8 +11441,9 @@ run_cmd do
         mkLambdaFVars #[s]
           (← mkAppOptM ``Except.error #[some stepErr, some payload, some err])
       let auth ← mkAppM (ns ++ `WideSlice.authorityOf)
-        #[obsTy, decObs, frameObs, sizeObs, retUsize, retU32, retWide, ubObs]
-      return (auth, frameObs, sizeObs, retU32, retWide, ubObs)
+        #[obsTy, decObs, frameObs, sizeObs, pipelineObs, retUsize, retU32,
+          retWide, ubObs]
+      return (auth, frameObs, sizeObs, pipelineObs, retU32, retWide, ubObs)
     let authTy ← MetaM.run' <| inferType wsAuth
     let miriName := ns ++ `CrossRoot.WideSlice.miri
     let dv : DefinitionVal :=
@@ -11236,15 +11474,28 @@ run_cmd do
           safety := .safe }
       addDecl (.defnDecl dv)
       return type
-    -- The vendored interpreter computes exactly the reference table, and
-    -- passes the certificate of the LeanMiri side.
+    -- The vendored interpreter computes exactly the reference table, has a
+    -- non-shadowing `denote` table, and passes the LeanMiri certificate.
     addThm (ns ++ `CrossRoot.WideSlice.miri_matches)
       (eqTrue (mkApp (mkConst (ns ++ `WideSlice.matchesReference)) miriC))
       reflTrue
     addThm (ns ++ `CrossRoot.WideSlice.miri_check)
       (eqTrue (mkApp (mkConst (ns ++ `WideSlice.checkOf)) miriC)) reflTrue
+    let wsDenoteC ← MetaM.run' <|
+      mkAppOptM (ns ++ `Corpus.ObsAuthority.denoteConsistent)
+        #[none, none, some (mkConst ``instDecidableEqNat), some miriC]
+    let wsDenoteName := ns ++ `CrossRoot.WideSlice.miri_denoteConsistent
+    addThm wsDenoteName (eqTrue wsDenoteC) reflTrue
+    let wsDenoteSpec ← MetaM.run' <|
+      mkAppOptM (ns ++ `Corpus.ObsAuthority.denoteConsistent_sound)
+        #[none, none, some (mkConst ``instDecidableEqNat), some miriC,
+          some (mkConst wsDenoteName)]
+    let wsDenoteSpecName :=
+      ns ++ `CrossRoot.WideSlice.miri_denoteConsistent_spec
+    addThm wsDenoteSpecName (← MetaM.run' <| inferType wsDenoteSpec)
+      wsDenoteSpec
     added := added ++ #[ns ++ `CrossRoot.WideSlice.miri_matches,
-      ns ++ `CrossRoot.WideSlice.miri_check]
+      ns ++ `CrossRoot.WideSlice.miri_check, wsDenoteName, wsDenoteSpecName]
     -- 3. FloatCast Miri authority over `Miri.Interpreter.Cast.cast`
     let immTy ← MetaM.run' <| mkAppM (mi ++ `Immediate) #[prov]
     let castS ← MetaM.run' <| mkAppM ``Option #[immTy]
@@ -11582,8 +11833,21 @@ run_cmd do
       reflTrue
     addThm (ns ++ `CrossRoot.FloatCast.miri_check)
       (eqTrue (mkApp (mkConst (ns ++ `FloatCast.checkOf)) fcMiriC)) reflTrue
+    let fcDenoteC ← MetaM.run' <|
+      mkAppOptM (ns ++ `Corpus.ObsAuthority.denoteConsistent)
+        #[none, none, some (mkConst ``instDecidableEqNat), some fcMiriC]
+    let fcDenoteName := ns ++ `CrossRoot.FloatCast.miri_denoteConsistent
+    addThm fcDenoteName (eqTrue fcDenoteC) reflTrue
+    let fcDenoteSpec ← MetaM.run' <|
+      mkAppOptM (ns ++ `Corpus.ObsAuthority.denoteConsistent_sound)
+        #[none, none, some (mkConst ``instDecidableEqNat), some fcMiriC,
+          some (mkConst fcDenoteName)]
+    let fcDenoteSpecName :=
+      ns ++ `CrossRoot.FloatCast.miri_denoteConsistent_spec
+    addThm fcDenoteSpecName (← MetaM.run' <| inferType fcDenoteSpec)
+      fcDenoteSpec
     added := added ++ #[fcMiriName, ns ++ `CrossRoot.FloatCast.miri_matches,
-      ns ++ `CrossRoot.FloatCast.miri_check]
+      ns ++ `CrossRoot.FloatCast.miri_check, fcDenoteName, fcDenoteSpecName]
     -- Tightness of `FloatCast.gateLM` against `Miri.Interpreter.Cast.cast`:
     -- vendored `Cast.cast` converts `1.5f16` (`0x3e00`) and `1.5f128`
     -- (`0x3fff8000000000000000000000000000`) cleanly to `1.5f32`
@@ -11605,11 +11869,23 @@ run_cmd do
     added := added ++ #[ns ++ `CrossRoot.FloatCast.f16_gateLM_tight,
       ns ++ `CrossRoot.FloatCast.f128_gateLM_tight]
     -- 3b. The vendored float engine agrees with the reference specification
-    -- `FloatCast.Ref` primitive by primitive, and the type identifiers used
-    -- by `runCast` are LeanMiriSpec's encodings of the Anneal cast types.
+    -- `FloatCast.Ref` primitive by primitive (`decode`, `convert`,
+    -- `nanChoices`, `FloatOps.adjustNaN`, `toInteger`, `fromInteger`), and
+    -- the type identifiers + byte widths used by `runCast` are
+    -- LeanMiriSpec's encodings of the Anneal cast types.
     let fbTy := mkConst (mi ++ `FloatBits)
     let fmtTy := mkConst (mi ++ `FloatFormat)
-    let mkEngine (swapMode : Bool) : MetaM Expr := do
+    -- `engKind`: 0 = valid, 1 = mode-swapped `nanChoices`, 2 = forged
+    -- `decode` accepting out-of-width floats, 3 = forged `adjustNaN`
+    -- ignoring the oracle pick.
+    let mkEngine (engKind : Nat) : MetaM Expr := do
+      let boolTy := mkConst ``Bool
+      let unitTy := mkConst ``Unit
+      let feTy := mkConst (mi ++ `FloatError)
+      let fdTy := mkConst (mi ++ `FloatDecoded)
+      let refClsTy := mkConst (ns ++ `FloatCast.Ref.Class)
+      let refDecTy := mkConst (ns ++ `FloatCast.Ref.Decoded)
+      let optRefDecTy ← mkAppM ``Option #[refDecTy]
       let mkB ← withLocalDeclD `f fmtTy fun f =>
         withLocalDeclD `n natTy fun n => do
           mkLambdaFVars #[f, n] (← mkAppM (mi ++ `FloatBits.mk)
@@ -11617,25 +11893,112 @@ run_cmd do
       let bitsF ← withLocalDeclD `b fbTy fun b => do
         mkLambdaFVars #[b] (← mkAppM ``BitVec.toNat
           #[← mkAppM (mi ++ `FloatBits.bits) #[b]])
+      let decFn ← withLocalDeclD `b fbTy fun b => do
+        let decCall ← mkAppM (mi ++ `FloatBits.decode) #[b]
+        let exTy ← mkAppM ``Except #[feTy, fdTy]
+        let motiveE ← withLocalDeclD `_e exTy fun e =>
+          mkLambdaFVars #[e] optRefDecTy
+        let onErr ← withLocalDeclD `_err feTy fun err => do
+          if engKind == 2 then
+            let infDec := mkApp2 (mkConst (ns ++ `FloatCast.Ref.Decoded.mk))
+              (mkConst ``Bool.false)
+              (mkConst (ns ++ `FloatCast.Ref.Class.infinite))
+            mkLambdaFVars #[err]
+              (← mkAppOptM ``Option.some #[some refDecTy, some infDec])
+          else
+            mkLambdaFVars #[err]
+              (← mkAppOptM ``Option.none #[some refDecTy])
+        let onOk ← withLocalDeclD `fd fdTy fun fd => do
+          let neg ← mkAppM (mi ++ `FloatDecoded.negative) #[fd]
+          let val ← mkAppM (mi ++ `FloatDecoded.value) #[fd]
+          let motiveC ← withLocalDeclD `_c (mkConst (mi ++ `FloatClass))
+            fun c => mkLambdaFVars #[c] refClsTy
+          let onFin ← withLocalDeclD `n natTy fun n =>
+            withLocalDeclD `d natTy fun d =>
+              mkLambdaFVars #[n, d]
+                (mkApp2 (mkConst (ns ++ `FloatCast.Ref.Class.finite)) n d)
+          let onInf := mkConst (ns ++ `FloatCast.Ref.Class.infinite)
+          let onNan ← withLocalDeclD `p natTy fun p =>
+            mkLambdaFVars #[p]
+              (mkApp (mkConst (ns ++ `FloatCast.Ref.Class.nan)) p)
+          let cls ← mkAppOptM (mi ++ `FloatClass.casesOn)
+            #[some motiveC, some val, some onFin, some onInf, some onNan]
+          let decV := mkApp2 (mkConst (ns ++ `FloatCast.Ref.Decoded.mk))
+            neg cls
+          mkLambdaFVars #[fd]
+            (← mkAppOptM ``Option.some #[some refDecTy, some decV])
+        let body ← mkAppOptM ``Except.casesOn
+          #[some feTy, some fdTy, some motiveE, some decCall, some onErr,
+            some onOk]
+        mkLambdaFVars #[b] body
       let listFb ← mkAppM ``List #[fbTy]
       let nanCh ←
-        if swapMode then
+        if engKind == 1 then
           withLocalDeclD `f fmtTy fun f =>
           withLocalDeclD `l listFb fun l =>
-          withLocalDeclD `_b (mkConst ``Bool) fun b => do
+          withLocalDeclD `_b boolTy fun b => do
             mkLambdaFVars #[f, l, b] (← mkAppM (mi ++ `FloatBits.nanChoices)
               #[f, l, mkConst ``Bool.true])
         else pure (mkConst (mi ++ `FloatBits.nanChoices))
+      let tyIdTy := mkConst `Miri.MIR.TyId
+      let intKindTy := mkConst `Miri.MIR.IntegerKind
+      let layoutTy ← mkAppM `Miri.ABI.TyAndLayout #[tyIdTy]
+      let optFbTy ← mkAppM ``Option #[fbTy]
+      let leafU (name : String) (aTy : Expr) : MetaM Expr :=
+        mkAppOptM (lm ++ `annealUnsupportedLeaf)
+          #[some unitTy, some aTy, some (mkStrLit name)]
+      let kindOfU ← withLocalDeclD `_c natTy fun c =>
+        withLocalDeclD `_t tyIdTy fun t => do
+          mkLambdaFVars #[c, t] (← leafU "integerKindOf" intKindTy)
+      let fmtOfU ← withLocalDeclD `_c natTy fun c =>
+        withLocalDeclD `_t tyIdTy fun t => do
+          mkLambdaFVars #[c, t] (← leafU "formatOf" fmtTy)
+      let boolLayU ← withLocalDeclD `_c natTy fun c => do
+        mkLambdaFVars #[c] (← leafU "boolLayout" layoutTy)
+      let chooseU ← withLocalDeclD `c natTy fun c =>
+        withLocalDeclD `cands listFb fun cands => do
+          let idx ←
+            if engKind == 3 then pure (mkNatLit 0)
+            else mkAppM ``Nat.mod #[c, ← mkAppM ``List.length #[cands]]
+          mkLambdaFVars #[c, cands]
+            (← mkAppOptM ``EStateM.pure
+              #[some stepErr, some unitTy, some natTy, some idx])
+      let adjFn ← withLocalDeclD `flag boolTy fun flag =>
+        withLocalDeclD `pick natTy fun pick =>
+        withLocalDeclD `val fbTy fun val =>
+        withLocalDeclD `inps listFb fun inps => do
+          let fHooks ← mkAppOptM (mi ++ `FloatOpsHooks.mk)
+            #[some prov, some unitTy, some natTy, some kindOfU, some fmtOfU,
+              some boolLayU, some flag, some chooseU]
+          let actAdj ← mkAppOptM (mi ++ `FloatOps.adjustNaN)
+            #[some prov, some unitTy, some natTy, some fHooks, some pick,
+              some val, some inps]
+          let runAdj ← mkAppM ``EStateM.run #[actAdj, mkConst ``Unit.unit]
+          let resTy ← mkAppM ``EStateM.Result #[stepErr, unitTy, fbTy]
+          let motiveR ← withLocalDeclD `_r resTy fun r =>
+            mkLambdaFVars #[r] optFbTy
+          let onOkR ← withLocalDeclD `fb fbTy fun fb =>
+            withLocalDeclD `_st unitTy fun st => do
+              mkLambdaFVars #[fb, st]
+                (← mkAppOptM ``Option.some #[some fbTy, some fb])
+          let onErrR ← withLocalDeclD `_e stepErr fun e =>
+            withLocalDeclD `_st unitTy fun st => do
+              mkLambdaFVars #[e, st]
+                (← mkAppOptM ``Option.none #[some fbTy])
+          let res ← mkAppOptM ``EStateM.Result.casesOn
+            #[some stepErr, some unitTy, some fbTy, some motiveR, some runAdj,
+              some onOkR, some onErrR]
+          mkLambdaFVars #[flag, pick, val, inps] res
       return mkAppN (mkConst (ns ++ `FloatCast.Engine.mk))
-        #[fmtTy, fbTy, mkConst (mi ++ `FloatError),
+        #[fmtTy, fbTy, feTy,
           mkConst (mi ++ `FloatFormat.binary32),
           mkConst (mi ++ `FloatFormat.binary64), mkB, bitsF,
-          mkConst (mi ++ `FloatBits.preferredNaN),
-          mkConst (mi ++ `FloatBits.convert), nanCh,
+          mkConst (mi ++ `FloatBits.preferredNaN), decFn,
+          mkConst (mi ++ `FloatBits.convert), nanCh, adjFn,
           mkConst (mi ++ `FloatBits.toInteger),
           mkConst (mi ++ `FloatBits.fromInteger)]
     let engName := ns ++ `CrossRoot.FloatCast.engine
-    let _ ← addDef engName (← MetaM.run' <| mkEngine false)
+    let _ ← addDef engName (← MetaM.run' <| mkEngine 0)
     let engC := mkConst engName
     let engAgreesName := ns ++ `CrossRoot.FloatCast.engine_agrees
     addThm engAgreesName
@@ -11645,8 +12008,10 @@ run_cmd do
       engC (mkConst engAgreesName)
     let engSpecName := ns ++ `CrossRoot.FloatCast.engine_agrees_spec
     addThm engSpecName (← MetaM.run' <| inferType engSpec) engSpec
-    -- Direct statements over the vendored constants: the preferred NaNs and
-    -- the six signaling-NaN candidates of the widening cast.
+    -- Direct statements over the vendored constants: preferred NaNs,
+    -- out-of-width `decode` `.encodingExceedsWidth` errors, and `nanChoices`
+    -- across widening quiet NaN, widening signaling NaN, and narrowing
+    -- signaling NaN in both modes.
     let (directTys, directPfs) ← MetaM.run' do
       let refC (n : Name) : Expr := mkConst (ns ++ `FloatCast.Ref ++ n)
       let bitsOfFb (b : Expr) : MetaM Expr := do
@@ -11656,28 +12021,47 @@ run_cmd do
           #[mkConst (mi ++ `FloatFormat ++ f)])
         let rhs := mkApp (refC `preferredNaN) (refC (`Fmt ++ r))
         return (← mkEq lhs rhs, ← mkEqRefl lhs)
-      let choices (flag : Name) : MetaM (Expr × Expr) := do
+      let choicesAt (src dst : Name) (bits : Nat) (flag : Name) :
+          MetaM (Expr × Expr) := do
         let input ← mkAppM (mi ++ `FloatBits.mk)
-          #[mkConst (mi ++ `FloatFormat.binary32),
-            ← mkAppM ``BitVec.ofNat #[mkNatLit 128, mkNatLit 0x7f800001]]
+          #[mkConst (mi ++ `FloatFormat ++ src),
+            ← mkAppM ``BitVec.ofNat #[mkNatLit 128, mkNatLit bits]]
         let call ← mkAppM (mi ++ `FloatBits.nanChoices)
-          #[mkConst (mi ++ `FloatFormat.binary64),
+          #[mkConst (mi ++ `FloatFormat ++ dst),
             ← mkListLit fbTy [input], mkConst flag]
         let bitsF ← withLocalDeclD `b fbTy fun b => do
           mkLambdaFVars #[b] (← bitsOfFb b)
         let lhs ← mkAppM ``Option.map
           #[← mkAppM ``List.map #[bitsF], ← mkAppM ``Except.toOption #[call]]
         let pairTy ← mkAppM ``Prod #[refC `Fmt, natTy]
-        let pair ← mkAppM ``Prod.mk #[refC `Fmt.binary32, mkNatLit 0x7f800001]
-        let rhs := mkApp3 (refC `nanChoices) (refC `Fmt.binary64)
+        let pair ← mkAppM ``Prod.mk #[refC (`Fmt ++ src), mkNatLit bits]
+        let rhs := mkApp3 (refC `nanChoices) (refC (`Fmt ++ dst))
           (← mkListLit pairTy [pair]) (mkConst flag)
         return (← mkEq lhs rhs, ← mkEqRefl lhs)
-      let ds ← [pref `binary32 `binary32, pref `binary64 `binary64,
-        choices ``Bool.true, choices ``Bool.false].mapM id
+      let oobDec (f : Name) (bits : Nat) : MetaM (Expr × Expr) := do
+        let inp ← mkAppM (mi ++ `FloatBits.mk)
+          #[mkConst (mi ++ `FloatFormat ++ f),
+            ← mkAppM ``BitVec.ofNat #[mkNatLit 128, mkNatLit bits]]
+        let lhs ← mkAppM (mi ++ `FloatBits.decode) #[inp]
+        let rhs ← mkAppOptM ``Except.error
+          #[some (mkConst (mi ++ `FloatError)),
+            some (mkConst (mi ++ `FloatDecoded)),
+            some (mkConst (mi ++ `FloatError.encodingExceedsWidth))]
+        return (← mkEq lhs rhs, ← mkEqRefl lhs)
+      let ds ←
+        [pref `binary32 `binary32, pref `binary64 `binary64,
+         choicesAt `binary32 `binary64 0x7f800001 ``Bool.true,
+         choicesAt `binary32 `binary64 0x7f800001 ``Bool.false,
+         choicesAt `binary32 `binary64 0x7fc00001 ``Bool.true,
+         choicesAt `binary64 `binary32 0x7ff0000020000000 ``Bool.true,
+         choicesAt `binary64 `binary32 0x7ff0000020000000 ``Bool.false,
+         oobDec `binary32 (2 ^ 32), oobDec `binary64 (2 ^ 64)].mapM id
       return (ds.map (·.1), ds.map (·.2))
     let directNames : List Name :=
       [`preferredNaN32_eq, `preferredNaN64_eq, `nanChoices_signaling_nondet,
-        `nanChoices_signaling_det]
+        `nanChoices_signaling_det, `nanChoices_quiet_widen_nondet,
+        `nanChoices_narrow_signaling_nondet, `nanChoices_narrow_signaling_det,
+        `decode_oob32_eq_error, `decode_oob64_eq_error]
     for (n, ty, pf) in directNames.zip (directTys.zip directPfs) do
       addThm (ns ++ `CrossRoot.FloatCast ++ n) ty pf
       added := added.push (ns ++ `CrossRoot.FloatCast ++ n)
@@ -11685,18 +12069,34 @@ run_cmd do
       [(`f32ToF64, 31, 32), (`f64ToF32, 32, 31), (`f32ToI32, 31, 12),
         (`i32ToF32, 12, 31), (`bitsU32ToI32, 22, 12),
         (`bitsU64ToI64, 23, 13), (`f16ToF32, 30, 31), (`f128ToF32, 33, 31)]
-    let tyIdLock (prog : Name) (src dst : Nat) : MetaM (Expr × Expr) := do
+    let tyIdLock (prog : Name) (src dst : Nat)
+        (widthOverride? : Option Nat := none) : MetaM (Expr × Expr) := do
       let shape := mkApp (mkConst (ns ++ `FloatCast.castShape))
         (mkConst (ns ++ `FloatCast.Prog ++ prog))
       let srcTy ← mkAppM ``Prod.fst #[shape]
-      let dstTy ← mkAppM ``Prod.fst
-        #[← mkAppM ``Prod.snd #[← mkAppM ``Prod.snd #[shape]]]
+      let rest ← mkAppM ``Prod.snd #[shape]
+      let srcBytes ← mkAppM ``Prod.fst #[rest]
+      let dstTy ← mkAppM ``Prod.fst #[← mkAppM ``Prod.snd #[rest]]
       let enc (t : Expr) : Expr := mkApp (mkConst (lm ++ `encodeTyId)) t
+      let empLay :=
+        mkConst ``Trusted.Rustc.V2026_06_01.MirSemantics.emptyLayoutTable
+      let lay :=
+        mkApp2 (mkConst (lm ++ `layoutOfEncodedTyId)) (mkNatLit src) empLay
+      let layBytes ← mkAppM ``UInt64.toNat
+        #[← mkAppM `Miri.ABI.Size.bytes
+          #[← mkAppM `Miri.ABI.LayoutData.size
+            #[← mkAppM `Miri.ABI.TyAndLayout.layout #[lay]]]]
+      let targetBytes := match widthOverride? with
+        | some w => mkNatLit w
+        | none => srcBytes
       let e1 ← mkEq (enc srcTy) (mkNatLit src)
       let e2 ← mkEq (enc dstTy) (mkNatLit dst)
-      return (mkApp2 (mkConst ``And) e1 e2,
-        mkApp4 (mkConst ``And.intro) e1 e2 (← mkEqRefl (enc srcTy))
-          (← mkEqRefl (enc dstTy)))
+      let e3 ← mkEq layBytes targetBytes
+      let e23 := mkApp2 (mkConst ``And) e2 e3
+      let pf23 := mkApp4 (mkConst ``And.intro) e2 e3
+        (← mkEqRefl (enc dstTy)) (← mkEqRefl layBytes)
+      return (mkApp2 (mkConst ``And) e1 e23,
+        mkApp4 (mkConst ``And.intro) e1 e23 (← mkEqRefl (enc srcTy)) pf23)
     for (prog, src, dst) in castIds do
       let (ty, pf) ← MetaM.run' <| tyIdLock prog src dst
       let name := ns ++ `CrossRoot.FloatCast.tyIdLock ++ prog
@@ -11775,6 +12175,10 @@ run_cmd do
         lockEq `sizeOfValInit (mkApp (ws `sizeOfValInit) len)
           (← mkAppM (lw ++ `singleWideIntrinsicInitAnneal)
             #[mkApp (ws `wideVal) len]) #[len])
+      out := out.push (← lockEq `pipelineBody (ws `pipelineBody)
+        (lwc `wideSlicePipelineBody) #[])
+      out := out.push (← lockEq `pipelineInit (ws `pipelineInit)
+        (lwc `wideSlicePipelineInitAnneal) #[])
       return out
     for (n, ty, pf) in locks do
       let name := ns ++ `CrossRoot.WideSlice.lock ++ n
@@ -11789,11 +12193,24 @@ run_cmd do
       return r
     let boolFalse := mkConst ``Bool.false
     let forgedAuth ← MetaM.run' <| mkAppM (ns ++ `WideSlice.authorityOf)
-      #[obsTy, decObs, wsFrameObs, wsSizeObs, wsRetU32, wsRetU32, wsRetWide,
-        wsUbObs]
+      #[obsTy, decObs, wsFrameObs, wsSizeObs, wsPipelineObs, wsRetU32,
+        wsRetU32, wsRetWide, wsUbObs]
+    let collidingAuth ← MetaM.run' do
+      let constObs ← withLocalDeclD `_n natTy fun n =>
+        mkLambdaFVars #[n] (mkApp wsRetU32 (mkNatLit 0))
+      mkAppM (ns ++ `WideSlice.authorityOf)
+        #[obsTy, decObs, wsFrameObs, wsSizeObs, wsPipelineObs, constObs,
+          constObs, wsRetWide, wsUbObs]
+    let collidingDenote ← MetaM.run' <|
+      mkAppOptM (ns ++ `Corpus.ObsAuthority.denoteConsistent)
+        #[none, none, some (mkConst ``instDecidableEqNat), some collidingAuth]
     let forgedFcAuth ← MetaM.run' <| mkFcAuth true
-    let forgedEngine ← MetaM.run' <| mkEngine true
+    let forgedEngine ← MetaM.run' <| mkEngine 1
+    let forgedDecodeEngine ← MetaM.run' <| mkEngine 2
+    let forgedAdjustEngine ← MetaM.run' <| mkEngine 3
     let (forgedTyIdTy, forgedTyIdPf) ← MetaM.run' <| tyIdLock `f32ToF64 32 31
+    let (forgedWidthTy, forgedWidthPf) ← MetaM.run' <|
+      tyIdLock `f32ToF64 31 32 (some 8)
     let (forgedF16Ty, forgedF16Pf) ← MetaM.run' do
       let bad := mkApp fcRet32 (mkNatLit 0x3f800000)
       let f16Call := mkAppN fcRunCastC
@@ -11834,6 +12251,11 @@ run_cmd do
               (mkApp (mkConst (ns ++ `WideSlice.matchesReference))
                 forgedAuth)
             value := reflTrue }),
+       ("colliding WideSlice denote table", .thmDecl
+          { name := ns ++ `CrossRoot.forged.collidingDenote
+            levelParams := []
+            type := eqTrue collidingDenote
+            value := reflTrue }),
        ("swapped fixture lock", .thmDecl
           { name := ns ++ `CrossRoot.forged.swappedLock
             levelParams := []
@@ -11872,11 +12294,30 @@ run_cmd do
             type := eqTrue
               (mkApp (mkConst (ns ++ `FloatCast.Engine.agrees)) forgedEngine)
             value := reflTrue }),
+       ("agreement of an out-of-width-accepting float engine", .thmDecl
+          { name := ns ++ `CrossRoot.forged.engineBadDecode
+            levelParams := []
+            type := eqTrue
+              (mkApp (mkConst (ns ++ `FloatCast.Engine.agrees))
+                forgedDecodeEngine)
+            value := reflTrue }),
+       ("agreement of a pick-ignoring adjustNaN float engine", .thmDecl
+          { name := ns ++ `CrossRoot.forged.engineBadAdjust
+            levelParams := []
+            type := eqTrue
+              (mkApp (mkConst (ns ++ `FloatCast.Engine.agrees))
+                forgedAdjustEngine)
+            value := reflTrue }),
        ("wrong type-identifier lock", .thmDecl
           { name := ns ++ `CrossRoot.forged.wrongTyId
             levelParams := []
             type := forgedTyIdTy
-            value := forgedTyIdPf })]
+            value := forgedTyIdPf }),
+       ("wrong byte-width type-identifier lock", .thmDecl
+          { name := ns ++ `CrossRoot.forged.wrongTyWidth
+            levelParams := []
+            type := forgedWidthTy
+            value := forgedWidthPf })]
     let mut rejected : Nat := 0
     for (what, d) in forged do
       unless ← rejects d do
@@ -11904,7 +12345,8 @@ run_cmd do
     for (auth, needed) in
         [(miriName,
           [mi ++ `Step.step, mi ++ `Cast.cast,
-            lm ++ `annealStepHooksWideSlice]),
+            lm ++ `annealStepHooksWideSlice, lw ++ `wideSlicePipelineMiri4,
+            lw ++ `wideSlicePipelineInitMiri, lw ++ `wideSlicePipelineHooks]),
          (fcRunCastName,
           [mi ++ `Cast.cast, mi ++ `Cast.castFromIntLike,
             mi ++ `FloatOps.readBits, mi ++ `FloatOps.adjustNaN,
@@ -11916,7 +12358,8 @@ run_cmd do
          (engName,
           [mi ++ `FloatBits.nanChoices, mi ++ `FloatBits.preferredNaN,
             mi ++ `FloatBits.convert, mi ++ `FloatBits.decode,
-            mi ++ `FloatBits.toInteger, mi ++ `FloatBits.fromInteger])]
+            mi ++ `FloatBits.toInteger, mi ++ `FloatBits.fromInteger,
+            mi ++ `FloatOps.adjustNaN])]
         do
       let mut reach : NameSet := {}
       let mut todo : Array Name := #[auth]
@@ -11939,7 +12382,7 @@ run_cmd do
       maxHeartbeats := 0 }
   let ((replayed, added, bundles, rejected), _) ←
     liftCoreM <| (act.toIO ctx { env := baseEnv })
-  unless replayed ≥ 400 && added ≥ 80 && bundles = 12 && rejected = 12 do
+  unless replayed ≥ 400 && added ≥ 95 && bundles = 12 && rejected = 16 do
     throwError "cross-root: unexpected counts \
       (replayed={replayed}, added={added}, bundles={bundles}, \
       rejected={rejected})"
@@ -11989,6 +12432,11 @@ run_cmd do
     match ci with
     | .thmInfo v => v.type.isConstOf ``True
     | _ => false
+  -- Lazy equational lemma detector for imported definitions in `map₂`.
+  let isLazyEq (n : Name) (ci : ConstantInfo) : Bool :=
+    let leaf := match n with | .str _ s => s | _ => ""
+    (match ci with | .thmInfo _ => true | _ => false) &&
+    (leaf.startsWith "eq_" || leaf == "eq_def")
   -- Transitive closure of the used-constant relation.
   let closure (start : Array Name) : NameSet := Id.run do
     let mut seen : NameSet := {}
@@ -12015,12 +12463,10 @@ run_cmd do
     else if !n.isInternal then
       -- Lean lazily synthesizes equational lemmas (`*.eq_*` / `*.eq_def`)
       -- for imported definitions on demand in `map₂`; reject anything else.
-      let leaf := match n with | .str _ s => s | _ => ""
-      let isLazyEq :=
-        (match ci with | .thmInfo _ => true | _ => false) &&
-        (leaf.startsWith "eq_" || leaf == "eq_def")
-      unless isLazyEq do
+      unless isLazyEq n ci do
         throwError "audit: stray top-level declaration {n} outside {testNs}"
+      if rejected ci then
+        throwError "audit: lazy equational lemma {n} is not safe"
       lazyEqs := lazyEqs.push n
     else
       -- Even internal declarations outside `testNs` (except Lean's transient
@@ -12079,6 +12525,11 @@ run_cmd do
     unless isTrivialThm ci do
       throwError "audit self-test: trivial `: True` theorem was not detected"
   | none => throwError "audit self-test: `trivial` is missing"
+  match env.find? ``Nat.add with
+  | some ci =>
+    unless !testNs.isPrefixOf ``Nat.add && !isLazyEq ``Nat.add ci do
+      throwError "audit self-test: stray declaration was not detected"
+  | none => throwError "audit self-test: `Nat.add` is missing"
   unless (closure #[]).isEmpty do
     throwError "audit self-test: the empty closure is not empty"
   let bundleOnly := closure <| roots.filter fun n =>
