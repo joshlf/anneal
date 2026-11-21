@@ -2186,6 +2186,36 @@ theorem ptrToPtr_spatialPin_scalarAddr_and_negative_canaries :
 
 /-! ## 8. Automated `run_cmd` Axiom & Reachability Audit -/
 
+/-! Audits every declaration with a source range whose first line lies in the closed
+span-inclusive anchor interval `[startAnchor.range.pos.line, endAnchor.range.endPos.line]` of
+`Anneal.MirLiftCore` (`[updateBorrowPerm_tag, mirStep_assign_cast_ptrToPtr_wide_to_wide]`),
+`Anneal.SepLogicLenses`
+(`[WidePtrVal.dataVal, UnsizedSliceDstAt.evalRvalue_cast_ptrToPtr_wide_to_wide]`), and
+`Anneal.PureLift.V2026_06_01Bridge`
+(`[stdWideSliceVal, mirStep_assign_cast_ptrToPtr_wide_to_wide_preserves_spatialPin]`). The upper
+bound is the *last* line of `endAnchor`'s declaration range, so `endAnchor` and every ranged
+declaration nested in its span are included, while declarations appended after `endAnchor` start
+on a later line and are excluded.
+
+Seam: the first two intervals start at the exclusive end anchors of
+`MirSliceWidePtrLensTests.lean`. Each also names `prevAnchor`, the last top-level declaration
+audited by that file (its `lastAnchor`), and no declaration may start between `prevAnchor` and
+`startAnchor`. Together the two audits therefore cover those modules from that file's start
+anchors through these end anchors without gap or overlap, and moving the boundary in only one of
+the two files, or adding a declaration at the boundary, fails here or there. This holds only
+where both files are elaborated: a runner that elaborates one of them audits only its side.
+(`V2026_06_01Bridge` has no such neighbor.)
+
+Fails closed if an anchor is missing, has no source range, belongs to the wrong module, is
+misordered, or was not audited; if any declaration spans an interval boundary (so both boundaries
+are clean cuts between top-level declarations), extends past `prevAnchor`, or starts between
+`prevAnchor` and `startAnchor`; or if any declaration violates the constructive-axiom,
+projection-discipline, or reachability invariants.
+
+Compiler-generated auxiliaries without a source range (`_proof_*`, `match_*`, `_f`, equation
+lemmas) are not counted: `collectAxioms` is transitive, so their axioms are audited through the
+declarations that use them; the projection-discipline check follows matchers explicitly, and the
+reachability search walks through them. -/
 open Lean Elab Command in
 run_cmd do
   let env ← getEnv
@@ -2195,19 +2225,69 @@ run_cmd do
   let mut theorems : Nat := 0
   let mut auditedThms : Array Name := #[]
   let mut modIdxs : Array ModuleIdx := #[]
-  for (modName, anchor, minCount) in
-      [(`Anneal.MirLiftCore, ``Anneal.MirLiftCore.updateBorrowPerm_tag, 100),
-       (`Anneal.SepLogicLenses, ``Anneal.SepLogicLenses.WidePtrVal.dataVal, 60),
-       (`Anneal.PureLift.V2026_06_01Bridge, ``Anneal.PureLift.V2026_06_01Bridge.stdWideSliceVal, 40)] do
+  for (modName, prevAnchor?, startAnchor, endAnchor, minCount) in
+      [(`Anneal.MirLiftCore,
+          some ``Anneal.MirLiftCore.mirWpConverges_nil_narrow_of_closed_poly_clean,
+          ``Anneal.MirLiftCore.updateBorrowPerm_tag,
+          ``Anneal.MirLiftCore.mirStep_assign_cast_ptrToPtr_wide_to_wide, 100),
+       (`Anneal.SepLogicLenses,
+          some ``Anneal.SepLogicLenses.ActiveTypedSliceMutBorrow.derefWriteWithLayouts_single,
+          ``Anneal.SepLogicLenses.WidePtrVal.dataVal,
+          ``Anneal.SepLogicLenses.UnsizedSliceDstAt.evalRvalue_cast_ptrToPtr_wide_to_wide, 60),
+       (`Anneal.PureLift.V2026_06_01Bridge, none,
+          ``Anneal.PureLift.V2026_06_01Bridge.stdWideSliceVal,
+          ``Anneal.PureLift.V2026_06_01Bridge.mirStep_assign_cast_ptrToPtr_wide_to_wide_preserves_spatialPin, 40)] do
     let some modIdx := env.getModuleIdx? modName | throwError "module {modName} not imported"
     modIdxs := modIdxs.push modIdx
-    let some anchorRange ← findDeclarationRanges? anchor | throwError "no range for {anchor}"
-    let startLine := anchorRange.range.pos.line
+    unless env.getModuleIdxFor? startAnchor == some modIdx do
+      throwError "start anchor {startAnchor} does not belong to module {modName}"
+    unless env.getModuleIdxFor? endAnchor == some modIdx do
+      throwError "end anchor {endAnchor} does not belong to module {modName}"
+    let some startRange ← findDeclarationRanges? startAnchor | throwError "no range for {startAnchor}"
+    let some endRange ← findDeclarationRanges? endAnchor | throwError "no range for {endAnchor}"
+    let startLine := startRange.range.pos.line
+    let startEndLine := startRange.range.endPos.line
+    let endLine := endRange.range.endPos.line
+    if startEndLine < startLine || endRange.range.pos.line < startLine || endLine < endRange.range.pos.line then
+      throwError "{modName}: invalid anchor range [{startLine}, {endLine}] for {startAnchor} .. {endAnchor}"
+    -- `(prevAnchor, last line of its declaration range)` for intervals with a seam neighbor.
+    let mut prev? : Option (Name × Nat) := none
+    if let some prevAnchor := prevAnchor? then
+      unless env.getModuleIdxFor? prevAnchor == some modIdx do
+        throwError "previous anchor {prevAnchor} does not belong to module {modName}"
+      let some prevRange ← findDeclarationRanges? prevAnchor | throwError "no range for {prevAnchor}"
+      let prevLine := prevRange.range.pos.line
+      let prevEndLine := prevRange.range.endPos.line
+      if prevEndLine < prevLine then
+        throwError "{modName}: previous anchor {prevAnchor} has inverted declaration range ({prevLine}-{prevEndLine})"
+      unless prevEndLine < startLine do
+        throwError "{modName}: previous anchor {prevAnchor} (last line {prevEndLine}) does not end \
+          before start anchor {startAnchor} (line {startLine})"
+      prev? := some (prevAnchor, prevEndLine)
     let mut count : Nat := 0
+    let mut modAudited : NameSet := {}
     for (n, ci) in env.constants.map₁.toList do
       if env.getModuleIdxFor? n == some modIdx then
         if let some r ← findDeclarationRanges? n then
-          if r.range.pos.line ≥ startLine then
+          let declLine := r.range.pos.line
+          let declEndLine := r.range.endPos.line
+          if declEndLine < declLine then
+            throwError "{modName}: {n} has inverted declaration range ({declLine}-{declEndLine})"
+          if declLine < startLine && startLine ≤ declEndLine then
+            throwError "{modName}: {n} (lines {declLine}-{declEndLine}) spans start anchor \
+              {startAnchor} (line {startLine})"
+          if let some (prevAnchor, prevEndLine) := prev? then
+            if prevEndLine < declLine && declLine < startLine then
+              throwError "{modName}: {n} (line {declLine}) starts after previous anchor \
+                {prevAnchor} (last line {prevEndLine}) and before start anchor {startAnchor} (line \
+                {startLine}); update the seam here and in MirSliceWidePtrLensTests.lean together"
+            if declLine ≤ prevEndLine && prevEndLine < declEndLine then
+              throwError "{modName}: {n} (lines {declLine}-{declEndLine}) extends past previous \
+                anchor {prevAnchor} (last line {prevEndLine})"
+          if startLine ≤ declLine && declLine ≤ endLine then
+            if endLine < declEndLine then
+              throwError "{modName}: {n} (lines {declLine}-{declEndLine}) extends past end anchor \
+                {endAnchor} (last line {endLine})"
             if ci.isUnsafe then throwError "unsafe declaration: {n}"
             let axs ← collectAxioms n
             for a in axs do
@@ -2240,9 +2320,17 @@ run_cmd do
                       seen := seen.insert c
                       toCheck := toCheck.push c
             count := count + 1
+            modAudited := modAudited.insert n
             if ci matches .thmInfo _ then
               theorems := theorems + 1
               auditedThms := auditedThms.push n
+    if let some (prevAnchor, _) := prev? then
+      if modAudited.contains prevAnchor then
+        throwError "{modName}: previous anchor {prevAnchor} was unexpectedly audited"
+    unless modAudited.contains startAnchor do
+      throwError "{modName}: start anchor {startAnchor} was not audited"
+    unless modAudited.contains endAnchor do
+      throwError "{modName}: end anchor {endAnchor} was not audited"
     if count < minCount then
       throwError "{modName}: audited only {count} declarations (expected ≥ {minCount})"
     audited := audited + count
