@@ -42,11 +42,11 @@ This module never names them. Instead:
 
 No `sorry`, `native_decide`, `unsafe`, `implemented_by`, custom axioms, or name-resolution
 metaprogramming are used; Part 5 instantiates all 50 theorems in closed/existential `private`
-non-vacuity witnesses on concrete states, and Part 6 checks with `#assert_standard_axioms` and
-`#assert_module_standard_axioms` that the module exposes those exact 50 public theorems (zero
-private-helper type leakage, matching `LeanMiriSpec.MemoryLemmas` re-exports, 50/50 non-vacuity
-witness coverage) and that every declaration in this module depends only on `propext`,
-`Classical.choice`, and `Quot.sound`.
+non-vacuity witnesses on concrete states, and Part 6 checks with `#assert_standard_axioms` that
+the module exposes those exact 50 public theorems and re-exports (zero private-helper type
+leakage, zero `_`-prefixed public helper leaks, 50/50 non-vacuity witness coverage) and that every
+declaration in `env.constants.map₂` depends only on `propext`, `Classical.choice`, and
+`Quot.sound`.
 
 ## The 50 theorems
 
@@ -69,25 +69,30 @@ witness coverage) and that every declaration in this module depends only on `pro
 set_option autoImplicit false
 
 /-- Fail unless:
-1. every listed declaration depends only on Lean's standard axioms (`propext`, `Quot.sound`,
+1. every listed declaration (and every other public or `private` declaration elaborated in this
+   module's `env.constants.map₂`) depends only on Lean's standard axioms (`propext`, `Quot.sound`,
    `Classical.choice`) — in particular zero `sorryAx` and zero `Lean.ofReduceBool`;
 2. every listed declaration's kernel type references zero `private` helper declarations;
 3. every listed declaration is re-exported under `LeanMiriSpec.MemoryLemmas.<shortName>` pointing
-   to the exact same declaration;
+   to the exact same declaration, with zero extra `export` aliases in `LeanMiriSpec.MemoryLemmas`;
 4. every listed declaration appears in the kernel proof/type terms of the `private theorem`
    non-vacuity witnesses in `LeanMiriSpec.MemoryLemmas.NonVacuity`; and
-5. no extra user-authored public declaration exists in `env.constants.map₂` outside the listed 50.
+5. no extra public declaration exists in `env.constants.map₂` outside the listed 50 (even if
+   `_`-prefixed, rejecting user declarations via `Lean.findDeclarationRanges?` and bounding
+   range-less compiler/elaborator auxiliaries strictly to children of the 50 theorems, this
+   command's own `local elab`, or imported equational lemmas).
 File-local analogue of `LeanMiriSpec.Audit`'s command (that module imports all of `LeanMiriSpec`). -/
 local elab "#assert_standard_axioms " ids:ident* : command => do
   let env ← Lean.getEnv
   let mut witnessUsed : Lean.NameSet := {}
   for (c, ci) in env.constants.map₂.toList do
-    if (c.toString.splitOn "LeanMiriSpec.MemoryLemmas.NonVacuity.").length > 1 then
-      if let some v := ci.value? (allowOpaque := true) then
-        for u in v.getUsedConstants do
+    if let some un := Lean.privateToUserName? c then
+      if (`LeanMiriSpec.MemoryLemmas.NonVacuity).isPrefixOf un then
+        if let some v := ci.value? (allowOpaque := true) then
+          for u in v.getUsedConstants do
+            witnessUsed := witnessUsed.insert u
+        for u in ci.type.getUsedConstants do
           witnessUsed := witnessUsed.insert u
-      for u in ci.type.getUsedConstants do
-        witnessUsed := witnessUsed.insert u
   let mut listed : Lean.NameSet := {}
   for id in ids do
     let n ← Lean.Elab.Command.liftCoreM <| Lean.Elab.realizeGlobalConstNoOverloadWithInfo id
@@ -112,20 +117,15 @@ local elab "#assert_standard_axioms " ids:ident* : command => do
     Lean.logInfo m!"{n} depends on axioms: {axs.toList}"
   unless listed.size == 50 do
     throwError "expected exactly 50 audited public theorems, got {listed.size}"
-  for (c, _) in env.constants.map₂.toList do
-    if !Lean.isPrivateName c then
-      -- Compiler/elaborator auxiliaries (`._proof_N`, `._simp_N`, `_aux_…` elab rules,
-      -- `._sparseCasesOn_N`, …) all have an internal (`_`-prefixed) name component; matchers are
-      -- recognized structurally. No substring heuristics, so e.g. a leaked public
-      -- `Miri.Memory.Allocation.foo_aux_bar` or `….match_spec` is still rejected.
-      let isAux := c.isInternalDetail || Lean.Meta.isMatcherCore env c
-      if !isAux && !listed.contains c then
-        throwError "unexpected extra public declaration {c} in LeanMiriSpec.MemoryLemmas"
-
-/-- Sweep every declaration elaborated in this module (`env.constants.map₂`, both public and
-private) and fail if any depends on a non-standard axiom. -/
-local elab "#assert_module_standard_axioms" : command => do
-  let env ← Lean.getEnv
+  let mut aliasCount : Nat := 0
+  for (aliasName, targets) in (Lean.aliasExtension.getState env).toList do
+    if (`LeanMiriSpec.MemoryLemmas).isPrefixOf aliasName then
+      for t in targets do
+        unless listed.contains t do
+          throwError "unexpected export alias {aliasName} -> {t} in LeanMiriSpec.MemoryLemmas"
+        aliasCount := aliasCount + 1
+  unless aliasCount == 50 do
+    throwError "expected exactly 50 export aliases in LeanMiriSpec.MemoryLemmas, got {aliasCount}"
   let mut checked : Nat := 0
   let mut seen : Array Lean.Name := #[]
   for (c, _) in env.constants.map₂.toList do
@@ -136,6 +136,23 @@ local elab "#assert_module_standard_axioms" : command => do
       unless seen.contains a do
         seen := seen.push a
     checked := checked + 1
+    if !Lean.isPrivateName c && !listed.contains c then
+      let isElabRule :=
+        match c.getRoot with
+        | .str .anonymous root =>
+          root.startsWith "_aux_" && root.endsWith "_command#assert_standard_axioms__1"
+        | _ => false
+      if (← Lean.findDeclarationRanges? c).isSome then
+        unless isElabRule do
+          throwError "unexpected extra public declaration {c} in LeanMiriSpec.MemoryLemmas"
+      else
+        let isTheoremAux :=
+          (c.isInternalDetail || Lean.Meta.isMatcherCore env c) &&
+          listed.any (fun t => t != c && t.isPrefixOf c)
+        let isImportedEqnAux :=
+          c.isInternalDetail && (env.getModuleIdxFor? c.getPrefix).isSome
+        unless isElabRule || isTheoremAux || isImportedEqnAux do
+          throwError "unexpected extra public declaration {c} in LeanMiriSpec.MemoryLemmas"
   if checked == 0 then
     throwError "module-wide axiom audit checked 0 declarations"
   Lean.logInfo m!"LeanMiriSpec.MemoryLemmas module-wide audit: {checked} declarations depend only on {seen.toList}"
@@ -3931,14 +3948,16 @@ end LeanMiriSpec.MemoryLemmas
 Compile-time checks that the hypotheses of all 50 specification theorems are jointly satisfiable
 on concrete states, by instantiating every theorem in closed or existentially-constructed
 `private theorem`s (unlike `example`, `private theorem` declarations remain in `env.constants.map₂`
-so `#assert_module_standard_axioms` audits their axiom footprint while adding zero public API).
+so `#assert_standard_axioms` audits their axiom footprint while adding zero public API).
 They cover multi-block `.Lazy` → `.Materialized` `InitMask` transitions (`64` and `128` byte
 boundaries), `ProvenanceMap` operations, `fromBytes` / `tryNew` (`.Uninit` and `.Zero`), framed
 `writeBytes`, `writeUninit`, zero-length writes, `getBytesUnchecked` size/subrange/split,
-`getBytesStripProvenance`, little- and big-endian integer and pointer `writeScalar` / `readScalar`
-roundtrips, `withExtra` / `mapExtra` commutations, cross-allocation plus same-allocation
-`copy` and `copyRepeatedly`, and kernel-evaluated concrete 64-bit `InitMask` word layouts
-(set and clear writes straddling word boundaries, and the full-overwrite collapse to `.Lazy`). -/
+`getBytesStripProvenance` (both `CtfeProvenance` empty-range and `Provenance` `offsetIsAddr = true`
+live-pointer stripping), little- and big-endian integer and pointer `writeScalar` / `readScalar`
+roundtrips and pointer-to-integer transmutation, `withExtra` / `mapExtra` commutations,
+cross-allocation plus same-allocation `copy` and `copyRepeatedly`, and kernel-evaluated concrete
+64-bit `InitMask` word layouts paired with `.Materialized` `set_range_get` / `isRangeInitialized_frame`
+/ `prepareCopy_of_uniform` proofs. -/
 
 namespace LeanMiriSpec.MemoryLemmas.NonVacuity
 open Miri.ABI Miri.Memory
@@ -4397,43 +4416,224 @@ private theorem wit_copy_and_copyRepeatedly :
   exact ⟨src, d0, d1, d2, d3, hsrc, hd0, hc1, hc2, hb2_22, hb2_02, hd2_10,
     hc3, by simpa using hb3_46, hb3_04, his3_46, his3_02, hd3_10⟩
 
-/-- 7. Concrete 64-bit word layouts, evaluated by the kernel (no `native_decide`): a `.Lazy` →
-`.Materialized` write straddling both the 64- and 128-byte word boundaries
-(`[60, 140)` ↦ words `0xF000000000000000`, `0xFFFFFFFFFFFFFFFF`, `0xFFF`, `0`), a `.Materialized`
-clearing write straddling byte 64 (`[62, 66)` ↦ `0x3000000000000000`, `0xFFFFFFFFFFFFFFFC`), and a
-full overwrite collapsing back to `.Lazy`; plus `get_ok_of_wellFormed` on the non-trivial
-`.Materialized` branch, whose `WellFormed` capacity premise (`200 ≤ 4 * 64`) is discharged on the
-concrete mask. -/
+/-- 7. Concrete 64-bit word layouts, evaluated by the kernel (`decide +kernel`, zero
+`Lean.ofReduceBool`), paired with `.Materialized`-input instantiations of `set_range_get`
+(`.Materialized` → `.Materialized` clearing write straddling byte 64 and `.Materialized` → `.Lazy`
+full overwrite), `isRangeInitialized_frame` (`state = false`, `Or.inl` disjoint branch on
+`.Materialized`), `prepareCopy_of_uniform` (`state = false` uniform uninitialized chunk), and
+`get_ok_of_wellFormed` on `.Materialized`. -/
 private theorem wit_initMask_word_layout :
+    let m1 : InitMask :=
+      ⟨.Materialized ⟨#[0xF000000000000000, 0xFFFFFFFFFFFFFFFF, 0xFFF, 0]⟩, Size.ofBytes 200⟩
+    let m2 : InitMask :=
+      ⟨.Materialized ⟨#[0x3000000000000000, 0xFFFFFFFFFFFFFFFC, 0xFFF, 0]⟩, Size.ofBytes 200⟩
     (InitMask.new (Size.ofBytes 200) false).setRange
-        (allocRange (Size.ofBytes 60) (Size.ofBytes 80)) true =
-      .ok ⟨.Materialized ⟨#[0xF000000000000000, 0xFFFFFFFFFFFFFFFF, 0xFFF, 0]⟩, Size.ofBytes 200⟩ ∧
-    (⟨.Materialized ⟨#[0xF000000000000000, 0xFFFFFFFFFFFFFFFF, 0xFFF, 0]⟩, Size.ofBytes 200⟩ :
-        InitMask).setRange (allocRange (Size.ofBytes 62) (Size.ofBytes 4)) false =
-      .ok ⟨.Materialized ⟨#[0x3000000000000000, 0xFFFFFFFFFFFFFFFC, 0xFFF, 0]⟩, Size.ofBytes 200⟩ ∧
-    (⟨.Materialized ⟨#[0x3000000000000000, 0xFFFFFFFFFFFFFFFC, 0xFFF, 0]⟩, Size.ofBytes 200⟩ :
-        InitMask).setRange (allocRange Size.ZERO (Size.ofBytes 200)) true =
+        (allocRange (Size.ofBytes 60) (Size.ofBytes 80)) true = .ok m1 ∧
+    m1.setRange (allocRange (Size.ofBytes 62) (Size.ofBytes 4)) false = .ok m2 ∧
+    m2.setRange (allocRange Size.ZERO (Size.ofBytes 200)) true =
       .ok (InitMask.new (Size.ofBytes 200) true) ∧
-    (⟨.Materialized ⟨#[0x3000000000000000, 0xFFFFFFFFFFFFFFFC, 0xFFF, 0]⟩, Size.ofBytes 200⟩ :
-        InitMask).get (Size.ofBytes 61) = .ok true ∧
-    (⟨.Materialized ⟨#[0x3000000000000000, 0xFFFFFFFFFFFFFFFC, 0xFFF, 0]⟩, Size.ofBytes 200⟩ :
-        InitMask).get (Size.ofBytes 62) = .ok false ∧
-    (⟨.Materialized ⟨#[0x3000000000000000, 0xFFFFFFFFFFFFFFFC, 0xFFF, 0]⟩, Size.ofBytes 200⟩ :
-        InitMask).get (Size.ofBytes 65) = .ok false ∧
-    (⟨.Materialized ⟨#[0x3000000000000000, 0xFFFFFFFFFFFFFFFC, 0xFFF, 0]⟩, Size.ofBytes 200⟩ :
-        InitMask).get (Size.ofBytes 66) = .ok true ∧
-    ∃ b, (⟨.Materialized ⟨#[0x3000000000000000, 0xFFFFFFFFFFFFFFFC, 0xFFF, 0]⟩,
-        Size.ofBytes 200⟩ : InitMask).get (Size.ofBytes 199) = .ok b := by
-  have hwf : InitMask.WriteProof.WellFormed
-      (⟨.Materialized ⟨#[0x3000000000000000, 0xFFFFFFFFFFFFFFFC, 0xFFF, 0]⟩, Size.ofBytes 200⟩ :
-        InitMask) := by
+    m2.get (Size.ofBytes 61) = .ok true ∧
+    m2.get (Size.ofBytes 62) = .ok false ∧
+    m2.get (Size.ofBytes 65) = .ok false ∧
+    m2.get (Size.ofBytes 66) = .ok true ∧
+    m2.isRangeInitialized (allocRange (Size.ofBytes 66) (Size.ofBytes 74)) = .ok (.ok ()) ∧
+    m2.prepareCopy (allocRange (Size.ofBytes 62) (Size.ofBytes 4)) = .ok ⟨false, #[4]⟩ ∧
+    (InitMask.new (Size.ofBytes 200) true).get (Size.ofBytes 62) = .ok true ∧
+    ∃ b, m2.get (Size.ofBytes 199) = .ok b := by
+  let m1 : InitMask :=
+    ⟨.Materialized ⟨#[0xF000000000000000, 0xFFFFFFFFFFFFFFFF, 0xFFF, 0]⟩, Size.ofBytes 200⟩
+  let m2 : InitMask :=
+    ⟨.Materialized ⟨#[0x3000000000000000, 0xFFFFFFFFFFFFFFFC, 0xFFF, 0]⟩, Size.ofBytes 200⟩
+  have hwf0 : InitMask.WriteProof.WellFormed (InitMask.new (Size.ofBytes 200) false) := trivial
+  have hwf1 : InitMask.WriteProof.WellFormed m1 := by
     simp only [InitMask.WriteProof.WellFormed]; decide
-  -- The elaborator's `whnf` does not reliably evaluate the `Nat.lor`/`Nat.land` word updates on
-  -- these 64-bit literals, so the concrete layouts are checked by kernel reduction
-  -- (`decide +kernel`: a kernel-checked `Decidable` evaluation, no `Lean.ofReduceBool`).
-  exact ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
-    by decide +kernel, by decide +kernel, by decide +kernel,
-    InitMask.WriteProof.get_ok_of_wellFormed _ (Size.ofBytes 199) hwf (by decide)⟩
+  have hwf2 : InitMask.WriteProof.WellFormed m2 := by
+    simp only [InitMask.WriteProof.WellFormed]; decide
+  -- Kernel-checked (`decide +kernel`, zero `Lean.ofReduceBool`) evaluation of 64-bit word layouts:
+  have hset01 : (InitMask.new (Size.ofBytes 200) false).setRange
+      (allocRange (Size.ofBytes 60) (Size.ofBytes 80)) true = .ok m1 := by decide +kernel
+  have hset12 : m1.setRange (allocRange (Size.ofBytes 62) (Size.ofBytes 4)) false = .ok m2 := by
+    decide +kernel
+  have hset23 : m2.setRange (allocRange Size.ZERO (Size.ofBytes 200)) true =
+      .ok (InitMask.new (Size.ofBytes 200) true) := by decide +kernel
+  have hm1_get : ∀ idx : Size, idx.bytes.toNat < 200 → m1.get idx =
+      if 60 ≤ idx.bytes.toNat ∧ idx.bytes.toNat < 140 then .ok true else .ok false :=
+    fun idx hidx => InitMask.WriteProof.set_range_get _ m1 _ (Size.ofBytes 140) idx true
+      hwf0 (by decide) (by decide) (by decide) hidx hset01
+  have hm2_get : ∀ idx : Size, idx.bytes.toNat < 200 → m2.get idx =
+      if 62 ≤ idx.bytes.toNat ∧ idx.bytes.toNat < 66 then .ok false else m1.get idx :=
+    fun idx hidx => InitMask.WriteProof.set_range_get m1 m2 _ (Size.ofBytes 66) idx false
+      hwf1 (by decide) (by decide) (by decide) hidx hset12
+  have hg61 : m2.get (Size.ofBytes 61) = .ok true := by
+    rw [hm2_get _ (by decide), hm1_get _ (by decide)]; decide
+  have hg62 : m2.get (Size.ofBytes 62) = .ok false := by rw [hm2_get _ (by decide)]; decide
+  have hg65 : m2.get (Size.ofBytes 65) = .ok false := by rw [hm2_get _ (by decide)]; decide
+  have hg66 : m2.get (Size.ofBytes 66) = .ok true := by
+    rw [hm2_get _ (by decide), hm1_get _ (by decide)]; decide
+  have hm1_66_140 : m1.isRangeInitialized (allocRange (Size.ofBytes 66) (Size.ofBytes 74)) =
+      .ok (.ok ()) :=
+    (InitMask.WriteProof.isRangeInitialized_nonempty_iff m1 _ (Size.ofBytes 140)
+      hwf1 (by decide) (by decide) (by decide)).1.mpr fun idx hlo hhi => by
+      change 66 ≤ idx.bytes.toNat at hlo
+      change idx.bytes.toNat < 140 at hhi
+      rw [hm1_get idx (by omega)]
+      split
+      · rfl
+      · omega
+  have hm2_66_140 : m2.isRangeInitialized (allocRange (Size.ofBytes 66) (Size.ofBytes 74)) =
+      .ok (.ok ()) :=
+    (InitMask.WriteProof.isRangeInitialized_frame m1 m2
+      (allocRange (Size.ofBytes 62) (Size.ofBytes 4))
+      (allocRange (Size.ofBytes 66) (Size.ofBytes 74))
+      (Size.ofBytes 66) (Size.ofBytes 140) false hwf1 (by decide) (by decide)
+      (by decide) (by decide) (by decide) (by decide) (Or.inl (by decide)) hset12).mpr hm1_66_140
+  have hpc_false : m2.prepareCopy (allocRange (Size.ofBytes 62) (Size.ofBytes 4)) =
+      .ok ⟨false, #[4]⟩ :=
+    InitMask.WriteProof.prepareCopy_of_uniform m2 _ (Size.ofBytes 66) false
+      hwf2 (by decide) (by decide) (by decide) fun idx hlo hhi => by
+      change 62 ≤ idx.bytes.toNat at hlo
+      change idx.bytes.toNat < 66 at hhi
+      rw [hm2_get idx (by omega)]
+      split
+      · rfl
+      · omega
+  have hm3_62 : (InitMask.new (Size.ofBytes 200) true).get (Size.ofBytes 62) = .ok true := by
+    have h := InitMask.WriteProof.set_range_get m2 (InitMask.new (Size.ofBytes 200) true)
+      (allocRange Size.ZERO (Size.ofBytes 200)) (Size.ofBytes 200) (Size.ofBytes 62) true
+      hwf2 (by decide) (by decide) (by decide) (by decide) hset23
+    rw [h]; decide
+  exact ⟨hset01, hset12, hset23, hg61, hg62, hg65, hg66, hm2_66_140, hpc_false, hm3_62,
+    InitMask.WriteProof.get_ok_of_wellFormed m2 (Size.ofBytes 199) hwf2 (by decide)⟩
+
+/-- 8. Exposed-address (`Provenance`, `PointerProvenance.offsetIsAddr = true`) `Or.inl` branch of
+`getBytesStripProvenance_ok`, `readScalar_int_roundtrip`, and `readScalar_int_of_bytes` on an
+allocation carrying live pointer provenance (`rangeEmpty = .ok false`, refuting `Or.inr`), pinning
+the concrete serialized pointer bytes across both little- and big-endian target layouts. -/
+private theorem wit_exposed_provenance_strip_and_transmute (endian : Endian) :
+    ∃ (p0 pPtr : Allocation Provenance Unit),
+      let layout : TargetDataLayout := ⟨endian, .w64⟩
+      let ptr : Pointer Provenance := ⟨Size.ofBytes 0x1020, .wildcard⟩
+      let ptrVal : Scalar Provenance := Scalar.fromPointer layout ptr
+      let r08 := allocRange Size.ZERO (Size.ofBytes 8)
+      let subRange := if endian == .little then allocRange Size.ZERO (Size.ofBytes 2)
+        else allocRange (Size.ofBytes 6) (Size.ofBytes 2)
+      Allocation.tryNew (Size.ofBytes 8) Align.EIGHT .Uninit
+        (fun n _ => some (Array.replicate n.bytes.toNat 0)) = .ok p0 ∧
+      Allocation.writeScalar layout r08 ptrVal p0 = .ok () pPtr ∧
+      pPtr.provenanceMap.rangeEmpty r08 (Size.ofBytes 8) = .ok false ∧
+      pPtr.getBytesStripProvenance layout r08 =
+        .ok (if endian == .little then #[0x20, 0x10, 0, 0, 0, 0, 0, 0]
+          else #[0, 0, 0, 0, 0, 0, 0x10, 0x20]) ∧
+      pPtr.readScalar layout r08 false =
+        .ok (Scalar.fromScalarInt (ScalarInt.ofUInt64 0x1020)) ∧
+      pPtr.readScalar layout subRange false =
+        (Scalar.fromUInt (BitVec.ofNat 128 0x1020) (Size.ofBytes 2)).mapError AllocError.scalar := by
+  let layout : TargetDataLayout := ⟨endian, .w64⟩
+  let ptr : Pointer Provenance := ⟨Size.ofBytes 0x1020, .wildcard⟩
+  let ptrVal : Scalar Provenance := Scalar.fromPointer layout ptr
+  let r08 := allocRange Size.ZERO (Size.ofBytes 8)
+  have hend08 : r08.endExclusive = .ok (Size.ofBytes 8) := by decide
+  have hps_eq : Size.fromBits layout.pointerWidth.bits = Size.ofBytes 8 := by
+    dsimp only [layout]; decide
+  obtain ⟨pm1, hpm1_ins, hpm1_ptrs⟩ :
+      ∃ pm1 : ProvenanceMap Provenance,
+        ProvenanceMap.insertPtr Size.ZERO Provenance.wildcard (Size.ofBytes 8) ProvenanceMap.new =
+          .ok () pm1 ∧
+        pm1.ptrs = #[(Size.ZERO, Provenance.wildcard)] :=
+    ⟨_, ProvenanceMap.insertPtr_new Size.ZERO (Size.ofBytes 8) (Size.ofBytes 8)
+      Provenance.wildcard (by decide) hend08, rfl⟩
+  have hconvPtr : ptrVal.toBitsOrPtrInternal r08.size = .ok (.pointer ptr) := by
+    cases endian <;> decide
+  obtain ⟨p0, hp0, _⟩ := Allocation.tryNew_exists (P := Provenance)
+    (Size.ofBytes 8) Align.EIGHT 8 .Uninit (by decide) (by decide)
+  obtain ⟨hbsP, hlenP, hmutP, _, _, hprovP, hmaskP, _, hwfP, _⟩ :=
+    Allocation.tryNew_spec (Size.ofBytes 8) Align.EIGHT .Uninit p0 hp0
+  obtain ⟨pPtr, hwPtr, _, _, _, _, _, _, hmlPtr, hwfPtr, _, hisPtr, hprovPtr, _, hbytesPtr, _⟩ :=
+    Allocation.writeScalar_spec layout p0 r08 ptrVal (.pointer ptr) ProvenanceMap.new pm1
+      (by rw [hlenP, hbsP]) hmutP (by rw [hmaskP rfl, hbsP]; rfl) hwfP
+      (by decide) (by decide) (by rw [hbsP]; decide) hconvPtr
+      (fun _ _ => by
+        rw [hprovP, hps_eq]
+        exact ProvenanceMap.clear_new _ _ _ (Size.ofBytes 8) (by decide) hend08)
+      ⟨hps_eq.symm, by rw [hps_eq]; exact hpm1_ins⟩
+  have hnotEmpty : pPtr.provenanceMap.rangeEmpty r08 (Size.ofBytes 8) = .ok false := by
+    rw [hprovPtr]
+    unfold ProvenanceMap.rangeEmpty
+    rw [ProvenanceMap.rangePtrs_eq_R]
+    unfold ProvenanceMap.rangePtrsR ProvenanceMap.adjustedStart ProvenanceMap.rangeEnd
+      ProvenanceMap.rangeEntries
+    rw [hpm1_ptrs]
+    rfl
+  have hrawBytes : pPtr.getBytesUnchecked r08 =
+      .ok (if endian == .little then #[0x20, 0x10, 0, 0, 0, 0, 0, 0]
+        else #[0, 0, 0, 0, 0, 0, 0x10, 0x20]) := by
+    rw [hbytesPtr ptr rfl]
+    cases endian <;> decide
+  have hstrip : pPtr.getBytesStripProvenance layout r08 =
+      .ok (if endian == .little then #[0x20, 0x10, 0, 0, 0, 0, 0, 0]
+        else #[0, 0, 0, 0, 0, 0, 0x10, 0x20]) :=
+    (Allocation.getBytesStripProvenance_ok pPtr layout r08 hisPtr (Or.inl rfl)).trans hrawBytes
+  have hbv : (BitVec.ofNat 128 ptr.offset.bytes.toNat).toNat = (0x1020 : Nat) := by decide
+  have hpSlice : pPtr.getBytesUnchecked r08 =
+      .ok (Array.ofFn (fun i : Fin r08.size.bytes.toNat =>
+        UInt8.ofNat (((BitVec.ofNat 128 0x1020).toNat / 2 ^ (8 *
+          (if layout.endian == .little then i.1 else r08.size.bytes.toNat - i.1 - 1))) % 256))) := by
+    simpa [hbv] using hbytesPtr ptr rfl
+  have hfromUInt8 : (Scalar.fromUInt (Prov := Provenance) (BitVec.ofNat 128 0x1020) r08.size).mapError
+      AllocError.scalar = .ok (Scalar.fromScalarInt (ScalarInt.ofUInt64 0x1020)) := by decide
+  have htransmute8 : pPtr.readScalar layout r08 false =
+      .ok (Scalar.fromScalarInt (ScalarInt.ofUInt64 0x1020)) :=
+    (Allocation.readScalar_int_roundtrip pPtr layout r08 (BitVec.ofNat 128 0x1020)
+      hisPtr (by decide) (by decide) (Or.inl rfl) hpSlice).trans hfromUInt8
+  have hlenMaskPtr : pPtr.initializationMask.len = Size.ofBytes 8 := by
+    rw [hmlPtr, hmaskP rfl]; rfl
+  have hallInit : ∀ idx : Size, 0 ≤ idx.bytes.toNat → idx.bytes.toNat < 8 →
+      pPtr.initializationMask.get idx = .ok true :=
+    (InitMask.WriteProof.isRangeInitialized_nonempty_iff pPtr.initializationMask r08
+      (Size.ofBytes 8) hwfPtr hend08 (by decide) (by rw [hlenMaskPtr]; decide)).1.mp hisPtr
+  have hsub : pPtr.readScalar layout
+      (if endian == .little then allocRange Size.ZERO (Size.ofBytes 2)
+        else allocRange (Size.ofBytes 6) (Size.ofBytes 2)) false =
+      (Scalar.fromUInt (BitVec.ofNat 128 0x1020) (Size.ofBytes 2)).mapError AllocError.scalar := by
+    cases endian
+    · have hinitSub : pPtr.initializationMask.isRangeInitialized
+          (allocRange Size.ZERO (Size.ofBytes 2)) = .ok (.ok ()) :=
+        (InitMask.WriteProof.isRangeInitialized_nonempty_iff pPtr.initializationMask _
+          (Size.ofBytes 2) hwfPtr (by decide) (by decide)
+          (by rw [hlenMaskPtr]; decide)).1.mpr fun idx hlo hhi => by
+          change idx.bytes.toNat < 2 at hhi
+          exact hallInit idx hlo (by omega)
+      have hsliceSub : pPtr.getBytesUnchecked (allocRange Size.ZERO (Size.ofBytes 2)) =
+          .ok #[0x20, 0x10] := by
+        have hs := Allocation.getBytesUnchecked_subrange pPtr r08
+          (allocRange Size.ZERO (Size.ofBytes 2)) (Size.ofBytes 8) (Size.ofBytes 2)
+          #[0x20, 0x10, 0, 0, 0, 0, 0, 0] hend08 (by decide) (by decide) (by decide) (by decide)
+          hrawBytes
+        exact hs.trans (by decide)
+      change pPtr.readScalar ⟨.little, .w64⟩ (allocRange Size.ZERO (Size.ofBytes 2)) false = _
+      rw [Allocation.readScalar_int_of_bytes pPtr ⟨.little, .w64⟩ _ #[0x20, 0x10]
+        hinitSub hsliceSub (by decide) (Or.inl rfl)]
+      rfl
+    · have hinitSub : pPtr.initializationMask.isRangeInitialized
+          (allocRange (Size.ofBytes 6) (Size.ofBytes 2)) = .ok (.ok ()) :=
+        (InitMask.WriteProof.isRangeInitialized_nonempty_iff pPtr.initializationMask _
+          (Size.ofBytes 8) hwfPtr (by decide) (by decide)
+          (by rw [hlenMaskPtr]; decide)).1.mpr fun idx hlo hhi => by
+          change 6 ≤ idx.bytes.toNat at hlo
+          change idx.bytes.toNat < 8 at hhi
+          exact hallInit idx (by omega) hhi
+      have hsliceSub : pPtr.getBytesUnchecked (allocRange (Size.ofBytes 6) (Size.ofBytes 2)) =
+          .ok #[0x10, 0x20] := by
+        have hs := Allocation.getBytesUnchecked_subrange pPtr r08
+          (allocRange (Size.ofBytes 6) (Size.ofBytes 2)) (Size.ofBytes 8) (Size.ofBytes 8)
+          #[0, 0, 0, 0, 0, 0, 0x10, 0x20] hend08 (by decide) (by decide) (by decide) (by decide)
+          hrawBytes
+        exact hs.trans (by decide)
+      change pPtr.readScalar ⟨.big, .w64⟩ (allocRange (Size.ofBytes 6) (Size.ofBytes 2)) false = _
+      rw [Allocation.readScalar_int_of_bytes pPtr ⟨.big, .w64⟩ _ #[0x10, 0x20]
+        hinitSub hsliceSub (by decide) (Or.inl rfl)]
+      rfl
+  exact ⟨p0, pPtr, hp0, hwPtr, hnotEmpty, hstrip, htransmute8, hsub⟩
 
 end LeanMiriSpec.MemoryLemmas.NonVacuity
 
@@ -4490,5 +4690,3 @@ end LeanMiriSpec.MemoryLemmas.NonVacuity
   Miri.Memory.Allocation.writeUninit_spec
   Miri.Memory.Allocation.copyRepeatedly_initialized_spec
   Miri.Memory.Allocation.copy_initialized_spec
-
-#assert_module_standard_axioms
