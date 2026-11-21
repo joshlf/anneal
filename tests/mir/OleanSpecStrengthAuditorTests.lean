@@ -959,6 +959,12 @@ def b11Cert : MultiMutantSpecCert b11Strong.pre b11Strong.post := ret10MultiCert
 -- B1-6: a universe-polymorphic `sorry` certificate must report `sorryAxiomReached` (audit first).
 def b16PolySorryCert.{u} : (fun (_ : Sort u) => MultiMutantSpecCert ret10Pre ret10Post) PUnit := sorry
 
+-- A2-7: an erased global instance (`attribute [-instance]`) must fail `isGlobalInstanceRegistered`
+-- even in live `MetaM` when `useSynthInstance := false`.
+instance a27ErasedInst : ItemSpec "ep2::a27_erased" where pre := ret10Pre; post := ret10Post
+attribute [-instance] a27ErasedInst
+def a27Cert : MultiMutantSpecCert a27ErasedInst.pre a27ErasedInst.post := ret10MultiCert
+
 #eval show MetaM Unit from do
   let env ← getEnv
   let p := specInstanceCandidates env `Trusted.VerificationResult.ItemSpec "ep2::b11" 256
@@ -974,6 +980,8 @@ def b16PolySorryCert.{u} : (fun (_ : Sort u) => MultiMutantSpecCert ret10Pre ret
   IO.println s!"B1_1_theorem_major_zero_fp_control: pure={pc == #[]} meta={mc == #[]}"
   IO.println (fmtTags "B1_6_poly_sorry_cert_reports_sorry"
     (← auditSpecStrengthCert ``b16PolySorryCert (.direct (mkConst ``ret10Pre) (mkConst ``ret10Post))))
+  IO.println (fmtTags "A2_7_erased_instance_rejected_no_synth"
+    (← auditItemSpecStrengthBySynth .item "ep2::a27_erased" ``a27Cert (useSynthInstance := false)))
 
 -- A4-5a: `Lean.reduceBool` canary (fails closed in both scanners: never evaluated natively)
 def a4RbFlag : Bool := true
@@ -1163,6 +1171,77 @@ theorem b21ResolvesWeak : (inferInstance : ItemSpec "ep2::b21").pre [] = False :
   IO.println s!"{fmtTags "B2_1_forged_instance_entry_gate_no_synth" g1} names={g1.any (fun v => (v.detail.splitOn "b21Universal").length > 1)}"
   let g2 ← auditItemSpecStrengthBySynth .item "ep2::b21" ``b21Cert
   IO.println s!"{fmtTags "B2_1_forged_instance_entry_gate_synth" g2} names={g2.any (fun v => (v.detail.splitOn "b21Universal").length > 1)}"
+
+/-! ### Episode 2 `A2` regressions (`.proj` / `recInfo` / `.local` / `default_instance` forged entries) -/
+
+-- A2-1a: `.proj`-headed forged instance (`[c : A21aCarrier] → c.ty`) keyed like `ItemSpec "ep2::a21a"`.
+instance a21aStrong : ItemSpec "ep2::a21a" where pre := ret10Pre; post := ret10Post
+class A21aCarrier : Type 2 where
+  ty : Type 1
+  inst : ty
+instance a21aCarrierInst : A21aCarrier where
+  ty := ItemSpec "ep2::a21a"
+  inst := { pre := fun _ => False, post := fun _ _ => True }
+def a21aProjUniv [c : A21aCarrier] : c.ty := c.inst
+def a21aCert : MultiMutantSpecCert a21aStrong.pre a21aStrong.post := ret10MultiCert
+run_cmd Elab.Command.liftTermElabM do
+  let keys ← Meta.DiscrTree.mkPath (mkApp (mkConst ``ItemSpec) (mkStrLit "ep2::a21a"))
+  let ent : Meta.InstanceEntry := { keys := keys, val := mkConst ``a21aProjUniv, priority := 5000, globalName? := some ``a21aProjUniv, synthOrder := #[0], attrKind := AttributeKind.global }
+  Meta.instanceExtension.add ent AttributeKind.global
+theorem a21aResolvesWeak : (inferInstance : ItemSpec "ep2::a21a").pre [] = False := rfl
+
+-- A2-1b: `recInfo`-headed forged instance (`Bool.rec _ s.a s.b s.tag`) keyed like `ItemSpec "ep2::a21b"`.
+instance a21bStrong : ItemSpec "ep2::a21b" where pre := ret10Pre; post := ret10Post
+class A21bSum : Type 2 where
+  tag : Bool
+  a : Type 1
+  b : Type 1
+  inst : Bool.rec (motive := fun _ => Type 1) a b tag
+instance a21bSumInst : A21bSum where
+  tag := false
+  a := ItemSpec "ep2::a21b"
+  b := PUnit
+  inst := { pre := fun _ => False, post := fun _ _ => True }
+def a21bRecUniv [s : A21bSum] : Bool.rec (motive := fun _ => Type 1) s.a s.b s.tag := s.inst
+def a21bCert : MultiMutantSpecCert a21bStrong.pre a21bStrong.post := ret10MultiCert
+run_cmd Elab.Command.liftTermElabM do
+  let keys ← Meta.DiscrTree.mkPath (mkApp (mkConst ``ItemSpec) (mkStrLit "ep2::a21b"))
+  let ent : Meta.InstanceEntry := { keys := keys, val := mkConst ``a21bRecUniv, priority := 5000, globalName? := some ``a21bRecUniv, synthOrder := #[0], attrKind := AttributeKind.global }
+  Meta.instanceExtension.add ent AttributeKind.global
+theorem a21bResolvesWeak : (inferInstance : ItemSpec "ep2::a21b").pre [] = False := rfl
+
+-- A2-3: `.local` forged instance stored ONLY in `stateStack` (never in `newEntries` or `getModuleEntries`).
+instance a23Strong : ItemSpec "ep2::a23" where pre := ret10Pre; post := ret10Post
+class A23Holder (T : Type 1) where val : T
+instance a23HolderInst : A23Holder (ItemSpec "ep2::a23") := ⟨{ pre := fun _ => False, post := fun _ _ => True }⟩
+def a23LocUniv {T : Type 1} [h : A23Holder T] : T := h.val
+def a23Cert : MultiMutantSpecCert a23Strong.pre a23Strong.post := ret10MultiCert
+run_cmd Elab.Command.liftTermElabM do
+  let keys ← Meta.DiscrTree.mkPath (mkApp (mkConst ``ItemSpec) (mkStrLit "ep2::a23"))
+  let ent : Meta.InstanceEntry := { keys := keys, val := mkConst ``a23LocUniv, priority := 5000, globalName? := some ``a23LocUniv, synthOrder := #[1], attrKind := AttributeKind.local }
+  Meta.instanceExtension.add ent AttributeKind.local
+theorem a23ResolvesWeak : (inferInstance : ItemSpec "ep2::a23").pre [] = False := rfl
+
+-- A2-6: forged `Meta.defaultInstanceExtension` entry for `ItemSpec`.
+def a26DefUniv [c : A21aCarrier] : c.ty := c.inst
+run_cmd Elab.Command.liftCoreM do
+  modifyEnv fun env => Meta.defaultInstanceExtension.addEntry env { className := ``ItemSpec, instanceName := ``a26DefUniv, priority := 1000 }
+
+#eval show MetaM Unit from do
+  let env ← getEnv
+  let ctx := SpecAuditCtx.forLiveMeta env 400
+  let ecProj := instanceEntryCandidates env ctx.toolchainProv `Trusted.VerificationResult.ItemSpec "ep2::a21a" 256
+  let ecRec := instanceEntryCandidates env ctx.toolchainProv `Trusted.VerificationResult.ItemSpec "ep2::a21b" 256
+  let ecLoc := instanceEntryCandidates env ctx.toolchainProv `Trusted.VerificationResult.ItemSpec "ep2::a23" 256
+  IO.println s!"A2_1a_proj_forged_scan: listed={ecProj.contains ``a21aProjUniv} defInst={ecProj.contains ``a26DefUniv}"
+  IO.println s!"A2_1b_rec_forged_scan: listed={ecRec.contains ``a21bRecUniv}"
+  IO.println s!"A2_3_local_stateStack_scan: listed={ecLoc.contains ``a23LocUniv}"
+  let gp ← auditItemSpecStrengthBySynth .item "ep2::a21a" ``a21aCert (useSynthInstance := false)
+  let gr ← auditItemSpecStrengthBySynth .item "ep2::a21b" ``a21bCert (useSynthInstance := false)
+  let gl ← auditItemSpecStrengthBySynth .item "ep2::a23" ``a23Cert (useSynthInstance := false)
+  IO.println s!"{fmtTags "A2_1a_proj_forged_gate" gp} names={gp.any (fun v => (v.detail.splitOn "a21aProjUniv").length > 1)}"
+  IO.println s!"{fmtTags "A2_1b_rec_forged_gate" gr} names={gr.any (fun v => (v.detail.splitOn "a21bRecUniv").length > 1)}"
+  IO.println s!"{fmtTags "A2_3_local_stateStack_gate" gl} names={gl.any (fun v => (v.detail.splitOn "a23LocUniv").length > 1)}"
 "##
 
 private def collectPartsJson (baseDir : System.FilePath) (modName : String) : IO Lean.Json := do
@@ -1330,6 +1409,7 @@ B1_1_theorem_major_synth_gate: #[specInstanceAmbiguous]
 B1_1_theorem_major_gate_no_synth: #[specInstanceAmbiguous]
 B1_1_theorem_major_zero_fp_control: pure=true meta=true
 B1_6_poly_sorry_cert_reports_sorry: #[sorryAxiomReached]
+A2_7_erased_instance_rejected_no_synth: #[specStrengthCertMissing]
 A4_5a_reduceBool: pure=true meta=true
 A4_5b_reduceNat_asymmetry: pure=true meta=true
 A4_5b_reduceNat_synth_gate: #[specInstanceAmbiguous]
@@ -1345,6 +1425,12 @@ A1_4_string_rec_literal: pure=true meta=true
 B2_1_forged_instance_entry_scan: listed=true strongListed=true
 B2_1_forged_instance_entry_gate_no_synth: #[specInstanceAmbiguous] names=true
 B2_1_forged_instance_entry_gate_synth: #[specInstanceAmbiguous] names=true
+A2_1a_proj_forged_scan: listed=true defInst=true
+A2_1b_rec_forged_scan: listed=true
+A2_3_local_stateStack_scan: listed=true
+A2_1a_proj_forged_gate: #[specInstanceAmbiguous] names=true
+A2_1b_rec_forged_gate: #[specInstanceAmbiguous] names=true
+A2_3_local_stateStack_gate: #[specInstanceAmbiguous] names=true
 V7_statement_leak: ok=false statementOriginLeak=true
 V7_proof_only_ok: ok=true statementOriginLeak=false
 tmp_clean=true

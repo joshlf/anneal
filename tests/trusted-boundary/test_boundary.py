@@ -1825,6 +1825,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "theorem epVacClaim_ok : VerificationResult epVacClaim := ⟨trivial⟩\n"
             "def epTrivClaim : Claim := { pre := epPre, post := fun _ _ => True }\n"
             "theorem epTrivClaim_ok : VerificationResult epTrivClaim := ⟨trivial⟩\n"
+            "def epTrivCert := epMultiCert\n"
             "def epNotAThm : VerificationResult epClaim := ⟨trivial⟩\n"
             "def epWrongRelyCert : ModularMultiMutantSpecCert (fun _ => True) epModClaim.pre epModClaim.post := {\n"
             "  envNonVacuous := ⟨fun x => x, trivial⟩, specCert := epStMultiCert }\n"
@@ -1853,6 +1854,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         # Batched with distinct `(tag, decl)` pairs so every single violation is verified explicitly.
         olean_reject(ol2, base_spec_mods + ["OlEp2SpecClean"],
                      "[specStrengthCertInvalidType] epMultiCert",
+                     "[specStrengthCertInvalidType] epTrivCert",
                      "[unapprovedAxiom] Classical.choice",
                      "[specStrengthCoverageGap] epMultiCert",
                      "[specStrengthCertInvalidType] epNotAThm",
@@ -1860,6 +1862,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                      "[specStrengthCertInvalidType] epDetCert",
                      specStrengthChecks=[
                          {"kind": "claim", "claim": "epVacClaim_ok", "cert": "epMultiCert"},
+                         {"kind": "claim", "claim": "epTrivClaim_ok", "cert": "epTrivCert"},
                          {"kind": "claim", "claim": "epClaim_ok", "cert": "epClassicalCert"},
                          {"kind": "claim", "claim": "epClaim_ok", "cert": "epMultiCert",
                           "requiredCategories": ["wrongReturn", "unpreservedFrame"]},
@@ -1867,8 +1870,6 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                          {"kind": "claim", "claim": "epModClaim_ok", "cert": "epWrongRelyCert"},
                          {"kind": "claim", "claim": "epClaim_ok", "cert": "epDetCert", "requireInputSensitive": True},
                      ])
-        olean_reject(ol2, base_spec_mods + ["OlEp2SpecClean"], "[specStrengthCertInvalidType] epMultiCert",
-                     specStrengthChecks=[{"kind": "claim", "claim": "epTrivClaim_ok", "cert": "epMultiCert"}])
 
         # A1-4 (`sorry`-faked cert reports `sorryAxiomReached`, NOT `specStrengthCoverageGap`).
         olean_module(ol2, "OlEp2A14", (
@@ -2020,20 +2021,33 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         assert native_marker.exists(), "native-evaluator canary is not live (the compiler did not run it)"
         native_marker.unlink()
         native_mods = base_spec_mods + ["OlEp2SpecClean", "OlEp2NativeImpl", "OlEp2NativeUse"]
-        for native_extra in (
-            {"specStrengthChecks": [{"kind": "itemSynth", "defId": "ep2::ev", "cert": "epMultiCert"}]},
-            {"claimModules": ["OlEp2NativeUse"]},
-            {},
-        ):
-            native_err = olean_reject(ol2, native_mods, "[nativeDecideReached] Lean.reduceBool",
-                                      "kernel-native evaluator", "[nativeDecideReached] Lean.trustCompiler",
-                                      **native_extra)
-            assert not native_marker.exists(), f"audited code ran inside OleanEnvAuditor ({native_extra})"
-            assert "specInstanceAmbiguous" not in native_err and "kernelReplayFailed" not in native_err, native_err
+        native_err = olean_reject(
+            ol2, native_mods, "[nativeDecideReached] Lean.reduceBool",
+            "kernel-native evaluator", "[nativeDecideReached] Lean.trustCompiler",
+            specStrengthChecks=[{"kind": "itemSynth", "defId": "ep2::ev", "cert": "epMultiCert"}],
+            claimModules=["OlEp2NativeUse"])
+        assert not native_marker.exists(), "audited code ran inside OleanEnvAuditor (specStrengthChecks + claimModules)"
+        assert "specInstanceAmbiguous" not in native_err and "kernelReplayFailed" not in native_err, native_err
         # `Lean.reduceNat` alone (no `Lean.reduceBool` anywhere) is the same class.
         olean_module(ol2, "OlEp2NativeNat", "prelude\nimport Init\nset_option linter.deprecated false\n"
                      "def rnVal : Nat := 0\ndef rnUse : Nat := Lean.reduceNat rnVal\n", ["Init"])
         olean_reject(ol2, ["OlEp2NativeNat"], "[nativeDecideReached] Lean.reduceBool", "kernel-native evaluator")
+
+        # A2-5: `Lean.reduceBool` hidden ONLY inside a forged `Meta.instanceExtension` entry's
+        # `ent.val` (no declaration in `data.constants` mentions `Lean.reduceBool`).
+        olean_module(ol2, "OlEp2NativeInst", (
+            "prelude\nimport Init\nimport Lean\nimport OlEp2SpecClean\n"
+            "open Lean Meta Trusted.VerificationResult\n"
+            "def a25Flag : Bool := true\n"
+            "run_cmd Elab.Command.liftTermElabM do\n"
+            "  let keys ← DiscrTree.mkPath (mkApp (mkConst ``ItemSpec) (mkStrLit \"ep2::a25\"))\n"
+            "  let ent : InstanceEntry := { keys := keys, val := mkApp (mkConst ``Lean.reduceBool) (mkConst ``a25Flag), "
+            "priority := 5000, globalName? := none, synthOrder := #[], attrKind := AttributeKind.global }\n"
+            "  instanceExtension.add ent AttributeKind.global\n"),
+            ["Init", "Lean", "OlEp2SpecClean"])
+        olean_reject(ol2, base_spec_mods + ["OlEp2SpecClean", "OlEp2NativeInst"],
+                     "[nativeDecideReached] Lean.reduceBool", "kernel-native evaluator",
+                     toolchainRoots=["Init", "Std", "Lean"])
 
         # A1-1 (duplicate reserved theorem copy native-evaluator RCE bypass of B1-4): when M1's
         # clean `a1f.eq_1` shadows M2's evil `a1f.eq_1` in `env.find?`, `reachesNativeEvaluator`
@@ -2058,6 +2072,24 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                      "[nativeDecideReached] Lean.reduceBool", "kernel-native evaluator",
                      toolchainRoots=["Init", "Std", "Lean"])
         assert not native_marker.exists(), "A1-1 duplicate reserved theorem executed audited code inside OleanEnvAuditor!"
+
+        # A2-4 (duplicate reserved theorem copy with `Classical.choice` in `constructiveModules`):
+        # when M1's clean `a1f.eq_1` shadows `OlEp2DupChoice`'s classical `a1f.eq_1` in `env.find?`,
+        # auditing `OlEp2DupChoice` under `constructiveModules` with `allowClassicalChoice=True`
+        # must still reject `Classical.choice`.
+        olean_module(ol2, "OlEp2DupChoice", (
+            "prelude\nimport Init\nimport Lean\nimport OlEp2DupM0\nopen Lean\n"
+            "run_cmd Elab.Command.liftCoreM do\n"
+            "  let ty := mkApp3 (mkConst ``Eq [Level.one]) (mkConst ``Nat) (mkApp (mkConst ``a1f) (mkNatLit 0)) (mkNatLit 0)\n"
+            "  let choiceVal := mkApp2 (mkConst ``Classical.choice [Level.one]) (mkConst ``Nat) "
+            "(mkApp2 (mkConst ``Nonempty.intro [Level.one]) (mkConst ``Nat) (mkNatLit 0))\n"
+            "  let val := Expr.letE `c (mkConst ``Nat) choiceVal (mkApp2 (mkConst ``Eq.refl [Level.one]) (mkConst ``Nat) (mkNatLit 0)) false\n"
+            "  addDecl (.thmDecl { name := `a1f.eq_1, levelParams := [], type := ty, value := val })\n"),
+            ["Init", "Lean", "OlEp2DupM0"])
+        olean_reject(ol2, ["OlEp2DupM0", "OlEp2DupChoice", "OlEp2DupM1"],
+                     "[unapprovedAxiom]", "Classical.choice",
+                     toolchainRoots=["Init", "Std", "Lean"],
+                     allowClassicalChoice=True, constructiveModules=["OlEp2DupChoice"])
 
         # B1-5 & A1-5a/d (specification-library provenance & constructive `allowClassicalChoice=False`
         # with checker-compiled `Trusted`).
@@ -2122,13 +2154,12 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             ol2.modules = saved_modules
             ol2.spec_lib_owned = False
 
-        # B2-1 (forged registered-instance entry). Resolution retrieves an instance by the `keys`
-        # stored in its `Meta.instanceExtension` entry and unifies with the declared type of the entry's
-        # constant. `instanceExtension.add` bypasses `addInstance`'s "return type is a class" check, so
-        # an entry for `fiUniversal {T : Type 1} [h : FiHolder T] : T` keyed like `ItemSpec "ep2::fi"`
-        # makes `ItemSpec "ep2::fi"` resolve to the weak `FiHolder` payload (the fixture proves it with
-        # `rfl`). No declaration's type mentions the weak specification under `ItemSpec`; the standalone
-        # gate used to certify the strong instance as unique.
+        # B2-1 + A2-1a/b + A2-2a/b + A2-6 (forged registered-instance & default-instance entries).
+        # `instanceExtension.add` bypasses `addInstance`'s "return type is a class" check, so forged
+        # entries concluding in a variable (`T`, B2-1), stuck projection (`c.ty`, A2-1a), or stuck
+        # eliminator (`Bool.rec _ s.a s.b s.tag`, A2-1b) keyed like `ItemSpec d` make `inferInstance`
+        # resolve to weak specs (`rfl`-proved in `OlEp2ForgedUse`), and forged `defaultInstanceExtension`
+        # entries (A2-6) can inject weak defaults; all must be caught as candidates.
         olean_module(ol2, "OlEp2ForgedInst", (
             "prelude\nimport Init\nimport Lean\nimport OlEp2SpecClean\n"
             "open Lean Meta Trusted.VerificationResult\n"
@@ -2137,29 +2168,82 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "instance fiHolderInst : FiHolder (ItemSpec \"ep2::fi\") :=\n"
             "  ⟨{ pre := fun _ => False, post := fun _ _ => True }⟩\n"
             "def fiUniversal {T : Type 1} [h : FiHolder T] : T := h.val\n"
+            "instance a2ProjStrong : ItemSpec \"ep2::a2proj\" where pre := epPre; post := epPost\n"
+            "class A2Carrier : Type 2 where\n  ty : Type 1\n  inst : ty\n"
+            "instance a2CarrierInst : A2Carrier where\n"
+            "  ty := ItemSpec \"ep2::a2proj\"\n  inst := { pre := fun _ => False, post := fun _ _ => True }\n"
+            "def a2ProjUniv [c : A2Carrier] : c.ty := c.inst\n"
+            "instance a2RecStrong : ItemSpec \"ep2::a2rec\" where pre := epPre; post := epPost\n"
+            "class A2Sum : Type 2 where\n"
+            "  tag : Bool\n  a : Type 1\n  b : Type 1\n  inst : Bool.rec (motive := fun _ => Type 1) a b tag\n"
+            "instance a2SumInst : A2Sum where\n"
+            "  tag := false\n  a := ItemSpec \"ep2::a2rec\"\n  b := PUnit\n"
+            "  inst := { pre := fun _ => False, post := fun _ _ => True }\n"
+            "def a2RecUniv [s : A2Sum] : Bool.rec (motive := fun _ => Type 1) s.a s.b s.tag := s.inst\n"
+            "def a2DefUniv [c : A2Carrier] : c.ty := c.inst\n"
             "run_cmd Elab.Command.liftTermElabM do\n"
-            "  let keys ← DiscrTree.mkPath (mkApp (mkConst ``ItemSpec) (mkStrLit \"ep2::fi\"))\n"
-            "  let ent : InstanceEntry := { keys := keys, val := mkConst ``fiUniversal, priority := 5000, "
-            "globalName? := some ``fiUniversal, synthOrder := #[1], attrKind := AttributeKind.global }\n"
-            "  instanceExtension.add ent AttributeKind.global\n"
-            "instance fiOtherStrong : ItemSpec \"ep2::fi_other\" where pre := epPre; post := epPost\n"),
+            "  let k1 ← DiscrTree.mkPath (mkApp (mkConst ``ItemSpec) (mkStrLit \"ep2::fi\"))\n"
+            "  instanceExtension.add { keys := k1, val := mkConst ``fiUniversal, priority := 5000, "
+            "globalName? := some ``fiUniversal, synthOrder := #[1], attrKind := AttributeKind.global } AttributeKind.global\n"
+            "  let k2 ← DiscrTree.mkPath (mkApp (mkConst ``ItemSpec) (mkStrLit \"ep2::a2proj\"))\n"
+            "  instanceExtension.add { keys := k2, val := mkConst ``a2ProjUniv, priority := 5000, "
+            "globalName? := some ``a2ProjUniv, synthOrder := #[0], attrKind := AttributeKind.global } AttributeKind.global\n"
+            "  let k3 ← DiscrTree.mkPath (mkApp (mkConst ``ItemSpec) (mkStrLit \"ep2::a2rec\"))\n"
+            "  instanceExtension.add { keys := k3, val := mkConst ``a2RecUniv, priority := 5000, "
+            "globalName? := some ``a2RecUniv, synthOrder := #[0], attrKind := AttributeKind.global } AttributeKind.global\n"
+            "  modifyEnv fun env => defaultInstanceExtension.addEntry env { className := ``ItemSpec, instanceName := ``a2DefUniv, priority := 1000 }\n"
+            "instance fiOtherStrong : ItemSpec \"ep2::fi_other\" where pre := epPre; post := epPost\n"
+            "def c_fi := epMultiCert\ndef c_fi_other := epMultiCert\n"
+            "def c_a2proj := epMultiCert\ndef c_a2rec := epMultiCert\n"),
             ["Init", "Lean", "OlEp2SpecClean"])
         olean_module(ol2, "OlEp2ForgedUse", (
             "prelude\nimport Init\nimport OlEp2ForgedInst\n"
             "open Trusted.VerificationResult\n"
-            "theorem fiResolvesWeak : (inferInstance : ItemSpec \"ep2::fi\").pre [0] = False := rfl\n"),
+            "theorem fiResolvesWeak : (inferInstance : ItemSpec \"ep2::fi\").pre [0] = False := rfl\n"
+            "theorem a2ProjResolvesWeak : (inferInstance : ItemSpec \"ep2::a2proj\").pre [0] = False := rfl\n"
+            "theorem a2RecResolvesWeak : (inferInstance : ItemSpec \"ep2::a2rec\").pre [0] = False := rfl\n"),
             ["Init", "OlEp2ForgedInst"])
         forged_mods = base_spec_mods + ["OlEp2SpecClean", "OlEp2ForgedInst", "OlEp2ForgedUse"]
-        olean_reject(ol2, forged_mods, "[specInstanceAmbiguous] epMultiCert", "fiUniversal",
-                     toolchainRoots=["Init", "Std", "Lean"],
-                     specStrengthChecks=[{"kind": "itemSynth", "defId": "ep2::fi", "cert": "epMultiCert"}])
-        # The registered `ItemSpec` instances themselves are classified, not failed closed: the
-        # variable-conclusion entry is a candidate everywhere, a class-concluding one only for its defId.
-        fi_err = olean_reject(ol2, forged_mods, "[specInstanceAmbiguous] epMultiCert",
-                              toolchainRoots=["Init", "Std", "Lean"],
-                              specStrengthChecks=[{"kind": "itemSynth", "defId": "ep2::fi_other",
-                                                   "cert": "epMultiCert"}])
-        assert "#[fiOtherStrong, fiUniversal]" in fi_err, fi_err
+        fi_err = olean_reject(
+            ol2, forged_mods,
+            "[specInstanceAmbiguous] c_fi", "fiUniversal",
+            "[specInstanceAmbiguous] c_a2proj", "a2ProjUniv", "a2DefUniv",
+            "[specInstanceAmbiguous] c_a2rec", "a2RecUniv",
+            "[specInstanceAmbiguous] c_fi_other", "fiOtherStrong",
+            toolchainRoots=["Init", "Std", "Lean"],
+            specStrengthChecks=[
+                {"kind": "itemSynth", "defId": "ep2::fi", "cert": "c_fi"},
+                {"kind": "itemSynth", "defId": "ep2::a2proj", "cert": "c_a2proj"},
+                {"kind": "itemSynth", "defId": "ep2::a2rec", "cert": "c_a2rec"},
+                {"kind": "itemSynth", "defId": "ep2::fi_other", "cert": "c_fi_other"},
+            ])
+        assert "#[a2DefUniv, a2ProjUniv, a2RecUniv, fiOtherStrong, fiUniversal]" in fi_err, fi_err
+
+        # A2-2a & A2-2b (forged `isGlobalInstanceRegistered` entries): a plain non-instance `def`
+        # backed by a `.global` entry with either a spoofed `globalName?` on an unrelated `val`
+        # (A2-2a) or wrong discrimination-tree keys (A2-2b) must still fail with `specStrengthCertMissing`.
+        olean_module(ol2, "OlEp2ForgedKeys", (
+            "prelude\nimport Init\nimport Lean\nimport OlEp2SpecClean\n"
+            "open Lean Meta Trusted.VerificationResult\n"
+            "def a2Plain : ItemSpec \"ep2::a2plain\" := { pre := epPre, post := epPost }\n"
+            "def a2Dummy : Nat := 0\n"
+            "def a2WrongKeys : ItemSpec \"ep2::a2wkeys\" := { pre := epPre, post := epPost }\n"
+            "run_cmd Elab.Command.liftTermElabM do\n"
+            "  let natKeys ← DiscrTree.mkPath (mkConst ``Nat)\n"
+            "  instanceExtension.add { keys := natKeys, val := mkConst ``a2Dummy, priority := 1000, "
+            "globalName? := some ``a2Plain, synthOrder := #[], attrKind := AttributeKind.global } AttributeKind.global\n"
+            "  instanceExtension.add { keys := natKeys, val := mkConst ``a2WrongKeys, priority := 1000, "
+            "globalName? := some ``a2WrongKeys, synthOrder := #[], attrKind := AttributeKind.global } AttributeKind.global\n"),
+            ["Init", "Lean", "OlEp2SpecClean"])
+        olean_reject(
+            ol2, base_spec_mods + ["OlEp2SpecClean", "OlEp2ForgedKeys"],
+            "[specStrengthCertMissing] a2Plain",
+            "[specStrengthCertMissing] a2WrongKeys",
+            toolchainRoots=["Init", "Std", "Lean"],
+            specStrengthChecks=[
+                {"kind": "itemSynth", "defId": "ep2::a2plain", "cert": "epMultiCert"},
+                {"kind": "itemSynth", "defId": "ep2::a2wkeys", "cert": "epMultiCert"},
+            ])
 
         # A4-7 (26-deep binary branching) in a compiled `.olean`.
         exp_lines = ["prelude", "import Init", "import OlEp2SpecClean", "open Trusted.VerificationResult",
@@ -2181,7 +2265,8 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         runner.make_tree_writable(ol2.checkout)
         shutil.rmtree(ol2.checkout)
         done("Episode 2 compiled spec-strength gates (V8/V9, 4 claim kinds, A1-4, A3-3 _sunfold, A1-2/S3 shadows, "
-             "B1-1 theorem-major, B1-4/A1-1 native-evaluator canaries, B1-5/A1-5 provenance & constructive, A1-3/A1-6, B2-1 forged instance entry, A4-7)")
+             "B1-1 theorem-major, B1-4/A1-1/A2-5 native-evaluator canaries, B1-5/A1-5/A2-4 provenance & constructive, "
+             "A1-3/A1-6, B2-1/A2-1/A2-2/A2-6 forged instances, A4-7)")
     except BaseException as error:
         (suite / "failure.traceback").write_text(traceback.format_exc())
         print(f"SELF-TEST FAILED: {error}\nPreserved fixture sources/raw logs: {suite}", file=sys.stderr)

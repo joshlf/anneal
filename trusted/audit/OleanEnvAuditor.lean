@@ -2682,7 +2682,7 @@ def specClassConclusionMatchBudget (env : Environment) (specClass : Name) (targe
             let isElim := match env.find? c with
               | some (.recInfo _) | some (.quotInfo _) => true
               | _ => false
-            if isElim && exprCanReachSpecClass specClass reach? e' then
+            if isElim && (varHeadIsCandidate || exprCanReachSpecClass specClass reach? e') then
               .undecided
             else
               .notMatched
@@ -2691,7 +2691,9 @@ def specClassConclusionMatchBudget (env : Environment) (specClass : Name) (targe
           -- for a *registered instance* that is a candidate whatever constants it mentions.
           if varHeadIsCandidate || exprCanReachSpecClass specClass reach? e' then .undecided else .notMatched
         | .proj _ _ _ =>
-          if exprCanReachSpecClass specClass reach? e' then .undecided else .notMatched
+          -- A stuck projection conclusion (`[c : Carrier] → c.ty`) can equally instantiate to any
+          -- `specClass targetDefId` when registered via a forged `Meta.instanceExtension` entry (`A2-1a`).
+          if varHeadIsCandidate || exprCanReachSpecClass specClass reach? e' then .undecided else .notMatched
         | _ => .notMatched
 termination_by fuel
 
@@ -3344,57 +3346,171 @@ public def auditClaimSpecStrength (thmName certName : Name)
   let ctx := SpecAuditCtx.forLiveMeta (← getEnv) budget
   auditClaimSpecStrengthCore ctx thmName certName requiredCategories requireDeterministic requireInputSensitive
 
-/-- Check whether `declName` is registered as a `.global` `@[instance]` in serialized module
-extension entries (works even when `importModules` ran with `loadExts := false`, `A1-6`). -/
-def isGlobalInstanceRegistered (env : Environment) (declName : Name) : Bool := Id.run do
+/-- Whether a `Meta.DiscrTree` key path stored in a `Meta.instanceExtension` entry could match
+a typeclass lookup for `specClass targetDefId` (`A2-1`). -/
+def keysCanMatchSpecClass (keys : Array Meta.DiscrTree.Key) (specClass : Name)
+    (targetDefId : String) : Bool :=
+  match keys.toList with
+  | [] => true
+  | .star :: _ | .other :: _ => true
+  | .const c _ :: rest =>
+    if c != specClass then false
+    else
+      match rest with
+      | .lit (.strVal s) :: _ => s == targetDefId
+      | _ => true
+  | _ => false
+
+/-- Total fold over all values stored in a `Meta.DiscrTree`. -/
+def discrTreeFold {α σ : Type} (f : σ → α → σ) (init : σ) (d : Meta.DiscrTree α) : σ :=
+  let rec goTrie (acc : σ) (t : Meta.DiscrTree.Trie α) : σ :=
+    match t with
+    | .node vs children =>
+      let acc := vs.foldl f acc
+      children.attach.foldl (fun a ⟨(_, child), hmem⟩ =>
+        have : sizeOf child < 1 + sizeOf vs + sizeOf children := by
+          have h1 := Array.sizeOf_lt_of_mem hmem
+          simp only [Prod.mk.sizeOf_spec] at h1
+          omega
+        goTrie a child) acc
+  termination_by sizeOf t
+  d.root.foldl (fun acc _ trie => goTrie acc trie) init
+
+/-- Check whether `declName` is registered as an active `.global` zero-argument `@[instance]`
+keyed for `specClass targetDefId` (`A1-6`, `A2-2`, `A2-7`). -/
+def isGlobalInstanceRegistered (env : Environment) (declName specClass : Name)
+    (targetDefId : String) (allowLocalDecls : Bool := false) : Bool := Id.run do
   let target := mkConst declName []
+  let expectedKeys : Array Meta.DiscrTree.Key := #[.const specClass 1, .lit (.strVal targetDefId)]
+  let matchesEntry (ent : Meta.InstanceEntry) : Bool :=
+    ent.attrKind == .global && ent.val == target && ent.globalName? == some declName &&
+      ent.synthOrder.isEmpty && ent.keys == expectedKeys
+  if allowLocalDecls then
+    if (Meta.instanceExtension.getState env).erased.contains declName then
+      return false
+    for e in (Meta.instanceExtension.ext.getState env).newEntries do
+      match e with
+      | .global ent => if matchesEntry ent then return true
+      | .scoped _ _ => pure ()
   for i in [0:env.header.modules.size] do
     for e in Meta.instanceExtension.ext.getModuleEntries env i do
       match e with
-      | .global ent =>
-        if ent.val == target || ent.globalName? == some declName then
-          return true
+      | .global ent => if matchesEntry ent then return true
       | .scoped _ _ => pure ()
   return false
 
-/-- Registered-instance scan (`B2-1`). Type class resolution retrieves an instance through the
-discrimination-tree `keys` stored in its `Meta.instanceExtension` entry and then unifies the goal with
-the *declared type of the entry's constant*; the keys need not describe that type. A metaprogram can
-store an entry directly (`instanceExtension.add`), bypassing `addInstance`'s "return type is a class"
-check, so an entry whose constant concludes in a variable (`{T : Type 1} → [h : Holder T] → T`) and
-whose keys are those of `ItemSpec d` makes resolution of `ItemSpec d` return `@c (ItemSpec d) h`, a
-weak specification no declaration-type scan sees (measured: standalone gate `ok`). Every entry stored
-by a non-toolchain module (global or scoped) is therefore a candidate unless the pure normalizer is
-certain its conclusion is not `specClass targetDefId`, with variable conclusions always candidates;
-an entry whose value is not a constant, or names a missing constant, is a candidate as well. -/
-public def instanceEntryCandidates (env : Environment) (toolchainProv : Std.HashSet Name)
-    (specClass : Name) (targetDefId : String) (fuel : Nat := 256) : Array Name := Id.run do
+/-- Collect non-toolchain (or `specClass`-key-matching) `Meta.InstanceEntry` records across
+serialized non-toolchain modules plus live `newEntries`, `scopedEntries`, and `stateStack`
+(capturing `.local` forged instances in live `MetaM`, `A2-3`). -/
+def collectRelevantInstanceEntries (env : Environment) (toolchainProv : Std.HashSet Name)
+    (specClass : Name) (targetDefId : String) : Array Meta.InstanceEntry := Id.run do
   let mut entries : Array Meta.InstanceEntry := #[]
   for h : i in [0:env.header.modules.size] do
     if toolchainProv.contains env.header.modules[i].module then continue
     for e in Meta.instanceExtension.ext.getModuleEntries env i do
       entries := entries.push (match e with | .global a => a | .scoped _ a => a)
-  -- Entries added by the file being elaborated (live `MetaM` use; empty for a loaded environment).
-  for e in (Meta.instanceExtension.ext.getState env).newEntries do
+  let st := Meta.instanceExtension.ext.getState env
+  let isToolchainVal (ent : Meta.InstanceEntry) : Bool :=
+    match ent.val with
+    | .const n _ => (origin? env n).any toolchainProv.contains
+    | _ => false
+  for e in st.newEntries do
     entries := entries.push (match e with | .global a => a | .scoped _ a => a)
+  for (_, es) in st.scopedEntries.map.toList do
+    for ent in es.toArray do
+      if keysCanMatchSpecClass ent.keys specClass targetDefId || !isToolchainVal ent then
+        entries := entries.push ent
+  for frame in st.stateStack do
+    entries := discrTreeFold (init := entries) (fun acc ent =>
+      if keysCanMatchSpecClass ent.keys specClass targetDefId || !isToolchainVal ent then
+        acc.push ent
+      else acc) frame.state.discrTree
+  return entries
+
+/-- Collect non-toolchain `Meta.DefaultInstanceEntry` records from serialized non-toolchain modules
+and live `defaultInstanceExtension` state (`A2-6`). -/
+def collectRelevantDefaultInstances (env : Environment) (toolchainProv : Std.HashSet Name)
+    (specClass : Name) : Array Name := Id.run do
+  let mut toolDefInsts : Std.HashSet (Name × Name) := {}
+  let mut out : Array Name := #[]
+  for h : i in [0:env.header.modules.size] do
+    let m := env.header.modules[i].module
+    let isTool := toolchainProv.contains m
+    for d in Meta.defaultInstanceExtension.getModuleEntries env i do
+      if isTool then
+        toolDefInsts := toolDefInsts.insert (d.className, d.instanceName)
+      else if !out.contains d.instanceName then
+        out := out.push d.instanceName
+  let liveDefs := (Meta.defaultInstanceExtension.getState env).defaultInstances.find? specClass |>.getD []
+  for (instName, _) in liveDefs do
+    unless toolDefInsts.contains (specClass, instName) do
+      if !out.contains instName then
+        out := out.push instName
+  return out
+
+/-- Registered-instance scan (`B2-1`, `A2-1`, `A2-3`, `A2-6`). Type class resolution retrieves an
+instance through the discrimination-tree `keys` stored in its `Meta.instanceExtension` entry (or via
+`Meta.defaultInstanceExtension`) and then unifies the goal with the *declared type of the entry's
+constant*; the keys need not describe that type. A metaprogram can store an entry directly
+(`instanceExtension.add`), bypassing `addInstance`'s "return type is a class" check, so an entry
+whose constant concludes in a variable (`T`), stuck projection (`c.ty`), or stuck eliminator
+(`Bool.rec _ s.a s.b s.tag`) keyed like `ItemSpec d` makes resolution of `ItemSpec d` return a weak
+specification no declaration-type scan sees. Every relevant registered entry (global, scoped, local
+in `stateStack`, or default instance) is therefore a candidate if either its `keys` can match
+`specClass targetDefId` or the pure normalizer is not certain its conclusion is unrelated (with
+variable, projection, and eliminator conclusions always candidates); an entry whose value is not a
+constant, or names a missing constant, is a candidate as well. -/
+public def instanceEntryCandidates (env : Environment) (toolchainProv : Std.HashSet Name)
+    (specClass : Name) (targetDefId : String) (fuel : Nat := 256) : Array Name := Id.run do
+  let entries := collectRelevantInstanceEntries env toolchainProv specClass targetDefId
   let mut out : Array Name := #[]
   for ent in entries do
-      let label := match ent.val with
-        | .const n _ => n
-        | _ => (ent.globalName?.getD `_forged_instance_entry).str "_non_constant_instance_value"
-      let isCand := match ent.val with
-        | .const n _ =>
-          match env.find? n with
-          | some ci =>
-            match specClassConclusionMatchBudget env specClass targetDefId ci.type fuel none
-                (varHeadIsCandidate := true) with
-            | .notMatched => false
-            | _ => true
-          | none => true
+    let label := match ent.val with
+      | .const n _ => n
+      | _ => (ent.globalName?.getD `_forged_instance_entry).str "_non_constant_instance_value"
+    let isCand :=
+      keysCanMatchSpecClass ent.keys specClass targetDefId ||
+      match ent.val with
+      | .const n _ =>
+        match env.find? n with
+        | some ci =>
+          match specClassConclusionMatchBudget env specClass targetDefId ci.type fuel none
+              (varHeadIsCandidate := true) with
+          | .notMatched => false
+          | _ => true
+        | none => true
+      | _ => true
+    if isCand && !out.contains label then
+      out := out.push label
+  for instName in collectRelevantDefaultInstances env toolchainProv specClass do
+    let isCand := match env.find? instName with
+      | some ci =>
+        match specClassConclusionMatchBudget env specClass targetDefId ci.type fuel none
+            (varHeadIsCandidate := true) with
+        | .notMatched => false
         | _ => true
-      if isCand && !out.contains label then
-        out := out.push label
+      | none => true
+    if isCand && !out.contains instName then
+      out := out.push instName
   return out
+
+/-- Whether any relevant registered `Meta.instanceExtension` or `Meta.defaultInstanceExtension`
+entry transitively reaches a kernel-native evaluator (`A2-5`), checked before calling
+`Meta.synthInstance?` in live `MetaM`. -/
+def instanceEntriesReachNative (env : Environment) (toolchainProv : Std.HashSet Name)
+    (specClass : Name) (targetDefId : String) : Bool := Id.run do
+  let mut roots : Array Name := #[]
+  let mut seen : NameSet := {}
+  for ent in collectRelevantInstanceEntries env toolchainProv specClass targetDefId do
+    for c in ent.val.getUsedConstants do
+      unless seen.contains c do
+        seen := seen.insert c
+        roots := roots.push c
+  for instName in collectRelevantDefaultInstances env toolchainProv specClass do
+    unless seen.contains instName do
+      seen := seen.insert instName
+      roots := roots.push instName
+  (reachesNativeEvaluator env roots {} (envConstantCount env + 64)).1
 
 /-- Unique-instance synthesis spec-strength gate (`R7`, `A1-2`, `S3a/b`, `B4-3/4/6`, `A3-3c`,
 `A4-3`, `A4-5`, `A4-7`):
@@ -3441,7 +3557,18 @@ def auditItemSpecStrengthBySynthCore (ctx : SpecAuditCtx) (kind : SpecClassKind)
     if !instViolations.isEmpty then
       return instViolations
     let expectedInstTy := mkApp (mkConst specClass []) (mkStrLit defId)
+    -- Always confirm in Lean's kernel that the bare constant `soleCand` has type `specClass defId`
+    -- (rejects parameterized instance-chain functions `S3a/b` as `specInstanceAmbiguous` before
+    -- checking global `@[instance]` registration).
+    let instKernOk ← liftM (m := IO)
+      (kernelConfirmsHasType env (mkConst soleCand []) expectedInstTy ctx.budget)
+    unless instKernOk do
+      return singleV "specInstanceAmbiguous" soleCand
+        s!"unique candidate {soleCand} is not a bare zero-argument constant of type {specClass} \"{defId}\""
     if ctx.useSynthInstance then
+      if instanceEntriesReachNative env ctx.toolchainProv specClass defId then
+        return singleV "nativeDecideReached" soleCand
+          "kernel-native evaluator (Lean.reduceBool / Lean.reduceNat) reachable from a registered instance entry"
       let synth? ← try Meta.synthInstance? expectedInstTy catch _ => pure none
       match synth? with
       | none =>
@@ -3460,20 +3587,13 @@ def auditItemSpecStrengthBySynthCore (ctx : SpecAuditCtx) (kind : SpecClassKind)
         | _ =>
           return singleV "specInstanceAmbiguous" soleCand
             s!"synthesized instance for {specClass} \"{defId}\" is not a bare zero-argument constant (instance chain rejected)"
-    else if !ctx.allowLocalDecls then
-      -- In standalone `.olean` mode (`loadExts := false`), confirm `soleCand` is actually
-      -- registered as a `.global` `@[instance]` in serialized `Meta.instanceExtension` entries
-      -- so a plain non-instance `def` cannot pass `itemSynth` (`A1-6`).
-      unless isGlobalInstanceRegistered env soleCand do
+    else
+      -- Confirm `soleCand` is actually registered as an active `.global` zero-argument `@[instance]`
+      -- keyed for `specClass defId` so a plain non-instance `def`, forged wrong-key entry, or
+      -- erased instance cannot pass `itemSynth` (`A1-6`, `A2-2`, `A2-7`).
+      unless isGlobalInstanceRegistered env soleCand specClass defId ctx.allowLocalDecls do
         return singleV "specStrengthCertMissing" soleCand
-          s!"sole candidate {soleCand} for {specClass} \"{defId}\" is not registered as a global @[instance]"
-    -- Always confirm in Lean's kernel that the bare constant `soleCand` has type `specClass defId`
-    -- (this also rejects instance-chain functions `S3a/b` even when `useSynthInstance := false`).
-    let instKernOk ← liftM (m := IO)
-      (kernelConfirmsHasType env (mkConst soleCand []) expectedInstTy ctx.budget)
-    unless instKernOk do
-      return singleV "specInstanceAmbiguous" soleCand
-        s!"unique candidate {soleCand} is not a bare zero-argument constant of type {specClass} \"{defId}\""
+          s!"sole candidate {soleCand} for {specClass} \"{defId}\" is not registered as a global @[instance] keyed for {specClass} \"{defId}\""
     let instConst := mkConst soleCand []
     let defLit := mkStrLit defId
     let expected : ExpectedSpec := match kind with
@@ -3572,6 +3692,19 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
           unless nativeRootSet.contains d do
             nativeRootSet := nativeRootSet.insert d
             nativeRoots := nativeRoots.push d
+      -- Also seed from registered instance entries (`ent.val`) and default instances (`A2-5`) so
+      -- a forged `Meta.instanceExtension` entry carrying `Lean.reduceBool`/`Lean.reduceNat` is
+      -- caught before any kernel or `MetaM` evaluation runs.
+      for e in Meta.instanceExtension.ext.getModuleEntries env i do
+        let ent := match e with | .global a => a | .scoped _ a => a
+        for d in ent.val.getUsedConstants do
+          unless nativeRootSet.contains d do
+            nativeRootSet := nativeRootSet.insert d
+            nativeRoots := nativeRoots.push d
+      for d in Meta.defaultInstanceExtension.getModuleEntries env i do
+        unless nativeRootSet.contains d.instanceName do
+          nativeRootSet := nativeRootSet.insert d.instanceName
+          nativeRoots := nativeRoots.push d.instanceName
   let (nativeReach, _) := reachesNativeEvaluator env nativeRoots {} (envConstantCount env + 64)
   if nativeReach then
     report "nativeDecideReached" ``Lean.reduceBool ((origin? env ``Lean.reduceBool).getD .anonymous)
@@ -3738,6 +3871,14 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
           cCompRoots := cCompRoots.push ci.name
         else
           cRoots := cRoots.push ci.name
+      else
+        -- A duplicate reserved theorem copy stored by a constructive module (`A2-4`) must also
+        -- have its own stored proof dependencies audited under `allowClassical := false`.
+        for d in declEdges ci do
+          cRoots := cRoots.push d
+    for (em, edges) in extraEdges do
+      if em == cm then
+        cRoots := cRoots ++ edges.toArray
     let _ ← closure L cRoots {} {} (fun _ => false) fuel cm (allowClassical := false)
     for c in cCompRoots do
       let _ ← closure L #[c] {} genuine (fun _ => false) fuel cm (allowClassical := false)
