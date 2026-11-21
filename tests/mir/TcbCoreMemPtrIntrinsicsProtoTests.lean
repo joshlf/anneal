@@ -2412,12 +2412,16 @@ theorem provenance_carrying_usize_operands_fail_closed :
     isUbNode (evalPtrMaskProto s decls protoLayouts [p 1, .unit] locals dstLocal0 (.some 1)) = true := by
   refine ⟨rfl, rfl, rfl, rfl⟩
 
-/-- 16(e): `layoutDataMaskProto` mirrors the `unionRanges` scalar-array fast path
-(`ValidityVisitor.lean:256-258`):
-- `union X { a: [E; 2], b: () }` where `E` is a scalar-ABI union WITHOUT field layouts: the array
-  contributes `[0, 4)` as data (previously the whole mask failed closed);
-- `union Y { a: [(u8, u16); 2], b: () }`: the element is not scalar-ABI, so each element's
-  padding byte (`1`, `5`) stays padding. -/
+/-- 16(e): `layoutDataMaskProto` scalar-array fast path & padding-preservation soundness:
+- `union X { a: [E; 2], b: () }` where `E` is an unpadded initialized scalar (`size = stride = 2`,
+  `.scalar (.initialized I16 _)`): hits the fast path -> `[true, true, true, true]`;
+- `union UArr { a: [OpaqueScalarUnion; 2], b: () }` where `OpaqueScalarUnion` is a field-layout-less
+  `.scalar (.union I16)` union: MUST NOT bypass the fail-closed guard -> `.none` (matching bare union);
+- `[PaddedU8; 2]` (`#[repr(C, align(4))] struct PaddedU8(u8)`, `size = 4`, `.scalar (.initialized I8 _)`):
+  MUST NOT mark trailing padding bytes `1..3, 5..7` as data -> `[true, false, false, false, true, false, false, false]`;
+- stride-padded scalar array (`elemSize = 1, stride = 2, count = 2, size = 4`): MUST keep stride padding
+  at bytes `1, 3` (`[true, false, true, false]`), never packing data to the front;
+- `union Y { a: [(u8, u16); 2], b: () }`: element padding bytes `1, 5` stay padding. -/
 theorem union_scalar_array_fast_path_data_mask :
     let mL : LayoutTable :=
       { pointerBits := 64
@@ -2426,9 +2430,9 @@ theorem union_scalar_array_fast_path_data_mask :
           [ -- idx 0: `()`
             { size := ⟨0⟩, align := ⟨1⟩, fields := .arbitrary [] [], variants := .single 0,
               backendRepr := .memory, isUninhabited := false },
-            -- idx 1: `E`, scalar-ABI union without field layouts
+            -- idx 1: `E`, unpadded initialized scalar (e.g. `u16` or full-width initialized union)
             { size := ⟨2⟩, align := ⟨2⟩, fields := .union 2, variants := .single 0,
-              backendRepr := .scalar (.union (.int 16 false)), isUninhabited := false },
+              backendRepr := .scalar (.initialized (.int 16 false) ⟨0, 65535⟩), isUninhabited := false },
             -- idx 2: `[E; 2]`
             { size := ⟨4⟩, align := ⟨2⟩, fields := .array ⟨2⟩ 2, variants := .single 0,
               backendRepr := .memory, fieldLayouts := [1], isUninhabited := false },
@@ -2446,10 +2450,31 @@ theorem union_scalar_array_fast_path_data_mask :
             { size := ⟨8⟩, align := ⟨2⟩, fields := .array ⟨4⟩ 2, variants := .single 0,
               backendRepr := .memory, fieldLayouts := [4], isUninhabited := false },
             { size := ⟨8⟩, align := ⟨2⟩, fields := .union 2, variants := .single 0,
-              backendRepr := .memory, fieldLayouts := [7, 0], isUninhabited := false } ] }
+              backendRepr := .memory, fieldLayouts := [7, 0], isUninhabited := false },
+            -- idx 9: `OpaqueScalarUnion` (`.scalar (.union I16)` without `fieldLayouts`)
+            { size := ⟨2⟩, align := ⟨2⟩, fields := .union 2, variants := .single 0,
+              backendRepr := .scalar (.union (.int 16 false)), isUninhabited := false },
+            -- idx 10: `[OpaqueScalarUnion; 2]`; idx 11: `union UArr { a: [OpaqueScalarUnion; 2], b: () }`
+            { size := ⟨4⟩, align := ⟨2⟩, fields := .array ⟨2⟩ 2, variants := .single 0,
+              backendRepr := .memory, fieldLayouts := [9], isUninhabited := false },
+            { size := ⟨4⟩, align := ⟨2⟩, fields := .union 2, variants := .single 0,
+              backendRepr := .memory, fieldLayouts := [10, 0], isUninhabited := false },
+            -- idx 12: `#[repr(C, align(4))] struct PaddedU8(u8)` (size 4, scalar width 1!)
+            { size := ⟨4⟩, align := ⟨4⟩, fields := .arbitrary [⟨0⟩] [0], variants := .single 0,
+              backendRepr := .scalar (.initialized (.int 8 false) ⟨0, 255⟩), isUninhabited := false },
+            -- idx 13: `[PaddedU8; 2]`
+            { size := ⟨8⟩, align := ⟨4⟩, fields := .array ⟨4⟩ 2, variants := .single 0,
+              backendRepr := .memory, fieldLayouts := [12], isUninhabited := false },
+            -- idx 14: stride-padded array (`elemSize = 1, stride = 2, count = 2, size = 4`)
+            { size := ⟨4⟩, align := ⟨2⟩, fields := .array ⟨2⟩ 2, variants := .single 0,
+              backendRepr := .memory, fieldLayouts := [5], isUninhabited := false } ] }
     layoutDataMaskProto 8 mL 3 = .some [true, true, true, true] ∧
-    layoutDataMaskProto 8 mL 8 = .some [true, false, true, true, true, false, true, true] := by
-  refine ⟨rfl, rfl⟩
+    layoutDataMaskProto 8 mL 8 = .some [true, false, true, true, true, false, true, true] ∧
+    layoutDataMaskProto 8 mL 10 = .none ∧
+    layoutDataMaskProto 8 mL 11 = .none ∧
+    layoutDataMaskProto 8 mL 13 = .some [true, false, false, false, true, false, false, false] ∧
+    layoutDataMaskProto 8 mL 14 = .some [true, false, true, false] := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- 16(f): non-vacuity witnesses for the pass-B3 universally quantified prototype theorems
 (`isUninhabitedRigidTyProto_pointer_false`, `charShapedSurrogateProto_not_valid_char` with a
@@ -2473,7 +2498,291 @@ theorem b3_universal_theorems_non_vacuous :
     rigidTyLayoutDeterminedProto_non64_pointer_false [] { pointerBits := 32, isLittleEndian := true, entries := [] }
       true 7 .not (.uint .u8) rfl⟩
 
-/-! ## Section 17: Non-Vacuity Witnesses & Mechanical Standard-Axiom Gate -/
+/-! ## Section 17: Pass A3 Adversarial Critique-and-Fix Regression Tests -/
+
+/-- 17(a): 32-bit tag-window sub-place sizing & non-64-bit root alignment (`exactTyByteSizeProto?`
+and `exactRootAllocAlignProto?`):
+- On a 32-bit `LayoutTable`, borrowing `&s.len` (`usize`, field 0) of `struct S { len: usize, x: u32 }`
+  gives tag window `[0, 4)` (NOT `[0, 8)` from 64-bit `Bytes.rigidTyByteSize`!), so writing/reading
+  `[4, 8)` (`s.x`) through `&s.len` fails closed `.unsupported` instead of escaping into sibling `s.x`,
+  while reading `[0, 4)` succeeds;
+- On a 32-bit `LayoutTable`, a `u64` local WITHOUT an explicit layout entry has undetermined alignment:
+  `checkPtrArgAlignedProto` at `reqAlign = 8` returns `.unsupported` and `ptr_mask(p_off_5, !7)` fails
+  closed `.unsupported` (previously assumed 8-byte alignment);
+- WITH an explicit 32-bit `i686` layout (`size = 8, align = 4`), `checkPtrArgAlignedProto` at
+  `reqAlign = 8` deterministically faults `.ub` (`4 < 8`), `ptr_mask(p_off_5, !3)` succeeds with
+  offset `4`, and `ptr_mask(p_off_5, !7)` fails closed `.unsupported`. -/
+theorem tag_window_and_root_align_on_32bit_table :
+    let l32 : LayoutTable :=
+      { pointerBits := 32
+        isLittleEndian := true
+        entries :=
+          [ -- idx 0: `()`
+            { size := ⟨0⟩, align := ⟨1⟩, fields := .arbitrary [] [], variants := .single 0,
+              backendRepr := .memory, isUninhabited := false },
+            -- idx 1: `struct S32 { len: usize, x: u32 }` (size 8, align 4, offsets [0, 4])
+            { size := ⟨8⟩, align := ⟨4⟩, fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1], variants := .single 0,
+              backendRepr := .memory, fieldLayouts := [2, 3], isUninhabited := false },
+            -- idx 2: 32-bit `usize` (size 4, align 4)
+            { size := ⟨4⟩, align := ⟨4⟩, fields := .primitive, variants := .single 0,
+              backendRepr := .scalar (.initialized (.int 32 false) ⟨0, 4294967295⟩), isUninhabited := false },
+            -- idx 3: `u32` (size 4, align 4)
+            { size := ⟨4⟩, align := ⟨4⟩, fields := .primitive, variants := .single 0,
+              backendRepr := .scalar (.initialized (.int 32 false) ⟨0, 4294967295⟩), isUninhabited := false },
+            -- idx 4: 32-bit `i686` `u64` (size 8, align 4!)
+            { size := ⟨8⟩, align := ⟨4⟩, fields := .primitive, variants := .single 0,
+              backendRepr := .scalar (.initialized (.int 64 false) ⟨0, 18446744073709551615⟩), isUninhabited := false } ] }
+    let s32Ty : Ty := { kind := .adt "tests::S32" [.uint .usize, .uint .u32], layoutIdx := 1 }
+    let s32Decls := [mkDecl i32Ty, mkDecl s32Ty]
+    let s32Locals : List LocalSlot := [.uninit, .init (.aggregate 0 [.scalar ⟨11, 4⟩, mkU32 22])]
+    let bLen : BorrowEntry :=
+      { tag := 1, targetLocal := 1, targetProjection := [.field 0 { kind := .uint .usize, layoutIdx := 0 }],
+        perm := .unique }
+    let s32State := mkState s32Locals [bLen]
+    -- Reading [0, 4) through `&s.len` succeeds; reading [4, 8) (`s.x`) through `&s.len` fails closed!
+    let rInWin := evalCompareBytesProto s32State s32Decls l32
+      [.ptr { allocId := 1, offsetBytes := 0 } 4, .ptr { allocId := 1, offsetBytes := 0 } 4, .scalar ⟨4, 4⟩]
+      s32Locals dstLocal0 (.some 1)
+    let rEscapeSibling := evalCompareBytesProto s32State s32Decls l32
+      [.ptr { allocId := 1, offsetBytes := 4 } 4, .ptr { allocId := 1, offsetBytes := 4 } 4, .scalar ⟨4, 4⟩]
+      s32Locals dstLocal0 (.some 1)
+    -- 32-bit `u64` local without explicit layout (`layoutIdx = 0`) vs explicit `i686` layout (`layoutIdx = 4`):
+    let u64NoLayoutDecls := [mkDecl rawConstU8Ty, mkDecl u64Ty]
+    let u64I686Ty : Ty := { kind := .uint .u64, layoutIdx := 4 }
+    let u64I686Decls := [mkDecl rawConstU8Ty, mkDecl u64I686Ty]
+    let u64Locals : List LocalSlot := [.uninit, .init (.scalar ⟨99, 8⟩)]
+    let bU64 : BorrowEntry := { tag := 5, targetLocal := 1, targetProjection := [], perm := .unique }
+    let sU64 := mkState u64Locals [bU64]
+    let pU64Off0 : PtrArgProto := .prov { allocId := 5, offsetBytes := 0 }
+    let pU64Off5 : Value := .ptr { allocId := 5, offsetBytes := 5 } 4
+    let maskNot3_32 : Value := .scalar ⟨4294967292, 4⟩
+    let maskNot7_32 : Value := .scalar ⟨4294967288, 4⟩
+    (stepLocals? rInWin).bind (fun ls => get? ls 0) = .some (.init (.scalar ⟨0, 4⟩)) ∧
+    isUnsupportedNode rEscapeSibling = true ∧
+    (match checkPtrArgAlignedProto sU64 u64Locals u64NoLayoutDecls l32 pU64Off0 8 with
+     | .unsupported => true | _ => false) = true ∧
+    isUnsupportedNode (evalPtrMaskProto sU64 u64NoLayoutDecls l32 [pU64Off5, maskNot7_32] u64Locals dstLocal0 (.some 1)) = true ∧
+    (match checkPtrArgAlignedProto sU64 u64Locals u64I686Decls l32 pU64Off0 8 with
+     | .ub => true | _ => false) = true ∧
+    (stepLocals? (evalPtrMaskProto sU64 u64I686Decls l32 [pU64Off5, maskNot3_32] u64Locals dstLocal0 (.some 1))).bind
+      (fun ls => get? ls 0) = .some (.init (.ptr { allocId := 5, offsetBytes := 4 } 4)) ∧
+    isUnsupportedNode (evalPtrMaskProto sU64 u64I686Decls l32 [pU64Off5, maskNot7_32] u64Locals dstLocal0 (.some 1)) = true := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- 17(b): `decodeUsizeArgProto?` closes B3's wildcard `.ptr` UB-masking regression, handles
+unbacked `allocId = 0` integer counts/masks, and completes ZST copies with provenance counts:
+- malformed pointer arguments (`.unit`) and null pointers in `compare_bytes` STILL fault `.ub`
+  even when `count`/`mask` carries real pointer provenance;
+- wrong-width `.ptr _ 4` mask on 64-bit faults `.ub`;
+- unbacked `allocId = 0` `.ptr` counts/masks decode to their wrapped integer offsets (`copy` count 0,
+  `compare_bytes` count 0, `ptr_mask` with `!7`);
+- `copy::<()>` (ZST) with real provenance `count` succeeds (`0 * count = 0`), whereas misaligned
+  `copy::<u32>(addr=1, dst, prov_count)` still faults `.ub`. -/
+theorem decode_usize_arg_malformed_ptr_ub_unbacked_zero_and_zst_prov :
+    let decls := [mkDecl unitTy, mkDecl aligned16BufTy, mkDecl aligned16BufTy]
+    let locals : List LocalSlot := [.uninit, .init .unit, .init .unit]
+    let b (t l : Nat) : BorrowEntry := { tag := t, targetLocal := l, targetProjection := [], perm := .unique }
+    let s := mkState locals [b 1 1, b 2 2]
+    let p (tag off : Nat) : Value := .ptr { allocId := tag, offsetBytes := off } 8
+    let zeroProv (off : Nat) : Value := .ptr { allocId := 0, offsetBytes := off } 8
+    isUbNode (evalCopyProto s (mkTarget "core::intrinsics::copy" [.uint .u8]) decls protoLayouts []
+      [.unit, p 2 0, p 1 0] locals dstLocal0 (.some 1)) = true ∧
+    isUbNode (evalCompareBytesProto s decls protoLayouts [.unit, p 2 0, p 1 0] locals dstLocal0 (.some 1)) = true ∧
+    isUbNode (evalCompareBytesProto s decls protoLayouts [mkUsize 0, p 2 0, p 1 0] locals dstLocal0 (.some 1)) = true ∧
+    isUbNode (evalPtrMaskProto s decls protoLayouts [.unit, p 1 0] locals dstLocal0 (.some 1)) = true ∧
+    isUbNode (evalPtrMaskProto s decls protoLayouts [p 1 0, .ptr { allocId := 1, offsetBytes := 0 } 4] locals dstLocal0 (.some 1)) = true ∧
+    (stepLocals? (evalCopyProto s (mkTarget "core::intrinsics::copy" [.uint .u8]) decls protoLayouts []
+      [p 1 0, p 2 0, zeroProv 0] locals dstLocal0 (.some 1))).bind (fun ls => get? ls 0) = .some (.init .unit) ∧
+    (stepLocals? (evalCompareBytesProto s [mkDecl i32Ty, mkDecl aligned16BufTy, mkDecl aligned16BufTy] protoLayouts
+      [p 1 0, p 2 0, zeroProv 0] locals dstLocal0 (.some 1))).bind (fun ls => get? ls 0) = .some (.init (.scalar ⟨0, 4⟩)) ∧
+    (stepLocals? (evalPtrMaskProto s [mkDecl rawConstU8Ty, mkDecl aligned16BufTy, mkDecl aligned16BufTy] protoLayouts
+      [p 1 13, zeroProv 18446744073709551608] locals dstLocal0 (.some 1))).bind (fun ls => get? ls 0) =
+      .some (.init (.ptr { allocId := 1, offsetBytes := 8 } 8)) ∧
+    (stepLocals? (evalCopyProto s (mkTarget "core::intrinsics::copy" [.tuple []]) decls protoLayouts []
+      [p 1 0, p 2 0, p 1 0] locals dstLocal0 (.some 1))).bind (fun ls => get? ls 0) = .some (.init .unit) ∧
+    isUbNode (evalCopyProto s (mkTarget "core::intrinsics::copy" [.uint .u32]) decls protoLayouts []
+      [mkUsize 1, p 2 0, p 1 0] locals dstLocal0 (.some 1)) = true := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- 17(c): custom-DST / wide-tuple validation & target-aware slice metadata sizing:
+- `ptrPointeeMayBeUnsizedProto` recurses through tuple tails with `.param`/`.alias` (`(u8, T)` -> `true`);
+- `black_box` and `validateTypedBytesProto` reject a thin 8-byte pointer for confirmed-wide `&Packet`
+  and for known-wide `&(u8, [u8])` as `.ub` (previously `.valid`!), fail closed `.unsupported` on
+  unconfirmed thin `&Packet`, reject null wide `&Packet` and null wide `&(u8, [u8])` as `.ub`
+  (previously `.unsupported`!), accept thin `&Hdr` when confirmed by `refHdrTy`, and accept valid raw
+  wide `*const (u8, [u8])`;
+- 32-bit `&[usize]` slice metadata uses `elemSize = 4` (so `len = 2^28` is `.valid`, NOT false UB
+  from 64-bit `elemSize = 8`, while `len = 2^29` is `.ub`), and 64-bit `&[&Packet]` uses `elemSize = 16`
+  when `refPacketTy` is present (so `len = 2^59` is `.ub`, NOT missed UB from `elemSize = 8`, and
+  unconfirmed `&[&Packet]` fails closed `.unsupported`). -/
+theorem custom_dst_wide_tuple_and_32bit_slice_meta_validity :
+    let s0 := mkState [.uninit]
+    let bb (decls : List LocalDecl) (L : LayoutTable) (ty : RigidTy) (v : Value) : MirStepNode :=
+      evalBlackBoxProto s0 (mkTarget "core::intrinsics::black_box" [ty]) decls L [] [v] [.uninit] dstLocal0 (.some 1)
+    let pktDecls := [mkDecl unitTy, mkDecl refPacketTy]
+    let hdrDecls := [mkDecl unitTy, mkDecl refHdrTy]
+    let wideTupleK : RigidTy := .tuple [.uint .u8, .slice (.uint .u8)]
+    let layouts32 : LayoutTable := { pointerBits := 32, isLittleEndian := true, entries := [] }
+    let nonNull4 : List AbstractByte := [.init 1 .none, .init 0 .none, .init 0 .none, .init 0 .none]
+    let len2Pow28Bytes : List AbstractByte := [.init 0 .none, .init 0 .none, .init 0 .none, .init 16 .none]
+    let len2Pow29Bytes : List AbstractByte := [.init 0 .none, .init 0 .none, .init 0 .none, .init 32 .none]
+    let nonNull8 : List AbstractByte := [.init 1 .none] ++ List.replicate 7 (.init 0 .none)
+    let null8 : List AbstractByte := List.replicate 8 (.init 0 .none)
+    ptrPointeeMayBeUnsizedProto (.tuple [.uint .u8, .param 0 "T"]) = true ∧
+    ptrPointeeMayBeUnsizedProto (.tuple [.uint .u8, .alias "Item" []]) = true ∧
+    isUbNode (bb pktDecls dstLayouts (.ref .not packetK) (mkUsize 4096)) = true ∧
+    isUnsupportedNode (bb [mkDecl unitTy] dstLayouts (.ref .not packetK) (mkUsize 4096)) = true ∧
+    isUbNode (bb pktDecls dstLayouts (.ref .not packetK) (.aggregate 0 [mkUsize 0, mkUsize 3])) = true ∧
+    stepLocals? (bb hdrDecls dstLayouts (.ref .not hdrK) (mkUsize 4096)) = .some [.init (mkUsize 4096)] ∧
+    isUbNode (bb [mkDecl unitTy] protoLayouts (.ref .not wideTupleK) (mkUsize 4096)) = true ∧
+    isUbNode (bb [mkDecl unitTy] protoLayouts (.ref .not wideTupleK) (.aggregate 0 [mkUsize 0, mkUsize 3])) = true ∧
+    isUbNode (bb [mkDecl unitTy] protoLayouts (.ref .not wideTupleK)
+      (.aggregate 0 [mkUsize 4096, mkUsize 9223372036854775808])) = true ∧
+    stepLocals? (bb [mkDecl unitTy] protoLayouts (.rawPtr .not wideTupleK) (.aggregate 0 [mkUsize 0, mkUsize 3])) =
+      .some [.init (.aggregate 0 [mkUsize 0, mkUsize 3])] ∧
+    validateTypedBytesProto 8 pktDecls dstLayouts (.ref .not packetK) nonNull8 = .ub ∧
+    validateTypedBytesProto 8 pktDecls dstLayouts (.ref .not packetK) (null8 ++ nonNull8) = .ub ∧
+    validateTypedBytesProto 8 pktDecls dstLayouts (.ref .not packetK) (nonNull8 ++ nonNull8) = .unsupported ∧
+    validateTypedBytesProto 8 [] protoLayouts (.ref .not wideTupleK) nonNull8 = .ub ∧
+    validateTypedBytesProto 8 [] protoLayouts (.ref .not wideTupleK) (null8 ++ nonNull8) = .ub ∧
+    stepLocals? (bb [mkDecl unitTy] layouts32 (.ref .not (.slice (.uint .usize)))
+      (.aggregate 0 [.scalar ⟨4096, 4⟩, .scalar ⟨268435456, 4⟩])) =
+      .some [.init (.aggregate 0 [.scalar ⟨4096, 4⟩, .scalar ⟨268435456, 4⟩])] ∧
+    isUbNode (bb [mkDecl unitTy] layouts32 (.ref .not (.slice (.uint .usize)))
+      (.aggregate 0 [.scalar ⟨4096, 4⟩, .scalar ⟨536870912, 4⟩])) = true ∧
+    validateTypedBytesProto 8 [] layouts32 (.ref .not (.slice (.uint .usize))) (nonNull4 ++ len2Pow28Bytes) = .valid ∧
+    validateTypedBytesProto 8 [] layouts32 (.ref .not (.slice (.uint .usize))) (nonNull4 ++ len2Pow29Bytes) = .ub ∧
+    isUbNode (bb pktDecls dstLayouts (.ref .not (.slice (.ref .not packetK)))
+      (.aggregate 0 [mkUsize 4096, mkUsize 576460752303423488])) = true ∧
+    isUnsupportedNode (bb [mkDecl unitTy] dstLayouts (.ref .not (.slice (.ref .not packetK)))
+      (.aggregate 0 [mkUsize 4096, mkUsize 576460752303423488])) = true := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- 17(d): `ptr_offset_from::<u64>` precision on 32-bit targets (`withAlign := false`) AND
+`const_eval_select` runtime dispatch to all 8 new core memory & pointer intrinsics (verifying
+`evalDirectRustIntrinsicProto?` routes `const_eval_select` to every new intrinsic instead of
+falling through to `MirStepNode.extCall`, including pointee-`T` inference from `ARG`). -/
+theorem ptr_offset_from_u64_on_32bit_and_const_eval_select_all_8_intrinsics :
+    let layouts32 : LayoutTable := { pointerBits := 32, isLittleEndian := true, entries := [] }
+    let g16 : CapturedAllocation :=
+      { allocId := 80, bytes := List.replicate 16 (.some 0), relocations := [], align := ⟨8⟩, mutability := .mut }
+    let s32 := mkState [.uninit] [] [] [g16]
+    let p32 (off : Nat) : Value := .ptr { allocId := 80, offsetBytes := off } 4
+    let rOff32Signed := evalPtrOffsetFromProto s32 (mkTarget "core::intrinsics::ptr_offset_from" [.uint .u64])
+      [mkDecl isizeTy] layouts32 [] [p32 8, p32 0] [.uninit] dstLocal0 (.some 1) false
+    let rOff32Unsigned := evalPtrOffsetFromProto s32 (mkTarget "core::intrinsics::ptr_offset_from_unsigned" [.uint .u64])
+      [mkDecl usizeTy] layouts32 [] [p32 8, p32 0] [.uninit] dstLocal0 (.some 1) true
+    let rOff32Usize := evalPtrOffsetFromProto s32 (mkTarget "core::intrinsics::ptr_offset_from" [.uint .usize])
+      [mkDecl isizeTy] layouts32 [] [p32 4, p32 0] [.uninit] dstLocal0 (.some 1) false
+    -- `const_eval_select` runtime dispatch to all 8 new intrinsics:
+    let gA : CapturedAllocation :=
+      { allocId := 90, bytes := [.some 10, .some 0, .some 0, .some 0, .some 20, .some 0, .some 0, .some 0],
+        relocations := [], align := ⟨4⟩, mutability := .mut }
+    let gB : CapturedAllocation :=
+      { allocId := 91, bytes := [.some 30, .some 0, .some 0, .some 0, .some 40, .some 0, .some 0, .some 0],
+        relocations := [], align := ⟨4⟩, mutability := .mut }
+    let sg := mkState [.uninit] [] [] [gA, gB]
+    let pg (id off : Nat) : Value := .ptr { allocId := id, offsetBytes := off } 8
+    let callSelect (argTys : List RigidTy) (rtPath : DefPath) (rtTypeArgs : List RigidTy)
+        (args : List Value) (dstDecl : LocalDecl) : Option MirStepNode :=
+      let argTupleTy : RigidTy := .tuple argTys
+      let rtFnTy : RigidTy := .fnDef rtPath rtTypeArgs
+      let ctFnTy : RigidTy := .fnDef "tests::ct_fn" []
+      let target := mkTarget "core::intrinsics::const_eval_select" [argTupleTy, ctFnTy, rtFnTy, dstDecl.ty.kind]
+      let rtOp : Operand := .constant { ty := { kind := rtFnTy, layoutIdx := 0 }, val := .zeroSized }
+      let ctOp : Operand := .constant { ty := { kind := ctFnTy, layoutIdx := 0 }, val := .zeroSized }
+      let tupOp : Operand := .constant { ty := { kind := argTupleTy, layoutIdx := 0 }, val := .zeroSized }
+      evalDirectRustIntrinsicProto? sg .none target [dstDecl] protoLayouts
+        [tupOp, ctOp, rtOp] [.aggregate 0 args, .unit, .unit] [.uninit] dstLocal0 (.some 1) .continue_
+    -- 1. copy<u32> (typeArg inferred from `*const u32` via `isPtrPointeeIntrinsicProtoKind`)
+    let rSelCopy := callSelect [.rawPtr .not (.uint .u32), .rawPtr .mut (.uint .u32), .uint .usize]
+      "core::intrinsics::copy" [] [pg 90 0, pg 91 0, mkUsize 1] (mkDecl unitTy)
+    -- 2. compare_bytes
+    let rSelCmp := callSelect [.rawPtr .not (.uint .u8), .rawPtr .not (.uint .u8), .uint .usize]
+      "core::intrinsics::compare_bytes" [] [pg 90 0, pg 91 0, mkUsize 4] (mkDecl i32Ty)
+    -- 3. raw_eq<u32> (typeArg inferred from `&u32`)
+    let rSelRawEq := callSelect [.ref .not (.uint .u32), .ref .not (.uint .u32)]
+      "core::intrinsics::raw_eq" [] [pg 90 0, pg 90 0] (mkDecl boolTy)
+    -- 4. typed_swap_nonoverlapping<u32> (typeArg inferred from `*mut u32`)
+    let rSelSwap := callSelect [.rawPtr .mut (.uint .u32), .rawPtr .mut (.uint .u32)]
+      "core::intrinsics::typed_swap_nonoverlapping" [] [pg 90 0, pg 91 0] (mkDecl unitTy)
+    -- 5. ptr_offset_from<u32>
+    let rSelOffS := callSelect [.rawPtr .not (.uint .u32), .rawPtr .not (.uint .u32)]
+      "core::intrinsics::ptr_offset_from" [] [pg 90 4, pg 90 0] (mkDecl isizeTy)
+    -- 6. ptr_offset_from_unsigned<u32>
+    let rSelOffU := callSelect [.rawPtr .not (.uint .u32), .rawPtr .not (.uint .u32)]
+      "core::intrinsics::ptr_offset_from_unsigned" [] [pg 90 4, pg 90 0] (mkDecl usizeTy)
+    -- 7. ptr_mask<u8>
+    let rSelMask := callSelect [.rawPtr .not (.uint .u8), .uint .usize]
+      "core::intrinsics::ptr_mask" [] [pg 90 7, mkUsize 18446744073709551612] (mkDecl rawConstU8Ty)
+    -- 8. black_box<u32>
+    let rSelBb := callSelect [.uint .u32]
+      "core::intrinsics::black_box" [] [mkU32 42] (mkDecl u32Ty)
+    (stepLocals? rOff32Signed).bind (fun ls => get? ls 0) = .some (.init (.scalar ⟨1, 4⟩)) ∧
+    (stepLocals? rOff32Unsigned).bind (fun ls => get? ls 0) = .some (.init (.scalar ⟨1, 4⟩)) ∧
+    isUnsupportedNode rOff32Usize = true ∧
+    (rSelCopy.bind (fun n => globalBytes? n 1)) =
+      .some [.some 10, .some 0, .some 0, .some 0, .some 40, .some 0, .some 0, .some 0] ∧
+    (rSelCmp.bind stepLocals?).bind (fun ls => get? ls 0) = .some (.init (.scalar ⟨4294967295, 4⟩)) ∧
+    (rSelRawEq.bind stepLocals?).bind (fun ls => get? ls 0) = .some (.init (.scalar (boolToScalar true))) ∧
+    (rSelSwap.bind (fun n => globalBytes? n 0)) =
+      .some [.some 30, .some 0, .some 0, .some 0, .some 20, .some 0, .some 0, .some 0] ∧
+    (rSelOffS.bind stepLocals?).bind (fun ls => get? ls 0) = .some (.init (.scalar ⟨1, 8⟩)) ∧
+    (rSelOffU.bind stepLocals?).bind (fun ls => get? ls 0) = .some (.init (.scalar ⟨1, 8⟩)) ∧
+    (rSelMask.bind stepLocals?).bind (fun ls => get? ls 0) = .some (.init (pg 90 4)) ∧
+    (rSelBb.bind stepLocals?).bind (fun ls => get? ls 0) = .some (.init (mkU32 42)) := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- 17(e): non-vacuity witnesses for the pass-A3 universally quantified prototype theorems
+(`decodeUsizeArgProto?_unbacked_zero_ok_and_prov_unsupported`,
+`layoutDataMaskProto_scalar_array_exact`, and `layoutDataMaskProto_array_union_no_fields_none`). -/
+theorem a3_universal_theorems_non_vacuous :
+    let mProv : Memory :=
+      { emptyMemory with borrows := [{ tag := 7, targetLocal := 1, targetProjection := [], perm := .unique }] }
+    let elemInit : TypeLayout :=
+      { size := ⟨2⟩, align := ⟨2⟩, fields := .primitive, variants := .single 0,
+        backendRepr := .scalar (.initialized (.int 16 false) ⟨0, 65535⟩), isUninhabited := false }
+    let arrInit : TypeLayout :=
+      { size := ⟨4⟩, align := ⟨2⟩, fields := .array ⟨2⟩ 2, variants := .single 0,
+        backendRepr := .memory, fieldLayouts := [0], isUninhabited := false }
+    let elemUnion : TypeLayout :=
+      { size := ⟨2⟩, align := ⟨2⟩, fields := .union 2, variants := .single 0,
+        backendRepr := .scalar (.union (.int 16 false)), isUninhabited := false }
+    let arrUnion : TypeLayout :=
+      { size := ⟨4⟩, align := ⟨2⟩, fields := .array ⟨2⟩ 2, variants := .single 0,
+        backendRepr := .memory, fieldLayouts := [2], isUninhabited := false }
+    let lTab : LayoutTable :=
+      { pointerBits := 64, isLittleEndian := true, entries := [elemInit, arrInit, elemUnion, arrUnion] }
+    decodeUsizeArgProto? emptyMemory 8 (.ptr { allocId := 0, offsetBytes := 12 } 8) = .ok 12 ∧
+    decodeUsizeArgProto? mProv 8 (.ptr { allocId := 7, offsetBytes := 0 } 8) = .unsupported ∧
+    decodeUsizeArgProto? mProv 8 (.ptr { allocId := 7, offsetBytes := 0 } 4) = .ub ∧
+    layoutDataMaskProto 2 lTab 1 = .some [true, true, true, true] ∧
+    layoutDataMaskProto 3 lTab 3 = .none := by
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · exact (decodeUsizeArgProto?_unbacked_zero_ok_and_prov_unsupported
+      emptyMemory 8 8 { allocId := 0, offsetBytes := 12 }).1 rfl
+  · exact (decodeUsizeArgProto?_unbacked_zero_ok_and_prov_unsupported
+      { emptyMemory with borrows := [{ tag := 7, targetLocal := 1, targetProjection := [], perm := .unique }] }
+      8 8 { allocId := 7, offsetBytes := 0 }).2.1 rfl
+  · exact (decodeUsizeArgProto?_unbacked_zero_ok_and_prov_unsupported
+      { emptyMemory with borrows := [{ tag := 7, targetLocal := 1, targetProjection := [], perm := .unique }] }
+      8 4 { allocId := 7, offsetBytes := 0 }).2.2 (by decide)
+  · exact layoutDataMaskProto_scalar_array_exact 1 _ 1 0 0 0 2
+      { size := ⟨4⟩, align := ⟨2⟩, fields := .array ⟨2⟩ 2, variants := .single 0,
+        backendRepr := .memory, fieldLayouts := [0], isUninhabited := false }
+      { size := ⟨2⟩, align := ⟨2⟩, fields := .primitive, variants := .single 0,
+        backendRepr := .scalar (.initialized (.int 16 false) ⟨0, 65535⟩), isUninhabited := false }
+      ⟨2⟩ (.int 16 false) ⟨0, 65535⟩
+      rfl rfl rfl (by decide) rfl rfl rfl rfl rfl (by decide) rfl rfl
+  · exact layoutDataMaskProto_array_union_no_fields_none 1 _ 3 2 0 0 2 2
+      { size := ⟨4⟩, align := ⟨2⟩, fields := .array ⟨2⟩ 2, variants := .single 0,
+        backendRepr := .memory, fieldLayouts := [2], isUninhabited := false }
+      { size := ⟨2⟩, align := ⟨2⟩, fields := .union 2, variants := .single 0,
+        backendRepr := .scalar (.union (.int 16 false)), isUninhabited := false }
+      ⟨2⟩ (.int 16 false)
+      rfl rfl rfl (by decide) rfl rfl rfl rfl rfl rfl
+
+/-! ## Section 18: Non-Vacuity Witnesses & Mechanical Standard-Axiom Gate -/
 
 /--
 Non-vacuity witness instantiating EVERY universally quantified theorem in
@@ -2682,6 +2991,11 @@ theorem all_proto_and_test_theorems :
   have _ := provenance_carrying_usize_operands_fail_closed
   have _ := union_scalar_array_fast_path_data_mask
   have _ := b3_universal_theorems_non_vacuous
+  have _ := tag_window_and_root_align_on_32bit_table
+  have _ := decode_usize_arg_malformed_ptr_ub_unbacked_zero_and_zst_prov
+  have _ := custom_dst_wide_tuple_and_32bit_slice_meta_validity
+  have _ := ptr_offset_from_u64_on_32bit_and_const_eval_select_all_8_intrinsics
+  have _ := a3_universal_theorems_non_vacuous
   have _ := non_vacuity_all_quantified_theorems
   exact ⟨rfl, compareUnsignedBytesProto_eq_miriBytesCompareSpec, ptrMask_baseAddr_invariant,
     evalPtrOffsetFromDistanceProto_eq_miriSpec, misaligned_offset_has_misaligned_placement, trivial⟩
@@ -2826,6 +3140,11 @@ elab "#assert_proto_standard_axioms " ids:ident* : command => do
   provenance_carrying_usize_operands_fail_closed
   union_scalar_array_fast_path_data_mask
   b3_universal_theorems_non_vacuous
+  tag_window_and_root_align_on_32bit_table
+  decode_usize_arg_malformed_ptr_ub_unbacked_zero_and_zst_prov
+  custom_dst_wide_tuple_and_32bit_slice_meta_validity
+  ptr_offset_from_u64_on_32bit_and_const_eval_select_all_8_intrinsics
+  a3_universal_theorems_non_vacuous
   non_vacuity_all_quantified_theorems
   all_proto_and_test_theorems
 
