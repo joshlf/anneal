@@ -793,9 +793,11 @@ run_meta do
   assertRequiresRefuted ``falsePre
   assertRequiresRefuted ``contradictoryPreContract
   assertRequiresRefuted ``contradictoryClaim
-  -- An unsatisfiable `requires` is invisible to the `ensures` check: the
-  -- postcondition of `contradictoryClaim` binds its output.
-  assertEnsuresBindsOutput ``contradictoryClaim
+  -- Judged without its `requires`, the postcondition of `contradictoryClaim`
+  -- binds its output; judged as a contract, nothing is admissible.
+  assertEnsuresBindsOutput ``contradictoryClaim (cfg := { useRequires := false })
+  assertEnsuresVacuous ``contradictoryClaim (some .requiresUnsatisfiable)
+  assertEnsuresVacuous ``contradictoryPreContract (some .requiresUnsatisfiable)
   -- A satisfiable `requires` is not refuted.
   assertRequiresNotRefuted ``Refinement.incPre
   assertRequiresNotRefuted ``Refinement.checkedIncClaim
@@ -2059,6 +2061,452 @@ run_meta do
     assertEnsuresVacuous n (cfg := noProbe)
 
 end HardeningB1
+
+/-! ## Hardening (pass A1): case trees, hypotheses, and the precondition -/
+
+namespace HardeningA1
+
+/-! ### `match` case trees: several discriminants and nested patterns -/
+
+/-- Return-blind behind a `match` on the answer *and* the arguments. -/
+def multiDiscrBlind : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans, req.args with
+    | .returned _ _, [_] => True
+    | .returned _ _, _ => True
+    | _, _ => False
+
+theorem multiDiscrBlind_post_returned (req : MirCallReq) (v : Value) (m : Memory) :
+    multiDiscrBlind.post req (.returned v m) := by
+  show (match MirCallAns.returned v m, req.args with
+    | .returned _ _, [_] => True
+    | .returned _ _, _ => True
+    | _, _ => False)
+  split <;> first | trivial | simp_all
+
+theorem multiDiscrBlind_not_normalDichotomy :
+    ¬ MirCallContractNormalDichotomy multiDiscrBlind :=
+  not_mirCallContractNormalDichotomy_of_return_blind fun req _ _ _ _ _ =>
+    ⟨fun _ => multiDiscrBlind_post_returned req _ _,
+      fun _ => multiDiscrBlind_post_returned req _ _⟩
+
+/-- Return-blind behind nested patterns on the returned value. -/
+def nestedPatternBlind : MirCallContract where
+  pre _ := True
+  post _ ans :=
+    match ans with
+    | .returned (.scalar _) _ => True
+    | .returned (.ptr _ _) _ => True
+    | .returned _ _ => True
+    | _ => False
+
+theorem nestedPatternBlind_post_returned (req : MirCallReq) (v : Value)
+    (m : Memory) : nestedPatternBlind.post req (.returned v m) := by
+  cases v <;> trivial
+
+theorem nestedPatternBlind_not_normalDichotomy :
+    ¬ MirCallContractNormalDichotomy nestedPatternBlind :=
+  not_mirCallContractNormalDichotomy_of_return_blind fun req _ _ _ _ _ =>
+    ⟨fun _ => nestedPatternBlind_post_returned req _ _,
+      fun _ => nestedPatternBlind_post_returned req _ _⟩
+
+/-- Reflexive equations spread over a two-discriminant `match`. -/
+def multiDiscrRefl : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans, req.args with
+    | .returned v _, [] => v = v
+    | .returned _ m, _ :: _ => m = m
+    | .panicked _, _ => False
+    | .aborted, _ => True
+
+theorem multiDiscrRefl_post_returned (req : MirCallReq) (v : Value) (m : Memory) :
+    multiDiscrRefl.post req (.returned v m) := by
+  show (match MirCallAns.returned v m, req.args with
+    | .returned v _, [] => v = v
+    | .returned _ m, _ :: _ => m = m
+    | .panicked _, _ => False
+    | .aborted, _ => True)
+  split <;> first | rfl | simp_all
+
+theorem multiDiscrRefl_not_normalDichotomy :
+    ¬ MirCallContractNormalDichotomy multiDiscrRefl :=
+  not_mirCallContractNormalDichotomy_of_return_blind fun req _ _ _ _ _ =>
+    ⟨fun _ => multiDiscrRefl_post_returned req _ _,
+      fun _ => multiDiscrRefl_post_returned req _ _⟩
+
+#expect_vacuous multiDiscrBlind returnBlind
+#expect_vacuous nestedPatternBlind returnBlind
+#expect_vacuous multiDiscrRefl returnBlind
+
+/-- The same two-discriminant shape with one binding alternative. -/
+def multiDiscrGenuine : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans, req.args with
+    | .returned v _, [x] => v = x
+    | .returned _ _, _ => True
+    | _, _ => False
+
+theorem multiDiscrGenuine_returnValueDichotomy :
+    MirCallContractReturnValueDichotomy multiDiscrGenuine :=
+  ⟨{ defPath := "", args := [.unit], memory := emptyMemory }, .unit, .uninit,
+    emptyMemory, trivial, rfl, nofun⟩
+
+/-- The same nested-pattern shape with one rejecting alternative. -/
+def nestedPatternGenuine : MirCallContract where
+  pre _ := True
+  post _ ans :=
+    match ans with
+    | .returned (.scalar _) _ => True
+    | .returned _ _ => False
+    | _ => False
+
+theorem nestedPatternGenuine_returnValueDichotomy :
+    MirCallContractReturnValueDichotomy nestedPatternGenuine :=
+  ⟨witnessReq, .scalar ⟨0, 1⟩, .unit, emptyMemory, trivial, trivial, id⟩
+
+#expect_binds multiDiscrGenuine
+#expect_binds nestedPatternGenuine
+
+-- Its case tree still scrutinises the input, so the proof search settles it.
+vacuous_case pairMatchInput semanticallyInsensitive :=
+  fun x r => match x, r with
+    | 0, _ => x < 9
+    | _ + 1, 0 => x < 7
+    | _ + 1, _ + 1 => x < 7
+  by intro x r₁ r₂; cases x <;> cases r₁ <;> cases r₂ <;> simp [pairMatchInput]
+genuine_case pairMatchGenuine := fun x r => match x, r with
+    | 0, _ => True
+    | _ + 1, 0 => False
+    | _ + 1, _ + 1 => True
+  witness 1 1 0 by simp [pairMatchGenuine]
+
+/-! ### Hypotheses that rewrite or contradict -/
+
+/-- An uninterpreted function: only congruence is known of it. -/
+opaque opaqueFn : Nat → Nat
+
+vacuous_case congrUnderHyp reflexiveTautology :=
+  fun x r => r = x → opaqueFn r = opaqueFn x
+  by intro x r₁ r₂; exact ⟨fun _ h => h ▸ rfl, fun _ h => h ▸ rfl⟩
+vacuous_case congrUnderIte reflexiveTautology :=
+  fun x r => if r = x then opaqueFn r = opaqueFn x else True
+  by
+    intro x r₁ r₂
+    have key : ∀ r, (if r = x then opaqueFn r = opaqueFn x else True) := by
+      intro r; split
+      · next h => exact h ▸ rfl
+      · trivial
+    exact ⟨fun _ => key r₂, fun _ => key r₁⟩
+genuine_case hypEqGenuine := fun x r => x = 3 → r = x
+  witness 3 3 0 by simp [hypEqGenuine]
+genuine_case hypEqOutput := fun x r => r = 3 → x = r
+  witness 0 0 3 by simp [hypEqOutput]
+
+/-- Premises that contradict each other, over `Value`s (no arithmetic). -/
+def contradictoryHypVal (a r : Value) : Prop :=
+  (a = .unit ∧ a = .uninit) → r = .unit
+
+theorem contradictoryHypVal_not_dichotomy (pre : Value → Prop) :
+    ¬ PostconditionDichotomy pre contradictoryHypVal :=
+  not_dichotomy_of_universal_post fun _ _ _ ⟨h₁, h₂⟩ =>
+    nomatch h₁.symm.trans h₂
+
+#expect_vacuous contradictoryHypVal semanticallyInsensitive
+
+vacuous_case nonemptyFin semanticallyInsensitive :=
+  fun _ r => Nonempty (Fin (r + 1))
+  by intro _ r₁ r₂; exact ⟨fun _ => ⟨0⟩, fun _ => ⟨0⟩⟩
+vacuous_case nonlinearIdentity semanticallyInsensitive :=
+  fun x r => (r + x) * (r + x) = r * r + 2 * r * x + x * x
+  by intro x r₁ r₂; simp only [nonlinearIdentity]; constructor <;> intro _ <;> grind
+
+/-! ### Exhaustive constructor disjunctions (case split on the output) -/
+
+def optionExhaustive (_x : Nat) (r : Option Nat) : Prop :=
+  r = none ∨ ∃ v, r = some v
+
+theorem optionExhaustive_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre optionExhaustive :=
+  not_dichotomy_of_universal_post fun _ r _ => by
+    cases r with
+    | none => exact .inl rfl
+    | some v => exact .inr ⟨v, rfl⟩
+
+def optionGenuine (_x : Nat) (r : Option Nat) : Prop := r = none ∨ r = some 3
+
+theorem optionGenuine_dichotomy :
+    PostconditionDichotomy (fun _ => True) optionGenuine :=
+  ⟨0, none, some 4, trivial, .inl rfl, fun h => by
+    rcases h with h | h <;> cases h⟩
+
+/-- A `Claim` whose `ensures` lists every constructor of `Value`. -/
+def valueExhaustiveClaim (body : CapturedMir) : Claim where
+  body := body
+  pre _ := True
+  post _ ret :=
+    ret = .unit ∨ ret = .uninit ∨ (∃ s, ret = .scalar s) ∨
+      (∃ p n, ret = .ptr p n) ∨ ∃ i fs, ret = .aggregate i fs
+
+theorem valueExhaustiveClaim_not_dichotomy (body : CapturedMir) :
+    ¬ ClaimDichotomy (valueExhaustiveClaim body) :=
+  not_dichotomy_of_universal_post fun _ ret _ => by
+    cases ret with
+    | unit => exact .inl rfl
+    | uninit => exact .inr (.inl rfl)
+    | scalar s => exact .inr (.inr (.inl ⟨s, rfl⟩))
+    | ptr p n => exact .inr (.inr (.inr (.inl ⟨p, n, rfl⟩)))
+    | aggregate i fs => exact .inr (.inr (.inr (.inr ⟨i, fs, rfl⟩)))
+
+/-- Both Boolean outputs lead to the same input-only condition. -/
+def boolSplitVacuous (x : Nat) (r : Bool) : Prop :=
+  (r = true ∧ x = 1) ∨ (r = false ∧ x = 1)
+
+theorem boolSplitVacuous_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre boolSplitVacuous :=
+  not_dichotomy_of_input_predicate (fun x => x = 1) fun x r _ => by
+    cases r <;> simp [boolSplitVacuous]
+
+/-- The two Boolean outputs lead to different conditions: a genuine clause. -/
+def boolSplitGenuine (x : Nat) (r : Bool) : Prop :=
+  (r = true ∧ x = 1) ∨ (r = false ∧ x = 2)
+
+theorem boolSplitGenuine_dichotomy :
+    PostconditionDichotomy (fun _ => True) boolSplitGenuine :=
+  ⟨1, true, false, trivial, by simp [boolSplitGenuine],
+    by simp [boolSplitGenuine]⟩
+
+#expect_vacuous optionExhaustive reflexiveTautology
+#expect_binds optionGenuine
+#expect_vacuous valueExhaustiveClaim reflexiveTautology
+#expect_vacuous boolSplitVacuous reflexiveTautology
+#expect_binds boolSplitGenuine
+
+run_meta do
+  -- The case split is syntactic: it does not need the proof search.
+  let noProbe : EnsuresCheckConfig := { semanticProbe := false }
+  for n in #[``optionExhaustive, ``valueExhaustiveClaim, ``boolSplitVacuous,
+      ``multiDiscrBlind, ``nestedPatternBlind, ``multiDiscrRefl,
+      ``congrUnderHyp, ``congrUnderIte] do
+    assertEnsuresVacuous n (cfg := noProbe)
+
+/-! ### Binding is relative to the precondition -/
+
+def smallPre (x : Nat) : Prop := x < 10
+
+/-- `ensures(x >= 10 ==> ret == 5)`: binding on its own ... -/
+def guardedPost (x ret : Nat) : Prop := x ≥ 10 → ret = 5
+
+theorem guardedPost_dichotomy :
+    PostconditionDichotomy (fun _ => True) guardedPost :=
+  ⟨10, 5, 0, trivial, fun _ => rfl,
+    fun h => absurd (h (Nat.le_refl 10)) (by decide)⟩
+
+/-- ... and vacuous under `requires(x < 10)`: its guard is never met. -/
+theorem guardedPost_not_dichotomy_under_requires :
+    ¬ PostconditionDichotomy smallPre guardedPost :=
+  not_dichotomy_of_universal_post fun x _ (hx : x < 10) (h : x ≥ 10) => by
+    omega
+
+/-- `ensures(x > 20 && ret == 5)` contradicts `requires(x < 10)`. -/
+def contradictedPost (x ret : Nat) : Prop := x > 20 ∧ ret = 5
+
+theorem contradictedPost_not_realizable :
+    ¬ ContractRealizable smallPre contradictedPost :=
+  not_realizable_of_unsat_post fun x _ (hx : x < 10) (h : x > 20 ∧ _) => by
+    omega
+
+/-- The guarded shape on a `Claim`: the `requires` bounds the argument. -/
+def guardedClaim (body : CapturedMir) : Claim where
+  body := body
+  pre args := ∃ a, args = [u32Arg a] ∧ a < 10
+  post args ret := ∀ a, args = [u32Arg a] → a ≥ 10 → ret = u32Arg 0
+
+theorem guardedClaim_not_dichotomy (body : CapturedMir) :
+    ¬ ClaimDichotomy (guardedClaim body) :=
+  not_dichotomy_of_universal_post fun _ _ ⟨a₀, h₀, hlt⟩ a ha hge => by
+    have : a₀ = a := u32Single_inj h₀ ha
+    omega
+
+/-- The same guard, met by some admissible argument: a genuine `ensures`. -/
+def guardedGenuineClaim (body : CapturedMir) : Claim where
+  body := body
+  pre args := ∃ a, args = [u32Arg a] ∧ a < 10
+  post args ret := ∀ a, args = [u32Arg a] → a ≥ 5 → ret = u32Arg 0
+
+theorem guardedGenuineClaim_dichotomy (body : CapturedMir) :
+    ClaimDichotomy (guardedGenuineClaim body) :=
+  ⟨[u32Arg 7], u32Arg 0, u32Arg 1, ⟨7, rfl, by decide⟩, fun _ _ _ => rfl,
+    fun h => absurd (u32Arg_inj (h 7 rfl (by decide))) (by decide)⟩
+
+/-- The guarded shape on a `MirCallContract`. -/
+def guardedContract : MirCallContract where
+  pre req := ∃ a, req.args = [u32Arg a] ∧ a < 10
+  post req ans :=
+    match ans with
+    | .returned retVal _ => ∀ a, req.args = [u32Arg a] → a ≥ 10 → retVal = u32Arg 0
+    | .panicked _ => False
+    | .aborted => False
+
+theorem guardedContract_not_normalDichotomy :
+    ¬ MirCallContractNormalDichotomy guardedContract :=
+  fun ⟨_, _, _, _, _, ⟨a₀, h₀, hlt⟩, _, hbad⟩ =>
+    hbad fun a ha hge => by
+      have : a₀ = a := u32Single_inj h₀ ha
+      omega
+
+/-- The guarded shape on a `StatefulClaim`: the guard needs one argument. -/
+def guardedStatefulClaim (body : CapturedMir) : StatefulClaim where
+  body := body
+  pre args _ := args = []
+  post args _ ret mem' := args.length = 1 → (ret = .unit ∧ mem' = emptyMemory)
+
+theorem guardedStatefulClaim_not_dichotomy (body : CapturedMir) :
+    ¬ StatefulClaimDichotomy (guardedStatefulClaim body) :=
+  not_statefulClaimDichotomy_of_output_blind
+    fun args _ _ _ _ _ (h : args = []) => by
+      subst h
+      exact ⟨fun _ h' => absurd h' (by decide), fun _ h' => absurd h' (by decide)⟩
+
+run_meta do
+  assertEnsuresVacuous ``guardedStatefulClaim (some .vacuousUnderRequires)
+  -- Judged alone the clause binds; judged against its `requires` it does not.
+  assertEnsuresBindsOutput ``guardedPost
+  assertEnsuresVacuous ``guardedPost (some .vacuousUnderRequires)
+    (preDecl? := some ``smallPre)
+  assertEnsuresBindsOutput ``contradictedPost
+  assertEnsuresVacuous ``contradictedPost (some .unrealizableUnderRequires)
+    (preDecl? := some ``smallPre)
+  -- A precondition that leaves the guard reachable does not change the verdict.
+  assertEnsuresBindsOutput ``Refinement.incSpec (preDecl? := some ``Refinement.incPre)
+  -- Contracts carry their own `requires`.
+  assertEnsuresVacuous ``guardedClaim (some .vacuousUnderRequires)
+  assertEnsuresVacuous ``guardedContract (some .vacuousUnderRequires)
+  assertEnsuresBindsOutput ``guardedClaim (cfg := { useRequires := false })
+  assertEnsuresBindsOutput ``guardedContract (cfg := { useRequires := false })
+  assertEnsuresBindsOutput ``guardedGenuineClaim
+  -- A precondition must be a predicate over leading binders of the postcondition.
+  let failed (x : MetaM EnsuresCheckReport) : MetaM Bool := do
+    try
+      discard x
+      return false
+    catch _ =>
+      return true
+  unless ← failed (reportOf ``guardedPost (cfg := {}) |>.bind fun _ =>
+      checkDeclEnsuresBindsOutput ``guardedPost (preDecl? := some ``u32Arg)) do
+    throwError "a non-predicate precondition was accepted"
+  unless ← failed
+      (checkDeclEnsuresBindsOutput ``Class3.reflPost
+        (preDecl? := some ``Refinement.geSpec)) do
+    throwError "a precondition over the output binder was accepted"
+
+/-! ### Boilerplate in disguise (user `ensures` mode) -/
+
+/-- Frame boilerplate behind a vacuous disjunction. -/
+def frameOrFalse : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned _ memAfter => callFramePreserved req.memory memAfter ∨ False
+    | .panicked _ => False
+    | .aborted => True
+
+/-- Frame boilerplate behind a double negation. -/
+def frameNotNot : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned _ memAfter => ¬ ¬ callFramePreserved req.memory memAfter
+    | .panicked _ => False
+    | .aborted => True
+
+/-- Frame boilerplate behind `↔ True`. -/
+def frameIffTrue : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned _ memAfter => (callFramePreserved req.memory memAfter ↔ True)
+    | .panicked _ => False
+    | .aborted => True
+
+/-- Frame boilerplate as a contrapositive. -/
+def frameContrapositive : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned _ memAfter => ¬ callFramePreserved req.memory memAfter → False
+    | .panicked _ => False
+    | .aborted => True
+
+theorem frameOrFalse_not_returnValueDichotomy :
+    ¬ MirCallContractReturnValueDichotomy frameOrFalse :=
+  not_mirCallContractReturnValueDichotomy_of_value_blind
+    fun _ _ _ _ _ => Iff.rfl
+
+theorem frameNotNot_not_returnValueDichotomy :
+    ¬ MirCallContractReturnValueDichotomy frameNotNot :=
+  not_mirCallContractReturnValueDichotomy_of_value_blind
+    fun _ _ _ _ _ => Iff.rfl
+
+theorem frameIffTrue_not_returnValueDichotomy :
+    ¬ MirCallContractReturnValueDichotomy frameIffTrue :=
+  not_mirCallContractReturnValueDichotomy_of_value_blind
+    fun _ _ _ _ _ => Iff.rfl
+
+theorem frameContrapositive_not_returnValueDichotomy :
+    ¬ MirCallContractReturnValueDichotomy frameContrapositive :=
+  not_mirCallContractReturnValueDichotomy_of_value_blind
+    fun _ _ _ _ _ => Iff.rfl
+
+run_meta do
+  -- Each says exactly what `frameOnlyMirCallContract` says. A wrapper must not
+  -- turn the frame condition into a user constraint, and (as before) a negated
+  -- frame condition must not erase a genuine one (`genuineNegBoilerplate`).
+  for n in #[``frameOrFalse, ``frameNotNot, ``frameIffTrue,
+      ``frameContrapositive] do
+    let r ← reportOf n
+    unless r.bindsOutput && !r.bindsBeyondBoilerplate do
+      throwError "{n}: expected binding by boilerplate only\n{r.describe}"
+    expectReason n .boilerplateOnly (cfg := { userEnsuresOnly := true })
+    expectReason n .returnValueUnconstrained (cfg := { strictReturnValue := true })
+  assertEnsuresBindsOutput ``HardeningB1.genuineNegBoilerplate
+    (cfg := { userEnsuresOnly := true, strictReturnValue := true })
+
+/-! ### What an unrealizable call contract does to its caller -/
+
+/-- Under the abort-only trap, no conforming handler ever returns. -/
+theorem abortOnlyTrap_handler_never_returns {handler : ExternalCallHandler}
+    (h : Class5.abortOnlyTrap.holdsOn handler)
+    (tr : List (Trusted.Effect.Event MirClosedEffect)) (v : Value) (m : Memory) :
+    ¬ Trusted.ITree.ReachesRet (handler (CheckedAdd.req 1 2)) tr
+      (MirCallAns.returned v m) :=
+  not_reachesRet_returned_of_holdsOn_of_not_normalRealizable
+    Class5.abortOnlyTrap_not_normalRealizable h
+    (CheckedAdd.pre_req 1 2 (by decide) (by decide)) tr v m
+
+/-! ### Sequential composition -/
+
+/-- A composite ending in `ensures(true)` binds nothing. -/
+theorem seq_then_constTrue_not_dichotomy :
+    ¬ PostconditionDichotomy
+      (seqPre Refinement.incPre Refinement.incSpec (fun _ => True))
+      (seqPost Refinement.incSpec Class2.constTruePost) :=
+  not_dichotomy_seq_of_second_outputInsensitive fun _ _ _ _ _ => trivial
+
+/-- `inc ; inc` separates outputs: the first stage is deterministic. -/
+theorem seq_inc_inc_dichotomy :
+    PostconditionDichotomy
+      (seqPre Refinement.incPre Refinement.incSpec Refinement.incPre)
+      (seqPost Refinement.incSpec Refinement.incSpec) :=
+  dichotomy_seq_of_deterministic_first Refinement.incSpec_deterministic
+    ⟨5, 6, 7, 0,
+      ⟨Refinement.incPre_five, fun mid (h : mid = 5 + 1) =>
+        show mid < 100 by omega⟩,
+      rfl, rfl, show ¬ 0 = 6 + 1 by omega⟩
+
+end HardeningA1
 
 /-! ## Axiom and soundness audit -/
 
