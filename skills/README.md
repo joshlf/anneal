@@ -27,7 +27,7 @@ development notes, upstream. The provenance links below retain access to it.
 | [`reader-oriented-explanation`](reader-oriented-explanation/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | [`reader-oriented-explanation/` at `b563468a8148df117283494915cee5b6561cc47f`](https://github.com/joshlf/skills/tree/b563468a8148df117283494915cee5b6561cc47f/reader-oriented-explanation) |
 | [`robust-code`](robust-code/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | [`robust-code/` at `468f74547999ad6879905c91398b1a218b010791`](https://github.com/joshlf/skills/tree/468f74547999ad6879905c91398b1a218b010791/robust-code) (patched; see below) |
 | [`skill-authorship`](skill-authorship/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | [`skill-authorship/` at `3bf3f345b2916f8417306ba197f779b0b4429c1d`](https://github.com/joshlf/skills/tree/3bf3f345b2916f8417306ba197f779b0b4429c1d/skill-authorship) |
-| [`swarm-model-refinement`](swarm-model-refinement/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | [`swarm-model-refinement/` at `3bf3f345b2916f8417306ba197f779b0b4429c1d`](https://github.com/joshlf/skills/tree/3bf3f345b2916f8417306ba197f779b0b4429c1d/swarm-model-refinement) |
+| [`swarm-model-refinement`](swarm-model-refinement/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | [`swarm-model-refinement/` at `f0afc6cb1203fff09089112f31cc481df7f1de75`](https://github.com/joshlf/skills/tree/f0afc6cb1203fff09089112f31cc481df7f1de75/swarm-model-refinement) (patched; see below) |
 | [`tech-lead`](tech-lead/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | [`tech-lead/` at `3bf3f345b2916f8417306ba197f779b0b4429c1d`](https://github.com/joshlf/skills/tree/3bf3f345b2916f8417306ba197f779b0b4429c1d/tech-lead) |
 | [`williams-style`](williams-style/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | [`williams-style/` at `b563468a8148df117283494915cee5b6561cc47f`](https://github.com/joshlf/skills/tree/b563468a8148df117283494915cee5b6561cc47f/williams-style) |
 | [`change-review`](change-review/SKILL.md) | Repository-owned | Local and hosted review workflow, risk sizing, pipelining, and receipts ([maintainer contract](../docs/review-policy-design.md)) |
@@ -48,6 +48,12 @@ modifications:
 - **`skills/williams-style/`:** The copy omits the upstream
   `references/SOURCES.md` document and removes its optional link from
   `SKILL.md`.
+
+- **`skills/swarm-model-refinement/`:** Omits the upstream
+  `scripts/holdout-seal.py` helper (executable scripts stay out of skill roots)
+  and removes its relative link from `SKILL.md`; hosts supplying an external,
+  unpinned `holdout-seal.py` still enable cooperative same-UID `sealed-file`
+  mode, otherwise `private-subagent` or fail-closed `none` applies.
 
 - **`skills/robust-code/`:**
   - **Omitted file:** `references/agent-scaffolding.md`. (This reference file
