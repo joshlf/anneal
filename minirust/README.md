@@ -1405,9 +1405,11 @@ These are deliberate and are the first things to lift:
   general `TupleSpec`). An `Ordering` local is written by `Cmp` or `Use` and
   read by `Use` or `Return` (no `Ordering` constants, `Discriminant`, or
   `SwitchInt` on it); `Type::Enum` (beyond `Ordering`) and `Type::Union` are
-  interpreted as representations (layout, `decode`, `encode`, `check_value`)
-  without `ValueExpr::{Union, Variant, GetDiscriminant}`,
-  `Statement::SetDiscriminant`, or downcast projections. Raw pointers and
+  executed in `Interp.lean` (representation, `PlaceExpr::Downcast`,
+  `ValueExpr::{Union, Variant, GetDiscriminant}`, and
+  `Statement::SetDiscriminant`), but remain outside the `inFragment`
+  correspondence fragment (which does not translate multi-variant ADTs, unions,
+  `SetDiscriminant`, or downcast projections). Raw pointers and
   references are restricted (below); there are no slices, nested arrays,
   multi-variant ADTs, other casts, calls, drops, or assertions.
 * **`Repeat(copy p, 0)` is excluded (while `Repeat(const c, 0)` is included).**
