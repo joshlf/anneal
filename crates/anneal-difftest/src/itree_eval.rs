@@ -914,9 +914,9 @@ impl ItreeOleanFootprint {
 pub struct ItreeOleanFootprintIndex {
     /// Aggregate shared vs. staged `.olean`/`.ilean` totals.
     pub footprint: ItreeOleanFootprint,
-    /// Exact on-disk byte sizes (`.olean` + `.olean.server` + `.olean.private`
-    /// + `.ilean`) of each built staged module under `Mir`, keyed by Lean
-    /// module name (e.g. `"Mir.ItreeDiffStaged.b0_c0__kernel_step"`).
+    /// Exact on-disk byte sizes (`.olean`, `.olean.server`, `.olean.private`,
+    /// and `.ilean` together) of each built staged module under `Mir`, keyed
+    /// by Lean module name (e.g. `"Mir.ItreeDiffStaged.b0_c0__kernel_step"`).
     pub staged_module_bytes: BTreeMap<String, u64>,
 }
 
@@ -2170,6 +2170,14 @@ where
 /// non-memory failures are recorded directly without re-running them, while
 /// memory-failed `k == 1` leaves from a multi-worker wave (`wave_width > 1`)
 /// get one sequential retry at full worker memory (`concurrency = 1`).
+///
+/// Systematic memory failures are bounded across the whole stage, not per
+/// chunk: while the stage has confirmed nothing, the candidates with a
+/// single-case module that exceeded a memory limit carry over to later waves
+/// (of at least the same width), so once [`ITREE_FALLBACK_CIRCUIT_BREAKER`] of
+/// them are known a later chunk is run once and not halved (see
+/// [`run_adaptive_confirm_chunk_collecting`]). The first confirmation anywhere
+/// in the stage re-arms halving.
 fn run_isolated_adaptive_confirm_stage<C, X, K, F>(
     stage_label: &str,
     cases: &[C],
@@ -2256,43 +2264,62 @@ where
         }
     };
 
+    // Candidates with a single-case module that exceeded a memory limit so far,
+    // each with the narrowest wave (the largest per-worker memory share) in
+    // which that happened. A wave inherits them only while the stage has
+    // confirmed nothing, and only from waves at most as wide as itself: a
+    // systematic failure that one chunk has established then costs every later
+    // chunk one run (see `run_adaptive_confirm_chunk_collecting`), but a module
+    // that was too large for a `1 / jobs` share is no evidence against halving
+    // in a narrower final wave with more memory per worker.
+    let mut stage_memory_failed_leaf_fns: BTreeMap<String, usize> = BTreeMap::new();
     let chunks: Vec<&[C]> = cases.chunks(chunk_size).collect();
     for (wave_idx, wave) in chunks.chunks(jobs).enumerate() {
         let wave_width = wave.len();
         if adaptive_confirm_chunks {
-            let wave_res: Vec<(String, Result<AdaptiveConfirmChunkOutcome<C, X>, String>)> =
-                std::thread::scope(|s| {
-                    let handles: Vec<_> = wave
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &chunk)| {
-                            let label = format!("{stage_label}Chunk{}", wave_idx * jobs + i);
-                            let run_chunk = &run_chunk;
-                            let case_key = &case_key;
-                            let worker_label = label.clone();
-                            let handle = s.spawn(move || {
-                                let _concurrency = ItreeLeanConcurrencyGuard::enter(wave_width);
-                                run_adaptive_confirm_chunk_collecting(
-                                    &worker_label,
-                                    chunk,
-                                    case_key,
-                                    case_to_fn,
-                                    run_chunk,
-                                )
-                            });
-                            (label, handle)
-                        })
-                        .collect();
-                    handles
-                        .into_iter()
-                        .map(|(label, h)| {
-                            let res = h
-                                .join()
-                                .map_err(|_| "Lean chunk worker panicked".to_string());
-                            (label, res)
-                        })
-                        .collect()
-                });
+            let inherited_memory_failed_leaf_fns: BTreeSet<String> = if results.is_empty() {
+                stage_memory_failed_leaf_fns
+                    .iter()
+                    .filter(|&(_, &failed_wave_width)| failed_wave_width <= wave_width)
+                    .map(|(fn_name, _)| fn_name.clone())
+                    .collect()
+            } else {
+                BTreeSet::new()
+            };
+            let wave_res: AdaptiveConfirmWaveResults<C, X> = std::thread::scope(|s| {
+                let handles: Vec<_> = wave
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &chunk)| {
+                        let label = format!("{stage_label}Chunk{}", wave_idx * jobs + i);
+                        let run_chunk = &run_chunk;
+                        let case_key = &case_key;
+                        let inherited_memory_failed_leaf_fns = &inherited_memory_failed_leaf_fns;
+                        let worker_label = label.clone();
+                        let handle = s.spawn(move || {
+                            let _concurrency = ItreeLeanConcurrencyGuard::enter(wave_width);
+                            run_adaptive_confirm_chunk_collecting(
+                                &worker_label,
+                                chunk,
+                                case_key,
+                                case_to_fn,
+                                inherited_memory_failed_leaf_fns,
+                                run_chunk,
+                            )
+                        });
+                        (label, handle)
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|(label, h)| {
+                        let res = h
+                            .join()
+                            .map_err(|_| "Lean chunk worker panicked".to_string());
+                        (label, res)
+                    })
+                    .collect()
+            });
             for (&chunk, (label, res)) in wave.iter().zip(wave_res) {
                 let outcome = match res {
                     Ok(outcome) => outcome,
@@ -2303,6 +2330,12 @@ where
                     }
                 };
                 results.extend(outcome.confirmed);
+                for fn_name in outcome.memory_failed_leaf_fns {
+                    let failed_wave_width = stage_memory_failed_leaf_fns
+                        .entry(fn_name)
+                        .or_insert(wave_width);
+                    *failed_wave_width = (*failed_wave_width).min(wave_width);
+                }
                 let mut chunk_unresolved: Vec<C> = Vec::new();
                 for (sub_label, single_case, err) in outcome.irreducible_singletons {
                     let kind = classify_itree_lean_failure(&err);
@@ -2318,10 +2351,7 @@ where
                         chunk_unresolved.push(single_case);
                     } else {
                         let key = case_key(&single_case);
-                        let fn_name = case_to_fn
-                            .get(key)
-                            .map(String::as_str)
-                            .unwrap_or("unknown");
+                        let fn_name = case_to_fn.get(key).map(String::as_str).unwrap_or("unknown");
                         errors.push(format!(
                             "{sub_label} (irreducible single case `{key}` of `{fn_name}`): {}",
                             truncate_lean_diag(&err)
@@ -2338,18 +2368,31 @@ where
                 if !outcome.skipped_by_abort.is_empty() {
                     if let Some(ref missing_err) = outcome.missing_toolchain_err {
                         note_failure(&outcome.skipped_by_abort, missing_err);
-                    } else if wave_width > 1 && outcome.aborted_with_memory_pressure {
-                        // Multi-worker wave hit systematic memory pressure; give the
-                        // remaining cases a chance under sequential full-memory fallback.
-                        chunk_unresolved.extend(outcome.skipped_by_abort);
                     } else {
-                        errors.push(format!(
-                            "{label}: adaptive Stage 2 confirm stopped after \
-                             {ITREE_FALLBACK_CIRCUIT_BREAKER} consecutive irreducible leaf \
-                             failures with 0 confirmed cases ({} remaining case(s) skipped)",
-                            outcome.skipped_by_abort.len()
-                        ));
-                        note_failure(&outcome.skipped_by_abort, "");
+                        // Not a missing toolchain, so these cases were given up by a
+                        // module that exceeded a memory limit while halving was
+                        // suspended.
+                        let (probe_label, probe_err) = outcome
+                            .suspended_probe_failure
+                            .as_ref()
+                            .map_or((label.as_str(), ""), |(l, e)| (l.as_str(), e.as_str()));
+                        if wave_width > 1 {
+                            // That module ran on a `1 / wave_width` share of the
+                            // memory: retry its cases sequentially on the whole budget.
+                            errors
+                                .push(format!("{probe_label}: {}", truncate_lean_diag(probe_err)));
+                            chunk_unresolved.extend(outcome.skipped_by_abort);
+                        } else {
+                            errors.push(format!(
+                                "{label}: adaptive Stage 2 confirm stopped halving after \
+                                 {ITREE_FALLBACK_CIRCUIT_BREAKER} single-case module(s) exceeded \
+                                 memory without a confirmation; {} case(s) left unconfirmed, \
+                                 first by `{probe_label}`: {}",
+                                outcome.skipped_by_abort.len(),
+                                truncate_lean_diag(probe_err)
+                            ));
+                            note_failure(&outcome.skipped_by_abort, "");
+                        }
                     }
                 }
                 if !chunk_unresolved.is_empty() {
@@ -2561,35 +2604,80 @@ where
     }
 }
 
+/// `(chunk label, outcome)` per chunk of one adaptive Stage 2 wave; `Err` when
+/// the chunk's worker panicked.
+type AdaptiveConfirmWaveResults<C, X> =
+    Vec<(String, Result<AdaptiveConfirmChunkOutcome<C, X>, String>)>;
+
+/// What [`run_adaptive_confirm_chunk_collecting`] learned about one Stage 2
+/// confirmation chunk.
 struct AdaptiveConfirmChunkOutcome<C, X> {
+    /// Results of every case whose module (the chunk or one of its halves) the
+    /// kernel checked completely.
     confirmed: BTreeMap<String, X>,
+    /// `(label, case, error)` of every single-case module that failed.
     irreducible_singletons: Vec<(String, C, String)>,
+    /// `(label, cases, error)` of every multi-case module that failed in a way
+    /// halving does not relieve (a timeout, a rejection, an incomplete result),
+    /// and of the module that found the toolchain missing.
     unresolved: Vec<(String, Vec<C>, String)>,
+    /// Cases left without a result and without a failing module of their own:
+    /// their multi-case module exceeded a memory limit while halving was
+    /// suspended, or they were never run after the toolchain went missing.
     skipped_by_abort: Vec<C>,
-    aborted_by_circuit_breaker: bool,
-    aborted_with_memory_pressure: bool,
+    /// `(label, error)` of the first multi-case module that exceeded a memory
+    /// limit while halving was suspended.
+    suspended_probe_failure: Option<(String, String)>,
+    /// The error of the run that found the toolchain missing.
     missing_toolchain_err: Option<String>,
+    /// Candidates with a single-case module that exceeded a memory limit: the
+    /// inherited ones plus those of this chunk.
+    memory_failed_leaf_fns: BTreeSet<String>,
 }
 
 /// Partial-preserving adaptive Stage 2 confirmation splitter used by
 /// [`run_isolated_adaptive_confirm_stage`] on the outer chunk wave.
 ///
-/// Preserves every kernel-confirmed subchunk (`confirmed`), isolates
-/// irreducible `k == 1` leaves once instead of re-running them through
-/// `Fallback` + `Bisect`, and bounds systematic failures cleanly without
-/// starving unrelated healthy candidates in the same chunk:
-/// - A candidate with `>= ITREE_FALLBACK_CIRCUIT_BREAKER` irreducible leaf
-///   failures and `0` confirmed traces has its remaining pure-candidate slices
-///   skipped (`skipped_by_abort`), while slices touching other candidates still
-///   run normally.
-/// - If `>= ITREE_FALLBACK_CIRCUIT_BREAKER` distinct candidates fail at the
-///   leaf level while the chunk has `0` confirmed traces overall (or on a
-///   missing toolchain), the remaining slices of the chunk stop immediately.
+/// A multi-case module that exceeds a memory limit
+/// ([`ItreeLeanFailureKind::RssWatchdogExceeded`] or
+/// [`ItreeLeanFailureKind::LeanMemoryExhausted`]) is halved (`[..k/2]` and
+/// `[k/2..]`, under the collision-free labels
+/// `{base_label}_split_d{depth}_{lo}_{hi}`), every kernel-confirmed sub-slice
+/// is kept (`confirmed`), and an irreducible `k == 1` leaf is run once instead
+/// of again through `Fallback` + `Bisect`.
+///
+/// Systematic memory failures suspend *halving*, never the next run: a slice
+/// reached while halving is suspended is still run once, and only if that
+/// module also exceeds a memory limit are its cases given up
+/// (`skipped_by_abort`) rather than halved. The evidence that halving is
+/// futile is a single-case module that exceeds a memory limit on its own (a
+/// rejected or timed-out single case says nothing about memory, so it never
+/// counts). Halving is suspended for
+/// - every slice, while the chunk has confirmed nothing and at least
+///   [`ITREE_FALLBACK_CIRCUIT_BREAKER`] distinct candidates have such a
+///   module, counting `inherited_memory_failed_leaf_fns` (the candidates
+///   that failed that way in earlier chunks of a stage that has confirmed
+///   nothing yet);
+/// - a slice made only of cases of candidates that each have at least
+///   [`ITREE_FALLBACK_CIRCUIT_BREAKER`] such modules and no confirmed case in
+///   this chunk.
+///
+/// Either condition lapses as soon as a module confirms a case, so one healthy
+/// module re-arms halving. Giving a slice up without that one run would drop
+/// healthy cases that were never tried (every candidate behind four
+/// irreducibly heavy ones at the head of a chunk, say), while halving on
+/// regardless would spend `O(log k)` failing runs on every chunk of a campaign
+/// in which each module fails. With the single run, a systematic failure costs
+/// `O(log k)` extra runs in the chunk that detects it and one run per later
+/// chunk.
+///
+/// A missing toolchain stops the chunk at once: nothing is run after it.
 fn run_adaptive_confirm_chunk_collecting<C, X, K, F>(
     base_label: &str,
     cases: &[C],
     case_key: &K,
     case_to_fn: &BTreeMap<String, String>,
+    inherited_memory_failed_leaf_fns: &BTreeSet<String>,
     run_slice: &F,
 ) -> AdaptiveConfirmChunkOutcome<C, X>
 where
@@ -2602,9 +2690,9 @@ where
         irreducible_singletons: Vec::new(),
         unresolved: Vec::new(),
         skipped_by_abort: Vec::new(),
-        aborted_by_circuit_breaker: false,
-        aborted_with_memory_pressure: false,
+        suspended_probe_failure: None,
         missing_toolchain_err: None,
+        memory_failed_leaf_fns: inherited_memory_failed_leaf_fns.clone(),
     };
     if cases.is_empty() {
         return outcome;
@@ -2614,35 +2702,72 @@ where
         splits: usize,
         max_depth: usize,
         confirmed_by_fn: BTreeMap<String, usize>,
-        leaf_failures_by_fn: BTreeMap<String, usize>,
-        failed_leaf_fns: BTreeSet<String>,
+        memory_leaf_failures_by_fn: BTreeMap<String, usize>,
         first_unrecovered_err: Option<String>,
         outcome: &'a mut AdaptiveConfirmChunkOutcome<C, X>,
     }
 
-    impl<C, X> SplitState<'_, C, X> {
+    impl<C: Clone, X> SplitState<'_, C, X> {
+        /// The candidate of `key` (a case no candidate owns is its own).
         fn fn_for<'b>(case_to_fn: &'b BTreeMap<String, String>, key: &'b str) -> &'b str {
             case_to_fn.get(key).map(String::as_str).unwrap_or(key)
         }
 
         fn fn_is_exhausted(&self, fn_name: &str) -> bool {
             self.confirmed_by_fn.get(fn_name).copied().unwrap_or(0) == 0
-                && self.leaf_failures_by_fn.get(fn_name).copied().unwrap_or(0)
+                && self
+                    .memory_leaf_failures_by_fn
+                    .get(fn_name)
+                    .copied()
+                    .unwrap_or(0)
                     >= ITREE_FALLBACK_CIRCUIT_BREAKER
         }
 
-        fn should_skip_slice<K: Fn(&C) -> &str>(
+        /// Whether a module of `slice` that exceeds a memory limit is given up
+        /// instead of halved (see [`run_adaptive_confirm_chunk_collecting`]).
+        fn halving_suspended<K: Fn(&C) -> &str>(
             &self,
             slice: &[C],
             case_key: &K,
             case_to_fn: &BTreeMap<String, String>,
         ) -> bool {
-            self.outcome.aborted_by_circuit_breaker
-                || self.outcome.missing_toolchain_err.is_some()
-                || (!slice.is_empty()
-                    && slice
-                        .iter()
-                        .all(|c| self.fn_is_exhausted(Self::fn_for(case_to_fn, case_key(c)))))
+            let systematic = self.outcome.confirmed.is_empty()
+                && self.outcome.memory_failed_leaf_fns.len() >= ITREE_FALLBACK_CIRCUIT_BREAKER;
+            systematic
+                || slice
+                    .iter()
+                    .all(|c| self.fn_is_exhausted(Self::fn_for(case_to_fn, case_key(c))))
+        }
+
+        fn note_unrecovered(&mut self, err: &str) {
+            if self.first_unrecovered_err.is_none() {
+                self.first_unrecovered_err = Some(err.to_string());
+            }
+        }
+
+        /// Records the failed single-case module `label` of `case`; only one
+        /// that exceeded a memory limit is evidence against halving.
+        fn record_leaf_failure<K: Fn(&C) -> &str>(
+            &mut self,
+            label: String,
+            case: &C,
+            err: String,
+            is_memory_limit: bool,
+            case_key: &K,
+            case_to_fn: &BTreeMap<String, String>,
+        ) {
+            self.note_unrecovered(&err);
+            if is_memory_limit {
+                let fn_name = Self::fn_for(case_to_fn, case_key(case)).to_string();
+                *self
+                    .memory_leaf_failures_by_fn
+                    .entry(fn_name.clone())
+                    .or_insert(0) += 1;
+                self.outcome.memory_failed_leaf_fns.insert(fn_name);
+            }
+            self.outcome
+                .irreducible_singletons
+                .push((label, case.clone(), err));
         }
     }
 
@@ -2663,10 +2788,12 @@ where
         F: Fn(&str, &[C]) -> Result<BTreeMap<String, X>, String>,
     {
         let slice = &cases[lo..hi];
-        if state.should_skip_slice(slice, case_key, case_to_fn) {
+        if state.outcome.missing_toolchain_err.is_some() {
             state.outcome.skipped_by_abort.extend_from_slice(slice);
             return;
         }
+        // Decided on what is known when the slice is reached, before its run.
+        let halving_suspended = state.halving_suspended(slice, case_key, case_to_fn);
         let label = if depth == 0 {
             base_label.to_string()
         } else {
@@ -2679,15 +2806,12 @@ where
                         "{label}: Lean confirm subchunk produced no result for `{}`",
                         case_key(missing)
                     );
-                    if state.first_unrecovered_err.is_none() {
-                        state.first_unrecovered_err = Some(err.clone());
-                    }
                     if slice.len() == 1 {
-                        state
-                            .outcome
-                            .irreducible_singletons
-                            .push((label, slice[0].clone(), err));
+                        state.record_leaf_failure(
+                            label, &slice[0], err, false, case_key, case_to_fn,
+                        );
                     } else {
+                        state.note_unrecovered(&err);
                         state.outcome.unresolved.push((label, slice.to_vec(), err));
                     }
                     return;
@@ -2704,9 +2828,7 @@ where
             Err(err) => {
                 let kind = classify_itree_lean_failure(&err);
                 if kind == ItreeLeanFailureKind::MissingToolchain {
-                    if state.first_unrecovered_err.is_none() {
-                        state.first_unrecovered_err = Some(err.clone());
-                    }
+                    state.note_unrecovered(&err);
                     state.outcome.missing_toolchain_err = Some(err.clone());
                     state.outcome.unresolved.push((label, slice.to_vec(), err));
                     return;
@@ -2717,39 +2839,41 @@ where
                         | ItreeLeanFailureKind::LeanMemoryExhausted
                 );
                 if slice.len() <= 1 {
-                    if state.first_unrecovered_err.is_none() {
-                        state.first_unrecovered_err = Some(err.clone());
-                    }
-                    if is_memory_limit {
-                        state.outcome.aborted_with_memory_pressure = true;
-                    }
-                    let fn_name =
-                        SplitState::<C, X>::fn_for(case_to_fn, case_key(&slice[0])).to_string();
-                    *state.leaf_failures_by_fn.entry(fn_name.clone()).or_insert(0) += 1;
-                    state.failed_leaf_fns.insert(fn_name);
-                    state
-                        .outcome
-                        .irreducible_singletons
-                        .push((label, slice[0].clone(), err));
-                    if state.outcome.confirmed.is_empty()
-                        && state.failed_leaf_fns.len() >= ITREE_FALLBACK_CIRCUIT_BREAKER
-                    {
-                        state.outcome.aborted_by_circuit_breaker = true;
-                    }
+                    state.record_leaf_failure(
+                        label,
+                        &slice[0],
+                        err,
+                        is_memory_limit,
+                        case_key,
+                        case_to_fn,
+                    );
                     return;
                 }
                 if !is_memory_limit {
-                    if state.first_unrecovered_err.is_none() {
-                        state.first_unrecovered_err = Some(err.clone());
-                    }
+                    state.note_unrecovered(&err);
                     state.outcome.unresolved.push((label, slice.to_vec(), err));
+                    return;
+                }
+                let summary = err.lines().next().unwrap_or("");
+                if halving_suspended {
+                    eprintln!(
+                        "itree-difftest: adaptive Stage 2 confirm halving suspended \
+                         label={label} cases={} given up after {ITREE_FALLBACK_CIRCUIT_BREAKER} \
+                         single-case module(s) exceeded memory without a confirmation \
+                         kind={kind:?} reason={summary}",
+                        hi - lo
+                    );
+                    state.note_unrecovered(&err);
+                    state.outcome.skipped_by_abort.extend_from_slice(slice);
+                    if state.outcome.suspended_probe_failure.is_none() {
+                        state.outcome.suspended_probe_failure = Some((label, err));
+                    }
                     return;
                 }
                 let mid = lo + (hi - lo) / 2;
                 let next_depth = depth + 1;
                 state.splits += 1;
                 state.max_depth = state.max_depth.max(next_depth);
-                let summary = err.lines().next().unwrap_or("");
                 eprintln!(
                     "itree-difftest: adaptive Stage 2 confirm split \
                      label={label} depth={next_depth} cases={} -> left={} right={} \
@@ -2759,26 +2883,10 @@ where
                     hi - mid
                 );
                 split_rec(
-                    base_label,
-                    cases,
-                    lo,
-                    mid,
-                    next_depth,
-                    state,
-                    case_key,
-                    case_to_fn,
-                    run_slice,
+                    base_label, cases, lo, mid, next_depth, state, case_key, case_to_fn, run_slice,
                 );
                 split_rec(
-                    base_label,
-                    cases,
-                    mid,
-                    hi,
-                    next_depth,
-                    state,
-                    case_key,
-                    case_to_fn,
-                    run_slice,
+                    base_label, cases, mid, hi, next_depth, state, case_key, case_to_fn, run_slice,
                 );
             }
         }
@@ -2789,8 +2897,7 @@ where
             splits: 0,
             max_depth: 0,
             confirmed_by_fn: BTreeMap::new(),
-            leaf_failures_by_fn: BTreeMap::new(),
-            failed_leaf_fns: BTreeSet::new(),
+            memory_leaf_failures_by_fn: BTreeMap::new(),
             first_unrecovered_err: None,
             outcome: &mut outcome,
         };
@@ -2831,135 +2938,6 @@ where
         }
     }
     outcome
-}
-
-/// Evaluates a Stage 2 confirmation slice with deterministic adaptive halving
-/// when a multi-case module exceeds memory limits
-/// ([`ItreeLeanFailureKind::RssWatchdogExceeded`] or
-/// [`ItreeLeanFailureKind::LeanMemoryExhausted`]).
-///
-/// Direct fail-closed helper used by unit tests of the standalone halving
-/// primitive; production Stage 2 confirmation calls
-/// [`run_isolated_adaptive_confirm_stage`] (which uses
-/// [`run_adaptive_confirm_chunk_collecting`] so confirmed subchunks are
-/// retained across partial failures).
-#[cfg(test)]
-fn run_adaptive_confirm_chunk<C, X, K, F>(
-    base_label: &str,
-    cases: &[C],
-    case_key: &K,
-    run_slice: &F,
-) -> Result<BTreeMap<String, X>, String>
-where
-    K: Fn(&C) -> &str,
-    F: Fn(&str, &[C]) -> Result<BTreeMap<String, X>, String>,
-{
-    if cases.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn split_rec<C, X, K, F>(
-        base_label: &str,
-        cases: &[C],
-        lo: usize,
-        hi: usize,
-        depth: usize,
-        splits: &mut usize,
-        max_depth: &mut usize,
-        case_key: &K,
-        run_slice: &F,
-    ) -> Result<BTreeMap<String, X>, String>
-    where
-        K: Fn(&C) -> &str,
-        F: Fn(&str, &[C]) -> Result<BTreeMap<String, X>, String>,
-    {
-        let slice = &cases[lo..hi];
-        let label = if depth == 0 {
-            base_label.to_string()
-        } else {
-            format!("{base_label}_split_d{depth}_{lo}_{hi}")
-        };
-        match run_slice(&label, slice) {
-            Ok(map) => {
-                if let Some(missing) = slice.iter().find(|c| !map.contains_key(case_key(c))) {
-                    return Err(format!(
-                        "{label}: Lean confirm subchunk produced no result for `{}`",
-                        case_key(missing)
-                    ));
-                }
-                Ok(map)
-            }
-            Err(err) => {
-                let kind = classify_itree_lean_failure(&err);
-                let is_memory_limit = matches!(
-                    kind,
-                    ItreeLeanFailureKind::RssWatchdogExceeded
-                        | ItreeLeanFailureKind::LeanMemoryExhausted
-                );
-                if slice.len() <= 1 || !is_memory_limit {
-                    return Err(err);
-                }
-                let mid = lo + (hi - lo) / 2;
-                let next_depth = depth + 1;
-                *splits += 1;
-                *max_depth = (*max_depth).max(next_depth);
-                let summary = err.lines().next().unwrap_or("");
-                eprintln!(
-                    "itree-difftest: adaptive Stage 2 confirm split \
-                     label={label} depth={next_depth} cases={} -> left={} right={} \
-                     kind={kind:?} reason={summary}",
-                    hi - lo,
-                    mid - lo,
-                    hi - mid
-                );
-                let mut merged = split_rec(
-                    base_label, cases, lo, mid, next_depth, splits, max_depth, case_key, run_slice,
-                )?;
-                let right = split_rec(
-                    base_label, cases, mid, hi, next_depth, splits, max_depth, case_key, run_slice,
-                )?;
-                merged.extend(right);
-                Ok(merged)
-            }
-        }
-    }
-
-    let mut splits = 0usize;
-    let mut max_depth = 0usize;
-    let res = split_rec(
-        base_label,
-        cases,
-        0,
-        cases.len(),
-        0,
-        &mut splits,
-        &mut max_depth,
-        case_key,
-        run_slice,
-    );
-    if splits > 0 {
-        match &res {
-            Ok(_) => eprintln!(
-                "itree-difftest: adaptive Stage 2 confirm recovered \
-                 label={base_label} cases={} splits={splits} max_depth={max_depth}",
-                cases.len()
-            ),
-            // The first sub-slice that could not be halved further (a `k == 1`
-            // singleton or a non-memory failure) fails the whole chunk closed:
-            // no partial result is reported, so `run_isolated_lean_stage`
-            // re-isolates every case of the chunk per candidate.
-            Err(err) => eprintln!(
-                "itree-difftest: adaptive Stage 2 confirm unrecovered \
-                 label={base_label} cases={} splits={splits} max_depth={max_depth} \
-                 kind={:?} reason={}",
-                cases.len(),
-                classify_itree_lean_failure(err),
-                err.lines().next().unwrap_or("")
-            ),
-        }
-    }
-    res
 }
 
 /// Candidates of `stage.failed_fns` that stay comparable on their completed
@@ -5223,7 +5201,7 @@ fn evaluate_itree_entries(
             lean_jobs,
             batch_case_ident,
             &case_to_fn,
-            &run_confirm_slice,
+            run_confirm_slice,
         );
         // When `batch_cases.len() > ITREE_FULL_CONFIRM_MAX_TRACES`, each agreeing
         // candidate had only its first `ok` trace selected into `confirm_cases`.
@@ -5260,7 +5238,7 @@ fn evaluate_itree_entries(
                 lean_jobs,
                 batch_case_ident,
                 &case_to_fn,
-                &run_confirm_slice,
+                run_confirm_slice,
             );
             confirm_cases.extend(replacement_cases);
             confirm_stage.results.extend(rep_stage.results);
@@ -9033,39 +9011,52 @@ mod tests {
             "expected 1 + 2 + 4 split runs, got {labels:?}"
         );
 
-        // 2. Singleton (`k == 1`) RSS failure must fail closed and surface `Err`.
+        // 2. Singleton (`k == 1`) RSS failure must fail closed: no result, and the
+        //    failed single-case module is reported as such.
         let single = vec!["case_poison_t0".to_string()];
-        let single_err = run_adaptive_confirm_chunk(
-            "ItreeDiffBatchConfirmChunk0",
-            &single,
-            &ident,
-            &|_label, _slice| {
-                Err::<BTreeMap<String, ()>, String>(
-                    "[WATCHDOG:RSS_EXCEEDED] singleton exceeded RSS limit".to_string(),
-                )
-            },
-        )
-        .expect_err("k=1 singleton RSS failure must fail closed");
+        let single_outcome = collect_confirm_chunk(&single, |_label: &str, _slice: &[String]| {
+            Err("[WATCHDOG:RSS_EXCEEDED] singleton exceeded RSS limit".to_string())
+        });
+        assert!(single_outcome.confirmed.is_empty());
+        assert!(single_outcome.unresolved.is_empty() && single_outcome.skipped_by_abort.is_empty());
+        assert_eq!(single_outcome.irreducible_singletons.len(), 1);
+        let (single_label, single_case, single_err) = &single_outcome.irreducible_singletons[0];
+        assert_eq!(
+            (single_label.as_str(), single_case.as_str()),
+            ("Base", "case_poison_t0")
+        );
         assert!(single_err.contains("[WATCHDOG:RSS_EXCEEDED]"));
 
         // 3. Non-memory failure (e.g. `rfl` kernel rejection) must NOT be swallowed or split
-        //    silently; it returns `Err` on the very first attempt so `run_isolated_lean_stage`
-        //    isolates/rejects it properly.
+        //    silently; the module is reported unresolved after the very first attempt so the
+        //    stage isolates/rejects it properly.
         let rej_calls = AtomicUsize::new(0);
-        let rej_err = run_adaptive_confirm_chunk(
-            "ItreeDiffBatchConfirmChunk0",
-            &cases[..4],
-            &ident,
-            &|_label, _slice| {
-                rej_calls.fetch_add(1, Ordering::SeqCst);
-                Err::<BTreeMap<String, ()>, String>(
-                    "error: Tactic `rfl` failed: type mismatch".to_string(),
-                )
-            },
-        )
-        .expect_err("non-memory kernel rejection must fail closed immediately");
-        assert!(rej_err.contains("rfl"));
+        let rej_outcome = collect_confirm_chunk(&cases[..4], |_label: &str, _slice: &[String]| {
+            rej_calls.fetch_add(1, Ordering::SeqCst);
+            Err("error: Tactic `rfl` failed: type mismatch".to_string())
+        });
+        assert!(rej_outcome.confirmed.is_empty());
+        assert!(rej_outcome.irreducible_singletons.is_empty());
+        assert_eq!(rej_outcome.unresolved.len(), 1);
+        assert_eq!(rej_outcome.unresolved[0].1, cases[..4]);
+        assert!(rej_outcome.unresolved[0].2.contains("rfl"));
         assert_eq!(rej_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Runs the production Stage 2 splitter on one chunk labelled `Base` in
+    /// which every case is its own candidate and no earlier chunk has failed.
+    fn collect_confirm_chunk(
+        cases: &[String],
+        run_slice: impl Fn(&str, &[String]) -> Result<BTreeMap<String, usize>, String>,
+    ) -> AdaptiveConfirmChunkOutcome<String, usize> {
+        run_adaptive_confirm_chunk_collecting(
+            "Base",
+            cases,
+            &ident,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &run_slice,
+        )
     }
 
     /// One recorded `(label, cases)` Lean run of a mock Stage 2 slice runner.
@@ -9831,36 +9822,44 @@ mod tests {
     }
 
     /// For every chunk size up to [`ITREE_MAX_CONFIRM_CHUNK_SIZE`] and every
-    /// module size that fits in memory, the successful sub-slices partition the
-    /// chunk in order: no case is skipped, repeated, or reordered, whichever of
-    /// the two memory failure kinds (RSS watchdog, Lean `-M`) triggers a split.
+    /// module size that fits in memory, the successful sub-slices of the
+    /// production splitter partition the chunk in order: no case is skipped,
+    /// repeated, or reordered, whichever of the two memory failure kinds (RSS
+    /// watchdog, Lean `-M`) triggers a split, and nothing is reported failed.
     #[test]
     fn adaptive_stage2_split_partitions_every_chunk_size_in_order_without_gaps_or_repeats() {
         for k in 1..=ITREE_MAX_CONFIRM_CHUNK_SIZE {
             let cases: Vec<String> = (0..k).map(|i| format!("case_f_t{i}")).collect();
             for max_ok in [1usize, 2, 3, 5, 8, ITREE_MAX_CONFIRM_CHUNK_SIZE] {
                 let runs = MockLeanRuns::default();
-                let res = run_adaptive_confirm_chunk(
-                    "Base",
-                    &cases,
-                    &ident,
-                    &|label: &str, slice: &[String]| {
-                        let mut runs = runs.lock().unwrap();
-                        let attempt = runs.len();
-                        runs.push((label.to_string(), slice.to_vec()));
-                        if slice.len() <= max_ok {
-                            ok_all(slice)
-                        } else if attempt % 2 == 0 {
-                            Err(mock_rss_exceeded(label))
-                        } else {
-                            Err(mock_lean_memory_exhausted(label))
-                        }
-                    },
-                )
-                .unwrap_or_else(|e| panic!("k={k} max_ok={max_ok} must recover: {e}"));
+                let outcome = collect_confirm_chunk(&cases, |label: &str, slice: &[String]| {
+                    let mut runs = runs.lock().unwrap();
+                    let attempt = runs.len();
+                    runs.push((label.to_string(), slice.to_vec()));
+                    if slice.len() <= max_ok {
+                        ok_all(slice)
+                    } else if attempt % 2 == 0 {
+                        Err(mock_rss_exceeded(label))
+                    } else {
+                        Err(mock_lean_memory_exhausted(label))
+                    }
+                });
                 let runs = runs.into_inner().unwrap();
+                assert!(
+                    outcome.irreducible_singletons.is_empty()
+                        && outcome.unresolved.is_empty()
+                        && outcome.skipped_by_abort.is_empty()
+                        && outcome.suspended_probe_failure.is_none()
+                        && outcome.missing_toolchain_err.is_none()
+                        && outcome.memory_failed_leaf_fns.is_empty(),
+                    "k={k} max_ok={max_ok} must recover completely"
+                );
                 assert_eq!(
-                    res.keys().cloned().collect::<BTreeSet<String>>(),
+                    outcome
+                        .confirmed
+                        .keys()
+                        .cloned()
+                        .collect::<BTreeSet<String>>(),
                     cases.iter().cloned().collect::<BTreeSet<String>>(),
                     "k={k} max_ok={max_ok}"
                 );
@@ -9888,11 +9887,11 @@ mod tests {
         }
     }
 
-    /// Only memory failures split: a timeout, a missing toolchain, and a kernel
-    /// or elaboration rejection are returned verbatim after exactly one run,
-    /// while a signal-terminated root (e.g. the cgroup OOM killer) splits. A
-    /// sub-slice that reports success without a result for each of its cases
-    /// fails the chunk closed.
+    /// Only memory failures split: a multi-case module that times out, finds
+    /// the toolchain missing, or is rejected is reported unresolved, verbatim,
+    /// after exactly one run, while a signal-terminated root (e.g. the cgroup
+    /// OOM killer) splits. A module that reports success without a result for
+    /// each of its cases confirms none of them.
     #[test]
     fn adaptive_stage2_split_only_splits_memory_failures_and_rejects_incomplete_subchunks() {
         let cases: Vec<String> = (0..4).map(|i| format!("case_f_t{i}")).collect();
@@ -9916,84 +9915,106 @@ mod tests {
         ] {
             assert_eq!(classify_itree_lean_failure(err), kind);
             let calls = AtomicUsize::new(0);
-            let got = run_adaptive_confirm_chunk(
-                "Base",
-                &cases,
-                &ident,
-                &|_label: &str, _slice: &[String]| {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    Err::<BTreeMap<String, usize>, String>(err.to_string())
-                },
-            )
-            .expect_err("a non-memory failure must fail closed");
-            assert_eq!(got, err, "{kind:?} must be returned verbatim");
+            let outcome = collect_confirm_chunk(&cases, |_label: &str, _slice: &[String]| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(err.to_string())
+            });
             assert_eq!(calls.load(Ordering::SeqCst), 1, "{kind:?} must not split");
+            assert!(
+                outcome.confirmed.is_empty()
+                    && outcome.irreducible_singletons.is_empty()
+                    && outcome.skipped_by_abort.is_empty(),
+                "{kind:?}"
+            );
+            assert_eq!(outcome.unresolved.len(), 1, "{kind:?}");
+            let (label, slice, got) = &outcome.unresolved[0];
+            assert_eq!((label.as_str(), slice), ("Base", &cases), "{kind:?}");
+            assert_eq!(got, err, "{kind:?} must be reported verbatim");
+            assert_eq!(
+                outcome.missing_toolchain_err.is_some(),
+                kind == ItreeLeanFailureKind::MissingToolchain
+            );
         }
 
         // A root killed by a signal is a memory-kind failure: halves are retried.
         let signal_runs = MockLeanRuns::default();
-        let recovered =
-            run_adaptive_confirm_chunk("Base", &cases, &ident, &|label: &str, slice: &[String]| {
-                signal_runs
-                    .lock()
-                    .unwrap()
-                    .push((label.to_string(), slice.to_vec()));
-                if slice.len() > 2 {
-                    Err(format!(
-                        "[LEAN:RESOURCE_EXHAUSTED] terminated by a signal (e.g. the cgroup OOM \
-                         killer) `/tmp/verify/{label}.lean` failed (peak RSS 5900000 KiB / \
-                         8388608 KiB, -M 7168 MiB, LEAN_NUM_THREADS=2):\nstdout:\n\nstderr:\n"
-                    ))
-                } else {
-                    ok_all(slice)
-                }
-            })
-            .expect("halves of a signal-killed module must be retried");
-        assert_eq!(recovered.len(), 4);
+        let recovered = collect_confirm_chunk(&cases, |label: &str, slice: &[String]| {
+            signal_runs
+                .lock()
+                .unwrap()
+                .push((label.to_string(), slice.to_vec()));
+            if slice.len() > 2 {
+                Err(format!(
+                    "[LEAN:RESOURCE_EXHAUSTED] terminated by a signal (e.g. the cgroup OOM \
+                     killer) `/tmp/verify/{label}.lean` failed (peak RSS 5900000 KiB / \
+                     8388608 KiB, -M 7168 MiB, LEAN_NUM_THREADS=2):\nstdout:\n\nstderr:\n"
+                ))
+            } else {
+                ok_all(slice)
+            }
+        });
+        assert_eq!(recovered.confirmed.len(), 4);
+        assert!(recovered.irreducible_singletons.is_empty() && recovered.unresolved.is_empty());
         assert_eq!(signal_runs.into_inner().unwrap().len(), 3);
 
-        // A sub-slice "succeeding" without `case_f_t3` must not complete the chunk.
-        let incomplete =
-            run_adaptive_confirm_chunk("Base", &cases, &ident, &|label: &str, slice: &[String]| {
-                if slice.len() > 2 {
-                    return Err(mock_rss_exceeded(label));
-                }
-                let mut map = ok_all(slice)?;
-                map.remove("case_f_t3");
-                Ok(map)
-            })
-            .expect_err("an incomplete sub-slice must fail the chunk closed");
-        assert!(
-            incomplete.contains("Base_split_d1_2_4")
-                && incomplete.contains("produced no result for `case_f_t3`"),
-            "{incomplete}"
+        // A sub-slice "succeeding" without `case_f_t3` confirms neither of its
+        // cases; the complete half keeps its results.
+        let incomplete = collect_confirm_chunk(&cases, |label: &str, slice: &[String]| {
+            if slice.len() > 2 {
+                return Err(mock_rss_exceeded(label));
+            }
+            let mut map = ok_all(slice)?;
+            map.remove("case_f_t3");
+            Ok(map)
+        });
+        assert_eq!(
+            incomplete.confirmed.keys().collect::<Vec<_>>(),
+            ["case_f_t0", "case_f_t1"]
         );
-        // ... and neither may the unsplit chunk itself, or an empty result.
-        let unsplit = run_adaptive_confirm_chunk(
-            "Base",
-            &cases,
-            &ident,
-            &|_label: &str, _slice: &[String]| Ok(BTreeMap::<String, usize>::new()),
-        )
-        .expect_err("an empty result must fail closed");
-        assert!(
-            unsplit.contains("produced no result for `case_f_t0`"),
-            "{unsplit}"
+        assert_eq!(incomplete.unresolved.len(), 1);
+        let (label, slice, err) = &incomplete.unresolved[0];
+        assert_eq!(
+            (label.as_str(), slice.as_slice()),
+            ("Base_split_d1_2_4", &cases[2..])
         );
+        assert!(err.contains("produced no result for `case_f_t3`"), "{err}");
+        // ... and neither does the unsplit chunk itself with an empty result ...
+        let unsplit =
+            collect_confirm_chunk(
+                &cases,
+                |_label: &str, _slice: &[String]| Ok(BTreeMap::new()),
+            );
+        assert!(unsplit.confirmed.is_empty());
+        assert_eq!(unsplit.unresolved.len(), 1);
+        assert_eq!(unsplit.unresolved[0].1, cases);
+        assert!(
+            unsplit.unresolved[0]
+                .2
+                .contains("produced no result for `case_f_t0`"),
+            "{}",
+            unsplit.unresolved[0].2
+        );
+        // ... while a single-case module without its result is a failed leaf
+        // (though not one that says anything about memory).
+        let single = collect_confirm_chunk(&cases[..1], |_label: &str, _slice: &[String]| {
+            Ok(BTreeMap::new())
+        });
+        assert!(single.confirmed.is_empty() && single.unresolved.is_empty());
+        assert_eq!(single.irreducible_singletons.len(), 1);
+        assert!(single.memory_failed_leaf_fns.is_empty());
 
         // No cases, no Lean run.
         let calls = AtomicUsize::new(0);
-        let empty = run_adaptive_confirm_chunk(
-            "Base",
-            &[] as &[String],
-            &ident,
-            &|_label: &str, slice: &[String]| {
-                calls.fetch_add(1, Ordering::SeqCst);
-                ok_all(slice)
-            },
-        )
-        .expect("an empty chunk is trivially confirmed");
-        assert!(empty.is_empty());
+        let empty = collect_confirm_chunk(&[], |_label: &str, slice: &[String]| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            ok_all(slice)
+        });
+        assert!(
+            empty.confirmed.is_empty()
+                && empty.irreducible_singletons.is_empty()
+                && empty.unresolved.is_empty()
+                && empty.skipped_by_abort.is_empty()
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -10092,8 +10113,10 @@ mod tests {
     /// missing toolchain aborts immediately without Fallback retries.
     #[test]
     fn adaptive_stage2_circuit_breaker_and_missing_toolchain_behave_precisely() {
-        // A. Single-candidate 16-case all-poison chunk stops after 4 leaves
-        //    (9 runs instead of 31); skipped cases stay non-inconclusive.
+        // A. Single-candidate 16-case all-poison chunk stops halving after 4
+        //    leaves: 9 runs to isolate them (16, 8, 4, 2, 1, 1, 2, 1, 1), then one
+        //    unhalved run for each slice still pending ([4, 8) and [8, 16)),
+        //    instead of 31; the cases those two give up stay non-inconclusive.
         let (c0_cases, c0_map) = stage_fixture(&[("c0", 16)]);
         let runs_a = MockLeanRuns::default();
         let stage_a = run_isolated_adaptive_confirm_stage(
@@ -10113,11 +10136,22 @@ mod tests {
         );
         assert!(stage_a.results.is_empty());
         assert_eq!(stage_a.failed_fns, BTreeSet::from(["c0".to_string()]));
-        assert_eq!(runs_a.into_inner().unwrap().len(), 9);
+        let runs_a = runs_a.into_inner().unwrap();
+        assert_eq!(runs_a.len(), 11, "{runs_a:?}");
+        assert_eq!(
+            runs_a[9..]
+                .iter()
+                .map(|(l, s)| (l.as_str(), s.len()))
+                .collect::<Vec<_>>(),
+            [
+                ("ItreeDiffBatchConfirmChunk0_split_d2_4_8", 4),
+                ("ItreeDiffBatchConfirmChunk0_split_d1_8_16", 8)
+            ]
+        );
         assert_eq!(
             stage_a.inconclusive_cases.len(),
             ITREE_FALLBACK_CIRCUIT_BREAKER,
-            "only the 4 leaves actually killed by RSS are inconclusive; skipped cases are not"
+            "only the 4 leaves actually killed by RSS are inconclusive; given-up cases are not"
         );
 
         // B. One bad candidate (`c0`, 4 failing leaves) in a multi-candidate
@@ -10142,8 +10176,9 @@ mod tests {
         assert_eq!(stage_b.results.len(), 12);
         assert_eq!(stage_b.failed_fns, BTreeSet::from(["c0".to_string()]));
 
-        // C. 16 distinct candidates all failing systematically trip the
-        //    whole-chunk breaker after 4 distinct failing candidates (9 runs).
+        // C. 16 distinct candidates all failing systematically stop halving
+        //    after 4 distinct failing candidates (9 runs), then run the two
+        //    pending slices once each (11 runs).
         let spec_c: Vec<(&str, usize)> = vec![
             ("c0", 1),
             ("c1", 1),
@@ -10181,7 +10216,11 @@ mod tests {
         );
         assert!(stage_c.results.is_empty());
         assert_eq!(stage_c.failed_fns.len(), 16);
-        assert_eq!(runs_c.into_inner().unwrap().len(), 9);
+        assert_eq!(runs_c.into_inner().unwrap().len(), 11);
+        assert_eq!(
+            stage_c.inconclusive_cases.len(),
+            ITREE_FALLBACK_CIRCUIT_BREAKER
+        );
 
         // D. Missing toolchain stops after 1 run, skips Fallback, and marks
         //    every case inconclusive.
@@ -10256,7 +10295,10 @@ mod tests {
         assert_eq!(idx.footprint.shared_bytes, 100 * 1024);
         assert_eq!(idx.footprint.staged_bytes, (50 + 30 + 10 + 4000) * 1024);
         assert_eq!(idx.staged_module_bytes.get("Mir"), Some(&(50 * 1024)));
-        assert_eq!(idx.staged_module_bytes.get("Mir.Common"), Some(&(30 * 1024)));
+        assert_eq!(
+            idx.staged_module_bytes.get("Mir.Common"),
+            Some(&(30 * 1024))
+        );
         assert_eq!(
             idx.staged_module_bytes.get("Mir.ItreeDiffStaged.small"),
             Some(&(10 * 1024))
@@ -10296,5 +10338,351 @@ mod tests {
         let unindexed = idx.worker_kib_for_modules(["Mir.ItreeDiffStaged.missing"], 2, 1);
         assert_eq!(unindexed, idx.footprint.worker_kib(2, 1));
         assert!(unindexed > 140);
+    }
+
+    /// `(cases, case_to_fn)` of `n` single-case candidates `f00`, `f01`, ...
+    fn single_case_candidates(n: usize) -> (Vec<String>, BTreeMap<String, String>) {
+        let names: Vec<String> = (0..n).map(|i| format!("f{i:02}")).collect();
+        let spec: Vec<(&str, usize)> = names.iter().map(|name| (name.as_str(), 1)).collect();
+        stage_fixture(&spec)
+    }
+
+    /// A campaign in which every module exceeds memory must establish that once
+    /// per stage, not once per chunk: the first chunk isolates
+    /// [`ITREE_FALLBACK_CIRCUIT_BREAKER`] failing candidates (9 runs) and runs
+    /// its two pending slices once each, and every later chunk then costs one
+    /// run instead of the 9 a per-chunk breaker spent (36 runs for these 4
+    /// chunks, 450 for the 50 chunks of an 800-candidate campaign; the stage
+    /// without adaptive halving spends 8). The first confirmation anywhere in
+    /// the stage re-arms halving for the chunks after it.
+    #[test]
+    fn adaptive_stage2_systematic_memory_failure_costs_one_run_per_later_chunk() {
+        let (cases, case_to_fn) = single_case_candidates(64);
+        let run_stage = |jobs: usize, healthy: std::ops::Range<usize>| {
+            let runs = MockLeanRuns::default();
+            let stage = run_isolated_adaptive_confirm_stage(
+                "S",
+                &cases,
+                16,
+                jobs,
+                ident,
+                &case_to_fn,
+                |label: &str, slice: &[String]| {
+                    runs.lock()
+                        .unwrap()
+                        .push((label.to_string(), slice.to_vec()));
+                    let is_healthy = |c: &String| {
+                        healthy.contains(&cases.iter().position(|x| x == c).expect("known case"))
+                    };
+                    if slice.iter().all(is_healthy) {
+                        ok_all(slice)
+                    } else {
+                        Err(mock_rss_exceeded(label))
+                    }
+                },
+            );
+            (stage, runs.into_inner().unwrap())
+        };
+        let stopped_halving = |errors: &[String]| {
+            errors
+                .iter()
+                .filter(|e| e.contains("stopped halving"))
+                .count()
+        };
+
+        // 1. Nothing fits: 11 runs in the first chunk, then one per chunk.
+        let (stage, runs) = run_stage(1, 0..0);
+        assert!(stage.results.is_empty());
+        assert_eq!(stage.failed_fns.len(), 64);
+        assert_eq!(runs.len(), 11 + 3, "{runs:?}");
+        assert_eq!(
+            runs[11..]
+                .iter()
+                .map(|(l, s)| (l.as_str(), s.len()))
+                .collect::<Vec<_>>(),
+            [("SChunk1", 16), ("SChunk2", 16), ("SChunk3", 16)],
+            "later chunks must be run once, unhalved"
+        );
+        // Only the four isolated single-case modules were killed on their own;
+        // every given-up case stays a plain (non-inconclusive) failure.
+        assert_eq!(
+            stage.inconclusive_cases,
+            cases[..4].iter().cloned().collect::<BTreeSet<String>>()
+        );
+        assert_eq!(stopped_halving(&stage.errors), 4, "{:?}", stage.errors);
+        let labels: Vec<String> = runs.into_iter().map(|(l, _)| l).collect();
+        assert_labels_unique_file_stems(&labels);
+
+        // 2. The third chunk fits: its single run confirms all 16 cases, which
+        //    re-arms halving for the fourth chunk (11 runs of its own).
+        let (stage, runs) = run_stage(1, 32..48);
+        assert_eq!(
+            stage.results.keys().cloned().collect::<BTreeSet<String>>(),
+            cases[32..48].iter().cloned().collect::<BTreeSet<String>>()
+        );
+        assert_eq!(runs.len(), 11 + 1 + 1 + 11, "{runs:?}");
+        assert_eq!(
+            (runs[11].0.as_str(), runs[12].0.as_str()),
+            ("SChunk1", "SChunk2")
+        );
+        assert!(runs.iter().any(|(l, _)| l == "SChunk3_split_d1_0_8"));
+        // The first, second, and fourth chunk each gave cases up.
+        assert_eq!(stopped_halving(&stage.errors), 3, "{:?}", stage.errors);
+
+        // 3. Two concurrent chunks cannot learn from each other (11 runs each),
+        //    and the cases they give up get the sequential full-memory fallback,
+        //    whose own breaker stops after 4 candidates.
+        let (cases32, case_to_fn32) = single_case_candidates(32);
+        let runs = MockLeanRuns::default();
+        let stage = run_isolated_adaptive_confirm_stage(
+            "S",
+            &cases32,
+            16,
+            2,
+            ident,
+            &case_to_fn32,
+            |label: &str, slice: &[String]| {
+                runs.lock()
+                    .unwrap()
+                    .push((label.to_string(), slice.to_vec()));
+                Err::<BTreeMap<String, usize>, String>(mock_rss_exceeded(label))
+            },
+        );
+        let runs = runs.into_inner().unwrap();
+        assert!(stage.results.is_empty());
+        assert_eq!(stage.failed_fns.len(), 32);
+        assert_eq!(
+            runs.len(),
+            11 + 11 + ITREE_FALLBACK_CIRCUIT_BREAKER,
+            "{runs:?}"
+        );
+        assert_eq!(
+            runs.iter()
+                .filter(|(l, _)| l.starts_with("SFallback_"))
+                .count(),
+            ITREE_FALLBACK_CIRCUIT_BREAKER
+        );
+        assert_eq!(
+            stage.inconclusive_cases,
+            cases32[..4].iter().cloned().collect::<BTreeSet<String>>()
+        );
+    }
+
+    /// Four irreducibly heavy candidates at the head of a chunk suspend halving
+    /// before any other candidate was tried. The slices still pending must be
+    /// run once before their cases are given up: a slice that fits one module
+    /// confirms its candidates and re-arms halving for the rest of the chunk.
+    /// Skipping them unrun dropped all 12 healthy candidates.
+    #[test]
+    fn adaptive_stage2_breaker_runs_pending_slices_once_before_giving_healthy_cases_up() {
+        let (cases, case_to_fn) = single_case_candidates(16);
+        let heavy: BTreeSet<String> = cases[..4].iter().cloned().collect();
+        let run_stage = |max_ok: usize| {
+            let runs = MockLeanRuns::default();
+            let stage = run_isolated_adaptive_confirm_stage(
+                "S",
+                &cases,
+                16,
+                1,
+                ident,
+                &case_to_fn,
+                |label: &str, slice: &[String]| {
+                    runs.lock()
+                        .unwrap()
+                        .push((label.to_string(), slice.to_vec()));
+                    if slice.len() > max_ok || slice.iter().any(|c| heavy.contains(c)) {
+                        Err(mock_rss_exceeded(label))
+                    } else {
+                        ok_all(slice)
+                    }
+                },
+            );
+            (stage, runs.into_inner().unwrap())
+        };
+        // 9 runs isolate the four heavy candidates (16, 8, 4, 2, 1, 1, 2, 1, 1).
+        // Then [4, 8) is run once and fits; with 16-case modules [8, 16) fits
+        // too (11 runs), with 4-case modules it is halved again (13 runs).
+        for (max_ok, expected_runs) in [(16usize, 11usize), (4, 13)] {
+            let (stage, runs) = run_stage(max_ok);
+            assert_eq!(runs.len(), expected_runs, "max_ok={max_ok}: {runs:?}");
+            assert_eq!(
+                stage.results.keys().cloned().collect::<BTreeSet<String>>(),
+                cases[4..].iter().cloned().collect::<BTreeSet<String>>(),
+                "max_ok={max_ok}: every healthy candidate must be confirmed"
+            );
+            assert_eq!(stage.inconclusive_cases, heavy, "max_ok={max_ok}");
+            assert_eq!(stage.errors.len(), 4, "max_ok={max_ok}: {:?}", stage.errors);
+            assert!(
+                stage
+                    .errors
+                    .iter()
+                    .all(|e| e.contains("irreducible single case")),
+                "max_ok={max_ok}: {:?}",
+                stage.errors
+            );
+            let labels: Vec<String> = runs.into_iter().map(|(l, _)| l).collect();
+            assert_labels_unique_file_stems(&labels);
+        }
+        // The single run is all a suspended slice gets: when [4, 8) itself does
+        // not fit one module (2-case modules), its cases and those of [8, 16)
+        // are given up as plain failures rather than halved.
+        let (stage, runs) = run_stage(2);
+        assert_eq!(runs.len(), 11, "{runs:?}");
+        assert!(stage.results.is_empty());
+        assert_eq!(stage.failed_fns.len(), 16);
+        assert_eq!(stage.inconclusive_cases, heavy);
+        assert!(
+            stage.errors.iter().any(|e| {
+                e.contains("stopped halving")
+                    && e.contains("12 case(s) left unconfirmed")
+                    && e.contains("`SChunk0_split_d2_4_8`")
+            }),
+            "{:?}",
+            stage.errors
+        );
+    }
+
+    /// The same holds within one candidate: four leading traces that are heavy
+    /// on their own exhaust the candidate, but its pending slices are still run
+    /// once, so the 12 traces that fit stay confirmed and the candidate stays
+    /// comparable on them instead of being dropped whole.
+    #[test]
+    fn adaptive_stage2_exhausted_candidate_keeps_its_traces_that_fit_one_module() {
+        let (cases, case_to_fn) = stage_fixture(&[("c0", 16)]);
+        let heavy: BTreeSet<String> = cases[..4].iter().cloned().collect();
+        let runs = MockLeanRuns::default();
+        let stage = run_isolated_adaptive_confirm_stage(
+            "S",
+            &cases,
+            16,
+            1,
+            ident,
+            &case_to_fn,
+            |label: &str, slice: &[String]| {
+                runs.lock()
+                    .unwrap()
+                    .push((label.to_string(), slice.to_vec()));
+                if slice.len() > 4 || slice.iter().any(|c| heavy.contains(c)) {
+                    Err(mock_rss_exceeded(label))
+                } else {
+                    ok_all(slice)
+                }
+            },
+        );
+        let runs = runs.into_inner().unwrap();
+        // 9 runs isolate t0..t3, [4, 8) fits (10), [8, 16) is halved (13).
+        assert_eq!(runs.len(), 13, "{runs:?}");
+        assert_eq!(
+            stage.results.keys().cloned().collect::<BTreeSet<String>>(),
+            cases[4..].iter().cloned().collect::<BTreeSet<String>>()
+        );
+        assert_eq!(stage.failed_fns, BTreeSet::from(["c0".to_string()]));
+        assert_eq!(stage.inconclusive_cases, heavy);
+        assert_eq!(
+            itree_partially_comparable_fns(&stage, &cases, ident, &case_to_fn, |_| true),
+            BTreeMap::from([("c0".to_string(), 4)])
+        );
+    }
+
+    /// Only a single-case module that exceeds memory on its own is evidence that
+    /// halving is futile. Four leading candidates that the kernel *rejects*
+    /// leave the chunk without a confirmation just the same, but halving the
+    /// memory-limited modules behind them must go on: every healthy candidate
+    /// is confirmed, and the rejections stay conclusive.
+    #[test]
+    fn adaptive_stage2_rejected_single_cases_never_suspend_halving() {
+        let (cases, case_to_fn) = single_case_candidates(16);
+        let rejected: BTreeSet<String> = cases[..4].iter().cloned().collect();
+        let runs = MockLeanRuns::default();
+        let stage = run_isolated_adaptive_confirm_stage(
+            "S",
+            &cases,
+            16,
+            1,
+            ident,
+            &case_to_fn,
+            |label: &str, slice: &[String]| {
+                runs.lock()
+                    .unwrap()
+                    .push((label.to_string(), slice.to_vec()));
+                if slice.len() > 1 {
+                    Err(mock_lean_memory_exhausted(label))
+                } else if rejected.contains(&slice[0]) {
+                    Err(mock_rfl_rejection(label, &slice[0]))
+                } else {
+                    ok_all(slice)
+                }
+            },
+        );
+        let runs = runs.into_inner().unwrap();
+        // Every module of the halving tree ran once: 15 inner ones and 16 leaves.
+        assert_eq!(runs.len(), 31, "{runs:?}");
+        assert_eq!(
+            stage.results.keys().cloned().collect::<BTreeSet<String>>(),
+            cases[4..].iter().cloned().collect::<BTreeSet<String>>()
+        );
+        assert_eq!(stage.failed_fns.len(), 4);
+        assert!(
+            stage.inconclusive_cases.is_empty(),
+            "a kernel rejection is never inconclusive: {:?}",
+            stage.inconclusive_cases
+        );
+        assert_eq!(stage.errors.len(), 4, "{:?}", stage.errors);
+        assert!(
+            stage
+                .errors
+                .iter()
+                .all(|e| e.contains("irreducible single case") && e.contains("Tactic `rfl` failed"))
+        );
+    }
+
+    /// A module that was too large for a `1 / jobs` memory share is no evidence
+    /// against halving in a narrower final wave that has the whole budget: the
+    /// last chunk of a 3-chunk, 2-job stage must still be halved after both
+    /// chunks of the first wave failed systematically on half the memory (whose
+    /// cases then recover in the sequential full-memory fallback).
+    #[test]
+    fn adaptive_stage2_narrower_final_wave_does_not_inherit_failures_of_wider_waves() {
+        let (cases, case_to_fn) = single_case_candidates(48);
+        let runs = MockLeanRuns::default();
+        let stage = run_isolated_adaptive_confirm_stage(
+            "S",
+            &cases,
+            16,
+            2,
+            ident,
+            &case_to_fn,
+            |label: &str, slice: &[String]| {
+                let concurrency = itree_lean_stage_concurrency(2);
+                runs.lock()
+                    .unwrap()
+                    .push((format!("{label}@c{concurrency}"), slice.to_vec()));
+                // Nothing fits half the memory; 4-case modules fit all of it.
+                if concurrency > 1 || slice.len() > 4 {
+                    Err(mock_rss_exceeded(label))
+                } else {
+                    ok_all(slice)
+                }
+            },
+        );
+        let runs = runs.into_inner().unwrap();
+        assert_eq!(stage.results.len(), 48, "{:?}", stage.failed_fns);
+        assert!(stage.failed_fns.is_empty() && stage.inconclusive_cases.is_empty());
+        // Wave 1 (two workers): 11 runs per chunk. Wave 2 (one worker, the whole
+        // budget): 16, 8 -> 4 + 4, 8 -> 4 + 4. Fallback: 32 single cases.
+        let count = |pred: &dyn Fn(&str) -> bool| runs.iter().filter(|(l, _)| pred(l)).count();
+        assert_eq!(count(&|l| l.ends_with("@c2")), 22, "{runs:?}");
+        assert_eq!(
+            count(&|l| l.starts_with("SChunk2") && l.ends_with("@c1")),
+            7,
+            "the single-worker wave must be halved normally: {runs:?}"
+        );
+        assert_eq!(count(&|l| l.starts_with("SFallback_")), 32, "{runs:?}");
+        assert_eq!(runs.len(), 22 + 7 + 32);
+        let labels: Vec<String> = runs
+            .into_iter()
+            .map(|(l, _)| l.split('@').next().unwrap().to_string())
+            .collect();
+        assert_labels_unique_file_stems(&labels);
     }
 }

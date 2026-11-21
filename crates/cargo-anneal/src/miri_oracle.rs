@@ -2151,20 +2151,14 @@ fn miri_oracle_lean_max_mb_for_avail_kib(stage_cap_mb: u64, avail_kib: Option<u6
     heap_mb.clamp(MIN_HEAP_MB_TINY, cap)
 }
 
+/// Resolves the `lean -M` limit for a stage from the effective memory headroom:
+/// host `MemAvailable` intersected with the enclosing cgroup v2 / v1 limits
+/// ([`crate::probe_effective_memory_kib`], the same probe `miri-difftest` and
+/// `itree-difftest` size their Lean workers with). A host without a cgroup
+/// limit but with little free memory needs the headroom just as a capped
+/// capsule does.
 fn resolve_miri_oracle_lean_max_mb(stage_cap_mb: u64) -> u64 {
-    let cg_headroom = fs::read_to_string("/proc/self/cgroup")
-        .ok()
-        .and_then(|cg| crate::cgroup_memory_limits_kib(Path::new("/sys/fs/cgroup"), &cg).1);
-    let cg_v1_headroom = fs::read_to_string("/proc/self/cgroup")
-        .ok()
-        .and_then(|cg| {
-            crate::cgroup_v1_memory_limits_kib(Path::new("/sys/fs/cgroup/memory"), &cg).1
-        });
-    let avail_kib = match (cg_headroom, cg_v1_headroom) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) | (None, Some(a)) => Some(a),
-        (None, None) => None,
-    };
+    let (_total_kib, avail_kib) = crate::probe_effective_memory_kib();
     miri_oracle_lean_max_mb_for_avail_kib(stage_cap_mb, avail_kib)
 }
 
