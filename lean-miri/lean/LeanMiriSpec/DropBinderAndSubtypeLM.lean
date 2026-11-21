@@ -399,10 +399,12 @@ def ep2FieldByteRange? (decls : List LocalDecl) (layouts : LayoutTable) (localId
       match offs[idx]? with
       | some off =>
         let layoutSz? : Option Nat :=
-          match layouts.lookup decl.ty.layoutIdx with
+          match resolvedTyLayout? decls layouts decl.ty with
           | some tl =>
             match get? tl.fieldLayouts idx with
-            | some flIdx => (layouts.lookup flIdx).map (·.size.bytes)
+            | some flIdx =>
+              if isUnresolvedLayoutIdx layouts flIdx then none
+              else (layouts.lookup flIdx).map (·.size.bytes)
             | none => none
           | none => none
         let sz? : Option Nat :=
@@ -419,6 +421,42 @@ def ep2FieldByteRange? (decls : List LocalDecl) (layouts : LayoutTable) (localId
       | none => none
     | _ => none
   | _, _ => none
+
+/-- **Field-range layout resolution regression (B2)**: the local's recorded
+layout is resolved through Trusted `resolvedTyLayout?` / `isUnresolvedLayoutIdx`
+(index `0` is the reserved unresolved slot), so a `(u32, u32)` local with
+`layoutIdx := 0` in a table whose dummy entry `0` carries `fieldLayouts := [1, 1]`
+(pointing at an 8-byte layout) still drops exactly 4 bytes per field (A1 read the
+dummy entry and would have deinitialized the sibling too); while a resolved closure
+local (`v8ClosureCapMirTy`, `layoutIdx := 1`) takes its field sizes (`u32` = 4,
+`*const u32` = 8) from the recorded `fieldLayouts` at the vendored offsets. -/
+theorem ep2FieldByteRange?_layout_resolution :
+    let pairLay : Miri.Interpreter.LocalLayout :=
+      { ty := encodeTyIdOverlay pairU32MirTy,
+        layout := {
+          fields := .Arbitrary #[Miri.ABI.Size.ZERO, Miri.ABI.Size.ofBytes 4] #[0, 1],
+          variants := .Single 0,
+          backendRepr := .Memory (sized := true),
+          largestNiche := none, uninhabited := false,
+          align := ⟨⟨2⟩⟩, size := Miri.ABI.Size.ofBytes 8,
+          maxReprAlign := none, unadjustedAbiAlign := ⟨2⟩,
+          reprC := false, randomizationSeed := 0 } }
+    let dummy0 : TypeLayout :=
+      { size := ⟨8⟩, align := ⟨4⟩, backendRepr := .memory,
+        fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1], fieldLayouts := [1, 1],
+        variants := .single 0, isUninhabited := false }
+    let big1 : TypeLayout :=
+      { size := ⟨8⟩, align := ⟨8⟩, backendRepr := .memory,
+        fields := .primitive, variants := .single 0, isUninhabited := false }
+    let lays : LayoutTable := { pointerBits := 64, isLittleEndian := true, entries := [dummy0, big1] }
+    let decls := [mkDecl u32MirTy, mkDecl pairU32MirTy]
+    ep2FieldByteRange? decls lays 1 (some pairLay) 0 = some (0, 4) ∧
+    ep2FieldByteRange? decls lays 1 (some pairLay) 1 = some (4, 4) ∧
+    ep2FieldByteRange? v8ClosureCapMir.localDecls ep2ClosureCapLayouts 0
+      (some (translateTyOverlay v8ClosureCapMirTy ep2ClosureCapLayouts)) 0 = some (0, 4) ∧
+    ep2FieldByteRange? v8ClosureCapMir.localDecls ep2ClosureCapLayouts 0
+      (some (translateTyOverlay v8ClosureCapMirTy ep2ClosureCapLayouts)) 1 = some (8, 8) := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel⟩
 
 /-- Walk parent pointers in vendored `BorrowTree.nodes` (bounded by `fuel`) to test
 whether `anc` is an ancestor of (or equal to) `cur` in the borrow tree. -/
@@ -445,22 +483,25 @@ respecting:
 * exact byte-range overlap (`seg.range` vs. `[start, start + size)`),
 * per-location `accessed` bit and permission (`.Cell`, `.Disabled`, `.Frozen`,
   `.Unique`, `.ReservedFrz`, `.ReservedIM`), and
-* the global vendored `ProtectedTags` table (`.StrongProtector`). -/
+* the global vendored `ProtectedTags` table (`.StrongProtector`).
+
+An accessing tag that is not registered in `tree` is a conflict (fail closed),
+matching vendored `performBorrowAccessRange`'s `.MissingTag` (non-`Completed`)
+status; A1 instead treated every node as foreign and could let the drop succeed. -/
 def ep2ProtectorConflict (protectedTags : Miri.TreeBorrows.ProtectedTags)
     (tree : Miri.TreeBorrows.BorrowTree) (tag : Miri.Memory.BorTag)
     (start size : Miri.ABI.Size) : Bool :=
   let startNat := start.bytes.toNat
   let endNat := startNat + size.bytes.toNat
-  let srcIdx? := tree.tagMapping.get tag
   let fuel := tree.nodes.data.size + 1
+  match tree.tagMapping.get tag with
+  | none => true
+  | some srcIdx =>
   tree.locations.entries.any fun seg =>
     seg.range.start.toNat < endNat && startNat < seg.range.stop.toNat &&
     tree.tagMapping.mapping.any fun (otherTag, otherIdx) =>
       let relPos : Miri.TreeBorrows.AccessRelatedness :=
-        match srcIdx? with
-        | some srcIdx =>
-          if ep2IsAncestor tree otherIdx srcIdx fuel then .LocalAccess else .ForeignAccess
-        | none => .ForeignAccess
+        if ep2IsAncestor tree otherIdx srcIdx fuel then .LocalAccess else .ForeignAccess
       let isProt : Bool := protectedTags.get otherTag == some .StrongProtector
       let locSt? : Option Miri.TreeBorrows.Tree.LocationState :=
         match seg.data.perms.get otherIdx with
@@ -492,7 +533,9 @@ private def lmU32ChildTree : Miri.TreeBorrows.BorrowTree :=
 4. Disjoint byte range `[4, 8)` on `lmU32ChildTree` does NOT conflict (`false`);
 5. Interior-mutable protected child (`hooksTwoNodeTree .cell`) does NOT conflict
    on a foreign write (`ep2ProtectorConflict = false` AND `performBorrowAccessRange`
-   `.Completed`)! -/
+   `.Completed`)!
+6. A write through a tag absent from the tree (`BorTag 3`) conflicts (fail closed,
+   as vendored `.MissingTag`), even with no protectors at all. -/
 theorem ep2ProtectorConflict_agrees_with_vendored_tree_borrows (isProtected : Bool) :
     let parentProt : Miri.TreeBorrows.ProtectedTags :=
       ({} : Miri.TreeBorrows.ProtectedTags).insert retagParentTag .StrongProtector
@@ -509,10 +552,11 @@ theorem ep2ProtectorConflict_agrees_with_vendored_tree_borrows (isProtected : Bo
     ep2ProtectorConflict (hooksForChildProtected true).protectedTags
         lmU32ChildTree retagParentTag (Miri.ABI.Size.ofBytes 4) (Miri.ABI.Size.ofBytes 4) = false ∧
     ep2ProtectorConflict (hooksForChildProtected true).protectedTags
-        (hooksTwoNodeTree .cell) retagParentTag Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8) = false := by
+        (hooksTwoNodeTree .cell) retagParentTag Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8) = false ∧
+    ep2ProtectorConflict {} lmU32ChildTree ⟨3, by decide⟩ Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4) = true := by
   refine ⟨by cases isProtected <;> decide +kernel, ?_,
           by cases isProtected <;> decide +kernel,
-          by decide +kernel, by decide +kernel, by decide +kernel⟩
+          by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel⟩
   have h := (borrowTree_performBorrowAccessRange_simulation .write .foreignAccess .unique isProtected).1
   refine h.trans ?_
   cases isProtected <;> decide +kernel

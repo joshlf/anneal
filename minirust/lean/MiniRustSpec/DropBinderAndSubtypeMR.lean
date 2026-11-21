@@ -2031,9 +2031,19 @@ inductive Ep2ValRel {M : Type} [Gen.Memory M]
       (hProv : prov.map provAllocId = some p.allocId) :
       Ep2ValRel allocBase provAllocId (.aggregate 0 [.ptr p 8, .scalar ⟨metaVal, 8⟩])
         (mrWidePtrValM (M := M) { addr := addr, provenance := prov } (Int.ofNat metaVal))
-  | aggregate (variant : Nat) (vs : List MirSemantics.Value) (mvs : List (Gen.Value M))
+  /-- Struct/tuple/closure/binder-struct aggregates (Trusted variant index `0`) are
+  MiniRust tuples. (A0/A1 accepted ANY variant index here, relating Trusted enum
+  variants `.aggregate v _` with `v ≠ 0` to MiniRust `.Tuple`; MiniRust represents
+  those as `.Variant`, see `enumVariant`.) -/
+  | aggregate (vs : List MirSemantics.Value) (mvs : List (Gen.Value M))
       (hFields : Ep2ValListRel allocBase provAllocId vs mvs) :
-      Ep2ValRel allocBase provAllocId (.aggregate variant vs) (.Tuple mvs)
+      Ep2ValRel allocBase provAllocId (.aggregate 0 vs) (.Tuple mvs)
+  /-- Single-payload enum variants (e.g. `NonZero<u8>`, whose MiniRust image is
+  `.Variant 0 payload`): Trusted `.aggregate variant [v]` is MiniRust
+  `.Variant variant mv`. -/
+  | enumVariant (variant : Nat) (v : MirSemantics.Value) (mv : Gen.Value M)
+      (hPayload : Ep2ValRel allocBase provAllocId v mv) :
+      Ep2ValRel allocBase provAllocId (.aggregate variant [v]) (.Variant (Int.ofNat variant) mv)
 
 inductive Ep2ValListRel {M : Type} [Gen.Memory M]
     (allocBase : Nat → Nat) (provAllocId : Gen.Memory.Provenance M → Nat) :
@@ -2144,6 +2154,71 @@ theorem v5_v6_binder_and_subtype_coupled_valRel_sim {M : Type} [Gen.Memory M] [M
       transmuteM_int_sameSize (M := M) u32 u32 rfl (by decide) ⟨4⟩ rfl rfl bits hBits m
     exact ⟨.scalar ⟨bits, 4⟩, .Int (Int.ofNat bits), hWrap, hCast, hCast, hMr, .scalar bits 4⟩
 
+/-- **V5 Value-Coupled Universal Binder-Struct & `NonZero` Wrapping
+(`v5_wrapUnsafeBinder_struct_nonZero_coupled_valRel_sim`)**: for EVERY `M ∈ {BM, TBM}`
+and EVERY operand (beyond the transparent `u32 → u32` identity of
+`v5_v6_binder_and_subtype_coupled_valRel_sim`):
+1. single-field `BinderU32` wrapping of ANY `u32` related by `Ep2ValRel` yields a
+   Trusted aggregate related (`aggregate`) to MiniRust's `transmuteM` tuple image;
+2. `NonZeroU8` wrapping of ANY `1 ≤ b < 256` yields a Trusted aggregate related
+   (`enumVariant 0`) to MiniRust's `.Variant 0` image;
+3. `NonZeroU8` wrapping of `0` faults UB on Trusted AND MiniRust. -/
+theorem v5_wrapUnsafeBinder_struct_nonZero_coupled_valRel_sim {M : Type} [Gen.Memory M] [MemoryOps M]
+    (allocBase : Nat → Nat) (provAllocId : Gen.Memory.Provenance M → Nat)
+    (locals locals' : List LocalSlot) (op : MirAst.Operand) (mem mem' : MirSemantics.Memory)
+    (m : Option (Machine M)) :
+    (∀ (bits : Nat) (mv : Gen.Value M), bits < 2 ^ 32 →
+      evalUseRvalue locals op mem [mkDecl binderU32MirTy, mkDecl u32MirTy] ep2BinderLayouts =
+        .ok (.scalar ⟨bits, 4⟩) locals' mem' →
+      operandTy [mkDecl binderU32MirTy, mkDecl u32MirTy] ep2BinderLayouts op = some u32MirTy →
+      Ep2ValRel allocBase provAllocId (.scalar ⟨bits, 4⟩) mv →
+      ∃ tv mv',
+        evalRvalue locals (.wrapUnsafeBinder op binderU32MirTy) mem
+          [mkDecl binderU32MirTy, mkDecl u32MirTy] ep2BinderLayouts = .ok tv locals' mem' ∧
+        transmuteM (M := M) mv u32MrTy (mrBinderWrapperTy u32MrTy ⟨4⟩ ⟨4⟩) m = .ok mv' ∧
+        Ep2ValRel allocBase provAllocId tv mv') ∧
+    (∀ (b : Nat) (mv : Gen.Value M), 1 ≤ b → b < 256 →
+      evalUseRvalue locals op mem [mkDecl binderNzU8MirTy, mkDecl u8MirTy] ep2BinderLayouts =
+        .ok (.scalar ⟨b, 1⟩) locals' mem' →
+      operandTy [mkDecl binderNzU8MirTy, mkDecl u8MirTy] ep2BinderLayouts op = some u8MirTy →
+      Ep2ValRel allocBase provAllocId (.scalar ⟨b, 1⟩) mv →
+      ∃ tv mv',
+        evalRvalue locals (.wrapUnsafeBinder op binderNzU8MirTy) mem
+          [mkDecl binderNzU8MirTy, mkDecl u8MirTy] ep2BinderLayouts = .ok tv locals' mem' ∧
+        transmuteM (M := M) mv u8MrTy nonZeroU8MrTy m = .ok mv' ∧
+        Ep2ValRel allocBase provAllocId tv mv') ∧
+    (∀ (mv : Gen.Value M),
+      evalUseRvalue locals op mem [mkDecl binderNzU8MirTy, mkDecl u8MirTy] ep2BinderLayouts =
+        .ok (.scalar ⟨0, 1⟩) locals' mem' →
+      operandTy [mkDecl binderNzU8MirTy, mkDecl u8MirTy] ep2BinderLayouts op = some u8MirTy →
+      Ep2ValRel allocBase provAllocId (.scalar ⟨0, 1⟩) mv →
+      evalRvalue locals (.wrapUnsafeBinder op binderNzU8MirTy) mem
+          [mkDecl binderNzU8MirTy, mkDecl u8MirTy] ep2BinderLayouts = .ub ∧
+        ∃ msg, transmuteM (M := M) mv u8MrTy nonZeroU8MrTy m = .error (.ub msg)) := by
+  refine ⟨?_, ?_, ?_⟩
+  · intro bits mv hBits hUse hTy hRel
+    cases hRel with
+    | scalar _ _ =>
+      have hT := ((v5_wrapUnsafeBinder_universal_sim locals locals' op mem mem' bits 0 hBits (by decide)
+        none none).1 hUse hTy).1
+      have hM := (transmuteM_binderWrapper_u32_and_thinPtr (M := M) bits 0 hBits (by decide) none m).2.1
+      have hI : intFromBits bits u32 = Int.ofNat bits := rfl
+      rw [hI] at hM
+      exact ⟨_, _, hT, hM, .aggregate _ _ (.cons (.scalar bits 4) .nil)⟩
+  · intro b mv h1 hb hUse hTy hRel
+    cases hRel with
+    | scalar _ _ =>
+      have hT := ((v5_wrapUnsafeBinder_universal_sim locals locals' op mem mem' 0 b (by decide) hb
+        none none).2.2.2.2.2.1 h1 hUse hTy).1
+      have hM := (transmuteM_u8_to_nonZeroU8 (M := M) b hb m).2 h1
+      exact ⟨_, _, hT, hM, .enumVariant 0 _ _ (.scalar b 1)⟩
+  · intro mv hUse hTy hRel
+    cases hRel with
+    | scalar _ _ =>
+      have hT := ((v5_wrapUnsafeBinder_universal_sim locals locals' op mem mem' 0 0 (by decide) (by decide)
+        none none).2.2.2.2.1 hUse hTy).1
+      exact ⟨hT, _, (transmuteM_u8_to_nonZeroU8 (M := M) 0 (by decide) m).1 rfl⟩
+
 /-- **V7 Value-Coupled Universal Thin & Wide `AggregateKind.rawPtr` + Episode 1 `UnOp.GetMetadata`
 Simulation (`v7_rawPtr_coupled_valRel_sim`)**: for EVERY `M ∈ {BM, TBM}`, whenever
 Trusted data pointer `p` and metadata (`unit` for thin, `usize` `len` for wide)
@@ -2239,7 +2314,7 @@ theorem v8_closure_coupled_valRel_sim {M : Type} [Gen.Memory M] [MemoryOps M]
       Ep2ValRel allocBase provAllocId tv mv' :=
   have h := (closure_n_capture_lockstep_M (M := M) locals locals' dp ops vals mem decls layouts
     m m' es mvals mrClTy).1 hOps hEs
-  ⟨.aggregate 0 vals, .Tuple mvals, h.2.2.1, h.2.2.2, .aggregate 0 vals mvals hRel⟩
+  ⟨.aggregate 0 vals, .Tuple mvals, h.2.2.1, h.2.2.2, .aggregate vals mvals hRel⟩
 
 /-! ## §9. Canonical Executable MiniRust Corpus Observation Interface
 
