@@ -13062,7 +13062,8 @@ private theorem ep1_encodeUnionChunksM_total_and_disjoint {M : Type} [Gen.Memory
    `Type.encodeM ty v` **unconditionally succeeds** returning `bs` with `bs.length = sz.bytes`;
 2. whenever `chunks` are pairwise disjoint (`ep1ChunksDisjoint chunks`), re-decoding `bs` via
    `Type.decodeM ty bs` recovers **the exact same union value** `some v` (`Type.decodeM ty bs =
-   .ok (some v)`). -/
+   .ok (some v)`). (`ep1_evalValueM_union_decode_encode_roundtrip_any_chunks` proves the
+   roundtrip without the disjointness hypothesis.) -/
 theorem ep1_evalValueM_union_encode_total_and_disjoint_roundtrip
     {M : Type} [Gen.Memory M] [MemoryOps M]
     (m m1 : Gen.Machine M) (field : Int) (expr : Gen.ValueExpr)
@@ -13234,6 +13235,254 @@ theorem ep1_union_gapped_chunks_and_setDiscr_downcast_field_witness :
   have hwf4 : MachTB.wfLive t4 := evalValueM_tb_wfLive _ hwf3 ht4
   exact ⟨hu, m1, m2, m3, m4, hm1, hm2, hm3, hm4, t1, t2, t3, t4, ht1, ht2, ht3, ht4, ht3Eq, hwf4⟩
 
+/-! ### `[adv B3]` `Union` `decode ∘ encode` needs no chunk disjointness; overlapping-chunk witness -/
+
+/-- Whether byte position `p` lies in some chunk `[off, off + len)` of `chunks`. -/
+def ep1Covered (chunks : List (Gen.Offset × Size)) (p : Nat) : Bool :=
+  chunks.any (fun c => decide (c.1.bytes ≤ p ∧ p < c.1.bytes + c.2.bytes))
+
+private theorem ep1_writeSubsliceAtIndex_getElem? {T : Type} {xs src ys : List T} {off : Nat}
+    (hws : writeSubsliceAtIndex xs (off : Int) src = .ok ys) (p : Nat) :
+    ys.length = xs.length ∧
+    ys[p]? = if off ≤ p ∧ p < off + src.length then src[p - off]? else xs[p]? := by
+  unfold writeSubsliceAtIndex at hws
+  split at hws
+  · rename_i hc
+    obtain rfl := ep1_pure_ok hws
+    have hle : off + src.length ≤ xs.length := by omega
+    simp only [Int.toNat_natCast]
+    have hlt : (xs.take off).length = off := by simp; omega
+    refine ⟨by simp; omega, ?_⟩
+    by_cases h1 : p < off
+    · rw [List.append_assoc, List.getElem?_append_left (by omega)]
+      simp only [List.getElem?_take, h1, ↓reduceIte]
+      have : ¬(off ≤ p ∧ p < off + src.length) := by omega
+      simp [this]
+    · rw [List.append_assoc, List.getElem?_append_right (by omega), hlt]
+      by_cases h2 : p < off + src.length
+      · rw [List.getElem?_append_left (by omega)]
+        have : off ≤ p ∧ p < off + src.length := by omega
+        simp [this]
+      · rw [List.getElem?_append_right (by omega), List.getElem?_drop]
+        have : ¬(off ≤ p ∧ p < off + src.length) := by omega
+        simp only [this, ↓reduceIte]
+        congr 1
+        omega
+  · simp [specPanic] at hws
+
+/-- Writing the chunks of a *single* buffer `data` (in any order, overlapping or not) yields
+a buffer that holds `data` at every covered position and is unchanged elsewhere. -/
+private theorem ep1_encodeUnionChunksM_pointwise {M : Type} [Gen.Memory M]
+    (data : List (Gen.AbstractByte (Gen.Memory.Provenance M))) :
+    ∀ (chunks : List (Gen.Offset × Size)) (buf : List (Gen.AbstractByte (Gen.Memory.Provenance M))),
+      buf.length = data.length →
+      (∀ c ∈ chunks, c.1.bytes + c.2.bytes ≤ data.length) →
+      ∃ out, Type.encodeUnionChunksM (M := M) chunks
+          (chunks.map (fun c => (data.drop c.1.bytes).take c.2.bytes)) buf = .ok out ∧
+        out.length = data.length ∧
+        ∀ p, out[p]? = if ep1Covered chunks p then data[p]? else buf[p]?
+  | [], buf, hbuf, _ => by
+    refine ⟨buf, by unfold Type.encodeUnionChunksM; rfl, hbuf, fun p => ?_⟩
+    simp [ep1Covered]
+  | (off, csz) :: rest, buf, hbuf, hrange => by
+    have h0 : off.bytes + csz.bytes ≤ data.length := hrange (off, csz) (List.mem_cons_self ..)
+    let src := (data.drop off.bytes).take csz.bytes
+    have hsrcLen : src.length = csz.bytes := by simp [src]; omega
+    have hws : writeSubsliceAtIndex buf (off.bytes : Int) src =
+        .ok (buf.take off.bytes ++ src ++ buf.drop (off.bytes + src.length)) := by
+      unfold writeSubsliceAtIndex
+      have hc : (0 : Int) ≤ (off.bytes : Int) ∧ (off.bytes : Int) + (src.length : Int) ≤
+          (buf.length : Int) := by rw [hsrcLen, hbuf]; omega
+      simp only [hc, and_self, ↓reduceIte, Int.toNat_natCast, pure, Except.pure]
+    obtain ⟨out, hrec, houtLen, hout⟩ := ep1_encodeUnionChunksM_pointwise data rest
+      (buf.take off.bytes ++ src ++ buf.drop (off.bytes + src.length))
+      ((ep1_writeSubsliceAtIndex_getElem? hws 0).1.trans hbuf)
+      (fun c hc => hrange c (List.mem_cons_of_mem _ hc))
+    refine ⟨out, ?_, houtLen, fun p => ?_⟩
+    · rw [List.map_cons]
+      unfold Type.encodeUnionChunksM
+      have hsl : ((data.drop off.bytes).take csz.bytes).length = csz.bytes := hsrcLen
+      simp only [hsl, ne_eq, not_true_eq_false, ↓reduceIte]
+      simp only [bind, Except.bind]
+      rw [show writeSubsliceAtIndex buf (off.bytes : Int) ((data.drop off.bytes).take csz.bytes) =
+        _ from hws]
+      exact hrec
+    · rw [hout p, (ep1_writeSubsliceAtIndex_getElem? hws p).2, hsrcLen]
+      have hcov : ep1Covered ((off, csz) :: rest) p =
+          (decide (off.bytes ≤ p ∧ p < off.bytes + csz.bytes) || ep1Covered rest p) := by
+        simp [ep1Covered, List.any_cons]
+      rw [hcov]
+      by_cases hr : ep1Covered rest p = true
+      · simp [hr]
+      · have hr' : ep1Covered rest p = false := by simpa using hr
+        by_cases hc : off.bytes ≤ p ∧ p < off.bytes + csz.bytes
+        · have hlt : p - off.bytes < csz.bytes := by omega
+          have hgoal : ((data.drop off.bytes).take csz.bytes)[p - off.bytes]? = data[p]? := by
+            rw [List.getElem?_take, List.getElem?_drop]
+            simp only [hlt, ↓reduceIte]
+            congr 1
+            omega
+          have hdc : decide (off.bytes ≤ p ∧ p < off.bytes + csz.bytes) = true := decide_eq_true hc
+          rw [hr', hdc]
+          simp only [Bool.false_eq_true, Bool.true_or, hc, and_self, ↓reduceIte]
+          exact hgoal
+        · have hdc : decide (off.bytes ≤ p ∧ p < off.bytes + csz.bytes) = false := decide_eq_false hc
+          rw [hr', hdc]
+          simp [hc]
+
+private theorem ep1_mapM_subslice_eq {T : Type} (data : List T) :
+    ∀ (cs : List (Gen.Offset × Size)) (cd : List (List T)),
+      cs.mapM (fun (c : Gen.Offset × Size) =>
+        subsliceWithLength data (c.1.bytes : Int) (c.2.bytes : Int)) = .ok cd →
+      cd = cs.map (fun c => (data.drop c.1.bytes).take c.2.bytes) ∧
+        ∀ c ∈ cs, c.1.bytes + c.2.bytes ≤ data.length
+  | [], cd, h => by
+    obtain rfl := ep1_pure_ok h
+    exact ⟨rfl, by simp⟩
+  | c :: rest, cd, h => by
+    simp only [List.mapM_cons] at h
+    obtain ⟨bs, hsub, h⟩ := ep1_bind_ok h
+    obtain ⟨bsRest, hrest, h⟩ := ep1_bind_ok h
+    obtain rfl := ep1_pure_ok h
+    obtain ⟨ihEq, ihRange⟩ := ep1_mapM_subslice_eq data rest bsRest hrest
+    unfold subsliceWithLength at hsub
+    split at hsub
+    · rename_i hc
+      obtain rfl := ep1_pure_ok hsub
+      refine ⟨by simp [ihEq], ?_⟩
+      intro c' hc'
+      rcases List.mem_cons.mp hc' with rfl | hc'
+      · omega
+      · exact ihRange c' hc'
+    · simp [specPanic] at hsub
+
+/-- **`ValueExpr::Union` values survive `encode` then `decode` for every chunk layout** — the
+pairwise-disjointness hypothesis of A2's `ep1_evalValueM_union_encode_total_and_disjoint_roundtrip`
+is unnecessary. The chunks of a constructed union value are all subslices of one buffer, so
+writing them back (`Type::encode` at `Union`, in chunk order) agrees with that buffer at every
+covered byte even where chunks overlap, and `Type::decode` re-reads exactly those bytes. On
+every `Memory` `M` and for every (empty, gapped, overlapping, or out-of-order) chunk list: -/
+theorem ep1_evalValueM_union_decode_encode_roundtrip_any_chunks
+    {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m m1 : Gen.Machine M) (field : Int) (expr : Gen.ValueExpr)
+    (fields : List (Gen.Offset × Gen.Type)) (chunks : List (Gen.Offset × Size))
+    (sz : Size) (al : Align) (v : Gen.Value M) (ty : Gen.Type)
+    (h : evalValueM m (.Union field expr (.Union fields chunks sz al)) = .ok ((v, ty), m1)) :
+    ty = .Union fields chunks sz al ∧
+    ∃ bs, Type.encodeM ty v = .ok bs ∧ bs.length = sz.bytes ∧
+      Type.decodeM (M := M) ty bs = .ok (some v) := by
+  rw [ep1_evalValueM_union_complete_spec] at h
+  obtain ⟨⟨off, exprTy⟩, _, h⟩ := ep1_bind_ok h
+  obtain ⟨⟨⟨val, _⟩, _⟩, _, h⟩ := ep1_bind_ok h
+  obtain ⟨encoded, _, h⟩ := ep1_bind_ok h
+  obtain ⟨data, hws, h⟩ := ep1_bind_ok h
+  obtain ⟨chunkData, hmap, hp⟩ := ep1_bind_ok h
+  obtain ⟨hvt, _⟩ := Prod.mk.inj (ep1_pure_ok hp)
+  obtain ⟨rfl, rfl⟩ := Prod.mk.inj hvt
+  have hdataLen : data.length = sz.bytes := by
+    rw [writeSubsliceAtIndex_length hws, List.length_replicate]
+  obtain ⟨rfl, hrange⟩ := ep1_mapM_subslice_eq data chunks chunkData hmap
+  obtain ⟨out, henc, houtLen, hout⟩ := ep1_encodeUnionChunksM_pointwise data chunks
+    (List.replicate sz.bytes .Uninit) (by simp [hdataLen]) hrange
+  refine ⟨rfl, out, ?_, houtLen.trans hdataLen, ?_⟩
+  · unfold Type.encodeM
+    simp only [List.length_map, ne_eq, not_true_eq_false, ↓reduceIte]
+    exact henc
+  · unfold Type.decodeM
+    simp only [houtLen, hdataLen, ne_eq, not_true_eq_false, ↓reduceIte]
+    have hsame : ∀ c ∈ chunks, (out.drop c.1.bytes).take c.2.bytes =
+        (data.drop c.1.bytes).take c.2.bytes := by
+      intro c hc
+      apply List.ext_getElem?
+      intro i
+      simp only [List.getElem?_take, List.getElem?_drop]
+      by_cases hi : i < c.2.bytes
+      · simp only [hi, ↓reduceIte]
+        rw [hout]
+        have hcov : ep1Covered chunks (c.1.bytes + i) = true := by
+          simp only [ep1Covered, List.any_eq_true, decide_eq_true_eq]
+          exact ⟨c, hc, by omega, by omega⟩
+        simp [hcov]
+      · simp [hi]
+    have hmapOut : chunks.mapM (fun (x : Gen.Offset × Size) =>
+        subsliceWithLength out (x.1.bytes : Int) (x.2.bytes : Int)) =
+        .ok (chunks.map (fun c => (data.drop c.1.bytes).take c.2.bytes)) := by
+      have key : ∀ cs : List (Gen.Offset × Size), (∀ c ∈ cs, c ∈ chunks) →
+          cs.mapM (fun (x : Gen.Offset × Size) =>
+            subsliceWithLength out (x.1.bytes : Int) (x.2.bytes : Int)) =
+          .ok (cs.map (fun c => (data.drop c.1.bytes).take c.2.bytes)) := by
+        intro cs
+        induction cs with
+        | nil => intro _; rfl
+        | cons c rest ih =>
+          intro hsub
+          have hc := hsub c (List.mem_cons_self ..)
+          have hr := hrange c hc
+          have hsl : subsliceWithLength out (c.1.bytes : Int) (c.2.bytes : Int) =
+              .ok ((data.drop c.1.bytes).take c.2.bytes) := by
+            unfold subsliceWithLength
+            have hcond : (0 : Int) ≤ (c.1.bytes : Int) ∧ (0 : Int) ≤ (c.2.bytes : Int) ∧
+                (c.1.bytes : Int) + (c.2.bytes : Int) ≤ (out.length : Int) := by
+              rw [houtLen]; omega
+            simp only [hcond, and_self, ↓reduceIte, Int.toNat_natCast, pure, Except.pure,
+              hsame c hc]
+          simp only [List.mapM_cons, hsl, ih (fun c' hc' => hsub c' (List.mem_cons_of_mem _ hc')),
+            List.map_cons, bind, Except.bind, pure, Except.pure]
+      exact key chunks (fun _ h => h)
+    simp only [hmapOut, bind, Except.bind, pure, Except.pure]
+
+/-- **Overlapping-chunk union witness** (outside A2's disjointness hypothesis): a 4-byte union
+with *overlapping* chunks `[(0, 3), (1, 3)]` and a `u32` field. Constructing it with
+`0x04030201`, encoding the value, and decoding again returns the very same value, on both
+`Mach` and `MachTB`; and an `Assign` + `Load` of the union through a local round-trips it. -/
+theorem ep1_union_overlapping_chunks_roundtrip_witness :
+    let overlapUnionTy : Gen.Type :=
+      .Union [(⟨0⟩, .Int ep1U32)] [(⟨0⟩, ⟨3⟩), (⟨1⟩, ⟨3⟩)] ⟨4⟩ ⟨4⟩
+    let uexpr : Gen.ValueExpr := .Union 0 (.Constant (.Int 0x04030201) (.Int ep1U32)) overlapUnionTy
+    let uval : Val := .Union [[.Init 1 none, .Init 2 none, .Init 3 none],
+                              [.Init 2 none, .Init 3 none, .Init 4 none]]
+    let uvalTB : Gen.Value TBM := .Union [[.Init 1 none, .Init 2 none, .Init 3 none],
+                                          [.Init 2 none, .Init 3 none, .Init 4 none]]
+    let mBM := ep1MachBM
+      [{ data := List.replicate 4 .Uninit, addr := 0x100, align := ⟨4⟩, kind := .Stack,
+         live := true, extra := () }]
+      [(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩)]
+      [(⟨⟨0⟩⟩, overlapUnionTy)]
+    let mTB := liftMachToTB mBM
+    ¬ ep1ChunksDisjoint [((⟨0⟩ : Gen.Offset), (⟨3⟩ : Size)), (⟨1⟩, ⟨3⟩)] ∧
+    evalValue mBM uexpr = .ok ((uval, overlapUnionTy), mBM) ∧
+    evalValueM mTB uexpr = .ok ((uvalTB, overlapUnionTy), mTB) ∧
+    (Type.encode overlapUnionTy uval >>= Type.decode overlapUnionTy) = .ok (some uval) ∧
+    (Type.encodeM overlapUnionTy uvalTB >>= Type.decodeM (M := TBM) overlapUnionTy) =
+      .ok (some uvalTB) ∧
+    (∃ m1 m2, evalStatement mBM (.Assign (.Local ⟨⟨0⟩⟩) uexpr) = .ok m1 ∧
+      evalValue m1 (.Load (.Local ⟨⟨0⟩⟩)) = .ok ((uval, overlapUnionTy), m2)) ∧
+    (∃ m1 m2, evalStatementM mTB (.Assign (.Local ⟨⟨0⟩⟩) uexpr) = .ok m1 ∧
+      evalValueM m1 (.Load (.Local ⟨⟨0⟩⟩)) = .ok ((uvalTB, overlapUnionTy), m2)) := by
+  intro overlapUnionTy uexpr uval uvalTB mBM mTB
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · simp [ep1ChunksDisjoint]
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · have hseq : (do
+        let m1 ← evalStatement mBM (.Assign (.Local ⟨⟨0⟩⟩) uexpr)
+        let (r, _) ← evalValue m1 (.Load (.Local ⟨⟨0⟩⟩))
+        pure r) = .ok (uval, overlapUnionTy) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨⟨r, m2⟩, hm2, hret⟩ := ep1_bind_ok hseq
+    obtain rfl := ep1_pure_ok hret
+    exact ⟨m1, m2, hm1, hm2⟩
+  · have hseq : (do
+        let m1 ← evalStatementM mTB (.Assign (.Local ⟨⟨0⟩⟩) uexpr)
+        let (r, _) ← evalValueM m1 (.Load (.Local ⟨⟨0⟩⟩))
+        pure r) = .ok (uvalTB, overlapUnionTy) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨⟨r, m2⟩, hm2, hret⟩ := ep1_bind_ok hseq
+    obtain rfl := ep1_pure_ok hret
+    exact ⟨m1, m2, hm1, hm2⟩
+
 #check_theorem_deps "[EP1-EXPR-AUDIT]"
   ep1_type_meta_kind_eq_layout_meta_kind
   ep1_evalUnOpM_computeSize_computeAlign_mach_indep
@@ -13282,6 +13531,8 @@ theorem ep1_union_gapped_chunks_and_setDiscr_downcast_field_witness :
   ep1_evalPlaceM_downcast_field_tb_to_bm
   ep1_evalValueM_union_encode_total_and_disjoint_roundtrip
   ep1_union_gapped_chunks_and_setDiscr_downcast_field_witness
+  ep1_evalValueM_union_decode_encode_roundtrip_any_chunks
+  ep1_union_overlapping_chunks_roundtrip_witness
 
 /-- Verify that every newly added or modified executable `Interp` definition in
 Episode 1 is strictly computable (`Classical.choice`-free, `sorryAx`-free, and
