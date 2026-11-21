@@ -118,11 +118,13 @@ def faultKindOf {V : Type} : Option (Verdict V) → CorrFaultKind
   | _ => .undefined
 
 /--
-A reference authority presented through its own observations: `runs` lists
-the authority-typed observation of the authority's interpreter on every
-corpus key, and `denote` lists the authority-typed observation denoted by
-each verdict. Observations are compared with the authority's own decidable
-equality, so no conversion out of the authority's types is trusted.
+A reference authority presented through its own observations: `observe`
+is the authority-typed observation of the authority's interpreter on each
+corpus key (`none` outside the corpus), and `denote` lists the
+authority-typed observation denoted by each verdict. Observations are
+compared with the authority's own decidable equality, so no conversion out
+of the authority's types is trusted, and the verdict of a key depends on
+the key only through its observation.
 -/
 structure ObsAuthority (Key V : Type) : Type 1 where
   /-- Authority-typed observations. -/
@@ -130,7 +132,7 @@ structure ObsAuthority (Key V : Type) : Type 1 where
   /-- Decidable equality of observations. -/
   decEq : DecidableEq Obs
   /-- Observation of the authority's run on each corpus key. -/
-  runs : List (Key × Obs)
+  observe : Key → Option Obs
   /-- Observation denoted by each verdict. -/
   denote : List (Verdict V × Obs)
 
@@ -138,28 +140,29 @@ namespace ObsAuthority
 
 variable {Key V : Type}
 
-/-- Observation of the authority's run on `k`, if `k` is in the corpus. -/
-def observe [DecidableEq Key] (A : ObsAuthority Key V) (k : Key) :
-    Option A.Obs :=
-  (A.runs.find? (fun r => decide (r.1 = k))).map (fun r => r.2)
-
 /-- First verdict whose denotation is the observation `o`. -/
 def decode (A : ObsAuthority Key V) (o : A.Obs) : Option (Verdict V) :=
   (A.denote.find? (fun d => @decide (d.2 = o) (A.decEq d.2 o))).map
     (fun d => d.1)
 
 /-- Verdict of the authority's run on `k`. -/
-def verdict [DecidableEq Key] (A : ObsAuthority Key V) (k : Key) :
-    Option (Verdict V) :=
+def verdict (A : ObsAuthority Key V) (k : Key) : Option (Verdict V) :=
   (A.observe k).bind A.decode
 
+/-- Two keys with the same observation have the same verdict: the
+verdict is a function of the authority's own observation. -/
+theorem verdict_eq_of_observe_eq (A : ObsAuthority Key V) {k k' : Key}
+    (h : A.observe k = A.observe k') : A.verdict k = A.verdict k' := by
+  unfold verdict
+  rw [h]
+
 /-- Boolean agreement of an authority with a verdict table on `keys`. -/
-def matchesOn [DecidableEq Key] [DecidableEq V] (A : ObsAuthority Key V)
+def matchesOn [DecidableEq V] (A : ObsAuthority Key V)
     (f : Key → Option (Verdict V)) (keys : List Key) : Bool :=
   keys.all (fun k => decide (A.verdict k = f k))
 
 /-- `matchesOn` certifies pointwise equality with the table. -/
-theorem matchesOn_sound [DecidableEq Key] [DecidableEq V]
+theorem matchesOn_sound [DecidableEq V]
     (A : ObsAuthority Key V) (f : Key → Option (Verdict V))
     (keys : List Key) (h : A.matchesOn f keys = true) :
     ∀ k, k ∈ keys → A.verdict k = f k := by
@@ -1508,6 +1511,30 @@ def lmUbMessages : List String :=
   ["place index 4 out of bounds for 3", "pointer dereference check failed",
     "InvalidMeta(SliceTooBig)"]
 
+/-- Representation class of a returned LeanMiri local. -/
+inductive RetClass : Type where
+  /-- A `usize` local. -/
+  | usize
+  /-- A `u32` local. -/
+  | u32
+  /-- A wide-pointer local. -/
+  | wide
+  deriving DecidableEq
+
+/-- Representation class of the result of a program. -/
+def retClassOf : Prog → RetClass
+  | .indexRead => .u32
+  | .reborrow => .wide
+  | _ => .usize
+
+/-- The distinct normal returns of `lmReference` on the LeanMiri keys, with
+their representation classes. -/
+def lmReturnDenotations : List (Nat × RetClass) :=
+  (lmKeys.filterMap fun k =>
+    match lmReferenceAt k with
+    | some (.returns n) => some (n, retClassOf k.2.1)
+    | _ => none).eraseDups
+
 /-- The LeanMiri authority assembled from interpreter-typed observation
 functions: `frameObs body retTy len idx` is one interpreter step of a frame
 program observing `_0`, `sizeObs body len` is one step of `size_of_val`,
@@ -1520,21 +1547,20 @@ def authorityOf (Obs : Type) (decEq : DecidableEq Obs)
     ObsAuthority (Regime × Prog × Query × Unit) Nat where
   Obs := Obs
   decEq := decEq
-  runs := lmKeys.map fun k =>
-    (k,
-      match k.2.1 with
-      | .sizeOfVal => sizeObs sizeOfValBody k.2.2.1.len
-      | p => frameObs (lmBody k.1 p) (lmRetTy k.1 p) k.2.2.1.len k.2.2.1.idx)
+  observe := fun k =>
+    match k.2.1 with
+    | .sizeOfVal => some (sizeObs sizeOfValBody k.2.2.1.len)
+    | .metadata | .placeLen | .indexRead | .reborrow =>
+      some (frameObs (lmBody k.1 k.2.1) (lmRetTy k.1 k.2.1) k.2.2.1.len
+        k.2.2.1.idx)
+    | _ => none
   denote :=
-    (lmKeys.filterMap fun k =>
-      match lmReferenceAt k with
-      | some (.returns n) =>
-        some (.returns n,
-          match k.2.1 with
-          | .indexRead => retU32 n
-          | .reborrow => retWide n
-          | _ => retUsize n)
-      | _ => none) ++
+    (lmReturnDenotations.map fun d =>
+      (.returns d.1,
+        match d.2 with
+        | .u32 => retU32 d.1
+        | .wide => retWide d.1
+        | .usize => retUsize d.1)) ++
     lmUbMessages.map fun s => (.undefinedBehavior, ubObs s)
 
 /-- Verdict function of an authority. -/
@@ -2999,6 +3025,19 @@ def lmReferenceAt (k : NanMode × Prog × Query × Pick) :
 /-- Diagnostic of the vendored interpreter on the uninitialized source. -/
 def lmUninitMessage : String := "read of uninitialized local"
 
+/-- Whether a program returns a 64-bit scalar. -/
+def returns64 : Prog → Bool
+  | .f32ToF64 | .bitsU64ToI64 => true
+  | _ => false
+
+/-- The distinct normal returns of `lmReference` on the LeanMiri keys, with
+their widths (`true`: 64-bit). -/
+def lmReturnDenotations : List (Nat × Bool) :=
+  (lmKeys.filterMap fun k =>
+    match lmReferenceAt k with
+    | some (.returns n) => some (n, returns64 k.2.1)
+    | _ => none).eraseDups
+
 /-- The LeanMiri authority assembled from `Cast.cast` and `Step.step`
 observation functions: `widenObs bits flag pick` / `narrowObs bits flag pick`
 run `FloatToFloat` under the `floatNondeterministic` flag and oracle pick;
@@ -3014,26 +3053,23 @@ def authorityOf (Obs : Type) (decEq : DecidableEq Obs)
     ObsAuthority (NanMode × Prog × Query × Pick) Nat where
   Obs := Obs
   decEq := decEq
-  runs := lmKeys.map fun k =>
-    (k,
-      match k.2.1 with
-      | .f32ToF64 => widenObs k.2.2.1.bits32 k.1.flag k.2.2.2.toNat
-      | .f64ToF32 => narrowObs k.2.2.1.bits64 k.1.flag k.2.2.2.toNat
-      | .f32ToI32 => toIntObs k.2.2.1.bits32
-      | .i32ToF32 => fromIntObs k.2.2.1.bits32
-      | .bitsU32ToI32 => carrier32Obs k.2.2.1.bits32
-      | .bitsU64ToI64 => carrier64Obs k.2.2.1.bits64
-      | _ => uninitObs uninitCastBody)
-  denote := lmKeys.filterMap fun k =>
-    match lmReferenceAt k with
-    | some (.returns n) =>
-      some (.returns n,
-        match k.2.1 with
-        | .f32ToF64 | .bitsU64ToI64 => ret64 n
-        | _ => ret32 n)
-    | some .undefinedBehavior =>
-      some (.undefinedBehavior, ubObs lmUninitMessage)
+  observe := fun k =>
+    match k.2.1 with
+    | .f32ToF64 => some (widenObs k.2.2.1.bits32 k.1.flag k.2.2.2.toNat)
+    | .f64ToF32 => some (narrowObs k.2.2.1.bits64 k.1.flag k.2.2.2.toNat)
+    | .f32ToI32 => some (toIntObs k.2.2.1.bits32)
+    | .i32ToF32 => some (fromIntObs k.2.2.1.bits32)
+    | .bitsU32ToI32 => some (carrier32Obs k.2.2.1.bits32)
+    | .bitsU64ToI64 => some (carrier64Obs k.2.2.1.bits64)
+    | .uninitCast =>
+      match k.2.2.1 with
+      | .onePointFive => some (uninitObs uninitCastBody)
+      | _ => none
     | _ => none
+  denote :=
+    (lmReturnDenotations.map fun d =>
+      (.returns d.1, if d.2 then ret64 d.1 else ret32 d.1)) ++
+    [(.undefinedBehavior, ubObs lmUninitMessage)]
 
 /-- Verdict function of an authority. -/
 def verdictOf (A : ObsAuthority (NanMode × Prog × Query × Pick) Nat) :
@@ -4164,6 +4200,172 @@ theorem empty_schedule_is_vacuous
       gatedRetRel (fun (_ : Unit) (_ : Unit) => True)
       (m := ()) (p := .uninitCast) (q := .onePointFive)
       ⟨.p2, rfl⟩).1.mp hwf) .undefined trusted_uninit_outcome⟩
+
+end FloatCast
+
+/-! ### C.10 Agreement of a float engine with the reference specification
+
+`Engine` abstracts the primitive operations of an IEEE-754 engine over its
+own format, bit-pattern, and error types. `Engine.agrees` compares an engine
+with `Ref` on every corpus input, in both directions and in both NaN
+modes; the cross-root kernel bridge instantiates it with the vendored
+`Miri.Interpreter.FloatBits` engine, so the reference specification used
+by the surface bundle is locked to the vendored engine primitive by
+primitive, not only through the authority's observations. -/
+
+namespace FloatCast
+
+/-- Primitive operations of an IEEE-754 engine. -/
+structure Engine : Type 1 where
+  /-- Formats. -/
+  F : Type
+  /-- Bit patterns tagged with their format. -/
+  B : Type
+  /-- Errors. -/
+  E : Type
+  /-- `binary32`. -/
+  f32 : F
+  /-- `binary64`. -/
+  f64 : F
+  /-- Bit pattern of a format. -/
+  ofBits : F → Nat → B
+  /-- Raw bits of a pattern. -/
+  bits : B → Nat
+  /-- Preferred NaN of a format. -/
+  preferredNaN : F → B
+  /-- Float-to-float conversion. -/
+  convert : B → F → Except E B
+  /-- NaN candidates for a result format, inputs, and NaN mode. -/
+  nanChoices : F → List B → Bool → Except E (List B)
+  /-- Saturating float-to-integer conversion. -/
+  toInteger : B → Nat → Bool → Except E Int
+  /-- Integer-to-float conversion. -/
+  fromInteger : F → Int → Except E B
+
+namespace Engine
+
+variable (G : Engine)
+
+/-- The engine's format for a reference format. -/
+def fmt : Ref.Fmt → G.F
+  | .binary32 => G.f32
+  | .binary64 => G.f64
+
+/-- Conversion on raw bits. -/
+def conv (src dst : Ref.Fmt) (b : Nat) : Option Nat :=
+  (G.convert (G.ofBits (G.fmt src) b) (G.fmt dst)).toOption.map G.bits
+
+/-- NaN candidates on raw bits, for one input. -/
+def choices (src dst : Ref.Fmt) (b : Nat) (flag : Bool) :
+    Option (List Nat) :=
+  (G.nanChoices (G.fmt dst) [G.ofBits (G.fmt src) b] flag).toOption.map
+    (List.map G.bits)
+
+/-- Saturating float-to-integer conversion on raw bits. -/
+def toInt (src : Ref.Fmt) (b w : Nat) (signed : Bool) : Option Int :=
+  (G.toInteger (G.ofBits (G.fmt src) b) w signed).toOption
+
+/-- Integer-to-float conversion to raw bits. -/
+def fromInt (dst : Ref.Fmt) (v : Int) : Option Nat :=
+  (G.fromInteger (G.fmt dst) v).toOption.map G.bits
+
+/-- Agreement with `Ref` on the corpus input `q`: conversions in both
+directions, NaN candidates in both directions and both modes, saturating
+conversions to `i32` and `u64`, and conversions from `i32`. -/
+def agreesAt (q : Query) : Bool :=
+  decide (G.conv .binary32 .binary64 q.bits32 =
+    Ref.convert .binary32 .binary64 q.bits32) &&
+  decide (G.conv .binary64 .binary32 q.bits64 =
+    Ref.convert .binary64 .binary32 q.bits64) &&
+  decide (G.choices .binary32 .binary64 q.bits32 true =
+    Ref.nanChoices .binary64 [(.binary32, q.bits32)] true) &&
+  decide (G.choices .binary32 .binary64 q.bits32 false =
+    Ref.nanChoices .binary64 [(.binary32, q.bits32)] false) &&
+  decide (G.choices .binary64 .binary32 q.bits64 true =
+    Ref.nanChoices .binary32 [(.binary64, q.bits64)] true) &&
+  decide (G.choices .binary64 .binary32 q.bits64 false =
+    Ref.nanChoices .binary32 [(.binary64, q.bits64)] false) &&
+  decide (G.toInt .binary32 q.bits32 32 true =
+    Ref.toInteger .binary32 q.bits32 32 true) &&
+  decide (G.toInt .binary64 q.bits64 64 false =
+    Ref.toInteger .binary64 q.bits64 64 false) &&
+  decide (G.fromInt .binary32 (signedOfBits 32 q.bits32) =
+    Ref.fromInteger .binary32 (signedOfBits 32 q.bits32)) &&
+  decide (G.fromInt .binary64 (signedOfBits 32 q.bits32) =
+    Ref.fromInteger .binary64 (signedOfBits 32 q.bits32))
+
+/-- Agreement with `Ref` on every corpus input, and on the preferred NaNs
+of both formats. -/
+def agrees : Bool :=
+  decide (G.bits (G.preferredNaN G.f32) = Ref.preferredNaN .binary32) &&
+  decide (G.bits (G.preferredNaN G.f64) = Ref.preferredNaN .binary64) &&
+  allQueries.all G.agreesAt
+
+/-- `agrees` certifies the preferred NaNs and the NaN candidates of every
+corpus input in both directions and both modes. -/
+theorem agrees_sound (h : G.agrees = true) :
+    G.bits (G.preferredNaN G.f32) = Ref.preferredNaN .binary32 ∧
+    G.bits (G.preferredNaN G.f64) = Ref.preferredNaN .binary64 ∧
+    ∀ (q : Query) (flag : Bool),
+      G.conv .binary32 .binary64 q.bits32 =
+        Ref.convert .binary32 .binary64 q.bits32 ∧
+      G.conv .binary64 .binary32 q.bits64 =
+        Ref.convert .binary64 .binary32 q.bits64 ∧
+      G.choices .binary32 .binary64 q.bits32 flag =
+        Ref.nanChoices .binary64 [(.binary32, q.bits32)] flag ∧
+      G.choices .binary64 .binary32 q.bits64 flag =
+        Ref.nanChoices .binary32 [(.binary64, q.bits64)] flag := by
+  simp only [agrees, Bool.and_eq_true, decide_eq_true_eq] at h
+  obtain ⟨⟨h32, h64⟩, hall⟩ := h
+  refine ⟨h32, h64, fun q flag => ?_⟩
+  have hq := List.all_eq_true.mp hall q (by cases q <;> decide)
+  simp only [agreesAt, Bool.and_eq_true, decide_eq_true_eq] at hq
+  obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨hc1, hc2⟩, ht1⟩, hf1⟩, ht2⟩, hf2⟩, _⟩, _⟩, _⟩, _⟩ := hq
+  cases flag
+  · exact ⟨hc1, hc2, hf1, hf2⟩
+  · exact ⟨hc1, hc2, ht1, ht2⟩
+
+end Engine
+
+/-- The reference specification is itself an engine, and agrees with
+itself (the agreement check is therefore satisfiable). -/
+def refEngine : Engine where
+  F := Ref.Fmt
+  B := Ref.Fmt × Nat
+  E := Unit
+  f32 := .binary32
+  f64 := .binary64
+  ofBits := fun f b => (f, b)
+  bits := fun p => p.2
+  preferredNaN := fun f => (f, Ref.preferredNaN f)
+  convert := fun p dst =>
+    match Ref.convert p.1 dst p.2 with
+    | some b => .ok (dst, b)
+    | none => .error ()
+  nanChoices := fun f inputs flag =>
+    match Ref.nanChoices f inputs flag with
+    | some l => .ok (l.map fun b => (f, b))
+    | none => .error ()
+  toInteger := fun p w signed =>
+    match Ref.toInteger p.1 p.2 w signed with
+    | some i => .ok i
+    | none => .error ()
+  fromInteger := fun f v =>
+    match Ref.fromInteger f v with
+    | some b => .ok (f, b)
+    | none => .error ()
+
+/-- The reference engine passes the agreement check. -/
+theorem refEngine_agrees : refEngine.agrees = true := by decide +kernel
+
+/-- An engine that answers the deterministic NaN mode with the
+nondeterministic candidates fails the agreement check, so the check
+separates the two NaN modes. -/
+theorem modeSwapped_engine_disagrees :
+    { refEngine with
+        nanChoices := fun f inputs _ => refEngine.nanChoices f inputs true
+      }.agrees = false := by
+  decide +kernel
 
 end FloatCast
 
@@ -10847,7 +11049,8 @@ run_cmd do
         ns ++ `WideSlice.frameInit, ns ++ `WideSlice.sizeOfValInit,
         ns ++ `FloatCast.authorityOf, ns ++ `FloatCast.checkOf,
         ns ++ `FloatCast.matchesReference_sound,
-        ns ++ `FloatCast.empty_schedule_is_vacuous]
+        ns ++ `FloatCast.empty_schedule_is_vacuous,
+        ns ++ `FloatCast.Engine.agrees_sound, ns ++ `FloatCast.castShape]
     for n in wsWith ++ wsDefs do roots := roots.push (ns ++ `WideSlice ++ n)
     for n in fcWith ++ fcDefs do roots := roots.push (ns ++ `FloatCast ++ n)
     let mut pending : Array Name := #[]
@@ -11401,6 +11604,105 @@ run_cmd do
     addThm (ns ++ `CrossRoot.FloatCast.f128_gateLM_tight) f128Ty f128Pf
     added := added ++ #[ns ++ `CrossRoot.FloatCast.f16_gateLM_tight,
       ns ++ `CrossRoot.FloatCast.f128_gateLM_tight]
+    -- 3b. The vendored float engine agrees with the reference specification
+    -- `FloatCast.Ref` primitive by primitive, and the type identifiers used
+    -- by `runCast` are LeanMiriSpec's encodings of the Anneal cast types.
+    let fbTy := mkConst (mi ++ `FloatBits)
+    let fmtTy := mkConst (mi ++ `FloatFormat)
+    let mkEngine (swapMode : Bool) : MetaM Expr := do
+      let mkB ← withLocalDeclD `f fmtTy fun f =>
+        withLocalDeclD `n natTy fun n => do
+          mkLambdaFVars #[f, n] (← mkAppM (mi ++ `FloatBits.mk)
+            #[f, ← mkAppM ``BitVec.ofNat #[mkNatLit 128, n]])
+      let bitsF ← withLocalDeclD `b fbTy fun b => do
+        mkLambdaFVars #[b] (← mkAppM ``BitVec.toNat
+          #[← mkAppM (mi ++ `FloatBits.bits) #[b]])
+      let listFb ← mkAppM ``List #[fbTy]
+      let nanCh ←
+        if swapMode then
+          withLocalDeclD `f fmtTy fun f =>
+          withLocalDeclD `l listFb fun l =>
+          withLocalDeclD `_b (mkConst ``Bool) fun b => do
+            mkLambdaFVars #[f, l, b] (← mkAppM (mi ++ `FloatBits.nanChoices)
+              #[f, l, mkConst ``Bool.true])
+        else pure (mkConst (mi ++ `FloatBits.nanChoices))
+      return mkAppN (mkConst (ns ++ `FloatCast.Engine.mk))
+        #[fmtTy, fbTy, mkConst (mi ++ `FloatError),
+          mkConst (mi ++ `FloatFormat.binary32),
+          mkConst (mi ++ `FloatFormat.binary64), mkB, bitsF,
+          mkConst (mi ++ `FloatBits.preferredNaN),
+          mkConst (mi ++ `FloatBits.convert), nanCh,
+          mkConst (mi ++ `FloatBits.toInteger),
+          mkConst (mi ++ `FloatBits.fromInteger)]
+    let engName := ns ++ `CrossRoot.FloatCast.engine
+    let _ ← addDef engName (← MetaM.run' <| mkEngine false)
+    let engC := mkConst engName
+    let engAgreesName := ns ++ `CrossRoot.FloatCast.engine_agrees
+    addThm engAgreesName
+      (eqTrue (mkApp (mkConst (ns ++ `FloatCast.Engine.agrees)) engC))
+      reflTrue
+    let engSpec := mkApp2 (mkConst (ns ++ `FloatCast.Engine.agrees_sound))
+      engC (mkConst engAgreesName)
+    let engSpecName := ns ++ `CrossRoot.FloatCast.engine_agrees_spec
+    addThm engSpecName (← MetaM.run' <| inferType engSpec) engSpec
+    -- Direct statements over the vendored constants: the preferred NaNs and
+    -- the six signaling-NaN candidates of the widening cast.
+    let (directTys, directPfs) ← MetaM.run' do
+      let refC (n : Name) : Expr := mkConst (ns ++ `FloatCast.Ref ++ n)
+      let bitsOfFb (b : Expr) : MetaM Expr := do
+        mkAppM ``BitVec.toNat #[← mkAppM (mi ++ `FloatBits.bits) #[b]]
+      let pref (f r : Name) : MetaM (Expr × Expr) := do
+        let lhs ← bitsOfFb (← mkAppM (mi ++ `FloatBits.preferredNaN)
+          #[mkConst (mi ++ `FloatFormat ++ f)])
+        let rhs := mkApp (refC `preferredNaN) (refC (`Fmt ++ r))
+        return (← mkEq lhs rhs, ← mkEqRefl lhs)
+      let choices (flag : Name) : MetaM (Expr × Expr) := do
+        let input ← mkAppM (mi ++ `FloatBits.mk)
+          #[mkConst (mi ++ `FloatFormat.binary32),
+            ← mkAppM ``BitVec.ofNat #[mkNatLit 128, mkNatLit 0x7f800001]]
+        let call ← mkAppM (mi ++ `FloatBits.nanChoices)
+          #[mkConst (mi ++ `FloatFormat.binary64),
+            ← mkListLit fbTy [input], mkConst flag]
+        let bitsF ← withLocalDeclD `b fbTy fun b => do
+          mkLambdaFVars #[b] (← bitsOfFb b)
+        let lhs ← mkAppM ``Option.map
+          #[← mkAppM ``List.map #[bitsF], ← mkAppM ``Except.toOption #[call]]
+        let pairTy ← mkAppM ``Prod #[refC `Fmt, natTy]
+        let pair ← mkAppM ``Prod.mk #[refC `Fmt.binary32, mkNatLit 0x7f800001]
+        let rhs := mkApp3 (refC `nanChoices) (refC `Fmt.binary64)
+          (← mkListLit pairTy [pair]) (mkConst flag)
+        return (← mkEq lhs rhs, ← mkEqRefl lhs)
+      let ds ← [pref `binary32 `binary32, pref `binary64 `binary64,
+        choices ``Bool.true, choices ``Bool.false].mapM id
+      return (ds.map (·.1), ds.map (·.2))
+    let directNames : List Name :=
+      [`preferredNaN32_eq, `preferredNaN64_eq, `nanChoices_signaling_nondet,
+        `nanChoices_signaling_det]
+    for (n, ty, pf) in directNames.zip (directTys.zip directPfs) do
+      addThm (ns ++ `CrossRoot.FloatCast ++ n) ty pf
+      added := added.push (ns ++ `CrossRoot.FloatCast ++ n)
+    let castIds : List (Name × Nat × Nat) :=
+      [(`f32ToF64, 31, 32), (`f64ToF32, 32, 31), (`f32ToI32, 31, 12),
+        (`i32ToF32, 12, 31), (`bitsU32ToI32, 22, 12),
+        (`bitsU64ToI64, 23, 13), (`f16ToF32, 30, 31), (`f128ToF32, 33, 31)]
+    let tyIdLock (prog : Name) (src dst : Nat) : MetaM (Expr × Expr) := do
+      let shape := mkApp (mkConst (ns ++ `FloatCast.castShape))
+        (mkConst (ns ++ `FloatCast.Prog ++ prog))
+      let srcTy ← mkAppM ``Prod.fst #[shape]
+      let dstTy ← mkAppM ``Prod.fst
+        #[← mkAppM ``Prod.snd #[← mkAppM ``Prod.snd #[shape]]]
+      let enc (t : Expr) : Expr := mkApp (mkConst (lm ++ `encodeTyId)) t
+      let e1 ← mkEq (enc srcTy) (mkNatLit src)
+      let e2 ← mkEq (enc dstTy) (mkNatLit dst)
+      return (mkApp2 (mkConst ``And) e1 e2,
+        mkApp4 (mkConst ``And.intro) e1 e2 (← mkEqRefl (enc srcTy))
+          (← mkEqRefl (enc dstTy)))
+    for (prog, src, dst) in castIds do
+      let (ty, pf) ← MetaM.run' <| tyIdLock prog src dst
+      let name := ns ++ `CrossRoot.FloatCast.tyIdLock ++ prog
+      addThm name ty pf
+      added := added.push name
+    added := added ++ #[engName, engAgreesName, engSpecName]
     -- 4. Bundles and theorems over the vendored interpreter: every
     -- `*_with` declaration instantiated at the cross-root authority.
     let mut bundleCount : Nat := 0
@@ -11490,6 +11792,8 @@ run_cmd do
       #[obsTy, decObs, wsFrameObs, wsSizeObs, wsRetU32, wsRetU32, wsRetWide,
         wsUbObs]
     let forgedFcAuth ← MetaM.run' <| mkFcAuth true
+    let forgedEngine ← MetaM.run' <| mkEngine true
+    let (forgedTyIdTy, forgedTyIdPf) ← MetaM.run' <| tyIdLock `f32ToF64 32 31
     let (forgedF16Ty, forgedF16Pf) ← MetaM.run' do
       let bad := mkApp fcRet32 (mkNatLit 0x3f800000)
       let f16Call := mkAppN fcRunCastC
@@ -11561,7 +11865,18 @@ run_cmd do
           { name := ns ++ `CrossRoot.forged.fcWrongF16
             levelParams := []
             type := forgedF16Ty
-            value := forgedF16Pf })]
+            value := forgedF16Pf }),
+       ("agreement of a mode-swapped float engine", .thmDecl
+          { name := ns ++ `CrossRoot.forged.engineSwapped
+            levelParams := []
+            type := eqTrue
+              (mkApp (mkConst (ns ++ `FloatCast.Engine.agrees)) forgedEngine)
+            value := reflTrue }),
+       ("wrong type-identifier lock", .thmDecl
+          { name := ns ++ `CrossRoot.forged.wrongTyId
+            levelParams := []
+            type := forgedTyIdTy
+            value := forgedTyIdPf })]
     let mut rejected : Nat := 0
     for (what, d) in forged do
       unless ← rejects d do
@@ -11597,7 +11912,11 @@ run_cmd do
             mi ++ `FloatBits.convert, mi ++ `FloatBits.decode,
             mi ++ `FloatBits.toInteger, mi ++ `FloatBits.fromInteger]),
          (fcMiriName,
-          [fcRunCastName, mi ++ `Cast.cast, mi ++ `Step.step])]
+          [fcRunCastName, mi ++ `Cast.cast, mi ++ `Step.step]),
+         (engName,
+          [mi ++ `FloatBits.nanChoices, mi ++ `FloatBits.preferredNaN,
+            mi ++ `FloatBits.convert, mi ++ `FloatBits.decode,
+            mi ++ `FloatBits.toInteger, mi ++ `FloatBits.fromInteger])]
         do
       let mut reach : NameSet := {}
       let mut todo : Array Name := #[auth]
@@ -11620,7 +11939,7 @@ run_cmd do
       maxHeartbeats := 0 }
   let ((replayed, added, bundles, rejected), _) ←
     liftCoreM <| (act.toIO ctx { env := baseEnv })
-  unless replayed ≥ 400 && added ≥ 65 && bundles = 12 && rejected = 10 do
+  unless replayed ≥ 400 && added ≥ 80 && bundles = 12 && rejected = 12 do
     throwError "cross-root: unexpected counts \
       (replayed={replayed}, added={added}, bundles={bundles}, \
       rejected={rejected})"
