@@ -923,6 +923,40 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         api = ol.audit_olean_request({"roots": ["OlClean"], "modules": ["OlClean"], "artifacts": [],
                                       "sources": [["OlClean", clean_src]], "scope": "api"})
         assert api["scope"] == "api" and api["auditedDeclarations"] == clean["auditedDeclarations"]
+        # A fresh Checker calling `--audit-olean` without optional `graph` must succeed, while
+        # attempting to override the locked foundation DAG or pass a symlinked parent dir via
+        # `--fast` cache must fail closed.
+        clean_parts = ol.artifacts["OlClean"]
+        fresh_cache = suite / "olean-api-cache"
+        fresh_ol = runner.Checker(fixture(), lean, temp_parent=suite, fast=True, cache_dir=fresh_cache)
+        disposable.append(fresh_ol.stage)
+        fresh_ol.tool_admission()
+        fresh_verdict = fresh_ol.audit_olean_request({
+            "roots": ["OlClean"], "modules": ["OlClean"],
+            "artifacts": [["OlClean", clean_parts]],
+            "sources": [["OlClean", clean_src]], "scope": "fresh-no-graph",
+        })
+        assert fresh_verdict["replay"] is True and fresh_verdict["auditedDeclarations"] == clean["auditedDeclarations"]
+        sym_parent = suite / "olean-sym-parent"
+        sym_parent.symlink_to(ol.stage / "olean-lib")
+        sym_olean = str(sym_parent / "OlClean.olean")
+        fresh_ol2 = runner.Checker(fixture(), lean, temp_parent=suite, fast=True, cache_dir=fresh_cache)
+        disposable.append(fresh_ol2.stage)
+        fresh_ol2.tool_admission()
+        expect_failure(lambda: fresh_ol2.audit_olean_request({
+            "roots": ["OlClean"], "modules": ["OlClean"],
+            "artifacts": [["OlClean", [[sym_olean], []]]],
+            "sources": [["OlClean", clean_src]], "scope": "fresh-no-graph",
+        }), 1, "olean-audit", "moduleProvenanceSpoofed")
+        expect_failure(lambda: fresh_ol2.audit_olean_request({
+            "roots": ["OlClean"], "modules": ["OlClean"],
+            "artifacts": [["OlClean", clean_parts]],
+            "graph": {"Init.Prelude": [{"module": "Fake", "importAll": False, "isExported": True, "isMeta": False}]},
+        }), 1, "olean-audit", "locked foundation DAG")
+        shutil.rmtree(fresh_cache, ignore_errors=True)
+        sym_parent.unlink()
+        expect_failure(lambda: ol.olean_audit("olean-audit", scope="fixture", roots=["Init.Prelude"], modules=[]),
+                       1, "olean-audit", "no audited modules")
         expect_failure(lambda: ol.audit_olean_request({"roots": ["OlClean"], "modules": ["OlClean"], "artifacts": [],
                                                        "allowProvisionalNative": True}),
                        2, "olean-audit", "malformed --audit-olean request")
@@ -933,6 +967,18 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         cache_probe.chmod(0o664)
         assert not runner._trusted_cache_file(cache_probe)
         cache_probe.unlink()
+        # `_restore_cached_module` must also refuse world/group-writable cache entries.
+        bad_cache = suite / "bad-olean-cache"
+        bad_entry = bad_cache / "olean" / "badkey"
+        bad_entry.mkdir(parents=True)
+        (bad_entry / "artifact.olean").write_bytes(b"tampered")
+        (bad_entry / "artifact.olean").chmod(0o666)
+        (bad_entry / "meta.json").write_text(json.dumps({"olean": runner.digest(bad_entry / "artifact.olean")}))
+        (bad_entry / "meta.json").chmod(0o666)
+        bad_rc = runner.Checker(fixture(), lean, temp_parent=suite, fast=True, cache_dir=bad_cache)
+        disposable.append(bad_rc.stage)
+        assert not bad_rc._restore_cached_module("BadMod", "badkey", bad_rc.stage / "BadMod.olean")
+        shutil.rmtree(bad_cache, ignore_errors=True)
         done("compiled-environment auditor: 0-FP positive control, --audit-olean API, cache trust")
 
         # Group 20: artifact completeness and all-parts provenance. A `module` file's private axiom
@@ -1006,7 +1052,22 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                      "[compilerOverrideAttribute] op._unsafe_rec", "[compilerOverrideAttribute] selfRec._unsafe_rec",
                      "unsafe_rec_sibling", "[sourceForbiddenIdentifier]",
                      sources=[("OlRec", str(ol.stage / "olean-src/OlRec.lean"))])
-        done("partial/unsafe declarations and forged _unsafe_rec siblings (stdlib, opaque, non-partial parents)")
+        # Reaching an `Init` `partial def` (opaque + partial `_unsafe_rec` sibling) must be caught
+        # in the dependency closure, and `Char` literals `'"'` or interpolated strings `s!"..."`
+        # must not blind the source-level `_unsafe_rec` identifier scanner.
+        olean_module(ol, "OlStdPartial", "prelude\nimport Init.Prelude\n"
+                     "def callsStdPartial (s : Lean.Syntax) : Option Lean.SourceInfo := Lean.Syntax.getHeadInfo? s\n",
+                     ["Init.Prelude"])
+        olean_reject(ol, ["OlStdPartial"], "[partialOrUnsafeRecDependency] Lean.Syntax.getHeadInfo?")
+        olean_module(ol, "OlScanBlind", prelude_init + (
+            "def quoteChar : Char := '\"'\n"
+            "def after_char_unsafe_rec (n : Nat) : Nat := n\n"
+            "def interpStr : String := s!\"{let inside_interp_unsafe_rec := 1; inside_interp_unsafe_rec}\"\n"),
+            ["Init"])
+        olean_reject(ol, ["OlScanBlind"], "[sourceForbiddenIdentifier] after_char_unsafe_rec",
+                     "[sourceForbiddenIdentifier] inside_interp_unsafe_rec",
+                     sources=[("OlScanBlind", str(ol.stage / "olean-src/OlScanBlind.lean"))])
+        done("partial/unsafe declarations, stdlib partial closure, forged _unsafe_rec siblings, and hardened source scan")
 
         # Group 22: compiler overrides persisted in compiled artifacts: implemented_by, extern,
         # export, initialize, @[csimp] redirecting a stdlib function, @[scoped csimp], and an erased
@@ -1056,7 +1117,30 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         olean_reject(ol, ["OlForged"], "csimp: List.map", "cpass: compiler pass installer", "constant_fold: folder forgedFolder",
                      "casesOn_tag", "FakeT.casesOn", "sparse_casesOn_tag", "sparseFake", "noConfusion_tag", "ncFake",
                      toolchainRoots=["Init", "Std", "Lean"])
-        done("metaprogram-forged csimp/cpass/folder state and casesOn/sparseCasesOn/noConfusion tags, Lean library foreign")
+        # Forged `_sparseCasesOn` with `.default` BEFORE `.ctor` (compiled IR short-circuits to the
+        # default branch even though per-ctor kernel equations hold), duplicate `.default`, and
+        # forged IR calling toolchain `unsafeBaseIO` must all be rejected.
+        forged_sem_source = "prelude\nimport Init\nimport Lean\n" + (
+            "inductive FTwo where | a | b\n"
+            "def FTwo._sparseCasesOn_rev.{u} {motive : FTwo → Sort u} (t : FTwo)\n"
+            "    (dflt : motive t) (altA : motive .a) : motive t :=\n"
+            "  FTwo.casesOn (motive := fun x => motive x → motive x) t (fun _ => altA) (fun d => d) dflt\n"
+            "run_cmd Lean.modifyEnv (Lean.markSparseCasesOn · ``FTwo._sparseCasesOn_rev)\n"
+            "def FTwo._sparseCasesOn_dupdef.{u} {motive : FTwo → Sort u} (t : FTwo)\n"
+            "    (d1 : motive t) (d2 : motive t) : motive t := d1\n"
+            "run_cmd Lean.modifyEnv (Lean.markSparseCasesOn · ``FTwo._sparseCasesOn_dupdef)\n"
+            "def irUnsafeVictim (n : Nat) : Nat := n\n"
+            "run_cmd Lean.modifyEnv fun env =>\n"
+            "  let d := Lean.IR.Decl.fdecl ``irUnsafeVictim #[{ x := ⟨1⟩, borrow := false, ty := .object }] .object\n"
+            "    (.vdecl ⟨2⟩ .object (.fap ``unsafeBaseIO #[.var ⟨1⟩]) (.ret (.var ⟨2⟩))) {}\n"
+            "  Lean.IR.declMapExt.addEntry env d\n")
+        olean_module(ol, "OlForgedSem", forged_sem_source, ["Init", "Lean"])
+        olean_reject(ol, ["OlForgedSem"],
+                     "FTwo._sparseCasesOn_rev", "constructor alternative appears after default alternative",
+                     "FTwo._sparseCasesOn_dupdef", "duplicate default alternative",
+                     "[unsafeDeclaration] unsafeBaseIO", "duplicate IR declaration entry",
+                     toolchainRoots=["Init", "Std", "Lean"])
+        done("metaprogram-forged csimp/cpass/folder state, intrinsic tag ordering/IR-unsafe, Lean library foreign")
 
         # Group 24: separate compilation (`-Dcompiler.postponeCompile=true`) of a `module` file
         # writes no IR for public or private functions.
@@ -1095,21 +1179,46 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         done("native_decide rejection, kernel re-check of forged/_sunfold-steered native axioms, provisional never passes")
 
         # Group 26: statement-origin separation in the compiled environment: a claim statement that
-        # unfolds into a forbidden theory module is rejected; proof-only use is not.
+        # unfolds (directly or via an intermediate examples/Specs module) into a forbidden theory
+        # module is rejected; proof-only use is not; missing claimModules entries fail closed.
         olean_module(ol, "OlTheory", prelude_init + "def UntrustedProp : Prop := True\n", ["Init"])
+        olean_module(ol, "OlSpecMod", "prelude\nimport OlTheory\ndef SpecProp : Prop := UntrustedProp\n", ["OlTheory"])
         olean_module(ol, "OlClaim", "prelude\nimport OlTheory\ndef myClaim : Prop := UntrustedProp\n"
                      "theorem leaked : myClaim := True.intro\n", ["OlTheory"])
+        olean_module(ol, "OlClaimViaSpec", "prelude\nimport OlSpecMod\n"
+                     "theorem leakedViaSpec : SpecProp := True.intro\n", ["OlSpecMod"])
         olean_module(ol, "OlClaimOk", "prelude\nimport OlTheory\n"
                      "theorem proofOnly : True := (fun (_ : UntrustedProp) => True.intro) True.intro\n", ["OlTheory"])
         olean_reject(ol, ["OlTheory", "OlClaim"], "[statementOriginLeak] leaked", "UntrustedProp",
                      claimModules=["OlClaim"], statementForbidden=["OlTheory"], statementUnfold=["OlClaim"])
+        olean_reject(ol, ["OlTheory", "OlSpecMod", "OlClaimViaSpec"], "[statementOriginLeak] leakedViaSpec", "UntrustedProp",
+                     claimModules=["OlClaimViaSpec"], statementForbidden=["OlTheory"],
+                     statementUnfold=["OlClaimViaSpec", "OlSpecMod"])
+        olean_reject(ol, ["OlTheory"], "[missingDeclaration]", "MissingClaimMod",
+                     claimModules=["MissingClaimMod"], statementForbidden=["OlTheory"])
         olean_accept(ol, ["OlTheory", "OlClaimOk"], claimModules=["OlClaimOk"], statementForbidden=["OlTheory"],
                      statementUnfold=["OlClaimOk"])
+        done("compiled statement-origin separation (incl. Specs/examples and missing claimModules)")
+
+        # Group 27: pure Lean 4 hardcoded compiler-intrinsic name spoofing (no `import Lean`, no
+        # attributes, no axioms): redefining ConstantFold/ToLCNF built-in names in non-toolchain
+        # modules causes compiled code to silently diverge from the kernel and must be rejected.
+        olean_module(ol, "OlSpoofFold", "prelude\nimport Init.Core\n"
+                     "def Nat.nextPowerOfTwo (_ : Nat) : Nat := 1000\n"
+                     "def String.length (_ : String) : Nat := 1000\n"
+                     "def victim : Nat := Nat.nextPowerOfTwo 3\n"
+                     "theorem kernel_val : victim = 1000 := rfl\n", ["Init.Core"])
+        olean_reject(ol, ["OlSpoofFold"], "[compilerOverrideAttribute] Nat.nextPowerOfTwo",
+                     "[compilerOverrideAttribute] String.length", "compiler_intrinsic_name")
+        olean_module(ol, "OlSpoofPrelude", "prelude\n"
+                     "inductive PNat where | zero | succ (n : PNat)\n"
+                     "def Empty.rec (x : PNat) (_y : PNat) : PNat := PNat.succ x\n", [])
+        olean_reject(ol, ["OlSpoofPrelude"], "[compilerOverrideAttribute] Empty.rec", "compiler_intrinsic_name")
         runner.make_tree_writable(ol.stage)
         shutil.rmtree(ol.stage)
-        done("compiled statement-origin separation")
+        done("pure Lean 4 hardcoded compiler-intrinsic name spoofing")
 
-        # Group 27: `trusted/root-manifest.sha256` verification before any Lean child.
+        # Group 28: `trusted/root-manifest.sha256` verification before any Lean child.
         root = fixture()
         pinned_input = root / "fixture-input.txt"
         pinned_input.write_text("pinned build input\n")
@@ -1150,6 +1259,10 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         (root / "flake.nix").write_text("{}\n")
         (root / "lakefile.toml").write_text("name = \"fixture\"\n")
         expect_failure(lambda: runner.verify_root_manifest(root), 1, "root-manifest", "missing trusted/root-manifest.sha256")
+        # In a repository checkout (`flake.nix` + `lakefile.toml`), stripping root build files from
+        # `trusted/root-manifest.sha256` must be rejected.
+        write_manifest(covered)
+        expect_failure(lambda: runner.verify_root_manifest(root), 1, "root-manifest", "Cargo.toml")
         done("root-manifest drift, symlink, missing-entry, malformed, and missing-manifest rejection before Lean")
     except BaseException as error:
         (suite / "failure.traceback").write_text(traceback.format_exc())

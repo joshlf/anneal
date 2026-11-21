@@ -41,6 +41,8 @@ def remove_process_binaries() -> None:
     for path in _PROCESS_OLEAN_BINARIES.values():
         shutil.rmtree(path.parent, ignore_errors=True)
     _PROCESS_OLEAN_BINARIES.clear()
+
+
 OLEAN_AUDITOR = "trusted/audit/OleanEnvAuditor.lean"
 OLEAN_AUDIT_MODES = ("olean-audit", "olean-downstream-audit")
 ROOT_MANIFEST = "trusted/root-manifest.sha256"
@@ -48,6 +50,14 @@ ROOT_MANIFEST_PHASE = "root-manifest"
 # The trusted checker and the compiled environment auditor must always be covered by the root
 # manifest, next to the root build inputs it already pins.
 ROOT_MANIFEST_REQUIRED = ("trusted/audit/check_trusted.py", OLEAN_AUDITOR)
+ROOT_MANIFEST_REPO_REQUIRED = (
+    "Cargo.toml",
+    "Cargo.lock",
+    "flake.nix",
+    "flake.lock",
+    "trusted/audit/check_trusted.py",
+    OLEAN_AUDITOR,
+)
 OLEAN_RESULT_KEYS = frozenset({
     "auditor", "schema", "scope", "modules", "loadedModules", "artifactPartsChecked",
     "auditedDeclarations", "reachableDeclarations", "codegenCompanions", "irDeclarationsChecked",
@@ -371,6 +381,31 @@ def _trusted_cache_file(path: Path) -> bool:
             and not st.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
 
 
+def _trusted_cache_dir(path: Path) -> bool:
+    """A cache directory is trusted only if it is a regular directory owned by this user and
+    writable by no one else."""
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    return (stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid()
+            and not st.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+
+
+def _canonical_regular(path: Path) -> bool:
+    """True iff `path` is an absolute, canonical, non-symlinked regular file whose containing
+    directory also resolves to itself."""
+    if not path.is_absolute():
+        return False
+    try:
+        st = path.lstat()
+        if not stat.S_ISREG(st.st_mode):
+            return False
+        return path.resolve() == path and path.parent.resolve() == path.parent
+    except OSError:
+        return False
+
+
 class Checker:
     def __init__(
         self,
@@ -408,7 +443,7 @@ class Checker:
             self.cache_dir = raw_cache.resolve()
             if self.cache_dir == self.checkout or self.checkout in self.cache_dir.parents:
                 raise Failure(2, "admission", f"cache directory must reside outside checkout: {self.cache_dir}")
-        self.stage = Path(tempfile.mkdtemp(prefix="anneal-trusted-", dir=temp_parent))
+        self.stage = Path(tempfile.mkdtemp(prefix="anneal-trusted-", dir=temp_parent)).resolve()
         self.phase, self.execution_began, self.counter = "admission", False, 0
         self.environment = {k: v for k, v in os.environ.items()
                             if not k.startswith(("LEAN", "LAKE", "ELAN", "DYLD_"))}
@@ -532,6 +567,7 @@ class Checker:
             "leancSha256": digest(leanc),
             "auditorSha256": self.olean_auditor_hash,
         })
+        created_bin_dir = False
         if self.fast and self.cache_dir is not None:
             bin_dir = self.cache_dir / "inspector-bin"
         else:
@@ -543,6 +579,7 @@ class Checker:
                 return known
             try:
                 bin_dir = Path(tempfile.mkdtemp(prefix="anneal-trusted-olean-bin-"))
+                created_bin_dir = True
             except OSError:
                 return None
         bin_path = bin_dir / f"OleanEnvAuditor-{bin_key}"
@@ -553,7 +590,10 @@ class Checker:
             bin_dir.mkdir(parents=True, exist_ok=True)
             tmp_dir = Path(tempfile.mkdtemp(prefix=f"tmp-olean-{bin_key[:12]}-", dir=bin_dir))
         except OSError:
+            if created_bin_dir:
+                shutil.rmtree(bin_dir, ignore_errors=True)
             return None
+        stored = False
         try:
             c_path = tmp_dir / "OleanEnvAuditor.c"
             tmp_bin = tmp_dir / "OleanEnvAuditor"
@@ -577,11 +617,14 @@ class Checker:
             self._compiled_olean_auditor = bin_path
             if not self.fast:
                 _PROCESS_OLEAN_BINARIES[bin_key] = bin_path
+            stored = True
             return bin_path
         except (OSError, subprocess.SubprocessError):
             return None
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+            if created_bin_dir and not stored:
+                shutil.rmtree(bin_dir, ignore_errors=True)
 
     def _inspect_cache_key(self, mode: str, fields: dict) -> str | None:
         if not self.fast or self.cache_dir is None or self.expected_lean_sha is None:
@@ -612,6 +655,16 @@ class Checker:
             })
         if mode in ("audit", "downstream-audit", *OLEAN_AUDIT_MODES):
             if mode in OLEAN_AUDIT_MODES:
+                # Never satisfy an OleanEnvAuditor audit from cache if any artifact or source path
+                # is non-canonical or traverses a symlink: let the auditor run and reject it.
+                for mod in self.artifacts:
+                    for group in self.artifacts[mod]:
+                        for p in group:
+                            if not _canonical_regular(Path(p)):
+                                return None
+                for _, p in fields.get("sources", []):
+                    if not _canonical_regular(Path(p)):
+                        return None
                 # Staged source paths differ per run; key them by module and content instead.
                 fields = {**fields, "sources": [(m, digest(Path(p))) for m, p in fields.get("sources", [])]}
                 inspector_sha = {"trustedBoundary": inspector_sha,
@@ -634,7 +687,7 @@ class Checker:
                 "leanSha256": self.expected_lean_sha,
                 "inspectorSha256": inspector_sha,
                 "lock": self.lock,
-                "graph": self.graph,
+                "graph": fields["graph"] if "graph" in fields else self.graph,
                 "artifactHashes": artifact_hashes,
                 "fields": fields,
             })
@@ -694,7 +747,7 @@ class Checker:
             return False
         entry_dir = self.cache_dir / "olean" / cache_key
         meta_path = entry_dir / "meta.json"
-        if not meta_path.is_file():
+        if not _trusted_cache_dir(entry_dir) or not _trusted_cache_file(meta_path):
             return False
         try:
             meta = json.loads(meta_path.read_text())
@@ -704,7 +757,7 @@ class Checker:
             return False
         for part, expected_sha in meta.items():
             cached_part = entry_dir / f"artifact.{part}"
-            if not cached_part.is_file() or digest(cached_part) != expected_sha:
+            if not _trusted_cache_file(cached_part) or digest(cached_part) != expected_sha:
                 return False
         output.parent.mkdir(parents=True, exist_ok=True)
         available = {}
@@ -763,6 +816,8 @@ class Checker:
                    "artifacts": sorted(self.artifacts.items()),
                    "foundation": self.foundation, "graph": self.graph,
                    "axioms": self.lock["axioms"], **fields}
+        if mode in OLEAN_AUDIT_MODES and "graph" in fields and fields["graph"] is None:
+            del request["graph"]
         stem = self.stage / f"request-{self.counter + 1:03d}-{mode}"
         request_path, result_path = Path(str(stem) + ".json"), Path(str(stem) + ".result.json")
         request_path.write_text(json.dumps(request, sort_keys=True))
@@ -910,31 +965,47 @@ class Checker:
             value = request.get(key, [])
             require(isinstance(value, list) and all(isinstance(m, str) and m for m in value), phase,
                     f"malformed --audit-olean field {key}")
+        require(bool(request["roots"]) and len(request["roots"]) == len(set(request["roots"])), phase,
+                "malformed --audit-olean field roots")
+        require(bool(request["modules"]) and len(request["modules"]) == len(set(request["modules"])), phase,
+                "malformed --audit-olean field modules")
         artifacts = request["artifacts"]
         require(isinstance(artifacts, list), phase, "malformed --audit-olean artifacts")
         for entry in artifacts:
-            require(isinstance(entry, list) and len(entry) == 2 and isinstance(entry[0], str)
+            require(isinstance(entry, list) and len(entry) == 2 and isinstance(entry[0], str) and bool(entry[0])
                     and entry[0] not in self.artifacts and isinstance(entry[1], list) and len(entry[1]) == 2
                     and all(isinstance(g, list) and all(isinstance(p, str) and os.path.isabs(p) for p in g)
                             for g in entry[1]), phase, "malformed --audit-olean artifact entry")
             for group in entry[1]:
                 for path in group:
                     regular(Path(path), phase)
+                    if not _canonical_regular(Path(path)):
+                        raise Failure(1, phase, f"[moduleProvenanceSpoofed] non-canonical artifact path: {path}")
                     self.expected_artifacts[path] = digest(Path(path))
             self.artifacts[entry[0]] = [list(entry[1][0]), list(entry[1][1])]
-        graph = request.get("graph", {})
-        require(valid_graph(graph), phase, "malformed --audit-olean graph")
-        self.graph = {**self.graph, **graph}
+        if "graph" in request:
+            graph = request["graph"]
+            require(valid_graph(graph), phase, "malformed --audit-olean graph")
+            for mod, edges in graph.items():
+                if mod in self.foundation and edges != self.lock["graph"].get(mod):
+                    raise Failure(1, phase, f"[graphMismatch] --audit-olean cannot override locked foundation DAG for {mod}")
+            merged_graph: dict | None = {**self.graph, **graph}
+            self.graph = merged_graph
+        else:
+            merged_graph = None
         sources = request.get("sources", [])
         require(isinstance(sources, list) and all(
             isinstance(s, list) and len(s) == 2 and all(isinstance(x, str) and x for x in s) for s in sources),
             phase, "malformed --audit-olean sources")
         for _, path in sources:
             regular(Path(path), phase)
+            if not _canonical_regular(Path(path)):
+                raise Failure(1, phase, f"[moduleProvenanceSpoofed] non-canonical source path: {path}")
         scope = request.get("scope", "request")
         require(isinstance(scope, str) and bool(scope), phase, "malformed --audit-olean scope")
         return self.olean_audit(
             "olean-audit", scope=scope, roots=request["roots"], modules=request["modules"],
+            graph=merged_graph,
             localAxiomModules=request.get("localAxiomModules", []),
             claimModules=request.get("claimModules", []),
             statementForbidden=request.get("statementForbidden", []),
@@ -1213,7 +1284,7 @@ class Checker:
             localAxiomModules=allowed_axiom_mods,
             claimModules=[m for m, _, _, r in targets if r == "claim"],
             statementForbidden=[m for m, _, _, r in targets if r == "theory"],
-            statementUnfold=[m for m, _, _, r in targets if r == "claim"],
+            statementUnfold=[m for m, _, _, r in targets if r in ("claim", "examples", "test")],
             sources=[*((n, str(self.source_copy / p)) for n, p in self.modules.items()),
                      *((m, str(copies[m])) for m in downstream_modules)])
         result["waiverVacuityAudit"] = waiver_audit
@@ -5409,7 +5480,8 @@ def verify_root_manifest(checkout: Path) -> dict[str, str] | None:
         if actual != match[1].decode("ascii"):
             raise Failure(1, phase, f"root-manifest drift: {name} does not match its pinned SHA-256")
         covered[name] = actual
-    missing = [name for name in ROOT_MANIFEST_REQUIRED if name not in covered]
+    required = ROOT_MANIFEST_REPO_REQUIRED if has_markers else ROOT_MANIFEST_REQUIRED
+    missing = [name for name in required if name not in covered]
     if missing:
         raise Failure(1, phase, f"{ROOT_MANIFEST} does not cover required TCB files: {', '.join(missing)}")
     return covered
@@ -5521,7 +5593,12 @@ def _main() -> int:
         return 0
     if args.audit_olean is not None:
         try:
+            if base_snapshot is not None:
+                verify_base_snapshot(checkout, base_snapshot, tuple(args.expected_tcb_drift))
             request = json.loads(args.audit_olean.read_text())
+        except Failure as error:
+            print(f"Trusted check failed ({error.phase}): {error}", file=sys.stderr)
+            return error.code
         except (OSError, ValueError) as error:
             print(f"Trusted check failed (olean-audit): cannot read request: {error}", file=sys.stderr)
             return 2
@@ -5539,6 +5616,9 @@ def _main() -> int:
             phase = error.phase if isinstance(error, Failure) else olean_checker.phase
             print(f"Trusted check failed ({phase}): {error}\npreserved logs: {olean_checker.stage}", file=sys.stderr)
             return code
+        except KeyboardInterrupt:
+            print(f"Trusted check interrupted; preserved logs: {olean_checker.stage}", file=sys.stderr)
+            return 2
         print(json.dumps(verdict, indent=2, sort_keys=True))
         make_tree_writable(olean_checker.stage)
         shutil.rmtree(olean_checker.stage)
