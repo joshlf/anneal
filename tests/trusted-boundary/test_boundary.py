@@ -1214,9 +1214,23 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                      "inductive PNat where | zero | succ (n : PNat)\n"
                      "def Empty.rec (x : PNat) (_y : PNat) : PNat := PNat.succ x\n", [])
         olean_reject(ol, ["OlSpoofPrelude"], "[compilerOverrideAttribute] Empty.rec", "compiler_intrinsic_name")
+        # A fixed denylist cannot keep up with the names the code generator special-cases
+        # (`LCNF.Types`/`ToImpureType` match `Void.nonemptyType`; `ExtractClosed` and
+        # `SimpleGroundExpr` match `Array.emptyWithCapacity` and `Lean.Name.mkStr1`..): any
+        # non-toolchain declaration reusing a name the pinned toolchain declares is rejected, even
+        # when the declaring toolchain module is not imported.
+        olean_module(ol, "OlSpoofToolchainName", "prelude\nimport Init.Prelude\n"
+                     "def Void.nonemptyType : Nat := 0\n", ["Init.Prelude"])
+        olean_reject(ol, ["OlSpoofToolchainName"], "[compilerOverrideAttribute] Void.nonemptyType", "toolchain_name")
+        # Source rule: a raw string `r"\"` has no escapes, so it must not hide the next line.
+        raw_src = "prelude\nimport Init\ndef rawS : String := r\"\\\"\ndef hiddenRaw._unsafe_rec (n : Nat) : Nat := n\n" \
+                  "def rawT : String := \"x\"\n"
+        olean_module(ol, "OlRawString", raw_src, ["Init"])
+        olean_reject(ol, ["OlRawString"], "[sourceForbiddenIdentifier] hiddenRaw._unsafe_rec",
+                     sources=[("OlRawString", str(ol.stage / "olean-src/OlRawString.lean"))])
         runner.make_tree_writable(ol.stage)
         shutil.rmtree(ol.stage)
-        done("pure Lean 4 hardcoded compiler-intrinsic name spoofing")
+        done("pure Lean 4 hardcoded compiler-intrinsic and toolchain-owned name spoofing, raw-string source scan")
 
         # Group 28: `trusted/root-manifest.sha256` verification before any Lean child.
         root = fixture()
@@ -1268,6 +1282,10 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         (suite / "failure.traceback").write_text(traceback.format_exc())
         print(f"SELF-TEST FAILED: {error}\nPreserved fixture sources/raw logs: {suite}", file=sys.stderr)
         return 2
+    finally:
+        # This module loads its own copy of the checker; its per-process auditor binaries are not
+        # the ones `check_trusted.main()` removes.
+        runner.remove_process_binaries()
     print(f"PASS: {len(passed)} fixture groups in {time.monotonic() - started:.1f}s; sequential, no research builds")
     shutil.rmtree(suite)
     return 0

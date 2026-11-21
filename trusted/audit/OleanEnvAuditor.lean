@@ -379,6 +379,51 @@ def loadEnvironment (req : Request) (roots : Array Name) : IO Environment := do
     fail "[environmentLoadFailed] refusing an exported-level (module-system) environment"
   return env.setExporting false
 
+/-- Every module the pinned toolchain ships under the admitted toolchain roots, found by a bounded
+walk of `<sysroot>/lib/lean/<root>`. -/
+def listToolchainModules (libDir : System.FilePath) (roots : Array Name) : IO (Array Name) := do
+  let mut result : Array Name := #[]
+  let mut pending : List (System.FilePath × Name) := []
+  for r in roots do
+    let rs := r.toString (escape := false)
+    if ← (libDir / (rs ++ ".olean")).pathExists then result := result.push r
+    pending := (libDir / rs, r) :: pending
+  let mut done := false
+  for _ in [0:100000] do
+    match pending with
+    | [] => done := true; break
+    | (dir, pre) :: rest =>
+      pending := rest
+      unless ← dir.isDir do continue
+      for entry in ← dir.readDir do
+        if ← entry.path.isDir then
+          pending := (entry.path, pre.str entry.fileName) :: pending
+        else if entry.fileName.endsWith ".olean" then
+          result := result.push (pre.str (entry.fileName.dropEnd 6).toString)
+  unless done do operational "toolchain module walk exhausted its fuel"
+  return result
+
+/-- Names of every constant (and IR-only helper) the pinned toolchain declares under the admitted
+toolchain roots, whether or not the audited modules import the declaring module. The code generator
+special-cases many of these by name alone (`ConstantFold.builtinFolders`, `builtinRuntimeTypes`,
+`ToLCNF.visitApp`, `ExtractClosed`, `SimpleGroundExpr`, `ToImpureType`, ...), so a non-toolchain
+module that declares one of them, while not importing the toolchain module that owns it, gets
+compiler semantics that its kernel definition does not have. -/
+def toolchainNameInventory (req : Request) : IO (Std.HashSet Name) := do
+  let libDir := req.sysroot / "lib" / "lean"
+  searchPathRef.set [libDir]
+  let mods ← listToolchainModules libDir req.toolchainRoots
+  if mods.isEmpty then fail "[environmentLoadFailed] the pinned toolchain ships no modules"
+  let env ← try
+      importModules (mods.map fun n => { module := n }) {} (trustLevel := 0) (plugins := #[])
+        (loadExts := false) (level := .exported)
+    catch e => fail s!"[environmentLoadFailed] cannot load the toolchain name inventory: {e}"
+  let mut names : Std.HashSet Name := {}
+  for data in env.header.moduleData do
+    for n in data.constNames do names := names.insert n
+    for n in data.extraConstNames do names := names.insert n
+  return names
+
 def origin? (env : Environment) (n : Name) : Option Name := do
   let idx ← env.getModuleIdxFor? n
   let m ← env.header.modules[idx.toNat]?
@@ -902,9 +947,9 @@ def matchRawStrStart (cs : Array Char) (i : Nat) : Option (Nat × Nat) := Id.run
         j := j + 1
       else break
     else break
-  if hashes > 0 then
-    if h : j < cs.size then
-      if cs[j] == '"' then return some (hashes, j + 1)
+  -- `r"..."` (no hashes) is a raw string too: no escapes, so `r"\"` ends at its second quote.
+  if h : j < cs.size then
+    if cs[j] == '"' then return some (hashes, j + 1)
   return none
 
 /-- Check whether `cs` at index `i` has `"` followed by `hashes` `#` characters. -/
@@ -1426,7 +1471,8 @@ def failWithViolations (req : Request) (violations : Array Violation) : IO α :=
 /-- Provenance, inventory, policy and replay checks over one loaded environment. -/
 def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
     (artMap : Std.HashMap Name (Array System.FilePath × Array System.FilePath))
-    (modIdx : Std.HashMap Name Nat) (preloaded : Nat) : AuditM (Loaded × Nat × Nat × Bool × Nat) := do
+    (modIdx : Std.HashMap Name Nat) (preloaded : Nat) (toolchainNames : Std.HashSet Name) :
+    AuditM (Loaded × Nat × Nat × Bool × Nat) := do
   -- Provenance of every loaded module.
   let mut toolchainProv : Std.HashSet Name := {}
   let mut nonToolchain : Array Name := #[]
@@ -1519,6 +1565,9 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
       if compilerReservedNames.contains n then
         report "compilerOverrideAttribute" n m
           "compiler_intrinsic_name: non-toolchain declaration shadows compiler-builtin constant"
+      if toolchainNames.contains n then
+        report "compilerOverrideAttribute" n m
+          "toolchain_name: non-toolchain declaration reuses a name the pinned toolchain declares"
       match env.checked.get.find? n with
       | none => report "inventoryMismatch" n m "declaration missing from the kernel environment"
       | some stored =>
@@ -1557,6 +1606,10 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
       else
         strictRoots := strictRoots.push n
       unless isCompanion do replayLocals := replayLocals.insert n ci
+    for n in data.extraConstNames do
+      if toolchainNames.contains n then
+        report "compilerOverrideAttribute" n m
+          "toolchain_name: IR helper reuses a name the pinned toolchain declares"
     checkModuleIR L i m data toolchainImplByTargets
   -- Uninventoried kernel constants attributed to an audited module.
   for (n, _) in env.checked.get.constants do
@@ -1612,6 +1665,7 @@ def audit (req : Request) : IO Json := do
   let libDir := req.sysroot / "lib" / "lean"
   let (preloaded, preSt) ← (preloadArtifactChecks req).run {}
   if !preSt.violations.isEmpty then failWithViolations req preSt.violations
+  let toolchainNames ← toolchainNameInventory req
   let env ← loadEnvironment req req.roots
   let importUs ← IO.monoNanosNow
   let mut artMap : Std.HashMap Name (Array System.FilePath × Array System.FilePath) := {}
@@ -1619,7 +1673,7 @@ def audit (req : Request) : IO Json := do
   let mut modIdx : Std.HashMap Name Nat := {}
   for h : i in [0:env.header.modules.size] do
     modIdx := modIdx.insert env.header.modules[i].module i
-  let (result, st) ← (auditCore req env libDir artMap modIdx preloaded).run {}
+  let (result, st) ← (auditCore req env libDir artMap modIdx preloaded toolchainNames).run {}
   let (L, partsChecked, audited, replayed, replayedCount) := result
   let endUs ← IO.monoNanosNow
   if !st.violations.isEmpty then failWithViolations req st.violations
