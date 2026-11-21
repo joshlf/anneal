@@ -269,12 +269,44 @@ def anyListTrueProto {α : Type} (p : α → Bool) : List α → Bool
     | false => anyListTrueProto p rest
 
 /--
-Test whether `ty` is uninhabited (`!`, an ADT/closure whose `LayoutTable` entry
-sets `isUninhabited = true` or `variants = .empty`, a non-empty array or tuple
-containing an uninhabited element, or a reference `&T` / `&mut T` to a sized
-uninhabited pointee such as `&!` or `&UninhabStruct` — matching Miri
-`ValidityVisitor.lean:226` `opsemInhabited`; note that `&[!; 0]` and `&[!]`
-ARE inhabited).
+Test whether the LAYOUT of `ty` is uninhabited (`LayoutData::is_uninhabited`):
+`!`, an ADT/closure whose `LayoutTable` entry sets `isUninhabited = true` or
+`variants = .empty`, or a non-empty array or tuple containing such an element.
+
+A pointer type is NEVER layout-uninhabited, whatever its pointee: the layout of
+`&T` is a non-null pointer scalar, so `&!` is layout-inhabited even though no
+valid value of type `&!` exists. The two notions must stay apart:
+
+- a reference is invalid when its **pointee layout** is uninhabited
+  (`referenceToUninhabitedProto`, checked where a `&T` value is validated), so
+  `&!` and `&(u8, !)` values are UB;
+- `&&!`, `&(u8, &!)` and `*const &!` are ordinary pointers to a pointer-sized,
+  layout-inhabited pointee. Their validity is shallow (the pointee's bytes are
+  not validated), and `raw_eq::<&!>` merely compares the pointer bytes behind
+  two valid `&&!` arguments ("any validity restrictions will be ignored").
+  Treating `&!` itself as uninhabited would report false UB for all of these.
+
+Reference (`compiler/rustc_const_eval/src/interpret/validity.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/validity.rs#L736-L737>
+
+> "// Do not allow references to uninhabited types.
+> if place.layout.is_uninhabited() {"
+
+Reference (`compiler/rustc_ty_utils/src/layout.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_ty_utils/src/layout.rs#L410-L419>
+
+> "// Potentially-wide pointers.
+> ty::Ref(_, pointee, _) | ty::RawPtr(pointee, _) => {
+>     let mut data_ptr = scalar_unit(Pointer(AddressSpace::ZERO));
+>     if !ty.is_raw_ptr() {
+>         data_ptr.valid_range_mut().start = 1;
+>     }
+>
+>     if pointee.is_sized(tcx, cx.typing_env) {
+>         return Ok(tcx.mk_layout(LayoutData::scalar(cx, data_ptr)));
+>     }"
 
 Reference (The Rust Reference, "Behavior considered undefined — Invalid values"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
@@ -292,10 +324,6 @@ def isUninhabitedRigidTyProto
     | .never => true
     | .array elem (.succ _) => isUninhabitedRigidTyProto localDecls layouts fuel' elem
     | .tuple ks => anyListTrueProto (isUninhabitedRigidTyProto localDecls layouts fuel') ks
-    | .ref _ pointee =>
-      match isUnsizedRigidTy 8 pointee with
-      | true => false
-      | false => isUninhabitedRigidTyProto localDecls layouts fuel' pointee
     | .adt _ _ | .closure _ _ =>
       match findDeclLayoutForRigidTy localDecls layouts ty with
       | .some l =>
@@ -307,6 +335,160 @@ def isUninhabitedRigidTyProto
           | _ => false
       | .none => false
     | _ => false
+
+/--
+Whether a reference `&T` / `&mut T` to `pointee` is invalid because the pointee
+LAYOUT is uninhabited ("safe pointer to uninhabited type",
+`Miri/Interpreter/ValidityVisitor.lean:226`): `&!`, `&(u8, !)`,
+`&UninhabitedStruct`. Unsized pointees (`[!]`, `str`, `dyn Trait`) are never
+layout-uninhabited, and neither is any pointer pointee (`&&!` is a valid
+reference to the layout-inhabited `&!`; see `isUninhabitedRigidTyProto`).
+-/
+@[reducible]
+def referenceToUninhabitedProto
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (pointee : RigidTy) :
+    Bool :=
+  match isUnsizedRigidTy 8 pointee with
+  | true => false
+  | false => isUninhabitedRigidTyProto localDecls layouts 8 pointee
+
+/-- Higher-order list `all` helper so fuel-recursive functions remain purely structurally recursive. -/
+@[reducible]
+def allListTrueProto {α : Type} (p : α → Bool) : List α → Bool
+  | .nil => true
+  | x :: rest =>
+    match p x with
+    | true => allListTrueProto p rest
+    | false => false
+
+/--
+Whether a pointer to `pointee` may be a WIDE pointer that the `RigidTy` alone
+does not reveal: an ADT (its fields, hence a possible unsized tail, are not
+recorded in `RigidTy.adt`), an unresolved parameter / alias / unrecognized
+type, or a tuple ending in one (`Terminators.intrinsicTailMayBeUnsized`). The
+built-in unsized pointees `[T]`, `str` and `dyn Trait` are excluded by the
+callers: pointers to them are always wide.
+-/
+@[reducible]
+def ptrPointeeMayBeUnsizedProto (pointee : RigidTy) : Bool :=
+  match pointee with
+  | .param _ _ | .alias _ _ => true
+  | _ => intrinsicTailMayBeUnsized 8 pointee
+
+/--
+Byte size recorded by the compiler for a pointer to `pointee`: the
+`LayoutTable` size of the first local in `localDecls` whose type is
+`&pointee`, `&mut pointee`, `*const pointee` or `*mut pointee` (all four share
+one width), or `.none` when no such local carries a layout.
+-/
+@[reducible]
+def declPtrToPointeeByteSizeProto?
+    (layouts : LayoutTable)
+    (pointee : RigidTy) :
+    List LocalDecl → Option Nat
+  | .nil => .none
+  | decl :: rest =>
+    let hit : Option Nat :=
+      match decl.ty.kind with
+      | .ref _ p | .rawPtr _ p =>
+        match rigidTyEq p pointee with
+        | true =>
+          match LayoutTable.lookup layouts decl.ty.layoutIdx with
+          | .some l => .some l.size.bytes
+          | .none => .none
+        | false => .none
+      | _ => .none
+    match hit with
+    | .some sz => .some sz
+    | .none => declPtrToPointeeByteSizeProto? layouts pointee rest
+
+/--
+Whether the STRUCTURAL size (and, when `withAlign = true`, alignment) that
+`intrinsicRigidTyByteSize` / `rigidTyByteSize` / `intrinsicRigidTyAlign` report
+for `ty` can be trusted.
+
+Those helpers size and align scalars and pointers from the `RigidTy`
+constructor alone, for a 64-bit target: `usize`, `isize`, `fn` pointers and
+thin pointers are 8 bytes, `u64` / `f64` are 8-aligned, and a pointer is wide
+(16 bytes) only when its pointee is literally `[T]`, `str` or `dyn Trait`
+(`Bytes.rigidTyKindByteSize`, `Places.intrinsicRigidTyKindAlign`). Three
+situations make that answer wrong, and a wrong `size_of::<T>()` or
+`align_of::<T>()` silently corrupts every intrinsic that scales by it (`copy`,
+`raw_eq`, `typed_swap_nonoverlapping`, `ptr_offset_from*`) or checks alignment
+against it:
+
+1. **Custom dynamically sized types.** `&Dst` / `*const Dst` for a struct with
+   an unsized tail (`struct Packet { hdr: Header, body: [u8] }`, `Path`, `CStr`)
+   is a 16-byte wide pointer, but `RigidTy.adt` does not record the tail. Such
+   a pointer is accepted only when a local of that pointer type confirms the
+   thin width through its compiler-computed layout
+   (`declPtrToPointeeByteSizeProto?`); a recorded wide layout, or no evidence
+   at all, is undetermined.
+2. **Non-64-bit pointer width.** When `layoutPointerBytes layouts != 8`, every
+   target-width scalar (`usize`, `isize`, any pointer) is undetermined.
+3. **Target-dependent primitive alignment** (`withAlign = true` only). Off
+   64-bit targets the alignment of `u64` / `i64` / `f64` / `u128` / `i128` /
+   `f128` varies (4 on `i686`, 8 on 32-bit ARM), and on 16-bit targets even
+   `u16` / `u32` may be 1- or 2-aligned. With 4-byte pointers only 1-, 2- and
+   4-byte primitives are trusted; with any other non-64-bit width only 1-byte
+   ones are.
+
+ADTs and closures are always determined: their size, alignment and fields come
+from their own `LayoutTable` entry. Callers fail closed with
+`MirStepNode.unsupported` when this returns `false`.
+
+Reference (The Rust Reference 1.98.0, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html#r-dynamic-sized.pointer-types>
+
+> "Pointer types to DSTs are sized but have twice the size of pointers to sized
+> types"
+
+Reference (The Rust Reference 1.98.0, "Type layout — Primitive data layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#r-layout.primitive.platform-specific-alignment>
+
+> "The alignment of primitives is platform-specific. In most cases, their
+> alignment is equal to their size, but it may be less. In particular, `i128`
+> and `u128` are often aligned to 4 or 8 bytes even though their size is 16,
+> and on many 32-bit platforms, `i64`, `u64`, and `f64` are only aligned to 4
+> bytes, not 8."
+-/
+@[reducible]
+def rigidTyLayoutDeterminedProto
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (withAlign : Bool) :
+    Nat → RigidTy → Bool
+  | .zero, _ => false
+  | .succ fuel', ty =>
+    let ptrBytes := layoutPointerBytes layouts
+    let is64 := Nat.beq ptrBytes 8
+    match ty with
+    | .uint .usize | .int .isize | .fnPtr _ _ _ _ => is64
+    | .ref _ pointee | .rawPtr _ pointee =>
+      match is64 with
+      | false => false
+      | true =>
+        match pointee with
+        | .slice _ | .str | .dynamic _ => true
+        | _ =>
+          match ptrPointeeMayBeUnsizedProto pointee with
+          | false => true
+          | true =>
+            match declPtrToPointeeByteSizeProto? layouts pointee localDecls with
+            | .some sz => Nat.beq sz 8
+            | .none => false
+    | .uint .u64 | .int .i64 | .float .f64
+    | .uint .u128 | .int .i128 | .float .f128 =>
+      Bool.or (Bool.not withAlign) is64
+    | .uint .u16 | .int .i16 | .uint .u32 | .int .i32
+    | .char | .float .f16 | .float .f32 =>
+      Bool.or (Bool.not withAlign) (Bool.or is64 (Nat.beq ptrBytes 4))
+    | .array elem _ => rigidTyLayoutDeterminedProto localDecls layouts withAlign fuel' elem
+    | .tuple ks =>
+      allListTrueProto (rigidTyLayoutDeterminedProto localDecls layouts withAlign fuel') ks
+    | _ => true
 
 /--
 Test whether `ty` is a `FieldsShape.union` ADT in `localDecls` / `layouts`.
@@ -808,9 +990,15 @@ def resolveLiveMemEndpointProto
             let rootSizeOpt : Option Nat :=
               match rootTyOpt with
               | .some rTy =>
-                match rigidTyByteSize targetLayouts rTy with
-                | .some sz => .some sz
-                | .none => intrinsicRigidTyByteSize targetDecls targetLayouts rTy.kind
+                -- A root whose structural size cannot be trusted (it holds an
+                -- unconfirmed custom-DST pointer, or a target-width scalar on a
+                -- non-64-bit table) has no known extent: fail closed.
+                match rigidTyLayoutDeterminedProto targetDecls targetLayouts false 8 rTy.kind with
+                | false => .none
+                | true =>
+                  match rigidTyByteSize targetLayouts rTy with
+                  | .some sz => .some sz
+                  | .none => intrinsicRigidTyByteSize targetDecls targetLayouts rTy.kind
               | .none =>
                 -- Untyped caller referent: only a leaf or array-shaped buffer
                 -- has an exact byte size (an untyped padded struct does not).
@@ -1894,6 +2082,11 @@ def evalCopyMemoryProto
       match resolveMemIntrinsicPointeeTyProto? target bodyLocalDecls bodyLayouts argOps with
       | .none => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
       | .some elemTy =>
+        -- `size_of::<T>()` must be trustworthy (no unconfirmed custom-DST pointer,
+        -- no target-width scalar on a non-64-bit table): fail closed otherwise.
+        match rigidTyLayoutDeterminedProto bodyLocalDecls bodyLayouts true 8 elemTy with
+        | false => MirStepNode.unsupported
+        | true =>
         match
           intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts elemTy,
           intrinsicRigidTyAlign bodyLocalDecls bodyLayouts elemTy
@@ -2011,6 +2204,9 @@ def evalCopyMemoryProto
                                             globals := globals' })
         | _, _ => intrinsicUnresolvedLayoutStep elemTy
     | _, _, _ => MirStepNode.fail .ub
+  -- A `usize` count that carries pointer provenance has no modeled integer
+  -- value (allocations have no concrete base address): fail closed.
+  | _ :: _ :: .ptr _ _ :: .nil => MirStepNode.unsupported
   | _ => MirStepNode.fail .ub
 
 /--
@@ -2355,6 +2551,8 @@ def evalCompareBytesProto
                                       bodyLocalDecls
                                       bodyLayouts
     | _, _, _ => MirStepNode.fail .ub
+  -- A `usize` length that carries pointer provenance has no modeled integer value.
+  | _ :: _ :: .ptr _ _ :: .nil => MirStepNode.unsupported
   | _ => MirStepNode.fail .ub
 
 /-! ## Section 9: Intrinsic 3 — `core::intrinsics::raw_eq` -/
@@ -2424,7 +2622,11 @@ def evalRawEqProto
     match resolveMemIntrinsicPointeeTyProto? target bodyLocalDecls bodyLayouts argOps with
     | .none => MirStepNode.unsupported
     | .some elemTy =>
-      match isUnsizedRigidTy 8 elemTy with
+      match
+        Bool.or
+          (isUnsizedRigidTy 8 elemTy)
+          (Bool.not (rigidTyLayoutDeterminedProto bodyLocalDecls bodyLayouts true 8 elemTy))
+      with
       | true => MirStepNode.unsupported
       | false =>
         match
@@ -2457,7 +2659,9 @@ def evalRawEqProto
               | .ub => MirStepNode.fail .ub
               | .unsupported => MirStepNode.unsupported
               | .ok () =>
-                -- Uninhabited `&T` is always invalid UB regardless of `size_of::<T>()`.
+                -- A `&T` argument whose pointee LAYOUT is uninhabited is an invalid
+                -- reference regardless of `size_of::<T>()`. (`T = &!` is layout-inhabited:
+                -- its `&&!` arguments are valid and their pointer bytes are compared.)
                 match isUninhabitedRigidTyProto bodyLocalDecls bodyLayouts 8 elemTy, isZero with
                 | true, _ => MirStepNode.fail .ub
                 | false, true =>
@@ -2578,6 +2782,72 @@ def combineTypedValidityProto :
   | .valid, .valid => .valid
 
 /--
+Byte width of an integer `RigidTy` on the target described by `layouts`:
+`usize` / `isize` take the table's pointer width (`layoutPointerBytes`), every
+other integer its fixed width (`intCastTargetBytes`, which hard-codes 8 bytes
+for `usize` / `isize`).
+-/
+@[reducible]
+def intTyTargetBytesProto (layouts : LayoutTable) (ty : RigidTy) : Option Nat :=
+  match ty with
+  | .uint .usize | .int .isize => .some (layoutPointerBytes layouts)
+  | _ => intCastTargetBytes ty
+
+/--
+Whether a non-pointer scalar bit pattern `bits`, already inside `validRange`,
+may still be an invalid `char`: `pk` is `Int(I32, false)`, `validRange` is a
+non-wrapping subrange of `0..=0x10FFFF`, and `bits` is a surrogate code point
+(`0xD800..=0xDFFF`).
+
+A `LayoutTable` entry records a scalar's valid range but not its Rust type. The
+layout of `char` admits surrogates, which validation rejects BY TYPE; a pattern
+type over `u32` with the same range accepts them (`CodePointInner`), and a
+pattern type over `char` (`NonZeroCharInner`) rejects them again. The three are
+indistinguishable by layout, so layout-directed validation of an ADT field
+fails closed with `.unsupported` on exactly these bit patterns instead of
+accepting a surrogate as a valid `char` (missed UB). `char`s reached through a
+`RigidTy` (`.char`, arrays, tuples) are checked exactly by `isValidCharCode`.
+
+Reference (`compiler/rustc_ty_utils/src/layout.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_ty_utils/src/layout.rs#L391-L397>
+
+> "ty::Char => tcx.mk_layout(LayoutData::scalar(
+>     cx,
+>     Scalar::Initialized {
+>         value: Int(I32, false),
+>         valid_range: WrappingRange { start: 0, end: 0x10FFFF },
+>     },
+> )),"
+
+Reference (`compiler/rustc_const_eval/src/interpret/validity.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_const_eval/src/interpret/validity.rs#L896-L899>
+
+> "ty::Char => {
+>     let scalar = self.read_scalar(value, ExpectedKind::Char)?;
+>     try_validation!(
+>         scalar.to_char(),"
+
+Reference (`library/core/src/num/niche_types.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`; `NonZeroCharInner` is the `char`
+pattern type declared at line 138 of the same file):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/num/niche_types.rs#L159>
+
+> "pub struct CodePointInner(u32 is 0..=0x10ffff);"
+-/
+@[reducible]
+def charShapedSurrogateProto (pk : PrimitiveKind) (validRange : WrappingRange) (bits : Nat) : Bool :=
+  match pk with
+  | .int intBits signed =>
+    Bool.and (Nat.beq intBits 32)
+      (Bool.and (Bool.not signed)
+        (Bool.and (Nat.ble validRange.start validRange.end_)
+          (Bool.and (Nat.ble validRange.end_ 1114111)
+            (Bool.and (Nat.ble 55296 bits) (Nat.ble bits 57343)))))
+  | _ => false
+
+/--
 Validate a raw `AbstractByte` slice against a `ScalarLayout` descriptor
 (enforcing initialization and `validRange` for `.initialized`, while allowing
 arbitrary bytes for `.union`).
@@ -2588,6 +2858,10 @@ non-pointer type strips the provenance and leaves the absolute address bits
 (`Miri.Interpreter.Intrinsics.typedSwap` validates with provenance reset,
 `Intrinsics.lean:209-211`), and `MirSemantics` allocations have no concrete
 base address from which to compute those bits or to range-check them.
+
+An in-range surrogate code point in a `char`-shaped scalar likewise fails
+closed with `.unsupported` (`charShapedSurrogateProto`): the layout cannot tell
+`char` (invalid) from a `u32` pattern type with the same range (valid).
 -/
 @[reducible]
 def validateScalarLayoutBytesProto
@@ -2626,7 +2900,10 @@ def validateScalarLayoutBytesProto
             | .some _ => .unsupported
             | .none =>
               match wrappingRangeContains validRange sv.bits with
-              | true => .valid
+              | true =>
+                match charShapedSurrogateProto pk validRange sv.bits with
+                | true => .unsupported
+                | false => .valid
               | false => .ub
 
 /--
@@ -2982,11 +3259,11 @@ def validateTypedBytesWithMemProto (mem : Memory) :
         | .some (_, .some _) => .unsupported
         | .none => .ub
     | .uint w =>
-      match intCastTargetBytes (.uint w) with
+      match intTyTargetBytesProto layouts (.uint w) with
       | .some sz => validateInitNoProvScalarBytesProto sz bytes
       | .none => .unsupported
     | .int w =>
-      match intCastTargetBytes (.int w) with
+      match intTyTargetBytesProto layouts (.int w) with
       | .some sz => validateInitNoProvScalarBytesProto sz bytes
       | .none => .unsupported
     | .float fk =>
@@ -3026,7 +3303,7 @@ def validateTypedBytesWithMemProto (mem : Memory) :
       let ptrBytes := layoutPointerBytes layouts
       match isWide with
       | false =>
-        match isUninhabitedRigidTyProto localDecls layouts 8 pointee with
+        match referenceToUninhabitedProto localDecls layouts pointee with
         | true => .ub
         | false =>
           match Nat.beq (length bytes) ptrBytes with
@@ -3292,18 +3569,23 @@ def orOffsetFieldMasksWith
   | _, _, _ => .none
 
 /--
-Exact data-byte mask of `LayoutTable` entry `lIdx`, 1-to-1 with
-`Miri/Interpreter/ValidityVisitor.lean:245-270` (`unionRanges`):
-a byte is `true` iff it is a non-padding data byte of `lIdx` (or, for a union,
-a data byte of AT LEAST ONE field).
+Exact data-byte mask of `LayoutTable` entry `lIdx`, mirroring
+`Miri/Interpreter/ValidityVisitor.lean:245-270` (`unionRanges`), including its
+scalar-array fast path (an array whose element has a `Scalar` ABI contributes
+`[base, base + elemSize * count)` as data): a byte is `true` iff it is a
+non-padding data byte of `lIdx` (or, for a union, a data byte of AT LEAST ONE
+field). The one structural departure is that multi-variant layouts fail closed
+instead of visiting every variant.
 
 Soundness invariants:
 - `.union fieldCount`: strictly requires `fieldLayouts` (`length = fieldCount > 0`)
   to compute the exact union of its fields' data bytes; without `fieldLayouts`,
-  ONLY an `.initialized` scalar spanning the entire union is accepted — NEVER
-  `.scalar (.union _)` (because `rustc` assigns `Scalar::Union` to padded
-  unions like `#[repr(C, align(4))] union U { a: (), b: (u8, u16) }` whose
-  byte `1` is common padding!).
+  ONLY an `.initialized` scalar spanning the entire union is accepted, never a
+  `.scalar (.union _)` ABI. `rustc` gives a union a `Scalar` ABI only when every
+  non-ZST field has that same ABI and alignment (so no byte is common padding),
+  but a `LayoutTable` entry is not checked against that invariant, and
+  `#[repr(C)]` unions never get it (`inhibits_union_abi_opt`): the field
+  layouts are the only trustworthy source of the data range.
 - `.arbitrary` without `fieldLayouts`: strictly requires `.initialized` scalar(s)
   and verifies `scalarPairOffsetsValidProto` on `.scalarPair`.
 - Individual uninhabited fields inside an inhabited union (such as
@@ -3388,11 +3670,22 @@ def layoutDataMaskProto : Nat → LayoutTable → Nat → Option (List Bool)
                 with
                 | false => .none
                 | true =>
-                  match layoutDataMaskProto fuel' layouts elemIdx with
-                  | .none => .none
-                  | .some elemMask =>
-                    let stridePad := emptyDataMaskProto (Nat.sub stride.bytes elemFl.size.bytes)
-                    .some (repeatMaskProto (appendMaskProto elemMask stridePad) count)
+                  match elemFl.backendRepr with
+                  | .scalar _ =>
+                    -- `unionRanges` scalar-array fast path (`ValidityVisitor.lean:256-258`):
+                    -- `[base, base + elemSize * count)` is data, whatever the element's
+                    -- own fields.
+                    let dataLen := Nat.mul elemFl.size.bytes count
+                    .some
+                      (appendMaskProto
+                        (replicateBoolProto true dataLen)
+                        (emptyDataMaskProto (Nat.sub l.size.bytes dataLen)))
+                  | _ =>
+                    match layoutDataMaskProto fuel' layouts elemIdx with
+                    | .none => .none
+                    | .some elemMask =>
+                      let stridePad := emptyDataMaskProto (Nat.sub stride.bytes elemFl.size.bytes)
+                      .some (repeatMaskProto (appendMaskProto elemMask stridePad) count)
             | _ => .none
       | .multiple _ _ _ => .none
 
@@ -3583,7 +3876,11 @@ def evalTypedSwapNonOverlappingProto
     match resolveMemIntrinsicPointeeTyProto? target bodyLocalDecls bodyLayouts argOps with
     | .none => MirStepNode.unsupported
     | .some elemTy =>
-      match isUnsizedRigidTy 8 elemTy with
+      match
+        Bool.or
+          (isUnsizedRigidTy 8 elemTy)
+          (Bool.not (rigidTyLayoutDeterminedProto bodyLocalDecls bodyLayouts true 8 elemTy))
+      with
       | true => MirStepNode.unsupported
       | false =>
         match
@@ -4105,6 +4402,10 @@ def evalPtrOffsetFromProto
       match resolveMemIntrinsicPointeeTyProto? target bodyLocalDecls bodyLayouts argOps with
       | .none => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
       | .some elemTy =>
+        -- The quotient divides by `size_of::<T>()`, which must be trustworthy.
+        match rigidTyLayoutDeterminedProto bodyLocalDecls bodyLayouts true 8 elemTy with
+        | false => MirStepNode.unsupported
+        | true =>
         match intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts elemTy with
         | .none => intrinsicUnresolvedLayoutStep elemTy
         | .some elemSize =>
@@ -4340,6 +4641,8 @@ def evalPtrMaskProto
         | .ok maskedVal =>
           writeIntrinsicReturnProto s locals' destination targetOpt maskedVal
             bodyLocalDecls bodyLayouts
+  -- A `usize` mask that carries pointer provenance has no modeled integer value.
+  | _ :: .ptr _ _ :: .nil => MirStepNode.unsupported
   | _ => MirStepNode.fail .ub
 
 /-! ## Section 13: Intrinsic 8 — `core::intrinsics::black_box` -/
@@ -4552,7 +4855,12 @@ def validateScalarLayoutValueProto
       | .uninit => .ub
       | .scalar sv =>
         match Bool.and (Nat.beq sv.sizeBytes sz) (wrappingRangeContains validRange sv.bits) with
-        | true => .valid
+        | true =>
+          -- In-range surrogate in a `char`-shaped scalar: `char` or a `u32`
+          -- pattern type, undecidable from the layout (fail closed).
+          match charShapedSurrogateProto pk validRange sv.bits with
+          | true => .unsupported
+          | false => .valid
         | false => .ub
       | .ptr p pSz =>
         match Nat.beq pSz sz with
@@ -4716,7 +5024,7 @@ def validateValueForRigidTyProto (mem : Memory) :
           | .ptr _ _ => .unsupported
           | _ => .ub
         | .uint w =>
-          match intCastTargetBytes (.uint w) with
+          match intTyTargetBytesProto layouts (.uint w) with
           | .none => .unsupported
           | .some sz =>
             match v with
@@ -4727,7 +5035,7 @@ def validateValueForRigidTyProto (mem : Memory) :
             | .ptr _ _ => .unsupported
             | _ => .ub
         | .int w =>
-          match intCastTargetBytes (.int w) with
+          match intTyTargetBytesProto layouts (.int w) with
           | .none => .unsupported
           | .some sz =>
             match v with
@@ -4761,7 +5069,13 @@ def validateValueForRigidTyProto (mem : Memory) :
           | false =>
             match decodeThinPtrArgProto? ptrBytes v with
             | .some _ => .valid
-            | .none => .ub
+            | .none =>
+              -- A wide `[data, metadata]` value at a pointee that may be a custom
+              -- DST (`*const Packet`): its metadata rules depend on the unsized
+              -- tail, which `RigidTy.adt` does not record (fail closed).
+              match ptrPointeeMayBeUnsizedProto pointee, v with
+              | true, .aggregate 0 (_ :: _ :: .nil) => .unsupported
+              | _, _ => .ub
           | true =>
             match v with
             | .aggregate 0 (dVal :: mVal :: .nil) =>
@@ -4776,12 +5090,20 @@ def validateValueForRigidTyProto (mem : Memory) :
             | _ => false
           match isWide with
           | false =>
-            match decodeThinPtrArgProto? ptrBytes v with
-            | .some pArg =>
-              match isNullPtrArgProto mem pArg with
-              | true => .ub
-              | false => .valid
-            | .none => .ub
+            match referenceToUninhabitedProto localDecls layouts pointee with
+            | true => .ub
+            | false =>
+              match decodeThinPtrArgProto? ptrBytes v with
+              | .some pArg =>
+                match isNullPtrArgProto mem pArg with
+                | true => .ub
+                | false => .valid
+              | .none =>
+                -- Wide `[data, metadata]` reference to a possible custom DST
+                -- (`&Path`, `&Packet`): fail closed instead of reporting UB.
+                match ptrPointeeMayBeUnsizedProto pointee, v with
+                | true, .aggregate 0 (_ :: _ :: .nil) => .unsupported
+                | _, _ => .ub
           | true =>
             match v with
             | .aggregate 0 (dVal :: mVal :: .nil) =>
@@ -6294,6 +6616,65 @@ theorem scalarPair_bOffset_lt_sum_and_separates_trailing_zst
   have hModLt : (sz0 + a1 - 1) % a1 < a1 := Nat.mod_lt _ hA1Pos
   have hMulComm : ((sz0 + a1 - 1) / a1) * a1 = a1 * ((sz0 + a1 - 1) / a1) := Nat.mul_comm _ _
   omega
+
+/--
+**Pointers Are Never Layout-Uninhabited**: for EVERY pointee, mutability, local
+declaration table, layout table and fuel, `isUninhabitedRigidTyProto` answers
+`false` on a reference or raw pointer type. In particular `T = &!` never makes
+`raw_eq::<T>` or `typed_swap_nonoverlapping::<T>` fail by the uninhabited-`T`
+check: an invalid `&!` VALUE is rejected only where a reference value is
+validated (`referenceToUninhabitedProto`).
+-/
+theorem isUninhabitedRigidTyProto_pointer_false
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (fuel : Nat)
+    (m : Mutability) (pointee : RigidTy) :
+    isUninhabitedRigidTyProto localDecls layouts fuel (.ref m pointee) = false ∧
+    isUninhabitedRigidTyProto localDecls layouts fuel (.rawPtr m pointee) = false := by
+  cases fuel <;> exact ⟨rfl, rfl⟩
+
+/--
+**Surrogate Guard Soundness**: whenever `charShapedSurrogateProto` fires, the bit
+pattern is NOT a valid `char` (`isValidCharCode bits = false`), so the
+`.unsupported` it triggers only ever replaces an answer that would have accepted
+an invalid `char` — it never hides a valid one.
+-/
+theorem charShapedSurrogateProto_not_valid_char
+    (pk : PrimitiveKind) (validRange : WrappingRange) (bits : Nat)
+    (h : charShapedSurrogateProto pk validRange bits = true) :
+    isValidCharCode bits = false := by
+  cases pk with
+  | int intBits signed =>
+    unfold charShapedSurrogateProto at h
+    simp only [Bool.and_eq_true, Nat.ble_eq] at h
+    obtain ⟨_, _, _, _, hLo, hHi⟩ := h
+    unfold isValidCharCode
+    have h1 : Nat.ble 55296 bits = true := Nat.ble_eq.mpr hLo
+    have h2 : Nat.ble 57344 bits = false := by
+      cases h3 : Nat.ble 57344 bits with
+      | false => rfl
+      | true => have := Nat.ble_eq.mp h3; omega
+    rw [h1, h2]
+    rfl
+  | float _ => cases h
+  | pointer _ => cases h
+
+/--
+**Target-Width Fail-Closed Theorem**: on a layout table whose pointer width is not
+8 bytes, `rigidTyLayoutDeterminedProto` rejects EVERY reference, raw pointer,
+`usize` and `isize` type (for every fuel above zero, alignment mode and
+pointee), so no intrinsic ever scales by the 64-bit structural pointer size on
+such a target.
+-/
+theorem rigidTyLayoutDeterminedProto_non64_pointer_false
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (withAlign : Bool) (fuel : Nat)
+    (m : Mutability) (pointee : RigidTy)
+    (hWidth : Nat.beq (layoutPointerBytes layouts) 8 = false) :
+    rigidTyLayoutDeterminedProto localDecls layouts withAlign (fuel + 1) (.ref m pointee) = false ∧
+    rigidTyLayoutDeterminedProto localDecls layouts withAlign (fuel + 1) (.rawPtr m pointee) = false ∧
+    rigidTyLayoutDeterminedProto localDecls layouts withAlign (fuel + 1) (.uint .usize) = false ∧
+    rigidTyLayoutDeterminedProto localDecls layouts withAlign (fuel + 1) (.int .isize) = false := by
+  refine ⟨?_, ?_, ?_, ?_⟩ <;>
+    (unfold rigidTyLayoutDeterminedProto; dsimp only; rw [hWidth])
 
 /--
 **`black_box` Preservation Theorem**:
