@@ -1224,10 +1224,14 @@ run_cmd Elab.Command.liftTermElabM do
   Meta.instanceExtension.add ent AttributeKind.local
 theorem a23ResolvesWeak : (inferInstance : ItemSpec "ep2::a23").pre [] = False := rfl
 
--- A2-6: forged `Meta.defaultInstanceExtension` entry for `ItemSpec`.
+-- A2-6 + A3-2: forged `Meta.defaultInstanceExtension` entries (both under `ItemSpec` and under an
+-- arbitrary class key in live `MetaM`).
 def a26DefUniv [c : A21aCarrier] : c.ty := c.inst
+def a32AliasDefUniv [c : A21aCarrier] : c.ty := c.inst
 run_cmd Elab.Command.liftCoreM do
-  modifyEnv fun env => Meta.defaultInstanceExtension.addEntry env { className := ``ItemSpec, instanceName := ``a26DefUniv, priority := 1000 }
+  modifyEnv fun env =>
+    let env := Meta.defaultInstanceExtension.addEntry env { className := ``ItemSpec, instanceName := ``a26DefUniv, priority := 1000 }
+    Meta.defaultInstanceExtension.addEntry env { className := `A32AliasClass, instanceName := ``a32AliasDefUniv, priority := 1000 }
 
 #eval show MetaM Unit from do
   let env ← getEnv
@@ -1235,7 +1239,7 @@ run_cmd Elab.Command.liftCoreM do
   let ecProj := instanceEntryCandidates env ctx.toolchainProv `Trusted.VerificationResult.ItemSpec "ep2::a21a" 256
   let ecRec := instanceEntryCandidates env ctx.toolchainProv `Trusted.VerificationResult.ItemSpec "ep2::a21b" 256
   let ecLoc := instanceEntryCandidates env ctx.toolchainProv `Trusted.VerificationResult.ItemSpec "ep2::a23" 256
-  IO.println s!"A2_1a_proj_forged_scan: listed={ecProj.contains ``a21aProjUniv} defInst={ecProj.contains ``a26DefUniv}"
+  IO.println s!"A2_1a_proj_forged_scan: listed={ecProj.contains ``a21aProjUniv} defInst={ecProj.contains ``a26DefUniv} aliasDefInst={ecProj.contains ``a32AliasDefUniv}"
   IO.println s!"A2_1b_rec_forged_scan: listed={ecRec.contains ``a21bRecUniv}"
   IO.println s!"A2_3_local_stateStack_scan: listed={ecLoc.contains ``a23LocUniv}"
   let gp ← auditItemSpecStrengthBySynth .item "ep2::a21a" ``a21aCert (useSynthInstance := false)
@@ -1427,7 +1431,7 @@ A1_4_string_rec_literal: pure=true meta=true
 B2_1_forged_instance_entry_scan: listed=true strongListed=true
 B2_1_forged_instance_entry_gate_no_synth: #[specInstanceAmbiguous] names=true
 B2_1_forged_instance_entry_gate_synth: #[specInstanceAmbiguous] names=true
-A2_1a_proj_forged_scan: listed=true defInst=true
+A2_1a_proj_forged_scan: listed=true defInst=true aliasDefInst=true
 A2_1b_rec_forged_scan: listed=true
 A2_3_local_stateStack_scan: listed=true
 A2_1a_proj_forged_gate: #[specInstanceAmbiguous] names=true

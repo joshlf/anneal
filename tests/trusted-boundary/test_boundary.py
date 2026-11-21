@@ -1686,14 +1686,15 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         # `A4-7`, `Classical.choice` certificate rejection, `--fast` cache sensitivity, and the
         # Episode 2 `B1` findings: theorem-headed major premises, kernel-native evaluators executing
         # audited code inside the auditor, and specification-library provenance).
-        mir_stub = prelude_init + (
+        mir_stub = (
+            "module\nprelude\npublic import Init\npublic section\n"
             "namespace Trusted.Rustc.V2026_06_01.MirSemantics\n"
             "abbrev Value := Nat\n"
             "abbrev Memory := Nat\n"
             "abbrev ExternalCallHandler := Nat → Nat\n"
             "end Trusted.Rustc.V2026_06_01.MirSemantics\n")
         verif_stub = (
-            "prelude\nimport Init\nimport Trusted.Rustc.V2026_06_01.MirSemantics\n"
+            "module\nprelude\npublic import Init\npublic import Trusted.Rustc.V2026_06_01.MirSemantics\npublic section\n"
             "namespace Trusted.VerificationResult\n"
             "open Trusted.Rustc.V2026_06_01.MirSemantics\n"
             "structure Claim where\n  pre : List Value → Prop\n  post : List Value → Value → Prop\n"
@@ -1712,7 +1713,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "  pre : List Value → Memory → Prop\n  post : List Value → Memory → Value → Memory → Prop\n"
             "end Trusted.VerificationResult\n")
         spec_lib_stub = (
-            "prelude\nimport Init\nimport Trusted.VerificationResult\n"
+            "module\nprelude\npublic import Init\npublic import Trusted.VerificationResult\npublic section\n"
             "namespace Anneal.OleanSpecStrengthAuditor\n"
             "open Trusted.Rustc.V2026_06_01.MirSemantics\n"
             "inductive MutantCategory where\n"
@@ -1729,7 +1730,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "  mutantOutput : β\n  mutantRejected : ¬ ens input mutantOutput\n"
             "structure MultiMutantSpecCert {α : Type u} {β : Type v} (req : α → Prop) (ens : α → β → Prop) where\n"
             "  kills : List (NamedMutantKill req ens)\n  nonEmpty : kills ≠ []\n"
-            "def MultiMutantSpecCert.coversCategory {α : Type u} {β : Type v} {req : α → Prop} {ens : α → β → Prop}\n"
+            "@[expose] def MultiMutantSpecCert.coversCategory {α : Type u} {β : Type v} {req : α → Prop} {ens : α → β → Prop}\n"
             "    (c : MultiMutantSpecCert req ens) (cat : MutantCategory) : Bool :=\n"
             "  c.kills.any (fun k => k.category == cat)\n"
             "structure DeterministicSpecCert {α : Type u} {β : Type v} (req : α → Prop) (ens : α → β → Prop) where\n"
@@ -1743,8 +1744,8 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "  output₁ : β\n  output₂ : β\n  accepted₁ : ens input₁ output₁\n"
             "  accepted₂ : ens input₂ output₂\n"
             "  nonInterchangeable : ¬ ens input₁ output₂ ∨ ¬ ens input₂ output₁\n"
-            "def uncurryPre (pre : List Value → Memory → Prop) : (List Value × Memory) → Prop := fun p => pre p.1 p.2\n"
-            "def uncurryPost (post : List Value → Memory → Value → Memory → Prop) :\n"
+            "@[expose] def uncurryPre (pre : List Value → Memory → Prop) : (List Value × Memory) → Prop := fun p => pre p.1 p.2\n"
+            "@[expose] def uncurryPost (post : List Value → Memory → Value → Memory → Prop) :\n"
             "    (List Value × Memory) → (Value × Memory) → Prop := fun p q => post p.1 p.2 q.1 q.2\n"
             "structure ModularSpecStrengthCert (envA : ExternalCallHandler → Prop)\n"
             "    (pre : List Value → Memory → Prop) (post : List Value → Memory → Value → Memory → Prop) where\n"
@@ -1752,7 +1753,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "structure ModularMultiMutantSpecCert (envA : ExternalCallHandler → Prop)\n"
             "    (pre : List Value → Memory → Prop) (post : List Value → Memory → Value → Memory → Prop) where\n"
             "  envNonVacuous : ∃ h, envA h\n  specCert : MultiMutantSpecCert (uncurryPre pre) (uncurryPost post)\n"
-            "def ModularMultiMutantSpecCert.coversCategory {envA pre post}\n"
+            "@[expose] def ModularMultiMutantSpecCert.coversCategory {envA pre post}\n"
             "    (c : ModularMultiMutantSpecCert envA pre post) (cat : MutantCategory) : Bool :=\n"
             "  c.specCert.coversCategory cat\n"
             "structure ModularDeterministicSpecCert (envA : ExternalCallHandler → Prop)\n"
@@ -1762,9 +1763,9 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "    (pre : List Value → Memory → Prop) (post : List Value → Memory → Value → Memory → Prop) where\n"
             "  envNonVacuous : ∃ h, envA h\n  specCert : InputSensitiveSpecCert (uncurryPre pre) (uncurryPost post)\n"
             "end Anneal.OleanSpecStrengthAuditor\n")
-        olean_module(ol2, "Trusted.Rustc.V2026_06_01.MirSemantics", mir_stub, ["Init"])
-        olean_module(ol2, "Trusted.VerificationResult", verif_stub, ["Init", "Trusted.Rustc.V2026_06_01.MirSemantics"])
-        olean_module(ol2, "Anneal.OleanSpecStrengthAuditor", spec_lib_stub, ["Init", "Trusted.VerificationResult"])
+        olean_module(ol2, "Trusted.Rustc.V2026_06_01.MirSemantics", mir_stub, ["Init"], module_file=True)
+        olean_module(ol2, "Trusted.VerificationResult", verif_stub, ["Init", "Trusted.Rustc.V2026_06_01.MirSemantics"], module_file=True)
+        olean_module(ol2, "Anneal.OleanSpecStrengthAuditor", spec_lib_stub, ["Init", "Trusted.VerificationResult"], module_file=True)
         base_spec_mods = ["Trusted.Rustc.V2026_06_01.MirSemantics", "Trusted.VerificationResult",
                           "Anneal.OleanSpecStrengthAuditor"]
 
@@ -1791,7 +1792,9 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "    { name := \"k1\", category := .wrongReturn, input := [0], inputValid := Or.inl rfl,\n"
             "      referenceOutput := 10, referenceAccepted := rfl, mutantOutput := 0, mutantRejected := (by dsimp [epPost]; decide) },\n"
             "    { name := \"k2\", category := .offByOneScalar, input := [0], inputValid := Or.inl rfl,\n"
-            "      referenceOutput := 10, referenceAccepted := rfl, mutantOutput := 11, mutantRejected := (by dsimp [epPost]; decide) }\n"
+            "      referenceOutput := 10, referenceAccepted := rfl, mutantOutput := 11, mutantRejected := (by dsimp [epPost]; decide) },\n"
+            "    { name := \"k3\", category := .custom \"ep2_tag\", input := [0], inputValid := Or.inl rfl,\n"
+            "      referenceOutput := 10, referenceAccepted := rfl, mutantOutput := 99, mutantRejected := (by dsimp [epPost]; decide) }\n"
             "  ],\n  nonEmpty := (by intro h; nomatch h) }\n"
             "def epDetCert : DeterministicSpecCert epPre epPost := {\n"
             "  witnessInput := [0], witnessValid := Or.inl rfl, referenceOutput := 10, referenceAccepted := rfl,\n"
@@ -1818,6 +1821,8 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "    output₁ := (10, 0), output₂ := (11, 0), accepted₁ := ⟨rfl, rfl⟩, accepted₂ := ⟨rfl, rfl⟩,\n"
             "    nonInterchangeable := Or.inl (by intro ⟨h, _⟩; dsimp [epModClaim, epPost] at h; exact absurd h (by decide)) } }\n"
             "instance epCleanItem : ItemSpec \"ep2::clean\" where pre := epPre; post := epPost\n"
+            "instance epCleanStItem : StatefulItemSpec \"ep2::clean_st\" where pre := epStClaim.pre; post := epStClaim.post\n"
+            "instance epCleanTotItem : TotalItemSpec \"ep2::clean_tot\" where pre := epTotClaim.pre; post := epTotClaim.post\n"
             "instance epCleanModItem : ModularItemSpec \"ep2::clean_mod\" where\n"
             "  envAssumed := epRely; pre := epModClaim.pre; post := epModClaim.post\n"
             "-- V8/V9/non-theorem/wrong-rely/classical canaries in the same module (audited per-check):\n"
@@ -1841,7 +1846,12 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             {"kind": "claim", "claim": "epTotClaim_ok", "cert": "epStMultiCert", "requiredCategories": ["wrongReturn"]},
             {"kind": "claim", "claim": "epModClaim_ok", "cert": "epModMultiCert", "requiredCategories": ["wrongReturn"]},
             {"kind": "claim", "claim": "epModClaim_ok", "cert": "epModInSensCert", "requireInputSensitive": True},
-            {"kind": "itemSynth", "defId": "ep2::clean", "cert": "epMultiCert", "requiredCategories": ["wrongReturn"]},
+            {"kind": "itemSynth", "defId": "ep2::clean", "cert": "epMultiCert",
+             "requiredCategories": ["wrongReturn", "custom:ep2_tag"]},
+            {"kind": "statefulItemSynth", "defId": "ep2::clean_st", "cert": "epStMultiCert",
+             "requiredCategories": ["wrongReturn"]},
+            {"kind": "totalItemSynth", "defId": "ep2::clean_tot", "cert": "epStMultiCert",
+             "requiredCategories": ["wrongReturn"]},
             {"kind": "modularItemSynth", "defId": "ep2::clean_mod", "cert": "epModMultiCert",
              "requiredCategories": ["wrongReturn"]},
         ]
@@ -2036,7 +2046,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         # A2-5: `Lean.reduceBool` hidden ONLY inside a forged `Meta.instanceExtension` entry's
         # `ent.val` (no declaration in `data.constants` mentions `Lean.reduceBool`).
         olean_module(ol2, "OlEp2NativeInst", (
-            "prelude\nimport Init\nimport Lean\nimport OlEp2SpecClean\n"
+            "prelude\nimport Init\nimport Lean.Elab.Command\nimport OlEp2SpecClean\n"
             "open Lean Meta Trusted.VerificationResult\n"
             "def a25Flag : Bool := true\n"
             "run_cmd Elab.Command.liftTermElabM do\n"
@@ -2044,7 +2054,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "  let ent : InstanceEntry := { keys := keys, val := mkApp (mkConst ``Lean.reduceBool) (mkConst ``a25Flag), "
             "priority := 5000, globalName? := none, synthOrder := #[], attrKind := AttributeKind.global }\n"
             "  instanceExtension.add ent AttributeKind.global\n"),
-            ["Init", "Lean", "OlEp2SpecClean"])
+            ["Init", "Lean.Elab.Command", "OlEp2SpecClean"])
         olean_reject(ol2, base_spec_mods + ["OlEp2SpecClean", "OlEp2NativeInst"],
                      "[nativeDecideReached] Lean.reduceBool", "kernel-native evaluator",
                      toolchainRoots=["Init", "Std", "Lean"])
@@ -2056,7 +2066,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         olean_module(ol2, "OlEp2DupM1", "prelude\nimport Init\nimport OlEp2DupM0\n"
                      "theorem useDupM1 : a1f 0 = 0 := a1f.eq_1\n", ["Init", "OlEp2DupM0"])
         olean_module(ol2, "OlEp2DupM2", (
-            "prelude\nimport Init\nimport Lean\nimport OlEp2DupM0\nimport OlEp2NativeImpl\nopen Lean\n"
+            "prelude\nimport Init\nimport Lean.Elab.Command\nimport OlEp2DupM0\nimport OlEp2NativeImpl\nopen Lean\n"
             "run_cmd Elab.Command.liftCoreM do\n"
             "  let ty := mkApp3 (mkConst ``Eq [Level.one]) (mkConst ``Nat) (mkApp (mkConst ``a1f) (mkNatLit 0)) (mkNatLit 0)\n"
             "  let trig := mkApp (mkConst ``Lean.reduceBool) (mkConst ``nativeFlag)\n"
@@ -2064,7 +2074,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "  let pfTrue := mkApp2 (mkConst ``Eq.refl [Level.one]) (mkConst ``Bool) (mkConst ``Bool.true)\n"
             "  let val := Expr.letE `h eqTrue pfTrue (mkApp2 (mkConst ``Eq.refl [Level.one]) (mkConst ``Nat) (mkNatLit 0)) false\n"
             "  addDecl (.thmDecl { name := `a1f.eq_1, levelParams := [], type := ty, value := val })\n"),
-            ["Init", "Lean", "OlEp2DupM0", "OlEp2NativeImpl"])
+            ["Init", "Lean.Elab.Command", "OlEp2DupM0", "OlEp2NativeImpl"])
         assert native_marker.exists(), "A1-1 duplicate-reserved canary is not live (compiler did not run it)"
         native_marker.unlink()
         # Load M2 before M1 so M1's clean `a1f.eq_1` wins in `env.find?`.
@@ -2078,14 +2088,14 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         # auditing `OlEp2DupChoice` under `constructiveModules` with `allowClassicalChoice=True`
         # must still reject `Classical.choice`.
         olean_module(ol2, "OlEp2DupChoice", (
-            "prelude\nimport Init\nimport Lean\nimport OlEp2DupM0\nopen Lean\n"
+            "prelude\nimport Init\nimport Lean.Elab.Command\nimport OlEp2DupM0\nopen Lean\n"
             "run_cmd Elab.Command.liftCoreM do\n"
             "  let ty := mkApp3 (mkConst ``Eq [Level.one]) (mkConst ``Nat) (mkApp (mkConst ``a1f) (mkNatLit 0)) (mkNatLit 0)\n"
             "  let choiceVal := mkApp2 (mkConst ``Classical.choice [Level.one]) (mkConst ``Nat) "
             "(mkApp2 (mkConst ``Nonempty.intro [Level.one]) (mkConst ``Nat) (mkNatLit 0))\n"
             "  let val := Expr.letE `c (mkConst ``Nat) choiceVal (mkApp2 (mkConst ``Eq.refl [Level.one]) (mkConst ``Nat) (mkNatLit 0)) false\n"
             "  addDecl (.thmDecl { name := `a1f.eq_1, levelParams := [], type := ty, value := val })\n"),
-            ["Init", "Lean", "OlEp2DupM0"])
+            ["Init", "Lean.Elab.Command", "OlEp2DupM0"])
         olean_reject(ol2, ["OlEp2DupM0", "OlEp2DupChoice", "OlEp2DupM1"],
                      "[unapprovedAxiom]", "Classical.choice",
                      toolchainRoots=["Init", "Std", "Lean"],
@@ -2161,7 +2171,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         # resolve to weak specs (`rfl`-proved in `OlEp2ForgedUse`), and forged `defaultInstanceExtension`
         # entries (A2-6) can inject weak defaults; all must be caught as candidates.
         olean_module(ol2, "OlEp2ForgedInst", (
-            "prelude\nimport Init\nimport Lean\nimport OlEp2SpecClean\n"
+            "prelude\nimport Init\nimport Lean.Elab.Command\nimport OlEp2SpecClean\n"
             "open Lean Meta Trusted.VerificationResult\n"
             "instance fiStrong : ItemSpec \"ep2::fi\" where pre := epPre; post := epPost\n"
             "class FiHolder (T : Type 1) where val : T\n"
@@ -2195,7 +2205,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "instance fiOtherStrong : ItemSpec \"ep2::fi_other\" where pre := epPre; post := epPost\n"
             "def c_fi := epMultiCert\ndef c_fi_other := epMultiCert\n"
             "def c_a2proj := epMultiCert\ndef c_a2rec := epMultiCert\n"),
-            ["Init", "Lean", "OlEp2SpecClean"])
+            ["Init", "Lean.Elab.Command", "OlEp2SpecClean"])
         olean_module(ol2, "OlEp2ForgedUse", (
             "prelude\nimport Init\nimport OlEp2ForgedInst\n"
             "open Trusted.VerificationResult\n"
@@ -2223,7 +2233,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         # backed by a `.global` entry with either a spoofed `globalName?` on an unrelated `val`
         # (A2-2a) or wrong discrimination-tree keys (A2-2b) must still fail with `specStrengthCertMissing`.
         olean_module(ol2, "OlEp2ForgedKeys", (
-            "prelude\nimport Init\nimport Lean\nimport OlEp2SpecClean\n"
+            "prelude\nimport Init\nimport Lean.Elab.Command\nimport OlEp2SpecClean\n"
             "open Lean Meta Trusted.VerificationResult\n"
             "def a2Plain : ItemSpec \"ep2::a2plain\" := { pre := epPre, post := epPost }\n"
             "def a2Dummy : Nat := 0\n"
@@ -2234,7 +2244,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "globalName? := some ``a2Plain, synthOrder := #[], attrKind := AttributeKind.global } AttributeKind.global\n"
             "  instanceExtension.add { keys := natKeys, val := mkConst ``a2WrongKeys, priority := 1000, "
             "globalName? := some ``a2WrongKeys, synthOrder := #[], attrKind := AttributeKind.global } AttributeKind.global\n"),
-            ["Init", "Lean", "OlEp2SpecClean"])
+            ["Init", "Lean.Elab.Command", "OlEp2SpecClean"])
         olean_reject(
             ol2, base_spec_mods + ["OlEp2SpecClean", "OlEp2ForgedKeys"],
             "[specStrengthCertMissing] a2Plain",
@@ -2244,6 +2254,29 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                 {"kind": "itemSynth", "defId": "ep2::a2plain", "cert": "epMultiCert"},
                 {"kind": "itemSynth", "defId": "ep2::a2wkeys", "cert": "epMultiCert"},
             ])
+
+        # A3-1 (`module`-file unexported private instance vs exported `public instance`):
+        # In a `module` file, a non-`public` instance is withheld from `.olean` (`exportEntry?`
+        # exports `none` for `isPrivateName`), so `module` importers cannot synthesize it; standalone
+        # `itemSynth` must reject it with `specStrengthCertMissing` while accepting `public instance`.
+        olean_module(ol2, "OlEp2ModVis", (
+            "module\nprelude\npublic import Init\npublic import Anneal.OleanSpecStrengthAuditor\n"
+            "open Trusted.Rustc.V2026_06_01.MirSemantics Trusted.VerificationResult Anneal.OleanSpecStrengthAuditor\n"
+            "public section\n"
+            "@[expose] def mvPre (xs : List Value) : Prop := xs = [0]\n"
+            "@[expose] def mvPost (_ : List Value) (r : Value) : Prop := r = 10\n"
+            "@[expose] def mvCert : SpecStrengthCert mvPre mvPost := {\n"
+            "  witnessInput := [0], witnessValid := rfl, referenceOutput := 10, referenceAccepted := rfl,\n"
+            "  mutantOutput := 0, mutantRejected := (by dsimp [mvPost]; decide) }\n"
+            "public instance mvPubInst : ItemSpec \"ep2::mv_pub\" where pre := mvPre; post := mvPost\n"
+            "end\n"
+            "instance mvPrivInst : ItemSpec \"ep2::mv_priv\" where pre := mvPre; post := mvPost\n"),
+            ["Init", "Anneal.OleanSpecStrengthAuditor"], module_file=True)
+        mv_ok = olean_accept(ol2, base_spec_mods + ["OlEp2ModVis"],
+                             specStrengthChecks=[{"kind": "itemSynth", "defId": "ep2::mv_pub", "cert": "mvCert"}])
+        assert mv_ok["specStrengthChecksPassed"] == 1, mv_ok
+        olean_reject(ol2, base_spec_mods + ["OlEp2ModVis"], "[specStrengthCertMissing]", "mvPrivInst",
+                     specStrengthChecks=[{"kind": "itemSynth", "defId": "ep2::mv_priv", "cert": "mvCert"}])
 
         # A4-7 (26-deep binary branching) in a compiled `.olean`.
         exp_lines = ["prelude", "import Init", "import OlEp2SpecClean", "open Trusted.VerificationResult",
@@ -2264,9 +2297,9 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         shutil.rmtree(ol2.stage)
         runner.make_tree_writable(ol2.checkout)
         shutil.rmtree(ol2.checkout)
-        done("Episode 2 compiled spec-strength gates (V8/V9, 4 claim kinds, A1-4, A3-3 _sunfold, A1-2/S3 shadows, "
+        done("Episode 2 compiled spec-strength gates (V8/V9, 4 claim & 4 synth kinds, A1-4, A3-3 _sunfold, A1-2/S3 shadows, "
              "B1-1 theorem-major, B1-4/A1-1/A2-5 native-evaluator canaries, B1-5/A1-5/A2-4 provenance & constructive, "
-             "A1-3/A1-6, B2-1/A2-1/A2-2/A2-6 forged instances, A4-7)")
+             "A1-3/A1-6, B2-1/A2-1/A2-2/A2-6/A3-1 forged & private-module instances, A4-7)")
     except BaseException as error:
         (suite / "failure.traceback").write_text(traceback.format_exc())
         print(f"SELF-TEST FAILED: {error}\nPreserved fixture sources/raw logs: {suite}", file=sys.stderr)

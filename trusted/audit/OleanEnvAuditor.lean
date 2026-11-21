@@ -3376,8 +3376,11 @@ def discrTreeFold {α σ : Type} (f : σ → α → σ) (init : σ) (d : Meta.Di
   termination_by sizeOf t
   d.root.foldl (fun acc _ trie => goTrie acc trie) init
 
-/-- Check whether `declName` is registered as an active `.global` zero-argument `@[instance]`
-keyed for `specClass targetDefId` (`A1-6`, `A2-2`, `A2-7`). -/
+/-- Check whether `declName` is registered as an active, exported `.global` zero-argument
+`@[instance]` keyed for `specClass targetDefId` (`A1-6`, `A2-2`, `A2-7`, `A3-1`).
+In a `module` file, `Meta.instanceExtension`'s `exportEntry?` withholds any entry with
+`isPrivateName declName` from `.olean` (`exported := none`), so `module` importers cannot
+synthesize it; reject unexported private instances in `module` files here as well. -/
 def isGlobalInstanceRegistered (env : Environment) (declName specClass : Name)
     (targetDefId : String) (allowLocalDecls : Bool := false) : Bool := Id.run do
   let target := mkConst declName []
@@ -3388,11 +3391,14 @@ def isGlobalInstanceRegistered (env : Environment) (declName specClass : Name)
   if allowLocalDecls then
     if (Meta.instanceExtension.getState env).erased.contains declName then
       return false
-    for e in (Meta.instanceExtension.ext.getState env).newEntries do
-      match e with
-      | .global ent => if matchesEntry ent then return true
-      | .scoped _ _ => pure ()
+    if !(env.header.isModule && isPrivateName declName) then
+      for e in (Meta.instanceExtension.ext.getState env).newEntries do
+        match e with
+        | .global ent => if matchesEntry ent then return true
+        | .scoped _ _ => pure ()
   for i in [0:env.header.modules.size] do
+    if env.header.moduleData[i]!.isModule && isPrivateName declName then
+      continue
     for e in Meta.instanceExtension.ext.getModuleEntries env i do
       match e with
       | .global ent => if matchesEntry ent then return true
@@ -3428,9 +3434,9 @@ def collectRelevantInstanceEntries (env : Environment) (toolchainProv : Std.Hash
   return entries
 
 /-- Collect non-toolchain `Meta.DefaultInstanceEntry` records from serialized non-toolchain modules
-and live `defaultInstanceExtension` state (`A2-6`). -/
-def collectRelevantDefaultInstances (env : Environment) (toolchainProv : Std.HashSet Name)
-    (specClass : Name) : Array Name := Id.run do
+and live `defaultInstanceExtension` state (`A2-6`, `A3-2`). -/
+def collectRelevantDefaultInstances (env : Environment) (toolchainProv : Std.HashSet Name) :
+    Array Name := Id.run do
   let mut toolDefInsts : Std.HashSet (Name × Name) := {}
   let mut out : Array Name := #[]
   for h : i in [0:env.header.modules.size] do
@@ -3441,11 +3447,12 @@ def collectRelevantDefaultInstances (env : Environment) (toolchainProv : Std.Has
         toolDefInsts := toolDefInsts.insert (d.className, d.instanceName)
       else if !out.contains d.instanceName then
         out := out.push d.instanceName
-  let liveDefs := (Meta.defaultInstanceExtension.getState env).defaultInstances.find? specClass |>.getD []
-  for (instName, _) in liveDefs do
-    unless toolDefInsts.contains (specClass, instName) do
-      if !out.contains instName then
-        out := out.push instName
+  let liveMap := (Meta.defaultInstanceExtension.getState env).defaultInstances
+  for (clsName, defs) in liveMap.toList do
+    for (instName, _) in defs do
+      unless toolDefInsts.contains (clsName, instName) do
+        if !out.contains instName then
+          out := out.push instName
   return out
 
 /-- Registered-instance scan (`B2-1`, `A2-1`, `A2-3`, `A2-6`). Type class resolution retrieves an
@@ -3482,7 +3489,7 @@ public def instanceEntryCandidates (env : Environment) (toolchainProv : Std.Hash
       | _ => true
     if isCand && !out.contains label then
       out := out.push label
-  for instName in collectRelevantDefaultInstances env toolchainProv specClass do
+  for instName in collectRelevantDefaultInstances env toolchainProv do
     let isCand := match env.find? instName with
       | some ci =>
         match specClassConclusionMatchBudget env specClass targetDefId ci.type fuel none
@@ -3506,7 +3513,7 @@ def instanceEntriesReachNative (env : Environment) (toolchainProv : Std.HashSet 
       unless seen.contains c do
         seen := seen.insert c
         roots := roots.push c
-  for instName in collectRelevantDefaultInstances env toolchainProv specClass do
+  for instName in collectRelevantDefaultInstances env toolchainProv do
     unless seen.contains instName do
       seen := seen.insert instName
       roots := roots.push instName
