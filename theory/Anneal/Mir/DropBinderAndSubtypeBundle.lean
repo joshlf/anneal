@@ -1033,7 +1033,8 @@ theorem mr_modeSensitivity_present :
   rfl
 
 /-- Non-vacuous LeanMiri `ModeSensitivityWitness` on `dropTerminator.modeCase`
-(`protectedMode = false` returns `42`, `protectedMode = true` faults with protector UB!). -/
+(`treeBorrows = false` returns `42`; `treeBorrows = true` faults with a vendored Tree
+Borrows write conflict on the protected child of the dropped allocation's borrow tree). -/
 theorem lm_modeSensitivity_present_with (lmAuth : Corpus.ObsAuthority Ep2Key Ep2ObsVal)
     (hLM : lmCheckOf lmAuth = true) :
     ((lmSideOf lmAuth).flipW ep2Model hLM).isSome = true := by

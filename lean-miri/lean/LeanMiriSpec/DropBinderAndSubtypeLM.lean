@@ -30,10 +30,13 @@ boundary / mode-sensitivity witnesses, and executable authority-typed
    memory-backed whole-local and projected sub-place drop (layout-derived byte
    ranges, allocation-relative offsets) via vendored
    `Miri.Memory.Allocation.writeUninit` preserving sibling bytes, data-driven
-   Tree Borrows mode sensitivity (place-relative protector check on the dropped
-   allocation's vendored borrow tree against the vendored global protected-tag
-   table when `treeBorrows = true`, bridged to vendored
-   `BorrowTree.performBorrowAccessRange`),
+   Tree Borrows mode sensitivity (when `treeBorrows = true`, the drop is applied as
+   a write access to the dropped byte range of the allocation's own vendored borrow
+   tree via `ep2ApplyTreeBorrowsWrite` — per-node vendored
+   `Tree.LocationState.performAccess` with exact ancestry and the vendored global
+   protected-tag table — and the transitioned tree is persisted via
+   `Allocation.setExtra`; bridged to vendored `BorrowTree.performBorrowAccessRange`
+   by `ep2ProtectorConflict_agrees_with_vendored_tree_borrows`),
    cleanup-block unwind/post-drop
    transitions, and explicit witnessed characterization of post-elaboration
    no-glue drop deinit vs. canonical runtime-nop (`canonNoGlueDropHooks`).
@@ -2111,10 +2114,10 @@ def lmObsClosureCap7_1 : Ep2LmObs :=
   .retVal (.live (.immediate (.scalarPair (lmScalarUInt 7 4) (lmPtrScalar lmAid1 lmBase1))))
 
 /-- Direct vendored `Miri.Interpreter.Step.step` observation for EVERY
-`(protectedMode, variantIdx, caseIdx)` key across all 8 Episode 2 MIR variants
+`(treeBorrows, variantIdx, caseIdx)` key across all 8 Episode 2 MIR variants
 (`variantIdx ∈ 0..7`, `caseIdx ∈ 0..3`). Zero shadow evaluators: every entry runs
 `runMiriSteps` -> `Miri.Interpreter.Step.step`! -/
-def ep2LmObserve (protectedMode : Bool) (variantIdx : Nat) (caseIdx : Nat) : Ep2LmObs :=
+def ep2LmObserve (treeBorrows : Bool) (variantIdx : Nat) (caseIdx : Nat) : Ep2LmObs :=
   let u32Lay := some (translateTyOverlay u32MirTy emptyLayoutTable)
   let i32Lay := some (translateTyOverlay i32MirTy emptyLayoutTable)
   let u8Lay := some (translateTyOverlay u8MirTy emptyLayoutTable)
@@ -2127,33 +2130,33 @@ def ep2LmObserve (protectedMode : Bool) (variantIdx : Nat) (caseIdx : Nat) : Ep2
   match variantIdx, caseIdx with
   -- 0: coverage
   | 0, 0 | 0, 1 | 0, 3 =>
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v1CoverageOkMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v1CoverageOkMir treeBorrows) 8
       (mkLmMiriState v1CoverageOkMir u32MirTy #[⟨.live (.immediate .uninit), u32Lay⟩])
   | 0, 2 =>
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v1CoverageUbMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v1CoverageUbMir treeBorrows) 8
       (mkLmMiriState v1CoverageUbMir u32MirTy #[⟨.live (.immediate .uninit), u32Lay⟩])
   -- 1: backwardIncompatibleDropHint
   | 1, 0 | 1, 1 | 1, 3 =>
     let rawMutU32Lay := some (translateTyOverlay rawMutU32MirTy emptyLayoutTable)
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v2DropHintOkMir protectedMode) 12
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v2DropHintOkMir treeBorrows) 12
       (mkLmMiriState v2DropHintOkMir u32MirTy #[⟨.live (.immediate .uninit), u32Lay⟩, ⟨.live (.immediate .uninit), rawMutU32Lay⟩])
   | 1, 2 =>
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v2DropHintDeadReadUbMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v2DropHintDeadReadUbMir treeBorrows) 8
       (mkLmMiriState v2DropHintDeadReadUbMir u32MirTy #[⟨.live (.immediate .uninit), u32Lay⟩, ⟨.live (.immediate .uninit), u32Lay⟩])
-  -- 2: dropTerminator (genuine protectedMode sensitivity at caseIdx = 3!)
+  -- 2: dropTerminator (genuine treeBorrows sensitivity at caseIdx = 3!)
   | 2, 0 =>
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v3DropWholeOkMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v3DropWholeOkMir treeBorrows) 8
       (mkLmMiriState v3DropWholeOkMir u32MirTy
         #[⟨.live (.immediate .uninit), u32Lay⟩, ⟨.live (.immediate (.scalar (lmScalarUInt 11 4))), u32Lay⟩])
   | 2, 1 =>
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v3DropProjSiblingOkMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v3DropProjSiblingOkMir treeBorrows) 8
       (mkPairU32IndirectState v3DropProjSiblingOkMir 11 99)
   | 2, 2 =>
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v3DropDeadUbMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v3DropDeadUbMir treeBorrows) 8
       (mkLmMiriState v3DropDeadUbMir u32MirTy
         #[⟨.live (.immediate .uninit), u32Lay⟩, ⟨.live (.immediate (.scalar (lmScalarUInt 11 4))), u32Lay⟩])
   | 2, 3 =>
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v3DropProtectedMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v3DropProtectedMir treeBorrows) 8
       (mkTbDropMiriState v3DropProtectedMir true)
   -- 3: shallowInitBox (lowered .Cast .Transmute on uninit pointee allocation; distinct okPrimary vs. okSecondary!)
   | 3, 0 =>
@@ -2163,7 +2166,7 @@ def ep2LmObserve (protectedMode : Bool) (variantIdx : Nat) (caseIdx : Nat) : Ep2
         borrowTracker := none }
     let boxLay := some (translateTyOverlay boxU32MirTy emptyLayoutTable)
     let rawLay := some (translateTyOverlay rawMutU8MirTy emptyLayoutTable)
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v4ShallowInitBoxOkMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v4ShallowInitBoxOkMir treeBorrows) 8
       (mkLmMiriState v4ShallowInitBoxOkMir boxU32MirTy
         #[⟨.live (.immediate .uninit), boxLay⟩,
           ⟨.live (.immediate (.scalar (lmPtrScalar lmAid2 lmBase2))), rawLay⟩]
@@ -2175,7 +2178,7 @@ def ep2LmObserve (protectedMode : Bool) (variantIdx : Nat) (caseIdx : Nat) : Ep2
         borrowTracker := none }
     let boxLay := some (translateTyOverlay boxU64MirTy emptyLayoutTable)
     let rawLay := some (translateTyOverlay rawMutU32MirTy emptyLayoutTable)
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v4ShallowInitBoxDistinctOkMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v4ShallowInitBoxDistinctOkMir treeBorrows) 8
       (mkLmMiriState v4ShallowInitBoxDistinctOkMir boxU64MirTy
         #[⟨.live (.immediate .uninit), boxLay⟩,
           ⟨.live (.immediate (.scalar (lmPtrScalar lmAid5 lmBase5))), rawLay⟩]
@@ -2183,14 +2186,14 @@ def ep2LmObserve (protectedMode : Bool) (variantIdx : Nat) (caseIdx : Nat) : Ep2
   | 3, 2 =>
     let boxLay := some (translateTyOverlay boxU32MirTy emptyLayoutTable)
     let rawLay := some (translateTyOverlay rawMutU8MirTy emptyLayoutTable)
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v4ShallowInitBoxOkMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v4ShallowInitBoxOkMir treeBorrows) 8
       (mkLmMiriState v4ShallowInitBoxOkMir boxU32MirTy
         #[⟨.live (.immediate .uninit), boxLay⟩, ⟨.dead, rawLay⟩]
         AnnealMachine.empty (some v4ShallowInitBoxLoweredMiriBody))
   | 3, 3 =>
     let boxLay := some (translateTyOverlay boxU32MirTy emptyLayoutTable)
     let rawLay := some (translateTyOverlay rawMutU8MirTy emptyLayoutTable)
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v4ShallowInitBoxOkMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v4ShallowInitBoxOkMir treeBorrows) 8
       (mkLmMiriState v4ShallowInitBoxOkMir boxU32MirTy
         #[⟨.live (.immediate .uninit), boxLay⟩, ⟨.live (.immediate .uninit), rawLay⟩]
         AnnealMachine.empty (some v4ShallowInitBoxLoweredMiriBody))
@@ -2198,7 +2201,7 @@ def ep2LmObserve (protectedMode : Bool) (variantIdx : Nat) (caseIdx : Nat) : Ep2
   | 4, 0 =>
     let u32BLay := some (translateTyOverlay u32MirTy ep2BinderLayouts)
     let bndU32Lay := some (translateTyOverlay binderU32MirTy ep2BinderLayouts)
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v5WrapStructRoundtripMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v5WrapStructRoundtripMir treeBorrows) 8
       (mkLmMiriState v5WrapStructRoundtripMir u32MirTy
         #[⟨.live (.immediate .uninit), u32BLay⟩,
           ⟨.live (.immediate (.scalar (lmScalarUInt 73 4))), u32BLay⟩,
@@ -2206,60 +2209,60 @@ def ep2LmObserve (protectedMode : Bool) (variantIdx : Nat) (caseIdx : Nat) : Ep2
   | 4, 1 =>
     let bndNzLay := some (translateTyOverlay binderNzU8MirTy ep2BinderLayouts)
     let u8BLay := some (translateTyOverlay u8MirTy ep2BinderLayouts)
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v5WrapNzU8Mir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v5WrapNzU8Mir treeBorrows) 8
       (mkLmMiriState v5WrapNzU8Mir binderNzU8MirTy
         #[⟨.live (.immediate .uninit), bndNzLay⟩,
           ⟨.live (.immediate (.scalar (lmScalarUInt 7 1))), u8BLay⟩])
   | 4, 2 =>
     let bndNzLay := some (translateTyOverlay binderNzU8MirTy ep2BinderLayouts)
     let u8BLay := some (translateTyOverlay u8MirTy ep2BinderLayouts)
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v5WrapNzU8Mir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v5WrapNzU8Mir treeBorrows) 8
       (mkLmMiriState v5WrapNzU8Mir binderNzU8MirTy
         #[⟨.live (.immediate .uninit), bndNzLay⟩,
           ⟨.live (.immediate (.scalar (lmScalarUInt 0 1))), u8BLay⟩])
   | 4, 3 =>
     let bndBoolLay := some (translateTyOverlay binderBoolMirTy ep2BinderLayouts)
     let u8BLay := some (translateTyOverlay u8MirTy ep2BinderLayouts)
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v5WrapBoolMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v5WrapBoolMir treeBorrows) 8
       (mkLmMiriState v5WrapBoolMir binderBoolMirTy
         #[⟨.live (.immediate .uninit), bndBoolLay⟩,
           ⟨.live (.immediate (.scalar (lmScalarUInt 2 1))), u8BLay⟩])
   -- 5: castSubtype
   | 5, 0 =>
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v6SubtypeU32ToI32Mir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v6SubtypeU32ToI32Mir treeBorrows) 8
       (mkLmMiriState v6SubtypeU32ToI32Mir i32MirTy
         #[⟨.live (.immediate .uninit), i32Lay⟩,
           ⟨.live (.immediate (.scalar (lmScalarUInt 4294967295 4))), u32Lay⟩])
   | 5, 1 =>
     let nzLay := some (translateTyOverlay nonZeroU8MirTy nonZeroU8Layouts)
     let u8NzLay := some (translateTyOverlay u8MirTy nonZeroU8Layouts)
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v6SubtypeU8ToNzMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v6SubtypeU8ToNzMir treeBorrows) 8
       (mkLmMiriState v6SubtypeU8ToNzMir nonZeroU8MirTy
         #[⟨.live (.immediate .uninit), nzLay⟩,
           ⟨.live (.immediate (.scalar (lmScalarUInt 7 1))), u8NzLay⟩])
   | 5, 2 =>
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v6SubtypeU8ToBoolMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v6SubtypeU8ToBoolMir treeBorrows) 8
       (mkLmMiriState v6SubtypeU8ToBoolMir boolMirTy
         #[⟨.live (.immediate .uninit), boolLay⟩,
           ⟨.live (.immediate (.scalar (lmScalarUInt 2 1))), u8Lay⟩])
   | 5, 3 =>
     let nzLay := some (translateTyOverlay nonZeroU8MirTy nonZeroU8Layouts)
     let u8NzLay := some (translateTyOverlay u8MirTy nonZeroU8Layouts)
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v6SubtypeU8ToNzMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v6SubtypeU8ToNzMir treeBorrows) 8
       (mkLmMiriState v6SubtypeU8ToNzMir nonZeroU8MirTy
         #[⟨.live (.immediate .uninit), nzLay⟩,
           ⟨.live (.immediate (.scalar (lmScalarUInt 0 1))), u8NzLay⟩])
   -- 6: aggregateRawPtr
   | 6, 0 =>
     let mach := lmAddrMachine #[⟨lmAid5, lmBase5⟩]
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v7RawPtrThinMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v7RawPtrThinMir treeBorrows) 8
       (mkLmMiriState v7RawPtrThinMir rawConstU32MirTy
         #[⟨.live (.immediate .uninit), rawU32Lay⟩,
           ⟨.live (.immediate (.scalar (lmPtrScalar lmAid5 lmBase5))), rawUnitLay⟩,
           ⟨.live (.immediate .uninit), unitLay⟩] mach)
   | 6, 1 =>
     let mach := lmAddrMachine #[⟨lmAid5, lmBase5⟩]
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v7RawPtrWideSliceMetaMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v7RawPtrWideSliceMetaMir treeBorrows) 8
       (mkLmMiriState v7RawPtrWideSliceMetaMir usizeMirTy
         #[⟨.live (.immediate .uninit), usizeLay⟩,
           ⟨.live (.immediate (.scalar (lmPtrScalar lmAid5 lmBase5))), rawUnitLay⟩,
@@ -2267,14 +2270,14 @@ def ep2LmObserve (protectedMode : Bool) (variantIdx : Nat) (caseIdx : Nat) : Ep2
           ⟨.dead, wideSliceLay⟩] mach)
   | 6, 2 =>
     let mach := lmAddrMachine #[⟨lmAid5, lmBase5⟩]
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v7RawPtrThinMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v7RawPtrThinMir treeBorrows) 8
       (mkLmMiriState v7RawPtrThinMir rawConstU32MirTy
         #[⟨.live (.immediate .uninit), rawU32Lay⟩,
           ⟨.dead, rawUnitLay⟩,
           ⟨.live (.immediate .uninit), unitLay⟩] mach)
   | 6, 3 =>
     let mach := lmAddrMachine #[⟨lmAid5, lmBase5⟩]
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v7RawPtrWideSliceMetaMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v7RawPtrWideSliceMetaMir treeBorrows) 8
       (mkLmMiriState v7RawPtrWideSliceMetaMir usizeMirTy
         #[⟨.live (.immediate .uninit), usizeLay⟩,
           ⟨.live (.immediate (.scalar (lmPtrScalar lmAid5 lmBase5))), rawUnitLay⟩,
@@ -2285,23 +2288,24 @@ def ep2LmObserve (protectedMode : Bool) (variantIdx : Nat) (caseIdx : Nat) : Ep2
     let mach := lmAddrMachine #[⟨lmAid1, lmBase1⟩]
     let zstLay := some ({ ty := encodeTyIdOverlay (closureZstMirTy "ep2::zst"),
                           layout := zstLayoutData } : Miri.Interpreter.LocalLayout)
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v8ClosureZstMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v8ClosureZstMir treeBorrows) 8
       (mkLmMiriState v8ClosureZstMir (closureZstMirTy "ep2::zst")
         #[⟨.live (.immediate .uninit), zstLay⟩] mach)
   | 7, 1 =>
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v8ClosureCapMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v8ClosureCapMir treeBorrows) 8
       (mkV8ClosureCapState (.live (.immediate (.scalar (lmScalarUInt 7 4)))))
   | 7, 2 =>
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v8ClosureCapMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v8ClosureCapMir treeBorrows) 8
       (mkV8ClosureCapState .dead)
   | 7, 3 =>
-    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v8ClosureCapMir protectedMode) 8
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v8ClosureCapMir treeBorrows) 8
       (mkV8ClosureCapState (.live (.immediate .uninit)))
   | _, _ => .unsupported
 
 /-- Mode sensitivity certified directly on `ep2LmObserve`: `dropTerminator.modeCase`
-(`variantIdx = 2, caseIdx = 3`) returns `42` under `protectedMode = false` and faults
-`.ub` under `protectedMode = true`! -/
+(`variantIdx = 2, caseIdx = 3`, memory-backed `_1` whose vendored borrow tree has a
+protected `Unique` child) returns `42` with `treeBorrows = false` and faults `.ub`
+with `treeBorrows = true` (vendored Tree Borrows write conflict). -/
 theorem ep2LmObserve_drop_mode_sensitivity :
     ep2LmObserve false 2 3 = lmObsU32 42 ∧ ep2LmObserve true 2 3 = .ub :=
   ⟨by decide +kernel, by decide +kernel⟩
