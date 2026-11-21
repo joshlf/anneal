@@ -8494,14 +8494,12 @@ theorem ep1_evalUnOpM_meta_unops_error_is_specPanic_or_unsupported
             dsimp only at h
             split at h
             · simp [pure, Except.pure] at h
-            · cases h; exact Or.inr ⟨_, rfl⟩
             · simp [specPanic] at h; exact Or.inl ⟨_, h.symm⟩
           | ElementCount =>
             rw [hk] at h
             dsimp only at h
             split at h
             · simp [pure, Except.pure] at h
-            · cases h; exact Or.inr ⟨_, rfl⟩
             · simp [specPanic] at h; exact Or.inl ⟨_, h.symm⟩
       | _ => exact hPanic _ rfl h
     | _ => exact hPanic _ rfl h
@@ -8941,6 +8939,1709 @@ theorem ep1_downcast_variant_lookup_agrees_with_representation
         exact ⟨h1, fun b => (hdec b).trans (h2 b), fun x m => (hchk x m).trans (h3 x m),
           fun x => (henc x).trans (h4 x)⟩
 
+/-! ### `[adv A1]` Universal `Load ⇒ GetDiscriminant` soundness (Mach & MachTB), `Union` validity/roundtrip, non-vtable totality, algebraic `GetMetadata`→`ComputeSize`/`ComputeAlign` composition, and edge-case witnesses -/
+
+/-- **Tree Borrows `Read` idempotence:** for every `Permission` (`Unprot` or `Prot`) and
+every tree relation (`Local` or `Foreign`), once a `Read` transition succeeds yielding `p'`,
+repeating any number of `Read` transitions at the same relation leaves `p'` unchanged and
+never triggers UB. This is the core algebraic invariant enabling `Load ⇒ GetDiscriminant`
+soundness on `MachTB` for arbitrary multi-level and overlapping discriminator trees. -/
+theorem ep1_tb_permission_read_idempotent (p p' : Gen.Permission) (rel : Gen.NodeRelation)
+    (h : Permission.transition p .Read rel = .ok p') :
+    Permission.transition p' .Read rel = .ok p' := by
+  cases p with
+  | Unprot u =>
+    cases u <;> cases rel <;>
+      simp [Permission.transition, PermissionUnprot.transition,
+        PermissionUnprot.local_read, PermissionUnprot.foreign_read,
+        ub, bind, Except.bind, pure, Except.pure] at h
+    all_goals subst h; rfl
+  | Prot u =>
+    cases u <;> cases rel <;>
+      simp [Permission.transition, PermissionProt.transition,
+        PermissionProt.local_read, PermissionProt.foreign_read,
+        ub, bind, Except.bind, pure, Except.pure] at h
+    all_goals subst h; rfl
+
+mutual
+private def ep1NodeReadOk (path : Option Gen.Path) (base len : Nat) : Gen.Node → Prop
+  | ⟨children, permissions, _⟩ =>
+    let rel : Gen.NodeRelation := if path.isSome then .Local else .Foreign
+    (∀ i, base ≤ i → i < base + len →
+      ∃ hi : i < permissions.length, ∃ p', Permission.transition permissions[i] .Read rel = .ok p') ∧
+    ep1ChildrenReadOk 0 path base len children
+
+private def ep1ChildrenReadOk (childId : Int) (path : Option Gen.Path) (base len : Nat) :
+    List Gen.Node → Prop
+  | [] => True
+  | c :: cs =>
+    let subPath : Option Gen.Path :=
+      match path with
+      | some (head :: tail) => if head == childId then some tail else none
+      | _ => none
+    ep1NodeReadOk subPath base len c ∧ ep1ChildrenReadOk (childId + 1) path base len cs
+end
+
+private theorem ep1_listIndex_eq_getElem {T : Type} {xs : List T} {i : Nat} {what : String} {v : T}
+    (h : listIndex xs (Int.ofNat i) what = .ok v) :
+    ∃ hi : i < xs.length, xs[i] = v := by
+  unfold listIndex at h
+  have hnn : (0 : Int) ≤ Int.ofNat i := Int.natCast_nonneg i
+  have hto : (Int.ofNat i).toNat = i := Int.toNat_natCast i
+  simp only [hnn, ↓reduceIte, hto] at h
+  cases hget : xs[i]? with
+  | none => simp [hget, specPanic] at h
+  | some x =>
+    simp only [hget, pure, Except.pure, Except.ok.injEq] at h
+    have hi : i < xs.length := (List.getElem?_eq_some_iff.mp hget).1
+    have hval : xs[i] = x := (List.getElem?_eq_some_iff.mp hget).2
+    exact ⟨hi, hval.trans h⟩
+
+private theorem ep1_listIndex_of_getElem {T : Type} {xs : List T} {i : Nat} (what : String)
+    (hi : i < xs.length) :
+    listIndex xs (Int.ofNat i) what = .ok xs[i] := by
+  unfold listIndex
+  have hnn : (0 : Int) ≤ Int.ofNat i := Int.natCast_nonneg i
+  have hto : (Int.ofNat i).toNat = i := Int.toNat_natCast i
+  simp only [hnn, ↓reduceIte, hto, List.getElem?_eq_getElem hi, pure, Except.pure]
+
+private theorem ep1_listSet_of_lt {T : Type} {xs : List T} {i : Nat} (v : T) (what : String)
+    (hi : i < xs.length) :
+    listSet xs (Int.ofNat i) v what = .ok (xs.set i v) := by
+  unfold listSet
+  have hnn : (0 : Int) ≤ Int.ofNat i := Int.natCast_nonneg i
+  have hto : (Int.ofNat i).toNat = i := Int.toNat_natCast i
+  simp only [hnn, hto, hi, and_self, ↓reduceIte, pure, Except.pure]
+
+private theorem ep1_listSet_eq {T : Type} {xs ys : List T} {i : Nat} {v : T} {what : String}
+    (h : listSet xs (Int.ofNat i) v what = .ok ys) :
+    i < xs.length ∧ ys = xs.set i v := by
+  unfold listSet at h
+  have hnn : (0 : Int) ≤ Int.ofNat i := Int.natCast_nonneg i
+  have hto : (Int.ofNat i).toNat = i := Int.toNat_natCast i
+  simp only [hnn, hto, true_and] at h
+  split at h
+  · rename_i hi
+    simp only [pure, Except.pure, Except.ok.injEq] at h
+    exact ⟨hi, h.symm⟩
+  · simp [specPanic] at h
+
+private theorem ep1_listIndex_int_eq_getElem {T : Type} {xs : List T} {idx : Int} {what : String} {v : T}
+    (h : listIndex xs idx what = .ok v) :
+    0 ≤ idx ∧ ∃ hi : idx.toNat < xs.length, xs[idx.toNat] = v := by
+  unfold listIndex at h
+  split at h
+  · rename_i hnn
+    cases hget : xs[idx.toNat]? with
+    | none => simp [hget, specPanic] at h
+    | some x =>
+      simp only [hget, pure, Except.pure, Except.ok.injEq] at h
+      have hi : idx.toNat < xs.length := (List.getElem?_eq_some_iff.mp hget).1
+      have hval : xs[idx.toNat] = x := (List.getElem?_eq_some_iff.mp hget).2
+      exact ⟨hnn, hi, hval.trans h⟩
+  · simp [specPanic] at h
+
+private theorem ep1_listIndex_int_of_getElem {T : Type} {xs : List T} {idx : Int} (what : String)
+    (hnn : 0 ≤ idx) (hi : idx.toNat < xs.length) :
+    listIndex xs idx what = .ok xs[idx.toNat] := by
+  unfold listIndex
+  simp only [hnn, ↓reduceIte, List.getElem?_eq_getElem hi, pure, Except.pure]
+
+private theorem ep1_listSet_int_of_lt {T : Type} {xs : List T} {idx : Int} (v : T) (what : String)
+    (hnn : 0 ≤ idx) (hi : idx.toNat < xs.length) :
+    listSet xs idx v what = .ok (xs.set idx.toNat v) := by
+  unfold listSet
+  simp only [hnn, hi, and_self, ↓reduceIte, pure, Except.pure]
+
+private theorem ep1_transitionRange_read_extract (rel : Gen.NodeRelation) :
+    ∀ (off rem : Nat) (perms perms' : List Gen.Permission),
+      Node.transitionRange rel .Read off rem perms = .ok perms' →
+      perms'.length = perms.length ∧
+      (∀ i, off ≤ i → i < off + rem →
+        ∃ hi : i < perms.length, ∃ p', Permission.transition perms[i] .Read rel = .ok p')
+  | off, 0, perms, perms', h => by
+    have hp := ep1_pure_ok h
+    subst hp
+    exact ⟨rfl, fun i h1 h2 => by omega⟩
+  | off, rem + 1, perms, perms', h => by
+    unfold Node.transitionRange at h
+    obtain ⟨⟨_, perms1⟩, hmut, hrest⟩ := ep1_bind_ok h
+    unfold listMutateAt at hmut
+    obtain ⟨elem, hidx, hmut⟩ := ep1_bind_ok hmut
+    obtain ⟨⟨_, p'⟩, htr_b, hmut⟩ := ep1_bind_ok hmut
+    obtain ⟨p1, htr, hp1⟩ := ep1_bind_ok htr_b
+    have hp1' := ep1_pure_ok hp1
+    rcases Prod.mk.inj hp1' with ⟨_, rfl⟩
+    obtain ⟨perms1', hset, hmut⟩ := ep1_bind_ok hmut
+    have hm := ep1_pure_ok hmut
+    rcases Prod.mk.inj hm with ⟨_, rfl⟩
+    obtain ⟨hhi, helem⟩ := ep1_listIndex_eq_getElem hidx
+    obtain ⟨_, rfl⟩ := ep1_listSet_eq hset
+    obtain ⟨hlen', hsub⟩ :=
+      ep1_transitionRange_read_extract rel (off + 1) rem (perms.set off p1) perms' hrest
+    refine ⟨by rw [hlen', List.length_set], fun i h1 h2 => ?_⟩
+    by_cases heq : i = off
+    · subst heq
+      exact ⟨hhi, p1, helem ▸ htr⟩
+    · obtain ⟨hi1, p2, htr2⟩ := hsub i (by omega) (by omega)
+      have hi0 : i < perms.length := by simpa [List.length_set] using hi1
+      have hne : off ≠ i := fun h => heq h.symm
+      rw [List.getElem_set_ne hne] at htr2
+      exact ⟨hi0, p2, htr2⟩
+
+private theorem ep1_transitionRange_read_exec (rel : Gen.NodeRelation) (base len : Nat) :
+    ∀ (off rem : Nat) (perms : List Gen.Permission),
+      base ≤ off → off + rem ≤ base + len →
+      (∀ i, base ≤ i → i < base + len →
+        ∃ hi : i < perms.length, ∃ p', Permission.transition perms[i] .Read rel = .ok p') →
+      ∃ perms', Node.transitionRange rel .Read off rem perms = .ok perms' ∧
+        perms'.length = perms.length ∧
+        (∀ i, base ≤ i → i < base + len →
+          ∃ hi : i < perms'.length, ∃ p', Permission.transition perms'[i] .Read rel = .ok p')
+  | off, 0, perms, _, _, hok => ⟨perms, rfl, rfl, hok⟩
+  | off, rem + 1, perms, hlo, hhi, hok => by
+    obtain ⟨hoff, p1, htr1⟩ := hok off hlo (by omega)
+    have hmut : listMutateAt perms (Int.ofNat off) "Node::transition"
+        (fun permission => do
+          let p' ← Permission.transition permission .Read rel
+          pure ((), p')) = .ok ((), perms.set off p1) := by
+      unfold listMutateAt
+      rw [ep1_listIndex_of_getElem "Node::transition" hoff]
+      simp only [bind, Except.bind, htr1, pure, Except.pure,
+        ep1_listSet_of_lt p1 "Node::transition" hoff]
+    have hok1 : ∀ i, base ≤ i → i < base + len →
+        ∃ hi : i < (perms.set off p1).length,
+          ∃ p', Permission.transition (perms.set off p1)[i] .Read rel = .ok p' := by
+      intro i hi1 hi2
+      by_cases heq : i = off
+      · subst heq
+        refine ⟨by simpa [List.length_set] using hoff, p1, ?_⟩
+        rw [List.getElem_set_self]
+        exact ep1_tb_permission_read_idempotent perms[i] p1 rel htr1
+      · obtain ⟨hi, p2, htr2⟩ := hok i hi1 hi2
+        refine ⟨by simpa [List.length_set] using hi, p2, ?_⟩
+        rw [List.getElem_set_ne (fun h => heq h.symm)]
+        exact htr2
+    obtain ⟨perms', hrest, hlen', hok'⟩ :=
+      ep1_transitionRange_read_exec rel base len (off + 1) rem (perms.set off p1)
+        (by omega) (by omega) hok1
+    refine ⟨perms', ?_, by rw [hlen', List.length_set], hok'⟩
+    unfold Node.transitionRange
+    rw [hmut]
+    exact hrest
+
+mutual
+private theorem ep1_node_access_read_extract :
+    ∀ (n n' : Gen.Node) (path : Option Gen.Path) (base len : Nat),
+      Node.access n path .Read ⟨base⟩ ⟨len⟩ = .ok n' →
+      ep1NodeReadOk path base len n
+  | ⟨children, perms, prot⟩, n', path, base, len, h => by
+    unfold Node.access at h
+    obtain ⟨n1, htr, h⟩ := ep1_bind_ok h
+    obtain ⟨cs', hcs, _⟩ := ep1_bind_ok h
+    unfold Node.transition at htr
+    obtain ⟨perms', htrR, _⟩ := ep1_bind_ok htr
+    exact ⟨(ep1_transitionRange_read_extract _ base len perms perms' htrR).2,
+      ep1_children_access_read_extract children cs' 0 path base len hcs⟩
+
+private theorem ep1_children_access_read_extract :
+    ∀ (cs cs' : List Gen.Node) (childId : Int) (path : Option Gen.Path) (base len : Nat),
+      Node.accessChildren childId path .Read ⟨base⟩ ⟨len⟩ cs = .ok cs' →
+      ep1ChildrenReadOk childId path base len cs
+  | [], _, _, _, _, _, _ => trivial
+  | c :: rest, cs', childId, path, base, len, h => by
+    unfold Node.accessChildren at h
+    obtain ⟨c', hc, h⟩ := ep1_bind_ok h
+    obtain ⟨rest', hr, _⟩ := ep1_bind_ok h
+    exact ⟨ep1_node_access_read_extract c c' _ base len hc,
+      ep1_children_access_read_extract rest rest' (childId + 1) path base len hr⟩
+end
+
+mutual
+private theorem ep1_node_access_read_exec (base len off subLen : Nat)
+    (hlo : base ≤ off) (hhi : off + subLen ≤ base + len) :
+    ∀ (n : Gen.Node) (path : Option Gen.Path),
+      ep1NodeReadOk path base len n →
+      ∃ n', Node.access n path .Read ⟨off⟩ ⟨subLen⟩ = .ok n' ∧ ep1NodeReadOk path base len n'
+  | ⟨children, perms, prot⟩, path, ⟨hperms, hcs⟩ => by
+    obtain ⟨perms', htrR, _, hperms'⟩ :=
+      ep1_transitionRange_read_exec (if path.isSome then .Local else .Foreign) base len off subLen
+        perms hlo hhi hperms
+    obtain ⟨cs', hcsExec, hcs'⟩ :=
+      ep1_children_access_read_exec base len off subLen hlo hhi children 0 path hcs
+    refine ⟨⟨cs', perms', prot⟩, ?_, ⟨hperms', hcs'⟩⟩
+    unfold Node.access Node.transition
+    simp only [htrR, hcsExec, bind, Except.bind, pure, Except.pure]
+
+private theorem ep1_children_access_read_exec (base len off subLen : Nat)
+    (hlo : base ≤ off) (hhi : off + subLen ≤ base + len) :
+    ∀ (cs : List Gen.Node) (childId : Int) (path : Option Gen.Path),
+      ep1ChildrenReadOk childId path base len cs →
+      ∃ cs', Node.accessChildren childId path .Read ⟨off⟩ ⟨subLen⟩ cs = .ok cs' ∧
+        ep1ChildrenReadOk childId path base len cs'
+  | [], _, _, _ => ⟨[], rfl, trivial⟩
+  | c :: rest, childId, path, ⟨hc, hr⟩ => by
+    rcases path with _ | (_ | ⟨head, tail⟩)
+    · obtain ⟨c', hcExec, hc'⟩ := ep1_node_access_read_exec base len off subLen hlo hhi c none hc
+      obtain ⟨rest', hrExec, hr'⟩ :=
+        ep1_children_access_read_exec base len off subLen hlo hhi rest (childId + 1) none hr
+      refine ⟨c' :: rest', ?_, ⟨hc', hr'⟩⟩
+      simp only [Node.accessChildren, hcExec, hrExec, bind, Except.bind, pure, Except.pure]
+    · obtain ⟨c', hcExec, hc'⟩ := ep1_node_access_read_exec base len off subLen hlo hhi c none hc
+      obtain ⟨rest', hrExec, hr'⟩ :=
+        ep1_children_access_read_exec base len off subLen hlo hhi rest (childId + 1) (some []) hr
+      refine ⟨c' :: rest', ?_, ⟨hc', hr'⟩⟩
+      simp only [Node.accessChildren, hcExec, hrExec, bind, Except.bind, pure, Except.pure]
+    · cases heq : (head == childId)
+      · simp only [heq, Bool.false_eq_true, ↓reduceIte] at hc
+        obtain ⟨c', hcExec, hc'⟩ := ep1_node_access_read_exec base len off subLen hlo hhi c none hc
+        obtain ⟨rest', hrExec, hr'⟩ :=
+          ep1_children_access_read_exec base len off subLen hlo hhi rest (childId + 1) (some (head :: tail)) hr
+        refine ⟨c' :: rest', ?_, ?_⟩
+        · simp only [Node.accessChildren, heq, Bool.false_eq_true, ↓reduceIte, hcExec, hrExec,
+            bind, Except.bind, pure, Except.pure]
+        · exact ⟨by simpa [heq] using hc', hr'⟩
+      · simp only [heq, ↓reduceIte] at hc
+        obtain ⟨c', hcExec, hc'⟩ := ep1_node_access_read_exec base len off subLen hlo hhi c (some tail) hc
+        obtain ⟨rest', hrExec, hr'⟩ :=
+          ep1_children_access_read_exec base len off subLen hlo hhi rest (childId + 1) (some (head :: tail)) hr
+        refine ⟨c' :: rest', ?_, ?_⟩
+        · simp only [Node.accessChildren, heq, ↓reduceIte, hcExec, hrExec,
+            bind, Except.bind, pure, Except.pure]
+        · exact ⟨by simpa [heq] using hc', hr'⟩
+end
+
+mutual
+private theorem ep1_decodeDiscriminantM_sim {M : Type} [Gen.Memory M] {σ : Type}
+    (Inv : σ → Prop)
+    (acc1 : Unit → Gen.Offset → Size →
+      Interp (List (Gen.AbstractByte (Gen.Memory.Provenance M)) × Unit))
+    (acc2 : σ → Gen.Offset → Size →
+      Interp (List (Gen.AbstractByte (Gen.Memory.Provenance M)) × σ))
+    (hstep : ∀ s off sz bs, Inv s → acc1 () off sz = .ok (bs, ()) →
+      ∃ s', acc2 s off sz = .ok (bs, s') ∧ Inv s') :
+    ∀ (d : Gen.Discriminator) (res : Option Int) (s : σ),
+      Inv s → decodeDiscriminantM (M := M) acc1 d () = .ok (res, ()) →
+      ∃ s', decodeDiscriminantM (M := M) acc2 d s = .ok (res, s') ∧ Inv s'
+  | .Known val, res, s, hinv, h => by
+    have hp := ep1_pure_ok h
+    rcases Prod.mk.inj hp with ⟨rfl, _⟩
+    exact ⟨s, rfl, hinv⟩
+  | .Invalid, res, s, hinv, h => by
+    have hp := ep1_pure_ok h
+    rcases Prod.mk.inj hp with ⟨rfl, _⟩
+    exact ⟨s, rfl, hinv⟩
+  | .Branch off vt fallback ⟨children⟩, res, s, hinv, h => by
+    unfold decodeDiscriminantM at h ⊢
+    obtain ⟨⟨bs, u⟩, ha1, h⟩ := ep1_bind_ok h
+    cases u
+    obtain ⟨s1, ha2, hinv1⟩ := hstep s off vt.size bs hinv ha1
+    rw [ha2]
+    dsimp only [bind, Except.bind] at h ⊢
+    obtain ⟨optv, hdec, h⟩ := ep1_bind_ok h
+    rw [hdec]
+    dsimp only at h ⊢
+    cases optv with
+    | none =>
+      have hp := ep1_pure_ok h
+      rcases Prod.mk.inj hp with ⟨rfl, _⟩
+      exact ⟨s1, rfl, hinv1⟩
+    | some v =>
+      cases v with
+      | Int tag =>
+        exact ep1_decodeDiscriminantChildrenM_sim Inv acc1 acc2 hstep tag
+          (decodeDiscriminantM (M := M) acc1 fallback)
+          (decodeDiscriminantM (M := M) acc2 fallback)
+          (fun res' s' hinv' hf =>
+            ep1_decodeDiscriminantM_sim Inv acc1 acc2 hstep fallback res' s' hinv' hf)
+          children res s1 hinv1 h
+      | _ =>
+        have hp := ep1_pure_ok h
+        rcases Prod.mk.inj hp with ⟨rfl, _⟩
+        exact ⟨s1, rfl, hinv1⟩
+
+private theorem ep1_decodeDiscriminantChildrenM_sim {M : Type} [Gen.Memory M] {σ : Type}
+    (Inv : σ → Prop)
+    (acc1 : Unit → Gen.Offset → Size →
+      Interp (List (Gen.AbstractByte (Gen.Memory.Provenance M)) × Unit))
+    (acc2 : σ → Gen.Offset → Size →
+      Interp (List (Gen.AbstractByte (Gen.Memory.Provenance M)) × σ))
+    (hstep : ∀ s off sz bs, Inv s → acc1 () off sz = .ok (bs, ()) →
+      ∃ s', acc2 s off sz = .ok (bs, s') ∧ Inv s')
+    (tag : Int)
+    (fb1 : Unit → Interp (Option Int × Unit)) (fb2 : σ → Interp (Option Int × σ))
+    (hfb : ∀ res s, Inv s → fb1 () = .ok (res, ()) → ∃ s', fb2 s = .ok (res, s') ∧ Inv s') :
+    ∀ (children : List ((Int × Int) × Gen.Discriminator)) (res : Option Int) (s : σ),
+      Inv s → decodeDiscriminantChildrenM (M := M) acc1 tag fb1 children () = .ok (res, ()) →
+      ∃ s', decodeDiscriminantChildrenM (M := M) acc2 tag fb2 children s = .ok (res, s') ∧ Inv s'
+  | [], res, s, hinv, h => hfb res s hinv h
+  | ((lo, hi), child) :: rest, res, s, hinv, h => by
+    unfold decodeDiscriminantChildrenM at h ⊢
+    by_cases hcond : lo ≤ tag ∧ tag < hi
+    · simp only [hcond] at h ⊢
+      exact ep1_decodeDiscriminantM_sim Inv acc1 acc2 hstep child res s hinv h
+    · simp only [hcond] at h ⊢
+      exact ep1_decodeDiscriminantChildrenM_sim Inv acc1 acc2 hstep tag fb1 fb2 hfb rest res s hinv h
+end
+
+private theorem ep1_subsliceWithLength_eq {T : Type} {xs bs : List T} {start len : Nat}
+    (h : subsliceWithLength xs (start : Int) (len : Int) = .ok bs) :
+    start + len ≤ xs.length ∧ bs = (xs.drop start).take len := by
+  unfold subsliceWithLength at h
+  have hts : ((start : Int)).toNat = start := Int.toNat_natCast start
+  have htl : ((len : Int)).toNat = len := Int.toNat_natCast len
+  split at h
+  · rename_i hcond
+    simp only [pure, Except.pure, Except.ok.injEq, hts, htl] at h
+    exact ⟨by omega, h.symm⟩
+  · simp [specPanic] at h
+
+private theorem ep1_subsliceWithLength_of_le {T : Type} (xs : List T) {start len : Nat}
+    (h : start + len ≤ xs.length) :
+    subsliceWithLength xs (start : Int) (len : Int) = .ok ((xs.drop start).take len) := by
+  unfold subsliceWithLength
+  have h1 : (0 : Int) ≤ (start : Int) := Int.natCast_nonneg start
+  have h2 : (0 : Int) ≤ (len : Int) := Int.natCast_nonneg len
+  have h3 : (start : Int) + (len : Int) ≤ (xs.length : Int) := by omega
+  simp only [h1, h2, h3, and_self, ↓reduceIte, Int.toNat_natCast, pure, Except.pure]
+
+private theorem ep1_drop_take_subslice {T : Type} (xs : List T) {base sz off subLen : Nat}
+    (h : off + subLen ≤ sz) :
+    (((xs.drop base).take sz).drop off).take subLen = (xs.drop (base + off)).take subLen := by
+  rw [List.drop_take, List.take_take, List.drop_drop]
+  have hmin : min subLen (sz - off) = subLen := Nat.min_eq_left (by omega)
+  rw [hmin]
+
+private theorem ep1_inBounds_nonneg_signed (n : Nat) (h : (n : Int) < (2 : Int) ^ 63) :
+    inBounds (n : Int) .Signed x86_64.PTR_SIZE = true := by
+  unfold inBounds x86_64.PTR_SIZE Size.bits
+  have hpow : (2 : Int) ^ (8 * 8 - 1) = (2 : Int) ^ 63 := rfl
+  have h1 : -((2 : Int) ^ (8 * 8 - 1)) ≤ (n : Int) := by rw [hpow]; omega
+  have h2 : (n : Int) < (2 : Int) ^ (8 * 8 - 1) := by rw [hpow]; exact h
+  simp only [decide_eq_true_eq, Bool.and_eq_true]
+  exact ⟨h1, h2⟩
+
+private theorem ep1_inBounds_unsigned (a : Int) (h0 : 0 ≤ a) (hhi : a < (2 : Int) ^ 64) :
+    inBounds a .Unsigned x86_64.PTR_SIZE = true := by
+  unfold inBounds x86_64.PTR_SIZE Size.bits
+  have hpow : (2 : Int) ^ (8 * 8) = (2 : Int) ^ 64 := rfl
+  simp only [decide_eq_true_eq, Bool.and_eq_true]
+  exact ⟨h0, by rw [hpow]; exact hhi⟩
+
+private theorem ep1_align_one_is_aligned (addr : Int) : Align.is_aligned ⟨1⟩ addr = true := by
+  simp [Align.is_aligned]
+
+private theorem ep1_not_oob_int {x y z : Int} (hx : 0 ≤ x) (hxy : x + y ≤ z) :
+    ¬(x < 0 ∨ x + y > z) := by
+  rintro (h | h) <;> omega
+
+private theorem ep1_ptrOffsetInboundsM_ok {M : Type} [Gen.Memory M] [MemoryOps M]
+    (mc : Gen.Machine M) (ptr : Gen.ThinPointer (Gen.Memory.Provenance M)) (off : Int)
+    (hsd : ConcurrentMemory.signed_dereferenceable mc.mem ptr off = .ok ())
+    (hib1 : inBounds off .Signed x86_64.PTR_SIZE = true)
+    (hib2 : inBounds (ptr.addr + off) .Unsigned x86_64.PTR_SIZE = true) :
+    ptrOffsetInboundsM mc ptr off = .ok { ptr with addr := ptr.addr + off } := by
+  unfold ptrOffsetInboundsM
+  simp only [hsd, hib1, hib2, bind, Except.bind, pure, Except.pure,
+    Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+
+private theorem ep1_concurrent_load_of_mem_load {M : Type} [Gen.Memory M] [MemoryOps M]
+    (cm : Gen.ConcurrentMemory M) (ptr : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (sz : Size) (al : Align) (at_ : Gen.Atomicity)
+    (bs : List (Gen.AbstractByte (Gen.Memory.Provenance M))) (mem' : M)
+    (h : MemoryOps.load cm.memory ptr sz al = .ok (bs, mem')) :
+    ConcurrentMemory.load cm ptr sz al at_ =
+      .ok (bs, { memory := mem', accesses := cm.accesses ++ [⟨.Load, at_, ptr.addr, sz⟩] }) := by
+  unfold ConcurrentMemory.load
+  simp only [h, bind, Except.bind, pure, Except.pure]
+
+/-- **Universal `Load ⇒ GetDiscriminant` soundness on `MachTB` (`TreeBorrowsMemory`):**
+for every enum type, every finite `Discriminator` tree (multi-level, signed/unsigned,
+overlapping/repeated tag reads, fallbacks, or zero-sized), and every machine `m` where the
+place address/size satisfy MiniRust's pointer bounds (`0 ≤ addr`, `size < 2^63`,
+`addr + size < 2^64`), whenever `evalValueM m (.Load place)` succeeds returning
+`Value.Variant d data`, `evalValueM m (.GetDiscriminant place)` ALSO succeeds on the exact
+same initial machine `m` and returns `(.Int d, .Int dty)`. -/
+theorem ep1_evalValueM_load_enum_implies_getDiscriminant_tb
+    (m m1 mLoad : MachTB) (place : Gen.PlaceExpr) (rp : Gen.Place TBM)
+    (variants : Map Int Gen.Variant) (dty : Gen.IntType) (discr : Gen.Discriminator)
+    (sz : Size) (al : Align) (d : Int) (data : Gen.Value TBM)
+    (hp : evalPlaceM m place = .ok ((rp, .Enum variants dty discr sz al), m1))
+    (haddr0 : 0 ≤ rp.ptr.thin_pointer.addr)
+    (hsz : (sz.bytes : Int) < (2 : Int) ^ 63)
+    (haddrHi : rp.ptr.thin_pointer.addr + (sz.bytes : Int) < (2 : Int) ^ 64)
+    (hload : evalValueM m (.Load place) = .ok ((.Variant d data, .Enum variants dty discr sz al), mLoad)) :
+    ∃ mDiscr, evalValueM m (.GetDiscriminant place) = .ok ((.Int d, .Int dty), mDiscr) := by
+  unfold evalValueM at hload
+  rw [hp] at hload
+  dsimp only [bind, Except.bind] at hload
+  obtain ⟨⟨v, mLoad'⟩, hpl, hret⟩ := ep1_bind_ok hload
+  have hret' := ep1_pure_ok hret
+  rcases Prod.mk.inj hret' with ⟨hvt, rfl⟩
+  rcases Prod.mk.inj hvt with ⟨rfl, _⟩
+  unfold placeLoadM at hpl
+  have hal : rp.aligned = true := by
+    cases h : rp.aligned
+    · simp [h, ub] at hpl
+    · rfl
+  simp only [hal, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hpl
+  unfold typedLoadM at hpl
+  simp only [Type.layout, LayoutStrategy.expect_size, bind, Except.bind, pure, Except.pure] at hpl
+  obtain ⟨⟨bytes, cm⟩, hcmLoad, hpl⟩ := ep1_bind_ok hpl
+  obtain ⟨decOpt, hdec, hpl⟩ := ep1_bind_ok hpl
+  have hdecSome : decOpt = some (.Variant d data) := by
+    cases decOpt with
+    | none => simp [ub] at hpl
+    | some v' =>
+      obtain ⟨_, _, hpl⟩ := ep1_bind_ok hpl
+      have hp' := ep1_pure_ok hpl
+      rcases Prod.mk.inj hp' with ⟨rfl, _⟩
+      rfl
+  subst hdecSome
+  unfold ConcurrentMemory.load at hcmLoad
+  obtain ⟨⟨bytes', tbm'⟩, htbLoad, hcmRet⟩ := ep1_bind_ok hcmLoad
+  have hcmRet' := ep1_pure_ok hcmRet
+  rcases Prod.mk.inj hcmRet' with ⟨rfl, _⟩
+  change TreeBorrowsMemory.load m1.mem.memory rp.ptr.thin_pointer sz ⟨1⟩ = .ok (bytes', tbm') at htbLoad
+  unfold TreeBorrowsMemory.load at htbLoad
+  obtain ⟨⟨bytes'', bm'⟩, hbmLoad, htbRet⟩ := ep1_bind_ok htbLoad
+  have htbRet' := ep1_pure_ok htbRet
+  rcases Prod.mk.inj htbRet' with ⟨rfl, _⟩
+  unfold BasicMemory.load at hbmLoad
+  simp only [ep1_align_one_is_aligned, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hbmLoad
+  obtain ⟨chkOpt, hchk, hbmLoad⟩ := ep1_bind_ok hbmLoad
+  have hbytesLen : bytes''.length = sz.bytes := by
+    cases chkOpt with
+    | none =>
+      unfold BasicMemory.check_ptr at hchk
+      split at hchk
+      · rename_i hsz0
+        have hp' := ep1_pure_ok hbmLoad
+        rcases Prod.mk.inj hp' with ⟨rfl, _⟩
+        exact hsz0.symm
+      · cases hpr : rp.ptr.thin_pointer.provenance with
+        | none => simp [hpr, ub] at hchk
+        | some ip =>
+          rcases ip with ⟨id, path⟩
+          simp only [hpr] at hchk
+          obtain ⟨alloc, _, hchk⟩ := ep1_bind_ok hchk
+          split at hchk
+          · simp [ub] at hchk
+          · split at hchk
+            · simp [ub] at hchk
+            · have hp' := ep1_pure_ok hchk; cases hp'
+    | some trip =>
+      rcases trip with ⟨id, path, baseOff⟩
+      obtain ⟨alloc, _, hbmLoad⟩ := ep1_bind_ok hbmLoad
+      obtain ⟨_, _, hbmLoad⟩ := ep1_bind_ok hbmLoad
+      obtain ⟨_, _, hbmLoad⟩ := ep1_bind_ok hbmLoad
+      obtain ⟨bs, hsub, hbmLoad⟩ := ep1_bind_ok hbmLoad
+      have hp' := ep1_pure_ok hbmLoad
+      rcases Prod.mk.inj hp' with ⟨rfl, _⟩
+      obtain ⟨hle, rfl⟩ := ep1_subsliceWithLength_eq hsub
+      simp [List.length_take, List.length_drop]; omega
+  unfold Type.decodeM at hdec
+  simp only [hbytesLen, ne_eq, not_true_eq_false, ↓reduceIte] at hdec
+  obtain ⟨⟨discrOpt, u⟩, hdd, hdec⟩ := ep1_bind_ok hdec
+  cases u
+  have hdiscrSome : discrOpt = some d := by
+    cases discrOpt with
+    | none => simp [pure, Except.pure] at hdec
+    | some d' =>
+      obtain ⟨vopt, _, hdec⟩ := ep1_bind_ok hdec
+      cases vopt with
+      | none => simp [pure, Except.pure] at hdec
+      | some _ =>
+        simp only [pure, Except.pure, Except.ok.injEq, Option.some.injEq,
+          Gen.Value.Variant.injEq] at hdec
+        exact congrArg some hdec.1
+  subst hdiscrSome
+  let accPure := fun (_ : Unit) (offset : Gen.Offset) (s : Size) => do
+    let bs ← subsliceWithLength bytes'' offset.bytes s.bytes
+    pure (bs, ())
+  let accLive := fun (mc : MachTB) (idx : Gen.Offset) (s : Size) => do
+    let ptr ← ptrOffsetInboundsM mc rp.ptr.thin_pointer (idx.bytes : Int)
+    let (bs, cm) ← ConcurrentMemory.load mc.mem ptr s ⟨1⟩ .None
+    pure (bs, { mc with mem := cm })
+  have hsim : ∃ mDiscr, decodeDiscriminantM (M := TBM) accLive discr m1 = .ok (some d, mDiscr) := by
+    cases chkOpt with
+    | none =>
+      have hsz0 : sz.bytes = 0 := by
+        unfold BasicMemory.check_ptr at hchk
+        split at hchk
+        · assumption
+        · cases hpr : rp.ptr.thin_pointer.provenance with
+          | none => simp [hpr, ub] at hchk
+          | some ip =>
+            simp only [hpr] at hchk
+            obtain ⟨alloc, _, hchk⟩ := ep1_bind_ok hchk
+            split at hchk
+            · simp [ub] at hchk
+            · split at hchk
+              · simp [ub] at hchk
+              · have hp' := ep1_pure_ok hchk; cases hp'
+      have hbytesNil : bytes'' = [] := List.eq_nil_of_length_eq_zero (hbytesLen.trans hsz0)
+      subst hbytesNil
+      let Inv : MachTB → Prop := fun mc => mc.mem.memory = m1.mem.memory
+      have hstep : ∀ mc off s bs, Inv mc → accPure () off s = .ok (bs, ()) →
+          ∃ mc', accLive mc off s = .ok (bs, mc') ∧ Inv mc' := by
+        intro mc off s bs hinv ha
+        obtain ⟨bs', hsub, hret⟩ := ep1_bind_ok ha
+        have hret' := ep1_pure_ok hret
+        rcases Prod.mk.inj hret' with ⟨rfl, _⟩
+        obtain ⟨hle, rfl⟩ := ep1_subsliceWithLength_eq hsub
+        have hoff0 : off.bytes = 0 := by simp at hle; omega
+        have hs0 : s.bytes = 0 := by simp at hle; omega
+        have hpoi : ptrOffsetInboundsM mc rp.ptr.thin_pointer (off.bytes : Int) = .ok rp.ptr.thin_pointer := by
+          have hsd : ConcurrentMemory.signed_dereferenceable mc.mem rp.ptr.thin_pointer (off.bytes : Int) = .ok () := by
+            unfold ConcurrentMemory.signed_dereferenceable
+            change TreeBorrowsMemory.signed_dereferenceable mc.mem.memory rp.ptr.thin_pointer (off.bytes : Int) = .ok ()
+            simp only [TreeBorrowsMemory.signed_dereferenceable, TreeBorrowsMemory.dereferenceable,
+              BasicMemory.check_ptr, hoff0, Int.natCast_zero, Int.lt_irrefl, ↓reduceIte, Int.neg_zero,
+              Int.toNat_zero, bind, Except.bind, pure, Except.pure]
+          have hib1 : inBounds (off.bytes : Int) .Signed x86_64.PTR_SIZE = true :=
+            ep1_inBounds_nonneg_signed off.bytes (by rw [hoff0]; omega)
+          have hib2 : inBounds (rp.ptr.thin_pointer.addr + (off.bytes : Int)) .Unsigned x86_64.PTR_SIZE = true :=
+            ep1_inBounds_unsigned _ (by rw [hoff0]; simp [haddr0])
+              (by rw [hsz0] at haddrHi; rw [hoff0]; omega)
+          rw [ep1_ptrOffsetInboundsM_ok mc rp.ptr.thin_pointer (off.bytes : Int) hsd hib1 hib2]
+          simp only [hoff0, Int.natCast_zero, Int.add_zero]
+        have hld : ConcurrentMemory.load mc.mem rp.ptr.thin_pointer s ⟨1⟩ .None =
+            .ok ([], { mc.mem with accesses := mc.mem.accesses ++ [⟨.Load, .None, rp.ptr.thin_pointer.addr, s⟩] }) := by
+          apply ep1_concurrent_load_of_mem_load
+          change TreeBorrowsMemory.load mc.mem.memory rp.ptr.thin_pointer s ⟨1⟩ = .ok ([], mc.mem.memory)
+          simp only [TreeBorrowsMemory.load, BasicMemory.load,
+            ep1_align_one_is_aligned, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+            BasicMemory.check_ptr, hs0, bind, Except.bind, pure, Except.pure]
+        refine ⟨{ mc with mem := { mc.mem with accesses := mc.mem.accesses ++ [⟨.Load, .None, rp.ptr.thin_pointer.addr, s⟩] } }, ?_, hinv⟩
+        dsimp only [accLive]
+        rw [hpoi]
+        simp only [bind, Except.bind, hld, pure, Except.pure, List.drop_nil, List.take_nil]
+      obtain ⟨mDiscr, hmDiscr, _⟩ :=
+        ep1_decodeDiscriminantM_sim Inv accPure accLive hstep discr (some d) m1 rfl hdd
+      exact ⟨mDiscr, hmDiscr⟩
+    | some trip =>
+      rcases trip with ⟨id, path, baseOff⟩
+      unfold BasicMemory.check_ptr at hchk
+      have hszPos : sz.bytes ≠ 0 := by
+        intro h0; simp [h0, pure, Except.pure] at hchk
+      simp only [hszPos, ↓reduceIte] at hchk
+      have hprov : rp.ptr.thin_pointer.provenance = some (id, path) := by
+        cases hpr : rp.ptr.thin_pointer.provenance with
+        | none => simp [hpr, ub] at hchk
+        | some ip =>
+          rcases ip with ⟨id', path'⟩
+          simp only [hpr] at hchk
+          obtain ⟨alloc, _, hchk⟩ := ep1_bind_ok hchk
+          split at hchk
+          · simp [ub] at hchk
+          · split at hchk
+            · simp [ub] at hchk
+            · have hp' := ep1_pure_ok hchk
+              simp only [Option.some.injEq, Prod.mk.injEq] at hp'
+              rcases hp' with ⟨rfl, rfl, _⟩
+              rfl
+      simp only [hprov] at hchk
+      obtain ⟨alloc0, hidx0, hchk⟩ := ep1_bind_ok hchk
+      have hlive0 : alloc0.live = true := by
+        cases hl : alloc0.live
+        · simp [hl, ub] at hchk
+        · rfl
+      simp only [hlive0, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hchk
+      have hbounds0 : ¬(rp.ptr.thin_pointer.addr - alloc0.addr < 0 ∨
+          rp.ptr.thin_pointer.addr - alloc0.addr + (sz.bytes : Int) > (Allocation.size alloc0).bytes) := by
+        intro hbad; simp [hbad, ub] at hchk
+      simp only [hbounds0, ↓reduceIte, pure, Except.pure, Except.ok.injEq, Option.some.injEq,
+        Prod.mk.injEq] at hchk
+      rcases hchk with ⟨_, _, hbaseOff⟩
+      obtain ⟨alloc0', hidx0', hbmLoad⟩ := ep1_bind_ok hbmLoad
+      have hallocEq : alloc0' = alloc0 := by rw [hidx0] at hidx0'; cases hidx0'; rfl
+      subst alloc0'
+      obtain ⟨extra', hextra, hbmLoad⟩ := ep1_bind_ok hbmLoad
+      obtain ⟨root', hnodeAcc, _⟩ := ep1_bind_ok hextra
+      obtain ⟨allocs', _, hbmLoad⟩ := ep1_bind_ok hbmLoad
+      obtain ⟨bs0, hsub0, hbmLoad⟩ := ep1_bind_ok hbmLoad
+      have hbmRet := ep1_pure_ok hbmLoad
+      rcases Prod.mk.inj hbmRet with ⟨rfl, _⟩
+      obtain ⟨hle0, rfl⟩ := ep1_subsliceWithLength_eq hsub0
+      have hreadOk0 : ep1NodeReadOk (some path) baseOff.bytes sz.bytes alloc0.extra.root :=
+        ep1_node_access_read_extract alloc0.extra.root root' (some path) baseOff.bytes sz.bytes hnodeAcc
+      have hbaseOffNat : (rp.ptr.thin_pointer.addr - alloc0.addr) = (baseOff.bytes : Int) := by
+        have hnotlt : ¬((rp.ptr.thin_pointer.addr : Int) - (alloc0.addr : Int) < (0 : Int)) :=
+          fun h => hbounds0 (Or.inl h)
+        have hnn : (0 : Int) ≤ (rp.ptr.thin_pointer.addr : Int) - (alloc0.addr : Int) :=
+          Int.not_lt.mp hnotlt
+        have hb : baseOff.bytes = (rp.ptr.thin_pointer.addr - alloc0.addr).toNat := by
+          cases hbaseOff; rfl
+        rw [hb]; exact (Int.toNat_of_nonneg hnn).symm
+      let Inv : MachTB → Prop := fun mc =>
+        ∃ allocC, listIndex mc.mem.memory.mem.allocations id._0 "self.allocations[id.0]" = .ok allocC ∧
+          allocC.data = alloc0.data ∧ allocC.addr = alloc0.addr ∧ allocC.live = true ∧
+          ep1NodeReadOk (some path) baseOff.bytes sz.bytes allocC.extra.root
+      have hinv0 : Inv m1 := ⟨alloc0, hidx0, rfl, rfl, hlive0, hreadOk0⟩
+      have hstep : ∀ mc off s bs, Inv mc → accPure () off s = .ok (bs, ()) →
+          ∃ mc', accLive mc off s = .ok (bs, mc') ∧ Inv mc' := by
+        intro mc off s bs ⟨allocC, hidxC, hdataC, haddrC, hliveC, hreadOkC⟩ ha
+        obtain ⟨bs', hsub, hret⟩ := ep1_bind_ok ha
+        have hret' := ep1_pure_ok hret
+        rcases Prod.mk.inj hret' with ⟨rfl, _⟩
+        obtain ⟨hleSub, rfl⟩ := ep1_subsliceWithLength_eq hsub
+        have hsubLeSz : off.bytes + s.bytes ≤ sz.bytes := by
+          rw [hbytesLen] at hleSub; exact hleSub
+        have hptrEq : (rp.ptr.thin_pointer.addr : Int) - (allocC.addr : Int) = (baseOff.bytes : Int) := by
+          rw [haddrC]; exact hbaseOffNat
+        have hpoi : ptrOffsetInboundsM mc rp.ptr.thin_pointer (off.bytes : Int) =
+            .ok { rp.ptr.thin_pointer with addr := rp.ptr.thin_pointer.addr + (off.bytes : Int) } := by
+          have hsd : ConcurrentMemory.signed_dereferenceable mc.mem rp.ptr.thin_pointer (off.bytes : Int) = .ok () := by
+            unfold ConcurrentMemory.signed_dereferenceable
+            change TreeBorrowsMemory.signed_dereferenceable mc.mem.memory rp.ptr.thin_pointer (off.bytes : Int) = .ok ()
+            unfold TreeBorrowsMemory.signed_dereferenceable TreeBorrowsMemory.dereferenceable
+            by_cases hoff0 : off.bytes = 0
+            · simp only [hoff0, Int.natCast_zero, Int.lt_irrefl, ↓reduceIte, Int.neg_zero, Int.toNat_zero,
+                BasicMemory.check_ptr, bind, Except.bind, pure, Except.pure]
+            · have hoffPos : (off.bytes : Int) > 0 := by omega
+              simp only [hoffPos, ↓reduceIte, Int.toNat_natCast]
+              unfold BasicMemory.check_ptr
+              simp only [hoff0, ↓reduceIte, hprov, hidxC, hliveC, Bool.not_true, Bool.false_eq_true,
+                bind, Except.bind]
+              have hnotOob : ¬(rp.ptr.thin_pointer.addr - allocC.addr < 0 ∨
+                  rp.ptr.thin_pointer.addr - allocC.addr + (off.bytes : Int) > (Allocation.size allocC).bytes) := by
+                unfold Allocation.size; dsimp only
+                rw [hdataC, hptrEq]
+                exact ep1_not_oob_int (Int.natCast_nonneg _) (by omega)
+              simp only [hnotOob, ↓reduceIte, pure, Except.pure]
+          have hib1 : inBounds (off.bytes : Int) .Signed x86_64.PTR_SIZE = true :=
+            ep1_inBounds_nonneg_signed off.bytes (by omega)
+          have hib2 : inBounds (rp.ptr.thin_pointer.addr + (off.bytes : Int)) .Unsigned x86_64.PTR_SIZE = true :=
+            ep1_inBounds_unsigned ((rp.ptr.thin_pointer.addr : Int) + (off.bytes : Int))
+              (Int.add_nonneg haddr0 (Int.natCast_nonneg _))
+              (Int.lt_of_le_of_lt
+                (Int.add_le_add_left (Int.ofNat_le.mpr (Nat.le_trans (Nat.le_add_right _ _) hsubLeSz)) _)
+                haddrHi)
+          exact ep1_ptrOffsetInboundsM_ok mc rp.ptr.thin_pointer (off.bytes : Int) hsd hib1 hib2
+        by_cases hs0 : s.bytes = 0
+        · have hld : ConcurrentMemory.load mc.mem
+              { rp.ptr.thin_pointer with addr := rp.ptr.thin_pointer.addr + (off.bytes : Int) }
+              s ⟨1⟩ .None =
+              .ok ([], { mc.mem with accesses := mc.mem.accesses ++
+                [⟨.Load, .None, rp.ptr.thin_pointer.addr + (off.bytes : Int), s⟩] }) := by
+            apply ep1_concurrent_load_of_mem_load
+            change TreeBorrowsMemory.load mc.mem.memory
+                { rp.ptr.thin_pointer with addr := rp.ptr.thin_pointer.addr + (off.bytes : Int) }
+                s ⟨1⟩ = .ok ([], mc.mem.memory)
+            simp only [TreeBorrowsMemory.load, BasicMemory.load,
+              ep1_align_one_is_aligned, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+              BasicMemory.check_ptr, hs0, bind, Except.bind, pure, Except.pure]
+          refine ⟨{ mc with mem := { mc.mem with accesses := mc.mem.accesses ++
+              [⟨.Load, .None, rp.ptr.thin_pointer.addr + (off.bytes : Int), s⟩] } }, ?_,
+            ⟨allocC, hidxC, hdataC, haddrC, hliveC, hreadOkC⟩⟩
+          dsimp only [accLive]
+          rw [hpoi]
+          simp only [bind, Except.bind, hld, hs0, List.take_zero, pure, Except.pure]
+        · have hchkSub : BasicMemory.check_ptr mc.mem.memory.mem
+              { rp.ptr.thin_pointer with addr := rp.ptr.thin_pointer.addr + (off.bytes : Int) } s =
+              .ok (some (id, path, ⟨baseOff.bytes + off.bytes⟩)) := by
+            unfold BasicMemory.check_ptr
+            simp only [hs0, ↓reduceIte, hprov, hidxC, hliveC, Bool.not_true, Bool.false_eq_true,
+              bind, Except.bind]
+            have hdiff : (rp.ptr.thin_pointer.addr : Int) + (off.bytes : Int) - (allocC.addr : Int) =
+                ((baseOff.bytes + off.bytes : Nat) : Int) := by
+              have hcomm : ∀ (x y z : Int), x + y - z = (x - z) + y := fun x y z => by omega
+              rw [hcomm, hptrEq]
+              exact (Int.natCast_add _ _).symm
+            have hnotOob : ¬(rp.ptr.thin_pointer.addr + (off.bytes : Int) - allocC.addr < 0 ∨
+                rp.ptr.thin_pointer.addr + (off.bytes : Int) - allocC.addr + (s.bytes : Int) >
+                  (Allocation.size allocC).bytes) := by
+              unfold Allocation.size; dsimp only
+              rw [hdataC, hdiff]
+              exact ep1_not_oob_int (Int.natCast_nonneg _) (by omega)
+            simp only [hnotOob, ↓reduceIte]
+            simp only [hdiff, Int.toNat_natCast, pure, Except.pure]
+          obtain ⟨rootC', hnodeAccC, hreadOkC'⟩ :=
+            ep1_node_access_read_exec baseOff.bytes sz.bytes (baseOff.bytes + off.bytes) s.bytes
+              (by omega) (by omega) allocC.extra.root (some path) hreadOkC
+          obtain ⟨hidNN, hidLt, _⟩ := ep1_listIndex_int_eq_getElem hidxC
+          let allocC' : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
+            { allocC with extra := { root := rootC' } }
+          have hsetC : listSet mc.mem.memory.mem.allocations id._0
+              { data := allocC.data, addr := allocC.addr, align := allocC.align, kind := allocC.kind,
+                live := allocC.live, extra := { root := rootC' } } "set" =
+              .ok (mc.mem.memory.mem.allocations.set id._0.toNat allocC') :=
+            ep1_listSet_int_of_lt allocC' "set" hidNN hidLt
+          have hsubC : subsliceWithLength allocC.data ((baseOff.bytes + off.bytes : Nat) : Int) (s.bytes : Int) =
+              .ok ((alloc0.data.drop (baseOff.bytes + off.bytes)).take s.bytes) := by
+            rw [hdataC]
+            exact ep1_subsliceWithLength_of_le alloc0.data (by omega)
+          let cmNext : Gen.ConcurrentMemory TBM :=
+            { memory := { mc.mem.memory with
+                mem := { mc.mem.memory.mem with
+                  allocations := mc.mem.memory.mem.allocations.set id._0.toNat allocC' } },
+              accesses := mc.mem.accesses ++
+                [⟨.Load, .None, rp.ptr.thin_pointer.addr + (off.bytes : Int), s⟩] }
+          have hld : ConcurrentMemory.load mc.mem
+              { rp.ptr.thin_pointer with addr := rp.ptr.thin_pointer.addr + (off.bytes : Int) }
+              s ⟨1⟩ .None =
+              .ok (((alloc0.data.drop (baseOff.bytes + off.bytes)).take s.bytes), cmNext) := by
+            apply ep1_concurrent_load_of_mem_load
+            change TreeBorrowsMemory.load mc.mem.memory
+                { rp.ptr.thin_pointer with addr := rp.ptr.thin_pointer.addr + (off.bytes : Int) }
+                s ⟨1⟩ = .ok (((alloc0.data.drop (baseOff.bytes + off.bytes)).take s.bytes), cmNext.memory)
+            unfold TreeBorrowsMemory.load BasicMemory.load
+            simp only [ep1_align_one_is_aligned, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+              hchkSub, hidxC, hnodeAccC, hsetC, hsubC, bind, Except.bind, pure, Except.pure]
+            rfl
+          refine ⟨{ mc with mem := cmNext }, ?_, ?_⟩
+          · dsimp only [accLive]
+            rw [hpoi]
+            simp only [bind, Except.bind, hld, pure, Except.pure, ep1_drop_take_subslice alloc0.data hsubLeSz]
+          · refine ⟨allocC', ?_, hdataC, haddrC, hliveC, hreadOkC'⟩
+            have hlt' : id._0.toNat < (mc.mem.memory.mem.allocations.set id._0.toNat allocC').length := by
+              simpa [List.length_set] using hidLt
+            rw [ep1_listIndex_int_of_getElem "self.allocations[id.0]" hidNN hlt', List.getElem_set_self]
+      obtain ⟨mDiscr, hmDiscr, _⟩ :=
+        ep1_decodeDiscriminantM_sim Inv accPure accLive hstep discr (some d) m1 hinv0 hdd
+      exact ⟨mDiscr, hmDiscr⟩
+  obtain ⟨mDiscr, hmDiscr⟩ := hsim
+  refine ⟨mDiscr, ?_⟩
+  unfold evalValueM
+  rw [hp]
+  simp only [hal, Bool.not_true, Bool.false_eq_true, ↓reduceIte, bind, Except.bind]
+  simp only [accLive, bind, Except.bind] at hmDiscr
+  rw [hmDiscr]
+  rfl
+
+/-- **Universal `Load ⇒ GetDiscriminant` soundness on `Mach` (`BasicMemory`):**
+whenever `evalValue m (.Load place)` succeeds returning `Value.Variant d data` at an enum
+place satisfying MiniRust's pointer bounds, `evalValue m (.GetDiscriminant place)` ALSO
+succeeds returning `(.Int d, .Int dty)` with identical underlying memory
+(`mDiscr.mem.memory = mLoad.mem.memory`). -/
+theorem ep1_evalValue_load_enum_implies_getDiscriminant_bm
+    (m m1 mLoad : Mach) (place : Gen.PlaceExpr) (rp : Gen.Place BM)
+    (variants : Map Int Gen.Variant) (dty : Gen.IntType) (discr : Gen.Discriminator)
+    (sz : Size) (al : Align) (d : Int) (data : Val)
+    (hp : evalPlace m place = .ok ((rp, .Enum variants dty discr sz al), m1))
+    (haddr0 : 0 ≤ rp.ptr.thin_pointer.addr)
+    (hsz : (sz.bytes : Int) < (2 : Int) ^ 63)
+    (haddrHi : rp.ptr.thin_pointer.addr + (sz.bytes : Int) < (2 : Int) ^ 64)
+    (hload : evalValue m (.Load place) = .ok ((.Variant d data, .Enum variants dty discr sz al), mLoad)) :
+    ∃ mDiscr, evalValue m (.GetDiscriminant place) = .ok ((.Int d, .Int dty), mDiscr) ∧
+      mDiscr.mem.memory = mLoad.mem.memory := by
+  rw [← evalPlaceM_bm_eq] at hp
+  rw [← evalValueM_bm_eq] at hload
+  suffices h : ∃ mDiscr, evalValueM (M := BM) m (.GetDiscriminant place) = .ok ((.Int d, .Int dty), mDiscr) ∧
+      mDiscr.mem.memory = mLoad.mem.memory by
+    obtain ⟨mDiscr, h1, h2⟩ := h
+    rw [evalValueM_bm_eq] at h1
+    exact ⟨mDiscr, h1, h2⟩
+  unfold evalValueM at hload
+  rw [hp] at hload
+  dsimp only [bind, Except.bind] at hload
+  obtain ⟨⟨v, mLoad'⟩, hpl, hret⟩ := ep1_bind_ok hload
+  have hret' := ep1_pure_ok hret
+  rcases Prod.mk.inj hret' with ⟨hvt, rfl⟩
+  rcases Prod.mk.inj hvt with ⟨rfl, _⟩
+  unfold placeLoadM at hpl
+  have hal : rp.aligned = true := by
+    cases h : rp.aligned
+    · simp [h, ub] at hpl
+    · rfl
+  simp only [hal, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hpl
+  unfold typedLoadM at hpl
+  simp only [Type.layout, LayoutStrategy.expect_size, bind, Except.bind, pure, Except.pure] at hpl
+  obtain ⟨⟨bytes, cm⟩, hcmLoad, hpl⟩ := ep1_bind_ok hpl
+  obtain ⟨decOpt, hdec, hpl⟩ := ep1_bind_ok hpl
+  have hdecSome : decOpt = some (.Variant d data) := by
+    cases decOpt with
+    | none => simp [ub] at hpl
+    | some v' =>
+      obtain ⟨_, _, hpl⟩ := ep1_bind_ok hpl
+      have hp' := ep1_pure_ok hpl
+      rcases Prod.mk.inj hp' with ⟨rfl, _⟩
+      rfl
+  subst hdecSome
+  have hmLoadMem : mLoad'.mem.memory = cm.memory := by
+    obtain ⟨_, _, hpl⟩ := ep1_bind_ok hpl
+    have hp' := ep1_pure_ok hpl
+    rcases Prod.mk.inj hp' with ⟨_, rfl⟩
+    rfl
+  unfold ConcurrentMemory.load at hcmLoad
+  obtain ⟨⟨bytes', bm'⟩, hbmLoad, hcmRet⟩ := ep1_bind_ok hcmLoad
+  have hcmRet' := ep1_pure_ok hcmRet
+  rcases Prod.mk.inj hcmRet' with ⟨rfl, rfl⟩
+  change BM.load m1.mem.memory rp.ptr.thin_pointer sz ⟨1⟩ = .ok (bytes', bm') at hbmLoad
+  unfold BM.load at hbmLoad
+  simp only [ep1_align_one_is_aligned, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hbmLoad
+  obtain ⟨chkOpt, hchk, hbmLoad⟩ := ep1_bind_ok hbmLoad
+  have hbmMemEq : bm' = m1.mem.memory := by
+    cases chkOpt with
+    | none =>
+      have hp' := ep1_pure_ok hbmLoad
+      rcases Prod.mk.inj hp' with ⟨_, rfl⟩; rfl
+    | some trip =>
+      rcases trip with ⟨id, _, baseOff⟩
+      obtain ⟨alloc, hidx, hbmLoad⟩ := ep1_bind_ok hbmLoad
+      obtain ⟨allocs', hset, hbmLoad⟩ := ep1_bind_ok hbmLoad
+      obtain ⟨_, _, hbmLoad⟩ := ep1_bind_ok hbmLoad
+      have hp' := ep1_pure_ok hbmLoad
+      rcases Prod.mk.inj hp' with ⟨_, rfl⟩
+      obtain ⟨hidNN, hidLt, helem⟩ := ep1_listIndex_int_eq_getElem hidx
+      have hsetEq := ep1_listSet_int_of_lt alloc "set" hidNN hidLt
+      rw [hsetEq] at hset; cases hset
+      rw [← helem, List.set_getElem_self]
+  have hbytesLen : bytes'.length = sz.bytes := by
+    cases chkOpt with
+    | none =>
+      unfold BM.check_ptr at hchk
+      split at hchk
+      · rename_i hsz0
+        have hp' := ep1_pure_ok hbmLoad
+        rcases Prod.mk.inj hp' with ⟨rfl, _⟩
+        exact hsz0.symm
+      · cases hpr : rp.ptr.thin_pointer.provenance with
+        | none => simp [hpr, ub] at hchk
+        | some ip =>
+          simp only [hpr] at hchk
+          obtain ⟨alloc, _, hchk⟩ := ep1_bind_ok hchk
+          split at hchk
+          · simp [ub] at hchk
+          · split at hchk
+            · simp [ub] at hchk
+            · have hp' := ep1_pure_ok hchk; cases hp'
+    | some trip =>
+      rcases trip with ⟨id, _, baseOff⟩
+      obtain ⟨alloc, _, hbmLoad⟩ := ep1_bind_ok hbmLoad
+      obtain ⟨_, _, hbmLoad⟩ := ep1_bind_ok hbmLoad
+      obtain ⟨bs, hsub, hbmLoad⟩ := ep1_bind_ok hbmLoad
+      have hp' := ep1_pure_ok hbmLoad
+      rcases Prod.mk.inj hp' with ⟨rfl, _⟩
+      obtain ⟨hle, rfl⟩ := ep1_subsliceWithLength_eq hsub
+      simp [List.length_take, List.length_drop]; omega
+  unfold Type.decodeM at hdec
+  simp only [hbytesLen, ne_eq, not_true_eq_false, ↓reduceIte] at hdec
+  obtain ⟨⟨discrOpt, u⟩, hdd, hdec⟩ := ep1_bind_ok hdec
+  cases u
+  have hdiscrSome : discrOpt = some d := by
+    cases discrOpt with
+    | none => simp [pure, Except.pure] at hdec
+    | some d' =>
+      obtain ⟨vopt, _, hdec⟩ := ep1_bind_ok hdec
+      cases vopt with
+      | none => simp [pure, Except.pure] at hdec
+      | some _ =>
+        simp only [pure, Except.pure, Except.ok.injEq, Option.some.injEq,
+          Gen.Value.Variant.injEq] at hdec
+        exact congrArg some hdec.1
+  subst hdiscrSome
+  let accPure := fun (_ : Unit) (offset : Gen.Offset) (s : Size) => do
+    let bs ← subsliceWithLength bytes' offset.bytes s.bytes
+    pure (bs, ())
+  let accLive := fun (mc : Mach) (idx : Gen.Offset) (s : Size) => do
+    let ptr ← ptrOffsetInboundsM (M := BM) mc rp.ptr.thin_pointer (idx.bytes : Int)
+    let (bs, cm) ← ConcurrentMemory.load (M := BM) mc.mem ptr s ⟨1⟩ .None
+    pure (bs, { mc with mem := cm })
+  let Inv : Mach → Prop := fun mc => mc.mem.memory = m1.mem.memory
+  have hsim : ∃ mDiscr, decodeDiscriminantM (M := BM) accLive discr m1 = .ok (some d, mDiscr) ∧ Inv mDiscr := by
+    cases chkOpt with
+    | none =>
+      have hsz0 : sz.bytes = 0 := by
+        unfold BM.check_ptr at hchk
+        split at hchk
+        · assumption
+        · cases hpr : rp.ptr.thin_pointer.provenance with
+          | none => simp [hpr, ub] at hchk
+          | some ip =>
+            simp only [hpr] at hchk
+            obtain ⟨alloc, _, hchk⟩ := ep1_bind_ok hchk
+            split at hchk
+            · simp [ub] at hchk
+            · split at hchk
+              · simp [ub] at hchk
+              · have hp' := ep1_pure_ok hchk; cases hp'
+      have hbytesNil : bytes' = [] := List.eq_nil_of_length_eq_zero (hbytesLen.trans hsz0)
+      subst hbytesNil
+      have hstep : ∀ mc off s bs, Inv mc → accPure () off s = .ok (bs, ()) →
+          ∃ mc', accLive mc off s = .ok (bs, mc') ∧ Inv mc' := by
+        intro mc off s bs hinv ha
+        obtain ⟨bs', hsub, hret⟩ := ep1_bind_ok ha
+        have hret' := ep1_pure_ok hret
+        rcases Prod.mk.inj hret' with ⟨rfl, _⟩
+        obtain ⟨hle, rfl⟩ := ep1_subsliceWithLength_eq hsub
+        have hoff0 : off.bytes = 0 := by simp at hle; omega
+        have hs0 : s.bytes = 0 := by simp at hle; omega
+        have hpoi : ptrOffsetInboundsM (M := BM) mc rp.ptr.thin_pointer (off.bytes : Int) = .ok rp.ptr.thin_pointer := by
+          have hsd : ConcurrentMemory.signed_dereferenceable (M := BM) mc.mem rp.ptr.thin_pointer (off.bytes : Int) = .ok () := by
+            unfold ConcurrentMemory.signed_dereferenceable
+            change BM.signed_dereferenceable mc.mem.memory rp.ptr.thin_pointer (off.bytes : Int) = .ok ()
+            simp only [BM.signed_dereferenceable, BM.dereferenceable, BM.check_ptr, hoff0,
+              Int.natCast_zero, Int.lt_irrefl, ↓reduceIte, Int.neg_zero, Int.toNat_zero,
+              bind, Except.bind, pure, Except.pure]
+          have hib1 : inBounds (off.bytes : Int) .Signed x86_64.PTR_SIZE = true :=
+            ep1_inBounds_nonneg_signed off.bytes (by rw [hoff0]; omega)
+          have hib2 : inBounds (rp.ptr.thin_pointer.addr + (off.bytes : Int)) .Unsigned x86_64.PTR_SIZE = true :=
+            ep1_inBounds_unsigned _ (by rw [hoff0]; simp [haddr0])
+              (by rw [hsz0] at haddrHi; rw [hoff0]; omega)
+          rw [ep1_ptrOffsetInboundsM_ok (M := BM) mc rp.ptr.thin_pointer (off.bytes : Int) hsd hib1 hib2]
+          simp only [hoff0, Int.natCast_zero, Int.add_zero]
+        have hld : ConcurrentMemory.load (M := BM) mc.mem rp.ptr.thin_pointer s ⟨1⟩ .None =
+            .ok ([], { mc.mem with accesses := mc.mem.accesses ++ [⟨.Load, .None, rp.ptr.thin_pointer.addr, s⟩] }) := by
+          apply ep1_concurrent_load_of_mem_load (M := BM)
+          change BM.load mc.mem.memory rp.ptr.thin_pointer s ⟨1⟩ = .ok ([], mc.mem.memory)
+          simp only [BM.load, ep1_align_one_is_aligned, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+            BM.check_ptr, hs0, bind, Except.bind, pure, Except.pure]
+        refine ⟨{ mc with mem := { mc.mem with accesses := mc.mem.accesses ++ [⟨.Load, .None, rp.ptr.thin_pointer.addr, s⟩] } }, ?_, hinv⟩
+        dsimp only [accLive]
+        rw [hpoi]
+        simp only [bind, Except.bind, hld, pure, Except.pure, List.drop_nil, List.take_nil]
+      exact ep1_decodeDiscriminantM_sim Inv accPure accLive hstep discr (some d) m1 rfl hdd
+    | some trip =>
+      rcases trip with ⟨id, pu, baseOff⟩
+      cases pu
+      unfold BM.check_ptr at hchk
+      have hszPos : sz.bytes ≠ 0 := by
+        intro h0; simp [h0, pure, Except.pure] at hchk
+      simp only [hszPos, ↓reduceIte] at hchk
+      have hprov : rp.ptr.thin_pointer.provenance = some (id, ()) := by
+        cases hpr : rp.ptr.thin_pointer.provenance with
+        | none => simp [hpr, ub] at hchk
+        | some ip =>
+          rcases ip with ⟨id', pu'⟩
+          cases pu'
+          simp only [hpr] at hchk
+          obtain ⟨alloc, _, hchk⟩ := ep1_bind_ok hchk
+          split at hchk
+          · simp [ub] at hchk
+          · split at hchk
+            · simp [ub] at hchk
+            · have hp' := ep1_pure_ok hchk
+              simp only [Option.some.injEq, Prod.mk.injEq] at hp'
+              rcases hp' with ⟨rfl, _, _⟩
+              rfl
+      simp only [hprov] at hchk
+      obtain ⟨alloc0, hidx0, hchk⟩ := ep1_bind_ok hchk
+      have hlive0 : alloc0.live = true := by
+        cases hl : alloc0.live
+        · simp [hl, ub] at hchk
+        · rfl
+      simp only [hlive0, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hchk
+      have hbounds0 : ¬(rp.ptr.thin_pointer.addr - alloc0.addr < 0 ∨
+          rp.ptr.thin_pointer.addr - alloc0.addr + (sz.bytes : Int) > (Allocation.size alloc0).bytes) := by
+        intro hbad; simp [hbad, ub] at hchk
+      simp only [hbounds0, ↓reduceIte, pure, Except.pure, Except.ok.injEq, Option.some.injEq,
+        Prod.mk.injEq] at hchk
+      rcases hchk with ⟨_, _, hbaseOff⟩
+      obtain ⟨alloc0', hidx0', hbmLoad⟩ := ep1_bind_ok hbmLoad
+      have hallocEq : alloc0' = alloc0 := by rw [hidx0] at hidx0'; cases hidx0'; rfl
+      subst alloc0'
+      obtain ⟨_, _, hbmLoad⟩ := ep1_bind_ok hbmLoad
+      obtain ⟨bs0, hsub0, hbmLoad⟩ := ep1_bind_ok hbmLoad
+      have hbmRet := ep1_pure_ok hbmLoad
+      rcases Prod.mk.inj hbmRet with ⟨rfl, _⟩
+      obtain ⟨hle0, rfl⟩ := ep1_subsliceWithLength_eq hsub0
+      have hbaseOffNat : (rp.ptr.thin_pointer.addr : Int) - (alloc0.addr : Int) = (baseOff.bytes : Int) := by
+        have hnotlt : ¬((rp.ptr.thin_pointer.addr : Int) - (alloc0.addr : Int) < (0 : Int)) :=
+          fun h => hbounds0 (Or.inl h)
+        have hnn : (0 : Int) ≤ (rp.ptr.thin_pointer.addr : Int) - (alloc0.addr : Int) :=
+          Int.not_lt.mp hnotlt
+        have hb : baseOff.bytes = (rp.ptr.thin_pointer.addr - alloc0.addr).toNat := by
+          cases hbaseOff; rfl
+        rw [hb]; exact (Int.toNat_of_nonneg hnn).symm
+      have hstep : ∀ mc off s bs, Inv mc → accPure () off s = .ok (bs, ()) →
+          ∃ mc', accLive mc off s = .ok (bs, mc') ∧ Inv mc' := by
+        intro mc off s bs hinv ha
+        obtain ⟨bs', hsub, hret⟩ := ep1_bind_ok ha
+        have hret' := ep1_pure_ok hret
+        rcases Prod.mk.inj hret' with ⟨rfl, _⟩
+        obtain ⟨hleSub, rfl⟩ := ep1_subsliceWithLength_eq hsub
+        have hsubLeSz : off.bytes + s.bytes ≤ sz.bytes := by
+          rw [hbytesLen] at hleSub; exact hleSub
+        have hidxC : listIndex mc.mem.memory.allocations id._0 "self.allocations[id.0]" = .ok alloc0 := by
+          rw [hinv]; exact hidx0
+        have hpoi : ptrOffsetInboundsM (M := BM) mc rp.ptr.thin_pointer (off.bytes : Int) =
+            .ok { rp.ptr.thin_pointer with addr := rp.ptr.thin_pointer.addr + (off.bytes : Int) } := by
+          have hsd : ConcurrentMemory.signed_dereferenceable (M := BM) mc.mem rp.ptr.thin_pointer (off.bytes : Int) = .ok () := by
+            unfold ConcurrentMemory.signed_dereferenceable
+            change BM.signed_dereferenceable mc.mem.memory rp.ptr.thin_pointer (off.bytes : Int) = .ok ()
+            unfold BM.signed_dereferenceable BM.dereferenceable
+            by_cases hoff0 : off.bytes = 0
+            · simp only [hoff0, Int.natCast_zero, Int.lt_irrefl, ↓reduceIte, Int.neg_zero, Int.toNat_zero,
+                BM.check_ptr, bind, Except.bind, pure, Except.pure]
+            · have hoffPos : (off.bytes : Int) > 0 := by omega
+              simp only [hoffPos, ↓reduceIte, Int.toNat_natCast]
+              unfold BM.check_ptr
+              simp only [hoff0, ↓reduceIte, hprov, hidxC, hlive0, Bool.not_true, Bool.false_eq_true,
+                bind, Except.bind]
+              have hnotOob : ¬(rp.ptr.thin_pointer.addr - alloc0.addr < 0 ∨
+                  rp.ptr.thin_pointer.addr - alloc0.addr + (off.bytes : Int) > (Allocation.size alloc0).bytes) := by
+                unfold Allocation.size; dsimp only
+                rw [hbaseOffNat]
+                exact ep1_not_oob_int (Int.natCast_nonneg _) (by omega)
+              simp only [hnotOob, ↓reduceIte, pure, Except.pure]
+          have hib1 : inBounds (off.bytes : Int) .Signed x86_64.PTR_SIZE = true :=
+            ep1_inBounds_nonneg_signed off.bytes (by omega)
+          have hib2 : inBounds (rp.ptr.thin_pointer.addr + (off.bytes : Int)) .Unsigned x86_64.PTR_SIZE = true :=
+            ep1_inBounds_unsigned ((rp.ptr.thin_pointer.addr : Int) + (off.bytes : Int))
+              (Int.add_nonneg haddr0 (Int.natCast_nonneg _))
+              (Int.lt_of_le_of_lt
+                (Int.add_le_add_left (Int.ofNat_le.mpr (Nat.le_trans (Nat.le_add_right _ _) hsubLeSz)) _)
+                haddrHi)
+          exact ep1_ptrOffsetInboundsM_ok (M := BM) mc rp.ptr.thin_pointer (off.bytes : Int) hsd hib1 hib2
+        by_cases hs0 : s.bytes = 0
+        · have hld : ConcurrentMemory.load (M := BM) mc.mem
+              { rp.ptr.thin_pointer with addr := rp.ptr.thin_pointer.addr + (off.bytes : Int) }
+              s ⟨1⟩ .None =
+              .ok ([], { mc.mem with accesses := mc.mem.accesses ++
+                [⟨.Load, .None, rp.ptr.thin_pointer.addr + (off.bytes : Int), s⟩] }) := by
+            apply ep1_concurrent_load_of_mem_load (M := BM)
+            change BM.load mc.mem.memory
+                { rp.ptr.thin_pointer with addr := rp.ptr.thin_pointer.addr + (off.bytes : Int) }
+                s ⟨1⟩ = .ok ([], mc.mem.memory)
+            simp only [BM.load, ep1_align_one_is_aligned, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+              BM.check_ptr, hs0, bind, Except.bind, pure, Except.pure]
+          refine ⟨{ mc with mem := { mc.mem with accesses := mc.mem.accesses ++
+              [⟨.Load, .None, rp.ptr.thin_pointer.addr + (off.bytes : Int), s⟩] } }, ?_, hinv⟩
+          dsimp only [accLive]
+          rw [hpoi]
+          simp only [bind, Except.bind, hld, hs0, List.take_zero, pure, Except.pure]
+        · have hchkSub : BM.check_ptr mc.mem.memory
+              { rp.ptr.thin_pointer with addr := rp.ptr.thin_pointer.addr + (off.bytes : Int) } s =
+              .ok (some (id, (), ⟨baseOff.bytes + off.bytes⟩)) := by
+            unfold BM.check_ptr
+            simp only [hs0, ↓reduceIte, hprov, hidxC, hlive0, Bool.not_true, Bool.false_eq_true,
+              bind, Except.bind]
+            have hdiff : (rp.ptr.thin_pointer.addr : Int) + (off.bytes : Int) - (alloc0.addr : Int) =
+                ((baseOff.bytes + off.bytes : Nat) : Int) := by
+              have hcomm : ∀ (x y z : Int), x + y - z = (x - z) + y := fun x y z => by omega
+              rw [hcomm, hbaseOffNat]
+              exact (Int.natCast_add _ _).symm
+            have hnotOob : ¬(rp.ptr.thin_pointer.addr + (off.bytes : Int) - alloc0.addr < 0 ∨
+                rp.ptr.thin_pointer.addr + (off.bytes : Int) - alloc0.addr + (s.bytes : Int) >
+                  (Allocation.size alloc0).bytes) := by
+              unfold Allocation.size; dsimp only
+              rw [hdiff]
+              exact ep1_not_oob_int (Int.natCast_nonneg _) (by omega)
+            simp only [hnotOob, ↓reduceIte]
+            simp only [hdiff, Int.toNat_natCast, pure, Except.pure]
+          obtain ⟨hidNN, hidLt, helem⟩ := ep1_listIndex_int_eq_getElem hidxC
+          have hsetC : listSet mc.mem.memory.allocations id._0 alloc0 "set" =
+              .ok mc.mem.memory.allocations := by
+            rw [ep1_listSet_int_of_lt _ "set" hidNN hidLt, ← helem, List.set_getElem_self]
+          have hsubC : subsliceWithLength alloc0.data ((baseOff.bytes + off.bytes : Nat) : Int) (s.bytes : Int) =
+              .ok ((alloc0.data.drop (baseOff.bytes + off.bytes)).take s.bytes) :=
+            ep1_subsliceWithLength_of_le alloc0.data (by omega)
+          let cmNext : Gen.ConcurrentMemory BM :=
+            { memory := mc.mem.memory,
+              accesses := mc.mem.accesses ++
+                [⟨.Load, .None, rp.ptr.thin_pointer.addr + (off.bytes : Int), s⟩] }
+          have hld : ConcurrentMemory.load (M := BM) mc.mem
+              { rp.ptr.thin_pointer with addr := rp.ptr.thin_pointer.addr + (off.bytes : Int) }
+              s ⟨1⟩ .None =
+              .ok (((alloc0.data.drop (baseOff.bytes + off.bytes)).take s.bytes), cmNext) := by
+            apply ep1_concurrent_load_of_mem_load (M := BM)
+            change BM.load mc.mem.memory
+                { rp.ptr.thin_pointer with addr := rp.ptr.thin_pointer.addr + (off.bytes : Int) }
+                s ⟨1⟩ = .ok (((alloc0.data.drop (baseOff.bytes + off.bytes)).take s.bytes), mc.mem.memory)
+            unfold BM.load
+            simp only [ep1_align_one_is_aligned, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+              hchkSub, hidxC, hsetC, hsubC, bind, Except.bind, pure, Except.pure]
+          refine ⟨{ mc with mem := cmNext }, ?_, hinv⟩
+          dsimp only [accLive]
+          rw [hpoi]
+          simp only [bind, Except.bind, hld, pure, Except.pure, ep1_drop_take_subslice alloc0.data hsubLeSz]
+      exact ep1_decodeDiscriminantM_sim Inv accPure accLive hstep discr (some d) m1 rfl hdd
+  obtain ⟨mDiscr, hmDiscr, hinv⟩ := hsim
+  refine ⟨mDiscr, ?_, by rw [hinv, hmLoadMem, hbmMemEq]⟩
+  unfold evalValueM
+  rw [hp]
+  simp only [hal, Bool.not_true, Bool.false_eq_true, ↓reduceIte, bind, Except.bind]
+  simp only [accLive, bind, Except.bind] at hmDiscr
+  rw [hmDiscr]
+  rfl
+
+private theorem ep1_subsliceWithLength_len {T : Type} {xs bs : List T} {start len : Nat}
+    (h : subsliceWithLength xs (start : Int) (len : Int) = .ok bs) :
+    bs.length = len := by
+  unfold subsliceWithLength at h
+  split at h
+  · rename_i hcond
+    simp only [pure, Except.pure, Except.ok.injEq, Int.toNat_natCast] at h
+    subst h
+    simp only [List.length_take, List.length_drop]
+    omega
+  · simp [specPanic] at h
+
+private theorem ep1_checkUnionChunksM_mapM {M : Type} [Gen.Memory M]
+    (data : List (Gen.AbstractByte (Gen.Memory.Provenance M))) :
+    ∀ (chunks : List (Gen.Offset × Size)) (chunkData : List (List (Gen.AbstractByte (Gen.Memory.Provenance M)))),
+      chunks.mapM (fun (offset, chunkSize) => subsliceWithLength data offset.bytes chunkSize.bytes) = .ok chunkData →
+      chunkData.length = chunks.length ∧
+        checkUnionChunksM (Provenance := Gen.Memory.Provenance M) chunkData chunks = Except.ok ()
+  | [], chunkData, h => by
+    have hp := ep1_pure_ok h; subst hp
+    exact ⟨rfl, rfl⟩
+  | (off, csz) :: rest, chunkData, h => by
+    simp only [List.mapM_cons] at h
+    obtain ⟨bs, hsub, h⟩ := ep1_bind_ok h
+    obtain ⟨restData, hrest, hp⟩ := ep1_bind_ok h
+    have hp' := ep1_pure_ok hp; subst hp'
+    have hlen : bs.length = csz.bytes := ep1_subsliceWithLength_len hsub
+    obtain ⟨hrestLen, hrestChk⟩ := ep1_checkUnionChunksM_mapM data rest restData hrest
+    refine ⟨by simp [hrestLen], ?_⟩
+    unfold checkUnionChunksM ensureElseUb
+    simp only [hlen, beq_self_eq_true, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+      bind, Except.bind, pure, Except.pure, hrestChk]
+
+/-- **Universal `ValueExpr::Union` validity and full-chunk encode-decode roundtrip:**
+on every `Memory` `M`:
+1. every successful `evalValueM m (.Union field expr unionTy)` yields a value of type
+   `unionTy` that satisfies `checkValueM v unionTy mOpt = .ok ()` for any `mOpt`;
+2. for a full-chunk union (`chunks = [(⟨0⟩, sz)]`), constructing via `ValueExpr::Union`
+   produces `.Union [data]`, re-encoding via `Type.encodeM` recovers the exact byte array
+   `data`, and slicing `data` at `(off, encoded.length)` recovers the exact `encoded` field
+   bytes. -/
+theorem ep1_evalValueM_union_produces_valid_value_and_roundtrip
+    {M : Type} [Gen.Memory M] [MemoryOps M] :
+    (∀ (m m' : Gen.Machine M) (field : Int) (expr : Gen.ValueExpr) (unionTy ty : Gen.Type)
+        (v : Gen.Value M) (mOpt : Option (Gen.Machine M)),
+      evalValueM m (.Union field expr unionTy) = .ok ((v, ty), m') →
+      ty = unionTy ∧ checkValueM v unionTy mOpt = .ok ()) ∧
+    (∀ (m m1 : Gen.Machine M) (field : Int) (expr : Gen.ValueExpr)
+        (fields : List (Gen.Offset × Gen.Type)) (sz : Size) (al : Align)
+        (off : Gen.Offset) (exprTy : Gen.Type) (val : Gen.Value M) (vty : Gen.Type)
+        (encoded data : List (Gen.AbstractByte (Gen.Memory.Provenance M))),
+      let unionTy : Gen.Type := .Union fields [(⟨0⟩, sz)] sz al
+      listIndex fields field "fields[field]" = .ok (off, exprTy) →
+      evalValueM m expr = .ok ((val, vty), m1) →
+      Type.encodeM exprTy val = .ok encoded →
+      writeSubsliceAtIndex (List.replicate sz.bytes .Uninit) (off.bytes : Int) encoded = .ok data →
+      evalValueM m (.Union field expr unionTy) = .ok ((.Union [data], unionTy), m1) ∧
+      Type.encodeM unionTy (.Union [data]) = .ok data ∧
+      subsliceWithLength data (off.bytes : Int) (encoded.length : Int) = .ok encoded) := by
+  constructor
+  · intro m m' field expr unionTy ty v mOpt h
+    cases unionTy with
+    | Union fields chunks sz al =>
+      rw [ep1_evalValueM_union_complete_spec] at h
+      obtain ⟨⟨off, exprTy⟩, _, h⟩ := ep1_bind_ok h
+      obtain ⟨⟨⟨val, _⟩, m1⟩, _, h⟩ := ep1_bind_ok h
+      obtain ⟨encoded, _, h⟩ := ep1_bind_ok h
+      obtain ⟨data, _, h⟩ := ep1_bind_ok h
+      obtain ⟨chunkData, hmap, hp⟩ := ep1_bind_ok h
+      have hp' := ep1_pure_ok hp
+      rcases Prod.mk.inj hp' with ⟨hvt, _⟩
+      rcases Prod.mk.inj hvt with ⟨rfl, rfl⟩
+      obtain ⟨hlen, hchk⟩ := ep1_checkUnionChunksM_mapM data chunks chunkData hmap
+      refine ⟨rfl, ?_⟩
+      unfold checkValueM ensureElseUb
+      simp only [hlen, beq_self_eq_true, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+        bind, Except.bind, pure, Except.pure, hchk]
+    | _ =>
+      simp [evalValueM, specPanic, bind, Except.bind] at h
+  · intro m m1 field expr fields sz al off exprTy val vty encoded data unionTy hidx hev henc hws
+    have hdataLen : data.length = sz.bytes := by
+      rw [writeSubsliceAtIndex_length hws, List.length_replicate]
+    have hsubFull : subsliceWithLength data ((0 : Nat) : Int) (sz.bytes : Int) = .ok data := by
+      unfold subsliceWithLength
+      have hcond : (0 : Int) ≤ ((0 : Nat) : Int) ∧ (0 : Int) ≤ (sz.bytes : Int) ∧
+          ((0 : Nat) : Int) + (sz.bytes : Int) ≤ (data.length : Int) := by
+        rw [hdataLen]; omega
+      simp only [hcond, and_self, ↓reduceIte]
+      simp only [Int.natCast_zero, Int.toNat_zero, Int.toNat_natCast, List.drop_zero,
+        ← hdataLen, List.take_length, pure, Except.pure]
+    have hUnionEval : evalValueM m (.Union field expr unionTy) = .ok ((.Union [data], unionTy), m1) := by
+      dsimp only [unionTy]
+      rw [ep1_evalValueM_union_complete_spec]
+      simp only [hidx, hev, henc, hws, List.mapM_cons, List.mapM_nil, hsubFull,
+        bind, Except.bind, pure, Except.pure]
+    have hEncode : Type.encodeM unionTy (.Union [data]) = .ok data := by
+      dsimp only [unionTy]
+      unfold Type.encodeM Type.encodeUnionChunksM
+      simp only [List.length_singleton, ne_eq, not_true_eq_false, ↓reduceIte, hdataLen,
+        bind, Except.bind]
+      unfold writeSubsliceAtIndex
+      have hcond : (0 : Int) ≤ ((0 : Nat) : Int) ∧ ((0 : Nat) : Int) + (data.length : Int) ≤
+          ((List.replicate sz.bytes
+            (.Uninit : Gen.AbstractByte (Gen.Memory.Provenance M))).length : Int) := by
+        rw [List.length_replicate, hdataLen]; omega
+      simp only [hcond, and_self, ↓reduceIte]
+      simp only [Int.natCast_zero, Int.toNat_zero, List.take_zero, List.nil_append,
+        Nat.zero_add, hdataLen, List.drop_replicate, Nat.sub_self, List.replicate_zero,
+        List.append_nil, pure, Except.pure]
+      rfl
+    have hRecover : subsliceWithLength data (off.bytes : Int) (encoded.length : Int) = .ok encoded := by
+      unfold writeSubsliceAtIndex at hws
+      split at hws
+      · rename_i hcond
+        have hdataEq := ep1_pure_ok hws
+        subst hdataEq
+        unfold subsliceWithLength
+        have hlenTake : (List.take off.bytes
+            (List.replicate sz.bytes (.Uninit : Gen.AbstractByte (Gen.Memory.Provenance M)))).length = off.bytes := by
+          simp only [List.length_take, List.length_replicate]
+          rw [List.length_replicate] at hcond
+          omega
+        have hcond2 : (0 : Int) ≤ (off.bytes : Int) ∧ (0 : Int) ≤ (encoded.length : Int) ∧
+            (off.bytes : Int) + (encoded.length : Int) ≤
+              ((List.take (off.bytes : Int).toNat
+                (List.replicate sz.bytes (.Uninit : Gen.AbstractByte (Gen.Memory.Provenance M))) ++
+                encoded ++
+                List.drop ((off.bytes : Int).toNat + encoded.length)
+                  (List.replicate sz.bytes (.Uninit : Gen.AbstractByte (Gen.Memory.Provenance M)))).length : Int) := by
+          simp only [List.length_append, Int.toNat_natCast, hlenTake, List.length_drop, List.length_replicate]
+          omega
+        simp only [hcond2, and_self, ↓reduceIte]
+        simp only [Int.toNat_natCast]
+        rw [List.append_assoc, List.drop_append, hlenTake]
+        simp only [Nat.sub_self, List.drop_zero,
+          List.drop_eq_nil_of_le (Nat.le_of_eq hlenTake), List.nil_append, List.take_left,
+          pure, Except.pure]
+      · simp [specPanic] at hws
+    exact ⟨hUnionEval, hEncode, hRecover⟩
+
+private theorem ep1_vtable_layout_total :
+    ∀ (ty : Gen.Type) (t : Gen.TraitName),
+      Type.meta_kind ty = .VTablePointer t →
+      ∃ lay, Type.layout ty = .ok lay ∧ LayoutStrategy.meta_kind lay = .VTablePointer t
+  | .TraitObject tn, t, h => by
+    simp only [Type.meta_kind, Gen.PointerMetaKind.VTablePointer.injEq] at h
+    subst h
+    exact ⟨.TraitObject tn, rfl, rfl⟩
+  | .Tuple _ head (some tail), t, h => by
+    simp only [Type.meta_kind] at h
+    obtain ⟨tlay, htlay, hmk⟩ := ep1_vtable_layout_total tail t h
+    refine ⟨.Tuple head tlay, ?_, by simpa [LayoutStrategy.meta_kind] using hmk⟩
+    simp only [Type.layout, htlay, bind, Except.bind, pure, Except.pure]
+  | .Tuple _ _ none, _, h => by simp [Type.meta_kind] at h
+  | .Int _, _, h => by simp [Type.meta_kind] at h
+  | .Bool, _, h => by simp [Type.meta_kind] at h
+  | .Ptr _, _, h => by simp [Type.meta_kind] at h
+  | .Union _ _ _ _, _, h => by simp [Type.meta_kind] at h
+  | .Enum _ _ _ _ _, _, h => by simp [Type.meta_kind] at h
+  | .Array _ _, _, h => by simp [Type.meta_kind] at h
+  | .Slice _, _, h => by simp [Type.meta_kind] at h
+
+/-- **Strict non-vtable panic totality and `Type::layout` totality on vtable types:**
+strengthening `ep1_evalUnOpM_meta_unops_error_is_specPanic_or_unsupported` on every `Memory` `M`:
+1. whenever `Type.meta_kind ty = .VTablePointer t`, `Type.layout ty` is total (succeeds with
+   a layout of kind `.VTablePointer t`), proving that the interpreter's fail-closed vtable
+   guard before `Type.layout` in `ComputeSize`/`ComputeAlign` can never mask a `Type.layout`
+   spec panic;
+2. for any non-vtable pointer type (`PtrType.meta_kind ptrTy ≠ .VTablePointer _`), any failure
+   of `GetMetadata` is strictly `Stop.specPanic` (never `unsupported` and never `ub`);
+3. for any non-vtable pointee type (`Type.meta_kind ty ≠ .VTablePointer _`), any failure of
+   `ComputeSize ty` or `ComputeAlign ty` is strictly `Stop.specPanic` (never `unsupported`
+   and never `ub`). -/
+theorem ep1_meta_unops_nonVTable_never_unsupported_and_vtable_layout_total
+    {M : Type} [Gen.Memory M] [MemoryOps M] :
+    (∀ (ty : Gen.Type) (t : Gen.TraitName),
+      Type.meta_kind ty = .VTablePointer t →
+      ∃ lay, Type.layout ty = .ok lay ∧ LayoutStrategy.meta_kind lay = .VTablePointer t) ∧
+    (∀ (ptr : Gen.Pointer (Gen.Memory.Provenance M)) (ptrTy : Gen.PtrType)
+        (m : Option (Gen.Machine M)) (e : Stop),
+      (∀ t, PtrType.meta_kind ptrTy ≠ .VTablePointer t) →
+      evalUnOpM .GetMetadata (.Ptr ptr, .Ptr ptrTy) m = .error e →
+      ∃ msg, e = .specPanic msg) ∧
+    (∀ (ty opTy : Gen.Type) (v : Gen.Value M) (m : Option (Gen.Machine M)) (e : Stop),
+      (∀ t, Type.meta_kind ty ≠ .VTablePointer t) →
+      (evalUnOpM (.ComputeSize ty) (v, opTy) m = .error e ∨
+       evalUnOpM (.ComputeAlign ty) (v, opTy) m = .error e) →
+      ∃ msg, e = .specPanic msg) := by
+  refine ⟨ep1_vtable_layout_total, ?_, ?_⟩
+  · intro ptr ptrTy m e hnv h
+    rcases ptr with ⟨thin, metaOpt⟩
+    cases hk : PtrType.meta_kind ptrTy with
+    | VTablePointer t => exact absurd hk (hnv t)
+    | None =>
+      cases metaOpt with
+      | none =>
+        rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy m).1 hk] at h
+        cases h
+      | some pm =>
+        rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy m).2.2.2.1 pm hk] at h
+        cases h; exact ⟨_, rfl⟩
+    | ElementCount =>
+      cases metaOpt with
+      | none =>
+        rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy m).2.2.2.2.1 hk] at h
+        cases h; exact ⟨_, rfl⟩
+      | some pm =>
+        cases pm with
+        | ElementCount c =>
+          rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy m).2.1 c hk] at h
+          cases hc : IntType.can_represent IntType.usize_ty c <;> simp [hc, specPanic] at h
+          exact ⟨_, h.symm⟩
+        | VTablePointer p =>
+          rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy m).2.2.2.2.2.1 p hk] at h
+          cases h; exact ⟨_, rfl⟩
+  · intro ty opTy v m e hnv h
+    have hDecodeNonVT : ∀ (pm : Option (Gen.PointerMeta (Gen.Memory.Provenance M))),
+        PointerMetaKind.decode_valueM (M := M) (Type.meta_kind ty) v = .ok pm →
+        ∀ p, pm ≠ some (.VTablePointer p) := by
+      intro pm hdv p hEq
+      subst hEq
+      cases hk : Type.meta_kind ty with
+      | VTablePointer t => exact absurd hk (hnv t)
+      | None =>
+        rw [hk] at hdv; unfold PointerMetaKind.decode_valueM at hdv
+        split at hdv <;> simp_all [pure, Except.pure, specPanic]
+      | ElementCount =>
+        rw [hk] at hdv; unfold PointerMetaKind.decode_valueM at hdv
+        split at hdv <;> simp_all [pure, Except.pure, specPanic]
+    have hCsaNonVT : ∀ (vt : Gen.ThinPointer (Gen.Memory.Provenance M) → Interp Gen.VTable)
+        (lay : Gen.LayoutStrategy) (pm : Option (Gen.PointerMeta (Gen.Memory.Provenance M))) (e' : Stop),
+        (∀ p, pm ≠ some (.VTablePointer p)) →
+        LayoutStrategy.compute_size_and_align vt lay pm = .error e' →
+        ∃ msg, e' = .specPanic msg := by
+      intro vt lay
+      induction lay with
+      | Sized _ _ =>
+        intro pm e' _ hcsa
+        cases pm <;> simp [LayoutStrategy.compute_size_and_align, pure, Except.pure, specPanic] at hcsa
+        exact ⟨_, hcsa.symm⟩
+      | Slice _ _ =>
+        intro pm e' hnotVT hcsa
+        cases pm with
+        | none => simp [LayoutStrategy.compute_size_and_align, specPanic] at hcsa; exact ⟨_, hcsa.symm⟩
+        | some mv =>
+          cases mv with
+          | VTablePointer p => exact absurd rfl (hnotVT p)
+          | ElementCount c =>
+            unfold LayoutStrategy.compute_size_and_align at hcsa; dsimp only at hcsa
+            split at hcsa <;> simp [pure, Except.pure, specPanic] at hcsa
+            exact ⟨_, hcsa.symm⟩
+      | TraitObject _ =>
+        intro pm e' hnotVT hcsa
+        cases pm with
+        | none => simp [LayoutStrategy.compute_size_and_align, specPanic] at hcsa; exact ⟨_, hcsa.symm⟩
+        | some mv =>
+          cases mv with
+          | VTablePointer p => exact absurd rfl (hnotVT p)
+          | ElementCount _ => simp [LayoutStrategy.compute_size_and_align, specPanic] at hcsa; exact ⟨_, hcsa.symm⟩
+      | Tuple _ tail ih =>
+        intro pm e' hnotVT hcsa
+        cases pm with
+        | none => simp [LayoutStrategy.compute_size_and_align, specPanic] at hcsa; exact ⟨_, hcsa.symm⟩
+        | some mv =>
+          unfold LayoutStrategy.compute_size_and_align at hcsa
+          rcases ep1_bind_error hcsa with ht | ⟨_, _, hp2⟩
+          · exact ih (some mv) e' hnotVT ht
+          · simp [pure, Except.pure] at hp2
+    have hRun : ∀ (isSize : Bool),
+        (if isSize then evalUnOpM (.ComputeSize ty) (v, opTy) none
+         else evalUnOpM (.ComputeAlign ty) (v, opTy) none) = .error e →
+        ∃ msg, e = .specPanic msg := by
+      intro isSize he
+      cases isSize <;> simp only [↓reduceIte, Bool.false_eq_true] at he <;> unfold evalUnOpM at he
+      · rcases ep1_bind_error he with hdv | ⟨pm, hdv, htail⟩
+        · unfold PointerMetaKind.decode_valueM at hdv
+          split at hdv <;> simp [pure, Except.pure, specPanic] at hdv
+          exact ⟨_, hdv.symm⟩
+        · have hnotVT := hDecodeNonVT pm hdv
+          cases pm with
+          | none =>
+            rcases ep1_bind_error htail with hl | ⟨lay, _, htail⟩
+            · exact ep1_Type_layout_error_is_specPanic ty e hl
+            · rcases ep1_bind_error htail with hc | ⟨_, _, hp⟩
+              · exact hCsaNonVT _ lay none e hnotVT (ep1_map_error hc)
+              · simp [pure, Except.pure] at hp
+          | some mval =>
+            cases mval with
+            | VTablePointer p => exact absurd rfl (hnotVT p)
+            | ElementCount c =>
+              rcases ep1_bind_error htail with hl | ⟨lay, _, htail⟩
+              · exact ep1_Type_layout_error_is_specPanic ty e hl
+              · rcases ep1_bind_error htail with hc | ⟨_, _, hp⟩
+                · exact hCsaNonVT _ lay (some (.ElementCount c)) e hnotVT (ep1_map_error hc)
+                · simp [pure, Except.pure] at hp
+      · rcases ep1_bind_error he with hdv | ⟨pm, hdv, htail⟩
+        · unfold PointerMetaKind.decode_valueM at hdv
+          split at hdv <;> simp [pure, Except.pure, specPanic] at hdv
+          exact ⟨_, hdv.symm⟩
+        · have hnotVT := hDecodeNonVT pm hdv
+          cases pm with
+          | none =>
+            rcases ep1_bind_error htail with hl | ⟨lay, _, htail⟩
+            · exact ep1_Type_layout_error_is_specPanic ty e hl
+            · rcases ep1_bind_error htail with hc | ⟨_, _, hp⟩
+              · exact hCsaNonVT _ lay none e hnotVT (ep1_map_error hc)
+              · simp [pure, Except.pure] at hp
+          | some mval =>
+            cases mval with
+            | VTablePointer p => exact absurd rfl (hnotVT p)
+            | ElementCount c =>
+              rcases ep1_bind_error htail with hl | ⟨lay, _, htail⟩
+              · exact ep1_Type_layout_error_is_specPanic ty e hl
+              · rcases ep1_bind_error htail with hc | ⟨_, _, hp⟩
+                · exact hCsaNonVT _ lay (some (.ElementCount c)) e hnotVT (ep1_map_error hc)
+                · simp [pure, Except.pure] at hp
+    rcases h with hS | hA
+    · cases m with
+      | none => exact hRun true hS
+      | some mach =>
+        rw [(ep1_evalUnOpM_computeSize_computeAlign_mach_indep ty opTy v mach).1] at hS
+        exact hRun true hS
+    · cases m with
+      | none => exact hRun false hA
+      | some mach =>
+        rw [(ep1_evalUnOpM_computeSize_computeAlign_mach_indep ty opTy v mach).2] at hA
+        exact hRun false hA
+
+/-- **Algebraic composition law `GetMetadata` → `ComputeSize` / `ComputeAlign`:**
+whenever `evalUnOpM .GetMetadata (.Ptr ptr, .Ptr ptrTy) m = .ok (metaVal, metaTy)` and `ty`
+has matching `Type.meta_kind ty = PtrType.meta_kind ptrTy` and `Type.layout ty = .ok lay`:
+1. `PointerMetaKind.decode_valueM (Type.meta_kind ty) metaVal = .ok ptr.metadata` (exact
+   encode/decode roundtrip on the live non-vtable domain);
+2. whenever `LayoutStrategy.compute_size_and_align vt lay ptr.metadata = .ok (sz, al)`,
+   feeding `(metaVal, metaTy)` directly into `ComputeSize ty` and `ComputeAlign ty` returns
+   `(.Int sz.bytes, usize)` and `(.Int al.bytes, usize)` respectively. -/
+theorem ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign
+    {M : Type} [Gen.Memory M] [MemoryOps M]
+    (ptr : Gen.Pointer (Gen.Memory.Provenance M)) (ptrTy : Gen.PtrType)
+    (ty : Gen.Type) (lay : Gen.LayoutStrategy)
+    (metaVal : Gen.Value M) (metaTy : Gen.Type) (m : Option (Gen.Machine M))
+    (hGet : evalUnOpM .GetMetadata (.Ptr ptr, .Ptr ptrTy) m = .ok (metaVal, metaTy))
+    (hKind : Type.meta_kind ty = PtrType.meta_kind ptrTy)
+    (hLay : Type.layout ty = .ok lay) :
+    PointerMetaKind.decode_valueM (M := M) (Type.meta_kind ty) metaVal = .ok ptr.metadata ∧
+    (∀ (sz : Size) (al : Align)
+        (vt : Gen.ThinPointer (Gen.Memory.Provenance M) → Interp Gen.VTable),
+      LayoutStrategy.compute_size_and_align vt lay ptr.metadata = .ok (sz, al) →
+      evalUnOpM (.ComputeSize ty) (metaVal, metaTy) m = .ok (.Int (sz.bytes : Int), .Int IntType.usize_ty) ∧
+      evalUnOpM (.ComputeAlign ty) (metaVal, metaTy) m = .ok (.Int (al.bytes : Int), .Int IntType.usize_ty)) := by
+  have hCsaIndep : ∀ (vt1 vt2 : Gen.ThinPointer (Gen.Memory.Provenance M) → Interp Gen.VTable)
+      (l : Gen.LayoutStrategy) (pm : Option (Gen.PointerMeta (Gen.Memory.Provenance M))),
+      (∀ p, pm ≠ some (.VTablePointer p)) →
+      LayoutStrategy.compute_size_and_align vt1 l pm = LayoutStrategy.compute_size_and_align vt2 l pm := by
+    intro vt1 vt2 l
+    induction l with
+    | Sized _ _ => intro pm _; cases pm <;> rfl
+    | Slice _ _ =>
+      intro pm _
+      cases pm with
+      | none => rfl
+      | some mv => cases mv <;> rfl
+    | TraitObject _ =>
+      intro pm hnv
+      cases pm with
+      | none => rfl
+      | some mv =>
+        cases mv with
+        | ElementCount _ => rfl
+        | VTablePointer p => exact absurd rfl (hnv p)
+    | Tuple _ tail ih =>
+      intro pm hnv
+      cases pm with
+      | none => rfl
+      | some mv =>
+        unfold LayoutStrategy.compute_size_and_align
+        rw [ih (some mv) hnv]
+  rcases ptr with ⟨thin, metaOpt⟩
+  have hPrep : PointerMetaKind.decode_valueM (M := M) (Type.meta_kind ty) metaVal = .ok metaOpt ∧
+      (∀ p, metaOpt ≠ some (.VTablePointer p)) := by
+    rw [hKind]
+    cases hk : PtrType.meta_kind ptrTy with
+    | VTablePointer t =>
+      cases metaOpt with
+      | none =>
+        rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy m).2.2.2.2.2.2.1 t hk] at hGet
+        cases hGet
+      | some mv =>
+        cases mv with
+        | ElementCount c =>
+          rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy m).2.2.2.2.2.2.2 t c hk] at hGet
+          cases hGet
+        | VTablePointer p =>
+          rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy m).2.2.1 t p hk] at hGet
+          cases hGet
+    | None =>
+      cases metaOpt with
+      | none =>
+        rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy m).1 hk] at hGet
+        simp only [Except.ok.injEq, Prod.mk.injEq] at hGet
+        rcases hGet with ⟨rfl, _⟩
+        exact ⟨rfl, fun _ h => by cases h⟩
+      | some mv =>
+        rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy m).2.2.2.1 mv hk] at hGet
+        cases hGet
+    | ElementCount =>
+      cases metaOpt with
+      | none =>
+        rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy m).2.2.2.2.1 hk] at hGet
+        cases hGet
+      | some mv =>
+        cases mv with
+        | ElementCount c =>
+          rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy m).2.1 c hk] at hGet
+          cases hc : IntType.can_represent IntType.usize_ty c <;> simp [hc, specPanic] at hGet
+          rcases hGet with ⟨rfl, _⟩
+          exact ⟨rfl, fun _ h => by cases h⟩
+        | VTablePointer p =>
+          rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy m).2.2.2.2.2.1 p hk] at hGet
+          cases hGet
+  obtain ⟨hDec, hNotVT⟩ := hPrep
+  refine ⟨hDec, ?_⟩
+  intro sz al vt hCsa
+  have hEvalNone :
+      evalUnOpM (.ComputeSize ty) (metaVal, metaTy) none = .ok (.Int (sz.bytes : Int), .Int IntType.usize_ty) ∧
+      evalUnOpM (.ComputeAlign ty) (metaVal, metaTy) none = .ok (.Int (al.bytes : Int), .Int IntType.usize_ty) := by
+    have h1 := hCsaIndep (fun _ => unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata") vt lay metaOpt hNotVT
+    have h2 := hCsaIndep (fun _ => unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata") vt lay metaOpt hNotVT
+    cases metaOpt with
+    | none =>
+      constructor
+      · unfold evalUnOpM; simp only [hDec, hLay, h1, hCsa, bind, Except.bind, Functor.map, Except.map, pure, Except.pure]
+      · unfold evalUnOpM; simp only [hDec, hLay, h2, hCsa, bind, Except.bind, Functor.map, Except.map, pure, Except.pure]
+    | some mv =>
+      cases mv with
+      | VTablePointer p => exact absurd rfl (hNotVT p)
+      | ElementCount c =>
+        constructor
+        · unfold evalUnOpM; simp only [hDec, hLay, h1, hCsa, bind, Except.bind, Functor.map, Except.map, pure, Except.pure]
+        · unfold evalUnOpM; simp only [hDec, hLay, h2, hCsa, bind, Except.bind, Functor.map, Except.map, pure, Except.pure]
+  cases m with
+  | none => exact hEvalNone
+  | some mach =>
+    rw [(ep1_evalUnOpM_computeSize_computeAlign_mach_indep ty metaTy metaVal mach).1,
+        (ep1_evalUnOpM_computeSize_computeAlign_mach_indep ty metaTy metaVal mach).2]
+    exact hEvalNone
+
+private def ep1KnownOnlyEnumTy : Gen.Type :=
+  let unitVar : Gen.Type := .Tuple [] ⟨⟨4⟩, ⟨4⟩, none⟩ none
+  .Enum ⟨[(0, { ty := unitVar, tagger := ⟨[]⟩ })]⟩ ep1U8 (.Known 0) ⟨4⟩ ⟨4⟩
+
+private def ep1MultiTagEnumTy : Gen.Type :=
+  let v0Ty : Gen.Type := .Tuple [(⟨2⟩, .Int ep1U16)] ⟨⟨4⟩, ⟨2⟩, none⟩ none
+  let v1Ty : Gen.Type := .Tuple [(⟨2⟩, .Int ep1U16)] ⟨⟨4⟩, ⟨2⟩, none⟩ none
+  let v0 : Gen.Variant := { ty := v0Ty, tagger := ⟨[(⟨0⟩, (ep1U8, 0x11)), (⟨1⟩, (ep1U8, 0x22))]⟩ }
+  let v1 : Gen.Variant := { ty := v1Ty, tagger := ⟨[(⟨0⟩, (ep1U8, 0x11)), (⟨1⟩, (ep1U8, 0x33))]⟩ }
+  let inner : Gen.Discriminator :=
+    .Branch ⟨1⟩ ep1U8 .Invalid ⟨[((0x22, 0x23), .Known 0), ((0x33, 0x34), .Known 1)]⟩
+  let disc : Gen.Discriminator :=
+    .Branch ⟨0⟩ ep1U8 .Invalid ⟨[((0x11, 0x12), inner)]⟩
+  .Enum ⟨[(0, v0), (1, v1)]⟩ ep1U8 disc ⟨4⟩ ⟨2⟩
+
+/-- **Concrete edge-case witnesses (`[adv A1]`):**
+1. misaligned `PlaceExpr::Downcast` preserves `aligned = false` without UB, while
+   `GetDiscriminant` on a misaligned `.Known`-only enum place (0 memory loads) still raises
+   `"Getting the discriminant of a place based on a misaligned pointer."`;
+2. ZST slice `[(); N]` and unsized `(u8, [(); N])` `ComputeSize`/`ComputeAlign` at `N = 0,
+   1000, -1` (`Size(0) * (-1) = Size(0)` matching `libspecr`);
+3. `GetMetadata` on thin `PtrType::VTablePtr` returns `()` while `Box` to `Tuple+TraitObject`
+   returns fail-closed `unsupported` and `Box` to `Slice` returns `ElementCount`;
+4. multi-tagger (2-offset) enum roundtrip (`Variant` → `Assign` → `GetDiscriminant` → `Load`)
+   on both `Mach` and `MachTB` (with `MachTB.wfLive` preservation). -/
+theorem ep1_misaligned_downcast_zst_slice_and_multitag_witness :
+    let zstTy : Gen.Type := .Tuple [] ⟨⟨0⟩, ⟨1⟩, none⟩ none
+    let zstSliceTy : Gen.Type := .Slice zstTy
+    let unsizedZstTailTy : Gen.Type := .Tuple [(⟨0⟩, .Int ep1U8)] ⟨⟨1⟩, ⟨1⟩, none⟩ (some zstSliceTy)
+    let traitObjTupleTy : Gen.Type := .Tuple [(⟨0⟩, .Int ep1U32)] ⟨⟨4⟩, ⟨4⟩, none⟩ (some (.TraitObject ⟨⟨0⟩⟩))
+    let usize : Gen.Type := .Int IntType.usize_ty
+    let mkPointee (lay : Gen.LayoutStrategy) : Gen.PointeeInfo :=
+      { layout := lay, inhabited := true, unsafe_cells := .Sized [], freeze := true, unpin := true }
+    let dynBoxTy : Gen.PtrType := .Box (mkPointee (.Tuple ⟨⟨4⟩, ⟨4⟩, none⟩ (.TraitObject ⟨⟨0⟩⟩)))
+    let sliceBoxTy : Gen.PtrType := .Box (mkPointee (.Slice ⟨4⟩ ⟨4⟩))
+    let vtableThin : Gen.ThinPointer (Gen.AllocId × Unit) := ⟨0x400, none⟩
+    let vtablePtr : Gen.Pointer (Gen.AllocId × Unit) := ⟨vtableThin, none⟩
+    let wideDynPtr : Gen.Pointer (Gen.AllocId × Unit) := ⟨⟨0x500, none⟩, some (.VTablePointer vtableThin)⟩
+    let wideSlicePtr : Gen.Pointer (Gen.AllocId × Unit) := ⟨⟨0x500, none⟩, some (.ElementCount 7)⟩
+    let vtableThinTB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x400, none⟩
+    let vtablePtrTB : Gen.Pointer Gen.TreeBorrowsProvenance := ⟨vtableThinTB, none⟩
+    let wideDynPtrTB : Gen.Pointer Gen.TreeBorrowsProvenance := ⟨⟨0x500, none⟩, some (.VTablePointer vtableThinTB)⟩
+    let wideSlicePtrTB : Gen.Pointer Gen.TreeBorrowsProvenance := ⟨⟨0x500, none⟩, some (.ElementCount 7)⟩
+    let mBM := ep1MachBM
+      [{ data := List.replicate 8 (.Init 0 none), addr := 0x102, align := ⟨2⟩, kind := .Stack, live := true, extra := () },
+       { data := List.replicate 4 .Uninit, addr := 0x200, align := ⟨2⟩, kind := .Stack, live := true, extra := () }]
+      [(⟨⟨0⟩⟩, ⟨0x102, some (⟨0⟩, ())⟩), (⟨⟨1⟩⟩, ⟨0x200, some (⟨1⟩, ())⟩)]
+      [(⟨⟨0⟩⟩, ep1KnownOnlyEnumTy), (⟨⟨1⟩⟩, ep1MultiTagEnumTy)]
+    let mTB := liftMachToTB mBM
+    let misPlace : Gen.PlaceExpr :=
+      .Deref (.Constant (.PointerWithoutProvenance 0x102) (.Ptr (.Raw .None))) ep1KnownOnlyEnumTy
+    let var1Expr : Gen.ValueExpr :=
+      .Variant 1 (.Tuple [.Constant (.Int 0xBEEF) (.Int ep1U16)] (.Tuple [(⟨2⟩, .Int ep1U16)] ⟨⟨4⟩, ⟨2⟩, none⟩ none)) ep1MultiTagEnumTy
+    -- 1. Misaligned Downcast preserves aligned = false, and misaligned .Known-only GetDiscriminant is still UB (0 loads)
+    (evalPlace mBM (.Downcast misPlace 0) =
+        .ok ((⟨⟨⟨0x102, none⟩, none⟩, false⟩, .Tuple [] ⟨⟨4⟩, ⟨4⟩, none⟩ none), mBM) ∧
+     evalPlaceM mTB (.Downcast misPlace 0) =
+        .ok ((⟨⟨⟨0x102, none⟩, none⟩, false⟩, .Tuple [] ⟨⟨4⟩, ⟨4⟩, none⟩ none), mTB) ∧
+     evalValue mBM (.GetDiscriminant misPlace) =
+        .error (.ub "Getting the discriminant of a place based on a misaligned pointer.") ∧
+     evalValueM mTB (.GetDiscriminant misPlace) =
+        .error (.ub "Getting the discriminant of a place based on a misaligned pointer.")) ∧
+    -- 2. ZST slice [(); N] and unsized (u8, [(); N]) ComputeSize/ComputeAlign at N = 0, 1000, -1 (Size 0 * -1 = 0!)
+    (evalUnOp (.ComputeSize zstSliceTy) (.Int 0, usize) none = .ok (.Int 0, usize) ∧
+     evalUnOp (.ComputeSize zstSliceTy) (.Int 1000, usize) none = .ok (.Int 0, usize) ∧
+     evalUnOp (.ComputeSize zstSliceTy) (.Int (-1), usize) none = .ok (.Int 0, usize) ∧
+     evalUnOp (.ComputeAlign zstSliceTy) (.Int 1000, usize) none = .ok (.Int 1, usize) ∧
+     evalUnOp (.ComputeSize unsizedZstTailTy) (.Int 1000, usize) none = .ok (.Int 1, usize) ∧
+     evalUnOp (.ComputeAlign unsizedZstTailTy) (.Int 1000, usize) none = .ok (.Int 1, usize) ∧
+     evalUnOpM (M := TBM) (.ComputeSize zstSliceTy) (.Int (-1), usize) none = .ok (.Int 0, usize) ∧
+     evalUnOpM (M := TBM) (.ComputeSize unsizedZstTailTy) (.Int 1000, usize) none = .ok (.Int 1, usize)) ∧
+    -- 3. GetMetadata: PtrType.VTablePtr is thin (returns ()), whereas Box to Tuple+TraitObject is wide (unsupported),
+    --    and Box to Slice is wide (returns ElementCount)
+    (evalUnOp .GetMetadata (.Ptr vtablePtr, .Ptr (.VTablePtr ⟨⟨0⟩⟩)) none = .ok (.Tuple [], unitType) ∧
+     evalUnOpM (M := TBM) .GetMetadata (.Ptr vtablePtrTB, .Ptr (.VTablePtr ⟨⟨0⟩⟩)) none = .ok (.Tuple [], unitType) ∧
+     evalUnOp .GetMetadata (.Ptr wideDynPtr, .Ptr dynBoxTy) none =
+       unsupported "eval_un_op UnOp::GetMetadata for vtable pointer metadata" ∧
+     evalUnOpM (M := TBM) .GetMetadata (.Ptr wideDynPtrTB, .Ptr dynBoxTy) none =
+       unsupported "eval_un_op UnOp::GetMetadata for vtable pointer metadata" ∧
+     evalUnOp .GetMetadata (.Ptr wideSlicePtr, .Ptr sliceBoxTy) none = .ok (.Int 7, usize) ∧
+     evalUnOpM (M := TBM) .GetMetadata (.Ptr wideSlicePtrTB, .Ptr sliceBoxTy) none = .ok (.Int 7, usize) ∧
+     evalUnOp (.ComputeSize traitObjTupleTy) (.Ptr vtablePtr, .Ptr (.VTablePtr ⟨⟨0⟩⟩)) none =
+       unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata") ∧
+    -- 4. Multi-tagger (2-offset) enum roundtrip: Variant -> Assign -> GetDiscriminant -> Load (Mach & MachTB + wfLive)
+    (∃ m1 m2 m3,
+      evalStatement mBM (.Assign (.Local ⟨⟨1⟩⟩) var1Expr) = .ok m1 ∧
+      evalValue m1 (.GetDiscriminant (.Local ⟨⟨1⟩⟩)) = .ok ((.Int 1, .Int ep1U8), m2) ∧
+      evalValue m2 (.Load (.Local ⟨⟨1⟩⟩)) = .ok ((.Variant 1 (.Tuple [.Int 0xBEEF]), ep1MultiTagEnumTy), m3)) ∧
+    (∃ m1 m2 m3,
+      evalStatementM mTB (.Assign (.Local ⟨⟨1⟩⟩) var1Expr) = .ok m1 ∧
+      evalValueM m1 (.GetDiscriminant (.Local ⟨⟨1⟩⟩)) = .ok ((.Int 1, .Int ep1U8), m2) ∧
+      evalValueM m2 (.Load (.Local ⟨⟨1⟩⟩)) = .ok ((.Variant 1 (.Tuple [.Int 0xBEEF]), ep1MultiTagEnumTy), m3) ∧
+      MachTB.wfLive m3) := by
+  intro zstTy zstSliceTy unsizedZstTailTy traitObjTupleTy usize mkPointee dynBoxTy sliceBoxTy
+    vtableThin vtablePtr wideDynPtr wideSlicePtr
+    vtableThinTB vtablePtrTB wideDynPtrTB wideSlicePtrTB
+    mBM mTB misPlace var1Expr
+  have h1 : evalPlace mBM (.Downcast misPlace 0) =
+      .ok ((⟨⟨⟨0x102, none⟩, none⟩, false⟩, .Tuple [] ⟨⟨4⟩, ⟨4⟩, none⟩ none), mBM) := by ep1_kernel_rfl
+  have h2 : evalPlaceM mTB (.Downcast misPlace 0) =
+      .ok ((⟨⟨⟨0x102, none⟩, none⟩, false⟩, .Tuple [] ⟨⟨4⟩, ⟨4⟩, none⟩ none), mTB) := by ep1_kernel_rfl
+  have h3 : evalValue mBM (.GetDiscriminant misPlace) =
+      .error (.ub "Getting the discriminant of a place based on a misaligned pointer.") := by ep1_kernel_rfl
+  have h4 : evalValueM mTB (.GetDiscriminant misPlace) =
+      .error (.ub "Getting the discriminant of a place based on a misaligned pointer.") := by ep1_kernel_rfl
+  have hbmRound : (do
+      let m1 ← evalStatement mBM (.Assign (.Local ⟨⟨1⟩⟩) var1Expr)
+      let (r1, m2) ← evalValue m1 (.GetDiscriminant (.Local ⟨⟨1⟩⟩))
+      let (r2, _) ← evalValue m2 (.Load (.Local ⟨⟨1⟩⟩))
+      pure (r1, r2)) =
+      .ok ((.Int 1, .Int ep1U8), (.Variant 1 (.Tuple [.Int 0xBEEF]), ep1MultiTagEnumTy)) := by
+    ep1_kernel_rfl
+  have htbRound : (do
+      let m1 ← evalStatementM mTB (.Assign (.Local ⟨⟨1⟩⟩) var1Expr)
+      let (r1, m2) ← evalValueM m1 (.GetDiscriminant (.Local ⟨⟨1⟩⟩))
+      let (r2, m3) ← evalValueM m2 (.Load (.Local ⟨⟨1⟩⟩))
+      pure (r1, r2, m3.mem.memory.mem.allocations.length)) =
+      .ok ((.Int 1, .Int ep1U8), (.Variant 1 (.Tuple [.Int 0xBEEF]), ep1MultiTagEnumTy), 2) := by
+    ep1_kernel_rfl
+  obtain ⟨m1, hm1, hbmRest⟩ := ep1_bind_ok hbmRound
+  obtain ⟨⟨r1, m2⟩, hm2, hbmRest⟩ := ep1_bind_ok hbmRest
+  obtain ⟨⟨r2, m3⟩, hm3, hbmRet⟩ := ep1_bind_ok hbmRest
+  have hbmEq := ep1_pure_ok hbmRet
+  rcases Prod.mk.inj hbmEq with ⟨rfl, rfl⟩
+  obtain ⟨t1, ht1, htbRest⟩ := ep1_bind_ok htbRound
+  obtain ⟨⟨tr1, t2⟩, ht2, htbRest⟩ := ep1_bind_ok htbRest
+  obtain ⟨⟨tr2, t3⟩, ht3, htbRet⟩ := ep1_bind_ok htbRest
+  have htbEq := ep1_pure_ok htbRet
+  rcases Prod.mk.inj htbEq with ⟨rfl, htbEq2⟩
+  rcases Prod.mk.inj htbEq2 with ⟨rfl, _⟩
+  have hwf0 : MachTB.wfLive mTB := liftMachToTB_wfLive mBM
+  have hwf1 : MachTB.wfLive t1 := evalStatementM_tb_wfLive hwf0 ht1
+  have hwf2 : MachTB.wfLive t2 := evalValueM_tb_wfLive _ hwf1 ht2
+  have hwf3 : MachTB.wfLive t3 := evalValueM_tb_wfLive _ hwf2 ht3
+  refine ⟨⟨h1, h2, h3, h4⟩, ?_, ?_, ⟨m1, m2, m3, hm1, hm2, hm3⟩, ⟨t1, t2, t3, ht1, ht2, ht3, hwf3⟩⟩
+  · refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> ep1_kernel_rfl
+  · refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> ep1_kernel_rfl
+
 #check_theorem_deps "[EP1-EXPR-AUDIT]"
   ep1_type_meta_kind_eq_layout_meta_kind
   ep1_evalUnOpM_computeSize_computeAlign_mach_indep
@@ -8965,6 +10666,13 @@ theorem ep1_downcast_variant_lookup_agrees_with_representation
   ep1_variant_union_ill_formed_ast_specPanic_witness
   ep1_getDiscriminant_ordering_agrees_with_model_and_lowering
   ep1_downcast_variant_lookup_agrees_with_representation
+  ep1_tb_permission_read_idempotent
+  ep1_evalValueM_load_enum_implies_getDiscriminant_tb
+  ep1_evalValue_load_enum_implies_getDiscriminant_bm
+  ep1_evalValueM_union_produces_valid_value_and_roundtrip
+  ep1_meta_unops_nonVTable_never_unsupported_and_vtable_layout_total
+  ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign
+  ep1_misaligned_downcast_zst_slice_and_multitag_witness
 
 /-- Verify that every newly added or modified executable `Interp` definition in
 Episode 1 is strictly computable (`Classical.choice`-free, `sorryAx`-free, and

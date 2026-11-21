@@ -2977,7 +2977,6 @@ def evalUnOp (op : UnOp) (arg : Val × «Type») (m : Option Mach := none) :
       let metaTy := PointerMetaKind.ty metaKind
       match checkValue metaValue metaTy m with
       | .ok () => pure (metaValue, metaTy)
-      | .error (.unsupported what) => .error (.unsupported what)
       | .error _ => specPanic "GetMetadata: sanity check, returned meta is well-formed"
   | .GetMetadata, _ => specPanic "non-pointer GetMetadata"
   | .ComputeSize ty, (operand, _) => do
@@ -7989,7 +7988,6 @@ def evalUnOpM {M : Type} [Memory M] [MemoryOps M] (op : UnOp) (arg : Value M × 
       let metaTy := PointerMetaKind.ty metaKind
       match checkValueM metaValue metaTy m with
       | .ok () => pure (metaValue, metaTy)
-      | .error (.unsupported what) => .error (.unsupported what)
       | .error _ => specPanic "GetMetadata: sanity check, returned meta is well-formed"
   | .GetMetadata, _ => specPanic "non-pointer GetMetadata"
   | .ComputeSize ty, (operand, _) => do
