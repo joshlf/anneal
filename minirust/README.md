@@ -128,13 +128,21 @@ functions needed to run the fragment below on both `Machine<BasicMemory<x86_64>>
 `Statement::{Assign, PlaceMention, Validate, StorageLive, StorageDead, Deinit}`
 (with `StackFrame::{storage_live, storage_dead}`, `ConcurrentMemory::deinit`,
 and `Machine::{retag_val, retag_ptr}`),
-`PlaceExpr::{Local, Field, Index, Deref}` (`Field` indexing `(offset, field_ty)`
+`PlaceExpr::{Local, Field, Index, Deref, Downcast}` (all 5 `PlaceExpr` variants;
+`Downcast` keeps the root place and types it at `variants[discriminant].ty`;
+`Field` indexing `(offset, field_ty)`
 on `Type::Tuple` and `Type::Union`, `Index` on `Type::Array` and `Type::Slice`,
 with `Machine::ptr_offset_inbounds`, `Memory::{dereferenceable,
 signed_dereferenceable}`, and the `Machine::compute_size` sanity check, and
 `Deref` evaluating its operand, checking a safe pointee's alignment and
 dereferenceability, and recording whether the place is aligned),
-`ValueExpr::{Constant, Load, Tuple, UnOp, BinOp}` (`ValueExpr::Tuple` evaluating
+`ValueExpr::{Constant, Load, Tuple, Union, Variant, GetDiscriminant, UnOp, BinOp}`
+(with `AddrOf` below, all 9 `ValueExpr` variants; `Union` encodes the operand into
+`size` `Uninit` bytes and decodes them at the union type, `Variant` builds
+`Value::Variant`, and `GetDiscriminant` runs `decode_discriminant` with an accessor
+that loads only the tag bytes through `Machine::ptr_offset_inbounds` and
+`ConcurrentMemory::load`, so under Tree Borrows it performs read accesses on exactly
+those bytes; `ValueExpr::Tuple` evaluating
 each element or field expression in order and returning `(Value::Tuple(vals),
 ty)` for both `Type::Tuple` and `Type::Array`, while `check_value` and
 `Type::encode` validate length and element/field values at `typed_store` /
@@ -192,7 +200,9 @@ scalar values), the full 6-module Tree Borrows memory model
 `new_call`, `end_call`, `release_protector`, and `leak_check`, backed by
 polymorphic `BasicMemory<x86_64, ProvExtra, AllocExtra>`),
 `PlaceExpr::Deref` (whose `aligned` flag makes a load or store through a
-misaligned pointer UB), `UnOp::GetThinPointer`, `BinOp::PtrOffset` with both
+misaligned pointer UB), `UnOp::GetThinPointer`, `UnOp::{GetMetadata, ComputeSize,
+ComputeAlign}` for thin and `ElementCount` metadata (vtable metadata and
+`UnOp::VTableMethodLookup` report `Stop.unsupported`), `BinOp::PtrOffset` with both
 `inbounds: true` (`Machine::ptr_offset_inbounds`) and `inbounds: false`
 (`ptr_offset_wrapping`), `BinOp::PtrOffsetFrom`,
 `Constant::PointerWithoutProvenance`, and `Terminator::Intrinsic` for
@@ -228,7 +238,7 @@ comments; `..` marks elided code). Effects are
 spec, which upstream calls a spec bug), and `Stop.unsupported` (outside the
 interpreted fragment; never silently wrong).
 
-`Anchors.lean` lists the 104 upstream items that `Interp.lean` transcribes,
+`Anchors.lean` lists the 114 upstream items that `Interp.lean` transcribes,
 each with its file path, item name, line, and token hash, and proves by `decide`
 that the generated model contains them unchanged (`anchors_ok`) with no
 duplicate entries (`anchors_nodup`). Re-pinning MiniRust therefore breaks
