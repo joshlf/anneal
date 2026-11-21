@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import json
 import os
@@ -166,9 +167,23 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         }
         sentinel = suite / "must-not-exist"
         negative_sources["evaluation sentinel"] = header + f'#eval IO.FS.writeFile "{sentinel}" "executed"\n'
-        for label, source in negative_sources.items():
-            checked(fixture(source), expected=1, phase="preflight", executed=False)
-            assert not sentinel.exists()
+        # The ~27 independent preflight rejections dominate this group (about 7 s each). Fixtures are
+        # created sequentially (`fixture()` is not reentrant); the checks run two at a time, each in
+        # its own Checker stage, so the suite stays well inside the 900 s default `anneal-lean-run`
+        # build timeout that the Episode 2 receipts invoke it under (measured: 900.4 s sequential).
+        negative_roots = [(label, fixture(source)) for label, source in negative_sources.items()]
+
+        def negative_check(item):
+            label, root = item
+            try:
+                checked(root, expected=1, phase="preflight", executed=False)
+            except AssertionError as error:
+                raise AssertionError(f"preflight negative {label!r}: {error}") from error
+
+        with ThreadPoolExecutor(max_workers=2) as negative_pool:
+            for _ in negative_pool.map(negative_check, negative_roots):
+                assert not sentinel.exists()
+        assert not sentinel.exists()
         done("parsed policy negatives, recursive wrappers/attributes, parser recovery, no eval sentinel")
 
         checked(fixture(header + "theorem bad : False := by sorry\n"), expected=1, phase="audit", executed=True)
