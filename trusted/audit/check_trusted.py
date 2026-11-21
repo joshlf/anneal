@@ -11,7 +11,7 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
@@ -28,6 +28,36 @@ TOOLCHAIN = "leanprover/lean4:v4.34.1"
 PARTS = ("olean", "olean.server", "olean.private", "ir.sig", "ir")
 MAX_BYTES = 512 * 1024 * 1024
 CHILD_TIMEOUT_SECS = 180
+# The compiled-environment auditor re-checks every non-toolchain declaration in the kernel (the
+# downstream environment holds ~50k declarations), so it gets a longer, still bounded, envelope.
+OLEAN_CHILD_TIMEOUT_SECS = 900
+# Natively compiled auditor binaries built by this process without `--fast` (never shared between
+# processes; `main()` removes them on exit): `{binary key: path}`.
+_PROCESS_OLEAN_BINARIES: dict[str, Path] = {}
+
+
+def remove_process_binaries() -> None:
+    """Remove the per-process auditor binaries built without `--fast`."""
+    for path in _PROCESS_OLEAN_BINARIES.values():
+        shutil.rmtree(path.parent, ignore_errors=True)
+    _PROCESS_OLEAN_BINARIES.clear()
+OLEAN_AUDITOR = "trusted/audit/OleanEnvAuditor.lean"
+OLEAN_AUDIT_MODES = ("olean-audit", "olean-downstream-audit")
+ROOT_MANIFEST = "trusted/root-manifest.sha256"
+ROOT_MANIFEST_PHASE = "root-manifest"
+# The trusted checker and the compiled environment auditor must always be covered by the root
+# manifest, next to the root build inputs it already pins.
+ROOT_MANIFEST_REQUIRED = ("trusted/audit/check_trusted.py", OLEAN_AUDITOR)
+OLEAN_RESULT_KEYS = frozenset({
+    "auditor", "schema", "scope", "modules", "loadedModules", "artifactPartsChecked",
+    "auditedDeclarations", "reachableDeclarations", "codegenCompanions", "irDeclarationsChecked",
+    "intrinsicTagsChecked", "kernelTagConfirmations", "axioms", "localTestAxioms",
+    "kernelConfirmedNativeAxioms", "provisionalNativeAxioms", "replayedDeclarations", "replay",
+    "importMicros", "elapsedMicros"})
+OLEAN_COUNT_KEYS = ("loadedModules", "artifactPartsChecked", "auditedDeclarations", "reachableDeclarations",
+                    "codegenCompanions", "irDeclarationsChecked", "intrinsicTagsChecked",
+                    "kernelTagConfirmations", "localTestAxioms", "replayedDeclarations",
+                    "importMicros", "elapsedMicros")
 
 # Each entry is (module_name, relative_path, direct_imports, role)
 # where role is "theory", "examples", "claim", or "test".
@@ -330,6 +360,17 @@ def snapshot(root: Path) -> tuple[dict, dict[str, str]]:
     return inventory, dict(sorted(modules.items()))
 
 
+def _trusted_cache_file(path: Path) -> bool:
+    """A cache entry is used only if it is a regular file owned by this user and writable by no
+    one else; anything else is a cache miss (the gate recomputes, it never trusts the entry)."""
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    return (stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid()
+            and not st.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+
+
 class Checker:
     def __init__(
         self,
@@ -351,6 +392,8 @@ class Checker:
         self.cache_dir: Path | None = None
         self.expected_lean_sha: str | None = None
         self._compiled_inspector: Path | None = None
+        self._compiled_olean_auditor: Path | None = None
+        self.root_manifest: dict[str, str] | None = None
         if self.fast:
             env_cache = os.environ.get("ANNEAL_TRUSTED_CACHE_DIR")
             raw_cache = (
@@ -380,7 +423,8 @@ class Checker:
         if size > MAX_BYTES:
             raise Failure(2, self.phase, "512 MiB retained-build envelope exceeded")
 
-    def process(self, label: str, arguments: list[str], *, executable: Path | None = None) -> str:
+    def process(self, label: str, arguments: list[str], *, executable: Path | None = None,
+                timeout: int = CHILD_TIMEOUT_SECS) -> str:
         self.phase = label
         self.counter += 1
         stem = self.stage / f"{self.counter:03d}-{label}"
@@ -391,7 +435,7 @@ class Checker:
             with stdout.open("xb") as out, stderr.open("xb") as err:
                 try:
                     completed = subprocess.run(command, cwd=self.stage, env=self.environment,
-                                               stdout=out, stderr=err, timeout=CHILD_TIMEOUT_SECS, check=False)
+                                               stdout=out, stderr=err, timeout=timeout, check=False)
                     code = completed.returncode
                 except subprocess.TimeoutExpired:
                     timed_out = True
@@ -404,7 +448,7 @@ class Checker:
         self.last_status = observation
         self.budget()
         if timed_out:
-            raise Failure(2, label, f"direct Lean child exceeded {CHILD_TIMEOUT_SECS} seconds; no retry")
+            raise Failure(2, label, f"direct Lean child exceeded {timeout} seconds; no retry")
         if code != 0:
             raise Failure(2, label, f"Lean exited {code}; see {stem}.stdout/.stderr")
         return stdout.read_text(encoding="utf-8", errors="strict")
@@ -412,7 +456,7 @@ class Checker:
     def _get_compiled_inspector(self) -> Path | None:
         if not self.fast or self.cache_dir is None or self.expected_lean_sha is None:
             return None
-        if self._compiled_inspector is not None and self._compiled_inspector.is_file():
+        if self._compiled_inspector is not None and _trusted_cache_file(self._compiled_inspector):
             return self._compiled_inspector
         leanc = self.lean.parent / "leanc"
         if not leanc.is_file():
@@ -426,7 +470,7 @@ class Checker:
         })
         bin_dir = self.cache_dir / "inspector-bin"
         bin_path = bin_dir / f"TrustedBoundary-{bin_key}"
-        if bin_path.is_file() and os.access(bin_path, os.X_OK):
+        if _trusted_cache_file(bin_path) and os.access(bin_path, os.X_OK):
             self._compiled_inspector = bin_path
             return bin_path
         try:
@@ -468,6 +512,77 @@ class Checker:
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def _get_compiled_olean_auditor(self) -> Path | None:
+        """Native `OleanEnvAuditor-<key>` binary, content-addressed by the staged auditor source,
+        `lean`, and `leanc`: cached under `--fast`, otherwise built once per process in a private
+        temporary directory. `None` falls back to running the staged auditor source with
+        `lean --run`, so the gate itself never depends on a cache."""
+        if self.expected_lean_sha is None or not hasattr(self, "olean_auditor_hash"):
+            return None
+        if self._compiled_olean_auditor is not None and _trusted_cache_file(self._compiled_olean_auditor):
+            return self._compiled_olean_auditor
+        leanc = self.lean.parent / "leanc"
+        if not leanc.is_file():
+            return None
+        bin_key = fingerprint({
+            "schema": 1,
+            "tool": "OleanEnvAuditor",
+            "toolchain": TOOLCHAIN,
+            "leanSha256": self.expected_lean_sha,
+            "leancSha256": digest(leanc),
+            "auditorSha256": self.olean_auditor_hash,
+        })
+        if self.fast and self.cache_dir is not None:
+            bin_dir = self.cache_dir / "inspector-bin"
+        else:
+            # Without `--fast` nothing is shared across runs: the binary is built from the staged,
+            # hashed source once per process in a private temporary directory.
+            known = _PROCESS_OLEAN_BINARIES.get(bin_key)
+            if known is not None and _trusted_cache_file(known) and os.access(known, os.X_OK):
+                self._compiled_olean_auditor = known
+                return known
+            try:
+                bin_dir = Path(tempfile.mkdtemp(prefix="anneal-trusted-olean-bin-"))
+            except OSError:
+                return None
+        bin_path = bin_dir / f"OleanEnvAuditor-{bin_key}"
+        if _trusted_cache_file(bin_path) and os.access(bin_path, os.X_OK):
+            self._compiled_olean_auditor = bin_path
+            return bin_path
+        try:
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            tmp_dir = Path(tempfile.mkdtemp(prefix=f"tmp-olean-{bin_key[:12]}-", dir=bin_dir))
+        except OSError:
+            return None
+        try:
+            c_path = tmp_dir / "OleanEnvAuditor.c"
+            tmp_bin = tmp_dir / "OleanEnvAuditor"
+            # No status files: the warm-cache contract counts only checked Lean children.
+            res_c = subprocess.run(
+                [str(self.lean), "-c", str(c_path), str(self.olean_auditor)],
+                cwd=self.stage, env=self.environment, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=CHILD_TIMEOUT_SECS, check=False)
+            if res_c.returncode != 0 or not c_path.is_file():
+                return None
+            if digest(self.olean_auditor) != self.olean_auditor_hash:
+                raise Failure(2, "freshness", "staged OleanEnvAuditor changed while compiling")
+            res_bin = subprocess.run(
+                [str(leanc), "-O3", "-rdynamic", "-o", str(tmp_bin), str(c_path)],
+                cwd=self.stage, env=self.environment, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=CHILD_TIMEOUT_SECS, check=False)
+            if res_bin.returncode != 0 or not tmp_bin.is_file():
+                return None
+            tmp_bin.chmod(0o755)
+            os.replace(tmp_bin, bin_path)
+            self._compiled_olean_auditor = bin_path
+            if not self.fast:
+                _PROCESS_OLEAN_BINARIES[bin_key] = bin_path
+            return bin_path
+        except (OSError, subprocess.SubprocessError):
+            return None
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     def _inspect_cache_key(self, mode: str, fields: dict) -> str | None:
         if not self.fast or self.cache_dir is None or self.expected_lean_sha is None:
             return None
@@ -495,7 +610,12 @@ class Checker:
                 "allowedAxiomModules": fields.get("allowedAxiomModules", []),
                 "sources": source_digests,
             })
-        if mode in ("audit", "downstream-audit"):
+        if mode in ("audit", "downstream-audit", *OLEAN_AUDIT_MODES):
+            if mode in OLEAN_AUDIT_MODES:
+                # Staged source paths differ per run; key them by module and content instead.
+                fields = {**fields, "sources": [(m, digest(Path(p))) for m, p in fields.get("sources", [])]}
+                inspector_sha = {"trustedBoundary": inspector_sha,
+                                 "oleanEnvAuditor": getattr(self, "olean_auditor_hash", None)}
             artifact_hashes = [
                 (
                     mod,
@@ -631,7 +751,7 @@ class Checker:
         cache_key = self._inspect_cache_key(mode, fields)
         if cache_key is not None and self.cache_dir is not None:
             cache_file = self.cache_dir / "inspect" / f"{mode}-{cache_key}.json"
-            if cache_file.is_file():
+            if _trusted_cache_file(cache_file):
                 try:
                     cached_result = json.loads(cache_file.read_text())
                     if isinstance(cached_result, dict):
@@ -647,10 +767,15 @@ class Checker:
         request_path, result_path = Path(str(stem) + ".json"), Path(str(stem) + ".result.json")
         request_path.write_text(json.dumps(request, sort_keys=True))
         self.last_status = None
-        compiled_inspector = self._get_compiled_inspector()
+        olean_mode = mode in OLEAN_AUDIT_MODES
+        compiled_inspector = self._get_compiled_olean_auditor() if olean_mode else self._get_compiled_inspector()
         try:
             if compiled_inspector is not None:
-                self.process(mode, [str(request_path), str(result_path)], executable=compiled_inspector)
+                self.process(mode, [str(request_path), str(result_path)], executable=compiled_inspector,
+                             timeout=OLEAN_CHILD_TIMEOUT_SECS if olean_mode else CHILD_TIMEOUT_SECS)
+            elif olean_mode:
+                self.process(mode, ["-j1", "--run", str(self.olean_auditor), str(request_path), str(result_path)],
+                             timeout=OLEAN_CHILD_TIMEOUT_SECS)
             else:
                 self.process(mode, ["-j1", "-M2048", "--run", str(self.inspector), str(request_path), str(result_path)])
         except Failure as failure:
@@ -739,14 +864,91 @@ class Checker:
                     and all(type(result[k]) is int and result[k] >= 0
                             for k in ("replayedDeclarations", "claimTheoremsChecked", "localTestAxioms")),
                     mode, "invalid downstream-audit observation")
+        elif mode in OLEAN_AUDIT_MODES:
+            require(set(result) == OLEAN_RESULT_KEYS
+                    and result["auditor"] == "OleanEnvAuditor" and result["schema"] == 1
+                    and result["scope"] == fields["scope"]
+                    and result["replay"] is True
+                    and result["modules"] == sorted(fields["modules"])
+                    and all(type(result[k]) is int and result[k] >= 0 for k in OLEAN_COUNT_KEYS)
+                    and result["auditedDeclarations"] >= result["replayedDeclarations"]
+                    and result["provisionalNativeAxioms"] == []
+                    and result["kernelConfirmedNativeAxioms"] == []
+                    and isinstance(result["axioms"], list)
+                    and all(isinstance(n, str) and n in {a[0] for a in self.lock["axioms"]} for n in result["axioms"])
+                    and len(result["axioms"]) == len(set(result["axioms"]))
+                    and (result["localTestAxioms"] == 0 or bool(fields.get("localAxiomModules"))),
+                    mode, "invalid compiled-environment audit observation")
         else:
             raise Failure(2, mode, "unknown inspector result mode")
 
+    def olean_audit(self, mode: str, **fields) -> dict:
+        """Run the compiled-environment auditor (`OleanEnvAuditor`) fail-closed: any violation,
+        provisional native axiom, missing artifact, or malformed verdict is a `Failure`."""
+        if mode not in OLEAN_AUDIT_MODES:
+            raise Failure(2, mode, "unknown compiled-environment audit mode")
+        regular(self.olean_auditor, "tool-snapshot")
+        result = self.inspect(mode, **fields)
+        if result.get("replay") is not True or result.get("provisionalNativeAxioms") != []:
+            raise Failure(2, mode, "incomplete compiled-environment audit evidence")
+        return result
+
+    def audit_olean_request(self, request: dict) -> dict:
+        """`--audit-olean`: audit caller-supplied compiled modules with the trust-gating policy.
+
+        Call after `tool_admission()`. `request` names `roots` and the exact non-toolchain
+        `modules`, their `artifacts` (`[[module, [[olean parts], [ir parts]]], ...]`) and
+        optionally `graph`, `localAxiomModules`, `claimModules`, `statementForbidden`,
+        `statementUnfold`, `sources` and `scope`. Provisional native evaluation and extra
+        toolchain roots cannot be requested here."""
+        allowed = {"roots", "modules", "artifacts", "graph", "localAxiomModules", "claimModules",
+                   "statementForbidden", "statementUnfold", "sources", "scope"}
+        phase = "olean-audit"
+        require(isinstance(request, dict) and set(request) <= allowed
+                and {"roots", "modules", "artifacts"} <= set(request), phase, "malformed --audit-olean request")
+        for key in ("roots", "modules", "localAxiomModules", "claimModules", "statementForbidden", "statementUnfold"):
+            value = request.get(key, [])
+            require(isinstance(value, list) and all(isinstance(m, str) and m for m in value), phase,
+                    f"malformed --audit-olean field {key}")
+        artifacts = request["artifacts"]
+        require(isinstance(artifacts, list), phase, "malformed --audit-olean artifacts")
+        for entry in artifacts:
+            require(isinstance(entry, list) and len(entry) == 2 and isinstance(entry[0], str)
+                    and entry[0] not in self.artifacts and isinstance(entry[1], list) and len(entry[1]) == 2
+                    and all(isinstance(g, list) and all(isinstance(p, str) and os.path.isabs(p) for p in g)
+                            for g in entry[1]), phase, "malformed --audit-olean artifact entry")
+            for group in entry[1]:
+                for path in group:
+                    regular(Path(path), phase)
+                    self.expected_artifacts[path] = digest(Path(path))
+            self.artifacts[entry[0]] = [list(entry[1][0]), list(entry[1][1])]
+        graph = request.get("graph", {})
+        require(valid_graph(graph), phase, "malformed --audit-olean graph")
+        self.graph = {**self.graph, **graph}
+        sources = request.get("sources", [])
+        require(isinstance(sources, list) and all(
+            isinstance(s, list) and len(s) == 2 and all(isinstance(x, str) and x for x in s) for s in sources),
+            phase, "malformed --audit-olean sources")
+        for _, path in sources:
+            regular(Path(path), phase)
+        scope = request.get("scope", "request")
+        require(isinstance(scope, str) and bool(scope), phase, "malformed --audit-olean scope")
+        return self.olean_audit(
+            "olean-audit", scope=scope, roots=request["roots"], modules=request["modules"],
+            localAxiomModules=request.get("localAxiomModules", []),
+            claimModules=request.get("claimModules", []),
+            statementForbidden=request.get("statementForbidden", []),
+            statementUnfold=request.get("statementUnfold", []),
+            sources=[tuple(s) for s in sources])
+
     def tool_admission(self) -> None:
+        # The root manifest is verified before any Lean child runs.
+        self.root_manifest = verify_root_manifest(self.checkout)
         self.initial, self.modules = snapshot(self.source)
         self.tool_paths = [
             self.checkout / "trusted/audit/check_trusted.py",
             self.checkout / "trusted/audit/TrustedBoundary.lean",
+            self.checkout / OLEAN_AUDITOR,
         ]
         for path in self.tool_paths:
             regular(path, "tool-snapshot")
@@ -757,6 +959,14 @@ class Checker:
         # process can mutate them in place; freshness() still re-hashes them.
         make_read_only(self.inspector)
         self.inspector_hash = digest(self.inspector)
+        # The compiled-environment auditor is required unconditionally: there is no code path
+        # that skips it when the source is absent (`regular` above already failed closed).
+        self.olean_auditor = self.stage / "OleanEnvAuditor.lean"
+        shutil.copyfile(self.tool_paths[2], self.olean_auditor)
+        make_read_only(self.olean_auditor)
+        self.olean_auditor_hash = digest(self.olean_auditor)
+        if self.olean_auditor_hash != self.tool_hashes[OLEAN_AUDITOR]:
+            raise Failure(2, "tool-snapshot", "OleanEnvAuditor changed while staging")
         source_copy = self.stage / "source"
         source_copy.mkdir()
         for relative, entry in self.initial.items():
@@ -868,6 +1078,10 @@ class Checker:
             raise Failure(2, "freshness", "checker/policy inputs changed during check")
         if digest(self.inspector) != self.inspector_hash:
             raise Failure(2, "freshness", "staged inspector changed")
+        if digest(self.olean_auditor) != self.olean_auditor_hash:
+            raise Failure(2, "freshness", "staged OleanEnvAuditor changed")
+        if verify_root_manifest(self.checkout) != self.root_manifest:
+            raise Failure(2, "freshness", "root manifest coverage changed during check")
         for path, expected in self.expected_artifacts.items():
             regular(Path(path), "freshness")
             if digest(Path(path)) != expected:
@@ -936,8 +1150,11 @@ class Checker:
                     "preflight",
                     f"project imports of {module} ({actual_proj}) differ from DOWNSTREAM_TARGETS ({expected_proj})",
                 )
+        # `--fast` elaborates up to four declarations at once (`-j4`, `Elab.async`), so its peak heap
+        # is several sequential peaks: `-M2048` makes the kernel abort with "excessive memory
+        # consumption" on large theory modules that the sequential `-j1 -M2048` path accepts.
         downstream_flags = (
-            ["-j4", "-M2048", "-t0", "-DElab.async=true", "-Ddebug.skipKernelTC=false", "-DwarningAsError=true"]
+            ["-j4", "-M4096", "-t0", "-DElab.async=true", "-Ddebug.skipKernelTC=false", "-DwarningAsError=true"]
             if self.fast
             else ["-j1", "-M2048", "-t0", "-DElab.async=false", "-Ddebug.skipKernelTC=false", "-DwarningAsError=true"]
         )
@@ -989,6 +1206,16 @@ class Checker:
             claimModules=[m for m, _, _, r in targets if r == "claim"],
             testModules=[m for m, _, _, r in targets if r == "test"],
         ))
+        downstream_modules = [m for m, _, _, _ in targets]
+        result["oleanAudit"] = self.olean_audit(
+            "olean-downstream-audit", scope="downstream",
+            roots=[*self.modules, *downstream_modules], modules=[*self.modules, *downstream_modules],
+            localAxiomModules=allowed_axiom_mods,
+            claimModules=[m for m, _, _, r in targets if r == "claim"],
+            statementForbidden=[m for m, _, _, r in targets if r == "theory"],
+            statementUnfold=[m for m, _, _, r in targets if r == "claim"],
+            sources=[*((n, str(self.source_copy / p)) for n, p in self.modules.items()),
+                     *((m, str(copies[m])) for m in downstream_modules)])
         result["waiverVacuityAudit"] = waiver_audit
         return result
 
@@ -1071,6 +1298,9 @@ class Checker:
         report = self.inspect("audit", trusted=list(self.modules))
         if report.get("graph") != self.graph or report.get("replay") is not True:
             raise Failure(2, "audit", "incomplete final audit evidence")
+        report["oleanAudit"] = self.olean_audit(
+            "olean-audit", scope="trusted", roots=list(self.modules), modules=list(self.modules),
+            sources=[(n, str(self.source_copy / p)) for n, p in self.modules.items()])
         if check_downstream:
             downstream = self.compile_and_audit_downstream()
             report["downstream"] = downstream
@@ -5093,10 +5323,10 @@ def make_tree_writable(root: Path) -> None:
 
 def tcb_snapshot_files(root: Path) -> dict[str, Path]:
     """TCB files compared by `--base-snapshot`, keyed by checkout-relative POSIX path:
-    `trusted/audit/{check_trusted.py,TrustedBoundary.lean}`, every non-doc file or symlink
+    `trusted/audit/{check_trusted.py,TrustedBoundary.lean,OleanEnvAuditor.lean}`, every non-doc file or symlink
     under `trusted/lean/`, and `trusted/rustc-capture/Cargo.toml`."""
     out: dict[str, Path] = {}
-    for rel in ("trusted/audit/check_trusted.py", "trusted/audit/TrustedBoundary.lean",
+    for rel in ("trusted/audit/check_trusted.py", "trusted/audit/TrustedBoundary.lean", OLEAN_AUDITOR,
                 "trusted/lean/lean-toolchain", "trusted/rustc-capture/Cargo.toml"):
         path = root / rel
         if path.exists() or path.is_symlink():
@@ -5118,6 +5348,71 @@ def tcb_snapshot_files(root: Path) -> dict[str, Path]:
                     continue
                 out[rel] = fpath
     return out
+
+
+def verify_root_manifest(checkout: Path) -> dict[str, str] | None:
+    """Verify `trusted/root-manifest.sha256` against the checkout before any Lean child runs.
+
+    The manifest is required whenever it exists or the checkout carries the repository markers
+    (`flake.nix` and `lakefile.toml`); a bare fixture without either has nothing to verify and
+    returns `None`. Every entry must be a canonical relative path naming a regular, non-symlinked
+    file inside the checkout (no symlinked parent directory either) whose SHA-256 matches; the
+    entries must be unique and must include `ROOT_MANIFEST_REQUIRED`. Any violation is
+    `Failure(1, "root-manifest", ...)`. Returns `{path: sha256}` of the covered files.
+    """
+    phase = ROOT_MANIFEST_PHASE
+    manifest = checkout / ROOT_MANIFEST
+    has_markers = (checkout / "flake.nix").exists() and (checkout / "lakefile.toml").exists()
+    if not (manifest.exists() or manifest.is_symlink()):
+        if has_markers:
+            raise Failure(1, phase, f"missing {ROOT_MANIFEST} in a repository checkout")
+        return None
+    root = checkout.resolve()
+    for component in (checkout / "trusted", manifest):
+        if component.is_symlink():
+            raise Failure(1, phase, f"symlinked root-manifest path: {component}")
+    try:
+        mode = manifest.lstat().st_mode
+        raw = manifest.read_bytes()
+    except OSError as error:
+        raise Failure(1, phase, f"cannot read {ROOT_MANIFEST}: {error}") from error
+    if not stat.S_ISREG(mode):
+        raise Failure(1, phase, f"{ROOT_MANIFEST} is not a regular file")
+    covered: dict[str, str] = {}
+    for number, line in enumerate(raw.splitlines(), 1):
+        if line.startswith(b"#") or not line.strip():
+            continue
+        match = re.fullmatch(rb"([0-9a-f]{64})( [ *])([^\r\n]+)", line)
+        if match is None:
+            raise Failure(1, phase, f"{ROOT_MANIFEST}:{number}: malformed checksum entry")
+        try:
+            name = match[3].decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise Failure(1, phase, f"{ROOT_MANIFEST}:{number}: non-UTF-8 path") from error
+        rel = PurePosixPath(name)
+        if rel.is_absolute() or ".." in rel.parts or str(rel) != name or name == ROOT_MANIFEST:
+            raise Failure(1, phase, f"{ROOT_MANIFEST}:{number}: expected a canonical relative path: {name!r}")
+        if name in covered:
+            raise Failure(1, phase, f"{ROOT_MANIFEST}:{number}: duplicate covered file: {name}")
+        path = checkout
+        for part in rel.parts:
+            path = path / part
+            if path.is_symlink():
+                raise Failure(1, phase, f"covered file traverses a symlink: {name}")
+        try:
+            file_mode = path.lstat().st_mode
+        except OSError as error:
+            raise Failure(1, phase, f"missing covered file: {name}") from error
+        if not stat.S_ISREG(file_mode) or not path.resolve().is_relative_to(root):
+            raise Failure(1, phase, f"covered file is not a regular file inside the checkout: {name}")
+        actual = digest(path)
+        if actual != match[1].decode("ascii"):
+            raise Failure(1, phase, f"root-manifest drift: {name} does not match its pinned SHA-256")
+        covered[name] = actual
+    missing = [name for name in ROOT_MANIFEST_REQUIRED if name not in covered]
+    if missing:
+        raise Failure(1, phase, f"{ROOT_MANIFEST} does not cover required TCB files: {', '.join(missing)}")
+    return covered
 
 
 def verify_base_snapshot(checkout: Path, snapshot: Path, expected_drift=()) -> dict[str, str]:
@@ -5178,6 +5473,13 @@ def waiver_vacuity_gate(checkout: Path) -> dict[str, dict[str, int]]:
 
 
 def main() -> int:
+    try:
+        return _main()
+    finally:
+        remove_process_binaries()
+
+
+def _main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lean", type=Path, help="absolute path to an already installed pinned Lean executable")
     parser.add_argument("--self-test", action="store_true", help="run the bounded regression fixtures")
@@ -5190,6 +5492,9 @@ def main() -> int:
                              "(default: $ANNEAL_TRUSTED_BASE_SNAPSHOT); any other TCB drift fails")
     parser.add_argument("--expected-tcb-drift", action="append", default=[], metavar="RELPATH",
                         help="checkout-relative TCB path allowed to differ from --base-snapshot (repeatable)")
+    parser.add_argument("--audit-olean", type=Path, metavar="REQUEST",
+                        help="audit the compiled modules named by a JSON request with OleanEnvAuditor "
+                             "(trust-gating policy) and print its verdict")
     args = parser.parse_args()
     checkout = Path(__file__).resolve().parent.parent.parent
     if args.lean is not None and not args.lean.is_absolute():
@@ -5213,6 +5518,30 @@ def main() -> int:
             print(f"Trusted check failed (waiver-pin): {error}", file=sys.stderr)
             return 2
         print(f"PASS: waiver pins and annotated-claim vacuity; {json.dumps(summary, sort_keys=True)}")
+        return 0
+    if args.audit_olean is not None:
+        try:
+            request = json.loads(args.audit_olean.read_text())
+        except (OSError, ValueError) as error:
+            print(f"Trusted check failed (olean-audit): cannot read request: {error}", file=sys.stderr)
+            return 2
+        try:
+            olean_checker = Checker(checkout, args.lean, fast=args.fast, cache_dir=args.cache_dir)
+        except (Failure, OSError) as error:
+            print(f"Trusted check failed (admission): {error}", file=sys.stderr)
+            return error.code if isinstance(error, Failure) else 2
+        try:
+            olean_checker.tool_admission()
+            verdict = olean_checker.audit_olean_request(request)
+            olean_checker.freshness()
+        except (Failure, OSError, ValueError, KeyError, TypeError) as error:
+            code = error.code if isinstance(error, Failure) else 2
+            phase = error.phase if isinstance(error, Failure) else olean_checker.phase
+            print(f"Trusted check failed ({phase}): {error}\npreserved logs: {olean_checker.stage}", file=sys.stderr)
+            return code
+        print(json.dumps(verdict, indent=2, sort_keys=True))
+        make_tree_writable(olean_checker.stage)
+        shutil.rmtree(olean_checker.stage)
         return 0
     try:
         checker = Checker(checkout, args.lean, fast=args.fast, cache_dir=args.cache_dir,
@@ -5241,7 +5570,13 @@ def main() -> int:
           f"{report['kernelDeclarations']} Trusted kernel declarations; "
           f"{downstream.get('replayedDeclarations', 0)} total replayed declarations; "
           f"{downstream.get('claimTheoremsChecked', 0)} claim theorem statements origin-checked; "
-          f"axioms={report['axioms']}\nSource {report['sourceSha256']}; tools/policy {report['toolsSha256']}\n"
+          f"axioms={report['axioms']}\n"
+          f"OleanEnvAuditor: {report['oleanAudit']['auditedDeclarations']} Trusted / "
+          f"{downstream.get('oleanAudit', {}).get('auditedDeclarations', 0)} downstream declarations audited from "
+          f"compiled artifacts; {downstream.get('oleanAudit', {}).get('intrinsicTagsChecked', 0)} compiler-intrinsic tags, "
+          f"{downstream.get('oleanAudit', {}).get('kernelTagConfirmations', 0)} kernel-confirmed tag equations, "
+          f"replay={report['oleanAudit']['replay'] and downstream.get('oleanAudit', {}).get('replay', False)}\n"
+          f"Source {report['sourceSha256']}; tools/policy {report['toolsSha256']}\n"
           f"Waiver pins and annotated-claim vacuity: {staged_lean} staged Lean files, "
           f"{audited.get('rustcCapture', {}).get('rustFiles', 0)} trusted/rustc-capture Rust files\n"
           f"{report['toolchain']}")

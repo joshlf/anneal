@@ -42,7 +42,9 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         (root / "trusted/lean").mkdir(parents=True)
         for name in ("foundation-lock.json", "lean-toolchain"):
             shutil.copyfile(checkout / "trusted/lean" / name, root / "trusted/lean" / name)
-        for name in ("check_trusted.py", "TrustedBoundary.lean"):
+        # `Checker` requires the compiled-environment auditor unconditionally: a fixture without it
+        # fails admission, so every fixture carries the checked-out source.
+        for name in ("check_trusted.py", "TrustedBoundary.lean", "OleanEnvAuditor.lean"):
             shutil.copyfile(checkout / "trusted/audit" / name, root / "trusted/audit" / name)
         (root / "trusted/lean/Trusted.lean").write_text(source if source is not None else header)
         return root
@@ -97,6 +99,11 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         assert any("instCoe" in n for n in declarations)
         assert all(d["module"] == "Trusted" for d in declarations.values())
         assert set(report["axioms"]) == {"Classical.choice", "Quot.sound", "propext"}
+        # The compiled-environment auditor ran on the same artifacts and audited every declaration.
+        olean = report["oleanAudit"]
+        assert olean["auditor"] == "OleanEnvAuditor" and olean["replay"] is True and olean["modules"] == ["Trusted"]
+        assert olean["auditedDeclarations"] >= report["kernelDeclarations"] and olean["intrinsicTagsChecked"] > 0
+        assert olean["kernelTagConfirmations"] > 0 and set(olean["axioms"]) == set(report["axioms"])
         done("private/opaque/data/mutual/nested/matcher/typeclass/coercion, module ownership, ambient paths")
 
         # Lock-only growth must affect parser, audit and replay roots consistently.
@@ -784,8 +791,9 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         ro_checker = runner.Checker(fixture(), lean, temp_parent=suite)
         disposable.append(ro_checker.stage)
         ro_checker.tool_admission()
-        staged_inputs = [ro_checker.inspector, *(p for p in ro_checker.source_copy.rglob("*") if p.is_file())]
-        assert len(staged_inputs) >= 2 and all(stat.S_IMODE(p.stat().st_mode) == 0o444 for p in staged_inputs)
+        staged_inputs = [ro_checker.inspector, ro_checker.olean_auditor,
+                         *(p for p in ro_checker.source_copy.rglob("*") if p.is_file())]
+        assert len(staged_inputs) >= 3 and all(stat.S_IMODE(p.stat().st_mode) == 0o444 for p in staged_inputs)
         if os.geteuid() != 0:
             try:
                 (ro_checker.source_copy / "Trusted.lean").write_text(header + "def tampered : Nat := 1\n")
@@ -828,6 +836,321 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                        2, "base-snapshot", "not read-only")
         shutil.rmtree(snap)
         done("waiver pins, annotated-claim vacuity, read-only staged inputs, and --base-snapshot TCB drift")
+
+        # Groups 19-27: Episode 1 compiled-environment auditor (OleanEnvAuditor). Attack modules are
+        # compiled directly (no preflight), exactly as a hostile build would hand them over, and the
+        # auditor must reject them from the compiled artifacts alone.
+        def olean_checker():
+            ol = runner.Checker(fixture(), lean, temp_parent=suite)
+            ol.tool_admission()  # Its stage spans Groups 19-26 and is removed after Group 26.
+            return ol
+
+        def olean_module(ol, name, source, imports, *, module_file=False, flags=()):
+            rel = name.replace(".", "/")
+            src = ol.stage / "olean-src" / (rel + ".lean")
+            src.parent.mkdir(parents=True, exist_ok=True)
+            src.write_text(source)
+            out = ol.stage / "olean-lib" / (rel + ".olean")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            edges = [{"module": m, "importAll": False, "isExported": True, "isMeta": False} for m in imports]
+            setup = {"name": name, "isModule": module_file, "imports": edges, "importArts": dict(ol.artifacts),
+                     "dynlibs": [], "plugins": [], "options": {}}
+            setup_path = ol.stage / f"{name}.olean-fixture.setup.json"
+            setup_path.write_text(json.dumps(setup))
+            ol.process("olean-fixture-" + name, ["-j1", "-M4096", "-t0", *flags, "--setup", str(setup_path),
+                                                  "-o", str(out), str(src)])
+            parts = {}
+            for part in runner.PARTS:
+                artifact = out.with_name(out.name[:-5] + part)
+                if artifact.exists():
+                    parts[part] = str(artifact)
+                    ol.expected_artifacts[str(artifact)] = runner.digest(artifact)
+            ol.artifacts[name] = [[parts[p] for p in runner.PARTS[:3] if p in parts],
+                                  [parts[p] for p in runner.PARTS[3:] if p in parts]]
+            ol.graph[name] = edges
+            return parts
+
+        def olean_reject(ol, names, *needles, **extra):
+            try:
+                ol.olean_audit("olean-audit", scope="fixture", roots=names, modules=names,
+                               maxReportedViolations=200, **extra)
+            except runner.Failure as error:
+                assert error.code == 1 and error.phase == "olean-audit", (error.code, error.phase, str(error))
+                for needle in needles:
+                    assert needle in str(error), (needle, str(error))
+                return str(error)
+            raise AssertionError(f"compiled-environment audit accepted {names} {extra}")
+
+        def olean_accept(ol, names, **extra):
+            return ol.olean_audit("olean-audit", scope="fixture", roots=names, modules=names, **extra)
+
+        def olean_raw(ol, names, **extra):
+            """Diagnostic run outside the trust gate (no result-schema gate) to observe verdicts."""
+            request = {"mode": "olean-audit", "sysroot": str(ol.prefix), "artifacts": sorted(ol.artifacts.items()),
+                       "foundation": ol.foundation, "graph": ol.graph, "axioms": ol.lock["axioms"],
+                       "roots": names, "modules": names, "scope": "diagnostic", "maxReportedViolations": 200, **extra}
+            raw = ol.stage / f"olean-raw-{len(list(ol.stage.glob('olean-raw-*.request.json')))}.request.json"
+            res = raw.with_name(raw.name.replace(".request.json", ".response.json"))
+            raw.write_text(json.dumps(request))
+            try:
+                ol.process("olean-diagnostic", ["-j1", "--run", str(ol.olean_auditor), str(raw), str(res)])
+            except runner.Failure:
+                pass
+            return json.loads(res.read_text())
+
+        prelude_init = "prelude\nimport Init\n"
+
+        # Group 19: positive control (inductives, structures, matchers, sparse casesOn, noConfusion,
+        # well-founded and structural recursion), the `--audit-olean` request API, and cache trust.
+        ol = olean_checker()
+        clean_source = prelude_init + (
+            "inductive Color where\n  | red | green | blue\nderiving DecidableEq\n"
+            "structure Pt where\n  x : Nat\n  y : Nat\nderiving DecidableEq\n"
+            "inductive Vec (α : Type) : Nat → Type where\n  | nil : Vec α 0\n  | cons : α → Vec α n → Vec α (n + 1)\n"
+            "def Color.next : Color → Color\n  | .red => .green\n  | .green => .blue\n  | .blue => .red\n"
+            "def isRed : Color → Bool\n  | .red => true\n  | _ => false\n"
+            "def ack : Nat → Nat → Nat\n  | 0, n => n + 1\n  | m + 1, 0 => ack m 1\n"
+            "  | m + 1, n + 1 => ack m (ack (m + 1) n)\ntermination_by m n => (m, n)\n"
+            "def sumTo : Nat → Nat\n  | 0 => 0\n  | n + 1 => (n + 1) + sumTo n\n"
+            "theorem vcons_head {α : Type} {n : Nat} (a b : α) (v w : Vec α n)\n"
+            "    (h : Vec.cons a v = Vec.cons b w) : a = b := by injection h\n"
+            "theorem red_ne_green : Color.red ≠ Color.green := by decide\n")
+        olean_module(ol, "OlClean", clean_source, ["Init"])
+        clean_src = str(ol.stage / "olean-src/OlClean.lean")
+        clean = olean_accept(ol, ["OlClean"], sources=[("OlClean", clean_src)])
+        assert clean["replay"] is True and clean["auditedDeclarations"] > 20 and clean["codegenCompanions"] >= 1
+        assert clean["intrinsicTagsChecked"] > 0 and clean["kernelTagConfirmations"] > 0 and clean["irDeclarationsChecked"] > 0
+        api = ol.audit_olean_request({"roots": ["OlClean"], "modules": ["OlClean"], "artifacts": [],
+                                      "sources": [["OlClean", clean_src]], "scope": "api"})
+        assert api["scope"] == "api" and api["auditedDeclarations"] == clean["auditedDeclarations"]
+        expect_failure(lambda: ol.audit_olean_request({"roots": ["OlClean"], "modules": ["OlClean"], "artifacts": [],
+                                                       "allowProvisionalNative": True}),
+                       2, "olean-audit", "malformed --audit-olean request")
+        cache_probe = suite / "cache-probe"
+        cache_probe.write_text("{}")
+        cache_probe.chmod(0o644)
+        assert runner._trusted_cache_file(cache_probe)
+        cache_probe.chmod(0o664)
+        assert not runner._trusted_cache_file(cache_probe)
+        cache_probe.unlink()
+        done("compiled-environment auditor: 0-FP positive control, --audit-olean API, cache trust")
+
+        # Group 20: artifact completeness and all-parts provenance. A `module` file's private axiom
+        # lives only in `.olean.private`; omitted, deleted, reordered, or symlinked companions and
+        # toolchain-named artifacts are rejected.
+        mod_header = "module\nprelude\npublic import Init.Core\n"
+        olean_module(ol, "OlMod", mod_header + "private axiom hiddenBackdoor : False\n"
+                     "public theorem sneaky : True := hiddenBackdoor.elim\n", ["Init.Core"], module_file=True)
+        olean_reject(ol, ["OlMod"], "[unapprovedAxiom]", "hiddenBackdoor")
+        mod_parts = olean_module(ol, "OlModClean", mod_header + "public def pubFn (n : Nat) : Nat := n + 1\n"
+                                 "def privFn (n : Nat) : Nat := n + 2\ntheorem privFn_eq : privFn 0 = 2 := rfl\n",
+                                 ["Init.Core"], module_file=True)
+        assert set(mod_parts) == set(runner.PARTS)
+        olean_accept(ol, ["OlModClean"])
+        genuine = [list(g) for g in ol.artifacts["OlModClean"]]
+        ol.artifacts["OlModClean"] = [[genuine[0][0]], genuine[1]]
+        olean_reject(ol, ["OlModClean"], "[missingPrivateArtifact]", "exists but was omitted")
+        ol.artifacts["OlModClean"] = [[genuine[0][0], genuine[0][2], genuine[0][1]], genuine[1]]
+        olean_reject(ol, ["OlModClean"], "[moduleProvenanceSpoofed]", "canonical companions")
+        ol.artifacts["OlModClean"] = [genuine[0], []]
+        olean_reject(ol, ["OlModClean"], "[missingPrivateArtifact]")
+        evil = ol.stage / "evil-artifacts"
+        evil.mkdir()
+        for part in runner.PARTS:
+            (evil / f"OlModClean.{part}").symlink_to(mod_parts[part])
+        ol.artifacts["OlModClean"] = [[str(evil / f"OlModClean.{p}") for p in runner.PARTS[:3]],
+                                      [str(evil / f"OlModClean.{p}") for p in runner.PARTS[3:]]]
+        olean_reject(ol, ["OlModClean"], "[moduleProvenanceSpoofed]", "resolves to")
+        split = ol.stage / "split-artifacts"
+        split.mkdir()
+        for part in runner.PARTS:
+            shutil.copyfile(mod_parts[part], split / f"OlModClean.{part}")
+        (split / "OlModClean.olean.private").unlink()
+        (split / "OlModClean.olean.private").symlink_to(ol.artifacts["OlMod"][0][2])
+        ol.artifacts["OlModClean"] = [[str(split / f"OlModClean.{p}") for p in runner.PARTS[:3]],
+                                      [str(split / f"OlModClean.{p}") for p in runner.PARTS[3:]]]
+        olean_reject(ol, ["OlModClean"], "[moduleProvenanceSpoofed]", "OlModClean.olean.private")
+        for part in ("ir", "ir.sig"):
+            Path(mod_parts[part]).unlink()
+        ol.artifacts["OlModClean"] = [genuine[0], []]
+        olean_reject(ol, ["OlModClean"], "[missingPrivateArtifact]", "module-system file")
+        del ol.artifacts["OlModClean"]  # Its IR is gone; every audited artifact entry must be intact.
+        olean_module(ol, "OlUsesZero", "prelude\nimport Init.Data.Zero\ndef usesZero : Nat := 0\n", ["Init.Data.Zero"])
+        spoof = ol.stage / "toolchain-spoof/Init/Data"
+        spoof.mkdir(parents=True)
+        zero_parts = [[], []]
+        for part in runner.PARTS:
+            shutil.copyfile(ol.prefix / "lib/lean/Init/Data" / f"Zero.{part}", spoof / f"Zero.{part}")
+            zero_parts[0 if part.startswith("olean") else 1].append(str(spoof / f"Zero.{part}"))
+        ol.artifacts["Init.Data.Zero"] = zero_parts
+        olean_reject(ol, ["OlUsesZero"], "[moduleProvenanceSpoofed]", "toolchain-named module")
+        del ol.artifacts["Init.Data.Zero"]
+        olean_accept(ol, ["OlUsesZero"])
+        done("hidden private axiom, omitted/reordered/deleted companions, split-part and toolchain-name provenance spoofing")
+
+        # Group 21: `partial`, `unsafe`, and forged `_unsafe_rec` code-generation companions (a
+        # sibling replaces the compiled code of its parent with no attribute), including a stdlib
+        # parent, an opaque parent, and a structurally recursive (non-partial) forged sibling; plus
+        # the source-level identifier rule.
+        rec_source = prelude_init + (
+            "partial def loopy (n : Nat) : Nat := loopy (n + 1)\n"
+            "unsafe def danger (n : Nat) : Nat := n\n"
+            "def victim._unsafe_rec (n : Nat) : Nat := n + 1\ndef victim (n : Nat) : Nat := n\n"
+            "def Bool.xor._unsafe_rec (a _b : Bool) : Bool := a\n"
+            "opaque op : Nat → Nat\ndef op._unsafe_rec (n : Nat) : Nat := n\n"
+            "noncomputable def selfRec._unsafe_rec : Nat → Nat\n  | 0 => 0\n  | n + 1 => selfRec._unsafe_rec n + 2\n"
+            "noncomputable def selfRec (n : Nat) : Nat := n\n")
+        olean_module(ol, "OlRec", rec_source, ["Init"])
+        olean_reject(ol, ["OlRec"], "[partialOrUnsafeRecDependency] loopy", "[unsafeDeclaration] danger",
+                     "[compilerOverrideAttribute] victim._unsafe_rec", "[compilerOverrideAttribute] Bool.xor._unsafe_rec",
+                     "[compilerOverrideAttribute] op._unsafe_rec", "[compilerOverrideAttribute] selfRec._unsafe_rec",
+                     "unsafe_rec_sibling", "[sourceForbiddenIdentifier]",
+                     sources=[("OlRec", str(ol.stage / "olean-src/OlRec.lean"))])
+        done("partial/unsafe declarations and forged _unsafe_rec siblings (stdlib, opaque, non-partial parents)")
+
+        # Group 22: compiler overrides persisted in compiled artifacts: implemented_by, extern,
+        # export, initialize, @[csimp] redirecting a stdlib function, @[scoped csimp], and an erased
+        # @[local csimp] whose lemma is audited as an inventory root (sorry / custom axiom).
+        override_source = prelude_init + (
+            "def evilImpl (n : Nat) : Nat := n + 1000\n"
+            "@[implemented_by evilImpl] def ib (n : Nat) : Nat := n\n"
+            "@[extern \"anneal_fixture_c_fn\"] def ext (n : Nat) : Nat := n\n"
+            "@[export anneal_fixture_sym] def exp (n : Nat) : Nat := n\n"
+            "def evilAdd (_a _b : Nat) : Nat := 999\naxiom csimpAx : @Nat.add = @evilAdd\n"
+            "@[csimp] theorem redirect : @Nat.add = @evilAdd := csimpAx\n"
+            "def evilMul (_a _b : Nat) : Nat := 7\n"
+            "namespace Scoped\n@[scoped csimp] theorem redirectMul : @Nat.mul = @evilMul := sorry\nend Scoped\n"
+            "def evilSub (_a _b : Nat) : Nat := 5\n"
+            "section\n@[local csimp] theorem redirectSub : @Nat.sub = @evilSub := sorry\n"
+            "def localCaller (a b : Nat) : Nat := Nat.sub a b\nend\n"
+            "initialize initFlag : Bool ← pure true\n")
+        olean_module(ol, "OlOverride", override_source, ["Init"])
+        olean_reject(ol, ["OlOverride"], "[compilerOverrideAttribute] ib", "implemented_by",
+                     "[compilerOverrideAttribute] ext", "extern", "[compilerOverrideAttribute] exp", "export",
+                     "[compilerOverrideAttribute] Nat.add", "csimp: Nat.add", "csimp: Nat.mul",
+                     "[compilerOverrideAttribute] initFlag", "init", "[unapprovedAxiom] csimpAx",
+                     "[sorryAxiomReached] sorryAx")
+        done("implemented_by/extern/export/init and stdlib, scoped, and erased local csimp redirections")
+
+        # Group 23: compiler state forged by a metaprogram (needs `import Lean`): a persisted csimp
+        # entry reusing the genuine List.map triple, a @[cpass] installer, a constant folder, and
+        # forged casesOn / sparseCasesOn / noConfusion compiler-intrinsic tags. A default audit
+        # rejects any Lean-library module outright; an audit that admits the Lean library still
+        # rejects every forged entry.
+        forged_source = "prelude\nimport Init\nimport Lean\nopen Lean\n" + (
+            "def victimF (n : Nat) : Nat := n\n"
+            "run_cmd Lean.modifyEnv fun env => Lean.Compiler.LCNF.Simp.ConstantFold.folderExt.addEntry env "
+            "{ declName := `victimF, folderDeclName := `forgedFolder, folder := fun _ => pure none }\n"
+            "run_cmd Lean.Compiler.CSimp.ext.add "
+            "{ fromDeclName := ``List.map, toDeclName := ``List.mapTR, thmName := ``List.map_eq_mapTR }\n"
+            "def FakeT.casesOn (_n : Nat) : Nat := 1\n"
+            "run_cmd Lean.modifyEnv (Lean.markAuxRecursor · ``FakeT.casesOn)\n"
+            "def sparseFake (_n : Nat) : Nat := 1\n"
+            "run_cmd Lean.modifyEnv (Lean.markSparseCasesOn · ``sparseFake)\n"
+            "def ncFake (_n : Nat) : Nat := 1\n"
+            "run_cmd Lean.modifyEnv (Lean.markNoConfusion · ``ncFake (.perCtor 1 0))\n"
+            "run_cmd Lean.modifyEnv fun env => Lean.Compiler.LCNF.passManagerExt.addEntry env "
+            "(`forgedInstaller, Lean.Compiler.LCNF.builtinPassManager)\n")
+        olean_module(ol, "OlForged", forged_source, ["Init", "Lean"])
+        olean_reject(ol, ["OlForged"], "[foreignModule] Lean")
+        olean_reject(ol, ["OlForged"], "csimp: List.map", "cpass: compiler pass installer", "constant_fold: folder forgedFolder",
+                     "casesOn_tag", "FakeT.casesOn", "sparse_casesOn_tag", "sparseFake", "noConfusion_tag", "ncFake",
+                     toolchainRoots=["Init", "Std", "Lean"])
+        done("metaprogram-forged csimp/cpass/folder state and casesOn/sparseCasesOn/noConfusion tags, Lean library foreign")
+
+        # Group 24: separate compilation (`-Dcompiler.postponeCompile=true`) of a `module` file
+        # writes no IR for public or private functions.
+        olean_module(ol, "OlPostponed", mod_header + "public def ppPublic (n : Nat) : Nat := n + 1\n"
+                     "def ppPriv (n : Nat) : Nat := n + 2\n", ["Init.Core"], module_file=True,
+                     flags=("-Dcompiler.postponeCompile=true",))
+        olean_reject(ol, ["OlPostponed"], "[missingPrivateArtifact]", "[environmentLoadFailed]", "postponed")
+        done("separate-compilation module files without IR")
+
+        # Group 25: native evaluation. Trust-gating audits reject native_decide; a diagnostic
+        # re-check refutes forged native axioms (including `_sunfold` steering and spoofed shapes)
+        # by the kernel, confirms a genuine one, and never passes an axiom that stays provisional;
+        # the gate rejects even kernel-confirmed native axioms (constraint 4).
+        olean_module(ol, "OlNative", prelude_init + "theorem nd : (2 + 2 == 4) = true := by native_decide\n", ["Init"])
+        olean_reject(ol, ["OlNative"], "[nativeDecideReached]")
+        diag = olean_raw(ol, ["OlNative"], allowProvisionalNative=True)
+        assert diag["ok"] is True and len(diag["result"]["kernelConfirmedNativeAxioms"]) == 1, diag
+        expect_failure(lambda: ol.olean_audit("olean-audit", scope="fixture", roots=["OlNative"], modules=["OlNative"],
+                                              allowProvisionalNative=True),
+                       2, "olean-audit", "invalid compiled-environment audit observation")
+        olean_module(ol, "OlForgedNative", prelude_init + (
+            "def bad : Bool := false\ndef bad._sunfold : Bool := true\n"
+            "axiom f1._native.native_decide.ax_1_1 : bad = true\n"
+            "axiom f2._native.native_decide.ax_1_1 : (!true) = true\n"
+            "axiom f3._native.native_decide.ax_1_1 : false = true\n"
+            "axiom f4._native.native_decide.ax_1_1 : False\n"), ["Init"])
+        olean_reject(ol, ["OlForgedNative"], "[nativeDecideReached] f1", "[unapprovedAxiom] f3", "[unapprovedAxiom] f4")
+        diag = olean_raw(ol, ["OlForgedNative"], allowProvisionalNative=True)
+        assert diag["ok"] is False and diag["category"] == "policy", diag
+        for needle in ("[unapprovedAxiom] f1", "[unapprovedAxiom] f2", "[unapprovedAxiom] f3", "[unapprovedAxiom] f4"):
+            assert needle in diag["message"], (needle, diag)
+        olean_module(ol, "OlStuckNative", prelude_init + "opaque stuck : Bool\n"
+                     "axiom f5._native.native_decide.ax_1_1 : stuck = true\n", ["Init"])
+        diag = olean_raw(ol, ["OlStuckNative"], allowProvisionalNative=True)
+        assert diag["ok"] is False and "provisionalNative" in diag["message"] and "f5" in diag["message"], diag
+        done("native_decide rejection, kernel re-check of forged/_sunfold-steered native axioms, provisional never passes")
+
+        # Group 26: statement-origin separation in the compiled environment: a claim statement that
+        # unfolds into a forbidden theory module is rejected; proof-only use is not.
+        olean_module(ol, "OlTheory", prelude_init + "def UntrustedProp : Prop := True\n", ["Init"])
+        olean_module(ol, "OlClaim", "prelude\nimport OlTheory\ndef myClaim : Prop := UntrustedProp\n"
+                     "theorem leaked : myClaim := True.intro\n", ["OlTheory"])
+        olean_module(ol, "OlClaimOk", "prelude\nimport OlTheory\n"
+                     "theorem proofOnly : True := (fun (_ : UntrustedProp) => True.intro) True.intro\n", ["OlTheory"])
+        olean_reject(ol, ["OlTheory", "OlClaim"], "[statementOriginLeak] leaked", "UntrustedProp",
+                     claimModules=["OlClaim"], statementForbidden=["OlTheory"], statementUnfold=["OlClaim"])
+        olean_accept(ol, ["OlTheory", "OlClaimOk"], claimModules=["OlClaimOk"], statementForbidden=["OlTheory"],
+                     statementUnfold=["OlClaimOk"])
+        runner.make_tree_writable(ol.stage)
+        shutil.rmtree(ol.stage)
+        done("compiled statement-origin separation")
+
+        # Group 27: `trusted/root-manifest.sha256` verification before any Lean child.
+        root = fixture()
+        pinned_input = root / "fixture-input.txt"
+        pinned_input.write_text("pinned build input\n")
+        manifest = root / "trusted/root-manifest.sha256"
+
+        def write_manifest(entries):
+            manifest.write_text("# fixture manifest\n\n" + "".join(f"{runner.digest(root / p)}  {p}\n" for p in entries))
+
+        covered = ["fixture-input.txt", "trusted/audit/check_trusted.py", "trusted/audit/OleanEnvAuditor.lean"]
+        write_manifest(covered)
+        assert set(runner.verify_root_manifest(root)) == set(covered)
+        pinned_input.write_text("drifted build input\n")
+        expect_failure(lambda: runner.verify_root_manifest(root), 1, "root-manifest", "drift: fixture-input.txt")
+        err = checked(root, expected=1, phase="root-manifest", executed=False)
+        assert "fixture-input.txt" in str(err)
+        assert not any(p.name.endswith(".status.json") for d in disposable[-1:] for p in Path(d).glob("*"))
+        pinned_input.unlink()
+        pinned_input.symlink_to(root / "trusted/lean/lean-toolchain")
+        write_manifest(["trusted/audit/check_trusted.py", "trusted/audit/OleanEnvAuditor.lean"])
+        manifest.write_text(manifest.read_text() + f"{runner.digest(pinned_input)}  fixture-input.txt\n")
+        expect_failure(lambda: runner.verify_root_manifest(root), 1, "root-manifest", "symlink")
+        pinned_input.unlink()
+        pinned_input.write_text("pinned build input\n")
+        write_manifest(["fixture-input.txt", "trusted/audit/check_trusted.py"])
+        expect_failure(lambda: runner.verify_root_manifest(root), 1, "root-manifest",
+                       "does not cover required TCB files: trusted/audit/OleanEnvAuditor.lean")
+        write_manifest(covered)
+        manifest.write_text(manifest.read_text() + "not a checksum line\n")
+        expect_failure(lambda: runner.verify_root_manifest(root), 1, "root-manifest", "malformed")
+        write_manifest(covered)
+        manifest.write_text(manifest.read_text() + f"{'0' * 64}  missing/file.txt\n")
+        expect_failure(lambda: runner.verify_root_manifest(root), 1, "root-manifest", "missing covered file")
+        write_manifest(covered)
+        manifest.write_text(manifest.read_text() + f"{runner.digest(pinned_input)}  ../escape\n")
+        expect_failure(lambda: runner.verify_root_manifest(root), 1, "root-manifest", "canonical relative path")
+        manifest.unlink()
+        assert runner.verify_root_manifest(root) is None
+        (root / "flake.nix").write_text("{}\n")
+        (root / "lakefile.toml").write_text("name = \"fixture\"\n")
+        expect_failure(lambda: runner.verify_root_manifest(root), 1, "root-manifest", "missing trusted/root-manifest.sha256")
+        done("root-manifest drift, symlink, missing-entry, malformed, and missing-manifest rejection before Lean")
     except BaseException as error:
         (suite / "failure.traceback").write_text(traceback.format_exc())
         print(f"SELF-TEST FAILED: {error}\nPreserved fixture sources/raw logs: {suite}", file=sys.stderr)
