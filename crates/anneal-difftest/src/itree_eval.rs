@@ -2018,6 +2018,12 @@ struct IsolatedLeanStage<X> {
     /// [`itree_lean_failure_is_inconclusive`] (watchdog kill, Lean resource
     /// limit, signal, missing toolchain) rather than with a Lean rejection, so
     /// the case is unchecked rather than refuted.
+    ///
+    /// Cases given up after a circuit-breaker trip (skipped fallbacks,
+    /// bisection-budget remainders, and slices given up by a suspended-halving
+    /// representative probe — including that probe's representative case) are
+    /// intentionally excluded so Stage 2 replacement rounds do not fan out
+    /// across systematically failing chunks.
     inconclusive_cases: BTreeSet<String>,
     /// Truncated diagnostics for each failed chunk, fallback, or irreducible
     /// single-case bisection run.
@@ -3146,6 +3152,131 @@ fn itree_confirm_replacements<'p, C, X>(
         }
     }
     out
+}
+
+/// Maximum consecutive Stage 2 replacement rounds that confirm zero new traces
+/// before stopping retries (when at least one trace has been confirmed across
+/// the stage so far; when the entire stage has confirmed zero traces, stops
+/// after `1` empty replacement round).
+const ITREE_MAX_CONSECUTIVE_EMPTY_REPLACEMENT_ROUNDS: usize = 2;
+
+/// Runs Stage 2 adaptive kernel confirmation over `confirm_cases` and then
+/// replaces candidates whose selected `ok` trace(s) all hit resource limits
+/// (`inconclusive_cases`) with their next unselected `ok` trace from `pool`.
+///
+/// Stops replacement rounds early on:
+/// - [`ItreeLeanFailureKind::MissingToolchain`] (retrying other traces cannot
+///   fix a missing toolchain), or
+/// - consecutive empty replacement rounds with zero new confirmations (`1`
+///   when `results` is still empty across the whole stage; otherwise
+///   [`ITREE_MAX_CONSECUTIVE_EMPTY_REPLACEMENT_ROUNDS`], resetting on any
+///   round that confirms at least one trace), so systematic OOMs and
+///   permanently-heavy MIR bodies do not burn all remaining trials.
+#[allow(clippy::too_many_arguments)]
+fn run_itree_confirm_with_replacements<C, X, K, O, F>(
+    confirm_cases: &mut Vec<C>,
+    pool: &[C],
+    confirm_chunk_size: usize,
+    lean_jobs: usize,
+    case_key: K,
+    case_to_fn: &BTreeMap<String, String>,
+    is_ok: O,
+    run_slice: F,
+) -> IsolatedLeanStage<X>
+where
+    C: Clone + Send + Sync,
+    X: Send,
+    K: Fn(&C) -> &str + Sync,
+    O: Fn(&C) -> bool,
+    F: Fn(&str, &[C]) -> Result<BTreeMap<String, X>, String> + Sync,
+{
+    let has_missing_toolchain = |errors: &[String]| {
+        errors
+            .iter()
+            .any(|e| classify_itree_lean_failure(e) == ItreeLeanFailureKind::MissingToolchain)
+    };
+    let mut confirm_stage = run_isolated_adaptive_confirm_stage(
+        "ItreeDiffBatchConfirm",
+        confirm_cases,
+        confirm_chunk_size,
+        lean_jobs,
+        &case_key,
+        case_to_fn,
+        &run_slice,
+    );
+    if has_missing_toolchain(&confirm_stage.errors) {
+        return confirm_stage;
+    }
+
+    let mut rep_round = 0usize;
+    let mut consecutive_empty_rounds = 0usize;
+    while confirm_cases.len() < pool.len() && !confirm_stage.failed_fns.is_empty() {
+        let replacement_cases: Vec<C> = itree_confirm_replacements(
+            &confirm_stage,
+            confirm_cases,
+            pool,
+            &case_key,
+            case_to_fn,
+            &is_ok,
+        )
+        .into_iter()
+        .cloned()
+        .collect();
+        if replacement_cases.is_empty() {
+            break;
+        }
+        let stage_label = if rep_round == 0 {
+            "ItreeDiffBatchConfirmReplacement".to_string()
+        } else {
+            format!("ItreeDiffBatchConfirmReplacement{}", rep_round + 1)
+        };
+        rep_round += 1;
+        let rep_stage = run_isolated_adaptive_confirm_stage(
+            &stage_label,
+            &replacement_cases,
+            confirm_chunk_size,
+            lean_jobs,
+            &case_key,
+            case_to_fn,
+            &run_slice,
+        );
+        let rep_missing_toolchain = has_missing_toolchain(&rep_stage.errors);
+        let rep_confirmed = rep_stage.results.len();
+        confirm_cases.extend(replacement_cases);
+        confirm_stage.results.extend(rep_stage.results);
+        confirm_stage
+            .inconclusive_cases
+            .extend(rep_stage.inconclusive_cases);
+        confirm_stage.errors.extend(rep_stage.errors);
+        confirm_stage.failed_fns = confirm_cases
+            .iter()
+            .filter(|c| !confirm_stage.results.contains_key(case_key(c)))
+            .filter_map(|c| case_to_fn.get(case_key(c)).cloned())
+            .collect();
+        if rep_missing_toolchain {
+            break;
+        }
+        if rep_confirmed > 0 {
+            consecutive_empty_rounds = 0;
+        } else {
+            consecutive_empty_rounds += 1;
+            let empty_limit = if confirm_stage.results.is_empty() {
+                1
+            } else {
+                ITREE_MAX_CONSECUTIVE_EMPTY_REPLACEMENT_ROUNDS
+            };
+            if consecutive_empty_rounds >= empty_limit {
+                confirm_stage.errors.push(format!(
+                    "ItreeDiffBatchConfirm: stopped Stage 2 replacement rounds after \
+                     {consecutive_empty_rounds} consecutive empty round(s) with {} confirmed \
+                     trace(s) overall",
+                    confirm_stage.results.len()
+                ));
+                break;
+            }
+        }
+    }
+    confirm_stage
 }
 
 fn resolve_itree_lake_bin() -> PathBuf {
@@ -5319,64 +5450,21 @@ fn evaluate_itree_entries(
                 })
                 .collect::<BTreeMap<String, String>>())
         };
-        let mut confirm_stage = run_isolated_adaptive_confirm_stage(
-            "ItreeDiffBatchConfirm",
-            &confirm_cases,
+        // Confirm `confirm_cases` with adaptive Stage 2 halving; when
+        // `batch_cases.len() > ITREE_FULL_CONFIRM_MAX_TRACES`, replace any
+        // candidate whose selected `ok` trace(s) all hit a watchdog / resource
+        // limit with its next unselected Stage-1 `ok` trace (bounded against
+        // missing toolchains and consecutive zero-confirmation rounds).
+        let confirm_stage = run_itree_confirm_with_replacements(
+            &mut confirm_cases,
+            &batch_cases,
             confirm_chunk_size,
             lean_jobs,
             batch_case_ident,
             &case_to_fn,
+            |c| c.expected_diag_tag.as_deref() == Some("ok"),
             run_confirm_slice,
         );
-        // When `batch_cases.len() > ITREE_FULL_CONFIRM_MAX_TRACES`, each agreeing
-        // candidate had only its first `ok` trace selected into `confirm_cases`.
-        // While any candidate's selected `ok` trace(s) all hit a watchdog /
-        // resource limit (`inconclusive_cases`), confirm the candidate's next
-        // unselected Stage-1 `ok` trace so it can still obtain at least one
-        // kernel-confirmed trace even if multiple `ok` traces time out.
-        let mut rep_round = 0usize;
-        while confirm_cases.len() < batch_cases.len() && !confirm_stage.failed_fns.is_empty() {
-            let replacement_cases: Vec<BatchTraceEvalCase> = itree_confirm_replacements(
-                &confirm_stage,
-                &confirm_cases,
-                &batch_cases,
-                batch_case_ident,
-                &case_to_fn,
-                |c| c.expected_diag_tag.as_deref() == Some("ok"),
-            )
-            .into_iter()
-            .cloned()
-            .collect();
-            if replacement_cases.is_empty() {
-                break;
-            }
-            let stage_label = if rep_round == 0 {
-                "ItreeDiffBatchConfirmReplacement".to_string()
-            } else {
-                format!("ItreeDiffBatchConfirmReplacement{}", rep_round + 1)
-            };
-            rep_round += 1;
-            let rep_stage = run_isolated_adaptive_confirm_stage(
-                &stage_label,
-                &replacement_cases,
-                confirm_chunk_size,
-                lean_jobs,
-                batch_case_ident,
-                &case_to_fn,
-                run_confirm_slice,
-            );
-            confirm_cases.extend(replacement_cases);
-            confirm_stage.results.extend(rep_stage.results);
-            confirm_stage
-                .inconclusive_cases
-                .extend(rep_stage.inconclusive_cases);
-            confirm_stage.errors.extend(rep_stage.errors);
-            confirm_stage.failed_fns = confirm_cases
-                .iter()
-                .filter(|c| !confirm_stage.results.contains_key(&c.case_ident))
-                .filter_map(|c| case_to_fn.get(&c.case_ident).cloned())
-                .collect();
-        }
         for err in &confirm_stage.errors {
             eprintln!("itree-difftest: Stage 2 Lean kernel confirmation failure: {err}");
         }
@@ -11408,5 +11496,157 @@ mod tests {
             pick(&[4, 6, 7, 8, 10, 11, 12, 13, 14, 15])
         );
         assert_eq!(stage.inconclusive_cases, heavy);
+    }
+
+    /// Stage 2 replacement rounds stop immediately on a missing toolchain
+    /// (zero replacement rounds), bound systematic zero-confirmation OOMs to
+    /// one replacement round, and stop permanently heavy MIR candidates after
+    /// [`ITREE_MAX_CONSECUTIVE_EMPTY_REPLACEMENT_ROUNDS`] empty rounds while
+    /// still recovering candidates whose lighter backup trace succeeds and
+    /// never replacing or partially comparing an unconfirmed divergence.
+    #[test]
+    fn stage2_confirm_with_replacements_bounds_missing_toolchain_and_empty_rounds() {
+        let spec: Vec<(String, usize)> = (0..16).map(|i| (format!("f{i:02}"), 12)).collect();
+        let spec_refs: Vec<(&str, usize)> = spec.iter().map(|(f, n)| (f.as_str(), *n)).collect();
+        let (pool, case_to_fn) = stage_fixture(&spec_refs);
+        let initial_t0 = |div_case: Option<&str>| -> Vec<String> {
+            pool.iter()
+                .filter(|c| c.ends_with("_t0") || div_case.is_some_and(|d| c.as_str() == d))
+                .cloned()
+                .collect()
+        };
+
+        // 1. Missing toolchain stops after 1 run with zero replacement rounds.
+        let mut selected = initial_t0(None);
+        let runs = MockLeanRuns::default();
+        let stage = run_itree_confirm_with_replacements(
+            &mut selected,
+            &pool,
+            16,
+            1,
+            ident,
+            &case_to_fn,
+            |_| true,
+            |label: &str, slice: &[String]| {
+                runs.lock()
+                    .unwrap()
+                    .push((label.to_string(), slice.to_vec()));
+                Err::<BTreeMap<String, usize>, String>(
+                    "failed to run `lake env lean`: No such file or directory (os error 2)"
+                        .to_string(),
+                )
+            },
+        );
+        let runs = runs.into_inner().unwrap();
+        assert!(stage.results.is_empty());
+        assert_eq!(runs.len(), 1, "missing toolchain must run zero replacements: {runs:?}");
+        assert_eq!(selected.len(), 16);
+
+        // 2. Systematic OOM (0 confirmed overall) runs at most 1 replacement round
+        //    (4 inconclusive leaves x 1 backup trace) instead of burning all 11 rounds.
+        let mut selected = initial_t0(None);
+        let runs = MockLeanRuns::default();
+        let stage = run_itree_confirm_with_replacements(
+            &mut selected,
+            &pool,
+            16,
+            1,
+            ident,
+            &case_to_fn,
+            |_| true,
+            |label: &str, slice: &[String]| {
+                runs.lock()
+                    .unwrap()
+                    .push((label.to_string(), slice.to_vec()));
+                Err::<BTreeMap<String, usize>, String>(mock_rss_exceeded(label))
+            },
+        );
+        let runs = runs.into_inner().unwrap();
+        assert!(stage.results.is_empty());
+        // 11 runs in initial chunk + 7 runs for the 4 inconclusive candidates' `t1`
+        // (4 -> 2+2 -> 1+1+1+1), then stops before `Replacement2`.
+        assert_eq!(runs.len(), 11 + 7, "{runs:?}");
+        assert!(
+            runs.iter()
+                .all(|(l, _)| !l.starts_with("ItreeDiffBatchConfirmReplacement2")),
+            "must stop after 1 empty replacement round when 0 traces confirmed: {runs:?}"
+        );
+        assert!(
+            stage
+                .errors
+                .iter()
+                .any(|e| e.contains("stopped Stage 2 replacement rounds")),
+            "{:?}",
+            stage.errors
+        );
+        let labels: Vec<String> = runs.into_iter().map(|(l, _)| l).collect();
+        assert_labels_unique_file_stems(&labels);
+
+        // 3. Partial heavy-MIR run:
+        //    - f00..f09 confirm on t0 (10 confirmed);
+        //    - f10 fails t0 with RSS and recovers on t1 (resets empty-round counter);
+        //    - f11 fails t0, t1, t2 with RSS and recovers on t3 (after 1 empty round t2);
+        //    - f12..f14 are permanently heavy MIR bodies (every trace exceeds RSS);
+        //    - f15 has an unconfirmed divergence on t0 (must NEVER be replaced or
+        //      partially compared!).
+        //    After f11 recovers on t3, t4 and t5 are 2 consecutive empty rounds and
+        //    stop before t6..t11.
+        let div_case = "case_f15_t0";
+        let mut selected = initial_t0(None);
+        let runs = MockLeanRuns::default();
+        let stage = run_itree_confirm_with_replacements(
+            &mut selected,
+            &pool,
+            16,
+            1,
+            ident,
+            &case_to_fn,
+            |c| c != div_case,
+            |label: &str, slice: &[String]| {
+                runs.lock()
+                    .unwrap()
+                    .push((label.to_string(), slice.to_vec()));
+                let fails_rss = |c: &String| {
+                    c == "case_f10_t0"
+                        || matches!(c.as_str(), "case_f11_t0" | "case_f11_t1" | "case_f11_t2")
+                        || c.starts_with("case_f12_")
+                        || c.starts_with("case_f13_")
+                        || c.starts_with("case_f14_")
+                        || c == div_case
+                };
+                if slice.iter().any(fails_rss) {
+                    Err(mock_rss_exceeded(label))
+                } else {
+                    ok_all(slice)
+                }
+            },
+        );
+        let runs = runs.into_inner().unwrap();
+        assert_eq!(stage.results.len(), 12, "f00..f11 must all confirm");
+        assert!(stage.results.contains_key("case_f10_t1"));
+        assert!(stage.results.contains_key("case_f11_t3"));
+        assert!(
+            !selected.iter().any(|c| c.starts_with("case_f15_t") && c != div_case),
+            "unconfirmed divergence f15 must never receive replacement ok traces: {selected:?}"
+        );
+        assert!(
+            runs.iter()
+                .all(|(l, _)| !l.starts_with("ItreeDiffBatchConfirmReplacement6")),
+            "must stop after 2 consecutive empty rounds (t4, t5) instead of burning t6..t11"
+        );
+        let partial = itree_partially_comparable_fns(
+            &stage,
+            &selected,
+            ident,
+            &case_to_fn,
+            |c| c != div_case,
+        );
+        assert_eq!(
+            partial,
+            BTreeMap::from([("f10".to_string(), 1), ("f11".to_string(), 3)]),
+            "only f10 and f11 (with >=1 confirmed trace and only ok inconclusive traces) stay partial"
+        );
+        let labels: Vec<String> = runs.into_iter().map(|(l, _)| l).collect();
+        assert_labels_unique_file_stems(&labels);
     }
 }

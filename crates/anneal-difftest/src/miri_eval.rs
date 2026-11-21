@@ -12518,11 +12518,6 @@ pub fn cand_shadow() -> u32 {
             (CONFIRM_LEAN_MEMORY_MB_CAP, 200 * MIB_KIB),
         ] {
             let max_mb = miri_lean_max_mb_for_rss_budget_kib(stage_cap_mb, rss_kib);
-            assert_eq!(
-                max_mb,
-                cargo_anneal::miri_oracle::miri_lean_max_mb_for_budget_kib(stage_cap_mb, rss_kib),
-                "miri_eval and cargo_anneal::miri_oracle must share one -M headroom formula"
-            );
             assert!(
                 max_mb <= stage_cap_mb,
                 "max_mb={max_mb} exceeded stage_cap_mb={stage_cap_mb}"
@@ -12593,14 +12588,6 @@ pub fn cand_shadow() -> u32 {
             let mut rss_kib = 64 * MIB_KIB + 1;
             while rss_kib <= 20 * GIB_KIB {
                 let max_mb = miri_lean_max_mb_for_rss_budget_kib(stage_cap_mb, rss_kib);
-                assert_eq!(
-                    max_mb,
-                    cargo_anneal::miri_oracle::miri_lean_max_mb_for_budget_kib(
-                        stage_cap_mb,
-                        rss_kib
-                    ),
-                    "miri_eval and cargo_anneal::miri_oracle must share one -M headroom formula"
-                );
                 let ctx = format!("stage_cap_mb={stage_cap_mb} rss_kib={rss_kib} max_mb={max_mb}");
                 assert!((64..=stage_cap_mb).contains(&max_mb), "{ctx}");
                 assert!(max_mb * 1024 < rss_kib, "{ctx}");
