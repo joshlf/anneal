@@ -269,8 +269,12 @@ def anyListTrueProto {α : Type} (p : α → Bool) : List α → Bool
     | false => anyListTrueProto p rest
 
 /--
-Test whether `ty` is uninhabited (`!` or an ADT whose `LayoutTable` entry sets
-`isUninhabited = true` or `variants = .empty`).
+Test whether `ty` is uninhabited (`!`, an ADT/closure whose `LayoutTable` entry
+sets `isUninhabited = true` or `variants = .empty`, a non-empty array or tuple
+containing an uninhabited element, or a reference `&T` / `&mut T` to a sized
+uninhabited pointee such as `&!` or `&UninhabStruct` — matching Miri
+`ValidityVisitor.lean:226` `opsemInhabited`; note that `&[!; 0]` and `&[!]`
+ARE inhabited).
 
 Reference (The Rust Reference, "Behavior considered undefined — Invalid values"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
@@ -288,7 +292,11 @@ def isUninhabitedRigidTyProto
     | .never => true
     | .array elem (.succ _) => isUninhabitedRigidTyProto localDecls layouts fuel' elem
     | .tuple ks => anyListTrueProto (isUninhabitedRigidTyProto localDecls layouts fuel') ks
-    | .adt _ _ =>
+    | .ref _ pointee =>
+      match isUnsizedRigidTy 8 pointee with
+      | true => false
+      | false => isUninhabitedRigidTyProto localDecls layouts fuel' pointee
+    | .adt _ _ | .closure _ _ =>
       match findDeclLayoutForRigidTy localDecls layouts ty with
       | .some l =>
         match l.isUninhabited with
@@ -459,6 +467,33 @@ def checkPtrArgAlignedProto
 /-! ## Section 3: Tree Borrows Read and Write Helpers -/
 
 /--
+Truncate a borrow entry's projection at any `union` container step so sibling
+union fields (`.field 0` vs `.field 1` of `union U { a: u32, b: u32 }`, which
+share offset `0`) always overlap in Tree Borrows read/write conflict checks
+(closing the gap where `Places.projectionsOverlap [.field 0] [.field 1] = false`).
+-/
+@[reducible]
+def normalizeAccessBorrowProjProto
+    (targetDecls : List LocalDecl)
+    (targetLayouts : LayoutTable)
+    (entry : BorrowEntry) :
+    List ProjectionElem :=
+  match entry.targetProjection with
+  | .nil => .nil
+  | pHead :: pTail =>
+    match
+      placeTouchesUnion
+        targetDecls
+        targetLayouts
+        { local_ := entry.targetLocal, projection := pHead :: pTail }
+    with
+    | false => pHead :: pTail
+    | true =>
+      match get? targetDecls entry.targetLocal with
+      | .some decl => truncateTyProjAtUnion targetDecls targetLayouts decl.ty (pHead :: pTail)
+      | .none => .nil
+
+/--
 Check Tree Borrows read permissions and apply the read permission transition for
 a non-zero read through borrow tag `tag` (with entry `entry` in `borrows`) over
 the exact accessed byte range `[accessOff, accessOff + accessLen)`.
@@ -482,7 +517,9 @@ def borrowsAfterReadAccessProto
     (activeProtectors : List Nat)
     (tag : Nat)
     (entry : BorrowEntry)
-    (accessOff accessLen : Nat) :
+    (accessOff accessLen : Nat)
+    (targetDecls : List LocalDecl := .nil)
+    (targetLayouts : LayoutTable := emptyLayoutTable) :
     Option (List BorrowEntry) :=
   match entry.perm with
   | .disabled => .none
@@ -494,9 +531,11 @@ def borrowsAfterReadAccessProto
     match ancReadUB with
     | true => .none
     | false =>
-      -- Pass the exact accessed byte range `[accessOff, accessOff + accessLen)`
-      -- (already verified within `[entry.rangeOffset, entry.rangeOffset + entry.rangeLen)`)
-      -- so an access to a sub-slice never over-invalidates disjoint ranged siblings!
+      -- Truncate at union containers (`normalizeAccessBorrowProjProto`) so
+      -- sibling union fields overlap, and pass the exact accessed byte range
+      -- `[accessOff, accessOff + accessLen)` so sub-slice accesses never
+      -- over-invalidate disjoint ranged siblings.
+      let effProj := normalizeAccessBorrowProjProto targetDecls targetLayouts entry
       let readUB : Bool :=
         hasTreeReadUB
           borrows
@@ -504,7 +543,7 @@ def borrowsAfterReadAccessProto
           activeProtectors
           entry.targetLocal
           (.some tag)
-          entry.targetProjection
+          effProj
           accessOff
           accessLen
           entry.targetFrameDepth
@@ -517,7 +556,7 @@ def borrowsAfterReadAccessProto
             borrows
             entry.targetLocal
             (.some tag)
-            entry.targetProjection
+            effProj
             accessOff
             accessLen
             activeProtectors
@@ -548,7 +587,9 @@ def borrowsAfterWriteAccessProto
     (activeProtectors : List Nat)
     (tag : Nat)
     (entry : BorrowEntry)
-    (accessOff accessLen : Nat) :
+    (accessOff accessLen : Nat)
+    (targetDecls : List LocalDecl := .nil)
+    (targetLayouts : LayoutTable := emptyLayoutTable) :
     Option (List BorrowEntry) :=
   let childWriteUB : Bool :=
     match entry.perm with
@@ -565,6 +606,7 @@ def borrowsAfterWriteAccessProto
     match ancWriteUB with
     | true => .none
     | false =>
+      let effProj := normalizeAccessBorrowProjProto targetDecls targetLayouts entry
       let protConflict : Bool :=
         match activeProtectors with
         | .nil => false
@@ -575,7 +617,7 @@ def borrowsAfterWriteAccessProto
             activeProtectors
             entry.targetLocal
             (.some tag)
-            entry.targetProjection
+            effProj
             accessOff
             accessLen
             entry.targetFrameDepth
@@ -588,7 +630,7 @@ def borrowsAfterWriteAccessProto
             borrows
             entry.targetLocal
             (.some tag)
-            entry.targetProjection
+            effProj
             accessOff
             accessLen
             entry.targetFrameDepth)
@@ -640,6 +682,77 @@ structure ResolvedMemEndpointProto : Type where
   rootSlot? : Option LocalSlot
   /-- Backing `CapturedAllocation`, if global-backed. -/
   globalAlloc? : Option CapturedAllocation
+
+/--
+Test whether `v` is a leaf value whose untyped byte encoding
+(`encodeUntypedValueToBytes`) is exact: a zero-sized unit, a scalar, a thin
+pointer, or a field-less aggregate. The byte width of a leaf is intrinsic to
+the value, so no layout information is needed to place its bytes.
+-/
+@[reducible]
+def isLeafValueProto : Value → Bool
+  | .unit => true
+  | .scalar _ => true
+  | .ptr _ _ => true
+  | .aggregate _ .nil => true
+  | _ => false
+
+/-- Test whether every value in `vs` is a leaf (`isLeafValueProto`) or `Value.uninit`. -/
+@[reducible]
+def allLeafOrUninitValuesProto : List Value → Bool
+  | .nil => true
+  | .uninit :: rest => allLeafOrUninitValuesProto rest
+  | v :: rest =>
+    match isLeafValueProto v with
+    | true => allLeafOrUninitValuesProto rest
+    | false => false
+
+/--
+Test whether `vs` is array-shaped: every element is a `Value.scalar` or
+`Value.ptr` of the same byte width `sz`.
+-/
+@[reducible]
+def allSameSizeLeafValuesProto (sz : Nat) : List Value → Bool
+  | .nil => true
+  | .scalar sc :: rest =>
+    match Nat.beq sc.sizeBytes sz with
+    | true => allSameSizeLeafValuesProto sz rest
+    | false => false
+  | .ptr _ pSz :: rest =>
+    match Nat.beq pSz sz with
+    | true => allSameSizeLeafValuesProto sz rest
+    | false => false
+  | _ :: _ => false
+
+/--
+Test whether an untyped root value (a caller-owned referent with no `LocalDecl`)
+has a byte image determined by the value alone: a leaf, or an array-shaped
+aggregate of equal-width scalars / pointers (a byte or word buffer). Every other
+untyped aggregate could contain padding, reordered fields, or an enum tag, so
+its image is unknown.
+-/
+@[reducible]
+def untypedValueHasExactByteImageProto : Value → Bool
+  | .aggregate 0 (.scalar sc :: rest) => allSameSizeLeafValuesProto sc.sizeBytes rest
+  | .aggregate 0 (.ptr _ pSz :: rest) => allSameSizeLeafValuesProto pSz rest
+  | v => isLeafValueProto v
+
+/--
+Test whether every populated field value of a union has a byte image
+determined by the value alone (`untypedValueHasExactByteImageProto`: a leaf or
+an array-shaped buffer such as the `[u8; N]` payload of `MaybeUninit<[u8; N]>`),
+or is `Value.uninit`. Union fields all start at offset `0`, so such a field's
+bytes are placed exactly by `encodeUnionStorageBytes`; any other nested
+aggregate would be encoded without its padding.
+-/
+@[reducible]
+def allUnionFieldValuesExactProto : List Value → Bool
+  | .nil => true
+  | .uninit :: rest => allUnionFieldValuesExactProto rest
+  | v :: rest =>
+    match untypedValueHasExactByteImageProto v with
+    | true => allUnionFieldValuesExactProto rest
+    | false => false
 
 /--
 Resolve a thin pointer argument `ptrArg` to a live memory endpoint in
@@ -695,39 +808,59 @@ def resolveLiveMemEndpointProto
             let rootSizeOpt : Option Nat :=
               match rootTyOpt with
               | .some rTy =>
-                match intrinsicRigidTyByteSize targetDecls targetLayouts rTy.kind with
+                match rigidTyByteSize targetLayouts rTy with
                 | .some sz => .some sz
-                | .none => rigidTyByteSize targetLayouts rTy
+                | .none => intrinsicRigidTyByteSize targetDecls targetLayouts rTy.kind
               | .none =>
+                -- Untyped caller referent: only a leaf or array-shaped buffer
+                -- has an exact byte size (an untyped padded struct does not).
                 match slot with
-                | .init v => valueDefaultByteSize v
+                | .init v =>
+                  match untypedValueHasExactByteImageProto v with
+                  | true => valueDefaultByteSize v
+                  | false => .none
                 | _ => .none
             match rootSizeOpt with
             | .none => .unsupported
             | .some rootSize =>
-              -- Tag window: the bytes this borrow entry covers. An explicit byte
-              -- range wins; a whole-local borrow covers the root; a sub-place
-              -- borrow covers `[placeOff, placeOff + size_of(place))`.
+              -- Tag window: the bytes this borrow entry covers.
+              -- Always compute the projection window `[placeOff, placeOff + size_of(place))`
+              -- for non-empty projections (using `placeTy.layoutIdx` before falling
+              -- back to `targetDecls`), AND intersect with `[rangeOffset, rangeEnd)`
+              -- whenever `entry.rangeLen > 0` so ranged sub-place borrows never
+              -- escape their own projection against unranged sibling borrows!
+              let projWindowOpt : Option (Nat × Nat) :=
+                match normalizeSubsliceProjections (stripTransparentProjections entry.targetProjection) with
+                | .nil => .some (0, rootSize)
+                | _ :: _ =>
+                  match
+                    placeTyResolved targetDecls targetLayouts
+                      { local_ := entry.targetLocal, projection := entry.targetProjection }
+                  with
+                  | .some placeTy =>
+                    let placeSizeOpt : Option Nat :=
+                      match rigidTyByteSize targetLayouts placeTy with
+                      | .some sz => .some sz
+                      | .none => intrinsicRigidTyByteSize targetDecls targetLayouts placeTy.kind
+                    match placeSizeOpt with
+                    | .some placeSize => .some (placeOff, Nat.add placeOff placeSize)
+                    | .none => .none
+                  | .none => .none
               let windowOpt : Option (Nat × Nat) :=
                 match Nat.beq entry.rangeLen 0 with
+                | true => projWindowOpt
                 | false =>
                   let rEnd := Nat.add entry.rangeOffset entry.rangeLen
-                  match Nat.ble rEnd rootSize with
-                  | true => .some (entry.rangeOffset, rEnd)
-                  | false => .some (entry.rangeOffset, rootSize)
-                | true =>
-                  match normalizeSubsliceProjections (stripTransparentProjections entry.targetProjection) with
-                  | .nil => .some (0, rootSize)
-                  | _ :: _ =>
-                    match
-                      placeTyResolved targetDecls targetLayouts
-                        { local_ := entry.targetLocal, projection := entry.targetProjection }
-                    with
-                    | .some placeTy =>
-                      match intrinsicRigidTyByteSize targetDecls targetLayouts placeTy.kind with
-                      | .some placeSize => .some (placeOff, Nat.add placeOff placeSize)
-                      | .none => .none
-                    | .none => .none
+                  let rangeHi :=
+                    match Nat.ble rEnd rootSize with
+                    | true => rEnd
+                    | false => rootSize
+                  match projWindowOpt with
+                  | .none => .none
+                  | .some (pLo, pHi) =>
+                    let lo := match Nat.ble entry.rangeOffset pLo with | true => pLo | false => entry.rangeOffset
+                    let hi := match Nat.ble rangeHi pHi with | true => rangeHi | false => pHi
+                    .some (lo, hi)
               let (accessLower, accessUpper, tagWindowKnown) : Nat × Nat × Bool :=
                 match windowOpt with
                 | .some (lo, hi) => (lo, hi, true)
@@ -809,77 +942,6 @@ def endpointAccessCheckProto (ep : ResolvedMemEndpointProto) (len : Nat) : Proto
     match Bool.and ep.tagWindowKnown (endpointRangeInBoundsProto ep len) with
     | true => .ok ()
     | false => .unsupported
-
-/--
-Test whether `v` is a leaf value whose untyped byte encoding
-(`encodeUntypedValueToBytes`) is exact: a zero-sized unit, a scalar, a thin
-pointer, or a field-less aggregate. The byte width of a leaf is intrinsic to
-the value, so no layout information is needed to place its bytes.
--/
-@[reducible]
-def isLeafValueProto : Value → Bool
-  | .unit => true
-  | .scalar _ => true
-  | .ptr _ _ => true
-  | .aggregate _ .nil => true
-  | _ => false
-
-/-- Test whether every value in `vs` is a leaf (`isLeafValueProto`) or `Value.uninit`. -/
-@[reducible]
-def allLeafOrUninitValuesProto : List Value → Bool
-  | .nil => true
-  | .uninit :: rest => allLeafOrUninitValuesProto rest
-  | v :: rest =>
-    match isLeafValueProto v with
-    | true => allLeafOrUninitValuesProto rest
-    | false => false
-
-/--
-Test whether `vs` is array-shaped: every element is a `Value.scalar` or
-`Value.ptr` of the same byte width `sz`.
--/
-@[reducible]
-def allSameSizeLeafValuesProto (sz : Nat) : List Value → Bool
-  | .nil => true
-  | .scalar sc :: rest =>
-    match Nat.beq sc.sizeBytes sz with
-    | true => allSameSizeLeafValuesProto sz rest
-    | false => false
-  | .ptr _ pSz :: rest =>
-    match Nat.beq pSz sz with
-    | true => allSameSizeLeafValuesProto sz rest
-    | false => false
-  | _ :: _ => false
-
-/--
-Test whether an untyped root value (a caller-owned referent with no `LocalDecl`)
-has a byte image determined by the value alone: a leaf, or an array-shaped
-aggregate of equal-width scalars / pointers (a byte or word buffer). Every other
-untyped aggregate could contain padding, reordered fields, or an enum tag, so
-its image is unknown.
--/
-@[reducible]
-def untypedValueHasExactByteImageProto : Value → Bool
-  | .aggregate 0 (.scalar sc :: rest) => allSameSizeLeafValuesProto sc.sizeBytes rest
-  | .aggregate 0 (.ptr _ pSz :: rest) => allSameSizeLeafValuesProto pSz rest
-  | v => isLeafValueProto v
-
-/--
-Test whether every populated field value of a union has a byte image
-determined by the value alone (`untypedValueHasExactByteImageProto`: a leaf or
-an array-shaped buffer such as the `[u8; N]` payload of `MaybeUninit<[u8; N]>`),
-or is `Value.uninit`. Union fields all start at offset `0`, so such a field's
-bytes are placed exactly by `encodeUnionStorageBytes`; any other nested
-aggregate would be encoded without its padding.
--/
-@[reducible]
-def allUnionFieldValuesExactProto : List Value → Bool
-  | .nil => true
-  | .uninit :: rest => allUnionFieldValuesExactProto rest
-  | v :: rest =>
-    match untypedValueHasExactByteImageProto v with
-    | true => allUnionFieldValuesExactProto rest
-    | false => false
 
 /--
 Higher-order at-offset field writer enforcing an EXACT byte length per field:
@@ -1439,6 +1501,16 @@ def updateGlobalAllocProto :
       | .some rest' => .some (a :: rest')
       | .none => .none
 
+/-- Exact bytewise equality of two `List AbstractByte`s (initialization, value, and provenance). -/
+@[reducible]
+def abstractBytesEqProto : List AbstractByte → List AbstractByte → Bool
+  | .nil, .nil => true
+  | a :: as, b :: bs =>
+    match abstractByteEqProto a b with
+    | true => abstractBytesEqProto as bs
+    | false => false
+  | _, _ => false
+
 /--
 Commit an updated root abstract byte buffer `updatedBytes` back to the backing
 storage of endpoint `ep`, updating either the owning stack/caller frame's
@@ -1448,12 +1520,13 @@ A stack local stores a structured `Value`, so the bytes are decoded at the
 local's declared type and the decoded value is accepted only when it
 **round-trips**: re-encoding it with the exact encoder
 (`encodeRawValueBytesProto`) must reproduce `updatedBytes`, up to bytes demoted
-to `.uninit` (`abstractBytesRefineProto`). A decode that would misplace a field,
-drop a pointer fragment's provenance, or strip provenance from an integer slot
-therefore fails closed with `.unsupported` instead of storing a value whose
-memory image differs from the bytes written. A union local whose decoded
-fields do not round-trip is reset to its uninitialized state, which refines
-every byte image.
+to `.uninit` (`abstractBytesRefineProto`). A global allocation stores raw bytes
+plus whole-pointer relocations, so its updated `CapturedAllocation` is likewise
+accepted only when reading it back via `globalAllocSliceToAbstractBytes`
+reproduces `updatedBytes` byte-for-byte with identical provenance
+(`abstractBytesEqProto`) — failing closed on partial-pointer provenance writes
+or 32-bit relocation width mismatches rather than silently stripping or bleeding
+provenance.
 -/
 def commitRootAbstractBytesProto
     (locals : List LocalSlot)
@@ -1471,9 +1544,17 @@ def commitRootAbstractBytesProto
     | true, .some alloc =>
       let (rawMask, relocs) := abstractBytesToGlobalDataProto ptrBytes updatedBytes
       let alloc' : CapturedAllocation := { alloc with bytes := rawMask, relocations := relocs }
-      match updateGlobalAllocProto globals allocId alloc' with
-      | .some globals' => .ok (locals, callStack, callerLocals, globals')
-      | .none => .ub
+      -- Global round-trip guard: never silently strip partial-pointer provenance
+      -- or bleed 8-byte relocations on non-64-bit targets.
+      match globalAllocSliceToAbstractBytes alloc' 0 (length updatedBytes) with
+      | .some roundTripped =>
+        match abstractBytesEqProto roundTripped updatedBytes with
+        | false => .unsupported
+        | true =>
+          match updateGlobalAllocProto globals allocId alloc' with
+          | .some globals' => .ok (locals, callStack, callerLocals, globals')
+          | .none => .ub
+      | .none => .unsupported
     | true, .none => .ub
   | .stack frameDepth localIdx =>
     let newSlotRes : ProtoRes LocalSlot :=
@@ -1664,15 +1745,15 @@ def writeIntrinsicReturnProto
         | .unsupported => MirStepNode.unsupported
       | .unsupported => MirStepNode.unsupported
     | proj =>
+      let resolvedProj :=
+        match proj with
+        | .nil => .nil
+        | _ :: _ =>
+          resolveBorrowWriteLocalProj bodyLocalDecls bodyLayouts locals' destination.local_ proj
       let protConflict : Bool :=
         match s.memory.activeProtectors with
         | .nil => false
         | _ :: _ =>
-          let resolvedProj :=
-            match proj with
-            | .nil => .nil
-            | _ :: _ =>
-              resolveBorrowWriteLocalProj bodyLocalDecls bodyLayouts locals' destination.local_ proj
           hasProtectedWriteConflict
             s.memory.borrows
             s.memory.activeProtectors
@@ -1696,6 +1777,21 @@ def writeIntrinsicReturnProto
             s.memory.callStack
         with
         | .ok updatedLocals =>
+          let memAfter : Memory :=
+            match s.memory.borrows with
+            | .nil => s.memory
+            | bHead :: bTail =>
+              let borrows := bHead :: bTail
+              let depth := length s.memory.callStack
+              match resolvedProj with
+              | .nil =>
+                { s.memory with
+                  borrows := invalidateConflictingBorrows borrows destination.local_ .none depth }
+              | _ :: _ =>
+                { s.memory with
+                  borrows :=
+                    invalidateConflictingBorrowsAtProj
+                      borrows destination.local_ .none resolvedProj 0 0 depth }
           MirStepNode.step {
             frame := {
               s.frame with
@@ -1703,7 +1799,7 @@ def writeIntrinsicReturnProto
               stmtIdx := 0
               locals := updatedLocals
             }
-            memory := invalidateDirectDestWriteBorrows s.memory locals' destination
+            memory := memAfter
           }
         | .ub => MirStepNode.fail .ub
         | .unsupported => MirStepNode.unsupported
@@ -1843,6 +1939,8 @@ def evalCopyMemoryProto
                           srcEntry
                           srcEp.effOffset
                           totalBytes
+                          srcEp.targetDecls
+                          srcEp.targetLayouts
                     match borrowsAfterReadOpt with
                     | .none => MirStepNode.fail .ub
                     | .some borrows₁ =>
@@ -1877,6 +1975,8 @@ def evalCopyMemoryProto
                                     dstEntryAfter
                                     dstEp.effOffset
                                     totalBytes
+                                    dstEp.targetDecls
+                                    dstEp.targetLayouts
                               match borrowsAfterWriteOpt with
                               | .none => MirStepNode.fail .ub
                               | .some borrows₂ =>
@@ -2192,6 +2292,8 @@ def evalCompareBytesProto
                       lEntry
                       leftEp.effOffset
                       count
+                      leftEp.targetDecls
+                      leftEp.targetLayouts
                 match borrows₁Opt with
                 | .none => MirStepNode.fail .ub
                 | .some borrows₁ =>
@@ -2226,6 +2328,8 @@ def evalCompareBytesProto
                                   rEntry
                                   rightEp.effOffset
                                   count
+                                  rightEp.targetDecls
+                                  rightEp.targetLayouts
                             match borrows₂Opt with
                             | .none => MirStepNode.fail .ub
                             | .some borrows₂ =>
@@ -2380,6 +2484,8 @@ def evalRawEqProto
                             aEntry
                             aEp.effOffset
                             elemSize
+                            aEp.targetDecls
+                            aEp.targetLayouts
                       match borrows₁Opt with
                       | .none => MirStepNode.fail .ub
                       | .some borrows₁ =>
@@ -2414,6 +2520,8 @@ def evalRawEqProto
                                         bEntry
                                         bEp.effOffset
                                         elemSize
+                                        bEp.targetDecls
+                                        bEp.targetLayouts
                                   match borrows₂Opt with
                                   | .none => MirStepNode.fail .ub
                                   | .some borrows₂ =>
@@ -2616,6 +2724,112 @@ def validateSeqTypedFieldsWith
   | _, _ => .ub
 
 /--
+Verify that a 2-field `.arbitrary [off0, off1] memIdx` layout without
+`fieldLayouts` genuinely places `BackendRepr.scalarPair s0 s1` at those two
+offsets rather than holding a nested pair plus a trailing ZST field
+(e.g., `#[repr(C, align(4))] struct S { a: (u8, bool), z: () }` with
+`offsets = [0, 2]`, `sz0 = 1`, `sz1 = 1`, where `s1` actually lives at byte `1`,
+NOT at the ZST offset `2`).
+
+In `rustc_abi::Layout::scalar_pair` (`Miri/ABI/RuntimeLayout.lean:707,763-772`,
+`Projection.lean:83-86`), `s0` is always at offset `0` and `s1` is at
+`bOffset = align_up(sz0, align(s1))`. Because every scalar primitive satisfies
+`1 <= align(s1) <= sz1`, `sz0 <= bOffset < sz0 + sz1` ALWAYS holds (proved in
+`scalarPair_bOffset_lt_sum_and_separates_trailing_zst`), whereas any trailing
+ZST placed after a nested `(s0, s1)` field sits at `off >= sz0 + sz1`.
+-/
+@[reducible]
+def scalarPairOffsetsValidProto
+    (totalSize : Nat)
+    (off0 off1 : Size)
+    (memIdx : List Nat)
+    (sz0 sz1 : Nat) :
+    Option (Nat × Nat) :=
+  let rawPair? : Option (Nat × Nat) :=
+    match memIdx with
+    | 0 :: 1 :: .nil => .some (off0.bytes, off1.bytes)
+    | 1 :: 0 :: .nil => .some (off1.bytes, off0.bytes)
+    | _ => .none
+  match rawPair? with
+  | .none => .none
+  | .some (firstOff, secondOff) =>
+    match
+      Bool.and (Nat.beq firstOff 0)
+        (Bool.and (Nat.blt 0 sz0)
+          (Bool.and (Nat.blt 0 sz1)
+            (Bool.and (Nat.ble sz0 secondOff)
+              (Bool.and (Nat.blt secondOff (Nat.add sz0 sz1))
+                (Nat.ble (Nat.add secondOff sz1) totalSize)))))
+    with
+    | true => .some (firstOff, secondOff)
+    | false => .none
+
+/--
+Validate wide-pointer metadata bytes (`metaSlice` of width `ptrBytes`) for
+pointee `pointee` (`.slice _`, `.str`, or `.dynamic _`), matching
+`Miri/Interpreter/ValidityVisitor.lean:184-205, 323-327`:
+- For `.dynamic _`: vtable pointer must be initialized and non-null (`.ub` if
+  null or unbacked `(0, 0)`, even on raw `*const dyn Trait`!).
+- For `.slice elem` / `.str`: metadata must be an initialized `usize` length
+  without pointer provenance (provenance fails closed `.unsupported`); when
+  `isRef = true`, total byte size `len * size_of::<elem>()` must fit in
+  `isize::MAX` (else `.ub`).
+-/
+@[reducible]
+def validateWideMetaBytesProto
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (pointee : RigidTy)
+    (isRef : Bool)
+    (metaSlice : List AbstractByte) :
+    TypedBytesValidityProto :=
+  let ptrBytes := layoutPointerBytes layouts
+  match decodeScalarBytes metaSlice false with
+  | .none => .ub
+  | .some (metaSv, metaProv) =>
+    match pointee with
+    | .dynamic _ =>
+      match metaProv with
+      | .some (aid, _) =>
+        match isUnbackedZeroProvProto mem { allocId := aid, offsetBytes := metaSv.bits } with
+        | false => .valid
+        | true =>
+          match Nat.beq metaSv.bits 0 with
+          | true => .ub
+          | false => .valid
+      | .none =>
+        match Nat.beq metaSv.bits 0 with
+        | true => .ub
+        | false => .valid
+    | .str =>
+      match metaProv with
+      | .some _ => .unsupported
+      | .none =>
+        match isRef with
+        | false => .valid
+        | true =>
+          let isizeMax := Nat.sub (signedHalfModulus ptrBytes) 1
+          match Nat.ble metaSv.bits isizeMax with
+          | true => .valid
+          | false => .ub
+    | .slice elem =>
+      match metaProv with
+      | .some _ => .unsupported
+      | .none =>
+        match isRef with
+        | false => .valid
+        | true =>
+          match intrinsicRigidTyByteSize localDecls layouts elem with
+          | .none => .unsupported
+          | .some elemSz =>
+            let isizeMax := Nat.sub (signedHalfModulus ptrBytes) 1
+            match Nat.ble (Nat.mul metaSv.bits elemSz) isizeMax with
+            | true => .valid
+            | false => .ub
+    | _ => .unsupported
+
+/--
 Validate that `bytes` (length `size_of::<T>()`) is a valid typed bit
 representation for `ty : RigidTy` (enforcing `kani#5205` and Miri's `typedSwap`
 typed-copy + `validatePlace` checks at `Miri/Interpreter/Intrinsics.lean:205-212`).
@@ -2623,7 +2837,9 @@ typed-copy + `validatePlace` checks at `Miri/Interpreter/Intrinsics.lean:205-212
 - Scalar integers, floats, and raw pointers require every byte initialized (`.init`).
 - `bool` requires a single initialized byte in `{0, 1}`.
 - `char` requires 4 initialized bytes forming a Unicode scalar value (`isValidCharCode`).
-- References `&T`/`&mut T` and `fn(...)` require initialized non-null pointer bytes.
+- References `&T`/`&mut T` and `fn(...)` require initialized non-null pointer bytes,
+  inhabited sized pointees (`&!` -> `.ub`), non-null `dyn` vtables (even on raw
+  `*const dyn Trait`), and `len * elemSize <= isize::MAX` for `&[T]`/`&str`.
 - Arrays, tuples, and structs validate every field at its layout offset while
   **permitting `.uninit` padding bytes**. ADT field types are taken from the
   ADT's `LayoutTable` entry (`fieldLayouts`), never from its generic arguments.
@@ -2680,22 +2896,12 @@ def validateTypedBytesForLayoutIdxWithMemProto (mem : Memory) :
                   | .none => .ub
                 | .none => .unsupported
               | off0 :: off1 :: .nil, .scalarPair s0 s1 =>
-                -- `BackendRepr.scalarPair s0 s1` is in MEMORY order (`memoryIndex`),
-                -- NOT declaration order (`offsets`), so verify memory order before pairing.
+                -- Verify exact `ScalarPair` separation (`firstOff = 0`,
+                -- `sz0 <= secondOff < sz0 + sz1`, `secondOff + sz1 <= size`)
+                -- so `{ nested_pair, trailing_zst }` structs fail closed.
                 match scalarLayoutByteWidth s0, scalarLayoutByteWidth s1 with
                 | .some sz0, .some sz1 =>
-                  let orderedPair? : Option (Nat × Nat) :=
-                    match memIdx with
-                    | 0 :: 1 :: .nil =>
-                      match Nat.ble (Nat.add off0.bytes sz0) off1.bytes with
-                      | true => .some (off0.bytes, off1.bytes)
-                      | false => .none
-                    | 1 :: 0 :: .nil =>
-                      match Nat.ble (Nat.add off1.bytes sz0) off0.bytes with
-                      | true => .some (off1.bytes, off0.bytes)
-                      | false => .none
-                    | _ => .none
-                  match orderedPair? with
+                  match scalarPairOffsetsValidProto l.size.bytes off0 off1 memIdx sz0 sz1 with
                   | .none => .unsupported
                   | .some (firstOff, secondOff) =>
                     match sliceAbstractBytes bytes firstOff sz0, sliceAbstractBytes bytes secondOff sz1 with
@@ -2794,13 +3000,24 @@ def validateTypedBytesWithMemProto (mem : Memory) :
       | _ :: _ => .ub
     | .rawPtr _ pointee =>
       let ptrBytes := layoutPointerBytes layouts
-      let expectedSz :=
+      let isWide :=
         match pointee with
-        | .slice _ | .str | .dynamic _ => Nat.mul 2 ptrBytes
-        | _ => ptrBytes
-      match Bool.and (Nat.beq (length bytes) expectedSz) (Bool.not (hasUninitByteProto bytes)) with
-      | true => .valid
-      | false => .ub
+        | .slice _ | .str | .dynamic _ => true
+        | _ => false
+      match isWide with
+      | false =>
+        match Bool.and (Nat.beq (length bytes) ptrBytes) (Bool.not (hasUninitByteProto bytes)) with
+        | true => .valid
+        | false => .ub
+      | true =>
+        match Nat.beq (length bytes) (Nat.mul 2 ptrBytes) with
+        | false => .ub
+        | true =>
+          let dataSlice := takeAbstractBytes ptrBytes bytes
+          let metaSlice := dropAbstractBytes ptrBytes bytes
+          match hasUninitByteProto dataSlice with
+          | true => .ub
+          | false => validateWideMetaBytesProto mem localDecls layouts pointee false metaSlice
     | .ref _ pointee =>
       let isWide :=
         match pointee with
@@ -2809,45 +3026,52 @@ def validateTypedBytesWithMemProto (mem : Memory) :
       let ptrBytes := layoutPointerBytes layouts
       match isWide with
       | false =>
-        match Nat.beq (length bytes) ptrBytes with
-        | false => .ub
-        | true =>
-          match decodeScalarBytes bytes false with
-          | .none => .ub
-          | .some (sv, prov) =>
-            match prov with
-            | .some (aid, _) =>
-              match isUnbackedZeroProvProto mem { allocId := aid, offsetBytes := sv.bits } with
-              | false => .valid
-              | true =>
+        match isUninhabitedRigidTyProto localDecls layouts 8 pointee with
+        | true => .ub
+        | false =>
+          match Nat.beq (length bytes) ptrBytes with
+          | false => .ub
+          | true =>
+            match decodeScalarBytes bytes false with
+            | .none => .ub
+            | .some (sv, prov) =>
+              match prov with
+              | .some (aid, _) =>
+                match isUnbackedZeroProvProto mem { allocId := aid, offsetBytes := sv.bits } with
+                | false => .valid
+                | true =>
+                  match Nat.beq sv.bits 0 with
+                  | true => .ub
+                  | false => .valid
+              | .none =>
                 match Nat.beq sv.bits 0 with
                 | true => .ub
                 | false => .valid
-            | .none =>
-              match Nat.beq sv.bits 0 with
-              | true => .ub
-              | false => .valid
       | true =>
         match Nat.beq (length bytes) (Nat.mul 2 ptrBytes) with
         | false => .ub
         | true =>
           let dataSlice := takeAbstractBytes ptrBytes bytes
           let metaSlice := dropAbstractBytes ptrBytes bytes
-          match decodeScalarBytes dataSlice false, decodeScalarBytes metaSlice false with
-          | .some (dataSv, prov), .some _ =>
-            match prov with
-            | .some (aid, _) =>
-              match isUnbackedZeroProvProto mem { allocId := aid, offsetBytes := dataSv.bits } with
-              | false => .valid
-              | true =>
+          let dataValid : TypedBytesValidityProto :=
+            match decodeScalarBytes dataSlice false with
+            | .none => .ub
+            | .some (dataSv, prov) =>
+              match prov with
+              | .some (aid, _) =>
+                match isUnbackedZeroProvProto mem { allocId := aid, offsetBytes := dataSv.bits } with
+                | false => .valid
+                | true =>
+                  match Nat.beq dataSv.bits 0 with
+                  | true => .ub
+                  | false => .valid
+              | .none =>
                 match Nat.beq dataSv.bits 0 with
                 | true => .ub
                 | false => .valid
-            | .none =>
-              match Nat.beq dataSv.bits 0 with
-              | true => .ub
-              | false => .valid
-          | _, _ => .ub
+          combineTypedValidityProto
+            dataValid
+            (validateWideMetaBytesProto mem localDecls layouts pointee true metaSlice)
     | .fnPtr _ _ _ _ =>
       let ptrBytes := layoutPointerBytes layouts
       match Nat.beq (length bytes) ptrBytes with
@@ -2988,28 +3212,48 @@ def resetTypedFieldsAtOffsetsWith
             resetTypedFieldsAtOffsetsWith sizeOfKind srcBytes resetOne offRest kRest dstBuf'
   | _, _, _ => .none
 
-/-- `n` initialized, provenance-free probe bytes (used to compute data ranges). -/
+/-- `n` copies of `b` (for data masks). -/
 @[reducible]
-def replicateInitBytesProto : Nat → List AbstractByte
+def replicateBoolProto (b : Bool) : Nat → List Bool
   | .zero => .nil
-  | .succ k => .init 0 .none :: replicateInitBytesProto k
+  | .succ k => b :: replicateBoolProto b k
 
-/-- `n` copies of `false`: the empty data mask of an `n`-byte union. -/
+/-- `n` copies of `false`: the empty data mask of an `n`-byte layout. -/
 @[reducible]
-def emptyDataMaskProto : Nat → List Bool
+def emptyDataMaskProto (n : Nat) : List Bool :=
+  replicateBoolProto false n
+
+/-- Append two `List Bool` masks structurally. -/
+@[reducible]
+def appendMaskProto : List Bool → List Bool → List Bool
+  | .nil, ys => ys
+  | x :: xs, ys => x :: appendMaskProto xs ys
+
+/-- Repeat `chunk` `count` times structurally. -/
+@[reducible]
+def repeatMaskProto (chunk : List Bool) : Nat → List Bool
   | .zero => .nil
-  | .succ k => false :: emptyDataMaskProto k
+  | .succ k => appendMaskProto chunk (repeatMaskProto chunk k)
 
-/--
-Mark as data every position of `mask` at which the field probe `probe` (placed
-at offset `0`) is still initialized after its padding was reset.
--/
+/-- Bitwise OR of `src` into `dst` starting at offset `0`, failing if `src` is longer than `dst`. -/
 @[reducible]
-def orProbeIntoDataMaskProto : List Bool → List AbstractByte → List Bool
-  | mask, .nil => mask
-  | .nil, _ :: _ => .nil
-  | _ :: maskRest, .init _ _ :: probeRest => true :: orProbeIntoDataMaskProto maskRest probeRest
-  | m :: maskRest, .uninit :: probeRest => m :: orProbeIntoDataMaskProto maskRest probeRest
+def orMaskPrefixProto : List Bool → List Bool → Option (List Bool)
+  | dst, .nil => .some dst
+  | .nil, _ :: _ => .none
+  | d :: dRest, s :: sRest =>
+    match orMaskPrefixProto dRest sRest with
+    | .some rest => .some (Bool.or d s :: rest)
+    | .none => .none
+
+/-- Bitwise OR of `src` into `dst` starting at byte offset `off`, preserving `dst.length`. -/
+@[reducible]
+def orMaskAtOffsetProto : List Bool → Nat → List Bool → Option (List Bool)
+  | dst, .zero, src => orMaskPrefixProto dst src
+  | .nil, .succ _, _ => .none
+  | d :: dRest, .succ off', src =>
+    match orMaskAtOffsetProto dRest off' src with
+    | .some rest => .some (d :: rest)
+    | .none => .none
 
 /-- Keep the bytes at data positions of `mask` and reset every other byte to `.uninit`. -/
 @[reducible]
@@ -3018,139 +3262,165 @@ def applyDataMaskProto : List Bool → List AbstractByte → List AbstractByte
   | false :: maskRest, _ :: bytesRest => .uninit :: applyDataMaskProto maskRest bytesRest
   | _, _ => .nil
 
-/--
-Data mask of a union from its field layouts: a byte is data iff it is a
-non-padding byte of AT LEAST ONE field (all fields start at offset `0`). Each
-field's data bytes are found by resetting the padding of an all-initialized
-probe of the field's size (`resetOne`). An unknown field layout yields `.none`.
--/
+/-- Fold data masks of a list of union field layout indices (all at offset `0`). -/
 @[reducible]
-def unionDataMaskWith
-    (layouts : LayoutTable)
-    (resetOne : Nat → List AbstractByte → Option (List AbstractByte)) :
+def orUnionFieldMasksWith
+    (maskOf : Nat → Option (List Bool)) :
     List Nat → List Bool → Option (List Bool)
-  | .nil, mask => .some mask
-  | fIdx :: fRest, mask =>
-    match LayoutTable.lookup layouts fIdx with
+  | .nil, acc => .some acc
+  | fIdx :: fRest, acc =>
+    match maskOf fIdx with
     | .none => .none
-    | .some fl =>
-      match resetOne fIdx (replicateInitBytesProto fl.size.bytes) with
+    | .some fMask =>
+      match orMaskAtOffsetProto acc 0 fMask with
       | .none => .none
-      | .some probe =>
-        unionDataMaskWith layouts resetOne fRest (orProbeIntoDataMaskProto mask probe)
+      | .some acc' => orUnionFieldMasksWith maskOf fRest acc'
+
+/-- Fold data masks of struct/tuple fields at explicit layout offsets. -/
+@[reducible]
+def orOffsetFieldMasksWith
+    (maskOf : Nat → Option (List Bool)) :
+    List Size → List Nat → List Bool → Option (List Bool)
+  | .nil, .nil, acc => .some acc
+  | off :: offRest, fIdx :: fRest, acc =>
+    match maskOf fIdx with
+    | .none => .none
+    | .some fMask =>
+      match orMaskAtOffsetProto acc off.bytes fMask with
+      | .none => .none
+      | .some acc' => orOffsetFieldMasksWith maskOf offRest fRest acc'
+  | _, _, _ => .none
+
+/--
+Exact data-byte mask of `LayoutTable` entry `lIdx`, 1-to-1 with
+`Miri/Interpreter/ValidityVisitor.lean:245-270` (`unionRanges`):
+a byte is `true` iff it is a non-padding data byte of `lIdx` (or, for a union,
+a data byte of AT LEAST ONE field).
+
+Soundness invariants:
+- `.union fieldCount`: strictly requires `fieldLayouts` (`length = fieldCount > 0`)
+  to compute the exact union of its fields' data bytes; without `fieldLayouts`,
+  ONLY an `.initialized` scalar spanning the entire union is accepted — NEVER
+  `.scalar (.union _)` (because `rustc` assigns `Scalar::Union` to padded
+  unions like `#[repr(C, align(4))] union U { a: (), b: (u8, u16) }` whose
+  byte `1` is common padding!).
+- `.arbitrary` without `fieldLayouts`: strictly requires `.initialized` scalar(s)
+  and verifies `scalarPairOffsetsValidProto` on `.scalarPair`.
+- Individual uninhabited fields inside an inhabited union (such as
+  `MaybeUninit<!>` or `union U { a: u32, b: (u32, !) }`) are traversed without
+  failing (`.variants = .empty` has no data bytes), matching `unionRanges`.
+- Multi-variant enums and incomplete layouts return `.none` (fail closed).
+-/
+def layoutDataMaskProto : Nat → LayoutTable → Nat → Option (List Bool)
+  | .zero, _, _ => .none
+  | .succ fuel', layouts, lIdx =>
+    match LayoutTable.lookup layouts lIdx with
+    | .none => .none
+    | .some l =>
+      match l.variants with
+      | .empty => .some (emptyDataMaskProto l.size.bytes)
+      | .single _ =>
+        match l.fields with
+        | .primitive => .some (replicateBoolProto true l.size.bytes)
+        | .union fieldCount =>
+          match Bool.and (Nat.beq (length l.fieldLayouts) fieldCount) (Bool.not (Nat.beq fieldCount 0)) with
+          | true =>
+            orUnionFieldMasksWith
+              (layoutDataMaskProto fuel' layouts)
+              l.fieldLayouts
+              (emptyDataMaskProto l.size.bytes)
+          | false =>
+            match l.backendRepr with
+            | .scalar (.initialized pk validRange) =>
+              match scalarLayoutByteWidth (.initialized pk validRange) with
+              | .some scalarBytes =>
+                match Nat.beq scalarBytes l.size.bytes with
+                | true => .some (replicateBoolProto true l.size.bytes)
+                | false => .none
+              | .none => .none
+            | _ => .none
+        | .arbitrary .nil _ => .some (emptyDataMaskProto l.size.bytes)
+        | .arbitrary offsets memIdx =>
+          match Nat.beq (length l.fieldLayouts) (length offsets) with
+          | true =>
+            orOffsetFieldMasksWith
+              (layoutDataMaskProto fuel' layouts)
+              offsets
+              l.fieldLayouts
+              (emptyDataMaskProto l.size.bytes)
+          | false =>
+            match offsets, l.backendRepr with
+            | off0 :: .nil, .scalar (.initialized pk0 r0) =>
+              match scalarLayoutByteWidth (.initialized pk0 r0) with
+              | .some sz0 =>
+                orMaskAtOffsetProto (emptyDataMaskProto l.size.bytes) off0.bytes (replicateBoolProto true sz0)
+              | .none => .none
+            | off0 :: off1 :: .nil, .scalarPair (.initialized pk0 r0) (.initialized pk1 r1) =>
+              match
+                scalarLayoutByteWidth (.initialized pk0 r0),
+                scalarLayoutByteWidth (.initialized pk1 r1)
+              with
+              | .some sz0, .some sz1 =>
+                match scalarPairOffsetsValidProto l.size.bytes off0 off1 memIdx sz0 sz1 with
+                | .none => .none
+                | .some (firstOff, secondOff) =>
+                  match
+                    orMaskAtOffsetProto (emptyDataMaskProto l.size.bytes) firstOff (replicateBoolProto true sz0)
+                  with
+                  | .none => .none
+                  | .some m1 =>
+                    orMaskAtOffsetProto m1 secondOff (replicateBoolProto true sz1)
+              | _, _ => .none
+            | _, _ => .none
+        | .array stride count =>
+          match Nat.beq count 0 with
+          | true => .some (emptyDataMaskProto l.size.bytes)
+          | false =>
+            match l.fieldLayouts with
+            | elemIdx :: .nil =>
+              match LayoutTable.lookup layouts elemIdx with
+              | .none => .none
+              | .some elemFl =>
+                match
+                  Bool.and
+                    (Nat.ble elemFl.size.bytes stride.bytes)
+                    (Nat.beq (Nat.mul count stride.bytes) l.size.bytes)
+                with
+                | false => .none
+                | true =>
+                  match layoutDataMaskProto fuel' layouts elemIdx with
+                  | .none => .none
+                  | .some elemMask =>
+                    let stridePad := emptyDataMaskProto (Nat.sub stride.bytes elemFl.size.bytes)
+                    .some (repeatMaskProto (appendMaskProto elemMask stridePad) count)
+            | _ => .none
+      | .multiple _ _ _ => .none
 
 /--
 Reset all padding bytes of `bytes` to `AbstractByte.uninit` according to
 `LayoutTable` entry `lIdx`, preserving every value byte (including pointer
-provenance). Multi-variant enums and incomplete layouts return `.none` (fail
-closed).
+provenance) and the exact data range of every union (`layoutDataMaskProto`).
+Multi-variant enums, uninhabited top-level types, and incomplete layouts return
+`.none` (fail closed).
 
-A union keeps exactly its **data range**: the bytes that are data in at least
-one field. Bytes that are padding in every field are reset like any other
-padding (for `MaybeUninit<(u8, u32)>` the fields are `()` and `(u8, u32)`, so
-bytes `1..3` are reset). This is the union data range of the interpreter's
-typed-copy validation, which `Miri.Interpreter.Intrinsics.typedSwap` runs with
-padding reset (`Intrinsics.lean:209-212`). The range needs the union's field
-layouts (`fieldLayouts`); without them only a scalar-ABI union whose scalar
-spans the whole union is accepted (every byte is data), and any other union
-fails closed rather than keeping bytes that may be common padding.
+Proved to strictly refine `bytes` (`abstractBytesRefineProto`) for ALL layouts
+in `resetTypedPaddingForLayoutIdxProto_refines`.
 -/
-def resetTypedPaddingForLayoutIdxProto :
-    Nat → LayoutTable → Nat → List AbstractByte → Option (List AbstractByte)
-  | .zero, _, _, _ => .none
-  | .succ fuel', layouts, lIdx, bytes =>
-    match LayoutTable.lookup layouts lIdx with
-    | .none => .none
-    | .some l =>
-      match Bool.or l.isUninhabited (Bool.not (Nat.beq (length bytes) l.size.bytes)) with
-      | true => .none
-      | false =>
-        match l.variants with
-        | .single _ =>
-          match l.fields with
-          | .primitive => .some bytes
-          | .union fieldCount =>
-            match Bool.and (Nat.beq (length l.fieldLayouts) fieldCount) (Bool.not (Nat.beq fieldCount 0)) with
-            | true =>
-              match
-                unionDataMaskWith
-                  layouts
-                  (resetTypedPaddingForLayoutIdxProto fuel' layouts)
-                  l.fieldLayouts
-                  (emptyDataMaskProto l.size.bytes)
-              with
-              | .some mask =>
-                let masked := applyDataMaskProto mask bytes
-                match Nat.beq (length masked) (length bytes) with
-                | true => .some masked
-                | false => .none
-              | .none => .none
-            | false =>
-              match l.backendRepr with
-              | .scalar sl =>
-                match scalarLayoutByteWidth sl with
-                | .some scalarBytes =>
-                  match Nat.beq scalarBytes l.size.bytes with
-                  | true => .some bytes
-                  | false => .none
-                | .none => .none
-              | _ => .none
-          | .arbitrary .nil _ => .some (replicateUninitBytes l.size.bytes)
-          | .arbitrary offsets memIdx =>
-            match Nat.beq (length l.fieldLayouts) (length offsets) with
-            | true =>
-              resetLayoutFieldsWith
-                layouts
-                bytes
-                (resetTypedPaddingForLayoutIdxProto fuel' layouts)
-                offsets
-                l.fieldLayouts
-                (replicateUninitBytes l.size.bytes)
-            | false =>
-              match offsets, l.backendRepr with
-              | off0 :: .nil, .scalar s0 =>
-                match scalarLayoutByteWidth s0 with
-                | .some sz0 =>
-                  match sliceAbstractBytes bytes off0.bytes sz0 with
-                  | .some s0Bytes =>
-                    writeAbstractBytesAt (replicateUninitBytes l.size.bytes) off0.bytes s0Bytes
-                  | .none => .none
-                | .none => .none
-              | off0 :: off1 :: .nil, .scalarPair s0 s1 =>
-                match scalarLayoutByteWidth s0, scalarLayoutByteWidth s1 with
-                | .some sz0, .some sz1 =>
-                  let orderedPair? : Option (Nat × Nat) :=
-                    match memIdx with
-                    | 0 :: 1 :: .nil =>
-                      match Nat.ble (Nat.add off0.bytes sz0) off1.bytes with
-                      | true => .some (off0.bytes, off1.bytes)
-                      | false => .none
-                    | 1 :: 0 :: .nil =>
-                      match Nat.ble (Nat.add off1.bytes sz0) off0.bytes with
-                      | true => .some (off1.bytes, off0.bytes)
-                      | false => .none
-                    | _ => .none
-                  match orderedPair? with
-                  | .none => .none
-                  | .some (firstOff, secondOff) =>
-                    match sliceAbstractBytes bytes firstOff sz0, sliceAbstractBytes bytes secondOff sz1 with
-                    | .some s0Bytes, .some s1Bytes =>
-                      match writeAbstractBytesAt (replicateUninitBytes l.size.bytes) firstOff s0Bytes with
-                      | .none => .none
-                      | .some buf1 => writeAbstractBytesAt buf1 secondOff s1Bytes
-                    | _, _ => .none
-                | _, _ => .none
-              | _, _ => .none
-          | .array stride count =>
-            match l.fieldLayouts with
-            | elemIdx :: .nil =>
-              resetArrayChunksWith
-                stride.bytes
-                (resetTypedPaddingForLayoutIdxProto fuel' layouts elemIdx)
-                count
-                bytes
-            | _ => .none
-        | _ => .none
+def resetTypedPaddingForLayoutIdxProto
+    (fuel : Nat) (layouts : LayoutTable) (lIdx : Nat) (bytes : List AbstractByte) :
+    Option (List AbstractByte) :=
+  match LayoutTable.lookup layouts lIdx with
+  | .none => .none
+  | .some l =>
+    match Bool.or l.isUninhabited (Bool.not (Nat.beq (length bytes) l.size.bytes)) with
+    | true => .none
+    | false =>
+      match layoutDataMaskProto fuel layouts lIdx with
+      | .none => .none
+      | .some mask =>
+        match Nat.beq (length mask) (length bytes) with
+        | true => .some (applyDataMaskProto mask bytes)
+        | false => .none
 
 /--
 Reset all padding bytes of `bytes` to `AbstractByte.uninit` at Rust type `ty`,
@@ -3391,6 +3661,7 @@ def evalTypedSwapNonOverlappingProto
                               borrowsAfterReadAccessProto
                                 s.memory.borrows s.memory.activeProtectors
                                 xTag xEntry xEp.effOffset elemSize
+                                xEp.targetDecls xEp.targetLayouts
                           match borrowsAfterXReadOpt with
                           | .none => MirStepNode.fail .ub
                           | .some borrows₁ =>
@@ -3404,6 +3675,7 @@ def evalTypedSwapNonOverlappingProto
                                   borrowsAfterReadAccessProto
                                     borrows₁ s.memory.activeProtectors
                                     yTag yEntry₁ yEp.effOffset elemSize
+                                    yEp.targetDecls yEp.targetLayouts
                             match borrowsAfterYReadOpt with
                             | .none => MirStepNode.fail .ub
                             | .some borrows₂ =>
@@ -3417,6 +3689,7 @@ def evalTypedSwapNonOverlappingProto
                                     borrowsAfterWriteAccessProto
                                       borrows₂ s.memory.activeProtectors
                                       xTag xEntry₂ xEp.effOffset elemSize
+                                      xEp.targetDecls xEp.targetLayouts
                               match borrowsAfterXWriteOpt with
                               | .none => MirStepNode.fail .ub
                               | .some borrows₃ =>
@@ -3430,6 +3703,7 @@ def evalTypedSwapNonOverlappingProto
                                       borrowsAfterWriteAccessProto
                                         borrows₃ s.memory.activeProtectors
                                         yTag yEntry₃ yEp.effOffset elemSize
+                                        yEp.targetDecls yEp.targetLayouts
                                 match borrowsAfterYWriteOpt with
                                 | .none => MirStepNode.fail .ub
                                 | .some borrows₄ =>
@@ -3701,8 +3975,33 @@ def resolvePtrOffsetFromOffsetsProto
           match deadStackRootProto? s locals pPtr, deadStackRootProto? s locals oPtr with
           | .some (pDepth, pLocal), .some (oDepth, oLocal) =>
             match Bool.and (Nat.beq pDepth oDepth) (Nat.beq pLocal oLocal) with
-            | true => .unsupported
             | false => .ub
+            | true =>
+              -- Two distinct dead tags of the same root local are `.ub` in EVERY
+              -- storage generation if their effective offsets within the local
+              -- are known to differ (same generation -> non-zero distance on a
+              -- dead allocation is `.ub`; different generations -> cross-alloc `.ub`).
+              -- Only equal (or uncomputable) effective offsets are genuinely ambiguous.
+              let pEffOpt : Option Nat :=
+                match lookupBorrow s.memory.borrows pPtr.tag with
+                | .some pEntry =>
+                  match borrowPlaceByteOffset? locals s.memory.callerLocals bodyLocalDecls bodyLayouts pEntry s.memory.callStack with
+                  | .some po => .some (Nat.add po pPtr.offsetBytes)
+                  | .none => .none
+                | .none => .none
+              let oEffOpt : Option Nat :=
+                match lookupBorrow s.memory.borrows oPtr.tag with
+                | .some oEntry =>
+                  match borrowPlaceByteOffset? locals s.memory.callerLocals bodyLocalDecls bodyLayouts oEntry s.memory.callStack with
+                  | .some oo => .some (Nat.add oo oPtr.offsetBytes)
+                  | .none => .none
+                | .none => .none
+              match pEffOpt, oEffOpt with
+              | .some pEff, .some oEff =>
+                match Nat.beq pEff oEff with
+                | false => .ub
+                | true => .unsupported
+              | _, _ => .unsupported
           | _, _ => .ub
       | .ub, _ => .ub
       | _, .ub => .ub
@@ -4165,6 +4464,77 @@ def uninitValidityProto : Option Bool → TypedBytesValidityProto
   | .some false => .ub
   | .none => .unsupported
 
+/--
+Validate wide-pointer metadata `Value` (`mVal`) for pointee `pointee`
+(`.slice _`, `.str`, or `.dynamic _`), mirroring `validateWideMetaBytesProto`
+and `Miri/Interpreter/ValidityVisitor.lean:184-205, 323-327`:
+- For `.dynamic _`: vtable pointer must be non-null (`.ub` if null, even on
+  raw `*const dyn Trait`).
+- For `.slice elem` / `.str`: metadata must be a `usize` scalar (pointer
+  provenance fails closed `.unsupported`); for `.ref`, `len * elemSize <= isize::MAX`
+  (else `.ub`).
+-/
+@[reducible]
+def validateWideMetaValueProto
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (pointee : RigidTy)
+    (isRef : Bool)
+    (mVal : Value) :
+    TypedBytesValidityProto :=
+  let ptrBytes := layoutPointerBytes layouts
+  match pointee with
+  | .dynamic _ =>
+    match decodeThinPtrArgProto? ptrBytes mVal with
+    | .none => .ub
+    | .some mArg =>
+      match isNullPtrArgProto mem mArg with
+      | true => .ub
+      | false => .valid
+  | .str =>
+    match mVal with
+    | .scalar sv =>
+      match Nat.beq sv.sizeBytes ptrBytes with
+      | false => .ub
+      | true =>
+        match isRef with
+        | false => .valid
+        | true =>
+          let len := wrapScalarBits sv.bits (scalarModulus ptrBytes)
+          let isizeMax := Nat.sub (signedHalfModulus ptrBytes) 1
+          match Nat.ble len isizeMax with
+          | true => .valid
+          | false => .ub
+    | .ptr _ pSz =>
+      match Nat.beq pSz ptrBytes with
+      | true => .unsupported
+      | false => .ub
+    | _ => .ub
+  | .slice elem =>
+    match mVal with
+    | .scalar sv =>
+      match Nat.beq sv.sizeBytes ptrBytes with
+      | false => .ub
+      | true =>
+        match isRef with
+        | false => .valid
+        | true =>
+          match intrinsicRigidTyByteSize localDecls layouts elem with
+          | .none => .unsupported
+          | .some elemSz =>
+            let len := wrapScalarBits sv.bits (scalarModulus ptrBytes)
+            let isizeMax := Nat.sub (signedHalfModulus ptrBytes) 1
+            match Nat.ble (Nat.mul len elemSz) isizeMax with
+            | true => .valid
+            | false => .ub
+    | .ptr _ pSz =>
+      match Nat.beq pSz ptrBytes with
+      | true => .unsupported
+      | false => .ub
+    | _ => .ub
+  | _ => .unsupported
+
 /-- Validate a single scalar or pointer `Value` against a `ScalarLayout` descriptor. -/
 @[reducible]
 def validateScalarLayoutValueProto
@@ -4198,6 +4568,21 @@ def validateScalarLayoutValueProto
               | false => .ub
           | _ => .unsupported
       | _ => .ub
+
+/--
+Helper for no-`fieldLayouts` `.scalar` / `.scalarPair` struct value validation:
+if the field value is an `.aggregate _ _` (e.g., a nested newtype wrapper
+`struct Outer(Inner(u32))`), fail closed `.unsupported` rather than false `.ub`.
+-/
+@[reducible]
+def validateNoFieldLayoutScalarValueProto
+    (mem : Memory)
+    (sl : ScalarLayout)
+    (v : Value) :
+    TypedBytesValidityProto :=
+  match v with
+  | .aggregate _ _ => .unsupported
+  | _ => validateScalarLayoutValueProto mem sl v
 
 /--
 Validate a structured `Value` against `LayoutTable` entry `lIdx` (driving ADT
@@ -4261,20 +4646,27 @@ def validateValueAtLayoutIdxProto (mem : Memory) :
                     l.fieldLayouts
                     fieldVals
                 | false =>
-                  match fieldVals, l.backendRepr with
-                  | v0 :: .nil, .scalar s0 => validateScalarLayoutValueProto mem s0 v0
-                  | v0 :: v1 :: .nil, .scalarPair s0 s1 =>
-                    match memIdx with
-                    | 0 :: 1 :: .nil =>
-                      combineTypedValidityProto
-                        (validateScalarLayoutValueProto mem s0 v0)
-                        (validateScalarLayoutValueProto mem s1 v1)
-                    | 1 :: 0 :: .nil =>
-                      combineTypedValidityProto
-                        (validateScalarLayoutValueProto mem s0 v1)
-                        (validateScalarLayoutValueProto mem s1 v0)
-                    | _ => .unsupported
-                  | _, _ => .unsupported
+                  match offsets, fieldVals, l.backendRepr with
+                  | _ :: .nil, v0 :: .nil, .scalar s0 =>
+                    validateNoFieldLayoutScalarValueProto mem s0 v0
+                  | off0 :: off1 :: .nil, v0 :: v1 :: .nil, .scalarPair s0 s1 =>
+                    match scalarLayoutByteWidth s0, scalarLayoutByteWidth s1 with
+                    | .some sz0, .some sz1 =>
+                      match scalarPairOffsetsValidProto l.size.bytes off0 off1 memIdx sz0 sz1 with
+                      | .none => .unsupported
+                      | .some _ =>
+                        match memIdx with
+                        | 0 :: 1 :: .nil =>
+                          combineTypedValidityProto
+                            (validateNoFieldLayoutScalarValueProto mem s0 v0)
+                            (validateNoFieldLayoutScalarValueProto mem s1 v1)
+                        | 1 :: 0 :: .nil =>
+                          combineTypedValidityProto
+                            (validateNoFieldLayoutScalarValueProto mem s0 v1)
+                            (validateNoFieldLayoutScalarValueProto mem s1 v0)
+                        | _ => .unsupported
+                    | _, _ => .unsupported
+                  | _, _, _ => .unsupported
             | _ => .ub
         | .multiple _ _ _ => .unsupported
 
@@ -4373,9 +4765,9 @@ def validateValueForRigidTyProto (mem : Memory) :
           | true =>
             match v with
             | .aggregate 0 (dVal :: mVal :: .nil) =>
-              match decodeThinPtrArgProto? ptrBytes dVal, decodeThinPtrArgProto? ptrBytes mVal with
-              | .some _, .some _ => .valid
-              | _, _ => .ub
+              match decodeThinPtrArgProto? ptrBytes dVal with
+              | .none => .ub
+              | .some _ => validateWideMetaValueProto mem localDecls layouts pointee false mVal
             | _ => .ub
         | .ref _ pointee =>
           let isWide :=
@@ -4393,12 +4785,16 @@ def validateValueForRigidTyProto (mem : Memory) :
           | true =>
             match v with
             | .aggregate 0 (dVal :: mVal :: .nil) =>
-              match decodeThinPtrArgProto? ptrBytes dVal, decodeThinPtrArgProto? ptrBytes mVal with
-              | .some dArg, .some _ =>
-                match isNullPtrArgProto mem dArg with
-                | true => .ub
-                | false => .valid
-              | _, _ => .ub
+              let dataValid : TypedBytesValidityProto :=
+                match decodeThinPtrArgProto? ptrBytes dVal with
+                | .none => .ub
+                | .some dArg =>
+                  match isNullPtrArgProto mem dArg with
+                  | true => .ub
+                  | false => .valid
+              combineTypedValidityProto
+                dataValid
+                (validateWideMetaValueProto mem localDecls layouts pointee true mVal)
             | _ => .ub
         | .fnPtr _ _ _ _ =>
           match decodeThinPtrArgProto? ptrBytes v with
@@ -4433,7 +4829,31 @@ def validateValueForRigidTyProto (mem : Memory) :
         | _ => .unsupported
 
 /--
-Validate `v` as a valid Rust value of optional type `tyOpt` for `black_box<T>`.
+Validate `v` as a valid Rust value of optional `Ty` (preserving any resolved
+`layoutIdx` on ADTs/closures, e.g. from `operandTyResolved` / `placeTyResolved`
+on a struct field whose ADT has no standalone `LocalDecl`).
+-/
+@[reducible]
+def validateBlackBoxTyValueProto
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (mem : Memory)
+    (tyOpt : Option Ty)
+    (v : Value) :
+    TypedBytesValidityProto :=
+  match tyOpt with
+  | .none => .unsupported
+  | .some ty =>
+    match ty.kind with
+    | .adt _ _ | .closure _ _ =>
+      match isUnresolvedLayoutIdx bodyLayouts ty.layoutIdx with
+      | false => validateValueAtLayoutIdxProto mem defaultCodecFuel bodyLayouts ty.layoutIdx v
+      | true => validateValueForRigidTyProto mem defaultCodecFuel bodyLocalDecls bodyLayouts ty.kind v
+    | _ =>
+      validateValueForRigidTyProto mem defaultCodecFuel bodyLocalDecls bodyLayouts ty.kind v
+
+/--
+Validate `v` as a valid Rust value of optional `RigidTy` `tyOpt` for `black_box<T>`.
 Fails closed with `.unsupported` when `tyOpt = .none` rather than silently
 accepting an arbitrary untyped value.
 
@@ -4457,16 +4877,41 @@ def validateBlackBoxValueProto
     validateValueForRigidTyProto mem defaultCodecFuel bodyLocalDecls bodyLayouts ty v
 
 /--
+Resolve the `Ty` of `black_box<T>` from `target.typeArgs`, `argOps`
+(`operandTyResolved`, preserving field `layoutIdx`), or `destination`
+(`placeTyResolved`, preserving field `layoutIdx`).
+-/
+@[reducible]
+def resolveBlackBoxTyProto?
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (destination : Place) :
+    Option Ty :=
+  match target.typeArgs with
+  | t :: _ => .some (resolveRigidTyWithDeclsProto bodyLocalDecls bodyLayouts t)
+  | .nil =>
+    match argOps with
+    | op0 :: _ =>
+      match operandTyResolved bodyLocalDecls bodyLayouts op0 with
+      | .some ty => .some ty
+      | .none => placeTyResolved bodyLocalDecls bodyLayouts destination
+    | .nil => placeTyResolved bodyLocalDecls bodyLayouts destination
+
+/--
 Evaluate `core::intrinsics::black_box<T>(dummy: T) -> T`.
 
 Exact semantics (aligned with `Miri/Interpreter/Intrinsics.lean:441`
 `h.copyOp choice (← arg args 0) dest`):
 1. Requires exactly one argument `dummyVal` (else `.fail .ub`).
-2. Resolves `T` from `target.typeArgs`, `argOps`, or `destination` and enforces
-   Rust typed validity (`validateBlackBoxValueProto`: rejects uninit scalars,
-   invalid `bool`/`char`, null `&T`, uninhabited `!`, while preserving union /
-   `MaybeUninit` uninit values, pointer `allocId` + Tree Borrows `tag`, and
-   compound structs/arrays verbatim).
+2. Resolves `T` (preserving resolved `layoutIdx`) from `target.typeArgs`,
+   `argOps`, or `destination` and enforces Rust typed validity
+   (`validateBlackBoxTyValueProto`: rejects uninit scalars, invalid
+   `bool`/`char`, null thin/wide `&T`, uninhabited `!`/`&!`, null `dyn` vtables,
+   and oversized `&[T]`/`&str` lengths, while preserving union/`MaybeUninit`
+   uninit values, pointer `allocId` + Tree Borrows `tag`, and compound
+   structs/arrays verbatim).
 3. Writes `dummyVal` to `destination` via `writeIntrinsicReturnProto` (full
    place projection + Tree Borrows write + protector checks) and jumps to
    `targetOpt` (`.fail .ub` if `targetOpt = .none`).
@@ -4506,23 +4951,8 @@ def evalBlackBoxProto
     MirStepNode :=
   match argVals with
   | dummyVal :: .nil =>
-    let tyOpt : Option RigidTy :=
-      match target.typeArgs with
-      | t :: _ => .some t
-      | .nil =>
-        match argOps with
-        | op0 :: _ =>
-          match operandTy bodyLocalDecls bodyLayouts op0 with
-          | .some ty => .some ty.kind
-          | .none =>
-            match placeTy bodyLocalDecls bodyLayouts destination with
-            | .some dTy => .some dTy.kind
-            | .none => .none
-        | .nil =>
-          match placeTy bodyLocalDecls bodyLayouts destination with
-          | .some dTy => .some dTy.kind
-          | .none => .none
-    match validateBlackBoxValueProto bodyLocalDecls bodyLayouts s.memory tyOpt dummyVal with
+    let tyOpt := resolveBlackBoxTyProto? target bodyLocalDecls bodyLayouts argOps destination
+    match validateBlackBoxTyValueProto bodyLocalDecls bodyLayouts s.memory tyOpt dummyVal with
     | .ub => MirStepNode.fail .ub
     | .unsupported => MirStepNode.unsupported
     | .valid =>
@@ -5801,6 +6231,70 @@ theorem applyDataMaskProto_refines :
     rw [abstractByteEqProto_refl]
     exact applyDataMaskProto_refines maskRest bytesRest (by simpa using h)
 
+private theorem length_eq_list_length {α : Type} : ∀ xs : List α, length xs = xs.length
+  | [] => rfl
+  | _ :: xs => by
+    change Nat.succ (length xs) = xs.length + 1
+    rw [length_eq_list_length xs]
+
+/--
+**Layout Padding-Reset Refinement Theorem**: whenever
+`resetTypedPaddingForLayoutIdxProto` succeeds on ANY `LayoutTable`, layout index
+`lIdx`, and byte list `bytes`, the output byte list refines `bytes`
+(`abstractBytesRefineProto`): every byte is either unchanged (exact value and
+provenance) or demoted to `.uninit`.
+-/
+theorem resetTypedPaddingForLayoutIdxProto_refines
+    (fuel : Nat) (layouts : LayoutTable) (lIdx : Nat)
+    (bytes out : List AbstractByte)
+    (h : resetTypedPaddingForLayoutIdxProto fuel layouts lIdx bytes = .some out) :
+    abstractBytesRefineProto out bytes = true := by
+  unfold resetTypedPaddingForLayoutIdxProto at h
+  cases hLook : LayoutTable.lookup layouts lIdx with
+  | none => rw [hLook] at h; cases h
+  | some l =>
+    rw [hLook] at h
+    dsimp only at h
+    cases hBad : Bool.or l.isUninhabited (Bool.not (Nat.beq (length bytes) l.size.bytes)) with
+    | true => rw [hBad] at h; cases h
+    | false =>
+      rw [hBad] at h
+      dsimp only at h
+      cases hMask : layoutDataMaskProto fuel layouts lIdx with
+      | none => rw [hMask] at h; cases h
+      | some mask =>
+        rw [hMask] at h
+        dsimp only at h
+        cases hLen : Nat.beq (length mask) (length bytes) with
+        | false => rw [hLen] at h; cases h
+        | true =>
+          rw [hLen] at h
+          cases h
+          have hLenEq : mask.length = bytes.length := by
+            have hBeq := Nat.beq_eq.mp hLen
+            rw [length_eq_list_length, length_eq_list_length] at hBeq
+            exact hBeq
+          exact applyDataMaskProto_refines mask bytes hLenEq
+
+/--
+**`ScalarPair` Offset Separation Theorem**: for any two non-zero scalar sizes
+`sz0, sz1 > 0` and any alignment `0 < a1 ≤ sz1`, the aligned offset
+`bOffset := ((sz0 + a1 - 1) / a1) * a1` of the second scalar in a genuine
+`BackendRepr::ScalarPair(s0, s1)` ALWAYS satisfies `sz0 ≤ bOffset < sz0 + sz1`,
+whereas any trailing ZST placed after a nested `(s0, s1)` field of size at least
+`bOffset + sz1` sits at `zstOff ≥ sz0 + sz1`. This mathematically justifies
+`scalarPairOffsetsValidProto`'s strict upper bound `secondOff < sz0 + sz1`.
+-/
+theorem scalarPair_bOffset_lt_sum_and_separates_trailing_zst
+    (sz0 sz1 a1 : Nat) (hA1Pos : 0 < a1) (hA1Le : a1 ≤ sz1) :
+    let bOffset := ((sz0 + a1 - 1) / a1) * a1
+    sz0 ≤ bOffset ∧ bOffset < sz0 + sz1 ∧ sz0 + sz1 ≤ bOffset + sz1 := by
+  dsimp only
+  have hDivMod := Nat.div_add_mod (sz0 + a1 - 1) a1
+  have hModLt : (sz0 + a1 - 1) % a1 < a1 := Nat.mod_lt _ hA1Pos
+  have hMulComm : ((sz0 + a1 - 1) / a1) * a1 = a1 * ((sz0 + a1 - 1) / a1) := Nat.mul_comm _ _
+  omega
+
 /--
 **`black_box` Preservation Theorem**:
 On a direct non-deref local destination `_0` with no active protectors,
@@ -5816,22 +6310,8 @@ theorem evalBlackBoxProto_valid_direct_dest
     (dstLocal : Local) (targetBb : BasicBlockIdx)
     (hNoProt : s.memory.activeProtectors = .nil)
     (hNoBorrows : s.memory.borrows = .nil)
-    (hValid : validateBlackBoxValueProto decls layouts s.memory
-      (match target.typeArgs with
-       | t :: _ => .some t
-       | .nil =>
-         match argOps with
-         | op0 :: _ =>
-           match operandTy decls layouts op0 with
-           | .some ty => .some ty.kind
-           | .none =>
-             match placeTy decls layouts { local_ := dstLocal, projection := .nil } with
-             | .some dTy => .some dTy.kind
-             | .none => .none
-         | .nil =>
-           match placeTy decls layouts { local_ := dstLocal, projection := .nil } with
-           | .some dTy => .some dTy.kind
-           | .none => .none) v = .valid)
+    (hValid : validateBlackBoxTyValueProto decls layouts s.memory
+      (resolveBlackBoxTyProto? target decls layouts argOps { local_ := dstLocal, projection := .nil }) v = .valid)
     (hWrite : writePlaceValue locals' .nil { local_ := dstLocal, projection := .nil } v
       decls layouts s.memory.callStack = .ok locals'') :
     evalBlackBoxProto s target decls layouts argOps [v] locals'
@@ -5845,7 +6325,5 @@ theorem evalBlackBoxProto_valid_direct_dest
   unfold writeIntrinsicReturnProto
   dsimp only
   rw [hNoProt, hNoBorrows, hWrite]
-  unfold invalidateDirectDestWriteBorrows
-  rw [hNoBorrows]
 
 end Anneal.TcbCoreMemPtrIntrinsicsPrototype
