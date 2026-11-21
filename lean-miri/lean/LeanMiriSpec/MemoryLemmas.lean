@@ -41,12 +41,12 @@ This module never names them. Instead:
   through the public `WellFounded.Nat.fix_eq`.
 
 No `sorry`, `native_decide`, `unsafe`, `implemented_by`, custom axioms, or name-resolution
-metaprogramming are used; Part 6 checks with `#assert_standard_axioms` and
-`#assert_module_standard_axioms` that all 50 theorems (with zero private-helper type leakage and
-matching `LeanMiriSpec.MemoryLemmas` re-exports) and every declaration in this module depend only
-on `propext`, `Classical.choice`, and `Quot.sound`. Part 5 instantiates representative theorems on
-concrete states (word-boundary `InitMask` writes, endian-dependent scalar reads, framed
-`writeBytes`) to check that their hypotheses are jointly satisfiable.
+metaprogramming are used; Part 5 instantiates all 50 theorems in closed/existential `private`
+non-vacuity witnesses on concrete states, and Part 6 checks with `#assert_standard_axioms` and
+`#assert_module_standard_axioms` that the module exposes those exact 50 public theorems (zero
+private-helper type leakage, matching `LeanMiriSpec.MemoryLemmas` re-exports, 50/50 non-vacuity
+witness coverage) and that every declaration in this module depends only on `propext`,
+`Classical.choice`, and `Quot.sound`.
 
 ## The 50 theorems
 
@@ -68,17 +68,32 @@ concrete states (word-boundary `InitMask` writes, endian-dependent scalar reads,
 
 set_option autoImplicit false
 
-/-- Fail unless every listed declaration:
-1. depends only on Lean's standard axioms (`propext`, `Quot.sound`, `Classical.choice`) —
-   in particular zero `sorryAx` and zero `Lean.ofReduceBool`;
-2. exposes a kernel type referencing zero `private` helper declarations; and
-3. is re-exported under `LeanMiriSpec.MemoryLemmas.<shortName>` pointing to the exact same
-   declaration.
+/-- Fail unless:
+1. every listed declaration depends only on Lean's standard axioms (`propext`, `Quot.sound`,
+   `Classical.choice`) — in particular zero `sorryAx` and zero `Lean.ofReduceBool`;
+2. every listed declaration's kernel type references zero `private` helper declarations;
+3. every listed declaration is re-exported under `LeanMiriSpec.MemoryLemmas.<shortName>` pointing
+   to the exact same declaration;
+4. every listed declaration appears in the kernel proof/type terms of the `private theorem`
+   non-vacuity witnesses in `LeanMiriSpec.MemoryLemmas.NonVacuity`; and
+5. no extra user-authored public declaration exists in `env.constants.map₂` outside the listed 50.
 File-local analogue of `LeanMiriSpec.Audit`'s command (that module imports all of `LeanMiriSpec`). -/
 local elab "#assert_standard_axioms " ids:ident* : command => do
   let env ← Lean.getEnv
+  let mut witnessUsed : Lean.NameSet := {}
+  for (c, ci) in env.constants.map₂.toList do
+    if (c.toString.splitOn "LeanMiriSpec.MemoryLemmas.NonVacuity.").length > 1 then
+      if let some v := ci.value? (allowOpaque := true) then
+        for u in v.getUsedConstants do
+          witnessUsed := witnessUsed.insert u
+      for u in ci.type.getUsedConstants do
+        witnessUsed := witnessUsed.insert u
+  let mut listed : Lean.NameSet := {}
   for id in ids do
     let n ← Lean.Elab.Command.liftCoreM <| Lean.Elab.realizeGlobalConstNoOverloadWithInfo id
+    if listed.contains n then
+      throwError "duplicate entry {n} in #assert_standard_axioms"
+    listed := listed.insert n
     let axs ← Lean.Elab.Command.liftCoreM <| Lean.collectAxioms n
     for a in axs do
       unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
@@ -92,7 +107,22 @@ local elab "#assert_standard_axioms " ids:ident* : command => do
       let aliasTarget ← Lean.Elab.Command.liftCoreM <| Lean.realizeGlobalConstNoOverload aliasId
       unless aliasTarget == n do
         throwError "re-export LeanMiriSpec.MemoryLemmas.{shortName} resolves to {aliasTarget}, expected {n}"
+    unless witnessUsed.contains n do
+      throwError "{n} is not exercised by any Part 5 NonVacuity witness"
     Lean.logInfo m!"{n} depends on axioms: {axs.toList}"
+  unless listed.size == 50 do
+    throwError "expected exactly 50 audited public theorems, got {listed.size}"
+  for (c, _) in env.constants.map₂.toList do
+    if !Lean.isPrivateName c then
+      let s := c.toString
+      let isAux :=
+        (s.splitOn "._proof_").length > 1 ||
+        (s.splitOn "._simp_").length > 1 ||
+        (s.splitOn ".match_").length > 1 ||
+        (s.splitOn "_aux_").length > 1 ||
+        s.endsWith ".eq_1"
+      if !isAux && !listed.contains c then
+        throwError "unexpected extra public declaration {c} in LeanMiriSpec.MemoryLemmas"
 
 /-- Sweep every declaration elaborated in this module (`env.constants.map₂`, both public and
 private) and fail if any depends on a non-standard axiom. -/
@@ -3898,78 +3928,259 @@ export Miri.Memory.Allocation (byteSize_withExtra len_withExtra align_withExtra
 
 end LeanMiriSpec.MemoryLemmas
 
-/-! ## Part 5. Non-vacuity witnesses
+/-! ## Part 5. Non-vacuity witnesses (50 / 50 theorem coverage)
 
-Compile-time checks that the hypotheses of representative theorems are jointly satisfiable on
-concrete states, by instantiating the theorems themselves (anonymous `example`s, so no public
-API is added). They exercise the edge cases the specifications are meant to cover: a write that
-crosses a 64-bit `InitMask` word boundary and forces the `.Lazy` → `.Materialized` transition,
-little- and big-endian scalar decoding, a fresh allocation from `fromBytes`, a framed
-`writeBytes` followed by read-back, zero-length writes, and a one-copy `copy`. -/
+Compile-time checks that the hypotheses of all 50 specification theorems are jointly satisfiable
+on concrete states, by instantiating every theorem in closed or existentially-constructed
+`private theorem`s (unlike `example`, `private theorem` declarations remain in `env.constants.map₂`
+so `#assert_module_standard_axioms` audits their axiom footprint while adding zero public API).
+They cover multi-block `.Lazy` → `.Materialized` `InitMask` transitions (`64` and `128` byte
+boundaries), `ProvenanceMap` operations, `fromBytes` / `tryNew` (`.Uninit` and `.Zero`), framed
+`writeBytes`, `writeUninit`, zero-length writes, `getBytesUnchecked` size/subrange/split,
+`getBytesStripProvenance`, little- and big-endian integer and pointer `writeScalar` / `readScalar`
+roundtrips, `withExtra` / `mapExtra` commutations, and cross-allocation plus same-allocation
+`copy` and `copyRepeatedly`. -/
 
 namespace LeanMiriSpec.MemoryLemmas.NonVacuity
 open Miri.ABI Miri.Memory
 
-/-- `set_range_get` across the 64-bit word boundary at byte 64, starting from a `.Lazy` mask. -/
-example : ∃ updated : InitMask,
-    (InitMask.new (Size.ofBytes 200) false).setRange
-      (allocRange (Size.ofBytes 60) (Size.ofBytes 80)) true = .ok updated ∧
-    updated.get (Size.ofBytes 59) = .ok false ∧ updated.get (Size.ofBytes 60) = .ok true ∧
-    updated.get (Size.ofBytes 63) = .ok true ∧ updated.get (Size.ofBytes 64) = .ok true ∧
-    updated.get (Size.ofBytes 139) = .ok true ∧ updated.get (Size.ofBytes 140) = .ok false := by
+/-- 1. All 7 `InitMask.WriteProof` theorems across two 64-bit word boundaries (`64` and `128`),
+starting from a `.Lazy false` mask. -/
+private theorem wit_initMask_full_chain :
+    ∃ (u uCopy : InitMask) (b0 : Bool) (bad : AllocRange),
+      (InitMask.new (Size.ofBytes 200) false).get Size.ZERO = .ok b0 ∧
+      (InitMask.new (Size.ofBytes 200) false).setRange
+        (allocRange (Size.ofBytes 60) (Size.ofBytes 80)) true = .ok u ∧
+      u.get (Size.ofBytes 59) = .ok false ∧ u.get (Size.ofBytes 60) = .ok true ∧
+      u.get (Size.ofBytes 63) = .ok true ∧ u.get (Size.ofBytes 64) = .ok true ∧
+      u.get (Size.ofBytes 127) = .ok true ∧ u.get (Size.ofBytes 128) = .ok true ∧
+      u.get (Size.ofBytes 139) = .ok true ∧ u.get (Size.ofBytes 140) = .ok false ∧
+      u.isRangeInitialized (allocRange (Size.ofBytes 60) (Size.ofBytes 80)) = .ok (.ok ()) ∧
+      (u.isRangeInitialized (allocRange Size.ZERO (Size.ofBytes 60)) = .ok (.ok ()) ↔
+        (InitMask.new (Size.ofBytes 200) false).isRangeInitialized
+          (allocRange Size.ZERO (Size.ofBytes 60)) = .ok (.ok ())) ∧
+      u.isRangeInitialized (allocRange Size.ZERO (Size.ofBytes 60)) = .ok (.error bad) ∧
+      u.prepareCopy (allocRange (Size.ofBytes 60) (Size.ofBytes 80)) = .ok ⟨true, #[80]⟩ ∧
+      u.applyCopy ⟨true, #[80]⟩ (allocRange Size.ZERO (Size.ofBytes 80)) 2 = .ok uCopy := by
+  let m0 := InitMask.new (Size.ofBytes 200) false
+  have hwf0 : InitMask.WriteProof.WellFormed m0 := trivial
+  obtain ⟨b0, hb0⟩ := InitMask.WriteProof.get_ok_of_wellFormed m0 Size.ZERO hwf0 (by decide)
   have hend : (allocRange (Size.ofBytes 60) (Size.ofBytes 80)).endExclusive =
       .ok (Size.ofBytes 140) := by decide
-  obtain ⟨u, hu, -, -⟩ := InitMask.WriteProof.set_range_exists (InitMask.new (Size.ofBytes 200) false)
-    (allocRange (Size.ofBytes 60) (Size.ofBytes 80)) (Size.ofBytes 140) true trivial hend
+  obtain ⟨u, hu, hlen, hwfu⟩ := InitMask.WriteProof.set_range_exists m0
+    (allocRange (Size.ofBytes 60) (Size.ofBytes 80)) (Size.ofBytes 140) true hwf0 hend
     (by decide) (by decide)
   have hget : ∀ idx : Size, idx.bytes.toNat < 200 → u.get idx =
       if 60 ≤ idx.bytes.toNat ∧ idx.bytes.toNat < 140 then .ok true else .ok false :=
-    fun idx hidx => InitMask.WriteProof.set_range_get (InitMask.new (Size.ofBytes 200) false) u
-      (allocRange (Size.ofBytes 60) (Size.ofBytes 80)) (Size.ofBytes 140) idx true trivial hend
+    fun idx hidx => InitMask.WriteProof.set_range_get m0 u
+      (allocRange (Size.ofBytes 60) (Size.ofBytes 80)) (Size.ofBytes 140) idx true hwf0 hend
       (by decide) (by decide) hidx hu
-  refine ⟨u, hu, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> rw [hget _ (by decide)] <;> decide
+  have his := InitMask.WriteProof.isRangeInitialized_after_setRange_true m0 u
+    (allocRange (Size.ofBytes 60) (Size.ofBytes 80)) (Size.ofBytes 140) hwf0 hend
+    (by decide) (by decide) hu
+  have hfr := InitMask.WriteProof.isRangeInitialized_frame m0 u
+    (allocRange (Size.ofBytes 60) (Size.ofBytes 80)) (allocRange Size.ZERO (Size.ofBytes 60))
+    (Size.ofBytes 140) (Size.ofBytes 60) true hwf0 hend (by decide)
+    (by decide) (by decide) (by decide) (by decide) (Or.inr (by decide)) hu
+  have hiff_true := (InitMask.WriteProof.isRangeInitialized_nonempty_iff u
+    (allocRange (Size.ofBytes 60) (Size.ofBytes 80)) (Size.ofBytes 140) hwfu hend
+    (by decide) (by rw [hlen]; decide)).1.mp his
+  have h59 : u.get (Size.ofBytes 59) = .ok false := by rw [hget _ (by decide)]; decide
+  obtain ⟨bad, hbad⟩ := (InitMask.WriteProof.isRangeInitialized_nonempty_iff u
+    (allocRange Size.ZERO (Size.ofBytes 60)) (Size.ofBytes 60) hwfu (by decide)
+    (by decide) (by rw [hlen]; decide)).2 ⟨Size.ofBytes 59, by decide, by decide, h59⟩
+  have hpc := InitMask.WriteProof.prepareCopy_of_uniform u
+    (allocRange (Size.ofBytes 60) (Size.ofBytes 80)) (Size.ofBytes 140) true hwfu hend
+    (by decide) (by rw [hlen]; decide) hiff_true
+  have hap := InitMask.WriteProof.applyCopy_singleton u Size.ZERO (Size.ofBytes 80)
+    (Size.ofBytes 160) 2 true (by decide) (by decide)
+  obtain ⟨uCopy, huCopy, -, -⟩ := InitMask.WriteProof.set_range_exists u
+    (allocRange Size.ZERO (Size.ofBytes 160)) (Size.ofBytes 160) true hwfu (by decide)
+    (by decide) (by rw [hlen]; decide)
+  refine ⟨u, uCopy, b0, bad, hb0, hu, h59, ?_, ?_, ?_, ?_, ?_, ?_, ?_, his, hfr, hbad, hpc,
+    hap.trans huCopy⟩ <;> rw [hget _ (by decide)] <;> decide
 
-/-- `fromBytes_exists` / `fromBytes_spec` / `writeBytes_spec` chain: a framed two-byte write
-into a fresh eight-byte allocation reads back, is initialized, and leaves other bytes alone. -/
-example : ∃ alloc updated : Allocation Unit Unit,
-    Allocation.fromBytes (Array.replicate 8 (0 : UInt8)) Align.ONE .Mut = .ok alloc ∧
-    Allocation.writeBytes (Size.ofBytes 2) #[7, 9] (Size.ofBytes 8) alloc = .ok () updated ∧
-    updated.getBytesUnchecked (allocRange (Size.ofBytes 2) (Size.ofBytes 2)) = .ok #[7, 9] ∧
-    updated.initializationMask.isRangeInitialized
-      (allocRange (Size.ofBytes 2) (Size.ofBytes 2)) = .ok (.ok ()) ∧
-    updated.getBytesUnchecked (allocRange (Size.ofBytes 4) (Size.ofBytes 4)) = .ok #[0, 0, 0, 0] := by
-  obtain ⟨alloc, hcreated, -, -⟩ := Allocation.fromBytes_exists (P := Unit)
+/-- 2. `fromBytes_exists` / `fromBytes_spec`, `writeBytes_spec`, `writeBytes_zero_spec`,
+`getBytesUnchecked_{size,subrange,split}`, and all 18 `withExtra`/`mapExtra` lemmas. -/
+private theorem wit_fromBytes_writeBytes_slices_and_mapExtra :
+    ∃ (alloc updated : Allocation CtfeProvenance Unit) (slice26 : Array UInt8),
+      Allocation.fromBytes (Array.replicate 8 (0 : UInt8)) Align.ONE .Mut = .ok alloc ∧
+      Allocation.writeBytes (Size.ofBytes 8) #[] (Size.ofBytes 8) alloc = .ok () alloc ∧
+      Allocation.writeBytes (Size.ofBytes 2) #[7, 9] (Size.ofBytes 8) alloc = .ok () updated ∧
+      updated.getBytesUnchecked (allocRange (Size.ofBytes 2) (Size.ofBytes 2)) = .ok #[7, 9] ∧
+      updated.initializationMask.isRangeInitialized
+        (allocRange (Size.ofBytes 2) (Size.ofBytes 2)) = .ok (.ok ()) ∧
+      updated.getBytesUnchecked (allocRange (Size.ofBytes 4) (Size.ofBytes 4)) = .ok #[0, 0, 0, 0] ∧
+      updated.getBytesUnchecked (allocRange (Size.ofBytes 2) (Size.ofBytes 4)) = .ok slice26 ∧
+      slice26.size = 4 ∧
+      updated.getBytesUnchecked (allocRange (Size.ofBytes 3) (Size.ofBytes 2)) =
+        .ok (slice26.extract 1 3) ∧
+      updated.getBytesUnchecked (allocRange (Size.ofBytes 2) (Size.ofBytes 6)) =
+        .ok (#[7, 9] ++ #[0, 0, 0, 0]) ∧
+      ((updated.withExtra (42 : Nat)).mapExtra (· + 1)).byteSize = updated.byteSize ∧
+      ((updated.withExtra (42 : Nat)).mapExtra (· + 1)).len = updated.len ∧
+      ((updated.withExtra (42 : Nat)).mapExtra (· + 1)).align = updated.align ∧
+      ((updated.withExtra (42 : Nat)).mapExtra (· + 1)).mutability = updated.mutability ∧
+      ((updated.withExtra (42 : Nat)).mapExtra (· + 1)).provenanceMap = updated.provenanceMap ∧
+      ((updated.withExtra (42 : Nat)).mapExtra (· + 1)).initializationMask =
+        updated.initializationMask ∧
+      ((updated.withExtra (42 : Nat)).mapExtra (· + 1)).getBytesUnchecked
+        (allocRange (Size.ofBytes 2) (Size.ofBytes 2)) =
+        updated.getBytesUnchecked (allocRange (Size.ofBytes 2) (Size.ofBytes 2)) ∧
+      (updated.mapExtra id).getBytesStripProvenance ⟨.little, .w64⟩
+        (allocRange (Size.ofBytes 2) (Size.ofBytes 2)) =
+        updated.getBytesStripProvenance ⟨.little, .w64⟩
+          (allocRange (Size.ofBytes 2) (Size.ofBytes 2)) ∧
+      (updated.mapExtra id).readScalar ⟨.little, .w64⟩
+        (allocRange (Size.ofBytes 2) (Size.ofBytes 2)) false =
+        updated.readScalar ⟨.little, .w64⟩
+          (allocRange (Size.ofBytes 2) (Size.ofBytes 2)) false ∧
+      Allocation.writeBytes (Size.ofBytes 2) #[7, 9] (Size.ofBytes 8) (alloc.mapExtra id) =
+        .ok () (updated.mapExtra id) ∧
+      Allocation.clearProvenance (allocRange Size.ZERO (Size.ofBytes 2)) (Size.ofBytes 8)
+        (updated.mapExtra id) =
+        (match Allocation.clearProvenance (allocRange Size.ZERO (Size.ofBytes 2))
+            (Size.ofBytes 8) updated with
+         | .ok v s => .ok v (s.mapExtra id)
+         | .error e s => .error e (s.mapExtra id)) := by
+  obtain ⟨alloc, hcreated, -, -⟩ := Allocation.fromBytes_exists (P := CtfeProvenance)
     (Array.replicate 8 0) Align.ONE 1 .Mut rfl rfl (by decide)
   obtain ⟨hbs, hlen, hmut, -, -, hprov, hmask, hwf, hslice⟩ :=
     Allocation.fromBytes_spec _ _ _ alloc hcreated
-  obtain ⟨updated, hw, -, -, -, -, -, -, -, -, -, hinit, -, hget, hframe⟩ :=
+  have hzero := Allocation.writeBytes_zero_spec (Size.ofBytes 8) (Size.ofBytes 8) #[] alloc
+    rfl (hlen.trans hbs.symm) (by rw [hbs]; decide)
+  obtain ⟨updated, hw, hbsU, hlenU, -, -, -, -, -, -, -, hinit, -, hget22, hframe⟩ :=
     Allocation.writeBytes_spec (Size.ofBytes 2) (Size.ofBytes 8) #[7, 9] alloc ProvenanceMap.new
       (by decide) (hlen.trans hbs.symm) hmut (by rw [hmask]; rfl) hwf (by rw [hbs]; decide)
-      (fun full _ => by
+      (fun _ _ => by
         rw [hprov]
         exact ProvenanceMap.clear_new _ _ _ (Size.ofBytes 4) (by decide) (by decide))
-  refine ⟨alloc, updated, hcreated, hw, hget, hinit, ?_⟩
-  rw [hframe _ (Size.ofBytes 8) (by decide) (by decide) (by rw [hbs]; decide) (by decide),
-    hslice _ (Size.ofBytes 8) (by decide) (by decide) (by decide)]
-  decide
+  have hget44 : updated.getBytesUnchecked (allocRange (Size.ofBytes 4) (Size.ofBytes 4)) =
+      .ok #[0, 0, 0, 0] := by
+    rw [hframe _ (Size.ofBytes 8) (by decide) (by decide) (by rw [hbs]; decide) (by decide),
+      hslice _ (Size.ofBytes 8) (by decide) (by decide) (by decide)]
+    decide
+  have hstorU : updated.len = updated.byteSize.bytes.toNat :=
+    hlenU.trans (hlen.trans (hbs.symm.trans (congrArg (·.bytes.toNat) hbsU.symm)))
+  obtain ⟨slice26, hget24, hsz24⟩ := Allocation.getBytesUnchecked_size updated
+    (allocRange (Size.ofBytes 2) (Size.ofBytes 4)) (Size.ofBytes 6) hstorU
+    (by decide) (by decide) (by rw [hbsU, hbs]; decide)
+  have hsub := Allocation.getBytesUnchecked_subrange updated
+    (allocRange (Size.ofBytes 2) (Size.ofBytes 4)) (allocRange (Size.ofBytes 3) (Size.ofBytes 2))
+    (Size.ofBytes 6) (Size.ofBytes 5) slice26 (by decide) (by decide)
+    (by decide) (by decide) (by decide) hget24
+  have hsplit := Allocation.getBytesUnchecked_split updated
+    (allocRange (Size.ofBytes 2) (Size.ofBytes 2)) (allocRange (Size.ofBytes 4) (Size.ofBytes 4))
+    (allocRange (Size.ofBytes 2) (Size.ofBytes 6)) (Size.ofBytes 4) (Size.ofBytes 8)
+    #[7, 9] #[0, 0, 0, 0] (by decide) rfl (by decide) rfl (by decide)
+    (by decide) (by decide) hget22 hget44
+  have hw_map := Allocation.writeBytes_mapExtra (Size.ofBytes 2) #[7, 9] (Size.ofBytes 8) alloc id
+  rw [hw] at hw_map
+  refine ⟨alloc, updated, slice26, hcreated, hzero, hw, hget22, hinit, hget44, hget24,
+    hsz24, hsub, hsplit,
+    (Allocation.byteSize_mapExtra _ _).trans (Allocation.byteSize_withExtra _ _),
+    (Allocation.len_mapExtra _ _).trans (Allocation.len_withExtra _ _),
+    (Allocation.align_mapExtra _ _).trans (Allocation.align_withExtra _ _),
+    (Allocation.mutability_mapExtra _ _).trans (Allocation.mutability_withExtra _ _),
+    (Allocation.provenanceMap_mapExtra _ _).trans (Allocation.provenanceMap_withExtra _ _),
+    (Allocation.initializationMask_mapExtra _ _).trans (Allocation.initializationMask_withExtra _ _),
+    (Allocation.getBytesUnchecked_mapExtra _ _ _).trans
+      (Allocation.getBytesUnchecked_withExtra _ _ _),
+    Allocation.getBytesStripProvenance_mapExtra _ _ _ _,
+    Allocation.readScalar_mapExtra _ _ _ _ _,
+    hw_map, ?_⟩
+  rw [Allocation.clearProvenance_mapExtra]
+  cases Allocation.clearProvenance (allocRange Size.ZERO (Size.ofBytes 2))
+    (Size.ofBytes 8) updated <;> rfl
 
-/-- `writeBytes_zero_spec`: an empty write at the end of the allocation is the identity. -/
-example (alloc : Allocation Unit Unit)
-    (hcreated : Allocation.fromBytes (Array.replicate 8 (0 : UInt8)) Align.ONE .Mut = .ok alloc) :
-    Allocation.writeBytes (Size.ofBytes 8) #[] (Size.ofBytes 8) alloc = .ok () alloc := by
-  obtain ⟨hbs, hlen, -⟩ := Allocation.fromBytes_spec _ _ _ alloc hcreated
-  exact Allocation.writeBytes_zero_spec _ _ _ alloc rfl (hlen.trans hbs.symm) (by rw [hbs]; decide)
+/-- 3. `tryNew_exists` / `tryNew_spec` (both `.Uninit` and `.Zero`),
+`getBytesStripProvenance_{uninit_err,ok}`, `readScalar_uninit_err`, and
+`writeUninit_{zero_,}spec`. -/
+private theorem wit_tryNew_strip_and_writeUninit :
+    ∃ (aUninit aZero aDeinit : Allocation CtfeProvenance Unit) (bad : AllocRange),
+      Allocation.tryNew (Size.ofBytes 8) Align.EIGHT .Uninit
+        (fun n _ => some (Array.replicate n.bytes.toNat 0)) = .ok aUninit ∧
+      aUninit.getBytesStripProvenance ⟨.little, .w64⟩ (allocRange Size.ZERO (Size.ofBytes 4)) =
+        .error (.invalidUninitBytes (some ⟨allocRange Size.ZERO (Size.ofBytes 4), bad⟩)) ∧
+      aUninit.readScalar ⟨.little, .w64⟩ (allocRange Size.ZERO (Size.ofBytes 4)) false =
+        .error (.invalidUninitBytes (some ⟨allocRange Size.ZERO (Size.ofBytes 4), bad⟩)) ∧
+      Allocation.tryNew (Size.ofBytes 8) Align.EIGHT .Zero
+        (fun n _ => some (Array.replicate n.bytes.toNat 0)) = .ok aZero ∧
+      aZero.getBytesStripProvenance ⟨.little, .w64⟩ (allocRange Size.ZERO (Size.ofBytes 4)) =
+        .ok #[0, 0, 0, 0] ∧
+      Allocation.writeUninit (allocRange (Size.ofBytes 8) Size.ZERO) (Size.ofBytes 8) aZero =
+        .ok () aZero ∧
+      Allocation.writeUninit (allocRange Size.ZERO (Size.ofBytes 2)) (Size.ofBytes 8) aZero =
+        .ok () aDeinit ∧
+      aDeinit.initializationMask.get Size.ZERO = .ok false ∧
+      aDeinit.initializationMask.get (Size.ofBytes 2) = .ok true ∧
+      aDeinit.getBytesUnchecked (allocRange Size.ZERO (Size.ofBytes 4)) = .ok #[0, 0, 0, 0] := by
+  obtain ⟨aUninit, huNew, _⟩ := Allocation.tryNew_exists (P := CtfeProvenance)
+    (Size.ofBytes 8) Align.EIGHT 8 .Uninit (by decide) (by decide)
+  obtain ⟨hbsU, _, _, _, _, _, hmaskU, _, hwfU, _⟩ :=
+    Allocation.tryNew_spec (Size.ofBytes 8) Align.EIGHT .Uninit aUninit huNew
+  have hmU := hmaskU rfl
+  have hget0_false : aUninit.initializationMask.get Size.ZERO = .ok false := by rw [hmU]; rfl
+  obtain ⟨bad, hbad⟩ := (InitMask.WriteProof.isRangeInitialized_nonempty_iff
+    aUninit.initializationMask (allocRange Size.ZERO (Size.ofBytes 4)) (Size.ofBytes 4)
+    hwfU (by decide) (by decide) (by rw [hmU]; decide)).2
+    ⟨Size.ZERO, by decide, by decide, hget0_false⟩
+  have hstripErr := Allocation.getBytesStripProvenance_uninit_err aUninit ⟨.little, .w64⟩ _ bad hbad
+  have hreadErr := Allocation.readScalar_uninit_err aUninit ⟨.little, .w64⟩ _ bad false hbad
+  obtain ⟨aZero, hzNew, _⟩ := Allocation.tryNew_exists (P := CtfeProvenance)
+    (Size.ofBytes 8) Align.EIGHT 8 .Zero (by decide) (by decide)
+  obtain ⟨hbsZ, hlenZ, hmutZ, _, _, hprovZ, _, hmaskZ, hwfZ, hsliceZ⟩ :=
+    Allocation.tryNew_spec (Size.ofBytes 8) Align.EIGHT .Zero aZero hzNew
+  have hmZ := hmaskZ rfl
+  have hend4 : (allocRange Size.ZERO (Size.ofBytes 4)).endExclusive = .ok (Size.ofBytes 4) := by
+    decide
+  have hps : (Size.fromBits PointerWidth.w64.bits).bytes ≠ 0 := by decide
+  have hinitZ : aZero.initializationMask.isRangeInitialized
+      (allocRange Size.ZERO (Size.ofBytes 4)) = .ok (.ok ()) := by
+    rw [hmZ]
+    exact InitMask.lazy_initialized_query _ _ _ hend4 (by decide)
+  have hstripOk : aZero.getBytesStripProvenance ⟨.little, .w64⟩
+      (allocRange Size.ZERO (Size.ofBytes 4)) = .ok #[0, 0, 0, 0] := by
+    rw [Allocation.getBytesStripProvenance_ok aZero _ _ hinitZ
+      (Or.inr (by rw [hprovZ]; exact ProvenanceMap.rangeEmpty_new _ _ _ hps hend4))]
+    exact hsliceZ _ _ hend4 (by decide) (by decide)
+  have hstorZ : aZero.len = aZero.byteSize.bytes.toNat := by rw [hlenZ, hbsZ]
+  have hwuZero := Allocation.writeUninit_zero_spec (allocRange (Size.ofBytes 8) Size.ZERO)
+    (Size.ofBytes 8) (Size.ofBytes 8) aZero rfl hstorZ (by decide) (by decide)
+    (by rw [hbsZ]; decide)
+  obtain ⟨aDeinit, hwu, _, _, _, _, _, _, _, _, hsetF, _, hbytesEq⟩ :=
+    Allocation.writeUninit_spec (allocRange Size.ZERO (Size.ofBytes 2)) (Size.ofBytes 8)
+      aZero ProvenanceMap.new (by decide) hstorZ hmutZ (by rw [hmZ, hbsZ]; rfl) hwfZ
+      (by rw [hbsZ]; decide)
+      (fun _ _ => by
+        rw [hprovZ]
+        exact ProvenanceMap.clear_new _ _ _ (Size.ofBytes 2) (by decide) (by decide))
+  have hg0 := InitMask.WriteProof.set_range_get aZero.initializationMask
+    aDeinit.initializationMask (allocRange Size.ZERO (Size.ofBytes 2)) (Size.ofBytes 2)
+    Size.ZERO false hwfZ (by decide) (by decide) (by rw [hmZ]; decide) (by rw [hmZ]; decide) hsetF
+  have hg2 := InitMask.WriteProof.set_range_get aZero.initializationMask
+    aDeinit.initializationMask (allocRange Size.ZERO (Size.ofBytes 2)) (Size.ofBytes 2)
+    (Size.ofBytes 2) false hwfZ (by decide) (by decide) (by rw [hmZ]; decide)
+    (by rw [hmZ]; decide) hsetF
+  have hmZ0 : aZero.initializationMask.get Size.ZERO = .ok true := by rw [hmZ]; rfl
+  have hmZ2 : aZero.initializationMask.get (Size.ofBytes 2) = .ok true := by rw [hmZ]; rfl
+  refine ⟨aUninit, aZero, aDeinit, bad, huNew, hstripErr, hreadErr, hzNew, hstripOk, hwuZero,
+    hwu, ?_, ?_, (hbytesEq _).trans (hsliceZ _ _ hend4 (by decide) (by decide))⟩
+  · rw [hg0, hmZ0]; decide
+  · rw [hg2, hmZ2]; decide
 
-/-- `readScalar_int_of_bytes` decodes the bytes `[1, 2]` of a fresh allocation as `0x0201` on
-little-endian targets and as `0x0102` on big-endian targets. -/
-example (endian : Endian) : ∃ alloc : Allocation CtfeProvenance Unit,
-    Allocation.fromBytes #[1, 2] Align.ONE .Not = .ok alloc ∧
-    alloc.readScalar ⟨endian, .w64⟩ (allocRange Size.ZERO (Size.ofBytes 2)) false =
-      (Scalar.fromUInt (BitVec.ofNat 128 (if endian == .little then 0x0201 else 0x0102))
-        (Size.ofBytes 2)).mapError AllocError.scalar := by
+/-- 4. `readScalar_int_of_bytes` decodes `#[1, 2]` as `0x0201` on little-endian targets and
+`0x0102` on big-endian targets. -/
+private theorem wit_readScalar_int_of_bytes (endian : Endian) :
+    ∃ alloc : Allocation CtfeProvenance Unit,
+      Allocation.fromBytes #[1, 2] Align.ONE .Not = .ok alloc ∧
+      alloc.readScalar ⟨endian, .w64⟩ (allocRange Size.ZERO (Size.ofBytes 2)) false =
+        (Scalar.fromUInt (BitVec.ofNat 128 (if endian == .little then 0x0201 else 0x0102))
+          (Size.ofBytes 2)).mapError AllocError.scalar := by
   obtain ⟨alloc, hcreated, -, -⟩ := Allocation.fromBytes_exists (P := CtfeProvenance)
     #[1, 2] Align.ONE 1 .Not rfl rfl (by decide)
-  obtain ⟨hbs, -, -, -, -, hprov, hmask, -, hslice⟩ := Allocation.fromBytes_spec _ _ _ alloc hcreated
+  obtain ⟨hbs, -, -, -, -, hprov, hmask, -, hslice⟩ :=
+    Allocation.fromBytes_spec _ _ _ alloc hcreated
   have hend : (allocRange Size.ZERO (Size.ofBytes 2)).endExclusive = .ok (Size.ofBytes 2) := by
     decide
   have hps : (Size.fromBits PointerWidth.w64.bits).bytes ≠ 0 := by decide
@@ -3982,6 +4193,210 @@ example (endian : Endian) : ∃ alloc : Allocation CtfeProvenance Unit,
     (hslice _ _ hend (by decide) (by decide)) (by decide)
     (Or.inr (by rw [hprov]; exact ProvenanceMap.rangeEmpty_new _ _ _ hps hend))]
   cases endian <;> rfl
+
+/-- 5. `writeScalar_spec` (both `.bits` and `.pointer` branches) chained into
+`readScalar_int_roundtrip`, `readScalar_ptr_none_roundtrip`, and `readScalar_ptr_roundtrip`
+across both little- and big-endian target layouts. -/
+private theorem wit_writeScalar_and_readScalar_roundtrips (endian : Endian) :
+    ∃ (a0 aBits : Allocation CtfeProvenance Unit) (p0 pPtr : Allocation Provenance Unit),
+      let layout : TargetDataLayout := ⟨endian, .w64⟩
+      let intVal : Scalar CtfeProvenance := Scalar.fromScalarInt (ScalarInt.ofUInt64 0x0102030405060708)
+      let ptr : Pointer Provenance := ⟨Size.ofBytes 0x1020, .wildcard⟩
+      let ptrVal : Scalar Provenance := Scalar.fromPointer layout ptr
+      Allocation.tryNew (Size.ofBytes 8) Align.EIGHT .Uninit
+        (fun n _ => some (Array.replicate n.bytes.toNat 0)) = .ok a0 ∧
+      Allocation.writeScalar layout (allocRange Size.ZERO (Size.ofBytes 8)) intVal a0 =
+        .ok () aBits ∧
+      aBits.readScalar layout (allocRange Size.ZERO (Size.ofBytes 8)) false = .ok intVal ∧
+      aBits.readScalar layout (allocRange Size.ZERO (Size.ofBytes 8)) true = .ok intVal ∧
+      Allocation.tryNew (Size.ofBytes 16) Align.EIGHT .Uninit
+        (fun n _ => some (Array.replicate n.bytes.toNat 0)) = .ok p0 ∧
+      Allocation.writeScalar layout (allocRange Size.ZERO (Size.ofBytes 8)) ptrVal p0 =
+        .ok () pPtr ∧
+      pPtr.readScalar layout (allocRange Size.ZERO (Size.ofBytes 8)) true = .ok ptrVal ∧
+      pPtr.getBytesUnchecked (allocRange (Size.ofBytes 8) (Size.ofBytes 8)) =
+        .ok (Array.replicate 8 0) := by
+  let layout : TargetDataLayout := ⟨endian, .w64⟩
+  let bits : U128 := BitVec.ofNat 128 (0x0102030405060708 : UInt64).toNat
+  let intVal : Scalar CtfeProvenance := Scalar.fromScalarInt (ScalarInt.ofUInt64 0x0102030405060708)
+  let r08 := allocRange Size.ZERO (Size.ofBytes 8)
+  have hend08 : r08.endExclusive = .ok (Size.ofBytes 8) := by decide
+  have hps_eq : Size.fromBits layout.pointerWidth.bits = Size.ofBytes 8 := by
+    dsimp only [layout]; decide
+  have hps_nz : (Size.fromBits layout.pointerWidth.bits).bytes ≠ 0 := by
+    dsimp only [layout]; decide
+  obtain ⟨a0, ha0, _⟩ := Allocation.tryNew_exists (P := CtfeProvenance)
+    (Size.ofBytes 8) Align.EIGHT 8 .Uninit (by decide) (by decide)
+  obtain ⟨hbs0, hlen0, hmut0, _, _, hprov0, hmask0, _, hwf0, _⟩ :=
+    Allocation.tryNew_spec (Size.ofBytes 8) Align.EIGHT .Uninit a0 ha0
+  obtain ⟨aBits, hwBits, _, _, _, _, _, _, _, _, _, hisBits, hprovBits, hbytesBits, _, _⟩ :=
+    Allocation.writeScalar_spec layout a0 r08 intVal (.bits bits) ProvenanceMap.new ProvenanceMap.new
+      (by rw [hlen0, hbs0]) hmut0 (by rw [hmask0 rfl, hbs0]; rfl) hwf0
+      (by decide) (by decide) (by rw [hbs0]; decide) (by decide)
+      (fun _ _ => by
+        rw [hprov0, hps_eq]
+        exact ProvenanceMap.clear_new _ _ _ (Size.ofBytes 8) (by decide) hend08)
+      rfl
+  have hfromUInt : (Scalar.fromUInt (Prov := CtfeProvenance) bits r08.size).mapError
+      AllocError.scalar = .ok intVal := by decide
+  have hreadInt := Allocation.readScalar_int_roundtrip aBits layout r08 bits
+    hisBits (by decide) (by decide)
+    (Or.inr (by rw [hprovBits]; exact ProvenanceMap.rangeEmpty_new _ _ _ hps_nz hend08))
+    (hbytesBits bits rfl)
+  have hreadPtrNone := Allocation.readScalar_ptr_none_roundtrip aBits layout r08 bits
+    hisBits hps_eq.symm (by decide) (by decide)
+    (by rw [hprovBits, hps_eq]; exact ProvenanceMap.readPtr_new _ _ _ (by decide) hend08)
+    (hbytesBits bits rfl)
+  let ptr : Pointer Provenance := ⟨Size.ofBytes 0x1020, .wildcard⟩
+  let ptrVal : Scalar Provenance := Scalar.fromPointer layout ptr
+  obtain ⟨pm1, hpm1_ins, hpm1_ptrs⟩ :
+      ∃ pm1 : ProvenanceMap Provenance,
+        ProvenanceMap.insertPtr Size.ZERO Provenance.wildcard (Size.ofBytes 8) ProvenanceMap.new =
+          .ok () pm1 ∧
+        pm1.ptrs = #[(Size.ZERO, Provenance.wildcard)] :=
+    ⟨_, ProvenanceMap.insertPtr_new Size.ZERO (Size.ofBytes 8) (Size.ofBytes 8)
+      Provenance.wildcard (by decide) hend08, rfl⟩
+  have hconvPtr : ptrVal.toBitsOrPtrInternal r08.size = .ok (.pointer ptr) := by
+    cases endian <;> decide
+  obtain ⟨p0, hp0, _⟩ := Allocation.tryNew_exists (P := Provenance)
+    (Size.ofBytes 16) Align.EIGHT 8 .Uninit (by decide) (by decide)
+  obtain ⟨hbsP, hlenP, hmutP, _, _, hprovP, hmaskP, _, hwfP, hsliceP⟩ :=
+    Allocation.tryNew_spec (Size.ofBytes 16) Align.EIGHT .Uninit p0 hp0
+  obtain ⟨pPtr, hwPtr, _, _, _, _, _, _, _, _, _, hisPtr, hprovPtr, _, hbytesPtr, hframePtr⟩ :=
+    Allocation.writeScalar_spec layout p0 r08 ptrVal (.pointer ptr) ProvenanceMap.new pm1
+      (by rw [hlenP, hbsP]) hmutP (by rw [hmaskP rfl, hbsP]; rfl) hwfP
+      (by decide) (by decide) (by rw [hbsP]; decide) hconvPtr
+      (fun _ _ => by
+        rw [hprovP, hps_eq]
+        exact ProvenanceMap.clear_new _ _ _ (Size.ofBytes 8) (by decide) hend08)
+      ⟨hps_eq.symm, by rw [hps_eq]; exact hpm1_ins⟩
+  have hpSlice : pPtr.getBytesUnchecked r08 =
+      .ok (Array.ofFn (fun i : Fin r08.size.bytes.toNat =>
+        UInt8.ofNat ((ptr.offset.bytes.toNat / 2 ^ (8 *
+          (if layout.endian == .little then i.1 else r08.size.bytes.toNat - i.1 - 1))) % 256))) := by
+    have hbv : (BitVec.ofNat 128 ptr.offset.bytes.toNat).toNat = ptr.offset.bytes.toNat := by decide
+    simpa [hbv] using hbytesPtr ptr rfl
+  have hgetPtr : pm1.getPtr r08.start = some ptr.provenance := by
+    unfold ProvenanceMap.getPtr
+    rw [hpm1_ptrs]
+    decide
+  have hreadPtr := Allocation.readScalar_ptr_roundtrip pPtr layout r08 ptr
+    hisPtr hps_eq.symm (by decide) (by decide)
+    (by rw [hprovPtr, hps_eq]; exact ProvenanceMap.read_exact_pointer pm1 _ _ _ hgetPtr) hpSlice
+  have hfr8 := hframePtr (allocRange (Size.ofBytes 8) (Size.ofBytes 8)) (Size.ofBytes 16)
+    (by decide) (by decide) (by rw [hbsP]; decide) (Or.inl (by decide))
+  have hp8 := hsliceP (allocRange (Size.ofBytes 8) (Size.ofBytes 8)) (Size.ofBytes 16)
+    (by decide) (by decide) (by decide)
+  exact ⟨a0, aBits, p0, pPtr, ha0, hwBits, hreadInt.trans hfromUInt,
+    hreadPtrNone.trans hfromUInt, hp0, hwPtr, hreadPtr, hfr8.trans hp8⟩
+
+/-- 6. `copy_initialized_spec` (cross-allocation and non-overlapping same-allocation) and
+`copyRepeatedly_initialized_spec` (`repeatCount = 3`), together with `prepareCopy_new` and
+`applyCopy_empty`, verifying byte + mask `get` + `isRangeInitialized` framing. -/
+private theorem wit_copy_and_copyRepeatedly :
+    ∃ (src d0 d1 d2 d3 : Allocation CtfeProvenance Unit),
+      Allocation.fromBytes #[5, 6] Align.ONE .Not = .ok src ∧
+      Allocation.tryNew (Size.ofBytes 12) Align.ONE .Uninit
+        (fun n _ => some (Array.replicate n.bytes.toNat 0)) = .ok d0 ∧
+      Allocation.copy src (allocRange Size.ZERO (Size.ofBytes 2)) Size.ZERO
+        (Size.ofBytes 8) false true d0 = .ok () d1 ∧
+      Allocation.copy d1 (allocRange Size.ZERO (Size.ofBytes 2)) (Size.ofBytes 2)
+        (Size.ofBytes 8) true true d1 = .ok () d2 ∧
+      d2.getBytesUnchecked (allocRange (Size.ofBytes 2) (Size.ofBytes 2)) = .ok #[5, 6] ∧
+      d2.getBytesUnchecked (allocRange Size.ZERO (Size.ofBytes 2)) = .ok #[5, 6] ∧
+      d2.initializationMask.get (Size.ofBytes 10) = .ok false ∧
+      Allocation.copyRepeatedly d2 (allocRange Size.ZERO (Size.ofBytes 2)) (Size.ofBytes 4)
+        3 (Size.ofBytes 8) true true d2 = .ok () d3 ∧
+      d3.getBytesUnchecked (allocRange (Size.ofBytes 4) (Size.ofBytes 6)) =
+        .ok #[5, 6, 5, 6, 5, 6] ∧
+      d3.getBytesUnchecked (allocRange Size.ZERO (Size.ofBytes 4)) = .ok #[5, 6, 5, 6] ∧
+      d3.initializationMask.isRangeInitialized (allocRange (Size.ofBytes 4) (Size.ofBytes 6)) =
+        .ok (.ok ()) ∧
+      d3.initializationMask.isRangeInitialized (allocRange Size.ZERO (Size.ofBytes 2)) =
+        .ok (.ok ()) ∧
+      d3.initializationMask.get (Size.ofBytes 10) = .ok false := by
+  obtain ⟨src, hsrc, _, _⟩ := Allocation.fromBytes_exists (P := CtfeProvenance)
+    #[5, 6] Align.ONE 1 .Not rfl rfl (by decide)
+  obtain ⟨hbsS, hlenS, _, _, _, hprovS, hmaskS, hwfS, hsliceS⟩ :=
+    Allocation.fromBytes_spec _ _ _ src hsrc
+  have hend02 : (allocRange Size.ZERO (Size.ofBytes 2)).endExclusive = .ok (Size.ofBytes 2) := by
+    decide
+  have hinitS : src.initializationMask.isRangeInitialized
+      (allocRange Size.ZERO (Size.ofBytes 2)) = .ok (.ok ()) := by
+    rw [hmaskS]
+    exact InitMask.lazy_initialized_query _ _ _ hend02
+      (UInt64.le_iff_toNat_le.mpr (by rw [hbsS]; decide))
+  obtain ⟨d0, hd0, _⟩ := Allocation.tryNew_exists (P := CtfeProvenance)
+    (Size.ofBytes 12) Align.ONE 1 .Uninit (by decide) (by decide)
+  obtain ⟨hbs0, hlen0, hmut0, _, _, hprov0, hmask0, _, hwf0, _⟩ :=
+    Allocation.tryNew_spec (Size.ofBytes 12) Align.ONE .Uninit d0 hd0
+  have hm0 := hmask0 rfl
+  obtain ⟨d1, hc1, hbs1, hlen1, hmut1, _, _, _, hml1, hwf1, his1_02, hmget1, _, hprov1, hb1_02, _⟩ :=
+    Allocation.copy_initialized_spec src d0 (allocRange Size.ZERO (Size.ofBytes 2))
+      (Size.ofBytes 2) Size.ZERO (Size.ofBytes 8) false true #[5, 6]
+      ⟨#[], #[]⟩ ProvenanceMap.new ProvenanceMap.new
+      (hlenS.trans hbsS.symm) hend02 (by decide) (by rw [hmaskS]; rfl) hwfS hinitS
+      (hsliceS _ _ hend02 (by decide) (by decide)) (by rw [hbsS]; decide)
+      (fun _ _ => by rw [hprovS]; exact ProvenanceMap.prepareCopy_new _ _ _ _ (by decide) hend02)
+      (fun h => by cases h)
+      (by rw [hlen0, hbs0]) hmut0 (by rw [hm0, hbs0]; rfl) hwf0 (by rw [hbs0]; decide)
+      (fun _ _ => by rw [hprov0]; exact ProvenanceMap.clear_new _ _ _ _ (by decide) hend02)
+      (ProvenanceMap.applyCopy_empty _ 1 ProvenanceMap.new)
+  have hd1_stor : d1.len = d1.byteSize.bytes.toNat := by rw [hlen1, hbs1, hlen0, hbs0]
+  have hd1_ml : d1.initializationMask.len = d1.byteSize := by rw [hml1, hbs1, hm0, hbs0]; rfl
+  obtain ⟨d2, hc2, hbs2, hlen2, hmut2, _, _, _, hml2, hwf2, _, hmget2, hmfr2, hprov2, hb2_22, hbfr2⟩ :=
+    Allocation.copy_initialized_spec d1 d1 (allocRange Size.ZERO (Size.ofBytes 2))
+      (Size.ofBytes 2) (Size.ofBytes 2) (Size.ofBytes 8) true true #[5, 6]
+      ⟨#[], #[]⟩ ProvenanceMap.new ProvenanceMap.new
+      hd1_stor hend02 (by decide) hd1_ml hwf1 his1_02 hb1_02 (by rw [hbs1, hbs0]; decide)
+      (fun _ _ => by rw [hprov1]; exact ProvenanceMap.prepareCopy_new _ _ _ _ (by decide) hend02)
+      (fun _ _ => Or.inl (by decide))
+      hd1_stor (hmut1.trans hmut0) hd1_ml hwf1 (by rw [hbs1, hbs0]; decide)
+      (fun _ _ => by rw [hprov1]; exact ProvenanceMap.clear_new _ _ _ (Size.ofBytes 4) (by decide) (by decide))
+      (ProvenanceMap.applyCopy_empty _ 1 ProvenanceMap.new)
+  have hb2_02 : d2.getBytesUnchecked (allocRange Size.ZERO (Size.ofBytes 2)) = .ok #[5, 6] :=
+    (hbfr2 _ (Size.ofBytes 2) hend02 (by decide) (by rw [hbs1, hbs0]; decide)
+      (Or.inr (by decide))).trans hb1_02
+  have his2_02 : d2.initializationMask.isRangeInitialized
+      (allocRange Size.ZERO (Size.ofBytes 2)) = .ok (.ok ()) :=
+    (hmfr2 _ (Size.ofBytes 2) hend02 (by decide) (by rw [hbs1, hbs0]; decide)
+      (Or.inr (by decide))).mpr his1_02
+  have hd2_10 : d2.initializationMask.get (Size.ofBytes 10) = .ok false := by
+    have h2 := hmget2 (Size.ofBytes 10) (by rw [hbs1, hbs0]; decide)
+    have h1 := hmget1 (Size.ofBytes 10) (by rw [hbs0]; decide)
+    have hm0_10 : d0.initializationMask.get (Size.ofBytes 10) = .ok false := by rw [hm0]; rfl
+    rw [h2, h1, hm0_10]
+    decide
+  have hd2_stor : d2.len = d2.byteSize.bytes.toNat := by rw [hlen2, hbs2]; exact hd1_stor
+  have hd2_ml : d2.initializationMask.len = d2.byteSize := by rw [hml2, hbs2]; exact hd1_ml
+  obtain ⟨d3, hc3, _, _, _, _, _, _, _, _, his3_46, hmget3, hmfr3, _, hb3_46, hbfr3⟩ :=
+    Allocation.copyRepeatedly_initialized_spec d2 d2 (allocRange Size.ZERO (Size.ofBytes 2))
+      (Size.ofBytes 2) (Size.ofBytes 4) (Size.ofBytes 6) (Size.ofBytes 8) 3 true true #[5, 6]
+      ⟨#[], #[]⟩ ProvenanceMap.new ProvenanceMap.new
+      hd2_stor hend02 (by decide) hd2_ml hwf2 his2_02 hb2_02 (by rw [hbs2, hbs1, hbs0]; decide)
+      (fun _ _ => by rw [hprov2]; exact ProvenanceMap.prepareCopy_new _ _ _ _ (by decide) hend02)
+      (by decide) (by decide) (fun _ => rfl) (fun _ _ => Or.inl (by decide))
+      hd2_stor (hmut2.trans (hmut1.trans hmut0)) hd2_ml hwf2 (by rw [hbs2, hbs1, hbs0]; decide)
+      (fun _ _ => by rw [hprov2]; exact ProvenanceMap.clear_new _ _ _ (Size.ofBytes 10) (by decide) (by decide))
+      (ProvenanceMap.applyCopy_empty _ 3 ProvenanceMap.new)
+  have hb2_04 : d2.getBytesUnchecked (allocRange Size.ZERO (Size.ofBytes 4)) = .ok #[5, 6, 5, 6] :=
+    Allocation.getBytesUnchecked_split d2 (allocRange Size.ZERO (Size.ofBytes 2))
+      (allocRange (Size.ofBytes 2) (Size.ofBytes 2)) (allocRange Size.ZERO (Size.ofBytes 4))
+      (Size.ofBytes 2) (Size.ofBytes 4) #[5, 6] #[5, 6] hend02 rfl (by decide) rfl (by decide)
+      (by decide) (by decide) hb2_02 hb2_22
+  have hb3_04 : d3.getBytesUnchecked (allocRange Size.ZERO (Size.ofBytes 4)) = .ok #[5, 6, 5, 6] :=
+    (hbfr3 _ (Size.ofBytes 4) (by decide) (by decide) (by rw [hbs2, hbs1, hbs0]; decide)
+      (Or.inr (by decide))).trans hb2_04
+  have his3_02 : d3.initializationMask.isRangeInitialized
+      (allocRange Size.ZERO (Size.ofBytes 2)) = .ok (.ok ()) :=
+    (hmfr3 _ (Size.ofBytes 2) hend02 (by decide) (by rw [hbs2, hbs1, hbs0]; decide)
+      (Or.inr (by decide))).mpr his2_02
+  have hd3_10 : d3.initializationMask.get (Size.ofBytes 10) = .ok false := by
+    have h3 := hmget3 (Size.ofBytes 10) (by rw [hbs2, hbs1, hbs0]; decide)
+    rw [h3, hd2_10]
+    decide
+  exact ⟨src, d0, d1, d2, d3, hsrc, hd0, hc1, hc2, hb2_22, hb2_02, hd2_10,
+    hc3, by simpa using hb3_46, hb3_04, his3_46, his3_02, hd3_10⟩
 
 end LeanMiriSpec.MemoryLemmas.NonVacuity
 
