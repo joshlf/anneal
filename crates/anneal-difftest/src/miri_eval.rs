@@ -4615,27 +4615,11 @@ fn resolve_miri_lean_rss_budget_kib(stage_cap_mib: u64, jobs: usize) -> u64 {
 /// `rss_budget_kib` (for every budget above the 64 MiB absolute floor),
 /// withholding non-heap headroom for memory-mapped `.olean`/`.ilean` files,
 /// C++ thread stacks, and allocator arenas (`LEAN_NUM_THREADS=1`).
+///
+/// Delegates to [`cargo_anneal::miri_oracle::miri_lean_max_mb_for_budget_kib`]
+/// so `miri-difftest` and `cargo-anneal`'s plain Miri oracle share one formula.
 fn miri_lean_max_mb_for_rss_budget_kib(stage_cap_mb: u64, rss_budget_kib: u64) -> u64 {
-    const LARGE_BUDGET_KIB: u64 = 4 * 1024 * 1024;
-    const LARGE_RESERVE_KIB: u64 = 1024 * 1024;
-    const SMALL_RESERVE_MIN_KIB: u64 = 256 * 1024;
-    const MIN_HEAP_MB_SMALL: u64 = 256;
-    const MIN_HEAP_MB_TINY: u64 = 64;
-
-    let min_heap_kib = if rss_budget_kib >= 512 * 1024 {
-        MIN_HEAP_MB_SMALL * 1024
-    } else {
-        MIN_HEAP_MB_TINY * 1024
-    };
-    let max_reserve_kib = rss_budget_kib.saturating_sub(min_heap_kib);
-    let desired_reserve_kib = if rss_budget_kib >= LARGE_BUDGET_KIB {
-        LARGE_RESERVE_KIB
-    } else {
-        (rss_budget_kib / 4).max(SMALL_RESERVE_MIN_KIB)
-    };
-    let reserve_kib = desired_reserve_kib.min(max_reserve_kib);
-    let heap_mb = rss_budget_kib.saturating_sub(reserve_kib) / 1024;
-    heap_mb.clamp(MIN_HEAP_MB_TINY, stage_cap_mb.max(MIN_HEAP_MB_TINY))
+    cargo_anneal::miri_oracle::miri_lean_max_mb_for_budget_kib(stage_cap_mb, rss_budget_kib)
 }
 
 /// `(ppid, starttime)` from `/proc/<pid>/stat` contents (`pid (comm) state
@@ -12534,6 +12518,11 @@ pub fn cand_shadow() -> u32 {
             (CONFIRM_LEAN_MEMORY_MB_CAP, 200 * MIB_KIB),
         ] {
             let max_mb = miri_lean_max_mb_for_rss_budget_kib(stage_cap_mb, rss_kib);
+            assert_eq!(
+                max_mb,
+                cargo_anneal::miri_oracle::miri_lean_max_mb_for_budget_kib(stage_cap_mb, rss_kib),
+                "miri_eval and cargo_anneal::miri_oracle must share one -M headroom formula"
+            );
             assert!(
                 max_mb <= stage_cap_mb,
                 "max_mb={max_mb} exceeded stage_cap_mb={stage_cap_mb}"
@@ -12604,6 +12593,14 @@ pub fn cand_shadow() -> u32 {
             let mut rss_kib = 64 * MIB_KIB + 1;
             while rss_kib <= 20 * GIB_KIB {
                 let max_mb = miri_lean_max_mb_for_rss_budget_kib(stage_cap_mb, rss_kib);
+                assert_eq!(
+                    max_mb,
+                    cargo_anneal::miri_oracle::miri_lean_max_mb_for_budget_kib(
+                        stage_cap_mb,
+                        rss_kib
+                    ),
+                    "miri_eval and cargo_anneal::miri_oracle must share one -M headroom formula"
+                );
                 let ctx = format!("stage_cap_mb={stage_cap_mb} rss_kib={rss_kib} max_mb={max_mb}");
                 assert!((64..=stage_cap_mb).contains(&max_mb), "{ctx}");
                 assert!(max_mb * 1024 < rss_kib, "{ctx}");

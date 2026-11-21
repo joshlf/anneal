@@ -2119,36 +2119,50 @@ const MIRI_ORACLE_PROBE_LEAN_MEMORY_MB_CAP: u64 = 4096;
 /// `oracle/MiriOracleConfirm.lean`.
 const MIRI_ORACLE_CONFIRM_LEAN_MEMORY_MB_CAP: u64 = 3072;
 
+/// Absolute lower bound (in MiB) passed to `lean -M` for single-threaded Miri
+/// oracle / difftest invocations.
+const MIRI_LEAN_MIN_HEAP_MB_TINY: u64 = 64;
+
+/// Computes Lean's `-M` small-object heap limit (in MiB) strictly below
+/// `budget_kib` (for every budget above the 64 MiB absolute floor), withholding
+/// non-heap headroom for memory-mapped `.olean`/`.ilean` files, C++ thread
+/// stacks, and allocator arenas (`LEAN_NUM_THREADS=1`).
+///
+/// Shared by both `cargo-anneal`'s single-module Miri oracle (`miri_oracle.rs`)
+/// and `anneal-difftest`'s budgeted Miri difftest harness (`miri_eval.rs`).
+pub fn miri_lean_max_mb_for_budget_kib(stage_cap_mb: u64, budget_kib: u64) -> u64 {
+    const LARGE_BUDGET_KIB: u64 = 4 * 1024 * 1024;
+    const LARGE_RESERVE_KIB: u64 = 1024 * 1024;
+    const SMALL_RESERVE_MIN_KIB: u64 = 256 * 1024;
+    const MIN_HEAP_MB_SMALL: u64 = 256;
+
+    let cap = stage_cap_mb.max(MIRI_LEAN_MIN_HEAP_MB_TINY);
+    let min_heap_kib = if budget_kib >= 512 * 1024 {
+        MIN_HEAP_MB_SMALL * 1024
+    } else {
+        MIRI_LEAN_MIN_HEAP_MB_TINY * 1024
+    };
+    let max_reserve_kib = budget_kib.saturating_sub(min_heap_kib);
+    let desired_reserve_kib = if budget_kib >= LARGE_BUDGET_KIB {
+        LARGE_RESERVE_KIB
+    } else {
+        (budget_kib / 4).max(SMALL_RESERVE_MIN_KIB)
+    };
+    let reserve_kib = desired_reserve_kib.min(max_reserve_kib);
+    let heap_mb = budget_kib.saturating_sub(reserve_kib) / 1024;
+    heap_mb.clamp(MIRI_LEAN_MIN_HEAP_MB_TINY, cap)
+}
+
 /// Computes a headroom-safe `lean -M` limit (in MiB) for a single-threaded
 /// `oracle/MiriOracle{Probe,Confirm}.lean` invocation given optional available
 /// memory (`avail_kib` from cgroup / host headroom), withholding non-heap
 /// headroom for `.olean` mmaps and thread arenas so Lean's allocator engages
 /// before a tight capsule cgroup (e.g. `MemoryMax=5946M`) OOM-kills the run.
 fn miri_oracle_lean_max_mb_for_avail_kib(stage_cap_mb: u64, avail_kib: Option<u64>) -> u64 {
-    const LARGE_BUDGET_KIB: u64 = 4 * 1024 * 1024;
-    const LARGE_RESERVE_KIB: u64 = 1024 * 1024;
-    const SMALL_RESERVE_MIN_KIB: u64 = 256 * 1024;
-    const MIN_HEAP_MB_SMALL: u64 = 256;
-    const MIN_HEAP_MB_TINY: u64 = 64;
-
-    let cap = stage_cap_mb.max(MIN_HEAP_MB_TINY);
-    let Some(avail) = avail_kib else {
-        return cap;
-    };
-    let min_heap_kib = if avail >= 512 * 1024 {
-        MIN_HEAP_MB_SMALL * 1024
-    } else {
-        MIN_HEAP_MB_TINY * 1024
-    };
-    let max_reserve_kib = avail.saturating_sub(min_heap_kib);
-    let desired_reserve_kib = if avail >= LARGE_BUDGET_KIB {
-        LARGE_RESERVE_KIB
-    } else {
-        (avail / 4).max(SMALL_RESERVE_MIN_KIB)
-    };
-    let reserve_kib = desired_reserve_kib.min(max_reserve_kib);
-    let heap_mb = avail.saturating_sub(reserve_kib) / 1024;
-    heap_mb.clamp(MIN_HEAP_MB_TINY, cap)
+    match avail_kib {
+        Some(avail) => miri_lean_max_mb_for_budget_kib(stage_cap_mb, avail),
+        None => stage_cap_mb.max(MIRI_LEAN_MIN_HEAP_MB_TINY),
+    }
 }
 
 /// Resolves the `lean -M` limit for a stage from the effective memory headroom:
