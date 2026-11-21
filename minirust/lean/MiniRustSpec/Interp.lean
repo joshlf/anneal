@@ -47,8 +47,9 @@ here.
   `Machine::try_mutate_cur_frame`, `StackFrame::storage_live`, and
   `StackFrame::storage_dead`) (`spec/lang/step/statements.md`,
   `spec/lang/machine.md`).
-* `PlaceExpr::Local`, `PlaceExpr::Field`, `PlaceExpr::Index`, and
-  `PlaceExpr::Deref` (`spec/lang/step/expressions.md`),
+* All five `PlaceExpr` variants: `PlaceExpr::Local`, `PlaceExpr::Field`,
+  `PlaceExpr::Index`, `PlaceExpr::Deref`, and `PlaceExpr::Downcast`
+  (`spec/lang/step/expressions.md`),
   including `Machine::ptr_offset_inbounds` (`spec/lang/step/operators.md`),
   `ThinPointer::wrapping_offset`, `ThinPointer::widen`, and
   `PtrType::safe_pointee` (`spec/mem/pointer.md`), `Memory::dereferenceable`
@@ -56,16 +57,23 @@ here.
   `spec/mem/concurrent.md`, `spec/mem/interface.md`), and
   `Machine::vtable_lookup`, `Machine::compute_size`, and
   `Machine::compute_align` (`spec/lang/machine.md`).
-* `ValueExpr::Constant` (all `Constant` variants: `Int`, `Bool`,
-  `GlobalPointer`, `FnPointer`, `VTablePointer`, and
-  `PointerWithoutProvenance`), `ValueExpr::Tuple`, `ValueExpr::Load`,
+* All nine `ValueExpr` variants: `ValueExpr::Constant` (all `Constant` variants:
+  `Int`, `Bool`, `GlobalPointer`, `FnPointer`, `VTablePointer`, and
+  `PointerWithoutProvenance`), `ValueExpr::Tuple`, `ValueExpr::Union`,
+  `ValueExpr::Variant`, `ValueExpr::GetDiscriminant` (through
+  `decode_discriminant`, `Machine::ptr_offset_inbounds`, and
+  `ConcurrentMemory::load`), `ValueExpr::Load`,
   `ValueExpr::AddrOf` (with `check_value` at the pointer type and
   `BasicMemory`'s identity `retag_ptr`),
   `ValueExpr::UnOp` with `UnOp::Int` (all `IntUnOp` variants: `Neg`, `BitNot`,
   `CountOnes`), `UnOp::Cast` (both `CastOp` variants: `IntToInt` and
   `Transmute`, the latter through `Machine::transmute`, i.e. `encode` at the
-  old type followed by `decode` and `check_value` at the new type), and
-  `UnOp::GetThinPointer`, and
+  old type followed by `decode` and `check_value` at the new type),
+  `UnOp::GetThinPointer`, `UnOp::GetMetadata` (for thin and slice/DST
+  `ElementCount` pointers; `VTablePointer` metadata reports `unsupported`),
+  `UnOp::ComputeSize`, and `UnOp::ComputeAlign` (for sized and slice/DST
+  layouts; `VTablePointer` metadata and `UnOp::VTableMethodLookup` report
+  `unsupported`), and
   `ValueExpr::BinOp` with `BinOp::Int` (all `IntBinOp` variants: `Add`,
   `AddUnchecked`, `Sub`, `SubUnchecked`, `Mul`, `MulUnchecked`, `Div`,
   `DivExact`, `Rem`, `Shl`, `Shr`, `ShlUnchecked`, `ShrUnchecked`, `BitAnd`,
@@ -113,10 +121,10 @@ here.
   `Machine::check_value` (with `ensure_else_ub`, `checkUnionChunks`, and
   `check_ptr` / `check_ptr_metadata` for raw pointers and safe pointers
   `PtrType::Ref` / `PtrType::Box`) for
-  those types (`spec/lang/representation.md`); `Type::layout` across all nine
-  `Type` variants together with `LayoutStrategy::meta_kind` and
-  `PtrType::{safe_pointee, meta_kind}` (`spec/lang/types.md`,
-  `spec/mem/pointer.md`); `BasicMemory`'s `allocate`, `load`, `store`,
+  those types (`spec/lang/representation.md`); `Type::{layout, meta_kind}`
+  across all nine `Type` variants together with `LayoutStrategy::meta_kind`,
+  `PointerMetaKind::ty`, and `PtrType::{safe_pointee, meta_kind}`
+  (`spec/lang/types.md`, `spec/lang/representation.md`, `spec/mem/pointer.md`); `BasicMemory`'s `allocate`, `load`, `store`,
   `deallocate`, `dereferenceable`, `signed_dereferenceable`, `retag_ptr`,
   `leak_check`, and `check_ptr` (`spec/mem/basic.md`), wrapped by
   `ConcurrentMemory` (`spec/mem/concurrent.md`); and the full Tree Borrows
@@ -817,6 +825,27 @@ def Type.layout : «Type» → Interp LayoutStrategy
     pure (.Slice size align)
   | .TraitObject traitName => pure (.TraitObject traitName)
 
+/-- `Type::meta_kind` (`spec/lang/types.md`):
+> "/// Returns the metadata kind when this type is used as a pointee.
+> /// This matches the meta kind of the layout, but without needing to specify a target.
+> pub fn meta_kind(self) -> PointerMetaKind {
+>     match self {
+>         Type::Slice { .. } => PointerMetaKind::ElementCount,
+>         Type::TraitObject(trait_name) => PointerMetaKind::VTablePointer(trait_name),
+>         Type::Tuple { unsized_field, .. } => match unsized_field {
+>             None => PointerMetaKind::None,
+>             Some(ty) => ty.meta_kind(),
+>         },
+>         _ => PointerMetaKind::None,
+>     }
+> }" -/
+def Type.meta_kind : «Type» → PointerMetaKind
+  | .Slice _ => .ElementCount
+  | .TraitObject traitName => .VTablePointer traitName
+  | .Tuple _ _ none => .None
+  | .Tuple _ _ (some ty) => Type.meta_kind ty
+  | _ => .None
+
 /-! ## Representation relation (`spec/lang/representation.md`) -/
 
 /-- `AbstractByte::data` (`spec/mem/interface.md`):
@@ -971,6 +1000,29 @@ def encodePtr (ptr : Ptr) : Interp (List Byte) :=
   match Endianness.encode x86_64.ENDIANNESS .Unsigned x86_64.PTR_SIZE ptr.addr with
   | some data => pure (encodePtrBytes ptr.provenance 0 data)
   | none => specPanic "M::T::ENDIANNESS.encode(Unsigned, M::T::PTR_SIZE, ptr.addr).unwrap()"
+
+/-- `unit_type` (`spec/lang/step/intrinsics.md`):
+> "fn unit_type() -> Type {
+>      Type::Tuple { sized_fields: list![], sized_head_layout: TupleHeadLayout {
+>          end: Size::ZERO, align: Align::ONE, packed_align: None,
+>      }, unsized_field: None }
+>  }" -/
+def unitType : «Type» :=
+  .Tuple [] ⟨⟨0⟩, ⟨1⟩, none⟩ none
+
+/-- `PointerMetaKind::ty::<x86_64>` (`spec/lang/representation.md`):
+> "/// Returns the type of the metadata when used as a value.
+> pub fn ty<T: Target>(self) -> Type {
+>     match self {
+>         PointerMetaKind::None => unit_type(),
+>         PointerMetaKind::ElementCount => Type::Int(IntType::usize_ty::<T>()),
+>         PointerMetaKind::VTablePointer(trait_name) => Type::Ptr(PtrType::VTablePtr(trait_name)),
+>     }
+> }" -/
+def PointerMetaKind.ty : PointerMetaKind → «Type»
+  | .None => unitType
+  | .ElementCount => .Int IntType.usize_ty
+  | .VTablePointer traitName => .Ptr (.VTablePtr traitName)
 
 /-- `PtrType::as_wide_pair::<x86_64>` (`spec/lang/representation.md`), which
 views a wide pointer as the pair of a thin raw pointer and its metadata, or
@@ -2845,8 +2897,9 @@ def evalCastOp (castOp : CastOp) (arg : Val × «Type») (m : Option Mach := non
       let val ← transmute operand oldTy newTy m
       pure (val, newTy)
 
-/-- `Machine::eval_un_op` for `UnOp::Int`, `UnOp::Cast`, and
-`UnOp::GetThinPointer` (`spec/lang/step/operators.md`):
+/-- `Machine::eval_un_op` for `UnOp::Int`, `UnOp::Cast`, `UnOp::GetThinPointer`,
+`UnOp::GetMetadata`, `UnOp::ComputeSize`, and `UnOp::ComputeAlign`
+(`spec/lang/step/operators.md`):
 > "fn eval_un_op(&self, UnOp::Int(op): UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
 >     let Type::Int(int_ty) = op_ty else { panic!(\"non-integer input to integer operation\") };
 >     let Value::Int(operand) = operand else { panic!(\"non-integer input to integer operation\") };
@@ -2864,15 +2917,40 @@ def evalCastOp (castOp : CastOp) (arg : Val × «Type») (m : Option Mach := non
 > fn eval_un_op(&self, UnOp::Cast(cast_op): UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
 >     ret(self.eval_cast_op(cast_op, (operand, op_ty))?)
 > }"
-and `UnOp::GetThinPointer`, which `minimize` emits for a `PtrToPtr` cast from
-a wide to a thin raw pointer:
+wide pointer operators (`GetThinPointer` and `GetMetadata`):
 > "fn eval_un_op(&self, UnOp::GetThinPointer: UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
 >     let Value::Ptr(ptr) = operand else { panic!(\"non-pointer GetThinPointer\") };
 >
 >     let thin_ptr = Pointer { metadata: None, ..ptr };
 >     let thin_ptr_ty = PtrType::Raw { meta_kind: PointerMetaKind::None };
 >     ret((Value::Ptr(thin_ptr), Type::Ptr(thin_ptr_ty)))
-> }" -/
+> }
+>
+> fn eval_un_op(&self, UnOp::GetMetadata: UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
+>     let Value::Ptr(ptr) = operand else { panic!(\"non-pointer GetMetadata\") };
+>     let Type::Ptr(ptr_ty) = op_ty else { panic!(\"non-pointer GetMetadata\") };
+>
+>     let meta_value = ptr_ty.meta_kind().encode_as_value::<M>(ptr.metadata);
+>     let meta_ty = ptr_ty.meta_kind().ty::<M::T>();
+>     // O(1) sanity check
+>     self.check_value(meta_value, meta_ty).expect(\"GetMetadata: sanity check, returned meta is well-formed\");
+>     ret((meta_value, meta_ty))
+> }"
+and dynamic size and alignment computation (`ComputeSize` and `ComputeAlign`):
+> "fn eval_un_op(&self, UnOp::ComputeSize(ty): UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
+>     let meta = ty.meta_kind().decode_value::<M>(operand);
+>     let size = self.compute_size(ty.layout::<M::T>(), meta);
+>     ret((Value::Int(size.bytes()), Type::Int(IntType::usize_ty::<M::T>())))
+> }
+>
+> fn eval_un_op(&self, UnOp::ComputeAlign(ty): UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
+>     let meta = ty.meta_kind().decode_value::<M>(operand);
+>     let align = self.compute_align(ty.layout::<M::T>(), meta);
+>     ret((Value::Int(align.bytes()), Type::Int(IntType::usize_ty::<M::T>())))
+> }"
+Vtable metadata (`PointerMetaKind::VTablePointer` / `PointerMeta::VTablePointer`)
+and `UnOp::VTableMethodLookup` remain outside the fragment and fail closed with
+`Stop.unsupported`. -/
 def evalUnOp (op : UnOp) (arg : Val × «Type») (m : Option Mach := none) :
     Interp (Val × «Type») :=
   match op, arg with
@@ -2888,7 +2966,49 @@ def evalUnOp (op : UnOp) (arg : Val × «Type») (m : Option Mach := none) :
   | .Cast castOp, arg => evalCastOp castOp arg m
   | .GetThinPointer, (.Ptr ptr, _) => pure (.Ptr { ptr with metadata := none }, .Ptr (.Raw .None))
   | .GetThinPointer, _ => specPanic "non-pointer GetThinPointer"
-  | _, _ => unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}"
+  | .GetMetadata, (.Ptr ptr, .Ptr ptrTy) => do
+    let metaKind := PtrType.meta_kind ptrTy
+    let metaValue ← PointerMetaKind.encode_as_value metaKind ptr.metadata
+    match metaKind with
+    | .VTablePointer _ =>
+      unsupported "eval_un_op UnOp::GetMetadata for vtable pointer metadata"
+    | _ =>
+      let metaTy := PointerMetaKind.ty metaKind
+      match checkValue metaValue metaTy m with
+      | .ok () => pure (metaValue, metaTy)
+      | .error (.unsupported what) => .error (.unsupported what)
+      | .error _ => specPanic "GetMetadata: sanity check, returned meta is well-formed"
+  | .GetMetadata, _ => specPanic "non-pointer GetMetadata"
+  | .ComputeSize ty, (operand, _) => do
+    let ptrMeta ← PointerMetaKind.decode_value (Type.meta_kind ty) operand
+    match ptrMeta with
+    | some (.VTablePointer _) =>
+      unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata"
+    | _ => do
+      let layout ← Type.layout ty
+      let size ← match m with
+        | some mach => computeSize mach layout ptrMeta
+        | none =>
+          (·.1) <$> LayoutStrategy.compute_size_and_align
+            (fun _ => unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata")
+            layout ptrMeta
+      pure (.Int (size.bytes : Int), .Int IntType.usize_ty)
+  | .ComputeAlign ty, (operand, _) => do
+    let ptrMeta ← PointerMetaKind.decode_value (Type.meta_kind ty) operand
+    match ptrMeta with
+    | some (.VTablePointer _) =>
+      unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata"
+    | _ => do
+      let layout ← Type.layout ty
+      let align ← match m with
+        | some mach => computeAlign mach layout ptrMeta
+        | none =>
+          (·.2) <$> LayoutStrategy.compute_size_and_align
+            (fun _ => unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata")
+            layout ptrMeta
+      pure (.Int (align.bytes : Int), .Int IntType.usize_ty)
+  | .VTableMethodLookup _, _ =>
+    unsupported "eval_un_op for UnOp::VTableMethodLookup"
 
 /-- `Machine::eval_int_bin_op` across all `IntBinOp` variants
 (`spec/lang/step/operators.md`):
@@ -3407,8 +3527,9 @@ def fieldPlace (m : Mach) (root : Place BM) (ty : «Type») (field : Int) :
 
 mutual
 
-/-- `Machine::eval_place` for `PlaceExpr::Local`, `PlaceExpr::Field`,
-`PlaceExpr::Index`, and `PlaceExpr::Deref` (`spec/lang/step/expressions.md`):
+/-- `Machine::eval_place` for all five `PlaceExpr` variants: `PlaceExpr::Local`,
+`PlaceExpr::Field`, `PlaceExpr::Index`, `PlaceExpr::Downcast`, and
+`PlaceExpr::Deref` (`spec/lang/step/expressions.md`):
 > "let ty = self.cur_frame().func.locals[name];
 >  let Some(ptr) = self.cur_frame().locals.get(name) else {
 >      throw_ub!(\"access to a dead local\");
@@ -3494,6 +3615,17 @@ memory (`BM.check_ptr`):
 >     let aligned = self.compute_align(ty.layout::<M::T>(), ptr.metadata).is_aligned(ptr.thin_pointer.addr);
 >
 >     ret((Place { ptr, aligned }, ty))
+> }"
+and for `PlaceExpr::Downcast`:
+> "fn eval_place(&mut self, PlaceExpr::Downcast { root, discriminant }: PlaceExpr) -> Result<(Place<M>, Type)> {
+>     let (root, ty) = self.eval_place(root)?;
+>     // We only need to downcast the enum type into the variant data type
+>     // since all the enum data must have the same size with offset 0 (invariant).
+>     let var_ty = match ty {
+>         Type::Enum { variants, .. } => variants[discriminant].ty,
+>         _ => panic!(\"enum downcast on non-enum\"),
+>     };
+>     ret((root, var_ty))
 > }" -/
 def evalPlace (m : Mach) : PlaceExpr → Interp ((Place BM × «Type») × Mach)
   | .Local name => do
@@ -3570,10 +3702,18 @@ def evalPlace (m : Mach) : PlaceExpr → Interp ((Place BM × «Type») × Mach)
       let align ← computeAlign m (← Type.layout ty) ptr.metadata
       pure (({ ptr := ptr, aligned := Align.is_aligned align ptr.thin_pointer.addr }, ty), m)
     | _, _ => specPanic "dereferencing a non-pointer"
-  | _ => unsupported "eval_place for a place expression other than Local, Deref, Field, or Index"
+  | .Downcast root discriminant => do
+    let ((root, ty), m) ← evalPlace m root
+    let varTy ← match ty with
+      | .Enum variants _ _ _ _ => do
+        let variant ← mapIndex variants discriminant "variants[discriminant]"
+        pure variant.ty
+      | _ => specPanic "enum downcast on non-enum"
+    pure ((root, varTy), m)
 
-/-- `Machine::eval_value` for `Constant`, `Tuple`, `Load`, `AddrOf`, `UnOp`, and
-`BinOp`:
+/-- `Machine::eval_value` for all nine `ValueExpr` variants: `Constant`,
+`Tuple`, `Union`, `Variant`, `GetDiscriminant`, `Load`, `AddrOf`, `UnOp`, and
+`BinOp` (`spec/lang/step/expressions.md`):
 > "fn eval_value(&mut self, ValueExpr::Constant(constant, ty): ValueExpr) -> .. {
 >     ret((self.eval_constant(constant)?, ty))
 > }
@@ -3581,6 +3721,43 @@ def evalPlace (m : Mach) : PlaceExpr → Interp ((Place BM × «Type») × Mach)
 > fn eval_value(&mut self, ValueExpr::Tuple(exprs, ty): ValueExpr) -> Result<(Value<M>, Type)> {
 >     let vals = exprs.try_map(|e| self.eval_value(e))?.map(|e| e.0);
 >     ret((Value::Tuple(vals), ty))
+> }
+> ..
+> fn eval_value(&mut self, ValueExpr::Union { field, expr, union_ty } : ValueExpr) -> Result<(Value<M>, Type)> {
+>     let Type::Union { fields, size, .. } = union_ty else { panic!(\"ValueExpr::Union requires union type\") };
+>     let (offset, expr_ty) = fields[field];
+>     let mut data = list![AbstractByte::Uninit; size.bytes()];
+>     let (val, _) = self.eval_value(expr)?;
+>     data.write_subslice_at_index(offset.bytes(), expr_ty.encode::<M>(val));
+>     ret((union_ty.decode(data).unwrap(), union_ty))
+> }
+> ..
+> fn eval_value(&mut self, ValueExpr::Variant { enum_ty, discriminant, data } : ValueExpr) -> Result<(Value<M>, Type)> {
+>     ret((Value::Variant { discriminant, data: self.eval_value(data)?.0 }, enum_ty))
+> }
+> ..
+> fn eval_value(&mut self, ValueExpr::GetDiscriminant { place } : ValueExpr) -> Result<(Value<M>, Type)> {
+>     // Get the place of the enum and its information.
+>     let (place, ty) = self.eval_place(place)?;
+>     let Type::Enum { discriminator, discriminant_ty, .. } = ty else {
+>         panic!(\"ValueExpr::GetDiscriminant requires enum type\");
+>     };
+>     if !place.aligned {
+>         throw_ub!(\"Getting the discriminant of a place based on a misaligned pointer.\");
+>     }
+>
+>     // We don't require the variant to be valid,
+>     // we are only interested in the bytes that the discriminator actually touches.
+>     let accessor = |idx: Offset, size: Size| {
+>         let ptr = self.ptr_offset_inbounds(place.ptr.thin_pointer, idx.bytes())?;
+>         // We have ensured that the place is aligned, so no alignment requirement here.
+>         self.mem.load(ptr, size, Align::ONE, Atomicity::None)
+>     };
+>     let Some(discriminant) = decode_discriminant::<M>(accessor, discriminator)? else {
+>         throw_ub!(\"ValueExpr::GetDiscriminant encountered invalid discriminant.\");
+>     };
+>
+>     ret((Value::Int(discriminant), Type::Int(discriminant_ty)))
 > }
 > ..
 > fn eval_value(&mut self, ValueExpr::Load { source }: ValueExpr) -> .. {
@@ -3620,7 +3797,8 @@ aliasing model retag it (`retagPtrBM`, the identity for `BasicMemory`):
 >     ret((Value::Ptr(ptr), Type::Ptr(ptr_ty)))
 > }"
 `eval_un_op` threads `some m` (after evaluating `operand`) into `evalUnOp` so
-`CastOp::Transmute` checks safe-pointer dereferenceability against `m.mem`.
+`CastOp::Transmute` checks safe-pointer dereferenceability against `m.mem` and
+`ComputeSize` / `ComputeAlign` call `computeSize` / `computeAlign`.
 `eval_bin_op` for `BinOp::PtrOffset` and `BinOp::PtrOffsetFrom` reads the
 machine's memory, so those operators are evaluated by `evalPtrOffset` and
 `evalPtrOffsetFrom` on the machine after both operands, and all others by the
@@ -3630,6 +3808,37 @@ def evalValue (m : Mach) : ValueExpr → Interp ((Val × «Type») × Mach)
   | .Tuple exprs ty => do
     let (vals, m) ← evalValues m exprs
     pure ((.Tuple vals, ty), m)
+  | .Union field expr unionTy => do
+    let (fields, size) ← match unionTy with
+      | .Union fields _ size _ => pure (fields, size)
+      | _ => specPanic "ValueExpr::Union requires union type"
+    let (offset, exprTy) ← listIndex fields field "fields[field]"
+    let data : List Byte := List.replicate size.bytes .Uninit
+    let ((val, _), m) ← evalValue m expr
+    let encoded ← Type.encode exprTy val
+    let data ← writeSubsliceAtIndex data (offset.bytes : Int) encoded
+    match ← Type.decode unionTy data with
+    | some unionVal => pure ((unionVal, unionTy), m)
+    | none => specPanic "union_ty.decode(data).unwrap()"
+  | .Variant discriminant data enumTy => do
+    let ((val, _), m) ← evalValue m data
+    pure ((.Variant discriminant val, enumTy), m)
+  | .GetDiscriminant place => do
+    let ((place, ty), m) ← evalPlace m place
+    match ty with
+    | .Enum _ discriminantTy discriminator _ _ =>
+      if !place.aligned then
+        ub "Getting the discriminant of a place based on a misaligned pointer."
+      else do
+        let accessor := fun (m : Mach) (idx : Offset) (size : Size) => do
+          let ptr ← ptrOffsetInbounds m place.ptr.thin_pointer (idx.bytes : Int)
+          let (bytes, cm) ← CM.load m.mem ptr size ⟨1⟩ .None
+          pure (bytes, { m with mem := cm })
+        let (discrOpt, m) ← decodeDiscriminant accessor discriminator m
+        match discrOpt with
+        | some discriminant => pure ((.Int discriminant, .Int discriminantTy), m)
+        | none => ub "ValueExpr::GetDiscriminant encountered invalid discriminant."
+    | _ => specPanic "ValueExpr::GetDiscriminant requires enum type"
   | .Load source => do
     let ((place, ty), m) ← evalPlace m source
     let (v, m) ← placeLoad m place ty
@@ -3654,7 +3863,6 @@ def evalValue (m : Mach) : ValueExpr → Interp ((Val × «Type») × Mach)
     let (l, m) ← evalValue m left
     let (r, m) ← evalValue m right
     pure (← evalBinOp operator l r, m)
-  | _ => unsupported "eval_value for an expression outside the fragment"
 
 /-- The element loop of `Machine::eval_value` for `ValueExpr::Tuple`
 (`spec/lang/step/expressions.md`):
@@ -5701,15 +5909,6 @@ def evalResumeUnwind (m : Mach) : Interp Mach := do
 def unitValue : Val :=
   .Tuple []
 
-/-- `unit_type` (`spec/lang/step/intrinsics.md`):
-> "fn unit_type() -> Type {
->      Type::Tuple { sized_fields: list![], sized_head_layout: TupleHeadLayout {
->          end: Size::ZERO, align: Align::ONE, packed_align: None,
->      }, unsized_field: None }
->  }" -/
-def unitType : «Type» :=
-  .Tuple [] ⟨⟨0⟩, ⟨1⟩, none⟩ none
-
 /-- `BasicMemory::leak_check` (`spec/mem/basic.md`):
 > "fn leak_check(&self) -> Result {
 >      use AllocationKind::*;
@@ -7712,24 +7911,11 @@ def evalCastOpM {M : Type} [Memory M] [MemoryOps M] (castOp : CastOp)
       let val ← transmuteM operand oldTy newTy m
       pure (val, newTy)
 
-/-- Polymorphic `Machine::eval_un_op` (`spec/lang/step/operators.md`); see `evalUnOp`:
-> "fn eval_un_op(&self, UnOp::Int(op): UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
->     let Type::Int(int_ty) = op_ty else { panic!(\"non-integer input to integer operation\") };
->     let Value::Int(operand) = operand else { panic!(\"non-integer input to integer operation\") };
->     let ret_ty = match op {
->         IntUnOp::CountOnes => IntType { signed: Unsigned, size: Size::from_bytes(4).unwrap() },
->         _ => int_ty,
->     };
->     let result = Value::Int(Self::eval_int_un_op(op, operand, int_ty)?);
->     // Sanity-check that the result of `eval_int_un_op` is in-bounds.
->     self.check_value(result, Type::Int(ret_ty))
->         .expect(\"sanity check: result of UnOp::Int does not fit in the return type\");
->     ret((result, Type::Int(ret_ty)))
-> }
-> ..
-> fn eval_un_op(&self, UnOp::Cast(cast_op): UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
->     ret(self.eval_cast_op(cast_op, (operand, op_ty))?)
-> }" -/
+/-- Polymorphic `Machine::eval_un_op` (`spec/lang/step/operators.md`); see `evalUnOp`
+for full upstream quotations of `UnOp::{Int, Cast, GetThinPointer, GetMetadata,
+ComputeSize, ComputeAlign}`. Vtable metadata (`PointerMetaKind::VTablePointer` /
+`PointerMeta::VTablePointer`) and `UnOp::VTableMethodLookup` fail closed with
+`Stop.unsupported`. -/
 def evalUnOpM {M : Type} [Memory M] [MemoryOps M] (op : UnOp) (arg : Value M × «Type»)
     (m : Option (Machine M) := none) : Interp (Value M × «Type») :=
   match op, arg with
@@ -7745,7 +7931,49 @@ def evalUnOpM {M : Type} [Memory M] [MemoryOps M] (op : UnOp) (arg : Value M × 
   | .Cast castOp, arg => evalCastOpM castOp arg m
   | .GetThinPointer, (.Ptr ptr, _) => pure (.Ptr { ptr with metadata := none }, .Ptr (.Raw .None))
   | .GetThinPointer, _ => specPanic "non-pointer GetThinPointer"
-  | _, _ => unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}"
+  | .GetMetadata, (.Ptr ptr, .Ptr ptrTy) => do
+    let metaKind := PtrType.meta_kind ptrTy
+    let metaValue ← PointerMetaKind.encode_as_valueM (M := M) metaKind ptr.metadata
+    match metaKind with
+    | .VTablePointer _ =>
+      unsupported "eval_un_op UnOp::GetMetadata for vtable pointer metadata"
+    | _ =>
+      let metaTy := PointerMetaKind.ty metaKind
+      match checkValueM metaValue metaTy m with
+      | .ok () => pure (metaValue, metaTy)
+      | .error (.unsupported what) => .error (.unsupported what)
+      | .error _ => specPanic "GetMetadata: sanity check, returned meta is well-formed"
+  | .GetMetadata, _ => specPanic "non-pointer GetMetadata"
+  | .ComputeSize ty, (operand, _) => do
+    let ptrMeta ← PointerMetaKind.decode_valueM (M := M) (Type.meta_kind ty) operand
+    match ptrMeta with
+    | some (.VTablePointer _) =>
+      unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata"
+    | _ => do
+      let layout ← Type.layout ty
+      let size ← match m with
+        | some mach => computeSizeM mach layout ptrMeta
+        | none =>
+          (·.1) <$> LayoutStrategy.compute_size_and_align
+            (fun _ => unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata")
+            layout ptrMeta
+      pure (.Int (size.bytes : Int), .Int IntType.usize_ty)
+  | .ComputeAlign ty, (operand, _) => do
+    let ptrMeta ← PointerMetaKind.decode_valueM (M := M) (Type.meta_kind ty) operand
+    match ptrMeta with
+    | some (.VTablePointer _) =>
+      unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata"
+    | _ => do
+      let layout ← Type.layout ty
+      let align ← match m with
+        | some mach => computeAlignM mach layout ptrMeta
+        | none =>
+          (·.2) <$> LayoutStrategy.compute_size_and_align
+            (fun _ => unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata")
+            layout ptrMeta
+      pure (.Int (align.bytes : Int), .Int IntType.usize_ty)
+  | .VTableMethodLookup _, _ =>
+    unsupported "eval_un_op for UnOp::VTableMethodLookup"
 
 /-- Polymorphic `Machine::eval_rel_op` (`spec/lang/step/operators.md`); see `evalRelOp`:
 > "fn eval_rel_op(rel: RelOp, ord: std::cmp::Ordering) -> (Value<M>, Type) {
@@ -8010,10 +8238,20 @@ def evalPlaceM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) :
       let align ← computeAlignM m (← Type.layout ty) ptr.metadata
       pure (({ ptr := ptr, aligned := Align.is_aligned align ptr.thin_pointer.addr }, ty), m)
     | _, _ => specPanic "dereferencing a non-pointer"
-  | _ => unsupported "eval_place for a place expression other than Local, Deref, Field, or Index"
+  | .Downcast root discriminant => do
+    let ((root, ty), m) ← evalPlaceM m root
+    let varTy ← match ty with
+      | .Enum variants _ _ _ _ => do
+        let variant ← mapIndex variants discriminant "variants[discriminant]"
+        pure variant.ty
+      | _ => specPanic "enum downcast on non-enum"
+    pure ((root, varTy), m)
 
-/-- Polymorphic `Machine::eval_value` (`spec/lang/step/expressions.md`), wiring
-`ValueExpr::AddrOf` through `ConcurrentMemory.retag_ptr`:
+/-- Polymorphic `Machine::eval_value` (`spec/lang/step/expressions.md`) across
+all nine `ValueExpr` variants, wiring `ValueExpr::AddrOf` through
+`ConcurrentMemory.retag_ptr` and `ValueExpr::GetDiscriminant` through
+`decodeDiscriminantM` / `ConcurrentMemory.load` (performing Tree Borrows read
+accesses on the exact tag bytes visited by the discriminator):
 > "let lookup = self.vtable_lookup();
 > let ptr = self.mutate_cur_frame(|frame, mem| {
 >     mem.retag_ptr(&mut frame.extra, place.ptr, ptr_ty, /* fn_entry */ false, /* fn_implicit_writes */ true, lookup)
@@ -8024,6 +8262,37 @@ def evalValueM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) :
   | .Tuple exprs ty => do
     let (vals, m) ← evalValuesM m exprs
     pure ((.Tuple vals, ty), m)
+  | .Union field expr unionTy => do
+    let (fields, size) ← match unionTy with
+      | .Union fields _ size _ => pure (fields, size)
+      | _ => specPanic "ValueExpr::Union requires union type"
+    let (offset, exprTy) ← listIndex fields field "fields[field]"
+    let data : List (AbstractByte (Memory.Provenance M)) := List.replicate size.bytes .Uninit
+    let ((val, _), m) ← evalValueM m expr
+    let encoded ← Type.encodeM exprTy val
+    let data ← writeSubsliceAtIndex data (offset.bytes : Int) encoded
+    match ← Type.decodeM (M := M) unionTy data with
+    | some unionVal => pure ((unionVal, unionTy), m)
+    | none => specPanic "union_ty.decode(data).unwrap()"
+  | .Variant discriminant data enumTy => do
+    let ((val, _), m) ← evalValueM m data
+    pure ((.Variant discriminant val, enumTy), m)
+  | .GetDiscriminant place => do
+    let ((place, ty), m) ← evalPlaceM m place
+    match ty with
+    | .Enum _ discriminantTy discriminator _ _ =>
+      if !place.aligned then
+        ub "Getting the discriminant of a place based on a misaligned pointer."
+      else do
+        let accessor := fun (m : Machine M) (idx : Offset) (size : Size) => do
+          let ptr ← ptrOffsetInboundsM m place.ptr.thin_pointer (idx.bytes : Int)
+          let (bytes, cm) ← ConcurrentMemory.load m.mem ptr size ⟨1⟩ .None
+          pure (bytes, { m with mem := cm })
+        let (discrOpt, m) ← decodeDiscriminantM (M := M) accessor discriminator m
+        match discrOpt with
+        | some discriminant => pure ((.Int discriminant, .Int discriminantTy), m)
+        | none => ub "ValueExpr::GetDiscriminant encountered invalid discriminant."
+    | _ => specPanic "ValueExpr::GetDiscriminant requires enum type"
   | .Load source => do
     let ((place, ty), m) ← evalPlaceM m source
     let (v, m) ← placeLoadM m place ty
@@ -8052,7 +8321,6 @@ def evalValueM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) :
     let (l, m) ← evalValueM m left
     let (r, m) ← evalValueM m right
     pure (← evalBinOpM operator l r, m)
-  | _ => unsupported "eval_value for an expression outside the fragment"
 
 /-- Polymorphic tuple-element loop of `Machine::eval_value` (`spec/lang/step/expressions.md`);
 see `evalValues`:

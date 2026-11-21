@@ -6184,7 +6184,7 @@ open MiniRustSpec.Correspondence.WideSliceDst
   computeSize_computeAlign_slice_total
   checkPtr_rawSlice_ok
   sliceSizeOverflow_minirust_ub_locus
-  minirust_interp_metadata_unops_unsupported
+  minirust_interp_metadata_unops_exec_and_vtable_unsupported
   div_rawSliceSizeOfVal_isizeMax_anneal_ub_vs_minirust_total
   wideSliceParentWrite_aliasingDivergence_and_metadata_three_way
   WideSliceThinPtrRel.of_ctxWithBorrows
@@ -6582,21 +6582,70 @@ example (thin : Ptr) (len : Nat) (m : Option Mach)
         m = .ok () :=
   WideSliceDst.checkPtr_rawSlice_ok thin len m hAddr hLen
 
-example (sty ty : Gen.Type) (v : Val) (m : Option Mach)
-    (vTB : Gen.Value TBM) (mTB : Option MachTB) :
-    evalUnOp .GetMetadata (v, ty) m =
-      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" ∧
-    evalUnOp (.ComputeSize sty) (v, ty) m =
-      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" ∧
-    evalUnOp (.ComputeAlign sty) (v, ty) m =
-      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" ∧
-    evalUnOpM (M := TBM) .GetMetadata (vTB, ty) mTB =
-      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" ∧
-    evalUnOpM (M := TBM) (.ComputeSize sty) (vTB, ty) mTB =
-      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" ∧
-    evalUnOpM (M := TBM) (.ComputeAlign sty) (vTB, ty) mTB =
-      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" :=
-  minirust_interp_metadata_unops_unsupported sty ty v m vTB mTB
+example (thin vptr : Ptr) (thinTB vptrTB : ThinPointer TreeBorrowsProvenance)
+    (elemTy ty : Gen.Type) (elemSz elemAlign len : Nat)
+    (traitName : Gen.TraitName) (meth : Gen.TraitMethodName)
+    (v : Val) (m : Option Mach) (vTB : Gen.Value TBM) (mTB : Option MachTB)
+    (hElemLayout : Type.layout elemTy = .ok (.Sized ⟨elemSz⟩ ⟨elemAlign⟩))
+    (hLen : IntType.can_represent IntType.usize_ty (Int.ofNat len) = true) :
+    evalUnOp .GetMetadata (.Ptr (ThinPointer.widen thin none), .Ptr (.Raw .None)) m =
+      .ok (.Tuple [], unitType) ∧
+    evalUnOp .GetMetadata
+        (.Ptr (ThinPointer.widen thin (some (.ElementCount (Int.ofNat len)))),
+         .Ptr (.Raw .ElementCount)) m =
+      .ok (.Int (Int.ofNat len), .Int IntType.usize_ty) ∧
+    evalUnOp (.ComputeSize elemTy) (.Tuple [], unitType) m =
+      .ok (.Int (elemSz : Int), .Int IntType.usize_ty) ∧
+    evalUnOp (.ComputeAlign elemTy) (.Tuple [], unitType) m =
+      .ok (.Int (elemAlign : Int), .Int IntType.usize_ty) ∧
+    evalUnOp (.ComputeSize (.Slice elemTy)) (.Int (Int.ofNat len), .Int IntType.usize_ty) m =
+      .ok (.Int ((len * elemSz : Nat) : Int), .Int IntType.usize_ty) ∧
+    evalUnOp (.ComputeAlign (.Slice elemTy)) (.Int (Int.ofNat len), .Int IntType.usize_ty) m =
+      .ok (.Int (elemAlign : Int), .Int IntType.usize_ty) ∧
+    evalUnOp .GetMetadata
+        (.Ptr (ThinPointer.widen thin (some (.VTablePointer vptr))),
+         .Ptr (.Raw (.VTablePointer traitName))) m =
+      unsupported "eval_un_op UnOp::GetMetadata for vtable pointer metadata" ∧
+    evalUnOp (.ComputeSize (.TraitObject traitName))
+        (.Ptr (ThinPointer.widen vptr none), .Ptr (.VTablePtr traitName)) m =
+      unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata" ∧
+    evalUnOp (.ComputeAlign (.TraitObject traitName))
+        (.Ptr (ThinPointer.widen vptr none), .Ptr (.VTablePtr traitName)) m =
+      unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata" ∧
+    evalUnOp (.VTableMethodLookup meth) (v, ty) m =
+      unsupported "eval_un_op for UnOp::VTableMethodLookup" ∧
+    evalUnOpM (M := TBM) .GetMetadata
+        (.Ptr (ThinPointer.widen thinTB none), .Ptr (.Raw .None)) mTB =
+      .ok (.Tuple [], unitType) ∧
+    evalUnOpM (M := TBM) .GetMetadata
+        (.Ptr (ThinPointer.widen thinTB (some (.ElementCount (Int.ofNat len)))),
+         .Ptr (.Raw .ElementCount)) mTB =
+      .ok (.Int (Int.ofNat len), .Int IntType.usize_ty) ∧
+    evalUnOpM (M := TBM) (.ComputeSize elemTy) (.Tuple [], unitType) mTB =
+      .ok (.Int (elemSz : Int), .Int IntType.usize_ty) ∧
+    evalUnOpM (M := TBM) (.ComputeAlign elemTy) (.Tuple [], unitType) mTB =
+      .ok (.Int (elemAlign : Int), .Int IntType.usize_ty) ∧
+    evalUnOpM (M := TBM) (.ComputeSize (.Slice elemTy))
+        (.Int (Int.ofNat len), .Int IntType.usize_ty) mTB =
+      .ok (.Int ((len * elemSz : Nat) : Int), .Int IntType.usize_ty) ∧
+    evalUnOpM (M := TBM) (.ComputeAlign (.Slice elemTy))
+        (.Int (Int.ofNat len), .Int IntType.usize_ty) mTB =
+      .ok (.Int (elemAlign : Int), .Int IntType.usize_ty) ∧
+    evalUnOpM (M := TBM) .GetMetadata
+        (.Ptr (ThinPointer.widen thinTB (some (.VTablePointer vptrTB))),
+         .Ptr (.Raw (.VTablePointer traitName))) mTB =
+      unsupported "eval_un_op UnOp::GetMetadata for vtable pointer metadata" ∧
+    evalUnOpM (M := TBM) (.ComputeSize (.TraitObject traitName))
+        (.Ptr (ThinPointer.widen vptrTB none), .Ptr (.VTablePtr traitName)) mTB =
+      unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata" ∧
+    evalUnOpM (M := TBM) (.ComputeAlign (.TraitObject traitName))
+        (.Ptr (ThinPointer.widen vptrTB none), .Ptr (.VTablePtr traitName)) mTB =
+      unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata" ∧
+    evalUnOpM (M := TBM) (.VTableMethodLookup meth) (vTB, ty) mTB =
+      unsupported "eval_un_op for UnOp::VTableMethodLookup" :=
+  minirust_interp_metadata_unops_exec_and_vtable_unsupported
+    thin vptr thinTB vptrTB elemTy ty elemSz elemAlign len traitName meth v m vTB mTB
+    hElemLayout hLen
 
 example :
     (∃ mem, ReachesRet (mirTree wideRawPartsMir wideRawPartsS0) []
@@ -7150,6 +7199,804 @@ example
 end WideSliceDstStatementPins
 
 end WideSliceDstAuditPins
+
+section Ep1ExprAndMetaUnOpAudit
+
+open MiniRustSpec
+open MiniRustSpec.Gen
+open MiniRustSpec.LibSpecr
+open MiniRustSpec.Interp
+open MiniRustSpec.Correspondence
+open MiniRustSpec.Correspondence.RefWitness
+open MiniRustSpec.Correspondence.TbWitness
+
+/-! ## Episode 1: `UnOp.{GetMetadata, ComputeSize, ComputeAlign}`, `PlaceExpr.Downcast`,
+and `ValueExpr.{Union, Variant, GetDiscriminant}` — Equational Laws, Preservation, and Witnesses -/
+
+/-- `Type::meta_kind` agrees with `LayoutStrategy::meta_kind` for every type whose
+`Type::layout` succeeds (proving upstream `spec/lang/types.md:182`). -/
+theorem ep1_type_meta_kind_eq_layout_meta_kind :
+    ∀ (ty : Gen.Type) (lay : Gen.LayoutStrategy),
+      Type.layout ty = .ok lay → Type.meta_kind ty = LayoutStrategy.meta_kind lay
+  | .Int t, lay, h => by
+    unfold Type.layout at h
+    cases hal : IntType.align t with
+    | error _ => simp [hal, bind, Except.bind] at h
+    | ok a =>
+      simp [hal, bind, Except.bind, pure, Except.pure] at h
+      subst h; rfl
+  | .Bool, lay, h => by
+    simp [Type.layout, pure, Except.pure] at h; subst h; rfl
+  | .Ptr p, lay, h => by
+    unfold Type.layout at h
+    split at h <;> (simp [pure, Except.pure] at h; subst h; rfl)
+  | .Union _ _ _ _, lay, h => by
+    simp [Type.layout, pure, Except.pure] at h; subst h; rfl
+  | .Enum _ _ _ _ _, lay, h => by
+    simp [Type.layout, pure, Except.pure] at h; subst h; rfl
+  | .Tuple _ _ none, lay, h => by
+    simp [Type.layout, pure, Except.pure] at h; subst h; rfl
+  | .Tuple _ head (some tail), lay, h => by
+    unfold Type.layout at h
+    cases htl : Type.layout tail with
+    | error _ => simp [htl, bind, Except.bind] at h
+    | ok tailLay =>
+      simp [htl, bind, Except.bind, pure, Except.pure] at h
+      subst h
+      simpa [Type.meta_kind, LayoutStrategy.meta_kind] using
+        ep1_type_meta_kind_eq_layout_meta_kind tail tailLay htl
+  | .Array elem count, lay, h => by
+    unfold Type.layout at h
+    cases hel : Type.layout elem with
+    | error _ => simp [hel, bind, Except.bind] at h
+    | ok el =>
+      simp [hel, bind, Except.bind] at h
+      cases hsz : LayoutStrategy.expect_size el "WF ensures array element is sized" with
+      | error _ => simp [hsz] at h
+      | ok es =>
+        simp [hsz] at h
+        cases hal : LayoutStrategy.expect_align el "WF ensures array element is sized" with
+        | error _ => simp [hal] at h
+        | ok ea =>
+          simp [hal] at h
+          cases hmul : Size.mulInt es count with
+          | error _ => simp [hmul] at h
+          | ok sz =>
+            simp [hmul] at h
+            subst h; rfl
+  | .Slice elem, lay, h => by
+    unfold Type.layout at h
+    cases hel : Type.layout elem with
+    | error _ => simp [hel, bind, Except.bind] at h
+    | ok el =>
+      simp [hel, bind, Except.bind] at h
+      cases hsz : LayoutStrategy.expect_size el "WF ensures slice element is sized" with
+      | error _ => simp [hsz] at h
+      | ok es =>
+        simp [hsz] at h
+        cases hal : LayoutStrategy.expect_align el "WF ensures array element is sized" with
+        | error _ => simp [hal] at h
+        | ok ea =>
+          simp [hal] at h
+          subst h; rfl
+  | .TraitObject _, lay, h => by
+    simp [Type.layout, pure, Except.pure] at h; subst h; rfl
+
+private theorem ep1_compute_size_and_align_nonVTable_indep {P : Type}
+    (vt1 vt2 : Gen.ThinPointer P → Interp Gen.VTable) :
+    ∀ (lay : Gen.LayoutStrategy) (pm : Option (Gen.PointerMeta P)),
+      (∀ p, pm ≠ some (.VTablePointer p)) →
+      LayoutStrategy.compute_size_and_align vt1 lay pm =
+        LayoutStrategy.compute_size_and_align vt2 lay pm
+  | .Sized _ _, none, _ => rfl
+  | .Sized _ _, some _, _ => rfl
+  | .Slice _ _, none, _ => rfl
+  | .Slice _ _, some (.ElementCount _), _ => rfl
+  | .Slice _ _, some (.VTablePointer p), h => absurd rfl (h p)
+  | .TraitObject _, none, _ => rfl
+  | .TraitObject _, some (.ElementCount _), _ => rfl
+  | .TraitObject _, some (.VTablePointer p), h => absurd rfl (h p)
+  | .Tuple _ _, none, _ => rfl
+  | .Tuple head tail, some pm, h => by
+    unfold LayoutStrategy.compute_size_and_align
+    rw [ep1_compute_size_and_align_nonVTable_indep vt1 vt2 tail (some pm) h]
+
+/-- Non-vtable `ComputeSize` and `ComputeAlign` never invoke `vtableLookupM`, so
+evaluating them with `some mach` and with `none` agree identically on every
+`Memory` `M` (and on `Mach` via `evalUnOpM_bm_eq`). -/
+theorem ep1_evalUnOpM_computeSize_computeAlign_mach_indep
+    {M : Type} [Gen.Memory M] [MemoryOps M]
+    (ty opTy : Gen.Type) (v : Gen.Value M) (mach : Gen.Machine M) :
+    evalUnOpM (.ComputeSize ty) (v, opTy) (some mach) =
+      evalUnOpM (.ComputeSize ty) (v, opTy) none ∧
+    evalUnOpM (.ComputeAlign ty) (v, opTy) (some mach) =
+      evalUnOpM (.ComputeAlign ty) (v, opTy) none := by
+  constructor
+  · unfold evalUnOpM; dsimp only; simp only [bind, Except.bind]
+    cases hdv : PointerMetaKind.decode_valueM (M := M) (Type.meta_kind ty) v with
+    | error _ => rfl
+    | ok pm =>
+      dsimp only
+      cases pm with
+      | none =>
+        dsimp only
+        cases hlay : Type.layout ty with
+        | error _ => rfl
+        | ok lay =>
+          simp only [computeSizeM, Functor.map, Except.map, bind, Except.bind, pure, Except.pure]
+          rw [ep1_compute_size_and_align_nonVTable_indep (vtableLookupM mach)
+            (fun _ => unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata")
+            lay none (fun _ h => by cases h)]
+      | some mval =>
+        cases mval with
+        | VTablePointer _ => rfl
+        | ElementCount c =>
+          dsimp only
+          cases hlay : Type.layout ty with
+          | error _ => rfl
+          | ok lay =>
+            simp only [computeSizeM, Functor.map, Except.map, bind, Except.bind, pure, Except.pure]
+            rw [ep1_compute_size_and_align_nonVTable_indep (vtableLookupM mach)
+              (fun _ => unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata")
+              lay (some (.ElementCount c)) (fun _ h => by cases h)]
+  · unfold evalUnOpM; dsimp only; simp only [bind, Except.bind]
+    cases hdv : PointerMetaKind.decode_valueM (M := M) (Type.meta_kind ty) v with
+    | error _ => rfl
+    | ok pm =>
+      dsimp only
+      cases pm with
+      | none =>
+        dsimp only
+        cases hlay : Type.layout ty with
+        | error _ => rfl
+        | ok lay =>
+          simp only [computeAlignM, Functor.map, Except.map, bind, Except.bind, pure, Except.pure]
+          rw [ep1_compute_size_and_align_nonVTable_indep (vtableLookupM mach)
+            (fun _ => unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata")
+            lay none (fun _ h => by cases h)]
+      | some mval =>
+        cases mval with
+        | VTablePointer _ => rfl
+        | ElementCount c =>
+          dsimp only
+          cases hlay : Type.layout ty with
+          | error _ => rfl
+          | ok lay =>
+            simp only [computeAlignM, Functor.map, Except.map, bind, Except.bind, pure, Except.pure]
+            rw [ep1_compute_size_and_align_nonVTable_indep (vtableLookupM mach)
+              (fun _ => unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata")
+              lay (some (.ElementCount c)) (fun _ h => by cases h)]
+
+/-- Universal specification of `evalUnOpM` on `GetMetadata`, `ComputeSize`,
+`ComputeAlign` (including unsized structs with a slice tail), and fail-closed
+vtable boundaries (`VTablePointer` metadata and `VTableMethodLookup`). -/
+theorem ep1_evalUnOpM_meta_unops_spec {M : Type} [Gen.Memory M] [MemoryOps M]
+    (thin vptr : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (fields : List (Gen.Offset × Gen.Type)) (head : Gen.TupleHeadLayout)
+    (elemTy opTy : Gen.Type) (elemSz elemAlign len : Nat)
+    (badCount : Int) (traitName : Gen.TraitName) (meth : Gen.TraitMethodName)
+    (v : Gen.Value M) (m : Option (Gen.Machine M))
+    (hElemLayout : Type.layout elemTy = .ok (.Sized ⟨elemSz⟩ ⟨elemAlign⟩))
+    (hBadCount : IntType.can_represent IntType.usize_ty badCount = false) :
+    let dstTy : Gen.Type := .Tuple fields head (some (.Slice elemTy))
+    let dstPair := TupleHeadLayout.full_size_and_align head ⟨len * elemSz⟩ ⟨elemAlign⟩
+    evalUnOpM (M := M) .GetMetadata
+        (.Ptr (ThinPointer.widen thin (some (.ElementCount badCount))), .Ptr (.Raw .ElementCount)) m =
+      specPanic "GetMetadata: sanity check, returned meta is well-formed" ∧
+    evalUnOpM (M := M) .GetMetadata (.Int 0, .Ptr (.Raw .None)) m =
+      specPanic "non-pointer GetMetadata" ∧
+    evalUnOpM (M := M) .GetMetadata (.Ptr (ThinPointer.widen thin none), .Ptr (.Raw .ElementCount)) m =
+      specPanic "PointerMeta::encode_as_value called with invalid value" ∧
+    evalUnOpM (M := M) (.ComputeSize dstTy) (.Int (Int.ofNat len), .Int IntType.usize_ty) m =
+      .ok (.Int (dstPair.1.bytes : Int), .Int IntType.usize_ty) ∧
+    evalUnOpM (M := M) (.ComputeAlign dstTy) (.Int (Int.ofNat len), .Int IntType.usize_ty) m =
+      .ok (.Int (dstPair.2.bytes : Int), .Int IntType.usize_ty) ∧
+    evalUnOpM (M := M) (.ComputeSize (.Tuple fields head (some (.TraitObject traitName))))
+        (.Ptr (ThinPointer.widen vptr none), .Ptr (.VTablePtr traitName)) m =
+      unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata" ∧
+    evalUnOpM (M := M) (.ComputeAlign (.Tuple fields head (some (.TraitObject traitName))))
+        (.Ptr (ThinPointer.widen vptr none), .Ptr (.VTablePtr traitName)) m =
+      unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata" ∧
+    evalUnOpM (M := M) (.VTableMethodLookup meth) (v, opTy) m =
+      unsupported "eval_un_op for UnOp::VTableMethodLookup" := by
+  have hDstLayout : Type.layout (.Tuple fields head (some (.Slice elemTy))) =
+      .ok (.Tuple head (.Slice ⟨elemSz⟩ ⟨elemAlign⟩)) := by
+    simp [Type.layout, hElemLayout, LayoutStrategy.expect_size, LayoutStrategy.expect_align,
+      bind, Except.bind, pure, Except.pure]
+  refine ⟨?_, rfl, rfl, ?_, ?_, rfl, rfl, rfl⟩
+  · simp [evalUnOpM, ThinPointer.widen, PtrType.meta_kind, PointerMetaKind.encode_as_valueM,
+      PointerMetaKind.ty, checkValueM, ensureElseUb, hBadCount, ub, bind, Except.bind, pure,
+      Except.pure]
+  · cases m <;>
+      simp [evalUnOpM, Type.meta_kind, PointerMetaKind.decode_valueM, hDstLayout, computeSizeM,
+        LayoutStrategy.compute_size_and_align, Functor.map, Except.map,
+        bind, Except.bind, pure, Except.pure]
+  · cases m <;>
+      simp [evalUnOpM, Type.meta_kind, PointerMetaKind.decode_valueM, hDstLayout, computeAlignM,
+        LayoutStrategy.compute_size_and_align, Functor.map, Except.map,
+        bind, Except.bind, pure, Except.pure]
+
+/-- Universal specification of `PlaceExpr.Downcast` across polymorphic `Machine M`,
+`Mach` ↔ `Machine BM` agreement, and `MachTB.wfLive` preservation. -/
+theorem ep1_evalPlaceM_downcast_spec_and_wfLive {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m m1 : Gen.Machine M) (root : Gen.PlaceExpr) (rp : Gen.Place M) (d : Int) :
+    (∀ variants dty discr sz al var,
+      evalPlaceM m root = .ok ((rp, .Enum variants dty discr sz al), m1) →
+      mapIndex variants d "variants[discriminant]" = .ok var →
+      evalPlaceM m (.Downcast root d) = .ok ((rp, var.ty), m1)) ∧
+    (∀ variants dty discr sz al err,
+      evalPlaceM m root = .ok ((rp, .Enum variants dty discr sz al), m1) →
+      mapIndex variants d "variants[discriminant]" = .error err →
+      evalPlaceM m (.Downcast root d) = .error err) ∧
+    (∀ it,
+      evalPlaceM m root = .ok ((rp, .Int it), m1) →
+      evalPlaceM m (.Downcast root d) = specPanic "enum downcast on non-enum") ∧
+    (∀ (mBM : Mach), evalPlaceM (M := BM) mBM (.Downcast root d) = evalPlace mBM (.Downcast root d)) ∧
+    (∀ (mTB mTB' : MachTB) (out : Gen.Place TBM × Gen.Type),
+      MachTB.wfLive mTB → evalPlaceM mTB (.Downcast root d) = .ok (out, mTB') →
+      MachTB.wfLive mTB') := by
+  refine ⟨?_, ?_, ?_, fun mBM => evalPlaceM_bm_eq mBM (.Downcast root d),
+    fun mTB mTB' out hwf h => evalPlaceM_tb_wfLive (.Downcast root d) hwf h⟩
+  · intro variants dty discr sz al var hroot hidx
+    simp [evalPlaceM, hroot, hidx, bind, Except.bind, pure, Except.pure]
+  · intro variants dty discr sz al err hroot hidx
+    simp [evalPlaceM, hroot, hidx, bind, Except.bind]
+  · intro it hroot
+    simp [evalPlaceM, hroot, specPanic, bind, Except.bind]
+
+/-- Universal specification of `ValueExpr.{Union, Variant, GetDiscriminant}` across
+polymorphic `Machine M`, `Mach` ↔ `Machine BM` agreement, and `MachTB.wfLive`
+preservation. -/
+theorem ep1_evalValueM_union_variant_getDiscriminant_spec_and_wfLive
+    {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m m1 : Gen.Machine M) :
+    (∀ d data enumTy val vty,
+      evalValueM m data = .ok ((val, vty), m1) →
+      evalValueM m (.Variant d data enumTy) = .ok ((.Variant d val, enumTy), m1)) ∧
+    (∀ field expr it,
+      evalValueM m (.Union field expr (.Int it)) = specPanic "ValueExpr::Union requires union type") ∧
+    (∀ field expr fields chunks sz al err,
+      listIndex fields field "fields[field]" = .error err →
+      evalValueM m (.Union field expr (.Union fields chunks sz al)) = .error err) ∧
+    (∀ place rp it,
+      evalPlaceM m place = .ok ((rp, .Int it), m1) →
+      evalValueM m (.GetDiscriminant place) =
+        specPanic "ValueExpr::GetDiscriminant requires enum type") ∧
+    (∀ place rp variants dty discr sz al,
+      evalPlaceM m place = .ok ((rp, .Enum variants dty discr sz al), m1) →
+      rp.aligned = false →
+      evalValueM m (.GetDiscriminant place) =
+        ub "Getting the discriminant of a place based on a misaligned pointer.") ∧
+    (∀ place rp variants dty discrVal sz al,
+      evalPlaceM m place = .ok ((rp, .Enum variants dty (.Known discrVal) sz al), m1) →
+      rp.aligned = true →
+      evalValueM m (.GetDiscriminant place) = .ok ((.Int discrVal, .Int dty), m1)) ∧
+    (∀ place rp variants dty sz al,
+      evalPlaceM m place = .ok ((rp, .Enum variants dty .Invalid sz al), m1) →
+      rp.aligned = true →
+      evalValueM m (.GetDiscriminant place) =
+        ub "ValueExpr::GetDiscriminant encountered invalid discriminant.") ∧
+    (∀ (mBM : Mach) (ve : Gen.ValueExpr), evalValueM (M := BM) mBM ve = evalValue mBM ve) ∧
+    (∀ (mTB mTB' : MachTB) (ve : Gen.ValueExpr) (out : Gen.Value TBM × Gen.Type),
+      MachTB.wfLive mTB → evalValueM mTB ve = .ok (out, mTB') → MachTB.wfLive mTB') := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_,
+    fun mBM ve => evalValueM_bm_eq mBM ve,
+    fun mTB mTB' ve out hwf h => evalValueM_tb_wfLive ve hwf h⟩
+  · intro d data enumTy val vty hd
+    simp [evalValueM, hd, bind, Except.bind, pure, Except.pure]
+  · intro field expr it
+    simp [evalValueM, specPanic, bind, Except.bind]
+  · intro field expr fields chunks sz al err hidx
+    simp [evalValueM, hidx, bind, Except.bind, pure, Except.pure]
+  · intro place rp it hp
+    simp [evalValueM, hp, specPanic, bind, Except.bind]
+  · intro place rp variants dty discr sz al hp hmis
+    simp [evalValueM, hp, hmis, ub, bind, Except.bind]
+  · intro place rp variants dty discrVal sz al hp hal
+    simp [evalValueM, hp, hal, decodeDiscriminantM, bind, Except.bind, pure, Except.pure]
+  · intro place rp variants dty sz al hp hal
+    simp [evalValueM, hp, hal, decodeDiscriminantM, ub, bind, Except.bind, pure, Except.pure]
+
+private def ep1U8 : Gen.IntType := ⟨.Unsigned, ⟨1⟩⟩
+private def ep1U16 : Gen.IntType := ⟨.Unsigned, ⟨2⟩⟩
+private def ep1U32 : Gen.IntType := ⟨.Unsigned, ⟨4⟩⟩
+
+private def ep1EmptyProg : Gen.Program :=
+  { functions := ⟨[]⟩, start := ⟨⟨0⟩⟩, globals := ⟨[]⟩, traits := ⟨[]⟩, vtables := ⟨[]⟩ }
+
+private theorem ep1_bind_ok {α β : Type} {x : Interp α} {f : α → Interp β} {y : β}
+    (h : (x >>= f) = .ok y) : ∃ a, x = .ok a ∧ f a = .ok y := by
+  cases hx : x with
+  | error e => simp [hx, bind, Except.bind] at h
+  | ok a => simp [hx, bind, Except.bind] at h; exact ⟨a, rfl, h⟩
+
+private theorem ep1_pure_ok {α : Type} {a b : α} (h : (pure a : Interp α) = .ok b) : a = b := by
+  simpa [pure, Except.pure] using h
+
+private def ep1Fn (locals : List (Gen.LocalName × Gen.Type)) : Gen.Function :=
+  { locals := ⟨locals⟩, args := [], ret := ⟨⟨0⟩⟩, calling_convention := .Rust,
+    blocks := ⟨[(⟨⟨0⟩⟩, ⟨[], .Unreachable, .Regular⟩)]⟩, start := ⟨⟨0⟩⟩,
+    implicit_writes := false }
+
+private def ep1MachBM (allocs : List (Gen.Allocation Unit Unit))
+    (locals : List (Gen.LocalName × Ptr)) (localTys : List (Gen.LocalName × Gen.Type)) : Mach :=
+  { prog := ep1EmptyProg
+    mem := { memory := { allocations := allocs, _phantom := ⟨⟩ }, accesses := [] }
+    intptrcast := ⟨⟨[]⟩⟩
+    threads := [{ stack := [{ func := ep1Fn localTys, locals := ⟨locals⟩,
+                              stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩,
+                              next_stmt := 0, extra := () }],
+                  state := .Enabled, unwind_payloads := [] }]
+    active_thread := 0
+    synchronized_threads := ⟨[]⟩
+    locks := []
+    global_ptrs := ⟨[]⟩
+    fn_ptrs := ⟨[]⟩
+    vtable_ptrs := ⟨[]⟩
+    stdout := ⟨[]⟩
+    stderr := ⟨[]⟩ }
+
+private def ep1AllocTB (addr : Int) (al : Nat)
+    (bs : List (Gen.AbstractByte Gen.TreeBorrowsProvenance))
+    (children : List Gen.Node := [])
+    (rootPerms : List Gen.Permission := List.replicate bs.length (.Unprot .Unique)) :
+    Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
+  { data := bs, addr := addr, align := ⟨al⟩, kind := .Stack, live := true,
+    extra := { root := { children := children, permissions := rootPerms, «protected» := .No } } }
+
+private def ep1MachTB (allocs : List (Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra))
+    (locals : List (Gen.LocalName × Gen.ThinPointer Gen.TreeBorrowsProvenance))
+    (localTys : List (Gen.LocalName × Gen.Type)) : MachTB :=
+  { prog := ep1EmptyProg
+    mem := { memory := { params := { implicit_writes := false },
+                         mem := { allocations := allocs, _phantom := ⟨⟩ } },
+             accesses := [] }
+    intptrcast := ⟨⟨[]⟩⟩
+    threads := [{ stack := [{ func := ep1Fn localTys, locals := ⟨locals⟩,
+                              stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩,
+                              next_stmt := 0, extra := ⟨[]⟩ }],
+                  state := .Enabled, unwind_payloads := [] }]
+    active_thread := 0
+    synchronized_threads := ⟨[]⟩
+    locks := []
+    global_ptrs := ⟨[]⟩
+    fn_ptrs := ⟨[]⟩
+    vtable_ptrs := ⟨[]⟩
+    stdout := ⟨[]⟩
+    stderr := ⟨[]⟩ }
+
+private def ep1Var0TupleTy : Gen.Type := .Tuple [] ⟨⟨8⟩, ⟨4⟩, none⟩ none
+private def ep1Var1TupleTy : Gen.Type := .Tuple [(⟨4⟩, .Int ep1U32)] ⟨⟨8⟩, ⟨4⟩, none⟩ none
+
+/-- 8-byte align-4 enum: `u8` tag at offset `0`, variant `0` unit, variant `1` with
+`u32` payload at offset `4`. -/
+private def ep1EnumTy : Gen.Type :=
+  let v0 : Gen.Variant := { ty := ep1Var0TupleTy, tagger := ⟨[(⟨0⟩, (ep1U8, 0))]⟩ }
+  let v1 : Gen.Variant := { ty := ep1Var1TupleTy, tagger := ⟨[(⟨0⟩, (ep1U8, 1))]⟩ }
+  let disc : Gen.Discriminator :=
+    .Branch ⟨0⟩ ep1U8 .Invalid ⟨[((0, 1), .Known 0), ((1, 2), .Known 1)]⟩
+  .Enum ⟨[(0, v0), (1, v1)]⟩ ep1U8 disc ⟨8⟩ ⟨4⟩
+
+/-- Concrete kernel-checked witness for `ValueExpr.Variant`, `PlaceExpr.Downcast` +
+`PlaceExpr.Field`, `ValueExpr.GetDiscriminant` (positive roundtrip, partial-read with
+uninit payload vs `Load` UB, uninit tag UB, invalid tag UB, misaligned place UB, and
+missing-variant / non-enum `Downcast` panics) across both `Mach` and `MachTB` (with
+`MachTB.wfLive` preservation). -/
+theorem ep1_enum_variant_downcast_getDiscriminant_witness :
+    let localTys : List (Gen.LocalName × Gen.Type) :=
+      [(⟨⟨0⟩⟩, .Int ep1U32), (⟨⟨1⟩⟩, ep1EnumTy), (⟨⟨2⟩⟩, ep1EnumTy), (⟨⟨3⟩⟩, .Int ep1U32)]
+    let uninit8 {P : Type} : List (Gen.AbstractByte P) := List.replicate 8 .Uninit
+    let badTag8 {P : Type} : List (Gen.AbstractByte P) :=
+      [.Init 5 none, .Uninit, .Uninit, .Uninit, .Init 42 none, .Init 0 none, .Init 0 none, .Init 0 none]
+    let mBM := ep1MachBM
+      [{ data := uninit8, addr := 0x100, align := ⟨4⟩, kind := .Stack, live := true, extra := () },
+       { data := badTag8, addr := 0x200, align := ⟨4⟩, kind := .Stack, live := true, extra := () },
+       { data := List.replicate 4 .Uninit, addr := 0x300, align := ⟨4⟩, kind := .Stack, live := true, extra := () }]
+      [(⟨⟨1⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩), (⟨⟨2⟩⟩, ⟨0x200, some (⟨1⟩, ())⟩),
+       (⟨⟨3⟩⟩, ⟨0x300, some (⟨2⟩, ())⟩)]
+      localTys
+    let mTB := liftMachToTB mBM
+    let var1Expr : Gen.ValueExpr :=
+      .Variant 1 (.Tuple [.Constant (.Int 42) (.Int ep1U32)] ep1Var1TupleTy) ep1EnumTy
+    let payloadPlace : Gen.PlaceExpr := .Field (.Downcast (.Local ⟨⟨1⟩⟩) 1) 0
+    let misalignPlace : Gen.PlaceExpr :=
+      .Deref (.Constant (.PointerWithoutProvenance 0x101) (.Ptr (.Raw .None))) ep1EnumTy
+    let loadUb := "load at type but the data in memory violates the language invariant"
+    let invalidDiscrUb := "ValueExpr::GetDiscriminant encountered invalid discriminant."
+    let misalignDiscrUb := "Getting the discriminant of a place based on a misaligned pointer."
+    -- 1. Mach positive roundtrip: Variant store -> GetDiscriminant -> Downcast+Field load -> Downcast+Field store -> GetDiscriminant + full Load
+    (∃ m1 m2 m3 m4 m5 m6,
+      evalStatement mBM (.Assign (.Local ⟨⟨1⟩⟩) var1Expr) = .ok m1 ∧
+      evalValue m1 (.GetDiscriminant (.Local ⟨⟨1⟩⟩)) = .ok ((.Int 1, .Int ep1U8), m2) ∧
+      evalValue m2 (.Load payloadPlace) = .ok ((.Int 42, .Int ep1U32), m3) ∧
+      evalStatement m3 (.Assign payloadPlace (.Constant (.Int 99) (.Int ep1U32))) = .ok m4 ∧
+      evalValue m4 (.GetDiscriminant (.Local ⟨⟨1⟩⟩)) = .ok ((.Int 1, .Int ep1U8), m5) ∧
+      evalValue m5 (.Load (.Local ⟨⟨1⟩⟩)) =
+        .ok ((.Variant 1 (.Tuple [.Int 99]), ep1EnumTy), m6)) ∧
+    -- 2. MachTB positive roundtrip + MachTB.wfLive preservation
+    (∃ m1 m2 m3 m4 m5 m6,
+      evalStatementM mTB (.Assign (.Local ⟨⟨1⟩⟩) var1Expr) = .ok m1 ∧
+      evalValueM m1 (.GetDiscriminant (.Local ⟨⟨1⟩⟩)) = .ok ((.Int 1, .Int ep1U8), m2) ∧
+      evalValueM m2 (.Load payloadPlace) = .ok ((.Int 42, .Int ep1U32), m3) ∧
+      evalStatementM m3 (.Assign payloadPlace (.Constant (.Int 99) (.Int ep1U32))) = .ok m4 ∧
+      evalValueM m4 (.GetDiscriminant (.Local ⟨⟨1⟩⟩)) = .ok ((.Int 1, .Int ep1U8), m5) ∧
+      evalValueM m5 (.Load (.Local ⟨⟨1⟩⟩)) =
+        .ok ((.Variant 1 (.Tuple [.Int 99]), ep1EnumTy), m6) ∧
+      MachTB.wfLive m6) ∧
+    -- 3. Partial-read guarantee: SetDiscriminant on uninit enum lets GetDiscriminant succeed while Load raises UB
+    (∃ m1 m2,
+      evalStatement mBM (.SetDiscriminant (.Local ⟨⟨1⟩⟩) 1) = .ok m1 ∧
+      evalValue m1 (.GetDiscriminant (.Local ⟨⟨1⟩⟩)) = .ok ((.Int 1, .Int ep1U8), m2) ∧
+      evalValue m1 (.Load (.Local ⟨⟨1⟩⟩)) = .error (.ub loadUb)) ∧
+    (∃ m1 m2,
+      evalStatementM mTB (.SetDiscriminant (.Local ⟨⟨1⟩⟩) 1) = .ok m1 ∧
+      evalValueM m1 (.GetDiscriminant (.Local ⟨⟨1⟩⟩)) = .ok ((.Int 1, .Int ep1U8), m2) ∧
+      evalValueM m1 (.Load (.Local ⟨⟨1⟩⟩)) = .error (.ub loadUb) ∧
+      MachTB.wfLive m2) ∧
+    -- 4. Negative UB & specPanic controls on both Mach and MachTB
+    (evalValue mBM (.GetDiscriminant (.Local ⟨⟨1⟩⟩)) = .error (.ub invalidDiscrUb) ∧
+     evalValueM mTB (.GetDiscriminant (.Local ⟨⟨1⟩⟩)) = .error (.ub invalidDiscrUb) ∧
+     evalValue mBM (.GetDiscriminant (.Local ⟨⟨2⟩⟩)) = .error (.ub invalidDiscrUb) ∧
+     evalValueM mTB (.GetDiscriminant (.Local ⟨⟨2⟩⟩)) = .error (.ub invalidDiscrUb) ∧
+     evalValue mBM (.GetDiscriminant misalignPlace) = .error (.ub misalignDiscrUb) ∧
+     evalValueM mTB (.GetDiscriminant misalignPlace) = .error (.ub misalignDiscrUb) ∧
+     evalPlace mBM (.Downcast (.Local ⟨⟨1⟩⟩) 9) =
+       specPanic "map index: missing key (variants[discriminant])" ∧
+     evalPlaceM mTB (.Downcast (.Local ⟨⟨1⟩⟩) 9) =
+       specPanic "map index: missing key (variants[discriminant])" ∧
+     evalPlace mBM (.Downcast (.Local ⟨⟨3⟩⟩) 0) = specPanic "enum downcast on non-enum" ∧
+     evalPlaceM mTB (.Downcast (.Local ⟨⟨3⟩⟩) 0) = specPanic "enum downcast on non-enum") := by
+  intro localTys uninit8 badTag8 mBM mTB var1Expr payloadPlace misalignPlace loadUb invalidDiscrUb misalignDiscrUb
+  refine ⟨⟨_, _, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl⟩,
+    ?_,
+    ⟨_, _, rfl, rfl, rfl⟩,
+    ⟨_, _, rfl, rfl, rfl, ?_⟩,
+    ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩⟩
+  · let seq : Interp ((Gen.Value TBM × Gen.Type) × (Gen.Value TBM × Gen.Type) ×
+        (Gen.Value TBM × Gen.Type) × (Gen.Value TBM × Gen.Type) × MachTB) := do
+      let m1 ← evalStatementM mTB (.Assign (.Local ⟨⟨1⟩⟩) var1Expr)
+      let (r1, m2) ← evalValueM m1 (.GetDiscriminant (.Local ⟨⟨1⟩⟩))
+      let (r2, m3) ← evalValueM m2 (.Load payloadPlace)
+      let m4 ← evalStatementM m3 (.Assign payloadPlace (.Constant (.Int 99) (.Int ep1U32)))
+      let (r3, m5) ← evalValueM m4 (.GetDiscriminant (.Local ⟨⟨1⟩⟩))
+      let (r4, m6) ← evalValueM m5 (.Load (.Local ⟨⟨1⟩⟩))
+      pure (r1, r2, r3, r4, m6)
+    have hDec :
+        (match seq with
+         | .ok ((.Int 1, .Int ⟨.Unsigned, ⟨1⟩⟩),
+                (.Int 42, .Int ⟨.Unsigned, ⟨4⟩⟩),
+                (.Int 1, .Int ⟨.Unsigned, ⟨1⟩⟩),
+                (.Variant 1 (.Tuple [.Int 99]),
+                 .Enum ⟨[(0, { ty := .Tuple [] ⟨⟨8⟩, ⟨4⟩, none⟩ none,
+                               tagger := ⟨[(⟨0⟩, (⟨.Unsigned, ⟨1⟩⟩, 0))]⟩ }),
+                         (1, { ty := .Tuple [(⟨4⟩, .Int ⟨.Unsigned, ⟨4⟩⟩)] ⟨⟨8⟩, ⟨4⟩, none⟩ none,
+                               tagger := ⟨[(⟨0⟩, (⟨.Unsigned, ⟨1⟩⟩, 1))]⟩ })]⟩
+                   ⟨.Unsigned, ⟨1⟩⟩
+                   (.Branch ⟨0⟩ ⟨.Unsigned, ⟨1⟩⟩ .Invalid ⟨[((0, 1), .Known 0), ((1, 2), .Known 1)]⟩)
+                   ⟨8⟩ ⟨4⟩),
+                _) => true
+         | _ => false) = true := by decide +kernel
+    cases hseq : seq with
+    | error _ => rw [hseq] at hDec; cases hDec
+    | ok res =>
+      rw [hseq] at hDec
+      rcases res with ⟨r1, r2, r3, r4, m6⟩
+      dsimp only [seq] at hseq
+      obtain ⟨m1, hs1, hseq⟩ := ep1_bind_ok hseq
+      obtain ⟨⟨r1', m2⟩, hs2, hseq⟩ := ep1_bind_ok hseq
+      obtain ⟨⟨r2', m3⟩, hs3, hseq⟩ := ep1_bind_ok hseq
+      obtain ⟨m4, hs4, hseq⟩ := ep1_bind_ok hseq
+      obtain ⟨⟨r3', m5⟩, hs5, hseq⟩ := ep1_bind_ok hseq
+      obtain ⟨⟨r4', m6'⟩, hs6, hseq⟩ := ep1_bind_ok hseq
+      have hp := ep1_pure_ok hseq
+      dsimp only at hs1 hs2 hs3 hs4 hs5 hs6 hp
+      simp only [Prod.mk.injEq] at hp
+      rcases hp with ⟨rfl, rfl, rfl, rfl, rfl⟩
+      have hwf0 : MachTB.wfLive mTB := liftMachToTB_wfLive mBM
+      have hwf1 := evalStatementM_tb_wfLive hwf0 hs1
+      have hwf2 := evalValueM_tb_wfLive _ hwf1 hs2
+      have hwf3 := evalValueM_tb_wfLive _ hwf2 hs3
+      have hwf4 := evalStatementM_tb_wfLive hwf3 hs4
+      have hwf5 := evalValueM_tb_wfLive _ hwf4 hs5
+      have hwf6 := evalValueM_tb_wfLive _ hwf5 hs6
+      split at hDec
+      · rename_i _ heq
+        simp only [Except.ok.injEq, Prod.mk.injEq] at heq
+        rcases heq with ⟨hr1, hr2, hr3, hr4, _⟩
+        rw [hr1] at hs2; rw [hr2] at hs3; rw [hr3] at hs5; rw [hr4] at hs6
+        exact ⟨m1, m2, m3, m4, m5, m6', hs1, hs2, hs3, hs4, hs5, hs6, hwf6⟩
+      · cases hDec
+  · have h0 : MachTB.wfLive mTB := liftMachToTB_wfLive mBM
+    have h1 := evalStatementM_tb_wfLive (stmt := .SetDiscriminant (.Local ⟨⟨1⟩⟩) 1) h0 rfl
+    exact evalValueM_tb_wfLive (.GetDiscriminant (.Local ⟨⟨1⟩⟩)) h1 rfl
+
+/-- Byte-exact Tree Borrows read-access witness for `ValueExpr.GetDiscriminant`:
+1. Disabled tag byte `0` on child provenance `[0]`: `GetDiscriminant` succeeds with `1`
+   on `Mach` (`BasicMemory`) but raises Tree Borrows UB on `MachTB`;
+2. Child `[0]` has `.Frozen` on tag bytes `[0..4)` and `.Disabled` on payload bytes
+   `[4..8)`: `GetDiscriminant` succeeds on `MachTB` (touching only byte `0`), whereas
+   `ValueExpr.Load` through the same child raises Tree Borrows UB;
+3. Foreign `GetDiscriminant` read through root `[]` while child `[0]` is `.Unique` on
+   all 8 bytes transitions child `[0]`'s byte `0` to `.Frozen` while leaving bytes
+   `[1..8)` `.Unique` and preserving `MachTB.wfLive`. -/
+theorem ep1_getDiscriminant_tree_borrows_read_access_witness :
+    let enumBytes {P : Type} : List (Gen.AbstractByte P) :=
+      [.Init 1 none, .Uninit, .Uninit, .Uninit, .Init 42 none, .Init 0 none, .Init 0 none, .Init 0 none]
+    let localTys : List (Gen.LocalName × Gen.Type) :=
+      [(⟨⟨0⟩⟩, ep1EnumTy), (⟨⟨1⟩⟩, .Ptr (.Raw .None))]
+    let ptrBytesBM : List Byte := encodePtrBytes (some (⟨0⟩, ())) 0 [0x00, 0x01, 0, 0, 0, 0, 0, 0]
+    let ptrBytesTB : List (Gen.AbstractByte Gen.TreeBorrowsProvenance) :=
+      encodePtrBytesM (M := TBM) (some (⟨0⟩, [0])) 0 [0x00, 0x01, 0, 0, 0, 0, 0, 0]
+    let mBM := ep1MachBM
+      [{ data := enumBytes, addr := 0x100, align := ⟨4⟩, kind := .Stack, live := true, extra := () },
+       { data := ptrBytesBM, addr := 0x200, align := ⟨8⟩, kind := .Stack, live := true, extra := () }]
+      [(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩), (⟨⟨1⟩⟩, ⟨0x200, some (⟨1⟩, ())⟩)]
+      localTys
+    let childDisabledTag : Gen.Node :=
+      { children := [], permissions := List.replicate 8 (.Unprot .Disabled), «protected» := .No }
+    let childDisabledPayload : Gen.Node :=
+      { children := [],
+        permissions := List.replicate 4 (.Unprot .Frozen) ++ List.replicate 4 (.Unprot .Disabled),
+        «protected» := .No }
+    let childUniqueAll : Gen.Node :=
+      { children := [], permissions := List.replicate 8 (.Unprot .Unique), «protected» := .No }
+    let mkTB (child : Gen.Node) : MachTB :=
+      ep1MachTB
+        [ep1AllocTB 0x100 4 enumBytes [child], ep1AllocTB 0x200 8 ptrBytesTB]
+        [(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, [])⟩), (⟨⟨1⟩⟩, ⟨0x200, some (⟨1⟩, [])⟩)]
+        localTys
+    let derefChildPlace : Gen.PlaceExpr := .Deref (.Load (.Local ⟨⟨1⟩⟩)) ep1EnumTy
+    let expectedFrozenTagPerms : List Gen.Permission :=
+      .Unprot .Frozen :: List.replicate 7 (.Unprot .Unique)
+    -- 1. Disabled tag byte: BM succeeds, TB faults with UB
+    (∃ m1, evalValue mBM (.GetDiscriminant derefChildPlace) = .ok ((.Int 1, .Int ep1U8), m1)) ∧
+    (∃ msg, evalValueM (mkTB childDisabledTag) (.GetDiscriminant derefChildPlace) = .error (.ub msg)) ∧
+    -- 2. Disabled payload-only bytes: TB GetDiscriminant succeeds, TB Load faults with UB
+    (∃ m1, evalValueM (mkTB childDisabledPayload) (.GetDiscriminant derefChildPlace) =
+        .ok ((.Int 1, .Int ep1U8), m1)) ∧
+    (∃ msg, evalValueM (mkTB childDisabledPayload) (.Load derefChildPlace) = .error (.ub msg)) ∧
+    -- 3. Foreign GetDiscriminant through root freezes ONLY byte 0 of active child `[0]`
+    (∃ m1,
+      evalValueM (mkTB childUniqueAll) (.GetDiscriminant (.Local ⟨⟨0⟩⟩)) =
+        .ok ((.Int 1, .Int ep1U8), m1) ∧
+      m1.mem.memory.mem.allocations[0]?.bind (fun a => a.extra.root.children[0]?.map (·.permissions)) =
+        some expectedFrozenTagPerms ∧
+      MachTB.wfLive m1) := by
+  intro enumBytes localTys ptrBytesBM ptrBytesTB mBM childDisabledTag childDisabledPayload childUniqueAll mkTB derefChildPlace expectedFrozenTagPerms
+  refine ⟨⟨_, rfl⟩, ⟨_, rfl⟩, ⟨_, rfl⟩, ⟨_, rfl⟩, ⟨_, rfl, rfl, ?_⟩⟩
+  have hwf0 : MachTB.wfLive (mkTB childUniqueAll) := by
+    intro alloc hmem _
+    simp only [mkTB, childUniqueAll, ep1MachTB, ep1AllocTB, List.mem_cons, List.not_mem_nil, or_false] at hmem
+    rcases hmem with rfl | rfl
+    · refine ⟨by decide, fun p hp => by simp at hp; subst hp; rfl,
+        ⟨⟨by decide, fun p hp => by simp at hp; subst hp; rfl, trivial⟩, trivial⟩⟩
+    · exact ⟨by decide, fun p hp => by simp at hp; rcases hp with ⟨_, rfl⟩; rfl, trivial⟩
+  exact evalValueM_tb_wfLive (.GetDiscriminant (.Local ⟨⟨0⟩⟩)) hwf0 rfl
+
+private def ep1UnionTy : Gen.Type :=
+  .Union [(⟨0⟩, .Int ep1U32), (⟨0⟩, .Int ep1U16), (⟨2⟩, .Int ep1U16)] [(⟨0⟩, ⟨4⟩)] ⟨4⟩ ⟨4⟩
+
+private def ep1PaddedUnionTy : Gen.Type :=
+  .Union [(⟨0⟩, .Int ep1U8), (⟨2⟩, .Int ep1U8)] [(⟨0⟩, ⟨1⟩), (⟨2⟩, ⟨1⟩)] ⟨4⟩ ⟨2⟩
+
+/-- Concrete kernel-checked witness for `ValueExpr.Union` construction, store +
+little-endian field punning, partial-field write uninit-punning UB, padded-chunk
+decoding, and pre-evaluation `specPanic` precedence across `Mach` and `MachTB` (with
+`MachTB.wfLive` preservation). -/
+theorem ep1_union_construct_punning_and_errors_witness :
+    let localTys : List (Gen.LocalName × Gen.Type) :=
+      [(⟨⟨0⟩⟩, ep1UnionTy), (⟨⟨1⟩⟩, ep1PaddedUnionTy), (⟨⟨2⟩⟩, .Int ep1U32)]
+    let mBM := ep1MachBM
+      [{ data := List.replicate 4 .Uninit, addr := 0x100, align := ⟨4⟩, kind := .Stack, live := true, extra := () },
+       { data := List.replicate 4 .Uninit, addr := 0x200, align := ⟨2⟩, kind := .Stack, live := true, extra := () }]
+      [(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩), (⟨⟨1⟩⟩, ⟨0x200, some (⟨1⟩, ())⟩)]
+      localTys
+    let mTB := liftMachToTB mBM
+    let u32UnionExpr : Gen.ValueExpr := .Union 0 (.Constant (.Int 0x00020001) (.Int ep1U32)) ep1UnionTy
+    let u16UnionExpr : Gen.ValueExpr := .Union 1 (.Constant (.Int 0x1234) (.Int ep1U16)) ep1UnionTy
+    let padUnionExpr : Gen.ValueExpr := .Union 0 (.Constant (.Int 0xAB) (.Int ep1U8)) ep1PaddedUnionTy
+    let loadUb := "load at type but the data in memory violates the language invariant"
+    -- 1. Mach: u32 write -> u16 punning reads (1 and 2); u16 write -> low ok, u32/high UB; padded union chunks
+    (∃ m1 m2 m3 m4 m5,
+      evalStatement mBM (.Assign (.Local ⟨⟨0⟩⟩) u32UnionExpr) = .ok m1 ∧
+      evalValue m1 (.Load (.Field (.Local ⟨⟨0⟩⟩) 1)) = .ok ((.Int 1, .Int ep1U16), m2) ∧
+      evalValue m2 (.Load (.Field (.Local ⟨⟨0⟩⟩) 2)) = .ok ((.Int 2, .Int ep1U16), m3) ∧
+      evalStatement m3 (.Assign (.Local ⟨⟨0⟩⟩) u16UnionExpr) = .ok m4 ∧
+      evalValue m4 (.Load (.Field (.Local ⟨⟨0⟩⟩) 1)) = .ok ((.Int 0x1234, .Int ep1U16), m5) ∧
+      evalValue m5 (.Load (.Field (.Local ⟨⟨0⟩⟩) 0)) = .error (.ub loadUb) ∧
+      evalValue m5 (.Load (.Field (.Local ⟨⟨0⟩⟩) 2)) = .error (.ub loadUb)) ∧
+    -- 2. MachTB: exact same roundtrip + MachTB.wfLive preservation
+    (∃ m1 m2 m3 m4 m5,
+      evalStatementM mTB (.Assign (.Local ⟨⟨0⟩⟩) u32UnionExpr) = .ok m1 ∧
+      evalValueM m1 (.Load (.Field (.Local ⟨⟨0⟩⟩) 1)) = .ok ((.Int 1, .Int ep1U16), m2) ∧
+      evalValueM m2 (.Load (.Field (.Local ⟨⟨0⟩⟩) 2)) = .ok ((.Int 2, .Int ep1U16), m3) ∧
+      evalStatementM m3 (.Assign (.Local ⟨⟨0⟩⟩) u16UnionExpr) = .ok m4 ∧
+      evalValueM m4 (.Load (.Field (.Local ⟨⟨0⟩⟩) 1)) = .ok ((.Int 0x1234, .Int ep1U16), m5) ∧
+      evalValueM m5 (.Load (.Field (.Local ⟨⟨0⟩⟩) 0)) = .error (.ub loadUb) ∧
+      evalValueM m5 (.Load (.Field (.Local ⟨⟨0⟩⟩) 2)) = .error (.ub loadUb) ∧
+      MachTB.wfLive m5) ∧
+    -- 3. Padded union chunk extraction & pre-evaluation specPanic precedence (before dead local UB)
+    (evalValue mBM padUnionExpr = .ok ((.Union [[.Init 0xAB none], [.Uninit]], ep1PaddedUnionTy), mBM) ∧
+     evalValueM mTB padUnionExpr = .ok ((.Union [[.Init 0xAB none], [.Uninit]], ep1PaddedUnionTy), mTB) ∧
+     evalValue mBM (.Union 99 (.Load (.Local ⟨⟨2⟩⟩)) ep1UnionTy) =
+       specPanic "list index out of range (fields[field])" ∧
+     evalValueM mTB (.Union 99 (.Load (.Local ⟨⟨2⟩⟩)) ep1UnionTy) =
+       specPanic "list index out of range (fields[field])" ∧
+     evalValue mBM (.Union 0 (.Load (.Local ⟨⟨2⟩⟩)) (.Int ep1U32)) =
+       specPanic "ValueExpr::Union requires union type" ∧
+     evalValueM mTB (.Union 0 (.Load (.Local ⟨⟨2⟩⟩)) (.Int ep1U32)) =
+       specPanic "ValueExpr::Union requires union type") := by
+  intro localTys mBM mTB u32UnionExpr u16UnionExpr padUnionExpr loadUb
+  refine ⟨⟨_, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩,
+    ?_,
+    ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩⟩
+  let seq : Interp ((Gen.Value TBM × Gen.Type) × (Gen.Value TBM × Gen.Type) ×
+      (Gen.Value TBM × Gen.Type) × Interp ((Gen.Value TBM × Gen.Type) × MachTB) ×
+      Interp ((Gen.Value TBM × Gen.Type) × MachTB) × MachTB) := do
+    let m1 ← evalStatementM mTB (.Assign (.Local ⟨⟨0⟩⟩) u32UnionExpr)
+    let (r1, m2) ← evalValueM m1 (.Load (.Field (.Local ⟨⟨0⟩⟩) 1))
+    let (r2, m3) ← evalValueM m2 (.Load (.Field (.Local ⟨⟨0⟩⟩) 2))
+    let m4 ← evalStatementM m3 (.Assign (.Local ⟨⟨0⟩⟩) u16UnionExpr)
+    let (r3, m5) ← evalValueM m4 (.Load (.Field (.Local ⟨⟨0⟩⟩) 1))
+    let e0 := evalValueM m5 (.Load (.Field (.Local ⟨⟨0⟩⟩) 0))
+    let e2 := evalValueM m5 (.Load (.Field (.Local ⟨⟨0⟩⟩) 2))
+    pure (r1, r2, r3, e0, e2, m5)
+  have hDec :
+      (match seq with
+       | .ok ((.Int 1, .Int ⟨.Unsigned, ⟨2⟩⟩),
+              (.Int 2, .Int ⟨.Unsigned, ⟨2⟩⟩),
+              (.Int 0x1234, .Int ⟨.Unsigned, ⟨2⟩⟩),
+              .error (.ub msg0),
+              .error (.ub msg2),
+              _) => decide (msg0 = loadUb ∧ msg2 = loadUb)
+       | _ => false) = true := by decide +kernel
+  cases hseq : seq with
+  | error _ => rw [hseq] at hDec; cases hDec
+  | ok res =>
+    rw [hseq] at hDec
+    rcases res with ⟨r1, r2, r3, e0, e2, m5⟩
+    dsimp only [seq] at hseq
+    obtain ⟨m1, hs1, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨⟨r1', m2⟩, hs2, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨⟨r2', m3⟩, hs3, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨m4, hs4, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨⟨r3', m5'⟩, hs5, hseq⟩ := ep1_bind_ok hseq
+    have hp := ep1_pure_ok hseq
+    dsimp only at hs1 hs2 hs3 hs4 hs5 hp
+    simp only [Prod.mk.injEq] at hp
+    rcases hp with ⟨rfl, rfl, rfl, he0, he2, rfl⟩
+    have hwf0 : MachTB.wfLive mTB := liftMachToTB_wfLive mBM
+    have hwf1 := evalStatementM_tb_wfLive hwf0 hs1
+    have hwf2 := evalValueM_tb_wfLive _ hwf1 hs2
+    have hwf3 := evalValueM_tb_wfLive _ hwf2 hs3
+    have hwf4 := evalStatementM_tb_wfLive hwf3 hs4
+    have hwf5 := evalValueM_tb_wfLive _ hwf4 hs5
+    split at hDec
+    · rename_i msg0 msg2 _ heq
+      have ⟨hm0, hm2⟩ := of_decide_eq_true hDec
+      subst hm0; subst hm2
+      simp only [Except.ok.injEq, Prod.mk.injEq] at heq
+      rcases heq with ⟨hr1, hr2, hr3, hhe0, hhe2, _⟩
+      rw [hr1] at hs2; rw [hr2] at hs3; rw [hr3] at hs5
+      rw [hhe0] at he0; rw [hhe2] at he2
+      exact ⟨m1, m2, m3, m4, m5', hs1, hs2, hs3, hs4, hs5, he0, he2, hwf5⟩
+    · cases hDec
+
+/-- Concrete kernel-checked witness for `UnOp.{GetMetadata, ComputeSize, ComputeAlign}`
+on sized types, `[u32]` slices, unsized `(u8, [u32])` and `#[repr(packed(2))] (u8, [u32])`
+structs, negative/invalid-operand `specPanic` controls, and fail-closed `unsupported`
+on vtable metadata and `VTableMethodLookup`, on both `Mach` and `MachTB`. -/
+theorem ep1_meta_unops_unsized_dst_and_errors_witness :
+    let dstStructTy : Gen.Type :=
+      .Tuple [(⟨0⟩, .Int ep1U8)] ⟨⟨1⟩, ⟨1⟩, none⟩ (some (.Slice (.Int ep1U32)))
+    let packedDstTy : Gen.Type :=
+      .Tuple [(⟨0⟩, .Int ep1U8)] ⟨⟨1⟩, ⟨1⟩, some ⟨2⟩⟩ (some (.Slice (.Int ep1U32)))
+    let thinBM : Ptr := ⟨0x1000, none⟩
+    let thinTB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x1000, none⟩
+    let tr : Gen.TraitName := ⟨⟨0⟩⟩
+    let meth : Gen.TraitMethodName := ⟨⟨0⟩⟩
+    -- 1. Unsized & packed DST structs + slice + sized on Mach (m = none)
+    (evalUnOp .GetMetadata (.Ptr (ThinPointer.widen thinBM none), .Ptr (.Raw .None)) none =
+      .ok (.Tuple [], unitType) ∧
+     evalUnOp .GetMetadata (.Ptr (ThinPointer.widen thinBM (some (.ElementCount 5))),
+        .Ptr (.Raw .ElementCount)) none =
+      .ok (.Int 5, .Int IntType.usize_ty) ∧
+     evalUnOp (.ComputeSize (.Int ep1U32)) (.Tuple [], unitType) none =
+      .ok (.Int 4, .Int IntType.usize_ty) ∧
+     evalUnOp (.ComputeAlign (.Int ep1U32)) (.Tuple [], unitType) none =
+      .ok (.Int 4, .Int IntType.usize_ty) ∧
+     evalUnOp (.ComputeSize (.Slice (.Int ep1U32))) (.Int 5, .Int IntType.usize_ty) none =
+      .ok (.Int 20, .Int IntType.usize_ty) ∧
+     evalUnOp (.ComputeAlign (.Slice (.Int ep1U32))) (.Int 5, .Int IntType.usize_ty) none =
+      .ok (.Int 4, .Int IntType.usize_ty) ∧
+     evalUnOp (.ComputeSize dstStructTy) (.Int 3, .Int IntType.usize_ty) none =
+      .ok (.Int 16, .Int IntType.usize_ty) ∧
+     evalUnOp (.ComputeAlign dstStructTy) (.Int 3, .Int IntType.usize_ty) none =
+      .ok (.Int 4, .Int IntType.usize_ty) ∧
+     evalUnOp (.ComputeSize packedDstTy) (.Int 3, .Int IntType.usize_ty) none =
+      .ok (.Int 14, .Int IntType.usize_ty) ∧
+     evalUnOp (.ComputeAlign packedDstTy) (.Int 3, .Int IntType.usize_ty) none =
+      .ok (.Int 2, .Int IntType.usize_ty)) ∧
+    -- 2. Same on MachTB (`evalUnOpM (M := TBM)`)
+    (evalUnOpM (M := TBM) .GetMetadata (.Ptr (ThinPointer.widen thinTB none), .Ptr (.Raw .None)) none =
+      .ok (.Tuple [], unitType) ∧
+     evalUnOpM (M := TBM) .GetMetadata (.Ptr (ThinPointer.widen thinTB (some (.ElementCount 5))),
+        .Ptr (.Raw .ElementCount)) none =
+      .ok (.Int 5, .Int IntType.usize_ty) ∧
+     evalUnOpM (M := TBM) (.ComputeSize dstStructTy) (.Int 3, .Int IntType.usize_ty) none =
+      .ok (.Int 16, .Int IntType.usize_ty) ∧
+     evalUnOpM (M := TBM) (.ComputeAlign dstStructTy) (.Int 3, .Int IntType.usize_ty) none =
+      .ok (.Int 4, .Int IntType.usize_ty) ∧
+     evalUnOpM (M := TBM) (.ComputeSize packedDstTy) (.Int 3, .Int IntType.usize_ty) none =
+      .ok (.Int 14, .Int IntType.usize_ty) ∧
+     evalUnOpM (M := TBM) (.ComputeAlign packedDstTy) (.Int 3, .Int IntType.usize_ty) none =
+      .ok (.Int 2, .Int IntType.usize_ty)) ∧
+    -- 3. Negative specPanic and fail-closed vtable unsupported controls
+    (evalUnOp .GetMetadata (.Int 7, .Int ep1U32) none = specPanic "non-pointer GetMetadata" ∧
+     evalUnOp .GetMetadata (.Ptr (ThinPointer.widen thinBM (some (.ElementCount (-1)))),
+        .Ptr (.Raw .ElementCount)) none =
+       specPanic "GetMetadata: sanity check, returned meta is well-formed" ∧
+     evalUnOp (.ComputeSize (.Slice (.Int ep1U32))) (.Int (-1), .Int IntType.usize_ty) none =
+       specPanic "Size::from_bytes(count * elem_size.bytes()).unwrap()" ∧
+     evalUnOp (.ComputeSize (.Int ep1U32)) (.Int 0, .Int ep1U32) none =
+       specPanic "PointerMeta::decode_value called with invalid value" ∧
+     evalUnOp .GetMetadata (.Ptr (ThinPointer.widen thinBM (some (.VTablePointer thinBM))),
+        .Ptr (.Raw (.VTablePointer tr))) none =
+       unsupported "eval_un_op UnOp::GetMetadata for vtable pointer metadata" ∧
+     evalUnOp (.ComputeSize (.TraitObject tr)) (.Ptr (ThinPointer.widen thinBM none),
+        .Ptr (.VTablePtr tr)) none =
+       unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata" ∧
+     evalUnOp (.ComputeAlign (.TraitObject tr)) (.Ptr (ThinPointer.widen thinBM none),
+        .Ptr (.VTablePtr tr)) none =
+       unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata" ∧
+     evalUnOp (.VTableMethodLookup meth) (.Ptr (ThinPointer.widen thinBM none),
+        .Ptr (.VTablePtr tr)) none =
+       unsupported "eval_un_op for UnOp::VTableMethodLookup" ∧
+     evalUnOpM (M := TBM) .GetMetadata (.Ptr (ThinPointer.widen thinTB (some (.VTablePointer thinTB))),
+        .Ptr (.Raw (.VTablePointer tr))) none =
+       unsupported "eval_un_op UnOp::GetMetadata for vtable pointer metadata" ∧
+     evalUnOpM (M := TBM) (.VTableMethodLookup meth) (.Ptr (ThinPointer.widen thinTB none),
+        .Ptr (.VTablePtr tr)) none =
+       unsupported "eval_un_op for UnOp::VTableMethodLookup") :=
+  ⟨⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩,
+   ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩,
+   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩⟩
+
+#check_theorem_deps "[EP1-EXPR-AUDIT]"
+  ep1_type_meta_kind_eq_layout_meta_kind
+  ep1_evalUnOpM_computeSize_computeAlign_mach_indep
+  ep1_evalUnOpM_meta_unops_spec
+  ep1_evalPlaceM_downcast_spec_and_wfLive
+  ep1_evalValueM_union_variant_getDiscriminant_spec_and_wfLive
+  ep1_enum_variant_downcast_getDiscriminant_witness
+  ep1_getDiscriminant_tree_borrows_read_access_witness
+  ep1_union_construct_punning_and_errors_witness
+  ep1_meta_unops_unsized_dst_and_errors_witness
+
+/-- Verify that every newly added or modified executable `Interp` definition in
+Episode 1 is strictly computable (`Classical.choice`-free, `sorryAx`-free, and
+`Lean.ofReduceBool`-free). -/
+elab "#assert_ep1_interp_no_choice" : command => do
+  let targets : Array Lean.Name := #[
+    ``MiniRustSpec.Interp.Type.meta_kind,
+    ``MiniRustSpec.Interp.PointerMetaKind.ty,
+    ``MiniRustSpec.Interp.evalUnOp,
+    ``MiniRustSpec.Interp.evalUnOpM,
+    ``MiniRustSpec.Interp.evalPlace,
+    ``MiniRustSpec.Interp.evalPlaceM,
+    ``MiniRustSpec.Interp.evalValue,
+    ``MiniRustSpec.Interp.evalValueM
+  ]
+  for c in targets do
+    let axs ← liftCoreM <| Lean.collectAxioms c
+    for a in axs do
+      unless a == ``propext || a == ``Quot.sound do
+        throwError "[EP1-INTERP-COMPUTABLE] {c} depends on non-computable or non-standard axiom {a}"
+  logInfo m!"[EP1-INTERP-COMPUTABLE] verified {targets.size} Interp defs are Classical.choice-free"
+
+#assert_ep1_interp_no_choice
+
+end Ep1ExprAndMetaUnOpAudit
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment — as well as every declaration

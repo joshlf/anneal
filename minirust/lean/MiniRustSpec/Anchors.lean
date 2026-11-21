@@ -176,6 +176,10 @@ def anchors : List Anchor := [
     file := "spec/lang/representation.md", items := MiniRustSpec.Gen.Items.Lang.Representation.items,
     name := "impl_Machine__transmute", line := 788,
     tokenSha256 := "c38b1df79341aa42f078869af8ee4b2e17946dd8fc82b2a17ef95bfdc7801306" },
+  { interp := [``MiniRustSpec.Interp.evalValue, ``MiniRustSpec.Interp.evalValueM],
+    file := "spec/lang/step/expressions.md", items := MiniRustSpec.Gen.Items.Lang.Step.Expressions.items,
+    name := "impl_Machine__eval_value_0", line := 17,
+    tokenSha256 := "94bba638fd72303c49a31a13e3eaca00c4a68be47015acf95161bae5a1fed1fb" },
   { interp := [``MiniRustSpec.Interp.evalConstant, ``MiniRustSpec.Interp.evalValue,
       ``MiniRustSpec.Interp.evalConstantM, ``MiniRustSpec.Interp.evalValueM],
     file := "spec/lang/step/expressions.md", items := MiniRustSpec.Gen.Items.Lang.Step.Expressions.items,
@@ -186,6 +190,18 @@ def anchors : List Anchor := [
     file := "spec/lang/step/expressions.md", items := MiniRustSpec.Gen.Items.Lang.Step.Expressions.items,
     name := "impl_Machine__eval_value_1", line := 68,
     tokenSha256 := "70ec0b5857334f8c47e283a18eff8842ae603b20ad739a41f9eaeec5aa622b76" },
+  { interp := [``MiniRustSpec.Interp.evalValue, ``MiniRustSpec.Interp.evalValueM],
+    file := "spec/lang/step/expressions.md", items := MiniRustSpec.Gen.Items.Lang.Step.Expressions.items,
+    name := "impl_Machine__eval_value_2", line := 79,
+    tokenSha256 := "98f306bcf4d0dcf60678154b73f28ff2f0e499666e312f94a6131ed80179a4c5" },
+  { interp := [``MiniRustSpec.Interp.evalValue, ``MiniRustSpec.Interp.evalValueM],
+    file := "spec/lang/step/expressions.md", items := MiniRustSpec.Gen.Items.Lang.Step.Expressions.items,
+    name := "impl_Machine__eval_value_3", line := 94,
+    tokenSha256 := "4789cec43a85dcac465f8716a3ea688cb0255fe2a90f415fa408269999e238af" },
+  { interp := [``MiniRustSpec.Interp.evalValue, ``MiniRustSpec.Interp.evalValueM],
+    file := "spec/lang/step/expressions.md", items := MiniRustSpec.Gen.Items.Lang.Step.Expressions.items,
+    name := "impl_Machine__eval_value_4", line := 105,
+    tokenSha256 := "761a67cd73c23887120ea739b88f8d478df5cbb5ef88400e4b5b09852402a202" },
   { interp := [``MiniRustSpec.Interp.placeLoad, ``MiniRustSpec.Interp.evalValue,
       ``MiniRustSpec.Interp.placeLoadM, ``MiniRustSpec.Interp.evalValueM],
     file := "spec/lang/step/expressions.md", items := MiniRustSpec.Gen.Items.Lang.Step.Expressions.items,
@@ -195,6 +211,10 @@ def anchors : List Anchor := [
     file := "spec/lang/step/expressions.md", items := MiniRustSpec.Gen.Items.Lang.Step.Expressions.items,
     name := "impl_Machine__eval_value_6", line := 186,
     tokenSha256 := "4793fa0f7bd635890ad9b7916a959cac72a0df67faf4b09f02e98608807b7a3a" },
+  { interp := [``MiniRustSpec.Interp.evalPlace, ``MiniRustSpec.Interp.evalPlaceM],
+    file := "spec/lang/step/expressions.md", items := MiniRustSpec.Gen.Items.Lang.Step.Expressions.items,
+    name := "impl_Machine__eval_place_0", line := 211,
+    tokenSha256 := "7642a0b5418760da4b931b972824a3be02dcc10c08503ea3e6c0d2b1859fbec9" },
   { interp := [``MiniRustSpec.Interp.evalPlace, ``MiniRustSpec.Interp.evalPlaceM],
     file := "spec/lang/step/expressions.md", items := MiniRustSpec.Gen.Items.Lang.Step.Expressions.items,
     name := "impl_Machine__eval_place_1", line := 227,
@@ -314,7 +334,7 @@ def anchors : List Anchor := [
     file := "spec/lang/types.md", items := MiniRustSpec.Gen.Items.Lang.Types.items,
     name := "impl_IntType__align", line := 138,
     tokenSha256 := "7fe63ee221d67adfee70c4048a1ec290c95d557d77cc0c8bbec2df68ce95041a" },
-  { interp := [``MiniRustSpec.Interp.Type.layout],
+  { interp := [``MiniRustSpec.Interp.Type.layout, ``MiniRustSpec.Interp.Type.meta_kind],
     file := "spec/lang/types.md", items := MiniRustSpec.Gen.Items.Lang.Types.items,
     name := "impl_Type__layout", line := 148,
     tokenSha256 := "682e0cbfbea24b480557a76f0b8f41b2d286f604a8f6d0b26df81a02fa15cfcd" },
@@ -431,8 +451,8 @@ def anchors : List Anchor := [
     file := "spec/lang/representation.md", items := MiniRustSpec.Gen.Items.Lang.Representation.items,
     name := "fn_encode_ptr", line := 135,
     tokenSha256 := "015846ad4f5b1cd9e67cc094b56a16452a139a43044dfeee1a081737130fab88" },
-  { interp := [``MiniRustSpec.Interp.PtrType.as_wide_pair, ``MiniRustSpec.Interp.decodeMetaField,
-      ``MiniRustSpec.Interp.decodeMetaFieldM],
+  { interp := [``MiniRustSpec.Interp.PointerMetaKind.ty, ``MiniRustSpec.Interp.PtrType.as_wide_pair,
+      ``MiniRustSpec.Interp.decodeMetaField, ``MiniRustSpec.Interp.decodeMetaFieldM],
     file := "spec/lang/representation.md", items := MiniRustSpec.Gen.Items.Lang.Representation.items,
     name := "impl_PointerMetaKind__ty", line := 144,
     tokenSha256 := "0ab3da4c096cda23747507e6bbabb0ffc41b95878381acfbce4cbb5af3c3603f" },
@@ -468,6 +488,10 @@ def anchors : List Anchor := [
     file := "spec/lang/step/operators.md", items := MiniRustSpec.Gen.Items.Lang.Step.Operators.items,
     name := "impl_Machine__eval_un_op_1", line := 105,
     tokenSha256 := "4b04a40c487570eb8d2bf843a7d72369d19277fcf1f670de0b07c84a42557da0" },
+  { interp := [``MiniRustSpec.Interp.evalUnOp, ``MiniRustSpec.Interp.evalUnOpM],
+    file := "spec/lang/step/operators.md", items := MiniRustSpec.Gen.Items.Lang.Step.Operators.items,
+    name := "impl_Machine__eval_un_op_2", line := 130,
+    tokenSha256 := "2aaff5e02384e1fe1477d29115b70b5d83b0a62013dd8d4305753bf376065d5c" },
   { interp := [``MiniRustSpec.Interp.PtrType.safe_pointee, ``MiniRustSpec.Interp.PtrType.meta_kind],
     file := "spec/mem/pointer.md", items := MiniRustSpec.Gen.Items.Mem.Pointer.items,
     name := "impl_PtrType__safe_pointee", line := 176,
@@ -664,8 +688,10 @@ def anchors : List Anchor := [
     tokenSha256 := "e17e3fd080999bbde34565984f414643765dc083c196f391d85b9a563c2aef51" }
 ]
 
+set_option maxRecDepth 4000 in
 theorem anchors_ok : anchors.all Anchor.ok = true := by decide
 
+set_option maxRecDepth 4000 in
 theorem anchors_nodup :
     decide ((anchors.map (fun a => (a.file, a.name, a.line))).Nodup) = true := by decide
 
