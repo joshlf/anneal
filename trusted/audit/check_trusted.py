@@ -1005,8 +1005,11 @@ class Checker:
     def audit_olean_request(self, request: dict) -> dict:
         """`--audit-olean`: audit caller-supplied compiled modules with the trust-gating policy.
 
-        Call after `tool_admission()`. `request` names `roots` and the exact non-toolchain
-        `modules`, their `artifacts` (`[[module, [[olean parts], [ir parts]]], ...]`) and
+        Call after `tool_admission()` (and after `run()` when the audited modules import
+        `Trusted`: the checker's own audited `Trusted` artifacts are then added to the roots and
+        modules; callers can neither supply nor name `Trusted` modules). `request` names `roots`
+        and the exact other non-toolchain `modules`, their `artifacts`
+        (`[[module, [[olean parts], [ir parts]]], ...]`) and
         optionally `graph`, `localAxiomModules`, `claimModules`, `statementForbidden`,
         `statementUnfold`, `sources` and `scope`. Provisional native evaluation and extra
         toolchain roots cannot be requested here."""
@@ -1025,6 +1028,21 @@ class Checker:
                 "malformed --audit-olean field modules")
         artifacts = request["artifacts"]
         require(isinstance(artifacts, list), phase, "malformed --audit-olean artifacts")
+        # `Trusted` modules are compiled from the checkout by this checker (`run()`), never taken
+        # from the caller: a caller-supplied `Trusted` could redefine `VerificationResult`.
+        trusted_names = set(getattr(self, "modules", {}))
+
+        def is_trusted_name(name: str) -> bool:
+            return name in trusted_names or name == "Trusted" or name.startswith("Trusted.")
+
+        named = [*request["roots"], *request["modules"],
+                 *(e[0] for e in artifacts if isinstance(e, list) and e and isinstance(e[0], str)),
+                 *(request.get("graph", {}) if isinstance(request.get("graph"), dict) else {})]
+        spoofed = sorted({n for n in named if is_trusted_name(n)})
+        if spoofed:
+            raise Failure(1, phase, f"[moduleProvenanceSpoofed] --audit-olean cannot supply or name Trusted modules "
+                                    f"({', '.join(spoofed)}); they come from the checker's own compilation")
+        compiled_trusted = [m for m in getattr(self, "modules", {}) if m in self.artifacts]
         for entry in artifacts:
             require(isinstance(entry, list) and len(entry) == 2 and isinstance(entry[0], str) and bool(entry[0])
                     and entry[0] not in self.artifacts and isinstance(entry[1], list) and len(entry[1]) == 2
@@ -1059,7 +1077,8 @@ class Checker:
         scope = request.get("scope", "request")
         require(isinstance(scope, str) and bool(scope), phase, "malformed --audit-olean scope")
         return self.olean_audit(
-            "olean-audit", scope=scope, roots=request["roots"], modules=request["modules"],
+            "olean-audit", scope=scope, roots=[*request["roots"], *compiled_trusted],
+            modules=[*request["modules"], *compiled_trusted],
             graph=merged_graph,
             localAxiomModules=request.get("localAxiomModules", []),
             claimModules=request.get("claimModules", []),
@@ -5665,7 +5684,9 @@ def _main() -> int:
             print(f"Trusted check failed (admission): {error}", file=sys.stderr)
             return error.code if isinstance(error, Failure) else 2
         try:
-            olean_checker.tool_admission()
+            # Compile and audit `Trusted` from the checkout first: requests are audited against
+            # the checker's own `Trusted` artifacts, never caller-supplied ones.
+            olean_checker.run()
             verdict = olean_checker.audit_olean_request(request)
             olean_checker.freshness()
         except (Failure, OSError, ValueError, KeyError, TypeError) as error:

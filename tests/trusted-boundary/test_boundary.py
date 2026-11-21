@@ -957,6 +957,23 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         sym_parent.unlink()
         expect_failure(lambda: ol.olean_audit("olean-audit", scope="fixture", roots=["Init.Prelude"], modules=[]),
                        1, "olean-audit", "no audited modules")
+        # A caller can neither supply nor name `Trusted` modules: a forged `Trusted` redefining
+        # `VerificationResult` would otherwise make any claim audit clean.
+        for spoof in ({"roots": ["OlClean"], "modules": ["OlClean", "Trusted"], "artifacts": []},
+                      {"roots": ["Trusted.Fake"], "modules": ["Trusted.Fake"],
+                       "artifacts": [["Trusted.Fake", clean_parts]]}):
+            expect_failure(lambda: ol.audit_olean_request(spoof), 1, "olean-audit",
+                           "moduleProvenanceSpoofed", "Trusted modules")
+        # After `run()`, requests are audited together with the checker's own `Trusted` artifacts.
+        api_ol = runner.Checker(fixture(header + "def VerificationResult (p : Prop) : Prop := p\n"), lean,
+                                temp_parent=suite)
+        disposable.append(api_ol.stage)
+        api_ol.run()
+        olean_module(api_ol, "OlApiClaim", "prelude\nimport Trusted\n"
+                     "theorem verified : VerificationResult True := True.intro\n", ["Trusted"])
+        api_claim = api_ol.audit_olean_request({"roots": ["OlApiClaim"], "modules": ["OlApiClaim"], "artifacts": [],
+                                                "graph": {"OlApiClaim": api_ol.graph["OlApiClaim"]}})
+        assert api_claim["modules"] == ["OlApiClaim", "Trusted"] and api_claim["replay"] is True, api_claim
         expect_failure(lambda: ol.audit_olean_request({"roots": ["OlClean"], "modules": ["OlClean"], "artifacts": [],
                                                        "allowProvisionalNative": True}),
                        2, "olean-audit", "malformed --audit-olean request")
