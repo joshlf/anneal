@@ -2394,10 +2394,14 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
     for tok in toks do
       if forbiddenSourceIdentifier tok then
         report "sourceForbiddenIdentifier" tok.toName m "user identifiers must not mention _unsafe_rec"
-    -- Fail closed if the source declares custom `interpolatedStr` syntax (which could introduce
-    -- non-`!` interpolation delimiters) and `_unsafe_rec` appears anywhere outside comments.
-    if toks.contains "interpolatedStr" && forbiddenSourceIdentifier (stripComments text) then
-      report "sourceForbiddenIdentifier" m m "custom interpolatedStr source mentions _unsafe_rec outside comments"
+    -- Second, independent layer that guesses nothing about strings: `_unsafe_rec` anywhere outside
+    -- comments (string literals included) is rejected. Deciding which `"` opens an interpolated
+    -- string needs Lean's parser (`panic! "{"` is a plain string, `s! "{"` is not), so the
+    -- string-aware token scan can be desynchronized; this string-unaware pass cannot. A string
+    -- containing `--` or `/-` only makes it treat more text as a comment, and that text is
+    -- still covered by the token scan, so an identifier is missed only if both layers miss it.
+    if forbiddenSourceIdentifier (stripComments text) then
+      report "sourceForbiddenIdentifier" m m "_unsafe_rec appears outside comments"
   -- Kernel replay of every non-toolchain declaration on the toolchain-only environment.
   let baseRoots := env.header.modules.filterMap fun (m : EffectiveImport) =>
     if toolchainProv.contains m.module then some m.module else none

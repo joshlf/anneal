@@ -1507,6 +1507,14 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         olean_module(ol, "OlInterpSpace", interp_space_src, ["Init"])
         olean_reject(ol, ["OlInterpSpace"], "[sourceForbiddenIdentifier] my_unsafe_rec",
                      sources=[("OlInterpSpace", str(ol.stage / "olean-src/OlInterpSpace.lean"))])
+        # `panic! "{"` is a plain string, but `<ident>!` makes the token scan read it as an
+        # interpolated one; with quotes balanced by a trailing comment the scan stays "balanced"
+        # while missing the local identifier. The string-unaware pass still sees it.
+        panic_src = ("prelude\nimport Init\ndef panicS : String := panic! \"{\"\n"
+                     "def panicHidden : Nat := let my_unsafe_rec := 1; my_unsafe_rec -- \"}\"\n")
+        olean_module(ol, "OlPanicString", panic_src, ["Init"])
+        olean_reject(ol, ["OlPanicString"], "[sourceForbiddenIdentifier] OlPanicString", "outside comments",
+                     sources=[("OlPanicString", str(ol.stage / "olean-src/OlPanicString.lean"))])
         runner.make_tree_writable(ol.stage)
         shutil.rmtree(ol.stage)
         done("pure Lean 4 hardcoded compiler-intrinsic and toolchain-owned name spoofing, raw/bang-string source scan")
