@@ -709,12 +709,30 @@ class Checker:
         if mode in ("audit", "downstream-audit", *OLEAN_AUDIT_MODES):
             if mode in OLEAN_AUDIT_MODES:
                 # Never satisfy an OleanEnvAuditor audit from cache if any artifact or source path
-                # is non-canonical or traverses a symlink: let the auditor run and reject it.
-                for mod in self.artifacts:
-                    for group in self.artifacts[mod]:
-                        for p in group:
-                            if not _canonical_regular(Path(p)):
-                                return None
+                # is non-canonical, splits base directories, mismatches its module path, swaps
+                # olean/IR groups, or omits an on-disk companion: let the auditor run and reject it.
+                for mod, groups in self.artifacts.items():
+                    if not isinstance(groups, list) or len(groups) != 2:
+                        return None
+                    olean_parts, ir_parts = groups
+                    if len(olean_parts) not in (1, 3) or len(ir_parts) not in (0, 2):
+                        return None
+                    rel_suffix = "/" + mod.replace(".", "/") + ".olean"
+                    if not isinstance(olean_parts[0], str) or not olean_parts[0].endswith(rel_suffix):
+                        return None
+                    base = olean_parts[0][:-6]
+                    expected_olean = PARTS[:3] if len(olean_parts) == 3 else PARTS[:1]
+                    for p, ext in zip(olean_parts, expected_olean):
+                        if p != f"{base}.{ext}" or not _canonical_regular(Path(p)):
+                            return None
+                    for p, ext in zip(ir_parts, PARTS[3:]):
+                        if p != f"{base}.{ext}" or not _canonical_regular(Path(p)):
+                            return None
+                    listed = set(olean_parts) | set(ir_parts)
+                    for ext in PARTS:
+                        cand = Path(f"{base}.{ext}")
+                        if str(cand) not in listed and (cand.exists() or cand.is_symlink()):
+                            return None
                 for _, p in fields.get("sources", []):
                     if not _canonical_regular(Path(p)):
                         return None
@@ -722,17 +740,28 @@ class Checker:
                 fields = {**fields, "sources": [(m, digest(Path(p))) for m, p in fields.get("sources", [])]}
                 inspector_sha = {"trustedBoundary": inspector_sha,
                                  "oleanEnvAuditor": getattr(self, "olean_auditor_hash", None)}
-            artifact_hashes = [
-                (
-                    mod,
-                    [
-                        (Path(p).name, self.expected_artifacts.get(p) or digest(Path(p)))
-                        for group in self.artifacts[mod]
-                        for p in group
-                    ],
-                )
-                for mod in sorted(self.artifacts)
-            ]
+                artifact_hashes = [
+                    (
+                        mod,
+                        [
+                            [(Path(p).name, digest(Path(p))) for p in group]
+                            for group in self.artifacts[mod]
+                        ],
+                    )
+                    for mod in sorted(self.artifacts)
+                ]
+            else:
+                artifact_hashes = [
+                    (
+                        mod,
+                        [
+                            (Path(p).name, self.expected_artifacts.get(p) or digest(Path(p)))
+                            for group in self.artifacts[mod]
+                            for p in group
+                        ],
+                    )
+                    for mod in sorted(self.artifacts)
+                ]
             return fingerprint({
                 "schema": 1,
                 "mode": mode,
@@ -1036,25 +1065,28 @@ class Checker:
             return name in trusted_names or name == "Trusted" or name.startswith("Trusted.")
 
         named = [*request["roots"], *request["modules"],
+                 *request.get("localAxiomModules", []), *request.get("claimModules", []),
                  *(e[0] for e in artifacts if isinstance(e, list) and e and isinstance(e[0], str)),
+                 *(s[0] for s in (request.get("sources") if isinstance(request.get("sources"), list) else [])
+                   if isinstance(s, list) and s and isinstance(s[0], str)),
                  *(request.get("graph", {}) if isinstance(request.get("graph"), dict) else {})]
         spoofed = sorted({n for n in named if is_trusted_name(n)})
         if spoofed:
             raise Failure(1, phase, f"[moduleProvenanceSpoofed] --audit-olean cannot supply or name Trusted modules "
                                     f"({', '.join(spoofed)}); they come from the checker's own compilation")
-        compiled_trusted = [m for m in getattr(self, "modules", {}) if m in self.artifacts]
-        for entry in artifacts:
-            require(isinstance(entry, list) and len(entry) == 2 and isinstance(entry[0], str) and bool(entry[0])
-                    and entry[0] not in self.artifacts and isinstance(entry[1], list) and len(entry[1]) == 2
-                    and all(isinstance(g, list) and all(isinstance(p, str) and os.path.isabs(p) for p in g)
-                            for g in entry[1]), phase, "malformed --audit-olean artifact entry")
-            for group in entry[1]:
-                for path in group:
-                    regular(Path(path), phase)
-                    if not _canonical_regular(Path(path)):
-                        raise Failure(1, phase, f"[moduleProvenanceSpoofed] non-canonical artifact path: {path}")
-                    self.expected_artifacts[path] = digest(Path(path))
-            self.artifacts[entry[0]] = [list(entry[1][0]), list(entry[1][1])]
+        sources = request.get("sources", [])
+        require(isinstance(sources, list) and all(
+            isinstance(s, list) and len(s) == 2 and all(isinstance(x, str) and x for x in s) for s in sources)
+            and len({s[0] for s in sources}) == len(sources),
+            phase, "malformed --audit-olean sources")
+        source_hashes: dict[str, str] = {}
+        for _, path in sources:
+            regular(Path(path), phase)
+            if not _canonical_regular(Path(path)):
+                raise Failure(1, phase, f"[moduleProvenanceSpoofed] non-canonical source path: {path}")
+            source_hashes[path] = digest(Path(path))
+        scope = request.get("scope", "request")
+        require(isinstance(scope, str) and bool(scope), phase, "malformed --audit-olean scope")
         if "graph" in request:
             graph = request["graph"]
             require(valid_graph(graph), phase, "malformed --audit-olean graph")
@@ -1062,29 +1094,48 @@ class Checker:
                 if mod in self.foundation and edges != self.lock["graph"].get(mod):
                     raise Failure(1, phase, f"[graphMismatch] --audit-olean cannot override locked foundation DAG for {mod}")
             merged_graph: dict | None = {**self.graph, **graph}
-            self.graph = merged_graph
         else:
             merged_graph = None
-        sources = request.get("sources", [])
-        require(isinstance(sources, list) and all(
-            isinstance(s, list) and len(s) == 2 and all(isinstance(x, str) and x for x in s) for s in sources)
-            and len({s[0] for s in sources}) == len(sources),
-            phase, "malformed --audit-olean sources")
-        for _, path in sources:
-            regular(Path(path), phase)
-            if not _canonical_regular(Path(path)):
-                raise Failure(1, phase, f"[moduleProvenanceSpoofed] non-canonical source path: {path}")
-        scope = request.get("scope", "request")
-        require(isinstance(scope, str) and bool(scope), phase, "malformed --audit-olean scope")
-        return self.olean_audit(
-            "olean-audit", scope=scope, roots=[*request["roots"], *compiled_trusted],
-            modules=[*request["modules"], *compiled_trusted],
-            graph=merged_graph,
-            localAxiomModules=request.get("localAxiomModules", []),
-            claimModules=request.get("claimModules", []),
-            statementForbidden=request.get("statementForbidden", []),
-            statementUnfold=request.get("statementUnfold", []),
-            sources=[tuple(s) for s in sources])
+        compiled_trusted = [m for m in getattr(self, "modules", {}) if m in self.artifacts]
+        saved_artifacts = dict(self.artifacts)
+        saved_expected = dict(self.expected_artifacts)
+        saved_graph = dict(self.graph)
+        caller_hashes: dict[str, str] = {}
+        try:
+            for entry in artifacts:
+                require(isinstance(entry, list) and len(entry) == 2 and isinstance(entry[0], str) and bool(entry[0])
+                        and entry[0] not in self.artifacts and isinstance(entry[1], list) and len(entry[1]) == 2
+                        and all(isinstance(g, list) and all(isinstance(p, str) and os.path.isabs(p) for p in g)
+                                for g in entry[1]), phase, "malformed --audit-olean artifact entry")
+                for group in entry[1]:
+                    for path in group:
+                        regular(Path(path), phase)
+                        if not _canonical_regular(Path(path)):
+                            raise Failure(1, phase, f"[moduleProvenanceSpoofed] non-canonical artifact path: {path}")
+                        h = digest(Path(path))
+                        self.expected_artifacts[path] = h
+                        caller_hashes[path] = h
+                self.artifacts[entry[0]] = [list(entry[1][0]), list(entry[1][1])]
+            if merged_graph is not None:
+                self.graph = merged_graph
+            verdict = self.olean_audit(
+                "olean-audit", scope=scope, roots=[*request["roots"], *compiled_trusted],
+                modules=[*request["modules"], *compiled_trusted],
+                graph=merged_graph,
+                localAxiomModules=request.get("localAxiomModules", []),
+                claimModules=request.get("claimModules", []),
+                statementForbidden=request.get("statementForbidden", []),
+                statementUnfold=request.get("statementUnfold", []),
+                sources=[tuple(s) for s in sources])
+            for path, expected in (*caller_hashes.items(), *source_hashes.items()):
+                regular(Path(path), "freshness")
+                if digest(Path(path)) != expected:
+                    raise Failure(2, "freshness", f"caller input changed during check: {path}")
+            return verdict
+        finally:
+            self.artifacts = saved_artifacts
+            self.expected_artifacts = saved_expected
+            self.graph = saved_graph
 
     def tool_admission(self) -> None:
         # The root manifest is verified before any Lean child runs.
@@ -5508,7 +5559,8 @@ def verify_root_manifest(checkout: Path) -> dict[str, str] | None:
     """
     phase = ROOT_MANIFEST_PHASE
     manifest = checkout / ROOT_MANIFEST
-    has_markers = (checkout / "flake.nix").exists() and (checkout / "lakefile.toml").exists()
+    has_markers = any((checkout / m).exists() or (checkout / m).is_symlink()
+                      for m in ("flake.nix", "lakefile.toml"))
     if not (manifest.exists() or manifest.is_symlink()):
         if has_markers:
             raise Failure(1, phase, f"missing {ROOT_MANIFEST} in a repository checkout")

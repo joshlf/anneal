@@ -953,27 +953,89 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "artifacts": [["OlClean", clean_parts]],
             "graph": {"Init.Prelude": [{"module": "Fake", "importAll": False, "isExported": True, "isMeta": False}]},
         }), 1, "olean-audit", "locked foundation DAG")
+        # `--fast` cache must never return a hit when an artifact path mismatches its module name
+        # (even with identical basename and bytes), omits an on-disk companion, swaps olean/IR
+        # slots, or splits companion base directories.
+        olean_module(ol, "OlSub.Mod", "prelude\nimport Init.Prelude\ndef x : Nat := 1\n", ["Init.Prelude"])
+        sub_parts = ol.artifacts["OlSub.Mod"]
+        sub_verdict = fresh_ol2.audit_olean_request({
+            "roots": ["OlSub.Mod"], "modules": ["OlSub.Mod"],
+            "artifacts": [["OlSub.Mod", sub_parts]], "scope": "sub-cache",
+        })
+        assert sub_verdict["replay"] is True and sub_verdict["modules"] == ["OlSub.Mod"]
+        wrong_dir = suite / "olean-wrong-dir/NotSub"
+        wrong_dir.mkdir(parents=True)
+        wrong_olean = wrong_dir / "Mod.olean"
+        shutil.copyfile(sub_parts[0][0], wrong_olean)
+        expect_failure(lambda: fresh_ol2.audit_olean_request({
+            "roots": ["OlSub.Mod"], "modules": ["OlSub.Mod"],
+            "artifacts": [["OlSub.Mod", [[str(wrong_olean)], []]]], "scope": "sub-cache",
+        }), 1, "olean-audit", "moduleProvenanceSpoofed", "does not match the module name")
+        omit_dir = suite / "olean-omit-dir/OlSub"
+        omit_dir.mkdir(parents=True)
+        omit_olean = omit_dir / "Mod.olean"
+        shutil.copyfile(sub_parts[0][0], omit_olean)
+        (omit_dir / "Mod.olean.private").write_bytes(b"omitted companion")
+        expect_failure(lambda: fresh_ol2.audit_olean_request({
+            "roots": ["OlSub.Mod"], "modules": ["OlSub.Mod"],
+            "artifacts": [["OlSub.Mod", [[str(omit_olean)], []]]], "scope": "sub-cache",
+        }), 1, "olean-audit", "missingPrivateArtifact", "exists but was omitted")
+        expect_failure(lambda: fresh_ol2.audit_olean_request({
+            "roots": ["OlSub.Mod"], "modules": ["OlSub.Mod"],
+            "artifacts": [["OlSub.Mod", [[], [sub_parts[0][0]]]]], "scope": "sub-cache",
+        }), 1, "olean-audit", "missingPrivateArtifact")
+        olean_module(ol, "OlFastMod", "module\nprelude\npublic import Init.Prelude\npublic def y : Nat := 1\n",
+                     ["Init.Prelude"], module_file=True)
+        fm_parts = ol.artifacts["OlFastMod"]
+        fm_verdict = fresh_ol2.audit_olean_request({
+            "roots": ["OlFastMod"], "modules": ["OlFastMod"],
+            "artifacts": [["OlFastMod", fm_parts]], "scope": "fm-cache",
+        })
+        assert fm_verdict["replay"] is True
+        split_dir = suite / "olean-split-base"
+        split_dir.mkdir()
+        split_priv = split_dir / "OlFastMod.olean.private"
+        shutil.copyfile(fm_parts[0][2], split_priv)
+        expect_failure(lambda: fresh_ol2.audit_olean_request({
+            "roots": ["OlFastMod"], "modules": ["OlFastMod"],
+            "artifacts": [["OlFastMod", [[fm_parts[0][0], fm_parts[0][1], str(split_priv)], fm_parts[1]]]],
+            "scope": "fm-cache",
+        }), 1, "olean-audit", "moduleProvenanceSpoofed", "canonical companions")
+        shutil.rmtree(wrong_dir.parent, ignore_errors=True)
+        shutil.rmtree(omit_dir.parent, ignore_errors=True)
+        shutil.rmtree(split_dir, ignore_errors=True)
         shutil.rmtree(fresh_cache, ignore_errors=True)
         sym_parent.unlink()
         expect_failure(lambda: ol.olean_audit("olean-audit", scope="fixture", roots=["Init.Prelude"], modules=[]),
                        1, "olean-audit", "no audited modules")
-        # A caller can neither supply nor name `Trusted` modules: a forged `Trusted` redefining
-        # `VerificationResult` would otherwise make any claim audit clean.
+        # A caller can neither supply nor name `Trusted` modules in any field: a forged `Trusted`
+        # redefining `VerificationResult` or relaxing local axioms would compromise claims.
         for spoof in ({"roots": ["OlClean"], "modules": ["OlClean", "Trusted"], "artifacts": []},
                       {"roots": ["Trusted.Fake"], "modules": ["Trusted.Fake"],
-                       "artifacts": [["Trusted.Fake", clean_parts]]}):
+                       "artifacts": [["Trusted.Fake", clean_parts]]},
+                      {"roots": ["OlClean"], "modules": ["OlClean"], "artifacts": [],
+                       "localAxiomModules": ["Trusted"]},
+                      {"roots": ["OlClean"], "modules": ["OlClean"], "artifacts": [],
+                       "sources": [["Trusted", clean_src]]}):
             expect_failure(lambda: ol.audit_olean_request(spoof), 1, "olean-audit",
                            "moduleProvenanceSpoofed", "Trusted modules")
-        # After `run()`, requests are audited together with the checker's own `Trusted` artifacts.
+        # After `run()`, requests are audited together with the checker's own `Trusted` artifacts,
+        # and repeated `audit_olean_request` calls must not pollute `Checker` state.
         api_ol = runner.Checker(fixture(header + "def VerificationResult (p : Prop) : Prop := p\n"), lean,
                                 temp_parent=suite)
         disposable.append(api_ol.stage)
         api_ol.run()
         olean_module(api_ol, "OlApiClaim", "prelude\nimport Trusted\n"
                      "theorem verified : VerificationResult True := True.intro\n", ["Trusted"])
-        api_claim = api_ol.audit_olean_request({"roots": ["OlApiClaim"], "modules": ["OlApiClaim"], "artifacts": [],
-                                                "graph": {"OlApiClaim": api_ol.graph["OlApiClaim"]}})
-        assert api_claim["modules"] == ["OlApiClaim", "Trusted"] and api_claim["replay"] is True, api_claim
+        api_claim_parts = api_ol.artifacts.pop("OlApiClaim")
+        api_claim_edges = api_ol.graph.pop("OlApiClaim")
+        for _ in range(2):
+            api_claim = api_ol.audit_olean_request({
+                "roots": ["OlApiClaim"], "modules": ["OlApiClaim"],
+                "artifacts": [["OlApiClaim", api_claim_parts]],
+                "graph": {"OlApiClaim": api_claim_edges},
+            })
+            assert api_claim["modules"] == ["OlApiClaim", "Trusted"] and api_claim["replay"] is True, api_claim
         expect_failure(lambda: ol.audit_olean_request({"roots": ["OlClean"], "modules": ["OlClean"], "artifacts": [],
                                                        "allowProvisionalNative": True}),
                        2, "olean-audit", "malformed --audit-olean request")
@@ -1285,7 +1347,55 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         olean_module(ol, "OlForgedCompanion", forged_comp_source, ["Init", "Lean"])
         olean_reject(ol, ["OlForgedCompanion"], "cNr._unsafe_rec", "cNr2._unsafe_rec", "does not use a recursion combinator",
                      toolchainRoots=["Init", "Std", "Lean"])
-        done("metaprogram-forged csimp/cpass/folder/LCNF/companion state, intrinsic tags, IR-unsafe, Lean library foreign")
+        # B4 regressions: `LCNF.Specialize.specCacheExt` hijacking to a pure kernel def,
+        # `ElimDeadBranches` forged summary on a non-trivial (`SimpleRet.other`) Bool function,
+        # forged companion on a parent using `WellFounded.fix` with extra constants/literals, and
+        # simultaneous 3-phase (`base`+`mono`+`IR`) forgery contradicting a simple kernel body.
+        forged_b4_source = "prelude\nimport Init\nimport Lean\nopen Lean\n" + (
+            "@[specialize, noinline] def b4Apply (f : Nat → Nat) (x : Nat) : Nat :=\n"
+            "  match x with | 0 => f 0 | n + 1 => b4Apply f n + f (n + 1)\n"
+            "@[noinline] def b4Inc (n : Nat) : Nat := n + 1\n"
+            "@[noinline] def b4EvilSpec (_ : Nat) : Nat := 999\n"
+            "run_cmd Elab.Command.liftCoreM <|\n"
+            "  Lean.Compiler.LCNF.Specialize.cacheSpec (mkApp (mkConst ``b4Apply) (mkConst ``b4Inc)) ``b4EvilSpec\n"
+            "@[noinline] def b4SpecVictim (x : Nat) : Nat := b4Apply b4Inc x\n"
+            "@[noinline] def b4PredOther (n : Nat) : Bool := n == 0\n"
+            "run_cmd modifyEnv fun env =>\n"
+            "  Lean.Compiler.LCNF.UnreachableBranches.addFunctionSummary env ``b4PredOther (.ctor ``Bool.true #[])\n"
+            "def b4WfTpl (n : Nat) : Nat := WellFounded.fix (r := (· < ·)) Nat.lt_wfRel.wf (fun k _ => k) n\n"
+            "@[noinline] def b4ThreeDonor (_ : Nat) : Nat := 999\n"
+            "run_cmd Elab.Command.liftCoreM do\n"
+            "  let nat := mkConst ``Nat\n"
+            "  let ty := mkForall `n .default nat nat\n"
+            "  let pName := `b4WfSneaky\n"
+            "  let recName := pName.str (\"_unsafe\" ++ \"_rec\")\n"
+            "  let tplVal := (← getConstInfo ``b4WfTpl).value!\n"
+            "  let pDecl := Declaration.defnDecl { name := pName, levelParams := [], type := ty, value := tplVal, hints := .abbrev, safety := .safe }\n"
+            "  addDecl pDecl\n"
+            "  let mot := mkLambda `k .default nat nat\n"
+            "  let body := mkLambda `n .default nat (mkApp4 (mkConst ``Nat.casesOn [Level.one]) mot (mkBVar 0) (mkNatLit 999) (mkLambda `m .default nat (mkApp (mkConst recName) (mkBVar 0))))\n"
+            "  addDecl (.mutualDefnDecl [{ name := recName, levelParams := [], type := ty, value := body, hints := .opaque, safety := .partial }])\n"
+            "  compileDecl pDecl\n"
+            "  addDecl (.defnDecl { name := `b4ThreeVictim, levelParams := [], type := ty, value := mkLambda `n .default nat (mkNatLit 1), hints := .abbrev, safety := .safe })\n"
+            "  let env ← getEnv\n"
+            "  let some bd := Lean.Compiler.LCNF.getDeclCore? env Lean.Compiler.LCNF.baseExt ``b4ThreeDonor | throwError \"no b\"\n"
+            "  let some md := Lean.Compiler.LCNF.getDeclCore? env Lean.Compiler.LCNF.monoExt ``b4ThreeDonor | throwError \"no m\"\n"
+            "  let some sg := Lean.Compiler.LCNF.getSigCore? env Lean.Compiler.LCNF.impureSigExt ``b4ThreeDonor | throwError \"no s\"\n"
+            "  let some ir := Lean.IR.findEnvDecl env ``b4ThreeDonor | throwError \"no ir\"\n"
+            "  let ir' := match ir with | .fdecl _ xs t b i => .fdecl `b4ThreeVictim xs t b i | o => o\n"
+            "  modifyEnv fun e =>\n"
+            "    let e := Lean.Compiler.LCNF.baseExt.addEntry e { bd with name := `b4ThreeVictim }\n"
+            "    let e := Lean.Compiler.LCNF.monoExt.addEntry e { md with name := `b4ThreeVictim }\n"
+            "    let e := Lean.Compiler.LCNF.impureSigExt.addEntry e { sg with name := `b4ThreeVictim }\n"
+            "    Lean.IR.declMapExt.addEntry e ir'\n")
+        olean_module(ol, "OlForgedB4", forged_b4_source, ["Init", "Lean"])
+        olean_reject(ol, ["OlForgedB4"],
+                     "b4EvilSpec", "specialize_cache",
+                     "b4PredOther", "dead_branch_summary",
+                     "b4WfSneaky._unsafe_rec", "absent from parent closure",
+                     "b4ThreeVictim", "lcnf_ir_mismatch",
+                     toolchainRoots=["Init", "Std", "Lean"])
+        done("metaprogram-forged csimp/cpass/folder/LCNF/specCache/companion state, intrinsic tags, IR-unsafe, Lean library foreign")
 
         # Group 24: separate compilation (`-Dcompiler.postponeCompile=true`) of a `module` file
         # writes no IR for public or private functions.
@@ -1385,6 +1495,18 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         olean_module(ol, "OlBangString", bang_src, ["Init.Notation"])
         olean_reject(ol, ["OlBangString"], "[sourceForbiddenIdentifier] hidden_unsafe_rec",
                      sources=[("OlBangString", str(ol.stage / "olean-src/OlBangString.lean"))])
+        # Spaced `s! "..."` and `println! "..."` interpolated strings with `'"'` inside `{...}`
+        # must never desynchronize `scanIdents` or hide a subsequent `_unsafe_rec` identifier.
+        interp_space_src = (
+            "prelude\nimport Init\n"
+            "def spacedS : String := s! \"{'\"'}\"\n"
+            "def spacedP : IO Unit := println! \"{'\"'}\"\n"
+            "def hiddenLocal : Nat := let my_unsafe_rec := 42; my_unsafe_rec\n"
+            "-- \"\n"
+        )
+        olean_module(ol, "OlInterpSpace", interp_space_src, ["Init"])
+        olean_reject(ol, ["OlInterpSpace"], "[sourceForbiddenIdentifier] my_unsafe_rec",
+                     sources=[("OlInterpSpace", str(ol.stage / "olean-src/OlInterpSpace.lean"))])
         runner.make_tree_writable(ol.stage)
         shutil.rmtree(ol.stage)
         done("pure Lean 4 hardcoded compiler-intrinsic and toolchain-owned name spoofing, raw/bang-string source scan")
@@ -1430,6 +1552,10 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         (root / "flake.nix").write_text("{}\n")
         (root / "lakefile.toml").write_text("name = \"fixture\"\n")
         expect_failure(lambda: runner.verify_root_manifest(root), 1, "root-manifest", "missing trusted/root-manifest.sha256")
+        # Deleting one repository marker (`flake.nix`) must not bypass root-manifest enforcement.
+        (root / "flake.nix").unlink()
+        expect_failure(lambda: runner.verify_root_manifest(root), 1, "root-manifest", "missing trusted/root-manifest.sha256")
+        (root / "flake.nix").write_text("{}\n")
         # In a repository checkout (`flake.nix` + `lakefile.toml`), stripping root build files from
         # `trusted/root-manifest.sha256` must be rejected.
         write_manifest(covered)

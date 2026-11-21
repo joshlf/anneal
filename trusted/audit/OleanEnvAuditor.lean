@@ -1,3 +1,5 @@
+module
+
 import Lean.Replay
 import Lean.Compiler.IR.CompilerM
 import Lean.Compiler.IR.EmitUtil
@@ -12,7 +14,8 @@ import Lean.Compiler.LCNF.Passes
 import Lean.Compiler.LCNF.Simp.ConstantFold
 import Lean.Compiler.LCNF.ElimDeadBranches
 import Lean.Compiler.LCNF.Util
-import Lean.AuxRecursor
+import all Lean.Compiler.LCNF.Specialize
+import all Lean.AuxRecursor
 import Lean.Meta.Basic
 import Lean.Meta.InferType
 import Lean.Meta.CasesInfo
@@ -441,8 +444,20 @@ def listToolchainModules (libDir : System.FilePath) (roots : Array Name) : IO (A
   let mut pending : List (System.FilePath × Name) := []
   for r in roots do
     let rs := r.toString (escape := false)
-    if ← (libDir / (rs ++ ".olean")).pathExists then result := result.push r
-    pending := (libDir / rs, r) :: pending
+    let rootOlean := libDir / (rs ++ ".olean")
+    if ← entryExistsOnDisk rootOlean then
+      let md ← rootOlean.symlinkMetadata
+      if md.type == .symlink then
+        fail s!"[moduleProvenanceSpoofed] symlink inside toolchain library: {rootOlean}"
+      if md.type == .file then
+        result := result.push r
+    let rootDir := libDir / rs
+    if ← entryExistsOnDisk rootDir then
+      let md ← rootDir.symlinkMetadata
+      if md.type == .symlink then
+        fail s!"[moduleProvenanceSpoofed] symlink inside toolchain library: {rootDir}"
+      if md.type == .dir then
+        pending := (rootDir, r) :: pending
   let mut done := false
   for _ in [0:100000] do
     match pending with
@@ -552,6 +567,19 @@ def kernelAccepts (env : Environment) (lparams : List Name) (type value : Expr) 
   unless isClosedExpr type && isClosedExpr value do return false
   let name := freshName env `_olean_auditor_kernel_check
   let decl := Declaration.thmDecl { name, levelParams := lparams, type, value }
+  let threshold ← kernelHeartbeatThreshold budget
+  match env.toKernelEnv.addDeclCore threshold 0 decl none with
+  | .ok _ => return true
+  | .error _ => return false
+
+/-- Ask the kernel to type check a partial companion body `value : type` against `env`. -/
+def kernelAcceptsPartial (env : Environment) (lparams : List Name) (type value : Expr) (budget : Nat) :
+    IO Bool := do
+  unless isClosedExpr type && isClosedExpr value do return false
+  let name := freshName env `_olean_auditor_companion_check
+  let decl := Declaration.mutualDefnDecl [{
+    name, levelParams := lparams, type, value, hints := .opaque, safety := .partial
+  }]
   let threshold ← kernelHeartbeatThreshold budget
   match env.toKernelEnv.addDeclCore threshold 0 decl none with
   | .ok _ => return true
@@ -1028,15 +1056,44 @@ def matchRawStrEnd (cs : Array Char) (i hashes : Nat) : Bool := Id.run do
     if cs[i + 1 + k]! != '#' then return false
   return true
 
+/-- Strip line (`--`) and nested block (`/- ... -/`) comments from Lean source text, preserving
+everything else. Used as a fail-closed fallback when a file declares custom `interpolatedStr` syntax. -/
+def stripComments (text : String) : String := Id.run do
+  let cs := text.toList.toArray
+  let mut out : Array Char := #[]
+  let mut i := 0
+  let mut depth := 0
+  let mut inLine := false
+  for _ in [0:cs.size + 1] do
+    if h : i < cs.size then
+      let c := cs[i]
+      let d? := cs[i + 1]?
+      if inLine then
+        if c == '\n' then inLine := false; out := out.push '\n'
+        i := i + 1
+      else if depth > 0 then
+        if c == '/' && d? == some '-' then depth := depth + 1; i := i + 2
+        else if c == '-' && d? == some '/' then depth := depth - 1; i := i + 2
+        else i := i + 1
+      else
+        if c == '-' && d? == some '-' then inLine := true; i := i + 2
+        else if c == '/' && d? == some '-' then depth := 1; i := i + 2
+        else out := out.push c; i := i + 1
+    else break
+  return String.ofList out.toList
+
 /-- Identifier tokens of Lean source text outside comments and plain/raw string literals, while
 handling single-quoted `Char` literals and descending into `{...}` expressions inside Lean's
-built-in interpolated strings (`s!"..."`, `m!"..."`, `f!"..."`). Returns `(tokens, balanced)` where
+interpolated strings (`s!"..."`, `s! "..."`, `m!"..."`, `f!"..."`, `println! "..."`,
+`Macro.trace[...] "..."`, and any `<ident>!"..."` macro). Returns `(tokens, balanced)` where
 `balanced` is `false` if scanning reached EOF inside an unclosed string, raw string, comment,
 guillemet, or interpolation state (fail-closed guard against lexer desynchronization). -/
 def scanIdents (text : String) : Array String × Bool := Id.run do
   let cs := text.toList.toArray
   let mut acc : Array String := #[]
   let mut cur : List Char := []
+  let mut lastTok : String := ""
+  let mut inMacroTrace := false
   let mut i := 0
   let mut depth := 0
   let mut inLine := false
@@ -1059,6 +1116,8 @@ def scanIdents (text : String) : Array String × Bool := Id.run do
       else if let some nh := rawHashes then
         if matchRawStrEnd cs i nh then
           rawHashes := none
+          lastTok := "\""
+          inMacroTrace := false
           i := i + 1 + nh
         else
           i := i + 1
@@ -1067,10 +1126,14 @@ def scanIdents (text : String) : Array String × Bool := Id.run do
         else if c == '"' then
           inStr := false
           inInterpStr := false
+          lastTok := "\""
+          inMacroTrace := false
           i := i + 1
         else if inInterpStr && c == '{' then
           inStr := false
           inInterpStr := false
+          lastTok := "{"
+          inMacroTrace := false
           interpStack := 0 :: interpStack
           i := i + 1
         else
@@ -1088,24 +1151,37 @@ def scanIdents (text : String) : Array String × Bool := Id.run do
         -- Check `Char` literal `'c'` / `'\...'` at token boundary (never breaks `foo'`).
         if cur.isEmpty && c == '\'' then
           if let some nextI := skipCharLit cs i then
+            lastTok := "'"
+            inMacroTrace := false
             i := nextI
             continue
-        let isStart := (c == '-' && d? == some '-') || (c == '/' && d? == some '-') || c == '"'
-        let isInterpOpen := c == '"' && (cur == ['!', 's'] || cur == ['!', 'm'] || cur == ['!', 'f'])
+        let isCommentStart := (c == '-' && d? == some '-') || (c == '/' && d? == some '-')
+        let isStart := isCommentStart || c == '"'
         if isStart || !(isIdentChar c || c == '«') then
-          if !cur.isEmpty then acc := acc.push (String.ofList cur.reverse)
-          cur := []
+          if !cur.isEmpty then
+            let tok := String.ofList cur.reverse
+            acc := acc.push tok
+            lastTok := tok
+            if tok == "Macro.trace" then inMacroTrace := true
+            else if !inMacroTrace then inMacroTrace := false
+            cur := []
         if c == '-' && d? == some '-' then inLine := true; i := i + 2
         else if c == '/' && d? == some '-' then depth := 1; i := i + 2
         else if c == '"' then
+          let isInterpOpen :=
+            (lastTok.endsWith "!" && lastTok.length > 1) ||
+            (lastTok == "]" && inMacroTrace)
           inStr := true
           inInterpStr := isInterpOpen
+          inMacroTrace := false
           i := i + 1
         else if c == '«' then inGuil := true; i := i + 1
         else if c == '{' && !interpStack.isEmpty then
           match interpStack with
           | d :: rest => interpStack := (d + 1) :: rest
           | [] => pure ()
+          lastTok := "{"
+          inMacroTrace := false
           i := i + 1
         else if c == '}' && !interpStack.isEmpty then
           match interpStack with
@@ -1113,12 +1189,24 @@ def scanIdents (text : String) : Array String × Bool := Id.run do
             interpStack := rest
             inStr := true
             inInterpStr := true
+            lastTok := "}"
+            inMacroTrace := false
           | (d + 1) :: rest =>
             interpStack := d :: rest
+            lastTok := "}"
+            inMacroTrace := false
           | [] => pure ()
           i := i + 1
         else
-          if isIdentChar c then cur := c :: cur
+          if isIdentChar c then
+            cur := c :: cur
+          else if !c.isWhitespace then
+            let cs1 := String.singleton c
+            if c == '[' then
+              inMacroTrace := (lastTok == "Macro.trace")
+            else if c != ']' then
+              inMacroTrace := false
+            lastTok := cs1
           i := i + 1
     else break
   if !cur.isEmpty then acc := acc.push (String.ofList cur.reverse)
@@ -1244,6 +1332,40 @@ def parentUsesRecursionCombinator (env : Environment) (parent : Name) (parentCi 
         if checkCi hci then return true
   return false
 
+/-- Memoized DAG collector of all `Nat`/`String` literals occurring in `e` (total, fuel-bounded;
+returns `none` on fuel exhaustion so callers fail closed). -/
+def exprLiterals (e : Expr) (acc : Std.HashSet Literal) (seen0 : Std.HashSet Expr)
+    (fuel : Nat := 200000) : Option (Std.HashSet Literal × Std.HashSet Expr) := Id.run do
+  let mut lits := acc
+  let mut seen := seen0
+  let mut stack : List Expr := [e]
+  let mut done := false
+  for _ in [0:fuel] do
+    match stack with
+    | [] => done := true; break
+    | x :: rest =>
+      stack := rest
+      if seen.contains x then continue
+      seen := seen.insert x
+      match x with
+      | .lit l => lits := lits.insert l
+      | .app f a => stack := f :: a :: stack
+      | .lam _ t b _ | .forallE _ t b _ => stack := t :: b :: stack
+      | .letE _ t v b _ => stack := t :: v :: b :: stack
+      | .mdata _ b | .proj _ _ b => stack := b :: stack
+      | _ => pure ()
+  if done then return some (lits, seen) else return none
+
+/-- Strip leading lambdas from an expression (total, fuel-bounded). -/
+def stripLeadingLams (e : Expr) (fuel : Nat := 256) : Expr × Nat :=
+  let rec go (cur : Expr) (n : Nat) : Nat → Expr × Nat
+    | 0 => (cur, n)
+    | k + 1 =>
+      match cur with
+      | .lam _ _ b _ => go b (n + 1) k
+      | _ => (cur, n)
+  go e 0 fuel
+
 /-- Is `ci` a genuine equation-compiler code-generation companion `p._unsafe_rec`? -/
 def genuineCompanion (L : Loaded) (ci : ConstantInfo) : Except String Unit := do
   let .str parent "_unsafe_rec" := ci.name | throw "not a companion name"
@@ -1261,11 +1383,44 @@ def genuineCompanion (L : Loaded) (ci : ConstantInfo) : Except String Unit := do
     throw "companion and parent are declared in different modules"
   unless parentUsesRecursionCombinator L.env parent parentCi recMod do
     throw s!"companion parent {parent} does not use a recursion combinator"
-  let body := (ci.value? (allowOpaque := true)).getD (mkConst ``True)
+  let some body := ci.value? (allowOpaque := true) | throw "companion has no body"
   unless body.getUsedConstants.any (fun c =>
       (match c with | .str _ "_unsafe_rec" => true | _ => false) &&
       origin? L.env c == recMod) do
     throw "companion body is not recursive through a same-module _unsafe_rec"
+  -- Every non-companion constant and literal in the companion's body must already occur in the
+  -- parent's same-module transitive kernel closure (preventing forged companions on a parent
+  -- that merely invokes a recursion combinator with a different RHS).
+  let mut visited : NameSet := NameSet.empty.insert parent
+  let mut pending : List Name := [parent]
+  let mut pConsts : NameSet := NameSet.empty.insert parent
+  let mut pLits : Std.HashSet Literal := {}
+  let mut litSeen : Std.HashSet Expr := {}
+  let mut bfsDone := false
+  for _ in [0:16384] do
+    match pending with
+    | [] => bfsDone := true; break
+    | cur :: rest =>
+      pending := rest
+      if let some xci := L.env.find? cur then
+        if let some xv := xci.value? (allowOpaque := true) then
+          match exprLiterals xv pLits litSeen with
+          | some (l', s') => pLits := l'; litSeen := s'
+          | none => throw "companion parent literal scan exhausted its fuel"
+          for c in xv.getUsedConstants do
+            pConsts := pConsts.insert c
+            if !visited.contains c && origin? L.env c == recMod then
+              visited := visited.insert c
+              pending := c :: pending
+  unless bfsDone do throw "companion parent closure scan exhausted its fuel"
+  for c in body.getUsedConstants do
+    unless pConsts.contains c || (match c with | .str _ "_unsafe_rec" => true | _ => false) do
+      throw s!"companion introduces constant {c} absent from parent closure"
+  let some (cLits, _) := exprLiterals body {} {}
+    | throw "companion body literal scan exhausted its fuel"
+  for l in cLits do
+    unless pLits.contains l do
+      throw s!"companion introduces literal {reprStr l} absent from parent closure"
 
 /-- A lazily realized reserved theorem (`.eq_def`, `.eq_1`, ...) may be stored by several audited
 modules with different proofs of the same statement; the environment keeps one of them. Another
@@ -1363,9 +1518,40 @@ def scanModuleEntries (L : Loaded) : AuditM (Std.HashSet (Name × Name × Name) 
     for n in auxRecExt.getModuleEntries env i do
       unless origin? env n == some m do
         report "compilerOverrideAttribute" n m "casesOn_tag: auxiliary-recursor tag on a foreign declaration"
+    for n in sparseCasesOnExt.getModuleEntries env i do
+      unless origin? env n == some m do
+        report "compilerOverrideAttribute" n m "sparse_casesOn_tag: tag on a foreign declaration"
     for (n, _) in noConfusionExt.getModuleEntries env i do
       unless origin? env n == some m do
         report "compilerOverrideAttribute" n m "noConfusion_tag: tag on a foreign declaration"
+    let modData := env.header.moduleData[i]!
+    let modKernelNames : NameSet := modData.constNames.foldl (·.insert ·) {}
+    let modExtraNames : NameSet := modData.extraConstNames.foldl (·.insert ·) {}
+    let checkSpecEntry (e : Compiler.LCNF.Specialize.CacheEntry) : AuditM Unit := do
+      let dn := e.declName
+      if modKernelNames.contains dn || (env.find? dn).isSome then
+        report "compilerOverrideAttribute" dn m "specialize_cache: entry targets a kernel declaration"
+        return
+      unless modExtraNames.contains dn && origin? env dn == some m do
+        report "compilerOverrideAttribute" dn m "specialize_cache: entry target not owned by module"
+        return
+      if (IR.findEnvDecl env dn).isNone then
+        report "compilerOverrideAttribute" dn m "specialize_cache: entry target has no compiled IR body"
+        return
+      let (keyBody, _) := stripLeadingLams e.key 256
+      match keyBody.getAppFn with
+      | .const kfn _ =>
+        let dnStr := dn.toString
+        let kStr := kfn.toString
+        unless dnStr.startsWith (kStr ++ "._at_.") && (dnStr.splitOn ".spec_").length > 1 do
+          report "compilerOverrideAttribute" dn m
+            s!"specialize_cache: target {dn} does not match specialization key head {kfn}"
+      | _ =>
+        report "compilerOverrideAttribute" dn m "specialize_cache: malformed specialization key"
+    for e in Compiler.LCNF.Specialize.specCacheExt.getModuleEntries env i do
+      checkSpecEntry e
+    for e in Compiler.LCNF.Specialize.specCacheExt.getModuleIREntries env i do
+      checkSpecEntry e
   -- Live state across all `stateStack` frames, `newEntries`, and `scopedEntries`: only genuine
   -- toolchain triples, keyed by their own source constant.
   let csimpStack := Compiler.CSimp.ext.ext.getState env
@@ -1396,6 +1582,8 @@ def scanModuleEntries (L : Loaded) : AuditM (Std.HashSet (Name × Name × Name) 
       report "compilerOverrideAttribute" k .anonymous "constant_fold: live folder key not in builtinFolders"
   unless liveFolderKeys.size == builtinFolderKeySet.size do
     report "compilerOverrideAttribute" `constant_fold .anonymous "constant_fold: live folder table differs from builtinFolders"
+  for (_, dn) in (Compiler.LCNF.Specialize.specCacheExt.getState env).toList do
+    report "compilerOverrideAttribute" dn .anonymous "specialize_cache: live specialization cache entry"
   return (toolchainCSimp, toolchainImplByTargets)
 
 /-- Lightweight summary of a trivial direct-return body across LCNF and IR phases, used to detect
@@ -1460,6 +1648,23 @@ def classifyIR (d : IR.Decl) : SimpleRet :=
       | _ => .other
     | _ => .other
 
+def classifyKernel (env : Environment) (ci : ConstantInfo) : SimpleRet :=
+  match ci.value? (allowOpaque := true) with
+  | none => .other
+  | some v =>
+    let (body, nLams) := stripLeadingLams v 256
+    match body with
+    | .bvar i => if i < nLams then .param (nLams - 1 - i) else .other
+    | .lit (.natVal k) => .natLit k
+    | .lit (.strVal s) => .strLit s
+    | .app (.app (.app (.const ``OfNat.ofNat _) ty) (.lit (.natVal k))) _ =>
+      if ty == mkConst ``Nat then .natLit k else .other
+    | _ =>
+      match body.getAppFn with
+      | .const c _ =>
+        if env.find? c matches some (.ctorInfo _) then .ctor c else .other
+      | _ => .other
+
 /-- Cross-phase compatibility: ignore `.other` and `.ctor` (trivial structures erase `.ctor` to
 `.param` in `mono`, and enums lower `.ctor` to `.natLit` in `IR`), while rejecting direct
 contradictions between `.param`, `.natLit`, and `.strLit`. -/
@@ -1471,25 +1676,187 @@ def simpleRetCompat (a b : SimpleRet) : Bool :=
   | .param _, .param _ => true
   | _, _ => false
 
-/-- Check whether an `ElimDeadBranches` summary value is consistent with a trivial `mono` body. -/
-def summaryCompatWithMono (ret : SimpleRet)
-    (val : Compiler.LCNF.UnreachableBranches.Value) : Bool :=
-  match val with
-  | .top => true
-  | .bot =>
-    match ret with
-    | .other => true
-    | _ => false
-  | .ctor c _ =>
-    match ret with
-    | .param _ => false
-    | .ctor c' => c == c'
-    | _ => true
+/-- Value-preserving, total, fuel-bounded lattice operations for validating
+`ElimDeadBranches.functionSummariesExt` against `monoExt` in linear time (0 `partial`, 0 `unsafe`). -/
+abbrev SummaryVal := Compiler.LCNF.UnreachableBranches.Value
+
+def summaryJoin (v1 v2 : SummaryVal) (fuel : Nat) : SummaryVal :=
+  match fuel with
+  | 0 => .top
+  | fuel + 1 =>
+    match v1, v2 with
+    | .bot, v | v, .bot => v
+    | .top, _ | _, .top => .top
+    | .ctor c1 a1, .ctor c2 a2 =>
+      if c1 == c2 then
+        let n := max a1.size a2.size
+        let merged := (Array.range n).map fun i => summaryJoin (a1.getD i .top) (a2.getD i .top) fuel
+        .ctor c1 merged
+      else .choice [.ctor c1 a1, .ctor c2 a2]
+    | .choice vs, v | v, .choice vs =>
+      let list := match v with | .choice ws => ws | _ => [v]
+      if list.any (· == .top) || vs.any (· == .top) then .top
+      else
+        let addOne (acc : List SummaryVal) (x : SummaryVal) : List SummaryVal :=
+          match x with
+          | .ctor cx ax =>
+            if acc.any fun | .ctor c _ => c == cx | _ => false then
+              acc.map fun
+                | .ctor c a =>
+                  if c == cx then
+                    let n := max a.size ax.size
+                    .ctor c ((Array.range n).map fun i => summaryJoin (a.getD i .top) (ax.getD i .top) fuel)
+                  else .ctor c a
+                | o => o
+            else x :: acc
+          | _ => acc
+        .choice (list.foldl addOne vs)
+
+def summaryCtorArgs (v : SummaryVal) (ctor : Name) : Option (Array SummaryVal) :=
+  match v with
+  | .bot => none
+  | .top => some #[]
+  | .ctor c args => if c == ctor then some args else none
   | .choice vs =>
-    match ret with
-    | .param _ => false
-    | .ctor c' => vs.any fun | .ctor c _ => c == c' | _ => true
-    | _ => true
+    vs.findSome? fun
+      | .ctor c args => if c == ctor then some args else none
+      | .top => some #[]
+      | _ => none
+
+def summaryProj (v : SummaryVal) (idx : Nat) (fuel : Nat) : SummaryVal :=
+  match fuel, v with
+  | 0, _ => .top
+  | _, .bot => .bot
+  | _, .top => .top
+  | _, .ctor _ args => args.getD idx .top
+  | f + 1, .choice vs => vs.foldl (fun acc x => summaryJoin acc (summaryProj x idx f) f) .bot
+
+def summaryTopCtors (v : SummaryVal) (fuel : Nat) : Option NameSet :=
+  match fuel, v with
+  | 0, _ => none
+  | _, .bot => some {}
+  | _, .top => none
+  | _, .ctor c _ => some (NameSet.empty.insert c)
+  | f + 1, .choice vs =>
+    vs.foldlM (init := {}) fun acc x => do
+      let s ← summaryTopCtors x f
+      pure (s.foldl (·.insert ·) acc)
+
+def isExhaustiveCtorSet (env : Environment) (cs : NameSet) : Bool := Id.run do
+  let mut indOpt : Option Name := none
+  for c in cs do
+    match env.find? c with
+    | some (.ctorInfo cv) =>
+      match indOpt with
+      | none => indOpt := some cv.induct
+      | some ind => if ind != cv.induct then return false
+    | _ => return false
+  match indOpt with
+  | none => false
+  | some ind =>
+    match env.find? ind with
+    | some (.inductInfo iv) => iv.numCtors >= 1 && iv.ctors.all cs.contains
+    | _ => false
+
+def summarySubsumes (env : Environment) (actual claimed : SummaryVal) : Bool :=
+  match summaryTopCtors claimed 16 with
+  | none => true
+  | some allowed =>
+    match summaryTopCtors actual 16 with
+    | none => isExhaustiveCtorSet env allowed
+    | some got => got.all allowed.contains
+
+/-- Linear-time abstract evaluation of a `mono`-phase LCNF `Code .pure` body preserving constructor
+field summaries across `.proj` and `.cases` alt parameters: walks the AST at most once (evaluating
+join-point continuation `k` first to collect joined `.jmp` arguments, then evaluating `fd.value`
+once), returning `none` on fuel exhaustion so callers fail closed. -/
+def absEvalMono (env : Environment) (selfName : Name)
+    (code : Compiler.LCNF.Code .pure) (vars : Std.HashMap FVarId SummaryVal)
+    (jpArgs : Std.HashMap FVarId (Array SummaryVal))
+    (fuel : Nat) : Option (SummaryVal × Std.HashMap FVarId (Array SummaryVal)) :=
+  match fuel with
+  | 0 => none
+  | fuel + 1 =>
+    let argVal : Compiler.LCNF.Arg .pure → SummaryVal
+      | .fvar fv => vars.getD fv .top
+      | _ => .top
+    match code with
+    | .unreach _ => some (.bot, jpArgs)
+    | .return fv => some (vars.getD fv .top, jpArgs)
+    | .jmp fn args =>
+      let cur := jpArgs.getD fn #[]
+      let avs := args.map argVal
+      let merged := if cur.isEmpty then avs
+        else (cur.zip avs).map fun (a, b) => summaryJoin a b 8
+      some (.bot, jpArgs.insert fn merged)
+    | .fun fd k =>
+      absEvalMono env selfName k (vars.insert fd.fvarId .top) jpArgs fuel
+    | .jp fd k => do
+      let (r2, jpArgs') ← absEvalMono env selfName k vars jpArgs fuel
+      let passed := jpArgs'.getD fd.fvarId #[]
+      if passed.isEmpty && !fd.params.isEmpty && !jpArgs'.contains fd.fvarId then
+        return (r2, jpArgs')
+      let mut jpVars := vars
+      for h : idx in [0:fd.params.size] do
+        let p := fd.params[idx]
+        jpVars := jpVars.insert p.fvarId (passed.getD idx .top)
+      let (r1, jpArgs'') ← absEvalMono env selfName fd.value jpVars jpArgs' fuel
+      pure (summaryJoin r1 r2 8, jpArgs'')
+    | .let ld k =>
+      let lv : SummaryVal := match ld.value with
+        | .lit (.nat n) =>
+          if n == 0 then .ctor ``Nat.zero #[] else .ctor ``Nat.succ #[.top]
+        | .proj _ idx fv => summaryProj (vars.getD fv .top) idx 8
+        | .fvar fv args =>
+          if args.isEmpty then vars.getD fv .top else .top
+        | .const c _ args =>
+          if env.find? c matches some (.ctorInfo _) then
+            .ctor c (args.map argVal)
+          else if c == selfName then
+            .bot
+          else
+            match Compiler.LCNF.UnreachableBranches.getFunctionSummary? env c with
+            | some sv =>
+              match Compiler.LCNF.getDeclCore? env Compiler.LCNF.monoExt c with
+              | some cd => if args.size == cd.params.size then sv else .top
+              | none => .top
+            | none => .top
+        | _ => .top
+      absEvalMono env selfName k (vars.insert ld.fvarId lv) jpArgs fuel
+    | .cases cs =>
+      let dv := vars.getD cs.discr .top
+      cs.alts.foldlM (init := (.bot, jpArgs)) fun (acc, jpa) alt => do
+        match alt with
+        | .alt ctor ps body =>
+          match summaryCtorArgs dv ctor with
+          | none => pure (acc, jpa)
+          | some argVals =>
+            let mut vars' := vars
+            for h : idx in [0:ps.size] do
+              vars' := vars'.insert ps[idx].fvarId (argVals.getD idx .top)
+            let (r, jpa') ← absEvalMono env selfName body vars' jpa fuel
+            pure (summaryJoin acc r 8, jpa')
+        | .default body =>
+          if dv == .bot then pure (acc, jpa)
+          else
+            let (r, jpa') ← absEvalMono env selfName body vars jpa fuel
+            pure (summaryJoin acc r 8, jpa')
+
+/-- Validate a non-`.top` `ElimDeadBranches` summary against the function's `mono` LCNF body. -/
+def checkFunctionSummary (env : Environment) (m dn : Name)
+    (val : SummaryVal) : AuditM Unit := do
+  if val == .top then return
+  if let some md := Compiler.LCNF.getDeclCore? env Compiler.LCNF.monoExt dn then
+    match md.value with
+    | .extern .. => pure ()
+    | .code code =>
+      let vars0 := md.params.foldl (init := ({} : Std.HashMap FVarId SummaryVal)) fun a p => a.insert p.fvarId .top
+      match absEvalMono env dn code vars0 {} 8192 with
+      | none =>
+        report "auditFuelExhausted" dn m "dead_branch_summary: mono summary validation exhausted its fuel"
+      | some (av, _) =>
+        unless summarySubsumes env av val do
+          report "compilerOverrideAttribute" dn m "dead_branch_summary: function summary contradicts mono LCNF body"
 
 /-- Collect constant callees directly mentioned in an LCNF pure `Code` tree (total bounded walk;
 returns `none` on fuel exhaustion so callers fail closed with `auditFuelExhausted`). -/
@@ -1650,6 +2017,19 @@ def checkModuleIR (L : Loaded) (i : Nat) (m : Name) (data : ModuleData)
     if (IR.findEnvDecl env bn).isNone then
       report "environmentLoadFailed" bn m "base-phase LCNF body without IR body"
     checkLCNFDeclCallees L m "base" toolchainImplByTargets bd
+  let mut seenBaseIR : NameSet := {}
+  for bd in Compiler.LCNF.baseExt.getModuleIREntries env i do
+    let bn := bd.name
+    if seenBaseIR.contains bn then
+      report "environmentLoadFailed" bn m "duplicate base-phase LCNF IR declaration entry"
+    seenBaseIR := seenBaseIR.insert bn
+    unless kernelNames.contains bn || extraNames.contains bn do
+      report "environmentLoadFailed" bn m "base-phase LCNF IR declaration not owned by its module"
+    unless origin? env bn == some m do
+      report "environmentLoadFailed" bn m "base-phase LCNF IR declaration provenance mismatch"
+    if (IR.findEnvDecl env bn).isNone then
+      report "environmentLoadFailed" bn m "base-phase LCNF IR body without IR body"
+    checkLCNFDeclCallees L m "base-ir" toolchainImplByTargets bd
   let mut seenMono : NameSet := {}
   for md in Compiler.LCNF.monoExt.getModuleEntries env i do
     let mn := md.name
@@ -1663,6 +2043,19 @@ def checkModuleIR (L : Loaded) (i : Nat) (m : Name) (data : ModuleData)
     if (IR.findEnvDecl env mn).isNone then
       report "environmentLoadFailed" mn m "mono-phase LCNF body without IR body"
     checkLCNFDeclCallees L m "mono" toolchainImplByTargets md
+  let mut seenMonoIR : NameSet := {}
+  for md in Compiler.LCNF.monoExt.getModuleIREntries env i do
+    let mn := md.name
+    if seenMonoIR.contains mn then
+      report "environmentLoadFailed" mn m "duplicate mono-phase LCNF IR declaration entry"
+    seenMonoIR := seenMonoIR.insert mn
+    unless kernelNames.contains mn || extraNames.contains mn do
+      report "environmentLoadFailed" mn m "mono-phase LCNF IR declaration not owned by its module"
+    unless origin? env mn == some m do
+      report "environmentLoadFailed" mn m "mono-phase LCNF IR declaration provenance mismatch"
+    if (IR.findEnvDecl env mn).isNone then
+      report "environmentLoadFailed" mn m "mono-phase LCNF IR body without IR body"
+    checkLCNFDeclCallees L m "mono-ir" toolchainImplByTargets md
   let mut seenSumm : NameSet := {}
   for (dn, val) in Compiler.LCNF.UnreachableBranches.functionSummariesExt.getModuleEntries env i do
     if seenSumm.contains dn then
@@ -1672,25 +2065,35 @@ def checkModuleIR (L : Loaded) (i : Nat) (m : Name) (data : ModuleData)
       report "environmentLoadFailed" dn m "dead-branch function summary not owned by its module"
     unless origin? env dn == some m do
       report "environmentLoadFailed" dn m "dead-branch function summary provenance mismatch"
-    if let some md := Compiler.LCNF.getDeclCore? env Compiler.LCNF.monoExt dn then
-      unless summaryCompatWithMono (classifyLCNF env md) val do
-        report "compilerOverrideAttribute" dn m "dead_branch_summary: function summary contradicts mono LCNF body"
+    checkFunctionSummary env m dn val
+  let mut seenSummIR : NameSet := {}
+  for (dn, val) in Compiler.LCNF.UnreachableBranches.functionSummariesExt.getModuleIREntries env i do
+    if seenSummIR.contains dn then
+      report "environmentLoadFailed" dn m "duplicate dead-branch IR function summary entry"
+    seenSummIR := seenSummIR.insert dn
+    unless kernelNames.contains dn || extraNames.contains dn do
+      report "environmentLoadFailed" dn m "dead-branch IR function summary not owned by its module"
+    unless origin? env dn == some m do
+      report "environmentLoadFailed" dn m "dead-branch IR function summary provenance mismatch"
+    checkFunctionSummary env m dn val
   for ci in data.constants do
     let n := ci.name
     if let some irDecl := IR.findEnvDecl env n then
       if (ci matches .defnInfo _) && !(isExtern env n || isExternC env n) then
         let bd? := Compiler.LCNF.getDeclCore? env Compiler.LCNF.baseExt n
         let md? := Compiler.LCNF.getDeclCore? env Compiler.LCNF.monoExt n
-        if !seenBase.contains n && bd?.isNone then
+        if !seenBase.contains n && !seenBaseIR.contains n && bd?.isNone then
           report "environmentLoadFailed" n m "IR body for definition without base-phase LCNF declaration"
-        if !seenMono.contains n && md?.isNone then
+        if !seenMono.contains n && !seenMonoIR.contains n && md?.isNone then
           report "environmentLoadFailed" n m "IR body for definition without mono-phase LCNF declaration"
         if let (some bd, some md) := (bd?, md?) then
+          let ck := classifyKernel env ci
           let cb := classifyLCNF env bd
           let cm := classifyLCNF env md
           let ciR := classifyIR irDecl
-          unless simpleRetCompat cb cm && simpleRetCompat cm ciR && simpleRetCompat cb ciR do
-            report "compilerOverrideAttribute" n m "lcnf_ir_mismatch: base/mono LCNF and IR return values contradict each other"
+          unless simpleRetCompat ck cb && simpleRetCompat ck cm && simpleRetCompat ck ciR &&
+              simpleRetCompat cb cm && simpleRetCompat cm ciR && simpleRetCompat cb ciR do
+            report "compilerOverrideAttribute" n m "lcnf_ir_mismatch: kernel, base/mono LCNF, and IR return values contradict each other"
       continue
     if (Compiler.LCNF.getSigCore? env Compiler.LCNF.impureSigExt n).isSome then
       report "environmentLoadFailed" n m "compiled signature without IR body"
@@ -1900,9 +2303,15 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
       | .str _ "_unsafe_rec" =>
         match genuineCompanion L ci with
         | .ok () =>
-          genuine := genuine.insert n
-          isCompanion := true
-          modify fun (s : AuditState) => { s with companions := s.companions + 1 }
+          let bodyOk ← match ci.value? (allowOpaque := true) with
+            | some v => kernelAcceptsPartial env ci.levelParams ci.type v budget
+            | none => pure false
+          if bodyOk then
+            genuine := genuine.insert n
+            isCompanion := true
+            modify fun (s : AuditState) => { s with companions := s.companions + 1 }
+          else
+            report "compilerOverrideAttribute" n m "unsafe_rec_sibling: kernel rejected partial companion body"
         | .error e => report "compilerOverrideAttribute" n m s!"unsafe_rec_sibling: {e}"
       | _ =>
         if forbiddenSourceIdentifier n.toString then
@@ -1925,7 +2334,7 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
         strictRoots := strictRoots.push n
       unless isCompanion do replayLocals := replayLocals.insert n ci
     for n in data.extraConstNames do
-      if toolchainNames.contains n then
+      if toolchainNames.contains n || compilerReservedNames.contains n then
         report "compilerOverrideAttribute" n m
           "toolchain_name: IR helper reuses a name the pinned toolchain declares"
     checkModuleIR L i m data toolchainImplByTargets
@@ -1985,6 +2394,10 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
     for tok in toks do
       if forbiddenSourceIdentifier tok then
         report "sourceForbiddenIdentifier" tok.toName m "user identifiers must not mention _unsafe_rec"
+    -- Fail closed if the source declares custom `interpolatedStr` syntax (which could introduce
+    -- non-`!` interpolation delimiters) and `_unsafe_rec` appears anywhere outside comments.
+    if toks.contains "interpolatedStr" && forbiddenSourceIdentifier (stripComments text) then
+      report "sourceForbiddenIdentifier" m m "custom interpolatedStr source mentions _unsafe_rec outside comments"
   -- Kernel replay of every non-toolchain declaration on the toolchain-only environment.
   let baseRoots := env.header.modules.filterMap fun (m : EffectiveImport) =>
     if toolchainProv.contains m.module then some m.module else none
@@ -2048,7 +2461,7 @@ def run (j : Json) : IO Json := do
 
 end OleanEnvAuditor
 
-def main (args : List String) : IO UInt32 := do
+public def main (args : List String) : IO UInt32 := do
   match args with
   | [request, output] =>
     try
