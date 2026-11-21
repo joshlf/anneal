@@ -2508,6 +2508,539 @@ theorem seq_inc_inc_dichotomy :
 
 end HardeningA1
 
+/-! ## Adversarial hardening regressions (Pass B2) -/
+
+namespace HardeningB2
+
+/-! ### Part I: Boilerplate cofactoring and sequential composition -/
+
+/--
+Frame boilerplate in the antecedent of an implication guarding a genuine return
+pin: satisfies `MirCallContractReturnValueDichotomy` and
+`DichotomyBeyondPredicate` on `callFramePreserved`. Polarity-only stripping
+falsely collapses `callFramePreserved → retVal = 1` to `False → retVal = 1 = True`.
+-/
+def frameImpGenuine : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned retVal memAfter =>
+      callFramePreserved req.memory memAfter → retVal = u32Arg 1
+    | .panicked _ => False
+    | .aborted => False
+
+theorem frameImpGenuine_returnValueDichotomy :
+    MirCallContractReturnValueDichotomy frameImpGenuine :=
+  ⟨witnessReq, u32Arg 1, u32Arg 0, emptyMemory, trivial, fun _ => rfl,
+    fun h => absurd (u32Arg_inj (h (callFramePreserved_refl _))) (by decide)⟩
+
+theorem frameImpGenuine_dichotomyBeyond_frame :
+    DichotomyBeyondPredicate
+      (fun req (out : Value × Memory) => callFramePreserved req.memory out.2)
+      frameImpGenuine.pre (mirCallNormalPost frameImpGenuine) :=
+  (dichotomyBeyondPredicate_iff_cofactors _).mpr <| Or.inl
+    ⟨witnessReq, (u32Arg 1, emptyMemory), (u32Arg 0, emptyMemory),
+      trivial, callFramePreserved_refl _, callFramePreserved_refl _,
+      fun _ => rfl,
+      fun h => absurd (u32Arg_inj (h (callFramePreserved_refl _))) (by decide)⟩
+
+section ClassicalBoilerplate
+
+open Classical
+
+/--
+Return-deterministic postcondition branching on frame boilerplate: every memory
+pins `retVal` to either `1` or `2`, yet polarity-only stripping collapses both
+implications to `True`.
+-/
+def frameIteGenuine : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned retVal memAfter =>
+      if callFramePreserved req.memory memAfter then
+        retVal = u32Arg 1
+      else
+        retVal = u32Arg 2
+    | .panicked _ => False
+    | .aborted => False
+
+theorem frameIteGenuine_returnValueDichotomy :
+    MirCallContractReturnValueDichotomy frameIteGenuine :=
+  ⟨witnessReq, u32Arg 1, u32Arg 0, emptyMemory, trivial,
+    by
+      show (if callFramePreserved emptyMemory emptyMemory then u32Arg 1 = u32Arg 1
+        else u32Arg 1 = u32Arg 2)
+      split
+      · rfl
+      · exact absurd (callFramePreserved_refl emptyMemory) ‹_›,
+    by
+      show ¬ (if callFramePreserved emptyMemory emptyMemory then u32Arg 0 = u32Arg 1
+        else u32Arg 0 = u32Arg 2)
+      split
+      · exact fun h => absurd (u32Arg_inj h) (by decide)
+      · exact absurd (callFramePreserved_refl emptyMemory) ‹_›⟩
+
+/-- Classical equivalent of `frameImpGenuine` via `¬ (frame ∧ retVal ≠ 1)`. -/
+def frameNotAndNotGenuine : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned retVal memAfter =>
+      ¬ (callFramePreserved req.memory memAfter ∧ retVal ≠ u32Arg 1)
+    | .panicked _ => False
+    | .aborted => False
+
+theorem frameNotAndNotGenuine_returnValueDichotomy :
+    MirCallContractReturnValueDichotomy frameNotAndNotGenuine :=
+  ⟨witnessReq, u32Arg 1, u32Arg 0, emptyMemory, trivial,
+    fun ⟨_, hne⟩ => hne rfl,
+    fun h => h ⟨callFramePreserved_refl _,
+      fun heq => absurd (u32Arg_inj heq) (by decide)⟩⟩
+
+/-- Biconditional coupling frame boilerplate to a genuine return pin. -/
+def frameIffGenuine : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned retVal memAfter =>
+      callFramePreserved req.memory memAfter ↔ retVal = u32Arg 1
+    | .panicked _ => False
+    | .aborted => False
+
+theorem frameIffGenuine_returnValueDichotomy :
+    MirCallContractReturnValueDichotomy frameIffGenuine :=
+  ⟨witnessReq, u32Arg 1, u32Arg 0, emptyMemory, trivial,
+    ⟨fun _ => rfl, fun _ => callFramePreserved_refl _⟩,
+    fun h => absurd (u32Arg_inj (h.mp (callFramePreserved_refl _))) (by decide)⟩
+
+/-- Data-level `ite` branching on boilerplate while genuinely pinning `retVal`. -/
+def dataIteBoilerplateGenuine : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned retVal memAfter =>
+      retVal =
+        if callFramePreserved req.memory memAfter then u32Arg 1 else u32Arg 2
+    | .panicked _ => False
+    | .aborted => False
+
+theorem dataIteBoilerplateGenuine_returnValueDichotomy :
+    MirCallContractReturnValueDichotomy dataIteBoilerplateGenuine :=
+  ⟨witnessReq, u32Arg 1, u32Arg 0, emptyMemory, trivial,
+    by
+      show u32Arg 1 = if callFramePreserved emptyMemory emptyMemory then u32Arg 1 else u32Arg 2
+      split
+      · rfl
+      · exact absurd (callFramePreserved_refl emptyMemory) ‹_›,
+    by
+      show u32Arg 0 ≠ if callFramePreserved emptyMemory emptyMemory then u32Arg 1 else u32Arg 2
+      split
+      · exact fun h => absurd (u32Arg_inj h) (by decide)
+      · exact absurd (callFramePreserved_refl emptyMemory) ‹_›⟩
+
+/-- Data-level `ite` encoding pure frame boilerplate with no user constraint. -/
+def dataIteBoilerplateOnly : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned _ memAfter =>
+      (if callFramePreserved req.memory memAfter then (1 : Nat) else 2) = 1
+    | .panicked _ => False
+    | .aborted => True
+
+theorem dataIteBoilerplateOnly_not_returnValueDichotomy :
+    ¬ MirCallContractReturnValueDichotomy dataIteBoilerplateOnly :=
+  not_mirCallContractReturnValueDichotomy_of_value_blind fun _ _ _ _ _ => Iff.rfl
+
+end ClassicalBoilerplate
+
+/--
+Pure boilerplate biconditional: polarity-only stripping leaves `↔` untouched,
+letting this bypass `userEnsuresOnly`. Cofactoring refutes every assignment.
+-/
+def boilerplateIffBoilerplate (sidecar : CapturedMir) : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned retVal memAfter =>
+      callFramePreserved req.memory memAfter ↔
+        retMatchesCalleeReturnTy sidecar retVal
+    | .panicked _ => False
+    | .aborted => True
+
+theorem boilerplateIffBoilerplate_blind_given_boilerplate (sidecar : CapturedMir)
+    (req : MirCallReq) (v₁ v₂ : Value) (m₁ m₂ : Memory)
+    (hf : callFramePreserved req.memory m₁ ↔ callFramePreserved req.memory m₂)
+    (ht : retMatchesCalleeReturnTy sidecar v₁ ↔
+      retMatchesCalleeReturnTy sidecar v₂) :
+    (boilerplateIffBoilerplate sidecar).post req (.returned v₁ m₁) ↔
+      (boilerplateIffBoilerplate sidecar).post req (.returned v₂ m₂) :=
+  ⟨fun h => ⟨fun h₂ => ht.mp (h.mp (hf.mpr h₂)), fun h₂ => hf.mp (h.mpr (ht.mpr h₂))⟩,
+    fun h => ⟨fun h₁ => ht.mpr (h.mp (hf.mp h₁)), fun h₁ => hf.mpr (h.mpr (ht.mp h₁))⟩⟩
+
+theorem extSpecDefault_not_dichotomyBeyond_boilerplate (target : DefPath)
+    (sidecar : CapturedMir) :
+    ¬ DichotomyBeyondPredicate
+        (fun req (out : Value × Memory) =>
+          callFramePreserved req.memory out.2 ∧
+            retMatchesCalleeReturnTy sidecar out.1)
+        (Class5.extSpecDefault target sidecar).pre
+        (mirCallNormalPost (Class5.extSpecDefault target sidecar)) :=
+  not_dichotomyBeyondPredicate_of_boilerplate_only fun _ _ _ _ hiff =>
+    ⟨fun ⟨hf, ht, _⟩ => ⟨(hiff.mp ⟨hf, ht⟩).1, (hiff.mp ⟨hf, ht⟩).2, trivial⟩,
+      fun ⟨hf, ht, _⟩ => ⟨(hiff.mpr ⟨hf, ht⟩).1, (hiff.mpr ⟨hf, ht⟩).2, trivial⟩⟩
+
+theorem extSpecDefault_bridge (target : DefPath) (sidecar : CapturedMir) :
+    ¬ ExternalSpecEnsuresDichotomy target sidecar (fun _ => True)
+        (fun _ _ => True) :=
+  fun h => extSpecDefault_not_dichotomyBeyond_boilerplate target sidecar
+    ((externalSpecEnsuresDichotomy_iff_dichotomyBeyond_boilerplate
+      target sidecar (fun _ => True) (fun _ _ => True)).mp h)
+
+/-- Sequential composition into an unsatisfiable second stage is unrealizable. -/
+theorem seq_inc_constFalse_not_realizable :
+    ¬ ContractRealizable
+      (seqPre Refinement.incPre Refinement.incSpec (fun _ => True))
+      (seqPost Refinement.incSpec (fun (_ _ : Nat) => False)) :=
+  not_realizable_seq_of_second_unrealizable
+    (not_realizable_of_unsat_post fun _ _ _ h => h)
+
+/-- `inc ; inc` is deterministic, universally realizable, and pointwise-dichotomous. -/
+theorem seq_inc_inc_deterministic :
+    ContractDeterministic
+      (seqPre Refinement.incPre Refinement.incSpec Refinement.incPre)
+      (seqPost Refinement.incSpec Refinement.incSpec) :=
+  contractDeterministic_seq Refinement.incSpec_deterministic
+    Refinement.incSpec_deterministic
+
+theorem seq_inc_inc_universalRealizable :
+    UniversalContractRealizable
+      (seqPre Refinement.incPre Refinement.incSpec Refinement.incPre)
+      (seqPost Refinement.incSpec Refinement.incSpec) :=
+  universalRealizable_seq
+    ⟨5, Refinement.incPre_five, fun mid (h : mid = 5 + 1) =>
+      show mid < 100 by omega⟩
+    ⟨⟨5, Refinement.incPre_five⟩, fun x _ => ⟨x + 1, rfl⟩⟩
+    ⟨⟨5, Refinement.incPre_five⟩, fun y _ => ⟨y + 1, rfl⟩⟩
+
+theorem seq_inc_inc_pointwiseDichotomy :
+    PointwisePostconditionDichotomy
+      (seqPre Refinement.incPre Refinement.incSpec Refinement.incPre)
+      (seqPost Refinement.incSpec Refinement.incSpec) :=
+  pointwiseDichotomy_seq_of_deterministic_first
+    ⟨5, Refinement.incPre_five, fun mid (h : mid = 5 + 1) =>
+      show mid < 100 by omega⟩
+    ⟨⟨5, Refinement.incPre_five⟩, fun x _ => ⟨x + 1, rfl⟩⟩
+    Refinement.incSpec_deterministic
+    ⟨⟨5, Refinement.incPre_five⟩, fun y _ =>
+      ⟨⟨y + 1, rfl⟩, ⟨y + 2, show ¬ (y + 2 = y + 1) by omega⟩⟩⟩
+
+run_meta do
+  let user : EnsuresCheckConfig := { userEnsuresOnly := true }
+  let strictUser : EnsuresCheckConfig :=
+    { userEnsuresOnly := true, strictReturnValue := true }
+  for n in #[``frameImpGenuine, ``frameIteGenuine, ``frameNotAndNotGenuine,
+      ``frameIffGenuine, ``dataIteBoilerplateGenuine] do
+    let rDef ← reportOf n
+    unless rDef.bindsOutput && rDef.bindsBeyondBoilerplate do
+      throwError "{n}: expected bindsOutput and bindsBeyondBoilerplate\n{rDef.describe}"
+    assertEnsuresBindsOutput n (cfg := user)
+    assertEnsuresBindsOutput n (cfg := strictUser)
+  for n in #[``dataIteBoilerplateOnly, ``boilerplateIffBoilerplate] do
+    let rDef ← reportOf n
+    unless rDef.bindsOutput && !rDef.bindsBeyondBoilerplate do
+      throwError "{n}: expected binding by boilerplate only\n{rDef.describe}"
+    expectReason n .boilerplateOnly (cfg := user)
+  expectReason ``dataIteBoilerplateOnly .returnValueUnconstrained
+    (cfg := { strictReturnValue := true })
+
+/-! ### Dependent-type soundness in equational rewriting -/
+
+/--
+`n = 1` must not blindly substitute `n ↦ 1` into `@Fin.val n v` where `v : Fin n`,
+which would corrupt the residual into an ill-typed term.
+-/
+def depHypEq2 (n : Nat) (v : Fin n) (r : Nat) : Prop :=
+  n = 1 → r = v.val
+
+theorem depHypEq2_dichotomy :
+    PostconditionDichotomy (fun (_ : (n : Nat) × Fin n) => True)
+      (fun p r => depHypEq2 p.1 p.2 r) :=
+  ⟨⟨1, ⟨0, by decide⟩⟩, 0, 1, trivial, fun _ => rfl,
+    fun h => absurd (h rfl) (by decide)⟩
+
+def depHypVacuous (n : Nat) (_v : Fin n) (r : Nat) : Prop :=
+  n = 1 → r = r
+
+theorem depHypVacuous_not_dichotomy (pre : (n : Nat) × Fin n → Prop) :
+    ¬ PostconditionDichotomy pre (fun p r => depHypVacuous p.1 p.2 r) :=
+  not_dichotomy_of_universal_post fun _ _ _ _ => rfl
+
+def depPre1 (n : Nat) (_v : Fin n) : Prop := n = 1
+def depPostVal (n : Nat) (v : Fin n) (r : Nat) : Prop := r = v.val
+
+theorem depPostVal_dichotomy :
+    PostconditionDichotomy (fun p : (n : Nat) × Fin n => depPre1 p.1 p.2)
+      (fun p r => depPostVal p.1 p.2 r) :=
+  ⟨⟨1, ⟨0, by decide⟩⟩, 0, 1, rfl, rfl, show ¬ (1 = 0) by decide⟩
+
+#expect_binds depHypEq2
+#expect_vacuous depHypVacuous reflexiveTautology
+
+run_meta do
+  -- Directly verify that `simpProp` keeps `depHypEq2` kernel-well-typed.
+  withLocalDeclD `n (mkConst ``Nat) fun n =>
+  withLocalDeclD `v (mkApp (mkConst ``Fin) n) fun v =>
+  withLocalDeclD `r (mkConst ``Nat) fun r => do
+    let body := mkApp3 (mkConst ``depHypEq2) n v r
+    let ctx : EnsuresCheck.Context :=
+      { cfg := {}, outputs := #[r.fvarId!], stripBoilerplate := false }
+    let (res, _) ← ((EnsuresCheck.simpProp body).run ctx).run {}
+    check res
+  -- Rewriting under `requires` must likewise stay well-typed on dependent inputs.
+  assertEnsuresBindsOutput ``depPostVal (preDecl? := some ``depPre1)
+
+/-! ### `requires` consistency, `preRefuted` invariant, and existential contracts -/
+
+def unsatPreVal (a : Value) : Prop := a = .unit ∧ a = .uninit
+def unsatPreNonlin (x : Nat) : Prop := x * x + 1 = 0
+
+theorem unsatPreVal_not_satisfiable : ¬ PreconditionSatisfiable unsatPreVal :=
+  fun ⟨_, h₁, h₂⟩ => nomatch h₁.symm.trans h₂
+
+theorem unsatPreNonlin_not_satisfiable :
+    ¬ PreconditionSatisfiable unsatPreNonlin :=
+  fun ⟨_, h⟩ => Nat.succ_ne_zero _ h
+
+def unsatPreContract : MirCallContract where
+  pre req := req.args = [.unit] ∧ req.args = [.uninit]
+  post _ ans :=
+    match ans with
+    | .returned r _ => r = .unit
+    | .panicked _ => False
+    | .aborted => False
+
+theorem unsatPreContract_not_preSatisfiable :
+    ¬ MirCallContractPreSatisfiable unsatPreContract :=
+  fun ⟨_, h₁, h₂⟩ => nomatch h₁.symm.trans h₂
+
+def unsatDisjExistsContract : MirCallContract where
+  pre req :=
+    (∃ a, req.args = [u32Arg a] ∧ a < 5 ∧ a > 10) ∨
+      (∃ b, req.args = [u32Arg b] ∧ b < 2 ∧ b > 8)
+  post _ ans :=
+    match ans with
+    | .returned retVal _ => retVal = u32Arg 0
+    | .panicked _ => False
+    | .aborted => False
+
+theorem unsatDisjExistsContract_not_preSatisfiable :
+    ¬ MirCallContractPreSatisfiable unsatDisjExistsContract := by
+  rintro ⟨_, ⟨a, _, h₁, h₂⟩ | ⟨b, _, h₁, h₂⟩⟩ <;> omega
+
+def unsatPreWithGenuinePost : MirCallContract where
+  pre _ := False
+  post _ ans :=
+    match ans with
+    | .returned r _ => r = u32Arg 1
+    | .panicked _ => False
+    | .aborted => False
+
+def emptyInputPost (_ : Empty) (r : Nat) : Prop := r = 0
+
+theorem emptyInputPost_not_dichotomy :
+    ¬ PostconditionDichotomy HardeningB1.emptyDomainPre emptyInputPost :=
+  fun ⟨e, _, _, _, _, _⟩ => e.elim
+
+def zeroPre (x : Nat) : Prop := x = 0
+
+/-- Exhaustive 5-constructor `Value` disjunction hidden behind `x = 0` from `requires`. -/
+def valueExhaustiveUnderPre (x : Nat) (r : Value) : Prop :=
+  r = .unit ∨ r = .uninit ∨ (∃ s, r = .scalar s) ∨
+    (∃ p n, r = .ptr p n) ∨ (∃ i fs, r = .aggregate i fs ∧ x = 0)
+
+theorem valueExhaustiveUnderPre_not_dichotomy :
+    ¬ PostconditionDichotomy zeroPre valueExhaustiveUnderPre :=
+  not_dichotomy_of_universal_post fun _ r hx => by
+    cases r with
+    | unit => exact .inl rfl
+    | uninit => exact .inr (.inl rfl)
+    | scalar s => exact .inr (.inr (.inl ⟨s, rfl⟩))
+    | ptr p n => exact .inr (.inr (.inr (.inl ⟨p, n, rfl⟩)))
+    | aggregate i fs => exact .inr (.inr (.inr (.inr ⟨i, fs, rfl, hx⟩)))
+
+/-- Existential MIR contract whose `ensures` guard is dead under `requires`. -/
+def vacuousExistsContract : MirCallContract where
+  pre req := ∃ a, req.args = [u32Arg a] ∧ a < 10
+  post req ans :=
+    match ans with
+    | .returned retVal _ =>
+      ∃ a, req.args = [u32Arg a] ∧ (a ≥ 10 → retVal = u32Arg 0)
+    | .panicked _ => False
+    | .aborted => False
+
+theorem vacuousExistsContract_not_normalDichotomy :
+    ¬ MirCallContractNormalDichotomy vacuousExistsContract :=
+  not_mirCallContractNormalDichotomy_of_return_blind
+    fun _ _ _ _ _ ⟨a, ha, hlt⟩ =>
+      ⟨fun _ => ⟨a, ha, fun hge => absurd hge (by omega)⟩,
+        fun _ => ⟨a, ha, fun hge => absurd hge (by omega)⟩⟩
+
+/-- Existential MIR contract whose `ensures` contradicts `requires`. -/
+def contradictedExistsContract : MirCallContract where
+  pre req := ∃ a, req.args = [u32Arg a] ∧ a < 10
+  post req ans :=
+    match ans with
+    | .returned retVal _ =>
+      ∃ a, req.args = [u32Arg a] ∧ a ≥ 10 ∧ retVal = u32Arg 0
+    | .panicked _ => False
+    | .aborted => False
+
+theorem contradictedExistsContract_not_normalRealizable :
+    ¬ MirCallContractNormalRealizable contradictedExistsContract := by
+  rintro ⟨_, _, _, ⟨a, ha, hlt⟩, a', ha', hge, _⟩
+  have := u32Single_inj ha ha'
+  omega
+
+/-- Slice-metadata existential MIR contract whose guard is dead when `len = 0`. -/
+def sliceVacuousExistsContract : MirCallContract where
+  pre req := ∃ ptr sz len, req.args = [sliceArg ptr sz len] ∧ len = 0
+  post req ans :=
+    match ans with
+    | .returned retVal _ =>
+      ∃ ptr sz len, req.args = [sliceArg ptr sz len] ∧
+        (len > 0 → retVal = u32Arg 0)
+    | .panicked _ => False
+    | .aborted => False
+
+theorem sliceVacuousExistsContract_not_normalDichotomy :
+    ¬ MirCallContractNormalDichotomy sliceVacuousExistsContract :=
+  not_mirCallContractNormalDichotomy_of_return_blind
+    fun _ _ _ _ _ ⟨ptr, sz, len, ha, h0⟩ =>
+      ⟨fun _ => ⟨ptr, sz, len, ha, fun hgt => absurd hgt (by omega)⟩,
+        fun _ => ⟨ptr, sz, len, ha, fun hgt => absurd hgt (by omega)⟩⟩
+
+/-- Length precondition contradicting an empty-list guard. -/
+def lenPreContract : MirCallContract where
+  pre req := req.args.length = 1
+  post req ans :=
+    match ans with
+    | .returned retVal _ => req.args = [] → retVal = u32Arg 0
+    | .panicked _ => False
+    | .aborted => False
+
+theorem lenPreContract_not_normalDichotomy :
+    ¬ MirCallContractNormalDichotomy lenPreContract :=
+  not_mirCallContractNormalDichotomy_of_return_blind
+    fun _ _ _ _ _ hlen =>
+      ⟨fun _ hnil => by simp [lenPreContract, hnil] at hlen,
+        fun _ hnil => by simp [lenPreContract, hnil] at hlen⟩
+
+#expect_vacuous unsatPreContract requiresUnsatisfiable
+#expect_vacuous unsatDisjExistsContract requiresUnsatisfiable
+#expect_vacuous unsatPreWithGenuinePost requiresUnsatisfiable
+#expect_vacuous vacuousExistsContract vacuousUnderRequires
+#expect_vacuous contradictedExistsContract unrealizableUnderRequires
+#expect_vacuous sliceVacuousExistsContract vacuousUnderRequires
+#expect_vacuous lenPreContract vacuousUnderRequires
+
+run_meta do
+  -- `checkRequiresSatisfiable` and `checkEnsuresBindsOutput` agree on deep
+  -- constructor and nonlinear refutations.
+  for n in #[``unsatPreVal, ``unsatPreNonlin, ``unsatPreContract,
+      ``unsatDisjExistsContract] do
+    assertRequiresRefuted n
+  -- When `requiresUnsatisfiable` fires, `boundOutputIdxs` is empty and
+  -- `bindsBeyondBoilerplate` must be `false`.
+  for n in #[``unsatPreContract, ``unsatDisjExistsContract,
+      ``unsatPreWithGenuinePost, ``Class1.contradictoryClaim] do
+    let r ← reportOf n
+    unless r.reason? == some .requiresUnsatisfiable &&
+        r.boundOutputIdxs.isEmpty && !r.bindsBeyondBoilerplate do
+      throwError "{n}: inconsistent requiresUnsatisfiable report\n{r.describe}"
+  -- Empty input domain is also flagged as `requiresUnsatisfiable`.
+  let rEmp ← checkDeclEnsuresBindsOutput ``emptyInputPost
+    (preDecl? := some ``HardeningB1.emptyDomainPre)
+  unless rEmp.reason? == some .requiresUnsatisfiable &&
+      !rEmp.bindsBeyondBoilerplate do
+    throwError "emptyInputPost: unexpected report\n{rEmp.describe}"
+  -- `caseSplitOutput` re-runs on the precondition-rewritten residual.
+  assertEnsuresVacuous ``valueExhaustiveUnderPre (some .vacuousUnderRequires)
+    (preDecl? := some ``zeroPre)
+  -- Without `requires`, `valueExhaustiveUnderPre` binds (`x` could be nonzero).
+  assertEnsuresBindsOutput ``valueExhaustiveUnderPre
+
+/-! ### Disjunctive congruence, existential witnesses, and multi-conjunct unsat -/
+
+vacuous_case disjCongr reflexiveTautology :=
+  fun x r => r ≠ x ∨ HardeningA1.opaqueFn r = HardeningA1.opaqueFn x
+  by
+    intro x r₁ r₂
+    have key : ∀ r, r ≠ x ∨ HardeningA1.opaqueFn r = HardeningA1.opaqueFn x :=
+      fun r => if h : r = x then .inr (h ▸ rfl) else .inl h
+    exact ⟨fun _ => key r₂, fun _ => key r₁⟩
+
+vacuous_case disjCongrAndInput reflexiveTautology :=
+  fun x r => (r ≠ x ∨ HardeningA1.opaqueFn r = HardeningA1.opaqueFn x) ∧ x > 0
+  by
+    intro x r₁ r₂
+    have key : ∀ r, r ≠ x ∨ HardeningA1.opaqueFn r = HardeningA1.opaqueFn x :=
+      fun r => if h : r = x then .inr (h ▸ rfl) else .inl h
+    exact ⟨fun ⟨_, hx⟩ => ⟨key r₂, hx⟩, fun ⟨_, hx⟩ => ⟨key r₁, hx⟩⟩
+
+/--
+Non-vacuous twin of disjunctive congruence: `r ≠ x ∨ r ≠ y` rejects `r = 0`
+when `x = y = 0`. Guards against circular simultaneous substitution in `Or`.
+-/
+def disjNonVacuous (x y r : Nat) : Prop := r ≠ x ∨ r ≠ y
+
+theorem disjNonVacuous_dichotomy :
+    PostconditionDichotomy (fun _ : Nat × Nat => True)
+      (fun p r => disjNonVacuous p.1 p.2 r) :=
+  ⟨(0, 0), 1, 0, trivial, .inl (by decide), fun h => h.elim (· rfl) (· rfl)⟩
+
+vacuous_case existsParity semanticallyInsensitive :=
+  fun _ r => ∃ y : Nat, r = 2 * y ∨ r = 2 * y + 1
+  by
+    intro _ r₁ r₂
+    exact ⟨fun _ => ⟨r₂ / 2, by omega⟩, fun _ => ⟨r₁ / 2, by omega⟩⟩
+
+vacuous_case existsSumNat semanticallyInsensitive :=
+  fun _ r => ∃ a b : Nat, a + b = r
+  by
+    intro _ r₁ r₂
+    exact ⟨fun _ => ⟨0, r₂, by omega⟩, fun _ => ⟨0, r₁, by omega⟩⟩
+
+vacuous_case existsListLen semanticallyInsensitive :=
+  fun _ r => ∃ l : List Nat, l.length = r
+  by
+    intro _ r₁ r₂
+    exact ⟨fun _ => ⟨List.replicate r₂ 0, by simp⟩,
+      fun _ => ⟨List.replicate r₁ 0, by simp⟩⟩
+
+vacuous_case multiConjUnsat unsatisfiable :=
+  fun _ r => r = 0 ∧ r = 1
+  by intro _ r₁ r₂; exact ⟨fun ⟨h₁, h₂⟩ => by omega, fun ⟨h₁, h₂⟩ => by omega⟩
+
+def multiConjValUnsat (_x : Nat) (r : Value) : Prop := r = .unit ∧ r = .uninit
+
+theorem multiConjValUnsat_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre multiConjValUnsat :=
+  not_dichotomy_of_unsat_post fun _ _ _ ⟨h₁, h₂⟩ => nomatch h₁.symm.trans h₂
+
+#expect_binds disjNonVacuous
+#expect_vacuous multiConjValUnsat unsatisfiable
+
+run_meta do
+  let noProbe : EnsuresCheckConfig := { semanticProbe := false }
+  -- Classical disjunctive congruence is syntactic: needs no proof search.
+  assertEnsuresVacuous ``disjCongr (some .reflexiveTautology) (cfg := noProbe)
+  assertEnsuresVacuous ``disjCongrAndInput (some .reflexiveTautology) (cfg := noProbe)
+  assertEnsuresBindsOutput ``disjNonVacuous (cfg := noProbe)
+
+end HardeningB2
+
 /-! ## Axiom and soundness audit -/
 
 namespace Audit
