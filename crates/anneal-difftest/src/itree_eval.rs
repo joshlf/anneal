@@ -501,16 +501,102 @@ pub fn itree_lean_threads_for_resources(
     by_cpu.min(by_mem).max(1)
 }
 
+/// Conservative fallback `.olean`/`.ilean` mmap footprint in KiB (`512 MiB`)
+/// reserved when `<anneal_dir>/.lake/build/lib/lean` cannot be measured on disk.
+pub const DEFAULT_ITREE_OLEAN_RESERVE_KIB: u64 = 512 * 1024;
+
+/// Estimated per-thread non-heap RSS overhead in KiB (`128 MiB` per
+/// `LEAN_NUM_THREADS` worker thread for C++ thread stacks and glibc/mimalloc
+/// per-thread arenas that Lean 4's `-M` small-object allocator cap does not
+/// bound).
+pub const ITREE_PER_THREAD_ARENA_KIB: u64 = 128 * 1024;
+
+/// Minimum non-heap physical RSS reserve in KiB (`1024 MiB` = `1 GiB`) enforced
+/// whenever a worker's physical RSS watchdog ceiling is at least `4 GiB`.
+pub const MIN_ITREE_LARGE_BUDGET_RESERVE_KIB: u64 = 1024 * 1024;
+
+/// Automatic `LEAN_NUM_THREADS` cap for `itree-difftest` `lake env lean`
+/// workers whenever the worker's RSS ceiling is at or below
+/// [`DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB`] (`8 GiB`), unless overridden via
+/// `ANNEAL_ITREE_LEAN_THREADS`.
+pub const ITREE_LEAN_MAX_THREADS_UNDER_8GIB_RSS: usize = 2;
+
+const ITREE_LARGE_BUDGET_THRESHOLD_KIB: u64 = 4 * 1024 * 1024;
+const ITREE_MEDIUM_BUDGET_THRESHOLD_KIB: u64 = 2 * 1024 * 1024;
+const ITREE_MIN_LEAN_HEAP_MB_LARGE: u64 = 512;
+const ITREE_MIN_LEAN_HEAP_MB_SMALL: u64 = 256;
+const ITREE_MIN_LEAN_HEAP_MB_TINY: u64 = 64;
+const ITREE_MAX_LEAN_HEAP_MB: u64 = 16_384;
+
+fn itree_lean_measured_non_heap_kib(lean_threads: usize, olean_footprint_kib: Option<u64>) -> u64 {
+    let threads = lean_threads.max(1) as u64;
+    let olean_kib = olean_footprint_kib.unwrap_or(DEFAULT_ITREE_OLEAN_RESERVE_KIB);
+    olean_kib.saturating_add(ITREE_PER_THREAD_ARENA_KIB.saturating_mul(threads))
+}
+
+fn itree_lean_max_mb_for_rss_and_reserve(rss_limit_kib: u64, reserve_kib: u64) -> u64 {
+    let heap_kib = rss_limit_kib.saturating_sub(reserve_kib);
+    // Floor-divide KiB -> MiB so `lean_max_mb * 1024 + reserve_kib <= rss_limit_kib`
+    // holds without upward rounding ever eating into the non-heap reserve.
+    (heap_kib / 1024).clamp(ITREE_MIN_LEAN_HEAP_MB_TINY, ITREE_MAX_LEAN_HEAP_MB)
+}
+
+/// Computes the physical RSS reserve (in KiB) withheld from Lean 4's `-M`
+/// small-object heap limit to cover memory-mapped `.olean`/`.ilean` files,
+/// C++ thread stacks, and allocator per-thread arenas under an outer process-tree
+/// RSS ceiling of `rss_limit_kib`.
+///
+/// - `measured_need = olean_footprint_kib.unwrap_or(DEFAULT_ITREE_OLEAN_RESERVE_KIB)
+///   + ITREE_PER_THREAD_ARENA_KIB * lean_threads.max(1)`.
+/// - On budgets `>= 4 GiB`, reserves at least [`MIN_ITREE_LARGE_BUDGET_RESERVE_KIB`]
+///   (`1024 MiB`) or `measured_need` (whichever is larger), capped so Lean retains
+///   at least `512 MiB` for `-M`.
+/// - On smaller budgets (`512 MiB .. < 4 GiB`), scales at least proportionally
+///   (`max(rss_limit_kib / 4, measured_need)`), capped so Lean retains at least
+///   `512 MiB` on `>= 2 GiB` budgets and `256 MiB` on `>= 512 MiB` budgets.
+/// - On explicit sub-`512 MiB` budgets, reserves down to the absolute `64 MiB`
+///   `-M` floor so `lean_max_mb * 1024 + reserve_kib <= rss_limit_kib` (and
+///   strict `< rss_limit_kib`) holds for every budget above `64 MiB`.
+pub fn itree_lean_non_heap_reserve_kib(
+    rss_limit_kib: u64,
+    lean_threads: usize,
+    olean_footprint_kib: Option<u64>,
+) -> u64 {
+    let measured_need = itree_lean_measured_non_heap_kib(lean_threads, olean_footprint_kib);
+    let min_heap_kib = if rss_limit_kib >= ITREE_MEDIUM_BUDGET_THRESHOLD_KIB {
+        ITREE_MIN_LEAN_HEAP_MB_LARGE * 1024
+    } else if rss_limit_kib >= MIN_ITREE_LEAN_RSS_LIMIT_KIB {
+        ITREE_MIN_LEAN_HEAP_MB_SMALL * 1024
+    } else {
+        ITREE_MIN_LEAN_HEAP_MB_TINY * 1024
+    };
+    let max_reserve_kib = rss_limit_kib.saturating_sub(min_heap_kib);
+    if max_reserve_kib == 0 {
+        return 0;
+    }
+    let desired_kib = if rss_limit_kib >= ITREE_LARGE_BUDGET_THRESHOLD_KIB {
+        measured_need.max(MIN_ITREE_LARGE_BUDGET_RESERVE_KIB)
+    } else {
+        measured_need.max(rss_limit_kib / 4)
+    };
+    desired_kib.min(max_reserve_kib)
+}
+
 /// Computes `(lean_max_mb, rss_limit_kib)` for one `lake env lean` worker from
-/// effective `(total_kib, avail_kib)` and `active_workers`.
+/// effective `(total_kib, avail_kib)`, `active_workers`, `lean_threads`, and an
+/// optional measured `.olean`/`.ilean` footprint in KiB.
 ///
 /// Reserves `min(20% of available, 2 GiB)` for the rest of the system / test
-/// runner, divides the remaining budget across `active_workers`, and clamps to
-/// `[MIN_ITREE_LEAN_RSS_LIMIT_KIB, DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB]`.
-pub fn itree_lean_rss_budget_kib(
+/// runner, divides the remaining budget across `active_workers`, clamps
+/// `rss_limit_kib` to `[MIN_ITREE_LEAN_RSS_LIMIT_KIB, DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB]`,
+/// and subtracts [`itree_lean_non_heap_reserve_kib`] before deriving `lean_max_mb`
+/// so `lean_max_mb * 1024 + reserve_kib <= rss_limit_kib` always holds.
+pub fn itree_lean_rss_budget_with_reserve_kib(
     total_kib: Option<u64>,
     avail_kib: Option<u64>,
     active_workers: usize,
+    lean_threads: usize,
+    olean_footprint_kib: Option<u64>,
 ) -> (u64, u64) {
     const TWO_GIB_KIB: u64 = 2 * 1024 * 1024;
     let workers = (active_workers.max(1)) as u64;
@@ -522,20 +608,64 @@ pub fn itree_lean_rss_budget_kib(
         rss_kib = rss_kib.min(usable);
     }
     if let Some(total) = total_kib {
-        let usable_total = (total.saturating_mul(3) / 4) / workers;
+        // Compute exact `floor(3 * total / 4)` without overflowing `u64`.
+        let three_quarters = (total / 4)
+            .saturating_mul(3)
+            .saturating_add(((total % 4) * 3) / 4);
+        let usable_total = three_quarters / workers;
         rss_kib = rss_kib.min(usable_total);
     }
     let rss_limit_kib = rss_kib.clamp(
         MIN_ITREE_LEAN_RSS_LIMIT_KIB,
         DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB,
     );
-    let lean_max_mb = (rss_limit_kib / 1024).clamp(256, 8192);
+    let reserve_kib =
+        itree_lean_non_heap_reserve_kib(rss_limit_kib, lean_threads, olean_footprint_kib);
+    let lean_max_mb = itree_lean_max_mb_for_rss_and_reserve(rss_limit_kib, reserve_kib);
     (lean_max_mb, rss_limit_kib)
+}
+
+/// Computes `(lean_max_mb, rss_limit_kib)` for one `lake env lean` worker from
+/// effective `(total_kib, avail_kib)` and `active_workers`, using conservative
+/// non-heap reserve defaults ([`ITREE_LEAN_MAX_THREADS_UNDER_8GIB_RSS`] threads
+/// and [`DEFAULT_ITREE_OLEAN_RESERVE_KIB`]).
+pub fn itree_lean_rss_budget_kib(
+    total_kib: Option<u64>,
+    avail_kib: Option<u64>,
+    active_workers: usize,
+) -> (u64, u64) {
+    itree_lean_rss_budget_with_reserve_kib(
+        total_kib,
+        avail_kib,
+        active_workers,
+        ITREE_LEAN_MAX_THREADS_UNDER_8GIB_RSS,
+        None,
+    )
 }
 
 fn parse_positive_env_u64(raw: Option<&str>, min: u64) -> Option<u64> {
     raw.and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&n| n >= min)
+}
+
+/// Caps a resolved `LEAN_NUM_THREADS` count to
+/// [`ITREE_LEAN_MAX_THREADS_UNDER_8GIB_RSS`] (`2`) whenever the worker's RSS
+/// limit is at or below [`DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB`] (`8 GiB`), unless
+/// `ANNEAL_ITREE_LEAN_THREADS` was explicitly set by the caller.
+pub fn cap_itree_lean_threads_for_rss_with_env(
+    anneal_itree_lean_threads: Option<&str>,
+    threads: usize,
+    rss_limit_kib: u64,
+) -> usize {
+    let threads = threads.max(1);
+    if parse_positive_env_u64(anneal_itree_lean_threads, 1).is_some() {
+        return threads;
+    }
+    if rss_limit_kib <= DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB {
+        threads.min(ITREE_LEAN_MAX_THREADS_UNDER_8GIB_RSS)
+    } else {
+        threads
+    }
 }
 
 /// Pure helper for [`resolve_itree_lean_threads`]:
@@ -591,11 +721,59 @@ pub fn resolve_itree_lean_threads(active_workers: usize) -> usize {
     )
 }
 
-/// Pure helper for [`resolve_itree_lean_rss_budget_kib`]: starts from
-/// [`itree_lean_rss_budget_kib`]; an explicit `ANNEAL_ITREE_LEAN_MAX_MB`
-/// (`>= 64`, capped at 16384) sets Lean's `-M` (and, absent an RSS override, the
-/// RSS ceiling); an explicit `ANNEAL_ITREE_MAX_RSS_KIB` (`>= 1024`) sets the RSS
-/// ceiling and derives `-M` from it only when `-M` was not set explicitly.
+/// Pure helper resolving `(lean_max_mb, rss_limit_kib)` with explicit thread
+/// count and optional `.olean`/`.ilean` footprint:
+///
+/// - starts from [`itree_lean_rss_budget_with_reserve_kib`];
+/// - an explicit `ANNEAL_ITREE_LEAN_MAX_MB` (`>= 64`, capped at `16384`) sets
+///   Lean's `-M`, and absent `ANNEAL_ITREE_MAX_RSS_KIB` adds non-heap headroom
+///   on top so `.olean` mmaps and thread arenas do not trip the RSS watchdog
+///   before `-M` engages;
+/// - an explicit `ANNEAL_ITREE_MAX_RSS_KIB` (`>= 1024`) sets the RSS ceiling
+///   and, when `-M` was not set explicitly, derives `-M` after subtracting
+///   [`itree_lean_non_heap_reserve_kib`].
+pub fn resolve_itree_lean_rss_budget_with_env_and_reserve(
+    anneal_itree_lean_max_mb: Option<&str>,
+    anneal_itree_max_rss_kib: Option<&str>,
+    total_kib: Option<u64>,
+    avail_kib: Option<u64>,
+    active_workers: usize,
+    lean_threads: usize,
+    olean_footprint_kib: Option<u64>,
+) -> (u64, u64) {
+    let (mut lean_max_mb, mut rss_limit_kib) = itree_lean_rss_budget_with_reserve_kib(
+        total_kib,
+        avail_kib,
+        active_workers,
+        lean_threads,
+        olean_footprint_kib,
+    );
+    let explicit_mb = parse_positive_env_u64(anneal_itree_lean_max_mb, ITREE_MIN_LEAN_HEAP_MB_TINY)
+        .map(|mb| mb.min(ITREE_MAX_LEAN_HEAP_MB));
+    if let Some(mb) = explicit_mb {
+        lean_max_mb = mb;
+        let measured = itree_lean_measured_non_heap_kib(lean_threads, olean_footprint_kib);
+        let non_heap_kib = if mb >= 3072 {
+            measured.max(MIN_ITREE_LARGE_BUDGET_RESERVE_KIB)
+        } else {
+            measured.max(mb.saturating_mul(1024) / 3)
+        };
+        rss_limit_kib = mb.saturating_mul(1024).saturating_add(non_heap_kib);
+    }
+    if let Some(kib) = parse_positive_env_u64(anneal_itree_max_rss_kib, 1024) {
+        rss_limit_kib = kib;
+        if explicit_mb.is_none() {
+            let reserve_kib =
+                itree_lean_non_heap_reserve_kib(rss_limit_kib, lean_threads, olean_footprint_kib);
+            lean_max_mb = itree_lean_max_mb_for_rss_and_reserve(rss_limit_kib, reserve_kib);
+        }
+    }
+    (lean_max_mb, rss_limit_kib)
+}
+
+/// Pure helper for [`resolve_itree_lean_rss_budget_kib`], using conservative
+/// non-heap reserve defaults ([`ITREE_LEAN_MAX_THREADS_UNDER_8GIB_RSS`] threads
+/// and [`DEFAULT_ITREE_OLEAN_RESERVE_KIB`]).
 pub fn resolve_itree_lean_rss_budget_with_env(
     anneal_itree_lean_max_mb: Option<&str>,
     anneal_itree_max_rss_kib: Option<&str>,
@@ -603,20 +781,144 @@ pub fn resolve_itree_lean_rss_budget_with_env(
     avail_kib: Option<u64>,
     active_workers: usize,
 ) -> (u64, u64) {
-    let (mut lean_max_mb, mut rss_limit_kib) =
-        itree_lean_rss_budget_kib(total_kib, avail_kib, active_workers);
-    let explicit_mb = parse_positive_env_u64(anneal_itree_lean_max_mb, 64).map(|mb| mb.min(16_384));
-    if let Some(mb) = explicit_mb {
-        lean_max_mb = mb;
-        rss_limit_kib = mb.saturating_mul(1024);
+    resolve_itree_lean_rss_budget_with_env_and_reserve(
+        anneal_itree_lean_max_mb,
+        anneal_itree_max_rss_kib,
+        total_kib,
+        avail_kib,
+        active_workers,
+        ITREE_LEAN_MAX_THREADS_UNDER_8GIB_RSS,
+        None,
+    )
+}
+
+/// Resolves `(lean_max_mb, rss_limit_kib, lean_threads)` jointly for one
+/// `lake env lean` worker so that:
+/// 1. when `rss_limit_kib <= DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB` (`8 GiB`) and
+///    `ANNEAL_ITREE_LEAN_THREADS` is not explicitly set, `lean_threads` is
+///    capped to [`ITREE_LEAN_MAX_THREADS_UNDER_8GIB_RSS`] (`2`);
+/// 2. the non-heap reserve subtracted from `rss_limit_kib` (or added above an
+///    explicit `ANNEAL_ITREE_LEAN_MAX_MB`) matches that final `lean_threads`
+///    and optional `.olean`/`.ilean` footprint.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_itree_lean_execution_budget_with_env(
+    anneal_itree_lean_max_mb: Option<&str>,
+    anneal_itree_max_rss_kib: Option<&str>,
+    anneal_itree_lean_threads: Option<&str>,
+    caller_lean_num_threads: Option<&str>,
+    host_cores: usize,
+    cgroup_cores: Option<usize>,
+    total_kib: Option<u64>,
+    avail_kib: Option<u64>,
+    active_workers: usize,
+    olean_footprint_kib: Option<u64>,
+) -> (u64, u64, usize) {
+    let raw_threads = resolve_itree_lean_threads_with_env(
+        anneal_itree_lean_threads,
+        caller_lean_num_threads,
+        host_cores,
+        cgroup_cores,
+        avail_kib,
+        active_workers,
+    );
+    let (_prov_mb, prov_rss_kib) = resolve_itree_lean_rss_budget_with_env_and_reserve(
+        anneal_itree_lean_max_mb,
+        anneal_itree_max_rss_kib,
+        total_kib,
+        avail_kib,
+        active_workers,
+        raw_threads,
+        olean_footprint_kib,
+    );
+    let lean_threads = cap_itree_lean_threads_for_rss_with_env(
+        anneal_itree_lean_threads,
+        raw_threads,
+        prov_rss_kib,
+    );
+    let (lean_max_mb, rss_limit_kib) = resolve_itree_lean_rss_budget_with_env_and_reserve(
+        anneal_itree_lean_max_mb,
+        anneal_itree_max_rss_kib,
+        total_kib,
+        avail_kib,
+        active_workers,
+        lean_threads,
+        olean_footprint_kib,
+    );
+    (lean_max_mb, rss_limit_kib, lean_threads)
+}
+
+/// Measures the total on-disk size (in KiB, rounded up) of `.olean` / `.ilean`
+/// artifacts under `<anneal_dir>/.lake/build/lib/lean` (returning `None` if the
+/// directory does not exist or has no matching artifacts, so callers fall back
+/// to [`DEFAULT_ITREE_OLEAN_RESERVE_KIB`]). Does not follow directory symlinks.
+pub fn measure_itree_olean_footprint_kib(anneal_dir: &Path) -> Option<u64> {
+    let lib_root = anneal_dir.join(".lake/build/lib/lean");
+    if !lib_root.is_dir() {
+        return None;
     }
-    if let Some(kib) = parse_positive_env_u64(anneal_itree_max_rss_kib, 1024) {
-        rss_limit_kib = kib;
-        if explicit_mb.is_none() {
-            lean_max_mb = (kib / 1024).clamp(64, 16_384);
+    let mut total_bytes: u64 = 0;
+    let mut stack = vec![lib_root];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file() {
+                let name = entry.file_name();
+                let is_lean_artifact = name.to_str().is_some_and(|s| {
+                    s.ends_with(".olean")
+                        || s.ends_with(".olean.server")
+                        || s.ends_with(".olean.private")
+                        || s.ends_with(".ilean")
+                });
+                if is_lean_artifact && let Ok(meta) = entry.metadata() {
+                    total_bytes = total_bytes.saturating_add(meta.len());
+                }
+            }
         }
     }
-    (lean_max_mb, rss_limit_kib)
+    if total_bytes == 0 {
+        None
+    } else {
+        Some(total_bytes.div_ceil(1024))
+    }
+}
+
+/// Resolves `(lean_max_mb, rss_limit_kib, lean_threads)` for one of
+/// `active_workers` concurrent `lake env lean` workers against host + cgroup
+/// limits and an optional cached `.olean`/`.ilean` footprint.
+fn resolve_itree_lean_execution_budget(
+    active_workers: usize,
+    olean_footprint_kib: Option<u64>,
+) -> (u64, u64, usize) {
+    let host_cores = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    let cgroup_cores = fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|cg| cgroup_cpu_quota_cores(Path::new("/sys/fs/cgroup"), &cg));
+    let (total_kib, avail_kib) = effective_memory_limits_kib();
+    resolve_itree_lean_execution_budget_with_env(
+        env::var("ANNEAL_ITREE_LEAN_MAX_MB").ok().as_deref(),
+        env::var("ANNEAL_ITREE_MAX_RSS_KIB").ok().as_deref(),
+        env::var("ANNEAL_ITREE_LEAN_THREADS").ok().as_deref(),
+        env::var("LEAN_NUM_THREADS").ok().as_deref(),
+        host_cores,
+        cgroup_cores,
+        total_kib,
+        avail_kib,
+        active_workers,
+        olean_footprint_kib,
+    )
 }
 
 /// Resolves `(lean_max_mb, rss_limit_kib)` for one of `active_workers`
@@ -1877,6 +2179,140 @@ where
     }
 }
 
+/// Evaluates a Stage 2 confirmation slice with deterministic adaptive halving
+/// when a multi-case module exceeds memory limits
+/// ([`ItreeLeanFailureKind::RssWatchdogExceeded`] or
+/// [`ItreeLeanFailureKind::LeanMemoryExhausted`]).
+///
+/// If `cases.len() > 1` and `run_slice` fails due to RSS/memory exhaustion,
+/// splits `cases` into `[..mid]` and `[mid..]` (`mid = cases.len() / 2`),
+/// recursively confirms both halves under distinct collision-free labels
+/// (`{base_label}_split_d{depth}_{lo}_{hi}`), and logs structured `eprintln!`
+/// telemetry. When every subchunk succeeds and confirms every case in `cases`,
+/// returns `Ok(merged)` cleanly without surfacing any error to
+/// [`run_isolated_lean_stage`]. If a `k == 1` singleton fails, a non-memory
+/// failure occurs (timeout, elaboration/kernel rejection, missing toolchain),
+/// or any case is omitted by a subchunk, fails closed by returning `Err(...)`.
+fn run_adaptive_confirm_chunk<C, X, K, F>(
+    base_label: &str,
+    cases: &[C],
+    case_key: &K,
+    run_slice: &F,
+) -> Result<BTreeMap<String, X>, String>
+where
+    K: Fn(&C) -> &str,
+    F: Fn(&str, &[C]) -> Result<BTreeMap<String, X>, String>,
+{
+    if cases.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn split_rec<C, X, K, F>(
+        base_label: &str,
+        cases: &[C],
+        lo: usize,
+        hi: usize,
+        depth: usize,
+        splits: &mut usize,
+        max_depth: &mut usize,
+        case_key: &K,
+        run_slice: &F,
+    ) -> Result<BTreeMap<String, X>, String>
+    where
+        K: Fn(&C) -> &str,
+        F: Fn(&str, &[C]) -> Result<BTreeMap<String, X>, String>,
+    {
+        let slice = &cases[lo..hi];
+        let label = if depth == 0 {
+            base_label.to_string()
+        } else {
+            format!("{base_label}_split_d{depth}_{lo}_{hi}")
+        };
+        match run_slice(&label, slice) {
+            Ok(map) => {
+                if let Some(missing) = slice.iter().find(|c| !map.contains_key(case_key(c))) {
+                    return Err(format!(
+                        "{label}: Lean confirm subchunk produced no result for `{}`",
+                        case_key(missing)
+                    ));
+                }
+                Ok(map)
+            }
+            Err(err) => {
+                let kind = classify_itree_lean_failure(&err);
+                let is_memory_limit = matches!(
+                    kind,
+                    ItreeLeanFailureKind::RssWatchdogExceeded
+                        | ItreeLeanFailureKind::LeanMemoryExhausted
+                );
+                if slice.len() <= 1 || !is_memory_limit {
+                    return Err(err);
+                }
+                let mid = lo + (hi - lo) / 2;
+                let next_depth = depth + 1;
+                *splits += 1;
+                *max_depth = (*max_depth).max(next_depth);
+                let summary = err.lines().next().unwrap_or("");
+                eprintln!(
+                    "itree-difftest: adaptive Stage 2 confirm split \
+                     label={label} depth={next_depth} cases={} -> left={} right={} \
+                     kind={kind:?} reason={summary}",
+                    hi - lo,
+                    mid - lo,
+                    hi - mid
+                );
+                let mut merged = split_rec(
+                    base_label,
+                    cases,
+                    lo,
+                    mid,
+                    next_depth,
+                    splits,
+                    max_depth,
+                    case_key,
+                    run_slice,
+                )?;
+                let right = split_rec(
+                    base_label,
+                    cases,
+                    mid,
+                    hi,
+                    next_depth,
+                    splits,
+                    max_depth,
+                    case_key,
+                    run_slice,
+                )?;
+                merged.extend(right);
+                Ok(merged)
+            }
+        }
+    }
+
+    let mut splits = 0usize;
+    let mut max_depth = 0usize;
+    let res = split_rec(
+        base_label,
+        cases,
+        0,
+        cases.len(),
+        0,
+        &mut splits,
+        &mut max_depth,
+        case_key,
+        run_slice,
+    )?;
+    if splits > 0 {
+        eprintln!(
+            "itree-difftest: adaptive Stage 2 confirm recovered \
+             label={base_label} cases={} splits={splits} max_depth={max_depth}",
+            cases.len()
+        );
+    }
+    Ok(res)
+}
+
 /// Candidates of `stage.failed_fns` that stay comparable on their completed
 /// cases, mapped to how many of their cases are dropped: every case of the
 /// candidate without a result is in [`IsolatedLeanStage::inconclusive_cases`]
@@ -2066,7 +2502,8 @@ fn run_itree_lake_build_targets(dot_anneal_dir: &Path, targets: &[String]) -> Re
 
 /// Writes `src` to `verify_dir/<label>.lean` and runs `lake env lean -M <mb>`
 /// on it from `anneal_dir` under [`run_command_with_watchdog`], bounding
-/// `LEAN_NUM_THREADS`, Lean's internal allocator (`-M`), the process tree's
+/// `LEAN_NUM_THREADS`, Lean's internal allocator (`-M`, with non-heap headroom
+/// reserved for `.olean`/`.ilean` mmaps and thread arenas), the process tree's
 /// physical RSS, and wall-clock runtime for one of `active_workers` concurrent
 /// workers evaluating a module of `cases` trace cases.
 fn run_itree_lean_module_with_workers(
@@ -2076,11 +2513,12 @@ fn run_itree_lean_module_with_workers(
     src: &str,
     active_workers: usize,
     cases: usize,
+    olean_footprint_kib: Option<u64>,
 ) -> Result<String, String> {
     let file = verify_dir.join(format!("{label}.lean"));
     fs::write(&file, src).map_err(|e| format!("failed to write {}: {e}", file.display()))?;
-    let (lean_max_mb, rss_limit_kib) = resolve_itree_lean_rss_budget_kib(active_workers);
-    let lean_threads = resolve_itree_lean_threads(active_workers);
+    let (lean_max_mb, rss_limit_kib, lean_threads) =
+        resolve_itree_lean_execution_budget(active_workers, olean_footprint_kib);
     let timeout = resolve_itree_lean_timeout_for_cases(cases);
 
     let mut cmd = Command::new(resolve_itree_lake_bin());
@@ -2152,8 +2590,17 @@ fn run_itree_lean_module(
     anneal_dir: &Path,
     label: &str,
     src: &str,
+    olean_footprint_kib: Option<u64>,
 ) -> Result<String, String> {
-    run_itree_lean_module_with_workers(verify_dir, anneal_dir, label, src, 1, 1)
+    run_itree_lean_module_with_workers(
+        verify_dir,
+        anneal_dir,
+        label,
+        src,
+        1,
+        1,
+        olean_footprint_kib,
+    )
 }
 
 fn batch_case_ident(case: &BatchTraceEvalCase) -> &str {
@@ -3935,12 +4382,17 @@ fn evaluate_itree_entries(
         fs::create_dir_all(&verify_dir)
             .map_err(|e| format!("failed to create {}: {e}", verify_dir.display()))?;
 
+        // Measure the built `.olean`/`.ilean` footprint once after `mir_stage`
+        // so Stage 1 and Stage 2 reserve realistic mmap headroom without
+        // re-walking `.lake/build/lib/lean` per chunk.
+        let olean_footprint_kib = measure_itree_olean_footprint_kib(&anneal_dir);
         let lean_jobs = resolve_itree_lean_jobs();
         eprintln!(
             "itree-difftest: Lean TraceCheck over {} distinct traces from {} candidates \
-             with {lean_jobs} concurrent `lake env lean` worker(s)",
+             with {lean_jobs} concurrent `lake env lean` worker(s) (olean_footprint_kib={:?})",
             batch_cases.len(),
-            compared_fn_names.len()
+            compared_fn_names.len(),
+            olean_footprint_kib
         );
 
         // Stage 1: Probe `diagnoseRawByteTraceFullBounded` across all distinct
@@ -3964,6 +4416,7 @@ fn evaluate_itree_entries(
                     &src,
                     itree_lean_stage_concurrency(lean_jobs),
                     chunk.len(),
+                    olean_footprint_kib,
                 )?;
                 let parsed = parse_batch_trace_probe_output(&stdout);
                 for c in chunk {
@@ -4065,17 +4518,18 @@ fn evaluate_itree_entries(
         let confirm_chunk_size = options
             .confirm_chunk_size
             .clamp(1, ITREE_MAX_CONFIRM_CHUNK_SIZE);
-        let run_confirm_chunk = |label: &str, chunk: &[BatchTraceEvalCase]| {
-            let src = render_batch_trace_eval_lean_module(&format!("Proof.{label}"), chunk, false);
+        let run_confirm_slice = |label: &str, slice: &[BatchTraceEvalCase]| {
+            let src = render_batch_trace_eval_lean_module(&format!("Proof.{label}"), slice, false);
             run_itree_lean_module_with_workers(
                 &verify_dir,
                 &anneal_dir,
                 label,
                 &src,
                 itree_lean_stage_concurrency(lean_jobs),
-                chunk.len(),
+                slice.len(),
+                olean_footprint_kib,
             )?;
-            Ok(chunk
+            Ok(slice
                 .iter()
                 .map(|c| {
                     (
@@ -4084,6 +4538,9 @@ fn evaluate_itree_entries(
                     )
                 })
                 .collect::<BTreeMap<String, String>>())
+        };
+        let run_confirm_chunk = |label: &str, chunk: &[BatchTraceEvalCase]| {
+            run_adaptive_confirm_chunk(label, chunk, &batch_case_ident, &run_confirm_slice)
         };
         let mut confirm_stage = run_isolated_lean_stage(
             "ItreeDiffBatchConfirm",
@@ -5134,6 +5591,7 @@ pub fn reproduce_itree_finding(
         let mut lake_targets = vec!["Anneal".to_string(), root_mir_module];
         lake_targets.extend(callee_sig_modules);
         run_itree_lake_build_targets(&anneal_dir, &lake_targets)?;
+        let olean_footprint_kib = measure_itree_olean_footprint_kib(&anneal_dir);
 
         let verify_dir = anneal_dir.join("generated/Verify/ItreeDiffStaged");
         fs::create_dir_all(&verify_dir)
@@ -5148,6 +5606,7 @@ pub fn reproduce_itree_finding(
             &anneal_dir,
             "ItreeDiffReproProbe",
             &probe_src,
+            olean_footprint_kib,
         )
         .map_err(|e| format!("repro probe failed:\n{e}"))?;
         let probe_map = parse_batch_trace_probe_output(&probe_stdout);
@@ -5169,6 +5628,7 @@ pub fn reproduce_itree_finding(
             &anneal_dir,
             "ItreeDiffRepro",
             &confirm_src,
+            olean_footprint_kib,
         ) {
             Ok(_) => true,
             Err(e) if itree_lean_failure_is_inconclusive(&e) => {
@@ -6694,9 +7154,19 @@ mod tests {
         );
         let (lean_mb, rss_kib) =
             itree_lean_rss_budget_kib(Some(10 * GIB_KIB), Some(5 * GIB_KIB), 2);
-        // 5 GiB avail -> reserve 1 GiB -> 4 GiB usable / 2 workers = 2 GiB per worker.
+        // 5 GiB avail -> reserve 1 GiB -> 4 GiB usable / 2 workers = 2 GiB per worker;
+        // non-heap reserve (512 MiB olean + 2 * 128 MiB thread arenas = 768 MiB) leaves
+        // 1280 MiB for Lean's `-M` cap (`1280 * 1024 + 768 * 1024 == 2 GiB`).
+        let reserve_kib = itree_lean_non_heap_reserve_kib(
+            rss_kib,
+            ITREE_LEAN_MAX_THREADS_UNDER_8GIB_RSS,
+            None,
+        );
         assert_eq!(rss_kib, 2 * GIB_KIB);
-        assert_eq!(lean_mb, 2048);
+        assert_eq!(reserve_kib, 768 * 1024);
+        assert_eq!(lean_mb, 1280);
+        assert!(lean_mb * 1024 + reserve_kib <= rss_kib);
+        assert!(lean_mb * 1024 < rss_kib);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -7236,14 +7706,24 @@ mod tests {
             resolve_itree_lean_rss_budget_with_env(Some("4096"), Some("9000000"), None, None, 1),
             (4096, 9_000_000)
         );
-        assert_eq!(
-            resolve_itree_lean_rss_budget_with_env(None, Some("2097152"), None, None, 1),
-            (2048, 2_097_152)
+        // Explicit RSS override without `-M` still withholds the non-heap reserve.
+        let (derived_mb, explicit_rss) =
+            resolve_itree_lean_rss_budget_with_env(None, Some("2097152"), None, None, 1);
+        let reserve_2g = itree_lean_non_heap_reserve_kib(
+            2_097_152,
+            ITREE_LEAN_MAX_THREADS_UNDER_8GIB_RSS,
+            None,
         );
-        assert_eq!(
-            resolve_itree_lean_rss_budget_with_env(Some("1024"), None, None, None, 1),
-            (1024, 1024 * 1024)
-        );
+        assert_eq!(explicit_rss, 2_097_152);
+        assert_eq!(derived_mb, 1280);
+        assert!(derived_mb * 1024 + reserve_2g <= explicit_rss);
+        assert!(derived_mb * 1024 < explicit_rss);
+        // Explicit `-M` without RSS override adds non-heap headroom above `-M * 1024`.
+        let (explicit_mb, padded_rss) =
+            resolve_itree_lean_rss_budget_with_env(Some("1024"), None, None, None, 1);
+        assert_eq!(explicit_mb, 1024);
+        assert_eq!(padded_rss, (1024 + 768) * 1024);
+        assert!(explicit_mb * 1024 < padded_rss);
 
         // Timeouts scale with the module's case count unless set explicitly.
         assert_eq!(resolve_itree_lean_timeout_with_env(None, None, 1), DEFAULT_ITREE_LEAN_TIMEOUT);
@@ -7629,5 +8109,276 @@ mod tests {
                 .is_empty(),
             "cand_split must not be partially compared when its Chunk 3 fallback was skipped"
         );
+    }
+
+    #[test]
+    fn non_heap_reserve_enforces_strict_headroom_invariant_across_budgets_and_edge_cases() {
+        const MIB_KIB: u64 = 1024;
+
+        // 1. Canonical budgets (512 MiB, 2 GiB, 4 GiB, 8 GiB, 16 GiB) via explicit RSS
+        //    and via host/avail calculation: strict headroom invariant must hold everywhere.
+        for rss_kib in [
+            512 * MIB_KIB,
+            2 * GIB_KIB,
+            4 * GIB_KIB,
+            8 * GIB_KIB,
+            16 * GIB_KIB,
+            // Non-MiB-aligned sizes: floor division must never eat into `reserve_kib`.
+            512 * MIB_KIB + 777,
+            4 * GIB_KIB + 1023,
+            8 * GIB_KIB - 1,
+            256 * MIB_KIB + 1,
+            64 * MIB_KIB + 1,
+        ] {
+            for threads in [0usize, 1, 2, 4, 8] {
+                for olean in [None, Some(0u64), Some(256 * MIB_KIB), Some(2 * GIB_KIB)] {
+                    let reserve_kib = itree_lean_non_heap_reserve_kib(rss_kib, threads, olean);
+                    let rss_str = rss_kib.to_string();
+                    let (lean_mb, resolved_rss) = resolve_itree_lean_rss_budget_with_env_and_reserve(
+                        None,
+                        Some(&rss_str),
+                        None,
+                        None,
+                        1,
+                        threads,
+                        olean,
+                    );
+                    assert_eq!(resolved_rss, rss_kib);
+                    assert!(
+                        lean_mb.saturating_mul(1024).saturating_add(reserve_kib) <= resolved_rss,
+                        "headroom invariant violated for rss={rss_kib}, threads={threads}, \
+                         olean={olean:?}: lean_mb={lean_mb}, reserve={reserve_kib}"
+                    );
+                    assert!(
+                        lean_mb.saturating_mul(1024) < resolved_rss,
+                        "strict headroom violated for rss={rss_kib}, threads={threads}, \
+                         olean={olean:?}: lean_mb={lean_mb}"
+                    );
+                    if rss_kib >= 4 * GIB_KIB {
+                        assert!(
+                            reserve_kib >= MIN_ITREE_LARGE_BUDGET_RESERVE_KIB,
+                            "budgets >= 4 GiB must reserve >= 1024 MiB (got {reserve_kib})"
+                        );
+                    }
+                    if rss_kib >= 2 * GIB_KIB {
+                        assert!(
+                            lean_mb >= 512,
+                            "budgets >= 2 GiB must keep lean_max_mb >= 512 (got {lean_mb})"
+                        );
+                    } else if rss_kib >= 512 * MIB_KIB {
+                        assert!(
+                            lean_mb >= 256,
+                            "budgets >= 512 MiB must keep lean_max_mb >= 256 (got {lean_mb})"
+                        );
+                    }
+                }
+            }
+        }
+
+        // 2. Default 8 GiB budget leaves at least 1024 MiB headroom (`lean_max_mb <= 7168`).
+        let (lean_mb_8g, rss_8g) =
+            itree_lean_rss_budget_with_reserve_kib(Some(64 * GIB_KIB), Some(48 * GIB_KIB), 1, 2, None);
+        assert_eq!(rss_8g, DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB);
+        assert_eq!(lean_mb_8g, 7168);
+        assert_eq!(
+            itree_lean_non_heap_reserve_kib(rss_8g, 2, None),
+            MIN_ITREE_LARGE_BUDGET_RESERVE_KIB
+        );
+
+        // 3. Large measured `.olean` footprint increases reserve beyond 1024 MiB on 8 GiB,
+        //    while extreme/overflow inputs stay panic-free and preserve the 512 MiB heap floor.
+        let (lean_mb_big_olean, rss_big_olean) = itree_lean_rss_budget_with_reserve_kib(
+            Some(64 * GIB_KIB),
+            Some(48 * GIB_KIB),
+            1,
+            2,
+            Some(1536 * MIB_KIB),
+        );
+        assert_eq!(rss_big_olean, DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB);
+        // 1536 MiB olean + 2 * 128 MiB thread arenas = 1792 MiB reserve -> 6400 MiB heap.
+        assert_eq!(lean_mb_big_olean, 6400);
+
+        let extreme_reserve = itree_lean_non_heap_reserve_kib(8 * GIB_KIB, usize::MAX, Some(u64::MAX));
+        assert_eq!(extreme_reserve, 8 * GIB_KIB - 512 * MIB_KIB);
+        let (extreme_mb, extreme_rss) = itree_lean_rss_budget_with_reserve_kib(
+            Some(u64::MAX),
+            Some(u64::MAX),
+            0,
+            usize::MAX,
+            Some(u64::MAX),
+        );
+        assert_eq!(extreme_rss, DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB);
+        assert_eq!(extreme_mb, 512);
+        assert_eq!(itree_lean_non_heap_reserve_kib(0, 1, None), 0);
+        assert_eq!(itree_lean_non_heap_reserve_kib(64 * MIB_KIB, 1, None), 0);
+
+        // 4. `measure_itree_olean_footprint_kib` sums `.olean`/`.ilean` bytes and skips missing dirs.
+        let tmp = env::temp_dir().join(format!(
+            "anneal-itree-olean-measure-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        assert_eq!(measure_itree_olean_footprint_kib(&tmp), None);
+        let lean_lib = tmp.join(".lake/build/lib/lean/Trusted");
+        fs::create_dir_all(&lean_lib).unwrap();
+        fs::write(lean_lib.join("A.olean"), vec![0u8; 2049]).unwrap(); // 2049 B
+        fs::write(lean_lib.join("A.ilean"), vec![0u8; 1024]).unwrap(); // 1024 B
+        fs::write(lean_lib.join("A.olean.server"), vec![0u8; 512]).unwrap(); // 512 B
+        fs::write(lean_lib.join("ignored.txt"), vec![0u8; 100_000]).unwrap();
+        // Total matching bytes = 3585 -> ceil(3585 / 1024) = 4 KiB.
+        assert_eq!(measure_itree_olean_footprint_kib(&tmp), Some(4));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn execution_budget_caps_lean_threads_to_two_under_8gib_unless_overridden() {
+        // Default 8 GiB cap on a large 64-core / 128 GiB host caps `LEAN_NUM_THREADS` to 2.
+        let (lean_mb, rss_kib, threads) = resolve_itree_lean_execution_budget_with_env(
+            None,
+            None,
+            None,
+            Some("12"),
+            64,
+            None,
+            Some(128 * GIB_KIB),
+            Some(96 * GIB_KIB),
+            1,
+            None,
+        );
+        assert_eq!(rss_kib, DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB);
+        assert_eq!(threads, 2);
+        assert_eq!(lean_mb, 7168);
+
+        // Explicit `ANNEAL_ITREE_LEAN_THREADS` override still wins even under `<= 8 GiB`,
+        // and its higher thread count is reflected in the non-heap reserve.
+        let (ov_mb, ov_rss, ov_threads) = resolve_itree_lean_execution_budget_with_env(
+            None,
+            None,
+            Some("6"),
+            Some("12"),
+            64,
+            None,
+            Some(128 * GIB_KIB),
+            Some(96 * GIB_KIB),
+            1,
+            None,
+        );
+        assert_eq!(ov_rss, DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB);
+        assert_eq!(ov_threads, 6);
+        // 512 MiB olean + 6 * 128 MiB arenas = 1280 MiB reserve -> 6912 MiB heap.
+        assert_eq!(ov_mb, 6912);
+
+        // Budgets strictly above 8 GiB (explicit `ANNEAL_ITREE_MAX_RSS_KIB=16 GiB`) allow > 2 threads.
+        let rss_16g = (16 * GIB_KIB).to_string();
+        let (big_mb, big_rss, big_threads) = resolve_itree_lean_execution_budget_with_env(
+            None,
+            Some(&rss_16g),
+            None,
+            Some("4"),
+            64,
+            None,
+            Some(128 * GIB_KIB),
+            Some(96 * GIB_KIB),
+            1,
+            None,
+        );
+        assert_eq!(big_rss, 16 * GIB_KIB);
+        assert_eq!(big_threads, 4);
+        assert_eq!(big_mb, 15_360);
+    }
+
+    #[test]
+    fn adaptive_stage2_confirm_splits_16_case_rss_failure_cleanly_and_fails_closed_on_singleton() {
+        use std::sync::Mutex;
+
+        // 1. 16-case chunk fails with `[WATCHDOG:RSS_EXCEEDED]` whenever `slice.len() > 4`,
+        //    succeeding once halved to 4-case subchunks: all 16 cases confirmed, distinct
+        //    labels used, zero dropped candidates, zero `confirm_stage.errors`.
+        let (cases, case_to_fn) = stage_fixture(&[
+            ("c0", 4),
+            ("c1", 4),
+            ("c2", 4),
+            ("c3", 4),
+        ]);
+        assert_eq!(cases.len(), 16);
+        let seen_labels = Mutex::new(Vec::<String>::new());
+        let stage = run_isolated_lean_stage(
+            "ItreeDiffBatchConfirm",
+            &cases,
+            16,
+            1,
+            ident,
+            &case_to_fn,
+            |label: &str, chunk: &[String]| {
+                run_adaptive_confirm_chunk(label, chunk, &ident, &|sub_label, slice| {
+                    seen_labels.lock().unwrap().push(sub_label.to_string());
+                    if slice.len() > 4 {
+                        Err(format!(
+                            "[WATCHDOG:RSS_EXCEEDED] `{sub_label}.lean` exceeded RSS limit \
+                             (8432128 KiB > 8388608 KiB)"
+                        ))
+                    } else {
+                        ok_all(slice)
+                    }
+                })
+            },
+        );
+        assert!(
+            stage.errors.is_empty(),
+            "adaptive RSS recovery must not pollute confirm_stage.errors: {:?}",
+            stage.errors
+        );
+        assert!(stage.failed_fns.is_empty());
+        assert!(stage.inconclusive_cases.is_empty());
+        assert_eq!(stage.results.len(), 16);
+        for c in &cases {
+            assert!(stage.results.contains_key(c), "missing confirmed case `{c}`");
+        }
+        let labels = seen_labels.into_inner().unwrap();
+        let unique_labels: BTreeSet<&String> = labels.iter().collect();
+        assert_eq!(
+            unique_labels.len(),
+            labels.len(),
+            "subchunk labels must never collide: {labels:?}"
+        );
+        // 16 -> (8, 8) -> (4, 4, 4, 4) = 7 invocations total.
+        assert_eq!(labels.len(), 7, "expected 1 + 2 + 4 split runs, got {labels:?}");
+
+        // 2. Singleton (`k == 1`) RSS failure must fail closed and surface `Err`.
+        let single = vec!["case_poison_t0".to_string()];
+        let single_err = run_adaptive_confirm_chunk(
+            "ItreeDiffBatchConfirmChunk0",
+            &single,
+            &ident,
+            &|_label, _slice| {
+                Err::<BTreeMap<String, ()>, String>(
+                    "[WATCHDOG:RSS_EXCEEDED] singleton exceeded RSS limit".to_string(),
+                )
+            },
+        )
+        .expect_err("k=1 singleton RSS failure must fail closed");
+        assert!(single_err.contains("[WATCHDOG:RSS_EXCEEDED]"));
+
+        // 3. Non-memory failure (e.g. `rfl` kernel rejection) must NOT be swallowed or split
+        //    silently; it returns `Err` on the very first attempt so `run_isolated_lean_stage`
+        //    isolates/rejects it properly.
+        let rej_calls = AtomicUsize::new(0);
+        let rej_err = run_adaptive_confirm_chunk(
+            "ItreeDiffBatchConfirmChunk0",
+            &cases[..4],
+            &ident,
+            &|_label, _slice| {
+                rej_calls.fetch_add(1, Ordering::SeqCst);
+                Err::<BTreeMap<String, ()>, String>(
+                    "error: Tactic `rfl` failed: type mismatch".to_string(),
+                )
+            },
+        )
+        .expect_err("non-memory kernel rejection must fail closed immediately");
+        assert!(rej_err.contains("rfl"));
+        assert_eq!(rej_calls.load(Ordering::SeqCst), 1);
     }
 }

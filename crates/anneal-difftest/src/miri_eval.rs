@@ -597,7 +597,7 @@ def probeMirDiffExecBoundedFrom\n    \
   match fuel with\n  \
   | 0 => (.outOfFuel, activeSpan body st)\n  \
   | fuel' + 1 =>\n    \
-    match stepMirState body st with\n    \
+    match stepMirStatePeriodic fuel' body st with\n    \
     | .ret (.normal (.unit, _)) => (.normalUnit, \"none\")\n    \
     | .ret (.normal (.scalar sc, _)) => (.normalScalar sc.bits sc.sizeBytes, \"none\")\n    \
     | .ret (.normal (val, mem)) => ((MirDiffVerdict.normal val mem).toTagWithBody body, \"none\")\n    \
@@ -739,7 +739,7 @@ def probePanicOriginBoundedFrom\n    \
   match fuel with\n  \
   | 0 => none\n  \
   | fuel' + 1 =>\n    \
-    match stepMirState body st with\n    \
+    match stepMirStatePeriodic fuel' body st with\n    \
     | .ret .panic => some (origin.getD st)\n    \
     | .tau st' => probePanicOriginBoundedFrom fuel' body (unwindOrigin body origin st st') st'\n    \
     | .vis (.inr (.inl _)) k =>\n      \
@@ -4548,13 +4548,13 @@ fn acquire_live_lean_oracle_lock() -> (
     (guard, lock_file)
 }
 
-/// Lean's per-process memory cap (`lean -M`, in MiB) for Stage 1 probe
-/// evaluation runs of `oracle/MiriOracleProbe_*.lean`.
-const PROBE_LEAN_MEMORY_MB: &str = "8192";
+/// Upper cap on Lean's per-process memory flag (`lean -M`, in MiB) for Stage 1
+/// probe evaluation runs of `oracle/MiriOracleProbe_*.lean`.
+const PROBE_LEAN_MEMORY_MB_CAP: u64 = 8192;
 
-/// Lean's per-process memory cap (`lean -M`, in MiB) for kernel confirmation
-/// runs of `oracle/MiriOracleConfirm*.lean`.
-const CONFIRM_LEAN_MEMORY_MB: &str = "4096";
+/// Upper cap on Lean's per-process memory flag (`lean -M`, in MiB) for kernel
+/// confirmation runs of `oracle/MiriOracleConfirm*.lean`.
+const CONFIRM_LEAN_MEMORY_MB_CAP: u64 = 4096;
 
 /// Hard resident-set budget (MiB) for one Stage 1b `lake env lean` probe
 /// process tree, enforced by [`run_lean_with_rss_budget`].
@@ -4609,6 +4609,33 @@ fn resolve_miri_lean_rss_budget_kib(stage_cap_mib: u64, jobs: usize) -> u64 {
         jobs,
         avail_kib,
     )
+}
+
+/// Computes Lean's `-M` small-object heap limit (in MiB) strictly below
+/// `rss_budget_kib` (for every budget above the 64 MiB absolute floor),
+/// withholding non-heap headroom for memory-mapped `.olean`/`.ilean` files,
+/// C++ thread stacks, and allocator arenas (`LEAN_NUM_THREADS=1`).
+fn miri_lean_max_mb_for_rss_budget_kib(stage_cap_mb: u64, rss_budget_kib: u64) -> u64 {
+    const LARGE_BUDGET_KIB: u64 = 4 * 1024 * 1024;
+    const LARGE_RESERVE_KIB: u64 = 1024 * 1024;
+    const SMALL_RESERVE_MIN_KIB: u64 = 256 * 1024;
+    const MIN_HEAP_MB_SMALL: u64 = 256;
+    const MIN_HEAP_MB_TINY: u64 = 64;
+
+    let min_heap_kib = if rss_budget_kib >= 512 * 1024 {
+        MIN_HEAP_MB_SMALL * 1024
+    } else {
+        MIN_HEAP_MB_TINY * 1024
+    };
+    let max_reserve_kib = rss_budget_kib.saturating_sub(min_heap_kib);
+    let desired_reserve_kib = if rss_budget_kib >= LARGE_BUDGET_KIB {
+        LARGE_RESERVE_KIB
+    } else {
+        (rss_budget_kib / 4).max(SMALL_RESERVE_MIN_KIB)
+    };
+    let reserve_kib = desired_reserve_kib.min(max_reserve_kib);
+    let heap_mb = rss_budget_kib.saturating_sub(reserve_kib) / 1024;
+    heap_mb.clamp(MIN_HEAP_MB_TINY, stage_cap_mb.max(MIN_HEAP_MB_TINY))
 }
 
 /// `(ppid, starttime)` from `/proc/<pid>/stat` contents (`pid (comm) state
@@ -4928,26 +4955,31 @@ fn rss_budget_kill_note(budget_kib: u64, observed_kib: u64) -> String {
     )
 }
 
-/// Run `lake env lean -M CONFIRM_LEAN_MEMORY_MB <rel_oracle_path>` in `dot_anneal`
+/// Run `lake env lean -M <lean_max_mb> <rel_oracle_path>` in `dot_anneal`
 /// with `LEAN_NUM_THREADS=1` (so concurrent confirm chunk workers never
-/// multiply threads) under a hard `rss_budget_kib` resident-set budget.
+/// multiply threads) under a hard `rss_budget_kib` resident-set budget,
+/// deriving `-M` strictly below `rss_budget_kib` via
+/// [`miri_lean_max_mb_for_rss_budget_kib`].
 fn run_lean_confirm_file(
     lake_bin: &Path,
     dot_anneal: &Path,
     rel_oracle_path: &str,
     rss_budget_kib: u64,
 ) -> Result<LeanConfirmRun, String> {
+    let lean_max_mb =
+        miri_lean_max_mb_for_rss_budget_kib(CONFIRM_LEAN_MEMORY_MB_CAP, rss_budget_kib);
+    let lean_max_mb_arg = lean_max_mb.to_string();
     let mut cmd = Command::new(lake_bin);
     cmd.current_dir(dot_anneal)
         .env("LEAN_NUM_THREADS", "1")
         .arg("env")
         .arg("lean")
         .arg("-M")
-        .arg(CONFIRM_LEAN_MEMORY_MB)
+        .arg(&lean_max_mb_arg)
         .arg(rel_oracle_path);
     let run = run_lean_with_rss_budget(&mut cmd, Some(rss_budget_kib)).map_err(|err| {
         format!(
-            "failed to execute '{} env lean -M {CONFIRM_LEAN_MEMORY_MB} \
+            "failed to execute '{} env lean -M {lean_max_mb} \
              {rel_oracle_path}': {err}",
             lake_bin.display()
         )
@@ -5566,7 +5598,8 @@ fn resource_exhaustion_reason(module_name: &str, run: &LeanConfirmRun) -> String
 /// Stage 2: kernel-confirms `to_confirm` in `MiriOracleConfirm_{chunk_idx:03}.lean`
 /// modules of at most `chunk_size` entries, running at most `jobs` chunk
 /// modules concurrently (each `lake env lean` worker is bounded by
-/// `LEAN_NUM_THREADS=1` and `-M CONFIRM_LEAN_MEMORY_MB` in
+/// `LEAN_NUM_THREADS=1` and a headroom-reserved `-M` cap derived from
+/// `CONFIRM_LEAN_MEMORY_MB_CAP` and `rss_budget_kib` in
 /// [`run_lean_confirm_file`]), so no single Lean process ever has to hold an
 /// unbounded batch of theorems.
 ///
@@ -5968,6 +6001,11 @@ fn run_linked_difftest_oracle_pipeline(
                         format!("failed to write {}: {}", probe_path.display(), err)
                     })?;
 
+                    let probe_lean_max_mb = miri_lean_max_mb_for_rss_budget_kib(
+                        PROBE_LEAN_MEMORY_MB_CAP,
+                        probe_rss_budget_kib,
+                    );
+                    let probe_lean_max_mb_arg = probe_lean_max_mb.to_string();
                     let mut probe_cmd = Command::new(&lake_bin);
                     probe_cmd
                         .current_dir(&dot_anneal)
@@ -5975,12 +6013,12 @@ fn run_linked_difftest_oracle_pipeline(
                         .arg("env")
                         .arg("lean")
                         .arg("-M")
-                        .arg(PROBE_LEAN_MEMORY_MB)
+                        .arg(&probe_lean_max_mb_arg)
                         .arg(&rel_probe_path);
                     let probe_run = run_lean_with_rss_budget(&mut probe_cmd, Some(probe_rss_budget_kib))
                         .map_err(|err| {
                             format!(
-                                "failed to execute '{} env lean -M {PROBE_LEAN_MEMORY_MB} {rel_probe_path}': {err}",
+                                "failed to execute '{} env lean -M {probe_lean_max_mb} {rel_probe_path}': {err}",
                                 lake_bin.display()
                             )
                         })?;
@@ -10130,6 +10168,11 @@ fn probe_helper_protected_alias_write(_r: &u32, alias: *mut u32) -> u32 {
                 run_linked_difftest_oracle_pipeline(cfg, specs).map(|run| run.report.items)
             });
         let (_, plain) = run_probe_pipeline("probes_plain", &fn_sources, &names, |cfg, specs| {
+            // Serialize the plain `cargo_anneal` Lake/Lean pipeline with other
+            // live-Lean tests in the same `cargo test` process so concurrent
+            // `lake build` / `lake env lean` trees never stack inside a tight
+            // capsule cgroup (e.g. `MemoryMax=5946M`).
+            let _lean_guard = acquire_live_lean_oracle_lock();
             cargo_anneal::run_difftest_oracle_pipeline(cfg, specs).map(|rep| rep.items)
         });
 
@@ -12470,6 +12513,78 @@ pub fn cand_shadow() -> u32 {
         assert_eq!(
             miri_lean_rss_budget_kib(4096, None, 4, Some(GIB_KIB)),
             512 * 1024
+        );
+    }
+
+    #[test]
+    fn miri_lean_max_mb_reserves_non_heap_headroom_and_probes_use_periodic_spine_normalization() {
+        const MIB_KIB: u64 = 1024;
+        const GIB_KIB: u64 = 1024 * 1024;
+
+        // Every budget above the 64 MiB floor leaves strict non-heap headroom
+        // (`lean_max_mb * 1024 < rss_budget_kib`) and never exceeds the stage cap.
+        for (stage_cap_mb, rss_kib) in [
+            (CONFIRM_LEAN_MEMORY_MB_CAP, 512 * MIB_KIB),
+            (CONFIRM_LEAN_MEMORY_MB_CAP, 1536 * MIB_KIB),
+            (CONFIRM_LEAN_MEMORY_MB_CAP, 2560 * MIB_KIB),
+            (CONFIRM_LEAN_MEMORY_MB_CAP, 4 * GIB_KIB),
+            (CONFIRM_LEAN_MEMORY_MB_CAP, 4 * GIB_KIB + 999),
+            (PROBE_LEAN_MEMORY_MB_CAP, 8 * GIB_KIB),
+            (PROBE_LEAN_MEMORY_MB_CAP, 12 * GIB_KIB),
+            (CONFIRM_LEAN_MEMORY_MB_CAP, 200 * MIB_KIB),
+        ] {
+            let max_mb = miri_lean_max_mb_for_rss_budget_kib(stage_cap_mb, rss_kib);
+            assert!(
+                max_mb <= stage_cap_mb,
+                "max_mb={max_mb} exceeded stage_cap_mb={stage_cap_mb}"
+            );
+            assert!(
+                max_mb * 1024 < rss_kib,
+                "max_mb={max_mb} MiB left zero headroom under rss_kib={rss_kib}"
+            );
+            if rss_kib >= 4 * GIB_KIB && stage_cap_mb * 1024 >= rss_kib {
+                assert!(
+                    rss_kib - max_mb * 1024 >= GIB_KIB,
+                    "budget {rss_kib} KiB must withhold at least 1 GiB non-heap reserve (got max_mb={max_mb})"
+                );
+            }
+        }
+        assert_eq!(
+            miri_lean_max_mb_for_rss_budget_kib(CONFIRM_LEAN_MEMORY_MB_CAP, 4 * GIB_KIB),
+            3072
+        );
+        assert_eq!(
+            miri_lean_max_mb_for_rss_budget_kib(PROBE_LEAN_MEMORY_MB_CAP, 8 * GIB_KIB),
+            7168
+        );
+        assert_eq!(
+            miri_lean_max_mb_for_rss_budget_kib(CONFIRM_LEAN_MEMORY_MB_CAP, 512 * MIB_KIB),
+            256
+        );
+        // Tiny sub-floor budgets saturate safely at the 64 MiB floor without underflow.
+        assert_eq!(
+            miri_lean_max_mb_for_rss_budget_kib(CONFIRM_LEAN_MEMORY_MB_CAP, 0),
+            64
+        );
+
+        // Both generated Lean probe blocks must step via `stepMirStatePeriodic`
+        // so `by rfl` confirmation normalizes concrete `MachineState` spines
+        // periodically instead of blowing up kernel reduction memory.
+        assert!(
+            PROBE_EXEC_LEAN.contains("match stepMirStatePeriodic fuel' body st with"),
+            "PROBE_EXEC_LEAN must use stepMirStatePeriodic"
+        );
+        assert!(
+            !PROBE_EXEC_LEAN.contains("match stepMirState body st with"),
+            "PROBE_EXEC_LEAN must not regress to raw stepMirState"
+        );
+        assert!(
+            PANIC_MESSAGE_PROBE_LEAN.contains("match stepMirStatePeriodic fuel' body st with"),
+            "PANIC_MESSAGE_PROBE_LEAN must use stepMirStatePeriodic"
+        );
+        assert!(
+            !PANIC_MESSAGE_PROBE_LEAN.contains("match stepMirState body st with"),
+            "PANIC_MESSAGE_PROBE_LEAN must not regress to raw stepMirState"
         );
     }
 

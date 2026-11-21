@@ -773,7 +773,7 @@ def probeMirDiffExecBounded\n    \
   match fuel with\n  \
   | 0 => (.outOfFuel, activeSpan body st)\n  \
   | fuel' + 1 =>\n    \
-    match stepMirState body st with\n    \
+    match stepMirStatePeriodic fuel' body st with\n    \
     | .ret (.normal (.unit, _)) => (.normalUnit, \"none\")\n    \
     | .ret (.normal (.scalar sc, _)) => (.normalScalar sc.bits sc.sizeBytes, \"none\")\n    \
     | .ret (.normal (val, mem)) => ((MirDiffVerdict.normal val mem).toTagWithBody body, \"none\")\n    \
@@ -2741,5 +2741,17 @@ def isLastTarget (defPath : DefPath) : Bool :=
         );
         assert!(!is_trusted_inline_call_def_path("core::intrinsics::const_eval_select"));
         assert!(!is_trusted_inline_call_def_path("core::fmt::Arguments::<'a>::from_str"));
+    }
+
+    #[test]
+    fn mir_diff_probe_defs_use_periodic_spine_normalization() {
+        assert!(
+            MIR_DIFF_PROBE_LEAN_DEFS.contains("match stepMirStatePeriodic fuel' body st with"),
+            "MIR_DIFF_PROBE_LEAN_DEFS must use stepMirStatePeriodic"
+        );
+        assert!(
+            !MIR_DIFF_PROBE_LEAN_DEFS.contains("match stepMirState body st with"),
+            "MIR_DIFF_PROBE_LEAN_DEFS must not regress to raw stepMirState"
+        );
     }
 }

@@ -158,7 +158,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         mr = stage_a["minirust_authority"]
         self.assertEqual(mr["spec_files"], 27)
         self.assertEqual(mr["shallow_types_translated"], 100)
-        self.assertEqual(mr["interp_anchored_items"], 104)
+        self.assertEqual(mr["interp_anchored_items"], 108)
         self.assertGreater(mr["audited_declarations"], 500)
 
         lm = stage_a["lean_miri_authority"]

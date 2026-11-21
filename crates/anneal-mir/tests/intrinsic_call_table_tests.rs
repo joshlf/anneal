@@ -5113,13 +5113,21 @@ fn test_a2_adapter_tables_match_trusted_terminators_lean_exactly() {
             .collect::<std::collections::BTreeSet<_>>()
     };
     // `classifyRustIntrinsic?`: every path but `const_eval_select` (not modeled: `rustc` removes
-    // it before `optimized_mir`) is the intrinsic of the same name.
+    // it before `optimized_mir`) is the intrinsic of the same name, including the repatriated
+    // memory-intrinsic call forms (`copy_nonoverlapping`, `write_bytes`).
     let classify = trusted_def_strings(&source, "classifyRustIntrinsic?");
-    assert_eq!(classify.len(), 25);
+    assert_eq!(classify.len(), 27);
+    assert_eq!(
+        set(classify.clone()).len(),
+        classify.len(),
+        "duplicate def-path entries in classifyRustIntrinsic?"
+    );
     let mut expected_intrinsics = std::collections::BTreeSet::new();
+    let mut const_eval_select_count = 0usize;
     for path in &classify {
         let name = path.rsplit("::").next().unwrap();
         if name == "const_eval_select" {
+            const_eval_select_count += 1;
             assert_eq!(lower_intrinsic_kind_v2026_06_01(path), None);
             continue;
         }
@@ -5128,8 +5136,15 @@ fn test_a2_adapter_tables_match_trusted_terminators_lean_exactly() {
             .find(|op| op.name() == name)
             .unwrap_or_else(|| panic!("no IntrinsicOp named {name}"));
         assert_eq!(lower_intrinsic_kind_v2026_06_01(path), Some(op), "{path}");
-        expected_intrinsics.insert(path.clone());
+        assert!(
+            expected_intrinsics.insert(path.clone()),
+            "duplicate modeled intrinsic in classifyRustIntrinsic?: {path}"
+        );
     }
+    assert_eq!(const_eval_select_count, 1);
+    assert_eq!(expected_intrinsics.len(), 26);
+    assert!(expected_intrinsics.contains("core::intrinsics::copy_nonoverlapping"));
+    assert!(expected_intrinsics.contains("core::intrinsics::write_bytes"));
     // `isDirectExactDivTarget`.
     let exact_div = trusted_def_strings(&source, "isDirectExactDivTarget");
     assert_eq!(exact_div, vec!["core::intrinsics::exact_div".to_string()]);
@@ -5137,14 +5152,16 @@ fn test_a2_adapter_tables_match_trusted_terminators_lean_exactly() {
         lower_intrinsic_kind_v2026_06_01(&exact_div[0]),
         Some(IntrinsicOp::ExactDiv)
     );
-    expected_intrinsics.insert(exact_div[0].clone());
-    // The only additions: the call forms of the memory intrinsics (statements in `Trusted`).
-    expected_intrinsics.insert("core::intrinsics::copy_nonoverlapping".into());
-    expected_intrinsics.insert("core::intrinsics::write_bytes".into());
+    assert!(expected_intrinsics.insert(exact_div[0].clone()));
     let intrinsic_table: std::collections::BTreeSet<String> = RUST_INTRINSIC_DEF_PATHS_V2026_06_01
         .iter()
         .map(|(p, _)| p.to_string())
         .collect();
+    assert_eq!(
+        intrinsic_table.len(),
+        RUST_INTRINSIC_DEF_PATHS_V2026_06_01.len(),
+        "duplicate entries in RUST_INTRINSIC_DEF_PATHS_V2026_06_01"
+    );
     assert_eq!(intrinsic_table, expected_intrinsics);
     // The diverging entry points, exactly.
     assert_eq!(

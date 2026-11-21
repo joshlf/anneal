@@ -5,6 +5,7 @@ import Anneal.ITree
 import Anneal.EffectWP
 import Anneal.ITreeWP
 import Anneal.Rustc.V2026_06_01.Lower
+import Anneal.Rustc.V2026_06_01.SymbolicEval
 
 namespace Anneal.Rustc.V2026_06_01.TraceCheck
 
@@ -22,6 +23,7 @@ open Anneal.ITree
 open Anneal.EffectWP
 open Anneal.ITreeWP
 open Anneal.Rustc.V2026_06_01.Lower
+open Anneal.Rustc.V2026_06_01.SymbolicEval (stepMirStatePeriodic stepMirStatePeriodic_eq)
 
 /-!
 Executable trace-consistency checking, differential-testing triage diagnostics
@@ -1552,7 +1554,7 @@ def reconstructFullMirTrace
   match fuel with
   | 0 => none
   | fuel' + 1 =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel' body st with
     | .ret out =>
       match events with
       | [] =>
@@ -1607,7 +1609,7 @@ def reconstructFullMirTraceFast
   match fuel with
   | 0 => none
   | fuel' + 1 =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel' body st with
     | .ret out =>
       match events with
       | [] =>
@@ -1658,7 +1660,7 @@ def checkFullMirTraceFast
   match fuel with
   | 0 => false
   | fuel' + 1 =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel' body st with
     | .ret out =>
       match events with
       | [] => checkOutcomeMatches outcome out
@@ -1704,6 +1706,7 @@ theorem reconstructFullMirTraceFast_eq
   | zero => rfl
   | succ fuel' ih =>
     unfold reconstructFullMirTraceFast reconstructFullMirTrace
+    simp only [stepMirStatePeriodic_eq]
     cases stepMirState body st with
     | ret out₀ =>
       cases events with
@@ -1800,6 +1803,7 @@ theorem checkFullMirTraceFast_eq
   | zero => rfl
   | succ fuel' ih =>
     unfold checkFullMirTraceFast reconstructFullMirTrace
+    simp only [stepMirStatePeriodic_eq]
     cases stepMirState body st with
     | ret out₀ =>
       cases events with
@@ -1929,6 +1933,7 @@ theorem reconstructFullMirTrace_sound
   | zero => nomatch h_ok
   | succ fuel' ih =>
     unfold reconstructFullMirTrace at h_ok
+    simp only [stepMirStatePeriodic_eq] at h_ok
     have h_obs :
         (ITree.cofix (stepMirState body) st).observe =
           (stepMirState body st).map (ITree.cofix (stepMirState body)) :=
@@ -2112,7 +2117,7 @@ def reconstructObsErasedMirTrace
   match fuel with
   | 0 => none
   | fuel' + 1 =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel' body st with
     | .ret out =>
       match events with
       | [] =>
@@ -2157,7 +2162,7 @@ def reconstructObsErasedMirTraceFast
   match fuel with
   | 0 => none
   | fuel' + 1 =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel' body st with
     | .ret out =>
       match events with
       | [] =>
@@ -2200,7 +2205,7 @@ def checkObsErasedMirTraceFast
   match fuel with
   | 0 => false
   | fuel' + 1 =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel' body st with
     | .ret out =>
       match events with
       | [] => checkOutcomeMatches outcome out
@@ -2239,6 +2244,7 @@ theorem reconstructObsErasedMirTraceFast_eq
   | zero => rfl
   | succ fuel' ih =>
     unfold reconstructObsErasedMirTraceFast reconstructObsErasedMirTrace
+    simp only [stepMirStatePeriodic_eq]
     cases stepMirState body st with
     | ret out₀ =>
       cases events with
@@ -2309,6 +2315,7 @@ theorem checkObsErasedMirTraceFast_eq
   | zero => rfl
   | succ fuel' ih =>
     unfold checkObsErasedMirTraceFast reconstructObsErasedMirTrace
+    simp only [stepMirStatePeriodic_eq]
     cases stepMirState body st with
     | ret out₀ =>
       cases events with
@@ -2480,6 +2487,7 @@ theorem reconstructObsErasedMirTrace_sound
   | zero => nomatch h_ok
   | succ fuel' ih =>
     unfold reconstructObsErasedMirTrace at h_ok
+    simp only [stepMirStatePeriodic_eq] at h_ok
     have h_obs :
         (ITree.cofix (stepMirState body) st).observe =
           (stepMirState body st).map (ITree.cofix (stepMirState body)) :=
@@ -3096,6 +3104,7 @@ theorem checkMirTraceApprox_guarded_eq (body : CapturedMir) (n : Nat) :
     intro st events outcome
     unfold mirExecGuardedApprox at ih ⊢
     unfold approxCofix stepMirStateGuarded checkFullMirTraceFast
+    simp only [stepMirStatePeriodic_eq]
     cases hs : stepMirState body st with
     | ret out => rfl
     | tau st' => exact ih st' events outcome
@@ -3197,6 +3206,7 @@ theorem checkMirObsErasedTraceApprox_guarded_eq (body : CapturedMir) (n : Nat) :
     intro st events outcome
     unfold mirExecGuardedApprox at ih ⊢
     unfold approxCofix stepMirStateGuarded checkObsErasedMirTraceFast
+    simp only [stepMirStatePeriodic_eq]
     cases hs : stepMirState body st with
     | ret out => rfl
     | tau st' => exact ih st' events outcome
@@ -3332,6 +3342,7 @@ theorem checkFullMirTraceFast_mono
     | succ n' =>
       have hmn' : m' ≤ n' := Nat.le_of_succ_le_succ hmn
       unfold checkFullMirTraceFast at h_ok ⊢
+      simp only [stepMirStatePeriodic_eq] at h_ok ⊢
       cases h_step : stepMirState body st with
       | ret out₀ =>
         simp only [h_step] at h_ok ⊢
@@ -3394,6 +3405,7 @@ theorem checkObsErasedMirTraceFast_mono
     | succ n' =>
       have hmn' : m' ≤ n' := Nat.le_of_succ_le_succ hmn
       unfold checkObsErasedMirTraceFast at h_ok ⊢
+      simp only [stepMirStatePeriodic_eq] at h_ok ⊢
       cases h_step : stepMirState body st with
       | ret out₀ =>
         simp only [h_step] at h_ok ⊢
@@ -3451,6 +3463,7 @@ private theorem checkObsErasedMirTraceFast_imp_interpSilence_aux
       | zero => omega
       | succ n' =>
         unfold checkObsErasedMirTraceFast at h_ok
+        simp only [stepMirStatePeriodic_eq] at h_ok
         unfold mirExecGuardedApprox approxCofix stepMirStateGuarded
         cases hs : stepMirState body st with
         | ret out₀ =>
@@ -6367,7 +6380,7 @@ def diagnoseMirExecBounded
     let cur := execStateCursor st
     .outOfFuel cur.1 cur.2
   | fuel' + 1 =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel' body st with
     | .ret actualOut =>
       match events with
       | [] =>
@@ -6780,6 +6793,7 @@ theorem diagnoseMirExecBounded_isOk_full (body : CapturedMir) (fuel : Nat) :
   | succ m ih =>
     intro st events outcome
     unfold diagnoseMirExecBounded checkFullMirTraceFast
+    simp only [stepMirStatePeriodic_eq]
     cases hs : stepMirState body st with
     | ret out =>
       cases events with
@@ -6848,6 +6862,7 @@ theorem diagnoseMirExecBounded_isOk_obsErased (body : CapturedMir) (fuel : Nat) 
   | succ m ih =>
     intro st events outcome
     unfold diagnoseMirExecBounded checkObsErasedMirTraceFast
+    simp only [stepMirStatePeriodic_eq]
     cases hs : stepMirState body st with
     | ret out =>
       cases events with
@@ -7331,7 +7346,7 @@ def diagnoseMirExecBoundedFast
     let cur := execStateCursor st
     .outOfFuel cur.1 cur.2
   | fuel' + 1 =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel' body st with
     | .ret actualOut =>
       match events with
       | [] =>
@@ -7398,6 +7413,7 @@ theorem diagnoseMirExecBoundedFast_eq
   | succ fuel' ih =>
     intro st events outcome
     unfold diagnoseMirExecBoundedFast diagnoseMirExecBounded
+    simp only [stepMirStatePeriodic_eq]
     cases stepMirState body st with
     | ret actualOut =>
       cases events with
@@ -8172,7 +8188,7 @@ def stepFullMirEventWithin (body : CapturedMir) :
     Nat → MirExecState → ObservedEvent → Option (Event MirEffect × MirExecState)
   | 0, _, _ => none
   | fuel + 1, st, ev =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel body st with
     | .ret _ => none
     | .tau st' => stepFullMirEventWithin body fuel st' ev
     | .vis i k =>
@@ -8208,7 +8224,7 @@ def stepFullMirEventFastWithin (body : CapturedMir) :
     Nat → MirExecState → ObservedEvent → Option MirExecState
   | 0, _, _ => none
   | fuel + 1, st, ev =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel body st with
     | .ret _ => none
     | .tau st' => stepFullMirEventFastWithin body fuel st' ev
     | .vis i k =>
@@ -8242,7 +8258,7 @@ def finishFullMirTraceWithin (body : CapturedMir) :
     Nat → MirExecState → ObservedOutcome → Option MirOutcome
   | 0, _, _ => none
   | fuel + 1, st, outcome =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel body st with
     | .ret out => if checkOutcomeMatches outcome out then some out else none
     | .tau st' => finishFullMirTraceWithin body fuel st' outcome
     | .vis _ _ => none
@@ -8253,7 +8269,7 @@ def checkFullMirFinishWithin (body : CapturedMir) :
     Nat → MirExecState → ObservedOutcome → Bool
   | 0, _, _ => false
   | fuel + 1, st, outcome =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel body st with
     | .ret out => checkOutcomeMatches outcome out
     | .tau st' => checkFullMirFinishWithin body fuel st' outcome
     | .vis _ _ => false
@@ -8327,6 +8343,7 @@ theorem stepFullMirEventFastWithin_eq (body : CapturedMir) :
   | succ fuel' ih =>
     intro st ev
     unfold stepFullMirEventFastWithin stepFullMirEventWithin
+    simp only [stepMirStatePeriodic_eq]
     cases stepMirState body st with
     | ret _ => rfl
     | tau st' => exact ih st' ev
@@ -8364,6 +8381,7 @@ theorem checkFullMirFinishWithin_eq (body : CapturedMir) :
   | succ fuel' ih =>
     intro st outcome
     unfold checkFullMirFinishWithin finishFullMirTraceWithin
+    simp only [stepMirStatePeriodic_eq]
     cases stepMirState body st with
     | ret out =>
       dsimp only
@@ -8419,6 +8437,7 @@ theorem stepFullMirEventWithin_sound (body : CapturedMir) :
   | succ fuel' ih =>
     intro st ev e st' h_ok
     unfold stepFullMirEventWithin at h_ok
+    simp only [stepMirStatePeriodic_eq] at h_ok
     have h_obs :
         (ITree.cofix (stepMirState body) st).observe =
           (stepMirState body st).map (ITree.cofix (stepMirState body)) :=
@@ -8487,6 +8506,7 @@ theorem finishFullMirTraceWithin_sound (body : CapturedMir) :
   | succ fuel' ih =>
     intro st outcome out h_ok
     unfold finishFullMirTraceWithin at h_ok
+    simp only [stepMirStatePeriodic_eq] at h_ok
     have h_obs :
         (ITree.cofix (stepMirState body) st).observe =
           (stepMirState body st).map (ITree.cofix (stepMirState body)) :=
@@ -8590,6 +8610,7 @@ theorem stepFullMirEventWithin_mono (body : CapturedMir) :
     | succ n' =>
       have hmn' : m' ≤ n' := Nat.le_of_succ_le_succ hmn
       unfold stepFullMirEventWithin at h_ok ⊢
+      simp only [stepMirStatePeriodic_eq] at h_ok ⊢
       revert h_ok
       cases stepMirState body st with
       | tau st₁ => exact fun h_ok => ih st₁ ev r h_ok hmn'
@@ -8617,6 +8638,7 @@ theorem finishFullMirTraceWithin_mono (body : CapturedMir) :
     | succ n' =>
       have hmn' : m' ≤ n' := Nat.le_of_succ_le_succ hmn
       unfold finishFullMirTraceWithin at h_ok ⊢
+      simp only [stepMirStatePeriodic_eq] at h_ok ⊢
       revert h_ok
       cases stepMirState body st with
       | tau st₁ => exact fun h_ok => ih st₁ outcome out h_ok hmn'
@@ -8678,6 +8700,7 @@ theorem stepFullMirEventWithin_checkFullMirTraceFast (body : CapturedMir) :
     rw [Nat.add_right_comm]
     unfold stepFullMirEventWithin at h_seg
     unfold checkFullMirTraceFast
+    simp only [stepMirStatePeriodic_eq] at h_seg ⊢
     cases h_step : stepMirState body st with
     | ret out₀ => simp only [h_step] at h_seg; nomatch h_seg
     | tau st₁ =>
@@ -8737,6 +8760,7 @@ theorem finishFullMirTraceWithin_checkFullMirTraceFast (body : CapturedMir) :
     intro st outcome out h_fin
     unfold finishFullMirTraceWithin at h_fin
     unfold checkFullMirTraceFast
+    simp only [stepMirStatePeriodic_eq] at h_fin ⊢
     cases h_step : stepMirState body st with
     | ret out₀ =>
       simp only [h_step] at h_fin ⊢
@@ -8888,13 +8912,14 @@ private theorem checkFullMirTraceFast_imp_within_aux (body : CapturedMir) :
       have h_cur' : fuel' ≤ cur' := Nat.le_of_succ_le_succ h_cur
       have h_intra' : fuel' ≤ intra := Nat.le_of_succ_le h_intra
       unfold checkFullMirTraceFast at h_fast
+      simp only [stepMirStatePeriodic_eq] at h_fast
       cases h_step : stepMirState body st with
       | ret out₀ =>
         rw [h_step] at h_fast
         cases events with
         | nil =>
           unfold checkFullMirTraceWithinCur checkFullMirFinishWithin
-          rw [h_step]
+          rw [stepMirStatePeriodic_eq, h_step]
           exact h_fast
         | cons _ _ => nomatch h_fast
       | tau st₁ =>
@@ -8902,11 +8927,11 @@ private theorem checkFullMirTraceFast_imp_within_aux (body : CapturedMir) :
         cases events with
         | nil =>
           unfold checkFullMirTraceWithinCur checkFullMirFinishWithin
-          rw [h_step]
+          rw [stepMirStatePeriodic_eq, h_step]
           exact ih cur' intra h_cur' h_intra' st₁ [] outcome h_fast
         | cons ev rest =>
           unfold checkFullMirTraceWithinCur stepFullMirEventFastWithin
-          rw [h_step]
+          rw [stepMirStatePeriodic_eq, h_step]
           exact ih cur' intra h_cur' h_intra' st₁ (ev :: rest) outcome h_fast
       | vis i k =>
         rw [h_step] at h_fast
@@ -8923,7 +8948,7 @@ private theorem checkFullMirTraceFast_imp_within_aux (body : CapturedMir) :
                 cases ev with
                 | branch expectedTag =>
                   unfold checkFullMirTraceWithinCur stepFullMirEventFastWithin
-                  rw [h_step]
+                  rw [stepMirStatePeriodic_eq, h_step]
                   dsimp only [elimMirVis] at h_fast ⊢
                   revert h_fast
                   cases Nat.beq tag expectedTag <;> intro h_fast
@@ -8951,7 +8976,7 @@ private theorem checkFullMirTraceFast_imp_within_aux (body : CapturedMir) :
                    | some ans => checkFullMirTraceFast fuel' body (k ans) rest outcome
                    | none => false) = true at h_fast
                 unfold checkFullMirTraceWithinCur stepFullMirEventFastWithin
-                rw [h_step]
+                rw [stepMirStatePeriodic_eq, h_step]
                 dsimp only [elimMirVis]
                 rw [h_imp]
                 dsimp only
@@ -9509,7 +9534,7 @@ def diagnoseStepFullMirEventWithin (body : CapturedMir) :
     let cur := execStateCursor st
     .error (.outOfFuel cur.1 cur.2)
   | fuel + 1, st, ev, remCount =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel body st with
     | .ret _ => .error (.unconsumedEventsRemaining remCount)
     | .tau st' => diagnoseStepFullMirEventWithin body fuel st' ev remCount
     | .vis i k =>
@@ -9549,7 +9574,7 @@ def diagnoseStepFullMirEventFastWithin (body : CapturedMir) :
     let cur := execStateCursor st
     .error (.outOfFuel cur.1 cur.2)
   | fuel + 1, st, ev, remCount =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel body st with
     | .ret _ => .error (.unconsumedEventsRemaining remCount)
     | .tau st' => diagnoseStepFullMirEventFastWithin body fuel st' ev remCount
     | .vis i k =>
@@ -9589,7 +9614,7 @@ def diagnoseFinishFullMirTraceWithin (body : CapturedMir) :
     let cur := execStateCursor st
     .outOfFuel cur.1 cur.2
   | fuel + 1, st, outcome =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel body st with
     | .ret actualOut =>
       if checkOutcomeMatches outcome actualOut then
         .ok [] actualOut
@@ -9669,6 +9694,7 @@ theorem diagnoseStepFullMirEventWithin_toOption (body : CapturedMir) :
   | succ fuel' ih =>
     intro st ev remCount
     unfold diagnoseStepFullMirEventWithin stepFullMirEventWithin
+    simp only [stepMirStatePeriodic_eq]
     cases stepMirState body st with
     | ret _ => rfl
     | tau st' => exact ih st' ev remCount
@@ -9718,6 +9744,7 @@ theorem diagnoseStepFullMirEventWithin_error_not_ok (body : CapturedMir) :
   | succ fuel' ih =>
     intro st ev remCount d h
     unfold diagnoseStepFullMirEventWithin at h
+    simp only [stepMirStatePeriodic_eq] at h
     cases hs : stepMirState body st with
     | ret _ =>
       rw [hs] at h; injection h with h; subst h; rfl
@@ -9770,6 +9797,7 @@ theorem diagnoseStepFullMirEventFastWithin_eq (body : CapturedMir) :
   | succ fuel' ih =>
     intro st ev remCount
     unfold diagnoseStepFullMirEventFastWithin diagnoseStepFullMirEventWithin
+    simp only [stepMirStatePeriodic_eq]
     cases stepMirState body st with
     | ret _ => rfl
     | tau st' => exact ih st' ev remCount
@@ -9807,6 +9835,7 @@ theorem diagnoseFinishFullMirTraceWithin_isOk (body : CapturedMir) :
   | succ fuel' ih =>
     intro st outcome
     unfold diagnoseFinishFullMirTraceWithin checkFullMirFinishWithin
+    simp only [stepMirStatePeriodic_eq]
     cases stepMirState body st with
     | ret actualOut =>
       dsimp only
@@ -9834,6 +9863,7 @@ theorem diagnoseFinishFullMirTraceWithin_eraseTrace (body : CapturedMir) :
   | succ fuel' ih =>
     intro st outcome
     unfold diagnoseFinishFullMirTraceWithin
+    simp only [stepMirStatePeriodic_eq]
     cases stepMirState body st with
     | ret actualOut =>
       dsimp only

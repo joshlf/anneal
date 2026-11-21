@@ -1908,7 +1908,7 @@ pub fn render_anneal_probe_module(
            match fuel with\n  \
            | 0 => (.outOfFuel, activeSpan body st)\n  \
            | fuel' + 1 =>\n    \
-             match stepMirState body st with\n    \
+             match stepMirStatePeriodic fuel' body st with\n    \
              | .ret (.normal (.unit, _)) => (.normalUnit, \"none\")\n    \
              | .ret (.normal (.scalar sc, _)) => (.normalScalar sc.bits sc.sizeBytes, \"none\")\n    \
              | .ret (.normal (val, mem)) => ((MirDiffVerdict.normal val mem).toTagWithBody body, \"none\")\n    \
@@ -2049,7 +2049,7 @@ pub fn render_anneal_confirm_module(
            match fuel with\n  \
            | 0 => (.outOfFuel, activeSpan body st)\n  \
            | fuel' + 1 =>\n    \
-             match stepMirState body st with\n    \
+             match stepMirStatePeriodic fuel' body st with\n    \
              | .ret (.normal (.unit, _)) => (.normalUnit, \"none\")\n    \
              | .ret (.normal (.scalar sc, _)) => (.normalScalar sc.bits sc.sizeBytes, \"none\")\n    \
              | .ret (.normal (val, mem)) => ((MirDiffVerdict.normal val mem).toTagWithBody body, \"none\")\n    \
@@ -2257,6 +2257,7 @@ pub fn run_anneal_oracle(
     let lake_bin = resolve_lake_binary();
     let probe_out = Command::new(&lake_bin)
         .current_dir(&dot_anneal)
+        .env("LEAN_NUM_THREADS", "1")
         .arg("env")
         .arg("lean")
         .arg("oracle/MiriOracleProbe.lean")
@@ -2332,6 +2333,7 @@ pub fn confirm_anneal_outcomes_in_kernel(
     let lake_bin = resolve_lake_binary();
     let output = Command::new(&lake_bin)
         .current_dir(&dot_anneal)
+        .env("LEAN_NUM_THREADS", "1")
         .arg("env")
         .arg("lean")
         .arg("oracle/MiriOracleConfirm.lean")
@@ -3655,5 +3657,38 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
                 "capture_cmd must set {key}"
             );
         }
+    }
+
+    #[test]
+    fn rendered_probe_and_confirm_modules_use_periodic_spine_normalization() {
+        let item = OracleItemSpec::with_fuel("probe_item", 64);
+        let probe = render_anneal_probe_module("MiriDiffCorpus", std::slice::from_ref(&item));
+        assert!(
+            probe.contains("match stepMirStatePeriodic fuel' body st with"),
+            "probe module must use stepMirStatePeriodic"
+        );
+        assert!(
+            !probe.contains("match stepMirState body st with"),
+            "probe module must not regress to raw stepMirState"
+        );
+        let confirm = render_anneal_confirm_module(
+            "MiriDiffCorpus",
+            &[(
+                item,
+                AnnealOutcome::PassScalar {
+                    bits: 22,
+                    size_bytes: 4,
+                },
+            )],
+        )
+        .expect("render confirm module");
+        assert!(
+            confirm.contains("match stepMirStatePeriodic fuel' body st with"),
+            "confirm module must use stepMirStatePeriodic"
+        );
+        assert!(
+            !confirm.contains("match stepMirState body st with"),
+            "confirm module must not regress to raw stepMirState"
+        );
     }
 }
