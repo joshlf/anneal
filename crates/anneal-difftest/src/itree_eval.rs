@@ -692,8 +692,8 @@ pub fn resolve_itree_lean_threads_with_env(
         itree_lean_threads_for_resources(host_cores, cgroup_cores, avail_kib, active_workers);
     match parse_positive_env_u64(caller_lean_num_threads, 1) {
         Some(caller) => {
-            let share = (usize::try_from(caller).unwrap_or(usize::MAX) / active_workers.max(1))
-                .max(1);
+            let share =
+                (usize::try_from(caller).unwrap_or(usize::MAX) / active_workers.max(1)).max(1);
             computed.min(share)
         }
         None => computed,
@@ -10552,7 +10552,11 @@ mod tests {
         );
         assert_eq!(runs.len(), 11 + 1 + 2 + 11, "{runs:?}");
         assert_eq!(
-            (runs[11].0.as_str(), runs[12].0.as_str(), runs[13].0.as_str()),
+            (
+                runs[11].0.as_str(),
+                runs[12].0.as_str(),
+                runs[13].0.as_str()
+            ),
             (
                 "SChunk1_probe_d0_0_1",
                 "SChunk2_probe_d0_0_1",
@@ -10796,15 +10800,10 @@ mod tests {
     #[test]
     fn isolated_lean_stage_keeps_fallback_and_bisect_labels_unique_when_candidate_spans_chunks() {
         let (cases, case_to_fn) = stage_fixture(&[("c0", 12), ("c0_p1", 2)]);
-        let bad: BTreeSet<String> = [
-            "case_c0_t1",
-            "case_c0_t5",
-            "case_c0_t9",
-            "case_c0_p1_t0",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
+        let bad: BTreeSet<String> = ["case_c0_t1", "case_c0_t5", "case_c0_t9", "case_c0_p1_t0"]
+            .into_iter()
+            .map(String::from)
+            .collect();
         let runs = MockLeanRuns::default();
         let stage = run_isolated_lean_stage(
             "ItreeDiffBatchProbe",
@@ -10950,5 +10949,464 @@ mod tests {
             .map(|(l, _)| l.split('@').next().unwrap().to_string())
             .collect();
         assert_labels_unique_file_stems(&labels);
+    }
+
+    /// Deterministic xorshift64* stream for the randomized Stage 2 tests.
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// How a mock Stage 2 case behaves in a module of its own.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum MockCase {
+        /// Its theorems are kernel-confirmed.
+        Healthy,
+        /// It exceeds a memory limit.
+        Heavy,
+        /// The kernel rejects it.
+        Rejected,
+        /// It runs into the wall-clock timeout.
+        TimedOut,
+    }
+
+    /// Mock Lean run of the randomized Stage 2 tests: a module exceeds memory if
+    /// it has more than `max_ok` cases or any heavy one (Lean dies before it
+    /// reports anything else), otherwise it fails with its first rejection, then
+    /// with a timeout, and otherwise confirms every case.
+    fn mock_confirm_oracle(
+        kinds: &BTreeMap<String, MockCase>,
+        max_ok: usize,
+        label: &str,
+        slice: &[String],
+    ) -> Result<BTreeMap<String, usize>, String> {
+        let has = |kind: MockCase| slice.iter().any(|c| kinds[c] == kind);
+        if (slice.len() > 1 && slice.len() > max_ok) || has(MockCase::Heavy) {
+            Err(if label.len() % 2 == 0 {
+                mock_rss_exceeded(label)
+            } else {
+                mock_lean_memory_exhausted(label)
+            })
+        } else if let Some(rejected) = slice.iter().find(|c| kinds[*c] == MockCase::Rejected) {
+            Err(mock_rfl_rejection(label, rejected))
+        } else if has(MockCase::TimedOut) {
+            Err(format!(
+                "[WATCHDOG:TIMEOUT] `/tmp/verify/{label}.lean` exceeded wall-clock timeout \
+                 (180s for {} case(s), peak RSS 900000 KiB / 8388608 KiB, LEAN_NUM_THREADS=2):",
+                slice.len()
+            ))
+        } else {
+            ok_all(slice)
+        }
+    }
+
+    /// A random population of `n` cases: `(cases, case_to_fn, kinds, profile)`,
+    /// with 1 to 6 cases per candidate and one of five mixes (all healthy, a few
+    /// heavy, mostly heavy, every kind, a heavy head).
+    fn random_confirm_population(
+        rng: &mut TestRng,
+        n: usize,
+    ) -> (
+        Vec<String>,
+        BTreeMap<String, String>,
+        BTreeMap<String, MockCase>,
+        u64,
+    ) {
+        let profile = rng.below(5);
+        let fn_width = 1 + rng.below(6) as usize;
+        let heavy_head = 4 + rng.below(3) as usize;
+        let mut cases = Vec::new();
+        let mut case_to_fn = BTreeMap::new();
+        let mut kinds = BTreeMap::new();
+        for i in 0..n {
+            let fn_name = format!("f{:02}", i / fn_width);
+            let key = format!("case_{fn_name}_t{}", i % fn_width);
+            let kind = match profile {
+                0 => MockCase::Healthy,
+                1 if rng.below(12) == 0 => MockCase::Heavy,
+                1 => MockCase::Healthy,
+                2 if rng.below(8) == 0 => MockCase::Healthy,
+                2 => MockCase::Heavy,
+                3 => match rng.below(10) {
+                    0 | 1 => MockCase::Heavy,
+                    2 => MockCase::Rejected,
+                    3 => MockCase::TimedOut,
+                    _ => MockCase::Healthy,
+                },
+                _ if i < heavy_head || rng.below(10) == 0 => MockCase::Heavy,
+                _ => MockCase::Healthy,
+            };
+            case_to_fn.insert(key.clone(), fn_name);
+            kinds.insert(key.clone(), kind);
+            cases.push(key);
+        }
+        (cases, case_to_fn, kinds, profile)
+    }
+
+    /// Randomized audit of the production splitter (halving, suspension, and the
+    /// single-case probes) over 4000 chunk populations: every case ends in
+    /// exactly one bucket, only healthy cases are confirmed and only by a module
+    /// that succeeded, every reported single-case failure is that case's own
+    /// failure, no label and no single-case module is used twice, the run count
+    /// stays below `2k`, and fewer than [`ITREE_FALLBACK_CIRCUIT_BREAKER`] heavy
+    /// cases never cost a healthy one.
+    #[test]
+    fn adaptive_stage2_splitter_accounts_for_every_case_exactly_once_on_random_populations() {
+        let mut rng = TestRng(0x9E37_79B9_7F4A_7C15);
+        let mut gave_up = 0usize;
+        let mut probed = 0usize;
+        for scenario in 0..4000 {
+            let k = 1 + rng.below(ITREE_MAX_CONFIRM_CHUNK_SIZE as u64) as usize;
+            let (cases, case_to_fn, kinds, profile) = random_confirm_population(&mut rng, k);
+            let max_ok = [1usize, 2, 3, 4, 8, 64][rng.below(6) as usize];
+            let inherited: BTreeSet<String> = if rng.below(4) == 0 {
+                (0..ITREE_FALLBACK_CIRCUIT_BREAKER)
+                    .map(|i| format!("earlier{i}"))
+                    .collect()
+            } else {
+                BTreeSet::new()
+            };
+            let runs = MockLeanRuns::default();
+            let outcome = run_adaptive_confirm_chunk_collecting(
+                "Base",
+                &cases,
+                &ident,
+                &case_to_fn,
+                &inherited,
+                &|label: &str, slice: &[String]| {
+                    runs.lock()
+                        .unwrap()
+                        .push((label.to_string(), slice.to_vec()));
+                    mock_confirm_oracle(&kinds, max_ok, label, slice)
+                },
+            );
+            let runs = runs.into_inner().unwrap();
+            let ctx = format!(
+                "scenario={scenario} k={k} max_ok={max_ok} profile={profile} inherited={} \
+                 kinds={:?}",
+                inherited.len(),
+                cases.iter().map(|c| kinds[c]).collect::<Vec<_>>()
+            );
+
+            // Every case ends in exactly one bucket.
+            let mut accounted: Vec<&String> = outcome.confirmed.keys().collect();
+            accounted.extend(outcome.irreducible_singletons.iter().map(|(_, c, _)| c));
+            accounted.extend(outcome.unresolved.iter().flat_map(|(_, s, _)| s.iter()));
+            accounted.extend(outcome.skipped_by_abort.iter());
+            accounted.sort();
+            let mut expected: Vec<&String> = cases.iter().collect();
+            expected.sort();
+            assert_eq!(accounted, expected, "{ctx}");
+
+            // Only healthy cases are confirmed, and only by a module that succeeded.
+            for key in outcome.confirmed.keys() {
+                assert_eq!(kinds[key], MockCase::Healthy, "`{key}` confirmed: {ctx}");
+                assert!(
+                    runs.iter().any(|(l, s)| s.contains(key)
+                        && mock_confirm_oracle(&kinds, max_ok, l, s).is_ok()),
+                    "`{key}` has no successful module: {ctx}"
+                );
+            }
+            // A reported single-case failure is the failure of that case's own module.
+            for (label, case, err) in &outcome.irreducible_singletons {
+                assert!(
+                    runs.iter()
+                        .any(|(l, s)| l == label && s.as_slice() == std::slice::from_ref(case)),
+                    "`{label}` never ran `{case}` alone: {ctx}"
+                );
+                let failure = classify_itree_lean_failure(err);
+                let expected_failure = match kinds[case] {
+                    MockCase::Heavy => matches!(
+                        failure,
+                        ItreeLeanFailureKind::RssWatchdogExceeded
+                            | ItreeLeanFailureKind::LeanMemoryExhausted
+                    ),
+                    MockCase::Rejected => {
+                        failure == ItreeLeanFailureKind::ElaborationOrOutputFailure
+                    }
+                    MockCase::TimedOut => failure == ItreeLeanFailureKind::WallClockTimeout,
+                    MockCase::Healthy => false,
+                };
+                assert!(expected_failure, "`{case}` reported as {failure:?}: {ctx}");
+            }
+            let memory_failed_fns: BTreeSet<String> = outcome
+                .irreducible_singletons
+                .iter()
+                .filter(|(_, case, _)| kinds[case] == MockCase::Heavy)
+                .map(|(_, case, _)| case_to_fn[case].clone())
+                .chain(inherited.iter().cloned())
+                .collect();
+            assert_eq!(outcome.memory_failed_leaf_fns, memory_failed_fns, "{ctx}");
+
+            // No label, no empty module, and no single-case module twice.
+            let labels: Vec<String> = runs.iter().map(|(l, _)| l.clone()).collect();
+            assert_labels_unique_file_stems(&labels);
+            assert!(runs.iter().all(|(_, s)| !s.is_empty()), "{ctx}");
+            let mut singles: Vec<&String> = runs
+                .iter()
+                .filter(|(_, s)| s.len() == 1)
+                .map(|(_, s)| &s[0])
+                .collect();
+            let single_runs = singles.len();
+            singles.sort();
+            singles.dedup();
+            assert_eq!(singles.len(), single_runs, "a single case ran twice: {ctx}");
+            // A probe or a split costs one run and leaves strictly smaller slices.
+            assert!(runs.len() < 2 * k, "{} runs: {ctx}", runs.len());
+
+            let heavy = cases
+                .iter()
+                .filter(|c| kinds[*c] == MockCase::Heavy)
+                .count();
+            let only_memory_kinds = cases
+                .iter()
+                .all(|c| matches!(kinds[c], MockCase::Healthy | MockCase::Heavy));
+            if only_memory_kinds {
+                // Memory failures alone never leave a module for the fallback.
+                assert!(outcome.unresolved.is_empty(), "{ctx}");
+                assert!(outcome.missing_toolchain_err.is_none(), "{ctx}");
+            }
+            if only_memory_kinds && inherited.is_empty() && heavy < ITREE_FALLBACK_CIRCUIT_BREAKER {
+                // Too few heavy cases to suspend halving: nothing is given up.
+                assert!(outcome.skipped_by_abort.is_empty(), "{ctx}");
+                assert_eq!(
+                    outcome.confirmed.len() + outcome.irreducible_singletons.len(),
+                    k,
+                    "{ctx}"
+                );
+                assert_eq!(outcome.irreducible_singletons.len(), heavy, "{ctx}");
+            }
+            // Cases are given up only by a representative probe that exceeded memory.
+            assert_eq!(
+                outcome.skipped_by_abort.is_empty(),
+                outcome.suspended_probe_failure.is_none(),
+                "{ctx}"
+            );
+            if let Some((probe_label, probe_err)) = &outcome.suspended_probe_failure {
+                gave_up += 1;
+                assert!(
+                    runs.iter().any(|(l, s)| l == probe_label && s.len() == 1),
+                    "`{probe_label}` is not a single-case run: {ctx}"
+                );
+                assert!(
+                    matches!(
+                        classify_itree_lean_failure(probe_err),
+                        ItreeLeanFailureKind::RssWatchdogExceeded
+                            | ItreeLeanFailureKind::LeanMemoryExhausted
+                    ),
+                    "{ctx}"
+                );
+            }
+            if labels.iter().any(|l| l.contains("_probe_")) {
+                probed += 1;
+            }
+        }
+        assert!(
+            gave_up > 200 && probed > 400,
+            "the populations must exercise suspension: gave_up={gave_up} probed={probed}"
+        );
+    }
+
+    /// Randomized audit of the whole Stage 2 stage (chunk waves, sequential
+    /// fallback, bisection) over 1500 populations with 1 or 2 workers: a case
+    /// that is not healthy is never confirmed, every unconfirmed case fails its
+    /// candidate, an all-healthy population is confirmed without any stage
+    /// error whatever its modules' size limit, fewer than
+    /// [`ITREE_FALLBACK_CIRCUIT_BREAKER`] heavy cases never cost a healthy one,
+    /// no `.lean` label is reused, and a single-worker stage is deterministic.
+    #[test]
+    fn adaptive_stage2_stage_never_confirms_an_unhealthy_case_on_random_populations() {
+        let mut rng = TestRng(0xD1B5_4A32_D192_ED03);
+        let mut partial = 0usize;
+        for scenario in 0..1500 {
+            let n = 1 + rng.below(96) as usize;
+            let (cases, case_to_fn, kinds, profile) = random_confirm_population(&mut rng, n);
+            let max_ok = [1usize, 2, 4, 16][rng.below(4) as usize];
+            let chunk_size = [1usize, 3, 8, 16][rng.below(4) as usize];
+            let jobs = 1 + rng.below(2) as usize;
+            let run_stage = || {
+                let runs = MockLeanRuns::default();
+                let stage = run_isolated_adaptive_confirm_stage(
+                    "S",
+                    &cases,
+                    chunk_size,
+                    jobs,
+                    ident,
+                    &case_to_fn,
+                    |label: &str, slice: &[String]| {
+                        runs.lock()
+                            .unwrap()
+                            .push((label.to_string(), slice.to_vec()));
+                        mock_confirm_oracle(&kinds, max_ok, label, slice)
+                    },
+                );
+                (stage, runs.into_inner().unwrap())
+            };
+            let (stage, runs) = run_stage();
+            let ctx = format!(
+                "scenario={scenario} n={n} max_ok={max_ok} chunk_size={chunk_size} jobs={jobs} \
+                 profile={profile} kinds={:?}",
+                cases.iter().map(|c| kinds[c]).collect::<Vec<_>>()
+            );
+
+            for key in stage.results.keys() {
+                assert_eq!(kinds[key], MockCase::Healthy, "`{key}` confirmed: {ctx}");
+            }
+            let unconfirmed: BTreeSet<&String> = cases
+                .iter()
+                .filter(|c| !stage.results.contains_key(*c))
+                .collect();
+            assert_eq!(
+                stage.failed_fns,
+                unconfirmed
+                    .iter()
+                    .map(|c| case_to_fn[*c].clone())
+                    .collect::<BTreeSet<String>>(),
+                "{ctx}"
+            );
+            assert!(
+                stage
+                    .inconclusive_cases
+                    .iter()
+                    .all(|c| unconfirmed.contains(c)),
+                "{ctx}"
+            );
+            assert_eq!(stage.errors.is_empty(), unconfirmed.is_empty(), "{ctx}");
+            let labels: Vec<String> = runs.iter().map(|(l, _)| l.clone()).collect();
+            assert_labels_unique_file_stems(&labels);
+
+            let unhealthy = cases
+                .iter()
+                .filter(|c| kinds[*c] != MockCase::Healthy)
+                .count();
+            let heavy = cases
+                .iter()
+                .filter(|c| kinds[*c] == MockCase::Heavy)
+                .count();
+            if unhealthy == heavy && heavy < ITREE_FALLBACK_CIRCUIT_BREAKER {
+                assert_eq!(
+                    stage.results.len(),
+                    n - heavy,
+                    "healthy cases were lost: {ctx}"
+                );
+            }
+            if !stage.results.is_empty() && !unconfirmed.is_empty() {
+                partial += 1;
+            }
+            if jobs == 1 {
+                let (again, runs_again) = run_stage();
+                assert_eq!(
+                    (
+                        stage.results.keys().collect::<Vec<_>>(),
+                        &stage.inconclusive_cases,
+                        &stage.errors,
+                        &runs
+                    ),
+                    (
+                        again.results.keys().collect::<Vec<_>>(),
+                        &again.inconclusive_cases,
+                        &again.errors,
+                        &runs_again
+                    ),
+                    "{ctx}"
+                );
+            }
+        }
+        assert!(
+            partial > 300,
+            "too few partially confirmed stages: {partial}"
+        );
+    }
+
+    /// A suspended slice stands or falls with its first case: the single-case
+    /// probe confirms it and re-arms halving, or exceeds memory and gives the
+    /// whole slice up unrun. Behind four heavy candidates, two more heavy ones
+    /// that happen to lead the pending slices therefore cost all ten healthy
+    /// candidates, while the same six heavy candidates with those two one
+    /// position later cost none. The probe bounds a systematic failure to one
+    /// cheap run per slice; it does not make recovery independent of the order
+    /// of the cases.
+    #[test]
+    fn adaptive_stage2_heavy_probe_representative_gives_its_whole_slice_up() {
+        let (cases, case_to_fn) = single_case_candidates(16);
+        let pick = |indices: &[usize]| -> BTreeSet<String> {
+            indices.iter().map(|&i| cases[i].clone()).collect()
+        };
+        let run_stage = |heavy: &BTreeSet<String>| {
+            let runs = MockLeanRuns::default();
+            let stage = run_isolated_adaptive_confirm_stage(
+                "S",
+                &cases,
+                16,
+                1,
+                ident,
+                &case_to_fn,
+                |label: &str, slice: &[String]| {
+                    runs.lock()
+                        .unwrap()
+                        .push((label.to_string(), slice.to_vec()));
+                    if slice.iter().any(|c| heavy.contains(c)) {
+                        Err(mock_rss_exceeded(label))
+                    } else {
+                        ok_all(slice)
+                    }
+                },
+            );
+            (stage, runs.into_inner().unwrap())
+        };
+
+        // Heavy: the four leading candidates and both probe representatives.
+        let (stage, runs) = run_stage(&pick(&[0, 1, 2, 3, 4, 8]));
+        assert_eq!(runs.len(), 11, "{runs:?}");
+        assert_eq!(
+            runs[9..]
+                .iter()
+                .map(|(l, s)| (l.as_str(), s.as_slice()))
+                .collect::<Vec<_>>(),
+            [
+                ("SChunk0_probe_d2_4_5", &cases[4..5]),
+                ("SChunk0_probe_d1_8_9", &cases[8..9])
+            ]
+        );
+        assert!(
+            stage.results.is_empty(),
+            "the ten healthy candidates are given up unrun: {:?}",
+            stage.results.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(stage.failed_fns.len(), 16);
+        // The cases a probe gives up are plain failures, the two representatives
+        // included; only the four cases isolated by halving are inconclusive.
+        assert_eq!(stage.inconclusive_cases, pick(&[0, 1, 2, 3]));
+        assert!(
+            stage.errors.iter().any(|e| {
+                e.contains("stopped halving")
+                    && e.contains("12 case(s) left unconfirmed")
+                    && e.contains("`SChunk0_probe_d2_4_5`")
+            }),
+            "{:?}",
+            stage.errors
+        );
+
+        // The two extra heavy candidates one position later: both representatives
+        // fit, halving re-arms, and every healthy candidate is confirmed.
+        let heavy = pick(&[0, 1, 2, 3, 5, 9]);
+        let (stage, _runs) = run_stage(&heavy);
+        assert_eq!(
+            stage.results.keys().cloned().collect::<BTreeSet<String>>(),
+            pick(&[4, 6, 7, 8, 10, 11, 12, 13, 14, 15])
+        );
+        assert_eq!(stage.inconclusive_cases, heavy);
     }
 }
