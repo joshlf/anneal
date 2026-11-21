@@ -936,7 +936,46 @@ def a43Cert : MultiMutantSpecCert a43Strong.pre a43Strong.post := ret10MultiCert
     auditItemSpecStrengthBySynth .item "ep2::clean_single" ``cleanSingleCert #["wrongReturn"]
   IO.println (fmtTags "A4_3c_hostile_options_control" a43c)
 
--- A4-5a: `Lean.reduceBool` canary (fails closed in pure normalizer, resolves in Meta)
+/-! ### Episode 2 `B1` regressions (declared before the fail-closed native / budget canaries) -/
+
+-- B1-1: theorem-headed major premise. Lean's kernel δ-unfolds theorems exactly like definitions,
+-- `Meta.whnf` never does (`getUnfoldableConst?` answers `none` for `.thm` at every transparency).
+-- `b11ThmWeak` uses no axiom and no native code; the kernel accepts it as `ItemSpec "ep2::b11"`.
+theorem b11Acc : Acc (fun (_ _ : Nat) => False) 0 := Acc.intro 0 (fun _ h => False.elim h)
+instance b11Strong : ItemSpec "ep2::b11" where pre := ret10Pre; post := ret10Post
+-- (The elaborator cannot see through `b11Acc` either, so the value is transported along an
+-- equation that holds by proof irrelevance; the declared type is the `Acc.rec` term itself.)
+theorem b11TyEq :
+    @Acc.rec Nat (fun _ _ => False) (fun _ _ => Type 1) (fun _ _ _ => ItemSpec "ep2::b11") 0 b11Acc
+      = ItemSpec "ep2::b11" :=
+  @congrArg _ _ b11Acc (Acc.intro 0 (fun _ h => False.elim h))
+    (fun h => @Acc.rec Nat (fun _ _ => False) (fun _ _ => Type 1) (fun _ _ _ => ItemSpec "ep2::b11") 0 h)
+    rfl
+def b11ThmWeak :
+    @Acc.rec Nat (fun _ _ => False) (fun _ _ => Type 1) (fun _ _ _ => ItemSpec "ep2::b11") 0 b11Acc :=
+  cast b11TyEq.symm { pre := fun _ => False, post := fun _ _ => True }
+def b11Cert : MultiMutantSpecCert b11Strong.pre b11Strong.post := ret10MultiCert
+
+-- B1-6: a universe-polymorphic `sorry` certificate must report `sorryAxiomReached` (audit first).
+def b16PolySorryCert.{u} : (fun (_ : Sort u) => MultiMutantSpecCert ret10Pre ret10Post) PUnit := sorry
+
+#eval show MetaM Unit from do
+  let env ← getEnv
+  let p := specInstanceCandidates env `Trusted.VerificationResult.ItemSpec "ep2::b11" 256
+  let m ← specInstanceCandidatesMeta `Trusted.VerificationResult.ItemSpec "ep2::b11" 256
+  let expected := #[``b11Strong, ``b11ThmWeak]
+  IO.println s!"B1_1_theorem_major_scanners: pure={p == expected} meta={m == expected}"
+  IO.println (fmtTags "B1_1_theorem_major_synth_gate"
+    (← auditItemSpecStrengthBySynth .item "ep2::b11" ``b11Cert))
+  IO.println (fmtTags "B1_1_theorem_major_gate_no_synth"
+    (← auditItemSpecStrengthBySynth .item "ep2::b11" ``b11Cert (useSynthInstance := false)))
+  let pc := specInstanceCandidates env `Trusted.VerificationResult.ItemSpec "ep2::nobody_specifies_this" 256
+  let mc ← specInstanceCandidatesMeta `Trusted.VerificationResult.ItemSpec "ep2::nobody_specifies_this" 256
+  IO.println s!"B1_1_theorem_major_zero_fp_control: pure={pc == #[]} meta={mc == #[]}"
+  IO.println (fmtTags "B1_6_poly_sorry_cert_reports_sorry"
+    (← auditSpecStrengthCert ``b16PolySorryCert (.direct (mkConst ``ret10Pre) (mkConst ``ret10Post))))
+
+-- A4-5a: `Lean.reduceBool` canary (fails closed in both scanners: never evaluated natively)
 def a4RbFlag : Bool := true
 instance a4RbStrong : ItemSpec "ep2::a4rb" where pre := ret10Pre; post := ret10Post
 def a4RbWeak : Bool.rec (motive := fun _ => Type 1) PUnit (ItemSpec "ep2::a4rb") (Lean.reduceBool a4RbFlag) :=
@@ -975,7 +1014,8 @@ def a4RnCert : MultiMutantSpecCert a4RnStrong.pre a4RnStrong.post := ret10MultiC
   let env ← getEnv
   let p := specInstanceCandidates env `Trusted.VerificationResult.ItemSpec "ep2::a4rn" 256
   let m ← specInstanceCandidatesMeta `Trusted.VerificationResult.ItemSpec "ep2::a4rn" 256
-  IO.println s!"A4_5b_reduceNat_asymmetry: pure={p.contains `a4RnKernelWeak && p.contains ``a4RnStrong} meta={m == #[`a4RnKernelWeak, ``a4RnStrong, ``a4RnWeakVal]}"
+  -- `a4RbWeak` is listed too: a type that reaches a kernel-native evaluator is never normalized.
+  IO.println s!"A4_5b_reduceNat_asymmetry: pure={p.contains `a4RnKernelWeak && p.contains ``a4RnStrong} meta={m == #[``a4RbWeak, `a4RnKernelWeak, ``a4RnStrong, ``a4RnWeakVal]}"
   IO.println (fmtTags "A4_5b_reduceNat_synth_gate"
     (← auditItemSpecStrengthBySynth .item "ep2::a4rn" ``a4RnCert))
 
@@ -1018,6 +1058,36 @@ end
   let a47Cands := specInstanceCandidates env `Trusted.VerificationResult.ItemSpec "ep2::a47" 256
   let dt := (← IO.monoMsNow) - t0
   IO.println s!"A4_7_exp_branching_linear_budget: listed={a47Cands.contains ``a47ExpWeak} fast={decide (dt < 2000)}"
+
+/-! ### Episode 2 `B1` regressions (pure normalizer vs. kernel literals, native evaluators) -/
+
+-- B1-2: the kernel converts a string literal under a projection to `String.ofList [..]` and keeps
+-- reducing; the pure normalizer must not call `"abc".1` a certain stuck term.
+instance b12Strong : ItemSpec "ep2::b12" where pre := ret10Pre; post := ret10Post
+def b12StrWeak :
+    @List.rec UInt8 (fun _ => Type 1) PUnit (fun _ _ _ => ItemSpec "ep2::b12")
+      ("abc" : String).toByteArray.data.toList :=
+  { pre := fun _ => False, post := fun _ _ => True }
+
+-- B1-3: the kernel evaluates `Nat.gcd` on literals with GMP; whatever the body of `Nat.gcd` does
+-- (well-founded recursion through theorems), the pure normalizer must not call it stuck.
+instance b13Strong : ItemSpec "ep2::b13" where pre := ret10Pre; post := ret10Post
+def b13GcdWeak : Nat.rec (motive := fun _ => Type 1) (ItemSpec "ep2::b13") (fun _ _ => PUnit) (Nat.gcd 0 0) :=
+  { pre := fun _ => False, post := fun _ _ => True }
+
+#eval show MetaM Unit from do
+  let env ← getEnv
+  let p12 := specInstanceCandidates env `Trusted.VerificationResult.ItemSpec "ep2::b12" 256
+  let m12 ← specInstanceCandidatesMeta `Trusted.VerificationResult.ItemSpec "ep2::b12" 256
+  IO.println s!"B1_2_string_literal_projection: pure={p12.contains ``b12StrWeak} meta={m12.contains ``b12StrWeak}"
+  let p13 := specInstanceCandidates env `Trusted.VerificationResult.ItemSpec "ep2::b13" 256
+  let m13 ← specInstanceCandidatesMeta `Trusted.VerificationResult.ItemSpec "ep2::b13" 256
+  IO.println s!"B1_3_kernel_nat_gmp_major: pure={p13.contains ``b13GcdWeak} meta={m13.contains ``b13GcdWeak}"
+  -- B1-4: a type that reaches `Lean.reduceBool` / `Lean.reduceNat` is never handed to `Meta.whnf`
+  -- (that would run compiled code of the audited module inside the auditor): it is a candidate for
+  -- every `defId`, including one nobody specifies, in the `MetaM` scanner as well.
+  let m14 ← specInstanceCandidatesMeta `Trusted.VerificationResult.ItemSpec "ep2::b14_unrelated" 256
+  IO.println s!"B1_4_native_evaluator_never_run: reduceBool={m14.contains ``a4RbWeak} reduceNat={m14.contains `a4RnKernelWeak} clean={!m14.contains ``b11ThmWeak && !m14.contains ``b13GcdWeak}"
 "##
 
 private def collectPartsJson (baseDir : System.FilePath) (modName : String) : IO Lean.Json := do
@@ -1180,10 +1250,18 @@ B4_6i_real_model_exact_one: pure=true meta=true
 A4_3a_core_cache_poison: #[specInstanceAmbiguous]
 A4_3b_withExporting: #[specInstanceAmbiguous]
 A4_3c_hostile_options_control: #[]
+B1_1_theorem_major_scanners: pure=true meta=true
+B1_1_theorem_major_synth_gate: #[specInstanceAmbiguous]
+B1_1_theorem_major_gate_no_synth: #[specInstanceAmbiguous]
+B1_1_theorem_major_zero_fp_control: pure=true meta=true
+B1_6_poly_sorry_cert_reports_sorry: #[sorryAxiomReached]
 A4_5a_reduceBool: pure=true meta=true
 A4_5b_reduceNat_asymmetry: pure=true meta=true
 A4_5b_reduceNat_synth_gate: #[specInstanceAmbiguous]
 A4_7_exp_branching_linear_budget: listed=true fast=true
+B1_2_string_literal_projection: pure=true meta=true
+B1_3_kernel_nat_gmp_major: pure=true meta=true
+B1_4_native_evaluator_never_run: reduceBool=true reduceNat=true clean=true
 V7_statement_leak: ok=false statementOriginLeak=true
 V7_proof_only_ok: ok=true statementOriginLeak=false
 tmp_clean=true

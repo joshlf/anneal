@@ -1682,8 +1682,10 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         done("Episode 2 constructive policy, --audit-olean validation, cache-key sensitivity, and V1-V7 compiled checks")
 
         # Group 30: End-to-end compiled-`.olean` Spec-Strength & Mutant-Kill Gates (`V8`, `V9`,
-        # `R6`, `R7`, `R8`, `R11`, `A1-2`, `A1-4`, `A1-6`, `S3a/b`, `S5`, `A3-3a..e`, `A4-5b`,
-        # `A4-7`, `Classical.choice` certificate rejection, and `--fast` cache sensitivity).
+        # `R6`, `R7`, `R8`, `R11`, `A1-2`, `A1-4`, `A1-6`, `S3a/b`, `S5`, `A3-3a..e`, `A4-5`,
+        # `A4-7`, `Classical.choice` certificate rejection, `--fast` cache sensitivity, and the
+        # Episode 2 `B1` findings: theorem-headed major premises, kernel-native evaluators executing
+        # audited code inside the auditor, and specification-library provenance).
         mir_stub = prelude_init + (
             "namespace Trusted.Rustc.V2026_06_01.MirSemantics\n"
             "abbrev Value := Nat\n"
@@ -1944,31 +1946,126 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                          {"kind": "itemSynth", "defId": "ep2::sub", "cert": "c_sub"},
                      ])
 
-        # A4-5b (`Lean.reduceNat` kernel-vs-Meta.whnf asymmetry) and A4-7 (26-deep binary branching)
-        # in compiled `.olean`s.
-        a4_rn_src = (
-            "prelude\nimport Init\nimport Lean\nimport OlEp2SpecClean\n"
-            "open Lean Trusted.VerificationResult\n"
-            "def rnVal : Nat := 0\n"
-            "instance rnStrong : ItemSpec \"ep2::rn\" where pre := epPre; post := epPost\n"
-            "def rnWeakVal : ItemSpec \"ep2::rn\" := { pre := fun _ => False, post := fun _ _ => True }\n"
-            "run_cmd Elab.Command.liftCoreM do\n"
-            "  let natTy := mkConst ``Nat\n"
-            "  let u2 := Level.succ (Level.succ Level.zero)\n"
-            "  let u3 := Level.succ u2\n"
-            "  let motive := Expr.lam `k natTy (mkSort u2) .default\n"
-            "  let zCase := mkApp (mkConst ``ItemSpec) (mkStrLit \"ep2::rn\")\n"
-            "  let sCase := Expr.lam `_ natTy (Expr.lam `_ (mkSort u2) (mkConst ``PUnit [u2]) .default) .default\n"
-            "  let maj := mkApp (mkConst ``Lean.reduceNat) (mkConst ``rnVal)\n"
-            "  let ty := mkApp4 (mkConst ``Nat.rec [u3]) motive zCase sCase maj\n"
-            "  addDecl (.defnDecl {\n"
-            "    name := `rnKernelWeak, levelParams := [], type := ty,\n"
-            "    value := mkConst ``rnWeakVal, hints := .abbrev, safety := .safe })\n")
-        olean_module(ol2, "OlEp2A4Rn", a4_rn_src, ["Init", "Lean", "OlEp2SpecClean"])
-        olean_reject(ol2, base_spec_mods + ["OlEp2SpecClean", "OlEp2A4Rn"], "[specInstanceAmbiguous]",
-                     toolchainRoots=["Init", "Std", "Lean"],
-                     specStrengthChecks=[{"kind": "itemSynth", "defId": "ep2::rn", "cert": "epMultiCert"}])
+        # B1-1 (theorem-headed major premise). Lean's kernel δ-unfolds theorems exactly like
+        # definitions; `Meta.whnf` never does. `thmWeak` needs no axiom and no native code, its type
+        # is `Acc.rec … thmAcc`, and the kernel accepts it as `ItemSpec "ep2::thm"`. Both scanners
+        # used to answer "not a candidate" and the gate certified the strong instance as unique.
+        thm_ty = ("@Acc.rec Nat (fun _ _ => False) (fun _ _ => Type 1) "
+                  "(fun _ _ _ => ItemSpec \"ep2::thm\") 0")
+        thm_src = (
+            "prelude\nimport Init\nimport OlEp2SpecClean\n"
+            "open Trusted.VerificationResult\n"
+            "theorem thmAcc : Acc (fun (_ _ : Nat) => False) 0 := Acc.intro 0 (fun _ h => False.elim h)\n"
+            "instance thmStrong : ItemSpec \"ep2::thm\" where pre := epPre; post := epPost\n"
+            f"theorem thmTyEq : {thm_ty} thmAcc = ItemSpec \"ep2::thm\" :=\n"
+            "  @congrArg _ _ thmAcc (Acc.intro 0 (fun _ h => False.elim h))\n"
+            f"    (fun h => {thm_ty} h) rfl\n"
+            f"def thmWeak : {thm_ty} thmAcc :=\n"
+            "  cast thmTyEq.symm { pre := fun _ => False, post := fun _ _ => True }\n"
+            "instance thmOther : ItemSpec \"ep2::thm_other\" where pre := epPre; post := epPost\n")
+        olean_module(ol2, "OlEp2ThmMajor", thm_src, ["Init", "OlEp2SpecClean"])
+        thm_mods = base_spec_mods + ["OlEp2SpecClean", "OlEp2ThmMajor"]
+        olean_reject(ol2, thm_mods, "[specInstanceAmbiguous] epMultiCert", "#[thmStrong, thmWeak]",
+                     specStrengthChecks=[{"kind": "itemSynth", "defId": "ep2::thm", "cert": "epMultiCert"}])
+        # Control: `thmWeak` is no candidate for another `defId` (it is classified, not failed closed).
+        thm_ok = olean_accept(ol2, thm_mods, specStrengthChecks=[
+            {"kind": "itemSynth", "defId": "ep2::thm_other", "cert": "epMultiCert",
+             "requiredCategories": ["wrongReturn"]}])
+        assert thm_ok["specStrengthChecksPassed"] == 1, thm_ok
 
+        # B1-4 / A4-5 (kernel-native evaluators). `Lean.reduceBool c` and `Lean.reduceNat c` are
+        # reduced by the kernel and by `Meta.whnf` by *running the compiled code of `c`*, which the
+        # IR interpreter finds in the loaded artifacts. `nativeFlag` writes a marker file when it is
+        # evaluated; compiling `OlEp2NativeUse` runs it once (the elaborator normalizes the type), and
+        # that proves the canary is live. The auditor must then (a) never run it, in the instance
+        # scan, in the statement-origin pass, in tag validation or in replay, and (b) reject.
+        native_marker = ol2.stage / "native-evaluator-ran"
+        assert '"' not in str(native_marker) and "\\" not in str(native_marker)
+        olean_module(ol2, "OlEp2NativeImpl", (
+            "prelude\nimport Init\n"
+            "unsafe def nativeImpl (_ : Unit) : Bool :=\n"
+            f"  match unsafeIO (do IO.FS.writeFile \"{native_marker}\" \"ran\"; pure true) with\n"
+            "  | .ok b => b\n  | .error _ => true\n"
+            "@[implemented_by nativeImpl] def nativeHelper (_ : Unit) : Bool := true\n"
+            "def nativeFlag : Bool := nativeHelper ()\n"
+            "def nativeNat : Nat := 0\n"), ["Init"])
+        olean_module(ol2, "OlEp2NativeUse", (
+            "prelude\nimport Init\nimport OlEp2SpecClean\nimport OlEp2NativeImpl\n"
+            "open Trusted.VerificationResult\n"
+            "set_option linter.deprecated false\n"
+            "instance evStrong : ItemSpec \"ep2::ev\" where pre := epPre; post := epPost\n"
+            "def evWeak : Bool.rec (motive := fun _ => Type 1) PUnit (ItemSpec \"ep2::ev\")\n"
+            "    (Lean.reduceBool nativeFlag) := { pre := fun _ => False, post := fun _ _ => True }\n"
+            "def evSort : Bool.rec (motive := fun _ => Type 2) (Type 1) (Type 1) (Lean.reduceBool nativeFlag) := Type\n"
+            "def evInhab : evSort := Nat\n"
+            "def evNat : Nat := Lean.reduceNat nativeNat\n"),
+            ["Init", "OlEp2SpecClean", "OlEp2NativeImpl"])
+        assert native_marker.exists(), "native-evaluator canary is not live (the compiler did not run it)"
+        native_marker.unlink()
+        native_mods = base_spec_mods + ["OlEp2SpecClean", "OlEp2NativeImpl", "OlEp2NativeUse"]
+        for native_extra in (
+            {"specStrengthChecks": [{"kind": "itemSynth", "defId": "ep2::ev", "cert": "epMultiCert"}]},
+            {"claimModules": ["OlEp2NativeUse"]},
+            {},
+        ):
+            native_err = olean_reject(ol2, native_mods, "[nativeDecideReached] Lean.reduceBool",
+                                      "kernel-native evaluator", "[nativeDecideReached] Lean.trustCompiler",
+                                      **native_extra)
+            assert not native_marker.exists(), f"audited code ran inside OleanEnvAuditor ({native_extra})"
+            assert "specInstanceAmbiguous" not in native_err and "kernelReplayFailed" not in native_err, native_err
+        # `Lean.reduceNat` alone (no `Lean.reduceBool` anywhere) is the same class.
+        olean_module(ol2, "OlEp2NativeNat", "prelude\nimport Init\nset_option linter.deprecated false\n"
+                     "def rnVal : Nat := 0\ndef rnUse : Nat := Lean.reduceNat rnVal\n", ["Init"])
+        olean_reject(ol2, ["OlEp2NativeNat"], "[nativeDecideReached] Lean.reduceBool", "kernel-native evaluator")
+
+        # B1-5 (specification-library provenance). The gate recognizes certificate types by their
+        # declaring module `Anneal.OleanSpecStrengthAuditor`; like `Trusted`, that module therefore
+        # comes from the checker's own compilation. An `--audit-olean` caller can neither supply nor
+        # name it (a caller-built one could declare `SpecStrengthCert` as a one-field structure), and
+        # `specStrengthChecks` are refused while the checker owns no compiled copy.
+        spec_lib_parts = ol2.artifacts[runner.SPEC_LIB_MODULE]
+        for spec_spoof in (
+            {"roots": ["OlEp2ConstructiveOk"], "modules": ["OlEp2ConstructiveOk", runner.SPEC_LIB_MODULE],
+             "artifacts": []},
+            {"roots": [runner.SPEC_LIB_MODULE], "modules": ["OlEp2ConstructiveOk"], "artifacts": []},
+            {"roots": ["OlEp2ConstructiveOk"], "modules": ["OlEp2ConstructiveOk"],
+             "artifacts": [[runner.SPEC_LIB_MODULE, spec_lib_parts]]},
+            {"roots": ["OlEp2ConstructiveOk"], "modules": ["OlEp2ConstructiveOk"], "artifacts": [],
+             "constructiveModules": [runner.SPEC_LIB_MODULE]},
+            {"roots": ["OlEp2ConstructiveOk"], "modules": ["OlEp2ConstructiveOk"], "artifacts": [],
+             "graph": {runner.SPEC_LIB_MODULE: []}},
+        ):
+            expect_failure(lambda req=spec_spoof: ol2.audit_olean_request(req), 1, "olean-audit",
+                           "moduleProvenanceSpoofed", runner.SPEC_LIB_MODULE)
+        assert ol2.spec_lib_owned is False
+        expect_failure(lambda: ol2.audit_olean_request({
+            "roots": ["OlEp2SpecClean"], "modules": ["OlEp2SpecClean"], "artifacts": [],
+            "specStrengthChecks": [{"kind": "claim", "claim": "epClaim_ok", "cert": "epMultiCert"}],
+        }), 1, "olean-audit", "moduleProvenanceSpoofed", "checker's own compiled")
+        # With a checker-owned library the request needs no mention of it: it joins the audit by
+        # itself, under the constructive policy, and the checks run against it. (The fixture stands
+        # in for `run()` + `compile_spec_library()`, which compile the real `Trusted` and library.)
+        saved_modules = ol2.modules
+        ol2.modules = {**saved_modules, "Trusted.Rustc.V2026_06_01.MirSemantics": "MirSemantics.lean",
+                       "Trusted.VerificationResult": "VerificationResult.lean"}
+        ol2.spec_lib_owned = True
+        try:
+            owned = ol2.audit_olean_request({
+                "roots": ["OlEp2SpecClean"], "modules": ["OlEp2SpecClean"], "artifacts": [],
+                "specStrengthChecks": clean_checks, "scope": "ep2-owned-spec-lib",
+            })
+            assert owned["specStrengthChecksPassed"] == len(clean_checks), owned
+            assert owned["constructiveModulesChecked"] == 1 and runner.SPEC_LIB_MODULE in owned["modules"], owned
+            # Ownership does not relax the rule: the caller still cannot name the library.
+            expect_failure(lambda: ol2.audit_olean_request({
+                "roots": ["OlEp2SpecClean"], "modules": ["OlEp2SpecClean", runner.SPEC_LIB_MODULE],
+                "artifacts": [], "specStrengthChecks": clean_checks,
+            }), 1, "olean-audit", "moduleProvenanceSpoofed", runner.SPEC_LIB_MODULE)
+        finally:
+            ol2.modules = saved_modules
+            ol2.spec_lib_owned = False
+
+        # A4-7 (26-deep binary branching) in a compiled `.olean`.
         exp_lines = ["prelude", "import Init", "import OlEp2SpecClean", "open Trusted.VerificationResult",
                      "instance expStrong : ItemSpec \"ep2::exp\" where pre := epPre; post := epPost",
                      "noncomputable section", "def eb0 : Bool := true"]
@@ -1987,7 +2084,8 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         shutil.rmtree(ol2.stage)
         runner.make_tree_writable(ol2.checkout)
         shutil.rmtree(ol2.checkout)
-        done("Episode 2 compiled spec-strength gates (V8/V9, 4 claim kinds, A1-4, A3-3 _sunfold, A1-2/S3 shadows, A4-5b, A4-7)")
+        done("Episode 2 compiled spec-strength gates (V8/V9, 4 claim kinds, A1-4, A3-3 _sunfold, A1-2/S3 shadows, "
+             "B1-1 theorem-major, B1-4 native-evaluator canary, B1-5 spec-library provenance, A4-7)")
     except BaseException as error:
         (suite / "failure.traceback").write_text(traceback.format_exc())
         print(f"SELF-TEST FAILED: {error}\nPreserved fixture sources/raw logs: {suite}", file=sys.stderr)

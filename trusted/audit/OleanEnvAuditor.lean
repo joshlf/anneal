@@ -499,6 +499,9 @@ structure Loaded where
   modIdx : Std.HashMap Name Nat
   toolchainProv : Std.HashSet Name
   nonToolchain : Array Name
+  /-- `false` when a declaration of an audited module can reach a kernel-native evaluator: the
+  audit then performs no kernel or `MetaM` evaluation at all (see `reachesNativeEvaluator`). -/
+  dynamicOk : Bool := true
 
 def loadEnvironment (req : Request) (roots : Array Name) : IO Environment := do
   -- The search path is exactly the pinned toolchain library; `LEAN_PATH` is ignored so that an
@@ -624,6 +627,48 @@ def kindOf (ci : ConstantInfo) : String :=
   | .axiomInfo _ => "axiom" | .defnInfo _ => "definition" | .thmInfo _ => "theorem"
   | .opaqueInfo _ => "opaque" | .quotInfo _ => "quotient" | .inductInfo _ => "inductive"
   | .ctorInfo _ => "constructor" | .recInfo _ => "recursor"
+
+/-! ## Kernel-native evaluators
+
+`Lean.reduceBool c` and `Lean.reduceNat c` are the two terms Lean's kernel (`reduce_native`) and
+`Meta.whnf` (`reduceNative?`) reduce by *running the compiled code* of `c`. The IR interpreter finds
+that code in the loaded artifacts even under `loadExts := false`, so type checking, replaying or
+normalizing any term that can reach one of them executes code of the audited modules inside the
+auditor (measured: an instance type `Bool.rec _ _ (Lean.reduceBool flag)` in an audited module wrote
+a file from within `OleanEnvAuditor` during the instance scan). An auditor that runs the code it
+judges can be made to write its own verdict, so no kernel or `MetaM` evaluation is performed on
+anything whose dependency closure reaches a native evaluator. -/
+
+def kernelNativeEvaluators : List Name := [``Lean.reduceBool, ``Lean.reduceNat]
+
+/-- Whether the dependency closure of `roots` (types, values, theorem and opaque bodies, recursor
+rules) reaches a kernel-native evaluator. `clean` memoizes constants whose whole closure is known
+to be free of them, so repeated queries over one environment stay linear in its size. Fails closed
+(`true`) when the fuel runs out. -/
+def reachesNativeEvaluator (env : Environment) (roots : Array Name) (clean : NameSet) (fuel : Nat) :
+    Bool × NameSet := Id.run do
+  let mut visited : NameSet := {}
+  let mut pending : List Name := []
+  for r in roots do
+    unless clean.contains r || visited.contains r do
+      visited := visited.insert r
+      pending := r :: pending
+  for _ in [0:fuel] do
+    match pending with
+    | [] => return (false, clean ++ visited)
+    | n :: rest =>
+      pending := rest
+      if kernelNativeEvaluators.contains n then return (true, clean)
+      let some ci := env.find? n | continue
+      for d in declEdges ci do
+        unless clean.contains d || visited.contains d do
+          visited := visited.insert d
+          pending := d :: pending
+  if pending.isEmpty then return (false, clean ++ visited)
+  return (true, clean)
+
+def envConstantCount (env : Environment) : Nat :=
+  env.header.moduleData.foldl (fun a d => a + d.constants.size) 0 + env.constants.map₂.toList.length
 
 /-! ## Kernel helpers -/
 
@@ -1331,6 +1376,9 @@ def wellFormedNativeAxiom (L : Loaded) (ci : ConstantInfo) : Option Expr := do
 /-- Bounded `Meta.whnf` cost gate (all transparency, no smart unfolding, fresh caches), then the
 kernel on both polarities. -/
 def recheckNative (L : Loaded) (n : Name) (e : Expr) : AuditM Unit := do
+  unless L.dynamicOk do
+    modify fun (s : AuditState) => { s with provisionalNative := s.provisionalNative.insert n }
+    return
   let hb := L.req.nativeHeartbeats
   let value ← (show IO (Option Expr) from do
     try
@@ -1535,6 +1583,8 @@ def overrideKinds (env : Environment) (n : Name) : Array String := Id.run do
 
 /-- Validate the compiler-intrinsic tags of one non-toolchain declaration. -/
 def checkIntrinsicTags (L : Loaded) (n : Name) (m : Name) (budget : Nat) : AuditM Unit := do
+  -- Tag validation type checks terms of the audited module; never on a native-reaching environment.
+  unless L.dynamicOk do return
   let env := L.env
   if isAuxRecursor env n then
     modify fun (s : AuditState) => { s with tagChecks := s.tagChecks + 1 }
@@ -2362,6 +2412,25 @@ def natLitToCtor? : Expr → Option Expr
   | .lit (.natVal (n + 1)) => some (mkApp (mkConst ``Nat.succ) (.lit (.natVal n)))
   | _ => none
 
+/-- `"abc"` as the kernel sees it under a projection or a recursor: `String.ofList ['a', 'b', 'c']`. -/
+def strLitToOfList? : Expr → Option Expr
+  | .lit (.strVal s) => some (mkApp (mkConst ``String.ofList) (toExpr s.toList))
+  | _ => none
+
+/-- `Nat` functions the kernel evaluates natively (GMP) when their arguments are literals. -/
+def kernelNatAcceleratedOps : List Name :=
+  [``Nat.add, ``Nat.sub, ``Nat.mul, ``Nat.div, ``Nat.mod, ``Nat.gcd, ``Nat.beq, ``Nat.ble,
+   ``Nat.land, ``Nat.lor, ``Nat.xor, ``Nat.shiftLeft, ``Nat.shiftRight, ``Nat.pow, ``Nat.log2]
+
+def isCtorOrLitHead (env : Environment) (e : Expr) : Bool :=
+  match e.getAppFn with
+  | .lit _ => true
+  | .const c _ =>
+    match env.find? c with
+    | some (.ctorInfo _) => true
+    | _ => false
+  | _ => false
+
 def isStructureLikeInduct (env : Environment) (indName : Name) : Option (InductiveVal × ConstructorVal) := do
   let .inductInfo iv ← env.find? indName | none
   guard (iv.ctors.length == 1 && iv.numIndices == 0 && !iv.isRec && !iv.isReflexive && !iv.isUnsafe)
@@ -2421,9 +2490,17 @@ public def headNormalizeBudget (env : Environment) (e : Expr) (fuel : Nat) : Hea
                     certainWhnf := false
                     rem := liftRem (Nat.le_refl _) sRes.rem }
               else
-                { expr := mkAppN (.proj structName idx sRes.expr) args
-                  certainWhnf := sRes.certainWhnf
-                  rem := liftRem (Nat.le_refl _) sRes.rem }
+                match strLitToOfList? sRes.expr with
+                | some ofList =>
+                  -- The kernel converts a string literal under a projection to `String.ofList [..]`
+                  -- and keeps reducing; a literal is never a certain stuck structure value.
+                  have : sRes.rem.1 < fuel' + 1 := Nat.lt_succ_of_le sRes.rem.2
+                  liftRes sRes.rem.2
+                    (headNormalizeBudget env (mkAppN (.proj structName idx ofList) args) sRes.rem.1)
+                | none =>
+                  { expr := mkAppN (.proj structName idx sRes.expr) args
+                    certainWhnf := sRes.certainWhnf
+                    rem := liftRem (Nat.le_refl _) sRes.rem }
             | _ =>
               { expr := e, certainWhnf := false, rem := liftRem (Nat.le_refl _) sRes.rem }
           | _ =>
@@ -2439,6 +2516,22 @@ public def headNormalizeBudget (env : Environment) (e : Expr) (fuel : Nat) : Hea
           | some (.defnInfo dv) =>
             if dv.levelParams.length == us.length then
               let body := dv.value.instantiateLevelParams dv.levelParams us
+              let r := liftRes (Nat.le_refl _) (headNormalizeBudget env (mkAppN body args) fuel')
+              -- The kernel evaluates these `Nat` functions on literals with GMP and never looks at
+              -- their bodies, so a body that is stuck (on an axiom inside a well-foundedness proof,
+              -- say) proves nothing about the kernel: only a constructor or literal result is certain.
+              if kernelNatAcceleratedOps.contains c && !isCtorOrLitHead env r.expr then
+                { r with certainWhnf := false }
+              else r
+            else
+              { expr := e, certainWhnf := false, rem := ⟨fuel', Nat.le_succ _⟩ }
+          | some (.thmInfo tv) =>
+            -- Lean's kernel δ-unfolds theorems exactly like definitions (`is_delta` tests
+            -- `has_value`), while `Meta.whnf` never does (`getUnfoldableConst?` answers `none` for
+            -- `.thm` at every transparency): a recursor whose major premise is a theorem (`Acc.rec`,
+            -- any subsingleton eliminator) reduces in the kernel and is stuck in `MetaM`.
+            if tv.levelParams.length == us.length then
+              let body := tv.value.instantiateLevelParams tv.levelParams us
               liftRes (Nat.le_refl _) (headNormalizeBudget env (mkAppN body args) fuel')
             else
               { expr := e, certainWhnf := false, rem := ⟨fuel', Nat.le_succ _⟩ }
@@ -2521,8 +2614,7 @@ public def headNormalizeBudget (env : Environment) (e : Expr) (fuel : Nat) : Hea
                 { expr := e, certainWhnf := true, rem := ⟨fuel', Nat.le_succ _⟩ }
             | .type | .ctor =>
               { expr := e, certainWhnf := true, rem := ⟨fuel', Nat.le_succ _⟩ }
-          | some (.inductInfo _) | some (.ctorInfo _) | some (.axiomInfo _)
-          | some (.thmInfo _) | some (.opaqueInfo _) =>
+          | some (.inductInfo _) | some (.ctorInfo _) | some (.axiomInfo _) | some (.opaqueInfo _) =>
             { expr := e, certainWhnf := true, rem := ⟨fuel', Nat.le_succ _⟩ }
       | .mvar _ =>
         { expr := e, certainWhnf := false, rem := ⟨fuel', Nat.le_succ _⟩ }
@@ -2673,21 +2765,32 @@ public def specInstanceCandidates (env : Environment) (specClass : Name) (target
   return cands.qsort (fun a b => a.toString < b.toString)
 
 /-- `MetaM` uniqueness scan for `(specClass, targetDefId)` running inside `withKernelFaithfulMeta`
-with `Meta.withTransparency .all` and cross-checking stuck recursor/quotient/projection/native
-heads against `specClassConclusionMatch` (closing Lean `v4.34.1`'s `Meta.whnf` vs. kernel
-`Lean.reduceNat` soundness asymmetry, `A4-5b`). -/
+with `Meta.withTransparency .all`.
+
+`Meta.whnf` is strictly weaker than the kernel in two measured ways: it never δ-unfolds theorems
+(`getUnfoldableConst?` answers `none` for `.thm` at every transparency, so `Acc.rec … thm` is stuck
+where the kernel reduces it), and it leaves the result of `Lean.reduceNat` unnormalized (`A4-5b`).
+A "not the specification class" answer is therefore believed only when the kernel-faithful pure
+normalizer (`specClassConclusionMatch`) is certain of it as well, whatever head `Meta.whnf` stopped
+at. A type whose dependency closure reaches a kernel-native evaluator is never normalized at all
+(that would run audited code inside the auditor): it is a candidate. -/
 public def specInstanceCandidatesMeta (specClass : Name) (targetDefId : String) (fuel : Nat := 256) :
     MetaM (Array Name) :=
   withKernelFaithfulMeta do
     let env ← getEnv
-    let specIsProp ← try
+    let nativeFuel := envConstantCount env + 64
+    let (specNative, clean0) := reachesNativeEvaluator env #[specClass] {} nativeFuel
+    let specIsProp ← if specNative then pure true else try
         Meta.withTransparency .all (Meta.isProp (mkApp (mkConst specClass []) (mkStrLit targetDefId)))
       catch _ => pure true
     let mut cands : Array Name := #[]
     let mut seen : NameSet := {}
+    let mut clean : NameSet := clean0
     for (n, ci) in candidateDeclsForSpecClass env specClass do
       if seen.contains n then continue
-      let isCand ← try
+      let (native, clean') := reachesNativeEvaluator env ci.type.getUsedConstants clean nativeFuel
+      clean := clean'
+      let isCand ← if native then pure true else try
           Meta.withTransparency .all do
             if !specIsProp then
               if ← Meta.isProp ci.type then
@@ -2705,20 +2808,9 @@ public def specInstanceCandidatesMeta (specClass : Name) (targetDefId : String) 
                 else
                   return true
               else
-                let isStuckHead : Bool := match fn with
-                  | .proj _ _ _ => true
-                  | .const c _ =>
-                    c == ``Lean.reduceBool || c == ``Lean.reduceNat ||
-                    match env.find? c with
-                    | some (.recInfo _) | some (.quotInfo _) | some (.defnInfo _) => true
-                    | _ => false
-                  | _ => false
-                if isStuckHead then
-                  match specClassConclusionMatch env specClass targetDefId ci.type fuel with
-                  | .matched | .undecided => return true
-                  | .notMatched => return false
-                else
-                  return false
+                match specClassConclusionMatch env specClass targetDefId ci.type fuel with
+                | .matched | .undecided => return true
+                | .notMatched => return false
         catch _ =>
           pure true
       if isCand then
@@ -2981,12 +3073,12 @@ def auditSpecStrengthCertCore (ctx : SpecAuditCtx) (certName : Name) (expected :
     -- Step 2: existence & constructive audit BEFORE coverage (`A1-4`).
     let some certCi := env.find? certName
       | return singleV "specStrengthCertMissing" s!"spec-strength certificate {certName} not found"
-    unless certCi.levelParams.isEmpty do
-      return singleV "specStrengthCertInvalidType"
-        s!"spec-strength certificate {certName} must be monomorphic (got universe params {certCi.levelParams})"
     let certViolations := auditDeclsForSpec env ctx #[certName] (constructive := true)
     if !certViolations.isEmpty then
       return certViolations
+    unless certCi.levelParams.isEmpty do
+      return singleV "specStrengthCertInvalidType"
+        s!"spec-strength certificate {certName} must be monomorphic (got universe params {certCi.levelParams})"
     -- Step 3: verify head type provenance and confirm binding in Lean's kernel (`A3-3a/d`).
     let certTy ← try Meta.withTransparency .all (Meta.whnf certCi.type) catch _ => pure certCi.type
     let .const headName _ := certTy.getAppFn
@@ -3235,6 +3327,12 @@ def auditItemSpecStrengthBySynthCore (ctx : SpecAuditCtx) (kind : SpecClassKind)
       return singleV "specInstanceAmbiguous" certName
         s!"multiple {specClass} instance candidates for {defId}: {allCands}"
     let soleCand := allCands[0]!
+    -- The specification instance is audited (standard policy) before anything unfolds it: an
+    -- instance built from `sorryAx`, an unapproved axiom, or a kernel-native evaluator is rejected
+    -- here, never normalized or type checked.
+    let instViolations := auditDeclsForSpec env ctx #[soleCand] (constructive := false)
+    if !instViolations.isEmpty then
+      return instViolations
     let expectedInstTy := mkApp (mkConst specClass []) (mkStrLit defId)
     if ctx.useSynthInstance then
       let synth? ← try Meta.synthInstance? expectedInstTy catch _ => pure none
@@ -3344,7 +3442,19 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
       report "missingDeclaration" m m "admitted module missing from the loaded environment"
   if nonToolchain.isEmpty then
     report "noAuditTargets" .anonymous .anonymous "no non-toolchain modules to audit"
-  let L : Loaded := { env, req, libDir, artMap, modIdx, toolchainProv, nonToolchain }
+  -- Kernel-native evaluators: decide once, before anything is type checked or normalized,
+  -- whether in-process kernel / `MetaM` evaluation is safe on this environment.
+  let mut nativeRoots : Array Name := #[]
+  for m in nonToolchain do
+    if let some i := modIdx[m]? then
+      for ci in env.header.moduleData[i]!.constants do
+        nativeRoots := nativeRoots.push ci.name
+  let (nativeReach, _) := reachesNativeEvaluator env nativeRoots {} (envConstantCount env + 64)
+  if nativeReach then
+    report "nativeDecideReached" ``Lean.reduceBool ((origin? env ``Lean.reduceBool).getD .anonymous)
+      "kernel-native evaluator (Lean.reduceBool / Lean.reduceNat) reachable from an audited declaration: evaluating it would run audited code inside the auditor, so no kernel or MetaM evaluation is performed"
+  let L : Loaded := {
+    env, req, libDir, artMap, modIdx, toolchainProv, nonToolchain, dynamicOk := !nativeReach }
   -- Admitted import DAG.
   if let some expected := req.graph then
     let tracked := env.header.modules.filterMap fun (m : EffectiveImport) =>
@@ -3395,7 +3505,7 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
           unless stored.type == ci.type && stored.value? true == ci.value? true &&
               stored.levelParams == ci.levelParams && stored.isUnsafe == ci.isUnsafe &&
               stored.isPartial == ci.isPartial && kindOf stored == kindOf ci do
-            if ← reservedTheoremCopyOk env n stored ci then
+            if ← (if L.dynamicOk then reservedTheoremCopyOk env n stored ci else pure false) then
               extraEdges := extraEdges.push (m, declEdges ci)
             else
               report "inventoryMismatch" n m "reserved declaration copy differs from the stored declaration"
@@ -3416,7 +3526,7 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
         unless stored.type == ci.type && stored.value? true == ci.value? true &&
             stored.levelParams == ci.levelParams && stored.isUnsafe == ci.isUnsafe &&
             stored.isPartial == ci.isPartial && kindOf stored == kindOf ci do
-          if ← reservedTheoremCopyOk env n stored ci then
+          if ← (if L.dynamicOk then reservedTheoremCopyOk env n stored ci else pure false) then
             extraEdges := extraEdges.push (m, declEdges ci)
           else
             report "inventoryMismatch" n m "kernel environment differs from the module inventory"
@@ -3429,7 +3539,8 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
         match genuineCompanion L ci with
         | .ok () =>
           let bodyOk ← match ci.value? (allowOpaque := true) with
-            | some v => kernelAcceptsPartial env ci.levelParams ci.type v budget
+            | some v =>
+              if L.dynamicOk then kernelAcceptsPartial env ci.levelParams ci.type v budget else pure false
             | none => pure false
           if bodyOk then
             genuine := genuine.insert n
@@ -3509,7 +3620,8 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
       let _ ← closure L #[c] {} genuine (fun _ => false) fuel cm (allowClassical := false)
     modify fun (s : AuditState) => { s with constructiveModulesChecked := s.constructiveModulesChecked + 1 }
   -- Hardened spec-strength & mutant-kill verification gates.
-  if !req.specStrengthChecks.isEmpty then
+  -- (Skipped on a native-reaching environment: the gates normalize and type check audited terms.)
+  if !req.specStrengthChecks.isEmpty && L.dynamicOk then
     let specCtx := SpecAuditCtx.forLoaded L budget
     for sc in req.specStrengthChecks do
       let vs ← (show IO (Array Violation) from do
@@ -3539,8 +3651,9 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
       | .thmInfo _ =>
         checkStatementOrigin L ci.name m fuel
       | .defnInfo _ | .opaqueInfo _ =>
-        let isPropTy ← (show IO Bool from do
-          try runMeta env (Meta.isProp ci.type) (heartbeats := 50000) catch _ => pure true)
+        let isPropTy ← if L.dynamicOk then (show IO Bool from do
+            try runMeta env (Meta.isProp ci.type) (heartbeats := 50000) catch _ => pure true)
+          else pure true
         if isPropTy then
           checkStatementOrigin L ci.name m fuel
       | _ => pure ()

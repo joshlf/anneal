@@ -74,6 +74,10 @@ SPEC_CHECK_ALLOWED_KEYS = frozenset({
     "requireDeterministic", "requireInputSensitive"})
 SPEC_CHECK_SYNTH_KINDS = frozenset({
     "itemSynth", "statefulItemSynth", "totalItemSynth", "modularItemSynth"})
+# The specification-strength gate trusts the certificate types and `coversCategory` of this module
+# (OleanEnvAuditor matches them by declaring module). Like `Trusted`, it is therefore always compiled
+# from the checkout by this checker and can never be supplied or named by an `--audit-olean` caller.
+SPEC_LIB_MODULE = "Anneal.OleanSpecStrengthAuditor"
 
 # Each entry is (module_name, relative_path, direct_imports, role)
 # where role is "theory", "examples", "claim", or "test".
@@ -503,6 +507,9 @@ class Checker:
         self.artifacts: dict[str, list[list[str]]] = {}
         self.graph: dict = {}
         self.expected_artifacts: dict[str, str] = {}
+        # Set once this checker has compiled `SPEC_LIB_MODULE` from the checkout and audited it
+        # (constructive policy + live model certificates).
+        self.spec_lib_owned = False
         self.last_status = None
 
     def budget(self) -> None:
@@ -1116,6 +1123,16 @@ class Checker:
         if spoofed:
             raise Failure(1, phase, f"[moduleProvenanceSpoofed] --audit-olean cannot supply or name Trusted modules "
                                     f"({', '.join(spoofed)}); they come from the checker's own compilation")
+        # The certificate types the spec-strength gate recognizes live in `SPEC_LIB_MODULE`, and the
+        # auditor identifies them by that module name: a caller-supplied module of that name could
+        # declare `SpecStrengthCert` as a one-field structure and "certify" a vacuous claim.
+        if SPEC_LIB_MODULE in named:
+            raise Failure(1, phase, f"[moduleProvenanceSpoofed] --audit-olean cannot supply or name {SPEC_LIB_MODULE}; "
+                                    f"it comes from the checker's own compilation")
+        spec_lib_owned = bool(self.spec_lib_owned and SPEC_LIB_MODULE in self.artifacts)
+        if spec_checks and not spec_lib_owned:
+            raise Failure(1, phase, f"[moduleProvenanceSpoofed] specStrengthChecks need the checker's own compiled "
+                                    f"{SPEC_LIB_MODULE} (compile_spec_library()); none is available")
         sources = request.get("sources", [])
         require(isinstance(sources, list) and all(
             isinstance(s, list) and len(s) == 2 and all(isinstance(x, str) and x for x in s) for s in sources)
@@ -1139,6 +1156,10 @@ class Checker:
         else:
             merged_graph = None
         compiled_trusted = [m for m in getattr(self, "modules", {}) if m in self.artifacts]
+        # The checker's own spec library joins every request once compiled (callers may import it),
+        # always under the constructive policy.
+        compiled_own = [*compiled_trusted, *([SPEC_LIB_MODULE] if spec_lib_owned else [])]
+        owned_constructive = [SPEC_LIB_MODULE] if spec_lib_owned else []
         saved_artifacts = dict(self.artifacts)
         saved_expected = dict(self.expected_artifacts)
         saved_graph = dict(self.graph)
@@ -1161,11 +1182,11 @@ class Checker:
             if merged_graph is not None:
                 self.graph = merged_graph
             verdict = self.olean_audit(
-                "olean-audit", scope=scope, roots=[*request["roots"], *compiled_trusted],
-                modules=[*request["modules"], *compiled_trusted],
+                "olean-audit", scope=scope, roots=[*request["roots"], *compiled_own],
+                modules=[*request["modules"], *compiled_own],
                 graph=merged_graph,
                 allowClassicalChoice=allow_classical,
-                constructiveModules=constructive_mods,
+                constructiveModules=[*constructive_mods, *owned_constructive],
                 specStrengthChecks=spec_checks,
                 localAxiomModules=request.get("localAxiomModules", []),
                 claimModules=request.get("claimModules", []),
@@ -1448,8 +1469,8 @@ class Checker:
             testModules=[m for m, _, _, r in targets if r == "test"],
         ))
         downstream_modules = [m for m, _, _, _ in targets]
-        has_spec_lib = "Anneal.OleanSpecStrengthAuditor" in downstream_modules
-        constructive_mods = ["Anneal.OleanSpecStrengthAuditor"] if has_spec_lib else []
+        has_spec_lib = SPEC_LIB_MODULE in downstream_modules
+        constructive_mods = [SPEC_LIB_MODULE] if has_spec_lib else []
         downstream_spec_checks = (
             [
                 {
@@ -1510,7 +1531,19 @@ class Checker:
             sources=[*((n, str(self.source_copy / p)) for n, p in self.modules.items()),
                      *((m, str(copies[m])) for m in downstream_modules)])
         result["waiverVacuityAudit"] = waiver_audit
+        if has_spec_lib:
+            self.spec_lib_owned = True
         return result
+
+    def compile_spec_library(self) -> dict:
+        """Compile `SPEC_LIB_MODULE` from the checkout against the audited `Trusted` artifacts and
+        audit it (TrustedBoundary downstream audit, constructive OleanEnvAuditor policy, and the live
+        model certificates). Call after `run()`; `--audit-olean` requests with `specStrengthChecks`
+        are then judged against this copy, never a caller-supplied one."""
+        target = [t for t in DOWNSTREAM_TARGETS if t[0] == SPEC_LIB_MODULE]
+        if len(target) != 1 or any(n != "Trusted" and not n.startswith("Trusted.") for n in target[0][2]):
+            raise Failure(2, "downstream-input", f"{SPEC_LIB_MODULE} must be a DOWNSTREAM_TARGETS entry importing only Trusted")
+        return self.compile_and_audit_downstream(target)
 
     def run(self, *, check_downstream: bool = False) -> dict:
         base_hashes = (
@@ -5836,6 +5869,10 @@ def _main() -> int:
             # Compile and audit `Trusted` from the checkout first: requests are audited against
             # the checker's own `Trusted` artifacts, never caller-supplied ones.
             olean_checker.run()
+            if isinstance(request, dict) and request.get("specStrengthChecks"):
+                # Spec-strength checks are judged against the checkout's own specification-strength
+                # library, compiled and audited here.
+                olean_checker.compile_spec_library()
             verdict = olean_checker.audit_olean_request(request)
             olean_checker.freshness()
         except (Failure, OSError, ValueError, KeyError, TypeError) as error:
