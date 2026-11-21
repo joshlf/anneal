@@ -1627,6 +1627,439 @@ run_meta do
 
 end EntryPoints
 
+/-! ## Adversarial hardening regressions (Pass B1) -/
+
+namespace HardeningB1
+
+/-! ### Part I bridges, strictness chains, and vacuous-handler theorems -/
+
+theorem claimPre_bridge (body : CapturedMir) :
+    ClaimPreSatisfiable (Class1.contradictoryClaim body) ↔
+      NonVacuousPre (Class1.contradictoryClaim body).pre :=
+  claimPreSatisfiable_iff_nonVacuousPre
+
+theorem statefulPre_bridge (body : CapturedMir) :
+    StatefulClaimPreSatisfiable (Refinement.checkedIncClaim body) ↔
+      NonVacuousStatefulPre (Refinement.checkedIncClaim body).pre :=
+  statefulClaimPreSatisfiable_iff_nonVacuousStatefulPre
+
+/--
+An unsatisfiable `MirCallContract` precondition is satisfied even by a handler
+that unconditionally triggers undefined behavior (`ITree.fail .ub`).
+-/
+theorem contradictoryPre_holdsOn_ub_handler :
+    Class1.contradictoryPreContract.holdsOn
+      (fun _ => Trusted.ITree.ITree.fail Trusted.Effect.FailureKind.ub) :=
+  mirCallContract_holdsOn_of_not_preSatisfiable
+    Class1.contradictoryPre_not_preSatisfiable _
+
+/--
+Every `externalSpecCallContract` (even one with a genuine `extraPost`) is
+satisfied by the trivial always-aborting handler, because `.aborted` is `True`.
+-/
+theorem extSpecGenuine_holdsOn_abort_handler (target : DefPath)
+    (sidecar : CapturedMir) :
+    (Class5.extSpecGenuine target sidecar).holdsOn (fun _ => .ret .aborted) :=
+  mirCallContract_holdsOn_abort_of_abort_permitted fun _ _ => trivial
+
+theorem returnValueDichotomy_strict :
+    (∀ c, MirCallContractReturnValueDichotomy c →
+      MirCallContractNormalDichotomy c) ∧
+      ∃ c, MirCallContractNormalDichotomy c ∧
+        ¬ MirCallContractReturnValueDichotomy c :=
+  returnValueDichotomy_strictly_stronger_than_normalDichotomy
+
+theorem statefulReturnDichotomy_strict (body : CapturedMir) :
+    (∀ c, StatefulClaimReturnDichotomy c → StatefulClaimDichotomy c) ∧
+      ∃ c : StatefulClaim, c.body = body ∧
+        StatefulClaimDichotomy c ∧ ¬ StatefulClaimReturnDichotomy c :=
+  statefulClaimReturnDichotomy_strictly_stronger_than_dichotomy body
+
+/-- An unsatisfiable `TotalClaim` verifies for every MIR body. -/
+def unsatTotalClaim (body : CapturedMir) : TotalClaim where
+  body := body
+  pre args _ := ∃ a, args = [u32Arg a] ∧ a < 10 ∧ a > 20
+  post _ _ ret _ := ret = u32Arg 0
+
+theorem unsatTotalClaim_verified (body : CapturedMir) :
+    TotalVerificationResult (unsatTotalClaim body) :=
+  totalVerificationResult_of_not_preSatisfiable fun ⟨_, _, a, _, h₁, h₂⟩ => by
+    omega
+
+/-- An unsatisfiable `ModularClaim` verifies for every MIR body and rely. -/
+def unsatModularClaim (body : CapturedMir) : ModularClaim where
+  body := body
+  envAssumed _ := True
+  pre args _ := ∃ a, args = [u32Arg a] ∧ a < 10 ∧ a > 20
+  post _ _ ret _ := ret = u32Arg 0
+
+theorem unsatModularClaim_verified (body : CapturedMir) :
+    ModularVerificationResult (unsatModularClaim body) :=
+  modularVerificationResult_of_not_preSatisfiable fun ⟨_, _, a, _, h₁, h₂⟩ => by
+    omega
+
+/-- Observational mutation adequacy applied to `slice::is_empty`. -/
+theorem sliceIsEmpty_kills_every_obs_mutant
+    (mutant : OutputMutant MirCallReq (Value × Memory))
+    (req : MirCallReq) (out : Value × Memory)
+    (h_pre : SliceIsEmpty.sliceIsEmptyContract.pre req)
+    (h_post : mirCallNormalPost SliceIsEmpty.sliceIsEmptyContract req out)
+    (h_ne : (mutant req out).1 ≠ out.1) :
+    KillsMutantAt SliceIsEmpty.sliceIsEmptyContract.pre
+      (mirCallNormalPost SliceIsEmpty.sliceIsEmptyContract) mutant req out :=
+  (contractDeterministicOn_iff_kills_every_obs_nonequivalent_mutant Prod.fst).mp
+    SliceIsEmpty.return_deterministic mutant req out h_pre h_post h_ne
+
+/-- `MirCallContractSubsumes` transfers return-value dichotomy in one memory. -/
+theorem sliceIsEmpty_subsumes_returnValueDichotomy :
+    MirCallContractReturnValueDichotomy SliceIsEmpty.sliceIsEmptyContract ∧
+      MirCallContractReturnValueDichotomy SliceIsEmpty.sliceIsEmptyContract :=
+  MirCallContractSubsumes.returnValueDichotomy_of_super_ok_sub_bad
+    (MirCallContractSubsumes.refl _)
+    ⟨SliceIsEmpty.req 0, .scalar ⟨1, 1⟩, .scalar ⟨0, 1⟩, emptyMemory,
+      SliceIsEmpty.pre_req 0 (by decide), SliceIsEmpty.post_empty_true,
+      SliceIsEmpty.rejects_false_on_empty⟩
+
+/-! ### Soundness bug regressions (no false positives or ill-typed residuals) -/
+
+/--
+`collapseMatch?` must peel only `altNumParams` pattern binders, never domain
+binders of a function-valued motive (`Nat → Nat`).
+-/
+def genuineFnMatch (x r : Nat) : Prop :=
+  (match x with
+   | 0 => fun _ : Nat => 0
+   | _ + 1 => fun _ : Nat => 0) = (fun _ : Nat => r)
+
+theorem genuineFnMatch_dichotomy :
+    PostconditionDichotomy (fun _ => True) genuineFnMatch :=
+  ⟨0, 0, 1, trivial, rfl, fun h => by
+    have := congrFun h 0
+    exact Nat.zero_ne_one this⟩
+
+/-- Dependent-domain function equality whose RHS collapses via `collapseMatch?`. -/
+def genuineFinFnMatch (x r : Nat) : Prop :=
+  ∀ f : Fin r → Nat,
+    f = match x with
+        | 0 => fun _ => 0
+        | _ + 1 => fun _ => 0
+
+theorem genuineFinFnMatch_dichotomy :
+    PostconditionDichotomy (fun _ => True) genuineFinFnMatch := by
+  refine ⟨0, 0, 1, trivial, ?_, ?_⟩
+  · intro f
+    funext i
+    exact i.elim0
+  · intro h
+    have h1 := congrFun (h (fun _ => 1)) ⟨0, Nat.zero_lt_one⟩
+    exact Nat.one_ne_zero h1
+
+/--
+Negated boilerplate conjunct paired with a genuine return binding: boilerplate
+stripping must stay restricted to positive conjunctive positions so `¬ callFramePreserved`
+never collapses to `False` and falsely flags `retVal = u32Arg 1` as vacuous.
+-/
+def genuineNegBoilerplate : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned retVal memAfter =>
+      ¬ callFramePreserved req.memory memAfter ∧ retVal = u32Arg 1
+    | .panicked _ => False
+    | .aborted => False
+
+theorem genuineNegBoilerplate_returnValueDichotomy :
+    MirCallContractReturnValueDichotomy genuineNegBoilerplate :=
+  ⟨witnessReq, u32Arg 1, u32Arg 0,
+    { emptyMemory with activeProtectors := [0] }, trivial,
+    ⟨fun h => List.cons_ne_self 0 _ h.2.2.2.1, rfl⟩,
+    fun h => absurd (u32Arg_inj h.2) (by decide)⟩
+
+-- Genuine `Iff` and `Exists` postconditions immune to tactic error recovery.
+genuine_case genuineIff := fun x r => (r = 0) ↔ (x = 0)
+  witness 0 0 1 by simp [genuineIff]
+genuine_case genuineExistsSucc := fun _ r => ∃ y : Nat, r = y + 1
+  witness 0 1 0 by
+    unfold genuineExistsSucc
+    exact ⟨⟨0, rfl⟩, by rintro ⟨y, h⟩; omega⟩
+
+#expect_binds genuineFnMatch
+#expect_binds genuineFinFnMatch
+#expect_binds genuineNegBoilerplate
+
+run_meta do
+  -- `genuineNegBoilerplate` binds beyond boilerplate in every mode.
+  let rDef ← reportOf ``genuineNegBoilerplate
+  unless rDef.bindsOutput && rDef.bindsBeyondBoilerplate do
+    throwError "genuineNegBoilerplate (default): {rDef.describe}"
+  assertEnsuresBindsOutput ``genuineNegBoilerplate
+    (cfg := { userEnsuresOnly := true })
+  assertEnsuresBindsOutput ``genuineNegBoilerplate
+    (cfg := { userEnsuresOnly := true, strictReturnValue := true })
+  -- `frameOnlyMirCallContract` binds `memAfter` in default mode, fails strict
+  -- and user-ensures modes.
+  let rFrame ← reportOf ``frameOnlyMirCallContract
+  unless rFrame.bindsOutput && !rFrame.bindsBeyondBoilerplate do
+    throwError "frameOnlyMirCallContract (default): {rFrame.describe}"
+  expectReason ``frameOnlyMirCallContract .returnValueUnconstrained
+    (cfg := { strictReturnValue := true })
+  expectReason ``frameOnlyMirCallContract .boilerplateOnly
+    (cfg := { userEnsuresOnly := true })
+
+/-! ### Closed bypass regressions (each backed by a kernel insensitivity proof) -/
+
+-- 1. Discarded projections distributed through `ite`, `dite`, and `match`.
+vacuous_case projOfIte inputOnly :=
+  fun x r => (if x = 0 then (x, r) else (x + 1, r)).1 < 100
+  by intro x r₁ r₂; simp only [projOfIte]; split <;> rfl
+vacuous_case projOfMatch inputOnly :=
+  fun x r => (match x with | 0 => (0, r) | n + 1 => (n, r)).1 < 100
+  by intro x r₁ r₂; cases x <;> rfl
+vacuous_case diteDataTrue reflexiveTautology :=
+  fun x r => (if _h : r = r then x else r) < 100
+  by intros; simp [diteDataTrue]
+vacuous_case diteDataSame reflexiveTautology :=
+  fun x r => (if _h : r = 0 then x else x) < 100
+  by intros; simp [diteDataSame]
+
+/-- `MirCallContract` hiding `retVal` inside a discarded tuple projection in `ite`. -/
+def mirProjIte : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned retVal _ =>
+      (if req.args = [] then (req.defPath, retVal) else ("a", retVal)).1 = ""
+    | .panicked _ => False
+    | .aborted => True
+
+theorem mirProjIte_not_normalDichotomy :
+    ¬ MirCallContractNormalDichotomy mirProjIte :=
+  not_mirCallContractNormalDichotomy_of_return_blind fun req _ _ _ _ _ => by
+    dsimp [mirProjIte]
+    split <;> rfl
+
+#expect_vacuous mirProjIte returnBlind
+
+-- 2. Propositional tautologies, absorption, dead branches, and `dite` case splits.
+vacuous_case diteSame reflexiveTautology :=
+  fun x r => if _h : r = 0 then x < 5 else x < 5
+  by intros; simp [diteSame]
+vacuous_case diteDependent reflexiveTautology :=
+  fun x r => if _h : r = 0 then (r = 0 ∧ x < 5) else (r ≠ 0 ∧ x < 5)
+  by intro x r₁ r₂; simp only [diteDependent]; split <;> split <;> omega
+vacuous_case caseSplitNat reflexiveTautology :=
+  fun x r => (r = 0 → x < 5) ∧ (r ≠ 0 → x < 5)
+  by intro x r₁ r₂; simp only [caseSplitNat]; omega
+vacuous_case iteReordered reflexiveTautology :=
+  fun x r => if r = 0 then (x < 5 ∧ x < 10) else (x < 10 ∧ x < 5)
+  by intro x r₁ r₂; simp only [iteReordered]; split <;> split <;> omega
+vacuous_case matchReordered reflexiveTautology :=
+  fun x r => match r with
+    | 0 => x < 5 ∧ x < 10
+    | _ + 1 => x < 10 ∧ x < 5
+  by intro x r₁ r₂; cases r₁ <;> cases r₂ <;> simp only [matchReordered] <;> omega
+
+-- Non-arithmetic (`Value`) propositional disguises caught by `propSimplify`.
+def caseSplitVal (a r : Value) : Prop := (r = a → a = .unit) ∧ (r ≠ a → a = .unit)
+def deadBranchVal (a r : Value) : Prop := (a ≠ .unit → r = .unit) ∧ a = .unit
+def disjAbsorbVal (a r : Value) : Prop := a = .unit ∨ (a = .unit ∧ r = .unit)
+def conjAbsorbVal (a r : Value) : Prop := a = .unit ∧ (a = .unit ∨ r = .unit)
+def demorganVal (a r : Value) : Prop := ¬ (r = a ∧ a = .unit) ∨ r = a
+def contraposVal (a r : Value) : Prop :=
+  (r = a → a = .unit) ↔ (a ≠ .unit → r ≠ a)
+def peirceVal (a r : Value) : Prop :=
+  ((r = a → a = .unit) → r = a) → r = a
+
+theorem caseSplitVal_not_dichotomy (pre : Value → Prop) :
+    ¬ PostconditionDichotomy pre caseSplitVal :=
+  not_dichotomy_of_input_predicate (fun a => a = .unit) fun a r _ =>
+    ⟨fun h => (Classical.em (r = a)).elim h.1 h.2, fun h => ⟨fun _ => h, fun _ => h⟩⟩
+
+theorem deadBranchVal_not_dichotomy (pre : Value → Prop) :
+    ¬ PostconditionDichotomy pre deadBranchVal :=
+  not_dichotomy_of_input_predicate (fun a => a = .unit) fun _ _ _ =>
+    ⟨fun h => h.2, fun h => ⟨fun hne => absurd h hne, h⟩⟩
+
+theorem disjAbsorbVal_not_dichotomy (pre : Value → Prop) :
+    ¬ PostconditionDichotomy pre disjAbsorbVal :=
+  not_dichotomy_of_input_predicate (fun a => a = .unit) fun _ _ _ =>
+    ⟨fun h => h.elim id And.left, Or.inl⟩
+
+theorem conjAbsorbVal_not_dichotomy (pre : Value → Prop) :
+    ¬ PostconditionDichotomy pre conjAbsorbVal :=
+  not_dichotomy_of_input_predicate (fun a => a = .unit) fun _ _ _ =>
+    ⟨And.left, fun h => ⟨h, Or.inl h⟩⟩
+
+theorem demorganVal_not_dichotomy (pre : Value → Prop) :
+    ¬ PostconditionDichotomy pre demorganVal :=
+  not_dichotomy_of_universal_post fun a r _ =>
+    (Classical.em (r = a)).elim Or.inr fun h => Or.inl fun ⟨hr, _⟩ => h hr
+
+theorem contraposVal_not_dichotomy (pre : Value → Prop) :
+    ¬ PostconditionDichotomy pre contraposVal :=
+  not_dichotomy_of_universal_post fun _ _ _ =>
+    ⟨fun h hne hr => hne (h hr), fun h hr =>
+      Classical.byContradiction fun hne => h hne hr⟩
+
+theorem peirceVal_not_dichotomy (pre : Value → Prop) :
+    ¬ PostconditionDichotomy pre peirceVal :=
+  not_dichotomy_of_universal_post fun _ _ _ h =>
+    Classical.byContradiction fun hne => hne (h fun hr => absurd hr hne)
+
+#expect_vacuous caseSplitVal reflexiveTautology
+#expect_vacuous deadBranchVal reflexiveTautology
+#expect_vacuous disjAbsorbVal reflexiveTautology
+#expect_vacuous conjAbsorbVal reflexiveTautology
+#expect_vacuous demorganVal reflexiveTautology
+#expect_vacuous contraposVal reflexiveTautology
+#expect_vacuous peirceVal reflexiveTautology
+
+/-- Reordered conjuncts across all three outcomes remain `outcomeBlind`. -/
+def outcomeBlindReordered : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned _ _ => req.args = [] ∧ req.defPath = ""
+    | .panicked _ => req.defPath = "" ∧ req.args = []
+    | .aborted => req.args = [] ∧ req.defPath = ""
+
+theorem outcomeBlindReordered_not_dichotomy :
+    ¬ MirCallContractDichotomy outcomeBlindReordered :=
+  not_mirCallContractDichotomy_of_outcome_blind fun _ a₁ a₂ _ => by
+    cases a₁ <;> cases a₂ <;> simp [outcomeBlindReordered, and_comm]
+
+#expect_vacuous outcomeBlindReordered outcomeBlind
+
+-- 3. Curried `match` collapse with non-empty `remaining`.
+vacuous_case matchCurriedConst reflexiveTautology :=
+  fun x r => (match r with | 0 => fun _ : Nat => True | _ + 1 => fun _ : Nat => True) x
+  by intro _ r₁ r₂; cases r₁ <;> cases r₂ <;> rfl
+
+-- 4. Existential currying (`Prod`, `Subtype`), case-split one-point, and witness search.
+vacuous_case existsPairNat reflexiveTautology :=
+  fun _ r => ∃ p : Nat × Nat, p.1 = r
+  by intro _ r₁ r₂; exact ⟨fun _ => ⟨(r₂, 0), rfl⟩, fun _ => ⟨(r₁, 0), rfl⟩⟩
+
+vacuous_case existsSubtype reflexiveTautology :=
+  fun _ r => ∃ _ : { y : Nat // y = r }, True
+  by intro _ r₁ r₂; exact ⟨fun _ => ⟨⟨r₂, rfl⟩, trivial⟩, fun _ => ⟨⟨r₁, rfl⟩, trivial⟩⟩
+
+vacuous_case existsGe semanticallyInsensitive :=
+  fun _ r => ∃ y : Nat, r ≤ y
+  by intro _ r₁ r₂; exact ⟨fun _ => ⟨r₂, Nat.le_refl _⟩, fun _ => ⟨r₁, Nat.le_refl _⟩⟩
+
+vacuous_case existsGt semanticallyInsensitive :=
+  fun _ r => ∃ y : Nat, r < y
+  by intro _ r₁ r₂; exact ⟨fun _ => ⟨r₂ + 1, Nat.lt_succ_self _⟩,
+    fun _ => ⟨r₁ + 1, Nat.lt_succ_self _⟩⟩
+
+vacuous_case existsFinIteProj inputOnly :=
+  fun x r => ∃ _ : Fin (if x = 0 then (x, r) else (x + 1, r)).1, True
+  by intro x r₁ r₂; cases x <;> rfl
+
+def existsPairMir : MirCallContract where
+  pre _ := True
+  post _ ans := ∃ p : Value × Memory, ans = .returned p.1 p.2
+
+theorem existsPairMir_not_normalDichotomy :
+    ¬ MirCallContractNormalDichotomy existsPairMir :=
+  not_mirCallContractNormalDichotomy_of_return_blind fun _ v₁ m₁ v₂ m₂ _ =>
+    ⟨fun _ => ⟨(v₂, m₂), rfl⟩, fun _ => ⟨(v₁, m₁), rfl⟩⟩
+
+def existsImpCaseVal (x : Nat) (r : Value) : Prop :=
+  ∃ y : Value, (x < 5 → y = r) ∧ (¬ x < 5 → y = r)
+
+theorem existsImpCaseVal_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre existsImpCaseVal :=
+  not_dichotomy_of_universal_post fun _ r _ => ⟨r, fun _ => rfl, fun _ => rfl⟩
+
+#expect_vacuous existsPairMir returnBlind
+#expect_vacuous existsImpCaseVal reflexiveTautology
+
+-- 5. Subsingleton outputs and subsingleton equalities.
+def subsingletonFin1Pred (p : Fin 1 → Prop) (_x : Nat) (r : Fin 1) : Prop := p r
+def emptyOutputPred (p : Empty → Prop) (_x : Nat) (r : Empty) : Prop := p r
+def subsingletonFin1Eq (f : Nat → Fin 1) (x r : Nat) : Prop := f r = f x
+
+theorem subsingletonFin1Pred_not_dichotomy (p : Fin 1 → Prop) (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre (subsingletonFin1Pred p) :=
+  not_dichotomy_of_subsingleton
+
+theorem emptyOutputPred_not_dichotomy (p : Empty → Prop) (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre (emptyOutputPred p) :=
+  not_dichotomy_of_subsingleton_output fun a => a.elim
+
+theorem subsingletonFin1Eq_not_dichotomy (f : Nat → Fin 1) (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre (subsingletonFin1Eq f) :=
+  not_dichotomy_of_universal_post fun x r _ => Subsingleton.elim (f r) (f x)
+
+#expect_vacuous subsingletonFin1Pred semanticallyInsensitive
+#expect_vacuous emptyOutputPred semanticallyInsensitive
+#expect_vacuous subsingletonFin1Eq reflexiveTautology
+
+-- 6. Nested arithmetic subformula probing and small data-helper unfolding.
+def mixedValueAndArith (a : Value) (x r : Nat) : Prop :=
+  (a = .unit ∧ (x ≤ r ∨ r < x)) ∨ (a = .unit ∧ r = 0)
+
+theorem mixedValueAndArith_not_dichotomy (a : Value) (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre (mixedValueAndArith a) :=
+  not_dichotomy_of_input_predicate (fun _ => a = .unit) fun x r _ =>
+    ⟨fun h => h.elim And.left And.left,
+      fun h => Or.inl ⟨h, show x ≤ r ∨ r < x by omega⟩⟩
+
+def constZeroHelper (n : Nat) : Nat := n - n
+
+vacuous_case helperSubZero semanticallyInsensitive :=
+  fun x r => constZeroHelper r < x
+  by intro x r₁ r₂; simp [helperSubZero, constZeroHelper]
+
+#expect_vacuous mixedValueAndArith semanticallyInsensitive
+
+-- 7. `checkRequiresSatisfiable`: Bool preconditions, empty domains, nested And/Or/Exists.
+def boolFalsePre (_x : Nat) : Bool := false
+def emptyDomainPre (_ : Empty) : Prop := True
+def unsatPreAndExists (x : Nat) : Prop := x < 100 ∧ (∃ a : Nat, a < 10 ∧ a > 20)
+def unsatExtSpecPre (target : DefPath) (sidecar : CapturedMir) : MirCallContract :=
+  externalSpecCallContract target sidecar
+    (fun args => ∃ a, args = [u32Arg a] ∧ a < 10 ∧ a > 20)
+    (fun _ ret => ret = .unit)
+def unsatPreOr (x : Nat) : Prop := (x < 5 ∧ x > 10) ∨ (x < 2 ∧ x > 8)
+
+theorem emptyDomainPre_not_satisfiable :
+    ¬ PreconditionSatisfiable emptyDomainPre :=
+  fun ⟨e, _⟩ => e.elim
+
+theorem unsatPreAndExists_not_satisfiable :
+    ¬ PreconditionSatisfiable unsatPreAndExists := by
+  rintro ⟨_, _, a, h₁, h₂⟩
+  omega
+
+theorem unsatExtSpecPre_not_satisfiable (target : DefPath)
+    (sidecar : CapturedMir) :
+    ¬ MirCallContractPreSatisfiable (unsatExtSpecPre target sidecar) := by
+  rintro ⟨req, _, _, _, a, _, h₁, h₂⟩
+  omega
+
+theorem unsatPreOr_not_satisfiable : ¬ PreconditionSatisfiable unsatPreOr := by
+  rintro ⟨x, ⟨h₁, h₂⟩ | ⟨h₁, h₂⟩⟩ <;> omega
+
+run_meta do
+  assertRequiresRefuted ``boolFalsePre
+  assertRequiresRefuted ``emptyDomainPre
+  assertRequiresRefuted ``unsatPreAndExists
+  assertRequiresRefuted ``unsatExtSpecPre
+  assertRequiresRefuted ``unsatPreOr
+  -- Syntactic passes catch projection-distribution and propositional disguises
+  -- even with `semanticProbe := false`.
+  let noProbe : EnsuresCheckConfig := { semanticProbe := false }
+  for n in #[``projOfIte, ``projOfMatch, ``diteDataTrue, ``diteDataSame,
+      ``diteSame, ``deadBranchVal, ``disjAbsorbVal, ``conjAbsorbVal,
+      ``demorganVal, ``contraposVal, ``peirceVal, ``matchCurriedConst,
+      ``existsPairNat, ``existsSubtype, ``existsImpCaseVal, ``subsingletonFin1Eq] do
+    assertEnsuresVacuous n (cfg := noProbe)
+
+end HardeningB1
+
 /-! ## Axiom and soundness audit -/
 
 namespace Audit
