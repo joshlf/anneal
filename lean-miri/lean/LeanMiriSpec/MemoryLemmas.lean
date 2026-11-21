@@ -1582,9 +1582,9 @@ theorem prepareCopy_of_uniform (mask : InitMask) (range : AllocRange) (finish : 
   simp [List.forIn_cons, List.forIn_nil, h_chunk_range, h_chunk_isInit,
     Bind.bind, Except.bind, Pure.pure, Except.pure]
 
-/-- Applying a single-run copy encoding `⟨state, #[srcSize.bytes]⟩` `repeatCount` times starting
-at `destStart` is `setRange` of the whole span `allocRange destStart total` to `state`, where
-`Size.mul srcSize repeatCount = .ok total`. -/
+/-- Applying a single-run copy encoding `⟨state, #[srcSize.bytes]⟩` (with `srcSize` nonzero)
+`repeatCount` times starting at `destStart` is `setRange` of the whole span
+`allocRange destStart total` to `state`, where `Size.mul srcSize repeatCount = .ok total`. -/
 theorem applyCopy_singleton (destMask : InitMask) (destStart srcSize total : Size)
     (repeatCount : UInt64) (state : Bool)
     (nonzero : srcSize.bytes ≠ 0)
@@ -1707,7 +1707,8 @@ theorem rangeEmpty_new (range : AllocRange) (pointerSize finish : Size)
     (new (Prov := P)).rangeEmpty range pointerSize = .ok true :=
   empty_range range pointerSize finish positive endEq
 
-/-- Reading a pointer from the empty provenance map yields no provenance. -/
+/-- Reading a pointer from the empty provenance map yields no provenance (for a nonzero pointer
+size and a non-overflowing pointer range). -/
 theorem readPtr_new [DecidableEq P] [PointerProvenance P]
     (offset pointerSize finish : Size)
     (positive : pointerSize.bytes ≠ 0)
@@ -1718,7 +1719,8 @@ theorem readPtr_new [DecidableEq P] [PointerProvenance P]
   unfold rangePtrsR rangeBytesR adjustedStart rangeEnd rangeEntries new
   simp [positive, endEq, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure, Except.mapError]
 
-/-- Preparing a provenance copy from the empty provenance map yields the empty copy. -/
+/-- Preparing a provenance copy from the empty provenance map yields the empty copy (for a nonzero
+pointer size and a non-overflowing range). -/
 theorem prepareCopy_new (range : AllocRange) (data : Array UInt8) (pointerSize finish : Size)
     (positive : pointerSize.bytes ≠ 0)
     (endEq : range.endExclusive = .ok finish) :
@@ -3033,7 +3035,8 @@ theorem getBytesStripProvenance_uninit_err [PointerProvenance P]
   simp [h_uninit, bind, Bind.bind, Except.bind, Except.mapError, throw, MonadExceptOf.throw, throwThe]
 
 /-- If the range is initialized and either provenance offsets are addresses or the range carries
-no provenance, `getBytesStripProvenance` returns the raw bytes. -/
+no provenance, `getBytesStripProvenance` agrees with `getBytesUnchecked` on that range (including
+its bounds/storage errors; this lemma does not by itself assert success). -/
 theorem getBytesStripProvenance_ok [PointerProvenance P]
     (allocation : Allocation P E) (layout : TargetDataLayout) (range : AllocRange)
     (h_init : allocation.initializationMask.isRangeInitialized range = .ok (.ok ()))
