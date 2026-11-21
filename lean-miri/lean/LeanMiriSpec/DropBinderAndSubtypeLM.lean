@@ -493,6 +493,10 @@ def ep2ApplyTreeBorrowsWrite (protectedTags : Miri.TreeBorrows.ProtectedTags)
   match tree.tagMapping.get tag with
   | none => none
   | some srcIdx =>
+    -- Zero-sized accesses never reach the borrow tracker (vendored
+    -- `DedupRangeMap.iterMutWithClone` returns no positions when `len = 0`, so
+    -- `performBorrowAccessRange` completes with the tree unchanged).
+    if size.bytes.toNat = 0 then some tree else
     let updateLocTree (lt : Miri.TreeBorrows.LocationTree) : Option Miri.TreeBorrows.LocationTree :=
       tree.tagMapping.mapping.foldlM (init := lt) fun acc (otherTag, otherIdx) =>
         let relPos : Miri.TreeBorrows.AccessRelatedness :=
@@ -517,6 +521,7 @@ def ep2ApplyTreeBorrowsWrite (protectedTags : Miri.TreeBorrows.ProtectedTags)
         match updateLocTree seg.data with
         | none => none
         | some lt' =>
+          if lt' = seg.data then some (out.push seg) else
           let oStart := max s0 startNat
           let oStop := min s1 endNat
           let out1 := if s0 < oStart then
@@ -607,6 +612,25 @@ theorem ep2ApplyTreeBorrowsWrite_disables_unprotected_child_and_splits_subrange 
         !(ep2ProtectorConflict {} tree' retagChildTag (Miri.ABI.Size.ofBytes 4) (Miri.ABI.Size.ofBytes 4))
       | none => false) = true :=
   ⟨by decide +kernel, by decide +kernel⟩
+
+/-- **Zero-sized-access & persistence regressions (B3)**:
+1. A zero-sized write strictly inside a segment (`[4, 4)` of the 8-byte
+   `hooksTwoNodeTree .unique`) is a no-op returning the IDENTICAL tree, even with the
+   child protected (vendored `iterMutWithClone` skips `len = 0`; A2 applied the write
+   transition there, so a ZST drop under a protector was spuriously UB, and an
+   unprotected one inserted an empty `[4, 4)` segment);
+2. a write that changes no permission (child write through `retagChildTag` on
+   `[0, 4)` of `lmU32ChildTree`, already `Unique`/accessed) returns the identical,
+   unsplit tree (no redundant segments).
+(End-to-end persistence through `runMiriSteps`: `lm_v3_drop_tb_tree_persisted`.) -/
+theorem ep2ApplyTreeBorrowsWrite_zero_size_noop_and_persistence :
+    ep2ApplyTreeBorrowsWrite (hooksForChildProtected true).protectedTags (hooksTwoNodeTree .unique)
+      retagParentTag (Miri.ABI.Size.ofBytes 4) Miri.ABI.Size.ZERO = some (hooksTwoNodeTree .unique) ∧
+    ep2ApplyTreeBorrowsWrite {} (hooksTwoNodeTree .unique)
+      retagParentTag (Miri.ABI.Size.ofBytes 4) Miri.ABI.Size.ZERO = some (hooksTwoNodeTree .unique) ∧
+    ep2ApplyTreeBorrowsWrite {} lmU32ChildTree
+      retagChildTag Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4) = some lmU32ChildTree := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel⟩
 
 /-- Deinitialize `len` bytes at `relInLocal` inside the memory-backed local `mp`
 and jump to `target`:
@@ -1237,6 +1261,28 @@ theorem lm_v3_drop_comprehensive_witness :
           by decide +kernel, by decide +kernel, by decide +kernel,
           by decide +kernel, by decide +kernel, by decide +kernel,
           by decide +kernel⟩
+
+/-- **End-to-end Tree Borrows persistence (B3)**: running the whole drop body
+`v3DropProtectedMir` through vendored `Miri.Interpreter.Step.step` under
+`treeBorrows = true` with an UNPROTECTED child returns `42`, and the state just before
+the final return still holds `_1`'s allocation whose persisted vendored borrow tree
+(stored by `ep2DeinitIndirect` via `Allocation.setExtra`) now rejects a write through
+the child tag `retagChildTag` (disabled by the drop's foreign write), whereas the
+initial tree accepted it. -/
+theorem lm_v3_drop_tb_tree_persisted :
+    ep2ProtectorConflict {} lmU32ChildTree retagChildTag Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4) = false ∧
+    (match runMiriSteps (annealStepHooksDropBinderSubtype v3DropProtectedMir true) 8
+        (mkTbDropMiriState v3DropProtectedMir false) with
+      | .ok (st, some ret) =>
+        decide (ret = .live (.immediate (.scalar (lmScalarUInt 42 4)))) &&
+        (match st.machine.memory.live[0]? with
+          | some (_, la) =>
+            match la.allocation.extra with
+            | some t => ep2ProtectorConflict {} t retagChildTag Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4)
+            | none => false
+          | none => false)
+      | _ => false) = true := by
+  refine ⟨by decide +kernel, by decide +kernel⟩
 
 /-- **V4 (`Rvalue.shallowInitBox`) Lowered Miri Body**: lowers `Rvalue.shallowInitBox op contentTy`
 to `Miri.MIR.Rvalue.Cast .Transmute (translateOperand op) (encodeTyId boxU32MirTy)`
