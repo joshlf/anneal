@@ -224,6 +224,11 @@ never proves defect absence or substitutes for CI or merge gates.
   `PRINCIPLES.md` on new code and non-`SKILL.md` Markdown, 80-col prose
   wrapping, relative links and anchors). For policy edits, check for
   contradictory duties, missing routing, and authority creep.
+- **Documentation review:**
+  <!-- docs-reviewer -->
+  Check affected docs, examples, and links against each PR's diff. Flag stale
+  text, missing guidance, and broken links.
+  <!-- /docs-reviewer -->
 - **Execution, isolation, and probes:** Complete static, non-elaborating Pass 1
   checks before running any diff-derived code. Rely on executed deterministic
   checks for what they enforce and focus manual review beyond them. Verify

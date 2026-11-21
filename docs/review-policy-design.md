@@ -25,15 +25,14 @@ it never proves defect absence or substitutes for CI or the merge gates in
 ## Policy ownership
 
 Every operational procedure has **one canonical owner**; except for the
-self-contained `Code Review Rules` mirror shared verbatim between `AGENTS.md`
-and `.gemini/styleguide.md` (governed by the parity rules and drift checks
-below), peer files link to the canonical owner in at most one sentence without
+self-contained `Code Review Rules` and documentation clauses named below,
+peer files link to the canonical owner in at most one sentence without
 repeating CLI flags, path blocklists, or multi-step checklists. This table is
 the single repository-wide ownership map:
 
 | File | Sole canonical ownership |
 |---|---|
-| [`AGENTS.md`](../AGENTS.md) | Repository conventions, deterministic preflight checklist, privacy rule, author routing table, and shared [Code Review Rules](../AGENTS.md#code-review-rules) |
+| [`AGENTS.md`](../AGENTS.md) | Repository conventions, PR [documentation requirement](../AGENTS.md#standing-rules), deterministic preflight checklist, privacy rule, author routing table, and shared [Code Review Rules](../AGENTS.md#code-review-rules) |
 | [`.gemini/styleguide.md`](../.gemini/styleguide.md) | Role-pure single-turn reviewer mirror of the shared Code Review Rules (zero links, zero author workflow) |
 | [`skills/change-review/SKILL.md`](../skills/change-review/SKILL.md) | Reviewer coverage, isolated probes, and host-constrained reporting (Part I); evidence reuse, risk/structure sizing, delegation, holdouts, pipelining, adjudication, and receipts (Part II) |
 | [`skills/trust-review/SKILL.md`](../skills/trust-review/SKILL.md) | Path-to-surface map, repo-wide filesystem/Unicode hygiene, Pass 1 untrusted/seam/spec audit, Pass 2 TCB/CI checklists, and pre-existing hazard reporting |
@@ -48,10 +47,10 @@ Single-turn hosted reviewers cannot follow links, so `AGENTS.md` and
 `.gemini/styleguide.md` carry a verbatim marker-delimited `Code Review Rules`
 block. Codex's `project_doc_max_bytes` (32 KiB) is a **shared cumulative
 budget** across global user instructions, root `AGENTS.md`, and nested
-`AGENTS.md` files (truncating silently when exceeded); keep the repository's
-cumulative `AGENTS.md` footprint under 31 KiB (enforced below by reserving at
-least 1 KiB—or `GLOBAL_AGENTS_BYTES` when set—for global instructions within
-the 32 KiB limit). Maintain parity using two rules:
+`AGENTS.md` files, with silent truncation at the limit. Keep the cumulative
+`AGENTS.md` footprint under 31 KiB. The check below reserves 1 KiB for global
+instructions by default, or `GLOBAL_AGENTS_BYTES` when set. Maintain parity
+using two rules:
 
 1. Every bullet in `Code Review Rules` maps to one canonical section in
    `change-review` or `trust-review`; the skill hubs add multi-turn procedures,
@@ -68,12 +67,22 @@ Packaged editor/plugin rule bundles under `tools/*/rules/AGENTS.md` use a fixed
 plugin-manifest filename and sit outside Codex's repository-root `AGENTS.md`
 chain.
 
+[`AGENTS.md`](../AGENTS.md) owns the documentation rule and hosts both the
+author clause under `Standing rules` (`- **Documentation:**`) and the reviewer
+clause in `Code Review Rules` (`- **Documentation review:**`).
+[`.gemini/styleguide.md`](../.gemini/styleguide.md) and
+[`change-review`](../skills/change-review/SKILL.md) mirror the reviewer clause.
+The checks below compare each marked clause across line wrapping. Each clause
+must be an ordinary Markdown paragraph inside its list item after its bold
+label (`**Documentation:**` or `**Documentation review:**`).
+
 ## Drift checks
 
-Run these fail-closed checks whenever editing any file in the ownership table
-(and run `python3 -B -m unittest discover -s ci -p 'test_codex_review.py'`
-whenever `ci/codex_review.py`, `.github/workflows/codex-review.yml`, or
-`.github/codex-review-ruleset.json` changes):
+Run these fail-closed checks when editing an ownership-table file or a
+documentation mirror. Run with Python 3.10 or newer. Also run
+`python3 -B -m unittest discover -s ci -p 'test_codex_review.py'` when
+`ci/codex_review.py`, `.github/workflows/codex-review.yml`, or
+`.github/codex-review-ruleset.json` changes:
 
 ```bash
 set -euo pipefail
@@ -95,6 +104,7 @@ for req in \
   '^- \*\*Pass 1, filesystem hygiene, untrusted contents, and specifications:\*\*' \
   '^- \*\*Pass 2, TCB and CI \(only when triggered\):\*\*' \
   '^- \*\*General pass:\*\*' \
+  '^- \*\*Documentation review:\*\*' \
   '^- \*\*Execution, isolation, and probes:\*\*' \
   '^- \*\*Findings, severity, hazards, and host output:\*\*'; do
   if ! grep -Eq -- "$req" <<< "$rules"; then
@@ -132,15 +142,103 @@ if [ "$(grep -c '^#' .gemini/styleguide.md)" -ne 1 ]; then
   fail 'unexpected heading in styleguide'
 fi
 global_reserve="${GLOBAL_AGENTS_BYTES:-1024}"
-case "$global_reserve" in
-  ''|*[!0-9]*) fail "invalid GLOBAL_AGENTS_BYTES: $global_reserve" ;;
-esac
-agents_bytes="$(git ls-files -z 'AGENTS.md' '*/AGENTS.md' \
-  'AGENTS.override.md' '*/AGENTS.override.md' ':!tools/*/rules/AGENTS.md' | \
-  xargs -0 wc -c | tail -n 1 | awk '{print $1}')"
-if [ "$((agents_bytes + global_reserve))" -ge 32768 ]; then
-  fail "AGENTS.md ($agents_bytes B) + global reserve ($global_reserve B) >= 32 KiB"
-fi
+repo_root="$(git rev-parse --show-toplevel)"
+agents_bytes="$(
+  cd "$repo_root"
+  git ls-files -z -- 'AGENTS.md' '*/AGENTS.md' \
+    'AGENTS.override.md' '*/AGENTS.override.md' ':!tools/*/rules/AGENTS.md' | \
+    xargs -0 wc -c | tail -n 1 | awk '{print $1}'
+)"
+python3 -I -B - "$repo_root" "$agents_bytes" "$global_reserve" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+repo_path, agents_bytes, global_reserve = sys.argv[1:]
+if not (global_reserve.isascii() and global_reserve.isdecimal()):
+    sys.exit(f"invalid GLOBAL_AGENTS_BYTES: {global_reserve!r}")
+reserve = global_reserve.lstrip("0") or "0"
+if len(reserve) > 5 or int(agents_bytes) + int(reserve) >= 32768:
+    sys.exit(
+        f"AGENTS.md ({agents_bytes} B) + global reserve "
+        f"({global_reserve} B) >= 32 KiB"
+    )
+
+root = Path(repo_path)
+
+
+def strip_inactive_blocks(lines):
+    """Return active line indices outside fences and outer HTML comments."""
+    active = [True] * len(lines)
+    fence = None
+    in_comment = False
+    for idx, line in enumerate(lines):
+        if fence is not None:
+            active[idx] = False
+            if re.match(rf"^{re.escape(fence[0])}{{{fence[1]},}}\s*$", line):
+                fence = None
+            continue
+        if in_comment:
+            active[idx] = False
+            if "-->" in line:
+                in_comment = False
+            continue
+        m = re.match(r"^([`~]{3,})(.*)$", line)
+        if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+            active[idx] = False
+            fence = (m.group(1)[0], len(m.group(1)))
+            continue
+        if "<!--" in line:
+            stripped = line.strip()
+            if not (stripped.startswith("<!--") and stripped.endswith("-->")):
+                active[idx] = False
+                if "-->" not in line.split("<!--", 1)[1]:
+                    in_comment = True
+    return active
+
+
+def clause(path, role, label):
+    text = (root / path).read_text(encoding="utf-8")
+    start, end = f"<!-- docs-{role} -->", f"<!-- /docs-{role} -->"
+    if text.count(start) != 1 or text.count(end) != 1:
+        sys.exit(f"expected one documentation clause for {role} in {path}")
+
+    lines = text.splitlines()
+    active = strip_inactive_blocks(lines)
+    s_idx = next((i for i, ln in enumerate(lines) if ln == f"  {start}"), None)
+    e_idx = next((i for i, ln in enumerate(lines) if ln == f"  {end}"), None)
+    error = f"invalid documentation clause for {role} in {path}"
+    if s_idx is None or e_idx is None or e_idx <= s_idx + 1:
+        sys.exit(error)
+    if s_idx == 0 or lines[s_idx - 1] != f"- {label}":
+        sys.exit(error)
+    for i in range(s_idx - 1, e_idx + 1):
+        if not active[i]:
+            sys.exit(error)
+
+    body = lines[s_idx + 1 : e_idx]
+    for ln in body:
+        if not ln.startswith("  ") or not ln[2:].strip():
+            sys.exit(error)
+        inner = ln[2:]
+        if (
+            inner.startswith(("#", "- ", "* ", "+ ", ">", "`", "~", "<"))
+            or re.match(r"^\d+[.)]\s", inner)
+            or re.search(r"[`\[\]<>\\_*]", inner)
+        ):
+            sys.exit(error)
+    return " ".join(" ".join(body).split())
+
+
+author = clause("AGENTS.md", "author", "**Documentation:**")
+if not author:
+    sys.exit("empty documentation rule for author in AGENTS.md")
+
+reviewer = clause("AGENTS.md", "reviewer", "**Documentation review:**")
+for path in (".gemini/styleguide.md", "skills/change-review/SKILL.md"):
+    if reviewer != clause(path, "reviewer", "**Documentation review:**"):
+        sys.exit(f"documentation rule for reviewer differs in {path}")
+PY
 set +e
 git grep --untracked -n 'diff[-]tree' -- '*.md' ':!skills/source-control/SKILL.md'
 rc=$?
