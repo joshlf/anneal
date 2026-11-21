@@ -1138,8 +1138,10 @@ def a14StrRecWeak :
   let p13 := specInstanceCandidates env `Trusted.VerificationResult.ItemSpec "ep2::a13" 256
   let m13 ← specInstanceCandidatesMeta `Trusted.VerificationResult.ItemSpec "ep2::a13" 256
   IO.println s!"A1_3_dep_rec_shadow: pure={p13.contains ``a13CondShadow && p13.contains ``a13BoolShadow && p13.contains ``a13HigherOrderShadow} meta={m13.contains ``a13CondShadow && m13.contains ``a13BoolShadow && m13.contains ``a13HigherOrderShadow}"
-  IO.println (fmtTags "A1_3_dep_rec_synth_gate"
-    (← auditItemSpecStrengthBySynth .item "ep2::a13" ``a13Cert))
+  -- (After the native-evaluator canaries every `defId` is ambiguous in this file, so the gate line
+  -- also checks that the dependent shadows themselves are named among the candidates.)
+  let g13 ← auditItemSpecStrengthBySynth .item "ep2::a13" ``a13Cert (useSynthInstance := false)
+  IO.println s!"{fmtTags "A1_3_dep_rec_synth_gate" g13} names={g13.any (fun v => (v.detail.splitOn "a13CondShadow").length > 1 && (v.detail.splitOn "a13BoolShadow").length > 1)}"
   let p14 := specInstanceCandidates env `Trusted.VerificationResult.ItemSpec "ep2::a14str" 256
   let m14s ← specInstanceCandidatesMeta `Trusted.VerificationResult.ItemSpec "ep2::a14str" 256
   IO.println s!"A1_4_string_rec_literal: pure={p14.contains ``a14StrRecWeak} meta={m14s.contains ``a14StrRecWeak}"
@@ -1420,7 +1422,7 @@ B1_4_native_evaluator_never_run: reduceBool=true reduceNat=true clean=true
 A1_2a_expected_native_rejected: #[nativeDecideReached]
 A1_2b_poly_sorry_claim_reports_sorry: #[sorryAxiomReached]
 A1_3_dep_rec_shadow: pure=true meta=true
-A1_3_dep_rec_synth_gate: #[specInstanceAmbiguous]
+A1_3_dep_rec_synth_gate: #[specInstanceAmbiguous] names=true
 A1_4_string_rec_literal: pure=true meta=true
 B2_1_forged_instance_entry_scan: listed=true strongListed=true
 B2_1_forged_instance_entry_gate_no_synth: #[specInstanceAmbiguous] names=true
