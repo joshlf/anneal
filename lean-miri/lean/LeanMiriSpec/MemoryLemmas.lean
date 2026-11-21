@@ -41,8 +41,10 @@ This module never names them. Instead:
   through the public `WellFounded.Nat.fix_eq`.
 
 No `sorry`, `native_decide`, `unsafe`, `implemented_by`, custom axioms, or name-resolution
-metaprogramming are used; Part 5 checks with `#assert_standard_axioms` that each of the 50
-theorems depends only on `propext`, `Classical.choice`, and `Quot.sound`.
+metaprogramming are used; Part 5 checks with `#assert_standard_axioms` and
+`#assert_module_standard_axioms` that all 50 theorems (with zero private-helper type leakage and
+matching `LeanMiriSpec.MemoryLemmas` re-exports) and every declaration in this module depend only
+on `propext`, `Classical.choice`, and `Quot.sound`.
 
 ## The 50 theorems
 
@@ -64,18 +66,49 @@ theorems depends only on `propext`, `Classical.choice`, and `Quot.sound`.
 
 set_option autoImplicit false
 
-/-- Fail unless every listed declaration depends only on Lean's standard axioms
-(`propext`, `Quot.sound`, `Classical.choice`); in particular on no `sorryAx` and no
-`Lean.ofReduceBool`. File-local copy of `LeanMiriSpec.Audit`'s command (that module imports
-all of `LeanMiriSpec`). -/
+/-- Fail unless every listed declaration:
+1. depends only on Lean's standard axioms (`propext`, `Quot.sound`, `Classical.choice`) —
+   in particular zero `sorryAx` and zero `Lean.ofReduceBool`;
+2. exposes a kernel type referencing zero `private` helper declarations; and
+3. is re-exported under `LeanMiriSpec.MemoryLemmas.<shortName>` pointing to the exact same
+   declaration.
+File-local analogue of `LeanMiriSpec.Audit`'s command (that module imports all of `LeanMiriSpec`). -/
 local elab "#assert_standard_axioms " ids:ident* : command => do
+  let env ← Lean.getEnv
   for id in ids do
     let n ← Lean.Elab.Command.liftCoreM <| Lean.Elab.realizeGlobalConstNoOverloadWithInfo id
     let axs ← Lean.Elab.Command.liftCoreM <| Lean.collectAxioms n
     for a in axs do
       unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
         throwError "{n} depends on the non-standard axiom {a}"
+    if let some ci := env.find? n then
+      for u in ci.type.getUsedConstants do
+        if Lean.isPrivateName u then
+          throwError "{n}'s public type leaks private constant {u}"
+    if let .str _ shortName := n then
+      let aliasId := Lean.mkIdent (`LeanMiriSpec.MemoryLemmas ++ Lean.Name.mkSimple shortName)
+      let aliasTarget ← Lean.Elab.Command.liftCoreM <| Lean.realizeGlobalConstNoOverload aliasId
+      unless aliasTarget == n do
+        throwError "re-export LeanMiriSpec.MemoryLemmas.{shortName} resolves to {aliasTarget}, expected {n}"
     Lean.logInfo m!"{n} depends on axioms: {axs.toList}"
+
+/-- Sweep every declaration elaborated in this module (`env.constants.map₂`, both public and
+private) and fail if any depends on a non-standard axiom. -/
+local elab "#assert_module_standard_axioms" : command => do
+  let env ← Lean.getEnv
+  let mut checked : Nat := 0
+  let mut seen : Array Lean.Name := #[]
+  for (c, _) in env.constants.map₂.toList do
+    let axs ← Lean.Elab.Command.liftCoreM <| Lean.collectAxioms c
+    for a in axs do
+      unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
+        throwError "{c} (in LeanMiriSpec.MemoryLemmas) depends on the non-standard axiom {a}"
+      unless seen.contains a do
+        seen := seen.push a
+    checked := checked + 1
+  if checked == 0 then
+    throwError "module-wide axiom audit checked 0 declarations"
+  Lean.logInfo m!"LeanMiriSpec.MemoryLemmas module-wide audit: {checked} declarations depend only on {seen.toList}"
 
 /-! ## Part 1. `InitMask` -/
 
@@ -313,11 +346,6 @@ end Miri.Memory
 
 namespace Miri.Memory.InitMask.WriteProof
 open Miri.ABI Miri.Memory
-set_option linter.unusedSimpArgs false
-set_option maxRecDepth 65536
-set_option maxHeartbeats 4000000
-set_option backward.isDefEq.respectTransparency false
-set_option backward.dsimp.instances true
 variable {ε α β : Type}
 
 private abbrev getBlock := @Miri.Memory.InitMaskMaterialized.getBlock
@@ -368,7 +396,7 @@ private theorem set_range_inbounds_reduces (self : InitMaskMaterialized) (start 
   unfold InitMaskMaterialized.bitIndexR
   unfold Miri.Memory.sizeBytes
   unfold Miri.Memory.blockSize
-  cases state <;> simp only [Bool.false_eq_true, Bool.true_eq, ↓reduceIte, bind_if, bind_assoc, pure_bind]
+  cases state <;> simp only [Bool.false_eq_true, ↓reduceIte, bind_if, bind_assoc, pure_bind]
 
 private theorem materialize_lazy_nonzero (len : Size) (state : Bool) (nonzero : len.bytes.toNat ≠ 0) :
     materialize (InitMask.new len state) = .ok ⟨Array.replicate (len.bytes.toNat / 64 + 1) (if state then UInt64.ofNat 18446744073709551615 else 0)⟩ := by
@@ -380,7 +408,7 @@ private theorem materialize_lazy_nonzero (len : Size) (state : Bool) (nonzero : 
   unfold Miri.Memory.sizeBytes
   unfold Miri.Memory.blockSize
   unfold Miri.Memory.wordMask
-  simp [nonzero, Size.ofBytes, Array.empty_append, Pure.pure, Except.pure, Bind.bind, Except.bind]
+  simp [nonzero, Size.ofBytes, Array.empty_append, Pure.pure, Except.pure]
 
 /-- `collectChunks` (a well-founded private recursion in `lean-miri`) on an iterator that
 yields exactly one chunk. Unfolded through the public `WellFounded.Nat.fix_eq`. -/
@@ -499,8 +527,8 @@ private theorem write_list_getElem? (indices : List Nat) (words : Array UInt64) 
       · simp [h_rest]
       · simp only [h_rest, ↓reduceIte, List.mem_cons, or_false]
         by_cases h_eq : k = first
-        · subst h_eq; simp [Array.getElem?_set_self, h_first]
-        · simp [Array.getElem?_set, Ne.symm h_eq, h_eq]
+        · subst h_eq; simp [h_first]
+        · simp [Ne.symm h_eq, h_eq]
     · simp [h_first] at h_ok
 
 private theorem write_range_getElem? (lower upper : Nat) (words : Array UInt64) (word : UInt64)
@@ -514,7 +542,7 @@ private theorem write_range_getElem? (lower upper : Nat) (words : Array UInt64) 
   rw [h_elem k]
   have h_mem : (k ∈ List.range' [lower:upper].start [lower:upper].size [lower:upper].step) ↔
       (lower ≤ k ∧ k < upper) := by
-    simp only [List.mem_range', Std.Legacy.Range.size, Nat.div_one, Nat.one_mul, Nat.sub_zero, Nat.add_zero]
+    simp only [List.mem_range', Std.Legacy.Range.size, Nat.div_one, Nat.one_mul]
     constructor
     · rintro ⟨i, hi, rfl⟩; omega
     · intro ⟨h1, h2⟩; exact ⟨k - lower, by omega, by omega⟩
@@ -538,8 +566,8 @@ private theorem update_word_getElem? (words : Array UInt64) (index : Nat)
     subst h_ok
     refine ⟨h_idx, Array.size_set .., fun k => ?_⟩
     by_cases h_eq : k = index
-    · subst h_eq; simp [h_get, h_idx]
-    · simp [Array.getElem?_set, Ne.symm h_eq, h_eq]
+    · subst h_eq; simp [h_idx]
+    · simp [Ne.symm h_eq, h_eq]
   · have h_get : words[index]? = none := Array.getElem?_eq_none (Nat.le_of_not_lt h_idx)
     simp [h_get, Bind.bind, Except.bind] at h_ok
 
@@ -705,7 +733,6 @@ theorem set_range_get (mask updated : InitMask) (range : AllocRange) (finish idx
         .ok state
       else
         mask.get idx := by
-
   cases mask with
   | mk blocks len =>
     dsimp only at inBounds idxInBounds
@@ -797,7 +824,7 @@ theorem set_range_get (mask updated : InitMask) (range : AllocRange) (finish idx
           unfold materialize InitMask.new at matEq
           rw [matEq] at h_set
           have h_fin_le : finish.bytes ≤ len.bytes := UInt64.le_iff_toNat_le.mpr inBounds
-          simp only [Bind.bind, Except.bind] at h_set
+          dsimp only at h_set
           rw [if_pos_eq h_fin_le] at h_set
           let initWords := Array.replicate (len.bytes.toNat / 64 + 1)
             (if initial then UInt64.ofNat 18446744073709551615 else 0)
@@ -832,7 +859,7 @@ theorem set_range_get (mask updated : InitMask) (range : AllocRange) (finish idx
               have h_ib_len : idx.bytes.toNat / 64 < len.bytes.toNat / 64 + 1 := by omega
               have h_rep : initWords[idx.bytes.toNat / 64]? =
                   some (if initial then UInt64.ofNat 18446744073709551615 else 0) := by
-                simp [initWords, Array.getElem?_replicate, h_ib_len]
+                simp [initWords, h_ib_len]
               exact Option.some.inj (holdW.symm.trans h_rep)
             have h_old_bit : Nat.testBit oldW.toNat (idx.bytes.toNat % 64) = initial := by
               rw [h_oldW_eq]
@@ -924,7 +951,7 @@ private theorem searchBlock_spec (word : UInt64) (block startBit : Nat) (isInit 
     intro b hb
     dsimp only [bits]
     cases isInit
-    · simp only [Bool.false_eq_true, ↓reduceIte, Bool.not_false]
+    · simp only [Bool.false_eq_true, ↓reduceIte]
       rw [testBit_wordMask_sub word b hb]
       cases word.toNat.testBit b <;> simp
     · simp
@@ -1151,7 +1178,7 @@ private theorem findBit_spec (self : InitMaskMaterialized) (start finish : Size)
           [startBlock + 1:endBlock + 1].size [startBlock + 1:endBlock + 1].step
         have h_mem_rng : ∀ x, x ∈ rngList ↔ (startBlock + 1 ≤ x ∧ x ≤ endBlock) := by
           intro x
-          simp only [rngList, List.mem_range', Std.Legacy.Range.size, Nat.div_one, Nat.one_mul, Nat.sub_zero, Nat.add_zero]
+          simp only [rngList, List.mem_range', Std.Legacy.Range.size, Nat.div_one, Nat.one_mul]
           constructor
           · rintro ⟨i, hi, rfl⟩; omega
           · intro ⟨h1, h2⟩; exact ⟨x - (startBlock + 1), by omega, by omega⟩
@@ -1166,7 +1193,7 @@ private theorem findBit_spec (self : InitMaskMaterialized) (start finish : Size)
         unfold Miri.Memory.sizeBytes getBlock at h_loop
         dsimp only [rngList, startBlock, endBlock, endIncNat] at h_loop
         simp only [Bind.bind, Except.bind] at h_loop ⊢
-        rw [h_loop]
+        erw [h_loop]
         simp only [Pure.pure, Except.pure]
         cases loopOut with
         | none =>
@@ -1306,14 +1333,14 @@ theorem isRangeInitialized_nonempty_iff (mask : InitMask) (range : AllocRange) (
         obtain ⟨h_us_lo, h_us_lt, h_us_get, _⟩ := h_fb0_prop
         obtain ⟨end?, h_fb1, h_fb1_prop⟩ := findBit_spec mat uninitStart finish true h_cap
         rw [h_fb1]
-        simp only [Bind.bind, Except.bind, Pure.pure, Except.pure]
+        simp only [Pure.pure, Except.pure]
         have h_end_ge : uninitStart.bytes.toNat ≤ (end?.getD finish).bytes.toNat := by
           cases end? with
           | none => exact Nat.le_of_lt h_us_lt
           | some e => exact h_fb1_prop.1
         obtain ⟨bad, h_bad, _, _⟩ := fromEndpoints_ok_of_le uninitStart (end?.getD finish) h_end_ge
         rw [h_bad]
-        simp only [Bind.bind, Except.bind, Pure.pure, Except.pure]
+        dsimp only
         constructor
         · constructor
           · intro h; cases h
@@ -1488,7 +1515,7 @@ theorem applyCopy_singleton (destMask : InitMask) (destStart srcSize total : Siz
     destMask.applyCopy ⟨state, #[srcSize.bytes]⟩ (allocRange destStart srcSize) repeatCount =
       destMask.setRange (allocRange destStart total) state := by
   unfold InitMask.applyCopy
-  simp [nonzero, allocRange, h_mul, Except.mapError, Bind.bind, Except.bind, Pure.pure, Except.pure]
+  simp [nonzero, allocRange, h_mul, Except.mapError, Bind.bind, Except.bind]
 
 end Miri.Memory.InitMask.WriteProof
 
@@ -1586,8 +1613,6 @@ end Miri.Memory.ProvenanceMap
 
 namespace Miri.Memory.ProvenanceMap
 open Miri.ABI
-set_option maxRecDepth 65536
-set_option maxHeartbeats 4000000
 variable {P : Type}
 
 private theorem empty_range (range : AllocRange) (pointerSize finish : Size)
@@ -1673,7 +1698,6 @@ theorem prepareCopy_new (range : AllocRange) (data : Array UInt8) (pointerSize f
         .ok (Size.ofBytes (finish.bytes - (pointerSize.bytes - 1))) := by
       unfold subtractSize Size.sub Size.ofBytes
       simp [h_not_lt, Except.mapError]
-    have h_ge' : range.size.bytes ≥ pointerSize.bytes := h_ge
     simp only [ge_iff_le, h_ge, ↓reduceIte, h_sub_ok]
     have h_re : rangeEntries (new (Prov := P)).ptrs range.start
         (Size.ofBytes (finish.bytes - (pointerSize.bytes - 1))) = #[] := rfl
@@ -1695,7 +1719,7 @@ end Miri.Memory.ProvenanceMap
 
 `Allocation.mk` and the `rawBytes`/`size`/`provenance`/`initMask` fields are `private` in
 `lean-miri`. `mkAlloc` builds the private constructor with the standard `constructor`
-tactic, and `(raw Allocation)` reads the byte storage through the public `casesOn`
+tactic, and `Allocation.raw` reads the byte storage through the public `casesOn`
 eliminator; neither introduces axioms, and every mirror below is checked to be
 definitionally equal to the corresponding `lean-miri` operation by `rfl`. -/
 
@@ -2092,60 +2116,23 @@ private theorem copyRepeatedly_eq_R :
 end Allocation
 
 end Miri.Memory
+
 namespace Miri.Memory.Allocation
 open Miri.ABI
-set_option linter.unusedSimpArgs false
-set_option maxRecDepth 65536
-set_option maxHeartbeats 4000000
 variable {P E E' : Type}
 
 /-! ### 3c. Accessor lemmas for the mirrors and ported private `lean-miri` lemmas -/
 
 private theorem raw_withInitMask (a : Allocation P E) (m : InitMask) : raw (withInitMask a m) = raw a := rfl
-private theorem len_withInitMask (a : Allocation P E) (m : InitMask) : (withInitMask a m).len = a.len := rfl
 private theorem byteSize_withInitMask (a : Allocation P E) (m : InitMask) : (withInitMask a m).byteSize = a.byteSize := rfl
 private theorem provenanceMap_withInitMask (a : Allocation P E) (m : InitMask) : (withInitMask a m).provenanceMap = a.provenanceMap := rfl
 private theorem initializationMask_withInitMask (a : Allocation P E) (m : InitMask) : (withInitMask a m).initializationMask = m := rfl
-private theorem align_withInitMask (a : Allocation P E) (m : InitMask) : (withInitMask a m).align = a.align := rfl
-private theorem mutability_withInitMask (a : Allocation P E) (m : InitMask) : (withInitMask a m).mutability = a.mutability := rfl
-private theorem extra_withInitMask (a : Allocation P E) (m : InitMask) : (withInitMask a m).extra = a.extra := rfl
-private theorem nativeBuffer_withInitMask (a : Allocation P E) (m : InitMask) : (withInitMask a m).nativeBuffer = a.nativeBuffer := rfl
 private theorem raw_withProvenance (a : Allocation P E) (p : ProvenanceMap P) : raw (withProvenance a p) = raw a := rfl
-private theorem len_withProvenance (a : Allocation P E) (p : ProvenanceMap P) : (withProvenance a p).len = a.len := rfl
 private theorem byteSize_withProvenance (a : Allocation P E) (p : ProvenanceMap P) : (withProvenance a p).byteSize = a.byteSize := rfl
 private theorem provenanceMap_withProvenance (a : Allocation P E) (p : ProvenanceMap P) : (withProvenance a p).provenanceMap = p := rfl
 private theorem initializationMask_withProvenance (a : Allocation P E) (p : ProvenanceMap P) : (withProvenance a p).initializationMask = a.initializationMask := rfl
-private theorem align_withProvenance (a : Allocation P E) (p : ProvenanceMap P) : (withProvenance a p).align = a.align := rfl
-private theorem mutability_withProvenance (a : Allocation P E) (p : ProvenanceMap P) : (withProvenance a p).mutability = a.mutability := rfl
-private theorem extra_withProvenance (a : Allocation P E) (p : ProvenanceMap P) : (withProvenance a p).extra = a.extra := rfl
-private theorem nativeBuffer_withProvenance (a : Allocation P E) (p : ProvenanceMap P) : (withProvenance a p).nativeBuffer = a.nativeBuffer := rfl
-private theorem raw_withRawBytes (a : Allocation P E) (r : Array UInt8) : raw (withRawBytes a r) = r := rfl
-private theorem len_withRawBytes (a : Allocation P E) (r : Array UInt8) : (withRawBytes a r).len = r.size := rfl
-private theorem byteSize_withRawBytes (a : Allocation P E) (r : Array UInt8) : (withRawBytes a r).byteSize = a.byteSize := rfl
 private theorem provenanceMap_withRawBytes (a : Allocation P E) (r : Array UInt8) : (withRawBytes a r).provenanceMap = a.provenanceMap := rfl
 private theorem initializationMask_withRawBytes (a : Allocation P E) (r : Array UInt8) : (withRawBytes a r).initializationMask = a.initializationMask := rfl
-private theorem align_withRawBytes (a : Allocation P E) (r : Array UInt8) : (withRawBytes a r).align = a.align := rfl
-private theorem mutability_withRawBytes (a : Allocation P E) (r : Array UInt8) : (withRawBytes a r).mutability = a.mutability := rfl
-private theorem extra_withRawBytes (a : Allocation P E) (r : Array UInt8) : (withRawBytes a r).extra = a.extra := rfl
-private theorem nativeBuffer_withRawBytes (a : Allocation P E) (r : Array UInt8) : (withRawBytes a r).nativeBuffer = a.nativeBuffer := rfl
-private theorem raw_mkAlloc (r : Array UInt8) (s : Size) (p : ProvenanceMap P) (m : InitMask) (al : Align) (mu : Mutability) (ex : E) (nb : Option NativeBufferOwnership) :
-    raw (mkAlloc (Prov := P) (Extra := E) r s p m al mu ex nb) = r := rfl
-private theorem len_mkAlloc (r : Array UInt8) (s : Size) (p : ProvenanceMap P) (m : InitMask) (al : Align) (mu : Mutability) (ex : E) (nb : Option NativeBufferOwnership) :
-    (mkAlloc (Prov := P) (Extra := E) r s p m al mu ex nb).len = r.size := rfl
-private theorem byteSize_mkAlloc (r : Array UInt8) (s : Size) (p : ProvenanceMap P) (m : InitMask) (al : Align) (mu : Mutability) (ex : E) (nb : Option NativeBufferOwnership) :
-    (mkAlloc (Prov := P) (Extra := E) r s p m al mu ex nb).byteSize = s := rfl
-private theorem provenanceMap_mkAlloc (r : Array UInt8) (s : Size) (p : ProvenanceMap P) (m : InitMask) (al : Align) (mu : Mutability) (ex : E) (nb : Option NativeBufferOwnership) :
-    (mkAlloc (Prov := P) (Extra := E) r s p m al mu ex nb).provenanceMap = p := rfl
-private theorem initializationMask_mkAlloc (r : Array UInt8) (s : Size) (p : ProvenanceMap P) (m : InitMask) (al : Align) (mu : Mutability) (ex : E) (nb : Option NativeBufferOwnership) :
-    (mkAlloc (Prov := P) (Extra := E) r s p m al mu ex nb).initializationMask = m := rfl
-private theorem align_mkAlloc (r : Array UInt8) (s : Size) (p : ProvenanceMap P) (m : InitMask) (al : Align) (mu : Mutability) (ex : E) (nb : Option NativeBufferOwnership) :
-    (mkAlloc (Prov := P) (Extra := E) r s p m al mu ex nb).align = al := rfl
-private theorem mutability_mkAlloc (r : Array UInt8) (s : Size) (p : ProvenanceMap P) (m : InitMask) (al : Align) (mu : Mutability) (ex : E) (nb : Option NativeBufferOwnership) :
-    (mkAlloc (Prov := P) (Extra := E) r s p m al mu ex nb).mutability = mu := rfl
-private theorem extra_mkAlloc (r : Array UInt8) (s : Size) (p : ProvenanceMap P) (m : InitMask) (al : Align) (mu : Mutability) (ex : E) (nb : Option NativeBufferOwnership) :
-    (mkAlloc (Prov := P) (Extra := E) r s p m al mu ex nb).extra = ex := rfl
-private theorem nativeBuffer_mkAlloc (r : Array UInt8) (s : Size) (p : ProvenanceMap P) (m : InitMask) (al : Align) (mu : Mutability) (ex : E) (nb : Option NativeBufferOwnership) :
-    (mkAlloc (Prov := P) (Extra := E) r s p m al mu ex nb).nativeBuffer = nb := rfl
 private theorem raw_mapExtra (a : Allocation P E) (f : E → E') : raw (a.mapExtra f) = raw a := rfl
 
 private theorem write_add_size (left right : Size)
@@ -2171,8 +2158,7 @@ private theorem firstNonZero_replicate (n : Nat) : firstNonZero (Array.replicate
       have bound := good head (by simp)
       have atHead : (Array.replicate n (0 : UInt8))[head]? = some 0 := by simp [bound]
       rw [List.forIn_cons]
-      simp only [step, atHead, beq_self_eq_true, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
-        pure, Pure.pure, bind, Bind.bind]
+      simp only [step, atHead, pure, Pure.pure, bind, Bind.bind]
       exact ih (by intro index member; exact good index (by simp [member]))
   simp only [firstNonZero]
   simp only [Std.Legacy.Range.forIn_eq_forIn_range', Array.size_replicate, Std.Legacy.Range.size,
@@ -2406,8 +2392,7 @@ theorem writeBytes_mapExtra (start : Size) (bytes : Array UInt8) (ptrSize : Size
   rw [writeBytes_eq_R, writeBytes_eq_R]
   unfold writeBytesR setInitialization overwriteRawBytes
   simp only [Id.run, bind, Bind.bind, pure, Pure.pure, Except.bind, Except.mapError, Except.pure, slices,
-    mutability_mapExtra, initializationMask_mapExtra, raw_mapExtra, provenanceMap_mapExtra,
-    byteSize_mapExtra, raw_withInitMask, raw_withProvenance, raw_withRawBytes, byteSize_withInitMask, byteSize_withProvenance, byteSize_withRawBytes, provenanceMap_withInitMask, provenanceMap_withProvenance, provenanceMap_withRawBytes, initializationMask_withInitMask, initializationMask_withProvenance, initializationMask_withRawBytes]
+    mutability_mapExtra, initializationMask_mapExtra, raw_withProvenance, byteSize_withProvenance]
   cases sizeForArray bytes.size with
   | error e => rfl
   | ok writeSize =>
@@ -2427,7 +2412,7 @@ theorem writeBytes_mapExtra (start : Size) (bytes : Array UInt8) (ptrSize : Size
           | ok mask =>
             dsimp only
             simp only [raw_mapExtra, provenanceMap_mapExtra, byteSize_mapExtra,
-              raw_withInitMask, raw_withProvenance, raw_withRawBytes, byteSize_withInitMask, byteSize_withProvenance, byteSize_withRawBytes, provenanceMap_withInitMask, provenanceMap_withProvenance, provenanceMap_withRawBytes, initializationMask_withInitMask, initializationMask_withProvenance, initializationMask_withRawBytes]
+              raw_withInitMask, byteSize_withInitMask, provenanceMap_withInitMask]
             cases allocation.provenanceMap.clear (allocRange start writeSize) (raw allocation) ptrSize with
             | error e pm => rfl
             | ok _ pm =>
@@ -2622,7 +2607,6 @@ theorem getBytesUnchecked_subrange (allocation : Allocation P E)
     · simp only [h_oob, Bool.false_eq_true, ↓reduceIte, pure, Pure.pure, Except.pure,
         Except.ok.injEq] at h_outer
       simp only [Bool.or_eq_true, not_or, decide_eq_true_eq, gt_iff_lt, UInt64.lt_iff_toNat_lt] at h_oob
-      have h_bs_nat : allocation.byteSize.bytes.toNat = allocation.byteSize.bytes.toNat := rfl
       have h_fOuter_le : fOuter.bytes.toNat ≤ allocation.byteSize.bytes.toNat := by omega
       have h_fOuter_raw : fOuter.bytes.toNat ≤ (raw allocation).size := by omega
       have h_fInner_raw : fInner.bytes.toNat ≤ (raw allocation).size := by omega
@@ -2663,7 +2647,6 @@ theorem getBytesUnchecked_split (allocation : Allocation P E)
     by_cases h_oob : r2.start.bytes > fin.bytes || fin.bytes > allocation.byteSize.bytes
     · simp [h_oob] at h_chk2
     · simp only [Bool.or_eq_true, not_or, decide_eq_true_eq, gt_iff_lt, UInt64.lt_iff_toNat_lt] at h_oob
-      have h_bs_nat : allocation.byteSize.bytes.toNat = allocation.byteSize.bytes.toNat := rfl
       have h_fin_ib : fin.bytes.toNat ≤ allocation.byteSize.bytes.toNat := by omega
       have h_fin_raw : fin.bytes.toNat ≤ (raw allocation).size := by omega
       have h_mid_raw : mid.bytes.toNat ≤ (raw allocation).size := by omega
@@ -3040,8 +3023,7 @@ theorem readScalar_ptr_roundtrip [DecidableEq P] [PointerProvenance P]
         rfl
   simp only [h_init, h_slice, Except.mapError, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
   rw [h_read]
-  simp [h_ptr_sz, h_prov, h_bv_nat, h_not_gt, h_ptr_eta,
-    ]
+  simp [h_ptr_sz, h_prov, h_bv_nat, h_not_gt, h_ptr_eta]
 
 theorem readScalar_ptr_none_roundtrip [DecidableEq P] [PointerProvenance P]
     (allocation : Allocation P E) (layout : TargetDataLayout)
@@ -3720,7 +3702,9 @@ theorem copyRepeatedly_initialized_spec
     dsimp only [destRange, allocRange] at h_destSlice_chk mask1Ok h_clear_raw destEnd ⊢
     simp only [h_destSlice_chk, h_tot_nz, Bool.false_eq_true, ↓reduceIte,
       destMut, bne_self_eq_false, mask1Ok, Except.mapError, Except.bind, Except.pure,
-      h_clear_raw, InitCopy.noBytesInit, Bool.not_true, Bool.false_and, raw_withInitMask, raw_withProvenance, raw_withRawBytes, byteSize_withInitMask, byteSize_withProvenance, byteSize_withRawBytes, provenanceMap_withInitMask, provenanceMap_withProvenance, provenanceMap_withRawBytes, initializationMask_withInitMask, initializationMask_withProvenance, initializationMask_withRawBytes]
+      h_clear_raw, InitCopy.noBytesInit, Bool.not_true, Bool.false_and,
+      raw_withInitMask, raw_withProvenance, byteSize_withInitMask, byteSize_withProvenance,
+      provenanceMap_withInitMask]
     have h_first_fits : destStart.bytes.toNat + sourceRange.size.bytes.toNat < 2 ^ 64 := by
       have : sourceRange.size.bytes.toNat * 1 ≤ sourceRange.size.bytes.toNat * repeatCount.toNat :=
         Nat.mul_le_mul_left _ h_repPos
@@ -3756,8 +3740,11 @@ theorem copyRepeatedly_initialized_spec
       have h_loop_inst := h_rep_loop repeatCount.toNat 0 #[]
       dsimp only [pure, Pure.pure] at h_loop_inst
       rw [h_loop_inst]
-      simp only [Array.empty_append, destEnd, raw_withInitMask, raw_withProvenance, raw_withRawBytes, byteSize_withInitMask, byteSize_withProvenance, byteSize_withRawBytes, provenanceMap_withInitMask, provenanceMap_withProvenance, provenanceMap_withRawBytes, initializationMask_withInitMask, initializationMask_withProvenance, initializationMask_withRawBytes]
-      simp only [h_len_ne, Bool.false_eq_true, ↓reduceIte, h_apply_init, h_applyProv, raw_withInitMask, raw_withProvenance, raw_withRawBytes, byteSize_withInitMask, byteSize_withProvenance, byteSize_withRawBytes, provenanceMap_withInitMask, provenanceMap_withProvenance, provenanceMap_withRawBytes, initializationMask_withInitMask, initializationMask_withProvenance, initializationMask_withRawBytes]
+      simp only [Array.empty_append, destEnd]
+      simp only [h_len_ne, Bool.false_eq_true, ↓reduceIte, h_apply_init, h_applyProv,
+        provenanceMap_withProvenance, provenanceMap_withRawBytes,
+        initializationMask_withInitMask, initializationMask_withProvenance,
+        initializationMask_withRawBytes]
       rfl
     · simp only [h_sn, Bool.false_eq_true, ↓reduceIte, h_rep_chk,
         h_rc_nz_beq, Bool.not_false, Bool.false_and, Bool.and_false,
@@ -3766,8 +3753,11 @@ theorem copyRepeatedly_initialized_spec
       have h_loop_inst := h_rep_loop repeatCount.toNat 0 #[]
       dsimp only [pure, Pure.pure] at h_loop_inst
       rw [h_loop_inst]
-      simp only [Array.empty_append, destEnd, raw_withInitMask, raw_withProvenance, raw_withRawBytes, byteSize_withInitMask, byteSize_withProvenance, byteSize_withRawBytes, provenanceMap_withInitMask, provenanceMap_withProvenance, provenanceMap_withRawBytes, initializationMask_withInitMask, initializationMask_withProvenance, initializationMask_withRawBytes]
-      simp only [h_len_ne, Bool.false_eq_true, ↓reduceIte, h_apply_init, h_applyProv, raw_withInitMask, raw_withProvenance, raw_withRawBytes, byteSize_withInitMask, byteSize_withProvenance, byteSize_withRawBytes, provenanceMap_withInitMask, provenanceMap_withProvenance, provenanceMap_withRawBytes, initializationMask_withInitMask, initializationMask_withProvenance, initializationMask_withRawBytes]
+      simp only [Array.empty_append, destEnd]
+      simp only [h_len_ne, Bool.false_eq_true, ↓reduceIte, h_apply_init, h_applyProv,
+        provenanceMap_withProvenance, provenanceMap_withRawBytes,
+        initializationMask_withInitMask, initializationMask_withProvenance,
+        initializationMask_withRawBytes]
       rfl
   · rw [getBytesUnchecked_eq]
     have h_destFin_ib : destFinish.bytes.toNat ≤ updated.byteSize.bytes.toNat := by
@@ -3876,6 +3866,7 @@ theorem copy_initialized_spec
     h_isInit, h_mget, h_mframe, h_prov, h_bytes, h_frame⟩
 
 end Miri.Memory.Allocation
+
 /-! ## Part 4. `LeanMiriSpec.MemoryLemmas` re-exports
 
 All 50 theorems live in the `lean-miri` namespaces used by `google/zerocopy#4022`
@@ -3958,3 +3949,5 @@ end LeanMiriSpec.MemoryLemmas
   Miri.Memory.Allocation.writeUninit_spec
   Miri.Memory.Allocation.copyRepeatedly_initialized_spec
   Miri.Memory.Allocation.copy_initialized_spec
+
+#assert_module_standard_axioms
