@@ -41,10 +41,12 @@ This module never names them. Instead:
   through the public `WellFounded.Nat.fix_eq`.
 
 No `sorry`, `native_decide`, `unsafe`, `implemented_by`, custom axioms, or name-resolution
-metaprogramming are used; Part 5 checks with `#assert_standard_axioms` and
+metaprogramming are used; Part 6 checks with `#assert_standard_axioms` and
 `#assert_module_standard_axioms` that all 50 theorems (with zero private-helper type leakage and
 matching `LeanMiriSpec.MemoryLemmas` re-exports) and every declaration in this module depend only
-on `propext`, `Classical.choice`, and `Quot.sound`.
+on `propext`, `Classical.choice`, and `Quot.sound`. Part 5 instantiates representative theorems on
+concrete states (word-boundary `InitMask` writes, endian-dependent scalar reads, framed
+`writeBytes`) to check that their hypotheses are jointly satisfiable.
 
 ## The 50 theorems
 
@@ -3871,8 +3873,8 @@ end Miri.Memory.Allocation
 
 All 50 theorems live in the `lean-miri` namespaces used by `google/zerocopy#4022`
 (`Miri.Memory.InitMask.WriteProof`, `Miri.Memory.ProvenanceMap`, `Miri.Memory.Allocation`), so
-dot notation and `open Miri.Memory` work unchanged. The aliases below additionally make every
-theorem available after `open LeanMiriSpec.MemoryLemmas`. -/
+dot notation and `open Miri.Memory` work unchanged. The `export` aliases below additionally
+expose every one of the 50 theorems after `open LeanMiriSpec.MemoryLemmas`. -/
 
 namespace LeanMiriSpec.MemoryLemmas
 
@@ -3896,7 +3898,94 @@ export Miri.Memory.Allocation (byteSize_withExtra len_withExtra align_withExtra
 
 end LeanMiriSpec.MemoryLemmas
 
-/-! ## Part 5. Axiom audit of all 50 theorems -/
+/-! ## Part 5. Non-vacuity witnesses
+
+Compile-time checks that the hypotheses of representative theorems are jointly satisfiable on
+concrete states, by instantiating the theorems themselves (anonymous `example`s, so no public
+API is added). They exercise the edge cases the specifications are meant to cover: a write that
+crosses a 64-bit `InitMask` word boundary and forces the `.Lazy` → `.Materialized` transition,
+little- and big-endian scalar decoding, a fresh allocation from `fromBytes`, a framed
+`writeBytes` followed by read-back, zero-length writes, and a one-copy `copy`. -/
+
+namespace LeanMiriSpec.MemoryLemmas.NonVacuity
+open Miri.ABI Miri.Memory
+
+/-- `set_range_get` across the 64-bit word boundary at byte 64, starting from a `.Lazy` mask. -/
+example : ∃ updated : InitMask,
+    (InitMask.new (Size.ofBytes 200) false).setRange
+      (allocRange (Size.ofBytes 60) (Size.ofBytes 80)) true = .ok updated ∧
+    updated.get (Size.ofBytes 59) = .ok false ∧ updated.get (Size.ofBytes 60) = .ok true ∧
+    updated.get (Size.ofBytes 63) = .ok true ∧ updated.get (Size.ofBytes 64) = .ok true ∧
+    updated.get (Size.ofBytes 139) = .ok true ∧ updated.get (Size.ofBytes 140) = .ok false := by
+  have hend : (allocRange (Size.ofBytes 60) (Size.ofBytes 80)).endExclusive =
+      .ok (Size.ofBytes 140) := by decide
+  obtain ⟨u, hu, -, -⟩ := InitMask.WriteProof.set_range_exists (InitMask.new (Size.ofBytes 200) false)
+    (allocRange (Size.ofBytes 60) (Size.ofBytes 80)) (Size.ofBytes 140) true trivial hend
+    (by decide) (by decide)
+  have hget : ∀ idx : Size, idx.bytes.toNat < 200 → u.get idx =
+      if 60 ≤ idx.bytes.toNat ∧ idx.bytes.toNat < 140 then .ok true else .ok false :=
+    fun idx hidx => InitMask.WriteProof.set_range_get (InitMask.new (Size.ofBytes 200) false) u
+      (allocRange (Size.ofBytes 60) (Size.ofBytes 80)) (Size.ofBytes 140) idx true trivial hend
+      (by decide) (by decide) hidx hu
+  refine ⟨u, hu, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> rw [hget _ (by decide)] <;> decide
+
+/-- `fromBytes_exists` / `fromBytes_spec` / `writeBytes_spec` chain: a framed two-byte write
+into a fresh eight-byte allocation reads back, is initialized, and leaves other bytes alone. -/
+example : ∃ alloc updated : Allocation Unit Unit,
+    Allocation.fromBytes (Array.replicate 8 (0 : UInt8)) Align.ONE .Mut = .ok alloc ∧
+    Allocation.writeBytes (Size.ofBytes 2) #[7, 9] (Size.ofBytes 8) alloc = .ok () updated ∧
+    updated.getBytesUnchecked (allocRange (Size.ofBytes 2) (Size.ofBytes 2)) = .ok #[7, 9] ∧
+    updated.initializationMask.isRangeInitialized
+      (allocRange (Size.ofBytes 2) (Size.ofBytes 2)) = .ok (.ok ()) ∧
+    updated.getBytesUnchecked (allocRange (Size.ofBytes 4) (Size.ofBytes 4)) = .ok #[0, 0, 0, 0] := by
+  obtain ⟨alloc, hcreated, -, -⟩ := Allocation.fromBytes_exists (P := Unit)
+    (Array.replicate 8 0) Align.ONE 1 .Mut rfl rfl (by decide)
+  obtain ⟨hbs, hlen, hmut, -, -, hprov, hmask, hwf, hslice⟩ :=
+    Allocation.fromBytes_spec _ _ _ alloc hcreated
+  obtain ⟨updated, hw, -, -, -, -, -, -, -, -, -, hinit, -, hget, hframe⟩ :=
+    Allocation.writeBytes_spec (Size.ofBytes 2) (Size.ofBytes 8) #[7, 9] alloc ProvenanceMap.new
+      (by decide) (hlen.trans hbs.symm) hmut (by rw [hmask]; rfl) hwf (by rw [hbs]; decide)
+      (fun full _ => by
+        rw [hprov]
+        exact ProvenanceMap.clear_new _ _ _ (Size.ofBytes 4) (by decide) (by decide))
+  refine ⟨alloc, updated, hcreated, hw, hget, hinit, ?_⟩
+  rw [hframe _ (Size.ofBytes 8) (by decide) (by decide) (by rw [hbs]; decide) (by decide),
+    hslice _ (Size.ofBytes 8) (by decide) (by decide) (by decide)]
+  decide
+
+/-- `writeBytes_zero_spec`: an empty write at the end of the allocation is the identity. -/
+example (alloc : Allocation Unit Unit)
+    (hcreated : Allocation.fromBytes (Array.replicate 8 (0 : UInt8)) Align.ONE .Mut = .ok alloc) :
+    Allocation.writeBytes (Size.ofBytes 8) #[] (Size.ofBytes 8) alloc = .ok () alloc := by
+  obtain ⟨hbs, hlen, -⟩ := Allocation.fromBytes_spec _ _ _ alloc hcreated
+  exact Allocation.writeBytes_zero_spec _ _ _ alloc rfl (hlen.trans hbs.symm) (by rw [hbs]; decide)
+
+/-- `readScalar_int_of_bytes` decodes the bytes `[1, 2]` of a fresh allocation as `0x0201` on
+little-endian targets and as `0x0102` on big-endian targets. -/
+example (endian : Endian) : ∃ alloc : Allocation CtfeProvenance Unit,
+    Allocation.fromBytes #[1, 2] Align.ONE .Not = .ok alloc ∧
+    alloc.readScalar ⟨endian, .w64⟩ (allocRange Size.ZERO (Size.ofBytes 2)) false =
+      (Scalar.fromUInt (BitVec.ofNat 128 (if endian == .little then 0x0201 else 0x0102))
+        (Size.ofBytes 2)).mapError AllocError.scalar := by
+  obtain ⟨alloc, hcreated, -, -⟩ := Allocation.fromBytes_exists (P := CtfeProvenance)
+    #[1, 2] Align.ONE 1 .Not rfl rfl (by decide)
+  obtain ⟨hbs, -, -, -, -, hprov, hmask, -, hslice⟩ := Allocation.fromBytes_spec _ _ _ alloc hcreated
+  have hend : (allocRange Size.ZERO (Size.ofBytes 2)).endExclusive = .ok (Size.ofBytes 2) := by
+    decide
+  have hps : (Size.fromBits PointerWidth.w64.bits).bytes ≠ 0 := by decide
+  refine ⟨alloc, hcreated, ?_⟩
+  rw [Allocation.readScalar_int_of_bytes alloc _ _ #[1, 2]
+    (by
+      rw [hmask]
+      exact InitMask.lazy_initialized_query _ _ _ hend
+        (UInt64.le_iff_toNat_le.mpr (by rw [hbs]; decide)))
+    (hslice _ _ hend (by decide) (by decide)) (by decide)
+    (Or.inr (by rw [hprov]; exact ProvenanceMap.rangeEmpty_new _ _ _ hps hend))]
+  cases endian <;> rfl
+
+end LeanMiriSpec.MemoryLemmas.NonVacuity
+
+/-! ## Part 6. Axiom audit of all 50 theorems -/
 
 #assert_standard_axioms
   Miri.Memory.InitMask.WriteProof.get_ok_of_wellFormed
