@@ -907,15 +907,21 @@ theorem byte_image_of_nested_padded_struct_is_exact :
 `Two<u8, bool>` stores `(second: bool, first: u8)`:
 - `(second = 2, first = 1)` holds an invalid `bool` and is `.ub` (validating the fields as the
   generic arguments `(u8, bool)` would accept it);
-- `(second = 1, first = 2)` is a valid value, so the swap is NOT `.ub` (the same mistake would
-  reject it);
+- `(second = 1, first = 2)` swaps cleanly and round-trips via `decodeValueAtLayoutIdxProto`
+  (not merely non-UB);
 - a `bool = 2` inside an array field (`Flags { bits: [bool; 2] }`) is `.ub`, and valid flags swap;
-- a null pointer in a non-null pointer field (`NonNullU8`) is `.ub`. -/
+- a null pointer in a non-null pointer field (`NonNullU8`) is `.ub`, while valid provenance
+  pointers swap preserving `allocId`/`offsetBytes`. -/
 theorem typed_swap_validity_follows_layout_not_generic_args :
+    let pA : ProvenancePtr := { allocId := 11, offsetBytes := 4 }
+    let pB : ProvenancePtr := { allocId := 22, offsetBytes := 8 }
     isUbNode (swapLocals twoU8BoolTy
       (.aggregate 0 [.scalar ⟨2, 1⟩, mkU8 1]) (.aggregate 0 [.scalar ⟨1, 1⟩, mkU8 9])) = true ∧
-    isUbNode (swapLocals twoU8BoolTy
-      (.aggregate 0 [.scalar ⟨1, 1⟩, mkU8 2]) (.aggregate 0 [.scalar ⟨0, 1⟩, mkU8 9])) = false ∧
+    stepLocals? (swapLocals twoU8BoolTy
+      (.aggregate 0 [.scalar ⟨1, 1⟩, mkU8 2]) (.aggregate 0 [.scalar ⟨0, 1⟩, mkU8 9])) =
+      .some [.init .unit,
+        .init (.aggregate 0 [.scalar ⟨0, 1⟩, mkU8 9]),
+        .init (.aggregate 0 [.scalar ⟨1, 1⟩, mkU8 2])] ∧
     isUbNode (swapLocals flagsTy
       (.aggregate 0 [.aggregate 0 [.scalar ⟨2, 1⟩, .scalar ⟨1, 1⟩]])
       (.aggregate 0 [.aggregate 0 [.scalar ⟨0, 1⟩, .scalar ⟨1, 1⟩]])) = true ∧
@@ -926,8 +932,19 @@ theorem typed_swap_validity_follows_layout_not_generic_args :
         .init (.aggregate 0 [.aggregate 0 [.scalar ⟨0, 1⟩, .scalar ⟨1, 1⟩]]),
         .init (.aggregate 0 [.aggregate 0 [.scalar ⟨1, 1⟩, .scalar ⟨1, 1⟩]])] ∧
     isUbNode (swapLocals nonNullU8Ty
-      (.aggregate 0 [.scalar ⟨0, 8⟩]) (.aggregate 0 [.scalar ⟨4096, 8⟩])) = true := by
-  refine ⟨rfl, rfl, rfl, rfl, rfl⟩
+      (.aggregate 0 [.scalar ⟨0, 8⟩]) (.aggregate 0 [.scalar ⟨4096, 8⟩])) = true ∧
+    stepLocals? (swapLocals nonNullU8Ty
+      (.aggregate 0 [.ptr pA 8]) (.aggregate 0 [.ptr pB 8])) =
+      .some [.init .unit,
+        .init (.aggregate 0 [.ptr pB 8]),
+        .init (.aggregate 0 [.ptr pA 8])] ∧
+    stepLocals? (swapLocals outerTy
+      (.aggregate 0 [.aggregate 0 [mkU8 1, mkU32 10]])
+      (.aggregate 0 [.aggregate 0 [mkU8 2, mkU32 20]])) =
+      .some [.init .unit,
+        .init (.aggregate 0 [.aggregate 0 [mkU8 2, mkU32 20]]),
+        .init (.aggregate 0 [.aggregate 0 [mkU8 1, mkU32 10]])] := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- 10(c): a non-pointer scalar whose bytes carry pointer provenance fails closed (a typed copy
 would strip the provenance and leave address bits that have no concrete value here), an
@@ -1319,15 +1336,313 @@ theorem minirust_raw_eq_agreement :
 
 end MiniRustDualAlignment
 
-/-! ## Section 13: Non-Vacuity Witnesses & Mechanical Standard-Axiom Gate -/
+/-! ## Section 13: Pass A1 Soundness Hardening & Regression Witnesses -/
+
+/-- 13(a): Ranged borrows (`split_at_mut`-style disjoint byte slices) do NOT over-invalidate
+disjoint siblings when accessing a sub-range `[accessOff, accessOff + accessLen)`:
+- root borrow tag `1` spans `[0, 16)`, protected sibling tag `2` spans `[8, 16)`;
+- `copy` / `compare_bytes` / `typed_swap_nonoverlapping` on `[0, 4)` (or `[0, 4)` vs `[4, 8)`)
+  through tag `1` SUCCEEDS without tripping the protector on `[8, 16)`;
+- accessing `[4, 12)` (overlapping `[8, 16)`) STILL faults `.ub`! -/
+theorem ranged_borrow_split_at_mut_no_over_invalidation :
+    let decls := [mkDecl unitTy, mkDecl arrU32x4Ty]
+    let locals := [.uninit, .init (.aggregate 0 [mkU32 10, mkU32 20, mkU32 30, mkU32 40])]
+    let bRoot : BorrowEntry :=
+      { tag := 1, targetLocal := 1, targetProjection := [], perm := .unique,
+        rangeOffset := 0, rangeLen := 16 }
+    let bRightProt : BorrowEntry :=
+      { tag := 2, targetLocal := 1, targetProjection := [], perm := .unique,
+        protector := .some 99, rangeOffset := 8, rangeLen := 8 }
+    let s := mkState locals [bRoot, bRightProt] [99]
+    let p (o : Nat) : Value := .ptr { allocId := 1, offsetBytes := o } 8
+    let rCopyDisjoint := evalCopyProto s (mkTarget "core::intrinsics::copy" [.uint .u32])
+      decls protoLayouts [] [p 0, p 4, mkUsize 1] locals dstLocal0 (.some 1)
+    let rSwapDisjoint := evalTypedSwapNonOverlappingProto s
+      (mkTarget "core::intrinsics::typed_swap_nonoverlapping" [.uint .u32])
+      decls protoLayouts [] [p 0, p 4] locals dstLocal0 (.some 1)
+    let rCmpDisjoint := evalCompareBytesProto s decls protoLayouts [p 0, p 4, mkUsize 4]
+      locals dstLocal0 (.some 1)
+    let rCopyOverlapProt := evalCopyProto s (mkTarget "core::intrinsics::copy" [.uint .u32])
+      decls protoLayouts [] [p 0, p 4, mkUsize 2] locals dstLocal0 (.some 1)
+    stepLocals? rCopyDisjoint =
+      .some [.init .unit, .init (.aggregate 0 [mkU32 10, mkU32 10, mkU32 30, mkU32 40])] ∧
+    stepLocals? rSwapDisjoint =
+      .some [.init .unit, .init (.aggregate 0 [mkU32 20, mkU32 10, mkU32 30, mkU32 40])] ∧
+    (stepLocals? rCmpDisjoint).bind (fun ls => get? ls 0) =
+      .some (.init (.scalar ⟨4294967295, 4⟩)) ∧
+    isUbNode rCopyOverlapProt = true := by
+  refine ⟨rfl, rfl, rfl, rfl⟩
+
+/-- 13(b): `typed_swap_nonoverlapping` resets padding bytes on **stack byte-buffer locals**
+(`#[repr(C, align(4))] struct AlignedBytes16([u8; 16])`) as well as globals, faults `.ub` on an
+under-aligned `[u8; 16]` (align 1) local, AND supports `MaybeUninit<u32>` in mutable global
+allocations:
+- swapping two `(u8, u32)` values inside a 4-byte-aligned stack byte buffer whose padding bytes
+  `1..3` and `9..11` were initialized (`0xAA`/`0xBB`) resets bytes `1..3` and `9..11` to
+  `Value.uninit`, so a subsequent `compare_bytes` reading byte `1` faults `.ub`;
+- swapping two `(u8, u32)` values inside a plain `[u8; 16]` (align 1) faults `.ub` (known
+  symbolic alignment `1 < 4`, matching Miri `-Zmiri-symbolic-alignment-check`);
+- swapping two `MaybeUninit<u32>` global allocations containing `.uninit` bytes SUCCEEDS and
+  exchanges their exact raw byte masks. -/
+theorem typed_swap_resets_padding_in_stack_byte_buffer_and_union_global :
+    let bufLayouts : LayoutTable :=
+      { pointerBits := 64
+        isLittleEndian := true
+        entries :=
+          protoLayouts.entries ++
+          [ -- idx 6: `[u8; 16]` (size 16, align 1, array of u8 at idx 3)
+            { size := ⟨16⟩, align := ⟨1⟩, fields := .array ⟨1⟩ 16, variants := .single 0,
+              backendRepr := .memory, fieldLayouts := [3], isUninhabited := false },
+            -- idx 7: `#[repr(C, align(4))] struct AlignedBytes16([u8; 16])` (size 16, align 4)
+            { size := ⟨16⟩, align := ⟨4⟩, fields := .arbitrary [⟨0⟩] [0], variants := .single 0,
+              backendRepr := .memory, fieldLayouts := [6], isUninhabited := false } ] }
+    let alignedBytes16Ty : Ty := { kind := .adt "tests::AlignedBytes16" .nil, layoutIdx := 7 }
+    let unalignedBytes16Ty : Ty := { kind := .array (.uint .u8) 16, layoutIdx := 6 }
+    let decls := [mkDecl unitTy, mkDecl alignedBytes16Ty, mkDecl paddedPairTy]
+    let declsUnaligned := [mkDecl unitTy, mkDecl unalignedBytes16Ty, mkDecl paddedPairTy]
+    let initBytes : List Value :=
+      [mkU8 1, mkU8 170, mkU8 170, mkU8 170, mkU8 10, mkU8 0, mkU8 0, mkU8 0,
+       mkU8 2, mkU8 187, mkU8 187, mkU8 187, mkU8 20, mkU8 0, mkU8 0, mkU8 0]
+    let locals := [.uninit, .init (.aggregate 0 [.aggregate 0 initBytes]), .uninit]
+    let localsUnaligned := [.uninit, .init (.aggregate 0 initBytes), .uninit]
+    let b1 : BorrowEntry := { tag := 1, targetLocal := 1, targetProjection := [], perm := .unique }
+    let s := mkState locals [b1]
+    let p (o : Nat) : Value := .ptr { allocId := 1, offsetBytes := o } 8
+    let swapped := evalTypedSwapNonOverlappingProto s
+      (mkTarget "core::intrinsics::typed_swap_nonoverlapping" [paddedPairTy.kind])
+      decls bufLayouts [] [p 0, p 8] locals dstLocal0 (.some 1)
+    let cmpPadAfter := andThen swapped (fun s' =>
+      evalCompareBytesProto s' decls bufLayouts [p 0, p 8, mkUsize 2] s'.frame.locals dstLocal0 (.some 1))
+    let rUnderAligned := evalTypedSwapNonOverlappingProto (mkState localsUnaligned [b1])
+      (mkTarget "core::intrinsics::typed_swap_nonoverlapping" [paddedPairTy.kind])
+      declsUnaligned bufLayouts [] [p 0, p 8] localsUnaligned dstLocal0 (.some 1)
+    let expectedBytes : List Value :=
+      [mkU8 2, .uninit, .uninit, .uninit, mkU8 20, mkU8 0, mkU8 0, mkU8 0,
+       mkU8 1, .uninit, .uninit, .uninit, mkU8 10, mkU8 0, mkU8 0, mkU8 0]
+    -- Union (`MaybeUninit<u32>`) in global allocations:
+    let gMu1 : CapturedAllocation :=
+      { allocId := 70, bytes := [.some 7, .none, .some 9, .none], relocations := [], align := ⟨4⟩, mutability := .mut }
+    let gMu2 : CapturedAllocation :=
+      { allocId := 71, bytes := [.none, .some 3, .none, .some 5], relocations := [], align := ⟨4⟩, mutability := .mut }
+    let declsMu := [mkDecl unitTy, mkDecl maybeUninitU32Ty]
+    let sMu := mkState [.uninit, .uninit] [] [] [gMu1, gMu2]
+    let rMuGlobal := evalTypedSwapNonOverlappingProto sMu
+      (mkTarget "core::intrinsics::typed_swap_nonoverlapping" [maybeUninitU32Ty.kind])
+      declsMu protoLayouts []
+      [.ptr { allocId := 70, offsetBytes := 0 } 8, .ptr { allocId := 71, offsetBytes := 0 } 8]
+      [.uninit, .uninit] dstLocal0 (.some 1)
+    stepLocals? swapped = .some [.init .unit, .init (.aggregate 0 [.aggregate 0 expectedBytes]), .uninit] ∧
+    isUbNode cmpPadAfter = true ∧
+    isUbNode rUnderAligned = true ∧
+    globalBytes? rMuGlobal 0 = .some [.none, .some 3, .none, .some 5] ∧
+    globalBytes? rMuGlobal 1 = .some [.some 7, .none, .some 9, .none] := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-- 13(c): `black_box` nested validity & fail-closed guarantees:
+- `[MaybeUninit<u8>; 2]` and `(u32, MaybeUninit<u32>)` containing `.uninit` inside the union
+  SUCCEED (previously false UB from recursive `valueContainsUninit`);
+- `(bool=2, u32)`, `[bool=2; 2]`, null wide `&[u8]`, null `fn()`, `Two<u8, bool>` with invalid
+  `bool = 2`, and `NonNullU8` with null pointer ALL fault `.ub`;
+- valid wide `&[u8]`, valid `fn()`, and valid `Two<u8, bool>` SUCCEED;
+- pointer value at `u64`, unsized `[u8]`, and missing type `tyOpt = .none` fail closed `.unsupported`. -/
+theorem black_box_nested_maybeuninit_wide_ref_fnptr_and_adt_validity :
+    let arrMuTy : RigidTy := .array maybeUninitU32Ty.kind 2
+    let pairMuTy : RigidTy := .tuple [.uint .u32, maybeUninitU32Ty.kind]
+    let wideRefU8Ty : RigidTy := .ref .not (.slice (.uint .u8))
+    let fnPtrTy : RigidTy := .fnPtr .nil (.tuple .nil) .safe .rust
+    let s0 := mkState [.uninit]
+    let bb (decls : List LocalDecl) (layouts : LayoutTable) (ty : RigidTy) (v : Value) : MirStepNode :=
+      evalBlackBoxProto s0 (mkTarget "core::intrinsics::black_box" [ty]) decls layouts [] [v]
+        [.uninit] dstLocal0 (.some 1)
+    let arrMuVal : Value := .aggregate 0 [.aggregate 0 [.uninit], .aggregate 0 [mkU32 7]]
+    let pairMuVal : Value := .aggregate 0 [mkU32 9, .aggregate 0 [.uninit]]
+    let declsMu := [mkDecl unitTy, mkDecl maybeUninitU32Ty]
+    let declsExact := [mkDecl unitTy, mkDecl twoU8BoolTy, mkDecl nonNullU8Ty]
+    stepLocals? (bb declsMu protoLayouts arrMuTy arrMuVal) = .some [.init arrMuVal] ∧
+    stepLocals? (bb declsMu protoLayouts pairMuTy pairMuVal) = .some [.init pairMuVal] ∧
+    isUbNode (bb [mkDecl unitTy] protoLayouts (.tuple [.bool, .uint .u32])
+      (.aggregate 0 [.scalar ⟨2, 1⟩, mkU32 1])) = true ∧
+    isUbNode (bb [mkDecl unitTy] protoLayouts (.array .bool 2)
+      (.aggregate 0 [.scalar ⟨1, 1⟩, .scalar ⟨2, 1⟩])) = true ∧
+    isUbNode (bb [mkDecl unitTy] protoLayouts wideRefU8Ty
+      (.aggregate 0 [mkUsize 0, mkUsize 4])) = true ∧
+    stepLocals? (bb [mkDecl unitTy] protoLayouts wideRefU8Ty
+      (.aggregate 0 [.ptr { allocId := 1, offsetBytes := 0 } 8, mkUsize 4])) =
+      .some [.init (.aggregate 0 [.ptr { allocId := 1, offsetBytes := 0 } 8, mkUsize 4])] ∧
+    isUbNode (bb [mkDecl unitTy] protoLayouts fnPtrTy (mkUsize 0)) = true ∧
+    stepLocals? (bb [mkDecl unitTy] protoLayouts fnPtrTy (mkUsize 4096)) =
+      .some [.init (mkUsize 4096)] ∧
+    isUbNode (bb declsExact exactLayouts twoU8BoolTy.kind
+      (.aggregate 0 [.scalar ⟨2, 1⟩, mkU8 1])) = true ∧
+    stepLocals? (bb declsExact exactLayouts twoU8BoolTy.kind
+      (.aggregate 0 [.scalar ⟨1, 1⟩, mkU8 2])) =
+      .some [.init (.aggregate 0 [.scalar ⟨1, 1⟩, mkU8 2])] ∧
+    isUbNode (bb declsExact exactLayouts nonNullU8Ty.kind
+      (.aggregate 0 [mkUsize 0])) = true ∧
+    isUnsupportedNode (bb [mkDecl u64Ty] protoLayouts (.uint .u64)
+      (.ptr { allocId := 7, offsetBytes := 0 } 8)) = true ∧
+    isUnsupportedNode (bb [mkDecl unitTy] protoLayouts (.slice (.uint .u8)) .unit) = true ∧
+    isUnsupportedNode (evalBlackBoxProto s0 (mkTarget "core::intrinsics::black_box" [])
+      [] protoLayouts [] [mkU32 1] [.uninit] dstLocal0 (.some 1)) = true := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- 13(d): `ptr_mask` hardening:
+- `concreteBaseAddr? = .some 0` is rejected (`.unsupported`), preventing `ptr_mask(p, 0)` from
+  turning a live pointer into a bogus offset-0 dereferenceable pointer;
+- identity mask `usize::MAX` (`2^64 - 1`) succeeds on an opaque ADT local (unknown `allocAlign`)
+  AND on a dead tracked pointer, preserving `allocId`/`tag`;
+- wide pointer `.aggregate 0 [data, len]` fails closed `.unsupported` rather than false `.ub`. -/
+theorem ptr_mask_zero_base_rejected_identity_mask_and_wide_ptr :
+    let opaqueAdtTy : Ty := { kind := .adt "tests::Opaque" .nil, layoutIdx := 99 }
+    let decls := [mkDecl rawConstU8Ty, mkDecl aligned16BufTy, mkDecl opaqueAdtTy]
+    let locals := [.uninit, .init .unit, .init .unit]
+    let bAligned : BorrowEntry := { tag := 7, targetLocal := 1, targetProjection := [], perm := .unique }
+    let bOpaque : BorrowEntry := { tag := 8, targetLocal := 2, targetProjection := [], perm := .unique }
+    let bDead : BorrowEntry :=
+      { tag := 9, targetLocal := 1, targetProjection := [], perm := .frozen, allocDead := true }
+    let s := mkState locals [bAligned, bOpaque, bDead]
+    let allOnes : Nat := 18446744073709551615
+    let rZeroBase := evalPtrMaskProto s decls protoLayouts
+      [.ptr { allocId := 7, offsetBytes := 0 } 8, mkUsize 0] locals dstLocal0 (.some 1) (.some 0)
+    let rOpaqueId := evalPtrMaskProto s decls protoLayouts
+      [.ptr { allocId := 8, offsetBytes := 5 } 8, mkUsize allOnes] locals dstLocal0 (.some 1) .none
+    let rDeadMask := evalPtrMaskProto s decls protoLayouts
+      [.ptr { allocId := 9, offsetBytes := 13 } 8, mkUsize 18446744073709551608] locals dstLocal0 (.some 1) .none
+    let rWidePtr := evalPtrMaskProto s decls protoLayouts
+      [.aggregate 0 [.ptr { allocId := 7, offsetBytes := 13 } 8, mkUsize 4], mkUsize 18446744073709551608]
+      locals dstLocal0 (.some 1) .none
+    isUnsupportedNode rZeroBase = true ∧
+    (stepLocals? rOpaqueId).bind (fun ls => get? ls 0) =
+      .some (.init (.ptr { allocId := 8, offsetBytes := 5 } 8)) ∧
+    (stepLocals? rDeadMask).bind (fun ls => get? ls 0) =
+      .some (.init (.ptr { allocId := 9, offsetBytes := 8 } 8)) ∧
+    isUnsupportedNode rWidePtr = true := by
+  refine ⟨rfl, rfl, rfl, rfl⟩
+
+/-- 13(e): `writeIntrinsicReturnProto` forwards `bodyLocalDecls`/`bodyLayouts` on `.deref`
+destinations: writing `black_box(42u32)` to `*p` updates the target local, while writing through
+a `.frozen` tag faults `.ub`, and writing to a direct destination protected by an active protector
+also faults `.ub`. -/
+theorem write_intrinsic_return_deref_and_protector_enforcement :
+    let decls := [mkDecl rawMutU32Ty, mkDecl u32Ty]
+    let pMut : Value := .ptr { allocId := 1, offsetBytes := 0 } 8
+    let locals := [.init pMut, .init (mkU32 5)]
+    let derefDst : Place := { local_ := 0, projection := [.deref] }
+    let bUnique : BorrowEntry := { tag := 1, targetLocal := 1, targetProjection := [], perm := .unique }
+    let bFrozen : BorrowEntry := { tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen }
+    let bProt : BorrowEntry :=
+      { tag := 2, targetLocal := 1, targetProjection := [], perm := .unique, protector := .some 77 }
+    let rDerefOk := evalBlackBoxProto (mkState locals [bUnique])
+      (mkTarget "core::intrinsics::black_box" [.uint .u32]) decls protoLayouts []
+      [mkU32 42] locals derefDst (.some 1)
+    let rDerefFrozenUb := evalBlackBoxProto (mkState locals [bFrozen])
+      (mkTarget "core::intrinsics::black_box" [.uint .u32]) decls protoLayouts []
+      [mkU32 42] locals derefDst (.some 1)
+    let rDirectProtUb := evalBlackBoxProto (mkState locals [bProt] [77])
+      (mkTarget "core::intrinsics::black_box" [.uint .u32]) decls protoLayouts []
+      [mkU32 42] locals { local_ := 1, projection := .nil } (.some 1)
+    stepLocals? rDerefOk = .some [.init pMut, .init (mkU32 42)] ∧
+    isUbNode rDerefFrozenUb = true ∧
+    isUbNode rDirectProtUb = true := by
+  refine ⟨rfl, rfl, rfl⟩
+
+/-- 13(f): `raw_eq` uninhabited non-ZST UB, 32-bit wide `*const [u8]` width (`2 * ptrBytes = 8`),
+layout-less multi-field tuple fail-closed, and reordered `.scalarPair` (`memoryIndex = [1, 0]`)
+validation. -/
+theorem raw_eq_uninhabited_32bit_wide_rawptr_tuple_and_reordered_scalarpair :
+    let layouts32 : LayoutTable := { pointerBits := 32, isLittleEndian := true, entries := [] }
+    let extraLayouts : LayoutTable :=
+      { pointerBits := 64
+        isLittleEndian := true
+        entries :=
+          [ -- idx 0: uninhabited non-ZST struct (size 4, align 4, isUninhabited = true)
+            { size := ⟨4⟩, align := ⟨4⟩, fields := .arbitrary [⟨0⟩] [0], variants := .single 0,
+              backendRepr := .memory, isUninhabited := true },
+            -- idx 1: reordered `ScalarPair` struct `{ first: bool@4, second: u32@0 }`,
+            -- offsets `[4, 0]`, `memoryIndex = [1, 0]`, `backendRepr = .scalarPair u32 bool`, NO `fieldLayouts`!
+            { size := ⟨8⟩, align := ⟨4⟩, fields := .arbitrary [⟨4⟩, ⟨0⟩] [1, 0], variants := .single 0,
+              backendRepr := .scalarPair
+                (.initialized (.int 32 false) ⟨0, 4294967295⟩)
+                (.initialized (.int 8 false) ⟨0, 1⟩),
+              isUninhabited := false } ] }
+    let uninhabNonZstTy : Ty := { kind := .adt "tests::UninhabNonZst" .nil, layoutIdx := 0 }
+    let declsU := [mkDecl boolTy, mkDecl uninhabNonZstTy]
+    let gInit4 : CapturedAllocation :=
+      { allocId := 80, bytes := [.some 1, .some 2, .some 3, .some 4], relocations := [],
+        align := ⟨4⟩, mutability := .not }
+    let rRawEqUninhab := evalRawEqProto (mkState [.uninit, .uninit] [] [] [gInit4])
+      (mkTarget "core::intrinsics::raw_eq" [uninhabNonZstTy.kind]) declsU extraLayouts []
+      [.ptr { allocId := 80, offsetBytes := 0 } 8, .ptr { allocId := 80, offsetBytes := 0 } 8]
+      [.uninit, .uninit] dstLocal0 (.some 1)
+    let plain8 := List.replicate 8 (AbstractByte.init 1 .none)
+    let plain16 := List.replicate 16 (AbstractByte.init 1 .none)
+    -- Reordered `ScalarPair`: bytes 0..3 = u32(5), byte 4 = bool(1 or 2), bytes 5..7 = padding
+    let validPairBytes : List AbstractByte :=
+      [.init 5 .none, .init 0 .none, .init 0 .none, .init 0 .none, .init 1 .none, .uninit, .uninit, .uninit]
+    let badPairBytes : List AbstractByte :=
+      [.init 5 .none, .init 0 .none, .init 0 .none, .init 0 .none, .init 2 .none, .uninit, .uninit, .uninit]
+    -- Unbacked `allocId = 0, offsetBytes = 0` inside `&u32` bytes -> `.ub`:
+    let unbackedZeroPtrBytes : List AbstractByte := List.replicate 8 (.init 0 (.some (0, 0)))
+    isUbNode rRawEqUninhab = true ∧
+    validateTypedBytesProto 8 [] layouts32 (.rawPtr .not (.slice (.uint .u8))) plain8 = .valid ∧
+    validateTypedBytesProto 8 [] layouts32 (.rawPtr .not (.slice (.uint .u8))) plain16 = .ub ∧
+    validateTypedBytesProto 8 [] protoLayouts (.tuple [.uint .u8, .uint .u32]) plain8 = .unsupported ∧
+    decodePartialUninitValueProto 8 [] protoLayouts { kind := .tuple [.uint .u8, .uint .u32], layoutIdx := 99 } plain8 = .none ∧
+    validateTypedBytesForLayoutIdxProto 8 extraLayouts 1 validPairBytes = .valid ∧
+    validateTypedBytesForLayoutIdxProto 8 extraLayouts 1 badPairBytes = .ub ∧
+    validateTypedBytesProto 8 [] protoLayouts (.ref .not (.uint .u32)) unbackedZeroPtrBytes = .ub := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- 13(g): Unknown container alignment fails closed `.unsupported` (and still catches guaranteed
+misalignment `.ub` at `offset % reqAlign != 0`), and diverging `const_eval_select` (`target = none`)
+fails closed `.unsupported` rather than falsely faulting `.ub`. -/
+theorem unknown_alignment_fail_closed_and_diverging_const_eval_select :
+    let opaqueAdtTy : Ty := { kind := .adt "tests::Opaque" .nil, layoutIdx := 99 }
+    let decls := [mkDecl unitTy, mkDecl opaqueAdtTy]
+    let locals := [.uninit, .init .unit]
+    let bOpaque : BorrowEntry := { tag := 1, targetLocal := 1, targetProjection := [], perm := .unique }
+    let s := mkState locals [bOpaque]
+    let copyU32 := mkTarget "core::intrinsics::copy" [.uint .u32]
+    let rOpaqueZeroOff0 := evalCopyProto s copyU32 decls protoLayouts []
+      [.ptr { allocId := 1, offsetBytes := 0 } 8, mkUsize 4096, mkUsize 0] locals dstLocal0 (.some 1)
+    let rOpaqueZeroOff2 := evalCopyProto s copyU32 decls protoLayouts []
+      [.ptr { allocId := 1, offsetBytes := 2 } 8, mkUsize 4096, mkUsize 0] locals dstLocal0 (.some 1)
+    let rUnknownZeroOff0 := evalCopyProto s copyU32 decls protoLayouts []
+      [.ptr { allocId := 999, offsetBytes := 0 } 8, mkUsize 4096, mkUsize 0] locals dstLocal0 (.some 1)
+    let rUnknownZeroOff2 := evalCopyProto s copyU32 decls protoLayouts []
+      [.ptr { allocId := 999, offsetBytes := 2 } 8, mkUsize 4096, mkUsize 0] locals dstLocal0 (.some 1)
+    let rUnknownNonZero := evalCopyProto s copyU32 decls protoLayouts []
+      [.ptr { allocId := 999, offsetBytes := 0 } 8, mkUsize 4096, mkUsize 1] locals dstLocal0 (.some 1)
+    let rConstEvalDiv := evalDirectRustIntrinsicProto? s .none
+      (mkTarget "core::intrinsics::const_eval_select" []) decls protoLayouts [] [] locals dstLocal0 .none .continue_
+    let rWriteBytesDivUnsup := evalDirectRustIntrinsicProto? s .none
+      (mkTarget "core::intrinsics::write_bytes" [opaqueAdtTy.kind]) decls protoLayouts []
+      [.ptr { allocId := 1, offsetBytes := 0 } 8, mkU8 0, mkUsize 1] locals dstLocal0 .none .continue_
+    let sU32 := mkState [.uninit, .init (mkU32 0)]
+      [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .unique }]
+    let rWriteBytesDivRetUb := evalDirectRustIntrinsicProto? sU32 .none
+      (mkTarget "core::intrinsics::write_bytes" [.uint .u32]) [mkDecl unitTy, mkDecl u32Ty] protoLayouts []
+      [.ptr { allocId := 1, offsetBytes := 0 } 8, mkU8 0, mkUsize 0]
+      [.uninit, .init (mkU32 0)] dstLocal0 .none .continue_
+    isUnsupportedNode rOpaqueZeroOff0 = true ∧
+    isUbNode rOpaqueZeroOff2 = true ∧
+    isUnsupportedNode rUnknownZeroOff0 = true ∧
+    isUbNode rUnknownZeroOff2 = true ∧
+    isUbNode rUnknownNonZero = true ∧
+    rConstEvalDiv.map isUnsupportedNode = .some true ∧
+    rWriteBytesDivUnsup.map isUnsupportedNode = .some true ∧
+    rWriteBytesDivRetUb.map isUbNode = .some true := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-! ## Section 14: Non-Vacuity Witnesses & Mechanical Standard-Axiom Gate -/
 
 /--
 Non-vacuity witness instantiating EVERY universally quantified theorem in
 `Anneal.TcbCoreMemPtrIntrinsicsPrototype` with concrete, satisfiable inputs:
 1. `compareUnsignedBytesProto_eq_miriBytesCompareSpec` on `[0x80]` vs `[0x7f]`;
 2. `ptrMask_baseAddr_invariant` on 64-bit `m = 3` (`align = 8`), `baseAddr = 0x10000`, `relOff = 13`, `mask = !7`;
-3. `evalPtrMaskValueProto_preserves_provenance` and `evalPtrMaskValueProto_symbolic_eq_concrete`
-   on concrete stack borrow tag `7` with `baseAddr = 0x10000` and `baseAddr = 0x20008`!
+3. `evalPtrMaskValueProto_preserves_provenance`, `evalPtrMaskValueProto_allOnes_identity`, and
+   `evalPtrMaskValueProto_symbolic_eq_concrete` on concrete stack borrow tag `7` with `baseAddr = 0x20008`;
 4. `evalPtrOffsetFromDistanceProto_zst_ub`, `_unsigned_underflow_ub`, `_isizeMin_ub`;
 5. `evalBlackBoxProto_valid_direct_dest` on `u32 = 42`;
 6. the `lean-miri` mirror theorems `evalPtrOffsetFromDistanceProto_eq_miriSpec`,
@@ -1336,7 +1651,9 @@ Non-vacuity witness instantiating EVERY universally quantified theorem in
    (`-8` bytes, `-2` elements), with the mirror itself evaluated on the `isize::MIN`, unsigned
    underflow, inexact-division, and ZST cases so its UB branches are reachable;
 7. `evalPtrOffsetFromDistanceProto_same_offset`, `resolvePtrOffsetFromOffsetsProto_same_pointer`
-   (on a dead-allocation pointer), and `abstractBytesRefineProto_refl`.
+   (on a dead-allocation pointer), and `abstractBytesRefineProto_refl`;
+8. `misaligned_offset_has_misaligned_placement` on `(a = 1, r = 2, off = 2)` and
+   `evalDirectRustIntrinsicProto?_constEvalSelect_diverging_not_ub`.
 -/
 theorem non_vacuity_all_quantified_theorems :
     (compareUnsignedBytesProto [128] [127] = miriBytesCompareSpec [128] [127]) ∧
@@ -1353,6 +1670,11 @@ theorem non_vacuity_all_quantified_theorems :
         [.uninit, .init .unit] [mkDecl rawConstU8Ty, mkDecl aligned16BufTy] protoLayouts
         (.prov { allocId := 7, offsetBytes := 13 }) ⟨18446744073709551608, 8⟩ (.some 131080) =
       .ok (.ptr { allocId := 7, offsetBytes := 8 } 8)) ∧
+    (evalPtrMaskValueProto
+        (mkState [.uninit, .init .unit] [{ tag := 7, targetLocal := 1, targetProjection := [], perm := .unique }])
+        [.uninit, .init .unit] [mkDecl rawConstU8Ty, mkDecl aligned16BufTy] protoLayouts
+        (.prov { allocId := 7, offsetBytes := 13 }) ⟨scalarModulus 8 - 1, 8⟩ .none =
+      .ok (.ptr { allocId := 7, offsetBytes := 13 } 8)) ∧
     (evalPtrOffsetFromDistanceProto 4 0 0 8 false = .none) ∧
     (evalPtrOffsetFromDistanceProto 4 8 4 8 true = .none) ∧
     (evalPtrOffsetFromDistanceProto 0 (signedHalfModulus 8) 1 8 false = .none) ∧
@@ -1383,9 +1705,13 @@ theorem non_vacuity_all_quantified_theorems :
         (.prov { allocId := 3, offsetBytes := 8 }) (.prov { allocId := 3, offsetBytes := 8 }) =
         .ok (off, off)) ∧
     (abstractBytesRefineProto [.init 5 (.some (3, 3)), .uninit] [.init 5 (.some (3, 3)), .uninit] =
-      true) := by
-  refine ⟨compareUnsignedBytesProto_eq_miriBytesCompareSpec [128] [127], ?_, ?_, ?_, ?_, ?_, ?_, ?_,
-    ?_, ?_, ?_, rfl, rfl, rfl, rfl, rfl, rfl, ?_, ?_, ?_⟩
+      true) ∧
+    (∃ base, 0 < base ∧ base % 2 ^ 1 = 0 ∧ (base + 2) % 2 ^ 2 ≠ 0) ∧
+    (evalDirectRustIntrinsicProto? (mkState [.uninit]) .none
+      (mkTarget "core::intrinsics::const_eval_select" []) [mkDecl unitTy] protoLayouts [] []
+      [.uninit] dstLocal0 .none .continue_ = .some MirStepNode.unsupported) := by
+  refine ⟨compareUnsignedBytesProto_eq_miriBytesCompareSpec [128] [127], ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_,
+    ?_, ?_, ?_, rfl, rfl, rfl, rfl, rfl, rfl, ?_, ?_, ?_, ?_, ?_⟩
   · exact ptrMask_baseAddr_invariant 64 3 65536 13 18446744073709551608
       (by decide) (by decide) (by decide) (by decide)
   · rcases evalPtrMaskValueProto_preserves_provenance
@@ -1399,7 +1725,11 @@ theorem non_vacuity_all_quantified_theorems :
       [.uninit, .init .unit] [mkDecl rawConstU8Ty, mkDecl aligned16BufTy] protoLayouts
       { allocId := 7, offsetBytes := 13 } ⟨18446744073709551608, 8⟩ 8 0 131080
       (.ptr { allocId := 7, offsetBytes := 8 } 8)
-      rfl rfl ⟨3, rfl⟩ (by decide) (by decide) rfl
+      rfl rfl ⟨3, rfl⟩ (by decide) (by decide) (by decide) rfl
+  · exact evalPtrMaskValueProto_allOnes_identity
+      (mkState [.uninit, .init .unit] [{ tag := 7, targetLocal := 1, targetProjection := [], perm := .unique }])
+      [.uninit, .init .unit] [mkDecl rawConstU8Ty, mkDecl aligned16BufTy] protoLayouts
+      { allocId := 7, offsetBytes := 13 } rfl (by decide)
   · exact evalPtrOffsetFromDistanceProto_zst_ub 4 0 8 false
   · exact evalPtrOffsetFromDistanceProto_unsigned_underflow_ub 4 8 4 8 (by decide)
   · exact evalPtrOffsetFromDistanceProto_isizeMin_ub 1 8 (by decide) false
@@ -1415,6 +1745,9 @@ theorem non_vacuity_all_quantified_theorems :
   · exact evalPtrOffsetFromDistanceProto_same_offset 400 4 8 true (by decide)
   · exact resolvePtrOffsetFromOffsetsProto_same_pointer _ _ _ _ _
   · exact abstractBytesRefineProto_refl _
+  · exact misaligned_offset_has_misaligned_placement 1 2 2 (by decide)
+  · exact evalDirectRustIntrinsicProto?_constEvalSelect_diverging_not_ub
+      (mkState [.uninit]) .none [] [mkDecl unitTy] protoLayouts [] [] [.uninit] dstLocal0 .continue_
 
 /-- Aggregate conjunction linking every prototype and test theorem for axiom auditing. -/
 theorem all_proto_and_test_theorems :
@@ -1430,6 +1763,7 @@ theorem all_proto_and_test_theorems :
         (match miriPtrOffsetFromDistanceSpec aOff bOff (scalarModulus ptrBytes) unsigned with
          | .none => .none
          | .some distance => miriPtrOffsetFromExactDivSpec distance elemSize ptrBytes)) ∧
+    (∀ a r off, off % 2 ^ r ≠ 0 → ∃ base, 0 < base ∧ base % 2 ^ a = 0 ∧ (base + off) % 2 ^ r ≠ 0) ∧
     True := by
   have _ := classify_all_8_core_intrinsics
   have _ := classify_preserves_existing_and_rejects_wrappers
@@ -1473,9 +1807,16 @@ theorem all_proto_and_test_theorems :
   have _ := dispatcher_end_to_end_and_base_passthrough
   have _ := minirust_ptr_offset_from_agreement
   have _ := minirust_raw_eq_agreement
+  have _ := ranged_borrow_split_at_mut_no_over_invalidation
+  have _ := typed_swap_resets_padding_in_stack_byte_buffer_and_union_global
+  have _ := black_box_nested_maybeuninit_wide_ref_fnptr_and_adt_validity
+  have _ := ptr_mask_zero_base_rejected_identity_mask_and_wide_ptr
+  have _ := write_intrinsic_return_deref_and_protector_enforcement
+  have _ := raw_eq_uninhabited_32bit_wide_rawptr_tuple_and_reordered_scalarpair
+  have _ := unknown_alignment_fail_closed_and_diverging_const_eval_select
   have _ := non_vacuity_all_quantified_theorems
   exact ⟨rfl, compareUnsignedBytesProto_eq_miriBytesCompareSpec, ptrMask_baseAddr_invariant,
-    evalPtrOffsetFromDistanceProto_eq_miriSpec, trivial⟩
+    evalPtrOffsetFromDistanceProto_eq_miriSpec, misaligned_offset_has_misaligned_placement, trivial⟩
 
 section MechanicalAxiomAudit
 
@@ -1592,6 +1933,13 @@ elab "#assert_proto_standard_axioms " ids:ident* : command => do
   dispatcher_end_to_end_and_base_passthrough
   minirust_ptr_offset_from_agreement
   minirust_raw_eq_agreement
+  ranged_borrow_split_at_mut_no_over_invalidation
+  typed_swap_resets_padding_in_stack_byte_buffer_and_union_global
+  black_box_nested_maybeuninit_wide_ref_fnptr_and_adt_validity
+  ptr_mask_zero_base_rejected_identity_mask_and_wide_ptr
+  write_intrinsic_return_deref_and_protector_enforcement
+  raw_eq_uninhabited_32bit_wide_rawptr_tuple_and_reordered_scalarpair
+  unknown_alignment_fail_closed_and_diverging_const_eval_select
   non_vacuity_all_quantified_theorems
   all_proto_and_test_theorems
 
