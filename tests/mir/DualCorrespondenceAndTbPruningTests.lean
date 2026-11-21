@@ -3362,7 +3362,8 @@ theorem nondeterministic_signaling_outcomes :
   decide +kernel
 
 /-- The machine-level verdicts are the trusted cast functions, including
-both 32-bit and 64-bit `evalByteCast` bit carriers. -/
+unsigned 64-bit casts (`f64ToU64`, `u64ToF64`) and both 32-bit and 64-bit
+`evalByteCast` bit carriers. -/
 theorem trusted_matches_cast_functions (q : Query) :
     trustedVerdict .f32ToI32 q =
         some (.returns
@@ -3371,6 +3372,13 @@ theorem trusted_matches_cast_functions (q : Query) :
       trustedVerdict .i32ToF32 q =
         some (.returns
           (evalIntToFloatRoundTiesToEven true 32 q.bits32 .binary32)) ∧
+      trustedVerdict .f64ToU64 q =
+        some (.returns
+          (evalFloatToIntSaturating .binary64 q.bits64 (.unsigned .u64)
+            .bits64).bits) ∧
+      trustedVerdict .u64ToF64 q =
+        some (.returns
+          (evalIntToFloatRoundTiesToEven false 64 q.bits64 .binary64)) ∧
       trustedVerdict .f32ToF64 q =
         some (.returns
           (evalFloatToFloatRoundTiesToEven .binary32 .binary64 q.bits32)) ∧
@@ -3476,11 +3484,21 @@ theorem f32ToI32_saturates :
       trustedVerdict .f32ToI32 .threeBillion = some (.returns 0x7fffffff) := by
   decide +kernel
 
+/-- Initial state of a cast body on an explicit raw bit pattern. -/
+def castInitBits (p : Prog) (bits : Nat) : MachineState :=
+  { frame :=
+      { blockIdx := 0
+        stmtIdx := 0
+        locals := [.uninit, .init (.scalar ⟨bits, (castShape p).2.1⟩)] }
+    memory := emptyMemory }
+
 /-- Unsigned 64-bit casts: `f64 as u64` truncates `1.5` to `1`, keeps
-`3.0e9`, and saturates `-∞` and NaN to `0`; `u64 as f64` converts the
-63-bit integers `0x3ff8000000000000` and `0x7ff8000020000000` (exact: their
-low ten bits are zero). The trusted machine agrees with the reference
-specification on every query. -/
+`3.0e9`, saturates `-∞` and NaN to `0`, and saturates `+∞` to `u64::MAX`;
+`u64 as f64` converts bit-63-set `0xfff0000000000000` as unsigned (not
+negative), rounds halfway ties above `2^53` to even (`2^53 + 1 ↦ 2^53`,
+`2^53 + 3 ↦ 2^53 + 4`), and carries `u64::MAX` to `2^64`. The trusted
+machine agrees with the reference specification on every query and boundary
+input. -/
 theorem u64_casts :
     trustedVerdict .f64ToU64 .onePointFive = some (.returns 1) ∧
       trustedVerdict .f64ToU64 .threeBillion = some (.returns 3000000000) ∧
@@ -3490,6 +3508,25 @@ theorem u64_casts :
         some (.returns 0x43cffc0000000000) ∧
       trustedVerdict .u64ToF64 .quietNaN =
         some (.returns 0x43dffe0000080000) ∧
+      trustedVerdict .u64ToF64 .negInfinity =
+        some (.returns 0x43effe0000000000) ∧
+      WideSlice.frameVerdict (castBody .f64ToU64)
+          (castInitBits .f64ToU64 0x7ff0000000000000) =
+        some (.returns 0xffffffffffffffff) ∧
+      WideSlice.frameVerdict (castBody .u64ToF64)
+          (castInitBits .u64ToF64 (2 ^ 53 + 1)) =
+        some (.returns 0x4340000000000000) ∧
+      WideSlice.frameVerdict (castBody .u64ToF64)
+          (castInitBits .u64ToF64 (2 ^ 53 + 3)) =
+        some (.returns 0x4340000000000002) ∧
+      WideSlice.frameVerdict (castBody .u64ToF64)
+          (castInitBits .u64ToF64 (2 ^ 64 - 1)) =
+        some (.returns 0x43f0000000000000) ∧
+      Ref.toInteger .binary64 0x7ff0000000000000 64 false =
+        some 0xffffffffffffffff ∧
+      Ref.fromInteger .binary64 (2 ^ 53 + 1) = some 0x4340000000000000 ∧
+      Ref.fromInteger .binary64 (2 ^ 53 + 3) = some 0x4340000000000002 ∧
+      Ref.fromInteger .binary64 (2 ^ 64 - 1) = some 0x43f0000000000000 ∧
       allQueries.all (fun q =>
         decide (trustedVerdict .f64ToU64 q =
             lmReference .deterministic .f64ToU64 q .p0) &&
@@ -4546,7 +4583,7 @@ def adjAgrees (flag : Bool) (src dst : Ref.Fmt) (b : Nat) : Bool :=
 /-- Agreement with `Ref` on the corpus input `q`: decoding, conversions in
 both directions, NaN candidates and `adjustNaN` in both directions, both
 modes, and all picks, saturating `toInteger` (`i32` and `u64`), and
-`fromInteger` (`i32 → f32` and `i32 → f64`). -/
+`fromInteger` (`i32 → f32`, `i32 → f64`, and unsigned `u64 → f64`). -/
 def agreesAt (q : Query) : Bool :=
   decide (G.dec .binary32 q.bits32 = Ref.decode .binary32 q.bits32) &&
   decide (G.dec .binary64 q.bits64 = Ref.decode .binary64 q.bits64) &&
@@ -4573,26 +4610,40 @@ def agreesAt (q : Query) : Bool :=
   decide (G.fromInt .binary32 (signedOfBits 32 q.bits32) =
     Ref.fromInteger .binary32 (signedOfBits 32 q.bits32)) &&
   decide (G.fromInt .binary64 (signedOfBits 32 q.bits32) =
-    Ref.fromInteger .binary64 (signedOfBits 32 q.bits32))
+    Ref.fromInteger .binary64 (signedOfBits 32 q.bits32)) &&
+  decide (G.fromInt .binary64 (Int.ofNat q.bits64) =
+    Ref.fromInteger .binary64 (Int.ofNat q.bits64))
 
-/-- Agreement with `Ref` on every corpus input, on both preferred NaNs, and
-on out-of-width decode rejection (`2^32` for `f32`, `2^64` for `f64`). -/
+/-- Agreement with `Ref` on every corpus input, on both preferred NaNs, on
+out-of-width decode rejection (`2^32` for `f32`, `2^64` for `f64`), and on
+unsigned 64-bit overflow and tie-to-even rounding (`+∞ ↦ u64::MAX`,
+`2^53 + 1 ↦ 2^53`, `2^53 + 3 ↦ 2^53 + 4`, `u64::MAX ↦ 2^64`). -/
 def agrees : Bool :=
   decide (G.bits (G.preferredNaN G.f32) = Ref.preferredNaN .binary32) &&
   decide (G.bits (G.preferredNaN G.f64) = Ref.preferredNaN .binary64) &&
   decide (G.dec .binary32 (2 ^ 32) = none) &&
   decide (G.dec .binary64 (2 ^ 64) = none) &&
+  decide (G.toInt .binary64 0x7ff0000000000000 64 false =
+    some 0xffffffffffffffff) &&
+  decide (G.fromInt .binary64 (2 ^ 53 + 1) = some 0x4340000000000000) &&
+  decide (G.fromInt .binary64 (2 ^ 53 + 3) = some 0x4340000000000002) &&
+  decide (G.fromInt .binary64 (2 ^ 64 - 1) = some 0x43f0000000000000) &&
   allQueries.all G.agreesAt
 
 /-- `agrees` certifies every primitive checked by `agreesAt` and `agrees`
-(preferred NaNs, out-of-width decode rejection, `decode`, `convert`,
-`nanChoices`, `adjustNaN` across all picks, `toInteger`, and
-`fromInteger`), discarding none. -/
+(preferred NaNs, out-of-width decode rejection, unsigned 64-bit overflow
+and tie-to-even rounding, `decode`, `convert`, `nanChoices`, `adjustNaN`
+across all picks, `toInteger`, and `fromInteger`), discarding none. -/
 theorem agrees_sound (h : G.agrees = true) :
     G.bits (G.preferredNaN G.f32) = Ref.preferredNaN .binary32 ∧
     G.bits (G.preferredNaN G.f64) = Ref.preferredNaN .binary64 ∧
     G.dec .binary32 (2 ^ 32) = none ∧
     G.dec .binary64 (2 ^ 64) = none ∧
+    G.toInt .binary64 0x7ff0000000000000 64 false =
+      some 0xffffffffffffffff ∧
+    G.fromInt .binary64 (2 ^ 53 + 1) = some 0x4340000000000000 ∧
+    G.fromInt .binary64 (2 ^ 53 + 3) = some 0x4340000000000002 ∧
+    G.fromInt .binary64 (2 ^ 64 - 1) = some 0x43f0000000000000 ∧
     ∀ (q : Query) (flag : Bool) (c : Pick),
       G.dec .binary32 q.bits32 = Ref.decode .binary32 q.bits32 ∧
       G.dec .binary64 q.bits64 = Ref.decode .binary64 q.bits64 ∧
@@ -4621,24 +4672,26 @@ theorem agrees_sound (h : G.agrees = true) :
       G.fromInt .binary32 (signedOfBits 32 q.bits32) =
         Ref.fromInteger .binary32 (signedOfBits 32 q.bits32) ∧
       G.fromInt .binary64 (signedOfBits 32 q.bits32) =
-        Ref.fromInteger .binary64 (signedOfBits 32 q.bits32) := by
+        Ref.fromInteger .binary64 (signedOfBits 32 q.bits32) ∧
+      G.fromInt .binary64 (Int.ofNat q.bits64) =
+        Ref.fromInteger .binary64 (Int.ofNat q.bits64) := by
   simp only [agrees, Bool.and_eq_true, decide_eq_true_eq] at h
-  obtain ⟨⟨⟨⟨h32, h64⟩, ho32⟩, ho64⟩, hall⟩ := h
-  refine ⟨h32, h64, ho32, ho64, fun q flag c => ?_⟩
+  obtain ⟨⟨⟨⟨⟨⟨⟨⟨h32, h64⟩, ho32⟩, ho64⟩, hinf⟩, ht1⟩, ht3⟩, hmax⟩, hall⟩ := h
+  refine ⟨h32, h64, ho32, ho64, hinf, ht1, ht3, hmax, fun q flag c => ?_⟩
   have hq := List.all_eq_true.mp hall q (by cases q <;> decide)
   simp only [agreesAt, Bool.and_eq_true, decide_eq_true_eq] at hq
-  obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨hd32, hd64⟩, hc1⟩, hc2⟩, ht1⟩, hf1⟩, ht2⟩, hf2⟩,
-    hat1⟩, haf1⟩, hat2⟩, haf2⟩, hti1⟩, hti2⟩, hfi1⟩, hfi2⟩ := hq
+  obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨hd32, hd64⟩, hc1⟩, hc2⟩, hct1⟩, hcf1⟩, hct2⟩, hcf2⟩,
+    hat1⟩, haf1⟩, hat2⟩, haf2⟩, hti1⟩, hti2⟩, hfi1⟩, hfi2⟩, hfu64⟩ := hq
   have hcMem : c ∈ allPicks := by cases c <;> decide
   cases flag
-  · exact ⟨hd32, hd64, hc1, hc2, hf1, hf2,
+  · exact ⟨hd32, hd64, hc1, hc2, hcf1, hcf2,
       of_decide_eq_true (List.all_eq_true.mp haf1 c hcMem),
       of_decide_eq_true (List.all_eq_true.mp haf2 c hcMem),
-      hti1, hti2, hfi1, hfi2⟩
-  · exact ⟨hd32, hd64, hc1, hc2, ht1, ht2,
+      hti1, hti2, hfi1, hfi2, hfu64⟩
+  · exact ⟨hd32, hd64, hc1, hc2, hct1, hct2,
       of_decide_eq_true (List.all_eq_true.mp hat1 c hcMem),
       of_decide_eq_true (List.all_eq_true.mp hat2 c hcMem),
-      hti1, hti2, hfi1, hfi2⟩
+      hti1, hti2, hfi1, hfi2, hfu64⟩
 
 end Engine
 
@@ -7055,6 +7108,124 @@ theorem fx_liftFrame_end_to_end :
         (LiftFrame_congr_pruned_borrows fx_sameAlloc
           fx_writeNoop_conflictSets.1 0 none 0 rfl fx_returnFrame_pruned)))
 
+/-- Body performing a projected field write `_0.1 = (); return`. -/
+def cellProjWriteBody : CapturedMir :=
+  { emptyFnAssignUnit with
+    defPath := "Anneal::TbPruningTests::cell_proj_write"
+    basicBlocks := [
+      { statements := [
+          { kind := .assign { local_ := 0, projection := [fld 1] }
+              (.use (.constant { ty := emptyFnUnitTy, val := .zeroSized }))
+            span := "proj_write" }]
+        terminator := { kind := .return_, span := "ret" }
+        isCleanup := false }] }
+
+/-- End-to-end on the trusted machine for a projected field write on the
+cell-aware fixture: `stepMirFn` runs `invalidateConflictingBorrowsAtProj`,
+and `LiftFrame_congr_pruned_borrows_proj_rootNoop` transports the return
+frame proved at the explicit pruned forest (where strict invariants fail). -/
+theorem cell_projWrite_liftFrame_end_to_end :
+    LiftFrame cellProjWriteBody 0 0 [.init pairVal] (memWith cellBorrows [8])
+      (fun v => v = pairVal) 2 :=
+  liftState_iff_liftFrame.mp
+    (LiftState.of_step
+      (s' := PureState.toMachineState
+        { bb := 0, stmtIdx := 1, env := [.init pairVal] }
+        (memWith
+          (invalidateConflictingBorrowsAtProj cellBorrows 0 none [fld 1] 0 0
+            0) [8]))
+      rfl
+      (liftState_iff_liftFrame.mpr
+        (LiftFrame_congr_pruned_borrows_proj_rootNoop cell_sameAlloc
+          cell_rootNoop.1 0 none [fld 1] 0 0 0 rfl
+          (liftState_iff_liftFrame.mp (LiftState.of_retNormal rfl rfl)))))
+
+/-- Body performing a pointer-dereference write `*_1 = (); return`. -/
+def cellPtrWriteBody : CapturedMir :=
+  { emptyFnAssignUnit with
+    defPath := "Anneal::TbPruningTests::cell_ptr_write"
+    localDecls := [
+      { mutability := .mut, ty := emptyFnUnitTy, debugName := some "_0" },
+      { mutability := .not
+        ty := { kind := .ref .mut (.tuple []), layoutIdx := 0 }
+        debugName := some "_1" }]
+    basicBlocks := [
+      { statements := [
+          { kind := .assign { local_ := 1, projection := [.deref] }
+              (.use (.constant { ty := emptyFnUnitTy, val := .zeroSized }))
+            span := "ptr_write" }]
+        terminator := { kind := .return_, span := "ret" }
+        isCleanup := false }] }
+
+/-- End-to-end on the trusted machine for a tree-resolved pointer write
+through tag `91` (the `.unique` child of `.cell` root `90`): `stepMirFn` runs
+`invalidateTreeBorrowsAtProj`, and
+`LiftFrame_congr_pruned_borrows_tree_rootNoop` transports the return frame
+proved at the explicit pruned forest (tag `91` stays `.unique`). -/
+theorem cell_ptrWrite_liftFrame_end_to_end :
+    LiftFrame cellPtrWriteBody 0 0
+      [.init .unit, .init (.ptr { allocId := 91, offsetBytes := 0 } 8)]
+      (memWith cellBorrows [8]) (fun v => v = .unit) 2 :=
+  liftState_iff_liftFrame.mp
+    (LiftState.of_step
+      (s' := PureState.toMachineState
+        { bb := 0, stmtIdx := 1,
+          env :=
+            [.init .unit,
+              .init (.ptr { allocId := 91, offsetBytes := 0 } 8)] }
+        (memWith
+          (invalidateTreeBorrowsAtProj cellBorrows cellBorrows 0 (some 91) []
+            0 0 0) [8]))
+      rfl
+      (liftState_iff_liftFrame.mpr
+        (LiftFrame_congr_pruned_borrows_tree_rootNoop cell_sameAlloc
+          cell_rootNoop.1 0 (some 91) [] 0 0 0 rfl
+          (liftState_iff_liftFrame.mp (LiftState.of_retNormal rfl rfl)))))
+
+/-- Body performing a pointer-dereference read `_1 = copy (*_2); return`. -/
+def cellReadBody : CapturedMir :=
+  { emptyFnAssignUnit with
+    defPath := "Anneal::TbPruningTests::cell_read"
+    localDecls := [
+      { mutability := .mut, ty := emptyFnUnitTy, debugName := some "_0" },
+      { mutability := .mut, ty := emptyFnUnitTy, debugName := some "_1" },
+      { mutability := .not
+        ty := { kind := .ref .not (.tuple []), layoutIdx := 0 }
+        debugName := some "_2" }]
+    basicBlocks := [
+      { statements := [
+          { kind := .assign { local_ := 1, projection := [] }
+              (.use (.copy { local_ := 2, projection := [.deref] }))
+            span := "ptr_read" }]
+        terminator := { kind := .return_, span := "ret" }
+        isCleanup := false }] }
+
+/-- End-to-end on the trusted machine for a dereference read through tag `91`
+on the cell-aware fixture: `stepMirFn` runs `freezeTreeBorrowsOnReadAtProj`
+(and writing the unborrowed local `_1` leaves the table unchanged), and
+`LiftFrame_congr_pruned_borrows_read_rootNoop` transports the return frame
+proved at the explicit pruned forest (freezing only foreign live root `95`). -/
+theorem cell_read_liftFrame_end_to_end :
+    LiftFrame cellReadBody 0 0
+      [.init .unit, .uninit,
+        .init (.ptr { allocId := 91, offsetBytes := 0 } 8)]
+      (memWith cellBorrows [8]) (fun v => v = .unit) 2 :=
+  liftState_iff_liftFrame.mp
+    (LiftState.of_step
+      (s' := PureState.toMachineState
+        { bb := 0, stmtIdx := 1,
+          env :=
+            [.init .unit, .init .unit,
+              .init (.ptr { allocId := 91, offsetBytes := 0 } 8)] }
+        (memWith
+          (freezeTreeBorrowsOnReadAtProj cellBorrows cellBorrows 0 (some 91)
+            [] 0 0 [8] 0) [8]))
+      rfl
+      (liftState_iff_liftFrame.mpr
+        (LiftFrame_congr_pruned_borrows_read_rootNoop cell_sameAlloc
+          cell_rootNoop.2 0 (some 91) [] 0 0 0 rfl
+          (liftState_iff_liftFrame.mp (LiftState.of_retNormal rfl rfl)))))
+
 /-! ### `MirLiftCore` integration: `LiftFrame` congruences for any frame
 
 For an arbitrary body, frame, postcondition, and fuel: a frame at a memory
@@ -8775,6 +8946,94 @@ theorem mutFatRef_retag_step_and_frozen_ub (n : Nat) :
       (locals' := [.uninit, .init protSliceVal])
       rfl (Or.inl rfl) rfl rfl rfl rfl rfl
   exact ⟨(h .unique).1 _ rfl, rfl, (h .frozen).2.1 rfl⟩
+
+/-- **Untracked empty mutable slices (`&mut []`) are rejected**, contrasting
+with `emptySlice_retag_step` for `&[]`: a dangling `&mut []` at any non-null
+address `a + 1` is undefined behavior in both `prepFnEntryRetagAny` and the
+trusted `stepMirFn`. -/
+theorem danglingEmptyMutSlice_retag_ub (a : Nat) :
+    let s : MachineState :=
+      { frame :=
+          { blockIdx := 0, stmtIdx := 0
+            locals := [.uninit, .init (danglingEmptySlice a)] }
+        memory := { activeCallee := some mutSliceCallee, nextProtector := 10 } }
+    (prepFnEntryRetagAny mutSliceCallee 1).run s =
+        .error (FailReq.fail .ub) s ∧
+      stepMirFn mutSliceCallee s = MirStepNode.fail .ub := by
+  intro s
+  exact ⟨rfl, rfl⟩
+
+/-- **Disabled shared fat slices are rejected.** Retagging a `&[u8]` whose
+borrow-table entry is `.disabled` is undefined behavior in both
+`prepFnEntryRetagAny` and the trusted `stepMirFn`, for every protector
+counter. -/
+theorem disabledSharedFatSlice_retag_ub (n : Nat) :
+    let s : MachineState :=
+      { frame :=
+          { blockIdx := 0, stmtIdx := 0
+            locals := [.uninit, .init protSliceVal] }
+        memory :=
+          { borrows := [callerBorrow 1 .disabled]
+            activeCallee := some protCallee
+            nextProtector := n } }
+    (prepFnEntryRetagAny protCallee 1).run s =
+        .error (FailReq.fail .ub) s ∧
+      stepMirFn protCallee s = MirStepNode.fail .ub := by
+  intro s
+  exact ⟨rfl, rfl⟩
+
+/-- A callee taking `_1 : &!` (reference to the uninhabited never type). -/
+def uninhabitedRefCallee : CapturedMir :=
+  { thinRefCallee with
+    defPath := "Anneal::FrameWpTests::uninhabited_ref_callee"
+    localDecls := [
+      { mutability := .mut, ty := emptyFnUnitTy, debugName := some "_0" },
+      { mutability := .not
+        ty := { kind := .ref .not .never, layoutIdx := 0 }
+        debugName := some "_1" }] }
+
+/-- **Uninhabited pointees are rejected even with a live borrow.** Retagging
+`_1 : &!` whose borrow `1` is `.unique` is undefined behavior in both
+`prepFnEntryRetagAny` and the trusted `stepMirFn`, for all counters. -/
+theorem uninhabitedRef_retag_ub (t n : Nat) :
+    let s : MachineState :=
+      { frame :=
+          { blockIdx := 0, stmtIdx := 0
+            locals := [.uninit, .init thinRefParentVal] }
+        memory :=
+          { borrows := [callerBorrow 1 .unique]
+            nextTag := t
+            activeCallee := some uninhabitedRefCallee
+            nextProtector := n } }
+    (prepFnEntryRetagAny uninhabitedRefCallee 1).run s =
+        .error (FailReq.fail .ub) s ∧
+      stepMirFn uninhabitedRefCallee s = MirStepNode.fail .ub := by
+  intro s
+  exact ⟨rfl, rfl⟩
+
+/-- **Stage 3 fails closed on a global-allocation fat slice.** A `&[u8]`
+whose pointer targets an untracked `globals` allocation (`lookupBorrow =
+none`, `lookupGlobalAlloc = some _`) is rejected by `prepFnEntryRetagAny`
+with `.unsupported` (fail-closed boundary). -/
+theorem globalAllocFatSlice_retag_fails_closed (n : Nat) :
+    let gAlloc : CapturedAllocation :=
+      { allocId := 1
+        bytes := [some 1, some 2, some 3, some 4]
+        relocations := []
+        align := { bytes := 1 }
+        mutability := .not }
+    let s : MachineState :=
+      { frame :=
+          { blockIdx := 0, stmtIdx := 0
+            locals := [.uninit, .init protSliceVal] }
+        memory :=
+          { globals := [gAlloc]
+            activeCallee := some protCallee
+            nextProtector := n } }
+    (prepFnEntryRetagAny protCallee 1).run s =
+      .error (FailReq.fail .unsupported) s := by
+  intro gAlloc s
+  rfl
 
 /-! ### Stage 3: multi-parameter retag pipelines -/
 
@@ -11328,7 +11587,7 @@ run_cmd do
   ]
   let baseEnv ← liftCoreM <| Lean.importModules imports {} 0
   let opts : Options := ({} : Options).setBool `Elab.async false
-  let act : CoreM (Nat × Nat × Nat × Nat) := do
+  let act : CoreM (Nat × Nat × Nat × Nat × Array Name) := do
     -- 1. Replay the closure of the surface declarations used below.
     let wsWith : Array Name :=
       #[`safe_tooBig_fault_equiv_with, `lm_safe_tooBig_faults_with,
@@ -11885,7 +12144,8 @@ run_cmd do
     let _ ← addDef fcRunCastName fcRunCast
     added := added.push fcRunCastName
     let fcRunCastC := mkConst fcRunCastName
-    let mkFcAuth (invertFlag : Bool) : MetaM Expr := do
+    let mkFcAuth (invertFlag : Bool) (collideDenote : Bool := false) :
+        MetaM Expr := do
       let boolTy := mkConst ``Bool
       let flagOf (f : Expr) : MetaM Expr :=
         if invertFlag then mkAppM ``Bool.not #[f] else pure f
@@ -11912,10 +12172,16 @@ run_cmd do
       let carrier64Obs ← simpleObs 23 13 8 `Transmute
       let toU64Obs ← simpleObs 32 23 8 `FloatToInt
       let fromU64Obs ← simpleObs 23 32 8 `IntToFloat
+      let (r32, r64) ←
+        if collideDenote then do
+          let c0 ← withLocalDeclD `_n natTy fun n =>
+            mkLambdaFVars #[n] (mkApp fcRet32 (mkNatLit 0))
+          pure (c0, c0)
+        else pure (fcRet32, fcRet64)
       mkAppM (ns ++ `FloatCast.authorityOf)
         #[fcObsTy, decFcObs, widenObs, narrowObs, toIntObs, fromIntObs,
           toU64Obs, fromU64Obs, carrier32Obs, carrier64Obs, fcUninitObs,
-          fcRet32, fcRet64, fcUbObs]
+          r32, r64, fcUbObs]
     let fcAuth ← MetaM.run' <| mkFcAuth false
     let fcMiriName := ns ++ `CrossRoot.FloatCast.miri
     let _ ← addDef fcMiriName fcAuth
@@ -11958,8 +12224,35 @@ run_cmd do
         ← mkEq f128Call expected, ← mkEqRefl expected)
     addThm (ns ++ `CrossRoot.FloatCast.f16_gateLM_tight) f16Ty f16Pf
     addThm (ns ++ `CrossRoot.FloatCast.f128_gateLM_tight) f128Ty f128Pf
+    -- Unsigned 64-bit boundary casts through vendored `Cast.cast`:
+    -- `+∞ ↦ u64::MAX`, halfway ties `2^53 + 1 ↦ 2^53` and `2^53 + 3 ↦
+    -- 2^53 + 4`, and `u64::MAX ↦ 2^64`.
+    let (u64BndTy, u64BndPf) ← MetaM.run' do
+      let u64Cast (src dst : Nat) (k : Name) (bits exp : Nat) :
+          MetaM (Expr × Expr) := do
+        let call := mkAppN fcRunCastC
+          #[mkConst ``Bool.false, mkNatLit 0, mkNatLit src, mkNatLit dst,
+            mkConst (`Miri.MIR.CastKind ++ k), mkNatLit bits, mkNatLit 8]
+        let rhs := mkApp fcRet64 (mkNatLit exp)
+        return (← mkEq call rhs, ← mkEqRefl rhs)
+      let (t1, p1) ← u64Cast 32 23 `FloatToInt 0x7ff0000000000000
+        0xffffffffffffffff
+      let (t2, p2) ← u64Cast 23 32 `IntToFloat (2 ^ 53 + 1)
+        0x4340000000000000
+      let (t3, p3) ← u64Cast 23 32 `IntToFloat (2 ^ 53 + 3)
+        0x4340000000000002
+      let (t4, p4) ← u64Cast 23 32 `IntToFloat (2 ^ 64 - 1)
+        0x43f0000000000000
+      let t34 := mkApp2 (mkConst ``And) t3 t4
+      let p34 := mkApp4 (mkConst ``And.intro) t3 t4 p3 p4
+      let t234 := mkApp2 (mkConst ``And) t2 t34
+      let p234 := mkApp4 (mkConst ``And.intro) t2 t34 p2 p34
+      return (mkApp2 (mkConst ``And) t1 t234,
+        mkApp4 (mkConst ``And.intro) t1 t234 p1 p234)
+    let u64BndName := ns ++ `CrossRoot.FloatCast.u64_overflow_and_tie_cast
+    addThm u64BndName u64BndTy u64BndPf
     added := added ++ #[ns ++ `CrossRoot.FloatCast.f16_gateLM_tight,
-      ns ++ `CrossRoot.FloatCast.f128_gateLM_tight]
+      ns ++ `CrossRoot.FloatCast.f128_gateLM_tight, u64BndName]
     -- 3b. The vendored float engine agrees with the reference specification
     -- `FloatCast.Ref` primitive by primitive (`decode`, `convert`,
     -- `nanChoices`, `FloatOps.adjustNaN`, `toInteger`, `fromInteger`), and
@@ -12298,6 +12591,11 @@ run_cmd do
       mkAppOptM (ns ++ `Corpus.ObsAuthority.denoteConsistent)
         #[none, none, some (mkConst ``instDecidableEqNat), some collidingAuth]
     let forgedFcAuth ← MetaM.run' <| mkFcAuth true
+    let collidingFcAuth ← MetaM.run' <| mkFcAuth false true
+    let collidingFcDenote ← MetaM.run' <|
+      mkAppOptM (ns ++ `Corpus.ObsAuthority.denoteConsistent)
+        #[none, none, some (mkConst ``instDecidableEqNat),
+          some collidingFcAuth]
     let forgedEngine ← MetaM.run' <| mkEngine 1
     let forgedDecodeEngine ← MetaM.run' <| mkEngine 2
     let forgedAdjustEngine ← MetaM.run' <| mkEngine 3
@@ -12311,6 +12609,13 @@ run_cmd do
           mkConst `Miri.MIR.CastKind.FloatToFloat, mkNatLit 0x3e00,
           mkNatLit 2]
       return (← mkEq f16Call bad, ← mkEqRefl bad)
+    let (forgedTieTy, forgedTiePf) ← MetaM.run' do
+      let bad := mkApp fcRet64 (mkNatLit 0x4340000000000001)
+      let tieCall := mkAppN fcRunCastC
+        #[mkConst ``Bool.false, mkNatLit 0, mkNatLit 23, mkNatLit 32,
+          mkConst `Miri.MIR.CastKind.IntToFloat, mkNatLit (2 ^ 53 + 1),
+          mkNatLit 8]
+      return (← mkEq tieCall bad, ← mkEqRefl bad)
     let forged : List (String × Declaration) :=
       [("ill-typed theorem", .thmDecl
           { name := ns ++ `CrossRoot.forged.zeroEqOne
@@ -12410,15 +12715,29 @@ run_cmd do
           { name := ns ++ `CrossRoot.forged.wrongTyWidth
             levelParams := []
             type := forgedWidthTy
-            value := forgedWidthPf })]
+            value := forgedWidthPf }),
+       ("colliding FloatCast denote table", .thmDecl
+          { name := ns ++ `CrossRoot.forged.collidingFcDenote
+            levelParams := []
+            type := eqTrue collidingFcDenote
+            value := reflTrue }),
+       ("wrong u64 tie-to-even Cast.cast result", .thmDecl
+          { name := ns ++ `CrossRoot.forged.wrongU64Tie
+            levelParams := []
+            type := forgedTieTy
+            value := forgedTiePf })]
     let mut rejected : Nat := 0
     for (what, d) in forged do
       unless ← rejects d do
         throwError "cross-root: the kernel accepted a forged {what}"
       rejected := rejected + 1
     -- 7. Inspection of every cross-root declaration: kernel-checked
-    -- definitions and theorems only, with standard axioms only.
+    -- definitions and theorems only, with standard axioms only (plus
+    -- self-tests of the cross-root axiom checker).
     let env ← getEnv
+    let isStdAx (a : Name) : Bool :=
+      a == ``propext || a == ``Classical.choice || a == ``Quot.sound
+    let mut crAxioms : NameSet := {}
     for n in added do
       let some ci := env.find? n
         | throwError "cross-root: {n} is missing"
@@ -12430,30 +12749,46 @@ run_cmd do
           throwError "cross-root: {n} is trivial"
       | _ => throwError "cross-root: {n} is not a definition or theorem"
       for a in ← collectAxioms n do
-        unless a == ``propext || a == ``Classical.choice ||
-            a == ``Quot.sound do
+        unless isStdAx a do
           throwError "cross-root: {n} depends on the axiom {a}"
-    -- The authorities (and `runCast` directly, independently of `Step.step`)
-    -- genuinely run the vendored interpreter and `Miri.Interpreter.Cast.cast`.
-    for (auth, needed) in
-        [(miriName,
-          [mi ++ `Step.step, mi ++ `Cast.cast,
-            lm ++ `annealStepHooksWideSlice, lw ++ `wideSlicePipelineMiri4,
-            lw ++ `wideSlicePipelineInitMiri, lw ++ `wideSlicePipelineHooks]),
-         (fcRunCastName,
-          [mi ++ `Cast.cast, mi ++ `Cast.castFromIntLike,
-            mi ++ `FloatOps.readBits, mi ++ `FloatOps.adjustNaN,
-            mi ++ `FloatBits.nanChoices, mi ++ `FloatBits.preferredNaN,
-            mi ++ `FloatBits.convert, mi ++ `FloatBits.decode,
-            mi ++ `FloatBits.toInteger, mi ++ `FloatBits.fromInteger]),
-         (fcMiriName,
-          [fcRunCastName, mi ++ `Cast.cast, mi ++ `Step.step]),
-         (engName,
-          [mi ++ `FloatBits.nanChoices, mi ++ `FloatBits.preferredNaN,
-            mi ++ `FloatBits.convert, mi ++ `FloatBits.decode,
-            mi ++ `FloatBits.toInteger, mi ++ `FloatBits.fromInteger,
-            mi ++ `FloatOps.adjustNaN])]
-        do
+        crAxioms := crAxioms.insert a
+    unless !(← collectAxioms ``sorryAx).all isStdAx do
+      throwError "cross-root self-test: `sorryAx` was not detected"
+    unless !(← collectAxioms ``Lean.ofReduceBool).all isStdAx do
+      throwError "cross-root self-test: `Lean.ofReduceBool` was not detected"
+    -- The authorities, `runCast`, `engine`, and every one of the 12
+    -- cross-root bundles genuinely reach BOTH MiniRust and vendored Miri.
+    let mut reachChecks : List (Name × List Name) :=
+      [(miriName,
+        [mi ++ `Step.step, mi ++ `Cast.cast,
+          lm ++ `annealStepHooksWideSlice, lw ++ `wideSlicePipelineMiri4,
+          lw ++ `wideSlicePipelineInitMiri, lw ++ `wideSlicePipelineHooks]),
+       (fcRunCastName,
+        [mi ++ `Cast.cast, mi ++ `Cast.castFromIntLike,
+          mi ++ `FloatOps.readBits, mi ++ `FloatOps.adjustNaN,
+          mi ++ `FloatBits.nanChoices, mi ++ `FloatBits.preferredNaN,
+          mi ++ `FloatBits.convert, mi ++ `FloatBits.decode,
+          mi ++ `FloatBits.toInteger, mi ++ `FloatBits.fromInteger]),
+       (fcMiriName,
+        [fcRunCastName, mi ++ `Cast.cast, mi ++ `Step.step]),
+       (engName,
+        [mi ++ `FloatBits.nanChoices, mi ++ `FloatBits.preferredNaN,
+          mi ++ `FloatBits.convert, mi ++ `FloatBits.decode,
+          mi ++ `FloatBits.toInteger, mi ++ `FloatBits.fromInteger,
+          mi ++ `FloatOps.adjustNaN])]
+    for d in wsDefs do
+      reachChecks := reachChecks ++
+        [(ns ++ `CrossRoot.WideSlice ++ d,
+          [`MiniRustSpec.Interp.stepsTB, mi ++ `Step.step, mi ++ `Cast.cast,
+            lw ++ `wideSlicePipelineMiri4])]
+    for d in fcDefs do
+      reachChecks := reachChecks ++
+        [(ns ++ `CrossRoot.FloatCast ++ d,
+          [`MiniRustSpec.Interp.transmute,
+            `MiniRustSpec.Correspondence.translateRvalue, mi ++ `Cast.cast,
+            mi ++ `FloatOps.adjustNaN, mi ++ `FloatBits.nanChoices,
+            mi ++ `Step.step])]
+    for (auth, needed) in reachChecks do
       let mut reach : NameSet := {}
       let mut todo : Array Name := #[auth]
       while !todo.isEmpty do
@@ -12467,31 +12802,32 @@ run_cmd do
       for n in needed do
         unless reach.contains n do
           throwError "cross-root: {auth} does not reach {n}"
-    return (replayed, added.size, bundleCount, rejected)
+    return (replayed, added.size, bundleCount, rejected, crAxioms.toArray)
   let ctx : Core.Context :=
     { fileName := "<cross-root>"
       fileMap := default
       options := opts
       maxHeartbeats := 0 }
-  let ((replayed, added, bundles, rejected), _) ←
+  let ((replayed, added, bundles, rejected, crAxioms), _) ←
     liftCoreM <| (act.toIO ctx { env := baseEnv })
-  unless replayed ≥ 400 && added ≥ 95 && bundles = 12 && rejected = 16 do
+  unless replayed ≥ 400 && added ≥ 100 && bundles = 12 && rejected = 18 do
     throwError "cross-root: unexpected counts \
       (replayed={replayed}, added={added}, bundles={bundles}, \
       rejected={rejected})"
   logInfo m!"cross-root kernel bridge: replayed {replayed} surface \
     declarations, added {added} cross-root declarations ({bundles} \
-    bundles), rejected {rejected} forged declarations"
+    bundles), rejected {rejected} forged declarations, axioms {crAxioms}"
 
 /-! ## H. Constructive-axiom and transitive-reachability audit
 
 Fail-closed audit of both modules under test and of every declaration of
-this file: only kernel-checked safe definitions, theorems, and inductive
-types (nothing opaque, postulated, or outside the safe fragment), no
-trivial `True` theorems, no stray declarations outside the test namespace,
-axiom closures within `[propext, Quot.sound]`, the declaration-count floors
-of both modules, and transitive reachability of every public theorem of
-both modules from the declarations of this file, with no exemption list. -/
+this file (public, private, and compiler-generated): only kernel-checked safe
+definitions, theorems, and inductive types (nothing opaque, postulated, or
+outside the safe fragment), no trivial `True` theorems, no stray declarations
+outside the test namespace, axiom closures within `[propext, Quot.sound]`,
+the declaration-count floors of both modules, and transitive reachability of
+every public theorem of both modules from the declarations of this file, with
+no exemption list. -/
 
 open Lean Elab Command in
 run_cmd do
@@ -12530,6 +12866,11 @@ run_cmd do
     let leaf := match n with | .str _ s => s | _ => ""
     (match ci with | .thmInfo _ => true | _ => false) &&
     (leaf.startsWith "eq_" || leaf == "eq_def")
+  -- Private declaration belonging to `ns`.
+  let isPrivateIn (ns : Name) (n : Name) : Bool :=
+    match Lean.privateToUserName? n with
+    | some u => ns.isPrefixOf u
+    | none => false
   -- Transitive closure of the used-constant relation.
   let closure (start : Array Name) : NameSet := Id.run do
     let mut seen : NameSet := {}
@@ -12543,11 +12884,12 @@ run_cmd do
         for d in ci.getUsedConstantsAsSet do
           if !seen.contains d then stack := stack.push d
     return seen
-  -- 1. Every declaration added by this file (`env.constants.map₂`).
+  -- 1. Every declaration added by this file (`env.constants.map₂`), with
+  -- zero exemptions for `_private` or internal compiler helpers.
   let mut roots : Array Name := #[]
-  let mut lazyEqs : Array Name := #[]
+  let mut auxDecls : Array Name := #[]
   for (n, ci) in env.constants.map₂.toList do
-    if testNs.isPrefixOf n then
+    if testNs.isPrefixOf n || isPrivateIn testNs n then
       if rejected ci then
         throwError "audit: test declaration {n} is not a safe definition"
       if isTrivialThm ci then
@@ -12560,17 +12902,16 @@ run_cmd do
         throwError "audit: stray top-level declaration {n} outside {testNs}"
       if rejected ci then
         throwError "audit: lazy equational lemma {n} is not safe"
-      lazyEqs := lazyEqs.push n
+      auxDecls := auxDecls.push n
     else
-      -- Even internal declarations outside `testNs` (except Lean's transient
-      -- `_eval` / `_private` command runners) must stay safe.
-      let s := n.toString
-      unless s.startsWith "_eval" || s.startsWith "_private" do
-        if rejected ci then
-          throwError "audit: non-safe auxiliary declaration {n}"
+      if rejected ci then
+        throwError "audit: non-safe internal declaration {n}"
+      if isTrivialThm ci then
+        throwError "audit: trivial internal theorem {n}"
+      auxDecls := auxDecls.push n
   unless roots.size ≥ 1500 do
     throwError "audit: only {roots.size} test declarations"
-  let testAxioms ← scanAxioms (roots ++ lazyEqs)
+  let testAxioms ← scanAxioms (roots ++ auxDecls)
   unless constructive testAxioms do
     throwError "audit: test declarations use the axioms {testAxioms}"
   let reached := closure roots
@@ -12623,6 +12964,10 @@ run_cmd do
     unless !testNs.isPrefixOf ``Nat.add && !isLazyEq ``Nat.add ci do
       throwError "audit self-test: stray declaration was not detected"
   | none => throwError "audit self-test: `Nat.add` is missing"
+  let privOk := Lean.mkPrivateName env (testNs ++ `dummy)
+  let privBad := Lean.mkPrivateName env (`Other ++ `dummy)
+  unless isPrivateIn testNs privOk && !isPrivateIn testNs privBad do
+    throwError "audit self-test: private namespace classifier failed"
   unless (closure #[]).isEmpty do
     throwError "audit self-test: the empty closure is not empty"
   let bundleOnly := closure <| roots.filter fun n =>
