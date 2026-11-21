@@ -906,32 +906,105 @@ impl ItreeOleanFootprint {
     }
 }
 
+/// Per-module `.olean`/`.ilean` index produced by
+/// [`measure_itree_olean_footprint_index`], allowing each Stage 1 / Stage 2
+/// worker slice to reserve the exact byte footprint of the shared libraries
+/// plus only the specific staged `Mir.*` modules that slice actually imports.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ItreeOleanFootprintIndex {
+    /// Aggregate shared vs. staged `.olean`/`.ilean` totals.
+    pub footprint: ItreeOleanFootprint,
+    /// Exact on-disk byte sizes (`.olean` + `.olean.server` + `.olean.private`
+    /// + `.ilean`) of each built staged module under `Mir`, keyed by Lean
+    /// module name (e.g. `"Mir.ItreeDiffStaged.b0_c0__kernel_step"`).
+    pub staged_module_bytes: BTreeMap<String, u64>,
+}
+
+impl ItreeOleanFootprintIndex {
+    /// Returns the exact KiB (rounded up) mapped by a worker that imports
+    /// `modules` (plus `Mir.Common` if built and any `Mir.*` module is
+    /// requested). When every requested `Mir.*` module is present in
+    /// `staged_module_bytes`, avoids both proportional-share guesswork across
+    /// uneven candidate sizes and overcharging smaller split/fallback slices;
+    /// otherwise falls back conservatively to the max of matched bytes and
+    /// [`ItreeOleanFootprint::worker_kib`].
+    pub fn worker_kib_for_modules<'a>(
+        &self,
+        modules: impl IntoIterator<Item = &'a str>,
+        staged_fns: usize,
+        slice_fns: usize,
+    ) -> u64 {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut staged_requested = 0usize;
+        let mut staged_missing = 0usize;
+        let mut matched_bytes = 0u64;
+        for m in modules {
+            let is_staged = m == ITREE_STAGED_MIR_LIB
+                || m.strip_prefix(ITREE_STAGED_MIR_LIB)
+                    .is_some_and(|rest| rest.starts_with('.'));
+            if !is_staged || !seen.insert(m) {
+                continue;
+            }
+            staged_requested += 1;
+            match self.staged_module_bytes.get(m) {
+                Some(&bytes) => matched_bytes = matched_bytes.saturating_add(bytes),
+                None => staged_missing += 1,
+            }
+        }
+        if staged_requested > 0
+            && let Some(&common_bytes) = self.staged_module_bytes.get("Mir.Common")
+            && seen.insert("Mir.Common")
+        {
+            matched_bytes = matched_bytes.saturating_add(common_bytes);
+        }
+        let exact_kib = self
+            .footprint
+            .shared_bytes
+            .saturating_add(matched_bytes)
+            .div_ceil(1024);
+        if staged_requested > 0 && staged_missing == 0 {
+            exact_kib
+        } else {
+            exact_kib.max(self.footprint.worker_kib(staged_fns, slice_fns))
+        }
+    }
+}
+
+fn lean_artifact_module_stem(file_name: &str) -> Option<&str> {
+    file_name
+        .strip_suffix(".olean.server")
+        .or_else(|| file_name.strip_suffix(".olean.private"))
+        .or_else(|| file_name.strip_suffix(".olean"))
+        .or_else(|| file_name.strip_suffix(".ilean"))
+}
+
 /// Measures the `.olean` / `.ilean` artifacts under
-/// `<anneal_dir>/.lake/build/lib/lean` (returning `None` if the directory does
-/// not exist or has no matching artifacts, so callers fall back to
-/// [`DEFAULT_ITREE_OLEAN_RESERVE_KIB`]).
+/// `<anneal_dir>/.lake/build/lib/lean` and indexes staged `Mir.*` module byte
+/// sizes (returning `None` if the directory does not exist or has no matching
+/// artifacts, so callers fall back to [`DEFAULT_ITREE_OLEAN_RESERVE_KIB`]).
 ///
 /// A symlinked artifact *file* counts with the size of its target (Lean maps a
 /// link into a shared artifact cache exactly like a regular file, so skipping
 /// it would under-reserve), while symlinked *directories* are never traversed
 /// (no cycles, and nothing outside the build tree is walked).
-pub fn measure_itree_olean_footprint(anneal_dir: &Path) -> Option<ItreeOleanFootprint> {
+pub fn measure_itree_olean_footprint_index(anneal_dir: &Path) -> Option<ItreeOleanFootprintIndex> {
     /// Where a directory sits relative to the library root.
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[derive(Clone, PartialEq, Eq)]
     enum Scope {
         /// `.lake/build/lib/lean` itself.
         Root,
         /// Inside a library every worker imports whole.
         Shared,
-        /// Inside the staged per-candidate library.
-        Staged,
+        /// Inside the staged per-candidate library, carrying its Lean module
+        /// prefix (`"Mir"`, `"Mir.ItreeDiffStaged"`, ...) when valid UTF-8.
+        Staged(Option<String>),
     }
 
     let lib_root = anneal_dir.join(".lake/build/lib/lean");
     if !lib_root.is_dir() {
         return None;
     }
-    let mut footprint = ItreeOleanFootprint::default();
+    let mut index = ItreeOleanFootprintIndex::default();
     let mut stack = vec![(lib_root, Scope::Root)];
     while let Some((dir, scope)) = stack.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
@@ -946,36 +1019,88 @@ pub fn measure_itree_olean_footprint(anneal_dir: &Path) -> Option<ItreeOleanFoot
             let path = entry.path();
             let name = entry.file_name();
             if ft.is_dir() {
-                let child_scope = match scope {
-                    Scope::Root if name == ITREE_STAGED_MIR_LIB => Scope::Staged,
+                let child_scope = match &scope {
+                    Scope::Root if name == ITREE_STAGED_MIR_LIB => {
+                        Scope::Staged(Some(ITREE_STAGED_MIR_LIB.to_string()))
+                    }
                     Scope::Root => Scope::Shared,
-                    inherited => inherited,
+                    Scope::Shared => Scope::Shared,
+                    Scope::Staged(prefix) => {
+                        let next = prefix
+                            .as_deref()
+                            .zip(name.to_str())
+                            .map(|(p, seg)| format!("{p}.{seg}"));
+                        Scope::Staged(next)
+                    }
                 };
                 stack.push((path, child_scope));
                 continue;
             }
-            let is_lean_artifact = name.to_str().is_some_and(|s| {
-                s.ends_with(".olean")
-                    || s.ends_with(".olean.server")
-                    || s.ends_with(".olean.private")
-                    || s.ends_with(".ilean")
-            });
+            let Some(stem) = name.to_str().and_then(lean_artifact_module_stem) else {
+                continue;
+            };
             // `fs::metadata` follows a symlinked artifact to its target; a
             // dangling link or a link to a directory contributes nothing.
-            if is_lean_artifact
-                && let Ok(meta) = fs::metadata(&path)
+            if let Ok(meta) = fs::metadata(&path)
                 && meta.is_file()
             {
-                let bytes = if scope == Scope::Staged {
-                    &mut footprint.staged_bytes
-                } else {
-                    &mut footprint.shared_bytes
-                };
-                *bytes = bytes.saturating_add(meta.len());
+                let len = meta.len();
+                match &scope {
+                    Scope::Staged(prefix) => {
+                        index.footprint.staged_bytes =
+                            index.footprint.staged_bytes.saturating_add(len);
+                        if let Some(p) = prefix {
+                            let mod_name = format!("{p}.{stem}");
+                            let slot = index.staged_module_bytes.entry(mod_name).or_insert(0);
+                            *slot = slot.saturating_add(len);
+                        }
+                    }
+                    Scope::Root if stem == ITREE_STAGED_MIR_LIB => {
+                        index.footprint.staged_bytes =
+                            index.footprint.staged_bytes.saturating_add(len);
+                        let slot = index
+                            .staged_module_bytes
+                            .entry(ITREE_STAGED_MIR_LIB.to_string())
+                            .or_insert(0);
+                        *slot = slot.saturating_add(len);
+                    }
+                    Scope::Root | Scope::Shared => {
+                        index.footprint.shared_bytes =
+                            index.footprint.shared_bytes.saturating_add(len);
+                    }
+                }
             }
         }
     }
-    (footprint != ItreeOleanFootprint::default()).then_some(footprint)
+    (index.footprint != ItreeOleanFootprint::default()).then_some(index)
+}
+
+fn itree_slice_olean_footprint_kib(
+    index: Option<&ItreeOleanFootprintIndex>,
+    slice: &[BatchTraceEvalCase],
+    staged_fns: usize,
+    case_to_fn: &BTreeMap<String, String>,
+) -> Option<u64> {
+    let index = index?;
+    let slice_fns = slice
+        .iter()
+        .filter_map(|c| case_to_fn.get(&c.case_ident))
+        .collect::<BTreeSet<_>>()
+        .len()
+        .max(1);
+    let modules = slice.iter().flat_map(|c| {
+        std::iter::once(c.config.root_mir_module.as_str())
+            .chain(c.config.callee_sig_modules.iter().map(String::as_str))
+            .chain(c.config.inlined_callee_modules.iter().map(String::as_str))
+    });
+    Some(index.worker_kib_for_modules(modules, staged_fns, slice_fns))
+}
+
+/// Measures the `.olean` / `.ilean` artifacts under
+/// `<anneal_dir>/.lake/build/lib/lean` (see
+/// [`measure_itree_olean_footprint_index`]).
+pub fn measure_itree_olean_footprint(anneal_dir: &Path) -> Option<ItreeOleanFootprint> {
+    measure_itree_olean_footprint_index(anneal_dir).map(|idx| idx.footprint)
 }
 
 /// Total on-disk size (in KiB, rounded up) of the artifacts measured by
@@ -2017,16 +2142,83 @@ fn run_isolated_lean_stage<C, X, K, F>(
     run_chunk: F,
 ) -> IsolatedLeanStage<X>
 where
-    C: Clone + Sync,
+    C: Clone + Send + Sync,
     X: Send,
-    K: Fn(&C) -> &str,
+    K: Fn(&C) -> &str + Sync,
+    F: Fn(&str, &[C]) -> Result<BTreeMap<String, X>, String> + Sync,
+{
+    run_isolated_lean_stage_impl(
+        stage_label,
+        cases,
+        chunk_size,
+        jobs,
+        case_key,
+        case_to_fn,
+        run_chunk,
+        false,
+    )
+}
+
+/// Stage 2 confirmation variant of [`run_isolated_lean_stage`] that runs
+/// partial-preserving adaptive RSS/memory chunk halving on the outer chunk wave
+/// (never nested inside per-candidate `Fallback` or `Bisect`, preventing
+/// `O((log k)^2)` re-splitting and duplicate watchdog kills on irreducible
+/// `k == 1` singletons).
+///
+/// Confirmed subchunks from a partially split chunk are retained in `results`;
+/// irreducible `k == 1` leaves from a single-worker wave (`wave_width == 1`) or
+/// non-memory failures are recorded directly without re-running them, while
+/// memory-failed `k == 1` leaves from a multi-worker wave (`wave_width > 1`)
+/// get one sequential retry at full worker memory (`concurrency = 1`).
+fn run_isolated_adaptive_confirm_stage<C, X, K, F>(
+    stage_label: &str,
+    cases: &[C],
+    chunk_size: usize,
+    jobs: usize,
+    case_key: K,
+    case_to_fn: &BTreeMap<String, String>,
+    run_chunk: F,
+) -> IsolatedLeanStage<X>
+where
+    C: Clone + Send + Sync,
+    X: Send,
+    K: Fn(&C) -> &str + Sync,
+    F: Fn(&str, &[C]) -> Result<BTreeMap<String, X>, String> + Sync,
+{
+    run_isolated_lean_stage_impl(
+        stage_label,
+        cases,
+        chunk_size,
+        jobs,
+        case_key,
+        case_to_fn,
+        run_chunk,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_isolated_lean_stage_impl<C, X, K, F>(
+    stage_label: &str,
+    cases: &[C],
+    chunk_size: usize,
+    jobs: usize,
+    case_key: K,
+    case_to_fn: &BTreeMap<String, String>,
+    run_chunk: F,
+    adaptive_confirm_chunks: bool,
+) -> IsolatedLeanStage<X>
+where
+    C: Clone + Send + Sync,
+    X: Send,
+    K: Fn(&C) -> &str + Sync,
     F: Fn(&str, &[C]) -> Result<BTreeMap<String, X>, String> + Sync,
 {
     let chunk_size = chunk_size.max(1);
     let jobs = jobs.max(1);
     let mut results: BTreeMap<String, X> = BTreeMap::new();
     let mut errors: Vec<String> = Vec::new();
-    let mut failed_chunks: Vec<&[C]> = Vec::new();
+    let mut failed_chunks: Vec<Vec<C>> = Vec::new();
 
     let accept = |results: &mut BTreeMap<String, X>,
                   cases: &[C],
@@ -2067,36 +2259,135 @@ where
     let chunks: Vec<&[C]> = cases.chunks(chunk_size).collect();
     for (wave_idx, wave) in chunks.chunks(jobs).enumerate() {
         let wave_width = wave.len();
-        let wave_res: Vec<(String, Result<BTreeMap<String, X>, String>)> =
-            std::thread::scope(|s| {
-                let handles: Vec<_> = wave
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &chunk)| {
-                        let label = format!("{stage_label}Chunk{}", wave_idx * jobs + i);
-                        let run_chunk = &run_chunk;
-                        let worker_label = label.clone();
-                        let handle = s.spawn(move || {
-                            let _concurrency = ItreeLeanConcurrencyGuard::enter(wave_width);
-                            run_chunk(&worker_label, chunk)
-                        });
-                        (label, handle)
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|(label, h)| {
-                        let res = h
-                            .join()
-                            .unwrap_or_else(|_| Err("Lean chunk worker panicked".to_string()));
-                        (label, res)
-                    })
-                    .collect()
-            });
-        for (&chunk, (label, res)) in wave.iter().zip(wave_res) {
-            if let Err(e) = accept(&mut results, chunk, res, &label) {
-                errors.push(e);
-                failed_chunks.push(chunk);
+        if adaptive_confirm_chunks {
+            let wave_res: Vec<(String, Result<AdaptiveConfirmChunkOutcome<C, X>, String>)> =
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = wave
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &chunk)| {
+                            let label = format!("{stage_label}Chunk{}", wave_idx * jobs + i);
+                            let run_chunk = &run_chunk;
+                            let case_key = &case_key;
+                            let worker_label = label.clone();
+                            let handle = s.spawn(move || {
+                                let _concurrency = ItreeLeanConcurrencyGuard::enter(wave_width);
+                                run_adaptive_confirm_chunk_collecting(
+                                    &worker_label,
+                                    chunk,
+                                    case_key,
+                                    case_to_fn,
+                                    run_chunk,
+                                )
+                            });
+                            (label, handle)
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|(label, h)| {
+                            let res = h
+                                .join()
+                                .map_err(|_| "Lean chunk worker panicked".to_string());
+                            (label, res)
+                        })
+                        .collect()
+                });
+            for (&chunk, (label, res)) in wave.iter().zip(wave_res) {
+                let outcome = match res {
+                    Ok(outcome) => outcome,
+                    Err(panic_err) => {
+                        errors.push(format!("{label}: {panic_err}"));
+                        failed_chunks.push(chunk.to_vec());
+                        continue;
+                    }
+                };
+                results.extend(outcome.confirmed);
+                let mut chunk_unresolved: Vec<C> = Vec::new();
+                for (sub_label, single_case, err) in outcome.irreducible_singletons {
+                    let kind = classify_itree_lean_failure(&err);
+                    let is_memory_limit = matches!(
+                        kind,
+                        ItreeLeanFailureKind::RssWatchdogExceeded
+                            | ItreeLeanFailureKind::LeanMemoryExhausted
+                    );
+                    note_failure(std::slice::from_ref(&single_case), &err);
+                    if wave_width > 1 && is_memory_limit {
+                        // Retry once sequentially at full memory (`concurrency = 1`).
+                        errors.push(format!("{sub_label}: {}", truncate_lean_diag(&err)));
+                        chunk_unresolved.push(single_case);
+                    } else {
+                        let key = case_key(&single_case);
+                        let fn_name = case_to_fn
+                            .get(key)
+                            .map(String::as_str)
+                            .unwrap_or("unknown");
+                        errors.push(format!(
+                            "{sub_label} (irreducible single case `{key}` of `{fn_name}`): {}",
+                            truncate_lean_diag(&err)
+                        ));
+                    }
+                }
+                for (sub_label, slice, err) in outcome.unresolved {
+                    note_failure(&slice, &err);
+                    errors.push(format!("{sub_label}: {}", truncate_lean_diag(&err)));
+                    if outcome.missing_toolchain_err.is_none() {
+                        chunk_unresolved.extend(slice);
+                    }
+                }
+                if !outcome.skipped_by_abort.is_empty() {
+                    if let Some(ref missing_err) = outcome.missing_toolchain_err {
+                        note_failure(&outcome.skipped_by_abort, missing_err);
+                    } else if wave_width > 1 && outcome.aborted_with_memory_pressure {
+                        // Multi-worker wave hit systematic memory pressure; give the
+                        // remaining cases a chance under sequential full-memory fallback.
+                        chunk_unresolved.extend(outcome.skipped_by_abort);
+                    } else {
+                        errors.push(format!(
+                            "{label}: adaptive Stage 2 confirm stopped after \
+                             {ITREE_FALLBACK_CIRCUIT_BREAKER} consecutive irreducible leaf \
+                             failures with 0 confirmed cases ({} remaining case(s) skipped)",
+                            outcome.skipped_by_abort.len()
+                        ));
+                        note_failure(&outcome.skipped_by_abort, "");
+                    }
+                }
+                if !chunk_unresolved.is_empty() {
+                    failed_chunks.push(chunk_unresolved);
+                }
+            }
+        } else {
+            let wave_res: Vec<(String, Result<BTreeMap<String, X>, String>)> =
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = wave
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &chunk)| {
+                            let label = format!("{stage_label}Chunk{}", wave_idx * jobs + i);
+                            let run_chunk = &run_chunk;
+                            let worker_label = label.clone();
+                            let handle = s.spawn(move || {
+                                let _concurrency = ItreeLeanConcurrencyGuard::enter(wave_width);
+                                run_chunk(&worker_label, chunk)
+                            });
+                            (label, handle)
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|(label, h)| {
+                            let res = h
+                                .join()
+                                .unwrap_or_else(|_| Err("Lean chunk worker panicked".to_string()));
+                            (label, res)
+                        })
+                        .collect()
+                });
+            for (&chunk, (label, res)) in wave.iter().zip(wave_res) {
+                if let Err(e) = accept(&mut results, chunk, res, &label) {
+                    errors.push(e);
+                    failed_chunks.push(chunk.to_vec());
+                }
             }
         }
     }
@@ -2104,7 +2395,7 @@ where
     let mut fallback_successes = 0usize;
     let mut fallback_failures = 0usize;
     let mut skipped_fallbacks = 0usize;
-    for chunk in failed_chunks {
+    for chunk in &failed_chunks {
         let mut by_fn: BTreeMap<&str, Vec<C>> = BTreeMap::new();
         for c in chunk {
             if let Some(fn_name) = case_to_fn.get(case_key(c)) {
@@ -2270,20 +2561,289 @@ where
     }
 }
 
+struct AdaptiveConfirmChunkOutcome<C, X> {
+    confirmed: BTreeMap<String, X>,
+    irreducible_singletons: Vec<(String, C, String)>,
+    unresolved: Vec<(String, Vec<C>, String)>,
+    skipped_by_abort: Vec<C>,
+    aborted_by_circuit_breaker: bool,
+    aborted_with_memory_pressure: bool,
+    missing_toolchain_err: Option<String>,
+}
+
+/// Partial-preserving adaptive Stage 2 confirmation splitter used by
+/// [`run_isolated_adaptive_confirm_stage`] on the outer chunk wave.
+///
+/// Preserves every kernel-confirmed subchunk (`confirmed`), isolates
+/// irreducible `k == 1` leaves once instead of re-running them through
+/// `Fallback` + `Bisect`, and bounds systematic failures cleanly without
+/// starving unrelated healthy candidates in the same chunk:
+/// - A candidate with `>= ITREE_FALLBACK_CIRCUIT_BREAKER` irreducible leaf
+///   failures and `0` confirmed traces has its remaining pure-candidate slices
+///   skipped (`skipped_by_abort`), while slices touching other candidates still
+///   run normally.
+/// - If `>= ITREE_FALLBACK_CIRCUIT_BREAKER` distinct candidates fail at the
+///   leaf level while the chunk has `0` confirmed traces overall (or on a
+///   missing toolchain), the remaining slices of the chunk stop immediately.
+fn run_adaptive_confirm_chunk_collecting<C, X, K, F>(
+    base_label: &str,
+    cases: &[C],
+    case_key: &K,
+    case_to_fn: &BTreeMap<String, String>,
+    run_slice: &F,
+) -> AdaptiveConfirmChunkOutcome<C, X>
+where
+    C: Clone,
+    K: Fn(&C) -> &str,
+    F: Fn(&str, &[C]) -> Result<BTreeMap<String, X>, String>,
+{
+    let mut outcome = AdaptiveConfirmChunkOutcome {
+        confirmed: BTreeMap::new(),
+        irreducible_singletons: Vec::new(),
+        unresolved: Vec::new(),
+        skipped_by_abort: Vec::new(),
+        aborted_by_circuit_breaker: false,
+        aborted_with_memory_pressure: false,
+        missing_toolchain_err: None,
+    };
+    if cases.is_empty() {
+        return outcome;
+    }
+
+    struct SplitState<'a, C, X> {
+        splits: usize,
+        max_depth: usize,
+        confirmed_by_fn: BTreeMap<String, usize>,
+        leaf_failures_by_fn: BTreeMap<String, usize>,
+        failed_leaf_fns: BTreeSet<String>,
+        first_unrecovered_err: Option<String>,
+        outcome: &'a mut AdaptiveConfirmChunkOutcome<C, X>,
+    }
+
+    impl<C, X> SplitState<'_, C, X> {
+        fn fn_for<'b>(case_to_fn: &'b BTreeMap<String, String>, key: &'b str) -> &'b str {
+            case_to_fn.get(key).map(String::as_str).unwrap_or(key)
+        }
+
+        fn fn_is_exhausted(&self, fn_name: &str) -> bool {
+            self.confirmed_by_fn.get(fn_name).copied().unwrap_or(0) == 0
+                && self.leaf_failures_by_fn.get(fn_name).copied().unwrap_or(0)
+                    >= ITREE_FALLBACK_CIRCUIT_BREAKER
+        }
+
+        fn should_skip_slice<K: Fn(&C) -> &str>(
+            &self,
+            slice: &[C],
+            case_key: &K,
+            case_to_fn: &BTreeMap<String, String>,
+        ) -> bool {
+            self.outcome.aborted_by_circuit_breaker
+                || self.outcome.missing_toolchain_err.is_some()
+                || (!slice.is_empty()
+                    && slice
+                        .iter()
+                        .all(|c| self.fn_is_exhausted(Self::fn_for(case_to_fn, case_key(c)))))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn split_rec<C, X, K, F>(
+        base_label: &str,
+        cases: &[C],
+        lo: usize,
+        hi: usize,
+        depth: usize,
+        state: &mut SplitState<'_, C, X>,
+        case_key: &K,
+        case_to_fn: &BTreeMap<String, String>,
+        run_slice: &F,
+    ) where
+        C: Clone,
+        K: Fn(&C) -> &str,
+        F: Fn(&str, &[C]) -> Result<BTreeMap<String, X>, String>,
+    {
+        let slice = &cases[lo..hi];
+        if state.should_skip_slice(slice, case_key, case_to_fn) {
+            state.outcome.skipped_by_abort.extend_from_slice(slice);
+            return;
+        }
+        let label = if depth == 0 {
+            base_label.to_string()
+        } else {
+            format!("{base_label}_split_d{depth}_{lo}_{hi}")
+        };
+        match run_slice(&label, slice) {
+            Ok(mut map) => {
+                if let Some(missing) = slice.iter().find(|c| !map.contains_key(case_key(c))) {
+                    let err = format!(
+                        "{label}: Lean confirm subchunk produced no result for `{}`",
+                        case_key(missing)
+                    );
+                    if state.first_unrecovered_err.is_none() {
+                        state.first_unrecovered_err = Some(err.clone());
+                    }
+                    if slice.len() == 1 {
+                        state
+                            .outcome
+                            .irreducible_singletons
+                            .push((label, slice[0].clone(), err));
+                    } else {
+                        state.outcome.unresolved.push((label, slice.to_vec(), err));
+                    }
+                    return;
+                }
+                for c in slice {
+                    let key = case_key(c);
+                    if let Some(val) = map.remove(key) {
+                        state.outcome.confirmed.insert(key.to_string(), val);
+                        let fn_name = SplitState::<C, X>::fn_for(case_to_fn, key).to_string();
+                        *state.confirmed_by_fn.entry(fn_name).or_insert(0) += 1;
+                    }
+                }
+            }
+            Err(err) => {
+                let kind = classify_itree_lean_failure(&err);
+                if kind == ItreeLeanFailureKind::MissingToolchain {
+                    if state.first_unrecovered_err.is_none() {
+                        state.first_unrecovered_err = Some(err.clone());
+                    }
+                    state.outcome.missing_toolchain_err = Some(err.clone());
+                    state.outcome.unresolved.push((label, slice.to_vec(), err));
+                    return;
+                }
+                let is_memory_limit = matches!(
+                    kind,
+                    ItreeLeanFailureKind::RssWatchdogExceeded
+                        | ItreeLeanFailureKind::LeanMemoryExhausted
+                );
+                if slice.len() <= 1 {
+                    if state.first_unrecovered_err.is_none() {
+                        state.first_unrecovered_err = Some(err.clone());
+                    }
+                    if is_memory_limit {
+                        state.outcome.aborted_with_memory_pressure = true;
+                    }
+                    let fn_name =
+                        SplitState::<C, X>::fn_for(case_to_fn, case_key(&slice[0])).to_string();
+                    *state.leaf_failures_by_fn.entry(fn_name.clone()).or_insert(0) += 1;
+                    state.failed_leaf_fns.insert(fn_name);
+                    state
+                        .outcome
+                        .irreducible_singletons
+                        .push((label, slice[0].clone(), err));
+                    if state.outcome.confirmed.is_empty()
+                        && state.failed_leaf_fns.len() >= ITREE_FALLBACK_CIRCUIT_BREAKER
+                    {
+                        state.outcome.aborted_by_circuit_breaker = true;
+                    }
+                    return;
+                }
+                if !is_memory_limit {
+                    if state.first_unrecovered_err.is_none() {
+                        state.first_unrecovered_err = Some(err.clone());
+                    }
+                    state.outcome.unresolved.push((label, slice.to_vec(), err));
+                    return;
+                }
+                let mid = lo + (hi - lo) / 2;
+                let next_depth = depth + 1;
+                state.splits += 1;
+                state.max_depth = state.max_depth.max(next_depth);
+                let summary = err.lines().next().unwrap_or("");
+                eprintln!(
+                    "itree-difftest: adaptive Stage 2 confirm split \
+                     label={label} depth={next_depth} cases={} -> left={} right={} \
+                     kind={kind:?} reason={summary}",
+                    hi - lo,
+                    mid - lo,
+                    hi - mid
+                );
+                split_rec(
+                    base_label,
+                    cases,
+                    lo,
+                    mid,
+                    next_depth,
+                    state,
+                    case_key,
+                    case_to_fn,
+                    run_slice,
+                );
+                split_rec(
+                    base_label,
+                    cases,
+                    mid,
+                    hi,
+                    next_depth,
+                    state,
+                    case_key,
+                    case_to_fn,
+                    run_slice,
+                );
+            }
+        }
+    }
+
+    let (splits, max_depth, first_err) = {
+        let mut state = SplitState {
+            splits: 0,
+            max_depth: 0,
+            confirmed_by_fn: BTreeMap::new(),
+            leaf_failures_by_fn: BTreeMap::new(),
+            failed_leaf_fns: BTreeSet::new(),
+            first_unrecovered_err: None,
+            outcome: &mut outcome,
+        };
+        split_rec(
+            base_label,
+            cases,
+            0,
+            cases.len(),
+            0,
+            &mut state,
+            case_key,
+            case_to_fn,
+            run_slice,
+        );
+        (state.splits, state.max_depth, state.first_unrecovered_err)
+    };
+    if splits > 0 {
+        if outcome.irreducible_singletons.is_empty()
+            && outcome.unresolved.is_empty()
+            && outcome.skipped_by_abort.is_empty()
+        {
+            eprintln!(
+                "itree-difftest: adaptive Stage 2 confirm recovered \
+                 label={base_label} cases={} splits={splits} max_depth={max_depth}",
+                cases.len()
+            );
+        } else {
+            let err = first_err.as_deref().unwrap_or("");
+            eprintln!(
+                "itree-difftest: adaptive Stage 2 confirm unrecovered \
+                 label={base_label} cases={} confirmed={} splits={splits} max_depth={max_depth} \
+                 kind={:?} reason={}",
+                cases.len(),
+                outcome.confirmed.len(),
+                classify_itree_lean_failure(err),
+                err.lines().next().unwrap_or("")
+            );
+        }
+    }
+    outcome
+}
+
 /// Evaluates a Stage 2 confirmation slice with deterministic adaptive halving
 /// when a multi-case module exceeds memory limits
 /// ([`ItreeLeanFailureKind::RssWatchdogExceeded`] or
 /// [`ItreeLeanFailureKind::LeanMemoryExhausted`]).
 ///
-/// If `cases.len() > 1` and `run_slice` fails due to RSS/memory exhaustion,
-/// splits `cases` into `[..mid]` and `[mid..]` (`mid = cases.len() / 2`),
-/// recursively confirms both halves under distinct collision-free labels
-/// (`{base_label}_split_d{depth}_{lo}_{hi}`), and logs structured `eprintln!`
-/// telemetry. When every subchunk succeeds and confirms every case in `cases`,
-/// returns `Ok(merged)` cleanly without surfacing any error to
-/// [`run_isolated_lean_stage`]. If a `k == 1` singleton fails, a non-memory
-/// failure occurs (timeout, elaboration/kernel rejection, missing toolchain),
-/// or any case is omitted by a subchunk, fails closed by returning `Err(...)`.
+/// Direct fail-closed helper used by unit tests of the standalone halving
+/// primitive; production Stage 2 confirmation calls
+/// [`run_isolated_adaptive_confirm_stage`] (which uses
+/// [`run_adaptive_confirm_chunk_collecting`] so confirmed subchunks are
+/// retained across partial failures).
+#[cfg(test)]
 fn run_adaptive_confirm_chunk<C, X, K, F>(
     base_label: &str,
     cases: &[C],
@@ -4471,14 +5031,14 @@ fn evaluate_itree_entries(
         fs::create_dir_all(&verify_dir)
             .map_err(|e| format!("failed to create {}: {e}", verify_dir.display()))?;
 
-        // Measure the built `.olean`/`.ilean` footprint once after `mir_stage`
-        // so Stage 1 and Stage 2 reserve realistic mmap headroom without
-        // re-walking `.lake/build/lib/lean` per chunk. Every worker maps the
-        // shared libraries, but only the staged `Mir.*` modules of its own
-        // module's candidates (at most one chunk's worth), not those of the
-        // whole run.
-        let olean_footprint = measure_itree_olean_footprint(&anneal_dir);
-        let olean_footprint_kib = olean_footprint.map(|footprint| {
+        // Measure and index the built `.olean`/`.ilean` footprint once after
+        // `mir_stage` so each Stage 1 / Stage 2 worker slice reserves the exact
+        // mmap bytes of shared libraries plus only the specific `Mir.*` modules
+        // that slice actually imports (including smaller adaptive split slices),
+        // without re-walking `.lake/build/lib/lean` per chunk.
+        let olean_index = measure_itree_olean_footprint_index(&anneal_dir);
+        let olean_footprint = olean_index.as_ref().map(|idx| idx.footprint);
+        let max_chunk_olean_kib = olean_footprint.map(|footprint| {
             footprint.worker_kib(
                 mir_fn_cases.len(),
                 ITREE_PROBE_CHUNK_SIZE.max(ITREE_MAX_CONFIRM_CHUNK_SIZE),
@@ -4488,12 +5048,15 @@ fn evaluate_itree_entries(
         eprintln!(
             "itree-difftest: Lean TraceCheck over {} distinct traces from {} candidates \
              with {lean_jobs} concurrent `lake env lean` worker(s) \
-             (olean_footprint_kib={olean_footprint_kib:?} per worker, of {:?} KiB shared + \
-             {:?} KiB staged for {} candidate(s))",
+             (max_chunk_olean_kib={max_chunk_olean_kib:?}, shared={:?} KiB, \
+             staged={:?} KiB across {} indexed Mir module(s) for {} candidate(s))",
             batch_cases.len(),
             compared_fn_names.len(),
             olean_footprint.map(|f| f.shared_bytes.div_ceil(1024)),
             olean_footprint.map(|f| f.staged_bytes.div_ceil(1024)),
+            olean_index
+                .as_ref()
+                .map_or(0, |idx| idx.staged_module_bytes.len()),
             mir_fn_cases.len()
         );
 
@@ -4511,6 +5074,12 @@ fn evaluate_itree_entries(
             &case_to_fn,
             |label: &str, chunk: &[BatchTraceEvalCase]| {
                 let src = render_batch_trace_probe_lean_module(&format!("Proof.{label}"), chunk);
+                let slice_olean_kib = itree_slice_olean_footprint_kib(
+                    olean_index.as_ref(),
+                    chunk,
+                    mir_fn_cases.len(),
+                    &case_to_fn,
+                );
                 let stdout = run_itree_lean_module_with_workers(
                     &verify_dir,
                     &anneal_dir,
@@ -4518,7 +5087,7 @@ fn evaluate_itree_entries(
                     &src,
                     itree_lean_stage_concurrency(lean_jobs),
                     chunk.len(),
-                    olean_footprint_kib,
+                    slice_olean_kib,
                 )?;
                 let parsed = parse_batch_trace_probe_output(&stdout);
                 for c in chunk {
@@ -4622,6 +5191,12 @@ fn evaluate_itree_entries(
             .clamp(1, ITREE_MAX_CONFIRM_CHUNK_SIZE);
         let run_confirm_slice = |label: &str, slice: &[BatchTraceEvalCase]| {
             let src = render_batch_trace_eval_lean_module(&format!("Proof.{label}"), slice, false);
+            let slice_olean_kib = itree_slice_olean_footprint_kib(
+                olean_index.as_ref(),
+                slice,
+                mir_fn_cases.len(),
+                &case_to_fn,
+            );
             run_itree_lean_module_with_workers(
                 &verify_dir,
                 &anneal_dir,
@@ -4629,7 +5204,7 @@ fn evaluate_itree_entries(
                 &src,
                 itree_lean_stage_concurrency(lean_jobs),
                 slice.len(),
-                olean_footprint_kib,
+                slice_olean_kib,
             )?;
             Ok(slice
                 .iter()
@@ -4641,17 +5216,14 @@ fn evaluate_itree_entries(
                 })
                 .collect::<BTreeMap<String, String>>())
         };
-        let run_confirm_chunk = |label: &str, chunk: &[BatchTraceEvalCase]| {
-            run_adaptive_confirm_chunk(label, chunk, &batch_case_ident, &run_confirm_slice)
-        };
-        let mut confirm_stage = run_isolated_lean_stage(
+        let mut confirm_stage = run_isolated_adaptive_confirm_stage(
             "ItreeDiffBatchConfirm",
             &confirm_cases,
             confirm_chunk_size,
             lean_jobs,
             batch_case_ident,
             &case_to_fn,
-            run_confirm_chunk,
+            &run_confirm_slice,
         );
         // When `batch_cases.len() > ITREE_FULL_CONFIRM_MAX_TRACES`, each agreeing
         // candidate had only its first `ok` trace selected into `confirm_cases`.
@@ -4681,14 +5253,14 @@ fn evaluate_itree_entries(
                 format!("ItreeDiffBatchConfirmReplacement{}", rep_round + 1)
             };
             rep_round += 1;
-            let rep_stage = run_isolated_lean_stage(
+            let rep_stage = run_isolated_adaptive_confirm_stage(
                 &stage_label,
                 &replacement_cases,
                 confirm_chunk_size,
                 lean_jobs,
                 batch_case_ident,
                 &case_to_fn,
-                run_confirm_chunk,
+                &run_confirm_slice,
             );
             confirm_cases.extend(replacement_cases);
             confirm_stage.results.extend(rep_stage.results);
@@ -5693,7 +6265,18 @@ pub fn reproduce_itree_finding(
         let mut lake_targets = vec!["Anneal".to_string(), root_mir_module];
         lake_targets.extend(callee_sig_modules);
         run_itree_lake_build_targets(&anneal_dir, &lake_targets)?;
-        let olean_footprint_kib = measure_itree_olean_footprint_kib(&anneal_dir);
+        let olean_index = measure_itree_olean_footprint_index(&anneal_dir);
+        let olean_footprint_kib = olean_index.as_ref().map(|idx| {
+            let modules = std::iter::once(case.config.root_mir_module.as_str())
+                .chain(case.config.callee_sig_modules.iter().map(String::as_str))
+                .chain(
+                    case.config
+                        .inlined_callee_modules
+                        .iter()
+                        .map(String::as_str),
+                );
+            idx.worker_kib_for_modules(modules, 1, 1)
+        });
 
         let verify_dir = anneal_dir.join("generated/Verify/ItreeDiffStaged");
         fs::create_dir_all(&verify_dir)
@@ -8403,25 +8986,23 @@ mod tests {
         let (cases, case_to_fn) = stage_fixture(&[("c0", 4), ("c1", 4), ("c2", 4), ("c3", 4)]);
         assert_eq!(cases.len(), 16);
         let seen_labels = Mutex::new(Vec::<String>::new());
-        let stage = run_isolated_lean_stage(
+        let stage = run_isolated_adaptive_confirm_stage(
             "ItreeDiffBatchConfirm",
             &cases,
             16,
             1,
             ident,
             &case_to_fn,
-            |label: &str, chunk: &[String]| {
-                run_adaptive_confirm_chunk(label, chunk, &ident, &|sub_label, slice| {
-                    seen_labels.lock().unwrap().push(sub_label.to_string());
-                    if slice.len() > 4 {
-                        Err(format!(
-                            "[WATCHDOG:RSS_EXCEEDED] `{sub_label}.lean` exceeded RSS limit \
-                             (8432128 KiB > 8388608 KiB)"
-                        ))
-                    } else {
-                        ok_all(slice)
-                    }
-                })
+            |sub_label: &str, slice: &[String]| {
+                seen_labels.lock().unwrap().push(sub_label.to_string());
+                if slice.len() > 4 {
+                    Err(format!(
+                        "[WATCHDOG:RSS_EXCEEDED] `{sub_label}.lean` exceeded RSS limit \
+                         (8432128 KiB > 8388608 KiB)"
+                    ))
+                } else {
+                    ok_all(slice)
+                }
             },
         );
         assert!(
@@ -9052,39 +9633,33 @@ mod tests {
         );
     }
 
-    /// A chunk whose split leaves one irreducible `k == 1` RSS failure fails
-    /// closed as a whole (never a partial `Ok`), and the stage's per-candidate
-    /// isolation then still confirms every healthy case: nothing is dropped, the
-    /// poison case is inconclusive (unchecked, not refuted), and no `.lean`
-    /// module label is ever reused.
+    /// A chunk whose adaptive split leaves one irreducible `k == 1` RSS failure
+    /// preserves every confirmed subchunk in place instead of throwing them
+    /// away into nested `Fallback`/`Bisect` splits: every healthy case stays
+    /// confirmed, the poison case is hit only once (`O(log k)` runs total) and
+    /// marked inconclusive (unchecked, not refuted), and no `.lean` module
+    /// label is ever reused.
     #[test]
     fn adaptive_stage2_split_keeps_every_healthy_case_when_one_singleton_stays_over_rss() {
         let (cases, case_to_fn) = stage_fixture(&[("c0", 4), ("c1", 4), ("c2", 4), ("c3", 4)]);
         let poison = "case_c3_t2";
         let runs = MockLeanRuns::default();
-        let stage = run_isolated_lean_stage(
+        let stage = run_isolated_adaptive_confirm_stage(
             "ItreeDiffBatchConfirm",
             &cases,
             16,
             1,
             ident,
             &case_to_fn,
-            |label: &str, chunk: &[String]| {
-                run_adaptive_confirm_chunk(
-                    label,
-                    chunk,
-                    &ident,
-                    &|sub_label: &str, slice: &[String]| {
-                        runs.lock()
-                            .unwrap()
-                            .push((sub_label.to_string(), slice.to_vec()));
-                        if slice.len() > 4 || slice.iter().any(|c| c == poison) {
-                            Err(mock_rss_exceeded(sub_label))
-                        } else {
-                            ok_all(slice)
-                        }
-                    },
-                )
+            |sub_label: &str, slice: &[String]| {
+                runs.lock()
+                    .unwrap()
+                    .push((sub_label.to_string(), slice.to_vec()));
+                if slice.len() > 4 || slice.iter().any(|c| c == poison) {
+                    Err(mock_rss_exceeded(sub_label))
+                } else {
+                    ok_all(slice)
+                }
             },
         );
         assert_eq!(stage.results.len(), 15);
@@ -9124,52 +9699,56 @@ mod tests {
                 "`{c}` has no successful confirming run"
             );
         }
-        // Cost of one irreducible case (a regression pin on the split / fallback /
-        // bisection interplay): 10 chunk-phase runs (16, 8+8, 4+4+4+4, 2+2, 1),
-        // 3 healthy candidate fallbacks, 4 runs for `c3`'s fallback (4, 2+2, 1),
-        // and 5 bisection runs (2, 2 -> 1, 1, 1).
-        assert_eq!(runs.len(), 22, "unexpected Lean run count: {labels:?}");
+        // Partial-preserving adaptive Stage 2 cost of one irreducible case:
+        // 11 chunk-phase runs total (16, 8+8, 4+4+4+4, 2+2, 1+1), ZERO fallback
+        // or bisection re-runs, and the irreducible singleton is hit only ONCE.
+        assert_eq!(runs.len(), 11, "unexpected Lean run count: {labels:?}");
+        let poison_singleton_hits = runs
+            .iter()
+            .filter(|(_, s)| s.len() == 1 && s[0] == poison)
+            .count();
+        assert_eq!(
+            poison_singleton_hits, 1,
+            "irreducible poison singleton must not be re-killed across Fallback/Bisect: {labels:?}"
+        );
         assert_eq!(labels[0], "ItreeDiffBatchConfirmChunk0");
         assert!(labels.contains(&"ItreeDiffBatchConfirmChunk0_split_d4_14_15".to_string()));
-        assert!(labels.contains(&"ItreeDiffBatchConfirmFallback_c3_split_d2_2_3".to_string()));
-        assert!(labels.contains(&"ItreeDiffBatchConfirmBisect_c3_2_4_split_d1_0_1".to_string()));
+        assert!(
+            labels
+                .iter()
+                .all(|l| !l.contains("Fallback") && !l.contains("Bisect")),
+            "confirmed subchunks and wave_width==1 leaves must not re-enter Fallback/Bisect: {labels:?}"
+        );
     }
 
     /// A kernel rejection that a memory failure of the enclosing module masks
     /// must surface once the split isolates it: the candidate is refuted (not
     /// inconclusive, never partially compared as agreeing), and its healthy
-    /// neighbors are still confirmed.
+    /// neighbors are still confirmed without being re-run in Fallback.
     #[test]
     fn adaptive_stage2_split_never_hides_a_kernel_rejection_behind_a_memory_failure() {
         let (cases, case_to_fn) = stage_fixture(&[("c0", 4), ("c1", 4)]);
         let rejected = "case_c1_t1";
         let runs = MockLeanRuns::default();
-        let stage = run_isolated_lean_stage(
+        let stage = run_isolated_adaptive_confirm_stage(
             "ItreeDiffBatchConfirm",
             &cases,
             8,
             1,
             ident,
             &case_to_fn,
-            |label: &str, chunk: &[String]| {
-                run_adaptive_confirm_chunk(
-                    label,
-                    chunk,
-                    &ident,
-                    &|sub_label: &str, slice: &[String]| {
-                        runs.lock()
-                            .unwrap()
-                            .push((sub_label.to_string(), slice.to_vec()));
-                        if slice.len() > 2 {
-                            // Lean runs out of memory before reaching the rejection.
-                            Err(mock_lean_memory_exhausted(sub_label))
-                        } else if slice.iter().any(|c| c == rejected) {
-                            Err(mock_rfl_rejection(sub_label, rejected))
-                        } else {
-                            ok_all(slice)
-                        }
-                    },
-                )
+            |sub_label: &str, slice: &[String]| {
+                runs.lock()
+                    .unwrap()
+                    .push((sub_label.to_string(), slice.to_vec()));
+                if slice.len() > 2 {
+                    // Lean runs out of memory before reaching the rejection.
+                    Err(mock_lean_memory_exhausted(sub_label))
+                } else if slice.iter().any(|c| c == rejected) {
+                    Err(mock_rfl_rejection(sub_label, rejected))
+                } else {
+                    ok_all(slice)
+                }
             },
         );
         assert_eq!(stage.results.len(), 7);
@@ -9199,6 +9778,10 @@ mod tests {
             .map(|(l, _)| l)
             .collect();
         assert_labels_unique_file_stems(&labels);
+        assert!(
+            labels.iter().all(|l| !l.contains("Fallback_c0")),
+            "already-confirmed neighbor candidate `c0` must not be re-run in Fallback: {labels:?}"
+        );
     }
 
     /// Concurrent chunk workers and the Stage 2 replacement rounds (which reuse
@@ -9214,29 +9797,22 @@ mod tests {
             "ItreeDiffBatchConfirmReplacement",
             "ItreeDiffBatchConfirmReplacement2",
         ] {
-            let stage = run_isolated_lean_stage(
+            let stage = run_isolated_adaptive_confirm_stage(
                 stage_label,
                 &cases,
                 8,
                 2,
                 ident,
                 &case_to_fn,
-                |label: &str, chunk: &[String]| {
-                    run_adaptive_confirm_chunk(
-                        label,
-                        chunk,
-                        &ident,
-                        &|sub_label: &str, slice: &[String]| {
-                            runs.lock()
-                                .unwrap()
-                                .push((sub_label.to_string(), slice.to_vec()));
-                            if slice.len() > 2 {
-                                Err(mock_rss_exceeded(sub_label))
-                            } else {
-                                ok_all(slice)
-                            }
-                        },
-                    )
+                |sub_label: &str, slice: &[String]| {
+                    runs.lock()
+                        .unwrap()
+                        .push((sub_label.to_string(), slice.to_vec()));
+                    if slice.len() > 2 {
+                        Err(mock_rss_exceeded(sub_label))
+                    } else {
+                        ok_all(slice)
+                    }
                 },
             );
             assert!(stage.errors.is_empty(), "{stage_label}: {:?}", stage.errors);
@@ -9419,5 +9995,306 @@ mod tests {
         .expect("an empty chunk is trivially confirmed");
         assert!(empty.is_empty());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Regression pin against `O((log k)^2)` nested adaptive splitting: a
+    /// single-candidate 16-case chunk with one irreducible RSS poison trace
+    /// completes in 11 runs (1 hit on the poison leaf, zero Fallback/Bisect
+    /// re-runs) while preserving all 15 healthy traces.
+    #[test]
+    fn adaptive_stage2_single_candidate_16_case_poison_uses_o_log_k_runs() {
+        let (cases, case_to_fn) = stage_fixture(&[("c0", 16)]);
+        let poison = "case_c0_t14";
+        let runs = MockLeanRuns::default();
+        let stage = run_isolated_adaptive_confirm_stage(
+            "ItreeDiffBatchConfirm",
+            &cases,
+            16,
+            1,
+            ident,
+            &case_to_fn,
+            |label: &str, slice: &[String]| {
+                runs.lock()
+                    .unwrap()
+                    .push((label.to_string(), slice.to_vec()));
+                if slice.len() > 4 || slice.iter().any(|c| c == poison) {
+                    Err(mock_rss_exceeded(label))
+                } else {
+                    ok_all(slice)
+                }
+            },
+        );
+        assert_eq!(stage.results.len(), 15);
+        assert!(!stage.results.contains_key(poison));
+        assert_eq!(stage.failed_fns, BTreeSet::from(["c0".to_string()]));
+        assert_eq!(
+            stage.inconclusive_cases,
+            BTreeSet::from([poison.to_string()])
+        );
+        let runs = runs.into_inner().unwrap();
+        assert_eq!(runs.len(), 11, "expected O(log k) = 11 runs, got {runs:?}");
+        assert_eq!(
+            runs.iter()
+                .filter(|(_, s)| s.len() == 1 && s[0] == poison)
+                .count(),
+            1
+        );
+        let labels: Vec<String> = runs.into_iter().map(|(l, _)| l).collect();
+        assert_labels_unique_file_stems(&labels);
+    }
+
+    /// When a multi-worker wave (`wave_width > 1`) leaves a memory-failed
+    /// `k == 1` singleton under split per-worker memory, Stage 2 retries that
+    /// singleton once sequentially at full worker memory (`concurrency == 1`)
+    /// so transient concurrent-wave RSS pressure recovers completely.
+    #[test]
+    fn adaptive_stage2_concurrent_wave_retries_memory_failed_singleton_sequentially() {
+        let (cases, case_to_fn) = stage_fixture(&[("c0", 4), ("c1", 4)]);
+        let heavy = "case_c1_t2";
+        let runs = MockLeanRuns::default();
+        let stage = run_isolated_adaptive_confirm_stage(
+            "ItreeDiffBatchConfirm",
+            &cases,
+            4,
+            2,
+            ident,
+            &case_to_fn,
+            |label: &str, slice: &[String]| {
+                let conc = itree_lean_stage_concurrency(2);
+                runs.lock()
+                    .unwrap()
+                    .push((format!("{label}@c{conc}"), slice.to_vec()));
+                if conc > 1 && slice.iter().any(|c| c == heavy) {
+                    Err(mock_rss_exceeded(label))
+                } else {
+                    ok_all(slice)
+                }
+            },
+        );
+        assert_eq!(stage.results.len(), 8);
+        assert!(stage.failed_fns.is_empty());
+        assert!(stage.inconclusive_cases.is_empty());
+        let runs = runs.into_inner().unwrap();
+        assert!(
+            runs.iter()
+                .any(|(l, s)| l == "ItreeDiffBatchConfirmFallback_c1@c1" && s == &[heavy]),
+            "expected sequential full-memory retry of `{heavy}` only: {runs:?}"
+        );
+        let labels: Vec<String> = runs
+            .into_iter()
+            .map(|(l, _)| l.split('@').next().unwrap().to_string())
+            .collect();
+        assert_labels_unique_file_stems(&labels);
+    }
+
+    /// Systematic failures trip the adaptive Stage 2 circuit breaker cleanly
+    /// without starving unrelated healthy candidates in the same chunk, and a
+    /// missing toolchain aborts immediately without Fallback retries.
+    #[test]
+    fn adaptive_stage2_circuit_breaker_and_missing_toolchain_behave_precisely() {
+        // A. Single-candidate 16-case all-poison chunk stops after 4 leaves
+        //    (9 runs instead of 31); skipped cases stay non-inconclusive.
+        let (c0_cases, c0_map) = stage_fixture(&[("c0", 16)]);
+        let runs_a = MockLeanRuns::default();
+        let stage_a = run_isolated_adaptive_confirm_stage(
+            "ItreeDiffBatchConfirm",
+            &c0_cases,
+            16,
+            1,
+            ident,
+            &c0_map,
+            |label: &str, slice: &[String]| {
+                runs_a
+                    .lock()
+                    .unwrap()
+                    .push((label.to_string(), slice.to_vec()));
+                Err::<BTreeMap<String, usize>, String>(mock_rss_exceeded(label))
+            },
+        );
+        assert!(stage_a.results.is_empty());
+        assert_eq!(stage_a.failed_fns, BTreeSet::from(["c0".to_string()]));
+        assert_eq!(runs_a.into_inner().unwrap().len(), 9);
+        assert_eq!(
+            stage_a.inconclusive_cases.len(),
+            ITREE_FALLBACK_CIRCUIT_BREAKER,
+            "only the 4 leaves actually killed by RSS are inconclusive; skipped cases are not"
+        );
+
+        // B. One bad candidate (`c0`, 4 failing leaves) in a multi-candidate
+        //    chunk must NOT trip the chunk circuit breaker or drop healthy
+        //    candidates `c1`, `c2`, `c3`.
+        let (mix_cases, mix_map) = stage_fixture(&[("c0", 4), ("c1", 4), ("c2", 4), ("c3", 4)]);
+        let stage_b = run_isolated_adaptive_confirm_stage(
+            "ItreeDiffBatchConfirm",
+            &mix_cases,
+            16,
+            1,
+            ident,
+            &mix_map,
+            |label: &str, slice: &[String]| {
+                if slice.iter().any(|c| c.starts_with("case_c0_")) {
+                    Err(mock_rss_exceeded(label))
+                } else {
+                    ok_all(slice)
+                }
+            },
+        );
+        assert_eq!(stage_b.results.len(), 12);
+        assert_eq!(stage_b.failed_fns, BTreeSet::from(["c0".to_string()]));
+
+        // C. 16 distinct candidates all failing systematically trip the
+        //    whole-chunk breaker after 4 distinct failing candidates (9 runs).
+        let spec_c: Vec<(&str, usize)> = vec![
+            ("c0", 1),
+            ("c1", 1),
+            ("c2", 1),
+            ("c3", 1),
+            ("c4", 1),
+            ("c5", 1),
+            ("c6", 1),
+            ("c7", 1),
+            ("c8", 1),
+            ("c9", 1),
+            ("c10", 1),
+            ("c11", 1),
+            ("c12", 1),
+            ("c13", 1),
+            ("c14", 1),
+            ("c15", 1),
+        ];
+        let (c_cases, c_map) = stage_fixture(&spec_c);
+        let runs_c = MockLeanRuns::default();
+        let stage_c = run_isolated_adaptive_confirm_stage(
+            "ItreeDiffBatchConfirm",
+            &c_cases,
+            16,
+            1,
+            ident,
+            &c_map,
+            |label: &str, slice: &[String]| {
+                runs_c
+                    .lock()
+                    .unwrap()
+                    .push((label.to_string(), slice.to_vec()));
+                Err::<BTreeMap<String, usize>, String>(mock_rss_exceeded(label))
+            },
+        );
+        assert!(stage_c.results.is_empty());
+        assert_eq!(stage_c.failed_fns.len(), 16);
+        assert_eq!(runs_c.into_inner().unwrap().len(), 9);
+
+        // D. Missing toolchain stops after 1 run, skips Fallback, and marks
+        //    every case inconclusive.
+        let runs_d = MockLeanRuns::default();
+        let stage_d = run_isolated_adaptive_confirm_stage(
+            "ItreeDiffBatchConfirm",
+            &mix_cases,
+            16,
+            1,
+            ident,
+            &mix_map,
+            |label: &str, slice: &[String]| {
+                runs_d
+                    .lock()
+                    .unwrap()
+                    .push((label.to_string(), slice.to_vec()));
+                Err::<BTreeMap<String, usize>, String>(
+                    "failed to run `lake env lean`: No such file or directory (os error 2)"
+                        .to_string(),
+                )
+            },
+        );
+        assert!(stage_d.results.is_empty());
+        assert_eq!(runs_d.into_inner().unwrap().len(), 1);
+        assert_eq!(stage_d.inconclusive_cases.len(), 16);
+    }
+
+    /// `measure_itree_olean_footprint_index` classifies top-level `Mir.*`
+    /// artifacts as staged (not shared), indexes exact byte sizes per staged
+    /// module (handling skewed candidate sizes accurately without proportional
+    /// averaging), auto-includes `Mir.Common`, and falls back conservatively
+    /// when a requested module is unindexed.
+    #[test]
+    fn itree_olean_footprint_index_measures_exact_per_slice_modules_and_top_level_mir() {
+        let tmp = env::temp_dir().join(format!(
+            "anneal_itree_olean_index_test_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let lib = tmp.join(".lake/build/lib/lean");
+        fs::create_dir_all(lib.join("Anneal")).unwrap();
+        fs::create_dir_all(lib.join("Mir/ItreeDiffStaged")).unwrap();
+        // Shared: 100 KiB.
+        fs::write(lib.join("Anneal/TraceCheck.olean"), vec![0u8; 100 * 1024]).unwrap();
+        // Top-level `Mir.olean` (50 KiB) + `Mir/Common.olean` (30 KiB): both staged.
+        fs::write(lib.join("Mir.olean"), vec![0u8; 50 * 1024]).unwrap();
+        fs::write(lib.join("Mir/Common.olean"), vec![0u8; 30 * 1024]).unwrap();
+        // Skewed staged modules: `small` = 10 KiB (.olean + .ilean), `huge` = 4000 KiB.
+        fs::write(
+            lib.join("Mir/ItreeDiffStaged/small.olean"),
+            vec![0u8; 6 * 1024],
+        )
+        .unwrap();
+        fs::write(
+            lib.join("Mir/ItreeDiffStaged/small.ilean"),
+            vec![0u8; 4 * 1024],
+        )
+        .unwrap();
+        fs::write(
+            lib.join("Mir/ItreeDiffStaged/huge.olean"),
+            vec![0u8; 4000 * 1024],
+        )
+        .unwrap();
+
+        let idx = measure_itree_olean_footprint_index(&tmp).expect("artifacts exist");
+        let _ = fs::remove_dir_all(&tmp);
+
+        // Top-level `Mir.olean` must be classified as staged, NOT shared.
+        assert_eq!(idx.footprint.shared_bytes, 100 * 1024);
+        assert_eq!(idx.footprint.staged_bytes, (50 + 30 + 10 + 4000) * 1024);
+        assert_eq!(idx.staged_module_bytes.get("Mir"), Some(&(50 * 1024)));
+        assert_eq!(idx.staged_module_bytes.get("Mir.Common"), Some(&(30 * 1024)));
+        assert_eq!(
+            idx.staged_module_bytes.get("Mir.ItreeDiffStaged.small"),
+            Some(&(10 * 1024))
+        );
+        assert_eq!(
+            idx.staged_module_bytes.get("Mir.ItreeDiffStaged.huge"),
+            Some(&(4000 * 1024))
+        );
+
+        // Small slice gets exact shared (100) + Mir.Common (30) + small (10) = 140 KiB,
+        // NOT the proportional average (~2145 KiB).
+        assert_eq!(
+            idx.worker_kib_for_modules(["Mir.ItreeDiffStaged.small"], 2, 1),
+            140
+        );
+        // Huge slice gets exact shared (100) + Mir.Common (30) + huge (4000) = 4130 KiB,
+        // NOT under-reserved at ~2145 KiB.
+        assert_eq!(
+            idx.worker_kib_for_modules(["Mir.ItreeDiffStaged.huge"], 2, 1),
+            4130
+        );
+        // Deduplicates repeated imports and ignores non-Mir modules.
+        assert_eq!(
+            idx.worker_kib_for_modules(
+                [
+                    "Anneal",
+                    "Mir.ItreeDiffStaged.small",
+                    "Mir.ItreeDiffStaged.small",
+                    "Mir.Common",
+                ],
+                2,
+                1,
+            ),
+            140
+        );
+        // Unindexed staged module falls back conservatively to max(exact, proportional).
+        let unindexed = idx.worker_kib_for_modules(["Mir.ItreeDiffStaged.missing"], 2, 1);
+        assert_eq!(unindexed, idx.footprint.worker_kib(2, 1));
+        assert!(unindexed > 140);
     }
 }

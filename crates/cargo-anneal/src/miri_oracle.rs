@@ -2111,6 +2111,82 @@ pub struct AnnealOracleConfig {
     pub rustc_wrapper: Option<PathBuf>,
 }
 
+/// Default upper bound (in MiB) passed to `lean -M` when executing
+/// `oracle/MiriOracleProbe.lean`.
+const MIRI_ORACLE_PROBE_LEAN_MEMORY_MB_CAP: u64 = 4096;
+
+/// Default upper bound (in MiB) passed to `lean -M` when kernel-confirming
+/// `oracle/MiriOracleConfirm.lean`.
+const MIRI_ORACLE_CONFIRM_LEAN_MEMORY_MB_CAP: u64 = 3072;
+
+/// Computes a headroom-safe `lean -M` limit (in MiB) for a single-threaded
+/// `oracle/MiriOracle{Probe,Confirm}.lean` invocation given optional available
+/// memory (`avail_kib` from cgroup / host headroom), withholding non-heap
+/// headroom for `.olean` mmaps and thread arenas so Lean's allocator engages
+/// before a tight capsule cgroup (e.g. `MemoryMax=5946M`) OOM-kills the run.
+fn miri_oracle_lean_max_mb_for_avail_kib(stage_cap_mb: u64, avail_kib: Option<u64>) -> u64 {
+    const LARGE_BUDGET_KIB: u64 = 4 * 1024 * 1024;
+    const LARGE_RESERVE_KIB: u64 = 1024 * 1024;
+    const SMALL_RESERVE_MIN_KIB: u64 = 256 * 1024;
+    const MIN_HEAP_MB_SMALL: u64 = 256;
+    const MIN_HEAP_MB_TINY: u64 = 64;
+
+    let cap = stage_cap_mb.max(MIN_HEAP_MB_TINY);
+    let Some(avail) = avail_kib else {
+        return cap;
+    };
+    let min_heap_kib = if avail >= 512 * 1024 {
+        MIN_HEAP_MB_SMALL * 1024
+    } else {
+        MIN_HEAP_MB_TINY * 1024
+    };
+    let max_reserve_kib = avail.saturating_sub(min_heap_kib);
+    let desired_reserve_kib = if avail >= LARGE_BUDGET_KIB {
+        LARGE_RESERVE_KIB
+    } else {
+        (avail / 4).max(SMALL_RESERVE_MIN_KIB)
+    };
+    let reserve_kib = desired_reserve_kib.min(max_reserve_kib);
+    let heap_mb = avail.saturating_sub(reserve_kib) / 1024;
+    heap_mb.clamp(MIN_HEAP_MB_TINY, cap)
+}
+
+fn resolve_miri_oracle_lean_max_mb(stage_cap_mb: u64) -> u64 {
+    let cg_headroom = fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|cg| crate::cgroup_memory_limits_kib(Path::new("/sys/fs/cgroup"), &cg).1);
+    let cg_v1_headroom = fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|cg| {
+            crate::cgroup_v1_memory_limits_kib(Path::new("/sys/fs/cgroup/memory"), &cg).1
+        });
+    let avail_kib = match (cg_headroom, cg_v1_headroom) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    };
+    miri_oracle_lean_max_mb_for_avail_kib(stage_cap_mb, avail_kib)
+}
+
+/// Builds a bounded `lake env lean -M <max_mem_mb> <rel_module_path>` command
+/// with `LEAN_NUM_THREADS=1` for single-module oracle evaluation / confirmation.
+fn build_miri_oracle_lean_command(
+    lake_bin: &Path,
+    dot_anneal: &Path,
+    rel_module_path: &str,
+    max_mem_mb: u64,
+) -> Command {
+    let mut cmd = Command::new(lake_bin);
+    cmd.current_dir(dot_anneal)
+        .env("LEAN_NUM_THREADS", "1")
+        .arg("env")
+        .arg("lean")
+        .arg("-M")
+        .arg(max_mem_mb.to_string())
+        .arg(rel_module_path);
+    cmd
+}
+
 /// Capture MIR from `config.corpus_root`, scaffold `.anneal/`, build `Mir` and
 /// `SymbolicEval` with Lake, and run the generated Lean probe module to obtain
 /// an `AnnealOutcome` (with statement/terminator span) for every item in
@@ -2255,20 +2331,21 @@ pub fn run_anneal_oracle(
     })?;
 
     let lake_bin = resolve_lake_binary();
-    let probe_out = Command::new(&lake_bin)
-        .current_dir(&dot_anneal)
-        .env("LEAN_NUM_THREADS", "1")
-        .arg("env")
-        .arg("lean")
-        .arg("oracle/MiriOracleProbe.lean")
-        .output()
-        .map_err(|err| {
-            format!(
-                "failed to execute '{} env lean oracle/MiriOracleProbe.lean': {}",
-                lake_bin.display(),
-                err
-            )
-        })?;
+    let probe_max_mb = resolve_miri_oracle_lean_max_mb(MIRI_ORACLE_PROBE_LEAN_MEMORY_MB_CAP);
+    let probe_out = build_miri_oracle_lean_command(
+        &lake_bin,
+        &dot_anneal,
+        "oracle/MiriOracleProbe.lean",
+        probe_max_mb,
+    )
+    .output()
+    .map_err(|err| {
+        format!(
+            "failed to execute '{} env lean -M {probe_max_mb} oracle/MiriOracleProbe.lean': {}",
+            lake_bin.display(),
+            err
+        )
+    })?;
     if !probe_out.status.success() {
         let stdout = String::from_utf8_lossy(&probe_out.stdout);
         let stderr = String::from_utf8_lossy(&probe_out.stderr);
@@ -2331,20 +2408,21 @@ pub fn confirm_anneal_outcomes_in_kernel(
     })?;
 
     let lake_bin = resolve_lake_binary();
-    let output = Command::new(&lake_bin)
-        .current_dir(&dot_anneal)
-        .env("LEAN_NUM_THREADS", "1")
-        .arg("env")
-        .arg("lean")
-        .arg("oracle/MiriOracleConfirm.lean")
-        .output()
-        .map_err(|err| {
-            format!(
-                "failed to execute '{} env lean oracle/MiriOracleConfirm.lean': {}",
-                lake_bin.display(),
-                err
-            )
-        })?;
+    let confirm_max_mb = resolve_miri_oracle_lean_max_mb(MIRI_ORACLE_CONFIRM_LEAN_MEMORY_MB_CAP);
+    let output = build_miri_oracle_lean_command(
+        &lake_bin,
+        &dot_anneal,
+        "oracle/MiriOracleConfirm.lean",
+        confirm_max_mb,
+    )
+    .output()
+    .map_err(|err| {
+        format!(
+            "failed to execute '{} env lean -M {confirm_max_mb} oracle/MiriOracleConfirm.lean': {}",
+            lake_bin.display(),
+            err
+        )
+    })?;
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3689,6 +3767,63 @@ error: Undefined Behavior: memory access failed: null pointer is a dangling poin
         assert!(
             !confirm.contains("match stepMirState body st with"),
             "confirm module must not regress to raw stepMirState"
+        );
+    }
+
+    #[test]
+    fn miri_oracle_lean_command_bounds_threads_and_memory_headroom() {
+        const MIB_KIB: u64 = 1024;
+        const GIB_KIB: u64 = 1024 * 1024;
+
+        let cmd = build_miri_oracle_lean_command(
+            Path::new("/opt/bin/lake"),
+            Path::new("/tmp/corpus/.anneal"),
+            "oracle/MiriOracleConfirm.lean",
+            3072,
+        );
+        let envs: BTreeMap<&OsStr, Option<&OsStr>> = cmd.get_envs().collect();
+        assert_eq!(
+            envs.get(OsStr::new("LEAN_NUM_THREADS")),
+            Some(&Some(OsStr::new("1")))
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["env", "lean", "-M", "3072", "oracle/MiriOracleConfirm.lean"]
+        );
+
+        assert_eq!(
+            miri_oracle_lean_max_mb_for_avail_kib(MIRI_ORACLE_CONFIRM_LEAN_MEMORY_MB_CAP, None),
+            3072
+        );
+        assert_eq!(
+            miri_oracle_lean_max_mb_for_avail_kib(MIRI_ORACLE_PROBE_LEAN_MEMORY_MB_CAP, None),
+            4096
+        );
+        // Tight capsule cgroup (5946 MiB) and smaller budgets always withhold non-heap headroom.
+        for (cap, avail_kib) in [
+            (MIRI_ORACLE_CONFIRM_LEAN_MEMORY_MB_CAP, 512 * MIB_KIB),
+            (MIRI_ORACLE_CONFIRM_LEAN_MEMORY_MB_CAP, 2 * GIB_KIB),
+            (MIRI_ORACLE_CONFIRM_LEAN_MEMORY_MB_CAP, 4 * GIB_KIB),
+            (MIRI_ORACLE_PROBE_LEAN_MEMORY_MB_CAP, 5946 * MIB_KIB),
+            (MIRI_ORACLE_CONFIRM_LEAN_MEMORY_MB_CAP, 5946 * MIB_KIB),
+            (MIRI_ORACLE_PROBE_LEAN_MEMORY_MB_CAP, 4 * GIB_KIB + 777),
+            (MIRI_ORACLE_CONFIRM_LEAN_MEMORY_MB_CAP, 200 * MIB_KIB),
+            (MIRI_ORACLE_PROBE_LEAN_MEMORY_MB_CAP, u64::MAX),
+        ] {
+            let max_mb = miri_oracle_lean_max_mb_for_avail_kib(cap, Some(avail_kib));
+            assert!((64..=cap).contains(&max_mb));
+            assert!(max_mb.saturating_mul(1024) < avail_kib);
+            if avail_kib >= 4 * GIB_KIB {
+                assert!(avail_kib - max_mb * 1024 >= GIB_KIB);
+            }
+        }
+        assert_eq!(
+            miri_oracle_lean_max_mb_for_avail_kib(MIRI_ORACLE_CONFIRM_LEAN_MEMORY_MB_CAP, Some(0)),
+            64
         );
     }
 }
