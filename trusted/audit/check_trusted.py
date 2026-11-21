@@ -392,6 +392,51 @@ def _trusted_cache_dir(path: Path) -> bool:
             and not st.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
 
 
+def _trusted_cache_tree(cache_root: Path, target: Path, *, is_dir: bool = False) -> bool:
+    """Verify `cache_root`, every intermediate directory down to `target`, and `target` itself
+    contain no symlinks and are owned by this user with no group/world write permission."""
+    try:
+        rel = target.relative_to(cache_root)
+    except ValueError:
+        return False
+    cur = cache_root
+    if not _trusted_cache_dir(cur):
+        return False
+    parts = rel.parts
+    for part in parts[:-1]:
+        cur = cur / part
+        if not _trusted_cache_dir(cur):
+            return False
+    if not parts:
+        return is_dir
+    return _trusted_cache_dir(target) if is_dir else _trusted_cache_file(target)
+
+
+def _ensure_trusted_cache_dir(cache_root: Path, target_dir: Path) -> bool:
+    """Create `cache_root`..`target_dir` with private permissions if absent, and confirm every
+    directory in the chain satisfies `_trusted_cache_dir` (refusing symlinks or shared dirs)."""
+    try:
+        rel = target_dir.relative_to(cache_root)
+    except ValueError:
+        return False
+    try:
+        if not cache_root.exists() and not cache_root.is_symlink():
+            cache_root.mkdir(parents=True, exist_ok=True)
+            cache_root.chmod(0o700)
+        if not _trusted_cache_dir(cache_root):
+            return False
+        cur = cache_root
+        for part in rel.parts:
+            cur = cur / part
+            if not cur.exists() and not cur.is_symlink():
+                cur.mkdir(mode=0o700)
+            if not _trusted_cache_dir(cur):
+                return False
+        return True
+    except OSError:
+        return False
+
+
 def _canonical_regular(path: Path) -> bool:
     """True iff `path` is an absolute, canonical, non-symlinked regular file whose containing
     directory also resolves to itself."""
@@ -491,7 +536,7 @@ class Checker:
     def _get_compiled_inspector(self) -> Path | None:
         if not self.fast or self.cache_dir is None or self.expected_lean_sha is None:
             return None
-        if self._compiled_inspector is not None and _trusted_cache_file(self._compiled_inspector):
+        if self._compiled_inspector is not None and _trusted_cache_tree(self.cache_dir, self._compiled_inspector):
             return self._compiled_inspector
         leanc = self.lean.parent / "leanc"
         if not leanc.is_file():
@@ -505,11 +550,12 @@ class Checker:
         })
         bin_dir = self.cache_dir / "inspector-bin"
         bin_path = bin_dir / f"TrustedBoundary-{bin_key}"
-        if _trusted_cache_file(bin_path) and os.access(bin_path, os.X_OK):
+        if _trusted_cache_tree(self.cache_dir, bin_path) and os.access(bin_path, os.X_OK):
             self._compiled_inspector = bin_path
             return bin_path
+        if not _ensure_trusted_cache_dir(self.cache_dir, bin_dir):
+            return None
         try:
-            bin_dir.mkdir(parents=True, exist_ok=True)
             tmp_dir = Path(tempfile.mkdtemp(prefix=f"tmp-insp-{bin_key[:12]}-", dir=bin_dir))
         except OSError:
             return None
@@ -554,8 +600,10 @@ class Checker:
         `lean --run`, so the gate itself never depends on a cache."""
         if self.expected_lean_sha is None or not hasattr(self, "olean_auditor_hash"):
             return None
-        if self._compiled_olean_auditor is not None and _trusted_cache_file(self._compiled_olean_auditor):
-            return self._compiled_olean_auditor
+        if self._compiled_olean_auditor is not None:
+            root_for_bin = self.cache_dir if (self.fast and self.cache_dir is not None) else self._compiled_olean_auditor.parent
+            if _trusted_cache_tree(root_for_bin, self._compiled_olean_auditor):
+                return self._compiled_olean_auditor
         leanc = self.lean.parent / "leanc"
         if not leanc.is_file():
             return None
@@ -569,12 +617,13 @@ class Checker:
         })
         created_bin_dir = False
         if self.fast and self.cache_dir is not None:
+            cache_root = self.cache_dir
             bin_dir = self.cache_dir / "inspector-bin"
         else:
             # Without `--fast` nothing is shared across runs: the binary is built from the staged,
             # hashed source once per process in a private temporary directory.
             known = _PROCESS_OLEAN_BINARIES.get(bin_key)
-            if known is not None and _trusted_cache_file(known) and os.access(known, os.X_OK):
+            if known is not None and _trusted_cache_tree(known.parent, known) and os.access(known, os.X_OK):
                 self._compiled_olean_auditor = known
                 return known
             try:
@@ -582,12 +631,16 @@ class Checker:
                 created_bin_dir = True
             except OSError:
                 return None
+            cache_root = bin_dir
         bin_path = bin_dir / f"OleanEnvAuditor-{bin_key}"
-        if _trusted_cache_file(bin_path) and os.access(bin_path, os.X_OK):
+        if _trusted_cache_tree(cache_root, bin_path) and os.access(bin_path, os.X_OK):
             self._compiled_olean_auditor = bin_path
             return bin_path
+        if not _ensure_trusted_cache_dir(cache_root, bin_dir):
+            if created_bin_dir:
+                shutil.rmtree(bin_dir, ignore_errors=True)
+            return None
         try:
-            bin_dir.mkdir(parents=True, exist_ok=True)
             tmp_dir = Path(tempfile.mkdtemp(prefix=f"tmp-olean-{bin_key[:12]}-", dir=bin_dir))
         except OSError:
             if created_bin_dir:
@@ -747,7 +800,7 @@ class Checker:
             return False
         entry_dir = self.cache_dir / "olean" / cache_key
         meta_path = entry_dir / "meta.json"
-        if not _trusted_cache_dir(entry_dir) or not _trusted_cache_file(meta_path):
+        if not _trusted_cache_tree(self.cache_dir, meta_path):
             return False
         try:
             meta = json.loads(meta_path.read_text())
@@ -757,7 +810,7 @@ class Checker:
             return False
         for part, expected_sha in meta.items():
             cached_part = entry_dir / f"artifact.{part}"
-            if not _trusted_cache_file(cached_part) or digest(cached_part) != expected_sha:
+            if not _trusted_cache_tree(self.cache_dir, cached_part) or digest(cached_part) != expected_sha:
                 return False
         output.parent.mkdir(parents=True, exist_ok=True)
         available = {}
@@ -778,11 +831,12 @@ class Checker:
         if not self.fast or self.cache_dir is None:
             return
         olean_root = self.cache_dir / "olean"
+        if not _ensure_trusted_cache_dir(self.cache_dir, olean_root):
+            return
         entry_dir = olean_root / cache_key
-        if entry_dir.exists():
+        if entry_dir.exists() or entry_dir.is_symlink():
             return
         try:
-            olean_root.mkdir(parents=True, exist_ok=True)
             tmp_dir = Path(tempfile.mkdtemp(prefix=f"tmp-{cache_key[:12]}-", dir=olean_root))
         except OSError:
             return
@@ -792,7 +846,7 @@ class Checker:
                 shutil.copyfile(path_str, tmp_dir / f"artifact.{part}")
                 meta[part] = self.expected_artifacts[path_str]
             (tmp_dir / "meta.json").write_text(json.dumps(meta, sort_keys=True))
-            if entry_dir.exists():
+            if entry_dir.exists() or entry_dir.is_symlink():
                 shutil.rmtree(tmp_dir, ignore_errors=True)
             else:
                 os.replace(tmp_dir, entry_dir)
@@ -804,7 +858,7 @@ class Checker:
         cache_key = self._inspect_cache_key(mode, fields)
         if cache_key is not None and self.cache_dir is not None:
             cache_file = self.cache_dir / "inspect" / f"{mode}-{cache_key}.json"
-            if _trusted_cache_file(cache_file):
+            if _trusted_cache_tree(self.cache_dir, cache_file):
                 try:
                     cached_result = json.loads(cache_file.read_text())
                     if isinstance(cached_result, dict):
@@ -855,14 +909,14 @@ class Checker:
         self.validate_result(mode, result, fields)
         if cache_key is not None and self.cache_dir is not None:
             inspect_dir = self.cache_dir / "inspect"
-            try:
-                inspect_dir.mkdir(parents=True, exist_ok=True)
-                tmp_fd, tmp_name = tempfile.mkstemp(prefix=f"tmp-{mode}-", dir=inspect_dir)
-                with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
-                    json.dump(result, handle, sort_keys=True)
-                os.replace(tmp_name, inspect_dir / f"{mode}-{cache_key}.json")
-            except OSError:
-                pass
+            if _ensure_trusted_cache_dir(self.cache_dir, inspect_dir):
+                try:
+                    tmp_fd, tmp_name = tempfile.mkstemp(prefix=f"tmp-{mode}-", dir=inspect_dir)
+                    with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+                        json.dump(result, handle, sort_keys=True)
+                    os.replace(tmp_name, inspect_dir / f"{mode}-{cache_key}.json")
+                except OSError:
+                    pass
         return result
 
     def validate_result(self, mode, result, fields):

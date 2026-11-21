@@ -979,6 +979,24 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         disposable.append(bad_rc.stage)
         assert not bad_rc._restore_cached_module("BadMod", "badkey", bad_rc.stage / "BadMod.olean")
         shutil.rmtree(bad_cache, ignore_errors=True)
+        # Symlinked or world-writable `cache/inspect` directories must never be read or written.
+        sym_cache = suite / "sym-inspect-cache"
+        sym_target = suite / "sym-inspect-target"
+        sym_cache.mkdir(mode=0o700)
+        sym_target.mkdir(mode=0o700)
+        (sym_cache / "inspect").symlink_to(sym_target)
+        assert not runner._ensure_trusted_cache_dir(sym_cache, sym_cache / "inspect")
+        (sym_target / "probe.json").write_text("{}")
+        assert not runner._trusted_cache_tree(sym_cache, sym_cache / "inspect" / "probe.json")
+        ww_cache = suite / "ww-inspect-cache"
+        (ww_cache / "inspect").mkdir(parents=True)
+        (ww_cache / "inspect").chmod(0o777)
+        (ww_cache / "inspect" / "probe.json").write_text("{}")
+        assert not runner._trusted_cache_tree(ww_cache, ww_cache / "inspect" / "probe.json")
+        assert not runner._ensure_trusted_cache_dir(ww_cache, ww_cache / "inspect")
+        shutil.rmtree(sym_cache, ignore_errors=True)
+        shutil.rmtree(sym_target, ignore_errors=True)
+        shutil.rmtree(ww_cache, ignore_errors=True)
         done("compiled-environment auditor: 0-FP positive control, --audit-olean API, cache trust")
 
         # Group 20: artifact completeness and all-parts provenance. A `module` file's private axiom
@@ -1140,7 +1158,58 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                      "FTwo._sparseCasesOn_dupdef", "duplicate default alternative",
                      "[unsafeDeclaration] unsafeBaseIO", "duplicate IR declaration entry",
                      toolchainRoots=["Init", "Std", "Lean"])
-        done("metaprogram-forged csimp/cpass/folder state, intrinsic tag ordering/IR-unsafe, Lean library foreign")
+        # Forged LCNF compiler-extension state (ElimDeadBranches summary, baseExt/monoExt
+        # duplicates, single uncompiled IR entry via `Lean.addDecl`, forged `_unsafe_rec`
+        # companion on a non-recursive def, and non-Prop side binder in `_sparseCasesOn`).
+        forged_lcnf_source = "prelude\nimport Init\nimport Lean\n" + (
+            "inductive FSide where | a | b\n"
+            "def FSide._sparseCasesOn_side.{u} {motive : FSide → Sort u} (t : FSide)\n"
+            "    (_extra : Nat) (altA : motive .a) (altB : motive .b) : motive t :=\n"
+            "  FSide.casesOn t altA altB\n"
+            "run_cmd Lean.modifyEnv (Lean.markSparseCasesOn · ``FSide._sparseCasesOn_side)\n"
+            "@[noinline] def fDeadFlag (b : Bool) : Bool := b\n"
+            "run_cmd Lean.modifyEnv fun env =>\n"
+            "  Lean.Compiler.LCNF.UnreachableBranches.addFunctionSummary env ``fDeadFlag (.ctor ``Bool.true #[])\n"
+            "@[inline] def fBaseVictim (n : Nat) : Nat := n\n"
+            "def fMonoVictim (n : Nat) : Nat := n\n"
+            "def fEvilConst (_ : Nat) : Nat := 999\n"
+            "run_cmd do\n"
+            "  let env ← Lean.getEnv\n"
+            "  let some eb := Lean.Compiler.LCNF.getDeclCore? env Lean.Compiler.LCNF.baseExt ``fEvilConst | throwError \"no b\"\n"
+            "  let some em := Lean.Compiler.LCNF.getDeclCore? env Lean.Compiler.LCNF.monoExt ``fEvilConst | throwError \"no m\"\n"
+            "  Lean.modifyEnv fun e =>\n"
+            "    let e := Lean.Compiler.LCNF.baseExt.addEntry e { eb with name := ``fBaseVictim }\n"
+            "    Lean.Compiler.LCNF.monoExt.addEntry e { em with name := ``fMonoVictim }\n"
+            "run_cmd Lean.Elab.Command.liftCoreM do\n"
+            "  let natTy := Lean.mkConst ``Nat\n"
+            "  let fnTy := Lean.Expr.forallE `n natTy natTy .default\n"
+            "  let idVal := Lean.Expr.lam `n natTy (.bvar 0) .default\n"
+            "  Lean.addDecl (.defnDecl { name := `fGhost, levelParams := [], type := fnTy, value := idVal, hints := .abbrev, safety := .safe })\n"
+            "  let env ← Lean.getEnv\n"
+            "  let some tplIR := Lean.IR.findEnvDecl env ``fEvilConst | throwError \"no ir\"\n"
+            "  let some tplSig := Lean.Compiler.LCNF.getSigCore? env Lean.Compiler.LCNF.impureSigExt ``fEvilConst | throwError \"no sig\"\n"
+            "  let forgedIR := match tplIR with | .fdecl _ xs ty b info => .fdecl `fGhost xs ty b info | o => o\n"
+            "  Lean.modifyEnv fun e =>\n"
+            "    Lean.IR.declMapExt.addEntry (Lean.Compiler.LCNF.impureSigExt.addEntry e { tplSig with name := `fGhost }) forgedIR\n"
+            "  let pName := `fNonRec\n"
+            "  let recName := Lean.Name.str pName (\"_unsafe\" ++ \"_rec\")\n"
+            "  let parentDecl := Lean.Declaration.defnDecl { name := pName, levelParams := [], type := fnTy, value := idVal, hints := .abbrev, safety := .safe }\n"
+            "  Lean.addDecl parentDecl\n"
+            "  let motive := Lean.Expr.lam `_ natTy natTy .default\n"
+            "  let succCase := Lean.Expr.lam `_ natTy (Lean.Expr.app (Lean.mkConst recName) (Lean.mkConst ``Nat.zero)) .default\n"
+            "  let body := Lean.mkApp4 (Lean.mkConst ``Nat.casesOn [.succ .zero]) motive (.bvar 0) (Lean.mkRawNatLit 999) succCase\n"
+            "  Lean.addDecl (.mutualDefnDecl [{ name := recName, levelParams := [], type := fnTy, value := Lean.Expr.lam `n natTy body .default, hints := .opaque, safety := .partial }])\n"
+            "  Lean.compileDecl parentDecl\n")
+        olean_module(ol, "OlForgedLcnf", forged_lcnf_source, ["Init", "Lean"])
+        olean_reject(ol, ["OlForgedLcnf"],
+                     "FSide._sparseCasesOn_side", "side condition is not a Prop",
+                     "fDeadFlag", "dead_branch_summary",
+                     "fBaseVictim", "lcnf_ir_mismatch",
+                     "fMonoVictim",
+                     "fGhost", "IR body for definition without base-phase LCNF declaration",
+                     "fNonRec", "does not use a recursion combinator",
+                     toolchainRoots=["Init", "Std", "Lean"])
+        done("metaprogram-forged csimp/cpass/folder/LCNF/companion state, intrinsic tags, IR-unsafe, Lean library foreign")
 
         # Group 24: separate compilation (`-Dcompiler.postponeCompile=true`) of a `module` file
         # writes no IR for public or private functions.
@@ -1220,17 +1289,25 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         # non-toolchain declaration reusing a name the pinned toolchain declares is rejected, even
         # when the declaring toolchain module is not imported.
         olean_module(ol, "OlSpoofToolchainName", "prelude\nimport Init.Prelude\n"
-                     "def Void.nonemptyType : Nat := 0\n", ["Init.Prelude"])
-        olean_reject(ol, ["OlSpoofToolchainName"], "[compilerOverrideAttribute] Void.nonemptyType", "toolchain_name")
-        # Source rule: a raw string `r"\"` has no escapes, so it must not hide the next line.
+                     "def Void.nonemptyType : Nat := 0\n"
+                     "def Lean.Compiler.LCNF.PassInstaller : Nat := 1\n", ["Init.Prelude"])
+        olean_reject(ol, ["OlSpoofToolchainName"], "[compilerOverrideAttribute] Void.nonemptyType",
+                     "[compilerOverrideAttribute] Lean.Compiler.LCNF.PassInstaller", "toolchain_name")
+        # Source rule: a raw string `r"\"` has no escapes, and prefix `!` before `"{"` is not an
+        # interpolated string, so neither may blind the scanner to a following `_unsafe_rec` ident.
         raw_src = "prelude\nimport Init\ndef rawS : String := r\"\\\"\ndef hiddenRaw._unsafe_rec (n : Nat) : Nat := n\n" \
                   "def rawT : String := \"x\"\n"
         olean_module(ol, "OlRawString", raw_src, ["Init"])
         olean_reject(ol, ["OlRawString"], "[sourceForbiddenIdentifier] hiddenRaw._unsafe_rec",
                      sources=[("OlRawString", str(ol.stage / "olean-src/OlRawString.lean"))])
+        bang_src = "prelude\nimport Init.Notation\ninstance : Coe String Bool where coe _ := true\n" \
+                   "def blindBang : Bool := !\"{\"\ndef hidden_unsafe_rec : Nat := 1\n"
+        olean_module(ol, "OlBangString", bang_src, ["Init.Notation"])
+        olean_reject(ol, ["OlBangString"], "[sourceForbiddenIdentifier] hidden_unsafe_rec",
+                     sources=[("OlBangString", str(ol.stage / "olean-src/OlBangString.lean"))])
         runner.make_tree_writable(ol.stage)
         shutil.rmtree(ol.stage)
-        done("pure Lean 4 hardcoded compiler-intrinsic and toolchain-owned name spoofing, raw-string source scan")
+        done("pure Lean 4 hardcoded compiler-intrinsic and toolchain-owned name spoofing, raw/bang-string source scan")
 
         # Group 28: `trusted/root-manifest.sha256` verification before any Lean child.
         root = fixture()

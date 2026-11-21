@@ -10,6 +10,7 @@ import Lean.Compiler.LCNF.PhaseExt
 import Lean.Compiler.LCNF.Main
 import Lean.Compiler.LCNF.Passes
 import Lean.Compiler.LCNF.Simp.ConstantFold
+import Lean.Compiler.LCNF.ElimDeadBranches
 import Lean.Compiler.LCNF.Util
 import Lean.AuxRecursor
 import Lean.Meta.Basic
@@ -189,6 +190,18 @@ def parseRequest (j : Json) : IO Request := do
   for lm in localAxiomModules do
     unless validModuleName lm && seenMods.contains lm do
       fail s!"invalid localAxiomModules entry {lm}"
+  let statementForbidden := toNames (← optField (α := Array String) j "statementForbidden" #[])
+  for sf in statementForbidden do
+    unless validModuleName sf do fail s!"invalid statementForbidden entry {sf}"
+  let statementUnfold := toNames (← optField (α := Array String) j "statementUnfold" #[])
+  for su in statementUnfold do
+    unless validModuleName su do fail s!"invalid statementUnfold entry {su}"
+  let rawSources ← optField (α := Array (String × String)) j "sources" #[]
+  let mut sources := #[]
+  for (m, p) in rawSources do
+    let mName := m.toName
+    unless validModuleName mName do fail s!"invalid source module name {m}"
+    sources := sources.push (mName, System.FilePath.mk p)
   let graph := match j.getObjVal? "graph" with | .ok g => some g | .error _ => none
   return {
     sysroot := ⟨← reqField (α := String) j "sysroot"⟩
@@ -200,10 +213,9 @@ def parseRequest (j : Json) : IO Request := do
     axioms := ← reqField (α := Array (String × String)) j "axioms"
     localAxiomModules
     claimModules
-    statementForbidden := toNames (← optField (α := Array String) j "statementForbidden" #[])
-    statementUnfold := toNames (← optField (α := Array String) j "statementUnfold" #[])
-    sources := (← optField (α := Array (String × String)) j "sources" #[]).map
-      fun (m, p) => (m.toName, System.FilePath.mk p)
+    statementForbidden
+    statementUnfold
+    sources
     allowProvisionalNative := ← optField (α := Bool) j "allowProvisionalNative" false
     toolchainRoots
     scope := ← optField (α := String) j "scope" "modules"
@@ -396,7 +408,10 @@ def listToolchainModules (libDir : System.FilePath) (roots : Array Name) : IO (A
       pending := rest
       unless ← dir.isDir do continue
       for entry in ← dir.readDir do
-        if ← entry.path.isDir then
+        let md ← entry.path.symlinkMetadata
+        if md.type == .symlink then
+          fail s!"[moduleProvenanceSpoofed] symlink inside toolchain library: {entry.path}"
+        if md.type == .dir then
           pending := (entry.path, pre.str entry.fileName) :: pending
         else if entry.fileName.endsWith ".olean" then
           result := result.push (pre.str (entry.fileName.dropEnd 6).toString)
@@ -593,6 +608,10 @@ def casesLikeSemantics (env : Environment) (toolchainProv : Std.HashSet Name) (n
     let ni := indVal.numIndices
     unless cinfo.discrPos == np + 1 + ni do return .error "unexpected major premise position"
     let hasSide := cinfo.altsRange.lower == cinfo.discrPos + 2
+    unless cinfo.altsRange.lower == cinfo.discrPos + (if hasSide then 2 else 1) &&
+        cinfo.altsRange.upper == cinfo.arity &&
+        cinfo.altsRange.upper - cinfo.altsRange.lower == cinfo.altNumParams.size do
+      return .error "unexpected alternatives range in casesInfo"
     let mut obligations : Array (Expr × Expr) := #[]
     for ctor in indVal.ctors do
       let some (.ctorInfo ctorVal) := (← getEnv).find? ctor | return .error s!"missing constructor {ctor}"
@@ -614,6 +633,8 @@ def casesLikeSemantics (env : Environment) (toolchainProv : Std.HashSet Name) (n
           let rest' ← Meta.instantiateForall rest (is'.push major)
           let continueWith (side : Array Expr) (rest'' : Expr) : MetaM (Except String (Option (Expr × Expr))) := do
             Meta.forallTelescope rest'' fun alts _ => do
+              unless alts.size == cinfo.altNumParams.size do
+                return .error "alternative binder count differs from casesInfo"
               let lhs := mkAppN (mkConst n (lparams.map mkLevelParam)) (pm ++ is' ++ #[major] ++ side ++ alts)
               let mut chosen : Option (Expr × Nat) := none
               let mut dflt : Option (Expr × Nat) := none
@@ -638,6 +659,9 @@ def casesLikeSemantics (env : Environment) (toolchainProv : Std.HashSet Name) (n
           if hasSide then
             Meta.forallBoundedTelescope rest' (some 1) fun hs rest'' => do
               unless hs.size == 1 do return .error "missing side condition"
+              let rawSideTy ← Meta.inferType hs[0]!
+              unless ← Meta.isProp rawSideTy do
+                return .error "side condition is not a Prop"
               let r ← continueWith hs rest''
               match r with
               | .ok none =>
@@ -645,7 +669,6 @@ def casesLikeSemantics (env : Environment) (toolchainProv : Std.HashSet Name) (n
                 -- confirm directly in the kernel that the side condition reduces to `x = y` (`x ≠ y`).
                 unless isToolchainConst (← getEnv) toolchainProv ``Nat do
                   return .error "Nat does not originate from a verified toolchain module"
-                let rawSideTy ← Meta.inferType hs[0]!
                 let hTy ← Meta.whnf rawSideTy
                 match hTy.eq? with
                 | some (eqTy, a, b) =>
@@ -772,7 +795,9 @@ def noConfusionSemantics (env : Environment) (toolchainProv : Std.HashSet Name) 
         let b := xs[rhsPos]!
         let mut found := false
         for i in [1 + 2 * w : arity] do
-          let t ← Meta.whnf (← Meta.inferType xs[i]!)
+          let ty ← Meta.inferType xs[i]!
+          unless ← Meta.isProp ty do return false
+          let t ← Meta.whnf ty
           if let some (_, x, y) := t.eq? then
             if x == a && y == b then found := true
           if let some (_, x, _, y) := t.heq? then
@@ -961,9 +986,11 @@ def matchRawStrEnd (cs : Array Char) (i hashes : Nat) : Bool := Id.run do
   return true
 
 /-- Identifier tokens of Lean source text outside comments and plain/raw string literals, while
-handling single-quoted `Char` literals and descending into `{...}` expressions inside interpolated
-strings (`s!"..."`, `m!"..."`, `f!"..."`). Total bounded loop: every iteration strictly advances `i`. -/
-def scanIdents (text : String) : Array String := Id.run do
+handling single-quoted `Char` literals and descending into `{...}` expressions inside Lean's
+built-in interpolated strings (`s!"..."`, `m!"..."`, `f!"..."`). Returns `(tokens, balanced)` where
+`balanced` is `false` if scanning reached EOF inside an unclosed string, raw string, comment,
+guillemet, or interpolation state (fail-closed guard against lexer desynchronization). -/
+def scanIdents (text : String) : Array String × Bool := Id.run do
   let cs := text.toList.toArray
   let mut acc : Array String := #[]
   let mut cur : List Char := []
@@ -1021,7 +1048,7 @@ def scanIdents (text : String) : Array String := Id.run do
             i := nextI
             continue
         let isStart := (c == '-' && d? == some '-') || (c == '/' && d? == some '-') || c == '"'
-        let isInterpOpen := c == '"' && (match cur with | '!' :: _ => true | _ => false)
+        let isInterpOpen := c == '"' && (cur == ['!', 's'] || cur == ['!', 'm'] || cur == ['!', 'f'])
         if isStart || !(isIdentChar c || c == '«') then
           if !cur.isEmpty then acc := acc.push (String.ofList cur.reverse)
           cur := []
@@ -1052,7 +1079,8 @@ def scanIdents (text : String) : Array String := Id.run do
           i := i + 1
     else break
   if !cur.isEmpty then acc := acc.push (String.ofList cur.reverse)
-  return acc
+  let balanced := !inStr && rawHashes.isNone && depth == 0 && !inGuil && interpStack.isEmpty
+  return (acc, balanced)
 
 def forbiddenSourceIdentifier (tok : String) : Bool :=
   (tok.splitOn "_unsafe_rec").length > 1
@@ -1145,9 +1173,35 @@ def checkAxiom (L : Loaded) (ci : ConstantInfo) (m : Name) (localOk : Name → B
     return
   report "unapprovedAxiom" n m "axiom outside the locked toolchain policy"
 
+/-- Does `c` name a recursion/fixpoint combinator emitted by Lean's equation compiler? -/
+def isRecursionCombinator (c : Name) : Bool :=
+  c == ``WellFounded.fix || c == ``WellFounded.Nat.fix || c == ``WellFounded.fixF ||
+  c == ``Acc.rec || c.getRoot == `Lean ||
+  (match c with
+   | .str _ s => s == "brecOn" || s.startsWith "brecOn_" || s == "rec" || s == "recOn"
+   | _ => false)
+
+/-- Does `parentCi`'s body (or its same-module `_unary` / `_mutual` helper) use a recursion
+combinator, as every equation-compiler parent of a genuine `_unsafe_rec` companion does? -/
+def parentUsesRecursionCombinator (env : Environment) (parent : Name) (parentCi : ConstantInfo)
+    (recMod : Option Name) : Bool := Id.run do
+  let checkCi (ci : ConstantInfo) : Bool :=
+    match ci.value? (allowOpaque := true) with
+    | some v => v.getUsedConstants.any isRecursionCombinator
+    | none => false
+  if checkCi parentCi then return true
+  for suffix in #["_unary", "_mutual"] do
+    let helper := parent.str suffix
+    if origin? env helper == recMod then
+      if let some hci := env.find? helper then
+        if checkCi hci then return true
+  return false
+
 /-- Is `ci` a genuine equation-compiler code-generation companion `p._unsafe_rec`? -/
 def genuineCompanion (L : Loaded) (ci : ConstantInfo) : Except String Unit := do
   let .str parent "_unsafe_rec" := ci.name | throw "not a companion name"
+  if (match parent with | .str _ "_unsafe_rec" => true | _ => false) then
+    throw "nested _unsafe_rec companion"
   unless ci.isPartial && !ci.isUnsafe do throw "companion is not a safe partial definition"
   let some parentCi := L.env.find? parent | throw s!"companion without parent {parent}"
   unless parentCi matches .defnInfo _ do
@@ -1158,9 +1212,13 @@ def genuineCompanion (L : Loaded) (ci : ConstantInfo) : Except String Unit := do
   let recMod := origin? L.env ci.name
   unless recMod.isSome && origin? L.env parent == recMod do
     throw "companion and parent are declared in different modules"
+  unless parentUsesRecursionCombinator L.env parent parentCi recMod do
+    throw s!"companion parent {parent} does not use a recursion combinator"
   let body := (ci.value? (allowOpaque := true)).getD (mkConst ``True)
-  unless body.getUsedConstants.any (fun c => match c with | .str _ "_unsafe_rec" => true | _ => false) do
-    throw "companion body is not recursive through _unsafe_rec"
+  unless body.getUsedConstants.any (fun c =>
+      (match c with | .str _ "_unsafe_rec" => true | _ => false) &&
+      origin? L.env c == recMod) do
+    throw "companion body is not recursive through a same-module _unsafe_rec"
 
 /-- A lazily realized reserved theorem (`.eq_def`, `.eq_1`, ...) may be stored by several audited
 modules with different proofs of the same statement; the environment keeps one of them. Another
@@ -1291,6 +1349,144 @@ def scanModuleEntries (L : Loaded) : AuditM (Std.HashSet (Name × Name × Name) 
     report "compilerOverrideAttribute" `constant_fold .anonymous "constant_fold: live folder table differs from builtinFolders"
   return (toolchainCSimp, toolchainImplByTargets)
 
+/-- Lightweight summary of a trivial direct-return body across LCNF and IR phases, used to detect
+cross-phase forgery (`baseExt` vs `monoExt` vs `IR.declMapExt`) and forged `ElimDeadBranches`
+function summaries. -/
+inductive SimpleRet where
+  | param (idx : Nat)
+  | natLit (v : Nat)
+  | strLit (v : String)
+  | ctor (c : Name)
+  | other
+  deriving BEq
+
+def classifyLCNF (env : Environment) (d : Compiler.LCNF.Decl .pure) : SimpleRet :=
+  match d.value with
+  | .extern .. => .other
+  | .code code =>
+    let paramIdx (fv : FVarId) : Option Nat := d.params.findIdx? (·.fvarId == fv)
+    match code with
+    | .return fv =>
+      match paramIdx fv with
+      | some i => .param i
+      | none => .other
+    | .let ld (.return fv) =>
+      if ld.fvarId == fv then
+        match ld.value with
+        | .lit (.nat v) => .natLit v
+        | .lit (.str v) => .strLit v
+        | .fvar fv2 #[] =>
+          match paramIdx fv2 with
+          | some i => .param i
+          | none => .other
+        | .const c _ _ =>
+          if env.find? c matches some (.ctorInfo _) then .ctor c else .other
+        | _ => .other
+      else .other
+    | _ => .other
+
+def classifyIR (d : IR.Decl) : SimpleRet :=
+  match d with
+  | .extern .. => .other
+  | .fdecl _ xs _ body _ =>
+    let paramIdx (v : IR.VarId) : Option Nat := xs.findIdx? (·.x == v)
+    let rec stripRC (b : IR.FnBody) (fuel : Nat) : IR.FnBody :=
+      match fuel, b with
+      | 0, _ => b
+      | fuel + 1, .inc _ _ _ _ rest => stripRC rest fuel
+      | fuel + 1, .dec _ _ _ _ rest => stripRC rest fuel
+      | _, _ => b
+    match stripRC body 16 with
+    | .ret (.var v) =>
+      match paramIdx v with
+      | some i => .param i
+      | none => .other
+    | .vdecl x _ (.lit (.num v)) rest =>
+      match stripRC rest 16 with
+      | .ret (.var y) => if x == y then .natLit v else .other
+      | _ => .other
+    | .vdecl x _ (.lit (.str v)) rest =>
+      match stripRC rest 16 with
+      | .ret (.var y) => if x == y then .strLit v else .other
+      | _ => .other
+    | _ => .other
+
+/-- Cross-phase compatibility: ignore `.other` and `.ctor` (trivial structures erase `.ctor` to
+`.param` in `mono`, and enums lower `.ctor` to `.natLit` in `IR`), while rejecting direct
+contradictions between `.param`, `.natLit`, and `.strLit`. -/
+def simpleRetCompat (a b : SimpleRet) : Bool :=
+  match a, b with
+  | .other, _ | _, .other | .ctor _, _ | _, .ctor _ => true
+  | .natLit x, .natLit y => x == y
+  | .strLit x, .strLit y => x == y
+  | .param _, .param _ => true
+  | _, _ => false
+
+/-- Check whether an `ElimDeadBranches` summary value is consistent with a trivial `mono` body. -/
+def summaryCompatWithMono (ret : SimpleRet)
+    (val : Compiler.LCNF.UnreachableBranches.Value) : Bool :=
+  match val with
+  | .top => true
+  | .bot =>
+    match ret with
+    | .other => true
+    | _ => false
+  | .ctor c _ =>
+    match ret with
+    | .param _ => false
+    | .ctor c' => c == c'
+    | _ => true
+  | .choice vs =>
+    match ret with
+    | .param _ => false
+    | .ctor c' => vs.any fun | .ctor c _ => c == c' | _ => true
+    | _ => true
+
+/-- Collect constant callees directly mentioned in an LCNF pure `Code` tree (total bounded walk;
+returns `none` on fuel exhaustion so callers fail closed with `auditFuelExhausted`). -/
+def collectLCNFCodeConsts (code : Compiler.LCNF.Code .pure) (acc : NameSet) (fuel : Nat) :
+    Option NameSet :=
+  match fuel with
+  | 0 => none
+  | fuel + 1 =>
+    match code with
+    | .let ld k =>
+      let acc := match ld.value with
+        | .const c _ _ => acc.insert c
+        | _ => acc
+      collectLCNFCodeConsts k acc fuel
+    | .fun fd k | .jp fd k => do
+      let acc ← collectLCNFCodeConsts fd.value acc fuel
+      collectLCNFCodeConsts k acc fuel
+    | .cases cs =>
+      cs.alts.foldlM (init := acc) fun a alt =>
+        collectLCNFCodeConsts alt.getCode a fuel
+    | .jmp .. | .return .. | .unreach .. => some acc
+
+/-- Check callees of a pure LCNF declaration (base/mono) for unsafe or partial targets. -/
+def checkLCNFDeclCallees (L : Loaded) (m : Name) (phaseLabel : String)
+    (toolchainImplByTargets : NameSet) (d : Compiler.LCNF.Decl .pure) : AuditM Unit := do
+  let env := L.env
+  let n := d.name
+  let .code code := d.value | return
+  let some consts := collectLCNFCodeConsts code {} 16384
+    | report "auditFuelExhausted" n m s!"{phaseLabel} LCNF callee scan exhausted its fuel"; return
+  for c in consts do
+    if c == n then continue
+    if let some cm := origin? env c then
+      if let some cci := env.find? c then
+        if cci.isUnsafe then
+          unless L.toolchainProv.contains cm &&
+              (compilerBorrowedUnsafeIntrinsics.contains c || toolchainImplByTargets.contains c) do
+            report "unsafeDeclaration" c m s!"{phaseLabel} LCNF callee of {n} invokes unsafe declaration {c} from {cm}"
+        else if cci.isPartial then
+          unless (match c with | .str _ "_unsafe_rec" => true | _ => false) do
+            report "partialOrUnsafeRecDependency" c m s!"{phaseLabel} LCNF callee of {n} invokes partial declaration {c} from {cm}"
+        if let .opaqueInfo _ := cci then
+          if let some sib := env.find? (c.str "_unsafe_rec") then
+            if sib.isPartial || sib.isUnsafe then
+              report "partialOrUnsafeRecDependency" c m s!"{phaseLabel} LCNF callee of {n} invokes partial def {c} from {cm}"
+
 /-- Audit `sorryDep?` and every callee of a concrete IR declaration `d`. -/
 def checkIRDeclBody (L : Loaded) (m : Name) (toolchainImplByTargets : NameSet) (d : IR.Decl) :
     AuditM Unit := do
@@ -1366,22 +1562,87 @@ def checkModuleIR (L : Loaded) (i : Nat) (m : Name) (data : ModuleData)
   for n in data.extraConstNames do
     unless origin? env n == some m do
       report "environmentLoadFailed" n m "IR helper provenance mismatch"
-  -- Compiled code that exists but was not loaded: a signature or an LCNF base/mono body without IR.
+  -- Compiled code that exists but was not loaded, plus duplicate/provenance checks on LCNF
+  -- phase tables and dead-branch summaries, and cross-phase consistency for compiled definitions.
+  let mut seenSig : NameSet := {}
   for sig in Compiler.LCNF.impureSigExt.getModuleEntries env i do
-    if (IR.findEnvDecl env sig.name).isNone then
-      report "environmentLoadFailed" sig.name m "compiled signature without IR body"
+    let sn := sig.name
+    if seenSig.contains sn then
+      report "environmentLoadFailed" sn m "duplicate impure signature entry in module table"
+    seenSig := seenSig.insert sn
+    unless kernelNames.contains sn || extraNames.contains sn do
+      report "environmentLoadFailed" sn m "impure signature not owned by its module"
+    unless origin? env sn == some m do
+      report "environmentLoadFailed" sn m "impure signature provenance mismatch"
+    if (IR.findEnvDecl env sn).isNone then
+      report "environmentLoadFailed" sn m "compiled signature without IR body"
+  let mut seenSigIR : NameSet := {}
   for sig in Compiler.LCNF.impureSigExt.getModuleIREntries env i do
-    if (IR.findEnvDecl env sig.name).isNone then
-      report "environmentLoadFailed" sig.name m "compiled signature without IR body"
+    let sn := sig.name
+    if seenSigIR.contains sn then
+      report "environmentLoadFailed" sn m "duplicate impure signature entry in IR table"
+    seenSigIR := seenSigIR.insert sn
+    unless kernelNames.contains sn || extraNames.contains sn do
+      report "environmentLoadFailed" sn m "impure IR signature not owned by its module"
+    unless origin? env sn == some m do
+      report "environmentLoadFailed" sn m "impure IR signature provenance mismatch"
+    if (IR.findEnvDecl env sn).isNone then
+      report "environmentLoadFailed" sn m "compiled signature without IR body"
+  let mut seenBase : NameSet := {}
   for bd in Compiler.LCNF.baseExt.getModuleEntries env i do
-    if (IR.findEnvDecl env bd.name).isNone then
-      report "environmentLoadFailed" bd.name m "base-phase LCNF body without IR body"
+    let bn := bd.name
+    if seenBase.contains bn then
+      report "environmentLoadFailed" bn m "duplicate base-phase LCNF declaration entry"
+    seenBase := seenBase.insert bn
+    unless kernelNames.contains bn || extraNames.contains bn do
+      report "environmentLoadFailed" bn m "base-phase LCNF declaration not owned by its module"
+    unless origin? env bn == some m do
+      report "environmentLoadFailed" bn m "base-phase LCNF declaration provenance mismatch"
+    if (IR.findEnvDecl env bn).isNone then
+      report "environmentLoadFailed" bn m "base-phase LCNF body without IR body"
+    checkLCNFDeclCallees L m "base" toolchainImplByTargets bd
+  let mut seenMono : NameSet := {}
   for md in Compiler.LCNF.monoExt.getModuleEntries env i do
-    if (IR.findEnvDecl env md.name).isNone then
-      report "environmentLoadFailed" md.name m "mono-phase LCNF body without IR body"
+    let mn := md.name
+    if seenMono.contains mn then
+      report "environmentLoadFailed" mn m "duplicate mono-phase LCNF declaration entry"
+    seenMono := seenMono.insert mn
+    unless kernelNames.contains mn || extraNames.contains mn do
+      report "environmentLoadFailed" mn m "mono-phase LCNF declaration not owned by its module"
+    unless origin? env mn == some m do
+      report "environmentLoadFailed" mn m "mono-phase LCNF declaration provenance mismatch"
+    if (IR.findEnvDecl env mn).isNone then
+      report "environmentLoadFailed" mn m "mono-phase LCNF body without IR body"
+    checkLCNFDeclCallees L m "mono" toolchainImplByTargets md
+  let mut seenSumm : NameSet := {}
+  for (dn, val) in Compiler.LCNF.UnreachableBranches.functionSummariesExt.getModuleEntries env i do
+    if seenSumm.contains dn then
+      report "environmentLoadFailed" dn m "duplicate dead-branch function summary entry"
+    seenSumm := seenSumm.insert dn
+    unless kernelNames.contains dn || extraNames.contains dn do
+      report "environmentLoadFailed" dn m "dead-branch function summary not owned by its module"
+    unless origin? env dn == some m do
+      report "environmentLoadFailed" dn m "dead-branch function summary provenance mismatch"
+    if let some md := Compiler.LCNF.getDeclCore? env Compiler.LCNF.monoExt dn then
+      unless summaryCompatWithMono (classifyLCNF env md) val do
+        report "compilerOverrideAttribute" dn m "dead_branch_summary: function summary contradicts mono LCNF body"
   for ci in data.constants do
     let n := ci.name
-    if (IR.findEnvDecl env n).isSome then continue
+    if let some irDecl := IR.findEnvDecl env n then
+      if (ci matches .defnInfo _) && !(isExtern env n || isExternC env n) then
+        let bd? := Compiler.LCNF.getDeclCore? env Compiler.LCNF.baseExt n
+        let md? := Compiler.LCNF.getDeclCore? env Compiler.LCNF.monoExt n
+        if !seenBase.contains n && bd?.isNone then
+          report "environmentLoadFailed" n m "IR body for definition without base-phase LCNF declaration"
+        if !seenMono.contains n && md?.isNone then
+          report "environmentLoadFailed" n m "IR body for definition without mono-phase LCNF declaration"
+        if let (some bd, some md) := (bd?, md?) then
+          let cb := classifyLCNF env bd
+          let cm := classifyLCNF env md
+          let ciR := classifyIR irDecl
+          unless simpleRetCompat cb cm && simpleRetCompat cm ciR && simpleRetCompat cb ciR do
+            report "compilerOverrideAttribute" n m "lcnf_ir_mismatch: base/mono LCNF and IR return values contradict each other"
+      continue
     if (Compiler.LCNF.getSigCore? env Compiler.LCNF.impureSigExt n).isSome then
       report "environmentLoadFailed" n m "compiled signature without IR body"
     if (Compiler.LCNF.getDeclCore? env Compiler.LCNF.baseExt n).isSome then
@@ -1565,9 +1826,9 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
       if compilerReservedNames.contains n then
         report "compilerOverrideAttribute" n m
           "compiler_intrinsic_name: non-toolchain declaration shadows compiler-builtin constant"
-      if toolchainNames.contains n then
+      if toolchainNames.contains n || n.getRoot == `Init || n.getRoot == `Std || n.getRoot == `Lean then
         report "compilerOverrideAttribute" n m
-          "toolchain_name: non-toolchain declaration reuses a name the pinned toolchain declares"
+          "toolchain_name: non-toolchain declaration reuses a name or namespace reserved by the pinned toolchain"
       match env.checked.get.find? n with
       | none => report "inventoryMismatch" n m "declaration missing from the kernel environment"
       | some stored =>
@@ -1590,7 +1851,9 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
           isCompanion := true
           modify fun (s : AuditState) => { s with companions := s.companions + 1 }
         | .error e => report "compilerOverrideAttribute" n m s!"unsafe_rec_sibling: {e}"
-      | _ => pure ()
+      | _ =>
+        if forbiddenSourceIdentifier n.toString then
+          report "sourceForbiddenIdentifier" n m "non-companion declaration name mentions _unsafe_rec"
       if ci.isUnsafe then report "unsafeDeclaration" n m "unsafe declaration"
       else if ci.isPartial && !isCompanion then
         report "partialOrUnsafeRecDependency" n m "partial declaration"
@@ -1643,7 +1906,10 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
       try pure (some (← IO.FS.readFile path)) catch _ => pure none)
     let some text := text?
       | report "environmentLoadFailed" m m s!"cannot read source {path}"; continue
-    for tok in scanIdents text do
+    let (toks, balanced) := scanIdents text
+    unless balanced do
+      report "sourceForbiddenIdentifier" m m "source scan ended with unclosed string, comment, guillemet, or interpolation state"
+    for tok in toks do
       if forbiddenSourceIdentifier tok then
         report "sourceForbiddenIdentifier" tok.toName m "user identifiers must not mention _unsafe_rec"
   -- Kernel replay of every non-toolchain declaration on the toolchain-only environment.
