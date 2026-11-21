@@ -2509,6 +2509,94 @@ theorem unlinked_read_write_volatile_mmio_one_way_soundness
         Interp.typedStoreM, hChkTB, hEncTB, Interp.ConcurrentMemory.store, hbTB, bind,
         Except.bind, pure, Except.pure]
 
+/-- Store-value-free misaligned-pointer parity for `core::ptr::read_volatile` via
+`evalUnlinkedPtrAccessCall?`: unlike `unlinked_read_write_volatile_misaligned_parity` (which
+quantifies `mval` / `mbytes` with `checkValue` and `Type.encode` across the whole conjunction),
+this theorem needs no inhabitant or encodable value of `mty` and therefore applies non-vacuously to
+every MiniRust type — including uninhabited enums such as `#[repr(u32)] enum Empty4 {}`, where
+`checkValue` is always an error yet both Trusted and MiniRust (`typedLoad` / `typedLoadM`) still
+check pointer alignment first and report misaligned-load UB. -/
+theorem unlinked_read_volatile_misaligned_parity_any_ty
+    (s : MachineState) (target : ResolvedCallTarget) (decls : List LocalDecl)
+    (layouts : LayoutTable) (argOps : List Operand) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx)
+    (ptrVal : Value) (ptrArg : RawPtrArg) (elemTy : Ty) (size align : Nat)
+    (m : Interp.Mach) (mptr : Interp.Ptr)
+    (mtb : Interp.MachTB) (mptrTB : Gen.ThinPointer Gen.TreeBorrowsProvenance)
+    (mty : Gen.«Type») (msize : LibSpecr.Size)
+    (hPath : target.defPath = "core::ptr::read_volatile")
+    (hArg : rawPtrArgOfValue? (layoutPointerBytes layouts) ptrVal = .some ptrArg)
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
+    (hMis : rawPtrTargetAligned? s.memory.callStack locals' decls layouts align ptrArg
+      (classifyRawPtrTarget s.memory.borrows s.memory.globals ptrArg) = .some false)
+    (hMLay : Interp.Type.layout mty = .ok (.Sized msize ⟨align⟩))
+    (hMMis : Interp.Align.is_aligned ⟨align⟩ mptr.addr = false)
+    (hMMisTB : Interp.Align.is_aligned ⟨align⟩ mptrTB.addr = false) :
+    evalUnlinkedPtrAccessCall? s target decls layouts argOps [ptrVal] locals' destination
+        targetBb = some (MirStepNode.fail .ub) ∧
+    mrLoad true m mptr mty = .error (.ub "load from a misaligned pointer") ∧
+    mrLoadTB true mtb mptrTB mty = .error (.ub "load from a misaligned pointer") := by
+  have hT := trusted_load_misaligned_ub true s.memory.borrows s.memory.globals
+    s.memory.callStack s.memory.activeProtectors target decls layouts argOps ptrVal locals'
+    ptrArg elemTy size align hArg hLay hMis
+  refine ⟨?_, mr_load_misaligned_ub m mptr mty msize ⟨align⟩ hMLay hMMis,
+    mr_loadTB_misaligned_ub mtb mptrTB mty msize ⟨align⟩ hMLay hMMisTB⟩
+  rw [trustedUnlinkedAction_spec]
+  simp only [trustedUnlinkedAction, hPath]
+  have h1 : stringEq "core::ptr::read_volatile" "core::ptr::read_unaligned" = false := rfl
+  have h2 : stringEq "core::ptr::read_volatile" "core::ptr::write_unaligned" = false := rfl
+  have h3 : stringEq "core::ptr::read_volatile" "core::ptr::read_volatile" = true := rfl
+  rw [h1, h2, h3]
+  dsimp only
+  rw [hT]; rfl
+
+/-- Store-value-free Item 5 MMIO one-way soundness for `core::ptr::read_volatile` via
+`evalUnlinkedPtrAccessCall?`: requires no `val`, `rawPtrStoreValueFault?`, `checkValue`, or
+`Type.encode` hypotheses on either Trusted or MiniRust. -/
+theorem unlinked_read_volatile_mmio_one_way_soundness
+    (s : MachineState) (target : ResolvedCallTarget) (decls : List LocalDecl)
+    (layouts : LayoutTable) (argOps : List Operand) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx)
+    (elemTy : Ty) (size align addr : Nat)
+    (m : Interp.Mach) (mtb : Interp.MachTB)
+    (mty : Gen.«Type») (msize : LibSpecr.Size)
+    (hPath : target.defPath = "core::ptr::read_volatile")
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
+    (hMLay : Interp.Type.layout mty = .ok (.Sized msize ⟨align⟩))
+    (hpos : 0 < align)
+    (hAl : Interp.Align.is_aligned ⟨align⟩ (addr : Int) = true)
+    (hInh : rawPtrTyIsUninhabited layouts elemTy = false)
+    (hSize : size ≠ 0) (hMSize : msize.bytes ≠ 0) :
+    evalUnlinkedPtrAccessCall? s target decls layouts argOps
+        [.scalar ⟨addr, layoutPointerBytes layouts⟩] locals' destination targetBb =
+      some MirStepNode.unsupported ∧
+    mrLoad true m ⟨addr, none⟩ mty =
+      .error (.ub "dereferencing pointer without provenance") ∧
+    mrLoadTB true mtb ⟨addr, none⟩ mty =
+      .error (.ub "dereferencing pointer without provenance") := by
+  have hT := trusted_volatile_load_mmio_unsupported true s.memory.borrows s.memory.globals
+    s.memory.callStack s.memory.activeProtectors target decls layouts argOps locals' addr
+    elemTy size align hLay hpos (fun _ => hAl) hInh hSize
+  have hb := mr_bm_load_no_provenance_ub m.mem.memory addr msize ⟨align⟩ hAl hMSize
+  have hbTB : Interp.MemoryOps.load mtb.mem.memory
+      (⟨addr, none⟩ : Gen.ThinPointer Gen.TreeBorrowsProvenance) msize ⟨align⟩ =
+      .error (.ub "dereferencing pointer without provenance") :=
+    mr_tbm_load_no_provenance_ub mtb.mem.memory addr msize ⟨align⟩ hAl hMSize
+  refine ⟨?_, ?_, ?_⟩
+  · rw [trustedUnlinkedAction_spec]
+    simp only [trustedUnlinkedAction, hPath]
+    have h1 : stringEq "core::ptr::read_volatile" "core::ptr::read_unaligned" = false := rfl
+    have h2 : stringEq "core::ptr::read_volatile" "core::ptr::write_unaligned" = false := rfl
+    have h3 : stringEq "core::ptr::read_volatile" "core::ptr::read_volatile" = true := rfl
+    rw [h1, h2, h3]
+    dsimp only
+    rw [hT]; rfl
+  · simp [mrLoad, mrAccessAlign, hMLay, Interp.LayoutStrategy.expect_align, Interp.typedLoad,
+      Interp.LayoutStrategy.expect_size, Interp.CM.load, hb, bind, Except.bind, pure, Except.pure]
+  · simp [mrLoadTB, mrAccessAlign, hMLay, Interp.LayoutStrategy.expect_align, Interp.typedLoadM,
+      Interp.LayoutStrategy.expect_size, Interp.ConcurrentMemory.load, hbTB, bind, Except.bind,
+      pure, Except.pure]
+
 /-- `_0 = fnPath::<u32>(copy _1, copy _2, copy _3)` with `_1, _2 : *const u32`, `_3 : usize`. -/
 def vbMmioCopyBody (fnPath : String) : CapturedMir :=
   vbCallBody [vbDecl vbTyUnit, vbDecl vbTyPtrU32, vbDecl vbTyPtrU32, vbDecl ⟨.uint .usize, 2⟩]
@@ -3768,6 +3856,95 @@ theorem lockstep_mmio_aligned_0x40000000 :
       (interp_ok_of_toOption (by decide +kernel))
       (by decide) (by decide) rfl rfl (by decide) (by decide) (by decide)⟩
 
+/-- Uninhabited 4-aligned MiniRust enum (`#[repr(u32)] enum Empty4 {}`, size `0`, align `4`). -/
+def vbMrNeverAlign4 : Gen.«Type» := .Enum ⟨[]⟩ ⟨.Unsigned, ⟨4⟩⟩ .Invalid ⟨0⟩ ⟨4⟩
+
+/-- Non-vacuity instantiation of `unlinked_read_volatile_misaligned_parity_any_ty` (including on
+the uninhabited 4-aligned enum `vbMrNeverAlign4`, where `checkValue` is never `.ok ()` so
+`unlinked_read_write_volatile_misaligned_parity`'s store-value precondition is false),
+`unlinked_read_write_volatile_misaligned_parity`, `unlinked_read_volatile_mmio_one_way_soundness`,
+and `unlinked_read_write_volatile_mmio_one_way_soundness`. -/
+theorem wit_unlinked_read_write_volatile_misaligned_and_mmio :
+    (∀ v, Interp.checkValue v vbMrNeverAlign4 (some (vbMach (vbPlain vbArr8))) ≠ .ok ()) ∧
+    (evalUnlinkedPtrAccessCall? (vbMmioLoadState 0x40000001)
+        (vbTarget "core::ptr::read_volatile" vbTyZstAlign4)
+        [vbDecl vbTyZstAlign4, vbDecl ⟨.rawPtr .not vbTyZstAlign4.kind, 4⟩] vbTbl
+        [.copy ⟨1, []⟩] [.scalar ⟨0x40000001, 8⟩]
+        [.uninit, .init (.scalar ⟨0x40000001, 8⟩)] ⟨0, []⟩ 1 =
+      some (MirStepNode.fail .ub) ∧
+      mrLoad true (vbMach (vbPlain vbArr8)) ⟨(0x40000001 : Nat), none⟩ vbMrNeverAlign4 =
+        .error (.ub "load from a misaligned pointer") ∧
+      mrLoadTB true (vbMachTB (vbPlain vbArr8)) ⟨(0x40000001 : Nat), none⟩ vbMrNeverAlign4 =
+        .error (.ub "load from a misaligned pointer")) ∧
+    (evalUnlinkedPtrAccessCall? (vbMmioStoreState 0x40000001 0xCAFEBABE)
+        (vbTarget "core::ptr::write_volatile" vbTyU32)
+        [vbDecl vbTyUnit, vbDecl vbTyPtrU32, vbDecl vbTyU32] vbTbl
+        [.copy ⟨1, []⟩, .copy ⟨2, []⟩]
+        [.scalar ⟨0x40000001, 8⟩, .scalar ⟨0xCAFEBABE, 4⟩]
+        [.uninit, .init (.scalar ⟨0x40000001, 8⟩), .init (.scalar ⟨0xCAFEBABE, 4⟩)] ⟨0, []⟩ 1 =
+      some (MirStepNode.fail .ub) ∧
+      mrStore true (vbMach (vbPlain vbArr8)) ⟨(0x40000001 : Nat), none⟩ (.Int 0xCAFEBABE)
+        vbMrU32 = .error (.ub "store to a misaligned pointer") ∧
+      mrStoreTB true (vbMachTB (vbPlain vbArr8)) ⟨(0x40000001 : Nat), none⟩ (.Int 0xCAFEBABE)
+        vbMrU32 = .error (.ub "store to a misaligned pointer")) ∧
+    (evalUnlinkedPtrAccessCall? (vbMmioLoadState 0x40000000)
+        (vbTarget "core::ptr::read_volatile" vbTyU32)
+        [vbDecl vbTyU32, vbDecl vbTyPtrU32] vbTbl
+        [.copy ⟨1, []⟩] [.scalar ⟨0x40000000, layoutPointerBytes vbTbl⟩]
+        [.uninit, .init (.scalar ⟨0x40000000, 8⟩)] ⟨0, []⟩ 1 =
+      some MirStepNode.unsupported ∧
+      mrLoad true (vbMach (vbPlain vbArr8)) ⟨(0x40000000 : Nat), none⟩ vbMrU32 =
+        .error (.ub "dereferencing pointer without provenance") ∧
+      mrLoadTB true (vbMachTB (vbPlain vbArr8)) ⟨(0x40000000 : Nat), none⟩ vbMrU32 =
+        .error (.ub "dereferencing pointer without provenance")) ∧
+    (evalUnlinkedPtrAccessCall? (vbMmioStoreState 0x40000000 0xCAFEBABE)
+        (vbTarget "core::ptr::write_volatile" vbTyU32)
+        [vbDecl vbTyUnit, vbDecl vbTyPtrU32, vbDecl vbTyU32] vbTbl
+        [.copy ⟨1, []⟩, .copy ⟨2, []⟩]
+        [.scalar ⟨0x40000000, layoutPointerBytes vbTbl⟩, .scalar ⟨0xCAFEBABE, 4⟩]
+        [.uninit, .init (.scalar ⟨0x40000000, 8⟩), .init (.scalar ⟨0xCAFEBABE, 4⟩)] ⟨0, []⟩ 1 =
+      some MirStepNode.unsupported ∧
+      mrStore true (vbMach (vbPlain vbArr8)) ⟨(0x40000000 : Nat), none⟩ (.Int 0xCAFEBABE)
+        vbMrU32 = .error (.ub "dereferencing pointer without provenance") ∧
+      mrStoreTB true (vbMachTB (vbPlain vbArr8)) ⟨(0x40000000 : Nat), none⟩ (.Int 0xCAFEBABE)
+        vbMrU32 = .error (.ub "dereferencing pointer without provenance")) :=
+  ⟨(fun v => by cases v <;> intro h <;> cases h),
+   unlinked_read_volatile_misaligned_parity_any_ty _ _ _ _ _ _ _ _ _ (.addr 0x40000001)
+     vbTyZstAlign4 0 4 (vbMach (vbPlain vbArr8)) ⟨(0x40000001 : Nat), none⟩
+     (vbMachTB (vbPlain vbArr8)) ⟨(0x40000001 : Nat), none⟩ vbMrNeverAlign4 ⟨0⟩
+     rfl rfl rfl rfl rfl (by decide) (by decide),
+   (unlinked_read_write_volatile_misaligned_parity
+     (vbMmioStoreState 0x40000001 0xCAFEBABE)
+     (vbTarget "core::ptr::write_volatile" vbTyU32)
+     [vbDecl vbTyUnit, vbDecl vbTyPtrU32, vbDecl vbTyU32] vbTbl
+     [.copy ⟨1, []⟩, .copy ⟨2, []⟩]
+     [.uninit, .init (.scalar ⟨0x40000001, 8⟩), .init (.scalar ⟨0xCAFEBABE, 4⟩)] ⟨0, []⟩ 1
+     (.scalar ⟨0x40000001, 8⟩) (.scalar ⟨0xCAFEBABE, 4⟩) (.addr 0x40000001)
+     vbTyU32 4 4 (vbMach (vbPlain vbArr8)) ⟨(0x40000001 : Nat), none⟩
+     (.Int 0xCAFEBABE) (vbPlain [0xBE, 0xBA, 0xFE, 0xCA])
+     (vbMachTB (vbPlain vbArr8)) ⟨(0x40000001 : Nat), none⟩
+     (.Int 0xCAFEBABE) (vbPlain [0xBE, 0xBA, 0xFE, 0xCA]) vbMrU32 ⟨4⟩
+     rfl rfl rfl rfl (by decide) (by decide)
+     (interp_ok_of_toOption (by decide +kernel)) (interp_ok_of_toOption (by decide +kernel))
+     (interp_ok_of_toOption (by decide +kernel)) (interp_ok_of_toOption (by decide +kernel))).2 rfl,
+   unlinked_read_volatile_mmio_one_way_soundness _ _ _ _ _ _ _ _ vbTyU32 4 4 0x40000000
+     (vbMach (vbPlain vbArr8)) (vbMachTB (vbPlain vbArr8))
+     vbMrU32 ⟨4⟩ rfl rfl rfl (by decide) (by decide) rfl (by decide) (by decide),
+   (unlinked_read_write_volatile_mmio_one_way_soundness
+     (vbMmioStoreState 0x40000000 0xCAFEBABE)
+     (vbTarget "core::ptr::write_volatile" vbTyU32)
+     [vbDecl vbTyUnit, vbDecl vbTyPtrU32, vbDecl vbTyU32] vbTbl
+     [.copy ⟨1, []⟩, .copy ⟨2, []⟩]
+     [.uninit, .init (.scalar ⟨0x40000000, 8⟩), .init (.scalar ⟨0xCAFEBABE, 4⟩)] ⟨0, []⟩ 1
+     vbTyU32 4 4 0x40000000 (.scalar ⟨0xCAFEBABE, 4⟩)
+     (vbMach (vbPlain vbArr8)) (.Int 0xCAFEBABE) (vbPlain [0xBE, 0xBA, 0xFE, 0xCA])
+     (vbMachTB (vbPlain vbArr8)) (.Int 0xCAFEBABE) (vbPlain [0xBE, 0xBA, 0xFE, 0xCA])
+     vbMrU32 ⟨4⟩
+     rfl rfl (by decide) (by decide) rfl rfl (by decide) (by decide)
+     (interp_ok_of_toOption (by decide +kernel)) (interp_ok_of_toOption (by decide +kernel))
+     (interp_ok_of_toOption (by decide +kernel)) (interp_ok_of_toOption (by decide +kernel))
+     (by decide) (by decide)).2 rfl⟩
+
 /-! ## 11. Bounded-exhaustive lockstep on the `[u8; 8]` fixture (items 3 and 4) -/
 
 /-- `memmove` on a buffer: bytes `[dstOff, dstOff + n)` are replaced by the original bytes
@@ -4039,7 +4216,10 @@ Item 5 (aligned addresses outside all allocations):
   mmio_volatile_store_step_unsupported, mmio_volatile_not_noUB,
   mmio_volatile_copy_set_step_unsupported, mmio_volatile_copy_set_not_noUB,
   lockstep_mmio_aligned_0x40000000, unlinked_read_write_volatile_misaligned_parity,
-  unlinked_read_write_volatile_mmio_one_way_soundness
+  unlinked_read_volatile_misaligned_parity_any_ty,
+  unlinked_read_write_volatile_mmio_one_way_soundness,
+  unlinked_read_volatile_mmio_one_way_soundness,
+  wit_unlinked_read_write_volatile_misaligned_and_mmio
 
 Infrastructure (Trusted action specs, observation soundness):
   trustedVolatileAction_spec, trustedUnlinkedAction_spec, loadedInt_sound, loadedIntTB_sound,

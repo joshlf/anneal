@@ -325,6 +325,72 @@ theorem bdNullaryOp_all_variants_minirust :
     fun locals ty mem decls layouts =>
       (bdNullaryOp_ubChecks_contractChecks locals 0 ty mem decls layouts).2⟩
 
+/-- Companion Section-1 symbolic correspondence covering the remaining `NullOp` forms referenced by
+`bdNullaryOp_all_variants_minirust`: (1) `AlignOf` matches MiniRust's `Type::layout` alignment (both
+in general two-sided normal form and with the redundant power-of-two / `< 2^64` side conditions
+eliminated under `TableAlignWf`); (2) `OffsetOf` along any nested path `path : List Nat` agrees
+two-sidedly with MiniRust's `mrPathOffset?` under `FieldLayoutsRecorded` and
+`ScalarLeavesPrimitive`; and (3) `UbChecks` at any non-`bool` type fails closed with
+`.unsupported`. -/
+theorem bdNullaryOp_alignOf_offsetOf_ubChecks_minirust :
+    (∀ (locals : List LocalSlot) (mem : Memory) (decls : List LocalDecl) (layouts : LayoutTable)
+        (ty : Ty) (mrTy : Gen.«Type»),
+        layouts.pointerBits = 64 →
+        translateTy layouts ty = some mrTy →
+        NullaryFnPtrBridge.DeclLayoutCoherent decls layouts ty →
+        ∃ sz al,
+          Interp.Type.layout mrTy = .ok (.Sized ⟨sz⟩ ⟨al⟩) ∧
+            evalRvalue locals (.nullaryOp .alignOf ty) mem decls layouts =
+              if x86_64.valid_size ⟨sz⟩ = true ∧ Layout.Align.isPowerOfTwoBytes ⟨al⟩ = true ∧
+                  al < 18446744073709551616 then
+                .ok (.scalar ⟨al, 8⟩) locals mem
+              else .unsupported) ∧
+    (∀ (locals : List LocalSlot) (mem : Memory) (decls : List LocalDecl) (layouts : LayoutTable)
+        (ty : Ty) (mrTy : Gen.«Type») (al : Nat),
+        layouts.pointerBits = 64 →
+        NullaryFnPtrBridge.TableAlignWf layouts →
+        translateTy layouts ty = some mrTy →
+        NullaryFnPtrBridge.DeclLayoutCoherent decls layouts ty →
+        (evalRvalue locals (.nullaryOp .alignOf ty) mem decls layouts =
+            .ok (.scalar ⟨al, 8⟩) locals mem ↔
+          ∃ sz, Interp.Type.layout mrTy = .ok (.Sized ⟨sz⟩ ⟨al⟩) ∧
+            x86_64.valid_size ⟨sz⟩ = true)) ∧
+    (∀ (locals : List LocalSlot) (ty : Ty) (mem : Memory) (decls : List LocalDecl)
+        (layouts : LayoutTable) (fields : List (Nat × TupleSpec))
+        (size align : Nat) (path : List Nat),
+        layouts.pointerBits = 64 →
+        NullaryFnPtrBridge.FieldLayoutsRecorded layouts →
+        NullaryFnPtrBridge.ScalarLeavesPrimitive layouts ty.layoutIdx (.tuple fields size align) →
+        tupleTypeOf layouts ty = some (fields, size, align) →
+        NullaryFnPtrBridge.DeclLayoutCoherent decls layouts ty →
+        findDeclLayoutForRigidTy decls layouts ty.kind =
+          Layout.LayoutTable.lookup layouts ty.layoutIdx →
+        evalRvalue locals
+            (.nullaryOp (.offsetOf (path.map (fun i => ((0 : VariantIdx), (i : FieldIdx))))) ty) mem
+            decls layouts =
+          match
+              NullaryFnPtrBridge.mrPathOffset?
+                (TupleSpec.tuple fields size align).toMiniRustTy path with
+          | some off =>
+            if x86_64.valid_size ⟨size⟩ = true ∧ off ≤ size then .ok (.scalar ⟨off, 8⟩) locals mem
+            else .unsupported
+          | none => .unsupported) ∧
+    (∀ (locals : List LocalSlot) (ty : Ty) (mem : Memory) (decls : List LocalDecl)
+        (layouts : LayoutTable),
+        ty.kind ≠ .bool →
+        evalRvalue locals (.nullaryOp .ubChecks ty) mem decls layouts = .unsupported) :=
+  ⟨fun locals mem decls layouts ty mrTy hPtr hTr hCoh =>
+      NullaryFnPtrBridge.nullaryOp_alignOf_minirust_layout locals ty mem decls layouts mrTy
+        hPtr hTr hCoh,
+    fun locals mem decls layouts ty mrTy al hPtr hWf hTr hCoh =>
+      NullaryFnPtrBridge.nullaryOp_alignOf_wf_ok_iff locals ty mem decls layouts mrTy
+        hPtr hWf hTr hCoh al,
+    fun locals ty mem decls layouts fields size align path hPtr hRec hPrim hT hCoh hEnt =>
+      NullaryFnPtrBridge.nullaryOp_offsetOf_path_minirust_two_sided locals ty mem decls layouts
+        fields size align hPtr hRec hPrim hT hCoh hEnt path,
+    fun locals ty mem decls layouts hNe =>
+      NullaryFnPtrBridge.nullaryOp_ubChecks_nonBool_unsupported locals ty mem decls layouts hNe⟩
+
 /-! ## 2. `StatementKind::Intrinsic(CopyNonOverlapping)` -/
 
 /-- MIR of a body that copies `n` `u32` elements from its parameter `_1` into

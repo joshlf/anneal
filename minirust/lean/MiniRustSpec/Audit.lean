@@ -5664,6 +5664,7 @@ open MiniRustSpec.Correspondence in
   bdNullaryOp_translateRvalue
   bdUbChecks_rejected
   bdNullaryOp_all_variants_minirust
+  bdNullaryOp_alignOf_offsetOf_ubChecks_minirust
   bdCopy0_anneal_ret
   bdCopy1_anneal_ret
   bdCopy2_anneal_ret
@@ -7547,6 +7548,9 @@ typed and byte memory model on `Mach` and `MachTB`). -/
   VolatileBridge.mmio_volatile_copy_set_not_noUB
   VolatileBridge.unlinked_read_write_volatile_misaligned_parity
   VolatileBridge.unlinked_read_write_volatile_mmio_one_way_soundness
+  VolatileBridge.unlinked_read_volatile_misaligned_parity_any_ty
+  VolatileBridge.unlinked_read_volatile_mmio_one_way_soundness
+  VolatileBridge.wit_unlinked_read_write_volatile_misaligned_and_mmio
   VolatileBridge.mr_endianness_decode_eq_intFromBits
   VolatileBridge.codec_int_decode_agreement
   VolatileBridge.tDecodeIsUb_sound
@@ -7775,6 +7779,86 @@ example (s : MachineState) (target : ResolvedCallTarget) (decls : List MirAst.Lo
   unlinked_read_write_volatile_mmio_one_way_soundness s target decls layouts argOps locals'
     destination targetBb elemTy size align addr val m mval mbytes mtb mvalTB mbytesTB mty msize
     hLay hMLay hpos hAl hInh hVal hSize hMSize hChk hEnc hChkTB hEncTB hMLen hMLenTB
+
+example (s : MachineState) (target : ResolvedCallTarget) (decls : List MirAst.LocalDecl)
+    (layouts : LayoutTable) (argOps : List Operand) (locals' : List LocalSlot)
+    (destination : MirAst.Place) (targetBb : BasicBlockIdx)
+    (ptrVal storeVal : MirSemantics.Value) (ptrArg : RawPtrArg) (elemTy : Ty) (size align : Nat)
+    (m : Interp.Mach) (mptr : Interp.Ptr) (mval : Interp.Val) (mbytes : List Interp.Byte)
+    (mtb : Interp.MachTB) (mptrTB : Gen.ThinPointer Gen.TreeBorrowsProvenance)
+    (mvalTB : Gen.Value Interp.TBM)
+    (mbytesTB : List (Gen.AbstractByte Gen.TreeBorrowsProvenance))
+    (mty : Gen.«Type») (msize : LibSpecr.Size)
+    (hArg : rawPtrArgOfValue? (layoutPointerBytes layouts) ptrVal = .some ptrArg)
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
+    (hMis : rawPtrTargetAligned? s.memory.callStack locals' decls layouts align ptrArg
+      (classifyRawPtrTarget s.memory.borrows s.memory.globals ptrArg) = .some false)
+    (hMLay : Interp.Type.layout mty = .ok (.Sized msize ⟨align⟩))
+    (hMMis : Interp.Align.is_aligned ⟨align⟩ mptr.addr = false)
+    (hMMisTB : Interp.Align.is_aligned ⟨align⟩ mptrTB.addr = false)
+    (hChk : Interp.checkValue mval mty (some m) = .ok ())
+    (hEnc : Interp.Type.encode mty mval = .ok mbytes)
+    (hChkTB : Interp.checkValueM mvalTB mty (some mtb) = .ok ())
+    (hEncTB : Interp.Type.encodeM (M := Interp.TBM) mty mvalTB = .ok mbytesTB) :
+    (target.defPath = "core::ptr::read_volatile" →
+      evalUnlinkedPtrAccessCall? s target decls layouts argOps [ptrVal] locals' destination
+          targetBb = some (MirStepNode.fail .ub) ∧
+      mrLoad true m mptr mty = .error (.ub "load from a misaligned pointer") ∧
+      mrLoadTB true mtb mptrTB mty = .error (.ub "load from a misaligned pointer")) ∧
+    (target.defPath = "core::ptr::write_volatile" →
+      evalUnlinkedPtrAccessCall? s target decls layouts argOps [ptrVal, storeVal] locals'
+          destination targetBb = some (MirStepNode.fail .ub) ∧
+      mrStore true m mptr mval mty = .error (.ub "store to a misaligned pointer") ∧
+      mrStoreTB true mtb mptrTB mvalTB mty = .error (.ub "store to a misaligned pointer")) :=
+  unlinked_read_write_volatile_misaligned_parity s target decls layouts argOps locals'
+    destination targetBb ptrVal storeVal ptrArg elemTy size align m mptr mval mbytes mtb mptrTB
+    mvalTB mbytesTB mty msize hArg hLay hMis hMLay hMMis hMMisTB hChk hEnc hChkTB hEncTB
+
+example (s : MachineState) (target : ResolvedCallTarget) (decls : List MirAst.LocalDecl)
+    (layouts : LayoutTable) (argOps : List Operand) (locals' : List LocalSlot)
+    (destination : MirAst.Place) (targetBb : BasicBlockIdx)
+    (ptrVal : MirSemantics.Value) (ptrArg : RawPtrArg) (elemTy : Ty) (size align : Nat)
+    (m : Interp.Mach) (mptr : Interp.Ptr)
+    (mtb : Interp.MachTB) (mptrTB : Gen.ThinPointer Gen.TreeBorrowsProvenance)
+    (mty : Gen.«Type») (msize : LibSpecr.Size)
+    (hPath : target.defPath = "core::ptr::read_volatile")
+    (hArg : rawPtrArgOfValue? (layoutPointerBytes layouts) ptrVal = .some ptrArg)
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
+    (hMis : rawPtrTargetAligned? s.memory.callStack locals' decls layouts align ptrArg
+      (classifyRawPtrTarget s.memory.borrows s.memory.globals ptrArg) = .some false)
+    (hMLay : Interp.Type.layout mty = .ok (.Sized msize ⟨align⟩))
+    (hMMis : Interp.Align.is_aligned ⟨align⟩ mptr.addr = false)
+    (hMMisTB : Interp.Align.is_aligned ⟨align⟩ mptrTB.addr = false) :
+    evalUnlinkedPtrAccessCall? s target decls layouts argOps [ptrVal] locals' destination
+        targetBb = some (MirStepNode.fail .ub) ∧
+    mrLoad true m mptr mty = .error (.ub "load from a misaligned pointer") ∧
+    mrLoadTB true mtb mptrTB mty = .error (.ub "load from a misaligned pointer") :=
+  unlinked_read_volatile_misaligned_parity_any_ty s target decls layouts argOps locals'
+    destination targetBb ptrVal ptrArg elemTy size align m mptr mtb mptrTB mty msize hPath hArg
+    hLay hMis hMLay hMMis hMMisTB
+
+example (s : MachineState) (target : ResolvedCallTarget) (decls : List MirAst.LocalDecl)
+    (layouts : LayoutTable) (argOps : List Operand) (locals' : List LocalSlot)
+    (destination : MirAst.Place) (targetBb : BasicBlockIdx)
+    (elemTy : Ty) (size align addr : Nat)
+    (m : Interp.Mach) (mtb : Interp.MachTB)
+    (mty : Gen.«Type») (msize : LibSpecr.Size)
+    (hPath : target.defPath = "core::ptr::read_volatile")
+    (hLay : resolveRawPtrElemLayout target decls layouts argOps = .ok elemTy size align)
+    (hMLay : Interp.Type.layout mty = .ok (.Sized msize ⟨align⟩))
+    (hpos : 0 < align)
+    (hAl : Interp.Align.is_aligned ⟨align⟩ (addr : Int) = true)
+    (hInh : rawPtrTyIsUninhabited layouts elemTy = false)
+    (hSize : size ≠ 0) (hMSize : msize.bytes ≠ 0) :
+    evalUnlinkedPtrAccessCall? s target decls layouts argOps
+        [.scalar ⟨addr, layoutPointerBytes layouts⟩] locals' destination targetBb =
+      some MirStepNode.unsupported ∧
+    mrLoad true m ⟨addr, none⟩ mty =
+      .error (.ub "dereferencing pointer without provenance") ∧
+    mrLoadTB true mtb ⟨addr, none⟩ mty =
+      .error (.ub "dereferencing pointer without provenance") :=
+  unlinked_read_volatile_mmio_one_way_soundness s target decls layouts argOps locals' destination
+    targetBb elemTy size align addr m mtb mty msize hPath hLay hMLay hpos hAl hInh hSize hMSize
 
 end VolatileBridgeStatementPins
 

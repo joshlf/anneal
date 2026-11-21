@@ -1070,19 +1070,25 @@ theorem tree_borrows_frozen_write_ub :
   ⟨by run_fault, by run_fault, by run_fault, by run_fault⟩
 
 /-- `.disabled` read and write: after the direct write `x = 8` invalidates the `&mut x` tag,
-loading or storing through the raw pointer derived from it is UB. -/
+loading or storing through the raw pointer derived from it is UB across both intrinsic and
+`core::ptr::{read,write}_{unaligned,volatile}` entry points. -/
 theorem tree_borrows_disabled_read_write_ub :
     FaultsWith (disabledBody uvLoad [] tyU32) [] .ub ∧
     FaultsWith (disabledBody vLoad [] tyU32) [] .ub ∧
+    FaultsWith (disabledBody readUnaligned [] tyU32) [] .ub ∧
+    FaultsWith (disabledBody readVolatile [] tyU32) [] .ub ∧
     FaultsWith (disabledBody uvStore [cU32 9] tyUnit) [] .ub ∧
-    FaultsWith (disabledBody vStore [cU32 9] tyUnit) [] .ub :=
-  ⟨by run_fault, by run_fault, by run_fault, by run_fault⟩
+    FaultsWith (disabledBody vStore [cU32 9] tyUnit) [] .ub ∧
+    FaultsWith (disabledBody writeUnaligned [cU32 9] tyUnit) [] .ub ∧
+    FaultsWith (disabledBody writeVolatile [cU32 9] tyUnit) [] .ub :=
+  ⟨by run_fault, by run_fault, by run_fault, by run_fault,
+   by run_fault, by run_fault, by run_fault, by run_fault⟩
 
 /-- Active-protector conflict: inside `callee_prot`, after the `FnEntry` retag protects the
 reborrow of `r`, a store through `p` (a foreign write for the protected tag) is UB for the
-unaligned and the volatile stores. The same call without the retag
-(`unprotected_store_in_callee_ok`) and the protected read (`protected_read_in_callee_ok`) return
-normally. -/
+unaligned and the volatile stores (both intrinsics and `core::ptr::write_{unaligned,volatile}`).
+The same call without the retag (`unprotected_store_in_callee_ok`) and the protected read
+(`protected_read_in_callee_ok`) return normally. -/
 theorem protector_conflict_store_ub :
     StepsTo (protCaller tyUnit)
       (initMachineStateWithCallees (protCaller tyUnit) []
@@ -1095,8 +1101,12 @@ theorem protector_conflict_store_ub :
     StepsTo (protCaller tyUnit)
       (initMachineStateWithCallees (protCaller tyUnit) []
         [protCallee true writeUnaligned [cU32 9] tyUnit])
+      (MirStepNode.fail .ub) ∧
+    StepsTo (protCaller tyUnit)
+      (initMachineStateWithCallees (protCaller tyUnit) []
+        [protCallee true writeVolatile [cU32 9] tyUnit])
       (MirStepNode.fail .ub) :=
-  ⟨by run_fault, by run_fault, by run_fault⟩
+  ⟨by run_fault, by run_fault, by run_fault, by run_fault⟩
 
 /-! ### 2.7 Invalid bit patterns and the uninhabited type `!` -/
 
@@ -1111,13 +1121,20 @@ theorem load_invalid_bool_char_ub :
     FaultsWith (reinterpretLoadBody vLoad tyU32 (cU32 0x110000) tyChar) [] .ub :=
   ⟨by run_fault, by run_fault, by run_fault, by run_fault, by run_fault, by run_fault⟩
 
-/-- Loading or storing at the uninhabited type `!` is UB. -/
+/-- Loading or storing at the uninhabited type `!` is UB across all 8 typed load/store entry
+points (`{unaligned_volatile,volatile}_{load,store}` and
+`core::ptr::{read,write}_{unaligned,volatile}`). -/
 theorem load_store_uninhabited_never_ub :
     FaultsWith (reinterpretLoadBody uvLoad tyUnit (cZst tyUnit) tyNever) [] .ub ∧
     FaultsWith (reinterpretLoadBody vLoad tyUnit (cZst tyUnit) tyNever) [] .ub ∧
+    FaultsWith (reinterpretLoadBody readUnaligned tyUnit (cZst tyUnit) tyNever) [] .ub ∧
+    FaultsWith (reinterpretLoadBody readVolatile tyUnit (cZst tyUnit) tyNever) [] .ub ∧
     FaultsWith (neverStoreBody uvStore) [] .ub ∧
-    FaultsWith (neverStoreBody vStore) [] .ub :=
-  ⟨by run_fault, by run_fault, by run_fault, by run_fault⟩
+    FaultsWith (neverStoreBody vStore) [] .ub ∧
+    FaultsWith (neverStoreBody writeUnaligned) [] .ub ∧
+    FaultsWith (neverStoreBody writeVolatile) [] .ub :=
+  ⟨by run_fault, by run_fault, by run_fault, by run_fault,
+   by run_fault, by run_fault, by run_fault, by run_fault⟩
 
 /-! ### 2.8 `CastKind.fnPtrToPtr` on a data pointer -/
 
@@ -1285,9 +1302,10 @@ the kernel (`rfl`).
 
 section MiniRustCanaries
 
-open MiniRustSpec.Interp (checkPtr checkPtrM checkValue checkValueM vtableFromPtr vtableFromPtrM)
+open MiniRustSpec.Interp (checkPtr checkPtrM checkValue checkValueM vtableFromPtr vtableFromPtrM
+  evalValue evalValueM)
 open MiniRustSpec.Correspondence.VTablePtr (vtMach vtMachTB vtPtrA vtPtrB vtPtrATB vtPtrBTB
-  dataPtr dataPtrTB traitA traitB dynRefA dynBoxA vtableA)
+  vtNameA vtNameB dataPtr dataPtrTB traitA traitB dynRefA dynBoxA vtableA)
 
 /-! ### 4.1 Positive `ok` canaries -/
 
@@ -1335,6 +1353,38 @@ theorem minirust_transmute_vtablePtr_and_dyn_ref_ok :
         .Ptr (.Raw (.VTablePointer traitA))) (some vtMachTB) =
       .ok (.Ptr ⟨dataPtrTB 64, some (.VTablePointer vtPtrATB)⟩, .Ptr dynRefA) :=
   ⟨rfl, rfl, rfl, rfl⟩
+
+/-- End-to-end machine-level `evalValue` / `evalValueM` on `vtMach` and `vtMachTB`: evaluating
+`ValueExpr.Constant (.VTablePointer ...)` piped through `ValueExpr.UnOp (.Cast (.Transmute ...))`
+threads `(some m)` from `evalValue(M)` into `evalUnOp(M)` / `transmute(M)` / `checkPtr(M)`,
+succeeding for `vtNameA` at `PtrType.VTablePtr traitA` and reporting UB (never `Stop.unsupported`)
+for wrong-trait `vtNameB` and unregistered `PointerWithoutProvenance 64`. -/
+theorem minirust_evalValue_vtablePtr_ok_and_ub :
+    evalValue vtMach
+      (.UnOp (.Cast (.Transmute (.Ptr (.VTablePtr traitA))))
+        (.Constant (.VTablePointer vtNameA) (.Ptr (.Raw .None)))) =
+      .ok ((.Ptr ⟨vtPtrA, none⟩, .Ptr (.VTablePtr traitA)), vtMach) ∧
+    evalValueM vtMachTB
+      (.UnOp (.Cast (.Transmute (.Ptr (.VTablePtr traitA))))
+        (.Constant (.VTablePointer vtNameA) (.Ptr (.Raw .None)))) =
+      .ok ((.Ptr ⟨vtPtrATB, none⟩, .Ptr (.VTablePtr traitA)), vtMachTB) ∧
+    evalValue vtMach
+      (.UnOp (.Cast (.Transmute (.Ptr (.VTablePtr traitA))))
+        (.Constant (.VTablePointer vtNameB) (.Ptr (.Raw .None)))) =
+      .error (.ub "Value::Ptr: invalid vtable in metadata") ∧
+    evalValueM vtMachTB
+      (.UnOp (.Cast (.Transmute (.Ptr (.VTablePtr traitA))))
+        (.Constant (.VTablePointer vtNameB) (.Ptr (.Raw .None)))) =
+      .error (.ub "Value::Ptr: invalid vtable in metadata") ∧
+    evalValue vtMach
+      (.UnOp (.Cast (.Transmute (.Ptr (.VTablePtr traitA))))
+        (.Constant (.PointerWithoutProvenance 64) (.Ptr (.Raw .None)))) =
+      .error (.ub "invalid pointer for vtable lookup") ∧
+    evalValueM vtMachTB
+      (.UnOp (.Cast (.Transmute (.Ptr (.VTablePtr traitA))))
+        (.Constant (.PointerWithoutProvenance 64) (.Ptr (.Raw .None)))) =
+      .error (.ub "invalid pointer for vtable lookup") :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- Single-allocation `TreeBorrowsMemory` (8 bytes at address 64) with borrow tree `root`. -/
 private def tbMemOf (root : MiniRustSpec.Gen.Node) : MiniRustSpec.Interp.TBM :=
@@ -1944,5 +1994,166 @@ info: 'Anneal.Mir.UnalignedVolatileVTableTests.minirust_fnPtrToPtr_transmute_and
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms minirust_fnPtrToPtr_transmute_and_fnFromPtr
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.minirust_evalValue_vtablePtr_ok_and_ub' depends on axioms:
+[propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms minirust_evalValue_vtablePtr_ok_and_ub
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.unaligned_store_array_offset1_ok' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms unaligned_store_array_offset1_ok
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.unaligned_load_tuple_offset1_ok' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms unaligned_load_tuple_offset1_ok
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.unaligned_load_packed_field_ok' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms unaligned_load_packed_field_ok
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.volatile_load_aligned_ok' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms volatile_load_aligned_ok
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.volatile_load_aligned_interior_offset_ok' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms volatile_load_aligned_interior_offset_ok
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.volatile_zero_sized_aligned_ok' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms volatile_zero_sized_aligned_ok
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.volatile_copy_nonoverlapping_memory_same_array_disjoint_ok' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms volatile_copy_nonoverlapping_memory_same_array_disjoint_ok
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.volatile_copy_set_aligned_count_zero_ok' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms volatile_copy_set_aligned_count_zero_ok
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.nullaryOp_sizeOf_ok' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms nullaryOp_sizeOf_ok
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.nullaryOp_alignOf_ok' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms nullaryOp_alignOf_ok
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.nullaryOp_ubChecks_ok' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms nullaryOp_ubChecks_ok
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.load_valid_bool_char_ok' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms load_valid_bool_char_ok
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.unprotected_store_in_callee_ok' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms unprotected_store_in_callee_ok
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.volatile_load_store_array_and_packed_field_misaligned_ub' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms volatile_load_store_array_and_packed_field_misaligned_ub
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.volatile_copy_set_misaligned_ub' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms volatile_copy_set_misaligned_ub
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.volatile_copy_set_out_of_bounds_ub' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms volatile_copy_set_out_of_bounds_ub
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.read_unaligned_null_ub' depends on axioms:
+[propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms read_unaligned_null_ub
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.write_unaligned_null_ub' depends on axioms:
+[propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms write_unaligned_null_ub
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.write_unaligned_null_zst_ub' depends on axioms:
+[propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms write_unaligned_null_zst_ub
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.faultsWith_not_noUB' depends on axioms:
+[propext, Quot.sound]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms faultsWith_not_noUB
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.volatile_copy_set_mmio_aligned_unsupported' depends on axioms:
+[propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms volatile_copy_set_mmio_aligned_unsupported
+
+/--
+info: 'Anneal.Mir.UnalignedVolatileVTableTests.unaligned_volatile_load_null_unsupported' depends on axioms:
+[propext]
+-/
+#guard_msgs (whitespace := lax) in
+#print axioms unaligned_volatile_load_null_unsupported
 
 end Anneal.Mir.UnalignedVolatileVTableTests
