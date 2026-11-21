@@ -134,6 +134,7 @@ theorem ep2_mr_deep_theorems_used :
   have _ := @v4_shallowInitBox_coupled_valRel_sim
   have _ := @v5_wrapUnsafeBinder_comprehensive_witness
   have _ := @v5_v6_binder_and_subtype_coupled_valRel_sim
+  have _ := @v5_wrapUnsafeBinder_struct_nonZero_coupled_valRel_sim
   have _ := @v6_subtype_eq_transmute_and_sim
   have _ := @v7_aggregateRawPtr_comprehensive_witness
   have _ := @v7_rawPtr_coupled_valRel_sim

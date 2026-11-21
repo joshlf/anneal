@@ -2013,11 +2013,13 @@ projection `provAllocId : Gen.Memory.Provenance M → Nat`. -/
 
 mutual
 /-- Value-coupling relation directly linking Trusted `MirSemantics.Value` to
-MiniRust `Gen.Value M` across both `BasicMemory` (`BM`) and `TreeBorrowsMemory` (`TBM`). -/
+MiniRust `Gen.Value M` across both `BasicMemory` (`BM`) and `TreeBorrowsMemory` (`TBM`),
+enforcing bit-width bounds (`bits < 2 ^ (8 * sz)` for scalars, `metaVal < 2 ^ 64` for
+wide metadata) so out-of-range Trusted scalars cannot relate to MiniRust integers. -/
 inductive Ep2ValRel {M : Type} [Gen.Memory M]
     (allocBase : Nat → Nat) (provAllocId : Gen.Memory.Provenance M → Nat) :
     MirSemantics.Value → Gen.Value M → Prop where
-  | scalar (bits sz : Nat) :
+  | scalar (bits sz : Nat) (hBound : bits < 2 ^ (8 * sz)) :
       Ep2ValRel allocBase provAllocId (.scalar ⟨bits, sz⟩) (.Int (Int.ofNat bits))
   | unit :
       Ep2ValRel allocBase provAllocId .unit (.Tuple [])
@@ -2026,7 +2028,8 @@ inductive Ep2ValRel {M : Type} [Gen.Memory M]
       (hProv : prov.map provAllocId = some p.allocId) :
       Ep2ValRel allocBase provAllocId (.ptr p 8)
         (.Ptr (ThinPointer.widen { addr := addr, provenance := prov } none))
-  | widePtr (p : ProvenancePtr) (metaVal : Nat) (addr : Nat) (prov : Option (Gen.Memory.Provenance M))
+  | widePtr (p : ProvenancePtr) (metaVal : Nat) (hMeta : metaVal < 2 ^ 64)
+      (addr : Nat) (prov : Option (Gen.Memory.Provenance M))
       (hAddr : addr = allocBase p.allocId + p.offsetBytes)
       (hProv : prov.map provAllocId = some p.allocId) :
       Ep2ValRel allocBase provAllocId (.aggregate 0 [.ptr p 8, .scalar ⟨metaVal, 8⟩])
@@ -2098,23 +2101,37 @@ theorem v4_shallowInitBox_coupled_valRel_sim {M : Type} [Gen.Memory M] [MemoryOp
       transmuteM_thinRawPtr_to_boxU32 (M := M) (allocBase p.allocId + p.offsetBytes) hAddr hNonNull hAlign prov m (hDer prov hP),
       .thinPtr p (allocBase p.allocId + p.offsetBytes) prov rfl hP⟩
 
-/-- **V5 & V6 Value-Coupled Universal Scalar/Pointer Simulation (`v5_v6_binder_and_subtype_coupled_valRel_sim`)**:
-for EVERY `M ∈ {BM, TBM}`, whenever a Trusted scalar operand relates to a MiniRust
-`.Int` value via `Ep2ValRel`, `Rvalue.wrapUnsafeBinder`, `CastKind.subtype`, and
-`CastKind.transmute` produce outputs related by `Ep2ValRel` to MiniRust's
-`transmuteM` (identity on same-width valid scalars, preserving exact bits)! -/
+private theorem resolveTyWithLocalDecls_kind_mr (decls : List MirAst.LocalDecl)
+    (layouts : LayoutTable) (ty : MirAst.Ty) :
+    (resolveTyWithLocalDecls decls layouts ty).kind = ty.kind := by
+  unfold resolveTyWithLocalDecls
+  split
+  · rfl
+  · split
+    · rfl
+    · split
+      · split <;> rfl
+      · rfl
+
+private theorem lookup_emptyLayoutTable_mr (k : Nat) :
+    LayoutTable.lookup emptyLayoutTable k = none := by
+  cases k <;> rfl
+
+/-- **V5 & V6 Value-Coupled Universal Scalar Simulation (`v5_v6_binder_and_subtype_coupled_valRel_sim`)**:
+for EVERY `M ∈ {BM, TBM}` and EVERY `decls`, whenever a Trusted `u32` scalar operand relates
+to a MiniRust `.Int` value via `Ep2ValRel` (which enforces `bits < 2 ^ 32`),
+`Rvalue.wrapUnsafeBinder`, `CastKind.subtype`, and `CastKind.transmute` produce outputs
+related by `Ep2ValRel` to MiniRust's `transmuteM` (no redundant layout-resolution hypotheses!). -/
 theorem v5_v6_binder_and_subtype_coupled_valRel_sim {M : Type} [Gen.Memory M] [MemoryOps M]
     (allocBase : Nat → Nat) (provAllocId : Gen.Memory.Provenance M → Nat)
     (locals locals' : List LocalSlot) (op : MirAst.Operand)
     (mem : MirSemantics.Memory) (decls : List MirAst.LocalDecl)
-    (bits : Nat) (hBits : bits < 2 ^ 32) (mv : Gen.Value M) (m : Option (Gen.Machine M))
+    (bits : Nat) (mv : Gen.Value M) (m : Option (Gen.Machine M))
     (hOp : evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals decls mem.callStack =
       .ok (.scalar ⟨bits, 4⟩) locals')
     (hUse : evalUseRvalue locals op mem decls emptyLayoutTable = .ok (.scalar ⟨bits, 4⟩) locals' mem)
     (hRel : Ep2ValRel allocBase provAllocId (.scalar ⟨bits, 4⟩) mv)
-    (hSrcTy : operandTy decls emptyLayoutTable op = some u32MirTy)
-    (hResD : resolveTyWithLocalDecls decls emptyLayoutTable u32MirTy = u32MirTy)
-    (hSrcSz : resolveByteCastSrcTyAndSize decls emptyLayoutTable op u32MirTy = some (u32MirTy, 4)) :
+    (hSrcTy : operandTy decls emptyLayoutTable op = some u32MirTy) :
     ∃ tv mv',
       evalRvalue locals (.wrapUnsafeBinder op u32MirTy) mem decls emptyLayoutTable = .ok tv locals' mem ∧
       evalRvalue locals (.cast .subtype op u32MirTy) mem decls emptyLayoutTable = .ok tv locals' mem ∧
@@ -2122,39 +2139,83 @@ theorem v5_v6_binder_and_subtype_coupled_valRel_sim {M : Type} [Gen.Memory M] [M
       transmuteM (M := M) mv u32MrTy u32MrTy m = .ok mv' ∧
       Ep2ValRel allocBase provAllocId tv mv' := by
   cases hRel with
-  | scalar _ _ =>
+  | scalar _ _ hBits =>
+    have hBits32 : bits < 2 ^ 32 := hBits
+    have hKind : ∀ ty, (resolveTyWithLocalDecls decls emptyLayoutTable ty).kind = ty.kind :=
+      resolveTyWithLocalDecls_kind_mr decls emptyLayoutTable
+    have hU32Ty : ∀ k, tyByteSize decls emptyLayoutTable { kind := .uint .u32, layoutIdx := k } = some 4 := by
+      intro k
+      unfold tyByteSize tyByteSizeAndAlignAux
+      have hk : (resolveTyWithLocalDecls decls emptyLayoutTable { kind := .uint .u32, layoutIdx := k }).kind = .uint .u32 :=
+        hKind _
+      cases hr : resolveTyWithLocalDecls decls emptyLayoutTable { kind := .uint .u32, layoutIdx := k } with
+      | mk kd li =>
+        rw [hr] at hk; dsimp only at hk; subst hk
+        simp only [rigidTyByteSize, lookup_emptyLayoutTable_mr]
+        rfl
     have hWrap : evalRvalue locals (.wrapUnsafeBinder op u32MirTy) mem decls emptyLayoutTable =
         .ok (.scalar ⟨bits, 4⟩) locals' mem := by
       show evalWrapUnsafeBinder locals op u32MirTy mem decls emptyLayoutTable = _
       have hBnd : binderStructLayout? decls emptyLayoutTable u32MirTy = none := rfl
       have hRes : resolvedTyLayout? decls emptyLayoutTable u32MirTy = none := by
         unfold resolvedTyLayout?
-        rw [hResD]
+        dsimp only
+        cases isUnresolvedLayoutIdx emptyLayoutTable (resolveTyWithLocalDecls decls emptyLayoutTable u32MirTy).layoutIdx
+        · exact lookup_emptyLayoutTable_mr _
+        · rfl
       unfold evalWrapUnsafeBinder
       simp only [hUse, hBnd, hRes]
     have hCast : evalRvalue locals (.cast .subtype op u32MirTy) mem decls emptyLayoutTable =
         .ok (.scalar ⟨bits, 4⟩) locals' mem := by
-      have hEnc : encodeByteCastSourceBytes emptyLayoutTable u32MirTy (.scalar ⟨bits, 4⟩) =
-          some (encodeLittleEndianBytes bits 4 none) := rfl
+      have hrk : (resolveTyWithLocalDecls decls emptyLayoutTable u32MirTy).kind = .uint .u32 := hKind u32MirTy
+      have hDstSz : tyByteSize decls emptyLayoutTable (resolveTyWithLocalDecls decls emptyLayoutTable u32MirTy) = some 4 := by
+        cases hr : resolveTyWithLocalDecls decls emptyLayoutTable u32MirTy with
+        | mk kd li => rw [hr] at hrk; dsimp only at hrk; subst hrk; exact hU32Ty li
+      have hSrcSz : resolveByteCastSrcTyAndSize decls emptyLayoutTable op u32MirTy =
+          some (resolveTyWithLocalDecls decls emptyLayoutTable u32MirTy, 4) := by
+        unfold resolveByteCastSrcTyAndSize; dsimp only; rw [hDstSz]
+      have hEnc : encodeByteCastSourceBytes emptyLayoutTable
+          (resolveTyWithLocalDecls decls emptyLayoutTable u32MirTy) (.scalar ⟨bits, 4⟩) =
+          some (encodeLittleEndianBytes bits 4 none) := by
+        cases hr : resolveTyWithLocalDecls decls emptyLayoutTable u32MirTy with
+        | mk kd li =>
+          rw [hr] at hrk; dsimp only at hrk; subst hrk
+          unfold encodeByteCastSourceBytes encodeTypedValueToBytes normalizeCodecTy encodeValueToBytes
+          simp only [lookup_emptyLayoutTable_mr]; rfl
       have hLen : length (encodeLittleEndianBytes bits 4 none) = 4 := encodeLittleEndianBytes_len bits 4 none
-      have hDecAux : ∀ bs, length bs = 4 → decodeLittleEndianBytes bs = some (bits, none) →
-          decodeValueFromBytes 16 emptyLayoutTable u32MirTy bs = some (.scalar ⟨bits, 4⟩) := by
-        intro bs hl hd; unfold decodeValueFromBytes decodeScalarBytes; simp [u32MirTy, hl, hd]; rfl
-      have hDec : decodeTypedValueFromBytes defaultCodecFuel emptyLayoutTable u32MirTy
-          (encodeLittleEndianBytes bits 4 none) = some (.scalar ⟨bits, 4⟩) :=
-        hDecAux _ hLen (by
-          rw [decodeLittleEndianBytes_encode, show 256 ^ 4 = 2 ^ 32 by decide, Nat.mod_eq_of_lt hBits]; rfl)
-      have hDstSz : tyByteSize decls emptyLayoutTable u32MirTy = some 4 := by
-        unfold tyByteSize tyByteSizeAndAlignAux; rw [hResD]; rfl
+      have hDecAux : ∀ (li : LayoutIdx) (bs : List MirSemantics.AbstractByte),
+          length bs = 4 → decodeLittleEndianBytes bs = some (bits, none) →
+          decodeValueFromBytes 16 emptyLayoutTable { kind := .uint .u32, layoutIdx := li } bs =
+            some (.scalar ⟨bits, 4⟩) := by
+        intro li bs hl hd
+        unfold decodeValueFromBytes decodeScalarBytes
+        simp [hl, hd]; rfl
+      have hDec : decodeTypedValueFromBytes defaultCodecFuel emptyLayoutTable
+          (resolveTyWithLocalDecls decls emptyLayoutTable u32MirTy)
+          (encodeLittleEndianBytes bits 4 none) = some (.scalar ⟨bits, 4⟩) := by
+        cases hr : resolveTyWithLocalDecls decls emptyLayoutTable u32MirTy with
+        | mk kd li =>
+          rw [hr] at hrk; dsimp only at hrk; subst hrk
+          unfold decodeTypedValueFromBytes
+          dsimp only [normalizeCodecTy, defaultCodecFuel]
+          exact hDecAux li _ hLen (by
+            rw [decodeLittleEndianBytes_encode, show 256 ^ 4 = 2 ^ 32 by decide, Nat.mod_eq_of_lt hBits32]; rfl)
       show evalByteCast locals op u32MirTy mem decls emptyLayoutTable = _
       unfold evalByteCast
-      simp only [hOp, hResD, hDstSz, hSrcTy, hSrcSz, Nat.beq_refl, hEnc, hLen, hDec]
+      dsimp only
+      rw [hOp]; dsimp only
+      rw [hDstSz]; dsimp only
+      rw [hSrcTy]; dsimp only
+      rw [hSrcSz]; dsimp only
+      rw [hEnc]; dsimp only
+      rw [hLen]; dsimp only
+      rw [hDec]
     have hMr : transmuteM (M := M) (.Int (Int.ofNat bits)) u32MrTy u32MrTy m =
         .ok (.Int (Int.ofNat bits)) :=
-      transmuteM_int_sameSize (M := M) u32 u32 rfl (by decide) ⟨4⟩ rfl rfl bits hBits m
-    exact ⟨.scalar ⟨bits, 4⟩, .Int (Int.ofNat bits), hWrap, hCast, hCast, hMr, .scalar bits 4⟩
+      transmuteM_int_sameSize (M := M) u32 u32 rfl (by decide) ⟨4⟩ rfl rfl bits hBits32 m
+    exact ⟨.scalar ⟨bits, 4⟩, .Int (Int.ofNat bits), hWrap, hCast, hCast, hMr, .scalar bits 4 hBits32⟩
 
-/-- **V5 Value-Coupled Universal Binder-Struct & `NonZero` Wrapping
+/-- **V5 Value-Coupled Universal Binder-Struct, `NonZero`, & Transparent `bool` Wrapping
 (`v5_wrapUnsafeBinder_struct_nonZero_coupled_valRel_sim`)**: for EVERY `M ∈ {BM, TBM}`
 and EVERY operand (beyond the transparent `u32 → u32` identity of
 `v5_v6_binder_and_subtype_coupled_valRel_sim`):
@@ -2162,12 +2223,15 @@ and EVERY operand (beyond the transparent `u32 → u32` identity of
    Trusted aggregate related (`aggregate`) to MiniRust's `transmuteM` tuple image;
 2. `NonZeroU8` wrapping of ANY `1 ≤ b < 256` yields a Trusted aggregate related
    (`enumVariant 0`) to MiniRust's `.Variant 0` image;
-3. `NonZeroU8` wrapping of `0` faults UB on Trusted AND MiniRust. -/
+3. `NonZeroU8` wrapping of `0` faults UB on Trusted AND MiniRust;
+4. transparent `bool` wrapping (`binderBoolMirTy`): `b ∈ {0, 1}` succeeds on BOTH
+   Trusted (`.scalar ⟨b, 1⟩`) and MiniRust (`.Bool (b == 1)`), while `2 ≤ b < 256`
+   faults UB on BOTH Trusted and MiniRust! -/
 theorem v5_wrapUnsafeBinder_struct_nonZero_coupled_valRel_sim {M : Type} [Gen.Memory M] [MemoryOps M]
     (allocBase : Nat → Nat) (provAllocId : Gen.Memory.Provenance M → Nat)
     (locals locals' : List LocalSlot) (op : MirAst.Operand) (mem mem' : MirSemantics.Memory)
     (m : Option (Machine M)) :
-    (∀ (bits : Nat) (mv : Gen.Value M), bits < 2 ^ 32 →
+    (∀ (bits : Nat) (mv : Gen.Value M),
       evalUseRvalue locals op mem [mkDecl binderU32MirTy, mkDecl u32MirTy] ep2BinderLayouts =
         .ok (.scalar ⟨bits, 4⟩) locals' mem' →
       operandTy [mkDecl binderU32MirTy, mkDecl u32MirTy] ep2BinderLayouts op = some u32MirTy →
@@ -2177,7 +2241,7 @@ theorem v5_wrapUnsafeBinder_struct_nonZero_coupled_valRel_sim {M : Type} [Gen.Me
           [mkDecl binderU32MirTy, mkDecl u32MirTy] ep2BinderLayouts = .ok tv locals' mem' ∧
         transmuteM (M := M) mv u32MrTy (mrBinderWrapperTy u32MrTy ⟨4⟩ ⟨4⟩) m = .ok mv' ∧
         Ep2ValRel allocBase provAllocId tv mv') ∧
-    (∀ (b : Nat) (mv : Gen.Value M), 1 ≤ b → b < 256 →
+    (∀ (b : Nat) (mv : Gen.Value M), 1 ≤ b →
       evalUseRvalue locals op mem [mkDecl binderNzU8MirTy, mkDecl u8MirTy] ep2BinderLayouts =
         .ok (.scalar ⟨b, 1⟩) locals' mem' →
       operandTy [mkDecl binderNzU8MirTy, mkDecl u8MirTy] ep2BinderLayouts op = some u8MirTy →
@@ -2194,30 +2258,56 @@ theorem v5_wrapUnsafeBinder_struct_nonZero_coupled_valRel_sim {M : Type} [Gen.Me
       Ep2ValRel allocBase provAllocId (.scalar ⟨0, 1⟩) mv →
       evalRvalue locals (.wrapUnsafeBinder op binderNzU8MirTy) mem
           [mkDecl binderNzU8MirTy, mkDecl u8MirTy] ep2BinderLayouts = .ub ∧
-        ∃ msg, transmuteM (M := M) mv u8MrTy nonZeroU8MrTy m = .error (.ub msg)) := by
-  refine ⟨?_, ?_, ?_⟩
-  · intro bits mv hBits hUse hTy hRel
+        ∃ msg, transmuteM (M := M) mv u8MrTy nonZeroU8MrTy m = .error (.ub msg)) ∧
+    (∀ (b : Nat) (mv : Gen.Value M),
+      evalUseRvalue locals op mem [mkDecl binderBoolMirTy, mkDecl u8MirTy] ep2BinderLayouts =
+        .ok (.scalar ⟨b, 1⟩) locals' mem' →
+      Ep2ValRel allocBase provAllocId (.scalar ⟨b, 1⟩) mv →
+      ((b = 0 ∨ b = 1) →
+        evalRvalue locals (.wrapUnsafeBinder op binderBoolMirTy) mem
+          [mkDecl binderBoolMirTy, mkDecl u8MirTy] ep2BinderLayouts = .ok (.scalar ⟨b, 1⟩) locals' mem' ∧
+        transmuteM (M := M) mv u8MrTy .Bool m = .ok (.Bool (b == 1))) ∧
+      (2 ≤ b →
+        evalRvalue locals (.wrapUnsafeBinder op binderBoolMirTy) mem
+          [mkDecl binderBoolMirTy, mkDecl u8MirTy] ep2BinderLayouts = .ub ∧
+        ∃ msg, transmuteM (M := M) mv u8MrTy .Bool m = .error (.ub msg))) := by
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · intro bits mv hUse hTy hRel
     cases hRel with
-    | scalar _ _ =>
+    | scalar _ _ hBits =>
       have hT := ((v5_wrapUnsafeBinder_universal_sim locals locals' op mem mem' bits 0 hBits (by decide)
         none none).1 hUse hTy).1
       have hM := (transmuteM_binderWrapper_u32_and_thinPtr (M := M) bits 0 hBits (by decide) none m).2.1
       have hI : intFromBits bits u32 = Int.ofNat bits := rfl
       rw [hI] at hM
-      exact ⟨_, _, hT, hM, .aggregate _ _ (.cons (.scalar bits 4) .nil)⟩
-  · intro b mv h1 hb hUse hTy hRel
+      exact ⟨_, _, hT, hM, .aggregate _ _ (.cons (.scalar bits 4 hBits) .nil)⟩
+  · intro b mv h1 hUse hTy hRel
     cases hRel with
-    | scalar _ _ =>
+    | scalar _ _ hb =>
       have hT := ((v5_wrapUnsafeBinder_universal_sim locals locals' op mem mem' 0 b (by decide) hb
         none none).2.2.2.2.2.1 h1 hUse hTy).1
       have hM := (transmuteM_u8_to_nonZeroU8 (M := M) b hb m).2 h1
-      exact ⟨_, _, hT, hM, .enumVariant 0 _ _ (.scalar b 1)⟩
+      exact ⟨_, _, hT, hM, .enumVariant 0 _ _ (.scalar b 1 hb)⟩
   · intro mv hUse hTy hRel
     cases hRel with
-    | scalar _ _ =>
+    | scalar _ _ _ =>
       have hT := ((v5_wrapUnsafeBinder_universal_sim locals locals' op mem mem' 0 0 (by decide) (by decide)
         none none).2.2.2.2.1 hUse hTy).1
       exact ⟨hT, _, (transmuteM_u8_to_nonZeroU8 (M := M) 0 (by decide) m).1 rfl⟩
+  · intro b mv hUse hRel
+    cases hRel with
+    | scalar _ _ hb =>
+      refine ⟨?_, ?_⟩
+      · intro hb01
+        have hT := ((v5_wrapUnsafeBinder_universal_sim locals locals' op mem mem' 0 b (by decide) hb
+          none none).2.2.1 hb01 hUse).1
+        rcases hb01 with rfl | rfl
+        · exact ⟨hT, (transmuteM_u8_to_bool (M := M) 0 (by decide) m).1 rfl⟩
+        · exact ⟨hT, (transmuteM_u8_to_bool (M := M) 1 (by decide) m).2.1 rfl⟩
+      · intro hGe
+        have hT := ((v5_wrapUnsafeBinder_universal_sim locals locals' op mem mem' 0 b (by decide) hb
+          none none).2.2.2.1 hGe hUse).1
+        exact ⟨hT, _, (transmuteM_u8_to_bool (M := M) b hb m).2.2 hGe⟩
 
 /-- **V7 Value-Coupled Universal Thin & Wide `AggregateKind.rawPtr` + Episode 1 `UnOp.GetMetadata`
 Simulation (`v7_rawPtr_coupled_valRel_sim`)**: for EVERY `M ∈ {BM, TBM}`, whenever
@@ -2251,7 +2341,6 @@ theorem v7_rawPtr_coupled_valRel_sim {M : Type} [Gen.Memory M] [MemoryOps M]
       Ep2ValRel allocBase provAllocId (.ptr p 8) md →
       Ep2ValRel allocBase provAllocId (.scalar ⟨len, 8⟩) mm →
       allocBase p.allocId + p.offsetBytes < 2 ^ 64 →
-      len < 2 ^ 64 →
       ∃ tv mv',
         evalRvalue locals (.aggregate (.rawPtr ptee mut_) [dOp, mOp]) mem decls emptyLayoutTable = .ok tv locals' mem ∧
         transmuteM (M := M) (.Tuple [md, mm]) mrRawPtrWidePairTy wideSlicePtrMrTy m = .ok mv' ∧
@@ -2274,11 +2363,11 @@ theorem v7_rawPtr_coupled_valRel_sim {M : Type} [Gen.Memory M] [MemoryOps M]
           hTr,
           transmuteM_rawPtrThinPair_to_thinRawPtr (M := M) (allocBase p.allocId + p.offsetBytes) hAddr prov m,
           .thinPtr p (allocBase p.allocId + p.offsetBytes) prov rfl hP⟩
-  · intro locals locals' dOp mOp ptee mut_ mem decls p len md mm m hWide hOps hRelD hRelM hAddr hLen
+  · intro locals locals' dOp mOp ptee mut_ mem decls p len md mm m hWide hOps hRelD hRelM hAddr
     cases hRelD with
     | thinPtr _ addr prov hA hP =>
       cases hRelM with
-      | scalar _ _ =>
+      | scalar _ _ hLen =>
         subst hA
         have hTr : evalRvalue locals (.aggregate (.rawPtr ptee mut_) [dOp, mOp]) mem decls emptyLayoutTable =
             .ok (.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]) locals' mem := by
@@ -2291,8 +2380,8 @@ theorem v7_rawPtr_coupled_valRel_sim {M : Type} [Gen.Memory M] [MemoryOps M]
           hTr,
           transmuteM_rawPtrWidePair_to_wideSlicePtr (M := M) (allocBase p.allocId + p.offsetBytes) len hAddr hLen prov m,
           (evalUnOpM_rawPtr_meta_size_align (M := M) (allocBase p.allocId + p.offsetBytes) len hAddr hLen prov m).2.2.2.2.1,
-          .widePtr p len (allocBase p.allocId + p.offsetBytes) prov rfl hP,
-          .scalar len 8⟩
+          .widePtr p len hLen (allocBase p.allocId + p.offsetBytes) prov rfl hP,
+          .scalar len 8 hLen⟩
 
 /-- **V8 Value-Coupled Universal `n`-Capture Closure Simulation (`v8_closure_coupled_valRel_sim`)**:
 for EVERY `M ∈ {BM, TBM}` and EVERY capture list `ops` whose evaluated Trusted

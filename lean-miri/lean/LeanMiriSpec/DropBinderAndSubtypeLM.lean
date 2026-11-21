@@ -473,46 +473,70 @@ def ep2IsAncestor (tree : Miri.TreeBorrows.BorrowTree) (anc : Miri.TreeBorrows.U
         | none => false
       | none => false
 
-/-- Place- and byte-range-relative Tree Borrows write conflict check for a drop
-through `tag` on `[start, start + size)` in an allocation whose vendored borrow
-tree is `tree`. Directly delegates every overlapping location-tree segment and
-tree node to unmodified vendored `Miri.TreeBorrows.Tree.LocationState.performAccess`,
-respecting:
-* exact borrow-tree ancestry (`ep2IsAncestor` → `.LocalAccess` vs. `.ForeignAccess`,
-  so child writes under a protected ancestor are permitted!),
-* exact byte-range overlap (`seg.range` vs. `[start, start + size)`),
-* per-location `accessed` bit and permission (`.Cell`, `.Disabled`, `.Frozen`,
-  `.Unique`, `.ReservedFrz`, `.ReservedIM`), and
-* the global vendored `ProtectedTags` table (`.StrongProtector`).
-
-An accessing tag that is not registered in `tree` is a conflict (fail closed),
-matching vendored `performBorrowAccessRange`'s `.MissingTag` (non-`Completed`)
-status; A1 instead treated every node as foreign and could let the drop succeed. -/
-def ep2ProtectorConflict (protectedTags : Miri.TreeBorrows.ProtectedTags)
+/-- State-transitioning Tree Borrows `.Write` through `tag` on `[start, start + size)`
+for an allocation whose vendored borrow tree is `tree`:
+* fails closed (`none`) when `tag` is unregistered in `tree` (matching vendored
+  `BorrowTree.performBorrowAccessRange`'s `.MissingTag`) or when any overlapping
+  segment/node transition via unmodified vendored
+  `Miri.TreeBorrows.Tree.LocationState.performAccess` does not return `.Success`;
+* splits any partially-overlapping range segment so ONLY `[start, start + size)`
+  transitions while sibling bytes keep their original permissions;
+* writes every updated `LocationState` (e.g., disabling an unprotected foreign child
+  tag from `.Unique` to `.Disabled`!) back into the returned `BorrowTree` so
+  subsequent accesses observe exact post-drop permissions rather than stale state! -/
+def ep2ApplyTreeBorrowsWrite (protectedTags : Miri.TreeBorrows.ProtectedTags)
     (tree : Miri.TreeBorrows.BorrowTree) (tag : Miri.Memory.BorTag)
-    (start size : Miri.ABI.Size) : Bool :=
+    (start size : Miri.ABI.Size) : Option Miri.TreeBorrows.BorrowTree :=
   let startNat := start.bytes.toNat
   let endNat := startNat + size.bytes.toNat
   let fuel := tree.nodes.data.size + 1
   match tree.tagMapping.get tag with
-  | none => true
+  | none => none
   | some srcIdx =>
-  tree.locations.entries.any fun seg =>
-    seg.range.start.toNat < endNat && startNat < seg.range.stop.toNat &&
-    tree.tagMapping.mapping.any fun (otherTag, otherIdx) =>
-      let relPos : Miri.TreeBorrows.AccessRelatedness :=
-        if ep2IsAncestor tree otherIdx srcIdx fuel then .LocalAccess else .ForeignAccess
-      let isProt : Bool := protectedTags.get otherTag == some .StrongProtector
-      let locSt? : Option Miri.TreeBorrows.Tree.LocationState :=
-        match seg.data.perms.get otherIdx with
-        | some ls => some ls
-        | none => (tree.nodes.get otherIdx).map (·.defaultLocationState)
-      match locSt? with
-      | some ls =>
-        match Miri.TreeBorrows.Tree.LocationState.performAccess ls .Write relPos isProt with
-        | .Success _ _ => false
-        | _ => true
-      | none => false
+    let updateLocTree (lt : Miri.TreeBorrows.LocationTree) : Option Miri.TreeBorrows.LocationTree :=
+      tree.tagMapping.mapping.foldlM (init := lt) fun acc (otherTag, otherIdx) =>
+        let relPos : Miri.TreeBorrows.AccessRelatedness :=
+          if ep2IsAncestor tree otherIdx srcIdx fuel then .LocalAccess else .ForeignAccess
+        let isProt : Bool := protectedTags.get otherTag == some .StrongProtector
+        let locSt? : Option Miri.TreeBorrows.Tree.LocationState :=
+          match acc.perms.get otherIdx with
+          | some ls => some ls
+          | none => (tree.nodes.get otherIdx).map (·.defaultLocationState)
+        match locSt? with
+        | some ls =>
+          match Miri.TreeBorrows.Tree.LocationState.performAccess ls .Write relPos isProt with
+          | .Success nextLs _ => some { acc with perms := acc.perms.insert otherIdx nextLs }
+          | _ => none
+        | none => some acc
+    let stepSeg (out : Array (Miri.DataStructures.RangeMapSegment Miri.TreeBorrows.LocationTree))
+        (seg : Miri.DataStructures.RangeMapSegment Miri.TreeBorrows.LocationTree) :
+        Option (Array (Miri.DataStructures.RangeMapSegment Miri.TreeBorrows.LocationTree)) :=
+      let s0 := seg.range.start.toNat
+      let s1 := seg.range.stop.toNat
+      if s0 < endNat && startNat < s1 then
+        match updateLocTree seg.data with
+        | none => none
+        | some lt' =>
+          let oStart := max s0 startNat
+          let oStop := min s1 endNat
+          let out1 := if s0 < oStart then
+              out.push ⟨⟨seg.range.start, UInt64.ofNat oStart⟩, seg.data⟩
+            else out
+          let out2 := out1.push ⟨⟨UInt64.ofNat oStart, UInt64.ofNat oStop⟩, lt'⟩
+          let out3 := if oStop < s1 then
+              out2.push ⟨⟨UInt64.ofNat oStop, seg.range.stop⟩, seg.data⟩
+            else out2
+          some out3
+      else
+        some (out.push seg)
+    (tree.locations.entries.foldlM stepSeg #[]).map fun entries' =>
+      { tree with locations := { entries := entries' } }
+
+/-- Boolean conflict predicate backed directly by `ep2ApplyTreeBorrowsWrite`. -/
+def ep2ProtectorConflict (protectedTags : Miri.TreeBorrows.ProtectedTags)
+    (tree : Miri.TreeBorrows.BorrowTree) (tag : Miri.Memory.BorTag)
+    (start size : Miri.ABI.Size) : Bool :=
+  (ep2ApplyTreeBorrowsWrite protectedTags tree tag start size).isNone
 
 /-- Two-node vendored Tree Borrows tree over the 4 bytes of a `u32` local: root
 `retagParentTag` (`Unique`) with an accessed `Unique` child `retagChildTag`
@@ -561,14 +585,38 @@ theorem ep2ProtectorConflict_agrees_with_vendored_tree_borrows (isProtected : Bo
   refine h.trans ?_
   cases isProtected <;> decide +kernel
 
+/-- **Post-Drop Tree Borrows State Transition & Sub-Range Split Regression (A2)**:
+1. Writing through root `retagParentTag` on unprotected `lmU32ChildTree` succeeds
+   (`some tree'`) AND disables `retagChildTag` (`Unique → Disabled`), so a subsequent
+   write through `retagChildTag` on `tree'` NOW CONFLICTS (`true`, ruling out stale
+   pre-drop permissions!);
+2. Writing through root `retagParentTag` on the first 4 bytes `[0, 4)` of the 8-byte
+   unprotected `hooksTwoNodeTree .unique` splits `[0, 8)` into `[0, 4)` (child disabled)
+   and `[4, 8)` (child still `Unique`), so a subsequent write through `retagChildTag`
+   conflicts on `[0, 4)` (`true`) while sibling `[4, 8)` STILL SUCCEEDS (`false`)! -/
+theorem ep2ApplyTreeBorrowsWrite_disables_unprotected_child_and_splits_subrange :
+    (match ep2ApplyTreeBorrowsWrite {} lmU32ChildTree retagParentTag
+        Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4) with
+      | some tree' =>
+        ep2ProtectorConflict {} tree' retagChildTag Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4)
+      | none => false) = true ∧
+    (match ep2ApplyTreeBorrowsWrite {} (hooksTwoNodeTree .unique) retagParentTag
+        Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4) with
+      | some tree' =>
+        ep2ProtectorConflict {} tree' retagChildTag Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4) &&
+        !(ep2ProtectorConflict {} tree' retagChildTag (Miri.ABI.Size.ofBytes 4) (Miri.ABI.Size.ofBytes 4))
+      | none => false) = true :=
+  ⟨by decide +kernel, by decide +kernel⟩
+
 /-- Deinitialize `len` bytes at `relInLocal` inside the memory-backed local `mp`
 and jump to `target`:
 * the allocation-relative start is `mp`'s address minus the allocation's recorded
   base address (`ep2RelOffset?`), guarded against `UInt64` addition overflow;
 * when `treeBorrows = true` and the allocation carries a borrow tree and the
-  machine a borrow tracker, `ep2ProtectorConflict` checks the exact dropped byte
-  range `[start, start + size)` through unmodified vendored
-  `Miri.TreeBorrows.Tree.LocationState.performAccess`;
+  machine a borrow tracker, `ep2ApplyTreeBorrowsWrite` validates AND transitions
+  the borrow tree on `[start, start + size)` through unmodified vendored
+  `Miri.TreeBorrows.Tree.LocationState.performAccess`, writing the updated tree
+  back into the allocation's `extra` field;
 * the bytes are then cleared by unmodified vendored `Allocation.writeUninit`. -/
 def ep2DeinitIndirect (treeBorrows : Bool) (mp : Miri.Interpreter.MemPlace AnnealProv)
     (relInLocal : UInt64) (len : Nat) (target : Miri.MIR.BasicBlockId)
@@ -585,17 +633,19 @@ def ep2DeinitIndirect (treeBorrows : Bool) (mp : Miri.Interpreter.MemPlace Annea
       | some (_, liveAlloc) =>
         let start := Miri.ABI.Size.ofBytes (base + relInLocal)
         let size := Miri.ABI.Size.ofBytes (UInt64.ofNat len)
-        let conflict : Bool :=
+        let tbRes : Option (Option Miri.TreeBorrows.BorrowTree) :=
           match treeBorrows, state.machine.borrowTracker, liveAlloc.allocation.extra with
-          | true, some bt, some tree => ep2ProtectorConflict bt.global.protectedTags tree tag start size
-          | _, _, _ => false
-        if conflict then
+          | true, some bt, some tree =>
+            (ep2ApplyTreeBorrowsWrite bt.global.protectedTags tree tag start size).map some
+          | _, _, ext => some ext
+        match tbRes with
+        | none =>
           (state, .error (.undefinedBehavior "Tree Borrows write conflict on drop"))
-        else
+        | some extra' =>
           match Miri.Memory.Allocation.writeUninit (Miri.Memory.allocRange start size)
               (Miri.ABI.Size.ofBytes 8) liveAlloc.allocation with
           | .ok () alloc' =>
-            let mach' := updateAllocMachine state.machine lIdx aid liveAlloc.kind alloc'
+            let mach' := updateAllocMachine state.machine lIdx aid liveAlloc.kind (alloc'.setExtra extra')
             Miri.Interpreter.ControlFlow.goToBlock target { state with machine := mach' }
           | .error _ _ => (state, .error (.undefinedBehavior "drop out of bounds"))
       | none => (state, .error (.undefinedBehavior "drop on dangling allocation"))
@@ -1748,13 +1798,29 @@ theorem lm_v3_drop_dead_ub_overlay_universal (decls : List LocalDecl) (layouts :
   unfold annealEvalDropOverlay annealEvalDropLM4_1
   simp only [hcf, hdead, ite_self]
 
+private theorem resolveTyWithLocalDecls_kind_lm (decls : List LocalDecl)
+    (layouts : LayoutTable) (ty : Ty) :
+    (resolveTyWithLocalDecls decls layouts ty).kind = ty.kind := by
+  unfold resolveTyWithLocalDecls
+  split
+  · rfl
+  · split
+    · rfl
+    · split
+      · split <;> rfl
+      · rfl
+
+private theorem lookup_emptyLayoutTable_lm (k : Nat) :
+    LayoutTable.lookup emptyLayoutTable k = none := by
+  cases k <;> rfl
+
 /-- **V4 Trusted Lowering Justification (`trusted_shallowInitBox_eq_transmute_on_rawPtr`)**:
 justifies LeanMiri's `.Cast .Transmute` lowering of `Rvalue.shallowInitBox` directly in
 Trusted `MirSemantics.evalRvalue`! For EVERY `locals`, `op`, `mem`, `decls`, `aid`,
-`contentTy`, `srcInt`, and `boxInt`, whenever `op` evaluates to a base pointer
-`{ allocId := aid, offsetBytes := 0 }` of width 8 and static raw-pointer type
-`*mut <srcInt>`, `evalRvalue ... (.shallowInitBox op contentTy)` is IDENTICALLY EQUAL
-to `evalRvalue ... (.cast .transmute op (*mut <boxInt>))`! -/
+`contentTy`, `srcInt`, and `boxInt` (with zero redundant layout-resolution hypotheses!),
+whenever `op` evaluates to a base pointer `{ allocId := aid, offsetBytes := 0 }` of width 8
+and static raw-pointer type `*mut <srcInt>`, `evalRvalue ... (.shallowInitBox op contentTy)`
+is IDENTICALLY EQUAL to `evalRvalue ... (.cast .transmute op (*mut <boxInt>))`! -/
 theorem trusted_shallowInitBox_eq_transmute_on_rawPtr
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
     (decls : List LocalDecl) (contentTy : Ty) (srcInt boxInt : UintTy) (aid : Nat) :
@@ -1765,11 +1831,20 @@ theorem trusted_shallowInitBox_eq_transmute_on_rawPtr
       .ok (.ptr p 8) locals' →
     evalUseRvalue locals op mem decls emptyLayoutTable = .ok (.ptr p 8) locals' mem →
     operandTy decls emptyLayoutTable op = some srcTy →
-    resolveTyWithLocalDecls decls emptyLayoutTable boxTy = boxTy →
-    resolveByteCastSrcTyAndSize decls emptyLayoutTable op srcTy = some (srcTy, 8) →
     evalRvalue locals (.shallowInitBox op contentTy) mem decls emptyLayoutTable =
       evalRvalue locals (.cast .transmute op boxTy) mem decls emptyLayoutTable := by
-  intro srcTy boxTy p hOp hUse hSrcTy hResD hSrcSz
+  intro srcTy boxTy p hOp hUse hSrcTy
+  have hKind := resolveTyWithLocalDecls_kind_lm decls emptyLayoutTable
+  have hRawSz : ∀ (u : UintTy) (k : Nat),
+      tyByteSize decls emptyLayoutTable { kind := .rawPtr .mut (.uint u), layoutIdx := k } = some 8 := by
+    intro u k
+    unfold tyByteSize tyByteSizeAndAlignAux
+    have hk : (resolveTyWithLocalDecls decls emptyLayoutTable { kind := .rawPtr .mut (.uint u), layoutIdx := k }).kind =
+        .rawPtr .mut (.uint u) := hKind _
+    cases hr : resolveTyWithLocalDecls decls emptyLayoutTable { kind := .rawPtr .mut (.uint u), layoutIdx := k } with
+    | mk kd li =>
+      rw [hr] at hk; dsimp only at hk; subst hk
+      simp only [rigidTyByteSize, lookup_emptyLayoutTable_lm, layoutPointerBytes, emptyLayoutTable]
   have hShallow : evalRvalue locals (.shallowInitBox op contentTy) mem decls emptyLayoutTable =
       .ok (.ptr p 8) locals' mem := by
     show evalShallowInitBox locals op contentTy mem decls emptyLayoutTable = _
@@ -1777,10 +1852,25 @@ theorem trusted_shallowInitBox_eq_transmute_on_rawPtr
     simp only [hUse, hSrcTy, srcTy, layoutPointerBytes, emptyLayoutTable]
   have hTrans : evalRvalue locals (.cast .transmute op boxTy) mem decls emptyLayoutTable =
       .ok (.ptr p 8) locals' mem := by
-    have hDstSz : tyByteSize decls emptyLayoutTable boxTy = some 8 := by
-      unfold tyByteSize tyByteSizeAndAlignAux; rw [hResD]
-    have hEnc : encodeByteCastSourceBytes emptyLayoutTable srcTy (.ptr p 8) =
-        some (encodeLittleEndianBytes 0 8 (some (p.allocId, p.tag))) := rfl
+    have hrBoxK : (resolveTyWithLocalDecls decls emptyLayoutTable boxTy).kind = .rawPtr .mut (.uint boxInt) := hKind boxTy
+    have hrSrcK : (resolveTyWithLocalDecls decls emptyLayoutTable srcTy).kind = .rawPtr .mut (.uint srcInt) := hKind srcTy
+    have hDstSz : tyByteSize decls emptyLayoutTable (resolveTyWithLocalDecls decls emptyLayoutTable boxTy) = some 8 := by
+      cases hr : resolveTyWithLocalDecls decls emptyLayoutTable boxTy with
+      | mk kd li => rw [hr] at hrBoxK; dsimp only at hrBoxK; subst hrBoxK; exact hRawSz boxInt li
+    have hSrcTySz : tyByteSize decls emptyLayoutTable (resolveTyWithLocalDecls decls emptyLayoutTable srcTy) = some 8 := by
+      cases hr : resolveTyWithLocalDecls decls emptyLayoutTable srcTy with
+      | mk kd li => rw [hr] at hrSrcK; dsimp only at hrSrcK; subst hrSrcK; exact hRawSz srcInt li
+    have hSrcSz : resolveByteCastSrcTyAndSize decls emptyLayoutTable op srcTy =
+        some (resolveTyWithLocalDecls decls emptyLayoutTable srcTy, 8) := by
+      unfold resolveByteCastSrcTyAndSize; dsimp only; rw [hSrcTySz]
+    have hEnc : encodeByteCastSourceBytes emptyLayoutTable
+        (resolveTyWithLocalDecls decls emptyLayoutTable srcTy) (.ptr p 8) =
+        some (encodeLittleEndianBytes 0 8 (some (p.allocId, p.tag))) := by
+      cases hr : resolveTyWithLocalDecls decls emptyLayoutTable srcTy with
+      | mk kd li =>
+        rw [hr] at hrSrcK; dsimp only at hrSrcK; subst hrSrcK
+        unfold encodeByteCastSourceBytes encodeTypedValueToBytes normalizeCodecTy encodeValueToBytes
+        simp only [lookup_emptyLayoutTable_lm]; rfl
     have hLen : length (encodeLittleEndianBytes 0 8 (some (p.allocId, p.tag))) = 8 := rfl
     have hDecAux : ∀ bs, length bs = 8 →
         decodeLittleEndianBytes bs = some (0, some (p.allocId, p.tag)) →
@@ -1790,26 +1880,39 @@ theorem trusted_shallowInitBox_eq_transmute_on_rawPtr
       unfold decodePtrBytesNoForge decodeScalarBytes
       dsimp only
       rw [hl, hd, hu]
-    have hDec : decodeTypedValueFromBytes defaultCodecFuel emptyLayoutTable boxTy
+    have hDec : decodeTypedValueFromBytes defaultCodecFuel emptyLayoutTable
+        (resolveTyWithLocalDecls decls emptyLayoutTable boxTy)
         (encodeLittleEndianBytes 0 8 (some (p.allocId, p.tag))) = some (.ptr p 8) := by
-      change decodePtrBytesNoForge false (.uint boxInt) 8
-        (encodeLittleEndianBytes 0 8 (some (p.allocId, p.tag))) = some (.ptr p 8)
-      refine hDecAux _ hLen rfl ?_
-      unfold abstractBytesUniformProv
-      change abstractBytesAllProvAux aid p.tag (encodeLittleEndianBytes 0 7 (some (aid, p.tag))) = true
-      have hProv : ∀ n, abstractBytesAllProvAux aid p.tag
-          (encodeLittleEndianBytes 0 n (some (aid, p.tag))) = true := by
-        intro n
-        induction n with
-        | zero => rfl
-        | succ k ih =>
-          unfold encodeLittleEndianBytes abstractBytesAllProvAux
-          simp only [Nat.beq_refl, Bool.and_self]
-          exact ih
-      exact hProv 7
+      cases hr : resolveTyWithLocalDecls decls emptyLayoutTable boxTy with
+      | mk kd li =>
+        rw [hr] at hrBoxK; dsimp only at hrBoxK; subst hrBoxK
+        unfold decodeTypedValueFromBytes
+        dsimp only [normalizeCodecTy, defaultCodecFuel]
+        change decodePtrBytesNoForge false (.uint boxInt) 8
+          (encodeLittleEndianBytes 0 8 (some (p.allocId, p.tag))) = some (.ptr p 8)
+        refine hDecAux _ hLen rfl ?_
+        unfold abstractBytesUniformProv
+        change abstractBytesAllProvAux aid p.tag (encodeLittleEndianBytes 0 7 (some (aid, p.tag))) = true
+        have hProv : ∀ n, abstractBytesAllProvAux aid p.tag
+            (encodeLittleEndianBytes 0 n (some (aid, p.tag))) = true := by
+          intro n
+          induction n with
+          | zero => rfl
+          | succ k ih =>
+            unfold encodeLittleEndianBytes abstractBytesAllProvAux
+            simp only [Nat.beq_refl, Bool.and_self]
+            exact ih
+        exact hProv 7
     show evalByteCast locals op boxTy mem decls emptyLayoutTable = _
     unfold evalByteCast
-    simp only [hOp, hResD, hDstSz, hSrcTy, hSrcSz, Nat.beq_refl, hEnc, hLen, hDec]
+    dsimp only
+    rw [hOp]; dsimp only
+    rw [hDstSz]; dsimp only
+    rw [hSrcTy]; dsimp only
+    rw [hSrcSz]; dsimp only
+    rw [hEnc]; dsimp only
+    rw [hLen]; dsimp only
+    rw [hDec]
   rw [hShallow, hTrans]
 
 /-- **V4 Base-Translator Removal Boundary (`lm_v4_base_translate_unsupported`)**:
