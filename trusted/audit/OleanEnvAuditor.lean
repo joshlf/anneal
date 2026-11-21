@@ -1174,11 +1174,15 @@ def checkAxiom (L : Loaded) (ci : ConstantInfo) (m : Name) (localOk : Name → B
   report "unapprovedAxiom" n m "axiom outside the locked toolchain policy"
 
 /-- Does `c` name a recursion/fixpoint combinator emitted by Lean's equation compiler? -/
-def isRecursionCombinator (c : Name) : Bool :=
+def isRecursionCombinator (env : Environment) (c : Name) : Bool :=
   c == ``WellFounded.fix || c == ``WellFounded.Nat.fix || c == ``WellFounded.fixF ||
-  c == ``Acc.rec || c.getRoot == `Lean ||
+  c == ``Acc.rec || (`Lean.Order).isPrefixOf c ||
   (match c with
-   | .str _ s => s == "brecOn" || s.startsWith "brecOn_" || s == "rec" || s == "recOn"
+   | .str p s =>
+     -- Structural recursion is encoded through the inductive type's `brecOn`/`binductionOn`; a
+     -- bare recursor (`T.rec`) in a parent is not something the equation compiler emits.
+     (s == "brecOn" || s.startsWith "brecOn_" || s == "binductionOn") &&
+       (env.find? p matches some (.inductInfo _))
    | _ => false)
 
 /-- Does `parentCi`'s body (or its same-module `_unary` / `_mutual` helper) use a recursion
@@ -1187,7 +1191,7 @@ def parentUsesRecursionCombinator (env : Environment) (parent : Name) (parentCi 
     (recMod : Option Name) : Bool := Id.run do
   let checkCi (ci : ConstantInfo) : Bool :=
     match ci.value? (allowOpaque := true) with
-    | some v => v.getUsedConstants.any isRecursionCombinator
+    | some v => v.getUsedConstants.any (isRecursionCombinator env)
     | none => false
   if checkCi parentCi then return true
   for suffix in #["_unary", "_mutual"] do
@@ -1790,6 +1794,7 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
   let mut genuine : NameSet := {}
   let mut strictRoots : Array Name := #[]
   let mut localRoots : Std.HashMap Name (Array Name) := {}
+  let mut companionRoots : Array (Name × Name) := #[]
   let mut replayLocals : Std.HashMap Name ConstantInfo := {}
   let mut allNames : NameSet := {}
   let mut extraEdges : Array (Name × NameSet) := #[]
@@ -1864,7 +1869,9 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
       for k in overrideKinds env n do
         report "compilerOverrideAttribute" n m k
       checkIntrinsicTags L n m budget
-      if req.localAxiomModules.contains m then
+      if isCompanion then
+        companionRoots := companionRoots.push (m, n)
+      else if req.localAxiomModules.contains m then
         localRoots := localRoots.insert m ((localRoots.getD m #[]).push n)
       else
         strictRoots := strictRoots.push n
@@ -1888,9 +1895,20 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
       localRoots := localRoots.insert m ((localRoots.getD m #[]) ++ edges.toArray)
     else
       strictRoots := strictRoots ++ edges.toArray
-  let strictVisited ← closure L strictRoots {} genuine (fun _ => false) fuel `strict
+  -- Kernel closures never admit a code-generation companion: the kernel forbids safe declarations
+  -- from mentioning `partial` ones, so a companion reached from a kernel root is a forgery.
+  let strictVisited ← closure L strictRoots {} {} (fun _ => false) fuel `strict
+  let mut localVisited : Std.HashMap Name NameSet := {}
   for (m, rs) in localRoots.toList do
-    let _ ← closure L rs strictVisited genuine (fun om => om == m) fuel m
+    let v ← closure L rs strictVisited {} (fun om => om == m) fuel m
+    localVisited := localVisited.insert m v
+  -- Companion bodies are compiled code only; their dependencies are audited under the policy of
+  -- the module that stores them, admitting (other) genuine companions.
+  for (m, c) in companionRoots do
+    if req.localAxiomModules.contains m then
+      let _ ← closure L #[c] (localVisited.getD m strictVisited) genuine (fun om => om == m) fuel m
+    else
+      let _ ← closure L #[c] strictVisited genuine (fun _ => false) fuel `companions
   -- Statement origins of claim theorems.
   for m in req.claimModules do
     let some i := modIdx[m]?

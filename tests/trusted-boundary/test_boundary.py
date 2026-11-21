@@ -1209,6 +1209,24 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                      "fGhost", "IR body for definition without base-phase LCNF declaration",
                      "fNonRec", "does not use a recursion combinator",
                      toolchainRoots=["Init", "Std", "Lean"])
+        # A forged companion whose parent merely mentions some `Lean.*` constant (or a bare
+        # recursor) is not an equation-compiler companion: only well-founded / `brecOn` /
+        # `Lean.Order` fixpoint encodings count as recursion combinators.
+        forged_comp_source = "prelude\nimport Init\nimport Lean\nopen Lean\n" + (
+            "def cNr (n : Nat) : Nat := n + Lean.Name.anonymous.hash.toNat * 0\n"
+            "noncomputable def cNr2 (n : Nat) : Nat := Nat.rec n (fun _ ih => ih) 0\n"
+            "run_cmd Elab.Command.liftCoreM do\n"
+            "  for p in [`cNr, `cNr2] do\n"
+            "    let c := p ++ Name.mkSimple (\"_unsafe\" ++ \"_rec\")\n"
+            "    let ty ← mkArrow (mkConst ``Nat) (mkConst ``Nat)\n"
+            "    let body := mkLambda `n .default (mkConst ``Nat)\n"
+            "      (mkApp4 (mkConst ``Nat.rec [1]) (mkLambda `x .default (mkConst ``Nat) (mkConst ``Nat)) (mkNatLit 999)\n"
+            "        (mkLambda `k .default (mkConst ``Nat) (mkLambda `ih .default (mkConst ``Nat) (mkApp (mkConst c) (mkBVar 1))))\n"
+            "        (mkBVar 0))\n"
+            "    addDecl (.mutualDefnDecl [{ name := c, levelParams := [], type := ty, value := body, hints := .opaque, safety := .partial }])\n")
+        olean_module(ol, "OlForgedCompanion", forged_comp_source, ["Init", "Lean"])
+        olean_reject(ol, ["OlForgedCompanion"], "cNr._unsafe_rec", "cNr2._unsafe_rec", "does not use a recursion combinator",
+                     toolchainRoots=["Init", "Std", "Lean"])
         done("metaprogram-forged csimp/cpass/folder/LCNF/companion state, intrinsic tags, IR-unsafe, Lean library foreign")
 
         # Group 24: separate compilation (`-Dcompiler.postponeCompile=true`) of a `module` file
