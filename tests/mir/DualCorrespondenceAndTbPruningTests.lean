@@ -2909,6 +2909,12 @@ def castShape : Prog → Ty × Nat × Ty × CastKind
   | .uninitCast =>
     (WideSlice.usizeTy, 8, WideSlice.usizeTy, .floatToInt)
 
+/-- Target byte width of each cast program. -/
+def dstBytes : Prog → Nat
+  | .f32ToF64 | .bitsU64ToI64 | .f64ToU64 | .u64ToF64 | .uninitCast => 8
+  | .f64ToF32 | .f32ToI32 | .i32ToF32 | .bitsU32ToI32 | .f16ToF32
+  | .f128ToF32 => 4
+
 /-- The cast rvalue of a program (`_0 = copy _1 as T`). -/
 def castRvalue (p : Prog) : Rvalue :=
   .cast (castShape p).2.2.2 (.copy ⟨1, []⟩) (castShape p).2.2.1
@@ -2955,6 +2961,21 @@ def trustedVerdict (p : Prog) (q : Query) : Option (Verdict Nat) :=
   | .uninitCast =>
     WideSlice.frameVerdict uninitCastBody (WideSlice.frameInit 3 1)
   | _ => WideSlice.frameVerdict (castBody p) (castInit p q)
+
+/-- On every cast program supported by Anneal, executing the trusted machine
+writes a scalar whose byte width equals `dstBytes p`. -/
+theorem trusted_dstBytes_eq :
+    ∀ p ∈ [Prog.f32ToF64, .f64ToF32, .f32ToI32, .i32ToF32,
+           .bitsU32ToI32, .bitsU64ToI64, .f64ToU64, .u64ToF64],
+      match stepMirFn (castBody p) (castInit p .onePointFive) with
+      | .step s₁ =>
+        match s₁.frame.locals with
+        | .init (.scalar sc) :: _ => sc.sizeBytes = dstBytes p
+        | _ => False
+      | _ => False := by
+  intro p hp
+  simp only [List.mem_cons, List.not_mem_nil, or_false] at hp
+  rcases hp with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> rfl
 
 /-- Verdict of the Anneal model: the trusted machine, with a NaN result of
 a float-to-float cast replaced by the NaN the mode selects. The trusted
@@ -11548,27 +11569,42 @@ end Anneal.DualCorrespondenceAndTbPruningTests.FrameWp
 namespace Anneal.DualCorrespondenceAndTbPruningTests.Audit
 
 open Lean in
-/-- Syntactically trivial propositions under binders and conjunctions:
-`True`, reflexive `a = a` and `a ↔ a`, and conjunctions of trivial
-propositions. A bounded worklist (256 steps, far above any statement here)
-keeps the definition non-recursive, so no `_unsafe_rec` twin is emitted. -/
+/-- Non-recursive CNF worklist recognizing syntactically trivial propositions
+under universal, implication, `let`, and metadata wrappers: `True`, `¬ False`,
+`False → P`, `P → P`, reflexive `a = a`, `a ↔ a`, and `HEq a a`, conjunctions
+of trivial propositions, and disjunctions with a trivial disjunct. Bounded at
+256 steps with no recursion, so no `_unsafe_rec` twin is emitted. -/
 def trivialProp (e : Expr) : Bool := Id.run do
-  let mut todo : List Expr := [e]
+  let mut todo : List (List Expr) := [[e]]
   for _ in [0:256] do
     match todo with
     | [] => return true
-    | x :: rest =>
-      todo := rest
+    | [] :: _ => return false
+    | (x :: alts) :: rest =>
       match x with
-      | .forallE _ _ b _ => todo := b :: todo
-      | .mdata _ b => todo := b :: todo
-      | .const ``True _ => pure ()
-      | .app (.app (.const ``And _) a) b => todo := a :: b :: todo
+      | .mdata _ b => todo := (b :: alts) :: rest
+      | .letE _ _ _ b _ => todo := (b :: alts) :: rest
+      | .forallE _ d b _ =>
+        let dc := d.consumeMData
+        if dc.isConstOf ``False || dc.liftLooseBVars 0 1 == b.consumeMData then
+          todo := rest
+        else
+          todo := (b :: alts) :: rest
+      | .const ``True _ => todo := rest
+      | .app (.const ``Not _) a =>
+        if a.consumeMData.isConstOf ``False then todo := rest
+        else todo := alts :: rest
+      | .app (.app (.const ``And _) a) b =>
+        todo := (a :: alts) :: (b :: alts) :: rest
+      | .app (.app (.const ``Or _) a) b =>
+        todo := (a :: b :: alts) :: rest
       | .app (.app (.app (.const ``Eq _) _) a) b =>
-        unless a == b do return false
+        if a == b then todo := rest else todo := alts :: rest
       | .app (.app (.const ``Iff _) a) b =>
-        unless a == b do return false
-      | _ => return false
+        if a == b then todo := rest else todo := alts :: rest
+      | .app (.app (.app (.app (.const ``HEq _) _) a) _) b =>
+        if a == b then todo := rest else todo := alts :: rest
+      | _ => todo := alts :: rest
   return todo.isEmpty
 
 end Anneal.DualCorrespondenceAndTbPruningTests.Audit
@@ -11663,7 +11699,8 @@ run_cmd do
         ns ++ `FloatCast.authorityOf, ns ++ `FloatCast.checkOf,
         ns ++ `FloatCast.matchesReference_sound,
         ns ++ `FloatCast.empty_schedule_is_vacuous,
-        ns ++ `FloatCast.Engine.agrees_sound, ns ++ `FloatCast.castShape]
+        ns ++ `FloatCast.Engine.agrees_sound, ns ++ `FloatCast.castShape,
+        ns ++ `FloatCast.dstBytes]
     for n in wsWith ++ wsDefs do roots := roots.push (ns ++ `WideSlice ++ n)
     for n in fcWith ++ fcDefs do roots := roots.push (ns ++ `FloatCast ++ n)
     let mut pending : Array Name := #[]
@@ -11874,8 +11911,36 @@ run_cmd do
       ns ++ `CrossRoot.WideSlice.miri_denoteConsistent_spec
     addThm wsDenoteSpecName (← MetaM.run' <| inferType wsDenoteSpec)
       wsDenoteSpec
+    -- Every prefix step (1..4) and return/termination step (6..7) of the
+    -- multi-step `wideSlicePipeline` succeeds cleanly in vendored Miri
+    -- (step 5 and `_0 = 12` are pinned by `miri_matches`).
+    let (pipeAllTy, pipeAllPf) ← MetaM.run' do
+      let okBool (b : Name) : MetaM Expr :=
+        mkAppOptM ``Except.ok
+          #[some stepErr, some (mkConst ``Bool), some (mkConst b)]
+      let stepRes (stName : Name) (resB : Name) : MetaM (Expr × Expr) := do
+        let stp ← mkAppM (mi ++ `Step.step)
+          #[mkConst (lw ++ `wideSlicePipelineHooks), mkConst ``Unit.unit,
+            mkConst (lw ++ stName)]
+        let lhs ← mkAppM ``Prod.snd #[stp]
+        let rhs ← okBool resB
+        return (← mkEq lhs rhs, ← mkEqRefl rhs)
+      let items ←
+        [stepRes `wideSlicePipelineInitMiri ``Bool.true,
+         stepRes `wideSlicePipelineMiri1 ``Bool.true,
+         stepRes `wideSlicePipelineMiri2 ``Bool.true,
+         stepRes `wideSlicePipelineMiri3 ``Bool.true,
+         stepRes `wideSlicePipelineMiri5 ``Bool.true].mapM id
+      let last ← stepRes `wideSlicePipelineMiri6 ``Bool.false
+      return items.foldr
+        (fun (t, p) (tr, pr) =>
+          (mkApp2 (mkConst ``And) t tr, mkApp4 (mkConst ``And.intro) t tr p pr))
+        last
+    let wsPipeAllName := ns ++ `CrossRoot.WideSlice.pipeline_steps_ok
+    addThm wsPipeAllName pipeAllTy pipeAllPf
     added := added ++ #[ns ++ `CrossRoot.WideSlice.miri_matches,
-      ns ++ `CrossRoot.WideSlice.miri_check, wsDenoteName, wsDenoteSpecName]
+      ns ++ `CrossRoot.WideSlice.miri_check, wsDenoteName, wsDenoteSpecName,
+      wsPipeAllName]
     -- 3. FloatCast Miri authority over `Miri.Interpreter.Cast.cast`
     let immTy ← MetaM.run' <| mkAppM (mi ++ `Immediate) #[prov]
     let castS ← MetaM.run' <| mkAppM ``Option #[immTy]
@@ -12488,33 +12553,45 @@ run_cmd do
         (`bitsU64ToI64, 23, 13), (`f64ToU64, 32, 23), (`u64ToF64, 23, 32),
         (`f16ToF32, 30, 31), (`f128ToF32, 33, 31)]
     let tyIdLock (prog : Name) (src dst : Nat)
-        (widthOverride? : Option Nat := none) : MetaM (Expr × Expr) := do
-      let shape := mkApp (mkConst (ns ++ `FloatCast.castShape))
-        (mkConst (ns ++ `FloatCast.Prog ++ prog))
+        (srcWidthOverride? : Option Nat := none)
+        (dstWidthOverride? : Option Nat := none) : MetaM (Expr × Expr) := do
+      let progC := mkConst (ns ++ `FloatCast.Prog ++ prog)
+      let shape := mkApp (mkConst (ns ++ `FloatCast.castShape)) progC
       let srcTy ← mkAppM ``Prod.fst #[shape]
       let rest ← mkAppM ``Prod.snd #[shape]
       let srcBytes ← mkAppM ``Prod.fst #[rest]
       let dstTy ← mkAppM ``Prod.fst #[← mkAppM ``Prod.snd #[rest]]
+      let dstBytes := mkApp (mkConst (ns ++ `FloatCast.dstBytes)) progC
       let enc (t : Expr) : Expr := mkApp (mkConst (lm ++ `encodeTyId)) t
       let empLay :=
         mkConst ``Trusted.Rustc.V2026_06_01.MirSemantics.emptyLayoutTable
-      let lay :=
-        mkApp2 (mkConst (lm ++ `layoutOfEncodedTyId)) (mkNatLit src) empLay
-      let layBytes ← mkAppM ``UInt64.toNat
-        #[← mkAppM `Miri.ABI.Size.bytes
-          #[← mkAppM `Miri.ABI.LayoutData.size
-            #[← mkAppM `Miri.ABI.TyAndLayout.layout #[lay]]]]
-      let targetBytes := match widthOverride? with
+      let laySize (id : Nat) : MetaM Expr := do
+        let lay :=
+          mkApp2 (mkConst (lm ++ `layoutOfEncodedTyId)) (mkNatLit id) empLay
+        mkAppM ``UInt64.toNat
+          #[← mkAppM `Miri.ABI.Size.bytes
+            #[← mkAppM `Miri.ABI.LayoutData.size
+              #[← mkAppM `Miri.ABI.TyAndLayout.layout #[lay]]]]
+      let srcLayBytes ← laySize src
+      let dstLayBytes ← laySize dst
+      let targetSrc := match srcWidthOverride? with
         | some w => mkNatLit w
         | none => srcBytes
+      let targetDst := match dstWidthOverride? with
+        | some w => mkNatLit w
+        | none => dstBytes
       let e1 ← mkEq (enc srcTy) (mkNatLit src)
       let e2 ← mkEq (enc dstTy) (mkNatLit dst)
-      let e3 ← mkEq layBytes targetBytes
-      let e23 := mkApp2 (mkConst ``And) e2 e3
-      let pf23 := mkApp4 (mkConst ``And.intro) e2 e3
-        (← mkEqRefl (enc dstTy)) (← mkEqRefl layBytes)
-      return (mkApp2 (mkConst ``And) e1 e23,
-        mkApp4 (mkConst ``And.intro) e1 e23 (← mkEqRefl (enc srcTy)) pf23)
+      let e3 ← mkEq srcLayBytes targetSrc
+      let e4 ← mkEq dstLayBytes targetDst
+      let e34 := mkApp2 (mkConst ``And) e3 e4
+      let pf34 := mkApp4 (mkConst ``And.intro) e3 e4
+        (← mkEqRefl srcLayBytes) (← mkEqRefl dstLayBytes)
+      let e234 := mkApp2 (mkConst ``And) e2 e34
+      let pf234 := mkApp4 (mkConst ``And.intro) e2 e34
+        (← mkEqRefl (enc dstTy)) pf34
+      return (mkApp2 (mkConst ``And) e1 e234,
+        mkApp4 (mkConst ``And.intro) e1 e234 (← mkEqRefl (enc srcTy)) pf234)
     for (prog, src, dst) in castIds do
       let (ty, pf) ← MetaM.run' <| tyIdLock prog src dst
       let name := ns ++ `CrossRoot.FloatCast.tyIdLock ++ prog
@@ -12634,6 +12711,8 @@ run_cmd do
     let (forgedTyIdTy, forgedTyIdPf) ← MetaM.run' <| tyIdLock `f32ToF64 32 31
     let (forgedWidthTy, forgedWidthPf) ← MetaM.run' <|
       tyIdLock `f32ToF64 31 32 (some 8)
+    let (forgedDstWidthTy, forgedDstWidthPf) ← MetaM.run' <|
+      tyIdLock `f32ToF64 31 32 none (some 4)
     let (forgedF16Ty, forgedF16Pf) ← MetaM.run' do
       let bad := mkApp fcRet32 (mkNatLit 0x3f800000)
       let f16Call := mkAppN fcRunCastC
@@ -12748,6 +12827,11 @@ run_cmd do
             levelParams := []
             type := forgedWidthTy
             value := forgedWidthPf }),
+       ("wrong destination byte-width type-identifier lock", .thmDecl
+          { name := ns ++ `CrossRoot.forged.wrongDstTyWidth
+            levelParams := []
+            type := forgedDstWidthTy
+            value := forgedDstWidthPf }),
        ("colliding FloatCast denote table", .thmDecl
           { name := ns ++ `CrossRoot.forged.collidingFcDenote
             levelParams := []
@@ -12789,6 +12873,14 @@ run_cmd do
       throwError "cross-root self-test: `sorryAx` was not detected"
     unless !(← collectAxioms ``Lean.ofReduceBool).all isStdAx do
       throwError "cross-root self-test: `Lean.ofReduceBool` was not detected"
+    let crTrivialProp :=
+      Anneal.DualCorrespondenceAndTbPruningTests.Audit.trivialProp
+    let crRefl := mkApp3 (mkConst ``Eq [1]) natTy (mkNatLit 1) (mkNatLit 1)
+    let crLetRefl := Expr.letE `x natTy (mkNatLit 1)
+      (mkApp3 (mkConst ``Eq [1]) natTy (.bvar 0) (.bvar 0)) false
+    unless crTrivialProp crRefl && crTrivialProp crLetRefl &&
+        !crTrivialProp f16Ty do
+      throwError "cross-root self-test: trivial theorem detector failed"
     -- The authorities, `runCast`, `engine`, and every one of the 12
     -- cross-root bundles genuinely reach BOTH MiniRust and vendored Miri.
     let mut reachChecks : List (Name × List Name) :=
@@ -12843,7 +12935,7 @@ run_cmd do
       maxHeartbeats := 0 }
   let ((replayed, added, bundles, rejected, crAxioms), _) ←
     liftCoreM <| (act.toIO ctx { env := baseEnv })
-  unless replayed ≥ 850 && added ≥ 105 && bundles = 12 && rejected = 18 do
+  unless replayed ≥ 850 && added ≥ 106 && bundles = 12 && rejected = 19 do
     throwError "cross-root: unexpected counts \
       (replayed={replayed}, added={added}, bundles={bundles}, \
       rejected={rejected})"
@@ -12856,11 +12948,11 @@ run_cmd do
 Fail-closed audit of both modules under test and of every declaration of
 this file (public, private, and compiler-generated): only kernel-checked safe
 definitions, theorems, and inductive types (nothing opaque, postulated, or
-outside the safe fragment), no trivial `True` theorems, no stray declarations
-outside the test namespace, axiom closures within `[propext, Quot.sound]`,
-the declaration-count floors of both modules, and transitive reachability of
-every public theorem of both modules from the declarations of this file, with
-no exemption list. -/
+outside the safe fragment), no trivial theorems, no stray public or private
+declarations outside the test namespace, axiom closures within
+`[propext, Quot.sound]`, the declaration-count floors of both modules, and
+transitive reachability of every public theorem of both modules from the
+declarations of this file, with no exemption list. -/
 
 open Lean Elab Command in
 run_cmd do
@@ -12891,26 +12983,48 @@ run_cmd do
     | .recInfo v => v.isUnsafe
     | .thmInfo _ => false
     | .quotInfo _ => false
-  -- Trivial theorem detector: `True` for every theorem, and additionally
-  -- reflexive `=` / `↔` and conjunctions of trivialities, under any binders,
-  -- for every non-internal theorem (compiler-abstracted `_proof_*` field
-  -- obligations are legitimately reflexive).
+  -- User-visible name after stripping any `_private.<mod>.<idx>.` prefix, so
+  -- user-authored `private` declarations are not mistaken for compiler
+  -- internals (`_proof_*`, `match_*`).
+  let userName (n : Name) : Name :=
+    (Lean.privateToUserName? n).getD n
+  -- Trivial theorem detector: `True` for every theorem, and additionally all
+  -- `trivialProp` shapes for every user-authored (public or `private`) theorem;
+  -- compiler-abstracted `_proof_*` obligations remain legitimately reflexive.
   let isTrivialThm (ci : ConstantInfo) : Bool :=
     match ci with
     | .thmInfo v =>
-      v.type.isConstOf ``True || (!ci.name.isInternal && trivialProp v.type)
+      v.type.isConstOf ``True ||
+        (!(userName ci.name).isInternal && trivialProp v.type)
     | _ => false
-  -- Lazy equational lemma (`*.eq_*` / `*.eq_def`) that Lean synthesizes on
-  -- demand in `map₂` for a definition imported from another module.
+  -- Lazy equational lemma (`*.eq_*` / `*.eq_def`, or private
+  -- `<imported>.match_*.eq_*`) synthesized on demand in `map₂` for an imported
+  -- definition.
   let isLazyEq (n : Name) (ci : ConstantInfo) : Bool :=
-    let leaf := match n with | .str _ s => s | _ => ""
+    let u := userName n
+    let pre := u.getPrefix
+    let leaf := match u with | .str _ s => s | _ => ""
+    let preLeaf := match pre with | .str _ s => s | _ => ""
     let parentImportedDef :=
-      (env.getModuleIdxFor? n.getPrefix).isSome &&
-        (match env.find? n.getPrefix with
+      (env.getModuleIdxFor? pre).isSome &&
+        (match env.find? pre with
           | some (.defnInfo _) => true
           | _ => false)
+    (!Lean.isPrivateName n || preLeaf.startsWith "match_") &&
     (match ci with | .thmInfo _ => true | _ => false) &&
     (leaf.startsWith "eq_" || leaf == "eq_def") && parentImportedDef
+  -- Lazy matcher splitter (`_private.<mod>.0.<imported>.match_*.splitter`)
+  -- synthesized on demand as a safe definition in `map₂` for an imported
+  -- matcher.
+  let isLazySplitter (n : Name) (ci : ConstantInfo) : Bool :=
+    match Lean.privateToUserName? n with
+    | some (.str pre "splitter") =>
+      let preLeaf := match pre with | .str _ s => s | _ => ""
+      preLeaf.startsWith "match_" &&
+      (env.getModuleIdxFor? pre).isSome &&
+      (match env.find? pre with | some (.defnInfo _) => true | _ => false) &&
+      (match ci with | .defnInfo _ => true | _ => false)
+    | _ => false
   -- Private declaration belonging to `ns`.
   let isPrivateIn (ns : Name) (n : Name) : Bool :=
     match Lean.privateToUserName? n with
@@ -12940,13 +13054,16 @@ run_cmd do
       if isTrivialThm ci then
         throwError "audit: test theorem {n} is trivial"
       roots := roots.push n
-    else if !n.isInternal then
-      -- Lean lazily synthesizes equational lemmas (`*.eq_*` / `*.eq_def`)
-      -- for imported definitions on demand in `map₂`; reject anything else.
-      unless isLazyEq n ci do
-        throwError "audit: stray top-level declaration {n} outside {testNs}"
+    else if !(userName n).isInternal then
+      -- Lean lazily synthesizes equational lemmas (`*.eq_*` / `*.eq_def`) and
+      -- matcher splitters (`_private...<imported>.match_*.splitter`) on demand
+      -- in `map₂`; reject any other public or `private` decl outside `testNs`.
+      unless isLazyEq n ci || isLazySplitter n ci do
+        throwError "audit: stray declaration {n} outside {testNs}"
       if rejected ci then
-        throwError "audit: lazy equational lemma {n} is not safe"
+        throwError "audit: lazy auxiliary lemma {n} is not safe"
+      if isTrivialThm ci then
+        throwError "audit: trivial lazy auxiliary theorem {n}"
       auxDecls := auxDecls.push n
     else
       if rejected ci then
@@ -13011,42 +13128,93 @@ run_cmd do
     unless isTrivialThm refl && !isTrivialThm comm do
       throwError "audit self-test: reflexive theorem classifier failed"
   | _, _ => throwError "audit self-test: `Iff.rfl` is missing"
-  -- Reflexive, conjunctive, and binder-wrapped trivialities are flagged,
-  -- and genuine statements are not.
+  -- Reflexive, heterogeneous, `let`/binder-wrapped, conjunctive, disjunctive,
+  -- `¬ False`, `False → P`, and `P → P` trivialities are flagged, and genuine
+  -- statements are not.
   let natTy := mkConst ``Nat
   let eqN (a b : Nat) : Expr :=
     mkApp3 (mkConst ``Eq [1]) natTy (mkNatLit a) (mkNatLit b)
+  let heqN (a b : Nat) : Expr :=
+    mkApp4 (mkConst ``HEq [1]) natTy (mkNatLit a) natTy (mkNatLit b)
   let trivialShapes : List Expr :=
-    [eqN 1 1, mkApp2 (mkConst ``Iff) (mkConst ``False) (mkConst ``False),
+    [eqN 1 1, heqN 1 1,
+      mkApp2 (mkConst ``Iff) (mkConst ``False) (mkConst ``False),
       mkApp2 (mkConst ``And) (mkConst ``True) (eqN 2 2),
+      mkApp2 (mkConst ``Or) (mkConst ``True) (eqN 1 2),
+      mkApp2 (mkConst ``Or) (eqN 1 2) (eqN 3 3),
+      mkApp (mkConst ``Not) (mkConst ``False),
+      .forallE `_ (mkConst ``False) (eqN 1 2) .default,
+      .forallE `_ (eqN 1 2) (eqN 1 2) .default,
+      .letE `x natTy (mkNatLit 1)
+        (mkApp3 (mkConst ``Eq [1]) natTy (.bvar 0) (.bvar 0)) false,
       .forallE `n natTy (mkApp3 (mkConst ``Eq [1]) natTy (.bvar 0) (.bvar 0))
         .default]
   for e in trivialShapes do
     unless trivialProp e do
       throwError "audit self-test: trivial proposition {e} was not detected"
-  for e in [eqN 1 2, mkApp2 (mkConst ``And) (mkConst ``True) (eqN 1 2),
+  for e in [eqN 1 2, heqN 1 2,
+      mkApp2 (mkConst ``And) (mkConst ``True) (eqN 1 2),
+      mkApp2 (mkConst ``Or) (eqN 1 2) (eqN 2 3),
+      mkApp (mkConst ``Not) (mkConst ``True),
+      .forallE `_ (mkConst ``True) (eqN 1 2) .default,
+      .letE `x natTy (mkNatLit 1)
+        (mkApp3 (mkConst ``Eq [1]) natTy (.bvar 0) (mkNatLit 2)) false,
       mkConst ``False] do
     if trivialProp e then
       throwError "audit self-test: genuine proposition {e} was flagged"
-  -- A theorem named like an equational lemma whose parent is not an
-  -- imported definition is a stray declaration, not a lazy lemma.
+  -- User-authored `private` reflexive theorems are flagged, while compiler
+  -- `_proof_*` field obligations are flagged only when their type is `True`.
+  let privReflCi : ConstantInfo := .thmInfo
+    { name := Lean.mkPrivateName env (testNs ++ `bogusRefl)
+      levelParams := []
+      type := eqN 1 1
+      value := mkApp2 (mkConst ``Eq.refl [1]) natTy (mkNatLit 1) }
+  let compProofReflCi : ConstantInfo := .thmInfo
+    { name := Lean.mkPrivateName env (testNs ++ `foo ++ `_proof_1)
+      levelParams := []
+      type := eqN 1 1
+      value := mkApp2 (mkConst ``Eq.refl [1]) natTy (mkNatLit 1) }
+  let compProofTrueCi : ConstantInfo := .thmInfo
+    { name := Lean.mkPrivateName env (testNs ++ `foo ++ `_proof_1)
+      levelParams := []
+      type := mkConst ``True
+      value := mkConst ``True.intro }
+  unless isTrivialThm privReflCi && !isTrivialThm compProofReflCi &&
+      isTrivialThm compProofTrueCi do
+    throwError "audit self-test: private/internal triviality classifier failed"
+  -- A theorem or definition shaped like a lazy equational lemma or splitter
+  -- whose parent is not an imported definition (or imported matcher when
+  -- `private`) is stray, not a lazy auxiliary.
   match env.find? ``Nat.add_comm, env.find? ``Nat.add with
-  | some thm, some _ =>
-    unless isLazyEq (``Nat.add ++ `eq_1) thm do
+  | some thm, some defn =>
+    let matchPre :=
+      `Anneal.TreeBorrowsPruningAndFrameWp.BorrowSubtree.root.match_1
+    unless isLazyEq (``Nat.add ++ `eq_1) thm &&
+        isLazyEq (Lean.mkPrivateName env (matchPre ++ `eq_1)) thm do
       throwError "audit self-test: a lazy equational lemma was rejected"
     if isLazyEq (`Other ++ `eq_1) thm ||
-        isLazyEq (``Nat.add_comm ++ `eq_1) thm then
-      throwError "audit self-test: a stray `eq_` theorem was accepted"
+        isLazyEq (``Nat.add_comm ++ `eq_1) thm ||
+        isLazyEq (Lean.mkPrivateName env (``Nat.add ++ `eq_1)) thm ||
+        isLazySplitter (Lean.mkPrivateName env (`Other ++ `splitter)) defn ||
+        isLazySplitter (Lean.mkPrivateName env (``Nat.add ++ `splitter)) defn
+        then
+      throwError "audit self-test: a stray lazy-shaped decl was accepted"
+    let okSplit := Lean.mkPrivateName env (matchPre ++ `splitter)
+    unless isLazySplitter okSplit defn do
+      throwError "audit self-test: a lazy matcher splitter was rejected"
   | _, _ => throwError "audit self-test: `Nat.add_comm` is missing"
   match env.find? ``Nat.add with
   | some ci =>
-    unless !testNs.isPrefixOf ``Nat.add && !isLazyEq ``Nat.add ci do
+    unless !testNs.isPrefixOf ``Nat.add && !isLazyEq ``Nat.add ci &&
+        !isLazySplitter ``Nat.add ci do
       throwError "audit self-test: stray declaration was not detected"
+    let privOk := Lean.mkPrivateName env (testNs ++ `dummy)
+    let privBad := Lean.mkPrivateName env (`Other ++ `dummy)
+    unless isPrivateIn testNs privOk && !isPrivateIn testNs privBad &&
+        !(userName privBad).isInternal && !isLazyEq privBad ci &&
+        !isLazySplitter privBad ci do
+      throwError "audit self-test: stray private declaration was not detected"
   | none => throwError "audit self-test: `Nat.add` is missing"
-  let privOk := Lean.mkPrivateName env (testNs ++ `dummy)
-  let privBad := Lean.mkPrivateName env (`Other ++ `dummy)
-  unless isPrivateIn testNs privOk && !isPrivateIn testNs privBad do
-    throwError "audit self-test: private namespace classifier failed"
   unless (closure #[]).isEmpty do
     throwError "audit self-test: the empty closure is not empty"
   let bundleOnly := closure <| roots.filter fun n =>
