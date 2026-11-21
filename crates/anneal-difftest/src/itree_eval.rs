@@ -3154,24 +3154,28 @@ fn itree_confirm_replacements<'p, C, X>(
     out
 }
 
-/// Maximum consecutive Stage 2 replacement rounds that confirm zero new traces
-/// before stopping retries (when at least one trace has been confirmed across
-/// the stage so far; when the entire stage has confirmed zero traces, stops
-/// after `1` empty replacement round).
-const ITREE_MAX_CONSECUTIVE_EMPTY_REPLACEMENT_ROUNDS: usize = 2;
+/// Maximum number of replacement traces a candidate gets in Stage 2 after its
+/// selected `ok` trace hit a resource limit: up to its 4th distinct trace in
+/// all. The budget belongs to the candidate, so whether one candidate recovers
+/// never depends on what unrelated candidates do in the same rounds, and a
+/// permanently heavy MIR body costs at most this many extra confirmations.
+const ITREE_MAX_REPLACEMENT_TRACES_PER_CANDIDATE: usize = 3;
 
 /// Runs Stage 2 adaptive kernel confirmation over `confirm_cases` and then
 /// replaces candidates whose selected `ok` trace(s) all hit resource limits
 /// (`inconclusive_cases`) with their next unselected `ok` trace from `pool`.
 ///
-/// Stops replacement rounds early on:
-/// - [`ItreeLeanFailureKind::MissingToolchain`] (retrying other traces cannot
-///   fix a missing toolchain), or
-/// - consecutive empty replacement rounds with zero new confirmations (`1`
-///   when `results` is still empty across the whole stage; otherwise
-///   [`ITREE_MAX_CONSECUTIVE_EMPTY_REPLACEMENT_ROUNDS`], resetting on any
-///   round that confirms at least one trace), so systematic OOMs and
-///   permanently-heavy MIR bodies do not burn all remaining trials.
+/// Replacement stops
+/// - for a candidate, after [`ITREE_MAX_REPLACEMENT_TRACES_PER_CANDIDATE`]
+///   replacement traces (each candidate's budget is its own);
+/// - for the whole stage, on [`ItreeLeanFailureKind::MissingToolchain`]
+///   (retrying other traces cannot fix a missing toolchain), and after one
+///   replacement round that confirms nothing while the stage as a whole has
+///   confirmed nothing (a systematic failure).
+///
+/// A candidate that runs out of replacements keeps its unconfirmed traces, so
+/// it is reported `lean_confirm_failed` (or partially compared on traces that
+/// did confirm), never as agreeing without a kernel confirmation.
 #[allow(clippy::too_many_arguments)]
 fn run_itree_confirm_with_replacements<C, X, K, O, F>(
     confirm_cases: &mut Vec<C>,
@@ -3209,19 +3213,28 @@ where
     }
 
     let mut rep_round = 0usize;
-    let mut consecutive_empty_rounds = 0usize;
+    let mut replacements_by_fn: BTreeMap<String, usize> = BTreeMap::new();
+    let mut out_of_replacements: BTreeSet<String> = BTreeSet::new();
     while confirm_cases.len() < pool.len() && !confirm_stage.failed_fns.is_empty() {
-        let replacement_cases: Vec<C> = itree_confirm_replacements(
+        let mut replacement_cases: Vec<C> = Vec::new();
+        for case in itree_confirm_replacements(
             &confirm_stage,
             confirm_cases,
             pool,
             &case_key,
             case_to_fn,
             &is_ok,
-        )
-        .into_iter()
-        .cloned()
-        .collect();
+        ) {
+            let key = case_key(case);
+            let fn_name = case_to_fn.get(key).map_or(key, String::as_str);
+            let used = replacements_by_fn.entry(fn_name.to_string()).or_insert(0);
+            if *used >= ITREE_MAX_REPLACEMENT_TRACES_PER_CANDIDATE {
+                out_of_replacements.insert(fn_name.to_string());
+                continue;
+            }
+            *used += 1;
+            replacement_cases.push(case.clone());
+        }
         if replacement_cases.is_empty() {
             break;
         }
@@ -3256,25 +3269,30 @@ where
         if rep_missing_toolchain {
             break;
         }
-        if rep_confirmed > 0 {
-            consecutive_empty_rounds = 0;
-        } else {
-            consecutive_empty_rounds += 1;
-            let empty_limit = if confirm_stage.results.is_empty() {
-                1
-            } else {
-                ITREE_MAX_CONSECUTIVE_EMPTY_REPLACEMENT_ROUNDS
-            };
-            if consecutive_empty_rounds >= empty_limit {
-                confirm_stage.errors.push(format!(
-                    "ItreeDiffBatchConfirm: stopped Stage 2 replacement rounds after \
-                     {consecutive_empty_rounds} consecutive empty round(s) with {} confirmed \
-                     trace(s) overall",
-                    confirm_stage.results.len()
-                ));
-                break;
-            }
+        if rep_confirmed == 0 && confirm_stage.results.is_empty() {
+            confirm_stage.errors.push(
+                "ItreeDiffBatchConfirm: stopped Stage 2 replacement rounds after 1 empty \
+                 round with 0 confirmed trace(s) overall (systematic failure)"
+                    .to_string(),
+            );
+            break;
         }
+    }
+    // Only candidates that are still unconfirmed ran out (a candidate whose
+    // budget was spent in a round that confirmed it is not reported).
+    out_of_replacements.retain(|fn_name| confirm_stage.failed_fns.contains(fn_name));
+    if !out_of_replacements.is_empty() {
+        confirm_stage.errors.push(format!(
+            "ItreeDiffBatchConfirm: {} candidate(s) still unconfirmed after \
+             {ITREE_MAX_REPLACEMENT_TRACES_PER_CANDIDATE} inconclusive replacement trace(s) \
+             each: {}",
+            out_of_replacements.len(),
+            out_of_replacements
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     confirm_stage
 }
@@ -11082,7 +11100,7 @@ mod tests {
     ) -> Result<BTreeMap<String, usize>, String> {
         let has = |kind: MockCase| slice.iter().any(|c| kinds[c] == kind);
         if (slice.len() > 1 && slice.len() > max_ok) || has(MockCase::Heavy) {
-            Err(if label.len() % 2 == 0 {
+            Err(if label.len().is_multiple_of(2) {
                 mock_rss_exceeded(label)
             } else {
                 mock_lean_memory_exhausted(label)
@@ -11501,7 +11519,7 @@ mod tests {
     /// Stage 2 replacement rounds stop immediately on a missing toolchain
     /// (zero replacement rounds), bound systematic zero-confirmation OOMs to
     /// one replacement round, and stop permanently heavy MIR candidates after
-    /// [`ITREE_MAX_CONSECUTIVE_EMPTY_REPLACEMENT_ROUNDS`] empty rounds while
+    /// [`ITREE_MAX_REPLACEMENT_TRACES_PER_CANDIDATE`] replacement traces while
     /// still recovering candidates whose lighter backup trace succeeds and
     /// never replacing or partially comparing an unconfirmed divergence.
     #[test]
@@ -11539,7 +11557,11 @@ mod tests {
         );
         let runs = runs.into_inner().unwrap();
         assert!(stage.results.is_empty());
-        assert_eq!(runs.len(), 1, "missing toolchain must run zero replacements: {runs:?}");
+        assert_eq!(
+            runs.len(),
+            1,
+            "missing toolchain must run zero replacements: {runs:?}"
+        );
         assert_eq!(selected.len(), 16);
 
         // 2. Systematic OOM (0 confirmed overall) runs at most 1 replacement round
@@ -11589,8 +11611,8 @@ mod tests {
         //    - f12..f14 are permanently heavy MIR bodies (every trace exceeds RSS);
         //    - f15 has an unconfirmed divergence on t0 (must NEVER be replaced or
         //      partially compared!).
-        //    After f11 recovers on t3, t4 and t5 are 2 consecutive empty rounds and
-        //    stop before t6..t11.
+        //    f12..f14 run out of replacements after t1, t2, t3, so no fourth
+        //    replacement round runs.
         let div_case = "case_f15_t0";
         let mut selected = initial_t0(None);
         let runs = MockLeanRuns::default();
@@ -11626,21 +11648,38 @@ mod tests {
         assert!(stage.results.contains_key("case_f10_t1"));
         assert!(stage.results.contains_key("case_f11_t3"));
         assert!(
-            !selected.iter().any(|c| c.starts_with("case_f15_t") && c != div_case),
+            !selected
+                .iter()
+                .any(|c| c.starts_with("case_f15_t") && c != div_case),
             "unconfirmed divergence f15 must never receive replacement ok traces: {selected:?}"
         );
         assert!(
             runs.iter()
-                .all(|(l, _)| !l.starts_with("ItreeDiffBatchConfirmReplacement6")),
-            "must stop after 2 consecutive empty rounds (t4, t5) instead of burning t6..t11"
+                .all(|(l, _)| !l.starts_with("ItreeDiffBatchConfirmReplacement4")),
+            "permanently heavy candidates must stop after 3 replacement traces: {runs:?}"
         );
-        let partial = itree_partially_comparable_fns(
-            &stage,
-            &selected,
-            ident,
-            &case_to_fn,
-            |c| c != div_case,
+        for heavy_fn in ["f12", "f13", "f14"] {
+            assert_eq!(
+                selected
+                    .iter()
+                    .filter(|c| c.starts_with(&format!("case_{heavy_fn}_t")))
+                    .count(),
+                1 + ITREE_MAX_REPLACEMENT_TRACES_PER_CANDIDATE,
+                "{heavy_fn}: {selected:?}"
+            );
+        }
+        assert!(
+            stage
+                .errors
+                .iter()
+                .any(|e| e.contains("3 candidate(s) still unconfirmed after 3")
+                    && e.contains("f12, f13, f14")),
+            "{:?}",
+            stage.errors
         );
+        let partial = itree_partially_comparable_fns(&stage, &selected, ident, &case_to_fn, |c| {
+            c != div_case
+        });
         assert_eq!(
             partial,
             BTreeMap::from([("f10".to_string(), 1), ("f11".to_string(), 3)]),
@@ -11648,5 +11687,120 @@ mod tests {
         );
         let labels: Vec<String> = runs.into_iter().map(|(l, _)| l).collect();
         assert_labels_unique_file_stems(&labels);
+    }
+
+    /// A candidate's replacement budget is its own. Under a stage-wide counter
+    /// of consecutive empty rounds, a candidate whose 4th trace is the first to
+    /// fit was lost when it was the only one left needing replacements (two
+    /// empty rounds stopped the stage) but recovered when an unrelated candidate
+    /// happened to confirm in between; and a permanently heavy candidate kept
+    /// receiving replacement traces for as long as other candidates kept
+    /// confirming (6 instead of 3 here).
+    #[test]
+    fn stage2_replacement_budget_is_per_candidate_and_independent_of_other_candidates() {
+        let spec: Vec<(String, usize)> = (0..16).map(|i| (format!("f{i:02}"), 12)).collect();
+        let spec_refs: Vec<(&str, usize)> = spec.iter().map(|(f, n)| (f.as_str(), *n)).collect();
+        let (pool, case_to_fn) = stage_fixture(&spec_refs);
+        let run = |heavy: &(dyn Fn(&str) -> bool + Sync)| {
+            let mut selected: Vec<String> = pool
+                .iter()
+                .filter(|c| c.ends_with("_t0"))
+                .cloned()
+                .collect();
+            let runs = MockLeanRuns::default();
+            let stage = run_itree_confirm_with_replacements(
+                &mut selected,
+                &pool,
+                16,
+                1,
+                ident,
+                &case_to_fn,
+                |_| true,
+                |label: &str, slice: &[String]| {
+                    runs.lock()
+                        .unwrap()
+                        .push((label.to_string(), slice.to_vec()));
+                    if slice.iter().any(|c| heavy(c)) {
+                        Err(mock_rss_exceeded(label))
+                    } else {
+                        ok_all(slice)
+                    }
+                },
+            );
+            let labels: Vec<String> = runs
+                .into_inner()
+                .unwrap()
+                .into_iter()
+                .map(|(l, _)| l)
+                .collect();
+            assert_labels_unique_file_stems(&labels);
+            (stage, selected)
+        };
+        let traces_of = |selected: &[String], fn_name: &str| -> Vec<String> {
+            selected
+                .iter()
+                .filter(|c| c.starts_with(&format!("case_{fn_name}_t")))
+                .cloned()
+                .collect()
+        };
+
+        // 1. Alone: `f15` fits only on its 4th trace, and nothing else needs a
+        //    replacement. It is confirmed on `t3`.
+        let (stage, selected) =
+            run(&|c| matches!(c, "case_f15_t0" | "case_f15_t1" | "case_f15_t2"));
+        assert_eq!(stage.results.len(), 16, "{:?}", stage.errors);
+        assert!(stage.results.contains_key("case_f15_t3"));
+        // Its three inconclusive traces leave it partially compared on `t3`.
+        assert_eq!(
+            itree_partially_comparable_fns(&stage, &selected, ident, &case_to_fn, |_| true),
+            BTreeMap::from([("f15".to_string(), 3)])
+        );
+        assert_eq!(
+            traces_of(&selected, "f15"),
+            ["case_f15_t0", "case_f15_t1", "case_f15_t2", "case_f15_t3"]
+        );
+
+        // 2. Others recover in every round (`f10` on t1, `f11` on t2, `f12` on
+        //    t3) while `f13` is heavy on every trace: `f13` gets exactly 3
+        //    replacement traces, and everything else is confirmed.
+        let (stage, selected) = run(&|c| {
+            matches!(
+                c,
+                "case_f10_t0"
+                    | "case_f11_t0"
+                    | "case_f11_t1"
+                    | "case_f12_t0"
+                    | "case_f12_t1"
+                    | "case_f12_t2"
+            ) || c.starts_with("case_f13_")
+        });
+        assert_eq!(stage.results.len(), 15);
+        for recovered in ["case_f10_t1", "case_f11_t2", "case_f12_t3"] {
+            assert!(stage.results.contains_key(recovered), "{recovered}");
+        }
+        assert!(!stage.results.keys().any(|k| k.starts_with("case_f13_")));
+        assert_eq!(
+            traces_of(&selected, "f13"),
+            ["case_f13_t0", "case_f13_t1", "case_f13_t2", "case_f13_t3"]
+        );
+        assert!(
+            stage
+                .errors
+                .iter()
+                .any(|e| e.contains("1 candidate(s) still unconfirmed after 3")
+                    && e.ends_with("f13")),
+            "{:?}",
+            stage.errors
+        );
+        // `f13` has no confirmed trace, so it is dropped whole, never reported
+        // as agreeing; the others stay comparable on the trace that confirmed.
+        assert_eq!(
+            itree_partially_comparable_fns(&stage, &selected, ident, &case_to_fn, |_| true),
+            BTreeMap::from([
+                ("f10".to_string(), 1),
+                ("f11".to_string(), 2),
+                ("f12".to_string(), 3)
+            ])
+        );
     }
 }
