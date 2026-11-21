@@ -75,8 +75,9 @@ set_option autoImplicit false
 2. every listed declaration's kernel type references zero `private` helper declarations;
 3. every listed declaration is re-exported under `LeanMiriSpec.MemoryLemmas.<shortName>` pointing
    to the exact same declaration, with zero extra `export` aliases in `LeanMiriSpec.MemoryLemmas`;
-4. every listed declaration appears in the kernel proof/type terms of the `private theorem`
-   non-vacuity witnesses in `LeanMiriSpec.MemoryLemmas.NonVacuity`; and
+4. every listed declaration carries a non-empty docstring and appears in the kernel proof/type
+   terms of the `private theorem` non-vacuity witnesses in `LeanMiriSpec.MemoryLemmas.NonVacuity`;
+   and
 5. no extra public declaration exists in `env.constants.map₂` outside the listed 50 (even if
    `_`-prefixed, rejecting user declarations via `Lean.findDeclarationRanges?` and bounding
    range-less compiler/elaborator auxiliaries strictly to children of the 50 theorems, this
@@ -114,6 +115,12 @@ local elab "#assert_standard_axioms " ids:ident* : command => do
         throwError "re-export LeanMiriSpec.MemoryLemmas.{shortName} resolves to {aliasTarget}, expected {n}"
     unless witnessUsed.contains n do
       throwError "{n} is not exercised by any Part 5 NonVacuity witness"
+    match ← Lean.findDocString? env n with
+    | some doc =>
+      if doc.trimAscii.isEmpty then
+        throwError "{n} has an empty docstring"
+    | none =>
+      throwError "{n} is missing a docstring"
     Lean.logInfo m!"{n} depends on axioms: {axs.toList}"
   unless listed.size == 50 do
     throwError "expected exactly 50 audited public theorems, got {listed.size}"
@@ -2621,7 +2628,8 @@ theorem fromBytes_exists (bytes : Array UInt8) (align : Align) (alignmentBytes :
 
 /-- A successful `tryNew` with zeroed host storage produces a mutable allocation of `size` zero
 bytes with unit extra, no native buffer, empty provenance, and a well-formed mask that is
-`InitMask.new size false` for `.Uninit` and `InitMask.new size true` for `.Zero`. -/
+`InitMask.new size false` for `.Uninit` and `InitMask.new size true` for `.Zero`, whose in-bounds
+slices read back zero bytes. -/
 theorem tryNew_spec (size : Size) (align : Align) (init : AllocInit)
     (alloc : Allocation P Unit)
     (created : Allocation.tryNew size align init
@@ -3056,7 +3064,7 @@ theorem readScalar_uninit_err [DecidableEq P] [PointerProvenance P]
 
 /-- An integer `readScalar` (without provenance) of an initialized range of at most 16 bytes
 that is provenance-free (or whose provenance offsets are addresses) decodes the stored bytes in
-the target endianness. -/
+the target endianness via `(Scalar.fromUInt … range.size).mapError AllocError.scalar`. -/
 theorem readScalar_int_of_bytes [DecidableEq P] [PointerProvenance P]
     (allocation : Allocation P E) (layout : TargetDataLayout)
     (range : AllocRange) (bytes : Array UInt8)
@@ -3086,7 +3094,7 @@ theorem readScalar_int_of_bytes [DecidableEq P] [PointerProvenance P]
 
 /-- Integer round trip: if an initialized, provenance-free (or address-offset) range of at most
 16 bytes holds the target-endian encoding of `bits`, and `bits` fits in the range, an integer
-`readScalar` returns `Scalar.fromUInt bits range.size`. -/
+`readScalar` returns `(Scalar.fromUInt bits range.size).mapError AllocError.scalar`. -/
 theorem readScalar_int_roundtrip [DecidableEq P] [PointerProvenance P]
     (allocation : Allocation P E) (layout : TargetDataLayout)
     (range : AllocRange) (bits : U128)
@@ -3155,7 +3163,7 @@ theorem readScalar_ptr_roundtrip [DecidableEq P] [PointerProvenance P]
 
 /-- If an initialized pointer-sized range holds the target-endian encoding of `bits` and the
 provenance map reports no provenance at its start, a provenance-reading `readScalar` returns
-`Scalar.fromUInt bits range.size`. -/
+`(Scalar.fromUInt bits range.size).mapError AllocError.scalar`. -/
 theorem readScalar_ptr_none_roundtrip [DecidableEq P] [PointerProvenance P]
     (allocation : Allocation P E) (layout : TargetDataLayout)
     (range : AllocRange) (bits : U128)
@@ -3182,9 +3190,10 @@ theorem readScalar_ptr_none_roundtrip [DecidableEq P] [PointerProvenance P]
 
 /-- Specification of an in-bounds, nonzero-width (at most 16-byte) `writeScalar` on a mutable,
 storage-consistent allocation with a well-formed mask: it succeeds; preserves size, length,
-mutability, alignment, extra and native buffer; marks exactly the written range initialized;
-installs the specified provenance map; stores the target-endian encoding of the integer bits or
-pointer offset; and leaves the bytes of every disjoint range unchanged. -/
+mutability, alignment, extra and native buffer; updates the mask via `setRange range true`
+(marking the written range initialized while preserving other mask bits); installs the specified
+provenance map; stores the target-endian encoding of the integer bits or pointer offset; and
+leaves the bytes of every disjoint range unchanged. -/
 theorem writeScalar_spec (layout : TargetDataLayout)
     (allocation : Allocation P E) (range : AllocRange) (value : Scalar P)
     (converted : ScalarBitsOrPointer P) (cleared nextProvenance : ProvenanceMap P)
@@ -3360,9 +3369,10 @@ theorem writeBytes_zero_spec (start ptrSize : Size) (bytes : Array UInt8)
   rfl
 
 /-- Specification of a nonempty in-bounds `writeBytes` on a mutable, storage-consistent
-allocation with a well-formed mask: it succeeds; preserves metadata; marks exactly the written
-range initialized; installs the specified (cleared) provenance map; the written range reads back
-`bytes`; and every disjoint range is unchanged. -/
+allocation with a well-formed mask: it succeeds; preserves metadata; updates the mask via
+`setRange … true` (marking the written range initialized while preserving other mask bits);
+installs the specified (cleared) provenance map; the written range reads back `bytes`; and every
+disjoint range is unchanged. -/
 theorem writeBytes_spec (start ptrSize : Size) (bytes : Array UInt8)
     (allocation : Allocation P E) (nextProvenance : ProvenanceMap P)
     (h_nonempty : 0 < bytes.size)
