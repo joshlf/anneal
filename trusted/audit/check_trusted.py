@@ -1049,7 +1049,8 @@ class Checker:
             merged_graph = None
         sources = request.get("sources", [])
         require(isinstance(sources, list) and all(
-            isinstance(s, list) and len(s) == 2 and all(isinstance(x, str) and x for x in s) for s in sources),
+            isinstance(s, list) and len(s) == 2 and all(isinstance(x, str) and x for x in s) for s in sources)
+            and len({s[0] for s in sources}) == len(sources),
             phase, "malformed --audit-olean sources")
         for _, path in sources:
             regular(Path(path), phase)
@@ -5448,11 +5449,12 @@ def make_tree_writable(root: Path) -> None:
 
 def tcb_snapshot_files(root: Path) -> dict[str, Path]:
     """TCB files compared by `--base-snapshot`, keyed by checkout-relative POSIX path:
-    `trusted/audit/{check_trusted.py,TrustedBoundary.lean,OleanEnvAuditor.lean}`, every non-doc file or symlink
-    under `trusted/lean/`, and `trusted/rustc-capture/Cargo.toml`."""
+    `trusted/audit/{check_trusted.py,TrustedBoundary.lean,OleanEnvAuditor.lean}`,
+    `trusted/root-manifest.sha256`, every non-doc file or symlink under `trusted/lean/`, and
+    `trusted/rustc-capture/Cargo.toml`."""
     out: dict[str, Path] = {}
     for rel in ("trusted/audit/check_trusted.py", "trusted/audit/TrustedBoundary.lean", OLEAN_AUDITOR,
-                "trusted/lean/lean-toolchain", "trusted/rustc-capture/Cargo.toml"):
+                ROOT_MANIFEST, "trusted/lean/lean-toolchain", "trusted/rustc-capture/Cargo.toml"):
         path = root / rel
         if path.exists() or path.is_symlink():
             out[rel] = path
@@ -5634,6 +5636,7 @@ def _main() -> int:
         base_snapshot = Path(os.environ["ANNEAL_TRUSTED_BASE_SNAPSHOT"])
     if args.audit_vacuity:
         try:
+            verify_root_manifest(checkout)
             if base_snapshot is not None:
                 verify_base_snapshot(checkout, base_snapshot, tuple(args.expected_tcb_drift))
             summary = waiver_vacuity_gate(checkout)

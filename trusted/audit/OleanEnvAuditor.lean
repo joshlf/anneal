@@ -173,9 +173,13 @@ def parseRequest (j : Json) : IO Request := do
     if seenMods.contains m then fail s!"duplicate audited module {m}"
     seenMods := seenMods.insert m
   let toolchainRoots := toNames (← optField (α := Array String) j "toolchainRoots" #["Init", "Std"])
+  if toolchainRoots.isEmpty then fail "olean-audit request has no toolchainRoots"
+  let mut seenToolRoots : NameSet := {}
   for r in toolchainRoots do
     unless r == `Init || r == `Std || r == `Lean do
       fail s!"unsupported toolchain root {r}"
+    if seenToolRoots.contains r then fail s!"duplicate toolchain root {r}"
+    seenToolRoots := seenToolRoots.insert r
   for m in modules do
     if toolchainRoots.contains m.getRoot then
       fail s!"[moduleProvenanceSpoofed] toolchain-named module {m} listed in audited modules"
@@ -198,11 +202,21 @@ def parseRequest (j : Json) : IO Request := do
     unless validModuleName su do fail s!"invalid statementUnfold entry {su}"
   let rawSources ← optField (α := Array (String × String)) j "sources" #[]
   let mut sources := #[]
+  let mut seenSrcMods : NameSet := {}
   for (m, p) in rawSources do
     let mName := m.toName
     unless validModuleName mName do fail s!"invalid source module name {m}"
+    if seenSrcMods.contains mName then fail s!"duplicate source entry for module {m}"
+    seenSrcMods := seenSrcMods.insert mName
     sources := sources.push (mName, System.FilePath.mk p)
-  let graph := match j.getObjVal? "graph" with | .ok g => some g | .error _ => none
+  let graph ← match j.getObjVal? "graph" with
+    | .ok g =>
+      match g.getObj? with
+      | .ok _ => pure (some g)
+      | .error _ => fail "malformed olean-audit request field graph: expected JSON object"
+    | .error _ => pure none
+  let nativeHeartbeats ← optField (α := Nat) j "nativeHeartbeats" 200
+  if nativeHeartbeats == 0 then fail "malformed olean-audit request field nativeHeartbeats: must be positive"
   return {
     sysroot := ⟨← reqField (α := String) j "sysroot"⟩
     artifacts := arts
@@ -219,7 +233,7 @@ def parseRequest (j : Json) : IO Request := do
     allowProvisionalNative := ← optField (α := Bool) j "allowProvisionalNative" false
     toolchainRoots
     scope := ← optField (α := String) j "scope" "modules"
-    nativeHeartbeats := ← optField (α := Nat) j "nativeHeartbeats" 200
+    nativeHeartbeats
     maxReported := ← optField (α := Nat) j "maxReportedViolations" 12
   }
 
@@ -302,23 +316,31 @@ def checkModuleParts (m : Name) (base : System.FilePath) (oleanParts irParts : A
     if ← checkCanonicalPart m expected then checked := checked + 1
   return checked
 
+def entryExistsOnDisk (p : System.FilePath) : IO Bool := do
+  try
+    let _ ← p.symlinkMetadata
+    pure true
+  catch _ => pure false
+
 /-- Existing-part list for a toolchain module resolved through the pinned library directory. -/
 def sysrootParts (libDir : System.FilePath) (m : Name) : IO (Array System.FilePath × Array System.FilePath) := do
   let base := libDir / modRelPath m
   let mut olean := #[]
   for ext in #["olean", "olean.server", "olean.private"] do
     let p : System.FilePath := ⟨base.toString ++ "." ++ ext⟩
-    if ← p.pathExists then olean := olean.push p
+    if ← entryExistsOnDisk p then olean := olean.push p
   let mut ir := #[]
   for ext in #["ir.sig", "ir"] do
     let p : System.FilePath := ⟨base.toString ++ "." ++ ext⟩
-    if ← p.pathExists then ir := ir.push p
+    if ← entryExistsOnDisk p then ir := ir.push p
   return (olean, ir)
 
 /-- Artifact checks that need no loaded environment and therefore run before `importModules`
-reads a single byte: shape, canonical names, canonical paths, and companion parts that exist on
-disk but were omitted from the artifact list (selective omission hides private data or IR). -/
+reads a single byte: shape, canonical names, canonical paths, byte-for-byte pinned-sysroot
+identity for staged foundation modules, and companion parts that exist on disk but were omitted
+from the artifact list (selective omission hides private data or IR). -/
 def preloadArtifactChecks (req : Request) : AuditM Nat := do
+  let libDir := req.sysroot / "lib" / "lean"
   let mut checked := 0
   let mut seen : NameSet := {}
   for (m, olean, ir) in req.artifacts do
@@ -326,7 +348,8 @@ def preloadArtifactChecks (req : Request) : AuditM Nat := do
       report "moduleProvenanceSpoofed" m m "duplicate artifact entry"
       continue
     seen := seen.insert m
-    if isToolchainName req.toolchainRoots m && !req.foundation.contains m then
+    let isTool := isToolchainName req.toolchainRoots m
+    if isTool && !req.foundation.contains m then
       report "moduleProvenanceSpoofed" m m "toolchain-named module supplied as an untrusted artifact"
       continue
     let some first := olean[0]? | report "missingPrivateArtifact" m m "no .olean part"; continue
@@ -352,13 +375,33 @@ def preloadArtifactChecks (req : Request) : AuditM Nat := do
     unless shapeOk do
       report "moduleProvenanceSpoofed" m m "artifact parts are not the canonical companions of one base path"
       continue
+    let mut allCanon := true
     for p in olean ++ ir do
       if ← checkCanonicalPart m p then checked := checked + 1
+      else allCanon := false
     for ext in partNames do
       let p : System.FilePath := ⟨base ++ "." ++ ext⟩
       let listed := (olean ++ ir).contains p
-      if !listed && (← p.pathExists) then
+      if !listed && (← entryExistsOnDisk p) then
         report "missingPrivateArtifact" m m s!"companion part {p} exists but was omitted from the artifacts"
+    -- A staged foundation artifact must match the canonical pinned sysroot file byte-for-byte
+    -- across every companion part, so `foundation` cannot be used to spoof a toolchain module.
+    if isTool && allCanon then
+      let (sysOlean, sysIR) ← sysrootParts libDir m
+      if olean.size != sysOlean.size || ir.size != sysIR.size then
+        report "moduleProvenanceSpoofed" m m "foundation artifact part set differs from pinned sysroot"
+      else
+        for (stagedP, sysP) in (olean.zip sysOlean) ++ (ir.zip sysIR) do
+          let okSys ← checkCanonicalPart m sysP
+          if okSys then
+            let sameBytes ← (show IO Bool from do
+              try
+                let a ← IO.FS.readBinFile stagedP
+                let b ← IO.FS.readBinFile sysP
+                pure (a == b)
+              catch _ => pure false)
+            unless sameBytes do
+              report "moduleProvenanceSpoofed" m m s!"foundation artifact {stagedP} bytes differ from pinned sysroot {sysP}"
   return checked
 
 /-! ## Environment -/
@@ -1233,6 +1276,8 @@ def reservedTheoremCopyOk (env : Environment) (n : Name) (stored ci : ConstantIn
   let .thmInfo sv := stored | return false
   let .thmInfo cv := ci | return false
   unless sv.type == cv.type && sv.levelParams == cv.levelParams && declIsClosed ci do return false
+  -- Refuse circular self-proofs (`n` is already in `env`).
+  if (exprEdges cv.value {}).contains n then return false
   kernelAccepts env cv.levelParams cv.type cv.value 100000
 
 /-- Compiler-override attributes on one declaration (lookups by defining module). -/
@@ -1781,6 +1826,9 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
     for m in nonToolchain do
       unless tracked.contains m do
         report "graphMismatch" m m "module missing from the admitted import DAG"
+    for f in req.foundation do
+      if modIdx.contains f && !tracked.contains f then
+        report "graphMismatch" f f "loaded foundation module missing from the admitted import DAG"
     for m in tracked do
       let some i := modIdx[m]? | continue
       let actual := Lean.toJson env.header.moduleData[i]!.imports
@@ -1909,13 +1957,20 @@ def auditCore (req : Request) (env : Environment) (libDir : System.FilePath)
       let _ ← closure L #[c] (localVisited.getD m strictVisited) genuine (fun om => om == m) fuel m
     else
       let _ ← closure L #[c] strictVisited genuine (fun _ => false) fuel `companions
-  -- Statement origins of claim theorems.
+  -- Statement origins of claim theorems (and Prop-typed defs/opaques in claim modules).
   for m in req.claimModules do
     let some i := modIdx[m]?
       | report "missingDeclaration" m m "claim module missing from the loaded environment"; continue
     for ci in env.header.moduleData[i]!.constants do
-      if ci matches .thmInfo _ then
+      match ci with
+      | .thmInfo _ =>
         checkStatementOrigin L ci.name m fuel
+      | .defnInfo _ | .opaqueInfo _ =>
+        let isPropTy ← (show IO Bool from do
+          try runMeta env (Meta.isProp ci.type) (heartbeats := 50000) catch _ => pure true)
+        if isPropTy then
+          checkStatementOrigin L ci.name m fuel
+      | _ => pure ()
   -- Source-level rule: no user identifier may mention `_unsafe_rec`.
   for (m, path) in req.sources do
     let okPath ← checkCanonicalPart m path

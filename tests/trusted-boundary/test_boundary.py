@@ -960,6 +960,13 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         expect_failure(lambda: ol.audit_olean_request({"roots": ["OlClean"], "modules": ["OlClean"], "artifacts": [],
                                                        "allowProvisionalNative": True}),
                        2, "olean-audit", "malformed --audit-olean request")
+        expect_failure(lambda: ol.audit_olean_request({"roots": ["OlClean"], "modules": ["OlClean"], "artifacts": [],
+                                                       "sources": [["OlClean", clean_src], ["OlClean", clean_src]]}),
+                       2, "olean-audit", "malformed --audit-olean sources")
+        bad_hb = olean_raw(ol, ["OlClean"], nativeHeartbeats=0)
+        assert bad_hb["ok"] is False and "nativeHeartbeats" in bad_hb["message"], bad_hb
+        bad_graph = olean_raw(ol, ["OlClean"], graph={"OlClean": ol.graph["OlClean"]})
+        assert bad_graph["ok"] is False and "foundation module missing" in bad_graph["message"], bad_graph
         cache_probe = suite / "cache-probe"
         cache_probe.write_text("{}")
         cache_probe.chmod(0o644)
@@ -1049,8 +1056,42 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         ol.artifacts["Init.Data.Zero"] = zero_parts
         olean_reject(ol, ["OlUsesZero"], "[moduleProvenanceSpoofed]", "toolchain-named module")
         del ol.artifacts["Init.Data.Zero"]
+        # Standalone `OleanEnvAuditor` must also refuse a spoofed `Init.Core` passed via `foundation`
+        # + `artifacts` (whose bytes/parts do not match `<sysroot>/lib/lean/Init/Core.*`).
+        fspoof = ol.stage / "foundation-spoof"
+        (fspoof / "Init").mkdir(parents=True)
+        (fspoof / "Init/Core.lean").write_text("prelude\ninductive MyFalse : Prop\naxiom propext : MyFalse\n")
+        fsp_setup = fspoof / "InitCore.setup.json"
+        fsp_setup.write_text(json.dumps({"name": "Init.Core", "isModule": False, "imports": [],
+                                         "importArts": {}, "dynlibs": [], "plugins": [], "options": {}}))
+        ol.process("olean-fixture-InitCoreSpoof", ["-j1", "-M2048", "-t0", "--setup", str(fsp_setup),
+                                                   "-o", str(fspoof / "Init/Core.olean"), str(fspoof / "Init/Core.lean")])
+        (fspoof / "OlSpoofVic.lean").write_text("prelude\nimport Init.Core\ntheorem provenFalse : MyFalse := propext\n")
+        fsp_setup2 = fspoof / "OlSpoofVic.setup.json"
+        fsp_setup2.write_text(json.dumps({
+            "name": "OlSpoofVic", "isModule": False,
+            "imports": [{"module": "Init.Core", "importAll": False, "isExported": True, "isMeta": False}],
+            "importArts": {"Init.Core": [[str(fspoof / "Init/Core.olean")], []]},
+            "dynlibs": [], "plugins": [], "options": {},
+        }))
+        ol.process("olean-fixture-OlSpoofVic", ["-j1", "-M2048", "-t0", "--setup", str(fsp_setup2),
+                                                "-o", str(fspoof / "OlSpoofVic.olean"), str(fspoof / "OlSpoofVic.lean")])
+        fsp_req = {"mode": "olean-audit", "sysroot": str(ol.prefix), "foundation": ["Init.Core"],
+                   "artifacts": [["Init.Core", [[str(fspoof / "Init/Core.olean")], []]],
+                                 ["OlSpoofVic", [[str(fspoof / "OlSpoofVic.olean")], []]]],
+                   "roots": ["OlSpoofVic"], "modules": ["OlSpoofVic"],
+                   "axioms": [["propext", "Init.Core"]], "scope": "foundation-spoof"}
+        fsp_raw = ol.stage / "olean-raw-foundation-spoof.request.json"
+        fsp_res = ol.stage / "olean-raw-foundation-spoof.response.json"
+        fsp_raw.write_text(json.dumps(fsp_req))
+        try:
+            ol.process("olean-diagnostic", ["-j1", "--run", str(ol.olean_auditor), str(fsp_raw), str(fsp_res)])
+        except runner.Failure:
+            pass
+        fsp_verdict = json.loads(fsp_res.read_text())
+        assert fsp_verdict["ok"] is False and "[moduleProvenanceSpoofed]" in fsp_verdict["message"], fsp_verdict
         olean_accept(ol, ["OlUsesZero"])
-        done("hidden private axiom, omitted/reordered/deleted companions, split-part and toolchain-name provenance spoofing")
+        done("hidden private axiom, omitted/reordered/deleted companions, split-part and toolchain/foundation provenance spoofing")
 
         # Group 21: `partial`, `unsafe`, and forged `_unsafe_rec` code-generation companions (a
         # sibling replaces the compiled code of its parent with no attribute), including a stdlib
@@ -1274,6 +1315,8 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                      "theorem leaked : myClaim := True.intro\n", ["OlTheory"])
         olean_module(ol, "OlClaimViaSpec", "prelude\nimport OlSpecMod\n"
                      "theorem leakedViaSpec : SpecProp := True.intro\n", ["OlSpecMod"])
+        olean_module(ol, "OlClaimDef", "prelude\nimport OlTheory\n"
+                     "def leakedDef : UntrustedProp := True.intro\n", ["OlTheory"])
         olean_module(ol, "OlClaimOk", "prelude\nimport OlTheory\n"
                      "theorem proofOnly : True := (fun (_ : UntrustedProp) => True.intro) True.intro\n", ["OlTheory"])
         olean_reject(ol, ["OlTheory", "OlClaim"], "[statementOriginLeak] leaked", "UntrustedProp",
@@ -1281,6 +1324,8 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         olean_reject(ol, ["OlTheory", "OlSpecMod", "OlClaimViaSpec"], "[statementOriginLeak] leakedViaSpec", "UntrustedProp",
                      claimModules=["OlClaimViaSpec"], statementForbidden=["OlTheory"],
                      statementUnfold=["OlClaimViaSpec", "OlSpecMod"])
+        olean_reject(ol, ["OlTheory", "OlClaimDef"], "[statementOriginLeak] leakedDef", "UntrustedProp",
+                     claimModules=["OlClaimDef"], statementForbidden=["OlTheory"], statementUnfold=["OlClaimDef"])
         olean_reject(ol, ["OlTheory"], "[missingDeclaration]", "MissingClaimMod",
                      claimModules=["MissingClaimMod"], statementForbidden=["OlTheory"])
         olean_accept(ol, ["OlTheory", "OlClaimOk"], claimModules=["OlClaimOk"], statementForbidden=["OlTheory"],
@@ -1372,7 +1417,21 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         # `trusted/root-manifest.sha256` must be rejected.
         write_manifest(covered)
         expect_failure(lambda: runner.verify_root_manifest(root), 1, "root-manifest", "Cargo.toml")
-        done("root-manifest drift, symlink, missing-entry, malformed, and missing-manifest rejection before Lean")
+        # `tcb_snapshot_files` must include `trusted/root-manifest.sha256` when present, so
+        # mutating a covered file and refreshing the manifest is still caught by `--base-snapshot`.
+        assert "trusted/root-manifest.sha256" in runner.tcb_snapshot_files(root)
+        snap28 = suite / "snap-manifest-28"
+        for rel, src_p in runner.tcb_snapshot_files(root).items():
+            dst = snap28 / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src_p, dst)
+            dst.chmod(0o444)
+        pinned_input.write_text("mutated with refreshed manifest\n")
+        write_manifest(covered)
+        expect_failure(lambda: runner.verify_base_snapshot(root, snap28),
+                       1, "base-snapshot", "trusted/root-manifest.sha256")
+        shutil.rmtree(snap28)
+        done("root-manifest drift, symlink, missing-entry, malformed, base-snapshot, and missing-manifest rejection before Lean")
     except BaseException as error:
         (suite / "failure.traceback").write_text(traceback.format_exc())
         print(f"SELF-TEST FAILED: {error}\nPreserved fixture sources/raw logs: {suite}", file=sys.stderr)
