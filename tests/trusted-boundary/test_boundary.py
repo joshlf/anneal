@@ -33,7 +33,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         if sum(p.stat().st_size for p in suite.rglob("*") if p.is_file()) > runner.MAX_BYTES:
             raise AssertionError("self-test exceeded 512 MiB retained envelope")
 
-    def fixture(source=None):
+    def fixture(source=None, *, retain=False):
         nonlocal sequence
         check_budget()
         sequence += 1
@@ -47,6 +47,8 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         for name in ("check_trusted.py", "TrustedBoundary.lean", "OleanEnvAuditor.lean"):
             shutil.copyfile(checkout / "trusted/audit" / name, root / "trusted/audit" / name)
         (root / "trusted/lean/Trusted.lean").write_text(source if source is not None else header)
+        if not retain:
+            disposable.append(root)
         return root
 
     def checked(root, *, expected=None, phase=None, executed=None, check_downstream=False):
@@ -69,7 +71,9 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         passed.append(label)
         print(f"  PASS {label}", flush=True)
         for path in disposable:
-            shutil.rmtree(path)
+            if path.exists():
+                runner.make_tree_writable(path)
+                shutil.rmtree(path)
         disposable.clear()
 
     header = "prelude\nimport Init.Core\n"
@@ -841,8 +845,8 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         # compiled directly (no preflight), exactly as a hostile build would hand them over, and the
         # auditor must reject them from the compiled artifacts alone.
         def olean_checker():
-            ol = runner.Checker(fixture(), lean, temp_parent=suite)
-            ol.tool_admission()  # Its stage spans Groups 19-26 and is removed after Group 26.
+            ol = runner.Checker(fixture(retain=True), lean, temp_parent=suite)
+            ol.tool_admission()  # Its stage spans Groups 19-27 and is removed after Group 27.
             return ol
 
         def olean_module(ol, name, source, imports, *, module_file=False, flags=()):
@@ -1001,6 +1005,26 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "artifacts": [["OlFastMod", [[fm_parts[0][0], fm_parts[0][1], str(split_priv)], fm_parts[1]]]],
             "scope": "fm-cache",
         }), 1, "olean-audit", "moduleProvenanceSpoofed", "canonical companions")
+        # `--fast` cache-key sensitivity for constructive policy (`allowClassicalChoice` & `constructiveModules`).
+        olean_module(ol, "OlFastChoice", prelude_init + "noncomputable def fcChoice : Nat := Classical.choice ⟨0⟩\n",
+                     ["Init"])
+        fc_parts = ol.artifacts["OlFastChoice"]
+        ok_fc = fresh_ol2.audit_olean_request({
+            "roots": ["OlFastChoice"], "modules": ["OlFastChoice"],
+            "artifacts": [["OlFastChoice", fc_parts]],
+            "allowClassicalChoice": True, "scope": "ep2-cache-key",
+        })
+        assert "Classical.choice" in ok_fc["axioms"], ok_fc
+        expect_failure(lambda: fresh_ol2.audit_olean_request({
+            "roots": ["OlFastChoice"], "modules": ["OlFastChoice"],
+            "artifacts": [["OlFastChoice", fc_parts]],
+            "allowClassicalChoice": False, "scope": "ep2-cache-key",
+        }), 1, "olean-audit", "Classical.choice")
+        expect_failure(lambda: fresh_ol2.audit_olean_request({
+            "roots": ["OlFastChoice"], "modules": ["OlFastChoice"],
+            "artifacts": [["OlFastChoice", fc_parts]],
+            "constructiveModules": ["OlFastChoice"], "scope": "ep2-cache-key",
+        }), 1, "olean-audit", "Classical.choice")
         shutil.rmtree(wrong_dir.parent, ignore_errors=True)
         shutil.rmtree(omit_dir.parent, ignore_errors=True)
         shutil.rmtree(split_dir, ignore_errors=True)
@@ -1515,8 +1539,6 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         olean_module(ol, "OlPanicString", panic_src, ["Init"])
         olean_reject(ol, ["OlPanicString"], "[sourceForbiddenIdentifier] OlPanicString", "outside comments",
                      sources=[("OlPanicString", str(ol.stage / "olean-src/OlPanicString.lean"))])
-        runner.make_tree_writable(ol.stage)
-        shutil.rmtree(ol.stage)
         done("pure Lean 4 hardcoded compiler-intrinsic and toolchain-owned name spoofing, raw/bang-string source scan")
 
         # Group 28: `trusted/root-manifest.sha256` verification before any Lean child.
@@ -1583,6 +1605,389 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                        1, "base-snapshot", "trusted/root-manifest.sha256")
         shutil.rmtree(snap28)
         done("root-manifest drift, symlink, missing-entry, malformed, base-snapshot, and missing-manifest rejection before Lean")
+
+        # Group 29: Episode 2 constructive axiom policy (`allowClassicalChoice=False`,
+        # `constructiveModules`), `--audit-olean` validation, and end-to-end 9-vector
+        # (`V1`–`V7`, with `V8`–`V9` in Group 30) compiled-`.olean` checks.
+        ol2 = ol
+        olean_module(ol2, "OlEp2ConstructiveOk", prelude_init + (
+            "theorem ep2_propext (p q : Prop) (h : p ↔ q) : p = q := propext h\n"
+            "theorem ep2_quot : Quot.mk (fun (_ _ : Nat) => True) 0 = Quot.mk (fun (_ _ : Nat) => True) 1 :=\n"
+            "  Quot.sound trivial\n"), ["Init"])
+        olean_module(ol2, "OlEp2UsesChoice", prelude_init + (
+            "noncomputable def ep2_choice : Nat := Classical.choice ⟨0⟩\n"), ["Init"])
+        c_ok = olean_accept(ol2, ["OlEp2ConstructiveOk"], allowClassicalChoice=False)
+        assert "Classical.choice" not in c_ok["axioms"] and c_ok["constructiveModulesChecked"] == 0, c_ok
+        olean_reject(ol2, ["OlEp2UsesChoice"], "[unapprovedAxiom]", "Classical.choice",
+                     allowClassicalChoice=False)
+        c_mix = olean_accept(ol2, ["OlEp2ConstructiveOk", "OlEp2UsesChoice"],
+                             constructiveModules=["OlEp2ConstructiveOk"])
+        assert c_mix["constructiveModulesChecked"] == 1 and "Classical.choice" in c_mix["axioms"], c_mix
+        olean_reject(ol2, ["OlEp2ConstructiveOk", "OlEp2UsesChoice"], "[unapprovedAxiom]", "Classical.choice",
+                     constructiveModules=["OlEp2UsesChoice"])
+        # Malformed `--audit-olean` constructive/specStrengthChecks fields and `Trusted` in `constructiveModules`.
+        expect_failure(lambda: ol2.audit_olean_request({
+            "roots": ["OlEp2ConstructiveOk"], "modules": ["OlEp2ConstructiveOk"], "artifacts": [],
+            "constructiveModules": ["Trusted"],
+        }), 1, "olean-audit", "moduleProvenanceSpoofed", "Trusted modules")
+        for bad_req, needle in (
+            ({"roots": ["OlEp2ConstructiveOk"], "modules": ["OlEp2ConstructiveOk"], "artifacts": [],
+              "allowClassicalChoice": "no"}, "malformed"),
+            ({"roots": ["OlEp2ConstructiveOk"], "modules": ["OlEp2ConstructiveOk"], "artifacts": [],
+              "specStrengthChecks": [{"kind": "unknownKind", "cert": "c"}]}, "unsupported"),
+            ({"roots": ["OlEp2ConstructiveOk"], "modules": ["OlEp2ConstructiveOk"], "artifacts": [],
+              "specStrengthChecks": [{"kind": "claim", "claim": "t"}]}, "malformed"),
+            ({"roots": ["OlEp2ConstructiveOk"], "modules": ["OlEp2ConstructiveOk"], "artifacts": [],
+              "specStrengthChecks": [{"kind": "itemSynth", "cert": "c"}]}, "malformed"),
+        ):
+            expect_failure(lambda req=bad_req: ol2.audit_olean_request(req), 2, "olean-audit", needle)
+        # Vectors V1–V7 end-to-end on compiled `.olean`s.
+        olean_module(ol2, "OlEp2V1", prelude_init + "theorem v1 : True := by sorry\n", ["Init"])
+        olean_reject(ol2, ["OlEp2V1"], "[sorryAxiomReached]")
+        olean_module(ol2, "OlEp2V2", prelude_init + "theorem v2 : True := sorryAx True false\n", ["Init"])
+        olean_reject(ol2, ["OlEp2V2"], "[sorryAxiomReached]")
+        olean_module(ol2, "OlEp2V3", prelude_init + (
+            "axiom v3Cust : True\nprivate axiom v3Priv : True\n"
+            "theorem v3t : True := by have _ := v3Cust; exact v3Priv\n"
+            "def v3Tc : Bool := Lean.reduceBool true\n"), ["Init"])
+        olean_reject(ol2, ["OlEp2V3"], "[unapprovedAxiom]", "v3Cust", "v3Priv", "[nativeDecideReached]")
+        olean_module(ol2, "OlEp2V4", prelude_init + "theorem v4 : (1 + 1 == 2) = true := by native_decide\n", ["Init"])
+        olean_reject(ol2, ["OlEp2V4"], "[nativeDecideReached]")
+        olean_module(ol2, "OlEp2V5Bad", prelude_init + "partial def v5p (n : Nat) : Nat := v5p (n + 1)\n", ["Init"])
+        olean_reject(ol2, ["OlEp2V5Bad"], "[partialOrUnsafeRecDependency]")
+        olean_module(ol2, "OlEp2V5Ok", prelude_init + (
+            "def v5gcd : Nat → Nat → Nat\n  | 0, b => b\n  | a + 1, b => v5gcd (b % (a + 1)) (a + 1)\n"
+            "termination_by a _ => a\ndecreasing_by exact Nat.mod_lt b (Nat.succ_pos a)\n"), ["Init"])
+        olean_accept(ol2, ["OlEp2V5Ok"])
+        olean_module(ol2, "OlEp2V6", prelude_init + (
+            "unsafe def v6u (n : Nat) : Nat := n\n"
+            "def v6ib (n : Nat) : Nat := n + 1\n"
+            "@[implemented_by v6ib] def v6f (n : Nat) : Nat := n\n"
+            "@[extern \"ep2_c\"] def v6e (n : Nat) : Nat := n\n"
+            "@[export ep2_x] def v6x (n : Nat) : Nat := n\n"
+            "def v6cs1 (a : Nat) : Nat := a\ndef v6cs2 (a : Nat) : Nat := a\n"
+            "@[csimp] theorem v6cs : @v6cs1 = @v6cs2 := rfl\n"
+            "initialize v6i : Bool ← pure true\n"), ["Init"])
+        olean_reject(ol2, ["OlEp2V6"], "[unsafeDeclaration]", "[compilerOverrideAttribute]",
+                     "implemented_by", "extern", "export", "csimp", "init")
+        olean_module(ol2, "OlEp2V7Th", prelude_init + "def Ep2ThProp : Prop := True\n", ["Init"])
+        olean_module(ol2, "OlEp2V7Leak", "prelude\nimport OlEp2V7Th\ntheorem v7l : Ep2ThProp := True.intro\n",
+                     ["OlEp2V7Th"])
+        olean_module(ol2, "OlEp2V7Ok", "prelude\nimport OlEp2V7Th\n"
+                     "theorem v7ok : True := (fun (_ : Ep2ThProp) => True.intro) True.intro\n", ["OlEp2V7Th"])
+        olean_reject(ol2, ["OlEp2V7Th", "OlEp2V7Leak"], "[statementOriginLeak]", "v7l",
+                     claimModules=["OlEp2V7Leak"], statementForbidden=["OlEp2V7Th"], statementUnfold=["OlEp2V7Leak"])
+        olean_accept(ol2, ["OlEp2V7Th", "OlEp2V7Ok"],
+                     claimModules=["OlEp2V7Ok"], statementForbidden=["OlEp2V7Th"], statementUnfold=["OlEp2V7Ok"])
+        done("Episode 2 constructive policy, --audit-olean validation, cache-key sensitivity, and V1-V7 compiled checks")
+
+        # Group 30: End-to-end compiled-`.olean` Spec-Strength & Mutant-Kill Gates (`V8`, `V9`,
+        # `R6`, `R7`, `R8`, `R11`, `A1-2`, `A1-4`, `A1-6`, `S3a/b`, `S5`, `A3-3a..e`, `A4-5b`,
+        # `A4-7`, `Classical.choice` certificate rejection, and `--fast` cache sensitivity).
+        mir_stub = prelude_init + (
+            "namespace Trusted.Rustc.V2026_06_01.MirSemantics\n"
+            "abbrev Value := Nat\n"
+            "abbrev Memory := Nat\n"
+            "abbrev ExternalCallHandler := Nat → Nat\n"
+            "end Trusted.Rustc.V2026_06_01.MirSemantics\n")
+        verif_stub = (
+            "prelude\nimport Init\nimport Trusted.Rustc.V2026_06_01.MirSemantics\n"
+            "namespace Trusted.VerificationResult\n"
+            "open Trusted.Rustc.V2026_06_01.MirSemantics\n"
+            "structure Claim where\n  pre : List Value → Prop\n  post : List Value → Value → Prop\n"
+            "structure VerificationResult (c : Claim) : Prop where\n  ok : True\n"
+            "structure StatefulClaim where\n  pre : List Value → Memory → Prop\n  post : List Value → Memory → Value → Memory → Prop\n"
+            "structure StatefulVerificationResult (c : StatefulClaim) : Prop where\n  ok : True\n"
+            "structure TotalClaim where\n  pre : List Value → Memory → Prop\n  post : List Value → Memory → Value → Memory → Prop\n"
+            "structure TotalVerificationResult (c : TotalClaim) : Prop where\n  ok : True\n"
+            "structure ModularClaim where\n  envAssumed : ExternalCallHandler → Prop\n"
+            "  pre : List Value → Memory → Prop\n  post : List Value → Memory → Value → Memory → Prop\n"
+            "structure ModularVerificationResult (c : ModularClaim) : Prop where\n  ok : True\n"
+            "class ItemSpec (defId : String) : Type 1 where\n  pre : List Value → Prop\n  post : List Value → Value → Prop\n"
+            "class StatefulItemSpec (defId : String) : Type 1 where\n  pre : List Value → Memory → Prop\n  post : List Value → Memory → Value → Memory → Prop\n"
+            "class TotalItemSpec (defId : String) : Type 1 where\n  pre : List Value → Memory → Prop\n  post : List Value → Memory → Value → Memory → Prop\n"
+            "class ModularItemSpec (defId : String) : Type 1 where\n  envAssumed : ExternalCallHandler → Prop\n"
+            "  pre : List Value → Memory → Prop\n  post : List Value → Memory → Value → Memory → Prop\n"
+            "end Trusted.VerificationResult\n")
+        spec_lib_stub = (
+            "prelude\nimport Init\nimport Trusted.VerificationResult\n"
+            "namespace Anneal.OleanSpecStrengthAuditor\n"
+            "open Trusted.Rustc.V2026_06_01.MirSemantics\n"
+            "inductive MutantCategory where\n"
+            "  | wrongReturn | wrapOverflow | truncatedLength | swappedByteOrder\n"
+            "  | offByOneScalar | wrongBranchTag | unpreservedFrame | custom (name : String)\n"
+            "  deriving DecidableEq, BEq, Repr\n"
+            "structure SpecStrengthCert {α : Type u} {β : Type v} (req : α → Prop) (ens : α → β → Prop) where\n"
+            "  witnessInput : α\n  witnessValid : req witnessInput\n"
+            "  referenceOutput : β\n  referenceAccepted : ens witnessInput referenceOutput\n"
+            "  mutantOutput : β\n  mutantRejected : ¬ ens witnessInput mutantOutput\n"
+            "structure NamedMutantKill {α : Type u} {β : Type v} (req : α → Prop) (ens : α → β → Prop) where\n"
+            "  name : String\n  category : MutantCategory\n  input : α\n  inputValid : req input\n"
+            "  referenceOutput : β\n  referenceAccepted : ens input referenceOutput\n"
+            "  mutantOutput : β\n  mutantRejected : ¬ ens input mutantOutput\n"
+            "structure MultiMutantSpecCert {α : Type u} {β : Type v} (req : α → Prop) (ens : α → β → Prop) where\n"
+            "  kills : List (NamedMutantKill req ens)\n  nonEmpty : kills ≠ []\n"
+            "def MultiMutantSpecCert.coversCategory {α : Type u} {β : Type v} {req : α → Prop} {ens : α → β → Prop}\n"
+            "    (c : MultiMutantSpecCert req ens) (cat : MutantCategory) : Bool :=\n"
+            "  c.kills.any (fun k => k.category == cat)\n"
+            "structure DeterministicSpecCert {α : Type u} {β : Type v} (req : α → Prop) (ens : α → β → Prop) where\n"
+            "  witnessInput : α\n  witnessValid : req witnessInput\n"
+            "  referenceOutput : β\n  referenceAccepted : ens witnessInput referenceOutput\n"
+            "  mutantOutput : β\n  mutantDiffers : mutantOutput ≠ referenceOutput\n"
+            "  realizable : ∀ x, req x → ∃ y, ens x y\n"
+            "  uniqueOutput : ∀ x y₁ y₂, req x → ens x y₁ → ens x y₂ → y₁ = y₂\n"
+            "structure InputSensitiveSpecCert {α : Type u} {β : Type v} (req : α → Prop) (ens : α → β → Prop) where\n"
+            "  input₁ : α\n  input₂ : α\n  valid₁ : req input₁\n  valid₂ : req input₂\n"
+            "  output₁ : β\n  output₂ : β\n  accepted₁ : ens input₁ output₁\n"
+            "  accepted₂ : ens input₂ output₂\n"
+            "  nonInterchangeable : ¬ ens input₁ output₂ ∨ ¬ ens input₂ output₁\n"
+            "def uncurryPre (pre : List Value → Memory → Prop) : (List Value × Memory) → Prop := fun p => pre p.1 p.2\n"
+            "def uncurryPost (post : List Value → Memory → Value → Memory → Prop) :\n"
+            "    (List Value × Memory) → (Value × Memory) → Prop := fun p q => post p.1 p.2 q.1 q.2\n"
+            "structure ModularSpecStrengthCert (envA : ExternalCallHandler → Prop)\n"
+            "    (pre : List Value → Memory → Prop) (post : List Value → Memory → Value → Memory → Prop) where\n"
+            "  envNonVacuous : ∃ h, envA h\n  specCert : SpecStrengthCert (uncurryPre pre) (uncurryPost post)\n"
+            "structure ModularMultiMutantSpecCert (envA : ExternalCallHandler → Prop)\n"
+            "    (pre : List Value → Memory → Prop) (post : List Value → Memory → Value → Memory → Prop) where\n"
+            "  envNonVacuous : ∃ h, envA h\n  specCert : MultiMutantSpecCert (uncurryPre pre) (uncurryPost post)\n"
+            "def ModularMultiMutantSpecCert.coversCategory {envA pre post}\n"
+            "    (c : ModularMultiMutantSpecCert envA pre post) (cat : MutantCategory) : Bool :=\n"
+            "  c.specCert.coversCategory cat\n"
+            "structure ModularDeterministicSpecCert (envA : ExternalCallHandler → Prop)\n"
+            "    (pre : List Value → Memory → Prop) (post : List Value → Memory → Value → Memory → Prop) where\n"
+            "  envNonVacuous : ∃ h, envA h\n  specCert : DeterministicSpecCert (uncurryPre pre) (uncurryPost post)\n"
+            "structure ModularInputSensitiveSpecCert (envA : ExternalCallHandler → Prop)\n"
+            "    (pre : List Value → Memory → Prop) (post : List Value → Memory → Value → Memory → Prop) where\n"
+            "  envNonVacuous : ∃ h, envA h\n  specCert : InputSensitiveSpecCert (uncurryPre pre) (uncurryPost post)\n"
+            "end Anneal.OleanSpecStrengthAuditor\n")
+        olean_module(ol2, "Trusted.Rustc.V2026_06_01.MirSemantics", mir_stub, ["Init"])
+        olean_module(ol2, "Trusted.VerificationResult", verif_stub, ["Init", "Trusted.Rustc.V2026_06_01.MirSemantics"])
+        olean_module(ol2, "Anneal.OleanSpecStrengthAuditor", spec_lib_stub, ["Init", "Trusted.VerificationResult"])
+        base_spec_mods = ["Trusted.Rustc.V2026_06_01.MirSemantics", "Trusted.VerificationResult",
+                          "Anneal.OleanSpecStrengthAuditor"]
+
+        # Clean claims & certificates (all 4 claim kinds + clean single item & modular synth).
+        clean_spec_src = (
+            "prelude\nimport Init\nimport Anneal.OleanSpecStrengthAuditor\n"
+            "open Trusted.Rustc.V2026_06_01.MirSemantics\n"
+            "open Trusted.VerificationResult\n"
+            "open Anneal.OleanSpecStrengthAuditor\n"
+            "set_option linter.defProp false\n"
+            "def epPre (xs : List Value) : Prop := xs = [0] ∨ xs = [1]\n"
+            "def epPost (xs : List Value) (r : Value) : Prop := match xs with | [a] => r = a + 10 | _ => False\n"
+            "def epRely (h : ExternalCallHandler) : Prop := h 0 = 0\n"
+            "def epClaim : Claim := { pre := epPre, post := epPost }\n"
+            "theorem epClaim_ok : VerificationResult epClaim := ⟨trivial⟩\n"
+            "def epStClaim : StatefulClaim := { pre := fun xs m => epPre xs ∧ m = 0, post := fun xs m r m' => epPost xs r ∧ m' = m }\n"
+            "theorem epStClaim_ok : StatefulVerificationResult epStClaim := ⟨trivial⟩\n"
+            "def epTotClaim : TotalClaim := { pre := fun xs m => epPre xs ∧ m = 0, post := fun xs m r m' => epPost xs r ∧ m' = m }\n"
+            "theorem epTotClaim_ok : TotalVerificationResult epTotClaim := ⟨trivial⟩\n"
+            "def epModClaim : ModularClaim := { envAssumed := epRely, pre := fun xs m => epPre xs ∧ m = 0, post := fun xs m r m' => epPost xs r ∧ m' = m }\n"
+            "theorem epModClaim_ok : ModularVerificationResult epModClaim := ⟨trivial⟩\n"
+            "def epMultiCert : MultiMutantSpecCert epPre epPost := {\n"
+            "  kills := [\n"
+            "    { name := \"k1\", category := .wrongReturn, input := [0], inputValid := Or.inl rfl,\n"
+            "      referenceOutput := 10, referenceAccepted := rfl, mutantOutput := 0, mutantRejected := (by dsimp [epPost]; decide) },\n"
+            "    { name := \"k2\", category := .offByOneScalar, input := [0], inputValid := Or.inl rfl,\n"
+            "      referenceOutput := 10, referenceAccepted := rfl, mutantOutput := 11, mutantRejected := (by dsimp [epPost]; decide) }\n"
+            "  ],\n  nonEmpty := (by intro h; nomatch h) }\n"
+            "def epDetCert : DeterministicSpecCert epPre epPost := {\n"
+            "  witnessInput := [0], witnessValid := Or.inl rfl, referenceOutput := 10, referenceAccepted := rfl,\n"
+            "  mutantOutput := 11, mutantDiffers := (by decide),\n"
+            "  realizable := fun xs h => (by rcases h with rfl | rfl <;> exact ⟨_, rfl⟩),\n"
+            "  uniqueOutput := fun xs y₁ y₂ h h1 h2 => (by rcases h with rfl | rfl <;> exact h1.trans h2.symm) }\n"
+            "def epInSensCert : InputSensitiveSpecCert epPre epPost := {\n"
+            "  input₁ := [0], input₂ := [1], valid₁ := Or.inl rfl, valid₂ := Or.inr rfl,\n"
+            "  output₁ := 10, output₂ := 11, accepted₁ := rfl, accepted₂ := rfl,\n"
+            "  nonInterchangeable := Or.inl (by dsimp [epPost]; decide) }\n"
+            "def epStMultiCert : MultiMutantSpecCert (uncurryPre epStClaim.pre) (uncurryPost epStClaim.post) := {\n"
+            "  kills := [\n"
+            "    { name := \"k1\", category := .wrongReturn, input := ([0], 0), inputValid := ⟨Or.inl rfl, rfl⟩,\n"
+            "      referenceOutput := (10, 0), referenceAccepted := ⟨rfl, rfl⟩, mutantOutput := (0, 0),\n"
+            "      mutantRejected := (by intro ⟨h, _⟩; dsimp [epStClaim, epPost] at h; exact absurd h (by decide)) }\n"
+            "  ],\n"
+            "  nonEmpty := (by intro h; nomatch h) }\n"
+            "def epModMultiCert : ModularMultiMutantSpecCert epRely epModClaim.pre epModClaim.post := {\n"
+            "  envNonVacuous := ⟨fun x => x, rfl⟩, specCert := epStMultiCert }\n"
+            "def epModInSensCert : ModularInputSensitiveSpecCert epRely epModClaim.pre epModClaim.post := {\n"
+            "  envNonVacuous := ⟨fun x => x, rfl⟩,\n"
+            "  specCert := {\n"
+            "    input₁ := ([0], 0), input₂ := ([1], 0), valid₁ := ⟨Or.inl rfl, rfl⟩, valid₂ := ⟨Or.inr rfl, rfl⟩,\n"
+            "    output₁ := (10, 0), output₂ := (11, 0), accepted₁ := ⟨rfl, rfl⟩, accepted₂ := ⟨rfl, rfl⟩,\n"
+            "    nonInterchangeable := Or.inl (by intro ⟨h, _⟩; dsimp [epModClaim, epPost] at h; exact absurd h (by decide)) } }\n"
+            "instance epCleanItem : ItemSpec \"ep2::clean\" where pre := epPre; post := epPost\n"
+            "instance epCleanModItem : ModularItemSpec \"ep2::clean_mod\" where\n"
+            "  envAssumed := epRely; pre := epModClaim.pre; post := epModClaim.post\n"
+            "-- V8/V9/non-theorem/wrong-rely/classical canaries in the same module (audited per-check):\n"
+            "def epVacClaim : Claim := { pre := fun _ => False, post := epPost }\n"
+            "theorem epVacClaim_ok : VerificationResult epVacClaim := ⟨trivial⟩\n"
+            "def epTrivClaim : Claim := { pre := epPre, post := fun _ _ => True }\n"
+            "theorem epTrivClaim_ok : VerificationResult epTrivClaim := ⟨trivial⟩\n"
+            "def epNotAThm : VerificationResult epClaim := ⟨trivial⟩\n"
+            "def epWrongRelyCert : ModularMultiMutantSpecCert (fun _ => True) epModClaim.pre epModClaim.post := {\n"
+            "  envNonVacuous := ⟨fun x => x, trivial⟩, specCert := epStMultiCert }\n"
+            "noncomputable def epClassicalCert : MultiMutantSpecCert epPre epPost :=\n"
+            "  let _ : Nat := Classical.choice ⟨0⟩\n  epMultiCert\n")
+        olean_module(ol2, "OlEp2SpecClean", clean_spec_src, ["Init", "Anneal.OleanSpecStrengthAuditor"])
+        clean_checks = [
+            {"kind": "claim", "claim": "epClaim_ok", "cert": "epMultiCert",
+             "requiredCategories": ["wrongReturn", "offByOneScalar"]},
+            {"kind": "claim", "claim": "epClaim_ok", "cert": "epDetCert", "requireDeterministic": True},
+            {"kind": "claim", "claim": "epClaim_ok", "cert": "epInSensCert", "requireInputSensitive": True},
+            {"kind": "claim", "claim": "epStClaim_ok", "cert": "epStMultiCert", "requiredCategories": ["wrongReturn"]},
+            {"kind": "claim", "claim": "epTotClaim_ok", "cert": "epStMultiCert", "requiredCategories": ["wrongReturn"]},
+            {"kind": "claim", "claim": "epModClaim_ok", "cert": "epModMultiCert", "requiredCategories": ["wrongReturn"]},
+            {"kind": "claim", "claim": "epModClaim_ok", "cert": "epModInSensCert", "requireInputSensitive": True},
+            {"kind": "itemSynth", "defId": "ep2::clean", "cert": "epMultiCert", "requiredCategories": ["wrongReturn"]},
+            {"kind": "modularItemSynth", "defId": "ep2::clean_mod", "cert": "epModMultiCert",
+             "requiredCategories": ["wrongReturn"]},
+        ]
+        sc_res = olean_accept(ol2, base_spec_mods + ["OlEp2SpecClean"],
+                              constructiveModules=["Anneal.OleanSpecStrengthAuditor"],
+                              specStrengthChecks=clean_checks)
+        assert sc_res["specStrengthChecksPassed"] == len(clean_checks), sc_res
+        assert sc_res["constructiveModulesChecked"] == 1, sc_res
+        # Negative claim/cert checks: V8, V9, Classical.choice cert, R8 coverage gap, non-theorem, wrong rely, S5.
+        # Batched with distinct `(tag, decl)` pairs so every single violation is verified explicitly.
+        olean_reject(ol2, base_spec_mods + ["OlEp2SpecClean"],
+                     "[specStrengthCertInvalidType] epMultiCert",
+                     "[unapprovedAxiom] Classical.choice",
+                     "[specStrengthCoverageGap] epMultiCert",
+                     "[specStrengthCertInvalidType] epNotAThm",
+                     "[specStrengthCertInvalidType] epWrongRelyCert",
+                     "[specStrengthCertInvalidType] epDetCert",
+                     specStrengthChecks=[
+                         {"kind": "claim", "claim": "epVacClaim_ok", "cert": "epMultiCert"},
+                         {"kind": "claim", "claim": "epClaim_ok", "cert": "epClassicalCert"},
+                         {"kind": "claim", "claim": "epClaim_ok", "cert": "epMultiCert",
+                          "requiredCategories": ["wrongReturn", "unpreservedFrame"]},
+                         {"kind": "claim", "claim": "epNotAThm", "cert": "epMultiCert"},
+                         {"kind": "claim", "claim": "epModClaim_ok", "cert": "epWrongRelyCert"},
+                         {"kind": "claim", "claim": "epClaim_ok", "cert": "epDetCert", "requireInputSensitive": True},
+                     ])
+        olean_reject(ol2, base_spec_mods + ["OlEp2SpecClean"], "[specStrengthCertInvalidType] epMultiCert",
+                     specStrengthChecks=[{"kind": "claim", "claim": "epTrivClaim_ok", "cert": "epMultiCert"}])
+
+        # A1-4 (`sorry`-faked cert reports `sorryAxiomReached`, NOT `specStrengthCoverageGap`).
+        olean_module(ol2, "OlEp2A14", (
+            "prelude\nimport Init\nimport OlEp2SpecClean\n"
+            "open Anneal.OleanSpecStrengthAuditor\n"
+            "def a14SorryCert : MultiMutantSpecCert epPre epPost := by sorry\n"), ["Init", "OlEp2SpecClean"])
+        a14_err = olean_reject(ol2, base_spec_mods + ["OlEp2SpecClean", "OlEp2A14"], "[sorryAxiomReached]",
+                               specStrengthChecks=[{"kind": "claim", "claim": "epClaim_ok", "cert": "a14SorryCert",
+                                                    "requiredCategories": ["unpreservedFrame"]}])
+        assert "specStrengthCoverageGap" not in a14_err, a14_err
+
+        # A3-3a..e (`_sunfold` spec-gate spoofs) + R7 / A1-2a..d / S3a/b shadowing in compiled `.olean`.
+        shadow_src = (
+            "prelude\nimport Init\nimport OlEp2SpecClean\n"
+            "open Trusted.Rustc.V2026_06_01.MirSemantics\n"
+            "open Trusted.VerificationResult\n"
+            "open Anneal.OleanSpecStrengthAuditor\n"
+            "def s3VacPre (_ : List Value) : Prop := False\n"
+            "def s3VacPost (_ : List Value) (_ : Value) : Prop := True\n"
+            "def s3VacClaim : Claim := { pre := s3VacPre, post := s3VacPost }\n"
+            "theorem s3VacClaim_ok : VerificationResult s3VacClaim := ⟨trivial⟩\n"
+            "def s3VacPre._sunfold : List Value → Prop := epPre\n"
+            "def s3VacPost._sunfold : List Value → Value → Prop := epPost\n"
+            "def s3WeakKills : List (NamedMutantKill epPre epPost) := epMultiCert.kills\n"
+            "def s3WeakCert : MultiMutantSpecCert epPre epPost := { kills := s3WeakKills, nonEmpty := (by intro h; dsimp [s3WeakKills, epMultiCert] at h; nomatch h) }\n"
+            "def s3WeakKills._sunfold : List (NamedMutantKill epPre epPost) :=\n"
+            "  { name := \"f\", category := .unpreservedFrame, input := [0], inputValid := Or.inl rfl,\n"
+            "    referenceOutput := 10, referenceAccepted := rfl, mutantOutput := 99, mutantRejected := (by dsimp [epPost]; decide) } :: epMultiCert.kills\n"
+            "instance s3cStrong : ItemSpec \"ep2::s3c\" where pre := epPre; post := epPost\n"
+            "def s3Hide : Type 1 := ItemSpec \"ep2::s3c\"\n"
+            "def s3cShadow : s3Hide := { pre := fun _ => False, post := fun _ _ => True }\n"
+            "def s3Hide._sunfold : Type 1 := PUnit\n"
+            "def s3dFakeTy : Type := Unit\ndef s3dUnit : s3dFakeTy := ()\n"
+            "def s3dFakeTy._sunfold : Type := SpecStrengthCert epPre epPost\n"
+            "def s3eFakeTy : Prop := True\ntheorem s3eTriv : s3eFakeTy := trivial\n"
+            "def s3eFakeTy._sunfold : Prop := VerificationResult epClaim\n"
+            "instance r7S : ItemSpec \"ep2::r7\" where pre := epPre; post := epPost\n"
+            "def r7W : ItemSpec \"ep2::r7\" := { pre := fun _ => False, post := fun _ _ => True }\n"
+            "instance letS : ItemSpec \"ep2::let\" where pre := epPre; post := epPost\n"
+            "def letW : (let T := ItemSpec \"ep2::let\"; T) := { pre := fun _ => False, post := fun _ _ => True }\n"
+            "instance betaS : ItemSpec \"ep2::beta\" where pre := epPre; post := epPost\n"
+            "def betaW : ((fun s => ItemSpec s) \"ep2::beta\") := { pre := fun _ => False, post := fun _ _ => True }\n"
+            "instance projS : ItemSpec \"ep2::proj\" where pre := epPre; post := epPost\n"
+            "abbrev ProjPair : Type 1 × Type := (ItemSpec \"ep2::proj\", Nat)\n"
+            "def projW : ProjPair.1 := { pre := fun _ => False, post := fun _ _ => True }\n"
+            "class SubChain extends ItemSpec \"ep2::sub\"\n"
+            "instance subW : SubChain where pre := fun _ => False; post := fun _ _ => True\n"
+            "instance subS : SubChain where pre := epPre; post := epPost\n"
+            "def c_s3c := epMultiCert\ndef c_r7 := epMultiCert\ndef c_let := epMultiCert\n"
+            "def c_beta := epMultiCert\ndef c_proj := epMultiCert\ndef c_sub := epMultiCert\n")
+        olean_module(ol2, "OlEp2Shadow", shadow_src, ["Init", "OlEp2SpecClean"])
+        shadow_mods = base_spec_mods + ["OlEp2SpecClean", "OlEp2Shadow"]
+        olean_reject(ol2, shadow_mods,
+                     "[specStrengthCertInvalidType] epMultiCert",
+                     "[specStrengthCoverageGap] s3WeakCert",
+                     "[specInstanceAmbiguous] c_s3c",
+                     "[specStrengthCertInvalidType] s3dUnit",
+                     "[specStrengthCertInvalidType] s3eTriv",
+                     "[specInstanceAmbiguous] c_r7",
+                     "[specInstanceAmbiguous] c_let",
+                     "[specInstanceAmbiguous] c_beta",
+                     "[specInstanceAmbiguous] c_proj",
+                     "[specInstanceAmbiguous] SubChain.toItemSpec",
+                     specStrengthChecks=[
+                         {"kind": "claim", "claim": "s3VacClaim_ok", "cert": "epMultiCert"},
+                         {"kind": "claim", "claim": "epClaim_ok", "cert": "s3WeakCert",
+                          "requiredCategories": ["unpreservedFrame"]},
+                         {"kind": "itemSynth", "defId": "ep2::s3c", "cert": "c_s3c"},
+                         {"kind": "claim", "claim": "epClaim_ok", "cert": "s3dUnit"},
+                         {"kind": "claim", "claim": "s3eTriv", "cert": "epMultiCert"},
+                         {"kind": "itemSynth", "defId": "ep2::r7", "cert": "c_r7"},
+                         {"kind": "itemSynth", "defId": "ep2::let", "cert": "c_let"},
+                         {"kind": "itemSynth", "defId": "ep2::beta", "cert": "c_beta"},
+                         {"kind": "itemSynth", "defId": "ep2::proj", "cert": "c_proj"},
+                         {"kind": "itemSynth", "defId": "ep2::sub", "cert": "c_sub"},
+                     ])
+
+        # A4-5b (`Lean.reduceNat` kernel-vs-Meta.whnf asymmetry) and A4-7 (26-deep binary branching)
+        # in compiled `.olean`s.
+        a4_rn_src = (
+            "prelude\nimport Init\nimport Lean\nimport OlEp2SpecClean\n"
+            "open Lean Trusted.VerificationResult\n"
+            "def rnVal : Nat := 0\n"
+            "instance rnStrong : ItemSpec \"ep2::rn\" where pre := epPre; post := epPost\n"
+            "def rnWeakVal : ItemSpec \"ep2::rn\" := { pre := fun _ => False, post := fun _ _ => True }\n"
+            "run_cmd Elab.Command.liftCoreM do\n"
+            "  let natTy := mkConst ``Nat\n"
+            "  let u2 := Level.succ (Level.succ Level.zero)\n"
+            "  let u3 := Level.succ u2\n"
+            "  let motive := Expr.lam `k natTy (mkSort u2) .default\n"
+            "  let zCase := mkApp (mkConst ``ItemSpec) (mkStrLit \"ep2::rn\")\n"
+            "  let sCase := Expr.lam `_ natTy (Expr.lam `_ (mkSort u2) (mkConst ``PUnit [u2]) .default) .default\n"
+            "  let maj := mkApp (mkConst ``Lean.reduceNat) (mkConst ``rnVal)\n"
+            "  let ty := mkApp4 (mkConst ``Nat.rec [u3]) motive zCase sCase maj\n"
+            "  addDecl (.defnDecl {\n"
+            "    name := `rnKernelWeak, levelParams := [], type := ty,\n"
+            "    value := mkConst ``rnWeakVal, hints := .abbrev, safety := .safe })\n")
+        olean_module(ol2, "OlEp2A4Rn", a4_rn_src, ["Init", "Lean", "OlEp2SpecClean"])
+        olean_reject(ol2, base_spec_mods + ["OlEp2SpecClean", "OlEp2A4Rn"], "[specInstanceAmbiguous]",
+                     toolchainRoots=["Init", "Std", "Lean"],
+                     specStrengthChecks=[{"kind": "itemSynth", "defId": "ep2::rn", "cert": "epMultiCert"}])
+
+        exp_lines = ["prelude", "import Init", "import OlEp2SpecClean", "open Trusted.VerificationResult",
+                     "instance expStrong : ItemSpec \"ep2::exp\" where pre := epPre; post := epPost",
+                     "noncomputable section", "def eb0 : Bool := true"]
+        for k in range(1, 27):
+            exp_lines.append(f"def eb{k} : Bool := Bool.rec eb{k - 1} eb{k - 1} eb{k - 1}")
+        exp_lines.append("def expWeak : Bool.rec (motive := fun _ => Type 1) PUnit (ItemSpec \"ep2::exp\") eb26 :=")
+        exp_lines.append("  { pre := fun _ => False, post := fun _ _ => True }")
+        exp_lines.append("end\n")
+        olean_module(ol2, "OlEp2A4Exp", "\n".join(exp_lines), ["Init", "OlEp2SpecClean"])
+        t_exp0 = time.monotonic()
+        olean_reject(ol2, base_spec_mods + ["OlEp2SpecClean", "OlEp2A4Exp"], "[specInstanceAmbiguous]",
+                     specStrengthChecks=[{"kind": "itemSynth", "defId": "ep2::exp", "cert": "epMultiCert"}])
+        assert time.monotonic() - t_exp0 < 20.0, "A4-7 linear-budget gate exceeded time budget"
+
+        runner.make_tree_writable(ol2.stage)
+        shutil.rmtree(ol2.stage)
+        runner.make_tree_writable(ol2.checkout)
+        shutil.rmtree(ol2.checkout)
+        done("Episode 2 compiled spec-strength gates (V8/V9, 4 claim kinds, A1-4, A3-3 _sunfold, A1-2/S3 shadows, A4-5b, A4-7)")
     except BaseException as error:
         (suite / "failure.traceback").write_text(traceback.format_exc())
         print(f"SELF-TEST FAILED: {error}\nPreserved fixture sources/raw logs: {suite}", file=sys.stderr)

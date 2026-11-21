@@ -61,13 +61,19 @@ ROOT_MANIFEST_REPO_REQUIRED = (
 OLEAN_RESULT_KEYS = frozenset({
     "auditor", "schema", "scope", "modules", "loadedModules", "artifactPartsChecked",
     "auditedDeclarations", "reachableDeclarations", "codegenCompanions", "irDeclarationsChecked",
-    "intrinsicTagsChecked", "kernelTagConfirmations", "axioms", "localTestAxioms",
+    "intrinsicTagsChecked", "kernelTagConfirmations", "constructiveModulesChecked",
+    "specStrengthChecksPassed", "axioms", "localTestAxioms",
     "kernelConfirmedNativeAxioms", "provisionalNativeAxioms", "replayedDeclarations", "replay",
     "importMicros", "elapsedMicros"})
 OLEAN_COUNT_KEYS = ("loadedModules", "artifactPartsChecked", "auditedDeclarations", "reachableDeclarations",
                     "codegenCompanions", "irDeclarationsChecked", "intrinsicTagsChecked",
-                    "kernelTagConfirmations", "localTestAxioms", "replayedDeclarations",
-                    "importMicros", "elapsedMicros")
+                    "kernelTagConfirmations", "constructiveModulesChecked", "specStrengthChecksPassed",
+                    "localTestAxioms", "replayedDeclarations", "importMicros", "elapsedMicros")
+SPEC_CHECK_ALLOWED_KEYS = frozenset({
+    "kind", "claim", "defId", "cert", "requiredCategories",
+    "requireDeterministic", "requireInputSensitive"})
+SPEC_CHECK_SYNTH_KINDS = frozenset({
+    "itemSynth", "statefulItemSynth", "totalItemSynth", "modularItemSynth"})
 
 # Each entry is (module_name, relative_path, direct_imports, role)
 # where role is "theory", "examples", "claim", or "test".
@@ -105,7 +111,8 @@ DOWNSTREAM_TARGETS = [
     ("Anneal.PureLift.MirLiftCoreInterop", "theory/Anneal/PureLift/MirLiftCoreInterop.lean", ["Anneal.BitValidity", "Anneal.MirLiftCore", "Anneal.SepLogicLenses", "Anneal.PureLift.BlockCfg", "Anneal.PureLift.Canaries"], "theory"),
     ("Anneal.PureLift.V2026_06_01Bridge", "theory/Anneal/PureLift/V2026_06_01Bridge.lean", ["Anneal.PureLift.MirLiftCoreInterop"], "theory"),
     ("Anneal.PureLift", "theory/Anneal/PureLift.lean", ["Anneal.PureLift.Lens", "Anneal.PureLift.PermTree", "Anneal.PureLift.LoanGraph", "Anneal.PureLift.SpatialPin", "Anneal.PureLift.Plan", "Anneal.PureLift.BlockCfg", "Anneal.PureLift.Adapter", "Anneal.PureLift.Canaries", "Anneal.PureLift.MirLiftCoreInterop", "Anneal.PureLift.V2026_06_01Bridge"], "theory"),
-    ("Anneal", "theory/Anneal.lean", ["Trusted", "Anneal.Refinement", "Anneal.Effect", "Anneal.ITree", "Anneal.Pass", "Anneal.EffectWP", "Anneal.ITreeWP", "Anneal.MirLoops", "Anneal.Scalars", "Anneal.Memory", "Anneal.BitValidity", "Anneal.UnsafeObligations", "Anneal.SepLogic", "Anneal.Rustc.V2026_06_01.Lower", "Anneal.Rustc.V2026_06_01.SymbolicEval", "Anneal.Rustc.V2026_06_01.SymReflect", "Anneal.Rustc.V2026_06_01.TraceCheck", "Anneal.FunctionalTranslation", "Anneal.MirFuelFree", "Anneal.PureMirExec", "Anneal.MirLiftCore", "Anneal.MirLiftBench", "Anneal.SepLogicLenses", "Anneal.PureLift"], "theory"),
+    ("Anneal.OleanSpecStrengthAuditor", "theory/Anneal/OleanSpecStrengthAuditor.lean", ["Trusted"], "theory"),
+    ("Anneal", "theory/Anneal.lean", ["Trusted", "Anneal.Refinement", "Anneal.Effect", "Anneal.ITree", "Anneal.Pass", "Anneal.EffectWP", "Anneal.ITreeWP", "Anneal.MirLoops", "Anneal.Scalars", "Anneal.Memory", "Anneal.BitValidity", "Anneal.UnsafeObligations", "Anneal.SepLogic", "Anneal.Rustc.V2026_06_01.Lower", "Anneal.Rustc.V2026_06_01.SymbolicEval", "Anneal.Rustc.V2026_06_01.SymReflect", "Anneal.Rustc.V2026_06_01.TraceCheck", "Anneal.FunctionalTranslation", "Anneal.MirFuelFree", "Anneal.PureMirExec", "Anneal.MirLiftCore", "Anneal.MirLiftBench", "Anneal.SepLogicLenses", "Anneal.PureLift", "Anneal.OleanSpecStrengthAuditor"], "theory"),
     ("Smoke", "examples/Smoke.lean", ["Anneal"], "examples"),
     ("ToyYDiagram", "examples/refinement/ToyYDiagram.lean", ["Anneal.Refinement"], "examples"),
     ("ToyMachine", "examples/step-result/ToyMachine.lean", ["Trusted", "Anneal.Refinement", "Anneal.Effect", "Anneal.ITree", "Anneal.Pass"], "examples"),
@@ -1010,10 +1017,13 @@ class Checker:
                     and result["modules"] == sorted(fields["modules"])
                     and all(type(result[k]) is int and result[k] >= 0 for k in OLEAN_COUNT_KEYS)
                     and result["auditedDeclarations"] >= result["replayedDeclarations"]
+                    and result["constructiveModulesChecked"] == len(fields.get("constructiveModules", []))
+                    and result["specStrengthChecksPassed"] == len(fields.get("specStrengthChecks", []))
                     and result["provisionalNativeAxioms"] == []
                     and result["kernelConfirmedNativeAxioms"] == []
                     and isinstance(result["axioms"], list)
                     and all(isinstance(n, str) and n in {a[0] for a in self.lock["axioms"]} for n in result["axioms"])
+                    and (fields.get("allowClassicalChoice", True) or "Classical.choice" not in result["axioms"])
                     and len(result["axioms"]) == len(set(result["axioms"]))
                     and (result["localTestAxioms"] == 0 or bool(fields.get("localAxiomModules"))),
                     mode, "invalid compiled-environment audit observation")
@@ -1043,14 +1053,45 @@ class Checker:
         `statementUnfold`, `sources` and `scope`. Provisional native evaluation and extra
         toolchain roots cannot be requested here."""
         allowed = {"roots", "modules", "artifacts", "graph", "localAxiomModules", "claimModules",
-                   "statementForbidden", "statementUnfold", "sources", "scope"}
+                   "statementForbidden", "statementUnfold", "sources", "scope",
+                   "allowClassicalChoice", "constructiveModules", "specStrengthChecks"}
         phase = "olean-audit"
         require(isinstance(request, dict) and set(request) <= allowed
                 and {"roots", "modules", "artifacts"} <= set(request), phase, "malformed --audit-olean request")
-        for key in ("roots", "modules", "localAxiomModules", "claimModules", "statementForbidden", "statementUnfold"):
+        for key in ("roots", "modules", "localAxiomModules", "claimModules", "statementForbidden",
+                    "statementUnfold", "constructiveModules"):
             value = request.get(key, [])
             require(isinstance(value, list) and all(isinstance(m, str) and m for m in value), phase,
                     f"malformed --audit-olean field {key}")
+        allow_classical = request.get("allowClassicalChoice", True)
+        require(type(allow_classical) is bool, phase, "malformed --audit-olean field allowClassicalChoice")
+        constructive_mods = request.get("constructiveModules", [])
+        require(len(constructive_mods) == len(set(constructive_mods)), phase,
+                "malformed --audit-olean field constructiveModules")
+        spec_checks = request.get("specStrengthChecks", [])
+        require(isinstance(spec_checks, list), phase, "malformed --audit-olean field specStrengthChecks")
+        for entry in spec_checks:
+            require(isinstance(entry, dict) and set(entry) <= SPEC_CHECK_ALLOWED_KEYS
+                    and {"kind", "cert"} <= set(entry)
+                    and isinstance(entry["kind"], str) and isinstance(entry["cert"], str) and bool(entry["cert"]),
+                    phase, "malformed --audit-olean specStrengthChecks entry")
+            if entry["kind"] == "claim":
+                require("claim" in entry and "defId" not in entry
+                        and isinstance(entry["claim"], str) and bool(entry["claim"]),
+                        phase, "malformed --audit-olean claim specStrengthChecks entry")
+            elif entry["kind"] in SPEC_CHECK_SYNTH_KINDS:
+                require("defId" in entry and "claim" not in entry
+                        and isinstance(entry["defId"], str) and bool(entry["defId"]),
+                        phase, "malformed --audit-olean synth specStrengthChecks entry")
+            else:
+                raise Failure(2, phase, f"unsupported --audit-olean specStrengthChecks kind: {entry['kind']}")
+            if "requiredCategories" in entry:
+                cats = entry["requiredCategories"]
+                require(isinstance(cats, list) and all(isinstance(c, str) and bool(c) for c in cats),
+                        phase, "malformed --audit-olean requiredCategories")
+            for bkey in ("requireDeterministic", "requireInputSensitive"):
+                if bkey in entry:
+                    require(type(entry[bkey]) is bool, phase, f"malformed --audit-olean {bkey}")
         require(bool(request["roots"]) and len(request["roots"]) == len(set(request["roots"])), phase,
                 "malformed --audit-olean field roots")
         require(bool(request["modules"]) and len(request["modules"]) == len(set(request["modules"])), phase,
@@ -1066,6 +1107,7 @@ class Checker:
 
         named = [*request["roots"], *request["modules"],
                  *request.get("localAxiomModules", []), *request.get("claimModules", []),
+                 *constructive_mods,
                  *(e[0] for e in artifacts if isinstance(e, list) and e and isinstance(e[0], str)),
                  *(s[0] for s in (request.get("sources") if isinstance(request.get("sources"), list) else [])
                    if isinstance(s, list) and s and isinstance(s[0], str)),
@@ -1122,6 +1164,9 @@ class Checker:
                 "olean-audit", scope=scope, roots=[*request["roots"], *compiled_trusted],
                 modules=[*request["modules"], *compiled_trusted],
                 graph=merged_graph,
+                allowClassicalChoice=allow_classical,
+                constructiveModules=constructive_mods,
+                specStrengthChecks=spec_checks,
                 localAxiomModules=request.get("localAxiomModules", []),
                 claimModules=request.get("claimModules", []),
                 statementForbidden=request.get("statementForbidden", []),
@@ -1403,9 +1448,61 @@ class Checker:
             testModules=[m for m, _, _, r in targets if r == "test"],
         ))
         downstream_modules = [m for m, _, _, _ in targets]
+        has_spec_lib = "Anneal.OleanSpecStrengthAuditor" in downstream_modules
+        constructive_mods = ["Anneal.OleanSpecStrengthAuditor"] if has_spec_lib else []
+        downstream_spec_checks = (
+            [
+                {
+                    "kind": "itemSynth",
+                    "defId": "anneal_model::fxfs_storage_boundary::vmo_subslice_bounds_valid",
+                    "cert": "Anneal.OleanSpecStrengthAuditor.fxfsModelItemMultiCert",
+                    "requiredCategories": [
+                        "wrongReturn", "wrapOverflow", "truncatedLength",
+                        "swappedByteOrder", "offByOneScalar",
+                    ],
+                },
+                {
+                    "kind": "itemSynth",
+                    "defId": "anneal_model::fxfs_storage_boundary::vmo_subslice_bounds_valid",
+                    "cert": "Anneal.OleanSpecStrengthAuditor.fxfsModelItemDetCert",
+                    "requireDeterministic": True,
+                },
+                {
+                    "kind": "itemSynth",
+                    "defId": "anneal_model::fxfs_storage_boundary::vmo_subslice_bounds_valid",
+                    "cert": "Anneal.OleanSpecStrengthAuditor.fxfsModelItemInputSensitiveCert",
+                    "requireInputSensitive": True,
+                },
+                {
+                    "kind": "modularItemSynth",
+                    "defId": "anneal_model::fuchsia_usercopy::usercopy_copyin_bracketed",
+                    "cert": "Anneal.OleanSpecStrengthAuditor.fuchsiaModelModularItemMultiCert",
+                    "requiredCategories": [
+                        "wrongBranchTag", "truncatedLength",
+                        "offByOneScalar", "unpreservedFrame",
+                    ],
+                },
+                {
+                    "kind": "modularItemSynth",
+                    "defId": "anneal_model::fuchsia_usercopy::usercopy_copyin_bracketed",
+                    "cert": "Anneal.OleanSpecStrengthAuditor.fuchsiaModelModularItemDetCert",
+                    "requireDeterministic": True,
+                },
+                {
+                    "kind": "modularItemSynth",
+                    "defId": "anneal_model::fuchsia_usercopy::usercopy_copyin_bracketed",
+                    "cert": "Anneal.OleanSpecStrengthAuditor.fuchsiaModelModularItemInputSensitiveCert",
+                    "requireInputSensitive": True,
+                },
+            ]
+            if has_spec_lib
+            else []
+        )
         result["oleanAudit"] = self.olean_audit(
             "olean-downstream-audit", scope="downstream",
             roots=[*self.modules, *downstream_modules], modules=[*self.modules, *downstream_modules],
+            constructiveModules=constructive_mods,
+            specStrengthChecks=downstream_spec_checks,
             localAxiomModules=allowed_axiom_mods,
             claimModules=[m for m, _, _, r in targets if r == "claim"],
             statementForbidden=[m for m, _, _, r in targets if r == "theory"],

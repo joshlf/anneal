@@ -22,6 +22,7 @@ import Anneal.MirLiftCore
 import Anneal.MirLiftBench
 import Anneal.SepLogicLenses
 import Anneal.PureLift
+import Anneal.OleanSpecStrengthAuditor
 
 namespace Anneal
 
@@ -71,6 +72,21 @@ export Anneal.ITreeWP (
   dwlp_pure_adequacy dwlp_trace_adequacy dwp_pure_adequacy
   dwp_interp dwlp_interp dwp_interpState dwlp_interpState
   wpCoalBounded dwp_cofix_of_wpCoalBounded dwlp_cofix_of_wpCoalBounded
+)
+
+export Anneal.OleanSpecStrengthAuditor (
+  MutantCategory SpecStrengthCert NamedMutantKill MultiMutantSpecCert
+  DeterministicSpecCert InputSensitiveSpecCert
+  ModularSpecStrengthCert ModularMultiMutantSpecCert
+  ModularDeterministicSpecCert ModularInputSensitiveSpecCert
+  ItemSpecStrengthCert ItemMultiMutantSpecCert
+  ItemDeterministicSpecCert ItemInputSensitiveSpecCert
+  StatefulItemSpecStrengthCert StatefulItemMultiMutantSpecCert
+  StatefulItemDeterministicSpecCert StatefulItemInputSensitiveSpecCert
+  TotalItemSpecStrengthCert TotalItemMultiMutantSpecCert
+  TotalItemDeterministicSpecCert TotalItemInputSensitiveSpecCert
+  ModularItemSpecStrengthCert ModularItemMultiMutantSpecCert
+  ModularItemDeterministicSpecCert ModularItemInputSensitiveSpecCert
 )
 
 /-- Smoke-test witness exported from `Anneal`. -/
