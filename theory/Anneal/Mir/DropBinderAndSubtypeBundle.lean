@@ -745,8 +745,8 @@ def ep2AnnealEval (mode : Ep2Mode) (v : Ep2Variant) (c : Ep2Case) (_ch : Unit) :
     runTrustedVerdict v4ShallowInitBoxOkMir 10
       (initMachineState v4ShallowInitBoxOkMir [.ptr { allocId := 2, offsetBytes := 0 } 8])
   | .shallowInitBox, .okSecondary =>
-    runTrustedVerdict v4ShallowInitBoxOkMir 10
-      (initMachineState v4ShallowInitBoxOkMir [.ptr { allocId := 2, offsetBytes := 0 } 8])
+    runTrustedVerdict v4ShallowInitBoxDistinctOkMir 10
+      (initMachineState v4ShallowInitBoxDistinctOkMir [.ptr { allocId := 5, offsetBytes := 0 } 8])
   | .shallowInitBox, .ubFault =>
     runTrustedVerdict v4ShallowInitBoxOkMir 10
       { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .dead] }, memory := emptyMemory }

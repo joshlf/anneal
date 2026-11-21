@@ -123,16 +123,24 @@ theorem ep2_mr_all_8_variant_witnesses_linked :
 theorem ep2_mr_deep_theorems_used :
     (ep2MrObserve .basicMemory .dropTerminator .modeCase =
       .retBytes ((scalarBytes u32 42).map (projByteTB ∘ liftByteTB))) ∧
-    (ep2MrObserve .treeBorrows .dropTerminator .modeCase = .ub) := by
+    (ep2MrObserve .treeBorrows .dropTerminator .modeCase = .ub) ∧
+    (ep2AnnealEval .basic .shallowInitBox .okPrimary () ≠
+      ep2AnnealEval .basic .shallowInitBox .okSecondary ()) := by
   have _ := @v1_coverage_positive_and_ub_witness
   have _ := @v2_dropHint_positive_and_ub_witness
   have _ := @v3_drop_comprehensive_witness
+  have _ := @v3_drop_whole_coupled_lockstep_and_wfLive
   have _ := @v4_shallowInitBox_comprehensive_witness
+  have _ := @v4_shallowInitBox_coupled_valRel_sim
   have _ := @v5_wrapUnsafeBinder_comprehensive_witness
+  have _ := @v5_v6_binder_and_subtype_coupled_valRel_sim
   have _ := @v6_subtype_eq_transmute_and_sim
   have _ := @v7_aggregateRawPtr_comprehensive_witness
+  have _ := @v7_rawPtr_coupled_valRel_sim
   have _ := @v8_closure_comprehensive_witness
-  exact ep2MrObserve_drop_mode_sensitivity
+  have _ := @v8_closure_assign_coupled_lockstep_and_wfLive
+  have _ := @v8_closure_coupled_valRel_sim
+  exact ⟨ep2MrObserve_drop_mode_sensitivity.1, ep2MrObserve_drop_mode_sensitivity.2, by decide +kernel⟩
 
 /-! ## §2. Cross-Root Dual-Authority Kernel Bridge (`MiniRustSpec` + `LeanMiriSpec`) -/
 
@@ -443,6 +451,7 @@ run_cmd do
         (`v3DropPostReadMir, mrNs ++ `v3DropPostReadMir, lmNs ++ `v3DropPostReadMir),
         (`v3DropProtectedMir, mrNs ++ `v3DropProtectedMir, lmNs ++ `v3DropProtectedMir),
         (`v4ShallowInitBoxOkMir, mrNs ++ `v4ShallowInitBoxOkMir, lmNs ++ `v4ShallowInitBoxOkMir),
+        (`v4ShallowInitBoxDistinctOkMir, mrNs ++ `v4ShallowInitBoxDistinctOkMir, lmNs ++ `v4ShallowInitBoxDistinctOkMir),
         (`v4ShallowInitBoxNonPtrUnsupMir, mrNs ++ `v4ShallowInitBoxNonPtrUnsupMir, lmNs ++ `v4ShallowInitBoxNonPtrUnsupMir),
         (`v5WrapTransparentRoundtripMir, mrNs ++ `v5WrapTransparentRoundtripMir, lmNs ++ `v5WrapTransparentRoundtripMir),
         (`v5WrapStructRoundtripMir, mrNs ++ `v5WrapStructRoundtripMir, lmNs ++ `v5WrapStructRoundtripMir),
@@ -581,7 +590,7 @@ run_cmd do
     liftCoreM <| act.toIO ctx { env := baseEnv }
   unless addedCount ≥ 50 && bundleCount = 9 && rejectedCount = 5 do
     throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, rejected={rejectedCount})"
-  logInfo m!"ep2 cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles, 25 fixture locks), rejected {rejectedCount} forged controls, reached Trusted+MiniRust+Miri, axioms {crAxioms}"
+  logInfo m!"ep2 cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles, 26 fixture locks), rejected {rejectedCount} forged controls, reached Trusted+MiniRust+Miri, axioms {crAxioms}"
 
 /-! ## §3. Constructive Axiom Audit of `Anneal.Mir.DropBinderAndSubtypeBundle` & Test Module -/
 

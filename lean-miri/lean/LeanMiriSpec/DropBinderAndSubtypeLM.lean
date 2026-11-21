@@ -117,6 +117,7 @@ def mkMirBody (defPath : String) (decls : List LocalDecl) (argCount : Nat)
 @[reducible] def rawMutU32MirTy : Ty := { kind := .rawPtr .mut (.uint .u32), layoutIdx := 0 }
 @[reducible] def rawMutU8MirTy : Ty := { kind := .rawPtr .mut (.uint .u8), layoutIdx := 0 }
 @[reducible] def boxU32MirTy : Ty := { kind := .rawPtr .mut (.uint .u32), layoutIdx := 0 }
+@[reducible] def boxU64MirTy : Ty := { kind := .rawPtr .mut (.uint .u64), layoutIdx := 0 }
 @[reducible] def sliceU32MirTy : Ty := { kind := .slice (.uint .u32), layoutIdx := 0 }
 @[reducible] def strMirTy : Ty := { kind := .str, layoutIdx := 0 }
 @[reducible] def rawConstSliceU32MirTy : Ty := { kind := .rawPtr .not (.slice (.uint .u32)), layoutIdx := 0 }
@@ -209,6 +210,10 @@ def v3DropProtectedMir : CapturedMir := v3DropWholeOkMir
 def v4ShallowInitBoxOkMir : CapturedMir :=
   mkMirBody "ep2::v4_shallow_init_box_ok" [mkDecl boxU32MirTy, mkDecl rawMutU8MirTy] 1
     [mkBb [mkSt (.assign (locPlace 0) (.shallowInitBox (.copy (locPlace 1)) u32MirTy))] .return_]
+
+def v4ShallowInitBoxDistinctOkMir : CapturedMir :=
+  mkMirBody "ep2::v4_shallow_init_box_distinct_ok" [mkDecl boxU64MirTy, mkDecl rawMutU32MirTy] 1
+    [mkBb [mkSt (.assign (locPlace 0) (.shallowInitBox (.copy (locPlace 1)) u64MirTy))] .return_]
 
 def v4ShallowInitBoxNonPtrUnsupMir : CapturedMir :=
   mkMirBody "ep2::v4_shallow_init_box_nonptr_unsup" [mkDecl boxU32MirTy, mkDecl u64MirTy] 1
@@ -379,53 +384,135 @@ def ep2RelOffset? (mach : AnnealMachine) (aid : Miri.Memory.AllocId) (addr : UIn
 
 /-- Byte range `(offsetWithinLocal, size)` of field `idx` of local `localId`,
 derived (never hardcoded) from the local's vendored Miri layout
-(`FieldsShape.Arbitrary` offsets) and the Trusted static field type
-(`tuple` / `closure` component, sized by `MirSemantics.tyByteSize`). Fails closed
-(`none`) for any other shape. -/
+(`FieldsShape.Arbitrary` offsets) and:
+1. First, the recorded `LayoutTable` field layout (`tl.fieldLayouts[idx]?` → `fl.size.bytes`),
+   handling structs/ADTs and fields with non-zero `layoutIdx`;
+2. Falling back to `MirSemantics.tyByteSize` on tuple/closure component types when
+   no `fieldLayouts` table entry is attached (e.g., `emptyLayoutTable`).
+Fails closed (`none`) for any other shape. -/
 def ep2FieldByteRange? (decls : List LocalDecl) (layouts : LayoutTable) (localId : Nat)
     (lay? : Option Miri.Interpreter.LocalLayout) (idx : Nat) : Option (UInt64 × Nat) :=
   match lay?, get? decls localId with
   | some lay, some decl =>
-    let fieldKind? : Option RigidTy :=
-      match decl.ty.kind with
-      | .tuple tys => get? tys idx
-      | .closure _ tys => get? tys idx
-      | _ => none
-    match lay.layout.fields, fieldKind? with
-    | .Arbitrary offs _, some fk =>
-      match offs[idx]?, tyByteSize decls layouts { kind := fk, layoutIdx := 0 } with
-      | some off, some sz => some (off.bytes, sz)
-      | _, _ => none
-    | _, _ => none
+    match lay.layout.fields with
+    | .Arbitrary offs _ =>
+      match offs[idx]? with
+      | some off =>
+        let layoutSz? : Option Nat :=
+          match layouts.lookup decl.ty.layoutIdx with
+          | some tl =>
+            match get? tl.fieldLayouts idx with
+            | some flIdx => (layouts.lookup flIdx).map (·.size.bytes)
+            | none => none
+          | none => none
+        let sz? : Option Nat :=
+          match layoutSz? with
+          | some sz => some sz
+          | none =>
+            let fieldKind? : Option RigidTy :=
+              match decl.ty.kind with
+              | .tuple tys => get? tys idx
+              | .closure _ tys => get? tys idx
+              | _ => none
+            fieldKind?.bind (fun fk => tyByteSize decls layouts { kind := fk, layoutIdx := 0 })
+        sz?.map (fun sz => (off.bytes, sz))
+      | none => none
+    | _ => none
   | _, _ => none
 
-/-- Place-relative Tree Borrows protector check for a drop (a write) through tag
-`tag` into an allocation whose vendored borrow tree is `tree`: conflict iff some
-OTHER tag registered in this allocation's tree (`tree.tagMapping`) carries a
-`StrongProtector` in the global vendored protected-tag table.
+/-- Walk parent pointers in vendored `BorrowTree.nodes` (bounded by `fuel`) to test
+whether `anc` is an ancestor of (or equal to) `cur` in the borrow tree. -/
+def ep2IsAncestor (tree : Miri.TreeBorrows.BorrowTree) (anc : Miri.TreeBorrows.UniIndex) :
+    Miri.TreeBorrows.UniIndex → Nat → Bool
+  | _, 0 => false
+  | cur, fuel + 1 =>
+    if cur == anc then true
+    else
+      match tree.nodes.get cur with
+      | some node =>
+        match node.parent with
+        | some p => ep2IsAncestor tree anc p fuel
+        | none => false
+      | none => false
 
-Vendored `BorrowTree.performBorrowAccessRange` is not kernel-reducible, so it cannot
-drive the kernel-checked corpus; this check reads only vendored data (the dropped
-allocation's own tree and `GlobalState.protectedTags`), never a mode flag, and
-`ep2ProtectorConflict_agrees_with_vendored_tree_borrows` proves it returns exactly
-the verdict of `performBorrowAccessRange` on the vendored two-node witness tree. -/
+/-- Place- and byte-range-relative Tree Borrows write conflict check for a drop
+through `tag` on `[start, start + size)` in an allocation whose vendored borrow
+tree is `tree`. Directly delegates every overlapping location-tree segment and
+tree node to unmodified vendored `Miri.TreeBorrows.Tree.LocationState.performAccess`,
+respecting:
+* exact borrow-tree ancestry (`ep2IsAncestor` → `.LocalAccess` vs. `.ForeignAccess`,
+  so child writes under a protected ancestor are permitted!),
+* exact byte-range overlap (`seg.range` vs. `[start, start + size)`),
+* per-location `accessed` bit and permission (`.Cell`, `.Disabled`, `.Frozen`,
+  `.Unique`, `.ReservedFrz`, `.ReservedIM`), and
+* the global vendored `ProtectedTags` table (`.StrongProtector`). -/
 def ep2ProtectorConflict (protectedTags : Miri.TreeBorrows.ProtectedTags)
-    (tree : Miri.TreeBorrows.BorrowTree) (tag : Miri.Memory.BorTag) : Bool :=
-  tree.tagMapping.mapping.any (fun e => e.1 != tag && protectedTags.get e.1 == some .StrongProtector)
+    (tree : Miri.TreeBorrows.BorrowTree) (tag : Miri.Memory.BorTag)
+    (start size : Miri.ABI.Size) : Bool :=
+  let startNat := start.bytes.toNat
+  let endNat := startNat + size.bytes.toNat
+  let srcIdx? := tree.tagMapping.get tag
+  let fuel := tree.nodes.data.size + 1
+  tree.locations.entries.any fun seg =>
+    seg.range.start.toNat < endNat && startNat < seg.range.stop.toNat &&
+    tree.tagMapping.mapping.any fun (otherTag, otherIdx) =>
+      let relPos : Miri.TreeBorrows.AccessRelatedness :=
+        match srcIdx? with
+        | some srcIdx =>
+          if ep2IsAncestor tree otherIdx srcIdx fuel then .LocalAccess else .ForeignAccess
+        | none => .ForeignAccess
+      let isProt : Bool := protectedTags.get otherTag == some .StrongProtector
+      let locSt? : Option Miri.TreeBorrows.Tree.LocationState :=
+        match seg.data.perms.get otherIdx with
+        | some ls => some ls
+        | none => (tree.nodes.get otherIdx).map (·.defaultLocationState)
+      match locSt? with
+      | some ls =>
+        match Miri.TreeBorrows.Tree.LocationState.performAccess ls .Write relPos isProt with
+        | .Success _ _ => false
+        | _ => true
+      | none => false
 
-/-- Bridge to vendored Tree Borrows: on `hooksTwoNodeTree .unique` (root
-`retagParentTag`, accessed `Unique` child `retagChildTag`) with the child protected
-iff `isProtected`, `ep2ProtectorConflict` for a write through the root tag reports a
-conflict exactly when unmodified vendored `BorrowTree.performBorrowAccessRange`
-(`.Write` over `[0, 8)`) fails to complete. -/
+/-- Two-node vendored Tree Borrows tree over the 4 bytes of a `u32` local: root
+`retagParentTag` (`Unique`) with an accessed `Unique` child `retagChildTag`
+(`hooksTwoNodeTree .unique`, restricted to `[0, 4)`). -/
+private def lmU32ChildTree : Miri.TreeBorrows.BorrowTree :=
+  { hooksTwoNodeTree .unique with
+    locations := Miri.DataStructures.DedupRangeMap.new (Miri.ABI.Size.ofBytes 4) (hooksLocTree .unique) }
+
+/-- Bridge to unmodified vendored Tree Borrows:
+1. On `hooksTwoNodeTree .unique` (`[0, 8)`), `ep2ProtectorConflict` for a write
+   through root `retagParentTag` agrees identically with unmodified vendored
+   `BorrowTree.performBorrowAccessRange` (`.Write` over `[0, 8)`) for BOTH
+   `isProtected ∈ {false, true}`;
+2. On `lmU32ChildTree` (`[0, 4)` — the EXACT tree in `mkTbDropMiriState`),
+   `ep2ProtectorConflict` returns `isProtected`;
+3. Child write through `retagChildTag` with protected parent `retagParentTag`
+   does NOT conflict (`false`), matching Tree Borrows ancestry semantics;
+4. Disjoint byte range `[4, 8)` on `lmU32ChildTree` does NOT conflict (`false`);
+5. Interior-mutable protected child (`hooksTwoNodeTree .cell`) does NOT conflict
+   on a foreign write (`ep2ProtectorConflict = false` AND `performBorrowAccessRange`
+   `.Completed`)! -/
 theorem ep2ProtectorConflict_agrees_with_vendored_tree_borrows (isProtected : Bool) :
+    let parentProt : Miri.TreeBorrows.ProtectedTags :=
+      ({} : Miri.TreeBorrows.ProtectedTags).insert retagParentTag .StrongProtector
     ep2ProtectorConflict (hooksForChildProtected isProtected).protectedTags
-        (hooksTwoNodeTree .unique) retagParentTag = isProtected ∧
+        (hooksTwoNodeTree .unique) retagParentTag Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8) = isProtected ∧
     (((hooksTwoNodeTree .unique).performBorrowAccessRange (.concrete retagParentTag)
         Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8) .Write
         (hooksForChildProtected isProtected).protectedTags .VisitChildrenOfAccessed).status = .Completed ↔
-      isProtected = false) := by
-  refine ⟨by cases isProtected <;> decide +kernel, ?_⟩
+      isProtected = false) ∧
+    ep2ProtectorConflict (hooksForChildProtected isProtected).protectedTags
+        lmU32ChildTree retagParentTag Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4) = isProtected ∧
+    ep2ProtectorConflict parentProt
+        lmU32ChildTree retagChildTag Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4) = false ∧
+    ep2ProtectorConflict (hooksForChildProtected true).protectedTags
+        lmU32ChildTree retagParentTag (Miri.ABI.Size.ofBytes 4) (Miri.ABI.Size.ofBytes 4) = false ∧
+    ep2ProtectorConflict (hooksForChildProtected true).protectedTags
+        (hooksTwoNodeTree .cell) retagParentTag Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8) = false := by
+  refine ⟨by cases isProtected <;> decide +kernel, ?_,
+          by cases isProtected <;> decide +kernel,
+          by decide +kernel, by decide +kernel, by decide +kernel⟩
   have h := (borrowTree_performBorrowAccessRange_simulation .write .foreignAccess .unique isProtected).1
   refine h.trans ?_
   cases isProtected <;> decide +kernel
@@ -433,10 +520,11 @@ theorem ep2ProtectorConflict_agrees_with_vendored_tree_borrows (isProtected : Bo
 /-- Deinitialize `len` bytes at `relInLocal` inside the memory-backed local `mp`
 and jump to `target`:
 * the allocation-relative start is `mp`'s address minus the allocation's recorded
-  base address (`ep2RelOffset?`), so locals at non-zero offsets are handled;
+  base address (`ep2RelOffset?`), guarded against `UInt64` addition overflow;
 * when `treeBorrows = true` and the allocation carries a borrow tree and the
-  machine a borrow tracker, a protector conflict on the dropped allocation
-  (`ep2ProtectorConflict` against the global vendored protected-tag table) is UB;
+  machine a borrow tracker, `ep2ProtectorConflict` checks the exact dropped byte
+  range `[start, start + size)` through unmodified vendored
+  `Miri.TreeBorrows.Tree.LocationState.performAccess`;
 * the bytes are then cleared by unmodified vendored `Allocation.writeUninit`. -/
 def ep2DeinitIndirect (treeBorrows : Bool) (mp : Miri.Interpreter.MemPlace AnnealProv)
     (relInLocal : UInt64) (len : Nat) (target : Miri.MIR.BasicBlockId)
@@ -446,13 +534,16 @@ def ep2DeinitIndirect (treeBorrows : Bool) (mp : Miri.Interpreter.MemPlace Annea
     match state.machine.memory.live.findIdx? (fun e => e.1 == aid),
           ep2RelOffset? state.machine aid mp.ptr.offset.bytes with
     | some lIdx, some base =>
+      if base.toNat + relInLocal.toNat ≥ 2 ^ 64 then
+        (state, .error (.undefinedBehavior "drop offset overflow"))
+      else
       match state.machine.memory.live[lIdx]? with
       | some (_, liveAlloc) =>
         let start := Miri.ABI.Size.ofBytes (base + relInLocal)
         let size := Miri.ABI.Size.ofBytes (UInt64.ofNat len)
         let conflict : Bool :=
           match treeBorrows, state.machine.borrowTracker, liveAlloc.allocation.extra with
-          | true, some bt, some tree => ep2ProtectorConflict bt.global.protectedTags tree tag
+          | true, some bt, some tree => ep2ProtectorConflict bt.global.protectedTags tree tag start size
           | _, _, _ => false
         if conflict then
           (state, .error (.undefinedBehavior "Tree Borrows write conflict on drop"))
@@ -923,11 +1014,18 @@ private def lmExtractOk {ε α : Type} : (r : Except ε α) → r.isOk = true �
   | .error _, h => nomatch h
 
 private def lmAlign4 : Miri.ABI.Align := ⟨2⟩
+private def lmAlign8 : Miri.ABI.Align := ⟨3⟩
 
 private def lmUninit4Alloc : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree) :=
   (lmExtractOk
     (Miri.Memory.Allocation.tryNew (Prov := AnnealProv) (Miri.ABI.Size.ofBytes 4) lmAlign4 .Uninit
       (fun _ _ => some #[0, 0, 0, 0]))
+    (by decide +kernel)).withExtra none
+
+private def lmUninit8Alloc : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree) :=
+  (lmExtractOk
+    (Miri.Memory.Allocation.tryNew (Prov := AnnealProv) (Miri.ABI.Size.ofBytes 8) lmAlign8 .Uninit
+      (fun _ _ => some #[0, 0, 0, 0, 0, 0, 0, 0]))
     (by decide +kernel)).withExtra none
 
 private def mkPairU32Alloc (a b : Nat) : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree) :=
@@ -961,13 +1059,6 @@ private def mkPairU32IndirectState (body : CapturedMir) (a b : Nat) : AnnealStep
   mkLmMiriState body u32MirTy
     #[⟨.live (.immediate .uninit), some (translateTyOverlay u32MirTy emptyLayoutTable)⟩,
       ⟨.live (.indirect mp), some pairLay⟩] mach
-
-/-- Two-node vendored Tree Borrows tree over the 4 bytes of a `u32` local: root
-`retagParentTag` (`Unique`) with an accessed `Unique` child `retagChildTag`
-(`hooksTwoNodeTree .unique`, restricted to `[0, 4)`). -/
-private def lmU32ChildTree : Miri.TreeBorrows.BorrowTree :=
-  { hooksTwoNodeTree .unique with
-    locations := Miri.DataStructures.DedupRangeMap.new (Miri.ABI.Size.ofBytes 4) (hooksLocTree .unique) }
 
 private def lmU32Alloc11 : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree) :=
   match Miri.Memory.Allocation.fromBytes (Prov := AnnealProv) #[11, 0, 0, 0] lmAlign4 .Mut with
@@ -1064,6 +1155,20 @@ def v4ShallowInitBoxLoweredMiriBody : Miri.MIR.Body :=
       statements := #[{
         sourceInfo := defaultSourceInfo,
         kind := .Assign ⟨0, #[]⟩ (.Cast .Transmute (.Copy ⟨1, #[]⟩) (encodeTyId boxU32MirTy)) }],
+      terminator := { sourceInfo := defaultSourceInfo, kind := .Return },
+      cleanup := false }] }
+
+/-- **V4 (`Rvalue.shallowInitBox`) Distinct Secondary Lowered Miri Body**: lowers
+`v4ShallowInitBoxDistinctOkMir` (`*mut u32 → Box<u64>`) to `.Cast .Transmute` targeting
+`boxU64MirTy` on an 8-byte uninitialized allocation (`lmAid5` at `1024`), producing a
+genuinely distinct `okSecondary` outcome (`lmObsPtr5 ≠ lmObsPtr2`). -/
+def v4ShallowInitBoxDistinctLoweredMiriBody : Miri.MIR.Body :=
+  let base := translateBody v4ShallowInitBoxDistinctOkMir
+  { base with
+    basicBlocks := #[{
+      statements := #[{
+        sourceInfo := defaultSourceInfo,
+        kind := .Assign ⟨0, #[]⟩ (.Cast .Transmute (.Copy ⟨1, #[]⟩) (encodeTyId boxU64MirTy)) }],
       terminator := { sourceInfo := defaultSourceInfo, kind := .Return },
       cleanup := false }] }
 
@@ -1561,6 +1666,195 @@ theorem lm_v8_aggregateClosure_comprehensive_witness :
   refine ⟨by decide +kernel, runMiriSteps_v8ClosureCap_ok false,
           by decide +kernel, by decide +kernel⟩
 
+/-! ## §3b. Universal Trusted ↔ Vendored LeanMiri Step & Lowering Theorems (`V1`–`V8`) -/
+
+/-- **V1 & V2 Universal Simulation under `annealStepHooksDropBinderSubtype`**:
+for EVERY `CapturedMir` body, `treeBorrows : Bool`, `StateRel`-coupled state `(s, m)`,
+`StatementKind.coverage` and `StatementKind.backwardIncompatibleDropHint` step in
+lockstep between Trusted `stepMirFn` and vendored `Miri.Interpreter.Step.step` under
+`annealStepHooksDropBinderSubtype`. -/
+theorem lm_v1_v2_overlay_universal_sim {body : CapturedMir} (treeBorrows : Bool)
+    {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRel body s m) (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {stmt : Statement}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some stmt) :
+    (stmt.kind = .coverage →
+      StepRel body m (stepMirFn body s)
+        (Miri.Interpreter.Step.step (annealStepHooksDropBinderSubtype body treeBorrows) () m)) ∧
+    (∀ place, stmt.kind = .backwardIncompatibleDropHint place →
+      StepRel body m (stepMirFn body s)
+        (Miri.Interpreter.Step.step (annealStepHooksDropBinderSubtype body treeBorrows) () m)) :=
+  ⟨fun hk => step_coverage_simulation (annealStepHooksDropBinderSubtype body treeBorrows) hstate hphase hbb hstmt hk,
+   fun place hk => step_backwardIncompatibleDropHint_simulation (annealStepHooksDropBinderSubtype body treeBorrows) hstate hphase place hbb hstmt hk⟩
+
+/-- **V3 Universal Dead-Local `TerminatorKind.drop` UB Equivalence under `annealEvalDropOverlay`**:
+for EVERY `decls`, `layouts`, `treeBorrows : Bool`, `place`, `target`, `unwind`, and
+`state` whose active frame maps `place.localId` to `.dead`, `annealEvalDropOverlay`
+faults with `.undefinedBehavior "drop of dead local"` (matching Trusted `evalTerminator`). -/
+theorem lm_v3_drop_dead_ub_overlay_universal (decls : List LocalDecl) (layouts : LayoutTable)
+    (treeBorrows : Bool) (place : Miri.MIR.Place) (target : Miri.MIR.BasicBlockId)
+    (unwind : Miri.MIR.UnwindAction) (state : AnnealStepState)
+    (frame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+    (lay? : Option Miri.Interpreter.LocalLayout)
+    (hcf : state.stack.currentFrame? = some frame)
+    (hdead : frame.getLocal place.localId = .ok ⟨.dead, lay?⟩) :
+    annealEvalDropOverlay decls layouts treeBorrows place target unwind state =
+      (state, .error (.undefinedBehavior "drop of dead local")) := by
+  unfold annealEvalDropOverlay annealEvalDropLM4_1
+  simp only [hcf, hdead, ite_self]
+
+/-- **V4 Trusted Lowering Justification (`trusted_shallowInitBox_eq_transmute_on_rawPtr`)**:
+justifies LeanMiri's `.Cast .Transmute` lowering of `Rvalue.shallowInitBox` directly in
+Trusted `MirSemantics.evalRvalue`! For EVERY `locals`, `op`, `mem`, `decls`, `aid`,
+`contentTy`, `srcInt`, and `boxInt`, whenever `op` evaluates to a base pointer
+`{ allocId := aid, offsetBytes := 0 }` of width 8 and static raw-pointer type
+`*mut <srcInt>`, `evalRvalue ... (.shallowInitBox op contentTy)` is IDENTICALLY EQUAL
+to `evalRvalue ... (.cast .transmute op (*mut <boxInt>))`! -/
+theorem trusted_shallowInitBox_eq_transmute_on_rawPtr
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (decls : List LocalDecl) (contentTy : Ty) (srcInt boxInt : UintTy) (aid : Nat) :
+    let srcTy : Ty := { kind := .rawPtr .mut (.uint srcInt), layoutIdx := 0 }
+    let boxTy : Ty := { kind := .rawPtr .mut (.uint boxInt), layoutIdx := 0 }
+    let p : ProvenancePtr := { allocId := aid, offsetBytes := 0 }
+    evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals decls mem.callStack =
+      .ok (.ptr p 8) locals' →
+    evalUseRvalue locals op mem decls emptyLayoutTable = .ok (.ptr p 8) locals' mem →
+    operandTy decls emptyLayoutTable op = some srcTy →
+    resolveTyWithLocalDecls decls emptyLayoutTable boxTy = boxTy →
+    resolveByteCastSrcTyAndSize decls emptyLayoutTable op srcTy = some (srcTy, 8) →
+    evalRvalue locals (.shallowInitBox op contentTy) mem decls emptyLayoutTable =
+      evalRvalue locals (.cast .transmute op boxTy) mem decls emptyLayoutTable := by
+  intro srcTy boxTy p hOp hUse hSrcTy hResD hSrcSz
+  have hShallow : evalRvalue locals (.shallowInitBox op contentTy) mem decls emptyLayoutTable =
+      .ok (.ptr p 8) locals' mem := by
+    show evalShallowInitBox locals op contentTy mem decls emptyLayoutTable = _
+    unfold evalShallowInitBox
+    simp only [hUse, hSrcTy, srcTy, layoutPointerBytes, emptyLayoutTable]
+  have hTrans : evalRvalue locals (.cast .transmute op boxTy) mem decls emptyLayoutTable =
+      .ok (.ptr p 8) locals' mem := by
+    have hDstSz : tyByteSize decls emptyLayoutTable boxTy = some 8 := by
+      unfold tyByteSize tyByteSizeAndAlignAux; rw [hResD]
+    have hEnc : encodeByteCastSourceBytes emptyLayoutTable srcTy (.ptr p 8) =
+        some (encodeLittleEndianBytes 0 8 (some (p.allocId, p.tag))) := rfl
+    have hLen : length (encodeLittleEndianBytes 0 8 (some (p.allocId, p.tag))) = 8 := rfl
+    have hDecAux : ∀ bs, length bs = 8 →
+        decodeLittleEndianBytes bs = some (0, some (p.allocId, p.tag)) →
+        abstractBytesUniformProv bs = true →
+        decodePtrBytesNoForge false (.uint boxInt) 8 bs = some (.ptr p 8) := by
+      intro bs hl hd hu
+      unfold decodePtrBytesNoForge decodeScalarBytes
+      dsimp only
+      rw [hl, hd, hu]
+    have hDec : decodeTypedValueFromBytes defaultCodecFuel emptyLayoutTable boxTy
+        (encodeLittleEndianBytes 0 8 (some (p.allocId, p.tag))) = some (.ptr p 8) := by
+      change decodePtrBytesNoForge false (.uint boxInt) 8
+        (encodeLittleEndianBytes 0 8 (some (p.allocId, p.tag))) = some (.ptr p 8)
+      refine hDecAux _ hLen rfl ?_
+      unfold abstractBytesUniformProv
+      change abstractBytesAllProvAux aid p.tag (encodeLittleEndianBytes 0 7 (some (aid, p.tag))) = true
+      have hProv : ∀ n, abstractBytesAllProvAux aid p.tag
+          (encodeLittleEndianBytes 0 n (some (aid, p.tag))) = true := by
+        intro n
+        induction n with
+        | zero => rfl
+        | succ k ih =>
+          unfold encodeLittleEndianBytes abstractBytesAllProvAux
+          simp only [Nat.beq_refl, Bool.and_self]
+          exact ih
+      exact hProv 7
+    show evalByteCast locals op boxTy mem decls emptyLayoutTable = _
+    unfold evalByteCast
+    simp only [hOp, hResD, hDstSz, hSrcTy, hSrcSz, Nat.beq_refl, hEnc, hLen, hDec]
+  rw [hShallow, hTrans]
+
+/-- **V4 Base-Translator Removal Boundary (`lm_v4_base_translate_unsupported`)**:
+unmodified `LeanMiriSpec.Translate.translateRvalue` maps EVERY `Rvalue.shallowInitBox`
+to `.Use (.Constant (untranslatableConstOperand contentTy)) .No`, documenting the
+pinned-rustc MIR removal boundary before lowering to `.Cast .Transmute`. -/
+theorem lm_v4_base_translate_unsupported (op : Operand) (contentTy : Ty) :
+    translateRvalue (.shallowInitBox op contentTy) =
+      .Use (.Constant (untranslatableConstOperand contentTy)) .No := rfl
+
+/-- **V5 Universal `Rvalue.WrapUnsafeBinder` Unfolding (`lm_v5_wrapUnsafeBinder_evalRvalue_universal`)**:
+for EVERY `RvalueHooks`, `choice`, `operand`, `ty`, and `place`, unmodified vendored
+`Miri.Interpreter.evalRvalueIntoPlace` evaluates `.WrapUnsafeBinder` strictly via
+`evalPlace _ _ true`, `evalOperandAt`, and `copyOpAllowTransmute` (matching Trusted's
+layout-preserving transmute + validity range check). -/
+theorem lm_v5_wrapUnsafeBinder_evalRvalue_universal {P S C V : Type} [Miri.Memory.PointerProvenance P]
+    (h : Miri.Interpreter.RvalueHooks P S C V) (choice : C)
+    (operand : Miri.MIR.Operand) (ty : Miri.MIR.TyId) (place : Miri.MIR.Place) :
+    Miri.Interpreter.evalRvalueIntoPlace h choice (.WrapUnsafeBinder operand ty) place =
+      (do
+        let dest ← h.evalPlace choice place true
+        let op ← h.evalOperandAt choice (Miri.Interpreter.OperandPath.rvalue "operand") operand none
+        h.copyOpAllowTransmute choice op dest) := rfl
+
+/-- **V7 Universal `AggregateKind.RawPtr` Behavioral Step Law (`lm_v7_writeAggregate_rawPtr_universal`)**:
+for EVERY `AggregateHooks`, `choice`, `pointee`, `mut_`, `dataOp`, `metaOp`, `dest`, and
+state `st`, unmodified vendored `Miri.Interpreter.writeAggregate` on `.RawPtr` evaluates
+`dataOp` -> `readPointer`, evaluates `metaOp` -> thin (`MemPlaceMeta.none` when
+`isZst = true`) vs. wide (`.metadata (← readScalar ...)` when `isZst = false`),
+constructs the pointer via `Immediate.newPointerWithMeta`, and commits via `copyOp`! -/
+theorem lm_v7_writeAggregate_rawPtr_universal {P S C V : Type} [Miri.Memory.PointerProvenance P]
+    (h : Miri.Interpreter.AggregateHooks P S C V) (choice : C)
+    (pointee : Miri.MIR.TyId) (mut_ : Miri.MIR.Mutability)
+    (dataOp metaOp : Miri.MIR.Operand) (dest : V) (st st1 st2 st3 st4 : S)
+    (dOpTy mOpTy : Miri.Interpreter.OpTy P) (ptr : Miri.Memory.Pointer (Option P))
+    (imm : Miri.Interpreter.Immediate P)
+    (hEvalD : h.evalOperandAt choice (Miri.Interpreter.OperandPath.aggregate 0) dataOp none st = .ok dOpTy st1)
+    (hReadP : h.readPointer choice dOpTy st1 = .ok ptr st2)
+    (hEvalM : h.evalOperandAt choice (Miri.Interpreter.OperandPath.aggregate 1) metaOp none st2 = .ok mOpTy st3) :
+    (mOpTy.layout.layout.isZst = true →
+      Miri.Interpreter.Immediate.newPointerWithMeta ptr Miri.Interpreter.MemPlaceMeta.none h.target = .ok imm →
+      Miri.Interpreter.writeAggregate h choice (.RawPtr pointee mut_) #[dataOp, metaOp] dest st =
+        h.copyOp choice ⟨.immediate imm, h.placeLayout dest⟩ dest st3) ∧
+    (∀ sc, mOpTy.layout.layout.isZst = false →
+      h.readScalar choice mOpTy st3 = .ok sc st4 →
+      Miri.Interpreter.Immediate.newPointerWithMeta ptr (.metadata sc) h.target = .ok imm →
+      Miri.Interpreter.writeAggregate h choice (.RawPtr pointee mut_) #[dataOp, metaOp] dest st =
+        h.copyOp choice ⟨.immediate imm, h.placeLayout dest⟩ dest st4) := by
+  have hsz : ((#[dataOp, metaOp]).size != 2) = false := rfl
+  have h0 : (#[dataOp, metaOp])[0]? = some dataOp := rfl
+  have h1 : (#[dataOp, metaOp])[1]? = some metaOp := rfl
+  refine ⟨?_, ?_⟩
+  · intro hZst hNew
+    unfold Miri.Interpreter.writeAggregate
+    simp only [hsz, h0, h1, Bool.false_eq_true, ↓reduceIte, bind, EStateM.bind, pure, EStateM.pure,
+               hEvalD, hReadP, hEvalM, hZst, hNew]
+    cases h.copyOp choice ⟨.immediate imm, h.placeLayout dest⟩ dest st3 with
+    | ok u s => cases u; rfl
+    | error e s => rfl
+  · intro sc hNz hReadS hNew
+    unfold Miri.Interpreter.writeAggregate
+    simp only [hsz, h0, h1, Bool.false_eq_true, ↓reduceIte, bind, EStateM.bind, pure, EStateM.pure,
+               hEvalD, hReadP, hEvalM, hNz, hReadS, hNew]
+    cases h.copyOp choice ⟨.immediate imm, h.placeLayout dest⟩ dest st4 with
+    | ok u s => cases u; rfl
+    | error e s => rfl
+
+/-- **V8 Universal `AggregateKind.Closure` Overlay Simulation (`lm_v8_closure_overlay_universal`)**:
+directly lifts `c10_closure_rvalue_and_writeAggregate_simulation` to Episode 2's
+`annealRvalueHooksDropBinderSubtype`: Trusted `evalRvalue ... (.aggregate (.closure dp) ops)`
+and vendored `Miri.Interpreter.writeAggregate` on `.Closure` coincide with `.Tuple` under
+`annealAggregateHooksUnwindFnPtrClosure` and succeed on ZST closures. -/
+theorem lm_v8_closure_overlay_universal (body : CapturedMir) (fnPtrs : List FnPtrEntry)
+    (locals : List LocalSlot) (defPath : DefPath) (ops : List Operand) (mem : Memory)
+    (defId : Miri.MIR.DefId) (args : Array Miri.MIR.GenericArg) (mops : Array Miri.MIR.Operand)
+    (dest : Miri.Interpreter.RuntimePlace AnnealProv) (st : AnnealStepState)
+    (hfields : dest.layout.layout.fields = .Arbitrary #[] #[])
+    (hmem : ∀ f l o id, dest.ref = .local f l o id →
+      ∃ tf ov, st.stack.currentFrame? = some tf ∧ tf.getLocalOperand l = .ok ov) :
+    (annealRvalueHooksDropBinderSubtype body fnPtrs).writeAggregate () (.Closure defId args) mops dest =
+      Miri.Interpreter.writeAggregate (annealAggregateHooksUnwindFnPtrClosure body.localDecls body.layouts)
+        () .Tuple mops dest ∧
+    (annealRvalueHooksDropBinderSubtype body fnPtrs).writeAggregate () (.Closure defId args) #[] dest st =
+      .ok () st := by
+  have h := c10_closure_rvalue_and_writeAggregate_simulation locals defPath ops mem
+    body.localDecls body.layouts defId args mops dest st hfields hmem
+  dsimp only [annealRvalueHooksDropBinderSubtype, annealRvalueHooksUnwindFnPtrClosure]
+  exact ⟨h.2.1, h.2.2⟩
+
 /-! ## §4. Canonical Executable LeanMiri Corpus Observation (`ep2LmObserve`) -/
 
 /-- Authority-typed LeanMiri observation produced directly by stepping unmodified
@@ -1640,8 +1934,8 @@ def ep2LmObserve (protectedMode : Bool) (variantIdx : Nat) (caseIdx : Nat) : Ep2
   | 2, 3 =>
     toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v3DropProtectedMir protectedMode) 8
       (mkTbDropMiriState v3DropProtectedMir true)
-  -- 3: shallowInitBox (lowered .Cast .Transmute on uninit pointee allocation)
-  | 3, 0 | 3, 1 =>
+  -- 3: shallowInitBox (lowered .Cast .Transmute on uninit pointee allocation; distinct okPrimary vs. okSecondary!)
+  | 3, 0 =>
     let mach : AnnealMachine :=
       { memory := { AnnealMachine.empty.memory with live := #[(lmAid2, ⟨.stack, lmUninit4Alloc⟩)] },
         addresses := { AnnealMachine.empty.addresses with baseAddr := #[⟨lmAid2, lmBase2⟩] },
@@ -1653,6 +1947,18 @@ def ep2LmObserve (protectedMode : Bool) (variantIdx : Nat) (caseIdx : Nat) : Ep2
         #[⟨.live (.immediate .uninit), boxLay⟩,
           ⟨.live (.immediate (.scalar (lmPtrScalar lmAid2 lmBase2))), rawLay⟩]
         mach (some v4ShallowInitBoxLoweredMiriBody))
+  | 3, 1 =>
+    let mach : AnnealMachine :=
+      { memory := { AnnealMachine.empty.memory with live := #[(lmAid5, ⟨.stack, lmUninit8Alloc⟩)] },
+        addresses := { AnnealMachine.empty.addresses with baseAddr := #[⟨lmAid5, lmBase5⟩] },
+        borrowTracker := none }
+    let boxLay := some (translateTyOverlay boxU64MirTy emptyLayoutTable)
+    let rawLay := some (translateTyOverlay rawMutU32MirTy emptyLayoutTable)
+    toLmObs <| runMiriSteps (annealStepHooksDropBinderSubtype v4ShallowInitBoxDistinctOkMir protectedMode) 8
+      (mkLmMiriState v4ShallowInitBoxDistinctOkMir boxU64MirTy
+        #[⟨.live (.immediate .uninit), boxLay⟩,
+          ⟨.live (.immediate (.scalar (lmPtrScalar lmAid5 lmBase5))), rawLay⟩]
+        mach (some v4ShallowInitBoxDistinctLoweredMiriBody))
   | 3, 2 =>
     let boxLay := some (translateTyOverlay boxU32MirTy emptyLayoutTable)
     let rawLay := some (translateTyOverlay rawMutU8MirTy emptyLayoutTable)

@@ -92,8 +92,15 @@ open MiniRustSpec.UnwindSetDiscrAndFnPtrMR
 @[reducible] def boxU32MrTy : Gen.Type :=
   .Ptr (.Box (intPointeeInfo u32))
 
+/-- MiniRust `Box<u64>` safe pointer type (`PointeeInfo` sized 8, align 8, inhabited, freeze, unpin). -/
+@[reducible] def boxU64MrTy : Gen.Type :=
+  .Ptr (.Box (intPointeeInfo IntType.usize_ty))
+
 /-- Anneal `Box<u32>` MIR representation (`*mut u32` / `alloc::boxed::Box` thin raw pointer). -/
 @[reducible] def boxU32MirTy : MirAst.Ty := { kind := .rawPtr .mut (.uint .u32), layoutIdx := 0 }
+
+/-- Anneal `Box<u64>` MIR representation (`*mut u64` thin raw pointer, distinct pointee/contentTy for `V4.okSecondary`). -/
+@[reducible] def boxU64MirTy : MirAst.Ty := { kind := .rawPtr .mut (.uint .u64), layoutIdx := 0 }
 
 /-- Anneal `*mut u8` raw pointer MIR type (rustc's `ShallowInitBox` input operand type). -/
 @[reducible] def rawMutU8MirTy : MirAst.Ty := { kind := .rawPtr .mut (.uint .u8), layoutIdx := 0 }
@@ -1309,6 +1316,32 @@ def v4ShallowInitBoxOkMir : CapturedMir :=
   mkMirBody "ep2::v4_shallow_init_box_ok" [mkDecl boxU32MirTy, mkDecl rawMutU8MirTy] 1
     [mkBb [mkSt (.assign (locPlace 0) (.shallowInitBox (.copy (locPlace 1)) u32MirTy))] .return_]
 
+/-- V4 distinct secondary positive body: `shallowInitBox` on `*mut u32` -> `Box<u64>`
+(distinct source pointee, distinct `contentTy`, and distinct allocation `5` / address `1024`). -/
+def v4ShallowInitBoxDistinctOkMir : CapturedMir :=
+  mkMirBody "ep2::v4_shallow_init_box_distinct_ok" [mkDecl boxU64MirTy, mkDecl rawMutU32MirTy] 1
+    [mkBb [mkSt (.assign (locPlace 0) (.shallowInitBox (.copy (locPlace 1)) u64MirTy))] .return_]
+
+/-- MiniRust machine for `v4ShallowInitBoxDistinctOkMir`: converts a `*mut u32` pointing
+to an uninitialized 8-byte allocation `5` at `1024` into `Box<u64>` (`boxU64MrTy`) without
+reading or writing allocation `5`! -/
+def v4ShallowInitBoxDistinctMach : Mach :=
+  let fn := mkMrFn [(localName 0, boxU64MrTy), (localName 1, thinRawPtrTy)] [localName 1] (localName 0)
+    [(bbName 0, ⟨[.Assign (.Local (localName 0))
+                    (.UnOp (.Cast (.Transmute boxU64MrTy)) (.Load (.Local (localName 1))))],
+                 .Return, .Regular⟩)]
+  let locs : List (Gen.LocalName × Ptr) :=
+    [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+     (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) })]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 8 .Uninit) 8,
+     mkStackAlloc 256 (ptrBytes 1024 (some (⟨5⟩, ()))) 8,
+     mkStackAlloc 384 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 512 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 768 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 1024 (List.replicate 8 .Uninit) 8]
+    [mkRootFrame fn locs]
+
 /-- V4 non-raw-ptr fail-closed `.unsupported` body (`u64` operand). -/
 def v4ShallowInitBoxNonPtrUnsupMir : CapturedMir :=
   mkMirBody "ep2::v4_shallow_init_box_nonptr_unsup" [mkDecl boxU32MirTy, mkDecl u64MirTy] 1
@@ -1970,6 +2003,244 @@ abbrev v8_closure_assign_coupled_lockstep_and_wfLive := @closure_assign_coupled_
 /-- V8 concrete witness suite re-export (`Mach` & `MachTB`). -/
 abbrev v8_closure_comprehensive_witness := @c10_closure_zst_capture_and_ub_three_way_witness
 
+/-! ## §8b. Value-Coupled (`Ep2ValRel`) Universal Simulations Across `Mach` & `MachTB`
+
+Closes the value-relation link between Trusted `MirSemantics.Value` (including
+`ProvenancePtr.allocId` / `offsetBytes`, wide metadata, scalars, and aggregates)
+and MiniRust `Gen.Value M` (`BasicMemory` and `TreeBorrowsMemory`) via a single
+allocation base-address map `allocBase : Nat → Nat` and provenance allocator ID
+projection `provAllocId : Gen.Memory.Provenance M → Nat`. -/
+
+mutual
+/-- Value-coupling relation directly linking Trusted `MirSemantics.Value` to
+MiniRust `Gen.Value M` across both `BasicMemory` (`BM`) and `TreeBorrowsMemory` (`TBM`). -/
+inductive Ep2ValRel {M : Type} [Gen.Memory M]
+    (allocBase : Nat → Nat) (provAllocId : Gen.Memory.Provenance M → Nat) :
+    MirSemantics.Value → Gen.Value M → Prop where
+  | scalar (bits sz : Nat) :
+      Ep2ValRel allocBase provAllocId (.scalar ⟨bits, sz⟩) (.Int (Int.ofNat bits))
+  | unit :
+      Ep2ValRel allocBase provAllocId .unit (.Tuple [])
+  | thinPtr (p : ProvenancePtr) (addr : Nat) (prov : Option (Gen.Memory.Provenance M))
+      (hAddr : addr = allocBase p.allocId + p.offsetBytes)
+      (hProv : prov.map provAllocId = some p.allocId) :
+      Ep2ValRel allocBase provAllocId (.ptr p 8)
+        (.Ptr (ThinPointer.widen { addr := addr, provenance := prov } none))
+  | widePtr (p : ProvenancePtr) (metaVal : Nat) (addr : Nat) (prov : Option (Gen.Memory.Provenance M))
+      (hAddr : addr = allocBase p.allocId + p.offsetBytes)
+      (hProv : prov.map provAllocId = some p.allocId) :
+      Ep2ValRel allocBase provAllocId (.aggregate 0 [.ptr p 8, .scalar ⟨metaVal, 8⟩])
+        (mrWidePtrValM (M := M) { addr := addr, provenance := prov } (Int.ofNat metaVal))
+  | aggregate (variant : Nat) (vs : List MirSemantics.Value) (mvs : List (Gen.Value M))
+      (hFields : Ep2ValListRel allocBase provAllocId vs mvs) :
+      Ep2ValRel allocBase provAllocId (.aggregate variant vs) (.Tuple mvs)
+
+inductive Ep2ValListRel {M : Type} [Gen.Memory M]
+    (allocBase : Nat → Nat) (provAllocId : Gen.Memory.Provenance M → Nat) :
+    List MirSemantics.Value → List (Gen.Value M) → Prop where
+  | nil : Ep2ValListRel allocBase provAllocId [] []
+  | cons {v vs mv mvs} :
+      Ep2ValRel allocBase provAllocId v mv →
+      Ep2ValListRel allocBase provAllocId vs mvs →
+      Ep2ValListRel allocBase provAllocId (v :: vs) (mv :: mvs)
+end
+
+/-- **V4 Value-Coupled Universal Simulation (`v4_shallowInitBox_coupled_valRel_sim`)**:
+for EVERY `M ∈ {BM, TBM}`, whenever a Trusted thin raw-pointer operand relates to
+a MiniRust thin pointer value via `Ep2ValRel allocBase provAllocId` (preserving
+exact `allocId`, `offsetBytes`, and base address), `evalRvalue (.shallowInitBox ..)`
+and `transmuteM ... thinRawPtrTy boxU32MrTy` produce outputs STILL related by
+`Ep2ValRel allocBase provAllocId`! -/
+theorem v4_shallowInitBox_coupled_valRel_sim {M : Type} [Gen.Memory M] [MemoryOps M]
+    (allocBase : Nat → Nat) (provAllocId : Gen.Memory.Provenance M → Nat)
+    (locals locals' : List LocalSlot) (op : MirAst.Operand) (contentTy : MirAst.Ty)
+    (mem mem' : MirSemantics.Memory) (decls : List MirAst.LocalDecl) (layouts : LayoutTable)
+    (hPtr8 : layoutPointerBytes layouts = 8)
+    (p : ProvenancePtr) (mv : Gen.Value M) (m : Gen.Machine M)
+    (hUse : evalUseRvalue locals op mem decls layouts = .ok (.ptr p 8) locals' mem')
+    (hOpTy : operandTy decls layouts op = none ∨
+      ∃ mu t li, operandTy decls layouts op = some { kind := .rawPtr mu t, layoutIdx := li })
+    (hRel : Ep2ValRel allocBase provAllocId (.ptr p 8) mv)
+    (hAddr : allocBase p.allocId + p.offsetBytes < 2 ^ 64)
+    (hNonNull : allocBase p.allocId + p.offsetBytes ≠ 0)
+    (hAlign : (allocBase p.allocId + p.offsetBytes) % 4 = 0)
+    (hDer : ∀ prov, prov.map provAllocId = some p.allocId →
+      ConcurrentMemory.dereferenceable m.mem
+        { addr := allocBase p.allocId + p.offsetBytes, provenance := prov } ⟨4⟩ = .ok ()) :
+    ∃ tv mv',
+      evalRvalue locals (.shallowInitBox op contentTy) mem decls layouts = .ok tv locals' mem' ∧
+      transmuteM (M := M) mv thinRawPtrTy boxU32MrTy (some m) = .ok mv' ∧
+      Ep2ValRel allocBase provAllocId tv mv' := by
+  cases hRel with
+  | thinPtr _ addr prov hA hP =>
+    subst hA
+    have hExh := v4_shallowInitBox_exhaustive locals op mem decls layouts
+    have hUse' : evalUseRvalue locals op mem decls layouts =
+        .ok (.ptr p (layoutPointerBytes layouts)) locals' mem' := by rw [hPtr8]; exact hUse
+    have hTr : evalRvalue locals (.shallowInitBox op contentTy) mem decls layouts =
+        .ok (.ptr p 8) locals' mem' := by
+      rw [← hPtr8]
+      rcases hOpTy with hNone | ⟨mu, t, li, hSome⟩
+      · exact hExh.2.2.1 contentTy p locals' mem' hUse' hNone
+      · exact hExh.2.1 contentTy mu t li p locals' mem' hUse' hSome
+    refine ⟨.ptr p 8, .Ptr (ThinPointer.widen { addr := allocBase p.allocId + p.offsetBytes, provenance := prov } none),
+      hTr,
+      transmuteM_thinRawPtr_to_boxU32 (M := M) (allocBase p.allocId + p.offsetBytes) hAddr hNonNull hAlign prov m (hDer prov hP),
+      .thinPtr p (allocBase p.allocId + p.offsetBytes) prov rfl hP⟩
+
+/-- **V5 & V6 Value-Coupled Universal Scalar/Pointer Simulation (`v5_v6_binder_and_subtype_coupled_valRel_sim`)**:
+for EVERY `M ∈ {BM, TBM}`, whenever a Trusted scalar operand relates to a MiniRust
+`.Int` value via `Ep2ValRel`, `Rvalue.wrapUnsafeBinder`, `CastKind.subtype`, and
+`CastKind.transmute` produce outputs related by `Ep2ValRel` to MiniRust's
+`transmuteM` (identity on same-width valid scalars, preserving exact bits)! -/
+theorem v5_v6_binder_and_subtype_coupled_valRel_sim {M : Type} [Gen.Memory M] [MemoryOps M]
+    (allocBase : Nat → Nat) (provAllocId : Gen.Memory.Provenance M → Nat)
+    (locals locals' : List LocalSlot) (op : MirAst.Operand)
+    (mem : MirSemantics.Memory) (decls : List MirAst.LocalDecl)
+    (bits : Nat) (hBits : bits < 2 ^ 32) (mv : Gen.Value M) (m : Option (Gen.Machine M))
+    (hOp : evalOperand locals op mem.borrows mem.globals emptyLayoutTable mem.callerLocals decls mem.callStack =
+      .ok (.scalar ⟨bits, 4⟩) locals')
+    (hUse : evalUseRvalue locals op mem decls emptyLayoutTable = .ok (.scalar ⟨bits, 4⟩) locals' mem)
+    (hRel : Ep2ValRel allocBase provAllocId (.scalar ⟨bits, 4⟩) mv)
+    (hSrcTy : operandTy decls emptyLayoutTable op = some u32MirTy)
+    (hResD : resolveTyWithLocalDecls decls emptyLayoutTable u32MirTy = u32MirTy)
+    (hSrcSz : resolveByteCastSrcTyAndSize decls emptyLayoutTable op u32MirTy = some (u32MirTy, 4)) :
+    ∃ tv mv',
+      evalRvalue locals (.wrapUnsafeBinder op u32MirTy) mem decls emptyLayoutTable = .ok tv locals' mem ∧
+      evalRvalue locals (.cast .subtype op u32MirTy) mem decls emptyLayoutTable = .ok tv locals' mem ∧
+      evalRvalue locals (.cast .transmute op u32MirTy) mem decls emptyLayoutTable = .ok tv locals' mem ∧
+      transmuteM (M := M) mv u32MrTy u32MrTy m = .ok mv' ∧
+      Ep2ValRel allocBase provAllocId tv mv' := by
+  cases hRel with
+  | scalar _ _ =>
+    have hWrap : evalRvalue locals (.wrapUnsafeBinder op u32MirTy) mem decls emptyLayoutTable =
+        .ok (.scalar ⟨bits, 4⟩) locals' mem := by
+      show evalWrapUnsafeBinder locals op u32MirTy mem decls emptyLayoutTable = _
+      have hBnd : binderStructLayout? decls emptyLayoutTable u32MirTy = none := rfl
+      have hRes : resolvedTyLayout? decls emptyLayoutTable u32MirTy = none := by
+        unfold resolvedTyLayout?
+        rw [hResD]
+      unfold evalWrapUnsafeBinder
+      simp only [hUse, hBnd, hRes]
+    have hCast : evalRvalue locals (.cast .subtype op u32MirTy) mem decls emptyLayoutTable =
+        .ok (.scalar ⟨bits, 4⟩) locals' mem := by
+      have hEnc : encodeByteCastSourceBytes emptyLayoutTable u32MirTy (.scalar ⟨bits, 4⟩) =
+          some (encodeLittleEndianBytes bits 4 none) := rfl
+      have hLen : length (encodeLittleEndianBytes bits 4 none) = 4 := encodeLittleEndianBytes_len bits 4 none
+      have hDecAux : ∀ bs, length bs = 4 → decodeLittleEndianBytes bs = some (bits, none) →
+          decodeValueFromBytes 16 emptyLayoutTable u32MirTy bs = some (.scalar ⟨bits, 4⟩) := by
+        intro bs hl hd; unfold decodeValueFromBytes decodeScalarBytes; simp [u32MirTy, hl, hd]; rfl
+      have hDec : decodeTypedValueFromBytes defaultCodecFuel emptyLayoutTable u32MirTy
+          (encodeLittleEndianBytes bits 4 none) = some (.scalar ⟨bits, 4⟩) :=
+        hDecAux _ hLen (by
+          rw [decodeLittleEndianBytes_encode, show 256 ^ 4 = 2 ^ 32 by decide, Nat.mod_eq_of_lt hBits]; rfl)
+      have hDstSz : tyByteSize decls emptyLayoutTable u32MirTy = some 4 := by
+        unfold tyByteSize tyByteSizeAndAlignAux; rw [hResD]; rfl
+      show evalByteCast locals op u32MirTy mem decls emptyLayoutTable = _
+      unfold evalByteCast
+      simp only [hOp, hResD, hDstSz, hSrcTy, hSrcSz, Nat.beq_refl, hEnc, hLen, hDec]
+    have hMr : transmuteM (M := M) (.Int (Int.ofNat bits)) u32MrTy u32MrTy m =
+        .ok (.Int (Int.ofNat bits)) :=
+      transmuteM_int_sameSize (M := M) u32 u32 rfl (by decide) ⟨4⟩ rfl rfl bits hBits m
+    exact ⟨.scalar ⟨bits, 4⟩, .Int (Int.ofNat bits), hWrap, hCast, hCast, hMr, .scalar bits 4⟩
+
+/-- **V7 Value-Coupled Universal Thin & Wide `AggregateKind.rawPtr` + Episode 1 `UnOp.GetMetadata`
+Simulation (`v7_rawPtr_coupled_valRel_sim`)**: for EVERY `M ∈ {BM, TBM}`, whenever
+Trusted data pointer `p` and metadata (`unit` for thin, `usize` `len` for wide)
+relate to MiniRust values via `Ep2ValRel`, BOTH thin and wide `AggregateKind.rawPtr`
+construction (via `transmuteM`) AND Episode 1's `UnOp.GetMetadata` preserve
+`Ep2ValRel` with exact `allocId`, `offsetBytes`, and metadata length! -/
+theorem v7_rawPtr_coupled_valRel_sim {M : Type} [Gen.Memory M] [MemoryOps M]
+    (allocBase : Nat → Nat) (provAllocId : Gen.Memory.Provenance M → Nat) :
+    (∀ (locals locals' : List LocalSlot) (dOp mOp : MirAst.Operand)
+        (ptee : MirAst.Ty) (mut_ : MirAst.Mutability) (mem : MirSemantics.Memory)
+        (decls : List MirAst.LocalDecl)
+        (p : ProvenancePtr) (md mv : Gen.Value M) (m : Option (Gen.Machine M)),
+      isUnsizedRawPtrPointee ptee = false →
+      evalOperands locals [dOp, mOp] mem.borrows mem.globals emptyLayoutTable mem.callerLocals decls mem.callStack =
+        .ok [.ptr p 8, .unit] locals' →
+      Ep2ValRel allocBase provAllocId (.ptr p 8) md →
+      Ep2ValRel allocBase provAllocId .unit mv →
+      allocBase p.allocId + p.offsetBytes < 2 ^ 64 →
+      ∃ tv mv',
+        evalRvalue locals (.aggregate (.rawPtr ptee mut_) [dOp, mOp]) mem decls emptyLayoutTable = .ok tv locals' mem ∧
+        transmuteM (M := M) (.Tuple [md, mv]) mrRawPtrThinPairTy thinRawPtrTy m = .ok mv' ∧
+        Ep2ValRel allocBase provAllocId tv mv') ∧
+    (∀ (locals locals' : List LocalSlot) (dOp mOp : MirAst.Operand)
+        (ptee : MirAst.Ty) (mut_ : MirAst.Mutability) (mem : MirSemantics.Memory)
+        (decls : List MirAst.LocalDecl)
+        (p : ProvenancePtr) (len : Nat) (md mm : Gen.Value M) (m : Option (Gen.Machine M)),
+      wideAggregatePointeeIsDyn? ptee = some false →
+      evalOperands locals [dOp, mOp] mem.borrows mem.globals emptyLayoutTable mem.callerLocals decls mem.callStack =
+        .ok [.ptr p 8, .scalar ⟨len, 8⟩] locals' →
+      Ep2ValRel allocBase provAllocId (.ptr p 8) md →
+      Ep2ValRel allocBase provAllocId (.scalar ⟨len, 8⟩) mm →
+      allocBase p.allocId + p.offsetBytes < 2 ^ 64 →
+      len < 2 ^ 64 →
+      ∃ tv mv',
+        evalRvalue locals (.aggregate (.rawPtr ptee mut_) [dOp, mOp]) mem decls emptyLayoutTable = .ok tv locals' mem ∧
+        transmuteM (M := M) (.Tuple [md, mm]) mrRawPtrWidePairTy wideSlicePtrMrTy m = .ok mv' ∧
+        evalUnOpM (M := M) .GetMetadata (mv', wideSlicePtrMrTy) m = .ok (.Int (Int.ofNat len), usizeMrTy) ∧
+        Ep2ValRel allocBase provAllocId tv mv' ∧
+        Ep2ValRel allocBase provAllocId (.scalar ⟨len, 8⟩) (.Int (Int.ofNat len))) := by
+  refine ⟨?_, ?_⟩
+  · intro locals locals' dOp mOp ptee mut_ mem decls p md mv m hSized hOps hRelD hRelM hAddr
+    cases hRelD with
+    | thinPtr _ addr prov hA hP =>
+      cases hRelM with
+      | unit =>
+        subst hA
+        have hTr : evalRvalue locals (.aggregate (.rawPtr ptee mut_) [dOp, mOp]) mem decls emptyLayoutTable =
+            .ok (.ptr p 8) locals' mem := by
+          show evalAggregateRawPtr locals ptee [dOp, mOp] mem decls emptyLayoutTable = _
+          unfold evalAggregateRawPtr
+          simp only [hOps, layoutPointerBytes, emptyLayoutTable, hSized]
+        refine ⟨.ptr p 8, .Ptr (ThinPointer.widen { addr := allocBase p.allocId + p.offsetBytes, provenance := prov } none),
+          hTr,
+          transmuteM_rawPtrThinPair_to_thinRawPtr (M := M) (allocBase p.allocId + p.offsetBytes) hAddr prov m,
+          .thinPtr p (allocBase p.allocId + p.offsetBytes) prov rfl hP⟩
+  · intro locals locals' dOp mOp ptee mut_ mem decls p len md mm m hWide hOps hRelD hRelM hAddr hLen
+    cases hRelD with
+    | thinPtr _ addr prov hA hP =>
+      cases hRelM with
+      | scalar _ _ =>
+        subst hA
+        have hTr : evalRvalue locals (.aggregate (.rawPtr ptee mut_) [dOp, mOp]) mem decls emptyLayoutTable =
+            .ok (.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]) locals' mem := by
+          show evalAggregateRawPtr locals ptee [dOp, mOp] mem decls emptyLayoutTable = _
+          unfold evalAggregateRawPtr
+          simp only [hOps, layoutPointerBytes, emptyLayoutTable, hWide]
+          rfl
+        refine ⟨.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩],
+          mrWidePtrValM (M := M) { addr := allocBase p.allocId + p.offsetBytes, provenance := prov } (Int.ofNat len),
+          hTr,
+          transmuteM_rawPtrWidePair_to_wideSlicePtr (M := M) (allocBase p.allocId + p.offsetBytes) len hAddr hLen prov m,
+          (evalUnOpM_rawPtr_meta_size_align (M := M) (allocBase p.allocId + p.offsetBytes) len hAddr hLen prov m).2.2.2.2.1,
+          .widePtr p len (allocBase p.allocId + p.offsetBytes) prov rfl hP,
+          .scalar len 8⟩
+
+/-- **V8 Value-Coupled Universal `n`-Capture Closure Simulation (`v8_closure_coupled_valRel_sim`)**:
+for EVERY `M ∈ {BM, TBM}` and EVERY capture list `ops` whose evaluated Trusted
+upvars relate element-by-element to MiniRust tuple elements via
+`Ep2ValListRel allocBase provAllocId`, `AggregateKind.closure` and
+MiniRust `ValueExpr.Tuple` produce outputs related by `Ep2ValRel`! -/
+theorem v8_closure_coupled_valRel_sim {M : Type} [Gen.Memory M] [MemoryOps M]
+    (allocBase : Nat → Nat) (provAllocId : Gen.Memory.Provenance M → Nat)
+    (locals locals' : List LocalSlot) (dp : DefPath) (ops : List MirAst.Operand)
+    (vals : List MirSemantics.Value) (mem : MirSemantics.Memory) (decls : List MirAst.LocalDecl)
+    (layouts : LayoutTable) (m m' : Gen.Machine M) (es : List Gen.ValueExpr)
+    (mvals : List (Gen.Value M)) (mrClTy : Gen.Type)
+    (hOps : evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals decls mem.callStack = .ok vals locals')
+    (hEs : evalValuesM m es = .ok (mvals, m'))
+    (hRel : Ep2ValListRel allocBase provAllocId vals mvals) :
+    ∃ tv mv',
+      evalRvalue locals (.aggregate (.closure dp) ops) mem decls layouts = .ok tv locals' mem ∧
+      evalValueM m (.Tuple es mrClTy) = .ok ((mv', mrClTy), m') ∧
+      Ep2ValRel allocBase provAllocId tv mv' :=
+  have h := (closure_n_capture_lockstep_M (M := M) locals locals' dp ops vals mem decls layouts
+    m m' es mvals mrClTy).1 hOps hEs
+  ⟨.aggregate 0 vals, .Tuple mvals, h.2.2.1, h.2.2.2, .aggregate 0 vals mvals hRel⟩
+
 /-! ## §9. Canonical Executable MiniRust Corpus Observation Interface
 
 Directly executes `MiniRustSpec.Interp.{step, steps, stepTB, stepsTB}` for all 8
@@ -2055,7 +2326,7 @@ def ep2MrObserve (mode : Ep2MrMode) (v : Ep2Variant) (c : Ep2Case) : Ep2MrObs :=
   | .dropTerminator, .ubFault => runMrObs mode 2 0 v3DropDeadUbMach
   | .dropTerminator, .modeCase => runMrObs mode 4 0 v3DropProtectedMach
   | .shallowInitBox, .okPrimary => runMrObs mode 1 0 (v4ShallowInitBoxMach boxU32MrTy)
-  | .shallowInitBox, .okSecondary => runMrObs mode 1 0 (v4ShallowInitBoxMach thinRawPtrTy)
+  | .shallowInitBox, .okSecondary => runMrObs mode 1 0 v4ShallowInitBoxDistinctMach
   | .shallowInitBox, .ubFault => runMrObs mode 1 0 (v4ShallowInitBoxMach boxU32MrTy false true)
   | .shallowInitBox, .modeCase => runMrObs mode 1 0 (v4ShallowInitBoxMach boxU32MrTy true false)
   | .wrapUnsafeBinder, .okPrimary => runMrObs mode 2 0 (v5WrapRoundtripMach 73)
