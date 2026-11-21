@@ -10642,6 +10642,941 @@ theorem ep1_misaligned_downcast_zst_slice_and_multitag_witness :
   · refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> ep1_kernel_rfl
   · refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> ep1_kernel_rfl
 
+/-! ### `[adv B2]` `GetDiscriminant` is a sequence of memory loads: frame laws on every `Memory`,
+`BasicMemory` read-only-ness, Tree Borrows byte preservation, `Variant` well-formedness, and the
+tightness of the `Load ⇒ GetDiscriminant` address hypotheses -/
+
+mutual
+
+/-- `decodeDiscriminantM` preserves every invariant of the threaded state that each call of
+its accessor preserves (Audit-local counterpart of the private helper of
+`Correspondence.Pointers`). -/
+private theorem ep1_decodeDiscriminantM_inv {M : Type} [Gen.Memory M] {σ : Type} (P : σ → Prop)
+    {accessor : σ → Gen.Offset → Size →
+      Interp (List (Gen.AbstractByte (Gen.Memory.Provenance M)) × σ)}
+    (hacc : ∀ s offset sz bs s', P s → accessor s offset sz = .ok (bs, s') → P s') :
+    ∀ (d : Gen.Discriminator) (s s' : σ) (opt : Option Int),
+      P s → decodeDiscriminantM (M := M) accessor d s = .ok (opt, s') → P s'
+  | .Known _, s, s', opt, hs, h => by
+    unfold decodeDiscriminantM at h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (ep1_pure_ok h)
+    exact hs
+  | .Invalid, s, s', opt, hs, h => by
+    unfold decodeDiscriminantM at h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (ep1_pure_ok h)
+    exact hs
+  | .Branch offset valueType fallback ⟨children⟩, s, s', opt, hs, h => by
+    unfold decodeDiscriminantM at h
+    obtain ⟨⟨bs, s1⟩, ha, h⟩ := ep1_bind_ok h
+    have hs1 := hacc _ _ _ _ _ hs ha
+    obtain ⟨optv, _, h⟩ := ep1_bind_ok h
+    cases optv with
+    | none =>
+      obtain ⟨_, rfl⟩ := Prod.mk.inj (ep1_pure_ok h)
+      exact hs1
+    | some v =>
+      cases v with
+      | Int val =>
+        exact ep1_decodeDiscriminantChildrenM_inv P hacc val
+          (decodeDiscriminantM (M := M) accessor fallback)
+          (fun s0 s0' opt0 hs0 hfb => ep1_decodeDiscriminantM_inv P hacc fallback s0 s0' opt0 hs0 hfb)
+          children s1 s' opt hs1 h
+      | _ =>
+        obtain ⟨_, rfl⟩ := Prod.mk.inj (ep1_pure_ok h)
+        exact hs1
+
+private theorem ep1_decodeDiscriminantChildrenM_inv {M : Type} [Gen.Memory M] {σ : Type}
+    (P : σ → Prop)
+    {accessor : σ → Gen.Offset → Size →
+      Interp (List (Gen.AbstractByte (Gen.Memory.Provenance M)) × σ)}
+    (hacc : ∀ s offset sz bs s', P s → accessor s offset sz = .ok (bs, s') → P s')
+    (val : Int) (onFallback : σ → Interp (Option Int × σ))
+    (hfb : ∀ (s s' : σ) (opt : Option Int), P s → onFallback s = .ok (opt, s') → P s') :
+    ∀ (children : List ((Int × Int) × Gen.Discriminator)) (s s' : σ) (opt : Option Int),
+      P s → decodeDiscriminantChildrenM (M := M) accessor val onFallback children s = .ok (opt, s') →
+      P s'
+  | [], s, s', opt, hs, h => by
+    unfold decodeDiscriminantChildrenM at h
+    exact hfb s s' opt hs h
+  | ((start, end_), child) :: rest, s, s', opt, hs, h => by
+    unfold decodeDiscriminantChildrenM at h
+    split at h
+    · exact ep1_decodeDiscriminantM_inv P hacc child s s' opt hs h
+    · exact ep1_decodeDiscriminantChildrenM_inv P hacc val onFallback hfb rest s s' opt hs h
+
+end
+
+/-- **Frame law of `ValueExpr::GetDiscriminant` on every `Memory` `M`** ("value expression
+evaluation is reorderable and removable", `spec/lang/step/expressions.md`). A successful
+`GetDiscriminant` is `eval_place` followed by nothing but `Memory::load`s:
+
+* every machine field other than `mem` (program, threads and their frames and locals,
+  `intptrcast`, locks, global / function / vtable pointers, `stdout`, `stderr`, ...) is
+  exactly as `eval_place` left it;
+* the data-race access log only grows, by `Load` accesses with `Atomicity::None`;
+* the memory is related to the one after `eval_place` by **every** reflexive, transitive
+  relation `R` that `Memory::load` preserves.
+
+Instantiating `R` gives `BasicMemory` read-only-ness and Tree Borrows byte preservation
+below. -/
+theorem ep1_evalValueM_getDiscriminant_frame {M : Type} [Gen.Memory M] [MemoryOps M]
+    (R : M → M → Prop) (hrefl : ∀ a, R a a) (htrans : ∀ a b c, R a b → R b c → R a c)
+    (hload : ∀ (mem mem' : M) ptr len align bytes,
+      MemoryOps.load mem ptr len align = .ok (bytes, mem') → R mem mem')
+    (m m1 m' : Gen.Machine M) (place : Gen.PlaceExpr) (rp : Gen.Place M) (ty : Gen.Type)
+    (r : Gen.Value M × Gen.Type)
+    (hp : evalPlaceM m place = .ok ((rp, ty), m1))
+    (h : evalValueM m (.GetDiscriminant place) = .ok (r, m')) :
+    { m' with mem := m1.mem } = m1 ∧
+    R m1.mem.memory m'.mem.memory ∧
+    ∃ extra : List Gen.Access, m'.mem.accesses = m1.mem.accesses ++ extra ∧
+      ∀ a ∈ extra, a.ty = .Load ∧ a.atomicity = .None := by
+  let P : Gen.Machine M → Prop := fun s =>
+    { s with mem := m1.mem } = m1 ∧
+    R m1.mem.memory s.mem.memory ∧
+    ∃ extra : List Gen.Access, s.mem.accesses = m1.mem.accesses ++ extra ∧
+      ∀ a ∈ extra, a.ty = .Load ∧ a.atomicity = .None
+  have hP1 : P m1 := ⟨rfl, hrefl _, [], by simp, by simp⟩
+  simp only [evalValueM, hp, bind, Except.bind] at h
+  cases ty with
+  | Enum variants dty discr sz al =>
+    dsimp only at h
+    split at h
+    · simp [ub] at h
+    · have hstep : ∀ (s : Gen.Machine M) (off : Gen.Offset) (sz : Size)
+          (bs : List (Gen.AbstractByte (Gen.Memory.Provenance M))) (s' : Gen.Machine M),
+          P s →
+          (do
+            let ptr ← ptrOffsetInboundsM s rp.ptr.thin_pointer (off.bytes : Int)
+            let (bytes, cm) ← ConcurrentMemory.load s.mem ptr sz ⟨1⟩ .None
+            pure (bytes, { s with mem := cm })) = .ok (bs, s') → P s' := by
+        intro s off sz bs s' hs hacc
+        obtain ⟨ptr, _, hacc⟩ := ep1_bind_ok hacc
+        obtain ⟨⟨bytes, cm⟩, hld, hacc⟩ := ep1_bind_ok hacc
+        obtain ⟨_, rfl⟩ := Prod.mk.inj (ep1_pure_ok hacc)
+        unfold ConcurrentMemory.load at hld
+        obtain ⟨⟨bytes', mem'⟩, hml, hld⟩ := ep1_bind_ok hld
+        obtain ⟨_, rfl⟩ := Prod.mk.inj (ep1_pure_ok hld)
+        obtain ⟨hframe, hR, extra, hacc', hall⟩ := hs
+        refine ⟨hframe, htrans _ _ _ hR (hload _ _ _ _ _ _ hml),
+          extra ++ [⟨.Load, .None, ptr.addr, sz⟩], ?_, ?_⟩
+        · show s.mem.accesses ++ [_] = _
+          rw [hacc', List.append_assoc]
+        · intro a ha
+          rcases List.mem_append.mp ha with ha | ha
+          · exact hall a ha
+          · simp only [List.mem_singleton] at ha
+            subst ha
+            exact ⟨rfl, rfl⟩
+      cases hdd : decodeDiscriminantM (M := M)
+          (fun (m : Gen.Machine M) (idx : Gen.Offset) (size : Size) => do
+            let ptr ← ptrOffsetInboundsM m rp.ptr.thin_pointer (idx.bytes : Int)
+            let (bytes, cm) ← ConcurrentMemory.load m.mem ptr size ⟨1⟩ .None
+            pure (bytes, { m with mem := cm })) discr m1 with
+      | error e =>
+        simp only [bind, Except.bind] at hdd
+        rw [hdd] at h
+        cases h
+      | ok res =>
+        obtain ⟨opt, m2⟩ := res
+        have hP2 : P m2 := ep1_decodeDiscriminantM_inv P hstep discr m1 m2 opt hP1 hdd
+        simp only [bind, Except.bind] at hdd
+        rw [hdd] at h
+        dsimp only at h
+        cases opt with
+        | none => simp [ub] at h
+        | some dv =>
+          simp only [pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+          obtain ⟨_, rfl⟩ := h
+          exact hP2
+  | _ => simp [specPanic] at h
+
+/-- **`GetDiscriminant` is read-only on `BasicMemory`** (`Mach`): the machine it returns is the
+machine after `eval_place` with the *identical* memory (`mem.memory`, hence every allocation's
+bytes, liveness, and address) and identical non-memory state; only the data-race access log
+grows, by `Load` / `Atomicity::None` entries. No hypothesis on the place, the enum type, or
+the discriminator is needed. -/
+theorem ep1_evalValue_getDiscriminant_readonly_bm
+    (m m1 m' : Mach) (place : Gen.PlaceExpr) (rp : Gen.Place BM) (ty : Gen.Type)
+    (r : Val × Gen.Type)
+    (hp : evalPlace m place = .ok ((rp, ty), m1))
+    (h : evalValue m (.GetDiscriminant place) = .ok (r, m')) :
+    { m' with mem := m1.mem } = m1 ∧
+    m'.mem.memory = m1.mem.memory ∧
+    ∃ extra : List Gen.Access, m'.mem.accesses = m1.mem.accesses ++ extra ∧
+      ∀ a ∈ extra, a.ty = .Load ∧ a.atomicity = .None := by
+  rw [← evalPlaceM_bm_eq] at hp
+  rw [← evalValueM_bm_eq] at h
+  exact ep1_evalValueM_getDiscriminant_frame (M := BM) (fun a b => b = a)
+    (fun _ => rfl) (fun _ _ _ hab hbc => hbc.trans hab)
+    (fun mem mem' ptr len align bytes hl => BM.load_eq (mem := mem) (mem' := mem') hl)
+    m m1 m' place rp ty r hp h
+
+/-- The memory-model-independent content of an allocation: everything except its
+aliasing-model `extra` (for Tree Borrows, the borrow tree). -/
+def ep1AllocCore {ProvExtra AllocExtra : Type} (a : Gen.Allocation ProvExtra AllocExtra) :
+    List (Gen.AbstractByte (Gen.Provenance ProvExtra)) × Gen.Address × Align ×
+      Gen.AllocationKind × Bool :=
+  (a.data, a.addr, a.align, a.kind, a.live)
+
+/-- `BasicMemory::load` (the generic one underlying `TreeBorrowsMemory::load`) changes at
+most the `extra` of the accessed allocation: bytes, address, alignment, kind, liveness, and
+the number and order of allocations are preserved. -/
+private theorem ep1_BasicMemory_load_core {ProvExtra AllocExtra : Type}
+    (mem mem' : Gen.BasicMemory Gen.x86_64 ProvExtra AllocExtra)
+    (ptr : Gen.ThinPointer (Gen.Provenance ProvExtra)) (len : Size) (align : Align)
+    (handle : AllocExtra → ProvExtra → Gen.Offset → Interp AllocExtra)
+    (bytes : List (Gen.AbstractByte (Gen.Provenance ProvExtra)))
+    (h : BasicMemory.load mem ptr len align handle = .ok (bytes, mem')) :
+    mem'.allocations.map ep1AllocCore = mem.allocations.map ep1AllocCore := by
+  unfold BasicMemory.load at h
+  split at h
+  · simp [ub] at h
+  · obtain ⟨chk, _, h⟩ := ep1_bind_ok h
+    cases chk with
+    | none =>
+      obtain ⟨_, rfl⟩ := Prod.mk.inj (ep1_pure_ok h)
+      rfl
+    | some trip =>
+      rcases trip with ⟨id, provExtra, offset⟩
+      dsimp only at h
+      obtain ⟨alloc, hidx, h⟩ := ep1_bind_ok h
+      obtain ⟨extra', _, h⟩ := ep1_bind_ok h
+      obtain ⟨allocs', hset, h⟩ := ep1_bind_ok h
+      obtain ⟨bs, _, h⟩ := ep1_bind_ok h
+      obtain ⟨_, rfl⟩ := Prod.mk.inj (ep1_pure_ok h)
+      obtain ⟨_, hi, hget⟩ := ep1_listIndex_int_eq_getElem hidx
+      have hallocs : allocs' = mem.allocations.set id._0.toNat { alloc with extra := extra' } := by
+        unfold listSet at hset
+        split at hset
+        · exact (ep1_pure_ok hset).symm
+        · simp [specPanic] at hset
+      subst hallocs
+      show (mem.allocations.set id._0.toNat { alloc with extra := extra' }).map ep1AllocCore = _
+      rw [List.map_set]
+      have hcore : ep1AllocCore ({ alloc with extra := extra' } :
+            Gen.Allocation ProvExtra AllocExtra) =
+          (mem.allocations.map ep1AllocCore)[id._0.toNat]'(by simpa using hi) := by
+        simp only [List.getElem_map, hget]
+        rfl
+      rw [hcore, List.set_getElem_self]
+
+/-- **`GetDiscriminant` preserves every byte under Tree Borrows** (`MachTB`): a successful
+`GetDiscriminant` leaves all non-memory machine state, the Tree Borrows parameters, and the
+content of every allocation (bytes, address, alignment, kind, liveness; same number and order
+of allocations) exactly as `eval_place` left them. Only the borrow trees (permission state
+machines advanced by the tag reads) and the data-race access log (extended by `Load` /
+`Atomicity::None` entries) can change. -/
+theorem ep1_evalValueM_getDiscriminant_preserves_bytes_tb
+    (m m1 m' : MachTB) (place : Gen.PlaceExpr) (rp : Gen.Place TBM) (ty : Gen.Type)
+    (r : Gen.Value TBM × Gen.Type)
+    (hp : evalPlaceM m place = .ok ((rp, ty), m1))
+    (h : evalValueM m (.GetDiscriminant place) = .ok (r, m')) :
+    { m' with mem := m1.mem } = m1 ∧
+    (m'.mem.memory.params = m1.mem.memory.params ∧
+      m'.mem.memory.mem.allocations.map ep1AllocCore =
+        m1.mem.memory.mem.allocations.map ep1AllocCore) ∧
+    ∃ extra : List Gen.Access, m'.mem.accesses = m1.mem.accesses ++ extra ∧
+      ∀ a ∈ extra, a.ty = .Load ∧ a.atomicity = .None := by
+  refine ep1_evalValueM_getDiscriminant_frame (M := TBM)
+    (fun a b => b.params = a.params ∧
+      b.mem.allocations.map ep1AllocCore = a.mem.allocations.map ep1AllocCore)
+    (fun _ => ⟨rfl, rfl⟩)
+    (fun _ _ _ hab hbc => ⟨hbc.1.trans hab.1, hbc.2.trans hab.2⟩)
+    ?_ m m1 m' place rp ty r hp h
+  intro mem mem' ptr len align bytes hl
+  change TreeBorrowsMemory.load mem ptr len align = .ok (bytes, mem') at hl
+  unfold TreeBorrowsMemory.load at hl
+  obtain ⟨⟨bs, bm'⟩, hbl, hl⟩ := ep1_bind_ok hl
+  obtain ⟨_, rfl⟩ := Prod.mk.inj (ep1_pure_ok hl)
+  exact ⟨rfl, ep1_BasicMemory_load_core _ _ _ _ _ _ _ hbl⟩
+
+/-- **`Downcast`, `Variant`, and `Union` add no machine effect of their own** (inversion form,
+every `Memory` `M`): whenever one of them succeeds, the machine it returns is exactly the
+machine returned by its single sub-evaluation (`eval_place(root)`, `eval_value(data)`,
+`eval_value(expr)`), and `Downcast` returns the root place itself (same pointer, same
+`aligned` flag). Together with `ep1_evalValueM_getDiscriminant_frame` this covers the
+machine effect of every Episode 1 place / value arm. -/
+theorem ep1_evalM_downcast_variant_union_add_no_machine_effect
+    {M : Type} [Gen.Memory M] [MemoryOps M] (m m' : Gen.Machine M) :
+    (∀ root d (r : Gen.Place M × Gen.Type),
+      evalPlaceM m (.Downcast root d) = .ok (r, m') →
+      ∃ ty, evalPlaceM m root = .ok ((r.1, ty), m')) ∧
+    (∀ d data enumTy (r : Gen.Value M × Gen.Type),
+      evalValueM m (.Variant d data enumTy) = .ok (r, m') →
+      ∃ val vty, evalValueM m data = .ok ((val, vty), m') ∧ r = (.Variant d val, enumTy)) ∧
+    (∀ field expr unionTy (r : Gen.Value M × Gen.Type),
+      evalValueM m (.Union field expr unionTy) = .ok (r, m') →
+      ∃ v, evalValueM m expr = .ok (v, m') ∧ r.2 = unionTy) := by
+  refine ⟨?_, ?_, ?_⟩
+  · intro root d r h
+    simp only [evalPlaceM] at h
+    obtain ⟨⟨⟨rp, ty⟩, m1⟩, hroot, h⟩ := ep1_bind_ok h
+    cases ty with
+    | Enum variants dty discr sz al =>
+      dsimp only at h
+      cases hmi : mapIndex variants d "variants[discriminant]" with
+      | error e => simp [hmi, bind, Except.bind] at h
+      | ok var =>
+        simp only [hmi, bind, Except.bind, pure, Except.pure, Except.ok.injEq,
+          Prod.mk.injEq] at h
+        obtain ⟨rfl, rfl⟩ := h
+        exact ⟨_, hroot⟩
+    | _ => simp [specPanic, bind, Except.bind] at h
+  · intro d data enumTy r h
+    simp only [evalValueM] at h
+    obtain ⟨⟨⟨val, vty⟩, m1⟩, hd, h⟩ := ep1_bind_ok h
+    obtain ⟨rfl, rfl⟩ := Prod.mk.inj (ep1_pure_ok h)
+    exact ⟨val, vty, hd, rfl⟩
+  · intro field expr unionTy r h
+    cases unionTy with
+    | Union fields chunks sz al =>
+      rw [ep1_evalValueM_union_complete_spec] at h
+      obtain ⟨⟨off, exprTy⟩, _, h⟩ := ep1_bind_ok h
+      obtain ⟨⟨⟨val, vty⟩, m1⟩, hev, h⟩ := ep1_bind_ok h
+      obtain ⟨encoded, _, h⟩ := ep1_bind_ok h
+      obtain ⟨data, _, h⟩ := ep1_bind_ok h
+      obtain ⟨chunkData, _, h⟩ := ep1_bind_ok h
+      obtain ⟨rfl, rfl⟩ := Prod.mk.inj (ep1_pure_ok h)
+      exact ⟨(val, vty), hev, rfl⟩
+    | _ => simp [evalValueM, specPanic, bind, Except.bind] at h
+
+/-- **Well-formedness of a constructed `Variant` value, exactly.** `ValueExpr::Variant` itself
+checks nothing (upstream just builds `Value::Variant { discriminant, data }`). The value it
+builds satisfies `check_value` at the enum type exactly when `discriminant` is a declared
+variant and the payload satisfies `check_value` at **that variant's type — the very type
+`PlaceExpr::Downcast` assigns to the place**; an undeclared discriminant is `check_value`'s
+`throw_ub!`, which `typed_store`'s `assert!` then turns into a spec panic (witnessed by
+`ep1_variant_union_ill_formed_ast_specPanic_witness`). -/
+theorem ep1_evalValueM_variant_checkValue {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m m1 : Gen.Machine M) (d : Int) (data : Gen.ValueExpr)
+    (variants : List (Int × Gen.Variant)) (dty : Gen.IntType) (discr : Gen.Discriminator)
+    (sz : Size) (al : Align) (val : Gen.Value M) (vty : Gen.Type)
+    (mOpt : Option (Gen.Machine M))
+    (hd : evalValueM m data = .ok ((val, vty), m1)) :
+    evalValueM m (.Variant d data (.Enum ⟨variants⟩ dty discr sz al)) =
+      .ok ((.Variant d val, .Enum ⟨variants⟩ dty discr sz al), m1) ∧
+    checkValueM (.Variant d val) (.Enum ⟨variants⟩ dty discr sz al) mOpt =
+      (match mapGet (⟨variants⟩ : Map Int Gen.Variant) d with
+       | some var => checkValueM val var.ty mOpt
+       | none => ub "Value::Variant: invalid discrimant") := by
+  refine ⟨by simp [evalValueM, hd, bind, Except.bind, pure, Except.pure], ?_⟩
+  have hlookup := ep1_downcast_variant_lookup_agrees_with_representation (M := M) d variants
+  rw [checkValueM]
+  cases hget : mapGet (⟨variants⟩ : Map Int Gen.Variant) d with
+  | none => exact (hlookup.2 hget).2.2.1 val mOpt
+  | some var => exact (hlookup.1 var hget).2.2.1 val mOpt
+
+/-- **The address hypotheses of the `Load ⇒ GetDiscriminant` theorems are necessary, and
+`GetDiscriminant` validates nothing beyond what upstream validates.**
+
+1. `ep1_evalValue_load_enum_implies_getDiscriminant_bm` / `_tb` assume `0 ≤ addr` and
+   `addr + size < 2^64` for the place. On a machine violating the allocation invariant
+   ("`addr + data.len()` fits into a `usize`", `spec/mem/basic.md`) — an allocation at a
+   negative address or at `2^64` — a typed `Load` of the enum still succeeds, while
+   `GetDiscriminant` stops at `ptr_offset_inbounds`'s
+   `assert!((ptr.addr + offset).in_bounds(Unsigned, M::T::PTR_SIZE))`: a spec panic, exactly
+   as upstream's assertion would, on both `Mach` and `MachTB`. So neither hypothesis can be
+   dropped.
+2. `GetDiscriminant` returns `Value::Int(discriminant)` at `discriminant_ty` without a
+   `check_value` (as upstream): a `Known(300)` discriminator at `u8` returns `300`, although
+   `check_value(300, u8)` is UB. No UB or panic is fabricated for the ill-formed enum type. -/
+theorem ep1_getDiscriminant_address_hypotheses_necessary_and_no_result_check_witness :
+    let enumBytes : List Byte := .Init 0 none :: List.replicate 7 .Uninit
+    let mk (addr : Int) : Mach := ep1MachBM
+      [{ data := enumBytes, addr := addr, align := ⟨4⟩, kind := .Stack, live := true, extra := () }]
+      [(⟨⟨0⟩⟩, ⟨addr, some (⟨0⟩, ())⟩)]
+      [(⟨⟨0⟩⟩, ep1EnumTy)]
+    let assertPanic :=
+      "assertion failed: (ptr.addr + offset).in_bounds(Unsigned, M::T::PTR_SIZE)"
+    let known300Ty : Gen.Type := .Enum ⟨[]⟩ ep1U8 (.Known 300) ⟨0⟩ ⟨1⟩
+    let mZst : Mach := ep1MachBM
+      [{ data := [], addr := 0x100, align := ⟨1⟩, kind := .Stack, live := true, extra := () }]
+      [(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩)]
+      [(⟨⟨0⟩⟩, known300Ty)]
+    -- 0. control: at an in-range address both succeed
+    ((∃ m1, evalValue (mk 0x100) (.Load (.Local ⟨⟨0⟩⟩)) =
+        .ok ((.Variant 0 (.Tuple []), ep1EnumTy), m1)) ∧
+     (∃ m1, evalValue (mk 0x100) (.GetDiscriminant (.Local ⟨⟨0⟩⟩)) =
+        .ok ((.Int 0, .Int ep1U8), m1))) ∧
+    -- 1a. negative address: `Load` succeeds, `GetDiscriminant` hits the upstream assertion
+    ((∃ m1, evalValue (mk (-8)) (.Load (.Local ⟨⟨0⟩⟩)) =
+        .ok ((.Variant 0 (.Tuple []), ep1EnumTy), m1)) ∧
+     evalValue (mk (-8)) (.GetDiscriminant (.Local ⟨⟨0⟩⟩)) = specPanic assertPanic ∧
+     (∃ m1, evalValueM (liftMachToTB (mk (-8))) (.Load (.Local ⟨⟨0⟩⟩)) =
+        .ok ((.Variant 0 (.Tuple []), ep1EnumTy), m1)) ∧
+     evalValueM (liftMachToTB (mk (-8))) (.GetDiscriminant (.Local ⟨⟨0⟩⟩)) =
+        specPanic assertPanic) ∧
+    -- 1b. address `2^64`: same
+    ((∃ m1, evalValue (mk 0x10000000000000000) (.Load (.Local ⟨⟨0⟩⟩)) =
+        .ok ((.Variant 0 (.Tuple []), ep1EnumTy), m1)) ∧
+     evalValue (mk 0x10000000000000000) (.GetDiscriminant (.Local ⟨⟨0⟩⟩)) =
+        specPanic assertPanic ∧
+     (∃ m1, evalValueM (liftMachToTB (mk 0x10000000000000000)) (.Load (.Local ⟨⟨0⟩⟩)) =
+        .ok ((.Variant 0 (.Tuple []), ep1EnumTy), m1)) ∧
+     evalValueM (liftMachToTB (mk 0x10000000000000000)) (.GetDiscriminant (.Local ⟨⟨0⟩⟩)) =
+        specPanic assertPanic) ∧
+    -- 2. no `check_value` on the returned discriminant
+    (evalValue mZst (.GetDiscriminant (.Local ⟨⟨0⟩⟩)) = .ok ((.Int 300, .Int ep1U8), mZst) ∧
+     evalValueM (liftMachToTB mZst) (.GetDiscriminant (.Local ⟨⟨0⟩⟩)) =
+       .ok ((.Int 300, .Int ep1U8), liftMachToTB mZst) ∧
+     checkValue (.Int 300) (.Int ep1U8) = ub "Value::Int: invalid integer value") := by
+  intro enumBytes mk assertPanic known300Ty mZst
+  refine ⟨⟨ep1_ok_of_map_fst ?_, ep1_ok_of_map_fst ?_⟩,
+    ⟨ep1_ok_of_map_fst ?_, ?_, ep1_ok_of_map_fst ?_, ?_⟩,
+    ⟨ep1_ok_of_map_fst ?_, ?_, ep1_ok_of_map_fst ?_, ?_⟩,
+    ⟨?_, ?_, ?_⟩⟩
+  all_goals ep1_kernel_rfl
+
+/-! #### Tree Borrows only removes behaviours of `GetDiscriminant`: `MachTB` success ⇒ `Mach` success -/
+
+/-- What `GetDiscriminant` can observe of an allocation, on any memory model: the data of its
+bytes (provenance erased), its address, and its liveness. -/
+def ep1AllocView {ProvExtra AllocExtra : Type} (a : Gen.Allocation ProvExtra AllocExtra) :
+    List (Option UInt8) × Gen.Address × Bool :=
+  (a.data.map AbstractByte.dataM, a.addr, a.live)
+
+/-- `Type::decode` at `Type::Int` as a function of the byte count and the bytes' data only
+(provenance never matters). -/
+private def ep1DecodeIntView (vt : Gen.IntType) (len : Nat) (data : Option (List UInt8)) :
+    Interp (Option Int) :=
+  if len ≠ vt.size.bytes then specPanic "decode of Type::Int with invalid length"
+  else
+    match data with
+    | some d => pure (some (Endianness.decode x86_64.ENDIANNESS vt.signed d))
+    | none => pure none
+
+private theorem ep1_decodeIntM_view {M : Type} [Gen.Memory M] (vt : Gen.IntType)
+    (bs : List (Gen.AbstractByte (Gen.Memory.Provenance M))) :
+    Type.decodeIntM (M := M) vt bs =
+      (match ep1DecodeIntView vt bs.length (bs.mapM AbstractByte.dataM) with
+       | .ok o => .ok (o.map Gen.Value.Int)
+       | .error e => .error e) := by
+  obtain ⟨signed, size⟩ := vt
+  unfold Type.decodeIntM ep1DecodeIntView
+  by_cases hlen : bs.length ≠ size.bytes
+  · simp [hlen, specPanic]
+  · simp only [hlen, ↓reduceIte]
+    cases bs.mapM AbstractByte.dataM <;> rfl
+
+private theorem ep1_mapM_dataM_congr {P1 P2 : Type} :
+    ∀ (bs1 : List (Gen.AbstractByte P1)) (bs2 : List (Gen.AbstractByte P2)),
+      bs1.map AbstractByte.dataM = bs2.map AbstractByte.dataM →
+      bs1.length = bs2.length ∧ bs1.mapM AbstractByte.dataM = bs2.mapM AbstractByte.dataM
+  | [], [], _ => ⟨rfl, rfl⟩
+  | [], _ :: _, h => by simp at h
+  | _ :: _, [], h => by simp at h
+  | b1 :: t1, b2 :: t2, h => by
+    simp only [List.map_cons, List.cons.injEq] at h
+    obtain ⟨hlen, hm⟩ := ep1_mapM_dataM_congr t1 t2 h.2
+    refine ⟨by simp [hlen], ?_⟩
+    simp only [List.mapM_cons, h.1, hm]
+
+mutual
+
+/-- Two-memory simulation of `decode_discriminant`: if every accessor call on the first
+memory is matched by one on the second returning bytes with the same data, a successful
+decode on the first memory is matched by a decode with the same result on the second. -/
+private theorem ep1_decodeDiscriminantM_sim2 {M1 M2 : Type} [Gen.Memory M1] [Gen.Memory M2]
+    {σ1 σ2 : Type} (Rel : σ1 → σ2 → Prop)
+    (acc1 : σ1 → Gen.Offset → Size →
+      Interp (List (Gen.AbstractByte (Gen.Memory.Provenance M1)) × σ1))
+    (acc2 : σ2 → Gen.Offset → Size →
+      Interp (List (Gen.AbstractByte (Gen.Memory.Provenance M2)) × σ2))
+    (hstep : ∀ s1 s2 off sz bs1 s1', Rel s1 s2 → acc1 s1 off sz = .ok (bs1, s1') →
+      ∃ bs2 s2', acc2 s2 off sz = .ok (bs2, s2') ∧
+        bs1.map AbstractByte.dataM = bs2.map AbstractByte.dataM ∧ Rel s1' s2') :
+    ∀ (d : Gen.Discriminator) (res : Option Int) (s1 s1' : σ1) (s2 : σ2),
+      Rel s1 s2 → decodeDiscriminantM (M := M1) acc1 d s1 = .ok (res, s1') →
+      ∃ s2', decodeDiscriminantM (M := M2) acc2 d s2 = .ok (res, s2') ∧ Rel s1' s2'
+  | .Known val, res, s1, s1', s2, hrel, h => by
+    unfold decodeDiscriminantM at h ⊢
+    obtain ⟨rfl, rfl⟩ := Prod.mk.inj (ep1_pure_ok h)
+    exact ⟨s2, rfl, hrel⟩
+  | .Invalid, res, s1, s1', s2, hrel, h => by
+    unfold decodeDiscriminantM at h ⊢
+    obtain ⟨rfl, rfl⟩ := Prod.mk.inj (ep1_pure_ok h)
+    exact ⟨s2, rfl, hrel⟩
+  | .Branch off vt fallback ⟨children⟩, res, s1, s1', s2, hrel, h => by
+    unfold decodeDiscriminantM at h ⊢
+    obtain ⟨⟨bs1, s1a⟩, ha1, h⟩ := ep1_bind_ok h
+    obtain ⟨bs2, s2a, ha2, hbytes, hrela⟩ := hstep s1 s2 off vt.size bs1 s1a hrel ha1
+    rw [ha2]
+    dsimp only [bind, Except.bind] at h ⊢
+    obtain ⟨hlen, hm⟩ := ep1_mapM_dataM_congr bs1 bs2 hbytes
+    rw [ep1_decodeIntM_view] at h ⊢
+    rw [← hlen, ← hm]
+    cases hv : ep1DecodeIntView vt bs1.length (bs1.mapM AbstractByte.dataM) with
+    | error e => rw [hv] at h; cases h
+    | ok o =>
+      rw [hv] at h
+      cases o with
+      | none =>
+        obtain ⟨rfl, rfl⟩ := Prod.mk.inj (ep1_pure_ok h)
+        exact ⟨s2a, rfl, hrela⟩
+      | some tag =>
+        exact ep1_decodeDiscriminantChildrenM_sim2 Rel acc1 acc2 hstep tag
+          (decodeDiscriminantM (M := M1) acc1 fallback)
+          (decodeDiscriminantM (M := M2) acc2 fallback)
+          (fun res' t1 t1' t2 hr hf =>
+            ep1_decodeDiscriminantM_sim2 Rel acc1 acc2 hstep fallback res' t1 t1' t2 hr hf)
+          children res s1a s1' s2a hrela h
+
+private theorem ep1_decodeDiscriminantChildrenM_sim2 {M1 M2 : Type} [Gen.Memory M1]
+    [Gen.Memory M2] {σ1 σ2 : Type} (Rel : σ1 → σ2 → Prop)
+    (acc1 : σ1 → Gen.Offset → Size →
+      Interp (List (Gen.AbstractByte (Gen.Memory.Provenance M1)) × σ1))
+    (acc2 : σ2 → Gen.Offset → Size →
+      Interp (List (Gen.AbstractByte (Gen.Memory.Provenance M2)) × σ2))
+    (hstep : ∀ s1 s2 off sz bs1 s1', Rel s1 s2 → acc1 s1 off sz = .ok (bs1, s1') →
+      ∃ bs2 s2', acc2 s2 off sz = .ok (bs2, s2') ∧
+        bs1.map AbstractByte.dataM = bs2.map AbstractByte.dataM ∧ Rel s1' s2')
+    (tag : Int)
+    (fb1 : σ1 → Interp (Option Int × σ1)) (fb2 : σ2 → Interp (Option Int × σ2))
+    (hfb : ∀ res t1 t1' t2, Rel t1 t2 → fb1 t1 = .ok (res, t1') →
+      ∃ t2', fb2 t2 = .ok (res, t2') ∧ Rel t1' t2') :
+    ∀ (children : List ((Int × Int) × Gen.Discriminator)) (res : Option Int) (s1 s1' : σ1)
+      (s2 : σ2),
+      Rel s1 s2 →
+      decodeDiscriminantChildrenM (M := M1) acc1 tag fb1 children s1 = .ok (res, s1') →
+      ∃ s2', decodeDiscriminantChildrenM (M := M2) acc2 tag fb2 children s2 = .ok (res, s2') ∧
+        Rel s1' s2'
+  | [], res, s1, s1', s2, hrel, h => by
+    unfold decodeDiscriminantChildrenM at h ⊢
+    exact hfb res s1 s1' s2 hrel h
+  | ((lo, hi), child) :: rest, res, s1, s1', s2, hrel, h => by
+    unfold decodeDiscriminantChildrenM at h ⊢
+    by_cases hcond : lo ≤ tag ∧ tag < hi
+    · simp only [hcond, and_self, ↓reduceIte] at h ⊢
+      exact ep1_decodeDiscriminantM_sim2 Rel acc1 acc2 hstep child res s1 s1' s2 hrel h
+    · simp only [hcond, ↓reduceIte] at h ⊢
+      exact ep1_decodeDiscriminantChildrenM_sim2 Rel acc1 acc2 hstep tag fb1 fb2 hfb rest res
+        s1 s1' s2 hrel h
+
+end
+
+/-- What `GetDiscriminant` can observe of a thin pointer, on any memory model: its address and
+the allocation it points into (the aliasing-model part of the provenance is erased). -/
+def ep1PtrView {Extra : Type} (p : Gen.ThinPointer (Gen.Provenance Extra)) :
+    Gen.Address × Option Gen.AllocId :=
+  (p.addr, p.provenance.map Prod.fst)
+
+private theorem ep1_alloc_view_of_index {E1 A1 : Type}
+    (as1 : List (Gen.Allocation E1 A1)) (as2 : List (Gen.Allocation Unit Unit))
+    (hmem : as1.map ep1AllocView = as2.map ep1AllocView) (idx : Int) (what : String)
+    (a1 : Gen.Allocation E1 A1) (h : listIndex as1 idx what = .ok a1) :
+    0 ≤ idx ∧ ∃ hi2 : idx.toNat < as2.length, ep1AllocView a1 = ep1AllocView as2[idx.toNat] := by
+  obtain ⟨hnn, hi, hget⟩ := ep1_listIndex_int_eq_getElem h
+  have hlenEq : as1.length = as2.length := by
+    simpa using congrArg List.length hmem
+  have hi2 : idx.toNat < as2.length := hlenEq ▸ hi
+  refine ⟨hnn, hi2, ?_⟩
+  have h1 : (as1.map ep1AllocView)[idx.toNat]? = some (ep1AllocView a1) := by
+    simp [List.getElem?_map, List.getElem?_eq_getElem hi, hget]
+  have h2 : (as2.map ep1AllocView)[idx.toNat]? = some (ep1AllocView as2[idx.toNat]) := by
+    simp [List.getElem?_map, List.getElem?_eq_getElem hi2]
+  rw [hmem, h2] at h1
+  exact (Option.some.inj h1).symm
+
+/-- `check_ptr` on any `BasicMemory`-backed memory (in particular Tree Borrows) succeeding
+implies `check_ptr` on `BasicMemory<x86_64>` succeeding with the same allocation and offset,
+for memories and pointers with the same `GetDiscriminant`-observable view. -/
+private theorem ep1_check_ptr_any_to_bm {E1 A1 : Type}
+    (mem1 : Gen.BasicMemory Gen.x86_64 E1 A1) (mem2 : BM)
+    (p1 : Gen.ThinPointer (Gen.Provenance E1)) (p2 : Ptr) (len : Size)
+    (hmem : mem1.allocations.map ep1AllocView = mem2.allocations.map ep1AllocView)
+    (hptr : ep1PtrView p1 = ep1PtrView p2)
+    (r1 : Option (Gen.AllocId × E1 × Size))
+    (h : BasicMemory.check_ptr mem1 p1 len = .ok r1) :
+    ∃ r2, BM.check_ptr mem2 p2 len = .ok r2 ∧
+      r1.map (fun t => (t.1, t.2.2)) = r2.map (fun t => (t.1, t.2.2)) := by
+  unfold BasicMemory.check_ptr at h
+  unfold BM.check_ptr
+  have haddr : p1.addr = p2.addr := congrArg Prod.fst hptr
+  have hprov : p1.provenance.map Prod.fst = p2.provenance.map Prod.fst := congrArg Prod.snd hptr
+  by_cases hz : len.bytes = 0
+  · simp only [hz, ↓reduceIte] at h ⊢
+    obtain rfl := ep1_pure_ok h
+    exact ⟨none, rfl, rfl⟩
+  · simp only [hz, ↓reduceIte] at h ⊢
+    cases hp1 : p1.provenance with
+    | none => simp [hp1, ub] at h
+    | some ip1 =>
+      obtain ⟨id, e1⟩ := ip1
+      cases hp2 : p2.provenance with
+      | none => simp [hp1, hp2] at hprov
+      | some ip2 =>
+        obtain ⟨id2, e2⟩ := ip2
+        have hid : id = id2 := by simpa [hp1, hp2] using hprov
+        subst hid
+        simp only [hp1] at h
+        dsimp only
+        obtain ⟨a1, hidx, h⟩ := ep1_bind_ok h
+        obtain ⟨hnn, hi2, hview⟩ := ep1_alloc_view_of_index _ _ hmem _ _ a1 hidx
+        rw [ep1_listIndex_int_of_getElem _ hnn hi2]
+        simp only [ep1AllocView, Prod.mk.injEq] at hview
+        obtain ⟨hdata, haddrA, hlive⟩ := hview
+        have hsize : (Allocation.size a1).bytes =
+            (Allocation.size mem2.allocations[id._0.toNat]).bytes := by
+          simpa [Allocation.size] using congrArg List.length hdata
+        simp only [bind, Except.bind, ← hlive, ← haddrA, ← hsize, ← haddr]
+        split at h
+        · simp [ub] at h
+        · rename_i hl
+          simp only [hl, Bool.false_eq_true, ↓reduceIte]
+          split at h
+          · simp [ub] at h
+          · rename_i hb
+            simp only [hb, ↓reduceIte]
+            obtain rfl := ep1_pure_ok h
+            exact ⟨_, rfl, rfl⟩
+
+private theorem ep1_subslice_dataM_congr {P1 P2 : Type}
+    (xs1 : List (Gen.AbstractByte P1)) (xs2 : List (Gen.AbstractByte P2)) (start len : Int)
+    (hdata : xs1.map AbstractByte.dataM = xs2.map AbstractByte.dataM)
+    (bs1 : List (Gen.AbstractByte P1)) (h : subsliceWithLength xs1 start len = .ok bs1) :
+    ∃ bs2, subsliceWithLength xs2 start len = .ok bs2 ∧
+      bs1.map AbstractByte.dataM = bs2.map AbstractByte.dataM := by
+  have hlen : xs1.length = xs2.length := by simpa using congrArg List.length hdata
+  unfold subsliceWithLength at h ⊢
+  rw [← hlen]
+  split at h
+  · rename_i hc
+    simp only [hc, and_self, ↓reduceIte]
+    obtain rfl := ep1_pure_ok h
+    refine ⟨_, rfl, ?_⟩
+    rw [List.map_take, List.map_drop, List.map_take, List.map_drop, hdata]
+  · simp [specPanic] at h
+
+/-- `load` on any `BasicMemory`-backed memory (in particular `TreeBorrowsMemory::load`, whose
+`handle_extra` performs the Tree Borrows read access) succeeding implies `BasicMemory::load`
+on `BasicMemory<x86_64>` succeeding — leaving that memory unchanged — with bytes carrying the
+same data. -/
+private theorem ep1_load_any_to_bm {E1 A1 : Type}
+    (mem1 mem1' : Gen.BasicMemory Gen.x86_64 E1 A1) (mem2 : BM)
+    (p1 : Gen.ThinPointer (Gen.Provenance E1)) (p2 : Ptr) (len : Size) (align : Align)
+    (handle : A1 → E1 → Gen.Offset → Interp A1)
+    (hmem : mem1.allocations.map ep1AllocView = mem2.allocations.map ep1AllocView)
+    (hptr : ep1PtrView p1 = ep1PtrView p2)
+    (bs1 : List (Gen.AbstractByte (Gen.Provenance E1)))
+    (h : BasicMemory.load mem1 p1 len align handle = .ok (bs1, mem1')) :
+    ∃ bs2, BM.load mem2 p2 len align = .ok (bs2, mem2) ∧
+      bs1.map AbstractByte.dataM = bs2.map AbstractByte.dataM := by
+  suffices hs : ∃ bs2 mem2', BM.load mem2 p2 len align = .ok (bs2, mem2') ∧
+      bs1.map AbstractByte.dataM = bs2.map AbstractByte.dataM by
+    obtain ⟨bs2, mem2', hl, hd⟩ := hs
+    have := BM.load_eq hl
+    subst this
+    exact ⟨bs2, hl, hd⟩
+  have haddr : p1.addr = p2.addr := congrArg Prod.fst hptr
+  unfold BasicMemory.load at h
+  unfold BM.load
+  rw [← haddr]
+  split at h
+  · simp [ub] at h
+  · rename_i hal
+    simp only [hal]
+    obtain ⟨r1, hchk, h⟩ := ep1_bind_ok h
+    obtain ⟨r2, hchk2, hr⟩ := ep1_check_ptr_any_to_bm mem1 mem2 p1 p2 len hmem hptr r1 hchk
+    simp only [hchk2, bind, Except.bind]
+    cases r1 with
+    | none =>
+      cases r2 with
+      | none =>
+        obtain ⟨rfl, _⟩ := Prod.mk.inj (ep1_pure_ok h)
+        exact ⟨[], mem2, rfl, rfl⟩
+      | some t => simp at hr
+    | some t1 =>
+      cases r2 with
+      | none => simp at hr
+      | some t2 =>
+        obtain ⟨id, e1, off⟩ := t1
+        obtain ⟨id2, e2, off2⟩ := t2
+        simp only [Option.map_some, Option.some.injEq, Prod.mk.injEq] at hr
+        obtain ⟨rfl, rfl⟩ := hr
+        dsimp only at h ⊢
+        obtain ⟨a1, hidx, h⟩ := ep1_bind_ok h
+        obtain ⟨_, _, h⟩ := ep1_bind_ok h
+        obtain ⟨_, _, h⟩ := ep1_bind_ok h
+        obtain ⟨bs, hsub, h⟩ := ep1_bind_ok h
+        obtain ⟨rfl, _⟩ := Prod.mk.inj (ep1_pure_ok h)
+        obtain ⟨hnn, hi2, hview⟩ := ep1_alloc_view_of_index _ _ hmem _ _ a1 hidx
+        simp only [ep1AllocView, Prod.mk.injEq] at hview
+        obtain ⟨bs2, hsub2, hd⟩ :=
+          ep1_subslice_dataM_congr a1.data mem2.allocations[id._0.toNat].data _ _ hview.1 bs hsub
+        rw [ep1_listIndex_int_of_getElem _ hnn hi2]
+        simp only [ep1_listSet_int_of_lt _ _ hnn hi2, hsub2]
+        exact ⟨bs2, _, rfl, hd⟩
+
+/-- `ptr_offset_inbounds` succeeding on `MachTB` implies it succeeding on `Mach`, with the
+same resulting address and allocation. -/
+private theorem ep1_ptrOffsetInbounds_tb_to_bm (sTB : MachTB) (sBM : Mach)
+    (p1 : Gen.ThinPointer Gen.TreeBorrowsProvenance) (p2 : Ptr) (off : Int)
+    (hmem : sTB.mem.memory.mem.allocations.map ep1AllocView =
+      sBM.mem.memory.allocations.map ep1AllocView)
+    (hptr : ep1PtrView p1 = ep1PtrView p2)
+    (p1' : Gen.ThinPointer Gen.TreeBorrowsProvenance)
+    (h : ptrOffsetInboundsM sTB p1 off = .ok p1') :
+    ∃ p2', ptrOffsetInboundsM (M := BM) sBM p2 off = .ok p2' ∧ ep1PtrView p1' = ep1PtrView p2' := by
+  have haddr : p1.addr = p2.addr := congrArg Prod.fst hptr
+  have hprov : p1.provenance.map Prod.fst = p2.provenance.map Prod.fst := congrArg Prod.snd hptr
+  unfold ptrOffsetInboundsM at h ⊢
+  obtain ⟨u, hsd, h⟩ := ep1_bind_ok h
+  have hsd2 : ConcurrentMemory.signed_dereferenceable (M := BM) sBM.mem p2 off = .ok () := by
+    change TreeBorrowsMemory.signed_dereferenceable sTB.mem.memory p1 off = .ok u at hsd
+    change BM.signed_dereferenceable sBM.mem.memory p2 off = .ok ()
+    unfold TreeBorrowsMemory.signed_dereferenceable TreeBorrowsMemory.dereferenceable at hsd
+    unfold BM.signed_dereferenceable BM.dereferenceable
+    split at hsd
+    · rename_i hpos
+      simp only [hpos, ↓reduceIte]
+      obtain ⟨r1, hchk, _⟩ := ep1_bind_ok hsd
+      obtain ⟨r2, hchk2, _⟩ :=
+        ep1_check_ptr_any_to_bm sTB.mem.memory.mem sBM.mem.memory p1 p2 _ hmem hptr r1 hchk
+      simp only [hchk2, bind, Except.bind, pure, Except.pure]
+    · rename_i hpos
+      simp only [hpos, ↓reduceIte]
+      obtain ⟨r1, hchk, _⟩ := ep1_bind_ok hsd
+      have hptr' : ep1PtrView ({ p1 with addr := p1.addr + off } :
+            Gen.ThinPointer Gen.TreeBorrowsProvenance) =
+          ep1PtrView ({ p2 with addr := p2.addr + off } : Ptr) := by
+        simp only [ep1PtrView, haddr, hprov]
+      obtain ⟨r2, hchk2, _⟩ :=
+        ep1_check_ptr_any_to_bm sTB.mem.memory.mem sBM.mem.memory _ _ _ hmem hptr' r1 hchk
+      simp only [hchk2, bind, Except.bind, pure, Except.pure]
+  simp only [hsd2, bind, Except.bind, ← haddr]
+  split at h
+  · simp [specPanic] at h
+  · rename_i h1
+    simp only [h1, Bool.false_eq_true, ↓reduceIte]
+    split at h
+    · simp [specPanic] at h
+    · rename_i h2
+      simp only [h2, Bool.false_eq_true, ↓reduceIte]
+      obtain rfl := ep1_pure_ok h
+      refine ⟨_, rfl, ?_⟩
+      simp only [ep1PtrView, haddr, hprov]
+
+/-- **Tree Borrows only removes behaviours of `GetDiscriminant`.** Take a `MachTB` and a `Mach`
+evaluation of the same enum place whose results agree on what `GetDiscriminant` can observe:
+the places have the same address, allocation, and `aligned` flag (`ep1PtrView`), and the two
+memories hold allocations with the same byte data, addresses, and liveness (`ep1AllocView`;
+provenance and borrow trees are free to differ — `liftMachToTB` is one instance). Then
+whenever `GetDiscriminant` succeeds under Tree Borrows it also succeeds on `BasicMemory`
+with the **same discriminant at the same type**.
+
+Together with the witnesses in which `Mach` succeeds while `MachTB` raises Tree Borrows UB
+(`ep1_getDiscriminant_tree_borrows_read_access_witness`,
+`ep1_getDiscriminant_tree_borrows_nested_gap_byte_witness`), this pins the `Mach` / `MachTB`
+divergence of `GetDiscriminant` exactly: the aliasing model can only turn a `Mach` success
+into UB, never change the discriminant and never make a `Mach` failure succeed. -/
+theorem ep1_getDiscriminant_tb_success_implies_bm_success
+    (mTB mTB1 mTB' : MachTB) (m m1 : Mach) (place : Gen.PlaceExpr)
+    (rpTB : Gen.Place TBM) (rpBM : Gen.Place BM) (ty : Gen.Type)
+    (r : Gen.Value TBM × Gen.Type)
+    (hpTB : evalPlaceM mTB place = .ok ((rpTB, ty), mTB1))
+    (hpBM : evalPlace m place = .ok ((rpBM, ty), m1))
+    (hptr : ep1PtrView rpTB.ptr.thin_pointer = ep1PtrView rpBM.ptr.thin_pointer)
+    (hal : rpTB.aligned = rpBM.aligned)
+    (hmem : mTB1.mem.memory.mem.allocations.map ep1AllocView =
+      m1.mem.memory.allocations.map ep1AllocView)
+    (h : evalValueM mTB (.GetDiscriminant place) = .ok (r, mTB')) :
+    ∃ (x : Int) (dty : Gen.IntType) (m' : Mach),
+      r = (.Int x, .Int dty) ∧
+      evalValue m (.GetDiscriminant place) = .ok ((.Int x, .Int dty), m') := by
+  rw [← evalPlaceM_bm_eq] at hpBM
+  simp only [evalValueM, hpTB, bind, Except.bind] at h
+  cases ty with
+  | Enum variants dty discr sz al =>
+    dsimp only at h
+    split at h
+    · simp [ub] at h
+    · rename_i halTB
+      let accTB := fun (s : MachTB) (idx : Gen.Offset) (size : Size) => do
+        let ptr ← ptrOffsetInboundsM s rpTB.ptr.thin_pointer (idx.bytes : Int)
+        let (bytes, cm) ← ConcurrentMemory.load s.mem ptr size ⟨1⟩ .None
+        pure (bytes, { s with mem := cm })
+      let accBM := fun (s : Mach) (idx : Gen.Offset) (size : Size) => do
+        let ptr ← ptrOffsetInboundsM (M := BM) s rpBM.ptr.thin_pointer (idx.bytes : Int)
+        let (bytes, cm) ← ConcurrentMemory.load (M := BM) s.mem ptr size ⟨1⟩ .None
+        pure (bytes, { s with mem := cm })
+      let Rel : MachTB → Mach → Prop := fun sTB sBM =>
+        sTB.mem.memory.mem.allocations.map ep1AllocView =
+          sBM.mem.memory.allocations.map ep1AllocView
+      have hstep : ∀ (s1 : MachTB) (s2 : Mach) off sz bs1 s1', Rel s1 s2 →
+          accTB s1 off sz = .ok (bs1, s1') →
+          ∃ bs2 s2', accBM s2 off sz = .ok (bs2, s2') ∧
+            bs1.map AbstractByte.dataM = bs2.map AbstractByte.dataM ∧ Rel s1' s2' := by
+        intro s1 s2 off sz bs1 s1' hrel hacc
+        obtain ⟨p1', hpo, hacc⟩ := ep1_bind_ok hacc
+        obtain ⟨p2', hpo2, hview'⟩ :=
+          ep1_ptrOffsetInbounds_tb_to_bm s1 s2 _ _ _ hrel hptr p1' hpo
+        obtain ⟨⟨bytes, cm⟩, hld, hacc⟩ := ep1_bind_ok hacc
+        obtain ⟨rfl, rfl⟩ := Prod.mk.inj (ep1_pure_ok hacc)
+        unfold ConcurrentMemory.load at hld
+        obtain ⟨⟨bytes', tbm'⟩, hml, hld⟩ := ep1_bind_ok hld
+        obtain ⟨rfl, rfl⟩ := Prod.mk.inj (ep1_pure_ok hld)
+        change TreeBorrowsMemory.load s1.mem.memory p1' sz ⟨1⟩ = .ok (bytes', tbm') at hml
+        unfold TreeBorrowsMemory.load at hml
+        obtain ⟨⟨bs, bm'⟩, hbl, hml⟩ := ep1_bind_ok hml
+        obtain ⟨rfl, rfl⟩ := Prod.mk.inj (ep1_pure_ok hml)
+        obtain ⟨bs2, hbmload, hd⟩ :=
+          ep1_load_any_to_bm s1.mem.memory.mem bm' s2.mem.memory p1' p2' sz ⟨1⟩ _ hrel hview' bs hbl
+        have hml2 : MemoryOps.load (M := BM) s2.mem.memory p2' sz ⟨1⟩ =
+            .ok (bs2, s2.mem.memory) := hbmload
+        let cm2 : Gen.ConcurrentMemory BM :=
+          ⟨s2.mem.memory, s2.mem.accesses ++ [⟨.Load, .None, p2'.addr, sz⟩]⟩
+        refine ⟨bs2, { s2 with mem := cm2 }, ?_, hd, ?_⟩
+        · simp only [accBM, cm2, hpo2, ConcurrentMemory.load, hml2, bind, Except.bind, pure,
+            Except.pure]
+        · have hcore := ep1_BasicMemory_load_core _ _ _ _ _ _ _ hbl
+          have hviewEq : bm'.allocations.map ep1AllocView =
+              s1.mem.memory.mem.allocations.map ep1AllocView := by
+            have := congrArg (List.map (fun (c : List (Gen.AbstractByte Gen.TreeBorrowsProvenance) ×
+                Gen.Address × Align × Gen.AllocationKind × Bool) =>
+                (c.1.map AbstractByte.dataM, c.2.1, c.2.2.2.2))) hcore
+            rw [List.map_map, List.map_map] at this
+            exact this
+          show bm'.allocations.map ep1AllocView = s2.mem.memory.allocations.map ep1AllocView
+          rw [hviewEq]
+          exact hrel
+      cases hdd : decodeDiscriminantM (M := TBM) accTB discr mTB1 with
+      | error e =>
+        simp only [accTB, bind, Except.bind] at hdd
+        rw [hdd] at h
+        cases h
+      | ok res =>
+        obtain ⟨opt, m2⟩ := res
+        obtain ⟨s2', hdd2, _⟩ :=
+          ep1_decodeDiscriminantM_sim2 Rel accTB accBM hstep discr opt mTB1 m2 m1 hmem hdd
+        simp only [accTB, bind, Except.bind] at hdd
+        rw [hdd] at h
+        dsimp only at h
+        cases opt with
+        | none => simp [ub] at h
+        | some x =>
+          simp only [pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+          obtain ⟨rfl, _⟩ := h
+          refine ⟨x, dty, s2', rfl, ?_⟩
+          rw [← evalValueM_bm_eq]
+          have halBM : rpBM.aligned = true := by
+            rw [← hal]
+            cases hra : rpTB.aligned
+            · simp [hra] at halTB
+            · rfl
+          simp only [evalValueM, hpBM, halBM, bind, Except.bind, Bool.not_true,
+            Bool.false_eq_true, ↓reduceIte]
+          simp only [accBM, bind, Except.bind] at hdd2
+          rw [hdd2]
+          rfl
+  | _ => simp [specPanic] at h
+
+/-- `liftMachToTB` preserves what `GetDiscriminant` can observe of every allocation. -/
+theorem ep1_liftMachToTB_allocView (m : Mach) :
+    (liftMachToTB m).mem.memory.mem.allocations.map ep1AllocView =
+      m.mem.memory.allocations.map ep1AllocView := by
+  show (m.mem.memory.allocations.map liftAllocTB).map ep1AllocView = _
+  rw [List.map_map]
+  apply List.map_congr_left
+  intro a _
+  simp only [Function.comp, ep1AllocView, liftAllocTB, List.map_map, Prod.mk.injEq, and_true]
+  apply List.map_congr_left
+  intro b _
+  cases b <;> rfl
+
+private theorem ep1_listIndex_map {α β : Type} (f : α → β) (xs : List α) (i : Int)
+    (what : String) :
+    listIndex (xs.map f) i what =
+      (match listIndex xs i what with
+       | .ok a => .ok (f a)
+       | .error e => .error e) := by
+  unfold listIndex
+  by_cases hi : 0 ≤ i
+  · simp only [hi, ↓reduceIte, List.getElem?_map]
+    cases xs[i.toNat]? <;> rfl
+  · simp only [hi, ↓reduceIte]
+    rfl
+
+private theorem ep1_mapGet_lift_locals (locals : Map Gen.LocalName Ptr) (name : Gen.LocalName) :
+    mapGet (⟨locals.entries.map fun (k, p) => (k, liftThinPtrTB p)⟩ :
+        Map Gen.LocalName (Gen.ThinPointer Gen.TreeBorrowsProvenance)) name =
+      (mapGet locals name).map liftThinPtrTB := by
+  unfold mapGet
+  dsimp only
+  induction locals.entries with
+  | nil => rfl
+  | cons e rest ih =>
+    obtain ⟨k, p⟩ := e
+    by_cases hk : k = name
+    · simp [List.find?, hk]
+    · simp only [List.map_cons, List.find?, hk, decide_false]
+      exact ih
+
+/-- `eval_place(Local)` on a lifted machine is the lift of `eval_place(Local)` on the
+`BasicMemory` machine. -/
+private theorem ep1_evalPlaceM_local_lift (m : Mach) (name : Gen.LocalName) :
+    evalPlaceM (liftMachToTB m) (.Local name) =
+      (match evalPlace m (.Local name) with
+       | .ok ((rp, ty), _) =>
+         .ok ((⟨⟨liftThinPtrTB rp.ptr.thin_pointer, none⟩, rp.aligned⟩, ty), liftMachToTB m)
+       | .error e => .error e) := by
+  have hthreads : (liftMachToTB m).threads = m.threads.map liftThreadTB := rfl
+  have hact : (liftMachToTB m).active_thread = m.active_thread := rfl
+  simp only [evalPlaceM, evalPlace, curFrameM, curFrame, activeThreadM, activeThread, hthreads,
+    hact, ep1_listIndex_map, bind, Except.bind]
+  cases hth : listIndex m.threads m.active_thread "self.threads[self.active_thread]" with
+  | error e => rfl
+  | ok th =>
+    dsimp only
+    have hlast : (liftThreadTB th).stack.getLast? = th.stack.getLast?.map liftFrameTB := by
+      simp [liftThreadTB, List.getLast?_map]
+    rw [hlast]
+    cases hfr : th.stack.getLast? with
+    | none => rfl
+    | some fr =>
+      simp only [Option.map_some]
+      have hfunc : (liftFrameTB fr).func = fr.func := rfl
+      have hlocals : mapGet (liftFrameTB fr).locals name =
+          (mapGet fr.locals name).map liftThinPtrTB := ep1_mapGet_lift_locals fr.locals name
+      simp only [pure, Except.pure, hfunc, hlocals]
+      cases hty : mapIndex fr.func.locals name "self.cur_frame().func.locals[name]" with
+      | error e => rfl
+      | ok ty =>
+        dsimp only
+        cases hg : mapGet fr.locals name with
+        | none => rfl
+        | some p => rfl
+
+/-- **Hypothesis-free instance for locals of a lifted machine**: on `liftMachToTB m`, whenever
+`GetDiscriminant` of a local succeeds under Tree Borrows, it succeeds on the `BasicMemory`
+machine `m` itself with the same discriminant at the same type. (The premises of
+`ep1_getDiscriminant_tb_success_implies_bm_success` are discharged: the lifted local place has
+the same address / allocation / alignment, and lifting preserves every allocation's observable
+view.) -/
+theorem ep1_getDiscriminant_local_lifted_tb_success_implies_bm_success
+    (m : Mach) (name : Gen.LocalName) (r : Gen.Value TBM × Gen.Type) (mTB' : MachTB)
+    (h : evalValueM (liftMachToTB m) (.GetDiscriminant (.Local name)) = .ok (r, mTB')) :
+    ∃ (x : Int) (dty : Gen.IntType) (m' : Mach),
+      r = (.Int x, .Int dty) ∧
+      evalValue m (.GetDiscriminant (.Local name)) = .ok ((.Int x, .Int dty), m') := by
+  have hlift := ep1_evalPlaceM_local_lift m name
+  cases hpBM : evalPlace m (.Local name) with
+  | error e =>
+    rw [hpBM] at hlift
+    have := (ep1_evalM_type_mismatch_panics_and_error_propagation (liftMachToTB m)
+      (liftMachToTB m)).2.2.2.2.1 (.Local name) e hlift
+    rw [this] at h
+    cases h
+  | ok res =>
+    obtain ⟨⟨rp, ty⟩, m1⟩ := res
+    rw [hpBM] at hlift
+    have hm1 : m1 = m := evalPlace_derefFree_mach (.Local name) rfl m _ _ hpBM
+    subst hm1
+    refine ep1_getDiscriminant_tb_success_implies_bm_success (liftMachToTB m1) (liftMachToTB m1)
+      mTB' m1 m1 (.Local name) _ rp ty r hlift hpBM ?_ rfl (ep1_liftMachToTB_allocView m1) h
+    simp only [ep1PtrView, liftThinPtrTB, Option.map_map, Prod.mk.injEq, true_and]
+    cases rp.ptr.thin_pointer.provenance <;> rfl
+
 #check_theorem_deps "[EP1-EXPR-AUDIT]"
   ep1_type_meta_kind_eq_layout_meta_kind
   ep1_evalUnOpM_computeSize_computeAlign_mach_indep
@@ -10673,6 +11608,15 @@ theorem ep1_misaligned_downcast_zst_slice_and_multitag_witness :
   ep1_meta_unops_nonVTable_never_unsupported_and_vtable_layout_total
   ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign
   ep1_misaligned_downcast_zst_slice_and_multitag_witness
+  ep1_evalValueM_getDiscriminant_frame
+  ep1_evalValue_getDiscriminant_readonly_bm
+  ep1_evalValueM_getDiscriminant_preserves_bytes_tb
+  ep1_evalM_downcast_variant_union_add_no_machine_effect
+  ep1_evalValueM_variant_checkValue
+  ep1_getDiscriminant_address_hypotheses_necessary_and_no_result_check_witness
+  ep1_getDiscriminant_tb_success_implies_bm_success
+  ep1_liftMachToTB_allocView
+  ep1_getDiscriminant_local_lifted_tb_success_implies_bm_success
 
 /-- Verify that every newly added or modified executable `Interp` definition in
 Episode 1 is strictly computable (`Classical.choice`-free, `sorryAx`-free, and
