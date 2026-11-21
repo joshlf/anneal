@@ -1135,6 +1135,34 @@ def a14StrRecWeak :
   let p14 := specInstanceCandidates env `Trusted.VerificationResult.ItemSpec "ep2::a14str" 256
   let m14s ← specInstanceCandidatesMeta `Trusted.VerificationResult.ItemSpec "ep2::a14str" 256
   IO.println s!"A1_4_string_rec_literal: pure={p14.contains ``a14StrRecWeak} meta={m14s.contains ``a14StrRecWeak}"
+
+/-! ### Episode 2 `B2` regressions (forged registered-instance entries) -/
+
+-- B2-1: an instance entry stored directly with `instanceExtension.add` (bypassing `addInstance`'s
+-- "return type is a class" check) for a variable-concluding constant, keyed like `ItemSpec d`, makes
+-- `ItemSpec d` resolve to a weak payload that no declaration type exposes under `ItemSpec`.
+instance b21Strong : ItemSpec "ep2::b21" where pre := ret10Pre; post := ret10Post
+class B21Holder (T : Type 1) where val : T
+instance b21HolderInst : B21Holder (ItemSpec "ep2::b21") := ⟨{ pre := fun _ => False, post := fun _ _ => True }⟩
+def b21Universal {T : Type 1} [h : B21Holder T] : T := h.val
+def b21Cert : MultiMutantSpecCert b21Strong.pre b21Strong.post := ret10MultiCert
+run_cmd Elab.Command.liftTermElabM do
+  let keys ← Meta.DiscrTree.mkPath (mkApp (mkConst ``ItemSpec) (mkStrLit "ep2::b21"))
+  let ent : Meta.InstanceEntry := { keys := keys, val := mkConst ``b21Universal, priority := 5000, globalName? := some ``b21Universal, synthOrder := #[1], attrKind := AttributeKind.global }
+  Meta.instanceExtension.add ent AttributeKind.global
+theorem b21ResolvesWeak : (inferInstance : ItemSpec "ep2::b21").pre [] = False := rfl
+
+#eval show MetaM Unit from do
+  let env ← getEnv
+  let ctx := SpecAuditCtx.forLiveMeta env 400
+  let ec := instanceEntryCandidates env ctx.toolchainProv `Trusted.VerificationResult.ItemSpec "ep2::b21" 256
+  IO.println s!"B2_1_forged_instance_entry_scan: listed={ec.contains ``b21Universal} strongListed={ec.contains ``b21Strong}"
+  -- (Every `defId` is ambiguous in this file after the native-evaluator canaries, so the check is
+  -- that the forged entry itself is named among the candidates.)
+  let g1 ← auditItemSpecStrengthBySynth .item "ep2::b21" ``b21Cert (useSynthInstance := false)
+  IO.println s!"{fmtTags "B2_1_forged_instance_entry_gate_no_synth" g1} names={g1.any (fun v => (v.detail.splitOn "b21Universal").length > 1)}"
+  let g2 ← auditItemSpecStrengthBySynth .item "ep2::b21" ``b21Cert
+  IO.println s!"{fmtTags "B2_1_forged_instance_entry_gate_synth" g2} names={g2.any (fun v => (v.detail.splitOn "b21Universal").length > 1)}"
 "##
 
 private def collectPartsJson (baseDir : System.FilePath) (modName : String) : IO Lean.Json := do
@@ -1314,6 +1342,9 @@ A1_2b_poly_sorry_claim_reports_sorry: #[sorryAxiomReached]
 A1_3_dep_rec_shadow: pure=true meta=true
 A1_3_dep_rec_synth_gate: #[specInstanceAmbiguous]
 A1_4_string_rec_literal: pure=true meta=true
+B2_1_forged_instance_entry_scan: listed=true strongListed=true
+B2_1_forged_instance_entry_gate_no_synth: #[specInstanceAmbiguous] names=true
+B2_1_forged_instance_entry_gate_synth: #[specInstanceAmbiguous] names=true
 V7_statement_leak: ok=false statementOriginLeak=true
 V7_proof_only_ok: ok=true statementOriginLeak=false
 tmp_clean=true

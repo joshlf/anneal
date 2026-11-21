@@ -2653,7 +2653,8 @@ Shares the single global budget `fuel` across `forallE` stripping, head normaliz
 projection, or bound/free variable whose term can still reach `specClass`, instantiating a binder
 could reduce it to `specClass targetDefId`, so this returns `.undecided` (`A1-3`). -/
 def specClassConclusionMatchBudget (env : Environment) (specClass : Name) (targetDefId : String)
-    (e : Expr) (fuel : Nat) (reach? : Option NameSet := none) : SpecClassMatch :=
+    (e : Expr) (fuel : Nat) (reach? : Option NameSet := none) (varHeadIsCandidate : Bool := false) :
+    SpecClassMatch :=
   match fuel with
   | 0 => .undecided
   | fuel' + 1 =>
@@ -2661,9 +2662,9 @@ def specClassConclusionMatchBudget (env : Environment) (specClass : Name) (targe
     match res.expr with
     | .forallE _ _ body _ =>
       if _ : res.rem.1 < fuel' + 1 then
-        specClassConclusionMatchBudget env specClass targetDefId body res.rem.1 reach?
+        specClassConclusionMatchBudget env specClass targetDefId body res.rem.1 reach? varHeadIsCandidate
       else
-        specClassConclusionMatchBudget env specClass targetDefId body fuel' reach?
+        specClassConclusionMatchBudget env specClass targetDefId body fuel' reach? varHeadIsCandidate
     | e' =>
       if !res.certainWhnf then .undecided
       else
@@ -2685,7 +2686,11 @@ def specClassConclusionMatchBudget (env : Environment) (specClass : Name) (targe
               .undecided
             else
               .notMatched
-        | .proj _ _ _ | .bvar _ | .fvar _ =>
+        | .bvar _ | .fvar _ =>
+          -- A variable conclusion (`{T : Type 1} → [h : Holder T] → T`) unifies with every goal:
+          -- for a *registered instance* that is a candidate whatever constants it mentions.
+          if varHeadIsCandidate || exprCanReachSpecClass specClass reach? e' then .undecided else .notMatched
+        | .proj _ _ _ =>
           if exprCanReachSpecClass specClass reach? e' then .undecided else .notMatched
         | _ => .notMatched
 termination_by fuel
@@ -3352,6 +3357,45 @@ def isGlobalInstanceRegistered (env : Environment) (declName : Name) : Bool := I
       | .scoped _ _ => pure ()
   return false
 
+/-- Registered-instance scan (`B2-1`). Type class resolution retrieves an instance through the
+discrimination-tree `keys` stored in its `Meta.instanceExtension` entry and then unifies the goal with
+the *declared type of the entry's constant*; the keys need not describe that type. A metaprogram can
+store an entry directly (`instanceExtension.add`), bypassing `addInstance`'s "return type is a class"
+check, so an entry whose constant concludes in a variable (`{T : Type 1} → [h : Holder T] → T`) and
+whose keys are those of `ItemSpec d` makes resolution of `ItemSpec d` return `@c (ItemSpec d) h`, a
+weak specification no declaration-type scan sees (measured: standalone gate `ok`). Every entry stored
+by a non-toolchain module (global or scoped) is therefore a candidate unless the pure normalizer is
+certain its conclusion is not `specClass targetDefId`, with variable conclusions always candidates;
+an entry whose value is not a constant, or names a missing constant, is a candidate as well. -/
+public def instanceEntryCandidates (env : Environment) (toolchainProv : Std.HashSet Name)
+    (specClass : Name) (targetDefId : String) (fuel : Nat := 256) : Array Name := Id.run do
+  let mut entries : Array Meta.InstanceEntry := #[]
+  for h : i in [0:env.header.modules.size] do
+    if toolchainProv.contains env.header.modules[i].module then continue
+    for e in Meta.instanceExtension.ext.getModuleEntries env i do
+      entries := entries.push (match e with | .global a => a | .scoped _ a => a)
+  -- Entries added by the file being elaborated (live `MetaM` use; empty for a loaded environment).
+  for e in (Meta.instanceExtension.ext.getState env).newEntries do
+    entries := entries.push (match e with | .global a => a | .scoped _ a => a)
+  let mut out : Array Name := #[]
+  for ent in entries do
+      let label := match ent.val with
+        | .const n _ => n
+        | _ => (ent.globalName?.getD `_forged_instance_entry).str "_non_constant_instance_value"
+      let isCand := match ent.val with
+        | .const n _ =>
+          match env.find? n with
+          | some ci =>
+            match specClassConclusionMatchBudget env specClass targetDefId ci.type fuel none
+                (varHeadIsCandidate := true) with
+            | .notMatched => false
+            | _ => true
+          | none => true
+        | _ => true
+      if isCand && !out.contains label then
+        out := out.push label
+  return out
+
 /-- Unique-instance synthesis spec-strength gate (`R7`, `A1-2`, `S3a/b`, `B4-3/4/6`, `A3-3c`,
 `A4-3`, `A4-5`, `A4-7`):
 requires a globally unique candidate for `(specClass, defId)` across BOTH pure linear-budget
@@ -3375,9 +3419,10 @@ def auditItemSpecStrengthBySynthCore (ctx : SpecAuditCtx) (kind : SpecClassKind)
         s!"spec class {specClass} does not originate from {ctx.trustedOriginMod}"
     let pureCands := specInstanceCandidates env specClass defId 256
     let metaCands ← specInstanceCandidatesMeta specClass defId 256
+    let entryCands := instanceEntryCandidates env ctx.toolchainProv specClass defId 256
     let mut unionSet : NameSet := {}
     let mut allCands : Array Name := #[]
-    for c in pureCands ++ metaCands do
+    for c in pureCands ++ metaCands ++ entryCands do
       unless unionSet.contains c do
         unionSet := unionSet.insert c
         allCands := allCands.push c

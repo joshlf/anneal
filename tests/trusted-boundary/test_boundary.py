@@ -2122,6 +2122,45 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             ol2.modules = saved_modules
             ol2.spec_lib_owned = False
 
+        # B2-1 (forged registered-instance entry). Resolution retrieves an instance by the `keys`
+        # stored in its `Meta.instanceExtension` entry and unifies with the declared type of the entry's
+        # constant. `instanceExtension.add` bypasses `addInstance`'s "return type is a class" check, so
+        # an entry for `fiUniversal {T : Type 1} [h : FiHolder T] : T` keyed like `ItemSpec "ep2::fi"`
+        # makes `ItemSpec "ep2::fi"` resolve to the weak `FiHolder` payload (the fixture proves it with
+        # `rfl`). No declaration's type mentions the weak specification under `ItemSpec`; the standalone
+        # gate used to certify the strong instance as unique.
+        olean_module(ol2, "OlEp2ForgedInst", (
+            "prelude\nimport Init\nimport Lean\nimport OlEp2SpecClean\n"
+            "open Lean Meta Trusted.VerificationResult\n"
+            "instance fiStrong : ItemSpec \"ep2::fi\" where pre := epPre; post := epPost\n"
+            "class FiHolder (T : Type 1) where val : T\n"
+            "instance fiHolderInst : FiHolder (ItemSpec \"ep2::fi\") :=\n"
+            "  ⟨{ pre := fun _ => False, post := fun _ _ => True }⟩\n"
+            "def fiUniversal {T : Type 1} [h : FiHolder T] : T := h.val\n"
+            "run_cmd Elab.Command.liftTermElabM do\n"
+            "  let keys ← DiscrTree.mkPath (mkApp (mkConst ``ItemSpec) (mkStrLit \"ep2::fi\"))\n"
+            "  let ent : InstanceEntry := { keys := keys, val := mkConst ``fiUniversal, priority := 5000, "
+            "globalName? := some ``fiUniversal, synthOrder := #[1], attrKind := AttributeKind.global }\n"
+            "  instanceExtension.add ent AttributeKind.global\n"
+            "instance fiOtherStrong : ItemSpec \"ep2::fi_other\" where pre := epPre; post := epPost\n"),
+            ["Init", "Lean", "OlEp2SpecClean"])
+        olean_module(ol2, "OlEp2ForgedUse", (
+            "prelude\nimport Init\nimport OlEp2ForgedInst\n"
+            "open Trusted.VerificationResult\n"
+            "theorem fiResolvesWeak : (inferInstance : ItemSpec \"ep2::fi\").pre [0] = False := rfl\n"),
+            ["Init", "OlEp2ForgedInst"])
+        forged_mods = base_spec_mods + ["OlEp2SpecClean", "OlEp2ForgedInst", "OlEp2ForgedUse"]
+        olean_reject(ol2, forged_mods, "[specInstanceAmbiguous] epMultiCert", "fiUniversal",
+                     toolchainRoots=["Init", "Std", "Lean"],
+                     specStrengthChecks=[{"kind": "itemSynth", "defId": "ep2::fi", "cert": "epMultiCert"}])
+        # The registered `ItemSpec` instances themselves are classified, not failed closed: the
+        # variable-conclusion entry is a candidate everywhere, a class-concluding one only for its defId.
+        fi_err = olean_reject(ol2, forged_mods, "[specInstanceAmbiguous] epMultiCert",
+                              toolchainRoots=["Init", "Std", "Lean"],
+                              specStrengthChecks=[{"kind": "itemSynth", "defId": "ep2::fi_other",
+                                                   "cert": "epMultiCert"}])
+        assert "#[fiOtherStrong, fiUniversal]" in fi_err, fi_err
+
         # A4-7 (26-deep binary branching) in a compiled `.olean`.
         exp_lines = ["prelude", "import Init", "import OlEp2SpecClean", "open Trusted.VerificationResult",
                      "instance expStrong : ItemSpec \"ep2::exp\" where pre := epPre; post := epPost",
@@ -2142,7 +2181,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         runner.make_tree_writable(ol2.checkout)
         shutil.rmtree(ol2.checkout)
         done("Episode 2 compiled spec-strength gates (V8/V9, 4 claim kinds, A1-4, A3-3 _sunfold, A1-2/S3 shadows, "
-             "B1-1 theorem-major, B1-4/A1-1 native-evaluator canaries, B1-5/A1-5 provenance & constructive, A1-3/A1-6, A4-7)")
+             "B1-1 theorem-major, B1-4/A1-1 native-evaluator canaries, B1-5/A1-5 provenance & constructive, A1-3/A1-6, B2-1 forged instance entry, A4-7)")
     except BaseException as error:
         (suite / "failure.traceback").write_text(traceback.format_exc())
         print(f"SELF-TEST FAILED: {error}\nPreserved fixture sources/raw logs: {suite}", file=sys.stderr)
