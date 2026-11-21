@@ -11573,10 +11573,12 @@ open Lean in
 under universal, implication, `let`, and metadata wrappers: `True`, `¬ False`,
 `False → P`, `P → P`, reflexive `a = a`, `a ↔ a`, and `HEq a a`, conjunctions
 of trivial propositions, and disjunctions with a trivial disjunct. Bounded at
-256 steps with no recursion, so no `_unsafe_rec` twin is emitted. -/
+4096 steps with no recursion, so no `_unsafe_rec` twin is emitted. Exhausting
+the budget fails closed: a proposition whose first 4096 nodes are all still
+trivial is reported as trivial, so padding cannot smuggle one past. -/
 def trivialProp (e : Expr) : Bool := Id.run do
   let mut todo : List (List Expr) := [[e]]
-  for _ in [0:256] do
+  for _ in [0:4096] do
     match todo with
     | [] => return true
     | [] :: _ => return false
@@ -11605,7 +11607,7 @@ def trivialProp (e : Expr) : Bool := Id.run do
       | .app (.app (.app (.app (.const ``HEq _) _) a) _) b =>
         if a == b then todo := rest else todo := alts :: rest
       | _ => todo := alts :: rest
-  return todo.isEmpty
+  return true
 
 end Anneal.DualCorrespondenceAndTbPruningTests.Audit
 
@@ -13162,6 +13164,13 @@ run_cmd do
       mkConst ``False] do
     if trivialProp e then
       throwError "audit self-test: genuine proposition {e} was flagged"
+  -- Padding fails closed: 300 nested `True ∧ …` conjuncts (past the former
+  -- 256-step budget) are still flagged, and stay genuine if any conjunct is.
+  let pad (last : Expr) : Expr :=
+    (List.replicate 300 ()).foldl
+      (fun acc _ => mkApp2 (mkConst ``And) (mkConst ``True) acc) last
+  unless trivialProp (pad (mkConst ``True)) && !trivialProp (pad (eqN 1 2)) do
+    throwError "audit self-test: padded trivial proposition classifier failed"
   -- User-authored `private` reflexive theorems are flagged, while compiler
   -- `_proof_*` field obligations are flagged only when their type is `True`.
   let privReflCi : ConstantInfo := .thmInfo
