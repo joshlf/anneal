@@ -352,21 +352,33 @@ def borrowTargetDeclsAndLayoutsProto
 /--
 Check that thin pointer `ptrArg` satisfies ABI alignment `reqAlign` across ALL
 valid placements of its backing allocation (matching Miri's symbolic alignment
-check `Miri.Memory.checkPtrAlign` and `Terminators.writeBytesDstAddrAligned`),
-returning a 3-way `ProtoRes Unit`:
+check `Miri.Memory.isPtrMisaligned`, `Miri/Memory/Access.lean:196-221`: the
+allocation's alignment must be at least `reqAlign` and the offset within the
+allocation a multiple of `reqAlign`), returning a 3-way `ProtoRes Unit`.
+
+For a stack borrow the address is `base + placeOff + offsetBytes` with `base`
+any multiple of the root local's alignment, so the criterion is exact: aligned
+in every placement iff `reqAlign <= rootAlign` and
+`(placeOff + offsetBytes) % reqAlign == 0`. The enclosing containers on the
+projection path are irrelevant once the total offset is known (a field of a
+`#[repr(packed)]` struct that happens to sit at an aligned total offset of a
+sufficiently aligned local IS aligned), so no per-container walk is used: it
+could only turn an undetermined case into a false `.ub`.
+
 - `.ok ()`: guaranteed aligned to `reqAlign` under every valid placement
   (`reqAlign <= 1`, aligned provenance-free address, or known allocation with
   `allocAlign >= reqAlign` and `(placeOff + offsetBytes) % reqAlign == 0`);
-- `.ub`: guaranteed misaligned under at least one valid placement (unaligned
-  address, `allocAlign < reqAlign`, or `offsetBytes % reqAlign != 0` — proved
-  unsound for every power-of-two `allocAlign` in
+- `.ub`: misaligned under at least one valid placement (unaligned address,
+  known `allocAlign < reqAlign`, or a known total offset with
+  `(placeOff + offsetBytes) % reqAlign != 0`, which has a misaligned placement
+  for every power-of-two `allocAlign` by
   `misaligned_offset_has_misaligned_placement`);
-- `.unsupported`: `reqAlign > 1` and `offset % reqAlign == 0`, but the backing
-  allocation's alignment guarantee cannot be determined (opaque ADT without a
-  `LayoutTable` entry, untyped caller referent, uncomputable projection offset,
-  or unknown `allocId != 0` on a zero-sized access). When `allowUnknownDangling`
-  is `false` (non-zero access), an unknown `allocId != 0` immediately faults
-  `.ub` because no live allocation backs it.
+- `.unsupported`: the answer cannot be determined: the root allocation's
+  alignment is unknown (opaque ADT without a `LayoutTable` entry, untyped
+  caller referent), the total offset of a projected borrow is uncomputable, or
+  the pointer has an unknown `allocId != 0` on a zero-sized access. When
+  `allowUnknownDangling` is `false` (non-zero access), an unknown
+  `allocId != 0` immediately faults `.ub` because no live allocation backs it.
 
 Reference (The Rust Reference, "Size and Alignment"):
 <https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
@@ -402,50 +414,34 @@ def checkPtrArgAlignedProto
         | .some entry =>
           let (targetDecls, targetLayouts) :=
             borrowTargetDeclsAndLayoutsProto s.memory.callStack bodyLocalDecls bodyLayouts entry
-          let walkOk : Bool :=
-            match get? targetDecls entry.targetLocal with
-            | .some rootDecl =>
-              checkTargetPlaceAlignWalk
-                targetDecls
-                targetLayouts
-                reqAlign
-                p.offsetBytes
-                (.some rootDecl.ty)
-                .none
-                .none
-                entry.targetProjection
-            | .none => true
-          match walkOk with
-          | false => .ub
-          | true =>
-            let placeOffOpt :=
-              borrowPlaceByteOffset? locals s.memory.callerLocals bodyLocalDecls bodyLayouts entry s.memory.callStack
-            let knownMisaligned : Bool :=
-              match placeOffOpt with
-              | .some placeOff => Bool.not (isAlignedOffset (Nat.add placeOff p.offsetBytes) reqAlign)
-              | .none =>
-                match entry.targetProjection with
-                | .nil => Bool.not (isAlignedOffset p.offsetBytes reqAlign)
-                | _ :: _ => false
-            match knownMisaligned with
-            | true => .ub
-            | false =>
-              let rootAlignOpt : Option Nat :=
-                match get? targetDecls entry.targetLocal with
-                | .some rootDecl =>
-                  tyExactByteAlign? targetDecls targetLayouts
-                    (resolveTyWithLocalDecls targetDecls targetLayouts rootDecl.ty)
-                | .none => .none
-              match rootAlignOpt with
-              | .none => .unsupported
-              | .some rootAlign =>
-                match Nat.ble reqAlign rootAlign with
-                | false => .ub
-                | true =>
-                  match placeOffOpt, entry.targetProjection with
-                  | .some _, _ => .ok ()
-                  | .none, .nil => .ok ()
-                  | .none, _ :: _ => .unsupported
+          let placeOffOpt :=
+            borrowPlaceByteOffset? locals s.memory.callerLocals bodyLocalDecls bodyLayouts entry s.memory.callStack
+          let knownMisaligned : Bool :=
+            match placeOffOpt with
+            | .some placeOff => Bool.not (isAlignedOffset (Nat.add placeOff p.offsetBytes) reqAlign)
+            | .none =>
+              match entry.targetProjection with
+              | .nil => Bool.not (isAlignedOffset p.offsetBytes reqAlign)
+              | _ :: _ => false
+          match knownMisaligned with
+          | true => .ub
+          | false =>
+            let rootAlignOpt : Option Nat :=
+              match get? targetDecls entry.targetLocal with
+              | .some rootDecl =>
+                tyExactByteAlign? targetDecls targetLayouts
+                  (resolveTyWithLocalDecls targetDecls targetLayouts rootDecl.ty)
+              | .none => .none
+            match rootAlignOpt with
+            | .none => .unsupported
+            | .some rootAlign =>
+              match Nat.ble reqAlign rootAlign with
+              | false => .ub
+              | true =>
+                match placeOffOpt, entry.targetProjection with
+                | .some _, _ => .ok ()
+                | .none, .nil => .ok ()
+                | .none, _ :: _ => .unsupported
         | .none =>
           match lookupGlobalAlloc s.memory.globals p.allocId with
           | .some alloc =>
@@ -621,10 +617,15 @@ structure ResolvedMemEndpointProto : Type where
   effOffset : Nat
   /-- Total byte size of the root allocation. -/
   allocSize : Nat
-  /-- Lower byte bound accessible through this provenance (`0` unless ranged borrow). -/
+  /-- Lower byte bound of the tag window: the bytes of the root allocation covered
+      by the borrow entry's place or explicit byte range (`0` for a whole-local
+      borrow and for globals). -/
   accessLower : Nat
-  /-- Exclusive upper byte bound accessible through this provenance. -/
+  /-- Exclusive upper byte bound of the tag window. -/
   accessUpper : Nat
+  /-- Whether the tag window `[accessLower, accessUpper)` could be determined
+      (`false` when the borrowed sub-place's byte size is unknown). -/
+  tagWindowKnown : Bool
   /-- Whether writes to this allocation are permitted (`false` for immutable globals). -/
   writable : Bool
   /-- Backing borrow `(tag, entry)` for stack/caller locals, or `.none` for globals. -/
@@ -704,24 +705,40 @@ def resolveLiveMemEndpointProto
             match rootSizeOpt with
             | .none => .unsupported
             | .some rootSize =>
-              let accessLower :=
+              -- Tag window: the bytes this borrow entry covers. An explicit byte
+              -- range wins; a whole-local borrow covers the root; a sub-place
+              -- borrow covers `[placeOff, placeOff + size_of(place))`.
+              let windowOpt : Option (Nat × Nat) :=
                 match Nat.beq entry.rangeLen 0 with
-                | true => 0
-                | false => entry.rangeOffset
-              let accessUpper :=
-                match Nat.beq entry.rangeLen 0 with
-                | true => rootSize
                 | false =>
                   let rEnd := Nat.add entry.rangeOffset entry.rangeLen
                   match Nat.ble rEnd rootSize with
-                  | true => rEnd
-                  | false => rootSize
+                  | true => .some (entry.rangeOffset, rEnd)
+                  | false => .some (entry.rangeOffset, rootSize)
+                | true =>
+                  match normalizeSubsliceProjections (stripTransparentProjections entry.targetProjection) with
+                  | .nil => .some (0, rootSize)
+                  | _ :: _ =>
+                    match
+                      placeTyResolved targetDecls targetLayouts
+                        { local_ := entry.targetLocal, projection := entry.targetProjection }
+                    with
+                    | .some placeTy =>
+                      match intrinsicRigidTyByteSize targetDecls targetLayouts placeTy.kind with
+                      | .some placeSize => .some (placeOff, Nat.add placeOff placeSize)
+                      | .none => .none
+                    | .none => .none
+              let (accessLower, accessUpper, tagWindowKnown) : Nat × Nat × Bool :=
+                match windowOpt with
+                | .some (lo, hi) => (lo, hi, true)
+                | .none => (0, rootSize, false)
               .ok
                 { key := .stack entry.targetFrameDepth entry.targetLocal
                   effOffset := effOff
                   allocSize := rootSize
                   accessLower := accessLower
                   accessUpper := accessUpper
+                  tagWindowKnown := tagWindowKnown
                   writable := true
                   borrowInfo? := .some (p.tag, entry)
                   targetDecls := targetDecls
@@ -743,6 +760,7 @@ def resolveLiveMemEndpointProto
             allocSize := allocSz
             accessLower := 0
             accessUpper := allocSz
+            tagWindowKnown := true
             writable := writable
             borrowInfo? := .none
             targetDecls := .nil
@@ -754,13 +772,43 @@ def resolveLiveMemEndpointProto
 
 /--
 Check whether byte slice `[ep.effOffset, ep.effOffset + len)` lies completely
-within `[ep.accessLower, ep.accessUpper]` of `ep`.
+within the tag window `[ep.accessLower, ep.accessUpper]` of `ep`.
 -/
 @[reducible]
 def endpointRangeInBoundsProto (ep : ResolvedMemEndpointProto) (len : Nat) : Bool :=
   Bool.and
     (Nat.ble ep.accessLower ep.effOffset)
     (Nat.ble (Nat.add ep.effOffset len) ep.accessUpper)
+
+/--
+Three-way check of a `len`-byte access at `ep`:
+
+- `.ub` when `[effOffset, effOffset + len)` leaves the root allocation
+  `[0, allocSize)`: the pointer is not dereferenceable for `len` bytes.
+- `.unsupported` when the access stays inside the allocation but leaves the
+  **tag window** of the borrow it goes through (the borrowed sub-place or byte
+  range), or when that window is unknown. Tree Borrows permits such an access
+  (a pointer derived from `&mut s.a` may reach `s.b`; permissions outside the
+  reborrowed range are initialized lazily), but it is a foreign access to every
+  borrow of the bytes it touches. `BorrowEntry` keeps one permission per tag
+  and decides overlap between two unranged entries from their projections
+  (`borrowEntryOverlapsWrite`), so an access outside its own entry's place
+  would be compared with sibling borrows through the wrong place: a write to
+  `s.b` through a borrow of `s.a` would leave a `.unique` borrow of `s.b`
+  untouched (missed UB on its next use). Failing closed keeps every modeled
+  access inside its entry's place, where projection overlap is sound
+  (`Terminators.writeBytesAction` likewise rejects "writes past the end of a
+  sub-place" as unsupported).
+- `.ok ()` when the access lies inside the tag window.
+-/
+@[reducible]
+def endpointAccessCheckProto (ep : ResolvedMemEndpointProto) (len : Nat) : ProtoRes Unit :=
+  match Nat.ble (Nat.add ep.effOffset len) ep.allocSize with
+  | false => .ub
+  | true =>
+    match Bool.and ep.tagWindowKnown (endpointRangeInBoundsProto ep len) with
+    | true => .ok ()
+    | false => .unsupported
 
 /--
 Test whether `v` is a leaf value whose untyped byte encoding
@@ -1780,9 +1828,10 @@ def evalCopyMemoryProto
                 | .ub => MirStepNode.fail .ub
                 | .unsupported => MirStepNode.unsupported
                 | .ok srcEp =>
-                  match endpointRangeInBoundsProto srcEp totalBytes with
-                  | false => MirStepNode.fail .ub
-                  | true =>
+                  match endpointAccessCheckProto srcEp totalBytes with
+                  | .ub => MirStepNode.fail .ub
+                  | .unsupported => MirStepNode.unsupported
+                  | .ok () =>
                     let borrowsAfterReadOpt : Option (List BorrowEntry) :=
                       match srcEp.borrowInfo? with
                       | .none => .some s.memory.borrows
@@ -1809,9 +1858,14 @@ def evalCopyMemoryProto
                           | .ub => MirStepNode.fail .ub
                           | .unsupported => MirStepNode.unsupported
                           | .ok dstEp =>
-                            match Bool.and dstEp.writable (endpointRangeInBoundsProto dstEp totalBytes) with
-                            | false => MirStepNode.fail .ub
-                            | true =>
+                            let dstAccess : ProtoRes Unit :=
+                              match dstEp.writable with
+                              | false => .ub
+                              | true => endpointAccessCheckProto dstEp totalBytes
+                            match dstAccess with
+                            | .ub => MirStepNode.fail .ub
+                            | .unsupported => MirStepNode.unsupported
+                            | .ok () =>
                               let borrowsAfterWriteOpt : Option (List BorrowEntry) :=
                                 match dstEp.borrowInfo? with
                                 | .none => .some borrows₁
@@ -2123,9 +2177,10 @@ def evalCompareBytesProto
             | .ub => MirStepNode.fail .ub
             | .unsupported => MirStepNode.unsupported
             | .ok leftEp =>
-              match endpointRangeInBoundsProto leftEp count with
-              | false => MirStepNode.fail .ub
-              | true =>
+              match endpointAccessCheckProto leftEp count with
+              | .ub => MirStepNode.fail .ub
+              | .unsupported => MirStepNode.unsupported
+              | .ok () =>
                 let borrows₁Opt : Option (List BorrowEntry) :=
                   match leftEp.borrowInfo? with
                   | .none => .some s.memory.borrows
@@ -2156,9 +2211,10 @@ def evalCompareBytesProto
                         | .ub => MirStepNode.fail .ub
                         | .unsupported => MirStepNode.unsupported
                         | .ok rightEp =>
-                          match endpointRangeInBoundsProto rightEp count with
-                          | false => MirStepNode.fail .ub
-                          | true =>
+                          match endpointAccessCheckProto rightEp count with
+                          | .ub => MirStepNode.fail .ub
+                          | .unsupported => MirStepNode.unsupported
+                          | .ok () =>
                             let borrows₂Opt : Option (List BorrowEntry) :=
                               match rightEp.borrowInfo? with
                               | .none => .some borrows₁
@@ -2309,9 +2365,10 @@ def evalRawEqProto
                   | .ub => MirStepNode.fail .ub
                   | .unsupported => MirStepNode.unsupported
                   | .ok aEp =>
-                    match endpointRangeInBoundsProto aEp elemSize with
-                    | false => MirStepNode.fail .ub
-                    | true =>
+                    match endpointAccessCheckProto aEp elemSize with
+                    | .ub => MirStepNode.fail .ub
+                    | .unsupported => MirStepNode.unsupported
+                    | .ok () =>
                       let borrows₁Opt : Option (List BorrowEntry) :=
                         match aEp.borrowInfo? with
                         | .none => .some s.memory.borrows
@@ -2342,9 +2399,10 @@ def evalRawEqProto
                               | .ub => MirStepNode.fail .ub
                               | .unsupported => MirStepNode.unsupported
                               | .ok bEp =>
-                                match endpointRangeInBoundsProto bEp elemSize with
-                                | false => MirStepNode.fail .ub
-                                | true =>
+                                match endpointAccessCheckProto bEp elemSize with
+                                | .ub => MirStepNode.fail .ub
+                                | .unsupported => MirStepNode.unsupported
+                                | .ok () =>
                                   let borrows₂Opt : Option (List BorrowEntry) :=
                                     match bEp.borrowInfo? with
                                     | .none => .some borrows₁
@@ -2930,11 +2988,72 @@ def resetTypedFieldsAtOffsetsWith
             resetTypedFieldsAtOffsetsWith sizeOfKind srcBytes resetOne offRest kRest dstBuf'
   | _, _, _ => .none
 
+/-- `n` initialized, provenance-free probe bytes (used to compute data ranges). -/
+@[reducible]
+def replicateInitBytesProto : Nat → List AbstractByte
+  | .zero => .nil
+  | .succ k => .init 0 .none :: replicateInitBytesProto k
+
+/-- `n` copies of `false`: the empty data mask of an `n`-byte union. -/
+@[reducible]
+def emptyDataMaskProto : Nat → List Bool
+  | .zero => .nil
+  | .succ k => false :: emptyDataMaskProto k
+
+/--
+Mark as data every position of `mask` at which the field probe `probe` (placed
+at offset `0`) is still initialized after its padding was reset.
+-/
+@[reducible]
+def orProbeIntoDataMaskProto : List Bool → List AbstractByte → List Bool
+  | mask, .nil => mask
+  | .nil, _ :: _ => .nil
+  | _ :: maskRest, .init _ _ :: probeRest => true :: orProbeIntoDataMaskProto maskRest probeRest
+  | m :: maskRest, .uninit :: probeRest => m :: orProbeIntoDataMaskProto maskRest probeRest
+
+/-- Keep the bytes at data positions of `mask` and reset every other byte to `.uninit`. -/
+@[reducible]
+def applyDataMaskProto : List Bool → List AbstractByte → List AbstractByte
+  | true :: maskRest, b :: bytesRest => b :: applyDataMaskProto maskRest bytesRest
+  | false :: maskRest, _ :: bytesRest => .uninit :: applyDataMaskProto maskRest bytesRest
+  | _, _ => .nil
+
+/--
+Data mask of a union from its field layouts: a byte is data iff it is a
+non-padding byte of AT LEAST ONE field (all fields start at offset `0`). Each
+field's data bytes are found by resetting the padding of an all-initialized
+probe of the field's size (`resetOne`). An unknown field layout yields `.none`.
+-/
+@[reducible]
+def unionDataMaskWith
+    (layouts : LayoutTable)
+    (resetOne : Nat → List AbstractByte → Option (List AbstractByte)) :
+    List Nat → List Bool → Option (List Bool)
+  | .nil, mask => .some mask
+  | fIdx :: fRest, mask =>
+    match LayoutTable.lookup layouts fIdx with
+    | .none => .none
+    | .some fl =>
+      match resetOne fIdx (replicateInitBytesProto fl.size.bytes) with
+      | .none => .none
+      | .some probe =>
+        unionDataMaskWith layouts resetOne fRest (orProbeIntoDataMaskProto mask probe)
+
 /--
 Reset all padding bytes of `bytes` to `AbstractByte.uninit` according to
 `LayoutTable` entry `lIdx`, preserving every value byte (including pointer
-provenance) and every union byte. Multi-variant enums and incomplete layouts
-return `.none` (fail closed).
+provenance). Multi-variant enums and incomplete layouts return `.none` (fail
+closed).
+
+A union keeps exactly its **data range**: the bytes that are data in at least
+one field. Bytes that are padding in every field are reset like any other
+padding (for `MaybeUninit<(u8, u32)>` the fields are `()` and `(u8, u32)`, so
+bytes `1..3` are reset). This is the union data range of the interpreter's
+typed-copy validation, which `Miri.Interpreter.Intrinsics.typedSwap` runs with
+padding reset (`Intrinsics.lean:209-212`). The range needs the union's field
+layouts (`fieldLayouts`); without them only a scalar-ABI union whose scalar
+spans the whole union is accepted (every byte is data), and any other union
+fails closed rather than keeping bytes that may be common padding.
 -/
 def resetTypedPaddingForLayoutIdxProto :
     Nat → LayoutTable → Nat → List AbstractByte → Option (List AbstractByte)
@@ -2949,7 +3068,33 @@ def resetTypedPaddingForLayoutIdxProto :
         match l.variants with
         | .single _ =>
           match l.fields with
-          | .union _ | .primitive => .some bytes
+          | .primitive => .some bytes
+          | .union fieldCount =>
+            match Bool.and (Nat.beq (length l.fieldLayouts) fieldCount) (Bool.not (Nat.beq fieldCount 0)) with
+            | true =>
+              match
+                unionDataMaskWith
+                  layouts
+                  (resetTypedPaddingForLayoutIdxProto fuel' layouts)
+                  l.fieldLayouts
+                  (emptyDataMaskProto l.size.bytes)
+              with
+              | .some mask =>
+                let masked := applyDataMaskProto mask bytes
+                match Nat.beq (length masked) (length bytes) with
+                | true => .some masked
+                | false => .none
+              | .none => .none
+            | false =>
+              match l.backendRepr with
+              | .scalar sl =>
+                match scalarLayoutByteWidth sl with
+                | .some scalarBytes =>
+                  match Nat.beq scalarBytes l.size.bytes with
+                  | true => .some bytes
+                  | false => .none
+                | .none => .none
+              | _ => .none
           | .arbitrary .nil _ => .some (replicateUninitBytes l.size.bytes)
           | .arbitrary offsets memIdx =>
             match Nat.beq (length l.fieldLayouts) (length offsets) with
@@ -3009,7 +3154,8 @@ def resetTypedPaddingForLayoutIdxProto :
 
 /--
 Reset all padding bytes of `bytes` to `AbstractByte.uninit` at Rust type `ty`,
-preserving all value, pointer, and union (`MaybeUninit`) bytes.
+preserving all value and pointer bytes and the data range of every union
+(`resetTypedPaddingForLayoutIdxProto`).
 
 `Miri.Interpreter.Intrinsics.typedSwap` moves both values via typed copies with
 padding reset (`Intrinsics.lean:205-212`). Applying this unconditionally to BOTH
@@ -3218,15 +3364,17 @@ def evalTypedSwapNonOverlappingProto
                     | .unsupported, _ => MirStepNode.unsupported
                     | _, .unsupported => MirStepNode.unsupported
                     | .ok xEp, .ok yEp =>
-                      let boundsAndWritable :=
-                        Bool.and
-                          (Bool.and xEp.writable yEp.writable)
-                          (Bool.and
-                            (endpointRangeInBoundsProto xEp elemSize)
-                            (endpointRangeInBoundsProto yEp elemSize))
+                      let boundsAndWritable : ProtoRes Unit :=
+                        match Bool.and xEp.writable yEp.writable with
+                        | false => .ub
+                        | true =>
+                          combineProtoResUnit
+                            (endpointAccessCheckProto xEp elemSize)
+                            (endpointAccessCheckProto yEp elemSize)
                       match boundsAndWritable with
-                      | false => MirStepNode.fail .ub
-                      | true =>
+                      | .ub => MirStepNode.fail .ub
+                      | .unsupported => MirStepNode.unsupported
+                      | .ok () =>
                         -- Container-first disjointness (allows same-tag disjoint ranges!):
                         let disjointOk : Bool :=
                           match decide (xEp.key = yEp.key) with
@@ -3926,6 +4074,97 @@ def validateLayoutValueListWith
     combineTypedValidityProto (checkOne fIdx v) (validateLayoutValueListWith checkOne fRest vRest)
   | _, _ => .ub
 
+/-- Three-valued conjunction over a list of "permits a fully uninitialized value" answers. -/
+@[reducible]
+def allPermitUninitWith {κ : Type} (permits : κ → Option Bool) : List κ → Option Bool
+  | .nil => .some true
+  | k :: rest =>
+    match permits k, allPermitUninitWith permits rest with
+    | .some true, .some true => .some true
+    | .some false, _ => .some false
+    | _, .some false => .some false
+    | _, _ => .none
+
+/--
+Whether a fully uninitialized value is valid at `LayoutTable` entry `lIdx`:
+`some true` for zero-sized types, unions, and arrays / structs all of whose
+elements / fields permit it; `some false` for scalars, pointers, enums, and
+uninhabited types; `none` when the layout does not say.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "Note: Uninitialized memory is also implicitly invalid for any type that has a restricted set of valid values. In other words, the only cases in which reading uninitialized memory is permitted are inside `union`s and in “padding” (the gaps between the fields of a type)."
+-/
+def layoutPermitsUninitProto : Nat → LayoutTable → Nat → Option Bool
+  | .zero, _, _ => .none
+  | .succ fuel', layouts, lIdx =>
+    match LayoutTable.lookup layouts lIdx with
+    | .none => .none
+    | .some l =>
+      match l.isUninhabited with
+      | true => .some false
+      | false =>
+        match Nat.beq l.size.bytes 0 with
+        | true => .some true
+        | false =>
+          match l.variants with
+          | .single _ =>
+            match l.fields with
+            | .union _ => .some true
+            | .primitive =>
+              match l.backendRepr with
+              | .scalar (.union _) => .some true
+              | _ => .some false
+            | .array _ count =>
+              match Nat.beq count 0 with
+              | true => .some true
+              | false =>
+                match l.fieldLayouts with
+                | elemIdx :: .nil => layoutPermitsUninitProto fuel' layouts elemIdx
+                | _ => .none
+            | .arbitrary offsets _ =>
+              match Nat.beq (length l.fieldLayouts) (length offsets) with
+              | true => allPermitUninitWith (layoutPermitsUninitProto fuel' layouts) l.fieldLayouts
+              | false =>
+                match l.backendRepr with
+                | .scalar (.initialized _ _) => .some false
+                | .scalarPair (.initialized _ _) _ => .some false
+                | .scalarPair _ (.initialized _ _) => .some false
+                | _ => .none
+          | _ => .some false
+
+/--
+Whether a fully uninitialized value is valid at Rust type `ty`
+(`layoutPermitsUninitProto` for ADTs and closures).
+-/
+def rigidTyPermitsUninitProto : Nat → List LocalDecl → LayoutTable → RigidTy → Option Bool
+  | .zero, _, _, _ => .none
+  | .succ fuel', localDecls, layouts, ty =>
+    match ty with
+    | .tuple .nil | .fnDef _ _ => .some true
+    | .never | .bool | .char | .uint _ | .int _ | .float _
+    | .rawPtr _ _ | .ref _ _ | .fnPtr _ _ _ _ => .some false
+    | .array elemKind n =>
+      match Nat.beq n 0 with
+      | true => .some true
+      | false => rigidTyPermitsUninitProto fuel' localDecls layouts elemKind
+    | .tuple (kHead :: kTail) =>
+      allPermitUninitWith (rigidTyPermitsUninitProto fuel' localDecls layouts) (kHead :: kTail)
+    | .adt _ _ | .closure _ _ =>
+      layoutPermitsUninitProto fuel' layouts (resolveRigidTyWithDeclsProto localDecls layouts ty).layoutIdx
+    | _ => .none
+
+/--
+Validity of `Value.uninit` at a type whose "permits uninitialized" answer is
+`permits`: valid, UB, or undetermined (fail closed).
+-/
+@[reducible]
+def uninitValidityProto : Option Bool → TypedBytesValidityProto
+  | .some true => .valid
+  | .some false => .ub
+  | .none => .unsupported
+
 /-- Validate a single scalar or pointer `Value` against a `ScalarLayout` descriptor. -/
 @[reducible]
 def validateScalarLayoutValueProto
@@ -3984,7 +4223,7 @@ def validateValueAtLayoutIdxProto (mem : Memory) :
             match Nat.beq l.size.bytes 0 with
             | true =>
               match v with
-              | .unit | .aggregate _ .nil => .valid
+              | .unit | .aggregate _ .nil | .uninit => .valid
               | _ => .ub
             | false =>
               match l.backendRepr with
@@ -3992,7 +4231,7 @@ def validateValueAtLayoutIdxProto (mem : Memory) :
               | _ => .unsupported
           | .array _ count =>
             match v with
-            | .uninit => .ub
+            | .uninit => uninitValidityProto (layoutPermitsUninitProto fuel' layouts lIdx)
             | .aggregate 0 elems =>
               match Nat.beq (length elems) count with
               | false => .ub
@@ -4006,11 +4245,11 @@ def validateValueAtLayoutIdxProto (mem : Memory) :
             | _ => .ub
           | .arbitrary .nil _ =>
             match v with
-            | .unit | .aggregate _ .nil => .valid
+            | .unit | .aggregate _ .nil | .uninit => .valid
             | _ => .ub
           | .arbitrary offsets memIdx =>
             match v with
-            | .uninit => .ub
+            | .uninit => uninitValidityProto (layoutPermitsUninitProto fuel' layouts lIdx)
             | .aggregate varIdx fieldVals =>
               match Bool.and (Nat.beq varIdx expectedVar) (Nat.beq (length fieldVals) (length offsets)) with
               | false => .ub
@@ -4045,7 +4284,11 @@ Validate a structured `Value` against a Rust `RigidTy` `ty`, returning a 3-way
 - Permits `.uninit` inside `union`/`MaybeUninit` types at ANY nesting depth
   (including `[MaybeUninit<u8>; N]`, `(u32, MaybeUninit<u32>)`, and structs
   containing `MaybeUninit` fields);
-- Rejects bare/non-union `.uninit`, uninhabited types, invalid `bool`/`char`,
+- Accepts a wholly uninitialized sub-value (`Value.uninit`) at every type that
+  permits it (`rigidTyPermitsUninitProto`: zero-sized types, unions, and
+  arrays / tuples / structs of such types, e.g. a `[MaybeUninit<u8>; N]` field
+  that was never written);
+- Rejects `.uninit` at scalar, pointer, and enum types, uninhabited types, invalid `bool`/`char`,
   null thin AND wide `&T`/`&mut T`, null `fn()`, and layout-constrained ADTs
   (`NonZero*`, `NonNull*`, structs with invalid nested `bool`/`char` fields);
 - Fails closed with `.unsupported` on unsized `T`, pointer provenance in
@@ -4115,7 +4358,7 @@ def validateValueForRigidTyProto (mem : Memory) :
           | _ => .ub
         | .tuple .nil | .fnDef _ _ =>
           match v with
-          | .unit | .aggregate 0 .nil => .valid
+          | .unit | .aggregate 0 .nil | .uninit => .valid
           | _ => .ub
         | .rawPtr _ pointee =>
           let isWide :=
@@ -4166,7 +4409,7 @@ def validateValueForRigidTyProto (mem : Memory) :
           | .none => .ub
         | .array elemKind n =>
           match v with
-          | .uninit => .ub
+          | .uninit => uninitValidityProto (rigidTyPermitsUninitProto fuel' localDecls layouts ty)
           | .aggregate 0 elems =>
             match Nat.beq (length elems) n with
             | false => .ub
@@ -4177,7 +4420,7 @@ def validateValueForRigidTyProto (mem : Memory) :
           | _ => .ub
         | .tuple (kHead :: kTail) =>
           match v with
-          | .uninit => .ub
+          | .uninit => uninitValidityProto (rigidTyPermitsUninitProto fuel' localDecls layouts ty)
           | .aggregate 0 fVals =>
             validateTypedValueListWith
               (validateValueForRigidTyProto mem fuel' localDecls layouts)
@@ -5464,6 +5707,99 @@ theorem evalDirectRustIntrinsicProto?_constEvalSelect_diverging_not_ub
       { defPath := "core::intrinsics::const_eval_select", typeArgs := tys, fnSig := .none, isIndirect := false }
       decls layouts argOps argVals locals' dest .none unwind =
       .some MirStepNode.unsupported := rfl
+
+/--
+**Tag-Window Access Theorem (accepted accesses)**: `endpointAccessCheckProto`
+accepts a `len`-byte access exactly when it lies inside the root allocation AND
+inside the known tag window of the borrow it goes through. Every Tree Borrows
+transition computed by `borrowsAfterReadAccessProto` /
+`borrowsAfterWriteAccessProto` is therefore for an access contained in the
+accessing entry's own place or byte range, which is the precondition under
+which projection-based overlap with sibling entries is sound.
+-/
+theorem endpointAccessCheckProto_ok_iff (ep : ResolvedMemEndpointProto) (len : Nat) :
+    endpointAccessCheckProto ep len = .ok () ↔
+      (ep.effOffset + len ≤ ep.allocSize ∧ ep.tagWindowKnown = true ∧
+        ep.accessLower ≤ ep.effOffset ∧ ep.effOffset + len ≤ ep.accessUpper) := by
+  unfold endpointAccessCheckProto endpointRangeInBoundsProto
+  constructor
+  · intro h
+    cases hA : Nat.ble (Nat.add ep.effOffset len) ep.allocSize
+    · rw [hA] at h; cases h
+    · rw [hA] at h
+      dsimp only at h
+      cases hK : ep.tagWindowKnown
+      · rw [hK] at h; cases h
+      · rw [hK] at h
+        cases hL : Nat.ble ep.accessLower ep.effOffset
+        · rw [hL] at h; cases h
+        · rw [hL] at h
+          cases hU : Nat.ble (Nat.add ep.effOffset len) ep.accessUpper
+          · rw [hU] at h; cases h
+          · exact ⟨Nat.ble_eq.mp hA, rfl, Nat.ble_eq.mp hL, Nat.ble_eq.mp hU⟩
+  · rintro ⟨hA, hK, hL, hU⟩
+    have hA' : Nat.ble (Nat.add ep.effOffset len) ep.allocSize = true := Nat.ble_eq.mpr hA
+    have hL' : Nat.ble ep.accessLower ep.effOffset = true := Nat.ble_eq.mpr hL
+    have hU' : Nat.ble (Nat.add ep.effOffset len) ep.accessUpper = true := Nat.ble_eq.mpr hU
+    rw [hA', hK, hL', hU']
+    rfl
+
+/--
+**Tag-Window Access Theorem (UB)**: `endpointAccessCheckProto` reports `.ub`
+exactly when the access leaves the root allocation; an access that stays inside
+the allocation but leaves (or cannot be placed in) the tag window is never
+`.ub`, only `.unsupported`.
+-/
+theorem endpointAccessCheckProto_ub_iff (ep : ResolvedMemEndpointProto) (len : Nat) :
+    endpointAccessCheckProto ep len = .ub ↔ ep.allocSize < ep.effOffset + len := by
+  unfold endpointAccessCheckProto
+  constructor
+  · intro h
+    cases hA : Nat.ble (Nat.add ep.effOffset len) ep.allocSize
+    · have hNot : ¬ (ep.effOffset + len ≤ ep.allocSize) := fun hLe => by
+        have hT : Nat.ble (Nat.add ep.effOffset len) ep.allocSize = true := Nat.ble_eq.mpr hLe
+        rw [hA] at hT
+        cases hT
+      omega
+    · rw [hA] at h
+      dsimp only at h
+      cases hW : Bool.and ep.tagWindowKnown (endpointRangeInBoundsProto ep len)
+      · rw [hW] at h; cases h
+      · rw [hW] at h; cases h
+  · intro hLt
+    have hA : Nat.ble (Nat.add ep.effOffset len) ep.allocSize = false := by
+      cases hB : Nat.ble (Nat.add ep.effOffset len) ep.allocSize
+      · rfl
+      · have hLe : ep.effOffset + len ≤ ep.allocSize := Nat.ble_eq.mp hB
+        omega
+    rw [hA]
+
+/--
+**Padding-Reset Refinement Theorem**: for every data mask and byte list of the
+same length, the reset bytes refine the original bytes
+(`abstractBytesRefineProto`): each byte is either unchanged (value and
+provenance) or demoted to `.uninit`. A typed copy's padding reset therefore
+never fabricates or alters a value byte.
+-/
+theorem applyDataMaskProto_refines :
+    ∀ (mask : List Bool) (bytes : List AbstractByte),
+      mask.length = bytes.length →
+      abstractBytesRefineProto (applyDataMaskProto mask bytes) bytes = true
+  | [], [], _ => rfl
+  | [], _ :: _, h => by cases h
+  | _ :: _, [], h => by cases h
+  | false :: maskRest, _ :: bytesRest, h => by
+    change abstractBytesRefineProto (applyDataMaskProto maskRest bytesRest) bytesRest = true
+    exact applyDataMaskProto_refines maskRest bytesRest (by simpa using h)
+  | true :: maskRest, .uninit :: bytesRest, h => by
+    change abstractBytesRefineProto (applyDataMaskProto maskRest bytesRest) bytesRest = true
+    exact applyDataMaskProto_refines maskRest bytesRest (by simpa using h)
+  | true :: maskRest, .init v p :: bytesRest, h => by
+    change (match abstractByteEqProto (.init v p) (.init v p) with
+      | true => abstractBytesRefineProto (applyDataMaskProto maskRest bytesRest) bytesRest
+      | false => false) = true
+    rw [abstractByteEqProto_refl]
+    exact applyDataMaskProto_refines maskRest bytesRest (by simpa using h)
 
 /--
 **`black_box` Preservation Theorem**:
