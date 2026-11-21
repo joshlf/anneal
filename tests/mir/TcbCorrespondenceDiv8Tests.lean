@@ -261,6 +261,27 @@ def unsafeCellU32Layout : TypeLayout :=
 def unsafeCellU32Layouts : LayoutTable :=
   { pointerBits := 64, isLittleEndian := true, entries := [unsafeCellU32Layout] }
 
+/-- `Option<u32>` layout: direct `u32` tag at byte offset `0` and the `Some` payload `u32`
+at byte offset `4` (`None` has no payload fields). -/
+def optionU32Layout : TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 4 },
+    backendRepr := .scalarPair
+      (.initialized (.int 32 false) { start := 0, end_ := 1 })
+      (.initialized (.int 32 false) { start := 0, end_ := 4294967295 }),
+    fields := .arbitrary [{ bytes := 0 }] [0],
+    variants := .multiple (.initialized (.int 32 false) { start := 0, end_ := 1 }) 0
+      [.arbitrary [] [], .arbitrary [{ bytes := 4 }] [0]],
+    isUninhabited := false, fieldLayouts := [] }
+
+/-- Layout table holding `optionU32Layout` at index `1` (layout index `0` is always treated as
+unresolved by `isUnresolvedLayoutIdx`), so `SetDiscriminant` can determine variant payload
+arities (`enumVariantPayloadArity?`). -/
+def optionU32Layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [optionU32Layout, optionU32Layout] }
+
+def optionU32TL : Ty := { optionU32T with layoutIdx := 1 }
+def optionU32DeclL : LocalDecl := { mutability := .mut, ty := optionU32TL, debugName := none }
+
 def locPlace (n : Nat) : Place := { local_ := n, projection := [] }
 def derefPlace (n : Nat) : Place := { local_ := n, projection := [.deref] }
 def derefField0U32Place (n : Nat) : Place :=
@@ -685,35 +706,41 @@ theorem div7_offset_disabled_tag_end_to_end :
   refine ⟨by decide +kernel, by decide +kernel, by decide +kernel,
     by decide +kernel, by decide +kernel, by decide +kernel⟩
 
-/-- 8. `DIV-LM-ENUM-SET-DISCR-UNINIT` end-to-end witnesses and borrow/protector canaries. -/
+/-- 8. `DIV-LM-ENUM-SET-DISCR-UNINIT` end-to-end witnesses and borrow/protector canaries. The
+bodies carry `optionU32Layouts` because `SetDiscriminant` needs the captured variant layout to
+determine payload arities (`setDiscriminantUninitPayload?` / `padSetDiscriminantInitFields?`
+fail closed without it). -/
 def setDiscrUninitObsMir (variantIdx : Nat) : CapturedMir :=
   singleBlockBody "witness::set_discriminant_uninit_obs" 1
-    [isizeDecl, u32Decl, optionU32Decl]
+    [isizeDecl, u32Decl, optionU32DeclL]
     [.storageLive 2,
      .setDiscriminant (locPlace 2) variantIdx,
      .assign (locPlace 0) (.discriminant (locPlace 2)),
      .storageDead 2]
+    optionU32Layouts
 
 def setDiscrUninitPayloadMir : CapturedMir :=
   singleBlockBody "witness::set_discriminant_uninit_payload" 1
-    [u32Decl, u32Decl, optionU32Decl]
+    [u32Decl, u32Decl, optionU32DeclL]
     [.storageLive 2,
      .setDiscriminant (locPlace 2) 1,
      .assign (locPlace 0) (.use (.copy (somePayloadPlace 2))),
      .storageDead 2]
+    optionU32Layouts
 
 def setDiscrInvalidatesBorrowMir : CapturedMir :=
   singleBlockBody "witness::set_discr_invalidates_borrow" 1
-    [isizeDecl, optionU32Decl, refSharedOptionU32Decl]
+    [isizeDecl, optionU32DeclL, refSharedOptionU32Decl]
     [.storageLive 2,
      .assign (locPlace 2) (.ref .shared (locPlace 1)),
      .setDiscriminant (locPlace 1) 1,
      .assign (locPlace 0) (.discriminant (derefPlace 2)),
      .storageDead 2]
+    optionU32Layouts
 
 def setDiscrProtectedConflictMir (uninitSlot : Bool) : CapturedMir :=
   singleBlockBody "witness::set_discr_protected_conflict" 1
-    [isizeDecl, optionU32Decl, refSharedOptionU32Decl, optionU32Decl]
+    [isizeDecl, optionU32DeclL, refSharedOptionU32Decl, optionU32DeclL]
     ([.storageLive 2, .storageLive 3] ++
      (match uninitSlot with
       | true =>
@@ -727,6 +754,7 @@ def setDiscrProtectedConflictMir (uninitSlot : Bool) : CapturedMir :=
          .setDiscriminant (locPlace 1) 1,
          .assign (locPlace 0) (.discriminant (locPlace 1))]) ++
      [.storageDead 3, .storageDead 2])
+    optionU32Layouts
 
 theorem div8_set_discriminant_uninit_end_to_end :
     runTrustedScalar? (setDiscrUninitObsMir 1) [] [.scalar ⟨5, 4⟩] = .some (1, 8) ∧
@@ -881,13 +909,14 @@ theorem a1_intrinsic_and_extcall_dest_borrows_end_to_end :
 referents. -/
 def calleeSetDiscrSomeMir : CapturedMir :=
   singleBlockBody "witness::callee_set_discr_some" 1
-    [isizeDecl, refMutOptionU32Decl]
+    [isizeDecl, refMutOptionU32Decl, optionU32DeclL]
     [.setDiscriminant (derefPlace 1) 1,
      .assign (locPlace 0) (.use (constIsize 0))]
+    optionU32Layouts
 
 def callerSetDiscrCrossFrameInitMir : CapturedMir :=
-  mkMirBody "witness::caller_set_discr_cross_frame_init" 1
-    [isizeDecl, optionU32Decl, refMutOptionU32Decl]
+  { (mkMirBody "witness::caller_set_discr_cross_frame_init" 1
+    [isizeDecl, optionU32DeclL, refMutOptionU32Decl]
     [{ statements :=
          [mkStmt (.storageLive 2),
           mkStmt (.assign (locPlace 2) (.ref (.mut false) (locPlace 1)))],
@@ -898,17 +927,19 @@ def callerSetDiscrCrossFrameInitMir : CapturedMir :=
          [mkStmt (.assign (locPlace 0) (.discriminant (locPlace 1))),
           mkStmt (.storageDead 2)],
        terminator := mkTerm .return_,
-       isCleanup := false }]
+       isCleanup := false }]) with
+    layouts := optionU32Layouts }
 
 def calleeSetDiscrPtrNoneMir : CapturedMir :=
   singleBlockBody "witness::callee_set_discr_ptr_none" 1
-    [isizeDecl, ptrMutOptionU32Decl]
+    [isizeDecl, ptrMutOptionU32Decl, optionU32DeclL]
     [.setDiscriminant (derefPlace 1) 0,
      .assign (locPlace 0) (.use (constIsize 9))]
+    optionU32Layouts
 
 def callerSetDiscrCrossFrameUninitMir : CapturedMir :=
-  mkMirBody "witness::caller_set_discr_cross_frame_uninit" 1
-    [isizeDecl, u32Decl, optionU32Decl, ptrMutOptionU32Decl]
+  { (mkMirBody "witness::caller_set_discr_cross_frame_uninit" 1
+    [isizeDecl, u32Decl, optionU32DeclL, ptrMutOptionU32Decl]
     [{ statements :=
          [mkStmt (.storageLive 2),
           mkStmt (.storageLive 3),
@@ -921,7 +952,8 @@ def callerSetDiscrCrossFrameUninitMir : CapturedMir :=
           mkStmt (.storageDead 3),
           mkStmt (.storageDead 2)],
        terminator := mkTerm .return_,
-       isCleanup := false }]
+       isCleanup := false }]) with
+    layouts := optionU32Layouts }
 
 theorem a1_cross_frame_set_discriminant_deref_end_to_end :
     runTrustedScalar? callerSetDiscrCrossFrameInitMir [calleeSetDiscrSomeMir]

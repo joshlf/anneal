@@ -163,6 +163,7 @@ def SymVal.ofValue : Value → SymVal
   | .scalar sc => .scalar sc.bits sc.sizeBytes
   | .ptr p sz => .ptr p.allocId p.offsetBytes sz
   | .aggregate variant fields => .adt variant (SymVal.ofValueList fields)
+  | .uninit => .opaque .uninit
 
 /-- Lift a `List Value` pointwise into `List SymVal`. -/
 def SymVal.ofValueList : List Value → List SymVal
@@ -177,6 +178,7 @@ theorem SymVal.denote_ofValue (v : Value) :
   | unit => rfl
   | scalar sc => cases sc; rfl
   | ptr p sz => cases p; rfl
+  | uninit => rfl
   | aggregate variant fields =>
     dsimp [SymVal.ofValue, SymVal.denote]
     rw [SymVal.denoteList_ofValueList]
@@ -790,6 +792,7 @@ theorem stepMirFn_of_inspectBinarySwitch
                     | unit => nomatch h
                     | ptr _ _ => nomatch h
                     | aggregate _ _ => nomatch h
+                    | uninit => nomatch h
                     | scalar sc =>
                       dsimp only at h
                       injection h with h_tuple
@@ -1940,6 +1943,7 @@ theorem readAllocAt_writeAllocAt_self
         | unit => nomatch h_read
         | scalar _ => nomatch h_read
         | ptr _ _ => nomatch h_read
+        | uninit => nomatch h_read
         | aggregate variant elems =>
           cases variant with
           | succ _ => nomatch h_read
@@ -2066,6 +2070,7 @@ theorem readAllocAt_writeAllocAt_ne_alloc
           | unit => nomatch h_write
           | scalar _ => nomatch h_write
           | ptr _ _ => nomatch h_write
+          | uninit => nomatch h_write
           | aggregate variant elems =>
             cases variant with
             | succ _ => nomatch h_write

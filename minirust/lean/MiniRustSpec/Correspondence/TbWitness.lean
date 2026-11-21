@@ -8,6 +8,7 @@ This file may not be copied, modified, or distributed except according to
 those terms.
 -/
 
+import Lean
 import MiniRustSpec.Correspondence.RefWitness
 
 /-!
@@ -106,6 +107,42 @@ open MiniRustSpec.Correspondence
 open MiniRustSpec.Correspondence.Witness
 open MiniRustSpec.Correspondence.PointerWitness
 open MiniRustSpec.Correspondence.RefWitness
+
+local elab "kernel_rfl" : tactic => do
+  let mvarId ← Lean.Elab.Tactic.getMainGoal
+  let tgt ← Lean.MVarId.getType' mvarId
+  let some (ty, lhs, _) := tgt.eq? | Lean.Meta.throwTacticEx `kernel_rfl mvarId "expected equality goal"
+  let u ← Lean.Meta.getLevel ty
+  mvarId.assign (Lean.mkApp2 (Lean.mkConst ``Eq.refl [u]) ty lhs)
+  Lean.Elab.Tactic.replaceMainGoal []
+
+private theorem runA_isSome_noUB (body : CapturedMir) (fuel : Nat) (s : MachineState)
+    (h : (runA body fuel s).isSome = true) : MirNoUBTree (mirTree body s) := by
+  cases hr : runA body fuel s with
+  | none => rw [hr] at h; cases h
+  | some p => exact runA_noUB body fuel s p.1 p.2 hr
+
+private theorem runA_exists_mem_sound (body : CapturedMir) (fuel : Nat) (s : MachineState)
+    (tr : List (Event MirEffect)) (v : Value)
+    (h : (runA body fuel s).map (fun (tr', o) =>
+      match o with
+      | .normal (v', _) => some (tr', v')
+      | _ => none) = some (some (tr, v))) :
+    ∃ mem, ReachesRet (mirTree body s) tr (.normal (v, mem)) := by
+  cases hr : runA body fuel s with
+  | none => rw [hr] at h; cases h
+  | some p =>
+    rcases p with ⟨tr', o⟩
+    cases o with
+    | normal vm =>
+      rcases vm with ⟨v', mem⟩
+      rw [hr] at h
+      injection h with h1
+      injection h1 with h2
+      injection h2 with htr hv
+      cases htr; cases hv
+      exact ⟨mem, runA_sound body fuel s _ _ hr⟩
+    | _ => rw [hr] at h; cases h
 
 /-! ## Multi-argument and intrinsic `Mach` / `MachTB` runner helpers -/
 
@@ -217,7 +254,7 @@ def swapRefs : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem swapRefs_inFragment : inFragment swapRefs = true := by decide
+theorem swapRefs_inFragment : inFragment swapRefs = true := by decide +kernel
 
 def swapRefsFn : Gen.Function where
   locals := ⟨[
@@ -263,11 +300,11 @@ def swapRefsMInit : Mach :=
 
 theorem swapRefs_anneal_ret :
     ∃ mem, ReachesRet (mirTree swapRefs swapRefsS0) [] (.normal (.scalar ⟨940, 4⟩, mem)) :=
-  ⟨_, runA_sound swapRefs 40 _ _ _ rfl⟩
+  runA_exists_mem_sound swapRefs 40 _ _ _ (by kernel_rfl)
 
 theorem swapRefs_noUB :
     MirNoUBTree (mirCallTree swapRefs swapRefsArgs) :=
-  runA_noUB swapRefs 40 _ _ _ rfl
+  runA_isSome_noUB swapRefs 40 _ (by kernel_rfl)
 
 theorem swapRefs_ctxOk : CtxOk swapRefs ctx0_2 where
   baseLow := by unfold BaseLow; decide
@@ -286,7 +323,7 @@ theorem swapRefs_ctxOk : CtxOk swapRefs ctx0_2 where
     have hlay : swapRefs.layouts = emptyLayoutTable := rfl
     rw [hlay]
     simp [swapRefs] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 theorem swapRefs_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n swapRefsMInit = .ok m' ∧
@@ -295,7 +332,7 @@ theorem swapRefs_minirust_ret_from_start :
   obtain ⟨mem, hretA⟩ := swapRefs_anneal_ret
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret swapRefs_inFragment swapRefs_translate ctx0_2 swapRefs_ctxOk
-      swapRefsArgs (by decide) swapRefsMInit rfl rfl rfl hretA
+      swapRefsArgs (by decide +kernel) swapRefsMInit rfl rfl rfl hretA
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [swapRefs] at hd; subst hd
   simp [retPtr, ctx0_2, ctx0] at hp
@@ -311,7 +348,7 @@ theorem swapRefs_minirust_noUB {n : Nat} {e : Stop}
       ReturnRel swapRefs ctx0_2 s' v mRet ∧
       ReachesRet (mirCallTree swapRefs swapRefsArgs) tr (.normal (v, mem)) :=
   mirCall_noUB swapRefs_inFragment swapRefs_translate ctx0_2 swapRefs_ctxOk
-    swapRefsArgs (by decide) swapRefsMInit rfl rfl rfl swapRefs_noUB herr
+    swapRefsArgs (by decide +kernel) swapRefsMInit rfl rfl rfl swapRefs_noUB herr
 
 theorem swapRefs_progress (n : Nat) :
     (∃ s' m' tr, Interp.steps (1 + n) swapRefsMInit = .ok m' ∧
@@ -321,7 +358,7 @@ theorem swapRefs_progress (n : Nat) :
       ReturnRel swapRefs ctx0_2 s' v mRet ∧
       ReachesRet (mirCallTree swapRefs swapRefsArgs) tr (.normal (v, mem))) :=
   mirCall_progress_N swapRefs_inFragment swapRefs_translate ctx0_2 swapRefs_ctxOk
-    swapRefsArgs (by decide) swapRefsMInit rfl rfl rfl swapRefs_noUB n
+    swapRefsArgs (by decide +kernel) swapRefsMInit rfl rfl rfl swapRefs_noUB n
 
 theorem swapRefs_minirust_direct :
     retAfter2 swapRefs swapRefsArgs 21 =
@@ -343,7 +380,7 @@ def derefCopyUninitSrcUb : CapturedMir :=
      .assign (derefPlace 2) (.use (.copy (derefPlace 3))),
      .assign (local_ 0) (.use (.copy (local_ 1)))]
 
-theorem derefCopyUninitSrcUb_inFragment : inFragment derefCopyUninitSrcUb = true := by decide
+theorem derefCopyUninitSrcUb_inFragment : inFragment derefCopyUninitSrcUb = true := by decide +kernel
 
 def derefCopyUninitSrcUbFn : Gen.Function where
   locals := ⟨[
@@ -375,7 +412,7 @@ def derefCopyUninitSrcUbMInit : Mach :=
 
 theorem derefCopyUninitSrcUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTree derefCopyUninitSrcUb [.scalar ⟨5, 4⟩]) tr u ∧ FaultNow u :=
-  faultsA_sound derefCopyUninitSrcUb 15 _ (by decide)
+  faultsA_sound derefCopyUninitSrcUb 15 _ (by kernel_rfl)
 
 theorem derefCopyUninitSrcUb_ctxOk : CtxOk derefCopyUninitSrcUb ctx0 where
   baseLow := by unfold BaseLow; decide
@@ -393,13 +430,13 @@ theorem derefCopyUninitSrcUb_ctxOk : CtxOk derefCopyUninitSrcUb ctx0 where
     have hlay : derefCopyUninitSrcUb.layouts = emptyLayoutTable := rfl
     rw [hlay]
     simp [derefCopyUninitSrcUb, ptrBody] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 theorem derefCopyUninitSrcUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n derefCopyUninitSrcUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := derefCopyUninitSrcUb_anneal_ub
   exact mirCall_ub derefCopyUninitSrcUb_inFragment derefCopyUninitSrcUb_translate ctx0
-    derefCopyUninitSrcUb_ctxOk [.scalar ⟨5, 4⟩] (by decide) derefCopyUninitSrcUbMInit rfl rfl rfl hr hf
+    derefCopyUninitSrcUb_ctxOk [.scalar ⟨5, 4⟩] (by decide +kernel) derefCopyUninitSrcUbMInit rfl rfl rfl hr hf
 
 theorem derefCopyUninitSrcUb_converse_error {n : Nat} {e : Stop}
     (herr : Interp.steps n derefCopyUninitSrcUbMInit = .error e) :
@@ -409,7 +446,7 @@ theorem derefCopyUninitSrcUb_converse_error {n : Nat} {e : Stop}
       ReturnRel derefCopyUninitSrcUb ctx0 s' v mRet ∧
       ReachesRet (mirCallTree derefCopyUninitSrcUb [.scalar ⟨5, 4⟩]) tr (.normal (v, mem))) :=
   mirCall_steps_error derefCopyUninitSrcUb_inFragment derefCopyUninitSrcUb_translate ctx0
-    derefCopyUninitSrcUb_ctxOk [.scalar ⟨5, 4⟩] (by decide) derefCopyUninitSrcUbMInit rfl rfl rfl herr
+    derefCopyUninitSrcUb_ctxOk [.scalar ⟨5, 4⟩] (by decide +kernel) derefCopyUninitSrcUbMInit rfl rfl rfl herr
 
 theorem derefCopyUninitSrcUb_outcome_N (n : Nat) :
     (∃ s' m' tr, Interp.steps (1 + n) derefCopyUninitSrcUbMInit = .ok m' ∧
@@ -422,7 +459,7 @@ theorem derefCopyUninitSrcUb_outcome_N (n : Nat) :
     (∃ msg, Interp.steps (1 + n) derefCopyUninitSrcUbMInit = .error (.ub msg) ∧
       ∃ tr u, Reaches (mirCallTree derefCopyUninitSrcUb [.scalar ⟨5, 4⟩]) tr u ∧ FaultNow u) :=
   mirCall_outcome_N derefCopyUninitSrcUb_inFragment derefCopyUninitSrcUb_translate ctx0
-    derefCopyUninitSrcUb_ctxOk [.scalar ⟨5, 4⟩] (by decide) derefCopyUninitSrcUbMInit rfl rfl rfl n
+    derefCopyUninitSrcUb_ctxOk [.scalar ⟨5, 4⟩] (by decide +kernel) derefCopyUninitSrcUbMInit rfl rfl rfl n
 
 theorem derefCopyUninitSrcUb_minirust_direct :
     ubAfter derefCopyUninitSrcUb [.scalar ⟨5, 4⟩] 5 =
@@ -445,7 +482,7 @@ def derefWriteMoveUninitUb : CapturedMir :=
      .assign (derefPlace 2) (.use (.move (local_ 3))),
      .assign (local_ 0) (.use (.copy (local_ 1)))]
 
-theorem derefWriteMoveUninitUb_inFragment : inFragment derefWriteMoveUninitUb = true := by decide
+theorem derefWriteMoveUninitUb_inFragment : inFragment derefWriteMoveUninitUb = true := by decide +kernel
 
 def derefWriteMoveUninitUbFn : Gen.Function where
   locals := ⟨[
@@ -476,7 +513,7 @@ def derefWriteMoveUninitUbMInit : Mach :=
 
 theorem derefWriteMoveUninitUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTree derefWriteMoveUninitUb [.scalar ⟨5, 4⟩]) tr u ∧ FaultNow u :=
-  faultsA_sound derefWriteMoveUninitUb 15 _ (by decide)
+  faultsA_sound derefWriteMoveUninitUb 15 _ (by kernel_rfl)
 
 theorem derefWriteMoveUninitUb_ctxOk : CtxOk derefWriteMoveUninitUb ctx0 where
   baseLow := by unfold BaseLow; decide
@@ -494,13 +531,13 @@ theorem derefWriteMoveUninitUb_ctxOk : CtxOk derefWriteMoveUninitUb ctx0 where
     have hlay : derefWriteMoveUninitUb.layouts = emptyLayoutTable := rfl
     rw [hlay]
     simp [derefWriteMoveUninitUb, ptrBody] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 theorem derefWriteMoveUninitUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n derefWriteMoveUninitUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := derefWriteMoveUninitUb_anneal_ub
   exact mirCall_ub derefWriteMoveUninitUb_inFragment derefWriteMoveUninitUb_translate ctx0
-    derefWriteMoveUninitUb_ctxOk [.scalar ⟨5, 4⟩] (by decide) derefWriteMoveUninitUbMInit rfl rfl rfl hr hf
+    derefWriteMoveUninitUb_ctxOk [.scalar ⟨5, 4⟩] (by decide +kernel) derefWriteMoveUninitUbMInit rfl rfl rfl hr hf
 
 theorem derefWriteMoveUninitUb_converse_error {n : Nat} {e : Stop}
     (herr : Interp.steps n derefWriteMoveUninitUbMInit = .error e) :
@@ -510,7 +547,7 @@ theorem derefWriteMoveUninitUb_converse_error {n : Nat} {e : Stop}
       ReturnRel derefWriteMoveUninitUb ctx0 s' v mRet ∧
       ReachesRet (mirCallTree derefWriteMoveUninitUb [.scalar ⟨5, 4⟩]) tr (.normal (v, mem))) :=
   mirCall_steps_error derefWriteMoveUninitUb_inFragment derefWriteMoveUninitUb_translate ctx0
-    derefWriteMoveUninitUb_ctxOk [.scalar ⟨5, 4⟩] (by decide) derefWriteMoveUninitUbMInit rfl rfl rfl herr
+    derefWriteMoveUninitUb_ctxOk [.scalar ⟨5, 4⟩] (by decide +kernel) derefWriteMoveUninitUbMInit rfl rfl rfl herr
 
 theorem derefWriteMoveUninitUb_outcome_N (n : Nat) :
     (∃ s' m' tr, Interp.steps (1 + n) derefWriteMoveUninitUbMInit = .ok m' ∧
@@ -523,7 +560,7 @@ theorem derefWriteMoveUninitUb_outcome_N (n : Nat) :
     (∃ msg, Interp.steps (1 + n) derefWriteMoveUninitUbMInit = .error (.ub msg) ∧
       ∃ tr u, Reaches (mirCallTree derefWriteMoveUninitUb [.scalar ⟨5, 4⟩]) tr u ∧ FaultNow u) :=
   mirCall_outcome_N derefWriteMoveUninitUb_inFragment derefWriteMoveUninitUb_translate ctx0
-    derefWriteMoveUninitUb_ctxOk [.scalar ⟨5, 4⟩] (by decide) derefWriteMoveUninitUbMInit rfl rfl rfl n
+    derefWriteMoveUninitUb_ctxOk [.scalar ⟨5, 4⟩] (by decide +kernel) derefWriteMoveUninitUbMInit rfl rfl rfl n
 
 theorem derefWriteMoveUninitUb_minirust_direct :
     ubAfter derefWriteMoveUninitUb [.scalar ⟨5, 4⟩] 5 =
@@ -584,7 +621,7 @@ theorem pairSplitReborrowOk_anneal_ret :
     ∃ mem, ReachesRet (mirTree pairSplitReborrowOk
       (initMachineState pairSplitReborrowOk [initPairU32])) []
       (.normal (.scalar ⟨42, 4⟩, mem)) :=
-  ⟨_, runA_sound pairSplitReborrowOk 30 _ _ _ rfl⟩
+  runA_exists_mem_sound pairSplitReborrowOk 30 _ _ _ (by kernel_rfl)
 
 theorem pairSplitReborrowOk_minirust_direct :
     retAfter pairSplitReborrowOk [initPairU32] 15 =
@@ -619,7 +656,7 @@ theorem pairParentWriteDisablesChild_translate :
 theorem pairParentWriteDisablesChild_anneal_ub :
     ∃ tr u, Reaches (mirTree pairParentWriteDisablesChild
       (initMachineState pairParentWriteDisablesChild [initPairU32])) tr u ∧ FaultNow u :=
-  faultsA_sound pairParentWriteDisablesChild 30 _ (by decide)
+  faultsA_sound pairParentWriteDisablesChild 30 _ (by kernel_rfl)
 
 theorem pairParentWriteDisablesChild_minirust_direct :
     retAfter pairParentWriteDisablesChild [initPairU32] 13 =
@@ -679,7 +716,7 @@ theorem unsafeCellUnprotInteriorMut_anneal_ret :
     ∃ mem, ReachesRet (mirTree unsafeCellUnprotInteriorMut
       (initMachineState unsafeCellUnprotInteriorMut [initUnsafeCellU32])) []
       (.normal (.scalar ⟨77, 4⟩, mem)) :=
-  ⟨_, runA_sound unsafeCellUnprotInteriorMut 25 _ _ _ rfl⟩
+  runA_exists_mem_sound unsafeCellUnprotInteriorMut 25 _ _ _ (by kernel_rfl)
 
 theorem unsafeCellUnprotInteriorMut_minirust_direct :
     retAfter unsafeCellUnprotInteriorMut [initUnsafeCellU32] 8 =
@@ -722,7 +759,7 @@ theorem unsafeCellProtectedInteriorMut_anneal_ret :
     ∃ mem, ReachesRet (mirTree unsafeCellProtectedInteriorMutMir
       (initMachineState unsafeCellProtectedInteriorMutMir [initUnsafeCellU32])) []
       (.normal (.scalar ⟨77, 4⟩, mem)) :=
-  ⟨_, runA_sound unsafeCellProtectedInteriorMutMir 25 _ _ _ rfl⟩
+  runA_exists_mem_sound unsafeCellProtectedInteriorMutMir 25 _ _ _ (by kernel_rfl)
 
 theorem unsafeCellProtectedInteriorMut_minirust_direct :
     retAfter unsafeCellProtectedInteriorMutMir [initUnsafeCellU32] 9 =
@@ -736,7 +773,7 @@ theorem unsafeCellProtectedInteriorMut_tb_direct :
 theorem unsafeCellProtectedInteriorMut_anneal_noUB :
     MirNoUBTree (mirTree unsafeCellProtectedInteriorMutMir
       (initMachineState unsafeCellProtectedInteriorMutMir [initUnsafeCellU32])) :=
-  runA_noUB unsafeCellProtectedInteriorMutMir 25 _ _ _ rfl
+  runA_isSome_noUB unsafeCellProtectedInteriorMutMir 25 _ (by kernel_rfl)
 
 /-- `DIV-MR-TB-UNSAFECELL-PROTECTED-IM` 3-way `.ok 77` + `MirNoUBTree` simulation
 agreement across Anneal, `Mach`, and `MachTB` (note: general direct-local Tree
@@ -786,8 +823,8 @@ theorem unsafeCellProtectedStorageDead_simulation :
       some (some { retAlloc with data := scalarBytes u32 77 }, [1]) ∧
     retAfterTB unsafeCellProtectedStorageDeadMir [initUnsafeCellU32] 10 = tbRetU32 77 :=
   ⟨by decide +kernel,
-   ⟨_, runA_sound unsafeCellProtectedStorageDeadMir 25 _ _ _ rfl⟩,
-   runA_noUB unsafeCellProtectedStorageDeadMir 25 _ _ _ rfl,
+   runA_exists_mem_sound unsafeCellProtectedStorageDeadMir 25 _ _ _ (by kernel_rfl),
+   runA_isSome_noUB unsafeCellProtectedStorageDeadMir 25 _ (by kernel_rfl),
    by decide +kernel,
    by decide +kernel⟩
 
@@ -815,7 +852,7 @@ theorem exposeSingleRefMutRoundTrip_anneal_ret :
     ∃ mem, ReachesRet (mirTree exposeSingleRefMutRoundTrip
       (initMachineState exposeSingleRefMutRoundTrip [.scalar ⟨5, 4⟩])) []
       (.normal (.scalar ⟨88, 4⟩, mem)) :=
-  ⟨_, runA_sound exposeSingleRefMutRoundTrip 30 _ _ _ rfl⟩
+  runA_exists_mem_sound exposeSingleRefMutRoundTrip 30 _ _ _ (by kernel_rfl)
 
 theorem exposeSingleRefMutRoundTrip_minirust_direct :
     retAfterIntr exposeSingleRefMutRoundTrip [.scalar ⟨5, 4⟩] 12 =
@@ -847,7 +884,7 @@ theorem exposeSharedRefWriteUb_translateIntr :
 theorem exposeSharedRefWriteUb_anneal_ub :
     ∃ tr u, Reaches (mirTree exposeSharedRefWriteUb
       (initMachineState exposeSharedRefWriteUb [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u :=
-  faultsA_sound exposeSharedRefWriteUb 30 _ (by decide)
+  faultsA_sound exposeSharedRefWriteUb 30 _ (by kernel_rfl)
 
 theorem exposeSharedRefWriteUb_minirust_direct :
     retAfterIntr exposeSharedRefWriteUb [.scalar ⟨5, 4⟩] 12 =
@@ -889,7 +926,7 @@ theorem exposeTwoRefMutAngelicUnsupported_anneal_ret :
     ∃ mem, ReachesRet (mirTree exposeTwoRefMutAngelicUnsupported
       (initMachineState exposeTwoRefMutAngelicUnsupported [.scalar ⟨5, 4⟩])) []
       (.normal (.scalar ⟨88, 4⟩, mem)) :=
-  ⟨_, runA_sound exposeTwoRefMutAngelicUnsupported 35 _ _ _ rfl⟩
+  runA_exists_mem_sound exposeTwoRefMutAngelicUnsupported 35 _ _ _ (by kernel_rfl)
 
 theorem exposeTwoRefMutAngelicUnsupported_minirust_direct :
     retAfterIntr exposeTwoRefMutAngelicUnsupported [.scalar ⟨5, 4⟩] 18 =
@@ -990,7 +1027,7 @@ theorem boolMutRefToggle_true_three_way :
     retAfter boolMutRefToggle [.scalar ⟨1, 1⟩] 10 =
       some (some { retAlloc with data := scalarBytes u32 0 }, [1]) ∧
     retAfterTB boolMutRefToggle [.scalar ⟨1, 1⟩] 10 = tbRetU32 0 :=
-  ⟨⟨_, runA_sound boolMutRefToggle 25 _ _ _ rfl⟩, by decide +kernel, by decide +kernel⟩
+  ⟨runA_exists_mem_sound boolMutRefToggle 25 _ _ _ (by kernel_rfl), by decide +kernel, by decide +kernel⟩
 
 theorem boolMutRefToggle_false_three_way :
     (∃ mem, ReachesRet (mirTree boolMutRefToggle
@@ -999,7 +1036,7 @@ theorem boolMutRefToggle_false_three_way :
     retAfter boolMutRefToggle [.scalar ⟨0, 1⟩] 10 =
       some (some { retAlloc with data := scalarBytes u32 1 }, [1]) ∧
     retAfterTB boolMutRefToggle [.scalar ⟨0, 1⟩] 10 = tbRetU32 1 :=
-  ⟨⟨_, runA_sound boolMutRefToggle 25 _ _ _ rfl⟩, by decide +kernel, by decide +kernel⟩
+  ⟨runA_exists_mem_sound boolMutRefToggle 25 _ _ _ (by kernel_rfl), by decide +kernel, by decide +kernel⟩
 
 /-- Transmuting `*const u8` pointing to `2u8` into `&bool` succeeds at the
 transmute itself (`checkPtr` checks alignment `1`, non-null, inhabitedness, and
@@ -1023,7 +1060,7 @@ theorem boolInvalidByteRefUb_translate :
 theorem boolInvalidByteRefUb_anneal_ub :
     ∃ tr u, Reaches (mirTree boolInvalidByteRefUb
       (initMachineState boolInvalidByteRefUb [.scalar ⟨2, 1⟩])) tr u ∧ FaultNow u :=
-  faultsA_sound boolInvalidByteRefUb 25 _ (by decide)
+  faultsA_sound boolInvalidByteRefUb 25 _ (by kernel_rfl)
 
 theorem boolInvalidByteRefUb_minirust_direct :
     ubAfter boolInvalidByteRefUb [.scalar ⟨2, 1⟩] 7 =
@@ -1212,7 +1249,7 @@ def selfDerefCopyOk : CapturedMir :=
      .assign (local_ 3) (.ref .shared (derefPlace 2)),
      .assign (local_ 0) (.use (.copy (derefPlace 3)))]
 
-theorem selfDerefCopyOk_inFragment : inFragment selfDerefCopyOk = true := by decide
+theorem selfDerefCopyOk_inFragment : inFragment selfDerefCopyOk = true := by decide +kernel
 
 def selfDerefCopyOkFn : Gen.Function where
   locals := ⟨[
@@ -1244,11 +1281,11 @@ def selfDerefCopyOkMInit : Mach :=
 theorem selfDerefCopyOk_anneal_ret :
     ∃ mem, ReachesRet (mirTree selfDerefCopyOk selfDerefCopyOkS0) []
       (.normal (.scalar ⟨42, 4⟩, mem)) :=
-  ⟨_, runA_sound selfDerefCopyOk 25 _ _ _ rfl⟩
+  runA_exists_mem_sound selfDerefCopyOk 25 _ _ _ (by kernel_rfl)
 
 theorem selfDerefCopyOk_noUB :
     MirNoUBTree (mirCallTree selfDerefCopyOk [.scalar ⟨42, 4⟩]) :=
-  runA_noUB selfDerefCopyOk 25 _ _ _ rfl
+  runA_isSome_noUB selfDerefCopyOk 25 _ (by kernel_rfl)
 
 theorem selfDerefCopyOk_ctxOk : CtxOk selfDerefCopyOk ctx0 where
   baseLow := by unfold BaseLow; decide
@@ -1266,7 +1303,7 @@ theorem selfDerefCopyOk_ctxOk : CtxOk selfDerefCopyOk ctx0 where
     have hlay : selfDerefCopyOk.layouts = emptyLayoutTable := rfl
     rw [hlay]
     simp [selfDerefCopyOk, ptrBody] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 theorem selfDerefCopyOk_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n selfDerefCopyOkMInit = .ok m' ∧
@@ -1275,7 +1312,7 @@ theorem selfDerefCopyOk_minirust_ret_from_start :
   obtain ⟨mem, hretA⟩ := selfDerefCopyOk_anneal_ret
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret selfDerefCopyOk_inFragment selfDerefCopyOk_translate ctx0 selfDerefCopyOk_ctxOk
-      [.scalar ⟨42, 4⟩] (by decide) selfDerefCopyOkMInit rfl rfl rfl hretA
+      [.scalar ⟨42, 4⟩] (by decide +kernel) selfDerefCopyOkMInit rfl rfl rfl hretA
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [selfDerefCopyOk, ptrBody] at hd; subst hd
   simp [retPtr, ctx0] at hp
@@ -1291,7 +1328,7 @@ theorem selfDerefCopyOk_minirust_noUB {n : Nat} {e : Stop}
       ReturnRel selfDerefCopyOk ctx0 s' v mRet ∧
       ReachesRet (mirCallTree selfDerefCopyOk [.scalar ⟨42, 4⟩]) tr (.normal (v, mem)) :=
   mirCall_noUB selfDerefCopyOk_inFragment selfDerefCopyOk_translate ctx0 selfDerefCopyOk_ctxOk
-    [.scalar ⟨42, 4⟩] (by decide) selfDerefCopyOkMInit rfl rfl rfl selfDerefCopyOk_noUB herr
+    [.scalar ⟨42, 4⟩] (by decide +kernel) selfDerefCopyOkMInit rfl rfl rfl selfDerefCopyOk_noUB herr
 
 theorem selfDerefCopyOk_progress (n : Nat) :
     (∃ s' m' tr, Interp.steps (1 + n) selfDerefCopyOkMInit = .ok m' ∧
@@ -1302,7 +1339,7 @@ theorem selfDerefCopyOk_progress (n : Nat) :
       ReturnRel selfDerefCopyOk ctx0 s' v mRet ∧
       ReachesRet (mirCallTree selfDerefCopyOk [.scalar ⟨42, 4⟩]) tr (.normal (v, mem))) :=
   mirCall_progress_N selfDerefCopyOk_inFragment selfDerefCopyOk_translate ctx0
-    selfDerefCopyOk_ctxOk [.scalar ⟨42, 4⟩] (by decide) selfDerefCopyOkMInit rfl rfl rfl
+    selfDerefCopyOk_ctxOk [.scalar ⟨42, 4⟩] (by decide +kernel) selfDerefCopyOkMInit rfl rfl rfl
     selfDerefCopyOk_noUB n
 
 theorem selfDerefCopyOk_minirust_direct :
@@ -1342,7 +1379,7 @@ def parentDerefCopyDisablesChild : CapturedMir where
   allocations := []
 
 theorem parentDerefCopyDisablesChild_notInFragment :
-    inFragment parentDerefCopyDisablesChild = false := by decide
+    inFragment parentDerefCopyDisablesChild = false := by decide +kernel
 
 theorem parentDerefCopyDisablesChild_translate :
     (translateFn parentDerefCopyDisablesChild).isSome = true := by decide +kernel
@@ -1350,7 +1387,7 @@ theorem parentDerefCopyDisablesChild_translate :
 theorem parentDerefCopyDisablesChild_anneal_ub :
     ∃ tr u, Reaches (mirCallTree parentDerefCopyDisablesChild
       [.scalar ⟨10, 4⟩, .scalar ⟨99, 4⟩]) tr u ∧ FaultNow u :=
-  faultsA_sound parentDerefCopyDisablesChild 25 _ (by decide)
+  faultsA_sound parentDerefCopyDisablesChild 25 _ (by kernel_rfl)
 
 theorem parentDerefCopyDisablesChild_minirust_direct :
     retAfter2 parentDerefCopyDisablesChild [.scalar ⟨10, 4⟩, .scalar ⟨99, 4⟩] 10 =
@@ -1411,7 +1448,7 @@ def loopDerefCopyCountdown : CapturedMir where
   allocations := []
 
 theorem loopDerefCopyCountdown_inFragment :
-    inFragment loopDerefCopyCountdown = true := by decide
+    inFragment loopDerefCopyCountdown = true := by decide +kernel
 
 def loopDerefCopyCountdownFn : Gen.Function where
   locals := ⟨[
@@ -1469,11 +1506,11 @@ def loopDerefCopyCountdownTrace : List (Event MirEffect) :=
 theorem loopDerefCopyCountdown_anneal_ret :
     ∃ mem, ReachesRet (mirTree loopDerefCopyCountdown loopDerefCopyCountdownS0)
       loopDerefCopyCountdownTrace (.normal (.scalar ⟨16, 4⟩, mem)) :=
-  ⟨_, runA_sound loopDerefCopyCountdown 80 _ _ _ rfl⟩
+  runA_exists_mem_sound loopDerefCopyCountdown 80 _ _ _ (by kernel_rfl)
 
 theorem loopDerefCopyCountdown_noUB :
     MirNoUBTree (mirCallTree loopDerefCopyCountdown loopDerefCopyCountdownArgs) :=
-  runA_noUB loopDerefCopyCountdown 80 _ _ _ rfl
+  runA_isSome_noUB loopDerefCopyCountdown 80 _ (by kernel_rfl)
 
 theorem loopDerefCopyCountdown_ctxOk : CtxOk loopDerefCopyCountdown ctx0_2 where
   baseLow := by unfold BaseLow; decide
@@ -1492,7 +1529,7 @@ theorem loopDerefCopyCountdown_ctxOk : CtxOk loopDerefCopyCountdown ctx0_2 where
     have hlay : loopDerefCopyCountdown.layouts = emptyLayoutTable := rfl
     rw [hlay]
     simp [loopDerefCopyCountdown] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 theorem loopDerefCopyCountdown_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n loopDerefCopyCountdownMInit = .ok m' ∧
@@ -1501,7 +1538,7 @@ theorem loopDerefCopyCountdown_minirust_ret_from_start :
   obtain ⟨mem, hretA⟩ := loopDerefCopyCountdown_anneal_ret
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret loopDerefCopyCountdown_inFragment loopDerefCopyCountdown_translate ctx0_2
-      loopDerefCopyCountdown_ctxOk loopDerefCopyCountdownArgs (by decide)
+      loopDerefCopyCountdown_ctxOk loopDerefCopyCountdownArgs (by decide +kernel)
       loopDerefCopyCountdownMInit rfl rfl rfl hretA
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [loopDerefCopyCountdown] at hd; subst hd
@@ -1519,7 +1556,7 @@ theorem loopDerefCopyCountdown_minirust_noUB {n : Nat} {e : Stop}
       ReachesRet (mirCallTree loopDerefCopyCountdown loopDerefCopyCountdownArgs) tr
         (.normal (v, mem)) :=
   mirCall_noUB loopDerefCopyCountdown_inFragment loopDerefCopyCountdown_translate ctx0_2
-    loopDerefCopyCountdown_ctxOk loopDerefCopyCountdownArgs (by decide)
+    loopDerefCopyCountdown_ctxOk loopDerefCopyCountdownArgs (by decide +kernel)
     loopDerefCopyCountdownMInit rfl rfl rfl loopDerefCopyCountdown_noUB herr
 
 theorem loopDerefCopyCountdown_progress (n : Nat) :
@@ -1532,7 +1569,7 @@ theorem loopDerefCopyCountdown_progress (n : Nat) :
       ReachesRet (mirCallTree loopDerefCopyCountdown loopDerefCopyCountdownArgs) tr
         (.normal (v, mem))) :=
   mirCall_progress_N loopDerefCopyCountdown_inFragment loopDerefCopyCountdown_translate ctx0_2
-    loopDerefCopyCountdown_ctxOk loopDerefCopyCountdownArgs (by decide)
+    loopDerefCopyCountdown_ctxOk loopDerefCopyCountdownArgs (by decide +kernel)
     loopDerefCopyCountdownMInit rfl rfl rfl loopDerefCopyCountdown_noUB n
 
 theorem loopDerefCopyCountdown_minirust_direct :
@@ -1595,7 +1632,7 @@ theorem stdOrderingMutRefCmp_five_three_way :
     retAfter stdOrderingMutRefCmp [.scalar ⟨5, 4⟩] 15 =
       some (some { retAlloc with data := scalarBytes u32 1 }, [1]) ∧
     retAfterTB stdOrderingMutRefCmp [.scalar ⟨5, 4⟩] 15 = tbRetU32 1 :=
-  ⟨⟨_, runA_sound stdOrderingMutRefCmp 30 _ _ _ rfl⟩, by decide +kernel, by decide +kernel⟩
+  ⟨runA_exists_mem_sound stdOrderingMutRefCmp 30 _ _ _ (by kernel_rfl), by decide +kernel, by decide +kernel⟩
 
 set_option maxRecDepth 16384 in
 theorem stdOrderingMutRefCmp_twenty_three_way :
@@ -1605,7 +1642,7 @@ theorem stdOrderingMutRefCmp_twenty_three_way :
     retAfter stdOrderingMutRefCmp [.scalar ⟨20, 4⟩] 15 =
       some (some { retAlloc with data := scalarBytes u32 255 }, [1]) ∧
     retAfterTB stdOrderingMutRefCmp [.scalar ⟨20, 4⟩] 15 = tbRetU32 255 :=
-  ⟨⟨_, runA_sound stdOrderingMutRefCmp 30 _ _ _ rfl⟩, by decide +kernel, by decide +kernel⟩
+  ⟨runA_exists_mem_sound stdOrderingMutRefCmp 30 _ _ _ (by kernel_rfl), by decide +kernel, by decide +kernel⟩
 
 def unitTupleLayout : TypeLayout :=
   { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := .memory,
@@ -1654,7 +1691,7 @@ theorem unitTupleMutRefRoundTrip_three_way :
     retAfter unitTupleMutRefRoundTrip [.scalar ⟨42, 4⟩] 14 =
       some (some { retAlloc with data := scalarBytes u32 42 }, [1]) ∧
     retAfterTB unitTupleMutRefRoundTrip [.scalar ⟨42, 4⟩] 14 = tbRetU32 42 :=
-  ⟨⟨_, runA_sound unitTupleMutRefRoundTrip 30 _ _ _ rfl⟩, by decide +kernel, by decide +kernel⟩
+  ⟨runA_exists_mem_sound unitTupleMutRefRoundTrip 30 _ _ _ (by kernel_rfl), by decide +kernel, by decide +kernel⟩
 
 /-! ## 8. MR-3.3 Provenance & `IntPtrCast` (`PointerExposeProvenance` / `PointerWithExposedProvenance`) 3-Way Witnesses -/
 
@@ -1847,7 +1884,7 @@ theorem boolInvalidLoadDirectUb_three_way_ub :
       some "load at type but the data in memory violates the language invariant" ∧
     ubAfterTB boolInvalidLoadDirectUb [.scalar ⟨2, 1⟩] 7 =
       some "load at type but the data in memory violates the language invariant" :=
-  ⟨faultsA_sound boolInvalidLoadDirectUb 20 _ (by decide),
+  ⟨faultsA_sound boolInvalidLoadDirectUb 20 _ (by kernel_rfl),
    by decide +kernel, by decide +kernel⟩
 
 /-- Control for `boolInvalidLoadDirectUb_three_way_ub`: on the valid `bool` byte
@@ -1863,8 +1900,8 @@ theorem boolInvalidLoadDirectUb_valid_three_way_ret :
     retAfter boolInvalidLoadDirectUb [.scalar ⟨1, 1⟩] 9 =
       some (some { retAlloc with data := scalarBytes u32 0 }, [1]) ∧
     retAfterTB boolInvalidLoadDirectUb [.scalar ⟨1, 1⟩] 9 = tbRetU32 0 :=
-  ⟨⟨_, runA_sound boolInvalidLoadDirectUb 30 _ _ _ rfl⟩,
-   runA_noUB boolInvalidLoadDirectUb 30 _ _ _ rfl,
+  ⟨runA_exists_mem_sound boolInvalidLoadDirectUb 30 _ _ _ (by kernel_rfl),
+   runA_isSome_noUB boolInvalidLoadDirectUb 30 _ (by kernel_rfl),
    by decide +kernel, by decide +kernel⟩
 
 /-- `D2` (`disableLocalBorrows`) tag-disabling correspondence across stack-slot
@@ -1897,7 +1934,7 @@ theorem storageCycleDisablesBorrowUb_three_way_ub :
       some "dereferencing pointer to dead allocation" ∧
     ubAfterTB storageCycleDisablesBorrowUb [.scalar ⟨5, 4⟩] 9 =
       some "dereferencing pointer to dead allocation" :=
-  ⟨faultsA_sound storageCycleDisablesBorrowUb 25 _ (by decide),
+  ⟨faultsA_sound storageCycleDisablesBorrowUb 25 _ (by kernel_rfl),
    by decide +kernel, by decide +kernel⟩
 
 /-- Dereference-read Tree Borrows freezing (`freezeDerefReadBorrowsAt`):
@@ -1932,7 +1969,7 @@ theorem derefReadFreezesActiveMutUb_three_way :
       some (some { retAlloc with data := scalarBytes u32 99 }, [1]) ∧
     ubAfterTB derefReadFreezesActiveMutUb [.scalar ⟨5, 4⟩] 9 =
       some "Tree Borrows: local write of Frozen reference" :=
-  ⟨faultsA_sound derefReadFreezesActiveMutUb 25 _ (by decide),
+  ⟨faultsA_sound derefReadFreezesActiveMutUb 25 _ (by kernel_rfl),
    by decide +kernel, by decide +kernel⟩
 
 /-- In-fragment `.reserved` mutable reference reborrow (`_3 = &mut (*_2)`) across
@@ -2003,16 +2040,16 @@ theorem mutReborrowForeignReadRoundTrip_ctxOk : CtxOk mutReborrowForeignReadRoun
     have hlay : mutReborrowForeignReadRoundTrip.layouts = emptyLayoutTable := rfl
     rw [hlay]
     simp [mutReborrowForeignReadRoundTrip, ptrBody] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 theorem mutReborrowForeignReadRoundTrip_anneal_ret :
     ∃ mem, ReachesRet (mirTree mutReborrowForeignReadRoundTrip mutReborrowForeignReadRoundTripS0) []
       (.normal (.scalar ⟨42, 4⟩, mem)) :=
-  ⟨_, runA_sound mutReborrowForeignReadRoundTrip 30 _ _ _ rfl⟩
+  runA_exists_mem_sound mutReborrowForeignReadRoundTrip 30 _ _ _ (by kernel_rfl)
 
 theorem mutReborrowForeignReadRoundTrip_noUB :
     MirNoUBTree (mirCallTree mutReborrowForeignReadRoundTrip [.scalar ⟨5, 4⟩]) :=
-  runA_noUB mutReborrowForeignReadRoundTrip 30 _ _ _ rfl
+  runA_isSome_noUB mutReborrowForeignReadRoundTrip 30 _ (by kernel_rfl)
 
 theorem mutReborrowForeignReadRoundTrip_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n mutReborrowForeignReadRoundTripMInit = .ok m' ∧
@@ -2022,7 +2059,7 @@ theorem mutReborrowForeignReadRoundTrip_minirust_ret_from_start :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret mutReborrowForeignReadRoundTrip_inFragment
       mutReborrowForeignReadRoundTrip_translate ctx0
-      mutReborrowForeignReadRoundTrip_ctxOk [.scalar ⟨5, 4⟩] (by decide)
+      mutReborrowForeignReadRoundTrip_ctxOk [.scalar ⟨5, 4⟩] (by decide +kernel)
       mutReborrowForeignReadRoundTripMInit rfl rfl rfl hretA
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [mutReborrowForeignReadRoundTrip, ptrBody] at hd; subst hd
@@ -2041,7 +2078,7 @@ theorem mutReborrowForeignReadRoundTrip_minirust_noUB {n : Nat} {e : Stop}
         (.normal (v, mem)) :=
   mirCall_noUB mutReborrowForeignReadRoundTrip_inFragment
     mutReborrowForeignReadRoundTrip_translate ctx0
-    mutReborrowForeignReadRoundTrip_ctxOk [.scalar ⟨5, 4⟩] (by decide)
+    mutReborrowForeignReadRoundTrip_ctxOk [.scalar ⟨5, 4⟩] (by decide +kernel)
     mutReborrowForeignReadRoundTripMInit rfl rfl rfl mutReborrowForeignReadRoundTrip_noUB herr
 
 theorem mutReborrowForeignReadRoundTrip_progress (n : Nat) :
@@ -2055,7 +2092,7 @@ theorem mutReborrowForeignReadRoundTrip_progress (n : Nat) :
         (.normal (v, mem))) :=
   mirCall_progress_N mutReborrowForeignReadRoundTrip_inFragment
     mutReborrowForeignReadRoundTrip_translate ctx0
-    mutReborrowForeignReadRoundTrip_ctxOk [.scalar ⟨5, 4⟩] (by decide)
+    mutReborrowForeignReadRoundTrip_ctxOk [.scalar ⟨5, 4⟩] (by decide +kernel)
     mutReborrowForeignReadRoundTripMInit rfl rfl rfl mutReborrowForeignReadRoundTrip_noUB n
 
 theorem mutReborrowForeignReadRoundTrip_three_way :
@@ -2097,7 +2134,7 @@ theorem storageLiveReallocDisablesBorrowUb_three_way_ub :
       some "dereferencing pointer to dead allocation" ∧
     ubAfterTB storageLiveReallocDisablesBorrowUb [.scalar ⟨5, 4⟩] 8 =
       some "dereferencing pointer to dead allocation" :=
-  ⟨faultsA_sound storageLiveReallocDisablesBorrowUb 25 _ (by decide),
+  ⟨faultsA_sound storageLiveReallocDisablesBorrowUb 25 _ (by kernel_rfl),
    by decide +kernel, by decide +kernel⟩
 
 end MiniRustSpec.Correspondence.TbWitness

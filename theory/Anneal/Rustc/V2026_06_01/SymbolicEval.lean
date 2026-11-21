@@ -1766,52 +1766,37 @@ def finishAssignStmtNode
       match get? locals₁ dst.local_ with
       | .some (.init rootVal) =>
         match
-          writeProjectedForLocal
-            locals₁
+          ensureNestedFieldShells
+            rootVal
+            (proj :: rest)
             localDecls
             layouts
-            dst.local_
-            (ensureNestedFieldShells rootVal (proj :: rest))
-            (proj :: rest)
-            val
+            (placeTy localDecls layouts { local_ := dst.local_, projection := .nil })
         with
-        | .ok rootVal' =>
-          match set? locals₁ dst.local_ (.init rootVal') with
-          | .some locals₂ =>
-            let resolvedLocalProj :=
-              resolveBorrowWriteLocalProj
-                localDecls
-                layouts
-                locals₁
-                dst.local_
-                (proj :: rest)
-            match mem₁.activeProtectors with
-            | .nil =>
-              let borrows' :=
-                invalidateConflictingBorrowsAtProj
-                  mem₁.borrows
+        | .none => MirStepNode.fail .ub
+        | .some shelledRoot =>
+          match
+            writeProjectedForLocal
+              locals₁
+              localDecls
+              layouts
+              dst.local_
+              shelledRoot
+              (proj :: rest)
+              val
+          with
+          | .ok rootVal' =>
+            match set? locals₁ dst.local_ (.init rootVal') with
+            | .some locals₂ =>
+              let resolvedLocalProj :=
+                resolveBorrowWriteLocalProj
+                  localDecls
+                  layouts
+                  locals₁
                   dst.local_
-                  .none
-                  resolvedLocalProj
-                  0
-                  0
-                  (length mem₁.callStack)
-              MirStepNode.step
-                (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
-            | protHead :: protTail =>
-              match
-                hasProtectedWriteConflict
-                  mem₁.borrows
-                  (protHead :: protTail)
-                  dst.local_
-                  .none
-                  resolvedLocalProj
-                  0
-                  0
-                  (length mem₁.callStack)
-              with
-              | true => MirStepNode.fail .ub
-              | false =>
+                  (proj :: rest)
+              match mem₁.activeProtectors with
+              | .nil =>
                 let borrows' :=
                   invalidateConflictingBorrowsAtProj
                     mem₁.borrows
@@ -1823,9 +1808,34 @@ def finishAssignStmtNode
                     (length mem₁.callStack)
                 MirStepNode.step
                   (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
-          | .none => MirStepNode.fail .ub
-        | .ub => MirStepNode.fail .ub
-        | .unsupported => MirStepNode.unsupported
+              | protHead :: protTail =>
+                match
+                  hasProtectedWriteConflict
+                    mem₁.borrows
+                    (protHead :: protTail)
+                    dst.local_
+                    .none
+                    resolvedLocalProj
+                    0
+                    0
+                    (length mem₁.callStack)
+                with
+                | true => MirStepNode.fail .ub
+                | false =>
+                  let borrows' :=
+                    invalidateConflictingBorrowsAtProj
+                      mem₁.borrows
+                      dst.local_
+                      .none
+                      resolvedLocalProj
+                      0
+                      0
+                      (length mem₁.callStack)
+                  MirStepNode.step
+                    (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+            | .none => MirStepNode.fail .ub
+          | .ub => MirStepNode.fail .ub
+          | .unsupported => MirStepNode.unsupported
       | .some .uninit =>
         match uninitFieldWriteShell? localDecls layouts dst.local_ proj rest with
         | .some rootVal =>
@@ -2551,6 +2561,360 @@ theorem wrapScalarBits_of_ble_false
 
 /-! ## 5. Computable Fast-Path Checkers & Bidirectional `MirBoolPredicateHolds` -/
 
+@[reducible]
+def strictBool : Bool → Option Bool
+  | false => .some false
+  | true => .some true
+
+private theorem strictBool_eq : ∀ (b : Bool), strictBool b = .some b
+  | false => rfl
+  | true => rfl
+
+@[reducible]
+def strictBits : Nat → Nat → Option Nat
+  | .zero, n => .some n
+  | .succ _, .zero => .some .zero
+  | .succ _, .succ .zero => .some (.succ .zero)
+  | .succ k, .succ (.succ m) =>
+    let n := .succ (.succ m)
+    match strictBits k (Nat.div n 2), Nat.beq (Nat.mod n 2) 0 with
+    | .some q, true => .some (Nat.mul 2 q)
+    | .some q, false => .some (.succ (Nat.mul 2 q))
+    | .none, _ => .none
+
+theorem strictBits_eq : ∀ (k n : Nat), strictBits k n = .some n
+  | .zero, _ => rfl
+  | .succ _, .zero => rfl
+  | .succ _, .succ .zero => rfl
+  | .succ k, .succ (.succ m) => by
+    unfold strictBits
+    dsimp only
+    rw [strictBits_eq k (Nat.div (.succ (.succ m)) 2)]
+    cases hm : Nat.beq (Nat.mod (.succ (.succ m)) 2) 0
+    · dsimp only
+      have hm' : (.succ (.succ m)) % 2 ≠ 0 := fun hc => by
+        change Nat.mod (.succ (.succ m)) 2 = 0 at hc
+        rw [hc] at hm
+        nomatch hm
+      change Option.some (2 * ((m + 2) / 2) + 1) = Option.some (m + 2)
+      exact congrArg Option.some (by omega)
+    · dsimp only
+      have hm' : (.succ (.succ m)) % 2 = 0 := Nat.eq_of_beq_eq_true hm
+      change Option.some (2 * ((m + 2) / 2)) = Option.some (m + 2)
+      exact congrArg Option.some (by omega)
+
+@[reducible]
+def strictOpt {α : Type} : Option α → Option (Option α)
+  | .none => .some .none
+  | .some x => .some (.some x)
+
+private theorem strictOpt_eq {α : Type} : ∀ (o : Option α), strictOpt o = .some o
+  | .none => rfl
+  | .some _ => rfl
+
+@[reducible]
+def strictOptNat : Option Nat → Option (Option Nat)
+  | .none => .some .none
+  | .some n =>
+    match strictBits 32 n with
+    | .some n' => .some (.some n')
+    | .none => .none
+
+private theorem strictOptNat_eq : ∀ (o : Option Nat), strictOptNat o = .some o
+  | .none => rfl
+  | .some n => by
+    unfold strictOptNat
+    dsimp only
+    rw [strictBits_eq 32 n]
+
+@[reducible]
+def strictList {α : Type} : List α → Option (List α)
+  | .nil => .some .nil
+  | x :: xs =>
+    match strictList xs with
+    | .some xs' => .some (x :: xs')
+    | .none => .none
+
+private theorem strictList_eq {α : Type} : ∀ (xs : List α), strictList xs = .some xs
+  | .nil => rfl
+  | _ :: xs => by
+    unfold strictList
+    rw [strictList_eq xs]
+
+@[reducible]
+def strictPerm : TreeBorrowPerm → Option TreeBorrowPerm
+  | .cell => .some .cell
+  | .reservedFrz b =>
+    match strictBool b with
+    | .some b' => .some (.reservedFrz b')
+    | .none => .none
+  | .reservedIM => .some .reservedIM
+  | .unique => .some .unique
+  | .frozen => .some .frozen
+  | .disabled => .some .disabled
+
+private theorem strictPerm_eq : ∀ (p : TreeBorrowPerm), strictPerm p = .some p
+  | .cell => rfl
+  | .reservedFrz b => by
+    unfold strictPerm
+    dsimp only
+    rw [strictBool_eq b]
+  | .reservedIM => rfl
+  | .unique => rfl
+  | .frozen => rfl
+  | .disabled => rfl
+
+@[reducible]
+def strictBorrowEntry (e : BorrowEntry) : Option BorrowEntry :=
+  match strictBits 32 e.tag, strictBits 16 e.targetLocal, strictList e.targetProjection, strictPerm e.perm with
+  | .some tag', .some loc', .some proj', .some perm' =>
+    match strictBits 64 e.rangeOffset, strictBits 64 e.rangeLen, strictOptNat e.protector with
+    | .some roff', .some rlen', .some prot' =>
+      match strictOptNat e.parentTag, strictBits 16 e.targetFrameDepth, strictBool e.allocDead with
+      | .some ptag', .some depth', .some dead' =>
+        .some
+          { tag := tag'
+            targetLocal := loc'
+            targetProjection := proj'
+            perm := perm'
+            rangeOffset := roff'
+            rangeLen := rlen'
+            protector := prot'
+            parentTag := ptag'
+            targetFrameDepth := depth'
+            allocDead := dead' }
+      | _, _, _ => .none
+    | _, _, _ => .none
+  | _, _, _, _ => .none
+
+private theorem strictBorrowEntry_eq (e : BorrowEntry) : strictBorrowEntry e = .some e := by
+  cases e
+  unfold strictBorrowEntry
+  dsimp only
+  rw [strictBits_eq, strictBits_eq, strictList_eq, strictPerm_eq,
+      strictBits_eq, strictBits_eq, strictOptNat_eq, strictOptNat_eq,
+      strictBits_eq, strictBool_eq]
+
+@[reducible]
+def strictBorrows : List BorrowEntry → Option (List BorrowEntry)
+  | .nil => .some .nil
+  | e :: rest =>
+    match strictBorrowEntry e, strictBorrows rest with
+    | .some e', .some rest' => .some (e' :: rest')
+    | _, _ => .none
+
+theorem strictBorrows_eq : ∀ (bs : List BorrowEntry), strictBorrows bs = .some bs
+  | .nil => rfl
+  | e :: rest => by
+    unfold strictBorrows
+    rw [strictBorrowEntry_eq e, strictBorrows_eq rest]
+
+@[reducible]
+def mapStrictList {α : Type} (f : α → Option α) : List α → Option (List α)
+  | .nil => .some .nil
+  | x :: xs =>
+    match f x, mapStrictList f xs with
+    | .some x', .some xs' => .some (x' :: xs')
+    | _, _ => .none
+
+theorem mapStrictList_eq {α : Type} (f : α → Option α) (hf : ∀ x, f x = .some x) :
+    ∀ (xs : List α), mapStrictList f xs = .some xs
+  | .nil => rfl
+  | x :: xs => by
+    unfold mapStrictList
+    rw [hf x, mapStrictList_eq f hf xs]
+
+@[reducible]
+def strictValue : Nat → Value → Option Value
+  | .zero, v => .some v
+  | .succ _, .unit => .some .unit
+  | .succ _, .uninit => .some .uninit
+  | .succ _, .scalar sc =>
+    match strictBits 128 sc.bits, strictBits 16 sc.sizeBytes with
+    | .some b', .some sz' => .some (.scalar ⟨b', sz'⟩)
+    | _, _ => .none
+  | .succ _, .ptr p sz =>
+    match strictBits 64 p.allocId, strictBits 64 p.offsetBytes, strictBits 16 sz with
+    | .some a', .some o', .some sz' => .some (.ptr ⟨a', o'⟩ sz')
+    | _, _, _ => .none
+  | .succ d, .aggregate v fs =>
+    match strictBits 16 v, mapStrictList (strictValue d) fs with
+    | .some v', .some fs' => .some (.aggregate v' fs')
+    | _, _ => .none
+
+theorem strictValue_eq : ∀ (d : Nat) (v : Value), strictValue d v = .some v
+  | .zero, _ => rfl
+  | .succ d, v => by
+    cases v with
+    | unit => rfl
+    | uninit => rfl
+    | scalar sc =>
+      cases sc
+      unfold strictValue
+      dsimp only
+      rw [strictBits_eq, strictBits_eq]
+    | ptr p sz =>
+      cases p
+      unfold strictValue
+      dsimp only
+      rw [strictBits_eq, strictBits_eq, strictBits_eq]
+    | aggregate v fs =>
+      unfold strictValue
+      rw [strictBits_eq, mapStrictList_eq (strictValue d) (strictValue_eq d) fs]
+
+@[reducible]
+def strictValueTop (v : Value) : Value :=
+  match strictValue 16 v with
+  | .some v' => v'
+  | .none => v
+
+@[simp]
+theorem strictValueTop_eq (v : Value) : strictValueTop v = v := by
+  unfold strictValueTop
+  rw [strictValue_eq 16 v]
+
+@[reducible]
+def strictSlotsAt (argCount idx : Nat) : List LocalSlot → Option (List LocalSlot)
+  | .nil => .some .nil
+  | .dead :: rest =>
+    match strictSlotsAt argCount (.succ idx) rest with
+    | .some rest' => .some (.dead :: rest')
+    | .none => .none
+  | .uninit :: rest =>
+    match strictSlotsAt argCount (.succ idx) rest with
+    | .some rest' => .some (.uninit :: rest')
+    | .none => .none
+  | .init v :: rest =>
+    match Bool.and (Nat.ble 1 idx) (Nat.ble idx argCount) with
+    | true =>
+      match strictSlotsAt argCount (.succ idx) rest with
+      | .some rest' => .some (.init v :: rest')
+      | .none => .none
+    | false =>
+      match strictValue 16 v, strictSlotsAt argCount (.succ idx) rest with
+      | .some v', .some rest' => .some (.init v' :: rest')
+      | _, _ => .none
+
+private theorem strictSlotsAt_eq (argCount : Nat) :
+    ∀ (idx : Nat) (ls : List LocalSlot), strictSlotsAt argCount idx ls = .some ls
+  | _, .nil => rfl
+  | idx, slot :: rest => by
+    cases slot with
+    | dead =>
+      unfold strictSlotsAt
+      rw [strictSlotsAt_eq argCount (.succ idx) rest]
+    | uninit =>
+      unfold strictSlotsAt
+      rw [strictSlotsAt_eq argCount (.succ idx) rest]
+    | init v =>
+      unfold strictSlotsAt
+      cases Bool.and (Nat.ble 1 idx) (Nat.ble idx argCount) <;> dsimp only
+      · rw [strictValue_eq 16 v, strictSlotsAt_eq argCount (.succ idx) rest]
+      · rw [strictSlotsAt_eq argCount (.succ idx) rest]
+
+@[reducible]
+def strictFrame (argCount : Nat) (f : StackFrame) : Option StackFrame :=
+  match strictBits 16 f.blockIdx, strictBits 16 f.stmtIdx, strictSlotsAt argCount 0 f.locals with
+  | .some blk, .some idx, .some locs =>
+    .some { blockIdx := blk, stmtIdx := idx, locals := locs }
+  | _, _, _ => .none
+
+private theorem strictFrame_eq (argCount : Nat) (f : StackFrame) :
+    strictFrame argCount f = .some f := by
+  cases f
+  unfold strictFrame
+  dsimp only
+  rw [strictBits_eq, strictBits_eq, strictSlotsAt_eq]
+
+@[reducible]
+def strictMemory (m : Memory) : Option Memory :=
+  match strictBits 32 m.nextAllocId, strictList m.globals, strictBorrows m.borrows, strictBits 32 m.nextTag with
+  | .some naid, .some glob, .some bor, .some nt =>
+    match strictList m.callees, strictList m.traitImpls, strictList m.callStack, strictOpt m.activeCallee with
+    | .some cal, .some ti, .some cs, .some ac =>
+      match strictList m.activeProtectors, strictBits 32 m.nextProtector, strictSlotsAt 0 0 m.callerLocals with
+      | .some ap, .some np, .some cl =>
+        match strictList m.fnPtrs, strictList m.exposedAllocIds with
+        | .some fp, .some ea =>
+          .some
+            { nextAllocId := naid, globals := glob, borrows := bor, nextTag := nt,
+              callees := cal, traitImpls := ti, callStack := cs, activeCallee := ac,
+              activeProtectors := ap, nextProtector := np, callerLocals := cl,
+              fnPtrs := fp, exposedAllocIds := ea }
+        | _, _ => .none
+      | _, _, _ => .none
+    | _, _, _, _ => .none
+  | _, _, _, _ => .none
+
+private theorem strictMemory_eq (m : Memory) : strictMemory m = .some m := by
+  cases m
+  unfold strictMemory
+  dsimp only
+  rw [strictBits_eq, strictList_eq, strictBorrows_eq, strictBits_eq,
+      strictList_eq, strictList_eq, strictList_eq, strictOpt_eq,
+      strictList_eq, strictBits_eq, strictSlotsAt_eq, strictList_eq, strictList_eq]
+
+@[reducible]
+def strictMachineState (argCount : Nat) (s : MachineState) : Option MachineState :=
+  match strictFrame argCount s.frame, strictMemory s.memory with
+  | .some f', .some m' => .some { frame := f', memory := m' }
+  | _, _ => .none
+
+private theorem strictMachineState_eq (argCount : Nat) (s : MachineState) :
+    strictMachineState argCount s = .some s := by
+  cases s
+  unfold strictMachineState
+  dsimp only
+  rw [strictFrame_eq, strictMemory_eq]
+
+/--
+Spine-normalizing wrapper around `stepMirState` for closed-term `by rfl`
+checkers.
+-/
+@[reducible]
+def stepMirStateStrict (body : CapturedMir) (st : MirExecState) : MirStepNode :=
+  match st with
+  | .running s =>
+    match
+      strictMachineState
+        (match s.memory.activeCallee with
+         | .some callee => callee.argCount
+         | .none => body.argCount)
+        s
+    with
+    | .some s' => stepMirState body (.running s')
+    | .none => stepMirState body st
+  | _ => stepMirState body st
+
+@[simp]
+theorem stepMirStateStrict_eq (body : CapturedMir) (st : MirExecState) :
+    stepMirStateStrict body st = stepMirState body st := by
+  cases st with
+  | running s =>
+    unfold stepMirStateStrict
+    dsimp only
+    rw [strictMachineState_eq _ s]
+  | halted _ => rfl
+  | faulted _ => rfl
+
+/--
+Periodic spine-normalizing wrapper around `stepMirState`: normalizes concrete
+`MachineState` spines once every 4 steps (`Nat.beq (fuel' % 4) 0`), keeping
+call-by-name kernel reduction linear in MIR length with compact kernel `Expr`
+arenas and zero overhead on short symbolic companions.
+-/
+@[reducible]
+def stepMirStatePeriodic (fuel' : Nat) (body : CapturedMir) (st : MirExecState) : MirStepNode :=
+  match Nat.beq (fuel' % 4) 0 with
+  | false => stepMirState body st
+  | true => stepMirStateStrict body st
+
+@[simp]
+theorem stepMirStatePeriodic_eq (fuel' : Nat) (body : CapturedMir) (st : MirExecState) :
+    stepMirStatePeriodic fuel' body st = stepMirState body st := by
+  unfold stepMirStatePeriodic
+  cases Nat.beq (fuel' % 4) 0 <;> simp only [stepMirStateStrict_eq]
+
 /--
 Computable bounded boolean checker for `MirBoolPredicateHolds`: returns `true`
 when `specBody` halts normally with `true` (`.scalar ⟨1, 1⟩`) or unwinds safely
@@ -2561,7 +2925,7 @@ def checkMirBoolExecBounded
   match fuel with
   | 0 => false
   | fuel' + 1 =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel' body st with
     | .ret (.normal (.scalar { bits := 1, sizeBytes := 1 }, _)) => true
     | .ret (.normal _) => false
     | .ret .panic => true
@@ -2604,6 +2968,7 @@ private theorem wpCoalBounded_of_checkMirBoolExecBounded
   | zero => nomatch h
   | succ fuel' ih =>
     unfold checkMirBoolExecBounded at h
+    rw [stepMirStatePeriodic_eq] at h
     unfold wpCoalBounded
     cases h_step : stepMirState body st with
     | ret out =>
@@ -3057,9 +3422,9 @@ def checkMirRustPinnedSpecWithCallees
     match fuel with
     | 0 => false
     | fuel' + 1 =>
-      match stepMirState subjectBody st with
+      match stepMirStatePeriodic fuel' subjectBody st with
       | .ret (.normal (retVal, _)) =>
-        checkMirBoolWithCalleesBounded specFuel ensBody callees (args ++ [retVal])
+        checkMirBoolWithCalleesBounded specFuel ensBody callees (args ++ [strictValueTop retVal])
       | .ret .panic => false
       | .ret .abort => false
       | .tau st' => loop fuel' st'
@@ -3111,6 +3476,7 @@ theorem wpMirBounded_of_checkMirRustPinnedSpecWithCallees
   | succ fuel' ih =>
     intro st h
     unfold checkMirRustPinnedSpecWithCallees.loop at h
+    rw [stepMirStatePeriodic_eq] at h
     unfold wpCoalBounded
     cases h_step : stepMirState subjectBody st with
     | ret out =>
@@ -3118,6 +3484,7 @@ theorem wpMirBounded_of_checkMirRustPinnedSpecWithCallees
       cases out with
       | normal p =>
         rcases p with ⟨rv, m⟩
+        simp only [strictValueTop_eq] at h
         intro retVal mem' h_eq
         injection h_eq with h_pair
         cases h_pair
@@ -3162,7 +3529,7 @@ def reachesFaultExecBounded
   match fuel with
   | 0 => false
   | fuel' + 1 =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel' body st with
     | .ret _ => false
     | .tau st' => reachesFaultExecBounded fuel' body st'
     | .vis (.inl _) _ => true
@@ -3206,6 +3573,7 @@ theorem reachesFaultExecBounded_not_treeSafe
   | succ fuel' ih =>
     intro h_safe
     unfold reachesFaultExecBounded at h_fault
+    rw [stepMirStatePeriodic_eq] at h_fault
     have h_obs :
         (ITree.cofix (stepMirState body) st).observe =
           (stepMirState body st).map (ITree.cofix (stepMirState body)) :=
@@ -3997,40 +4365,46 @@ def evalTerminatorFrameSymTree
            let nLocals := length s.frame.locals
            let borrows₁ := disableFrameBorrows s.memory.borrows depth nLocals
            match s.memory.callStack with
-           | .nil => MirStepNode.retNormal retVal { s.memory with borrows := borrows₁ }
+           | .nil =>
+             match valueContainsUninit retVal with
+             | true => MirStepNode.fail .ub
+             | false => MirStepNode.retNormal retVal { s.memory with borrows := borrows₁ }
            | caller :: restStack =>
              match caller.isDiverging with
              | true => MirStepNode.fail .ub
              | false =>
-               let restoredProtectors := restoreCallerProtectors caller
-               let callerMem : Memory := {
-                 s.memory with
-                 borrows := borrows₁
-                 callStack := restStack
-                 activeCallee := .some caller.callerBody
-                 activeProtectors := restoredProtectors
-               }
-               match
-                 writeReturnDestination
-                   caller.frame.locals
-                   callerMem
-                   caller.destination
-                   retVal
-                   caller.callerBody.localDecls
-                   caller.callerBody.layouts
-               with
-               | .ok updatedCallerLocals mem' =>
-                 MirStepNode.step {
-                   frame := {
-                     caller.frame with
-                     blockIdx := caller.returnTarget
-                     stmtIdx := 0
-                     locals := updatedCallerLocals
-                   }
-                   memory := mem'
+               match valueContainsUninit retVal with
+               | true => MirStepNode.fail .ub
+               | false =>
+                 let restoredProtectors := restoreCallerProtectors caller
+                 let callerMem : Memory := {
+                   s.memory with
+                   borrows := borrows₁
+                   callStack := restStack
+                   activeCallee := .some caller.callerBody
+                   activeProtectors := restoredProtectors
                  }
-               | .ub => MirStepNode.fail .ub
-               | .unsupported => MirStepNode.unsupported
+                 match
+                   writeReturnDestination
+                     caller.frame.locals
+                     callerMem
+                     caller.destination
+                     retVal
+                     caller.callerBody.localDecls
+                     caller.callerBody.layouts
+                 with
+                 | .ok updatedCallerLocals mem' =>
+                   MirStepNode.step {
+                     frame := {
+                       caller.frame with
+                       blockIdx := caller.returnTarget
+                       stmtIdx := 0
+                       locals := updatedCallerLocals
+                     }
+                     memory := mem'
+                   }
+                 | .ub => MirStepNode.fail .ub
+                 | .unsupported => MirStepNode.unsupported
          | _ => MirStepNode.fail .ub
        | _ :: _ => evalTerminator s term (some currentBody))
   | _ => evalTerminatorSymTree s term currentBody
@@ -6213,7 +6587,7 @@ def evalMirDiffExecBounded
   match fuel with
   | 0 => .outOfFuel
   | fuel' + 1 =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel' body st with
     | .ret (.normal (retVal, mem)) => .normal retVal mem
     | .ret .panic => .panic
     | .ret .abort => .abort
@@ -6274,7 +6648,7 @@ def probeMirDiffExecBounded
   match fuel with
   | 0 => (.outOfFuel, activeMirSpan body st)
   | fuel' + 1 =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel' body st with
     | .ret (.normal (retVal, mem)) =>
       ((MirDiffVerdict.normal retVal mem).toTagWithBody body, "none")
     | .ret .panic => (.panic, activeMirSpan body st)
@@ -6309,6 +6683,7 @@ theorem probeMirDiffExecBounded_fst_eq_toTagWithBody
   | zero => rfl
   | succ fuel' ih =>
     unfold probeMirDiffExecBounded evalMirDiffExecBounded
+    rw [stepMirStatePeriodic_eq]
     cases h_step : stepMirState body st with
     | ret out =>
       cases out with
@@ -6351,7 +6726,7 @@ def reachesStrictUBExecBounded
   match fuel with
   | 0 => false
   | fuel' + 1 =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel' body st with
     | .ret _ => false
     | .tau st' => reachesStrictUBExecBounded fuel' body st'
     | .vis (.inl (.fail .ub)) _ => true
@@ -6379,6 +6754,7 @@ theorem reachesFaultExecBounded_of_reachesStrictUBExecBounded
   | succ fuel' ih =>
     unfold reachesStrictUBExecBounded at h_ub
     unfold reachesFaultExecBounded
+    rw [stepMirStatePeriodic_eq] at h_ub ⊢
     cases h_step : stepMirState body st with
     | ret _ =>
       simp only [h_step] at h_ub
@@ -6474,7 +6850,7 @@ def reachesPanicExecBounded
   match fuel with
   | 0 => false
   | fuel' + 1 =>
-    match stepMirState body st with
+    match stepMirStatePeriodic fuel' body st with
     | .ret .panic => true
     | .ret (.normal _) => false
     | .ret .abort => false
@@ -6501,6 +6877,7 @@ theorem reachesPanicExecBounded_reachesRet
   | zero => nomatch h_panic
   | succ fuel' ih =>
     unfold reachesPanicExecBounded at h_panic
+    rw [stepMirStatePeriodic_eq] at h_panic
     have h_obs :
         (ITree.cofix (stepMirState body) st).observe =
           (stepMirState body st).map (ITree.cofix (stepMirState body)) :=
@@ -6586,6 +6963,7 @@ theorem wpCoalBounded_of_reachesPanicExecBounded
   | zero => nomatch h_panic
   | succ fuel' ih =>
     unfold reachesPanicExecBounded at h_panic
+    rw [stepMirStatePeriodic_eq] at h_panic
     unfold wpCoalBounded
     cases h_step : stepMirState body st with
     | ret out =>
@@ -6661,14 +7039,16 @@ theorem verifySafePanicMirPointBounded
 /--
 Frame-preserving rely contract for the external calls of a modular safe-panic
 certificate (`verifyModularSafePanicMirBounded`). It places no requirement on a
-call request, and it assumes only that the callee returns or unwinds to the
-same call frame (`callFramePreserved`) or aborts. It assumes nothing about the
-returned value or about the rest of the post-call memory.
+call request, and it assumes only that the callee returns an initialized value
+(`valueContainsUninit retVal = false`) or unwinds to the same call frame
+(`callFramePreserved`), or aborts. It assumes nothing else about the returned
+value or about the rest of the post-call memory.
 
 A `StatefulVerificationResult` cannot certify a body that panics after an
 uninterpreted external call: `mirDefaultWP` lets that call return any answer,
-including one whose memory carries a corrupted call stack or callee table, and
-the caller can then fault. This contract rules out exactly those answers.
+including `Value.uninit` (which faults when moved into `panic_fmt`) or a memory
+whose call stack or callee table is corrupted, and the caller can then fault.
+This contract rules out those answers.
 
 `TrustedBoundary.checkStatementOrigins` rejects a `Verify.*` certificate whose
 statement mentions an `Anneal.*` constant, so generated certificates spell out
@@ -6679,7 +7059,8 @@ def framePreservingCallContract : MirCallContract where
   pre _ := True
   post req ans :=
     match ans with
-    | .returned _ memAfter => callFramePreserved req.memory memAfter
+    | .returned retVal memAfter =>
+      And (valueContainsUninit retVal = false) (callFramePreserved req.memory memAfter)
     | .panicked memAfter => callFramePreserved req.memory memAfter
     | .aborted => True
 
@@ -6692,18 +7073,22 @@ theorem framePreservingCallContract_framePreserved :
       framePreservingCallContract.post req ans →
         ans.framePreserved req.memory := by
   intro req ans h_post
-  cases ans <;> exact h_post
+  cases ans with
+  | returned _ _ => exact h_post.2
+  | panicked _ => exact h_post
+  | aborted => exact h_post
 
 /--
 `framePreservingCallContract` is satisfiable, so a certificate that assumes it
-is not vacuous: the handler under which every external call returns `retVal`
-and leaves memory unchanged implements it.
+is not vacuous: the handler under which every external call returns an
+initialized `retVal` and leaves memory unchanged implements it.
 -/
-theorem framePreservingCallContract_holdsOn_returnUnchanged (retVal : Value) :
+theorem framePreservingCallContract_holdsOn_returnUnchanged
+    (retVal : Value) (h_init : valueContainsUninit retVal = false := by rfl) :
     framePreservingCallContract.holdsOn
       (fun req => ITree.ret (.returned retVal req.memory)) :=
   holdsOn_of_envSatisfiesContract _ _ fun _ _ _ h_post =>
-    DWLP.ret (h_post _ ⟨rfl, rfl, rfl, rfl, [], rfl⟩)
+    DWLP.ret (h_post _ ⟨h_init, rfl, rfl, rfl, rfl, [], rfl⟩)
 
 /--
 Answers to the uninterpreted external calls along one execution path: the
@@ -6792,11 +7177,12 @@ theorem wpMirExecFrameModularSym_of_reachesModularSafePanicExecBounded
     (fuel : Nat) (body : CapturedMir) (st : MirExecState)
     (h_check :
       ∀ answers : MirCallAnswerStream,
+        (∀ n, valueContainsUninit (answers n).1 = false) →
         reachesModularSafePanicExecBounded fuel body answers st = true) :
     wpMirExecFrameModularSym framePreservingCallContract fuel body st
       (fun out => ∀ retVal mem', out = .normal (retVal, mem') → False) := by
   induction fuel generalizing st with
-  | zero => nomatch h_check MirCallAnswerStream.unitEmpty
+  | zero => nomatch h_check MirCallAnswerStream.unitEmpty (fun _ => rfl)
   | succ fuel ih =>
     unfold wpMirExecFrameModularSym
     rw [evalSymNodeTreeFrameModular_eq, stepMirExecFrameSymTree_eval]
@@ -6804,50 +7190,63 @@ theorem wpMirExecFrameModularSym_of_reachesModularSafePanicExecBounded
     | ret out =>
       cases out with
       | normal _ =>
-        have h := h_check MirCallAnswerStream.unitEmpty
+        have h := h_check MirCallAnswerStream.unitEmpty (fun _ => rfl)
         unfold reachesModularSafePanicExecBounded at h
         simp only [h_step] at h
         nomatch h
       | panic => intro _ _ h_eq; nomatch h_eq
       | abort => intro _ _ h_eq; nomatch h_eq
     | tau st' =>
-      refine ih st' (fun answers => ?_)
-      have h := h_check answers
+      refine ih st' (fun answers h_init => ?_)
+      have h := h_check answers h_init
       unfold reachesModularSafePanicExecBounded at h
       simp only [h_step] at h
       exact h
     | vis i k =>
       rcases i with f | (e | c)
-      · have h := h_check MirCallAnswerStream.unitEmpty
+      · have h := h_check MirCallAnswerStream.unitEmpty (fun _ => rfl)
         unfold reachesModularSafePanicExecBounded at h
         simp only [h_step] at h
         nomatch h
       · cases e
-        refine ih (k PUnit.unit) (fun answers => ?_)
-        have h := h_check answers
+        refine ih (k PUnit.unit) (fun answers h_init => ?_)
+        have h := h_check answers h_init
         unfold reachesModularSafePanicExecBounded at h
         simp only [h_step] at h
         exact h
       · rcases c with ⟨req⟩
-        refine ⟨trivial, fun ans _ => ?_⟩
+        refine ⟨trivial, fun ans h_post => ?_⟩
         cases ans with
         | returned retVal memAfter =>
-          refine ih _ (fun answers => ?_)
+          refine ih _ (fun answers h_init => ?_)
           have h :=
-            h_check (MirCallAnswerStream.cons (retVal, memAfter) answers)
+            h_check (MirCallAnswerStream.cons (retVal, memAfter) answers) (by
+              intro n
+              cases n with
+              | zero => exact h_post.1
+              | succ m => exact h_init m)
           unfold reachesModularSafePanicExecBounded at h
           simp only [h_step, Bool.and_eq_true] at h
           exact h.1
         | panicked memAfter =>
-          refine ih _ (fun answers => ?_)
-          have h := h_check (MirCallAnswerStream.cons (.unit, memAfter) answers)
+          refine ih _ (fun answers h_init => ?_)
+          have h :=
+            h_check (MirCallAnswerStream.cons (.unit, memAfter) answers) (by
+              intro n
+              cases n with
+              | zero => rfl
+              | succ m => exact h_init m)
           unfold reachesModularSafePanicExecBounded at h
           simp only [h_step, Bool.and_eq_true] at h
           exact h.2.1
         | aborted =>
-          refine ih _ (fun answers => ?_)
+          refine ih _ (fun answers h_init => ?_)
           have h :=
-            h_check (MirCallAnswerStream.cons (.unit, emptyMemory) answers)
+            h_check (MirCallAnswerStream.cons (.unit, emptyMemory) answers) (by
+              intro n
+              cases n with
+              | zero => rfl
+              | succ m => exact h_init m)
           unfold reachesModularSafePanicExecBounded at h
           simp only [h_step, Bool.and_eq_true] at h
           exact h.2.2
@@ -6919,15 +7318,15 @@ theorem reachesModularSafePanicBounded_of_forall
     (fuel : Nat) (body : CapturedMir) (s : MachineState)
     (h_modular :
       ∀ answers : MirCallAnswerStream,
+        (∀ n, valueContainsUninit (answers n).1 = false) →
         reachesModularSafePanicExecBounded fuel body answers (.running s) =
           true)
     (h_panic :
-      ∀ retVal : Value,
-        reachesPanicAcrossCallsBounded (fun req => .returned retVal req.memory)
-          fuel body s = true) :
+      reachesPanicAcrossCallsBounded (fun req => .returned .unit req.memory)
+        fuel body s = true) :
     reachesModularSafePanicBounded fuel body s = true := by
   unfold reachesModularSafePanicBounded
-  rw [h_modular, h_panic]
+  rw [h_modular MirCallAnswerStream.unitEmpty (fun _ => rfl), h_panic]
   rfl
 
 /--
@@ -7012,20 +7411,139 @@ theorem refuteTotalClaimByBoundedPanicAcrossCalls
   rcases (h_holds args mem h_pre).2.2.2 tr .panic h_ret with ⟨_, _, h_eq, _⟩
   nomatch h_eq
 
+/-- One step of `reachesModularSafePanicExecBounded` after `stepMirState`. -/
+def reachesModularSafePanicExecStep
+    (fuel : Nat) (body : CapturedMir) (answers : MirCallAnswerStream)
+    (node : MirStepNode) : Bool :=
+  match node with
+  | .ret .panic => true
+  | .ret .abort => true
+  | .ret (.normal _) => false
+  | .tau st' => reachesModularSafePanicExecBounded fuel body answers st'
+  | .vis (.inl _) _ => false
+  | .vis (.inr (.inl _)) k =>
+    reachesModularSafePanicExecBounded fuel body answers (k PUnit.unit)
+  | .vis (.inr (.inr (.call req))) k =>
+    Bool.and
+      (reachesModularSafePanicExecBounded fuel body (fun n => answers (n + 1))
+        (k (.returned (answers 0).1 (restoreCallFrame req.memory (answers 0).2))))
+      (Bool.and
+        (reachesModularSafePanicExecBounded fuel body (fun n => answers (n + 1))
+          (k (.panicked (restoreCallFrame req.memory (answers 0).2))))
+        (reachesModularSafePanicExecBounded fuel body (fun n => answers (n + 1))
+          (k .aborted)))
+
+theorem modular_call_branches_true {a b c : Bool}
+    (ha : a = true) (hb : b = true) (hc : c = true) :
+    Bool.and a (Bool.and b c) = true := by
+  rw [ha, hb, hc]
+  rfl
+
+theorem reachesModularSafePanicExecBounded_succ
+    (fuel : Nat) (body : CapturedMir) (answers : MirCallAnswerStream)
+    (st : MirExecState) :
+    reachesModularSafePanicExecBounded (fuel + 1) body answers st =
+      reachesModularSafePanicExecStep fuel body answers (stepMirState body st) :=
+  rfl
+
+/-- Extract the initialized value of `locals[idx]`, or `.unit` otherwise. -/
+def peekLocalInitOrUnit (locals : List LocalSlot) (idx : LocalIdx) : Value :=
+  match Trusted.Sequence.get? locals idx with
+  | .some (.init v) => v
+  | _ => .unit
+
+theorem evalOperands_cons_eq (locals : List LocalSlot) (op : Operand) (ops : List Operand)
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (layouts : LayoutTable) (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl) (callStack : List SavedCallerFrame) :
+    evalOperands locals (op :: ops) borrows globals layouts callerLocals localDecls callStack =
+      match evalOperand locals op borrows globals layouts callerLocals localDecls callStack with
+      | .ok v locals' =>
+        match evalOperands locals' ops borrows globals layouts callerLocals localDecls callStack with
+        | .ok vs locals'' => .ok (v :: vs) locals''
+        | .ub => .ub
+        | .unsupported => .unsupported
+      | .ub => .ub
+      | .unsupported => .unsupported := rfl
+
+theorem evalOperand_move_nil_eq (locals : List LocalSlot) (idx : LocalIdx)
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (layouts : LayoutTable) (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl) (callStack : List SavedCallerFrame) :
+    evalOperand locals (.move { local_ := idx, projection := .nil })
+      borrows globals layouts callerLocals localDecls callStack =
+      match valueContainsUninit (peekLocalInitOrUnit locals idx) with
+      | true => .ub
+      | false =>
+        match Trusted.Sequence.get? locals idx with
+        | .some (.init v) =>
+          match Trusted.Sequence.set? locals idx .uninit with
+          | .some locals' => .ok v locals'
+          | .none => .ub
+        | .some .uninit => .ub
+        | .some .dead => .ub
+        | .none => .ub := by
+  delta evalOperand peekLocalInitOrUnit
+  dsimp only []
+  cases Trusted.Sequence.get? locals idx with
+  | none => rfl
+  | some slot =>
+    cases slot with
+    | init v =>
+      dsimp only []
+      have h_r : readProjectedValue locals v .nil =
+          match valueContainsUninit v with
+          | false => .ok v
+          | true => .ub := rfl
+      rw [h_r]
+      cases valueContainsUninit v <;> rfl
+    | uninit => rfl
+    | dead => rfl
+
+theorem evalOperand_copy_nil_eq (locals : List LocalSlot) (idx : LocalIdx)
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (layouts : LayoutTable) (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl) (callStack : List SavedCallerFrame) :
+    evalOperand locals (.copy { local_ := idx, projection := .nil })
+      borrows globals layouts callerLocals localDecls callStack =
+      match valueContainsUninit (peekLocalInitOrUnit locals idx) with
+      | true => .ub
+      | false =>
+        match Trusted.Sequence.get? locals idx with
+        | .some (.init v) => .ok v locals
+        | .some .uninit => .ub
+        | .some .dead => .ub
+        | .none => .ub := by
+  delta evalOperand peekLocalInitOrUnit
+  dsimp only []
+  cases Trusted.Sequence.get? locals idx with
+  | none => rfl
+  | some slot =>
+    cases slot with
+    | init v =>
+      dsimp only []
+      have h_r : readProjectedValue locals v .nil =
+          match valueContainsUninit v with
+          | false => .ok v
+          | true => .ub := rfl
+      rw [h_r]
+      cases valueContainsUninit v <;> rfl
+    | uninit => rfl
+    | dead => rfl
+
 /--
 Certify a Miri `panic` test whose execution passes through uninterpreted
 external calls, with linked `callees`, at `(args, mem)`. It proves both
 1. `ModularVerificationResult` with `post := False` under
    `framePreservingCallContract.holdsOn`: for every external-call handler that
-   returns or unwinds to the caller's call frame (or aborts), execution never
-   faults and never returns normally; and
+   returns an initialized value or unwinds to the caller's call frame (or
+   aborts), execution never faults and never returns normally; and
 2. `¬ TotalClaim.holds`, refuting total correctness.
 
 `h_modular` discharges the first conjunct
 (`wpMirExecFrameModularSym_of_reachesModularSafePanicExecBounded`). `h_panic`
-discharges the second: for every returned value, the path on which each
-external call returns that value and leaves memory unchanged unwinds to
-`.ret .panic` (`refuteTotalClaimByBoundedPanicAcrossCalls`).
+discharges the second along the path on which each external call returns `.unit`
+and leaves memory unchanged (`refuteTotalClaimByBoundedPanicAcrossCalls`).
 
 A body that panics without an external call satisfies both hypotheses as well,
 but `verifySafePanicMirPointBounded` certifies it with the stronger-looking
@@ -7039,16 +7557,33 @@ theorem verifyModularSafePanicMirBounded
     (mem : Memory)
     (h_modular :
       ∀ answers : MirCallAnswerStream,
+        (∀ n, valueContainsUninit (answers n).1 = false) →
         reachesModularSafePanicExecBounded fuel body answers
           (.running (initMachineStateWithMemoryAndCallees body args mem callees)) =
             true := by
-      intro _; rfl)
+      intro answers h_init
+      repeat' (
+        rw [reachesModularSafePanicExecBounded_succ]
+        (conv => lhs; arg 4; whnf)
+        try (
+          simp (config := { decide := false }) only [
+            evalOperands_cons_eq, evalOperand_move_nil_eq, evalOperand_copy_nil_eq]
+          (conv in valueContainsUninit _ => arg 1; whnf)
+          simp (config := { decide := false }) only [h_init]
+          (conv => lhs; arg 4; whnf)
+        )
+        delta reachesModularSafePanicExecStep
+        dsimp only []
+        first
+        | rfl
+        | apply modular_call_branches_true
+        | skip
+      ))
     (h_panic :
-      ∀ retVal : Value,
-        reachesPanicAcrossCallsBounded (fun req => .returned retVal req.memory)
-          fuel body (initMachineStateWithMemoryAndCallees body args mem callees) =
-            true := by
-      intro _; rfl) :
+      reachesPanicAcrossCallsBounded (fun req => .returned .unit req.memory)
+        fuel body (initMachineStateWithMemoryAndCallees body args mem callees) =
+          true := by
+      rfl) :
     ModularVerificationResult
       { body := body
         envAssumed := framePreservingCallContract.holdsOn
@@ -7072,7 +7607,7 @@ theorem verifyModularSafePanicMirBounded
         post := fun _ _ _ _ => True
         callees := callees }
       fuel args mem ⟨rfl, rfl⟩ (fun req => .returned .unit req.memory)
-      (h_panic .unit)
+      h_panic
 
 /--
 If `(evalMirDiffExecBounded fuel body st).toTag = .normalUnit`, then
@@ -7088,6 +7623,7 @@ theorem wpCoalBounded_of_evalMirDiffExecBounded_normalUnit
   | zero => nomatch h_ok
   | succ fuel' ih =>
     unfold evalMirDiffExecBounded at h_ok
+    rw [stepMirStatePeriodic_eq] at h_ok
     unfold wpCoalBounded
     cases h_step : stepMirState body st with
     | ret out =>
@@ -7100,6 +7636,7 @@ theorem wpCoalBounded_of_evalMirDiffExecBounded_normalUnit
         | scalar _ => nomatch h_ok
         | ptr _ _ => nomatch h_ok
         | aggregate _ _ => nomatch h_ok
+        | uninit => nomatch h_ok
       | panic =>
         simp only [h_step] at h_ok
         nomatch h_ok
@@ -7141,6 +7678,7 @@ theorem wpCoalBounded_of_evalMirDiffExecBounded_normalScalar
   | zero => nomatch h_ok
   | succ fuel' ih =>
     unfold evalMirDiffExecBounded at h_ok
+    rw [stepMirStatePeriodic_eq] at h_ok
     unfold wpCoalBounded
     cases h_step : stepMirState body st with
     | ret out =>
@@ -7159,6 +7697,7 @@ theorem wpCoalBounded_of_evalMirDiffExecBounded_normalScalar
           exact ⟨.scalar { bits := b, sizeBytes := sz }, m, rfl, rfl⟩
         | ptr _ _ => nomatch h_ok
         | aggregate _ _ => nomatch h_ok
+        | uninit => nomatch h_ok
       | panic =>
         simp only [h_step] at h_ok
         nomatch h_ok
@@ -7194,6 +7733,7 @@ theorem MirDiffVerdict.toTag_eq_normalUnit_of_toTagWithBody
     | unit => rfl
     | scalar _ => nomatch h
     | ptr _ _ => nomatch h
+    | uninit => nomatch h
     | aggregate varIdx fields =>
       cases fields with
       | nil =>
@@ -7430,6 +7970,7 @@ theorem MirDiffVerdict.eq_normal_of_toTagWithBody_normalScalar
       subst h_sz
       exact ⟨.scalar { bits := b, sizeBytes := sz }, mem, rfl, Or.inl rfl⟩
     | ptr _ _ => nomatch h
+    | uninit => nomatch h
     | aggregate varIdx fields =>
       cases fields with
       | nil =>
@@ -7481,6 +8022,7 @@ theorem wpCoalBounded_of_evalMirDiffExecBounded_toTagWithBody_normalScalar
   | zero => nomatch h_ok
   | succ fuel' ih =>
     unfold evalMirDiffExecBounded at h_ok
+    rw [stepMirStatePeriodic_eq] at h_ok
     unfold wpCoalBounded
     cases h_step : stepMirState body st with
     | ret out =>

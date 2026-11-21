@@ -1684,6 +1684,7 @@ def polyIdClaimFor (typeArgs : TypeSubst) : Claim where
   body := polyIdMir.instantiate typeArgs
   pre args :=
     ∃ v : Value, args = [v] ∧
+      valueContainsUninit v = false ∧
       -- Typed loads (`Operand.move`) validate `bool` (`0`/`1`) and `char`
       -- (4-byte Unicode scalar value, `DIV-LM-RAW-OVERWRITE-CHAR-COPY`).
       (match typeArgs with
@@ -1709,8 +1710,66 @@ theorem polyId_all_typeArgs_verified :
     | cons head2 tail2 => intro h_len; dsimp [TypeSubst.length] at h_len; have : polyIdMir.typeParamCount = 1 := rfl; omega
     | nil =>
       rcases head with ⟨t, l⟩
-      intro h_len args s rfl ⟨v, h_args, hv⟩ h_ctx
+      intro h_len args s rfl ⟨v, h_args, h_v_init, hv⟩ h_ctx
       subst h_args
+      have h_non_bc :
+          t ≠ .bool → t ≠ .char →
+          ∀ v : Value,
+            valueContainsUninit v = false →
+            wpMirSym 8 (polyIdClaimFor [(t, l)]).body
+              (initMachineStateWithCallees (polyIdClaimFor [(t, l)]).body [v]
+                (polyIdClaimFor [(t, l)]).callees)
+              (mirNormalPost (fun retVal _ =>
+                (polyIdClaimFor [(t, l)]).post [v] retVal)) := by
+        intro h_nb h_nc v h_v_init
+        let body_t := (polyIdClaimFor [(t, l)]).body
+        let s0 := initMachineStateWithCallees body_t [v] (polyIdClaimFor [(t, l)]).callees
+        have h_op :
+            evalOperand s0.frame.locals (.move { local_ := 1, projection := [] })
+              s0.memory.borrows s0.memory.globals
+              (s0.memory.activeCallee.getD body_t).layouts
+              s0.memory.callerLocals
+              (s0.memory.activeCallee.getD body_t).localDecls
+              s0.memory.callStack =
+            .ok v [.uninit, .uninit] := by
+          rw [evalOperand_move_nil_eq]
+          (conv in peekLocalInitOrUnit _ _ => whnf)
+          rw [h_v_init]
+          rfl
+        have h_s1 :
+            stepMirFn body_t s0 =
+            MirStepNode.step
+              { frame := { blockIdx := 0, stmtIdx := 1,
+                           locals := [.init v, .uninit] }
+                memory := s0.memory } := by
+          cases t <;> first | contradiction | (
+            (conv => lhs; whnf)
+            (conv in evalRvalue _ _ _ _ _ => delta evalRvalue evalUseRvalue; dsimp only [])
+            rw [h_op]
+            rfl)
+        have h_s2 :
+            stepMirFn (polyIdClaimFor [(t, l)]).body
+              { frame := { blockIdx := 0, stmtIdx := 1,
+                           locals := [.init v, .uninit] }
+                memory := (initMachineStateWithCallees (polyIdClaimFor [(t, l)]).body
+                            [v] (polyIdClaimFor [(t, l)]).callees).memory } =
+            match valueContainsUninit v with
+            | true => MirStepNode.fail .ub
+            | false =>
+              MirStepNode.retNormal v
+                (initMachineStateWithCallees (polyIdClaimFor [(t, l)]).body
+                  [v] (polyIdClaimFor [(t, l)]).callees).memory := rfl
+        rw [h_v_init] at h_s2
+        unfold wpMirSym wpMirExecSym
+        rw [evalSymNodeTree_eq, stepMirExecSymTree_eval]
+        dsimp only [stepMirState]
+        rw [h_s1]
+        dsimp only [MirStepNode.step, evalNodeWP]
+        unfold wpMirExecSym
+        rw [evalSymNodeTree_eq, stepMirExecSymTree_eval]
+        dsimp only [stepMirState]
+        rw [h_s2]
+        rfl
       cases t
       case bool =>
         rcases hv with rfl | rfl <;> rfl
@@ -1745,7 +1804,8 @@ theorem polyId_all_typeArgs_verified :
                   (polyIdClaimFor [(.char, l)]).callees).memory := rfl
         rw [h_rv, h_char]
         rfl
-      all_goals rfl
+      all_goals
+        exact h_non_bc (by intro h; nomatch h) (by intro h; nomatch h) v h_v_init
 
 /--
 `#[external_spec]` sidecar for `core::slice::from_raw_parts_mut` and a modular
@@ -1902,7 +1962,8 @@ private theorem evalTerminator_return_root_of_eq_nil
     (h_kind : term.kind = .return_)
     (h_ret : Trusted.Sequence.get? s.frame.locals 0 = .some (.init retVal))
     (h_prots : s.memory.activeProtectors = [])
-    (h_stack : s.memory.callStack = []) :
+    (h_stack : s.memory.callStack = [])
+    (h_init : valueContainsUninit retVal = false := by rfl) :
     evalTerminator s term currentBody =
       MirStepNode.retNormal retVal
         { s.memory with
@@ -1920,7 +1981,7 @@ private theorem evalTerminator_return_root_of_eq_nil
   rw [hasFrameDeallocProtectorConflict_of_eq_nil h_prots]
   dsimp only
   cases h_cs : s.memory.callStack with
-  | nil => rfl
+  | nil => dsimp only; rw [h_init]
   | cons _ _ => rw [h_stack] at h_cs; nomatch h_cs
 
 private theorem evalTerminator_return_callee_nil_of_eq_nil
@@ -1936,7 +1997,8 @@ private theorem evalTerminator_return_callee_nil_of_eq_nil
     (h_dst : caller.destination = { local_ := dstLoc, projection := [] })
     (h_get : Trusted.Sequence.get? caller.frame.locals dstLoc = .some slot)
     (h_not_dead : slot ≠ .dead)
-    (h_set : Trusted.Sequence.set? caller.frame.locals dstLoc (.init retVal) = .some locals') :
+    (h_set : Trusted.Sequence.set? caller.frame.locals dstLoc (.init retVal) = .some locals')
+    (h_init : valueContainsUninit retVal = false := by rfl) :
     evalTerminator s term currentBody =
       MirStepNode.step
         { frame :=
@@ -1967,6 +2029,8 @@ private theorem evalTerminator_return_callee_nil_of_eq_nil
   rw [h_stack]
   dsimp only
   rw [h_not_div]
+  dsimp only
+  rw [h_init]
   dsimp only
   rw [h_dst]
   rw [writeReturnDestination_nil_of_eq_nil h_restored h_get h_not_dead h_set]
@@ -2056,12 +2120,13 @@ private theorem step_modular_return_root
              borrows :=
                disableFrameBorrows s.memory.borrows
                  (Trusted.Sequence.length s.memory.callStack)
-                 (Trusted.Sequence.length s.frame.locals) }))) :
+                 (Trusted.Sequence.length s.frame.locals) })))
+    (h_init : valueContainsUninit retVal = false := by rfl) :
     wpMirExecFrameAndTraitsModularSym contract (fuel + 1) body (.running s) post :=
   step_modular_retNormal
     (by
       rw [stepMirFn_term h_ctx h_phase h_bb h_none h_end]
-      exact evalTerminator_return_root_of_eq_nil h_kind h_ret h_prots h_stack)
+      exact evalTerminator_return_root_of_eq_nil h_kind h_ret h_prots h_stack h_init)
     h_next
 
 private theorem step_modular_return_callee_nil
@@ -2104,13 +2169,14 @@ private theorem step_modular_return_callee_nil
                 callStack := restStack
                 activeCallee := .some caller.callerBody
                 activeProtectors := [] } })
-        post) :
+        post)
+    (h_init : valueContainsUninit retVal = false := by rfl) :
     wpMirExecFrameAndTraitsModularSym contract (fuel + 1) body (.running s) post :=
   step_modular_tau
     (by
       rw [stepMirFn_term h_ctx h_phase h_bb h_none h_end]
       exact evalTerminator_return_callee_nil_of_eq_nil
-        h_kind h_ret h_prots h_stack h_not_div h_restored h_dst h_get h_not_dead h_set)
+        h_kind h_ret h_prots h_stack h_not_div h_restored h_dst h_get h_not_dead h_set h_init)
     h_next
 
 private theorem step_noCall_return_root
@@ -2134,12 +2200,13 @@ private theorem step_noCall_return_root
              borrows :=
                disableFrameBorrows s.memory.borrows
                  (Trusted.Sequence.length s.memory.callStack)
-                 (Trusted.Sequence.length s.frame.locals) }))) :
+                 (Trusted.Sequence.length s.frame.locals) })))
+    (h_init : valueContainsUninit retVal = false := by rfl) :
     wpMirExecNoCallSym (fuel + 1) body (.running s) post :=
   step_noCall_retNormal
     (by
       rw [stepMirFn_term h_ctx h_phase h_bb h_none h_end]
-      exact evalTerminator_return_root_of_eq_nil h_kind h_ret h_prots h_stack)
+      exact evalTerminator_return_root_of_eq_nil h_kind h_ret h_prots h_stack h_init)
     h_next
 
 /--
@@ -3331,7 +3398,8 @@ theorem fmtPanic_modular_safe_panic_verified :
           { pre := fun _ => True
             post := fun req ans =>
               match ans with
-              | .returned _ memAfter => callFramePreserved req.memory memAfter
+              | .returned retVal memAfter =>
+                And (valueContainsUninit retVal = false) (callFramePreserved req.memory memAfter)
               | .panicked memAfter => callFramePreserved req.memory memAfter
               | .aborted => True }
         pre := fun args mem => args = [] ∧ mem = emptyMemory
@@ -3918,6 +3986,7 @@ def v26FfiReadRegClaim : Claim where
 theorem v26FfiReadRegPinnedAuto_verified : VerificationResult v26FfiReadRegClaim :=
   dischargeRustPinnedContractAuto
     v26FfiReadRegClaim 64 64 (.some v26FfiReadRegReqMir) (.some v26FfiReadRegEnsMir)
+    (h_check := by decide +kernel)
 
 theorem v26FfiReadRegEqU32_verified : VerificationResult v26FfiReadRegClaim :=
   dischargeRustEqU32FuelFree
@@ -3936,6 +4005,7 @@ def v26FfiReadRegTotalClaim : TotalClaim where
 theorem v26FfiReadRegTotalPinnedAuto_verified : TotalVerificationResult v26FfiReadRegTotalClaim :=
   dischargeRustTotalPinnedContractAuto
     v26FfiReadRegTotalClaim 64 64 (.some v26FfiReadRegReqMir) (.some v26FfiReadRegEnsMir)
+    (h_check := by decide +kernel)
 
 /-- Soundness canary (Pitfall A): without `argsMatchCalleeParamTys` / `argsMatchSignature`,
 an untyped aggregate `[.aggregate 0 [.scalar ⟨10, 4⟩]]` satisfies the closure-deref `requires`
@@ -3978,6 +4048,7 @@ theorem v26ClampAddOneSymRange_verified : VerificationResult v26ClampAddOneClaim
 theorem v26ClampAddOneBoundedRange_verified : VerificationResult v26ClampAddOneClaim :=
   dischargeRustBoundedRange1Auto
     v26ClampAddOneClaim 64 64 v26ClampAddOneReqMir (.some v26ClampAddOneEnsMir)
+    (h_check := by decide +kernel)
 
 def v26ClampAddOneTotalClaim : TotalClaim where
   body := v26ClampAddOneMir
@@ -3993,6 +4064,7 @@ theorem v26ClampAddOneTotalBoundedRange_verified :
     TotalVerificationResult v26ClampAddOneTotalClaim :=
   dischargeRustTotalBoundedRange1Auto
     v26ClampAddOneTotalClaim 64 64 v26ClampAddOneReqMir (.some v26ClampAddOneEnsMir)
+    (h_check := by decide +kernel)
 
 def v26ZeroArgConstMir : CapturedMir :=
   mkMirBody "sym_test::zero_arg_const" 0
@@ -4184,7 +4256,8 @@ theorem v26FfiReadRegReversedPinnedAuto_verified :
     VerificationResult v26FfiReadRegReversedClaim :=
   ⟨rfl, rfl, rfl,
     dischargeRustPinnedContractAuto
-      v26FfiReadRegReversedClaim 64 64 (.some v26FfiReadRegReversedReqMir) (.some v26FfiReadRegEnsMir)⟩
+      v26FfiReadRegReversedClaim 64 64 (.some v26FfiReadRegReversedReqMir) (.some v26FfiReadRegEnsMir)
+      (h_check := by decide +kernel)⟩
 
 theorem v26FfiReadRegReversedEqU32_verified : VerificationResult v26FfiReadRegReversedClaim :=
   dischargeRustEqU32FuelFree
@@ -4249,6 +4322,7 @@ theorem v26FfiReadRegIntermMoveTotal_verified :
     TotalVerificationResult v26FfiReadRegIntermMoveTotalClaim :=
   dischargeRustTotalPinnedContractAuto
     v26FfiReadRegIntermMoveTotalClaim 64 64 (.some v26FfiReadRegIntermMoveReqMir) (.some v26FfiReadRegEnsMir)
+    (h_check := by decide +kernel)
 
 /-- Two-parameter `u32` closure-deref short-circuit `requires` (`a == 10 && 20 == b`)
 and `ensures` (`30 == result`), discharged via both `dischargeRustPinnedContractAuto`
@@ -4389,7 +4463,8 @@ theorem v26AddTwoRegsPinnedAuto_verified :
     VerificationResult v26AddTwoRegsClaim :=
   ⟨rfl,
     dischargeRustPinnedContractAuto
-      v26AddTwoRegsClaim 64 64 (.some v26AddTwoRegsReqMir) (.some v26AddTwoRegsEnsMir)⟩
+      v26AddTwoRegsClaim 64 64 (.some v26AddTwoRegsReqMir) (.some v26AddTwoRegsEnsMir)
+      (h_check := by decide +kernel)⟩
 
 theorem v26AddTwoRegsEq2U32_verified : VerificationResult v26AddTwoRegsClaim :=
   dischargeRustEq2U32FuelFree
@@ -4421,12 +4496,12 @@ concrete frame fields but an arbitrary (symbolic) `mem.borrows`, a root
 closed by `exact`, without rewriting `hasFrameDeallocProtectorConflict`).
 -/
 theorem frameModularSym_return_reduces_over_symbolic_borrows
-    (contract : MirCallContract) (fuel : Nat) (retVal : Value) (mem : Memory)
+    (contract : MirCallContract) (fuel : Nat) (retSc : ScalarVal) (mem : Memory)
     (post : MirOutcome → Prop)
     (h :
       post
         (.normal
-          (retVal,
+          (.scalar retSc,
            { mem with
              callStack := []
              activeCallee := .none
@@ -4434,19 +4509,19 @@ theorem frameModularSym_return_reduces_over_symbolic_borrows
              borrows := disableFrameBorrows mem.borrows 0 1 }))) :
     wpMirExecFrameModularSym contract (fuel + 1) frameReturnMir
       (.running
-        { frame := { blockIdx := 0, stmtIdx := 0, locals := [.init retVal] }
+        { frame := { blockIdx := 0, stmtIdx := 0, locals := [.init (.scalar retSc)] }
           memory := { mem with callStack := [], activeCallee := .none, activeProtectors := [] } })
       post :=
   h
 
 /-- The same WHNF reduction holds for `wpMirExecFrameAndTraitsModularSym`. -/
 theorem frameAndTraitsModularSym_return_reduces_over_symbolic_borrows
-    (contract : MirCallContract) (fuel : Nat) (retVal : Value) (mem : Memory)
+    (contract : MirCallContract) (fuel : Nat) (retSc : ScalarVal) (mem : Memory)
     (post : MirOutcome → Prop)
     (h :
       post
         (.normal
-          (retVal,
+          (.scalar retSc,
            { mem with
              callStack := []
              activeCallee := .none
@@ -4454,7 +4529,7 @@ theorem frameAndTraitsModularSym_return_reduces_over_symbolic_borrows
              borrows := disableFrameBorrows mem.borrows 0 1 }))) :
     wpMirExecFrameAndTraitsModularSym contract (fuel + 1) frameReturnMir
       (.running
-        { frame := { blockIdx := 0, stmtIdx := 0, locals := [.init retVal] }
+        { frame := { blockIdx := 0, stmtIdx := 0, locals := [.init (.scalar retSc)] }
           memory := { mem with callStack := [], activeCallee := .none, activeProtectors := [] } })
       post :=
   h

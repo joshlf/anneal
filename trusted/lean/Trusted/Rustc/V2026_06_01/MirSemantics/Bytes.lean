@@ -573,13 +573,22 @@ def decodeArrayChunksWith
 
 /--
 Encode a runtime `Value` without requiring a type descriptor by dispatching on
-the value's runtime representation (`.unit`, `.scalar`, `.ptr`, or `.aggregate`).
+the value's runtime representation (`.unit`, `.scalar`, `.ptr`, or `.aggregate`),
+failing closed (`.none`) on `Value.uninit`.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "- An integer (`i*`/`u*`), floating point value (`f*`), or raw pointer must be initialized, i.e., must not be obtained from uninitialized memory."
+>
+> "Note: Uninitialized memory is also implicitly invalid for any type that has a restricted set of valid values. In other words, the only cases in which reading uninitialized memory is permitted are inside `union`s and in “padding” (the gaps between the fields of a type)."
 -/
 @[reducible]
 def encodeUntypedValueToBytes :
     Nat → Value → Option (List AbstractByte)
   | .zero, _ => .none
   | .succ _, .unit => .some .nil
+  | .succ _, .uninit => .none
   | .succ _, .scalar sv => encodeScalarBytes sv .none
   | .succ _, .ptr p sz =>
     encodeScalarBytes ⟨p.offsetBytes, sz⟩ (.some (p.allocId, p.tag))
@@ -944,6 +953,90 @@ Default structural recursion budget for `encodeValueToBytes` and
 def defaultCodecFuel : Nat := 16
 
 /--
+Search `discriminants` starting at 0-based variant index `curIdx` for the first
+variant whose machine discriminant bit pattern equals `tagBits`.
+
+Reference (`compiler/rustc_abi/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1950-L1954>
+
+> "    /// Enum-likes with more than one variant: each variant comes with
+>     /// a *discriminant* (usually the same as the variant index but the user can
+>     /// assign explicit discriminant values). That discriminant gets encoded
+>     /// as a *tag* on the machine."
+-/
+@[reducible]
+def findDiscriminantVariantIdx? : Nat → List Nat → Nat → Option Nat
+  | _, .nil, _ => .none
+  | curIdx, d :: rest, tagBits =>
+    match Nat.beq d tagBits with
+    | true => .some curIdx
+    | false => findDiscriminantVariantIdx? (.succ curIdx) rest tagBits
+
+/--
+Resolve a decoded multi-variant enum tag bit pattern `tagBits` to its 0-based
+variant index: when `variantDiscriminants` (`TypeLayout.variantDiscriminants`) is
+non-empty, matches `tagBits` against the explicit per-variant machine
+discriminants (rejecting undeclared gap bit patterns with `.none`); when empty,
+falls back to the default `0 .. n - 1` direct variant-index encoding.
+
+Reference (The Rust Reference, "Primitive representation of field-less enums"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#primitive-representation-of-field-less-enums>
+
+> "For field-less enums, primitive representations set the size and alignment to
+> be the same as the primitive type of the same name. For example, a field-less
+> enum with a `u8` representation can only have discriminants between 0 and 255
+> inclusive."
+-/
+@[reducible]
+def resolveEnumVariantIdxByTag
+    (variantDiscriminants : List Nat)
+    (tagBits : Nat) :
+    Option Nat :=
+  match variantDiscriminants with
+  | .nil => .some tagBits
+  | d :: rest => findDiscriminantVariantIdx? 0 (d :: rest) tagBits
+
+/--
+Resolve the machine discriminant bit pattern to write at `tagField` when
+encoding variant `varIdx` of a `VariantsShape.multiple` enum: when
+`variantDiscriminants` is empty, uses `varIdx` directly (`0 .. n - 1` default
+discriminants); when populated, looks up `variantDiscriminants[varIdx]` and
+validates that it fits in `tagSz` bytes (`< scalarModulus tagSz`) and satisfies
+`tagLayout`'s `WrappingRange`.
+
+Reference (`compiler/rustc_abi/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1950-L1954>
+
+> "    /// Enum-likes with more than one variant: each variant comes with
+>     /// a *discriminant* (usually the same as the variant index but the user can
+>     /// assign explicit discriminant values). That discriminant gets encoded
+>     /// as a *tag* on the machine."
+-/
+@[reducible]
+def resolveEnumDiscriminantForVariant
+    (tagLayout : ScalarLayout)
+    (tagSz : Nat)
+    (variantDiscriminants : List Nat)
+    (varIdx : Nat) :
+    Option Nat :=
+  match variantDiscriminants with
+  | .nil => .some varIdx
+  | d :: rest =>
+    match get? (d :: rest) varIdx with
+    | .some discrBits =>
+      let inWidth := Nat.blt discrBits (scalarModulus tagSz)
+      let inRange :=
+        match tagLayout with
+        | .initialized _ vr => wrappingRangeContains vr discrBits
+        | .union _ => true
+      match Bool.and inWidth inRange with
+      | true => .some discrBits
+      | false => .none
+    | .none => .none
+
+/--
 Fuel-bounded byte-level encoder converting a runtime `Value` of type `ty` under
 `layouts` into its little-endian `List AbstractByte` representation.
 
@@ -1206,24 +1299,33 @@ def encodeValueToBytes :
                 match get? outerOffsets tagField with
                 | .none => .none
                 | .some tagOff =>
-                  match encodeScalarBytes ⟨varIdx, tagSz⟩ .none with
+                  match
+                    resolveEnumDiscriminantForVariant
+                      tagLayout
+                      tagSz
+                      l.variantDiscriminants
+                      varIdx
+                  with
                   | .none => .none
-                  | .some tagBytes =>
-                    match
-                      writeAbstractBytesAt
-                        (replicateUninitBytes l.size.bytes)
-                        tagOff.bytes
-                        tagBytes
-                    with
+                  | .some tagBits =>
+                    match encodeScalarBytes ⟨tagBits, tagSz⟩ .none with
                     | .none => .none
-                    | .some bufWithTag =>
-                      encodeFieldsAtOffsetsWith
-                        encodeTyped
-                        encodeFallback
-                        varOffsets
-                        .nil
-                        fieldVals
-                        bufWithTag
+                    | .some tagBytes =>
+                      match
+                        writeAbstractBytesAt
+                          (replicateUninitBytes l.size.bytes)
+                          tagOff.bytes
+                          tagBytes
+                      with
+                      | .none => .none
+                      | .some bufWithTag =>
+                        encodeFieldsAtOffsetsWith
+                          encodeTyped
+                          encodeFallback
+                          varOffsets
+                          .nil
+                          fieldVals
+                          bufWithTag
               | _, _, _ => .none
             | _ => .none
     | _ => .none
@@ -1663,13 +1765,15 @@ def decodeValueFromBytes :
                 | .some tagSlice =>
                   match decodeScalarLayoutBytes tagLayout tagSlice with
                   | .some (.scalar tagSc) =>
-                    let varIdx := tagSc.bits
-                    match get? variantShapes varIdx with
-                    | .some (.arbitrary varOffsets _) =>
-                      match decodeFieldsBySpan bytes l.size.bytes varOffsets with
-                      | .some vals => .some (.aggregate varIdx vals)
-                      | .none => .none
-                    | _ => .none
+                    match resolveEnumVariantIdxByTag l.variantDiscriminants tagSc.bits with
+                    | .some varIdx =>
+                      match get? variantShapes varIdx with
+                      | .some (.arbitrary varOffsets _) =>
+                        match decodeFieldsBySpan bytes l.size.bytes varOffsets with
+                        | .some vals => .some (.aggregate varIdx vals)
+                        | .none => .none
+                      | _ => .none
+                    | .none => .none
                   | _ => .none
             | _, _ => .none
     | _ => .none

@@ -7117,28 +7117,31 @@ def prepTeardownAndWriteback : FramePrepM Unit := fun s =>
         match caller.isDiverging with
         | true => .error (.fail .ub) s
         | false =>
-          match
-            writeReturnDestination caller.frame.locals
-              { s.memory with
-                borrows :=
-                  disableFrameBorrows s.memory.borrows
-                    (length s.memory.callStack) (length s.frame.locals)
-                callStack := restStack
-                activeCallee := .some caller.callerBody
-                activeProtectors := restoreCallerProtectors caller }
-              caller.destination retVal caller.callerBody.localDecls
-              caller.callerBody.layouts
-          with
-          | .ok updatedCallerLocals mem' =>
-            .ok ()
-              { frame :=
-                  { caller.frame with
-                    blockIdx := caller.returnTarget
-                    stmtIdx := 0
-                    locals := updatedCallerLocals }
-                memory := mem' }
-          | .ub => .error (.fail .ub) s
-          | .unsupported => .error (.fail .unsupported) s
+          match valueContainsUninit retVal with
+          | true => .error (.fail .ub) s
+          | false =>
+            match
+              writeReturnDestination caller.frame.locals
+                { s.memory with
+                  borrows :=
+                    disableFrameBorrows s.memory.borrows
+                      (length s.memory.callStack) (length s.frame.locals)
+                  callStack := restStack
+                  activeCallee := .some caller.callerBody
+                  activeProtectors := restoreCallerProtectors caller }
+                caller.destination retVal caller.callerBody.localDecls
+                caller.callerBody.layouts
+            with
+            | .ok updatedCallerLocals mem' =>
+              .ok ()
+                { frame :=
+                    { caller.frame with
+                      blockIdx := caller.returnTarget
+                      stmtIdx := 0
+                      locals := updatedCallerLocals }
+                  memory := mem' }
+            | .ub => .error (.fail .ub) s
+            | .unsupported => .error (.fail .unsupported) s
   | _ => .error (.fail .ub) s
 
 /--
@@ -7338,36 +7341,45 @@ theorem prepTeardownAndWriteback_spec {s s' : MachineState}
           | false =>
             rw [hdiv] at h
             dsimp only [] at h
-            cases hwrite : writeReturnDestination caller.frame.locals
-                { s.memory with
-                  borrows :=
-                    disableFrameBorrows s.memory.borrows
-                      (length (caller :: restStack)) (length s.frame.locals)
-                  callStack := restStack
-                  activeCallee := .some caller.callerBody
-                  activeProtectors := restoreCallerProtectors caller }
-                caller.destination retVal caller.callerBody.localDecls
-                caller.callerBody.layouts with
-            | ub =>
-              rw [hwrite] at h
+            cases huninit : valueContainsUninit retVal with
+            | true =>
+              rw [huninit] at h
               cases h
-            | unsupported =>
-              rw [hwrite] at h
-              cases h
-            | ok updatedCallerLocals mem' =>
-              rw [hwrite] at h
-              cases h
-              refine ⟨fun span currentBody => ?_,
-                caller, restStack, updatedCallerLocals, mem', rfl, hdiv, rfl⟩
-              unfold evalTerminator
-              dsimp only []
-              rw [hget]
-              dsimp only []
-              rw [hstack, hconf]
-              dsimp only []
-              rw [hdiv]
-              dsimp only []
-              rw [hwrite]
+            | false =>
+              rw [huninit] at h
+              dsimp only [] at h
+              cases hwrite : writeReturnDestination caller.frame.locals
+                  { s.memory with
+                    borrows :=
+                      disableFrameBorrows s.memory.borrows
+                        (length (caller :: restStack)) (length s.frame.locals)
+                    callStack := restStack
+                    activeCallee := .some caller.callerBody
+                    activeProtectors := restoreCallerProtectors caller }
+                  caller.destination retVal caller.callerBody.localDecls
+                  caller.callerBody.layouts with
+              | ub =>
+                rw [hwrite] at h
+                cases h
+              | unsupported =>
+                rw [hwrite] at h
+                cases h
+              | ok updatedCallerLocals mem' =>
+                rw [hwrite] at h
+                cases h
+                refine ⟨fun span currentBody => ?_,
+                  caller, restStack, updatedCallerLocals, mem', rfl, hdiv, rfl⟩
+                unfold evalTerminator
+                dsimp only []
+                rw [hget]
+                dsimp only []
+                rw [hstack, hconf]
+                dsimp only []
+                rw [hdiv]
+                dsimp only []
+                rw [huninit]
+                dsimp only []
+                rw [hwrite]
 
 /-- Stage 4 as one trusted step, for any terminator of kind `return_`. -/
 theorem evalTerminator_return_of_prepTeardown {s s' : MachineState}
@@ -12303,7 +12315,8 @@ For ANY symbolic value `v : Value` and ANY active protector ID `protId : Nat`,
 calling `emptyFnAssignUnit` inside `emptyFnCallerProt` preserves `_2 = v` and
 the caller's active protector and returns `v` in 5 trusted steps.
 -/
-theorem emptyFnCallerWithProtector_liftFrame (v : Value) (protId : Nat) :
+theorem emptyFnCallerWithProtector_liftFrame (v : Value) (protId : Nat)
+    (hv : valueContainsUninit v = false) :
     LiftFrame emptyFnCallerProt 0 0 [.uninit, .uninit, .init v]
       (emptyFnCallerProtMem protId) (fun r => r = v) 5 := by
   have hFresh :
@@ -12334,8 +12347,60 @@ theorem emptyFnCallerWithProtector_liftFrame (v : Value) (protId : Nat) :
     rfl (Or.inl rfl) rfl rfl rfl rfl rfl hFresh rfl (fun h => by cases h)
     hNoConf rfl ?_
   -- Continuation at `bb1`: `_0 = copy _2; return;` (2 trusted steps).
-  exact liftState_iff_liftFrame.mp
-    (LiftState.of_step rfl (LiftState.of_retNormal rfl rfl))
+  let mem₀ : Memory :=
+    { (emptyFnCallerProtMem protId) with
+      borrows := disableFrameBorrows (emptyFnCallerProtMem protId).borrows 1 1
+      activeCallee := some emptyFnCallerProt }
+  let mem₁ : Memory :=
+    { mem₀ with borrows := invalidateConflictingBorrows mem₀.borrows 0 .none 0 }
+  let mem₂ : Memory :=
+    { mem₁ with borrows := disableFrameBorrows mem₁.borrows 0 3 }
+  refine liftState_iff_liftFrame.mp
+    (LiftState.of_step
+      (s' :=
+        { frame :=
+            { blockIdx := 1, stmtIdx := 1,
+              locals := [.init v, .init .unit, .init v] }
+          memory := mem₁ })
+      ?_
+      (LiftState.of_retNormal (mem' := mem₂) ?_ rfl))
+  · have hRval :
+        evalRvalue [.uninit, .init .unit, .init v]
+          (.use (.copy { local_ := 2, projection := [] })) mem₀
+          emptyFnCallerProt.localDecls emptyFnLayouts =
+          .ok v [.uninit, .init .unit, .init v] mem₀ := by
+      change
+        (match
+          match
+            match valueContainsUninit v with
+            | false => ProjReadResult.ok v
+            | true => ProjReadResult.ub
+          with
+          | .ok fieldVal =>
+            PlaceReadResult.ok fieldVal [.uninit, .init .unit, .init v]
+          | .ub => PlaceReadResult.ub
+          | .unsupported => PlaceReadResult.unsupported
+         with
+         | .ok val locals' => RvalueEvalResult.ok val locals' mem₀
+         | .ub => RvalueEvalResult.ub
+         | .unsupported => RvalueEvalResult.unsupported) = _
+      rw [hv]
+    change
+      (match
+        evalRvalue [.uninit, .init .unit, .init v]
+          (.use (.copy { local_ := 2, projection := [] })) mem₀
+          emptyFnCallerProt.localDecls emptyFnLayouts
+       with
+       | .ok val locals₁ mem₁' => _
+       | .ub => _
+       | .unsupported => _) = _
+    rw [hRval]
+    rfl
+  · change
+      (match valueContainsUninit v with
+       | true => MirStepNode.fail .ub
+       | false => MirStepNode.retNormal v mem₂) = _
+    rw [hv]
 
 /-- Caller memory with BOTH an active caller protector `protId` AND a stale
 `.disabled` borrow at depth `1` (as left by `disableFrameBorrows` from an
@@ -12357,7 +12422,8 @@ when an active caller protector AND a stale `.disabled` borrow at callee frame
 depth `1` are both present, proving that neither `activeProtectors = []` nor
 fresh-frame depth is needed for symbolic multi-call lifting.
 -/
-theorem emptyFnCallerStaleProtected_liftFrame (v : Value) (protId : Nat) :
+theorem emptyFnCallerStaleProtected_liftFrame (v : Value) (protId : Nat)
+    (hv : valueContainsUninit v = false) :
     LiftFrame emptyFnCallerProt 0 0 [.uninit, .uninit, .init v]
       (emptyFnCallerStaleProtMem protId) (fun r => r = v) 5 := by
   refine wpFramePrep_empty_function_symbolic_wp (body := emptyFnCallerProt)
@@ -12375,8 +12441,61 @@ theorem emptyFnCallerStaleProtected_liftFrame (v : Value) (protId : Nat) :
     (updatedCallerLocals := [.uninit, .init .unit, .init v])
     rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl (fun h => by cases h)
     rfl rfl ?_
-  exact liftState_iff_liftFrame.mp
-    (LiftState.of_step rfl (LiftState.of_retNormal rfl rfl))
+  let mem₀ : Memory :=
+    { (emptyFnCallerStaleProtMem protId) with
+      borrows :=
+        disableFrameBorrows (emptyFnCallerStaleProtMem protId).borrows 1 1
+      activeCallee := some emptyFnCallerProt }
+  let mem₁ : Memory :=
+    { mem₀ with borrows := invalidateConflictingBorrows mem₀.borrows 0 .none 0 }
+  let mem₂ : Memory :=
+    { mem₁ with borrows := disableFrameBorrows mem₁.borrows 0 3 }
+  refine liftState_iff_liftFrame.mp
+    (LiftState.of_step
+      (s' :=
+        { frame :=
+            { blockIdx := 1, stmtIdx := 1,
+              locals := [.init v, .init .unit, .init v] }
+          memory := mem₁ })
+      ?_
+      (LiftState.of_retNormal (mem' := mem₂) ?_ rfl))
+  · have hRval :
+        evalRvalue [.uninit, .init .unit, .init v]
+          (.use (.copy { local_ := 2, projection := [] })) mem₀
+          emptyFnCallerProt.localDecls emptyFnLayouts =
+          .ok v [.uninit, .init .unit, .init v] mem₀ := by
+      change
+        (match
+          match
+            match valueContainsUninit v with
+            | false => ProjReadResult.ok v
+            | true => ProjReadResult.ub
+          with
+          | .ok fieldVal =>
+            PlaceReadResult.ok fieldVal [.uninit, .init .unit, .init v]
+          | .ub => PlaceReadResult.ub
+          | .unsupported => PlaceReadResult.unsupported
+         with
+         | .ok val locals' => RvalueEvalResult.ok val locals' mem₀
+         | .ub => RvalueEvalResult.ub
+         | .unsupported => RvalueEvalResult.unsupported) = _
+      rw [hv]
+    change
+      (match
+        evalRvalue [.uninit, .init .unit, .init v]
+          (.use (.copy { local_ := 2, projection := [] })) mem₀
+          emptyFnCallerProt.localDecls emptyFnLayouts
+       with
+       | .ok val locals₁ mem₁' => _
+       | .ub => _
+       | .unsupported => _) = _
+    rw [hRval]
+    rfl
+  · change
+      (match valueContainsUninit v with
+       | true => MirStepNode.fail .ub
+       | false => MirStepNode.retNormal v mem₂) = _
+    rw [hv]
 
 /-- Slice reference type `&[u8]` for the Stage-3 protector-registration
 instance. -/

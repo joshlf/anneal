@@ -9523,6 +9523,51 @@ private theorem frame_eq_of_shape {m : Mach} {ctx : Ctx} {fr fr' : Frame} {A' : 
   simp [thread1] at h
   exact h.symm
 
+/-- `encodeDiscriminant` carries a relation `R` between two threaded states
+along: if every accessor call sends `R`-related states to `R`-related states
+(and stops on the second state whenever it stops on the first), then so does
+the whole tag loop. `evalStatement_rethread` uses it with the two machines
+that differ only in their thread list. -/
+private theorem encodeDiscriminant_rel {σ τ : Type} (R : σ → τ → Prop)
+    {acc1 : σ → Gen.Offset → List Byte → Interp σ}
+    {acc2 : τ → Gen.Offset → List Byte → Interp τ}
+    (hacc : ∀ s t offset bytes, R s t →
+      (∀ s', acc1 s offset bytes = .ok s' → ∃ t', acc2 t offset bytes = .ok t' ∧ R s' t') ∧
+      (∀ err, acc1 s offset bytes = .error err → acc2 t offset bytes = .error err))
+    (tagger : Map Gen.Offset (Gen.IntType × Int)) {s : σ} {t : τ} (h : R s t) :
+    (∀ s', encodeDiscriminant acc1 tagger s = .ok s' →
+      ∃ t', encodeDiscriminant acc2 tagger t = .ok t' ∧ R s' t') ∧
+    (∀ err, encodeDiscriminant acc1 tagger s = .error err →
+      encodeDiscriminant acc2 tagger t = .error err) := by
+  unfold encodeDiscriminant
+  generalize tagger.entries = entries
+  induction entries generalizing s t with
+  | nil =>
+    refine ⟨fun s' hs => ⟨t, rfl, ?_⟩, fun err he => by cases he⟩
+    cases hs
+    exact h
+  | cons e es ih =>
+    obtain ⟨offset, valueType, value⟩ := e
+    simp only [List.foldlM_cons]
+    cases Type.encodeInt valueType (.Int value) with
+    | error e =>
+      refine ⟨fun _ hs => (by cases hs), fun _ he => ?_⟩
+      simp only [error_bind] at he ⊢
+      exact congrArg Except.error (Except.error.inj he)
+    | ok bytes =>
+      simp only [ok_bind]
+      obtain ⟨hok, herr⟩ := hacc s t offset bytes h
+      cases h1 : acc1 s offset bytes with
+      | error e =>
+        rw [herr e h1]
+        refine ⟨fun _ hs => (by cases hs), fun _ he => ?_⟩
+        simp only [error_bind] at he ⊢
+        exact congrArg Except.error (Except.error.inj he)
+      | ok s1 =>
+        obtain ⟨t1, ht1, hR⟩ := hok s1 h1
+        rw [ht1]
+        exact ih hR
+
 /-- Lifting `evalStatement` from `[curCtx.caller, fr]` to an arbitrary stack
 prefix `pre ++ [fr]`. -/
 theorem evalStatement_rethread (st : Gen.Statement) (m : Mach) (rootCtx curCtx : Ctx)
@@ -9692,8 +9737,68 @@ theorem evalStatement_rethread (st : Gen.Statement) (m : Mach) (rootCtx curCtx :
                 rethread_with_mem_eq (curCtx := curCtx) hthr cm2
               rw [hre]
               exact ⟨rfl, ⟨hthr, hact, hsh2.allocs⟩, rfl, rfl⟩
-  | .SetDiscriminant _ _ =>
-    simp [evalStatement, unsupported]
+  | .SetDiscriminant dst value =>
+    obtain ⟨hpok, hperr⟩ := evalPlace_rethread dst m rootCtx curCtx pre fr hthr hact
+    simp only [evalStatement, evalSetDiscriminant]
+    cases hep : evalPlace (rethread m curCtx [curCtx.caller, fr]) dst with
+    | error err => simp [hperr err hep]
+    | ok ptm =>
+      obtain ⟨⟨p, ty⟩, m0⟩ := ptm
+      obtain ⟨cm0, rfl, hpm⟩ := hpok _ m0 hep
+      simp only [hpm, ok_bind]
+      cases ty with
+      | Enum variants _ _ _ _ =>
+        dsimp only
+        by_cases hal : !p.aligned
+        · simp [hal, ub]
+        · simp only [hal, Bool.false_eq_true, ↓reduceIte]
+          cases hv : mapGet variants value with
+          | none => simp [specPanic]
+          | some variant =>
+            dsimp only
+            obtain ⟨hok, herr⟩ := encodeDiscriminant_rel
+              (R := fun (s t : Mach) => ∃ cm,
+                s = { rethread m curCtx [curCtx.caller, fr] with mem := cm } ∧
+                  t = { m with mem := cm })
+              (acc1 := fun (m : Mach) offset bytes => do
+                let ptr ← ptrOffsetInbounds m p.ptr.thin_pointer (offset.bytes : Int)
+                let cm ← CM.store m.mem ptr bytes ⟨1⟩ .None
+                pure { m with mem := cm })
+              (acc2 := fun (m : Mach) offset bytes => do
+                let ptr ← ptrOffsetInbounds m p.ptr.thin_pointer (offset.bytes : Int)
+                let cm ← CM.store m.mem ptr bytes ⟨1⟩ .None
+                pure { m with mem := cm })
+              (fun s t offset bytes hR => by
+                obtain ⟨cm, rfl, rfl⟩ := hR
+                have hptr : ptrOffsetInbounds
+                    { rethread m curCtx [curCtx.caller, fr] with mem := cm }
+                    p.ptr.thin_pointer (offset.bytes : Int) =
+                    ptrOffsetInbounds { m with mem := cm } p.ptr.thin_pointer
+                      (offset.bytes : Int) := rfl
+                dsimp only
+                rw [hptr]
+                cases ptrOffsetInbounds { m with mem := cm } p.ptr.thin_pointer
+                    (offset.bytes : Int) with
+                | error e => exact ⟨fun _ hs => (by cases hs), fun _ he => he⟩
+                | ok ptr =>
+                  simp only [ok_bind]
+                  cases CM.store cm ptr bytes ⟨1⟩ .None with
+                  | error e => exact ⟨fun _ hs => (by cases hs), fun _ he => he⟩
+                  | ok cm' =>
+                    refine ⟨fun s' hs => ?_, fun _ he => by cases he⟩
+                    cases hs
+                    exact ⟨_, rfl, cm', rfl, rfl⟩)
+              variant.tagger ⟨cm0, rfl, rfl⟩
+            refine ⟨fun m2 fr' A' hm2 hsh2 => ?_, fun err he => herr err he⟩
+            obtain ⟨_, ht', cm2, rfl, rfl⟩ := hok m2 hm2
+            have hfrEq := frame_eq_of_shape rfl hsh2
+            cases hfrEq
+            have hre : rethread { rethread m curCtx [curCtx.caller, fr] with mem := cm2 } rootCtx
+                (pre ++ [fr]) = { m with mem := cm2 } :=
+              rethread_with_mem_eq (curCtx := curCtx) hthr cm2
+            rw [hre]
+            exact ⟨ht', ⟨hthr, hact, hsh2.allocs⟩, rfl, rfl⟩
+      | _ => simp [specPanic]
 
 /-! ### `LocalsOkA`, `BaseCandBounded`, ABI reflexivity, and `CallerDestRel` helpers -/
 
@@ -12030,7 +12135,7 @@ theorem evalReturn_caller_spec {callerBody calleeBody : CapturedMir}
       cases retVal with
       | aggregate v fs =>
         exact False.elim (not_slotOk_aggregate rfl v fs hvOk)
-      | unit | ptr =>
+      | unit | ptr | uninit =>
         simp [SlotOk] at hvOk
       | scalar scNew =>
         obtain ⟨hscNewSz, hscNewLt⟩ := hvOk
@@ -12106,7 +12211,7 @@ theorem evalReturn_caller_spec {callerBody calleeBody : CapturedMir}
       cases retVal with
       | aggregate v fs =>
         exact False.elim (not_slotOk_aggregate rfl v fs hvOk)
-      | unit | ptr =>
+      | unit | ptr | uninit =>
         simp [SlotOk] at hvOk
       | scalar scNew =>
         obtain ⟨hscNewSz, hscNewLt⟩ := hvOk

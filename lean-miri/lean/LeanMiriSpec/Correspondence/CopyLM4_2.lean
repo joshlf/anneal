@@ -277,13 +277,19 @@ theorem evalOperand_copy_local_eq (locals : List LocalSlot) (idx : Local)
     (callerLocals : List LocalSlot) :
     evalOperand locals (.copy ⟨idx, .nil⟩) borrows globals ly callerLocals =
       match get? locals idx with
-      | some (.init v) => .ok v locals
+      | some (.init v) =>
+        match valueContainsUninit v with
+        | false => .ok v locals
+        | true => .ub
       | _ => .ub := by
-  unfold evalOperand
+  unfold evalOperand readProjectedValue
   dsimp only
   cases get? locals idx with
   | none => rfl
-  | some slot => cases slot <;> rfl
+  | some slot =>
+    cases slot with
+    | dead | uninit => rfl
+    | init v => dsimp only; cases valueContainsUninit v <;> rfl
 
 /-- Raw-pointer operand evaluation without the immediate read (`annealEvalOperand`
 on a copy of an immediate raw-pointer local from `StateRelLM3_1`). -/
@@ -3137,9 +3143,8 @@ private theorem copyScalarVal?_of_evalOperand_ok
       | dead => rw [hslot] at heval; cases heval
       | uninit => rw [hslot] at heval; cases heval
       | init v =>
-        rw [hslot] at heval
-        injection heval with hv _
-        subst hv
+        rw [hslot] at heval; dsimp only [] at heval
+        cases hvc : valueContainsUninit v <;> rw [hvc] at heval <;> cases heval
         exact ⟨by simp [writeBytesScalarVal?, hslot], Or.inr ⟨idx, rfl, hslot⟩⟩
 
 private theorem copyEvalOperand_scalar_ub_or_ok
@@ -3460,10 +3465,12 @@ private theorem evalCopySingleDirect_dead_dst_ub
       | dead => rfl
       | uninit => rfl
       | init v_s =>
-        dsimp only [readProjectedValue]
-        rw [hopS, hopD]; dsimp only
-        rw [sameRigidTyShape_of_primScalar hprim]; dsimp only
-        rw [writePlaceValue_root_dead hdead_d, hdead_d]
+        cases hu : valueContainsUninit v_s
+        · dsimp only [readProjectedValue]; rw [hu]; dsimp only
+          rw [hopS, hopD]; dsimp only
+          rw [sameRigidTyShape_of_primScalar hprim]; dsimp only
+          rw [writePlaceValue_root_dead hdead_d, hdead_d]
+        · dsimp only [readProjectedValue]; rw [hu]
 
 private theorem evalCopySingleDirect_overlap_ub
     {s : MachineState} {src dst : MirAst.Operand}
@@ -7184,31 +7191,38 @@ private theorem evalCopyNonOverlapping_stage1_eq_of_withCount_eq
     | dead | uninit => rfl
     | init srcVal =>
       dsimp only
-      rw [evalOperand_copy_local_eq (idx := dstIdx)]
-      cases hdst : get? s.frame.locals dstIdx with
-      | none => rfl
-      | some slotD =>
-        cases slotD with
-        | dead | uninit => rfl
-        | init dstVal =>
-          dsimp only
-          cases hop with
-          | constScalar c countSc hval _ _ _ _ _ _ =>
-            unfold evalOperand; dsimp only; rw [hval]; dsimp only
-            exact hwith srcVal dstVal countSc hsrc hdst (Or.inl ⟨c, rfl, hval⟩)
-          | copyLocal cIdx _ _ _ _ =>
-            rw [evalOperand_copy_local_eq (idx := cIdx)]
-            cases hc : get? s.frame.locals cIdx with
-            | none => rfl
-            | some slotC =>
-              cases slotC with
-              | dead | uninit => rfl
-              | init vC =>
-                cases vC with
-                | scalar countSc =>
-                  dsimp only
-                  exact hwith srcVal dstVal countSc hsrc hdst (Or.inr ⟨cIdx, rfl, hc⟩)
-                | _ => rfl
+      cases valueContainsUninit srcVal
+      · dsimp only
+        rw [evalOperand_copy_local_eq (idx := dstIdx)]
+        cases hdst : get? s.frame.locals dstIdx with
+        | none => rfl
+        | some slotD =>
+          cases slotD with
+          | dead | uninit => rfl
+          | init dstVal =>
+            dsimp only
+            cases valueContainsUninit dstVal
+            · dsimp only
+              cases hop with
+              | constScalar c countSc hval _ _ _ _ _ _ =>
+                unfold evalOperand; dsimp only; rw [hval]; dsimp only
+                exact hwith srcVal dstVal countSc hsrc hdst (Or.inl ⟨c, rfl, hval⟩)
+              | copyLocal cIdx _ _ _ _ =>
+                rw [evalOperand_copy_local_eq (idx := cIdx)]
+                cases hc : get? s.frame.locals cIdx with
+                | none => rfl
+                | some slotC =>
+                  cases slotC with
+                  | dead | uninit => rfl
+                  | init vC =>
+                    cases vC with
+                    | scalar countSc =>
+                      dsimp only
+                      exact hwith srcVal dstVal countSc hsrc hdst (Or.inr ⟨cIdx, rfl, hc⟩)
+                    | aggregate _ fs => dsimp only [valueContainsUninit]; cases valueListContainsUninit fs <;> rfl
+                    | _ => rfl
+            · rfl
+      · rfl
 
 private theorem evalCopyNonOverlappingWithCount_stage1_single_eq
     {s : MachineState} {src dst : MirAst.Operand}

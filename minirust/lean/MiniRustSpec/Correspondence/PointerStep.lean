@@ -4034,7 +4034,7 @@ theorem derefReadTreeUB_false_of_ancestors_not_disabled (locals : List LocalSlot
           exact hasTreeReadUB_false_of_ancestors_not_disabled borrows borrows
             entry.targetLocal ptrVal.tag _ entry.rangeOffset entry.rangeLen
             entry.targetFrameDepth (hanc ptrVal sz hloc)
-      | unit | scalar _ | aggregate _ _ => rfl
+      | unit | uninit | scalar _ | aggregate _ _ => rfl
 
 theorem evalRvalue_derefRead_eq (locals : List LocalSlot) {rv : Rvalue} {p : Nat}
     (hcrv : copyRv rv = .use (.copy ⟨p, [.deref]⟩)) (mem : MirSemantics.Memory)
@@ -4959,7 +4959,7 @@ theorem evalStmt_assign_expose_op (s : MachineState) (decls : List LocalDecl)
           .ok (.ptr pv 8) (opPost s.frame.locals (.move ⟨p, []⟩)) := by
         dsimp only [evalOperand, get?, opPost, opMoved]
         rw [hp]
-        simp [set?, hp_lt]
+        simp [readProjectedValue, set?, hp_lt]
       have hrv := evalRvalue_expose s.frame.locals (.move ⟨p, []⟩) targetTy s.memory decls layouts
         pv (opPost s.frame.locals (.move ⟨p, []⟩)) fullAddr hop hty hsrc haddr hlt hptr8
       simp only [evalStmt, hrv, get?, exposeMem]
@@ -5024,7 +5024,7 @@ theorem evalStmt_assign_withExposed_op (s : MachineState) (decls : List LocalDec
           .ok (.scalar sc) (opPost s.frame.locals (.move ⟨u, []⟩)) := by
         dsimp only [evalOperand, get?, opPost, opMoved]
         rw [hu]
-        simp [set?, hu_lt]
+        simp [readProjectedValue, set?, hu_lt]
       have hrv := evalRvalue_withExposed s.frame.locals (.move ⟨u, []⟩) targetTy s.memory decls layouts
         sc (opPost s.frame.locals (.move ⟨u, []⟩)) recoveredVal hop hsz hlt hbad hsrc hsigned hrec hptr8
       simp only [evalStmt, hrv, get?]

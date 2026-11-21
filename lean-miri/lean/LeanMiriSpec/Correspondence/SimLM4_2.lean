@@ -61,8 +61,9 @@ by `stepMirFn_copyNonOverlapping_stage1_eq_lm4_2`):
 * `call_intrinsic_write_bytes_simulation` (with
   `call_intrinsic_write_bytes_simulation_explicit` and
   `call_intrinsic_write_bytes_perm_divergence`; proved in `WriteBytesLM4_2`):
-  Stage-1 turns `write_bytes` into an external call
-  (`stepMirFn_stage1_unmodeled_intrinsic_extCall`).
+  Stage-1 executes `write_bytes` with its own, more restrictive
+  `Trusted.Rustc.V2026_06_01.MirSemantics.evalWriteBytesCall` (single-element
+  primitive writes at offset `0`; see `MiriDiffWitnesses.w6_write_bytes_read_returns`).
 * `call_intrinsic_offset_simulation` (`OffsetLM4_2`): the `wrapping_offset` and
   `std::intrinsics::*` aliases and provenance-free scalar pointers, none of which
   Stage-1 evaluates like the reference model.
@@ -96,9 +97,10 @@ by `stepMirFn_copyNonOverlapping_stage1_eq_lm4_2`):
    * `arith_offset` rejects provenance-free `.scalar` pointers.
 
    See `WitLM4_2.lean` §6/§7/§14/§15.
-4. **Stage-1 external-call boundary.** Stage-1 hands `write_bytes`,
-   `rotate_left`, and `rotate_right` to the environment, while `lean-miri`
-   executes them or fails closed. The `Stage1ExtraIntrinsic` calls that Stage-1
+4. **Stage-1 external-call boundary.** Stage-1 hands `rotate_left` and
+   `rotate_right` to the environment, while `lean-miri` fails closed on them
+   (Stage-1 executes `write_bytes` inline with its own, more restrictive
+   `evalWriteBytesCall`). The `Stage1ExtraIntrinsic` calls that Stage-1
    evaluates inline fail closed in `annealCallHooks`.
 5. **Tree Borrows.** `annealMemoryCopyHooks` and `annealWriteRepeatedBytes` track
    no Tree Borrows state, so the `*_perm_divergence` results compare Stage-1

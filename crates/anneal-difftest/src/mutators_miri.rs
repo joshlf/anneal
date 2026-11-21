@@ -214,6 +214,96 @@ pub fn helper_unwind_guarded(base: u32, delta: u32) -> u32 {
     let _guard = UnwindCleanupGuard(base);
     helper_unwind_leaf(base, delta)
 }
+
+#[repr(C)]
+pub struct FreezeAndCell {
+    pub frozen: u32,
+    pub cell: UnsafeCell<u32>,
+}
+
+unsafe impl Sync for FreezeAndCell {}
+
+pub const __ANNEAL_MODEL_STATIC_FROZEN_PAIR: &str = \"STATIC_FROZEN_PAIR\";
+pub static STATIC_FROZEN_PAIR: PairU32 = PairU32 { a: 7u32, b: 35u32 };
+
+pub const __ANNEAL_MODEL_STATIC_FREEZE_AND_CELL: &str = \"STATIC_FREEZE_AND_CELL\";
+pub static STATIC_FREEZE_AND_CELL: FreezeAndCell = FreezeAndCell {
+    frozen: 3u32,
+    cell: unsafe { transmute::<u32, UnsafeCell<u32>>(12u32) },
+};
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_pass_copy_nonoverlapping_same_tag_disjoint_array_halves: &str =
+    \"pass_copy_nonoverlapping_same_tag_disjoint_array_halves\";
+#[inline(never)]
+pub fn pass_copy_nonoverlapping_same_tag_disjoint_array_halves() -> u32 {
+    let mut arr: [u32; 4] = [10u32, 20u32, 30u32, 40u32];
+    let p: *mut u32 = &raw mut arr[0];
+    unsafe {
+        let dst: *mut u32 = offset(p, 2isize);
+        copy_nonoverlapping(p as *const u32, dst, 2usize);
+    }
+    arr[2] ^ arr[3]
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_pass_copy_nonoverlapping_same_tag_disjoint_u8_array_halves: &str =
+    \"pass_copy_nonoverlapping_same_tag_disjoint_u8_array_halves\";
+#[inline(never)]
+pub fn pass_copy_nonoverlapping_same_tag_disjoint_u8_array_halves() -> u32 {
+    let mut arr: [u8; 8] = [3u8, 5u8, 9u8, 17u8, 33u8, 65u8, 129u8, 250u8];
+    let p: *mut u8 = (&raw mut arr) as *mut u8;
+    unsafe {
+        let dst: *mut u8 = offset(p, 4isize);
+        copy_nonoverlapping(p as *const u8, dst, 4usize);
+    }
+    (arr[4] as u32)
+        | ((arr[5] as u32) << 8u32)
+        | ((arr[6] as u32) << 16u32)
+        | ((arr[7] as u32) << 24u32)
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_pass_copy_nonoverlapping_same_tag_disjoint_struct_fields: &str =
+    \"pass_copy_nonoverlapping_same_tag_disjoint_struct_fields\";
+#[inline(never)]
+pub fn pass_copy_nonoverlapping_same_tag_disjoint_struct_fields() -> u32 {
+    let mut pair: PairU32 = PairU32 { a: 44u32, b: 33u32 };
+    let p: *mut u32 = &raw mut pair.a;
+    unsafe {
+        let dst: *mut u32 = offset(p, 1isize);
+        copy_nonoverlapping(p as *const u32, dst, 1usize);
+    }
+    pair.b
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_pass_static_const_raw_ptr_read_and_freeze_retag: &str =
+    \"pass_static_const_raw_ptr_read_and_freeze_retag\";
+#[inline(never)]
+pub fn pass_static_const_raw_ptr_read_and_freeze_retag() -> u32 {
+    let raw: *const u32 = &raw const STATIC_FROZEN_PAIR.b;
+    let shared: &PairU32 = &STATIC_FROZEN_PAIR;
+    let first: u32 = unsafe { *raw };
+    let again: u32 = unsafe { *raw };
+    first ^ shared.a ^ (again << 8u32)
+}
+
+#[allow(non_upper_case_globals)]
+pub const __ANNEAL_MODEL_ub_static_unsafe_cell_raw_const_cast_mut_write: &str =
+    \"ub_static_unsafe_cell_raw_const_cast_mut_write\";
+#[inline(never)]
+pub fn ub_static_unsafe_cell_raw_const_cast_mut_write() -> u32 {
+    let cell: *mut u32 = (&raw const STATIC_FREEZE_AND_CELL.cell) as *const u32 as *mut u32;
+    unsafe {
+        *cell = 21u32;
+    }
+    let frozen: *mut u32 = (&raw const STATIC_FREEZE_AND_CELL.frozen) as *mut u32;
+    unsafe {
+        *frozen = *cell;
+        *frozen
+    }
+}
 ";
 
 /// A single closed, zero-argument seed function extracted from
@@ -322,57 +412,678 @@ impl DetRng {
     }
 }
 
-/// Extract the 110 closed zero-argument test functions from
+/// Extract the 112 closed zero-argument test functions from
 /// `tests/miri-diff/corpus/src/lib.rs` (excluding `helper_add_ten` and model
-/// helpers).
+/// items, including the model-marked Category 11 probes).
 pub fn load_miri_diff_corpus_seeds() -> Vec<MiriCorpusSeed> {
     extract_closed_corpus_seeds(RAW_MIRI_DIFF_CORPUS_RS)
 }
 
+/// Extract all model-marked item names declared by `const __ANNEAL_MODEL_*`
+/// markers in `file`, honoring both the marker suffix and any `&str` literal
+/// target value (matching `trusted/rustc-capture`'s `specs.rs`).
+pub(crate) fn model_marked_names_in_file(file: &File) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for item in &file.items {
+        if let Item::Const(c) = item
+            && let Some(model_ident) = c.ident.to_string().strip_prefix("__ANNEAL_MODEL_")
+        {
+            names.insert(model_ident.to_string());
+            let mut init_expr: &Expr = &c.expr;
+            loop {
+                match init_expr {
+                    Expr::Paren(p) => init_expr = &p.expr,
+                    Expr::Group(g) => init_expr = &g.expr,
+                    _ => break,
+                }
+            }
+            if let Expr::Lit(el) = init_expr
+                && let Lit::Str(ls) = &el.lit
+            {
+                let target = ls.value();
+                if !target.is_empty() {
+                    names.insert(target);
+                }
+            }
+        }
+    }
+    names
+}
+
+fn advance_rust_literal_bytes(source: &str, i: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let n = bytes.len();
+    if i >= n {
+        return None;
+    }
+    let at_word_start = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+    if at_word_start {
+        let mut r_pos = i;
+        if (bytes[r_pos] == b'b' || bytes[r_pos] == b'c') && r_pos + 1 < n && bytes[r_pos + 1] == b'r' {
+            r_pos += 1;
+        }
+        if bytes[r_pos] == b'r' {
+            let mut q = r_pos + 1;
+            let mut hashes = 0usize;
+            while q < n && bytes[q] == b'#' {
+                hashes += 1;
+                q += 1;
+            }
+            if q < n && bytes[q] == b'"' {
+                let mut k = q + 1;
+                while k < n {
+                    if bytes[k] == b'"'
+                        && k + 1 + hashes <= n
+                        && bytes[k + 1..k + 1 + hashes].iter().all(|&b| b == b'#')
+                    {
+                        return Some(k + 1 + hashes);
+                    }
+                    k += 1;
+                }
+                return Some(n);
+            }
+        }
+    }
+    if bytes[i] == b'"'
+        || ((bytes[i] == b'b' || bytes[i] == b'c')
+            && i + 1 < n
+            && bytes[i + 1] == b'"'
+            && at_word_start)
+    {
+        let mut k = i + if bytes[i] == b'"' { 1 } else { 2 };
+        while k < n {
+            if bytes[k] == b'\\' {
+                if k + 1 < n {
+                    let next_ch = source[k + 1..].chars().next().unwrap();
+                    k += 1 + next_ch.len_utf8();
+                } else {
+                    return Some(n);
+                }
+            } else if bytes[k] == b'"' {
+                return Some(k + 1);
+            } else {
+                let ch = source[k..].chars().next().unwrap();
+                k += ch.len_utf8();
+            }
+        }
+        return Some(n);
+    }
+    if bytes[i] == b'\''
+        || (bytes[i] == b'b' && i + 1 < n && bytes[i + 1] == b'\'' && at_word_start)
+    {
+        let k = i + if bytes[i] == b'\'' { 1 } else { 2 };
+        if k < n {
+            if bytes[k] == b'\\' && k + 1 < n {
+                let esc = bytes[k + 1];
+                if esc == b'x' && k + 4 < n && bytes[k + 4] == b'\'' {
+                    return Some(k + 5);
+                }
+                if esc == b'u' && k + 2 < n && bytes[k + 2] == b'{' {
+                    let mut m = k + 3;
+                    let mut hex_digits = 0usize;
+                    while m < n && (bytes[m].is_ascii_hexdigit() || bytes[m] == b'_') {
+                        if bytes[m].is_ascii_hexdigit() {
+                            hex_digits += 1;
+                        }
+                        m += 1;
+                    }
+                    if (1..=6).contains(&hex_digits)
+                        && m + 1 < n
+                        && bytes[m] == b'}'
+                        && bytes[m + 1] == b'\''
+                    {
+                        return Some(m + 2);
+                    }
+                } else {
+                    let ch = source[k + 1..].chars().next().unwrap();
+                    let close_idx = k + 1 + ch.len_utf8();
+                    if close_idx < n && bytes[close_idx] == b'\'' {
+                        return Some(close_idx + 1);
+                    }
+                }
+                // `'\...` or `b'\...` is never a lifetime; bound malformed escapes
+                // to the current line so `\u{` neither bumps `brace_depth` nor
+                // swallows subsequent lines.
+                let mut m = k + 1;
+                while m < n && bytes[m] != b'\n' {
+                    if bytes[m] == b'\'' {
+                        return Some(m + 1);
+                    }
+                    m += 1;
+                }
+                return Some(m);
+            } else if bytes[k] != b'\'' && bytes[k] != b'\n' {
+                let ch = source[k..].chars().next().unwrap();
+                let close_idx = k + ch.len_utf8();
+                if close_idx < n && bytes[close_idx] == b'\'' {
+                    return Some(close_idx + 1);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn push_blanked_preserving_len(out: &mut String, seg: &str) {
+    for b in seg.bytes() {
+        out.push(if b == b'\n' { '\n' } else { ' ' });
+    }
+}
+
+/// Mask Rust line/nested-block comments, `{ ... }` bodies (`brace_depth >= 1`),
+/// top-level `#[...]` / `#![...]` attributes, and (when `!keep_top_level_strings`)
+/// string/char literal contents into ASCII spaces of identical byte length.
+fn mask_rust_top_level_source(source: &str, keep_top_level_strings: bool) -> String {
+    let bytes = source.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n);
+    let mut i = 0usize;
+    let mut brace_depth = 0usize;
+    while i < n {
+        if bytes[i] == b'/' && i + 1 < n && bytes[i + 1] == b'/' {
+            let start = i;
+            i += 2;
+            while i < n && bytes[i] != b'\n' {
+                i += 1;
+            }
+            push_blanked_preserving_len(&mut out, &source[start..i]);
+            continue;
+        }
+        if bytes[i] == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
+            let start = i;
+            let mut depth = 1usize;
+            i += 2;
+            while i < n && depth > 0 {
+                if bytes[i] == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && i + 1 < n && bytes[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            push_blanked_preserving_len(&mut out, &source[start..i]);
+            continue;
+        }
+        if let Some(lit_end) = advance_rust_literal_bytes(source, i) {
+            let seg = &source[i..lit_end];
+            let is_char_lit = bytes[i] == b'\'' || (bytes[i] == b'b' && bytes.get(i + 1) == Some(&b'\''));
+            if brace_depth == 0 && keep_top_level_strings && !is_char_lit {
+                out.push_str(seg);
+            } else {
+                push_blanked_preserving_len(&mut out, seg);
+            }
+            i = lit_end;
+            continue;
+        }
+        if brace_depth == 0 && bytes[i] == b'#' {
+            let mut j = i + 1;
+            while j < n && matches!(bytes[j], b' ' | b'\t') {
+                j += 1;
+            }
+            if j < n && bytes[j] == b'!' {
+                j += 1;
+                while j < n && matches!(bytes[j], b' ' | b'\t') {
+                    j += 1;
+                }
+            }
+            if j < n && bytes[j] == b'[' {
+                let mut bdepth = 1usize;
+                let mut k = j + 1;
+                while k < n && bdepth > 0 {
+                    if bytes[k] == b'/' && k + 1 < n && bytes[k + 1] == b'/' {
+                        k += 2;
+                        while k < n && bytes[k] != b'\n' {
+                            k += 1;
+                        }
+                        continue;
+                    }
+                    if bytes[k] == b'/' && k + 1 < n && bytes[k + 1] == b'*' {
+                        let mut cdepth = 1usize;
+                        k += 2;
+                        while k < n && cdepth > 0 {
+                            if bytes[k] == b'/' && k + 1 < n && bytes[k + 1] == b'*' {
+                                cdepth += 1;
+                                k += 2;
+                            } else if bytes[k] == b'*' && k + 1 < n && bytes[k + 1] == b'/' {
+                                cdepth -= 1;
+                                k += 2;
+                            } else {
+                                k += 1;
+                            }
+                        }
+                        continue;
+                    }
+                    if let Some(inner_end) = advance_rust_literal_bytes(source, k) {
+                        k = inner_end;
+                        continue;
+                    }
+                    if bytes[k] == b'[' {
+                        bdepth += 1;
+                    } else if bytes[k] == b']' {
+                        bdepth -= 1;
+                    }
+                    k += 1;
+                }
+                push_blanked_preserving_len(&mut out, &source[i..k]);
+                i = k;
+                continue;
+            }
+        }
+        if brace_depth == 0
+            && bytes[i] == b'!'
+            && i > 0
+            && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_')
+        {
+            let mut j = i + 1;
+            while j < n && matches!(bytes[j], b' ' | b'\t' | b'\r' | b'\n') {
+                j += 1;
+            }
+            if j < n && matches!(bytes[j], b'(' | b'[') {
+                let open_delim = bytes[j];
+                let close_delim = if open_delim == b'(' { b')' } else { b']' };
+                let mut mdepth = 1usize;
+                let mut k = j + 1;
+                while k < n && mdepth > 0 {
+                    if bytes[k] == b'/' && k + 1 < n && bytes[k + 1] == b'/' {
+                        k += 2;
+                        while k < n && bytes[k] != b'\n' {
+                            k += 1;
+                        }
+                        continue;
+                    }
+                    if bytes[k] == b'/' && k + 1 < n && bytes[k + 1] == b'*' {
+                        let mut cdepth = 1usize;
+                        k += 2;
+                        while k < n && cdepth > 0 {
+                            if bytes[k] == b'/' && k + 1 < n && bytes[k + 1] == b'*' {
+                                cdepth += 1;
+                                k += 2;
+                            } else if bytes[k] == b'*' && k + 1 < n && bytes[k + 1] == b'/' {
+                                cdepth -= 1;
+                                k += 2;
+                            } else {
+                                k += 1;
+                            }
+                        }
+                        continue;
+                    }
+                    if let Some(inner_end) = advance_rust_literal_bytes(source, k) {
+                        k = inner_end;
+                        continue;
+                    }
+                    if bytes[k] == open_delim {
+                        mdepth += 1;
+                    } else if bytes[k] == close_delim {
+                        mdepth -= 1;
+                    }
+                    k += 1;
+                }
+                if k > i && matches!(bytes[k - 1], b')' | b']') {
+                    push_blanked_preserving_len(&mut out, &source[i..k - 1]);
+                    out.push(';');
+                } else {
+                    push_blanked_preserving_len(&mut out, &source[i..k]);
+                }
+                i = k;
+                continue;
+            }
+        }
+        if bytes[i] == b'{' {
+            out.push(if brace_depth == 0 { '{' } else { ' ' });
+            brace_depth += 1;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'}' {
+            brace_depth = brace_depth.saturating_sub(1);
+            out.push(if brace_depth == 0 { '}' } else { ' ' });
+            i += 1;
+            continue;
+        }
+        let ch = source[i..].chars().next().unwrap();
+        if brace_depth > 0 {
+            push_blanked_preserving_len(&mut out, &source[i..i + ch.len_utf8()]);
+        } else {
+            out.push(ch);
+        }
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn parse_rust_str_literal_value(raw: &str) -> Option<String> {
+    let mut trimmed = raw.trim();
+    while let Some(inner) = trimmed.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+        trimmed = inner.trim();
+    }
+    if let Some(rest) = trimmed.strip_prefix('r') {
+        let hashes = rest.bytes().take_while(|&b| b == b'#').count();
+        let after_hashes = &rest[hashes..];
+        let closing_hashes: String = "#".repeat(hashes);
+        let suffix = format!("\"{closing_hashes}");
+        if let Some(inner_and_close) = after_hashes.strip_prefix('"')
+            && let Some(inner) = inner_and_close.strip_suffix(&suffix)
+        {
+            return Some(inner.to_string());
+        }
+        return None;
+    }
+    if let Some(inner) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+        && !inner.contains('"')
+        && !inner.contains('\\')
+    {
+        return Some(inner.to_string());
+    }
+    None
+}
+
+/// Extract model-marked item names from raw Rust `source` when `syn::parse_file`
+/// fails (for example on nightly syntax inside a function body), ignoring
+/// comments, string/char literals, attributes, and nested `{ ... }` bodies.
+pub(crate) fn model_marked_names_in_source_text(
+    source: &str,
+) -> std::collections::BTreeSet<String> {
+    let top_no_str = mask_rust_top_level_source(source, false);
+    let top_with_str = mask_rust_top_level_source(source, true);
+    debug_assert_eq!(top_no_str.len(), top_with_str.len());
+
+    let mut names = std::collections::BTreeSet::new();
+    let mut offset = 0usize;
+    while let Some(rel_pos) = top_no_str[offset..].find("__ANNEAL_MODEL_") {
+        let pos = offset + rel_pos;
+        let before = &top_no_str[..pos];
+        let is_const_decl = before
+            .trim_end()
+            .rsplit_once(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(before.trim_end(), |(_, kw)| kw)
+            == "const";
+        let after_idx = pos + "__ANNEAL_MODEL_".len();
+        let after_no_str = &top_no_str[after_idx..];
+        let ident_len = after_no_str
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .count();
+        if is_const_decl && ident_len > 0 {
+            names.insert(after_no_str[..ident_len].to_string());
+            let tail_start = after_idx + ident_len;
+            if let Some(rel_semi) = top_no_str[tail_start..].find(';') {
+                let decl_tail = &top_with_str[tail_start..tail_start + rel_semi];
+                if let Some((_, rhs)) = decl_tail.split_once('=')
+                    && let Some(target) = parse_rust_str_literal_value(rhs)
+                    && !target.is_empty()
+                {
+                    names.insert(target);
+                }
+            }
+        }
+        offset = after_idx + ident_len.max(1);
+    }
+    names
+}
+
+/// Discover top-level exported zero-argument `pub ... fn <name>()` items in raw
+/// Rust `source` when `syn::parse_file` fails, ignoring comments, string/char
+/// literals, attributes, nested `{ ... }` bodies, and `pub(...)` items.
+pub(crate) fn discover_top_level_zero_arg_pub_fns_in_source_text(source: &str) -> Vec<String> {
+    let top_no_str = mask_rust_top_level_source(source, false);
+    let mut out = Vec::new();
+    for segment in top_no_str.split([';', '}']) {
+        let mut s = segment.trim_start();
+        let Some(after_pub) = s.strip_prefix("pub") else {
+            continue;
+        };
+        if after_pub
+            .bytes()
+            .next()
+            .is_none_or(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            continue;
+        }
+        s = after_pub.trim_start();
+        // Exclude restricted visibility `pub(crate)` / `pub(super)` / `pub(in ...)`.
+        if s.starts_with('(') {
+            continue;
+        }
+        loop {
+            if let Some(rest) = s.strip_prefix("const")
+                && rest
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| !b.is_ascii_alphanumeric() && b != b'_')
+            {
+                s = rest.trim_start();
+                continue;
+            }
+            if let Some(rest) = s.strip_prefix("unsafe")
+                && rest
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| !b.is_ascii_alphanumeric() && b != b'_')
+            {
+                s = rest.trim_start();
+                continue;
+            }
+            if let Some(rest) = s.strip_prefix("extern")
+                && rest
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| !b.is_ascii_alphanumeric() && b != b'_')
+            {
+                s = rest.trim_start();
+                continue;
+            }
+            break;
+        }
+        let Some(after_fn) = s.strip_prefix("fn") else {
+            continue;
+        };
+        if after_fn
+            .bytes()
+            .next()
+            .is_none_or(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            continue;
+        }
+        let rest = after_fn.trim_start();
+        let rest = rest.strip_prefix("r#").unwrap_or(rest);
+        let ident_len = rest
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .count();
+        if ident_len == 0 {
+            continue;
+        }
+        let ident = &rest[..ident_len];
+        let mut after_ident = rest[ident_len..].trim_start();
+        if after_ident.starts_with('<') {
+            let Some((end_generics, callable_without_turbofish)) =
+                scan_leading_rust_generics(after_ident)
+            else {
+                continue;
+            };
+            if !callable_without_turbofish {
+                continue;
+            }
+            after_ident = after_ident[end_generics..].trim_start();
+        }
+        if let Some(after_open) = after_ident.strip_prefix('(')
+            && after_open.trim_start().starts_with(')')
+        {
+            out.push(ident.to_string());
+        }
+    }
+    out
+}
+
+/// Scan a leading `<...>` generic parameter list in `src` (already comment- and
+/// literal-masked), returning `(closing_byte_offset, callable_without_turbofish)`.
+///
+/// Tracks nested `<...>`, `(...)`, `[...]`, and `{...}` delimiters and skips
+/// `->` return-type arrows so defaulted function-pointer parameters like
+/// `<F = fn() -> u32>` do not close `<...>` early, and requires `=` at top
+/// parameter depth (`gdepth == 1` outside nested `<...>`/`(...)`/`[...]`) so
+/// associated-type bounds like `<T: Iterator<Item = u32>>` are rejected.
+fn scan_leading_rust_generics(src: &str) -> Option<(usize, bool)> {
+    let bytes = src.as_bytes();
+    if bytes.first() != Some(&b'<') {
+        return None;
+    }
+    let mut gdepth = 0usize;
+    let mut pdepth = 0usize;
+    let mut bdepth = 0usize;
+    let mut cdepth = 0usize;
+    let mut i = 0usize;
+    let mut param_start = 1usize;
+    let mut param_has_top_eq = false;
+    let mut all_callable = true;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'-' && bytes.get(i + 1) == Some(&b'>') {
+            i += 2;
+            continue;
+        }
+        match b {
+            b'(' => pdepth += 1,
+            b')' => pdepth = pdepth.saturating_sub(1),
+            b'[' => bdepth += 1,
+            b']' => bdepth = bdepth.saturating_sub(1),
+            b'{' => cdepth += 1,
+            b'}' => cdepth = cdepth.saturating_sub(1),
+            b'<' if pdepth == 0 && bdepth == 0 && cdepth == 0 => {
+                gdepth += 1;
+            }
+            b'>' if pdepth == 0 && bdepth == 0 && cdepth == 0 => {
+                gdepth = gdepth.saturating_sub(1);
+                if gdepth == 0 {
+                    let param = src[param_start..i].trim();
+                    if !param.is_empty() && !param.starts_with('\'') && !param_has_top_eq {
+                        all_callable = false;
+                    }
+                    return Some((i + 1, all_callable));
+                }
+            }
+            b'=' if gdepth == 1 && pdepth == 0 && bdepth == 0 && cdepth == 0 => {
+                if bytes.get(i + 1) != Some(&b'>') && bytes.get(i + 1) != Some(&b'=') {
+                    param_has_top_eq = true;
+                }
+            }
+            b',' if gdepth == 1 && pdepth == 0 && bdepth == 0 && cdepth == 0 => {
+                let param = src[param_start..i].trim();
+                if !param.is_empty() && !param.starts_with('\'') && !param_has_top_eq {
+                    all_callable = false;
+                }
+                param_start = i + 1;
+                param_has_top_eq = false;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether `generics` allows calling a function as `f()` without explicit
+/// turbofish type or const arguments (lifetime parameters and defaulted
+/// type/const parameters are permitted).
+pub(crate) fn is_zero_arg_callable_generics(generics: &syn::Generics) -> bool {
+    generics.params.iter().all(|param| match param {
+        syn::GenericParam::Lifetime(_) => true,
+        syn::GenericParam::Type(tp) => tp.default.is_some(),
+        syn::GenericParam::Const(cp) => cp.default.is_some(),
+    })
+}
+
+/// Index in `file.items` of the candidate target entry `Item::Fn`:
+/// 1. Last non-model zero-arg callable `pub fn` (leaving trailing parameterized
+///    or non-defaulted generic `pub fn` helpers intact),
+/// 2. Last non-model callable-generic `pub fn` (for parameterized seeds that
+///    `close_miri_seed` closes into zero-arg candidates),
+/// 3. Last non-model `pub fn`,
+/// 4. Last non-model zero-arg callable `fn`, else last non-model `Item::Fn`.
+fn target_entry_fn_index(
+    file: &File,
+    local_models: &std::collections::BTreeSet<String>,
+) -> Option<usize> {
+    let find_last = |pred: &dyn Fn(&ItemFn) -> bool| -> Option<usize> {
+        file.items.iter().rposition(|item| match item {
+            Item::Fn(f) => {
+                !is_helper_fn_name_in_set(&f.sig.ident.to_string(), local_models) && pred(f)
+            }
+            _ => false,
+        })
+    };
+    find_last(&|f| {
+        matches!(f.vis, syn::Visibility::Public(_))
+            && f.sig.asyncness.is_none()
+            && f.sig.inputs.is_empty()
+            && is_zero_arg_callable_generics(&f.sig.generics)
+    })
+    .or_else(|| {
+        find_last(&|f| {
+            matches!(f.vis, syn::Visibility::Public(_))
+                && f.sig.asyncness.is_none()
+                && is_zero_arg_callable_generics(&f.sig.generics)
+        })
+    })
+    .or_else(|| {
+        find_last(&|f| matches!(f.vis, syn::Visibility::Public(_)) && f.sig.asyncness.is_none())
+    })
+    .or_else(|| {
+        find_last(&|f| {
+            f.sig.asyncness.is_none()
+                && f.sig.inputs.is_empty()
+                && is_zero_arg_callable_generics(&f.sig.generics)
+        })
+    })
+    .or_else(|| find_last(&|f| f.sig.asyncness.is_none()))
+    .or_else(|| find_last(&|_| true))
+}
+
+/// Whether `name` is a helper/model function given `model_names` rather than a
+/// candidate entry point (`helper_add_ten`, `__ANNEAL_MODEL_*`, or in `model_names`).
+pub(crate) fn is_helper_fn_name_in_set(
+    name: &str,
+    model_names: &std::collections::BTreeSet<String>,
+) -> bool {
+    let norm = name.strip_prefix("r#").unwrap_or(name);
+    norm == "helper_add_ten" || norm.starts_with("__ANNEAL_MODEL_") || model_names.contains(norm)
+}
+
 /// Names of the corpus call-chain helpers: every `<name>` for which
 /// `tests/miri-diff/corpus/src/lib.rs` declares an Anneal model marker
-/// `const __ANNEAL_MODEL_<name>: &str`.
+/// `const __ANNEAL_MODEL_<name>: &str` (or `: () = ()`).
+#[cfg(test)]
 fn corpus_model_helper_names() -> &'static std::collections::BTreeSet<String> {
     static NAMES: std::sync::OnceLock<std::collections::BTreeSet<String>> =
         std::sync::OnceLock::new();
     NAMES.get_or_init(|| {
         syn::parse_file(RAW_MIRI_DIFF_CORPUS_RS)
-            .map(|file| {
-                file.items
-                    .iter()
-                    .filter_map(|item| match item {
-                        Item::Const(c) => c
-                            .ident
-                            .to_string()
-                            .strip_prefix("__ANNEAL_MODEL_")
-                            .map(str::to_string),
-                        _ => None,
-                    })
-                    .collect()
-            })
+            .map(|file| model_marked_names_in_file(&file))
             .unwrap_or_default()
     })
 }
 
-/// Whether `name` is a corpus helper rather than a test entry point:
-/// `helper_add_ten`, an `__ANNEAL_MODEL_*` marker, or a model-marked call-chain
-/// helper ([`corpus_model_helper_names`]).
-pub(crate) fn is_corpus_helper_fn_name(name: &str) -> bool {
-    name == "helper_add_ten"
-        || name.starts_with("__ANNEAL_MODEL_")
-        || corpus_model_helper_names().contains(name)
-}
-
 /// Parse `corpus_source` and extract all zero-argument `pub fn` items other
-/// than `helper_add_ten` and `__ANNEAL_MODEL_*` helpers.
+/// than `helper_add_ten` and `__ANNEAL_MODEL_*` helpers declared in `corpus_source`.
 pub fn extract_closed_corpus_seeds(corpus_source: &str) -> Vec<MiriCorpusSeed> {
     let parsed = syn::parse_file(corpus_source)
         .expect("tests/miri-diff/corpus/src/lib.rs must parse as valid Rust");
+    let local_models = model_marked_names_in_file(&parsed);
     let mut seeds = Vec::new();
     for item in parsed.items {
         if let Item::Fn(func) = item {
+            if !matches!(func.vis, syn::Visibility::Public(_)) {
+                continue;
+            }
             let name = func.sig.ident.to_string();
-            if is_corpus_helper_fn_name(&name) || !func.sig.inputs.is_empty() {
+            if is_helper_fn_name_in_set(&name, &local_models)
+                || func.sig.asyncness.is_some()
+                || !func.sig.inputs.is_empty()
+                || !is_zero_arg_callable_generics(&func.sig.generics)
+            {
                 continue;
             }
             let single_file = File {
@@ -540,7 +1251,10 @@ fn infer_expr_type_name(expr: &Expr) -> String {
             Expr::Path(ep) if ep.qself.is_none() => match ep.path.segments.len() {
                 1 => {
                     let name = ep.path.segments[0].ident.to_string();
-                    if matches!(name.as_str(), "MetersU32" | "NonZeroMeters") {
+                    if matches!(
+                        name.as_str(),
+                        "MetersU32" | "NonZeroMeters" | "NonCopyU32" | "UnwindCleanupGuard"
+                    ) {
                         name
                     } else {
                         "unknown".to_string()
@@ -1128,6 +1842,10 @@ fn seeded_scalar_expr(ty_str: &str, rng: &mut DetRng) -> Expr {
         }
         "SingleC" => syn::parse_quote!(SingleC::Only(#pick)),
         "NonCopyU32" => syn::parse_quote!(NonCopyU32(#pick)),
+        "UnwindCleanupGuard" => syn::parse_quote!(UnwindCleanupGuard(#pick)),
+        "UnsafeCell<u32>" | "core::cell::UnsafeCell<u32>" => {
+            syn::parse_quote!(unsafe { transmute::<u32, UnsafeCell<u32>>(#pick) })
+        }
         "NonCopyPairU32" => {
             syn::parse_quote!(NonCopyPairU32 { a: NonCopyU32(#pick), b: #pick ^ 3u32 })
         }
@@ -1136,6 +1854,10 @@ fn seeded_scalar_expr(ty_str: &str, rng: &mut DetRng) -> Expr {
             let b = (pick & 0x7F) as u8;
             syn::parse_quote!(PaddedU8U32 { tag: #b, word: #pick })
         }
+        "FreezeAndCell" => syn::parse_quote!(FreezeAndCell {
+            frozen: #pick ^ 3u32,
+            cell: unsafe { transmute::<u32, UnsafeCell<u32>>(#pick) },
+        }),
         "OverlayU32" => syn::parse_quote!(OverlayU32 { word: #pick }),
         "[u8;4]" => {
             let b0 = (pick & 0xFF) as u8;
@@ -1289,8 +2011,21 @@ struct ArithAstPerturber<'a> {
 }
 
 impl VisitMut for ArithAstPerturber<'_> {
+    fn visit_file_mut(&mut self, file: &mut File) {
+        let local_models = model_marked_names_in_file(file);
+        for item in &mut file.items {
+            if let Item::Fn(f) = item
+                && is_helper_fn_name_in_set(&f.sig.ident.to_string(), &local_models)
+            {
+                continue;
+            }
+            self.visit_item_mut(item);
+        }
+    }
+
     fn visit_item_fn_mut(&mut self, func: &mut ItemFn) {
-        if is_corpus_helper_fn_name(&func.sig.ident.to_string()) {
+        let name = func.sig.ident.to_string();
+        if name == "helper_add_ten" || name.starts_with("__ANNEAL_MODEL_") {
             return;
         }
         syn::visit_mut::visit_item_fn_mut(self, func);
@@ -1311,6 +2046,10 @@ impl VisitMut for ArithAstPerturber<'_> {
     fn visit_item_const_mut(&mut self, _item: &mut syn::ItemConst) {}
 
     fn visit_item_static_mut(&mut self, _item: &mut syn::ItemStatic) {}
+
+    fn visit_item_impl_mut(&mut self, _item: &mut syn::ItemImpl) {}
+
+    fn visit_item_trait_mut(&mut self, _item: &mut syn::ItemTrait) {}
 
     fn visit_expr_const_mut(&mut self, _expr: &mut syn::ExprConst) {}
 
@@ -1437,15 +2176,14 @@ impl MiriAstMutator for ArithmeticCastMutator {
         mode: MutationMode,
         locals_log: &mut Vec<(String, String)>,
     ) {
-        if matches!(mode, MutationMode::Pass | MutationMode::PerturbAst) {
-            let mut visitor = ArithAstPerturber { rng };
-            visitor.visit_file_mut(file);
-        }
-
-        for item in &mut file.items {
-            let Item::Fn(func) = item else { continue };
-            if is_corpus_helper_fn_name(&func.sig.ident.to_string()) {
-                continue;
+        let local_models = model_marked_names_in_file(file);
+        let Some(target_idx) = target_entry_fn_index(file, &local_models) else {
+            return;
+        };
+        if let Some(Item::Fn(func)) = file.items.get_mut(target_idx) {
+            if matches!(mode, MutationMode::Pass | MutationMode::PerturbAst) {
+                let mut visitor = ArithAstPerturber { rng };
+                visitor.visit_item_fn_mut(func);
             }
             let locals = collect_initialized_locals(func);
             for loc in &locals {
@@ -1847,6 +2585,10 @@ impl VisitMut for ProjectionAstPerturber<'_> {
         // Never mutate `[T; N]` array lengths in types.
     }
 
+    fn visit_pat_mut(&mut self, _pat: &mut Pat) {}
+
+    fn visit_item_enum_mut(&mut self, _item: &mut syn::ItemEnum) {}
+
     fn visit_file_mut(&mut self, file: &mut File) {
         let prev_asym = self.has_asymmetric_ab_struct;
         for item in &file.items {
@@ -1856,12 +2598,31 @@ impl VisitMut for ProjectionAstPerturber<'_> {
                 self.has_asymmetric_ab_struct = true;
             }
         }
-        syn::visit_mut::visit_file_mut(self, file);
+        let local_models = model_marked_names_in_file(file);
+        for item in &mut file.items {
+            if let Item::Fn(f) = item
+                && is_helper_fn_name_in_set(&f.sig.ident.to_string(), &local_models)
+            {
+                continue;
+            }
+            self.visit_item_mut(item);
+        }
         self.has_asymmetric_ab_struct = prev_asym;
     }
 
+    fn visit_item_const_mut(&mut self, _item: &mut syn::ItemConst) {}
+
+    fn visit_item_static_mut(&mut self, _item: &mut syn::ItemStatic) {}
+
+    fn visit_item_impl_mut(&mut self, _item: &mut syn::ItemImpl) {}
+
+    fn visit_item_trait_mut(&mut self, _item: &mut syn::ItemTrait) {}
+
+    fn visit_expr_const_mut(&mut self, _expr: &mut syn::ExprConst) {}
+
     fn visit_item_fn_mut(&mut self, func: &mut ItemFn) {
-        if is_corpus_helper_fn_name(&func.sig.ident.to_string()) {
+        let name = func.sig.ident.to_string();
+        if name == "helper_add_ten" || name.starts_with("__ANNEAL_MODEL_") {
             return;
         }
         let prev_borrowed = std::mem::take(&mut self.field_borrowed_bases);
@@ -2020,15 +2781,19 @@ impl MiriAstMutator for PlaceProjectionWrapper {
         mode: MutationMode,
         locals_log: &mut Vec<(String, String)>,
     ) {
-        if matches!(mode, MutationMode::Pass | MutationMode::PerturbAst) {
-            let mut visitor = ProjectionAstPerturber::new(rng);
-            visitor.visit_file_mut(file);
-        }
-
-        for item in &mut file.items {
-            let Item::Fn(func) = item else { continue };
-            if is_corpus_helper_fn_name(&func.sig.ident.to_string()) {
-                continue;
+        let local_models = model_marked_names_in_file(file);
+        let Some(target_idx) = target_entry_fn_index(file, &local_models) else {
+            return;
+        };
+        let has_asym = file.items.iter().any(|item| match item {
+            Item::Struct(st) => struct_item_has_asymmetric_ab(st),
+            _ => false,
+        });
+        if let Some(Item::Fn(func)) = file.items.get_mut(target_idx) {
+            if matches!(mode, MutationMode::Pass | MutationMode::PerturbAst) {
+                let mut visitor = ProjectionAstPerturber::new(rng);
+                visitor.has_asymmetric_ab_struct = has_asym;
+                visitor.visit_item_fn_mut(func);
             }
             let locals = collect_initialized_locals(func);
             for loc in &locals {
@@ -2215,8 +2980,37 @@ fn offset_arg_lit_suffix(expr: &Expr) -> Option<&str> {
 }
 
 impl VisitMut for OffsetArgPerturber<'_> {
+    fn visit_file_mut(&mut self, file: &mut File) {
+        let local_models = model_marked_names_in_file(file);
+        for item in &mut file.items {
+            if let Item::Fn(f) = item
+                && is_helper_fn_name_in_set(&f.sig.ident.to_string(), &local_models)
+            {
+                continue;
+            }
+            self.visit_item_mut(item);
+        }
+    }
+
+    fn visit_type_mut(&mut self, _ty: &mut Type) {}
+
+    fn visit_pat_mut(&mut self, _pat: &mut Pat) {}
+
+    fn visit_item_enum_mut(&mut self, _item: &mut syn::ItemEnum) {}
+
+    fn visit_item_const_mut(&mut self, _item: &mut syn::ItemConst) {}
+
+    fn visit_item_static_mut(&mut self, _item: &mut syn::ItemStatic) {}
+
+    fn visit_item_impl_mut(&mut self, _item: &mut syn::ItemImpl) {}
+
+    fn visit_item_trait_mut(&mut self, _item: &mut syn::ItemTrait) {}
+
+    fn visit_expr_const_mut(&mut self, _expr: &mut syn::ExprConst) {}
+
     fn visit_item_fn_mut(&mut self, func: &mut ItemFn) {
-        if is_corpus_helper_fn_name(&func.sig.ident.to_string()) {
+        let name = func.sig.ident.to_string();
+        if name == "helper_add_ten" || name.starts_with("__ANNEAL_MODEL_") {
             return;
         }
         syn::visit_mut::visit_item_fn_mut(self, func);
@@ -2270,21 +3064,20 @@ impl MiriAstMutator for RawPtrOffsetMutator {
         mode: MutationMode,
         locals_log: &mut Vec<(String, String)>,
     ) {
-        if matches!(
-            mode,
-            MutationMode::Pass | MutationMode::PerturbAst | MutationMode::Ub
-        ) {
-            let mut v = OffsetArgPerturber {
-                rng,
-                allow_oob: matches!(mode, MutationMode::PerturbAst | MutationMode::Ub),
-            };
-            v.visit_file_mut(file);
-        }
-
-        for item in &mut file.items {
-            let Item::Fn(func) = item else { continue };
-            if is_corpus_helper_fn_name(&func.sig.ident.to_string()) {
-                continue;
+        let local_models = model_marked_names_in_file(file);
+        let Some(target_idx) = target_entry_fn_index(file, &local_models) else {
+            return;
+        };
+        if let Some(Item::Fn(func)) = file.items.get_mut(target_idx) {
+            if matches!(
+                mode,
+                MutationMode::Pass | MutationMode::PerturbAst | MutationMode::Ub
+            ) {
+                let mut v = OffsetArgPerturber {
+                    rng,
+                    allow_oob: matches!(mode, MutationMode::PerturbAst | MutationMode::Ub),
+                };
+                v.visit_item_fn_mut(func);
             }
             let locals = collect_initialized_locals(func);
             for loc in &locals {
@@ -3130,6 +3923,22 @@ struct ScopedBlockReorderer<'a, 'b> {
 }
 
 impl VisitMut for ScopedBlockReorderer<'_, '_> {
+    fn visit_type_mut(&mut self, _ty: &mut Type) {}
+
+    fn visit_pat_mut(&mut self, _pat: &mut Pat) {}
+
+    fn visit_item_enum_mut(&mut self, _item: &mut syn::ItemEnum) {}
+
+    fn visit_item_const_mut(&mut self, _item: &mut syn::ItemConst) {}
+
+    fn visit_item_static_mut(&mut self, _item: &mut syn::ItemStatic) {}
+
+    fn visit_item_impl_mut(&mut self, _item: &mut syn::ItemImpl) {}
+
+    fn visit_item_trait_mut(&mut self, _item: &mut syn::ItemTrait) {}
+
+    fn visit_expr_const_mut(&mut self, _expr: &mut syn::ExprConst) {}
+
     fn visit_item_fn_mut(&mut self, func: &mut ItemFn) {
         AliasingAccessReorderer { rng: self.rng }.visit_item_fn_mut(func);
     }
@@ -3152,8 +3961,37 @@ impl VisitMut for ScopedBlockReorderer<'_, '_> {
 }
 
 impl VisitMut for AliasingAccessReorderer<'_> {
+    fn visit_file_mut(&mut self, file: &mut File) {
+        let local_models = model_marked_names_in_file(file);
+        for item in &mut file.items {
+            if let Item::Fn(f) = item
+                && is_helper_fn_name_in_set(&f.sig.ident.to_string(), &local_models)
+            {
+                continue;
+            }
+            self.visit_item_mut(item);
+        }
+    }
+
+    fn visit_type_mut(&mut self, _ty: &mut Type) {}
+
+    fn visit_pat_mut(&mut self, _pat: &mut Pat) {}
+
+    fn visit_item_enum_mut(&mut self, _item: &mut syn::ItemEnum) {}
+
+    fn visit_item_const_mut(&mut self, _item: &mut syn::ItemConst) {}
+
+    fn visit_item_static_mut(&mut self, _item: &mut syn::ItemStatic) {}
+
+    fn visit_item_impl_mut(&mut self, _item: &mut syn::ItemImpl) {}
+
+    fn visit_item_trait_mut(&mut self, _item: &mut syn::ItemTrait) {}
+
+    fn visit_expr_const_mut(&mut self, _expr: &mut syn::ExprConst) {}
+
     fn visit_item_fn_mut(&mut self, func: &mut ItemFn) {
-        if is_corpus_helper_fn_name(&func.sig.ident.to_string()) {
+        let name = func.sig.ident.to_string();
+        if name == "helper_add_ten" || name.starts_with("__ANNEAL_MODEL_") {
             return;
         }
         let borrow_ctx = SafeBorrowContext::from_item_fn(func);
@@ -3186,18 +4024,17 @@ impl MiriAstMutator for TreeBorrowsRetagInterleaver {
         mode: MutationMode,
         locals_log: &mut Vec<(String, String)>,
     ) {
-        if matches!(
-            mode,
-            MutationMode::Pass | MutationMode::PerturbAst | MutationMode::Ub
-        ) {
-            let mut reorderer = AliasingAccessReorderer { rng };
-            reorderer.visit_file_mut(file);
-        }
-
-        for item in &mut file.items {
-            let Item::Fn(func) = item else { continue };
-            if is_corpus_helper_fn_name(&func.sig.ident.to_string()) {
-                continue;
+        let local_models = model_marked_names_in_file(file);
+        let Some(target_idx) = target_entry_fn_index(file, &local_models) else {
+            return;
+        };
+        if let Some(Item::Fn(func)) = file.items.get_mut(target_idx) {
+            if matches!(
+                mode,
+                MutationMode::Pass | MutationMode::PerturbAst | MutationMode::Ub
+            ) {
+                let mut reorderer = AliasingAccessReorderer { rng };
+                reorderer.visit_item_fn_mut(func);
             }
             let locals = collect_initialized_locals(func);
             for loc in &locals {
@@ -3985,8 +4822,37 @@ impl TransmuteValidityPerturber<'_> {
 }
 
 impl VisitMut for TransmuteValidityPerturber<'_> {
+    fn visit_file_mut(&mut self, file: &mut File) {
+        let local_models = model_marked_names_in_file(file);
+        for item in &mut file.items {
+            if let Item::Fn(f) = item
+                && is_helper_fn_name_in_set(&f.sig.ident.to_string(), &local_models)
+            {
+                continue;
+            }
+            self.visit_item_mut(item);
+        }
+    }
+
+    fn visit_type_mut(&mut self, _ty: &mut Type) {}
+
+    fn visit_pat_mut(&mut self, _pat: &mut Pat) {}
+
+    fn visit_item_enum_mut(&mut self, _item: &mut syn::ItemEnum) {}
+
+    fn visit_item_const_mut(&mut self, _item: &mut syn::ItemConst) {}
+
+    fn visit_item_static_mut(&mut self, _item: &mut syn::ItemStatic) {}
+
+    fn visit_item_impl_mut(&mut self, _item: &mut syn::ItemImpl) {}
+
+    fn visit_item_trait_mut(&mut self, _item: &mut syn::ItemTrait) {}
+
+    fn visit_expr_const_mut(&mut self, _expr: &mut syn::ExprConst) {}
+
     fn visit_item_fn_mut(&mut self, func: &mut ItemFn) {
-        if is_corpus_helper_fn_name(&func.sig.ident.to_string()) {
+        let name = func.sig.ident.to_string();
+        if name == "helper_add_ten" || name.starts_with("__ANNEAL_MODEL_") {
             return;
         }
         let prev_ret = self.fn_ret_target;
@@ -4105,22 +4971,21 @@ impl MiriAstMutator for BitValidityTransmuteMutator {
         mode: MutationMode,
         locals_log: &mut Vec<(String, String)>,
     ) {
-        if matches!(
-            mode,
-            MutationMode::Pass | MutationMode::PerturbAst | MutationMode::Ub
-        ) {
-            let mut visitor = TransmuteValidityPerturber {
-                rng,
-                inject_invalid: mode == MutationMode::Ub,
-                fn_ret_target: None,
-            };
-            visitor.visit_file_mut(file);
-        }
-
-        for item in &mut file.items {
-            let Item::Fn(func) = item else { continue };
-            if is_corpus_helper_fn_name(&func.sig.ident.to_string()) {
-                continue;
+        let local_models = model_marked_names_in_file(file);
+        let Some(target_idx) = target_entry_fn_index(file, &local_models) else {
+            return;
+        };
+        if let Some(Item::Fn(func)) = file.items.get_mut(target_idx) {
+            if matches!(
+                mode,
+                MutationMode::Pass | MutationMode::PerturbAst | MutationMode::Ub
+            ) {
+                let mut visitor = TransmuteValidityPerturber {
+                    rng,
+                    inject_invalid: mode == MutationMode::Ub,
+                    fn_ret_target: None,
+                };
+                visitor.visit_item_fn_mut(func);
             }
             let locals = collect_initialized_locals(func);
             for loc in &locals {
@@ -4475,12 +5340,12 @@ pub fn collect_non_fault_seed_indices(seeds: &[&str]) -> Vec<usize> {
         .enumerate()
         .filter_map(|(idx, src)| {
             let parsed = syn::parse_str::<File>(src).ok()?;
-            let fn_name = parsed.items.iter().rev().find_map(|it| match it {
-                Item::Fn(f) if !is_corpus_helper_fn_name(&f.sig.ident.to_string()) => {
-                    Some(f.sig.ident.to_string())
-                }
-                _ => None,
-            })?;
+            let local_models = model_marked_names_in_file(&parsed);
+            let target_idx = target_entry_fn_index(&parsed, &local_models)?;
+            let fn_name = match parsed.items.get(target_idx)? {
+                Item::Fn(f) => f.sig.ident.to_string(),
+                _ => return None,
+            };
             if !fn_name.starts_with("panic_") && !fn_name.starts_with("ub_") {
                 Some(idx)
             } else {
@@ -4601,42 +5466,391 @@ impl MiriSeedDraw {
     }
 }
 
-/// Close a parsed seed in place: keep only its function items other than
-/// `helper_add_ten`, rewrite method calls in every helper function that precedes
-/// the last one (so multi-function seeds do not hit `ExternalCall` skips in
-/// helpers), and rename the last function to `fn_name_for(seed_name)` before
-/// closing it (`close_and_normalize_function` draws any parameter initializers
-/// from `cand_rng`). Returns `(seed_name, fn_name)`, or `None` when the seed has
-/// no function item.
+pub(crate) fn collect_use_tree_bound_idents(
+    parent_ident: Option<&syn::Ident>,
+    tree: &syn::UseTree,
+    bound_idents: &mut Vec<String>,
+    glob_prefixes: &mut Vec<String>,
+) {
+    match tree {
+        syn::UseTree::Name(n) => {
+            if n.ident == "self" {
+                if let Some(p) = parent_ident {
+                    bound_idents.push(p.to_string());
+                }
+            } else {
+                bound_idents.push(n.ident.to_string());
+            }
+        }
+        syn::UseTree::Rename(r) => {
+            if r.rename != "_" {
+                bound_idents.push(r.rename.to_string());
+            }
+        }
+        syn::UseTree::Path(p) => {
+            collect_use_tree_bound_idents(Some(&p.ident), &p.tree, bound_idents, glob_prefixes);
+        }
+        syn::UseTree::Group(g) => {
+            for sub in &g.items {
+                collect_use_tree_bound_idents(parent_ident, sub, bound_idents, glob_prefixes);
+            }
+        }
+        syn::UseTree::Glob(_) => {
+            let pfx = parent_ident
+                .map(std::string::ToString::to_string)
+                .unwrap_or_default();
+            glob_prefixes.push(pfx);
+        }
+    }
+}
+
+pub(crate) fn normalize_use_target_path(raw: &str) -> String {
+    let stripped = raw.trim_start_matches("::");
+    let core_norm = if let Some(rest) = stripped.strip_prefix("std::") {
+        format!("core::{rest}")
+    } else {
+        stripped.to_string()
+    };
+    if core_norm == "core::mem::transmute" {
+        "core::intrinsics::transmute".to_string()
+    } else {
+        core_norm
+    }
+}
+
+pub(crate) fn collect_use_tree_leaf_targets(
+    prefix: &str,
+    parent_ident: Option<&syn::Ident>,
+    tree: &syn::UseTree,
+    out: &mut Vec<(String, String)>,
+) {
+    match tree {
+        syn::UseTree::Name(n) => {
+            if n.ident == "self" {
+                if let Some(p) = parent_ident {
+                    out.push((p.to_string(), normalize_use_target_path(prefix)));
+                }
+            } else {
+                let bound = n.ident.to_string();
+                let target = if prefix.is_empty() {
+                    bound.clone()
+                } else {
+                    format!("{prefix}::{bound}")
+                };
+                out.push((bound, normalize_use_target_path(&target)));
+            }
+        }
+        syn::UseTree::Rename(r) => {
+            if r.rename != "_" {
+                let orig = if r.ident == "self" {
+                    match parent_ident {
+                        Some(p) => p.to_string(),
+                        None => return,
+                    }
+                } else {
+                    r.ident.to_string()
+                };
+                let target = if r.ident == "self" || prefix.is_empty() {
+                    if r.ident == "self" {
+                        prefix.to_string()
+                    } else {
+                        orig
+                    }
+                } else {
+                    format!("{prefix}::{orig}")
+                };
+                out.push((r.rename.to_string(), normalize_use_target_path(&target)));
+            }
+        }
+        syn::UseTree::Path(p) => {
+            let next_prefix = if prefix.is_empty() {
+                p.ident.to_string()
+            } else {
+                format!("{prefix}::{}", p.ident)
+            };
+            collect_use_tree_leaf_targets(&next_prefix, Some(&p.ident), &p.tree, out);
+        }
+        syn::UseTree::Group(g) => {
+            for sub in &g.items {
+                collect_use_tree_leaf_targets(prefix, parent_ident, sub, out);
+            }
+        }
+        syn::UseTree::Glob(_) => {}
+    }
+}
+
+pub(crate) fn preamble_use_target_map() -> &'static std::collections::BTreeMap<String, String> {
+    static MAP: std::sync::OnceLock<std::collections::BTreeMap<String, String>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut out = std::collections::BTreeMap::new();
+        if let Ok(file) = syn::parse_file(MIRI_CORPUS_MODULE_PREAMBLE) {
+            for item in &file.items {
+                if let Item::Use(u) = item {
+                    let mut leaves = Vec::new();
+                    collect_use_tree_leaf_targets("", None, &u.tree, &mut leaves);
+                    for (bound, target) in leaves {
+                        out.insert(bound, target);
+                    }
+                }
+            }
+        }
+        out
+    })
+}
+
+pub(crate) fn use_subtree_is_redundant_with_preamble(
+    prefix: &str,
+    parent_ident: Option<&syn::Ident>,
+    tree: &syn::UseTree,
+) -> bool {
+    let mut leaves = Vec::new();
+    collect_use_tree_leaf_targets(prefix, parent_ident, tree, &mut leaves);
+    let mut bound = Vec::new();
+    let mut globs = Vec::new();
+    collect_use_tree_bound_idents(parent_ident, tree, &mut bound, &mut globs);
+    if !globs.is_empty() || leaves.is_empty() {
+        return false;
+    }
+    let preamble_uses = preamble_use_target_map();
+    leaves
+        .iter()
+        .all(|(b, target)| preamble_uses.get(b) == Some(target))
+}
+
+fn prune_preamble_use_tree(
+    prefix: &str,
+    parent_ident: Option<&syn::Ident>,
+    tree: &syn::UseTree,
+) -> Option<syn::UseTree> {
+    if use_subtree_is_redundant_with_preamble(prefix, parent_ident, tree) {
+        return None;
+    }
+    match tree {
+        syn::UseTree::Name(n) => Some(syn::UseTree::Name(n.clone())),
+        syn::UseTree::Rename(r) => Some(syn::UseTree::Rename(r.clone())),
+        syn::UseTree::Path(p) => {
+            let next_prefix = if prefix.is_empty() {
+                p.ident.to_string()
+            } else {
+                format!("{prefix}::{}", p.ident)
+            };
+            prune_preamble_use_tree(&next_prefix, Some(&p.ident), &p.tree).map(|sub| {
+                syn::UseTree::Path(syn::UsePath {
+                    ident: p.ident.clone(),
+                    colon2_token: p.colon2_token,
+                    tree: Box::new(sub),
+                })
+            })
+        }
+        syn::UseTree::Group(g) => {
+            let kept: Vec<syn::UseTree> = g
+                .items
+                .iter()
+                .filter_map(|sub| prune_preamble_use_tree(prefix, parent_ident, sub))
+                .collect();
+            match kept.len() {
+                0 => None,
+                1 => kept.into_iter().next(),
+                _ => {
+                    let mut punct = syn::punctuated::Punctuated::new();
+                    for sub in kept {
+                        punct.push(sub);
+                    }
+                    Some(syn::UseTree::Group(syn::UseGroup {
+                        brace_token: g.brace_token,
+                        items: punct,
+                    }))
+                }
+            }
+        }
+        syn::UseTree::Glob(_) => Some(tree.clone()),
+    }
+}
+
+/// Rust namespace/coherence keys occupied by a top-level auxiliary item so
+/// `close_miri_seed` and multi-candidate crate staging detect both exact
+/// duplicates and cross-kind collisions (such as `struct Foo` vs `enum Foo` in
+/// the type namespace, tuple/unit `struct S(u32)` vs `fn S()` / `const S` in
+/// the value namespace, or `use` imports colliding with preamble/sibling items).
+pub(crate) fn aux_item_namespace_keys(item: &Item) -> Vec<String> {
+    match item {
+        Item::Fn(f) => vec![format!("val:{}", f.sig.ident)],
+        Item::Const(c) => {
+            if c.ident == "_" {
+                Vec::new()
+            } else {
+                vec![format!("val:{}", c.ident)]
+            }
+        }
+        Item::Static(s) => vec![format!("val:{}", s.ident)],
+        Item::Struct(s) => {
+            if matches!(s.fields, syn::Fields::Unnamed(_) | syn::Fields::Unit) {
+                vec![format!("ty:{}", s.ident), format!("val:{}", s.ident)]
+            } else {
+                vec![format!("ty:{}", s.ident)]
+            }
+        }
+        Item::Enum(e) => vec![format!("ty:{}", e.ident)],
+        Item::Union(u) => vec![format!("ty:{}", u.ident)],
+        Item::Type(t) => vec![format!("ty:{}", t.ident)],
+        Item::Trait(tr) => vec![format!("ty:{}", tr.ident)],
+        Item::Mod(m) => vec![format!("ty:{}", m.ident)],
+        Item::Macro(mac) => mac
+            .ident
+            .as_ref()
+            .map(|id| vec![format!("mac:{id}")])
+            .unwrap_or_default(),
+        Item::Use(u) => {
+            let mut bound = Vec::new();
+            let mut globs = Vec::new();
+            collect_use_tree_bound_idents(None, &u.tree, &mut bound, &mut globs);
+            let mut keys = Vec::with_capacity(bound.len() * 3 + globs.len());
+            for id in bound {
+                keys.push(format!("ty:{id}"));
+                keys.push(format!("val:{id}"));
+                keys.push(format!("mac:{id}"));
+            }
+            for g in globs {
+                keys.push(format!("use_glob:{g}"));
+            }
+            keys
+        }
+        Item::Impl(im) => {
+            let self_ty = im.self_ty.to_token_stream().to_string();
+            if let Some((bang, trait_path, _)) = &im.trait_ {
+                let neg = if bang.is_some() { "!" } else { "" };
+                vec![format!(
+                    "impl_trait:{neg}{}:{self_ty}",
+                    trait_path.to_token_stream()
+                )]
+            } else {
+                let assoc: Vec<String> = im
+                    .items
+                    .iter()
+                    .filter_map(|it| match it {
+                        syn::ImplItem::Fn(m) => Some(format!("impl_assoc:{self_ty}:{}", m.sig.ident)),
+                        syn::ImplItem::Const(c) => Some(format!("impl_assoc:{self_ty}:{}", c.ident)),
+                        syn::ImplItem::Type(t) => Some(format!("impl_assoc:{self_ty}:{}", t.ident)),
+                        _ => None,
+                    })
+                    .collect();
+                if assoc.is_empty() {
+                    vec![format!("impl_inherent:{self_ty}")]
+                } else {
+                    assoc
+                }
+            }
+        }
+        Item::ForeignMod(fm) => fm
+            .items
+            .iter()
+            .filter_map(|fi| match fi {
+                syn::ForeignItem::Fn(f) => Some(format!("val:{}", f.sig.ident)),
+                syn::ForeignItem::Static(s) => Some(format!("val:{}", s.ident)),
+                syn::ForeignItem::Type(t) => Some(format!("ty:{}", t.ident)),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn preamble_defined_item_keys() -> &'static std::collections::BTreeSet<String> {
+    static KEYS: std::sync::OnceLock<std::collections::BTreeSet<String>> =
+        std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        syn::parse_file(MIRI_CORPUS_MODULE_PREAMBLE)
+            .map(|file| {
+                file.items
+                    .iter()
+                    .flat_map(aux_item_namespace_keys)
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// Close a parsed seed in place: locate its target entry function via
+/// [`target_entry_fn_index`], keep any non-preamble auxiliary items (`struct`,
+/// `enum`, `union`, `type`, `trait`, `macro_rules!`, `static`, `const`, `impl`,
+/// and helper `fn`s — normalizing method calls in non-model helper `fn`s) ahead
+/// of the target function, and rename + close the target function. Returns
+/// `(seed_name, fn_name)`, or `None` when no target function exists.
 fn close_miri_seed(
     parsed: &mut File,
     cand_rng: &mut DetRng,
     fn_name_for: impl FnOnce(&str) -> String,
 ) -> Option<(String, String)> {
+    let local_models = model_marked_names_in_file(parsed);
+    let preamble_keys = preamble_defined_item_keys();
+    let target_idx = target_entry_fn_index(parsed, &local_models)?;
     parsed.attrs.clear();
-    parsed.items.retain(|item| {
-        if let Item::Fn(f) = item {
-            !is_corpus_helper_fn_name(&f.sig.ident.to_string())
-        } else {
-            false
+    let old_items = std::mem::take(&mut parsed.items);
+    let mut target_fn: Option<ItemFn> = None;
+    let mut kept_items: Vec<Item> = Vec::new();
+    for (idx, item) in old_items.into_iter().enumerate() {
+        if idx == target_idx {
+            if let Item::Fn(f) = item {
+                target_fn = Some(f);
+            }
+            continue;
         }
-    });
-    let fn_count = parsed.items.len();
-    if fn_count > 1 {
-        let mut normalizer = MethodCallNormalizer;
-        for item in &mut parsed.items[..fn_count - 1] {
-            if let Item::Fn(helper_fn) = item {
-                normalizer.visit_item_fn_mut(helper_fn);
+        match item {
+            Item::Fn(mut helper_fn) => {
+                let name = helper_fn.sig.ident.to_string();
+                if name == "helper_add_ten" || preamble_keys.contains(&format!("val:{name}")) {
+                    continue;
+                }
+                if !is_helper_fn_name_in_set(&name, &local_models) {
+                    MethodCallNormalizer.visit_item_fn_mut(&mut helper_fn);
+                }
+                kept_items.push(Item::Fn(helper_fn));
+            }
+            Item::Const(c) if c.ident == "_" => {
+                kept_items.push(Item::Const(c));
+            }
+            Item::Use(mut u) => {
+                if let Some(pruned) = prune_preamble_use_tree("", None, &u.tree) {
+                    u.tree = pruned;
+                    kept_items.push(Item::Use(u));
+                }
+            }
+            Item::Impl(mut im) => {
+                let keys = aux_item_namespace_keys(&Item::Impl(im.clone()));
+                if !keys.is_empty() && keys.iter().all(|k| !preamble_keys.contains(k)) {
+                    for sub in &mut im.items {
+                        if let syn::ImplItem::Fn(m) = sub
+                            && !is_helper_fn_name_in_set(&m.sig.ident.to_string(), &local_models)
+                        {
+                            MethodCallNormalizer.visit_impl_item_fn_mut(m);
+                        }
+                    }
+                    kept_items.push(Item::Impl(im));
+                }
+            }
+            Item::Trait(mut tr) => {
+                let keys = aux_item_namespace_keys(&Item::Trait(tr.clone()));
+                if !keys.is_empty() && keys.iter().all(|k| !preamble_keys.contains(k)) {
+                    MethodCallNormalizer.visit_item_trait_mut(&mut tr);
+                    kept_items.push(Item::Trait(tr));
+                }
+            }
+            other => {
+                let keys = aux_item_namespace_keys(&other);
+                if !keys.is_empty() && keys.iter().all(|k| !preamble_keys.contains(k)) {
+                    kept_items.push(other);
+                }
             }
         }
     }
-    let Some(Item::Fn(func)) = parsed.items.last_mut() else {
-        return None;
-    };
+    let mut func = target_fn?;
     let seed_name = func.sig.ident.to_string();
     let fn_name = fn_name_for(&seed_name);
     func.sig.ident = format_ident!("{}", fn_name);
-    close_and_normalize_function(func, cand_rng);
+    close_and_normalize_function(&mut func, cand_rng);
+    kept_items.push(Item::Fn(func));
+    parsed.items = kept_items;
     Some((seed_name, fn_name))
 }
 
@@ -4689,11 +5903,12 @@ fn finish_miri_candidate(
     parsed: &File,
     mut raw_locals: Vec<(String, String)>,
 ) -> (Vec<(String, String)>, String, String) {
-    for item in &parsed.items {
-        if let Item::Fn(func) = item {
-            for loc in collect_initialized_locals(func) {
-                raw_locals.push((loc.name, loc.ty));
-            }
+    let local_models = model_marked_names_in_file(parsed);
+    if let Some(target_idx) = target_entry_fn_index(parsed, &local_models)
+        && let Some(Item::Fn(func)) = parsed.items.get(target_idx)
+    {
+        for loc in collect_initialized_locals(func) {
+            raw_locals.push((loc.name, loc.ty));
         }
     }
     let mut tracked_locals = Vec::new();
@@ -4923,12 +6138,12 @@ mod tests {
     }
 
     #[test]
-    fn corpus_seeds_load_all_110_zero_arg_functions_and_do_not_blocklist_known_bugs() {
+    fn corpus_seeds_load_all_112_zero_arg_functions_and_do_not_blocklist_known_bugs() {
         let seeds = load_miri_diff_corpus_seeds();
         assert_eq!(
             seeds.len(),
-            110,
-            "expected 110 zero-arg functions from tests/miri-diff/corpus/src/lib.rs"
+            112,
+            "expected 112 zero-arg functions from tests/miri-diff/corpus/src/lib.rs"
         );
         assert!(seeds.iter().any(|s| s.name == "pass_integer_arith_basic"));
         assert!(
@@ -4972,8 +6187,25 @@ mod tests {
             "ub_frozen_reborrow_write_in_callee_frame",
             "pass_copy_nonoverlapping_multi_elem_array_pair",
             "ub_raw_ptr_read_uninit_struct_padding_kani5183",
+            "pass_shared_temp_const_raw_ptr_read_and_freeze_retag",
+            "ub_shared_temp_unsafe_cell_raw_const_cast_mut_write",
         ] {
             assert!(seeds.iter().any(|s| s.name == name), "missing seed {name}");
+        }
+        // The Category 11 probes and statics are model items, never seeds.
+        for model in [
+            "pass_copy_nonoverlapping_same_tag_disjoint_array_halves",
+            "pass_copy_nonoverlapping_same_tag_disjoint_u8_array_halves",
+            "pass_copy_nonoverlapping_same_tag_disjoint_struct_fields",
+            "pass_static_const_raw_ptr_read_and_freeze_retag",
+            "ub_static_unsafe_cell_raw_const_cast_mut_write",
+            "STATIC_FROZEN_PAIR",
+            "STATIC_FREEZE_AND_CELL",
+        ] {
+            assert!(
+                corpus_model_helper_names().contains(model),
+                "{model} must be model-marked"
+            );
         }
         // Every model-marked call-chain helper is excluded from the seeds.
         for helper in corpus_model_helper_names() {
@@ -7139,24 +8371,80 @@ pub fn unsuffixed_off() -> u32 {
 
     #[test]
     fn mutators_never_modify_corpus_preamble_helpers_when_applied_to_standalone_file() {
-        let seed_fn = "pub fn cand_root() -> u32 {\n    let x: u32 = 10u32;\n    x + 1u32\n}\n";
-        let standalone = build_standalone_candidate_source(seed_fn);
+        let extra_statics_and_consts = "\
+pub static SYNTH_NZ_STATIC: NonZeroU32 = unsafe { transmute::<u32, NonZeroU32>(7u32) };
+pub static SYNTH_BLOCK_STATIC: u32 = unsafe {
+    let arr: [u32; 2] = [11u32, 22u32];
+    let p: *const u32 = &raw const arr[0];
+    *offset(p, 1isize)
+};
+pub const SYNTH_NZ_CONST: NonZeroU32 = unsafe { transmute::<u32, NonZeroU32>(9u32) };
+pub struct SynthImplHolder(pub u32);
+impl SynthImplHolder {
+    pub const ASSOC_NZ: NonZeroU32 = unsafe { transmute::<u32, NonZeroU32>(5u32) };
+    pub fn keep_intact(x: u32) -> u32 {
+        x + 1u32
+    }
+}
+pub const __ANNEAL_MODEL_local_model_callee: &str = \"local_model_callee\";
+pub fn local_model_callee() -> u32 {
+    let arr: [u32; 2] = [3u32, 7u32];
+    let p: *const u32 = &raw const arr[0];
+    unsafe { *offset(p, 1isize) + 1u32 }
+}
+pub fn cand_root() -> u32 {
+    let x: u32 = 10u32;
+    x + 1u32
+}
+";
+        let standalone = build_standalone_candidate_source(extra_statics_and_consts);
         let baseline_parsed = syn::parse_file(&standalone).unwrap();
-        let baseline_helpers: std::collections::BTreeMap<String, String> = baseline_parsed
-            .items
-            .iter()
-            .filter_map(|it| match it {
-                Item::Fn(f) if is_corpus_helper_fn_name(&f.sig.ident.to_string()) => Some((
-                    f.sig.ident.to_string(),
-                    f.to_token_stream().to_string(),
-                )),
-                _ => None,
-            })
-            .collect();
+        let baseline_models = model_marked_names_in_file(&baseline_parsed);
+        let mut baseline_protected: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for it in &baseline_parsed.items {
+            match it {
+                Item::Fn(f)
+                    if is_helper_fn_name_in_set(&f.sig.ident.to_string(), &baseline_models) =>
+                {
+                    baseline_protected
+                        .insert(format!("fn:{}", f.sig.ident), f.to_token_stream().to_string());
+                }
+                Item::Static(st) => {
+                    baseline_protected.insert(
+                        format!("static:{}", st.ident),
+                        st.to_token_stream().to_string(),
+                    );
+                }
+                Item::Const(ct) => {
+                    baseline_protected.insert(
+                        format!("const:{}", ct.ident),
+                        ct.to_token_stream().to_string(),
+                    );
+                }
+                Item::Struct(sr) => {
+                    baseline_protected.insert(
+                        format!("struct:{}", sr.ident),
+                        sr.to_token_stream().to_string(),
+                    );
+                }
+                Item::Impl(im) => {
+                    baseline_protected.insert(
+                        format!("impl:{}", im.self_ty.to_token_stream()),
+                        im.to_token_stream().to_string(),
+                    );
+                }
+                _ => {}
+            }
+        }
         assert!(
-            baseline_helpers.len() >= 10,
-            "expected all preamble helpers in baseline: {:?}",
-            baseline_helpers.keys().collect::<Vec<_>>()
+            baseline_protected.contains_key("fn:local_model_callee"),
+            "file-local model helper must be tracked as protected"
+        );
+        assert!(
+            baseline_protected.len() >= 27,
+            "expected preamble helpers, statics, consts, structs, and impls in baseline: {:?}",
+            baseline_protected.keys().collect::<Vec<_>>()
         );
 
         for mutator in MIRI_AST_MUTATORS {
@@ -7166,18 +8454,40 @@ pub fn unsuffixed_off() -> u32 {
                 MutationMode::Panic,
                 MutationMode::Ub,
             ] {
-                let mut file = syn::parse_file(&standalone).unwrap();
-                let mut rng = DetRng::new(0x55AA_1234);
-                let mut locals_log = Vec::new();
-                mutator.mutate_with_mode(&mut file, &mut rng, mode, &mut locals_log);
-                for item in &file.items {
-                    if let Item::Fn(f) = item {
-                        let name = f.sig.ident.to_string();
-                        if let Some(expected_tokens) = baseline_helpers.get(&name) {
+                for seed_idx in 0..8u64 {
+                    let mut file = syn::parse_file(&standalone).unwrap();
+                    let mut rng = DetRng::new(0x55AA_1234 ^ (seed_idx * 0x9E37));
+                    let mut locals_log = Vec::new();
+                    mutator.mutate_with_mode(&mut file, &mut rng, mode, &mut locals_log);
+                    for item in &file.items {
+                        let (key, actual) = match item {
+                            Item::Fn(f) => (
+                                format!("fn:{}", f.sig.ident),
+                                f.to_token_stream().to_string(),
+                            ),
+                            Item::Static(st) => (
+                                format!("static:{}", st.ident),
+                                st.to_token_stream().to_string(),
+                            ),
+                            Item::Const(ct) => (
+                                format!("const:{}", ct.ident),
+                                ct.to_token_stream().to_string(),
+                            ),
+                            Item::Struct(sr) => (
+                                format!("struct:{}", sr.ident),
+                                sr.to_token_stream().to_string(),
+                            ),
+                            Item::Impl(im) => (
+                                format!("impl:{}", im.self_ty.to_token_stream()),
+                                im.to_token_stream().to_string(),
+                            ),
+                            _ => continue,
+                        };
+                        if let Some(expected_tokens) = baseline_protected.get(&key) {
                             assert_eq!(
-                                &f.to_token_stream().to_string(),
+                                &actual,
                                 expected_tokens,
-                                "`{}` under {:?} mutated corpus helper `{name}`",
+                                "`{}` under {:?} (seed_idx={seed_idx}) mutated protected item `{key}`",
                                 mutator.name(),
                                 mode
                             );
@@ -7185,6 +8495,455 @@ pub fn unsuffixed_off() -> u32 {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn category11_seeds_model_markers_and_freeze_and_cell_synthesis_hold() {
+        // 1. `extract_closed_corpus_seeds` must honor source-local `__ANNEAL_MODEL_*`
+        //    markers (both `&str = "<target>"` and `() = ()`), skip non-`pub` functions,
+        //    and NOT falsely blocklist Category 11 probe names when unmarked in a
+        //    standalone source string.
+        let synthetic_corpus = "\
+pub const __ANNEAL_MODEL_custom_unit_probe: () = ();
+pub fn custom_unit_probe() -> u32 { 1u32 }
+
+pub const __ANNEAL_MODEL_marker_alias: &str = \"custom_aliased_probe\";
+pub fn custom_aliased_probe() -> u32 { 2u32 }
+
+fn private_zero_arg_helper() -> u32 { 3u32 }
+
+pub fn pass_copy_nonoverlapping_same_tag_disjoint_array_halves() -> u32 { 4u32 }
+pub fn pass_real_seed() -> u32 { 5u32 }
+";
+        let extracted = extract_closed_corpus_seeds(synthetic_corpus);
+        let extracted_names: Vec<&str> = extracted.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            extracted_names,
+            vec![
+                "pass_copy_nonoverlapping_same_tag_disjoint_array_halves",
+                "pass_real_seed",
+            ],
+            "source-local model markers and `pub` visibility must govern seed extraction"
+        );
+        // Generating a batch from that unmarked standalone seed reusing a
+        // Category 11 probe name must keep, rename, and mutate the seed (never
+        // dropping it via the global corpus `OnceLock`).
+        let unmarked_sources: Vec<&str> = extracted.iter().map(|s| s.fn_source.as_str()).collect();
+        let unmarked_batch = generate_miri_batch(&unmarked_sources, 6, 0xC16_A101);
+        assert_eq!(unmarked_batch.len(), 6);
+        assert!(
+            unmarked_batch
+                .iter()
+                .any(|c| c.seed_name == "pass_copy_nonoverlapping_same_tag_disjoint_array_halves"),
+            "expected candidates derived from unmarked Category 11 probe seed"
+        );
+        for cand in &unmarked_batch {
+            assert!(
+                !cand.fn_source.trim().is_empty() && cand.fn_source.contains(&cand.fn_name),
+                "candidate `{}` must contain a non-empty renamed function:\n{}",
+                cand.fn_name,
+                cand.fn_source
+            );
+            assert!(
+                crate::miri_eval::compile_rust_snippet("unmarked_c11_batch", &cand.source),
+                "unmarked Category 11 seed candidate `{}` failed rustc typecheck:\n{}",
+                cand.fn_name,
+                cand.source
+            );
+            let (base, steps) = reconstruct_miri_mutation_steps(cand, &unmarked_sources)
+                .expect("reconstruct unmarked Category 11 seed candidate");
+            assert!(miri_candidate_replay_is_faithful(cand, &base, &steps));
+        }
+
+        // Trailing file-local `__ANNEAL_MODEL_*` helper in a multi-function seed
+        // must stay intact while `close_miri_seed` targets `seed_with_trailing_model`.
+        let trailing_model_seed = "\
+pub fn seed_with_trailing_model(x: u32) -> u32 {
+    trailing_local_model_fn() ^ x
+}
+pub const __ANNEAL_MODEL_trailing_local_model_fn: &str = \"trailing_local_model_fn\";
+pub fn trailing_local_model_fn() -> u32 {
+    41u32 + 1u32
+}
+";
+        let trailing_batch = generate_miri_batch(&[trailing_model_seed], 4, 0xC16_A102);
+        assert_eq!(trailing_batch.len(), 4);
+        for cand in &trailing_batch {
+            assert_eq!(cand.seed_name, "seed_with_trailing_model");
+            assert!(
+                cand.fn_source.contains("pub fn trailing_local_model_fn() -> u32 {\n    41u32 + 1u32\n}"),
+                "trailing file-local model helper must stay unmutated:\n{}",
+                cand.fn_source
+            );
+            assert!(
+                crate::miri_eval::compile_rust_snippet("trailing_model_cand", &cand.source),
+                "trailing model-helper candidate `{}` failed rustc typecheck:\n{}",
+                cand.fn_name,
+                cand.source
+            );
+            let (base, steps) =
+                reconstruct_miri_mutation_steps(cand, &[trailing_model_seed])
+                    .expect("reconstruct trailing-model-helper candidate");
+            assert!(miri_candidate_replay_is_faithful(cand, &base, &steps));
+        }
+
+        // Seed-local `struct`, `const`, and aliased `__ANNEAL_MODEL_helper_add_ten`
+        // marker (whose marker suffix is in `is_corpus_helper_fn_name` even though
+        // `MIRI_CORPUS_MODULE_PREAMBLE` defines no such `const`) must be preserved
+        // by `close_miri_seed` and keep `aliased_local_callee` unmutated.
+        let aux_and_aliased_seed = "\
+#[repr(C)]
+pub struct SeedLocalPair {
+    pub lo: u32,
+    pub hi: u32,
+}
+pub const SEED_LOCAL_BIAS: u32 = 5u32;
+pub fn seed_with_local_aux(x: u32) -> u32 {
+    let p = SeedLocalPair { lo: x, hi: SEED_LOCAL_BIAS };
+    p.lo ^ p.hi ^ aliased_local_callee()
+}
+pub const __ANNEAL_MODEL_helper_add_ten: &str = \"aliased_local_callee\";
+pub fn aliased_local_callee() -> u32 {
+    60u32 + 3u32
+}
+";
+        let aux_batch = generate_miri_batch(&[aux_and_aliased_seed], 4, 0xC16_B201);
+        assert_eq!(aux_batch.len(), 4);
+        for cand in &aux_batch {
+            assert_eq!(cand.seed_name, "seed_with_local_aux");
+            assert!(
+                cand.fn_source
+                    .contains("pub fn aliased_local_callee() -> u32 {\n    60u32 + 3u32\n}"),
+                "aliased model helper must stay unmutated:\n{}",
+                cand.fn_source
+            );
+            assert!(
+                crate::miri_eval::compile_rust_snippet("aux_and_aliased_cand", &cand.source),
+                "seed-local aux candidate `{}` failed rustc typecheck:\n{}",
+                cand.fn_name,
+                cand.source
+            );
+            let (base, steps) =
+                reconstruct_miri_mutation_steps(cand, &[aux_and_aliased_seed])
+                    .expect("reconstruct seed-local aux candidate");
+            assert!(miri_candidate_replay_is_faithful(cand, &base, &steps));
+        }
+
+        // Source-text fallback lexers ignore `"/*"` and `"const __ANNEAL_MODEL_..."`
+        // inside string literals, honor raw-string marker targets, and skip `pub fn`
+        // inside comments/strings while recognizing attributes, `const fn`, and `extern "C"`.
+        let tricky_fallback_src = "\
+#![no_std]
+pub const STR_OPEN_COMMENT: &str = \"/* not a real comment\";
+pub const STR_FAKE_MARKER: &str = \"pub const __ANNEAL_MODEL_cand_keep: () = (); pub fn ghost_str() {}\";
+/* nested /* block comment
+pub fn ghost_comment() -> u32 { 0 }
+*/ end */
+pub const __ANNEAL_MODEL_raw_alias: &str = r#\"raw_marked_helper\"#;
+#[inline(never)] pub const fn raw_marked_helper() -> u32 { 7u32 }
+pub(crate) fn restricted_not_exported() -> u32 { 1u32 }
+/* doc */ #[inline(never)] pub extern \"C\" fn cand_keep() -> u32 { @@@ }
+";
+        let marked = model_marked_names_in_source_text(tricky_fallback_src);
+        assert!(marked.contains("raw_alias") && marked.contains("raw_marked_helper"));
+        assert!(!marked.contains("cand_keep"));
+        let discovered = discover_top_level_zero_arg_pub_fns_in_source_text(tricky_fallback_src);
+        assert_eq!(discovered, vec!["raw_marked_helper", "cand_keep"]);
+
+        // Unmarked multi-function seeds (including private helpers positioned after
+        // the `pub fn` entry point and non-`u32`-returning local helper `fn`s) must
+        // close and mutate ONLY the target entry function while preserving helper
+        // `fn` bodies identically across generated candidates.
+        let unmarked_multi_fn_seed = "\
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct UnmarkedLocalPair {
+    pub lo: u32,
+    pub hi: u32,
+}
+fn unmarked_pair_step(p: UnmarkedLocalPair) -> UnmarkedLocalPair {
+    UnmarkedLocalPair {
+        lo: p.lo ^ 3u32,
+        hi: p.hi + 5u32,
+    }
+}
+pub fn seed_unmarked_multi_fn(x: u32) -> u32 {
+    let stepped = unmarked_pair_step(UnmarkedLocalPair { lo: x, hi: 9u32 });
+    trailing_private_bias(stepped.lo ^ stepped.hi)
+}
+fn trailing_private_bias(v: u32) -> u32 {
+    v ^ 11u32
+}
+";
+        let unmarked_batch = generate_miri_batch(&[unmarked_multi_fn_seed], 6, 0xC16_A202);
+        assert_eq!(unmarked_batch.len(), 6);
+        for cand in &unmarked_batch {
+            assert_eq!(cand.seed_name, "seed_unmarked_multi_fn");
+            assert!(
+                cand.fn_source.contains(
+                    "fn unmarked_pair_step(p: UnmarkedLocalPair) -> UnmarkedLocalPair {\n    \
+                     UnmarkedLocalPair {\n        lo: p.lo ^ 3u32,\n        hi: p.hi + 5u32,\n    }\n}"
+                ),
+                "unmarked helper returning non-integer struct must stay unmutated:\n{}",
+                cand.fn_source
+            );
+            assert!(
+                cand.fn_source
+                    .contains("fn trailing_private_bias(v: u32) -> u32 {\n    v ^ 11u32\n}"),
+                "trailing private helper must stay unmutated and not steal entry selection:\n{}",
+                cand.fn_source
+            );
+            assert!(
+                crate::miri_eval::compile_rust_snippet("unmarked_multi_fn_cand", &cand.source),
+                "unmarked multi-fn candidate `{}` failed rustc typecheck:\n{}",
+                cand.fn_name,
+                cand.source
+            );
+            let (base, steps) = reconstruct_miri_mutation_steps(cand, &[unmarked_multi_fn_seed])
+                .expect("reconstruct unmarked multi-fn candidate");
+            assert!(miri_candidate_replay_is_faithful(cand, &base, &steps));
+        }
+
+        // Fallback lexer edge cases: unclosed `'\u{...` without newline swallowing,
+        // top-level `ident!(...)` / `ident![...]` macro masking, spaced nested parens
+        // on marker string targets, and lifetime-generic vs type-generic zero-arg `pub fn`s.
+        let edge_fallback_src = "\
+#![no_std]
+const BROKEN_UNICODE_CHAR: char = '\\u{1234
+pub const __ANNEAL_MODEL_paren_alias: &str = ( ( \"paren_marked_helper\" ) );
+decl_items!(pub const __ANNEAL_MODEL_real_lt_cand: () = (); pub fn macro_paren_ghost() -> u32 { 0 });
+decl_items![pub fn macro_bracket_ghost() -> u32 { 1 }];
+pub fn paren_marked_helper() -> u32 { 7u32 }
+pub fn non_callable_type_generic<T>() -> u32 { 0u32 }
+pub fn non_callable_assoc_bound<T: Iterator<Item = u32>>() -> u32 { 0u32 }
+pub fn callable_defaulted_generic<T = u32>() -> u32 { 1u32 }
+pub fn callable_fn_ptr_default<F = fn() -> u32>() -> u32 { 2u32 }
+pub fn real_lt_cand<'a>() { @@@ }
+";
+        let edge_marked = model_marked_names_in_source_text(edge_fallback_src);
+        assert!(edge_marked.contains("paren_alias") && edge_marked.contains("paren_marked_helper"));
+        assert!(!edge_marked.contains("real_lt_cand"));
+        let edge_discovered = discover_top_level_zero_arg_pub_fns_in_source_text(edge_fallback_src);
+        assert_eq!(
+            edge_discovered,
+            vec![
+                "paren_marked_helper",
+                "callable_defaulted_generic",
+                "callable_fn_ptr_default",
+                "real_lt_cand"
+            ]
+        );
+
+        // Trailing parameterized `pub fn` helpers and `ub_*`-named private helpers
+        // must not hijack `target_entry_fn_index`, `collect_non_fault_seed_indices`,
+        // or `finish_miri_candidate` `tracked_locals`.
+        let trailing_pub_param_seed = "\
+pub fn pass_with_trailing_pub_helper() -> u32 {
+    let entry_only_local: u32 = 17u32;
+    trailing_pub_param_helper(entry_only_local)
+}
+pub fn trailing_pub_param_helper(helper_only_param: u32) -> u32 {
+    helper_only_param ^ 9u32
+}
+fn ub_named_private_helper() -> u32 { 3u32 }
+";
+        let fault_with_trailing_private_seed = "\
+pub fn ub_seed_with_trailing_private() -> u32 { 0u32 }
+fn pass_named_private_helper() -> u32 { 1u32 }
+";
+        let non_fault = collect_non_fault_seed_indices(&[
+            trailing_pub_param_seed,
+            fault_with_trailing_private_seed,
+        ]);
+        assert_eq!(non_fault, vec![0]);
+        let param_pub_batch = generate_miri_batch(&[trailing_pub_param_seed], 3, 0xC16_B301);
+        for cand in &param_pub_batch {
+            assert_eq!(cand.seed_name, "pass_with_trailing_pub_helper");
+            assert!(
+                !cand
+                    .tracked_locals
+                    .iter()
+                    .any(|(n, _)| n == "helper_only_param"),
+                "helper locals leaked into tracked_locals: {:?}",
+                cand.tracked_locals
+            );
+            assert!(
+                crate::miri_eval::compile_rust_snippet("trailing_pub_param_cand", &cand.source),
+                "candidate with trailing parameterized pub fn failed rustc:\n{}",
+                cand.source
+            );
+        }
+
+        // Seeds with `use` imports (`use core::mem::{size_of, transmute};`) must
+        // prune redundant preamble imports (`transmute`) while preserving
+        // non-preamble imports (`size_of`), and `async fn` items must never be
+        // extracted as synchronous zero-arg corpus seeds or fallback candidates.
+        let use_and_async_seed = "\
+use core::mem::{size_of, transmute};
+pub fn pass_seed_with_use_import() -> u32 {
+    size_of::<PairU32>() as u32
+}
+pub async fn trailing_async_helper() -> u32 {
+    99u32
+}
+";
+        let use_batch = generate_miri_batch(&[use_and_async_seed], 2, 0xC16_A301);
+        assert_eq!(use_batch.len(), 2);
+        for cand in &use_batch {
+            assert_eq!(cand.seed_name, "pass_seed_with_use_import");
+            assert!(
+                cand.fn_source.contains("use core::mem::size_of;"),
+                "non-preamble `use` import dropped by close_miri_seed:\n{}",
+                cand.fn_source
+            );
+            assert!(
+                crate::miri_eval::compile_rust_snippet("use_import_cand", &cand.source),
+                "candidate with pruned `use` import failed rustc:\n{}",
+                cand.source
+            );
+        }
+        assert_eq!(
+            extract_closed_corpus_seeds(use_and_async_seed)
+                .into_iter()
+                .map(|s| s.name)
+                .collect::<Vec<_>>(),
+            vec!["pass_seed_with_use_import"]
+        );
+        assert_eq!(
+            discover_top_level_zero_arg_pub_fns_in_source_text(
+                "pub async fn rogue_async() {} pub fn sync_cand() { @@@ }"
+            ),
+            vec!["sync_cand"]
+        );
+        // Target-aware `prune_preamble_use_tree` must NOT delete a `use` rename
+        // whose target path differs from `MIRI_CORPUS_MODULE_PREAMBLE` (such as
+        // `use core::mem::size_of as offset;`), while `aux_item_namespace_keys`
+        // tracks `extern "C"` foreign `fn`/`static`/`type` declarations.
+        let non_preamble_rename: syn::ItemUse =
+            syn::parse_quote!(use core::mem::{size_of as offset, transmute};);
+        let pruned_rename = prune_preamble_use_tree("", None, &non_preamble_rename.tree)
+            .expect("must keep size_of as offset while pruning transmute");
+        assert_eq!(
+            pruned_rename.to_token_stream().to_string(),
+            "core :: mem :: size_of as offset"
+        );
+        let foreign_block: Item = syn::parse_quote! {
+            unsafe extern "C" {
+                fn ext_sym(x: u32) -> u32;
+                static EXT_SLOT: u32;
+            }
+        };
+        assert_eq!(
+            aux_item_namespace_keys(&foreign_block),
+            vec!["val:ext_sym".to_string(), "val:EXT_SLOT".to_string()]
+        );
+
+        // `close_miri_seed` must also run `MethodCallNormalizer` inside seed-local
+        // `impl` method bodies (so `.wrapping_add(...)` becomes `wrapping_add(...)`)
+        // and honor `r#<ident>` raw-identifier model markers.
+        let impl_method_norm_seed = "\
+pub struct SeedAdder(pub u32);
+impl SeedAdder {
+    pub fn add_bias(&self, y: u32) -> u32 {
+        self.0.wrapping_add(y)
+    }
+}
+pub const __ANNEAL_MODEL_raw_marked_fn: &str = \"raw_marked_fn\";
+pub fn r#raw_marked_fn() -> u32 { 7u32 }
+pub fn pass_impl_method_norm_seed() -> u32 {
+    SeedAdder(4u32).add_bias(5u32)
+}
+";
+        let norm_cands = generate_miri_batch(&[impl_method_norm_seed], 1, 0xC16_A401);
+        assert_eq!(norm_cands.len(), 1);
+        assert_eq!(norm_cands[0].seed_name, "pass_impl_method_norm_seed");
+        assert!(
+            norm_cands[0]
+                .fn_source
+                .contains("wrapping_add(self.0, y)"),
+            "impl method body must normalize `.wrapping_add(...)` -> `wrapping_add(...)`:\n{}",
+            norm_cands[0].fn_source
+        );
+
+        // 2. `close_miri_seed` / `seeded_type_expr` must synthesize valid `FreezeAndCell`,
+        //    `NonCopyU32`, `UnwindCleanupGuard`, and `UnsafeCell<u32>` arguments and
+        //    infer `NonCopyU32(...)` / `UnwindCleanupGuard(...)` constructor locals.
+        let parameterized = "\
+pub fn probe_freeze_cell(
+    by_val: FreezeAndCell,
+    by_ref: &FreezeAndCell,
+    by_ptr: *const FreezeAndCell,
+    nc: NonCopyU32,
+    guard: UnwindCleanupGuard,
+    cell_ref: &UnsafeCell<u32>,
+) -> u32 {
+    let local_nc = NonCopyU32(9u32);
+    let local_guard = UnwindCleanupGuard(3u32);
+    let cell_val = unsafe { *((cell_ref as *const UnsafeCell<u32>) as *const u32) };
+    by_val.frozen ^ by_ref.frozen ^ (unsafe { (*by_ptr).frozen }) ^ nc.0 ^ guard.0 ^ local_nc.0 ^ local_guard.0 ^ cell_val
+}
+";
+        for seed in 0..6u64 {
+            let mut file = syn::parse_file(parameterized).unwrap();
+            let mut rng = DetRng::new(0xFC11_0000 + seed);
+            close_miri_seed(&mut file, &mut rng, |s| format!("{s}_{seed}"));
+            let fn_item = file
+                .items
+                .iter()
+                .find_map(|it| match it {
+                    Item::Fn(f) => Some(f),
+                    _ => None,
+                })
+                .expect("closed fn");
+            let locals = collect_initialized_locals(fn_item);
+            assert!(
+                locals
+                    .iter()
+                    .any(|l| l.name == "local_nc" && l.ty == "NonCopyU32")
+                    && locals
+                        .iter()
+                        .any(|l| l.name == "local_guard" && l.ty == "UnwindCleanupGuard"),
+                "expected `NonCopyU32(...)` and `UnwindCleanupGuard(...)` local type inference, got {locals:?}"
+            );
+            let full_src = build_standalone_candidate_source(&prettyplease::unparse(&file));
+            assert!(
+                crate::miri_eval::compile_rust_snippet("freeze_and_cell_closed", &full_src),
+                "`FreezeAndCell` closed candidate failed rustc typecheck:\n{full_src}"
+            );
+        }
+
+        // 3. Multi-pass batches seeded from both Category 11 corpus seeds compile
+        //    cleanly under `rustc` and replay byte-for-byte.
+        let corpus_seeds = load_miri_diff_corpus_seeds();
+        let cat11_sources: Vec<&str> = [
+            "pass_shared_temp_const_raw_ptr_read_and_freeze_retag",
+            "ub_shared_temp_unsafe_cell_raw_const_cast_mut_write",
+        ]
+        .into_iter()
+        .map(|name| {
+            corpus_seeds
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing Category 11 corpus seed `{name}`"))
+                .fn_source
+                .as_str()
+        })
+        .collect();
+        for cand in generate_miri_batch(&cat11_sources, 10, 0xCA71_0011) {
+            assert!(
+                crate::miri_eval::compile_rust_snippet("cat11_mutated_cand", &cand.source),
+                "Category 11 mutated candidate `{}` failed rustc typecheck:\n{}",
+                cand.fn_name,
+                cand.source
+            );
+            let (base, steps) = reconstruct_miri_mutation_steps(&cand, &cat11_sources)
+                .expect("reconstruct Category 11 candidate passes");
+            assert!(
+                miri_candidate_replay_is_faithful(&cand, &base, &steps),
+                "replay mismatch on Category 11 candidate `{}`",
+                cand.fn_name
+            );
         }
     }
 }

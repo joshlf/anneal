@@ -8,6 +8,7 @@ This file may not be copied, modified, or distributed except according to
 those terms.
 -/
 
+import Lean
 import MiniRustSpec.Correspondence.Witness
 
 /-!
@@ -97,6 +98,42 @@ open MiniRustSpec
 open MiniRustSpec.LibSpecr
 open MiniRustSpec.Interp
 open MiniRustSpec.Correspondence.Witness
+
+local elab "kernel_rfl" : tactic => do
+  let mvarId ← Lean.Elab.Tactic.getMainGoal
+  let tgt ← Lean.MVarId.getType' mvarId
+  let some (ty, lhs, _) := tgt.eq? | Lean.Meta.throwTacticEx `kernel_rfl mvarId "expected equality goal"
+  let u ← Lean.Meta.getLevel ty
+  mvarId.assign (Lean.mkApp2 (Lean.mkConst ``Eq.refl [u]) ty lhs)
+  Lean.Elab.Tactic.replaceMainGoal []
+
+private theorem runA_isSome_noUB (body : CapturedMir) (fuel : Nat) (s : MachineState)
+    (h : (runA body fuel s).isSome = true) : MirNoUBTree (mirTree body s) := by
+  cases hr : runA body fuel s with
+  | none => rw [hr] at h; cases h
+  | some p => exact runA_noUB body fuel s p.1 p.2 hr
+
+private theorem runA_exists_mem_sound (body : CapturedMir) (fuel : Nat) (s : MachineState)
+    (tr : List (Event MirEffect)) (v : Value)
+    (h : (runA body fuel s).map (fun (tr', o) =>
+      match o with
+      | .normal (v', _) => some (tr', v')
+      | _ => none) = some (some (tr, v))) :
+    ∃ mem, ReachesRet (mirTree body s) tr (.normal (v, mem)) := by
+  cases hr : runA body fuel s with
+  | none => rw [hr] at h; cases h
+  | some p =>
+    rcases p with ⟨tr', o⟩
+    cases o with
+    | normal vm =>
+      rcases vm with ⟨v', mem⟩
+      rw [hr] at h
+      injection h with h1
+      injection h1 with h2
+      injection h2 with htr hv
+      cases htr; cases hv
+      exact ⟨mem, runA_sound body fuel s _ _ hr⟩
+    | _ => rw [hr] at h; cases h
 
 /-! ## Shared building blocks -/
 
@@ -233,7 +270,7 @@ theorem fbCtxU32_ok_u8 {body : CapturedMir} (h : body.localDecls = [u32Decl, u8D
       | _ + 2, hd => simp at hd)
     (by
       intro d hd; rw [h] at hd; simp at hd; subst hd
-      exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩)
+      exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩)
 
 theorem fbCtxU32_ok_u32 {body : CapturedMir} (h : body.localDecls = [u32Decl, u32Decl]) :
     CtxOk body fbCtxU32 :=
@@ -246,7 +283,7 @@ theorem fbCtxU32_ok_u32 {body : CapturedMir} (h : body.localDecls = [u32Decl, u3
       | _ + 2, hd => simp at hd)
     (by
       intro d hd; rw [h] at hd; simp at hd; subst hd
-      exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩)
+      exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩)
 
 theorem fbCtxU32_ok_u32u32 {body : CapturedMir}
     (h : body.localDecls = [u32Decl, u32Decl, u32Decl]) : CtxOk body fbCtxU32 :=
@@ -260,7 +297,7 @@ theorem fbCtxU32_ok_u32u32 {body : CapturedMir}
       | _ + 3, hd => simp at hd)
     (by
       intro d hd; rw [h] at hd; simp at hd; subst hd
-      exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩)
+      exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩)
 
 theorem fbCtxU8_ok_u8 {body : CapturedMir} (h : body.localDecls = [u8Decl, u8Decl]) :
     CtxOk body fbCtxU8 :=
@@ -273,7 +310,7 @@ theorem fbCtxU8_ok_u8 {body : CapturedMir} (h : body.localDecls = [u8Decl, u8Dec
       | _ + 2, hd => simp at hd)
     (by
       intro d hd; rw [h] at hd; simp at hd; subst hd
-      exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩)
+      exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩)
 
 theorem fbCtxU8_ok_u8u8 {body : CapturedMir} (h : body.localDecls = [u8Decl, u8Decl, u8Decl]) :
     CtxOk body fbCtxU8 :=
@@ -287,7 +324,7 @@ theorem fbCtxU8_ok_u8u8 {body : CapturedMir} (h : body.localDecls = [u8Decl, u8D
       | _ + 3, hd => simp at hd)
     (by
       intro d hd; rw [h] at hd; simp at hd; subst hd
-      exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩)
+      exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩)
 
 theorem fbCtxI8_ok_i8i8 {body : CapturedMir} (h : body.localDecls = [i8Decl, i8Decl, i8Decl]) :
     CtxOk body fbCtxI8 :=
@@ -301,7 +338,7 @@ theorem fbCtxI8_ok_i8i8 {body : CapturedMir} (h : body.localDecls = [i8Decl, i8D
       | _ + 3, hd => simp at hd)
     (by
       intro d hd; rw [h] at hd; simp at hd; subst hd
-      exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩)
+      exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩)
 
 /-- The MiniRust machine that runs the translated `entry` (with `callee` as
 `fnName 1`) on `args` from its start block under root context `ctx`. -/
@@ -513,7 +550,7 @@ def fbCtlzCaller : CapturedMir :=
   fbCaller "fallback::ctlz_caller" "core::intrinsics::ctlz" [] [u32Decl, u8Decl]
     (fbAbi [i8Layout] u32Layout)
 
-theorem fbCtlz_inFragment : progInFragment fbCtlzCaller [fbCtlzCallee] = true := by decide
+theorem fbCtlz_inFragment : progInFragment fbCtlzCaller [fbCtlzCallee] = true := by decide +kernel
 
 def fbCtlzCalleeFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u8), (localName 2, .Int u8),
@@ -605,17 +642,17 @@ theorem fbCtlz128_anneal_ret :
       (.normal (.scalar ⟨fbCtlzSpec 128, 4⟩,
         { (initMachineStateWithCallees fbCtlzCaller [.scalar ⟨128, 1⟩] [fbCtlzCallee]).memory with
           activeCallee := some fbCtlzCaller })) :=
-  runA_sound fbCtlzCaller 30 _ _ _ rfl
+  runA_sound fbCtlzCaller 30 _ _ _ (by kernel_rfl)
 
 theorem fbCtlz128_noUB :
     MirNoUBTree (mirCallTreeWithCallees fbCtlzCaller [.scalar ⟨128, 1⟩] [fbCtlzCallee]) :=
-  runA_noUB fbCtlzCaller 30 _ _ _ rfl
+  runA_isSome_noUB fbCtlzCaller 30 _ (by kernel_rfl)
 
 theorem fbCtlz128_minirust_ret :
     fbMiniRustRet (fbCtlzMInit 128) callerFrame retAlloc fbAddrs
       (scalarBytes u32 (fbCtlzSpec 128)) :=
   fb_minirust_ret (d := u32Decl) fbCtlz_inFragment fbCtlz_translate fbCtlzCaller_translateInProg
-    (fbCtxU32_ok_u8 rfl) rfl (by decide) fbCtlz128_anneal_ret
+    (fbCtxU32_ok_u8 rfl) rfl (by decide +kernel) fbCtlz128_anneal_ret
 
 theorem fbCtlz128_minirust_direct :
     (Interp.steps 21 (fbCtlzMInit 128)).toOption.map
@@ -681,7 +718,7 @@ def fbCttzCaller : CapturedMir :=
   fbCaller "fallback::cttz_caller" "core::intrinsics::cttz" [] [u32Decl, u8Decl]
     (fbAbi [i8Layout] u32Layout)
 
-theorem fbCttz_inFragment : progInFragment fbCttzCaller [fbCttzCallee] = true := by decide
+theorem fbCttz_inFragment : progInFragment fbCttzCaller [fbCttzCallee] = true := by decide +kernel
 
 def fbCttzCalleeFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u8), (localName 2, .Int u8)]⟩
@@ -755,17 +792,17 @@ theorem fbCttz12_anneal_ret :
       (.normal (.scalar ⟨fbCttzSpec 12, 4⟩,
         { (initMachineStateWithCallees fbCttzCaller [.scalar ⟨12, 1⟩] [fbCttzCallee]).memory with
           activeCallee := some fbCttzCaller })) :=
-  runA_sound fbCttzCaller 60 _ _ _ rfl
+  runA_sound fbCttzCaller 60 _ _ _ (by kernel_rfl)
 
 theorem fbCttz12_noUB :
     MirNoUBTree (mirCallTreeWithCallees fbCttzCaller [.scalar ⟨12, 1⟩] [fbCttzCallee]) :=
-  runA_noUB fbCttzCaller 60 _ _ _ rfl
+  runA_isSome_noUB fbCttzCaller 60 _ (by kernel_rfl)
 
 theorem fbCttz12_minirust_ret :
     fbMiniRustRet (fbCttzMInit 12) callerFrame retAlloc fbAddrs
       (scalarBytes u32 (fbCttzSpec 12)) :=
   fb_minirust_ret (d := u32Decl) fbCttz_inFragment fbCttz_translate fbCttzCaller_translateInProg
-    (fbCtxU32_ok_u8 rfl) rfl (by decide) fbCttz12_anneal_ret
+    (fbCtxU32_ok_u8 rfl) rfl (by decide +kernel) fbCttz12_anneal_ret
 
 theorem fbCttz12_minirust_direct :
     (Interp.steps 22 (fbCttzMInit 12)).toOption.map
@@ -825,7 +862,7 @@ def fbBswapCaller : CapturedMir :=
   fbCaller "fallback::bswap_caller" "core::intrinsics::bswap" [] [u32Decl, u32Decl]
     (fbAbi [u32Layout] u32Layout)
 
-theorem fbBswap_inFragment : progInFragment fbBswapCaller [fbBswapCallee] = true := by decide
+theorem fbBswap_inFragment : progInFragment fbBswapCaller [fbBswapCallee] = true := by decide +kernel
 
 def fbBswapCalleeFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32), (localName 2, .Int u32),
@@ -907,17 +944,17 @@ theorem fbBswapMid_anneal_ret :
         { (initMachineStateWithCallees fbBswapCaller [.scalar ⟨305419896, 4⟩]
             [fbBswapCallee]).memory with
           activeCallee := some fbBswapCaller })) :=
-  runA_sound fbBswapCaller 20 _ _ _ rfl
+  runA_sound fbBswapCaller 20 _ _ _ (by kernel_rfl)
 
 theorem fbBswapMid_noUB :
     MirNoUBTree (mirCallTreeWithCallees fbBswapCaller [.scalar ⟨305419896, 4⟩] [fbBswapCallee]) :=
-  runA_noUB fbBswapCaller 20 _ _ _ rfl
+  runA_isSome_noUB fbBswapCaller 20 _ (by kernel_rfl)
 
 theorem fbBswapMid_minirust_ret :
     fbMiniRustRet (fbBswapMInit 305419896) callerFrame retAlloc fbAddrs
       (scalarBytes u32 (fbBswapSpec 305419896)) :=
   fb_minirust_ret (d := u32Decl) fbBswap_inFragment fbBswap_translate
-    fbBswapCaller_translateInProg (fbCtxU32_ok_u32 rfl) rfl (by decide) fbBswapMid_anneal_ret
+    fbBswapCaller_translateInProg (fbCtxU32_ok_u32 rfl) rfl (by decide +kernel) fbBswapMid_anneal_ret
 
 theorem fbBswapMid_minirust_direct :
     (Interp.steps 18 (fbBswapMInit 305419896)).toOption.map
@@ -986,7 +1023,7 @@ def fbBitrevCaller : CapturedMir :=
   fbCaller "fallback::bitreverse_caller" "core::intrinsics::bitreverse" []
     [u8Decl, u8Decl] (fbAbi [i8Layout] i8Layout)
 
-theorem fbBitrev_inFragment : progInFragment fbBitrevCaller [fbBitrevCallee] = true := by decide
+theorem fbBitrev_inFragment : progInFragment fbBitrevCaller [fbBitrevCallee] = true := by decide +kernel
 
 def fbBitrevCalleeFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u8), (localName 1, .Int u8), (localName 2, .Int u8),
@@ -1075,17 +1112,17 @@ theorem fbBitrev35_anneal_ret :
         { (initMachineStateWithCallees fbBitrevCaller [.scalar ⟨53, 1⟩]
             [fbBitrevCallee]).memory with
           activeCallee := some fbBitrevCaller })) :=
-  runA_sound fbBitrevCaller 30 _ _ _ rfl
+  runA_sound fbBitrevCaller 30 _ _ _ (by kernel_rfl)
 
 theorem fbBitrev35_noUB :
     MirNoUBTree (mirCallTreeWithCallees fbBitrevCaller [.scalar ⟨53, 1⟩] [fbBitrevCallee]) :=
-  runA_noUB fbBitrevCaller 30 _ _ _ rfl
+  runA_isSome_noUB fbBitrevCaller 30 _ (by kernel_rfl)
 
 theorem fbBitrev35_minirust_ret :
     fbMiniRustRet (fbBitrevMInit 53) fbCallerFrameU8 retAllocI8 fbAddrs
       (scalarBytes u8 (fbBitrevSpec 53)) :=
   fb_minirust_ret (d := u8Decl) fbBitrev_inFragment fbBitrev_translate
-    fbBitrevCaller_translateInProg (fbCtxU8_ok_u8 rfl) rfl (by decide) fbBitrev35_anneal_ret
+    fbBitrevCaller_translateInProg (fbCtxU8_ok_u8 rfl) rfl (by decide +kernel) fbBitrev35_anneal_ret
 
 theorem fbBitrev35_minirust_direct :
     (Interp.steps 22 (fbBitrevMInit 53)).toOption.map
@@ -1150,7 +1187,7 @@ def fbSatAddCaller : CapturedMir :=
   fbCaller "fallback::saturating_add_caller" "core::intrinsics::saturating_add" []
     [u8Decl, u8Decl, u8Decl] (fbAbi [i8Layout, i8Layout] i8Layout)
 
-theorem fbSatAdd_inFragment : progInFragment fbSatAddCaller [fbSatAddCallee] = true := by decide
+theorem fbSatAdd_inFragment : progInFragment fbSatAddCaller [fbSatAddCallee] = true := by decide +kernel
 
 def fbSatAddCalleeFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u8), (localName 1, .Int u8), (localName 2, .Int u8),
@@ -1240,18 +1277,18 @@ theorem fbSatAddOv_anneal_ret :
         { (initMachineStateWithCallees fbSatAddCaller [.scalar ⟨200, 1⟩, .scalar ⟨100, 1⟩]
             [fbSatAddCallee]).memory with
           activeCallee := some fbSatAddCaller })) :=
-  runA_sound fbSatAddCaller 20 _ _ _ rfl
+  runA_sound fbSatAddCaller 20 _ _ _ (by kernel_rfl)
 
 theorem fbSatAddOv_noUB :
     MirNoUBTree (mirCallTreeWithCallees fbSatAddCaller [.scalar ⟨200, 1⟩, .scalar ⟨100, 1⟩]
       [fbSatAddCallee]) :=
-  runA_noUB fbSatAddCaller 20 _ _ _ rfl
+  runA_isSome_noUB fbSatAddCaller 20 _ (by kernel_rfl)
 
 theorem fbSatAddOv_minirust_ret :
     fbMiniRustRet (fbSatAddMInit 200 100) fbCallerFrameU8 retAllocI8 fbAddrs
       (scalarBytes u8 (fbSatAddSpec 200 100)) :=
   fb_minirust_ret (d := u8Decl) fbSatAdd_inFragment fbSatAdd_translate
-    fbSatAddCaller_translateInProg (fbCtxU8_ok_u8u8 rfl) rfl (by decide) fbSatAddOv_anneal_ret
+    fbSatAddCaller_translateInProg (fbCtxU8_ok_u8u8 rfl) rfl (by decide +kernel) fbSatAddOv_anneal_ret
 
 theorem fbSatAddOv_minirust_direct :
     (Interp.steps 10 (fbSatAddMInit 200 100)).toOption.map
@@ -1321,7 +1358,7 @@ def fbSatSubCaller : CapturedMir :=
   fbCaller "fallback::saturating_sub_caller" "core::intrinsics::saturating_sub" []
     [i8Decl, i8Decl, i8Decl] (fbAbi [i8Layout, i8Layout] i8Layout)
 
-theorem fbSatSub_inFragment : progInFragment fbSatSubCaller [fbSatSubCallee] = true := by decide
+theorem fbSatSub_inFragment : progInFragment fbSatSubCaller [fbSatSubCallee] = true := by decide +kernel
 
 def fbSatSubCalleeFn : Gen.Function where
   locals := ⟨[(localName 0, .Int i8), (localName 1, .Int i8), (localName 2, .Int i8),
@@ -1453,18 +1490,18 @@ theorem fbSatSubMin_anneal_ret :
         { (initMachineStateWithCallees fbSatSubCaller [.scalar ⟨128, 1⟩, .scalar ⟨1, 1⟩]
             [fbSatSubCallee]).memory with
           activeCallee := some fbSatSubCaller })) :=
-  runA_sound fbSatSubCaller 20 _ _ _ rfl
+  runA_sound fbSatSubCaller 20 _ _ _ (by kernel_rfl)
 
 theorem fbSatSubMin_noUB :
     MirNoUBTree (mirCallTreeWithCallees fbSatSubCaller [.scalar ⟨128, 1⟩, .scalar ⟨1, 1⟩]
       [fbSatSubCallee]) :=
-  runA_noUB fbSatSubCaller 20 _ _ _ rfl
+  runA_isSome_noUB fbSatSubCaller 20 _ (by kernel_rfl)
 
 theorem fbSatSubMin_minirust_ret :
     fbMiniRustRet (fbSatSubMInit 128 1) callerFrameI8 retAllocI8 fbAddrs
       (scalarBytes i8 (fbSatSubSpec 128 1)) :=
   fb_minirust_ret (d := i8Decl) fbSatSub_inFragment fbSatSub_translate
-    fbSatSubCaller_translateInProg (fbCtxI8_ok_i8i8 rfl) rfl (by decide) fbSatSubMin_anneal_ret
+    fbSatSubCaller_translateInProg (fbCtxI8_ok_i8i8 rfl) rfl (by decide +kernel) fbSatSubMin_anneal_ret
 
 theorem fbSatSubMin_minirust_direct :
     (Interp.steps 14 (fbSatSubMInit 128 1)).toOption.map
@@ -1516,8 +1553,8 @@ def fbShrCaller : CapturedMir :=
   fbCaller "fallback::wrapping_shr_caller" "core::num::<impl u32>::wrapping_shr" []
     [u32Decl, u32Decl, u32Decl] (fbAbi [u32Layout, u32Layout] u32Layout)
 
-theorem fbShl_inFragment : progInFragment fbShlCaller [fbShlCallee] = true := by decide
-theorem fbShr_inFragment : progInFragment fbShrCaller [fbShrCallee] = true := by decide
+theorem fbShl_inFragment : progInFragment fbShlCaller [fbShlCallee] = true := by decide +kernel
+theorem fbShr_inFragment : progInFragment fbShrCaller [fbShrCallee] = true := by decide +kernel
 
 /-- The translation of `fbShiftCallee dp op` when `op` translates to the
 MiniRust integer operator `iop`. -/
@@ -1653,18 +1690,18 @@ theorem fbShl33_anneal_ret :
         { (initMachineStateWithCallees fbShlCaller [.scalar ⟨1, 4⟩, .scalar ⟨33, 4⟩]
             [fbShlCallee]).memory with
           activeCallee := some fbShlCaller })) :=
-  runA_sound fbShlCaller 20 _ _ _ rfl
+  runA_sound fbShlCaller 20 _ _ _ (by kernel_rfl)
 
 theorem fbShl33_noUB :
     MirNoUBTree (mirCallTreeWithCallees fbShlCaller [.scalar ⟨1, 4⟩, .scalar ⟨33, 4⟩]
       [fbShlCallee]) :=
-  runA_noUB fbShlCaller 20 _ _ _ rfl
+  runA_isSome_noUB fbShlCaller 20 _ (by kernel_rfl)
 
 theorem fbShl33_minirust_ret :
     fbMiniRustRet (fbShlMInit 1 33) callerFrame retAlloc fbAddrs
       (scalarBytes u32 (fbShlSpec 1 33)) :=
   fb_minirust_ret (d := u32Decl) fbShl_inFragment fbShl_translate fbShlCaller_translateInProg
-    (fbCtxU32_ok_u32u32 rfl) rfl (by decide) fbShl33_anneal_ret
+    (fbCtxU32_ok_u32u32 rfl) rfl (by decide +kernel) fbShl33_anneal_ret
 
 theorem fbShl33_minirust_direct :
     (Interp.steps 9 (fbShlMInit 1 33)).toOption.map
@@ -1681,18 +1718,18 @@ theorem fbShr63_anneal_ret :
         { (initMachineStateWithCallees fbShrCaller [.scalar ⟨2147483648, 4⟩, .scalar ⟨63, 4⟩]
             [fbShrCallee]).memory with
           activeCallee := some fbShrCaller })) :=
-  runA_sound fbShrCaller 20 _ _ _ rfl
+  runA_sound fbShrCaller 20 _ _ _ (by kernel_rfl)
 
 theorem fbShr63_noUB :
     MirNoUBTree (mirCallTreeWithCallees fbShrCaller [.scalar ⟨2147483648, 4⟩, .scalar ⟨63, 4⟩]
       [fbShrCallee]) :=
-  runA_noUB fbShrCaller 20 _ _ _ rfl
+  runA_isSome_noUB fbShrCaller 20 _ (by kernel_rfl)
 
 theorem fbShr63_minirust_ret :
     fbMiniRustRet (fbShrMInit 2147483648 63) callerFrame retAlloc fbAddrs
       (scalarBytes u32 (fbShrSpec 2147483648 63)) :=
   fb_minirust_ret (d := u32Decl) fbShr_inFragment fbShr_translate fbShrCaller_translateInProg
-    (fbCtxU32_ok_u32u32 rfl) rfl (by decide) fbShr63_anneal_ret
+    (fbCtxU32_ok_u32u32 rfl) rfl (by decide +kernel) fbShr63_anneal_ret
 
 theorem fbShr63_minirust_direct :
     (Interp.steps 9 (fbShrMInit 2147483648 63)).toOption.map
@@ -1818,18 +1855,18 @@ theorem fbBlackBoxMid_anneal_ret :
         { (initMachineStateWithCallees fbBlackBoxCaller [.scalar ⟨305419896, 4⟩]
             [fbBlackBoxCallee]).memory with
           activeCallee := some fbBlackBoxCaller })) :=
-  runA_sound fbBlackBoxCaller 10 _ _ _ rfl
+  runA_sound fbBlackBoxCaller 10 _ _ _ (by kernel_rfl)
 
 theorem fbBlackBoxMid_noUB :
     MirNoUBTree (mirCallTreeWithCallees fbBlackBoxCaller [.scalar ⟨305419896, 4⟩]
       [fbBlackBoxCallee]) :=
-  runA_noUB fbBlackBoxCaller 10 _ _ _ rfl
+  runA_isSome_noUB fbBlackBoxCaller 10 _ (by kernel_rfl)
 
 theorem fbBlackBoxMid_minirust_ret :
     fbMiniRustRet (fbBlackBoxMInit 305419896) callerFrame retAlloc fbAddrs
       (scalarBytes u32 (fbBlackBoxSpec 305419896)) :=
   fb_minirust_ret (d := u32Decl) fbBlackBox_inFragment fbBlackBox_translate
-    fbBlackBoxCaller_translateInProg (fbCtxU32_ok_u32 rfl) rfl (by decide)
+    fbBlackBoxCaller_translateInProg (fbCtxU32_ok_u32 rfl) rfl (by decide +kernel)
     fbBlackBoxMid_anneal_ret
 
 theorem fbBlackBoxMid_minirust_direct :

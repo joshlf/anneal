@@ -30,6 +30,7 @@ import MiniRustSpec.Correspondence.ProvenanceWitness
 import MiniRustSpec.Correspondence.IntrinsicFallback
 import MiniRustSpec.Correspondence.WideSliceDst
 import MiniRustSpec.Correspondence.IntrinsicBoundary
+import MiniRustSpec.UnwindSetDiscrAndFnPtrMR
 import MiniRustSpec.Audit
 
 /-!
@@ -64,6 +65,15 @@ import MiniRustSpec.Audit
   DST pointer-metadata correspondence (`Correspondence.WideSliceDst`), and
   boundary witnesses for the intrinsic constructs outside the fragment
   (`Correspondence.IntrinsicBoundary`).
+* `MiniRustSpec.UnwindSetDiscrAndFnPtrMR`: correspondence, `MachTB.wfLive`
+  preservation, `Classical.choice`-free codecs, and boundary/divergence
+  characterizations across `Mach` and `MachTB` for
+  `Statement.SetDiscriminant`, `Terminator.{StartUnwind, StopUnwind,
+  ResumeUnwind}`, `unwindResume`, `unwindTerminate`, `coverage`,
+  `backwardIncompatibleDropHint`, `fnPtrToPtr`, `subtype`, non-`Unsize`
+  `pointerCoercion` (`ReifyFnPointer`, `ClosureFnPointer`, `UnsafeFnPointer`,
+  `MutToConstPointer`, `ArrayToPointer`), `unwrapUnsafeBinder`, and
+  `AggregateKind.closure`.
 * `MiniRustSpec.Audit`: fails the build unless the main theorems use only the
   standard axioms.
 

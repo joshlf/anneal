@@ -8,6 +8,7 @@ This file may not be copied, modified, or distributed except according to
 those terms.
 -/
 
+import Lean
 import MiniRustSpec.Correspondence.IntrinsicFallback
 import MiniRustSpec.Correspondence.DeinitBridge
 import Trusted.VerificationResult
@@ -39,7 +40,10 @@ that `StatementKind::Intrinsic(Assume)` *is* now inside `progInFragment`; see
      `bdExactDiv_inline`, `bdUbChecksCall_anneal_ret`), and diverging
      `core::intrinsics::abort` steps to `MirStepNode.retOutcome .abort`
      (`bdAbort_anneal_abort`).
-   * Unmodeled intrinsics (`write_bytes`, `raw_eq`, `cold_path`) emit external
+   * The call form of `write_bytes` is modeled in `evalDirectRustIntrinsic?`
+     (`evalWriteBytesCall`) and fails closed on an untracked destination
+     pointer (`bdWriteBytes_untracked_unsupported`).
+   * Unmodeled intrinsics (`raw_eq`, `cold_path`) emit external
      `MirCallReq` requests carrying `defPath`, `typeArgs`, `args`, and `memory`
      (`bdMirCallReq_fields`). When interpreted via `mirHandledTree`
      (`Trusted.VerificationResult`), `coldPathHandler` corresponds to
@@ -76,8 +80,12 @@ characterizations + `CountOnes` conservation, full value-level two-sided `some v
 `align_of_val` ↔ `Type.layout` & `LayoutStrategy.compute_size_and_align`, symbolic `panicUnwind`,
 and multi-byte / `char` / slice-layout negative controls). Section 10 (`[adv ep2-B4]` /
 `[adv ep2-A4]`) pins the remaining boundaries and closes all 30 `LIntrinsicOp` variants: MiniRust's
-executable spec rejects every unwinding terminator (`StartUnwind`, `StopUnwind`, `ResumeUnwind`) as
-`unsupported`, `RigidTy.str` wide pointers (`&str` / `*const str`) match `Type.layout (.Slice
+executable spec runs every unwinding terminator (`StartUnwind`, `StopUnwind`,
+`ResumeUnwind`) and `Statement::SetDiscriminant` across both `Mach` and
+`MachTB`, so `panicUnwind` has no single `IntrinsicOp` counterpart (MiniRust
+models unwinding with those terminators, and no simulation between them and
+`startPanic` is proved here),
+`RigidTy.str` wide pointers (`&str` / `*const str`) match `Type.layout (.Slice
 (.Int u8))`, missing `nextBlock = none` / `target = none` raises UB on value-returning intrinsics in
 both semantics, and `lintrinsicOp_exhaustive_minirust_classification` partitions all 30
 `LIntrinsicOp` constructors across their four verified correspondence regimes.
@@ -99,6 +107,42 @@ open MiniRustSpec
 open MiniRustSpec.LibSpecr
 open MiniRustSpec.Interp
 open MiniRustSpec.Correspondence.Witness
+
+local elab "kernel_rfl" : tactic => do
+  let mvarId ← Lean.Elab.Tactic.getMainGoal
+  let tgt ← Lean.MVarId.getType' mvarId
+  let some (ty, lhs, _) := tgt.eq? | Lean.Meta.throwTacticEx `kernel_rfl mvarId "expected equality goal"
+  let u ← Lean.Meta.getLevel ty
+  mvarId.assign (Lean.mkApp2 (Lean.mkConst ``Eq.refl [u]) ty lhs)
+  Lean.Elab.Tactic.replaceMainGoal []
+
+private theorem runA_isSome_noUB (body : CapturedMir) (fuel : Nat) (s : MachineState)
+    (h : (runA body fuel s).isSome = true) : MirNoUBTree (mirTree body s) := by
+  cases hr : runA body fuel s with
+  | none => rw [hr] at h; cases h
+  | some p => exact runA_noUB body fuel s p.1 p.2 hr
+
+private theorem runA_exists_mem_sound (body : CapturedMir) (fuel : Nat) (s : MachineState)
+    (tr : List (Event MirEffect)) (v : Value)
+    (h : (runA body fuel s).map (fun (tr', o) =>
+      match o with
+      | .normal (v', _) => some (tr', v')
+      | _ => none) = some (some (tr, v))) :
+    ∃ mem, ReachesRet (mirTree body s) tr (.normal (v, mem)) := by
+  cases hr : runA body fuel s with
+  | none => rw [hr] at h; cases h
+  | some p =>
+    rcases p with ⟨tr', o⟩
+    cases o with
+    | normal vm =>
+      rcases vm with ⟨v', mem⟩
+      rw [hr] at h
+      injection h with h1
+      injection h1 with h2
+      injection h2 with htr hv
+      cases htr; cases hv
+      exact ⟨mem, runA_sound body fuel s _ _ hr⟩
+    | _ => rw [hr] at h; cases h
 
 /-! ## Shared building blocks -/
 
@@ -159,10 +203,12 @@ def bdCallReq? : MirStepNode → Option MirCallReq
 ```text
 bb0: _0 = UbChecks(); return
 ```
-Anneal: `evalRvalue` (`Places.lean:1951`) has no arm for `Rvalue.nullaryOp`,
-so its final catch-all arm (`Places.lean:2267`) returns `.unsupported`, and
-the assignment arm of `evalStmt` (`Statements.lean:909`, `1020`) turns that
-into `MirStepNode.unsupported`, a fault that no UB-free tree may reach.
+Anneal: `evalRvalue` evaluates `Rvalue.nullaryOp .ubChecks` at type `bool`
+through `evalNullaryOp` (`Places.lean`) to `true`, Anneal's UB-checking
+operational mode (the same flag that a call to `core::intrinsics::ub_checks`
+returns, `bdUbChecksCall_anneal_ret`), so the body returns `true`
+(`bdUbChecks_anneal_ret`); `NullOp.contractChecks` stays unsupported
+(`bdNullaryOp_ubChecks_contractChecks`).
 
 `minimize`: `translate_rvalue_smir` (`rvalue.rs:8-371`) has no arm for a
 nullary operation. In the stable MIR it consumes, the runtime-check flags are
@@ -176,20 +222,20 @@ def bdUbChecksBody : CapturedMir :=
     { statements := [mkStmt (.assign (local_ 0) (.nullaryOp .ubChecks boolTy))],
       terminator := mkTerm .return_, isCleanup := false }]
 
-/-- Every nullary operation is unsupported in Anneal, in every state. -/
-theorem bdNullaryOp_unsupported (locals : List LocalSlot) (op : NullOp) (ty : Ty) (mem : Memory)
-    (decls : List LocalDecl) (layouts : LayoutTable) :
-    evalRvalue locals (.nullaryOp op ty) mem decls layouts = .unsupported := rfl
+/-- In every state, Anneal evaluates the runtime UB-check flag `NullOp.ubChecks` at `bool` to
+`true` (`1 : u8`) without touching the frame or memory, and rejects `NullOp.contractChecks` as
+unsupported. -/
+theorem bdNullaryOp_ubChecks_contractChecks (locals : List LocalSlot) (idx : LayoutIdx)
+    (ty : Ty) (mem : Memory) (decls : List LocalDecl) (layouts : LayoutTable) :
+    evalRvalue locals (.nullaryOp .ubChecks ⟨.bool, idx⟩) mem decls layouts =
+        .ok (.scalar ⟨1, 1⟩) locals mem ∧
+      evalRvalue locals (.nullaryOp .contractChecks ty) mem decls layouts = .unsupported :=
+  ⟨rfl, rfl⟩
 
-theorem bdUbChecks_step :
-    stepMirFn bdUbChecksBody (initMachineState bdUbChecksBody []) = MirStepNode.unsupported :=
-  rfl
-
-/-- Anneal cannot certify any execution of `bdUbChecksBody`. -/
-theorem bdUbChecks_not_noUB : ¬ MirNoUBTree (mirCallTree bdUbChecksBody []) := by
-  obtain ⟨tr, u, hr, hf⟩ :=
-    faultsA_sound bdUbChecksBody 1 (initMachineState bdUbChecksBody []) rfl
-  exact fun hsafe => hsafe tr u hr hf
+/-- Anneal runs `bdUbChecksBody` to completion, returning `true`. -/
+theorem bdUbChecks_anneal_ret :
+    ∃ mem, ReachesRet (mirCallTree bdUbChecksBody []) [] (.normal (.scalar ⟨1, 1⟩, mem)) :=
+  runA_exists_mem_sound bdUbChecksBody 10 _ _ _ (by kernel_rfl)
 
 theorem bdNullaryOp_translateRvalue (layouts : Layout.LayoutTable) (decls : List LocalDecl)
     (targetTy : Option Ty) (op : NullOp) (ty : Ty) :
@@ -198,7 +244,7 @@ theorem bdNullaryOp_translateRvalue (layouts : Layout.LayoutTable) (decls : List
 theorem bdUbChecks_rejected :
     statementOk [boolDecl] (mkStmt (.assign (local_ 0) (.nullaryOp .ubChecks boolTy))) = false ∧
       inFragment bdUbChecksBody = false :=
-  ⟨rfl, by decide⟩
+  ⟨rfl, by decide +kernel⟩
 
 /-! ## 2. `StatementKind::Intrinsic(CopyNonOverlapping)` -/
 
@@ -241,13 +287,13 @@ def bdCopyBody (n : Nat) : CapturedMir :=
 theorem bdCopy0_anneal_ret :
     ∃ mem, ReachesRet (mirCallTree (bdCopyBody 0) [.scalar ⟨7, 4⟩]) []
       (.normal (.scalar ⟨0, 4⟩, mem)) :=
-  ⟨_, runA_sound (bdCopyBody 0) 30 _ _ _ rfl⟩
+  runA_exists_mem_sound (bdCopyBody 0) 30 _ _ _ (by kernel_rfl)
 
 /-- `count = 1`: the argument `7` is copied into `_0` and returned. -/
 theorem bdCopy1_anneal_ret :
     ∃ mem, ReachesRet (mirCallTree (bdCopyBody 1) [.scalar ⟨7, 4⟩]) []
       (.normal (.scalar ⟨7, 4⟩, mem)) :=
-  ⟨_, runA_sound (bdCopyBody 1) 30 _ _ _ rfl⟩
+  runA_exists_mem_sound (bdCopyBody 1) 30 _ _ _ (by kernel_rfl)
 
 /-- `count = 2`: the copy covers `2 * size_of::<u32>() = 8` bytes, but `_1`
 and `_0` are 4-byte locals, and the `copy_nonoverlapping` safety contract
@@ -256,11 +302,11 @@ Anneal nevertheless returns `7`, the same result as for `count = 1`. -/
 theorem bdCopy2_anneal_ret :
     ∃ mem, ReachesRet (mirCallTree (bdCopyBody 2) [.scalar ⟨7, 4⟩]) []
       (.normal (.scalar ⟨7, 4⟩, mem)) :=
-  ⟨_, runA_sound (bdCopyBody 2) 30 _ _ _ rfl⟩
+  runA_exists_mem_sound (bdCopyBody 2) 30 _ _ _ (by kernel_rfl)
 
 /-- Anneal certifies the `count = 2` run free of UB. -/
 theorem bdCopy2_noUB : MirNoUBTree (mirCallTree (bdCopyBody 2) [.scalar ⟨7, 4⟩]) :=
-  runA_noUB (bdCopyBody 2) 30 _ _ _ rfl
+  runA_isSome_noUB (bdCopyBody 2) 30 _ (by kernel_rfl)
 
 /-- A `copy_nonoverlapping` with `count = 0` and two non-pointer operands. -/
 def bdCopyZeroScalars : MirAst.Statement :=
@@ -281,7 +327,7 @@ theorem bdCopy_translateStatement (decls : List LocalDecl) (src dst count : Oper
 /-- The fragment also has no type for the raw-pointer locals. -/
 theorem bdCopy_rejected :
     scalarTypeOf bdRawConstU32Ty = none ∧ inFragment (bdCopyBody 1) = false :=
-  ⟨rfl, by decide⟩
+  ⟨rfl, by decide +kernel⟩
 
 /-! ## 3. `BinOp::Offset` and `arith_offset` -/
 
@@ -307,7 +353,7 @@ one-past-the-end byte offset `offsetBytes = 4 = size_of::<u32>()`. -/
 theorem bdOffset1_anneal_ret :
     ∃ mem, ReachesRet (mirCallTree (bdOffsetBody 1) [.scalar ⟨7, 4⟩]) []
       (.normal (.ptr ⟨1, 4⟩ 8, mem)) :=
-  ⟨_, runA_sound (bdOffsetBody 1) 30 _ _ _ rfl⟩
+  runA_exists_mem_sound (bdOffsetBody 1) 30 _ _ _ (by kernel_rfl)
 
 /-- `k = -1` (bits `2^64 - 1`): moving `-4` bytes before the start of `_1`
 faults with UB in Anneal, matching MiniRust's `InBounds::Yes` `ptr_offset`. -/
@@ -315,7 +361,7 @@ theorem bdOffsetNeg1_anneal_ub :
     ∃ tr u,
       Reaches (mirCallTree (bdOffsetBody 18446744073709551615) [.scalar ⟨7, 4⟩]) tr u ∧
       FaultNow u :=
-  faultsA_sound (bdOffsetBody 18446744073709551615) 30 _ rfl
+  faultsA_sound (bdOffsetBody 18446744073709551615) 30 _ (by kernel_rfl)
 
 theorem bdOffsetNeg1_not_noUB :
     ¬ MirNoUBTree (mirCallTree (bdOffsetBody 18446744073709551615) [.scalar ⟨7, 4⟩]) := by
@@ -332,7 +378,7 @@ theorem bdOffset_rejected :
       (translateRvalue ⟨64, true, []⟩ [bdDecl bdRawConstU32Ty, u32Decl] none
         (.binaryOp .offset (.copy (local_ 0)) (bdConstIsize 1))).isSome = true ∧
       inFragment (bdOffsetBody 1) = false :=
-  ⟨rfl, rfl, by decide⟩
+  ⟨rfl, rfl, by decide +kernel⟩
 
 /-- MIR of `fn arith_offset_caller(p: *const u32, k: isize) -> *const u32`,
 which calls `core::intrinsics::arith_offset::<u32>(p, k)`. Anneal's
@@ -349,7 +395,7 @@ def bdArithOffsetArgs : List Value := [.ptr ⟨1, 0⟩ 8, .scalar ⟨1, 8⟩]
 theorem bdArithOffset_anneal_ret :
     ∃ mem, ReachesRet (mirCallTree bdArithOffsetCaller bdArithOffsetArgs) []
       (.normal (.ptr ⟨1, 4⟩ 8, mem)) :=
-  ⟨_, runA_sound bdArithOffsetCaller 10 _ _ _ rfl⟩
+  runA_exists_mem_sound bdArithOffsetCaller 10 _ _ _ (by kernel_rfl)
 
 /-! ## 4. Intrinsic calls without a body in `callees` -/
 
@@ -421,17 +467,19 @@ to `build::abort()` (`bb.rs:611-614`). -/
 def bdAbortCaller : CapturedMir :=
   bdCallBody "boundary::abort_caller" "core::intrinsics::abort" [] 0 [bdDecl bdNeverTy] none
 
+/-- Anneal evaluates the call form of `write_bytes` inline (`evalWriteBytesCall`): the
+destination pointer of `bdWriteBytesArgs` carries no Tree Borrows entry in the initial state, so
+its target place (and hence its alignment and validity) is unknown and the call fails closed with
+`MirStepNode.unsupported`, never reaching `minimize`'s `span_bug!`. -/
+theorem bdWriteBytes_untracked_unsupported :
+    stepMirFn bdWriteBytesCaller (initMachineState bdWriteBytesCaller bdWriteBytesArgs) =
+      MirStepNode.unsupported :=
+  rfl
+
 /-- Anneal: unmodeled intrinsics with a return target and no body in
-`Memory.callees` (`write_bytes`, `raw_eq`, `cold_path`) emit `MirStepNode.extCall`
-with `typeArgs` preserved, whereas `ctpop` and `exact_div` evaluate inline via
-`evalDirectRustIntrinsic?` and `abort` returns `MirOutcome.abort`. -/
-theorem bdWriteBytes_extCall :
-    ∃ k, stepMirFn bdWriteBytesCaller (initMachineState bdWriteBytesCaller bdWriteBytesArgs) =
-      MirStepNode.extCall
-        { defPath := "core::intrinsics::write_bytes", typeArgs := [.uint .u32],
-          args := bdWriteBytesArgs,
-          memory := (initMachineState bdWriteBytesCaller bdWriteBytesArgs).memory } k :=
-  ⟨_, rfl⟩
+`Memory.callees` (`raw_eq`, `cold_path`) emit `MirStepNode.extCall` with `typeArgs` preserved,
+whereas `ctpop` and `exact_div` evaluate inline via `evalDirectRustIntrinsic?` and `abort` returns
+`MirOutcome.abort`. -/
 
 theorem bdRawEq_extCall :
     ∃ k, stepMirFn bdRawEqCaller (initMachineState bdRawEqCaller bdRawEqArgs) =
@@ -451,12 +499,12 @@ theorem bdColdPath_extCall :
 theorem bdCtpop_anneal_ret :
     ∃ mem, ReachesRet (mirCallTree bdCtpopCaller bdCtpopArgs) []
       (.normal (.scalar ⟨4, 4⟩, mem)) :=
-  ⟨_, runA_sound bdCtpopCaller 10 _ _ _ rfl⟩
+  runA_exists_mem_sound bdCtpopCaller 10 _ _ _ (by kernel_rfl)
 
 theorem bdExactDivI32_anneal_ret :
     ∃ mem, ReachesRet (mirCallTree bdExactDivI32Caller bdExactDivArgs) []
       (.normal (.scalar ⟨4294967294, 4⟩, mem)) :=
-  ⟨_, runA_sound bdExactDivI32Caller 10 _ _ _ rfl⟩
+  runA_exists_mem_sound bdExactDivI32Caller 10 _ _ _ (by kernel_rfl)
 
 /-- Anneal: `core::intrinsics::abort` is recognized in `isAbortingPanicDefPath`
 and terminates with `MirStepNode.retOutcome .abort`, matching MiniRust's
@@ -651,38 +699,6 @@ private theorem mirHandledTree_extCall_ret {body : CapturedMir} {args : List Val
     simp [ITree.interpStep, hobsS1, ITreeF.map]
   exact ⟨_, .tau hobs1 (.refl _), hobs2⟩
 
-private theorem mirHandledTree_extCall_ub {body : CapturedMir} {args : List Value}
-    {mem : Memory} {h : ExternalCallHandler} {req : MirCallReq}
-    {kStep : MirCallAns → MirExecState} {fk : FailureKind}
-    (hstep0 : stepMirFn body (initMachineStateWithMemory body args mem) = .extCall req kStep)
-    (hreq : h req = ITree.fail (E := MirClosedEffect) fk) :
-    FaultNow (mirHandledTree body args mem h) := by
-  have hobs0 : (mirStatefulTree body args mem).observe =
-      .vis (.inr (.inr (CallReq.call req : MirCallE.I)))
-        (fun ans => ITree.cofix (stepMirState body) (kStep ans)) := by
-    rw [mirStatefulTree, mirTree, ITree.observe_cofix]
-    simp [stepMirState, hstep0, MirStepNode.extCall, ITreeF.map]
-  have hfail : ∃ (kFail : PEmpty → ITree MirClosedEffect MirCallAns),
-      (ITree.fail (E := MirClosedEffect) (R := MirCallAns) fk).observe =
-      .vis (.inl (FailReq.fail fk : (FailE FailureKind).I)) kFail := by
-    dsimp only [ITree.fail, Bind.bind, Monad.toBind, ITree.bind, ITree.triggerSub]
-    rw [ITree.observe_cofix]
-    dsimp only
-    rw [ITree.observe_vis]
-    exact ⟨_, rfl⟩
-  obtain ⟨kFail, hkFail⟩ := hfail
-  have hobsH : ∃ (kOut : PEmpty → ITree MirClosedEffect MirOutcome),
-      (mirHandledTree body args mem h).observe =
-      .vis (.inl (FailReq.fail fk : (FailE FailureKind).I)) kOut := by
-    rw [mirHandledTree, mirHandledTreeWithCallees, ITree.interp, ITree.observe_cofix]
-    dsimp only [ITree.interpStep]
-    erw [hobs0]
-    dsimp only [handleMirExternalCalls]
-    erw [hreq, hkFail]
-    exact ⟨_, rfl⟩
-  obtain ⟨kOut, hkOut⟩ := hobsH
-  exact ⟨mirHandledTree body args mem h, .inl (.fail fk), kOut, .refl _, hkOut, trivial⟩
-
 /-- `ExternalCallHandler` for `core::intrinsics::cold_path`: returns `()` with
 unchanged memory, matching `minimize`'s no-op `Terminator::Goto(target)`
 (`bb.rs:595-599`). -/
@@ -751,8 +767,8 @@ theorem bdCtpop_inline :
       (∃ mem, ReachesRet (mirCallTree bdCtpopI8Caller [.scalar ⟨255, 1⟩]) []
         (.normal (.scalar ⟨8, 4⟩, mem))) ∧
       evalUnOp (.Int .CountOnes) (.Int (-1), .Int IntType.I8) = .ok (.Int 8, .Int u32) :=
-  ⟨⟨_, runA_sound bdCtpopCaller 10 _ _ _ rfl⟩, rfl,
-   ⟨_, runA_sound bdCtpopI8Caller 10 _ _ _ rfl⟩, rfl⟩
+  ⟨runA_exists_mem_sound bdCtpopCaller 10 _ _ _ (by kernel_rfl), rfl,
+   runA_exists_mem_sound bdCtpopI8Caller 10 _ _ _ (by kernel_rfl), rfl⟩
 
 /-- Anneal's inline `evalDirectExactDiv` on `bdExactDivI32Caller` and
 `bdExactDivU32Caller` matches MiniRust's `IntBinOp::DivExact` across exact
@@ -776,11 +792,11 @@ theorem bdExactDiv_inline :
         FaultNow u) ∧
       evalBinOp (.Int .DivExact) (.Int (-2147483648), .Int i32) (.Int (-1), .Int i32) =
         .error (.ub "overflow in division") :=
-  ⟨⟨_, runA_sound bdExactDivI32Caller 10 _ _ _ rfl⟩,
-   faultsA_sound bdExactDivU32Caller 10 _ rfl,
-   faultsA_sound bdExactDivI32Caller 10 _ rfl,
+  ⟨runA_exists_mem_sound bdExactDivI32Caller 10 _ _ _ (by kernel_rfl),
+   faultsA_sound bdExactDivU32Caller 10 _ (by kernel_rfl),
+   faultsA_sound bdExactDivI32Caller 10 _ (by kernel_rfl),
    rfl,
-   faultsA_sound bdExactDivI32Caller 10 _ rfl,
+   faultsA_sound bdExactDivI32Caller 10 _ (by kernel_rfl),
    rfl⟩
 
 /-- Symbolic correspondence between `exactDivHandler it` and MiniRust's
@@ -839,18 +855,17 @@ theorem exactDivHandler_iff_minirust (it : Gen.IntType)
 
 /-! ### 4c. Completeness boundary for `write_bytes` and `ub_checks`
 
-* `core::intrinsics::write_bytes`: `stepMirFn` does **not** return
-  `MirStepNode.unsupported` directly; because `write_bytes` has a return target
-  and no body in `Memory.callees`, `stepMirFn` emits `MirStepNode.extCall`
-  (`bdWriteBytes_extCall`). Under any `ExternalCallHandler` that rejects
-  unmodeled calls with `ITree.fail FailureKind.unsupported`, `mirHandledTree`
-  faults immediately (`bdWriteBytes_unhandled_fault`), while `minimize`'s
+* `core::intrinsics::write_bytes`: `stepMirFn` evaluates the call inline
+  (`evalWriteBytesCall`); on the untracked destination pointer of
+  `bdWriteBytesArgs` it fails closed (`bdWriteBytes_untracked_unsupported`), so
+  Anneal certifies no execution of the caller
+  (`bdWriteBytes_untracked_not_noUB`), while `minimize`'s
   `translate_rs_intrinsic` (`bb.rs:429-694`) has no `sym::write_bytes` arm and
   hits `span_bug!` (`bb.rs:615`).
 * `core::intrinsics::ub_checks`: appears in two MIR forms. Inline
-  `Rvalue.nullaryOp .ubChecks` steps directly to `MirStepNode.unsupported` in
-  Anneal (`bdUbChecks_step`, `bdUbChecks_not_noUB`) and is rejected by
-  `translateRvalue` (`bdNullaryOp_translateRvalue`). An unlowered
+  `Rvalue.nullaryOp .ubChecks` evaluates to `true` in Anneal
+  (`bdNullaryOp_ubChecks_contractChecks`, `bdUbChecks_anneal_ret`) and is
+  rejected by `translateRvalue` (`bdNullaryOp_translateRvalue`). An unlowered
   `TerminatorKind.call` to `core::intrinsics::ub_checks` instead emits
   `MirStepNode.extCall` (`bdUbChecksCall_extCall`), and `ubChecksHandler flag`
   supplies the session-configured `bool` matching `minimize`'s
@@ -858,15 +873,14 @@ theorem exactDivHandler_iff_minirust (it : Gen.IntType)
   `bdUbChecksCall_handled`).
 -/
 
-/-- Without a handler for `core::intrinsics::write_bytes`, interpreting
-`bdWriteBytesCaller` under an `unsupported`-defaulting `ExternalCallHandler`
-faults immediately (`FaultNow`), and `progInFragment` rejects the caller
-(`bdExtCallers_rejected`). -/
-theorem bdWriteBytes_unhandled_fault :
-    FaultNow
-      (mirHandledTree bdWriteBytesCaller bdWriteBytesArgs emptyMemory
-        (fun _ => ITree.fail FailureKind.unsupported)) :=
-  mirHandledTree_extCall_ub rfl rfl
+/-- Anneal certifies no execution of `bdWriteBytesCaller` on `bdWriteBytesArgs`: its first step
+fails closed (`bdWriteBytes_untracked_unsupported`), independently of any external-call handler,
+and `progInFragment` rejects the caller (`bdExtCallers_rejected`). -/
+theorem bdWriteBytes_untracked_not_noUB :
+    ¬ MirNoUBTree (mirCallTree bdWriteBytesCaller bdWriteBytesArgs) := by
+  obtain ⟨tr, u, hr, hf⟩ :=
+    faultsA_sound bdWriteBytesCaller 1 (initMachineState bdWriteBytesCaller bdWriteBytesArgs) (by kernel_rfl)
+  exact fun hsafe => hsafe tr u hr hf
 
 /-- `fn ub_checks_call_caller() -> bool`, calling `core::intrinsics::ub_checks`
 as an unlowered `TerminatorKind.call` (`bb.rs:607-610`). -/
@@ -880,7 +894,7 @@ assertions in Anneal. -/
 theorem bdUbChecksCall_anneal_ret :
     ∃ mem, ReachesRet (mirCallTree bdUbChecksCallCaller []) []
       (.normal (.scalar ⟨1, 1⟩, mem)) :=
-  ⟨_, runA_sound bdUbChecksCallCaller 10 _ _ _ rfl⟩
+  runA_exists_mem_sound bdUbChecksCallCaller 10 _ _ _ (by kernel_rfl)
 
 /-- Session-parameterized `ExternalCallHandler` for external calls to
 `core::intrinsics::ub_checks`: returns `flag` as a 1-byte scalar (`0` or `1`)
@@ -922,7 +936,7 @@ theorem bdUnreach_anneal_ub :
 
 theorem bdUnreach_anneal_fault :
     ∃ tr u, Reaches (mirCallTree bdUnreachCaller []) tr u ∧ FaultNow u :=
-  faultsA_sound bdUnreachCaller 1 _ rfl
+  faultsA_sound bdUnreachCaller 1 _ (by kernel_rfl)
 
 /-- MiniRust's `Terminator::Unreachable` raises UB in every machine
 (`Interp.evalTerminator`). -/
@@ -931,7 +945,7 @@ theorem bd_minirust_unreachable_ub (m : Mach) :
 
 theorem bdUnreach_rejected :
     progInFragment bdUnreachCaller [] = false ∧ translateProg bdUnreachCaller [] = none :=
-  ⟨by decide, rfl⟩
+  ⟨by decide +kernel, rfl⟩
 
 /-- The fragment does cover MIR's own `TerminatorKind::Unreachable`, which
 translates to MiniRust's `Terminator::Unreachable`. -/
@@ -959,7 +973,7 @@ theorem bdPolymorphicCallee_rejected :
           [u32Decl, u32Decl] (fbAbi [u32Layout] u32Layout))
         [fbBlackBoxCallee] = false ∧
       progInFragment fbBlackBoxCaller [{ fbBlackBoxCallee with typeParamCount := 1 }] = false :=
-  ⟨rfl, rfl, rfl, rfl, by decide, by decide⟩
+  ⟨rfl, rfl, rfl, rfl, by decide +kernel, by decide +kernel⟩
 
 /-- Runtime fail-closed execution for polymorphic callee mismatches in Anneal's
 `stepMirFn`:
@@ -1029,7 +1043,7 @@ theorem bdUnmonoParamAliasBody_failClosed :
       stepMirFn (bdUnmonoCastBody (.alias "T::Item" []))
         (initMachineState (bdUnmonoCastBody (.alias "T::Item" [])) [.scalar ⟨7, 4⟩]) =
         MirStepNode.unsupported :=
-  ⟨by decide, rfl, rfl, by decide, rfl, rfl⟩
+  ⟨by decide +kernel, rfl, rfl, by decide +kernel, rfl, rfl⟩
 
 /-! ## 7. Lowered `LIntrinsicOp` / `LCallTarget` boundary correspondence (`DeinitBridge`) -/
 
@@ -1397,7 +1411,7 @@ theorem evalLIntrinsic_abort_minirust_correspondence
       Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01 "core::intrinsics::abort" =
         some .abort ∧
       isAbortingPanicDefPath "core::intrinsics::abort" = true := by
-  refine ⟨rfl, ?_, fun t => ?_, rfl, by decide⟩
+  refine ⟨rfl, ?_, fun t => ?_, rfl, by decide +kernel⟩
   · simp only [Anneal.Mir.AdtAndControl.evalLoweredIntrinsicCall]
     cases Anneal.Mir.AdtAndControl.unwindActionOk body inCleanup unwind <;> rfl
   · simp only [Anneal.Mir.AdtAndControl.evalLoweredIntrinsicCall]
@@ -1424,7 +1438,7 @@ theorem evalLIntrinsic_unreachable_minirust_correspondence
         some .unreachableUnchecked ∧
       isUnreachableCallTarget "core::hint::unreachable_unchecked" = true ∧
       isUnreachableCallTarget "core::intrinsics::unreachable" = true :=
-  ⟨rfl, rfl, rfl, rfl, by decide, by decide⟩
+  ⟨rfl, rfl, rfl, rfl, by decide +kernel, by decide +kernel⟩
 
 /-- **`ctlz_nonzero` / `cttz_nonzero` against MiniRust's `IntrinsicOp::Assume`
 (`evalLIntrinsic_nonzero_minirust_assume`)**: across every integer width (`GoodSize`) and valid
@@ -1602,7 +1616,7 @@ theorem leValue_lt : ∀ (xs : List UInt8), Interp.leValue xs < 256 ^ xs.length
 
 private theorem uint8_ofNat_mod_256 (u : Nat) : (UInt8.ofNat (u % 256)).toNat = u % 256 := by
   rw [UInt8.toNat_ofNat']
-  exact Nat.mod_eq_of_lt (Nat.mod_lt u (by decide))
+  exact Nat.mod_eq_of_lt (Nat.mod_lt u (by decide +kernel))
 
 /-- `Interp.leBytes (Interp.leValue xs) xs.length = xs` for every byte list `xs`. -/
 theorem leBytes_leValue : ∀ (xs : List UInt8), Interp.leBytes (Interp.leValue xs) xs.length = xs
@@ -2029,8 +2043,8 @@ theorem evalLIntrinsic_saturating_valOf_minirust
     have hp : (2 : Int) ^ (8 * it.size.bytes) = ((2 ^ (8 * it.size.bytes) : Nat) : Int) := by
       push_cast; rfl
     have hHalfLt : 2 ^ (8 * it.size.bytes - 1) < 2 ^ (8 * it.size.bytes) :=
-      Nat.pow_lt_pow_right (by decide) (by omega)
-    have hPowPos : 0 < 2 ^ (8 * it.size.bytes) := Nat.pow_pos (by decide)
+      Nat.pow_lt_pow_right (by decide +kernel) (by omega)
+    have hPowPos : 0 < 2 ^ (8 * it.size.bytes) := Nat.pow_pos (by decide +kernel)
     cases hRep : IntType.can_represent it
         (intCheckedArith (if isSub then .Sub else .Add) (intFromBits x it) (intFromBits y it))
     · simp only [ValidBits, Bool.false_eq_true, ↓reduceIte]
@@ -2049,8 +2063,8 @@ theorem evalLIntrinsic_saturating_valOf_minirust
     rcases it with ⟨s, ⟨sz⟩⟩
     dsimp only [valOf, intTypeMinVal, intTypeMaxVal] at hgood hx hy ⊢
     congr 1
-    have hBitsPos : 0 < 8 * sz := Nat.mul_pos (by decide) hgood.pos
-    have hHalfPos : 0 < 2 ^ (8 * sz - 1) := Nat.pow_pos (by decide)
+    have hBitsPos : 0 < 8 * sz := Nat.mul_pos (by decide +kernel) hgood.pos
+    have hHalfPos : 0 < 2 ^ (8 * sz - 1) := Nat.pow_pos (by decide +kernel)
     have hTwoHalfNat : 2 ^ (8 * sz) = 2 * 2 ^ (8 * sz - 1) := by
       obtain ⟨m, hm⟩ : ∃ m, 8 * sz = m + 1 := ⟨8 * sz - 1, by omega⟩
       rw [hm, Nat.add_sub_cancel, Nat.pow_succ, Nat.mul_comm]
@@ -2252,7 +2266,7 @@ theorem evalLIntrinsic_sizeOfVal_alignOfVal_minirust_layout
     | int i => cases i <;> cases hrk <;> exact ⟨rfl, rfl, rfl⟩
     | _ => simp [intTyBytes] at hrk
   obtain ⟨hMrAlign, hSzRk, hAlRk⟩ := hProps
-  have hHalf8 : signedHalfModulus 8 = 2 ^ 63 := by decide
+  have hHalf8 : signedHalfModulus 8 = 2 ^ 63 := by decide +kernel
   have hSlice : evalSliceSizeOfVal it.size.bytes ⟨len, 8⟩ =
       if len * it.size.bytes < 2 ^ 63 then some ⟨len * it.size.bytes, 8⟩ else none := by
     unfold evalSliceSizeOfVal
@@ -2320,9 +2334,14 @@ theorem evalLIntrinsic_sizeOfVal_alignOfVal_minirust_layout
   bb)`!);
 - canonical `V2026_06_01` unwinding panic entry points (`core::panicking::panic`, `panic_fmt`,
   `assert_failed`) lower to `.panicUnwind`.
-The statement itself mentions no MiniRust term: MiniRust's executable spec has no unwinding, and
-`minirust_unwind_terminators_unsupported` (Section 10) pins that fail-closed boundary, so the
-semantic counterpart of `panicUnwind` is `Trusted`'s `startPanic` / `applyUnwindAction` only. -/
+The statement itself mentions no MiniRust term: MiniRust has no `IntrinsicOp`
+for an unwinding panic. It models unwinding with the terminators `StartUnwind`
+/ `StopUnwind` / `ResumeUnwind`, which both `Interp.evalTerminator` (`Mach`)
+and `Interp.evalTerminatorM` (`MachTB`) execute
+(`minirust_unwind_terminators_supported`, `minirust_unwind_concrete_witnesses`,
+Section 10). No simulation between those terminators and `panicUnwind` is
+proved in this module, so the only semantic counterpart established here is
+`Trusted`'s `startPanic` / `applyUnwindAction`. -/
 theorem evalLIntrinsic_panicUnwind_minirust_correspondence
     (env : Anneal.Mir.AdtAndControl.CfgEnv) (body : Anneal.Mir.AdtAndControl.LBody)
     (bb : Nat) (inCleanup : Bool) (args : List Operand) (avs : List Value)
@@ -2339,7 +2358,7 @@ theorem evalLIntrinsic_panicUnwind_minirust_correspondence
       some .panicUnwind ∧
     Anneal.Mir.AdtAndControl.lowerIntrinsicKind_V2026_06_01 "core::panicking::assert_failed" =
       some .panicUnwind := by
-  refine ⟨rfl, fun _ => ?_, by decide, by decide, by decide⟩
+  refine ⟨rfl, fun _ => ?_, by decide +kernel, by decide +kernel, by decide +kernel⟩
   simp only [Anneal.Mir.AdtAndControl.evalLoweredIntrinsicCall]
 
 /-- **Extended negative controls (`minirust_bitops_char_and_layout_negative_controls`)**:
@@ -2385,20 +2404,2834 @@ section AdvEp2B4
 
 set_option autoImplicit false
 
-/-- **MiniRust's executable spec has no unwinding (`minirust_unwind_terminators_unsupported`)**:
-`Interp.evalTerminator` stops with `.unsupported` on every `StartUnwind`, `StopUnwind`, and
-`ResumeUnwind` terminator, for every machine, payload, and target block. Anneal's lowered
-`panicUnwind` (routed to `startPanic` by `evalLIntrinsic_panicUnwind_minirust_correspondence`)
-and its cleanup / `UnwindResume` / `unwindLCallStack` machinery therefore have no executable
-MiniRust counterpart; their correspondence is with `Trusted`'s `startPanic` /
-`applyUnwindAction` / `unwindFromCallStack` only, while `abort` (`IntrinsicOp::Abort`) and
-`unreachable_unchecked` (`Terminator::Unreachable`) do have MiniRust counterparts (Section 8c). -/
-theorem minirust_unwind_terminators_unsupported (m : Mach) (payload : Gen.ValueExpr)
-    (blk : Gen.BbName) :
-    (∃ what, Interp.evalTerminator m (.StartUnwind payload blk) = .error (.unsupported what)) ∧
-      (∃ what, Interp.evalTerminator m (.StopUnwind blk) = .error (.unsupported what)) ∧
-      (∃ what, Interp.evalTerminator m .ResumeUnwind = .error (.unsupported what)) :=
-  ⟨⟨_, rfl⟩, ⟨_, rfl⟩, ⟨_, rfl⟩⟩
+/-- `Machine::mutate_active_thread` on a machine whose active thread is `t`:
+the closure runs on `t` and its result replaces `t` in the thread list. -/
+private theorem mutateActiveThread_eq {α : Type} {m : Mach} {t : Gen.Thread BM}
+    (f : Gen.Thread BM → Interp (α × Gen.Thread BM))
+    (ht : Interp.activeThread m = .ok t) :
+    Interp.mutateActiveThread m f =
+      (f t >>= fun r =>
+        pure (r.1, { m with threads := m.threads.set m.active_thread.toNat r.2 })) := by
+  obtain ⟨hge, hget⟩ := listIndex_ok_get ht
+  have hlt : m.active_thread.toNat < m.threads.length :=
+    (List.getElem?_eq_some_iff.mp hget).1
+  unfold Interp.mutateActiveThread
+  rw [ht]
+  simp only [ok_bind]
+  cases f t with
+  | error e => rfl
+  | ok r =>
+    obtain ⟨out, t'⟩ := r
+    simp [listSet, hge, hlt]
+
+/-- Replacing the active thread makes the replacement the active thread. -/
+private theorem activeThread_set {m : Mach} {t : Gen.Thread BM} (t' : Gen.Thread BM)
+    (ht : Interp.activeThread m = .ok t) :
+    Interp.activeThread { m with threads := m.threads.set m.active_thread.toNat t' } =
+      .ok t' := by
+  obtain ⟨hge, hget⟩ := listIndex_ok_get ht
+  exact listIndex_set_self t' hge hget _
+
+/-- `Machine::jump_to_block` on a machine whose active thread is `t` with top
+frame `fr`: only the program counter of `fr` changes, and every non-active
+thread in `m.threads` is preserved. -/
+private theorem jumpToBlock_activeThread {m : Mach} {t : Gen.Thread BM} {fr : Frame}
+    (b : Gen.BbName) (ht : Interp.activeThread m = .ok t)
+    (hfr : t.stack.getLast? = some fr) :
+    ∃ m', Interp.jumpToBlock m b = .ok m' ∧
+      Interp.activeThread m' = .ok
+        { t with stack := t.stack.dropLast ++ [{ fr with next_block := b, next_stmt := 0 }] } ∧
+      m'.mem = m.mem ∧
+      m'.threads.length = m.threads.length ∧
+      (∀ i, i ≠ m.active_thread.toNat → m'.threads[i]? = m.threads[i]?) := by
+  obtain ⟨hge, hget⟩ := listIndex_ok_get ht
+  have hlt : m.active_thread.toNat < m.threads.length :=
+    (List.getElem?_eq_some_iff.mp hget).1
+  refine ⟨_, ?_, activeThread_set _ ht, rfl, List.length_set,
+    fun i hne => List.getElem?_set_ne (Ne.symm hne)⟩
+  unfold Interp.jumpToBlock Interp.mutateCurFrame
+  rw [ht]
+  simp [hfr, listSet, hge, hlt]
+
+/-- `Machine::jump_to_block` fails with `specPanic` when the active thread's
+stack is empty. -/
+private theorem jumpToBlock_empty_stack {m : Mach} {t : Gen.Thread BM}
+    (b : Gen.BbName) (ht : Interp.activeThread m = .ok t) (hemp : t.stack = []) :
+    Interp.jumpToBlock m b =
+      .error (.specPanic "`try_mutate_cur_frame` called on empty stack!") := by
+  unfold Interp.jumpToBlock Interp.mutateCurFrame
+  rw [ht]
+  simp [hemp, specPanic]
+
+/-- `StackFrame::storage_dead` changes only the `locals` of the frame. -/
+private theorem storageDead_stack_pop_action {fr fr' : Frame}
+    {cm cm' : Gen.ConcurrentMemory BM} {l : Gen.LocalName}
+    (h : Interp.storageDead fr cm l = .ok (fr', cm')) :
+    fr'.stack_pop_action = fr.stack_pop_action := by
+  unfold Interp.storageDead at h
+  obtain ⟨_, _, h⟩ := interpBind_ok h
+  obtain ⟨_, _, h⟩ := interpBind_ok h
+  obtain ⟨_, _, h⟩ := interpBind_ok h
+  obtain ⟨_, _, h⟩ := interpBind_ok h
+  dsimp only at h
+  split at h
+  · obtain ⟨_, _, h⟩ := interpBind_ok h
+    cases h
+    rfl
+  · cases h
+    rfl
+
+/-- The teardown loop of `Terminator::Return` and `Terminator::ResumeUnwind`
+changes only the `locals` of the frame. -/
+private theorem deallocAll_stack_pop_action :
+    ∀ (fuel : Nat) {fr fr' : Frame} {cm cm' : Gen.ConcurrentMemory BM},
+      Interp.deallocAll fuel fr cm = .ok (fr', cm') →
+      fr'.stack_pop_action = fr.stack_pop_action
+  | 0, fr, _, _, _, h => by
+    unfold Interp.deallocAll at h
+    rcases hent : fr.locals.entries with _ | ⟨⟨_, _⟩, _⟩ <;> simp only [hent] at h
+    · cases h
+      rfl
+    · cases h
+  | fuel + 1, fr, _, _, _, h => by
+    unfold Interp.deallocAll at h
+    rcases hent : fr.locals.entries with _ | ⟨⟨local_, _⟩, _⟩ <;> simp only [hent] at h
+    · cases h
+      rfl
+    · obtain ⟨⟨fr1, cm1⟩, hsd, h⟩ := interpBind_ok h
+      exact (deallocAll_stack_pop_action fuel h).trans (storageDead_stack_pop_action hsd)
+
+/-- Polymorphic `Machine::mutate_active_thread` on a machine whose active
+thread is `t`: the closure runs on `t` and replaces `t` in the thread list. -/
+private theorem mutateActiveThreadM_eq {M : Type} [Gen.Memory M] {α : Type}
+    {m : Gen.Machine M} {t : Gen.Thread M}
+    (f : Gen.Thread M → Interp (α × Gen.Thread M))
+    (ht : Interp.activeThreadM m = .ok t) :
+    Interp.mutateActiveThreadM m f =
+      (f t >>= fun r =>
+        pure (r.1, { m with threads := m.threads.set m.active_thread.toNat r.2 })) := by
+  obtain ⟨hge, hget⟩ := listIndex_ok_get ht
+  have hlt : m.active_thread.toNat < m.threads.length :=
+    (List.getElem?_eq_some_iff.mp hget).1
+  unfold Interp.mutateActiveThreadM
+  rw [ht]
+  simp only [ok_bind]
+  cases f t with
+  | error e => rfl
+  | ok r =>
+    obtain ⟨out, t'⟩ := r
+    simp [listSet, hge, hlt]
+
+/-- Replacing the active thread makes the replacement the active thread
+(polymorphic `Machine M`). -/
+private theorem activeThreadM_set {M : Type} [Gen.Memory M]
+    {m : Gen.Machine M} {t : Gen.Thread M} (t' : Gen.Thread M)
+    (ht : Interp.activeThreadM m = .ok t) :
+    Interp.activeThreadM { m with threads := m.threads.set m.active_thread.toNat t' } =
+      .ok t' := by
+  obtain ⟨hge, hget⟩ := listIndex_ok_get ht
+  exact listIndex_set_self t' hge hget _
+
+/-- Polymorphic `Machine::jump_to_block` on a machine whose active thread is `t`
+with top frame `fr`: only the program counter of `fr` changes, and every
+non-active thread in `m.threads` is preserved. -/
+private theorem jumpToBlockM_activeThread {M : Type} [Gen.Memory M]
+    {m : Gen.Machine M} {t : Gen.Thread M} {fr : Gen.StackFrame M}
+    (b : Gen.BbName) (ht : Interp.activeThreadM m = .ok t)
+    (hfr : t.stack.getLast? = some fr) :
+    ∃ m', Interp.jumpToBlockM m b = .ok m' ∧
+      Interp.activeThreadM m' = .ok
+        { t with stack := t.stack.dropLast ++ [{ fr with next_block := b, next_stmt := 0 }] } ∧
+      m'.mem = m.mem ∧
+      m'.threads.length = m.threads.length ∧
+      (∀ i, i ≠ m.active_thread.toNat → m'.threads[i]? = m.threads[i]?) := by
+  obtain ⟨hge, hget⟩ := listIndex_ok_get ht
+  have hlt : m.active_thread.toNat < m.threads.length :=
+    (List.getElem?_eq_some_iff.mp hget).1
+  refine ⟨_, ?_, activeThreadM_set _ ht, rfl, List.length_set,
+    fun i hne => List.getElem?_set_ne (Ne.symm hne)⟩
+  unfold Interp.jumpToBlockM Interp.mutateCurFrameM
+  rw [ht]
+  simp [hfr, listSet, hge, hlt]
+
+/-- Polymorphic `Machine::jump_to_block` fails with `specPanic` when the active
+thread's stack is empty. -/
+private theorem jumpToBlockM_empty_stack {M : Type} [Gen.Memory M]
+    {m : Gen.Machine M} {t : Gen.Thread M}
+    (b : Gen.BbName) (ht : Interp.activeThreadM m = .ok t) (hemp : t.stack = []) :
+    Interp.jumpToBlockM m b =
+      .error (.specPanic "`try_mutate_cur_frame` called on empty stack!") := by
+  unfold Interp.jumpToBlockM Interp.mutateCurFrameM
+  rw [ht]
+  simp [hemp, specPanic]
+
+/-- Polymorphic `StackFrame::storage_dead` preserves `stack_pop_action` and
+`extra`. -/
+private theorem storageDeadM_preserves {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    {fr fr' : Gen.StackFrame M} {cm cm' : Gen.ConcurrentMemory M} {l : Gen.LocalName}
+    (h : Interp.storageDeadM fr cm l = .ok (fr', cm')) :
+    fr'.stack_pop_action = fr.stack_pop_action ∧ fr'.extra = fr.extra := by
+  unfold Interp.storageDeadM at h
+  obtain ⟨_, _, h⟩ := interpBind_ok h
+  obtain ⟨_, _, h⟩ := interpBind_ok h
+  obtain ⟨_, _, h⟩ := interpBind_ok h
+  obtain ⟨_, _, h⟩ := interpBind_ok h
+  dsimp only at h
+  split at h
+  · obtain ⟨_, _, h⟩ := interpBind_ok h
+    cases h
+    exact ⟨rfl, rfl⟩
+  · cases h
+    exact ⟨rfl, rfl⟩
+
+/-- Polymorphic `deallocAllM` preserves `stack_pop_action` and `extra`. -/
+private theorem deallocAllM_preserves {M : Type} [Gen.Memory M] [Interp.MemoryOps M] :
+    ∀ (fuel : Nat) {fr fr' : Gen.StackFrame M} {cm cm' : Gen.ConcurrentMemory M},
+      Interp.deallocAllM fuel fr cm = .ok (fr', cm') →
+      fr'.stack_pop_action = fr.stack_pop_action ∧ fr'.extra = fr.extra
+  | 0, fr, _, _, _, h => by
+    unfold Interp.deallocAllM at h
+    rcases hent : fr.locals.entries with _ | ⟨⟨_, _⟩, _⟩ <;> simp only [hent] at h
+    · cases h
+      exact ⟨rfl, rfl⟩
+    · cases h
+  | fuel + 1, fr, _, _, _, h => by
+    unfold Interp.deallocAllM at h
+    rcases hent : fr.locals.entries with _ | ⟨⟨local_, _⟩, _⟩ <;> simp only [hent] at h
+    · cases h
+      exact ⟨rfl, rfl⟩
+    · obtain ⟨⟨fr1, cm1⟩, hsd, h⟩ := interpBind_ok h
+      obtain ⟨hspa1, hext1⟩ := storageDeadM_preserves hsd
+      obtain ⟨hspa2, hext2⟩ := deallocAllM_preserves fuel h
+      exact ⟨hspa2.trans hspa1, hext2.trans hext1⟩
+
+/-- **MiniRust's executable spec runs the unwinding terminators on both `Mach`
+and polymorphic `Machine M` (`MachTB`)
+(`minirust_unwind_terminators_supported`)**:
+for every target block `blk`, both `Interp.evalTerminator` (`Mach`) and
+`Interp.evalTerminatorM` (`Machine M`, instantiating `MachTB`) execute
+`StartUnwind`, `StopUnwind`, and `ResumeUnwind` faithfully instead of stopping
+with `.unsupported`:
+- `StartUnwind` propagates any `evalValue` / `evalValueM` error unchanged; on a
+  thin raw pointer payload it appends `p.thin_pointer` at the back of the
+  active thread's `unwind_payloads` and jumps to `blk` without touching memory,
+  while any other `(val, ty)` pair (wide raw pointers, safe references, boxes,
+  fn pointers, integers, Booleans, etc.) raises `specPanic`;
+- `StopUnwind` raises UB on an empty payload stack, and otherwise pops the back
+  payload (LIFO) and jumps to `blk`;
+- `ResumeUnwind` raises `specPanic "stack.pop().unwrap()"` on an empty call
+  stack; otherwise it pops the top frame, runs `deallocAll` / `deallocAllM`,
+  and on `Machine M` runs `ConcurrentMemory.end_call cm fr.extra` before
+  inspecting `stack_pop_action` (so any `end_call` failure preempts both
+  `BottomOfStack` and missing `unwind_block`), then raises UB on
+  `BottomOfStack` or `unwind_block = none`, raises `specPanic` if
+  `BackToCaller _ (some ubBlk) _` has no caller frame left after popping, and
+  otherwise leaves `unwind_payloads` intact and jumps to `unwind_block` in the
+  caller frame. Every successful unwinding terminator leaves all non-active
+  threads untouched.
+
+Concrete non-vacuous witnesses discharging every branch on both `Mach` and
+`MachTB` (including live-local teardown and Tree Borrows protector release) are
+in `minirust_unwind_concrete_witnesses`. Anneal's lowered `panicUnwind` (routed
+to `startPanic` by `evalLIntrinsic_panicUnwind_minirust_correspondence`) has no
+single `IntrinsicOp` counterpart; no simulation between these terminators and
+`Trusted`'s `startPanic` / `applyUnwindAction` is proved in this module. -/
+theorem minirust_unwind_terminators_supported (m : Mach) (blk : Gen.BbName) :
+    ((∀ (payload : Gen.ValueExpr) (p : Gen.Pointer Prov) (m1 : Mach) (t : Gen.Thread BM)
+        (fr : Frame),
+      Interp.evalValue m payload = .ok ((.Ptr p, .Ptr (.Raw .None)), m1) →
+      Interp.activeThread m1 = .ok t → t.stack.getLast? = some fr →
+      ∃ m', Interp.evalTerminator m (.StartUnwind payload blk) = .ok m' ∧
+        Interp.activeThread m' = .ok
+          { stack := t.stack.dropLast ++ [{ fr with next_block := blk, next_stmt := 0 }],
+            state := t.state,
+            unwind_payloads := t.unwind_payloads ++ [p.thin_pointer] } ∧
+        m'.mem = m1.mem ∧
+        m'.threads.length = m1.threads.length ∧
+        (∀ i, i ≠ m1.active_thread.toNat → m'.threads[i]? = m1.threads[i]?)) ∧
+    (∀ (payload : Gen.ValueExpr) (v : Val) (ty : Gen.Type) (m1 : Mach),
+      (¬ ∃ p, v = .Ptr p ∧ ty = .Ptr (.Raw .None)) →
+      Interp.evalValue m payload = .ok ((v, ty), m1) →
+      Interp.evalTerminator m (.StartUnwind payload blk) =
+        .error (.specPanic "StartUnwind: the unwind payload is not a raw pointer")) ∧
+    (∀ (payload : Gen.ValueExpr) (e : Interp.Stop),
+      Interp.evalValue m payload = .error e →
+      Interp.evalTerminator m (.StartUnwind payload blk) = .error e) ∧
+    (∀ (t : Gen.Thread BM),
+      Interp.activeThread m = .ok t → t.unwind_payloads = [] →
+      Interp.evalTerminator m (.StopUnwind blk) =
+        .error (.ub "StopUnwind: the payload stack is empty")) ∧
+    (∀ (t : Gen.Thread BM) (ps : List Ptr) (q : Ptr) (fr : Frame),
+      Interp.activeThread m = .ok t → t.unwind_payloads = ps ++ [q] →
+      t.stack.getLast? = some fr →
+      ∃ m', Interp.evalTerminator m (.StopUnwind blk) = .ok m' ∧
+        Interp.activeThread m' = .ok
+          { stack := t.stack.dropLast ++ [{ fr with next_block := blk, next_stmt := 0 }],
+            state := t.state,
+            unwind_payloads := ps } ∧
+        m'.mem = m.mem ∧
+        m'.threads.length = m.threads.length ∧
+        (∀ i, i ≠ m.active_thread.toNat → m'.threads[i]? = m.threads[i]?)) ∧
+    (∀ (t : Gen.Thread BM),
+      Interp.activeThread m = .ok t → t.stack = [] →
+      Interp.evalTerminator m .ResumeUnwind =
+        .error (.specPanic "stack.pop().unwrap()")) ∧
+    (∀ (t : Gen.Thread BM) (fr fr' : Frame) (cm : Gen.ConcurrentMemory BM),
+      Interp.activeThread m = .ok t → t.stack.getLast? = some fr →
+      Interp.deallocAll fr.locals.entries.length fr m.mem = .ok (fr', cm) →
+      (fr.stack_pop_action = .BottomOfStack →
+        Interp.evalTerminator m .ResumeUnwind =
+          .error (.ub "the function at the bottom of the stack must not unwind")) ∧
+      (∀ nextBlock retPtr, fr.stack_pop_action = .BackToCaller nextBlock none retPtr →
+        Interp.evalTerminator m .ResumeUnwind =
+          .error (.ub
+            "unwinding from a function where the caller did not specify an unwind_block")) ∧
+      (∀ nextBlock unwindBlock retPtr,
+        fr.stack_pop_action = .BackToCaller nextBlock (some unwindBlock) retPtr →
+        t.stack.dropLast = [] →
+        Interp.evalTerminator m .ResumeUnwind =
+          .error (.specPanic "`try_mutate_cur_frame` called on empty stack!")) ∧
+      (∀ nextBlock unwindBlock retPtr (caller : Frame),
+        fr.stack_pop_action = .BackToCaller nextBlock (some unwindBlock) retPtr →
+        t.stack.dropLast.getLast? = some caller →
+        ∃ m', Interp.evalTerminator m .ResumeUnwind = .ok m' ∧
+          Interp.activeThread m' = .ok
+            { stack := t.stack.dropLast.dropLast ++
+                [{ caller with next_block := unwindBlock, next_stmt := 0 }],
+              state := t.state,
+              unwind_payloads := t.unwind_payloads } ∧
+          m'.mem = cm ∧
+          m'.threads.length = m.threads.length ∧
+          (∀ i, i ≠ m.active_thread.toNat → m'.threads[i]? = m.threads[i]?)))) ∧
+    (∀ {M : Type} [Gen.Memory M] [Interp.MemoryOps M] (mM : Gen.Machine M),
+      (∀ (payload : Gen.ValueExpr) (p : Gen.Pointer (Gen.Memory.Provenance M))
+          (m1 : Gen.Machine M) (t : Gen.Thread M) (fr : Gen.StackFrame M),
+        Interp.evalValueM mM payload = .ok ((.Ptr p, .Ptr (.Raw .None)), m1) →
+        Interp.activeThreadM m1 = .ok t → t.stack.getLast? = some fr →
+        ∃ m', Interp.evalTerminatorM mM (.StartUnwind payload blk) = .ok m' ∧
+          Interp.activeThreadM m' = .ok
+            { stack := t.stack.dropLast ++ [{ fr with next_block := blk, next_stmt := 0 }],
+              state := t.state,
+              unwind_payloads := t.unwind_payloads ++ [p.thin_pointer] } ∧
+          m'.mem = m1.mem ∧
+          m'.threads.length = m1.threads.length ∧
+          (∀ i, i ≠ m1.active_thread.toNat → m'.threads[i]? = m1.threads[i]?)) ∧
+      (∀ (payload : Gen.ValueExpr) (v : Gen.Value M) (ty : Gen.Type) (m1 : Gen.Machine M),
+        (¬ ∃ p, v = .Ptr p ∧ ty = .Ptr (.Raw .None)) →
+        Interp.evalValueM mM payload = .ok ((v, ty), m1) →
+        Interp.evalTerminatorM mM (.StartUnwind payload blk) =
+          .error (.specPanic "StartUnwind: the unwind payload is not a raw pointer")) ∧
+      (∀ (payload : Gen.ValueExpr) (e : Interp.Stop),
+        Interp.evalValueM mM payload = .error e →
+        Interp.evalTerminatorM mM (.StartUnwind payload blk) = .error e) ∧
+      (∀ (t : Gen.Thread M),
+        Interp.activeThreadM mM = .ok t → t.unwind_payloads = [] →
+        Interp.evalTerminatorM mM (.StopUnwind blk) =
+          .error (.ub "StopUnwind: the payload stack is empty")) ∧
+      (∀ (t : Gen.Thread M) (ps : List (Gen.ThinPointer (Gen.Memory.Provenance M)))
+          (q : Gen.ThinPointer (Gen.Memory.Provenance M)) (fr : Gen.StackFrame M),
+        Interp.activeThreadM mM = .ok t → t.unwind_payloads = ps ++ [q] →
+        t.stack.getLast? = some fr →
+        ∃ m', Interp.evalTerminatorM mM (.StopUnwind blk) = .ok m' ∧
+          Interp.activeThreadM m' = .ok
+            { stack := t.stack.dropLast ++ [{ fr with next_block := blk, next_stmt := 0 }],
+              state := t.state,
+              unwind_payloads := ps } ∧
+          m'.mem = mM.mem ∧
+          m'.threads.length = mM.threads.length ∧
+          (∀ i, i ≠ mM.active_thread.toNat → m'.threads[i]? = mM.threads[i]?)) ∧
+      (∀ (t : Gen.Thread M),
+        Interp.activeThreadM mM = .ok t → t.stack = [] →
+        Interp.evalTerminatorM mM .ResumeUnwind =
+          .error (.specPanic "stack.pop().unwrap()")) ∧
+      (∀ (t : Gen.Thread M) (fr fr' : Gen.StackFrame M) (cm1 : Gen.ConcurrentMemory M),
+        Interp.activeThreadM mM = .ok t → t.stack.getLast? = some fr →
+        Interp.deallocAllM fr.locals.entries.length fr mM.mem = .ok (fr', cm1) →
+        (∀ e, Interp.ConcurrentMemory.end_call cm1 fr.extra = .error e →
+          Interp.evalTerminatorM mM .ResumeUnwind = .error e) ∧
+        (∀ cm2, Interp.ConcurrentMemory.end_call cm1 fr.extra = .ok cm2 →
+          (fr.stack_pop_action = .BottomOfStack →
+            Interp.evalTerminatorM mM .ResumeUnwind =
+              .error (.ub "the function at the bottom of the stack must not unwind")) ∧
+          (∀ nextBlock retPtr, fr.stack_pop_action = .BackToCaller nextBlock none retPtr →
+            Interp.evalTerminatorM mM .ResumeUnwind =
+              .error (.ub
+                "unwinding from a function where the caller did not specify an unwind_block")) ∧
+          (∀ nextBlock unwindBlock retPtr,
+            fr.stack_pop_action = .BackToCaller nextBlock (some unwindBlock) retPtr →
+            t.stack.dropLast = [] →
+            Interp.evalTerminatorM mM .ResumeUnwind =
+              .error (.specPanic "`try_mutate_cur_frame` called on empty stack!")) ∧
+          (∀ nextBlock unwindBlock retPtr (caller : Gen.StackFrame M),
+            fr.stack_pop_action = .BackToCaller nextBlock (some unwindBlock) retPtr →
+            t.stack.dropLast.getLast? = some caller →
+            ∃ m', Interp.evalTerminatorM mM .ResumeUnwind = .ok m' ∧
+              Interp.activeThreadM m' = .ok
+                { stack := t.stack.dropLast.dropLast ++
+                    [{ caller with next_block := unwindBlock, next_stmt := 0 }],
+                  state := t.state,
+                  unwind_payloads := t.unwind_payloads } ∧
+              m'.mem = cm2 ∧
+              m'.threads.length = mM.threads.length ∧
+              (∀ i, i ≠ mM.active_thread.toNat → m'.threads[i]? = mM.threads[i]?))))) := by
+  refine ⟨⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩, ?_⟩
+  · intro payload p m1 t fr hev ht hfr
+    obtain ⟨m', hj, hact, hmem, hlen, hne⟩ := jumpToBlock_activeThread (fr := fr) blk
+      (activeThread_set
+        { t with unwind_payloads := t.unwind_payloads ++ [p.thin_pointer] } ht) hfr
+    refine ⟨m', ?_, hact, hmem, hlen.trans List.length_set, fun i hi =>
+      (hne i hi).trans (List.getElem?_set_ne (Ne.symm hi))⟩
+    simp only [Interp.evalTerminator, hev, ok_bind]
+    rw [mutateActiveThread_eq _ ht]
+    exact hj
+  · intro payload v ty m1 hnot hev
+    simp only [Interp.evalTerminator, hev, ok_bind]
+    cases v with
+    | Ptr p =>
+      cases ty with
+      | Ptr pt =>
+        cases pt with
+        | Raw mk =>
+          cases mk with
+          | None => exact absurd ⟨p, rfl, rfl⟩ hnot
+          | ElementCount => rfl
+          | VTablePointer _ => rfl
+        | Ref _ _ => rfl
+        | Box _ => rfl
+        | FnPtr => rfl
+        | VTablePtr _ => rfl
+      | Int _ => rfl
+      | Bool => rfl
+      | Tuple _ _ _ => rfl
+      | Array _ _ => rfl
+      | Slice _ => rfl
+      | Union _ _ _ _ => rfl
+      | Enum _ _ _ _ _ => rfl
+      | TraitObject _ => rfl
+    | Int _ => rfl
+    | Bool _ => rfl
+    | Tuple _ => rfl
+    | Union _ => rfl
+    | Variant _ _ => rfl
+  · intro payload e herr
+    simp [Interp.evalTerminator, herr, error_bind]
+  · intro t ht hemp
+    simp only [Interp.evalTerminator]
+    rw [mutateActiveThread_eq _ ht]
+    simp [hemp, ub]
+  · intro t ps q fr ht hps hfr
+    obtain ⟨m', hj, hact, hmem, hlen, hne⟩ := jumpToBlock_activeThread (fr := fr) blk
+      (activeThread_set { t with unwind_payloads := ps } ht) hfr
+    refine ⟨m', ?_, hact, hmem, hlen.trans List.length_set, fun i hi =>
+      (hne i hi).trans (List.getElem?_set_ne (Ne.symm hi))⟩
+    simp only [Interp.evalTerminator]
+    rw [mutateActiveThread_eq _ ht]
+    simp only [hps, List.getLast?_append, List.getLast?_singleton, Option.some_or,
+      List.dropLast_concat, pure_ok, ok_bind]
+    exact hj
+  · intro t ht hemp
+    simp only [Interp.evalTerminator, Interp.evalResumeUnwind]
+    rw [ht]
+    simp [hemp, specPanic]
+  · intro t fr fr' cm ht hfr hdealloc
+    obtain ⟨hge, hget⟩ := listIndex_ok_get ht
+    have hlt : m.active_thread.toNat < m.threads.length :=
+      (List.getElem?_eq_some_iff.mp hget).1
+    have hspa := deallocAll_stack_pop_action _ hdealloc
+    have hpop : Interp.evalTerminator m .ResumeUnwind =
+        (match fr'.stack_pop_action with
+          | .BottomOfStack => ub "the function at the bottom of the stack must not unwind"
+          | .BackToCaller _ unwindBlock _ =>
+            match unwindBlock with
+            | some unwindBlock =>
+              Interp.jumpToBlock
+                { m with
+                  threads := m.threads.set m.active_thread.toNat
+                    { t with stack := t.stack.dropLast },
+                  mem := cm } unwindBlock
+            | none =>
+              ub "unwinding from a function where the caller did not specify an unwind_block") := by
+      simp only [Interp.evalTerminator, Interp.evalResumeUnwind]
+      rw [ht]
+      simp only [ok_bind, hfr, pure_ok, listSet, hge, hlt, and_self, ↓reduceIte, hdealloc]
+      cases fr'.stack_pop_action with
+      | BottomOfStack => rfl
+      | BackToCaller _ unwindBlock _ => cases unwindBlock <;> rfl
+    refine ⟨fun hbot => ?_, fun nextBlock retPtr hback => ?_,
+      fun nextBlock unwindBlock retPtr hback hemp => ?_,
+      fun nextBlock unwindBlock retPtr caller hback hcaller => ?_⟩
+    · rw [hpop, hspa, hbot]
+      rfl
+    · rw [hpop, hspa, hback]
+      rfl
+    · have hact : Interp.activeThread
+          { m with
+            threads := m.threads.set m.active_thread.toNat { t with stack := t.stack.dropLast },
+            mem := cm } = .ok { t with stack := t.stack.dropLast } :=
+        activeThread_set (m := { m with mem := cm }) _ ht
+      rw [hpop, hspa, hback]
+      exact jumpToBlock_empty_stack unwindBlock hact hemp
+    · have hact : Interp.activeThread
+          { m with
+            threads := m.threads.set m.active_thread.toNat { t with stack := t.stack.dropLast },
+            mem := cm } = .ok { t with stack := t.stack.dropLast } :=
+        activeThread_set (m := { m with mem := cm }) _ ht
+      obtain ⟨m', hj, hact', hmem, hlen, hne⟩ := jumpToBlock_activeThread (fr := caller) unwindBlock
+        hact hcaller
+      refine ⟨m', ?_, hact', hmem, hlen.trans List.length_set, fun i hi =>
+        (hne i hi).trans (List.getElem?_set_ne (Ne.symm hi))⟩
+      rw [hpop, hspa, hback]
+      exact hj
+  · intro M _ _ mM
+    refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+    · intro payload p m1 t fr hev ht hfr
+      obtain ⟨m', hj, hact, hmem, hlen, hne⟩ := jumpToBlockM_activeThread (fr := fr) blk
+        (activeThreadM_set
+          { t with unwind_payloads := t.unwind_payloads ++ [p.thin_pointer] } ht) hfr
+      refine ⟨m', ?_, hact, hmem, hlen.trans List.length_set, fun i hi =>
+        (hne i hi).trans (List.getElem?_set_ne (Ne.symm hi))⟩
+      simp only [Interp.evalTerminatorM, hev, ok_bind]
+      rw [mutateActiveThreadM_eq _ ht]
+      exact hj
+    · intro payload v ty m1 hnot hev
+      simp only [Interp.evalTerminatorM, hev, ok_bind]
+      cases v with
+      | Ptr p =>
+        cases ty with
+        | Ptr pt =>
+          cases pt with
+          | Raw mk =>
+            cases mk with
+            | None => exact absurd ⟨p, rfl, rfl⟩ hnot
+            | ElementCount => rfl
+            | VTablePointer _ => rfl
+          | Ref _ _ => rfl
+          | Box _ => rfl
+          | FnPtr => rfl
+          | VTablePtr _ => rfl
+        | Int _ => rfl
+        | Bool => rfl
+        | Tuple _ _ _ => rfl
+        | Array _ _ => rfl
+        | Slice _ => rfl
+        | Union _ _ _ _ => rfl
+        | Enum _ _ _ _ _ => rfl
+        | TraitObject _ => rfl
+      | Int _ => rfl
+      | Bool _ => rfl
+      | Tuple _ => rfl
+      | Union _ => rfl
+      | Variant _ _ => rfl
+    · intro payload e herr
+      simp [Interp.evalTerminatorM, herr, error_bind]
+    · intro t ht hemp
+      simp only [Interp.evalTerminatorM]
+      rw [mutateActiveThreadM_eq _ ht]
+      simp [hemp, ub]
+    · intro t ps q fr ht hps hfr
+      obtain ⟨m', hj, hact, hmem, hlen, hne⟩ := jumpToBlockM_activeThread (fr := fr) blk
+        (activeThreadM_set { t with unwind_payloads := ps } ht) hfr
+      refine ⟨m', ?_, hact, hmem, hlen.trans List.length_set, fun i hi =>
+        (hne i hi).trans (List.getElem?_set_ne (Ne.symm hi))⟩
+      simp only [Interp.evalTerminatorM]
+      rw [mutateActiveThreadM_eq _ ht]
+      simp only [hps, List.getLast?_append, List.getLast?_singleton, Option.some_or,
+        List.dropLast_concat, pure_ok, ok_bind]
+      exact hj
+    · intro t ht hemp
+      simp only [Interp.evalTerminatorM, Interp.evalResumeUnwindM]
+      rw [ht]
+      simp [hemp, specPanic]
+    · intro t fr fr' cm1 ht hfr hdealloc
+      obtain ⟨hge, hget⟩ := listIndex_ok_get ht
+      have hlt : mM.active_thread.toNat < mM.threads.length :=
+        (List.getElem?_eq_some_iff.mp hget).1
+      obtain ⟨hspa, hext⟩ := deallocAllM_preserves _ hdealloc
+      have hpre : Interp.evalTerminatorM mM .ResumeUnwind =
+          (Interp.ConcurrentMemory.end_call cm1 fr.extra >>= fun cm2 =>
+            match fr.stack_pop_action with
+            | .BottomOfStack => ub "the function at the bottom of the stack must not unwind"
+            | .BackToCaller _ unwindBlock _ =>
+              match unwindBlock with
+              | some unwindBlock =>
+                Interp.jumpToBlockM
+                  { mM with
+                    threads := mM.threads.set mM.active_thread.toNat
+                      { t with stack := t.stack.dropLast },
+                    mem := cm2 } unwindBlock
+              | none => ub
+                "unwinding from a function where the caller did not specify an unwind_block") := by
+        simp only [Interp.evalTerminatorM, Interp.evalResumeUnwindM]
+        rw [ht]
+        simp only [ok_bind, hfr, pure_ok, listSet, hge, hlt, and_self, ↓reduceIte, hdealloc,
+          hext, hspa]
+        cases Interp.ConcurrentMemory.end_call cm1 fr.extra with
+        | error e => rfl
+        | ok cm2 =>
+          simp only [ok_bind]
+          cases fr.stack_pop_action with
+          | BottomOfStack => rfl
+          | BackToCaller _ unwindBlock _ => cases unwindBlock <;> rfl
+      refine ⟨fun e herr => ?_, fun cm2 hok => ?_⟩
+      · rw [hpre, herr]
+        rfl
+      · refine ⟨fun hbot => ?_, fun nextBlock retPtr hback => ?_,
+          fun nextBlock unwindBlock retPtr hback hemp => ?_,
+          fun nextBlock unwindBlock retPtr caller hback hcaller => ?_⟩
+        · rw [hpre, hok, ok_bind, hbot]
+          rfl
+        · rw [hpre, hok, ok_bind, hback]
+          rfl
+        · have hact : Interp.activeThreadM
+              { mM with
+                threads := mM.threads.set mM.active_thread.toNat
+                  { t with stack := t.stack.dropLast },
+                mem := cm2 } = .ok { t with stack := t.stack.dropLast } :=
+            activeThreadM_set (m := { mM with mem := cm2 }) _ ht
+          rw [hpre, hok, ok_bind, hback]
+          exact jumpToBlockM_empty_stack unwindBlock hact hemp
+        · have hact : Interp.activeThreadM
+              { mM with
+                threads := mM.threads.set mM.active_thread.toNat
+                  { t with stack := t.stack.dropLast },
+                mem := cm2 } = .ok { t with stack := t.stack.dropLast } :=
+            activeThreadM_set (m := { mM with mem := cm2 }) _ ht
+          obtain ⟨m', hj, hact', hmem, hlen, hne⟩ := jumpToBlockM_activeThread (fr := caller)
+            unwindBlock hact hcaller
+          refine ⟨m', ?_, hact', hmem, hlen.trans List.length_set, fun i hi =>
+            (hne i hi).trans (List.getElem?_set_ne (Ne.symm hi))⟩
+          rw [hpre, hok, ok_bind, hback]
+          exact hj
+
+/-! ### Unwinding and `SetDiscriminant`: concrete witnesses and general laws -/
+
+private def uwEmptyProg : Gen.Program :=
+  { functions := ⟨[]⟩
+    start := ⟨⟨0⟩⟩
+    globals := ⟨[]⟩
+    traits := ⟨[]⟩
+    vtables := ⟨[]⟩ }
+
+private def uwFn (locals : List (Gen.LocalName × Gen.Type)) : Gen.Function :=
+  { locals := ⟨locals⟩
+    args := []
+    ret := ⟨⟨0⟩⟩
+    calling_convention := .Rust
+    blocks := ⟨[]⟩
+    start := ⟨⟨0⟩⟩
+    implicit_writes := false }
+
+private def uwMachBM (allocs : List (Gen.Allocation Unit Unit))
+    (stack : List Frame) (payloads : List Ptr) : Mach :=
+  { prog := uwEmptyProg
+    mem := { memory := { allocations := allocs, _phantom := ⟨⟩ }, accesses := [] }
+    intptrcast := ⟨⟨[]⟩⟩
+    threads := [{ stack := stack, state := .Enabled, unwind_payloads := payloads }]
+    active_thread := 0
+    synchronized_threads := ⟨[]⟩
+    locks := []
+    global_ptrs := ⟨[]⟩
+    fn_ptrs := ⟨[]⟩
+    vtable_ptrs := ⟨[]⟩
+    stdout := ⟨[]⟩
+    stderr := ⟨[]⟩ }
+
+private def uwMachTB (allocs : List (Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra))
+    (stack : List (Gen.StackFrame TBM))
+    (payloads : List (Gen.ThinPointer Gen.TreeBorrowsProvenance)) : MachTB :=
+  { prog := uwEmptyProg
+    mem :=
+      { memory :=
+          { params := { implicit_writes := false }
+            mem := { allocations := allocs, _phantom := ⟨⟩ } }
+        accesses := [] }
+    intptrcast := ⟨⟨[]⟩⟩
+    threads := [{ stack := stack, state := .Enabled, unwind_payloads := payloads }]
+    active_thread := 0
+    synchronized_threads := ⟨[]⟩
+    locks := []
+    global_ptrs := ⟨[]⟩
+    fn_ptrs := ⟨[]⟩
+    vtable_ptrs := ⟨[]⟩
+    stdout := ⟨[]⟩
+    stderr := ⟨[]⟩ }
+
+private def uwRawThinPtrExpr (addr : Int) : Gen.ValueExpr :=
+  .Constant (.PointerWithoutProvenance addr) (.Ptr (.Raw .None))
+
+private def uwLiveStackAllocBM (addr : Int) : Gen.Allocation Unit Unit :=
+  { data := [.Init 0x42 none]
+    addr := addr
+    align := ⟨1⟩
+    kind := .Stack
+    live := true
+    extra := () }
+
+private def uwLiveAllocTB (addr : Int) (kind : Gen.AllocationKind) (root : Gen.Node) :
+    Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
+  { data := [.Init 0x42 none]
+    addr := addr
+    align := ⟨1⟩
+    kind := kind
+    live := true
+    extra := { root := root } }
+
+private def uwProtNode (prot : Gen.Protected) (perm : Gen.Permission) : Gen.Node :=
+  { children := [], permissions := [perm], «protected» := prot }
+
+private def uwRootWithChildren (cs : List Gen.Node) : Gen.Node :=
+  { children := cs, permissions := [.Unprot .Unique], «protected» := .No }
+
+/-- **Non-vacuous concrete unwinding witnesses across `Mach` and `MachTB`
+(`minirust_unwind_concrete_witnesses`)**: kernel-checked executions without any
+conditional hypotheses exercising:
+1. 2-deep LIFO unwind payload cycle (`StartUnwind` push `0x1000` → `StartUnwind`
+   push `0x2000` → `GetUnwindPayload` yields `0x2000` → `StopUnwind` pops
+   `0x2000` → `GetUnwindPayload` yields `0x1000` → `StopUnwind` pops `0x1000` →
+   third `StopUnwind` raises UB `"StopUnwind: the payload stack is empty"`) on
+   both `Mach` and `MachTB`, plus concrete `StartUnwind` `specPanic` rejections
+   of non-raw (`Ref`), wide-raw (`ElementCount`), and integer payloads;
+2. `ResumeUnwind` on `Mach` tearing down a live stack local (`live` flips
+   `true → false`), popping the callee, jumping the caller to `unwind_block`
+   while preserving `unwind_payloads`, plus concrete `BottomOfStack` UB,
+   missing-`unwind_block` UB, and empty-stack `specPanic`;
+3. `ResumeUnwind` on `MachTB` (Tree Borrows):
+   - live local teardown (`alloc 1` becomes `live = false`) **and** `end_call`
+     releasing a strong protector on caller `alloc 0` (`protected` transitions
+     `.Strong → .No`, permission `.Prot (.Frozen true) → .Unprot .Frozen`)
+     while jumping the caller to `unwind_block`;
+   - `deallocAllM` raising Tree Borrows UB when unwinding tries to deallocate a
+     strongly protected local
+     (`"Tree Borrows: deallocating strongly protected allocation"`);
+   - `end_call` raising Tree Borrows protector-conflict UB when releasing a
+     `Prot .Unique` protector conflicts with a strongly protected
+     `Prot (.Frozen true)` sibling, **preempting** `BottomOfStack` UB (proving
+     `end_call` executes before inspecting `stack_pop_action`);
+   - `BottomOfStack` and missing-`unwind_block` UB on `MachTB` when `end_call`
+     succeeds. -/
+theorem minirust_unwind_concrete_witnesses :
+    let p1 : Ptr := ⟨0x1000, none⟩
+    let p2 : Ptr := ⟨0x2000, none⟩
+    let p1TB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x1000, none⟩
+    let p2TB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x2000, none⟩
+    let baseFrameBM : Frame :=
+      { func := uwFn [], locals := ⟨[]⟩, stack_pop_action := .BottomOfStack,
+        next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := () }
+    let baseFrameTB : Gen.StackFrame TBM :=
+      { func := uwFn [], locals := ⟨[]⟩, stack_pop_action := .BottomOfStack,
+        next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := ⟨[]⟩ }
+    let m0BM := uwMachBM [] [baseFrameBM] []
+    let m0TB := uwMachTB [] [baseFrameTB] []
+    let rawTy : Gen.Type := .Ptr (.Raw .None)
+    let badIntPayload : Gen.ValueExpr := .Constant (.Int 7) (.Int u8)
+    let widePairTy : Gen.Type :=
+      .Tuple [(⟨0⟩, .Ptr (.Raw .None)), (⟨8⟩, .Int IntType.usize_ty)] ⟨⟨16⟩, ⟨8⟩, none⟩ none
+    let badWidePayload : Gen.ValueExpr :=
+      .UnOp (.Cast (.Transmute (.Ptr (.Raw .ElementCount))))
+        (.Tuple [uwRawThinPtrExpr 0x1000, .Constant (.Int 0) (.Int IntType.usize_ty)] widePairTy)
+    let badRefPayload : Gen.ValueExpr :=
+      .Constant (.PointerWithoutProvenance 0x1000)
+        (.Ptr (.Ref .Immutable ⟨.Sized ⟨0⟩ ⟨1⟩, true, .Sized [], true, true⟩))
+    let lifoBM := do
+      let m1 ← Interp.evalTerminator m0BM (.StartUnwind (uwRawThinPtrExpr 0x1000) ⟨⟨1⟩⟩)
+      let m2 ← Interp.evalTerminator m1 (.StartUnwind (uwRawThinPtrExpr 0x2000) ⟨⟨2⟩⟩)
+      let (top2, m2') ← Interp.evalIntrinsic m2 .GetUnwindPayload [] rawTy
+      let m3 ← Interp.evalTerminator m2' (.StopUnwind ⟨⟨3⟩⟩)
+      let (top1, m3') ← Interp.evalIntrinsic m3 .GetUnwindPayload [] rawTy
+      let m4 ← Interp.evalTerminator m3' (.StopUnwind ⟨⟨4⟩⟩)
+      pure (top2, top1, m4)
+    let lifoTB := do
+      let m1 ← Interp.evalTerminatorM m0TB (.StartUnwind (uwRawThinPtrExpr 0x1000) ⟨⟨1⟩⟩)
+      let m2 ← Interp.evalTerminatorM m1 (.StartUnwind (uwRawThinPtrExpr 0x2000) ⟨⟨2⟩⟩)
+      let (top2, m2') ← Interp.evalIntrinsicM m2 .GetUnwindPayload [] rawTy
+      let m3 ← Interp.evalTerminatorM m2' (.StopUnwind ⟨⟨3⟩⟩)
+      let (top1, m3') ← Interp.evalIntrinsicM m3 .GetUnwindPayload [] rawTy
+      let m4 ← Interp.evalTerminatorM m3' (.StopUnwind ⟨⟨4⟩⟩)
+      pure (top2, top1, m4)
+    let calleeFn := uwFn [(⟨⟨1⟩⟩, .Int u8)]
+    let calleeFrameBM : Frame :=
+      { func := calleeFn
+        locals := ⟨[(⟨⟨1⟩⟩, ⟨0x4000, some (⟨0⟩, ())⟩)]⟩
+        stack_pop_action := .BackToCaller none (some ⟨⟨9⟩⟩) ⟨0, none⟩
+        next_block := ⟨⟨5⟩⟩
+        next_stmt := 0
+        extra := () }
+    let mResumeBM := uwMachBM [uwLiveStackAllocBM 0x4000] [baseFrameBM, calleeFrameBM] [p1]
+    let mNoUnwindBM := uwMachBM []
+      [baseFrameBM,
+        { calleeFrameBM with
+          locals := ⟨[]⟩
+          stack_pop_action := .BackToCaller (some ⟨⟨7⟩⟩) none ⟨0, none⟩ }] [p1]
+    let mEmptyStackBM := uwMachBM [] [] []
+    let tbCallerAlloc := uwLiveAllocTB 0x3000 .Stack
+      (uwRootWithChildren [uwProtNode .Strong (.Prot (.Frozen true))])
+    let tbCalleeAlloc := uwLiveAllocTB 0x4000 .Stack (uwRootWithChildren [])
+    let calleeFrameTB : Gen.StackFrame TBM :=
+      { func := calleeFn
+        locals := ⟨[(⟨⟨1⟩⟩, ⟨0x4000, some (⟨1⟩, [])⟩)]⟩
+        stack_pop_action := .BackToCaller none (some ⟨⟨9⟩⟩) ⟨0, none⟩
+        next_block := ⟨⟨5⟩⟩
+        next_stmt := 0
+        extra := { protectors := [(⟨0⟩, [0])] } }
+    let mResumeTB := uwMachTB [tbCallerAlloc, tbCalleeAlloc]
+      [baseFrameTB, calleeFrameTB] [p1TB]
+    let tbProtDeallocAlloc := uwLiveAllocTB 0x3000 .Stack
+      (uwProtNode .Strong (.Prot .Unique))
+    let mProtDeallocTB := uwMachTB [tbProtDeallocAlloc]
+      [baseFrameTB,
+        { calleeFrameTB with
+          locals := ⟨[(⟨⟨1⟩⟩, ⟨0x3000, some (⟨0⟩, [])⟩)]⟩
+          extra := { protectors := [] } }] [p1TB]
+    let tbConflictAlloc := uwLiveAllocTB 0x5000 .Stack
+      (uwRootWithChildren
+        [uwProtNode .Strong (.Prot .Unique),
+         uwProtNode .Strong (.Prot (.Frozen true))])
+    let mEndCallConflictTB := uwMachTB [tbConflictAlloc]
+      [{ baseFrameTB with extra := { protectors := [(⟨0⟩, [0])] } }] [p1TB]
+    let mNoUnwindTB := uwMachTB []
+      [baseFrameTB,
+        { calleeFrameTB with
+          locals := ⟨[]⟩
+          stack_pop_action := .BackToCaller (some ⟨⟨7⟩⟩) none ⟨0, none⟩
+          extra := { protectors := [] } }] [p1TB]
+    (∃ m4, lifoBM = .ok (.Ptr ⟨p2, none⟩, .Ptr ⟨p1, none⟩, m4) ∧
+      Interp.activeThread m4 = .ok
+        { stack := [{ baseFrameBM with next_block := ⟨⟨4⟩⟩, next_stmt := 0 }],
+          state := .Enabled, unwind_payloads := [] } ∧
+      Interp.evalTerminator m4 (.StopUnwind ⟨⟨5⟩⟩) =
+        .error (.ub "StopUnwind: the payload stack is empty")) ∧
+    (∃ m4, lifoTB = .ok (.Ptr ⟨p2TB, none⟩, .Ptr ⟨p1TB, none⟩, m4) ∧
+      Interp.activeThreadM m4 = .ok
+        { stack := [{ baseFrameTB with next_block := ⟨⟨4⟩⟩, next_stmt := 0 }],
+          state := .Enabled, unwind_payloads := [] } ∧
+      Interp.evalTerminatorM m4 (.StopUnwind ⟨⟨5⟩⟩) =
+        .error (.ub "StopUnwind: the payload stack is empty")) ∧
+    (Interp.evalTerminator m0BM (.StartUnwind badIntPayload ⟨⟨1⟩⟩) =
+      .error (.specPanic "StartUnwind: the unwind payload is not a raw pointer") ∧
+     Interp.evalTerminator m0BM (.StartUnwind badWidePayload ⟨⟨1⟩⟩) =
+      .error (.specPanic "StartUnwind: the unwind payload is not a raw pointer") ∧
+     Interp.evalTerminator m0BM (.StartUnwind badRefPayload ⟨⟨1⟩⟩) =
+      .error (.specPanic "StartUnwind: the unwind payload is not a raw pointer") ∧
+     Interp.evalTerminatorM m0TB (.StartUnwind badIntPayload ⟨⟨1⟩⟩) =
+      .error (.specPanic "StartUnwind: the unwind payload is not a raw pointer") ∧
+     Interp.evalTerminatorM m0TB (.StartUnwind badWidePayload ⟨⟨1⟩⟩) =
+      .error (.specPanic "StartUnwind: the unwind payload is not a raw pointer") ∧
+     Interp.evalTerminatorM m0TB (.StartUnwind badRefPayload ⟨⟨1⟩⟩) =
+      .error (.specPanic "StartUnwind: the unwind payload is not a raw pointer")) ∧
+    (∃ m', Interp.evalTerminator mResumeBM .ResumeUnwind = .ok m' ∧
+      m'.mem.memory.allocations.map (·.live) = [false] ∧
+      Interp.activeThread m' = .ok
+        { stack := [{ baseFrameBM with next_block := ⟨⟨9⟩⟩, next_stmt := 0 }],
+          state := .Enabled, unwind_payloads := [p1] }) ∧
+    (Interp.evalTerminator m0BM .ResumeUnwind =
+      .error (.ub "the function at the bottom of the stack must not unwind") ∧
+     Interp.evalTerminator mNoUnwindBM .ResumeUnwind =
+      .error (.ub "unwinding from a function where the caller did not specify an unwind_block") ∧
+     Interp.evalTerminator mEmptyStackBM .ResumeUnwind =
+      .error (.specPanic "stack.pop().unwrap()")) ∧
+    (∃ m', Interp.evalTerminatorM mResumeTB .ResumeUnwind = .ok m' ∧
+      m'.mem.memory.mem.allocations.map (·.live) = [true, false] ∧
+      (m'.mem.memory.mem.allocations[0]?.bind (fun a => a.extra.root.children[0]?)) =
+        some (uwProtNode .No (.Unprot .Frozen)) ∧
+      Interp.activeThreadM m' = .ok
+        { stack := [{ baseFrameTB with next_block := ⟨⟨9⟩⟩, next_stmt := 0 }],
+          state := .Enabled, unwind_payloads := [p1TB] }) ∧
+    (Interp.evalTerminatorM mProtDeallocTB .ResumeUnwind =
+      .error (.ub "Tree Borrows: deallocating strongly protected allocation") ∧
+     Interp.evalTerminatorM mEndCallConflictTB .ResumeUnwind =
+      .error (.ub
+        "Tree Borrows: foreign write of protected Frozen reference which had a local read") ∧
+     Interp.evalTerminatorM m0TB .ResumeUnwind =
+      .error (.ub "the function at the bottom of the stack must not unwind") ∧
+     Interp.evalTerminatorM mNoUnwindTB .ResumeUnwind =
+      .error (.ub
+        "unwinding from a function where the caller did not specify an unwind_block")) := by
+  refine ⟨⟨_, rfl, rfl, rfl⟩, ⟨_, rfl, rfl, rfl⟩, ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩,
+    ⟨_, rfl, rfl, rfl⟩, ⟨rfl, rfl, rfl⟩, ⟨_, rfl, rfl, rfl, rfl⟩, ⟨rfl, rfl, rfl, rfl⟩⟩
+
+private def sdPayloadBytes {P : Type} : List (Gen.AbstractByte P) :=
+  [.Init 0xAA none, .Init 0xBB none, .Init 0xCC none, .Init 0xDD none,
+   .Init 0xEE none, .Init 0xFF none, .Init 0x11 none, .Init 0x22 none]
+
+private def sdExpectedBytes {P : Type} : List (Gen.AbstractByte P) :=
+  [.Init 0x03 none, .Init 0xBB none, .Init 0xCC none, .Init 0xDD none,
+   .Init 0x78 none, .Init 0x56 none, .Init 0x11 none, .Init 0x22 none]
+
+private def sdEnumTy : Gen.Type :=
+  let v7 : Gen.Variant :=
+    { ty := .Tuple [] ⟨⟨8⟩, ⟨4⟩, none⟩ none
+      tagger := ⟨[(⟨0⟩, (u8, 0x03)), (⟨4⟩, (u16, 0x5678))]⟩ }
+  let vNiche : Gen.Variant :=
+    { ty := .Tuple [] ⟨⟨8⟩, ⟨4⟩, none⟩ none
+      tagger := ⟨[]⟩ }
+  let vOob : Gen.Variant :=
+    { ty := .Tuple [] ⟨⟨8⟩, ⟨4⟩, none⟩ none
+      tagger := ⟨[(⟨16⟩, (u8, 1))]⟩ }
+  let disc : Gen.Discriminator :=
+    .Branch ⟨0⟩ u8 .Invalid
+      ⟨[((3, 4), .Branch ⟨4⟩ u16 .Invalid ⟨[((0x5678, 0x5679), .Known 7)]⟩)]⟩
+  .Enum ⟨[(7, v7), (8, vNiche), (9, vOob)]⟩ u8 disc ⟨8⟩ ⟨4⟩
+
+/-- **MiniRust `Statement::SetDiscriminant` semantics on `Mach` and `MachTB`
+(`minirust_setDiscriminant_supported`)**: combines universal error-ordering and
+empty-tagger laws (across `Mach` and polymorphic `Machine M`) with concrete
+kernel-checked witnesses on both `Mach` and `MachTB`:
+- Universal laws (both `evalStatement` and `evalStatementM`):
+  1. Any `evalPlace` / `evalPlaceM` error propagates unchanged;
+  2. Non-enum destination raises `specPanic` before checking alignment;
+  3. Misaligned enum destination raises `ub` before looking up `value`;
+  4. Missing variant `value` raises
+     `specPanic s!"setting an invalid discriminant ({value})"`;
+  5. Empty `tagger` (niche variant) returns `m1` unchanged with zero stores;
+- Concrete witnesses (`Mach` and `MachTB`):
+  6. Multi-entry tagger writes `u8` (`0x03`) at offset `0` and little-endian
+     `u16` (`0x5678` → `[0x78, 0x56]`) at offset `4`, leaving all five payload
+     bytes (`0xBB, 0xCC, 0xDD, 0x11, 0x22`) untouched, recording the two
+     `Store` accesses in `tagger.entries` order, and round-tripping through
+     `decodeDiscriminant` to `some 7`;
+  7. Concrete negative controls on both `Mach` and `MachTB`: misaligned enum
+     with missing variant `99` (UB wins over missing variant), misaligned
+     non-enum (`specPanic` wins over misaligned UB), missing negative
+     discriminant `-1`, empty-tagger niche variant through an aligned raw
+     pointer without provenance (succeeds with zero accesses: nothing is
+     stored, so the missing provenance never matters), and out-of-bounds
+     tagger offset (`ptr_offset_inbounds` UB);
+  8. Concrete Tree Borrows per-byte aliasing witnesses on `MachTB`:
+     `SetDiscriminant` through a `Frozen` pointer raises
+     `"Tree Borrows: local write of Frozen reference"`, while a pointer that is
+     `Unique` on tag bytes `{0, 4, 5}` and `Frozen` on payload bytes
+     `{1, 2, 3, 6, 7}` succeeds (confirming only tag bytes are accessed). -/
+theorem minirust_setDiscriminant_supported :
+    (∀ (m : Mach) (dst : Gen.PlaceExpr) (value : Int) (e : Interp.Stop),
+      Interp.evalPlace m dst = .error e →
+      Interp.evalStatement m (.SetDiscriminant dst value) = .error e) ∧
+    (∀ (m m1 : Mach) (dst : Gen.PlaceExpr) (value : Int) (place : Gen.Place BM) (ty : Gen.Type),
+      Interp.evalPlace m dst = .ok ((place, ty), m1) →
+      (∀ (vs : Map Int Gen.Variant) dt d sz al, ty ≠ .Enum vs dt d sz al) →
+      Interp.evalStatement m (.SetDiscriminant dst value) =
+        .error (.specPanic
+          "setting the discriminant type of a non-enum contradicts well-formedness")) ∧
+    (∀ (m m1 : Mach) (dst : Gen.PlaceExpr) (value : Int) (place : Gen.Place BM)
+        (vs : Map Int Gen.Variant) (dt : Gen.IntType) (d : Gen.Discriminator)
+        (sz : LibSpecr.Size) (al : LibSpecr.Align),
+      Interp.evalPlace m dst = .ok ((place, .Enum vs dt d sz al), m1) →
+      (place.aligned = false →
+        Interp.evalStatement m (.SetDiscriminant dst value) =
+          .error (.ub "setting the discriminant of a place based on a misaligned pointer")) ∧
+      (place.aligned = true → mapGet vs value = none →
+        Interp.evalStatement m (.SetDiscriminant dst value) =
+          .error (.specPanic s!"setting an invalid discriminant ({value})")) ∧
+      (∀ vTy, place.aligned = true → mapGet vs value = some ⟨vTy, ⟨[]⟩⟩ →
+        Interp.evalStatement m (.SetDiscriminant dst value) = .ok m1)) ∧
+    (∀ {M : Type} [Gen.Memory M] [Interp.MemoryOps M] (m : Gen.Machine M)
+        (dst : Gen.PlaceExpr) (value : Int) (e : Interp.Stop),
+      Interp.evalPlaceM m dst = .error e →
+      Interp.evalStatementM m (.SetDiscriminant dst value) = .error e) ∧
+    (∀ {M : Type} [Gen.Memory M] [Interp.MemoryOps M] (m m1 : Gen.Machine M)
+        (dst : Gen.PlaceExpr) (value : Int) (place : Gen.Place M) (ty : Gen.Type),
+      Interp.evalPlaceM m dst = .ok ((place, ty), m1) →
+      (∀ (vs : Map Int Gen.Variant) dt d sz al, ty ≠ .Enum vs dt d sz al) →
+      Interp.evalStatementM m (.SetDiscriminant dst value) =
+        .error (.specPanic
+          "setting the discriminant type of a non-enum contradicts well-formedness")) ∧
+    (∀ {M : Type} [Gen.Memory M] [Interp.MemoryOps M] (m m1 : Gen.Machine M)
+        (dst : Gen.PlaceExpr) (value : Int) (place : Gen.Place M)
+        (vs : Map Int Gen.Variant) (dt : Gen.IntType) (d : Gen.Discriminator)
+        (sz : LibSpecr.Size) (al : LibSpecr.Align),
+      Interp.evalPlaceM m dst = .ok ((place, .Enum vs dt d sz al), m1) →
+      (place.aligned = false →
+        Interp.evalStatementM m (.SetDiscriminant dst value) =
+          .error (.ub "setting the discriminant of a place based on a misaligned pointer")) ∧
+      (place.aligned = true → mapGet vs value = none →
+        Interp.evalStatementM m (.SetDiscriminant dst value) =
+          .error (.specPanic s!"setting an invalid discriminant ({value})")) ∧
+      (∀ vTy, place.aligned = true → mapGet vs value = some ⟨vTy, ⟨[]⟩⟩ →
+        Interp.evalStatementM m (.SetDiscriminant dst value) = .ok m1)) ∧
+    (let fnEnum := uwFn [(⟨⟨1⟩⟩, sdEnumTy)]
+     let allocBM : Gen.Allocation Unit Unit :=
+       { data := sdPayloadBytes, addr := 0x100, align := ⟨4⟩, kind := .Stack, live := true,
+         extra := () }
+     let frBM : Frame :=
+       { func := fnEnum, locals := ⟨[(⟨⟨1⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩)]⟩,
+         stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := () }
+     let mBM := uwMachBM [allocBM] [frBM] []
+     let rootAllUnique : Gen.Node :=
+       { children := [], permissions := List.replicate 8 (.Unprot .Unique), «protected» := .No }
+     let rootAllFrozen : Gen.Node :=
+       { children := [], permissions := List.replicate 8 (.Unprot .Frozen), «protected» := .No }
+     let rootTagOnlyUnique : Gen.Node :=
+       { children := []
+         permissions :=
+           [.Unprot .Unique, .Unprot .Frozen, .Unprot .Frozen, .Unprot .Frozen,
+            .Unprot .Unique, .Unprot .Unique, .Unprot .Frozen, .Unprot .Frozen]
+         «protected» := .No }
+     let mkAllocTB (r : Gen.Node) : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
+       { data := sdPayloadBytes, addr := 0x100, align := ⟨4⟩, kind := .Stack, live := true,
+         extra := { root := r } }
+     let frTB : Gen.StackFrame TBM :=
+       { func := fnEnum, locals := ⟨[(⟨⟨1⟩⟩, ⟨0x100, some (⟨0⟩, [])⟩)]⟩,
+         stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := ⟨[]⟩ }
+     let mTB := uwMachTB [mkAllocTB rootAllUnique] [frTB] []
+     let mTBFrozen := uwMachTB [mkAllocTB rootAllFrozen] [frTB] []
+     let mTBTagOnly := uwMachTB [mkAllocTB rootTagOnlyUnique] [frTB] []
+     let loc : Gen.PlaceExpr := .Local ⟨⟨1⟩⟩
+     let misalignEnum : Gen.PlaceExpr := .Deref (uwRawThinPtrExpr 0x101) sdEnumTy
+     let misalignNonEnum : Gen.PlaceExpr := .Deref (uwRawThinPtrExpr 0x101) (.Int u32)
+     let noProvAlignedEnum : Gen.PlaceExpr := .Deref (uwRawThinPtrExpr 0x100) sdEnumTy
+     let expectedAccs : List Gen.Access :=
+       [⟨.Store, .None, 0x100, ⟨1⟩⟩, ⟨.Store, .None, 0x104, ⟨2⟩⟩]
+     let disc : Gen.Discriminator :=
+       .Branch ⟨0⟩ u8 .Invalid
+         ⟨[((3, 4), .Branch ⟨4⟩ u16 .Invalid ⟨[((0x5678, 0x5679), .Known 7)]⟩)]⟩
+     (∃ m', Interp.evalStatement mBM (.SetDiscriminant loc 7) = .ok m' ∧
+       m'.mem.memory.allocations.map (·.data) = [sdExpectedBytes] ∧
+       m'.mem.accesses = expectedAccs ∧
+       Interp.decodeDiscriminant
+         (fun _ off sz => do pure (← subsliceWithLength sdExpectedBytes off.bytes sz.bytes, ()))
+         disc () = .ok (some 7, ())) ∧
+     (∃ m', Interp.evalStatementM mTB (.SetDiscriminant loc 7) = .ok m' ∧
+       m'.mem.memory.mem.allocations.map (·.data) = [sdExpectedBytes] ∧
+       m'.mem.accesses = expectedAccs) ∧
+     (Interp.evalStatement mBM (.SetDiscriminant misalignEnum 99) =
+       .error (.ub "setting the discriminant of a place based on a misaligned pointer") ∧
+      Interp.evalStatement mBM (.SetDiscriminant misalignNonEnum 7) =
+       .error (.specPanic
+         "setting the discriminant type of a non-enum contradicts well-formedness") ∧
+      Interp.evalStatement mBM (.SetDiscriminant loc (-1)) =
+       .error (.specPanic "setting an invalid discriminant (-1)") ∧
+      Interp.evalStatement mBM (.SetDiscriminant noProvAlignedEnum 8) = .ok mBM ∧
+      Interp.evalStatement mBM (.SetDiscriminant loc 9) =
+       .error (.ub "dereferencing pointer outside the bounds of its allocation")) ∧
+     (Interp.evalStatementM mTB (.SetDiscriminant misalignEnum 99) =
+       .error (.ub "setting the discriminant of a place based on a misaligned pointer") ∧
+      Interp.evalStatementM mTB (.SetDiscriminant misalignNonEnum 7) =
+       .error (.specPanic
+         "setting the discriminant type of a non-enum contradicts well-formedness") ∧
+      Interp.evalStatementM mTB (.SetDiscriminant loc (-1)) =
+       .error (.specPanic "setting an invalid discriminant (-1)") ∧
+      Interp.evalStatementM mTB (.SetDiscriminant noProvAlignedEnum 8) = .ok mTB ∧
+      Interp.evalStatementM mTB (.SetDiscriminant loc 9) =
+       .error (.ub "dereferencing pointer outside the bounds of its allocation")) ∧
+     (Interp.evalStatementM mTBFrozen (.SetDiscriminant loc 7) =
+       .error (.ub "Tree Borrows: local write of Frozen reference") ∧
+      ∃ m', Interp.evalStatementM mTBTagOnly (.SetDiscriminant loc 7) = .ok m' ∧
+        m'.mem.memory.mem.allocations.map (·.data) = [sdExpectedBytes])) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ⟨_, rfl, rfl, rfl, rfl⟩, ⟨_, rfl, rfl, rfl⟩,
+    ⟨rfl, rfl, rfl, rfl, rfl⟩, ⟨rfl, rfl, rfl, rfl, rfl⟩, ⟨rfl, _, rfl, rfl⟩⟩
+  · intro m dst value e herr
+    simp [Interp.evalStatement, Interp.evalSetDiscriminant, herr, error_bind]
+  · intro m m1 dst value place ty hp hne
+    simp only [Interp.evalStatement, Interp.evalSetDiscriminant, hp, ok_bind]
+    cases ty with
+    | Enum vs dt d sz al => exact absurd rfl (hne vs dt d sz al)
+    | Int _ => rfl
+    | Bool => rfl
+    | Ptr _ => rfl
+    | Tuple _ _ _ => rfl
+    | Array _ _ => rfl
+    | Slice _ => rfl
+    | Union _ _ _ _ => rfl
+    | TraitObject _ => rfl
+  · intro m m1 dst value place vs dt d sz al hp
+    refine ⟨fun hna => ?_, fun ha hnone => ?_, fun vTy ha hsome => ?_⟩
+    · simp [Interp.evalStatement, Interp.evalSetDiscriminant, hp, hna, ub]
+    · simp [Interp.evalStatement, Interp.evalSetDiscriminant, hp, ha, hnone, specPanic]
+    · simp [Interp.evalStatement, Interp.evalSetDiscriminant, hp, ha, hsome,
+        Interp.encodeDiscriminant]
+  · intro M _ _ m dst value e herr
+    simp [Interp.evalStatementM, Interp.evalSetDiscriminantM, herr, error_bind]
+  · intro M _ _ m m1 dst value place ty hp hne
+    simp only [Interp.evalStatementM, Interp.evalSetDiscriminantM, hp, ok_bind]
+    cases ty with
+    | Enum vs dt d sz al => exact absurd rfl (hne vs dt d sz al)
+    | Int _ => rfl
+    | Bool => rfl
+    | Ptr _ => rfl
+    | Tuple _ _ _ => rfl
+    | Array _ _ => rfl
+    | Slice _ => rfl
+    | Union _ _ _ _ => rfl
+    | TraitObject _ => rfl
+  · intro M _ _ m m1 dst value place vs dt d sz al hp
+    refine ⟨fun hna => ?_, fun ha hnone => ?_, fun vTy ha hsome => ?_⟩
+    · simp [Interp.evalStatementM, Interp.evalSetDiscriminantM, hp, hna, ub]
+    · simp [Interp.evalStatementM, Interp.evalSetDiscriminantM, hp, ha, hnone, specPanic]
+    · simp [Interp.evalStatementM, Interp.evalSetDiscriminantM, hp, ha, hsome,
+        Interp.encodeDiscriminantM]
+
+/-- An enum whose variants list their tags in an order that differs from the
+order of the tag offsets: variant `1` lists the tag at offset `4` before the
+tag at offset `0`, and variants `2` and `3` each pair an out-of-bounds tag
+(offset `16` in an 8-byte enum) with an in-bounds tag (offset `0`), in
+opposite orders. -/
+private def sdOrderEnumTy : Gen.Type :=
+  let mk (tagger : List (Gen.Offset × (Gen.IntType × Int))) : Gen.Variant :=
+    { ty := .Tuple [] ⟨⟨8⟩, ⟨4⟩, none⟩ none, tagger := ⟨tagger⟩ }
+  .Enum
+    ⟨[(1, mk [(⟨4⟩, (u16, 0x5678)), (⟨0⟩, (u8, 0x03))]),
+      (2, mk [(⟨16⟩, (u8, 1)), (⟨0⟩, (u8, 0x03))]),
+      (3, mk [(⟨0⟩, (u8, 0x03)), (⟨16⟩, (u8, 1))])]⟩
+    u8 .Invalid ⟨8⟩ ⟨4⟩
+
+/-- **`Statement::SetDiscriminant` writes its tags in `tagger.entries` order
+(`minirust_setDiscriminant_tagger_order`)**: the witnesses of
+`minirust_setDiscriminant_supported` list their tags by ascending offset, so
+they cannot tell the order of the entries from the order of the offsets.
+Here the two differ:
+1. on `Mach` and `MachTB`, a variant listing the `u16` tag at offset `4`
+   before the `u8` tag at offset `0` produces the same bytes, but records its
+   two `Store` accesses as `0x104` then `0x100`: entry order, not address
+   order;
+2. on `MachTB` through an all-`Frozen` pointer, where both the out-of-bounds
+   tag and the in-bounds tag fail, the tag listed first decides the UB: the
+   bounds error of `ptr_offset_inbounds` when the out-of-bounds tag comes
+   first, the Tree Borrows write error when the in-bounds tag comes first.
+   So the reported `Stop` is that of the first failing entry in list
+   order. -/
+theorem minirust_setDiscriminant_tagger_order :
+    let fnEnum := uwFn [(⟨⟨1⟩⟩, sdOrderEnumTy)]
+    let allocBM : Gen.Allocation Unit Unit :=
+      { data := sdPayloadBytes, addr := 0x100, align := ⟨4⟩, kind := .Stack, live := true,
+        extra := () }
+    let frBM : Frame :=
+      { func := fnEnum, locals := ⟨[(⟨⟨1⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩)]⟩,
+        stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := () }
+    let mBM := uwMachBM [allocBM] [frBM] []
+    let mkAllocTB (perm : Gen.Permission) :
+        Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
+      { data := sdPayloadBytes, addr := 0x100, align := ⟨4⟩, kind := .Stack, live := true,
+        extra :=
+          { root :=
+              { children := [], permissions := List.replicate 8 perm, «protected» := .No } } }
+    let frTB : Gen.StackFrame TBM :=
+      { func := fnEnum, locals := ⟨[(⟨⟨1⟩⟩, ⟨0x100, some (⟨0⟩, [])⟩)]⟩,
+        stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := ⟨[]⟩ }
+    let mTB := uwMachTB [mkAllocTB (.Unprot .Unique)] [frTB] []
+    let mTBFrozen := uwMachTB [mkAllocTB (.Unprot .Frozen)] [frTB] []
+    let loc : Gen.PlaceExpr := .Local ⟨⟨1⟩⟩
+    let entryOrderAccs : List Gen.Access :=
+      [⟨.Store, .None, 0x104, ⟨2⟩⟩, ⟨.Store, .None, 0x100, ⟨1⟩⟩]
+    (∃ m', Interp.evalStatement mBM (.SetDiscriminant loc 1) = .ok m' ∧
+      m'.mem.memory.allocations.map (·.data) = [sdExpectedBytes] ∧
+      m'.mem.accesses = entryOrderAccs) ∧
+    (∃ m', Interp.evalStatementM mTB (.SetDiscriminant loc 1) = .ok m' ∧
+      m'.mem.memory.mem.allocations.map (·.data) = [sdExpectedBytes] ∧
+      m'.mem.accesses = entryOrderAccs) ∧
+    (Interp.evalStatementM mTBFrozen (.SetDiscriminant loc 2) =
+      .error (.ub "dereferencing pointer outside the bounds of its allocation") ∧
+     Interp.evalStatementM mTBFrozen (.SetDiscriminant loc 3) =
+      .error (.ub "Tree Borrows: local write of Frozen reference")) :=
+  ⟨⟨_, rfl, rfl, rfl⟩, ⟨_, rfl, rfl, rfl⟩, ⟨rfl, rfl⟩⟩
+
+/-- The `Store` access that `SetDiscriminant` records for one tagger entry of
+a place whose pointer has address `base`: it starts at the entry's offset from
+`base` and is as long as the entry's integer type. -/
+private def sdTagAccess (base : Int) (e : Gen.Offset × (Gen.IntType × Int)) : Gen.Access :=
+  ⟨.Store, .None, base + (e.1.bytes : Int), ⟨e.2.1.size.bytes⟩⟩
+
+/-- `Type.encodeInt` at `ity` yields exactly `ity.size.bytes` bytes. -/
+private theorem encodeInt_length {ity : Gen.IntType} {v : Val} {bytes : List Byte}
+    (h : Interp.Type.encodeInt ity v = .ok bytes) : bytes.length = ity.size.bytes := by
+  obtain ⟨signed, size⟩ := ity
+  cases v with
+  | Int i =>
+    simp only [Interp.Type.encodeInt] at h
+    cases henc : Interp.Endianness.encode Interp.x86_64.ENDIANNESS signed size i with
+    | none => simp [henc, specPanic] at h
+    | some data =>
+      simp only [henc, pure_ok, Except.ok.injEq] at h
+      subst h
+      simp only [Interp.Endianness.encode] at henc
+      split at henc
+      · simp only [Option.some.injEq] at henc
+        subst henc
+        simp [Interp.x86_64.ENDIANNESS, leBytes_length]
+      · cases henc
+  | _ => simp [Interp.Type.encodeInt, specPanic] at h
+
+/-- Polymorphic `Type.encodeIntM` at `ity` yields exactly `ity.size.bytes`
+bytes. -/
+private theorem encodeIntM_length {M : Type} [Gen.Memory M] {ity : Gen.IntType}
+    {v : Gen.Value M} {bytes : List (Gen.AbstractByte (Gen.Memory.Provenance M))}
+    (h : Interp.Type.encodeIntM (M := M) ity v = .ok bytes) :
+    bytes.length = ity.size.bytes := by
+  obtain ⟨signed, size⟩ := ity
+  cases v with
+  | Int i =>
+    simp only [Interp.Type.encodeIntM] at h
+    cases henc : Interp.Endianness.encode Interp.x86_64.ENDIANNESS signed size i with
+    | none => simp [henc, specPanic] at h
+    | some data =>
+      simp only [henc, pure_ok, Except.ok.injEq] at h
+      subst h
+      simp only [Interp.Endianness.encode] at henc
+      split at henc
+      · simp only [Option.some.injEq] at henc
+        subst henc
+        simp [Interp.x86_64.ENDIANNESS, leBytes_length]
+      · cases henc
+  | _ => simp [Interp.Type.encodeIntM, specPanic] at h
+
+/-- When every accessor call changes only `mem` and appends one `Store` of the
+written bytes at its offset from `base`, `encodeDiscriminant` changes only
+`mem` and appends one such `Store` per tagger entry, in entry order. -/
+private theorem encodeDiscriminant_accesses
+    {acc : Mach → Gen.Offset → List Byte → Interp Mach} (base : Int)
+    (hacc : ∀ s offset bytes s', acc s offset bytes = .ok s' →
+      (∃ cm, s' = { s with mem := cm }) ∧
+      s'.mem.accesses = s.mem.accesses ++
+        [⟨.Store, .None, base + (offset.bytes : Int), ⟨bytes.length⟩⟩])
+    (tagger : Map Gen.Offset (Gen.IntType × Int)) {s s' : Mach}
+    (h : Interp.encodeDiscriminant acc tagger s = .ok s') :
+    (∃ cm, s' = { s with mem := cm }) ∧
+    s'.mem.accesses = s.mem.accesses ++ tagger.entries.map (sdTagAccess base) := by
+  unfold Interp.encodeDiscriminant at h
+  generalize tagger.entries = entries at h ⊢
+  induction entries generalizing s with
+  | nil =>
+    cases h
+    exact ⟨⟨_, rfl⟩, by simp⟩
+  | cons e es ih =>
+    obtain ⟨offset, valueType, value⟩ := e
+    rw [List.foldlM_cons] at h
+    obtain ⟨s1, h1, h⟩ := interpBind_ok h
+    obtain ⟨bytes, henc, h1⟩ := interpBind_ok h1
+    obtain ⟨⟨cm1, rfl⟩, hacc1⟩ := hacc _ _ _ _ h1
+    obtain ⟨⟨cm2, rfl⟩, hacc2⟩ := ih h
+    refine ⟨⟨cm2, rfl⟩, ?_⟩
+    rw [hacc2, hacc1, encodeInt_length henc]
+    simp [sdTagAccess]
+
+/-- Polymorphic counterpart of `encodeDiscriminant_accesses`. -/
+private theorem encodeDiscriminantM_accesses {M : Type} [Gen.Memory M]
+    {acc : Gen.Machine M → Gen.Offset → List (Gen.AbstractByte (Gen.Memory.Provenance M)) →
+      Interp (Gen.Machine M)} (base : Int)
+    (hacc : ∀ s offset bytes s', acc s offset bytes = .ok s' →
+      (∃ cm, s' = { s with mem := cm }) ∧
+      s'.mem.accesses = s.mem.accesses ++
+        [⟨.Store, .None, base + (offset.bytes : Int), ⟨bytes.length⟩⟩])
+    (tagger : Map Gen.Offset (Gen.IntType × Int)) {s s' : Gen.Machine M}
+    (h : Interp.encodeDiscriminantM (M := M) acc tagger s = .ok s') :
+    (∃ cm, s' = { s with mem := cm }) ∧
+    s'.mem.accesses = s.mem.accesses ++ tagger.entries.map (sdTagAccess base) := by
+  unfold Interp.encodeDiscriminantM at h
+  generalize tagger.entries = entries at h ⊢
+  induction entries generalizing s with
+  | nil =>
+    cases h
+    exact ⟨⟨_, rfl⟩, by simp⟩
+  | cons e es ih =>
+    obtain ⟨offset, valueType, value⟩ := e
+    rw [List.foldlM_cons] at h
+    obtain ⟨s1, h1, h⟩ := interpBind_ok h
+    obtain ⟨bytes, henc, h1⟩ := interpBind_ok h1
+    obtain ⟨⟨cm1, rfl⟩, hacc1⟩ := hacc _ _ _ _ h1
+    obtain ⟨⟨cm2, rfl⟩, hacc2⟩ := ih h
+    refine ⟨⟨cm2, rfl⟩, ?_⟩
+    rw [hacc2, hacc1, encodeIntM_length henc]
+    simp [sdTagAccess]
+
+/-- **`Statement::SetDiscriminant` stores exactly the tags, in entry order
+(`minirust_setDiscriminant_accesses_law`)**: the concrete witnesses show on
+particular enums that only tag bytes are written. This is the general
+statement, for every machine, place, and enum type, on `Mach` and on
+polymorphic `Machine M` (`MachTB`): whenever `SetDiscriminant` succeeds on an
+aligned enum place with variant `value`,
+- the machine differs from the one `eval_place` returned only in `mem`, and
+- the access log grows by exactly one non-atomic `Store` per entry of the
+  variant's `tagger`, in the order of `tagger.entries`, each starting at the
+  entry's offset from the place and as long as the entry's integer type.
+
+So `SetDiscriminant` issues no load and no store outside the tag ranges, and
+never touches threads, frames, or the payload stack. The law is about which
+stores are issued. That a tag range is disjoint from the bytes of the
+variant's fields is a well-formedness property of the enum type, which
+`SetDiscriminant` does not check: the stores listed here are issued whether
+or not a tag range overlaps a field. -/
+theorem minirust_setDiscriminant_accesses_law :
+    (∀ (m m1 m' : Mach) (dst : Gen.PlaceExpr) (value : Int) (place : Gen.Place BM)
+        (vs : Map Int Gen.Variant) (dt : Gen.IntType) (d : Gen.Discriminator)
+        (sz : LibSpecr.Size) (al : LibSpecr.Align) (variant : Gen.Variant),
+      Interp.evalPlace m dst = .ok ((place, .Enum vs dt d sz al), m1) →
+      place.aligned = true → mapGet vs value = some variant →
+      Interp.evalStatement m (.SetDiscriminant dst value) = .ok m' →
+      (∃ cm, m' = { m1 with mem := cm }) ∧
+      m'.mem.accesses = m1.mem.accesses ++
+        variant.tagger.entries.map (sdTagAccess place.ptr.thin_pointer.addr)) ∧
+    (∀ {M : Type} [Gen.Memory M] [Interp.MemoryOps M] (m m1 m' : Gen.Machine M)
+        (dst : Gen.PlaceExpr) (value : Int) (place : Gen.Place M)
+        (vs : Map Int Gen.Variant) (dt : Gen.IntType) (d : Gen.Discriminator)
+        (sz : LibSpecr.Size) (al : LibSpecr.Align) (variant : Gen.Variant),
+      Interp.evalPlaceM m dst = .ok ((place, .Enum vs dt d sz al), m1) →
+      place.aligned = true → mapGet vs value = some variant →
+      Interp.evalStatementM m (.SetDiscriminant dst value) = .ok m' →
+      (∃ cm, m' = { m1 with mem := cm }) ∧
+      m'.mem.accesses = m1.mem.accesses ++
+        variant.tagger.entries.map (sdTagAccess place.ptr.thin_pointer.addr)) := by
+  refine ⟨?_, ?_⟩
+  · intro m m1 m' dst value place vs dt d sz al variant hp ha hsome h
+    simp only [Interp.evalStatement, Interp.evalSetDiscriminant, hp, ok_bind, ha,
+      Bool.not_true, Bool.false_eq_true, ↓reduceIte, hsome] at h
+    refine encodeDiscriminant_accesses place.ptr.thin_pointer.addr
+      (fun s offset bytes s' hs => ?_) variant.tagger h
+    obtain ⟨ptr, hptr, hs⟩ := interpBind_ok hs
+    obtain ⟨cm, hst, hs⟩ := interpBind_ok hs
+    cases hs
+    have haddr : ptr.addr = place.ptr.thin_pointer.addr + (offset.bytes : Int) := by
+      unfold Interp.ptrOffsetInbounds at hptr
+      obtain ⟨_, _, hptr⟩ := interpBind_ok hptr
+      split at hptr
+      · cases hptr
+      · split at hptr
+        · cases hptr
+        · cases hptr
+          rfl
+    have hlog : cm.accesses = s.mem.accesses ++ [⟨.Store, .None, ptr.addr, ⟨bytes.length⟩⟩] := by
+      unfold Interp.CM.store at hst
+      obtain ⟨_, _, hst⟩ := interpBind_ok hst
+      cases hst
+      rfl
+    exact ⟨⟨cm, rfl⟩, by rw [hlog, haddr]⟩
+  · intro M _ _ m m1 m' dst value place vs dt d sz al variant hp ha hsome h
+    simp only [Interp.evalStatementM, Interp.evalSetDiscriminantM, hp, ok_bind, ha,
+      Bool.not_true, Bool.false_eq_true, ↓reduceIte, hsome] at h
+    refine encodeDiscriminantM_accesses place.ptr.thin_pointer.addr
+      (fun s offset bytes s' hs => ?_) variant.tagger h
+    obtain ⟨ptr, hptr, hs⟩ := interpBind_ok hs
+    obtain ⟨cm, hst, hs⟩ := interpBind_ok hs
+    cases hs
+    have haddr : ptr.addr = place.ptr.thin_pointer.addr + (offset.bytes : Int) := by
+      unfold Interp.ptrOffsetInboundsM at hptr
+      obtain ⟨_, _, hptr⟩ := interpBind_ok hptr
+      split at hptr
+      · cases hptr
+      · split at hptr
+        · cases hptr
+        · cases hptr
+          rfl
+    have hlog : cm.accesses = s.mem.accesses ++ [⟨.Store, .None, ptr.addr, ⟨bytes.length⟩⟩] := by
+      unfold Interp.ConcurrentMemory.store at hst
+      obtain ⟨_, _, hst⟩ := interpBind_ok hst
+      cases hst
+      rfl
+    exact ⟨⟨cm, rfl⟩, by rw [hlog, haddr]⟩
+
+/-- Whether byte index `k` of an allocation at `allocAddr` lies inside the byte
+range written by tagger entry `e` for a place at address `base`. -/
+private def sdInTagRange (base allocAddr : Int)
+    (e : Gen.Offset × (Gen.IntType × Int)) (k : Nat) : Prop :=
+  base + (e.1.bytes : Int) ≤ allocAddr + (k : Int) ∧
+    allocAddr + (k : Int) < base + (e.1.bytes : Int) + (e.2.1.size.bytes : Int)
+
+/-- `writeSubsliceAtIndex` preserves list length and every element outside
+`[start, start + src.length)`, and writes `src[i]` at `start + i`. -/
+private theorem writeSubsliceAtIndex_spec {T : Type} {xs src xs' : List T} {start : Int}
+    (h : Interp.writeSubsliceAtIndex xs start src = .ok xs') :
+    0 ≤ start ∧
+    start.toNat + src.length ≤ xs.length ∧
+    xs'.length = xs.length ∧
+    (∀ k : Nat, k < start.toNat ∨ start.toNat + src.length ≤ k → xs'[k]? = xs[k]?) ∧
+    (∀ i : Nat, i < src.length → xs'[start.toNat + i]? = src[i]?) := by
+  unfold Interp.writeSubsliceAtIndex at h
+  split at h
+  · rename_i hcond
+    cases h
+    have hle : start.toNat + src.length ≤ xs.length := by omega
+    have htake : (xs.take start.toNat).length = start.toNat :=
+      List.length_take_of_le (by omega)
+    refine ⟨hcond.1, hle, ?_, ?_, ?_⟩
+    · simp only [List.length_append, htake, List.length_drop]
+      omega
+    · intro k hk
+      rcases hk with hlt | hge
+      · rw [List.getElem?_append_left (by simp only [List.length_append, htake]; omega)]
+        rw [List.getElem?_append_left (by rw [htake]; exact hlt)]
+        exact List.getElem?_take_of_lt hlt
+      · rw [List.getElem?_append_right (by simp only [List.length_append, htake]; exact hge)]
+        simp only [List.length_append, htake, List.getElem?_drop]
+        congr 1
+        omega
+    · intro i hi
+      rw [List.getElem?_append_left (by simp only [List.length_append, htake]; omega)]
+      rw [List.getElem?_append_right (by rw [htake]; omega)]
+      rw [htake]
+      simp
+  · cases h
+
+/-- Single-store frame and write law for `BM.store`: preserves allocation
+count, every non-target allocation verbatim, target metadata, and every byte
+outside `[ptr.addr, ptr.addr + bytes.length)`, and writes `bytes` in range. -/
+private theorem bmStore_frame {mem mem' : BM} {ptr : Ptr} {bytes : List Byte}
+    {align : LibSpecr.Align} (h : Interp.BM.store mem ptr bytes align = .ok mem') :
+    mem'.allocations.length = mem.allocations.length ∧
+    (∀ j : Nat, ptr.provenance.map Prod.fst ≠ some ⟨(j : Int)⟩ →
+      mem'.allocations[j]? = mem.allocations[j]?) ∧
+    (∀ (j : Nat) (a a' : Gen.Allocation Unit Unit),
+      mem.allocations[j]? = some a → mem'.allocations[j]? = some a' →
+      a'.addr = a.addr ∧ a'.align = a.align ∧ a'.kind = a.kind ∧ a'.live = a.live ∧
+      a'.data.length = a.data.length ∧
+      (∀ k : Nat, ¬(ptr.addr ≤ a.addr + (k : Int) ∧
+          a.addr + (k : Int) < ptr.addr + (bytes.length : Int)) →
+        a'.data[k]? = a.data[k]?)) ∧
+    (0 < bytes.length →
+      ∃ (aid : Gen.AllocId) (pex : Unit) (a a' : Gen.Allocation Unit Unit),
+        ptr.provenance = some (aid, pex) ∧ 0 ≤ aid._0 ∧
+        mem.allocations[aid._0.toNat]? = some a ∧
+        mem'.allocations[aid._0.toNat]? = some a' ∧
+        0 ≤ ptr.addr - a.addr ∧
+        ∀ i : Nat, i < bytes.length →
+          a'.data[(ptr.addr - a.addr).toNat + i]? = bytes[i]?) := by
+  unfold Interp.BM.store at h
+  split at h
+  · cases h
+  · obtain ⟨chk, hchk, h⟩ := interpBind_ok h
+    cases chk with
+    | none =>
+      cases h
+      refine ⟨rfl, fun _ _ => rfl,
+        fun j a a' ha ha' => by
+          rw [ha] at ha'
+          cases ha'
+          exact ⟨rfl, rfl, rfl, rfl, rfl, fun _ _ => rfl⟩,
+        fun hpos => ?_⟩
+      unfold Interp.BM.check_ptr at hchk
+      split at hchk
+      · rename_i hzero
+        simp only at hzero
+        omega
+      · cases hprov : ptr.provenance with
+        | none => simp [hprov, ub] at hchk
+        | some pp =>
+          simp only [hprov] at hchk
+          obtain ⟨a, _, hchk⟩ := interpBind_ok hchk
+          split at hchk
+          · cases hchk
+          · split at hchk <;> cases hchk
+    | some res =>
+      obtain ⟨aid, pex, offset⟩ := res
+      obtain ⟨a0, hidx, h⟩ := interpBind_ok h
+      obtain ⟨data', hws, h⟩ := interpBind_ok h
+      obtain ⟨allocs', hset, h⟩ := interpBind_ok h
+      cases h
+      unfold Interp.BM.check_ptr at hchk
+      split at hchk
+      · cases hchk
+      · cases hprov : ptr.provenance with
+        | none => simp [hprov, ub] at hchk
+        | some pp =>
+          obtain ⟨aid', pex'⟩ := pp
+          simp only [hprov] at hchk
+          obtain ⟨aChk, hidxChk, hchk⟩ := interpBind_ok hchk
+          split at hchk
+          · cases hchk
+          · split at hchk
+            · cases hchk
+            · rename_i hnotoob
+              cases hchk
+              obtain ⟨hgeId, hget0⟩ := listIndex_ok_get hidx
+              obtain ⟨_, hgetChk⟩ := listIndex_ok_get hidxChk
+              rw [hget0] at hgetChk
+              cases hgetChk
+              unfold listSet at hset
+              split at hset
+              · rename_i hsetcond
+                cases hset
+                obtain ⟨_, _, hLenEq, hOut, hIn⟩ := writeSubsliceAtIndex_spec hws
+                have htoNat :
+                    (({ bytes := (ptr.addr - a0.addr).toNat } : LibSpecr.Size).bytes : Int).toNat =
+                      (ptr.addr - a0.addr).toNat := rfl
+                rw [htoNat] at hOut hIn
+                have hoffGe : 0 ≤ ptr.addr - a0.addr :=
+                  Int.not_lt.mp (fun hlt => hnotoob (Or.inl hlt))
+                refine ⟨List.length_set, ?_, ?_, ?_⟩
+                · intro j hne
+                  have hij : aid._0.toNat ≠ j := by
+                    intro heq
+                    apply hne
+                    simp only [Option.map_some, Option.some.injEq]
+                    cases aid
+                    simp only at hgeId heq ⊢
+                    congr 1
+                    omega
+                  exact List.getElem?_set_ne hij
+                · intro j a a' ha ha'
+                  by_cases hij : aid._0.toNat = j
+                  · subst hij
+                    rw [hget0] at ha
+                    cases ha
+                    rw [List.getElem?_set_self hsetcond.2] at ha'
+                    cases ha'
+                    refine ⟨rfl, rfl, rfl, rfl, hLenEq, fun k hk => ?_⟩
+                    let pa : Int := ptr.addr
+                    let aa : Int := a0.addr
+                    have hge0 : (0 : Int) ≤ pa - aa := hoffGe
+                    have hk' : ¬(pa ≤ aa + (k : Int) ∧
+                        aa + (k : Int) < pa + (bytes.length : Int)) := hk
+                    have hko : k < (pa - aa).toNat ∨ (pa - aa).toNat + bytes.length ≤ k := by
+                      omega
+                    exact hOut k hko
+                  · rw [List.getElem?_set_ne hij, ha] at ha'
+                    cases ha'
+                    exact ⟨rfl, rfl, rfl, rfl, rfl, fun _ _ => rfl⟩
+                · intro _
+                  refine ⟨aid, pex, a0, { a0 with data := data' }, rfl, hgeId, hget0,
+                    List.getElem?_set_self hsetcond.2, hoffGe, fun i hi => hIn i hi⟩
+              · cases hset
+
+/-- Single-store frame and write law for polymorphic `BasicMemory.store`
+(applied below to `TreeBorrowsMemory.store`): preserves allocation count, every
+non-target allocation verbatim (including `extra`), target metadata, and every
+byte outside `[ptr.addr, ptr.addr + bytes.length)`, and writes `bytes`. -/
+private theorem basicMemoryStore_frame {ProvExtra AllocExtra : Type}
+    {mem mem' : Gen.BasicMemory Gen.x86_64 ProvExtra AllocExtra}
+    {ptr : Gen.ThinPointer (Gen.Provenance ProvExtra)}
+    {bytes : List (Gen.AbstractByte (Gen.Provenance ProvExtra))}
+    {align : LibSpecr.Align}
+    {handleExtra : AllocExtra → ProvExtra → Gen.Offset → Interp AllocExtra}
+    (h : Interp.BasicMemory.store mem ptr bytes align handleExtra = .ok mem') :
+    mem'.allocations.length = mem.allocations.length ∧
+    (∀ j : Nat, ptr.provenance.map Prod.fst ≠ some ⟨(j : Int)⟩ →
+      mem'.allocations[j]? = mem.allocations[j]?) ∧
+    (∀ (j : Nat) (a a' : Gen.Allocation ProvExtra AllocExtra),
+      mem.allocations[j]? = some a → mem'.allocations[j]? = some a' →
+      a'.addr = a.addr ∧ a'.align = a.align ∧ a'.kind = a.kind ∧ a'.live = a.live ∧
+      a'.data.length = a.data.length ∧
+      (∀ k : Nat, ¬(ptr.addr ≤ a.addr + (k : Int) ∧
+          a.addr + (k : Int) < ptr.addr + (bytes.length : Int)) →
+        a'.data[k]? = a.data[k]?)) ∧
+    (0 < bytes.length →
+      ∃ (aid : Gen.AllocId) (pex : ProvExtra)
+          (a a' : Gen.Allocation ProvExtra AllocExtra),
+        ptr.provenance = some (aid, pex) ∧ 0 ≤ aid._0 ∧
+        mem.allocations[aid._0.toNat]? = some a ∧
+        mem'.allocations[aid._0.toNat]? = some a' ∧
+        0 ≤ ptr.addr - a.addr ∧
+        ∀ i : Nat, i < bytes.length →
+          a'.data[(ptr.addr - a.addr).toNat + i]? = bytes[i]?) := by
+  unfold Interp.BasicMemory.store at h
+  split at h
+  · cases h
+  · obtain ⟨chk, hchk, h⟩ := interpBind_ok h
+    cases chk with
+    | none =>
+      cases h
+      refine ⟨rfl, fun _ _ => rfl,
+        fun j a a' ha ha' => by
+          rw [ha] at ha'
+          cases ha'
+          exact ⟨rfl, rfl, rfl, rfl, rfl, fun _ _ => rfl⟩,
+        fun hpos => ?_⟩
+      unfold Interp.BasicMemory.check_ptr at hchk
+      split at hchk
+      · rename_i hzero
+        simp only at hzero
+        omega
+      · cases hprov : ptr.provenance with
+        | none => simp [hprov, ub] at hchk
+        | some pp =>
+          simp only [hprov] at hchk
+          obtain ⟨a, _, hchk⟩ := interpBind_ok hchk
+          split at hchk
+          · cases hchk
+          · split at hchk <;> cases hchk
+    | some res =>
+      obtain ⟨aid, pex, offset⟩ := res
+      obtain ⟨a0, hidx, h⟩ := interpBind_ok h
+      obtain ⟨extra', _, h⟩ := interpBind_ok h
+      obtain ⟨data', hws, h⟩ := interpBind_ok h
+      obtain ⟨allocs', hset, h⟩ := interpBind_ok h
+      cases h
+      unfold Interp.BasicMemory.check_ptr at hchk
+      split at hchk
+      · cases hchk
+      · cases hprov : ptr.provenance with
+        | none => simp [hprov, ub] at hchk
+        | some pp =>
+          obtain ⟨aid', pex'⟩ := pp
+          simp only [hprov] at hchk
+          obtain ⟨aChk, hidxChk, hchk⟩ := interpBind_ok hchk
+          split at hchk
+          · cases hchk
+          · split at hchk
+            · cases hchk
+            · rename_i hnotoob
+              cases hchk
+              obtain ⟨hgeId, hget0⟩ := listIndex_ok_get hidx
+              obtain ⟨_, hgetChk⟩ := listIndex_ok_get hidxChk
+              rw [hget0] at hgetChk
+              cases hgetChk
+              unfold listSet at hset
+              split at hset
+              · rename_i hsetcond
+                cases hset
+                obtain ⟨_, _, hLenEq, hOut, hIn⟩ := writeSubsliceAtIndex_spec hws
+                have htoNat :
+                    (({ bytes := (ptr.addr - a0.addr).toNat } : LibSpecr.Size).bytes : Int).toNat =
+                      (ptr.addr - a0.addr).toNat := rfl
+                rw [htoNat] at hOut hIn
+                have hoffGe : 0 ≤ ptr.addr - a0.addr :=
+                  Int.not_lt.mp (fun hlt => hnotoob (Or.inl hlt))
+                refine ⟨List.length_set, ?_, ?_, ?_⟩
+                · intro j hne
+                  have hij : aid._0.toNat ≠ j := by
+                    intro heq
+                    apply hne
+                    simp only [Option.map_some, Option.some.injEq]
+                    cases aid
+                    simp only at hgeId heq ⊢
+                    congr 1
+                    omega
+                  exact List.getElem?_set_ne hij
+                · intro j a a' ha ha'
+                  by_cases hij : aid._0.toNat = j
+                  · subst hij
+                    rw [hget0] at ha
+                    cases ha
+                    rw [List.getElem?_set_self hsetcond.2] at ha'
+                    cases ha'
+                    refine ⟨rfl, rfl, rfl, rfl, hLenEq, fun k hk => ?_⟩
+                    let pa : Int := ptr.addr
+                    let aa : Int := a0.addr
+                    have hge0 : (0 : Int) ≤ pa - aa := hoffGe
+                    have hk' : ¬(pa ≤ aa + (k : Int) ∧
+                        aa + (k : Int) < pa + (bytes.length : Int)) := hk
+                    have hko : k < (pa - aa).toNat ∨ (pa - aa).toNat + bytes.length ≤ k := by
+                      omega
+                    exact hOut k hko
+                  · rw [List.getElem?_set_ne hij, ha] at ha'
+                    cases ha'
+                    exact ⟨rfl, rfl, rfl, rfl, rfl, fun _ _ => rfl⟩
+                · intro _
+                  refine ⟨aid, pex, a0, { a0 with data := data', extra := extra' }, rfl, hgeId,
+                    hget0, List.getElem?_set_self hsetcond.2, hoffGe, fun i hi => hIn i hi⟩
+              · cases hset
+
+/-- Inductive memory-frame and tag-write law for `encodeDiscriminant` on
+`Mach`. -/
+private theorem encodeDiscriminant_memory_frame (p : Ptr)
+    (tagger : Map Gen.Offset (Gen.IntType × Int)) {s s' : Mach}
+    (h : Interp.encodeDiscriminant
+      (fun (m : Mach) offset bytes => do
+        let ptr ← Interp.ptrOffsetInbounds m p (offset.bytes : Int)
+        let cm ← Interp.CM.store m.mem ptr bytes ⟨1⟩ .None
+        pure { m with mem := cm }) tagger s = .ok s') :
+    s'.mem.memory.allocations.length = s.mem.memory.allocations.length ∧
+    (∀ j : Nat, p.provenance.map Prod.fst ≠ some ⟨(j : Int)⟩ →
+      s'.mem.memory.allocations[j]? = s.mem.memory.allocations[j]?) ∧
+    (∀ (j : Nat) (a a' : Gen.Allocation Unit Unit),
+      s.mem.memory.allocations[j]? = some a →
+      s'.mem.memory.allocations[j]? = some a' →
+      a'.addr = a.addr ∧ a'.align = a.align ∧ a'.kind = a.kind ∧ a'.live = a.live ∧
+      a'.data.length = a.data.length ∧
+      (∀ k : Nat, (∀ e ∈ tagger.entries, ¬ sdInTagRange p.addr a.addr e k) →
+        a'.data[k]? = a.data[k]?)) ∧
+    (∀ pre off ity val post, tagger.entries = pre ++ (off, (ity, val)) :: post →
+      ∃ bytes, Interp.Type.encodeInt ity (.Int val) = .ok bytes ∧
+        (0 < ity.size.bytes →
+          ∃ (aid : Gen.AllocId) (pex : Unit) (a a' : Gen.Allocation Unit Unit),
+            p.provenance = some (aid, pex) ∧ 0 ≤ aid._0 ∧
+            s.mem.memory.allocations[aid._0.toNat]? = some a ∧
+            s'.mem.memory.allocations[aid._0.toNat]? = some a' ∧
+            0 ≤ p.addr + (off.bytes : Int) - a.addr ∧
+            ∀ i : Nat, i < bytes.length →
+              (∀ e' ∈ post,
+                ¬ sdInTagRange p.addr a.addr e'
+                  ((p.addr + (off.bytes : Int) - a.addr).toNat + i)) →
+              a'.data[(p.addr + (off.bytes : Int) - a.addr).toNat + i]? = bytes[i]?)) := by
+  unfold Interp.encodeDiscriminant at h
+  generalize tagger.entries = entries at h ⊢
+  induction entries generalizing s with
+  | nil =>
+    cases h
+    refine ⟨rfl, fun _ _ => rfl,
+      fun j a a' ha ha' => by
+        rw [ha] at ha'
+        cases ha'
+        exact ⟨rfl, rfl, rfl, rfl, rfl, fun _ _ => rfl⟩,
+      fun pre off ity val post hsplit => by
+        cases pre <;> simp at hsplit⟩
+  | cons e0 es ih =>
+    obtain ⟨off0, ity0, val0⟩ := e0
+    rw [List.foldlM_cons] at h
+    obtain ⟨s1, h1, h⟩ := interpBind_ok h
+    obtain ⟨bytes0, henc0, h1⟩ := interpBind_ok h1
+    obtain ⟨ptr0, hptr0, h1⟩ := interpBind_ok h1
+    obtain ⟨cm1, hcm1, h1⟩ := interpBind_ok h1
+    cases h1
+    have hptrEq : ptr0 = { p with addr := p.addr + (off0.bytes : Int) } := by
+      unfold Interp.ptrOffsetInbounds at hptr0
+      obtain ⟨_, _, hptr0⟩ := interpBind_ok hptr0
+      split at hptr0
+      · cases hptr0
+      · split at hptr0
+        · cases hptr0
+        · cases hptr0
+          rfl
+    subst hptrEq
+    unfold Interp.CM.store at hcm1
+    obtain ⟨mem1, hst1, hcm1⟩ := interpBind_ok hcm1
+    cases hcm1
+    obtain ⟨hlen1, hother1, hmeta1, hwr1⟩ := bmStore_frame hst1
+    obtain ⟨hlen2, hother2, hmeta2, hwr2⟩ := ih h
+    have hblen0 : bytes0.length = ity0.size.bytes := encodeInt_length henc0
+    refine ⟨hlen2.trans hlen1,
+      fun j hj => (hother2 j hj).trans (hother1 j hj),
+      ?_, ?_⟩
+    · intro j a a' ha ha'
+      have hjlt : j < mem1.allocations.length := by
+        rw [hlen1]
+        exact (List.getElem?_eq_some_iff.mp ha).1
+      let a1 := mem1.allocations[j]
+      have ha1 : mem1.allocations[j]? = some a1 := List.getElem?_eq_getElem hjlt
+      obtain ⟨haddr1, hal1, hk1, hl1, hd1, hout1⟩ := hmeta1 j a a1 ha ha1
+      obtain ⟨haddr2, hal2, hk2, hl2, hd2, hout2⟩ := hmeta2 j a1 a' ha1 ha'
+      refine ⟨haddr2.trans haddr1, hal2.trans hal1, hk2.trans hk1, hl2.trans hl1, hd2.trans hd1,
+        fun k hk => ?_⟩
+      have hk0 : ¬(p.addr + (off0.bytes : Int) ≤ a.addr + (k : Int) ∧
+          a.addr + (k : Int) < p.addr + (off0.bytes : Int) + (bytes0.length : Int)) := by
+        rw [hblen0]
+        exact hk (off0, (ity0, val0)) (by simp)
+      have hkes : ∀ e ∈ es, ¬ sdInTagRange p.addr a1.addr e k := by
+        intro e he
+        rw [haddr1]
+        exact hk e (by simp [he])
+      exact (hout2 k hkes).trans (hout1 k hk0)
+    · intro pre off ity val post hsplit
+      cases pre with
+      | nil =>
+        simp only [List.nil_append, List.cons.injEq, Prod.mk.injEq] at hsplit
+        obtain ⟨⟨rfl, rfl, rfl⟩, rfl⟩ := hsplit
+        refine ⟨bytes0, henc0, fun hpos => ?_⟩
+        obtain ⟨aid, pex, a, a1, hprov, hgeId, ha, ha1, hoffGe, hbytes1⟩ :=
+          hwr1 (by omega)
+        have hidlt : aid._0.toNat < s'.mem.memory.allocations.length := by
+          rw [hlen2]
+          exact (List.getElem?_eq_some_iff.mp ha1).1
+        let a' := s'.mem.memory.allocations[aid._0.toNat]
+        have ha' : s'.mem.memory.allocations[aid._0.toNat]? = some a' :=
+          List.getElem?_eq_getElem hidlt
+        obtain ⟨haddr1, _, _, _, _, _⟩ := hmeta1 aid._0.toNat a a1 ha ha1
+        obtain ⟨_, _, _, _, _, hout2⟩ := hmeta2 aid._0.toNat a1 a' ha1 ha'
+        refine ⟨aid, pex, a, a', hprov, hgeId, ha, ha', hoffGe, fun i hi hnotpost => ?_⟩
+        have hpost1 : ∀ e' ∈ es,
+            ¬ sdInTagRange p.addr a1.addr e' ((p.addr + (off0.bytes : Int) - a.addr).toNat + i) :=
+          fun e' he' => by rw [haddr1]; exact hnotpost e' he'
+        exact (hout2 _ hpost1).trans (hbytes1 i hi)
+      | cons e0' pre' =>
+        simp only [List.cons_append, List.cons.injEq] at hsplit
+        obtain ⟨rfl, htail⟩ := hsplit
+        obtain ⟨bytes, henc, hrest⟩ := hwr2 pre' off ity val post htail
+        refine ⟨bytes, henc, fun hpos => ?_⟩
+        obtain ⟨aid, pex, a1, a', hprov, hgeId, ha1, ha', hoffGe, hbytes2⟩ := hrest hpos
+        have hidlt : aid._0.toNat < s.mem.memory.allocations.length := by
+          rw [← hlen1]
+          exact (List.getElem?_eq_some_iff.mp ha1).1
+        let a := s.mem.memory.allocations[aid._0.toNat]
+        have ha : s.mem.memory.allocations[aid._0.toNat]? = some a :=
+          List.getElem?_eq_getElem hidlt
+        obtain ⟨haddr1, _, _, _, _, _⟩ := hmeta1 aid._0.toNat a a1 ha ha1
+        refine ⟨aid, pex, a, a', hprov, hgeId, ha, ha', by rw [← haddr1]; exact hoffGe,
+          fun i hi hnotpost => ?_⟩
+        simpa [haddr1] using hbytes2 i hi (by simpa [haddr1] using hnotpost)
+
+/-- Inductive memory-frame and tag-write law for `encodeDiscriminantM` on
+`MachTB` (`TreeBorrowsMemory`). -/
+private theorem encodeDiscriminantM_tb_memory_frame
+    (p : Gen.ThinPointer Gen.TreeBorrowsProvenance)
+    (tagger : Map Gen.Offset (Gen.IntType × Int)) {s s' : MachTB}
+    (h : Interp.encodeDiscriminantM (M := TBM)
+      (fun (m : MachTB) offset bytes => do
+        let ptr ← Interp.ptrOffsetInboundsM m p (offset.bytes : Int)
+        let cm ← Interp.ConcurrentMemory.store m.mem ptr bytes ⟨1⟩ .None
+        pure { m with mem := cm }) tagger s = .ok s') :
+    s'.mem.memory.params = s.mem.memory.params ∧
+    s'.mem.memory.mem.allocations.length = s.mem.memory.mem.allocations.length ∧
+    (∀ j : Nat, p.provenance.map Prod.fst ≠ some ⟨(j : Int)⟩ →
+      s'.mem.memory.mem.allocations[j]? = s.mem.memory.mem.allocations[j]?) ∧
+    (∀ (j : Nat) (a a' : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra),
+      s.mem.memory.mem.allocations[j]? = some a →
+      s'.mem.memory.mem.allocations[j]? = some a' →
+      a'.addr = a.addr ∧ a'.align = a.align ∧ a'.kind = a.kind ∧ a'.live = a.live ∧
+      a'.data.length = a.data.length ∧
+      (∀ k : Nat, (∀ e ∈ tagger.entries, ¬ sdInTagRange p.addr a.addr e k) →
+        a'.data[k]? = a.data[k]?)) ∧
+    (∀ pre off ity val post, tagger.entries = pre ++ (off, (ity, val)) :: post →
+      ∃ bytes, Interp.Type.encodeIntM (M := TBM) ity (.Int val) = .ok bytes ∧
+        (0 < ity.size.bytes →
+          ∃ (aid : Gen.AllocId) (pex : Gen.Path)
+              (a a' : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra),
+            p.provenance = some (aid, pex) ∧ 0 ≤ aid._0 ∧
+            s.mem.memory.mem.allocations[aid._0.toNat]? = some a ∧
+            s'.mem.memory.mem.allocations[aid._0.toNat]? = some a' ∧
+            0 ≤ p.addr + (off.bytes : Int) - a.addr ∧
+            ∀ i : Nat, i < bytes.length →
+              (∀ e' ∈ post,
+                ¬ sdInTagRange p.addr a.addr e'
+                  ((p.addr + (off.bytes : Int) - a.addr).toNat + i)) →
+              a'.data[(p.addr + (off.bytes : Int) - a.addr).toNat + i]? = bytes[i]?)) := by
+  unfold Interp.encodeDiscriminantM at h
+  generalize tagger.entries = entries at h ⊢
+  induction entries generalizing s with
+  | nil =>
+    cases h
+    refine ⟨rfl, rfl, fun _ _ => rfl,
+      fun j a a' ha ha' => by
+        rw [ha] at ha'
+        cases ha'
+        exact ⟨rfl, rfl, rfl, rfl, rfl, fun _ _ => rfl⟩,
+      fun pre off ity val post hsplit => by
+        cases pre <;> simp at hsplit⟩
+  | cons e0 es ih =>
+    obtain ⟨off0, ity0, val0⟩ := e0
+    rw [List.foldlM_cons] at h
+    obtain ⟨s1, h1, h⟩ := interpBind_ok h
+    obtain ⟨bytes0, henc0, h1⟩ := interpBind_ok h1
+    obtain ⟨ptr0, hptr0, h1⟩ := interpBind_ok h1
+    obtain ⟨cm1, hcm1, h1⟩ := interpBind_ok h1
+    cases h1
+    have hptrEq : ptr0 = { p with addr := p.addr + (off0.bytes : Int) } := by
+      unfold Interp.ptrOffsetInboundsM at hptr0
+      obtain ⟨_, _, hptr0⟩ := interpBind_ok hptr0
+      split at hptr0
+      · cases hptr0
+      · split at hptr0
+        · cases hptr0
+        · cases hptr0
+          rfl
+    subst hptrEq
+    unfold Interp.ConcurrentMemory.store at hcm1
+    obtain ⟨tbm1, htbm1, hcm1⟩ := interpBind_ok hcm1
+    cases hcm1
+    change Interp.TreeBorrowsMemory.store s.mem.memory
+      { p with addr := p.addr + (off0.bytes : Int) } bytes0 ⟨1⟩ = .ok tbm1 at htbm1
+    unfold Interp.TreeBorrowsMemory.store at htbm1
+    obtain ⟨mem1, hst1, htbm1⟩ := interpBind_ok htbm1
+    cases htbm1
+    obtain ⟨hlen1, hother1, hmeta1, hwr1⟩ := basicMemoryStore_frame hst1
+    obtain ⟨hpar2, hlen2, hother2, hmeta2, hwr2⟩ := ih h
+    have hblen0 : bytes0.length = ity0.size.bytes := encodeIntM_length henc0
+    refine ⟨hpar2, hlen2.trans hlen1,
+      fun j hj => (hother2 j hj).trans (hother1 j hj),
+      ?_, ?_⟩
+    · intro j a a' ha ha'
+      have hjlt : j < mem1.allocations.length := by
+        rw [hlen1]
+        exact (List.getElem?_eq_some_iff.mp ha).1
+      let a1 := mem1.allocations[j]
+      have ha1 : mem1.allocations[j]? = some a1 := List.getElem?_eq_getElem hjlt
+      obtain ⟨haddr1, hal1, hk1, hl1, hd1, hout1⟩ := hmeta1 j a a1 ha ha1
+      obtain ⟨haddr2, hal2, hk2, hl2, hd2, hout2⟩ := hmeta2 j a1 a' ha1 ha'
+      refine ⟨haddr2.trans haddr1, hal2.trans hal1, hk2.trans hk1, hl2.trans hl1, hd2.trans hd1,
+        fun k hk => ?_⟩
+      have hk0 : ¬(p.addr + (off0.bytes : Int) ≤ a.addr + (k : Int) ∧
+          a.addr + (k : Int) < p.addr + (off0.bytes : Int) + (bytes0.length : Int)) := by
+        rw [hblen0]
+        exact hk (off0, (ity0, val0)) (by simp)
+      have hkes : ∀ e ∈ es, ¬ sdInTagRange p.addr a1.addr e k := by
+        intro e he
+        rw [haddr1]
+        exact hk e (by simp [he])
+      exact (hout2 k hkes).trans (hout1 k hk0)
+    · intro pre off ity val post hsplit
+      cases pre with
+      | nil =>
+        simp only [List.nil_append, List.cons.injEq, Prod.mk.injEq] at hsplit
+        obtain ⟨⟨rfl, rfl, rfl⟩, rfl⟩ := hsplit
+        refine ⟨bytes0, henc0, fun hpos => ?_⟩
+        obtain ⟨aid, pex, a, a1, hprov, hgeId, ha, ha1, hoffGe, hbytes1⟩ :=
+          hwr1 (by omega)
+        have hidlt : aid._0.toNat < s'.mem.memory.mem.allocations.length := by
+          rw [hlen2]
+          exact (List.getElem?_eq_some_iff.mp ha1).1
+        let a' := s'.mem.memory.mem.allocations[aid._0.toNat]
+        have ha' : s'.mem.memory.mem.allocations[aid._0.toNat]? = some a' :=
+          List.getElem?_eq_getElem hidlt
+        obtain ⟨haddr1, _, _, _, _, _⟩ := hmeta1 aid._0.toNat a a1 ha ha1
+        obtain ⟨_, _, _, _, _, hout2⟩ := hmeta2 aid._0.toNat a1 a' ha1 ha'
+        refine ⟨aid, pex, a, a', hprov, hgeId, ha, ha', hoffGe, fun i hi hnotpost => ?_⟩
+        have hpost1 : ∀ e' ∈ es,
+            ¬ sdInTagRange p.addr a1.addr e' ((p.addr + (off0.bytes : Int) - a.addr).toNat + i) :=
+          fun e' he' => by rw [haddr1]; exact hnotpost e' he'
+        exact (hout2 _ hpost1).trans (hbytes1 i hi)
+      | cons e0' pre' =>
+        simp only [List.cons_append, List.cons.injEq] at hsplit
+        obtain ⟨rfl, htail⟩ := hsplit
+        obtain ⟨bytes, henc, hrest⟩ := hwr2 pre' off ity val post htail
+        refine ⟨bytes, henc, fun hpos => ?_⟩
+        obtain ⟨aid, pex, a1, a', hprov, hgeId, ha1, ha', hoffGe, hbytes2⟩ := hrest hpos
+        have hidlt : aid._0.toNat < s.mem.memory.mem.allocations.length := by
+          rw [← hlen1]
+          exact (List.getElem?_eq_some_iff.mp ha1).1
+        let a := s.mem.memory.mem.allocations[aid._0.toNat]
+        have ha : s.mem.memory.mem.allocations[aid._0.toNat]? = some a :=
+          List.getElem?_eq_getElem hidlt
+        obtain ⟨haddr1, _, _, _, _, _⟩ := hmeta1 aid._0.toNat a a1 ha ha1
+        refine ⟨aid, pex, a, a', hprov, hgeId, ha, ha', by rw [← haddr1]; exact hoffGe,
+          fun i hi hnotpost => ?_⟩
+        simpa [haddr1] using hbytes2 i hi (by simpa [haddr1] using hnotpost)
+
+/-- **Universal memory-contents and allocation-frame law for
+`Statement::SetDiscriminant` on `Mach` and `MachTB`
+(`minirust_setDiscriminant_memory_frame_law`)**: whereas
+`minirust_setDiscriminant_accesses_law` characterizes only the concurrency
+access log (`mem.accesses`), this theorem characterizes the actual memory state
+produced by any successful `SetDiscriminant` on any aligned enum place, for
+both `Mach` (`BasicMemory`) and `MachTB` (`TreeBorrowsMemory`):
+1. Allocation count (and `TreeBorrowsMemory.params` on `MachTB`) is preserved;
+2. Every allocation whose `AllocId` is not `place.ptr.thin_pointer`'s
+   provenance is preserved verbatim (including all bytes and, on `MachTB`, its
+   entire Tree Borrows borrow tree); if the pointer carries no provenance, all
+   allocations are preserved verbatim;
+3. Every allocation preserves `addr`, `align`, `kind`, `live`, and
+   `data.length`, and every byte index `k` outside every entry of
+   `variant.tagger.entries` (`¬ sdInTagRange`) is preserved unchanged;
+4. For every tagger entry `(off, (ity, val))` in `variant.tagger.entries =
+   pre ++ (off, (ity, val)) :: post`, `Type.encodeInt` / `Type.encodeIntM`
+   succeeds with `bytes`, and whenever `0 < ity.size.bytes` and no later entry
+   in `post` covers byte `(base + off - a.addr) + i`, the resulting allocation
+   holds `bytes[i]?` at that byte (exact last-write-wins tag semantics, and
+   exact simultaneous tag bytes whenever tag ranges are pairwise disjoint).
+
+Every clause compares against `m1`, the machine that `eval_place` returned
+for `destination`, and not against the machine the statement started from:
+evaluating `destination` can itself load from memory (the pointer operand of
+a `Deref`), which is recorded in the access log and, on `MachTB`, is a read
+access to a borrow tree. In clause 4, `base` is the address of the place and
+`a` is the allocation that its provenance names. On `MachTB` the borrow tree
+of that one allocation is outside this law: every tag store is a write access
+that may update it, so for that allocation the law covers the bytes and the
+listed metadata only. -/
+theorem minirust_setDiscriminant_memory_frame_law :
+    (∀ (m m1 m' : Mach) (dst : Gen.PlaceExpr) (value : Int) (place : Gen.Place BM)
+        (vs : Map Int Gen.Variant) (dt : Gen.IntType) (d : Gen.Discriminator)
+        (sz : LibSpecr.Size) (al : LibSpecr.Align) (variant : Gen.Variant),
+      Interp.evalPlace m dst = .ok ((place, .Enum vs dt d sz al), m1) →
+      place.aligned = true → mapGet vs value = some variant →
+      Interp.evalStatement m (.SetDiscriminant dst value) = .ok m' →
+      m'.mem.memory.allocations.length = m1.mem.memory.allocations.length ∧
+      (∀ j : Nat, place.ptr.thin_pointer.provenance.map Prod.fst ≠ some ⟨(j : Int)⟩ →
+        m'.mem.memory.allocations[j]? = m1.mem.memory.allocations[j]?) ∧
+      (∀ (j : Nat) (a a' : Gen.Allocation Unit Unit),
+        m1.mem.memory.allocations[j]? = some a →
+        m'.mem.memory.allocations[j]? = some a' →
+        a'.addr = a.addr ∧ a'.align = a.align ∧ a'.kind = a.kind ∧ a'.live = a.live ∧
+        a'.data.length = a.data.length ∧
+        (∀ k : Nat,
+          (∀ e ∈ variant.tagger.entries,
+            ¬ sdInTagRange place.ptr.thin_pointer.addr a.addr e k) →
+          a'.data[k]? = a.data[k]?)) ∧
+      (∀ pre off ity val post,
+        variant.tagger.entries = pre ++ (off, (ity, val)) :: post →
+        ∃ bytes, Interp.Type.encodeInt ity (.Int val) = .ok bytes ∧
+          (0 < ity.size.bytes →
+            ∃ (aid : Gen.AllocId) (pex : Unit) (a a' : Gen.Allocation Unit Unit),
+              place.ptr.thin_pointer.provenance = some (aid, pex) ∧ 0 ≤ aid._0 ∧
+              m1.mem.memory.allocations[aid._0.toNat]? = some a ∧
+              m'.mem.memory.allocations[aid._0.toNat]? = some a' ∧
+              0 ≤ place.ptr.thin_pointer.addr + (off.bytes : Int) - a.addr ∧
+              ∀ i : Nat, i < bytes.length →
+                (∀ e' ∈ post,
+                  ¬ sdInTagRange place.ptr.thin_pointer.addr a.addr e'
+                    ((place.ptr.thin_pointer.addr + (off.bytes : Int) - a.addr).toNat + i)) →
+                a'.data[(place.ptr.thin_pointer.addr + (off.bytes : Int) - a.addr).toNat + i]? =
+                  bytes[i]?))) ∧
+    (∀ (m m1 m' : MachTB) (dst : Gen.PlaceExpr) (value : Int) (place : Gen.Place TBM)
+        (vs : Map Int Gen.Variant) (dt : Gen.IntType) (d : Gen.Discriminator)
+        (sz : LibSpecr.Size) (al : LibSpecr.Align) (variant : Gen.Variant),
+      Interp.evalPlaceM m dst = .ok ((place, .Enum vs dt d sz al), m1) →
+      place.aligned = true → mapGet vs value = some variant →
+      Interp.evalStatementM m (.SetDiscriminant dst value) = .ok m' →
+      m'.mem.memory.params = m1.mem.memory.params ∧
+      m'.mem.memory.mem.allocations.length = m1.mem.memory.mem.allocations.length ∧
+      (∀ j : Nat, place.ptr.thin_pointer.provenance.map Prod.fst ≠ some ⟨(j : Int)⟩ →
+        m'.mem.memory.mem.allocations[j]? = m1.mem.memory.mem.allocations[j]?) ∧
+      (∀ (j : Nat) (a a' : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra),
+        m1.mem.memory.mem.allocations[j]? = some a →
+        m'.mem.memory.mem.allocations[j]? = some a' →
+        a'.addr = a.addr ∧ a'.align = a.align ∧ a'.kind = a.kind ∧ a'.live = a.live ∧
+        a'.data.length = a.data.length ∧
+        (∀ k : Nat,
+          (∀ e ∈ variant.tagger.entries,
+            ¬ sdInTagRange place.ptr.thin_pointer.addr a.addr e k) →
+          a'.data[k]? = a.data[k]?)) ∧
+      (∀ pre off ity val post,
+        variant.tagger.entries = pre ++ (off, (ity, val)) :: post →
+        ∃ bytes, Interp.Type.encodeIntM (M := TBM) ity (.Int val) = .ok bytes ∧
+          (0 < ity.size.bytes →
+            ∃ (aid : Gen.AllocId) (pex : Gen.Path)
+                (a a' : Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra),
+              place.ptr.thin_pointer.provenance = some (aid, pex) ∧ 0 ≤ aid._0 ∧
+              m1.mem.memory.mem.allocations[aid._0.toNat]? = some a ∧
+              m'.mem.memory.mem.allocations[aid._0.toNat]? = some a' ∧
+              0 ≤ place.ptr.thin_pointer.addr + (off.bytes : Int) - a.addr ∧
+              ∀ i : Nat, i < bytes.length →
+                (∀ e' ∈ post,
+                  ¬ sdInTagRange place.ptr.thin_pointer.addr a.addr e'
+                    ((place.ptr.thin_pointer.addr + (off.bytes : Int) - a.addr).toNat + i)) →
+                a'.data[(place.ptr.thin_pointer.addr + (off.bytes : Int) - a.addr).toNat + i]? =
+                  bytes[i]?))) := by
+  refine ⟨?_, ?_⟩
+  · intro m m1 m' dst value place vs dt d sz al variant hp ha hsome h
+    simp only [Interp.evalStatement, Interp.evalSetDiscriminant, hp, ok_bind, ha,
+      Bool.not_true, Bool.false_eq_true, ↓reduceIte, hsome] at h
+    exact encodeDiscriminant_memory_frame place.ptr.thin_pointer variant.tagger h
+  · intro m m1 m' dst value place vs dt d sz al variant hp ha hsome h
+    simp only [Interp.evalStatementM, Interp.evalSetDiscriminantM, hp, ok_bind, ha,
+      Bool.not_true, Bool.false_eq_true, ↓reduceIte, hsome] at h
+    exact encodeDiscriminantM_tb_memory_frame place.ptr.thin_pointer variant.tagger h
+
+/-- **`ResumeUnwind` propagates a failing frame teardown
+(`minirust_resumeUnwind_teardown_error`)**: this closes the case analysis of
+`minirust_unwind_terminators_supported`, whose `ResumeUnwind` clauses assume
+that `deallocAll` / `deallocAllM` succeeded. When `storage_dead` of a local of
+the popped frame stops (for example with Tree Borrows UB on a strongly
+protected local), `ResumeUnwind` stops with that same `Stop`. On `Machine M`
+this is before `end_call` runs, and on both machines it is before
+`stack_pop_action` is inspected, so a failing teardown preempts the UB of
+unwinding out of the bottom of the stack and of a missing unwind block. -/
+theorem minirust_resumeUnwind_teardown_error :
+    (∀ (m : Mach) (t : Gen.Thread BM) (fr : Frame) (e : Interp.Stop),
+      Interp.activeThread m = .ok t → t.stack.getLast? = some fr →
+      Interp.deallocAll fr.locals.entries.length fr m.mem = .error e →
+      Interp.evalTerminator m .ResumeUnwind = .error e) ∧
+    (∀ {M : Type} [Gen.Memory M] [Interp.MemoryOps M] (mM : Gen.Machine M)
+        (t : Gen.Thread M) (fr : Gen.StackFrame M) (e : Interp.Stop),
+      Interp.activeThreadM mM = .ok t → t.stack.getLast? = some fr →
+      Interp.deallocAllM fr.locals.entries.length fr mM.mem = .error e →
+      Interp.evalTerminatorM mM .ResumeUnwind = .error e) := by
+  refine ⟨?_, ?_⟩
+  · intro m t fr e ht hfr hdealloc
+    obtain ⟨hge, hget⟩ := listIndex_ok_get ht
+    have hlt : m.active_thread.toNat < m.threads.length :=
+      (List.getElem?_eq_some_iff.mp hget).1
+    simp only [Interp.evalTerminator, Interp.evalResumeUnwind]
+    rw [ht]
+    simp only [ok_bind, hfr, pure_ok, listSet, hge, hlt, and_self, ↓reduceIte, hdealloc,
+      error_bind]
+  · intro M _ _ mM t fr e ht hfr hdealloc
+    obtain ⟨hge, hget⟩ := listIndex_ok_get ht
+    have hlt : mM.active_thread.toNat < mM.threads.length :=
+      (List.getElem?_eq_some_iff.mp hget).1
+    simp only [Interp.evalTerminatorM, Interp.evalResumeUnwindM]
+    rw [ht]
+    simp only [ok_bind, hfr, pure_ok, listSet, hge, hlt, and_self, ↓reduceIte, hdealloc,
+      error_bind]
+
+/-- Callee of `minirust_unwind_setDiscriminant_step_witness`: its entry block
+brings an enum local to life, sets its discriminant, and starts unwinding into
+the cleanup block, which resumes unwinding in the caller. -/
+private def uwStepCalleeFn : Gen.Function :=
+  { locals := ⟨[(⟨⟨0⟩⟩, .Int u8), (⟨⟨1⟩⟩, sdEnumTy)]⟩
+    args := []
+    ret := ⟨⟨0⟩⟩
+    calling_convention := .Rust
+    blocks := ⟨[
+      (⟨⟨0⟩⟩, ⟨[.StorageLive ⟨⟨1⟩⟩, .SetDiscriminant (.Local ⟨⟨1⟩⟩) 7],
+        .StartUnwind (uwRawThinPtrExpr 0x1000) ⟨⟨1⟩⟩, .Regular⟩),
+      (⟨⟨1⟩⟩, ⟨[], .ResumeUnwind, .Cleanup⟩)]⟩
+    start := ⟨⟨0⟩⟩
+    implicit_writes := false }
+
+/-- Caller of `minirust_unwind_setDiscriminant_step_witness`: it calls
+`uwStepCalleeFn` with return block `1` and unwind block `2`; the unwind block
+is a catch block that stops unwinding and continues in block `3`. -/
+private def uwStepCallerFn : Gen.Function :=
+  { locals := ⟨[(⟨⟨0⟩⟩, .Int u8)]⟩
+    args := []
+    ret := ⟨⟨0⟩⟩
+    calling_convention := .Rust
+    blocks := ⟨[
+      (⟨⟨0⟩⟩, ⟨[], .Call (fnPtrExpr (fnName 1)) .Rust [] (.Local ⟨⟨0⟩⟩)
+        (some ⟨⟨1⟩⟩) (some ⟨⟨2⟩⟩), .Regular⟩),
+      (⟨⟨1⟩⟩, ⟨[], .Unreachable, .Regular⟩),
+      (⟨⟨2⟩⟩, ⟨[], .StopUnwind ⟨⟨3⟩⟩, .Catch⟩),
+      (⟨⟨3⟩⟩, ⟨[], .Unreachable, .Regular⟩)]⟩
+    start := ⟨⟨0⟩⟩
+    implicit_writes := false }
+
+private def uwStepProg : Gen.Program :=
+  { functions := ⟨[(fnName 0, uwStepCallerFn), (fnName 1, uwStepCalleeFn)]⟩
+    start := fnName 0
+    globals := ⟨[]⟩
+    traits := ⟨[]⟩
+    vtables := ⟨[]⟩ }
+
+/-- `uwStepCallerFn` about to execute its `Call`, on `Mach`: one thread, one
+frame, and the caller's `u8` return place live at `0x100`. -/
+private def uwStepMachBM : Mach :=
+  { uwMachBM [uwLiveStackAllocBM 0x100]
+      [{ func := uwStepCallerFn, locals := ⟨[(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩)]⟩,
+         stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0,
+         extra := () }]
+      [] with
+    prog := uwStepProg
+    fn_ptrs := ⟨[(fnName 1, ⟨0x8000, none⟩)]⟩ }
+
+/-- `uwStepCallerFn` about to execute its `Call`, on `MachTB`: exact Tree
+Borrows counterpart of `uwStepMachBM`, starting at the caller's `Call` with
+only the caller's live `u8` return place at `0x100`. -/
+private def uwStepMachTB : MachTB :=
+  { uwMachTB [uwLiveAllocTB 0x100 .Stack (uwRootWithChildren [])]
+      [{ func := uwStepCallerFn, locals := ⟨[(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, [])⟩)]⟩,
+         stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0,
+         extra := ⟨[]⟩ }]
+      [] with
+    prog := uwStepProg
+    fn_ptrs := ⟨[(fnName 1, ⟨0x8000, none⟩)]⟩ }
+
+/-- Extract the `Stop` error from an `Interp` result so kernel `decide` can
+check error outcomes without needing `DecidableEq` on the success type. -/
+private def interpStopOf {α : Type} (r : Interp α) : Option Interp.Stop :=
+  match r with
+  | .error e => some e
+  | .ok _ => none
+
+private theorem eq_error_of_interpStopOf {α : Type} {r : Interp α} {e : Interp.Stop}
+    (h : interpStopOf r = some e) : r = .error e := by
+  cases r with
+  | ok _ => cases h
+  | error err => cases h; rfl
+
+/-- The enum local of `uwStepCalleeFn` after `SetDiscriminant`: fresh storage
+is uninitialized, and only the three tag bytes have been written. -/
+private def uwStepEnumBytes {P : Type} : List (Gen.AbstractByte P) :=
+  [.Init 0x03 none, .Uninit, .Uninit, .Uninit,
+   .Init 0x78 none, .Init 0x56 none, .Uninit, .Uninit]
+
+/-- **Unwinding and `SetDiscriminant` through `Machine::step` on both `Mach`
+and `MachTB` from the caller's `Call`
+(`minirust_unwind_setDiscriminant_step_witness`)**: a two-function program runs
+from the caller's `Call` through all 7 steps (`Call`, `StorageLive`,
+`SetDiscriminant`, `StartUnwind`, `ResumeUnwind`, `StopUnwind`, `Unreachable`)
+under both `Interp.steps` (`Mach`) and `Interp.stepsTB` (`MachTB`), so the new
+statement and terminators are reached through the block lookup, program-counter
+updates, real `Call`/`StorageLive` allocation, and data-race check of `step`.
+Below, `pcs` is the `(next_block, next_stmt)` of every frame, bottom frame
+first.
+- after 3 steps (`Call`, `StorageLive`, `SetDiscriminant`) the callee's enum
+  local holds exactly its three tag bytes and the callee is at statement `2`
+  of its entry block;
+- after 4 steps (`StartUnwind`) the payload stack is `[0x1000]`, the callee
+  is in its cleanup block, and all three allocations are still live;
+- after 5 steps (`ResumeUnwind`) the callee frame is gone, both of its locals
+  are dead, the payload is still on the payload stack, and the caller is at
+  the unwind block `2` named by its `Call`, not at the return block `1`;
+- after 6 steps (`StopUnwind`) the payload stack is empty and the caller is
+  in block `3`;
+- the 7th step reaches the `Unreachable` of block `3`, so execution continued
+  in the caller after the catch block. -/
+theorem minirust_unwind_setDiscriminant_step_witness :
+    let pcsBM (m : Mach) :=
+      m.threads.map (fun t => t.stack.map (fun f => (f.next_block, f.next_stmt)))
+    let pcsTB (m : MachTB) :=
+      m.threads.map (fun t => t.stack.map (fun f => (f.next_block, f.next_stmt)))
+    let payload : Ptr := ⟨0x1000, none⟩
+    let payloadTB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x1000, none⟩
+    ((Interp.steps 3 uwStepMachBM).toOption.map
+          (fun m => (m.mem.memory.allocations.map (·.data), pcsBM m)) =
+        some ([[.Uninit], [.Uninit], uwStepEnumBytes], [[(⟨⟨0⟩⟩, 0), (⟨⟨0⟩⟩, 2)]]) ∧
+      (Interp.steps 4 uwStepMachBM).toOption.map
+          (fun m => (m.threads.map (·.unwind_payloads), pcsBM m,
+            m.mem.memory.allocations.map (·.live))) =
+        some ([[payload]], [[(⟨⟨0⟩⟩, 0), (⟨⟨1⟩⟩, 0)]], [true, true, true]) ∧
+      (Interp.steps 5 uwStepMachBM).toOption.map
+          (fun m => (m.threads.map (·.unwind_payloads), pcsBM m,
+            m.mem.memory.allocations.map (·.live))) =
+        some ([[payload]], [[(⟨⟨2⟩⟩, 0)]], [true, false, false]) ∧
+      (Interp.steps 6 uwStepMachBM).toOption.map
+          (fun m => (m.threads.map (·.unwind_payloads), pcsBM m)) =
+        some ([[]], [[(⟨⟨3⟩⟩, 0)]]) ∧
+      Interp.steps 7 uwStepMachBM = .error (.ub "reached unreachable code")) ∧
+    ((Interp.stepsTB 3 uwStepMachTB).toOption.map
+          (fun m => m.mem.memory.mem.allocations.map (·.data)) =
+        some [[.Uninit], [.Uninit], uwStepEnumBytes] ∧
+      (Interp.stepsTB 3 uwStepMachTB).toOption.map pcsTB =
+        some [[(⟨⟨0⟩⟩, 0), (⟨⟨0⟩⟩, 2)]] ∧
+      (Interp.stepsTB 4 uwStepMachTB).toOption.map (fun m => m.threads.map (·.unwind_payloads)) =
+        some [[payloadTB]] ∧
+      (Interp.stepsTB 4 uwStepMachTB).toOption.map pcsTB =
+        some [[(⟨⟨0⟩⟩, 0), (⟨⟨1⟩⟩, 0)]] ∧
+      (Interp.stepsTB 4 uwStepMachTB).toOption.map
+          (fun m => m.mem.memory.mem.allocations.map (·.live)) =
+        some [true, true, true] ∧
+      (Interp.stepsTB 5 uwStepMachTB).toOption.map (fun m => m.threads.map (·.unwind_payloads)) =
+        some [[payloadTB]] ∧
+      (Interp.stepsTB 5 uwStepMachTB).toOption.map pcsTB =
+        some [[(⟨⟨2⟩⟩, 0)]] ∧
+      (Interp.stepsTB 5 uwStepMachTB).toOption.map
+          (fun m => m.mem.memory.mem.allocations.map (·.live)) =
+        some [true, false, false] ∧
+      (Interp.stepsTB 6 uwStepMachTB).toOption.map (fun m => m.threads.map (·.unwind_payloads)) =
+        some [[]] ∧
+      (Interp.stepsTB 6 uwStepMachTB).toOption.map pcsTB =
+        some [[(⟨⟨3⟩⟩, 0)]] ∧
+      Interp.stepsTB 7 uwStepMachTB = .error (.ub "reached unreachable code")) := by
+  refine ⟨⟨rfl, rfl, rfl, rfl, rfl⟩,
+    ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+     by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+     by decide +kernel, by decide +kernel, eq_error_of_interpStopOf (by decide +kernel)⟩⟩
+
+private def uwProtRefPtrTy : Gen.PtrType :=
+  .Ref .Immutable ⟨.Sized ⟨1⟩ ⟨1⟩, true, .Sized [], true, true⟩
+
+private def uwProtCalleeFn : Gen.Function :=
+  { locals := ⟨[(⟨⟨0⟩⟩, .Int u8), (⟨⟨1⟩⟩, .Ptr uwProtRefPtrTy), (⟨⟨2⟩⟩, sdEnumTy)]⟩
+    args := [⟨⟨1⟩⟩]
+    ret := ⟨⟨0⟩⟩
+    calling_convention := .Rust
+    blocks := ⟨[
+      (⟨⟨0⟩⟩, ⟨[
+          .Validate (.Local ⟨⟨1⟩⟩) true,
+          .StorageLive ⟨⟨2⟩⟩,
+          .SetDiscriminant (.Local ⟨⟨2⟩⟩) 7],
+        .StartUnwind (uwRawThinPtrExpr 0x1000) ⟨⟨1⟩⟩, .Regular⟩),
+      (⟨⟨1⟩⟩, ⟨[], .ResumeUnwind, .Cleanup⟩)]⟩
+    start := ⟨⟨0⟩⟩
+    implicit_writes := false }
+
+private def uwProtCallerFn : Gen.Function :=
+  { locals := ⟨[(⟨⟨0⟩⟩, .Int u8), (⟨⟨1⟩⟩, .Int u8)]⟩
+    args := []
+    ret := ⟨⟨0⟩⟩
+    calling_convention := .Rust
+    blocks := ⟨[
+      (⟨⟨0⟩⟩, ⟨[],
+        .Call (fnPtrExpr (fnName 1)) .Rust
+          [.ByValue (.AddrOf (.Local ⟨⟨1⟩⟩) uwProtRefPtrTy)]
+          (.Local ⟨⟨0⟩⟩) (some ⟨⟨1⟩⟩) (some ⟨⟨2⟩⟩), .Regular⟩),
+      (⟨⟨1⟩⟩, ⟨[], .Unreachable, .Regular⟩),
+      (⟨⟨2⟩⟩, ⟨[], .StopUnwind ⟨⟨3⟩⟩, .Catch⟩),
+      (⟨⟨3⟩⟩, ⟨[.Assign (.Local ⟨⟨1⟩⟩) (.Constant (.Int 0x63) (.Int u8))],
+        .Unreachable, .Regular⟩)]⟩
+    start := ⟨⟨0⟩⟩
+    implicit_writes := false }
+
+private def uwProtProg : Gen.Program :=
+  { functions := ⟨[(fnName 0, uwProtCallerFn), (fnName 1, uwProtCalleeFn)]⟩
+    start := fnName 0
+    globals := ⟨[]⟩
+    traits := ⟨[]⟩
+    vtables := ⟨[]⟩ }
+
+private def uwProtMachTB : MachTB :=
+  let mkAlloc (addr : Int) (b : UInt8) :
+      Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
+    { data := [.Init b none]
+      addr := addr
+      align := ⟨1⟩
+      kind := .Stack
+      live := true
+      extra := { root := uwRootWithChildren [] } }
+  { uwMachTB [mkAlloc 0x100 0x00, mkAlloc 0x200 0x2A]
+      [{ func := uwProtCallerFn
+         locals := ⟨[(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, [])⟩), (⟨⟨1⟩⟩, ⟨0x200, some (⟨1⟩, [])⟩)]⟩
+         stack_pop_action := .BottomOfStack
+         next_block := ⟨⟨0⟩⟩
+         next_stmt := 0
+         extra := ⟨[]⟩ }]
+      [] with
+    prog := uwProtProg
+    fn_ptrs := ⟨[(fnName 1, ⟨0x8000, none⟩)]⟩ }
+
+private def uwAlloc1ProtStatus (m : MachTB) : Option (Gen.Protected × List Gen.Permission) :=
+  m.mem.memory.mem.allocations[1]?.bind fun a =>
+    a.extra.root.children[0]?.bind fun c0 =>
+      c0.children[0]?.map fun c00 => (c00.«protected», c00.permissions)
+
+/-- **End-to-end `MachTB` Tree Borrows protector lifecycle across `Call`,
+`Validate`, `SetDiscriminant`, `StartUnwind`, `ResumeUnwind`, and `StopUnwind`
+(`minirust_tb_call_validate_unwind_protector_step_witness`)**: runs a 9-step
+program through `Interp.stepsTB` starting at the caller's `Call` passing
+`&_1 : &u8`:
+1. After 2 steps (`Call`, `Validate (.Local _1) true`), callee's
+   `frame.extra.protectors` holds `(⟨1⟩, [0, 0])` and that borrow-tree node is
+   `.Strong` / `[.Prot (.Frozen true)]`.
+2. Negative control at step 2: writing to `_1` through caller's root provenance
+   while the protector is active raises Tree Borrows foreign-write UB on the
+   protected `Frozen` reference.
+3. After 4 steps (`StorageLive`, `SetDiscriminant`), the callee's enum local
+   holds `uwStepEnumBytes`.
+4. After 6 steps (`StartUnwind`, `ResumeUnwind`), all three callee locals are
+   dead (`[true, true, false, false, false]`), `TreeBorrowsMemory.end_call`
+   releases the protector to `.No` / `[.Unprot .Frozen]`, `unwind_payloads`
+   retains `[0x1000]`, and the caller stands at unwind block `2`.
+5. After 8 steps (`StopUnwind`, caller `Assign _1 0x63`), mutating `_1` through
+   caller's root provenance succeeds (`[.Init 0x63 none]`, child `[0, 0]` now
+   `.No` / `[.Unprot .Disabled]`), proving `ResumeUnwind` released the
+   protector, and step 9 hits `Unreachable`. -/
+theorem minirust_tb_call_validate_unwind_protector_step_witness :
+    let payloadTB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x1000, none⟩
+    ((Interp.stepsTB 2 uwProtMachTB).toOption.map (fun m =>
+        m.threads.map (fun t => t.stack.map (fun f => f.extra.protectors))) =
+      some [[[], [(⟨1⟩, [0, 0])]]]) ∧
+    ((Interp.stepsTB 2 uwProtMachTB).toOption.map uwAlloc1ProtStatus =
+      some (some (.Strong, [.Prot (.Frozen true)]))) ∧
+    ((Interp.stepsTB 2 uwProtMachTB) >>= fun m =>
+        Interp.ConcurrentMemory.store m.mem ⟨0x200, some (⟨1⟩, [])⟩ [.Init 0x63 none] ⟨1⟩ .None) =
+      .error (.ub
+        "Tree Borrows: foreign write of protected Frozen reference which had a local read") ∧
+    ((Interp.stepsTB 4 uwProtMachTB).toOption.map (fun m =>
+        m.mem.memory.mem.allocations[4]?.map (·.data)) =
+      some (some uwStepEnumBytes)) ∧
+    ((Interp.stepsTB 6 uwProtMachTB).toOption.map (fun m =>
+        m.mem.memory.mem.allocations.map (·.live)) =
+      some [true, true, false, false, false]) ∧
+    ((Interp.stepsTB 6 uwProtMachTB).toOption.map uwAlloc1ProtStatus =
+      some (some (.No, [.Unprot .Frozen]))) ∧
+    ((Interp.stepsTB 6 uwProtMachTB).toOption.map (fun m =>
+        m.threads.map (·.unwind_payloads)) =
+      some [[payloadTB]]) ∧
+    ((Interp.stepsTB 6 uwProtMachTB).toOption.map (fun m =>
+        m.threads.map (fun t => t.stack.map (fun f => (f.next_block, f.next_stmt)))) =
+      some [[(⟨⟨2⟩⟩, 0)]]) ∧
+    ((Interp.stepsTB 8 uwProtMachTB).toOption.map (fun m =>
+        m.mem.memory.mem.allocations[1]?.map (·.data)) =
+      some (some [.Init 0x63 none])) ∧
+    ((Interp.stepsTB 8 uwProtMachTB).toOption.map uwAlloc1ProtStatus =
+      some (some (.No, [.Unprot .Disabled]))) ∧
+    (Interp.stepsTB 9 uwProtMachTB = .error (.ub "reached unreachable code")) := by
+  refine ⟨by decide +kernel, by decide +kernel,
+    eq_error_of_interpStopOf (by decide +kernel), by decide +kernel, by decide +kernel,
+    by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+    by decide +kernel, eq_error_of_interpStopOf (by decide +kernel)⟩
+
+/-- Innermost function of `minirust_nested_unwind_step_witness`: it starts
+unwinding at once and resumes it from its cleanup block. -/
+private def uwNestInnerFn : Gen.Function :=
+  { locals := ⟨[(⟨⟨0⟩⟩, .Int u8)]⟩
+    args := []
+    ret := ⟨⟨0⟩⟩
+    calling_convention := .Rust
+    blocks := ⟨[
+      (⟨⟨0⟩⟩, ⟨[], .StartUnwind (uwRawThinPtrExpr 0x1000) ⟨⟨1⟩⟩, .Regular⟩),
+      (⟨⟨1⟩⟩, ⟨[], .ResumeUnwind, .Cleanup⟩)]⟩
+    start := ⟨⟨0⟩⟩
+    implicit_writes := false }
+
+/-- Middle function of `minirust_nested_unwind_step_witness`: it calls
+`uwNestInnerFn` with unwind block `2`, a cleanup block that only resumes
+unwinding into its own caller. -/
+private def uwNestMiddleFn : Gen.Function :=
+  { locals := ⟨[(⟨⟨0⟩⟩, .Int u8)]⟩
+    args := []
+    ret := ⟨⟨0⟩⟩
+    calling_convention := .Rust
+    blocks := ⟨[
+      (⟨⟨0⟩⟩, ⟨[], .Call (fnPtrExpr (fnName 2)) .Rust [] (.Local ⟨⟨0⟩⟩)
+        (some ⟨⟨1⟩⟩) (some ⟨⟨2⟩⟩), .Regular⟩),
+      (⟨⟨1⟩⟩, ⟨[], .Unreachable, .Regular⟩),
+      (⟨⟨2⟩⟩, ⟨[], .ResumeUnwind, .Cleanup⟩)]⟩
+    start := ⟨⟨0⟩⟩
+    implicit_writes := false }
+
+/-- Outermost function of `minirust_nested_unwind_step_witness`: it calls
+`uwNestMiddleFn` with unwind block `2`, a catch block that reads the unwind
+payload into the raw-pointer local `_1` and then, in block `3`, stops
+unwinding and continues in block `4`. -/
+private def uwNestOuterFn : Gen.Function :=
+  { locals := ⟨[(⟨⟨0⟩⟩, .Int u8), (⟨⟨1⟩⟩, .Ptr (.Raw .None))]⟩
+    args := []
+    ret := ⟨⟨0⟩⟩
+    calling_convention := .Rust
+    blocks := ⟨[
+      (⟨⟨0⟩⟩, ⟨[], .Call (fnPtrExpr (fnName 1)) .Rust [] (.Local ⟨⟨0⟩⟩)
+        (some ⟨⟨1⟩⟩) (some ⟨⟨2⟩⟩), .Regular⟩),
+      (⟨⟨1⟩⟩, ⟨[], .Unreachable, .Regular⟩),
+      (⟨⟨2⟩⟩, ⟨[], .Intrinsic .GetUnwindPayload [] (.Local ⟨⟨1⟩⟩) (some ⟨⟨3⟩⟩), .Catch⟩),
+      (⟨⟨3⟩⟩, ⟨[], .StopUnwind ⟨⟨4⟩⟩, .Catch⟩),
+      (⟨⟨4⟩⟩, ⟨[], .Unreachable, .Regular⟩)]⟩
+    start := ⟨⟨0⟩⟩
+    implicit_writes := false }
+
+private def uwNestProg : Gen.Program :=
+  { functions :=
+      ⟨[(fnName 0, uwNestOuterFn), (fnName 1, uwNestMiddleFn), (fnName 2, uwNestInnerFn)]⟩
+    start := fnName 0
+    globals := ⟨[]⟩
+    traits := ⟨[]⟩
+    vtables := ⟨[]⟩ }
+
+/-- `uwNestOuterFn` about to execute its `Call`, on `Mach`: its `u8` return
+place is live at `0x100` and its raw-pointer local `_1` at `0x200`. -/
+private def uwNestMachBM : Mach :=
+  { uwMachBM
+      [uwLiveStackAllocBM 0x100,
+       { data := List.replicate 8 .Uninit, addr := 0x200, align := ⟨8⟩, kind := .Stack,
+         live := true, extra := () }]
+      [{ func := uwNestOuterFn
+         locals := ⟨[(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩), (⟨⟨1⟩⟩, ⟨0x200, some (⟨1⟩, ())⟩)]⟩
+         stack_pop_action := .BottomOfStack
+         next_block := ⟨⟨0⟩⟩
+         next_stmt := 0
+         extra := () }]
+      [] with
+    prog := uwNestProg
+    fn_ptrs := ⟨[(fnName 1, ⟨0x8000, none⟩), (fnName 2, ⟨0x8001, none⟩)]⟩ }
+
+/-- The machine of `uwNestMachBM` on `MachTB`. -/
+private def uwNestMachTB : MachTB :=
+  { uwMachTB
+      [uwLiveAllocTB 0x100 .Stack (uwRootWithChildren []),
+       { data := List.replicate 8 .Uninit, addr := 0x200, align := ⟨8⟩, kind := .Stack,
+         live := true,
+         extra :=
+           { root :=
+               { children := [], permissions := List.replicate 8 (.Unprot .Unique),
+                 «protected» := .No } } }]
+      [{ func := uwNestOuterFn
+         locals := ⟨[(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, [])⟩), (⟨⟨1⟩⟩, ⟨0x200, some (⟨1⟩, [])⟩)]⟩
+         stack_pop_action := .BottomOfStack
+         next_block := ⟨⟨0⟩⟩
+         next_stmt := 0
+         extra := ⟨[]⟩ }]
+      [] with
+    prog := uwNestProg
+    fn_ptrs := ⟨[(fnName 1, ⟨0x8000, none⟩), (fnName 2, ⟨0x8001, none⟩)]⟩ }
+
+/-- The payload pointer `0x1000` (without provenance) as `GetUnwindPayload`
+stores it: eight little-endian bytes, none carrying provenance. -/
+private def uwNestPayloadBytes {P : Type} : List (Gen.AbstractByte P) :=
+  [.Init 0x00 none, .Init 0x10 none, .Init 0 none, .Init 0 none,
+   .Init 0 none, .Init 0 none, .Init 0 none, .Init 0 none]
+
+/-- **Unwinding through two frames via `Machine::step` on `Mach` and `MachTB`
+(`minirust_nested_unwind_step_witness`)**: every other witness of this section
+unwinds exactly one frame. Here `uwNestOuterFn` calls `uwNestMiddleFn`, which
+calls `uwNestInnerFn`, and the unwind started in the innermost frame travels
+up through both callers. With `pcs` the `(next_block, next_stmt)` of every
+frame, bottom frame first, `Interp.steps` and `Interp.stepsTB` agree:
+- after 4 steps (`Call`, `Call`, `StartUnwind`, `ResumeUnwind`) the innermost
+  frame is gone and its return local is dead, and the middle frame is at its
+  cleanup block `2`, the unwind block of its own `Call`;
+- after 5 steps (a second `ResumeUnwind`, now from that cleanup block) the
+  middle frame is gone and its return local is dead as well, the outer frame
+  is at its catch block `2`, and the payload pushed two frames further down
+  is still on the payload stack;
+- after 6 steps (`GetUnwindPayload` in the catch block) the outer local `_1`
+  holds that payload pointer and the payload stack is unchanged: reading the
+  payload does not pop it;
+- after 7 steps (`StopUnwind`) the payload stack is empty and the outer frame
+  is in block `4`;
+- the 8th step reaches the `Unreachable` of block `4`.
+
+The run has one thread and a payload pointer without provenance. -/
+theorem minirust_nested_unwind_step_witness :
+    let pcsBM (m : Mach) :=
+      m.threads.map (fun t => t.stack.map (fun f => (f.next_block, f.next_stmt)))
+    let pcsTB (m : MachTB) :=
+      m.threads.map (fun t => t.stack.map (fun f => (f.next_block, f.next_stmt)))
+    let payload : Ptr := ⟨0x1000, none⟩
+    let payloadTB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x1000, none⟩
+    ((Interp.steps 4 uwNestMachBM).toOption.map
+          (fun m => (pcsBM m, m.threads.map (·.unwind_payloads),
+            m.mem.memory.allocations.map (·.live))) =
+        some ([[(⟨⟨0⟩⟩, 0), (⟨⟨2⟩⟩, 0)]], [[payload]], [true, true, true, false]) ∧
+      (Interp.steps 5 uwNestMachBM).toOption.map
+          (fun m => (pcsBM m, m.threads.map (·.unwind_payloads),
+            m.mem.memory.allocations.map (·.live))) =
+        some ([[(⟨⟨2⟩⟩, 0)]], [[payload]], [true, true, false, false]) ∧
+      (Interp.steps 6 uwNestMachBM).toOption.map
+          (fun m => (pcsBM m, m.threads.map (·.unwind_payloads),
+            m.mem.memory.allocations[1]?.map (·.data))) =
+        some ([[(⟨⟨3⟩⟩, 0)]], [[payload]], some uwNestPayloadBytes) ∧
+      (Interp.steps 7 uwNestMachBM).toOption.map
+          (fun m => (pcsBM m, m.threads.map (·.unwind_payloads))) =
+        some ([[(⟨⟨4⟩⟩, 0)]], [[]]) ∧
+      Interp.steps 8 uwNestMachBM = .error (.ub "reached unreachable code")) ∧
+    ((Interp.stepsTB 4 uwNestMachTB).toOption.map pcsTB =
+        some [[(⟨⟨0⟩⟩, 0), (⟨⟨2⟩⟩, 0)]] ∧
+      (Interp.stepsTB 4 uwNestMachTB).toOption.map
+          (fun m => m.threads.map (·.unwind_payloads)) =
+        some [[payloadTB]] ∧
+      (Interp.stepsTB 4 uwNestMachTB).toOption.map
+          (fun m => m.mem.memory.mem.allocations.map (·.live)) =
+        some [true, true, true, false] ∧
+      (Interp.stepsTB 5 uwNestMachTB).toOption.map pcsTB = some [[(⟨⟨2⟩⟩, 0)]] ∧
+      (Interp.stepsTB 5 uwNestMachTB).toOption.map
+          (fun m => m.threads.map (·.unwind_payloads)) =
+        some [[payloadTB]] ∧
+      (Interp.stepsTB 5 uwNestMachTB).toOption.map
+          (fun m => m.mem.memory.mem.allocations.map (·.live)) =
+        some [true, true, false, false] ∧
+      (Interp.stepsTB 6 uwNestMachTB).toOption.map pcsTB = some [[(⟨⟨3⟩⟩, 0)]] ∧
+      (Interp.stepsTB 6 uwNestMachTB).toOption.map
+          (fun m => m.threads.map (·.unwind_payloads)) =
+        some [[payloadTB]] ∧
+      (Interp.stepsTB 6 uwNestMachTB).toOption.map
+          (fun m => m.mem.memory.mem.allocations[1]?.map (·.data)) =
+        some (some uwNestPayloadBytes) ∧
+      (Interp.stepsTB 7 uwNestMachTB).toOption.map pcsTB = some [[(⟨⟨4⟩⟩, 0)]] ∧
+      (Interp.stepsTB 7 uwNestMachTB).toOption.map
+          (fun m => m.threads.map (·.unwind_payloads)) =
+        some [[]] ∧
+      Interp.stepsTB 8 uwNestMachTB = .error (.ub "reached unreachable code")) := by
+  refine ⟨⟨rfl, rfl, rfl, rfl, rfl⟩,
+    ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+     by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+     by decide +kernel, by decide +kernel, by decide +kernel,
+     eq_error_of_interpStopOf (by decide +kernel)⟩⟩
+
+private def sdStructTy : Gen.Type :=
+  .Tuple [(⟨0⟩, .Int u32), (⟨4⟩, sdEnumTy), (⟨12⟩, .Int u32)] ⟨⟨16⟩, ⟨4⟩, none⟩ none
+
+private def sdStructInitBytes {P : Type} : List (Gen.AbstractByte P) :=
+  [.Init 0x10 none, .Init 0x20 none, .Init 0x30 none, .Init 0x40 none] ++
+    sdPayloadBytes ++
+    [.Init 0x50 none, .Init 0x60 none, .Init 0x70 none, .Init 0x80 none]
+
+private def sdStructExpectedBytes {P : Type} : List (Gen.AbstractByte P) :=
+  [.Init 0x10 none, .Init 0x20 none, .Init 0x30 none, .Init 0x40 none] ++
+    sdExpectedBytes ++
+    [.Init 0x50 none, .Init 0x60 none, .Init 0x70 none, .Init 0x80 none]
+
+private def sdBadEncodeEnumTy : Gen.Type :=
+  let vBad : Gen.Variant :=
+    { ty := .Tuple [] ⟨⟨8⟩, ⟨4⟩, none⟩ none
+      tagger := ⟨[(⟨0⟩, (u8, 256)), (⟨16⟩, (u8, 1))]⟩ }
+  .Enum ⟨[(1, vBad)]⟩ u8 .Invalid ⟨8⟩ ⟨4⟩
+
+/-- **Projected `PlaceExpr.Field` `SetDiscriminant` and unrepresentable tagger
+encoding (`minirust_setDiscriminant_field_and_encode_witness`)**:
+1. On both `Mach` and `MachTB`, `SetDiscriminant` on
+   `PlaceExpr.Field (.Local 1) 1` (an 8-byte enum nested at byte offset `4`
+   inside a 16-byte struct at `0x100`) offsets each tag from the field's base
+   pointer (`0x104 + 0` and `0x104 + 4`), leaving surrounding struct fields
+   (bytes `0..3` and `12..15`) and the enum's five payload bytes untouched;
+2. When a tagger entry's integer (`256`) does not fit its `IntType` (`u8`),
+   `Type.encodeInt` raises `specPanic` before the accessor runs (preempting a
+   subsequent out-of-bounds tagger entry at offset `16`), on both `Mach` and
+   `MachTB`. -/
+theorem minirust_setDiscriminant_field_and_encode_witness :
+    let fnStruct := uwFn [(⟨⟨1⟩⟩, sdStructTy), (⟨⟨2⟩⟩, sdBadEncodeEnumTy)]
+    let allocStructBM : Gen.Allocation Unit Unit :=
+      { data := sdStructInitBytes, addr := 0x100, align := ⟨4⟩, kind := .Stack, live := true,
+        extra := () }
+    let allocBadBM : Gen.Allocation Unit Unit :=
+      { data := sdPayloadBytes, addr := 0x200, align := ⟨4⟩, kind := .Stack, live := true,
+        extra := () }
+    let frBM : Frame :=
+      { func := fnStruct
+        locals := ⟨[(⟨⟨1⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩), (⟨⟨2⟩⟩, ⟨0x200, some (⟨1⟩, ())⟩)]⟩
+        stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := () }
+    let mBM := uwMachBM [allocStructBM, allocBadBM] [frBM] []
+    let mkAllocTB (addr : Int) (bs : List (Gen.AbstractByte Gen.TreeBorrowsProvenance)) :
+        Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
+      { data := bs, addr := addr, align := ⟨4⟩, kind := .Stack, live := true,
+        extra :=
+          { root :=
+              { children := [], permissions := List.replicate bs.length (.Unprot .Unique),
+                «protected» := .No } } }
+    let frTB : Gen.StackFrame TBM :=
+      { func := fnStruct
+        locals := ⟨[(⟨⟨1⟩⟩, ⟨0x100, some (⟨0⟩, [])⟩), (⟨⟨2⟩⟩, ⟨0x200, some (⟨1⟩, [])⟩)]⟩
+        stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := ⟨[]⟩ }
+    let mTB := uwMachTB
+      [mkAllocTB 0x100 sdStructInitBytes, mkAllocTB 0x200 sdPayloadBytes] [frTB] []
+    let fieldPlace : Gen.PlaceExpr := .Field (.Local ⟨⟨1⟩⟩) 1
+    let expectedAccs : List Gen.Access :=
+      [⟨.Store, .None, 0x104, ⟨1⟩⟩, ⟨.Store, .None, 0x108, ⟨2⟩⟩]
+    let badEncMsg := "Endianness::encode(..).unwrap()"
+    (∃ m', Interp.evalStatement mBM (.SetDiscriminant fieldPlace 7) = .ok m' ∧
+      m'.mem.memory.allocations[0]?.map (·.data) = some sdStructExpectedBytes ∧
+      m'.mem.accesses = expectedAccs) ∧
+    (∃ m', Interp.evalStatementM mTB (.SetDiscriminant fieldPlace 7) = .ok m' ∧
+      m'.mem.memory.mem.allocations[0]?.map (·.data) = some sdStructExpectedBytes ∧
+      m'.mem.accesses = expectedAccs) ∧
+    (Interp.evalStatement mBM (.SetDiscriminant (.Local ⟨⟨2⟩⟩) 1) =
+      .error (.specPanic badEncMsg) ∧
+     Interp.evalStatementM mTB (.SetDiscriminant (.Local ⟨⟨2⟩⟩) 1) =
+      .error (.specPanic badEncMsg)) :=
+  ⟨⟨_, rfl, rfl, rfl⟩, ⟨_, rfl, rfl, rfl⟩, ⟨rfl, rfl⟩⟩
+
+private def uwMtCalleeFn : Gen.Function :=
+  { locals := ⟨[(⟨⟨0⟩⟩, .Int u8), (⟨⟨1⟩⟩, .Ptr (.Raw .None))]⟩
+    args := [⟨⟨1⟩⟩]
+    ret := ⟨⟨0⟩⟩
+    calling_convention := .Rust
+    blocks := ⟨[
+      (⟨⟨0⟩⟩, ⟨[], .StartUnwind (.Load (.Local ⟨⟨1⟩⟩)) ⟨⟨1⟩⟩, .Regular⟩),
+      (⟨⟨1⟩⟩, ⟨[], .ResumeUnwind, .Cleanup⟩)]⟩
+    start := ⟨⟨0⟩⟩
+    implicit_writes := false }
+
+private def uwMtOuterFn : Gen.Function :=
+  { locals :=
+      ⟨[(⟨⟨0⟩⟩, .Int u16), (⟨⟨1⟩⟩, .Int u16),
+        (⟨⟨2⟩⟩, .Ptr (.Raw .None)), (⟨⟨3⟩⟩, .Int u8)]⟩
+    args := []
+    ret := ⟨⟨0⟩⟩
+    calling_convention := .Rust
+    blocks := ⟨[
+      (⟨⟨0⟩⟩, ⟨[],
+        .Call (fnPtrExpr (fnName 1)) .Rust
+          [.ByValue (.AddrOf (.Local ⟨⟨1⟩⟩) (.Raw .None))]
+          (.Local ⟨⟨3⟩⟩) (some ⟨⟨1⟩⟩) (some ⟨⟨2⟩⟩), .Regular⟩),
+      (⟨⟨1⟩⟩, ⟨[], .Unreachable, .Regular⟩),
+      (⟨⟨2⟩⟩, ⟨[], .Intrinsic .GetUnwindPayload [] (.Local ⟨⟨2⟩⟩) (some ⟨⟨3⟩⟩), .Catch⟩),
+      (⟨⟨3⟩⟩, ⟨[], .StopUnwind ⟨⟨4⟩⟩, .Catch⟩),
+      (⟨⟨4⟩⟩, ⟨[.Assign (.Local ⟨⟨0⟩⟩) (.Load (.Deref (.Load (.Local ⟨⟨2⟩⟩)) (.Int u16)))],
+        .Unreachable, .Regular⟩)]⟩
+    start := ⟨⟨0⟩⟩
+    implicit_writes := false }
+
+private def uwMtProg : Gen.Program :=
+  { functions := ⟨[(fnName 0, uwMtOuterFn), (fnName 1, uwMtCalleeFn)]⟩
+    start := fnName 0
+    globals := ⟨[]⟩
+    traits := ⟨[]⟩
+    vtables := ⟨[]⟩ }
+
+private def uwMtT0FrameBM : Frame :=
+  { func := uwMtOuterFn, locals := ⟨[]⟩, stack_pop_action := .BottomOfStack,
+    next_block := ⟨⟨9⟩⟩, next_stmt := 0, extra := () }
+
+private def uwMtT0FrameTB : Gen.StackFrame TBM :=
+  { func := uwMtOuterFn, locals := ⟨[]⟩, stack_pop_action := .BottomOfStack,
+    next_block := ⟨⟨9⟩⟩, next_stmt := 0, extra := ⟨[]⟩ }
+
+private def uwMtMachBM : Mach :=
+  let a0 : Gen.Allocation Unit Unit :=
+    { data := [.Init 0 none, .Init 0 none], addr := 0x100, align := ⟨2⟩, kind := .Stack,
+      live := true, extra := () }
+  let a1 : Gen.Allocation Unit Unit :=
+    { data := [.Init 0xEF none, .Init 0xBE none], addr := 0x200, align := ⟨2⟩, kind := .Stack,
+      live := true, extra := () }
+  let a2 : Gen.Allocation Unit Unit :=
+    { data := List.replicate 8 .Uninit, addr := 0x300, align := ⟨8⟩, kind := .Stack,
+      live := true, extra := () }
+  let a3 : Gen.Allocation Unit Unit :=
+    { data := [.Init 0 none], addr := 0x400, align := ⟨1⟩, kind := .Stack,
+      live := true, extra := () }
+  let fr1 : Frame :=
+    { func := uwMtOuterFn
+      locals := ⟨[(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩), (⟨⟨1⟩⟩, ⟨0x200, some (⟨1⟩, ())⟩),
+                  (⟨⟨2⟩⟩, ⟨0x300, some (⟨2⟩, ())⟩), (⟨⟨3⟩⟩, ⟨0x400, some (⟨3⟩, ())⟩)]⟩
+      stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := () }
+  { prog := uwMtProg
+    mem := { memory := { allocations := [a0, a1, a2, a3], _phantom := ⟨⟩ }, accesses := [] }
+    intptrcast := ⟨⟨[]⟩⟩
+    threads :=
+      [{ stack := [uwMtT0FrameBM], state := .Terminated, unwind_payloads := [⟨0x9000, none⟩] },
+       { stack := [fr1], state := .Enabled, unwind_payloads := [] }]
+    active_thread := 0
+    synchronized_threads := ⟨[]⟩
+    locks := []
+    global_ptrs := ⟨[]⟩
+    fn_ptrs := ⟨[(fnName 1, ⟨0x8000, none⟩)]⟩
+    vtable_ptrs := ⟨[]⟩
+    stdout := ⟨[]⟩
+    stderr := ⟨[]⟩ }
+
+private def uwMtMachTB : MachTB :=
+  let mkA (addr : Int) (al : Nat) (bs : List (Gen.AbstractByte Gen.TreeBorrowsProvenance)) :
+      Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
+    { data := bs, addr := addr, align := ⟨al⟩, kind := .Stack, live := true,
+      extra :=
+        { root :=
+            { children := [], permissions := List.replicate bs.length (.Unprot .Unique),
+              «protected» := .No } } }
+  let fr1 : Gen.StackFrame TBM :=
+    { func := uwMtOuterFn
+      locals := ⟨[(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, [])⟩), (⟨⟨1⟩⟩, ⟨0x200, some (⟨1⟩, [])⟩),
+                  (⟨⟨2⟩⟩, ⟨0x300, some (⟨2⟩, [])⟩), (⟨⟨3⟩⟩, ⟨0x400, some (⟨3⟩, [])⟩)]⟩
+      stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := ⟨[]⟩ }
+  { prog := uwMtProg
+    mem :=
+      { memory :=
+          { params := { implicit_writes := false }
+            mem :=
+              { allocations :=
+                  [mkA 0x100 2 [.Init 0 none, .Init 0 none],
+                   mkA 0x200 2 [.Init 0xEF none, .Init 0xBE none],
+                   mkA 0x300 8 (List.replicate 8 .Uninit),
+                   mkA 0x400 1 [.Init 0 none]]
+                _phantom := ⟨⟩ } }
+        accesses := [] }
+    intptrcast := ⟨⟨[]⟩⟩
+    threads :=
+      [{ stack := [uwMtT0FrameTB], state := .Terminated, unwind_payloads := [⟨0x9000, none⟩] },
+       { stack := [fr1], state := .Enabled, unwind_payloads := [] }]
+    active_thread := 0
+    synchronized_threads := ⟨[]⟩
+    locks := []
+    global_ptrs := ⟨[]⟩
+    fn_ptrs := ⟨[(fnName 1, ⟨0x8000, none⟩)]⟩
+    vtable_ptrs := ⟨[]⟩
+    stdout := ⟨[]⟩
+    stderr := ⟨[]⟩ }
+
+/-- **Provenance-carrying unwind payload, non-zero `active_thread = 1`
+multi-thread isolation, and `Return` vs `ResumeUnwind` contrast on a non-main
+thread (`minirust_unwind_provenance_multithread_step_witness`)**:
+1. On a two-thread machine (`Mach` and `MachTB`) where thread `0` is
+   `.Terminated` (holding its own stack frame and `unwind_payloads = [0x9000]`)
+   and thread `1` is the sole `.Enabled` thread (`pickActiveThread` chooses
+   `active_thread = 1`):
+   - outer calls `uwMtCalleeFn` passing `AddrOf (.Local _1) (.Raw .None)` (a
+     raw pointer carrying real provenance to the live `u16` `0xBEEF`);
+   - callee loads that pointer via `.Load (.Local _1)` in `StartUnwind` and
+     propagates via `ResumeUnwind`;
+   - outer catches via `GetUnwindPayload`, clears via `StopUnwind`, and
+     dereferences the caught pointer to load `0xBEEF` (`[0xEF, 0xBE]`) into
+     `_0`, proving provenance survived the full unwind cycle (a provenance-free
+     pointer would raise UB on dereference);
+   - thread `0` is preserved (`m.threads[0]? = uwMtMachBM.threads[0]?`
+     verbatim on `Mach`, and matching `state`, `unwind_payloads`, and every
+     stack frame's `locals`, `stack_pop_action`, `next_block`, `next_stmt`, and
+     `extra.protectors` on `MachTB`), and step `7` hits `Unreachable`.
+2. Non-main thread `BottomOfStack` contrast (`active_thread = 1`): on both
+   `Mach` and `MachTB`, `Terminator.Return` at `BottomOfStack` terminates
+   thread `1` normally while leaving thread `0` verbatim untouched, whereas
+   `Terminator.ResumeUnwind` on the exact same state raises UB
+   `"the function at the bottom of the stack must not unwind"`. -/
+theorem minirust_unwind_provenance_multithread_step_witness :
+    let botFn := uwFn [(⟨⟨0⟩⟩, .Int u8)]
+    let botFrBM : Frame :=
+      { func := botFn, locals := ⟨[(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩)]⟩,
+        stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := () }
+    let botMachBM : Mach :=
+      { uwMachBM [uwLiveStackAllocBM 0x100] [] [] with
+        threads :=
+          [{ stack := [uwMtT0FrameBM], state := .Enabled, unwind_payloads := [⟨0x9000, none⟩] },
+           { stack := [botFrBM], state := .Enabled, unwind_payloads := [] }]
+        active_thread := 1 }
+    let botFrTB : Gen.StackFrame TBM :=
+      { func := botFn, locals := ⟨[(⟨⟨0⟩⟩, ⟨0x100, some (⟨0⟩, [])⟩)]⟩,
+        stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := ⟨[]⟩ }
+    let botMachTB : MachTB :=
+      { uwMachTB [uwLiveAllocTB 0x100 .Stack (uwRootWithChildren [])] [] [] with
+        threads :=
+          [{ stack := [uwMtT0FrameTB], state := .Enabled, unwind_payloads := [⟨0x9000, none⟩] },
+           { stack := [botFrTB], state := .Enabled, unwind_payloads := [] }]
+        active_thread := 1 }
+    ((Interp.steps 6 uwMtMachBM).toOption.map (fun m =>
+      (m.active_thread,
+       m.mem.memory.allocations[0]?.map (·.data),
+       m.mem.memory.allocations.map (·.live),
+       m.threads.length,
+       m.threads[1]?.map (fun t => (t.state, t.unwind_payloads, t.stack.length)))) =
+      some (1, some [.Init 0xEF none, .Init 0xBE none],
+        [true, true, true, true, false, false], 2, some (.Enabled, [], 1)) ∧
+     (Interp.steps 6 uwMtMachBM).toOption.map (·.threads[0]?) = some uwMtMachBM.threads[0]? ∧
+     Interp.steps 7 uwMtMachBM = .error (.ub "reached unreachable code")) ∧
+    ((Interp.stepsTB 6 uwMtMachTB).toOption.map (·.active_thread) = some 1 ∧
+     (Interp.stepsTB 6 uwMtMachTB).toOption.map (fun m =>
+       m.mem.memory.mem.allocations[0]?.map (·.data)) =
+       some (some [.Init 0xEF none, .Init 0xBE none]) ∧
+     (Interp.stepsTB 6 uwMtMachTB).toOption.map (fun m =>
+       m.mem.memory.mem.allocations.map (·.live)) =
+       some [true, true, true, true, false, false] ∧
+     (Interp.stepsTB 6 uwMtMachTB).toOption.map (fun m =>
+       m.threads.map (·.unwind_payloads)) =
+       some [[⟨0x9000, none⟩], []] ∧
+     (Interp.stepsTB 6 uwMtMachTB).toOption.map (fun m => m.threads.map (·.state)) =
+       some [.Terminated, .Enabled] ∧
+     (Interp.stepsTB 6 uwMtMachTB).toOption.map (fun m => m.threads.map (·.stack.length)) =
+       some [1, 1] ∧
+     (Interp.stepsTB 6 uwMtMachTB).toOption.map (fun m =>
+       m.threads[0]?.map (fun t => t.stack.map (fun f => f.locals.entries.isEmpty))) =
+       some (some [true]) ∧
+     (Interp.stepsTB 6 uwMtMachTB).toOption.map (fun m =>
+       m.threads[0]?.map (fun t => t.stack.map (fun f =>
+         match f.stack_pop_action with
+         | .BottomOfStack => true
+         | .BackToCaller _ _ _ => false))) =
+       some (some [true]) ∧
+     (Interp.stepsTB 6 uwMtMachTB).toOption.map (fun m =>
+       m.threads[0]?.map (fun t => t.stack.map (fun f => (f.next_block, f.next_stmt)))) =
+       some (some [(⟨⟨9⟩⟩, 0)]) ∧
+     (Interp.stepsTB 6 uwMtMachTB).toOption.map (fun m =>
+       m.threads[0]?.map (fun t => t.stack.map (fun f => f.extra.protectors))) =
+       some (some [[]]) ∧
+     Interp.stepsTB 7 uwMtMachTB = .error (.ub "reached unreachable code")) ∧
+    ((Interp.evalTerminator botMachBM .Return).toOption.map (fun m =>
+       (m.threads[0]?, m.threads[1]?.map (fun t => (t.state, t.unwind_payloads)))) =
+       some (botMachBM.threads[0]?, some (.Terminated, [])) ∧
+     Interp.evalTerminator botMachBM .ResumeUnwind =
+       .error (.ub "the function at the bottom of the stack must not unwind") ∧
+     (Interp.evalTerminatorM botMachTB .Return).toOption.map (fun m =>
+       (m.threads[0]?, m.threads[1]?.map (fun t => (t.state, t.unwind_payloads)))) =
+       some (botMachTB.threads[0]?, some (.Terminated, [])) ∧
+     Interp.evalTerminatorM botMachTB .ResumeUnwind =
+       .error (.ub "the function at the bottom of the stack must not unwind")) := by
+  refine ⟨⟨rfl, rfl, rfl⟩,
+    ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+     by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+     by decide +kernel, by decide +kernel, eq_error_of_interpStopOf (by decide +kernel)⟩,
+    ⟨rfl, rfl, rfl, rfl⟩⟩
+
+private def sdPayloadEnumTy : Gen.Type :=
+  let payloadTuple : Gen.Type :=
+    .Tuple [(⟨2⟩, .Int u16)] ⟨⟨4⟩, ⟨2⟩, none⟩ none
+  let v0 : Gen.Variant := { ty := payloadTuple, tagger := ⟨[(⟨0⟩, (u8, 0))]⟩ }
+  let v1 : Gen.Variant := { ty := payloadTuple, tagger := ⟨[(⟨0⟩, (u8, 1))]⟩ }
+  let disc : Gen.Discriminator :=
+    .Branch ⟨0⟩ u8 .Invalid ⟨[((0, 1), .Known 0), ((1, 2), .Known 1)]⟩
+  .Enum ⟨[(0, v0), (1, v1)]⟩ u8 disc ⟨4⟩ ⟨2⟩
+
+/-- **`SetDiscriminant` + `ValueExpr.Load` full enum round-trip and error
+propagation controls (`minirust_setDiscriminant_load_roundtrip_witness`)**:
+1. On both `Mach` and `MachTB`, starting from a 4-byte enum carrying `u8` tag
+   `0` at offset `0`, uninitialized padding at offset `1`, and `u16` payload
+   `0xBEEF` at offset `2`, executing `Statement.SetDiscriminant (.Local 1) 1`
+   writes only byte `0` (`0x01`) while preserving padding and payload, and
+   `ValueExpr.Load (.Local 1)` decodes `.Variant 1 (.Tuple [.Int 0xBEEF])`;
+2. Concrete error-propagation controls on both `Mach` and `MachTB`:
+   `SetDiscriminant` on a dead local raises `.ub "access to a dead local"`, and
+   `StartUnwind` with an uninitialized raw-pointer local raises `typedLoad` UB
+   without pushing onto `unwind_payloads`. -/
+theorem minirust_setDiscriminant_load_roundtrip_witness :
+    let initBytes {P : Type} : List (Gen.AbstractByte P) :=
+      [.Init 0x00 none, .Uninit, .Init 0xEF none, .Init 0xBE none]
+    let afterBytes {P : Type} : List (Gen.AbstractByte P) :=
+      [.Init 0x01 none, .Uninit, .Init 0xEF none, .Init 0xBE none]
+    let fn := uwFn [(⟨⟨1⟩⟩, sdPayloadEnumTy), (⟨⟨2⟩⟩, sdPayloadEnumTy),
+                    (⟨⟨3⟩⟩, .Ptr (.Raw .None))]
+    let allocEnumBM : Gen.Allocation Unit Unit :=
+      { data := initBytes, addr := 0x100, align := ⟨2⟩, kind := .Stack, live := true,
+        extra := () }
+    let allocPtrBM : Gen.Allocation Unit Unit :=
+      { data := List.replicate 8 .Uninit, addr := 0x200, align := ⟨8⟩, kind := .Stack,
+        live := true, extra := () }
+    let frBM : Frame :=
+      { func := fn
+        locals := ⟨[(⟨⟨1⟩⟩, ⟨0x100, some (⟨0⟩, ())⟩), (⟨⟨3⟩⟩, ⟨0x200, some (⟨1⟩, ())⟩)]⟩
+        stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := () }
+    let mBM := uwMachBM [allocEnumBM, allocPtrBM] [frBM] []
+    let mkAllocTB (addr : Int) (al : Nat)
+        (bs : List (Gen.AbstractByte Gen.TreeBorrowsProvenance)) :
+        Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
+      { data := bs, addr := addr, align := ⟨al⟩, kind := .Stack, live := true,
+        extra :=
+          { root :=
+              { children := [], permissions := List.replicate bs.length (.Unprot .Unique),
+                «protected» := .No } } }
+    let frTB : Gen.StackFrame TBM :=
+      { func := fn
+        locals := ⟨[(⟨⟨1⟩⟩, ⟨0x100, some (⟨0⟩, [])⟩), (⟨⟨3⟩⟩, ⟨0x200, some (⟨1⟩, [])⟩)]⟩
+        stack_pop_action := .BottomOfStack, next_block := ⟨⟨0⟩⟩, next_stmt := 0, extra := ⟨[]⟩ }
+    let mTB := uwMachTB
+      [mkAllocTB 0x100 2 initBytes, mkAllocTB 0x200 8 (List.replicate 8 .Uninit)] [frTB] []
+    let loadUb := "load at type but the data in memory violates the language invariant"
+    (∃ m1 m2,
+      Interp.evalStatement mBM (.SetDiscriminant (.Local ⟨⟨1⟩⟩) 1) = .ok m1 ∧
+      m1.mem.memory.allocations[0]?.map (·.data) = some afterBytes ∧
+      Interp.evalValue m1 (.Load (.Local ⟨⟨1⟩⟩)) =
+        .ok ((.Variant 1 (.Tuple [.Int 0xBEEF]), sdPayloadEnumTy), m2)) ∧
+    (∃ m1 m2,
+      Interp.evalStatementM mTB (.SetDiscriminant (.Local ⟨⟨1⟩⟩) 1) = .ok m1 ∧
+      m1.mem.memory.mem.allocations[0]?.map (·.data) = some afterBytes ∧
+      Interp.evalValueM m1 (.Load (.Local ⟨⟨1⟩⟩)) =
+        .ok ((.Variant 1 (.Tuple [.Int 0xBEEF]), sdPayloadEnumTy), m2)) ∧
+    (Interp.evalStatement mBM (.SetDiscriminant (.Local ⟨⟨2⟩⟩) 1) =
+      .error (.ub "access to a dead local") ∧
+     Interp.evalStatementM mTB (.SetDiscriminant (.Local ⟨⟨2⟩⟩) 1) =
+      .error (.ub "access to a dead local") ∧
+     Interp.evalTerminator mBM (.StartUnwind (.Load (.Local ⟨⟨3⟩⟩)) ⟨⟨1⟩⟩) =
+      .error (.ub loadUb) ∧
+     Interp.evalTerminatorM mTB (.StartUnwind (.Load (.Local ⟨⟨3⟩⟩)) ⟨⟨1⟩⟩) =
+      .error (.ub loadUb)) :=
+  ⟨⟨_, _, rfl, rfl, rfl⟩, ⟨_, _, rfl, rfl, rfl⟩, ⟨rfl, rfl, rfl, rfl⟩⟩
 
 /-- **`sizeOfVal` & `alignOfVal` on unsized `RigidTy.str` (`&str` / `*const str`) ↔ MiniRust
 `Type.layout (.Slice (.Int u8))` (`evalLIntrinsic_sizeOfVal_alignOfVal_str_minirust_layout`,
@@ -2425,7 +5258,7 @@ theorem evalLIntrinsic_sizeOfVal_alignOfVal_str_minirust_layout
       (if len < 2 ^ 63 then some (.scalar ⟨1, 8⟩) else none) := by
   have hLenWrap : wrapScalarBits len (scalarModulus 8) = len := by
     rw [wrapScalarBits_eq, scalarModulus_eq, Nat.mod_eq_of_lt hlen]
-  have hHalf8 : signedHalfModulus 8 = 2 ^ 63 := by decide
+  have hHalf8 : signedHalfModulus 8 = 2 ^ 63 := by decide +kernel
   have hSlice1 : evalSliceSizeOfVal 1 ⟨len, 8⟩ =
       if len < 2 ^ 63 then some ⟨len, 8⟩ else none := by
     unfold evalSliceSizeOfVal
@@ -2506,9 +5339,14 @@ inductive LIntrinsicBridgeClass : Type where
   MIR `StatementKind::CopyNonOverlapping`; `writeBytes` is pinned as external `MirCallReq` in
   Section 3 and sub-place byte-fill in `AdtAndControl` Section 5c/5g) — 2 variants. -/
   | callFormMemory
-  /-- `Trusted`-only unwinding panic (`minirust_unwind_terminators_unsupported` proves MiniRust's
-  `Interp.evalTerminator` stops with `.unsupported` on `StartUnwind`/`StopUnwind`/`ResumeUnwind`) —
-  1 variant (`panicUnwind`). -/
+  /-- Unwinding panic with no single MiniRust `IntrinsicOp` primitive: MiniRust
+  models unwinding with the terminators `StartUnwind`/`StopUnwind`/
+  `ResumeUnwind`, which `Interp.evalTerminator` (`Mach`) and
+  `Interp.evalTerminatorM` (`MachTB`) execute
+  (`minirust_unwind_terminators_supported`,
+  `minirust_unwind_concrete_witnesses`). The correspondence proved in this
+  module is with `Trusted`'s `startPanic` only; no simulation against those
+  terminators is proved here — 1 variant (`panicUnwind`). -/
   | trustedOnlyUnwind
   deriving DecidableEq, Repr
 
@@ -2548,7 +5386,7 @@ theorem lintrinsicOp_exhaustive_minirust_classification :
     (allLIntrinsicOps.filter (classifyLIntrinsicBridge · == .symbolicBitAndFallback)).length = 5 ∧
     (allLIntrinsicOps.filter (classifyLIntrinsicBridge · == .callFormMemory)).length = 2 ∧
     (allLIntrinsicOps.filter (classifyLIntrinsicBridge · == .trustedOnlyUnwind)).length = 1 := by
-  refine ⟨rfl, by decide, fun op => ?_, rfl, rfl, rfl, rfl⟩
+  refine ⟨rfl, by decide +kernel, fun op => ?_, rfl, rfl, rfl, rfl⟩
   cases op <;> decide
 
 end AdvEp2B4

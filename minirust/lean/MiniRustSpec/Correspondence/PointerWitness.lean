@@ -8,6 +8,7 @@ This file may not be copied, modified, or distributed except according to
 those terms.
 -/
 
+import Lean
 import MiniRustSpec.Correspondence.Witness
 import MiniRustSpec.Correspondence.Pointers
 
@@ -129,6 +130,42 @@ open MiniRustSpec.Interp
 open MiniRustSpec.Correspondence
 open MiniRustSpec.Correspondence.Witness
 
+local elab "kernel_rfl" : tactic => do
+  let mvarId ← Lean.Elab.Tactic.getMainGoal
+  let tgt ← Lean.MVarId.getType' mvarId
+  let some (ty, lhs, _) := tgt.eq? | Lean.Meta.throwTacticEx `kernel_rfl mvarId "expected equality goal"
+  let u ← Lean.Meta.getLevel ty
+  mvarId.assign (Lean.mkApp2 (Lean.mkConst ``Eq.refl [u]) ty lhs)
+  Lean.Elab.Tactic.replaceMainGoal []
+
+private theorem runA_isSome_noUB (body : CapturedMir) (fuel : Nat) (s : MachineState)
+    (h : (runA body fuel s).isSome = true) : MirNoUBTree (mirTree body s) := by
+  cases hr : runA body fuel s with
+  | none => rw [hr] at h; cases h
+  | some p => exact runA_noUB body fuel s p.1 p.2 hr
+
+private theorem runA_exists_mem_sound (body : CapturedMir) (fuel : Nat) (s : MachineState)
+    (tr : List (Event MirEffect)) (v : Value)
+    (h : (runA body fuel s).map (fun (tr', o) =>
+      match o with
+      | .normal (v', _) => some (tr', v')
+      | _ => none) = some (some (tr, v))) :
+    ∃ mem, ReachesRet (mirTree body s) tr (.normal (v, mem)) := by
+  cases hr : runA body fuel s with
+  | none => rw [hr] at h; cases h
+  | some p =>
+    rcases p with ⟨tr', o⟩
+    cases o with
+    | normal vm =>
+      rcases vm with ⟨v', mem⟩
+      rw [hr] at h
+      injection h with h1
+      injection h1 with h2
+      injection h2 with htr hv
+      cases htr; cases hv
+      exact ⟨mem, runA_sound body fuel s _ _ hr⟩
+    | _ => rw [hr] at h; cases h
+
 /-! ## MIR building blocks -/
 
 def ptrMutU32Ty : Ty := { kind := .rawPtr .mut (.uint .u32), layoutIdx := 0 }
@@ -211,7 +248,7 @@ def ptrRoundTrip : CapturedMir :=
 /-- `ptrRoundTrip` lies in the correspondence fragment: `_1` is a parameter
 borrowed only by `&raw mut _1`, never written directly, and every pointer
 statement is one that `statementOk` admits. -/
-theorem ptrRoundTrip_inFragment : inFragment ptrRoundTrip = true := by decide
+theorem ptrRoundTrip_inFragment : inFragment ptrRoundTrip = true := by decide +kernel
 
 /-- The MiniRust function `minimize` produces for `ptrRoundTrip`: `&raw mut _1`
 becomes `AddrOf` at the thin raw pointer type, `*_2` becomes
@@ -247,11 +284,11 @@ theorem ptrRoundTrip_anneal_ret :
     ReachesRet (mirTree ptrRoundTrip ptrRoundTripS0) []
       (.normal (.scalar ⟨6, 4⟩,
         { ptrRoundTripS0.memory with borrows := retBorrows [rawPtrEntry 1 .mut (local_ 1)], nextTag := 2 })) :=
-  runA_sound ptrRoundTrip 30 _ _ _ rfl
+  runA_sound ptrRoundTrip 30 _ _ _ (by kernel_rfl)
 
 theorem ptrRoundTrip_noUB :
     MirNoUBTree (mirCallTree ptrRoundTrip [.scalar ⟨5, 4⟩]) :=
-  runA_noUB ptrRoundTrip 30 _ _ _ rfl
+  runA_isSome_noUB ptrRoundTrip 30 _ (by kernel_rfl)
 
 /-- MiniRust returns `6` too, after ten steps (the init block's `Goto`, nine
 statements, and `Return`). -/
@@ -289,7 +326,7 @@ theorem ptrRoundTrip_minirust_ret_from_start :
       m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret ptrRoundTrip_inFragment ptrRoundTrip_translate ctx0 ptrRoundTrip_ctxOk
-      [.scalar ⟨5, 4⟩] (by decide) ptrRoundTripMInit rfl rfl rfl ptrRoundTrip_anneal_ret
+      [.scalar ⟨5, 4⟩] (by decide +kernel) ptrRoundTripMInit rfl rfl rfl ptrRoundTrip_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [ptrRoundTrip, ptrBody] at hd; subst hd
   simp [retPtr, ctx0] at hp
@@ -305,7 +342,7 @@ theorem ptrRoundTrip_minirust_noUB {n : Nat} {e : Stop}
       ReturnRel ptrRoundTrip ctx0 s' v mRet ∧
       ReachesRet (mirCallTree ptrRoundTrip [.scalar ⟨5, 4⟩]) tr (.normal (v, mem)) :=
   mirCall_noUB ptrRoundTrip_inFragment ptrRoundTrip_translate ctx0 ptrRoundTrip_ctxOk
-    [.scalar ⟨5, 4⟩] (by decide) ptrRoundTripMInit rfl rfl rfl ptrRoundTrip_noUB herr
+    [.scalar ⟨5, 4⟩] (by decide +kernel) ptrRoundTripMInit rfl rfl rfl ptrRoundTrip_noUB herr
 
 theorem ptrRoundTrip_progress (n : Nat) :
     (∃ s' m' tr, Interp.steps (1 + n) ptrRoundTripMInit = .ok m' ∧
@@ -315,7 +352,7 @@ theorem ptrRoundTrip_progress (n : Nat) :
       ReturnRel ptrRoundTrip ctx0 s' v mRet ∧
       ReachesRet (mirCallTree ptrRoundTrip [.scalar ⟨5, 4⟩]) tr (.normal (v, mem))) :=
   mirCall_progress_N ptrRoundTrip_inFragment ptrRoundTrip_translate ctx0 ptrRoundTrip_ctxOk
-    [.scalar ⟨5, 4⟩] (by decide) ptrRoundTripMInit rfl rfl rfl ptrRoundTrip_noUB n
+    [.scalar ⟨5, 4⟩] (by decide +kernel) ptrRoundTripMInit rfl rfl rfl ptrRoundTrip_noUB n
 
 /-! ## `&raw mut a[-2]` and `&raw mut a[-1]` on an array parameter -/
 
@@ -360,7 +397,7 @@ def arrayParamPtr : CapturedMir :=
        .assign (local_ 0) (.use (.copy (derefPlace 4)))] with
     fnAbi := fnAbiArrU32_2Arg }
 
-theorem arrayParamPtr_inFragment : inFragment arrayParamPtr = true := by decide
+theorem arrayParamPtr_inFragment : inFragment arrayParamPtr = true := by decide +kernel
 
 def arrayParamPtrFn : Gen.Function where
   locals := ⟨[
@@ -413,11 +450,11 @@ theorem arrayParamPtr_anneal_ret :
           borrows := retBorrows [rawPtrEntry 2 .mut (placeConstIdx 1 1 2 true),
                       rawPtrEntry 1 .mut (placeConstIdx 1 2 2 true)],
           nextTag := 3 })) :=
-  runA_sound arrayParamPtr 40 _ _ _ rfl
+  runA_sound arrayParamPtr 40 _ _ _ (by kernel_rfl)
 
 theorem arrayParamPtr_noUB :
     MirNoUBTree (mirCallTree arrayParamPtr [initArrU32_2]) :=
-  runA_noUB arrayParamPtr 40 _ _ _ rfl
+  runA_isSome_noUB arrayParamPtr 40 _ (by kernel_rfl)
 
 theorem arrayParamPtr_ctxOk : CtxOk arrayParamPtr ctx0 where
   baseLow := by unfold BaseLow; decide
@@ -435,7 +472,7 @@ theorem arrayParamPtr_ctxOk : CtxOk arrayParamPtr ctx0 where
     have hlay : arrayParamPtr.layouts = emptyLayoutTable := rfl
     rw [hlay]
     simp [arrayParamPtr, ptrBody] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 def arrayParamPtrMInit : Mach :=
   machine arrayParamPtr arrayParamPtrFn arrayParamPtrS0.frame.locals arrayParamPtrFn.start
@@ -446,7 +483,7 @@ theorem arrayParamPtr_minirust_ret_from_start :
       m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret arrayParamPtr_inFragment arrayParamPtr_translate ctx0 arrayParamPtr_ctxOk
-      [initArrU32_2] (by decide) arrayParamPtrMInit rfl rfl rfl arrayParamPtr_anneal_ret
+      [initArrU32_2] (by decide +kernel) arrayParamPtrMInit rfl rfl rfl arrayParamPtr_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [arrayParamPtr, ptrBody] at hd; subst hd
   simp [retPtr, ctx0] at hp
@@ -462,7 +499,7 @@ theorem arrayParamPtr_minirust_noUB {n : Nat} {e : Stop}
       ReturnRel arrayParamPtr ctx0 s' v mRet ∧
       ReachesRet (mirCallTree arrayParamPtr [initArrU32_2]) tr (.normal (v, mem)) :=
   mirCall_noUB arrayParamPtr_inFragment arrayParamPtr_translate ctx0 arrayParamPtr_ctxOk
-    [initArrU32_2] (by decide) arrayParamPtrMInit rfl rfl rfl arrayParamPtr_noUB herr
+    [initArrU32_2] (by decide +kernel) arrayParamPtrMInit rfl rfl rfl arrayParamPtr_noUB herr
 
 theorem arrayParamPtr_progress (n : Nat) :
     (∃ s' m' tr, Interp.steps (1 + n) arrayParamPtrMInit = .ok m' ∧
@@ -472,7 +509,7 @@ theorem arrayParamPtr_progress (n : Nat) :
       ReturnRel arrayParamPtr ctx0 s' v mRet ∧
       ReachesRet (mirCallTree arrayParamPtr [initArrU32_2]) tr (.normal (v, mem))) :=
   mirCall_progress_N arrayParamPtr_inFragment arrayParamPtr_translate ctx0 arrayParamPtr_ctxOk
-    [initArrU32_2] (by decide) arrayParamPtrMInit rfl rfl rfl arrayParamPtr_noUB n
+    [initArrU32_2] (by decide +kernel) arrayParamPtrMInit rfl rfl rfl arrayParamPtr_noUB n
 
 theorem arrayParamPtr_minirust_direct :
     retAfter arrayParamPtr [initArrU32_2] 21 =
@@ -507,7 +544,7 @@ theorem arrayElemPtr_notInFragment : inFragment arrayElemPtr = false := by decid
 theorem arrayElemPtr_anneal_ret :
     ∃ mem, ReachesRet (mirTree arrayElemPtr (initMachineState arrayElemPtr [.scalar ⟨5, 4⟩])) []
       (.normal (.scalar ⟨12, 4⟩, mem)) :=
-  ⟨_, runA_sound arrayElemPtr 30 _ _ _ rfl⟩
+  runA_exists_mem_sound arrayElemPtr 30 _ _ _ (by kernel_rfl)
 
 theorem arrayElemPtr_minirust_direct :
     retAfter arrayElemPtr [.scalar ⟨5, 4⟩] 10 =
@@ -539,7 +576,7 @@ def fieldPtr : CapturedMir :=
     fnAbi := fnAbiPaddedArg, layouts := paddedLayouts }
 
 /-- `fieldPtr` lies in the correspondence fragment. -/
-theorem fieldPtr_inFragment : inFragment fieldPtr = true := by decide
+theorem fieldPtr_inFragment : inFragment fieldPtr = true := by decide +kernel
 
 def fieldPtrFn : Gen.Function where
   locals := ⟨[
@@ -571,11 +608,11 @@ theorem fieldPtr_anneal_ret :
       (.normal (.scalar ⟨100, 4⟩,
         { fieldPtrS0.memory with
           borrows := retBorrows [rawPtrEntry 1 .mut (placeField 1 [(1, u32Ty)])], nextTag := 2 })) :=
-  runA_sound fieldPtr 30 _ _ _ rfl
+  runA_sound fieldPtr 30 _ _ _ (by kernel_rfl)
 
 theorem fieldPtr_noUB :
     MirNoUBTree (mirCallTree fieldPtr [initPaddedStruct]) :=
-  runA_noUB fieldPtr 30 _ _ _ rfl
+  runA_isSome_noUB fieldPtr 30 _ (by kernel_rfl)
 
 theorem fieldPtr_ctxOk : CtxOk fieldPtr ctx0 where
   baseLow := by unfold BaseLow; decide
@@ -593,7 +630,7 @@ theorem fieldPtr_ctxOk : CtxOk fieldPtr ctx0 where
     have hlay : fieldPtr.layouts = paddedLayouts := rfl
     rw [hlay]
     simp [fieldPtr, ptrBody] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 def fieldPtrMInit : Mach :=
   machine fieldPtr fieldPtrFn fieldPtrS0.frame.locals fieldPtrFn.start
@@ -604,7 +641,7 @@ theorem fieldPtr_minirust_ret_from_start :
       m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret fieldPtr_inFragment fieldPtr_translate ctx0 fieldPtr_ctxOk
-      [initPaddedStruct] (by decide) fieldPtrMInit rfl rfl rfl fieldPtr_anneal_ret
+      [initPaddedStruct] (by decide +kernel) fieldPtrMInit rfl rfl rfl fieldPtr_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [fieldPtr, ptrBody] at hd; subst hd
   simp [retPtr, ctx0] at hp
@@ -620,7 +657,7 @@ theorem fieldPtr_minirust_noUB {n : Nat} {e : Stop}
       ReturnRel fieldPtr ctx0 s' v mRet ∧
       ReachesRet (mirCallTree fieldPtr [initPaddedStruct]) tr (.normal (v, mem)) :=
   mirCall_noUB fieldPtr_inFragment fieldPtr_translate ctx0 fieldPtr_ctxOk
-    [initPaddedStruct] (by decide) fieldPtrMInit rfl rfl rfl fieldPtr_noUB herr
+    [initPaddedStruct] (by decide +kernel) fieldPtrMInit rfl rfl rfl fieldPtr_noUB herr
 
 theorem fieldPtr_progress (n : Nat) :
     (∃ s' m' tr, Interp.steps (1 + n) fieldPtrMInit = .ok m' ∧
@@ -630,7 +667,7 @@ theorem fieldPtr_progress (n : Nat) :
       ReturnRel fieldPtr ctx0 s' v mRet ∧
       ReachesRet (mirCallTree fieldPtr [initPaddedStruct]) tr (.normal (v, mem))) :=
   mirCall_progress_N fieldPtr_inFragment fieldPtr_translate ctx0 fieldPtr_ctxOk
-    [initPaddedStruct] (by decide) fieldPtrMInit rfl rfl rfl fieldPtr_noUB n
+    [initPaddedStruct] (by decide +kernel) fieldPtrMInit rfl rfl rfl fieldPtr_noUB n
 
 theorem fieldPtr_minirust_direct :
     retAfter fieldPtr [initPaddedStruct] 8 =
@@ -685,7 +722,7 @@ def nestedFieldPtr : CapturedMir :=
            (.copy (placeField 1 [(0, innerTupleTy), (1, u32Ty)])))] with
     fnAbi := fnAbiOuterTupleArg, layouts := nestedLayouts }
 
-theorem nestedFieldPtr_inFragment : inFragment nestedFieldPtr = true := by decide
+theorem nestedFieldPtr_inFragment : inFragment nestedFieldPtr = true := by decide +kernel
 
 def nestedFieldPtrFn : Gen.Function where
   locals := ⟨[
@@ -742,11 +779,11 @@ theorem nestedFieldPtr_anneal_ret :
           borrows := retBorrows [rawPtrEntry 2 .mut (placeField 1 [(1, u16Ty)]),
                       rawPtrEntry 1 .mut (placeField 1 [(0, innerTupleTy), (1, u32Ty)])],
           nextTag := 3 })) :=
-  runA_sound nestedFieldPtr 40 _ _ _ rfl
+  runA_sound nestedFieldPtr 40 _ _ _ (by kernel_rfl)
 
 theorem nestedFieldPtr_noUB :
     MirNoUBTree (mirCallTree nestedFieldPtr [initOuterTuple]) :=
-  runA_noUB nestedFieldPtr 40 _ _ _ rfl
+  runA_isSome_noUB nestedFieldPtr 40 _ (by kernel_rfl)
 
 theorem nestedFieldPtr_ctxOk : CtxOk nestedFieldPtr ctx0 where
   baseLow := by unfold BaseLow; decide
@@ -764,7 +801,7 @@ theorem nestedFieldPtr_ctxOk : CtxOk nestedFieldPtr ctx0 where
     have hlay : nestedFieldPtr.layouts = nestedLayouts := rfl
     rw [hlay]
     simp [nestedFieldPtr, ptrBody] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 def nestedFieldPtrMInit : Mach :=
   machine nestedFieldPtr nestedFieldPtrFn nestedFieldPtrS0.frame.locals nestedFieldPtrFn.start
@@ -775,7 +812,7 @@ theorem nestedFieldPtr_minirust_ret_from_start :
       m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret nestedFieldPtr_inFragment nestedFieldPtr_translate ctx0 nestedFieldPtr_ctxOk
-      [initOuterTuple] (by decide) nestedFieldPtrMInit rfl rfl rfl nestedFieldPtr_anneal_ret
+      [initOuterTuple] (by decide +kernel) nestedFieldPtrMInit rfl rfl rfl nestedFieldPtr_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [nestedFieldPtr, ptrBody] at hd; subst hd
   simp [retPtr, ctx0] at hp
@@ -791,7 +828,7 @@ theorem nestedFieldPtr_minirust_noUB {n : Nat} {e : Stop}
       ReturnRel nestedFieldPtr ctx0 s' v mRet ∧
       ReachesRet (mirCallTree nestedFieldPtr [initOuterTuple]) tr (.normal (v, mem)) :=
   mirCall_noUB nestedFieldPtr_inFragment nestedFieldPtr_translate ctx0 nestedFieldPtr_ctxOk
-    [initOuterTuple] (by decide) nestedFieldPtrMInit rfl rfl rfl nestedFieldPtr_noUB herr
+    [initOuterTuple] (by decide +kernel) nestedFieldPtrMInit rfl rfl rfl nestedFieldPtr_noUB herr
 
 theorem nestedFieldPtr_progress (n : Nat) :
     (∃ s' m' tr, Interp.steps (1 + n) nestedFieldPtrMInit = .ok m' ∧
@@ -801,7 +838,7 @@ theorem nestedFieldPtr_progress (n : Nat) :
       ReturnRel nestedFieldPtr ctx0 s' v mRet ∧
       ReachesRet (mirCallTree nestedFieldPtr [initOuterTuple]) tr (.normal (v, mem))) :=
   mirCall_progress_N nestedFieldPtr_inFragment nestedFieldPtr_translate ctx0 nestedFieldPtr_ctxOk
-    [initOuterTuple] (by decide) nestedFieldPtrMInit rfl rfl rfl nestedFieldPtr_noUB n
+    [initOuterTuple] (by decide +kernel) nestedFieldPtrMInit rfl rfl rfl nestedFieldPtr_noUB n
 
 theorem nestedFieldPtr_minirust_direct :
     retAfter nestedFieldPtr [initOuterTuple] 17 =
@@ -863,7 +900,7 @@ def ptrCountdown : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem ptrCountdown_inFragment : inFragment ptrCountdown = true := by decide
+theorem ptrCountdown_inFragment : inFragment ptrCountdown = true := by decide +kernel
 
 def ptrCountdownFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32), (localName 2, thinRawPtrTy),
@@ -909,10 +946,10 @@ theorem ptrCountdown_anneal_ret :
     ReachesRet (mirTree ptrCountdown ptrCountdownS0) ptrCountdownTrace
       (.normal (.scalar ⟨3, 4⟩,
         { ptrCountdownS0.memory with borrows := retBorrows [rawPtrEntry 1 .mut (local_ 1)], nextTag := 2 })) :=
-  runA_sound ptrCountdown 40 _ _ _ rfl
+  runA_sound ptrCountdown 40 _ _ _ (by kernel_rfl)
 
 theorem ptrCountdown_noUB : MirNoUBTree (mirCallTree ptrCountdown [.scalar ⟨3, 4⟩]) :=
-  runA_noUB ptrCountdown 40 _ _ _ rfl
+  runA_isSome_noUB ptrCountdown 40 _ (by kernel_rfl)
 
 theorem ptrCountdown_ctxOk : CtxOk ptrCountdown ctx0 where
   baseLow := by unfold BaseLow; decide
@@ -930,7 +967,7 @@ theorem ptrCountdown_ctxOk : CtxOk ptrCountdown ctx0 where
     have hlay : ptrCountdown.layouts = emptyLayoutTable := rfl
     rw [hlay]
     simp [ptrCountdown] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 /-- MiniRust at `minimize`'s init block (the function's `start`). -/
 def ptrCountdownMInit : Mach :=
@@ -944,7 +981,7 @@ theorem ptrCountdown_minirust_ret_from_start :
       m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret ptrCountdown_inFragment ptrCountdown_translate ctx0 ptrCountdown_ctxOk
-      [.scalar ⟨3, 4⟩] (by decide) ptrCountdownMInit rfl rfl rfl ptrCountdown_anneal_ret
+      [.scalar ⟨3, 4⟩] (by decide +kernel) ptrCountdownMInit rfl rfl rfl ptrCountdown_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [ptrCountdown] at hd; subst hd
   simp [retPtr, ctx0] at hp
@@ -960,7 +997,7 @@ theorem ptrCountdown_minirust_noUB {n : Nat} {e : Stop}
       ReturnRel ptrCountdown ctx0 s' v mRet ∧
       ReachesRet (mirCallTree ptrCountdown [.scalar ⟨3, 4⟩]) tr (.normal (v, mem)) :=
   mirCall_noUB ptrCountdown_inFragment ptrCountdown_translate ctx0 ptrCountdown_ctxOk
-    [.scalar ⟨3, 4⟩] (by decide) ptrCountdownMInit rfl rfl rfl ptrCountdown_noUB herr
+    [.scalar ⟨3, 4⟩] (by decide +kernel) ptrCountdownMInit rfl rfl rfl ptrCountdown_noUB herr
 
 theorem ptrCountdown_progress (n : Nat) :
     (∃ s' m' tr, Interp.steps (1 + n) ptrCountdownMInit = .ok m' ∧
@@ -970,7 +1007,7 @@ theorem ptrCountdown_progress (n : Nat) :
       ReturnRel ptrCountdown ctx0 s' v mRet ∧
       ReachesRet (mirCallTree ptrCountdown [.scalar ⟨3, 4⟩]) tr (.normal (v, mem))) :=
   mirCall_progress_N ptrCountdown_inFragment ptrCountdown_translate ctx0 ptrCountdown_ctxOk
-    [.scalar ⟨3, 4⟩] (by decide) ptrCountdownMInit rfl rfl rfl ptrCountdown_noUB n
+    [.scalar ⟨3, 4⟩] (by decide +kernel) ptrCountdownMInit rfl rfl rfl ptrCountdown_noUB n
 
 /-- MiniRust's return, computed directly: 26 steps (the init block's `Goto`,
 six steps of `bb0`, four visits of `bb1`, three of `bb2`, and `bb3`). -/
@@ -1027,7 +1064,7 @@ def constBorrowLoop : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem constBorrowLoop_inFragment : inFragment constBorrowLoop = true := by decide
+theorem constBorrowLoop_inFragment : inFragment constBorrowLoop = true := by decide +kernel
 
 def constBorrowLoopFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32), (localName 2, thinRawPtrTy),
@@ -1077,10 +1114,10 @@ theorem constBorrowLoop_anneal_ret :
           borrows := retBorrows [rawPtrEntry 3 .not (local_ 1), rawPtrEntry 2 .not (local_ 1),
                       rawPtrEntry 1 .not (local_ 1)],
           nextTag := 4 })) :=
-  runA_sound constBorrowLoop 50 _ _ _ rfl
+  runA_sound constBorrowLoop 50 _ _ _ (by kernel_rfl)
 
 theorem constBorrowLoop_noUB : MirNoUBTree (mirCallTree constBorrowLoop [.scalar ⟨5, 4⟩]) :=
-  runA_noUB constBorrowLoop 50 _ _ _ rfl
+  runA_isSome_noUB constBorrowLoop 50 _ (by kernel_rfl)
 
 theorem constBorrowLoop_ctxOk : CtxOk constBorrowLoop ctx0 where
   baseLow := by unfold BaseLow; decide
@@ -1098,7 +1135,7 @@ theorem constBorrowLoop_ctxOk : CtxOk constBorrowLoop ctx0 where
     have hlay : constBorrowLoop.layouts = emptyLayoutTable := rfl
     rw [hlay]
     simp [constBorrowLoop] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 /-- MiniRust at `minimize`'s init block (the function's `start`). -/
 def constBorrowLoopMInit : Mach :=
@@ -1112,7 +1149,7 @@ theorem constBorrowLoop_minirust_ret_from_start :
       m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret constBorrowLoop_inFragment constBorrowLoop_translate ctx0 constBorrowLoop_ctxOk
-      [.scalar ⟨5, 4⟩] (by decide) constBorrowLoopMInit rfl rfl rfl constBorrowLoop_anneal_ret
+      [.scalar ⟨5, 4⟩] (by decide +kernel) constBorrowLoopMInit rfl rfl rfl constBorrowLoop_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [constBorrowLoop] at hd; subst hd
   simp [retPtr, ctx0] at hp
@@ -1128,7 +1165,7 @@ theorem constBorrowLoop_minirust_noUB {n : Nat} {e : Stop}
       ReturnRel constBorrowLoop ctx0 s' v mRet ∧
       ReachesRet (mirCallTree constBorrowLoop [.scalar ⟨5, 4⟩]) tr (.normal (v, mem)) :=
   mirCall_noUB constBorrowLoop_inFragment constBorrowLoop_translate ctx0 constBorrowLoop_ctxOk
-    [.scalar ⟨5, 4⟩] (by decide) constBorrowLoopMInit rfl rfl rfl constBorrowLoop_noUB herr
+    [.scalar ⟨5, 4⟩] (by decide +kernel) constBorrowLoopMInit rfl rfl rfl constBorrowLoop_noUB herr
 
 theorem constBorrowLoop_progress (n : Nat) :
     (∃ s' m' tr, Interp.steps (1 + n) constBorrowLoopMInit = .ok m' ∧
@@ -1138,7 +1175,7 @@ theorem constBorrowLoop_progress (n : Nat) :
       ReturnRel constBorrowLoop ctx0 s' v mRet ∧
       ReachesRet (mirCallTree constBorrowLoop [.scalar ⟨5, 4⟩]) tr (.normal (v, mem))) :=
   mirCall_progress_N constBorrowLoop_inFragment constBorrowLoop_translate ctx0
-    constBorrowLoop_ctxOk [.scalar ⟨5, 4⟩] (by decide) constBorrowLoopMInit rfl rfl rfl
+    constBorrowLoop_ctxOk [.scalar ⟨5, 4⟩] (by decide +kernel) constBorrowLoopMInit rfl rfl rfl
     constBorrowLoop_noUB n
 
 /-- MiniRust's return, computed directly: 34 steps (the init block's `Goto`,
@@ -1179,7 +1216,7 @@ def repointPtr : CapturedMir :=
        .assign (local_ 0) (.use (.copy (placeConstIdx 1 1 2 false)))] with
     fnAbi := fnAbiArrU32_2Arg }
 
-theorem repointPtr_inFragment : inFragment repointPtr = true := by decide
+theorem repointPtr_inFragment : inFragment repointPtr = true := by decide +kernel
 
 def repointPtrFn : Gen.Function where
   locals := ⟨[
@@ -1222,10 +1259,10 @@ theorem repointPtr_anneal_ret :
           borrows := retBorrows [rawPtrEntry 2 .mut (placeConstIdx 1 1 2 false),
                       rawPtrEntry 1 .mut (placeConstIdx 1 0 2 false)],
           nextTag := 3 })) :=
-  runA_sound repointPtr 30 _ _ _ rfl
+  runA_sound repointPtr 30 _ _ _ (by kernel_rfl)
 
 theorem repointPtr_noUB : MirNoUBTree (mirCallTree repointPtr [initArrU32_2]) :=
-  runA_noUB repointPtr 30 _ _ _ rfl
+  runA_isSome_noUB repointPtr 30 _ (by kernel_rfl)
 
 theorem repointPtr_ctxOk : CtxOk repointPtr ctx0 where
   baseLow := by unfold BaseLow; decide
@@ -1243,7 +1280,7 @@ theorem repointPtr_ctxOk : CtxOk repointPtr ctx0 where
     have hlay : repointPtr.layouts = emptyLayoutTable := rfl
     rw [hlay]
     simp [repointPtr, ptrBody] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 /-- MiniRust at `minimize`'s init block (the function's `start`). -/
 def repointPtrMInit : Mach :=
@@ -1257,7 +1294,7 @@ theorem repointPtr_minirust_ret_from_start :
       m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret repointPtr_inFragment repointPtr_translate ctx0 repointPtr_ctxOk
-      [initArrU32_2] (by decide) repointPtrMInit rfl rfl rfl repointPtr_anneal_ret
+      [initArrU32_2] (by decide +kernel) repointPtrMInit rfl rfl rfl repointPtr_anneal_ret
   obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
   simp [repointPtr, ptrBody] at hd; subst hd
   simp [retPtr, ctx0] at hp
@@ -1273,7 +1310,7 @@ theorem repointPtr_minirust_noUB {n : Nat} {e : Stop}
       ReturnRel repointPtr ctx0 s' v mRet ∧
       ReachesRet (mirCallTree repointPtr [initArrU32_2]) tr (.normal (v, mem)) :=
   mirCall_noUB repointPtr_inFragment repointPtr_translate ctx0 repointPtr_ctxOk
-    [initArrU32_2] (by decide) repointPtrMInit rfl rfl rfl repointPtr_noUB herr
+    [initArrU32_2] (by decide +kernel) repointPtrMInit rfl rfl rfl repointPtr_noUB herr
 
 theorem repointPtr_progress (n : Nat) :
     (∃ s' m' tr, Interp.steps (1 + n) repointPtrMInit = .ok m' ∧
@@ -1283,7 +1320,7 @@ theorem repointPtr_progress (n : Nat) :
       ReturnRel repointPtr ctx0 s' v mRet ∧
       ReachesRet (mirCallTree repointPtr [initArrU32_2]) tr (.normal (v, mem))) :=
   mirCall_progress_N repointPtr_inFragment repointPtr_translate ctx0 repointPtr_ctxOk
-    [initArrU32_2] (by decide) repointPtrMInit rfl rfl rfl repointPtr_noUB n
+    [initArrU32_2] (by decide +kernel) repointPtrMInit rfl rfl rfl repointPtr_noUB n
 
 /-- MiniRust's return, computed directly: 13 steps (the init block's `Goto`,
 eleven statements, and `Return`). -/
@@ -1338,7 +1375,7 @@ def ptrSpinLoop : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem ptrSpinLoop_inFragment : inFragment ptrSpinLoop = true := by decide
+theorem ptrSpinLoop_inFragment : inFragment ptrSpinLoop = true := by decide +kernel
 
 def ptrSpinLoopFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32), (localName 2, thinRawPtrTy)]⟩
@@ -1431,7 +1468,7 @@ theorem ptrSpinLoop_ctxOk : CtxOk ptrSpinLoop ctx0 where
     have hlay : ptrSpinLoop.layouts = emptyLayoutTable := rfl
     rw [hlay]
     simp [ptrSpinLoop] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 def ptrSpinLoopMInit : Mach :=
   machine ptrSpinLoop ptrSpinLoopFn ptrSpinLoopS0.frame.locals ptrSpinLoopFn.start
@@ -1440,7 +1477,7 @@ def ptrSpinLoopMInit : Mach :=
 theorem ptrSpinLoop_minirust_steps_ok (n : Nat) :
     ∃ m', Interp.steps n ptrSpinLoopMInit = .ok m' :=
   mirCall_diverges_steps_ok ptrSpinLoop_inFragment ptrSpinLoop_translate ctx0 ptrSpinLoop_ctxOk
-    [.scalar ⟨5, 4⟩] (by decide) ptrSpinLoopMInit rfl rfl rfl ptrSpinLoop_noUB ptrSpinLoop_diverges n
+    [.scalar ⟨5, 4⟩] (by decide +kernel) ptrSpinLoopMInit rfl rfl rfl ptrSpinLoop_noUB ptrSpinLoop_diverges n
 
 /-- Stronger lockstep divergence witness via `mirCall_diverges_rel_N`: for every
 `n : Nat`, `1 + n` MiniRust steps from `ptrSpinLoopFn.start` stay in `StateRelN`
@@ -1450,7 +1487,7 @@ theorem ptrSpinLoop_minirust_diverges_rel (n : Nat) :
       StateRelN ptrSpinLoop ptrSpinLoopFn ctx0 s' m' ∧
       Reaches (mirCallTree ptrSpinLoop [.scalar ⟨5, 4⟩]) tr (mirTree ptrSpinLoop s') :=
   mirCall_diverges_rel_N ptrSpinLoop_inFragment ptrSpinLoop_translate ctx0 ptrSpinLoop_ctxOk
-    [.scalar ⟨5, 4⟩] (by decide) ptrSpinLoopMInit rfl rfl rfl ptrSpinLoop_noUB ptrSpinLoop_diverges n
+    [.scalar ⟨5, 4⟩] (by decide +kernel) ptrSpinLoopMInit rfl rfl rfl ptrSpinLoop_noUB ptrSpinLoop_diverges n
 
 /-- MiniRust, run directly rather than through the correspondence: after
 `1 + 4 + 4 * 5 = 25` steps (the init block's `Goto`, `bb0`, and four iterations
@@ -1475,7 +1512,7 @@ def uninitPtrReadUb : CapturedMir :=
     [.storageLive 2,
      .assign (local_ 0) (.use (.copy (derefPlace 2)))]
 
-theorem uninitPtrReadUb_inFragment : inFragment uninitPtrReadUb = true := by decide
+theorem uninitPtrReadUb_inFragment : inFragment uninitPtrReadUb = true := by decide +kernel
 
 def uninitPtrReadUbFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32), (localName 2, thinRawPtrTy)]⟩
@@ -1499,7 +1536,7 @@ def uninitPtrReadUbMInit : Mach :=
 
 theorem uninitPtrReadUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTree uninitPtrReadUb [.scalar ⟨5, 4⟩]) tr u ∧ FaultNow u :=
-  faultsA_sound uninitPtrReadUb 10 _ (by decide)
+  faultsA_sound uninitPtrReadUb 10 _ (by kernel_rfl)
 
 theorem uninitPtrReadUb_ctxOk : CtxOk uninitPtrReadUb ctx0 where
   baseLow := by unfold BaseLow; decide
@@ -1517,13 +1554,13 @@ theorem uninitPtrReadUb_ctxOk : CtxOk uninitPtrReadUb ctx0 where
     have hlay : uninitPtrReadUb.layouts = emptyLayoutTable := rfl
     rw [hlay]
     simp [uninitPtrReadUb, ptrBody] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 theorem uninitPtrReadUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n uninitPtrReadUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := uninitPtrReadUb_anneal_ub
   exact mirCall_ub uninitPtrReadUb_inFragment uninitPtrReadUb_translate ctx0 uninitPtrReadUb_ctxOk
-    [.scalar ⟨5, 4⟩] (by decide) uninitPtrReadUbMInit rfl rfl rfl hr hf
+    [.scalar ⟨5, 4⟩] (by decide +kernel) uninitPtrReadUbMInit rfl rfl rfl hr hf
 
 theorem uninitPtrReadUb_converse_error {n : Nat} {e : Stop}
     (herr : Interp.steps n uninitPtrReadUbMInit = .error e) :
@@ -1533,7 +1570,7 @@ theorem uninitPtrReadUb_converse_error {n : Nat} {e : Stop}
       ReturnRel uninitPtrReadUb ctx0 s' v mRet ∧
       ReachesRet (mirCallTree uninitPtrReadUb [.scalar ⟨5, 4⟩]) tr (.normal (v, mem))) :=
   mirCall_steps_error uninitPtrReadUb_inFragment uninitPtrReadUb_translate ctx0 uninitPtrReadUb_ctxOk
-    [.scalar ⟨5, 4⟩] (by decide) uninitPtrReadUbMInit rfl rfl rfl herr
+    [.scalar ⟨5, 4⟩] (by decide +kernel) uninitPtrReadUbMInit rfl rfl rfl herr
 
 theorem uninitPtrReadUb_outcome (n : Nat) :
     (∃ s' m' tr, Interp.steps (1 + n) uninitPtrReadUbMInit = .ok m' ∧
@@ -1545,7 +1582,7 @@ theorem uninitPtrReadUb_outcome (n : Nat) :
     (∃ msg, Interp.steps (1 + n) uninitPtrReadUbMInit = .error (.ub msg) ∧
       ∃ tr u, Reaches (mirCallTree uninitPtrReadUb [.scalar ⟨5, 4⟩]) tr u ∧ FaultNow u) :=
   mirCall_outcome_N uninitPtrReadUb_inFragment uninitPtrReadUb_translate ctx0 uninitPtrReadUb_ctxOk
-    [.scalar ⟨5, 4⟩] (by decide) uninitPtrReadUbMInit rfl rfl rfl n
+    [.scalar ⟨5, 4⟩] (by decide +kernel) uninitPtrReadUbMInit rfl rfl rfl n
 
 theorem uninitPtrReadUb_minirust_direct :
     ubAfter uninitPtrReadUb [.scalar ⟨5, 4⟩] 3 =
@@ -1563,7 +1600,7 @@ def uninitPtrWriteUb : CapturedMir :=
      .assign (derefPlace 2) (.use (.copy (local_ 1))),
      .assign (local_ 0) (.use (.copy (local_ 1)))]
 
-theorem uninitPtrWriteUb_inFragment : inFragment uninitPtrWriteUb = true := by decide
+theorem uninitPtrWriteUb_inFragment : inFragment uninitPtrWriteUb = true := by decide +kernel
 
 def uninitPtrWriteUbFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32), (localName 2, thinRawPtrTy)]⟩
@@ -1588,7 +1625,7 @@ def uninitPtrWriteUbMInit : Mach :=
 
 theorem uninitPtrWriteUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTree uninitPtrWriteUb [.scalar ⟨5, 4⟩]) tr u ∧ FaultNow u :=
-  faultsA_sound uninitPtrWriteUb 10 _ (by decide)
+  faultsA_sound uninitPtrWriteUb 10 _ (by kernel_rfl)
 
 theorem uninitPtrWriteUb_ctxOk : CtxOk uninitPtrWriteUb ctx0 where
   baseLow := by unfold BaseLow; decide
@@ -1606,13 +1643,13 @@ theorem uninitPtrWriteUb_ctxOk : CtxOk uninitPtrWriteUb ctx0 where
     have hlay : uninitPtrWriteUb.layouts = emptyLayoutTable := rfl
     rw [hlay]
     simp [uninitPtrWriteUb, ptrBody] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 theorem uninitPtrWriteUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n uninitPtrWriteUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := uninitPtrWriteUb_anneal_ub
   exact mirCall_ub uninitPtrWriteUb_inFragment uninitPtrWriteUb_translate ctx0 uninitPtrWriteUb_ctxOk
-    [.scalar ⟨5, 4⟩] (by decide) uninitPtrWriteUbMInit rfl rfl rfl hr hf
+    [.scalar ⟨5, 4⟩] (by decide +kernel) uninitPtrWriteUbMInit rfl rfl rfl hr hf
 
 theorem uninitPtrWriteUb_converse_error {n : Nat} {e : Stop}
     (herr : Interp.steps n uninitPtrWriteUbMInit = .error e) :
@@ -1622,7 +1659,7 @@ theorem uninitPtrWriteUb_converse_error {n : Nat} {e : Stop}
       ReturnRel uninitPtrWriteUb ctx0 s' v mRet ∧
       ReachesRet (mirCallTree uninitPtrWriteUb [.scalar ⟨5, 4⟩]) tr (.normal (v, mem))) :=
   mirCall_steps_error uninitPtrWriteUb_inFragment uninitPtrWriteUb_translate ctx0 uninitPtrWriteUb_ctxOk
-    [.scalar ⟨5, 4⟩] (by decide) uninitPtrWriteUbMInit rfl rfl rfl herr
+    [.scalar ⟨5, 4⟩] (by decide +kernel) uninitPtrWriteUbMInit rfl rfl rfl herr
 
 theorem uninitPtrWriteUb_outcome (n : Nat) :
     (∃ s' m' tr, Interp.steps (1 + n) uninitPtrWriteUbMInit = .ok m' ∧
@@ -1634,7 +1671,7 @@ theorem uninitPtrWriteUb_outcome (n : Nat) :
     (∃ msg, Interp.steps (1 + n) uninitPtrWriteUbMInit = .error (.ub msg) ∧
       ∃ tr u, Reaches (mirCallTree uninitPtrWriteUb [.scalar ⟨5, 4⟩]) tr u ∧ FaultNow u) :=
   mirCall_outcome_N uninitPtrWriteUb_inFragment uninitPtrWriteUb_translate ctx0 uninitPtrWriteUb_ctxOk
-    [.scalar ⟨5, 4⟩] (by decide) uninitPtrWriteUbMInit rfl rfl rfl n
+    [.scalar ⟨5, 4⟩] (by decide +kernel) uninitPtrWriteUbMInit rfl rfl rfl n
 
 theorem uninitPtrWriteUb_minirust_direct :
     ubAfter uninitPtrWriteUb [.scalar ⟨5, 4⟩] 3 =
@@ -1656,7 +1693,7 @@ def deadPtrReadUb : CapturedMir :=
      .storageDead 2,
      .assign (local_ 0) (.use (.copy (derefPlace 2)))]
 
-theorem deadPtrReadUb_inFragment : inFragment deadPtrReadUb = true := by decide
+theorem deadPtrReadUb_inFragment : inFragment deadPtrReadUb = true := by decide +kernel
 
 def deadPtrReadUbFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32), (localName 2, thinRawPtrTy)]⟩
@@ -1682,7 +1719,7 @@ def deadPtrReadUbMInit : Mach :=
 
 theorem deadPtrReadUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTree deadPtrReadUb [.scalar ⟨5, 4⟩]) tr u ∧ FaultNow u :=
-  faultsA_sound deadPtrReadUb 10 _ (by decide)
+  faultsA_sound deadPtrReadUb 10 _ (by kernel_rfl)
 
 theorem deadPtrReadUb_ctxOk : CtxOk deadPtrReadUb ctx0 where
   baseLow := by unfold BaseLow; decide
@@ -1700,13 +1737,13 @@ theorem deadPtrReadUb_ctxOk : CtxOk deadPtrReadUb ctx0 where
     have hlay : deadPtrReadUb.layouts = emptyLayoutTable := rfl
     rw [hlay]
     simp [deadPtrReadUb, ptrBody] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 theorem deadPtrReadUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n deadPtrReadUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := deadPtrReadUb_anneal_ub
   exact mirCall_ub deadPtrReadUb_inFragment deadPtrReadUb_translate ctx0 deadPtrReadUb_ctxOk
-    [.scalar ⟨5, 4⟩] (by decide) deadPtrReadUbMInit rfl rfl rfl hr hf
+    [.scalar ⟨5, 4⟩] (by decide +kernel) deadPtrReadUbMInit rfl rfl rfl hr hf
 
 theorem deadPtrReadUb_converse_error {n : Nat} {e : Stop}
     (herr : Interp.steps n deadPtrReadUbMInit = .error e) :
@@ -1716,7 +1753,7 @@ theorem deadPtrReadUb_converse_error {n : Nat} {e : Stop}
       ReturnRel deadPtrReadUb ctx0 s' v mRet ∧
       ReachesRet (mirCallTree deadPtrReadUb [.scalar ⟨5, 4⟩]) tr (.normal (v, mem))) :=
   mirCall_steps_error deadPtrReadUb_inFragment deadPtrReadUb_translate ctx0 deadPtrReadUb_ctxOk
-    [.scalar ⟨5, 4⟩] (by decide) deadPtrReadUbMInit rfl rfl rfl herr
+    [.scalar ⟨5, 4⟩] (by decide +kernel) deadPtrReadUbMInit rfl rfl rfl herr
 
 theorem deadPtrReadUb_outcome (n : Nat) :
     (∃ s' m' tr, Interp.steps (1 + n) deadPtrReadUbMInit = .ok m' ∧
@@ -1728,7 +1765,7 @@ theorem deadPtrReadUb_outcome (n : Nat) :
     (∃ msg, Interp.steps (1 + n) deadPtrReadUbMInit = .error (.ub msg) ∧
       ∃ tr u, Reaches (mirCallTree deadPtrReadUb [.scalar ⟨5, 4⟩]) tr u ∧ FaultNow u) :=
   mirCall_outcome_N deadPtrReadUb_inFragment deadPtrReadUb_translate ctx0 deadPtrReadUb_ctxOk
-    [.scalar ⟨5, 4⟩] (by decide) deadPtrReadUbMInit rfl rfl rfl n
+    [.scalar ⟨5, 4⟩] (by decide +kernel) deadPtrReadUbMInit rfl rfl rfl n
 
 theorem deadPtrReadUb_minirust_direct :
     ubAfter deadPtrReadUb [.scalar ⟨5, 4⟩] 5 =
@@ -1747,7 +1784,7 @@ def uninitPtrOffsetUb : CapturedMir :=
      .assign (local_ 3) (.binaryOp .offset (.copy (local_ 2)) (constUsize 0)),
      .assign (local_ 0) (.use (.copy (local_ 1)))]
 
-theorem uninitPtrOffsetUb_inFragment : inFragment uninitPtrOffsetUb = true := by decide
+theorem uninitPtrOffsetUb_inFragment : inFragment uninitPtrOffsetUb = true := by decide +kernel
 
 def uninitPtrOffsetUbFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32),
@@ -1776,7 +1813,7 @@ def uninitPtrOffsetUbMInit : Mach :=
 
 theorem uninitPtrOffsetUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTree uninitPtrOffsetUb [.scalar ⟨5, 4⟩]) tr u ∧ FaultNow u :=
-  faultsA_sound uninitPtrOffsetUb 10 _ (by decide)
+  faultsA_sound uninitPtrOffsetUb 10 _ (by kernel_rfl)
 
 theorem uninitPtrOffsetUb_ctxOk : CtxOk uninitPtrOffsetUb ctx0 where
   baseLow := by unfold BaseLow; decide
@@ -1794,13 +1831,13 @@ theorem uninitPtrOffsetUb_ctxOk : CtxOk uninitPtrOffsetUb ctx0 where
     have hlay : uninitPtrOffsetUb.layouts = emptyLayoutTable := rfl
     rw [hlay]
     simp [uninitPtrOffsetUb, ptrBody] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 theorem uninitPtrOffsetUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n uninitPtrOffsetUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := uninitPtrOffsetUb_anneal_ub
   exact mirCall_ub uninitPtrOffsetUb_inFragment uninitPtrOffsetUb_translate ctx0 uninitPtrOffsetUb_ctxOk
-    [.scalar ⟨5, 4⟩] (by decide) uninitPtrOffsetUbMInit rfl rfl rfl hr hf
+    [.scalar ⟨5, 4⟩] (by decide +kernel) uninitPtrOffsetUbMInit rfl rfl rfl hr hf
 
 theorem uninitPtrOffsetUb_converse_error {n : Nat} {e : Stop}
     (herr : Interp.steps n uninitPtrOffsetUbMInit = .error e) :
@@ -1810,7 +1847,7 @@ theorem uninitPtrOffsetUb_converse_error {n : Nat} {e : Stop}
       ReturnRel uninitPtrOffsetUb ctx0 s' v mRet ∧
       ReachesRet (mirCallTree uninitPtrOffsetUb [.scalar ⟨5, 4⟩]) tr (.normal (v, mem))) :=
   mirCall_steps_error uninitPtrOffsetUb_inFragment uninitPtrOffsetUb_translate ctx0 uninitPtrOffsetUb_ctxOk
-    [.scalar ⟨5, 4⟩] (by decide) uninitPtrOffsetUbMInit rfl rfl rfl herr
+    [.scalar ⟨5, 4⟩] (by decide +kernel) uninitPtrOffsetUbMInit rfl rfl rfl herr
 
 theorem uninitPtrOffsetUb_outcome (n : Nat) :
     (∃ s' m' tr, Interp.steps (1 + n) uninitPtrOffsetUbMInit = .ok m' ∧
@@ -1822,7 +1859,7 @@ theorem uninitPtrOffsetUb_outcome (n : Nat) :
     (∃ msg, Interp.steps (1 + n) uninitPtrOffsetUbMInit = .error (.ub msg) ∧
       ∃ tr u, Reaches (mirCallTree uninitPtrOffsetUb [.scalar ⟨5, 4⟩]) tr u ∧ FaultNow u) :=
   mirCall_outcome_N uninitPtrOffsetUb_inFragment uninitPtrOffsetUb_translate ctx0 uninitPtrOffsetUb_ctxOk
-    [.scalar ⟨5, 4⟩] (by decide) uninitPtrOffsetUbMInit rfl rfl rfl n
+    [.scalar ⟨5, 4⟩] (by decide +kernel) uninitPtrOffsetUbMInit rfl rfl rfl n
 
 theorem uninitPtrOffsetUb_minirust_direct :
     ubAfter uninitPtrOffsetUb [.scalar ⟨5, 4⟩] 4 =
@@ -1843,7 +1880,7 @@ def derefWriteRhsUb : CapturedMir :=
      .assign (derefPlace 2) (.use (.copy (local_ 3))),
      .assign (local_ 0) (.use (.copy (local_ 1)))]
 
-theorem derefWriteRhsUb_inFragment : inFragment derefWriteRhsUb = true := by decide
+theorem derefWriteRhsUb_inFragment : inFragment derefWriteRhsUb = true := by decide +kernel
 
 def derefWriteRhsUbFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32),
@@ -1870,7 +1907,7 @@ def derefWriteRhsUbMInit : Mach :=
 
 theorem derefWriteRhsUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTree derefWriteRhsUb [.scalar ⟨5, 4⟩]) tr u ∧ FaultNow u :=
-  faultsA_sound derefWriteRhsUb 10 _ (by decide)
+  faultsA_sound derefWriteRhsUb 10 _ (by kernel_rfl)
 
 theorem derefWriteRhsUb_ctxOk : CtxOk derefWriteRhsUb ctx0 where
   baseLow := by unfold BaseLow; decide
@@ -1888,13 +1925,13 @@ theorem derefWriteRhsUb_ctxOk : CtxOk derefWriteRhsUb ctx0 where
     have hlay : derefWriteRhsUb.layouts = emptyLayoutTable := rfl
     rw [hlay]
     simp [derefWriteRhsUb, ptrBody] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 theorem derefWriteRhsUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n derefWriteRhsUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := derefWriteRhsUb_anneal_ub
   exact mirCall_ub derefWriteRhsUb_inFragment derefWriteRhsUb_translate ctx0 derefWriteRhsUb_ctxOk
-    [.scalar ⟨5, 4⟩] (by decide) derefWriteRhsUbMInit rfl rfl rfl hr hf
+    [.scalar ⟨5, 4⟩] (by decide +kernel) derefWriteRhsUbMInit rfl rfl rfl hr hf
 
 theorem derefWriteRhsUb_converse_error {n : Nat} {e : Stop}
     (herr : Interp.steps n derefWriteRhsUbMInit = .error e) :
@@ -1904,7 +1941,7 @@ theorem derefWriteRhsUb_converse_error {n : Nat} {e : Stop}
       ReturnRel derefWriteRhsUb ctx0 s' v mRet ∧
       ReachesRet (mirCallTree derefWriteRhsUb [.scalar ⟨5, 4⟩]) tr (.normal (v, mem))) :=
   mirCall_steps_error derefWriteRhsUb_inFragment derefWriteRhsUb_translate ctx0 derefWriteRhsUb_ctxOk
-    [.scalar ⟨5, 4⟩] (by decide) derefWriteRhsUbMInit rfl rfl rfl herr
+    [.scalar ⟨5, 4⟩] (by decide +kernel) derefWriteRhsUbMInit rfl rfl rfl herr
 
 theorem derefWriteRhsUb_outcome (n : Nat) :
     (∃ s' m' tr, Interp.steps (1 + n) derefWriteRhsUbMInit = .ok m' ∧
@@ -1916,7 +1953,7 @@ theorem derefWriteRhsUb_outcome (n : Nat) :
     (∃ msg, Interp.steps (1 + n) derefWriteRhsUbMInit = .error (.ub msg) ∧
       ∃ tr u, Reaches (mirCallTree derefWriteRhsUb [.scalar ⟨5, 4⟩]) tr u ∧ FaultNow u) :=
   mirCall_outcome_N derefWriteRhsUb_inFragment derefWriteRhsUb_translate ctx0 derefWriteRhsUb_ctxOk
-    [.scalar ⟨5, 4⟩] (by decide) derefWriteRhsUbMInit rfl rfl rfl n
+    [.scalar ⟨5, 4⟩] (by decide +kernel) derefWriteRhsUbMInit rfl rfl rfl n
 
 theorem derefWriteRhsUb_minirust_direct :
     ubAfter derefWriteRhsUb [.scalar ⟨5, 4⟩] 5 =
@@ -1940,7 +1977,7 @@ def derefIdxWriteRhsUb : CapturedMir :=
        .assign (local_ 0) (.use (.copy (placeConstIdx 1 0 2 false)))] with
     fnAbi := fnAbiArrU32_2Arg }
 
-theorem derefIdxWriteRhsUb_inFragment : inFragment derefIdxWriteRhsUb = true := by decide
+theorem derefIdxWriteRhsUb_inFragment : inFragment derefIdxWriteRhsUb = true := by decide +kernel
 
 def derefIdxWriteRhsUbFn : Gen.Function where
   locals := ⟨[
@@ -1972,7 +2009,7 @@ def derefIdxWriteRhsUbMInit : Mach :=
 
 theorem derefIdxWriteRhsUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTree derefIdxWriteRhsUb [initArrU32_2]) tr u ∧ FaultNow u :=
-  faultsA_sound derefIdxWriteRhsUb 10 _ (by decide)
+  faultsA_sound derefIdxWriteRhsUb 10 _ (by kernel_rfl)
 
 theorem derefIdxWriteRhsUb_ctxOk : CtxOk derefIdxWriteRhsUb ctx0 where
   baseLow := by unfold BaseLow; decide
@@ -1990,13 +2027,13 @@ theorem derefIdxWriteRhsUb_ctxOk : CtxOk derefIdxWriteRhsUb ctx0 where
     have hlay : derefIdxWriteRhsUb.layouts = emptyLayoutTable := rfl
     rw [hlay]
     simp [derefIdxWriteRhsUb, ptrBody] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 theorem derefIdxWriteRhsUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n derefIdxWriteRhsUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := derefIdxWriteRhsUb_anneal_ub
   exact mirCall_ub derefIdxWriteRhsUb_inFragment derefIdxWriteRhsUb_translate ctx0
-    derefIdxWriteRhsUb_ctxOk [initArrU32_2] (by decide) derefIdxWriteRhsUbMInit rfl rfl rfl hr hf
+    derefIdxWriteRhsUb_ctxOk [initArrU32_2] (by decide +kernel) derefIdxWriteRhsUbMInit rfl rfl rfl hr hf
 
 theorem derefIdxWriteRhsUb_converse_error {n : Nat} {e : Stop}
     (herr : Interp.steps n derefIdxWriteRhsUbMInit = .error e) :
@@ -2006,7 +2043,7 @@ theorem derefIdxWriteRhsUb_converse_error {n : Nat} {e : Stop}
       ReturnRel derefIdxWriteRhsUb ctx0 s' v mRet ∧
       ReachesRet (mirCallTree derefIdxWriteRhsUb [initArrU32_2]) tr (.normal (v, mem))) :=
   mirCall_steps_error derefIdxWriteRhsUb_inFragment derefIdxWriteRhsUb_translate ctx0
-    derefIdxWriteRhsUb_ctxOk [initArrU32_2] (by decide) derefIdxWriteRhsUbMInit rfl rfl rfl herr
+    derefIdxWriteRhsUb_ctxOk [initArrU32_2] (by decide +kernel) derefIdxWriteRhsUbMInit rfl rfl rfl herr
 
 theorem derefIdxWriteRhsUb_outcome (n : Nat) :
     (∃ s' m' tr, Interp.steps (1 + n) derefIdxWriteRhsUbMInit = .ok m' ∧
@@ -2018,7 +2055,7 @@ theorem derefIdxWriteRhsUb_outcome (n : Nat) :
     (∃ msg, Interp.steps (1 + n) derefIdxWriteRhsUbMInit = .error (.ub msg) ∧
       ∃ tr u, Reaches (mirCallTree derefIdxWriteRhsUb [initArrU32_2]) tr u ∧ FaultNow u) :=
   mirCall_outcome_N derefIdxWriteRhsUb_inFragment derefIdxWriteRhsUb_translate ctx0
-    derefIdxWriteRhsUb_ctxOk [initArrU32_2] (by decide) derefIdxWriteRhsUbMInit rfl rfl rfl n
+    derefIdxWriteRhsUb_ctxOk [initArrU32_2] (by decide +kernel) derefIdxWriteRhsUbMInit rfl rfl rfl n
 
 theorem derefIdxWriteRhsUb_minirust_direct :
     ubAfter derefIdxWriteRhsUb [initArrU32_2] 5 =
@@ -2044,7 +2081,7 @@ def derefFieldWriteRhsUb : CapturedMir :=
        .assign (local_ 0) (.use (.copy (placeField 1 [(1, u32Ty)])))] with
     fnAbi := fnAbiPaddedArg, layouts := paddedLayouts }
 
-theorem derefFieldWriteRhsUb_inFragment : inFragment derefFieldWriteRhsUb = true := by decide
+theorem derefFieldWriteRhsUb_inFragment : inFragment derefFieldWriteRhsUb = true := by decide +kernel
 
 def derefFieldWriteRhsUbFn : Gen.Function where
   locals := ⟨[
@@ -2075,7 +2112,7 @@ def derefFieldWriteRhsUbMInit : Mach :=
 
 theorem derefFieldWriteRhsUb_anneal_ub :
     ∃ tr u, Reaches (mirCallTree derefFieldWriteRhsUb [initPaddedStruct]) tr u ∧ FaultNow u :=
-  faultsA_sound derefFieldWriteRhsUb 10 _ (by decide)
+  faultsA_sound derefFieldWriteRhsUb 10 _ (by kernel_rfl)
 
 theorem derefFieldWriteRhsUb_ctxOk : CtxOk derefFieldWriteRhsUb ctx0 where
   baseLow := by unfold BaseLow; decide
@@ -2093,13 +2130,13 @@ theorem derefFieldWriteRhsUb_ctxOk : CtxOk derefFieldWriteRhsUb ctx0 where
     have hlay : derefFieldWriteRhsUb.layouts = paddedLayouts := rfl
     rw [hlay]
     simp [derefFieldWriteRhsUb, ptrBody] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 theorem derefFieldWriteRhsUb_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n derefFieldWriteRhsUbMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := derefFieldWriteRhsUb_anneal_ub
   exact mirCall_ub derefFieldWriteRhsUb_inFragment derefFieldWriteRhsUb_translate ctx0
-    derefFieldWriteRhsUb_ctxOk [initPaddedStruct] (by decide) derefFieldWriteRhsUbMInit rfl rfl rfl
+    derefFieldWriteRhsUb_ctxOk [initPaddedStruct] (by decide +kernel) derefFieldWriteRhsUbMInit rfl rfl rfl
     hr hf
 
 theorem derefFieldWriteRhsUb_converse_error {n : Nat} {e : Stop}
@@ -2110,7 +2147,7 @@ theorem derefFieldWriteRhsUb_converse_error {n : Nat} {e : Stop}
       ReturnRel derefFieldWriteRhsUb ctx0 s' v mRet ∧
       ReachesRet (mirCallTree derefFieldWriteRhsUb [initPaddedStruct]) tr (.normal (v, mem))) :=
   mirCall_steps_error derefFieldWriteRhsUb_inFragment derefFieldWriteRhsUb_translate ctx0
-    derefFieldWriteRhsUb_ctxOk [initPaddedStruct] (by decide) derefFieldWriteRhsUbMInit rfl rfl rfl
+    derefFieldWriteRhsUb_ctxOk [initPaddedStruct] (by decide +kernel) derefFieldWriteRhsUbMInit rfl rfl rfl
     herr
 
 theorem derefFieldWriteRhsUb_outcome (n : Nat) :
@@ -2124,7 +2161,7 @@ theorem derefFieldWriteRhsUb_outcome (n : Nat) :
     (∃ msg, Interp.steps (1 + n) derefFieldWriteRhsUbMInit = .error (.ub msg) ∧
       ∃ tr u, Reaches (mirCallTree derefFieldWriteRhsUb [initPaddedStruct]) tr u ∧ FaultNow u) :=
   mirCall_outcome_N derefFieldWriteRhsUb_inFragment derefFieldWriteRhsUb_translate ctx0
-    derefFieldWriteRhsUb_ctxOk [initPaddedStruct] (by decide) derefFieldWriteRhsUbMInit rfl rfl rfl
+    derefFieldWriteRhsUb_ctxOk [initPaddedStruct] (by decide +kernel) derefFieldWriteRhsUbMInit rfl rfl rfl
     n
 
 theorem derefFieldWriteRhsUb_minirust_direct :
@@ -2152,7 +2189,7 @@ theorem dangling_notInFragment : inFragment dangling = false := by decide +kerne
 theorem dangling_anneal_ub :
     ∃ tr u, Reaches (mirTree dangling (initMachineState dangling [.scalar ⟨5, 4⟩])) tr u ∧
       FaultNow u :=
-  faultsA_sound dangling 30 _ (by decide)
+  faultsA_sound dangling 30 _ (by kernel_rfl)
 
 theorem dangling_minirust_direct :
     ubAfter dangling [.scalar ⟨5, 4⟩] 7 = some "dereferencing pointer to dead allocation" := by
@@ -2226,8 +2263,8 @@ theorem offsetDeref_anneal_ret :
       [] (.normal (.scalar ⟨5, 4⟩, mem))) ∧
     (∃ mem, ReachesRet (mirTree (offsetDeref 1) (initMachineState (offsetDeref 1) [.scalar ⟨5, 4⟩]))
       [] (.normal (.scalar ⟨7, 4⟩, mem))) :=
-  ⟨⟨_, runA_sound (offsetDeref 0) 30 _ _ _ rfl⟩,
-   ⟨_, runA_sound (offsetDeref 1) 30 _ _ _ rfl⟩⟩
+  ⟨runA_exists_mem_sound (offsetDeref 0) 30 _ _ _ (by kernel_rfl),
+   runA_exists_mem_sound (offsetDeref 1) 30 _ _ _ (by kernel_rfl)⟩
 
 /-- For `k ∈ {2, 3, usize::MAX}`, Anneal faults with UB (reading through
 one-past-the-end `p.offset(2)`, out-of-bounds `p.offset(3)`, and overflowing
@@ -2238,9 +2275,9 @@ theorem offsetDeref_anneal_ub (k : Nat) (hk : k ∈ [2, 3, usizeMax]) :
       FaultNow u := by
   simp only [List.mem_cons, List.not_mem_nil, or_false] at hk
   rcases hk with rfl | rfl | rfl
-  · exact faultsA_sound (offsetDeref 2) 30 _ rfl
-  · exact faultsA_sound (offsetDeref 3) 30 _ rfl
-  · exact faultsA_sound (offsetDeref usizeMax) 30 _ rfl
+  · exact faultsA_sound (offsetDeref 2) 30 _ (by kernel_rfl)
+  · exact faultsA_sound (offsetDeref 3) 30 _ (by kernel_rfl)
+  · exact faultsA_sound (offsetDeref usizeMax) 30 _ (by kernel_rfl)
 
 /-- MiniRust reads `a[1] = 7` through `p.offset(1)`. -/
 theorem offsetDeref1_minirust_direct :
@@ -2300,7 +2337,7 @@ bundled across Anneal, `BasicMemory`, and `TreeBorrowsMemory` in
 theorem misaligned_anneal_ub :
     ∃ tr u, Reaches (mirTree misaligned (initMachineState misaligned [.scalar ⟨5, 4⟩])) tr u ∧
       FaultNow u :=
-  faultsA_sound misaligned 30 _ (by decide)
+  faultsA_sound misaligned 30 _ (by kernel_rfl)
 
 /-- MiniRust raises UB: the place `*q` is based on a pointer that is not
 aligned for `u32`. -/
@@ -2349,7 +2386,7 @@ theorem exposeTwice_anneal_ret :
           borrows := retBorrows [rawPtrEntry 2 .not (local_ 1), rawPtrEntry 1 .not (local_ 1)],
           exposedAllocIds := [2, 1],
           nextTag := 3 })) :=
-  runA_sound exposeTwice 30 _ _ _ rfl
+  runA_sound exposeTwice 30 _ _ _ (by kernel_rfl)
 
 /-- `minimize`'s translation of `exposeTwice`: each `PointerExposeProvenance`
 cast ends its block with a `PointerExposeProvenance` intrinsic call whose
@@ -2409,7 +2446,7 @@ through `_2` is UB. -/
 theorem directWrite_anneal_ub :
     ∃ tr u, Reaches (mirTree directWrite (initMachineState directWrite [.scalar ⟨5, 4⟩])) tr u ∧
       FaultNow u :=
-  faultsA_sound directWrite 30 _ (by decide)
+  faultsA_sound directWrite 30 _ (by kernel_rfl)
 
 /-- MiniRust reads `9`. -/
 theorem directWrite_minirust_direct :
@@ -2436,7 +2473,7 @@ theorem frozenWrite_notInFragment : inFragment frozenWrite = false := by decide 
 theorem frozenWrite_anneal_ub :
     ∃ tr u, Reaches (mirTree frozenWrite (initMachineState frozenWrite [.scalar ⟨5, 4⟩])) tr u ∧
       FaultNow u :=
-  faultsA_sound frozenWrite 30 _ (by decide)
+  faultsA_sound frozenWrite 30 _ (by kernel_rfl)
 
 /-- MiniRust stores `9` into `x` and returns it. -/
 theorem frozenWrite_minirust_direct :
@@ -2473,8 +2510,8 @@ theorem checkValue_thinRawPtr_bounds (prov : Option Prov) :
         .error (.ub "Value::Ptr: pointer out-of-bounds") ∧
       checkValue (thinPtrVal (-1) prov) thinRawPtrTy =
         .error (.ub "Value::Ptr: pointer out-of-bounds") :=
-  ⟨checkValue_thinRawPtr 18446744073709551615 (by decide) prov,
-   checkValue_thinRawPtr_oob _ (by decide) prov,
-   checkValue_thinRawPtr_oob _ (by decide) prov⟩
+  ⟨checkValue_thinRawPtr 18446744073709551615 (by decide +kernel) prov,
+   checkValue_thinRawPtr_oob _ (by decide +kernel) prov,
+   checkValue_thinRawPtr_oob _ (by decide +kernel) prov⟩
 
 end MiniRustSpec.Correspondence.PointerWitness

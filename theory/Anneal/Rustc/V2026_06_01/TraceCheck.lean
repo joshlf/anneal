@@ -156,6 +156,7 @@ mutual
   @[reducible]
   def valueEq : Value → Value → Bool
     | .unit, .unit => true
+    | .uninit, .uninit => true
     | .scalar s₁, .scalar s₂ => scalarIntEq s₁ s₂
     | .ptr p₁ sz₁, .ptr p₂ sz₂ =>
       provenancePtrEq p₁ p₂ && Nat.beq sz₁ sz₂
@@ -178,6 +179,14 @@ mutual
     | unit =>
       cases v₂ with
       | unit => rfl
+      | scalar _ => nomatch h
+      | ptr _ _ => nomatch h
+      | aggregate _ _ => nomatch h
+      | uninit => nomatch h
+    | uninit =>
+      cases v₂ with
+      | uninit => rfl
+      | unit => nomatch h
       | scalar _ => nomatch h
       | ptr _ _ => nomatch h
       | aggregate _ _ => nomatch h
@@ -232,6 +241,7 @@ end
 mutual
   theorem valueEq_refl : (v : Value) → valueEq v v = true
     | .unit => rfl
+    | .uninit => rfl
     | .scalar s => scalarIntEq_refl s
     | .ptr p sz => by
       unfold valueEq
@@ -267,24 +277,35 @@ def valueHeadEq
     | .scalar _ => false
     | .ptr _ _ => false
     | .aggregate _ _ => false
+    | .uninit => false
+  | .uninit =>
+    match v₂ with
+    | .uninit => true
+    | .unit => false
+    | .scalar _ => false
+    | .ptr _ _ => false
+    | .aggregate _ _ => false
   | .scalar s₁ =>
     match v₂ with
     | .unit => false
     | .scalar s₂ => scalarIntEq s₁ s₂
     | .ptr _ _ => false
     | .aggregate _ _ => false
+    | .uninit => false
   | .ptr p₁ sz₁ =>
     match v₂ with
     | .unit => false
     | .scalar _ => false
     | .ptr p₂ sz₂ => provenancePtrEq p₁ p₂ && Nat.beq sz₁ sz₂
     | .aggregate _ _ => false
+    | .uninit => false
   | .aggregate var₁ fs₁ =>
     match v₂ with
     | .unit => false
     | .scalar _ => false
     | .ptr _ _ => false
     | .aggregate var₂ fs₂ => Nat.beq var₁ var₂ && ih fs₁ fs₂
+    | .uninit => false
 
 /--
 Fuel-bounded structural equality on `List Value`, defined via `Nat.rec` and
@@ -329,12 +350,21 @@ theorem valueHeadEq_sound
     | scalar _ => nomatch h
     | ptr _ _ => nomatch h
     | aggregate _ _ => nomatch h
+    | uninit => nomatch h
+  | uninit =>
+    cases v₂ with
+    | uninit => rfl
+    | unit => nomatch h
+    | scalar _ => nomatch h
+    | ptr _ _ => nomatch h
+    | aggregate _ _ => nomatch h
   | scalar s₁ =>
     cases v₂ with
     | unit => nomatch h
     | scalar s₂ => exact congrArg Value.scalar (scalarIntEq_sound h)
     | ptr _ _ => nomatch h
     | aggregate _ _ => nomatch h
+    | uninit => nomatch h
   | ptr p₁ sz₁ =>
     cases v₂ with
     | unit => nomatch h
@@ -343,6 +373,7 @@ theorem valueHeadEq_sound
       rcases Bool.and_eq_true_iff.mp h with ⟨hp, hsz⟩
       rw [provenancePtrEq_sound hp, Nat.beq_eq.mp hsz]
     | aggregate _ _ => nomatch h
+    | uninit => nomatch h
   | aggregate var₁ fs₁ =>
     cases v₂ with
     | unit => nomatch h
@@ -351,6 +382,7 @@ theorem valueHeadEq_sound
     | aggregate var₂ fs₂ =>
       rcases Bool.and_eq_true_iff.mp h with ⟨hvar, hfs⟩
       rw [Nat.beq_eq.mp hvar, h_ih hfs]
+    | uninit => nomatch h
 
 theorem valueListEqFuel_sound :
     ∀ (fuel : Nat) {xs ys : List Value},
@@ -374,6 +406,7 @@ theorem valueEqFuel_sound {fuel : Nat} {v₁ v₂ : Value}
 mutual
   def reprValuePrec : Value → Nat → Std.Format
     | .unit, _ => "Value.unit"
+    | .uninit, _ => "Value.uninit"
     | .scalar s, prec =>
       Repr.addAppParen ("Value.scalar " ++ reprArg s) prec
     | .ptr p sz, prec =>
@@ -1451,7 +1484,7 @@ def valueListHasImpureExtCallPtr (borrows : List BorrowEntry) : Nat → List Val
             | none => true
           | .aggregate _ fields =>
             ih fields
-          | .unit | .scalar _ => false
+          | .unit | .scalar _ | .uninit => false
         if headImpure then
           true
         else

@@ -10087,11 +10087,63 @@ theorem seqCaller_wp_call_c (v : Value) (Q : MachineState → Prop)
       rfl, hQ⟩
 
 /-- The final continuation of `seqCaller` at `bb3`: `_0 = copy _2; return`
-returns the symbolic value in two trusted steps, so every postcondition
-that holds of `v` is established. -/
+returns any initialized symbolic value in two trusted steps, so every
+postcondition that holds of `v` is established. -/
 theorem seqCaller_final_continuation (v : Value) (post : Value → Prop)
-    (hPost : post v) : LiftState seqCaller (seqAtEnd v) post 2 :=
-  LiftState.of_step rfl (LiftState.of_retNormal rfl hPost)
+    (hv : valueContainsUninit v = false) (hPost : post v) :
+    LiftState seqCaller (seqAtEnd v) post 2 := by
+  let mem₀ : Memory := seqResumedMem
+  let mem₁ : Memory :=
+    { mem₀ with borrows := invalidateConflictingBorrows mem₀.borrows 0 .none 0 }
+  let mem₂ : Memory :=
+    { mem₁ with borrows := disableFrameBorrows mem₁.borrows 0 4 }
+  refine
+    LiftState.of_step
+      (s' :=
+        { frame :=
+            { blockIdx := 3, stmtIdx := 1,
+              locals := [.init v, .init .unit, .init v, .init .unit] }
+          memory := mem₁ })
+      ?_
+      (LiftState.of_retNormal (mem' := mem₂) ?_ hPost)
+  · have hRval :
+        evalRvalue [.uninit, .init .unit, .init v, .init .unit]
+          (.use (.copy { local_ := 2, projection := [] })) mem₀
+          seqCaller.localDecls emptyFnLayouts =
+          .ok v [.uninit, .init .unit, .init v, .init .unit] mem₀ := by
+      change
+        (match
+          match
+            match valueContainsUninit v with
+            | false => ProjReadResult.ok v
+            | true => ProjReadResult.ub
+          with
+          | .ok fieldVal =>
+            PlaceReadResult.ok fieldVal
+              [.uninit, .init .unit, .init v, .init .unit]
+          | .ub => PlaceReadResult.ub
+          | .unsupported => PlaceReadResult.unsupported
+         with
+         | .ok val locals' => RvalueEvalResult.ok val locals' mem₀
+         | .ub => RvalueEvalResult.ub
+         | .unsupported => RvalueEvalResult.unsupported) = _
+      rw [hv]
+    change
+      (match
+        evalRvalue [.uninit, .init .unit, .init v, .init .unit]
+          (.use (.copy { local_ := 2, projection := [] })) mem₀
+          seqCaller.localDecls emptyFnLayouts
+       with
+       | .ok val locals₁ mem₁' => _
+       | .ub => _
+       | .unsupported => _) = _
+    rw [hRval]
+    rfl
+  · change
+      (match valueContainsUninit v with
+       | true => MirStepNode.fail .ub
+       | false => MirStepNode.retNormal v mem₂) = _
+    rw [hv]
 
 /-- Block `bb0` of `seqCaller`, as data. -/
 def seqBlockA : BasicBlockData :=
@@ -10123,7 +10175,7 @@ def seqBlockC : BasicBlockData :=
 (`StorageLive(_3)`) reaches the third call, and the caller returns `v`:
 `2 + 1 + 2 + 1 + 1 + 2` trusted steps, for every postcondition of `v`. -/
 theorem seqCaller_bridge_liftFrame (v : Value) (post : Value → Prop)
-    (hPost : post v) :
+    (hv : valueContainsUninit v = false) (hPost : post v) :
     LiftFrame seqCaller 1 0 [.uninit, .init .unit, .init v, .dead]
       seqResumedMem post (2 + 1 + 2 + 1 + 1 + 2) :=
   wpFramePrep_seq_bridge_sound_stepMirFn (body := seqCaller)
@@ -10137,14 +10189,15 @@ theorem seqCaller_bridge_liftFrame (v : Value) (post : Value → Prop)
         hMid ▸ StepsTo.single rfl, rfl, seqCaller_wp_call_c v _ rfl⟩)
     (fun _ _ hQ =>
       liftState_iff_liftFrame.mp
-        (hQ ▸ seqCaller_final_continuation v post hPost))
+        (hQ ▸ seqCaller_final_continuation v post hv hPost))
 
 /-- Continuation of `seqCaller` at `bb2`, symbolic in the kept value: one
 step for `StorageLive(_3)`, then the third call discharged by the
 once-and-for-all empty-function rule (three steps, callee never unfolded),
 then the two-step return of `v`. -/
 theorem seqCaller_continuation_at_c (v : Value) (post : Value → Prop)
-    (hPost : post v) : LiftState seqCaller (seqAt 2 v) post 6 := by
+    (hv : valueContainsUninit v = false) (hPost : post v) :
+    LiftState seqCaller (seqAt 2 v) post 6 := by
   refine LiftState.of_step
     (s' := PureState.toMachineState
       { bb := 2, stmtIdx := 1,
@@ -10157,13 +10210,14 @@ theorem seqCaller_continuation_at_c (v : Value) (post : Value → Prop)
     (s' := seqAtEnd v) rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl
     (fun _ _ h =>
       liftState_iff_liftFrame.mp
-        (h ▸ LiftState.of_step rfl (LiftState.of_retNormal rfl hPost)))
+        (h ▸ seqCaller_final_continuation v post hv hPost))
 
 /-- **Sequential two-call soundness, symbolic in the kept value.** The two
 adjacent calls of `bb0` and `bb1`, composed by nesting `wpFramePrep`, lift
 `seqCaller` from its initial frame: `6 + 1 + 2 + 1 + 2` trusted steps, and
 the caller returns the value it kept in `_2` across all three calls. -/
-theorem seqCaller_seq_liftFrame (v : Value) :
+theorem seqCaller_seq_liftFrame (v : Value)
+    (hv : valueContainsUninit v = false) :
     LiftFrame seqCaller 0 0 [.uninit, .uninit, .init v, .dead] seqCallerMem
       (fun r => r = v) (6 + 1 + 2 + 1 + 2) :=
   wpFramePrep_seq_sound_stepMirFn (body := seqCaller) (cur := seqCaller)
@@ -10174,14 +10228,15 @@ theorem seqCaller_seq_liftFrame (v : Value) :
     (seqCaller_wp_call_a v _ ⟨rfl, seqCaller_wp_call_b v _ rfl⟩)
     (fun _ _ hQ =>
       liftState_iff_liftFrame.mp
-        (hQ ▸ seqCaller_continuation_at_c v _ rfl))
+        (hQ ▸ seqCaller_continuation_at_c v _ hv rfl))
 
 /-- **A two-call prefix verified once, two suffix specifications.** The
 nested `wpFramePrep` of the calls of `bb0` and `bb1` is established once
 for the mid-state `seqAt 2 v`; two continuations with distinct
 postconditions are discharged against it, and the caller is lifted for
 their conjunction. -/
-theorem seqCaller_seq_duplicate_prefix_liftFrame (v : Value) :
+theorem seqCaller_seq_duplicate_prefix_liftFrame (v : Value)
+    (hv : valueContainsUninit v = false) :
     LiftFrame seqCaller 0 0 [.uninit, .uninit, .init v, .dead] seqCallerMem
       (fun r => r = v ∧ (v = .unit → r = .unit)) (6 + 1 + 2 + 1 + 2) :=
   wpFramePrep_seq_duplicate_prefix_liftFrame (body := seqCaller)
@@ -10192,16 +10247,17 @@ theorem seqCaller_seq_duplicate_prefix_liftFrame (v : Value) :
     (seqCaller_wp_call_a v _ ⟨rfl, seqCaller_wp_call_b v _ rfl⟩)
     (fun _ _ hQ =>
       liftState_iff_liftFrame.mp
-        (hQ ▸ seqCaller_continuation_at_c v _ rfl))
+        (hQ ▸ seqCaller_continuation_at_c v _ hv rfl))
     (fun _ _ hQ =>
       liftState_iff_liftFrame.mp
-        (hQ ▸ seqCaller_continuation_at_c v _ (fun h => h)))
+        (hQ ▸ seqCaller_continuation_at_c v _ hv (fun h => h)))
 
 /-- **One call verified once, two suffix specifications.** The first call of
 `seqCaller` is verified once for the mid-state `seqAt 1 v`; the bridged
 remainder of the body is lifted for two distinct postconditions against
 that single prefix, and the caller is lifted for their conjunction. -/
-theorem seqCaller_duplicate_prefix_liftFrame (v : Value) :
+theorem seqCaller_duplicate_prefix_liftFrame (v : Value)
+    (hv : valueContainsUninit v = false) :
     LiftFrame seqCaller 0 0 [.uninit, .uninit, .init v, .dead] seqCallerMem
       (fun r => r = v ∧ (v = .unit → r = .unit))
       (2 + 1 + 2 + 1 + 1 + 2 + 1 + 2) :=
@@ -10212,11 +10268,11 @@ theorem seqCaller_duplicate_prefix_liftFrame (v : Value) :
     (fun _ _ hQ =>
       liftState_iff_liftFrame.mp
         (hQ ▸ liftState_iff_liftFrame.mpr
-          (seqCaller_bridge_liftFrame v _ rfl)))
+          (seqCaller_bridge_liftFrame v _ hv rfl)))
     (fun _ _ hQ =>
       liftState_iff_liftFrame.mp
         (hQ ▸ liftState_iff_liftFrame.mpr
-          (seqCaller_bridge_liftFrame v _ (fun h => h))))
+          (seqCaller_bridge_liftFrame v _ hv (fun h => h))))
 
 /-! ### Sequential composition and prefix sharing as `Std.Do.Triple`s -/
 
@@ -10602,7 +10658,8 @@ counters and in the kept value. The retagging call, the bridge statement
 `StorageLive(_6)`, and the call to the empty function lift the caller from
 its initial frame in `2 + 1 + 0 + 2 + 1 + 1 + 1 + 2` trusted steps, and it
 returns the value kept in `_5`. -/
-theorem mixedSeq_bridge_liftFrame (t n : Nat) (v : Value) :
+theorem mixedSeq_bridge_liftFrame (t n : Nat) (v : Value)
+    (hv : valueContainsUninit v = false) :
     LiftFrame mixedSeqCaller 0 0
       [.uninit, .uninit, .init thinRefParentVal, .dead, .uninit, .init v,
         .dead]
@@ -10627,9 +10684,64 @@ theorem mixedSeq_bridge_liftFrame (t n : Nat) (v : Value) :
               EStateM.Result.ok (ε := FramePrepFault) () s₁ = .ok () s₃ := hS3
           cases hS3'
           exact ⟨StepsTo.refl s₁, rfl⟩⟩)
-    (fun _ _ hQ =>
-      liftState_iff_liftFrame.mp
-        (hQ ▸ LiftState.of_step rfl (LiftState.of_retNormal rfl rfl)))
+    (fun _ _ hQ => by
+      let env₀ : List LocalSlot :=
+        [.uninit, .init .unit, .init thinRefParentVal, .dead, .init .unit,
+          .init v, .uninit]
+      let env₁ : List LocalSlot :=
+        [.init v, .init .unit, .init thinRefParentVal, .dead, .init .unit,
+          .init v, .uninit]
+      let mem₀ : Memory := mixedSeqResumedMem t n
+      let mem₁ : Memory :=
+        { mem₀ with
+          borrows := invalidateConflictingBorrows mem₀.borrows 0 .none 0 }
+      let mem₂ : Memory :=
+        { mem₁ with borrows := disableFrameBorrows mem₁.borrows 0 7 }
+      have hEnd :
+          LiftState mixedSeqCaller
+            (mixedSeqAt 2 0 (.init .unit) .uninit t n v)
+            (fun r => r = v) 2 := by
+        refine
+          LiftState.of_step
+            (s' := { frame := { blockIdx := 2, stmtIdx := 1, locals := env₁ }
+                     memory := mem₁ })
+            ?_
+            (LiftState.of_retNormal (mem' := mem₂) ?_ rfl)
+        · have hRval :
+              evalRvalue env₀ (.use (.copy { local_ := 5, projection := [] }))
+                mem₀ mixedSeqCaller.localDecls emptyFnLayouts =
+                .ok v env₀ mem₀ := by
+            change
+              (match
+                match
+                  match valueContainsUninit v with
+                  | false => ProjReadResult.ok v
+                  | true => ProjReadResult.ub
+                with
+                | .ok fieldVal => PlaceReadResult.ok fieldVal env₀
+                | .ub => PlaceReadResult.ub
+                | .unsupported => PlaceReadResult.unsupported
+               with
+               | .ok val locals' => RvalueEvalResult.ok val locals' mem₀
+               | .ub => RvalueEvalResult.ub
+               | .unsupported => RvalueEvalResult.unsupported) = _
+            rw [hv]
+          change
+            (match
+              evalRvalue env₀ (.use (.copy { local_ := 5, projection := [] }))
+                mem₀ mixedSeqCaller.localDecls emptyFnLayouts
+             with
+             | .ok val locals₁ mem₁' => _
+             | .ub => _
+             | .unsupported => _) = _
+          rw [hRval]
+          rfl
+        · change
+            (match valueContainsUninit v with
+             | true => MirStepNode.fail .ub
+             | false => MirStepNode.retNormal v mem₂) = _
+          rw [hv]
+      exact liftState_iff_liftFrame.mp (hQ ▸ hEnd))
 
 /-- **Two executable four-stage pipelines in sequence.** The nested
 four-stage weakest precondition is a valid precondition of the two
@@ -10959,7 +11071,98 @@ the kept value and the active protector: the third call of `seqCaller`
 lifts by the rule with an explicit teardown state and, for a second
 postcondition, by the fully symbolic rule. The caller's protector stays
 active across the call and the caller returns `v`. -/
-theorem seqCaller_call_c_protected (v : Value) (p : Nat) :
+private theorem seqCaller_bb3_prot_liftFrame (v : Value) (p : Nat)
+    (useStale : Bool) (post : Value → Prop)
+    (hv : valueContainsUninit v = false) (hPost : post v) :
+    LiftFrame seqCaller 3 0 [.uninit, .init .unit, .init v, .init .unit]
+      { (seqProtMem p (if useStale then [staleCalleeBorrow] else [])) with
+        borrows :=
+          disableFrameBorrows
+            (seqProtMem p
+              (if useStale then [staleCalleeBorrow] else [])).borrows
+            1 1
+        activeCallee := some seqCaller }
+      post 2 := by
+  let mem₀ : Memory :=
+    { (seqProtMem p (if useStale then [staleCalleeBorrow] else [])) with
+      borrows :=
+        disableFrameBorrows
+          (seqProtMem p
+            (if useStale then [staleCalleeBorrow] else [])).borrows
+          1 1
+      activeCallee := some seqCaller }
+  let mem₁ : Memory :=
+    { mem₀ with borrows := invalidateConflictingBorrows mem₀.borrows 0 .none 0 }
+  let mem₂ : Memory :=
+    { mem₁ with borrows := disableFrameBorrows mem₁.borrows 0 4 }
+  refine liftState_iff_liftFrame.mp
+    (LiftState.of_step
+      (s' :=
+        { frame :=
+            { blockIdx := 3, stmtIdx := 1,
+              locals := [.init v, .init .unit, .init v, .init .unit] }
+          memory := mem₁ })
+      ?_
+      (LiftState.of_retNormal (mem' := mem₂) ?_ hPost))
+  · have hRval :
+        evalRvalue [.uninit, .init .unit, .init v, .init .unit]
+          (.use (.copy { local_ := 2, projection := [] })) mem₀
+          seqCaller.localDecls emptyFnLayouts =
+          .ok v [.uninit, .init .unit, .init v, .init .unit] mem₀ := by
+      change
+        (match
+          match
+            match valueContainsUninit v with
+            | false => ProjReadResult.ok v
+            | true => ProjReadResult.ub
+          with
+          | .ok fieldVal =>
+            PlaceReadResult.ok fieldVal
+              [.uninit, .init .unit, .init v, .init .unit]
+          | .ub => PlaceReadResult.ub
+          | .unsupported => PlaceReadResult.unsupported
+         with
+         | .ok val locals' => RvalueEvalResult.ok val locals' mem₀
+         | .ub => RvalueEvalResult.ub
+         | .unsupported => RvalueEvalResult.unsupported) = _
+      rw [hv]
+    cases useStale
+    · change
+        (match
+          evalRvalue [.uninit, .init .unit, .init v, .init .unit]
+            (.use (.copy { local_ := 2, projection := [] })) mem₀
+            seqCaller.localDecls emptyFnLayouts
+         with
+         | .ok val locals₁ mem₁' => _
+         | .ub => _
+         | .unsupported => _) = _
+      rw [hRval]
+      rfl
+    · change
+        (match
+          evalRvalue [.uninit, .init .unit, .init v, .init .unit]
+            (.use (.copy { local_ := 2, projection := [] })) mem₀
+            seqCaller.localDecls emptyFnLayouts
+         with
+         | .ok val locals₁ mem₁' => _
+         | .ub => _
+         | .unsupported => _) = _
+      rw [hRval]
+      rfl
+  · cases useStale
+    · change
+        (match valueContainsUninit v with
+         | true => MirStepNode.fail .ub
+         | false => MirStepNode.retNormal v mem₂) = _
+      rw [hv]
+    · change
+        (match valueContainsUninit v with
+         | true => MirStepNode.fail .ub
+         | false => MirStepNode.retNormal v mem₂) = _
+      rw [hv]
+
+theorem seqCaller_call_c_protected (v : Value) (p : Nat)
+    (hv : valueContainsUninit v = false) :
     LiftFrame seqCaller 2 1 (seqEnvAtC v) (seqProtMem p []) (fun r => r = v)
         (2 + 3) ∧
       LiftFrame seqCaller 2 1 (seqEnvAtC v) (seqProtMem p [])
@@ -10982,7 +11185,8 @@ theorem seqCaller_call_c_protected (v : Value) (p : Nat) :
       rfl (Or.inl rfl) rfl rfl rfl rfl rfl hFresh rfl
       (fun _ _ h =>
         liftState_iff_liftFrame.mp
-          (h ▸ LiftState.of_step rfl (LiftState.of_retNormal rfl rfl)))
+          (h ▸ liftState_iff_liftFrame.mpr
+            (seqCaller_bb3_prot_liftFrame v p false _ hv rfl)))
   · exact wpFramePrep_empty_function_symbolic (body := seqCaller)
       (cur := seqCaller) (blk := seqBlockC)
       (call := ⟨emptyFnAssignUnit, [], seqEnvAtC v⟩) (slot := .uninit)
@@ -10990,8 +11194,7 @@ theorem seqCaller_call_c_protected (v : Value) (p : Nat) :
         [.uninit, .init .unit, .init v, .init .unit])
       rfl (Or.inl rfl) rfl rfl rfl rfl rfl hFresh rfl (fun h => by cases h)
       rfl rfl
-      (liftState_iff_liftFrame.mp
-        (LiftState.of_step rfl (LiftState.of_retNormal rfl fun h => h)))
+      (seqCaller_bb3_prot_liftFrame v p false _ hv fun h => h)
 
 /-- **The weakest-precondition rules with a stale borrow under an active
 protector**, symbolic in the kept value and the protector: neither "no
@@ -10999,7 +11202,8 @@ active protector" nor "no borrow at the callee depth" holds, yet the third
 call of `seqCaller` lifts by the weakest-precondition rule with an explicit
 teardown state and, for a second postcondition, by its fully symbolic
 form. -/
-theorem seqCaller_call_c_stale (v : Value) (p : Nat) :
+theorem seqCaller_call_c_stale (v : Value) (p : Nat)
+    (hv : valueContainsUninit v = false) :
     LiftFrame seqCaller 2 1 (seqEnvAtC v) (seqProtMem p [staleCalleeBorrow])
         (fun r => r = v) (2 + 3) ∧
       LiftFrame seqCaller 2 1 (seqEnvAtC v)
@@ -11012,11 +11216,15 @@ theorem seqCaller_call_c_stale (v : Value) (p : Nat) :
       (s' := PureState.toMachineState
         { bb := 3, stmtIdx := 0,
           env := [.uninit, .init .unit, .init v, .init .unit] }
-        (seqProtMem p [staleCalleeBorrow]))
+        { (seqProtMem p [staleCalleeBorrow]) with
+          borrows :=
+            disableFrameBorrows (seqProtMem p [staleCalleeBorrow]).borrows 1 1
+          activeCallee := some seqCaller })
       rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl
       (fun _ _ h =>
         liftState_iff_liftFrame.mp
-          (h ▸ LiftState.of_step rfl (LiftState.of_retNormal rfl rfl)))
+          (h ▸ liftState_iff_liftFrame.mpr
+            (seqCaller_bb3_prot_liftFrame v p true _ hv rfl)))
   · exact wpFramePrep_empty_function_symbolic_wp (body := seqCaller)
       (cur := seqCaller) (blk := seqBlockC)
       (call := ⟨emptyFnAssignUnit, [], seqEnvAtC v⟩) (slot := .uninit)
@@ -11024,8 +11232,7 @@ theorem seqCaller_call_c_stale (v : Value) (p : Nat) :
         [.uninit, .init .unit, .init v, .init .unit])
       rfl (Or.inl rfl) rfl rfl rfl rfl rfl rfl rfl rfl (fun h => by cases h)
       rfl rfl
-      (liftState_iff_liftFrame.mp
-        (LiftState.of_step rfl (LiftState.of_retNormal rfl fun h => h)))
+      (seqCaller_bb3_prot_liftFrame v p true _ hv fun h => h)
 
 /-! ### Frame teardown and root-level pruning of the borrow forest -/
 
@@ -11420,13 +11627,13 @@ empty function returns the value it kept in `_2`, both from the fresh
 memory and from the memory that additionally holds a stale disabled borrow
 at the callee frame depth. -/
 theorem emptyFnCallerProt_fresh_and_stale (v : Value) (protId fuel : Nat)
-    (hFuel : 5 ≤ fuel) :
+    (hv : valueContainsUninit v = false) (hFuel : 5 ≤ fuel) :
     LiftFrame emptyFnCallerProt 0 0 [.uninit, .uninit, .init v]
         (emptyFnCallerProtMem protId) (fun r => r = v) fuel ∧
       LiftFrame emptyFnCallerProt 0 0 [.uninit, .uninit, .init v]
         (emptyFnCallerStaleProtMem protId) (fun r => r = v) fuel :=
-  ⟨LiftFrame.mono hFuel (emptyFnCallerWithProtector_liftFrame v protId),
-    LiftFrame.mono hFuel (emptyFnCallerStaleProtected_liftFrame v protId)⟩
+  ⟨LiftFrame.mono hFuel (emptyFnCallerWithProtector_liftFrame v protId hv),
+    LiftFrame.mono hFuel (emptyFnCallerStaleProtected_liftFrame v protId hv)⟩
 
 /-- **The protector-registering callee: explicit trace prefix and lift.**
 From the call terminator of `protCaller`, the first two trusted steps are

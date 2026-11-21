@@ -40,6 +40,22 @@ the `BEGIN/END SHARED WAIVER-PIN & 3-AXIS AUDITOR` banners, byte-identical in
    unused subjects. `include_unannotated_vacuity=True` (`--all-theorems`) applies every
    check to every theorem.
 
+Two advisory rules (`ADVISORY_RULES`) are opt-in (`include_advisories=True`, CLI
+`--advisories`) and never part of `ALL_RULES` or of a default scan; they point at proof-scaling
+traps that are legal Lean and that `scan_projection_and_rewrite_order_hazards` finds
+structurally:
+A1. `simp_deep_projection_chain`: an uncollapsed `(advanceStmt ...).memory.<field>` /
+    `.frame.<field>` projection chain handed to a `simp`-family tactic other than `dsimp`,
+    either inside the call (lemma list, configuration, discharger, `simpa ... using`) or by a
+    `change` / `show` / `have` / `suffices` that the very next tactic step simplifies
+    (`leanprover/lean4#16532`: `Simp.simpProj` builds a `fun s => e = s.i` motive per level).
+A2. `try_rw_hyp_before_target`: `try rw [...] at h ⊢` (also `erw` / `rewrite` / `rwa`) naming a
+    hypothesis before the goal, so a goal rewrite that fails throws away the hypothesis work.
+
+Comment, string and identifier lexing is shared with the other Lean tools through
+`lean_lexer.py` (next to this file); the shared auditor section keeps its own copy of the
+lexer because the TCB checker must stay a single file.
+
 Also provides delta-only post-edit checking (`check_post_edit_proof_health`) for
 `tools/anneal-lsp/hooks/post_tool_use.py`, unbatched tool-call latency telemetry
 (`compute_unbatched_tool_latencies`), and a CLI (`python3 proof_health.py --help`).
@@ -58,17 +74,24 @@ import sys
 
 sys.dont_write_bytecode = True
 
-from bisect import bisect_right
 from datetime import datetime
 import json
 import math
 import os
 from pathlib import Path
 import re
-import statistics
 import time
 from typing import Any, Iterable
 import zlib
+
+# The shared Lean 4 lexer lives next to this file. Hooks, tests and other tools may load
+# this module by file path or from any working directory, so make sure the sibling module
+# is importable (without disturbing an already imported one) before importing it.
+if "lean_lexer" not in sys.modules:
+    _SERVER_DIR = str(Path(__file__).resolve().parent)
+    if _SERVER_DIR not in sys.path:
+        sys.path.insert(0, _SERVER_DIR)
+import lean_lexer  # noqa: E402
 
 RULE_DSIMP_FORBIDDEN_SYM = "dsimp_forbidden_sym"
 RULE_DSIMP_MIR_BODY_UNFOLD = "dsimp_mir_body_unfold"
@@ -87,6 +110,20 @@ ALL_RULES: tuple[str, ...] = (
     RULE_UNPINNED_OR_DRIFTED_WAIVER,
     RULE_TRIVIAL_OR_VACUOUS_CLAIM,
 )
+
+# Advisory rules: reported only on request (`include_advisories=True` / `--advisories`),
+# never blocking and never part of `ALL_RULES`.
+RULE_SIMP_DEEP_PROJECTION_CHAIN = "simp_deep_projection_chain"
+RULE_TRY_RW_HYP_BEFORE_TARGET = "try_rw_hyp_before_target"
+
+ADVISORY_RULES: tuple[str, ...] = (
+    RULE_SIMP_DEEP_PROJECTION_CHAIN,
+    RULE_TRY_RW_HYP_BEFORE_TARGET,
+)
+
+# Sub-rules of `simp_deep_projection_chain` (the finding's `subrule`).
+SUBRULE_PROJECTION_IN_SIMP_ARGS = "projection_in_simp_arguments"
+SUBRULE_SIMP_AFTER_PROJECTION_STATEMENT = "simp_after_projection_statement"
 
 MIN_PROFILER_THRESHOLD = 50
 DEFAULT_LONG_CALL_THRESHOLD_MS = 1000.0
@@ -289,29 +326,20 @@ class PrivateDecl:
         )
 
 
-def _is_ident_char(ch: str) -> bool:
-    # Lean 4 identifier continuation characters (`isIdRest`): letters (including
-    # Unicode letters and subscripts), digits, `_`, `'`, `!` and `?` (`get?`, `get!`).
-    return ch.isalnum() or ch in "_'!?"
+# Lexical helpers. The implementations live in the shared single-pass lexer
+# (`lean_lexer.py`); the names below are kept because the rules in this module, the
+# PostToolUse hook and the tests use them.
 
+# Lean 4 identifier continuation characters (`isIdRest`): letters (including Unicode
+# letters and subscripts), digits, `_`, `'`, `!` and `?` (`get?`, `get!`).
+_is_ident_char = lean_lexer.is_ident_char
 
-# Byte table mapping every byte except `\n` to a space (`bytes.translate` is a tight
-# C loop; ASCII text round-trips through it unchanged in length).
-_BLANK_BYTES_TABLE = bytes(10 if i == 10 else 32 for i in range(256))
+# Byte table mapping every byte except `\n` to a space.
+_BLANK_BYTES_TABLE = lean_lexer._BLANK_BYTES_TABLE
 
-
-def _blank_multiline(seg: str) -> str:
-    """`seg` (already known to contain `\\n`) with non-newlines replaced by spaces."""
-    if seg.isascii():
-        return seg.encode("ascii").translate(_BLANK_BYTES_TABLE).decode("ascii")
-    return "\n".join([" " * len(part) for part in seg.split("\n")])
-
-
-def _blank(seg: str) -> str:
-    """`seg` with every character except newlines replaced by a space."""
-    if "\n" not in seg:
-        return " " * len(seg)
-    return _blank_multiline(seg)
+# `seg` with every character except newlines replaced by a space.
+_blank = lean_lexer.blank_preserving_newlines
+_blank_multiline = lean_lexer.blank_preserving_newlines
 
 
 def strip_lean_comments_and_strings(text: str, *, keep_strings: bool = False) -> str:
@@ -324,210 +352,24 @@ def strip_lean_comments_and_strings(text: str, *, keep_strings: bool = False) ->
     end at the matching `"#...`; the quote character literals `'"'` / `'\\"'` do not
     open a string, while an identifier prime before a string (`x'"..."`) does not
     make a character literal; guillemet names `«a--b»` are code, not comments. With
-    `keep_strings=True` only comments are blanked. The scan jumps between delimiters
-    with `str.find`, about 3 ms per MB of Lean source.
+    `keep_strings=True` only comments are blanked.
+
+    Delegates to `lean_lexer.strip_comments_and_strings_preserving_offsets` (about 3 ms
+    per MB of Lean source), which blanks exactly the characters that the shared auditor's
+    lexer `_scan_lean_comments_and_strings` blanks.
     """
-    n = len(text)
-    if n == 0:
-        return ""
-    out: list[str] = []
-    app = out.append  # bound once: the loop runs once per comment/string token
-    find = text.find
-    pos = 0
-    i_lin = find("--", 0)
-    if i_lin == -1:
-        i_lin = n
-    i_blk = find("/-", 0)
-    if i_blk == -1:
-        i_blk = n
-    i_str = find('"', 0)
-    if i_str == -1:
-        i_str = n
-    i_gui = find("«", 0)
-    if i_gui == -1:
-        i_gui = n
-    while pos < n:
-        if i_lin < pos:
-            i_lin = find("--", pos)
-            if i_lin == -1:
-                i_lin = n
-        if i_blk < pos:
-            i_blk = find("/-", pos)
-            if i_blk == -1:
-                i_blk = n
-        if i_str < pos:
-            i_str = find('"', pos)
-            if i_str == -1:
-                i_str = n
-        if i_gui < pos:
-            i_gui = find("«", pos)
-            if i_gui == -1:
-                i_gui = n
-
-        nxt = i_lin
-        if i_blk < nxt:
-            nxt = i_blk
-        if i_str < nxt:
-            nxt = i_str
-        if i_gui < nxt:
-            nxt = i_gui
-
-        if nxt == n:
-            app(text[pos:])
-            break
-        if nxt > pos:
-            app(text[pos:nxt])
-
-        if nxt == i_lin:
-            # `--` line comment up to (not including) the newline
-            nl = find("\n", nxt + 2)
-            end = n if nl == -1 else nl
-            app(" " * (end - nxt))
-            pos = end
-            continue
-
-        if nxt == i_blk:
-            # `/- ... -/` block comment with arbitrary nesting depth
-            depth = 1
-            cur = nxt + 2
-            while depth > 0 and cur < n:
-                c = find("-/", cur)
-                if c == -1:
-                    cur = n
-                    break
-                o = find("/-", cur, c)
-                if o != -1:
-                    depth += 1
-                    cur = o + 2
-                else:
-                    depth -= 1
-                    cur = c + 2
-            if find("\n", nxt, cur) == -1:
-                app(" " * (cur - nxt))
-            else:
-                app(_blank_multiline(text[nxt:cur]))
-            pos = cur
-            continue
-
-        if nxt == i_gui:
-            # `'«'` is a character literal, not an opening guillemet identifier; blank
-            # it when stripping literals so a `»` inside a trailing `--` comment never pairs.
-            if (
-                nxt > 0
-                and nxt + 1 < n
-                and text[nxt - 1] == "'"
-                and text[nxt + 1] == "'"
-                and (nxt < 2 or (not _is_ident_char(text[nxt - 2]) and text[nxt - 2] != "\\"))
-            ):
-                app("«" if keep_strings else " ")
-                pos = nxt + 1
-                continue
-            # Lean 4 guillemet identifier `«...»` (single-line): `--` or `/-` inside
-            # `«a--b»` is part of the identifier name, not a comment start.
-            g_end = find("»", nxt + 1)
-            if g_end != -1 and find("\n", nxt + 1, g_end) == -1:
-                app(text[nxt : g_end + 1])
-                pos = g_end + 1
-            else:
-                app("«")
-                pos = nxt + 1
-            continue
-
-        # Raw string literal `r"..."` / `r#"..."#` and quote character literals `'"'` /
-        # `'\"'` (the character before the `"` is then `#`, `r`, `'` or a backslash).
-        if nxt > 0 and text[nxt - 1] in "#r'\\":
-            h = nxt
-            while h > 0 and text[h - 1] == "#":
-                h -= 1
-            if (
-                h > 0
-                and text[h - 1] == "r"
-                and (h < 2 or not (_is_ident_char(text[h - 2]) or text[h - 2] == "."))
-            ):
-                closer = '"' + "#" * (nxt - h)
-                c = find(closer, nxt + 1)
-                cur = n if c == -1 else c + len(closer)
-                app(text[nxt:cur] if keep_strings else _blank(text[nxt:cur]))
-                pos = cur
-                continue
-            if (
-                nxt + 1 < n
-                and text[nxt + 1] == "'"
-                and (
-                    (
-                        text[nxt - 1] == "'"
-                        and (
-                            nxt < 2
-                            or (not _is_ident_char(text[nxt - 2]) and text[nxt - 2] != "\\")
-                        )
-                    )
-                    or (
-                        nxt >= 2
-                        and text[nxt - 2 : nxt] == "'\\"
-                        and (nxt < 3 or not _is_ident_char(text[nxt - 3]))
-                    )
-                )
-            ):
-                app('"' if keep_strings else " ")
-                pos = nxt + 1
-                continue
-        q = find('"', nxt + 1)
-        if q == -1:
-            cur = n
-        elif text[q - 1] != "\\":
-            cur = q + 1
-        else:
-            cur = nxt + 1
-            while cur < n:
-                q = find('"', cur)
-                if q == -1:
-                    cur = n
-                    break
-                bs = 0
-                k = q - 1
-                while k >= nxt + 1 and text[k] == "\\":
-                    bs += 1
-                    k -= 1
-                cur = q + 1
-                if bs % 2 == 0:
-                    break
-        if keep_strings:
-            app(text[nxt:cur])
-        elif find("\n", nxt, cur) == -1:
-            app(" " * (cur - nxt))
-        else:
-            app(_blank_multiline(text[nxt:cur]))
-        pos = cur
-    return "".join(out)
+    return lean_lexer.strip_comments_and_strings_preserving_offsets(
+        text, keep_strings=keep_strings
+    )
 
 
-def _offset_to_line(text_or_offsets: str | list[int], offset: int) -> int:
-    if isinstance(text_or_offsets, str):
-        return text_or_offsets.count("\n", 0, offset) + 1
-    return bisect_right(text_or_offsets, offset) + 1
+# 1-based line of an offset, from the text or from the sorted offsets of its newlines.
+_offset_to_line = lean_lexer.offset_to_line
 
-
-class _LineCounter:
-    """1-based line numbers of offsets in `text`, counted incrementally from the
-    previous query, so a scan's queries cost O(len(text)) in total instead of one
-    prefix count per finding."""
-
-    __slots__ = ("text", "off", "line")
-
-    def __init__(self, text: str) -> None:
-        self.text = text
-        self.off = 0
-        self.line = 1
-
-    def __call__(self, offset: int) -> int:
-        if offset >= self.off:
-            self.line += self.text.count("\n", self.off, offset)
-        elif offset * 2 < self.off:
-            self.line = self.text.count("\n", 0, offset) + 1
-        else:
-            self.line -= self.text.count("\n", offset, self.off)
-        self.off = offset
-        return self.line
+# 1-based line numbers of offsets in a text, counted incrementally from the previous
+# query, so a scan's queries cost O(len(text)) in total instead of one prefix count per
+# finding.
+_LineCounter = lean_lexer.LineCounter
 
 
 # Tactic and pattern regexes on stripped Lean 4 text.
@@ -2253,6 +2095,7 @@ def scan_lean_text(
     scan_siblings: bool = True,
     sibling_decls: list[PrivateDecl] | None = None,
     include_unannotated_vacuity: bool = False,
+    include_advisories: bool = False,
 ) -> list[ProofHealthFinding]:
     """Scan Lean 4 source `text` and return all structural proof-health findings.
 
@@ -2261,9 +2104,10 @@ def scan_lean_text(
     megabyte-sized string), the options, and (when the text can declare `private` items and
     siblings are scanned) the identity of every sibling's cached declaration list, which is
     replaced whenever that sibling's bytes change; an explicit `sibling_decls` list bypasses
-    the memo.
+    the memo. `include_advisories=True` additionally includes `ADVISORY_RULES` from
+    `scan_projection_and_rewrite_order_hazards`.
     """
-    cache_key: tuple[int, str, str, str, bool, bool] | None = None
+    cache_key: tuple[int, str, str, str, bool, bool, bool] | None = None
     sib_lists: tuple[list[PrivateDecl], ...] = ()
     sib_names: tuple[str, ...] = ()
     computed_siblings = False
@@ -2280,6 +2124,7 @@ def scan_lean_text(
             str(file_path) if file_path is not None else "",
             bool(scan_siblings),
             bool(include_unannotated_vacuity),
+            bool(include_advisories),
         )
         hit = _SCAN_RESULT_CACHE.get(cache_key)
         if (
@@ -2290,6 +2135,61 @@ def scan_lean_text(
             and all(a is b for a, b in zip(hit[2], sib_lists))
         ):
             return list(hit[3])
+        if include_advisories:
+            base_hit = _SCAN_RESULT_CACHE.get((*cache_key[:6], False))
+            if (
+                base_hit is not None
+                and base_hit[0] == text
+                and base_hit[1] == sib_names
+                and len(base_hit[2]) == len(sib_lists)
+                and all(a is b for a, b in zip(base_hit[2], sib_lists))
+            ):
+                base_scan_key = (cache_key[3], cache_key[4], cache_key[5], False)
+                base_prev = _LAST_LEAN_SCAN.get(base_scan_key)
+                pre_stripped = base_prev[1] if (base_prev is not None and base_prev[0] == text) else None
+                merged = list(base_hit[3]) + scan_projection_and_rewrite_order_hazards(
+                    text, stripped=pre_stripped
+                )
+                merged.sort(key=lambda f: (f.line, f.rule, f.symbol, f.subrule))
+                merged_tup = tuple(merged)
+                _SCAN_RESULT_CACHE.pop(cache_key, None)
+                _SCAN_RESULT_CACHE[cache_key] = (text, sib_names, sib_lists, merged_tup)
+                while len(_SCAN_RESULT_CACHE) > _SCAN_RESULT_CACHE_MAX:
+                    del _SCAN_RESULT_CACHE[next(iter(_SCAN_RESULT_CACHE))]
+                if base_prev is not None and base_prev[0] == text:
+                    true_scan_key = (cache_key[3], cache_key[4], cache_key[5], True)
+                    if true_scan_key not in _LAST_LEAN_SCAN and len(_LAST_LEAN_SCAN) >= 16:
+                        _LAST_LEAN_SCAN.clear()
+                    _LAST_LEAN_SCAN[true_scan_key] = (
+                        *base_prev[:6],
+                        merged_tup,
+                    )
+                return merged
+        else:
+            adv_hit = _SCAN_RESULT_CACHE.get((*cache_key[:6], True))
+            if (
+                adv_hit is not None
+                and adv_hit[0] == text
+                and adv_hit[1] == sib_names
+                and len(adv_hit[2]) == len(sib_lists)
+                and all(a is b for a, b in zip(adv_hit[2], sib_lists))
+            ):
+                filtered = [f for f in adv_hit[3] if f.rule not in _ADVISORY_RULE_SET]
+                filtered_tup = tuple(filtered)
+                _SCAN_RESULT_CACHE.pop(cache_key, None)
+                _SCAN_RESULT_CACHE[cache_key] = (text, sib_names, sib_lists, filtered_tup)
+                while len(_SCAN_RESULT_CACHE) > _SCAN_RESULT_CACHE_MAX:
+                    del _SCAN_RESULT_CACHE[next(iter(_SCAN_RESULT_CACHE))]
+                adv_prev = _LAST_LEAN_SCAN.get((cache_key[3], cache_key[4], cache_key[5], True))
+                if adv_prev is not None and adv_prev[0] == text:
+                    false_scan_key = (cache_key[3], cache_key[4], cache_key[5], False)
+                    if false_scan_key not in _LAST_LEAN_SCAN and len(_LAST_LEAN_SCAN) >= 16:
+                        _LAST_LEAN_SCAN.clear()
+                    _LAST_LEAN_SCAN[false_scan_key] = (
+                        *adv_prev[:6],
+                        filtered_tup,
+                    )
+                return filtered
     findings = _scan_lean_text_uncached(
         text,
         file_path=file_path,
@@ -2298,6 +2198,7 @@ def scan_lean_text(
             [d for lst in sib_lists for d in lst] if computed_siblings else sibling_decls
         ),
         include_unannotated_vacuity=include_unannotated_vacuity,
+        include_advisories=include_advisories,
     )
     if cache_key is not None:
         _SCAN_RESULT_CACHE.pop(cache_key, None)
@@ -2308,10 +2209,11 @@ def scan_lean_text(
 
 
 # `scan_lean_text` memo: `(len(text), text[:128], text[-128:], file_path, scan_siblings,
-# include_unannotated_vacuity)` -> `(text, sibling paths, sibling declaration lists, findings)`,
-# least recently stored first; a hit additionally requires full `text` equality.
+# include_unannotated_vacuity, include_advisories)` -> `(text, sibling paths, sibling
+# declaration lists, findings)`, least recently stored first; a hit additionally requires
+# full `text` equality.
 _SCAN_RESULT_CACHE: dict[
-    tuple[int, str, str, str, bool, bool],
+    tuple[int, str, str, str, bool, bool, bool],
     tuple[str, tuple[str, ...], tuple[list[PrivateDecl], ...], tuple[ProofHealthFinding, ...]],
 ] = {}
 _SCAN_RESULT_CACHE_MAX = 32
@@ -2324,12 +2226,14 @@ def _scan_lean_text_uncached(
     scan_siblings: bool = True,
     sibling_decls: list[PrivateDecl] | None = None,
     include_unannotated_vacuity: bool = False,
+    include_advisories: bool = False,
     _preparsed: tuple[str, list[tuple[int, int, int, str, str]]] | None = None,
 ) -> list[ProofHealthFinding]:
     scan_key = (
         str(file_path) if file_path is not None else "",
         bool(scan_siblings),
         bool(include_unannotated_vacuity),
+        bool(include_advisories),
     )
     if INCREMENTAL_SPLICING and _preparsed is None and len(text) >= 32768:
         prev_scan = _LAST_LEAN_SCAN.get(scan_key)
@@ -2375,6 +2279,7 @@ def _scan_lean_text_uncached(
                             scan_siblings=False,
                             sibling_decls=[],
                             include_unannotated_vacuity=include_unannotated_vacuity,
+                            include_advisories=include_advisories,
                             _preparsed=(win_code, win_comments),
                         )
                         spliced = [f for f in old_findings if f.line < cut_lo_line]
@@ -2411,7 +2316,7 @@ def _scan_lean_text_uncached(
                                         tier=f.tier,
                                     )
                                 )
-                        spliced.sort(key=lambda f: (f.line, f.rule, f.symbol))
+                        spliced.sort(key=lambda f: (f.line, f.rule, f.symbol, f.subrule))
                         return spliced
 
     if _preparsed is not None:
@@ -2641,7 +2546,10 @@ def _scan_lean_text_uncached(
         )
     )
 
-    findings.sort(key=lambda f: (f.line, f.rule, f.symbol))
+    if include_advisories:
+        findings.extend(scan_projection_and_rewrite_order_hazards(text, stripped=stripped))
+
+    findings.sort(key=lambda f: (f.line, f.rule, f.symbol, f.subrule))
     if INCREMENTAL_SPLICING and _preparsed is None and len(text) >= 32768:
         thms = _iter_lean_theorem_headers(stripped)
         col0_thms = [kw for kw, _, _ in thms if kw == 0 or stripped[kw - 1] == "\n"]
@@ -2661,7 +2569,7 @@ def _scan_lean_text_uncached(
 
 
 _LAST_LEAN_SCAN: dict[
-    tuple[str, bool, bool],
+    tuple[str, bool, bool, bool],
     tuple[
         str,
         str,
@@ -2679,6 +2587,7 @@ def scan_lean_file(
     *,
     scan_siblings: bool = True,
     include_unannotated_vacuity: bool = False,
+    include_advisories: bool = False,
 ) -> list[ProofHealthFinding]:
     path = Path(file_path)
     key = _SCAN_FILE_KEY_PREFIX + str(path)
@@ -2701,6 +2610,7 @@ def scan_lean_file(
                 file_path=path,
                 scan_siblings=scan_siblings,
                 include_unannotated_vacuity=include_unannotated_vacuity,
+                include_advisories=include_advisories,
             )
     # Bytes + decode skips text-mode newline translation; line numbers count `\n`
     # either way and a stray `\r` is whitespace to every rule.
@@ -2712,6 +2622,7 @@ def scan_lean_file(
         file_path=path,
         scan_siblings=scan_siblings,
         include_unannotated_vacuity=include_unannotated_vacuity,
+        include_advisories=include_advisories,
     )
 
 
@@ -2720,6 +2631,1327 @@ def count_findings_by_rule(findings: Iterable[ProofHealthFinding]) -> dict[str, 
     for f in findings:
         counts[f.rule] = counts.get(f.rule, 0) + 1
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Advisory hazards: deep projection chains under `simp`, and `try rw ... at h ⊢`
+# ---------------------------------------------------------------------------
+
+_ADVISORY_RULE_SET: frozenset[str] = frozenset(ADVISORY_RULES)
+
+# How far before a projection chain the `simp` call or statement keyword that contains it
+# may start, the longest tactic step / bracket group / `try` block that is followed, and
+# how many candidate occurrences before a chain are tried. The bounds keep the scan linear
+# on adversarial input; real proofs stay far below them.
+_ADV_BACK_WINDOW = 8192
+_ADV_STATEMENT_WINDOW = 2048
+_ADV_SCAN_LIMIT = 16384
+_ADV_MAX_SIMP_CANDIDATES = 24
+_ADV_MAX_STATEMENT_CANDIDATES = 12
+_ADV_STATEMENT_KEYWORDS = ("change", "show", "have", "suffices")
+_ADV_WS = " \t\r\n"
+_ADV_STATEMENT_STOPS = frozenset((":=", "by", "from", "at", ";", "<;>"))
+_ADV_STEP_STOPS = frozenset((";", "<;>"))
+_ADV_USING_STOPS = frozenset((";", "<;>", ","))
+_ADV_TRY_STOPS = frozenset(("|",))
+_ADV_NO_STOPS: frozenset[str] = frozenset()
+_ADV_TURNSTILES = ("⊢", "|-")
+_ADV_LOC_STOP_WORDS: frozenset[str] = _UNFOLD_STOP_WORDS | frozenset(
+    (
+        "λ",
+        "try",
+        "erw",
+        "rewrite",
+        "rwa",
+        "all_goals",
+        "any_goals",
+        "repeat",
+        "repeat'",
+        "focus",
+        "first",
+        "push_neg",
+        "ring",
+        "ring_nf",
+        "norm_num",
+        "norm_cast",
+        "field_simp",
+        "aesop",
+        "grind",
+        "linarith",
+        "nlinarith",
+        "clear",
+        "subst",
+        "revert",
+        "generalize",
+        "generalize_proofs",
+        "specialize",
+        "split",
+        "rename_i",
+        "congr",
+        "ext",
+        "funext",
+        "tauto",
+        "exfalso",
+        "left",
+        "right",
+        "use",
+        "then",
+        "else",
+        "for",
+        "while",
+        "unless",
+    )
+)
+_ADV_NON_TACTIC_BEFORE_TRY_CHARS = frozenset(":=+-*/,→")
+_ADV_NON_TACTIC_BEFORE_TRY_WORDS = frozenset(
+    (
+        "let",
+        "exact",
+        "apply",
+        "refine",
+        "return",
+        "fun",
+        "λ",
+        "have",
+        "suffices",
+        "show",
+        "change",
+        "from",
+        "use",
+        "intro",
+        "intros",
+        "cases",
+        "induction",
+        "rcases",
+        "obtain",
+        "rename_i",
+        "clear",
+        "subst",
+        "revert",
+        "specialize",
+        "unfold",
+        "delta",
+        "at",
+        "using",
+        "if",
+        "match",
+        "forall",
+        "theorem",
+        "lemma",
+        "def",
+        "abbrev",
+        "axiom",
+        "opaque",
+        "structure",
+        "class",
+        "inductive",
+        "instance",
+        "namespace",
+        "section",
+        "end",
+        "open",
+        "variable",
+    )
+)
+_ADV_GUI_OR_CHAR = (
+    r"«[^»\n]*»"
+    r"|(?<![\w'!?\u00bb])'(?:\\(?:x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|.)|[^'\\\n])'"
+)
+
+
+class _AdvisoryRegexes:
+    """Regexes of the advisory scanner, compiled on first use: scans without
+    `include_advisories` (every hook process) never pay for them."""
+
+    __slots__ = (
+        "step_token",
+        "bracket",
+        "projection",
+        "advance_stmt_sym",
+        "config_item",
+        "step_prefix",
+        "rw_head",
+        "location",
+        "next_line",
+        "flat_line",
+    )
+
+    def __init__(self) -> None:
+        # Guillemet identifiers and char literals are skipped whole first so brackets or
+        # semicolons inside `«a]b»` or `']'` never desync tactic/bracket boundaries.
+        # Standalone `|` excludes `|-` turnstiles and `||` / `|>` / `<|>` operators.
+        self.step_token = re.compile(
+            _ADV_GUI_OR_CHAR
+            + r"|[()\[\]{}⟨⟩;,\n]|:=|=>|<;>|(?<![|<])\|(?![->|])|"
+            + r"(?<![\w'!?.\u00ab])(?:by|from|at|fun|λ)(?![\w'!?.\u00bb])"
+        )
+        self.bracket = re.compile(_ADV_GUI_OR_CHAR + r"|[()\[\]{}⟨⟩]")
+        # One projection: `.field`, `.1`, `.«field»`.
+        self.projection = re.compile(r"\.(?:[^\W\d][\w'!?]*|\d+|«[^»\n]+»)")
+        # Unfolded `advanceStmt` symbol (optionally qualified or `.eq_def` / `.eq_unfold` / `.eq_N`).
+        self.advance_stmt_sym = re.compile(
+            r"(?<![\w'!?.\u00ab])"
+            + _QUAL_PREFIX
+            + r"advanceStmt"
+            + _UNFOLD_EQ_SUFFIX
+            + r"(?![\w'!?.\u00bb])"
+        )
+        # `(config := ...)`, `(disch := ...)`, `(occs := ...)`: a named argument group.
+        self.config_item = re.compile(r"\(\s*[^\W\d][\w'!?]*\s*:=")
+        # Combinators that run the tactic after them on the current goal(s).
+        self.step_prefix = re.compile(
+            r"(?:try|all_goals|any_goals|repeat'?|focus)(?![\w'!?.\u00bb])"
+        )
+        self.rw_head = re.compile(
+            r"(?<![\w'!?.\u00ab])(rw|erw|rewrite|rwa)(?![\w'!?.\u00bb])"
+        )
+        # One rewrite location on the same line: the goal, `*`, or a hypothesis name.
+        self.location = re.compile(r"[ \t]*(⊢|\|-|\*|[^\W\d][\w'!?]*|«[^»\n]+»)")
+        # From just past a line end: blank lines, then (group 1) the indentation of the
+        # next non-blank line. Always matches; it ends at that line's first character.
+        self.next_line = re.compile(r"(?:[ \t\r]*\n)*([ \t\r]*)")
+        # The rest of a line that holds no `;` or standalone `|` and only flat, balanced
+        # bracket groups.
+        atom = _ADV_GUI_OR_CHAR + r"|[^\n;|()\[\]{}]|\|(?=[-|>])|(?<=[|<])\|"
+        self.flat_line = re.compile(
+            rf"(?:{atom}|\[(?:{atom})*\]|\((?:{atom})*\)|\{{(?:{atom})*\}})*(?=\n|\Z)"
+        )
+
+
+_ADVISORY_REGEXES: _AdvisoryRegexes | None = None
+
+
+def _advisory_regexes() -> _AdvisoryRegexes:
+    global _ADVISORY_REGEXES
+    if _ADVISORY_REGEXES is None:
+        _ADVISORY_REGEXES = _AdvisoryRegexes()
+    return _ADVISORY_REGEXES
+
+
+def _adv_skip_ws(stripped: str, pos: int, n: int) -> int:
+    while pos < n and stripped[pos] in _ADV_WS:
+        pos += 1
+    return pos
+
+
+def _adv_word_at(stripped: str, pos: int, word: str, n: int) -> bool:
+    """True when the whole token at `pos` is the keyword `word`."""
+    if not stripped.startswith(word, pos):
+        return False
+    end = pos + len(word)
+    return end >= n or not (_is_ident_char(stripped[end]) or stripped[end] in ".»")
+
+
+def _adv_col(stripped: str, pos: int) -> int:
+    return pos - (stripped.rfind("\n", 0, pos) + 1)
+
+
+def _adv_step_col(stripped: str, pos: int) -> int:
+    """Column of the first tactic token on `pos`'s line (after leading whitespace and any
+    focusing bullets `·`, `.`, `-`, `+`, `*`). Later lines must exceed this column to
+    continue the tactic sequence starting on that line."""
+    line_start = stripped.rfind("\n", 0, pos) + 1
+    k = line_start
+    while k < pos and stripped[k] in " \t":
+        k += 1
+    while k < pos:
+        ch = stripped[k]
+        if ch in " \t·":
+            k += 1
+        elif ch in ".-+*" and k + 1 < pos and stripped[k + 1] in " \t":
+            k += 1
+        else:
+            break
+    return k - line_start
+
+
+def _adv_match_close(stripped: str, open_idx: int, n: int) -> int:
+    """Offset of the bracket closing the one at `open_idx` (nesting of `()`, `[]`, `{}` and
+    `⟨⟩` counted together), or `-1` when it does not close within `_ADV_SCAN_LIMIT`."""
+    depth = 0
+    hard_end = open_idx + _ADV_SCAN_LIMIT
+    if hard_end > n:
+        hard_end = n
+    for m in _advisory_regexes().bracket.finditer(stripped, open_idx, hard_end):
+        tok = m.group()
+        if len(tok) != 1:
+            continue
+        if tok in "([{⟨":
+            depth += 1
+        else:
+            depth -= 1
+            if depth <= 0:
+                return m.start()
+    return -1
+
+
+def _adv_scan_to(
+    stripped: str,
+    pos: int,
+    n: int,
+    min_indent: int,
+    stops: frozenset[str],
+    *,
+    same_line_stops: frozenset[str] = _ADV_NO_STOPS,
+    infix_min_indent: int | None = None,
+) -> tuple[int, str, int]:
+    """Follow the tactic step (or term) starting at `pos` and return `(end, token, next)`,
+    where it stops outside every bracket opened after `pos`:
+
+    * at a token of `stops` (`;`, `<;>`, `,`, `:=`, `by`, `from`, `at`) or (before the
+      first newline at depth 0) a token of `same_line_stops`: `token` is that token and
+      `next` the offset just past it;
+    * at a line end whose next non-blank line is indented less than `min_indent` (or
+      `infix_min_indent` when the line ends with `<;>` / `<|>`): `token` is `"\\n"` and
+      `next` the offset of that next line's first character;
+    * at a bracket that closes one opened before `pos` (`token` `")"`), at the end of the
+      text, or after `_ADV_SCAN_LIMIT` characters (`token` `""`): `next` is `-1`.
+    """
+    depth = 0
+    crossed_nl = False
+    inf_min = min_indent if infix_min_indent is None else infix_min_indent
+    hard_end = pos + _ADV_SCAN_LIMIT
+    if hard_end > n:
+        hard_end = n
+    res = _advisory_regexes()
+    next_line = res.next_line
+    for m in res.step_token.finditer(stripped, pos, hard_end):
+        tok = m.group()
+        first = tok[0]
+        if first in ("«", "'"):
+            continue
+        if first in "([{⟨":
+            depth += 1
+        elif first in ")]}⟩":
+            if depth == 0:
+                return m.start(), ")", -1
+            depth -= 1
+        elif depth:
+            continue
+        elif first == "\n":
+            line = next_line.match(stripped, m.end())
+            k = line.end()
+            if k >= n:
+                return n, "", -1
+            nxt_indent = k - line.start(1)
+            req_indent = min_indent
+            if inf_min < min_indent and nxt_indent >= inf_min:
+                e = m.start() - 1
+                while e >= pos and stripped[e] in " \t\r":
+                    e -= 1
+                if (
+                    e >= pos + 2
+                    and stripped[e - 2 : e + 1] in ("<;>", "<|>")
+                    and not lean_lexer._inside_guillemets(stripped, e)
+                ):
+                    req_indent = inf_min
+            if nxt_indent < req_indent:
+                return m.start(), "\n", k
+            crossed_nl = True
+        elif tok in stops or (not crossed_nl and tok in same_line_stops):
+            return m.start(), tok, m.end()
+    return hard_end, "", -1
+
+
+def _adv_scan_at_locations(
+    stripped: str, at_end: int, n: int, rw_col: int, *, stop_before_using: bool = False
+) -> tuple[list[str], int]:
+    """Scan the location list following `at` (ending at `at_end`), crossing blank/comment
+    tails and CRLF line breaks into lines indented strictly past `rw_col`. Returns
+    `(locations, stop_offset)` stopping before tactic/clause keywords."""
+    res = _advisory_regexes()
+    location = res.location
+    next_line = res.next_line
+    locs: list[str] = []
+    k = at_end
+    while True:
+        m = location.match(stripped, k)
+        if m is not None:
+            tok = m.group(1)
+            if (stop_before_using and tok == "using") or tok in _ADV_LOC_STOP_WORDS:
+                return locs, m.start(1)
+            locs.append(tok)
+            k = m.end()
+            continue
+        k_eol = k
+        while k_eol < n and stripped[k_eol] in " \t\r":
+            k_eol += 1
+        if k_eol < n and stripped[k_eol] == "\n":
+            line = next_line.match(stripped, k_eol + 1)
+            nxt_k = line.end()
+            if nxt_k < n and nxt_k - line.start(1) > rw_col:
+                m = location.match(stripped, nxt_k)
+                if m is not None:
+                    tok = m.group(1)
+                    if (stop_before_using and tok == "using") or tok in _ADV_LOC_STOP_WORDS:
+                        return locs, m.start(1)
+                    locs.append(tok)
+                    k = m.end()
+                    continue
+        return locs, k
+
+
+def _bracket_unfolds_advance_stmt(bracket_text: str) -> bool:
+    """True when `dsimp only [<bracket_text>]` actually unfolds `advanceStmt` (or a
+    qualified / `.eq_def` form), excluding erasures `-advanceStmt`, reverse rewrites
+    `← advanceStmt`, unrelated `advanceStmt_*` lemmas, guillemet names, or argument
+    occurrences."""
+    if "advanceStmt" not in bracket_text:
+        return False
+    has_gui = "«" in bracket_text
+    for m in _advisory_regexes().advance_stmt_sym.finditer(bracket_text):
+        if has_gui and lean_lexer._inside_guillemets(bracket_text, m.start()):
+            continue
+        if _is_simp_unfold_entry(bracket_text, m.start(), m.end()):
+            return True
+    return False
+
+
+def _parse_simp_call(
+    stripped: str, s_idx: int, n: int, has_guillemets: bool = False
+) -> tuple[str, bool, int, int, bool, str, tuple[str, ...] | None, int] | None:
+    """`(tactic_kind, is_dsimp, args_start, end, has_only, bracket_text, at_locs, using_pos)`
+    of the simp-family call whose `simp` is at `s_idx` (`dsimp`, `simp`, `simp?`, `simp!`,
+    `simpa`, `simpa ? !`, `simp_all`, `simp_arith`, `simp_rw`, ...), or `None` when `simp`
+    is only part of a longer name (`foo.simp`, `simp_wf`, `my_simp`, `«simp»`). `args_start`
+    is the offset immediately past the tactic head and any `?`/`!` marks; `using_pos` is the
+    offset of `simpa`'s `using` keyword or `-1`.
+
+    `stripped[s_idx:end]` covers named argument groups (`(config := ...)`, `(disch := ...)`),
+    `+opt` / `-opt`, `only`, the `[...]` lemma list, optional `at <locs>`, and (for `simpa`)
+    the `using` term.
+    """
+    if has_guillemets and lean_lexer._inside_guillemets(stripped, s_idx):
+        return None
+    is_dsimp = False
+    if s_idx > 0:
+        before = stripped[s_idx - 1]
+        if before == "d":
+            if s_idx > 1 and (_is_ident_char(stripped[s_idx - 2]) or stripped[s_idx - 2] in ".«"):
+                return None
+            is_dsimp = True
+        elif _is_ident_char(before) or before in ".«":
+            return None
+    cur = s_idx + 4
+    variant = ""
+    if not is_dsimp:
+        for cand in _SIMP_VARIANT_TUPLE:
+            if stripped.startswith(cand, cur):
+                variant = cand
+                cur += len(cand)
+                break
+    marks_start = cur
+    while cur < n and cur - marks_start < 2 and stripped[cur] in "!?":
+        cur += 1
+    if cur < n and (_is_ident_char(stripped[cur]) or stripped[cur] in ".»"):
+        return None
+    marks = stripped[marks_start:cur]
+    # Allow same-line whitespace-separated `?` / `!` marks (e.g. `simpa ? !`, `simp !`).
+    while len(marks) < 2:
+        k_mark = cur
+        while k_mark < n and stripped[k_mark] in " \t":
+            k_mark += 1
+        if k_mark >= n or stripped[k_mark] not in "!?":
+            break
+        m_end = k_mark
+        while m_end < n and len(marks) + (m_end - k_mark) < 2 and stripped[m_end] in "!?":
+            m_end += 1
+        if m_end < n and (_is_ident_char(stripped[m_end]) or stripped[m_end] in ".«»"):
+            break
+        marks += stripped[k_mark:m_end]
+        cur = m_end
+    args_start = cur
+    tactic_kind = ("d" if is_dsimp else "") + "simp" + variant + marks
+
+    res = _advisory_regexes()
+    end = cur
+    has_only = False
+    bracket_text = ""
+    while True:
+        k = _adv_skip_ws(stripped, end, n)
+        if k >= n:
+            break
+        ch = stripped[k]
+        if ch == "[":
+            close = _adv_match_close(stripped, k, n)
+            if close != -1:
+                bracket_text = stripped[k + 1 : close]
+                end = close + 1
+            break  # the lemma list is the last argument before `at` / `using`
+        if ch == "(":
+            if res.config_item.match(stripped, k) is None:
+                break  # a parenthesised tactic or term, not an argument of this call
+            close = _adv_match_close(stripped, k, n)
+            if close == -1:
+                break
+            end = close + 1
+        elif _adv_word_at(stripped, k, "only", n):
+            has_only = True
+            end = k + 4
+        elif ch in "+-" and k + 1 < n and (stripped[k + 1].isalpha() or stripped[k + 1] == "_"):
+            k += 2
+            while k < n and (_is_ident_char(stripped[k]) or stripped[k] == "."):
+                k += 1
+            end = k
+        else:
+            break
+    step_col = _adv_step_col(stripped, s_idx)
+    at_locs: tuple[str, ...] | None = None
+    using_pos = -1
+    k = _adv_skip_ws(stripped, end, n)
+    if _adv_word_at(stripped, k, "at", n):
+        scanned_locs, k_after_at = _adv_scan_at_locations(
+            stripped, k + 2, n, step_col, stop_before_using=(variant == "a")
+        )
+        at_locs = tuple(scanned_locs)
+        end = k_after_at
+    if variant == "a":
+        k = _adv_skip_ws(stripped, end, n)
+        if _adv_word_at(stripped, k, "using", n):
+            using_pos = k
+            end = _adv_scan_to(stripped, k + 5, n, step_col + 1, _ADV_USING_STOPS)[0]
+    return tactic_kind, is_dsimp, args_start, end, has_only, bracket_text, at_locs, using_pos
+
+
+def _advance_stmt_projection_chains(
+    stripped: str, has_guillemets: bool = False
+) -> list[tuple[int, int, str]]:
+    """`(start, end, symbol)` of every uncollapsed `(advanceStmt ...)` projection chain in
+    comment- and string-blanked code: `stripped[start:end]` runs from the opening
+    parenthesis through the last projection, and `symbol` is the chain with the arguments
+    elided (`(advanceStmt ...).memory.locals`).
+
+    A chain is a parenthesised application whose head is `advanceStmt` (optionally
+    qualified, `Mir.advanceStmt`, or explicit, `@advanceStmt`; redundant outer parentheses
+    allowed) immediately followed by two or more projections. `(advanceStmt ...).memory`
+    alone, `advanceStmt'`, `advanceStmt_spec`, `advanceStmt.eq_1` and applications in which
+    `advanceStmt` is only an argument (`(f (advanceStmt s l)).memory.locals`) are not.
+    """
+    n = len(stripped)
+    find = stripped.find
+    projection = _advisory_regexes().projection
+    chains: list[tuple[int, int, str]] = []
+    pos = find("advanceStmt")
+    while pos != -1:
+        after = pos + 11
+        if (
+            (has_guillemets and lean_lexer._inside_guillemets(stripped, pos))
+            or (after < n and (_is_ident_char(stripped[after]) or stripped[after] in ".»"))
+        ):
+            pos = find("advanceStmt", after)
+            continue
+        j = pos
+        if j > 0 and stripped[j - 1] != "." and (_is_ident_char(stripped[j - 1]) or stripped[j - 1] == "«"):
+            pos = find("advanceStmt", after)
+            continue
+        while j > 0 and (stripped[j - 1] == "." or _is_ident_char(stripped[j - 1]) or stripped[j - 1] in "«»"):
+            if stripped[j - 1] == "»":
+                line_start = stripped.rfind("\n", 0, j - 1) + 1
+                g_open = stripped.rfind("«", line_start, j - 1)
+                if g_open == -1:
+                    break
+                j = g_open
+            else:
+                j -= 1
+        name = stripped[j:after]
+        if j > 0 and stripped[j - 1] == "@":
+            j -= 1
+        while j > 0 and stripped[j - 1] in _ADV_WS:
+            j -= 1
+        if j == 0 or stripped[j - 1] != "(":
+            pos = find("advanceStmt", after)
+            continue
+        open_idx = j - 1
+        close = _adv_match_close(stripped, open_idx, n)
+        if close == -1:
+            pos = find("advanceStmt", after)
+            continue
+        while True:  # redundant parentheses: `((advanceStmt ...)).memory.locals`
+            outer_close = _adv_skip_ws(stripped, close + 1, n)
+            if outer_close >= n or stripped[outer_close] != ")":
+                break
+            b = open_idx
+            while b > 0 and stripped[b - 1] in _ADV_WS:
+                b -= 1
+            if b == 0 or stripped[b - 1] != "(":
+                break
+            open_idx = b - 1
+            close = outer_close
+        k = close + 1
+        levels = 0
+        while True:
+            m = projection.match(stripped, k)
+            if m is None:
+                break
+            levels += 1
+            k = m.end()
+        if levels >= 2:
+            chains.append((open_idx, k, f"({name} ...){stripped[close + 1 : k]}"))
+        pos = find("advanceStmt", after)
+    return chains
+
+
+def _enclosing_simp_call(
+    stripped: str, a: int, b: int, n: int, has_guillemets: bool = False
+) -> tuple[str, bool] | None:
+    """`(tactic_kind, is_dsimp)` of the innermost simp-family call whose arguments contain
+    `stripped[a:b]`, or `None`."""
+    lo = a - _ADV_BACK_WINDOW if a > _ADV_BACK_WINDOW else 0
+    s = stripped.rfind("simp", lo, a)
+    calls = 0
+    while s != -1 and calls < _ADV_MAX_SIMP_CANDIDATES:
+        call = _parse_simp_call(stripped, s, n, has_guillemets)
+        if call is not None:
+            if call[3] >= b:
+                return call[0], call[1]
+            calls += 1
+        s = stripped.rfind("simp", lo, s)
+    return None
+
+
+def _call_mentions_ident(args_slice: str, ident: str, *, using_rel: int = -1) -> bool:
+    """True when `args_slice` (after the simp tactic head) references `ident` positively,
+    allowing projections (`h.symm`, `h.1`) while excluding qualified names (`Foo.h`,
+    `Foo.«h»`), pre-bracket `only` / config flags (`-zeta`, `+zeta`), named config/field
+    assignments (`zeta := false`), and simp erasures (`[-h]`). `using_rel` is the offset in
+    `args_slice` right past `simpa`'s `using` keyword, or `-1`."""
+    if not ident:
+        return False
+    is_gui = ident[0] == "«"
+    klen = len(ident)
+    n_sl = len(args_slice)
+    has_gui = "«" in args_slice
+    pos = args_slice.find(ident)
+    while pos != -1:
+        end = pos + klen
+        valid_before = pos == 0 or not (
+            _is_ident_char(args_slice[pos - 1]) or args_slice[pos - 1] in ".«»"
+        )
+        valid_after = end >= n_sl or not (
+            _is_ident_char(args_slice[end])
+            or (args_slice[end] == "«" if is_gui else args_slice[end] in "«»")
+        )
+        if (
+            valid_before
+            and valid_after
+            and (is_gui or not (has_gui and lean_lexer._inside_guillemets(args_slice, pos)))
+        ):
+            in_using = using_rel != -1 and pos >= using_rel
+            if (
+                ident == "only"
+                and not in_using
+                and "[" not in args_slice[:pos]
+                and args_slice.count("(", 0, pos) <= args_slice.count(")", 0, pos)
+            ):
+                pos = args_slice.find(ident, end)
+                continue
+            f = _adv_skip_ws(args_slice, end, n_sl)
+            if args_slice.startswith(":=", f) and not args_slice.startswith(":==", f):
+                pos = args_slice.find(ident, end)
+                continue
+            if (
+                not in_using
+                and pos > 0
+                and args_slice[pos - 1] in "+-"
+                and (pos == 1 or args_slice[pos - 2] in _ADV_WS)
+                and "[" not in args_slice[: pos - 1]
+                and args_slice.count("(", 0, pos - 1) <= args_slice.count(")", 0, pos - 1)
+            ):
+                pos = args_slice.find(ident, end)
+                continue
+            # Ignore simp erasure entries `-h` (`[-h]` / `[..., -h]`).
+            b = pos - 1
+            while b >= 0 and args_slice[b] in _ADV_WS:
+                b -= 1
+            is_erasure = False
+            if b >= 0 and args_slice[b] == "-":
+                b2 = b - 1
+                while b2 >= 0 and args_slice[b2] in _ADV_WS:
+                    b2 -= 1
+                if b2 >= 0 and args_slice[b2] in "[,":
+                    is_erasure = True
+            if not is_erasure:
+                return True
+        pos = args_slice.find(ident, end)
+    return False
+
+
+def _simp_step_at(
+    stripped: str,
+    p: int,
+    n: int,
+    has_guillemets: bool = False,
+    *,
+    targets: frozenset[str] | None = None,
+) -> tuple[str, int] | None:
+    """`(tactic_kind, offset)` when the tactic sequence starting at `p` reaches a non-`dsimp`
+    simp-family call touching `targets` before `advanceStmt` is collapsed on `targets` by
+    `dsimp`, looking through focusing bullets (`·`, `.`, `-`, `+`, `*`), `{...}` / `(...)`
+    blocks, and the combinators `try` / `all_goals` / `any_goals` / `repeat` / `focus`."""
+    step_prefix = _advisory_regexes().step_prefix
+    rem_targets = targets
+    for _ in range(8):
+        if rem_targets is not None and not rem_targets:
+            return None
+        step_col = _adv_col(stripped, p) if 0 <= p < n else 0
+        for _ in range(8):
+            if p < 0 or p >= n:
+                return None
+            ch = stripped[p]
+            if ch in "·({" or (ch in ".-+*" and p + 1 < n and stripped[p + 1] in " \t"):
+                p = _adv_skip_ws(stripped, p + 1, n)
+                if 0 <= p < n:
+                    step_col = _adv_col(stripped, p)
+                continue
+            m = step_prefix.match(stripped, p)
+            if m is None:
+                break
+            next_p = _adv_skip_ws(stripped, m.end(), n)
+            if stripped.find("\n", m.end(), next_p) != -1 and 0 <= next_p < n:
+                step_col = _adv_col(stripped, next_p)
+            p = next_p
+        if p < 0 or p >= n:
+            return None
+        s = p + 1 if stripped.startswith("dsimp", p) else p
+        if not stripped.startswith("simp", s):
+            return None
+        call = _parse_simp_call(stripped, s, n, has_guillemets)
+        if call is None:
+            return None
+        tactic_kind, is_dsimp, args_start, call_end, _, bracket_text, at_locs, using_pos = call
+        has_star = at_locs is not None and "*" in at_locs
+        loc_set = (
+            frozenset(("⊢",))
+            if not at_locs
+            else frozenset("⊢" if l in _ADV_TURNSTILES else l for l in at_locs)
+        )
+        if not is_dsimp:
+            if rem_targets is None or has_star or tactic_kind.startswith("simp_all"):
+                return tactic_kind, s
+            if rem_targets & loc_set:
+                return tactic_kind, s
+            args_slice = stripped[args_start:call_end]
+            using_rel = using_pos + 5 - args_start if using_pos != -1 else -1
+            for hyp in rem_targets:
+                if hyp != "⊢" and (
+                    _call_mentions_ident(args_slice, hyp, using_rel=using_rel)
+                    or (hyp == "this" and tactic_kind.startswith("simpa") and using_pos == -1)
+                ):
+                    return tactic_kind, s
+        else:
+            # `advanceStmt` is a plain `def` (neither `@[simp]` nor `@[reducible]`), so
+            # bare `dsimp`, `dsimp [unrelatedDef]`, and `dsimp [-advanceStmt]` leave it
+            # uncollapsed; only an explicit `advanceStmt` unfold entry collapses it.
+            if _bracket_unfolds_advance_stmt(bracket_text):
+                if rem_targets is None or has_star:
+                    return None
+                rem_targets = rem_targets - loc_set
+                if not rem_targets:
+                    return None
+        _, tok, nxt = _adv_scan_to(stripped, call_end, n, step_col + 1, _ADV_STEP_STOPS)
+        if tok in (";", "<;>"):
+            p = _adv_skip_ws(stripped, nxt, n)
+        elif tok == "\n" and _adv_col(stripped, nxt) == step_col:
+            p = nxt
+        else:
+            return None
+    return None
+
+
+def _extract_statement_bound_hyp(stripped: str, kw_end: int, stmt_end: int) -> str | None:
+    """Identifier bound by `have [h] [binders...] : ...` / `suffices [h] [binders...] : ...`,
+    or `None` when destructured (e.g. `have ⟨a, b⟩ : ...`)."""
+    n = len(stripped)
+    q = _adv_skip_ws(stripped, kw_end, stmt_end)
+    if q >= stmt_end:
+        return None
+    ident: str | None = None
+    if stripped[q] == ":" and stripped[q : q + 2] != ":=":
+        return "this"
+    if stripped[q] in "({[":
+        ident = "this"
+        after = q
+    else:
+        m = _advisory_regexes().location.match(stripped, q)
+        if m is None:
+            return None
+        cand = m.group(1)
+        if cand in _ADV_TURNSTILES or cand == "*" or cand in _ADV_LOC_STOP_WORDS:
+            return None
+        ident = cand
+        after = _adv_skip_ws(stripped, m.end(), stmt_end + 2)
+    while after < stmt_end and stripped[after] in "({[":
+        close = _adv_match_close(stripped, after, n)
+        if close == -1 or close >= stmt_end:
+            return None
+        after = _adv_skip_ws(stripped, close + 1, stmt_end + 2)
+    if after < n and stripped[after] == ":" and stripped[after : after + 2] != ":=":
+        return ident
+    return None
+
+
+def _statement_seq_col(stripped: str, kw_pos: int, col: int) -> int:
+    """When `statement_kw` at `kw_pos` immediately follows a top-level `;` or `<;>` tactic
+    separator on the same line (e.g. `  intro h; change <chain>\\n  simp` or
+    `  have h0 := 1; change <chain>\\n  simp`), return the tactic sequence's column so a
+    dedented sibling tactic at that column is checked too."""
+    line_start = stripped.rfind("\n", 0, kw_pos) + 1
+    if ";" not in stripped[line_start:kw_pos]:
+        return col
+    b = kw_pos - 1
+    while b >= line_start and stripped[b] in " \t":
+        b -= 1
+    if b < line_start or not (
+        stripped[b] == ";" or (b >= line_start + 2 and stripped[b - 2 : b + 1] == "<;>")
+    ):
+        return col
+    depth = 0
+    saw_semi = False
+    saw_term_arrow_src = False
+    arm_arrow_end = -1
+    for m in _advisory_regexes().step_token.finditer(stripped, line_start, kw_pos):
+        tok = m.group()
+        ch = tok[0]
+        if ch in ("«", "'"):
+            continue
+        if ch in "([{⟨":
+            depth += 1
+        elif ch in ")]}⟩":
+            if depth == 0:
+                return col
+            depth -= 1
+        elif depth == 0:
+            if tok == "by":
+                # A `;` after an unparenthesised `by` stays inside that `by` block rather
+                # than continuing the enclosing line's tactic sequence.
+                return col
+            if tok in (":=", "fun", "λ"):
+                saw_term_arrow_src = True
+            elif tok in (";", "<;>"):
+                saw_semi = True
+                saw_term_arrow_src = False
+            elif tok == "=>" and not saw_semi and not saw_term_arrow_src:
+                arm_arrow_end = m.end()
+    if depth != 0:
+        return col
+    if arm_arrow_end != -1:
+        k = arm_arrow_end
+        while k < kw_pos:
+            ch = stripped[k]
+            if ch in " \t·":
+                k += 1
+            elif ch in ".-+*" and k + 1 < kw_pos and stripped[k + 1] in " \t":
+                k += 1
+            else:
+                break
+        return k - line_start
+    return _adv_step_col(stripped, kw_pos)
+
+
+_TERM_LINE_END_WORDS = frozenset(
+    ("from", "exact", "apply", "refine", "return", "fun", "λ", "show", "change")
+)
+
+
+def _prev_line_ends_term_prefix(stripped: str, line_start: int) -> bool:
+    """True when the preceding non-blank line ends with `:=` / `=` / `←` / `→` or a
+    term-introducing keyword so a leading `(...)` on `line_start` continues a term."""
+    cur = line_start - 1
+    while cur >= 0 and stripped[cur] in " \t\r\n":
+        cur -= 1
+    if cur < 0:
+        return False
+    prev_start = stripped.rfind("\n", 0, cur) + 1
+    ch = stripped[cur]
+    if ch in ":=←→+*,":
+        return True
+    if ch == "-" and (cur == prev_start or stripped[cur - 1] != "|"):
+        return True
+    if _is_ident_char(ch) or ch == "λ":
+        w = cur
+        while w > prev_start and _is_ident_char(stripped[w - 1]):
+            w -= 1
+        if stripped[w : cur + 1] in _TERM_LINE_END_WORDS:
+            return True
+    return False
+
+
+def _enclosing_tactic_paren_col(stripped: str, kw_pos: int, col: int) -> int:
+    """When `statement_kw` at `kw_pos` is directly wrapped in a tactic-position `(` on the
+    same line (`  (suffices ... by ...)` or `  (change ...)`), return the enclosing step's
+    column, else `-1`."""
+    line_start = stripped.rfind("\n", 0, kw_pos) + 1
+    b = kw_pos - 1
+    while b >= line_start and stripped[b] in " \t":
+        b -= 1
+    if b < line_start or stripped[b] != "(":
+        return -1
+    b_col = b - line_start
+    step_c = _adv_step_col(stripped, b)
+    if b_col == step_c:
+        if _prev_line_ends_term_prefix(stripped, line_start):
+            return -1
+        return step_c
+    seq_c = _statement_seq_col(stripped, b, b_col)
+    return seq_c if seq_c != b_col else -1
+
+
+def _simp_after_statement(
+    stripped: str, a: int, b: int, n: int, has_guillemets: bool = False
+) -> tuple[str, int, str, int] | None:
+    """`(statement_keyword, keyword_offset, tactic_kind, simp_offset)` when `stripped[a:b]`
+    lies in the statement of a `change` / `show` / `have` / `suffices` and the following
+    tactic sequence simplifies the affected target before `advanceStmt` is collapsed."""
+    lo = a - _ADV_STATEMENT_WINDOW if a > _ADV_STATEMENT_WINDOW else 0
+    rfind = stripped.rfind
+    nearest = [(rfind(kw, lo, a), kw) for kw in _ADV_STATEMENT_KEYWORDS]
+    examined = 0
+    while examined < _ADV_MAX_STATEMENT_CANDIDATES:
+        kw_pos, statement_kw = max(nearest)
+        if kw_pos == -1:
+            return None
+        nearest[nearest.index((kw_pos, statement_kw))] = (
+            rfind(statement_kw, lo, kw_pos),
+            statement_kw,
+        )
+        if has_guillemets and lean_lexer._inside_guillemets(stripped, kw_pos):
+            continue
+        kw_end = kw_pos + len(statement_kw)
+        if kw_pos > 0 and (_is_ident_char(stripped[kw_pos - 1]) or stripped[kw_pos - 1] in ".«"):
+            continue  # `h.show`, `behave`, `«show»`
+        if _is_ident_char(stripped[kw_end]) or stripped[kw_end] in ".»":
+            continue  # `have'`, `showFoo` (`kw_end < a <= n`, so the index is valid)
+        examined += 1
+        col = _adv_col(stripped, kw_pos)
+        seq_col = _statement_seq_col(stripped, kw_pos, col)
+        min_col = seq_col if seq_col < col else col
+        end, tok, nxt = _adv_scan_to(stripped, kw_end, n, min_col + 1, _ADV_STATEMENT_STOPS)
+        if end < b:
+            continue  # this statement ends before the chain does: try an enclosing one
+        step_end = end
+        targets: frozenset[str] | None = None
+        if statement_kw in ("change", "show"):
+            targets = frozenset(("⊢",))
+        p = -1
+        entered_own_by = False
+        if tok in (":=", "from", "by"):
+            p = _adv_skip_ws(stripped, nxt, n)
+            if tok == "by":
+                entered_own_by = True
+            elif _adv_word_at(stripped, p, "by", n):
+                p = _adv_skip_ws(stripped, p + 2, n)
+                entered_own_by = True
+            else:
+                step_end, tok, nxt = _adv_scan_to(stripped, p, n, min_col + 1, _ADV_STEP_STOPS)
+                p = -1
+        elif tok == "at":
+            c_locs, after_at = _adv_scan_at_locations(stripped, nxt, n, min_col)
+            if c_locs and "*" not in c_locs:
+                targets = frozenset("⊢" if l in _ADV_TURNSTILES else l for l in c_locs)
+            else:
+                targets = None
+            step_end, tok, nxt = _adv_scan_to(stripped, after_at, n, min_col + 1, _ADV_STEP_STOPS)
+        if statement_kw == "have":
+            if entered_own_by:
+                targets = frozenset(("⊢",))
+            else:
+                hyp = _extract_statement_bound_hyp(stripped, kw_end, end)
+                targets = frozenset((hyp,)) if hyp is not None else None
+        elif statement_kw == "suffices":
+            if entered_own_by:
+                hyp = _extract_statement_bound_hyp(stripped, kw_end, end)
+                targets = frozenset((hyp,)) if hyp is not None else None
+            else:
+                targets = frozenset(("⊢",))
+        if p == -1:
+            if tok in (";", "<;>"):
+                p = _adv_skip_ws(stripped, nxt, n)
+            elif tok == "\n" and _adv_col(stripped, nxt) in (col, seq_col):
+                p = nxt
+            elif tok == ")" and step_end < n and stripped[step_end] == ")":
+                wrap_col = _enclosing_tactic_paren_col(stripped, kw_pos, col)
+                if wrap_col != -1:
+                    _, tok_w, nxt_w = _adv_scan_to(
+                        stripped, step_end + 1, n, wrap_col + 1, _ADV_STEP_STOPS
+                    )
+                    if tok_w in (";", "<;>"):
+                        p = _adv_skip_ws(stripped, nxt_w, n)
+                    elif tok_w == "\n" and _adv_col(stripped, nxt_w) in (col, seq_col, wrap_col):
+                        p = nxt_w
+        step = (
+            _simp_step_at(stripped, p, n, has_guillemets, targets=targets)
+            if p != -1
+            else None
+        )
+        if step is None and statement_kw == "suffices" and entered_own_by and p != -1:
+            post_p = -1
+            if stripped[p] in "({":
+                close_grp = _adv_match_close(stripped, p, n)
+                if close_grp != -1:
+                    _, tok2, nxt2 = _adv_scan_to(
+                        stripped, close_grp + 1, n, min_col + 1, _ADV_STEP_STOPS
+                    )
+                    if tok2 in (";", "<;>"):
+                        post_p = _adv_skip_ws(stripped, nxt2, n)
+                    elif tok2 == "\n" and _adv_col(stripped, nxt2) in (col, seq_col):
+                        post_p = nxt2
+            elif _adv_col(stripped, p) > min_col:
+                end2, tok2, nxt2 = _adv_scan_to(stripped, p, n, min_col + 1, _ADV_NO_STOPS)
+                if tok2 == "\n" and _adv_col(stripped, nxt2) in (col, seq_col):
+                    post_p = nxt2
+                elif tok2 == ")" and end2 < n and stripped[end2] == ")":
+                    wrap_col = _enclosing_tactic_paren_col(stripped, kw_pos, col)
+                    if wrap_col != -1:
+                        _, tok3, nxt3 = _adv_scan_to(
+                            stripped, end2 + 1, n, wrap_col + 1, _ADV_STEP_STOPS
+                        )
+                        if tok3 in (";", "<;>"):
+                            post_p = _adv_skip_ws(stripped, nxt3, n)
+                        elif tok3 == "\n" and _adv_col(stripped, nxt3) in (
+                            col,
+                            seq_col,
+                            wrap_col,
+                        ):
+                            post_p = nxt3
+            if post_p != -1:
+                step = _simp_step_at(
+                    stripped, post_p, n, has_guillemets, targets=frozenset(("⊢",))
+                )
+        if step is None:
+            continue  # inner term/statement did not lead to `simp`: try an enclosing one
+        return statement_kw, kw_pos, step[0], step[1]
+    return None
+
+
+def _is_in_first_arm(stripped: str, line_start: int, t: int) -> bool:
+    """True when `try` at `t` sits inside an inline `first | ...` arm at the same bracket
+    depth on the current line, so a following standalone `|` begins the next `first`
+    alternative rather than continuing `try`."""
+    if stripped.find("|", line_start, t) == -1:
+        return False
+    group_start = line_start
+    open_stack: list[int] = []
+    # Per-depth state `[active_first_arm, in_fun_binder]`.
+    state_by_depth: dict[int, list[bool]] = {0: [False, False]}
+    for m in _advisory_regexes().step_token.finditer(stripped, line_start, t):
+        tok = m.group()
+        ch = tok[0]
+        if ch in ("«", "'"):
+            continue
+        if ch in "([{⟨":
+            open_stack.append(m.end())
+            state_by_depth[len(open_stack)] = [False, False]
+        elif ch in ")]}⟩":
+            if open_stack:
+                state_by_depth.pop(len(open_stack), None)
+                open_stack.pop()
+            else:
+                group_start = m.end()
+                state_by_depth[0] = [False, False]
+        else:
+            d = len(open_stack)
+            g_lo = open_stack[-1] if d > 0 else group_start
+            st = state_by_depth.setdefault(d, [False, False])
+            if tok in ("fun", "λ"):
+                st[1] = True
+            elif tok in (";", "<;>"):
+                st[1] = False
+            elif tok == "=>":
+                if st[1]:
+                    st[1] = False
+                else:
+                    st[0] = False
+            elif tok == "|":
+                st[1] = False
+                p_pos = m.start()
+                b = p_pos - 1
+                while b >= g_lo and stripped[b] in " \t":
+                    b -= 1
+                if b < g_lo and d == 0:
+                    st[0] = True
+                elif b >= g_lo + 4 and stripped[b - 4 : b + 1] == "first":
+                    before_f = b - 5
+                    if before_f < 0 or not (
+                        _is_ident_char(stripped[before_f]) or stripped[before_f] in ".«"
+                    ):
+                        st[0] = True
+    return state_by_depth.get(len(open_stack), [False, False])[0]
+
+
+def _is_non_tactic_try(stripped: str, t: int) -> bool:
+    """True when `try` at `t` sits immediately after a term-position operator or keyword
+    on the same line (e.g. `have _ := try (by ...)`), so it is a term rather than the
+    `try` tactic. Line-leading `-`, `+`, `*` are focusing bullets, not binary operators."""
+    line_start = stripped.rfind("\n", 0, t) + 1
+    b = t - 1
+    while b >= line_start and stripped[b] in " \t":
+        b -= 1
+    if b < line_start:
+        return False
+    ch = stripped[b]
+    if ch in _ADV_NON_TACTIC_BEFORE_TRY_CHARS:
+        if ch in "-+*" and all(c in " \t" for c in stripped[line_start:b]):
+            return False
+        return True
+    if _is_ident_char(ch) or ch == "λ":
+        w_start = b
+        while w_start > line_start and _is_ident_char(stripped[w_start - 1]):
+            w_start -= 1
+        if stripped[w_start : b + 1] in _ADV_NON_TACTIC_BEFORE_TRY_WORDS:
+            return True
+    return False
+
+
+def _try_rewrite_hyp_before_target(
+    stripped: str, has_guillemets: bool = False
+) -> list[tuple[int, str, tuple[str, ...]]]:
+    """`(at_offset, rewrite_tactic, locations)` for every `rw` / `erw` / `rewrite` / `rwa`
+    under a `try` whose location list names a hypothesis before the goal (`⊢` or `|-`).
+
+    Every rewrite of the `try`'s tactic sequence counts, since a failure anywhere in the
+    sequence rolls all of it back: the tactic right after `try` (through `(` / `{` or
+    combinators such as `all_goals`), later steps after `;` / `<;>`, and the steps of a
+    parenthesised or indented block.
+    """
+    res = _advisory_regexes()
+    n = len(stripped)
+    find = stripped.find
+    rw_head = res.rw_head
+    config_item = res.config_item
+    flat_line = res.flat_line
+    next_line = res.next_line
+    hits: list[tuple[int, str, tuple[str, ...]]] = []
+    seen: set[int] = set()
+
+    def consider(head: re.Match[str]) -> None:
+        h_pos = head.start()
+        if h_pos in seen:
+            return
+        seen.add(h_pos)
+        if has_guillemets and lean_lexer._inside_guillemets(stripped, h_pos):
+            return
+        k = _adv_skip_ws(stripped, head.end(), n)
+        while k < n:
+            ch = stripped[k]
+            if ch == "(":
+                if config_item.match(stripped, k) is None:
+                    return
+                close = _adv_match_close(stripped, k, n)
+                if close == -1:
+                    return
+                k = _adv_skip_ws(stripped, close + 1, n)
+            elif ch in "+-" and k + 1 < n and (stripped[k + 1].isalpha() or stripped[k + 1] == "_"):
+                k += 2
+                while k < n and (_is_ident_char(stripped[k]) or stripped[k] == "."):
+                    k += 1
+                k = _adv_skip_ws(stripped, k, n)
+            else:
+                break
+        if k >= n or stripped[k] != "[":
+            return
+        close = _adv_match_close(stripped, k, n)
+        if close == -1:
+            return
+        at_pos = _adv_skip_ws(stripped, close + 1, n)
+        if not _adv_word_at(stripped, at_pos, "at", n):
+            return
+        rw_col = _adv_step_col(stripped, h_pos)
+        locs, _ = _adv_scan_at_locations(stripped, at_pos + 2, n, rw_col)
+        for i, loc in enumerate(locs):
+            if loc in _ADV_TURNSTILES:
+                if any(prev != "*" for prev in locs[:i]):
+                    hits.append((at_pos, head.group(1), tuple(locs)))
+                return
+
+    after_try = 0
+    while True:
+        t = find("try", after_try)
+        if t == -1:
+            break
+        after_try = t + 3
+        if t > 0 and (_is_ident_char(stripped[t - 1]) or stripped[t - 1] in ".«"):
+            continue  # `h.try`, `retry`, `«try»`
+        if after_try < n and (_is_ident_char(stripped[after_try]) or stripped[after_try] in ".»"):
+            continue  # `try?`, `tryFoo`
+        if has_guillemets and lean_lexer._inside_guillemets(stripped, t):
+            continue
+        if _is_non_tactic_try(stripped, t):
+            continue
+        try_col = _adv_step_col(stripped, t)
+        t_col = _adv_col(stripped, t)
+        first = _adv_skip_ws(stripped, after_try, n)
+        if first >= n or stripped[first] in ":)]}⟩,=":
+            continue
+        has_nl_after_try = find("\n", after_try, first) != -1
+        first_col = _adv_col(stripped, first)
+        if has_nl_after_try and first_col <= try_col:
+            if stripped[first] in "({":
+                close = _adv_match_close(stripped, first, n)
+                scope_end = close if close != -1 else min(n, first + _ADV_SCAN_LIMIT)
+            else:
+                continue  # `try` with no indented tactic block before a sibling step
+        else:
+            # Only treat a subsequent standalone `|` as ending `try`'s scope when `try`
+            # itself sits inside an inline `first | ...` arm; otherwise `|` inside `try`
+            # belongs to a nested `cases` / `match` / `first` / `rcases` tactic.
+            line_start = stripped.rfind("\n", 0, t) + 1
+            in_first_arm = _is_in_first_arm(stripped, line_start, t)
+            same_line_stops = (
+                _ADV_TRY_STOPS if (in_first_arm and not has_nl_after_try) else _ADV_NO_STOPS
+            )
+            min_indent = first_col if has_nl_after_try else min(first_col, t_col + 1)
+            infix_min = min(min_indent, try_col + 1)
+            if not has_nl_after_try and not in_first_arm and stripped[first] not in "({":
+                flat = flat_line.match(stripped, first)
+                if flat is not None:
+                    flat_end = flat.end()
+                    line = next_line.match(stripped, flat_end + 1) if flat_end < n else None
+                    nxt_ind = (
+                        -1
+                        if (line is None or line.end() >= n)
+                        else line.end() - line.start(1)
+                    )
+                    if nxt_ind < infix_min or (
+                        nxt_ind < min_indent
+                        and not stripped[first:flat_end].rstrip(" \t\r").endswith("<|>")
+                    ):
+                        if find("w", first, flat_end) != -1:
+                            for head in rw_head.finditer(stripped, first, flat_end):
+                                consider(head)
+                        continue
+            scope_end = _adv_scan_to(
+                stripped,
+                first,
+                n,
+                min_indent,
+                _ADV_NO_STOPS,
+                same_line_stops=same_line_stops,
+                infix_min_indent=infix_min,
+            )[0]
+        if find("w", first, scope_end) != -1:
+            for head in rw_head.finditer(stripped, first, scope_end):
+                consider(head)
+    return hits
+
+
+def scan_projection_and_rewrite_order_hazards(
+    text: str, *, stripped: str | None = None
+) -> list[ProofHealthFinding]:
+    """Advisory findings (`ADVISORY_RULES`) for two proof-scaling traps, sorted by line.
+
+    Purely structural and fast (no Lean process); comments, strings and guillemet names
+    never match. Pass `stripped` when `strip_lean_comments_and_strings(text)` is already
+    at hand (a value of the wrong length is ignored and the text is lexed again).
+
+    `simp_deep_projection_chain` (`leanprover/lean4#16532`). Until the toolchain carries the
+    fix, `Simp.simpProj` builds and typechecks a `fun s => e = s.i` motive at every level of
+    an uncollapsed projection chain. A chain is `(advanceStmt ...)` followed directly by two
+    or more projections, e.g. `(advanceStmt s locals mem).memory.locals` or
+    `(advanceStmt s locals).frame.stmtIdx` (see `_advance_stmt_projection_chains`). It is
+    reported in two situations, never for `dsimp` (definitional unfolding builds no motive):
+
+    * sub-rule `projection_in_simp_arguments`, at the chain's line: the chain is written
+      inside a `simp` / `simp only` / `simp?` / `simpa` / `simp_all` / `simp_arith` /
+      `simp_rw` call, that is in its `[...]` lemma list, a `(config := ...)` /
+      `(disch := ...)` argument, or the term after `simpa ... using`. The innermost
+      enclosing simp-family call decides, so a chain inside `dsimp only [...]` is exempt.
+    * sub-rule `simp_after_projection_statement`, at the `simp` call's line: a `change`,
+      `show`, `have` or `suffices` states the chain and the first tactic step after the
+      statement is such a call (or follows a `dsimp only [...]` step that omitted
+      `advanceStmt`; see `_simp_after_statement`), so `simp` meets the chain in the goal or
+      hypothesis just introduced. A `dsimp only [advanceStmt, ...]` step in between
+      collapses the chain first and silences the finding.
+
+    `try_rw_hyp_before_target`, at the line of the `at` clause: `try rw [...] at h ⊢`
+    (also `erw`, `rewrite`, `rwa`; `|-` for `⊢`; any rewrite in the `try`'s sequence or
+    block) lists a hypothesis before the goal. `rw` then runs `kabstract` over the
+    hypotheses first, and when the goal rewrite fails `try` rolls that work back. Not
+    reported: the goal first (`at ⊢ h`), no goal (`at h`), `at *`, or no `try` (a plain
+    `rw [...] at h ⊢` is expected to succeed everywhere).
+    """
+    has_chain_name = "advanceStmt" in text
+    has_try = "try" in text and ("⊢" in text or "|-" in text)
+    if not has_chain_name and not has_try:
+        return []
+    if stripped is None or len(stripped) != len(text):
+        stripped = strip_lean_comments_and_strings(text)
+    n = len(stripped)
+    has_guillemets = "«" in stripped
+    line_of = _LineCounter(stripped)
+    found: dict[tuple[str, int, str, str], ProofHealthFinding] = {}
+
+    if has_chain_name and "advanceStmt" in stripped:
+        why = (
+            "`Simp.simpProj` builds and typechecks a `fun s => e = s.i` motive at every "
+            "projection level (leanprover/lean4#16532)."
+        )
+        for a, b, symbol in _advance_stmt_projection_chains(stripped, has_guillemets):
+            call = _enclosing_simp_call(stripped, a, b, n, has_guillemets)
+            if call is not None:
+                tactic_kind, is_dsimp = call
+                if is_dsimp:
+                    continue
+                line = line_of(a)
+                found.setdefault(
+                    (RULE_SIMP_DEEP_PROJECTION_CHAIN, line, symbol, SUBRULE_PROJECTION_IN_SIMP_ARGS),
+                    ProofHealthFinding(
+                        RULE_SIMP_DEEP_PROJECTION_CHAIN,
+                        line,
+                        f"Uncollapsed projection chain `{symbol}` inside `{tactic_kind}`: {why}",
+                        "Collapse the projections definitionally first with "
+                        f"`dsimp only [advanceStmt, ...]`, then run `{tactic_kind}` without "
+                        "the chain.",
+                        symbol,
+                        subrule=SUBRULE_PROJECTION_IN_SIMP_ARGS,
+                    ),
+                )
+                continue
+            after = _simp_after_statement(stripped, a, b, n, has_guillemets)
+            if after is None:
+                continue
+            statement_kw, _, tactic_kind, simp_pos = after
+            line = line_of(simp_pos)
+            found.setdefault(
+                (
+                    RULE_SIMP_DEEP_PROJECTION_CHAIN,
+                    line,
+                    symbol,
+                    SUBRULE_SIMP_AFTER_PROJECTION_STATEMENT,
+                ),
+                ProofHealthFinding(
+                    RULE_SIMP_DEEP_PROJECTION_CHAIN,
+                    line,
+                    f"`{tactic_kind}` runs right after `{statement_kw}` stated the uncollapsed "
+                    f"projection chain `{symbol}`: {why}",
+                    f"Insert `dsimp only [advanceStmt, ...]` between `{statement_kw}` and "
+                    f"`{tactic_kind}` so the projections collapse definitionally first.",
+                    symbol,
+                    subrule=SUBRULE_SIMP_AFTER_PROJECTION_STATEMENT,
+                ),
+            )
+
+    if has_try and "try" in stripped and ("⊢" in stripped or "|-" in stripped):
+        for at_pos, rewrite_kw, locs in _try_rewrite_hyp_before_target(stripped, has_guillemets):
+            line = line_of(at_pos)
+            written = " ".join(locs)
+            goal_at = next(i for i, loc in enumerate(locs) if loc in _ADV_TURNSTILES)
+            reordered = " ".join((locs[goal_at],) + locs[:goal_at] + locs[goal_at + 1 :])
+            symbol = f"try {rewrite_kw} [...] at {written}"
+            found.setdefault(
+                (RULE_TRY_RW_HYP_BEFORE_TARGET, line, symbol, ""),
+                ProofHealthFinding(
+                    RULE_TRY_RW_HYP_BEFORE_TARGET,
+                    line,
+                    f"`{symbol}` rewrites the hypotheses before the goal: when the rewrite "
+                    f"fails on `{locs[goal_at]}`, the `kabstract` work already done at "
+                    f"`{' '.join(locs[:goal_at])}` is rolled back and wasted.",
+                    f"List the goal first (`at {reordered}`) so a failing goal rewrite aborts "
+                    "before any hypothesis is traversed.",
+                    symbol,
+                ),
+            )
+
+    return sorted(found.values(), key=lambda f: (f.line, f.rule, f.symbol, f.subrule))
 
 
 def default_cache_path() -> Path:
@@ -3638,6 +4870,8 @@ def compute_unbatched_tool_latencies(
             else:
                 unbatched.append(entry)
                 by_tool_unbatched.setdefault(tname, []).append(r["duration_ms"])
+
+    import statistics  # deferred: telemetry only, keeps cold hook imports fast
 
     unbatched_durs = [e["duration_ms"] for e in unbatched]
     mean_ms = statistics.mean(unbatched_durs) if unbatched_durs else None
@@ -7654,13 +8888,18 @@ def scan_file(
     *,
     scan_siblings: bool = True,
     include_unannotated_vacuity: bool = False,
+    include_advisories: bool = False,
 ) -> list[ProofHealthFinding]:
-    """Scan one `.lean` (rules 1-7) or `.rs` (rule 6) file."""
+    """Scan one `.lean` (rules 1-7, plus advisory rules with `include_advisories`) or
+    `.rs` (rule 6) file."""
     path = Path(file_path)
     if path.suffix == ".rs":
         return scan_rust_file(path)
     return scan_lean_file(
-        path, scan_siblings=scan_siblings, include_unannotated_vacuity=include_unannotated_vacuity
+        path,
+        scan_siblings=scan_siblings,
+        include_unannotated_vacuity=include_unannotated_vacuity,
+        include_advisories=include_advisories,
     )
 
 
@@ -7704,12 +8943,15 @@ def _iter_cli_files(raw: str) -> list[Path]:
 
 
 _CLI_USAGE = (
-    "Usage: proof_health.py [--json] [--all-theorems] [--compute-pins] [--no-siblings] "
-    "<file.lean|file.rs|directory> [...]\n"
+    "Usage: proof_health.py [--json] [--all-theorems] [--advisories] [--compute-pins] "
+    "[--no-siblings] <file.lean|file.rs|directory> [...]\n"
     "  Scans Lean files for rules 1-7 and Rust files for rule 6; exits 0 when clean,\n"
     "  1 on findings, 2 on usage or I/O errors.\n"
     "  --json          machine-readable report ({ok, finding_count, files_scanned, counts, findings})\n"
     "  --all-theorems  apply every rule 7 check to every theorem (include_unannotated_vacuity)\n"
+    "  --advisories    also report advisory rules on Lean files (simp_deep_projection_chain,\n"
+    "                  try_rw_hyp_before_target); advisories are marked (`advisory:` / JSON\n"
+    "                  `\"advisory\": true`, `advisory_count`) and never fail the exit status\n"
     "  --compute-pins  print the expected `pin:sha256:<12hex>` of every Lean declaration and\n"
     "                  doc-commented Rust item instead of scanning\n"
     "  --no-siblings   skip sibling `.lean` files for rule 5"
@@ -7719,7 +8961,7 @@ _CLI_USAGE = (
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint (`0` = clean, `1` = findings, `2` = usage / I/O error)."""
     args = list(sys.argv[1:] if argv is None else argv)
-    json_mode = all_theorems = compute_pins = False
+    json_mode = all_theorems = compute_pins = advisories = False
     scan_siblings = True
     raw_paths: list[str] = []
     for arg in args:
@@ -7727,6 +8969,8 @@ def main(argv: list[str] | None = None) -> int:
             json_mode = True
         elif arg == "--all-theorems":
             all_theorems = True
+        elif arg == "--advisories":
+            advisories = True
         elif arg == "--compute-pins":
             compute_pins = True
         elif arg == "--no-siblings":
@@ -7773,9 +9017,17 @@ def main(argv: list[str] | None = None) -> int:
 
     all_findings: list[dict[str, Any]] = []
     counts = {rule: 0 for rule in ALL_RULES}
+    if advisories:
+        counts.update({rule: 0 for rule in ADVISORY_RULES})
+    advisory_count = 0
     for f in files:
         try:
-            findings = scan_file(f, scan_siblings=scan_siblings, include_unannotated_vacuity=all_theorems)
+            findings = scan_file(
+                f,
+                scan_siblings=scan_siblings,
+                include_unannotated_vacuity=all_theorems,
+                include_advisories=advisories,
+            )
         except OSError as error:
             print(f"error: cannot read {f}: {error}", file=sys.stderr)
             return 2
@@ -7783,27 +9035,31 @@ def main(argv: list[str] | None = None) -> int:
             counts[finding.rule] = counts.get(finding.rule, 0) + 1
             entry = finding.to_dict()
             entry["file"] = str(f)
+            is_advisory = finding.rule in _ADVISORY_RULE_SET
+            if is_advisory:
+                entry["advisory"] = True
+                advisory_count += 1
             all_findings.append(entry)
             if not json_mode:
                 tag = f"{finding.rule}/{finding.subrule}" if finding.subrule else finding.rule
+                if is_advisory:
+                    tag = "advisory:" + tag
                 print(
                     f"{f}:{finding.line}: [{tag}] ({finding.symbol}) {finding.message} "
                     f"Suggestion: {finding.suggestion}"
                 )
-    ok = not all_findings
+    ok = len(all_findings) == advisory_count
     if json_mode:
-        print(
-            json.dumps(
-                {
-                    "ok": ok,
-                    "finding_count": len(all_findings),
-                    "files_scanned": len(files),
-                    "counts": counts,
-                    "findings": all_findings,
-                },
-                indent=2,
-            )
-        )
+        report: dict[str, Any] = {
+            "ok": ok,
+            "finding_count": len(all_findings),
+            "files_scanned": len(files),
+            "counts": counts,
+            "findings": all_findings,
+        }
+        if advisories:
+            report["advisory_count"] = advisory_count
+        print(json.dumps(report, indent=2))
     return 0 if ok else 1
 
 
