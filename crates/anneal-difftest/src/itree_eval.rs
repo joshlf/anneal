@@ -3278,9 +3278,15 @@ where
             break;
         }
     }
-    // Only candidates that are still unconfirmed ran out (a candidate whose
-    // budget was spent in a round that confirmed it is not reported).
-    out_of_replacements.retain(|fn_name| confirm_stage.failed_fns.contains(fn_name));
+    // Only candidates with zero confirmed traces ran out (a partially-confirmed
+    // candidate still appears in `failed_fns` for its earlier inconclusive
+    // traces, so filter against candidates with any confirmed trace).
+    let confirmed_fns: BTreeSet<&str> = confirm_cases
+        .iter()
+        .filter(|c| confirm_stage.results.contains_key(case_key(c)))
+        .filter_map(|c| case_to_fn.get(case_key(c)).map(String::as_str))
+        .collect();
+    out_of_replacements.retain(|fn_name| !confirmed_fns.contains(fn_name.as_str()));
     if !out_of_replacements.is_empty() {
         confirm_stage.errors.push(format!(
             "ItreeDiffBatchConfirm: {} candidate(s) still unconfirmed after \
@@ -11801,6 +11807,183 @@ mod tests {
                 ("f11".to_string(), 2),
                 ("f12".to_string(), 3)
             ])
+        );
+    }
+
+    /// Randomized end-to-end audit of [`run_itree_confirm_with_replacements`]
+    /// over 500 multi-trace pools mixing `ok` and diverging traces, healthy /
+    /// heavy / rejected / timed-out outcomes, `max_ok` limits, chunk sizes, and
+    /// 1 or 2 workers:
+    /// - no unhealthy trace is ever confirmed;
+    /// - no candidate receives more than
+    ///   [`ITREE_MAX_REPLACEMENT_TRACES_PER_CANDIDATE`] replacement traces;
+    /// - no candidate with an unconfirmed divergence is ever replaced or
+    ///   admitted by [`itree_partially_comparable_fns`];
+    /// - every partially-comparable candidate has at least one kernel-confirmed
+    ///   trace and zero kernel rejections;
+    /// - selected traces never duplicate and every `.lean` label across all
+    ///   rounds stays unique.
+    #[test]
+    fn stage2_confirm_with_replacements_invariants_hold_on_random_pools() {
+        let mut rng = TestRng(0xA4B4_C0DE_5EED_9187);
+        let mut saw_replacement = 0usize;
+        let mut saw_budget_exhausted = 0usize;
+        let mut saw_partial = 0usize;
+        let mut saw_unconfirmed_div = 0usize;
+        for scenario in 0..500 {
+            let n_fns = 4 + rng.below(17) as usize;
+            let traces_per_fn = 2 + rng.below(7) as usize;
+            let max_ok = [1usize, 2, 4, 16][rng.below(4) as usize];
+            let chunk_size = [4usize, 8, 16][rng.below(3) as usize];
+            let jobs = 1 + rng.below(2) as usize;
+            let profile = rng.below(4);
+
+            let mut pool = Vec::new();
+            let mut case_to_fn = BTreeMap::new();
+            let mut kinds = BTreeMap::new();
+            let mut is_div = BTreeSet::new();
+            for f in 0..n_fns {
+                let fn_name = format!("f{f:02}");
+                let perm_heavy = profile == 2 && rng.below(4) == 0;
+                for t in 0..traces_per_fn {
+                    let key = format!("case_{fn_name}_t{t}");
+                    let kind = if perm_heavy {
+                        MockCase::Heavy
+                    } else {
+                        match rng.below(10) {
+                            0..=3 => MockCase::Heavy,
+                            4 => MockCase::TimedOut,
+                            5 if profile != 1 => MockCase::Rejected,
+                            _ => MockCase::Healthy,
+                        }
+                    };
+                    if rng.below(12) == 0 {
+                        is_div.insert(key.clone());
+                    }
+                    case_to_fn.insert(key.clone(), fn_name.clone());
+                    kinds.insert(key.clone(), kind);
+                    pool.push(key);
+                }
+            }
+            // Mirror `evaluate_itree_entries`: select every divergence plus the
+            // first trace of every candidate.
+            let mut initial_selected = Vec::new();
+            let mut seen_fn: BTreeSet<String> = BTreeSet::new();
+            let mut initial_count_by_fn: BTreeMap<String, usize> = BTreeMap::new();
+            for case in &pool {
+                let fn_name = &case_to_fn[case];
+                if is_div.contains(case) || seen_fn.insert(fn_name.clone()) {
+                    initial_selected.push(case.clone());
+                    *initial_count_by_fn.entry(fn_name.clone()).or_insert(0) += 1;
+                }
+            }
+            let mut selected = initial_selected.clone();
+            let runs = MockLeanRuns::default();
+            let stage = run_itree_confirm_with_replacements(
+                &mut selected,
+                &pool,
+                chunk_size,
+                jobs,
+                ident,
+                &case_to_fn,
+                |c| !is_div.contains(c),
+                |label: &str, slice: &[String]| {
+                    runs.lock()
+                        .unwrap()
+                        .push((label.to_string(), slice.to_vec()));
+                    mock_confirm_oracle(&kinds, max_ok, label, slice)
+                },
+            );
+            let runs = runs.into_inner().unwrap();
+            let ctx = format!(
+                "scenario={scenario} n_fns={n_fns} traces_per_fn={traces_per_fn} \
+                 max_ok={max_ok} chunk_size={chunk_size} jobs={jobs} profile={profile}"
+            );
+
+            // 1. Selected traces never duplicate and every label across all rounds is unique.
+            let unique_selected: BTreeSet<&String> = selected.iter().collect();
+            assert_eq!(unique_selected.len(), selected.len(), "dup select: {ctx}");
+            let labels: Vec<String> = runs.iter().map(|(l, _)| l.clone()).collect();
+            assert_labels_unique_file_stems(&labels);
+
+            // 2. Only healthy traces are confirmed.
+            for key in stage.results.keys() {
+                assert_eq!(kinds[key], MockCase::Healthy, "`{key}` confirmed: {ctx}");
+            }
+
+            // 3. Per-candidate replacement cap is never exceeded, and no candidate
+            //    with an unconfirmed divergence is ever replaced.
+            let mut final_count_by_fn: BTreeMap<String, usize> = BTreeMap::new();
+            for c in &selected {
+                *final_count_by_fn.entry(case_to_fn[c].clone()).or_insert(0) += 1;
+            }
+            if selected.len() > initial_selected.len() {
+                saw_replacement += 1;
+            }
+            for (fn_name, &final_cnt) in &final_count_by_fn {
+                let init_cnt = initial_count_by_fn[fn_name];
+                let added = final_cnt - init_cnt;
+                assert!(
+                    added <= ITREE_MAX_REPLACEMENT_TRACES_PER_CANDIDATE,
+                    "`{fn_name}` got {added} replacements: {ctx}"
+                );
+                let has_unconfirmed_div = initial_selected.iter().any(|c| {
+                    &case_to_fn[c] == fn_name
+                        && is_div.contains(c)
+                        && !stage.results.contains_key(c)
+                });
+                if has_unconfirmed_div {
+                    saw_unconfirmed_div += 1;
+                    assert_eq!(
+                        added, 0,
+                        "candidate `{fn_name}` with unconfirmed divergence was replaced: {ctx}"
+                    );
+                }
+            }
+            if stage
+                .errors
+                .iter()
+                .any(|e| e.contains("inconclusive replacement trace(s) each"))
+            {
+                saw_budget_exhausted += 1;
+            }
+
+            // 4. Every partially-comparable candidate has >=1 confirmed trace,
+            //    zero kernel rejections, and zero unconfirmed divergences.
+            let partial = itree_partially_comparable_fns(&stage, &selected, ident, &case_to_fn, |c| {
+                !is_div.contains(c)
+            });
+            if !partial.is_empty() {
+                saw_partial += 1;
+            }
+            for fn_name in partial.keys() {
+                let fn_sel: Vec<&String> = selected
+                    .iter()
+                    .filter(|c| &case_to_fn[*c] == fn_name)
+                    .collect();
+                assert!(
+                    fn_sel.iter().any(|c| stage.results.contains_key(*c)),
+                    "partial `{fn_name}` has 0 confirmed traces: {ctx}"
+                );
+                for c in fn_sel {
+                    if !stage.results.contains_key(c) {
+                        assert!(!is_div.contains(c), "partial `{fn_name}` dropped div `{c}`");
+                        assert_ne!(
+                            kinds[c],
+                            MockCase::Rejected,
+                            "partial `{fn_name}` dropped rejection `{c}`"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_replacement > 100
+                && saw_budget_exhausted > 20
+                && saw_partial > 100
+                && saw_unconfirmed_div > 20,
+            "randomized pool audit must cover all branches: repl={saw_replacement} \
+             exhausted={saw_budget_exhausted} partial={saw_partial} div={saw_unconfirmed_div}"
         );
     }
 }
