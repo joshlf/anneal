@@ -614,11 +614,45 @@ def exactRigidTyByteSizeProto?
         | true => intrinsicRigidTyByteSize localDecls layouts ty
 
 /--
+Whether `l`, the explicit `LayoutTable` entry named by a type's `layoutIdx`, is
+CONSISTENT with that type's kind: when the kind has a target-aware structural
+size (`exactRigidTyByteSizeProto?`), the entry must have exactly that size; a
+pointer kind whose width is not structurally known must have a 1- or 2-word
+entry; ADTs, closures, and tuples / arrays without a structural size (e.g.
+containing `usize` on a 32-bit table) are described by their entry alone.
+
+An inconsistent index would otherwise be trusted over the type it annotates.
+`Places.tyExactByteAlign?` applies the same rule (it uses the direct layout's
+alignment only when the entry's size equals the type's structural size), and
+`Bytes.rigidTyByteSize` consults the kind before the index for the same reason.
+-/
+@[reducible]
+def explicitLayoutConsistentProto
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (kind : RigidTy)
+    (l : TypeLayout) :
+    Bool :=
+  let ptrBytes := layoutPointerBytes layouts
+  match exactRigidTyByteSizeProto? localDecls layouts kind with
+  | .some sz => Nat.beq sz l.size.bytes
+  | .none =>
+    match kind with
+    | .ref _ _ | .rawPtr _ _ =>
+      Bool.or (Nat.beq l.size.bytes ptrBytes) (Nat.beq l.size.bytes (Nat.mul 2 ptrBytes))
+    | .adt _ _ | .closure _ _ | .tuple _ | .array _ _ => true
+    | _ => false
+
+/--
 Target-aware exact byte size of a resolved `Ty` (such as a borrowed sub-place
 type in `resolveLiveMemEndpointProto`):
 - Unsized types return `.none` (never trusting a partial prefix layout).
 - An explicit non-unresolved `LayoutTable` entry `ty.layoutIdx` is consulted
-  FIRST (before `Bytes.rigidTyByteSize`, which hard-codes 8 for `usize`/pointers).
+  FIRST (before `Bytes.rigidTyByteSize`, which hard-codes 8 for `usize`/pointers),
+  but only when it is consistent with `ty.kind`
+  (`explicitLayoutConsistentProto`); an inconsistent entry yields `.none`, so a
+  mislabeled field type can never widen a Tree Borrows tag window over a
+  sibling field.
 - Otherwise delegates to `exactRigidTyByteSizeProto?` (with `rigidTyByteSize`
   fallback when `rigidTyLayoutDeterminedProto` holds).
 -/
@@ -632,7 +666,10 @@ def exactTyByteSizeProto?
   | true => .none
   | false =>
     match Bool.not (isUnresolvedLayoutIdx layouts ty.layoutIdx), LayoutTable.lookup layouts ty.layoutIdx with
-    | true, .some l => .some l.size.bytes
+    | true, .some l =>
+      match explicitLayoutConsistentProto localDecls layouts ty.kind l with
+      | true => .some l.size.bytes
+      | false => .none
     | _, _ =>
       match exactRigidTyByteSizeProto? localDecls layouts ty.kind with
       | .some sz => .some sz
@@ -645,9 +682,13 @@ def exactTyByteSizeProto?
 Target-aware exact root allocation alignment for a local `rootTy`:
 - Unsized types return `.none`.
 - An explicit non-unresolved `LayoutTable` entry `rTy.layoutIdx` with
-  power-of-two `align.bytes` is trusted FIRST (handling e.g. 32-bit `u64` or
+  power-of-two `align.bytes` is trusted FIRST when it is consistent with the
+  root's kind (`explicitLayoutConsistentProto`), handling e.g. 32-bit `u64` or
   `usize` locals whose compiler layout specifies `align = 4`, which
-  `tyExactByteAlign?` would reject due to 64-bit size comparison).
+  `tyExactByteAlign?` would reject due to 64-bit size comparison. An
+  inconsistent entry (a `u8` local labeled with a 4-aligned 8-byte layout) is
+  ignored, exactly as `tyExactByteAlign?` ignores it: trusting it would accept
+  misaligned accesses and base-address-dependent `ptr_mask` results as safe.
 - Otherwise gates `tyExactByteAlign?` on
   `rigidTyLayoutDeterminedProto localDecls layouts true 8 rTy.kind` so 32-bit
   locals without explicit layouts (such as `u64` or `usize` on `i686`) fail
@@ -666,7 +707,11 @@ def exactRootAllocAlignProto?
     let explicitOpt : Option Nat :=
       match Bool.not (isUnresolvedLayoutIdx layouts rTy.layoutIdx), LayoutTable.lookup layouts rTy.layoutIdx with
       | true, .some l =>
-        match isPowerOfTwoNatProto l.align.bytes with
+        match
+          Bool.and
+            (explicitLayoutConsistentProto localDecls layouts rTy.kind l)
+            (isPowerOfTwoNatProto l.align.bytes)
+        with
         | true => .some l.align.bytes
         | false => .none
       | _, _ => .none
@@ -7243,6 +7288,35 @@ theorem layoutDataMaskProto_array_union_no_fields_none
     cases fieldCount with
     | zero => rfl
     | succ k => rfl
+
+/--
+**Inconsistent Layout Index Rejection Theorem**: for EVERY type `ty` whose
+`layoutIdx` names a resolved entry `l` that disagrees with the target-aware
+structural size `sz` of `ty.kind`, `exactTyByteSizeProto?` answers `.none`, and
+`exactRootAllocAlignProto?` never reads `l.align`: the tag window of a borrow
+through such a sub-place is undetermined (fail closed), never widened by `l`.
+-/
+theorem exactTyByteSizeProto?_rejects_inconsistent_explicit
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (ty : Ty) (l : TypeLayout) (sz : Nat)
+    (hSized : isUnsizedRigidTy 8 ty.kind = false)
+    (hRes : isUnresolvedLayoutIdx layouts ty.layoutIdx = false)
+    (hLook : LayoutTable.lookup layouts ty.layoutIdx = .some l)
+    (hStruct : exactRigidTyByteSizeProto? localDecls layouts ty.kind = .some sz)
+    (hNe : Nat.beq sz l.size.bytes = false) :
+    exactTyByteSizeProto? localDecls layouts ty = .none ∧
+    explicitLayoutConsistentProto localDecls layouts ty.kind l = false := by
+  have hCons : explicitLayoutConsistentProto localDecls layouts ty.kind l = false := by
+    unfold explicitLayoutConsistentProto
+    dsimp only
+    rw [hStruct]
+    exact hNe
+  refine ⟨?_, hCons⟩
+  unfold exactTyByteSizeProto?
+  rw [hSized]
+  dsimp only
+  rw [hRes, hLook]
+  simp only [Bool.not_false]
+  rw [hCons]
 
 /--
 **`black_box` Preservation Theorem**:

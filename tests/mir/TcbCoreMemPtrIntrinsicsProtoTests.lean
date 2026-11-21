@@ -2782,7 +2782,81 @@ theorem a3_universal_theorems_non_vacuous :
       ⟨2⟩ (.int 16 false)
       rfl rfl rfl (by decide) rfl rfl rfl rfl rfl rfl
 
-/-! ## Section 18: Non-Vacuity Witnesses & Mechanical Standard-Axiom Gate -/
+/-! ## Section 18: Pass B4 Regression & Soundness Witnesses -/
+
+/-- Layout fixtures for pass B4: idx 1 `u8`; idx 2 an 8-byte, 4-aligned struct `(u32, u32)`;
+idx 3 `u16`; idx 4 `S3 = (u8, u8, u16)` (offsets `[0, 1, 2]`, size 4); idx 5 `u32`. -/
+def b4Layouts : LayoutTable :=
+  { pointerBits := 64
+    isLittleEndian := true
+    entries :=
+      [ { size := ⟨0⟩, align := ⟨1⟩, fields := .arbitrary [] [], variants := .single 0,
+          backendRepr := .memory, isUninhabited := false },
+        { size := ⟨1⟩, align := ⟨1⟩, fields := .primitive, variants := .single 0,
+          backendRepr := .scalar (.initialized (.int 8 false) ⟨0, 255⟩), isUninhabited := false },
+        { size := ⟨8⟩, align := ⟨4⟩, fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1], variants := .single 0,
+          backendRepr := .memory, fieldLayouts := [5, 5], isUninhabited := false },
+        { size := ⟨2⟩, align := ⟨2⟩, fields := .primitive, variants := .single 0,
+          backendRepr := .scalar (.initialized (.int 16 false) ⟨0, 65535⟩), isUninhabited := false },
+        { size := ⟨4⟩, align := ⟨2⟩, fields := .arbitrary [⟨0⟩, ⟨1⟩, ⟨2⟩] [0, 1, 2], variants := .single 0,
+          backendRepr := .memory, fieldLayouts := [1, 1, 3], isUninhabited := false },
+        { size := ⟨4⟩, align := ⟨4⟩, fields := .primitive, variants := .single 0,
+          backendRepr := .scalar (.initialized (.int 32 false) ⟨0, 4294967295⟩), isUninhabited := false } ] }
+
+/-- 18(a): an explicit layout index that is INCONSISTENT with the type it annotates is never
+trusted over the type (pass A3 trusted it unconditionally):
+- a `u8` local labeled with the 8-byte, 4-aligned entry idx 2: `copy::<u32>` with `count = 0`
+  through a pointer to it is `.ub` (a `u8` local is only 1-aligned, so some placement is
+  misaligned), not a successful no-op; `ptr_mask(p, !3)` is `.unsupported` (the mask touches base
+  address bits of a 1-aligned allocation), not the unchanged pointer;
+- borrow `tag 1` of `s.0` whose field type `u8` carries idx 2 (8 bytes) inside `S3 = (u8, u8, u16)`:
+  writing `s.1` through `tag 1` is `.unsupported` (tag window undetermined) instead of succeeding
+  while the sibling borrow `tag 2` of `s.1` stays `.unique` (missed Tree Borrows invalidation);
+- a correctly labeled `u8` local (idx 1) keeps working: `copy::<u8>` copies;
+- `exactTyByteSizeProto?` answers `.some 1` for the consistent label and `.none` for the
+  inconsistent one. -/
+theorem inconsistent_explicit_layout_index_not_trusted :
+    let u8Bogus : Ty := { kind := .uint .u8, layoutIdx := 2 }
+    let u8L : Ty := { kind := .uint .u8, layoutIdx := 1 }
+    let declsR := [mkDecl unitTy, mkDecl u8Bogus, mkDecl u8L]
+    let localsR : List LocalSlot := [.uninit, .init (mkU8 1), .init (mkU8 7)]
+    let bR (t l : Nat) : BorrowEntry := { tag := t, targetLocal := l, targetProjection := [], perm := .unique }
+    let sR := mkState localsR [bR 1 1, bR 2 2]
+    let p (t o : Nat) : Value := .ptr { allocId := t, offsetBytes := o } 8
+    let rCopyZero := evalCopyProto sR (mkTarget "core::intrinsics::copy" [.uint .u32]) declsR b4Layouts []
+      [p 1 0, p 1 0, mkUsize 0] localsR dstLocal0 (.some 1)
+    let rMask := evalPtrMaskProto sR declsR b4Layouts [p 1 0, mkUsize 18446744073709551612] localsR dstLocal0 (.some 1)
+    let rCopyOk := evalCopyProto sR (mkTarget "core::intrinsics::copy" [.uint .u8]) declsR b4Layouts []
+      [p 2 0, p 1 0, mkUsize 1] localsR dstLocal0 (.some 1)
+    let s3Ty : Ty := { kind := .adt "tests::S3" [], layoutIdx := 4 }
+    let declsW := [mkDecl unitTy, mkDecl s3Ty, mkDecl u8L]
+    let localsW : List LocalSlot := [.uninit, .init (.aggregate 0 [mkU8 1, mkU8 2, .scalar ⟨3, 2⟩]), .init (mkU8 9)]
+    let bA : BorrowEntry := { tag := 1, targetLocal := 1, targetProjection := [.field 0 u8Bogus], perm := .unique }
+    let bB : BorrowEntry := { tag := 2, targetLocal := 1, targetProjection := [.field 1 u8L], perm := .unique }
+    let bS : BorrowEntry := { tag := 3, targetLocal := 2, targetProjection := [], perm := .frozen }
+    let rWindow := evalCopyProto (mkState localsW [bA, bB, bS]) (mkTarget "core::intrinsics::copy" [.uint .u8])
+      declsW b4Layouts [] [p 3 0, p 1 1, mkUsize 1] localsW dstLocal0 (.some 1)
+    isUbNode rCopyZero = true ∧
+    isUnsupportedNode rMask = true ∧
+    stepLocals? rCopyOk = .some [.init .unit, .init (mkU8 7), .init (mkU8 7)] ∧
+    isUnsupportedNode rWindow = true ∧
+    exactTyByteSizeProto? declsW b4Layouts u8L = .some 1 ∧
+    exactTyByteSizeProto? declsW b4Layouts u8Bogus = .none := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- 18(b): non-vacuity witness for `exactTyByteSizeProto?_rejects_inconsistent_explicit`
+(all premises satisfied by the `u8` type labeled with the 8-byte entry idx 2). -/
+theorem b4_universal_theorems_non_vacuous :
+    let entry2 : TypeLayout :=
+      { size := ⟨8⟩, align := ⟨4⟩, fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1], variants := .single 0,
+        backendRepr := .memory, fieldLayouts := [5, 5], isUninhabited := false }
+    exactTyByteSizeProto? [] b4Layouts { kind := .uint .u8, layoutIdx := 2 } = .none ∧
+    explicitLayoutConsistentProto [] b4Layouts (.uint .u8) entry2 = false := by
+  exact exactTyByteSizeProto?_rejects_inconsistent_explicit [] b4Layouts { kind := .uint .u8, layoutIdx := 2 }
+    { size := ⟨8⟩, align := ⟨4⟩, fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1], variants := .single 0,
+      backendRepr := .memory, fieldLayouts := [5, 5], isUninhabited := false } 1 rfl rfl rfl rfl rfl
+
+/-! ## Section 19: Non-Vacuity Witnesses & Mechanical Standard-Axiom Gate -/
 
 /--
 Non-vacuity witness instantiating EVERY universally quantified theorem in
@@ -2996,6 +3070,8 @@ theorem all_proto_and_test_theorems :
   have _ := custom_dst_wide_tuple_and_32bit_slice_meta_validity
   have _ := ptr_offset_from_u64_on_32bit_and_const_eval_select_all_8_intrinsics
   have _ := a3_universal_theorems_non_vacuous
+  have _ := inconsistent_explicit_layout_index_not_trusted
+  have _ := b4_universal_theorems_non_vacuous
   have _ := non_vacuity_all_quantified_theorems
   exact ⟨rfl, compareUnsignedBytesProto_eq_miriBytesCompareSpec, ptrMask_baseAddr_invariant,
     evalPtrOffsetFromDistanceProto_eq_miriSpec, misaligned_offset_has_misaligned_placement, trivial⟩
@@ -3145,6 +3221,8 @@ elab "#assert_proto_standard_axioms " ids:ident* : command => do
   custom_dst_wide_tuple_and_32bit_slice_meta_validity
   ptr_offset_from_u64_on_32bit_and_const_eval_select_all_8_intrinsics
   a3_universal_theorems_non_vacuous
+  inconsistent_explicit_layout_index_not_trusted
+  b4_universal_theorems_non_vacuous
   non_vacuity_all_quantified_theorems
   all_proto_and_test_theorems
 
