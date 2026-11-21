@@ -9014,7 +9014,9 @@ theorem uninhabitedRef_retag_ub (t n : Nat) :
 /-- **Stage 3 fails closed on a global-allocation fat slice.** A `&[u8]`
 whose pointer targets an untracked `globals` allocation (`lookupBorrow =
 none`, `lookupGlobalAlloc = some _`) is rejected by `prepFnEntryRetagAny`
-with `.unsupported` (fail-closed boundary). -/
+with `.unsupported`, even though the trusted `stepMirFn` retags it as a
+no-op step. The divergence is conservative: Stage 3 proves nothing about
+this state instead of claiming an outcome the machine does not produce. -/
 theorem globalAllocFatSlice_retag_fails_closed (n : Nat) :
     let gAlloc : CapturedAllocation :=
       { allocId := 1
@@ -9031,9 +9033,11 @@ theorem globalAllocFatSlice_retag_fails_closed (n : Nat) :
             activeCallee := some protCallee
             nextProtector := n } }
     (prepFnEntryRetagAny protCallee 1).run s =
-      .error (FailReq.fail .unsupported) s := by
+        .error (FailReq.fail .unsupported) s ∧
+      stepMirFn protCallee s =
+        MirStepNode.step { s with frame := { s.frame with stmtIdx := 1 } } := by
   intro gAlloc s
-  rfl
+  exact ⟨rfl, rfl⟩
 
 /-! ### Stage 3: multi-parameter retag pipelines -/
 
@@ -11541,6 +11545,34 @@ end
 
 end Anneal.DualCorrespondenceAndTbPruningTests.FrameWp
 
+namespace Anneal.DualCorrespondenceAndTbPruningTests.Audit
+
+open Lean in
+/-- Syntactically trivial propositions under binders and conjunctions:
+`True`, reflexive `a = a` and `a ↔ a`, and conjunctions of trivial
+propositions. A bounded worklist (256 steps, far above any statement here)
+keeps the definition non-recursive, so no `_unsafe_rec` twin is emitted. -/
+def trivialProp (e : Expr) : Bool := Id.run do
+  let mut todo : List Expr := [e]
+  for _ in [0:256] do
+    match todo with
+    | [] => return true
+    | x :: rest =>
+      todo := rest
+      match x with
+      | .forallE _ _ b _ => todo := b :: todo
+      | .mdata _ b => todo := b :: todo
+      | .const ``True _ => pure ()
+      | .app (.app (.const ``And _) a) b => todo := a :: b :: todo
+      | .app (.app (.app (.const ``Eq _) _) a) b =>
+        unless a == b do return false
+      | .app (.app (.const ``Iff _) a) b =>
+        unless a == b do return false
+      | _ => return false
+  return todo.isEmpty
+
+end Anneal.DualCorrespondenceAndTbPruningTests.Audit
+
 /-! ## G. Cross-root kernel bridge
 
 The LeanMiri correspondence modules and the vendored `Miri` interpreter are
@@ -12745,7 +12777,8 @@ run_cmd do
       | .defnInfo v =>
         if v.safety != .safe then throwError "cross-root: {n} is not safe"
       | .thmInfo _ =>
-        if ci.type.isConstOf ``True then
+        if Anneal.DualCorrespondenceAndTbPruningTests.Audit.trivialProp
+            ci.type then
           throwError "cross-root: {n} is trivial"
       | _ => throwError "cross-root: {n} is not a definition or theorem"
       for a in ← collectAxioms n do
@@ -12810,7 +12843,7 @@ run_cmd do
       maxHeartbeats := 0 }
   let ((replayed, added, bundles, rejected, crAxioms), _) ←
     liftCoreM <| (act.toIO ctx { env := baseEnv })
-  unless replayed ≥ 400 && added ≥ 100 && bundles = 12 && rejected = 18 do
+  unless replayed ≥ 850 && added ≥ 105 && bundles = 12 && rejected = 18 do
     throwError "cross-root: unexpected counts \
       (replayed={replayed}, added={added}, bundles={bundles}, \
       rejected={rejected})"
@@ -12833,6 +12866,8 @@ open Lean Elab Command in
 run_cmd do
   let env ← getEnv
   let testNs := `Anneal.DualCorrespondenceAndTbPruningTests
+  let trivialProp :=
+    Anneal.DualCorrespondenceAndTbPruningTests.Audit.trivialProp
   let modules : List (Name × Nat × Nat) :=
     [(`Anneal.DualCorrespondenceBundle, 700, 228),
      (`Anneal.TreeBorrowsPruningAndFrameWp, 950, 378)]
@@ -12856,16 +12891,26 @@ run_cmd do
     | .recInfo v => v.isUnsafe
     | .thmInfo _ => false
     | .quotInfo _ => false
-  -- Trivial `: True` theorem detector.
+  -- Trivial theorem detector: `True` for every theorem, and additionally
+  -- reflexive `=` / `↔` and conjunctions of trivialities, under any binders,
+  -- for every non-internal theorem (compiler-abstracted `_proof_*` field
+  -- obligations are legitimately reflexive).
   let isTrivialThm (ci : ConstantInfo) : Bool :=
     match ci with
-    | .thmInfo v => v.type.isConstOf ``True
+    | .thmInfo v =>
+      v.type.isConstOf ``True || (!ci.name.isInternal && trivialProp v.type)
     | _ => false
-  -- Lazy equational lemma detector for imported definitions in `map₂`.
+  -- Lazy equational lemma (`*.eq_*` / `*.eq_def`) that Lean synthesizes on
+  -- demand in `map₂` for a definition imported from another module.
   let isLazyEq (n : Name) (ci : ConstantInfo) : Bool :=
     let leaf := match n with | .str _ s => s | _ => ""
+    let parentImportedDef :=
+      (env.getModuleIdxFor? n.getPrefix).isSome &&
+        (match env.find? n.getPrefix with
+          | some (.defnInfo _) => true
+          | _ => false)
     (match ci with | .thmInfo _ => true | _ => false) &&
-    (leaf.startsWith "eq_" || leaf == "eq_def")
+    (leaf.startsWith "eq_" || leaf == "eq_def") && parentImportedDef
   -- Private declaration belonging to `ns`.
   let isPrivateIn (ns : Name) (n : Name) : Bool :=
     match Lean.privateToUserName? n with
@@ -12893,7 +12938,7 @@ run_cmd do
       if rejected ci then
         throwError "audit: test declaration {n} is not a safe definition"
       if isTrivialThm ci then
-        throwError "audit: test theorem {n} has trivial type `True`"
+        throwError "audit: test theorem {n} is trivial"
       roots := roots.push n
     else if !n.isInternal then
       -- Lean lazily synthesizes equational lemmas (`*.eq_*` / `*.eq_def`)
@@ -12909,7 +12954,7 @@ run_cmd do
       if isTrivialThm ci then
         throwError "audit: trivial internal theorem {n}"
       auxDecls := auxDecls.push n
-  unless roots.size ≥ 1500 do
+  unless roots.size ≥ 2000 do
     throwError "audit: only {roots.size} test declarations"
   let testAxioms ← scanAxioms (roots ++ auxDecls)
   unless constructive testAxioms do
@@ -12928,6 +12973,8 @@ run_cmd do
           throwError "audit: {n} is not a safe definition"
         decls := decls.push n
         if let .thmInfo _ := ci then
+          if isTrivialThm ci then
+            throwError "audit: {modName} theorem {n} is trivial"
           if !n.isInternal then pubThms := pubThms.push n
     unless decls.size ≥ minDecls do
       throwError "audit: {modName} has only {decls.size} declarations"
@@ -12959,6 +13006,38 @@ run_cmd do
     unless isTrivialThm ci do
       throwError "audit self-test: trivial `: True` theorem was not detected"
   | none => throwError "audit self-test: `trivial` is missing"
+  match env.find? ``Iff.rfl, env.find? ``Nat.add_comm with
+  | some refl, some comm =>
+    unless isTrivialThm refl && !isTrivialThm comm do
+      throwError "audit self-test: reflexive theorem classifier failed"
+  | _, _ => throwError "audit self-test: `Iff.rfl` is missing"
+  -- Reflexive, conjunctive, and binder-wrapped trivialities are flagged,
+  -- and genuine statements are not.
+  let natTy := mkConst ``Nat
+  let eqN (a b : Nat) : Expr :=
+    mkApp3 (mkConst ``Eq [1]) natTy (mkNatLit a) (mkNatLit b)
+  let trivialShapes : List Expr :=
+    [eqN 1 1, mkApp2 (mkConst ``Iff) (mkConst ``False) (mkConst ``False),
+      mkApp2 (mkConst ``And) (mkConst ``True) (eqN 2 2),
+      .forallE `n natTy (mkApp3 (mkConst ``Eq [1]) natTy (.bvar 0) (.bvar 0))
+        .default]
+  for e in trivialShapes do
+    unless trivialProp e do
+      throwError "audit self-test: trivial proposition {e} was not detected"
+  for e in [eqN 1 2, mkApp2 (mkConst ``And) (mkConst ``True) (eqN 1 2),
+      mkConst ``False] do
+    if trivialProp e then
+      throwError "audit self-test: genuine proposition {e} was flagged"
+  -- A theorem named like an equational lemma whose parent is not an
+  -- imported definition is a stray declaration, not a lazy lemma.
+  match env.find? ``Nat.add_comm, env.find? ``Nat.add with
+  | some thm, some _ =>
+    unless isLazyEq (``Nat.add ++ `eq_1) thm do
+      throwError "audit self-test: a lazy equational lemma was rejected"
+    if isLazyEq (`Other ++ `eq_1) thm ||
+        isLazyEq (``Nat.add_comm ++ `eq_1) thm then
+      throwError "audit self-test: a stray `eq_` theorem was accepted"
+  | _, _ => throwError "audit self-test: `Nat.add_comm` is missing"
   match env.find? ``Nat.add with
   | some ci =>
     unless !testNs.isPrefixOf ``Nat.add && !isLazyEq ``Nat.add ci do
