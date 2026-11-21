@@ -114,13 +114,11 @@ local elab "#assert_standard_axioms " ids:ident* : command => do
     throwError "expected exactly 50 audited public theorems, got {listed.size}"
   for (c, _) in env.constants.map₂.toList do
     if !Lean.isPrivateName c then
-      let s := c.toString
-      let isAux :=
-        (s.splitOn "._proof_").length > 1 ||
-        (s.splitOn "._simp_").length > 1 ||
-        (s.splitOn ".match_").length > 1 ||
-        (s.splitOn "_aux_").length > 1 ||
-        s.endsWith ".eq_1"
+      -- Compiler/elaborator auxiliaries (`._proof_N`, `._simp_N`, `_aux_…` elab rules,
+      -- `._sparseCasesOn_N`, …) all have an internal (`_`-prefixed) name component; matchers are
+      -- recognized structurally. No substring heuristics, so e.g. a leaked public
+      -- `Miri.Memory.Allocation.foo_aux_bar` or `….match_spec` is still rejected.
+      let isAux := c.isInternalDetail || Lean.Meta.isMatcherCore env c
       if !isAux && !listed.contains c then
         throwError "unexpected extra public declaration {c} in LeanMiriSpec.MemoryLemmas"
 
@@ -3938,8 +3936,9 @@ They cover multi-block `.Lazy` → `.Materialized` `InitMask` transitions (`64` 
 boundaries), `ProvenanceMap` operations, `fromBytes` / `tryNew` (`.Uninit` and `.Zero`), framed
 `writeBytes`, `writeUninit`, zero-length writes, `getBytesUnchecked` size/subrange/split,
 `getBytesStripProvenance`, little- and big-endian integer and pointer `writeScalar` / `readScalar`
-roundtrips, `withExtra` / `mapExtra` commutations, and cross-allocation plus same-allocation
-`copy` and `copyRepeatedly`. -/
+roundtrips, `withExtra` / `mapExtra` commutations, cross-allocation plus same-allocation
+`copy` and `copyRepeatedly`, and kernel-evaluated concrete 64-bit `InitMask` word layouts
+(set and clear writes straddling word boundaries, and the full-overwrite collapse to `.Lazy`). -/
 
 namespace LeanMiriSpec.MemoryLemmas.NonVacuity
 open Miri.ABI Miri.Memory
@@ -4397,6 +4396,44 @@ private theorem wit_copy_and_copyRepeatedly :
     decide
   exact ⟨src, d0, d1, d2, d3, hsrc, hd0, hc1, hc2, hb2_22, hb2_02, hd2_10,
     hc3, by simpa using hb3_46, hb3_04, his3_46, his3_02, hd3_10⟩
+
+/-- 7. Concrete 64-bit word layouts, evaluated by the kernel (no `native_decide`): a `.Lazy` →
+`.Materialized` write straddling both the 64- and 128-byte word boundaries
+(`[60, 140)` ↦ words `0xF000000000000000`, `0xFFFFFFFFFFFFFFFF`, `0xFFF`, `0`), a `.Materialized`
+clearing write straddling byte 64 (`[62, 66)` ↦ `0x3000000000000000`, `0xFFFFFFFFFFFFFFFC`), and a
+full overwrite collapsing back to `.Lazy`; plus `get_ok_of_wellFormed` on the non-trivial
+`.Materialized` branch, whose `WellFormed` capacity premise (`200 ≤ 4 * 64`) is discharged on the
+concrete mask. -/
+private theorem wit_initMask_word_layout :
+    (InitMask.new (Size.ofBytes 200) false).setRange
+        (allocRange (Size.ofBytes 60) (Size.ofBytes 80)) true =
+      .ok ⟨.Materialized ⟨#[0xF000000000000000, 0xFFFFFFFFFFFFFFFF, 0xFFF, 0]⟩, Size.ofBytes 200⟩ ∧
+    (⟨.Materialized ⟨#[0xF000000000000000, 0xFFFFFFFFFFFFFFFF, 0xFFF, 0]⟩, Size.ofBytes 200⟩ :
+        InitMask).setRange (allocRange (Size.ofBytes 62) (Size.ofBytes 4)) false =
+      .ok ⟨.Materialized ⟨#[0x3000000000000000, 0xFFFFFFFFFFFFFFFC, 0xFFF, 0]⟩, Size.ofBytes 200⟩ ∧
+    (⟨.Materialized ⟨#[0x3000000000000000, 0xFFFFFFFFFFFFFFFC, 0xFFF, 0]⟩, Size.ofBytes 200⟩ :
+        InitMask).setRange (allocRange Size.ZERO (Size.ofBytes 200)) true =
+      .ok (InitMask.new (Size.ofBytes 200) true) ∧
+    (⟨.Materialized ⟨#[0x3000000000000000, 0xFFFFFFFFFFFFFFFC, 0xFFF, 0]⟩, Size.ofBytes 200⟩ :
+        InitMask).get (Size.ofBytes 61) = .ok true ∧
+    (⟨.Materialized ⟨#[0x3000000000000000, 0xFFFFFFFFFFFFFFFC, 0xFFF, 0]⟩, Size.ofBytes 200⟩ :
+        InitMask).get (Size.ofBytes 62) = .ok false ∧
+    (⟨.Materialized ⟨#[0x3000000000000000, 0xFFFFFFFFFFFFFFFC, 0xFFF, 0]⟩, Size.ofBytes 200⟩ :
+        InitMask).get (Size.ofBytes 65) = .ok false ∧
+    (⟨.Materialized ⟨#[0x3000000000000000, 0xFFFFFFFFFFFFFFFC, 0xFFF, 0]⟩, Size.ofBytes 200⟩ :
+        InitMask).get (Size.ofBytes 66) = .ok true ∧
+    ∃ b, (⟨.Materialized ⟨#[0x3000000000000000, 0xFFFFFFFFFFFFFFFC, 0xFFF, 0]⟩,
+        Size.ofBytes 200⟩ : InitMask).get (Size.ofBytes 199) = .ok b := by
+  have hwf : InitMask.WriteProof.WellFormed
+      (⟨.Materialized ⟨#[0x3000000000000000, 0xFFFFFFFFFFFFFFFC, 0xFFF, 0]⟩, Size.ofBytes 200⟩ :
+        InitMask) := by
+    simp only [InitMask.WriteProof.WellFormed]; decide
+  -- The elaborator's `whnf` does not reliably evaluate the `Nat.lor`/`Nat.land` word updates on
+  -- these 64-bit literals, so the concrete layouts are checked by kernel reduction
+  -- (`decide +kernel`: a kernel-checked `Decidable` evaluation, no `Lean.ofReduceBool`).
+  exact ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+    by decide +kernel, by decide +kernel, by decide +kernel,
+    InitMask.WriteProof.get_ok_of_wellFormed _ (Size.ofBytes 199) hwf (by decide)⟩
 
 end LeanMiriSpec.MemoryLemmas.NonVacuity
 
