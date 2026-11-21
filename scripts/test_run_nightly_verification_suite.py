@@ -160,6 +160,30 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         self.assertEqual(mr["shallow_types_translated"], 100)
         self.assertEqual(mr["interp_anchored_items"], 108)
         self.assertGreater(mr["audited_declarations"], 500)
+        # `interp_anchored_items` counts the well-formed `tokenSha256` pins of
+        # `MiniRustSpec/Anchors.lean`. Recount them independently of the suite: a malformed
+        # hash would drop out of its count silently, and an item pinned twice would inflate
+        # it without anchoring anything new, so neither may hide behind the pinned total.
+        anchors_text = (REPO_ROOT / "minirust/lean/MiniRustSpec/Anchors.lean").read_text(
+            encoding="utf-8"
+        )
+        anchors = re.findall(
+            r'file\s*:=\s*"([^"]+)"[^{}]*?name\s*:=\s*"([^"]+)"\s*,\s*line\s*:=\s*(\d+)\s*,'
+            r'\s*tokenSha256\s*:=\s*"([^"]*)"',
+            anchors_text,
+        )
+        self.assertEqual(len(anchors), mr["interp_anchored_items"])
+        self.assertEqual(len(re.findall(r"tokenSha256\s*:=", anchors_text)), len(anchors))
+        self.assertEqual(len({anchor[:3] for anchor in anchors}), len(anchors))
+        for file, name, line, token_sha256 in anchors:
+            self.assertRegex(token_sha256, r"\A[0-9a-f]{64}\Z", f"{file}:{line} {name}")
+        # The derived share is computed from the same two totals.
+        self.assertLessEqual(mr["interp_anchored_items"], mr["spec_items_total"])
+        self.assertEqual(
+            mr["interp_anchored_pct_of_items"],
+            round(100.0 * mr["interp_anchored_items"] / mr["spec_items_total"], 2),
+        )
+        self.assertLessEqual(mr["shallow_types_translated"], mr["shallow_types_candidates"])
 
         lm = stage_a["lean_miri_authority"]
         self.assertEqual(lm["vendored_miri_files"], 608)

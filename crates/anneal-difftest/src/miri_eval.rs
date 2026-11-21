@@ -12588,6 +12588,134 @@ pub fn cand_shadow() -> u32 {
         );
     }
 
+    /// `-M` stays strictly below the RSS budget for every budget the two Lean
+    /// stages can resolve (stage caps, `ANNEAL_MIRI_LEAN_MAX_RSS_MIB` overrides
+    /// including saturating ones, worker counts, and cgroup headroom), is the
+    /// exact floor of the heap share (KiB -> MiB never rounds up into the
+    /// reserve), and never decreases as the budget grows.
+    #[test]
+    fn miri_lean_max_mb_keeps_strict_headroom_for_every_resolved_stage_budget() {
+        const MIB_KIB: u64 = 1024;
+        const GIB_KIB: u64 = 1024 * 1024;
+
+        // 1. Dense sweep over budgets that are not MiB-aligned.
+        for stage_cap_mb in [CONFIRM_LEAN_MEMORY_MB_CAP, PROBE_LEAN_MEMORY_MB_CAP] {
+            let mut prev_mb = 0u64;
+            let mut rss_kib = 64 * MIB_KIB + 1;
+            while rss_kib <= 20 * GIB_KIB {
+                let max_mb = miri_lean_max_mb_for_rss_budget_kib(stage_cap_mb, rss_kib);
+                let ctx = format!("stage_cap_mb={stage_cap_mb} rss_kib={rss_kib} max_mb={max_mb}");
+                assert!((64..=stage_cap_mb).contains(&max_mb), "{ctx}");
+                assert!(max_mb * 1024 < rss_kib, "{ctx}");
+                assert!(
+                    max_mb >= prev_mb,
+                    "a larger budget lowered -M from {prev_mb}: {ctx}"
+                );
+                prev_mb = max_mb;
+                if rss_kib >= 512 * MIB_KIB {
+                    assert!(max_mb >= 256, "{ctx}");
+                }
+                if rss_kib >= 4 * GIB_KIB {
+                    assert!(rss_kib - max_mb * 1024 >= GIB_KIB, "{ctx}");
+                    if max_mb < stage_cap_mb {
+                        // Exactly the 1 GiB reserve, minus at most the floor remainder.
+                        assert!(rss_kib - max_mb * 1024 < GIB_KIB + 1024, "{ctx}");
+                    }
+                }
+                rss_kib += 29_989;
+            }
+        }
+
+        // 2. Every budget `miri_lean_rss_budget_kib` can resolve for either stage.
+        for (rss_cap_mib, mem_cap_mb) in [
+            (CONFIRM_LEAN_RSS_BUDGET_MIB, CONFIRM_LEAN_MEMORY_MB_CAP),
+            (PROBE_LEAN_RSS_BUDGET_MIB, PROBE_LEAN_MEMORY_MB_CAP),
+        ] {
+            for override_mib in [
+                None,
+                Some("abc"),
+                Some("0"),
+                Some("1"),
+                Some("512"),
+                Some("6000"),
+                Some("16384"),
+                Some("18446744073709551615"),
+            ] {
+                for jobs in [0usize, 1, 2, 8] {
+                    for avail_kib in [
+                        None,
+                        Some(0),
+                        Some(GIB_KIB),
+                        Some(5946 * MIB_KIB),
+                        Some(64 * GIB_KIB),
+                        Some(u64::MAX),
+                    ] {
+                        let budget_kib =
+                            miri_lean_rss_budget_kib(rss_cap_mib, override_mib, jobs, avail_kib);
+                        let max_mb = miri_lean_max_mb_for_rss_budget_kib(mem_cap_mb, budget_kib);
+                        let ctx = format!(
+                            "rss_cap_mib={rss_cap_mib} override={override_mib:?} jobs={jobs} \
+                             avail_kib={avail_kib:?} budget_kib={budget_kib} max_mb={max_mb}"
+                        );
+                        assert!(budget_kib >= 512 * MIB_KIB, "{ctx}");
+                        assert!((256..=mem_cap_mb).contains(&max_mb), "{ctx}");
+                        assert!(max_mb.saturating_mul(1024) < budget_kib, "{ctx}");
+                        if budget_kib >= 4 * GIB_KIB {
+                            assert!(budget_kib - max_mb * 1024 >= GIB_KIB, "{ctx}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. The capsule guard that OOM-killed the suite (`MemoryMax=5946M`): one
+        //    worker's budget stays below the cgroup limit, and `-M` leaves 1 GiB.
+        let capsule_avail = Some(5946 * MIB_KIB);
+        let probe_budget =
+            miri_lean_rss_budget_kib(PROBE_LEAN_RSS_BUDGET_MIB, None, 1, capsule_avail);
+        let confirm_budget =
+            miri_lean_rss_budget_kib(CONFIRM_LEAN_RSS_BUDGET_MIB, None, 1, capsule_avail);
+        assert_eq!(probe_budget, 5946 * MIB_KIB / 100 * 85);
+        assert_eq!(confirm_budget, 4096 * MIB_KIB);
+        assert!(probe_budget < 5946 * MIB_KIB && confirm_budget < 5946 * MIB_KIB);
+        assert_eq!(
+            miri_lean_max_mb_for_rss_budget_kib(PROBE_LEAN_MEMORY_MB_CAP, probe_budget),
+            (probe_budget - GIB_KIB) / 1024
+        );
+        assert_eq!(
+            miri_lean_max_mb_for_rss_budget_kib(CONFIRM_LEAN_MEMORY_MB_CAP, confirm_budget),
+            3072
+        );
+    }
+
+    /// A live-Lean test that fails while holding the oracle lock (as
+    /// `semantic_mutant_probes_agree_live_and_known_provenance_gaps_stay_pinned`
+    /// now does around its plain pipeline) must not take the other live-Lean
+    /// tests down with it: the poisoned mutex is recovered, and the file lock is
+    /// released when the panicking holder's handle is dropped.
+    #[test]
+    fn live_lean_oracle_lock_recovers_after_a_holder_panics() {
+        let holder = std::thread::spawn(|| {
+            let _lean_guard = acquire_live_lean_oracle_lock();
+            panic!("simulated live-Lean test failure while holding the oracle lock");
+        });
+        assert!(
+            holder.join().is_err(),
+            "the holder thread must have panicked"
+        );
+
+        // Neither a poison panic nor a deadlock on the file lock, on this thread ...
+        let (guard, lock_file) = acquire_live_lean_oracle_lock();
+        drop(guard);
+        drop(lock_file);
+        // ... or on another one.
+        std::thread::spawn(|| {
+            let _lean_guard = acquire_live_lean_oracle_lock();
+        })
+        .join()
+        .expect("a later acquisition must not observe the poison");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn rss_budget_watchdog_captures_output_kills_process_trees_and_classifies_exhaustion() {

@@ -5163,19 +5163,61 @@ fn test_a2_adapter_tables_match_trusted_terminators_lean_exactly() {
         "duplicate entries in RUST_INTRINSIC_DEF_PATHS_V2026_06_01"
     );
     assert_eq!(intrinsic_table, expected_intrinsics);
-    // The diverging entry points, exactly.
-    assert_eq!(
-        set(trusted_def_strings(&source, "isUnreachableCallTarget")),
-        table_set(UNREACHABLE_DEF_PATHS_V2026_06_01)
-    );
-    assert_eq!(
-        set(trusted_def_strings(&source, "isAbortingPanicDefPath")),
-        table_set(ABORTING_PANIC_DEF_PATHS_V2026_06_01)
-    );
-    assert_eq!(
-        set(trusted_def_strings(&source, "isUnwindingPanicDefPath")),
-        table_set(UNWINDING_PANIC_DEF_PATHS_V2026_06_01)
-    );
+    // Each table entry's op is the one the lowering resolves for its path, so no entry is
+    // shadowed by an earlier one or bypassed by a special case.
+    for (path, op) in RUST_INTRINSIC_DEF_PATHS_V2026_06_01 {
+        assert_eq!(lower_intrinsic_kind_v2026_06_01(path), Some(*op), "{path}");
+    }
+    // The diverging entry points, exactly. As for `classifyRustIntrinsic?`, a set comparison
+    // alone would let a duplicated def-path on either side collapse silently, so each side's
+    // length is pinned to its set first.
+    let mut diverging: Vec<(&str, std::collections::BTreeSet<String>)> = Vec::new();
+    for (lean_def, table) in [
+        ("isUnreachableCallTarget", UNREACHABLE_DEF_PATHS_V2026_06_01),
+        (
+            "isAbortingPanicDefPath",
+            ABORTING_PANIC_DEF_PATHS_V2026_06_01,
+        ),
+        (
+            "isUnwindingPanicDefPath",
+            UNWINDING_PANIC_DEF_PATHS_V2026_06_01,
+        ),
+    ] {
+        let lean_paths = trusted_def_strings(&source, lean_def);
+        let lean_set = set(lean_paths.clone());
+        assert!(!lean_paths.is_empty(), "`{lean_def}` lists no def-path");
+        assert_eq!(
+            lean_set.len(),
+            lean_paths.len(),
+            "duplicate def-path entries in {lean_def}: {lean_paths:?}"
+        );
+        assert_eq!(
+            table_set(table).len(),
+            table.len(),
+            "duplicate entries in the adapter table of {lean_def}: {table:?}"
+        );
+        assert_eq!(lean_set, table_set(table), "{lean_def}");
+        diverging.push((lean_def, lean_set));
+    }
+    // No def-path is classified twice: an intrinsic is never also a diverging entry point,
+    // and the three diverging classes are pairwise disjoint (the Lean classifiers are
+    // consulted in sequence, so an overlap would make the adapter's answer order-dependent).
+    for (lean_def, paths) in &diverging {
+        let overlap: Vec<&String> = paths.intersection(&intrinsic_table).collect();
+        assert!(
+            overlap.is_empty() && !paths.contains("core::intrinsics::const_eval_select"),
+            "{lean_def} overlaps the intrinsic table: {overlap:?}"
+        );
+    }
+    for (i, (def_a, paths_a)) in diverging.iter().enumerate() {
+        for (def_b, paths_b) in &diverging[i + 1..] {
+            let overlap: Vec<&String> = paths_a.intersection(paths_b).collect();
+            assert!(
+                overlap.is_empty(),
+                "{def_a} and {def_b} overlap: {overlap:?}"
+            );
+        }
+    }
 }
 
 #[test]

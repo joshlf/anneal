@@ -800,6 +800,17 @@ pub fn resolve_itree_lean_rss_budget_with_env(
 /// 2. the non-heap reserve subtracted from `rss_limit_kib` (or added above an
 ///    explicit `ANNEAL_ITREE_LEAN_MAX_MB`) matches that final `lean_threads`
 ///    and optional `.olean`/`.ilean` footprint.
+///
+/// The RSS ceiling can itself depend on the thread count: an explicit
+/// `ANNEAL_ITREE_LEAN_MAX_MB` without `ANNEAL_ITREE_MAX_RSS_KIB` pads the
+/// ceiling by a per-thread arena estimate. The cap is therefore decided on the
+/// budget of the *capped* thread count: judging it on the uncapped count would
+/// let a wide host (e.g. 8 threads) inflate its own ceiling past `8 GiB` and
+/// thereby exempt itself from the cap, although the same `-M` fits under
+/// `8 GiB` with 2 threads. The ceiling never shrinks as threads grow, so the
+/// returned triple always satisfies (1): either the capped budget is at most
+/// `8 GiB` and is returned with the capped count, or even the capped budget
+/// exceeds `8 GiB`, and then so does the uncapped one.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_itree_lean_execution_budget_with_env(
     anneal_itree_lean_max_mb: Option<&str>,
@@ -820,77 +831,157 @@ pub fn resolve_itree_lean_execution_budget_with_env(
         cgroup_cores,
         avail_kib,
         active_workers,
-    );
-    let (_prov_mb, prov_rss_kib) = resolve_itree_lean_rss_budget_with_env_and_reserve(
-        anneal_itree_lean_max_mb,
-        anneal_itree_max_rss_kib,
-        total_kib,
-        avail_kib,
-        active_workers,
-        raw_threads,
-        olean_footprint_kib,
-    );
-    let lean_threads = cap_itree_lean_threads_for_rss_with_env(
-        anneal_itree_lean_threads,
-        raw_threads,
-        prov_rss_kib,
-    );
-    let (lean_max_mb, rss_limit_kib) = resolve_itree_lean_rss_budget_with_env_and_reserve(
-        anneal_itree_lean_max_mb,
-        anneal_itree_max_rss_kib,
-        total_kib,
-        avail_kib,
-        active_workers,
-        lean_threads,
-        olean_footprint_kib,
-    );
-    (lean_max_mb, rss_limit_kib, lean_threads)
+    )
+    .max(1);
+    let budget_for = |lean_threads: usize| {
+        resolve_itree_lean_rss_budget_with_env_and_reserve(
+            anneal_itree_lean_max_mb,
+            anneal_itree_max_rss_kib,
+            total_kib,
+            avail_kib,
+            active_workers,
+            lean_threads,
+            olean_footprint_kib,
+        )
+    };
+    // `rss_limit_kib = 0` asks for the cap unconditionally (unless
+    // `ANNEAL_ITREE_LEAN_THREADS` overrides it).
+    let capped_threads =
+        cap_itree_lean_threads_for_rss_with_env(anneal_itree_lean_threads, raw_threads, 0);
+    let (capped_mb, capped_rss_kib) = budget_for(capped_threads);
+    if capped_threads == raw_threads || capped_rss_kib <= DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB {
+        return (capped_mb, capped_rss_kib, capped_threads);
+    }
+    let (lean_max_mb, rss_limit_kib) = budget_for(raw_threads);
+    (lean_max_mb, rss_limit_kib, raw_threads)
 }
 
-/// Measures the total on-disk size (in KiB, rounded up) of `.olean` / `.ilean`
-/// artifacts under `<anneal_dir>/.lake/build/lib/lean` (returning `None` if the
-/// directory does not exist or has no matching artifacts, so callers fall back
-/// to [`DEFAULT_ITREE_OLEAN_RESERVE_KIB`]). Does not follow directory symlinks.
-pub fn measure_itree_olean_footprint_kib(anneal_dir: &Path) -> Option<u64> {
+/// Top-level Lean library of `<anneal_dir>/.lake/build/lib/lean` that holds the
+/// staged per-candidate modules (`Mir.ItreeDiffStaged.*`).
+const ITREE_STAGED_MIR_LIB: &str = "Mir";
+
+/// On-disk size of the `.olean` / `.ilean` artifacts under
+/// `<anneal_dir>/.lake/build/lib/lean`, split by which `lake env lean` workers
+/// map them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ItreeOleanFootprint {
+    /// Bytes of the libraries every worker imports whole (`Trusted`, `Anneal`):
+    /// everything outside the staged [`ITREE_STAGED_MIR_LIB`] library.
+    pub shared_bytes: u64,
+    /// Bytes of the staged per-candidate `Mir.*` modules of *all* candidates of
+    /// the run. A worker imports only the modules of its own chunk's
+    /// candidates, so it maps a share of these that shrinks as the run grows.
+    pub staged_bytes: u64,
+}
+
+impl ItreeOleanFootprint {
+    /// The whole tree in KiB (rounded up): what a worker maps when the staged
+    /// modules all belong to its own module (a single-candidate reproduction).
+    pub fn total_kib(self) -> u64 {
+        self.shared_bytes
+            .saturating_add(self.staged_bytes)
+            .div_ceil(1024)
+    }
+
+    /// What one worker maps, in KiB (rounded up), when the staged modules belong
+    /// to `staged_fns` candidates and one Lean module covers at most
+    /// `max_chunk_fns` of them: the shared libraries plus that fraction of the
+    /// staged bytes (rounded up; all of them when `staged_fns <= max_chunk_fns`).
+    ///
+    /// Reserving the whole tree instead would charge every worker for the
+    /// modules of every other chunk: a campaign-sized run stages a few MiB per
+    /// candidate, so the "measured" reserve would grow with the campaign and
+    /// squeeze `-M` toward its floor for memory no worker ever maps. The share
+    /// assumes candidates of similar size; a chunk of unusually large ones is
+    /// under-reserved by the difference, which fails safe (the RSS watchdog
+    /// still bounds the worker, and Stage 2 halves the chunk).
+    pub fn worker_kib(self, staged_fns: usize, max_chunk_fns: usize) -> u64 {
+        let fns = staged_fns.max(1) as u128;
+        let chunk_fns = (max_chunk_fns.max(1) as u128).min(fns);
+        let staged_share = (u128::from(self.staged_bytes) * chunk_fns).div_ceil(fns);
+        // `staged_share <= staged_bytes`, so it fits `u64`.
+        self.shared_bytes
+            .saturating_add(staged_share as u64)
+            .div_ceil(1024)
+    }
+}
+
+/// Measures the `.olean` / `.ilean` artifacts under
+/// `<anneal_dir>/.lake/build/lib/lean` (returning `None` if the directory does
+/// not exist or has no matching artifacts, so callers fall back to
+/// [`DEFAULT_ITREE_OLEAN_RESERVE_KIB`]).
+///
+/// A symlinked artifact *file* counts with the size of its target (Lean maps a
+/// link into a shared artifact cache exactly like a regular file, so skipping
+/// it would under-reserve), while symlinked *directories* are never traversed
+/// (no cycles, and nothing outside the build tree is walked).
+pub fn measure_itree_olean_footprint(anneal_dir: &Path) -> Option<ItreeOleanFootprint> {
+    /// Where a directory sits relative to the library root.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Scope {
+        /// `.lake/build/lib/lean` itself.
+        Root,
+        /// Inside a library every worker imports whole.
+        Shared,
+        /// Inside the staged per-candidate library.
+        Staged,
+    }
+
     let lib_root = anneal_dir.join(".lake/build/lib/lean");
     if !lib_root.is_dir() {
         return None;
     }
-    let mut total_bytes: u64 = 0;
-    let mut stack = vec![lib_root];
-    while let Some(dir) = stack.pop() {
+    let mut footprint = ItreeOleanFootprint::default();
+    let mut stack = vec![(lib_root, Scope::Root)];
+    while let Some((dir, scope)) = stack.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
+            // `DirEntry::file_type` does not follow symlinks, so a symlinked
+            // directory is neither `is_dir` here nor pushed below.
             let Ok(ft) = entry.file_type() else {
                 continue;
             };
-            if ft.is_symlink() {
+            let path = entry.path();
+            let name = entry.file_name();
+            if ft.is_dir() {
+                let child_scope = match scope {
+                    Scope::Root if name == ITREE_STAGED_MIR_LIB => Scope::Staged,
+                    Scope::Root => Scope::Shared,
+                    inherited => inherited,
+                };
+                stack.push((path, child_scope));
                 continue;
             }
-            let path = entry.path();
-            if ft.is_dir() {
-                stack.push(path);
-            } else if ft.is_file() {
-                let name = entry.file_name();
-                let is_lean_artifact = name.to_str().is_some_and(|s| {
-                    s.ends_with(".olean")
-                        || s.ends_with(".olean.server")
-                        || s.ends_with(".olean.private")
-                        || s.ends_with(".ilean")
-                });
-                if is_lean_artifact && let Ok(meta) = entry.metadata() {
-                    total_bytes = total_bytes.saturating_add(meta.len());
-                }
+            let is_lean_artifact = name.to_str().is_some_and(|s| {
+                s.ends_with(".olean")
+                    || s.ends_with(".olean.server")
+                    || s.ends_with(".olean.private")
+                    || s.ends_with(".ilean")
+            });
+            // `fs::metadata` follows a symlinked artifact to its target; a
+            // dangling link or a link to a directory contributes nothing.
+            if is_lean_artifact
+                && let Ok(meta) = fs::metadata(&path)
+                && meta.is_file()
+            {
+                let bytes = if scope == Scope::Staged {
+                    &mut footprint.staged_bytes
+                } else {
+                    &mut footprint.shared_bytes
+                };
+                *bytes = bytes.saturating_add(meta.len());
             }
         }
     }
-    if total_bytes == 0 {
-        None
-    } else {
-        Some(total_bytes.div_ceil(1024))
-    }
+    (footprint != ItreeOleanFootprint::default()).then_some(footprint)
+}
+
+/// Total on-disk size (in KiB, rounded up) of the artifacts measured by
+/// [`measure_itree_olean_footprint`]: see [`ItreeOleanFootprint::total_kib`].
+pub fn measure_itree_olean_footprint_kib(anneal_dir: &Path) -> Option<u64> {
+    measure_itree_olean_footprint(anneal_dir).map(ItreeOleanFootprint::total_kib)
 }
 
 /// Resolves `(lean_max_mb, rss_limit_kib, lean_threads)` for one of
@@ -2263,26 +2354,10 @@ where
                     hi - mid
                 );
                 let mut merged = split_rec(
-                    base_label,
-                    cases,
-                    lo,
-                    mid,
-                    next_depth,
-                    splits,
-                    max_depth,
-                    case_key,
-                    run_slice,
+                    base_label, cases, lo, mid, next_depth, splits, max_depth, case_key, run_slice,
                 )?;
                 let right = split_rec(
-                    base_label,
-                    cases,
-                    mid,
-                    hi,
-                    next_depth,
-                    splits,
-                    max_depth,
-                    case_key,
-                    run_slice,
+                    base_label, cases, mid, hi, next_depth, splits, max_depth, case_key, run_slice,
                 )?;
                 merged.extend(right);
                 Ok(merged)
@@ -2302,15 +2377,29 @@ where
         &mut max_depth,
         case_key,
         run_slice,
-    )?;
+    );
     if splits > 0 {
-        eprintln!(
-            "itree-difftest: adaptive Stage 2 confirm recovered \
-             label={base_label} cases={} splits={splits} max_depth={max_depth}",
-            cases.len()
-        );
+        match &res {
+            Ok(_) => eprintln!(
+                "itree-difftest: adaptive Stage 2 confirm recovered \
+                 label={base_label} cases={} splits={splits} max_depth={max_depth}",
+                cases.len()
+            ),
+            // The first sub-slice that could not be halved further (a `k == 1`
+            // singleton or a non-memory failure) fails the whole chunk closed:
+            // no partial result is reported, so `run_isolated_lean_stage`
+            // re-isolates every case of the chunk per candidate.
+            Err(err) => eprintln!(
+                "itree-difftest: adaptive Stage 2 confirm unrecovered \
+                 label={base_label} cases={} splits={splits} max_depth={max_depth} \
+                 kind={:?} reason={}",
+                cases.len(),
+                classify_itree_lean_failure(err),
+                err.lines().next().unwrap_or("")
+            ),
+        }
     }
-    Ok(res)
+    res
 }
 
 /// Candidates of `stage.failed_fns` that stay comparable on their completed
@@ -4384,15 +4473,28 @@ fn evaluate_itree_entries(
 
         // Measure the built `.olean`/`.ilean` footprint once after `mir_stage`
         // so Stage 1 and Stage 2 reserve realistic mmap headroom without
-        // re-walking `.lake/build/lib/lean` per chunk.
-        let olean_footprint_kib = measure_itree_olean_footprint_kib(&anneal_dir);
+        // re-walking `.lake/build/lib/lean` per chunk. Every worker maps the
+        // shared libraries, but only the staged `Mir.*` modules of its own
+        // module's candidates (at most one chunk's worth), not those of the
+        // whole run.
+        let olean_footprint = measure_itree_olean_footprint(&anneal_dir);
+        let olean_footprint_kib = olean_footprint.map(|footprint| {
+            footprint.worker_kib(
+                mir_fn_cases.len(),
+                ITREE_PROBE_CHUNK_SIZE.max(ITREE_MAX_CONFIRM_CHUNK_SIZE),
+            )
+        });
         let lean_jobs = resolve_itree_lean_jobs();
         eprintln!(
             "itree-difftest: Lean TraceCheck over {} distinct traces from {} candidates \
-             with {lean_jobs} concurrent `lake env lean` worker(s) (olean_footprint_kib={:?})",
+             with {lean_jobs} concurrent `lake env lean` worker(s) \
+             (olean_footprint_kib={olean_footprint_kib:?} per worker, of {:?} KiB shared + \
+             {:?} KiB staged for {} candidate(s))",
             batch_cases.len(),
             compared_fn_names.len(),
-            olean_footprint_kib
+            olean_footprint.map(|f| f.shared_bytes.div_ceil(1024)),
+            olean_footprint.map(|f| f.staged_bytes.div_ceil(1024)),
+            mir_fn_cases.len()
         );
 
         // Stage 1: Probe `diagnoseRawByteTraceFullBounded` across all distinct
@@ -7157,11 +7259,8 @@ mod tests {
         // 5 GiB avail -> reserve 1 GiB -> 4 GiB usable / 2 workers = 2 GiB per worker;
         // non-heap reserve (512 MiB olean + 2 * 128 MiB thread arenas = 768 MiB) leaves
         // 1280 MiB for Lean's `-M` cap (`1280 * 1024 + 768 * 1024 == 2 GiB`).
-        let reserve_kib = itree_lean_non_heap_reserve_kib(
-            rss_kib,
-            ITREE_LEAN_MAX_THREADS_UNDER_8GIB_RSS,
-            None,
-        );
+        let reserve_kib =
+            itree_lean_non_heap_reserve_kib(rss_kib, ITREE_LEAN_MAX_THREADS_UNDER_8GIB_RSS, None);
         assert_eq!(rss_kib, 2 * GIB_KIB);
         assert_eq!(reserve_kib, 768 * 1024);
         assert_eq!(lean_mb, 1280);
@@ -7709,11 +7808,8 @@ mod tests {
         // Explicit RSS override without `-M` still withholds the non-heap reserve.
         let (derived_mb, explicit_rss) =
             resolve_itree_lean_rss_budget_with_env(None, Some("2097152"), None, None, 1);
-        let reserve_2g = itree_lean_non_heap_reserve_kib(
-            2_097_152,
-            ITREE_LEAN_MAX_THREADS_UNDER_8GIB_RSS,
-            None,
-        );
+        let reserve_2g =
+            itree_lean_non_heap_reserve_kib(2_097_152, ITREE_LEAN_MAX_THREADS_UNDER_8GIB_RSS, None);
         assert_eq!(explicit_rss, 2_097_152);
         assert_eq!(derived_mb, 1280);
         assert!(derived_mb * 1024 + reserve_2g <= explicit_rss);
@@ -8134,15 +8230,16 @@ mod tests {
                 for olean in [None, Some(0u64), Some(256 * MIB_KIB), Some(2 * GIB_KIB)] {
                     let reserve_kib = itree_lean_non_heap_reserve_kib(rss_kib, threads, olean);
                     let rss_str = rss_kib.to_string();
-                    let (lean_mb, resolved_rss) = resolve_itree_lean_rss_budget_with_env_and_reserve(
-                        None,
-                        Some(&rss_str),
-                        None,
-                        None,
-                        1,
-                        threads,
-                        olean,
-                    );
+                    let (lean_mb, resolved_rss) =
+                        resolve_itree_lean_rss_budget_with_env_and_reserve(
+                            None,
+                            Some(&rss_str),
+                            None,
+                            None,
+                            1,
+                            threads,
+                            olean,
+                        );
                     assert_eq!(resolved_rss, rss_kib);
                     assert!(
                         lean_mb.saturating_mul(1024).saturating_add(reserve_kib) <= resolved_rss,
@@ -8176,8 +8273,13 @@ mod tests {
         }
 
         // 2. Default 8 GiB budget leaves at least 1024 MiB headroom (`lean_max_mb <= 7168`).
-        let (lean_mb_8g, rss_8g) =
-            itree_lean_rss_budget_with_reserve_kib(Some(64 * GIB_KIB), Some(48 * GIB_KIB), 1, 2, None);
+        let (lean_mb_8g, rss_8g) = itree_lean_rss_budget_with_reserve_kib(
+            Some(64 * GIB_KIB),
+            Some(48 * GIB_KIB),
+            1,
+            2,
+            None,
+        );
         assert_eq!(rss_8g, DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB);
         assert_eq!(lean_mb_8g, 7168);
         assert_eq!(
@@ -8198,7 +8300,8 @@ mod tests {
         // 1536 MiB olean + 2 * 128 MiB thread arenas = 1792 MiB reserve -> 6400 MiB heap.
         assert_eq!(lean_mb_big_olean, 6400);
 
-        let extreme_reserve = itree_lean_non_heap_reserve_kib(8 * GIB_KIB, usize::MAX, Some(u64::MAX));
+        let extreme_reserve =
+            itree_lean_non_heap_reserve_kib(8 * GIB_KIB, usize::MAX, Some(u64::MAX));
         assert_eq!(extreme_reserve, 8 * GIB_KIB - 512 * MIB_KIB);
         let (extreme_mb, extreme_rss) = itree_lean_rss_budget_with_reserve_kib(
             Some(u64::MAX),
@@ -8297,12 +8400,7 @@ mod tests {
         // 1. 16-case chunk fails with `[WATCHDOG:RSS_EXCEEDED]` whenever `slice.len() > 4`,
         //    succeeding once halved to 4-case subchunks: all 16 cases confirmed, distinct
         //    labels used, zero dropped candidates, zero `confirm_stage.errors`.
-        let (cases, case_to_fn) = stage_fixture(&[
-            ("c0", 4),
-            ("c1", 4),
-            ("c2", 4),
-            ("c3", 4),
-        ]);
+        let (cases, case_to_fn) = stage_fixture(&[("c0", 4), ("c1", 4), ("c2", 4), ("c3", 4)]);
         assert_eq!(cases.len(), 16);
         let seen_labels = Mutex::new(Vec::<String>::new());
         let stage = run_isolated_lean_stage(
@@ -8335,7 +8433,10 @@ mod tests {
         assert!(stage.inconclusive_cases.is_empty());
         assert_eq!(stage.results.len(), 16);
         for c in &cases {
-            assert!(stage.results.contains_key(c), "missing confirmed case `{c}`");
+            assert!(
+                stage.results.contains_key(c),
+                "missing confirmed case `{c}`"
+            );
         }
         let labels = seen_labels.into_inner().unwrap();
         let unique_labels: BTreeSet<&String> = labels.iter().collect();
@@ -8345,7 +8446,11 @@ mod tests {
             "subchunk labels must never collide: {labels:?}"
         );
         // 16 -> (8, 8) -> (4, 4, 4, 4) = 7 invocations total.
-        assert_eq!(labels.len(), 7, "expected 1 + 2 + 4 split runs, got {labels:?}");
+        assert_eq!(
+            labels.len(),
+            7,
+            "expected 1 + 2 + 4 split runs, got {labels:?}"
+        );
 
         // 2. Singleton (`k == 1`) RSS failure must fail closed and surface `Err`.
         let single = vec!["case_poison_t0".to_string()];
@@ -8380,5 +8485,939 @@ mod tests {
         .expect_err("non-memory kernel rejection must fail closed immediately");
         assert!(rej_err.contains("rfl"));
         assert_eq!(rej_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// One recorded `(label, cases)` Lean run of a mock Stage 2 slice runner.
+    type MockLeanRuns = std::sync::Mutex<Vec<(String, Vec<String>)>>;
+
+    /// Error text of an RSS watchdog kill of `<label>.lean`, in the format of
+    /// `run_itree_lean_module_with_workers`.
+    fn mock_rss_exceeded(label: &str) -> String {
+        format!(
+            "[WATCHDOG:RSS_EXCEEDED] `/tmp/verify/{label}.lean` exceeded RSS limit \
+             (8432128 KiB > 8388608 KiB, -M 7168 MiB, LEAN_NUM_THREADS=2):\nstdout:\n\nstderr:\n"
+        )
+    }
+
+    /// Error text of Lean's own `-M` exhaustion on `<label>.lean`, which the
+    /// non-heap reserve makes reachable below the RSS ceiling.
+    fn mock_lean_memory_exhausted(label: &str) -> String {
+        format!(
+            "`/tmp/verify/{label}.lean` failed (peak RSS 7400000 KiB / 8388608 KiB, -M 7168 MiB, \
+             LEAN_NUM_THREADS=2):\nstdout:\n/tmp/verify/{label}.lean:12:2: error: (kernel) \
+             excessive memory consumption detected at 'whnf' (potential solution: increase \
+             memory consumption threshold)\nstderr:\n"
+        )
+    }
+
+    /// Error text of a kernel rejection of `case`'s `by rfl` theorem in
+    /// `<label>.lean`.
+    fn mock_rfl_rejection(label: &str, case: &str) -> String {
+        format!(
+            "`/tmp/verify/{label}.lean` failed (peak RSS 600000 KiB / 8388608 KiB, -M 7168 MiB, \
+             LEAN_NUM_THREADS=2):\nstdout:\n/tmp/verify/{label}.lean:9:4: error: Tactic `rfl` \
+             failed: The left-hand side\n  {case}_diag\nis not definitionally equal to the \
+             right-hand side\n  \"ok\"\nstderr:\n"
+        )
+    }
+
+    fn assert_labels_unique_file_stems(labels: &[String]) {
+        let unique: BTreeSet<&String> = labels.iter().collect();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "a `.lean` module label was reused: {labels:?}"
+        );
+        for label in labels {
+            assert!(
+                !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "`{label}` is not a plain Lean identifier / file stem"
+            );
+        }
+    }
+
+    /// An explicit `ANNEAL_ITREE_LEAN_MAX_MB` without `ANNEAL_ITREE_MAX_RSS_KIB`
+    /// pads the RSS ceiling by a per-thread arena estimate, so the ceiling grows
+    /// with the thread count. Deciding the `<= 2` thread cap on the *uncapped*
+    /// count's ceiling let a wide host exempt itself: 8 threads padded `-M 7168`
+    /// to `8704 MiB > 8 GiB`, so the cap never applied, although the same `-M`
+    /// fits under `8 GiB` with 2 threads.
+    #[test]
+    fn execution_budget_thread_cap_cannot_be_evaded_by_a_thread_inflated_explicit_max_mb_ceiling() {
+        let total = Some(128 * GIB_KIB);
+        let avail = Some(96 * GIB_KIB);
+        let resolve = |max_mb: Option<&str>, threads: Option<&str>, olean: Option<u64>| {
+            resolve_itree_lean_execution_budget_with_env(
+                max_mb,
+                None,
+                threads,
+                Some("12"),
+                64,
+                None,
+                total,
+                avail,
+                1,
+                olean,
+            )
+        };
+        // This host resolves 8 uncapped threads, whose padded ceiling exceeds 8 GiB.
+        assert_eq!(
+            resolve_itree_lean_threads_with_env(None, Some("12"), 64, None, avail, 1),
+            8
+        );
+        assert_eq!(
+            resolve_itree_lean_rss_budget_with_env_and_reserve(
+                Some("7168"),
+                None,
+                total,
+                avail,
+                1,
+                8,
+                None
+            ),
+            (7168, (7168 + 1536) * 1024)
+        );
+        // The capped pair fits exactly: 7168 MiB heap + 1024 MiB reserve = 8 GiB.
+        assert_eq!(resolve(Some("7168"), None, None), (7168, 8 * GIB_KIB, 2));
+        assert_eq!(
+            resolve(Some("7168"), None, Some(464_258)),
+            (7168, 8 * GIB_KIB, 2),
+            "the footprint measured on the frozen seed stays below the 1 GiB reserve floor"
+        );
+        assert_eq!(
+            resolve(Some("1024"), None, None),
+            (1024, (1024 + 768) * 1024, 2)
+        );
+        // `-M 8192` cannot fit under 8 GiB even with 2 threads (8192 + 1024 MiB), so
+        // the budget is genuinely above 8 GiB and keeps the host's thread count.
+        assert_eq!(
+            resolve(Some("8192"), None, None),
+            (8192, (8192 + 1536) * 1024, 8)
+        );
+        // An explicit `ANNEAL_ITREE_LEAN_THREADS` still wins and sizes the ceiling.
+        assert_eq!(
+            resolve(Some("7168"), Some("6"), None),
+            (7168, (7168 + 1280) * 1024, 6)
+        );
+        assert_eq!(
+            resolve(Some("7168"), Some("1"), None),
+            (7168, 8 * GIB_KIB, 1)
+        );
+    }
+
+    /// Postconditions of [`resolve_itree_lean_execution_budget_with_env`] over a
+    /// grid of env overrides (valid, below-minimum, and capped values), host
+    /// shapes, worker counts, and `.olean` footprints.
+    #[test]
+    fn execution_budget_postconditions_hold_across_env_host_and_footprint_grid() {
+        const MIB_KIB: u64 = 1024;
+        let parse = |raw: Option<&str>, min: u64| {
+            raw.and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|&n| n >= min)
+        };
+        let mut checked = 0usize;
+        let mut capped_from_wider = 0usize;
+        let mut uncapped_above_8gib = 0usize;
+        for max_mb in [
+            None,
+            Some("63"),
+            Some("64"),
+            Some("1024"),
+            Some("3071"),
+            Some("3072"),
+            Some("7168"),
+            Some("8192"),
+            Some("99999"),
+        ] {
+            for max_rss in [
+                None,
+                Some("1023"),
+                Some("1024"),
+                Some("524288"),
+                Some("8388608"),
+                Some("8388609"),
+                Some("16777216"),
+            ] {
+                for thr in [None, Some("0"), Some("1"), Some("2"), Some("3"), Some("64")] {
+                    for caller in [None, Some("1"), Some("64")] {
+                        for host_cores in [1usize, 4, 64] {
+                            for avail in [
+                                None,
+                                Some(2 * GIB_KIB),
+                                Some(6 * GIB_KIB),
+                                Some(96 * GIB_KIB),
+                            ] {
+                                let total = avail.map(|a| a.saturating_mul(2));
+                                for workers in [0usize, 1, 4] {
+                                    for olean in
+                                        [None, Some(0u64), Some(464_258), Some(3 * GIB_KIB)]
+                                    {
+                                        let ctx = || {
+                                            format!(
+                                                "max_mb={max_mb:?} max_rss={max_rss:?} thr={thr:?} \
+                                                 caller={caller:?} host_cores={host_cores} \
+                                                 avail={avail:?} workers={workers} olean={olean:?}"
+                                            )
+                                        };
+                                        let budget_for = |threads: usize| {
+                                            resolve_itree_lean_rss_budget_with_env_and_reserve(
+                                                max_mb, max_rss, total, avail, workers, threads,
+                                                olean,
+                                            )
+                                        };
+                                        let (mb, rss, threads) =
+                                            resolve_itree_lean_execution_budget_with_env(
+                                                max_mb, max_rss, thr, caller, host_cores, None,
+                                                total, avail, workers, olean,
+                                            );
+                                        let raw = resolve_itree_lean_threads_with_env(
+                                            thr, caller, host_cores, None, avail, workers,
+                                        );
+                                        // The triple is self-consistent: `-M` and the ceiling
+                                        // are the ones derived for the returned thread count.
+                                        assert!((1..=16).contains(&threads), "{}", ctx());
+                                        assert_eq!((mb, rss), budget_for(threads), "{}", ctx());
+                                        match parse(thr, 1) {
+                                            Some(n) => {
+                                                assert_eq!(threads as u64, n.min(16), "{}", ctx())
+                                            }
+                                            None if threads
+                                                > ITREE_LEAN_MAX_THREADS_UNDER_8GIB_RSS =>
+                                            {
+                                                // Uncapped only when even 2 threads cannot fit
+                                                // under 8 GiB.
+                                                assert_eq!(threads, raw, "{}", ctx());
+                                                assert!(
+                                                    rss > DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB
+                                                        && budget_for(
+                                                            ITREE_LEAN_MAX_THREADS_UNDER_8GIB_RSS
+                                                        )
+                                                        .1 > DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB,
+                                                    "{}",
+                                                    ctx()
+                                                );
+                                                uncapped_above_8gib += 1;
+                                            }
+                                            None => {
+                                                assert_eq!(
+                                                    threads,
+                                                    raw.min(ITREE_LEAN_MAX_THREADS_UNDER_8GIB_RSS),
+                                                    "{}",
+                                                    ctx()
+                                                );
+                                                if raw > threads {
+                                                    capped_from_wider += 1;
+                                                }
+                                            }
+                                        }
+                                        let explicit_mb = parse(max_mb, 64).map(|n| n.min(16_384));
+                                        let explicit_rss = parse(max_rss, 1024);
+                                        if let Some(n) = explicit_mb {
+                                            assert_eq!(mb, n, "{}", ctx());
+                                        }
+                                        if let Some(n) = explicit_rss {
+                                            assert_eq!(rss, n, "{}", ctx());
+                                        }
+                                        let reserve =
+                                            itree_lean_non_heap_reserve_kib(rss, threads, olean);
+                                        match (explicit_mb, explicit_rss) {
+                                            // Both explicit: honored verbatim, no derived headroom.
+                                            (Some(_), Some(_)) => {}
+                                            // Explicit `-M` alone: the ceiling is padded above it
+                                            // by at least the measured non-heap need.
+                                            (Some(_), None) => {
+                                                let measured = olean
+                                                    .unwrap_or(DEFAULT_ITREE_OLEAN_RESERVE_KIB)
+                                                    + ITREE_PER_THREAD_ARENA_KIB * threads as u64;
+                                                assert!(rss >= mb * 1024 + measured, "{}", ctx());
+                                                assert!(mb * 1024 + reserve <= rss, "{}", ctx());
+                                                assert!(mb * 1024 < rss, "{}", ctx());
+                                            }
+                                            // Derived `-M`: strict headroom above the 64 MiB floor.
+                                            (None, explicit_rss) => {
+                                                if explicit_rss.is_none() {
+                                                    assert!(
+                                                        (MIN_ITREE_LEAN_RSS_LIMIT_KIB
+                                                            ..=DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB)
+                                                            .contains(&rss),
+                                                        "{}",
+                                                        ctx()
+                                                    );
+                                                }
+                                                if rss > 64 * MIB_KIB {
+                                                    assert!(
+                                                        mb * 1024 + reserve <= rss,
+                                                        "{}",
+                                                        ctx()
+                                                    );
+                                                    assert!(mb * 1024 < rss, "{}", ctx());
+                                                }
+                                            }
+                                        }
+                                        checked += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 9 * 7 * 6 * 3 * 3 * 4 * 3 * 4);
+        assert!(
+            capped_from_wider > 0 && uncapped_above_8gib > 0,
+            "vacuous grid"
+        );
+    }
+
+    /// The derived `-M` is the exact floor of `(rss_limit - reserve) / 1024` (never
+    /// rounded up into the reserve, never more than `1023 KiB` below it), never
+    /// decreases as the RSS budget grows, and never increases with more threads
+    /// or a larger `.olean` footprint.
+    #[test]
+    fn derived_lean_max_mb_is_floor_tight_and_monotone_in_budget_threads_and_footprint() {
+        const MIB_KIB: u64 = 1024;
+        let mut budgets: Vec<u64> = Vec::new();
+        for center in [
+            64 * MIB_KIB,
+            256 * MIB_KIB,
+            MIN_ITREE_LEAN_RSS_LIMIT_KIB,
+            2 * GIB_KIB,
+            4 * GIB_KIB,
+            DEFAULT_ITREE_LEAN_RSS_LIMIT_KIB,
+            16 * GIB_KIB,
+            17 * GIB_KIB,
+        ] {
+            for delta in 0..=2 {
+                budgets.push(center - delta);
+                budgets.push(center + delta);
+            }
+        }
+        let mut rss = 64 * MIB_KIB + 1;
+        while rss <= 20 * GIB_KIB {
+            budgets.push(rss);
+            rss += 37_717;
+        }
+        budgets.sort_unstable();
+        budgets.dedup();
+
+        let derive = |rss: u64, threads: usize, olean: Option<u64>| {
+            let reserve = itree_lean_non_heap_reserve_kib(rss, threads, olean);
+            (itree_lean_max_mb_for_rss_and_reserve(rss, reserve), reserve)
+        };
+        let thread_counts = [0usize, 1, 2, 4, 16];
+        let footprints = [
+            Some(0u64),
+            Some(1),
+            Some(464_258),
+            None,
+            Some(2 * GIB_KIB),
+            Some(u64::MAX),
+        ];
+        for threads in thread_counts {
+            for olean in footprints {
+                let mut prev_mb = 0u64;
+                for &rss in &budgets {
+                    let (mb, reserve) = derive(rss, threads, olean);
+                    let ctx = format!(
+                        "rss={rss} threads={threads} olean={olean:?} mb={mb} reserve={reserve}"
+                    );
+                    assert!(reserve <= rss, "{ctx}");
+                    assert!((64..=16_384).contains(&mb), "{ctx}");
+                    if rss > 64 * MIB_KIB {
+                        assert!(mb * 1024 + reserve <= rss, "{ctx}");
+                        assert!(mb * 1024 < rss, "{ctx}");
+                    }
+                    if mb < 16_384 && rss >= 64 * MIB_KIB {
+                        assert!(
+                            rss - reserve - mb * 1024 < 1024,
+                            "floor division wasted a whole MiB: {ctx}"
+                        );
+                    }
+                    if rss >= 4 * GIB_KIB {
+                        assert!(reserve >= MIN_ITREE_LARGE_BUDGET_RESERVE_KIB, "{ctx}");
+                    }
+                    if rss >= 2 * GIB_KIB {
+                        assert!(mb >= 512, "{ctx}");
+                    } else if rss >= MIN_ITREE_LEAN_RSS_LIMIT_KIB {
+                        assert!(mb >= 256, "{ctx}");
+                    }
+                    assert!(
+                        mb >= prev_mb,
+                        "a larger RSS budget lowered -M from {prev_mb}: {ctx}"
+                    );
+                    prev_mb = mb;
+                }
+            }
+        }
+        for &rss in &budgets {
+            for olean in footprints {
+                let mbs: Vec<u64> = thread_counts
+                    .iter()
+                    .map(|&t| derive(rss, t, olean).0)
+                    .collect();
+                assert!(
+                    mbs.windows(2).all(|w| w[0] >= w[1]),
+                    "more threads raised -M at rss={rss} olean={olean:?}: {mbs:?}"
+                );
+            }
+            for threads in thread_counts {
+                // `footprints` is sorted by effective size (`None` is the 512 MiB default).
+                let mbs: Vec<u64> = footprints
+                    .iter()
+                    .map(|&o| derive(rss, threads, o).0)
+                    .collect();
+                assert!(
+                    mbs.windows(2).all(|w| w[0] >= w[1]),
+                    "a larger footprint raised -M at rss={rss} threads={threads}: {mbs:?}"
+                );
+            }
+        }
+    }
+
+    /// Lake may restore an artifact as a link into a shared cache: a symlinked
+    /// `.olean` *file* is mapped like a regular one and must count, while a
+    /// symlinked *directory* must never be traversed (cycles, foreign trees).
+    #[cfg(unix)]
+    #[test]
+    fn olean_footprint_follows_symlinked_artifacts_but_never_symlinked_directories() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = env::temp_dir().join(format!(
+            "anneal-itree-olean-symlink-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let lib = tmp.join(".lake/build/lib/lean");
+        let cache = tmp.join("cache");
+        let foreign = tmp.join("foreign");
+        fs::create_dir_all(lib.join("Anneal")).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(cache.join("blob.art"), vec![0u8; 4096]).unwrap();
+        fs::write(foreign.join("X.olean"), vec![0u8; 1 << 20]).unwrap();
+        fs::write(lib.join("Anneal/B.olean"), vec![0u8; 1024]).unwrap();
+        // A link into the cache counts with its target's size.
+        symlink(cache.join("blob.art"), lib.join("Anneal/A.olean")).unwrap();
+        // A dangling link, a directory link named like an artifact, a link to a
+        // foreign tree, and a cycle back to the root contribute nothing.
+        symlink(tmp.join("missing.art"), lib.join("Anneal/C.olean")).unwrap();
+        symlink(&foreign, lib.join("Anneal/D.olean")).unwrap();
+        symlink(&foreign, lib.join("Foreign")).unwrap();
+        symlink(&lib, lib.join("Anneal/cycle")).unwrap();
+        assert_eq!(measure_itree_olean_footprint_kib(&tmp), Some(5));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// All candidates of a run are staged in one build tree, but a worker maps
+    /// only the staged `Mir.*` modules of its own chunk. Charging every worker
+    /// for the whole tree makes the reserve grow with the campaign (a few MiB
+    /// per candidate) and lowers `-M` for memory no worker maps.
+    #[test]
+    fn worker_olean_footprint_charges_shared_libraries_plus_one_chunk_of_staged_modules() {
+        const MIB: u64 = 1024 * 1024;
+
+        // 1. The on-disk split: only the top-level staged library is "staged".
+        let tmp = env::temp_dir().join(format!(
+            "anneal-itree-olean-split-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        assert_eq!(measure_itree_olean_footprint(&tmp), None);
+        let lib = tmp.join(".lake/build/lib/lean");
+        for dir in [
+            "Anneal/Rustc",
+            "Anneal/Mir",
+            "Trusted",
+            "Mir/ItreeDiffStaged",
+        ] {
+            fs::create_dir_all(lib.join(dir)).unwrap();
+        }
+        assert_eq!(
+            measure_itree_olean_footprint(&tmp),
+            None,
+            "a tree without artifacts falls back to the default reserve"
+        );
+        for (file, len) in [
+            ("Anneal.olean", 1000usize),
+            ("Anneal/Rustc/TraceCheck.olean", 3000),
+            // A nested directory that merely shares the staged library's name.
+            ("Anneal/Mir/NotStaged.olean", 500),
+            ("Trusted/T.ilean", 596),
+            ("Mir/ItreeDiffStaged/b0_c0__f.olean", 2048),
+            ("Mir/ItreeDiffStaged/b0_c1__f.olean", 2048),
+            ("Mir/ItreeDiffStaged/b0_c1__f.trace", 9999),
+        ] {
+            fs::write(lib.join(file), vec![0u8; len]).unwrap();
+        }
+        let footprint = measure_itree_olean_footprint(&tmp).expect("artifacts were written");
+        let _ = fs::remove_dir_all(&tmp);
+        assert_eq!(
+            footprint,
+            ItreeOleanFootprint {
+                shared_bytes: 5096,
+                staged_bytes: 4096
+            }
+        );
+        // 9192 B round up once, not per part.
+        assert_eq!(footprint.total_kib(), 9);
+        // A chunk that covers both candidates maps the whole tree; one that covers
+        // one of them maps the shared 5096 B plus half of the staged 4096 B.
+        assert_eq!(footprint.worker_kib(2, 64), 9);
+        assert_eq!(footprint.worker_kib(2, 1), 7);
+
+        // 2. Campaign scale, with the sizes of the frozen-seed run (about 438 MiB
+        //    shared, 28 MiB staged per 16 candidates): 800 candidates stage 1400 MiB.
+        let smoke = ItreeOleanFootprint {
+            shared_bytes: 438 * MIB,
+            staged_bytes: 28 * MIB,
+        };
+        assert_eq!(smoke.worker_kib(16, 64), smoke.total_kib());
+        let campaign = ItreeOleanFootprint {
+            shared_bytes: 438 * MIB,
+            staged_bytes: 50 * 28 * MIB,
+        };
+        assert_eq!(campaign.total_kib(), (438 + 1400) * 1024);
+        assert_eq!(campaign.worker_kib(800, 64), (438 + 112) * 1024);
+        // Under the default 8 GiB ceiling the whole tree would cost 1070 MiB of
+        // `-M` (reserve 1838 + 256 MiB); one chunk's share stays under the 1 GiB
+        // reserve floor.
+        let default_mb = |olean_kib: u64| {
+            itree_lean_rss_budget_with_reserve_kib(
+                Some(64 * GIB_KIB),
+                Some(48 * GIB_KIB),
+                1,
+                2,
+                Some(olean_kib),
+            )
+            .0
+        };
+        assert_eq!(default_mb(campaign.total_kib()), 6098);
+        assert_eq!(default_mb(campaign.worker_kib(800, 64)), 7168);
+        // On a 2 GiB per-worker budget the whole tree would pin `-M` to its floor.
+        let small_mb = |olean_kib: u64| {
+            let reserve = itree_lean_non_heap_reserve_kib(2 * GIB_KIB, 2, Some(olean_kib));
+            itree_lean_max_mb_for_rss_and_reserve(2 * GIB_KIB, reserve)
+        };
+        assert_eq!(small_mb(campaign.total_kib()), 512);
+        assert_eq!(
+            small_mb(campaign.worker_kib(800, 64)),
+            2048 - (438 + 112 + 256)
+        );
+
+        // 3. The share is bounded by the shared libraries and the whole tree, never
+        //    shrinks as a chunk covers more candidates, and cannot overflow.
+        let shared_kib = campaign.shared_bytes.div_ceil(1024);
+        for fns in [0usize, 1, 2, 63, 64, 65, 800, usize::MAX] {
+            let mut prev = 0u64;
+            for chunk_fns in [0usize, 1, 16, 64, 65, usize::MAX] {
+                let worker = campaign.worker_kib(fns, chunk_fns);
+                assert!(
+                    (shared_kib..=campaign.total_kib()).contains(&worker),
+                    "fns={fns} chunk_fns={chunk_fns}: {worker}"
+                );
+                if chunk_fns.max(1) >= fns.max(1) {
+                    assert_eq!(
+                        worker,
+                        campaign.total_kib(),
+                        "fns={fns} chunk_fns={chunk_fns}"
+                    );
+                }
+                assert!(worker >= prev, "fns={fns} chunk_fns={chunk_fns}");
+                prev = worker;
+            }
+        }
+        let huge = ItreeOleanFootprint {
+            shared_bytes: u64::MAX,
+            staged_bytes: u64::MAX,
+        };
+        assert_eq!(huge.total_kib(), u64::MAX.div_ceil(1024));
+        assert_eq!(
+            huge.worker_kib(usize::MAX, usize::MAX),
+            u64::MAX.div_ceil(1024)
+        );
+        assert_eq!(
+            ItreeOleanFootprint {
+                shared_bytes: 0,
+                staged_bytes: u64::MAX
+            }
+            .worker_kib(3, 2),
+            (u64::MAX / 3 * 2).div_ceil(1024)
+        );
+    }
+
+    /// A chunk whose split leaves one irreducible `k == 1` RSS failure fails
+    /// closed as a whole (never a partial `Ok`), and the stage's per-candidate
+    /// isolation then still confirms every healthy case: nothing is dropped, the
+    /// poison case is inconclusive (unchecked, not refuted), and no `.lean`
+    /// module label is ever reused.
+    #[test]
+    fn adaptive_stage2_split_keeps_every_healthy_case_when_one_singleton_stays_over_rss() {
+        let (cases, case_to_fn) = stage_fixture(&[("c0", 4), ("c1", 4), ("c2", 4), ("c3", 4)]);
+        let poison = "case_c3_t2";
+        let runs = MockLeanRuns::default();
+        let stage = run_isolated_lean_stage(
+            "ItreeDiffBatchConfirm",
+            &cases,
+            16,
+            1,
+            ident,
+            &case_to_fn,
+            |label: &str, chunk: &[String]| {
+                run_adaptive_confirm_chunk(
+                    label,
+                    chunk,
+                    &ident,
+                    &|sub_label: &str, slice: &[String]| {
+                        runs.lock()
+                            .unwrap()
+                            .push((sub_label.to_string(), slice.to_vec()));
+                        if slice.len() > 4 || slice.iter().any(|c| c == poison) {
+                            Err(mock_rss_exceeded(sub_label))
+                        } else {
+                            ok_all(slice)
+                        }
+                    },
+                )
+            },
+        );
+        assert_eq!(stage.results.len(), 15);
+        for c in cases.iter().filter(|c| *c != poison) {
+            assert!(
+                stage.results.contains_key(c),
+                "healthy case `{c}` was dropped"
+            );
+        }
+        assert_eq!(stage.failed_fns, BTreeSet::from(["c3".to_string()]));
+        assert_eq!(
+            stage.inconclusive_cases,
+            BTreeSet::from([poison.to_string()])
+        );
+        assert_eq!(
+            itree_partially_comparable_fns(&stage, &cases, ident, &case_to_fn, |_| true),
+            BTreeMap::from([("c3".to_string(), 1)])
+        );
+        assert!(
+            stage.errors.iter().any(|e| {
+                e.contains("irreducible single case `case_c3_t2` of `c3`")
+                    && e.contains("[WATCHDOG:RSS_EXCEEDED]")
+            }),
+            "expected an explicit single-case diagnostic in {:?}",
+            stage.errors
+        );
+
+        let runs = runs.into_inner().unwrap();
+        let labels: Vec<String> = runs.iter().map(|(l, _)| l.clone()).collect();
+        assert_labels_unique_file_stems(&labels);
+        // No run that contained the poison case (or more than 4 cases) succeeded,
+        // and every healthy case was confirmed by a run without it.
+        for c in cases.iter().filter(|c| *c != poison) {
+            assert!(
+                runs.iter()
+                    .any(|(_, s)| s.len() <= 4 && s.contains(c) && !s.iter().any(|x| x == poison)),
+                "`{c}` has no successful confirming run"
+            );
+        }
+        // Cost of one irreducible case (a regression pin on the split / fallback /
+        // bisection interplay): 10 chunk-phase runs (16, 8+8, 4+4+4+4, 2+2, 1),
+        // 3 healthy candidate fallbacks, 4 runs for `c3`'s fallback (4, 2+2, 1),
+        // and 5 bisection runs (2, 2 -> 1, 1, 1).
+        assert_eq!(runs.len(), 22, "unexpected Lean run count: {labels:?}");
+        assert_eq!(labels[0], "ItreeDiffBatchConfirmChunk0");
+        assert!(labels.contains(&"ItreeDiffBatchConfirmChunk0_split_d4_14_15".to_string()));
+        assert!(labels.contains(&"ItreeDiffBatchConfirmFallback_c3_split_d2_2_3".to_string()));
+        assert!(labels.contains(&"ItreeDiffBatchConfirmBisect_c3_2_4_split_d1_0_1".to_string()));
+    }
+
+    /// A kernel rejection that a memory failure of the enclosing module masks
+    /// must surface once the split isolates it: the candidate is refuted (not
+    /// inconclusive, never partially compared as agreeing), and its healthy
+    /// neighbors are still confirmed.
+    #[test]
+    fn adaptive_stage2_split_never_hides_a_kernel_rejection_behind_a_memory_failure() {
+        let (cases, case_to_fn) = stage_fixture(&[("c0", 4), ("c1", 4)]);
+        let rejected = "case_c1_t1";
+        let runs = MockLeanRuns::default();
+        let stage = run_isolated_lean_stage(
+            "ItreeDiffBatchConfirm",
+            &cases,
+            8,
+            1,
+            ident,
+            &case_to_fn,
+            |label: &str, chunk: &[String]| {
+                run_adaptive_confirm_chunk(
+                    label,
+                    chunk,
+                    &ident,
+                    &|sub_label: &str, slice: &[String]| {
+                        runs.lock()
+                            .unwrap()
+                            .push((sub_label.to_string(), slice.to_vec()));
+                        if slice.len() > 2 {
+                            // Lean runs out of memory before reaching the rejection.
+                            Err(mock_lean_memory_exhausted(sub_label))
+                        } else if slice.iter().any(|c| c == rejected) {
+                            Err(mock_rfl_rejection(sub_label, rejected))
+                        } else {
+                            ok_all(slice)
+                        }
+                    },
+                )
+            },
+        );
+        assert_eq!(stage.results.len(), 7);
+        assert!(!stage.results.contains_key(rejected));
+        assert_eq!(stage.failed_fns, BTreeSet::from(["c1".to_string()]));
+        assert!(
+            stage.inconclusive_cases.is_empty(),
+            "a kernel rejection is never inconclusive: {:?}",
+            stage.inconclusive_cases
+        );
+        assert!(
+            itree_partially_comparable_fns(&stage, &cases, ident, &case_to_fn, |_| true).is_empty(),
+            "a refuted candidate must be dropped whole"
+        );
+        assert!(
+            stage.errors.iter().any(|e| {
+                e.contains("irreducible single case `case_c1_t1` of `c1`")
+                    && e.contains("Tactic `rfl` failed")
+            }),
+            "expected the rejection diagnostic in {:?}",
+            stage.errors
+        );
+        let labels: Vec<String> = runs
+            .into_inner()
+            .unwrap()
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect();
+        assert_labels_unique_file_stems(&labels);
+    }
+
+    /// Concurrent chunk workers and the Stage 2 replacement rounds (which reuse
+    /// the confirm runner under their own stage labels) never share a `.lean`
+    /// module label, even when every chunk of every round splits.
+    #[test]
+    fn adaptive_stage2_split_labels_stay_disjoint_across_concurrent_chunks_and_replacement_rounds()
+    {
+        let (cases, case_to_fn) = stage_fixture(&[("c0", 4), ("c1", 4), ("c2", 4), ("c3", 4)]);
+        let runs = MockLeanRuns::default();
+        for stage_label in [
+            "ItreeDiffBatchConfirm",
+            "ItreeDiffBatchConfirmReplacement",
+            "ItreeDiffBatchConfirmReplacement2",
+        ] {
+            let stage = run_isolated_lean_stage(
+                stage_label,
+                &cases,
+                8,
+                2,
+                ident,
+                &case_to_fn,
+                |label: &str, chunk: &[String]| {
+                    run_adaptive_confirm_chunk(
+                        label,
+                        chunk,
+                        &ident,
+                        &|sub_label: &str, slice: &[String]| {
+                            runs.lock()
+                                .unwrap()
+                                .push((sub_label.to_string(), slice.to_vec()));
+                            if slice.len() > 2 {
+                                Err(mock_rss_exceeded(sub_label))
+                            } else {
+                                ok_all(slice)
+                            }
+                        },
+                    )
+                },
+            );
+            assert!(stage.errors.is_empty(), "{stage_label}: {:?}", stage.errors);
+            assert!(stage.failed_fns.is_empty() && stage.inconclusive_cases.is_empty());
+            assert_eq!(stage.results.len(), 16);
+        }
+        let labels: Vec<String> = runs
+            .into_inner()
+            .unwrap()
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect();
+        // 3 rounds x 2 concurrent chunks x (8, 4+4, 2+2+2+2).
+        assert_eq!(labels.len(), 3 * 2 * 7);
+        assert_labels_unique_file_stems(&labels);
+    }
+
+    /// For every chunk size up to [`ITREE_MAX_CONFIRM_CHUNK_SIZE`] and every
+    /// module size that fits in memory, the successful sub-slices partition the
+    /// chunk in order: no case is skipped, repeated, or reordered, whichever of
+    /// the two memory failure kinds (RSS watchdog, Lean `-M`) triggers a split.
+    #[test]
+    fn adaptive_stage2_split_partitions_every_chunk_size_in_order_without_gaps_or_repeats() {
+        for k in 1..=ITREE_MAX_CONFIRM_CHUNK_SIZE {
+            let cases: Vec<String> = (0..k).map(|i| format!("case_f_t{i}")).collect();
+            for max_ok in [1usize, 2, 3, 5, 8, ITREE_MAX_CONFIRM_CHUNK_SIZE] {
+                let runs = MockLeanRuns::default();
+                let res = run_adaptive_confirm_chunk(
+                    "Base",
+                    &cases,
+                    &ident,
+                    &|label: &str, slice: &[String]| {
+                        let mut runs = runs.lock().unwrap();
+                        let attempt = runs.len();
+                        runs.push((label.to_string(), slice.to_vec()));
+                        if slice.len() <= max_ok {
+                            ok_all(slice)
+                        } else if attempt % 2 == 0 {
+                            Err(mock_rss_exceeded(label))
+                        } else {
+                            Err(mock_lean_memory_exhausted(label))
+                        }
+                    },
+                )
+                .unwrap_or_else(|e| panic!("k={k} max_ok={max_ok} must recover: {e}"));
+                let runs = runs.into_inner().unwrap();
+                assert_eq!(
+                    res.keys().cloned().collect::<BTreeSet<String>>(),
+                    cases.iter().cloned().collect::<BTreeSet<String>>(),
+                    "k={k} max_ok={max_ok}"
+                );
+                let confirmed: Vec<String> = runs
+                    .iter()
+                    .filter(|(_, s)| s.len() <= max_ok)
+                    .flat_map(|(_, s)| s.iter().cloned())
+                    .collect();
+                assert_eq!(confirmed, cases, "k={k} max_ok={max_ok}");
+                for (label, slice) in &runs {
+                    assert!(!slice.is_empty(), "empty module `{label}` (k={k})");
+                }
+                // Every failing run halves, so at most `k - 1` runs fail before
+                // the at most `k` successful leaves.
+                assert!(
+                    runs.len() < 2 * k,
+                    "k={k} max_ok={max_ok}: {} runs",
+                    runs.len()
+                );
+                assert_eq!(runs[0].0, "Base");
+                assert_eq!(runs[0].1, cases);
+                let labels: Vec<String> = runs.iter().map(|(l, _)| l.clone()).collect();
+                assert_labels_unique_file_stems(&labels);
+            }
+        }
+    }
+
+    /// Only memory failures split: a timeout, a missing toolchain, and a kernel
+    /// or elaboration rejection are returned verbatim after exactly one run,
+    /// while a signal-terminated root (e.g. the cgroup OOM killer) splits. A
+    /// sub-slice that reports success without a result for each of its cases
+    /// fails the chunk closed.
+    #[test]
+    fn adaptive_stage2_split_only_splits_memory_failures_and_rejects_incomplete_subchunks() {
+        let cases: Vec<String> = (0..4).map(|i| format!("case_f_t{i}")).collect();
+        for (err, kind) in [
+            (
+                "[WATCHDOG:TIMEOUT] `/tmp/verify/Base.lean` exceeded wall-clock timeout \
+                 (195s for 4 case(s), peak RSS 900000 KiB / 8388608 KiB, LEAN_NUM_THREADS=2):",
+                ItreeLeanFailureKind::WallClockTimeout,
+            ),
+            (
+                "failed to run `lake env lean` on /tmp/verify/Base.lean: No such file or \
+                 directory (os error 2)",
+                ItreeLeanFailureKind::MissingToolchain,
+            ),
+            (
+                "`/tmp/verify/Base.lean` failed (peak RSS 600000 KiB / 8388608 KiB, -M 7168 MiB, \
+                 LEAN_NUM_THREADS=2):\nstdout:\n/tmp/verify/Base.lean:3:2: error: unknown \
+                 constant 'case_f_t0_rawTrace'\nstderr:\n",
+                ItreeLeanFailureKind::ElaborationOrOutputFailure,
+            ),
+        ] {
+            assert_eq!(classify_itree_lean_failure(err), kind);
+            let calls = AtomicUsize::new(0);
+            let got = run_adaptive_confirm_chunk(
+                "Base",
+                &cases,
+                &ident,
+                &|_label: &str, _slice: &[String]| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err::<BTreeMap<String, usize>, String>(err.to_string())
+                },
+            )
+            .expect_err("a non-memory failure must fail closed");
+            assert_eq!(got, err, "{kind:?} must be returned verbatim");
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{kind:?} must not split");
+        }
+
+        // A root killed by a signal is a memory-kind failure: halves are retried.
+        let signal_runs = MockLeanRuns::default();
+        let recovered =
+            run_adaptive_confirm_chunk("Base", &cases, &ident, &|label: &str, slice: &[String]| {
+                signal_runs
+                    .lock()
+                    .unwrap()
+                    .push((label.to_string(), slice.to_vec()));
+                if slice.len() > 2 {
+                    Err(format!(
+                        "[LEAN:RESOURCE_EXHAUSTED] terminated by a signal (e.g. the cgroup OOM \
+                         killer) `/tmp/verify/{label}.lean` failed (peak RSS 5900000 KiB / \
+                         8388608 KiB, -M 7168 MiB, LEAN_NUM_THREADS=2):\nstdout:\n\nstderr:\n"
+                    ))
+                } else {
+                    ok_all(slice)
+                }
+            })
+            .expect("halves of a signal-killed module must be retried");
+        assert_eq!(recovered.len(), 4);
+        assert_eq!(signal_runs.into_inner().unwrap().len(), 3);
+
+        // A sub-slice "succeeding" without `case_f_t3` must not complete the chunk.
+        let incomplete =
+            run_adaptive_confirm_chunk("Base", &cases, &ident, &|label: &str, slice: &[String]| {
+                if slice.len() > 2 {
+                    return Err(mock_rss_exceeded(label));
+                }
+                let mut map = ok_all(slice)?;
+                map.remove("case_f_t3");
+                Ok(map)
+            })
+            .expect_err("an incomplete sub-slice must fail the chunk closed");
+        assert!(
+            incomplete.contains("Base_split_d1_2_4")
+                && incomplete.contains("produced no result for `case_f_t3`"),
+            "{incomplete}"
+        );
+        // ... and neither may the unsplit chunk itself, or an empty result.
+        let unsplit = run_adaptive_confirm_chunk(
+            "Base",
+            &cases,
+            &ident,
+            &|_label: &str, _slice: &[String]| Ok(BTreeMap::<String, usize>::new()),
+        )
+        .expect_err("an empty result must fail closed");
+        assert!(
+            unsplit.contains("produced no result for `case_f_t0`"),
+            "{unsplit}"
+        );
+
+        // No cases, no Lean run.
+        let calls = AtomicUsize::new(0);
+        let empty = run_adaptive_confirm_chunk(
+            "Base",
+            &[] as &[String],
+            &ident,
+            &|_label: &str, slice: &[String]| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                ok_all(slice)
+            },
+        )
+        .expect("an empty chunk is trivially confirmed");
+        assert!(empty.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }
