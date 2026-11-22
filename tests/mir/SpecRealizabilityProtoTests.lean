@@ -3041,6 +3041,524 @@ run_meta do
 
 end HardeningB2
 
+/-! ## Hardening (pass A2): exhaustive cofactors, inhabitants, and witnesses -/
+
+namespace HardeningA2
+
+/-! ### Part I: dichotomy modulo an observation -/
+
+/-- The parity of the output, as an observation. -/
+def parityObs (_ : Nat) (r : Nat) : Nat := r % 2
+
+/-- `r = x` separates two outputs of the same parity. -/
+theorem eq_dichotomyModuloParity :
+    DichotomyModuloObservation parityObs (fun _ => True) (fun x r => r = x) :=
+  ⟨0, 0, 2, trivial, rfl, rfl, (by decide : ¬ (2 : Nat) = 0)⟩
+
+/-- The fibre form: both witnesses lie over one observed value. -/
+theorem eq_dichotomy_on_a_parity_fibre :
+    ∃ b x ok bad, True ∧ parityObs x ok = b ∧ parityObs x bad = b ∧
+      ok = x ∧ ¬ bad = x :=
+  (dichotomyModuloObservation_iff_fibres parityObs).mp eq_dichotomyModuloParity
+
+/-- "The output is even" has a dichotomy, but none modulo parity. -/
+theorem even_dichotomy :
+    PostconditionDichotomy (fun (_ : Nat) => True) (fun _ r => r % 2 = 0) :=
+  ⟨0, 0, 1, trivial, rfl, (by decide : ¬ (1 % 2 = 0))⟩
+
+theorem even_not_dichotomyModuloParity :
+    ¬ DichotomyModuloObservation parityObs (fun _ => True)
+      (fun _ r => r % 2 = 0) :=
+  not_dichotomyModuloObservation_of_factors (fun _ b => b = 0)
+    fun _ _ _ => Iff.rfl
+
+/-- The same fact through the cofactors: each fibre's cofactor is constant. -/
+theorem even_not_dichotomyModuloParity_by_cofactors :
+    ¬ DichotomyModuloObservation parityObs (fun _ => True)
+      (fun _ r => r % 2 = 0) :=
+  not_dichotomyModuloObservation_of_cofactors_insensitive
+    (fun b _ _ => b = 0) (fun _ _ _ => Iff.rfl) (fun _ _ _ _ _ h => h)
+
+/-- Coarsening parity to evenness, then back to the one-predicate notion. -/
+theorem eq_dichotomyBeyond_even :
+    DichotomyBeyondPredicate (fun (_ : Nat) r => r % 2 = 0) (fun _ => True)
+      (fun x r => r = x) :=
+  (dichotomyBeyondPredicate_iff_moduloObservation _).mpr
+    (eq_dichotomyModuloParity.of_coarser
+      fun _ o₁ o₂ (h : o₁ % 2 = o₂ % 2) => by
+        show (o₁ % 2 = 0) = (o₂ % 2 = 0)
+        rw [h])
+
+/-- A constant observation is no observation. -/
+theorem eq_dichotomyModuloConst :
+    DichotomyModuloObservation (fun (_ _ : Nat) => ()) (fun _ => True)
+      (fun x r => r = x) :=
+  (dichotomyModuloObservation_const_iff ()).mpr
+    eq_dichotomyModuloParity.toPostconditionDichotomy
+
+/-- An observation that determines the output leaves nothing to bind. -/
+theorem eq_not_dichotomyModuloSucc :
+    ¬ DichotomyModuloObservation (fun (_ r : Nat) => r + 1) (fun _ => True)
+      (fun x r => r = x) :=
+  not_dichotomyModuloObservation_of_injective fun _ _ _ h => Nat.succ.inj h
+
+/-- The exact negation, used as a rewriting rule. -/
+theorem even_determined_by_parity (x r₁ r₂ : Nat) (h : r₁ % 2 = r₂ % 2)
+    (h₁ : r₁ % 2 = 0) : r₂ % 2 = 0 :=
+  (not_dichotomyModuloObservation_iff parityObs).mp
+    even_not_dichotomyModuloParity x r₁ r₂ trivial h h₁
+
+/-! ### Cofactoring is exhaustive: the binding assignment may be any of `2 ^ k` -/
+
+/-- A memory whose protector stack is not the empty memory's. -/
+def protectedMemory : Memory := { emptyMemory with activeProtectors := [7] }
+
+/-- A memory with yet another protector stack. -/
+def otherProtectedMemory : Memory :=
+  { emptyMemory with activeProtectors := [8] }
+
+/-- A request issued in `protectedMemory`. -/
+def protectedReq : MirCallReq :=
+  { defPath := "", args := .nil, memory := protectedMemory }
+
+theorem not_frame_empty_protected :
+    ¬ callFramePreserved emptyMemory protectedMemory :=
+  fun h => List.cons_ne_nil 7 [] h.2.2.2.1
+
+theorem not_frame_protected_empty :
+    ¬ callFramePreserved protectedMemory emptyMemory :=
+  fun h => List.cons_ne_nil 7 [] h.2.2.2.1.symm
+
+theorem not_frame_protected_other :
+    ¬ callFramePreserved protectedMemory otherProtectedMemory :=
+  fun h => absurd (List.cons.inj h.2.2.2.1).1 (by decide)
+
+theorem not_frame_empty_other :
+    ¬ callFramePreserved emptyMemory otherProtectedMemory :=
+  fun h => List.cons_ne_nil 8 [] h.2.2.2.1
+
+/--
+The five frame atoms of `fiveAtomGuard` and `fiveAtomBoilerplate`, as the
+observation the checker fixes when it cofactors them.
+-/
+def fiveFrameObs (req : MirCallReq) (out : Value × Memory) :
+    Prop × Prop × Prop × Prop × Prop :=
+  (callFramePreserved req.memory out.2, callFramePreserved out.2 req.memory,
+    callFramePreserved emptyMemory out.2, callFramePreserved out.2 emptyMemory,
+    callFramePreserved out.2 out.2)
+
+/--
+Five boilerplate atoms, with the user constraint guarded by the *mixed* truth
+assignment `(true, true, false, false, true)`. Sampling the all-true, the
+all-false, and the single-flip assignments never reaches it; only an
+exhaustive enumeration does.
+-/
+def fiveAtomGuard : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned retVal memAfter =>
+      (callFramePreserved req.memory memAfter ∧
+        callFramePreserved memAfter req.memory ∧
+        ¬ callFramePreserved emptyMemory memAfter ∧
+        ¬ callFramePreserved memAfter emptyMemory ∧
+        callFramePreserved memAfter memAfter) → retVal = u32Arg 1
+    | .panicked _ => False
+    | .aborted => False
+
+theorem fiveAtomGuard_returnValueDichotomy :
+    MirCallContractReturnValueDichotomy fiveAtomGuard :=
+  ⟨protectedReq, u32Arg 1, u32Arg 2, protectedMemory, trivial, fun _ => rfl,
+    fun h => absurd
+      (u32Arg_inj (h ⟨callFramePreserved_refl _, callFramePreserved_refl _,
+        not_frame_empty_protected, not_frame_protected_empty,
+        callFramePreserved_refl _⟩))
+      (by decide)⟩
+
+/--
+The guard binds beyond its own five atoms: the two returns share the memory,
+and the atoms are functions of the memory.
+-/
+theorem fiveAtomGuard_dichotomyModuloItsAtoms :
+    DichotomyModuloObservation fiveFrameObs fiveAtomGuard.pre
+      (mirCallNormalPost fiveAtomGuard) :=
+  (mirCallContractReturnValueDichotomy_iff_moduloMemory.mp
+    fiveAtomGuard_returnValueDichotomy).of_coarser
+    fun req o₁ o₂ (h : o₁.2 = o₂.2) => by
+      show fiveFrameObs req o₁ = fiveFrameObs req o₂
+      simp only [fiveFrameObs, h]
+
+/-- The dichotomy sits in the cofactor of exactly one assignment. -/
+theorem fiveAtomGuard_cofactor :
+    ∃ b req ok bad, fiveAtomGuard.pre req ∧
+      fiveFrameObs req ok = b ∧ fiveFrameObs req bad = b ∧
+      ((b.1 ∧ b.2.1 ∧ ¬ b.2.2.1 ∧ ¬ b.2.2.2.1 ∧ b.2.2.2.2) →
+        ok.1 = u32Arg 1) ∧
+      ¬ ((b.1 ∧ b.2.1 ∧ ¬ b.2.2.1 ∧ ¬ b.2.2.2.1 ∧ b.2.2.2.2) →
+        bad.1 = u32Arg 1) :=
+  fiveAtomGuard_dichotomyModuloItsAtoms.exists_cofactor_dichotomy
+    (fun (b : Prop × Prop × Prop × Prop × Prop) (_ : MirCallReq)
+        (out : Value × Memory) =>
+      (b.1 ∧ b.2.1 ∧ ¬ b.2.2.1 ∧ ¬ b.2.2.2.1 ∧ b.2.2.2.2) →
+        out.1 = u32Arg 1)
+    fun _ _ _ => Iff.rfl
+
+/--
+Pure boilerplate over the same five atoms (the last disjunct is refuted once
+the frame is unfolded, so the full analysis still sees a frame constraint).
+-/
+def fiveAtomBoilerplate : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned _ memAfter =>
+      (callFramePreserved req.memory memAfter ∧
+          callFramePreserved memAfter req.memory) ∨
+        (¬ callFramePreserved emptyMemory memAfter ∧
+          callFramePreserved memAfter emptyMemory) ∨
+        ¬ callFramePreserved memAfter memAfter
+    | .panicked _ => False
+    | .aborted => True
+
+/-- Every one of its 32 cofactors is output-free: no dichotomy modulo the atoms. -/
+theorem fiveAtomBoilerplate_not_dichotomyModuloItsAtoms :
+    ¬ DichotomyModuloObservation fiveFrameObs fiveAtomBoilerplate.pre
+      (mirCallNormalPost fiveAtomBoilerplate) :=
+  not_dichotomyModuloObservation_of_cofactors_insensitive
+    (fun b _ _ => (b.1 ∧ b.2.1) ∨ (¬ b.2.2.1 ∧ b.2.2.2.1) ∨ ¬ b.2.2.2.2)
+    (fun _ _ _ => Iff.rfl) (fun _ _ _ _ _ h => h)
+
+theorem fiveAtomBoilerplate_not_returnValueDichotomy :
+    ¬ MirCallContractReturnValueDichotomy fiveAtomBoilerplate :=
+  not_mirCallContractReturnValueDichotomy_of_value_blind
+    fun _ _ _ _ _ => Iff.rfl
+
+/--
+Nine distinct boilerplate atoms and nothing else. Past `maxCofactorAtoms` the
+checker does not enumerate; it reports the conservative *binds* together with
+a note, although the contract is value-blind (a completeness limit, never a
+false positive).
+-/
+def nineAtomBoilerplate : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned _ memAfter =>
+      (callFramePreserved req.memory memAfter ∧
+          callFramePreserved memAfter req.memory) ∨
+        (¬ callFramePreserved emptyMemory memAfter ∧
+          callFramePreserved memAfter emptyMemory) ∨
+        (callFramePreserved memAfter memAfter ∧
+          ¬ callFramePreserved req.memory req.memory) ∨
+        (callFramePreserved emptyMemory req.memory ∧
+          ¬ callFramePreserved req.memory emptyMemory) ∨
+        ¬ callFramePreserved emptyMemory emptyMemory
+    | .panicked _ => False
+    | .aborted => True
+
+theorem nineAtomBoilerplate_not_returnValueDichotomy :
+    ¬ MirCallContractReturnValueDichotomy nineAtomBoilerplate :=
+  not_mirCallContractReturnValueDichotomy_of_value_blind
+    fun _ _ _ _ _ => Iff.rfl
+
+/-! ### Boilerplate predicates at other arguments, and under binders -/
+
+/-- Two rejected frames are observed alike by the frame and return-type pair. -/
+theorem protected_obs_eq (sidecar : CapturedMir) (v : Value) :
+    externalSpecBoilerplateObs sidecar protectedReq (v, emptyMemory) =
+      externalSpecBoilerplateObs sidecar protectedReq
+        (v, otherProtectedMemory) :=
+  congrArg (fun p => (p, retMatchesCalleeReturnTy sidecar v))
+    (propext ⟨fun h => absurd h not_frame_protected_empty,
+      fun h => absurd h not_frame_protected_other⟩)
+
+/--
+A boilerplate predicate applied to a *bound* memory. The clause says that the
+protector stack is empty after the call, which the frame of the request does
+not determine; the bound atom is not an observation of the output, and treating
+it as one (cofactoring it to `True`/`False`) would report `boilerplateOnly`.
+-/
+def quantifiedFrame : MirCallContract where
+  pre _ := True
+  post _ ans :=
+    match ans with
+    | .returned _ memAfter =>
+      ∀ m' : Memory, callFramePreserved m' memAfter → m'.activeProtectors = []
+    | .panicked _ => False
+    | .aborted => False
+
+theorem quantifiedFrame_iff (m : Memory) :
+    (∀ m' : Memory, callFramePreserved m' m → m'.activeProtectors = []) ↔
+      m.activeProtectors = [] :=
+  ⟨fun h => h m (callFramePreserved_refl m),
+    fun h _ hf => hf.2.2.2.1.symm.trans h⟩
+
+theorem quantifiedFrame_dichotomyModuloBoilerplate (sidecar : CapturedMir) :
+    DichotomyModuloObservation (externalSpecBoilerplateObs sidecar)
+      quantifiedFrame.pre (mirCallNormalPost quantifiedFrame) :=
+  ⟨protectedReq, (Value.unit, emptyMemory), (Value.unit, otherProtectedMemory),
+    trivial, protected_obs_eq sidecar Value.unit,
+    (quantifiedFrame_iff emptyMemory).mpr rfl,
+    fun h => List.cons_ne_nil 8 [] ((quantifiedFrame_iff _).mp h)⟩
+
+/--
+A frame predicate at *other* arguments than the contract's own. By convention
+every closed application of a boilerplate predicate is an observation, so the
+checker reports `boilerplateOnly`: there is no dichotomy modulo that atom
+(`otherFrameInstance_not_dichotomyModuloItsAtom`). The convention is visible,
+not hidden: relative to the canonical frame-and-return-type observation the
+clause does separate two memories
+(`otherFrameInstance_dichotomyModuloBoilerplate`), and the default mode reports
+that it binds `memAfter`.
+-/
+def otherFrameInstance : MirCallContract where
+  pre _ := True
+  post _ ans :=
+    match ans with
+    | .returned _ memAfter => callFramePreserved emptyMemory memAfter
+    | .panicked _ => False
+    | .aborted => False
+
+theorem otherFrameInstance_not_dichotomyModuloItsAtom :
+    ¬ DichotomyModuloObservation
+      (fun (_ : MirCallReq) (out : Value × Memory) =>
+        callFramePreserved emptyMemory out.2)
+      otherFrameInstance.pre (mirCallNormalPost otherFrameInstance) :=
+  not_dichotomyModuloObservation_of_factors (fun _ b => b) fun _ _ _ => Iff.rfl
+
+theorem otherFrameInstance_dichotomyModuloBoilerplate (sidecar : CapturedMir) :
+    DichotomyModuloObservation (externalSpecBoilerplateObs sidecar)
+      otherFrameInstance.pre (mirCallNormalPost otherFrameInstance) :=
+  ⟨protectedReq, (Value.unit, emptyMemory), (Value.unit, otherProtectedMemory),
+    trivial, protected_obs_eq sidecar Value.unit,
+    callFramePreserved_refl emptyMemory, not_frame_empty_other⟩
+
+/-- The frame-only contract binds nothing modulo the canonical observation. -/
+theorem frameOnly_not_dichotomyModuloBoilerplate (sidecar : CapturedMir) :
+    ¬ DichotomyModuloObservation (externalSpecBoilerplateObs sidecar)
+      frameOnlyMirCallContract.pre
+      (mirCallNormalPost frameOnlyMirCallContract) :=
+  frameOnlyMirCallContract_not_dichotomyModuloBoilerplate sidecar
+
+/-- `ensures(true)` on an external spec, through the pair observation. -/
+theorem extSpecDefault_not_dichotomyModuloBoilerplate (target : DefPath)
+    (sidecar : CapturedMir) :
+    ¬ DichotomyModuloObservation (externalSpecBoilerplateObs sidecar)
+      (Class5.extSpecDefault target sidecar).pre
+      (mirCallNormalPost (Class5.extSpecDefault target sidecar)) :=
+  fun h => not_externalSpecEnsuresDichotomy_default target sidecar
+    (fun _ => True)
+    ((externalSpecEnsuresDichotomy_iff_moduloObservation target sidecar
+      (fun _ => True) (fun _ _ => True)).mpr h)
+
+run_meta do
+  let user : EnsuresCheckConfig := { userEnsuresOnly := true }
+  let strictUser : EnsuresCheckConfig :=
+    { userEnsuresOnly := true, strictReturnValue := true }
+  -- The guard is one mixed assignment out of 32; it must be found.
+  let r ← reportOf ``fiveAtomGuard
+  unless r.bindsOutput && r.bindsBeyondBoilerplate do
+    throwError "fiveAtomGuard: expected binding beyond boilerplate\n{r.describe}"
+  assertEnsuresBindsOutput ``fiveAtomGuard (cfg := user)
+  assertEnsuresBindsOutput ``fiveAtomGuard (cfg := strictUser)
+  -- Five atoms of pure boilerplate are still recognised as such.
+  let r ← reportOf ``fiveAtomBoilerplate
+  unless r.bindsOutput && !r.bindsBeyondBoilerplate do
+    throwError "fiveAtomBoilerplate: expected boilerplate-only binding\n\
+      {r.describe}"
+  expectReason ``fiveAtomBoilerplate .boilerplateOnly (cfg := user)
+  expectReason ``fiveAtomBoilerplate .returnValueUnconstrained
+    (cfg := { strictReturnValue := true })
+  -- Past the enumeration bound the verdict is conservative, and says so.
+  let r ← reportOf ``nineAtomBoilerplate (cfg := user)
+  unless r.bindsOutput && r.bindsBeyondBoilerplate &&
+      r.notes.any (fun n => (n.splitOn "cofactoring abandoned").length > 1) do
+    throwError "nineAtomBoilerplate: expected a conservative verdict with a \
+      note\n{r.describe}"
+  expectReason ``nineAtomBoilerplate .returnValueUnconstrained
+    (cfg := strictUser)
+  -- A boilerplate predicate at a bound argument is not cofactored away.
+  let r ← reportOf ``quantifiedFrame
+  unless r.bindsOutput && r.bindsBeyondBoilerplate do
+    throwError "quantifiedFrame: expected binding beyond boilerplate\n\
+      {r.describe}"
+  assertEnsuresBindsOutput ``quantifiedFrame (cfg := user)
+  -- The stated convention for closed atoms at other arguments.
+  let r ← reportOf ``otherFrameInstance
+  unless r.bindsOutput && !r.bindsBeyondBoilerplate do
+    throwError "otherFrameInstance: expected boilerplate-only binding\n\
+      {r.describe}"
+  expectReason ``otherFrameInstance .boilerplateOnly (cfg := user)
+  expectReason ``frameOnlyMirCallContract .boilerplateOnly (cfg := user)
+
+/-! ### Output types with a single inhabitant in disguise -/
+
+/-- `Option Empty` is inhabited by `none` alone. -/
+def optionEmptyNone : Nat → Option Empty → Prop := fun _ r => r = none
+
+theorem optionEmptyNone_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre optionEmptyNone :=
+  not_dichotomy_of_const_true fun _ r _ =>
+    match r with
+    | none => rfl
+    | some e => nomatch e
+
+/-- `List Empty` is inhabited by `[]` alone. -/
+def listEmptyNil : Nat → List Empty → Prop := fun _ r => r = []
+
+theorem listEmptyNil_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre listEmptyNil :=
+  not_dichotomy_of_const_true fun _ r _ =>
+    match r with
+    | [] => rfl
+    | e :: _ => nomatch e
+
+/-- Both sides range over the one inhabitant of `Option PEmpty`. -/
+def optionPEmptyEq : Option PEmpty.{1} → Option PEmpty.{1} → Prop :=
+  fun x r => r = x
+
+theorem optionPEmptyEq_not_dichotomy (pre : Option PEmpty.{1} → Prop) :
+    ¬ PostconditionDichotomy pre optionPEmptyEq :=
+  not_dichotomy_of_subsingleton_output fun a b =>
+    match a, b with
+    | none, none => rfl
+    | some e, _ => nomatch e
+    | _, some e => nomatch e
+
+/-- Only `Sum.inr` builds a value of `Sum Empty Nat`. -/
+def sumEmptyInr : Nat → Sum Empty Nat → Prop := fun _ r => ∃ n, r = Sum.inr n
+
+theorem sumEmptyInr_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre sumEmptyInr :=
+  not_dichotomy_of_const_true fun _ r _ =>
+    match r with
+    | .inr n => ⟨n, rfl⟩
+    | .inl e => nomatch e
+
+/-- A structure over a one-inhabitant field has one inhabitant. -/
+structure EmptyBox where
+  content : Option Empty
+
+def emptyBoxPinned : Nat → EmptyBox → Prop := fun _ r => r = ⟨none⟩
+
+theorem emptyBoxPinned_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre emptyBoxPinned :=
+  not_dichotomy_of_const_true fun _ r _ =>
+    match r with
+    | ⟨none⟩ => rfl
+    | ⟨some e⟩ => nomatch e
+
+#expect_vacuous emptyBoxPinned reflexiveTautology
+#expect_vacuous optionEmptyNone reflexiveTautology
+#expect_vacuous listEmptyNil reflexiveTautology
+#expect_vacuous optionPEmptyEq reflexiveTautology
+#expect_vacuous sumEmptyInr semanticallyInsensitive
+
+/-- Over an inhabited element type the same equations are genuine. -/
+def optionNatNone : Nat → Option Nat → Prop := fun _ r => r = none
+
+theorem optionNatNone_dichotomy :
+    PostconditionDichotomy (fun _ => True) optionNatNone :=
+  ⟨0, none, some 0, trivial, rfl, fun (h : some 0 = none) => nomatch h⟩
+
+def listOptionEmptyNil : Nat → List (Option Empty) → Prop := fun _ r => r = []
+
+theorem listOptionEmptyNil_dichotomy :
+    PostconditionDichotomy (fun _ => True) listOptionEmptyNil :=
+  ⟨0, [], [none], trivial, rfl, fun (h : [none] = []) => nomatch h⟩
+
+def sumEmptyPinned : Nat → Sum Empty Nat → Prop := fun _ r => r = Sum.inr 3
+
+theorem sumEmptyPinned_dichotomy :
+    PostconditionDichotomy (fun _ => True) sumEmptyPinned :=
+  ⟨0, .inr 3, .inr 4, trivial, rfl, fun h => absurd (Sum.inr.inj h) (by decide)⟩
+
+/-- An empty type among the *inputs* does not make the output unbound. -/
+def emptyInputPinned : Option Empty → Nat → Prop := fun _ r => r = 0
+
+theorem emptyInputPinned_dichotomy :
+    PostconditionDichotomy (fun _ => True) emptyInputPinned :=
+  ⟨none, 0, 1, trivial, rfl, (by decide : ¬ (1 : Nat) = 0)⟩
+
+#expect_binds optionNatNone
+#expect_binds listOptionEmptyNil
+#expect_binds sumEmptyPinned
+#expect_binds emptyInputPinned
+
+/-! ### Existential witnesses beyond a leading `∃` -/
+
+vacuous_case forallExistsBound semanticallyInsensitive :=
+  fun _ r => ∀ a, ∃ b, a + r ≤ b
+  by
+    intro _ r₁ r₂
+    exact ⟨fun _ a => ⟨a + r₂, Nat.le_refl _⟩,
+      fun _ a => ⟨a + r₁, Nat.le_refl _⟩⟩
+
+vacuous_case zeroOrSucc semanticallyInsensitive :=
+  fun _ r => r = 0 ∨ ∃ y, r = y + 1
+  by
+    intro _ r₁ r₂
+    have h : ∀ r : Nat, r = 0 ∨ ∃ y, r = y + 1 := fun r =>
+      match r with
+      | 0 => .inl rfl
+      | n + 1 => .inr ⟨n, rfl⟩
+    exact ⟨fun _ => h r₂, fun _ => h r₁⟩
+
+vacuous_case evenOrOdd semanticallyInsensitive :=
+  fun _ r => (∃ k, r = 2 * k) ∨ (∃ k, r = 2 * k + 1)
+  by
+    intro _ r₁ r₂
+    have h : ∀ r : Nat, (∃ k, r = 2 * k) ∨ (∃ k, r = 2 * k + 1) := fun r =>
+      (Nat.mod_two_eq_zero_or_one r).elim
+        (fun h => .inl ⟨r / 2, by omega⟩) (fun h => .inr ⟨r / 2, by omega⟩)
+    exact ⟨fun _ => h r₂, fun _ => h r₁⟩
+
+vacuous_case forallLeExistsDiff semanticallyInsensitive :=
+  fun _ r => ∀ a, a ≤ r → ∃ b, r = a + b
+  by
+    intro _ r₁ r₂
+    exact ⟨fun _ a _ => ⟨r₂ - a, by omega⟩, fun _ a _ => ⟨r₁ - a, by omega⟩⟩
+
+vacuous_case ltExistsGap semanticallyInsensitive :=
+  fun x r => x < r → ∃ d, r = x + d + 1
+  by
+    intro x r₁ r₂
+    exact ⟨fun _ _ => ⟨r₂ - x - 1, by omega⟩, fun _ _ => ⟨r₁ - x - 1, by omega⟩⟩
+
+genuine_case forallExistsBelow :=
+  fun _ r => ∀ a : Nat, ∃ b, b < r ∧ a = a
+  witness 0 1 0 by
+    exact ⟨fun _ => ⟨0, by omega, rfl⟩,
+      fun h => by obtain ⟨b, hb, _⟩ := h 0; omega⟩
+
+genuine_case zeroOrSuccSucc :=
+  fun _ r => r = 0 ∨ ∃ y, r = y + 2
+  witness 0 0 1 by
+    exact ⟨.inl rfl, fun h => by rcases h with h | ⟨y, h⟩ <;> omega⟩
+
+genuine_case evenOrOneModFour :=
+  fun _ r => (∃ k, r = 2 * k) ∨ (∃ k, r = 4 * k + 1)
+  witness 0 0 3 by
+    exact ⟨.inl ⟨0, rfl⟩, fun h => by rcases h with ⟨k, h⟩ | ⟨k, h⟩ <;> omega⟩
+
+genuine_case forallBelowExistsSum :=
+  fun x r => ∀ a, a < x → ∃ b, r = a + b
+  witness 2 1 0 by
+    exact ⟨fun a _ => ⟨1 - a, by omega⟩,
+      fun h => by obtain ⟨b, hb⟩ := h 1 (by omega); omega⟩
+
+genuine_case notSucc :=
+  fun _ r => ¬ ∃ y, r = y + 1
+  witness 0 0 1 by
+    exact ⟨fun ⟨y, h⟩ => by omega, fun h => h ⟨0, rfl⟩⟩
+
+genuine_case existsInHypothesis :=
+  fun x r => (∃ y, x = y + 1) → r = x
+  witness 1 1 0 by
+    exact ⟨fun _ => rfl, fun h => by have := h ⟨0, rfl⟩; omega⟩
+
+end HardeningA2
+
 /-! ## Axiom and soundness audit -/
 
 namespace Audit

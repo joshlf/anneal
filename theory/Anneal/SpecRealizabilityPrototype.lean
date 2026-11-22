@@ -38,7 +38,10 @@ It has two parts.
   rejected output. Its negation is exactly `OutputInsensitive`
   (`not_postconditionDichotomy_iff_outputInsensitive`), so each of the classes
   2–5 refutes it, and it is equivalent to the existence of a killed output
-  mutant (`postconditionDichotomy_iff_exists_killed_mutant`).
+  mutant (`postconditionDichotomy_iff_exists_killed_mutant`). Its relativised
+  form `DichotomyModuloObservation` asks for the two outputs to agree on a
+  given observation (the frame and return-type boilerplate of an external
+  spec), which is what "the user `ensures` clause binds the output" means.
 
 * **Part II (`MetaM`).** `checkEnsuresBindsOutput` inspects the `Expr` of a
   postcondition, normalises it by logical equivalences and definitional
@@ -828,6 +831,195 @@ theorem not_dichotomyBeyondPredicate_of_boilerplate_only
   fun ⟨inp, ok, bad, hp, hiff, hok, hbad⟩ =>
     hbad ((h inp ok bad hp hiff).mp hok)
 
+/-! ### Dichotomy modulo an observation (several boilerplate predicates) -/
+
+/--
+`post` separates two outputs that the observation `obs` cannot tell apart: some
+admissible input has an accepted `out_ok` and a rejected `out_bad` with
+`obs inp out_ok = obs inp out_bad`.
+
+`DichotomyBeyondPredicate bp` is the instance `obs := bp`
+(`dichotomyBeyondPredicate_iff_moduloObservation`). With several boilerplate
+predicates the observation that matters is the *tuple* of their truth values:
+the two candidates have to agree on **each** predicate. Agreeing on their
+conjunction is strictly coarser (`exists_dichotomyBeyond_conj_not_moduloPair`):
+a postcondition that merely repeats one of two boilerplate predicates separates
+two outputs on which the conjunction is false both times. The tuple is what
+the checker fixes in `userEnsuresOnly` mode, one cofactor per truth assignment
+(`not_dichotomyModuloObservation_of_cofactors_insensitive`).
+-/
+def DichotomyModuloObservation {Obs : Type w}
+    (obs : Input → Output → Obs)
+    (pre : Input → Prop) (post : Input → Output → Prop) : Prop :=
+  ∃ inp out_ok out_bad,
+    pre inp ∧ obs inp out_ok = obs inp out_bad ∧
+      post inp out_ok ∧ ¬ post inp out_bad
+
+theorem DichotomyModuloObservation.toPostconditionDichotomy
+    {Obs : Type w} {obs : Input → Output → Obs}
+    (h : DichotomyModuloObservation obs pre post) :
+    PostconditionDichotomy pre post :=
+  let ⟨inp, ok, bad, hp, _, hok, hbad⟩ := h
+  ⟨inp, ok, bad, hp, hok, hbad⟩
+
+/-- A single predicate is the observation of its truth value. -/
+theorem dichotomyBeyondPredicate_iff_moduloObservation
+    (bp : Input → Output → Prop) :
+    DichotomyBeyondPredicate bp pre post ↔
+      DichotomyModuloObservation bp pre post :=
+  ⟨fun ⟨inp, ok, bad, hp, hiff, hok, hbad⟩ =>
+      ⟨inp, ok, bad, hp, propext hiff, hok, hbad⟩,
+    fun ⟨inp, ok, bad, hp, heq, hok, hbad⟩ =>
+      ⟨inp, ok, bad, hp, heq ▸ Iff.rfl, hok, hbad⟩⟩
+
+/--
+Fibre decomposition, the `n`-ary form of `dichotomyBeyondPredicate_iff_cofactors`:
+`post` separates two outputs with the same observation iff, for some observed
+value `b`, it separates two outputs both observed as `b`.
+-/
+theorem dichotomyModuloObservation_iff_fibres
+    {Obs : Type w} (obs : Input → Output → Obs) :
+    DichotomyModuloObservation obs pre post ↔
+      ∃ b inp out_ok out_bad,
+        pre inp ∧ obs inp out_ok = b ∧ obs inp out_bad = b ∧
+          post inp out_ok ∧ ¬ post inp out_bad :=
+  ⟨fun ⟨inp, ok, bad, hp, heq, hok, hbad⟩ =>
+      ⟨obs inp ok, inp, ok, bad, hp, rfl, heq.symm, hok, hbad⟩,
+    fun ⟨_, inp, ok, bad, hp, h₁, h₂, hok, hbad⟩ =>
+      ⟨inp, ok, bad, hp, h₁.trans h₂.symm, hok, hbad⟩⟩
+
+/--
+The exact negation: no dichotomy modulo `obs` iff, on admissible inputs, the
+verdict of `post` is a function of the observation.
+-/
+theorem not_dichotomyModuloObservation_iff
+    {Obs : Type w} (obs : Input → Output → Obs) :
+    ¬ DichotomyModuloObservation obs pre post ↔
+      ∀ inp out₁ out₂, pre inp → obs inp out₁ = obs inp out₂ →
+        post inp out₁ → post inp out₂ :=
+  ⟨fun h inp out₁ out₂ hp heq h₁ =>
+      Classical.byContradiction fun h₂ => h ⟨inp, out₁, out₂, hp, heq, h₁, h₂⟩,
+    fun h ⟨inp, ok, bad, hp, heq, hok, hbad⟩ => hbad (h inp ok bad hp heq hok)⟩
+
+/--
+A postcondition that is, on admissible inputs, any function `f` of the input
+and the observation (any Boolean combination of the boilerplate predicates)
+has no dichotomy modulo that observation.
+-/
+theorem not_dichotomyModuloObservation_of_factors
+    {Obs : Type w} {obs : Input → Output → Obs} (f : Input → Obs → Prop)
+    (h : ∀ inp out, pre inp → (post inp out ↔ f inp (obs inp out))) :
+    ¬ DichotomyModuloObservation obs pre post :=
+  fun ⟨inp, ok, bad, hp, heq, hok, hbad⟩ =>
+    hbad ((h inp bad hp).mpr (heq ▸ (h inp ok hp).mp hok))
+
+/--
+Soundness of cofactoring over any number of boilerplate predicates. Let `cof b`
+be `post` with the observation fixed to `b` (so `post` and `cof b` agree on
+every output observed as `b`). If every cofactor is output-insensitive, `post`
+has no dichotomy modulo `obs`: this is the verdict `boilerplateOnly`.
+-/
+theorem not_dichotomyModuloObservation_of_cofactors_insensitive
+    {Obs : Type w} {obs : Input → Output → Obs}
+    (cof : Obs → Input → Output → Prop)
+    (h_cof : ∀ inp out, pre inp → (post inp out ↔ cof (obs inp out) inp out))
+    (h_ins : ∀ b, OutputInsensitive pre (cof b)) :
+    ¬ DichotomyModuloObservation obs pre post :=
+  fun ⟨inp, ok, bad, hp, heq, hok, hbad⟩ =>
+    hbad ((h_cof inp bad hp).mpr
+      (heq ▸ h_ins (obs inp ok) inp ok bad hp ((h_cof inp ok hp).mp hok)))
+
+/--
+Completeness of cofactoring: a dichotomy modulo `obs` is a dichotomy of the
+cofactor at the common observation, witnessed on that fibre. A cofactor that
+separates two outputs *of its own fibre* therefore cannot be dismissed; a
+checker that samples only some of the `2 ^ k` assignments can miss exactly
+this witness.
+-/
+theorem DichotomyModuloObservation.exists_cofactor_dichotomy
+    {Obs : Type w} {obs : Input → Output → Obs}
+    (cof : Obs → Input → Output → Prop)
+    (h_cof : ∀ inp out, pre inp → (post inp out ↔ cof (obs inp out) inp out))
+    (h : DichotomyModuloObservation obs pre post) :
+    ∃ b inp out_ok out_bad, pre inp ∧ obs inp out_ok = b ∧ obs inp out_bad = b ∧
+      cof b inp out_ok ∧ ¬ cof b inp out_bad :=
+  let ⟨inp, ok, bad, hp, heq, hok, hbad⟩ := h
+  ⟨obs inp ok, inp, ok, bad, hp, rfl, heq.symm, (h_cof inp ok hp).mp hok,
+    fun hc => hbad ((h_cof inp bad hp).mpr (heq ▸ hc))⟩
+
+/--
+Coarsening: when `obs'` is determined by `obs`, two outputs that `obs` cannot
+tell apart are not told apart by `obs'` either, so a dichotomy modulo the finer
+`obs` is a dichotomy modulo the coarser `obs'`. Equivalently, observing *more*
+boilerplate can only remove dichotomies.
+-/
+theorem DichotomyModuloObservation.of_coarser
+    {Obs : Type w} {Obs' : Type _} {obs : Input → Output → Obs}
+    {obs' : Input → Output → Obs'}
+    (h_obs : ∀ inp out₁ out₂, obs inp out₁ = obs inp out₂ →
+      obs' inp out₁ = obs' inp out₂)
+    (h : DichotomyModuloObservation obs pre post) :
+    DichotomyModuloObservation obs' pre post :=
+  let ⟨inp, ok, bad, hp, heq, hok, hbad⟩ := h
+  ⟨inp, ok, bad, hp, h_obs inp ok bad heq, hok, hbad⟩
+
+/-- A constant observation sees nothing: the notion is plain dichotomy. -/
+theorem dichotomyModuloObservation_const_iff {Obs : Type w} (b : Obs) :
+    DichotomyModuloObservation (fun (_ : Input) (_ : Output) => b) pre post ↔
+      PostconditionDichotomy pre post :=
+  ⟨fun h => h.toPostconditionDichotomy,
+    fun ⟨inp, ok, bad, hp, hok, hbad⟩ => ⟨inp, ok, bad, hp, rfl, hok, hbad⟩⟩
+
+/--
+An observation that determines the output leaves nothing to bind: whatever the
+postcondition says, it is a function of what is already observed.
+-/
+theorem not_dichotomyModuloObservation_of_injective
+    {Obs : Type w} {obs : Input → Output → Obs}
+    (h_inj : ∀ inp out₁ out₂, obs inp out₁ = obs inp out₂ → out₁ = out₂) :
+    ¬ DichotomyModuloObservation obs pre post :=
+  fun ⟨inp, ok, bad, _, heq, hok, hbad⟩ => hbad (h_inj inp ok bad heq ▸ hok)
+
+/--
+Agreement on each of two predicates implies agreement on their conjunction, so
+a dichotomy modulo the pair is a dichotomy beyond the conjunction.
+-/
+theorem DichotomyModuloObservation.pair_toBeyondConj
+    {bp₁ bp₂ : Input → Output → Prop}
+    (h : DichotomyModuloObservation
+      (fun inp out => (bp₁ inp out, bp₂ inp out)) pre post) :
+    DichotomyBeyondPredicate (fun inp out => bp₁ inp out ∧ bp₂ inp out)
+      pre post :=
+  let ⟨inp, ok, bad, hp, heq, hok, hbad⟩ := h
+  have h₁ : bp₁ inp ok = bp₁ inp bad := congrArg Prod.fst heq
+  have h₂ : bp₂ inp ok = bp₂ inp bad := congrArg Prod.snd heq
+  have hiff : (bp₁ inp ok ∧ bp₂ inp ok) ↔ (bp₁ inp bad ∧ bp₂ inp bad) := by
+    rw [h₁, h₂]
+  ⟨inp, ok, bad, hp, hiff, hok, hbad⟩
+
+/--
+The converse fails: over `Bool × Bool` with `bp₁ o := o.1 = true` and
+`bp₂ o := o.2 = true`, the postcondition `bp₁` (pure boilerplate) separates
+`(true, false)` from `(false, false)`, on which the conjunction is false both
+times; yet it never separates two outputs agreeing on `bp₁` and on `bp₂`. A
+checker judging boilerplate by the conjunction alone would report that this
+postcondition binds its output beyond boilerplate.
+-/
+theorem exists_dichotomyBeyond_conj_not_moduloPair :
+    ∃ (bp₁ bp₂ post : Unit → Bool × Bool → Prop),
+      DichotomyBeyondPredicate (fun inp out => bp₁ inp out ∧ bp₂ inp out)
+        (fun _ => True) post ∧
+      ¬ DichotomyModuloObservation (fun inp out => (bp₁ inp out, bp₂ inp out))
+        (fun _ => True) post :=
+  ⟨fun _ o => o.1 = true, fun _ o => o.2 = true, fun _ o => o.1 = true,
+    ⟨(), (true, false), (false, false), trivial,
+      ⟨fun h => absurd h.2 Bool.false_ne_true,
+        fun h => absurd h.1 Bool.false_ne_true⟩,
+      rfl, Bool.false_ne_true⟩,
+    fun ⟨_, ok, bad, _, heq, hok, hbad⟩ =>
+      have h₁ : (ok.1 = true) = (bad.1 = true) := congrArg Prod.fst heq
+      hbad (h₁.mp hok)⟩
+
 /-! ### Mutation-testing bridge -/
 
 /--
@@ -1219,6 +1411,26 @@ theorem normalDichotomy_strictly_stronger_than_dichotomy :
     returnBlindNounwindContract_not_normalDichotomy⟩
 
 /--
+Return-value dichotomy is dichotomy of the normal-return slice *modulo the
+returned memory*: the accepted and the rejected return share `memAfter`. Any
+observation that is a function of the memory alone (every frame predicate) is
+coarser, so a return-value dichotomy survives it
+(`DichotomyModuloObservation.of_coarser`).
+-/
+theorem mirCallContractReturnValueDichotomy_iff_moduloMemory :
+    MirCallContractReturnValueDichotomy c ↔
+      DichotomyModuloObservation
+        (fun (_ : MirCallReq) (out : Value × Memory) => out.2)
+        c.pre (mirCallNormalPost c) := by
+  constructor
+  · rintro ⟨req, ok, bad, m, hp, hok, hbad⟩
+    exact ⟨req, (ok, m), (bad, m), hp, rfl, hok, hbad⟩
+  · rintro ⟨req, ⟨ok, m₁⟩, ⟨bad, m₂⟩, hp, heq, hok, hbad⟩
+    have heq : m₁ = m₂ := heq
+    subst heq
+    exact ⟨req, ok, bad, m₁, hp, hok, hbad⟩
+
+/--
 A frame-only call contract: normal returns must preserve the call frame, but
 every returned `Value` is blindly accepted.
 -/
@@ -1446,6 +1658,75 @@ theorem externalSpecEnsuresDichotomy_iff_dichotomyBeyond_boilerplate :
     have ⟨_, htyBad⟩ := hiff.mp ⟨hfOk, htyOk⟩
     exact ⟨req, ok, bad, hp, htyOk, hok, htyBad,
       fun hpost => hbad ⟨(hiff.mp ⟨hfOk, htyOk⟩).1, htyBad, hpost⟩⟩
+
+/--
+What the frame and return-type boilerplate of an external spec observes of a
+normal return: the truth values of `callFramePreserved req.memory memAfter` and
+of `retMatchesCalleeReturnTy sidecarBody retVal`, *separately*.
+-/
+def externalSpecBoilerplateObs (req : MirCallReq) (out : Value × Memory) :
+    Prop × Prop :=
+  (callFramePreserved req.memory out.2,
+    retMatchesCalleeReturnTy sidecarBody out.1)
+
+/--
+`ExternalSpecEnsuresDichotomy` is dichotomy of the normal-return slice modulo
+the pair observation. For the external spec itself this coincides with the
+conjunction form above (an accepted return satisfies both predicates); for an
+arbitrary postcondition only the pair form is the right notion
+(`frameOnlyMirCallContract_dichotomyBeyond_conj_of_illTyped`).
+-/
+theorem externalSpecEnsuresDichotomy_iff_moduloObservation :
+    ExternalSpecEnsuresDichotomy targetDefPath sidecarBody extraPre extraPost ↔
+      DichotomyModuloObservation (externalSpecBoilerplateObs sidecarBody)
+        (externalSpecCallContract targetDefPath sidecarBody extraPre extraPost).pre
+        (mirCallNormalPost
+          (externalSpecCallContract targetDefPath sidecarBody extraPre extraPost)) := by
+  constructor
+  · rintro ⟨req, ok, bad, hp, htyOk, hok, htyBad, hbad⟩
+    refine ⟨req, (ok, req.memory), (bad, req.memory), hp, ?_,
+      ⟨callFramePreserved_refl _, htyOk, hok⟩, fun h => hbad h.2.2⟩
+    exact congrArg (Prod.mk _) (propext ⟨fun _ => htyBad, fun _ => htyOk⟩)
+  · rintro ⟨req, ⟨ok, mok⟩, ⟨bad, mbad⟩, hp, heq, ⟨hfOk, htyOk, hok⟩, hbad⟩
+    have hf : callFramePreserved req.memory mok =
+        callFramePreserved req.memory mbad := congrArg Prod.fst heq
+    have hty : retMatchesCalleeReturnTy sidecarBody ok =
+        retMatchesCalleeReturnTy sidecarBody bad := congrArg Prod.snd heq
+    exact ⟨req, ok, bad, hp, htyOk, hok, hty ▸ htyOk,
+      fun hpost => hbad ⟨hf ▸ hfOk, hty ▸ htyOk, hpost⟩⟩
+
+/--
+The frame-only contract binds nothing beyond boilerplate, whatever the sidecar
+body: its normal-return verdict is the first component of the observation.
+-/
+theorem frameOnlyMirCallContract_not_dichotomyModuloBoilerplate :
+    ¬ DichotomyModuloObservation (externalSpecBoilerplateObs sidecarBody)
+      frameOnlyMirCallContract.pre
+      (mirCallNormalPost frameOnlyMirCallContract) :=
+  not_dichotomyModuloObservation_of_factors (fun _ b => b.1)
+    fun _ _ _ => Iff.rfl
+
+/--
+Relative to the *conjunction* of frame and return type, the same frame-only
+contract would count as binding as soon as one value is ill-typed: with that
+value returned, the conjunction is false whether or not the frame is preserved,
+while the contract accepts one memory and rejects the other. This is why the
+checker cofactors over the boilerplate atoms individually.
+-/
+theorem frameOnlyMirCallContract_dichotomyBeyond_conj_of_illTyped
+    (h : ∃ v, ¬ retMatchesCalleeReturnTy sidecarBody v) :
+    DichotomyBeyondPredicate
+      (fun req (out : Value × Memory) =>
+        callFramePreserved req.memory out.2 ∧
+          retMatchesCalleeReturnTy sidecarBody out.1)
+      frameOnlyMirCallContract.pre
+      (mirCallNormalPost frameOnlyMirCallContract) :=
+  let ⟨v, hv⟩ := h
+  ⟨witnessReq, (v, emptyMemory),
+    (v, { emptyMemory with activeProtectors := [0] }), trivial,
+    ⟨fun hc => absurd hc.2 hv, fun hc => absurd hc.2 hv⟩,
+    callFramePreserved_refl _,
+    fun hbad => List.cons_ne_self 0 _ hbad.2.2.2.1⟩
 
 end ExternalSpec
 
@@ -1863,19 +2144,25 @@ constrains its designated output binders.
   one-point rules `∃ y, y = t ∧ P y ↔ P t` and `∀ y, y = t → P y ↔ P t` for
   `y` not in `t`.
 
-An output is *bound* when its type is not a subsingleton, it still occurs in
-the residual, a bounded, `sorry`-free proof search (`rfl`, `omega`,
+An output is *bound* when its type is not a subsingleton (by instance, by
+proof, or structurally: at most one constructor can build a value, as for
+`Option Empty`, `List Empty`, and structures over such types), it still occurs
+in the residual, a bounded, `sorry`-free proof search (`rfl`, `omega`,
 `simp +arith`, `decide`, `infer_instance`, `subst_vars`, `grind`, top-level
-`Iff` splitting, existential witness search over `Nat` including `v / 2` and
-`List` including `[]`/`List.replicate`, nested subformula probing, and
-single-step unfolding of small non-recursive output helpers) can neither
-discharge the subformulas mentioning it nor prove the residual insensitive to
-it, and a case split on its constructors (for an inductive output with two to
-eight of them) does not reduce the postcondition to one proposition free of
-it. All rewrites are equivalences, so a postcondition reported as not binding
-an output is semantically insensitive to that output; a postcondition reported
-as binding may still be vacuous in a way the search does not see (for example
-behind an `opaque` or `irreducible` definition, or a fact needing induction).
+`Iff` splitting, existential witness search — over `Nat` including `v / 2` and
+`List` including `[]`/`List.replicate` for a leading `∃`, behind a `∀`/`→`
+prefix, and by Herbrand expansion of `Nat` existentials nested in positive
+positions —, nested subformula probing, and single-step unfolding of small
+non-recursive output helpers) can neither discharge the subformulas mentioning
+it nor prove the residual insensitive to it, and a case split on its
+constructors (for an inductive output with two to eight of them, skipping those
+that need a value of an empty type) does not reduce the postcondition to one
+proposition free of it. All rewrites are equivalences, so a postcondition
+reported as not binding an output is semantically insensitive to that output;
+a postcondition reported as binding may still be vacuous in a way the search
+does not see (for example behind an `opaque` or `irreducible` definition, a
+fact needing induction or nonlinear arithmetic, or an existential whose
+witness is not among the candidates).
 
 **Relative to the precondition.** `PostconditionDichotomy pre post` ranges over
 admissible inputs, and an `ensures` clause that binds its output in general
@@ -1893,18 +2180,31 @@ and `unrealizableUnderRequires` are the ones that needed it;
 `useRequires := false` judges the postcondition alone.
 
 **User `ensures` mode.** The one deliberate projection is `userEnsuresOnly`
-(and the `bindsBeyondBoilerplate` field), which asks whether the clause
-satisfies `DichotomyBeyondPredicate` once the frame and return-type boilerplate
-of an external spec is fixed (`dichotomyBeyondPredicate_iff_cofactors`,
-`externalSpecEnsuresDichotomy_iff_dichotomyBeyond_boilerplate`). Rather than
+(and the `bindsBeyondBoilerplate` field), which asks whether the clause still
+separates two outputs once the frame and return-type boilerplate of an external
+spec is fixed. With one boilerplate predicate this is
+`DichotomyBeyondPredicate` (`dichotomyBeyondPredicate_iff_cofactors`); in
+general it is `DichotomyModuloObservation` for the observation "truth value of
+each boilerplate atom occurring in the postcondition"
+(`externalSpecEnsuresDichotomy_iff_moduloObservation`). The atoms are judged
+*individually*: agreement on their conjunction is strictly coarser and would
+let pure boilerplate through (`exists_dichotomyBeyond_conj_not_moduloPair`,
+`frameOnlyMirCallContract_dichotomyBeyond_conj_of_illTyped`). Rather than
 replacing boilerplate predicates independently by syntactic polarity (which
 collapses `frame → ret = 1`, `if frame then ret = 1 else ret = 2`, and
 `¬(frame ∧ ret ≠ 1)` to `True`, while missing `frame ↔ retTy`), the checker
 normalises with boilerplate kept opaque and then evaluates the cofactors over
-truth assignments `{True, False}^k` to the distinct boilerplate atoms occurring
-in the residual (with a zero-cost fast path whenever no boilerplate constant
-was encountered). An output is bound beyond boilerplate iff some cofactor
-constrains it.
+**all** truth assignments `{True, False}^k` to the distinct closed boilerplate
+atoms occurring in the residual (with a zero-cost fast path whenever no
+boilerplate constant was encountered). An output is bound beyond boilerplate
+iff some cofactor constrains it
+(`not_dichotomyModuloObservation_of_cofactors_insensitive`). The assignments
+are never sampled, since the one cofactor carrying a dichotomy can be any of
+them; past eight atoms, or when a cofactor cannot be judged, the verdict is the
+conservative *binds*. By convention every closed application of a boilerplate
+predicate is an observation, including one at other arguments than the
+contract's own (`callFramePreserved emptyMemory memAfter`): a clause built
+from such atoms alone is reported `boilerplateOnly`.
 
 **`MirCallAns`.** When the single output binder has type `MirCallAns`, the
 postcondition is instantiated at `.returned retVal memAfter`, `.panicked
@@ -2411,18 +2711,83 @@ def matchingFVars (e α : Expr) : MetaM (Array Expr) := do
   return out
 
 /--
-`tryProveCore`, augmented with a sound witness search for leading existentials
-`∃ y : α, P y` (`Nat`: `0`, local variables, `v + 1`, `v / 2`, and sum plus one;
-`List β`: `[]`, local variables, and `List.replicate v default` when `Inhabited β`
-synthesizes). Every witness is kernel-checked by `tryProveCore`, so this cannot
-introduce false positives.
+Candidate `Nat` witnesses built from the `Nat` variables occurring in `e`: `0`,
+each variable `v`, `v + 1`, `v - 1`, `v / 2`, the sum of all and its successor,
+and for two variables their truncated differences (and predecessors).
+-/
+def natWitnessCandidates (e : Expr) : MetaM (Array Expr) := do
+  let fvars ← matchingFVars e (mkConst ``Nat)
+  let mut cands : Array Expr := #[mkNatLit 0]
+  for v in fvars do
+    cands := cands.push v
+    cands := cands.push (mkNatAdd v (mkNatLit 1))
+    cands := cands.push (mkNatSub v (mkNatLit 1))
+    if let some half ← safely (do
+        return some (← mkAppM ``HDiv.hDiv #[v, mkNatLit 2])) none then
+      cands := cands.push half
+  if fvars.size ≥ 2 then
+    let sum := fvars.foldl (fun acc v => mkNatAdd acc v) (mkNatLit 0)
+    cands := cands.push sum
+    cands := cands.push (mkNatAdd sum (mkNatLit 1))
+  if fvars.size == 2 then
+    for (v, w) in #[(fvars[0]!, fvars[1]!), (fvars[1]!, fvars[0]!)] do
+      cands := cands.push (mkNatSub v w)
+      cands := cands.push (mkNatSub (mkNatSub v w) (mkNatLit 1))
+  return cands
+
+/--
+Herbrand strengthening. Each existential `∃ y : Nat, P y` in a *positive*
+position of `e` (under `∧`, `∨`, a universal binder, or the conclusion of an
+implication) is replaced by the finite disjunction `P w₁ ∨ … ∨ P wₙ` over
+candidate witnesses. Positive positions are monotone, so the result implies
+`e`: proving it proves `e`, and nothing is concluded when it is not proved.
+Hypotheses, negations, and equivalences are left untouched.
+-/
+partial def herbrandNat (e : Expr) (fuel : Nat := 2) : MetaM Expr := do
+  match e.getAppFnArgs with
+  | (``And, #[a, b]) =>
+    return mkApp2 (mkConst ``And) (← herbrandNat a fuel) (← herbrandNat b fuel)
+  | (``Or, #[a, b]) =>
+    return mkApp2 (mkConst ``Or) (← herbrandNat a fuel) (← herbrandNat b fuel)
+  | (``Exists, #[α, p]) =>
+    if fuel == 0 || !(← safely (whnfR α) α).isConstOf ``Nat then
+      return e
+    let cands := (← natWitnessCandidates p).extract 0 (if fuel ≥ 2 then 16 else 3)
+    let mut out? : Option Expr := none
+    for w in cands do
+      let inst ← herbrandNat (p.beta #[w]) (fuel - 1)
+      out? := some <|
+        match out? with
+        | none => inst
+        | some acc => mkApp2 (mkConst ``Or) acc inst
+    return out?.getD e
+  | _ =>
+    if e.isForall then
+      forallBoundedTelescope e (some 1) fun xs body => do
+        mkForallFVars xs (← herbrandNat body fuel)
+    else
+      return e
+
+/--
+`tryProveCore`, augmented with a sound witness search for existentials:
+
+* a leading `∃ y : α, P y` (`Nat`: `0`, local variables, `v + 1`, `v / 2`, and
+  sum plus one; `List β`: `[]`, local variables, and `List.replicate v default`
+  when `Inhabited β` synthesizes; otherwise local variables);
+* a `∀`/`→` prefix in front of an existential (`∀ a, ∃ b, a + r ≤ b`): the
+  binders are introduced and the search continues on the conclusion;
+* existentials over `Nat` nested under `∧`/`∨`/`→`/`∀` (`r = 0 ∨ ∃ y, r = y + 1`,
+  `(∃ k, r = 2 * k) ∨ ∃ k, r = 2 * k + 1`): `herbrandNat`.
+
+Every instance is proved by `tryProveCore` and kernel-checked, and each of the
+goals attempted implies the original one, so this cannot introduce false
+positives.
 -/
 partial def tryProve (goal : Expr) (heartbeats : Nat) (deep : Bool := false)
     (exFuel : Nat := 1) : MetaM Bool := do
   if ← tryProveCore goal heartbeats deep then
     return true
-  match goal.getAppFnArgs with
-  | (``Exists, #[α, p]) =>
+  if let (``Exists, #[α, p]) := goal.getAppFnArgs then
     let αn ← safely (whnfR α) α
     let fvars ← matchingFVars p αn
     let mut cands : Array Expr := #[]
@@ -2466,8 +2831,25 @@ partial def tryProve (goal : Expr) (heartbeats : Nat) (deep : Bool := false)
           tryProveCore inst heartbeats false
       if ok then
         return true
-    return false
-  | _ => return false
+  else if goal.isForall then
+    let found ← safely (forallTelescope goal fun _ body => do
+      if body.isAppOf ``Exists then
+        tryProve body heartbeats false exFuel
+      else
+        return false) false
+    if found then
+      return true
+  -- Existentials over `Nat` anywhere in a positive position.
+  let natExists (sub : Expr) : Bool :=
+    match sub.getAppFnArgs with
+    | (``Exists, #[α, _]) => α.isConstOf ``Nat
+    | _ => false
+  if exFuel > 0 && (goal.find? natExists).isSome then
+    let strengthened ← safely (herbrandNat goal) goal
+    if strengthened != goal && sizeUpTo 4001 strengthened ≤ 4000 then
+      if ← safely (do check strengthened; return true) false then
+        return ← tryProveCore strengthened heartbeats false
+  return false
 
 /-- Syntactic equality up to alpha and eta, or reducible definitional equality. -/
 def sameExpr (a b : Expr) : CheckM Bool := do
@@ -2481,13 +2863,98 @@ def typeNonempty (α : Expr) : CheckM Bool :=
     let u ← getLevel α
     return (← synthInstance? (mkApp (mkConst ``Nonempty [u]) α)).isSome) false
 
-/-- Types known mathematically to have at least two distinct inhabitants. -/
+/--
+Types with at least two distinct inhabitants whatever their arguments. `List`
+and `Option` are deliberately absent: `List Empty` and `Option Empty` have
+exactly one inhabitant (`knownTwoInhabitants`).
+-/
 def isKnownNonSubsingleton (α : Expr) : Bool :=
   match α.getAppFn with
   | .const n _ =>
-    #[``Nat, ``Int, ``Bool, ``String, ``Char, ``List, ``Option, ``Value,
+    #[``Nat, ``Int, ``Bool, ``String, ``Char, ``Value,
       ``Memory, ``MirCallAns, ``MirCallReq].contains n
   | _ => false
+
+/-- Types inhabited whatever their arguments (`[]`, `none`, `()`). -/
+def isKnownNonempty (α : Expr) : Bool :=
+  isKnownNonSubsingleton α ||
+    match α.getAppFn with
+    | .const n _ => #[``List, ``Option, ``Unit, ``PUnit].contains n
+    | _ => false
+
+/--
+Whether `α` is known to have two distinct inhabitants: a base type of
+`isKnownNonSubsingleton`, or `List β` / `Option β` over an element type that is
+known to be inhabited (`[]` against `[b]`, `none` against `some b`).
+-/
+def knownTwoInhabitants (α : Expr) : MetaM Bool := do
+  if isKnownNonSubsingleton α then
+    return true
+  match α.getAppFnArgs with
+  | (``List, #[β]) | (``Option, #[β]) =>
+    let βn ← safely (whnfR β) β
+    if isKnownNonempty βn then
+      return true
+    safely (do
+      let u ← getLevel βn
+      return (← synthInstance? (mkApp (mkConst ``Nonempty [u]) βn)).isSome) false
+  | _ => return false
+
+/-- Whether `ty` reduces to an inductive type without constructors. -/
+def isEmptyInductive (ty : Expr) : MetaM Bool :=
+  safely (do
+    let ty ← whnf ty
+    let .const n _ := ty.getAppFn | return false
+    let some (.inductInfo ind) := (← getEnv).find? n | return false
+    return ind.ctors.isEmpty) false
+
+/--
+Whether the constructor application `ctor` (parameters supplied) has a field of
+a constructorless type (`Empty`, `PEmpty`, `False`, ...), together with its
+number of fields. Such a constructor builds no value: `some : Empty → Option
+Empty`, `List.cons : Empty → List Empty → List Empty`.
+-/
+def ctorFieldInfo (ctor : Expr) : MetaM (Bool × Nat) :=
+  safely (do
+    forallTelescopeReducing (← inferType ctor) fun fields _ => do
+      let dead ← fields.anyM fun f => do isEmptyInductive (← inferType f)
+      return (dead, fields.size)) (false, 1)
+
+/--
+Structural subsingleton test: at most one constructor of the inductive type
+`α` can build a value, and each of its fields ranges over a proposition or a
+type that passes the same test (to depth `fuel`). This covers `Option Empty`,
+`List Empty`, `Empty`, `Unit`, a one-constant enumeration, and structures over
+such types.
+-/
+partial def inductiveAtMostOne (α : Expr) (fuel : Nat := 3) : MetaM Bool :=
+  safely (do
+    if ← isProp α then
+      return true
+    let ty ← whnf α
+    let .const n lvls := ty.getAppFn | return false
+    let some (.inductInfo ind) := (← getEnv).find? n | return false
+    if ind.numIndices != 0 then
+      return false
+    let mut live := 0
+    for c in ind.ctors do
+      let ctor := mkAppN (mkConst c lvls) ty.getAppArgs
+      -- `none`: builds no value; `some ok`: builds one, `ok` iff at most one.
+      let verdict? ← forallTelescopeReducing (← inferType ctor) fun fields _ => do
+        for f in fields do
+          if ← isEmptyInductive (← inferType f) then
+            return none
+        for f in fields do
+          if fuel == 0 then
+            return some false
+          unless ← inductiveAtMostOne (← inferType f) (fuel - 1) do
+            return some false
+        return some true
+      match verdict? with
+      | none => pure ()
+      | some false => return false
+      | some true => live := live + 1
+    return live ≤ 1) false
 
 /--
 Whether `α` has at most one inhabitant (`Subsingleton α`, proof irrelevance, or
@@ -2497,8 +2964,10 @@ def typeSubsingleton (α : Expr) (semanticProbe : Bool) (heartbeats : Nat) :
     MetaM Bool := do
   if ← safely (isProp α) false then
     return true
-  if isKnownNonSubsingleton α then
+  if ← knownTwoInhabitants α then
     return false
+  if ← inductiveAtMostOne α then
+    return true
   let hasInst ← safely (do
     let u ← getLevel α
     return (← synthInstance? (mkApp (mkConst ``Subsingleton [u]) α)).isSome) false
@@ -2514,11 +2983,8 @@ def typeSubsingleton (α : Expr) (semanticProbe : Bool) (heartbeats : Nat) :
 /-- Whether `ty` is provably empty (`∀ x : ty, False`). -/
 def isEmptyDomain (ty : Expr) (heartbeats : Nat) : MetaM Bool := do
   let tyn ← safely (whnfR ty) ty
-  if isKnownNonSubsingleton tyn then
+  if isKnownNonempty tyn then
     return false
-  if let .const n _ := tyn.getAppFn then
-    if #[``Unit, ``PUnit].contains n then
-      return false
   if ← safely (do
       let u ← getLevel tyn
       return (← synthInstance? (mkApp (mkConst ``Nonempty [u]) tyn)).isSome) false then
@@ -2547,7 +3013,7 @@ def isBareOutputEq (outputs : Array Expr) (e : Expr) : MetaM Bool := do
   if !matched then
     return false
   let αn ← safely (whnfR α) α
-  return isKnownNonSubsingleton αn
+  knownTwoInhabitants αn
 
 /--
 Marks a position that is not a positive conjunctive one. Boilerplate is kept
@@ -3623,6 +4089,8 @@ where
       let ctor := mkAppN (mkConst ctorName lvls) ty.getAppArgs
       let some ctorTy ← safely (do return some (← inferType ctor)) none
         | return none
+      if (← ctorFieldInfo ctor).1 then
+        continue
       let r? ← forallTelescopeReducing ctorTy fun fields _ => do
         let inst := e.replace fun sub =>
           if sub == d then some (mkAppN ctor fields) else none
@@ -3728,6 +4196,12 @@ structure BodyAnalysis where
   provedInsensitive : Bool := false
   /-- Set when an output is unbound only relative to the precondition. -/
   requiresReason? : Option EnsuresVacuityReason := none
+  /--
+  Cofactoring over the boilerplate atoms was abandoned (too many atoms or
+  cofactors, or an ill-typed cofactor): the user-`ensures` verdict is the
+  conservative *binds*.
+  -/
+  cofactorIncomplete : Bool := false
 
 def BodyAnalysis.anyBound (a : BodyAnalysis) : Bool := a.bound.any id
 
@@ -3899,6 +4373,8 @@ the output, the postcondition is that proposition, and the output is not bound.
 This is the outcome analysis of `MirCallAns`, for any inductive output; it sees
 exhaustive disjunctions such as `r = none ∨ ∃ v, r = some v`. The instances
 are judged by the syntactic pass alone and kernel-typechecked before reduction.
+Constructors with a field of an empty type are skipped: no output is built
+from them (`some` at `Option Empty`).
 -/
 def caseSplitOutput (cfg : EnsuresCheckConfig)
     (outputs : Array Expr) (i : Nat) (body : Expr) : MetaM (Option Expr) :=
@@ -3918,6 +4394,9 @@ def caseSplitOutput (cfg : EnsuresCheckConfig)
     let mut common? : Option Expr := none
     for ctorName in ind.ctors do
       let ctor := mkAppN (mkConst ctorName lvls) ty.getAppArgs
+      -- A constructor with a field of an empty type builds no output.
+      if (← ctorFieldInfo ctor).1 then
+        continue
       let r? ← forallTelescopeReducing (← inferType ctor) fun fields _ => do
         let inst := body.replaceFVar o (mkAppN ctor fields)
         unless ← safely (do check inst; return true) false do
@@ -4146,14 +4625,31 @@ def analyzeBodySplit (cfg : EnsuresCheckConfig)
           state := { a.state with droppedOutputTaut := true } }
   return a
 
+/-- Most boilerplate atoms cofactored exhaustively (`2 ^ 8` assignments). -/
+def maxCofactorAtoms : Nat := 8
+
+/-- Most cofactors handed to the full analysis before giving up. -/
+def maxCofactorAnalyses : Nat := 64
+
 /--
 Determine which outputs are constrained *beyond* the predicates in
-`cfg.boilerplate` (`DichotomyBeyondPredicate`), via exact cofactoring
-(`dichotomyBeyondPredicate_iff_cofactors`): normalise with boilerplate kept
-opaque, enumerate truth assignments `{True, False}^k` to the distinct
-boilerplate atoms occurring in the residual, and OR per-output binding across
-cofactors. When the full pass never encountered any boilerplate constant (and
-did not exhaust its budget), returns `full` immediately at zero extra cost.
+`cfg.boilerplate`, by exact cofactoring: normalise with boilerplate kept
+opaque, enumerate **every** truth assignment `{True, False}^k` to the distinct
+closed boilerplate atoms occurring in the residual, and OR per-output binding
+across cofactors. This decides `DichotomyModuloObservation` for the observation
+"truth values of those atoms", which for one atom is `DichotomyBeyondPredicate`
+(soundness: `not_dichotomyModuloObservation_of_cofactors_insensitive`).
+
+The enumeration is never sampled: a dichotomy modulo the observation lives in
+exactly one cofactor (`DichotomyModuloObservation.exists_cofactor_dichotomy`),
+and that one may be any of the `2 ^ k`. Whenever the answer is not established
+— more than `maxCofactorAtoms` atoms, more than `maxCofactorAnalyses` cofactors
+needing the full analysis, or a cofactor that does not typecheck — the result
+is `full`, i.e. *binds beyond boilerplate*. Atoms under a binder whose variable
+they mention are not observations of the output at all; they stay opaque.
+
+When the full pass never encountered any boilerplate constant (and did not
+exhaust its budget), returns `full` immediately at zero extra cost.
 -/
 def analyzeUserBeyondBoilerplate (cfg : EnsuresCheckConfig)
     (outputs : Array Expr) (body : Expr) (full : BodyAnalysis)
@@ -4165,23 +4661,35 @@ def analyzeUserBeyondBoilerplate (cfg : EnsuresCheckConfig)
   let ctx : Context :=
     { cfg, outputs := outputs.map Expr.fvarId!, stripBoilerplate := true }
   let (bpRes, bpSt) ← ((do propSimplify (← simpProp body)).run ctx).run {}
-  let atoms := collectBoilerplateAtoms cfg.boilerplate bpRes
+  let atoms := (collectBoilerplateAtoms cfg.boilerplate bpRes).filter
+    fun a => !a.hasLooseBVars
   if atoms.isEmpty then
     return full
   let k := atoms.size
-  let masks : Array Nat :=
-    if k ≤ 4 then
-      (Array.range (1 <<< k)).reverse
-    else
-      let allTrue := (1 <<< k) - 1
-      #[allTrue, 0] ++ (Array.range k).map fun i => allTrue ^^^ (1 <<< i)
+  if k > maxCofactorAtoms then
+    return { full with cofactorIncomplete := true }
+  let mentions (e : Expr) : Bool :=
+    e.hasAnyFVar fun fv => outputs.any fun o => o.fvarId! == fv
   let mut boundAcc := Array.replicate outputs.size false
   let mut best? : Option BodyAnalysis := none
   let mut first? : Option BodyAnalysis := none
-  for mask in masks do
+  let mut analyses := 0
+  -- All-true first: the cofactor a well-formed external spec lives in.
+  for mask in (Array.range (1 <<< k)).reverse do
     let cand ← replaceBoilerplateAtoms atoms mask bpRes
     unless ← safely (do check cand; return true) false do
+      return { full with cofactorIncomplete := true }
+    -- A cofactor that folds to an output-free proposition binds nothing.
+    let folded := evalBoolConsts cand
+    if !mentions folded then
+      if first?.isNone then
+        first? := some
+          { residual := folded, bound := Array.replicate outputs.size false
+            state := {}, provedInsensitive := false, requiresReason? := none }
       continue
+    if analyses ≥ maxCofactorAnalyses then
+      return { full with cofactorIncomplete := true }
+    analyses := analyses + 1
     let a ← analyzeBodySplit cfg outputs cand hyp?
     if first?.isNone then
       first? := some a
@@ -4222,6 +4730,13 @@ def budgetNotes (a : BodyAnalysis) : Array String :=
   else
     #[]
 
+def cofactorNotes (user : BodyAnalysis) : Array String :=
+  if user.cofactorIncomplete then
+    #["boilerplate cofactoring abandoned (too many boilerplate atoms or \
+      cofactors): the user-`ensures` verdict errs towards `binds output`"]
+  else
+    #[]
+
 def ppResidual (e : Expr) : MetaM String :=
   safely (do return (← ppExpr e).pretty) "<unprintable>"
 
@@ -4256,7 +4771,7 @@ def analyzeGeneric (cfg : EnsuresCheckConfig) (kind : String) (body : Expr)
     reason?
     bindsBeyondBoilerplate := full.anyBound && user.anyBound
     residual := ← ppResidual eff.residual
-    notes := budgetNotes full }
+    notes := budgetNotes full ++ cofactorNotes user }
 
 /--
 `MirCallAns` verdict: instantiate the answer at each outcome and judge the
@@ -4281,7 +4796,8 @@ def analyzeMirCallAns (cfg : EnsuresCheckConfig) (kind : String) (body : Expr)
       let boundNote :=
         s!"`.returned retVal memAfter` binds retVal: {eff.bound[0]!}, \
           memAfter: {eff.bound[1]!}"
-      return (full, user, eff, returnedStr, boundNote, budgetNotes full)
+      return (full, user, eff, returnedStr, boundNote,
+        budgetNotes full ++ cofactorNotes user)
   -- `.aborted` and `.panicked`: semantic probing on `.panicked` is only needed
   -- when `.returned` failed to bind, to tell outcome-blind from return-blind.
   let outcomeCfg := if full.anyBound then { cfg with semanticProbe := false } else cfg
