@@ -1600,6 +1600,167 @@ abbrev np_v2_dyn_dispatch_and_invalid_vtable_ub_witness :=
 abbrev np_v2_dyn_ptr_memory_roundtrip_witness :=
   @dynPtr_memory_roundtrip_and_misaligned_place_witness
 
+/-! ### `V2` universal `dyn Trait` wide-pointer bridge (every `Machine M`)
+
+The witnesses above run one registered vtable on `Mach` and `MachTB`. The
+results below hold on EVERY memory model `M` (`BasicMemory`, Tree Borrows, or
+any other `Gen.Memory` instance), for every machine `m`, trait `tr`, vtable
+`vt`, vtable pointer `vtThin`, and thin data pointer `dataThin`. -/
+
+/-- **V2 Universal `GetMetadata` on a `dyn Trait` Wide Raw Pointer (`Machine M`)**:
+whenever the vtable pointer `vtThin` passes `check_ptr` at
+`PtrType::VTablePtr(tr)`, `UnOp::GetMetadata` on the wide pointer
+`(dataThin, vtThin)` returns exactly `vtThin` at
+`Type::Ptr(PtrType::VTablePtr(tr))`, independently of the data pointer. -/
+theorem np_v2_dyn_getMetadata_vtable_universal_M {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m : Gen.Machine M) (tr : Gen.TraitName)
+    (dataThin vtThin : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (hChk : checkPtrM (ThinPointer.widen vtThin none) (.VTablePtr tr) (some m) = .ok ()) :
+    evalUnOpM (M := M) .GetMetadata
+        (.Ptr (ThinPointer.widen dataThin (some (.VTablePointer vtThin))),
+         .Ptr (.Raw (.VTablePointer tr))) (some m) =
+      .ok (.Ptr (ThinPointer.widen vtThin none), .Ptr (.VTablePtr tr)) := by
+  have hChk' : checkValueM (M := M) (.Ptr (ThinPointer.widen vtThin none))
+      (.Ptr (.VTablePtr tr)) (some m) = .ok () := by
+    rw [checkValueM]; exact hChk
+  first
+    | (rw [evalUnOpM]
+       simp only [ThinPointer.widen, PtrType.meta_kind, PointerMetaKind.encode_as_valueM,
+         PointerMetaKind.ty, bind, Except.bind, pure, Except.pure] at hChk' ⊢
+       rw [hChk'])
+    | (rw [evalUnOpM_getMetadata_eq_sanity _ _ _ (Or.inr ⟨m, rfl⟩)]
+       simp only [ThinPointer.widen, PtrType.meta_kind, PointerMetaKind.encode_as_valueM,
+         PointerMetaKind.ty, getMetadataSanity, bind, Except.bind, pure, Except.pure] at hChk' ⊢
+       rw [hChk'])
+
+/-- **V2 Universal `dyn Trait` Wide-Pointer / Vtable Bridge (`Machine M`)**:
+when `m.vtable_ptrs` registers `vtThin` under `vtName` and
+`m.prog.vtables[vtName] = vt` is a vtable of trait `tr`, then on every memory
+model `M`:
+1. `Machine::vtable_from_ptr` and `Machine::vtable_lookup` both resolve
+   `vtThin` to `vt`, and `vtThin` passes `check_ptr` at `PtrType::VTablePtr(tr)`;
+2. `check_ptr` of the safe wide pointer `(dataThin, vtThin)` at
+   `&dyn tr` / `&mut dyn tr` / `Box<dyn tr>` IS `check_ptr` of the thin pointer
+   `dataThin` at the sized layout `(vt.size, vt.align)`, so its verdict is
+   exactly the address, `isize::MAX`, non-null, `vt.align` alignment,
+   `pointee.inhabited`, and `Memory::dereferenceable … dataThin vt.size` checks
+   (specialized below by `np_v2_dyn_checkPtrM_traitObject_*`);
+3. `UnOp::ComputeSize(TraitObject tr)` and `UnOp::ComputeAlign(TraitObject tr)`
+   on `vtThin` return `vt.size.bytes` and `vt.align.bytes`;
+4. `UnOp::VTableMethodLookup(meth)` on `vtThin` returns the `Constant::FnPointer`
+   value of `vt.methods[meth]`, read from `m.fn_ptrs`. -/
+theorem np_v2_dyn_wide_ptr_vtable_ops_universal_M {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m : Gen.Machine M) (tr : Gen.TraitName) (vt : Gen.VTable) (vtName : Gen.VTableName)
+    (dataThin vtThin vp : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (hFind : m.vtable_ptrs.entries.find?
+      (fun (_, (vtablePtr : Gen.ThinPointer (Gen.Memory.Provenance M))) =>
+        decide (vtablePtr = vtThin)) = some (vtName, vp))
+    (hVt : mapIndex m.prog.vtables vtName "self.prog.vtables[vtable_name]" = .ok vt)
+    (hTrait : vt.trait_name = tr)
+    (hVAddr : inBounds vtThin.addr .Unsigned x86_64.PTR_SIZE = true) :
+    vtableFromPtrM m vtThin = .ok vt ∧
+    vtableLookupM m vtThin = .ok vt ∧
+    checkPtrM (ThinPointer.widen vtThin none) (.VTablePtr tr) (some m) = .ok () ∧
+    (∀ (mk : Gen.PointeeInfo → Gen.PtrType) (pointee : Gen.PointeeInfo),
+      ((∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box) →
+      pointee.layout = .TraitObject tr →
+      checkPtrM (ThinPointer.widen dataThin (some (.VTablePointer vtThin))) (mk pointee) (some m) =
+        checkPtrM (ThinPointer.widen dataThin none)
+          (mk { pointee with layout := .Sized vt.size vt.align }) (some m)) ∧
+    (∀ (opTy : Gen.Type),
+      evalUnOpM (.ComputeSize (.TraitObject tr)) (.Ptr (ThinPointer.widen vtThin none), opTy)
+          (some m) =
+        .ok (.Int (vt.size.bytes : Int), .Int IntType.usize_ty) ∧
+      evalUnOpM (.ComputeAlign (.TraitObject tr)) (.Ptr (ThinPointer.widen vtThin none), opTy)
+          (some m) =
+        .ok (.Int (vt.align.bytes : Int), .Int IntType.usize_ty)) ∧
+    (∀ (ty : Gen.PtrType) (meth : Gen.TraitMethodName) (fnName : Gen.FnName),
+      mapIndex vt.methods meth "vtable.methods[method]" = .ok fnName →
+      evalUnOpM (.VTableMethodLookup meth) (.Ptr (ThinPointer.widen vtThin none), .Ptr ty)
+          (some m) =
+        (do
+          let fnPtr ← evalConstantM m (.FnPointer fnName)
+          pure (fnPtr, .Ptr .FnPtr))) := by
+  have hFrom : vtableFromPtrM m vtThin = .ok vt :=
+    (vtableFromPtrM_eq_mapIndex_of_find m vtThin vtName vp hFind).trans hVt
+  have hLookup : vtableLookupM m vtThin = .ok vt :=
+    (vtableFromPtrM_ok_iff_vtableLookupM_ok m vtThin vt).mp hFrom
+  refine ⟨hFrom, hLookup, checkPtrM_vtablePtr_ok vtThin tr m vt hVAddr hFrom hTrait, ?_, ?_, ?_⟩
+  · intro mk pointee hMk hLayout
+    exact checkPtrM_traitObject_eq_sized dataThin vtThin mk pointee tr m vt hMk hLayout hVAddr
+      hFrom hTrait
+  · intro opTy
+    constructor
+    · first
+        | (have h : evalUnOpM (.ComputeSize (.TraitObject tr))
+               (.Ptr (ThinPointer.widen vtThin none), opTy) (some m) =
+               (computeSizeM m (.TraitObject tr) (some (.VTablePointer vtThin)) >>= fun size =>
+                 pure (.Int (size.bytes : Int), .Int IntType.usize_ty)) := rfl
+           rw [h]; unfold computeSizeM; rw [compute_size_and_align_traitObject, hLookup]; rfl)
+        | simp [evalUnOpM, Type.meta_kind, PointerMetaKind.decode_valueM, ThinPointer.widen,
+            Type.layout, computeSizeM, LayoutStrategy.compute_size_and_align, hLookup,
+            bind, Except.bind, pure, Except.pure]
+    · first
+        | (have h : evalUnOpM (.ComputeAlign (.TraitObject tr))
+               (.Ptr (ThinPointer.widen vtThin none), opTy) (some m) =
+               (computeAlignM m (.TraitObject tr) (some (.VTablePointer vtThin)) >>= fun align =>
+                 pure (.Int (align.bytes : Int), .Int IntType.usize_ty)) := rfl
+           rw [h]; unfold computeAlignM; rw [compute_size_and_align_traitObject, hLookup]; rfl)
+        | simp [evalUnOpM, Type.meta_kind, PointerMetaKind.decode_valueM, ThinPointer.widen,
+            Type.layout, computeAlignM, LayoutStrategy.compute_size_and_align, hLookup,
+            bind, Except.bind, pure, Except.pure]
+  · intro ty meth fnName hfn
+    exact evalUnOpM_vtableMethodLookup_eq_fnPointer m vtThin ty meth vt fnName hLookup hfn
+
+/-- **V2 Universal `check_ptr` Acceptance on a `dyn Trait` Safe Wide Pointer
+(`Machine M`)**: the polymorphic Episode 1 law specializing conjunct 2 of
+`np_v2_dyn_wide_ptr_vtable_ops_universal_M`. The pointer is accepted when the
+data pointer is non-null, `vt.align`-aligned, inhabited, and
+`Memory::dereferenceable` for `vt.size` bytes. -/
+abbrev np_v2_dyn_checkPtrM_traitObject_ok := @checkPtrM_traitObject_ok
+
+/-- **V2 Universal Misaligned `dyn Trait` Safe Wide Pointer UB (`Machine M`)**:
+a data pointer that is not `vt.align`-aligned is UB. -/
+abbrev np_v2_dyn_checkPtrM_traitObject_unaligned_ub := @checkPtrM_traitObject_unaligned_ub
+
+/-- **V2 Universal Uninhabited `dyn Trait` Safe Wide Pointer UB (`Machine M`)**:
+a safe pointer whose pointee is uninhabited is UB. -/
+abbrev np_v2_dyn_checkPtrM_traitObject_uninhabited_ub := @checkPtrM_traitObject_uninhabited_ub
+
+/-- **V2 Universal Non-Dereferenceable `dyn Trait` Safe Wide Pointer UB
+(`Machine M`)**: a data pointer that `Memory::dereferenceable` rejects for
+`vt.size` bytes is UB. -/
+abbrev np_v2_dyn_checkPtrM_traitObject_nonDereferenceable_ub :=
+  @checkPtrM_traitObject_nonDereferenceable_ub
+
+/-- **V2 ZST `dyn Trait` Safe Wide Pointer (`Mach`)**: with `vt.size = ⟨0⟩` the
+pointer passes `check_ptr` at every non-null, `vt.align`-aligned address without
+provenance or a live data allocation. `Memory::dereferenceable` of a zero-sized
+range is a property of the memory model, so this is stated per model rather
+than for an abstract `M`. -/
+abbrev np_v2_dyn_checkPtr_traitObject_zst_ok_mach := @checkPtr_traitObject_zst_ok
+
+/-- **V2 ZST `dyn Trait` Safe Wide Pointer (`MachTB`)**: the Tree Borrows
+counterpart of `np_v2_dyn_checkPtr_traitObject_zst_ok_mach`. -/
+abbrev np_v2_dyn_checkPtrM_traitObject_zst_ok_tb := @checkPtrM_traitObject_zst_tb_ok
+
+/-- **Non-Vacuity of `np_v2_dyn_wide_ptr_vtable_ops_universal_M`**: its four
+hypotheses hold on the concrete machine `npDynUnsizeMach` (vtable of trait `0`
+registered at `8192`), where the universal theorem resolves the vtable pointer
+to `dynDispatchVTable`. -/
+theorem np_v2_dyn_wide_ptr_vtable_ops_universal_M_nonvacuous :
+    vtableFromPtrM npDynUnsizeMach ({ addr := 8192, provenance := some (⟨3⟩, ()) } : Ptr) =
+      .ok dynDispatchVTable ∧
+    vtableLookupM npDynUnsizeMach ({ addr := 8192, provenance := some (⟨3⟩, ()) } : Ptr) =
+      .ok dynDispatchVTable :=
+  have h := np_v2_dyn_wide_ptr_vtable_ops_universal_M (M := BM) npDynUnsizeMach (traitNameOf 0)
+    dynDispatchVTable ⟨⟨0⟩⟩ ({ addr := 640, provenance := some (⟨4⟩, ()) } : Ptr)
+    ({ addr := 8192, provenance := some (⟨3⟩, ()) } : Ptr)
+    ({ addr := 8192, provenance := some (⟨3⟩, ()) } : Ptr)
+    (by first | rfl | decide +kernel) (by first | rfl | decide +kernel)
+    (by first | rfl | decide +kernel) (by first | rfl | decide +kernel)
+  ⟨h.1, h.2.1⟩
+
 /-! ## §4 (`V3`): `CastKind.fnPtrToPtr` (`Mach` & `MachTB`) -/
 
 /-- **V3 Dispatch**: `evalRvalue` evaluates `CastKind.fnPtrToPtr` exactly by
@@ -1651,6 +1812,66 @@ theorem np_v3_fnPtrToPtr_rustIntrinsic_abi_ub :
     evalFnPtrToPtr [.uninit, .init (.ptr { allocId := fnPtrAllocBase, offsetBytes := 0 } 8)]
       (.copy (locPlace 1)) rawConstUnitMirTy emptyMemory
       [mkDecl rawConstUnitMirTy, mkDecl fnPtrIntrinsicU32MirTy] emptyLayoutTable = .ub := rfl
+
+/-- **V3 Trusted Boundary Witnesses for Every `evalFnPtrToPtr` Pointer Check**
+(concrete instances of the universal `np_v3_fnPtrToPtr_extra_checks_divergence`,
+each differing from the accepted control in exactly one attribute):
+1. control: a function pointer at offset `0` with a non-intrinsic source type is
+   cast unchanged;
+2. (a) a non-zero offset into the function allocation is `.ub`;
+3. (b) the same pointer is `.ub` once its tag is a stack borrow in `mem.borrows`;
+4. (c) a provenance-free integer (`Value.scalar`), an `AllocId` below
+   `fnPtrAllocBase` with no reified table, and an `AllocId` missing from a
+   non-empty `mem.fnPtrs` table are each `.ub`;
+5. (d) the `rustIntrinsic` ABI check has two independent sources: the operand's
+   declared type (`np_v3_fnPtrToPtr_rustIntrinsic_abi_ub`) and the reified
+   signature `FnPtrEntry.fnSig`; an entry with the `rustIntrinsic` ABI is `.ub`
+   even when the declared source type is a plain `fn(u32) -> u32`, while the
+   same entry with the `rust` ABI is accepted.
+
+MiniRust has no counterpart of these checks at the cast: `check_ptr` at
+`PtrType::FnPtr` and at a thin raw pointer validates only the address range, and
+the `Transmute` lowering is the identity on every pointer
+(`np_v3_fnPtrToPtr_extra_checks_divergence`, `c6FnPtrMach true true 4097`), so
+MiniRust raises UB for such a pointer only when it is called
+(`Machine::fn_from_ptr`). Trusted is strictly stricter here. -/
+theorem np_v3_fnPtrToPtr_trusted_boundary_ub_witness :
+    let fnPtr : ProvenancePtr := { allocId := fnPtrAllocBase, offsetBytes := 0 }
+    let okLocals : List LocalSlot := [.uninit, .init (.ptr fnPtr 8)]
+    let srcDecls : List MirAst.LocalDecl := [mkDecl rawConstUnitMirTy, mkDecl npSafeFnPtrMirTy]
+    let stackBorrow : BorrowEntry :=
+      { tag := 65536, targetLocal := 0, targetProjection := [], perm := .active,
+        targetFrameDepth := 0 }
+    (match evalFnPtrToPtr okLocals (.copy (locPlace 1)) rawConstUnitMirTy emptyMemory srcDecls
+        emptyLayoutTable with
+     | .ok v _ _ => v = .ptr fnPtr 8
+     | _ => False) ∧
+    evalFnPtrToPtr [.uninit, .init (.ptr { allocId := fnPtrAllocBase, offsetBytes := 1 } 8)]
+      (.copy (locPlace 1)) rawConstUnitMirTy emptyMemory srcDecls emptyLayoutTable = .ub ∧
+    evalFnPtrToPtr okLocals (.copy (locPlace 1)) rawConstUnitMirTy
+      { emptyMemory with borrows := [stackBorrow] } srcDecls emptyLayoutTable = .ub ∧
+    evalFnPtrToPtr [.uninit, .init (.scalar ⟨4096, 8⟩)] (.copy (locPlace 1)) rawConstUnitMirTy
+      emptyMemory srcDecls emptyLayoutTable = .ub ∧
+    evalFnPtrToPtr [.uninit, .init (.ptr { allocId := 7, offsetBytes := 0 } 8)]
+      (.copy (locPlace 1)) rawConstUnitMirTy emptyMemory srcDecls emptyLayoutTable = .ub ∧
+    evalFnPtrToPtr okLocals (.copy (locPlace 1)) rawConstUnitMirTy
+      { emptyMemory with fnPtrs :=
+          [{ allocId := 65537, defPath := "np::other_fn", typeArgs := .nil,
+             fnSig := some (.fnPtr [.uint .u32] (.uint .u32) .safe .rust) }] }
+      srcDecls emptyLayoutTable = .ub ∧
+    evalFnPtrToPtr okLocals (.copy (locPlace 1)) rawConstUnitMirTy
+      { emptyMemory with fnPtrs :=
+          [{ allocId := 65536, defPath := "np::intr_fn", typeArgs := .nil,
+             fnSig := some (.fnPtr [.uint .u32] (.uint .u32) .safe .rustIntrinsic) }] }
+      srcDecls emptyLayoutTable = .ub ∧
+    (match evalFnPtrToPtr okLocals (.copy (locPlace 1)) rawConstUnitMirTy
+        { emptyMemory with fnPtrs :=
+            [{ allocId := 65536, defPath := "np::rust_fn", typeArgs := .nil,
+               fnSig := some (.fnPtr [.uint .u32] (.uint .u32) .safe .rust) }] }
+        srcDecls emptyLayoutTable with
+     | .ok v _ _ => v = .ptr fnPtr 8
+     | _ => False) :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- MiniRust function for `v3FnPtrToPtrMutChainMir`: `fnPtrToPtr` then
 `ptrToPtr`, both `Transmute` at the thin raw pointer type. -/

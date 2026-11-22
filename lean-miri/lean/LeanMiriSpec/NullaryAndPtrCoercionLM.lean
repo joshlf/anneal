@@ -295,7 +295,8 @@ by `annealCastHooksNullaryPtr.lockstepTails` and consumed only by its `typeInfo`
 inside vendored `Cast.unsizeIntoPointer`. -/
 def npUnsizeArrayTailTyId : Miri.MIR.TyId := 3500
 
-/-- Mirror of Trusted `MirSemantics.unsizeArrayLen?`: extracts `(elemTy, len)`
+/-- Mirror of the **type-level** component of Trusted `MirSemantics.unsizeArrayLen?`
+(called with its default `borrows := []`, `tag := 0`): extracts `(elemTy, len)`
 exactly when `ck = "Unsize"` and `(opTy, targetKind)` is a valid Rust
 array-to-slice unsizing (`&[T; n] -> &[T]`, `&mut [T; n] -> &mut [T]`,
 `&mut [T; n] -> &[T]`, `&[T; n] -> *const [T]`, `&mut [T; n] -> *mut/*const [T]`,
@@ -304,7 +305,15 @@ mutability (`unsizeMutabilityCompatible`), identical element type (`rigidTyEq`),
 and 64-bit `usize` length (`n < scalarModulus 8`). Rejects mutability upgrades
 (`*const -> *mut`, `& -> &mut`, `& -> *mut`), raw-to-ref upgrades
 (`*const/*mut -> &/&mut`), element mismatches (`[u32; 3] -> [u8]`), and
-`n ≥ 2^64` length overflow (preventing silent `UInt64.ofNat` truncation). -/
+`n ≥ 2^64` length overflow (preventing silent `UInt64.ofNat` truncation).
+
+It does NOT mirror the Tree Borrows permission component
+(`unsizeBorrowPermCompatible borrows tag targetKind`, and the equivalent
+`borrowValid` check inlined in Trusted `evalUnsizeCoercion`), which rejects a
+`.disabled` source tag and a `.frozen` source tag coerced to `&mut [T]` /
+`*mut [T]`: the cast hooks read no borrow state, exactly as Miri performs no
+borrow-tracker access on an unsizing cast. Trusted is strictly stricter on that
+component (`lm_np_v2_unsize_tb_perm_trusted_stricter_witness`). -/
 def npUnsizeArraySpec? (ck : String) (opTy : Option Ty) (targetKind : RigidTy) :
     Option (RigidTy × Nat) :=
   match unsizeArrayLen? ck opTy targetKind with
@@ -314,9 +323,11 @@ def npUnsizeArraySpec? (ck : String) (opTy : Option Ty) (targetKind : RigidTy) :
     | _ => none
   | none => none
 
-/-- **Exact 1-to-1 agreement between `npUnsizeArraySpec?` and Trusted
-`MirSemantics.unsizeArrayLen?`** across EVERY coercion tag, operand type, and
-target type. -/
+/-- **Agreement between `npUnsizeArraySpec?` and Trusted
+`MirSemantics.unsizeArrayLen?` at the empty borrow table** (`borrows := []`,
+`tag := 0`) across EVERY coercion tag, operand type, and target type. With a
+non-empty borrow table the Trusted function additionally applies
+`unsizeBorrowPermCompatible`, which this mirror does not model. -/
 theorem npUnsizeArraySpec?_snd_eq_unsizeArrayLen? (ck : String) (opTy : Option Ty)
     (targetKind : RigidTy) :
     (npUnsizeArraySpec? ck opTy targetKind).map Prod.snd =
@@ -566,10 +577,18 @@ of the live allocation referenced by `prov` via `ep2ApplyTreeBorrowsWrite`
 vendored global protected-tag table), persisting the transitioned borrow tree
 with `Allocation.setExtra` and rejecting conflicts or offset overflows as
 `StepError.undefinedBehavior`. Untracked allocations and non-concrete
-provenances are left untouched. -/
+provenances are left untouched.
+
+A zero-sized write (`size = 0`, for example a ZST binder `unsafe<'a> ()`) is a
+no-op decided BEFORE any allocation, offset, or tag lookup: Miri's memory hooks
+run only for accesses of non-zero size, so a zero-sized write must not fault
+even through a tag that is not registered in the allocation's borrow tree
+(`ep2ApplyTreeBorrowsWrite` alone would report such a tag as a conflict, because
+it resolves the tag before testing the size). -/
 def npApplyTreeBorrowsWriteAt (prov : Option AnnealProv) (absAddr : UInt64)
     (size : Miri.ABI.Size) (state : AnnealStepState) :
     Except Miri.Interpreter.StepError AnnealStepState :=
+  if size.bytes.toNat = 0 then .ok state else
   match prov with
   | some (.concrete aid tag) =>
     match state.machine.memory.live.findIdx? (fun e => e.1 == aid),
@@ -642,6 +661,18 @@ def npTreeBorrowsWriteCheck (currentBody : CapturedMir) (treeBorrows : Bool)
 theorem npTreeBorrowsWriteCheck_basic_mode (currentBody : CapturedMir)
     (place : Miri.MIR.Place) (state : AnnealStepState) :
     npTreeBorrowsWriteCheck currentBody false place state = .ok state := rfl
+
+/-- **Zero-sized `UnwrapUnsafeBinder` writes never reach the borrow tracker**:
+for EVERY provenance (including a tag that is not registered in the
+allocation's borrow tree), address, and state, `npApplyTreeBorrowsWriteAt` with
+`size = 0` returns the state unchanged. -/
+theorem npApplyTreeBorrowsWriteAt_zst_noop (prov : Option AnnealProv) (absAddr : UInt64)
+    (size : Miri.ABI.Size) (state : AnnealStepState) (hZst : size.bytes.toNat = 0) :
+    npApplyTreeBorrowsWriteAt prov absAddr size state = .ok state := by
+  unfold npApplyTreeBorrowsWriteAt
+  first
+    | exact if_pos hZst
+    | simp [hZst]
 
 /-- Conservative `StepHooks` overlay extending `annealStepHooksDropBinderSubtype`:
 * assignments first run `npTreeBorrowsWriteCheck` (a no-op unless
@@ -1548,6 +1579,68 @@ theorem lm_np_v2_unsize_fidelity_and_negative_witness :
           by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
           rfl, rfl, rfl, rfl,
           rfl, rfl, rfl, rfl⟩
+
+/-- **`V2` `Unsize` Tree Borrows Permission Boundary: Trusted Is Strictly
+Stricter (`DIV-LM-UNSIZE-TB-PERM`)**. Trusted `evalUnsizeCoercion` rejects an
+array-to-slice `Unsize` whose source tag is `.disabled`, or `.frozen` when the
+target is `&mut [T]` / `*mut [T]` (`unsizeBorrowPermCompatible`). Miri performs
+no borrow-tracker access on an unsizing cast, and neither does this overlay:
+`annealRvalueHooksNullaryPtr` / `annealCastHooksNullaryPtr` take no
+`treeBorrows` argument, and `npTreeBorrowsWriteCheck` is gated on
+`UnwrapUnsafeBinder` destinations only. A stale tag is therefore reported by
+Miri at the first access through the unsized pointer, and by Trusted already at
+the cast (the fail-closed direction).
+1. `unsizeBorrowPermCompatible` rejects a `.disabled` tag for every target and
+   a `.frozen` tag for mutable slice targets, and accepts a `.frozen` tag for a
+   `*const [T]` target and a `.disabled` entry under a different tag;
+2. the type-level mirror `npUnsizeArraySpec?` accepts `*mut [u32; 3] -> *const
+   [u32]`, while Trusted `unsizeArrayLen?` on the same types with the borrow
+   table rejects the `.disabled` tag and the `.frozen -> *mut [u32]` coercion
+   (and still accepts `.frozen -> *const [u32]`);
+3. Trusted `evalUnsizeCoercion` is `.ub` on both, and accepts the same
+   `*mut [u32; 3] -> *mut [u32]` coercion once the borrow table is empty;
+4. `annealStepHooksNullaryPtr` in `treeBorrows = true` mode executes that
+   `*mut [u32; 3] -> *mut [u32]` coercion to length `3` (on a machine without a
+   borrow tracker; the acceptance of a stale tag itself follows from the hook
+   structure above rather than from a stepped tree witness). -/
+theorem lm_np_v2_unsize_tb_perm_trusted_stricter_witness :
+    let eDisabled : BorrowEntry :=
+      { tag := 5, targetLocal := 2, targetProjection := [], perm := .disabled,
+        targetFrameDepth := 0 }
+    let eFrozen : BorrowEntry :=
+      { tag := 5, targetLocal := 2, targetProjection := [], perm := .frozen,
+        targetFrameDepth := 0 }
+    let tLocs : List LocalSlot := [.uninit, .init (.ptr ⟨5, 0⟩ 8), .uninit]
+    -- 1. Trusted permission predicate
+    unsizeBorrowPermCompatible [eDisabled] 5 (.rawPtr .not (.slice (.uint .u32))) = false ∧
+    unsizeBorrowPermCompatible [eFrozen] 5 (.rawPtr .mut (.slice (.uint .u32))) = false ∧
+    unsizeBorrowPermCompatible [eFrozen] 5 (.ref .mut (.slice (.uint .u32))) = false ∧
+    unsizeBorrowPermCompatible [eFrozen] 5 (.rawPtr .not (.slice (.uint .u32))) = true ∧
+    unsizeBorrowPermCompatible [eDisabled] 6 (.rawPtr .not (.slice (.uint .u32))) = true ∧
+    -- 2. Type-level mirror vs. borrow-aware Trusted specification
+    npUnsizeArraySpec? "Unsize" (some npRawMutArr3U32MirTy) (.rawPtr .not (.slice (.uint .u32))) =
+      some (.uint .u32, 3) ∧
+    unsizeArrayLen? "Unsize" (some npRawMutArr3U32MirTy) (.rawPtr .not (.slice (.uint .u32)))
+      [eDisabled] 5 = none ∧
+    unsizeArrayLen? "Unsize" (some npRawMutArr3U32MirTy) (.rawPtr .mut (.slice (.uint .u32)))
+      [eFrozen] 5 = none ∧
+    unsizeArrayLen? "Unsize" (some npRawMutArr3U32MirTy) (.rawPtr .not (.slice (.uint .u32)))
+      [eFrozen] 5 = some 3 ∧
+    -- 3. Trusted evaluator
+    evalUnsizeCoercion tLocs (.copy (locPlace 1)) rawConstSliceU32MirTy
+      { emptyMemory with borrows := [eDisabled] } npUnsizeMutToConstMir.localDecls
+      emptyLayoutTable = .ub ∧
+    evalUnsizeCoercion tLocs (.copy (locPlace 1)) npRawMutSliceU32MirTy
+      { emptyMemory with borrows := [eFrozen] } npUnsizeMutToMutMir.localDecls
+      emptyLayoutTable = .ub ∧
+    evalUnsizeCoercion tLocs (.copy (locPlace 1)) npRawMutSliceU32MirTy emptyMemory
+      npUnsizeMutToMutMir.localDecls emptyLayoutTable =
+      .ok (.aggregate 0 [.ptr ⟨5, 0⟩ 8, .scalar ⟨3, 8⟩]) tLocs emptyMemory ∧
+    -- 4. LeanMiri in Tree Borrows mode
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npUnsizeMutToMutMir true) 8
+      (mkNpUnsizeState npUnsizeMutToMutMir npRawMutArr3U32MirTy npRawMutSliceU32MirTy
+        (.live (.immediate (.scalar (npPtrScalar npAid5 npBase5)))))) = .usizeVal 3 := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, by decide +kernel⟩
 
 /-- **`V3` (`CastKind.fnPtrToPtr`) UB & Divergence Witness** on `v3FnPtrToPtrConstMir`:
 1. a function pointer at a nonzero offset into its function allocation is UB;

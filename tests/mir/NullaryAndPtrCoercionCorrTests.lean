@@ -181,6 +181,16 @@ theorem np_mr_deep_theorems_used :
   have _ := @np_v2_pointerCoercion_three_way_witness
   have _ := @np_v2_dyn_unsize_wide_pointer_bridge_witness
   have _ := @np_v2_dyn_dispatch_and_invalid_vtable_ub_witness
+  have _ := @np_v2_dyn_getMetadata_vtable_universal_M
+  have _ := @np_v2_dyn_wide_ptr_vtable_ops_universal_M
+  have _ := @np_v2_dyn_checkPtrM_traitObject_ok
+  have _ := @np_v2_dyn_checkPtrM_traitObject_unaligned_ub
+  have _ := @np_v2_dyn_checkPtrM_traitObject_uninhabited_ub
+  have _ := @np_v2_dyn_checkPtrM_traitObject_nonDereferenceable_ub
+  have _ := @np_v2_dyn_checkPtr_traitObject_zst_ok_mach
+  have _ := @np_v2_dyn_checkPtrM_traitObject_zst_ok_tb
+  have _ := @np_v2_dyn_wide_ptr_vtable_ops_universal_M_nonvacuous
+  have _ := @np_v3_fnPtrToPtr_trusted_boundary_ub_witness
   have _ := @np_v3_evalRvalue_fnPtrToPtr_eq
   have _ := @np_v3_fnPtrToPtr_lockstep_mach_and_tb
   have _ := @np_v3_fnPtrToPtr_extra_checks_divergence
