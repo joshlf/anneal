@@ -3161,7 +3161,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             "depHash": "56989c8629fa0281",
             "log": [],
             "inputs": [
-                ["deps", [["imports", [["Trusted:importAllArts", "927a2227cd6747b8"]]]]],
+                ["deps", [["imports", []]]],
                 ["Lean 4.34.1, commit 5045d0056413266e57c625dcd7c365b10e377c52", "e9f3658beb070375"],
                 [
                     f"/some/other/worktree/examples/../src/{rel_mod}.lean",
@@ -3572,6 +3572,105 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             with contextlib.redirect_stderr(stderr):
                 self.assertEqual(suite._preflight_clean_stale_oleans(root), [])
             self.assertEqual(stderr.getvalue(), "")
+
+    def test_preflight_stale_olean_guard_reports_orphan_non_olean_module_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_file_at(root / "theory/Anneal/Orphan.lean", b"def o := 1\n", 1_700_000_500.0)
+            ilean = self._write_file_at(root / ".lake/build/lib/lean/Anneal/Orphan.ilean", b"x", 1_700_000_000.0)
+            trace = self._write_file_at(root / ".lake/build/lib/lean/Anneal/Orphan.trace", b"{}", 1_700_000_000.0)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                removed = suite._preflight_clean_stale_oleans(root)
+            self.assertEqual(removed, [ilean, trace])
+            self.assertEqual(
+                stderr.getvalue(),
+                "[nightly-suite] stale .olean pre-flight removed 2 artifact file(s) of 1 module(s): "
+                ".lake/build/lib/lean/Anneal/Orphan.ilean\n",
+            )
+
+    def test_clean_stale_oleans_detects_partial_trusted_rebuild_via_import_hashes(self) -> None:
+        t_first, t_edit, t_rebuild = 1_700_000_000.0, 1_700_000_500.0, 1_700_001_000.0
+
+        def import_art_hex(olean_hash_hex: str) -> str:
+            return f"{suite._lake_mix_hash(suite._LAKE_HASH_NIL, int(olean_hash_hex, 16)):016x}"
+
+        def write_built_mod(
+            root: Path,
+            rel_mod: str,
+            src_rel: str,
+            src_bytes: bytes,
+            olean_hash: str,
+            src_mtime: float,
+            build_mtime: float,
+            dep_hashes: dict[str, str],
+        ) -> list[Path]:
+            src_path = self._write_file_at(root / src_rel, src_bytes, src_mtime)
+            lib = root / ".lake/build/lib/lean"
+            olean = self._write_file_at(lib / f"{rel_mod}.olean", b"o", build_mtime)
+            ohash = self._write_file_at(lib / f"{rel_mod}.olean.hash", f"{olean_hash}\n".encode("ascii"), build_mtime)
+            trace_doc = {
+                "synthetic": False,
+                "schemaVersion": "2025-09-10",
+                "outputs": {"o": [f"{olean_hash}.olean"], "m": False},
+                "inputs": [
+                    [
+                        "deps",
+                        [
+                            [
+                                "imports",
+                                [
+                                    [f"{dep.replace('/', '.')}:importAllArts", import_art_hex(h)]
+                                    for dep, h in dep_hashes.items()
+                                ],
+                            ]
+                        ],
+                    ],
+                    [os.fspath(src_path), suite._lake_text_hash_hex(src_bytes)],
+                ],
+                "depHash": "0123456789abcdef",
+            }
+            trace = self._write_file_at(
+                lib / f"{rel_mod}.trace", json.dumps(trace_doc).encode("utf-8"), build_mtime
+            )
+            return [olean, ohash, trace]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            core_h1 = "1111111111111111"
+            mid_h = "2222222222222222"
+            top_h = "3333333333333333"
+            indep_h = "4444444444444444"
+            core_files = write_built_mod(
+                root, "Trusted/Core", "trusted/lean/Trusted/Core.lean", b"def core := 1\n",
+                core_h1, t_first - 100, t_first, {},
+            )
+            mid_files = write_built_mod(
+                root, "Anneal/Mid", "theory/Anneal/Mid.lean", b"import Trusted.Core\n",
+                mid_h, t_first - 100, t_first, {"Trusted/Core": core_h1},
+            )
+            top_files = write_built_mod(
+                root, "Anneal/Top", "theory/Anneal/Top.lean", b"import Anneal.Mid\n",
+                top_h, t_first - 100, t_first, {"Anneal/Mid": mid_h},
+            )
+            indep_files = write_built_mod(
+                root, "Anneal/Indep", "theory/Anneal/Indep.lean", b"def indep := 0\n",
+                indep_h, t_first - 100, t_first, {},
+            )
+            # Coherent tree: nothing removed.
+            self.assertEqual(suite.clean_stale_oleans(root), [])
+
+            # Partial `lake build Trusted`: Trusted/Core rebuilt cleanly to a new hash while
+            # Anneal/Mid and Anneal/Top were never rebuilt (every source is still older than
+            # its own `.olean`). Rule 3 catches Mid and transitively Top, keeping Core & Indep.
+            core_h2 = "aaaaaaaaaaaaaaaa"
+            core_files = write_built_mod(
+                root, "Trusted/Core", "trusted/lean/Trusted/Core.lean", b"def core := 2\n",
+                core_h2, t_edit, t_rebuild, {},
+            )
+            removed = set(suite.clean_stale_oleans(root))
+            self.assertEqual(removed, set(mid_files + top_files))
+            self.assertTrue(all(p.is_file() for p in core_files + indep_files))
 
     def test_probe_ram_ceiling_and_lean_miri_spec_single_thread_right_sizing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

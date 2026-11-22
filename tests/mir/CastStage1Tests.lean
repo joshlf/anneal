@@ -518,6 +518,22 @@ def runFloatSteps (body : CapturedMir) : Nat → MachineState → MirStepNode
     | .tau (.running s') => runFloatSteps body n s'
     | r => r
 
+private theorem runFloatSteps_add {body : CapturedMir} {m n : Nat} {s s' : MachineState}
+    (h : runFloatSteps body m s = .tau (.running s')) :
+    runFloatSteps body (m + n) s = runFloatSteps body n s' := by
+  induction m generalizing s with
+  | zero =>
+    cases h
+    simp only [Nat.zero_add]
+  | succ m ih =>
+    simp only [Nat.succ_add, runFloatSteps] at h ⊢
+    cases hs : stepMirFn body s with
+    | tau st =>
+      cases st with
+      | running s₁ => rw [hs] at h; exact ih h
+      | _ => rw [hs] at h; cases h
+    | _ => rw [hs] at h; cases h
+
 /-- Frame locals of a silent-step node. -/
 def stepLocals? : MirStepNode → Option (List LocalSlot)
   | .tau (.running s) => some s.frame.locals
@@ -589,8 +605,29 @@ theorem stepMirFn_float_pipeline_run :
         .init (.scalar ⟨0x7F, 1⟩), .uninit, .init (.scalar ⟨0x7F800000, 4⟩)] ∧
     stepLocals? (runFloatSteps floatPipelineBody 16 s₀) =
       some [.init (.scalar ⟨0x2, 4⟩), .dead, .dead, .dead, .dead, .dead] ∧
-    retScalar? (runFloatSteps floatPipelineBody 17 s₀) = some ⟨0x2, 4⟩ :=
-  ⟨rfl, rfl, rfl, rfl⟩
+    retScalar? (runFloatSteps floatPipelineBody 17 s₀) = some ⟨0x2, 4⟩ := by
+  intro s₀
+  let s₅ : MachineState :=
+    { s₀ with frame := ⟨0, 5, [.uninit, .uninit, .uninit, .uninit, .uninit, .uninit]⟩ }
+  let s₈ : MachineState :=
+    { s₀ with frame := ⟨0, 8, [.uninit, .init (.scalar ⟨0x2, 4⟩),
+        .init (.scalar ⟨0x36B0000000000000, 8⟩), .init (.scalar ⟨0x7F, 1⟩), .uninit, .uninit]⟩ }
+  let s₁₁ : MachineState :=
+    { s₀ with frame := ⟨0, 11, [.init (.scalar ⟨0x2, 4⟩), .init (.scalar ⟨0x2, 4⟩), .uninit,
+        .init (.scalar ⟨0x7F, 1⟩), .uninit, .init (.scalar ⟨0x7F800000, 4⟩)]⟩ }
+  let s₁₆ : MachineState :=
+    { s₀ with frame := ⟨0, 16, [.init (.scalar ⟨0x2, 4⟩), .dead, .dead, .dead, .dead, .dead]⟩ }
+  have h5 : runFloatSteps floatPipelineBody 5 s₀ = .tau (.running s₅) := rfl
+  have h8 : runFloatSteps floatPipelineBody 8 s₀ = .tau (.running s₈) := by
+    rw [show (8 : Nat) = 5 + 3 from rfl, runFloatSteps_add h5]; dsimp only [s₅, s₈, s₀]; exact rfl
+  have h11 : runFloatSteps floatPipelineBody 11 s₀ = .tau (.running s₁₁) := by
+    rw [show (11 : Nat) = 8 + 3 from rfl, runFloatSteps_add h8]; dsimp only [s₈, s₁₁, s₀]; exact rfl
+  have h16 : runFloatSteps floatPipelineBody 16 s₀ = .tau (.running s₁₆) := by
+    rw [show (16 : Nat) = 11 + 5 from rfl, runFloatSteps_add h11]; dsimp only [s₁₁, s₁₆, s₀]; exact rfl
+  refine ⟨rfl, ?_, ?_, ?_⟩
+  · rw [h11]; exact rfl
+  · rw [h16]; exact rfl
+  · rw [show (17 : Nat) = 16 + 1 from rfl, runFloatSteps_add h16]; dsimp only [s₁₆, s₀]; exact rfl
 
 /-- (W3) `StorageLive(_1.._13)`, then the twelve saturating float-to-int casts of
 `LeanMiriSpec.WitFloatCastLM.wfcW3Body` into `_0 : i8 .. _11 : usize` (sources `_12 : f32`,
@@ -631,8 +668,59 @@ theorem stepMirFn_float_to_int_all_targets_run :
         .init (.scalar ⟨0xFFFFFF00000000000000000000000000, 16⟩),
         .init (.scalar ⟨0xFFFFFFFFFFFFFFFF, 8⟩), .uninit,
         .init (.scalar ⟨0xBFF8000000000000, 8⟩)] ∧
-    retScalar? (runFloatSteps floatToIntAllTargetsBody 28 s₀) = some ⟨0x7F, 1⟩ :=
-  ⟨rfl, rfl⟩
+    retScalar? (runFloatSteps floatToIntAllTargetsBody 28 s₀) = some ⟨0x7F, 1⟩ := by
+  intro s₀
+  let s₁₃ : MachineState := { s₀ with frame := ⟨0, 13, List.replicate 14 .uninit⟩ }
+  let s₁₆ : MachineState :=
+    { s₀ with frame := ⟨0, 16,
+        [.init (.scalar ⟨0x7F, 1⟩), .uninit, .uninit, .uninit, .uninit, .uninit, .uninit,
+         .uninit, .uninit, .uninit, .uninit, .uninit, .init (.scalar ⟨0x65A96816, 4⟩),
+         .init (.scalar ⟨0xBFF8000000000000, 8⟩)]⟩ }
+  let s₁₉ : MachineState :=
+    { s₀ with frame := ⟨0, 19,
+        [.init (.scalar ⟨0x7F, 1⟩), .init (.scalar ⟨0x8000, 2⟩),
+         .init (.scalar ⟨0x7FFFFFFF, 4⟩), .init (.scalar ⟨0xFFFFFFFFFFFFFFFE, 8⟩),
+         .uninit, .uninit, .uninit, .uninit, .uninit, .uninit, .uninit, .uninit,
+         .init (.scalar ⟨0x65A96816, 4⟩), .init (.scalar ⟨0xBFF8000000000000, 8⟩)]⟩ }
+  let s₂₂ : MachineState :=
+    { s₀ with frame := ⟨0, 22,
+        [.init (.scalar ⟨0x7F, 1⟩), .init (.scalar ⟨0x8000, 2⟩),
+         .init (.scalar ⟨0x7FFFFFFF, 4⟩), .init (.scalar ⟨0xFFFFFFFFFFFFFFFE, 8⟩),
+         .init (.scalar ⟨0, 16⟩), .init (.scalar ⟨0, 8⟩), .init (.scalar ⟨0, 1⟩),
+         .uninit, .uninit, .uninit, .uninit, .uninit,
+         .init (.scalar ⟨0x65A96816, 4⟩), .init (.scalar ⟨0xBFF8000000000000, 8⟩)]⟩ }
+  let s₂₅ : MachineState :=
+    { s₀ with frame := ⟨0, 25,
+        [.init (.scalar ⟨0x7F, 1⟩), .init (.scalar ⟨0x8000, 2⟩),
+         .init (.scalar ⟨0x7FFFFFFF, 4⟩), .init (.scalar ⟨0xFFFFFFFFFFFFFFFE, 8⟩),
+         .init (.scalar ⟨0, 16⟩), .init (.scalar ⟨0, 8⟩), .init (.scalar ⟨0, 1⟩),
+         .init (.scalar ⟨0xFFFF, 2⟩), .init (.scalar ⟨0xFFFFFFFF, 4⟩),
+         .init (.scalar ⟨0xFFFFFFFFFFFFFFFF, 8⟩), .uninit, .uninit,
+         .init (.scalar ⟨0x65A96816, 4⟩), .init (.scalar ⟨0xBFF8000000000000, 8⟩)]⟩ }
+  let s₂₇ : MachineState :=
+    { s₀ with frame := ⟨0, 27,
+        [.init (.scalar ⟨0x7F, 1⟩), .init (.scalar ⟨0x8000, 2⟩),
+         .init (.scalar ⟨0x7FFFFFFF, 4⟩), .init (.scalar ⟨0xFFFFFFFFFFFFFFFE, 8⟩),
+         .init (.scalar ⟨0, 16⟩), .init (.scalar ⟨0, 8⟩), .init (.scalar ⟨0, 1⟩),
+         .init (.scalar ⟨0xFFFF, 2⟩), .init (.scalar ⟨0xFFFFFFFF, 4⟩),
+         .init (.scalar ⟨0xFFFFFFFFFFFFFFFF, 8⟩),
+         .init (.scalar ⟨0xFFFFFF00000000000000000000000000, 16⟩),
+         .init (.scalar ⟨0xFFFFFFFFFFFFFFFF, 8⟩), .uninit,
+         .init (.scalar ⟨0xBFF8000000000000, 8⟩)]⟩ }
+  have h13 : runFloatSteps floatToIntAllTargetsBody 13 s₀ = .tau (.running s₁₃) := rfl
+  have h16 : runFloatSteps floatToIntAllTargetsBody 16 s₀ = .tau (.running s₁₆) := by
+    rw [show (16 : Nat) = 13 + 3 from rfl, runFloatSteps_add h13]; dsimp only [s₁₃, s₁₆, s₀]; exact rfl
+  have h19 : runFloatSteps floatToIntAllTargetsBody 19 s₀ = .tau (.running s₁₉) := by
+    rw [show (19 : Nat) = 16 + 3 from rfl, runFloatSteps_add h16]; dsimp only [s₁₆, s₁₉, s₀]; exact rfl
+  have h22 : runFloatSteps floatToIntAllTargetsBody 22 s₀ = .tau (.running s₂₂) := by
+    rw [show (22 : Nat) = 19 + 3 from rfl, runFloatSteps_add h19]; dsimp only [s₁₉, s₂₂, s₀]; exact rfl
+  have h25 : runFloatSteps floatToIntAllTargetsBody 25 s₀ = .tau (.running s₂₅) := by
+    rw [show (25 : Nat) = 22 + 3 from rfl, runFloatSteps_add h22]; dsimp only [s₂₂, s₂₅, s₀]; exact rfl
+  have h27 : runFloatSteps floatToIntAllTargetsBody 27 s₀ = .tau (.running s₂₇) := by
+    rw [show (27 : Nat) = 25 + 2 from rfl, runFloatSteps_add h25]; dsimp only [s₂₅, s₂₇, s₀]; exact rfl
+  refine ⟨?_, ?_⟩
+  · rw [h27]; exact rfl
+  · rw [show (28 : Nat) = 27 + 1 from rfl, runFloatSteps_add h27]; dsimp only [s₂₇, s₀]; exact rfl
 
 /-- (W4) `StorageLive(_1.._10)`, then the integer-to-float casts of
 `LeanMiriSpec.WitFloatCastLM.wfcW4Body` plus signed negative `i64 -> f64` halfway ties, then
@@ -669,8 +757,47 @@ theorem stepMirFn_int_to_float_ties_run :
         .init (.scalar ⟨0x4340000000000000, 8⟩), .init (.scalar ⟨0x4340000000000002, 8⟩),
         .uninit, .init (.scalar ⟨0xC340000000000000, 8⟩),
         .init (.scalar ⟨0xC340000000000002, 8⟩)] ∧
-    retScalar? (runFloatSteps intToFloatTiesBody 22 s₀) = some ⟨0xC3000000, 4⟩ :=
-  ⟨rfl, rfl⟩
+    retScalar? (runFloatSteps intToFloatTiesBody 22 s₀) = some ⟨0xC3000000, 4⟩ := by
+  intro s₀
+  let s₁₀ : MachineState := { s₀ with frame := ⟨0, 10, List.replicate 11 .uninit⟩ }
+  let s₁₃ : MachineState :=
+    { s₀ with frame := ⟨0, 13,
+        [.uninit, .init (.scalar ⟨0x7F800000, 4⟩),
+         .init (.scalar ⟨0x47F0000000000000, 8⟩), .uninit, .uninit, .uninit,
+         .uninit, .uninit, .uninit, .uninit, .uninit]⟩ }
+  let s₁₆ : MachineState :=
+    { s₀ with frame := ⟨0, 16,
+        [.uninit, .init (.scalar ⟨0x7F800000, 4⟩),
+         .init (.scalar ⟨0x47F0000000000000, 8⟩), .init (.scalar ⟨0xFF000000, 4⟩),
+         .init (.scalar ⟨0x4B800000, 4⟩), .init (.scalar ⟨0x4B800002, 4⟩),
+         .uninit, .uninit, .uninit, .uninit, .uninit]⟩ }
+  let s₁₉ : MachineState :=
+    { s₀ with frame := ⟨0, 19,
+        [.uninit, .init (.scalar ⟨0x7F800000, 4⟩),
+         .init (.scalar ⟨0x47F0000000000000, 8⟩), .init (.scalar ⟨0xFF000000, 4⟩),
+         .init (.scalar ⟨0x4B800000, 4⟩), .init (.scalar ⟨0x4B800002, 4⟩),
+         .init (.scalar ⟨0x4340000000000000, 8⟩), .init (.scalar ⟨0x4340000000000002, 8⟩),
+         .uninit, .init (.scalar ⟨0xC340000000000000, 8⟩), .uninit]⟩ }
+  let s₂₁ : MachineState :=
+    { s₀ with frame := ⟨0, 21,
+        [.init (.scalar ⟨0xC3000000, 4⟩), .init (.scalar ⟨0x7F800000, 4⟩),
+         .init (.scalar ⟨0x47F0000000000000, 8⟩), .init (.scalar ⟨0xFF000000, 4⟩),
+         .init (.scalar ⟨0x4B800000, 4⟩), .init (.scalar ⟨0x4B800002, 4⟩),
+         .init (.scalar ⟨0x4340000000000000, 8⟩), .init (.scalar ⟨0x4340000000000002, 8⟩),
+         .uninit, .init (.scalar ⟨0xC340000000000000, 8⟩),
+         .init (.scalar ⟨0xC340000000000002, 8⟩)]⟩ }
+  have h10 : runFloatSteps intToFloatTiesBody 10 s₀ = .tau (.running s₁₀) := rfl
+  have h13 : runFloatSteps intToFloatTiesBody 13 s₀ = .tau (.running s₁₃) := by
+    rw [show (13 : Nat) = 10 + 3 from rfl, runFloatSteps_add h10]; dsimp only [s₁₀, s₁₃, s₀]; exact rfl
+  have h16 : runFloatSteps intToFloatTiesBody 16 s₀ = .tau (.running s₁₆) := by
+    rw [show (16 : Nat) = 13 + 3 from rfl, runFloatSteps_add h13]; dsimp only [s₁₃, s₁₆, s₀]; exact rfl
+  have h19 : runFloatSteps intToFloatTiesBody 19 s₀ = .tau (.running s₁₉) := by
+    rw [show (19 : Nat) = 16 + 3 from rfl, runFloatSteps_add h16]; dsimp only [s₁₆, s₁₉, s₀]; exact rfl
+  have h21 : runFloatSteps intToFloatTiesBody 21 s₀ = .tau (.running s₂₁) := by
+    rw [show (21 : Nat) = 19 + 2 from rfl, runFloatSteps_add h19]; dsimp only [s₁₉, s₂₁, s₀]; exact rfl
+  refine ⟨?_, ?_⟩
+  · rw [h21]; exact rfl
+  · rw [show (22 : Nat) = 21 + 1 from rfl, runFloatSteps_add h21]; dsimp only [s₂₁, s₀]; exact rfl
 
 /-- (W2) `StorageLive(_1.._4)`; `_1 = const 0x7F80_0001_f32 as f64`;
 `_2 = const 0x7FF0_0000_0000_0001_f64 as f32`; `_3 = const 0x7FF0_0000_2000_0001_f64 as f32`;
@@ -824,8 +951,38 @@ theorem stepMirFn_promoted_raw_float_cast_run :
     stepLocals? (runFloatSteps promotedRawFloatBody 8 s₀) =
       some [.init (.scalar ⟨0xC045000000000000, 8⟩), .init (.scalar ⟨0xFFFFFFFFFFFFFFD6, 8⟩),
         .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .uninit] ∧
-    retScalar? (runFloatSteps promotedRawFloatBody 12 s₀) = some ⟨0xC045000000000000, 8⟩ :=
-  ⟨rfl, rfl, rfl, rfl⟩
+    retScalar? (runFloatSteps promotedRawFloatBody 12 s₀) = some ⟨0xC045000000000000, 8⟩ := by
+  intro s₀
+  let m₄ := { s₀.memory with
+    borrows := [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .active }],
+    nextTag := 2 }
+  let m₅ := { m₄ with
+    borrows := [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .disabled }] }
+  let s₃ : MachineState := { s₀ with frame := ⟨0, 3, [.uninit, .uninit, .uninit, .uninit]⟩ }
+  let s₄ : MachineState :=
+    { frame := ⟨0, 4, [.uninit, .uninit, .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .uninit]⟩,
+      memory := m₄ }
+  let s₅ : MachineState :=
+    { frame := ⟨0, 5, [.uninit, .init (.scalar ⟨0xFFFFFFFFFFFFFFD6, 8⟩),
+        .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .uninit]⟩,
+      memory := m₅ }
+  let s₈ : MachineState :=
+    { frame := ⟨0, 8, [.init (.scalar ⟨0xC045000000000000, 8⟩),
+        .init (.scalar ⟨0xFFFFFFFFFFFFFFD6, 8⟩),
+        .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .uninit]⟩,
+      memory := m₅ }
+  have h3 : runFloatSteps promotedRawFloatBody 3 s₀ = .tau (.running s₃) := rfl
+  have h4 : runFloatSteps promotedRawFloatBody 4 s₀ = .tau (.running s₄) := by
+    rw [show (4 : Nat) = 3 + 1 from rfl, runFloatSteps_add h3]; dsimp only [s₃, s₄, m₄, s₀]; exact rfl
+  have h5 : runFloatSteps promotedRawFloatBody 5 s₀ = .tau (.running s₅) := by
+    rw [show (5 : Nat) = 4 + 1 from rfl, runFloatSteps_add h4]; dsimp only [s₄, s₅, m₅, m₄, s₀]; exact rfl
+  have h8 : runFloatSteps promotedRawFloatBody 8 s₀ = .tau (.running s₈) := by
+    rw [show (8 : Nat) = 5 + 3 from rfl, runFloatSteps_add h5]; dsimp only [s₅, s₈, m₅, m₄, s₀]; exact rfl
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · rw [h4]; exact rfl
+  · rw [h5]; exact rfl
+  · rw [h8]; exact rfl
+  · rw [show (12 : Nat) = 8 + 4 from rfl, runFloatSteps_add h8]; dsimp only [s₈, m₅, m₄, s₀]; exact rfl
 
 end FloatStepRuns
 
@@ -943,42 +1100,42 @@ info: 'Anneal.CastStage1Tests.fcast_int_to_float_limits_and_ties' depends on axi
 
 /--
 info: 'Anneal.CastStage1Tests.stepMirFn_float_pipeline_run' depends on axioms:
-  [propext, Quot.sound]
+  [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms stepMirFn_float_pipeline_run
 
 /--
 info: 'Anneal.CastStage1Tests.stepMirFn_float_to_int_all_targets_run' depends on axioms:
-  [propext, Quot.sound]
+  [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms stepMirFn_float_to_int_all_targets_run
 
 /--
 info: 'Anneal.CastStage1Tests.stepMirFn_int_to_float_ties_run' depends on axioms:
-  [propext, Quot.sound]
+  [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms stepMirFn_int_to_float_ties_run
 
 /--
 info: 'Anneal.CastStage1Tests.stepMirFn_float_nan_run' depends on axioms:
-  [propext, Quot.sound]
+  [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms stepMirFn_float_nan_run
 
 /--
 info: 'Anneal.CastStage1Tests.stepMirFn_float_ub_and_fail_closed_runs' depends on axioms:
-  [propext, Quot.sound]
+  [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms stepMirFn_float_ub_and_fail_closed_runs
 
 /--
 info: 'Anneal.CastStage1Tests.stepMirFn_promoted_raw_float_cast_run' depends on axioms:
-  [propext, Quot.sound]
+  [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms stepMirFn_promoted_raw_float_cast_run

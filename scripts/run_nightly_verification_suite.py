@@ -5372,6 +5372,15 @@ def _build_step_env(
     return env
 
 
+def _lake_mix_hash(a: int, b: int) -> int:
+    """Lake's `mixHash a b` (`lean_uint64_mix_hash`)."""
+    mask, mul = _LAKE_HASH_MASK, _LAKE_HASH_MUL
+    k = (b * mul) & mask
+    k ^= k >> 47
+    k ^= mul
+    return ((a ^ k) * mul) & mask
+
+
 def _lake_bytes_hash_hex(data: bytes) -> str:
     """Lake's `Hash.ofByteArray data` (also `Hash.ofString` of UTF-8 `data`), as the
     16-digit lowercase hex Lake writes to `.trace` and `.hash` files."""
@@ -5388,11 +5397,7 @@ def _lake_bytes_hash_hex(data: bytes) -> str:
     h ^= h >> 47
     h = (h * mul) & mask
     h ^= h >> 47
-    # `mixHash Hash.nil h` (`lean_uint64_mix_hash`).
-    k = (h * mul) & mask
-    k ^= k >> 47
-    k ^= mul
-    return f"{((_LAKE_HASH_NIL ^ k) * mul) & mask:016x}"
+    return f"{_lake_mix_hash(_LAKE_HASH_NIL, h):016x}"
 
 
 def _lake_text_hash_hex(data: bytes) -> str:
@@ -5533,6 +5538,82 @@ def _lake_records_prove_source_unchanged(
             return _lake_text_hash_hex(fh.read()) == src_hash
     except OSError:
         return False
+
+
+def _lake_trace_import_art_hashes(trace_text: str) -> dict[str, str]:
+    """Extract `{Dep/Sub/Mod: importAllArts_hex}` from a non-synthetic Lake build
+    `.trace`, or `{}` for synthetic/fetch/malformed traces."""
+    try:
+        doc = json.loads(trace_text)
+    except ValueError:
+        return {}
+    if not isinstance(doc, dict) or doc.get("synthetic") is True:
+        return {}
+    inputs = doc.get("inputs")
+    if not isinstance(inputs, list):
+        return {}
+    dep_hashes: dict[str, str] = {}
+    for item in inputs:
+        if not (isinstance(item, list) and len(item) == 2 and item[0] == "deps" and isinstance(item[1], list)):
+            continue
+        for dep_entry in item[1]:
+            if not (
+                isinstance(dep_entry, list)
+                and len(dep_entry) == 2
+                and dep_entry[0] == "imports"
+                and isinstance(dep_entry[1], list)
+            ):
+                continue
+            for imp_entry in dep_entry[1]:
+                if not (
+                    isinstance(imp_entry, list)
+                    and len(imp_entry) == 2
+                    and isinstance(imp_entry[0], str)
+                    and isinstance(imp_entry[1], str)
+                    and imp_entry[0].endswith(":importAllArts")
+                    and _LAKE_HASH_HEX_RE.fullmatch(imp_entry[1])
+                ):
+                    continue
+                mod_name = imp_entry[0][: -len(":importAllArts")]
+                if mod_name:
+                    dep_hashes[mod_name.replace(".", "/")] = imp_entry[1]
+    return dep_hashes
+
+
+def _lean_module_current_import_all_arts_hex(arts: Mapping[str, str]) -> str | None:
+    """Compute Lake's current `importAllArts` hash hex for a module from its verified
+    private `.olean*.hash` sidecars, or `None` if unavailable/unverified."""
+    part_suffixes = [sfx for sfx in (".olean", ".olean.server", ".olean.private") if sfx in arts]
+    if not part_suffixes or part_suffixes[0] != ".olean":
+        return None
+    acc = _LAKE_HASH_NIL
+    for sfx in part_suffixes:
+        sidecar_path = arts.get(f"{sfx}.hash")
+        if sidecar_path is None:
+            return None
+        sidecar_st = _private_regular_file_stat(sidecar_path)
+        if sidecar_st is None:
+            return None
+        try:
+            if sidecar_st.st_mtime_ns < os.stat(arts[sfx]).st_mtime_ns:
+                return None
+            with open(sidecar_path, encoding="ascii", errors="replace") as fh:
+                content_hash = fh.read(64).strip()
+        except OSError:
+            return None
+        if not _LAKE_HASH_HEX_RE.fullmatch(content_hash):
+            return None
+        acc = _lake_mix_hash(acc, int(content_hash, 16))
+    return f"{acc:016x}"
+
+
+def _lean_artifact_module_stem(path: Path) -> Path:
+    """Strip the longest matching `_LEAN_ARTIFACT_SUFFIXES` suffix from `path`."""
+    name = path.name
+    for suffix in sorted(_LEAN_ARTIFACT_SUFFIXES, key=len, reverse=True):
+        if name.endswith(suffix):
+            return path.with_name(name[: -len(suffix)])
+    return path
 
 
 def _lake_lib_src_dirs(lake_root: Path, repo_root: Path) -> tuple[dict[str, list[str]], list[str]]:
@@ -5690,6 +5771,55 @@ def clean_stale_oleans(repo_root: Path) -> list[Path]:
                 rel_mod for rel_mod, top in tops.items() if top not in _TRUSTED_INDEPENDENT_LIBS
             )
 
+        # Rule 3: Lake build-trace direct-import hash coherence. If a dependency module
+        # (such as a partially rebuilt `Trusted` module) now has a different verified
+        # `importAllArts` hash than what a downstream module's non-synthetic build `.trace`
+        # recorded, mark the downstream module (and its recorded importers) stale.
+        dep_edges: dict[str, dict[str, str]] = {}
+        current_import_hashes: dict[str, str | None] = {}
+        for rel_mod, arts in modules.items():
+            if rel_mod in stale or rel_mod not in tops:
+                continue
+            trace_path = arts.get(".trace")
+            if trace_path is None or _private_regular_file_stat(trace_path) is None:
+                continue
+            try:
+                with open(trace_path, encoding="utf-8", errors="replace") as fh:
+                    imports = _lake_trace_import_art_hashes(fh.read())
+            except OSError:
+                continue
+            if imports:
+                dep_edges[rel_mod] = imports
+
+        changed = True
+        while changed:
+            changed = False
+            for rel_mod, imports in dep_edges.items():
+                if rel_mod in stale:
+                    continue
+                for dep_mod, recorded_hex in imports.items():
+                    if dep_mod in stale:
+                        stale.add(rel_mod)
+                        changed = True
+                        break
+                    if dep_mod in modules:
+                        if dep_mod not in current_import_hashes:
+                            current_import_hashes[dep_mod] = _lean_module_current_import_all_arts_hex(
+                                modules[dep_mod]
+                            )
+                        cur_hex = current_import_hashes[dep_mod]
+                        if cur_hex is not None and cur_hex != recorded_hex:
+                            stale.add(rel_mod)
+                            changed = True
+                            break
+            if changed and any(tops[rel_mod] == _TRUSTED_LIB for rel_mod in stale):
+                before = len(stale)
+                stale.update(
+                    rel_mod for rel_mod, top in tops.items() if top not in _TRUSTED_INDEPENDENT_LIBS
+                )
+                if len(stale) != before:
+                    changed = True
+
         for rel_mod in sorted(stale):
             for art_path in sorted(modules[rel_mod].values()):
                 parent_real = os.path.realpath(os.path.dirname(art_path))
@@ -5716,12 +5846,18 @@ def _preflight_clean_stale_oleans(repo_root: Path) -> list[Path]:
         sys.stderr.write(f"[nightly-suite] stale .olean pre-flight failed ({type(exc).__name__}: {exc})\n")
         return []
     if removed:
-        stale_oleans = [p for p in removed if p.name.endswith(".olean")]
-        shown = ", ".join(os.path.relpath(p, repo_root) for p in stale_oleans[:5])
-        more = f", ... (+{len(stale_oleans) - 5} more)" if len(stale_oleans) > 5 else ""
+        by_mod: dict[Path, list[Path]] = {}
+        for p in removed:
+            by_mod.setdefault(_lean_artifact_module_stem(p), []).append(p)
+        reps = [
+            next((p for p in paths if p.name.endswith(".olean")), sorted(paths)[0])
+            for _mod, paths in sorted(by_mod.items())
+        ]
+        shown = ", ".join(os.path.relpath(p, repo_root) for p in reps[:5])
+        more = f", ... (+{len(reps) - 5} more)" if len(reps) > 5 else ""
         sys.stderr.write(
             f"[nightly-suite] stale .olean pre-flight removed {len(removed)} artifact file(s) "
-            f"of {len(stale_oleans)} module(s): {shown}{more}\n"
+            f"of {len(reps)} module(s): {shown}{more}\n"
         )
     return removed
 
