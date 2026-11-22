@@ -603,10 +603,14 @@ def npActiveUnsizeTargetMut? (currentBody : CapturedMir) (st : AnnealStepState) 
 The probed window is `[startNat, startNat + spanBytes)`. Trusted's check does
 not depend on the slice length, so a zero-length coercion (`[T; 0]`, or a
 zero-sized element type) still probes one byte: the byte at `startNat`, or, for
-a pointer at or past the end of the tracked range (one past the end), the last
-tracked byte. A tracked allocation of size zero has no location states, so the
-check passes there, while Trusted (whose permission is per borrow entry rather
-than per byte) can still reject (`lm_np_v2_unsize_tb_perm_edge_cases_witness`). -/
+a pointer strictly one past the end of the tracked range (`startNat = trackedEnd`),
+the last tracked byte (`trackedEnd - 1`). Strictly out-of-bounds offsets
+(`startNat > trackedEnd`) are NOT clamped into `[0, trackedEnd)` (preserving the
+honest Miri-vs-Trusted OOB raw-pointer boundary:
+`np_vendored_borrowTree_zero_size_and_oob_boundary`). A tracked allocation of
+size zero has `locations.entries = #[]` (and vendored `BorrowTree.new` stores
+`defaultInitialPermission = .Disabled` even on the live root tag), so the check
+passes there (`np_vendored_borrowTree_zero_size_and_oob_boundary`). -/
 def npUnsizeTreeBorrowsPermCheck (tree : Miri.TreeBorrows.BorrowTree)
     (tag : Miri.Memory.BorTag) (startNat spanBytes : Nat) (isMutTarget : Bool) :
     Except Miri.Interpreter.StepError Unit :=
@@ -619,7 +623,7 @@ def npUnsizeTreeBorrowsPermCheck (tree : Miri.TreeBorrows.BorrowTree)
             (seg : Miri.DataStructures.RangeMapSegment Miri.TreeBorrows.LocationTree) =>
           max acc seg.range.stop.toNat) 0
     let probeStart : Nat :=
-      if spanBytes = 0 ∧ trackedEnd ≤ startNat ∧ 0 < trackedEnd then trackedEnd - 1
+      if spanBytes = 0 ∧ startNat = trackedEnd ∧ 0 < trackedEnd then trackedEnd - 1
       else startNat
     let endNat := probeStart + max 1 spanBytes
     let checkSeg (_ : Unit)
@@ -741,6 +745,121 @@ def annealCastHooksNullaryPtr (currentBody : CapturedMir) (fnPtrs : List FnPtrEn
       else
         pure () }
 
+/-- Whether `place` starts with a `.Deref` followed by at least one `.Field`
+projection (covering `(*ptr).field.unwrapUnsafeBinder` and `(*ptr).field` on
+dereferenced struct pointers). -/
+def npIsDerefFieldPlace (place : Miri.MIR.Place) : Bool :=
+  match place.projection.toList with
+  | .Deref :: rest =>
+    rest.any (fun e => match e with | .Field _ _ => true | _ => false)
+  | _ => false
+
+/-- Whether `place` contains any `.Field` projection (for sub-range Tree Borrows
+write checks on both `_1.field` and `(*ptr).field`). -/
+def npHasFieldProj (place : Miri.MIR.Place) : Bool :=
+  place.projection.toList.any (fun e => match e with | .Field _ _ => true | _ => false)
+
+/-- Whether an `Rvalue` reads a dereferenced struct-field place
+(`(*ptr).field...`). -/
+def npRvalueHasDerefField : Miri.MIR.Rvalue → Bool
+  | .Use (.Copy p) _ | .Use (.Move p) _ => npIsDerefFieldPlace p
+  | _ => false
+
+private def npFindDeclTyForKind : List LocalDecl → RigidTy → Option Ty
+  | [], _ => none
+  | d :: ds, pt => if rigidTyEq d.ty.kind pt then some d.ty else npFindDeclTyForKind ds pt
+
+/-- Resolve the pointee `LocalLayout` when dereferencing a raw pointer or safe
+reference to a struct/ADT whose layout is declared in `localDecls` / `layouts`. -/
+def npDerefStructPointeeLayout? (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (localId : Miri.MIR.LocalId) : Option Miri.Interpreter.LocalLayout :=
+  match get? localDecls localId with
+  | some decl =>
+    match decl.ty.kind with
+    | .rawPtr _ pt | .ref _ pt =>
+      (npFindDeclTyForKind localDecls pt).map (fun ptTy => translateTyOverlay ptTy layouts)
+    | _ => none
+  | none => none
+
+private def npDerefImmediateToMemPlace (imm : Miri.Interpreter.Immediate AnnealProv)
+    (ptLay : Miri.Interpreter.LocalLayout) :
+    Miri.Interpreter.RvalueM AnnealStepState (Miri.Interpreter.OpTy AnnealProv) := do
+  let sc ← match imm.toScalar with
+    | .ok s => pure s
+    | .error e => throw (Miri.Interpreter.ScalarOps.immediateError e)
+  let ptr ← match sc.toPointer annealTargetDataLayout with
+    | .ok p => pure p
+    | .error e => throw (Miri.Interpreter.ScalarOps.scalarError e)
+  let mismatch ← match annealOffsetMisalignment ptr.offset ptLay.layout.align.abi with
+    | .ok m => pure m
+    | .error e => throw (.invalidProgram (toString e))
+  return ⟨.indirect ⟨ptr, .none, mismatch⟩, ptLay⟩
+
+/-- `PlaceProjectionHooks` extending `annealPlaceProjectionHooksOverlay` so
+dereferencing a struct pointer (`(*ptr).field...`) resolves the pointee's
+declared `LocalLayout` before running unmodified vendored
+`Miri.Interpreter.PlaceDynamic.evalPlace`. -/
+def npPlaceProjectionHooksNullaryPtr (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    Miri.Interpreter.PlaceProjectionHooks AnnealProv AnnealStepState Unit Unit :=
+  let baseHooks := annealPlaceProjectionHooksOverlay localDecls layouts
+  { baseHooks with
+    place := { baseHooks.place with
+      deref := fun c base skipValidity =>
+        match base.ref with
+        | .local _ localId none _ =>
+          match npDerefStructPointeeLayout? localDecls layouts localId with
+          | some ptLay => do
+            let st ← get
+            let some frame := st.stack.currentFrame? | throw (.stack .emptyStack)
+            let opVal ← match frame.getLocalOperand localId with
+              | .ok v => pure v
+              | .error (.localExpectedLive _) => throw (.undefinedBehavior "read of dead local")
+              | .error e => throw (.stack e)
+            let imm ← annealReadImmediate ⟨opVal, base.layout⟩
+            let derefed ← npDerefImmediateToMemPlace imm.imm ptLay
+            match derefed.op with
+            | .indirect mp => return ⟨.memory mp, derefed.layout⟩
+            | .immediate _ => throw (.invalidProgram "deref produced immediate")
+          | none => baseHooks.place.deref c base skipValidity
+        | _ => baseHooks.place.deref c base skipValidity } }
+
+/-- Place evaluator extending `annealEvalPlaceOverlay` with struct-pointer
+dereference + field projections (`(*ptr).field[.unwrapUnsafeBinder]`). -/
+def npEvalPlaceNullaryPtr (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (place : Miri.MIR.Place) (skipValidity : Bool := false) :
+    Miri.Interpreter.RvalueM AnnealStepState (Miri.Interpreter.RuntimePlace AnnealProv) :=
+  if npIsDerefFieldPlace place then
+    Miri.Interpreter.PlaceDynamic.evalPlace
+      (npPlaceProjectionHooksNullaryPtr localDecls layouts) () place skipValidity
+  else
+    annealEvalPlaceOverlay localDecls layouts place skipValidity
+
+/-- Operand evaluator extending `annealEvalOperandOverlay` with reads through
+`(*ptr).field[.unwrapUnsafeBinder]`. -/
+def npEvalOperandNullaryPtr (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (op : Miri.MIR.Operand) (known : Option Miri.Interpreter.LocalLayout) :
+    Miri.Interpreter.RvalueM AnnealStepState (Miri.Interpreter.OpTy AnnealProv) := do
+  match op with
+  | .Copy place | .Move place =>
+    if npIsDerefFieldPlace place then
+      match place.projection.toList with
+      | .Deref :: rest =>
+        match npDerefStructPointeeLayout? localDecls layouts place.localId with
+        | some ptLay =>
+          let (frame', layout) ←
+            annealResolveAndCacheLocalLayoutOverlay localDecls layouts place.localId known
+          let operand ← match frame'.getLocalOperand place.localId with
+            | .ok opVal => pure opVal
+            | .error (.localExpectedLive _) => throw (.undefinedBehavior "read of dead local")
+            | .error e => throw (.stack e)
+          let imm ← annealReadImmediate ⟨operand, layout⟩
+          let derefed ← npDerefImmediateToMemPlace imm.imm ptLay
+          annealEvalUnwrapChainOp localDecls layouts place.localId frame' derefed rest
+        | none => annealEvalOperandOverlay localDecls layouts op known
+      | _ => annealEvalOperandOverlay localDecls layouts op known
+    else annealEvalOperandOverlay localDecls layouts op known
+  | _ => annealEvalOperandOverlay localDecls layouts op known
+
 /-- Syntactic predicate for `Assign` rvalues routed through the overlay's own
 `RvalueHooks`: `Operand.RuntimeChecks` uses and `PointerCoercion(Unsize)` casts. -/
 def isNullaryPtrRvalue : Miri.MIR.Rvalue → Bool
@@ -749,24 +868,38 @@ def isNullaryPtrRvalue : Miri.MIR.Rvalue → Bool
   | _ => false
 
 /-- `RvalueHooks` overlay extending `annealRvalueHooksDropBinderSubtype` with the
-`Operand.RuntimeChecks` operand arm and the `PointerCoercion(Unsize)` cast arm
+`Operand.RuntimeChecks` operand arm, the `PointerCoercion(Unsize)` cast arm
 (vendored `Cast.cast` over `annealCastHooksNullaryPtr`, threading `treeBorrows`
 for live BorrowTree permission checks and targeting the destination's own
-wide-pointer `TyId`). Every other operand and cast is delegated unchanged. -/
+wide-pointer `TyId`), and struct-pointer dereference + field projections
+(`(*ptr).field[.unwrapUnsafeBinder]`). Every other operand and cast is delegated
+unchanged. -/
 def annealRvalueHooksNullaryPtr (currentBody : CapturedMir) (fnPtrs : List FnPtrEntry := .nil)
     (treeBorrows : Bool := false) :
     Miri.Interpreter.RvalueHooks AnnealProv AnnealStepState Unit
       (Miri.Interpreter.RuntimePlace AnnealProv) :=
   let base := annealRvalueHooksDropBinderSubtype currentBody fnPtrs
   { base with
+    evalPlace := fun _ p skipValidity =>
+      npEvalPlaceNullaryPtr currentBody.localDecls currentBody.layouts p skipValidity
     evalOperand := fun c op known =>
       match op with
       | .RuntimeChecks checks => npEvalRuntimeChecksOperand currentBody.layouts c checks
-      | _ => base.evalOperand c op known
+      | _ =>
+        if match op with | .Copy p | .Move p => npIsDerefFieldPlace p | _ => false then
+          npEvalOperandNullaryPtr currentBody.localDecls currentBody.layouts op known
+        else base.evalOperand c op known
     evalOperandAt := fun c path op known =>
       match op with
       | .RuntimeChecks checks => npEvalRuntimeChecksOperand currentBody.layouts c checks
-      | _ => base.evalOperandAt c path op known
+      | _ =>
+        if match op with | .Copy p | .Move p => npIsDerefFieldPlace p | _ => false then
+          npEvalOperandNullaryPtr currentBody.localDecls currentBody.layouts op known
+        else base.evalOperandAt c path op known
+    evalPlaceToOp := fun c p known =>
+      if npIsDerefFieldPlace p then
+        npEvalOperandNullaryPtr currentBody.localDecls currentBody.layouts (.Copy p) known
+      else base.evalPlaceToOp c p known
     cast := fun c src kind ty dest =>
       match kind with
       | .PointerCoercion .Unsize _ =>
@@ -776,9 +909,10 @@ def annealRvalueHooksNullaryPtr (currentBody : CapturedMir) (fnPtrs : List FnPtr
       | _ => base.cast c src kind ty dest }
 
 /-- Whether an assignment to `place` is subject to the Tree Borrows write check:
-only in `treeBorrows` mode and only through an `UnwrapUnsafeBinder` place. -/
+in `treeBorrows` mode, through an `UnwrapUnsafeBinder` place or a projected
+field / dereferenced struct-field place. -/
 def npTbWriteGate (treeBorrows : Bool) (place : Miri.MIR.Place) : Bool :=
-  treeBorrows && hasRealUnwrapUnsafeBinder place
+  treeBorrows && (hasRealUnwrapUnsafeBinder place || npHasFieldProj place)
 
 /-- Apply a Tree Borrows write to the byte range `[absAddr - baseAddr, +size)`
 of the live allocation referenced by `prov` via `ep2ApplyTreeBorrowsWrite`
@@ -838,7 +972,7 @@ and place-resolution errors (which immediately surface from the subsequent
 `evalRvalueIntoPlace` step) are left untouched. -/
 def npTreeBorrowsWriteApply (currentBody : CapturedMir) (place : Miri.MIR.Place)
     (state : AnnealStepState) : Except Miri.Interpreter.StepError AnnealStepState :=
-  match annealEvalPlaceOverlay currentBody.localDecls currentBody.layouts place true state with
+  match npEvalPlaceNullaryPtr currentBody.localDecls currentBody.layouts place true state with
   | .error _ _ => .ok state
   | .ok rp _ =>
     match rp.ref with
@@ -903,7 +1037,7 @@ def annealStepHooksNullaryPtr (currentBody : CapturedMir)
       match npTreeBorrowsWriteCheck currentBody treeBorrows place state with
       | .error e => (state, .error e)
       | .ok state' =>
-        if isNullaryPtrRvalue rvalue then
+        if isNullaryPtrRvalue rvalue || npIsDerefFieldPlace place || npRvalueHasDerefField rvalue then
           Miri.Interpreter.runRvalue
             (Miri.Interpreter.evalRvalueIntoPlace
               (annealRvalueHooksNullaryPtr currentBody fnPtrs treeBorrows) choice rvalue place)
@@ -920,12 +1054,13 @@ def annealStepHooksNullaryPtrForState (rootBody : CapturedMir) (s : MachineState
     (annealPoppedFrameState s) s.memory.fnPtrs
 
 /-- Syntactic predicate for statements untouched by the overlay: an `Assign` whose
-rvalue is not routed through `annealRvalueHooksNullaryPtr` and whose destination is
-not subject to the Tree Borrows write check. -/
+rvalue and place are not routed through `annealRvalueHooksNullaryPtr` and whose
+destination is not subject to the Tree Borrows write check. -/
 def stmtFreeOfNullaryPtrOverlay (treeBorrows : Bool) (stmt : Miri.MIR.Statement) : Prop :=
   match stmt.kind with
   | .Assign place rvalue =>
-      isNullaryPtrRvalue rvalue = false ∧ npTbWriteGate treeBorrows place = false
+      isNullaryPtrRvalue rvalue = false ∧ npIsDerefFieldPlace place = false ∧
+      npRvalueHasDerefField rvalue = false ∧ npTbWriteGate treeBorrows place = false
   | _ => True
 
 /-- **Conservative Extension Theorem (`step_nullaryPtr_overlay_eq_ep2_of_free`)**:
@@ -972,8 +1107,9 @@ theorem step_nullaryPtr_overlay_eq_ep2_of_free {currentBody : CapturedMir}
                   choice place rvalue state =
                 (annealStepHooksDropBinderSubtype currentBody treeBorrows callees poppedFrame fnPtrs).assign
                   choice place rvalue state := by
-              simp only [annealStepHooksNullaryPtr, npTreeBorrowsWriteCheck, hs.1, hs.2,
-                         Bool.false_eq_true, ↓reduceIte]
+              simp only [annealStepHooksNullaryPtr, npTreeBorrowsWriteCheck,
+                         hs.1, hs.2.1, hs.2.2.1, hs.2.2.2,
+                         Bool.or_self, Bool.false_eq_true, ↓reduceIte]
             have hEval :
                 Miri.Interpreter.Step.evalStatement
                   (annealStepHooksNullaryPtr currentBody treeBorrows callees poppedFrame fnPtrs)
@@ -1031,13 +1167,17 @@ operand leaf IS `annealRvalueHooksUnwindFnPtrClosure`'s. -/
 theorem np_rvalueHooks_evalOperandAt_eq_unwind_on_places (body : CapturedMir)
     (fnPtrs : List FnPtrEntry) (c : Unit) (path : Miri.Interpreter.OperandPath)
     (known : Option Miri.Interpreter.LocalLayout) :
-    (∀ p, (annealRvalueHooksNullaryPtr body fnPtrs).evalOperandAt c path (.Copy p) known =
+    (∀ p, npIsDerefFieldPlace p = false →
+      (annealRvalueHooksNullaryPtr body fnPtrs).evalOperandAt c path (.Copy p) known =
       (annealRvalueHooksUnwindFnPtrClosure body fnPtrs).evalOperandAt c path (.Copy p) known) ∧
-    (∀ p, (annealRvalueHooksNullaryPtr body fnPtrs).evalOperandAt c path (.Move p) known =
+    (∀ p, npIsDerefFieldPlace p = false →
+      (annealRvalueHooksNullaryPtr body fnPtrs).evalOperandAt c path (.Move p) known =
       (annealRvalueHooksUnwindFnPtrClosure body fnPtrs).evalOperandAt c path (.Move p) known) ∧
     (∀ k, (annealRvalueHooksNullaryPtr body fnPtrs).evalOperandAt c path (.Constant k) known =
-      (annealRvalueHooksUnwindFnPtrClosure body fnPtrs).evalOperandAt c path (.Constant k) known) :=
-  ⟨fun _ => rfl, fun _ => rfl, fun _ => rfl⟩
+      (annealRvalueHooksUnwindFnPtrClosure body fnPtrs).evalOperandAt c path (.Constant k) known) := by
+  refine ⟨fun p hp => ?_, fun p hp => ?_, fun _ => rfl⟩
+  · simp only [annealRvalueHooksNullaryPtr, hp, Bool.false_eq_true, ↓reduceIte]; rfl
+  · simp only [annealRvalueHooksNullaryPtr, hp, Bool.false_eq_true, ↓reduceIte]; rfl
 
 /-- **`Unsize` dispatch**: for EVERY source, coercion source tag, target and
 destination, the overlay's `cast` leaf on `PointerCoercion(Unsize)` is unmodified
@@ -2053,6 +2193,54 @@ theorem lm_np_v2_unsize_tb_edge_cases_stepped_witness :
         endPtr (npMachine5Tree .disabled))) = .usizeVal 0 := by
   refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel⟩
 
+/-- **`V2` `Unsize` Zero-Size Vendored `BorrowTree` Representation Boundary &
+Strict OOB Offset Boundary (`np_vendored_borrowTree_zero_size_and_oob_boundary`)**:
+1. **Zero-size tracked allocation representation**: in vendored
+   `Miri.TreeBorrows.BorrowTree.new retagParentTag Size.ZERO`, `locations.entries`
+   is empty (`#[]`) and the live root node STILL carries
+   `defaultInitialPermission = .Disabled` (representing out-of-bounds default
+   permissions). Hence `npUnsizeTreeBorrowsPermCheck` MUST NOT fall back to
+   `defaultInitialPermission` when `locations.entries` is empty (doing so would
+   falsely reject the valid root tag of every zero-sized allocation!), and
+   accepts the live root tag cleanly.
+2. **Strictly out-of-bounds offset (`startNat = 20 > trackedEnd = 12`)**:
+   clamping in `npUnsizeTreeBorrowsPermCheck` is restricted strictly to exact
+   one-past-the-end (`startNat = trackedEnd`), so an OOB zero-length raw pointer
+   at offset `20` is NOT over-clamped to byte `11` (passing `npUnsizeTreeBorrowsPermCheck`
+   and stepping to `.usizeVal 0` in LeanMiri), while Trusted `evalUnsizeCoercion`
+   rejects offset `20` as `.ub` in `stackTargetValid` for BOTH `.disabled` and
+   `.unique` tags (strict fail-closed direction). -/
+theorem np_vendored_borrowTree_zero_size_and_oob_boundary :
+    let zTree := Miri.TreeBorrows.BorrowTree.new retagParentTag Miri.ABI.Size.ZERO
+    let eDisabled5 : BorrowEntry :=
+      { tag := 5, targetLocal := 3, targetProjection := [], perm := .disabled,
+        targetFrameDepth := 0 }
+    let eUnique5 : BorrowEntry :=
+      { tag := 5, targetLocal := 3, targetProjection := [], perm := .unique,
+        targetFrameDepth := 0 }
+    let arr : LocalSlot :=
+      .init (.aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨2, 4⟩, .scalar ⟨3, 4⟩])
+    let tLocsOob : List LocalSlot := [.uninit, .init (.ptr ⟨5, 20⟩ 8), .uninit, arr]
+    let oobPtr : Miri.Interpreter.LocalValue AnnealProv :=
+      .live (.immediate (.scalar (npPtrScalarTagged npAid5 (npBase5 + 20) retagChildTag)))
+    -- 1. Vendored `BorrowTree.new _ Size.ZERO` structure & live root tag acceptance
+    zTree.locations.entries.isEmpty = true ∧
+    (zTree.nodes.get ⟨0⟩).map (·.defaultInitialPermission) = some .Disabled ∧
+    (npUnsizeTreeBorrowsPermCheck zTree retagParentTag 0 0 true).isOk = true ∧
+    -- 2. Strict OOB (`20 > 12`) not over-clamped to byte `11` vs. Trusted fail-closed UB
+    (npUnsizeTreeBorrowsPermCheck (npArr3U32Tree .disabled) retagChildTag 20 0 false).isOk = true ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npUnsizeZeroLenMir true) 8
+      (mkNpUnsizeState npUnsizeZeroLenMir npRawMutArr0U32MirTy rawConstSliceU32MirTy
+        oobPtr (npMachine5Tree .disabled))) = .usizeVal 0 ∧
+    evalUnsizeCoercion tLocsOob (.copy (locPlace 1)) rawConstSliceU32MirTy
+      { emptyMemory with borrows := [eDisabled5] } npUnsizeZeroLenMir.localDecls
+      emptyLayoutTable = .ub ∧
+    evalUnsizeCoercion tLocsOob (.copy (locPlace 1)) rawConstSliceU32MirTy
+      { emptyMemory with borrows := [eUnique5] } npUnsizeZeroLenMir.localDecls
+      emptyLayoutTable = .ub := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel,
+          by decide +kernel, by decide +kernel, rfl, rfl⟩
+
 private def npMutToConstSliceMir : CapturedMir :=
   mkMirBody "np::w_mut_to_const_slice"
     [mkDecl usizeMirTy, mkDecl npRawMutSliceU32MirTy, mkDecl rawConstSliceU32MirTy] 1
@@ -2325,6 +2513,148 @@ theorem lm_np_v4_nested_field_unwrap_disjoint_tb_witness :
   refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
           by decide +kernel⟩
 
+/-! ### `V4` Sub-Range Tree Borrows Disjointness on `{ fst: u32, snd: BinderU32 }` & `(*ptr).field.unwrapUnsafeBinder` -/
+
+/-- 8-byte layout for `np::PairU32Binder { fst: u32, snd: BinderU32 }`:
+`fst` at `[0, 4)`, `snd` at `[4, 8)`. -/
+def npPairU32BinderMirLayout : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨4⟩,
+    backendRepr := .scalarPair
+      (.initialized (.int 32 false) ⟨0, 0xffffffff⟩)
+      (.initialized (.int 32 false) ⟨0, 0xffffffff⟩),
+    fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1],
+    fieldLayouts := [0, 1],
+    variants := .single 0, isUninhabited := false }
+
+def npSubrangeLayouts : LayoutTable :=
+  { npLayouts with entries := npLayouts.entries ++ [npPairU32BinderMirLayout] }
+
+@[reducible] def npPairU32BinderMirTy : Ty :=
+  { kind := .adt "np::PairU32Binder" [], layoutIdx := 5 }
+
+@[reducible] def npRawMutPairU32BinderMirTy : Ty :=
+  { kind := .rawPtr .mut npPairU32BinderMirTy.kind, layoutIdx := 0 }
+
+private def npV4PairLocalSndUnwrapMir : CapturedMir :=
+  mkMirBody "np::w_v4_pair_local_snd_unwrap"
+    [mkDecl u32MirTy, mkDecl npPairU32BinderMirTy] 1
+    [mkBb [mkSt (.assign (locPlace 1 [.field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy])
+             (.use (constU32 99))),
+           mkSt (.assign (locPlace 0)
+             (.use (.copy (locPlace 1 [.field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy]))))]
+      .return_]
+    npSubrangeLayouts
+
+private def npV4PairLocalFstMir : CapturedMir :=
+  mkMirBody "np::w_v4_pair_local_fst"
+    [mkDecl u32MirTy, mkDecl npPairU32BinderMirTy] 1
+    [mkBb [mkSt (.assign (locPlace 1 [.field 0 u32MirTy, .unwrapUnsafeBinder u32MirTy])
+             (.use (constU32 99))),
+           mkSt (.assign (locPlace 0)
+             (.use (.copy (locPlace 1 [.field 0 u32MirTy, .unwrapUnsafeBinder u32MirTy]))))]
+      .return_]
+    npSubrangeLayouts
+
+private def npV4PairDerefSndUnwrapMir : CapturedMir :=
+  mkMirBody "np::w_v4_pair_deref_snd_unwrap"
+    [mkDecl u32MirTy, mkDecl npRawMutPairU32BinderMirTy, mkDecl npPairU32BinderMirTy] 1
+    [mkBb [mkSt (.assign (locPlace 1 [.deref, .field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy])
+             (.use (constU32 99))),
+           mkSt (.assign (locPlace 0)
+             (.use (.copy (locPlace 1 [.deref, .field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy]))))]
+      .return_]
+    npSubrangeLayouts
+
+private def npV4PairDerefFstMir : CapturedMir :=
+  mkMirBody "np::w_v4_pair_deref_fst"
+    [mkDecl u32MirTy, mkDecl npRawMutPairU32BinderMirTy, mkDecl npPairU32BinderMirTy] 1
+    [mkBb [mkSt (.assign (locPlace 1 [.deref, .field 0 u32MirTy]) (.use (constU32 99))),
+           mkSt (.assign (locPlace 0) (.use (.copy (locPlace 1 [.deref, .field 0 u32MirTy]))))]
+      .return_]
+    npSubrangeLayouts
+
+private def mkNpPairLocalTbState (body : CapturedMir) (childOnFst childProtected : Bool) :
+    AnnealStepState :=
+  let alloc := npPaddedAlloc8.setExtra (some (npSplitChildTree childOnFst))
+  let mach : AnnealMachine :=
+    { memory := { AnnealMachine.empty.memory with live := #[(npAid1, ⟨.stack, alloc⟩)] },
+      addresses := { AnnealMachine.empty.addresses with baseAddr := #[⟨npAid1, npBase1⟩] },
+      borrowTracker := some
+        { global := { protectedTags := (hooksForChildProtected childProtected).protectedTags },
+          retagMode := .Default } }
+  let mp : Miri.Interpreter.MemPlace AnnealProv :=
+    ⟨⟨Miri.ABI.Size.ofBytes npBase1, some (.concrete npAid1 retagParentTag)⟩, .none, none⟩
+  npMkState body u32MirTy
+    #[npUninit (translateTyOverlay u32MirTy npSubrangeLayouts),
+      ⟨.live (.indirect mp), some (translateTyOverlay npPairU32BinderMirTy npSubrangeLayouts)⟩]
+    mach
+
+private def mkNpPairDerefTbState (body : CapturedMir) (childOnFst childProtected : Bool) :
+    AnnealStepState :=
+  let alloc := npPaddedAlloc8.setExtra (some (npSplitChildTree childOnFst))
+  let mach : AnnealMachine :=
+    { memory := { AnnealMachine.empty.memory with live := #[(npAid1, ⟨.stack, alloc⟩)] },
+      addresses := { AnnealMachine.empty.addresses with baseAddr := #[⟨npAid1, npBase1⟩] },
+      borrowTracker := some
+        { global := { protectedTags := (hooksForChildProtected childProtected).protectedTags },
+          retagMode := .Default } }
+  npMkState body u32MirTy
+    #[npUninit (translateTyOverlay u32MirTy npSubrangeLayouts),
+      npScalarLocal (npPtrScalarTagged npAid1 npBase1 retagParentTag)
+        (translateTyOverlay npRawMutPairU32BinderMirTy npSubrangeLayouts),
+      npUninit (translateTyOverlay npPairU32BinderMirTy npSubrangeLayouts)]
+    mach
+
+/-- **`V4` Sub-Range Tree Borrows Disjointness on `{ fst: u32, snd: BinderU32 }`
+for BOTH Local (`(_1.1).unwrapUnsafeBinder`, `_1.0`) AND Dereferenced
+(`(*ptr).1.unwrapUnsafeBinder`, `(*ptr).0`) Places (LeanMiri)**:
+with a `StrongProtector` covering ONLY `[0, 4)` (`fst`, `childOnFst = true`):
+1. `(_1.1).unwrapUnsafeBinder = 99` (`[4, 8)`) succeeds (`99`) in `treeBorrows = true`,
+   and faults UB when the protector covers `[4, 8)` (`childOnFst = false`);
+2. `(*ptr).1.unwrapUnsafeBinder = 99` (`[4, 8)` through an immediate raw pointer)
+   succeeds (`99`) in basic mode, succeeds (`99`) in `treeBorrows = true` with
+   protected `[0, 4)`, faults UB with protected `[4, 8)`, and succeeds (`99`)
+   when unprotected `[4, 8)`;
+3. writing the protected field `[0, 4)` via `_1.0 = 99` OR `(*ptr).0 = 99`
+   faults UB in `treeBorrows = true` when `[0, 4)` is protected, and succeeds
+   (`99`) in basic mode and when only `[4, 8)` is protected. -/
+theorem lm_np_v4_pair_subrange_disjoint_and_deref_field_tb_witness :
+    -- 1. Local `(_1.1).unwrapUnsafeBinder` at `[4, 8)`
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairLocalSndUnwrapMir true) 8
+      (mkNpPairLocalTbState npV4PairLocalSndUnwrapMir true true)) = .u32Val 99 ∧
+    (runMiriSteps (annealStepHooksNullaryPtr npV4PairLocalSndUnwrapMir true) 8
+      (mkNpPairLocalTbState npV4PairLocalSndUnwrapMir false true)).map (·.2) =
+      .error (.undefinedBehavior "Tree Borrows write conflict on unwrapUnsafeBinder place") ∧
+    -- 2. Deref `(*ptr).1.unwrapUnsafeBinder` at `[4, 8)`
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndUnwrapMir false) 8
+      (mkNpPairDerefTbState npV4PairDerefSndUnwrapMir false true)) = .u32Val 99 ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndUnwrapMir true) 8
+      (mkNpPairDerefTbState npV4PairDerefSndUnwrapMir true true)) = .u32Val 99 ∧
+    (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndUnwrapMir true) 8
+      (mkNpPairDerefTbState npV4PairDerefSndUnwrapMir false true)).map (·.2) =
+      .error (.undefinedBehavior "Tree Borrows write conflict on unwrapUnsafeBinder place") ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndUnwrapMir true) 8
+      (mkNpPairDerefTbState npV4PairDerefSndUnwrapMir false false)) = .u32Val 99 ∧
+    -- 3. Protected `[0, 4)` writes (`_1.0` and `(*ptr).0`): UB when `[0, 4)` protected, ok otherwise
+    (runMiriSteps (annealStepHooksNullaryPtr npV4PairLocalFstMir true) 8
+      (mkNpPairLocalTbState npV4PairLocalFstMir true true)).map (·.2) =
+      .error (.undefinedBehavior "Tree Borrows write conflict on unwrapUnsafeBinder place") ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairLocalFstMir true) 8
+      (mkNpPairLocalTbState npV4PairLocalFstMir false true)) = .u32Val 99 ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairLocalFstMir false) 8
+      (mkNpPairLocalTbState npV4PairLocalFstMir true true)) = .u32Val 99 ∧
+    (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefFstMir true) 8
+      (mkNpPairDerefTbState npV4PairDerefFstMir true true)).map (·.2) =
+      .error (.undefinedBehavior "Tree Borrows write conflict on unwrapUnsafeBinder place") ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefFstMir true) 8
+      (mkNpPairDerefTbState npV4PairDerefFstMir false true)) = .u32Val 99 ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefFstMir false) 8
+      (mkNpPairDerefTbState npV4PairDerefFstMir true true)) = .u32Val 99 := by
+  refine ⟨by decide +kernel, by decide +kernel,
+          by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+          by decide +kernel, by decide +kernel, by decide +kernel,
+          by decide +kernel, by decide +kernel, by decide +kernel⟩
+
 /-- **`V4` Zero-Sized (`()`) `UnwrapUnsafeBinder` Write 3-Layer Boundary
 (`DIV-LM-UNWRAP-ZST-WRITE`)**: separates the exact semantics across all three
 layers on a zero-sized (`Size.ZERO`) write through `.unwrapUnsafeBinder`:
@@ -2505,6 +2835,144 @@ theorem lm_np_storage_lifecycle_witness :
           by decide +kernel, by decide +kernel, by decide +kernel,
           by decide +kernel, by decide +kernel, by decide +kernel,
           by decide +kernel, by decide +kernel, by decide +kernel⟩
+
+/-! ### `V1` Multi-Hop Nested `offset_of!`, Enum Variant `offset_of!`, & Fail-Closed `.unsupported` Boundaries -/
+
+/-- 12-byte outer struct `{ tag: u8, inner: PaddedU8U32 }` (`tag` at `0`, 3
+padding bytes, `inner` at `4` with `fieldLayouts[1] = 1` pointing to
+`npPaddedU8U32MirLayout` whose field `1` is at offset `4`). -/
+def npOuterNestedMirLayout : TypeLayout :=
+  { size := ⟨12⟩, align := ⟨4⟩, backendRepr := .memory,
+    fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1],
+    fieldLayouts := [0, 1],
+    variants := .single 0, isUninhabited := false }
+
+/-- 12-byte 2-variant enum layout: variant `0` is unit (`[]`), variant `1` has
+two fields at offsets `4` and `8`. -/
+def npEnumMirLayout : TypeLayout :=
+  { size := ⟨12⟩, align := ⟨4⟩, backendRepr := .memory,
+    fields := .arbitrary [⟨0⟩] [0],
+    variants := .multiple (.initialized (.int 8 false) ⟨0, 1⟩) 0
+      [.arbitrary [] [], .arbitrary [⟨4⟩, ⟨8⟩] [0, 1]],
+    isUninhabited := false }
+
+def npNestedLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [binderU32MirLayout, npPaddedU8U32MirLayout, npOuterNestedMirLayout, npEnumMirLayout] }
+
+@[reducible] def npOuterNestedMirTy : Ty :=
+  { kind := .adt "np::OuterNested" [], layoutIdx := 2 }
+
+@[reducible] def npEnumMirTy : Ty :=
+  { kind := .adt "np::EnumTwoVar" [], layoutIdx := 3 }
+
+@[reducible] def npUnresolvedAdtMirTy : Ty :=
+  { kind := .adt "np::UnresolvedAdt" [], layoutIdx := 0 }
+
+private def npV1MultiHopOffsetMir : CapturedMir :=
+  mkMirBody "np::w_v1_multihop_offset" [mkDecl usizeMirTy, mkDecl npOuterNestedMirTy] 0
+    [mkBb [mkSt (.assign (locPlace 0) (.nullaryOp (.offsetOf [(0, 1), (0, 1)]) npOuterNestedMirTy))]
+      .return_]
+    npNestedLayouts
+
+private def npV1EnumOffsetMir : CapturedMir :=
+  mkMirBody "np::w_v1_enum_offset" [mkDecl usizeMirTy, mkDecl npEnumMirTy] 0
+    [mkBb [mkSt (.assign (locPlace 0) (.nullaryOp (.offsetOf [(1, 1)]) npEnumMirTy))] .return_]
+    npNestedLayouts
+
+private def npV1OobOffsetMir : CapturedMir :=
+  mkMirBody "np::w_v1_oob_offset" [mkDecl usizeMirTy, mkDecl npPaddedMirTy] 0
+    [mkBb [mkSt (.assign (locPlace 0) (.nullaryOp (.offsetOf [(0, 99)]) npPaddedMirTy))] .return_]
+    npLayouts
+
+private def npV1UnsizedSizeOfMir (ty : Ty) (name : String) : CapturedMir :=
+  mkMirBody name [mkDecl usizeMirTy] 0
+    [mkBb [mkSt (.assign (locPlace 0) (.nullaryOp .sizeOf ty))] .return_]
+
+private def npV1UnresolvedLayoutMir : CapturedMir :=
+  mkMirBody "np::w_v1_unresolved_layout" [mkDecl usizeMirTy, mkDecl npUnresolvedAdtMirTy] 0
+    [mkBb [mkSt (.assign (locPlace 0) (.nullaryOp .sizeOf npUnresolvedAdtMirTy))] .return_]
+
+/-- **`V1` Multi-Hop Nested `offset_of!`, Multi-Variant Enum `offset_of!`, &
+Fail-Closed `.unsupported` Boundary Parity (Trusted + `lowerNullaryMirBody`/LeanMiri)**:
+1. Multi-hop nested struct `offset_of!([(0, 1), (0, 1)]) = 4 + 4 = 8` agrees
+   across Trusted `evalNullaryOp` / `stepMirFn` AND `lowerNullaryMirBody` +
+   LeanMiri `runMiriSteps` (in both `treeBorrows` modes);
+2. Multi-variant enum `offset_of!([(1, 1)]) = 8` agrees across Trusted AND
+   `lowerNullaryMirBody` + LeanMiri;
+3. Fail-closed `.unsupported` boundary parity across Trusted AND
+   `lowerNullaryMirBody`/LeanMiri for:
+   (a) out-of-bounds `offset_of!` field index (`[(0, 99)]`, unit variant
+       `[(0, 0)]`, out-of-range variant `[(2, 0)]`),
+   (b) unsized types (`[u32]`, `str`, `dyn Trait`) in `sizeOf` / `alignOf`,
+   (c) `NullOp.contractChecks`, and
+   (d) unresolved ADT layout index (`layoutIdx := 0` in `emptyLayoutTable`). -/
+theorem lm_np_v1_multihop_offsetof_and_failclosed_unsupported_witness :
+    let usizeNestedLay := translateTyOverlay usizeMirTy npNestedLayouts
+    let outerLay := translateTyOverlay npOuterNestedMirTy npNestedLayouts
+    let enumLay := translateTyOverlay npEnumMirTy npNestedLayouts
+    let usizeEmptyLay := translateTyOverlay usizeMirTy emptyLayoutTable
+    let usizeNpLay := translateTyOverlay usizeMirTy npLayouts
+    let paddedLay := translateTyOverlay npPaddedMirTy npLayouts
+    let unresLay := translateTyOverlay npUnresolvedAdtMirTy emptyLayoutTable
+    let dynTy : Ty := { kind := .dynamic "np::Tr", layoutIdx := 0 }
+    let lowMulti := lowerNullaryMirBody npV1MultiHopOffsetMir
+    let lowEnum := lowerNullaryMirBody npV1EnumOffsetMir
+    let lowOob := lowerNullaryMirBody npV1OobOffsetMir
+    let lowSlice := lowerNullaryMirBody (npV1UnsizedSizeOfMir sliceU32MirTy "np::w_v1_unsized_slice")
+    let lowStr := lowerNullaryMirBody (npV1UnsizedSizeOfMir strMirTy "np::w_v1_unsized_str")
+    let lowDyn := lowerNullaryMirBody (npV1UnsizedSizeOfMir dynTy "np::w_v1_unsized_dyn")
+    let lowUnres := lowerNullaryMirBody npV1UnresolvedLayoutMir
+    -- 1. Multi-hop nested struct `offset_of!([(0, 1), (0, 1)]) = 8`
+    evalNullaryOp [] (.offsetOf [(0, 1), (0, 1)]) npOuterNestedMirTy emptyMemory
+      npV1MultiHopOffsetMir.localDecls npNestedLayouts = .ok (.scalar ⟨8, 8⟩) [] emptyMemory ∧
+    npLmRunTrusted npV1MultiHopOffsetMir 8 (initMachineState npV1MultiHopOffsetMir []) = .usizeVal 8 ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr lowMulti false) 8
+      (npMkState lowMulti usizeMirTy #[npUninit usizeNestedLay, npUninit outerLay])) = .usizeVal 8 ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr lowMulti true) 8
+      (npMkState lowMulti usizeMirTy #[npUninit usizeNestedLay, npUninit outerLay])) = .usizeVal 8 ∧
+    -- 2. Multi-variant enum `offset_of!([(1, 1)]) = 8`
+    evalNullaryOp [] (.offsetOf [(1, 1)]) npEnumMirTy emptyMemory
+      npV1EnumOffsetMir.localDecls npNestedLayouts = .ok (.scalar ⟨8, 8⟩) [] emptyMemory ∧
+    npLmRunTrusted npV1EnumOffsetMir 8 (initMachineState npV1EnumOffsetMir []) = .usizeVal 8 ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr lowEnum false) 8
+      (npMkState lowEnum usizeMirTy #[npUninit usizeNestedLay, npUninit enumLay])) = .usizeVal 8 ∧
+    -- 3a. Out-of-bounds `offset_of!` fails closed with `.unsupported`
+    evalNullaryOp [] (.offsetOf [(0, 99)]) npPaddedMirTy emptyMemory
+      npV1OobOffsetMir.localDecls npLayouts = .unsupported ∧
+    evalNullaryOp [] (.offsetOf [(0, 0)]) npEnumMirTy emptyMemory
+      npV1EnumOffsetMir.localDecls npNestedLayouts = .unsupported ∧
+    evalNullaryOp [] (.offsetOf [(2, 0)]) npEnumMirTy emptyMemory
+      npV1EnumOffsetMir.localDecls npNestedLayouts = .unsupported ∧
+    npIsUnsupportedErr (Miri.Interpreter.Step.step (annealStepHooksNullaryPtr lowOob) ()
+      (npMkState lowOob usizeMirTy #[npUninit usizeNpLay, npUninit paddedLay])).2 = true ∧
+    -- 3b. Unsized types (`[u32]`, `str`, `dyn Trait`) fail closed with `.unsupported`
+    evalNullaryOp [] .sizeOf sliceU32MirTy emptyMemory [] emptyLayoutTable = .unsupported ∧
+    evalNullaryOp [] .alignOf strMirTy emptyMemory [] emptyLayoutTable = .unsupported ∧
+    evalNullaryOp [] .sizeOf dynTy emptyMemory [] emptyLayoutTable = .unsupported ∧
+    npIsUnsupportedErr (Miri.Interpreter.Step.step (annealStepHooksNullaryPtr lowSlice) ()
+      (npMkState lowSlice usizeMirTy #[npUninit usizeEmptyLay])).2 = true ∧
+    npIsUnsupportedErr (Miri.Interpreter.Step.step (annealStepHooksNullaryPtr lowStr) ()
+      (npMkState lowStr usizeMirTy #[npUninit usizeEmptyLay])).2 = true ∧
+    npIsUnsupportedErr (Miri.Interpreter.Step.step (annealStepHooksNullaryPtr lowDyn) ()
+      (npMkState lowDyn usizeMirTy #[npUninit usizeEmptyLay])).2 = true ∧
+    -- 3c. `contractChecks` fails closed with `.unsupported`
+    evalNullaryOp [] .contractChecks boolMirTy emptyMemory [] emptyLayoutTable = .unsupported ∧
+    npIsUnsupportedErr (runMiriSteps (annealStepHooksNullaryPtr npContractChecksMir) 8
+      npStContractChecks) = true ∧
+    -- 3d. Unresolved ADT layout index fails closed with `.unsupported`
+    evalNullaryOp [] .sizeOf npUnresolvedAdtMirTy emptyMemory
+      npV1UnresolvedLayoutMir.localDecls emptyLayoutTable = .unsupported ∧
+    evalNullaryOp [] (.offsetOf [(0, 0)]) npUnresolvedAdtMirTy emptyMemory
+      npV1UnresolvedLayoutMir.localDecls emptyLayoutTable = .unsupported ∧
+    npIsUnsupportedErr (Miri.Interpreter.Step.step (annealStepHooksNullaryPtr lowUnres) ()
+      (npMkState lowUnres usizeMirTy #[npUninit usizeEmptyLay, npUninit unresLay])).2 = true := by
+  refine ⟨rfl, by decide +kernel, by decide +kernel, by decide +kernel,
+          rfl, by decide +kernel, by decide +kernel,
+          rfl, rfl, rfl, by decide +kernel,
+          rfl, rfl, rfl, by decide +kernel, by decide +kernel, by decide +kernel,
+          rfl, by decide +kernel,
+          rfl, rfl, by decide +kernel⟩
 
 /-- **Trusted-side anchors** (`Trusted.Rustc.V2026_06_01.MirSemantics`):
 1. the constants produced by `lowerNullaryMirBody` are exactly Trusted

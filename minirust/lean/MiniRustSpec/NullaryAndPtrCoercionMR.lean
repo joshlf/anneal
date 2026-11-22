@@ -1749,6 +1749,237 @@ theorem np_v1_nullaryOp_frame_inhabitation_and_nonvacuity :
       rfl rfl rfl hNull rfl wDeadBM wDeadTB
     exact ⟨hDead.2.1, hDead.2.2.2.1, hDead.2.2.2.2.2⟩
 
+/-! ### Multi-Hop Nested `offset_of!`, Multi-Variant Enum `offset_of!`, & Fail-Closed `.unsupported` Parity (`V1`) -/
+
+/-- 12-byte outer struct `{ tag: u8, inner: PaddedU8U32 }` (`tag` at `0`, 3
+padding bytes, `inner` at `4` with `fieldLayouts[1] = 1` pointing to
+`npPaddedU8U32MirLayout` whose field `1` is at offset `4`). -/
+def npOuterNestedMirLayout : TypeLayout :=
+  { size := ⟨12⟩, align := ⟨4⟩, backendRepr := .memory,
+    fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1],
+    fieldLayouts := [0, 1],
+    variants := .single 0, isUninhabited := false }
+
+/-- 12-byte 2-variant enum layout: variant `0` is unit (`[]`), variant `1` has
+two fields at offsets `4` and `8`. -/
+def npEnumMirLayout : TypeLayout :=
+  { size := ⟨12⟩, align := ⟨4⟩, backendRepr := .memory,
+    fields := .arbitrary [⟨0⟩] [0],
+    variants := .multiple (.initialized (.int 8 false) ⟨0, 1⟩) 0
+      [.arbitrary [] [], .arbitrary [⟨4⟩, ⟨8⟩] [0, 1]],
+    isUninhabited := false }
+
+def npNestedLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [binderU32MirLayout, npPaddedU8U32MirLayout, npOuterNestedMirLayout, npEnumMirLayout] }
+
+@[reducible] def npOuterNestedMirTy : Ty :=
+  { kind := .adt "np::OuterNested" [], layoutIdx := 2 }
+
+@[reducible] def npEnumMirTy : Ty :=
+  { kind := .adt "np::EnumTwoVar" [], layoutIdx := 3 }
+
+@[reducible] def npUnresolvedAdtMirTy : Ty :=
+  { kind := .adt "np::UnresolvedAdt" [], layoutIdx := 0 }
+
+/-- MiniRust `OuterNested { u8, PaddedU8U32 }` tuple type (size 12, align 4). -/
+@[reducible] def npOuterNestedMrTy : Gen.Type :=
+  .Tuple [(⟨0⟩, u8MrTy), (⟨4⟩, npPaddedU8U32MrTy)] ⟨⟨12⟩, ⟨4⟩, none⟩ none
+
+/-- MiniRust variant table for `npEnumMrTy`: variant `0` is unit, variant `1`
+places its two `u32` fields at offsets `4` and `8`. -/
+def npEnumVariants : Map Int Gen.Variant :=
+  ⟨[(0, ⟨.Tuple [] ⟨⟨12⟩, ⟨4⟩, none⟩ none, ⟨[(⟨0⟩, (⟨.Unsigned, ⟨1⟩⟩, 0))]⟩⟩),
+    (1, ⟨.Tuple [(⟨4⟩, u32MrTy), (⟨8⟩, u32MrTy)] ⟨⟨12⟩, ⟨4⟩, none⟩ none,
+         ⟨[(⟨0⟩, (⟨.Unsigned, ⟨1⟩⟩, 1))]⟩⟩)]⟩
+
+/-- MiniRust 2-variant `Enum` type matching `npEnumMirLayout` (size 12, align 4). -/
+@[reducible] def npEnumMrTy : Gen.Type :=
+  .Enum npEnumVariants ⟨.Unsigned, ⟨1⟩⟩
+    (.Branch ⟨0⟩ ⟨.Unsigned, ⟨1⟩⟩ .Invalid ⟨[((0, 1), .Known 0), ((1, 2), .Known 1)]⟩)
+    ⟨12⟩ ⟨4⟩
+
+/-- Multi-hop `(variantIdx, fieldIdx)` byte-offset query on MiniRust `Tuple` and
+`Enum` types, failing closed with `none` on out-of-range variants or fields. -/
+def npOffsetOfMrPath : Gen.Type → List (Nat × Nat) → Option Nat
+  | _, [] => some 0
+  | .Tuple fields _ _, (0, i) :: rest =>
+    match fields[i]? with
+    | some (off, fTy) => (npOffsetOfMrPath fTy rest).map (fun tail => off.bytes + tail)
+    | none => none
+  | .Enum variants _ _ _ _, (v, i) :: rest =>
+    match mapGet variants (Int.ofNat v) with
+    | some var =>
+      match var.ty with
+      | .Tuple fields _ _ =>
+        match fields[i]? with
+        | some (off, fTy) => (npOffsetOfMrPath fTy rest).map (fun tail => off.bytes + tail)
+        | none => none
+      | _ => none
+    | none => none
+  | _, _ :: _ => none
+
+def npV1MultiHopOffsetMir : CapturedMir :=
+  mkMirBody "np::w_v1_multihop_offset" [mkDecl usizeMirTy, mkDecl npOuterNestedMirTy] 0
+    [mkBb [mkSt (.assign (locPlace 0) (.nullaryOp (.offsetOf [(0, 1), (0, 1)]) npOuterNestedMirTy))]
+      .return_]
+    npNestedLayouts
+
+def npV1EnumOffsetMir : CapturedMir :=
+  mkMirBody "np::w_v1_enum_offset" [mkDecl usizeMirTy, mkDecl npEnumMirTy] 0
+    [mkBb [mkSt (.assign (locPlace 0) (.nullaryOp (.offsetOf [(1, 1)]) npEnumMirTy))] .return_]
+    npNestedLayouts
+
+def npV1OobOffsetMir : CapturedMir :=
+  mkMirBody "np::w_v1_oob_offset" [mkDecl usizeMirTy, mkDecl npPaddedMirTy] 0
+    [mkBb [mkSt (.assign (locPlace 0) (.nullaryOp (.offsetOf [(0, 99)]) npPaddedMirTy))] .return_]
+    npLayouts
+
+def npV1UnresolvedLayoutMir : CapturedMir :=
+  mkMirBody "np::w_v1_unresolved_layout" [mkDecl usizeMirTy, mkDecl npUnresolvedAdtMirTy] 0
+    [mkBb [mkSt (.assign (locPlace 0) (.nullaryOp .sizeOf npUnresolvedAdtMirTy))] .return_]
+
+/-- Lowered MiniRust machine for `npV1MultiHopOffsetMir` / `npV1EnumOffsetMir`
+(assigning the const-evaluated `usize` `8`). -/
+def npV1Offset8Mach : Mach :=
+  let fn := mkMrFn [(localName 0, usizeMrTy)] [] (localName 0)
+    [(bbName 0, ⟨[.Assign (.Local (localName 0)) (.Constant (.Int 8) usizeMrTy)],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 8 .Uninit) 8]
+    [mkRootFrame fn [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) })]]
+
+/-- Runtime MiniRust machine loading `(_1.1).1` of `npOuterNestedMrTy`, proving
+that MiniRust's `evalPlaceM` computes byte offset `4 + 4 = 8` (reading `55` at
+bytes `[8, 12)` of allocation `1`). -/
+def npV1MultiHopRuntimeLoadMach : Mach :=
+  let fn := mkMrFn [(localName 0, u32MrTy), (localName 1, npOuterNestedMrTy)]
+    [localName 1] (localName 0)
+    [(bbName 0, ⟨[
+        .Assign (.Local (localName 0)) (.Load (.Field (.Field (.Local (localName 1)) 1) 1))],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256
+       (([.Init 1 none, .Uninit, .Uninit, .Uninit,
+          .Init 2 none, .Uninit, .Uninit, .Uninit] : List Byte) ++ scalarBytes u32 55) 4]
+    [mkRootFrame fn
+      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) })]]
+
+/-- Runtime MiniRust machine loading `(_1 as Variant1).1` of `npEnumMrTy`,
+proving that MiniRust's `evalPlaceM` `.Downcast 1` -> `.Field 1` computes byte
+offset `8` (reading `77` at bytes `[8, 12)` of allocation `1`). -/
+def npV1EnumRuntimeLoadMach : Mach :=
+  let fn := mkMrFn [(localName 0, u32MrTy), (localName 1, npEnumMrTy)]
+    [localName 1] (localName 0)
+    [(bbName 0, ⟨[
+        .Assign (.Local (localName 0)) (.Load (.Field (.Downcast (.Local (localName 1)) 1) 1))],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256
+       (([.Init 1 none, .Uninit, .Uninit, .Uninit] : List Byte) ++
+        scalarBytes u32 33 ++ scalarBytes u32 77) 4]
+    [mkRootFrame fn
+      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) })]]
+
+/-- **`V1` Multi-Hop Nested `offset_of!`, Multi-Variant Enum `offset_of!`, &
+Fail-Closed `.unsupported` Boundary Parity (Trusted + MiniRust `Mach` & `MachTB`
+with `MachTB.wfLive`)**:
+1. Multi-hop nested struct `offset_of!([(0, 1), (0, 1)]) = 4 + 4 = 8` agrees
+   across Trusted `evalNullaryOp` / `npRunTrusted` (from `initMachineState`),
+   MiniRust `Type.layout` + `npOffsetOfMrPath`, lowered `Mach` / `MachTB`, AND
+   runtime `evalPlaceM` nested `.Field (.Field _ 1) 1` load (`55` from offset `8`);
+2. Multi-variant enum `offset_of!([(1, 1)]) = 8` agrees across Trusted
+   `evalNullaryOp` / `npRunTrusted`, MiniRust `Type.layout` + `npOffsetOfMrPath`,
+   lowered `Mach` / `MachTB`, AND runtime `.Downcast 1 -> .Field 1` load (`77`
+   from offset `8`);
+3. Fail-closed `.unsupported` boundary parity for:
+   (a) OOB `offset_of!` (`[(0, 99)]`, unit variant `[(0, 0)]`, out-of-range
+       variant `[(2, 0)]`) + `npOffsetOfMrPath = none`,
+   (b) unsized `[u32]`, `str`, `dyn Trait` in Trusted `evalNullaryOp`, MiniRust
+       `LayoutStrategy.is_sized = false`, and `evalUnOpM (.ComputeSize _)`
+       rejecting empty metadata `()`,
+   (c) `NullOp.contractChecks = .unsupported`, and
+   (d) unresolved ADT layout index (`layoutIdx := 0` in `emptyLayoutTable`). -/
+theorem np_v1_multihop_offsetof_and_failclosed_unsupported_three_way_witness :
+    -- 1. Multi-hop nested struct `offset_of!([(0, 1), (0, 1)]) = 8`
+    evalNullaryOp [] (.offsetOf [(0, 1), (0, 1)]) npOuterNestedMirTy emptyMemory
+      npV1MultiHopOffsetMir.localDecls npNestedLayouts = .ok (.scalar ⟨8, 8⟩) [] emptyMemory ∧
+    npRunTrusted npV1MultiHopOffsetMir 8 (initMachineState npV1MultiHopOffsetMir []) = .usizeVal 8 ∧
+    Type.layout npOuterNestedMrTy = .ok (.Sized ⟨12⟩ ⟨4⟩) ∧
+    npOffsetOfMrPath npOuterNestedMrTy [(0, 1), (0, 1)] = some 8 ∧
+    (∃ m1, Interp.steps 1 npV1Offset8Mach = .ok m1 ∧
+      m1.mem.memory.allocations[0]?.map (·.data) = some (scalarBytes IntType.usize_ty 8)) ∧
+    (∃ m1, Interp.stepsTB 1 (liftMachToTB npV1Offset8Mach) = .ok m1 ∧ MachTB.wfLive m1 ∧
+      m1.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB) =
+        some ((scalarBytes IntType.usize_ty 8).map (projByteTB ∘ liftByteTB))) ∧
+    (∃ m1, Interp.steps 1 npV1MultiHopRuntimeLoadMach = .ok m1 ∧
+      m1.mem.memory.allocations[0]?.map (·.data) = some (scalarBytes u32 55)) ∧
+    (∃ m1, Interp.stepsTB 1 (liftMachToTB npV1MultiHopRuntimeLoadMach) = .ok m1 ∧
+      MachTB.wfLive m1 ∧
+      m1.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB) =
+        some ((scalarBytes u32 55).map (projByteTB ∘ liftByteTB))) ∧
+    -- 2. Multi-variant enum `offset_of!([(1, 1)]) = 8`
+    evalNullaryOp [] (.offsetOf [(1, 1)]) npEnumMirTy emptyMemory
+      npV1EnumOffsetMir.localDecls npNestedLayouts = .ok (.scalar ⟨8, 8⟩) [] emptyMemory ∧
+    npRunTrusted npV1EnumOffsetMir 8 (initMachineState npV1EnumOffsetMir []) = .usizeVal 8 ∧
+    Type.layout npEnumMrTy = .ok (.Sized ⟨12⟩ ⟨4⟩) ∧
+    npOffsetOfMrPath npEnumMrTy [(1, 1)] = some 8 ∧
+    (∃ m1, Interp.steps 1 npV1EnumRuntimeLoadMach = .ok m1 ∧
+      m1.mem.memory.allocations[0]?.map (·.data) = some (scalarBytes u32 77)) ∧
+    (∃ m1, Interp.stepsTB 1 (liftMachToTB npV1EnumRuntimeLoadMach) = .ok m1 ∧
+      MachTB.wfLive m1 ∧
+      m1.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB) =
+        some ((scalarBytes u32 77).map (projByteTB ∘ liftByteTB))) ∧
+    -- 3a. OOB `offset_of!` fails closed
+    evalNullaryOp [] (.offsetOf [(0, 99)]) npPaddedMirTy emptyMemory
+      npV1OobOffsetMir.localDecls npLayouts = .unsupported ∧
+    evalNullaryOp [] (.offsetOf [(0, 0)]) npEnumMirTy emptyMemory
+      npV1EnumOffsetMir.localDecls npNestedLayouts = .unsupported ∧
+    evalNullaryOp [] (.offsetOf [(2, 0)]) npEnumMirTy emptyMemory
+      npV1EnumOffsetMir.localDecls npNestedLayouts = .unsupported ∧
+    npRunTrusted npV1OobOffsetMir 8 (initMachineState npV1OobOffsetMir []) = .unsupported ∧
+    npOffsetOfMrPath npPaddedU8U32MrTy [(0, 99)] = none ∧
+    npOffsetOfMrPath npEnumMrTy [(0, 0)] = none ∧
+    npOffsetOfMrPath npEnumMrTy [(2, 0)] = none ∧
+    -- 3b. Unsized `[u32]`, `str`, `dyn Trait` fail closed in Trusted & reject `()` metadata in MiniRust
+    evalNullaryOp [] .sizeOf sliceU32MirTy emptyMemory [] emptyLayoutTable = .unsupported ∧
+    evalNullaryOp [] .alignOf strMirTy emptyMemory [] emptyLayoutTable = .unsupported ∧
+    evalNullaryOp [] .sizeOf { kind := .dynamic "np::Tr", layoutIdx := 0 } emptyMemory []
+      emptyLayoutTable = .unsupported ∧
+    (Type.layout (.Slice u32MrTy)).toOption.map LayoutStrategy.is_sized = some false ∧
+    (Type.layout (.Slice u8MrTy)).toOption.map LayoutStrategy.is_sized = some false ∧
+    (Type.layout (.TraitObject (traitNameOf 0))).toOption.map LayoutStrategy.is_sized = some false ∧
+    (evalUnOpM (M := BM) (.ComputeSize (.Slice u32MrTy)) (.Tuple [], unitType) none).toOption.isNone =
+      true ∧
+    (evalUnOpM (M := BM) (.ComputeSize (.Slice u8MrTy)) (.Tuple [], unitType) none).toOption.isNone =
+      true ∧
+    (evalUnOpM (M := BM) (.ComputeSize (.TraitObject (traitNameOf 0)))
+      (.Tuple [], unitType) none).toOption.isNone = true ∧
+    -- 3c. `contractChecks` fails closed
+    evalNullaryOp [] .contractChecks boolMirTy emptyMemory [] emptyLayoutTable = .unsupported ∧
+    -- 3d. Unresolved ADT layout index fails closed
+    evalNullaryOp [] .sizeOf npUnresolvedAdtMirTy emptyMemory
+      npV1UnresolvedLayoutMir.localDecls emptyLayoutTable = .unsupported ∧
+    evalNullaryOp [] (.offsetOf [(0, 0)]) npUnresolvedAdtMirTy emptyMemory
+      npV1UnresolvedLayoutMir.localDecls emptyLayoutTable = .unsupported ∧
+    npRunTrusted npV1UnresolvedLayoutMir 8 (initMachineState npV1UnresolvedLayoutMir []) =
+      .unsupported :=
+  ⟨rfl, by decide +kernel, rfl, rfl,
+   ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   rfl, by decide +kernel, rfl, rfl,
+   ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   rfl, rfl, rfl, by decide +kernel, rfl, rfl, rfl,
+   rfl, rfl, rfl,
+   by decide +kernel, by decide +kernel, by decide +kernel,
+   by decide +kernel, by decide +kernel, by decide +kernel,
+   rfl,
+   rfl, rfl, by decide +kernel⟩
+
 /-! ## §3 (`V2`): `CastKind.pointerCoercion` — all 6 coercions (`Mach` & `MachTB`) -/
 
 /-- **V2 Universal Dispatch Law**: `evalRvalue` evaluates every
@@ -2797,6 +3028,276 @@ theorem np_v4_nested_field_unwrap_mach_and_tb_witness :
       m2.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB) =
         some ((scalarBytes u32 99).map (projByteTB ∘ liftByteTB))) :=
   ⟨ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel)⟩
+
+/-! ### Sub-Range Tree Borrows Disjointness on `{ fst: u32, snd: BinderU32 }` & `(*ptr).field.unwrapUnsafeBinder` -/
+
+/-- 8-byte layout for `np::PairU32Binder { fst: u32, snd: BinderU32 }`:
+`fst` at `[0, 4)`, `snd` at `[4, 8)` (shared verbatim with `NullaryAndPtrCoercionLM`). -/
+def npPairU32BinderMirLayout : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨4⟩,
+    backendRepr := .scalarPair
+      (.initialized (.int 32 false) ⟨0, 0xffffffff⟩)
+      (.initialized (.int 32 false) ⟨0, 0xffffffff⟩),
+    fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1],
+    fieldLayouts := [0, 1],
+    variants := .single 0, isUninhabited := false }
+
+def npSubrangeLayouts : LayoutTable :=
+  { npLayouts with entries := npLayouts.entries ++ [npPairU32BinderMirLayout] }
+
+@[reducible] def npPairU32BinderMirTy : Ty :=
+  { kind := .adt "np::PairU32Binder" [], layoutIdx := 5 }
+
+@[reducible] def npRawMutPairU32BinderMirTy : Ty :=
+  { kind := .rawPtr .mut npPairU32BinderMirTy.kind, layoutIdx := 0 }
+
+/-- MiniRust `{ fst: u32, snd: BinderU32 }` tuple type (size 8, align 4). -/
+@[reducible] def npPairU32BinderMrTy : Gen.Type :=
+  .Tuple [(⟨0⟩, u32MrTy), (⟨4⟩, mrBinderWrapperTy u32MrTy ⟨4⟩ ⟨4⟩)] ⟨⟨8⟩, ⟨4⟩, none⟩ none
+
+def npV4PairLocalSndUnwrapMir : CapturedMir :=
+  mkMirBody "np::w_v4_pair_local_snd_unwrap"
+    [mkDecl u32MirTy, mkDecl npPairU32BinderMirTy] 1
+    [mkBb [mkSt (.assign (locPlace 1 [.field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy])
+             (.use (constU32 99))),
+           mkSt (.assign (locPlace 0)
+             (.use (.copy (locPlace 1 [.field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy]))))]
+      .return_]
+    npSubrangeLayouts
+
+def npV4PairLocalFstMir : CapturedMir :=
+  mkMirBody "np::w_v4_pair_local_fst"
+    [mkDecl u32MirTy, mkDecl npPairU32BinderMirTy] 1
+    [mkBb [mkSt (.assign (locPlace 1 [.field 0 u32MirTy, .unwrapUnsafeBinder u32MirTy])
+             (.use (constU32 99))),
+           mkSt (.assign (locPlace 0)
+             (.use (.copy (locPlace 1 [.field 0 u32MirTy, .unwrapUnsafeBinder u32MirTy]))))]
+      .return_]
+    npSubrangeLayouts
+
+def npV4PairDerefSndUnwrapMir : CapturedMir :=
+  mkMirBody "np::w_v4_pair_deref_snd_unwrap"
+    [mkDecl u32MirTy, mkDecl npRawMutPairU32BinderMirTy, mkDecl npPairU32BinderMirTy] 1
+    [mkBb [mkSt (.assign (locPlace 1 [.deref, .field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy])
+             (.use (constU32 99))),
+           mkSt (.assign (locPlace 0)
+             (.use (.copy (locPlace 1 [.deref, .field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy]))))]
+      .return_]
+    npSubrangeLayouts
+
+def npV4PairDerefFstMir : CapturedMir :=
+  mkMirBody "np::w_v4_pair_deref_fst"
+    [mkDecl u32MirTy, mkDecl npRawMutPairU32BinderMirTy, mkDecl npPairU32BinderMirTy] 1
+    [mkBb [mkSt (.assign (locPlace 1 [.deref, .field 0 u32MirTy]) (.use (constU32 99))),
+           mkSt (.assign (locPlace 0) (.use (.copy (locPlace 1 [.deref, .field 0 u32MirTy]))))]
+      .return_]
+    npSubrangeLayouts
+
+/-- Trusted initial state for local pair fixtures: `_1` holds `{ fst: 7, snd: 11 }`
+and borrow tag `1` protects ONLY `_1.0` (`[0, 4)`) when `protectedMode = true`. -/
+def npPairLocalTrustedInit (body : CapturedMir) (protectedMode : Bool) : MachineState :=
+  let base := initMachineState body [.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨11, 4⟩]]
+  let bProt : BorrowEntry :=
+    { tag := 1, targetLocal := 1, targetProjection := [.field 0 u32MirTy], perm := .unique,
+      rangeOffset := 0, rangeLen := 4,
+      protector := if protectedMode then some 1 else none,
+      parentTag := none, targetFrameDepth := 0, allocDead := false }
+  { base with
+    memory := { base.memory with
+      borrows := [bProt],
+      activeProtectors := if protectedMode then [1] else [] } }
+
+/-- Trusted initial state for deref pair fixtures: `_1` holds `*mut PairU32Binder`
+with tag `1` targeting `_2 = { fst: 7, snd: 11 }`, and child borrow tag `2`
+protects ONLY `_2.0` (`[0, 4)`) when `protectedMode = true`. -/
+def npPairDerefTrustedInit (body : CapturedMir) (protectedMode : Bool) : MachineState :=
+  let bPtr : BorrowEntry :=
+    { tag := 1, targetLocal := 2, targetProjection := [], perm := .unique,
+      rangeOffset := 0, rangeLen := 0, protector := none, parentTag := none,
+      targetFrameDepth := 0, allocDead := false }
+  let bProt : BorrowEntry :=
+    { tag := 2, targetLocal := 2, targetProjection := [.field 0 u32MirTy], perm := .unique,
+      rangeOffset := 0, rangeLen := 4,
+      protector := if protectedMode then some 1 else none,
+      parentTag := some 1, targetFrameDepth := 0, allocDead := false }
+  { frame := { blockIdx := 0, stmtIdx := 0,
+               locals := [.uninit, .init (.ptr ⟨1, 0⟩ 8),
+                          .init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨11, 4⟩])] },
+    memory := { (initMachineState body []).memory with
+      borrows := [bPtr, bProt],
+      activeProtectors := if protectedMode then [1] else [] } }
+
+/-- MiniRust machine for `(_1.1).unwrapUnsafeBinder = 99` (`[4, 8)`) while `_2 : &u32`
+holds a function-entry protector (`Validate _2 true`) covering ONLY `_1.0` (`[0, 4)`). -/
+def npV4PairLocalSndDisjointMach : Mach :=
+  let fn := mkMrFn
+    [(localName 0, u32MrTy), (localName 1, npPairU32BinderMrTy), (localName 2, refTy .not u32)]
+    [localName 1] (localName 0)
+    [(bbName 0, ⟨[
+        .Validate (.Local (localName 2)) true,
+        .Assign (.Field (.Field (.Local (localName 1)) 1) 0) (.Constant (.Int 99) u32MrTy),
+        .Assign (.Local (localName 0)) (.Load (.Field (.Field (.Local (localName 1)) 1) 0))],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (scalarBytes u32 7 ++ scalarBytes u32 11) 4,
+     mkStackAlloc 384 (ptrBytes 256 (some (⟨1⟩, ()))) 8]
+    [mkRootFrame fn
+      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) }),
+       (localName 2, { addr := 384, provenance := some (⟨2⟩, ()) })]]
+
+/-- MiniRust machine for `(*_3).1.unwrapUnsafeBinder = 99` (`[4, 8)` through
+raw pointer `_3`) while `_2 : &u32` holds a function-entry protector covering
+ONLY `[0, 4)` of allocation `1`. -/
+def npV4PairDerefSndDisjointMach : Mach :=
+  let fn := mkMrFn
+    [(localName 0, u32MrTy), (localName 1, npPairU32BinderMrTy),
+     (localName 2, refTy .not u32), (localName 3, thinRawPtrTy)]
+    [localName 1] (localName 0)
+    [(bbName 0, ⟨[
+        .Validate (.Local (localName 2)) true,
+        .Assign (.Field (.Field (.Deref (.Load (.Local (localName 3))) npPairU32BinderMrTy) 1) 0)
+          (.Constant (.Int 99) u32MrTy),
+        .Assign (.Local (localName 0))
+          (.Load (.Field (.Field (.Deref (.Load (.Local (localName 3))) npPairU32BinderMrTy) 1) 0))],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (scalarBytes u32 7 ++ scalarBytes u32 11) 4,
+     mkStackAlloc 384 (ptrBytes 256 (some (⟨1⟩, ()))) 8,
+     mkStackAlloc 512 (ptrBytes 256 (some (⟨1⟩, ()))) 8]
+    [mkRootFrame fn
+      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) }),
+       (localName 2, { addr := 384, provenance := some (⟨2⟩, ()) }),
+       (localName 3, { addr := 512, provenance := some (⟨3⟩, ()) })]]
+
+/-- MiniRust machine writing the protected field `_1.0 = 99` (`[0, 4)`):
+returns `99` on `Mach` (`BasicMemory`), faults UB on `MachTB` (`TreeBorrowsMemory`). -/
+def npV4PairLocalFstConflictMach : Mach :=
+  let fn := mkMrFn
+    [(localName 0, u32MrTy), (localName 1, npPairU32BinderMrTy), (localName 2, refTy .not u32)]
+    [localName 1] (localName 0)
+    [(bbName 0, ⟨[
+        .Validate (.Local (localName 2)) true,
+        .Assign (.Field (.Local (localName 1)) 0) (.Constant (.Int 99) u32MrTy),
+        .Assign (.Local (localName 0)) (.Load (.Field (.Local (localName 1)) 0))],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (scalarBytes u32 7 ++ scalarBytes u32 11) 4,
+     mkStackAlloc 384 (ptrBytes 256 (some (⟨1⟩, ()))) 8]
+    [mkRootFrame fn
+      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) }),
+       (localName 2, { addr := 384, provenance := some (⟨2⟩, ()) })]]
+
+/-- MiniRust machine writing the protected field through raw pointer `(*_3).0 = 99`
+(`[0, 4)`): returns `99` on `Mach`, faults UB on `MachTB`. -/
+def npV4PairDerefFstConflictMach : Mach :=
+  let fn := mkMrFn
+    [(localName 0, u32MrTy), (localName 1, npPairU32BinderMrTy),
+     (localName 2, refTy .not u32), (localName 3, thinRawPtrTy)]
+    [localName 1] (localName 0)
+    [(bbName 0, ⟨[
+        .Validate (.Local (localName 2)) true,
+        .Assign (.Field (.Deref (.Load (.Local (localName 3))) npPairU32BinderMrTy) 0)
+          (.Constant (.Int 99) u32MrTy),
+        .Assign (.Local (localName 0))
+          (.Load (.Field (.Deref (.Load (.Local (localName 3))) npPairU32BinderMrTy) 0))],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (scalarBytes u32 7 ++ scalarBytes u32 11) 4,
+     mkStackAlloc 384 (ptrBytes 256 (some (⟨1⟩, ()))) 8,
+     mkStackAlloc 512 (ptrBytes 256 (some (⟨1⟩, ()))) 8]
+    [mkRootFrame fn
+      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) }),
+       (localName 2, { addr := 384, provenance := some (⟨2⟩, ()) }),
+       (localName 3, { addr := 512, provenance := some (⟨3⟩, ()) })]]
+
+/-- Execute the two body statements (`write` + `read into _0`) via `stepMirFn`
+before frame-teardown `return_` (isolating statement-level sub-range protector
+checks from `DIV-MR-TB-FNENTRY-LOCAL-DEALLOC` on same-frame borrows). -/
+def npRunTrustedTwoStmtsLoc0 (body : CapturedMir) (s : MachineState) : NullaryPtrTrustedObs :=
+  match stepMirFn body s with
+  | .tau (.running s1) =>
+    match stepMirFn body s1 with
+    | .tau (.running s2) =>
+      match get? s2.frame.locals 0 with
+      | some (.init v) => npTrustedValueObs v
+      | _ => .stuck
+    | .vis (.inl (.fail .ub)) _ => .ub
+    | .vis (.inl (.fail .unsupported)) _ => .unsupported
+    | _ => .stuck
+  | .vis (.inl (.fail .ub)) _ => .ub
+  | .vis (.inl (.fail .unsupported)) _ => .unsupported
+  | _ => .stuck
+
+/-- **`V4` Sub-Range Tree Borrows Disjointness on `{ fst: u32, snd: BinderU32 }`
+Across Trusted, `Mach`, and `MachTB` (with `MachTB.wfLive`)** for BOTH local
+(`(_1.1).unwrapUnsafeBinder`, `_1.0`) AND dereferenced
+(`(*ptr).1.unwrapUnsafeBinder`, `(*ptr).0`) places (completing 3-authority parity
+with `lm_np_v4_pair_subrange_disjoint_and_deref_field_tb_witness`):
+with a function-entry protector covering ONLY `[0, 4)` (`fst`):
+1. `(_1.1).unwrapUnsafeBinder = 99` (`[4, 8)`) succeeds (`99`, preserving `[0, 4) = 7`)
+   on protected Trusted, `Mach`, AND `MachTB` (preserving `MachTB.wfLive`);
+2. `(*ptr).1.unwrapUnsafeBinder = 99` (`[4, 8)`) likewise succeeds (`99`, preserving
+   `[0, 4) = 7`) on protected Trusted, `Mach`, AND `MachTB` (preserving `MachTB.wfLive`);
+3. conflicting writes to the protected `[0, 4)` field via `_1.0 = 99` OR
+   `(*ptr).0 = 99` return `99` on unprotected Trusted & `Mach` (`BasicMemory`),
+   and fault `.ub` on protected Trusted & `MachTB` (`TreeBorrowsMemory`). -/
+theorem np_v4_pair_subrange_disjoint_and_deref_field_three_way_witness :
+    -- 1. Disjoint local `(_1.1).unwrapUnsafeBinder` at `[4, 8)` with protected `[0, 4)`
+    npRunTrustedTwoStmtsLoc0 npV4PairLocalSndUnwrapMir
+      (npPairLocalTrustedInit npV4PairLocalSndUnwrapMir true) = .u32Val 99 ∧
+    (∃ m3, Interp.steps 3 npV4PairLocalSndDisjointMach = .ok m3 ∧
+      ([0, 1].map (fun i => m3.mem.memory.allocations[i]?.map (·.data))) =
+        [some (scalarBytes u32 99 : List Byte),
+         some ((scalarBytes u32 7 ++ scalarBytes u32 99) : List Byte)]) ∧
+    (∃ m3, Interp.stepsTB 3 (liftMachToTB npV4PairLocalSndDisjointMach) = .ok m3 ∧
+      MachTB.wfLive m3 ∧
+      ([0, 1].map (fun i => m3.mem.memory.mem.allocations[i]?.map (fun a => a.data.map projByteTB))) =
+        [some ((scalarBytes u32 99).map (projByteTB ∘ liftByteTB)),
+         some ((scalarBytes u32 7 ++ scalarBytes u32 99).map (projByteTB ∘ liftByteTB))]) ∧
+    -- 2. Disjoint deref `(*ptr).1.unwrapUnsafeBinder` at `[4, 8)` with protected `[0, 4)`
+    npRunTrustedTwoStmtsLoc0 npV4PairDerefSndUnwrapMir
+      (npPairDerefTrustedInit npV4PairDerefSndUnwrapMir true) = .u32Val 99 ∧
+    (∃ m3, Interp.steps 3 npV4PairDerefSndDisjointMach = .ok m3 ∧
+      ([0, 1].map (fun i => m3.mem.memory.allocations[i]?.map (·.data))) =
+        [some (scalarBytes u32 99 : List Byte),
+         some ((scalarBytes u32 7 ++ scalarBytes u32 99) : List Byte)]) ∧
+    (∃ m3, Interp.stepsTB 3 (liftMachToTB npV4PairDerefSndDisjointMach) = .ok m3 ∧
+      MachTB.wfLive m3 ∧
+      ([0, 1].map (fun i => m3.mem.memory.mem.allocations[i]?.map (fun a => a.data.map projByteTB))) =
+        [some ((scalarBytes u32 99).map (projByteTB ∘ liftByteTB)),
+         some ((scalarBytes u32 7 ++ scalarBytes u32 99).map (projByteTB ∘ liftByteTB))]) ∧
+    -- 3. Conflicting local `_1.0` at protected `[0, 4)`
+    npRunTrusted npV4PairLocalFstMir 16
+      (npPairLocalTrustedInit npV4PairLocalFstMir false) = .u32Val 99 ∧
+    npRunTrustedTwoStmtsLoc0 npV4PairLocalFstMir
+      (npPairLocalTrustedInit npV4PairLocalFstMir true) = .ub ∧
+    (∃ m3, Interp.steps 3 npV4PairLocalFstConflictMach = .ok m3 ∧
+      m3.mem.memory.allocations[0]?.map (·.data) = some (scalarBytes u32 99)) ∧
+    (interpUbMsg (Interp.stepsTB 3 (liftMachToTB npV4PairLocalFstConflictMach))).isSome = true ∧
+    -- 4. Conflicting deref `(*ptr).0` at protected `[0, 4)`
+    npRunTrusted npV4PairDerefFstMir 16
+      (npPairDerefTrustedInit npV4PairDerefFstMir false) = .u32Val 99 ∧
+    npRunTrustedTwoStmtsLoc0 npV4PairDerefFstMir
+      (npPairDerefTrustedInit npV4PairDerefFstMir true) = .ub ∧
+    (∃ m3, Interp.steps 3 npV4PairDerefFstConflictMach = .ok m3 ∧
+      m3.mem.memory.allocations[0]?.map (·.data) = some (scalarBytes u32 99)) ∧
+    (interpUbMsg (Interp.stepsTB 3 (liftMachToTB npV4PairDerefFstConflictMach))).isSome = true :=
+  ⟨by decide +kernel,
+   ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   by decide +kernel,
+   ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   by decide +kernel, by decide +kernel,
+   ok_of_map_toOption (by decide +kernel), by decide +kernel,
+   by decide +kernel, by decide +kernel,
+   ok_of_map_toOption (by decide +kernel), by decide +kernel⟩
 
 /-! ## §6. Canonical Executable MiniRust Corpus Observation Interface
 

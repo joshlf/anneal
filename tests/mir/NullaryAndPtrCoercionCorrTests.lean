@@ -174,6 +174,7 @@ theorem np_mr_deep_theorems_used :
   have _ := @np_v1_nullaryOp_dead_dst_ub_lockstep
   have _ := @np_v1_nullaryOp_three_way_witness
   have _ := @np_v1_nullaryOp_frame_inhabitation_and_nonvacuity
+  have _ := @np_v1_multihop_offsetof_and_failclosed_unsupported_three_way_witness
   have _ := @np_v2_pointerCoercion_dispatch
   have _ := @np_v2_reify_and_closure_fnPointer_lockstep
   have _ := @np_v2_unsafeFnPointer_ground_truth_and_divergences
@@ -206,6 +207,7 @@ theorem np_mr_deep_theorems_used :
   have _ := @np_v2_mutToConstPointer_wide_slice_three_way_witness
   have _ := @np_v4_nested_field_unwrap_trusted_witness
   have _ := @np_v4_nested_field_unwrap_mach_and_tb_witness
+  have _ := @np_v4_pair_subrange_disjoint_and_deref_field_three_way_witness
   have _ := @np_variant_outcomes_distinct
   have _ := @npTrustedObserve_table
   have _ := @npMrObserveClass_table
@@ -461,6 +463,17 @@ run_cmd do
         ("forged ill-typed Unsize acceptance (mutability upgrade / element mismatch)", .thmDecl {
           name := ns ++ `forged.illTypedUnsizeAccepted, levelParams := [],
           type := eqTrue (mkConst (lmNs ++ `npIllTypedUnsizeAccepted)),
+          value := reflTrue }),
+        ("swapped fixture lock (V3 fnPtrToPtr != V4 unwrapUnsafeBinder)", .thmDecl {
+          name := ns ++ `forged.swappedV3V4Fixture, levelParams := [],
+          type := mkApp3 (mkConst ``Eq [1]) capMirTy
+            (mkConst (mrNs ++ `v3FnPtrToPtrConstMir)) (mkConst (lmNs ++ `v4UnwrapBinderRoundtripMir)),
+          value := mkApp2 (mkConst ``Eq.refl [1]) capMirTy
+            (mkConst (mrNs ++ `v3FnPtrToPtrConstMir)) }),
+        ("mode-inverted per-variant LM certificate (unwrapUnsafeBinder)", .thmDecl {
+          name := ns ++ `forged.modeInvertedUnwrapVariantCheck, levelParams := [],
+          type := eqTrue (mkApp2 (mkConst (bNs ++ `lmVariantCheckOf))
+            (mkConst (mrNs ++ `NullaryPtrVariant.unwrapUnsafeBinder)) invertedAuth),
           value := reflTrue }) ]
     let mut rejected : Nat := 0
     for (what, d) in forged do
@@ -507,11 +520,14 @@ run_cmd do
         lmNs ++ `lm_np_v2_unsize_tb_perm_agreement_and_mode_sensitivity_witness,
         lmNs ++ `lm_np_v2_unsize_tb_perm_edge_cases_witness,
         lmNs ++ `lm_np_v2_unsize_tb_edge_cases_stepped_witness,
+        lmNs ++ `np_vendored_borrowTree_zero_size_and_oob_boundary,
         lmNs ++ `lm_np_v2_mutToConstPointer_wide_slice_witness,
         lmNs ++ `lm_np_v4_deref_and_subplace_unwrap_tb_witness,
         lmNs ++ `lm_np_v4_nested_field_unwrap_disjoint_tb_witness,
+        lmNs ++ `lm_np_v4_pair_subrange_disjoint_and_deref_field_tb_witness,
         lmNs ++ `lm_np_v4_zst_unwrap_write_boundary_witness,
-        lmNs ++ `lm_np_storage_lifecycle_witness ]
+        lmNs ++ `lm_np_storage_lifecycle_witness,
+        lmNs ++ `lm_np_v1_multihop_offsetof_and_failclosed_unsupported_witness ]
     for n in lmDeepThms do
       let some (.thmInfo v) := env.find? n
         | throwError "cross-root: required LM theorem {n} missing"
@@ -568,7 +584,7 @@ run_cmd do
     { fileName := "<np-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, bundleCount, rejectedCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount ≥ 48 && bundleCount = 5 && rejectedCount = 6 do
+  unless addedCount ≥ 48 && bundleCount = 5 && rejectedCount = 8 do
     throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, rejected={rejectedCount})"
   logInfo m!"np cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles, 16 fixture locks), rejected {rejectedCount} forged controls, reached Trusted+MiniRust+Miri, axioms {crAxioms}"
 
@@ -580,11 +596,18 @@ run_cmd do
   let constructiveDecls : List Name :=
     [ ``Anneal.Mir.NullaryAndPtrCoercionBundle.npCodec,
       ``Anneal.Mir.NullaryAndPtrCoercionBundle.npCodec_tight,
+      ``Anneal.Mir.NullaryAndPtrCoercionBundle.allNpModes_complete,
+      ``Anneal.Mir.NullaryAndPtrCoercionBundle.allNpMrModes_complete,
+      ``Anneal.Mir.NullaryAndPtrCoercionBundle.allNpLmModes_complete,
+      ``Anneal.Mir.NullaryAndPtrCoercionBundle.allNpVariants_complete,
+      ``Anneal.Mir.NullaryAndPtrCoercionBundle.allNpCases_complete,
       ``Anneal.Mir.NullaryAndPtrCoercionBundle.npAnnealEval,
       ``Anneal.Mir.NullaryAndPtrCoercionBundle.npAnnealEval_eq,
+      ``Anneal.Mir.NullaryAndPtrCoercionBundle.npAnnealEval_funext,
       ``Anneal.Mir.NullaryAndPtrCoercionBundle.mrAuthority,
       ``Anneal.Mir.NullaryAndPtrCoercionBundle.mrAuthority_denoteConsistent,
       ``Anneal.Mir.NullaryAndPtrCoercionBundle.mrAuthority_verdict_eq,
+      ``Anneal.Mir.NullaryAndPtrCoercionBundle.mrVerdictFn_funext,
       ``Anneal.Mir.NullaryAndPtrCoercionBundle.mrSide_check,
       ``Anneal.Mir.NullaryAndPtrCoercionBundle.mrVariantSide_check,
       ``Anneal.Mir.NullaryAndPtrCoercionBundle.lmCheckOf_congr,
