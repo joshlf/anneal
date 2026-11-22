@@ -67,6 +67,12 @@ Operational correspondence between Anneal's trusted MIR semantics
     multi-capture scalar/pointer closures relating Trusted `.aggregate 0 vals`
     to MiniRust `ValueExpr.Tuple` on `Mach` and `MachTB`, including
     left-to-right operand evaluation and dead/uninit upvar UB propagation.
+
+Next to the indirect call through a function pointer of `C8`,
+`dynDispatch_call_mach_and_machTB_witness` runs MiniRust's dynamic dispatch
+(`Terminator::Call` on `VTableMethodLookup(GetMetadata(self))`) end to end on
+`Mach` and `MachTB`, together with the UB of a receiver whose vtable-pointer
+metadata is invalid.
 -/
 namespace MiniRustSpec.UnwindSetDiscrAndFnPtrMR
 set_option Elab.async false
@@ -3090,6 +3096,91 @@ theorem c8_capturing_closure_wide_and_unknown_tag_witness :
    eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel), eq_some_scalar_of_valAsScalar (by decide +kernel),
    ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel), rfl, ok_of_map_toOption (by decide +kernel), ok_stepTB_wfLive (by decide +kernel),
    rfl, rfl, rfl, rfl, rfl⟩
+
+/-! ### Dynamic Dispatch: `Terminator::Call` on
+`VTableMethodLookup(GetMetadata(self))` (`Mach` & `MachTB`)
+
+MiniRust represents a dynamic call as a `Terminator::Call` whose callee is the
+value expression `VTableMethodLookup(GetMetadata(self))`
+(`spec/lang/syntax.md`, `spec/lang/step/operators.md`). Loading the receiver,
+a `*const dyn Trait` wide pointer, validates its vtable-pointer metadata with
+`Machine::vtable_from_ptr` and the trait check of `check_ptr`
+(`check_ptr_metadata`); `UnOp::GetMetadata` extracts the vtable pointer,
+`UnOp::VTableMethodLookup` resolves the method to a function pointer, and
+`Machine::fn_from_ptr` resolves that pointer to the callee. -/
+
+/-- Build a `BasicMemory` vtable allocation at `addr` (size 0, align 1), the
+allocation that `Machine::new` creates for each vtable. -/
+def mkVTableAlloc (addr : Int) : Gen.Allocation :=
+  { addr, data := [], align := ⟨1⟩, kind := .VTable, live := true, extra := () }
+
+/-- The trait method that `dynDispatchVTable` implements. -/
+@[reducible] def dynDispatchMethod : Gen.TraitMethodName := ⟨⟨0⟩⟩
+
+/-- A vtable for trait `0` (size `4`, alignment `4`) that implements
+`dynDispatchMethod` with function `1`. -/
+def dynDispatchVTable : Gen.VTable :=
+  { trait_name := traitNameOf 0, size := ⟨4⟩, align := ⟨4⟩, cells := [],
+    methods := ⟨[(dynDispatchMethod, fnName 1)]⟩ }
+
+/-- The callee of the dynamic call: it writes `77` to its `u32` return local. -/
+def dynDispatchCallee : Gen.Function := mkMrFn [(localName 0, u32MrTy)] [] (localName 0)
+  [(bbName 0, ⟨[.Assign (.Local (localName 0)) (.Constant (.Int 77) u32MrTy)], .Return, .Regular⟩)]
+
+/-- The caller: local `1` holds the receiver, a `*const dyn Trait` wide pointer
+for trait `ptrTrait`, and the callee of its call is
+`VTableMethodLookup(GetMetadata(self))` on that receiver. -/
+def dynDispatchCaller (ptrTrait : Nat) : Gen.Function :=
+  mkMrFn [(localName 0, u32MrTy), (localName 1, wideDynPtrMrTy ptrTrait)] [] (localName 0)
+    [(bbName 0, ⟨[], .Call (.UnOp (.VTableMethodLookup dynDispatchMethod)
+          (.UnOp .GetMetadata (.Load (.Local (localName 1)))))
+        .Rust [] (.Local (localName 0)) (some (bbName 1)) none, .Regular⟩),
+     (bbName 1, ⟨[], .Return, .Regular⟩)]
+
+/-- A `BasicMemory` machine about to run the dynamic call. Allocation `0` is
+function `1` (at `4096`), `1` the caller's `u32` return local, `2` the receiver
+local, which holds the data pointer `128` and the vtable pointer `vtAddr`, and
+`3` the vtable of trait `0`, which is registered at `8192`. -/
+def dynDispatchMach (vtAddr ptrTrait : Nat) : Mach :=
+  let caller := dynDispatchCaller ptrTrait
+  let prog : Gen.Program :=
+    { functions := ⟨[(fnName 0, caller), (fnName 1, dynDispatchCallee)]⟩, start := fnName 0,
+      globals := ⟨[]⟩, traits := ⟨[(traitNameOf 0, ⟨[dynDispatchMethod]⟩)]⟩,
+      vtables := ⟨[(⟨⟨0⟩⟩, dynDispatchVTable)]⟩ }
+  let vtPtr : Ptr := { addr := 8192, provenance := some (⟨3⟩, ()) }
+  let base := mkMrMach prog
+    [mkFnAlloc 4096, mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (ptrBytes 128 (some (⟨1⟩, ())) ++ ptrBytes vtAddr (some (⟨3⟩, ()))) 8,
+     mkVTableAlloc 8192]
+    [mkRootFrame caller [(localName 0, { addr := 128, provenance := some (⟨1⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨2⟩, ()) })]]
+    [(fnName 1, { addr := 4096, provenance := some (⟨0⟩, ()) })]
+  { base with vtable_ptrs := ⟨[(⟨⟨0⟩⟩, vtPtr)]⟩ }
+
+/-- Concrete dynamic-dispatch witness on `Mach` and `MachTB`. With the
+registered vtable pointer as receiver metadata, the three steps `Call`, the
+callee's assignment, and `Return` run the vtable's method: the callee's `77`
+arrives in the caller's return local (and `MachTB.wfLive` is preserved). A
+receiver whose metadata is not the address of a vtable (`9000`), or is the
+vtable of another trait (the receiver type names trait `1`), is UB as soon as
+the receiver is loaded (`Machine::vtable_from_ptr`, respectively the trait
+check of `check_ptr`). -/
+theorem dynDispatch_call_mach_and_machTB_witness :
+    (∃ m3, Interp.steps 3 (dynDispatchMach 8192 0) = .ok m3 ∧
+      m3.mem.memory.allocations[1]?.map (·.data) = some (scalarBytes u32 77)) ∧
+    (∃ m3, Interp.stepsTB 3 (liftMachToTB (dynDispatchMach 8192 0)) = .ok m3 ∧ MachTB.wfLive m3 ∧
+      m3.mem.memory.mem.allocations[1]?.map (fun a => a.data.map projByteTB) =
+        some ((scalarBytes u32 77).map (projByteTB ∘ liftByteTB))) ∧
+    Interp.steps 1 (dynDispatchMach 9000 0) = .error (.ub "invalid pointer for vtable lookup") ∧
+    Interp.stepsTB 1 (liftMachToTB (dynDispatchMach 9000 0)) =
+      .error (.ub "invalid pointer for vtable lookup") ∧
+    Interp.steps 1 (dynDispatchMach 8192 1) =
+      .error (.ub "Value::Ptr: invalid vtable in metadata") ∧
+    Interp.stepsTB 1 (liftMachToTB (dynDispatchMach 8192 1)) =
+      .error (.ub "Value::Ptr: invalid vtable in metadata") :=
+  ⟨ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
 
 /-! ## §9 (`C9`): `ProjectionElem.unwrapUnsafeBinder` (`Mach` & `MachTB`) -/
 /-- **C9 Fragment Boundary (`translatePlace_unwrapUnsafeBinder_none`)**:

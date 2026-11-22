@@ -262,7 +262,12 @@ theorem inBounds_goodSize {sz : Size} (hgood : GoodSize sz.bytes) :
   · rw [h8]; decide
   · rw [h16]; decide
 
-@[simp] theorem checkPtrMetadata_none : checkPtrMetadata none .None = .ok () := rfl
+/-- The metadata check of a thin pointer (`(None, PointerMetaKind::None) => {}`)
+passes whatever the machine argument is. The machine is an explicit argument
+without a default value, so that `rw [checkPtrMetadata_none]` rewrites
+`checkPtrMetadata none .None m` for every `m`. -/
+@[simp] theorem checkPtrMetadata_none (m : Option Mach) :
+    checkPtrMetadata none .None m = .ok () := rfl
 
 @[simp] theorem compute_size_and_align_sized {Provenance : Type}
     (vtables : Gen.ThinPointer Provenance → Interp Gen.VTable) (sz : Size) (al : Align) :
@@ -6970,11 +6975,32 @@ private theorem vtableLookupM_bm_eq (m : Mach) :
   rcases m.vtable_ptrs.entries.find? (fun e : Gen.VTableName × Ptr => decide (e.2 = ptr)) with
     _ | ⟨_, _⟩ <;> rfl
 
+/-- The polymorphic `Machine::vtable_from_ptr` at `M = BasicMemory<x86_64>` is
+`vtableFromPtr`. -/
+theorem vtableFromPtrM_bm_eq (m : Mach) :
+    vtableFromPtrM (M := BM) m = vtableFromPtr m := by
+  funext (ptr : Ptr)
+  unfold vtableFromPtrM vtableFromPtr
+  conv =>
+    lhs
+    rw [find?_eq_of_eq (q := fun e : Gen.VTableName × Ptr => decide (e.2 = ptr))
+      (by intro ⟨_, vp⟩; exact congrArg (@decide (vp = ptr)) (Subsingleton.elim _ _))]
+  conv =>
+    rhs
+    rw [find?_eq_of_eq (q := fun e : Gen.VTableName × Ptr => decide (e.2 = ptr))
+      (by intro ⟨_, vp⟩; rfl)]
+  rcases m.vtable_ptrs.entries.find? (fun e : Gen.VTableName × Ptr => decide (e.2 = ptr)) with
+    _ | ⟨_, _⟩ <;> rfl
+
 private theorem checkPtrMetadataM_bm_eq (pm : Option (Gen.PointerMeta Prov))
-    (kind : Gen.PointerMetaKind) :
-    checkPtrMetadataM pm kind = checkPtrMetadata pm kind := by
+    (kind : Gen.PointerMetaKind) (m : Option Mach) :
+    checkPtrMetadataM pm kind (m.map (vtableFromPtrM (M := BM) ·)) =
+      checkPtrMetadata pm kind m := by
   unfold checkPtrMetadataM checkPtrMetadata
-  rcases pm with _ | (_ | _) <;> cases kind <;> rfl
+  rcases pm with _ | (_ | _) <;> cases kind <;> try rfl
+  cases m with
+  | none => rfl
+  | some mach => dsimp only [Option.map]; rw [vtableFromPtrM_bm_eq]
 
 private theorem cm_dereferenceable_bm_eq (cm : Gen.ConcurrentMemory BM) (ptr : Ptr) (sz : Size) :
     ConcurrentMemory.dereferenceable (M := BM) cm ptr sz =
@@ -6985,9 +7011,15 @@ private theorem checkPtrM_bm_eq (ptr : Gen.Pointer Prov) (ptrTy : Gen.PtrType)
     checkPtrM (M := BM) ptr ptrTy m = checkPtr ptr ptrTy m := by
   unfold checkPtrM checkPtr
   refine bind_congr_right _ (fun _ => ?_)
-  refine bind_congr (checkPtrMetadataM_bm_eq _ _) (fun _ => ?_)
+  refine bind_congr (checkPtrMetadataM_bm_eq _ _ _) (fun _ => ?_)
   cases PtrType.safe_pointee ptrTy with
-  | none => cases ptrTy <;> rfl
+  | none =>
+    cases ptrTy with
+    | VTablePtr _ =>
+      cases m with
+      | none => rfl
+      | some mach => dsimp only; rw [vtableFromPtrM_bm_eq]
+    | _ => rfl
   | some pointee =>
     dsimp only
     refine bind_congr ?_ (fun ⟨size, align⟩ => ?_)
@@ -7251,9 +7283,12 @@ private theorem evalUnOpM_bm_eq (op : Gen.UnOp) (arg : Val × Gen.«Type») (m :
         dsimp only
         rw [hev]
         refine bind_congr_right _ (fun mv => ?_)
-        cases PtrType.meta_kind ptrTy <;> dsimp only <;> try rfl
-        · rw [checkValueM_bm_eq]
-        · rw [checkValueM_bm_eq]
+        cases PtrType.meta_kind ptrTy with
+        | VTablePointer _ =>
+          cases m with
+          | none => rfl
+          | some mach => dsimp only; rw [checkValueM_bm_eq]
+        | _ => dsimp only; rw [checkValueM_bm_eq]
       | _ => rfl
     | _ => rfl
   | ComputeSize cty =>
@@ -7267,15 +7302,10 @@ private theorem evalUnOpM_bm_eq (op : Gen.UnOp) (arg : Val × Gen.«Type») (m :
     dsimp only
     rw [hdv]
     refine bind_congr_right _ (fun pm => ?_)
-    rcases pm with _ | (_ | _) <;> try rfl
-    · refine bind_congr_right _ (fun lay => ?_)
-      cases m with
-      | none => rfl
-      | some mach => dsimp only; rw [computeSizeM_bm_eq]
-    · refine bind_congr_right _ (fun lay => ?_)
-      cases m with
-      | none => rfl
-      | some mach => dsimp only; rw [computeSizeM_bm_eq]
+    refine bind_congr_right _ (fun lay => ?_)
+    cases m with
+    | none => rfl
+    | some mach => dsimp only; rw [computeSizeM_bm_eq]
   | ComputeAlign cty =>
     have hdv : PointerMetaKind.decode_valueM (M := BM) (Type.meta_kind cty) v =
         PointerMetaKind.decode_value (Type.meta_kind cty) v := by
@@ -7287,16 +7317,606 @@ private theorem evalUnOpM_bm_eq (op : Gen.UnOp) (arg : Val × Gen.«Type») (m :
     dsimp only
     rw [hdv]
     refine bind_congr_right _ (fun pm => ?_)
-    rcases pm with _ | (_ | _) <;> try rfl
-    · refine bind_congr_right _ (fun lay => ?_)
-      cases m with
-      | none => rfl
-      | some mach => dsimp only; rw [computeAlignM_bm_eq]
-    · refine bind_congr_right _ (fun lay => ?_)
-      cases m with
-      | none => rfl
-      | some mach => dsimp only; rw [computeAlignM_bm_eq]
-  | VTableMethodLookup _ => rfl
+    refine bind_congr_right _ (fun lay => ?_)
+    cases m with
+    | none => rfl
+    | some mach => dsimp only; rw [computeAlignM_bm_eq]
+  | VTableMethodLookup _ =>
+    cases v with
+    | Ptr ptr =>
+      cases ty with
+      | Ptr _ =>
+        cases m with
+        | none => rfl
+        | some mach => dsimp only; rw [vtableLookupM_bm_eq]
+      | _ => rfl
+    | _ => rfl
+
+/-! ## Vtable pointers and trait-object safe pointers (`Machine::vtable_from_ptr`)
+
+`check_ptr` (`spec/lang/representation.md`) validates a vtable pointer with
+`Machine::vtable_from_ptr` (`spec/lang/machine.md`), both as a stand-alone
+`PtrType::VTablePtr` and as the metadata of a trait-object pointer, and then checks a
+trait-object safe pointer (`&dyn Trait`, `&mut dyn Trait`, `Box<dyn Trait>`) at the
+dynamic size and alignment recorded in that vtable. The results below hold for every
+machine; each is stated for `Mach` (`BasicMemory`) and for the polymorphic
+`Machine M` (in particular `MachTB`, Tree Borrows). -/
+
+/-- `Machine::vtable_from_ptr` and `Machine::vtable_lookup` find the same vtable. They
+differ only in how they fail: `vtable_from_ptr` raises UB for a pointer that is not the
+address of a vtable, where `vtable_lookup` unwraps (a spec panic). -/
+theorem vtableFromPtr_ok_iff_vtableLookup_ok (m : Mach) (ptr : Ptr) (vt : Gen.VTable) :
+    vtableFromPtr m ptr = .ok vt ↔ vtableLookup m ptr = .ok vt := by
+  unfold vtableFromPtr vtableLookup
+  split
+  · unfold mapIndex
+    split
+    · exact Iff.rfl
+    · constructor <;> intro h <;> cases h
+  · constructor <;> intro h <;> cases h
+
+/-- Polymorphic `vtableFromPtr_ok_iff_vtableLookup_ok`. -/
+theorem vtableFromPtrM_ok_iff_vtableLookupM_ok {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m : Gen.Machine M) (ptr : Gen.ThinPointer (Gen.Memory.Provenance M)) (vt : Gen.VTable) :
+    vtableFromPtrM m ptr = .ok vt ↔ vtableLookupM m ptr = .ok vt := by
+  unfold vtableFromPtrM vtableLookupM
+  split
+  · unfold mapIndex
+    split
+    · exact Iff.rfl
+    · constructor <;> intro h <;> cases h
+  · constructor <;> intro h <;> cases h
+
+/-- A pointer that is not the address of any vtable of the machine (for example a null,
+dangling, or data pointer) is UB for `Machine::vtable_from_ptr`. -/
+theorem vtableFromPtr_ub_of_not_mem (m : Mach) (ptr : Ptr)
+    (h : ∀ e ∈ m.vtable_ptrs.entries, e.2 ≠ ptr) :
+    vtableFromPtr m ptr = .error (.ub "invalid pointer for vtable lookup") := by
+  have hnone : m.vtable_ptrs.entries.find?
+      (fun (_, (vtablePtr : Ptr)) => decide (vtablePtr = ptr)) = none := by
+    rw [List.find?_eq_none]
+    intro e he
+    obtain ⟨name, vp⟩ := e
+    simp only [decide_eq_true_eq]
+    exact h (name, vp) he
+  unfold vtableFromPtr
+  rw [hnone]
+  rfl
+
+/-- Polymorphic `vtableFromPtr_ub_of_not_mem`. -/
+theorem vtableFromPtrM_ub_of_not_mem {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m : Gen.Machine M) (ptr : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (h : ∀ e ∈ m.vtable_ptrs.entries, e.2 ≠ ptr) :
+    vtableFromPtrM m ptr = .error (.ub "invalid pointer for vtable lookup") := by
+  have hnone : m.vtable_ptrs.entries.find?
+      (fun (_, (vtablePtr : Gen.ThinPointer (Gen.Memory.Provenance M))) =>
+        decide (vtablePtr = ptr)) = none := by
+    rw [List.find?_eq_none]
+    intro e he
+    obtain ⟨name, vp⟩ := e
+    simp only [decide_eq_true_eq]
+    exact h (name, vp) he
+  unfold vtableFromPtrM
+  rw [hnone]
+  rfl
+
+/-- **`check_ptr_metadata` on vtable metadata is `check_ptr` at `PtrType::VTablePtr`**
+(`spec/lang/representation.md`):
+> "(Some(PointerMeta::VTablePointer(ptr)), PointerMetaKind::VTablePointer(trait_name)) => {
+>     self.check_ptr(ptr.widen(None), PtrType::VTablePtr(trait_name))?;
+> }"
+The branch of `checkPtrMetadata` that unrolls this recursive call equals the call. -/
+theorem checkPtrMetadata_vtable_eq_checkPtr (vptr : Ptr) (traitName : Gen.TraitName) (m : Mach) :
+    checkPtrMetadata (some (.VTablePointer vptr)) (.VTablePointer traitName) (some m) =
+      checkPtr (ThinPointer.widen vptr none) (.VTablePtr traitName) (some m) := rfl
+
+/-- Polymorphic `checkPtrMetadata_vtable_eq_checkPtr`, on every `Memory` `M` (in
+particular on `MachTB`): the vtable lookup that `checkPtrM` passes to
+`checkPtrMetadataM` is `vtableFromPtrM` of its machine. -/
+theorem checkPtrMetadataM_vtable_eq_checkPtrM {M : Type} [Gen.Memory M] [MemoryOps M]
+    (vptr : Gen.ThinPointer (Gen.Memory.Provenance M)) (traitName : Gen.TraitName)
+    (m : Gen.Machine M) :
+    checkPtrMetadataM (some (.VTablePointer vptr)) (.VTablePointer traitName)
+        (some (vtableFromPtrM m)) =
+      checkPtrM (ThinPointer.widen vptr none) (.VTablePtr traitName) (some m) := rfl
+
+/-- The polymorphic metadata check of a thin pointer passes whatever the vtable lookup
+argument is. -/
+theorem checkPtrMetadataM_none {Provenance : Type}
+    (lookup? : Option (Gen.ThinPointer Provenance → Interp Gen.VTable)) :
+    checkPtrMetadataM (none : Option (Gen.PointerMeta Provenance)) .None lookup? = .ok () := rfl
+
+/-- `LayoutStrategy::compute_size_and_align` on a trait object reads the size and the
+alignment from the vtable that the pointer metadata points to. -/
+theorem compute_size_and_align_traitObject {Provenance : Type}
+    (vtables : Gen.ThinPointer Provenance → Interp Gen.VTable) (traitName : Gen.TraitName)
+    (vptr : Gen.ThinPointer Provenance) :
+    LayoutStrategy.compute_size_and_align vtables (.TraitObject traitName)
+        (some (.VTablePointer vptr)) =
+      (do let vtable ← vtables vptr; pure (vtable.size, vtable.align)) := rfl
+
+/-- `check_ptr` at `PtrType::VTablePtr` with a machine: an in-bounds stand-alone vtable
+pointer is well formed exactly when it is the address of a vtable for the given trait. -/
+theorem checkPtr_vtablePtr_eq (vptr : Ptr) (traitName : Gen.TraitName) (m : Mach)
+    (hAddr : inBounds vptr.addr .Unsigned x86_64.PTR_SIZE = true) :
+    checkPtr (ThinPointer.widen vptr none) (.VTablePtr traitName) (some m) =
+      (do
+        let vtable ← vtableFromPtr m vptr
+        ensureElseUb (vtable.trait_name == traitName) "Value::Ptr: invalid vtable in metadata") := by
+  unfold checkPtr
+  dsimp only [ThinPointer.widen, PtrType.meta_kind, PtrType.safe_pointee]
+  rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadata_none, ok_bind]
+
+/-- Polymorphic `checkPtr_vtablePtr_eq`. -/
+theorem checkPtrM_vtablePtr_eq {M : Type} [Gen.Memory M] [MemoryOps M]
+    (vptr : Gen.ThinPointer (Gen.Memory.Provenance M)) (traitName : Gen.TraitName)
+    (m : Gen.Machine M)
+    (hAddr : inBounds vptr.addr .Unsigned x86_64.PTR_SIZE = true) :
+    checkPtrM (ThinPointer.widen vptr none) (.VTablePtr traitName) (some m) =
+      (do
+        let vtable ← vtableFromPtrM m vptr
+        ensureElseUb (vtable.trait_name == traitName) "Value::Ptr: invalid vtable in metadata") := by
+  unfold checkPtrM
+  dsimp only [ThinPointer.widen, PtrType.meta_kind, PtrType.safe_pointee]
+  rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadataM_none, ok_bind]
+
+/-- A vtable pointer of the right trait passes `check_ptr`. -/
+theorem checkPtr_vtablePtr_ok (vptr : Ptr) (traitName : Gen.TraitName) (m : Mach)
+    (vt : Gen.VTable)
+    (hAddr : inBounds vptr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hvt : vtableFromPtr m vptr = .ok vt) (hTrait : vt.trait_name = traitName) :
+    checkPtr (ThinPointer.widen vptr none) (.VTablePtr traitName) (some m) = .ok () := by
+  subst hTrait
+  rw [checkPtr_vtablePtr_eq vptr _ m hAddr, hvt, ok_bind, beq_self_eq_true, ensureElseUb_true]
+
+/-- Polymorphic `checkPtr_vtablePtr_ok`. -/
+theorem checkPtrM_vtablePtr_ok {M : Type} [Gen.Memory M] [MemoryOps M]
+    (vptr : Gen.ThinPointer (Gen.Memory.Provenance M)) (traitName : Gen.TraitName)
+    (m : Gen.Machine M) (vt : Gen.VTable)
+    (hAddr : inBounds vptr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hvt : vtableFromPtrM m vptr = .ok vt) (hTrait : vt.trait_name = traitName) :
+    checkPtrM (ThinPointer.widen vptr none) (.VTablePtr traitName) (some m) = .ok () := by
+  subst hTrait
+  rw [checkPtrM_vtablePtr_eq vptr _ m hAddr, hvt, ok_bind, beq_self_eq_true, ensureElseUb_true]
+
+/-- A pointer that is not the address of a vtable (null, dangling, or unmapped) is UB at
+`PtrType::VTablePtr`: `"invalid pointer for vtable lookup"`. -/
+theorem checkPtr_vtablePtr_invalid_ptr_ub (vptr : Ptr) (traitName : Gen.TraitName) (m : Mach)
+    (hAddr : inBounds vptr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hNotVTable : ∀ e ∈ m.vtable_ptrs.entries, e.2 ≠ vptr) :
+    checkPtr (ThinPointer.widen vptr none) (.VTablePtr traitName) (some m) =
+      .error (.ub "invalid pointer for vtable lookup") := by
+  rw [checkPtr_vtablePtr_eq vptr _ m hAddr, vtableFromPtr_ub_of_not_mem m vptr hNotVTable,
+    error_bind]
+
+/-- Polymorphic `checkPtr_vtablePtr_invalid_ptr_ub`. -/
+theorem checkPtrM_vtablePtr_invalid_ptr_ub {M : Type} [Gen.Memory M] [MemoryOps M]
+    (vptr : Gen.ThinPointer (Gen.Memory.Provenance M)) (traitName : Gen.TraitName)
+    (m : Gen.Machine M)
+    (hAddr : inBounds vptr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hNotVTable : ∀ e ∈ m.vtable_ptrs.entries, e.2 ≠ vptr) :
+    checkPtrM (ThinPointer.widen vptr none) (.VTablePtr traitName) (some m) =
+      .error (.ub "invalid pointer for vtable lookup") := by
+  rw [checkPtrM_vtablePtr_eq vptr _ m hAddr, vtableFromPtrM_ub_of_not_mem m vptr hNotVTable,
+    error_bind]
+
+/-- A pointer to a vtable for the wrong trait is UB at `PtrType::VTablePtr`:
+`"Value::Ptr: invalid vtable in metadata"`. -/
+theorem checkPtr_vtablePtr_wrong_trait_ub (vptr : Ptr) (traitName : Gen.TraitName) (m : Mach)
+    (vt : Gen.VTable)
+    (hAddr : inBounds vptr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hvt : vtableFromPtr m vptr = .ok vt) (hTrait : vt.trait_name ≠ traitName) :
+    checkPtr (ThinPointer.widen vptr none) (.VTablePtr traitName) (some m) =
+      .error (.ub "Value::Ptr: invalid vtable in metadata") := by
+  rw [checkPtr_vtablePtr_eq vptr _ m hAddr, hvt, ok_bind, beq_eq_false_iff_ne.mpr hTrait,
+    ensureElseUb_false]
+
+/-- Polymorphic `checkPtr_vtablePtr_wrong_trait_ub`. -/
+theorem checkPtrM_vtablePtr_wrong_trait_ub {M : Type} [Gen.Memory M] [MemoryOps M]
+    (vptr : Gen.ThinPointer (Gen.Memory.Provenance M)) (traitName : Gen.TraitName)
+    (m : Gen.Machine M) (vt : Gen.VTable)
+    (hAddr : inBounds vptr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hvt : vtableFromPtrM m vptr = .ok vt) (hTrait : vt.trait_name ≠ traitName) :
+    checkPtrM (ThinPointer.widen vptr none) (.VTablePtr traitName) (some m) =
+      .error (.ub "Value::Ptr: invalid vtable in metadata") := by
+  rw [checkPtrM_vtablePtr_eq vptr _ m hAddr, hvt, ok_bind, beq_eq_false_iff_ne.mpr hTrait,
+    ensureElseUb_false]
+
+/-- **`check_ptr` on a trait-object safe pointer whose vtable metadata is ill formed**
+(`&dyn Trait`, `&mut dyn Trait`, `Box<dyn Trait>`; `mk` is `PtrType::Ref` at some
+mutability or `PtrType::Box`): the pointer metadata is checked first, and that check is
+`check_ptr` of the vtable pointer at `PtrType::VTablePtr`, so every failure of the
+latter (a null, dangling, or unmapped vtable pointer, or a vtable for the wrong trait)
+is the failure of the safe pointer. -/
+theorem checkPtr_traitObject_metadata_error (thin vptr : Ptr)
+    (mk : Gen.PointeeInfo → Gen.PtrType) (pointee : Gen.PointeeInfo)
+    (traitName : Gen.TraitName) (m : Mach) (e : Stop)
+    (hMk : (∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box)
+    (hLayout : pointee.layout = .TraitObject traitName)
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hMeta : checkPtr (ThinPointer.widen vptr none) (.VTablePtr traitName) (some m) = .error e) :
+    checkPtr (ThinPointer.widen thin (some (.VTablePointer vptr))) (mk pointee) (some m) =
+      .error e := by
+  obtain ⟨layout, inhabited, cells, freeze, unpin⟩ := pointee
+  dsimp only at hLayout
+  subst hLayout
+  rcases hMk with ⟨mutbl, rfl⟩ | rfl
+  · unfold checkPtr
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadata_vtable_eq_checkPtr, hMeta, error_bind]
+  · unfold checkPtr
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadata_vtable_eq_checkPtr, hMeta, error_bind]
+
+/-- Polymorphic `checkPtr_traitObject_metadata_error`. -/
+theorem checkPtrM_traitObject_metadata_error {M : Type} [Gen.Memory M] [MemoryOps M]
+    (thin vptr : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (mk : Gen.PointeeInfo → Gen.PtrType) (pointee : Gen.PointeeInfo)
+    (traitName : Gen.TraitName) (m : Gen.Machine M) (e : Stop)
+    (hMk : (∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box)
+    (hLayout : pointee.layout = .TraitObject traitName)
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hMeta : checkPtrM (ThinPointer.widen vptr none) (.VTablePtr traitName) (some m) =
+      .error e) :
+    checkPtrM (ThinPointer.widen thin (some (.VTablePointer vptr))) (mk pointee) (some m) =
+      .error e := by
+  obtain ⟨layout, inhabited, cells, freeze, unpin⟩ := pointee
+  dsimp only at hLayout
+  subst hLayout
+  rcases hMk with ⟨mutbl, rfl⟩ | rfl
+  · unfold checkPtrM
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind, Option.map]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadataM_vtable_eq_checkPtrM, hMeta,
+      error_bind]
+  · unfold checkPtrM
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind, Option.map]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadataM_vtable_eq_checkPtrM, hMeta,
+      error_bind]
+
+/-- **`check_ptr` on a trait-object safe pointer with well-formed vtable metadata**
+(`&dyn Trait`, `&mut dyn Trait`, `Box<dyn Trait>`; `mk` is `PtrType::Ref` at some
+mutability or `PtrType::Box`): once the vtable pointer is the address of a vtable `vt`
+for the pointee's trait, the pointer is checked exactly like a thin safe pointer to a
+sized pointee with the dynamic size `vt.size` and alignment `vt.align` read from that
+vtable: the size fits in `isize::MAX`, the address is non-null and aligned to
+`vt.align`, the pointee is inhabited, and `vt.size` bytes are dereferenceable in the
+machine's memory. -/
+theorem checkPtr_traitObject_eq_sized (thin vptr : Ptr) (mk : Gen.PointeeInfo → Gen.PtrType)
+    (pointee : Gen.PointeeInfo) (traitName : Gen.TraitName) (m : Mach) (vt : Gen.VTable)
+    (hMk : (∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box)
+    (hLayout : pointee.layout = .TraitObject traitName)
+    (hVAddr : inBounds vptr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hvt : vtableFromPtr m vptr = .ok vt) (hTrait : vt.trait_name = traitName) :
+    checkPtr (ThinPointer.widen thin (some (.VTablePointer vptr))) (mk pointee) (some m) =
+      checkPtr (ThinPointer.widen thin none)
+        (mk { pointee with layout := .Sized vt.size vt.align }) (some m) := by
+  have hMeta : checkPtrMetadata (some (.VTablePointer vptr)) (.VTablePointer traitName) (some m) =
+      .ok () := by
+    rw [checkPtrMetadata_vtable_eq_checkPtr]
+    exact checkPtr_vtablePtr_ok vptr traitName m vt hVAddr hvt hTrait
+  have hvl : vtableLookup m vptr = .ok vt :=
+    (vtableFromPtr_ok_iff_vtableLookup_ok m vptr vt).mp hvt
+  obtain ⟨layout, inhabited, cells, freeze, unpin⟩ := pointee
+  dsimp only at hLayout
+  subst hLayout
+  rcases hMk with ⟨mutbl, rfl⟩ | rfl
+  · unfold checkPtr
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee]
+    refine bind_congr_right _ (fun _ => ?_)
+    rw [hMeta, checkPtrMetadata_none, compute_size_and_align_traitObject, hvl,
+      compute_size_and_align_sized]
+    rfl
+  · unfold checkPtr
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee]
+    refine bind_congr_right _ (fun _ => ?_)
+    rw [hMeta, checkPtrMetadata_none, compute_size_and_align_traitObject, hvl,
+      compute_size_and_align_sized]
+    rfl
+
+/-- Polymorphic `checkPtr_traitObject_eq_sized`, on every `Memory` `M` (in particular
+on `MachTB`, where dereferenceability is `TreeBorrowsMemory::dereferenceable`). -/
+theorem checkPtrM_traitObject_eq_sized {M : Type} [Gen.Memory M] [MemoryOps M]
+    (thin vptr : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (mk : Gen.PointeeInfo → Gen.PtrType) (pointee : Gen.PointeeInfo)
+    (traitName : Gen.TraitName) (m : Gen.Machine M) (vt : Gen.VTable)
+    (hMk : (∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box)
+    (hLayout : pointee.layout = .TraitObject traitName)
+    (hVAddr : inBounds vptr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hvt : vtableFromPtrM m vptr = .ok vt) (hTrait : vt.trait_name = traitName) :
+    checkPtrM (ThinPointer.widen thin (some (.VTablePointer vptr))) (mk pointee) (some m) =
+      checkPtrM (ThinPointer.widen thin none)
+        (mk { pointee with layout := .Sized vt.size vt.align }) (some m) := by
+  have hMeta : checkPtrMetadataM (some (.VTablePointer vptr)) (.VTablePointer traitName)
+      (some (vtableFromPtrM m)) = .ok () := by
+    rw [checkPtrMetadataM_vtable_eq_checkPtrM]
+    exact checkPtrM_vtablePtr_ok vptr traitName m vt hVAddr hvt hTrait
+  have hvl : vtableLookupM m vptr = .ok vt :=
+    (vtableFromPtrM_ok_iff_vtableLookupM_ok m vptr vt).mp hvt
+  obtain ⟨layout, inhabited, cells, freeze, unpin⟩ := pointee
+  dsimp only at hLayout
+  subst hLayout
+  rcases hMk with ⟨mutbl, rfl⟩ | rfl
+  · unfold checkPtrM
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee, Option.map]
+    refine bind_congr_right _ (fun _ => ?_)
+    rw [hMeta, checkPtrMetadataM_none, compute_size_and_align_traitObject, hvl,
+      compute_size_and_align_sized]
+    rfl
+  · unfold checkPtrM
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee, Option.map]
+    refine bind_congr_right _ (fun _ => ?_)
+    rw [hMeta, checkPtrMetadataM_none, compute_size_and_align_traitObject, hvl,
+      compute_size_and_align_sized]
+    rfl
+
+/-- **A well-formed trait-object safe pointer passes `check_ptr`**: valid vtable
+metadata for the pointee's trait, the dynamic size `vt.size` within `isize::MAX`, a
+non-null address aligned to the dynamic alignment `vt.align`, an inhabited pointee, and
+`vt.size` dereferenceable bytes (`Memory::dereferenceable`). -/
+theorem checkPtr_traitObject_ok (thin vptr : Ptr) (mk : Gen.PointeeInfo → Gen.PtrType)
+    (pointee : Gen.PointeeInfo) (traitName : Gen.TraitName) (m : Mach) (vt : Gen.VTable)
+    (hMk : (∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box)
+    (hLayout : pointee.layout = .TraitObject traitName)
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hVAddr : inBounds vptr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hvt : vtableFromPtr m vptr = .ok vt) (hTrait : vt.trait_name = traitName)
+    (hSize : inBounds (vt.size.bytes : Int) .Signed x86_64.PTR_SIZE = true)
+    (hNonNull : (thin.addr != 0) = true)
+    (hAligned : Align.is_aligned vt.align thin.addr = true)
+    (hInhabited : pointee.inhabited = true)
+    (hDeref : CM.dereferenceable m.mem thin vt.size = .ok ()) :
+    checkPtr (ThinPointer.widen thin (some (.VTablePointer vptr))) (mk pointee) (some m) =
+      .ok () := by
+  rw [checkPtr_traitObject_eq_sized thin vptr mk pointee traitName m vt hMk hLayout hVAddr hvt
+    hTrait]
+  rcases hMk with ⟨mutbl, rfl⟩ | rfl
+  · unfold checkPtr
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadata_none, ok_bind,
+      compute_size_and_align_sized, ok_bind, hSize, ensureElseUb_true, ok_bind,
+      hNonNull, ensureElseUb_true, ok_bind, hAligned, ensureElseUb_true, ok_bind,
+      hInhabited, ensureElseUb_true, ok_bind, hDeref]
+    rfl
+  · unfold checkPtr
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadata_none, ok_bind,
+      compute_size_and_align_sized, ok_bind, hSize, ensureElseUb_true, ok_bind,
+      hNonNull, ensureElseUb_true, ok_bind, hAligned, ensureElseUb_true, ok_bind,
+      hInhabited, ensureElseUb_true, ok_bind, hDeref]
+    rfl
+
+/-- Polymorphic `checkPtr_traitObject_ok` (in particular on `MachTB`). -/
+theorem checkPtrM_traitObject_ok {M : Type} [Gen.Memory M] [MemoryOps M]
+    (thin vptr : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (mk : Gen.PointeeInfo → Gen.PtrType) (pointee : Gen.PointeeInfo)
+    (traitName : Gen.TraitName) (m : Gen.Machine M) (vt : Gen.VTable)
+    (hMk : (∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box)
+    (hLayout : pointee.layout = .TraitObject traitName)
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hVAddr : inBounds vptr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hvt : vtableFromPtrM m vptr = .ok vt) (hTrait : vt.trait_name = traitName)
+    (hSize : inBounds (vt.size.bytes : Int) .Signed x86_64.PTR_SIZE = true)
+    (hNonNull : (thin.addr != 0) = true)
+    (hAligned : Align.is_aligned vt.align thin.addr = true)
+    (hInhabited : pointee.inhabited = true)
+    (hDeref : ConcurrentMemory.dereferenceable m.mem thin vt.size = .ok ()) :
+    checkPtrM (ThinPointer.widen thin (some (.VTablePointer vptr))) (mk pointee) (some m) =
+      .ok () := by
+  rw [checkPtrM_traitObject_eq_sized thin vptr mk pointee traitName m vt hMk hLayout hVAddr hvt
+    hTrait]
+  rcases hMk with ⟨mutbl, rfl⟩ | rfl
+  · unfold checkPtrM
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadataM_none, ok_bind,
+      compute_size_and_align_sized, ok_bind, hSize, ensureElseUb_true, ok_bind,
+      hNonNull, ensureElseUb_true, ok_bind, hAligned, ensureElseUb_true, ok_bind,
+      hInhabited, ensureElseUb_true, ok_bind, hDeref]
+    rfl
+  · unfold checkPtrM
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadataM_none, ok_bind,
+      compute_size_and_align_sized, ok_bind, hSize, ensureElseUb_true, ok_bind,
+      hNonNull, ensureElseUb_true, ok_bind, hAligned, ensureElseUb_true, ok_bind,
+      hInhabited, ensureElseUb_true, ok_bind, hDeref]
+    rfl
+
+/-- **A trait-object safe pointer whose data address is not aligned to the dynamic
+alignment `vt.align` of its vtable is UB**: `"Value::Ptr: unaligned safe pointer"`. -/
+theorem checkPtr_traitObject_unaligned_ub (thin vptr : Ptr)
+    (mk : Gen.PointeeInfo → Gen.PtrType) (pointee : Gen.PointeeInfo)
+    (traitName : Gen.TraitName) (m : Mach) (vt : Gen.VTable)
+    (hMk : (∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box)
+    (hLayout : pointee.layout = .TraitObject traitName)
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hVAddr : inBounds vptr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hvt : vtableFromPtr m vptr = .ok vt) (hTrait : vt.trait_name = traitName)
+    (hSize : inBounds (vt.size.bytes : Int) .Signed x86_64.PTR_SIZE = true)
+    (hNonNull : (thin.addr != 0) = true)
+    (hUnaligned : Align.is_aligned vt.align thin.addr = false) :
+    checkPtr (ThinPointer.widen thin (some (.VTablePointer vptr))) (mk pointee) (some m) =
+      .error (.ub "Value::Ptr: unaligned safe pointer") := by
+  rw [checkPtr_traitObject_eq_sized thin vptr mk pointee traitName m vt hMk hLayout hVAddr hvt
+    hTrait]
+  rcases hMk with ⟨mutbl, rfl⟩ | rfl
+  · unfold checkPtr
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadata_none, ok_bind,
+      compute_size_and_align_sized, ok_bind, hSize, ensureElseUb_true, ok_bind,
+      hNonNull, ensureElseUb_true, ok_bind, hUnaligned, ensureElseUb_false, error_bind]
+  · unfold checkPtr
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadata_none, ok_bind,
+      compute_size_and_align_sized, ok_bind, hSize, ensureElseUb_true, ok_bind,
+      hNonNull, ensureElseUb_true, ok_bind, hUnaligned, ensureElseUb_false, error_bind]
+
+/-- Polymorphic `checkPtr_traitObject_unaligned_ub` (in particular on `MachTB`). -/
+theorem checkPtrM_traitObject_unaligned_ub {M : Type} [Gen.Memory M] [MemoryOps M]
+    (thin vptr : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (mk : Gen.PointeeInfo → Gen.PtrType) (pointee : Gen.PointeeInfo)
+    (traitName : Gen.TraitName) (m : Gen.Machine M) (vt : Gen.VTable)
+    (hMk : (∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box)
+    (hLayout : pointee.layout = .TraitObject traitName)
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hVAddr : inBounds vptr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hvt : vtableFromPtrM m vptr = .ok vt) (hTrait : vt.trait_name = traitName)
+    (hSize : inBounds (vt.size.bytes : Int) .Signed x86_64.PTR_SIZE = true)
+    (hNonNull : (thin.addr != 0) = true)
+    (hUnaligned : Align.is_aligned vt.align thin.addr = false) :
+    checkPtrM (ThinPointer.widen thin (some (.VTablePointer vptr))) (mk pointee) (some m) =
+      .error (.ub "Value::Ptr: unaligned safe pointer") := by
+  rw [checkPtrM_traitObject_eq_sized thin vptr mk pointee traitName m vt hMk hLayout hVAddr hvt
+    hTrait]
+  rcases hMk with ⟨mutbl, rfl⟩ | rfl
+  · unfold checkPtrM
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadataM_none, ok_bind,
+      compute_size_and_align_sized, ok_bind, hSize, ensureElseUb_true, ok_bind,
+      hNonNull, ensureElseUb_true, ok_bind, hUnaligned, ensureElseUb_false, error_bind]
+  · unfold checkPtrM
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadataM_none, ok_bind,
+      compute_size_and_align_sized, ok_bind, hSize, ensureElseUb_true, ok_bind,
+      hNonNull, ensureElseUb_true, ok_bind, hUnaligned, ensureElseUb_false, error_bind]
+
+/-- **A trait-object safe pointer whose memory is not dereferenceable for the dynamic
+size `vt.size` of its vtable is UB** (an allocation smaller than `vt.size`, a dead
+allocation, or a pointer without provenance):
+`"Value::Ptr: non-dereferenceable safe pointer"`. -/
+theorem checkPtr_traitObject_nonDereferenceable_ub (thin vptr : Ptr)
+    (mk : Gen.PointeeInfo → Gen.PtrType) (pointee : Gen.PointeeInfo)
+    (traitName : Gen.TraitName) (m : Mach) (vt : Gen.VTable)
+    (hMk : (∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box)
+    (hLayout : pointee.layout = .TraitObject traitName)
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hVAddr : inBounds vptr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hvt : vtableFromPtr m vptr = .ok vt) (hTrait : vt.trait_name = traitName)
+    (hSize : inBounds (vt.size.bytes : Int) .Signed x86_64.PTR_SIZE = true)
+    (hNonNull : (thin.addr != 0) = true)
+    (hAligned : Align.is_aligned vt.align thin.addr = true)
+    (hInhabited : pointee.inhabited = true) (msg : String)
+    (hDeref : CM.dereferenceable m.mem thin vt.size = .error (.ub msg)) :
+    checkPtr (ThinPointer.widen thin (some (.VTablePointer vptr))) (mk pointee) (some m) =
+      .error (.ub "Value::Ptr: non-dereferenceable safe pointer") := by
+  rw [checkPtr_traitObject_eq_sized thin vptr mk pointee traitName m vt hMk hLayout hVAddr hvt
+    hTrait]
+  rcases hMk with ⟨mutbl, rfl⟩ | rfl
+  · unfold checkPtr
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadata_none, ok_bind,
+      compute_size_and_align_sized, ok_bind, hSize, ensureElseUb_true, ok_bind,
+      hNonNull, ensureElseUb_true, ok_bind, hAligned, ensureElseUb_true, ok_bind,
+      hInhabited, ensureElseUb_true, ok_bind, hDeref]
+    rfl
+  · unfold checkPtr
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadata_none, ok_bind,
+      compute_size_and_align_sized, ok_bind, hSize, ensureElseUb_true, ok_bind,
+      hNonNull, ensureElseUb_true, ok_bind, hAligned, ensureElseUb_true, ok_bind,
+      hInhabited, ensureElseUb_true, ok_bind, hDeref]
+    rfl
+
+/-- Polymorphic `checkPtr_traitObject_nonDereferenceable_ub` (in particular on `MachTB`,
+where `Memory::dereferenceable` is `TreeBorrowsMemory::dereferenceable`). -/
+theorem checkPtrM_traitObject_nonDereferenceable_ub {M : Type} [Gen.Memory M] [MemoryOps M]
+    (thin vptr : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (mk : Gen.PointeeInfo → Gen.PtrType) (pointee : Gen.PointeeInfo)
+    (traitName : Gen.TraitName) (m : Gen.Machine M) (vt : Gen.VTable)
+    (hMk : (∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box)
+    (hLayout : pointee.layout = .TraitObject traitName)
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hVAddr : inBounds vptr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hvt : vtableFromPtrM m vptr = .ok vt) (hTrait : vt.trait_name = traitName)
+    (hSize : inBounds (vt.size.bytes : Int) .Signed x86_64.PTR_SIZE = true)
+    (hNonNull : (thin.addr != 0) = true)
+    (hAligned : Align.is_aligned vt.align thin.addr = true)
+    (hInhabited : pointee.inhabited = true) (msg : String)
+    (hDeref : ConcurrentMemory.dereferenceable m.mem thin vt.size = .error (.ub msg)) :
+    checkPtrM (ThinPointer.widen thin (some (.VTablePointer vptr))) (mk pointee) (some m) =
+      .error (.ub "Value::Ptr: non-dereferenceable safe pointer") := by
+  rw [checkPtrM_traitObject_eq_sized thin vptr mk pointee traitName m vt hMk hLayout hVAddr hvt
+    hTrait]
+  rcases hMk with ⟨mutbl, rfl⟩ | rfl
+  · unfold checkPtrM
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadataM_none, ok_bind,
+      compute_size_and_align_sized, ok_bind, hSize, ensureElseUb_true, ok_bind,
+      hNonNull, ensureElseUb_true, ok_bind, hAligned, ensureElseUb_true, ok_bind,
+      hInhabited, ensureElseUb_true, ok_bind, hDeref]
+    rfl
+  · unfold checkPtrM
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadataM_none, ok_bind,
+      compute_size_and_align_sized, ok_bind, hSize, ensureElseUb_true, ok_bind,
+      hNonNull, ensureElseUb_true, ok_bind, hAligned, ensureElseUb_true, ok_bind,
+      hInhabited, ensureElseUb_true, ok_bind, hDeref]
+    rfl
+
+/-- **Dynamic dispatch resolves to the function pointer constant**: with a machine,
+`UnOp::VTableMethodLookup(method)` on a pointer to a vtable `vt` returns, at
+`Type::Ptr(PtrType::FnPtr)`, exactly the value of `Constant::FnPointer` for the function
+`vt.methods[method]`, the callee value that `Terminator::Call` resolves with
+`Machine::fn_from_ptr`. -/
+theorem evalUnOp_vtableMethodLookup_eq_fnPointer (m : Mach) (vptr : Ptr) (ty : Gen.PtrType)
+    (meth : Gen.TraitMethodName) (vt : Gen.VTable) (fnName : Gen.FnName)
+    (hvt : vtableLookup m vptr = .ok vt)
+    (hfn : mapIndex vt.methods meth "vtable.methods[method]" = .ok fnName) :
+    evalUnOp (.VTableMethodLookup meth) (.Ptr (ThinPointer.widen vptr none), .Ptr ty) (some m) =
+      (do
+        let fnPtr ← evalConstant m (.FnPointer fnName)
+        pure (fnPtr, .Ptr .FnPtr)) := by
+  have h : evalUnOp (.VTableMethodLookup meth) (.Ptr (ThinPointer.widen vptr none), .Ptr ty)
+      (some m) =
+      (do
+        let vtable ← vtableLookup m vptr
+        let fnName ← mapIndex vtable.methods meth "vtable.methods[method]"
+        let fnThin ← mapIndex m.fn_ptrs fnName "self.fn_ptrs[fn_name]"
+        pure (.Ptr (ThinPointer.widen fnThin none), .Ptr .FnPtr)) := rfl
+  have hc : evalConstant m (.FnPointer fnName) =
+      (do
+        let ptr ← mapIndex m.fn_ptrs fnName "self.fn_ptrs[fn_name]"
+        pure (.Ptr (ThinPointer.widen ptr none))) := rfl
+  rw [h, hvt, ok_bind, hfn, ok_bind, hc]
+  cases mapIndex m.fn_ptrs fnName "self.fn_ptrs[fn_name]" <;> rfl
+
+/-- Polymorphic `evalUnOp_vtableMethodLookup_eq_fnPointer` (in particular on `MachTB`). -/
+theorem evalUnOpM_vtableMethodLookup_eq_fnPointer {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m : Gen.Machine M) (vptr : Gen.ThinPointer (Gen.Memory.Provenance M)) (ty : Gen.PtrType)
+    (meth : Gen.TraitMethodName) (vt : Gen.VTable) (fnName : Gen.FnName)
+    (hvt : vtableLookupM m vptr = .ok vt)
+    (hfn : mapIndex vt.methods meth "vtable.methods[method]" = .ok fnName) :
+    evalUnOpM (.VTableMethodLookup meth) (.Ptr (ThinPointer.widen vptr none), .Ptr ty) (some m) =
+      (do
+        let fnPtr ← evalConstantM m (.FnPointer fnName)
+        pure (fnPtr, .Ptr .FnPtr)) := by
+  have h : evalUnOpM (.VTableMethodLookup meth) (.Ptr (ThinPointer.widen vptr none), .Ptr ty)
+      (some m) =
+      (do
+        let vtable ← vtableLookupM m vptr
+        let fnName ← mapIndex vtable.methods meth "vtable.methods[method]"
+        let fnThin ← mapIndex m.fn_ptrs fnName "self.fn_ptrs[fn_name]"
+        pure (.Ptr (ThinPointer.widen fnThin none), .Ptr .FnPtr)) := rfl
+  have hc : evalConstantM m (.FnPointer fnName) =
+      (do
+        let ptr ← mapIndex m.fn_ptrs fnName "self.fn_ptrs[fn_name]"
+        pure (.Ptr (ThinPointer.widen ptr none))) := rfl
+  rw [h, hvt, ok_bind, hfn, ok_bind, hc]
+  cases mapIndex m.fn_ptrs fnName "self.fn_ptrs[fn_name]" <;> rfl
 
 private theorem comparePtrM_bm_eq (lp rp : Gen.Pointer Prov) :
     comparePtrM lp rp = comparePtr lp rp := by

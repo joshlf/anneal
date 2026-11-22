@@ -8701,8 +8701,10 @@ theorem checkPtr_congr_mach {M1 M2 : Mach} (hmem : M1.mem = M2.mem)
     checkPtr ptr ptrTy (some M1) = checkPtr ptr ptrTy (some M2) := by
   have hvl : vtableLookup M1 = vtableLookup M2 := by
     funext p; unfold vtableLookup; rw [hvt, hprog]
-  unfold checkPtr
-  simp only [hvl, hmem]
+  have hvf : vtableFromPtr M1 = vtableFromPtr M2 := by
+    funext p; unfold vtableFromPtr; rw [hvt, hprog]
+  unfold checkPtr checkPtrMetadata
+  simp only [hvl, hvf, hmem]
 
 /-- `Machine::check_value` reads only the machine's memory and vtables. -/
 theorem checkValue_congr_mach {M1 M2 : Mach} (hmem : M1.mem = M2.mem)
@@ -8773,9 +8775,11 @@ theorem checkValue_congr_mach {M1 M2 : Mach} (hmem : M1.mem = M2.mem)
     intro d ty tagger rest disc data m hne ih hm; subst hm
     simp only [checkVariant, hne, ↓reduceIte, ih rfl]
 
-/-- `Machine::eval_un_op` reads only the machine's memory and vtables. -/
+/-- `Machine::eval_un_op` reads only the machine's memory, vtables, and
+function pointers (the latter in `UnOp::VTableMethodLookup`). -/
 theorem evalUnOp_congr_mach {M1 M2 : Mach} (hmem : M1.mem = M2.mem)
     (hvt : M1.vtable_ptrs = M2.vtable_ptrs) (hprog : M1.prog = M2.prog)
+    (hfn : M1.fn_ptrs = M2.fn_ptrs)
     (op : Gen.UnOp) (arg : Val × Gen.Type) :
     evalUnOp op arg (some M1) = evalUnOp op arg (some M2) := by
   have hcv := checkValue_congr_mach hmem hvt hprog
@@ -8786,7 +8790,7 @@ theorem evalUnOp_congr_mach {M1 M2 : Mach} (hmem : M1.mem = M2.mem)
   have hca : ∀ lay pm, computeAlign M1 lay pm = computeAlign M2 lay pm := by
     intro lay pm; unfold computeAlign; rw [hvl]
   unfold evalUnOp evalCastOp transmute
-  simp only [hcv, hcs, hca]
+  simp only [hcv, hcs, hca, hvl, hfn]
 
 /-- `retag_ptr` of `BasicMemory` on a machine whose single thread has a
 non-empty stack is the identity. -/
@@ -9425,7 +9429,7 @@ theorem evalValue_rethread (e : Gen.ValueExpr) (m : Mach) (rootCtx curCtx : Ctx)
       have huo : evalUnOp op arg (some ({ rethread m curCtx [curCtx.caller, fr] with mem := cm } : Mach)) =
           evalUnOp op arg (some { m with mem := cm }) :=
         evalUnOp_congr_mach (M1 := { rethread m curCtx [curCtx.caller, fr] with mem := cm })
-          (M2 := { m with mem := cm }) rfl rfl rfl op arg
+          (M2 := { m with mem := cm }) rfl rfl rfl rfl op arg
       rw [huo]
       cases evalUnOp op arg (some { m with mem := cm }) with
       | error err => simp
