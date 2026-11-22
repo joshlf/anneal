@@ -135,7 +135,12 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
     # Operator knobs read from the ambient environment that change which wrapper the suite
     # resolves or how long it waits for it. The suite runs these tests as one of its own
     # steps (`scripts_python_unit_tests`), with whatever the operator exported for the run.
-    _AMBIENT_SUITE_KNOBS = ("ANNEAL_LEAN_RUN", "ANNEAL_LEAN_TIMEOUT_SEC")
+    _AMBIENT_SUITE_KNOBS = (
+        "ANNEAL_LEAN_RUN",
+        "ANNEAL_LEAN_TIMEOUT_SEC",
+        "ANNEAL_LEAN_RUN_IN_SCOPE",
+        "ANNEAL_LSP_NO_EVICT",
+    )
 
     def setUp(self) -> None:
         # Every test starts without those knobs, and whatever a test writes to `os.environ`
@@ -4548,6 +4553,148 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     miri_cmd, {"ANNEAL_LEAN_RUN": f"  {os.path.relpath(renamed)}  "}
                 )
             )
+
+    def test_ensure_toolchain_path_and_build_step_env_isolate_home_and_probe_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_home = root / "fake_home"
+            (fake_home / ".elan/bin").mkdir(parents=True)
+            (fake_home / ".cargo/bin").mkdir(parents=True)
+            real_home = str(Path.home())
+
+            # Isolated `base_env` with explicit `HOME` prepends only that `HOME`'s toolchains
+            # and never leaks the host process's `Path.home()`.
+            env_with_home = suite._build_step_env(
+                "ci_check_non_stable_version",
+                base_env={"HOME": str(fake_home), "PATH": "/usr/bin"},
+            )
+            path_parts = env_with_home["PATH"].split(os.pathsep)
+            self.assertIn(str(fake_home / ".elan/bin"), path_parts)
+            self.assertIn(str(fake_home / ".cargo/bin"), path_parts)
+            if real_home != str(fake_home):
+                self.assertFalse(any(p.startswith(real_home + os.sep) for p in path_parts), path_parts)
+
+            # Isolated `base_env` without `HOME` must not leak ambient host `HOME` either.
+            env_no_home = suite._build_step_env(
+                "ci_check_non_stable_version",
+                base_env={"PATH": "/usr/bin"},
+            )
+            self.assertEqual(env_no_home["PATH"], "/usr/bin")
+
+            # `env_overrides` (renamed `ANNEAL_LEAN_RUN` / `ANNEAL_LEAN_MEMORY_MAX_MB`) must be
+            # visible to `_probe_lean_run_memory_max_mib`, while explicit `LEAN_NUM_THREADS` in
+            # `env_overrides` still takes final precedence.
+            renamed = root / "custom-wrapper"
+            renamed.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "mb = int(os.environ.get('ANNEAL_LEAN_MEMORY_MAX_MB', '5712'))\n"
+                "print(json.dumps({'memory_max_mb': mb}))\n",
+                encoding="utf-8",
+            )
+            renamed.chmod(0o755)
+            cmd = [str(renamed), "--mode", "build", "--", "lake", "--dir", "examples", "build", "LeanMiriSpec"]
+            with mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=65536):
+                probed_low = suite._build_step_env(
+                    "lake_build_lean_miri_spec",
+                    base_env={"PATH": "/usr/bin"},
+                    env_overrides={"ANNEAL_LEAN_RUN": str(renamed)},
+                    cmd=cmd,
+                    cwd=root,
+                )
+                self.assertEqual(probed_low.get("LEAN_NUM_THREADS"), "1")
+
+                probed_high = suite._build_step_env(
+                    "lake_build_lean_miri_spec",
+                    base_env={"PATH": "/usr/bin"},
+                    env_overrides={"ANNEAL_LEAN_RUN": str(renamed), "ANNEAL_LEAN_MEMORY_MAX_MB": "16384"},
+                    cmd=cmd,
+                    cwd=root,
+                )
+                self.assertNotIn("LEAN_NUM_THREADS", probed_high)
+
+                explicit_override = suite._build_step_env(
+                    "lake_build_lean_miri_spec",
+                    base_env={"PATH": "/usr/bin"},
+                    env_overrides={"ANNEAL_LEAN_RUN": str(renamed), "LEAN_NUM_THREADS": "4"},
+                    cmd=cmd,
+                    cwd=root,
+                )
+                self.assertEqual(explicit_override.get("LEAN_NUM_THREADS"), "4")
+
+    def test_outer_timeout_handles_passthrough_lsp_no_evict_and_lake_global_opts_auto_mode(self) -> None:
+        lr = str(REPO_ROOT / "scripts/anneal-lean-run")
+        grace = suite.WRAPPER_TIMEOUT_GRACE_SEC
+        build_wait = suite.LEAN_RUN_SLOT_WAIT_SEC["build"]
+        file_wait = suite.LEAN_RUN_SLOT_WAIT_SEC["file"]
+
+        cmd_build = [lr, "--mode", "build", "--timeout", "600", "--", "lake", "build", "Anneal"]
+        cmd_nested = [lr, "--mode", "build", "--timeout", "600", "--nested-ok", "--", "lake", "build", "Anneal"]
+
+        # Inside an enclosing `anneal-lean-run` scope (`ANNEAL_LEAN_RUN_IN_SCOPE=1`),
+        # the wrapper executes `_exec_passthrough` (no slot wait, no OOM retry, no internal timer),
+        # so `_outer_timeout_sec` returns the exact step budget unless `--nested-ok` is set.
+        self.assertEqual(
+            suite._outer_timeout_sec(cmd_build, 600, env={"ANNEAL_LEAN_RUN_IN_SCOPE": "1"}),
+            600,
+        )
+        self.assertEqual(
+            suite._outer_timeout_sec(cmd_nested, 600, env={"ANNEAL_LEAN_RUN_IN_SCOPE": "1"}),
+            build_wait + max(600, suite.LEAN_RUN_OOM_RETRY_WINDOW_SEC) + grace,
+        )
+
+        # `ANNEAL_LSP_NO_EVICT=1` disables on-OOM retry in `anneal-lean-run`, matching `--no-oom-retry`.
+        self.assertEqual(
+            suite._outer_timeout_sec(cmd_build, 600, env={"ANNEAL_LSP_NO_EVICT": "1"}),
+            build_wait + 600 + grace,
+        )
+
+        # `auto` mode scans past Lake global options (`--dir`, `-d`, `-q`, `+toolchain`, `--`)
+        # before `env lean`, matching `scripts/anneal-lean-run`'s `_lake_env_lean_index`.
+        for file_cmd in (
+            [lr, "--timeout", "180", "--", "lake", "--dir", "examples", "env", "lean", "Foo.lean"],
+            [lr, "--timeout", "180", "--", "lake", "-dexamples", "-q", "env", "--", "lean", "Foo.lean"],
+            [lr, "--timeout", "180", "--", "lake", "+nightly", "-Kfoo=bar", "env", "lean", "Foo.lean"],
+        ):
+            self.assertEqual(suite._lean_run_wrapper_flags(file_cmd), ("file", 180, True), file_cmd)
+            self.assertEqual(suite._outer_timeout_sec(file_cmd, 180, env={}), file_wait + 180 + grace, file_cmd)
+        run_cmd = [lr, "--timeout", "180", "--", "lake", "--dir", "examples", "env", "lean", "--run", "Foo.lean"]
+        self.assertEqual(suite._lean_run_wrapper_flags(run_cmd)[0], "build")
+
+    def test_run_step_empty_cmd_and_dashboard_corrupt_state_json_resilience(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Empty `cmd` must fail cleanly with exit 127 rather than crashing with `IndexError`.
+            empty_res = suite._run_step("empty_step", "cat7_python_and_ci_tests", [], cwd=root, timeout_sec=10)
+            self.assertEqual(empty_res["status"], "FAIL")
+            self.assertEqual(empty_res["exit_code"], 127)
+            self.assertIn("<empty>", empty_res["failure_excerpt"])
+
+            # Non-dict / malformed `LATEST_CAMPAIGN_SUMMARY.json` and `correspondence_ratchet.json`
+            # must never crash `run_suite_and_generate_dashboard`.
+            state_dir = root / "state_out"
+            difftest_dir = root / "difftest_in"
+            (state_dir / "state").mkdir(parents=True)
+            (difftest_dir / "reports").mkdir(parents=True)
+            (difftest_dir / "reports/LATEST_CAMPAIGN_SUMMARY.json").write_text("[]\n", encoding="utf-8")
+            (state_dir / "state/correspondence_ratchet.json").write_text(
+                '{"high_water_minirust_audited_decls": "corrupt", "high_water_blended_completeness_pct": true}\n',
+                encoding="utf-8",
+            )
+            code, dashboard, _md = suite.run_suite_and_generate_dashboard(
+                repo_root=REPO_ROOT,
+                profile="census-only",
+                state_dir=state_dir,
+                difftest_dir=difftest_dir,
+            )
+            self.assertEqual(code, suite.EXIT_SUCCESS)
+            self.assertEqual(
+                dashboard["pillar_2_correctness_and_correspondence"]["latest_differential_testing"]["overall_status"],
+                "unknown",
+            )
+            ratchet = json.loads((state_dir / "state/correspondence_ratchet.json").read_text(encoding="utf-8"))
+            self.assertIsInstance(ratchet["high_water_minirust_audited_decls"], int)
+            self.assertIsInstance(ratchet["high_water_blended_completeness_pct"], float)
 
     def test_tracecheck_import_isolation_matches_check_trusted_downstream_targets(self) -> None:
         tc_path = REPO_ROOT / "theory/Anneal/Rustc/V2026_06_01/TraceCheck.lean"

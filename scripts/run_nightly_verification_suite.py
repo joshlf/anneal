@@ -5035,9 +5035,78 @@ def _is_lean_run_wrapped(cmd: list[str], env: Mapping[str, str] | None = None) -
     return bool(override) and os.path.abspath(override) == os.path.abspath(cmd[0])
 
 
-def _parse_lean_run_wrapper(cmd: list[str]) -> tuple[str, int | None, bool, bool, bool]:
-    """`(mode, timeout_sec, slot_lock, saw_timeout_flag, oom_retry)` from the
-    `anneal-lean-run` options preceding `--` or the first positional command token.
+_LAKE_VALUE_OPTS: frozenset[str] = frozenset(
+    {"-d", "--dir", "-f", "--file", "-K", "--key", "-p", "--packages"}
+)
+_LAKE_VALUE_EQ_PREFIXES: tuple[str, ...] = (
+    "-d=",
+    "--dir=",
+    "-f=",
+    "--file=",
+    "-K=",
+    "--key=",
+    "-p=",
+    "--packages=",
+)
+_LAKE_FLAG_OPTS: frozenset[str] = frozenset(
+    {
+        "-q",
+        "--quiet",
+        "-v",
+        "--verbose",
+        "-R",
+        "--reconfigure",
+        "-U",
+        "--update",
+        "--keep-toolchain",
+        "--wfail",
+        "--old",
+        "--offline",
+        "--no-build",
+    }
+)
+
+
+def _lake_env_lean_index(inner: list[str]) -> int | None:
+    """Index of `lean` in `lake [global-opts] env [--] <*/lean> ...`, matching
+    `scripts/anneal-lean-run`'s `_lake_env_lean_index`, or `None`."""
+    if not inner or Path(inner[0]).name != "lake":
+        return None
+    i, n = 1, len(inner)
+    sub_idx: int | None = None
+    while i < n:
+        arg = inner[i]
+        if arg == "--":
+            break
+        if arg.startswith("+") and len(arg) > 1:
+            i += 1
+            continue
+        if arg in _LAKE_VALUE_OPTS:
+            i += 2
+            continue
+        if arg.startswith(_LAKE_VALUE_EQ_PREFIXES) or (
+            len(arg) > 2 and arg[:2] in ("-d", "-f", "-K", "-p")
+        ):
+            i += 1
+            continue
+        if arg in _LAKE_FLAG_OPTS:
+            i += 1
+            continue
+        if arg.startswith("-"):
+            break
+        sub_idx = i
+        break
+    if sub_idx is None or inner[sub_idx] != "env":
+        return None
+    j = sub_idx + 1
+    if j < n and inner[j] == "--":
+        j += 1
+    return j if j < n and Path(inner[j]).name == "lean" else None
+
+
+def _parse_lean_run_wrapper(cmd: list[str]) -> tuple[str, int | None, bool, bool, bool, bool]:
+    """`(mode, timeout_sec, slot_lock, saw_timeout_flag, oom_retry, nested_ok)` from
+    the `anneal-lean-run` options preceding `--` or the first positional command token.
     `slot_lock` is whether the wrapper queues for a build slot (`--exclusive` always
     does, `--no-slot-lock` otherwise does not)."""
     mode = "auto"
@@ -5046,6 +5115,7 @@ def _parse_lean_run_wrapper(cmd: list[str]) -> tuple[str, int | None, bool, bool
     slot_lock = True
     exclusive = False
     oom_retry = True
+    nested_ok = False
     i = 1
     n = len(cmd)
     while i < n:
@@ -5071,6 +5141,8 @@ def _parse_lean_run_wrapper(cmd: list[str]) -> tuple[str, int | None, bool, bool
             exclusive = True
         elif opt == "--no-oom-retry":
             oom_retry = False
+        elif opt == "--nested-ok":
+            nested_ok = True
         elif opt == "--mode" and val is not None:
             mode = val
         elif opt == "--timeout" and val is not None:
@@ -5082,40 +5154,42 @@ def _parse_lean_run_wrapper(cmd: list[str]) -> tuple[str, int | None, bool, bool
         i += 1
     inner = cmd[i:]
     if mode not in ("file", "build"):
-        is_lean_file = (bool(inner) and Path(inner[0]).name == "lean") or (
-            len(inner) >= 3
-            and Path(inner[0]).name == "lake"
-            and inner[1] == "env"
-            and Path(inner[2]).name == "lean"
-        )
-        mode = "file" if is_lean_file and "--run" not in inner else "build"
+        lean_idx = _lake_env_lean_index(inner)
+        if bool(inner) and Path(inner[0]).name == "lean" and "--run" not in inner[1:]:
+            mode = "file"
+        elif lean_idx is not None and "--run" not in inner[lean_idx + 1 :]:
+            mode = "file"
+        else:
+            mode = "build"
     if timeout is not None and timeout <= 0:
         timeout = None
-    return mode, timeout, slot_lock or exclusive, saw_timeout, oom_retry
+    return mode, timeout, slot_lock or exclusive, saw_timeout, oom_retry, nested_ok
 
 
 def _lean_run_wrapper_flags(cmd: list[str]) -> tuple[str, int | None, bool]:
     """`(mode, timeout_sec, slot_lock)` from the `anneal-lean-run` options preceding
     `--` or the first positional command token (an `auto` mode resolves like the
-    wrapper: `lean` or `lake env lean` without `--run` is `file`)."""
-    mode, timeout, slot_lock, _saw_timeout, _oom_retry = _parse_lean_run_wrapper(cmd)
+    wrapper: `lean` or `lake [global-opts] env lean` without `--run` is `file`)."""
+    mode, timeout, slot_lock, _saw_timeout, _oom_retry, _nested_ok = _parse_lean_run_wrapper(cmd)
     return mode, timeout, slot_lock
 
 
 def _outer_timeout_sec(
     cmd: list[str], timeout_sec: int, env: dict[str, str] | None = None
 ) -> int:
-    """Outer Python deadline for a step: the step budget itself for direct commands,
-    and for `anneal-lean-run` wrapped ones the wrapper's worst-case lifetime (build
-    slot queueing + its own `--timeout`, or its OOM-retry window if that is longer +
-    termination) plus a grace margin, so the wrapper's structured diagnostics (exit 124,
-    `BUILD_SLOT_TIMEOUT`, the OOM-retry verdict) always win the race and a step that
-    merely queued behind another build is not killed while still inside its budget."""
+    """Outer Python deadline for a step: the step budget itself for direct commands
+    (and for `anneal-lean-run` re-entrancy pass-through when `ANNEAL_LEAN_RUN_IN_SCOPE=1`
+    without `--nested-ok`, where the wrapper `exec`s immediately with no slot lock,
+    OOM retry, or internal timer), and otherwise the wrapper's worst-case lifetime
+    (build slot queueing + its own `--timeout`, or its OOM-retry window if that is
+    longer + termination) plus a grace margin."""
     if not _is_lean_run_wrapped(cmd, env):
         return timeout_sec
-    mode, inner_timeout, slot_lock, saw_timeout, oom_retry = _parse_lean_run_wrapper(cmd)
+    mode, inner_timeout, slot_lock, saw_timeout, oom_retry, nested_ok = _parse_lean_run_wrapper(cmd)
+    env_map = os.environ if env is None else env
+    if env_map.get("ANNEAL_LEAN_RUN_IN_SCOPE") == "1" and not nested_ok:
+        return timeout_sec
     if inner_timeout is None and not saw_timeout:
-        env_map = os.environ if env is None else env
         raw_env_timeout = env_map.get("ANNEAL_LEAN_TIMEOUT_SEC", "").strip()
         if raw_env_timeout:
             try:
@@ -5126,7 +5200,7 @@ def _outer_timeout_sec(
                 pass
     inner = inner_timeout if inner_timeout is not None else LEAN_RUN_DEFAULT_TIMEOUT_SEC[mode]
     worst = inner
-    if mode == "build" and oom_retry:
+    if mode == "build" and oom_retry and env_map.get("ANNEAL_LSP_NO_EVICT") != "1":
         worst = max(worst, LEAN_RUN_OOM_RETRY_WINDOW_SEC)
     if slot_lock:
         slot_wait = LEAN_RUN_SLOT_WAIT_SEC[mode]
@@ -5136,14 +5210,22 @@ def _outer_timeout_sec(
     return max(timeout_sec, worst) + WRAPPER_TIMEOUT_GRACE_SEC
 
 
-def _ensure_toolchain_path(env: dict[str, str]) -> None:
-    """Ensure `~/.elan/bin`, `~/.cargo/bin`, and `~/.local/bin` are on `env["PATH"]`
-    so cron/automation invocations with minimal `PATH` still locate `lake` and `cargo`."""
+def _ensure_toolchain_path(env: dict[str, str], *, use_ambient_home: bool = True) -> None:
+    """Ensure `<home>/.elan/bin`, `<home>/.cargo/bin`, and `<home>/.local/bin` are on
+    `env["PATH"]` so cron/automation invocations with minimal `PATH` still locate `lake`
+    and `cargo`. Prefers `env["HOME"]` when set and only falls back to `Path.home()`
+    when `use_ambient_home` is true (never leaking host `HOME` into isolated `base_env`s)."""
     raw_path = env.get("PATH", "")
     parts = [p for p in raw_path.split(os.pathsep) if p]
-    try:
-        home = Path.home()
-    except (KeyError, RuntimeError):
+    raw_home = env.get("HOME", "").strip()
+    if raw_home:
+        home = Path(raw_home)
+    elif use_ambient_home:
+        try:
+            home = Path.home()
+        except (KeyError, RuntimeError):
+            return
+    else:
         return
     prepend: list[str] = []
     for rel in (".elan/bin", ".cargo/bin", ".local/bin"):
@@ -5412,15 +5494,16 @@ def _build_step_env(
     - Explicit `env_overrides` take final precedence.
     """
     env = dict(os.environ if base_env is None else base_env)
-    _ensure_toolchain_path(env)
+    _ensure_toolchain_path(env, use_ambient_home=base_env is None)
     env.update(LAKE_ARTIFACT_CACHE_ENV)
     if step_name == "lake_build_lean_miri_spec":
         if effective_ram_mib is _RAM_UNSET:
+            probe_env = {**env, **env_overrides} if env_overrides else env
             ceilings = [
                 mib
                 for mib in (
                     _probe_effective_ram_ceiling_mib(),
-                    _probe_lean_run_memory_max_mib(cmd, env=env, cwd=cwd) if cmd else None,
+                    _probe_lean_run_memory_max_mib(cmd, env=probe_env, cwd=cwd) if cmd else None,
                 )
                 if mib is not None
             ]
@@ -6071,6 +6154,17 @@ def _run_step(
     env = _build_step_env(name, env_overrides=env_overrides, cmd=cmd, cwd=cwd)
     outer_timeout = _outer_timeout_sec(cmd, timeout_sec, env=env)
     timed_out = False
+    if not cmd:
+        return {
+            "name": name,
+            "category": category,
+            "status": "FAIL",
+            "exit_code": 127,
+            "duration_sec": round(time.monotonic() - t0, 2),
+            "command": "",
+            "audit_tags": [],
+            "failure_excerpt": "Failed to launch <empty>: empty command",
+        }
     try:
         proc = subprocess.Popen(
             cmd,
@@ -6083,7 +6177,7 @@ def _run_step(
             errors="replace",
             start_new_session=True,
         )
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         return {
             "name": name,
             "category": category,
@@ -6830,8 +6924,10 @@ def run_suite_and_generate_dashboard(
         latest_dt = difftest_dir / "reports/LATEST_CAMPAIGN_SUMMARY.json"
         if latest_dt.is_file():
             try:
-                difftest_summary = json.loads(latest_dt.read_text(encoding="utf-8"))
-            except ValueError:
+                loaded_dt = json.loads(latest_dt.read_text(encoding="utf-8"))
+                if isinstance(loaded_dt, dict):
+                    difftest_summary = loaded_dt
+            except (OSError, ValueError):
                 difftest_summary = {}
 
     dashboard: dict[str, Any] = {
@@ -6889,28 +6985,38 @@ def run_suite_and_generate_dashboard(
     prev_ratchet: dict[str, Any] = {}
     if ratchet_path.is_file():
         try:
-            prev_ratchet = json.loads(ratchet_path.read_text(encoding="utf-8"))
-        except ValueError:
+            loaded_ratchet = json.loads(ratchet_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_ratchet, dict):
+                prev_ratchet = loaded_ratchet
+        except (OSError, ValueError):
             prev_ratchet = {}
+
+    def _ratchet_int(key: str, default: int) -> int:
+        val = prev_ratchet.get(key, default)
+        return val if isinstance(val, int) and not isinstance(val, bool) else default
+
+    def _ratchet_float(key: str, default: float) -> float:
+        val = prev_ratchet.get(key, default)
+        return float(val) if isinstance(val, (int, float)) and not isinstance(val, bool) else default
 
     comb_lifters = stage_b["combined"]["layers"]["anneal_proof_lifters"]
     new_ratchet = {
         "updated_at_utc": now_iso,
         "unstable_commit_sha": dashboard["unstable_commit_sha"],
         "high_water_minirust_audited_decls": max(
-            prev_ratchet.get("high_water_minirust_audited_decls", 0),
+            _ratchet_int("high_water_minirust_audited_decls", 0),
             stage_a["minirust_authority"]["audited_declarations"],
         ),
         "high_water_lean_miri_audited_decls": max(
-            prev_ratchet.get("high_water_lean_miri_audited_decls", 0),
+            _ratchet_int("high_water_lean_miri_audited_decls", 0),
             stage_a["lean_miri_authority"]["audited_declarations"],
         ),
         "high_water_blended_completeness_pct": max(
-            prev_ratchet.get("high_water_blended_completeness_pct", 0.0),
+            _ratchet_float("high_water_blended_completeness_pct", 0.0),
             comb_lifters["blended_completeness_score_pct"],
         ),
         "low_water_actionable_divergences": min(
-            prev_ratchet.get(
+            _ratchet_int(
                 "low_water_actionable_divergences",
                 divergences["actionable_anneal_bugs_count"],
             ),
