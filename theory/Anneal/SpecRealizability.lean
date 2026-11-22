@@ -1752,7 +1752,11 @@ def starvedCofactorCap? (starvedStart now : Nat) : Option Nat :=
     Monotone across the starvation boundary: a nearly dry budget (`some remCap` with
     `remCap < closedNatSubtermHeartbeats`) or a sub-floor `stepHeartbeats` never
     receives a smaller cofactoring cap than an already-exhausted budget (`none`), while
-    a well-funded budget stays capped at `min remCap closedNatFoldHeartbeats`. -/
+    a well-funded budget stays capped at `min remCap closedNatFoldHeartbeats`.
+
+    While the budget has room, Phase 3 passes the fresh floor `starvedCofactorCap? 0 0`
+    and leaves the starved clock unanchored, so the floor only starts to drain at the
+    point of exhaustion, never while probes can still be charged to the budget. -/
 def phase3CofactorCap? (remCap? floorCap? : Option Nat) : Option Nat :=
   match remCap? with
   | some remCap =>
@@ -4112,22 +4116,18 @@ private def analyzeNormalizedSpec
         let fibreAssump := mkFibreAssumption expandedAtoms mask
         -- Bound `cofactorBoilerplate` so nested `match` expressions composed with up to
         -- `2^8 = 256` boilerplate masks cannot exhaust the enclosing command's heartbeats.
-        -- Near or after budget exhaustion (or under a sub-floor `stepHeartbeats`), pure
-        -- syntactic cofactoring retains a bounded structural floor (`phase3CofactorCap?`
-        -- + `starvedCofactorCap?`: `closedNatFoldHeartbeats` in total across remaining
-        -- masks) so starved-budget syntactic checks still succeed while pathological
-        -- masks degrade conservatively.
+        -- Pure syntactic cofactoring always retains a bounded structural floor
+        -- (`phase3CofactorCap?`), so starved-budget syntactic checks still succeed while
+        -- pathological masks degrade conservatively. While `budget` has room, a nearly
+        -- dry budget or a sub-floor `stepHeartbeats` is raised to the per-call floor and
+        -- every heartbeat spent is still charged to `budget`; the starved clock stays
+        -- unanchored, so probes on earlier fibres never drain the floor. Once `budget` is
+        -- spent, the floor is `closedNatFoldHeartbeats` in total across the remaining
+        -- masks, measured from the exhaustion point (`starvedCofactorCap?`).
         let mut cofactorCap? : Option Nat := none
         match ← budget.nextCap? with
         | some remCap =>
-          if remCap >= closedNatSubtermHeartbeats then
-            cofactorCap? := phase3CofactorCap? (some remCap) none
-          else
-            let now ← IO.getNumHeartbeats
-            let starvedStart := phase3StarvedStart?.getD now
-            phase3StarvedStart? := some starvedStart
-            cofactorCap? :=
-              phase3CofactorCap? (some remCap) (starvedCofactorCap? starvedStart now)
+          cofactorCap? := phase3CofactorCap? (some remCap) (starvedCofactorCap? 0 0)
         | none =>
           phase3BudgetExhausted := true
           probeCutOffRef.set true

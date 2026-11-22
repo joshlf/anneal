@@ -5916,3 +5916,68 @@ fn negative_controls_stateful_read_write_invariants_and_option_result_contracts(
         assert!(res_stats.mutants_survived() > 0, "seed {seed:#x}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Double-negated reflexivity and one-point existential bypasses (dynamic
+// counterparts of the Lean `¬(ret ≠ ret)` and `∃ k, k = ret` regressions)
+// ---------------------------------------------------------------------------
+
+#[spec(
+    requires: x < 100,
+    ensures: |r| !(r != r),
+)]
+fn trivial_double_negation_fn(x: u32) -> u32 {
+    x
+}
+
+// One-point existential: some `k` in the singleton range `r..=r` equals `r`.
+#[spec(
+    requires: x < 100,
+    ensures: |r| (r..=r).contains(&r),
+)]
+fn trivial_one_point_exists_fn(x: u32) -> u32 {
+    x
+}
+
+#[test]
+fn catches_double_negated_reflexivity_and_one_point_existential_bypasses() {
+    for seed in [0u64, 1, 0xCAFE_BABE, u64::MAX] {
+        for domain in [ProbeDomain::PreconditionOnly, ProbeDomain::Unconstrained] {
+            let cfg = SpecCheckConfig::default()
+                .with_seed(seed)
+                .with_probe_domain(domain);
+
+            // Baseline: plain reflexivity `r == r` accepts every output.
+            let reflexive = check_contract(
+                cfg,
+                |&x: &u32| __anodized_fn_requires_trivial_reflexive_fn(x),
+                |&x| trivial_reflexive_fn(x),
+                |&x, &r| __anodized_fn_ensures_trivial_reflexive_fn(x, r),
+            );
+            assert_eq!(
+                reflexive.vacuity_class(),
+                Some(VacuityClass::TrivialPostcondition),
+                "seed {seed:#x}"
+            );
+
+            // `!(r != r)` mentions the output twice yet accepts every output, so the
+            // checker reports exactly what it reports for `r == r`.
+            let double_negation = check_contract(
+                cfg,
+                |&x: &u32| __anodized_fn_requires_trivial_double_negation_fn(x),
+                |&x| trivial_double_negation_fn(x),
+                |&x, &r| __anodized_fn_ensures_trivial_double_negation_fn(x, r),
+            );
+            assert_eq!(double_negation, reflexive, "seed {seed:#x}");
+
+            // An existential witnessed by the output itself is just as unconstraining.
+            let one_point = check_contract(
+                cfg,
+                |&x: &u32| __anodized_fn_requires_trivial_one_point_exists_fn(x),
+                |&x| trivial_one_point_exists_fn(x),
+                |&x, &r| __anodized_fn_ensures_trivial_one_point_exists_fn(x, r),
+            );
+            assert_eq!(one_point, reflexive, "seed {seed:#x}");
+        }
+    }
+}

@@ -3961,6 +3961,29 @@ theorem phase3CofactorCap_subfloor_step_keeps_floor :
       phase3CofactorCap? none (starvedCofactorCap? 7000000 9000000) = none := by
   decide
 
+/-- While the probe budget still has room, Phase 3 pairs the remaining cap with the fresh
+    floor `starvedCofactorCap? 0 0` without anchoring the starved clock, so the cofactoring
+    cap never drops below the full per-call floor however small `remCap` is. -/
+theorem phase3CofactorCap_fresh_floor_lower_bound (remCap : Nat) :
+    ∃ cap,
+      phase3CofactorCap? (some remCap) (starvedCofactorCap? 0 0) = some cap ∧
+      250000 ≤ cap :=
+  phase3CofactorCap_never_below_starved_floor remCap 0 0 250000 (by decide)
+
+/-- Concrete values of the fresh-floor pairing and the regression it guards. A sub-floor or
+    nearly dry cap is raised to the per-call floor and a well-funded cap is unchanged.
+    Anchoring the starved clock at the first sub-floor cap instead of at exhaustion would
+    let probes that ran while the budget still had room drain the floor (no cap at all
+    2,000,000 heartbeats later); anchored at exhaustion, the full per-call cap remains. -/
+theorem phase3CofactorCap_fresh_floor_and_exhaustion_anchor :
+    phase3CofactorCap? (some 1000) (starvedCofactorCap? 0 0) = some 250000 ∧
+      phase3CofactorCap? (some 249999) (starvedCofactorCap? 0 0) = some 250000 ∧
+      phase3CofactorCap? (some 1000000) (starvedCofactorCap? 0 0) = some 1000000 ∧
+      phase3CofactorCap? (some 50000000) (starvedCofactorCap? 0 0) = some 2000000 ∧
+      phase3CofactorCap? none (starvedCofactorCap? 0 2000000) = none ∧
+      phase3CofactorCap? none (starvedCofactorCap? 2000000 2000000) = some 250000 := by
+  decide
+
 -- A sub-floor `stepHeartbeats` with ample `totalHeartbeats` still grants `cofactorBoilerplate`
 -- the starved structural floor, matching `{ stepHeartbeats := 0, totalHeartbeats := 0 }`.
 #eval assertDeclEnsuresVacuous ``matchOptionU32BoilerplateContract (some .unboundReturnOutput)
