@@ -1,0 +1,9 @@
+/lean/.lake/
+*.olean
+*.olean.server
+*.olean.private
+*.ilean
+*.ir
+*.ir.sig
+__pycache__/
+*.py[cod]

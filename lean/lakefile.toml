@@ -1,0 +1,6 @@
+name = "workbench"
+version = "0.1.0"
+defaultTargets = ["Workbench"]
+
+[[lean_lib]]
+name = "Workbench"

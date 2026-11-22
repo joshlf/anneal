@@ -1,0 +1,1666 @@
+{
+  "schema": "anneal-workbench/1",
+  "toolchain": "leanprover/lean4:v4.34.1",
+  "badges": {
+    "pass1_portable": "Pure `prelude` + 51 locked `Init.*` modules, 26 allowed theory tactics, zero `._unsafe_rec`, and standard axioms only; directly copyable into `anneal/theory/` or `anneal/correspondence/`.",
+    "lab_meta": "Exploration, `#eval` counterexample/vacuity probing, and `Lean.Expr` / kernel replay profiling modules importing `Init`, `Std`, or `Lean`.",
+    "host_script": "Standalone Python 3.10+ stdlib CLI diagnostics and certificate generators."
+  },
+  "modules": [
+    {
+      "module": "Workbench.Lab.Counterexample",
+      "path": "lean/Workbench/Lab/Counterexample.lean",
+      "badge": "lab_meta",
+      "summary": "Exploration-only (`lab_meta`) utilities for falsifying candidate lemmas and auditing proposed specifications *before* investing proof effort:",
+      "line_count": 137,
+      "imports": [],
+      "declaration_count": 11,
+      "declarations": [
+        {
+          "kind": "def",
+          "name": "mask64"
+        },
+        {
+          "kind": "def",
+          "name": "splitMix64Next"
+        },
+        {
+          "kind": "def",
+          "name": "boundaryNats"
+        },
+        {
+          "kind": "def",
+          "name": "sampleNats"
+        },
+        {
+          "kind": "def",
+          "name": "findCounterexample1"
+        },
+        {
+          "kind": "def",
+          "name": "findCounterexample2"
+        },
+        {
+          "kind": "def",
+          "name": "findCounterexample3"
+        },
+        {
+          "kind": "structure",
+          "name": "SpecHealthReport"
+        },
+        {
+          "kind": "def",
+          "name": "SpecHealthReport.isHealthy"
+        },
+        {
+          "kind": "def",
+          "name": "SpecHealthReport.warnings"
+        },
+        {
+          "kind": "def",
+          "name": "probeSpecHealth"
+        }
+      ]
+    },
+    {
+      "module": "Workbench.Lab.KernelBench",
+      "path": "lean/Workbench/Lab/KernelBench.lean",
+      "badge": "lab_meta",
+      "summary": "Exploration-only (`lab_meta`) profiling helpers for diagnosing `.olean` size explosions, loss of `Expr` subterm sharing, and slow kernel typechecking:",
+      "line_count": 109,
+      "imports": [
+        "Lean"
+      ],
+      "declaration_count": 7,
+      "declarations": [
+        {
+          "kind": "structure",
+          "name": "ExprStats"
+        },
+        {
+          "kind": "def",
+          "name": "treeNodeCap"
+        },
+        {
+          "kind": "def",
+          "name": "measureExpr"
+        },
+        {
+          "kind": "structure",
+          "name": "DeclProfile"
+        },
+        {
+          "kind": "def",
+          "name": "classifyConstantKind"
+        },
+        {
+          "kind": "def",
+          "name": "profileConstantInfo"
+        },
+        {
+          "kind": "def",
+          "name": "profileDecl"
+        }
+      ]
+    },
+    {
+      "module": "Workbench.Lab",
+      "path": "lean/Workbench/Lab.lean",
+      "badge": "lab_meta",
+      "summary": "",
+      "line_count": 10,
+      "imports": [
+        "Workbench.Lab.Counterexample",
+        "Workbench.Lab.KernelBench"
+      ],
+      "declaration_count": 0,
+      "declarations": []
+    },
+    {
+      "module": "Workbench.Pass1.BitTrieLrat",
+      "path": "lean/Workbench/Pass1/BitTrieLrat.lean",
+      "badge": "pass1_portable",
+      "summary": "Pass-1-portable (`prelude` + locked `Init.*` only, `[propext]` only, zero `._unsafe_rec`, zero `bv_decide`) propositional UNSAT certificate checker:",
+      "line_count": 809,
+      "imports": [
+        "Init.Core",
+        "Init.NotationExtra",
+        "Init.Data.Nat.Basic",
+        "Init.Data.Nat.Div.Basic",
+        "Init.Data.Nat.Bitwise.Basic",
+        "Init.Data.List.Basic",
+        "Init.SimpLemmas"
+      ],
+      "declaration_count": 74,
+      "declarations": [
+        {
+          "kind": "def",
+          "name": "strictNat"
+        },
+        {
+          "kind": "theorem",
+          "name": "strictNat_eq"
+        },
+        {
+          "kind": "def",
+          "name": "listFoldl"
+        },
+        {
+          "kind": "theorem",
+          "name": "listFoldl_cons"
+        },
+        {
+          "kind": "def",
+          "name": "boolNot"
+        },
+        {
+          "kind": "def",
+          "name": "boolOr"
+        },
+        {
+          "kind": "def",
+          "name": "boolAnd"
+        },
+        {
+          "kind": "def",
+          "name": "boolBeq"
+        },
+        {
+          "kind": "theorem",
+          "name": "boolAnd_eq_true"
+        },
+        {
+          "kind": "theorem",
+          "name": "boolOr_eq_false"
+        },
+        {
+          "kind": "theorem",
+          "name": "boolBeq_false_not"
+        },
+        {
+          "kind": "theorem",
+          "name": "boolBeq_true_eq"
+        },
+        {
+          "kind": "theorem",
+          "name": "eq_of_nat_beq"
+        },
+        {
+          "kind": "theorem",
+          "name": "mod2_eq_one_of_beq_zero_false"
+        },
+        {
+          "kind": "theorem",
+          "name": "div2_mod2_inj"
+        },
+        {
+          "kind": "inductive",
+          "name": "Trie"
+        },
+        {
+          "kind": "def",
+          "name": "strictTrie"
+        },
+        {
+          "kind": "theorem",
+          "name": "strictTrie_eq"
+        },
+        {
+          "kind": "def",
+          "name": "Trie.get"
+        },
+        {
+          "kind": "theorem",
+          "name": "Trie.get_succ"
+        },
+        {
+          "kind": "def",
+          "name": "Trie.set"
+        },
+        {
+          "kind": "def",
+          "name": "trieVal"
+        },
+        {
+          "kind": "def",
+          "name": "trieEv"
+        },
+        {
+          "kind": "def",
+          "name": "trieOd"
+        },
+        {
+          "kind": "theorem",
+          "name": "Trie.set_succ_parts"
+        },
+        {
+          "kind": "def",
+          "name": "Trie.erase"
+        },
+        {
+          "kind": "theorem",
+          "name": "Trie.erase_succ"
+        },
+        {
+          "kind": "theorem",
+          "name": "Trie.get_leaf"
+        },
+        {
+          "kind": "theorem",
+          "name": "Trie.get_set_inv"
+        },
+        {
+          "kind": "theorem",
+          "name": "Trie.get_erase_inv"
+        },
+        {
+          "kind": "abbrev",
+          "name": "Valuation"
+        },
+        {
+          "kind": "abbrev",
+          "name": "Clause"
+        },
+        {
+          "kind": "def",
+          "name": "mkLit"
+        },
+        {
+          "kind": "def",
+          "name": "litVar"
+        },
+        {
+          "kind": "def",
+          "name": "litPos"
+        },
+        {
+          "kind": "def",
+          "name": "evalLit"
+        },
+        {
+          "kind": "def",
+          "name": "evalClause"
+        },
+        {
+          "kind": "theorem",
+          "name": "evalClause_cons"
+        },
+        {
+          "kind": "def",
+          "name": "evalCnf"
+        },
+        {
+          "kind": "theorem",
+          "name": "evalCnf_cons"
+        },
+        {
+          "kind": "def",
+          "name": "UnsatCnf"
+        },
+        {
+          "kind": "inductive",
+          "name": "ClauseRupState"
+        },
+        {
+          "kind": "def",
+          "name": "stepLitRUP"
+        },
+        {
+          "kind": "def",
+          "name": "evalClauseRUP"
+        },
+        {
+          "kind": "theorem",
+          "name": "evalClauseRUP_cons"
+        },
+        {
+          "kind": "inductive",
+          "name": "HintPropState"
+        },
+        {
+          "kind": "def",
+          "name": "stepRupHint"
+        },
+        {
+          "kind": "def",
+          "name": "initRupAssign"
+        },
+        {
+          "kind": "theorem",
+          "name": "initRupAssign_nil"
+        },
+        {
+          "kind": "theorem",
+          "name": "initRupAssign_cons"
+        },
+        {
+          "kind": "def",
+          "name": "propagateHints"
+        },
+        {
+          "kind": "def",
+          "name": "checkRupStep"
+        },
+        {
+          "kind": "inductive",
+          "name": "RupStep"
+        },
+        {
+          "kind": "inductive",
+          "name": "RupVerdict"
+        },
+        {
+          "kind": "def",
+          "name": "loadCnfTrie"
+        },
+        {
+          "kind": "def",
+          "name": "eraseIdsTrie"
+        },
+        {
+          "kind": "inductive",
+          "name": "ProofLoopState"
+        },
+        {
+          "kind": "def",
+          "name": "isEmptyClause"
+        },
+        {
+          "kind": "def",
+          "name": "stepRupProof"
+        },
+        {
+          "kind": "def",
+          "name": "checkRupProof"
+        },
+        {
+          "kind": "def",
+          "name": "AssignConsistent"
+        },
+        {
+          "kind": "def",
+          "name": "DbEntailed"
+        },
+        {
+          "kind": "theorem",
+          "name": "initRupAssign_consistent"
+        },
+        {
+          "kind": "theorem",
+          "name": "evalClauseRUP_sound"
+        },
+        {
+          "kind": "theorem",
+          "name": "propagateHints_no_conflict"
+        },
+        {
+          "kind": "theorem",
+          "name": "checkRupStep_sound"
+        },
+        {
+          "kind": "theorem",
+          "name": "loadCnfTrie_aux"
+        },
+        {
+          "kind": "theorem",
+          "name": "eraseIdsTrie_entailed"
+        },
+        {
+          "kind": "theorem",
+          "name": "proofLoop_preserves_nonempty"
+        },
+        {
+          "kind": "theorem",
+          "name": "checkRupProof_sound"
+        },
+        {
+          "kind": "def",
+          "name": "sampleUnsatCnf"
+        },
+        {
+          "kind": "def",
+          "name": "sampleUnsatSteps"
+        },
+        {
+          "kind": "theorem",
+          "name": "sampleUnsat_verified"
+        },
+        {
+          "kind": "theorem",
+          "name": "sampleForgedHint_rejected"
+        }
+      ]
+    },
+    {
+      "module": "Workbench.Pass1.Firewall",
+      "path": "lean/Workbench/Pass1/Firewall.lean",
+      "badge": "pass1_portable",
+      "summary": "Pass-1-portable (`prelude` + `Init.Core`, zero axioms, zero `._unsafe_rec`) barriers that stop Lean's kernel `whnf` and tactic `rw` / `simp` traversals from penetrating huge symbolic weakest-precondition or MIR state ASTs. Two complementary mechanisms are provided:",
+      "line_count": 94,
+      "imports": [
+        "Init.Core"
+      ],
+      "declaration_count": 11,
+      "declarations": [
+        {
+          "kind": "structure",
+          "name": "Firewall"
+        },
+        {
+          "kind": "theorem",
+          "name": "wrap"
+        },
+        {
+          "kind": "theorem",
+          "name": "unwrap"
+        },
+        {
+          "kind": "theorem",
+          "name": "map"
+        },
+        {
+          "kind": "theorem",
+          "name": "map2"
+        },
+        {
+          "kind": "theorem",
+          "name": "trans_tag"
+        },
+        {
+          "kind": "structure",
+          "name": "IndexedCut"
+        },
+        {
+          "kind": "theorem",
+          "name": "seal_cut"
+        },
+        {
+          "kind": "theorem",
+          "name": "open_cut"
+        },
+        {
+          "kind": "theorem",
+          "name": "step_cut"
+        },
+        {
+          "kind": "theorem",
+          "name": "finish_cut"
+        }
+      ]
+    },
+    {
+      "module": "Workbench.Pass1.InitLemmas",
+      "path": "lean/Workbench/Pass1/InitLemmas.lean",
+      "badge": "pass1_portable",
+      "summary": "Pass-1-portable (`prelude` + locked `Init.*` only, zero `._unsafe_rec`, allowed theory tactics only) lemma pack consolidating the six highest-frequency helper clusters otherwise duplicated across `anneal/theory/` and `anneal/correspondence/`:",
+      "line_count": 369,
+      "imports": [
+        "Init.Core",
+        "Init.NotationExtra",
+        "Init.SimpLemmas",
+        "Init.Data.Nat.Basic",
+        "Init.Data.Nat.Div.Basic",
+        "Init.Data.Nat.Bitwise.Basic",
+        "Init.Data.Int.Basic",
+        "Init.Data.List.Basic"
+      ],
+      "declaration_count": 52,
+      "declarations": [
+        {
+          "kind": "theorem",
+          "name": "bool_and_left"
+        },
+        {
+          "kind": "theorem",
+          "name": "bool_and_right"
+        },
+        {
+          "kind": "theorem",
+          "name": "bool_and_iff"
+        },
+        {
+          "kind": "theorem",
+          "name": "bool_or_eq_false"
+        },
+        {
+          "kind": "theorem",
+          "name": "bool_not_true_eq_false"
+        },
+        {
+          "kind": "theorem",
+          "name": "bool_not_false_eq_true"
+        },
+        {
+          "kind": "theorem",
+          "name": "ite_true_of"
+        },
+        {
+          "kind": "theorem",
+          "name": "ite_false_of"
+        },
+        {
+          "kind": "theorem",
+          "name": "dite_true_of"
+        },
+        {
+          "kind": "theorem",
+          "name": "dite_false_of"
+        },
+        {
+          "kind": "theorem",
+          "name": "beq_refl_of_iff"
+        },
+        {
+          "kind": "theorem",
+          "name": "eq_of_beq_of_iff"
+        },
+        {
+          "kind": "theorem",
+          "name": "beq_iff_of_refl_and_eq"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_beq_refl"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_eq_of_beq"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_beq_iff"
+        },
+        {
+          "kind": "def",
+          "name": "natListBeq"
+        },
+        {
+          "kind": "theorem",
+          "name": "natListBeq_cons_cons"
+        },
+        {
+          "kind": "theorem",
+          "name": "natListBeq_refl"
+        },
+        {
+          "kind": "theorem",
+          "name": "eq_of_natListBeq"
+        },
+        {
+          "kind": "theorem",
+          "name": "natListBeq_iff"
+        },
+        {
+          "kind": "theorem",
+          "name": "add_four_rearrange"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_pow_zero"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_pow_succ"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_pow_add"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_two_pow_pos"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_div_add_mod"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_mod_eq_of_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "div2_mod2_inj"
+        },
+        {
+          "kind": "def",
+          "name": "intPos"
+        },
+        {
+          "kind": "def",
+          "name": "intNeg"
+        },
+        {
+          "kind": "def",
+          "name": "IntBalance"
+        },
+        {
+          "kind": "theorem",
+          "name": "intBalance_self"
+        },
+        {
+          "kind": "theorem",
+          "name": "intBalance_ofNat"
+        },
+        {
+          "kind": "theorem",
+          "name": "intBalance_subNatNat"
+        },
+        {
+          "kind": "def",
+          "name": "listNth"
+        },
+        {
+          "kind": "theorem",
+          "name": "listNth_zero"
+        },
+        {
+          "kind": "theorem",
+          "name": "listNth_succ"
+        },
+        {
+          "kind": "theorem",
+          "name": "listNth_map"
+        },
+        {
+          "kind": "def",
+          "name": "listSet"
+        },
+        {
+          "kind": "theorem",
+          "name": "listSet_length"
+        },
+        {
+          "kind": "theorem",
+          "name": "listNth_listSet_same"
+        },
+        {
+          "kind": "theorem",
+          "name": "listNth_listSet_other"
+        },
+        {
+          "kind": "def",
+          "name": "listTake"
+        },
+        {
+          "kind": "def",
+          "name": "listDrop"
+        },
+        {
+          "kind": "theorem",
+          "name": "listTake_append_listDrop"
+        },
+        {
+          "kind": "def",
+          "name": "replaceSlice"
+        },
+        {
+          "kind": "theorem",
+          "name": "listTake_length_of_le"
+        },
+        {
+          "kind": "theorem",
+          "name": "listDrop_nil"
+        },
+        {
+          "kind": "theorem",
+          "name": "listDrop_succ_cons"
+        },
+        {
+          "kind": "theorem",
+          "name": "listDrop_length"
+        },
+        {
+          "kind": "theorem",
+          "name": "replaceSlice_length"
+        }
+      ]
+    },
+    {
+      "module": "Workbench.Pass1.LinearArith",
+      "path": "lean/Workbench/Pass1/LinearArith.lean",
+      "badge": "pass1_portable",
+      "summary": "Pass-1-portable (`prelude` + locked `Init.*` only, `[propext]` only, zero `._unsafe_rec`, zero `omega`) reflective linear-inequality solver replacing banned `omega` in `anneal/theory/` and `anneal/correspondence/`:",
+      "line_count": 1649,
+      "imports": [
+        "Init.Core",
+        "Init.NotationExtra",
+        "Init.SimpLemmas",
+        "Init.Data.Nat.Basic",
+        "Init.Data.Nat.Div.Basic",
+        "Init.Data.Nat.Bitwise.Basic",
+        "Init.Data.Int.Basic",
+        "Init.Data.List.Basic"
+      ],
+      "declaration_count": 125,
+      "declarations": [
+        {
+          "kind": "def",
+          "name": "intPos"
+        },
+        {
+          "kind": "def",
+          "name": "intNeg"
+        },
+        {
+          "kind": "def",
+          "name": "IntBalance"
+        },
+        {
+          "kind": "theorem",
+          "name": "add_four_rearrange"
+        },
+        {
+          "kind": "theorem",
+          "name": "add_three_mid"
+        },
+        {
+          "kind": "theorem",
+          "name": "intBalance_iff_of_add_eq"
+        },
+        {
+          "kind": "theorem",
+          "name": "intBalance_eq_of_eq"
+        },
+        {
+          "kind": "theorem",
+          "name": "intBalance_self"
+        },
+        {
+          "kind": "theorem",
+          "name": "intBalance_ofNat"
+        },
+        {
+          "kind": "theorem",
+          "name": "intBalance_negOfNat"
+        },
+        {
+          "kind": "theorem",
+          "name": "intBalance_subNatNat"
+        },
+        {
+          "kind": "theorem",
+          "name": "intBalance_neg"
+        },
+        {
+          "kind": "theorem",
+          "name": "intBalance_add"
+        },
+        {
+          "kind": "theorem",
+          "name": "intBalance_sub"
+        },
+        {
+          "kind": "theorem",
+          "name": "intBalance_mul_nat"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_mul_negSucc_left"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_mul_negSucc_right"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_mul_balance_cancel"
+        },
+        {
+          "kind": "theorem",
+          "name": "intBalance_mul_nat_var"
+        },
+        {
+          "kind": "theorem",
+          "name": "intBalance_mul"
+        },
+        {
+          "kind": "theorem",
+          "name": "intBalance_le"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_le_of_not_succ_le"
+        },
+        {
+          "kind": "def",
+          "name": "magCap128"
+        },
+        {
+          "kind": "structure",
+          "name": "SInt"
+        },
+        {
+          "kind": "def",
+          "name": "SInt.zero"
+        },
+        {
+          "kind": "def",
+          "name": "SInt.one"
+        },
+        {
+          "kind": "def",
+          "name": "SInt.negOne"
+        },
+        {
+          "kind": "def",
+          "name": "SInt.toInt"
+        },
+        {
+          "kind": "def",
+          "name": "SInt.posPart"
+        },
+        {
+          "kind": "def",
+          "name": "SInt.negPart"
+        },
+        {
+          "kind": "theorem",
+          "name": "sint_intBalance"
+        },
+        {
+          "kind": "def",
+          "name": "SInt.ofPN"
+        },
+        {
+          "kind": "theorem",
+          "name": "sint_ofPN_balance"
+        },
+        {
+          "kind": "def",
+          "name": "SInt.negate"
+        },
+        {
+          "kind": "theorem",
+          "name": "sint_negate_balance"
+        },
+        {
+          "kind": "def",
+          "name": "SInt.add"
+        },
+        {
+          "kind": "theorem",
+          "name": "sint_add_balance"
+        },
+        {
+          "kind": "theorem",
+          "name": "sint_add_toInt"
+        },
+        {
+          "kind": "def",
+          "name": "SInt.sub"
+        },
+        {
+          "kind": "def",
+          "name": "SInt.scaleNat"
+        },
+        {
+          "kind": "theorem",
+          "name": "sint_scaleNat_toInt"
+        },
+        {
+          "kind": "def",
+          "name": "boolXor"
+        },
+        {
+          "kind": "def",
+          "name": "SInt.mul"
+        },
+        {
+          "kind": "theorem",
+          "name": "sint_mul_toInt"
+        },
+        {
+          "kind": "def",
+          "name": "SInt.isZero"
+        },
+        {
+          "kind": "def",
+          "name": "SInt.isStrictlyNeg"
+        },
+        {
+          "kind": "def",
+          "name": "SInt.withinCap"
+        },
+        {
+          "kind": "def",
+          "name": "SInt.divExact"
+        },
+        {
+          "kind": "def",
+          "name": "SInt.fdiv"
+        },
+        {
+          "kind": "theorem",
+          "name": "sint_divExact_scale"
+        },
+        {
+          "kind": "theorem",
+          "name": "sint_divExact_toInt"
+        },
+        {
+          "kind": "theorem",
+          "name": "chvatal_gomory_floor_sound"
+        },
+        {
+          "kind": "def",
+          "name": "listGet"
+        },
+        {
+          "kind": "def",
+          "name": "envLookupInt"
+        },
+        {
+          "kind": "def",
+          "name": "envLookupNat"
+        },
+        {
+          "kind": "inductive",
+          "name": "IntLinExpr"
+        },
+        {
+          "kind": "def",
+          "name": "IntLinExpr.eval"
+        },
+        {
+          "kind": "structure",
+          "name": "IntCutIneq"
+        },
+        {
+          "kind": "def",
+          "name": "IntCutIneq.holds"
+        },
+        {
+          "kind": "def",
+          "name": "HypsImp"
+        },
+        {
+          "kind": "structure",
+          "name": "IntCutGoal"
+        },
+        {
+          "kind": "def",
+          "name": "IntCutGoal.denote"
+        },
+        {
+          "kind": "inductive",
+          "name": "NatLinExpr"
+        },
+        {
+          "kind": "def",
+          "name": "NatLinExpr.eval"
+        },
+        {
+          "kind": "def",
+          "name": "NatLinExpr.toIntExpr"
+        },
+        {
+          "kind": "theorem",
+          "name": "natLinExpr_toInt_eval"
+        },
+        {
+          "kind": "structure",
+          "name": "NatCutIneq"
+        },
+        {
+          "kind": "def",
+          "name": "NatCutIneq.holds"
+        },
+        {
+          "kind": "def",
+          "name": "NatCutIneq.toIntIneq"
+        },
+        {
+          "kind": "structure",
+          "name": "NatCutGoal"
+        },
+        {
+          "kind": "def",
+          "name": "NatCutGoal.denote"
+        },
+        {
+          "kind": "structure",
+          "name": "SparseIneq"
+        },
+        {
+          "kind": "def",
+          "name": "evalTerms"
+        },
+        {
+          "kind": "def",
+          "name": "SparseIneq.holds"
+        },
+        {
+          "kind": "def",
+          "name": "addTermsAux"
+        },
+        {
+          "kind": "def",
+          "name": "addTerms"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_add_comm"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_add_assoc"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_zero_add"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_add_zero"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_mul_add"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_add_mul"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_mul_assoc"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_zero_mul"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_neg_toInt_zero"
+        },
+        {
+          "kind": "theorem",
+          "name": "evalTerms_addAux"
+        },
+        {
+          "kind": "theorem",
+          "name": "evalTerms_add"
+        },
+        {
+          "kind": "def",
+          "name": "scaleTermsNat"
+        },
+        {
+          "kind": "def",
+          "name": "scaleTermsSInt"
+        },
+        {
+          "kind": "theorem",
+          "name": "evalTerms_scaleNat"
+        },
+        {
+          "kind": "theorem",
+          "name": "evalTerms_scaleSInt"
+        },
+        {
+          "kind": "def",
+          "name": "normIntLinExpr"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_one_mul"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_negOne_mul"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_sub_eq_add_neg"
+        },
+        {
+          "kind": "theorem",
+          "name": "normIntLinExpr_sound"
+        },
+        {
+          "kind": "def",
+          "name": "ineqToSparse"
+        },
+        {
+          "kind": "theorem",
+          "name": "ineqToSparse_sound"
+        },
+        {
+          "kind": "inductive",
+          "name": "CutStep"
+        },
+        {
+          "kind": "def",
+          "name": "allDivisible"
+        },
+        {
+          "kind": "def",
+          "name": "divTerms"
+        },
+        {
+          "kind": "theorem",
+          "name": "evalTerms_divTerms"
+        },
+        {
+          "kind": "def",
+          "name": "stepCut"
+        },
+        {
+          "kind": "def",
+          "name": "AllHolds"
+        },
+        {
+          "kind": "theorem",
+          "name": "allHolds_listGet"
+        },
+        {
+          "kind": "theorem",
+          "name": "mem_of_mem_append"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_add_le_add"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_mul_nat_le_mul_nat"
+        },
+        {
+          "kind": "theorem",
+          "name": "stepCut_sound"
+        },
+        {
+          "kind": "def",
+          "name": "runCutStepsAux"
+        },
+        {
+          "kind": "def",
+          "name": "listLast"
+        },
+        {
+          "kind": "theorem",
+          "name": "listLast"
+        },
+        {
+          "kind": "theorem",
+          "name": "runCutStepsAux_sound"
+        },
+        {
+          "kind": "def",
+          "name": "checkCutRefute"
+        },
+        {
+          "kind": "theorem",
+          "name": "checkCutRefute_sound"
+        },
+        {
+          "kind": "def",
+          "name": "checkIntCutGoal"
+        },
+        {
+          "kind": "theorem",
+          "name": "hypsImp_allHolds_int"
+        },
+        {
+          "kind": "theorem",
+          "name": "checkIntCutGoal_sound"
+        },
+        {
+          "kind": "def",
+          "name": "checkNatCutGoal"
+        },
+        {
+          "kind": "theorem",
+          "name": "hypsImp_nat_to_int"
+        },
+        {
+          "kind": "theorem",
+          "name": "hypsImp_concl_mono"
+        },
+        {
+          "kind": "theorem",
+          "name": "checkNatCutGoal_sound"
+        },
+        {
+          "kind": "def",
+          "name": "parityStrideGoal"
+        },
+        {
+          "kind": "def",
+          "name": "parityStrideCert"
+        },
+        {
+          "kind": "theorem",
+          "name": "parity_stride_lt"
+        }
+      ]
+    },
+    {
+      "module": "Workbench.Pass1.PTree",
+      "path": "lean/Workbench/Pass1/PTree.lean",
+      "badge": "pass1_portable",
+      "summary": "Pass-1-portable (`prelude` + locked `Init.*` only, zero `._unsafe_rec`, allowed theory tactics only) Appel-Leroy canonical positive radix trie `PTree α`:",
+      "line_count": 694,
+      "imports": [
+        "Init.Core",
+        "Init.NotationExtra",
+        "Init.SimpLemmas",
+        "Init.Data.Nat.Basic",
+        "Init.Data.Nat.Bitwise.Basic",
+        "Init.Data.List.Basic"
+      ],
+      "declaration_count": 58,
+      "declarations": [
+        {
+          "kind": "theorem",
+          "name": "bool_and_left"
+        },
+        {
+          "kind": "theorem",
+          "name": "bool_and_right"
+        },
+        {
+          "kind": "inductive",
+          "name": "Pos"
+        },
+        {
+          "kind": "def",
+          "name": "Pos.beq"
+        },
+        {
+          "kind": "theorem",
+          "name": "posBeq_refl"
+        },
+        {
+          "kind": "theorem",
+          "name": "pos_eq_of_beq"
+        },
+        {
+          "kind": "def",
+          "name": "Pos.succ"
+        },
+        {
+          "kind": "def",
+          "name": "natToPos"
+        },
+        {
+          "kind": "def",
+          "name": "posToNat"
+        },
+        {
+          "kind": "theorem",
+          "name": "posToNat_succ"
+        },
+        {
+          "kind": "theorem",
+          "name": "posToNat_natToPos"
+        },
+        {
+          "kind": "theorem",
+          "name": "natToPos_inj"
+        },
+        {
+          "kind": "inductive",
+          "name": "RawTree"
+        },
+        {
+          "kind": "def",
+          "name": "RawTree.isLeaf"
+        },
+        {
+          "kind": "def",
+          "name": "RawTree.isCanon"
+        },
+        {
+          "kind": "theorem",
+          "name": "rawTree_isCanon_left"
+        },
+        {
+          "kind": "theorem",
+          "name": "rawTree_isCanon_right"
+        },
+        {
+          "kind": "def",
+          "name": "RawTree.make"
+        },
+        {
+          "kind": "theorem",
+          "name": "rawTree_make_isCanon"
+        },
+        {
+          "kind": "def",
+          "name": "RawTree.get"
+        },
+        {
+          "kind": "theorem",
+          "name": "rawTree_get_make"
+        },
+        {
+          "kind": "def",
+          "name": "RawTree.set"
+        },
+        {
+          "kind": "theorem",
+          "name": "rawTree_set_isCanon"
+        },
+        {
+          "kind": "theorem",
+          "name": "rawTree_get_set_same"
+        },
+        {
+          "kind": "theorem",
+          "name": "rawTree_get_set_other"
+        },
+        {
+          "kind": "def",
+          "name": "RawTree.remove"
+        },
+        {
+          "kind": "theorem",
+          "name": "rawTree_remove_isCanon"
+        },
+        {
+          "kind": "theorem",
+          "name": "rawTree_get_remove_same"
+        },
+        {
+          "kind": "theorem",
+          "name": "rawTree_get_remove_other"
+        },
+        {
+          "kind": "theorem",
+          "name": "rawTree_all_none_eq_leaf"
+        },
+        {
+          "kind": "theorem",
+          "name": "rawTree_eq_of_get"
+        },
+        {
+          "kind": "structure",
+          "name": "PTree"
+        },
+        {
+          "kind": "theorem",
+          "name": "ptree_mk_eq"
+        },
+        {
+          "kind": "def",
+          "name": "PTree.empty"
+        },
+        {
+          "kind": "def",
+          "name": "PTree.get"
+        },
+        {
+          "kind": "def",
+          "name": "PTree.set"
+        },
+        {
+          "kind": "def",
+          "name": "PTree.remove"
+        },
+        {
+          "kind": "def",
+          "name": "PTree.singleton"
+        },
+        {
+          "kind": "theorem",
+          "name": "ptree_eq_of_get"
+        },
+        {
+          "kind": "theorem",
+          "name": "ptree_get_empty"
+        },
+        {
+          "kind": "theorem",
+          "name": "ptree_get_set_same"
+        },
+        {
+          "kind": "theorem",
+          "name": "ptree_get_set_other"
+        },
+        {
+          "kind": "theorem",
+          "name": "ptree_get_remove_same"
+        },
+        {
+          "kind": "theorem",
+          "name": "ptree_get_remove_other"
+        },
+        {
+          "kind": "theorem",
+          "name": "ptree_set_set_comm"
+        },
+        {
+          "kind": "def",
+          "name": "PTree.DisjointProp"
+        },
+        {
+          "kind": "def",
+          "name": "RawTree.union"
+        },
+        {
+          "kind": "theorem",
+          "name": "rawTree_union_isCanon"
+        },
+        {
+          "kind": "def",
+          "name": "PTree.union"
+        },
+        {
+          "kind": "theorem",
+          "name": "rawTree_get_union"
+        },
+        {
+          "kind": "def",
+          "name": "RawTree.diffWithLoop"
+        },
+        {
+          "kind": "def",
+          "name": "RawTree.diffWith"
+        },
+        {
+          "kind": "theorem",
+          "name": "rawTree_diffWith_isCanon"
+        },
+        {
+          "kind": "def",
+          "name": "ptreeWrapDiff"
+        },
+        {
+          "kind": "theorem",
+          "name": "ptreeWrapDiff_some"
+        },
+        {
+          "kind": "def",
+          "name": "PTree.diffWith"
+        },
+        {
+          "kind": "theorem",
+          "name": "rawTree_diffWith_pointwise"
+        },
+        {
+          "kind": "theorem",
+          "name": "ptree_diffWith_sound"
+        }
+      ]
+    },
+    {
+      "module": "Workbench.Pass1.SpineForce",
+      "path": "lean/Workbench/Pass1/SpineForce.lean",
+      "badge": "pass1_portable",
+      "summary": "Pass-1-portable (`prelude` + locked `Init.*` only, zero `._unsafe_rec`, allowed theory tactics only) combinators solving three recurring Lean 4.34.1 kernel scaling and TCB-admission bottlenecks:",
+      "line_count": 173,
+      "imports": [
+        "Init.Core",
+        "Init.Data.Nat.Basic",
+        "Init.Data.List.Basic"
+      ],
+      "declaration_count": 20,
+      "declarations": [
+        {
+          "kind": "def",
+          "name": "withStrictNat"
+        },
+        {
+          "kind": "theorem",
+          "name": "withStrictNat_eq"
+        },
+        {
+          "kind": "def",
+          "name": "forceNat"
+        },
+        {
+          "kind": "theorem",
+          "name": "forceNat_eq"
+        },
+        {
+          "kind": "def",
+          "name": "forceOption"
+        },
+        {
+          "kind": "theorem",
+          "name": "forceOption_eq"
+        },
+        {
+          "kind": "def",
+          "name": "forceList"
+        },
+        {
+          "kind": "theorem",
+          "name": "forceList_eq"
+        },
+        {
+          "kind": "def",
+          "name": "natFold"
+        },
+        {
+          "kind": "theorem",
+          "name": "natFold_zero"
+        },
+        {
+          "kind": "theorem",
+          "name": "natFold_succ"
+        },
+        {
+          "kind": "def",
+          "name": "runPow2"
+        },
+        {
+          "kind": "theorem",
+          "name": "runPow2_zero"
+        },
+        {
+          "kind": "theorem",
+          "name": "runPow2_succ"
+        },
+        {
+          "kind": "theorem",
+          "name": "runPow2_preserves"
+        },
+        {
+          "kind": "def",
+          "name": "checkRange"
+        },
+        {
+          "kind": "theorem",
+          "name": "checkRange_zero"
+        },
+        {
+          "kind": "theorem",
+          "name": "checkRange_succ"
+        },
+        {
+          "kind": "theorem",
+          "name": "checkRange_true_imp"
+        },
+        {
+          "kind": "theorem",
+          "name": "checkRange_sound"
+        }
+      ]
+    },
+    {
+      "module": "Workbench.Pass1",
+      "path": "lean/Workbench/Pass1.lean",
+      "badge": "pass1_portable",
+      "summary": "",
+      "line_count": 15,
+      "imports": [
+        "Workbench.Pass1.InitLemmas",
+        "Workbench.Pass1.Firewall",
+        "Workbench.Pass1.SpineForce",
+        "Workbench.Pass1.PTree",
+        "Workbench.Pass1.LinearArith",
+        "Workbench.Pass1.BitTrieLrat"
+      ],
+      "declaration_count": 0,
+      "declarations": []
+    }
+  ],
+  "scripts": [
+    {
+      "name": "audit_lean_hygiene",
+      "path": "scripts/audit_lean_hygiene.py",
+      "badge": "host_script",
+      "summary": "Compiled Lean 4 Environment hygiene auditor (`._unsafe_rec`, `isPartial`, axioms).",
+      "cli_flags": [
+        "--allow-partial",
+        "--json",
+        "--lake-dir",
+        "--module",
+        "--namespace",
+        "--no-wrapper"
+      ]
+    },
+    {
+      "name": "farkas_cert_gen",
+      "path": "scripts/farkas_cert_gen.py",
+      "badge": "host_script",
+      "summary": "Synthesizes verified Pass-1 `Workbench.Pass1.LinearArith` certificates (replacing `omega`).",
+      "cli_flags": [
+        "--domain",
+        "--goal",
+        "--hyp",
+        "--json",
+        "--name"
+      ]
+    },
+    {
+      "name": "olean_profiler",
+      "path": "scripts/olean_profiler.py",
+      "badge": "host_script",
+      "summary": "Profiles `.olean` artifact sizes and per-declaration `Lean.Expr` DAG/tree bloat.",
+      "cli_flags": [
+        "--json",
+        "--module",
+        "--no-wrapper",
+        "--prefix",
+        "--top"
+      ]
+    },
+    {
+      "name": "proof_health_scan",
+      "path": "scripts/proof_health_scan.py",
+      "badge": "host_script",
+      "summary": "Fast static Pass-1 TrustedBoundary & proof-health scanner for Lean 4 files.",
+      "cli_flags": [
+        "--allow-import-prefix",
+        "--json",
+        "--pass1",
+        "--strict-warnings"
+      ]
+    },
+    {
+      "name": "split_lean_module",
+      "path": "scripts/split_lean_module.py",
+      "badge": "host_script",
+      "summary": "Analyzes a large Lean 4 file's declaration DAG and proposes safe submodule splits.",
+      "cli_flags": [
+        "--json",
+        "--target-lines"
+      ]
+    }
+  ]
+}
