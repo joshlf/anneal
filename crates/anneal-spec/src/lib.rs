@@ -11,6 +11,8 @@
 
 #![no_std]
 
+pub mod spec_check;
+
 pub use anodized::{self, __, arithmetic, logic, result, types};
 pub use anneal_spec_macros::{
     embed_spec, external_spec, invariant, model, spec, unsafe_impl, unsafe_trait,
