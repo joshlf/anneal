@@ -1016,8 +1016,26 @@ impl<T: SampleInput + ReturnMutants> ReturnMutants for Option<T> {
     fn visit_mutants<F: FnMut(Self)>(&self, rng: &mut SplitMix64, mut emit: F) {
         match self {
             Some(v) => {
-                emit(None);
-                v.visit_mutants(rng, |m| emit(Some(m)));
+                let mut emitted_none = false;
+                if !T::IS_SUBSINGLETON {
+                    v.visit_mutants(rng, |m| {
+                        emit(Some(m));
+                        if !emitted_none {
+                            emitted_none = true;
+                            // Emit `None` right after the first payload mutant so
+                            // small budgets (`>= 2`) test both axes, a budget of 1
+                            // tests the `Some` payload instead of letting a
+                            // discriminant-only spec (`r.is_some()`) fake a 100%
+                            // pointwise kill rate, and mutant chains advance
+                            // monotonically within `Some(...)` instead of resetting
+                            // through `None`.
+                            emit(None);
+                        }
+                    });
+                }
+                if !emitted_none {
+                    emit(None);
+                }
             }
             None => {
                 emit(Some(T::sample_at(0, rng)));
@@ -2274,6 +2292,9 @@ pub fn replay_stateful_trial_input<S: SampleInput, A: SampleInput>(
     Some(<(S, A) as SampleInput>::sample_at(trial_idx, &mut rng))
 }
 
+/// Fixed stack capacity for zero-allocation Stage D3 mutant deduplication.
+const STAGE_D3_DEDUP_CAP: usize = 16;
+
 /// Shared fallible core powering [`check_contract`],
 /// [`check_contract_with_mutants`], and [`check_contract_fallible`].
 fn check_contract_core<I, R, Pre, Body, Post>(
@@ -2366,12 +2387,23 @@ where
                     record_mutant(&mut stats, post(&input, ret_bad));
                 }
             } else {
+                let mut seen: [Option<R>; STAGE_D3_DEDUP_CAP] = array::from_fn(|_| None);
+                let mut seen_len = 0usize;
                 ret_ok.visit_mutants(&mut mutant_rng, |ret_bad| {
-                    if tested_this_hit >= config.max_mutants_per_hit || ret_bad == ret_ok {
+                    if tested_this_hit >= config.max_mutants_per_hit
+                        || ret_bad == ret_ok
+                        || seen[..seen_len]
+                            .iter()
+                            .any(|prev| prev.as_ref() == Some(&ret_bad))
+                    {
                         return;
                     }
                     tested_this_hit += 1;
                     record_mutant(&mut stats, post(&input, &ret_bad));
+                    if seen_len < STAGE_D3_DEDUP_CAP {
+                        seen[seen_len] = Some(ret_bad);
+                        seen_len += 1;
+                    }
                 });
             }
         }
@@ -3161,14 +3193,25 @@ where
         // Return-value mutant perturbation axis.
         if !R::IS_SUBSINGLETON && config.max_mutants_per_hit > 0 {
             let mut tested_this_hit = 0usize;
+            let mut seen_ret: [Option<R>; STAGE_D3_DEDUP_CAP] = array::from_fn(|_| None);
+            let mut seen_ret_len = 0usize;
             ret_ok.visit_mutants(&mut ret_mutant_rng, |ret_bad| {
-                if tested_this_hit >= config.max_mutants_per_hit || ret_bad == ret_ok {
+                if tested_this_hit >= config.max_mutants_per_hit
+                    || ret_bad == ret_ok
+                    || seen_ret[..seen_ret_len]
+                        .iter()
+                        .any(|prev| prev.as_ref() == Some(&ret_bad))
+                {
                     return;
                 }
                 tested_this_hit += 1;
                 return_mutants_tested += 1;
                 if record_mutant(&mut stats, post(&old_s, &args, &new_s, &ret_bad)) {
                     return_mutants_killed += 1;
+                }
+                if seen_ret_len < STAGE_D3_DEDUP_CAP {
+                    seen_ret[seen_ret_len] = Some(ret_bad);
+                    seen_ret_len += 1;
                 }
             });
         }
@@ -3186,10 +3229,15 @@ where
                 }
             }
 
+            let mut seen_s: [Option<S>; STAGE_D3_DEDUP_CAP] = array::from_fn(|_| None);
+            let mut seen_s_len = 0usize;
             new_s.visit_mutants(&mut state_mutant_rng, |bad_s| {
                 if tested_this_hit >= config.max_mutants_per_hit
                     || bad_s == new_s
                     || (tested_pre_revert && bad_s == old_s)
+                    || seen_s[..seen_s_len]
+                        .iter()
+                        .any(|prev| prev.as_ref() == Some(&bad_s))
                 {
                     return;
                 }
@@ -3197,6 +3245,10 @@ where
                 state_mutants_tested += 1;
                 if record_mutant(&mut stats, post(&old_s, &args, &bad_s, &ret_ok)) {
                     state_mutants_killed += 1;
+                }
+                if seen_s_len < STAGE_D3_DEDUP_CAP {
+                    seen_s[seen_s_len] = Some(bad_s);
+                    seen_s_len += 1;
                 }
             });
         }

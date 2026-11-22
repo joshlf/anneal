@@ -3950,3 +3950,416 @@ mod cross_language_parity_suite {
         assert_eq!(VacuityClass::from_canonical_name("deadprecondition"), None);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Episode 2 Round 1 hardening: Option payload-first ordering, half-weak
+// composite coverage, Stage D3 visit_mutants deduplication, narrow boundary
+// preconditions, and late stateful fallible trap propagation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn option_payload_first_mutant_order_exposes_half_weak_specs_and_fixes_chains() {
+    let mut rng = SplitMix64::new(0xBEEF);
+
+    // For a non-subsingleton payload, `Some(v)` emits its first payload mutant before
+    // `None`, followed by remaining payload mutants.
+    let mut some_u32_muts = Vec::new();
+    Some(10u32).visit_mutants(&mut rng, |m| some_u32_muts.push(m));
+    assert!(some_u32_muts.len() >= 3);
+    assert_eq!(some_u32_muts[0], Some(11));
+    assert_eq!(some_u32_muts[1], None);
+    assert!(some_u32_muts[2].is_some());
+    assert_ne!(some_u32_muts[2], Some(10));
+
+    // For a subsingleton payload (`Option<()>`), `Some(())` still emits `[None]`.
+    let mut some_unit_muts = Vec::new();
+    Some(()).visit_mutants(&mut rng, |m| some_unit_muts.push(m));
+    assert_eq!(some_unit_muts, vec![None]);
+
+    let budget1 = SpecCheckConfig::default().with_max_mutants_per_hit(1);
+    let budget2 = SpecCheckConfig::default().with_max_mutants_per_hit(2);
+
+    // Half-weak `Option<u32>` spec checking ONLY the `is_some()` discriminant while
+    // ignoring the `Some(sum)` payload: under `max_mutants_per_hit == 1`, `None` hits
+    // still kill `Some(0)` (so `PostconditionDichotomy` holds), yet every `Some` hit
+    // tests `Some(sum + 1)` and survives, honestly exposing `hits_without_kill() > 0`.
+    let half_weak_checked_add = check_contract(
+        budget1,
+        |&(a, b): &(u32, u32)| __anodized_fn_requires_spec_u32_checked_add(a, b),
+        |&(a, b)| a.checked_add(b),
+        |&(a, b), r: &Option<u32>| r.is_some() == (a <= u32::MAX - b),
+    );
+    assert!(half_weak_checked_add.is_strong());
+    let half_stats = half_weak_checked_add.stats();
+    assert!(!half_stats.is_pointwise_strong());
+    assert!(half_stats.hits_without_kill() > 0);
+    assert!(half_stats.mutants_killed < half_stats.mutants_tested);
+
+    // By contrast, the full `u32::checked_add` contract kills 100% of hits even at
+    // `max_mutants_per_hit == 1`.
+    let full_checked_add = assert_contract_strong(
+        budget1,
+        |&(a, b): &(u32, u32)| __anodized_fn_requires_spec_u32_checked_add(a, b),
+        |&(a, b)| a.checked_add(b),
+        |&(a, b), &ret| __anodized_fn_ensures_spec_u32_checked_add(a, b, ret),
+    );
+    assert!(full_checked_add.is_pointwise_strong());
+    assert_eq!(full_checked_add.hits_without_kill(), 0);
+
+    // When `body` always returns `Some(a + b)`, a discriminant-only `r.is_some()` spec
+    // survives every `Some(v + 1)` mutant at budget 1 (`SurvivedAllMutants`) and only
+    // kills half the mutants at budget 2, whereas a payload-constraining spec kills
+    // every hit even at budget 1.
+    let some_only_disc_b1 = check_contract(
+        budget1,
+        |&(a, b): &(u32, u32)| a < 100 && b < 100,
+        |&(a, b)| Some(a + b),
+        |_, r: &Option<u32>| r.is_some(),
+    );
+    assert_eq!(
+        some_only_disc_b1.vacuity_class(),
+        Some(VacuityClass::SurvivedAllMutants)
+    );
+
+    let some_only_disc_b2 = assert_contract_strong(
+        budget2,
+        |&(a, b): &(u32, u32)| a < 100 && b < 100,
+        |&(a, b)| Some(a + b),
+        |_, r: &Option<u32>| r.is_some(),
+    );
+    assert!(some_only_disc_b2.mutants_killed < some_only_disc_b2.mutants_tested);
+
+    let some_only_payload_b1 = assert_contract_strong(
+        budget1,
+        |&(a, b): &(u32, u32)| a < 100 && b < 100,
+        |&(a, b)| Some(a + b),
+        |&(a, b), r: &Option<u32>| match *r {
+            Some(v) => v == a + b,
+            None => true,
+        },
+    );
+    assert!(some_only_payload_b1.is_pointwise_strong());
+
+    // `Option<u32>` mutant chains advance monotonically `Some(1000) -> Some(1001) -> ...`
+    // instead of resetting through `None -> Some(0)`, so `x < 10 || *r == Some(1005)`
+    // classifies cleanly as `SurvivedAllMutants` (not `UnboundReturnOutput`).
+    let opt_chain = check_contract(
+        SpecCheckConfig::default().with_probe_domain(ProbeDomain::Unconstrained),
+        |&x: &u32| x < 10,
+        |&x| Some(x + 1_000),
+        |&x, r: &Option<u32>| x < 10 || *r == Some(1_005),
+    );
+    assert_eq!(
+        opt_chain.vacuity_class(),
+        Some(VacuityClass::SurvivedAllMutants)
+    );
+}
+
+#[test]
+fn half_weak_tuple_and_result_specs_and_tight_budget_coverage() {
+    let budget1 = SpecCheckConfig::default().with_max_mutants_per_hit(1);
+    let budget2 = SpecCheckConfig::default().with_max_mutants_per_hit(2);
+
+    // Half-weak tuple spec constraining only `r.0`: at budget 2, both fields are
+    // perturbed on every hit so the surviving `r.1` mutant keeps the kill rate < 100%.
+    let half_tuple = assert_contract_strong(
+        budget2,
+        |_: &(u32, u32)| true,
+        |&p| p,
+        |&(a, _), &(ra, _): &(u32, u32)| ra == a,
+    );
+    assert!(half_tuple.mutants_killed < half_tuple.mutants_tested);
+
+    let full_tuple = assert_contract_strong(
+        budget2,
+        |_: &(u32, u32)| true,
+        |&p| p,
+        |&(a, b), &(ra, rb): &(u32, u32)| ra == a && rb == b,
+    );
+    assert_eq!(full_tuple.mutants_killed, full_tuple.mutants_tested);
+
+    // Half-weak `Result<u32, u8>` spec checking only `r.is_ok() == (divisor != 0)`:
+    // at budget 1 every `Ok` hit tests `Ok(q + 1)` and every `Err` hit tests `Err(code + 1)`,
+    // exposing that neither payload is constrained (`SurvivedAllMutants`). At budget 2,
+    // opposite-variant flips are tested so dichotomy passes with a 50% kill rate, while
+    // the full `checked_div_u32` contract kills 100%.
+    let half_res_b1 = check_contract(
+        budget1,
+        |&(dividend, divisor): &(u32, u32)| {
+            __anodized_fn_requires_checked_div_u32(dividend, divisor)
+        },
+        |&(dividend, divisor)| checked_div_u32(dividend, divisor),
+        |&(_, divisor), r: &Result<u32, u8>| r.is_ok() == (divisor != 0),
+    );
+    assert_eq!(
+        half_res_b1.vacuity_class(),
+        Some(VacuityClass::SurvivedAllMutants)
+    );
+
+    let half_res_b2 = assert_contract_strong(
+        budget2,
+        |&(dividend, divisor): &(u32, u32)| {
+            __anodized_fn_requires_checked_div_u32(dividend, divisor)
+        },
+        |&(dividend, divisor)| checked_div_u32(dividend, divisor),
+        |&(_, divisor), r: &Result<u32, u8>| r.is_ok() == (divisor != 0),
+    );
+    assert!(half_res_b2.mutants_killed < half_res_b2.mutants_tested);
+
+    let full_res_b2 = assert_contract_strong(
+        budget2,
+        |&(dividend, divisor): &(u32, u32)| {
+            __anodized_fn_requires_checked_div_u32(dividend, divisor)
+        },
+        |&(dividend, divisor)| checked_div_u32(dividend, divisor),
+        |&(dividend, divisor), &ret| __anodized_fn_ensures_checked_div_u32(dividend, divisor, ret),
+    );
+    assert_eq!(full_res_b2.mutants_killed, full_res_b2.mutants_tested);
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NoisyDupMutant(u32);
+
+impl SampleInput for NoisyDupMutant {
+    const BOUNDARY_COUNT: usize = <u32 as SampleInput>::BOUNDARY_COUNT;
+
+    fn sample_at(trial_idx: usize, rng: &mut SplitMix64) -> Self {
+        Self(u32::sample_at(trial_idx, rng))
+    }
+}
+
+impl ReturnMutants for NoisyDupMutant {
+    fn visit_mutants<F: FnMut(Self)>(&self, _rng: &mut SplitMix64, mut emit: F) {
+        let dup = self.0.wrapping_add(1);
+        let distinct = self.0.wrapping_add(2);
+        emit(Self(self.0));
+        emit(Self(dup));
+        emit(Self(dup));
+        emit(Self(dup));
+        emit(Self(distinct));
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SingleDupMutant(u32);
+
+impl SampleInput for SingleDupMutant {
+    const BOUNDARY_COUNT: usize = <u32 as SampleInput>::BOUNDARY_COUNT;
+
+    fn sample_at(trial_idx: usize, rng: &mut SplitMix64) -> Self {
+        Self(u32::sample_at(trial_idx, rng))
+    }
+}
+
+impl ReturnMutants for SingleDupMutant {
+    fn visit_mutants<F: FnMut(Self)>(&self, _rng: &mut SplitMix64, mut emit: F) {
+        let only = self.0.wrapping_add(1);
+        emit(Self(only));
+        emit(Self(only));
+        emit(Self(only));
+        emit(Self(only));
+    }
+}
+
+#[test]
+fn visit_mutants_duplicates_are_deduplicated_in_stateless_and_stateful_checks() {
+    // A custom `ReturnMutants` emitting one wrong answer 4x counts it once per hit,
+    // never inflating `mutants_tested` or `mutants_killed`.
+    let single_dup = assert_contract_strong(
+        SpecCheckConfig::default().with_max_trials(16),
+        |_x: &u32| true,
+        |&x| SingleDupMutant(x),
+        |&x, r: &SingleDupMutant| r.0 == x,
+    );
+    assert_eq!(single_dup.mutants_tested, single_dup.precondition_hits);
+    assert_eq!(single_dup.mutants_killed, single_dup.precondition_hits);
+
+    // Duplicates must not consume the `max_mutants_per_hit` budget ahead of a distinct
+    // candidate: with budget 2, `self + 2` is reached behind three copies of `self + 1`
+    // and kills `r.0 == x || r.0 == x.wrapping_add(1)`.
+    let noisy_stateless = assert_contract_strong(
+        SpecCheckConfig::default()
+            .with_max_trials(16)
+            .with_max_mutants_per_hit(2),
+        |_x: &u32| true,
+        |&x| NoisyDupMutant(x),
+        |&x, r: &NoisyDupMutant| r.0 == x || r.0 == x.wrapping_add(1),
+    );
+    assert!(noisy_stateless.is_pointwise_strong());
+    assert_eq!(
+        noisy_stateless.mutants_tested,
+        2 * noisy_stateless.precondition_hits
+    );
+
+    // The same deduplication applies to both return and state axes in stateful checks:
+    // allowing `new == old` (so pre-state revert survives) and `new == old + 11` (so the
+    // duplicated mutant survives) forces budget 3 to reach `new == old + 12` behind the
+    // repeated copies of `old + 11`.
+    let noisy_stateful = assert_stateful_contract_strong(
+        SpecCheckConfig::default()
+            .with_max_trials(16)
+            .with_max_mutants_per_hit(3),
+        |_s: &NoisyDupMutant, _a: &()| true,
+        |s: &mut NoisyDupMutant, _a: &()| {
+            let old = s.clone();
+            s.0 = s.0.wrapping_add(10);
+            old
+        },
+        |old: &NoisyDupMutant, _a: &(), new: &NoisyDupMutant, ret: &NoisyDupMutant| {
+            (ret.0 == old.0 || ret.0 == old.0.wrapping_add(1))
+                && (new.0 == old.0
+                    || new.0 == old.0.wrapping_add(10)
+                    || new.0 == old.0.wrapping_add(11))
+        },
+    );
+    assert!(noisy_stateful.is_pointwise_strong());
+
+    // Built-in `[1, 0, 0, 0]` array permutations (`swap(0, 3)`, `rotate_left(1)`,
+    // `reverse()`) all produce `[0, 0, 0, 1]`; Stage D3 must hand each mutant to `post`
+    // at most once per hit.
+    let mut seen_on_hit0: Vec<[u32; 4]> = Vec::new();
+    let arr_dedup = assert_contract_strong(
+        SpecCheckConfig::default().with_max_trials(1),
+        |&x: &u32| x == 0,
+        |_| [1u32, 0, 0, 0],
+        |_, r: &[u32; 4]| {
+            if *r == [1, 0, 0, 0] {
+                return true;
+            }
+            assert!(
+                !seen_on_hit0.contains(r),
+                "duplicate mutant {r:?} evaluated twice in one hit"
+            );
+            seen_on_hit0.push(*r);
+            false
+        },
+    );
+    assert_eq!(arr_dedup.precondition_hits, 1);
+    assert_eq!(arr_dedup.mutants_tested, seen_on_hit0.len());
+    assert!(seen_on_hit0.contains(&[0, 0, 0, 1]));
+}
+
+#[test]
+fn narrow_preconditions_and_stateful_fallible_trap_propagation() {
+    // Narrow cross-boundary preconditions are hit deterministically inside the boundary
+    // corpus.
+    assert!(first_boundary_hit::<(u32, u32), _>(|&(a, b)| a == u32::MAX && b == 1).is_some());
+    assert_eq!(
+        first_boundary_hit::<(u32, u32, u32), _>(|&(_, b, c)| b == c),
+        Some(0)
+    );
+    assert!(
+        first_boundary_hit::<(u32, u32, u32), _>(|&(val, lo, hi)| lo == hi && val > hi).is_some()
+    );
+
+    let max_plus_one = assert_contract_strong(
+        SpecCheckConfig::default().with_max_trials(<(u32, u32) as SampleInput>::BOUNDARY_COUNT),
+        |&(a, b): &(u32, u32)| a == u32::MAX && b == 1,
+        |&(a, b)| a.checked_add(b),
+        |_, r: &Option<u32>| r.is_none(),
+    );
+    assert_eq!(max_plus_one.precondition_hits, 1);
+
+    let triple_eq_bc = assert_contract_strong(
+        SpecCheckConfig::default()
+            .with_max_trials(<(u32, u32, u32) as SampleInput>::BOUNDARY_COUNT),
+        |&(_, b, c): &(u32, u32, u32)| b == c,
+        |&(a, b, c)| a.wrapping_add(b.wrapping_sub(c)),
+        |&(a, _, _), &r: &u32| r == a,
+    );
+    assert!(triple_eq_bc.precondition_hits >= 4);
+    assert!(triple_eq_bc.is_pointwise_strong());
+
+    // Late `BodyPanicked` in `check_stateful_contract_fallible`: after earlier trials
+    // succeed and kill mutants, a trapping body that partially mutates state reports
+    // `BodyPanicked` and never passes the partially mutated state to `post`.
+    let mut saw_corrupted_state = false;
+    let stateful_body_trap = check_stateful_contract_fallible(
+        SpecCheckConfig::default(),
+        |old: &u32, &()| Ok(*old < 100),
+        |state: &mut u32, &()| {
+            if *state == 2 {
+                *state = 999;
+                return Err(());
+            }
+            *state += 1;
+            Ok(*state)
+        },
+        |old: &u32, &(), new: &u32, ret: &u32| {
+            if *old == 2 && *new == 999 {
+                saw_corrupted_state = true;
+            }
+            Ok(*new == *old + 1 && *ret == *new)
+        },
+    );
+    assert!(!saw_corrupted_state);
+    assert_eq!(
+        stateful_body_trap.vacuity_class(),
+        Some(VacuityClass::SpecViolation)
+    );
+    assert_eq!(
+        stateful_body_trap.failure().map(|f| f.detail),
+        Some(FailureDetail::Violation(ViolationKind::ExecutionTrapped {
+            trial_idx: 2,
+            trap: TrapKind::BodyPanicked,
+        }))
+    );
+    assert_eq!(stateful_body_trap.stats().precondition_hits, 3);
+    assert!(stateful_body_trap.stats().mutants_killed > 0);
+
+    // Late live `PostconditionPanicked` in `check_stateful_contract_fallible` after
+    // earlier trials already passed and killed mutants.
+    let stateful_post_trap = check_stateful_contract_fallible(
+        SpecCheckConfig::default(),
+        |old: &u32, &()| Ok(*old < 100),
+        |state: &mut u32, &()| {
+            *state += 1;
+            Ok(*state)
+        },
+        |old: &u32, &(), new: &u32, ret: &u32| {
+            if *old == 2 && *new == 3 && *ret == 3 {
+                Err(())
+            } else {
+                Ok(*new == *old + 1 && *ret == *new)
+            }
+        },
+    );
+    assert_eq!(
+        stateful_post_trap.vacuity_class(),
+        Some(VacuityClass::SpecViolation)
+    );
+    assert_eq!(
+        stateful_post_trap.failure().map(|f| f.detail),
+        Some(FailureDetail::Violation(ViolationKind::ExecutionTrapped {
+            trial_idx: 2,
+            trap: TrapKind::PostconditionPanicked,
+        }))
+    );
+    assert_eq!(stateful_post_trap.stats().precondition_hits, 3);
+    assert!(stateful_post_trap.stats().mutants_killed > 0);
+
+    // Trapping mutant evaluations on BOTH return and state axes count as killed and
+    // trapped without triggering `SpecViolation`.
+    let stateful_mutant_traps = check_stateful_contract_fallible(
+        SpecCheckConfig::default()
+            .with_max_trials(8)
+            .with_max_mutants_per_hit(4),
+        |old: &u32, &()| Ok(*old < 10),
+        |state: &mut u32, &()| {
+            *state += 1;
+            Ok(*state)
+        },
+        |old: &u32, &(), new: &u32, ret: &u32| {
+            if *new == *old + 1 && *ret == *old + 1 {
+                Ok(true)
+            } else {
+                Err(())
+            }
+        },
+    );
+    assert!(stateful_mutant_traps.is_strong());
+    let trap_stats = stateful_mutant_traps.stats();
+    assert!(trap_stats.mutants_tested > 0);
+    assert_eq!(trap_stats.mutants_killed, trap_stats.mutants_tested);
+    assert_eq!(trap_stats.mutants_trapped, trap_stats.mutants_killed);
+}

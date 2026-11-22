@@ -2846,6 +2846,311 @@ def assertVacuityRow (idx : Nat) : Lean.Meta.MetaM Unit := do
 
 end CrossLanguageParitySuite
 
+/-! ### 3.22 Indirect Vacuity Disguises: Branch Projections, Quantifier Wrappers & Boilerplate Bounds -/
+
+/-- Projection over `ite` discarding `ret` in both branches (`UnboundReturnOutput`). -/
+def iteTupleDiscardedPost (x ret : Nat) : Prop :=
+  (if x < 10 then (True, ret) else (True, ret)).1
+
+/-- Projection over `ite` with input-dependent non-trivial branches (`UnboundReturnOutput`). -/
+def iteProdDiscardedPost (x ret : Nat) : Prop :=
+  (if x < 10 then (x, ret) else (x + 1, ret)).1 = x
+
+/-- Projection over `dite` discarding `ret` (`UnboundReturnOutput`). -/
+def diteProdDiscardedPost (x ret : Nat) : Prop :=
+  (if _ : x < 10 then (x, ret) else (x, ret)).1 = x
+
+/-- Projection over `match` discarding `ret` (`UnboundReturnOutput`). -/
+def matchBoolProdDiscardedPost (b : Bool) (x ret : Nat) : Prop :=
+  (match b with
+  | true => (x, ret)
+  | false => (x + 1, ret)).1 = x
+
+/-- Projection over `ite` with contradictory `False` branches (`SpecViolation`). -/
+def iteTupleContraPost (x ret : Nat) : Prop :=
+  (if x < 10 then (False, ret) else (False, ret)).1
+
+/-- Negative control: projection over `match` genuinely keeping `ret` in field 1. -/
+def matchBoolProdGenuinePost (b : Bool) (x ret : Nat) : Prop :=
+  (match b with
+  | true => (ret, x)
+  | false => (ret, x + 1)).1 = x
+
+/-- Existential wrapper `∃ k, k = ret` (trivially true via `⟨ret, rfl⟩`). -/
+def existsEqRetPost (_x ret : Nat) : Prop :=
+  ∃ k : Nat, k = ret
+
+/-- Symmetric existential wrapper `∃ k, ret = k`. -/
+def existsRetEqPost (_x ret : Nat) : Prop :=
+  ∃ k : Nat, ret = k
+
+/-- Branching existential wrapper: trivially true in every branch, yet neither
+    `simp_all`, `omega`, nor `grind` synthesizes the branching Skolem witness. -/
+def existsBranchEqRetPost (x ret : Nat) : Prop :=
+  ∃ k : Nat, if x < 10 then k = ret else k = ret + 1
+
+/-- Existential wrapper over `Unit` paired with a discarded `let _ := ret`. -/
+def existsUnitDiscardedPost (_x ret : Nat) : Prop :=
+  ∃ u : Unit, u = () ∧ (let _ := ret; True)
+
+/-- One-point existential masking an input-only predicate (`UnboundReturnOutput`). -/
+def existsOnePointInputOnlyPost (x ret : Nat) : Prop :=
+  ∃ k : Nat, k = ret ∧ x < 10
+
+/-- Universal tautology `∀ k, k = ret → k = ret` (implication inside a dependent `∀`). -/
+def forallEqSelfImpPost (_x ret : Nat) : Prop :=
+  ∀ k : Nat, k = ret → k = ret
+
+/-- Universal symmetric tautology `∀ k, k = ret → ret = k`. -/
+def forallEqSymmImpPost (_x ret : Nat) : Prop :=
+  ∀ k : Nat, k = ret → ret = k
+
+/-- User helper predicates hidden beneath `∃` and dependent `∀`. -/
+def helperEqPred (a b : Nat) : Prop := a = b
+def helperTruePred (_a _b : Nat) : Prop := True
+
+def existsHiddenHelperPost (_x ret : Nat) : Prop :=
+  ∃ k : Nat, helperEqPred k ret
+
+def forallHiddenHelperPost (_x ret : Nat) : Prop :=
+  ∀ k : Nat, helperTruePred k ret
+
+/-- `BEq` reflexivity over lawful `Nat` (`(ret == ret) = true`, caught by prover). -/
+def beqSelfNatPost (_x ret : Nat) : Prop :=
+  (ret == ret) = true
+
+/-- `decide (ret ≠ ret) = false` (syntactically tautological in all models). -/
+def decideNeFalsePost (_x ret : Nat) : Prop :=
+  decide (ret ≠ ret) = false
+
+/-- Negative control: one-point existential genuinely constraining `ret = x`. -/
+def existsOnePointGenuinePost (x ret : Nat) : Prop :=
+  ∃ k : Nat, k = ret ∧ k = x
+
+/-- Negative control: universal implication genuinely bounding `ret` by `x`. -/
+def forallGenuineBoundPost (x ret : Nat) : Prop :=
+  ∀ k : Nat, k < ret → k < x
+
+/-- External-spec `extraPost` merely restating `retMatchesCalleeReturnTy` for `u32`. -/
+def restatesU32BoundsExtraPost (_args : List Value) (retVal : Value) : Prop :=
+  match retVal with
+  | .scalar sv => sv.bits < scalarModulus 4
+  | _ => False
+
+def restatesU32BoundsExtContract : MirCallContract :=
+  externalSpecCallContract "test::u32_bounds_only" rangeClampSidecar
+    (fun _ => True) restatesU32BoundsExtraPost
+
+/-- External-spec `extraPost` merely restating `retMatchesCalleeReturnTy` for `bool`. -/
+def restatesBoolBoundsExtraPost (_args : List Value) (retVal : Value) : Prop :=
+  match retVal with
+  | .scalar sv => sv.bits = 0 ∨ sv.bits = 1
+  | _ => False
+
+def restatesBoolBoundsExtContract : MirCallContract :=
+  externalSpecCallContract "test::bool_bounds_only" sliceIsEmptySidecar
+    (fun _ => True) restatesBoolBoundsExtraPost
+
+/-- External-spec boilerplate wrapped in a one-point existential `∃ k, k = retVal ∧ ...`. -/
+def existsWrappedBoilerplateContract : MirCallContract := {
+  pre := fun _ => True
+  post := fun req ans =>
+    match ans with
+    | .returned retVal memAfter =>
+      ∃ k : Value, k = retVal ∧
+        callFramePreserved req.memory memAfter ∧
+        retMatchesCalleeReturnTy rangeClampSidecar k
+    | .panicked _ => False
+    | .aborted => True
+}
+
+theorem iteTupleDiscardedPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) iteTupleDiscardedPost :=
+  not_postconditionDichotomy_of_trivial (fun x _ _ => by
+    by_cases hx : x < 10 <;> simp [iteTupleDiscardedPost, hx])
+
+theorem iteProdDiscardedPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) iteProdDiscardedPost :=
+  not_postconditionDichotomy_of_forwardOutputInsensitive (fun x _ _ _ h => by
+    by_cases hx : x < 10 <;> simp_all [iteProdDiscardedPost])
+
+theorem diteProdDiscardedPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) diteProdDiscardedPost :=
+  not_postconditionDichotomy_of_trivial (fun x _ _ => by
+    by_cases hx : x < 10 <;> simp [diteProdDiscardedPost, hx])
+
+theorem matchBoolProdDiscardedPost_not_dichotomy :
+    ¬ PostconditionDichotomy
+        (fun _ : Bool × Nat => True)
+        (fun p ret => matchBoolProdDiscardedPost p.1 p.2 ret) :=
+  not_postconditionDichotomy_of_forwardOutputInsensitive (fun p _ _ _ h => by
+    rcases p with ⟨b, x⟩
+    cases b <;> exact h)
+
+theorem iteTupleContraPost_not_realizable :
+    ¬ ContractRealizable (fun _ : Nat => True) iteTupleContraPost := by
+  rintro ⟨x, _, _, h⟩
+  by_cases hx : x < 10 <;> simp [iteTupleContraPost, hx] at h
+
+theorem matchBoolProdGenuinePost_dichotomy :
+    PostconditionDichotomy
+        (fun _ : Bool × Nat => True)
+        (fun p ret => matchBoolProdGenuinePost p.1 p.2 ret) := by
+  refine ⟨(true, 0), trivial, ⟨0, rfl⟩, ⟨1, by simp [matchBoolProdGenuinePost]⟩⟩
+
+theorem existsEqRetPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) existsEqRetPost :=
+  not_postconditionDichotomy_of_trivial (fun _ ret _ => ⟨ret, rfl⟩)
+
+theorem existsRetEqPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) existsRetEqPost :=
+  not_postconditionDichotomy_of_trivial (fun _ ret _ => ⟨ret, rfl⟩)
+
+theorem existsBranchEqRetPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) existsBranchEqRetPost :=
+  not_postconditionDichotomy_of_trivial (fun x ret _ => by
+    dsimp [existsBranchEqRetPost]
+    by_cases hx : x < 10
+    · exact ⟨ret, by simp [hx]⟩
+    · exact ⟨ret + 1, by simp [hx]⟩)
+
+theorem existsUnitDiscardedPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) existsUnitDiscardedPost :=
+  not_postconditionDichotomy_of_trivial (fun _ _ _ => ⟨(), rfl, trivial⟩)
+
+theorem existsOnePointInputOnlyPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) existsOnePointInputOnlyPost :=
+  not_postconditionDichotomy_of_forwardOutputInsensitive (fun _ _ _ y₂ ⟨_, _, hx⟩ =>
+    ⟨y₂, rfl, hx⟩)
+
+theorem forallEqSelfImpPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) forallEqSelfImpPost :=
+  not_postconditionDichotomy_of_trivial (fun _ _ _ _ h => h)
+
+theorem forallEqSymmImpPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) forallEqSymmImpPost :=
+  not_postconditionDichotomy_of_trivial (fun _ _ _ _ h => h.symm)
+
+theorem existsHiddenHelperPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) existsHiddenHelperPost :=
+  not_postconditionDichotomy_of_trivial (fun _ ret _ => ⟨ret, rfl⟩)
+
+theorem forallHiddenHelperPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) forallHiddenHelperPost :=
+  not_postconditionDichotomy_of_trivial (fun _ _ _ _ => trivial)
+
+theorem beqSelfNatPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) beqSelfNatPost :=
+  not_postconditionDichotomy_of_trivial (fun _ _ _ => by simp [beqSelfNatPost])
+
+theorem decideNeFalsePost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) decideNeFalsePost :=
+  not_postconditionDichotomy_of_trivial (fun _ _ _ => by simp [decideNeFalsePost])
+
+theorem existsOnePointGenuinePost_dichotomy :
+    PostconditionDichotomy (fun _ : Nat => True) existsOnePointGenuinePost := by
+  refine ⟨0, trivial, ⟨0, 0, rfl, rfl⟩, ⟨1, ?_⟩⟩
+  rintro ⟨_, hk1, hk0⟩
+  exact Nat.succ_ne_zero 0 (hk1.symm.trans hk0)
+
+theorem forallGenuineBoundPost_dichotomy :
+    PostconditionDichotomy (fun _ : Nat => True) forallGenuineBoundPost := by
+  refine ⟨0, trivial, ⟨0, by simp [forallGenuineBoundPost]⟩, ⟨1, ?_⟩⟩
+  intro h
+  have hZero : 0 < 0 := h 0 (by decide)
+  omega
+
+theorem restatesU32BoundsExtContract_not_ensuresDichotomy :
+    ¬ ExternalSpecEnsuresDichotomy "test::u32_bounds_only" rangeClampSidecar
+        (fun _ => True) restatesU32BoundsExtraPost := by
+  intro h
+  rcases (externalSpecEnsuresDichotomy_iff_moduloObservation
+    "test::u32_bounds_only" rangeClampSidecar
+    (fun _ => True) restatesU32BoundsExtraPost).mp h with
+    ⟨_, _, _, v_bad, _, _, _, hTyBad, _, hNotBad⟩
+  have hTy : ∃ bits : Nat, bits < scalarModulus 4 ∧
+      v_bad = .scalar { bits := bits, sizeBytes := 4 } := hTyBad
+  rcases hTy with ⟨bits, hLt, hEq⟩
+  subst hEq
+  exact hNotBad hLt
+
+theorem restatesBoolBoundsExtContract_not_ensuresDichotomy :
+    ¬ ExternalSpecEnsuresDichotomy "test::bool_bounds_only" sliceIsEmptySidecar
+        (fun _ => True) restatesBoolBoundsExtraPost := by
+  intro h
+  rcases (externalSpecEnsuresDichotomy_iff_moduloObservation
+    "test::bool_bounds_only" sliceIsEmptySidecar
+    (fun _ => True) restatesBoolBoundsExtraPost).mp h with
+    ⟨_, _, _, v_bad, _, _, _, hTyBad, _, hNotBad⟩
+  have hTy : ∃ b : Nat, b < 2 ∧
+      v_bad = .scalar { bits := b, sizeBytes := 1 } := hTyBad
+  rcases hTy with ⟨b, hLt, hEq⟩
+  subst hEq
+  exact hNotBad (by dsimp [restatesBoolBoundsExtraPost]; omega)
+
+theorem existsWrappedBoilerplateContract_not_dichotomyModuloObs :
+    ¬ DichotomyModuloObservation
+        (externalSpecBoilerplateObs rangeClampSidecar)
+        existsWrappedBoilerplateContract.pre
+        (fun req q => existsWrappedBoilerplateContract.post req (.returned q.1 q.2)) := by
+  apply not_dichotomyModuloObservation_of_fibre_forwardInsensitive
+  intro req q₁ q₂ _ hObsEq hOk
+  dsimp [existsWrappedBoilerplateContract] at hOk ⊢
+  rcases hOk with ⟨k, hk, hFrame₁, hTyK⟩
+  subst hk
+  have hFrameEq : callFramePreserved req.memory q₁.2 = callFramePreserved req.memory q₂.2 :=
+    congrArg Prod.fst hObsEq
+  have hTyEq : retMatchesCalleeReturnTy rangeClampSidecar q₁.1 =
+      retMatchesCalleeReturnTy rangeClampSidecar q₂.1 :=
+    congrArg Prod.snd hObsEq
+  exact ⟨q₂.1, rfl, hFrameEq ▸ hFrame₁, hTyEq ▸ hTyK⟩
+
+-- Branch projections (`ite`/`dite`/`match`) drop discarded outputs syntactically even
+-- with zero prover budget.
+#eval assertEnsuresVacuous (Lean.mkConst ``iteTupleDiscardedPost) none
+  (some .unboundReturnOutput) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``iteProdDiscardedPost) none
+  (some .unboundReturnOutput) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``diteProdDiscardedPost) none
+  (some .unboundReturnOutput) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``matchBoolProdDiscardedPost) none
+  (some .unboundReturnOutput) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``iteTupleContraPost) none
+  (some .specViolation) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresBindsOutput (Lean.mkConst ``matchBoolProdGenuinePost)
+
+-- Existential wrappers, dependent universal tautologies, hidden helpers, and `decide`/`BEq`.
+#eval assertEnsuresVacuous (Lean.mkConst ``existsEqRetPost) none
+  (some .trivialPostcondition) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``existsRetEqPost) none
+  (some .trivialPostcondition) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``existsBranchEqRetPost) none
+  (some .trivialPostcondition) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``existsUnitDiscardedPost) none
+  (some .unboundReturnOutput) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``existsOnePointInputOnlyPost) none
+  (some .unboundReturnOutput) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``forallEqSelfImpPost) none
+  (some .trivialPostcondition) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``forallEqSymmImpPost) none
+  (some .trivialPostcondition) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``existsHiddenHelperPost) none
+  (some .trivialPostcondition) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``forallHiddenHelperPost) none
+  (some .trivialPostcondition) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``beqSelfNatPost) none (some .trivialPostcondition)
+#eval assertEnsuresVacuous (Lean.mkConst ``decideNeFalsePost) none
+  (some .trivialPostcondition) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresBindsOutput (Lean.mkConst ``existsOnePointGenuinePost)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``forallGenuineBoundPost)
+
+-- External specs restating `retMatchesCalleeReturnTy` bit-width invariants or wrapping
+-- boilerplate inside a one-point existential are caught as `UnboundReturnOutput`.
+#eval assertDeclEnsuresVacuous ``restatesU32BoundsExtContract (some .unboundReturnOutput)
+#eval assertDeclEnsuresVacuous ``restatesBoolBoundsExtContract (some .unboundReturnOutput)
+#eval assertDeclEnsuresVacuous ``existsWrappedBoilerplateContract (some .unboundReturnOutput)
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+
 /-! ## 4. Mandatory Compile-Time Kernel Axiom Audit -/
 
 /-- Axioms a kernel-checked declaration of this development may depend on. -/

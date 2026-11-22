@@ -1685,10 +1685,119 @@ def zetaBetaReduce : Nat → Expr → Expr
       .proj s i (zetaBetaReduce fuel struct)
     | other => other
 
+/-- Push a non-dependent structure projection `rebuild` through `ite`, `dite`, `cond`,
+    or a `match`/`casesOn` matcher application (`(if c then (a, ret) else (b, ret)).1`
+    → `if c then (a, ret).1 else (b, ret).1`).
+
+    Whenever the pushed expression passes `isTypeCorrect` with the same non-dependent
+    field type as `origExpr`, `origExpr = pushed` is a universal theorem of Lean's
+    logic (by case split on the branch condition/discriminant and `rfl` on each arm),
+    so pushing preserves validity, unsatisfiability, output-insensitivity, and
+    boilerplate fibres identically. Dependent projections fail `isTypeCorrect` and
+    are left untouched. -/
+private def pushProjOverBranch?
+    (origExpr structExpr : Expr) (rebuild : Expr → Expr) : MetaM (Option Expr) := do
+  let structExpr := structExpr.consumeMData
+  if structExpr.isAppOfArity ``ite 5 then
+    let args := structExpr.getAppArgs
+    try
+      let fieldTy ← inferType origExpr
+      if fieldTy.hasLooseBVars then
+        return none
+      let u ← getLevel fieldTy
+      let pushed := mkAppN (mkConst ``ite [u])
+        #[fieldTy, args[1]!, args[2]!, rebuild args[3]!, rebuild args[4]!]
+      if ← isTypeCorrect pushed then
+        return some pushed
+      return none
+    catch _ =>
+      return none
+  else if structExpr.isAppOfArity ``dite 5 then
+    let args := structExpr.getAppArgs
+    match args[3]!.consumeMData, args[4]!.consumeMData with
+    | .lam tn tdom tbody tbi, .lam fn fdom fbody fbi =>
+      try
+        let fieldTy ← inferType origExpr
+        if fieldTy.hasLooseBVars then
+          return none
+        let u ← getLevel fieldTy
+        let tLam ← withLocalDecl tn tbi tdom fun fv => do
+          let body := rebuild (tbody.instantiate1 fv)
+          return .lam tn tdom (body.abstract #[fv]) tbi
+        let fLam ← withLocalDecl fn fbi fdom fun fv => do
+          let body := rebuild (fbody.instantiate1 fv)
+          return .lam fn fdom (body.abstract #[fv]) fbi
+        let pushed := mkAppN (mkConst ``dite [u])
+          #[fieldTy, args[1]!, args[2]!, tLam, fLam]
+        if ← isTypeCorrect pushed then
+          return some pushed
+        return none
+      catch _ =>
+        return none
+    | _, _ => return none
+  else if structExpr.isAppOfArity ``cond 4 then
+    let args := structExpr.getAppArgs
+    try
+      let fieldTy ← inferType origExpr
+      if fieldTy.hasLooseBVars then
+        return none
+      let u ← getLevel fieldTy
+      let pushed := mkAppN (mkConst ``cond [u])
+        #[fieldTy, args[1]!, rebuild args[2]!, rebuild args[3]!]
+      if ← isTypeCorrect pushed then
+        return some pushed
+      return none
+    catch _ =>
+      return none
+  else
+    try
+      let some mApp ← matchMatcherApp? structExpr (alsoCasesOn := true) | return none
+      if !mApp.remaining.isEmpty then
+        return none
+      let fieldTy ← inferType origExpr
+      if fieldTy.hasLooseBVars then
+        return none
+      let u ← getLevel fieldTy
+      let newLevels : Array Level := match mApp.uElimPos? with
+        | some pos =>
+          if pos < mApp.matcherLevels.size then
+            (mApp.matcherLevels.extract 0 pos).push u ++
+              mApp.matcherLevels.extract (pos + 1) mApp.matcherLevels.size
+          else
+            mApp.matcherLevels
+        | none => mApp.matcherLevels
+      let newMotive? : Option Expr ←
+        lambdaBoundedTelescope mApp.motive mApp.discrs.size fun xs _ => do
+          if xs.size != mApp.discrs.size then
+            return none
+          return some (← mkLambdaFVars xs fieldTy)
+      let some newMotive := newMotive? | return none
+      let altParams := mApp.altNumParams
+      if altParams.size != mApp.alts.size then
+        return none
+      let mut newAlts : Array Expr := #[]
+      for i in [:mApp.alts.size] do
+        let nParams := altParams[i]!
+        let newAlt? : Option Expr ←
+          lambdaBoundedTelescope mApp.alts[i]! nParams fun xs body => do
+            if xs.size != nParams then
+              return none
+            return some (← mkLambdaFVars xs (rebuild body))
+        let some newAlt := newAlt? | return none
+        newAlts := newAlts.push newAlt
+      let pushed :=
+        { mApp with matcherLevels := newLevels, motive := newMotive, alts := newAlts }.toExpr
+      if ← isTypeCorrect pushed then
+        return some pushed
+      return none
+    catch _ =>
+      return none
+
 /-- Reduce structure projections (both raw `Expr.proj` and non-class projection
     function applications such as `Prod.snd (a, b)` or custom structure field
-    getters applied to a constructor) alongside `zetaBetaReduce`, opening binders
-    with `withLocalDecl` so `Meta.reduceProj?` never sees loose bound variables. -/
+    getters applied to a constructor, or distributed across `ite`/`dite`/`cond`/
+    `match` branches) alongside `zetaBetaReduce`, opening binders with
+    `withLocalDecl` so `Meta.reduceProj?` never sees loose bound variables. -/
 def zetaBetaProjReduce : Nat → Expr → MetaM Expr
   | 0, e => return zetaBetaReduce 64 e
   | fuel + 1, e => do
@@ -1699,7 +1808,10 @@ def zetaBetaProjReduce : Nat → Expr → MetaM Expr
       let e' := Expr.proj s i struct'
       match ← Meta.reduceProj? e' with
       | some r => zetaBetaProjReduce fuel r
-      | none => return e'
+      | none =>
+        match ← pushProjOverBranch? e' struct' (fun x => Expr.proj s i x) with
+        | some pushed => zetaBetaProjReduce fuel pushed
+        | none => return e'
     | .app f a =>
       let f' ← zetaBetaProjReduce fuel f
       let a' ← zetaBetaProjReduce fuel a
@@ -1711,15 +1823,21 @@ def zetaBetaProjReduce : Nat → Expr → MetaM Expr
           if let some projInfo := (← getEnv).getProjectionFnInfo? fnName then
             if !projInfo.fromClass then
               let args := e'.getAppArgs
-              if hStruct : projInfo.numParams < args.size then
-                let structVal := args[projInfo.numParams].consumeMData
+              if projInfo.numParams < args.size then
+                let structVal := args[projInfo.numParams]!.consumeMData
                 if structVal.getAppFn.isConstOf projInfo.ctorName then
                   let ctorArgs := structVal.getAppArgs
                   let fieldIdx := projInfo.numParams + projInfo.i
-                  if hField : fieldIdx < ctorArgs.size then
+                  if fieldIdx < ctorArgs.size then
                     let restArgs := args.extract (projInfo.numParams + 1) args.size
-                    let reduced := mkAppN ctorArgs[fieldIdx] restArgs
+                    let reduced := mkAppN ctorArgs[fieldIdx]! restArgs
                     return ← zetaBetaProjReduce fuel reduced
+                else
+                  let prefixArgs := args.extract 0 projInfo.numParams
+                  let restArgs := args.extract (projInfo.numParams + 1) args.size
+                  if let some pushed ← pushProjOverBranch? e' structVal (fun x =>
+                      mkAppN e'.getAppFn ((prefixArgs.push x) ++ restArgs)) then
+                    return ← zetaBetaProjReduce fuel pushed
         return e'
     | .lam n t b bi =>
       let t' ← zetaBetaProjReduce fuel t
@@ -1923,9 +2041,11 @@ private def hasComplementaryPair (props : List Expr) : Bool :=
   props.any (fun p => props.any (fun q => isNegationOf q p))
 
 /-- Fast syntactic contradiction recognizer for `Prop` expressions (`False`, `r ≠ r`,
-    `¬ True`, `¬ (r = r)`, `¬ (P ↔ P)`, `P ↔ ¬ P`, a conjunction with a contradictory
-    conjunct or with a complementary pair `P`, `¬ P` among its conjuncts, and a
-    disjunction of contradictions).
+    `true = false`, `decide (r ≠ r) = true`, `decide (r = r) = false`, `¬ True`,
+    `¬ (r = r)`, `¬ (P ↔ P)`, `P ↔ ¬ P`, a conjunction with a contradictory conjunct
+    or with a complementary pair `P`, `¬ P` among its conjuncts, a disjunction or
+    `ite`/`dite` whose branches are all contradictory, and an existential with a
+    contradictory body).
 
     Every recognized shape is unsatisfiable in all models, so the recognizer needs no
     prover and stays effective when the probe heartbeat budget is exhausted. Like
@@ -1937,6 +2057,33 @@ def detectSyntacticContradiction : Nat → Expr → Bool
     let e := e.consumeMData
     if e.isConstOf ``False then
       true
+    else if e.isAppOfArity ``Eq 3 then
+      let args := e.getAppArgs
+      let lhs := args[1]!.consumeMData
+      let rhs := args[2]!.consumeMData
+      if (lhs.isConstOf ``Bool.true && rhs.isConstOf ``Bool.false) ||
+         (lhs.isConstOf ``Bool.false && rhs.isConstOf ``Bool.true) then
+        true
+      else if rhs.isConstOf ``Bool.true && lhs.isAppOfArity ``Decidable.decide 2 then
+        detectSyntacticContradiction fuel lhs.appFn!.appArg!
+      else if lhs.isConstOf ``Bool.true && rhs.isAppOfArity ``Decidable.decide 2 then
+        detectSyntacticContradiction fuel rhs.appFn!.appArg!
+      else if rhs.isConstOf ``Bool.false && lhs.isAppOfArity ``Decidable.decide 2 then
+        let inner := lhs.appFn!.appArg!.consumeMData
+        inner.isConstOf ``True ||
+          (inner.isAppOfArity ``Eq 3 &&
+            inner.getAppArgs[1]!.consumeMData == inner.getAppArgs[2]!.consumeMData) ||
+          (inner.isAppOfArity ``Iff 2 &&
+            inner.appFn!.appArg!.consumeMData == inner.appArg!.consumeMData)
+      else if lhs.isConstOf ``Bool.false && rhs.isAppOfArity ``Decidable.decide 2 then
+        let inner := rhs.appFn!.appArg!.consumeMData
+        inner.isConstOf ``True ||
+          (inner.isAppOfArity ``Eq 3 &&
+            inner.getAppArgs[1]!.consumeMData == inner.getAppArgs[2]!.consumeMData) ||
+          (inner.isAppOfArity ``Iff 2 &&
+            inner.appFn!.appArg!.consumeMData == inner.appArg!.consumeMData)
+      else
+        false
     else if e.isAppOfArity ``Ne 3 then
       let args := e.getAppArgs
       args[1]!.consumeMData == args[2]!.consumeMData
@@ -1962,8 +2109,151 @@ def detectSyntacticContradiction : Nat → Expr → Bool
       let lhs := e.appFn!.appArg!
       let rhs := e.appArg!
       isNegationOf lhs rhs || isNegationOf rhs lhs
+    else if e.isAppOfArity ``ite 5 then
+      let args := e.getAppArgs
+      detectSyntacticContradiction fuel args[3]! &&
+        detectSyntacticContradiction fuel args[4]!
+    else if e.isAppOfArity ``dite 5 then
+      let args := e.getAppArgs
+      match args[3]!.consumeMData, args[4]!.consumeMData with
+      | .lam _ _ tBody _, .lam _ _ fBody _ =>
+        detectSyntacticContradiction fuel tBody &&
+          detectSyntacticContradiction fuel fBody
+      | _, _ => false
+    else if e.isAppOfArity ``Exists 2 then
+      match e.appArg!.consumeMData with
+      | .lam _ _ body _ => detectSyntacticContradiction fuel body
+      | _ => false
     else
       false
+
+/-- Collect candidate witnesses `t` (lowered to the scope enclosing `Exists`) from
+    top-level `(.bvar 0) = rhs` or `lhs = (.bvar 0)` equalities under propositional
+    connectives without crossing any inner binder. Because `Eq` requires both sides to
+    have the existential's domain type, every returned `t` witnesses inhabitation of
+    that domain type in all models. -/
+private def collectExistsEqWitnesses : Nat → Expr → List Expr
+  | 0, _ => []
+  | fuel + 1, e =>
+    let e := e.consumeMData
+    if e.isAppOfArity ``Eq 3 then
+      let args := e.getAppArgs
+      let lhs := args[1]!.consumeMData
+      let rhs := args[2]!.consumeMData
+      if lhs == .bvar 0 && !rhs.hasLooseBVar 0 then
+        [rhs.lowerLooseBVars 1 1]
+      else if rhs == .bvar 0 && !lhs.hasLooseBVar 0 then
+        [lhs.lowerLooseBVars 1 1]
+      else
+        []
+    else if e.isAppOfArity ``And 2 || e.isAppOfArity ``Or 2 || e.isAppOfArity ``Iff 2 then
+      collectExistsEqWitnesses fuel e.appFn!.appArg! ++
+        collectExistsEqWitnesses fuel e.appArg!
+    else
+      []
+
+/-- Core types unconditionally inhabited in Lean 4. -/
+private def isKnownInhabitedCoreType (dom : Expr) : Bool :=
+  let dom := dom.consumeMData
+  dom.isConstOf ``Nat || dom.isConstOf ``Bool || dom.isConstOf ``Unit ||
+  dom.isConstOf ``PUnit || dom.isConstOf ``Int || dom.isConstOf ``String
+
+/-- Drop the first conjunct from `cs` that is a one-point equality `(.bvar 0) = t` or
+    `t = (.bvar 0)` with `!t.hasLooseBVar 0`, returning `(lowered witness t, remaining)`. -/
+private def findOnePointWitness? : List Expr → Option (Expr × List Expr)
+  | [] => none
+  | c :: cs =>
+    let c := c.consumeMData
+    let hit? : Option Expr :=
+      if c.isAppOfArity ``Eq 3 then
+        let args := c.getAppArgs
+        let lhs := args[1]!.consumeMData
+        let rhs := args[2]!.consumeMData
+        if lhs == .bvar 0 && !rhs.hasLooseBVar 0 then
+          some (rhs.lowerLooseBVars 1 1)
+        else if rhs == .bvar 0 && !lhs.hasLooseBVar 0 then
+          some (lhs.lowerLooseBVars 1 1)
+        else
+          none
+      else
+        none
+    match hit? with
+    | some w => some (w, cs)
+    | none =>
+      match findOnePointWitness? cs with
+      | some (w, rest) => some (w, c :: rest)
+      | none => none
+
+/-- Re-conjoin a list of propositions into right-nested `And` (`True` if empty). -/
+private def mkAndList : List Expr → Expr
+  | [] => mkConst ``True
+  | [c] => c
+  | c :: cs => mkApp2 (mkConst ``And) c (mkAndList cs)
+
+/-- Fuel-bounded, propositionally equivalent one-point existential elimination:
+    rewrites `(∃ k : α, C₁ ∧ ... ∧ k = t ∧ ... ∧ Cₙ)` (with `k` not free in `t`) into
+    `(C₁ ∧ ... ∧ Cₙ)[k := t]`, and `(∃ k : α, k = t)` into `True`.
+
+    Every rewrite is an unconditional equivalence in Lean's logic
+    (`(∃ k, k = t ∧ P k) ↔ P t`), preserving validity, unsatisfiability,
+    output-insensitivity, and boilerplate fibres identically. -/
+private def eliminateOnePointExists : Nat → Expr → Expr
+  | 0, e => e
+  | fuel + 1, e =>
+    let e := e.consumeMData
+    if e.isAppOfArity ``Exists 2 then
+      let args := e.getAppArgs
+      match args[1]!.consumeMData with
+      | .lam n bdom body bi =>
+        let body' := eliminateOnePointExists fuel body
+        let conjuncts := flattenConjuncts 16 body'
+        match findOnePointWitness? conjuncts with
+        | some (w, rest) =>
+          let inst := (mkAndList rest).instantiate1 w
+          eliminateOnePointExists fuel inst
+        | none =>
+          mkApp2 e.getAppFn args[0]! (.lam n bdom body' bi)
+      | _ => e
+    else if e.isAppOfArity ``And 2 then
+      let lhs := eliminateOnePointExists fuel e.appFn!.appArg!
+      let rhs := eliminateOnePointExists fuel e.appArg!
+      if lhs.isConstOf ``True then rhs
+      else if rhs.isConstOf ``True then lhs
+      else mkApp2 (mkConst ``And) lhs rhs
+    else if e.isAppOfArity ``Or 2 then
+      let lhs := eliminateOnePointExists fuel e.appFn!.appArg!
+      let rhs := eliminateOnePointExists fuel e.appArg!
+      mkApp2 (mkConst ``Or) lhs rhs
+    else if e.isAppOfArity ``Iff 2 then
+      let lhs := eliminateOnePointExists fuel e.appFn!.appArg!
+      let rhs := eliminateOnePointExists fuel e.appArg!
+      mkApp2 (mkConst ``Iff) lhs rhs
+    else if e.isAppOfArity ``Not 1 then
+      mkApp (mkConst ``Not) (eliminateOnePointExists fuel e.appArg!)
+    else if e.isAppOfArity ``ite 5 then
+      let args := e.getAppArgs
+      let t' := eliminateOnePointExists fuel args[3]!
+      let f' := eliminateOnePointExists fuel args[4]!
+      mkAppN e.getAppFn #[args[0]!, args[1]!, args[2]!, t', f']
+    else if e.isAppOfArity ``dite 5 then
+      let args := e.getAppArgs
+      let t' := match args[3]!.consumeMData with
+        | .lam tn td tb tbi => .lam tn td (eliminateOnePointExists fuel tb) tbi
+        | other => other
+      let f' := match args[4]!.consumeMData with
+        | .lam fn fd fb fbi => .lam fn fd (eliminateOnePointExists fuel fb) fbi
+        | other => other
+      mkAppN e.getAppFn #[args[0]!, args[1]!, args[2]!, t', f']
+    else
+      match e with
+      | .forallE n dom body bi =>
+        if !body.hasLooseBVar 0 then
+          let dom' := eliminateOnePointExists fuel dom
+          let body' := eliminateOnePointExists fuel body
+          .forallE n dom' body' bi
+        else
+          .forallE n dom (eliminateOnePointExists fuel body) bi
+      | _ => e
 
 /-- Extend the hypothesis list `hyps` with `h`, also recording the conjuncts of a
     conjunctive hypothesis so `P ∧ Q → P` is recognized. -/
@@ -1975,11 +2265,12 @@ private def assumeHyp (h : Expr) (hyps : List Expr) : List Expr :=
     h :: hyps
 
 /-- Fast syntactic tautology recognizer for `Prop` expressions (`True`, `r = r`,
-    `HEq r r`, `decide (r = r) = true`, `¬ (r ≠ r)`, `¬ (P ∧ ¬ P)`, `P ↔ P`,
-    `(a = b) ↔ (b = a)`, `(a = b) = (b = a)`, `P → P`, `A → B → A`, `P ∧ Q → P`,
-    `a = b → b = a`, ex falso from a contradictory hypothesis (`r ≠ r → P`),
-    `r = r ∨ P`, `P ∨ Q ∨ ¬ P`, `if`/`dite` with tautological branches, and `∀ y, T`
-    with a tautological body).
+    `HEq r r`, `decide (r = r) = true`, `decide (r ≠ r) = false`, `¬ (r ≠ r)`,
+    `¬ (P ∧ ¬ P)`, `P ↔ P`, `(a = b) ↔ (b = a)`, `(a = b) = (b = a)`, `P → P`,
+    `A → B → A`, `P ∧ Q → P`, `a = b → b = a`, ex falso from a contradictory
+    hypothesis (`r ≠ r → P`), `r = r ∨ P`, `P ∨ Q ∨ ¬ P`, `if`/`dite` with
+    tautological branches, `∃ k, k = ret` (including branching existentials), and
+    `∀ k, k = ret → k = ret`).
 
     Every recognized shape is valid in all models. In particular `r ≤ r` is *not*
     recognized syntactically: `LE.le` is an arbitrary user-supplied relation, and
@@ -1990,10 +2281,10 @@ private def assumeHyp (h : Expr) (hyps : List Expr) : List Expr :=
     `r = r`. Reflexive inequalities over lawful orders are still caught by the bounded
     prover, which must actually prove them.
 
-    `hyps` holds the hypotheses in scope. A hypothesis mentioning a loose bound
-    variable is only ever compared against goals at its own binder depth: binders are
-    crossed either into a body with no loose bound variable at all, or (for a
-    dependent `∀`) after discarding every such hypothesis. -/
+    `hyps` holds the hypotheses in scope at the current binder depth: non-dependent
+    implications lower `body` via `lowerLooseBVars 1 1` so `dom`, `body`, and `hyps`
+    remain aligned even under enclosing `∀` binders, while dependent `∀` binders lift
+    `hyps` via `liftLooseBVars 0 1`. -/
 def detectSyntacticTautology : Nat → List Expr → Expr → Option EnsuresVacuityReason
   | 0, _, _ => none
   | fuel + 1, hyps, e =>
@@ -2014,6 +2305,12 @@ def detectSyntacticTautology : Nat → List Expr → Expr → Option EnsuresVacu
         detectSyntacticTautology fuel hyps lhs.appFn!.appArg!
       else if lhs.isConstOf ``Bool.true && rhs.isAppOfArity ``Decidable.decide 2 then
         detectSyntacticTautology fuel hyps rhs.appFn!.appArg!
+      else if rhs.isConstOf ``Bool.false && lhs.isAppOfArity ``Decidable.decide 2 &&
+              detectSyntacticContradiction fuel lhs.appFn!.appArg! then
+        some .tautologicalImplication
+      else if lhs.isConstOf ``Bool.false && rhs.isAppOfArity ``Decidable.decide 2 &&
+              detectSyntacticContradiction fuel rhs.appFn!.appArg! then
+        some .tautologicalImplication
       else
         none
     else if e.isAppOfArity ``HEq 4 then
@@ -2047,10 +2344,14 @@ def detectSyntacticTautology : Nat → List Expr → Expr → Option EnsuresVacu
       let cond := args[1]!.consumeMData
       match args[3]!.consumeMData, args[4]!.consumeMData with
       | .lam _ _ tBody _, .lam _ _ fBody _ =>
-        if !tBody.hasLooseBVars && !fBody.hasLooseBVars &&
-           (detectSyntacticTautology fuel (assumeHyp cond hyps) tBody).isSome &&
-           (detectSyntacticTautology fuel (mkApp (mkConst ``Not) cond :: hyps) fBody).isSome then
-          some .tautologicalImplication
+        if !tBody.hasLooseBVar 0 && !fBody.hasLooseBVar 0 then
+          let tBody' := tBody.lowerLooseBVars 1 1
+          let fBody' := fBody.lowerLooseBVars 1 1
+          if (detectSyntacticTautology fuel (assumeHyp cond hyps) tBody').isSome &&
+             (detectSyntacticTautology fuel (mkApp (mkConst ``Not) cond :: hyps) fBody').isSome then
+            some .tautologicalImplication
+          else
+            none
         else
           none
       | _, _ => none
@@ -2085,27 +2386,76 @@ def detectSyntacticTautology : Nat → List Expr → Expr → Option EnsuresVacu
       match detectSyntacticTautology fuel hyps lhs, detectSyntacticTautology fuel hyps rhs with
       | some r1, some _ => some r1
       | _, _ => none
+    else if e.isAppOfArity ``Exists 2 then
+      let args := e.getAppArgs
+      let dom := args[0]!
+      match args[1]!.consumeMData with
+      | .lam n bdom body bi =>
+        let body := body.consumeMData
+        let witnesses := collectExistsEqWitnesses 16 body
+        let witnessHit? := witnesses.findSome? (fun w =>
+          detectSyntacticTautology fuel hyps (body.instantiate1 w))
+        if let some r := witnessHit? then
+          some r
+        else if body.isAppOfArity ``ite 5 then
+          let bArgs := body.getAppArgs
+          let cond := bArgs[1]!.consumeMData
+          if !cond.hasLooseBVar 0 then
+            let cond' := cond.lowerLooseBVars 1 1
+            let exFn := e.getAppFn
+            let tEx := mkApp2 exFn dom (.lam n bdom bArgs[3]! bi)
+            let fEx := mkApp2 exFn dom (.lam n bdom bArgs[4]! bi)
+            if (detectSyntacticTautology fuel (assumeHyp cond' hyps) tEx).isSome &&
+               (detectSyntacticTautology fuel (mkApp (mkConst ``Not) cond' :: hyps) fEx).isSome then
+              some .tautologicalImplication
+            else
+              none
+          else
+            none
+        else if body.isAppOfArity ``dite 5 then
+          let bArgs := body.getAppArgs
+          let cond := bArgs[1]!.consumeMData
+          match bArgs[3]!.consumeMData, bArgs[4]!.consumeMData with
+          | .lam _ _ tb _, .lam _ _ fb _ =>
+            if !cond.hasLooseBVar 0 && !tb.hasLooseBVar 0 && !fb.hasLooseBVar 0 then
+              let cond' := cond.lowerLooseBVars 1 1
+              let exFn := e.getAppFn
+              let tEx := mkApp2 exFn dom (.lam n bdom (tb.lowerLooseBVars 1 1) bi)
+              let fEx := mkApp2 exFn dom (.lam n bdom (fb.lowerLooseBVars 1 1) bi)
+              if (detectSyntacticTautology fuel (assumeHyp cond' hyps) tEx).isSome &&
+                 (detectSyntacticTautology fuel (mkApp (mkConst ``Not) cond' :: hyps) fEx).isSome then
+                some .tautologicalImplication
+              else
+                none
+            else
+              none
+          | _, _ => none
+        else if !body.hasLooseBVar 0 && isKnownInhabitedCoreType dom then
+          detectSyntacticTautology fuel hyps (body.lowerLooseBVars 1 1)
+        else
+          none
+      | _ => none
     else
       match e with
       | .forallE _ dom body _ =>
-        if !body.hasLooseBVars then
+        if !body.hasLooseBVar 0 then
           let dom := dom.consumeMData
-          let body := body.consumeMData
+          let body' := (body.lowerLooseBVars 1 1).consumeMData
           if dom.isConstOf ``False then
             some .tautologicalImplication
-          else if dom == body then
+          else if dom == body' || isSymmetricRestatement dom body' then
             some .tautologicalImplication
           else if detectSyntacticContradiction fuel dom then
             some .tautologicalImplication
           else if hasComplementaryPair (assumeHyp dom hyps) then
             some .tautologicalImplication
-          else if (detectSyntacticTautology fuel (assumeHyp dom hyps) body).isSome then
+          else if (detectSyntacticTautology fuel (assumeHyp dom hyps) body').isSome then
             some .tautologicalImplication
           else
             none
         else
-          let closedHyps := hyps.filter (fun h => !h.hasLooseBVars)
-          if (detectSyntacticTautology fuel closedHyps body).isSome then
+          let liftedHyps := hyps.map (fun h => h.liftLooseBVars 0 1)
+          if (detectSyntacticTautology fuel liftedHyps body).isSome then
             some .tautologicalImplication
           else
             none
@@ -2152,6 +2502,10 @@ private def collectBoilerplateAtoms :
       let (acc2, ov2) := collectBoilerplateAtoms fuel limit args[3]! acc1
       let (acc3, ov3) := collectBoilerplateAtoms fuel limit args[4]! acc2
       (acc3, ov1 || ov2 || ov3)
+    else if e.isAppOfArity ``Exists 2 then
+      match e.appArg!.consumeMData with
+      | .lam _ _ body _ => collectBoilerplateAtoms fuel limit body acc
+      | _ => (acc, false)
     else
       match e with
       | .forallE _ dom body _ =>
@@ -2295,6 +2649,14 @@ private def cofactorBoilerplate : Nat → Array Expr → Nat → Expr → Expr
               mkAppN e.getAppFn #[args[0]!, args[1]!, args[2]!,
                 .lam tn tdom tb' tbi, .lam fn fdom fb' fbi]
           | _, _ => e
+      else if e.isAppOfArity ``Exists 2 then
+        let args := e.getAppArgs
+        match args[1]!.consumeMData with
+        | .lam n dom body bi =>
+          let b' := cofactorBoilerplate fuel atoms mask body
+          if b'.isConstOf ``False then mkConst ``False
+          else mkApp2 e.getAppFn args[0]! (.lam n dom b' bi)
+        | _ => e
       else
         match e with
         | .forallE n dom body bi =>
@@ -2313,11 +2675,15 @@ private def cofactorBoilerplate : Nat → Array Expr → Nat → Expr → Expr
         | _ => e
 
 /-- Fast sound recognizer for boilerplate atoms whose truth value is fixed
-    independently of variables (for example `callFramePreserved m m`, which holds
-    for every `m` by `callFramePreserved_refl`). -/
+    independently of variables (for example `True`, `False`, or `callFramePreserved m m`,
+    which holds for every `m` by `callFramePreserved_refl`). -/
 private def atomFixedTruth? (e : Expr) : Option Bool :=
   let e := e.consumeMData
-  if e.isAppOfArity ``Trusted.VerificationResult.callFramePreserved 2 then
+  if e.isConstOf ``True then
+    some true
+  else if e.isConstOf ``False then
+    some false
+  else if e.isAppOfArity ``Trusted.VerificationResult.callFramePreserved 2 then
     let args := e.getAppArgs
     if args[0]!.consumeMData == args[1]!.consumeMData then
       some true
@@ -2325,6 +2691,28 @@ private def atomFixedTruth? (e : Expr) : Option Bool :=
       none
   else
     none
+
+/-- Expand a closed `retMatchesCalleeReturnTy sidecarBody retVal` boilerplate atom via
+    bounded `whnf` so Phase 3 fibre-insensitivity and fibre-contradiction probes see the
+    callee's return-type validity invariant (e.g., `bits < scalarModulus 4` for `u32`,
+    `b < 2` for `bool`, or `False` for `!`). Because `whnf` preserves definitional
+    equality, replacing the atom in `fibreAssump` never introduces false positives. -/
+private def expandRetMatchesAtom (budget : ProbeBudget) (atom : Expr) : MetaM Expr := do
+  let atom := atom.consumeMData
+  if !atom.isAppOfArity ``Trusted.VerificationResult.retMatchesCalleeReturnTy 2 then
+    return atom
+  let args := atom.getAppArgs
+  let sidecar := args[0]!
+  if sidecar.hasFVar || sidecar.hasExprMVar || sidecar.hasLooseBVars then
+    return atom
+  let some cap ← budget.nextCap? | return atom
+  let subCap := min cap closedNatSubtermHeartbeats
+  let savedMsgs := (← getThe Core.State).messages
+  let expanded? ← withBoundedHeartbeats subCap (whnf atom)
+  modifyThe Core.State fun s => { s with messages := savedMsgs }
+  match expanded? with
+  | some e' => return e'
+  | none => return atom
 
 /-- Build the propositional conjunction characterizing a boilerplate fibre
     (`atom_i` for bit `1`, `¬ atom_i` for bit `0`). -/
@@ -2456,15 +2844,29 @@ private def unfoldUserConnectives : Nat → Expr → MetaM Expr
         if ← isTypeCorrect withCond then
           return withCond
       return mkAppN e.getAppFn #[args[0]!, args[1]!, args[2]!, t', f']
+    else if e.isAppOfArity ``Exists 2 then
+      let args := e.getAppArgs
+      match args[1]!.consumeMData with
+      | .lam n dom body bi =>
+        let body' ← withLocalDecl n bi dom fun fv => do
+          let b' ← unfoldUserConnectives fuel (body.instantiate1 fv)
+          return b'.abstract #[fv]
+        return mkApp2 e.getAppFn args[0]! (.lam n dom body' bi)
+      | _ => return e
     else
       match e with
       | .forallE n dom body bi =>
-        if !body.hasLooseBVars then
+        if !body.hasLooseBVar 0 then
           let dom' ← unfoldUserConnectives fuel dom
-          let body' ← unfoldUserConnectives fuel body
+          let body' ← withLocalDecl n bi dom' fun fv => do
+            let b' ← unfoldUserConnectives fuel (body.instantiate1 fv)
+            return b'.abstract #[fv]
           return .forallE n dom' body' bi
         else
-          return e
+          let body' ← withLocalDecl n bi dom fun fv => do
+            let b' ← unfoldUserConnectives fuel (body.instantiate1 fv)
+            return b'.abstract #[fv]
+          return .forallE n dom body' bi
       | _ => return e
 
 /-! ### Top-Level Lambda / Projection Normalization & Input/Output Splitting -/
@@ -2713,7 +3115,8 @@ private def analyzeNormalizedSpec
   let preNorm? ←
     match preProp? with
     | some preProp =>
-      pure (some (← unfoldUserConnectives 16 (← zetaBetaProjReduce 32 preProp)))
+      let unfoldedPre ← unfoldUserConnectives 16 (← zetaBetaProjReduce 32 preProp)
+      pure (some (eliminateOnePointExists 16 unfoldedPre))
     | none => pure none
 
   if let some preNorm := preNorm? then
@@ -2781,7 +3184,7 @@ private def analyzeNormalizedSpec
     return .vacuous .unrealizableUnderRequires ["ensures reduces to False"]
 
   if freeBefore && !freeAfter then
-    let normDiscarded ← unfoldUserConnectives 8 reducedBody
+    let normDiscarded := eliminateOnePointExists 16 (← unfoldUserConnectives 8 reducedBody)
     if normDiscarded.isConstOf ``False then
       return .vacuous .unrealizableUnderRequires
         ["ensures reduces to False after discarding output"]
@@ -2820,16 +3223,17 @@ private def analyzeNormalizedSpec
     return .vacuous fallbackReason [fallbackNote]
 
   if !freeAfter then
-    let normInputOnly ← unfoldUserConnectives 8 reducedBody
+    let normInputOnly := eliminateOnePointExists 16 (← unfoldUserConnectives 8 reducedBody)
     return ← classifyInputOnly normInputOnly .unusedOutputBinder
       "output variable does not occur free in ensures body"
 
-  -- Unfold user helper predicates nested under connectives (preserving boilerplate
-  -- atoms, core/trusted primitives, matchers, and projections).
-  let workBody ← unfoldUserConnectives 8 reducedBody
+  -- Unfold user helper predicates nested under connectives/quantifiers (preserving
+  -- boilerplate atoms, core/trusted primitives, matchers, and projections) and
+  -- eliminate one-point existentials `(∃ k, k = t ∧ P k) ↔ P t`.
+  let workBody := eliminateOnePointExists 16 (← unfoldUserConnectives 8 reducedBody)
   if !mentionsOutput workBody then
     return ← classifyInputOnly workBody .outputInsensitive
-      "output variable drops out once user helper predicates are unfolded"
+      "output variable drops out once user helper predicates or one-point existentials are simplified"
 
   -- Phase 3: `MirCallAns` boilerplate-atom cofactoring (`k ≤ 8`).
   if isMirCallAns && cfg.userEnsuresOnly then
@@ -2919,6 +3323,10 @@ private def analyzeNormalizedSpec
             return .insensitiveUnderRequires
         return .genuine
 
+      let mut expandedAtoms : Array Expr := #[]
+      for atom in atoms do
+        expandedAtoms := expandedAtoms.push (← expandRetMatchesAtom budget atom)
+
       let numMasks := 1 <<< atoms.size
       let mut feasibleMasks : Nat := 0
       let mut fibreGenuine := false
@@ -2930,24 +3338,24 @@ private def analyzeNormalizedSpec
       for mask in [:numMasks] do
         let mut maskFeasible := true
         for i in [:atoms.size] do
-          if let some fixedVal := atomFixedTruth? atoms[i]! then
+          if let some fixedVal := atomFixedTruth? expandedAtoms[i]! then
             if (((mask >>> i) &&& 1) == 1) != fixedVal then
               maskFeasible := false
               break
         if !maskFeasible then
           continue
         feasibleMasks := feasibleMasks + 1
-        let fibreAssump := mkFibreAssumption atoms mask
+        let fibreAssump := mkFibreAssumption expandedAtoms mask
         let rawRes := cofactorBoilerplate 64 atoms mask workBody
         -- Even once the prover heartbeat budget is exhausted, pure boilerplate
         -- cofactoring and syntactic fibre checks (`False`, `True`, `!mentionsOutput`,
         -- `detectSyntacticTautology`) still run at zero heartbeat cost while every
         -- semantic probe degrades conservatively to `false`.
-        let mut res := rawRes
+        let mut res := eliminateOnePointExists 16 rawRes
         match ← budget.nextCap? with
         | some remCap =>
           let unfolded? ← withBoundedHeartbeats remCap (unfoldUserConnectives 8 rawRes)
-          res := unfolded?.getD rawRes
+          res := eliminateOnePointExists 16 (unfolded?.getD rawRes)
         | none =>
           phase3BudgetExhausted := true
           probeCutOffRef.set true
@@ -3208,7 +3616,8 @@ def checkRequiresSatisfiable (requiresExpr : Expr)
         reason := "precondition expression does not return Prop"
       }
     let rawBody := (mkAppN reqExposed inputs).headBeta
-    let normBody ← unfoldUserConnectives 16 (← zetaBetaProjReduce 32 rawBody)
+    let normBody := eliminateOnePointExists 16
+      (← unfoldUserConnectives 16 (← zetaBetaProjReduce 32 rawBody))
     if normBody.isConstOf ``False then
       return { satisfiable? := some false, reason := "precondition is syntactically False" }
     if detectSyntacticContradiction 32 normBody then
@@ -3263,7 +3672,8 @@ def checkRequiresSatisfiable (requiresExpr : Expr)
         break
     if allWitnessed then
       let instRaw := (mkAppN reqExposed witnesses).headBeta
-      let instGoal ← unfoldUserConnectives 16 (← zetaBetaProjReduce 32 instRaw)
+      let instGoal := eliminateOnePointExists 16
+        (← unfoldUserConnectives 16 (← zetaBetaProjReduce 32 instRaw))
       if ← tryProveWithin budget instGoal then
         return {
           satisfiable? := some true
