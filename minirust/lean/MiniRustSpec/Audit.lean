@@ -12129,6 +12129,64 @@ theorem ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign
     · unfold evalUnOpM; simp only [hDec, hLay, computeSizeM, hCsaM, bind, Except.bind, pure, Except.pure]
     · unfold evalUnOpM; simp only [hDec, hLay, computeAlignM, hCsaM, bind, Except.bind, pure, Except.pure]
 
+/-- **Sharp `dyn Trait` instance of the composition law `GetMetadata` →
+`ComputeSize` / `ComputeAlign`, with a machine.** For every pointer type with
+vtable-pointer metadata (`&dyn Trait`, `&mut dyn Trait`, `Box<dyn Trait>`,
+`*const dyn Trait`, and pointers to unsized structs with a `dyn Trait` tail)
+and every pointer whose metadata `vptr` is in bounds and is the address of a
+vtable `vt` for the trait (the metadata part of `check_ptr`), on every memory
+model:
+1. `GetMetadata` returns `vptr` at `Type::Ptr(PtrType::VTablePtr(trait_name))`;
+2. feeding that result to `ComputeSize` / `ComputeAlign` at `Type::TraitObject`
+   returns exactly `vt.size` and `vt.align`;
+3. feeding it to `ComputeSize` / `ComputeAlign` at an unsized tuple with a
+   `dyn Trait` tail returns exactly the full size and alignment that
+   `TupleHeadLayout::full_size_and_align` computes from `vt.size` and
+   `vt.align`.
+None of the five operator applications errors. -/
+theorem ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign_dyn
+    {M : Type} [Gen.Memory M] [MemoryOps M]
+    (thin vptr : Gen.ThinPointer (Gen.Memory.Provenance M)) (ptrTy : Gen.PtrType)
+    (t : Gen.TraitName) (mach : Gen.Machine M) (vt : Gen.VTable)
+    (fields : List (Gen.Offset × Gen.Type)) (head : Gen.TupleHeadLayout)
+    (hKind : PtrType.meta_kind ptrTy = .VTablePointer t)
+    (hAddr : inBounds vptr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hvt : vtableLookupM mach vptr = .ok vt) (hTrait : vt.trait_name = t) :
+    evalUnOpM (M := M) .GetMetadata (.Ptr ⟨thin, some (.VTablePointer vptr)⟩, .Ptr ptrTy)
+        (some mach) = .ok (.Ptr ⟨vptr, none⟩, .Ptr (.VTablePtr t)) ∧
+    evalUnOpM (M := M) (.ComputeSize (.TraitObject t)) (.Ptr ⟨vptr, none⟩, .Ptr (.VTablePtr t))
+        (some mach) = .ok (.Int (vt.size.bytes : Int), .Int IntType.usize_ty) ∧
+    evalUnOpM (M := M) (.ComputeAlign (.TraitObject t)) (.Ptr ⟨vptr, none⟩, .Ptr (.VTablePtr t))
+        (some mach) = .ok (.Int (vt.align.bytes : Int), .Int IntType.usize_ty) ∧
+    evalUnOpM (M := M) (.ComputeSize (.Tuple fields head (some (.TraitObject t))))
+        (.Ptr ⟨vptr, none⟩, .Ptr (.VTablePtr t)) (some mach) =
+      .ok (.Int ((TupleHeadLayout.full_size_and_align head vt.size vt.align).1.bytes : Int),
+        .Int IntType.usize_ty) ∧
+    evalUnOpM (M := M) (.ComputeAlign (.Tuple fields head (some (.TraitObject t))))
+        (.Ptr ⟨vptr, none⟩, .Ptr (.VTablePtr t)) (some mach) =
+      .ok (.Int ((TupleHeadLayout.full_size_and_align head vt.size vt.align).2.bytes : Int),
+        .Int IntType.usize_ty) := by
+  have hChk : checkPtrM (M := M) ⟨vptr, none⟩ (.VTablePtr t) (some mach) = .ok () :=
+    checkPtrM_vtablePtr_ok vptr t mach vt hAddr
+      ((vtableFromPtrM_ok_iff_vtableLookupM_ok mach vptr vt).mpr hvt) hTrait
+  have hGet : evalUnOpM (M := M) .GetMetadata
+      (.Ptr ⟨thin, some (.VTablePointer vptr)⟩, .Ptr ptrTy) (some mach) =
+      .ok (.Ptr ⟨vptr, none⟩, .Ptr (.VTablePtr t)) := by
+    rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy (some mach)).2.2.2.2.2.2.2.2
+      t vptr mach hKind, hChk]
+  have hKindTy : Type.meta_kind (.TraitObject t) = PtrType.meta_kind ptrTy := by
+    rw [hKind]; rfl
+  have hCsa : LayoutStrategy.compute_size_and_align (vtableLookupM mach) (.TraitObject t)
+      (some (.VTablePointer vptr)) = .ok (vt.size, vt.align) := by
+    rw [compute_size_and_align_traitObject, hvt]; rfl
+  have hBare := (ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign
+    ⟨thin, some (.VTablePointer vptr)⟩ ptrTy (.TraitObject t) (.TraitObject t)
+    (.Ptr ⟨vptr, none⟩) (.Ptr (.VTablePtr t)) (some mach) hGet hKindTy rfl).2
+    vt.size vt.align (vtableLookupM mach) (Or.inr ⟨mach, rfl, rfl⟩) hCsa
+  have hTuple := evalUnOpM_tuple_traitObject_size_align mach vptr fields head t
+    (.Ptr (.VTablePtr t)) vt hvt
+  exact ⟨hGet, hBare.1, hBare.2, hTuple.1, hTuple.2⟩
+
 private def ep1KnownOnlyEnumTy : Gen.Type :=
   let unitVar : Gen.Type := .Tuple [] ⟨⟨4⟩, ⟨4⟩, none⟩ none
   .Enum ⟨[(0, { ty := unitVar, tagger := ⟨[]⟩ })]⟩ ep1U8 (.Known 0) ⟨4⟩ ⟨4⟩
@@ -18298,6 +18356,7 @@ theorem ep1_union_overlapping_checkValue_not_roundtrip_and_multitag_assign_witne
   ep1_vtable_zst_uninhabited_and_deref_witness
   ep1_vtable_constructWidePointer_boundary_and_decode_witness
   ep1_vtable_congr_mach_hypotheses_necessary_witness
+  ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign_dyn
 
 #assert_standard_axioms
   vtableFromPtrM_bm_eq
@@ -18383,6 +18442,7 @@ theorem ep1_union_overlapping_checkValue_not_roundtrip_and_multitag_assign_witne
   ep1_vtable_zst_uninhabited_and_deref_witness
   ep1_vtable_constructWidePointer_boundary_and_decode_witness
   ep1_vtable_congr_mach_hypotheses_necessary_witness
+  ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign_dyn
 
 /-- Verify that every newly added or modified executable `Interp` definition in
 Episode 1 is strictly computable (`Classical.choice`-free, `sorryAx`-free, and

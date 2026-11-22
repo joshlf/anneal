@@ -75,7 +75,9 @@ Next to the indirect call through a function pointer of `C8`,
 metadata is invalid, and `dynPtr_memory_roundtrip_and_misaligned_place_witness`
 round-trips `*const dyn Trait` and `PtrType::VTablePtr` pointers through
 memory and shows the alignment UB of a trait-object place whose data pointer
-is misaligned for its vtable.
+is misaligned for its vtable. `dynDispatch_safe_ref_receiver_call_return_witness`
+dispatches on a safe `&dyn Trait` receiver that is also passed to the callee,
+validated there at function entry, and released again on `Return`.
 -/
 namespace MiniRustSpec.UnwindSetDiscrAndFnPtrMR
 set_option Elab.async false
@@ -3269,6 +3271,79 @@ theorem dynPtr_memory_roundtrip_and_misaligned_place_witness :
       .error (.ub "loading from a place based on a misaligned pointer") ∧
     Interp.stepsTB 1 (liftMachToTB (dynPlaceMach dynPlaceDerefLoadStmts 130)) =
       .error (.ub "loading from a place based on a misaligned pointer") :=
+  ⟨ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
+
+/-! ### Dynamic Dispatch on a Safe `&dyn Trait` Receiver (`Mach` & `MachTB`)
+
+The receiver of the dynamic call is a safe `&dyn Trait` reference, which the
+call also passes to the callee by value. Loading it runs the trait-object
+checks of `check_ptr` (vtable, dynamic size and alignment, and
+`Memory::dereferenceable`). The callee validates its argument with
+`Statement::Validate` at function entry, which under Tree Borrows retags the
+reference with a protector, and `Terminator::Return` ends the call
+(`Memory::end_call`), which releases that protector. -/
+
+/-- `&dyn Trait` for trait `0`: an inhabited, freeze, unpin pointee whose layout
+and `UnsafeCell` ranges come from the vtable. -/
+@[reducible] def dynRefMrTy : Gen.Type :=
+  .Ptr (.Ref .Immutable ⟨.TraitObject (traitNameOf 0), true, .TraitObject, true, true⟩)
+
+/-- The callee: it validates its `&dyn Trait` argument at function entry and
+writes `77` to its `u32` return local. -/
+def dynRefCallee : Gen.Function :=
+  mkMrFn [(localName 0, u32MrTy), (localName 1, dynRefMrTy)] [localName 1] (localName 0)
+    [(bbName 0, ⟨[.Validate (.Local (localName 1)) true,
+        .Assign (.Local (localName 0)) (.Constant (.Int 77) u32MrTy)], .Return, .Regular⟩)]
+
+/-- The caller: local `1` holds the `&dyn Trait` receiver; the call dispatches
+through the receiver's vtable and passes the receiver by value. -/
+def dynRefCaller : Gen.Function :=
+  mkMrFn [(localName 0, u32MrTy), (localName 1, dynRefMrTy)] [] (localName 0)
+    [(bbName 0, ⟨[], .Call (.UnOp (.VTableMethodLookup dynDispatchMethod)
+          (.UnOp .GetMetadata (.Load (.Local (localName 1)))))
+        .Rust [.ByValue (.Load (.Local (localName 1)))] (.Local (localName 0))
+        (some (bbName 1)) none, .Regular⟩),
+     (bbName 1, ⟨[], .Return, .Regular⟩)]
+
+/-- A `BasicMemory` machine about to run the call. Allocation `0` is function
+`1`, `1` the caller's return local, `2` the receiver local (data pointer
+`dataAddr` with the provenance of allocation `4`, vtable pointer `8192`), `3`
+the vtable of trait `0` (size `4`, alignment `4`), and `4` the live 4-byte
+object at `640` that a valid receiver refers to. -/
+def dynRefCallMach (dataAddr : Nat) : Mach :=
+  let prog : Gen.Program :=
+    { functions := ⟨[(fnName 0, dynRefCaller), (fnName 1, dynRefCallee)]⟩, start := fnName 0,
+      globals := ⟨[]⟩, traits := ⟨[(traitNameOf 0, ⟨[dynDispatchMethod]⟩)]⟩,
+      vtables := ⟨[(⟨⟨0⟩⟩, dynDispatchVTable)]⟩ }
+  let vtPtr : Ptr := { addr := 8192, provenance := some (⟨3⟩, ()) }
+  let base := mkMrMach prog
+    [mkFnAlloc 4096, mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (ptrBytes dataAddr (some (⟨4⟩, ())) ++ ptrBytes 8192 (some (⟨3⟩, ()))) 8,
+     mkVTableAlloc 8192, mkStackAlloc 640 (scalarBytes u32 5) 4]
+    [mkRootFrame dynRefCaller [(localName 0, { addr := 128, provenance := some (⟨1⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨2⟩, ()) })]]
+    [(fnName 1, { addr := 4096, provenance := some (⟨0⟩, ()) })]
+  { base with vtable_ptrs := ⟨[(⟨⟨0⟩⟩, vtPtr)]⟩ }
+
+/-- Concrete witness for dynamic dispatch on a safe `&dyn Trait` receiver, on
+`Mach` and `MachTB`. The four steps `Call` (receiver loaded and checked twice,
+as callee and as argument), the callee's `Validate` at function entry, its
+assignment, and `Return` deliver the callee's `77` to the caller's return
+local (and `MachTB.wfLive` is preserved across the protector's lifetime). A
+receiver whose data pointer (`700`) lies outside the object it has provenance
+for is not dereferenceable for the vtable's size, which is UB as soon as the
+call loads it. -/
+theorem dynDispatch_safe_ref_receiver_call_return_witness :
+    (∃ m4, Interp.steps 4 (dynRefCallMach 640) = .ok m4 ∧
+      m4.mem.memory.allocations[1]?.map (·.data) = some (scalarBytes u32 77)) ∧
+    (∃ m4, Interp.stepsTB 4 (liftMachToTB (dynRefCallMach 640)) = .ok m4 ∧ MachTB.wfLive m4 ∧
+      m4.mem.memory.mem.allocations[1]?.map (fun a => a.data.map projByteTB) =
+        some ((scalarBytes u32 77).map (projByteTB ∘ liftByteTB))) ∧
+    Interp.steps 1 (dynRefCallMach 700) =
+      .error (.ub "Value::Ptr: non-dereferenceable safe pointer") ∧
+    Interp.stepsTB 1 (liftMachToTB (dynRefCallMach 700)) =
+      .error (.ub "Value::Ptr: non-dereferenceable safe pointer") :=
   ⟨ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
    eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
 
