@@ -1536,8 +1536,8 @@ theorem checked_and_unchecked_operational_equivalence (a b : Nat) (isSigned : Bo
       (Or.inr (Or.inr (by rintro (h | h | h | h | h | h) <;> cases h)))⟩
 
 /-- Canary 3j (typed `BitVec` array transmutation square including `xs = []`): `[i32; 4] → [i64; 2]`,
-`[u32; 4] → [i64; 2]`, `[i32; 4] → [u64; 2]`, and empty `[i32; 0] → [i64; 0]` all succeed directly
-from typed `BitVec` element lists without needing an external encoding witness. -/
+`[i32; 4] → [u64; 2]`, and empty `[u32; 0] → [i64; 0]` all succeed directly from typed `BitVec`
+element lists without needing an external encoding witness. -/
 theorem canary3_typed_signed_array_transmute_square (layouts : LayoutTable)
     (idx₁ idx₂ : LayoutIdx) (a b c d : BitVec 32) :
     (∃ v', decodeValueFromBytes defaultCodecFuel layouts
@@ -1552,6 +1552,192 @@ theorem canary3_typed_signed_array_transmute_square (layouts : LayoutTable)
   ⟨bitVecArray_int_transmute_sound layouts .i32 .i64 2 idx₁ idx₂ [a, b, c, d] rfl,
     bitVecArray_int_to_uint_transmute_sound layouts .i32 .u64 2 idx₁ idx₂ [a, b, c, d] rfl,
     bitVecArray_uint_to_int_transmute_sound layouts .u32 .i64 0 idx₁ idx₂ [] rfl⟩
+
+/-! ### 4.4 Exact Signed-Overflow Iffs, Unary Negation, Saturating Ops, `cttz` Alignment,
+Byte-Splitting and `ByteSeqValid` Canaries -/
+
+/-- Canary 1l (exact signed-overflow biconditionals & unary negation):
+- `signedOverflowAdd` and `signedOverflowSub` obey exact `signedKey` biconditionals;
+- `i32::MAX + 1` and `i32::MIN - 1` witness the exact overflow boundary;
+- `evalUnOp .neg` flips `ScalarSRange 4 [-1000, 500]` to `[-500, 1000]` and propagates 4-byte
+  alignment through `ScalarTnum`;
+- `i32::MIN` wraps to itself under `evalUnOp .neg`, confirming `0 < signedKey smin` is necessary. -/
+theorem canary1_exact_signed_overflow_iff_and_neg (a b : Nat) (isBool : Bool) (x : ScalarInt)
+    (hx_sr : ScalarSRange 4 (BitVec.ofNat 32 (2 ^ 32 - 1000)) (BitVec.ofNat 32 500) x)
+    (hx_tn : ScalarTnum 4 (BitVec.ofNat 32 0xFFFFFFFC) (BitVec.ofNat 32 0) x) :
+    (signedOverflowAdd a b 4 = false ↔
+        2 ^ 31 ≤ Anneal.BitVecArith.signedKey (BitVec.ofNat 32 a) +
+            Anneal.BitVecArith.signedKey (BitVec.ofNat 32 b) ∧
+          Anneal.BitVecArith.signedKey (BitVec.ofNat 32 a) +
+            Anneal.BitVecArith.signedKey (BitVec.ofNat 32 b) < 2 ^ 31 + 2 ^ 32) ∧
+      (signedOverflowSub a b 4 = false ↔
+        Anneal.BitVecArith.signedKey (BitVec.ofNat 32 b) ≤
+            Anneal.BitVecArith.signedKey (BitVec.ofNat 32 a) + 2 ^ 31 ∧
+          Anneal.BitVecArith.signedKey (BitVec.ofNat 32 a) <
+            Anneal.BitVecArith.signedKey (BitVec.ofNat 32 b) + 2 ^ 31) ∧
+      signedOverflowAdd 0x7FFFFFFF 1 4 = true ∧
+      signedOverflowSub 0x80000000 1 4 = true ∧
+      (∃ r, Anneal.Scalars.evalUnOp .neg x isBool = some r ∧
+        ScalarSRange 4 (Anneal.BitVecArith.neg (BitVec.ofNat 32 500))
+          (Anneal.BitVecArith.neg (BitVec.ofNat 32 (2 ^ 32 - 1000))) r ∧
+        ScalarTnum 4
+          (tnumSubMask (BitVec.ofNat 32 0) (BitVec.ofNat 32 0)
+            (BitVec.ofNat 32 0xFFFFFFFC) (BitVec.ofNat 32 0))
+          (tnumSubValue (BitVec.ofNat 32 0) (BitVec.ofNat 32 0)
+            (BitVec.ofNat 32 0xFFFFFFFC) (BitVec.ofNat 32 0)) r) ∧
+      Anneal.Scalars.evalUnOp .neg ⟨0x80000000, 4⟩ false = some ⟨0x80000000, 4⟩ := by
+  obtain ⟨r, hr, hsr⟩ := scalarSRange_evalUnOp_neg_no_overflow (by decide) isBool hx_sr (by decide)
+  obtain ⟨r', hr', htn⟩ := scalarTnum_evalUnOp_neg (by decide) isBool hx_tn
+  have hreq : r' = r := Option.some.inj (hr'.symm.trans hr)
+  subst r'
+  refine ⟨signedOverflowAdd_eq_false_iff_signedKey_bounds (by decide) a b,
+    signedOverflowSub_eq_false_iff_signedKey_bounds (by decide) a b,
+    by decide, by decide, ⟨r, hr, hsr, htn⟩, rfl⟩
+
+/-- Non-vacuity witness for `canary1_exact_signed_overflow_iff_and_neg`. -/
+theorem canary1_exact_signed_overflow_iff_and_neg_witness :
+    ScalarSRange 4 (BitVec.ofNat 32 (2 ^ 32 - 1000)) (BitVec.ofNat 32 500) ⟨40, 4⟩ ∧
+      ScalarTnum 4 (BitVec.ofNat 32 0xFFFFFFFC) (BitVec.ofNat 32 0) ⟨40, 4⟩ :=
+  ⟨⟨rfl, by decide, by decide, by decide⟩, ⟨rfl, by decide, rfl⟩⟩
+
+/-- Canary 1m (saturating unsigned & signed arithmetic, `bitreverse` involution on non-canonical
+bits, and end-to-end `evalCttz → ScalarTnum → bitwiseOrBits_aligned_bounded_injective`):
+every branch (unsigned no-overflow/clamp, unsigned no-underflow/clamp, signed no-overflow add/sub,
+non-canonical `evalBitreverse` involution, `evalCttz`/`evalCttzNonzero` rejection, and trailing-zero
+alignment proving pointer-tag packing injectivity) composes cleanly. -/
+theorem canary1_saturating_and_cttz_alignment (bits : Nat)
+    (ua ub uc ud : ScalarInt) (sa sb : ScalarInt) (x₁ x₂ : ScalarInt) (t₁ t₂ : Nat)
+    (hua : ScalarRange 4 (BitVec.ofNat 32 10) (BitVec.ofNat 32 100) ua)
+    (hub : ScalarRange 4 (BitVec.ofNat 32 20) (BitVec.ofNat 32 200) ub)
+    (huc : ScalarRange 4 (BitVec.ofNat 32 0xFFFF0000) (BitVec.ofNat 32 0xFFFFFFFF) uc)
+    (hud : ScalarRange 4 (BitVec.ofNat 32 0x10000) (BitVec.ofNat 32 0x20000) ud)
+    (hsa : ScalarSRange 4 (BitVec.ofNat 32 (2 ^ 32 - 100)) (BitVec.ofNat 32 200) sa)
+    (hsb : ScalarSRange 4 (BitVec.ofNat 32 (2 ^ 32 - 50)) (BitVec.ofNat 32 100) sb)
+    (hsz₁ : x₁.sizeBytes = 4) (hcan₁ : x₁.bits < scalarModulus 4)
+    (hsz₂ : x₂.sizeBytes = 4) (hcan₂ : x₂.bits < scalarModulus 4)
+    (hcttz₁ : evalCttz x₁ 4 = some ⟨4, 4⟩) (hcttz₂ : evalCttz x₂ 4 = some ⟨4, 4⟩)
+    (ht₁ : t₁ < 2 ^ 4) (ht₂ : t₂ < 2 ^ 4)
+    (hpack : bitwiseOrBits 32 x₁.bits t₁ = bitwiseOrBits 32 x₂.bits t₂) :
+    (∃ r, evalSaturatingAdd ua ub false = some r ∧
+        ScalarRange 4 (BitVec.ofNat 32 30) (BitVec.ofNat 32 300) r) ∧
+      evalSaturatingAdd uc ud false = some ⟨0xFFFFFFFF, 4⟩ ∧
+      (∃ r, evalSaturatingSub uc ud false = some r ∧
+        ScalarRange 4 (BitVec.ofNat 32 0xFFFD0000) (BitVec.ofNat 32 0xFFFEFFFF) r) ∧
+      evalSaturatingSub ua ud false = some ⟨0, 4⟩ ∧
+      (∃ r, evalSaturatingAdd sa sb true = some r ∧
+        ScalarSRange 4 (BitVec.ofNat 32 (2 ^ 32 - 150)) (BitVec.ofNat 32 300) r) ∧
+      (∃ r, evalSaturatingSub sa sb true = some r ∧
+        ScalarSRange 4 (BitVec.ofNat 32 (2 ^ 32 - 200)) (BitVec.ofNat 32 250) r) ∧
+      (evalBitreverse ⟨bits, 4⟩).bind evalBitreverse =
+        some ⟨wrapScalarBits bits (scalarModulus 4), 4⟩ ∧
+      Trusted.Rustc.V2026_06_01.MirSemantics.cttzLoop 32 (BitVec.ofNat 32 bits).toNat =
+        Anneal.BitVec.clz
+          (BitVec.ofNat 32 (Trusted.Rustc.V2026_06_01.MirSemantics.bitreverseLoop 32
+            (BitVec.ofNat 32 bits).toNat 0)) ∧
+      evalCttz ⟨bits, 0⟩ 4 = none ∧
+      evalCttzNonzero ⟨0, 4⟩ 4 = none ∧
+      ScalarTnum 4 (Anneal.BitVec.not (Anneal.BitVec.lowMask 32 4)) (BitVec.ofNat 32 0) x₁ ∧
+      x₁.bits = x₂.bits ∧ t₁ = t₂ := by
+  have h1 := scalarRange_evalSaturatingAdd_no_overflow (by decide) hua hub (by decide)
+  have h2 := scalarRange_evalSaturatingAdd_overflow_clamps (by decide) huc hud (by decide)
+  have h3 := scalarRange_evalSaturatingSub_no_underflow (by decide) huc hud (by decide)
+  have h4 := scalarRange_evalSaturatingSub_underflow_clamps (by decide) hua hud (by decide)
+  have h5 := scalarSRange_evalSaturatingAdd_no_overflow (by decide) hsa hsb (by decide) (by decide)
+  have h6 := scalarSRange_evalSaturatingSub_no_overflow (by decide) hsa hsb (by decide) (by decide)
+  have ⟨htn₁, hmod₁⟩ := scalarTnum_lowMask_of_evalCttz (by decide) (by decide) hsz₁ hcan₁ hcttz₁
+  have ⟨_, hmod₂⟩ := scalarTnum_lowMask_of_evalCttz (by decide) (by decide) hsz₂ hcan₂ hcttz₂
+  have hcan₁' : x₁.bits < 2 ^ 32 := by simpa only [scalarModulus_eq] using hcan₁
+  have hcan₂' : x₂.bits < 2 ^ 32 := by simpa only [scalarModulus_eq] using hcan₂
+  have ⟨hxeq, hteq⟩ := bitwiseOrBits_aligned_bounded_injective (w := 32) (k := 4)
+    (by decide) hcan₁' hcan₂' hmod₁ hmod₂ ht₁ ht₂ hpack
+  exact ⟨h1, h2, h3, h4, h5, h6,
+    evalBitreverse_evalBitreverse (by decide) bits,
+    cttzLoop_eq_clz_bitreverse (BitVec.ofNat 32 bits),
+    (evalCttz_eq_none_iff ⟨bits, 0⟩ 4).2 (Or.inl rfl),
+    (evalCttzNonzero_eq_none_iff (by decide) (by decide) 0).2 rfl,
+    htn₁, hxeq, hteq⟩
+
+/-- Non-vacuity witness for `canary1_saturating_and_cttz_alignment`. -/
+theorem canary1_saturating_and_cttz_alignment_witness :
+    ScalarRange 4 (BitVec.ofNat 32 10) (BitVec.ofNat 32 100) ⟨50, 4⟩ ∧
+      ScalarRange 4 (BitVec.ofNat 32 20) (BitVec.ofNat 32 200) ⟨80, 4⟩ ∧
+      ScalarRange 4 (BitVec.ofNat 32 0xFFFF0000) (BitVec.ofNat 32 0xFFFFFFFF) ⟨0xFFFF8000, 4⟩ ∧
+      ScalarRange 4 (BitVec.ofNat 32 0x10000) (BitVec.ofNat 32 0x20000) ⟨0x15000, 4⟩ ∧
+      ScalarSRange 4 (BitVec.ofNat 32 (2 ^ 32 - 100)) (BitVec.ofNat 32 200) ⟨42, 4⟩ ∧
+      ScalarSRange 4 (BitVec.ofNat 32 (2 ^ 32 - 50)) (BitVec.ofNat 32 100) ⟨2 ^ 32 - 10, 4⟩ ∧
+      evalCttz ⟨0x1230, 4⟩ 4 = some ⟨4, 4⟩ ∧
+      0x1230 < scalarModulus 4 ∧ 5 < 2 ^ 4 ∧
+      bitwiseOrBits 32 0x1230 5 = bitwiseOrBits 32 0x1230 5 :=
+  ⟨⟨rfl, by decide, by decide, by decide⟩,
+    ⟨rfl, by decide, by decide, by decide⟩,
+    ⟨rfl, by decide, by decide, by decide⟩,
+    ⟨rfl, by decide, by decide, by decide⟩,
+    ⟨rfl, by decide, by decide, by decide⟩,
+    ⟨rfl, by decide, by decide, by decide⟩,
+    rfl, by decide, by decide, rfl⟩
+
+/-- Canary 3k (exact `[u64; 2] → [u32; 4]` narrowing transmute via `extractBits`, unconditional
+`FixedByteCodec.prod` equivalence, and positive/negative `ByteSeqValid` across `[u32; n]` and
+`[i32; n]`):
+- Encoding `[x, y] : [u64; 2]` splits identically into `[lo32 x, hi32 x, lo32 y, hi32 y] : [u32; 4]`
+  and `decodeValueFromBytes` recovers those exact four 32-bit limbs;
+- `FixedByteCodec.prod u32LE u32LE` followed by limb concatenation agrees identically with
+  `u64LE.decode` on every `bs` (initialized, `.uninit`, or wrong length);
+- `bitVecLE.encodeElems` satisfies `ByteSeqValid` in all four modes for both `[u32; 2]` and `[i32; 2]`,
+  while `.uninit`-poisoned buffers are refuted for both unsigned and signed arrays. -/
+theorem canary3_narrowing_transmute_and_byteSeqValid (layouts : LayoutTable) (idx : LayoutIdx)
+    (x y : BitVec 64) (a b : BitVec 32) (bs : List AbstractByte) :
+    let limbs : List (BitVec 32) :=
+      [Anneal.BitVecArith.extractBits x 0 32, Anneal.BitVecArith.extractBits x 32 32,
+       Anneal.BitVecArith.extractBits y 0 32, Anneal.BitVecArith.extractBits y 32 32]
+    u64LE.encodeElems [x, y] = u32LE.encodeElems limbs ∧
+      decodeValueFromBytes defaultCodecFuel layouts
+          { kind := .array (.uint .u32) 4, layoutIdx := idx }
+          (u64LE.encodeElems [x, y]) = some (bitVecArrayValue 4 limbs) ∧
+      ((FixedByteCodec.prod u32LE u32LE).decode bs).map
+          (fun p => BitVec.ofNat 64 (p.1.toNat + 2 ^ 32 * p.2.toNat)) =
+        u64LE.decode bs ∧
+      ByteSeqValid layouts { kind := .array (.uint .u32) 2, layoutIdx := idx }
+        .BitValid (u32LE.encodeElems [a, b]) ∧
+      ByteSeqValid layouts { kind := .array (.int .i32) 2, layoutIdx := idx }
+        .BitValid (u32LE.encodeElems [a, b]) ∧
+      ByteSeqValid layouts { kind := .array (.int .i32) 0, layoutIdx := idx }
+        .BitValid [] ∧
+      ¬ ByteSeqValid layouts { kind := .array (.uint .u32) 1, layoutIdx := idx }
+        .BitValid [.init 1 none, .uninit, .init 2 none, .init 3 none] ∧
+      ¬ ByteSeqValid layouts { kind := .array (.int .i32) 1, layoutIdx := idx }
+        .BitValid [.init 1 none, .uninit, .init 2 none, .init 3 none] := by
+  have hx := bitVecLE_encode_split_extractBits 4 4 (by decide) (by decide) x
+  have hy := bitVecLE_encode_split_extractBits 4 4 (by decide) (by decide) y
+  have hbytes : u64LE.encodeElems [x, y] =
+      u32LE.encodeElems
+        [Anneal.BitVecArith.extractBits x 0 32, Anneal.BitVecArith.extractBits x 32 32,
+         Anneal.BitVecArith.extractBits y 0 32, Anneal.BitVecArith.extractBits y 32 32] := by
+    change u64LE.encode x ++ (u64LE.encode y ++ []) =
+      u32LE.encode (Anneal.BitVecArith.extractBits x 0 32) ++
+        (u32LE.encode (Anneal.BitVecArith.extractBits x 32 32) ++
+          (u32LE.encode (Anneal.BitVecArith.extractBits y 0 32) ++
+            (u32LE.encode (Anneal.BitVecArith.extractBits y 32 32) ++ [])))
+    rw [List.append_nil, List.append_nil, hx, hy, List.append_assoc]
+  have hdec := decodeValueFromBytes_encodeElems_bitVecLE layouts .u32 idx
+    [Anneal.BitVecArith.extractBits x 0 32, Anneal.BitVecArith.extractBits x 32 32,
+     Anneal.BitVecArith.extractBits y 0 32, Anneal.BitVecArith.extractBits y 32 32]
+  rw [← hbytes] at hdec
+  have hu := (byteSeqValid_encodeElems_bitVecLE layouts .u32 idx [a, b]).1
+  have hi := (byteSeqValid_encodeElems_bitVecLE_int layouts .i32 idx [a, b]).1
+  have hi0 := (byteSeqValid_encodeElems_bitVecLE_int layouts .i32 idx []).1
+  have hbad_u : ¬ ByteSeqValid layouts { kind := .array (.uint .u32) 1, layoutIdx := idx }
+      .BitValid [.init 1 none, .uninit, .init 2 none, .init 3 none] := by
+    intro h
+    have hinit := ((byteSeqValid_bitValid_array_uint_iff layouts .u32 1 idx _).1 h).2
+    cases hinit
+  have hbad_i : ¬ ByteSeqValid layouts { kind := .array (.int .i32) 1, layoutIdx := idx }
+      .BitValid [.init 1 none, .uninit, .init 2 none, .init 3 none] := by
+    intro h
+    have hinit := ((byteSeqValid_bitValid_array_int_iff layouts .i32 1 idx _).1 h).2
+    cases hinit
+  exact ⟨hbytes, hdec, bitVecLE_decode_prod 4 4 (by decide) (by decide) bs,
+    hu, hi, hi0, hbad_u, hbad_i⟩
 
 /-! ## 5. Axiom Audit Guards
 
@@ -1695,22 +1881,6 @@ theorem and definition of this file is pinned to its exact axiom set. All sets a
 /-- info: 'Anneal.BitVecScalarsBridge.ofLeWidth' does not depend on any axioms -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecScalarsBridge.ofLeWidth
-
-/-- info: 'Anneal.BitVecScalarsBridge.toNat_toLeWidth' does not depend on any axioms -/
-#guard_msgs (whitespace := lax) in
-#print axioms Anneal.BitVecScalarsBridge.toNat_toLeWidth
-
-/-- info: 'Anneal.BitVecScalarsBridge.toNat_ofLeWidth' does not depend on any axioms -/
-#guard_msgs (whitespace := lax) in
-#print axioms Anneal.BitVecScalarsBridge.toNat_ofLeWidth
-
-/-- info: 'Anneal.BitVecScalarsBridge.ofLeWidth_toLeWidth' does not depend on any axioms -/
-#guard_msgs (whitespace := lax) in
-#print axioms Anneal.BitVecScalarsBridge.ofLeWidth_toLeWidth
-
-/-- info: 'Anneal.BitVecScalarsBridge.toLeWidth_ofLeWidth' does not depend on any axioms -/
-#guard_msgs (whitespace := lax) in
-#print axioms Anneal.BitVecScalarsBridge.toLeWidth_ofLeWidth
 
 /-- info: 'Anneal.BitVecScalarsBridge.toLeWidth_injective' does not depend on any axioms -/
 #guard_msgs (whitespace := lax) in
@@ -3324,6 +3494,106 @@ theorem and definition of this file is pinned to its exact axiom set. All sets a
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecScalarsBridge.bitVecArray_int_to_uint_transmute_sound
 
+/-- info: 'Anneal.BitVecScalarsBridge.signedOverflowAdd_eq_false_iff_signedKey_bounds' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.signedOverflowAdd_eq_false_iff_signedKey_bounds
+
+/-- info: 'Anneal.BitVecScalarsBridge.signedOverflowSub_eq_false_iff_signedKey_bounds' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.signedOverflowSub_eq_false_iff_signedKey_bounds
+
+/-- info: 'Anneal.BitVecScalarsBridge.signedKey_neg_of_pos' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.signedKey_neg_of_pos
+
+/-- info: 'Anneal.BitVecScalarsBridge.scalarSRange_evalUnOp_neg_no_overflow' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.scalarSRange_evalUnOp_neg_no_overflow
+
+/-- info: 'Anneal.BitVecScalarsBridge.scalarTnum_evalUnOp_neg' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.scalarTnum_evalUnOp_neg
+
+/-- info: 'Anneal.BitVecScalarsBridge.scalarRange_evalSaturatingAdd_no_overflow' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.scalarRange_evalSaturatingAdd_no_overflow
+
+/-- info: 'Anneal.BitVecScalarsBridge.scalarRange_evalSaturatingAdd_overflow_clamps' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.scalarRange_evalSaturatingAdd_overflow_clamps
+
+/-- info: 'Anneal.BitVecScalarsBridge.scalarRange_evalSaturatingSub_no_underflow' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.scalarRange_evalSaturatingSub_no_underflow
+
+/-- info: 'Anneal.BitVecScalarsBridge.scalarRange_evalSaturatingSub_underflow_clamps' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.scalarRange_evalSaturatingSub_underflow_clamps
+
+/-- info: 'Anneal.BitVecScalarsBridge.scalarSRange_evalSaturatingAdd_no_overflow' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.scalarSRange_evalSaturatingAdd_no_overflow
+
+/-- info: 'Anneal.BitVecScalarsBridge.scalarSRange_evalSaturatingSub_no_overflow' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.scalarSRange_evalSaturatingSub_no_overflow
+
+/-- info: 'Anneal.BitVecScalarsBridge.bitreverseLoop_involutive' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.bitreverseLoop_involutive
+
+/-- info: 'Anneal.BitVecScalarsBridge.bitreverseLoop_lt' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.bitreverseLoop_lt
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalBitreverse_evalBitreverse' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalBitreverse_evalBitreverse
+
+/-- info: 'Anneal.BitVecScalarsBridge.cttzLoop_eq_clz_bitreverse' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.cttzLoop_eq_clz_bitreverse
+
+/-- info: 'Anneal.BitVecScalarsBridge.testBit_false_of_lt_cttzLoop' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.testBit_false_of_lt_cttzLoop
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalCttz_eq_none_iff' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalCttz_eq_none_iff
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalCttzNonzero_eq_none_iff' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalCttzNonzero_eq_none_iff
+
+/-- info: 'Anneal.BitVecScalarsBridge.scalarTnum_lowMask_of_evalCttz' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.scalarTnum_lowMask_of_evalCttz
+
+/-- info: 'Anneal.BitVecScalarsBridge.bitVecLE_encode_split_extractBits' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.bitVecLE_encode_split_extractBits
+
+/-- info: 'Anneal.BitVecScalarsBridge.bitVecLE_decode_prod' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.bitVecLE_decode_prod
+
+/-- info: 'Anneal.BitVecScalarsBridge.byteSeqValid_bitValid_array_uint_iff' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.byteSeqValid_bitValid_array_uint_iff
+
+/-- info: 'Anneal.BitVecScalarsBridge.byteSeqValid_bitValid_array_int_iff' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.byteSeqValid_bitValid_array_int_iff
+
+/-- info: 'Anneal.BitVecScalarsBridge.byteSeqValid_encodeElems_bitVecLE' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.byteSeqValid_encodeElems_bitVecLE
+
+/-- info: 'Anneal.BitVecScalarsBridge.byteSeqValid_encodeElems_bitVecLE_int' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.byteSeqValid_encodeElems_bitVecLE_int
+
 /-- info: 'Anneal.BitVecAndLeBytesBridgeTests.ctlz_width_zero' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecAndLeBytesBridgeTests.ctlz_width_zero
@@ -3719,5 +3989,25 @@ theorem and definition of this file is pinned to its exact axiom set. All sets a
 /-- info: 'Anneal.BitVecAndLeBytesBridgeTests.canary3_typed_signed_array_transmute_square' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecAndLeBytesBridgeTests.canary3_typed_signed_array_transmute_square
+
+/-- info: 'Anneal.BitVecAndLeBytesBridgeTests.canary1_exact_signed_overflow_iff_and_neg' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecAndLeBytesBridgeTests.canary1_exact_signed_overflow_iff_and_neg
+
+/-- info: 'Anneal.BitVecAndLeBytesBridgeTests.canary1_exact_signed_overflow_iff_and_neg_witness' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecAndLeBytesBridgeTests.canary1_exact_signed_overflow_iff_and_neg_witness
+
+/-- info: 'Anneal.BitVecAndLeBytesBridgeTests.canary1_saturating_and_cttz_alignment' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecAndLeBytesBridgeTests.canary1_saturating_and_cttz_alignment
+
+/-- info: 'Anneal.BitVecAndLeBytesBridgeTests.canary1_saturating_and_cttz_alignment_witness' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecAndLeBytesBridgeTests.canary1_saturating_and_cttz_alignment_witness
+
+/-- info: 'Anneal.BitVecAndLeBytesBridgeTests.canary3_narrowing_transmute_and_byteSeqValid' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecAndLeBytesBridgeTests.canary3_narrowing_transmute_and_byteSeqValid
 
 end Anneal.BitVecAndLeBytesBridgeTests
