@@ -17876,6 +17876,12 @@ theorem ep1_union_overlapping_checkValue_not_roundtrip_and_multitag_assign_witne
   checkPtrM_tuple_traitObject_size_overflow_ub
   evalUnOp_tuple_traitObject_size_align
   evalUnOpM_tuple_traitObject_size_align
+  getMetadataSanity
+  checkValue_nonVTable_meta_ok_or_ub
+  checkValueM_nonVTable_meta_ok_or_ub
+  evalUnOp_getMetadata_eq_sanity
+  evalUnOpM_getMetadata_eq_sanity
+  evalUnOpM_getMetadata_nonVTable_ok_or_specPanic
   evalUnOp_vtableMethodLookup_eq_fnPointer
   evalUnOpM_vtableMethodLookup_eq_fnPointer
   ep1_evalUnOpM_meta_unops_some_mach_error_is_specPanic

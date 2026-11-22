@@ -72,7 +72,10 @@ Next to the indirect call through a function pointer of `C8`,
 `dynDispatch_call_mach_and_machTB_witness` runs MiniRust's dynamic dispatch
 (`Terminator::Call` on `VTableMethodLookup(GetMetadata(self))`) end to end on
 `Mach` and `MachTB`, together with the UB of a receiver whose vtable-pointer
-metadata is invalid.
+metadata is invalid, and `dynPtr_memory_roundtrip_and_misaligned_place_witness`
+round-trips `*const dyn Trait` and `PtrType::VTablePtr` pointers through
+memory and shows the alignment UB of a trait-object place whose data pointer
+is misaligned for its vtable.
 -/
 namespace MiniRustSpec.UnwindSetDiscrAndFnPtrMR
 set_option Elab.async false
@@ -3180,6 +3183,93 @@ theorem dynDispatch_call_mach_and_machTB_witness :
       .error (.ub "Value::Ptr: invalid vtable in metadata") :=
   ⟨ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
    eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
+
+/-! ### Trait-Object Pointers in Memory and Dynamically Aligned Places
+(`Mach` & `MachTB`)
+
+`Machine::typed_load` and `Machine::typed_store` (`Type::decode` and
+`Type::encode`) round-trip a wide `*const dyn Trait` pointer and a thin
+`PtrType::VTablePtr` pointer through memory, keeping the provenance of the
+data pointer and of the vtable pointer. `PlaceExpr::Deref` at
+`Type::TraitObject` computes the `aligned` flag of its place from the
+alignment recorded in the vtable (`Machine::compute_align`), so loading from a
+place whose data pointer is misaligned for that vtable is UB. -/
+
+/-- A function that runs `stmts` over two `*const dyn Trait` locals (`0` and
+`1`) and two `PtrType::VTablePtr` locals (`2` and `3`), all for trait `0`. -/
+def dynPlaceFn (stmts : List Gen.Statement) : Gen.Function :=
+  mkMrFn [(localName 0, wideDynPtrMrTy 0), (localName 1, wideDynPtrMrTy 0),
+      (localName 2, .Ptr (.VTablePtr (traitNameOf 0))),
+      (localName 3, .Ptr (.VTablePtr (traitNameOf 0)))]
+    [] (localName 0) [(bbName 0, ⟨stmts, .Return, .Regular⟩)]
+
+/-- The bytes of a `*const dyn Trait` pointer whose data pointer has address
+`dataAddr` (with the provenance of allocation `0`) and whose metadata is the
+registered vtable pointer (`8192`, allocation `4`). -/
+def dynPlaceWideBytes (dataAddr : Nat) : List Byte :=
+  ptrBytes dataAddr (some (⟨0⟩, ())) ++ ptrBytes 8192 (some (⟨4⟩, ()))
+
+/-- A `BasicMemory` machine about to run `stmts` in `dynPlaceFn`. Allocations
+`0` to `3` are the locals (local `1` holds `dynPlaceWideBytes dataAddr`), and
+`4` is the vtable of trait `0` (`dynDispatchVTable`: size `4`, alignment `4`),
+registered at `8192`. -/
+def dynPlaceMach (stmts : List Gen.Statement) (dataAddr : Nat) : Mach :=
+  let fn := dynPlaceFn stmts
+  let prog : Gen.Program :=
+    { functions := ⟨[(fnName 0, fn)]⟩, start := fnName 0, globals := ⟨[]⟩,
+      traits := ⟨[(traitNameOf 0, ⟨[dynDispatchMethod]⟩)]⟩,
+      vtables := ⟨[(⟨⟨0⟩⟩, dynDispatchVTable)]⟩ }
+  let vtPtr : Ptr := { addr := 8192, provenance := some (⟨4⟩, ()) }
+  let base := mkMrMach prog
+    [mkStackAlloc 128 (List.replicate 16 .Uninit) 8,
+     mkStackAlloc 256 (dynPlaceWideBytes dataAddr) 8,
+     mkStackAlloc 384 (List.replicate 8 .Uninit) 8, mkStackAlloc 512 (List.replicate 8 .Uninit) 8,
+     mkVTableAlloc 8192]
+    [mkRootFrame fn [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) }),
+       (localName 2, { addr := 384, provenance := some (⟨2⟩, ()) }),
+       (localName 3, { addr := 512, provenance := some (⟨3⟩, ()) })]]
+  { base with vtable_ptrs := ⟨[(⟨⟨0⟩⟩, vtPtr)]⟩ }
+
+/-- Copy the wide pointer (`0 := load 1`), store the metadata of the copy as a
+thin vtable pointer (`2 := GetMetadata(load 0)`), and copy that
+(`3 := load 2`). -/
+def dynPlaceRoundTripStmts : List Gen.Statement :=
+  [.Assign (.Local (localName 0)) (.Load (.Local (localName 1))),
+   .Assign (.Local (localName 2)) (.UnOp .GetMetadata (.Load (.Local (localName 0)))),
+   .Assign (.Local (localName 3)) (.Load (.Local (localName 2)))]
+
+/-- Load from the trait-object place behind the wide pointer in local `1`. -/
+def dynPlaceDerefLoadStmts : List Gen.Statement :=
+  [.Assign (.Local (localName 0))
+     (.Load (.Deref (.Load (.Local (localName 1))) (.TraitObject (traitNameOf 0))))]
+
+/-- Concrete memory witness for trait-object pointers on `Mach` and `MachTB`.
+Three steps copy a `*const dyn Trait` pointer between locals, read the copy
+back, and store and copy its vtable pointer at `PtrType::VTablePtr`: the bytes
+written are exactly the encoding of the data pointer followed by the vtable
+pointer, each with its own provenance (and `MachTB.wfLive` is preserved). With
+a data pointer at `130`, which is misaligned for the vtable's alignment `4`,
+`PlaceExpr::Deref` at `Type::TraitObject` yields an unaligned place, and the
+load from it is UB. -/
+theorem dynPtr_memory_roundtrip_and_misaligned_place_witness :
+    (∃ m3, Interp.steps 3 (dynPlaceMach dynPlaceRoundTripStmts 128) = .ok m3 ∧
+      ([0, 2, 3].map (fun i => m3.mem.memory.allocations[i]?.map (·.data))) =
+        [some (dynPlaceWideBytes 128), some (ptrBytes 8192 (some (⟨4⟩, ()))),
+         some (ptrBytes 8192 (some (⟨4⟩, ())))]) ∧
+    (∃ m3, Interp.stepsTB 3 (liftMachToTB (dynPlaceMach dynPlaceRoundTripStmts 128)) = .ok m3 ∧
+      MachTB.wfLive m3 ∧
+      ([0, 2, 3].map (fun i =>
+          m3.mem.memory.mem.allocations[i]?.map (fun a => a.data.map projByteTB))) =
+        [some ((dynPlaceWideBytes 128).map (projByteTB ∘ liftByteTB)),
+         some ((ptrBytes 8192 (some (⟨4⟩, ()))).map (projByteTB ∘ liftByteTB)),
+         some ((ptrBytes 8192 (some (⟨4⟩, ()))).map (projByteTB ∘ liftByteTB))]) ∧
+    Interp.steps 1 (dynPlaceMach dynPlaceDerefLoadStmts 130) =
+      .error (.ub "loading from a place based on a misaligned pointer") ∧
+    Interp.stepsTB 1 (liftMachToTB (dynPlaceMach dynPlaceDerefLoadStmts 130)) =
+      .error (.ub "loading from a place based on a misaligned pointer") :=
+  ⟨ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
    eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
 
 /-! ## §9 (`C9`): `ProjectionElem.unwrapUnsafeBinder` (`Mach` & `MachTB`) -/

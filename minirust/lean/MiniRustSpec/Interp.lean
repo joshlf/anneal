@@ -3030,7 +3030,12 @@ and `UnOp::VTableMethodLookup` read the machine's vtables
 With a machine (`m = some mach`) they are interpreted as upstream; in
 `GetMetadata` on vtable metadata, upstream's `.expect(..)` catches UB from
 `check_value` while letting an internal spec panic (such as a missing
-`prog.vtables` entry) propagate directly. Without a machine (`m = none`) they
+`prog.vtables` entry) propagate directly. The branch for the other metadata
+kinds maps every error of the check to the sanity-check panic; that is the
+same function, because `check_value` of the unit and `usize` metadata values
+succeeds or is UB
+(`MiniRustSpec.Correspondence.evalUnOp_getMetadata_eq_sanity`). Without a
+machine (`m = none`) they
 fail closed with `unsupported`: `GetMetadata` before its sanity check (which is
 the same `check_value` call in both branches of the match on the metadata kind),
 so that the result does not depend on the address of the vtable pointer,

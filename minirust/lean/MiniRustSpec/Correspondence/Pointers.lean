@@ -8312,6 +8312,179 @@ theorem evalUnOpM_tuple_traitObject_size_align {M : Type} [Gen.Memory M] [Memory
     rw [compute_size_and_align_tuple_traitObject, hvt]
     rfl
 
+/-! ## `UnOp::GetMetadata`: one sanity check for every metadata kind
+
+Upstream runs `self.check_value(meta_value, meta_ty).expect(..)` for every
+metadata kind (`spec/lang/step/operators.md`). `evalUnOp` and `evalUnOpM` spell
+that check twice: once for vtable metadata, where it needs a machine, and once
+for the other kinds. The vtable branch separates UB of `check_value`, which
+`.expect(..)` turns into the sanity-check panic, from a panic inside
+`check_value`, which propagates; the other branch maps every error to the
+sanity-check panic. The results below show that the two branches agree:
+`check_value` of the unit and `usize` metadata values succeeds or is UB, so it
+has no other stop that the second branch could mask, and whenever the check
+runs `GetMetadata` is the single expression `getMetadataSanity`. -/
+
+/-- Upstream's `.expect(..)` on the `check_value` sanity check of
+`UnOp::GetMetadata`: UB of the check becomes the sanity-check panic, and any
+other stop (a panic inside `check_value`) propagates unchanged. -/
+def getMetadataSanity {α : Type} (check : Interp Unit) (result : α) : Interp α :=
+  match check with
+  | .ok () => pure result
+  | .error (.ub _) => specPanic "GetMetadata: sanity check, returned meta is well-formed"
+  | .error e => .error e
+
+/-- `check_value` of the metadata value of a thin or slice pointer succeeds or
+is UB, with or without a machine: it never panics and never reads the machine. -/
+theorem checkValue_nonVTable_meta_ok_or_ub (kind : Gen.PointerMetaKind)
+    (pm : Option (Gen.PointerMeta Prov)) (m : Option Mach) (mv : Val)
+    (hk : ∀ t, kind ≠ .VTablePointer t)
+    (henc : PointerMetaKind.encode_as_value kind pm = .ok mv) :
+    checkValue mv (PointerMetaKind.ty kind) m = .ok () ∨
+      ∃ msg, checkValue mv (PointerMetaKind.ty kind) m = .error (.ub msg) := by
+  cases kind with
+  | VTablePointer t => exact absurd rfl (hk t)
+  | None =>
+    cases pm with
+    | some _ => cases henc
+    | none =>
+      cases henc
+      exact Or.inl (by rw [PointerMetaKind.ty, unitType, checkValue]; rfl)
+  | ElementCount =>
+    cases pm with
+    | none => cases henc
+    | some pmv =>
+      cases pmv with
+      | VTablePointer p => cases henc
+      | ElementCount c =>
+        cases henc
+        cases hc : IntType.can_represent IntType.usize_ty c with
+        | true => exact Or.inl (by rw [PointerMetaKind.ty, checkValue, ensureElseUb, hc]; rfl)
+        | false => exact Or.inr ⟨_, by rw [PointerMetaKind.ty, checkValue, ensureElseUb, hc]; rfl⟩
+
+/-- Polymorphic `checkValue_nonVTable_meta_ok_or_ub` (in particular Tree Borrows). -/
+theorem checkValueM_nonVTable_meta_ok_or_ub {M : Type} [Gen.Memory M] [MemoryOps M]
+    (kind : Gen.PointerMetaKind) (pm : Option (Gen.PointerMeta (Gen.Memory.Provenance M)))
+    (m : Option (Gen.Machine M)) (mv : Gen.Value M)
+    (hk : ∀ t, kind ≠ .VTablePointer t)
+    (henc : PointerMetaKind.encode_as_valueM (M := M) kind pm = .ok mv) :
+    checkValueM mv (PointerMetaKind.ty kind) m = .ok () ∨
+      ∃ msg, checkValueM mv (PointerMetaKind.ty kind) m = .error (.ub msg) := by
+  cases kind with
+  | VTablePointer t => exact absurd rfl (hk t)
+  | None =>
+    cases pm with
+    | some _ => cases henc
+    | none =>
+      cases henc
+      exact Or.inl (by rw [PointerMetaKind.ty, unitType, checkValueM]; rfl)
+  | ElementCount =>
+    cases pm with
+    | none => cases henc
+    | some pmv =>
+      cases pmv with
+      | VTablePointer p => cases henc
+      | ElementCount c =>
+        cases henc
+        cases hc : IntType.can_represent IntType.usize_ty c with
+        | true => exact Or.inl (by rw [PointerMetaKind.ty, checkValueM, ensureElseUb, hc]; rfl)
+        | false => exact Or.inr ⟨_, by rw [PointerMetaKind.ty, checkValueM, ensureElseUb, hc]; rfl⟩
+
+/-- Whenever its sanity check runs (the metadata kind is not a vtable pointer,
+or a machine is supplied), `UnOp::GetMetadata` is upstream's single expression:
+`encode_as_value`, then `check_value(..).expect(..)` (`getMetadataSanity`).
+The two branches of `evalUnOp` therefore differ only in the machine-free
+vtable case, which stops with `unsupported` before the check. -/
+theorem evalUnOp_getMetadata_eq_sanity (ptr : Gen.Pointer Prov) (ptrTy : Gen.PtrType)
+    (m : Option Mach)
+    (h : (∀ t, PtrType.meta_kind ptrTy ≠ .VTablePointer t) ∨ ∃ mach, m = some mach) :
+    evalUnOp .GetMetadata (.Ptr ptr, .Ptr ptrTy) m =
+      (PointerMetaKind.encode_as_value (PtrType.meta_kind ptrTy) ptr.metadata >>= fun mv =>
+        getMetadataSanity (checkValue mv (PointerMetaKind.ty (PtrType.meta_kind ptrTy)) m)
+          (mv, PointerMetaKind.ty (PtrType.meta_kind ptrTy))) := by
+  rw [evalUnOp]
+  dsimp only
+  cases henc : PointerMetaKind.encode_as_value (PtrType.meta_kind ptrTy) ptr.metadata with
+  | error e => rfl
+  | ok mv =>
+    simp only [bind, Except.bind]
+    cases hk : PtrType.meta_kind ptrTy with
+    | VTablePointer t =>
+      rcases h with h | ⟨mach, rfl⟩
+      · exact absurd hk (h t)
+      · dsimp only
+        cases checkValue mv (PointerMetaKind.ty (.VTablePointer t)) (some mach) with
+        | ok u => cases u; rfl
+        | error e => cases e <;> rfl
+    | None =>
+      rw [hk] at henc
+      rcases checkValue_nonVTable_meta_ok_or_ub _ _ m mv (by intro t ht; cases ht) henc with
+        hc | ⟨msg, hc⟩ <;> (dsimp only; rw [hc]; rfl)
+    | ElementCount =>
+      rw [hk] at henc
+      rcases checkValue_nonVTable_meta_ok_or_ub _ _ m mv (by intro t ht; cases ht) henc with
+        hc | ⟨msg, hc⟩ <;> (dsimp only; rw [hc]; rfl)
+
+/-- Polymorphic `evalUnOp_getMetadata_eq_sanity` (in particular Tree Borrows). -/
+theorem evalUnOpM_getMetadata_eq_sanity {M : Type} [Gen.Memory M] [MemoryOps M]
+    (ptr : Gen.Pointer (Gen.Memory.Provenance M)) (ptrTy : Gen.PtrType)
+    (m : Option (Gen.Machine M))
+    (h : (∀ t, PtrType.meta_kind ptrTy ≠ .VTablePointer t) ∨ ∃ mach, m = some mach) :
+    evalUnOpM (M := M) .GetMetadata (.Ptr ptr, .Ptr ptrTy) m =
+      (PointerMetaKind.encode_as_valueM (M := M) (PtrType.meta_kind ptrTy) ptr.metadata >>=
+        fun mv =>
+          getMetadataSanity (checkValueM mv (PointerMetaKind.ty (PtrType.meta_kind ptrTy)) m)
+            (mv, PointerMetaKind.ty (PtrType.meta_kind ptrTy))) := by
+  rw [evalUnOpM]
+  dsimp only
+  cases henc : PointerMetaKind.encode_as_valueM (M := M) (PtrType.meta_kind ptrTy)
+      ptr.metadata with
+  | error e => rfl
+  | ok mv =>
+    simp only [bind, Except.bind]
+    cases hk : PtrType.meta_kind ptrTy with
+    | VTablePointer t =>
+      rcases h with h | ⟨mach, rfl⟩
+      · exact absurd hk (h t)
+      · dsimp only
+        cases checkValueM mv (PointerMetaKind.ty (.VTablePointer t)) (some mach) with
+        | ok u => cases u; rfl
+        | error e => cases e <;> rfl
+    | None =>
+      rw [hk] at henc
+      rcases checkValueM_nonVTable_meta_ok_or_ub _ _ m mv (by intro t ht; cases ht) henc with
+        hc | ⟨msg, hc⟩ <;> (dsimp only; rw [hc]; rfl)
+    | ElementCount =>
+      rw [hk] at henc
+      rcases checkValueM_nonVTable_meta_ok_or_ub _ _ m mv (by intro t ht; cases ht) henc with
+        hc | ⟨msg, hc⟩ <;> (dsimp only; rw [hc]; rfl)
+
+/-- The sanity check of `UnOp::GetMetadata` on a thin or slice pointer cannot
+hide a stop of `check_value`: the operator succeeds, panics in
+`encode_as_value` (metadata of the wrong kind), or raises the sanity-check
+panic for a slice length that is not a `usize`. Stated for the polymorphic
+`evalUnOpM`, that is, for every memory model. -/
+theorem evalUnOpM_getMetadata_nonVTable_ok_or_specPanic {M : Type} [Gen.Memory M] [MemoryOps M]
+    (ptr : Gen.Pointer (Gen.Memory.Provenance M)) (ptrTy : Gen.PtrType)
+    (m : Option (Gen.Machine M))
+    (hk : ∀ t, PtrType.meta_kind ptrTy ≠ .VTablePointer t) :
+    (∃ r, evalUnOpM (M := M) .GetMetadata (.Ptr ptr, .Ptr ptrTy) m = .ok r) ∨
+    evalUnOpM (M := M) .GetMetadata (.Ptr ptr, .Ptr ptrTy) m =
+      specPanic "PointerMeta::encode_as_value called with invalid value" ∨
+    evalUnOpM (M := M) .GetMetadata (.Ptr ptr, .Ptr ptrTy) m =
+      specPanic "GetMetadata: sanity check, returned meta is well-formed" := by
+  rw [evalUnOpM_getMetadata_eq_sanity ptr ptrTy m (Or.inl hk)]
+  cases henc : PointerMetaKind.encode_as_valueM (M := M) (PtrType.meta_kind ptrTy)
+      ptr.metadata with
+  | error e =>
+    refine Or.inr (Or.inl ?_)
+    unfold PointerMetaKind.encode_as_valueM at henc
+    split at henc <;> cases henc <;> rfl
+  | ok mv =>
+    rcases checkValueM_nonVTable_meta_ok_or_ub _ _ m mv hk henc with hc | ⟨msg, hc⟩
+    · exact Or.inl ⟨_, by simp only [bind, Except.bind, hc]; rfl⟩
+    · exact Or.inr (Or.inr (by simp only [bind, Except.bind, hc]; rfl))
+
 private theorem comparePtrM_bm_eq (lp rp : Gen.Pointer Prov) :
     comparePtrM lp rp = comparePtr lp rp := by
   unfold comparePtrM comparePtr
