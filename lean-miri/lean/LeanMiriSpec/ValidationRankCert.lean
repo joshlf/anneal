@@ -37,7 +37,10 @@ and `DataRangeSet` types:
    cycles) alongside `Schema17TypeNode` / `checkSchema17Table` mirroring `lean-miri#90`
    `Decoder.validateParsedDocument` across `.adt`, `.array`, `.slice`, `.patternType`,
    `.unsafeBinder`, `.tuple`, `.closure`, `.coroutine` `savedTypes`, and `normalizedType` aliases
-   while decoupling `.pointerIndirection` edges, with soundness and acyclicity theorems.
+   while decoupling `.pointerIndirection` edges, with soundness and acyclicity theorems, and the
+   end-to-end checker-to-adequacy bridge `schema17_certified_walkFuel_eq_walkNoFuel` /
+   `ofSchema17_walkFuel_eq_walkNoFuel` (any accepted table ⇒ bounded fuel `> layoutOrder root`
+   agrees with fuel-free validation for table-respecting walks).
 3. Rank-guarded traversals:
    - `RankedWalk` (`layoutOrder`) and `VisitLexWalk` (`visitOrder` under `Prod.Lex`, paired with an
      unconditional `Classical.choice`-free `ω · 2` nested-`Nat.rec` structural companion
@@ -1356,6 +1359,129 @@ theorem certified_walkFuel_eq_walkNoFuel {S α : Type} (cert : ValidationRankCer
     (ofGraph cert g pre).walkFuel fuel root acc = (ofGraph cert g pre).walkNoFuel root acc :=
   (ofGraph cert g pre).walkFuel_eq_walkNoFuel _ (ofGraph_descendsOn cert g pre hcert)
     fuel root acc hroot hfuel
+
+/-! ### End-to-end: Schema 17 type tables accepted by `checkSchema17Table` give fuel adequacy -/
+
+/-- A `RankedWalk` *respects* a Schema 17 table when every child projected from a place whose type
+resolves in the table has a type that is one of that table node's by-value children. -/
+def Schema17Respects {S Pl α : Type} (nodes : List Schema17TypeNode) (h : RankedWalk S Pl α) :
+    Prop :=
+  ∀ p node, nodes.find? (·.id == (h.layoutOf p).ty) = some node →
+    ∀ (s : S) (cs : Array Pl) (s' : S), h.children p s = .ok cs s' →
+      ∀ c ∈ cs.toList, ∃ children, schema17ByValueChildren node = .ok children ∧
+        (h.layoutOf c).ty ∈ children
+
+/-- **Schema 17 table → hook descent.** If `checkSchema17Table nodes` accepts, the walk ranks types
+by `Schema17TypeNode.toCert nodes`, and its projections respect the table, then the walk descends
+(in `layoutOrder`) on every place whose type resolves in the table. -/
+theorem schema17_descendsOn {S Pl α : Type} (nodes : List Schema17TypeNode)
+    (h : RankedWalk S Pl α) (hcheck : checkSchema17Table nodes = .ok ())
+    (hrank : h.typeRank = (Schema17TypeNode.toCert nodes).tyRank)
+    (hresp : Schema17Respects nodes h) :
+    h.DescendsOn (fun p => ∃ node, nodes.find? (·.id == (h.layoutOf p).ty) = some node) := by
+  rintro p ⟨node, hnode⟩ s cs s' hch c hc
+  obtain ⟨children, hchildren, hmem⟩ := hresp p node hnode s cs s' hch c hc
+  have hnodeMem : node ∈ nodes := List.mem_of_find?_eq_some hnode
+  have hid : node.id = (h.layoutOf p).ty := by simpa [beq_iff_eq] using List.find?_some hnode
+  obtain ⟨children', hch', hall⟩ := checkSchema17Table_sound nodes hcheck node hnodeMem
+  rw [hchildren] at hch'
+  injection hch' with hce
+  subst hce
+  obtain ⟨source, hsrc, _⟩ := hall _ hmem
+  refine ⟨⟨source, hsrc⟩, ?_⟩
+  obtain ⟨children'', hch'', hlt⟩ := checkSchema17Table_toCert_rank_lt nodes hcheck node hnodeMem
+  rw [hchildren] at hch''
+  injection hch'' with hce'
+  subst hce'
+  have hrk := hlt _ hmem
+  unfold RankedWalk.order
+  rw [hrank]
+  apply layoutOrder_lt_of_rank_lt
+  rw [← hid]
+  exact hrk
+
+/-- **End-to-end Schema 17 adequacy.** For every type table accepted by `checkSchema17Table` and
+every table-respecting walk ranked by `Schema17TypeNode.toCert`, bounded-fuel validation of any
+place whose type resolves in the table agrees with fuel-free validation for every
+`fuel > layoutOrder root` (in particular the canonical `fuel := rank(root) + 1` bound in
+`layoutOrder` units). -/
+theorem schema17_certified_walkFuel_eq_walkNoFuel {S Pl α : Type} (nodes : List Schema17TypeNode)
+    (h : RankedWalk S Pl α) (hcheck : checkSchema17Table nodes = .ok ())
+    (hrank : h.typeRank = (Schema17TypeNode.toCert nodes).tyRank)
+    (hresp : Schema17Respects nodes h) (root : Pl)
+    (hroot : ∃ node, nodes.find? (·.id == (h.layoutOf root).ty) = some node)
+    (acc : α) (fuel : Nat) (hfuel : h.order root < fuel) :
+    h.walkFuel fuel root acc = h.walkNoFuel root acc :=
+  h.walkFuel_eq_walkNoFuel _ (schema17_descendsOn nodes h hcheck hrank hresp) fuel root acc hroot
+    hfuel
+
+/-- Child layouts of a type read off a Schema 17 table (no children for undeclared types). -/
+def schema17ChildLayouts (nodes : List Schema17TypeNode) (layoutFor : Miri.MIR.TyId → LocalLayout)
+    (ty : Miri.MIR.TyId) : Except String (Array LocalLayout) :=
+  match nodes.find? (·.id == ty) with
+  | none => .ok #[]
+  | some node => (schema17ByValueChildren node).map fun cs => (cs.map layoutFor).toArray
+
+/-- Lift a decoder-level result into the validity monad (`.invalidProgram` on failure). -/
+def liftSchema17 {S A : Type} : Except String A → M S A
+  | .ok a => pure a
+  | .error e => throw (.invalidProgram e)
+
+/-- The walk read off a Schema 17 table: a place's children are the layouts (`layoutFor`) of its
+type node's by-value children (`.invalidProgram` on an unresolvable coroutine saved type). -/
+def ofSchema17 {S α : Type} (nodes : List Schema17TypeNode)
+    (layoutFor : Miri.MIR.TyId → LocalLayout) (pre : LocalLayout → α → M S α) :
+    RankedWalk S LocalLayout α where
+  typeRank := (Schema17TypeNode.toCert nodes).tyRank
+  layoutOf := id
+  pre := pre
+  children := fun p => liftSchema17 (schema17ChildLayouts nodes layoutFor p.ty)
+
+/-- `ofSchema17` respects its table whenever `layoutFor` preserves type ids. -/
+theorem ofSchema17_respects {S α : Type} (nodes : List Schema17TypeNode)
+    (layoutFor : Miri.MIR.TyId → LocalLayout) (pre : LocalLayout → α → M S α)
+    (hfor : ∀ ty, (layoutFor ty).ty = ty) :
+    Schema17Respects nodes (ofSchema17 nodes layoutFor pre) := by
+  intro p node hnode s cs s' hch c hc
+  simp only [ofSchema17, id] at hnode hch ⊢
+  cases hx : schema17ChildLayouts nodes layoutFor p.ty with
+  | error e =>
+    rw [hx] at hch
+    cases hch
+  | ok arr =>
+    rw [hx] at hch
+    simp only [liftSchema17, pure, EStateM.pure, EStateM.Result.ok.injEq] at hch
+    obtain ⟨rfl, -⟩ := hch
+    unfold schema17ChildLayouts at hx
+    rw [hnode] at hx
+    dsimp only at hx
+    cases hb : schema17ByValueChildren node with
+    | error e =>
+      rw [hb] at hx
+      cases hx
+    | ok children =>
+      rw [hb] at hx
+      simp only [Except.map, Except.ok.injEq] at hx
+      subst hx
+      refine ⟨children, rfl, ?_⟩
+      simp only [List.mem_map] at hc
+      obtain ⟨ty, hty, rfl⟩ := hc
+      rw [hfor]
+      exact hty
+
+/-- **Checker-to-adequacy, fully discharged.** For every Schema 17 table accepted by
+`checkSchema17Table`, the walk read off the table satisfies bounded-fuel = fuel-free validation at
+every `fuel > layoutOrder root`, for every root whose type is declared in the table. -/
+theorem ofSchema17_walkFuel_eq_walkNoFuel {S α : Type} (nodes : List Schema17TypeNode)
+    (layoutFor : Miri.MIR.TyId → LocalLayout) (pre : LocalLayout → α → M S α)
+    (hfor : ∀ ty, (layoutFor ty).ty = ty) (hcheck : checkSchema17Table nodes = .ok ())
+    (root : LocalLayout) (hroot : ∃ node, nodes.find? (·.id == root.ty) = some node)
+    (acc : α) (fuel : Nat)
+    (hfuel : layoutOrder (Schema17TypeNode.toCert nodes).tyRank root < fuel) :
+    (ofSchema17 nodes layoutFor pre).walkFuel fuel root acc =
+      (ofSchema17 nodes layoutFor pre).walkNoFuel root acc :=
+  schema17_certified_walkFuel_eq_walkNoFuel nodes _ hcheck rfl
+    (ofSchema17_respects nodes layoutFor pre hfor) root hroot acc fuel hfuel
 
 /-! ## 5. Bridge to `Anneal.MirFuelFree` -/
 
@@ -4173,6 +4299,10 @@ loop goes through the opaque `repeatM.impl`), whereas `lean-miri#90`'s structura
   vendored_unionRanges_eq_noFuel
   ofGraph_descendsOn
   certified_walkFuel_eq_walkNoFuel
+  schema17_descendsOn
+  ofSchema17_respects
+  schema17_certified_walkFuel_eq_walkNoFuel
+  ofSchema17_walkFuel_eq_walkNoFuel
   rankCountdown_converges_iff
   rankCountdown_canonical
   walkFuel_eq_walkNoFuel_of_wpCoalBounded

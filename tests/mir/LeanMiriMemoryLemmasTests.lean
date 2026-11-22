@@ -1703,6 +1703,32 @@ theorem wit_schema17_goodTable_toCert_rank_lt :
           (Schema17TypeNode.toCert schema17GoodTable).tyRank node.id :=
   checkSchema17Table_toCert_rank_lt schema17GoodTable wit_schema17_pointer_recursive_ok
 
+/-- Layout for every type id of the Schema 17 good table (single sized aggregate shape). -/
+def schema17LayoutFor (ty : Miri.MIR.TyId) : LocalLayout := ⟨ty, wrapperLayout⟩
+
+/-- **End-to-end checker → adequacy on a concrete table.** The walk read off the accepted
+pointer-recursive/coroutine table agrees between bounded fuel and fuel-free validation from the
+coroutine root (`ty 3`, rank 2, `layoutOrder 7`) at every `fuel > 7`. -/
+theorem wit_schema17_goodTable_walkFuel_eq_walkNoFuel (fuel : Nat) (hfuel : 7 < fuel) :
+    (ofSchema17 (S := Unit) schema17GoodTable schema17LayoutFor (fun _ acc => pure acc)).walkFuel
+        fuel (schema17LayoutFor 3) () =
+      (ofSchema17 (S := Unit) schema17GoodTable schema17LayoutFor (fun _ acc => pure acc)).walkNoFuel
+        (schema17LayoutFor 3) () :=
+  ofSchema17_walkFuel_eq_walkNoFuel schema17GoodTable schema17LayoutFor _ (fun _ => rfl)
+    wit_schema17_pointer_recursive_ok _ ⟨_, rfl⟩ () fuel (by
+      rw [show layoutOrder (Schema17TypeNode.toCert schema17GoodTable).tyRank
+          (schema17LayoutFor 3) = 7 by decide +kernel]
+      exact hfuel)
+
+/-- ... and the canonical fuel `layoutOrder root + 1 = 8` succeeds in the kernel while fuel `2`
+exhausts (the coroutine → ListNode → u32 chain has three levels). -/
+theorem wit_schema17_goodTable_canonical_fuel :
+    resultOk ((ofSchema17 (S := Unit) schema17GoodTable schema17LayoutFor
+        (fun _ acc => pure acc)).walkFuel 8 (schema17LayoutFor 3) () ()) = true ∧
+      resultExhausted "validity traversal fuel" ((ofSchema17 (S := Unit) schema17GoodTable
+        schema17LayoutFor (fun _ acc => pure acc)).walkFuel 2 (schema17LayoutFor 3) () ()) = true := by
+  exact ⟨by decide +kernel, by decide +kernel⟩
+
 /-! ### 3d. `visitOrder` (`(if isSized then 0 else 1, layoutOrder)`) & `dyn Trait` dynamic unpacking -/
 
 /-- Unsized `dyn Trait` layout (`ty = 0`, `backendRepr = .Memory (sized := false)`, `isSized = false`,
