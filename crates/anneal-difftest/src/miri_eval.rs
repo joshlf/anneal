@@ -2170,7 +2170,7 @@ pub fn minimize_miri_candidate_mutations(
     original_report: &ItemOracleReport,
     anneal_repo_root: Option<&Path>,
 ) -> Result<MiriCandidateShrinkResult, String> {
-    let toolchain = MiriToolchain::resolve(None, None, None)?;
+    let toolchain = resolve_miri_toolchain_safe()?;
     // Artifacts of signature-matching oracle runs, keyed by evaluated `fn_source`.
     let mut artifacts_by_source: BTreeMap<String, (String, String)> = BTreeMap::new();
     let eval_live = |sub_cand: &GeneratedMiriCandidate| -> Option<ItemOracleReport> {
@@ -4548,6 +4548,91 @@ fn acquire_live_lean_oracle_lock() -> (
     (guard, lock_file)
 }
 
+/// Returns `true` iff `sysroot` contains a compiled `libcore*.rlib` under
+/// `lib/rustlib/<target>/lib/`.
+///
+/// `cargo miri setup` creates `<sysroot>/lib/rustlib` before `libcore.rlib`
+/// finishes building; checking only `lib/rustlib` allows a concurrent caller
+/// to bypass `<sysroot>/.setup.lock` and hit `error[E0463]: can't find crate for core`.
+fn miri_sysroot_has_core_rlib(sysroot: &Path) -> bool {
+    let rustlib = sysroot.join("lib/rustlib");
+    let Ok(targets) = fs::read_dir(&rustlib) else {
+        return false;
+    };
+    for target in targets.flatten() {
+        let lib_dir = target.path().join("lib");
+        let Ok(entries) = fs::read_dir(&lib_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("libcore") && name.ends_with(".rlib") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Serializes `MiriToolchain::resolve(None, None, None)` across both threads in
+/// this process and concurrent processes via advisory file locks, and waits on
+/// `<sysroot>/.setup.lock` + verifies `libcore*.rlib` exists so parallel
+/// `cargo test` runs never observe a half-built Miri sysroot (`E0463`).
+fn resolve_miri_toolchain_safe() -> Result<MiriToolchain, String> {
+    static MIRI_TOOLCHAIN_RESOLVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = MIRI_TOOLCHAIN_RESOLVE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let lock_path = env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .and_then(|dir| {
+            fs::create_dir_all(&dir)
+                .ok()
+                .map(|()| dir.join("anneal-miri-sysroot-resolve.lock"))
+        })
+        .unwrap_or_else(|| env::temp_dir().join("anneal_miri_sysroot_resolve.lock"));
+    let global_lock = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok();
+    if let Some(ref f) = global_lock {
+        let _ = f.lock();
+    }
+    let toolchain = MiriToolchain::resolve(None, None, None)?;
+    // If an external process is currently running `cargo miri setup` on this
+    // sysroot, wait for it to release `<sysroot>/.setup.lock`.
+    let setup_lock = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(toolchain.miri_sysroot.join(".setup.lock"))
+        .ok();
+    if let Some(ref f) = setup_lock {
+        let _ = f.lock();
+    }
+    if !miri_sysroot_has_core_rlib(&toolchain.miri_sysroot) {
+        drop(setup_lock);
+        let rustlib = toolchain.miri_sysroot.join("lib/rustlib");
+        if rustlib.is_dir() {
+            let _ = fs::remove_dir_all(&rustlib);
+        }
+        let rebuilt = MiriToolchain::resolve(None, None, None)?;
+        if !miri_sysroot_has_core_rlib(&rebuilt.miri_sysroot) {
+            return Err(format!(
+                "Miri sysroot at {} is missing libcore*.rlib after setup",
+                rebuilt.miri_sysroot.display()
+            ));
+        }
+        return Ok(rebuilt);
+    }
+    Ok(toolchain)
+}
+
 /// Upper cap on Lean's per-process memory flag (`lean -M`, in MiB) for Stage 1
 /// probe evaluation runs of `oracle/MiriOracleProbe_*.lean`.
 const PROBE_LEAN_MEMORY_MB_CAP: u64 = 8192;
@@ -6382,7 +6467,7 @@ pub fn evaluate_miri_batches_with_options(
     let findings_dir = options.findings_dir.as_deref();
     let anneal_repo_root = options.anneal_repo_root.as_deref();
     let start = Instant::now();
-    let toolchain = MiriToolchain::resolve(None, None, None)?;
+    let toolchain = resolve_miri_toolchain_safe()?;
 
     let total_candidates: usize = batches.iter().map(Vec::len).sum();
     let compile_results = compile_candidates(batches);
@@ -6943,7 +7028,7 @@ pub fn reproduce_miri_finding(
         ));
     };
 
-    let toolchain = MiriToolchain::resolve(None, None, None)?;
+    let toolchain = resolve_miri_toolchain_safe()?;
     let staging_dir = create_staging_dir("repro")?;
     if let Err(e) = fs::write(staging_dir.join("src/lib.rs"), &source) {
         let _ = fs::remove_dir_all(&staging_dir);
@@ -9493,7 +9578,7 @@ pub fn parameterized_after(x: u32) -> u32 { x }
             .and_then(Path::parent)
             .expect("repository root")
             .to_path_buf();
-        let toolchain = MiriToolchain::resolve(None, None, None).expect("resolve Miri toolchain");
+        let toolchain = resolve_miri_toolchain_safe().expect("resolve Miri toolchain");
 
         let live = evaluate_candidate_live(
             &cand,
@@ -10006,7 +10091,7 @@ fn probe_helper_protected_alias_write(_r: &u32, alias: *mut u32) -> u32 {
             .and_then(Path::parent)
             .expect("repository root")
             .to_path_buf();
-        let toolchain = MiriToolchain::resolve(None, None, None).expect("resolve Miri toolchain");
+        let toolchain = resolve_miri_toolchain_safe().expect("resolve Miri toolchain");
         let staging_dir = create_staging_dir(label).expect("staging dir");
         let crate_source = build_standalone_candidate_source(&fn_sources.join("\n"));
         fs::write(staging_dir.join("src/lib.rs"), &crate_source).expect("write probes");
@@ -14201,5 +14286,34 @@ pub fn cand_ep1_b4_rename() -> u32 {
             .is_empty(),
             "other_touches_uninit must not link Uninit_closure_cand's closure"
         );
+    }
+
+    #[test]
+    fn miri_sysroot_has_core_rlib_distinguishes_incomplete_and_ready_sysroots() {
+        let tmp = env::temp_dir().join(format!(
+            "anneal_miri_sysroot_core_check_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let target_lib = tmp.join("lib/rustlib/x86_64-unknown-linux-gnu/lib");
+        fs::create_dir_all(&target_lib).unwrap();
+        assert!(
+            !miri_sysroot_has_core_rlib(&tmp),
+            "empty lib/rustlib must not be treated as initialized"
+        );
+        fs::write(target_lib.join("libcore-deadbeef.rmeta"), b"stub").unwrap();
+        assert!(
+            !miri_sysroot_has_core_rlib(&tmp),
+            ".rmeta alone must not satisfy libcore*.rlib readiness check"
+        );
+        fs::write(target_lib.join("libcore-deadbeef.rlib"), b"stub").unwrap();
+        assert!(
+            miri_sysroot_has_core_rlib(&tmp),
+            "populated libcore*.rlib must satisfy readiness check"
+        );
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

@@ -45,6 +45,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import datetime
 import hashlib
 import json
@@ -4898,6 +4899,42 @@ LEAN_RUN_DEFAULT_TIMEOUT_SEC = {"file": 180, "build": 900}
 STEP_TERMINATE_GRACE_SEC = 10
 STEP_PIPE_DRAIN_SEC = 5
 
+# Hermetic Lake 4.34.1 artifact-cache restoration defaults: ensure cached `.olean`s
+# are restored into `.lake/build/lib/lean/` and `examples/.lake/build/lib/lean/`
+# rather than leaving stale `.olean` copies behind across commits.
+LAKE_ARTIFACT_CACHE_ENV: dict[str, str] = {
+    "LAKE_ARTIFACT_CACHE": "true",
+    "LAKE_RESTORE_ARTIFACTS": "true",
+}
+
+# Hosts / cgroups with an effective RAM ceiling strictly below 10 GiB (10240 MiB)
+# elaborate `LeanMiriSpec` (608-file `Miri` + `LeanMiriSpec` closure) single-threaded
+# to avoid `exit 137` cgroup OOM kills.
+LEAN_MIRI_SPEC_SINGLE_THREAD_RAM_THRESHOLD_MIB = 10240
+
+# Sentinel distinguishing "caller omitted `effective_ram_mib`" from an explicit
+# `None` (representing an unreadable `/proc` / cgroup probe).
+_RAM_UNSET: object = object()
+
+# Ordered longest-first so `.olean.server` / `.olean.private` / `.olean.hash` match
+# before `.olean`.
+_LEAN_ARTIFACT_SUFFIXES: tuple[str, ...] = (
+    ".olean.server.hash",
+    ".olean.private.hash",
+    ".olean.server",
+    ".olean.private",
+    ".olean.hash",
+    ".ilean.hash",
+    ".olean",
+    ".ilean",
+    ".trace",
+)
+_LEAN_PRIMARY_ARTIFACT_SUFFIXES: frozenset[str] = frozenset(
+    (".olean", ".olean.server", ".olean.private", ".ilean")
+)
+# Vendored upstream `Miri` modules (`lean-miri/vendor/Miri`) never import `Trusted`.
+_TRUSTED_INDEPENDENT_LIBS: frozenset[str] = frozenset(("Miri",))
+
 
 _LEAN_RUN_VALUE_OPTS: frozenset[str] = frozenset(
     (
@@ -5044,6 +5081,416 @@ def _ensure_toolchain_path(env: dict[str, str]) -> None:
         env["PATH"] = os.pathsep.join([*prepend, *parts])
 
 
+def _is_executable_file(path: Path) -> bool:
+    try:
+        return path.is_file() and os.access(path, os.X_OK)
+    except OSError:
+        return False
+
+
+def _resolve_anneal_lean_run(
+    repo_root: Path,
+    env: Mapping[str, str] | None = None,
+    home: Path | None = None,
+) -> Path | None:
+    """Resolve `anneal-lean-run` wrapper with strict precedence:
+    1. `ANNEAL_LEAN_RUN` environment variable (executable regular file),
+    2. Fleet-managed `anneal-lean-run` on `PATH` or `~/.local/bin/anneal-lean-run`
+       (so cron environments with minimal `PATH` still prefer the fleet wrapper),
+    3. Fallback to in-repo `repo_root / "scripts/anneal-lean-run"` (executable file).
+    """
+    env_map: Mapping[str, str] = os.environ if env is None else env
+
+    env_lean_run = env_map.get("ANNEAL_LEAN_RUN", "").strip()
+    if env_lean_run:
+        env_path = Path(env_lean_run)
+        if _is_executable_file(env_path):
+            return env_path
+
+    raw_path = env_map.get("PATH", "")
+    if raw_path:
+        path_lean_run = shutil.which("anneal-lean-run", path=raw_path)
+        if path_lean_run:
+            found_path = Path(path_lean_run)
+            if _is_executable_file(found_path):
+                return found_path
+
+    home_dir = home
+    if home_dir is None:
+        if env is None:
+            try:
+                home_dir = Path.home()
+            except (KeyError, RuntimeError):
+                home_dir = None
+        else:
+            raw_home = env_map.get("HOME", "").strip()
+            home_dir = Path(raw_home) if raw_home else None
+    if home_dir is not None:
+        user_local = home_dir / ".local/bin/anneal-lean-run"
+        if _is_executable_file(user_local):
+            return user_local
+
+    local_lean_run = repo_root / "scripts/anneal-lean-run"
+    if _is_executable_file(local_lean_run):
+        return local_lean_run
+    return None
+
+
+def _parse_cgroup_memory_limit_mib(path: Path, *, max_sentinel_bytes: int = 1 << 60) -> int | None:
+    """Read a cgroup memory limit file (`memory.max` or `memory.limit_in_bytes`)
+    returning the ceiling in MiB, or `None` if absent, unreadable, `"max"`, or
+    an unbounded kernel sentinel."""
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    if not raw or raw == "max":
+        return None
+    try:
+        val_bytes = int(raw)
+    except ValueError:
+        return None
+    if val_bytes < 0 or val_bytes >= max_sentinel_bytes:
+        return None
+    return val_bytes // (1024 * 1024)
+
+
+def _safe_cgroup_subpath(cgroup_root: Path, raw_rel: str) -> Path | None:
+    """Join a `/proc/self/cgroup` relative path onto `cgroup_root` without
+    allowing `..` traversal outside `cgroup_root`."""
+    rel = raw_rel.strip().lstrip("/")
+    if not rel:
+        return cgroup_root
+    parts = [p for p in rel.split("/") if p and p != "."]
+    if any(p == ".." for p in parts):
+        return None
+    return cgroup_root.joinpath(*parts)
+
+
+def _probe_effective_ram_ceiling_mib(
+    *,
+    proc_meminfo: Path = Path("/proc/meminfo"),
+    proc_self_cgroup: Path = Path("/proc/self/cgroup"),
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+) -> int | None:
+    """Probe the effective available RAM / cgroup memory ceiling in MiB.
+
+    Takes the minimum finite MiB bound across:
+    - Host `/proc/meminfo` `MemTotal` and `MemAvailable` (kB -> MiB),
+    - Cgroup v2 `memory.max` walked upward from the process's `0::` hierarchy
+      to `cgroup_root` (ignoring `"max"` and unbounded sentinels),
+    - Cgroup v1 `memory.limit_in_bytes` walked upward from any `:memory:`
+      hierarchy under `cgroup_root / "memory"` (if present).
+
+    Returns `None` only when no readable finite memory bound exists.
+    """
+    candidates_mib: list[int] = []
+
+    try:
+        meminfo_text = proc_meminfo.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        meminfo_text = ""
+    for line in meminfo_text.splitlines():
+        m = re.match(r"^(MemTotal|MemAvailable):\s+(\d+)\s+kB\b", line.strip())
+        if m:
+            candidates_mib.append(int(m.group(2)) // 1024)
+
+    try:
+        cg_text = proc_self_cgroup.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        cg_text = ""
+
+    v2_rel: str | None = None
+    v1_mem_rel: str | None = None
+    for line in cg_text.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        hier_id, controllers, rel_path = parts
+        if hier_id == "0" and controllers == "":
+            v2_rel = rel_path
+        elif "memory" in controllers.split(","):
+            v1_mem_rel = rel_path
+
+    if v2_rel is not None and cgroup_root.is_dir():
+        cur = _safe_cgroup_subpath(cgroup_root, v2_rel)
+        while cur is not None:
+            lim = _parse_cgroup_memory_limit_mib(cur / "memory.max", max_sentinel_bytes=1 << 60)
+            if lim is not None:
+                candidates_mib.append(lim)
+            if cur == cgroup_root:
+                break
+            parent = cur.parent
+            if parent == cur:
+                break
+            cur = parent
+
+    v1_root = cgroup_root / "memory"
+    if v1_mem_rel is not None and v1_root.is_dir():
+        cur = _safe_cgroup_subpath(v1_root, v1_mem_rel)
+        while cur is not None:
+            lim = _parse_cgroup_memory_limit_mib(
+                cur / "memory.limit_in_bytes", max_sentinel_bytes=1 << 50
+            )
+            if lim is not None:
+                candidates_mib.append(lim)
+            if cur == v1_root:
+                break
+            parent = cur.parent
+            if parent == cur:
+                break
+            cur = parent
+
+    return min(candidates_mib) if candidates_mib else None
+
+
+def _build_step_env(
+    step_name: str,
+    *,
+    base_env: Mapping[str, str] | None = None,
+    env_overrides: Mapping[str, str] | None = None,
+    effective_ram_mib: int | None | object = _RAM_UNSET,
+) -> dict[str, str]:
+    """Build an isolated subprocess environment for suite step `step_name`.
+
+    - Always populates toolchain dirs on `PATH` without mutating `os.environ`.
+    - Always sets `LAKE_ARTIFACT_CACHE=true` and `LAKE_RESTORE_ARTIFACTS=true`
+      so Lake 4.34.1 restores cached `.olean`s into workspace build dirs.
+    - For `lake_build_lean_miri_spec`, injects `LEAN_NUM_THREADS=1` whenever the
+      effective host/cgroup RAM ceiling is `< 10240 MiB` (`< 10 GiB`), while
+      preserving normal multi-threaded builds on `>= 10 GiB` hosts.
+    - Explicit `env_overrides` take final precedence.
+    """
+    env = dict(os.environ if base_env is None else base_env)
+    _ensure_toolchain_path(env)
+    env.update(LAKE_ARTIFACT_CACHE_ENV)
+    if step_name == "lake_build_lean_miri_spec":
+        ram_mib = (
+            _probe_effective_ram_ceiling_mib()
+            if effective_ram_mib is _RAM_UNSET
+            else effective_ram_mib
+        )
+        if (
+            isinstance(ram_mib, int)
+            and not isinstance(ram_mib, bool)
+            and ram_mib < LEAN_MIRI_SPEC_SINGLE_THREAD_RAM_THRESHOLD_MIB
+        ):
+            env["LEAN_NUM_THREADS"] = "1"
+    if env_overrides:
+        env.update(env_overrides)
+    return env
+
+
+def _lake_lib_src_dirs(lake_root: Path, repo_root: Path) -> tuple[dict[str, list[Path]], list[Path]]:
+    """Map top-level Lean library names to source directories from `lakefile.toml`,
+    plus ordered fallback source roots for synthetic/partial trees."""
+    by_lib: dict[str, list[Path]] = {}
+    lakefile = lake_root / "lakefile.toml"
+    if lakefile.is_file():
+        try:
+            cfg = tomllib.loads(lakefile.read_text(encoding="utf-8"))
+            for lib in cfg.get("lean_lib", []):
+                if not isinstance(lib, dict) or not lib.get("name"):
+                    continue
+                src_dir = (lake_root / str(lib.get("srcDir", "."))).resolve()
+                lib_name = str(lib["name"])
+                by_lib.setdefault(lib_name, [])
+                if src_dir not in by_lib[lib_name]:
+                    by_lib[lib_name].append(src_dir)
+                roots = lib.get("roots")
+                if isinstance(roots, list):
+                    for r in roots:
+                        if isinstance(r, str) and r:
+                            top = r.split(".", 1)[0]
+                            by_lib.setdefault(top, [])
+                            if src_dir not in by_lib[top]:
+                                by_lib[top].append(src_dir)
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
+
+    fallback_rels: tuple[str, ...] = (
+        "trusted/lean",
+        "theory",
+        "minirust/lean",
+        "lean-miri/lean",
+        "lean-miri/vendor",
+        "examples",
+        "examples/refinement",
+        "examples/step-result",
+        "examples/pass",
+        "examples/mir",
+    )
+    fallbacks = [(repo_root / rel).resolve() for rel in fallback_rels]
+    return by_lib, fallbacks
+
+
+def _find_lean_source_for_module(
+    rel_mod: Path,
+    by_lib: dict[str, list[Path]],
+    fallbacks: list[Path],
+) -> Path | None:
+    top = rel_mod.parts[0]
+    rel_lean = Path(f"{rel_mod.as_posix()}.lean")
+    seen: set[Path] = set()
+    for base in (*by_lib.get(top, ()), *fallbacks):
+        if base in seen:
+            continue
+        seen.add(base)
+        cand = base / rel_lean
+        try:
+            if cand.is_file():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def _newest_lean_mtime_ns(root_dir: Path) -> int | None:
+    """Return the newest `st_mtime_ns` among all `*.lean` files under `root_dir`,
+    or `None` if `root_dir` is absent or contains no `.lean` files."""
+    if not root_dir.is_dir():
+        return None
+    newest: int | None = None
+    for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+        dp = Path(dirpath)
+        dirnames[:] = [d for d in dirnames if not (dp / d).is_symlink()]
+        for fname in filenames:
+            if not fname.endswith(".lean"):
+                continue
+            try:
+                mtime_ns = (dp / fname).stat().st_mtime_ns
+            except OSError:
+                continue
+            if newest is None or mtime_ns > newest:
+                newest = mtime_ns
+    return newest
+
+
+def _split_lean_artifact_name(filename: str) -> tuple[str, str] | None:
+    for suffix in _LEAN_ARTIFACT_SUFFIXES:
+        if filename.endswith(suffix) and len(filename) > len(suffix):
+            return filename[: -len(suffix)], suffix
+    return None
+
+
+def clean_stale_oleans(repo_root: Path) -> list[Path]:
+    """Pre-flight `.olean` freshness coherence guard across workspace Lake roots
+    (`.` and `examples`).
+
+    Removes `.lake/build/lib/lean/<ModPath>.{olean,olean.server,olean.private,ilean}`
+    (and companion `.hash`/`.trace` files) when either:
+    1. Its corresponding `.lean` source file under `trusted/lean/`, `theory/`,
+       `minirust/lean/`, `lean-miri/`, or `examples/` has `mtime > olean_mtime`, or
+    2. Any `Trusted` `.olean` in that Lake root predates the newest
+       `trusted/lean/**/*.lean` source file (or a downstream `Trusted`-dependent
+       `.olean` itself predates the newest `trusted/lean/**/*.lean` source file).
+
+    Never follows directory symlinks or deletes anything outside
+    `<lake_root>/.lake/build/lib/lean/`. Fast no-op (`< 50 ms`) when `.olean`s
+    are fresh or absent.
+    """
+    newest_trusted_src_ns = _newest_lean_mtime_ns(repo_root / "trusted/lean")
+    removed: list[Path] = []
+
+    for lake_root in (repo_root, repo_root / "examples"):
+        lake_dir = lake_root / ".lake"
+        build_dir = lake_dir / "build"
+        lib_dir = build_dir / "lib"
+        lib_lean_dir = lib_dir / "lean"
+        if any(p.is_symlink() for p in (lake_dir, build_dir, lib_dir, lib_lean_dir)):
+            continue
+        if not lib_lean_dir.is_dir():
+            continue
+        lib_lean_real = lib_lean_dir.resolve()
+
+        # Group artifact files by module relative path (`Mod/SubMod`).
+        modules: dict[Path, dict[str, Path]] = {}
+        for dirpath, dirnames, filenames in os.walk(lib_lean_dir, followlinks=False):
+            dp = Path(dirpath)
+            dirnames[:] = [d for d in dirnames if not (dp / d).is_symlink()]
+            rel_dir = dp.relative_to(lib_lean_dir)
+            for fname in filenames:
+                parsed = _split_lean_artifact_name(fname)
+                if parsed is None:
+                    continue
+                stem, suffix = parsed
+                rel_mod = (rel_dir / stem) if rel_dir != Path(".") else Path(stem)
+                modules.setdefault(rel_mod, {})[suffix] = dp / fname
+
+        if not modules:
+            continue
+
+        by_lib, fallbacks = _lake_lib_src_dirs(lake_root, repo_root)
+
+        # Compute representative mtime (`st_mtime_ns`) for each module that owns
+        # at least one primary `.olean`/`.ilean` artifact (`None` => broken symlink / stale).
+        mod_mtime_ns: dict[Path, int | None] = {}
+        for rel_mod, arts in modules.items():
+            if not any(s in arts for s in _LEAN_PRIMARY_ARTIFACT_SUFFIXES):
+                continue
+            if ".olean" in arts:
+                try:
+                    mod_mtime_ns[rel_mod] = arts[".olean"].stat().st_mtime_ns
+                except OSError:
+                    mod_mtime_ns[rel_mod] = None
+            else:
+                mtimes: list[int] = []
+                broken = False
+                for s in _LEAN_PRIMARY_ARTIFACT_SUFFIXES:
+                    p = arts.get(s)
+                    if p is None:
+                        continue
+                    try:
+                        mtimes.append(p.stat().st_mtime_ns)
+                    except OSError:
+                        broken = True
+                        break
+                mod_mtime_ns[rel_mod] = None if (broken or not mtimes) else min(mtimes)
+
+        trusted_stale_in_root = False
+        if newest_trusted_src_ns is not None:
+            for rel_mod, art_ns in mod_mtime_ns.items():
+                if rel_mod.parts[0] == "Trusted" and (
+                    art_ns is None or art_ns < newest_trusted_src_ns
+                ):
+                    trusted_stale_in_root = True
+                    break
+
+        stale_mods: list[Path] = []
+        for rel_mod, art_ns in mod_mtime_ns.items():
+            top = rel_mod.parts[0]
+            is_stale = art_ns is None
+            if not is_stale and newest_trusted_src_ns is not None and top not in _TRUSTED_INDEPENDENT_LIBS:
+                if trusted_stale_in_root or art_ns < newest_trusted_src_ns:
+                    is_stale = True
+            if not is_stale:
+                src_lean = _find_lean_source_for_module(rel_mod, by_lib, fallbacks)
+                if src_lean is not None:
+                    try:
+                        if src_lean.stat().st_mtime_ns > art_ns:
+                            is_stale = True
+                    except OSError:
+                        pass
+            if is_stale:
+                stale_mods.append(rel_mod)
+
+        for rel_mod in sorted(stale_mods):
+            for art_path in sorted(modules[rel_mod].values()):
+                try:
+                    parent_real = art_path.parent.resolve()
+                except OSError:
+                    continue
+                if not parent_real.is_relative_to(lib_lean_real):
+                    continue
+                try:
+                    art_path.unlink(missing_ok=True)
+                    removed.append(art_path)
+                except OSError:
+                    continue
+
+    return sorted(removed)
+
+
 def _signal_process_group(pgid: int, sig: int) -> None:
     try:
         os.killpg(pgid, sig)
@@ -5103,10 +5550,7 @@ def _run_step(
     env_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     t0 = time.monotonic()
-    env = os.environ.copy()
-    _ensure_toolchain_path(env)
-    if env_overrides:
-        env.update(env_overrides)
+    env = _build_step_env(name, env_overrides=env_overrides)
     outer_timeout = _outer_timeout_sec(cmd, timeout_sec, env=env)
     timed_out = False
     try:
@@ -5356,18 +5800,9 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
     the two can never drift apart (`_outer_timeout_sec` adds the wrapper's slot
     queueing and a grace margin on top).
     """
-    env_lean_run = os.environ.get("ANNEAL_LEAN_RUN", "").strip()
-    local_lean_run = repo_root / "scripts/anneal-lean-run"
-    if env_lean_run and Path(env_lean_run).is_file() and os.access(env_lean_run, os.X_OK):
-        lean_run = env_lean_run
-        has_lean_run = True
-    elif local_lean_run.is_file() and os.access(local_lean_run, os.X_OK):
-        lean_run = str(local_lean_run)
-        has_lean_run = True
-    else:
-        path_lean_run = shutil.which("anneal-lean-run")
-        lean_run = path_lean_run or str(local_lean_run)
-        has_lean_run = path_lean_run is not None
+    resolved_lean_run = _resolve_anneal_lean_run(repo_root)
+    lean_run = str(resolved_lean_run) if resolved_lean_run is not None else str(repo_root / "scripts/anneal-lean-run")
+    has_lean_run = resolved_lean_run is not None
     steps: list[tuple[str, str, list[str], int]] = []
 
     def add(name: str, category: str, cmd: list[str], timeout_sec: int, wrap: str | None = None) -> None:
@@ -5563,6 +5998,11 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
             300,
             wrap="build",
         )
+        # Measures ~570 s on a 32-core host across `--lib`, `campaign_orchestrator`,
+        # `itree_difftest_oracle`, and `miri_difftest_oracle` (after preserving
+        # `anneal-trace` staging artifacts, narrowing ITree Lean imports to
+        # `TraceCheck`, and serializing Miri sysroot setup); 1500 s preserves ~2x
+        # headroom on 8-core capsules without adding wall time.
         add(
             "domain_integration_tests_anneal_difftest",
             "cat4_rust_domain_integration_tests",
@@ -5576,7 +6016,7 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
                 "--tests",
                 "--locked",
             ],
-            900,
+            1500,
             wrap="build",
         )
         add(
@@ -5852,6 +6292,8 @@ def run_suite_and_generate_dashboard(
     )
 
     steps_spec = build_suite_steps(repo_root, profile)
+    if any(s_name.startswith("lake_build_") for s_name, _, _, _ in steps_spec):
+        clean_stale_oleans(repo_root)
     step_results: list[dict[str, Any]] = []
     t0 = time.monotonic()
     for s_name, s_cat, s_cmd, s_timeout in steps_spec:

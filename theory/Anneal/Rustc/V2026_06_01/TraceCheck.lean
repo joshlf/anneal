@@ -5,7 +5,6 @@ import Anneal.ITree
 import Anneal.EffectWP
 import Anneal.ITreeWP
 import Anneal.Rustc.V2026_06_01.Lower
-import Anneal.Rustc.V2026_06_01.SymbolicEval
 
 namespace Anneal.Rustc.V2026_06_01.TraceCheck
 
@@ -23,7 +22,6 @@ open Anneal.ITree
 open Anneal.EffectWP
 open Anneal.ITreeWP
 open Anneal.Rustc.V2026_06_01.Lower
-open Anneal.Rustc.V2026_06_01.SymbolicEval (stepMirStatePeriodic stepMirStatePeriodic_eq)
 
 /-!
 Executable trace-consistency checking, differential-testing triage diagnostics

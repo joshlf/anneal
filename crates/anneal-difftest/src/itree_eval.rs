@@ -4054,7 +4054,19 @@ fn build_anneal_trace_proc_macro_dylib(
     }
     if let Some(parent) = shared_out.parent() {
         let _ = fs::create_dir_all(parent);
-        let _ = fs::copy(&tmp_out, &shared_out);
+        let staged_shared = parent.join(format!(
+            ".libanneal_trace_difftest.{}.{}.{ext}.tmp",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        if fs::copy(&tmp_out, &staged_shared).is_ok() {
+            if fs::rename(&staged_shared, &shared_out).is_err() {
+                let _ = fs::remove_file(&staged_shared);
+            }
+        }
     }
     Ok(tmp_out)
 }
@@ -4080,6 +4092,57 @@ impl AsRef<std::ffi::OsStr> for ItreeStagingSlot {
 impl Drop for ItreeStagingSlot {
     fn drop(&mut self) {
         release_itree_staging_dir(&self.path);
+    }
+}
+
+/// Lean module that every `ItreeDiff*` Stage 1 probe, Stage 2 confirmation,
+/// and `--reproduce` module actually opens (`TraceCheck` is isolated from
+/// `SymbolicEval` / `MirLiftCore` / `PureMirExec` / `SepLogicLenses`).
+const ITREE_TRACE_CHECK_MODULE: &str = "Anneal.Rustc.V2026_06_01.TraceCheck";
+
+/// Replace the broad `import Anneal` header emitted by `trace_observer` with
+/// `import Anneal.Rustc.V2026_06_01.TraceCheck` so `lake build` and
+/// `lake env lean` neither build nor mmap unrelated `Anneal` proof libraries.
+fn narrow_itree_trace_check_imports(src: String) -> String {
+    src.replacen(
+        "import Trusted\nimport Anneal\n",
+        &format!("import Trusted\nimport {ITREE_TRACE_CHECK_MODULE}\n"),
+        1,
+    )
+}
+
+/// Clean per-run staged outputs inside `<slot>/target` while preserving
+/// compiled `anneal-trace` dependency artifacts and fingerprints so `cargo`
+/// does not recompile `anneal-trace` on every ITree evaluation or shrink step.
+fn clean_itree_staging_target_dir(target_dir: &Path) {
+    let _ = fs::remove_dir_all(target_dir.join("anneal"));
+    let debug_dir = target_dir.join("debug");
+    if !debug_dir.is_dir() {
+        return;
+    }
+    let is_staged_crate_entry = |name: &str| {
+        name.starts_with("itree_diff_staged") || name.starts_with("libitree_diff_staged")
+    };
+    let remove_matching = |dir: &Path| {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if is_staged_crate_entry(&name_str) {
+                let path = entry.path();
+                if path.is_dir() {
+                    let _ = fs::remove_dir_all(&path);
+                } else {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+    };
+    remove_matching(&debug_dir);
+    for sub in ["deps", ".fingerprint", "incremental", "build"] {
+        remove_matching(&debug_dir.join(sub));
     }
 }
 
@@ -4126,7 +4189,6 @@ fn create_itree_staging_dir(label: &str, repo_root: &Path) -> Result<ItreeStagin
         Some(slot_dir) => {
             for rel in [
                 "src",
-                "target",
                 "anneal",
                 ".anneal/generated",
                 ".anneal/.lake/build/lib/lean/Mir",
@@ -4142,6 +4204,7 @@ fn create_itree_staging_dir(label: &str, repo_root: &Path) -> Result<ItreeStagin
             ] {
                 let _ = fs::remove_dir_all(slot_dir.join(rel));
             }
+            clean_itree_staging_target_dir(&slot_dir.join("target"));
             for file_rel in [
                 "collect_traces.rs",
                 "collect_traces_bin_o0",
@@ -4181,8 +4244,11 @@ fn create_itree_staging_dir(label: &str, repo_root: &Path) -> Result<ItreeStagin
          [workspace]\n",
         anneal_trace_dir.display()
     );
-    fs::write(slot.join("Cargo.toml"), cargo_toml)
-        .map_err(|e| format!("failed to write staged Cargo.toml: {e}"))?;
+    let cargo_toml_path = slot.join("Cargo.toml");
+    if fs::read_to_string(&cargo_toml_path).ok().as_deref() != Some(cargo_toml.as_str()) {
+        fs::write(&cargo_toml_path, cargo_toml)
+            .map_err(|e| format!("failed to write staged Cargo.toml: {e}"))?;
+    }
     Ok(slot)
 }
 
@@ -5246,7 +5312,7 @@ fn evaluate_itree_entries(
             |(f, _): &(String, Vec<String>)| f.as_str(),
             &mir_fn_to_fn,
             |_label: &str, chunk: &[(String, Vec<String>)]| {
-                let mut targets = vec!["Anneal".to_string()];
+                let mut targets = vec![ITREE_TRACE_CHECK_MODULE.to_string()];
                 for (_f, mods) in chunk {
                     for m in mods {
                         if !targets.contains(m) {
@@ -5331,7 +5397,10 @@ fn evaluate_itree_entries(
             batch_case_ident,
             &case_to_fn,
             |label: &str, chunk: &[BatchTraceEvalCase]| {
-                let src = render_batch_trace_probe_lean_module(&format!("Proof.{label}"), chunk);
+                let src = narrow_itree_trace_check_imports(render_batch_trace_probe_lean_module(
+                    &format!("Proof.{label}"),
+                    chunk,
+                ));
                 let slice_olean_kib = itree_slice_olean_footprint_kib(
                     olean_index.as_ref(),
                     chunk,
@@ -5448,7 +5517,11 @@ fn evaluate_itree_entries(
             .confirm_chunk_size
             .clamp(1, ITREE_MAX_CONFIRM_CHUNK_SIZE);
         let run_confirm_slice = |label: &str, slice: &[BatchTraceEvalCase]| {
-            let src = render_batch_trace_eval_lean_module(&format!("Proof.{label}"), slice, false);
+            let src = narrow_itree_trace_check_imports(render_batch_trace_eval_lean_module(
+                &format!("Proof.{label}"),
+                slice,
+                false,
+            ));
             let slice_olean_kib = itree_slice_olean_footprint_kib(
                 olean_index.as_ref(),
                 slice,
@@ -6477,7 +6550,7 @@ pub fn reproduce_itree_finding(
         };
 
         let anneal_dir = staging_dir.join(".anneal");
-        let mut lake_targets = vec!["Anneal".to_string(), root_mir_module];
+        let mut lake_targets = vec![ITREE_TRACE_CHECK_MODULE.to_string(), root_mir_module];
         lake_targets.extend(callee_sig_modules);
         run_itree_lake_build_targets(&anneal_dir, &lake_targets)?;
         let olean_index = measure_itree_olean_footprint_index(&anneal_dir);
@@ -6497,10 +6570,10 @@ pub fn reproduce_itree_finding(
         fs::create_dir_all(&verify_dir)
             .map_err(|e| format!("failed to create {}: {e}", verify_dir.display()))?;
 
-        let probe_src = render_batch_trace_probe_lean_module(
+        let probe_src = narrow_itree_trace_check_imports(render_batch_trace_probe_lean_module(
             "Proof.ItreeDiffReproProbe",
             std::slice::from_ref(&case),
-        );
+        ));
         let probe_stdout = run_itree_lean_module(
             &verify_dir,
             &anneal_dir,
@@ -6516,11 +6589,11 @@ pub fn reproduce_itree_finding(
             .ok_or_else(|| "missing repro_case in probe output".to_string())?;
         case.expected_diag_tag = Some(diag_tag.clone());
 
-        let confirm_src = render_batch_trace_eval_lean_module(
+        let confirm_src = narrow_itree_trace_check_imports(render_batch_trace_eval_lean_module(
             "Proof.ItreeDiffRepro",
             std::slice::from_ref(&case),
             false,
-        );
+        ));
         // A watchdog kill, Lean resource limit, signal, or missing toolchain is
         // inconclusive, never a kernel rejection (`kernel_confirmed = false`).
         let kernel_confirmed = match run_itree_lean_module(
@@ -11984,6 +12057,80 @@ mod tests {
                 && saw_unconfirmed_div > 20,
             "randomized pool audit must cover all branches: repl={saw_replacement} \
              exhausted={saw_budget_exhausted} partial={saw_partial} div={saw_unconfirmed_div}"
+        );
+    }
+
+    #[test]
+    fn clean_itree_staging_target_dir_preserves_anneal_trace_artifacts() {
+        let tmp = env::temp_dir().join(format!(
+            "anneal_itree_clean_target_test_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let target = tmp.join("target");
+        let anneal_units = target.join("anneal/units");
+        let debug = target.join("debug");
+        let deps = debug.join("deps");
+        let fp = debug.join(".fingerprint");
+        let incr = debug.join("incremental");
+        fs::create_dir_all(&anneal_units).unwrap();
+        fs::create_dir_all(&deps).unwrap();
+        fs::create_dir_all(fp.join("anneal-trace-abc123")).unwrap();
+        fs::create_dir_all(fp.join("itree_diff_staged-def456")).unwrap();
+        fs::create_dir_all(incr.join("itree_diff_staged-xyz")).unwrap();
+        fs::create_dir_all(incr.join("anneal_trace-keep")).unwrap();
+
+        let unit_file = anneal_units.join("unit.json");
+        let staged_lib = debug.join("libitree_diff_staged.rlib");
+        let staged_dep = deps.join("libitree_diff_staged-111.rmeta");
+        let trace_dep = deps.join("libanneal_trace-222.so");
+        let trace_fp = fp.join("anneal-trace-abc123/invoked.timestamp");
+        let staged_fp = fp.join("itree_diff_staged-def456/invoked.timestamp");
+        for f in [
+            &unit_file,
+            &staged_lib,
+            &staged_dep,
+            &trace_dep,
+            &trace_fp,
+            &staged_fp,
+        ] {
+            fs::write(f, b"stub").unwrap();
+        }
+
+        clean_itree_staging_target_dir(&target);
+
+        assert!(!target.join("anneal").exists(), "target/anneal must be removed");
+        assert!(!staged_lib.exists(), "staged crate rlib must be removed");
+        assert!(!staged_dep.exists(), "staged crate dep must be removed");
+        assert!(
+            !fp.join("itree_diff_staged-def456").exists(),
+            "staged crate fingerprint must be removed"
+        );
+        assert!(
+            !incr.join("itree_diff_staged-xyz").exists(),
+            "staged crate incremental dir must be removed"
+        );
+        assert!(trace_dep.is_file(), "anneal-trace dylib must be preserved");
+        assert!(trace_fp.is_file(), "anneal-trace fingerprint must be preserved");
+        assert!(
+            incr.join("anneal_trace-keep").is_dir(),
+            "non-staged incremental cache must be preserved"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn narrow_itree_trace_check_imports_replaces_umbrella_anneal_import_once() {
+        let raw = "import Trusted\nimport Anneal\nimport Mir.ItreeDiffStaged.foo\n-- import Anneal\n"
+            .to_string();
+        let narrowed = narrow_itree_trace_check_imports(raw);
+        assert_eq!(
+            narrowed,
+            "import Trusted\nimport Anneal.Rustc.V2026_06_01.TraceCheck\nimport Mir.ItreeDiffStaged.foo\n-- import Anneal\n"
         );
     }
 }

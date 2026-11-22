@@ -158,7 +158,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         mr = stage_a["minirust_authority"]
         self.assertEqual(mr["spec_files"], 27)
         self.assertEqual(mr["shallow_types_translated"], 100)
-        self.assertEqual(mr["interp_anchored_items"], 108)
+        self.assertEqual(mr["interp_anchored_items"], 114)
         self.assertGreater(mr["audited_declarations"], 500)
         # `interp_anchored_items` counts the well-formed `tokenSha256` pins of
         # `MiniRustSpec/Anchors.lean`. Recount them independently of the suite: a malformed
@@ -1648,7 +1648,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             "lake_build_correspondence": 900,
             "lake_build_minirust_spec": 1200,
             "lake_build_lean_miri_spec": 1800,
-            "domain_integration_tests_anneal_difftest": 900,
+            "domain_integration_tests_anneal_difftest": 1500,
             "cargo_anneal_e2e_minirust_correspondence": 600,
             "cargo_anneal_e2e_pipeline_and_adoption": 900,
         }
@@ -2896,6 +2896,366 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         )
         self.assertTrue(suite._scan_lean_declarations_and_pins(modules[1])["ambient_hole"])
         self.assertTrue(suite._scan_lean_declarations_and_pins(modules[2])["ambient_hole"])
+
+    def test_run_step_injects_lake_artifact_cache_env_without_mutating_os_environ(self) -> None:
+        # `_build_step_env` always enforces `LAKE_ARTIFACT_CACHE=true` and
+        # `LAKE_RESTORE_ARTIFACTS=true`, even if base env unset or disabled them,
+        # without mutating the caller's mapping or `os.environ`.
+        base = {"PATH": "/usr/bin", "LAKE_ARTIFACT_CACHE": "false", "LAKE_RESTORE_ARTIFACTS": "false"}
+        env = suite._build_step_env("lake_build_core_theory", base_env=base)
+        self.assertEqual(env["LAKE_ARTIFACT_CACHE"], "true")
+        self.assertEqual(env["LAKE_RESTORE_ARTIFACTS"], "true")
+        self.assertEqual(base["LAKE_ARTIFACT_CACHE"], "false")
+        self.assertEqual(base["LAKE_RESTORE_ARTIFACTS"], "false")
+
+        # End-to-end `_run_step` subprocess observes both variables as `"true"`.
+        with tempfile.TemporaryDirectory() as tmp:
+            out_file = Path(tmp) / "env.json"
+            probe_code = (
+                "import json, os, pathlib; "
+                f"pathlib.Path({str(out_file)!r}).write_text(json.dumps({{"
+                "'LAKE_ARTIFACT_CACHE': os.environ.get('LAKE_ARTIFACT_CACHE'), "
+                "'LAKE_RESTORE_ARTIFACTS': os.environ.get('LAKE_RESTORE_ARTIFACTS')"
+                "}))"
+            )
+            res = suite._run_step(
+                name="probe_lake_cache_env",
+                category="cat1_trusted_boundary",
+                cmd=[sys.executable, "-c", probe_code],
+                cwd=REPO_ROOT,
+                timeout_sec=10,
+            )
+            self.assertEqual(res["status"], "PASS", res.get("failure_excerpt"))
+            observed = json.loads(out_file.read_text(encoding="utf-8"))
+            self.assertEqual(observed["LAKE_ARTIFACT_CACHE"], "true")
+            self.assertEqual(observed["LAKE_RESTORE_ARTIFACTS"], "true")
+
+    def test_resolve_anneal_lean_run_precedence_and_edge_cases(self) -> None:
+        def make_exe(path: Path, *, executable: bool = True) -> Path:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            path.chmod(0o755 if executable else 0o644)
+            return path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo_wrapper = make_exe(repo / "scripts/anneal-lean-run")
+            home_dir = root / "home"
+            home_wrapper = make_exe(home_dir / ".local/bin/anneal-lean-run")
+            path_bin = root / "path_bin"
+            path_wrapper = make_exe(path_bin / "anneal-lean-run")
+            env_wrapper = make_exe(root / "custom/anneal-lean-run")
+            non_exec = make_exe(root / "custom/non_exec_lean_run", executable=False)
+            broken_link = root / "custom/broken_lean_run"
+            broken_link.symlink_to(root / "does_not_exist")
+
+            # 1. `ANNEAL_LEAN_RUN` takes highest precedence when executable file.
+            self.assertEqual(
+                suite._resolve_anneal_lean_run(
+                    repo,
+                    env={
+                        "ANNEAL_LEAN_RUN": str(env_wrapper),
+                        "PATH": str(path_bin),
+                        "HOME": str(home_dir),
+                    },
+                ),
+                env_wrapper,
+            )
+
+            # 2. Invalid/non-executable/broken-symlink/directory `ANNEAL_LEAN_RUN`
+            #    falls through to `PATH`.
+            for bad in (str(non_exec), str(broken_link), str(root / "custom"), "   "):
+                self.assertEqual(
+                    suite._resolve_anneal_lean_run(
+                        repo,
+                        env={
+                            "ANNEAL_LEAN_RUN": bad,
+                            "PATH": str(path_bin),
+                            "HOME": str(home_dir),
+                        },
+                    ),
+                    path_wrapper,
+                    f"bad ANNEAL_LEAN_RUN={bad!r} should fall through to PATH",
+                )
+
+            # 3. Minimal cron `PATH` (omitting `~/.local/bin`) prefers fleet-managed
+            #    `~/.local/bin/anneal-lean-run` over in-repo `scripts/anneal-lean-run`.
+            self.assertEqual(
+                suite._resolve_anneal_lean_run(
+                    repo,
+                    env={"PATH": "/usr/bin:/bin", "HOME": str(home_dir)},
+                ),
+                home_wrapper,
+            )
+
+            # 4. When `~/.local/bin/anneal-lean-run` is absent or non-executable and
+            #    not on `PATH`, falls back to in-repo `scripts/anneal-lean-run`.
+            home_wrapper.chmod(0o644)
+            self.assertEqual(
+                suite._resolve_anneal_lean_run(
+                    repo,
+                    env={"PATH": "/usr/bin:/bin", "HOME": str(home_dir)},
+                ),
+                repo_wrapper,
+            )
+            self.assertEqual(
+                suite._resolve_anneal_lean_run(repo, env={"PATH": ""}),
+                repo_wrapper,
+            )
+
+            # 5. Returns `None` when none of the candidates is executable.
+            repo_wrapper.chmod(0o644)
+            self.assertIsNone(
+                suite._resolve_anneal_lean_run(
+                    repo,
+                    env={"PATH": "/usr/bin:/bin", "HOME": str(home_dir)},
+                )
+            )
+
+    def test_clean_stale_oleans_freshness_transitive_trusted_and_safety(self) -> None:
+        def touch(path: Path, ts_sec: float) -> Path:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x", encoding="utf-8")
+            os.utime(path, (ts_sec, ts_sec))
+            return path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            t_old = 1_700_000_000.0
+            t_mid = 1_700_000_100.0
+            t_new = 1_700_000_200.0
+
+            # Sources
+            touch(root / "trusted/lean/Trusted.lean", t_old)
+            touch(root / "trusted/lean/Trusted/Core.lean", t_old)
+            touch(root / "theory/Anneal/Fresh.lean", t_old)
+            touch(root / "theory/Anneal/Stale.lean", t_new)
+            touch(root / "minirust/lean/MiniRustSpec/Spec.lean", t_old)
+            touch(root / "examples/Smoke.lean", t_new)
+            touch(root / "lean-miri/vendor/Miri/Keep.lean", t_old)
+
+            # Root `.lake/build/lib/lean/` artifacts
+            trusted_olean = touch(root / ".lake/build/lib/lean/Trusted.olean", t_mid)
+            trusted_core = touch(root / ".lake/build/lib/lean/Trusted/Core.olean", t_mid)
+            fresh_olean = touch(root / ".lake/build/lib/lean/Anneal/Fresh.olean", t_mid)
+            stale_olean = touch(root / ".lake/build/lib/lean/Anneal/Stale.olean", t_mid)
+            stale_server = touch(root / ".lake/build/lib/lean/Anneal/Stale.olean.server", t_mid)
+            stale_priv = touch(root / ".lake/build/lib/lean/Anneal/Stale.olean.private", t_mid)
+            stale_ilean = touch(root / ".lake/build/lib/lean/Anneal/Stale.ilean", t_mid)
+            spec_olean = touch(root / ".lake/build/lib/lean/MiniRustSpec/Spec.olean", t_mid)
+            # Non-artifact sentinel outside `.lake/build/lib/lean/` must never be touched.
+            outside_file = touch(root / ".lake/build/sentinel.olean", t_old)
+
+            # `examples/.lake/build/lib/lean/` artifacts
+            ex_smoke_olean = touch(root / "examples/.lake/build/lib/lean/Smoke.olean", t_mid)
+            ex_smoke_ilean = touch(root / "examples/.lake/build/lib/lean/Smoke.ilean", t_mid)
+            ex_miri_olean = touch(root / "examples/.lake/build/lib/lean/Miri/Keep.olean", t_mid)
+
+            # Case 1: Only directly stale modules (`Anneal/Stale`, `examples/Smoke`) are removed;
+            # fresh `Trusted`, `Anneal/Fresh`, `MiniRustSpec/Spec`, `Miri/Keep`, and outside files stay.
+            removed = suite.clean_stale_oleans(root)
+            self.assertEqual(
+                set(removed),
+                {stale_olean, stale_server, stale_priv, stale_ilean, ex_smoke_olean, ex_smoke_ilean},
+            )
+            self.assertTrue(trusted_olean.is_file())
+            self.assertTrue(trusted_core.is_file())
+            self.assertTrue(fresh_olean.is_file())
+            self.assertTrue(spec_olean.is_file())
+            self.assertTrue(ex_miri_olean.is_file())
+            self.assertTrue(outside_file.is_file())
+
+            # Case 2: Re-running when everything remaining is fresh is a fast no-op.
+            t0 = time.monotonic()
+            self.assertEqual(suite.clean_stale_oleans(root), [])
+            self.assertLess(time.monotonic() - t0, 0.25)
+
+            # Case 3: Updating `trusted/lean/Trusted/Core.lean` transitively invalidates
+            # `Trusted` and downstream `Anneal`/`MiniRustSpec` `.olean`s, while sparing
+            # vendored `Miri` (which does not import `Trusted`) and files outside `lib/lean/`.
+            touch(root / "trusted/lean/Trusted/Core.lean", t_new)
+            removed_trans = suite.clean_stale_oleans(root)
+            self.assertEqual(
+                set(removed_trans),
+                {trusted_olean, trusted_core, fresh_olean, spec_olean},
+            )
+            self.assertTrue(ex_miri_olean.is_file())
+            self.assertTrue(outside_file.is_file())
+
+            # Case 4: Symlink safety — never traverse a symlinked dir inside `lib/lean/`.
+            escape_dir = root / "outside_secret"
+            escape_file = touch(escape_dir / "Target.olean", t_old)
+            (root / ".lake/build/lib/lean/Anneal").mkdir(parents=True, exist_ok=True)
+            (root / ".lake/build/lib/lean/Anneal/Escape").symlink_to(escape_dir)
+            suite.clean_stale_oleans(root)
+            self.assertTrue(escape_file.is_file())
+
+    def test_probe_ram_ceiling_and_lean_miri_spec_single_thread_right_sizing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            meminfo_64g = root / "meminfo_64g"
+            meminfo_64g.write_text(
+                "MemTotal:       67108864 kB\nMemAvailable:   52428800 kB\n",
+                encoding="utf-8",
+            )
+            meminfo_8g = root / "meminfo_8g"
+            meminfo_8g.write_text(
+                "MemTotal:        8388608 kB\nMemAvailable:    6291456 kB\n",
+                encoding="utf-8",
+            )
+            cg_root = root / "cgroup"
+            leaf = cg_root / "user.slice/user-1000.slice/anneal.scope"
+            leaf.mkdir(parents=True)
+            proc_cg = root / "proc_self_cgroup"
+            proc_cg.write_text("0::/user.slice/user-1000.slice/anneal.scope\n", encoding="utf-8")
+
+            # Unbounded `"max"` across the hierarchy falls back to `/proc/meminfo`.
+            (cg_root / "memory.max").write_text("max\n", encoding="utf-8")
+            (cg_root / "user.slice/memory.max").write_text("max\n", encoding="utf-8")
+            (leaf / "memory.max").write_text("max\n", encoding="utf-8")
+            self.assertEqual(
+                suite._probe_effective_ram_ceiling_mib(
+                    proc_meminfo=meminfo_64g, proc_self_cgroup=proc_cg, cgroup_root=cg_root
+                ),
+                51200,
+            )
+            self.assertEqual(
+                suite._probe_effective_ram_ceiling_mib(
+                    proc_meminfo=meminfo_8g, proc_self_cgroup=proc_cg, cgroup_root=cg_root
+                ),
+                6144,
+            )
+
+            # Ancestor cgroup v2 `memory.max` (`5712 MiB` capsule cap) tightens host 64 GiB.
+            (cg_root / "user.slice/memory.max").write_text(
+                str(5712 * 1024 * 1024) + "\n", encoding="utf-8"
+            )
+            self.assertEqual(
+                suite._probe_effective_ram_ceiling_mib(
+                    proc_meminfo=meminfo_64g, proc_self_cgroup=proc_cg, cgroup_root=cg_root
+                ),
+                5712,
+            )
+
+            # Missing files yield `None` cleanly (no exception).
+            self.assertIsNone(
+                suite._probe_effective_ram_ceiling_mib(
+                    proc_meminfo=root / "nope", proc_self_cgroup=root / "nope2", cgroup_root=root / "nope3"
+                )
+            )
+
+        # `lake_build_lean_miri_spec` sets `LEAN_NUM_THREADS=1` iff ceiling < 10240 MiB.
+        low_env = suite._build_step_env(
+            "lake_build_lean_miri_spec",
+            base_env={"PATH": "/usr/bin", "LEAN_NUM_THREADS": "4"},
+            effective_ram_mib=5712,
+        )
+        self.assertEqual(low_env["LEAN_NUM_THREADS"], "1")
+
+        boundary_low = suite._build_step_env(
+            "lake_build_lean_miri_spec",
+            base_env={"PATH": "/usr/bin"},
+            effective_ram_mib=10239,
+        )
+        self.assertEqual(boundary_low["LEAN_NUM_THREADS"], "1")
+
+        boundary_high = suite._build_step_env(
+            "lake_build_lean_miri_spec",
+            base_env={"PATH": "/usr/bin"},
+            effective_ram_mib=10240,
+        )
+        self.assertNotIn("LEAN_NUM_THREADS", boundary_high)
+
+        high_preserve = suite._build_step_env(
+            "lake_build_lean_miri_spec",
+            base_env={"PATH": "/usr/bin", "LEAN_NUM_THREADS": "4"},
+            effective_ram_mib=32768,
+        )
+        self.assertEqual(high_preserve["LEAN_NUM_THREADS"], "4")
+
+        # Other steps are unaffected even under `< 10240 MiB`.
+        other_low = suite._build_step_env(
+            "lake_build_core_theory",
+            base_env={"PATH": "/usr/bin", "LEAN_NUM_THREADS": "4"},
+            effective_ram_mib=5712,
+        )
+        self.assertEqual(other_low["LEAN_NUM_THREADS"], "4")
+
+    def test_tracecheck_import_isolation_matches_check_trusted_downstream_targets(self) -> None:
+        tc_path = REPO_ROOT / "theory/Anneal/Rustc/V2026_06_01/TraceCheck.lean"
+        tc_imports = suite._lean_header_imports(tc_path)
+        self.assertIsNotNone(tc_imports)
+        assert tc_imports is not None
+        self.assertNotIn("Anneal.Rustc.V2026_06_01.SymbolicEval", tc_imports)
+
+        # Load `DOWNSTREAM_TARGETS` from `trusted/audit/check_trusted.py` and verify exact parity
+        # for `TraceCheck`, `Lower`, and `SymbolicEval`.
+        check_trusted_src = (REPO_ROOT / "trusted/audit/check_trusted.py").read_text(encoding="utf-8")
+        m = re.search(
+            r'\("Anneal\.Rustc\.V2026_06_01\.TraceCheck",\s*"[^"]+",\s*(\[[^\]]+\]),\s*"theory"\)',
+            check_trusted_src,
+        )
+        self.assertIsNotNone(m, "TraceCheck entry missing from check_trusted.py DOWNSTREAM_TARGETS")
+        assert m is not None
+        expected_tc_imports = json.loads(m.group(1))
+        actual_tc_proj = [imp for imp in tc_imports if not imp.startswith(("Init", "Std"))]
+        self.assertEqual(actual_tc_proj, expected_tc_imports)
+
+        # Also verify `Lower.lean` required zero new imports.
+        lower_imports = suite._lean_header_imports(
+            REPO_ROOT / "theory/Anneal/Rustc/V2026_06_01/Lower.lean"
+        )
+        self.assertIsNotNone(lower_imports)
+        assert lower_imports is not None
+        m_lower = re.search(
+            r'\("Anneal\.Rustc\.V2026_06_01\.Lower",\s*"[^"]+",\s*(\[[^\]]+\]),\s*"theory"\)',
+            check_trusted_src,
+        )
+        self.assertIsNotNone(m_lower)
+        assert m_lower is not None
+        self.assertEqual(
+            [imp for imp in lower_imports if not imp.startswith(("Init", "Std"))],
+            json.loads(m_lower.group(1)),
+        )
+
+    def test_domain_integration_tests_anneal_difftest_config_and_timeout_invariants(self) -> None:
+        nightly_steps = suite.build_suite_steps(REPO_ROOT, "nightly")
+        self.assertEqual(len(nightly_steps), 27)
+        for step in nightly_steps:
+            self.assertEqual(len(step), 4)
+        by_name = {name: (cat, cmd, timeout) for name, cat, cmd, timeout in nightly_steps}
+        self.assertIn("domain_integration_tests_anneal_difftest", by_name)
+        cat, cmd, timeout = by_name["domain_integration_tests_anneal_difftest"]
+        self.assertEqual(cat, "cat4_rust_domain_integration_tests")
+        self.assertEqual(timeout, 1500)
+        self.assertTrue(suite._is_lean_run_wrapped(cmd))
+        mode, inner_timeout, slot_lock = suite._lean_run_wrapper_flags(cmd)
+        self.assertEqual(mode, "build")
+        self.assertEqual(inner_timeout, timeout)
+        self.assertTrue(slot_lock)
+        sep = cmd.index("--")
+        self.assertEqual(
+            cmd[sep + 1 :],
+            [
+                "cargo",
+                "test",
+                "--manifest-path",
+                "crates/anneal-difftest/Cargo.toml",
+                "--lib",
+                "--bins",
+                "--tests",
+                "--locked",
+            ],
+        )
+        outer_timeout = suite._outer_timeout_sec(cmd, timeout)
+        self.assertGreater(outer_timeout, timeout)
+        # Step env always receives Lake artifact-cache restoration defaults and never leaks into os.environ.
+        before_env = os.environ.copy()
+        step_env = suite._build_step_env("domain_integration_tests_anneal_difftest")
+        self.assertEqual(step_env["LAKE_ARTIFACT_CACHE"], "true")
+        self.assertEqual(step_env["LAKE_RESTORE_ARTIFACTS"], "true")
+        self.assertEqual(os.environ, before_env)
 
 
 if __name__ == "__main__":
