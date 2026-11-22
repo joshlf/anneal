@@ -7240,7 +7240,63 @@ private theorem evalUnOpM_bm_eq (op : Gen.UnOp) (arg : Val × Gen.«Type») (m :
     cases v with
     | Ptr p => rcases p with ⟨_, _⟩; rfl
     | _ => rfl
-  | _ => rfl
+  | GetMetadata =>
+    cases v with
+    | Ptr ptr =>
+      cases ty with
+      | Ptr ptrTy =>
+        have hev : PointerMetaKind.encode_as_valueM (M := BM) (PtrType.meta_kind ptrTy) ptr.metadata =
+            PointerMetaKind.encode_as_value (PtrType.meta_kind ptrTy) ptr.metadata := by
+          cases PtrType.meta_kind ptrTy <;> rcases ptr.metadata with _ | (_ | _) <;> rfl
+        dsimp only
+        rw [hev]
+        refine bind_congr_right _ (fun mv => ?_)
+        cases PtrType.meta_kind ptrTy <;> dsimp only <;> try rfl
+        · rw [checkValueM_bm_eq]
+        · rw [checkValueM_bm_eq]
+      | _ => rfl
+    | _ => rfl
+  | ComputeSize cty =>
+    have hdv : PointerMetaKind.decode_valueM (M := BM) (Type.meta_kind cty) v =
+        PointerMetaKind.decode_value (Type.meta_kind cty) v := by
+      cases Type.meta_kind cty <;> cases v <;>
+        first
+        | rfl
+        | (rename_i xs; cases xs <;> rfl)
+        | (rename_i p; rcases p with ⟨_, _ | _⟩ <;> rfl)
+    dsimp only
+    rw [hdv]
+    refine bind_congr_right _ (fun pm => ?_)
+    rcases pm with _ | (_ | _) <;> try rfl
+    · refine bind_congr_right _ (fun lay => ?_)
+      cases m with
+      | none => rfl
+      | some mach => dsimp only; rw [computeSizeM_bm_eq]
+    · refine bind_congr_right _ (fun lay => ?_)
+      cases m with
+      | none => rfl
+      | some mach => dsimp only; rw [computeSizeM_bm_eq]
+  | ComputeAlign cty =>
+    have hdv : PointerMetaKind.decode_valueM (M := BM) (Type.meta_kind cty) v =
+        PointerMetaKind.decode_value (Type.meta_kind cty) v := by
+      cases Type.meta_kind cty <;> cases v <;>
+        first
+        | rfl
+        | (rename_i xs; cases xs <;> rfl)
+        | (rename_i p; rcases p with ⟨_, _ | _⟩ <;> rfl)
+    dsimp only
+    rw [hdv]
+    refine bind_congr_right _ (fun pm => ?_)
+    rcases pm with _ | (_ | _) <;> try rfl
+    · refine bind_congr_right _ (fun lay => ?_)
+      cases m with
+      | none => rfl
+      | some mach => dsimp only; rw [computeAlignM_bm_eq]
+    · refine bind_congr_right _ (fun lay => ?_)
+      cases m with
+      | none => rfl
+      | some mach => dsimp only; rw [computeAlignM_bm_eq]
+  | VTableMethodLookup _ => rfl
 
 private theorem comparePtrM_bm_eq (lp rp : Gen.Pointer Prov) :
     comparePtrM lp rp = comparePtr lp rp := by
@@ -7592,7 +7648,9 @@ theorem evalPlaceM_bm_eq :
               exact htail
       | _ => rfl
     | _ => rfl
-  | _, .Downcast _ _ => by unfold evalPlaceM evalPlace; rfl
+  | m, .Downcast root discriminant => by
+    unfold evalPlaceM evalPlace
+    exact bind_congr (evalPlaceM_bm_eq m root) (fun ⟨⟨_, _⟩, _⟩ => rfl)
 
 theorem evalValueM_bm_eq :
     ∀ (m : Mach) (ve : Gen.ValueExpr),
@@ -7692,9 +7750,48 @@ theorem evalValueM_bm_eq :
         · rfl
         · dsimp only [bind, Except.bind]
           rw [evalBinOpM_bm_eq]
-  | _, .Union _ _ _ => by unfold evalValueM evalValue; rfl
-  | _, .Variant _ _ _ => by unfold evalValueM evalValue; rfl
-  | _, .GetDiscriminant _ => by unfold evalValueM evalValue; rfl
+  | m, .Union field expr unionTy => by
+    unfold evalValueM evalValue
+    cases unionTy with
+    | Union fields chunks size align =>
+      dsimp only [pure, Except.pure, bind, Except.bind]
+      refine bind_congr_right _ (fun ⟨offset, exprTy⟩ => ?_)
+      dsimp only
+      refine bind_congr (evalValueM_bm_eq m expr) (fun ⟨⟨val, _⟩, m1⟩ => ?_)
+      dsimp only
+      refine bind_congr (Type.encodeM_bm_eq exprTy val) (fun encoded => ?_)
+      refine bind_congr_right _ (fun data => ?_)
+      exact bind_congr (Type.decodeM_bm_eq (.Union fields chunks size align) data)
+        (fun optV => by cases optV <;> rfl)
+    | _ => rfl
+  | m, .Variant discriminant data enumTy => by
+    unfold evalValueM evalValue
+    exact bind_congr (evalValueM_bm_eq m data) (fun ⟨⟨_, _⟩, _⟩ => rfl)
+  | m, .GetDiscriminant place => by
+    unfold evalValueM evalValue
+    refine bind_congr (evalPlaceM_bm_eq m place) (fun ⟨⟨pl, ty⟩, m1⟩ => ?_)
+    dsimp only
+    cases ty with
+    | Enum variants discriminantTy discriminator size align =>
+      dsimp only
+      split
+      · rfl
+      · have hacc :
+            (fun (m : Mach) (idx : Gen.Offset) (sz : Size) => do
+              let ptr ← ptrOffsetInboundsM (M := BM) m pl.ptr.thin_pointer (idx.bytes : Int)
+              let (bytes, cm) ← ConcurrentMemory.load (M := BM) m.mem ptr sz ⟨1⟩ .None
+              pure (bytes, { m with mem := cm })) =
+            (fun (m : Mach) (idx : Gen.Offset) (sz : Size) => do
+              let ptr ← ptrOffsetInbounds m pl.ptr.thin_pointer (idx.bytes : Int)
+              let (bytes, cm) ← CM.load m.mem ptr sz ⟨1⟩ .None
+              pure (bytes, { m with mem := cm })) := by
+          funext m0 idx sz
+          exact bind_congr (ptrOffsetInboundsM_bm_eq m0 pl.ptr.thin_pointer _) (fun ptr =>
+            bind_congr (cm_load_bm_eq m0.mem ptr sz ⟨1⟩ .None) (fun ⟨_, _⟩ => rfl))
+        rw [hacc]
+        exact bind_congr (decodeDiscriminantM_bm_eq _ discriminator m1)
+          (fun ⟨opt, _⟩ => by cases opt <;> rfl)
+    | _ => rfl
 
 theorem evalValuesM_bm_eq :
     ∀ (m : Mach) (es : List Gen.ValueExpr),
@@ -10215,6 +10312,59 @@ theorem placeStoreM_tb_wfLive {m m' : MachTB} {place : Gen.Place TBM}
 
 mutual
 
+/-- `decodeDiscriminantM` preserves every invariant `P` of the threaded state
+that each call of its accessor preserves. -/
+private theorem decodeDiscriminantM_inv {M : Type} [Gen.Memory M] {σ : Type} (P : σ → Prop)
+    {accessor : σ → Gen.Offset → Size → Interp (List (Gen.AbstractByte (Gen.Memory.Provenance M)) × σ)}
+    (hacc : ∀ s offset sz bs s', P s → accessor s offset sz = .ok (bs, s') → P s') :
+    ∀ (d : Gen.Discriminator) {s s' : σ} {opt : Option Int},
+      P s → decodeDiscriminantM (M := M) accessor d s = .ok (opt, s') → P s'
+  | .Known _, _, _, _, hs, h => by
+    unfold decodeDiscriminantM at h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact hs
+  | .Invalid, _, _, _, hs, h => by
+    unfold decodeDiscriminantM at h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact hs
+  | .Branch offset valueType fallback ⟨children⟩, _, _, _, hs, h => by
+    unfold decodeDiscriminantM at h
+    obtain ⟨⟨bs, s1⟩, ha, h⟩ := bind_ok h
+    have hs1 := hacc _ _ _ _ _ hs ha
+    obtain ⟨optv, _, h⟩ := bind_ok h
+    cases optv with
+    | none =>
+      obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+      exact hs1
+    | some v =>
+      cases v with
+      | Int val =>
+        exact decodeDiscriminantChildrenM_inv P hacc val
+          (decodeDiscriminantM (M := M) accessor fallback)
+          (fun hs' hfb => decodeDiscriminantM_inv P hacc fallback hs' hfb)
+          children hs1 h
+      | _ =>
+        obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+        exact hs1
+
+private theorem decodeDiscriminantChildrenM_inv {M : Type} [Gen.Memory M] {σ : Type} (P : σ → Prop)
+    {accessor : σ → Gen.Offset → Size → Interp (List (Gen.AbstractByte (Gen.Memory.Provenance M)) × σ)}
+    (hacc : ∀ s offset sz bs s', P s → accessor s offset sz = .ok (bs, s') → P s')
+    (val : Int) (onFallback : σ → Interp (Option Int × σ))
+    (hfb : ∀ {s s' : σ} {opt : Option Int}, P s → onFallback s = .ok (opt, s') → P s') :
+    ∀ (children : List ((Int × Int) × Gen.Discriminator)) {s s' : σ} {opt : Option Int},
+      P s → decodeDiscriminantChildrenM (M := M) accessor val onFallback children s = .ok (opt, s') → P s'
+  | [], _, _, _, hs, h => hfb hs h
+  | ((start, end_), child) :: rest, _, _, _, hs, h => by
+    unfold decodeDiscriminantChildrenM at h
+    split at h
+    · exact decodeDiscriminantM_inv P hacc child hs h
+    · exact decodeDiscriminantChildrenM_inv P hacc val onFallback hfb rest hs h
+
+end
+
+mutual
+
 /-- `evalPlaceM` on `MachTB` preserves `MachTB.wfLive`. -/
 theorem evalPlaceM_tb_wfLive :
     ∀ (pe : Gen.PlaceExpr) {m m' : MachTB} {out : Gen.Place TBM × Gen.Type},
@@ -10364,8 +10514,17 @@ theorem evalPlaceM_tb_wfLive :
             exact hm1
       | _ => cases h
     | _ => cases h
-  | .Downcast _ _, _, _, _, _, h => by
-    unfold evalPlaceM at h; cases h
+  | .Downcast root _, _, _, _, hwf, h => by
+    unfold evalPlaceM at h
+    obtain ⟨⟨⟨_, ty⟩, m1⟩, hr, h⟩ := bind_ok h
+    have hm1 := evalPlaceM_tb_wfLive root hwf hr
+    cases ty with
+    | Enum _ _ _ _ _ =>
+      dsimp only at h
+      obtain ⟨_, _, h⟩ := bind_ok h
+      obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+      exact hm1
+    | _ => dsimp only at h; cases h
 
 /-- `evalValueM` on `MachTB` preserves `MachTB.wfLive`. -/
 theorem evalValueM_tb_wfLive :
@@ -10414,9 +10573,53 @@ theorem evalValueM_tb_wfLive :
       obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
       exact evalValueM_tb_wfLive right (evalValueM_tb_wfLive left hwf hl) hr
     }
-  | .Union _ _ _, _, _, _, _, h => by unfold evalValueM at h; cases h
-  | .Variant _ _ _, _, _, _, _, h => by unfold evalValueM at h; cases h
-  | .GetDiscriminant _, _, _, _, _, h => by unfold evalValueM at h; cases h
+  | .Union _ expr unionTy, _, _, _, hwf, h => by
+    unfold evalValueM at h
+    cases unionTy with
+    | Union _ _ _ _ =>
+      dsimp only [pure, Except.pure, bind, Except.bind] at h
+      obtain ⟨⟨_, _⟩, _, h⟩ := bind_ok h
+      obtain ⟨⟨_, m1⟩, he, h⟩ := bind_ok h
+      have hm1 := evalValueM_tb_wfLive expr hwf he
+      obtain ⟨_, _, h⟩ := bind_ok h
+      obtain ⟨_, _, h⟩ := bind_ok h
+      obtain ⟨opt, _, h⟩ := bind_ok h
+      cases opt with
+      | none => cases h
+      | some _ =>
+        obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+        exact hm1
+    | _ => dsimp only at h; cases h
+  | .Variant _ data _, _, _, _, hwf, h => by
+    unfold evalValueM at h
+    obtain ⟨⟨_, m1⟩, hd, h⟩ := bind_ok h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact evalValueM_tb_wfLive data hwf hd
+  | .GetDiscriminant place, _, _, _, hwf, h => by
+    unfold evalValueM at h
+    obtain ⟨⟨⟨pl, ty⟩, m1⟩, hp, h⟩ := bind_ok h
+    have hm1 := evalPlaceM_tb_wfLive place hwf hp
+    cases ty with
+    | Enum _ _ discriminator _ _ =>
+      dsimp only at h
+      cases hpa : pl.aligned with
+      | false => simp only [hpa, Bool.not_false, ↓reduceIte] at h; cases h
+      | true =>
+        simp only [hpa, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h
+        obtain ⟨⟨opt, m2⟩, hdd, h⟩ := bind_ok h
+        have hm2 := decodeDiscriminantM_inv MachTB.wfLive
+          (fun s idx sz bs s' hs hacc => by
+            obtain ⟨p, _, hacc⟩ := bind_ok hacc
+            obtain ⟨⟨_, cm⟩, hld, hacc⟩ := bind_ok hacc
+            obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok hacc)
+            exact cm_tb_load_wfLive hs hld)
+          discriminator hm1 hdd
+        cases opt with
+        | none => cases h
+        | some _ =>
+          obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+          exact hm2
+    | _ => dsimp only at h; cases h
 
 /-- `evalValuesM` on `MachTB` preserves `MachTB.wfLive`. -/
 theorem evalValuesM_tb_wfLive :

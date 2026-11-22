@@ -58,8 +58,10 @@ unsized DST pointer-metadata operations:
      (`sliceSizeOverflow_minirust_ub_locus`) and is strictly more restrictive (fail-closed, like
      Miri's `InvalidMeta(SliceTooBig)`) for raw `*const [T]` pointers
      (`div_rawSliceSizeOfVal_isizeMax_anneal_ub_vs_minirust_total`). The executable Lean
-     `MiniRustSpec.Interp` does not implement `GetMetadata` / `ComputeSize` / `ComputeAlign`
-     (`minirust_interp_metadata_unops_unsupported`), so the MiniRust side of those operations is
+     `MiniRustSpec.Interp` now implements `GetMetadata` / `ComputeSize` / `ComputeAlign` for thin
+     and slice `ElementCount` metadata (`minirust_interp_metadata_unops_exec_and_vtable_unsupported`,
+     which supersedes the former `minirust_interp_metadata_unops_unsupported` canary); the
+     witnesses below predate that support, so the MiniRust side of those operations is still
      stated against the spec functions they denote (`PointerMetaKind.encode_as_value`,
      `computeSize`, `computeAlign`) or lowered via `Transmute` to `mrWidePairTupleTy`.
 4. **Symbolic & Concrete `slice::from_raw_parts(_mut)` (`&*p` / `&mut *p`), `Rvalue.len (*s)`,
@@ -2036,7 +2038,8 @@ theorem wideSliceTreeBorrowsDisabledVsMetadataOk_three_way :
 Concrete ground-truth agreement between Anneal (`mirTree` returning `(size_of_val + align_of_val) as u32`)
 and MiniRust's `Machine::compute_size` / `compute_align` (`computeSize` / `computeAlign`, checking
 each individual component as the spec functions behind `UnOp::ComputeSize` / `ComputeAlign`, which
-the executable `Interp` leaves `unsupported` — see `minirust_interp_metadata_unops_unsupported`) on:
+the executable `Interp` now also evaluates on slice metadata — see
+`minirust_interp_metadata_unops_exec_and_vtable_unsupported`) on:
 1. `[u32]` (`len = 4`, `elemSz = 4`, `elemAlign = 4` $\mapsto$ `size = 16, align = 4`, Anneal sum `= 20`),
 2. `str` (`len = 5` $\mapsto$ `size = 5, align = 1`, Anneal sum `= 6`),
 3. empty `[u32]` (`len = 0` $\mapsto$ `size = 0, align = 4`, Anneal sum `= 4`), and
@@ -2448,27 +2451,181 @@ theorem sliceSizeOverflow_minirust_ub_locus (m : Mach) (thin : Ptr) (mutbl : Mir
     checkPtr_rawSlice_ok thin len (some m) hAddr hLen,
     computeSize_computeAlign_slice_total m elemSz elemAlign len⟩
 
-/-- **Fragment-boundary canary (`minirust_interp_metadata_unops_unsupported`)**: the executable
-Lean MiniRust interpreter (`evalUnOp` on `BasicMemory`, `evalUnOpM` on `TreeBorrowsMemory`) does
-not implement `UnOp::GetMetadata`, `UnOp::ComputeSize`, or `UnOp::ComputeAlign`. This is why the
-witnesses lower `ptr::metadata` via `Transmute` to `mrWidePairTupleTy` + `.Field 1` and state
-`size_of_val` / `align_of_val` against `computeSize` / `computeAlign`; the canary breaks (and
-forces those statements to be revisited) as soon as upstream adds executable support. -/
-theorem minirust_interp_metadata_unops_unsupported (sty ty : Gen.Type) (v : Val)
-    (m : Option Mach) (vTB : Gen.Value TBM) (mTB : Option MachTB) :
-    evalUnOp .GetMetadata (v, ty) m =
-      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" ∧
-    evalUnOp (.ComputeSize sty) (v, ty) m =
-      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" ∧
-    evalUnOp (.ComputeAlign sty) (v, ty) m =
-      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" ∧
-    evalUnOpM (M := TBM) .GetMetadata (vTB, ty) mTB =
-      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" ∧
-    evalUnOpM (M := TBM) (.ComputeSize sty) (vTB, ty) mTB =
-      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" ∧
-    evalUnOpM (M := TBM) (.ComputeAlign sty) (vTB, ty) mTB =
-      unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}" :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+/-- **Executable metadata-unop & vtable-boundary canary** (superseding the former
+`minirust_interp_metadata_unops_unsupported` canary): certifies that the executable
+Lean MiniRust interpreter (`evalUnOp` on `BasicMemory`, `evalUnOpM` on
+`TreeBorrowsMemory`) now executes `UnOp::GetMetadata`, `UnOp::ComputeSize`, and
+`UnOp::ComputeAlign` on thin pointers, sized types, and slice `ElementCount`
+wide pointers / DSTs (for both `m = none` and `m = some mach`), while keeping
+`PointerMetaKind::VTablePointer` / `PointerMeta::VTablePointer` and
+`UnOp::VTableMethodLookup` fail-closed `Stop.unsupported`. -/
+theorem minirust_interp_metadata_unops_exec_and_vtable_unsupported
+    (thin vptr : Ptr) (thinTB vptrTB : ThinPointer TreeBorrowsProvenance)
+    (elemTy ty : Gen.Type) (elemSz elemAlign len : Nat)
+    (traitName : Gen.TraitName) (meth : Gen.TraitMethodName)
+    (v : Val) (m : Option Mach) (vTB : Gen.Value TBM) (mTB : Option MachTB)
+    (hElemLayout : Type.layout elemTy = .ok (.Sized ⟨elemSz⟩ ⟨elemAlign⟩))
+    (hLen : IntType.can_represent IntType.usize_ty (Int.ofNat len) = true) :
+    evalUnOp .GetMetadata (.Ptr (ThinPointer.widen thin none), .Ptr (.Raw .None)) m =
+      .ok (.Tuple [], unitType) ∧
+    evalUnOp .GetMetadata
+        (.Ptr (ThinPointer.widen thin (some (.ElementCount (Int.ofNat len)))),
+         .Ptr (.Raw .ElementCount)) m =
+      .ok (.Int (Int.ofNat len), .Int IntType.usize_ty) ∧
+    evalUnOp (.ComputeSize elemTy) (.Tuple [], unitType) m =
+      .ok (.Int (elemSz : Int), .Int IntType.usize_ty) ∧
+    evalUnOp (.ComputeAlign elemTy) (.Tuple [], unitType) m =
+      .ok (.Int (elemAlign : Int), .Int IntType.usize_ty) ∧
+    evalUnOp (.ComputeSize (.Slice elemTy)) (.Int (Int.ofNat len), .Int IntType.usize_ty) m =
+      .ok (.Int ((len * elemSz : Nat) : Int), .Int IntType.usize_ty) ∧
+    evalUnOp (.ComputeAlign (.Slice elemTy)) (.Int (Int.ofNat len), .Int IntType.usize_ty) m =
+      .ok (.Int (elemAlign : Int), .Int IntType.usize_ty) ∧
+    evalUnOp .GetMetadata
+        (.Ptr (ThinPointer.widen thin (some (.VTablePointer vptr))),
+         .Ptr (.Raw (.VTablePointer traitName))) m =
+      unsupported "eval_un_op UnOp::GetMetadata for vtable pointer metadata" ∧
+    evalUnOp (.ComputeSize (.TraitObject traitName))
+        (.Ptr (ThinPointer.widen vptr none), .Ptr (.VTablePtr traitName)) m =
+      unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata" ∧
+    evalUnOp (.ComputeAlign (.TraitObject traitName))
+        (.Ptr (ThinPointer.widen vptr none), .Ptr (.VTablePtr traitName)) m =
+      unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata" ∧
+    evalUnOp (.VTableMethodLookup meth) (v, ty) m =
+      unsupported "eval_un_op for UnOp::VTableMethodLookup" ∧
+    evalUnOpM (M := TBM) .GetMetadata
+        (.Ptr (ThinPointer.widen thinTB none), .Ptr (.Raw .None)) mTB =
+      .ok (.Tuple [], unitType) ∧
+    evalUnOpM (M := TBM) .GetMetadata
+        (.Ptr (ThinPointer.widen thinTB (some (.ElementCount (Int.ofNat len)))),
+         .Ptr (.Raw .ElementCount)) mTB =
+      .ok (.Int (Int.ofNat len), .Int IntType.usize_ty) ∧
+    evalUnOpM (M := TBM) (.ComputeSize elemTy) (.Tuple [], unitType) mTB =
+      .ok (.Int (elemSz : Int), .Int IntType.usize_ty) ∧
+    evalUnOpM (M := TBM) (.ComputeAlign elemTy) (.Tuple [], unitType) mTB =
+      .ok (.Int (elemAlign : Int), .Int IntType.usize_ty) ∧
+    evalUnOpM (M := TBM) (.ComputeSize (.Slice elemTy))
+        (.Int (Int.ofNat len), .Int IntType.usize_ty) mTB =
+      .ok (.Int ((len * elemSz : Nat) : Int), .Int IntType.usize_ty) ∧
+    evalUnOpM (M := TBM) (.ComputeAlign (.Slice elemTy))
+        (.Int (Int.ofNat len), .Int IntType.usize_ty) mTB =
+      .ok (.Int (elemAlign : Int), .Int IntType.usize_ty) ∧
+    evalUnOpM (M := TBM) .GetMetadata
+        (.Ptr (ThinPointer.widen thinTB (some (.VTablePointer vptrTB))),
+         .Ptr (.Raw (.VTablePointer traitName))) mTB =
+      unsupported "eval_un_op UnOp::GetMetadata for vtable pointer metadata" ∧
+    evalUnOpM (M := TBM) (.ComputeSize (.TraitObject traitName))
+        (.Ptr (ThinPointer.widen vptrTB none), .Ptr (.VTablePtr traitName)) mTB =
+      unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata" ∧
+    evalUnOpM (M := TBM) (.ComputeAlign (.TraitObject traitName))
+        (.Ptr (ThinPointer.widen vptrTB none), .Ptr (.VTablePtr traitName)) mTB =
+      unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata" ∧
+    evalUnOpM (M := TBM) (.VTableMethodLookup meth) (vTB, ty) mTB =
+      unsupported "eval_un_op for UnOp::VTableMethodLookup" := by
+  have hElemMeta : Type.meta_kind elemTy = .None := by
+    cases elemTy with
+    | Tuple _ _ unsized =>
+      cases unsized with
+      | none => rfl
+      | some tail =>
+        unfold Type.layout at hElemLayout
+        cases htl : Type.layout tail <;> simp [htl, bind, Except.bind, pure, Except.pure] at hElemLayout
+    | Slice elem =>
+      unfold Type.layout at hElemLayout
+      cases htl : Type.layout elem <;> simp [htl, bind, Except.bind, pure, Except.pure] at hElemLayout
+      rename_i lay
+      cases lay <;> simp [LayoutStrategy.expect_size, LayoutStrategy.expect_align, specPanic,
+        bind, Except.bind, pure, Except.pure] at hElemLayout
+    | TraitObject _ =>
+      unfold Type.layout at hElemLayout
+      simp [pure, Except.pure] at hElemLayout
+    | _ => rfl
+  have hSliceLayout : Type.layout (.Slice elemTy) = .ok (.Slice ⟨elemSz⟩ ⟨elemAlign⟩) := by
+    simp [Type.layout, hElemLayout, LayoutStrategy.expect_size, LayoutStrategy.expect_align,
+      bind, Except.bind, pure, Except.pure]
+  have hNonneg : (0 : Int) ≤ Int.ofNat len * (elemSz : Int) := by
+    exact Int.natCast_nonneg (len * elemSz)
+  have hToNat : (Int.ofNat len * (elemSz : Int)).toNat = len * elemSz := by
+    change ((len * elemSz : Nat) : Int).toNat = len * elemSz
+    exact Int.toNat_natCast (len * elemSz)
+  have hGetMetaSlice : ∀ (count : Int),
+      IntType.can_represent IntType.usize_ty count = true →
+      evalUnOp .GetMetadata
+          (.Ptr (ThinPointer.widen thin (some (.ElementCount count))),
+           .Ptr (.Raw .ElementCount)) m =
+        .ok (.Int count, .Int IntType.usize_ty) := by
+    intro count hCount
+    have hCheck : checkValue (.Int count) (.Int IntType.usize_ty) m = .ok () := by
+      rw [checkValue, ensureElseUb, hCount]; rfl
+    rw [evalUnOp]
+    simp only [ThinPointer.widen, PtrType.meta_kind, PointerMetaKind.encode_as_value,
+      PointerMetaKind.ty, bind, Except.bind, pure, Except.pure]
+    rw [hCheck]
+  have hGetMetaSliceTB : ∀ (count : Int),
+      IntType.can_represent IntType.usize_ty count = true →
+      evalUnOpM (M := TBM) .GetMetadata
+          (.Ptr (ThinPointer.widen thinTB (some (.ElementCount count))),
+           .Ptr (.Raw .ElementCount)) mTB =
+        .ok (.Int count, .Int IntType.usize_ty) := by
+    intro count hCount
+    have hCheck : checkValueM (M := TBM) (.Int count) (.Int IntType.usize_ty) mTB = .ok () := by
+      rw [checkValueM, ensureElseUb, hCount]; rfl
+    rw [evalUnOpM]
+    simp only [ThinPointer.widen, PtrType.meta_kind, PointerMetaKind.encode_as_valueM,
+      PointerMetaKind.ty, bind, Except.bind, pure, Except.pure]
+    rw [hCheck]
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · simp [evalUnOp, ThinPointer.widen, PtrType.meta_kind, PointerMetaKind.encode_as_value,
+      PointerMetaKind.ty, unitType, checkValue, checkFields, bind, Except.bind, pure, Except.pure]
+  · exact hGetMetaSlice (Int.ofNat len) hLen
+  · cases m <;>
+      simp [evalUnOp, hElemMeta, PointerMetaKind.decode_value, hElemLayout, computeSize,
+        LayoutStrategy.compute_size_and_align, Functor.map, Except.map, bind, Except.bind,
+        pure, Except.pure]
+  · cases m <;>
+      simp [evalUnOp, hElemMeta, PointerMetaKind.decode_value, hElemLayout, computeAlign,
+        LayoutStrategy.compute_size_and_align, Functor.map, Except.map, bind, Except.bind,
+        pure, Except.pure]
+  · cases m <;>
+      simp [evalUnOp, Type.meta_kind, PointerMetaKind.decode_value, hSliceLayout, computeSize,
+        LayoutStrategy.compute_size_and_align, hNonneg, hToNat, Functor.map, Except.map,
+        bind, Except.bind, pure, Except.pure]
+  · cases m <;>
+      simp [evalUnOp, Type.meta_kind, PointerMetaKind.decode_value, hSliceLayout, computeAlign,
+        LayoutStrategy.compute_size_and_align, hNonneg, Functor.map, Except.map,
+        bind, Except.bind, pure, Except.pure]
+  · simp [evalUnOp, ThinPointer.widen, PtrType.meta_kind, PointerMetaKind.encode_as_value,
+      bind, Except.bind, pure, Except.pure]
+  · simp [evalUnOp, Type.meta_kind, PointerMetaKind.decode_value, ThinPointer.widen,
+      bind, Except.bind, pure, Except.pure]
+  · simp [evalUnOp, Type.meta_kind, PointerMetaKind.decode_value, ThinPointer.widen,
+      bind, Except.bind, pure, Except.pure]
+  · simp [evalUnOp]
+  · simp [evalUnOpM, ThinPointer.widen, PtrType.meta_kind, PointerMetaKind.encode_as_valueM,
+      PointerMetaKind.ty, unitType, checkValueM, checkFieldsM, bind, Except.bind, pure, Except.pure]
+  · exact hGetMetaSliceTB (Int.ofNat len) hLen
+  · cases mTB <;>
+      simp [evalUnOpM, hElemMeta, PointerMetaKind.decode_valueM, hElemLayout, computeSizeM,
+        LayoutStrategy.compute_size_and_align, Functor.map, Except.map, bind, Except.bind,
+        pure, Except.pure]
+  · cases mTB <;>
+      simp [evalUnOpM, hElemMeta, PointerMetaKind.decode_valueM, hElemLayout, computeAlignM,
+        LayoutStrategy.compute_size_and_align, Functor.map, Except.map, bind, Except.bind,
+        pure, Except.pure]
+  · cases mTB <;>
+      simp [evalUnOpM, Type.meta_kind, PointerMetaKind.decode_valueM, hSliceLayout, computeSizeM,
+        LayoutStrategy.compute_size_and_align, hNonneg, hToNat, Functor.map, Except.map,
+        bind, Except.bind, pure, Except.pure]
+  · cases mTB <;>
+      simp [evalUnOpM, Type.meta_kind, PointerMetaKind.decode_valueM, hSliceLayout, computeAlignM,
+        LayoutStrategy.compute_size_and_align, hNonneg, Functor.map, Except.map,
+        bind, Except.bind, pure, Except.pure]
+  · simp [evalUnOpM, ThinPointer.widen, PtrType.meta_kind, PointerMetaKind.encode_as_valueM,
+      bind, Except.bind, pure, Except.pure]
+  · simp [evalUnOpM, Type.meta_kind, PointerMetaKind.decode_valueM, ThinPointer.widen,
+      bind, Except.bind, pure, Except.pure]
+  · simp [evalUnOpM, Type.meta_kind, PointerMetaKind.decode_valueM, ThinPointer.widen,
+      bind, Except.bind, pure, Except.pure]
+  · simp [evalUnOpM]
 
 set_option maxHeartbeats 800000 in
 /-- **Divergence canary `DIV-MR-RAW-SLICE-SIZE-OF-VAL-ISIZE-MAX`
@@ -2554,8 +2711,8 @@ def wideSliceRawParentWriteMInit : Mach :=
 def wideSliceRawParentWriteTBInit : MachTB := liftMachToTB wideSliceRawParentWriteMInit
 
 /-- MiniRust translation of `wideSliceMetadataAfterParentWriteMir`, lowering
-`_5 = PtrMetadata(_4)` (no executable `UnOp::GetMetadata`) to `_6 = transmute(_4) :
-mrWidePairTupleTy; _5 = _6.1`. -/
+`_5 = PtrMetadata(_4)` (this witness predates the executable `UnOp::GetMetadata`) to
+`_6 = transmute(_4) : mrWidePairTupleTy; _5 = _6.1`. -/
 def wideSliceMetadataAfterParentWriteFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32),
     (localName 2, .Array (.Int u32) 4),

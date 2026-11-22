@@ -1919,8 +1919,9 @@ the decoded discriminant at the enum's `discriminant_ty`
 >     throw_ub!(\"ValueExpr::GetDiscriminant encountered invalid discriminant.\");
 > };
 > ret((Value::Int(discriminant), Type::Int(discriminant_ty)))"
-The executable interpretation `MiniRustSpec.Interp` does not implement
-`GetDiscriminant`, so the correspondence lowers it, for `orderingTy` only, to
+This lowering predates the executable `GetDiscriminant` of
+`MiniRustSpec.Interp` (`evalValue` / `evalValueM`): the correspondence lowers
+it, for `orderingTy` only, to
 the `Load` of the place followed by `transmute::<i8>` (`build::transmute`, as
 in `translateCmp`). `orderingTy` occupies exactly its one tag byte, which its
 discriminator decodes at `i8` with the three branches `-1`, `0`, `1` (and
@@ -1928,7 +1929,11 @@ discriminator decodes at `i8` with the three branches `-1`, `0`, `1` (and
 `orderingTy` and `GetDiscriminant` read that one byte, raise UB unless it is
 the tag `255`, `0`, or `1`, and otherwise produce `Value::Int` of the tag read
 as an `i8` (`orderingDiscrExpr_eq_getDiscriminant` in
-`MiniRustSpec.Correspondence.MiniRustEval` checks this on every byte). -/
+`MiniRustSpec.Correspondence.MiniRustEval` checks this on every byte against a
+model of `GetDiscriminant`, and
+`ep1_getDiscriminant_ordering_agrees_with_model_and_lowering` in
+`MiniRustSpec.Audit` checks it against the executable `GetDiscriminant` on
+both `Mach` and `MachTB`). -/
 def orderingDiscrExpr (v : Gen.ValueExpr) : Gen.ValueExpr :=
   .UnOp (.Cast (.Transmute (.Int IntType.I8))) v
 

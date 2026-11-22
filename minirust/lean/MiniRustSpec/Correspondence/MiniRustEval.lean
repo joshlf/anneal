@@ -8779,8 +8779,14 @@ theorem evalUnOp_congr_mach {M1 M2 : Mach} (hmem : M1.mem = M2.mem)
     (op : Gen.UnOp) (arg : Val × Gen.Type) :
     evalUnOp op arg (some M1) = evalUnOp op arg (some M2) := by
   have hcv := checkValue_congr_mach hmem hvt hprog
+  have hvl : vtableLookup M1 = vtableLookup M2 := by
+    funext p; unfold vtableLookup; rw [hvt, hprog]
+  have hcs : ∀ lay pm, computeSize M1 lay pm = computeSize M2 lay pm := by
+    intro lay pm; unfold computeSize; rw [hvl]
+  have hca : ∀ lay pm, computeAlign M1 lay pm = computeAlign M2 lay pm := by
+    intro lay pm; unfold computeAlign; rw [hvl]
   unfold evalUnOp evalCastOp transmute
-  simp only [hcv]
+  simp only [hcv, hcs, hca]
 
 /-- `retag_ptr` of `BasicMemory` on a machine whose single thread has a
 non-empty stack is the identity. -/
@@ -9102,6 +9108,103 @@ theorem placeStore_rethread (m : Mach) (c : Ctx) (fs : List Frame)
 
 mutual
 
+private theorem decodeDiscriminant_rethread_aux (m : Mach) (c : Ctx) (fs : List Frame)
+    (thin : Ptr) :
+    ∀ (d : Gen.Discriminator) (cm : Gen.ConcurrentMemory BM),
+      let acc := fun (m : Mach) (idx : Gen.Offset) (size : LibSpecr.Size) => do
+        let ptr ← ptrOffsetInbounds m thin (idx.bytes : Int)
+        let (bytes, cm) ← CM.load m.mem ptr size ⟨1⟩ .None
+        pure (bytes, { m with mem := cm })
+      (∀ opt m2, decodeDiscriminant acc d { rethread m c fs with mem := cm } = .ok (opt, m2) →
+        ∃ cm', m2 = { rethread m c fs with mem := cm' } ∧
+          decodeDiscriminant acc d { m with mem := cm } = .ok (opt, { m with mem := cm' })) ∧
+      (∀ err, decodeDiscriminant acc d { rethread m c fs with mem := cm } = .error err →
+        decodeDiscriminant acc d { m with mem := cm } = .error err)
+  | .Known val, cm =>
+    ⟨fun opt m2 h => by
+        simp [decodeDiscriminant] at h
+        obtain ⟨rfl, rfl⟩ := h
+        exact ⟨cm, rfl, by simp [decodeDiscriminant]⟩,
+      fun err h => by simp [decodeDiscriminant] at h⟩
+  | .Invalid, cm =>
+    ⟨fun opt m2 h => by
+        simp [decodeDiscriminant] at h
+        obtain ⟨rfl, rfl⟩ := h
+        exact ⟨cm, rfl, by simp [decodeDiscriminant]⟩,
+      fun err h => by simp [decodeDiscriminant] at h⟩
+  | .Branch offset valueType fallback ⟨children⟩, cm => by
+    dsimp only
+    simp only [decodeDiscriminant]
+    have hpo : ptrOffsetInbounds { rethread m c fs with mem := cm } thin (offset.bytes : Int) =
+        ptrOffsetInbounds { m with mem := cm } thin (offset.bytes : Int) := rfl
+    rw [hpo]
+    cases hptr : ptrOffsetInbounds { m with mem := cm } thin (offset.bytes : Int) with
+    | error e => simp
+    | ok ptr =>
+      simp only [ok_bind]
+      cases hld : CM.load cm ptr valueType.size ⟨1⟩ .None with
+      | error e => simp
+      | ok bc =>
+        obtain ⟨bytes, cm1⟩ := bc
+        simp only [ok_bind, pure_ok]
+        cases hdec : Type.decodeInt valueType bytes with
+        | error e => simp
+        | ok optv =>
+          cases optv with
+          | none =>
+            refine ⟨fun opt m2 h => ?_, fun err h => by simp at h⟩
+            simp at h; obtain ⟨rfl, rfl⟩ := h; exact ⟨cm1, rfl, rfl⟩
+          | some v =>
+            cases v with
+            | Int val =>
+              let acc := fun (m : Mach) (idx : Gen.Offset) (size : LibSpecr.Size) => do
+                let ptr ← ptrOffsetInbounds m thin (idx.bytes : Int)
+                let (bytes, cm) ← CM.load m.mem ptr size ⟨1⟩ .None
+                pure (bytes, { m with mem := cm })
+              exact decodeDiscriminantChildren_rethread_aux m c fs thin val
+                (decodeDiscriminant acc fallback)
+                (fun cm' => decodeDiscriminant_rethread_aux m c fs thin fallback cm')
+                children cm1
+            | _ =>
+              refine ⟨fun opt m2 h => ?_, fun err h => by simp at h⟩
+              simp at h; obtain ⟨rfl, rfl⟩ := h; exact ⟨cm1, rfl, rfl⟩
+
+private theorem decodeDiscriminantChildren_rethread_aux (m : Mach) (c : Ctx) (fs : List Frame)
+    (thin : Ptr) (val : Int) (onFallback : Mach → Interp (Option Int × Mach))
+    (hfb : ∀ cm,
+      (∀ opt m2, onFallback { rethread m c fs with mem := cm } = .ok (opt, m2) →
+        ∃ cm', m2 = { rethread m c fs with mem := cm' } ∧
+          onFallback { m with mem := cm } = .ok (opt, { m with mem := cm' })) ∧
+      (∀ err, onFallback { rethread m c fs with mem := cm } = .error err →
+        onFallback { m with mem := cm } = .error err)) :
+    ∀ (children : List ((Int × Int) × Gen.Discriminator)) (cm : Gen.ConcurrentMemory BM),
+      let acc := fun (m : Mach) (idx : Gen.Offset) (size : LibSpecr.Size) => do
+        let ptr ← ptrOffsetInbounds m thin (idx.bytes : Int)
+        let (bytes, cm) ← CM.load m.mem ptr size ⟨1⟩ .None
+        pure (bytes, { m with mem := cm })
+      (∀ opt m2,
+          decodeDiscriminantChildren acc val onFallback children
+            { rethread m c fs with mem := cm } = .ok (opt, m2) →
+        ∃ cm', m2 = { rethread m c fs with mem := cm' } ∧
+          decodeDiscriminantChildren acc val onFallback children
+            { m with mem := cm } = .ok (opt, { m with mem := cm' })) ∧
+      (∀ err,
+          decodeDiscriminantChildren acc val onFallback children
+            { rethread m c fs with mem := cm } = .error err →
+        decodeDiscriminantChildren acc val onFallback children
+          { m with mem := cm } = .error err)
+  | [], cm => hfb cm
+  | ((start, end_), child) :: rest, cm => by
+    dsimp only
+    simp only [decodeDiscriminantChildren]
+    split
+    · exact decodeDiscriminant_rethread_aux m c fs thin child cm
+    · exact decodeDiscriminantChildren_rethread_aux m c fs thin val onFallback hfb rest cm
+
+end
+
+mutual
+
 /-- `evalPlace` reads only `curFrame`, `prog.vtables`, `vtable_ptrs`, and `mem`
 (and, for `PlaceExpr::Deref`, whatever `evalValue` reads), so replacing any
 stack prefix ending in `fr` with `[curCtx.caller, fr]` changes neither its
@@ -9203,8 +9306,26 @@ theorem evalPlace_rethread (pe : Gen.PlaceExpr) (m : Mach) (rootCtx curCtx : Ctx
           simp only [ok_bind, pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
           obtain ⟨rfl, rfl⟩ := h
           exact ⟨cm2, rfl, rfl⟩
-  | .Downcast _ _ =>
-    simp [evalPlace, unsupported]
+  | .Downcast root discriminant =>
+    obtain ⟨hpok, hperr⟩ := evalPlace_rethread root m rootCtx curCtx pre fr hthr hact
+    simp only [evalPlace]
+    cases hep : evalPlace (rethread m curCtx [curCtx.caller, fr]) root with
+    | error err => simp [hperr err hep]
+    | ok ptm =>
+      obtain ⟨⟨rp, ty⟩, m1⟩ := ptm
+      obtain ⟨cm1, rfl, hpm⟩ := hpok _ m1 hep
+      simp only [hpm, ok_bind]
+      cases ty with
+      | Enum variants _ _ _ _ =>
+        dsimp only
+        cases hmi : mapIndex variants discriminant "variants[discriminant]" with
+        | error err => simp
+        | ok variant =>
+          refine ⟨fun pt m2 h => ?_, fun err h => by simp at h⟩
+          simp at h
+          obtain ⟨rfl, rfl⟩ := h
+          exact ⟨cm1, rfl, rfl⟩
+      | _ => simp [specPanic]
 
 /-- Lifting `evalValue` from `[curCtx.caller, fr]` to an arbitrary stack prefix
 `pre ++ [fr]`. -/
@@ -9345,8 +9466,103 @@ theorem evalValue_rethread (e : Gen.ValueExpr) (m : Mach) (rootCtx curCtx : Ctx)
           simp at h
           obtain ⟨rfl, rfl⟩ := h
           exact ⟨cm2, rfl, rfl⟩
-  | .Union _ _ _ | .Variant _ _ _ | .GetDiscriminant _ =>
-    simp [evalValue, unsupported]
+  | .Union field expr unionTy =>
+    obtain ⟨hok, herr⟩ := evalValue_rethread expr m rootCtx curCtx pre fr hthr hact
+    simp only [evalValue]
+    cases unionTy with
+    | Union fields chunks size align =>
+      simp only [pure_bind]
+      cases hidx : listIndex fields field "fields[field]" with
+      | error err => simp
+      | ok ofty =>
+        obtain ⟨offset, exprTy⟩ := ofty
+        simp only [ok_bind]
+        cases hev : evalValue (rethread m curCtx [curCtx.caller, fr]) expr with
+        | error err => simp [herr err hev]
+        | ok vm =>
+          obtain ⟨⟨val, _⟩, m1⟩ := vm
+          obtain ⟨cm, rfl, hm1⟩ := hok _ m1 hev
+          simp only [hm1, ok_bind]
+          cases henc : Type.encode exprTy val with
+          | error err => simp
+          | ok encoded =>
+            simp only [ok_bind]
+            cases hws : writeSubsliceAtIndex (List.replicate size.bytes .Uninit) (offset.bytes : Int) encoded with
+            | error err => simp
+            | ok data =>
+              simp only [ok_bind]
+              cases hdec : Type.decode (.Union fields chunks size align) data with
+              | error err => simp
+              | ok optv =>
+                cases optv with
+                | none => simp [specPanic]
+                | some uval =>
+                  refine ⟨fun vt m2 h => ?_, fun err h => by simp at h⟩
+                  simp at h
+                  obtain ⟨rfl, rfl⟩ := h
+                  exact ⟨cm, rfl, rfl⟩
+    | _ => simp [specPanic]
+  | .Variant discriminant data enumTy =>
+    obtain ⟨hok, herr⟩ := evalValue_rethread data m rootCtx curCtx pre fr hthr hact
+    simp only [evalValue]
+    cases hev : evalValue (rethread m curCtx [curCtx.caller, fr]) data with
+    | error err => simp [herr err hev]
+    | ok vm =>
+      obtain ⟨⟨val, _⟩, m1⟩ := vm
+      obtain ⟨cm, rfl, hm1⟩ := hok _ m1 hev
+      simp only [hm1, ok_bind]
+      refine ⟨fun vt m2 h => ?_, fun err h => by simp at h⟩
+      simp at h
+      obtain ⟨rfl, rfl⟩ := h
+      exact ⟨cm, rfl, rfl⟩
+  | .GetDiscriminant place =>
+    obtain ⟨hpok, hperr⟩ := evalPlace_rethread place m rootCtx curCtx pre fr hthr hact
+    simp only [evalValue]
+    cases hep : evalPlace (rethread m curCtx [curCtx.caller, fr]) place with
+    | error err => simp [hperr err hep]
+    | ok ptm =>
+      obtain ⟨⟨pl, ty⟩, m1⟩ := ptm
+      obtain ⟨cm1, rfl, hpm⟩ := hpok _ m1 hep
+      simp only [hpm, ok_bind]
+      cases ty with
+      | Enum variants discriminantTy discriminator size align =>
+        dsimp only
+        by_cases hal : !pl.aligned
+        · simp [hal, ub]
+        · simp only [hal, Bool.false_eq_true, ↓reduceIte]
+          obtain ⟨hdok, hderr⟩ :=
+            decodeDiscriminant_rethread_aux m curCtx [curCtx.caller, fr] pl.ptr.thin_pointer
+              discriminator cm1
+          dsimp only at hdok hderr
+          cases hdd : decodeDiscriminant
+              (fun (m : Mach) (idx : Gen.Offset) (size : LibSpecr.Size) => do
+                let ptr ← ptrOffsetInbounds m pl.ptr.thin_pointer (idx.bytes : Int)
+                let res ← CM.load m.mem ptr size ⟨1⟩ .None
+                pure (res.1, { m with mem := res.2 }))
+              discriminator { rethread m curCtx [curCtx.caller, fr] with mem := cm1 } with
+          | error err =>
+            have hdd' := hderr err hdd
+            refine ⟨fun vt m3 h => ?_, fun err' h => ?_⟩
+            · simp only [error_bind] at h; cases h
+            · simp only [error_bind] at h; rw [hdd', error_bind]; exact h
+          | ok dm =>
+            obtain ⟨discrOpt, m2⟩ := dm
+            obtain ⟨cm2, rfl, hdm⟩ := hdok discrOpt m2 hdd
+            refine ⟨fun vt m3 h => ?_, fun err' h => ?_⟩
+            · rw [hdm]
+              simp only [ok_bind] at h ⊢
+              cases discrOpt with
+              | none => simp [ub] at h
+              | some discr =>
+                simp only [pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h ⊢
+                obtain ⟨rfl, rfl⟩ := h
+                exact ⟨cm2, rfl, rfl, rfl⟩
+            · rw [hdm]
+              simp only [ok_bind] at h ⊢
+              cases discrOpt with
+              | none => exact h
+              | some discr => simp [pure, Except.pure] at h
+      | _ => simp [specPanic]
 
 theorem evalValues_rethread (es : List Gen.ValueExpr) (m : Mach) (rootCtx curCtx : Ctx)
     (pre : List Frame) (fr : Frame)
