@@ -709,4 +709,92 @@ theorem np_variant_outcomes_distinct (v : NullaryPtrVariant) :
     · rw [mrAuthority_verdict_eq, mrAuthority_verdict_eq]; intro h; dsimp only [npExpectedVerdict] at h; cases h
     · rw [mrAuthority_verdict_eq, mrAuthority_verdict_eq]; intro h; dsimp only [npExpectedVerdict] at h; cases h
 
+/-- **Episode 2 Capstone**: for EVERY LeanMiri observation authority `lmAuth`
+that passes the unified 32-key check (`lmCheckOf lmAuth = true`), the 4 MIR
+variants `Rvalue.nullaryOp`, `CastKind.pointerCoercion`, `CastKind.fnPtrToPtr`,
+and `ProjectionElem.unwrapUnsafeBinder` satisfy, in one statement:
+1. the observation codec is tight (`npCodec.TightValidRep`) and the MiniRust
+   authority's denotation table is consistent;
+2. the unified 32-key MiniRust side check and all 4 per-variant side checks hold
+   against the Trusted model `npModel`;
+3. three-way normal agreement, cross-authority fault equivalence, and exact
+   behavioral equivalence on both authorities, at the unified bundle
+   `bundleOf lmAuth hLM`;
+4. non-vacuous mode sensitivity on both authorities;
+5. for every variant whose per-variant LeanMiri check holds, the per-variant
+   bundle carries the correspondence and fault-equivalence claims and the
+   flip-direction guards of `variant_bundle_claims`;
+6. per-variant outcome distinctness (`np_variant_outcomes_distinct`).
+Each conjunct is the statement of the named theorem of this module; the proof
+adds no reasoning of its own. -/
+theorem ep2_nullary_ptrcoercion_fnptr_unwrap_capstone
+    (lmAuth : Corpus.ObsAuthority NullaryPtrKey NullaryPtrObsVal)
+    (hLM : lmCheckOf lmAuth = true) :
+    npCodec.TightValidRep ∧
+    mrAuthority.denoteConsistent = true ∧
+    mrSide.check npModel = true ∧
+    (∀ v, (mrVariantSide v).check npModel = true) ∧
+    (∀ (mMR : NullaryPtrMrMode) (mLM : Bool) (p : NullaryPtrVariant) (q : NullaryPtrCase),
+      npMrToMode mMR = npLmTreeBorrowsToMode mLM →
+      ∀ (cMR cLM : Unit) (vMR vLM : NullaryPtrObsVal),
+        (bundleOf lmAuth hLM).mrRel.ExecR mMR p q cMR (.normal vMR) →
+        (bundleOf lmAuth hLM).lmRel.ExecR mLM p q cLM (.normal vLM) →
+        npEncode vMR = npEncode vLM) ∧
+    (∀ (mMR : NullaryPtrMrMode) (mLM : Bool) (p : NullaryPtrVariant) (q : NullaryPtrCase),
+      npMrToMode mMR = npLmTreeBorrowsToMode mLM →
+      ∀ (k : CorrFaultKind),
+        ((∃ c, (bundleOf lmAuth hLM).mrRel.ExecR mMR p q c (.fault k)) ↔
+         (∃ c, (bundleOf lmAuth hLM).lmRel.ExecR mLM p q c (.fault k)))) ∧
+    (∀ (mMR : NullaryPtrMrMode) (mLM : Bool) (p : NullaryPtrVariant) (q : NullaryPtrCase),
+      ExactBehaviorEq (bundleOf lmAuth hLM).mrRel mMR p q ∧
+      ExactBehaviorEq (bundleOf lmAuth hLM).lmRel mLM p q) ∧
+    (mrSide.flipW npModel mrSide_check).isSome = true ∧
+    ((lmSideOf lmAuth).flipW npModel hLM).isSome = true ∧
+    (∀ (v : NullaryPtrVariant) (hV : lmVariantCheckOf v lmAuth = true),
+      let B := variantBundleOf v lmAuth hV
+      CorrespondenceClaim B.mrRel ∧
+      FaultEquivClaim B.mrRel ∧
+      CorrespondenceClaim B.lmRel ∧
+      FaultEquivClaim B.lmRel ∧
+      B.mrFlip.m = .basicMemory ∧
+      B.lmFlip.m = false ∧
+      (∃ a r, B.mrRel.ExecA B.mrFlip.m B.mrFlip.pOk B.mrFlip.qOk B.mrFlip.cOk (.normal a) ∧
+              B.mrRel.ExecR B.mrFlip.m B.mrFlip.pOk B.mrFlip.qOk B.mrFlip.cOk (.normal r) ∧
+              B.mrRel.RetRel a r) ∧
+      B.mrRel.ExecA B.mrFlip.m B.mrFlip.pFault B.mrFlip.qFault B.mrFlip.cFault
+        (.fault B.mrFlip.kind) ∧
+      B.mrRel.ExecR B.mrFlip.m B.mrFlip.pFault B.mrFlip.qFault B.mrFlip.cFault
+        (.fault B.mrFlip.kind) ∧
+      (∃ a r, B.lmRel.ExecA B.lmFlip.m B.lmFlip.pOk B.lmFlip.qOk B.lmFlip.cOk (.normal a) ∧
+              B.lmRel.ExecR B.lmFlip.m B.lmFlip.pOk B.lmFlip.qOk B.lmFlip.cOk (.normal r) ∧
+              B.lmRel.RetRel a r) ∧
+      B.lmRel.ExecA B.lmFlip.m B.lmFlip.pFault B.lmFlip.qFault B.lmFlip.cFault
+        (.fault B.lmFlip.kind) ∧
+      B.lmRel.ExecR B.lmFlip.m B.lmFlip.pFault B.lmFlip.qFault B.lmFlip.cFault
+        (.fault B.lmFlip.kind)) ∧
+    (∀ v : NullaryPtrVariant,
+      (∃ a b,
+        npAnnealEval .basic v .okPrimary () = some (.returns a) ∧
+        npAnnealEval .basic v .okSecondary () = some (.returns b) ∧
+        mrAuthority.verdict (.basic, v, .okPrimary) = some (.returns a) ∧
+        mrAuthority.verdict (.basic, v, .okSecondary) = some (.returns b) ∧
+        a ≠ b ∧
+        npEncode a ≠ npEncode b) ∧
+      npAnnealEval .basic v .okPrimary () ≠ npAnnealEval .basic v .ubFault () ∧
+      npAnnealEval .basic v .okSecondary () ≠ npAnnealEval .basic v .ubFault () ∧
+      mrAuthority.verdict (.basic, v, .okPrimary) ≠ mrAuthority.verdict (.basic, v, .ubFault) ∧
+      mrAuthority.verdict (.basic, v, .okSecondary) ≠ mrAuthority.verdict (.basic, v, .ubFault) ∧
+      npAnnealEval .basic .unwrapUnsafeBinder .modeCase () ≠
+        npAnnealEval .protectedTB .unwrapUnsafeBinder .modeCase () ∧
+      mrAuthority.verdict (.basic, .unwrapUnsafeBinder, .modeCase) ≠
+        mrAuthority.verdict (.protectedTB, .unwrapUnsafeBinder, .modeCase)) :=
+  ⟨npCodec_tight, mrAuthority_denoteConsistent, mrSide_check, mrVariantSide_check,
+   threeWayNormalAgreement lmAuth hLM,
+   crossAuthorityFaultEquiv lmAuth hLM,
+   exactBehaviorEq_both lmAuth hLM,
+   mr_modeSensitivity_present,
+   lm_modeSensitivity_present lmAuth hLM,
+   fun v hV => variant_bundle_claims v lmAuth hV,
+   np_variant_outcomes_distinct⟩
+
 end Anneal.Mir.NullaryAndPtrCoercionBundle

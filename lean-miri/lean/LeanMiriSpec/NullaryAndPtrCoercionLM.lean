@@ -1035,7 +1035,7 @@ def isNullaryPtrRvalue : Miri.MIR.Rvalue → Bool
 for live BorrowTree permission checks and targeting the destination's own
 wide-pointer `TyId`), and struct-pointer dereference + field projections
 (`(*ptr).field[.unwrapUnsafeBinder]`), whose reads run the Tree Borrows read
-check `npTreeBorrowsReadCheck` when `treeBorrows = true`. Every other operand
+gate `npTreeBorrowsReadGate` when `treeBorrows = true`. Every other operand
 and cast is delegated unchanged. -/
 def annealRvalueHooksNullaryPtr (currentBody : CapturedMir) (fnPtrs : List FnPtrEntry := .nil)
     (treeBorrows : Bool := false) :
@@ -1155,12 +1155,36 @@ def npTreeBorrowsWriteApply (currentBody : CapturedMir) (place : Miri.MIR.Place)
               rp.layout.layout.size state
         | _ => .ok state
 
-/-- Gated Tree Borrows write check run before an assignment. -/
+/-- The dereferenced struct-field place read by a `Use (Copy p)` / `Use (Move p)`
+rvalue, if any (`npRvalueHasDerefField` as an `Option`). -/
+def npRvalueDerefFieldSrc? : Miri.MIR.Rvalue → Option Miri.MIR.Place
+  | .Use (.Copy p) _ | .Use (.Move p) _ => if npIsDerefFieldPlace p then some p else none
+  | _ => none
+
+/-- Tree Borrows accesses of an assignment whose destination is subject to the
+write check, in the order in which Miri performs them: first the read of the
+source place `src?` (when the rvalue copies a dereferenced struct-field place),
+then the write of `place`. Trusted orders the two the same way (`evalRvalue`,
+then the place write). -/
+def npTreeBorrowsReadThenWriteApply (currentBody : CapturedMir) (place : Miri.MIR.Place)
+    (src? : Option Miri.MIR.Place) (state : AnnealStepState) :
+    Except Miri.Interpreter.StepError AnnealStepState :=
+  match src? with
+  | some src =>
+    match npTreeBorrowsReadApply currentBody src state with
+    | .ok state' => npTreeBorrowsWriteApply currentBody place state'
+    | .error e => .error e
+  | none => npTreeBorrowsWriteApply currentBody place state
+
+/-- Gated Tree Borrows write check run before an assignment. When the rvalue
+also reads a dereferenced struct-field place `src?`, that read is applied first
+(`npTreeBorrowsReadThenWriteApply`). -/
 def npTreeBorrowsWriteCheck (currentBody : CapturedMir) (treeBorrows : Bool)
-    (place : Miri.MIR.Place) (state : AnnealStepState) :
+    (place : Miri.MIR.Place) (state : AnnealStepState)
+    (src? : Option Miri.MIR.Place := none) :
     Except Miri.Interpreter.StepError AnnealStepState :=
   if npTbWriteGate treeBorrows place then
-    npTreeBorrowsWriteApply currentBody place state
+    npTreeBorrowsReadThenWriteApply currentBody place src? state
   else .ok state
 
 /-- Outside `treeBorrows` mode the write check never changes the state. -/
@@ -1180,7 +1204,11 @@ theorem npApplyTreeBorrowsWriteAt_zst_noop (prov : Option AnnealProv) (absAddr :
 
 /-- Conservative `StepHooks` overlay extending `annealStepHooksDropBinderSubtype`:
 * assignments first run `npTreeBorrowsWriteCheck` (a no-op unless
-  `treeBorrows = true` and the destination is an `UnwrapUnsafeBinder` place);
+  `treeBorrows = true` and the destination is an `UnwrapUnsafeBinder` or field
+  place); when the same statement also copies a dereferenced struct-field place,
+  the Tree Borrows read of that source is applied before the write, as Miri
+  does, and is not applied a second time while the rvalue is evaluated (that
+  rvalue is a `Use`, so no `Unsize` check is skipped);
 * `Operand.RuntimeChecks` uses and `PointerCoercion(Unsize)` casts
   (`isNullaryPtrRvalue`) run unmodified vendored `evalRvalueIntoPlace` over
   `annealRvalueHooksNullaryPtr` (threading `treeBorrows` so `Unsize` enforces
@@ -1197,13 +1225,17 @@ def annealStepHooksNullaryPtr (currentBody : CapturedMir)
   let base := annealStepHooksDropBinderSubtype currentBody treeBorrows callees poppedFrame fnPtrs
   { base with
     assign := fun choice place rvalue state =>
-      match npTreeBorrowsWriteCheck currentBody treeBorrows place state with
+      match npTreeBorrowsWriteCheck currentBody treeBorrows place state
+          (npRvalueDerefFieldSrc? rvalue) with
       | .error e => (state, .error e)
       | .ok state' =>
         if isNullaryPtrRvalue rvalue || npIsDerefFieldPlace place || npRvalueHasDerefField rvalue then
           Miri.Interpreter.runRvalue
             (Miri.Interpreter.evalRvalueIntoPlace
-              (annealRvalueHooksNullaryPtr currentBody fnPtrs treeBorrows) choice rvalue place)
+              (annealRvalueHooksNullaryPtr currentBody fnPtrs
+                (treeBorrows &&
+                  !(npTbWriteGate treeBorrows place && npRvalueHasDerefField rvalue)))
+              choice rvalue place)
             state'
         else
           base.assign choice place rvalue state' }
@@ -3231,6 +3263,67 @@ theorem lm_np_v4_deref_field_read_persistence_witness :
   refine ⟨by decide +kernel, by decide +kernel, by decide +kernel,
           by decide +kernel, by decide +kernel, by decide +kernel,
           by decide +kernel⟩
+
+/-- Single-statement copy between two dereferenced struct-field places, reading
+through `_1` and writing through `_2`:
+`(*_2).1.unwrapUnsafeBinder = copy (*_1).1.unwrapUnsafeBinder`, then
+`_0 = (*_2).1.unwrapUnsafeBinder`. -/
+private def npV4PairCopyParentToChildMir : CapturedMir :=
+  mkMirBody "np::w_v4_pair_copy_parent_to_child"
+    [mkDecl u32MirTy, mkDecl npRawMutPairU32BinderMirTy, mkDecl npRawMutPairU32BinderMirTy,
+     mkDecl npPairU32BinderMirTy, mkDecl u32MirTy] 2
+    [mkBb [mkSt (.assign (locPlace 2 [.deref, .field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy])
+             (.use (.copy (locPlace 1 [.deref, .field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy])))),
+           mkSt (.assign (locPlace 0)
+             (.use (.copy (locPlace 2 [.deref, .field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy]))))]
+      .return_]
+    npSubrangeLayouts
+
+/-- The reverse copy, reading through `_2` and writing through `_1`:
+`(*_1).1.unwrapUnsafeBinder = copy (*_2).1.unwrapUnsafeBinder`, then
+`_0 = (*_1).1.unwrapUnsafeBinder`. -/
+private def npV4PairCopyChildToParentMir : CapturedMir :=
+  mkMirBody "np::w_v4_pair_copy_child_to_parent"
+    [mkDecl u32MirTy, mkDecl npRawMutPairU32BinderMirTy, mkDecl npRawMutPairU32BinderMirTy,
+     mkDecl npPairU32BinderMirTy, mkDecl u32MirTy] 2
+    [mkBb [mkSt (.assign (locPlace 1 [.deref, .field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy])
+             (.use (.copy (locPlace 2 [.deref, .field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy])))),
+           mkSt (.assign (locPlace 0)
+             (.use (.copy (locPlace 1 [.deref, .field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy]))))]
+      .return_]
+    npSubrangeLayouts
+
+/-- **`V4` Single-Statement Copy Between Aliasing `(*ptr).field` Places: Read
+Before Write.** Miri evaluates the source operand (a read access) before it
+writes the destination, and Trusted does the same (`evalRvalue`, then the place
+write). For one statement that both reads a dereferenced struct-field place and
+writes a gated place, the overlay applies the Tree Borrows read of the source
+before the Tree Borrows write of the destination
+(`npTreeBorrowsReadThenWriteApply`). In `mkNpPairTwoPtrState`, `_1` carries the
+parent tag and `_2` the child tag of the 8-byte `hooksTwoNodeTree .unique`
+(child unprotected):
+1. `(*child).1.unwrapUnsafeBinder = copy (*parent).1.unwrapUnsafeBinder`: the
+   foreign read through the parent freezes the child on `[4, 8)`, so the write
+   through the child is UB in `treeBorrows = true` (applying the write first
+   would accept the statement); in basic mode the statement is not UB;
+2. `(*parent).1.unwrapUnsafeBinder = copy (*child).1.unwrapUnsafeBinder`: the
+   read through the child precedes the parent write that disables the child, so
+   the run is not UB in `treeBorrows = true` (applying the write first would
+   report a read through a disabled tag). -/
+theorem lm_np_v4_deref_field_copy_read_before_write_witness :
+    (runMiriSteps (annealStepHooksNullaryPtr npV4PairCopyParentToChildMir true) 8
+      (mkNpPairTwoPtrState npV4PairCopyParentToChildMir (hooksTwoNodeTree .unique)
+        false)).map (·.2) =
+      .error (.undefinedBehavior "Tree Borrows write conflict on unwrapUnsafeBinder place") ∧
+    (match runMiriSteps (annealStepHooksNullaryPtr npV4PairCopyParentToChildMir false) 8
+        (mkNpPairTwoPtrState npV4PairCopyParentToChildMir (hooksTwoNodeTree .unique) false) with
+      | .error (.undefinedBehavior _) => false
+      | _ => true) = true ∧
+    (match runMiriSteps (annealStepHooksNullaryPtr npV4PairCopyChildToParentMir true) 8
+        (mkNpPairTwoPtrState npV4PairCopyChildToParentMir (hooksTwoNodeTree .unique) false) with
+      | .error (.undefinedBehavior _) => false
+      | _ => true) = true := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel⟩
 
 /-- **`V4` Zero-Sized (`()`) `UnwrapUnsafeBinder` Write 3-Layer Boundary
 (`DIV-LM-UNWRAP-ZST-WRITE`)**: separates the exact semantics across all three

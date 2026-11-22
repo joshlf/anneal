@@ -37,7 +37,8 @@ Verifies the 4 already-trusted MIR variants end-to-end across BOTH authorities:
    - `lmSide_check` (unified 32-key certificate) + all 4 per-variant checks,
    - closed unified `DualCorrespondenceBundle` + all 4 per-variant bundles,
    - instantiated `threeWayNormalAgreement`, `crossAuthorityFaultEquiv`,
-     `exactBehaviorEq_both`, `lm_modeSensitivity_present`, and per-variant
+     `exactBehaviorEq_both`, `lm_modeSensitivity_present`, the Episode 2
+     capstone `ep2_nullary_ptrcoercion_fnptr_unwrap_capstone`, and per-variant
      claims + flip-direction guards,
    - **definitional `Eq.refl` fixture locks** proving all 16 `CapturedMir`
      fixtures of `MiniRustSpec.NullaryAndPtrCoercionMR` are definitionally
@@ -214,11 +215,43 @@ theorem np_mr_deep_theorems_used :
   have _ := @np_v4_pair_deref_caller_frame_full_return_witness
   have _ := @np_v4_pair_frozen_vs_cell_mach_and_tb_witness
   have _ := @np_v4_pair_foreign_read_freeze_three_way_witness
+  have _ := @np_v4_pair_reserved_no_cell_foreign_write_control_witness
   have _ := @np_variant_outcomes_distinct
   have _ := @npTrustedObserve_table
   have _ := @npMrObserveClass_table
   exact ⟨npMrObserve_unwrap_mode_sensitivity.1, npMrObserve_unwrap_mode_sensitivity.2,
     npMrObsDict_distinct, by decide +kernel⟩
+
+/-- **Episode 2 Root Capstone**: for EVERY LeanMiri observation authority
+`lmAuth` passing the unified 32-key check, the root-Lake projection of
+`ep2_nullary_ptrcoercion_fnptr_unwrap_capstone`: tight codec, consistent
+MiniRust authority, the unified and all 4 per-variant MiniRust side checks,
+mode sensitivity on both authorities, exact behavioral equivalence on both
+authorities, and pairwise distinct MiniRust observation classes. The proof
+destructures the bundle capstone and references the universal MiniRust `V1`-`V4`
+laws of this episode, so they are reachable from this theorem's proof. -/
+theorem ep2_nullary_ptrcoercion_fnptr_unwrap_root_capstone
+    (lmAuth : Anneal.Mir.DropBinderAndSubtypeBundle.Corpus.ObsAuthority NullaryPtrKey
+      NullaryPtrObsVal)
+    (hLM : lmCheckOf lmAuth = true) :
+    npCodec.TightValidRep ∧
+    mrAuthority.denoteConsistent = true ∧
+    mrSide.check npModel = true ∧
+    (∀ v, (mrVariantSide v).check npModel = true) ∧
+    (mrSide.flipW npModel mrSide_check).isSome = true ∧
+    ((lmSideOf lmAuth).flipW npModel hLM).isSome = true ∧
+    (∀ (mMR : NullaryPtrMrMode) (mLM : Bool) (p : NullaryPtrVariant) (q : NullaryPtrCase),
+      ExactBehaviorEq (bundleOf lmAuth hLM).mrRel mMR p q ∧
+      ExactBehaviorEq (bundleOf lmAuth hLM).lmRel mLM p q) ∧
+    npMrObsDictDistinct = true := by
+  have _ := @np_v1_nullaryOp_coupled_step_sim_all_four
+  have _ := @np_v2_dyn_wide_ptr_vtable_ops_universal_M
+  have _ := @np_v2_reify_and_closure_fnPointer_lockstep
+  have _ := @np_v3_fnPtrToPtr_lockstep_mach_and_tb
+  have _ := @np_v4_unwrapUnsafeBinder_assign_coupled_lockstep_and_wfLive
+  obtain ⟨hTight, hDen, hSide, hVar, _, _, hExact, hMrFlip, hLmFlip, _, _⟩ :=
+    ep2_nullary_ptrcoercion_fnptr_unwrap_capstone lmAuth hLM
+  exact ⟨hTight, hDen, hSide, hVar, hMrFlip, hLmFlip, hExact, npMrObsDict_distinct⟩
 
 /-! ## §2. Cross-Root Dual-Authority Kernel Bridge (`MiniRustSpec` + `LeanMiriSpec`) -/
 
@@ -366,7 +399,8 @@ run_cmd do
     -- Instantiate lifted cross-authority theorems + projectPositive/projectFault at the closed
     -- unified dual-authority bundle.
     for thmName in [`threeWayNormalAgreement, `crossAuthorityFaultEquiv,
-                    `exactBehaviorEq_both, `lm_modeSensitivity_present] do
+                    `exactBehaviorEq_both, `lm_modeSensitivity_present,
+                    `ep2_nullary_ptrcoercion_fnptr_unwrap_capstone] do
       let val := mkApp2 (mkConst (bNs ++ thmName)) lmAuthC (mkConst lmCheckName)
       let ty ← MetaM.run' <| inferType val
       let outName := ns ++ thmName
@@ -563,6 +597,7 @@ run_cmd do
         lmNs ++ `npApplyTreeBorrowsReadAt_zst_noop,
         lmNs ++ `lm_np_v4_deref_field_tb_frozen_disabled_cell_witness,
         lmNs ++ `lm_np_v4_deref_field_read_persistence_witness,
+        lmNs ++ `lm_np_v4_deref_field_copy_read_before_write_witness,
         lmNs ++ `lm_np_v4_zst_unwrap_write_boundary_witness,
         lmNs ++ `lm_np_storage_lifecycle_witness,
         lmNs ++ `lm_np_v1_multihop_offsetof_and_failclosed_unsupported_witness ]
@@ -658,7 +693,8 @@ run_cmd do
       ``Anneal.Mir.NullaryAndPtrCoercionBundle.mr_modeSensitivity_present,
       ``Anneal.Mir.NullaryAndPtrCoercionBundle.lm_modeSensitivity_present,
       ``Anneal.Mir.NullaryAndPtrCoercionBundle.variant_bundle_claims,
-      ``Anneal.Mir.NullaryAndPtrCoercionBundle.np_variant_outcomes_distinct ]
+      ``Anneal.Mir.NullaryAndPtrCoercionBundle.np_variant_outcomes_distinct,
+      ``Anneal.Mir.NullaryAndPtrCoercionBundle.ep2_nullary_ptrcoercion_fnptr_unwrap_capstone ]
   for d in constructiveDecls do
     let axs ← liftCoreM <| Lean.collectAxioms d
     for a in axs do

@@ -3844,6 +3844,48 @@ theorem np_v4_pair_foreign_read_freeze_three_way_witness :
    ok_of_map_toOption (by decide +kernel),
    ok_stepsTB_wfLive (by decide +kernel)⟩
 
+/-- Negative-control machine for `npV4PairReservedImForeignWriteMach`: identical
+except that `_2 : &mut np::PairU32Binder` has no `UnsafeCell`
+(`npRefMutPairFrozenMrTy`), so `Validate _2 false` yields `Reserved` (not
+`ReservedIm`) on `[4, 8)`. -/
+def npV4PairReservedNoCellForeignWriteMach : Mach :=
+  let fn := mkMrFn
+    [(localName 0, u32MrTy), (localName 1, npPairU32BinderMrTy),
+     (localName 2, npRefMutPairFrozenMrTy), (localName 3, thinRawPtrTy)]
+    [localName 1] (localName 0)
+    [(bbName 0, ⟨[
+        .Validate (.Local (localName 2)) false,
+        .Assign (.Field (.Field (.Deref (.Load (.Local (localName 3))) npPairU32BinderMrTy) 1) 0)
+          (.Constant (.Int 99) u32MrTy),
+        .Assign (.Field (.Field (.Deref (.Load (.Local (localName 2))) npPairU32BinderMrTy) 1) 0)
+          (.Constant (.Int 55) u32MrTy),
+        .Assign (.Local (localName 0))
+          (.Load (.Field (.Field (.Deref (.Load (.Local (localName 2))) npPairU32BinderMrTy) 1) 0))],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (scalarBytes u32 7 ++ scalarBytes u32 11) 4,
+     mkStackAlloc 384 (ptrBytes 256 (some (⟨1⟩, ()))) 8,
+     mkStackAlloc 512 (ptrBytes 256 (some (⟨1⟩, ()))) 8]
+    [mkRootFrame fn
+      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) }),
+       (localName 2, { addr := 384, provenance := some (⟨2⟩, ()) }),
+       (localName 3, { addr := 512, provenance := some (⟨3⟩, ()) })]]
+
+/-- **Negative Control for the `ReservedIm` Conjunct of
+`np_v4_pair_frozen_vs_cell_mach_and_tb_witness`**: without the `UnsafeCell`
+range, the foreign write through `_3` disables the `Reserved` tag of `_2`, so
+the following local write through `_2` is UB on `MachTB`, while `Mach`
+(`BasicMemory`) returns `55`. The success of the `ReservedIm` machine on
+`MachTB` is therefore due to the `UnsafeCell` range, not to a missing retag. -/
+theorem np_v4_pair_reserved_no_cell_foreign_write_control_witness :
+    (∃ m4, Interp.steps 4 npV4PairReservedNoCellForeignWriteMach = .ok m4 ∧
+      m4.mem.memory.allocations[0]?.map (·.data) = some (scalarBytes u32 55)) ∧
+    (interpUbMsg
+      (Interp.stepsTB 4 (liftMachToTB npV4PairReservedNoCellForeignWriteMach))).isSome = true :=
+  ⟨ok_of_map_toOption (by decide +kernel), by decide +kernel⟩
+
 /-! ## §6. Canonical Executable MiniRust Corpus Observation Interface
 
 Directly executes `MiniRustSpec.Interp.{steps, stepsTB}` for all 4 MIR
