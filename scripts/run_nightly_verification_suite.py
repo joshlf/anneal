@@ -1236,7 +1236,7 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "file": UNTESTED_VARIANT_TEST_FILE,
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Places",
         "switch_to_pass_criterion": "Strip leading/bare ProjectionElem.opaqueCast before the root-vs-projected dispatch in evalOperand (.move), writePlaceValue, evalStmt (.assign / .deinit), and uninitFieldWriteShell?, so (_l as T) and (_l as T).f behave like their post-borrowck erasures _l and _l.f.",
-        "summary": "A bare (_l as T) place takes Trusted's projected path while its erasure _l takes the root path, and uninitFieldWriteShell? returns none on a leading .opaqueCast: move keeps _l initialized, writes/assignments to an uninitialized _l (including (_l as T).f = v) fault with UB, and Deinit only read-checks. Latent: MirPhase::Runtime forbids OpaqueCast.",
+        "summary": "A bare (_l as T) place takes Trusted's projected path while its erasure _l takes the root path, and uninitFieldWriteShell? returns none on a leading .opaqueCast: move keeps _l initialized, writes/assignments to an uninitialized _l (including (_l as T).f = v) fault with UB, and Deinit((_l as T)) leaves _l as LocalSlot.init Value.uninit where Deinit(_l) stores LocalSlot.uninit. Latent: MirPhase::Runtime forbids OpaqueCast.",
     },
     {
         "id": "MODEL-LM-TAILCALL-MODULAR-ROOT",
@@ -4931,6 +4931,16 @@ _LEAN_PRIMARY_ARTIFACT_SUFFIXES: frozenset[str] = frozenset(
     (".olean", ".olean.server", ".olean.private", ".ilean")
 )
 _LEAN_OLEAN_PART_SUFFIXES: frozenset[str] = frozenset((".olean", ".olean.server", ".olean.private"))
+# The artifacts whose content hashes Lake mixes, in this order, into the
+# `<Mod>:importAllArts` trace that an importer records for a module-system (`module`)
+# dependency (`Module.computeExportInfo`); for a classic module it is the `.olean` alone.
+_LEAN_IMPORT_ALL_ARTS_MODULE_PARTS: tuple[str, ...] = (
+    ".olean",
+    ".olean.server",
+    ".olean.private",
+    ".ir.sig",
+    ".ir",
+)
 _LEAN_ARTIFACT_SUFFIXES: frozenset[str] = frozenset(
     (
         *_LEAN_PRIMARY_ARTIFACT_SUFFIXES,
@@ -5540,12 +5550,36 @@ def _lake_records_prove_source_unchanged(
         return False
 
 
-def _lake_trace_import_art_hashes(trace_text: str) -> dict[str, str]:
-    """Extract `{Dep/Sub/Mod: importAllArts_hex}` from a non-synthetic Lake build
-    `.trace`, or `{}` for synthetic/fetch/malformed traces."""
+def _read_private_regular_file(path: str) -> tuple[bytes, int] | None:
+    """`(content, st_mtime_ns)` of `path` if it is a regular file with a single hard link
+    (see `_private_regular_file_stat`), else `None`. Never follows a symlink at `path`,
+    never blocks on a FIFO there, and costs four system calls."""
     try:
-        doc = json.loads(trace_text)
-    except ValueError:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            return None
+        data = os.read(fd, st.st_size) if st.st_size else b""
+        # A file that changed size under the read is being rewritten: no evidence.
+        return (data, st.st_mtime_ns) if len(data) == st.st_size else None
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _lake_trace_import_art_hashes(trace: bytes) -> dict[str, str]:
+    """Extract `{Dep/Sub/Mod: importAllArts_hex}` from a non-synthetic Lake build
+    `.trace`, or `{}` for synthetic/fetch/malformed traces. A trace that never mentions
+    `:importAllArts` (every cache-fetch trace, every import-free module) is not parsed."""
+    if b':importAllArts"' not in trace:
+        return {}
+    try:
+        doc = json.loads(trace)
+    except (ValueError, RecursionError):
         return {}
     if not isinstance(doc, dict) or doc.get("synthetic") is True:
         return {}
@@ -5580,27 +5614,53 @@ def _lake_trace_import_art_hashes(trace_text: str) -> dict[str, str]:
     return dep_hashes
 
 
-def _lean_module_current_import_all_arts_hex(arts: Mapping[str, str]) -> str | None:
-    """Compute Lake's current `importAllArts` hash hex for a module from its verified
-    private `.olean*.hash` sidecars, or `None` if unavailable/unverified."""
-    part_suffixes = [sfx for sfx in (".olean", ".olean.server", ".olean.private") if sfx in arts]
-    if not part_suffixes or part_suffixes[0] != ".olean":
+def _lean_import_all_arts_parts(arts: Mapping[str, str]) -> tuple[str, ...] | None:
+    """Suffixes of the artifacts of a module whose content hashes Lake mixes, in this
+    order, into its `importAllArts` trace: `(".olean",)` for a classic module, all of
+    `_LEAN_IMPORT_ALL_ARTS_MODULE_PARTS` for a module-system one. `None` for any other
+    set of files (a torn module, or a layout this Lake version does not produce)."""
+    parts = tuple(sfx for sfx in _LEAN_IMPORT_ALL_ARTS_MODULE_PARTS if sfx in arts)
+    return parts if parts in ((".olean",), _LEAN_IMPORT_ALL_ARTS_MODULE_PARTS) else None
+
+
+def _lean_import_all_arts_recorded_ns(arts: Mapping[str, str]) -> int | None:
+    """When Lake last (re)recorded a content hash that enters the module's
+    `importAllArts` trace: the newest `st_mtime_ns` of the private `.hash` sidecars of
+    `_lean_import_all_arts_parts`, or `None` if one is missing or not private."""
+    parts = _lean_import_all_arts_parts(arts)
+    if parts is None:
         return None
-    acc = _LAKE_HASH_NIL
-    for sfx in part_suffixes:
+    newest: int | None = None
+    for sfx in parts:
         sidecar_path = arts.get(f"{sfx}.hash")
-        if sidecar_path is None:
-            return None
-        sidecar_st = _private_regular_file_stat(sidecar_path)
+        sidecar_st = None if sidecar_path is None else _private_regular_file_stat(sidecar_path)
         if sidecar_st is None:
             return None
+        if newest is None or sidecar_st.st_mtime_ns > newest:
+            newest = sidecar_st.st_mtime_ns
+    return newest
+
+
+def _lean_module_current_import_all_arts_hex(arts: Mapping[str, str]) -> str | None:
+    """Lake's current `importAllArts` trace hash of a module (16 hex digits): `Hash.nil`
+    mixed with the content hash of each of `_lean_import_all_arts_parts` in order, read
+    from the private `.hash` sidecars Lake itself trusts (each not older than its
+    artifact). `None` if the module's files do not let this be verified."""
+    parts = _lean_import_all_arts_parts(arts)
+    if parts is None:
+        return None
+    acc = _LAKE_HASH_NIL
+    for sfx in parts:
+        sidecar_path = arts.get(f"{sfx}.hash")
+        sidecar = None if sidecar_path is None else _read_private_regular_file(sidecar_path)
+        if sidecar is None:
+            return None
         try:
-            if sidecar_st.st_mtime_ns < os.stat(arts[sfx]).st_mtime_ns:
+            if sidecar[1] < os.stat(arts[sfx]).st_mtime_ns:
                 return None
-            with open(sidecar_path, encoding="ascii", errors="replace") as fh:
-                content_hash = fh.read(64).strip()
         except OSError:
             return None
+        content_hash = sidecar[0][:64].decode("ascii", errors="replace").strip()
         if not _LAKE_HASH_HEX_RE.fullmatch(content_hash):
             return None
         acc = _lake_mix_hash(acc, int(content_hash, 16))
@@ -5720,8 +5780,14 @@ def clean_stale_oleans(repo_root: Path) -> list[Path]:
        and Lake's own records do not prove the source unchanged
        (`_lake_records_prove_source_unchanged`), or
     2. it can depend on `Trusted` (any library but vendored `Miri`) and some `Trusted`
-       module of the same Lake root is stale by rule 1: every downstream `.olean` of
-       that root is then stale against `Trusted`.
+       module of the same Lake root is stale by rule 1 or 3: every downstream `.olean` of
+       that root is then stale against `Trusted`, or
+    3. Lake built it (its private `.trace` is a build trace, which records the
+       `<Dep>:importAllArts` hash of each direct import) and either a recorded import is
+       itself stale, or that import's artifacts were re-recorded after the trace was
+       written (a `.hash` sidecar of `_lean_import_all_arts_parts` is newer than the
+       trace) with a different `importAllArts` hash: the import was rebuilt without the
+       module, e.g. by a partial `lake build Trusted`.
 
     Rule 1's check of Lake's records is what keeps the guard a no-op on coherent trees
     whose mtimes are not: artifacts Lake restored by hard link, a cache seeded from another
@@ -5729,11 +5795,16 @@ def clean_stale_oleans(repo_root: Path) -> list[Path]:
     each `Trusted` `.olean` with its own source rather than with the newest
     `trusted/lean/**/*.lean` file: Lake rebuilds only the importers of an edited module,
     so every unrelated `Trusted` `.olean` legitimately stays older than that edit, and
-    comparing against it would wipe the whole root on every run from then on.
+    comparing against it would wipe the whole root on every run from then on. Rule 3
+    covers what that leaves open, and asks for both a newer sidecar and a different hash
+    so that neither alone removes anything: Lake rewrites sidecars without rebuilding,
+    and a hash computed by a formula this Lake version no longer uses would otherwise
+    disagree with every trace on every run. A module Lake restored from its cache has a
+    synthetic trace that names no import, so rule 3 leaves it to Lake.
 
     Never follows directory symlinks or deletes anything outside
     `<lake_root>/.lake/build/lib/lean/`; when no source is newer than its `.olean`
-    (or there are no `.olean`s) it only stats files.
+    (or there are no `.olean`s) it only stats files and reads each module's `.trace`.
     """
     removed: list[str] = []
     for lake_root in (repo_root, repo_root / "examples"):
@@ -5771,54 +5842,51 @@ def clean_stale_oleans(repo_root: Path) -> list[Path]:
                 rel_mod for rel_mod, top in tops.items() if top not in _TRUSTED_INDEPENDENT_LIBS
             )
 
-        # Rule 3: Lake build-trace direct-import hash coherence. If a dependency module
-        # (such as a partially rebuilt `Trusted` module) now has a different verified
-        # `importAllArts` hash than what a downstream module's non-synthetic build `.trace`
-        # recorded, mark the downstream module (and its recorded importers) stale.
-        dep_edges: dict[str, dict[str, str]] = {}
-        current_import_hashes: dict[str, str | None] = {}
+        # Rule 3: Lake build-trace import-hash coherence (see the docstring).
+        dep_edges: dict[str, tuple[int, dict[str, str]]] = {}
         for rel_mod, arts in modules.items():
             if rel_mod in stale or rel_mod not in tops:
                 continue
             trace_path = arts.get(".trace")
-            if trace_path is None or _private_regular_file_stat(trace_path) is None:
+            trace = None if trace_path is None else _read_private_regular_file(trace_path)
+            if trace is None:
                 continue
-            try:
-                with open(trace_path, encoding="utf-8", errors="replace") as fh:
-                    imports = _lake_trace_import_art_hashes(fh.read())
-            except OSError:
-                continue
+            imports = _lake_trace_import_art_hashes(trace[0])
             if imports:
-                dep_edges[rel_mod] = imports
+                dep_edges[rel_mod] = (trace[1], imports)
+
+        recorded_ns: dict[str, int | None] = {}
+        current_hex: dict[str, str | None] = {}
+        for rel_mod, (trace_ns, imports) in dep_edges.items():
+            for dep_mod, recorded_hex in imports.items():
+                dep_arts = modules.get(dep_mod)
+                if dep_arts is None or dep_mod in stale:
+                    continue
+                if dep_mod not in recorded_ns:
+                    recorded_ns[dep_mod] = _lean_import_all_arts_recorded_ns(dep_arts)
+                dep_ns = recorded_ns[dep_mod]
+                if dep_ns is None or dep_ns <= trace_ns:
+                    continue
+                if dep_mod not in current_hex:
+                    current_hex[dep_mod] = _lean_module_current_import_all_arts_hex(dep_arts)
+                dep_hex = current_hex[dep_mod]
+                if dep_hex is not None and dep_hex != recorded_hex:
+                    stale.add(rel_mod)
+                    break
 
         changed = True
         while changed:
             changed = False
-            for rel_mod, imports in dep_edges.items():
-                if rel_mod in stale:
-                    continue
-                for dep_mod, recorded_hex in imports.items():
-                    if dep_mod in stale:
-                        stale.add(rel_mod)
-                        changed = True
-                        break
-                    if dep_mod in modules:
-                        if dep_mod not in current_import_hashes:
-                            current_import_hashes[dep_mod] = _lean_module_current_import_all_arts_hex(
-                                modules[dep_mod]
-                            )
-                        cur_hex = current_import_hashes[dep_mod]
-                        if cur_hex is not None and cur_hex != recorded_hex:
-                            stale.add(rel_mod)
-                            changed = True
-                            break
-            if changed and any(tops[rel_mod] == _TRUSTED_LIB for rel_mod in stale):
+            for rel_mod, (_trace_ns, imports) in dep_edges.items():
+                if rel_mod not in stale and not stale.isdisjoint(imports):
+                    stale.add(rel_mod)
+                    changed = True
+            if any(tops[rel_mod] == _TRUSTED_LIB for rel_mod in stale):
                 before = len(stale)
                 stale.update(
                     rel_mod for rel_mod, top in tops.items() if top not in _TRUSTED_INDEPENDENT_LIBS
                 )
-                if len(stale) != before:
-                    changed = True
+                changed = changed or len(stale) != before
 
         for rel_mod in sorted(stale):
             for art_path in sorted(modules[rel_mod].values()):

@@ -3218,17 +3218,44 @@ private theorem placeIndexLocalsInit_erase (locals : List LocalSlot) :
     have ih := placeIndexLocalsInit_erase locals rest
     cases e <;> simp only [eraseOpaqueCasts, placeIndexLocalsInit, ih]
 
+/-- With no root type to validate against, no non-empty projected `Deinit` tail validates
+below an uninitialized (sub-)value. -/
+private theorem deinitTailOk_none_cons (locals : List LocalSlot) (decls : List LocalDecl)
+    (layouts : LayoutTable) (e : ProjectionElem) (r : List ProjectionElem) :
+    deinitTailOk locals decls layouts none (e :: r) = false := by
+  cases e with
+  | downcast n vi =>
+    cases r with
+    | nil => rfl
+    | cons e' r' => cases e' <;> rfl
+  | index i =>
+    simp only [deinitTailOk]
+    cases get? locals i with
+    | none => rfl
+    | some slot =>
+      cases slot with
+      | init v => cases v <;> rfl
+      | _ => rfl
+  | _ => rfl
+
 /-- **Trusted `placeMention` and `deinit` statement semantics on `.opaqueCast` (universal).**
 `StatementKind.placeMention` is completely invariant under erasing `.opaqueCast` at any
 depth (even with `.deref` or `.index` projections). By contrast, `StatementKind.deinit`
-distinguishes root `[]` from a projected path `.opaqueCast t :: rest`: on an initialized
-root `get? s.frame.locals l = some (.init rootVal)`, `.deinit ⟨l, .opaqueCast t :: rest⟩`
-runs `deinitProjectedForLocal` (failing closed with `.unsupported` when `rest` contains
-`.deref` or the place touches a union, and otherwise stepping through `.opaqueCast t` at
-the cast type to write `LocalSlot.init rootVal'` and invalidate conflicting borrows); on an
-`.uninit` root with `decls = []` (`placeTy = none`), `deinitTailOk` returns `false`, so it
-fails closed with `.unsupported` if `rest` has a `.deref` and `.fail .ub` otherwise (unlike
-root `.deinit ⟨l, []⟩`, which steps). -/
+distinguishes root `[]` from a projected path `.opaqueCast t :: rest`, and validates the
+tail below the cast at the *cast* type:
+* on an initialized root `get? s.frame.locals l = some (.init rootVal)`,
+  `.deinit ⟨l, .opaqueCast t :: rest⟩` runs `deinitProjectedForLocal`, which fails closed
+  with `.unsupported` when `rest` contains `.deref` or the place touches a union and
+  otherwise (for `rootVal ≠ .uninit`) steps through `.opaqueCast t` at the cast type;
+* on an `.uninit` root whose local has no declared type (`placeTy = none`, e.g.
+  `decls = []`), `deinitTailOk` returns `false`, so it fails closed with `.unsupported` if
+  `rest` has a `.deref` and `.fail .ub` otherwise (unlike root `.deinit ⟨l, []⟩`, which
+  steps);
+* on either kind of root, for *every* root value (including `Value.uninit`) and every
+  declaration table, `Deinit((_l as T).e.r)` is exactly `Deinit(_l.e.r)` whenever neither
+  place touches a union and the cast does not switch the root type (`T` resolves to the
+  declared type of `_l`, or `_l` has none). The root-type hypothesis is necessary:
+  `opaqueCast_witness_type_switch`. -/
 theorem opaqueCast_trusted_stmt_placeMention_and_deinit_universal
     (s : MachineState) (decls : List LocalDecl) (layouts : LayoutTable)
     (l : Nat) (t : Ty) (span : String) (rootSlot : LocalSlot) :
@@ -3239,19 +3266,19 @@ theorem opaqueCast_trusted_stmt_placeMention_and_deinit_universal
         evalStmt s ⟨.placeMention ⟨l, eraseOpaqueCasts p⟩, span⟩ decls layouts) ∧
     (∀ (rootVal : Value) (rest : List ProjectionElem),
       get? s.frame.locals l = some (.init rootVal) →
-      rootVal ≠ .uninit →
-      deinitProjectedForLocal s.frame.locals decls layouts l rootVal (.opaqueCast t :: rest) =
-        (match projListHasDeref rest with
-         | true => .unsupported
-         | false =>
-           match placeTouchesUnion decls layouts ⟨l, .opaqueCast t :: rest⟩ with
+      (rootVal ≠ .uninit →
+        deinitProjectedForLocal s.frame.locals decls layouts l rootVal (.opaqueCast t :: rest) =
+          (match projListHasDeref rest with
            | true => .unsupported
            | false =>
-             let nextTyOpt :=
-               match placeTy decls layouts ⟨l, []⟩ with
-               | .some _ => .some (resolveTyWithLocalDecls decls layouts t)
-               | .none => .none
-             deinitProjectedValue s.frame.locals rootVal rest decls layouts nextTyOpt) ∧
+             match placeTouchesUnion decls layouts ⟨l, .opaqueCast t :: rest⟩ with
+             | true => .unsupported
+             | false =>
+               let nextTyOpt :=
+                 match placeTy decls layouts ⟨l, []⟩ with
+                 | .some _ => .some (resolveTyWithLocalDecls decls layouts t)
+                 | .none => .none
+               deinitProjectedValue s.frame.locals rootVal rest decls layouts nextTyOpt)) ∧
       (∀ (e : ProjectionElem) (r : List ProjectionElem),
         rest = e :: r →
         placeTouchesUnion decls layouts ⟨l, .opaqueCast t :: e :: r⟩ = false →
@@ -3262,10 +3289,60 @@ theorem opaqueCast_trusted_stmt_placeMention_and_deinit_universal
           evalStmt s ⟨.deinit ⟨l, e :: r⟩, span⟩ decls layouts)) ∧
     (∀ rest : List ProjectionElem,
       get? s.frame.locals l = some .uninit →
-      evalStmt s ⟨.deinit ⟨l, .opaqueCast t :: rest⟩, span⟩ [] layouts =
-        match projectionHasDeref rest with
-        | true => MirStepNode.unsupported
-        | false => MirStepNode.fail .ub) := by
+      (placeTy decls layouts ⟨l, []⟩ = none →
+        evalStmt s ⟨.deinit ⟨l, .opaqueCast t :: rest⟩, span⟩ decls layouts =
+          match projectionHasDeref rest with
+          | true => MirStepNode.unsupported
+          | false => MirStepNode.fail .ub) ∧
+      (∀ (e : ProjectionElem) (r : List ProjectionElem),
+        rest = e :: r →
+        placeTouchesUnion decls layouts ⟨l, .opaqueCast t :: e :: r⟩ = false →
+        placeTouchesUnion decls layouts ⟨l, e :: r⟩ = false →
+        (∀ baseTy, placeTy decls layouts ⟨l, []⟩ = some baseTy →
+          resolveTyWithLocalDecls decls layouts t = baseTy) →
+        evalStmt s ⟨.deinit ⟨l, .opaqueCast t :: e :: r⟩, span⟩ decls layouts =
+          evalStmt s ⟨.deinit ⟨l, e :: r⟩, span⟩ decls layouts)) := by
+  have hprot : ∀ (bs : List BorrowEntry) (ps : List Nat) (q : List ProjectionElem) (d : Nat),
+      hasProtectedWriteConflict bs ps l none (.opaqueCast t :: q) 0 0 d =
+        hasProtectedWriteConflict bs ps l none q 0 0 d := by
+    intro bs ps q d
+    induction bs with
+    | nil => rfl
+    | cons b bs ih =>
+      simp only [hasProtectedWriteConflict, borrowEntryOverlapsWrite, projectionsOverlap,
+        stripTransparentProjections, ih]
+  have hinv : ∀ (bs : List BorrowEntry) (q : List ProjectionElem) (d : Nat),
+      invalidateConflictingBorrowsAtProj bs l none (.opaqueCast t :: q) 0 0 d =
+        invalidateConflictingBorrowsAtProj bs l none q 0 0 d := by
+    intro bs q d
+    induction bs with
+    | nil => rfl
+    | cons b bs ih =>
+      simp only [invalidateConflictingBorrowsAtProj, updateBorrowPermAtProj,
+        borrowEntryOverlapsWrite, projectionsOverlap, stripTransparentProjections, ih]
+  have hrlp : ∀ (e : ProjectionElem) (r : List ProjectionElem),
+      placeTouchesUnion decls layouts ⟨l, .opaqueCast t :: e :: r⟩ = false →
+      placeTouchesUnion decls layouts ⟨l, e :: r⟩ = false →
+      resolveBorrowWriteLocalProj decls layouts s.frame.locals l (.opaqueCast t :: e :: r) =
+        .opaqueCast t :: resolveBorrowWriteLocalProj decls layouts s.frame.locals l (e :: r) := by
+    intro e r hu hu'
+    rw [resolveBorrowWriteLocalProj_of_not_union decls layouts s.frame.locals l
+          (.opaqueCast t :: e :: r) hu,
+        resolveBorrowWriteLocalProj_of_not_union decls layouts s.frame.locals l (e :: r) hu']
+    simp only [resolveBorrowProjectionElems]
+    cases resolveBorrowProjectionElems s.frame.locals (e :: r) <;> rfl
+  have htail : ∀ (e : ProjectionElem) (r : List ProjectionElem),
+      (∀ baseTy, placeTy decls layouts ⟨l, []⟩ = some baseTy →
+        resolveTyWithLocalDecls decls layouts t = baseTy) →
+      deinitTailOk s.frame.locals decls layouts (placeTy decls layouts ⟨l, []⟩)
+          (.opaqueCast t :: e :: r) =
+        deinitTailOk s.frame.locals decls layouts (placeTy decls layouts ⟨l, []⟩) (e :: r) := by
+    intro e r hroot
+    cases hpt : placeTy decls layouts { local_ := l, projection := [] } with
+    | none => rw [deinitTailOk_none_cons s.frame.locals decls layouts e r]
+    | some baseTy =>
+      conv => lhs; unfold deinitTailOk
+      simp only [hroot baseTy hpt]
   refine ⟨?_, ?_, ?_⟩
   · intro p
     have hm : ∀ slot, placeMentionOperandsInit s.frame.locals slot (eraseOpaqueCasts p) =
@@ -3278,9 +3355,10 @@ theorem opaqueCast_trusted_stmt_placeMention_and_deinit_universal
     | none => rfl
     | some slot =>
       cases slot <;> simp only [hm]
-  · intro rootVal rest hv hne
+  · intro rootVal rest hv
     refine ⟨?_, ?_⟩
-    · simp only [deinitProjectedForLocal, projListHasDeref]
+    · intro hne
+      simp only [deinitProjectedForLocal, projListHasDeref]
       cases projListHasDeref rest with
       | true => rfl
       | false =>
@@ -3301,7 +3379,8 @@ theorem opaqueCast_trusted_stmt_placeMention_and_deinit_universal
         | true => rfl
         | false =>
           cases rootVal with
-          | uninit => exact absurd rfl hne
+          | uninit =>
+            simp only [deinitProjectedValue, htail e r hroot, projListHasDeref]
           | aggregate vi _ =>
             cases vi <;> {
               conv => lhs; unfold deinitProjectedValue
@@ -3314,46 +3393,16 @@ theorem opaqueCast_trusted_stmt_placeMention_and_deinit_universal
             cases hpt : placeTy decls layouts { local_ := l, projection := [] } with
             | none => rfl
             | some baseTy => simp only [hroot baseTy hpt]
-      have hres_er :
-          (match resolveBorrowProjectionElems s.frame.locals (.opaqueCast t :: e :: r) with
-           | some rp => rp
-           | none => .opaqueCast t :: e :: r) =
-          .opaqueCast t ::
-            (match resolveBorrowProjectionElems s.frame.locals (e :: r) with
-             | some rp => rp
-             | none => e :: r) := by
-        simp only [resolveBorrowProjectionElems]
-        cases resolveBorrowProjectionElems s.frame.locals (e :: r) <;> rfl
-      have hrlp : resolveBorrowWriteLocalProj decls layouts s.frame.locals l (.opaqueCast t :: e :: r) =
-          .opaqueCast t :: resolveBorrowWriteLocalProj decls layouts s.frame.locals l (e :: r) := by
-        rw [resolveBorrowWriteLocalProj_of_not_union decls layouts s.frame.locals l
-              (.opaqueCast t :: e :: r) hu,
-            resolveBorrowWriteLocalProj_of_not_union decls layouts s.frame.locals l (e :: r) hu']
-        exact hres_er
-      have hprot : ∀ (bs : List BorrowEntry) (ps : List Nat) (q : List ProjectionElem) (d : Nat),
-          hasProtectedWriteConflict bs ps l none (.opaqueCast t :: q) 0 0 d =
-            hasProtectedWriteConflict bs ps l none q 0 0 d := by
-        intro bs ps q d
-        induction bs with
-        | nil => rfl
-        | cons b bs ih =>
-          simp only [hasProtectedWriteConflict, borrowEntryOverlapsWrite, projectionsOverlap,
-            stripTransparentProjections, ih]
-      have hinv : ∀ (bs : List BorrowEntry) (q : List ProjectionElem) (d : Nat),
-          invalidateConflictingBorrowsAtProj bs l none (.opaqueCast t :: q) 0 0 d =
-            invalidateConflictingBorrowsAtProj bs l none q 0 0 d := by
-        intro bs q d
-        induction bs with
-        | nil => rfl
-        | cons b bs ih =>
-          simp only [invalidateConflictingBorrowsAtProj, updateBorrowPermAtProj,
-            borrowEntryOverlapsWrite, projectionsOverlap, stripTransparentProjections, ih]
-      simp only [evalStmt, hv, hdp, hrlp, hprot, hinv]
+      simp only [evalStmt, hv, hdp, hrlp e r hu hu', hprot, hinv]
   · intro rest huninit
-    have hpt : placeTy [] layouts { local_ := l, projection := [] } = none := by
-      simp [placeTy, get?]
-    simp only [evalStmt, huninit, hpt, deinitTailOk, projectionHasDeref]
-    cases projectionHasDeref rest <;> rfl
+    refine ⟨?_, ?_⟩
+    · intro hpt
+      simp only [evalStmt, huninit, hpt, deinitTailOk, projectionHasDeref]
+      cases projectionHasDeref rest <;> rfl
+    · intro e r hrest hu hu' hroot
+      subst hrest
+      simp only [evalStmt, huninit, htail e r hroot, hrlp e r hu hu', hprot, hinv,
+        projectionHasDeref]
 
 private theorem set?_get?_self {α : Type} {xs : List α} {i : Nat} {x : α} (y : α)
     (h : get? xs i = some x) : set? xs i y = some (xs.set i y) ∧ get? (xs.set i y) i = some y := by
@@ -3720,6 +3769,11 @@ def u8Arr2Decl : LocalDecl := { mutability := .mut, ty := tyU8Arr2, debugName :=
 
 def u8Arr2Locals : List LocalSlot := [.uninit, .init (.aggregate 0 [.scalar ⟨2, 1⟩, .scalar ⟨0, 1⟩])]
 
+/-- A borrow-free state whose `(u32, u32)` local `_1` holds `slot`. -/
+def ocDeinitState (slot : LocalSlot) : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, slot] },
+    memory := { borrows := [], nextTag := 7 } }
+
 /-- **Documented type switch (including `.ok` vs `.ub` runtime validity flip).** The opaque
 cast switches `placeTy` (write validation) and `placeTyResolved` (read validation). When an
 array `[u8; 2]` local holding `[2_u8, 0_u8]` is indexed at `0` (`e = .constantIndex 0 1 false`,
@@ -3728,7 +3782,12 @@ succeed at `tyU8`, whereas pre-casting the base via `.opaqueCast tyBoolArr2` swi
 element type to `bool` (`tyBool`) so `validateValueForTy?` rejects `2` and both
 `evalPlaceRead` and `writePlaceValue` fault with `.ub` — proving the `hty`/`htyR` agreement
 hypotheses of `opaqueCast_trusted_place_rw_with_decls` are necessary even for non-empty
-`e :: r` tails. -/
+`e :: r` tails. Likewise for `Deinit`, whose tail is validated at the cast type: on a
+`(u32, u32)` local that is uninitialized (`LocalSlot.uninit`) or holds `Value.uninit`,
+`Deinit((_1 as (u32, u32)).0)` steps exactly like `Deinit(_1.0)`, whereas
+`Deinit((_1 as u32).0)` asks `u32` for a field and faults with UB although neither place
+touches a union — the root-type agreement hypothesis of the `Deinit` erasure in
+`opaqueCast_trusted_stmt_placeMention_and_deinit_universal` is necessary. -/
 theorem opaqueCast_witness_type_switch :
     placeTy [u32Decl "_0", pairDecl] wLayouts ⟨1, [.opaqueCast tyU8]⟩ = some tyU8 ∧
       placeTy [u32Decl "_0", pairDecl] wLayouts ⟨1, []⟩ = some tyPair ∧
@@ -3745,13 +3804,30 @@ theorem opaqueCast_witness_type_switch :
         .ok u8Arr2Locals ∧
       writePlaceValue u8Arr2Locals [] ⟨1, [.opaqueCast tyBoolArr2, .constantIndex 0 1 false]⟩
           (.scalar ⟨2, 1⟩) [u32Decl "_0", u8Arr2Decl] wLayouts =
-        .ub := by
+        .ub ∧
+      placeTouchesUnion [u32Decl "_0", pairDecl] wLayouts ⟨1, [.opaqueCast tyU32, .field 0 tyU32]⟩ =
+        false ∧
+      placeTouchesUnion [u32Decl "_0", pairDecl] wLayouts (plainField 0) = false ∧
+      (∀ slot ∈ [LocalSlot.uninit, LocalSlot.init Value.uninit],
+        evalStmt (ocDeinitState slot) ⟨.deinit (plainField 0), "w"⟩ [u32Decl "_0", pairDecl]
+            wLayouts =
+          MirStepNode.step (advanceStmt (ocDeinitState slot) [.uninit, slot]) ∧
+        evalStmt (ocDeinitState slot) ⟨.deinit (ocField 0), "w"⟩ [u32Decl "_0", pairDecl]
+            wLayouts =
+          evalStmt (ocDeinitState slot) ⟨.deinit (plainField 0), "w"⟩ [u32Decl "_0", pairDecl]
+            wLayouts ∧
+        evalStmt (ocDeinitState slot) ⟨.deinit ⟨1, [.opaqueCast tyU32, .field 0 tyU32]⟩, "w"⟩
+            [u32Decl "_0", pairDecl] wLayouts =
+          MirStepNode.fail .ub) := by
   have h1 : placeTy [u32Decl "_0", pairDecl] wLayouts ⟨1, [.opaqueCast tyU8]⟩ = some tyU8 := rfl
   have h2 : placeTy [u32Decl "_0", pairDecl] wLayouts ⟨1, []⟩ = some tyPair := rfl
-  refine ⟨h1, h2, ?_, rfl, rfl, rfl, rfl⟩
-  rw [h1, h2]
-  intro h
-  simp [tyU8, tyPair] at h
+  refine ⟨h1, h2, ?_, rfl, rfl, rfl, rfl, rfl, rfl, ?_⟩
+  · rw [h1, h2]
+    intro h
+    simp [tyU8, tyPair] at h
+  · intro slot hslot
+    simp only [List.mem_cons, List.not_mem_nil, or_false] at hslot
+    rcases hslot with rfl | rfl <;> exact ⟨rfl, rfl, rfl⟩
 
 /-- **Positive witness (moves).** `move (p as T)` is a *projected* move: it yields the whole
 value and keeps `p` initialized (like Miri, whose moves do not de-initialize), whereas the
@@ -3772,8 +3848,9 @@ and `evalStmt` on `(_0 as u32) = 42` at the uninitialized return place `_0` faul
 while their erasures initialize `_0`; partial field initialization `(_1 as (u32, u32)).0 = 42`
 on an uninitialized tuple `_1` faults with UB (`uninitFieldWriteShell? = none`) while
 `_1.0 = 42` materializes the tuple shell and writes field `0`; and `Deinit((_1 as (u32, u32)))`
-keeps `p` initialized while `Deinit(_1)` de-initializes it — the opaque cast is observable
-with no type switch involved (`opaqueCast_trusted_root_dispatch_divergence`). -/
+leaves `_1` as `LocalSlot.init Value.uninit` while `Deinit(_1)` stores `LocalSlot.uninit` —
+the opaque cast is observable with no type switch involved
+(`opaqueCast_trusted_root_dispatch_divergence`). -/
 theorem opaqueCast_witness_root_dispatch :
     writePlaceValue ocLocals [] ⟨0, [.opaqueCast tyPair]⟩ pairVal = .ub ∧
       writePlaceValue ocLocals [] ⟨0, []⟩ pairVal = .ok [.init pairVal, .init pairVal] ∧

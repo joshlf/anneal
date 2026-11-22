@@ -3672,6 +3672,321 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             self.assertEqual(removed, set(mid_files + top_files))
             self.assertTrue(all(p.is_file() for p in core_files + indep_files))
 
+    # Content hashes Lake 4.34.1 itself wrote (`<Mod>.<part>.hash`) when building a
+    # scratch package, and the `<Mod>:importAllArts` hashes it then recorded in the
+    # `.trace` of a classic module importing both `ModA` (module system) and `PlainB`.
+    _LAKE_MODULE_SYSTEM_PART_HASHES = {
+        ".olean": "be0c133e0d0edd5c",
+        ".olean.server": "7f9db8e8a33ad80a",
+        ".olean.private": "f2cba97f1ec4f19f",
+        ".ir.sig": "6065654aaed314af",
+        ".ir": "9d207ed66150a81d",
+    }
+    _LAKE_MODULE_SYSTEM_IMPORT_ALL_ARTS = "2b1fd038f266de81"
+    _LAKE_CLASSIC_PART_HASHES = {".olean": "de7b71add399177b"}
+    _LAKE_CLASSIC_IMPORT_ALL_ARTS = "11758f8857b189a3"
+
+    def _write_lake_module_with_hashes(
+        self,
+        lib_dir: Path,
+        rel_mod: str,
+        part_hashes: dict[str, str],
+        built_at: float,
+        *,
+        imports: dict[str, str] | None = None,
+        fetched: bool = False,
+    ) -> dict[str, Path]:
+        """Lay down module `rel_mod` as Lake leaves it at `built_at`: one artifact and one
+        `.hash` sidecar (holding the given content hash) per part of `part_hashes`, and a
+        `.trace` recording `<Dep>:importAllArts` for each of `imports` (`{Dep/Mod: hex}`),
+        or the import-free synthetic trace of a cache fetch."""
+        files: dict[str, Path] = {}
+        for suffix, content_hash in part_hashes.items():
+            files[suffix] = self._write_file_at(lib_dir / f"{rel_mod}{suffix}", b"artifact", built_at)
+            files[f"{suffix}.hash"] = self._write_file_at(
+                lib_dir / f"{rel_mod}{suffix}.hash", content_hash.encode("ascii"), built_at
+            )
+        outputs = {"o": [f"{h}{sfx}" for sfx, h in part_hashes.items() if sfx.startswith(".olean")]}
+        recorded: list[list[str]] = []
+        for dep, import_hash in (imports or {}).items():
+            dep_name = dep.replace("/", ".")
+            recorded.append([f"{dep_name} transitive imports (legacy)", "00000000000006bb"])
+            recorded.append([f"{dep_name}:importAllArts", import_hash])
+        trace: dict[str, object] = {
+            "synthetic": False,
+            "schemaVersion": "2025-09-10",
+            "outputs": outputs,
+            "log": [],
+            "inputs": [
+                ["deps", [["Pkg/Lib:extraDep", [["@Pkg:extraDep", "00000000000006bb"]]], ["imports", recorded]]],
+                [f"/some/worktree/src/{rel_mod}.lean", "ad651cc2b3431caa"],
+            ],
+            "depHash": "56989c8629fa0281",
+        }
+        if fetched:
+            trace = {
+                "synthetic": True,
+                "schemaVersion": "2025-09-10",
+                "outputs": outputs,
+                "log": [],
+                "inputs": [],
+                "depHash": "cca9185a3f3ac0e6",
+            }
+        files[".trace"] = self._write_file_at(
+            lib_dir / f"{rel_mod}.trace", json.dumps(trace, indent=1).encode("utf-8"), built_at
+        )
+        return files
+
+    @staticmethod
+    def _classic_import_all_arts(olean_hash: str) -> str:
+        return f"{suite._lake_mix_hash(suite._LAKE_HASH_NIL, int(olean_hash, 16)):016x}"
+
+    def test_clean_stale_oleans_import_hash_rule_matches_lake_for_module_system_imports(self) -> None:
+        # Lake mixes five artifact hashes into the `importAllArts` trace of a module-system
+        # dependency (`.olean`, `.olean.server`, `.olean.private`, `.ir.sig`, `.ir`) and one
+        # for a classic module. Mixing only the three `.olean` parts disagrees with every
+        # trace Lake writes for an importer of a `module` file, which made the guard delete
+        # that importer, and everything Lake had built on top of it, on every single run.
+        t_dep, t_importer, t_top = 1_700_000_000.0, 1_700_000_100.0, 1_700_000_200.0
+        mod_a_hashes = self._LAKE_MODULE_SYSTEM_PART_HASHES
+        importer_olean, top_olean = "5555555555555555", "6666666666666666"
+
+        def build(root: Path) -> dict[str, dict[str, Path]]:
+            lib = root / "examples/.lake/build/lib/lean"
+            return {
+                "ModA": self._write_lake_module_with_hashes(lib, "Miri/ModA", mod_a_hashes, t_dep),
+                "PlainB": self._write_lake_module_with_hashes(
+                    lib, "Miri/PlainB", self._LAKE_CLASSIC_PART_HASHES, t_dep
+                ),
+                "Importer": self._write_lake_module_with_hashes(
+                    lib,
+                    "Miri/Importer",
+                    {".olean": importer_olean},
+                    t_importer,
+                    imports={
+                        "Miri/ModA": self._LAKE_MODULE_SYSTEM_IMPORT_ALL_ARTS,
+                        "Miri/PlainB": self._LAKE_CLASSIC_IMPORT_ALL_ARTS,
+                    },
+                ),
+                "Top": self._write_lake_module_with_hashes(
+                    lib,
+                    "Miri/Top",
+                    {".olean": top_olean},
+                    t_top,
+                    imports={"Miri/Importer": self._classic_import_all_arts(importer_olean)},
+                ),
+            }
+
+        def rerecord(files: dict[str, Path], suffix: str, content_hash: str, ts_sec: float) -> None:
+            self._write_file_at(files[f"{suffix}.hash"], content_hash.encode("ascii"), ts_sec)
+
+        def scanned(root: Path, mod: str) -> dict[str, str]:
+            return suite._scan_lean_module_artifacts(os.fspath(root / "examples/.lake/build/lib/lean"))[mod]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            built = build(root)
+            # The formula reproduces what Lake recorded, for both kinds of module.
+            self.assertEqual(
+                suite._lean_module_current_import_all_arts_hex(scanned(root, "Miri/ModA")),
+                self._LAKE_MODULE_SYSTEM_IMPORT_ALL_ARTS,
+            )
+            self.assertEqual(
+                suite._lean_module_current_import_all_arts_hex(scanned(root, "Miri/PlainB")),
+                self._LAKE_CLASSIC_IMPORT_ALL_ARTS,
+            )
+            # A freshly built tree is coherent, and deciding so needs no sidecar content:
+            # nothing was recorded after the traces that depend on it.
+            with mock.patch.object(
+                suite, "_lean_module_current_import_all_arts_hex", side_effect=AssertionError("sidecar read")
+            ):
+                self.assertEqual(suite.clean_stale_oleans(root), [])
+            # Lake rewrites a `.hash` sidecar whenever the artifact looks newer than it. The
+            # same hashes recorded again later are not a rebuild.
+            for suffix, content_hash in mod_a_hashes.items():
+                rerecord(built["ModA"], suffix, content_hash, t_top + 100)
+            rerecord(built["PlainB"], ".olean", self._LAKE_CLASSIC_PART_HASHES[".olean"], t_top + 100)
+            self.assertEqual(suite.clean_stale_oleans(root), [])
+            self.assertTrue(all(p.is_file() for files in built.values() for p in files.values()))
+
+        # A rebuild of the module-system dependency that changes any one of the five parts
+        # (here each in turn, the `.olean` itself staying identical for four of them)
+        # invalidates the importer Lake built against the old ones, and what was built on it.
+        for suffix in mod_a_hashes:
+            with self.subTest(rebuilt_part=suffix), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                built = build(root)
+                rerecord(built["ModA"], suffix, "abcdefabcdefabcd", t_top + 100)
+                self.assertEqual(
+                    set(suite.clean_stale_oleans(root)),
+                    set(built["Importer"].values()) | set(built["Top"].values()),
+                )
+                self.assertTrue(all(p.is_file() for mod in ("ModA", "PlainB") for p in built[mod].values()))
+                self.assertEqual(suite.clean_stale_oleans(root), [])
+
+        # A dependency whose files do not let its hash be verified is no evidence at all.
+        def drop_ir_sidecar(files: dict[str, Path]) -> None:
+            files[".ir.hash"].unlink()
+
+        def drop_ir(files: dict[str, Path]) -> None:
+            files[".ir"].unlink()
+            files[".ir.hash"].unlink()
+
+        def link_sidecar(files: dict[str, Path]) -> None:
+            os.link(files[".olean.hash"], files[".olean.hash"].with_name("ModA.olean.hash.seed"))
+
+        def garble_sidecar(files: dict[str, Path]) -> None:
+            rerecord(files, ".olean.server", "not-a-lake-hash!", t_top + 100)
+
+        def outdate_sidecar(files: dict[str, Path]) -> None:
+            os.utime(files[".olean.private"], (t_top + 200, t_top + 200))
+
+        for unverifiable in (drop_ir_sidecar, drop_ir, link_sidecar, garble_sidecar, outdate_sidecar):
+            with self.subTest(unverifiable=unverifiable.__name__), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                built = build(root)
+                rerecord(built["ModA"], ".olean", "abcdefabcdefabcd", t_top + 100)
+                unverifiable(built["ModA"])
+                self.assertIsNone(suite._lean_module_current_import_all_arts_hex(scanned(root, "Miri/ModA")))
+                self.assertEqual(suite.clean_stale_oleans(root), [])
+
+    def test_clean_stale_oleans_import_hash_rule_needs_a_private_build_trace_and_a_later_rebuild(self) -> None:
+        t_dep, t_importer, t_top, t_rebuild = (
+            1_700_000_000.0,
+            1_700_000_100.0,
+            1_700_000_200.0,
+            1_700_000_300.0,
+        )
+        dep_h1, dep_h2, importer_olean, top_olean = (
+            "1111111111111111",
+            "2222222222222222",
+            "5555555555555555",
+            "6666666666666666",
+        )
+
+        def build(root: Path, *, importer_fetched: bool = False, recorded_dep: str = dep_h1):
+            lib = root / ".lake/build/lib/lean"
+            return {
+                "Dep": self._write_lake_module_with_hashes(lib, "Anneal/Dep", {".olean": dep_h1}, t_dep),
+                "Importer": self._write_lake_module_with_hashes(
+                    lib,
+                    "Anneal/Importer",
+                    {".olean": importer_olean},
+                    t_importer,
+                    imports={
+                        "Anneal/Dep": self._classic_import_all_arts(recorded_dep),
+                        # Recorded imports this Lake root does not hold are not its business.
+                        "Init/Prelude": "0123456789abcdef",
+                    },
+                    fetched=importer_fetched,
+                ),
+                "Top": self._write_lake_module_with_hashes(
+                    lib,
+                    "Anneal/Top",
+                    {".olean": top_olean},
+                    t_top,
+                    imports={"Anneal/Importer": self._classic_import_all_arts(importer_olean)},
+                ),
+            }
+
+        def rebuild_dep(built: dict[str, dict[str, Path]]) -> None:
+            self._write_file_at(built["Dep"][".olean"], b"artifact 2", t_rebuild)
+            self._write_file_at(built["Dep"][".olean.hash"], dep_h2.encode("ascii"), t_rebuild)
+
+        def all_files(built: dict[str, dict[str, Path]]) -> set[Path]:
+            return {p for files in built.values() for p in files.values()}
+
+        # Baseline: the dependency is rebuilt after its importer, which then goes, with `Top`.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            built = build(root)
+            rebuild_dep(built)
+            self.assertEqual(
+                set(suite.clean_stale_oleans(root)),
+                set(built["Importer"].values()) | set(built["Top"].values()),
+            )
+
+        # A recorded hash that disagrees with a dependency nobody touched since the trace
+        # was written is not a rebuild. (This is what every trace looks like once a Lake
+        # release changes what it mixes into `importAllArts`.)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            built = build(root, recorded_dep="9999999999999999")
+            self.assertEqual(suite.clean_stale_oleans(root), [])
+            self.assertTrue(all(p.is_file() for p in all_files(built)))
+
+        # A module Lake restored from its cache has a synthetic trace naming no import:
+        # rule 3 has no evidence about it, and does not cascade through it either.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            built = build(root, importer_fetched=True)
+            rebuild_dep(built)
+            self.assertEqual(suite.clean_stale_oleans(root), [])
+            self.assertTrue(all(p.is_file() for p in all_files(built)))
+
+        # Only a private regular `.trace` is evidence: not one another tree can rewrite
+        # through a second hard link, not a symlink, not a FIFO (which must not block the
+        # suite either), and not one that is no JSON.
+        def link_trace(trace: Path) -> None:
+            os.link(trace, trace.with_name("Importer.trace.seed"))
+
+        def symlink_trace(trace: Path) -> None:
+            target = trace.with_name("Importer.trace.real")
+            trace.rename(target)
+            trace.symlink_to(target)
+
+        def fifo_trace(trace: Path) -> None:
+            trace.unlink()
+            os.mkfifo(trace)
+
+        def truncate_trace(trace: Path) -> None:
+            self._write_file_at(trace, trace.read_bytes()[:-2], t_importer)
+
+        for tamper in (link_trace, symlink_trace, fifo_trace, truncate_trace):
+            with self.subTest(trace=tamper.__name__), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                built = build(root)
+                rebuild_dep(built)
+                tamper(built["Importer"][".trace"])
+                self.assertEqual(suite.clean_stale_oleans(root), [])
+                self.assertTrue(all(os.path.lexists(p) for p in all_files(built)))
+
+    def test_clean_stale_oleans_import_hash_rule_reaches_trusted_dependents(self) -> None:
+        # `Trusted/Leaf` is rebuilt (say by a build of that one module) after `Trusted/Mid`
+        # was built against the old one. Every source is older than its `.olean`, so only
+        # the recorded import hashes show it. `Trusted/Mid` is then stale, and with a stale
+        # `Trusted` module so is everything of the root that can import `Trusted`, whatever
+        # trace it has; vendored `Miri` cannot.
+        t_built, t_rebuild = 1_700_000_000.0, 1_700_000_500.0
+        leaf_h1, leaf_h2, mid_h = "1111111111111111", "2222222222222222", "3333333333333333"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lib = root / ".lake/build/lib/lean"
+            leaf = self._write_lake_module_with_hashes(lib, "Trusted/Leaf", {".olean": leaf_h1}, t_built)
+            mid = self._write_lake_module_with_hashes(
+                lib,
+                "Trusted/Mid",
+                {".olean": mid_h},
+                t_built + 10,
+                imports={"Trusted/Leaf": self._classic_import_all_arts(leaf_h1)},
+            )
+            fetched = self._write_lake_module_with_hashes(
+                lib, "Anneal/Fetched", {".olean": "4444444444444444"}, t_built + 20, fetched=True
+            )
+            bare = self._write_file_at(lib / "MiniRust/Bare.olean", b"artifact", t_built + 20)
+            miri = self._write_lake_module_with_hashes(
+                lib, "Miri/Keep", {".olean": "7777777777777777"}, t_built + 20
+            )
+            self.assertEqual(suite.clean_stale_oleans(root), [])
+            self._write_file_at(leaf[".olean"], b"artifact 2", t_rebuild)
+            self._write_file_at(leaf[".olean.hash"], leaf_h2.encode("ascii"), t_rebuild)
+            self.assertEqual(
+                set(suite.clean_stale_oleans(root)),
+                set(leaf.values()) | set(mid.values()) | set(fetched.values()) | {bare},
+            )
+            self.assertTrue(all(p.is_file() for p in miri.values()))
+            self.assertEqual(suite.clean_stale_oleans(root), [])
+
     def test_probe_ram_ceiling_and_lean_miri_spec_single_thread_right_sizing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
