@@ -1023,12 +1023,12 @@ impl<T: SampleInput + ReturnMutants> ReturnMutants for Option<T> {
                         if !emitted_none {
                             emitted_none = true;
                             // Emit `None` right after the first payload mutant so
-                            // small budgets (`>= 2`) test both axes, a budget of 1
-                            // tests the `Some` payload instead of letting a
-                            // discriminant-only spec (`r.is_some()`) fake a 100%
-                            // pointwise kill rate, and mutant chains advance
-                            // monotonically within `Some(...)` instead of resetting
-                            // through `None`.
+                            // small budgets (`>= 2`) test both axes and mutant
+                            // chains advance monotonically within `Some(...)`
+                            // instead of resetting through `None`. A budget of 1
+                            // tests the `Some` payload first; if that mutant
+                            // survives, Stage D3 goes on to this `None` flip,
+                            // because a kill-free hit is never truncated.
                             emit(None);
                         }
                     });
@@ -1613,7 +1613,15 @@ pub struct SpecCheckConfig {
     pub max_trials: usize,
     /// Minimum number of precondition-admissible trials required (must be `>= 1`).
     pub min_precondition_hits: usize,
-    /// Maximum number of distinct output mutants evaluated per precondition hit.
+    /// Number of distinct output mutants evaluated per precondition hit (per
+    /// output axis in stateful checks).
+    ///
+    /// The budget is soft for a kill-free hit: a hit (or axis) whose budgeted
+    /// mutants all survived keeps testing further distinct mutants, at most
+    /// [`KILL_FREE_OVERSCAN`] beyond the budget, until its first kill. A tight
+    /// budget therefore never reports a contract that rejects a first-order
+    /// mutant as [`VacuityClass::SurvivedAllMutants`], and never makes
+    /// [`SpecCheckStats::is_pointwise_strong`] under-report.
     pub max_mutants_per_hit: usize,
     /// Optional syntactic hint refining `mutants_killed == 0` diagnostics.
     pub syntactic_hint: Option<SyntacticBindingHint>,
@@ -1788,6 +1796,25 @@ impl SpecCheckStats {
     /// pointwise postcondition dichotomy).
     pub const fn is_pointwise_strong(&self) -> bool {
         self.precondition_hits > 0 && self.hits_with_kill == self.precondition_hits
+    }
+
+    /// Number of tested mutants that the postcondition accepted.
+    pub const fn mutants_survived(&self) -> usize {
+        self.mutants_tested.saturating_sub(self.mutants_killed)
+    }
+
+    /// Returns `true` iff at least one mutant was tested and the postcondition
+    /// rejected every tested mutant.
+    ///
+    /// This is the strict, component-wise reading of the mutant gate. The
+    /// default gates only require one kill (per output axis in stateful
+    /// checks), so a postcondition that pins one field of a composite output
+    /// or post-state and leaves another unverified still passes them, while
+    /// the single-field mutants of the unverified field survive and make this
+    /// method return `false`. A contract that determines its output and
+    /// post-state exactly kills every mutant.
+    pub const fn kills_every_mutant(&self) -> bool {
+        self.mutants_tested > 0 && self.mutants_killed == self.mutants_tested
     }
 }
 
@@ -2295,6 +2322,24 @@ pub fn replay_stateful_trial_input<S: SampleInput, A: SampleInput>(
 /// Fixed stack capacity for zero-allocation Stage D3 mutant deduplication.
 const STAGE_D3_DEDUP_CAP: usize = 16;
 
+/// Maximum number of distinct mutants Stage D3 tests beyond
+/// [`SpecCheckConfig::max_mutants_per_hit`] on a hit (or stateful output axis)
+/// that has not killed any mutant yet.
+pub const KILL_FREE_OVERSCAN: usize = 64;
+
+/// Decides whether Stage D3 stops testing mutants of the current hit (or
+/// stateful output axis) once `tested` distinct mutants were evaluated.
+///
+/// Within the budget every distinct mutant is tested. Past it, testing stops
+/// at once if the hit already killed a mutant, and otherwise continues until
+/// the first kill or until [`KILL_FREE_OVERSCAN`] further mutants survived.
+/// Truncating a kill-free hit would report a postcondition that rejects a
+/// later first-order mutant (for example the `None` flip of a `Some` output
+/// under `r.is_some()`) as having survived every mutant.
+const fn stage_d3_budget_spent(tested: usize, killed_this_hit: bool, budget: usize) -> bool {
+    tested >= budget && (killed_this_hit || tested >= budget.saturating_add(KILL_FREE_OVERSCAN))
+}
+
 /// Shared fallible core powering [`check_contract`],
 /// [`check_contract_with_mutants`], and [`check_contract_fallible`].
 fn check_contract_core<I, R, Pre, Body, Post>(
@@ -2373,7 +2418,11 @@ where
             let mut tested_this_hit = 0usize;
             if let Some(slice) = custom_mutants {
                 for (bank_idx, ret_bad) in slice.iter().enumerate() {
-                    if tested_this_hit >= config.max_mutants_per_hit {
+                    if stage_d3_budget_spent(
+                        tested_this_hit,
+                        stats.mutants_killed > kills_before,
+                        config.max_mutants_per_hit,
+                    ) {
                         break;
                     }
                     // Skip the actual output and every repeat of an earlier
@@ -2390,7 +2439,12 @@ where
                 let mut seen: [Option<R>; STAGE_D3_DEDUP_CAP] = array::from_fn(|_| None);
                 let mut seen_len = 0usize;
                 ret_ok.visit_mutants(&mut mutant_rng, |ret_bad| {
-                    if tested_this_hit >= config.max_mutants_per_hit
+                    let spent = stage_d3_budget_spent(
+                        tested_this_hit,
+                        stats.mutants_killed > kills_before,
+                        config.max_mutants_per_hit,
+                    );
+                    if spent
                         || ret_bad == ret_ok
                         || seen[..seen_len]
                             .iter()
@@ -3195,8 +3249,14 @@ where
             let mut tested_this_hit = 0usize;
             let mut seen_ret: [Option<R>; STAGE_D3_DEDUP_CAP] = array::from_fn(|_| None);
             let mut seen_ret_len = 0usize;
+            let ret_kills_before = return_mutants_killed;
             ret_ok.visit_mutants(&mut ret_mutant_rng, |ret_bad| {
-                if tested_this_hit >= config.max_mutants_per_hit
+                let spent = stage_d3_budget_spent(
+                    tested_this_hit,
+                    return_mutants_killed > ret_kills_before,
+                    config.max_mutants_per_hit,
+                );
+                if spent
                     || ret_bad == ret_ok
                     || seen_ret[..seen_ret_len]
                         .iter()
@@ -3220,6 +3280,7 @@ where
         // whenever `new_s != old_s`).
         if !S::IS_SUBSINGLETON && config.max_mutants_per_hit > 0 {
             let mut tested_this_hit = 0usize;
+            let state_kills_before = state_mutants_killed;
             let tested_pre_revert = new_s != old_s;
             if tested_pre_revert {
                 tested_this_hit += 1;
@@ -3232,7 +3293,12 @@ where
             let mut seen_s: [Option<S>; STAGE_D3_DEDUP_CAP] = array::from_fn(|_| None);
             let mut seen_s_len = 0usize;
             new_s.visit_mutants(&mut state_mutant_rng, |bad_s| {
-                if tested_this_hit >= config.max_mutants_per_hit
+                let spent = stage_d3_budget_spent(
+                    tested_this_hit,
+                    state_mutants_killed > state_kills_before,
+                    config.max_mutants_per_hit,
+                );
+                if spent
                     || bad_s == new_s
                     || (tested_pre_revert && bad_s == old_s)
                     || seen_s[..seen_s_len]

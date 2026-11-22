@@ -2255,6 +2255,95 @@ private def eliminateOnePointExists : Nat → Expr → Expr
           .forallE n dom (eliminateOnePointExists fuel body) bi
       | _ => e
 
+/-- Candidate witnesses for the variable `(.bvar 0)` of an existential, harvested from
+    relational atoms of its body under `And`/`Or` without crossing any inner binder
+    and lowered to the scope enclosing the `Exists`: `t` for `k = t`, `k ≤ t`, `t ≤ k`,
+    `k ≥ t`, `t ≥ k`, and (over `Nat` only) `t + 1` for `t < k` and `k > t`.
+
+    The list only proposes candidates. A candidate is never trusted: it is substituted
+    for the bound variable and the instantiated body must then be proved, so a useless
+    or ill-typed candidate only makes its probe fail. -/
+private def collectExistsBoundWitnesses (domIsNat : Bool) : Nat → Expr → List Expr
+  | 0, _ => []
+  | fuel + 1, e =>
+    let e := e.consumeMData
+    if e.isAppOfArity ``And 2 || e.isAppOfArity ``Or 2 then
+      collectExistsBoundWitnesses domIsNat fuel e.appFn!.appArg! ++
+        collectExistsBoundWitnesses domIsNat fuel e.appArg!
+    else if e.isAppOfArity ``Eq 3 || e.isAppOfArity ``LE.le 4 || e.isAppOfArity ``GE.ge 4 then
+      let lhs := e.appFn!.appArg!.consumeMData
+      let rhs := e.appArg!.consumeMData
+      if lhs == .bvar 0 && !rhs.hasLooseBVar 0 then
+        [rhs.lowerLooseBVars 1 1]
+      else if rhs == .bvar 0 && !lhs.hasLooseBVar 0 then
+        [lhs.lowerLooseBVars 1 1]
+      else
+        []
+    else if domIsNat && e.isAppOfArity ``LT.lt 4 then
+      let lhs := e.appFn!.appArg!.consumeMData
+      let rhs := e.appArg!.consumeMData
+      if rhs == .bvar 0 && !lhs.hasLooseBVar 0 then
+        [mkApp (mkConst ``Nat.succ) (lhs.lowerLooseBVars 1 1)]
+      else
+        []
+    else if domIsNat && e.isAppOfArity ``GT.gt 4 then
+      let lhs := e.appFn!.appArg!.consumeMData
+      let rhs := e.appArg!.consumeMData
+      if lhs == .bvar 0 && !rhs.hasLooseBVar 0 then
+        [mkApp (mkConst ``Nat.succ) (rhs.lowerLooseBVars 1 1)]
+      else
+        []
+    else
+      []
+
+/-- Strengthen `e` by instantiating existentials in positive position with a candidate
+    witness (`collectExistsBoundWitnesses`, candidate number `pick`, falling back to
+    the first candidate). Returns the strengthened proposition and whether any
+    existential was instantiated.
+
+    Only positive positions are rewritten: the proposition itself, both sides of
+    `And`/`Or`, both branches of a `Prop`-valued `ite`, and the body of a `∀` or the
+    conclusion of an implication. `B[k := w]` implies `∃ k, B`, and each of those
+    connectives is monotone in the rewritten positions, so the result implies `e`
+    for every value of its free variables. It is in general strictly stronger, so it
+    may only be used to establish `e` (or to conclude `e` from a hypothesis), never
+    to refute it. -/
+private def instantiateExistsWitness (pick : Nat) : Nat → Expr → Expr × Bool
+  | 0, e => (e, false)
+  | fuel + 1, e =>
+    let e := e.consumeMData
+    if e.isAppOfArity ``Exists 2 then
+      let args := e.getAppArgs
+      match args[1]!.consumeMData with
+      | .lam n bdom body bi =>
+        let (body', changed) := instantiateExistsWitness pick fuel body
+        let cands :=
+          collectExistsBoundWitnesses (args[0]!.consumeMData.isConstOf ``Nat) 16 body'
+        let cand? : Option Expr :=
+          match cands.drop pick with
+          | w :: _ => some w
+          | [] => cands.head?
+        match cand? with
+        | some w => (body'.instantiate1 w, true)
+        | none => (mkApp2 e.getAppFn args[0]! (.lam n bdom body' bi), changed)
+      | _ => (e, false)
+    else if e.isAppOfArity ``And 2 || e.isAppOfArity ``Or 2 then
+      let (lhs, changedL) := instantiateExistsWitness pick fuel e.appFn!.appArg!
+      let (rhs, changedR) := instantiateExistsWitness pick fuel e.appArg!
+      (mkApp2 e.getAppFn lhs rhs, changedL || changedR)
+    else if e.isAppOfArity ``ite 5 &&
+        e.getAppArgs[0]!.consumeMData == mkSort Level.zero then
+      let args := e.getAppArgs
+      let (t', changedT) := instantiateExistsWitness pick fuel args[3]!
+      let (f', changedF) := instantiateExistsWitness pick fuel args[4]!
+      (mkAppN e.getAppFn #[args[0]!, args[1]!, args[2]!, t', f'], changedT || changedF)
+    else
+      match e with
+      | .forallE n dom body bi =>
+        let (body', changed) := instantiateExistsWitness pick fuel body
+        (.forallE n dom body' bi, changed)
+      | _ => (e, false)
+
 /-- Extend the hypothesis list `hyps` with `h`, also recording the conjuncts of a
     conjunctive hypothesis so `P ∧ Q → P` is recognized. -/
 private def assumeHyp (h : Expr) (hyps : List Expr) : List Expr :=
@@ -2976,14 +3065,20 @@ private def withOutputCopies {α : Type} [Inhabited α]
 
     Returns `none` when there is no output variable or when the substituted goal fails
     `Meta.check` (for instance because another binder's type depends on an output
-    variable), so an ill-typed substitution is never handed to the prover. -/
+    variable), so an ill-typed substitution is never handed to the prover.
+
+    When `concl?` is `some concl`, the goal concludes `concl[outs := outs']` instead of
+    `body[outs := outs']`. The caller must guarantee that `concl` implies `body` for
+    every value of their free variables, so the goal still entails
+    `body → body[outs := outs']`. -/
 private def mkOutputInsensitivityGoal?
     (binders outVars : Array Expr) (body : Expr)
-    (extraHyp? : Option Expr := none) : MetaM (Option Expr) := do
+    (extraHyp? : Option Expr := none) (concl? : Option Expr := none) :
+    MetaM (Option Expr) := do
   if outVars.isEmpty then
     return none
   withOutputCopies outVars fun copies => do
-    let body' := body.replaceFVars outVars copies
+    let body' := (concl?.getD body).replaceFVars outVars copies
     let core ← mkArrow body body'
     let inner ← match extraHyp? with
       | some hyp => mkArrow hyp core
@@ -3038,7 +3133,9 @@ private inductive FibreKind : Type where
       each fibre's atom assumptions in scope, pruning impossible fibres so an
       unreachable branch can never supply a "genuine" constraint.
     * Phase 4 tries to prove the body valid, unsatisfiable, or output-insensitive
-      without `requires`.
+      without `requires`. Validity and output-insensitivity are also attempted on the
+      body with its positive existentials instantiated by candidate witnesses
+      (`instantiateExistsWitness`), which implies the body.
     * Phase 5 repeats those probes under `requires`.
 
     Every prover probe is sound: a specification is flagged only on a `Meta.check`ed
@@ -3087,6 +3184,14 @@ private def analyzeNormalizedSpec
       probeCutOffRef.set true
       return false
     match ← mkOutputInsensitivityGoal? allVars outVars body cfpReflTy? with
+    | some goal => tryProveWithin budget goal cutOffOpt
+    | none => return false
+  -- `∀ allVars outs', (cfpRefl →) body → concl[outs := outs']`, where `concl` implies `body`.
+  let proveInsensitiveVia (body concl : Expr) : MetaM Bool := do
+    if (← budget.nextCap?).isNone then
+      probeCutOffRef.set true
+      return false
+    match ← mkOutputInsensitivityGoal? allVars outVars body cfpReflTy? (some concl) with
     | some goal => tryProveWithin budget goal cutOffOpt
     | none => return false
   -- The same goal with `h_pre : requires` in scope.
@@ -3399,6 +3504,15 @@ private def analyzeNormalizedSpec
         return .vacuous .outputInsensitiveUnderRequires
           (notes ++ ["residual user ensures is output-insensitive under requires in every fibre"])
 
+  -- Existential witness instantiation. Every goal in `witnessGoals` implies `workBody`
+  -- (`instantiateExistsWitness`), so proving one of them establishes `workBody` even
+  -- when the bounded prover cannot synthesize the witness itself (`∃ k, ret ≤ k`).
+  let mut witnessGoals : Array Expr := #[]
+  for pick in [0, 1, 2] do
+    let (strengthened, changed) := instantiateExistsWitness pick 32 workBody
+    if changed && !witnessGoals.contains strengthened then
+      witnessGoals := witnessGoals.push strengthened
+
   -- Phase 4: Syntactic tautology & global prover checks (without `requires`).
   if let some tautReason := detectSyntacticTautology 32 [] workBody then
     return .vacuous tautReason (notes ++ ["detected syntactic tautology"])
@@ -3410,6 +3524,11 @@ private def analyzeNormalizedSpec
   if ← proveClosed workBody then
     return .vacuous .tautologicalByProver
       (notes ++ ["ensures proved universally valid independent of requires"])
+
+  for goal in witnessGoals do
+    if ← proveClosed goal then
+      return .vacuous .tautologicalByProver
+        (notes ++ ["ensures proved universally valid by instantiating an existential witness"])
 
   if ← proveClosed (negate workBody) then
     return .vacuous .unrealizableUnderRequires
@@ -3427,6 +3546,16 @@ private def analyzeNormalizedSpec
     return .vacuous .outputInsensitive
       (notes ++ ["ensures proved independent of the output"])
 
+  for goal in witnessGoals do
+    if ← proveInsensitiveVia workBody goal then
+      if let some preNorm := preNorm? then
+        if ← proveUnderRequires preNorm (negate workBody) then
+          return .vacuous .unrealizableUnderRequires
+            (notes ++ ["ensures proved unsatisfiable under requires"])
+      return .vacuous .outputInsensitive
+        (notes ++
+          ["ensures proved independent of the output by instantiating an existential witness"])
+
   -- Phase 5: `requires`-aware semantic realizability and vacuity checks.
   if let some preNorm := preNorm? then
     if ← proveUnderRequires preNorm (negate workBody) then
@@ -3435,6 +3564,11 @@ private def analyzeNormalizedSpec
     if ← proveUnderRequires preNorm workBody then
       return .vacuous .vacuousUnderRequires
         (notes ++ ["ensures proved vacuously true for all outputs under requires"])
+    for goal in witnessGoals do
+      if ← proveUnderRequires preNorm goal then
+        return .vacuous .vacuousUnderRequires
+          (notes ++
+            ["ensures proved vacuously true under requires by instantiating an existential witness"])
     if ← proveInsensitiveUnderRequires preNorm workBody then
       return .vacuous .outputInsensitiveUnderRequires
         (notes ++ ["ensures proved independent of the output under requires"])

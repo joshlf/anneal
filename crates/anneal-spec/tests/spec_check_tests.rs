@@ -3592,8 +3592,12 @@ mod cross_language_parity_suite {
     }
 
     fn cl_vac_01_outcome() -> SpecCheckOutcome {
+        cl_vac_01_outcome_with(parity_config())
+    }
+
+    fn cl_vac_01_outcome_with(config: SpecCheckConfig) -> SpecCheckOutcome {
         check_contract(
-            parity_config(),
+            config,
             |&x: &u32| __anodized_fn_requires_cl_vac_01_dead_precondition_fn(x),
             |&x| cl_vac_01_dead_precondition_fn(x),
             |&x, &ret| __anodized_fn_ensures_cl_vac_01_dead_precondition_fn(x, ret),
@@ -3601,8 +3605,12 @@ mod cross_language_parity_suite {
     }
 
     fn cl_vac_02_outcome() -> SpecCheckOutcome {
+        cl_vac_02_outcome_with(parity_config())
+    }
+
+    fn cl_vac_02_outcome_with(config: SpecCheckConfig) -> SpecCheckOutcome {
         check_contract(
-            parity_config(),
+            config,
             |&(val, lo, hi): &(u32, u32, u32)| {
                 __anodized_fn_requires_cl_vac_02_spec_violation_fn(val, lo, hi)
             },
@@ -3614,8 +3622,12 @@ mod cross_language_parity_suite {
     }
 
     fn cl_vac_03_outcome() -> SpecCheckOutcome {
+        cl_vac_03_outcome_with(parity_config())
+    }
+
+    fn cl_vac_03_outcome_with(config: SpecCheckConfig) -> SpecCheckOutcome {
         check_contract(
-            parity_config(),
+            config,
             |&x: &u32| __anodized_fn_requires_cl_vac_03_trivial_postcondition_fn(x),
             |&x| cl_vac_03_trivial_postcondition_fn(x),
             |&x, &ret| __anodized_fn_ensures_cl_vac_03_trivial_postcondition_fn(x, ret),
@@ -3623,8 +3635,12 @@ mod cross_language_parity_suite {
     }
 
     fn cl_vac_04_outcome() -> SpecCheckOutcome {
+        cl_vac_04_outcome_with(parity_config())
+    }
+
+    fn cl_vac_04_outcome_with(config: SpecCheckConfig) -> SpecCheckOutcome {
         check_contract(
-            parity_config(),
+            config,
             |&(val, lo, hi): &(u32, u32, u32)| {
                 __anodized_fn_requires_cl_vac_04_unbound_return_output_fn(val, lo, hi)
             },
@@ -3636,8 +3652,12 @@ mod cross_language_parity_suite {
     }
 
     fn cl_vac_05_outcome() -> SpecCheckOutcome {
+        cl_vac_05_outcome_with(parity_config())
+    }
+
+    fn cl_vac_05_outcome_with(config: SpecCheckConfig) -> SpecCheckOutcome {
         check_contract(
-            parity_config(),
+            config,
             |&x: &u32| __anodized_fn_requires_cl_vac_05_survived_all_mutants_fn(x),
             |&x| cl_vac_05_survived_all_mutants_fn(x),
             |&x, &ret| __anodized_fn_ensures_cl_vac_05_survived_all_mutants_fn(x, ret),
@@ -3923,6 +3943,59 @@ mod cross_language_parity_suite {
         ));
     }
 
+    /// Seeds swept by `cl_verdicts_are_stable_across_seeds`.
+    const STABILITY_SEEDS: [u64; 5] = [0, 1, 0xDEAD_BEEF, 0x0123_4567_89AB_CDEF, u64::MAX];
+
+    #[test]
+    fn cl_verdicts_are_stable_across_seeds() {
+        // Every row is decided on the seed-independent boundary corpus, so neither a
+        // strong verdict nor a vacuity class may depend on the PRNG seed.
+        for seed in STABILITY_SEEDS {
+            let config = parity_config().with_seed(seed);
+
+            let emitted = [
+                cl_vac_01_outcome_with(config),
+                cl_vac_02_outcome_with(config),
+                cl_vac_03_outcome_with(config),
+                cl_vac_04_outcome_with(config),
+                cl_vac_05_outcome_with(config),
+            ]
+            .map(|outcome| outcome.vacuity_class().map(VacuityClass::canonical_name));
+            assert_eq!(emitted, EXPECTED_CLASS_NAMES.map(Some), "seed {seed:#x}");
+
+            let add = check_contract(
+                config,
+                |&(a, b): &(u32, u32)| __anodized_fn_requires_spec_u32_checked_add(a, b),
+                |&(a, b)| a.checked_add(b),
+                |&(a, b), &ret| __anodized_fn_ensures_spec_u32_checked_add(a, b, ret),
+            );
+            assert!(add.is_strong(), "seed {seed:#x}: {add:?}");
+            assert!(add.stats().is_pointwise_strong(), "seed {seed:#x}");
+
+            let clamp = check_contract(
+                config,
+                |&(val, lo, hi): &(u32, u32, u32)| __anodized_fn_requires_clamp_u32(val, lo, hi),
+                |&(val, lo, hi)| clamp_u32(val, lo, hi),
+                |&(val, lo, hi), &ret| __anodized_fn_ensures_clamp_u32(val, lo, hi, ret),
+            );
+            assert!(clamp.is_strong(), "seed {seed:#x}: {clamp:?}");
+            assert!(clamp.stats().is_pointwise_strong(), "seed {seed:#x}");
+
+            let step = check_stateful_contract(
+                config,
+                |old: &Counter, &()| old.clone().__anodized_fn_requires_step(),
+                |counter: &mut Counter, &()| counter.step(),
+                |old: &Counter, &(), new: &Counter, ret: &u32| {
+                    old.clone().__anodized_fn_ensures_step(*ret)
+                        && new.value == *ret
+                        && new.limit == old.limit
+                },
+            );
+            assert!(step.is_strong(), "seed {seed:#x}: {step:?}");
+            assert!(step.stats().is_pointwise_strong(), "seed {seed:#x}");
+        }
+    }
+
     #[test]
     fn cl_vacuity_class_names_match_the_lean_matrix_in_exact_order() {
         let matrix = vacuity_matrix();
@@ -3980,9 +4053,11 @@ fn option_payload_first_mutant_order_exposes_half_weak_specs_and_fixes_chains() 
     let budget2 = SpecCheckConfig::default().with_max_mutants_per_hit(2);
 
     // Half-weak `Option<u32>` spec checking ONLY the `is_some()` discriminant while
-    // ignoring the `Some(sum)` payload: under `max_mutants_per_hit == 1`, `None` hits
-    // still kill `Some(0)` (so `PostconditionDichotomy` holds), yet every `Some` hit
-    // tests `Some(sum + 1)` and survives, honestly exposing `hits_without_kill() > 0`.
+    // ignoring the `Some(sum)` payload: under `max_mutants_per_hit == 1`, every `Some`
+    // hit tests `Some(sum + 1)` first, which survives. A kill-free hit is never
+    // truncated, so Stage D3 goes on to the `None` flip and kills it: pointwise
+    // dichotomy genuinely holds (`is_pointwise_strong`), while the surviving payload
+    // mutants honestly expose the unconstrained payload (`mutants_survived() > 0`).
     let half_weak_checked_add = check_contract(
         budget1,
         |&(a, b): &(u32, u32)| __anodized_fn_requires_spec_u32_checked_add(a, b),
@@ -3991,9 +4066,10 @@ fn option_payload_first_mutant_order_exposes_half_weak_specs_and_fixes_chains() 
     );
     assert!(half_weak_checked_add.is_strong());
     let half_stats = half_weak_checked_add.stats();
-    assert!(!half_stats.is_pointwise_strong());
-    assert!(half_stats.hits_without_kill() > 0);
-    assert!(half_stats.mutants_killed < half_stats.mutants_tested);
+    assert!(half_stats.is_pointwise_strong());
+    assert_eq!(half_stats.hits_without_kill(), 0);
+    assert!(half_stats.mutants_survived() > 0);
+    assert!(!half_stats.kills_every_mutant());
 
     // By contrast, the full `u32::checked_add` contract kills 100% of hits even at
     // `max_mutants_per_hit == 1`.
@@ -4005,21 +4081,22 @@ fn option_payload_first_mutant_order_exposes_half_weak_specs_and_fixes_chains() 
     );
     assert!(full_checked_add.is_pointwise_strong());
     assert_eq!(full_checked_add.hits_without_kill(), 0);
+    assert!(full_checked_add.kills_every_mutant());
 
-    // When `body` always returns `Some(a + b)`, a discriminant-only `r.is_some()` spec
-    // survives every `Some(v + 1)` mutant at budget 1 (`SurvivedAllMutants`) and only
-    // kills half the mutants at budget 2, whereas a payload-constraining spec kills
-    // every hit even at budget 1.
-    let some_only_disc_b1 = check_contract(
+    // When `body` always returns `Some(a + b)`, the discriminant-only `r.is_some()`
+    // spec is a genuine contract (it rejects `None`), so it must not be reported as
+    // `SurvivedAllMutants` however tight the budget is: at budget 1 every hit tests the
+    // surviving `Some(v + 1)` and then kills the `None` flip, exactly as at budget 2.
+    // A payload-constraining spec kills its very first mutant on every hit.
+    let disc_b1 = assert_contract_strong(
         budget1,
         |&(a, b): &(u32, u32)| a < 100 && b < 100,
         |&(a, b)| Some(a + b),
         |_, r: &Option<u32>| r.is_some(),
     );
-    assert_eq!(
-        some_only_disc_b1.vacuity_class(),
-        Some(VacuityClass::SurvivedAllMutants)
-    );
+    assert!(disc_b1.is_pointwise_strong());
+    assert_eq!(disc_b1.mutants_tested, 2 * disc_b1.precondition_hits);
+    assert_eq!(disc_b1.mutants_killed, disc_b1.precondition_hits);
 
     let some_only_disc_b2 = assert_contract_strong(
         budget2,
@@ -4039,6 +4116,7 @@ fn option_payload_first_mutant_order_exposes_half_weak_specs_and_fixes_chains() 
         },
     );
     assert!(some_only_payload_b1.is_pointwise_strong());
+    assert!(some_only_payload_b1.kills_every_mutant());
 
     // `Option<u32>` mutant chains advance monotonically `Some(1000) -> Some(1001) -> ...`
     // instead of resetting through `None -> Some(0)`, so `x < 10 || *r == Some(1005)`
@@ -4080,10 +4158,11 @@ fn half_weak_tuple_and_result_specs_and_tight_budget_coverage() {
 
     // Half-weak `Result<u32, u8>` spec checking only `r.is_ok() == (divisor != 0)`:
     // at budget 1 every `Ok` hit tests `Ok(q + 1)` and every `Err` hit tests `Err(code + 1)`,
-    // exposing that neither payload is constrained (`SurvivedAllMutants`). At budget 2,
-    // opposite-variant flips are tested so dichotomy passes with a 50% kill rate, while
-    // the full `checked_div_u32` contract kills 100%.
-    let half_res_b1 = check_contract(
+    // which survive and expose that neither payload is constrained. The discriminant is
+    // genuinely constrained, so each kill-free hit goes on to the opposite-variant flip
+    // and kills it: dichotomy passes with a 50% kill rate at budget 1 and at budget 2,
+    // while the full `checked_div_u32` contract kills 100%.
+    let half_res_b1 = assert_contract_strong(
         budget1,
         |&(dividend, divisor): &(u32, u32)| {
             __anodized_fn_requires_checked_div_u32(dividend, divisor)
@@ -4091,10 +4170,12 @@ fn half_weak_tuple_and_result_specs_and_tight_budget_coverage() {
         |&(dividend, divisor)| checked_div_u32(dividend, divisor),
         |&(_, divisor), r: &Result<u32, u8>| r.is_ok() == (divisor != 0),
     );
+    assert!(half_res_b1.is_pointwise_strong());
     assert_eq!(
-        half_res_b1.vacuity_class(),
-        Some(VacuityClass::SurvivedAllMutants)
+        half_res_b1.mutants_tested,
+        2 * half_res_b1.precondition_hits
     );
+    assert_eq!(half_res_b1.mutants_killed, half_res_b1.precondition_hits);
 
     let half_res_b2 = assert_contract_strong(
         budget2,
@@ -4362,4 +4443,136 @@ fn narrow_preconditions_and_stateful_fallible_trap_propagation() {
     assert!(trap_stats.mutants_tested > 0);
     assert_eq!(trap_stats.mutants_killed, trap_stats.mutants_tested);
     assert_eq!(trap_stats.mutants_trapped, trap_stats.mutants_killed);
+}
+
+// ---------------------------------------------------------------------------
+// Episode 2 Round 1 critique: kill-free hits are never truncated by the mutant
+// budget, strict mutant-kill helpers, and half-weak multi-field `&mut` state
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tight_budget_never_fails_a_contract_that_rejects_a_first_order_mutant() {
+    let budget1 = SpecCheckConfig::default().with_max_mutants_per_hit(1);
+
+    // `r.is_some()` rejects `None`, so it is a genuine contract of an always-`Some`
+    // function even though its payload mutant `Some(x + 1)` comes first and survives.
+    let disc = assert_contract_strong(
+        budget1,
+        |&x: &u32| x < 1_000,
+        |&x| Some(x),
+        |_, r: &Option<u32>| r.is_some(),
+    );
+    assert!(disc.is_pointwise_strong());
+    assert_eq!(disc.mutants_survived(), disc.precondition_hits);
+    assert_eq!(disc.mutants_killed, disc.precondition_hits);
+    assert!(!disc.kills_every_mutant());
+
+    // The same holds for a custom mutant bank whose only wrong answer sits behind
+    // two accepted candidates.
+    let bank = check_contract_with_mutants(
+        budget1,
+        &[1u32, 2, 0],
+        |&x: &u32| x < 100,
+        |&x| x + 5,
+        |_, &r: &u32| r != 0,
+    );
+    assert!(bank.is_strong());
+    let bank_s = bank.stats();
+    assert!(bank_s.is_pointwise_strong());
+    assert_eq!(bank_s.mutants_tested, 3 * bank_s.precondition_hits);
+    assert_eq!(bank_s.mutants_killed, bank_s.precondition_hits);
+
+    // A postcondition that accepts every output still fails: the overscan of a
+    // kill-free hit is bounded and finds nothing to kill.
+    let vacuous = check_contract(
+        budget1,
+        |&x: &u32| x < 1_000,
+        |&x| Some(x),
+        |_, _r: &Option<u32>| true,
+    );
+    assert_eq!(
+        vacuous.vacuity_class(),
+        Some(VacuityClass::TrivialPostcondition)
+    );
+    let vacuous_s = vacuous.stats();
+    assert_eq!(vacuous_s.mutants_killed, 0);
+    assert!(vacuous_s.mutants_tested > vacuous_s.precondition_hits);
+
+    // Once a hit has killed a mutant the budget is a hard cap again.
+    let full = assert_contract_strong(
+        budget1,
+        |&x: &u32| x < 1_000,
+        |&x| Some(x),
+        |&x, r: &Option<u32>| *r == Some(x),
+    );
+    assert_eq!(full.mutants_tested, full.precondition_hits);
+    assert!(full.kills_every_mutant());
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TwoFieldState {
+    verified: u16,
+    shadow: u16,
+}
+
+anneal_spec::impl_spec_check_struct!(TwoFieldState {
+    verified: u16,
+    shadow: u16
+});
+
+#[test]
+fn half_weak_multi_field_state_is_exposed_by_strict_mutant_kill_helpers() {
+    // `body` bumps `verified` but silently corrupts `shadow`. A postcondition that only
+    // checks `verified` passes the default gates (both output axes kill mutants), yet
+    // every `shadow`-only state mutant survives, which the strict helpers expose.
+    let half_weak = assert_stateful_contract_strong(
+        SpecCheckConfig::default(),
+        |_old: &TwoFieldState, &()| true,
+        |s: &mut TwoFieldState, &()| {
+            s.verified = s.verified.wrapping_add(1);
+            s.shadow = 0xDEAD;
+            s.verified
+        },
+        |old: &TwoFieldState, &(), new: &TwoFieldState, ret: &u16| {
+            new.verified == old.verified.wrapping_add(1) && *ret == new.verified
+        },
+    );
+    assert!(half_weak.is_pointwise_strong());
+    assert!(half_weak.mutants_survived() > 0);
+    assert!(!half_weak.kills_every_mutant());
+
+    // Stating the frame condition for `shadow` turns the corruption into a live
+    // `SpecViolation`.
+    let framed = check_stateful_contract(
+        SpecCheckConfig::default(),
+        |_old: &TwoFieldState, &()| true,
+        |s: &mut TwoFieldState, &()| {
+            s.verified = s.verified.wrapping_add(1);
+            s.shadow = 0xDEAD;
+            s.verified
+        },
+        |old: &TwoFieldState, &(), new: &TwoFieldState, ret: &u16| {
+            new.verified == old.verified.wrapping_add(1)
+                && new.shadow == old.shadow
+                && *ret == new.verified
+        },
+    );
+    assert_eq!(framed.vacuity_class(), Some(VacuityClass::SpecViolation));
+
+    // An honest body under the full contract kills every tested mutant on both axes.
+    let full = assert_stateful_contract_strong(
+        SpecCheckConfig::default(),
+        |_old: &TwoFieldState, &()| true,
+        |s: &mut TwoFieldState, &()| {
+            s.verified = s.verified.wrapping_add(1);
+            s.verified
+        },
+        |old: &TwoFieldState, &(), new: &TwoFieldState, ret: &u16| {
+            new.verified == old.verified.wrapping_add(1)
+                && new.shadow == old.shadow
+                && *ret == new.verified
+        },
+    );
+    assert!(full.kills_every_mutant());
+    assert_eq!(full.mutants_survived(), 0);
 }

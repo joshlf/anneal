@@ -3151,6 +3151,106 @@ theorem existsWrappedBoilerplateContract_not_dichotomyModuloObs :
 #eval assertDeclEnsuresVacuous ``existsWrappedBoilerplateContract (some .unboundReturnOutput)
   { stepHeartbeats := 0, totalHeartbeats := 0 }
 
+/-! ### 3.23 Unbounded Existential Witnesses & Arithmetic Tautology Disguises -/
+
+/-- Unbounded existential `∃ k, ret ≤ k`: true of every `ret` (take `k := ret`), although
+    the bounded prover does not synthesize the witness on its own. -/
+def existsUpperBoundPost (_x ret : Nat) : Prop :=
+  ∃ k : Nat, ret ≤ k
+
+/-- Strict unbounded existential `∃ k, ret < k` (take `k := ret + 1`). -/
+def existsStrictUpperBoundPost (_x ret : Nat) : Prop :=
+  ∃ k : Nat, ret < k
+
+/-- Unbounded existential masking an input-only predicate (`UnboundReturnOutput`). -/
+def existsUpperBoundInputOnlyPost (x ret : Nat) : Prop :=
+  ∃ k : Nat, k ≥ ret ∧ x < 10
+
+/-- Unbounded existential binding `ret` only outside `requires` (`SurvivedAllMutants`). -/
+def existsUpperBoundMaskedPost (x ret : Nat) : Prop :=
+  ∃ k : Nat, ret ≤ k ∧ (x < 10 ∨ ret = 0)
+
+/-- `requires` shared by the `requires`-relative rows of this section. -/
+def smallInputPre (x : Nat) : Prop := x < 10
+
+/-- Negative control: evenness `∃ y, ret = 2 * y` genuinely constrains `ret`. -/
+def existsEvenPost (_x ret : Nat) : Prop :=
+  ∃ y : Nat, ret = 2 * y
+
+/-- Negative control: `∃ k, k ≤ x ∧ ret = 2 * k` bounds an even `ret` by `2 * x`. -/
+def existsBoundedDoublePost (x ret : Nat) : Prop :=
+  ∃ k : Nat, k ≤ x ∧ ret = 2 * k
+
+/-- Negative control: `∃ k, ret ≤ k ∧ k ≤ x` is equivalent to `ret ≤ x`. -/
+def existsSandwichPost (x ret : Nat) : Prop :=
+  ∃ k : Nat, ret ≤ k ∧ k ≤ x
+
+/-- `Nat` lower bound `ret ≥ 0` (true of every `ret`). -/
+def natGeZeroPost (_x ret : Nat) : Prop := ret ≥ 0
+
+/-- `Nat` lower bound `0 ≤ ret`. -/
+def natZeroLePost (_x ret : Nat) : Prop := 0 ≤ ret
+
+/-- Right identity `ret + 0 = ret`. -/
+def natAddZeroPost (_x ret : Nat) : Prop := ret + 0 = ret
+
+/-- Idempotent `min ret ret = ret`. -/
+def natMinSelfPost (_x ret : Nat) : Prop := min ret ret = ret
+
+/-- `ret + x ≥ x` holds for every `ret : Nat`, with or without `requires`. -/
+def natAddInputGePost (x ret : Nat) : Prop := ret + x ≥ x
+
+/-- `ret + 10 > x` holds for every `ret : Nat` once `requires` bounds `x < 10`. -/
+def natAddTenGtInputPost (x ret : Nat) : Prop := ret + 10 > x
+
+/-- Negative control: `ret + x ≥ 10` still excludes small `ret` under `x < 10`. -/
+def natAddInputGeTenPost (x ret : Nat) : Prop := ret + x ≥ 10
+
+theorem existsUpperBoundPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) existsUpperBoundPost :=
+  not_postconditionDichotomy_of_trivial (fun _ ret _ => ⟨ret, Nat.le_refl ret⟩)
+
+theorem existsStrictUpperBoundPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) existsStrictUpperBoundPost :=
+  not_postconditionDichotomy_of_trivial (fun _ ret _ => ⟨ret + 1, Nat.lt_succ_self ret⟩)
+
+theorem existsEvenPost_dichotomy :
+    PostconditionDichotomy (fun _ : Nat => True) existsEvenPost := by
+  refine ⟨0, trivial, ⟨0, 0, rfl⟩, ⟨1, ?_⟩⟩
+  rintro ⟨y, hy⟩
+  omega
+
+-- Unbounded existentials: the checker instantiates candidate witnesses (`k := ret`,
+-- `k := ret + 1`) and proves the instantiated body, with or without `requires`.
+#eval assertEnsuresVacuous (Lean.mkConst ``existsUpperBoundPost) none
+  (some .trivialPostcondition)
+#eval assertEnsuresVacuous (Lean.mkConst ``existsStrictUpperBoundPost) none
+  (some .trivialPostcondition)
+#eval assertEnsuresVacuous (Lean.mkConst ``existsUpperBoundInputOnlyPost) none
+  (some .unboundReturnOutput)
+#eval assertEnsuresVacuous (Lean.mkConst ``existsUpperBoundMaskedPost)
+  (some (Lean.mkConst ``smallInputPre)) (some .survivedAllMutants)
+
+-- Negative controls: witness instantiation only ever strengthens the goal, so genuine
+-- existential specifications (evenness, bounded witnesses) are still accepted.
+#eval assertEnsuresBindsOutput (Lean.mkConst ``existsUpperBoundMaskedPost)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``existsEvenPost)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``existsBoundedDoublePost)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``existsSandwichPost)
+
+-- Arithmetic and relational tautologies over `Nat`, including `requires`-implied ones.
+#eval assertEnsuresVacuous (Lean.mkConst ``natGeZeroPost) none (some .trivialPostcondition)
+#eval assertEnsuresVacuous (Lean.mkConst ``natZeroLePost) none (some .trivialPostcondition)
+#eval assertEnsuresVacuous (Lean.mkConst ``natAddZeroPost) none (some .trivialPostcondition)
+#eval assertEnsuresVacuous (Lean.mkConst ``natMinSelfPost) none (some .trivialPostcondition)
+#eval assertEnsuresVacuous (Lean.mkConst ``natAddInputGePost)
+  (some (Lean.mkConst ``smallInputPre)) (some .trivialPostcondition)
+#eval assertEnsuresVacuous (Lean.mkConst ``natAddTenGtInputPost)
+  (some (Lean.mkConst ``smallInputPre)) (some .survivedAllMutants)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``natAddTenGtInputPost)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``natAddInputGeTenPost)
+  (some (Lean.mkConst ``smallInputPre))
+
 /-! ## 4. Mandatory Compile-Time Kernel Axiom Audit -/
 
 /-- Axioms a kernel-checked declaration of this development may depend on. -/
