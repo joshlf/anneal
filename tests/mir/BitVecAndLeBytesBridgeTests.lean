@@ -1436,22 +1436,26 @@ both `i32::MIN - 1` (signed underflow) and `i32::MAX - (-1)` (signed overflow) t
 signed `subUnchecked` and raise `overflow = true` under `subWithOverflow`, while width `0`
 satisfies `signed_range_sub_no_overflow_sound` cleanly. -/
 theorem canary1_signed_sub_overflow_counterexamples (locals : List LocalSlot) (mem : Memory)
-    (z₁ z₂ : BitVec 0) :
+    (z_alo z_ahi z_blo z_bhi z_x z_y : BitVec 0) :
     evalScalarBinOp .subUnchecked ⟨0x80000000, 4⟩ ⟨1, 4⟩ locals mem true = .ub ∧
       evalScalarBinOp .subWithOverflow ⟨0x80000000, 4⟩ ⟨1, 4⟩ locals mem true =
         .ok (.aggregate 0 [.scalar ⟨0x7FFFFFFF, 4⟩, .scalar (boolToScalar true)]) locals mem ∧
       evalScalarBinOp .subUnchecked ⟨0x7FFFFFFF, 4⟩ ⟨0xFFFFFFFF, 4⟩ locals mem true = .ub ∧
       evalScalarBinOp .subWithOverflow ⟨0x7FFFFFFF, 4⟩ ⟨0xFFFFFFFF, 4⟩ locals mem true =
         .ok (.aggregate 0 [.scalar ⟨0x80000000, 4⟩, .scalar (boolToScalar true)]) locals mem ∧
-      (Anneal.BitVecArith.sle (z₁ - z₂) (z₁ - z₂) ∧
-        Anneal.BitVecArith.sle (z₁ - z₂) (z₁ - z₂)) := by
-  have hk1 := Anneal.BitVecArith.signedKey_lt z₁
-  have hk2 := Anneal.BitVecArith.signedKey_lt z₂
-  rw [natPow_eq] at hk1 hk2
+      (Anneal.BitVecArith.sle (z_alo - z_bhi) (z_x - z_y) ∧
+        Anneal.BitVecArith.sle (z_x - z_y) (z_ahi - z_blo)) := by
+  have hbv0 : ∀ u v : BitVec 0, Anneal.BitVecArith.sle u v := fun u v => by
+    have heq : u = v := Anneal.BitVec.eq_of_toNat_eq (by have := u.isLt; have := v.isLt; omega)
+    exact heq ▸ Anneal.BitVecArith.sle_refl u
+  have hk_ahi := Anneal.BitVecArith.signedKey_lt z_ahi
+  have hk_blo := Anneal.BitVecArith.signedKey_lt z_blo
+  have hk_bhi := Anneal.BitVecArith.signedKey_lt z_bhi
+  have hk_alo := Anneal.BitVecArith.signedKey_lt z_alo
+  rw [natPow_eq] at hk_ahi hk_blo hk_bhi hk_alo
   refine ⟨?_, ?_, ?_, ?_,
-    signed_range_sub_no_overflow_sound (Anneal.BitVecArith.sle_refl z₁)
-      (Anneal.BitVecArith.sle_refl z₁) (Anneal.BitVecArith.sle_refl z₂)
-      (Anneal.BitVecArith.sle_refl z₂) (by omega) (by omega)⟩
+    signed_range_sub_no_overflow_sound (hbv0 z_alo z_x) (hbv0 z_x z_ahi)
+      (hbv0 z_blo z_y) (hbv0 z_y z_bhi) (by omega) (by omega)⟩
   · rw [← (evalScalarBinOp_unchecked_arith_iff (by decide) (Or.inr (Or.inl rfl))
       0x80000000 1 locals mem true).2]
     rfl
@@ -2009,6 +2013,123 @@ theorem canary1_unchecked_shifts_and_ctpop_algebra_witness :
   ⟨by decide, by decide, by decide, by decide,
     ⟨rfl, by decide, rfl⟩,
     rfl, by decide⟩
+
+/-! ### 4.7 Sign-Parametric `evalExactDiv`, Pointer/Slice Intrinsics (`evalArithOffset`,
+`evalSliceSizeOfVal`), and `FixedByteCodec.listFixed`/`array` Chunking Canaries -/
+
+/-- Canary 1u (sign-parametric `evalExactDiv` across signed/unsigned & non-canonical inputs,
+exact two's-complement inverse `q * rhs = lhs`, and `i32::MIN / -1` UB):
+- `evalExactDiv` reduces identically to `evalUncheckedRem = 0` + `evalUncheckedDiv` for *every*
+  `lhs`, `rhs`, and `isSigned` (including `sz = 0`, mismatched widths, and non-canonical `.bits`),
+  and agrees with `Anneal.Scalars.evalBinOp .{rem, div}` on canonical scalars;
+- whenever `evalExactDiv lhs rhs isSigned = some q`, `q * rhs = lhs` holds in `BitVec (8 * sz)`
+  across *both* signednesses;
+- signed `-42 / -6 = 7`, `-42 / 6 = -7`, and `42 / -6 = -7` succeed, whereas signed `i32::MIN / -1`
+  is `none` (`.ub` under `evalScalarExactDiv`). -/
+theorem canary1_signed_exactDiv_and_mul_inverse {a b : Nat}
+    (ha : a < scalarModulus 4) (hb : b < scalarModulus 4) (isSigned : Bool)
+    (lhs rhs q : ScalarInt) (locals : List LocalSlot) (mem : Memory)
+    (hexact : evalExactDiv lhs rhs isSigned = some q) :
+    evalExactDiv lhs rhs isSigned =
+        (match evalUncheckedRem lhs rhs isSigned with
+         | some r => if r.bits = 0 then evalUncheckedDiv lhs rhs isSigned else none
+         | none => none) ∧
+      evalExactDiv ⟨a, 4⟩ ⟨b, 4⟩ isSigned =
+        (match Anneal.Scalars.evalBinOp .rem ⟨a, 4⟩ ⟨b, 4⟩ isSigned with
+         | some r => if r.bits = 0 then Anneal.Scalars.evalBinOp .div ⟨a, 4⟩ ⟨b, 4⟩ isSigned else none
+         | none => none) ∧
+      (q.sizeBytes = lhs.sizeBytes ∧
+        rhs.sizeBytes = lhs.sizeBytes ∧
+        0 < lhs.sizeBytes ∧
+        q.bits < scalarModulus lhs.sizeBytes ∧
+        Anneal.BitVec.mul (BitVec.ofNat (8 * lhs.sizeBytes) q.bits)
+          (BitVec.ofNat (8 * lhs.sizeBytes) rhs.bits) =
+          BitVec.ofNat (8 * lhs.sizeBytes) lhs.bits) ∧
+      evalExactDiv ⟨0x80000000, 4⟩ ⟨0xFFFFFFFF, 4⟩ true = none ∧
+      evalScalarExactDiv ⟨0x80000000, 4⟩ ⟨0xFFFFFFFF, 4⟩ locals mem true = .ub ∧
+      evalExactDiv ⟨0xFFFFFFD6, 4⟩ ⟨0xFFFFFFFA, 4⟩ true = some ⟨7, 4⟩ ∧
+      evalExactDiv ⟨0xFFFFFFD6, 4⟩ ⟨6, 4⟩ true = some ⟨0xFFFFFFF9, 4⟩ ∧
+      evalExactDiv ⟨42, 4⟩ ⟨0xFFFFFFFA, 4⟩ true = some ⟨0xFFFFFFF9, 4⟩ :=
+  ⟨evalExactDiv_eq_uncheckedDiv_of_uncheckedRem lhs rhs isSigned,
+    evalExactDiv_eq_evalBinOp ha hb isSigned,
+    evalExactDiv_mul_inverse hexact,
+    evalExactDiv_signed_min_div_neg_one (sz := 4) (by decide),
+    evalScalarExactDiv_signed_min_div_neg_one (sz := 4) (by decide) locals mem,
+    rfl, rfl, rfl⟩
+
+/-- Satisfiability witness for `canary1_signed_exactDiv_and_mul_inverse` (using non-canonical
+signed dividend `2^32 + (-42 mod 2^32)` divided by `-6` to witness wrapping + signed exact
+division). -/
+theorem canary1_signed_exactDiv_witness :
+    42 < scalarModulus 4 ∧ 6 < scalarModulus 4 ∧
+      evalExactDiv ⟨2 ^ 32 + 0xFFFFFFD6, 4⟩ ⟨0xFFFFFFFA, 4⟩ true = some ⟨7, 4⟩ :=
+  ⟨by decide, by decide, rfl⟩
+
+/-- Canary 1v (`evalArithOffset` 64-bit two's-complement multiply-accumulate, `evalSliceSizeOfVal`
+`isize::MAX` boundary & interval transfer, and `FixedByteCodec.listFixed`/`array` chunking):
+- `evalArithOffset` collapses both sign branches into `ptr + offset * stride` in `BitVec 64`
+  (including negative offsets, `i64::MIN`, and zero-stride ZSTs) and rejects non-8-byte widths;
+- `evalSliceSizeOfVal` transfers `ScalarRange 8 [10, 1000]` to `[160, 16000]` (`< 2^63`), succeeds
+  at `4 * (2^61 - 1) = 2^63 - 4` (`≤ isize::MAX`), and rejects `4 * 2^61 = 2^63` (`isize::MAX + 1`)
+  as well as non-8-byte length scalars;
+- `FixedByteCodec.listFixed` and `FixedByteCodec.array` distribute cleanly over `ListChunks.chunksOf`
+  and preserve all four `FixedByteCodec` well-formedness invariants (including `k = 0`). -/
+theorem canary1_arithOffset_sliceSizeOfVal_and_array_chunks
+    (ptrVal : ProvenancePtr) (offsetBits elemStride : Nat)
+    (lenSc : ScalarInt) (hlen : ScalarRange 8 (BitVec.ofNat 64 10) (BitVec.ofNat 64 1000) lenSc)
+    (v : Vector (BitVec 32) 4) (bs : List AbstractByte) :
+    evalArithOffset ptrVal 8 ⟨offsetBits, 8⟩ elemStride =
+        some { ptrVal with offsetBytes :=
+          (BitVec.ofNat 64 ptrVal.offsetBytes +
+            Anneal.BitVec.mul (BitVec.ofNat 64 offsetBits)
+              (BitVec.ofNat 64 elemStride)).toNat } ∧
+      evalArithOffset ptrVal 4 ⟨offsetBits, 8⟩ elemStride = none ∧
+      evalArithOffset ptrVal 8 ⟨offsetBits, 4⟩ elemStride = none ∧
+      (∃ r, evalSliceSizeOfVal 16 lenSc = some r ∧
+        ScalarRange 8 (BitVec.ofNat 64 160) (BitVec.ofNat 64 16000) r ∧
+        r.bits < 2 ^ 63) ∧
+      evalSliceSizeOfVal 4 ⟨2 ^ 61 - 1, 8⟩ = some ⟨2 ^ 63 - 4, 8⟩ ∧
+      evalSliceSizeOfVal 4 ⟨2 ^ 61, 8⟩ = none ∧
+      evalSliceSizeOfVal 4 ⟨1, 4⟩ = none ∧
+      Anneal.ListChunks.chunksOf 4 ((FixedByteCodec.array 4 u32LE).encode v) =
+        v.toList.map u32LE.encode ∧
+      ((FixedByteCodec.array 4 u32LE).decode bs).map Vector.toList =
+        (if bs.length = 4 * 4 then
+          sequenceOptions ((Anneal.ListChunks.chunksOf 4 bs).map u32LE.decode)
+        else none) ∧
+      ((FixedByteCodec.listFixed 4 u32LE).decode bs).map Subtype.val =
+        (if bs.length = 4 * 4 then
+          sequenceOptions ((Anneal.ListChunks.chunksOf 4 bs).map u32LE.decode)
+        else none) ∧
+      ((FixedByteCodec.array 0 u32LE).IsExactWidth ∧
+        (FixedByteCodec.array 0 u32LE).IsInitCodec ∧
+        (FixedByteCodec.array 0 u32LE).IsSurjectiveInitDecoder ∧
+        (FixedByteCodec.array 0 u32LE).HasZeroValid) := by
+  have ⟨r, hr, hrg, hlt⟩ := scalarRange_evalSliceSizeOfVal (elemSizeBytes := 16) hlen (by decide)
+  exact ⟨evalArithOffset_eq_add_mul ptrVal offsetBits elemStride,
+    (evalArithOffset_eq_none_iff ptrVal 4 ⟨offsetBits, 8⟩ elemStride).2 (Or.inl (fun h => nomatch h)),
+    (evalArithOffset_eq_none_iff ptrVal 8 ⟨offsetBits, 4⟩ elemStride).2 (Or.inr (fun h => nomatch h)),
+    ⟨r, hr, scalarRange_congr rfl rfl hrg, hlt⟩,
+    (evalSliceSizeOfVal_eq_mul (elemSizeBytes := 4) (lenBits := 2 ^ 61 - 1) (by decide)).1,
+    (evalSliceSizeOfVal_eq_none_iff 4 ⟨2 ^ 61, 8⟩).2 (Or.inr (by decide)),
+    (evalSliceSizeOfVal_eq_none_iff 4 ⟨1, 4⟩).2 (Or.inl (fun h => nomatch h)),
+    chunksOf_array_encode 4 u32LE (by decide) v,
+    array_decode_eq_chunksOf 4 u32LE (by decide) bs,
+    listFixed_decode_eq_chunksOf 4 u32LE (by decide) bs,
+    bitVecLE_array_wf 4 (by decide) 0⟩
+
+/-- Satisfiability witness for `canary1_arithOffset_sliceSizeOfVal_and_array_chunks`:
+`⟨256, 8⟩ ∈ [10, 1000]`, and stepping pointer offset `100` by `-3i64` (`2^64 - 3`) elements of
+stride `4` yields `88`. -/
+theorem canary1_arithOffset_and_sliceSizeOfVal_witness (allocId : Nat) :
+    ScalarRange 8 (BitVec.ofNat 64 10) (BitVec.ofNat 64 1000) ⟨256, 8⟩ ∧
+      evalArithOffset { allocId := allocId, offsetBytes := 100 } 8 ⟨2 ^ 64 - 3, 8⟩ 4 =
+        some { allocId := allocId, offsetBytes := 88 } :=
+  ⟨⟨rfl, by decide, by decide, by decide⟩, by
+    rw [evalArithOffset_eq_add_mul]
+    apply congrArg (fun off => some ({ allocId := allocId, offsetBytes := off } : ProvenancePtr))
+    rw [_root_.BitVec.toNat_add, Anneal.BitVec.toNat_mul, natMod_eq, natPow_eq]
+    simp only [_root_.BitVec.toNat_ofNat]⟩
 
 /-! ## 5. Axiom Audit Guards
 
@@ -4121,6 +4242,78 @@ theorem and definition of this file is pinned to its exact axiom set. All sets a
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecScalarsBridge.ctpopLoop_lowMask
 
+/-- info: 'Anneal.BitVecScalarsBridge.signedExactDiv_step' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.signedExactDiv_step
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalExactDiv_eq_uncheckedDiv_of_uncheckedRem' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalExactDiv_eq_uncheckedDiv_of_uncheckedRem
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalExactDiv_eq_evalBinOp' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalExactDiv_eq_evalBinOp
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalExactDiv_signed_min_div_neg_one' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalExactDiv_signed_min_div_neg_one
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalScalarExactDiv_signed_min_div_neg_one' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalScalarExactDiv_signed_min_div_neg_one
+
+/-- info: 'Anneal.BitVecScalarsBridge.mul_sub_mod_of_mul_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.mul_sub_mod_of_mul_eq
+
+/-- info: 'Anneal.BitVecScalarsBridge.sub_mul_sub_mod_of_mul_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.sub_mul_sub_mod_of_mul_eq
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalExactDiv_mul_inverse' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalExactDiv_mul_inverse
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalArithOffset_eq_none_iff' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalArithOffset_eq_none_iff
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalArithOffset_eq_add_mul' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalArithOffset_eq_add_mul
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalSliceSizeOfVal_eq_none_iff' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalSliceSizeOfVal_eq_none_iff
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalSliceSizeOfVal_eq_mul' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalSliceSizeOfVal_eq_mul
+
+/-- info: 'Anneal.BitVecScalarsBridge.scalarRange_evalSliceSizeOfVal' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.scalarRange_evalSliceSizeOfVal
+
+/-- info: 'Anneal.BitVecScalarsBridge.chunksOf_listFixed_encode' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.chunksOf_listFixed_encode
+
+/-- info: 'Anneal.BitVecScalarsBridge.listFixed_decode_eq_chunksOf' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.listFixed_decode_eq_chunksOf
+
+/-- info: 'Anneal.BitVecScalarsBridge.chunksOf_array_encode' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.chunksOf_array_encode
+
+/-- info: 'Anneal.BitVecScalarsBridge.array_decode_eq_chunksOf' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.array_decode_eq_chunksOf
+
+/-- info: 'Anneal.BitVecScalarsBridge.bitVecLE_array_wf' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.bitVecLE_array_wf
+
 /-- info: 'Anneal.BitVecAndLeBytesBridgeTests.ctlz_width_zero' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecAndLeBytesBridgeTests.ctlz_width_zero
@@ -4576,5 +4769,21 @@ theorem and definition of this file is pinned to its exact axiom set. All sets a
 /-- info: 'Anneal.BitVecAndLeBytesBridgeTests.canary1_unchecked_shifts_and_ctpop_algebra_witness' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecAndLeBytesBridgeTests.canary1_unchecked_shifts_and_ctpop_algebra_witness
+
+/-- info: 'Anneal.BitVecAndLeBytesBridgeTests.canary1_signed_exactDiv_and_mul_inverse' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecAndLeBytesBridgeTests.canary1_signed_exactDiv_and_mul_inverse
+
+/-- info: 'Anneal.BitVecAndLeBytesBridgeTests.canary1_signed_exactDiv_witness' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecAndLeBytesBridgeTests.canary1_signed_exactDiv_witness
+
+/-- info: 'Anneal.BitVecAndLeBytesBridgeTests.canary1_arithOffset_sliceSizeOfVal_and_array_chunks' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecAndLeBytesBridgeTests.canary1_arithOffset_sliceSizeOfVal_and_array_chunks
+
+/-- info: 'Anneal.BitVecAndLeBytesBridgeTests.canary1_arithOffset_and_sliceSizeOfVal_witness' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecAndLeBytesBridgeTests.canary1_arithOffset_and_sliceSizeOfVal_witness
 
 end Anneal.BitVecAndLeBytesBridgeTests

@@ -64,6 +64,9 @@ Sections:
 16. Remaining core intrinsics (`evalUnchecked{Div,Rem,Shl,Shr}`, `evalExactDiv`,
     `evalScalarExactDiv`, `evalBitreverse` failure) and `ctpop` algebraic identities
     (inclusion-exclusion, disjoint-mask additivity, Kernighan's clear-lowest-bit, `lowMask`).
+17. Sign-parametric `evalExactDiv` (including signed `T::MIN / -1` and exact inverse `q * b = a`),
+    pointer/slice intrinsics (`evalArithOffset`, `evalSliceSizeOfVal`), and
+    `FixedByteCodec.listFixed`/`array` chunking bridges.
 -/
 
 /-! ## 0. Notation Bridges -/
@@ -8007,5 +8010,777 @@ theorem ctpopLoop_lowMask {w k : Nat} (hle : k ≤ w) :
       Bool.true_and, Nat.testBit_two_pow_sub_one]
   rw [heq, _root_.BitVec.toNat_ofNat, Nat.mod_eq_of_lt hlt]
   exact ctpopLoop_two_pow_sub_one w k hle
+
+/-! ## 17. Sign-Parametric `evalExactDiv`, Pointer/Slice Intrinsics (`evalArithOffset`,
+`evalSliceSizeOfVal`), and `FixedByteCodec.listFixed`/`array` Chunking Bridges -/
+
+/-- Magnitude-step alignment helper between signed `evalExactDiv`, `evalUncheckedRem`, and
+`evalUncheckedDiv` once `magA < scalarModulus sz` and `0 < magB < scalarModulus sz`. -/
+theorem signedExactDiv_step {sz magA magB : Nat} (negA negB : Bool)
+    (hmagA_lt : magA < scalarModulus sz) (hmagB_pos : 0 < magB)
+    (hmagB_lt : magB < scalarModulus sz) :
+    (match Nat.beq (Nat.mod magA magB) 0 with
+     | false => none
+     | true =>
+       some ({ bits :=
+                 match negA, negB with
+                 | false, false => Nat.div magA magB
+                 | true, true => Nat.div magA magB
+                 | _, _ =>
+                   wrapScalarBits (Nat.sub (scalarModulus sz) (Nat.div magA magB))
+                     (scalarModulus sz),
+               sizeBytes := sz } : ScalarInt)) =
+    (match (some ({ bits :=
+                      match Nat.beq (Nat.mod magA magB) 0 with
+                      | true => 0
+                      | false =>
+                        match negA with
+                        | false => wrapScalarBits (Nat.mod magA magB) (scalarModulus sz)
+                        | true =>
+                          wrapScalarBits (Nat.sub (scalarModulus sz) (Nat.mod magA magB))
+                            (scalarModulus sz),
+                    sizeBytes := sz } : ScalarInt) : Option ScalarInt) with
+     | some r =>
+       if r.bits = 0 then
+         some ({ bits :=
+                   match Nat.beq (Nat.div magA magB) 0 with
+                   | true => 0
+                   | false =>
+                     match negA, negB with
+                     | false, false => wrapScalarBits (Nat.div magA magB) (scalarModulus sz)
+                     | true, true => wrapScalarBits (Nat.div magA magB) (scalarModulus sz)
+                     | _, _ =>
+                       wrapScalarBits (Nat.sub (scalarModulus sz) (Nat.div magA magB))
+                         (scalarModulus sz),
+                 sizeBytes := sz } : ScalarInt)
+       else none
+     | none => none) := by
+  have hmagR_lt : Nat.mod magA magB < scalarModulus sz := by
+    rw [natMod_eq]
+    exact Nat.lt_of_lt_of_le (Nat.mod_lt _ hmagB_pos) (Nat.le_of_lt hmagB_lt)
+  have hmagQ_lt : Nat.div magA magB < scalarModulus sz := by
+    rw [natDiv_eq]; exact Nat.lt_of_le_of_lt (Nat.div_le_self _ _) hmagA_lt
+  cases hrm : Nat.beq (Nat.mod magA magB) 0 with
+  | false =>
+    dsimp only
+    have hrm_pos : 0 < Nat.mod magA magB := by
+      cases Nat.eq_zero_or_pos (Nat.mod magA magB) with
+      | inl hz => rw [hz] at hrm; cases hrm
+      | inr hp => exact hp
+    cases negA with
+    | false =>
+      dsimp only
+      rw [wrapScalarBits_of_lt hmagR_lt]
+      have hne : Nat.mod magA magB ≠ 0 := by omega
+      simp only [hne, ↓reduceIte]
+    | true =>
+      dsimp only
+      have hsub_lt : Nat.sub (scalarModulus sz) (Nat.mod magA magB) < scalarModulus sz := by
+        rw [natSub_eq]; omega
+      rw [wrapScalarBits_of_lt hsub_lt]
+      have hne : Nat.sub (scalarModulus sz) (Nat.mod magA magB) ≠ 0 := by
+        rw [natSub_eq]; omega
+      simp only [hne, ↓reduceIte]
+  | true =>
+    dsimp only
+    simp only [↓reduceIte]
+    cases hqz : Nat.beq (Nat.div magA magB) 0 with
+    | true =>
+      have hq0 : Nat.div magA magB = 0 := Nat.eq_of_beq_eq_true hqz
+      have hwm : wrapScalarBits (Nat.sub (scalarModulus sz) 0) (scalarModulus sz) = 0 := by
+        rw [natSub_eq, Nat.sub_zero, wrapScalarBits_eq_toNat, scalarModulus_eq,
+          _root_.BitVec.toNat_ofNat, Nat.mod_self]
+      rw [hq0]
+      cases negA <;> cases negB <;> dsimp only <;> first | rfl | rw [hwm]
+    | false =>
+      rw [wrapScalarBits_of_lt hmagQ_lt]
+
+/-- Exact sign-parametric reduction of `evalExactDiv` to `evalUncheckedRem` and `evalUncheckedDiv`
+across all widths (including `0` and mismatched widths), both signednesses (`isSigned = false` and
+`isSigned = true`, including `T::MIN / -1` UB), and arbitrary (possibly non-canonical) bit patterns:
+`evalExactDiv` succeeds iff `evalUncheckedRem` succeeds with remainder `0`, in which case it equals
+`evalUncheckedDiv`. -/
+theorem evalExactDiv_eq_uncheckedDiv_of_uncheckedRem (lhs rhs : ScalarInt) (isSigned : Bool) :
+    evalExactDiv lhs rhs isSigned =
+      match evalUncheckedRem lhs rhs isSigned with
+      | some r => if r.bits = 0 then evalUncheckedDiv lhs rhs isSigned else none
+      | none => none := by
+  rcases lhs with ⟨la, sz⟩
+  rcases rhs with ⟨rb, szR⟩
+  unfold evalExactDiv evalUncheckedRem evalUncheckedDiv
+  dsimp only
+  cases heq : Nat.beq sz szR with
+  | false =>
+    rw [Bool.false_and, Bool.not_false, Bool.or_true]
+  | true =>
+    have hsz_eq : sz = szR := Nat.eq_of_beq_eq_true heq
+    subst hsz_eq
+    rw [Bool.true_and, Bool.not_true, Bool.or_false]
+    cases h0 : Nat.beq sz 0 with
+    | true =>
+      rw [Bool.not_true]
+    | false =>
+      have hsz : 0 < sz := by
+        cases hz : sz with
+        | zero => rw [hz] at h0; cases h0
+        | succ _ => exact Nat.succ_pos _
+      rw [Bool.not_false]
+      dsimp only
+      have hm : scalarModulus sz = 2 ^ (8 * sz) := scalarModulus_eq sz
+      have hca : wrapScalarBits la (scalarModulus sz) < scalarModulus sz := by
+        rw [wrapScalarBits_eq_toNat]; exact toNat_lt_scalarModulus _
+      have hcb : wrapScalarBits rb (scalarModulus sz) < scalarModulus sz := by
+        rw [wrapScalarBits_eq_toNat]; exact toNat_lt_scalarModulus _
+      generalize wrapScalarBits la (scalarModulus sz) = ca at hca ⊢
+      generalize wrapScalarBits rb (scalarModulus sz) = cb at hcb ⊢
+      cases hbz : Nat.beq cb 0 with
+      | true => rfl
+      | false =>
+        have hcb_pos : 0 < cb := by
+          cases Nat.eq_zero_or_pos cb with
+          | inl hz => rw [hz] at hbz; cases hbz
+          | inr hp => exact hp
+        dsimp only
+        cases isSigned with
+        | false =>
+          dsimp only
+          have hrem_lt : Nat.mod ca cb < scalarModulus sz := by
+            rw [natMod_eq]; exact Nat.lt_of_le_of_lt (Nat.mod_le _ _) hca
+          have hdiv_lt : Nat.div ca cb < scalarModulus sz := by
+            rw [natDiv_eq]; exact Nat.lt_of_le_of_lt (Nat.div_le_self _ _) hca
+          rw [wrapScalarBits_of_lt hrem_lt, wrapScalarBits_of_lt hdiv_lt]
+          cases hmod : Nat.beq (Nat.mod ca cb) 0 with
+          | true =>
+            have hm0 := Nat.eq_of_beq_eq_true hmod
+            simp [hm0]
+          | false =>
+            have hne : Nat.mod ca cb ≠ 0 := fun h => by rw [h] at hmod; cases hmod
+            simp [hne]
+        | true =>
+          dsimp only
+          have hpow : scalarPow2 (Nat.sub (Nat.mul sz 8) 1) = signedHalfModulus sz := by
+            rw [Anneal.Scalars.scalarPow2_eq_two_pow, natSub_eq, natMul_eight,
+              Anneal.Scalars.signedHalfModulus_eq_two_pow hsz]
+          rw [hpow]
+          cases hmin :
+              Bool.and (Nat.beq ca (signedHalfModulus sz))
+                (Nat.beq cb (Nat.sub (scalarModulus sz) 1)) with
+          | true => rfl
+          | false =>
+            dsimp only
+            have hnegA : isSignedNegative ca sz = Nat.ble (signedHalfModulus sz) ca := by
+              unfold isSignedNegative
+              rw [h0]
+              dsimp only
+              change Nat.ble (signedHalfModulus sz) (wrapScalarBits ca (scalarModulus sz)) =
+                Nat.ble (signedHalfModulus sz) ca
+              rw [wrapScalarBits_of_lt hca]
+            have hnegB : isSignedNegative cb sz = Nat.ble (signedHalfModulus sz) cb := by
+              unfold isSignedNegative
+              rw [h0]
+              dsimp only
+              change Nat.ble (signedHalfModulus sz) (wrapScalarBits cb (scalarModulus sz)) =
+                Nat.ble (signedHalfModulus sz) cb
+              rw [wrapScalarBits_of_lt hcb]
+            rw [hnegA, hnegB]
+            have hhalf : signedHalfModulus sz = 2 ^ (8 * sz - 1) :=
+              Anneal.Scalars.signedHalfModulus_eq_two_pow hsz
+            have hhalf_pos : 0 < signedHalfModulus sz := by
+              rw [hhalf]; exact Nat.two_pow_pos _
+            cases hA : Nat.ble (signedHalfModulus sz) ca <;>
+              cases hB : Nat.ble (signedHalfModulus sz) cb
+            · dsimp only
+              exact signedExactDiv_step false false hca hcb_pos hcb
+            · dsimp only
+              have hleB := Nat.le_of_ble_eq_true hB
+              have hsubB_lt : Nat.sub (scalarModulus sz) cb < scalarModulus sz := by
+                rw [natSub_eq]; omega
+              have hsubB_pos : 0 < Nat.sub (scalarModulus sz) cb := by
+                rw [natSub_eq]; omega
+              rw [wrapScalarBits_of_lt hsubB_lt]
+              exact signedExactDiv_step false true hca hsubB_pos hsubB_lt
+            · dsimp only
+              have hleA := Nat.le_of_ble_eq_true hA
+              have hsubA_lt : Nat.sub (scalarModulus sz) ca < scalarModulus sz := by
+                rw [natSub_eq]; omega
+              rw [wrapScalarBits_of_lt hsubA_lt]
+              exact signedExactDiv_step true false hsubA_lt hcb_pos hcb
+            · dsimp only
+              have hleA := Nat.le_of_ble_eq_true hA
+              have hleB := Nat.le_of_ble_eq_true hB
+              have hsubA_lt : Nat.sub (scalarModulus sz) ca < scalarModulus sz := by
+                rw [natSub_eq]; omega
+              have hsubB_lt : Nat.sub (scalarModulus sz) cb < scalarModulus sz := by
+                rw [natSub_eq]; omega
+              have hsubB_pos : 0 < Nat.sub (scalarModulus sz) cb := by
+                rw [natSub_eq]; omega
+              rw [wrapScalarBits_of_lt hsubA_lt, wrapScalarBits_of_lt hsubB_lt]
+              exact signedExactDiv_step true true hsubA_lt hsubB_pos hsubB_lt
+
+/-- On canonical scalars (including `sz = 0`), `evalExactDiv` across both signednesses agrees
+identically with checking `r.bits = 0` on `Anneal.Scalars.evalBinOp .rem` and returning
+`Anneal.Scalars.evalBinOp .div`. -/
+theorem evalExactDiv_eq_evalBinOp {sz : Nat} {a b : Nat}
+    (ha : a < scalarModulus sz) (hb : b < scalarModulus sz) (isSigned : Bool) :
+    evalExactDiv ⟨a, sz⟩ ⟨b, sz⟩ isSigned =
+      match Anneal.Scalars.evalBinOp .rem ⟨a, sz⟩ ⟨b, sz⟩ isSigned with
+      | some r => if r.bits = 0 then Anneal.Scalars.evalBinOp .div ⟨a, sz⟩ ⟨b, sz⟩ isSigned else none
+      | none => none := by
+  rw [evalExactDiv_eq_uncheckedDiv_of_uncheckedRem,
+    evalUncheckedRem_eq_evalBinOp ha hb isSigned]
+  cases Anneal.Scalars.evalBinOp .rem ⟨a, sz⟩ ⟨b, sz⟩ isSigned with
+  | none => rfl
+  | some r => simp only [evalUncheckedDiv_eq_evalBinOp ha hb isSigned]
+
+/-- Signed `evalExactDiv` rejects `T::MIN / -1` (`signedHalfModulus sz` divided by
+`scalarModulus sz - 1`) with `none` (UB) at every positive byte width. -/
+theorem evalExactDiv_signed_min_div_neg_one {sz : Nat} (hsz : 0 < sz) :
+    evalExactDiv ⟨signedHalfModulus sz, sz⟩ ⟨scalarModulus sz - 1, sz⟩ true = none := by
+  have hm : scalarModulus sz = 2 ^ (8 * sz) := scalarModulus_eq sz
+  have hhalf : signedHalfModulus sz = 2 ^ (8 * sz - 1) :=
+    Anneal.Scalars.signedHalfModulus_eq_two_pow hsz
+  have hm_pos : 2 ≤ scalarModulus sz := by
+    rw [hm]
+    have : 2 ^ 1 ≤ 2 ^ (8 * sz) := Nat.pow_le_pow_right (by decide) (by omega)
+    omega
+  have hhalf_lt : signedHalfModulus sz < scalarModulus sz := by
+    rw [hhalf, hm]
+    exact Nat.pow_lt_pow_right (by decide) (by omega)
+  have hm1_lt : scalarModulus sz - 1 < scalarModulus sz := by omega
+  have hm1_nz : Nat.beq (scalarModulus sz - 1) 0 = false :=
+    nat_beq_eq_false_of_ne (by omega)
+  unfold evalExactDiv
+  simp only [nat_beq_self, beq_zero_of_pos hsz, Bool.not_false,
+    wrapScalarBits_of_lt hhalf_lt, wrapScalarBits_of_lt hm1_lt, hm1_nz, natSub_eq, Bool.and_self]
+
+/-- Operational signed `evalScalarExactDiv` produces `.ub` on `T::MIN / -1`. -/
+theorem evalScalarExactDiv_signed_min_div_neg_one {sz : Nat} (hsz : 0 < sz)
+    (locals : List LocalSlot) (mem : Memory) :
+    evalScalarExactDiv ⟨signedHalfModulus sz, sz⟩ ⟨scalarModulus sz - 1, sz⟩ locals mem true =
+      .ub :=
+  (evalScalarExactDiv_eq_ub_iff _ _ locals mem true).2 (evalExactDiv_signed_min_div_neg_one hsz)
+
+/-- Modular negation-product helper: when `q * b = a` with `0 < a < m` and `b ≤ m`,
+`(q * (m - b)) % m = m - a`. -/
+theorem mul_sub_mod_of_mul_eq {m q b a : Nat}
+    (ha_pos : 0 < a) (ha_lt : a < m) (hb_le : b ≤ m) (hmul : q * b = a) :
+    (q * (m - b)) % m = m - a := by
+  have hq_pos : 0 < q := by
+    cases q with
+    | zero => simp at hmul; omega
+    | succ _ => exact Nat.succ_pos _
+  have h1 : q * (m - b) + a = q * m := by
+    rw [← hmul, ← Nat.mul_add, Nat.sub_add_cancel hb_le]
+  have h2 : q * m = (q - 1) * m + m := by
+    simpa [Nat.succ_eq_add_one, Nat.sub_add_cancel hq_pos] using Nat.succ_mul (q - 1) m
+  have h3 : q * (m - b) = (m - a) + (q - 1) * m := by omega
+  rw [h3, Nat.add_mul_mod_self_right, Nat.mod_eq_of_lt (by omega)]
+
+/-- Modular double-negation product helper: when `q * b = a < m` and `q + b ≤ m`,
+`((m - q) * (m - b)) % m = a`. -/
+theorem sub_mul_sub_mod_of_mul_eq {m q b a : Nat}
+    (ha_lt : a < m) (hsum_le : q + b ≤ m) (hmul : q * b = a) :
+    ((m - q) * (m - b)) % m = a := by
+  have hq_le : q ≤ m := by omega
+  have hb_le : b ≤ m := by omega
+  have h1 : (m - q) * (m - b) + q * (m - b) = m * (m - b) := by
+    rw [← Nat.add_mul, Nat.sub_add_cancel hq_le]
+  have h2 : q * (m - b) + a = q * m := by
+    rw [← hmul, ← Nat.mul_add, Nat.sub_add_cancel hb_le]
+  have h3 : m * (m - b) + m * b = m * m := by
+    rw [← Nat.mul_add, Nat.sub_add_cancel hb_le]
+  have h4 : q * m + m * b = (q + b) * m := by
+    rw [Nat.add_mul, Nat.mul_comm m b]
+  have h5 : (m - (q + b)) * m + (q + b) * m = m * m := by
+    rw [← Nat.add_mul, Nat.sub_add_cancel hsum_le]
+  have h6 : (m - q) * (m - b) = a + (m - (q + b)) * m := by omega
+  rw [h6, Nat.add_mul_mod_self_right, Nat.mod_eq_of_lt ha_lt]
+
+/-- Sign-parametric exact-inverse theorem for `evalExactDiv` (covering BOTH `isSigned = false` and
+`isSigned = true`, and arbitrary possibly non-canonical `lhs`/`rhs` bit patterns): whenever
+`evalExactDiv lhs rhs isSigned = some q`, `q` is canonical of width `lhs.sizeBytes` and satisfies
+the exact two's-complement multiplication identity `q * rhs = lhs` in `BitVec (8 * lhs.sizeBytes)`. -/
+theorem evalExactDiv_mul_inverse {lhs rhs q : ScalarInt} {isSigned : Bool}
+    (h : evalExactDiv lhs rhs isSigned = some q) :
+    q.sizeBytes = lhs.sizeBytes ∧
+      rhs.sizeBytes = lhs.sizeBytes ∧
+      0 < lhs.sizeBytes ∧
+      q.bits < scalarModulus lhs.sizeBytes ∧
+      Anneal.BitVec.mul (BitVec.ofNat (8 * lhs.sizeBytes) q.bits)
+        (BitVec.ofNat (8 * lhs.sizeBytes) rhs.bits) =
+        BitVec.ofNat (8 * lhs.sizeBytes) lhs.bits := by
+  rcases lhs with ⟨la, sz⟩
+  rcases rhs with ⟨rb, szR⟩
+  unfold evalExactDiv at h
+  dsimp only at h
+  cases heq : Nat.beq sz szR with
+  | false => rw [heq, Bool.false_and] at h; nomatch h
+  | true =>
+    have hsz_eq : sz = szR := Nat.eq_of_beq_eq_true heq
+    subst hsz_eq
+    rw [nat_beq_self, Bool.true_and] at h
+    cases h0 : Nat.beq sz 0 with
+    | true => rw [h0, Bool.not_true] at h; nomatch h
+    | false =>
+      have hsz : 0 < sz := by
+        cases hz : sz with
+        | zero => rw [hz] at h0; cases h0
+        | succ _ => exact Nat.succ_pos _
+      rw [h0, Bool.not_false] at h
+      dsimp only at h
+      have hm : scalarModulus sz = 2 ^ (8 * sz) := scalarModulus_eq sz
+      have hca : wrapScalarBits la (scalarModulus sz) < scalarModulus sz := by
+        rw [wrapScalarBits_eq_toNat]; exact toNat_lt_scalarModulus _
+      have hcb : wrapScalarBits rb (scalarModulus sz) < scalarModulus sz := by
+        rw [wrapScalarBits_eq_toNat]; exact toNat_lt_scalarModulus _
+      have hca_eq :
+          BitVec.ofNat (8 * sz) la =
+            BitVec.ofNat (8 * sz) (wrapScalarBits la (scalarModulus sz)) := by
+        apply Anneal.BitVec.eq_of_toNat_eq
+        rw [wrapScalarBits_eq_toNat, ofNat_toNat_self]
+      have hcb_eq :
+          BitVec.ofNat (8 * sz) rb =
+            BitVec.ofNat (8 * sz) (wrapScalarBits rb (scalarModulus sz)) := by
+        apply Anneal.BitVec.eq_of_toNat_eq
+        rw [wrapScalarBits_eq_toNat, ofNat_toNat_self]
+      generalize wrapScalarBits la (scalarModulus sz) = ca at h hca hca_eq
+      generalize wrapScalarBits rb (scalarModulus sz) = cb at h hcb hcb_eq
+      cases hbz : Nat.beq cb 0 with
+      | true => rw [hbz] at h; nomatch h
+      | false =>
+        rw [hbz] at h
+        have hcb_pos : 0 < cb := by
+          cases Nat.eq_zero_or_pos cb with
+          | inl hz => rw [hz] at hbz; cases hbz
+          | inr hp => exact hp
+        dsimp only at h
+        cases isSigned with
+        | false =>
+          dsimp only at h
+          cases hmod : Nat.beq (Nat.mod ca cb) 0 with
+          | false => rw [hmod] at h; nomatch h
+          | true =>
+            rw [hmod] at h
+            injection h with hq
+            subst hq
+            have hrem0 : ca % cb = 0 := by rw [← natMod_eq]; exact Nat.eq_of_beq_eq_true hmod
+            have hq_lt : Nat.div ca cb < scalarModulus sz := by
+              rw [natDiv_eq]; exact Nat.lt_of_le_of_lt (Nat.div_le_self _ _) hca
+            refine ⟨rfl, rfl, hsz, hq_lt, ?_⟩
+            dsimp only
+            rw [hca_eq, hcb_eq]
+            apply Anneal.BitVec.eq_of_toNat_eq
+            rw [Anneal.BitVec.toNat_mul, natMod_eq, natPow_eq]
+            simp only [_root_.BitVec.toNat_ofNat, ← hm,
+              Nat.mod_eq_of_lt hq_lt, Nat.mod_eq_of_lt hcb, Nat.mod_eq_of_lt hca]
+            rw [natDiv_eq, Nat.mul_comm]
+            have hdm := Nat.div_add_mod ca cb
+            rw [hrem0, Nat.add_zero] at hdm
+            rw [hdm, Nat.mod_eq_of_lt hca]
+        | true =>
+          dsimp only at h
+          cases hmin :
+              Bool.and (Nat.beq ca (signedHalfModulus sz))
+                (Nat.beq cb (Nat.sub (scalarModulus sz) 1)) with
+          | true => rw [hmin] at h; nomatch h
+          | false =>
+            rw [hmin] at h
+            dsimp only at h
+            have hhalf : signedHalfModulus sz = 2 ^ (8 * sz - 1) :=
+              Anneal.Scalars.signedHalfModulus_eq_two_pow hsz
+            have hm2 : scalarModulus sz = 2 * 2 ^ (8 * sz - 1) := by
+              rw [hm, Nat.mul_comm 2, ← Nat.pow_succ]; congr 1; omega
+            have hhalf_pos : 0 < signedHalfModulus sz := by
+              rw [hhalf]; exact Nat.two_pow_pos _
+            cases hA : Nat.ble (signedHalfModulus sz) ca <;>
+              cases hB : Nat.ble (signedHalfModulus sz) cb
+            · rw [hA, hB] at h; dsimp only at h
+              cases hmod : Nat.beq (Nat.mod ca cb) 0 with
+              | false => rw [hmod] at h; nomatch h
+              | true =>
+                rw [hmod] at h; injection h with hq; subst hq
+                have hrem0 : ca % cb = 0 := by rw [← natMod_eq]; exact Nat.eq_of_beq_eq_true hmod
+                have hq_lt : Nat.div ca cb < scalarModulus sz := by
+                  rw [natDiv_eq]; exact Nat.lt_of_le_of_lt (Nat.div_le_self _ _) hca
+                refine ⟨rfl, rfl, hsz, hq_lt, ?_⟩
+                dsimp only; rw [hca_eq, hcb_eq]; apply Anneal.BitVec.eq_of_toNat_eq
+                rw [Anneal.BitVec.toNat_mul, natMod_eq, natPow_eq]
+                simp only [_root_.BitVec.toNat_ofNat, ← hm,
+                  Nat.mod_eq_of_lt hq_lt, Nat.mod_eq_of_lt hcb, Nat.mod_eq_of_lt hca]
+                rw [natDiv_eq, Nat.mul_comm]
+                have hdm := Nat.div_add_mod ca cb
+                rw [hrem0, Nat.add_zero] at hdm
+                rw [hdm, Nat.mod_eq_of_lt hca]
+            · rw [hA, hB] at h; dsimp only at h
+              have hleB := Nat.le_of_ble_eq_true hB
+              have hca_lt_half : ca < signedHalfModulus sz := by
+                cases Nat.lt_or_ge ca (signedHalfModulus sz) with
+                | inl hlt => exact hlt
+                | inr hge => rw [Nat.ble_eq_true_of_le hge] at hA; cases hA
+              have hsubB_lt : Nat.sub (scalarModulus sz) cb < scalarModulus sz := by
+                rw [natSub_eq]; omega
+              rw [wrapScalarBits_of_lt hsubB_lt, natSub_eq] at h
+              cases hmod : Nat.beq (Nat.mod ca (scalarModulus sz - cb)) 0 with
+              | false => rw [hmod] at h; nomatch h
+              | true =>
+                rw [hmod] at h; dsimp only at h; injection h with hq; subst hq
+                have hrem0 : ca % (scalarModulus sz - cb) = 0 := by
+                  rw [← natMod_eq]; exact Nat.eq_of_beq_eq_true hmod
+                have hmul_mag : (ca / (scalarModulus sz - cb)) * (scalarModulus sz - cb) = ca := by
+                  rw [Nat.mul_comm]
+                  have hdm := Nat.div_add_mod ca (scalarModulus sz - cb)
+                  rw [hrem0, Nat.add_zero] at hdm; exact hdm
+                have hres_lt :
+                    wrapScalarBits
+                      (Nat.sub (scalarModulus sz) (Nat.div ca (scalarModulus sz - cb)))
+                      (scalarModulus sz) < scalarModulus sz := by
+                  rw [wrapScalarBits_eq_toNat]; exact toNat_lt_scalarModulus _
+                refine ⟨rfl, rfl, hsz, hres_lt, ?_⟩
+                dsimp only; rw [hca_eq, hcb_eq]; apply Anneal.BitVec.eq_of_toNat_eq
+                rw [Anneal.BitVec.toNat_mul, natMod_eq, natPow_eq]
+                simp only [_root_.BitVec.toNat_ofNat, ← hm,
+                  Nat.mod_eq_of_lt hres_lt, Nat.mod_eq_of_lt hcb, Nat.mod_eq_of_lt hca]
+                rw [natDiv_eq, natSub_eq]
+                cases Nat.eq_zero_or_pos (ca / (scalarModulus sz - cb)) with
+                | inl hqz =>
+                  have hca0 : ca = 0 := by rw [← hmul_mag, hqz, Nat.zero_mul]
+                  have hwm : wrapScalarBits (scalarModulus sz - 0) (scalarModulus sz) = 0 := by
+                    rw [Nat.sub_zero, wrapScalarBits_eq_toNat, scalarModulus_eq,
+                      _root_.BitVec.toNat_ofNat, Nat.mod_self]
+                  rw [hqz, hwm, Nat.zero_mul, Nat.zero_mod, hca0]
+                | inr hqp =>
+                  have hq_lt_half : ca / (scalarModulus sz - cb) < 2 ^ (8 * sz - 1) :=
+                    Nat.lt_of_le_of_lt (Nat.div_le_self _ _) (by omega)
+                  have hsubQ_lt :
+                      scalarModulus sz - ca / (scalarModulus sz - cb) < scalarModulus sz := by omega
+                  rw [wrapScalarBits_of_lt hsubQ_lt]
+                  have hcb_sub : cb = scalarModulus sz - (scalarModulus sz - cb) := by omega
+                  conv => lhs; arg 1; arg 2; rw [hcb_sub]
+                  exact sub_mul_sub_mod_of_mul_eq hca (by omega) hmul_mag
+            · rw [hA, hB] at h; dsimp only at h
+              have hleA := Nat.le_of_ble_eq_true hA
+              have hsubA_lt : Nat.sub (scalarModulus sz) ca < scalarModulus sz := by
+                rw [natSub_eq]; omega
+              rw [wrapScalarBits_of_lt hsubA_lt, natSub_eq] at h
+              cases hmod : Nat.beq (Nat.mod (scalarModulus sz - ca) cb) 0 with
+              | false => rw [hmod] at h; nomatch h
+              | true =>
+                rw [hmod] at h; dsimp only at h; injection h with hq; subst hq
+                have hrem0 : (scalarModulus sz - ca) % cb = 0 := by
+                  rw [← natMod_eq]; exact Nat.eq_of_beq_eq_true hmod
+                have hmul_mag :
+                    ((scalarModulus sz - ca) / cb) * cb = scalarModulus sz - ca := by
+                  rw [Nat.mul_comm]
+                  have hdm := Nat.div_add_mod (scalarModulus sz - ca) cb
+                  rw [hrem0, Nat.add_zero] at hdm; exact hdm
+                have hres_lt :
+                    wrapScalarBits
+                      (Nat.sub (scalarModulus sz) (Nat.div (scalarModulus sz - ca) cb))
+                      (scalarModulus sz) < scalarModulus sz := by
+                  rw [wrapScalarBits_eq_toNat]; exact toNat_lt_scalarModulus _
+                refine ⟨rfl, rfl, hsz, hres_lt, ?_⟩
+                dsimp only; rw [hca_eq, hcb_eq]; apply Anneal.BitVec.eq_of_toNat_eq
+                rw [Anneal.BitVec.toNat_mul, natMod_eq, natPow_eq]
+                simp only [_root_.BitVec.toNat_ofNat, ← hm,
+                  Nat.mod_eq_of_lt hres_lt, Nat.mod_eq_of_lt hcb, Nat.mod_eq_of_lt hca]
+                rw [natDiv_eq, natSub_eq]
+                have hmagA_pos : 0 < scalarModulus sz - ca := by omega
+                have hqp : 0 < (scalarModulus sz - ca) / cb := by
+                  cases hz : (scalarModulus sz - ca) / cb with
+                  | zero => rw [hz, Nat.zero_mul] at hmul_mag; omega
+                  | succ _ => exact Nat.succ_pos _
+                have hdiv_le : (scalarModulus sz - ca) / cb ≤ scalarModulus sz - ca :=
+                  Nat.div_le_self (scalarModulus sz - ca) cb
+                have hsubQ_lt :
+                    scalarModulus sz - (scalarModulus sz - ca) / cb < scalarModulus sz := by omega
+                rw [wrapScalarBits_of_lt hsubQ_lt, Nat.mul_comm]
+                have hmod_eq := mul_sub_mod_of_mul_eq hmagA_pos (by omega) (by omega)
+                  (Nat.mul_comm ((scalarModulus sz - ca) / cb) cb ▸ hmul_mag)
+                rw [hmod_eq]; omega
+            · rw [hA, hB] at h; dsimp only at h
+              have hleA := Nat.le_of_ble_eq_true hA
+              have hleB := Nat.le_of_ble_eq_true hB
+              have hsubA_lt : Nat.sub (scalarModulus sz) ca < scalarModulus sz := by
+                rw [natSub_eq]; omega
+              have hsubB_lt : Nat.sub (scalarModulus sz) cb < scalarModulus sz := by
+                rw [natSub_eq]; omega
+              rw [wrapScalarBits_of_lt hsubA_lt, wrapScalarBits_of_lt hsubB_lt] at h
+              simp only [natSub_eq] at h
+              cases hmod :
+                  Nat.beq (Nat.mod (scalarModulus sz - ca) (scalarModulus sz - cb)) 0 with
+              | false => rw [hmod] at h; nomatch h
+              | true =>
+                rw [hmod] at h; dsimp only at h; injection h with hq; subst hq
+                have hrem0 : (scalarModulus sz - ca) % (scalarModulus sz - cb) = 0 := by
+                  rw [← natMod_eq]; exact Nat.eq_of_beq_eq_true hmod
+                have hmul_mag :
+                    ((scalarModulus sz - ca) / (scalarModulus sz - cb)) *
+                      (scalarModulus sz - cb) = scalarModulus sz - ca := by
+                  rw [Nat.mul_comm]
+                  have hdm := Nat.div_add_mod (scalarModulus sz - ca) (scalarModulus sz - cb)
+                  rw [hrem0, Nat.add_zero] at hdm; exact hdm
+                have hq_lt :
+                    Nat.div (scalarModulus sz - ca) (scalarModulus sz - cb) <
+                      scalarModulus sz := by
+                  rw [natDiv_eq]
+                  exact Nat.lt_of_le_of_lt (Nat.div_le_self _ _) (by omega)
+                refine ⟨rfl, rfl, hsz, hq_lt, ?_⟩
+                dsimp only; rw [hca_eq, hcb_eq]; apply Anneal.BitVec.eq_of_toNat_eq
+                rw [Anneal.BitVec.toNat_mul, natMod_eq, natPow_eq]
+                simp only [_root_.BitVec.toNat_ofNat, ← hm,
+                  Nat.mod_eq_of_lt hq_lt, Nat.mod_eq_of_lt hcb, Nat.mod_eq_of_lt hca]
+                rw [natDiv_eq]
+                have hmagA_pos : 0 < scalarModulus sz - ca := by omega
+                have hcb_sub : cb = scalarModulus sz - (scalarModulus sz - cb) := by omega
+                conv => lhs; arg 1; arg 2; rw [hcb_sub]
+                rw [mul_sub_mod_of_mul_eq hmagA_pos (by omega) (by omega) hmul_mag]
+                omega
+
+/-- `evalArithOffset` fails iff either the pointer byte width or the offset scalar byte width is
+not `8`. -/
+theorem evalArithOffset_eq_none_iff (ptrVal : ProvenancePtr) (ptrSizeBytes : Nat)
+    (offsetSc : ScalarInt) (elemStride : Nat) :
+    evalArithOffset ptrVal ptrSizeBytes offsetSc elemStride = none ↔
+      ptrSizeBytes ≠ 8 ∨ offsetSc.sizeBytes ≠ 8 := by
+  unfold evalArithOffset
+  cases h0 : Nat.beq ptrSizeBytes 8 with
+  | false =>
+    have hne : ptrSizeBytes ≠ 8 := fun h => by rw [h] at h0; cases h0
+    rw [Bool.false_and]
+    exact ⟨fun _ => Or.inl hne, fun _ => rfl⟩
+  | true =>
+    have he0 : ptrSizeBytes = 8 := Nat.eq_of_beq_eq_true h0
+    rw [Bool.true_and]
+    cases h1 : Nat.beq offsetSc.sizeBytes 8 with
+    | false =>
+      have hne : offsetSc.sizeBytes ≠ 8 := fun h => by rw [h] at h1; cases h1
+      exact ⟨fun _ => Or.inr hne, fun _ => rfl⟩
+    | true =>
+      have he1 : offsetSc.sizeBytes = 8 := Nat.eq_of_beq_eq_true h1
+      refine ⟨(fun h => nomatch h), fun h => ?_⟩
+      rcases h with h | h
+      · exact absurd he0 h
+      · exact absurd he1 h
+
+/-- Two's-complement 64-bit multiply-accumulate equivalence for `evalArithOffset`: for *every*
+`ptrVal`, *every* (possibly negative, `i64::MIN`, or non-canonical) `offsetBits`, and *every*
+`elemStride` (including `0` for ZSTs), both branches of `evalArithOffset` collapse identically to
+`BitVec.ofNat 64 ptrVal.offsetBytes + Anneal.BitVec.mul offset stride`. -/
+theorem evalArithOffset_eq_add_mul (ptrVal : ProvenancePtr) (offsetBits elemStride : Nat) :
+    evalArithOffset ptrVal 8 ⟨offsetBits, 8⟩ elemStride =
+      some { ptrVal with offsetBytes :=
+        (BitVec.ofNat 64 ptrVal.offsetBytes +
+          Anneal.BitVec.mul (BitVec.ofNat 64 offsetBits)
+            (BitVec.ofNat 64 elemStride)).toNat } := by
+  unfold evalArithOffset
+  simp only [nat_beq_self, Bool.and_self]
+  congr 1; congr 1
+  have hm : scalarModulus 8 = 2 ^ 64 := scalarModulus_eq 8
+  have hoff_lt : wrapScalarBits offsetBits (scalarModulus 8) < 2 ^ 64 := by
+    rw [wrapScalarBits_eq_toNat]; exact (BitVec.ofNat 64 offsetBits).isLt
+  have hoff_eq : wrapScalarBits offsetBits (scalarModulus 8) = offsetBits % 2 ^ 64 := by
+    rw [wrapScalarBits_eq_toNat, _root_.BitVec.toNat_ofNat]
+  generalize wrapScalarBits offsetBits (scalarModulus 8) = off at hoff_lt hoff_eq ⊢
+  rw [_root_.BitVec.toNat_add, Anneal.BitVec.toNat_mul, natMod_eq, natPow_eq]
+  simp only [_root_.BitVec.toNat_ofNat]
+  cases hneg : isSignedNegative off 8 with
+  | false =>
+    dsimp only
+    rw [natAdd_eq, natMul_eq, wrapScalarBits_eq_toNat, _root_.BitVec.toNat_ofNat, hoff_eq]
+    change (ptrVal.offsetBytes + (offsetBits % 2 ^ 64) * elemStride) % 2 ^ 64 = _
+    rw [Nat.add_mod, Nat.mul_mod (offsetBits % 2 ^ 64) elemStride, Nat.mod_mod]
+  | true =>
+    dsimp only
+    have hbd_eq :
+        wrapScalarBits (Nat.mul (Nat.sub (scalarModulus 8) off) elemStride) (scalarModulus 8) =
+          ((2 ^ 64 - off) * elemStride) % 2 ^ 64 := by
+      rw [natMul_eq, natSub_eq, wrapScalarBits_eq_toNat, _root_.BitVec.toNat_ofNat, hm]
+    have hbd_lt :
+        wrapScalarBits (Nat.mul (Nat.sub (scalarModulus 8) off) elemStride) (scalarModulus 8) <
+          2 ^ 64 := by
+      rw [hbd_eq]; exact Nat.mod_lt _ (by decide)
+    generalize
+      wrapScalarBits (Nat.mul (Nat.sub (scalarModulus 8) off) elemStride) (scalarModulus 8) = bd
+      at hbd_eq hbd_lt ⊢
+    rw [natAdd_eq, natSub_eq, wrapScalarBits_eq_toNat, _root_.BitVec.toNat_ofNat, hm]
+    change (ptrVal.offsetBytes + (2 ^ 64 - bd)) % 2 ^ 64 = _
+    have hprod_lt : ((offsetBits % 2 ^ 64) * (elemStride % 2 ^ 64)) % 2 ^ 64 < 2 ^ 64 :=
+      Nat.mod_lt _ (by decide)
+    have hsum_mod :
+        (((offsetBits % 2 ^ 64) * (elemStride % 2 ^ 64)) % 2 ^ 64 + bd) % 2 ^ 64 = 0 := by
+      have hprod_eq :
+          ((offsetBits % 2 ^ 64) * (elemStride % 2 ^ 64)) % 2 ^ 64 =
+            (off * elemStride) % 2 ^ 64 := by
+        rw [hoff_eq, ← Nat.mul_mod, Nat.mod_mul_mod]
+      rw [hprod_eq, hbd_eq, ← Nat.add_mod, ← Nat.add_mul,
+        Nat.add_sub_of_le (Nat.le_of_lt hoff_lt), Nat.mul_mod_right]
+    generalize ((offsetBits % 2 ^ 64) * (elemStride % 2 ^ 64)) % 2 ^ 64 = prodMod
+      at hprod_lt hsum_mod ⊢
+    cases Nat.eq_zero_or_pos bd with
+    | inl hbd0 =>
+      have hp0 : prodMod = 0 := by
+        rw [hbd0, Nat.add_zero, Nat.mod_eq_of_lt hprod_lt] at hsum_mod
+        exact hsum_mod
+      rw [hbd0, Nat.sub_zero, hp0, Nat.add_mod_right]
+      simp only [Nat.add_zero, Nat.mod_mod]
+    | inr hbd_pos =>
+      have hsum_eq : prodMod + bd = 2 ^ 64 := by
+        have hlt2 : prodMod + bd < 2 * 2 ^ 64 := by omega
+        have hge1 : 2 ^ 64 ≤ prodMod + bd := by
+          cases Nat.lt_or_ge (prodMod + bd) (2 ^ 64) with
+          | inl hlt => rw [Nat.mod_eq_of_lt hlt] at hsum_mod; omega
+          | inr hge => exact hge
+        have hsub_lt : prodMod + bd - 2 ^ 64 < 2 ^ 64 := by omega
+        have hmod2 : (prodMod + bd) % 2 ^ 64 = prodMod + bd - 2 ^ 64 := by
+          conv => lhs; rw [show prodMod + bd = (prodMod + bd - 2 ^ 64) + 2 ^ 64 by omega]
+          rw [Nat.add_mod_right, Nat.mod_eq_of_lt hsub_lt]
+        omega
+      have hsub_eq : 2 ^ 64 - bd = prodMod := by omega
+      rw [hsub_eq, Nat.add_mod, Nat.mod_eq_of_lt hprod_lt]
+
+/-- Exact UB biconditional for `evalSliceSizeOfVal`: fails iff `lenSc.sizeBytes ≠ 8` or
+`elemSizeBytes * (lenSc.bits % 2^64) ≥ 2^63` (`isize::MAX + 1`). -/
+theorem evalSliceSizeOfVal_eq_none_iff (elemSizeBytes : Nat) (lenSc : ScalarInt) :
+    evalSliceSizeOfVal elemSizeBytes lenSc = none ↔
+      lenSc.sizeBytes ≠ 8 ∨ 2 ^ 63 ≤ elemSizeBytes * (BitVec.ofNat 64 lenSc.bits).toNat := by
+  unfold evalSliceSizeOfVal
+  cases h8 : Nat.beq lenSc.sizeBytes 8 with
+  | false =>
+    have hne : lenSc.sizeBytes ≠ 8 := fun h => by rw [h] at h8; cases h8
+    exact ⟨fun _ => Or.inl hne, fun _ => rfl⟩
+  | true =>
+    have he8 : lenSc.sizeBytes = 8 := Nat.eq_of_beq_eq_true h8
+    dsimp only
+    have hhalf : signedHalfModulus 8 = 2 ^ 63 := Anneal.Scalars.signedHalfModulus_eq_two_pow (by decide)
+    rw [hhalf, wrapScalarBits_eq_toNat, natMul_eq]
+    cases hble : Nat.ble (2 ^ 63) (elemSizeBytes * (BitVec.ofNat 64 lenSc.bits).toNat) with
+    | true =>
+      exact ⟨fun _ => Or.inr (Nat.le_of_ble_eq_true hble), fun _ => rfl⟩
+    | false =>
+      have hlt : elemSizeBytes * (BitVec.ofNat 64 lenSc.bits).toNat < 2 ^ 63 := by
+        cases Nat.lt_or_ge (elemSizeBytes * (BitVec.ofNat 64 lenSc.bits).toNat) (2 ^ 63) with
+        | inl h => exact h
+        | inr h => rw [Nat.ble_eq_true_of_le h] at hble; cases hble
+      refine ⟨(fun h => nomatch h), fun h => ?_⟩
+      rcases h with h | h
+      · exact absurd he8 h
+      · omega
+
+/-- Positive-path value bridge for `evalSliceSizeOfVal`: whenever `elemSizeBytes * len < 2^63`,
+`evalSliceSizeOfVal` returns `Anneal.BitVec.mul (BitVec.ofNat 64 elemSizeBytes) (BitVec.ofNat 64 lenBits)`
+with `msb = false` (`≤ isize::MAX`). -/
+theorem evalSliceSizeOfVal_eq_mul {elemSizeBytes lenBits : Nat}
+    (hlt : elemSizeBytes * (BitVec.ofNat 64 lenBits).toNat < 2 ^ 63) :
+    let prod := Anneal.BitVec.mul (BitVec.ofNat 64 elemSizeBytes) (BitVec.ofNat 64 lenBits)
+    evalSliceSizeOfVal elemSizeBytes ⟨lenBits, 8⟩ = some ⟨prod.toNat, 8⟩ ∧
+      prod.toNat = elemSizeBytes * (BitVec.ofNat 64 lenBits).toNat ∧
+      Anneal.BitVecArith.msb prod = false := by
+  have hlt64 : elemSizeBytes * (BitVec.ofNat 64 lenBits).toNat < 2 ^ 64 := by omega
+  have hhalf : signedHalfModulus 8 = 2 ^ 63 := Anneal.Scalars.signedHalfModulus_eq_two_pow (by decide)
+  have hble : Nat.ble (2 ^ 63) (elemSizeBytes * (BitVec.ofNat 64 lenBits).toNat) = false := by
+    cases h : Nat.ble (2 ^ 63) (elemSizeBytes * (BitVec.ofNat 64 lenBits).toNat) with
+    | false => rfl
+    | true => have := Nat.le_of_ble_eq_true h; omega
+  have htoNat :
+      (Anneal.BitVec.mul (BitVec.ofNat 64 elemSizeBytes) (BitVec.ofNat 64 lenBits)).toNat =
+        elemSizeBytes * (BitVec.ofNat 64 lenBits).toNat := by
+    rw [Anneal.BitVec.toNat_mul, natMod_eq, natPow_eq]
+    conv => lhs; arg 1; arg 1; rw [_root_.BitVec.toNat_ofNat]
+    rw [Nat.mod_mul_mod, Nat.mod_eq_of_lt hlt64]
+  have hmsb :
+      Anneal.BitVecArith.msb
+        (Anneal.BitVec.mul (BitVec.ofNat 64 elemSizeBytes) (BitVec.ofNat 64 lenBits)) = false := by
+    rw [msb_eq_core, _root_.BitVec.msb_eq_toNat, htoNat]
+    exact decide_eq_false (by omega)
+  refine ⟨?_, htoNat, hmsb⟩
+  unfold evalSliceSizeOfVal
+  dsimp only
+  rw [hhalf, wrapScalarBits_eq_toNat, natMul_eq, hble, htoNat]
+
+/-- Unsigned interval transfer through `evalSliceSizeOfVal`: if `lenSc ∈ [lo, hi]` and
+`elemSizeBytes * hi.toNat < 2^63`, then `evalSliceSizeOfVal` succeeds within
+`[elemSizeBytes * lo.toNat, elemSizeBytes * hi.toNat]` (and `< 2^63`). -/
+theorem scalarRange_evalSliceSizeOfVal {elemSizeBytes : Nat} {lo hi : BitVec 64} {lenSc : ScalarInt}
+    (hlen : ScalarRange 8 lo hi lenSc)
+    (hfit : elemSizeBytes * hi.toNat < 2 ^ 63) :
+    ∃ r, evalSliceSizeOfVal elemSizeBytes lenSc = some r ∧
+      ScalarRange 8 (BitVec.ofNat 64 (elemSizeBytes * lo.toNat))
+        (BitVec.ofNat 64 (elemSizeBytes * hi.toNat)) r ∧
+      r.bits < 2 ^ 63 := by
+  obtain ⟨lb, rfl, hlb, hlo, hhi⟩ := scalarRange_exists hlen
+  have hlt : elemSizeBytes * (BitVec.ofNat 64 lb).toNat < 2 ^ 63 :=
+    Nat.lt_of_le_of_lt (Nat.mul_le_mul_left elemSizeBytes hhi) hfit
+  obtain ⟨heval, htoNat, _⟩ := evalSliceSizeOfVal_eq_mul hlt
+  have hlohi : lo.toNat ≤ hi.toNat := Nat.le_trans hlo hhi
+  have hlo64 : elemSizeBytes * lo.toNat < 2 ^ 64 := by
+    have : elemSizeBytes * lo.toNat ≤ elemSizeBytes * hi.toNat := Nat.mul_le_mul_left _ hlohi
+    omega
+  have hhi64 : elemSizeBytes * hi.toNat < 2 ^ 64 := by omega
+  have hlo_eq : (BitVec.ofNat 64 (elemSizeBytes * lo.toNat)).toNat = elemSizeBytes * lo.toNat := by
+    rw [_root_.BitVec.toNat_ofNat, Nat.mod_eq_of_lt hlo64]
+  have hhi_eq : (BitVec.ofNat 64 (elemSizeBytes * hi.toNat)).toNat = elemSizeBytes * hi.toNat := by
+    rw [_root_.BitVec.toNat_ofNat, Nat.mod_eq_of_lt hhi64]
+  refine ⟨_, heval, scalarRange_of_bitVec _ ?_ ?_, ?_⟩
+  · show (BitVec.ofNat 64 (elemSizeBytes * lo.toNat)).toNat ≤
+      (Anneal.BitVec.mul (BitVec.ofNat 64 elemSizeBytes) (BitVec.ofNat 64 lb)).toNat
+    rw [hlo_eq, htoNat]
+    exact Nat.mul_le_mul_left elemSizeBytes hlo
+  · show (Anneal.BitVec.mul (BitVec.ofNat 64 elemSizeBytes) (BitVec.ofNat 64 lb)).toNat ≤
+      (BitVec.ofNat 64 (elemSizeBytes * hi.toNat)).toNat
+    rw [htoNat, hhi_eq]
+    exact Nat.mul_le_mul_left elemSizeBytes hhi
+  · rw [htoNat]; exact hlt
+
+/-- Chunking distributivity for `FixedByteCodec.listFixed`: splitting `(listFixed k c).encode xs`
+into `n`-byte chunks (`0 < n`) recovers `xs.val.map c.encode`. -/
+theorem chunksOf_listFixed_encode {α : Type} {n : Nat} (k : Nat) (c : FixedByteCodec α n)
+    (hn : 0 < n) (xs : { xs : List α // xs.length = k }) :
+    Anneal.ListChunks.chunksOf n ((FixedByteCodec.listFixed k c).encode xs) =
+      xs.val.map c.encode :=
+  chunksOf_encodeElems c hn xs.val
+
+/-- Exact agreement between `(FixedByteCodec.listFixed k c).decode` and `Anneal.ListChunks.chunksOf`. -/
+theorem listFixed_decode_eq_chunksOf {α : Type} {n : Nat} (k : Nat) (c : FixedByteCodec α n)
+    (hn : 0 < n) (bs : List AbstractByte) :
+    ((FixedByteCodec.listFixed k c).decode bs).map Subtype.val =
+      if bs.length = k * n then
+        sequenceOptions ((Anneal.ListChunks.chunksOf n bs).map c.decode)
+      else none :=
+  decodeChunks_eq_chunksOf c hn k bs
+
+/-- Chunking distributivity for `FixedByteCodec.array`: splitting `(array k c).encode v` into
+`n`-byte chunks (`0 < n`) recovers `v.toList.map c.encode`. -/
+theorem chunksOf_array_encode {α : Type} {n : Nat} (k : Nat) (c : FixedByteCodec α n)
+    (hn : 0 < n) (v : Vector α k) :
+    Anneal.ListChunks.chunksOf n ((FixedByteCodec.array k c).encode v) =
+      v.toList.map c.encode :=
+  chunksOf_encodeElems c hn v.toList
+
+/-- Exact agreement between `(FixedByteCodec.array k c).decode` and `Anneal.ListChunks.chunksOf`
+(for every `k : Nat`, including `k = 0`). -/
+theorem array_decode_eq_chunksOf {α : Type} {n : Nat} (k : Nat) (c : FixedByteCodec α n)
+    (hn : 0 < n) (bs : List AbstractByte) :
+    ((FixedByteCodec.array k c).decode bs).map Vector.toList =
+      if bs.length = k * n then
+        sequenceOptions ((Anneal.ListChunks.chunksOf n bs).map c.decode)
+      else none := by
+  rw [← decodeChunks_eq_chunksOf c hn k bs]
+  show (((c.decodeChunks k bs).map
+    (fun xs => Vector.mk xs.val.toArray (by rw [List.size_toArray, xs.property]))).map
+      Vector.toList) = (c.decodeChunks k bs).map Subtype.val
+  cases c.decodeChunks k bs with
+  | none => rfl
+  | some xs => simp [Vector.toList]
+
+/-- All four codec well-formedness properties (`IsExactWidth`, `IsInitCodec`,
+`IsSurjectiveInitDecoder`, `HasZeroValid`) lift to `FixedByteCodec.array k (bitVecLE sz hNz)` at
+every array length `k` (including `k = 0`). -/
+theorem bitVecLE_array_wf (sz : Nat) (hNz : 0 < sz) (k : Nat) :
+    let c := FixedByteCodec.array k (bitVecLE sz hNz)
+    c.IsExactWidth ∧ c.IsInitCodec ∧ c.IsSurjectiveInitDecoder ∧ c.HasZeroValid :=
+  ⟨FixedByteCodec.array_isExactWidth k _,
+   FixedByteCodec.array_isInitCodec k (bitVecLE_isInitCodec sz hNz),
+   FixedByteCodec.array_isSurjectiveInitDecoder k (bitVecLE_isSurjectiveInitDecoder sz hNz),
+   FixedByteCodec.array_hasZeroValid k (bitVecLE_hasZeroValid sz hNz)⟩
 
 end Anneal.BitVecScalarsBridge
