@@ -1862,6 +1862,154 @@ theorem canary1_core_unchecked_witness :
         (⟨0xFF, 1⟩ : ScalarInt).bits) = true :=
   ⟨by decide, by decide, by decide⟩
 
+/-! ### 4.6 Remaining Core Intrinsics (`evalUnchecked{Div,Rem,Shl,Shr}`, `evalExactDiv`,
+`evalScalarExactDiv`, `evalBitreverse`) and `ctpop` Algebraic Canaries -/
+
+/-- Canary 1s (`evalUncheckedDiv`, `evalUncheckedRem`, `evalExactDiv` and `evalScalarExactDiv`):
+- on canonical scalars (including `sz = 0`), `evalUnchecked{Div,Rem}` match `evalBinOp .{div,rem}`
+  identically across both signednesses (including `i32::MIN / -1` and div-by-zero UB);
+- unsigned interval transfers bound `evalUncheckedDiv` and `evalUncheckedRem`;
+- `evalExactDiv` on arbitrary (even non-canonical) inputs equals `Anneal.BitVec.udiv`, satisfies
+  exact inverse multiplication `q * b' = a'`, and lifts operationally to `evalScalarExactDiv`,
+  while non-divisible pairs trigger `.ub`. -/
+theorem canary1_unchecked_div_rem_and_exactDiv {a b ea eb : Nat}
+    (ha : a < scalarModulus 4) (hb : b < scalarModulus 4) (isSigned : Bool)
+    (x y : ScalarInt) (locals : List LocalSlot) (mem : Memory)
+    (hx : ScalarRange 4 (BitVec.ofNat 32 100) (BitVec.ofNat 32 500) x)
+    (hy : ScalarRange 4 (BitVec.ofNat 32 5) (BitVec.ofNat 32 10) y)
+    (hebz : BitVec.ofNat 32 eb ≠ BitVec.ofNat 32 0)
+    (hdvd : (BitVec.ofNat 32 ea).toNat % (BitVec.ofNat 32 eb).toNat = 0) :
+    evalUncheckedDiv ⟨a, 4⟩ ⟨b, 4⟩ isSigned =
+        Anneal.Scalars.evalBinOp .div ⟨a, 4⟩ ⟨b, 4⟩ isSigned ∧
+      evalUncheckedRem ⟨a, 4⟩ ⟨b, 4⟩ isSigned =
+        Anneal.Scalars.evalBinOp .rem ⟨a, 4⟩ ⟨b, 4⟩ isSigned ∧
+      evalUncheckedDiv ⟨0, 0⟩ ⟨0, 0⟩ isSigned =
+        Anneal.Scalars.evalBinOp .div ⟨0, 0⟩ ⟨0, 0⟩ isSigned ∧
+      evalUncheckedDiv ⟨0x80000000, 4⟩ ⟨0xFFFFFFFF, 4⟩ true = none ∧
+      (∃ q, evalUncheckedDiv x y false = some q ∧
+        ScalarRange 4 (BitVec.ofNat 32 10) (BitVec.ofNat 32 100) q) ∧
+      (∃ r, evalUncheckedRem x y false = some r ∧
+        ScalarRange 4 (BitVec.ofNat 32 0) (BitVec.ofNat 32 9) r) ∧
+      (let a' := BitVec.ofNat 32 ea
+       let b' := BitVec.ofNat 32 eb
+       let q := Anneal.BitVec.udiv a' b'
+       evalExactDiv ⟨ea, 4⟩ ⟨eb, 4⟩ false = some ⟨q.toNat, 4⟩ ∧
+         Anneal.BitVec.mul q b' = a' ∧
+         evalScalarExactDiv ⟨ea, 4⟩ ⟨eb, 4⟩ locals mem false =
+           .ok (.scalar ⟨q.toNat, 4⟩) locals mem) ∧
+      evalExactDiv ⟨10, 4⟩ ⟨3, 4⟩ false = none ∧
+      evalScalarExactDiv ⟨10, 4⟩ ⟨3, 4⟩ locals mem false = .ub := by
+  have ⟨hq, hmul⟩ := evalExactDiv_unsigned_eq_udiv (sz := 4) (by decide) ea eb hebz hdvd
+  have hok := (evalScalarExactDiv_eq_ok_iff ⟨ea, 4⟩ ⟨eb, 4⟩ locals mem false _).2 hq
+  have hbad : evalExactDiv ⟨10, 4⟩ ⟨3, 4⟩ false = none :=
+    (evalExactDiv_unsigned_eq_none_iff ⟨10, 4⟩ ⟨3, 4⟩).2 (Or.inr (Or.inr (Or.inr (by decide))))
+  have hub := (evalScalarExactDiv_eq_ub_iff ⟨10, 4⟩ ⟨3, 4⟩ locals mem false).2 hbad
+  exact ⟨evalUncheckedDiv_eq_evalBinOp ha hb isSigned,
+    evalUncheckedRem_eq_evalBinOp ha hb isSigned,
+    evalUncheckedDiv_eq_evalBinOp (sz := 0) (by decide) (by decide) isSigned,
+    rfl,
+    scalarRange_evalUncheckedDiv_unsigned (by decide) hx hy (by decide),
+    scalarRange_evalUncheckedRem_unsigned (by decide) hx hy (by decide),
+    ⟨hq, hmul, hok⟩,
+    hbad,
+    hub⟩
+
+/-- Satisfiability witness for `canary1_unchecked_div_rem_and_exactDiv` (using a non-canonical
+`ea = 2^32 + 42` to witness wrapping in `evalExactDiv`). -/
+theorem canary1_unchecked_div_rem_and_exactDiv_witness :
+    100 < scalarModulus 4 ∧ 7 < scalarModulus 4 ∧
+      ScalarRange 4 (BitVec.ofNat 32 100) (BitVec.ofNat 32 500) ⟨250, 4⟩ ∧
+      ScalarRange 4 (BitVec.ofNat 32 5) (BitVec.ofNat 32 10) ⟨8, 4⟩ ∧
+      BitVec.ofNat 32 6 ≠ BitVec.ofNat 32 0 ∧
+      (BitVec.ofNat 32 (2 ^ 32 + 42)).toNat % (BitVec.ofNat 32 6).toNat = 0 :=
+  ⟨by decide, by decide,
+    ⟨rfl, by decide, by decide, by decide⟩,
+    ⟨rfl, by decide, by decide, by decide⟩,
+    by decide, by decide⟩
+
+/-- Canary 1t (positive-path `evalUnchecked{Shl,Shr}` value/tnum/`evalBinOp` bridges, `evalBitreverse`
+zero-width rejection, canonicality asymmetry counterexample, and `ctpop` algebraic identities):
+- `evalUncheckedShl` matches `evalBinOp .shlUnchecked` even on non-canonical `lhs` (`⟨256, 1⟩`),
+  whereas unsigned `evalUncheckedShr` differs on `⟨256, 1⟩ >>> 1` (`0` vs `128`), proving `ha` is
+  strictly necessary for unsigned right shifts;
+- `ScalarTnum` transfers cleanly through `evalUncheckedShl` and both unsigned/signed `evalUncheckedShr`;
+- `ctpopLoop` obeys inclusion-exclusion (`or + and`), XOR popcount (`xor + 2 * and`), disjoint-mask
+  additivity (`and = 0 → ctpop(or) = ctpop + ctpop`), Brian Kernighan's clear-lowest-set-bit step
+  (`x ≠ 0 → ctpop(x &&& (x - 1)) + 1 = ctpop(x)`), and exact `lowMask` popcount (`k ≤ w`). -/
+theorem canary1_unchecked_shifts_and_ctpop_algebra {a b k : Nat}
+    (ha : a < scalarModulus 4) (hb : b < scalarModulus 1) (hk : k ≤ 32)
+    (lhsIsSigned : Bool) (x : ScalarInt) (m v : BitVec 32)
+    (hx : ScalarTnum 4 m v x) (hsh : wrapScalarBits b (scalarModulus 1) < 32)
+    (u w1 w2 nz : BitVec 32) (z : BitVec 0)
+    (hdisj : Anneal.BitVec.and w1 w2 = BitVec.ofNat 32 0)
+    (hnz : nz ≠ BitVec.ofNat 32 0) :
+    evalUncheckedShl ⟨a, 4⟩ ⟨b, 1⟩ false =
+        Anneal.Scalars.evalBinOp .shlUnchecked ⟨a, 4⟩ ⟨b, 1⟩ lhsIsSigned ∧
+      evalUncheckedShr ⟨a, 4⟩ ⟨b, 1⟩ lhsIsSigned false =
+        Anneal.Scalars.evalBinOp .shrUnchecked ⟨a, 4⟩ ⟨b, 1⟩ lhsIsSigned ∧
+      evalUncheckedShl ⟨256, 1⟩ ⟨1, 1⟩ false =
+        Anneal.Scalars.evalBinOp .shlUnchecked ⟨256, 1⟩ ⟨1, 1⟩ false ∧
+      evalUncheckedShr ⟨256, 1⟩ ⟨1, 1⟩ false false ≠
+        Anneal.Scalars.evalBinOp .shrUnchecked ⟨256, 1⟩ ⟨1, 1⟩ false ∧
+      evalUncheckedShl ⟨a, 4⟩ ⟨32, 1⟩ false = none ∧
+      evalUncheckedShr ⟨a, 4⟩ ⟨32, 1⟩ lhsIsSigned false = none ∧
+      evalBitreverse ⟨a, 0⟩ = none ∧
+      (∃ r, evalUncheckedShl x ⟨b, 1⟩ false = some r ∧
+        ScalarTnum 4 (Anneal.BitVec.shl m (wrapScalarBits b (scalarModulus 1)))
+          (Anneal.BitVec.shl v (wrapScalarBits b (scalarModulus 1))) r) ∧
+      (∃ r, evalUncheckedShr x ⟨b, 1⟩ false false = some r ∧
+        ScalarTnum 4 (Anneal.BitVec.ushr m (wrapScalarBits b (scalarModulus 1)))
+          (Anneal.BitVec.ushr v (wrapScalarBits b (scalarModulus 1))) r) ∧
+      (∃ r, evalUncheckedShr x ⟨b, 1⟩ true false = some r ∧
+        ScalarTnum 4 (Anneal.BitVecArith.ashr m (wrapScalarBits b (scalarModulus 1)))
+          (Anneal.BitVecArith.ashr v (wrapScalarBits b (scalarModulus 1))) r) ∧
+      Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop 32 (Anneal.BitVec.or u w1).toNat +
+          Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop 32 (Anneal.BitVec.and u w1).toNat =
+        Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop 32 u.toNat +
+          Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop 32 w1.toNat ∧
+      Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop 32 (Anneal.BitVec.xor u w1).toNat +
+          2 * Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop 32 (Anneal.BitVec.and u w1).toNat =
+        Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop 32 u.toNat +
+          Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop 32 w1.toNat ∧
+      Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop 32 (Anneal.BitVec.or w1 w2).toNat =
+        Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop 32 w1.toNat +
+          Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop 32 w2.toNat ∧
+      Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop 32
+          (Anneal.BitVec.and nz (nz - BitVec.ofNat 32 1)).toNat + 1 =
+        Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop 32 nz.toNat ∧
+      Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop 32 (Anneal.BitVec.lowMask 32 k).toNat = k ∧
+      Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop 0 (Anneal.BitVec.or z z).toNat =
+        Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop 0 z.toNat +
+          Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop 0 z.toNat :=
+  ⟨evalUncheckedShl_eq_evalBinOp a hb lhsIsSigned false (Or.inl rfl),
+    evalUncheckedShr_eq_evalBinOp ha hb lhsIsSigned false (Or.inl rfl),
+    evalUncheckedShl_eq_evalBinOp 256 (by decide) false false (Or.inl rfl),
+    (fun h => nomatch h),
+    (evalUncheckedShl_eq_none_iff _ _ _).2 (Or.inr (Or.inr (Or.inr (by dsimp only; decide)))),
+    (evalUncheckedShr_eq_none_iff _ _ _ _).2 (Or.inr (Or.inr (Or.inr (by dsimp only; decide)))),
+    (evalBitreverse_eq_none_iff _).2 rfl,
+    scalarTnum_evalUncheckedShl (by decide) (by decide) b false hx (Or.inl rfl) hsh,
+    scalarTnum_evalUncheckedShr_unsigned (by decide) (by decide) b false hx (Or.inl rfl) hsh,
+    scalarTnum_evalUncheckedShr_signed (by decide) (by decide) b false hx (Or.inl rfl) hsh,
+    ctpopLoop_or_add_and u w1,
+    ctpopLoop_xor_add_two_mul_and u w1,
+    ctpopLoop_or_disjoint hdisj,
+    ctpopLoop_and_sub_one hnz,
+    ctpopLoop_lowMask hk,
+    ctpopLoop_or_disjoint (show Anneal.BitVec.and z z = BitVec.ofNat 0 0 from
+      Anneal.BitVec.eq_of_toNat_eq (by omega))⟩
+
+/-- Satisfiability witness for `canary1_unchecked_shifts_and_ctpop_algebra`. -/
+theorem canary1_unchecked_shifts_and_ctpop_algebra_witness :
+    0x1234 < scalarModulus 4 ∧ 5 < scalarModulus 1 ∧ 12 ≤ 32 ∧
+      wrapScalarBits 5 (scalarModulus 1) < 32 ∧
+      ScalarTnum 4 0x00FF00FF#32 0x12003400#32 ⟨0x12563478, 4⟩ ∧
+      Anneal.BitVec.and 0x0F0F0F0F#32 0xF0F0F0F0#32 = BitVec.ofNat 32 0 ∧
+      (0x1020#32 : BitVec 32) ≠ BitVec.ofNat 32 0 :=
+  ⟨by decide, by decide, by decide, by decide,
+    ⟨rfl, by decide, rfl⟩,
+    rfl, by decide⟩
+
 /-! ## 5. Axiom Audit Guards
 
 Every declaration of `Anneal.BitVecScalarsBridge` (theorems, definitions and instances) and every
@@ -3837,6 +3985,142 @@ theorem and definition of this file is pinned to its exact axiom set. All sets a
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecScalarsBridge.evalThreeWayCompare_eq_evalBinOp_cmp
 
+/-- info: 'Anneal.BitVecScalarsBridge.evalBitreverse_eq_none_iff' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalBitreverse_eq_none_iff
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalUncheckedDiv_eq_evalBinOp' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalUncheckedDiv_eq_evalBinOp
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalUncheckedRem_eq_evalBinOp' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalUncheckedRem_eq_evalBinOp
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalUncheckedDiv_unsigned_eq_udiv' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalUncheckedDiv_unsigned_eq_udiv
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalUncheckedRem_unsigned_eq_urem' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalUncheckedRem_unsigned_eq_urem
+
+/-- info: 'Anneal.BitVecScalarsBridge.scalarRange_evalUncheckedDiv_unsigned' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.scalarRange_evalUncheckedDiv_unsigned
+
+/-- info: 'Anneal.BitVecScalarsBridge.scalarRange_evalUncheckedRem_unsigned' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.scalarRange_evalUncheckedRem_unsigned
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalUncheckedShl_eq_none_iff' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalUncheckedShl_eq_none_iff
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalUncheckedShr_eq_none_iff' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalUncheckedShr_eq_none_iff
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalUncheckedShl_eq_shl' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalUncheckedShl_eq_shl
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalUncheckedShr_unsigned_eq_ushr' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalUncheckedShr_unsigned_eq_ushr
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalUncheckedShr_signed_eq_ashr' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalUncheckedShr_signed_eq_ashr
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalUncheckedShl_eq_evalBinOp' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalUncheckedShl_eq_evalBinOp
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalUncheckedShr_eq_evalBinOp' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalUncheckedShr_eq_evalBinOp
+
+/-- info: 'Anneal.BitVecScalarsBridge.scalarTnum_evalUncheckedShl' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.scalarTnum_evalUncheckedShl
+
+/-- info: 'Anneal.BitVecScalarsBridge.scalarTnum_evalUncheckedShr_unsigned' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.scalarTnum_evalUncheckedShr_unsigned
+
+/-- info: 'Anneal.BitVecScalarsBridge.scalarTnum_evalUncheckedShr_signed' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.scalarTnum_evalUncheckedShr_signed
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalExactDiv_unsigned_eq_none_iff' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalExactDiv_unsigned_eq_none_iff
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalExactDiv_unsigned_eq_udiv' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalExactDiv_unsigned_eq_udiv
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalScalarExactDiv_eq_ok_iff' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalScalarExactDiv_eq_ok_iff
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalScalarExactDiv_eq_ub_iff' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalScalarExactDiv_eq_ub_iff
+
+/-- info: 'Anneal.BitVecScalarsBridge.lor_div_two' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.lor_div_two
+
+/-- info: 'Anneal.BitVecScalarsBridge.land_div_two' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.land_div_two
+
+/-- info: 'Anneal.BitVecScalarsBridge.xor_div_two' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.xor_div_two
+
+/-- info: 'Anneal.BitVecScalarsBridge.mod_two_eq_ite_testBit_zero' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.mod_two_eq_ite_testBit_zero
+
+/-- info: 'Anneal.BitVecScalarsBridge.ctpopLoop_lor_add_land' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.ctpopLoop_lor_add_land
+
+/-- info: 'Anneal.BitVecScalarsBridge.ctpopLoop_or_add_and' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.ctpopLoop_or_add_and
+
+/-- info: 'Anneal.BitVecScalarsBridge.ctpopLoop_xor_add_two_mul_land' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.ctpopLoop_xor_add_two_mul_land
+
+/-- info: 'Anneal.BitVecScalarsBridge.ctpopLoop_xor_add_two_mul_and' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.ctpopLoop_xor_add_two_mul_and
+
+/-- info: 'Anneal.BitVecScalarsBridge.ctpopLoop_or_disjoint' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.ctpopLoop_or_disjoint
+
+/-- info: 'Anneal.BitVecScalarsBridge.ctpopLoop_land_sub_one' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.ctpopLoop_land_sub_one
+
+/-- info: 'Anneal.BitVecScalarsBridge.ctpopLoop_and_sub_one' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.ctpopLoop_and_sub_one
+
+/-- info: 'Anneal.BitVecScalarsBridge.ctpopLoop_two_pow_sub_one' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.ctpopLoop_two_pow_sub_one
+
+/-- info: 'Anneal.BitVecScalarsBridge.ctpopLoop_lowMask' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.ctpopLoop_lowMask
+
 /-- info: 'Anneal.BitVecAndLeBytesBridgeTests.ctlz_width_zero' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecAndLeBytesBridgeTests.ctlz_width_zero
@@ -4276,5 +4560,21 @@ theorem and definition of this file is pinned to its exact axiom set. All sets a
 /-- info: 'Anneal.BitVecAndLeBytesBridgeTests.canary1_core_unchecked_witness' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecAndLeBytesBridgeTests.canary1_core_unchecked_witness
+
+/-- info: 'Anneal.BitVecAndLeBytesBridgeTests.canary1_unchecked_div_rem_and_exactDiv' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecAndLeBytesBridgeTests.canary1_unchecked_div_rem_and_exactDiv
+
+/-- info: 'Anneal.BitVecAndLeBytesBridgeTests.canary1_unchecked_div_rem_and_exactDiv_witness' does not depend on any axioms -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecAndLeBytesBridgeTests.canary1_unchecked_div_rem_and_exactDiv_witness
+
+/-- info: 'Anneal.BitVecAndLeBytesBridgeTests.canary1_unchecked_shifts_and_ctpop_algebra' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecAndLeBytesBridgeTests.canary1_unchecked_shifts_and_ctpop_algebra
+
+/-- info: 'Anneal.BitVecAndLeBytesBridgeTests.canary1_unchecked_shifts_and_ctpop_algebra_witness' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecAndLeBytesBridgeTests.canary1_unchecked_shifts_and_ctpop_algebra_witness
 
 end Anneal.BitVecAndLeBytesBridgeTests
