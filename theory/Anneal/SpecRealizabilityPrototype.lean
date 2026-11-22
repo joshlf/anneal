@@ -1020,6 +1020,117 @@ theorem exists_dichotomyBeyond_conj_not_moduloPair :
       have h₁ : (ok.1 = true) = (bad.1 = true) := congrArg Prod.fst heq
       hbad (h₁.mp hok)⟩
 
+/--
+Empty fibres contribute no dichotomy: to refute `DichotomyModuloObservation`,
+only *inhabited* fibres (`∃ inp out, pre inp ∧ obs inp out = b`) need an
+output-insensitive cofactor. Fixing a boilerplate atom that is provably
+constant (`True` or `False`, such as `callFramePreserved m m`) therefore
+discards only an empty fibre without losing completeness.
+-/
+theorem not_dichotomyModuloObservation_of_inhabited_cofactors_insensitive
+    {Obs : Type w} {obs : Input → Output → Obs}
+    (cof : Obs → Input → Output → Prop)
+    (h_cof : ∀ inp out, pre inp → (post inp out ↔ cof (obs inp out) inp out))
+    (h_ins : ∀ b, (∃ inp out, pre inp ∧ obs inp out = b) →
+      OutputInsensitive pre (cof b)) :
+    ¬ DichotomyModuloObservation obs pre post :=
+  fun ⟨inp, ok, bad, hp, heq, hok, hbad⟩ =>
+    hbad ((h_cof inp bad hp).mpr
+      (heq ▸ h_ins (obs inp ok) ⟨inp, ok, hp, rfl⟩ inp ok bad hp
+        ((h_cof inp ok hp).mp hok)))
+
+/--
+Strengthening a postcondition preserves dichotomy modulo `obs` whenever an
+admissible input has an accepted output of the stronger postcondition and a
+rejected output of the weaker one that share their observation.
+-/
+theorem dichotomyModuloObservation_preserved_under_strengthening
+    {Obs : Type w} {obs : Input → Output → Obs}
+    {pre' : Input → Prop} {post' : Input → Output → Prop}
+    (h_str : ∀ inp out, pre' inp → post' inp out → post inp out)
+    (h_wit : ∃ inp out_ok out_bad,
+      pre' inp ∧ obs inp out_ok = obs inp out_bad ∧
+        post' inp out_ok ∧ ¬ post inp out_bad) :
+    DichotomyModuloObservation obs pre' post' :=
+  let ⟨inp, ok, bad, hp', heq, hok', hbad⟩ := h_wit
+  ⟨inp, ok, bad, hp', heq, hok', fun h => hbad (h_str inp bad hp' h)⟩
+
+/-! ### Disjunctive preconditions and empty-wrapped outputs -/
+
+/-- Realizability distributes over a disjunctive precondition. -/
+theorem contractRealizable_or_pre_iff {pre₁ pre₂ : Input → Prop} :
+    ContractRealizable (fun inp => pre₁ inp ∨ pre₂ inp) post ↔
+      ContractRealizable pre₁ post ∨ ContractRealizable pre₂ post :=
+  ⟨fun ⟨inp, out, hp, hq⟩ =>
+      hp.elim (fun h₁ => .inl ⟨inp, out, h₁, hq⟩)
+        (fun h₂ => .inr ⟨inp, out, h₂, hq⟩),
+    fun h => h.elim (fun ⟨inp, out, h₁, hq⟩ => ⟨inp, out, .inl h₁, hq⟩)
+      (fun ⟨inp, out, h₂, hq⟩ => ⟨inp, out, .inr h₂, hq⟩)⟩
+
+/--
+Postcondition dichotomy distributes over a disjunctive precondition: a guarded
+postcondition has a dichotomy under `pre₁ ∨ pre₂` iff it has one under `pre₁`
+or under `pre₂`.
+-/
+theorem postconditionDichotomy_or_pre_iff {pre₁ pre₂ : Input → Prop} :
+    PostconditionDichotomy (fun inp => pre₁ inp ∨ pre₂ inp) post ↔
+      PostconditionDichotomy pre₁ post ∨ PostconditionDichotomy pre₂ post :=
+  ⟨fun ⟨inp, ok, bad, hp, hok, hbad⟩ =>
+      hp.elim (fun h₁ => .inl ⟨inp, ok, bad, h₁, hok, hbad⟩)
+        (fun h₂ => .inr ⟨inp, ok, bad, h₂, hok, hbad⟩),
+    fun h => h.elim
+      (fun ⟨inp, ok, bad, h₁, hok, hbad⟩ => ⟨inp, ok, bad, .inl h₁, hok, hbad⟩)
+      (fun ⟨inp, ok, bad, h₂, hok, hbad⟩ => ⟨inp, ok, bad, .inr h₂, hok, hbad⟩)⟩
+
+/-- Dichotomy modulo an observation distributes over a disjunctive precondition. -/
+theorem dichotomyModuloObservation_or_pre_iff
+    {Obs : Type w} {obs : Input → Output → Obs} {pre₁ pre₂ : Input → Prop} :
+    DichotomyModuloObservation obs (fun inp => pre₁ inp ∨ pre₂ inp) post ↔
+      DichotomyModuloObservation obs pre₁ post ∨
+        DichotomyModuloObservation obs pre₂ post :=
+  ⟨fun ⟨inp, ok, bad, hp, heq, hok, hbad⟩ =>
+      hp.elim (fun h₁ => .inl ⟨inp, ok, bad, h₁, heq, hok, hbad⟩)
+        (fun h₂ => .inr ⟨inp, ok, bad, h₂, heq, hok, hbad⟩),
+    fun h => h.elim
+      (fun ⟨inp, ok, bad, h₁, heq, hok, hbad⟩ =>
+        ⟨inp, ok, bad, .inl h₁, heq, hok, hbad⟩)
+      (fun ⟨inp, ok, bad, h₂, heq, hok, hbad⟩ =>
+        ⟨inp, ok, bad, .inr h₂, heq, hok, hbad⟩)⟩
+
+/-- Any empty element type makes `Option α` a subsingleton, refuting dichotomy. -/
+theorem not_dichotomy_of_option_empty {α : Type v} (h_empty : α → False)
+    {post : Input → Option α → Prop} :
+    ¬ PostconditionDichotomy pre post :=
+  not_dichotomy_of_subsingleton_output fun a b =>
+    match a, b with
+    | none, none => rfl
+    | some x, _ => (h_empty x).elim
+    | _, some y => (h_empty y).elim
+
+/-- Any empty element type makes `List α` a subsingleton, refuting dichotomy. -/
+theorem not_dichotomy_of_list_empty {α : Type v} (h_empty : α → False)
+    {post : Input → List α → Prop} :
+    ¬ PostconditionDichotomy pre post :=
+  not_dichotomy_of_subsingleton_output fun a b =>
+    match a, b with
+    | [], [] => rfl
+    | x :: _, _ => (h_empty x).elim
+    | _, y :: _ => (h_empty y).elim
+
+/--
+When the left summand of `Sum α β` is empty, only `.inr` values exist, so
+insensitivity on `.inr` values already refutes dichotomy.
+-/
+theorem not_dichotomy_of_sum_empty_left {α β : Type v} (h_empty : α → False)
+    {post : Input → Sum α β → Prop}
+    (h : ∀ inp b₁ b₂, pre inp → (post inp (.inr b₁) ↔ post inp (.inr b₂))) :
+    ¬ PostconditionDichotomy pre post :=
+  not_dichotomy_of_input_only fun inp o₁ o₂ hp =>
+    match o₁, o₂ with
+    | .inl x, _ => (h_empty x).elim
+    | _, .inl y => (h_empty y).elim
+    | .inr b₁, .inr b₂ => h inp b₁ b₂ hp
+
 /-! ### Mutation-testing bridge -/
 
 /--
@@ -2145,24 +2256,27 @@ constrains its designated output binders.
   `y` not in `t`.
 
 An output is *bound* when its type is not a subsingleton (by instance, by
-proof, or structurally: at most one constructor can build a value, as for
-`Option Empty`, `List Empty`, and structures over such types), it still occurs
-in the residual, a bounded, `sorry`-free proof search (`rfl`, `omega`,
+proof, or structurally with recursive emptiness: at most one constructor can
+build a value, covering `Option Empty`, `List Empty`, `Option (Empty × Nat)`,
+`Option (Sum Empty Empty)`, `Option (Fin 0)`, `Option { n : Nat // n < 0 }`,
+`Option (Unit → Empty)`, and structures over such types), it still occurs in
+the residual, a bounded, `sorry`-free proof search (`rfl`, `omega`,
 `simp +arith`, `decide`, `infer_instance`, `subst_vars`, `grind`, top-level
-`Iff` splitting, existential witness search — over `Nat` including `v / 2` and
-`List` including `[]`/`List.replicate` for a leading `∃`, behind a `∀`/`→`
-prefix, and by Herbrand expansion of `Nat` existentials nested in positive
-positions —, nested subformula probing, and single-step unfolding of small
-non-recursive output helpers) can neither discharge the subformulas mentioning
-it nor prove the residual insensitive to it, and a case split on its
-constructors (for an inductive output with two to eight of them, skipping those
-that need a value of an empty type) does not reduce the postcondition to one
-proposition free of it. All rewrites are equivalences, so a postcondition
-reported as not binding an output is semantically insensitive to that output;
-a postcondition reported as binding may still be vacuous in a way the search
-does not see (for example behind an `opaque` or `irreducible` definition, a
-fact needing induction or nonlinear arithmetic, or an existential whose
-witness is not among the candidates).
+`Iff` splitting including existential witness search via `underHyp`,
+existential witness search — over `Nat` including `v / 2`, `Int` including
+`Int.ediv v 2`, and `List` including `[]`/`List.replicate` for a leading `∃`,
+behind a `∀`/`→` prefix, and by Herbrand expansion of `Nat`/`Int` existentials
+nested in positive positions —, nested subformula probing, and single-step
+unfolding of small non-recursive output helpers) can neither discharge the
+subformulas mentioning it nor prove the residual insensitive to it, and a case
+split on its constructors (for an inductive output with two to eight of them,
+skipping those that need a value of an empty type) does not reduce the
+postcondition to one proposition free of it. All rewrites are equivalences, so
+a postcondition reported as not binding an output is semantically insensitive
+to that output; a postcondition reported as binding may still be vacuous in a
+way the search does not see (for example behind an `opaque` or `irreducible`
+definition, a fact needing induction or nonlinear arithmetic, or an
+existential whose witness is not among the candidates).
 
 **Relative to the precondition.** `PostconditionDichotomy pre post` ranges over
 admissible inputs, and an `ensures` clause that binds its output in general
@@ -2172,12 +2286,14 @@ may bind nothing on them (`requires(x < 10) ensures(x >= 10 ==> ret == 5)`,
 `preExpr?`), it is first checked for unsatisfiability via the shared
 `refuteUnderExists` and empty-domain check (keeping `checkRequiresSatisfiable`
 and `checkEnsuresBindsOutput` consistent), and what the passes above leave
-bound is then re-examined under it: its existentials are opened, its equations
-rewrite the residual with typechecked substitution, constructor case splitting
-is re-run on the rewritten residual, and its remaining facts are premises of
-the proof search. The verdicts `requiresUnsatisfiable`, `vacuousUnderRequires`,
-and `unrealizableUnderRequires` are the ones that needed it;
-`useRequires := false` judges the postcondition alone.
+bound is then re-examined under it: top-level disjunctive preconditions are
+split (`postconditionDichotomy_or_pre_iff`), existentials are opened, equations
+rewrite the residual (and implication guards rewrite precondition facts) with
+typechecked substitution, constructor case splitting is re-run on the rewritten
+residual, and remaining facts feed both `grind` and existential witness search.
+The verdicts `requiresUnsatisfiable`, `vacuousUnderRequires`, and
+`unrealizableUnderRequires` are the ones that needed it; `useRequires := false`
+judges the postcondition alone.
 
 **User `ensures` mode.** The one deliberate projection is `userEnsuresOnly`
 (and the `bindsBeyondBoilerplate` field), which asks whether the clause still
@@ -2194,17 +2310,21 @@ replacing boilerplate predicates independently by syntactic polarity (which
 collapses `frame → ret = 1`, `if frame then ret = 1 else ret = 2`, and
 `¬(frame ∧ ret ≠ 1)` to `True`, while missing `frame ↔ retTy`), the checker
 normalises with boilerplate kept opaque and then evaluates the cofactors over
-**all** truth assignments `{True, False}^k` to the distinct closed boilerplate
-atoms occurring in the residual (with a zero-cost fast path whenever no
-boilerplate constant was encountered). An output is bound beyond boilerplate
-iff some cofactor constrains it
-(`not_dichotomyModuloObservation_of_cofactors_insensitive`). The assignments
-are never sampled, since the one cofactor carrying a dichotomy can be any of
-them; past eight atoms, or when a cofactor cannot be judged, the verdict is the
-conservative *binds*. By convention every closed application of a boilerplate
-predicate is an observation, including one at other arguments than the
-contract's own (`callFramePreserved emptyMemory memAfter`): a clause built
-from such atoms alone is reported `boilerplateOnly`.
+**all** feasible truth assignments `{True, False}^k` to the distinct closed
+boilerplate atoms occurring in the residual (skipping empty fibres where an
+atom is provably constant, such as `callFramePreserved m m = True`, justified
+by `not_dichotomyModuloObservation_of_inhabited_cofactors_insensitive`, and
+short-circuiting at zero cost whenever no boilerplate constant was seen).
+Replacement descends into `.lam`, `.letE`, and `.mdata` so boilerplate inside
+`match` alternatives is substituted as well. An output is bound beyond
+boilerplate iff it is bound in the full analysis and some feasible cofactor
+constrains it (`not_dichotomyModuloObservation_of_cofactors_insensitive`). The
+assignments are never sampled, since the one cofactor carrying a dichotomy can
+be any of them; past eight atoms, or when a cofactor cannot be judged, the
+verdict is the conservative *binds*. By convention every closed application of
+a boilerplate predicate is an observation, including one at other arguments
+than the contract's own (`callFramePreserved emptyMemory memAfter`): a clause
+built from such atoms alone is reported `boilerplateOnly`.
 
 **`MirCallAns`.** When the single output binder has type `MirCallAns`, the
 postcondition is instantiated at `.returned retVal memAfter`, `.panicked
@@ -2710,21 +2830,43 @@ def matchingFVars (e α : Expr) : MetaM (Array Expr) := do
       out := out.push fvar
   return out
 
+/-- Collect up to 3 distinct `Nat` literals `2 ≤ n ≤ 1024` occurring in `e`. -/
+partial def collectNatLits (e : Expr) (acc : Array Nat := #[]) : Array Nat :=
+  if acc.size ≥ 3 then
+    acc
+  else
+    match e.rawNatLit? <|> e.nat? with
+    | some n =>
+      if n > 1 && n ≤ 1024 && !acc.contains n then acc.push n else acc
+    | none =>
+      match e with
+      | .app f a => collectNatLits a (collectNatLits f acc)
+      | .lam _ d b _ | .forallE _ d b _ => collectNatLits b (collectNatLits d acc)
+      | .letE _ t v b _ =>
+        collectNatLits b (collectNatLits v (collectNatLits t acc))
+      | .mdata _ b | .proj _ _ b => collectNatLits b acc
+      | _ => acc
+
 /--
 Candidate `Nat` witnesses built from the `Nat` variables occurring in `e`: `0`,
-each variable `v`, `v + 1`, `v - 1`, `v / 2`, the sum of all and its successor,
-and for two variables their truncated differences (and predecessors).
+every bare variable `v` first (so later variables are never starved by derived
+terms of earlier ones), then `v + 1`, `v - 1`, `v / 2`, `v - k` for small
+literals `k` in `e`, the sum of all and its successor, and for two variables
+their truncated differences (and predecessors).
 -/
 def natWitnessCandidates (e : Expr) : MetaM (Array Expr) := do
   let fvars ← matchingFVars e (mkConst ``Nat)
-  let mut cands : Array Expr := #[mkNatLit 0]
+  let lits := collectNatLits e
+  let mut cands : Array Expr := #[mkNatLit 0] ++ fvars
   for v in fvars do
-    cands := cands.push v
     cands := cands.push (mkNatAdd v (mkNatLit 1))
     cands := cands.push (mkNatSub v (mkNatLit 1))
     if let some half ← safely (do
         return some (← mkAppM ``HDiv.hDiv #[v, mkNatLit 2])) none then
       cands := cands.push half
+  for v in fvars.extract 0 2 do
+    for n in lits.extract 0 2 do
+      cands := cands.push (mkNatSub v (mkNatLit n))
   if fvars.size ≥ 2 then
     let sum := fvars.foldl (fun acc v => mkNatAdd acc v) (mkNatLit 0)
     cands := cands.push sum
@@ -2735,27 +2877,78 @@ def natWitnessCandidates (e : Expr) : MetaM (Array Expr) := do
       cands := cands.push (mkNatSub (mkNatSub v w) (mkNatLit 1))
   return cands
 
+/-- Canonical `Int` numeral `n` via `OfNat.ofNat`. -/
+def mkIntConst (n : Nat) : MetaM Expr :=
+  mkAppOptM ``OfNat.ofNat #[some (mkConst ``Int), some (mkRawNatLit n), none]
+
 /--
-Herbrand strengthening. Each existential `∃ y : Nat, P y` in a *positive*
-position of `e` (under `∧`, `∨`, a universal binder, or the conclusion of an
-implication) is replaced by the finite disjunction `P w₁ ∨ … ∨ P wₙ` over
-candidate witnesses. Positive positions are monotone, so the result implies
-`e`: proving it proves `e`, and nothing is concluded when it is not proved.
-Hypotheses, negations, and equivalences are left untouched.
+Candidate `Int` witnesses built from the `Int` variables occurring in `e`: `0`,
+every bare variable `v` first, then `v + 1`, `v - 1`, `-v`, Euclidean half
+`v / 2` (which satisfies `r = 2 * q ∨ r = 2 * q + 1` for negative and
+non-negative integers alike), sums, and differences.
 -/
-partial def herbrandNat (e : Expr) (fuel : Nat := 2) : MetaM Expr := do
+def intWitnessCandidates (e : Expr) : MetaM (Array Expr) := do
+  let fvars ← matchingFVars e (mkConst ``Int)
+  let some zero ← safely (do return some (← mkIntConst 0)) none | return fvars
+  let some one ← safely (do return some (← mkIntConst 1)) none | return #[zero] ++ fvars
+  let two? ← safely (do return some (← mkIntConst 2)) none
+  let mut cands : Array Expr := #[zero] ++ fvars
+  for v in fvars do
+    if let some vp1 ← safely (do return some (← mkAppM ``HAdd.hAdd #[v, one])) none then
+      cands := cands.push vp1
+    if let some vm1 ← safely (do return some (← mkAppM ``HSub.hSub #[v, one])) none then
+      cands := cands.push vm1
+    if let some nv ← safely (do return some (← mkAppM ``Neg.neg #[v])) none then
+      cands := cands.push nv
+    if let some two := two? then
+      if let some half ← safely (do return some (← mkAppM ``HDiv.hDiv #[v, two])) none then
+        cands := cands.push half
+  if fvars.size ≥ 2 then
+    if let some sum ← safely (do
+        let mut s := zero
+        for v in fvars do
+          s ← mkAppM ``HAdd.hAdd #[s, v]
+        return some s) none then
+      cands := cands.push sum
+      if let some sp1 ← safely (do return some (← mkAppM ``HAdd.hAdd #[sum, one])) none then
+        cands := cands.push sp1
+  if fvars.size == 2 then
+    for (v, w) in #[(fvars[0]!, fvars[1]!), (fvars[1]!, fvars[0]!)] do
+      if let some d ← safely (do return some (← mkAppM ``HSub.hSub #[v, w])) none then
+        cands := cands.push d
+        if let some dm1 ← safely (do return some (← mkAppM ``HSub.hSub #[d, one])) none then
+          cands := cands.push dm1
+  return cands
+
+/--
+Herbrand strengthening over `Nat` and `Int`. Each existential `∃ y : Nat/Int, P y`
+in a *positive* position of `e` (under `∧`, `∨`, a universal binder, or the
+conclusion of an implication) is replaced by the finite disjunction
+`P w₁ ∨ … ∨ P wₙ` over candidate witnesses. Positive positions are monotone, so
+the result implies `e`: proving it proves `e`, and nothing is concluded when it
+is not proved. Hypotheses, negations, and equivalences are left untouched.
+-/
+partial def herbrandArith (e : Expr) (fuel : Nat := 2) : MetaM Expr := do
   match e.getAppFnArgs with
   | (``And, #[a, b]) =>
-    return mkApp2 (mkConst ``And) (← herbrandNat a fuel) (← herbrandNat b fuel)
+    return mkApp2 (mkConst ``And) (← herbrandArith a fuel) (← herbrandArith b fuel)
   | (``Or, #[a, b]) =>
-    return mkApp2 (mkConst ``Or) (← herbrandNat a fuel) (← herbrandNat b fuel)
+    return mkApp2 (mkConst ``Or) (← herbrandArith a fuel) (← herbrandArith b fuel)
   | (``Exists, #[α, p]) =>
-    if fuel == 0 || !(← safely (whnfR α) α).isConstOf ``Nat then
+    if fuel == 0 then
       return e
-    let cands := (← natWitnessCandidates p).extract 0 (if fuel ≥ 2 then 16 else 3)
+    let αn ← safely (whnfR α) α
+    let cands ←
+      if αn.isConstOf ``Nat then
+        natWitnessCandidates p
+      else if αn.isConstOf ``Int then
+        intWitnessCandidates p
+      else
+        return e
+    let cands := cands.extract 0 (if fuel ≥ 2 then 16 else 4)
     let mut out? : Option Expr := none
     for w in cands do
-      let inst ← herbrandNat (p.beta #[w]) (fuel - 1)
+      let inst ← herbrandArith (p.beta #[w]) (fuel - 1)
       out? := some <|
         match out? with
         | none => inst
@@ -2764,20 +2957,24 @@ partial def herbrandNat (e : Expr) (fuel : Nat := 2) : MetaM Expr := do
   | _ =>
     if e.isForall then
       forallBoundedTelescope e (some 1) fun xs body => do
-        mkForallFVars xs (← herbrandNat body fuel)
+        mkForallFVars xs (← herbrandArith body fuel)
     else
       return e
 
 /--
 `tryProveCore`, augmented with a sound witness search for existentials:
 
-* a leading `∃ y : α, P y` (`Nat`: `0`, local variables, `v + 1`, `v / 2`, and
-  sum plus one; `List β`: `[]`, local variables, and `List.replicate v default`
-  when `Inhabited β` synthesizes; otherwise local variables);
+* a leading `∃ y : α, P y` (`Nat`: `natWitnessCandidates`; `Int`:
+  `intWitnessCandidates`; `List β`: `[]`, local variables, and
+  `List.replicate v default` when `Inhabited β` synthesizes; otherwise local
+  variables);
+* a top-level `Iff a b`: split via `underHyp a b` and `underHyp b a` so
+  existentials on both sides of an insensitivity equivalence can be witnessed;
 * a `∀`/`→` prefix in front of an existential (`∀ a, ∃ b, a + r ≤ b`): the
   binders are introduced and the search continues on the conclusion;
-* existentials over `Nat` nested under `∧`/`∨`/`→`/`∀` (`r = 0 ∨ ∃ y, r = y + 1`,
-  `(∃ k, r = 2 * k) ∨ ∃ k, r = 2 * k + 1`): `herbrandNat`.
+* existentials over `Nat` or `Int` nested under `∧`/`∨`/`→`/`∀`
+  (`r = 0 ∨ ∃ y, r = y + 1`, `(∃ k : Int, r = 2 * k) ∨ ∃ k : Int, r = 2 * k + 1`):
+  `herbrandArith`.
 
 Every instance is proved by `tryProveCore` and kernel-checked, and each of the
 goals attempted implies the original one, so this cannot introduce false
@@ -2789,35 +2986,30 @@ partial def tryProve (goal : Expr) (heartbeats : Nat) (deep : Bool := false)
     return true
   if let (``Exists, #[α, p]) := goal.getAppFnArgs then
     let αn ← safely (whnfR α) α
-    let fvars ← matchingFVars p αn
-    let mut cands : Array Expr := #[]
-    if αn.isConstOf ``Nat then
-      cands := cands.push (mkNatLit 0)
-      for v in fvars do
-        cands := cands.push v
-        cands := cands.push (mkNatAdd v (mkNatLit 1))
-        if let some half ← safely (do
-            return some (← mkAppM ``HDiv.hDiv #[v, mkNatLit 2])) none then
-          cands := cands.push half
-      if fvars.size ≥ 2 then
-        let sum := fvars.foldl (fun acc v => mkNatAdd acc v) (mkNatLit 0)
-        cands := cands.push (mkNatAdd sum (mkNatLit 1))
-    else if let (``List, #[β]) := αn.getAppFnArgs then
-      if let some nilE ← safely (do return some (← mkAppOptM ``List.nil #[some β])) none then
-        cands := cands.push nilE
-      cands := cands ++ fvars
-      if let some dflt ← safely (do
-          let u ← getLevel β
-          let inst ← synthInstance (mkApp (mkConst ``Inhabited [u]) β)
-          return some (mkApp2 (mkConst ``Inhabited.default [u]) β inst)) none then
-        let natFVars ← matchingFVars p (mkConst ``Nat)
-        for v in natFVars do
-          if let some repE ← safely (do
-              return some (← mkAppM ``List.replicate #[v, dflt])) none then
-            cands := cands.push repE
-    else
-      cands := fvars
-    let cap := if exFuel > 0 then 12 else 4
+    let cands ←
+      if αn.isConstOf ``Nat then
+        natWitnessCandidates p
+      else if αn.isConstOf ``Int then
+        intWitnessCandidates p
+      else if let (``List, #[β]) := αn.getAppFnArgs then
+        let fvars ← matchingFVars p αn
+        let mut cs : Array Expr := #[]
+        if let some nilE ← safely (do return some (← mkAppOptM ``List.nil #[some β])) none then
+          cs := cs.push nilE
+        cs := cs ++ fvars
+        if let some dflt ← safely (do
+            let u ← getLevel β
+            let inst ← synthInstance (mkApp (mkConst ``Inhabited [u]) β)
+            return some (mkApp2 (mkConst ``Inhabited.default [u]) β inst)) none then
+          let natFVars ← matchingFVars p (mkConst ``Nat)
+          for v in natFVars do
+            if let some repE ← safely (do
+                return some (← mkAppM ``List.replicate #[v, dflt])) none then
+              cs := cs.push repE
+        pure cs
+      else
+        matchingFVars p αn
+    let cap := if exFuel > 0 then 14 else 5
     let mut tried := 0
     for w in cands do
       if tried ≥ cap then
@@ -2831,6 +3023,13 @@ partial def tryProve (goal : Expr) (heartbeats : Nat) (deep : Bool := false)
           tryProveCore inst heartbeats false
       if ok then
         return true
+  else if let (``Iff, #[a, b]) := goal.getAppFnArgs then
+    if exFuel > 0 then
+      let hasEx (sub : Expr) : Bool := sub.isAppOf ``Exists
+      if (a.find? hasEx).isSome || (b.find? hasEx).isSome then
+        if (← tryProve (← underHyp a b) heartbeats false exFuel) &&
+            (← tryProve (← underHyp b a) heartbeats false exFuel) then
+          return true
   else if goal.isForall then
     let found ← safely (forallTelescope goal fun _ body => do
       if body.isAppOf ``Exists then
@@ -2839,14 +3038,14 @@ partial def tryProve (goal : Expr) (heartbeats : Nat) (deep : Bool := false)
         return false) false
     if found then
       return true
-  -- Existentials over `Nat` anywhere in a positive position.
-  let natExists (sub : Expr) : Bool :=
+  -- Existentials over `Nat` or `Int` anywhere in a positive position.
+  let arithExists (sub : Expr) : Bool :=
     match sub.getAppFnArgs with
-    | (``Exists, #[α, _]) => α.isConstOf ``Nat
+    | (``Exists, #[α, _]) => α.isConstOf ``Nat || α.isConstOf ``Int
     | _ => false
-  if exFuel > 0 && (goal.find? natExists).isSome then
-    let strengthened ← safely (herbrandNat goal) goal
-    if strengthened != goal && sizeUpTo 4001 strengthened ≤ 4000 then
+  if exFuel > 0 && (goal.find? arithExists).isSome then
+    let strengthened ← safely (herbrandArith goal) goal
+    if strengthened != goal && sizeUpTo 2501 strengthened ≤ 2500 then
       if ← safely (do check strengthened; return true) false then
         return ← tryProveCore strengthened heartbeats false
   return false
@@ -2900,34 +3099,103 @@ def knownTwoInhabitants (α : Expr) : MetaM Bool := do
       return (← synthInstance? (mkApp (mkConst ``Nonempty [u]) βn)).isSome) false
   | _ => return false
 
-/-- Whether `ty` reduces to an inductive type without constructors. -/
-def isEmptyInductive (ty : Expr) : MetaM Bool :=
+/--
+Recursive emptiness check for types: detects constructorless inductives
+(`Empty`, `PEmpty`, `False`), inductives where every constructor requires a
+field of an empty type (`Empty × Nat`, `Sum Empty Empty`), arrows from a known-
+nonempty domain into an empty codomain (`Unit → Empty`), and — when
+`semanticProbe` is enabled — tactic-provable emptiness (`Fin 0`,
+`{ n : Nat // n < 0 }`).
+-/
+partial def isEmptyType (ty : Expr) (semanticProbe : Bool) (heartbeats : Nat)
+    (fuel : Nat := 3) : MetaM Bool :=
   safely (do
-    let ty ← whnf ty
-    let .const n _ := ty.getAppFn | return false
-    let some (.inductInfo ind) := (← getEnv).find? n | return false
-    return ind.ctors.isEmpty) false
+    let tyn ← whnfR ty
+    if isKnownNonempty tyn then
+      return false
+    if ← safely (do
+        let u ← getLevel tyn
+        return (← synthInstance? (mkApp (mkConst ``Nonempty [u]) tyn)).isSome) false then
+      return false
+    let tyw ← whnf tyn
+    match tyw with
+    | .forallE _ dom body _ =>
+      if !body.hasLooseBVars && fuel > 0 then
+        let domNonempty ← do
+          let domn ← safely (whnfR dom) dom
+          if isKnownNonempty domn then
+            pure true
+          else
+            safely (do
+              let u ← getLevel domn
+              return (← synthInstance? (mkApp (mkConst ``Nonempty [u]) domn)).isSome) false
+        if domNonempty then
+          if ← isEmptyType body semanticProbe heartbeats (fuel - 1) then
+            return true
+    | _ =>
+      if let .const n lvls := tyw.getAppFn then
+        if let some (.inductInfo ind) := (← getEnv).find? n then
+          if ind.ctors.isEmpty then
+            return true
+          if ind.numIndices == 0 && fuel > 0 && ind.ctors.length ≤ 8 then
+            let mut allDead := true
+            let mut anyTriviallyLive := false
+            for c in ind.ctors do
+              let ctor := mkAppN (mkConst c lvls) tyw.getAppArgs
+              let (dead, trivLive) ← forallTelescopeReducing (← inferType ctor) fun fields _ => do
+                let mut d := false
+                let mut allKn := true
+                for f in fields do
+                  let fTy ← inferType f
+                  if ← isEmptyType fTy semanticProbe heartbeats (fuel - 1) then
+                    d := true
+                    allKn := false
+                    break
+                  if allKn then
+                    let fTyn ← safely (whnfR fTy) fTy
+                    unless isKnownNonempty fTyn do
+                      allKn := false
+                return (d, !d && allKn)
+              if trivLive then
+                anyTriviallyLive := true
+              if !dead then
+                allDead := false
+                if anyTriviallyLive then
+                  break
+            if allDead then
+              return true
+            if anyTriviallyLive then
+              return false
+    if semanticProbe then
+      let notInhab := mkForall `x .default tyn (mkConst ``False)
+      let tac ← `(tactic|
+        first | (intro x; cases x) | (intros; omega) | (simp +arith; done))
+      return ← runTacticClosed notInhab heartbeats tac
+    return false) false
 
 /--
 Whether the constructor application `ctor` (parameters supplied) has a field of
-a constructorless type (`Empty`, `PEmpty`, `False`, ...), together with its
-number of fields. Such a constructor builds no value: `some : Empty → Option
-Empty`, `List.cons : Empty → List Empty → List Empty`.
+an empty type (`Empty`, `Empty × Nat`, `Fin 0`, `Unit → Empty`, ...), together
+with its number of fields. Such a constructor builds no value.
 -/
-def ctorFieldInfo (ctor : Expr) : MetaM (Bool × Nat) :=
+def ctorFieldInfo (ctor : Expr) (semanticProbe : Bool := false)
+    (heartbeats : Nat := 0) : MetaM (Bool × Nat) :=
   safely (do
     forallTelescopeReducing (← inferType ctor) fun fields _ => do
-      let dead ← fields.anyM fun f => do isEmptyInductive (← inferType f)
+      let dead ← fields.anyM fun f => do
+        isEmptyType (← inferType f) semanticProbe heartbeats
       return (dead, fields.size)) (false, 1)
 
 /--
 Structural subsingleton test: at most one constructor of the inductive type
-`α` can build a value, and each of its fields ranges over a proposition or a
-type that passes the same test (to depth `fuel`). This covers `Option Empty`,
-`List Empty`, `Empty`, `Unit`, a one-constant enumeration, and structures over
-such types.
+`α` can build a value (skipping constructors with a recursively empty field),
+and each of its fields ranges over a proposition or a type that passes the same
+test (to depth `fuel`). Covers `Option Empty`, `List Empty`, `Option (Empty × Nat)`,
+`Option (Sum Empty Empty)`, `Option (Fin 0)`, `Option { n : Nat // n < 0 }`,
+`Option (Unit → Empty)`, `Empty`, `Unit`, and structures over such types.
 -/
-partial def inductiveAtMostOne (α : Expr) (fuel : Nat := 3) : MetaM Bool :=
+partial def inductiveAtMostOne (α : Expr) (semanticProbe : Bool := false)
+    (heartbeats : Nat := 0) (fuel : Nat := 3) : MetaM Bool :=
   safely (do
     if ← isProp α then
       return true
@@ -2942,12 +3210,13 @@ partial def inductiveAtMostOne (α : Expr) (fuel : Nat := 3) : MetaM Bool :=
       -- `none`: builds no value; `some ok`: builds one, `ok` iff at most one.
       let verdict? ← forallTelescopeReducing (← inferType ctor) fun fields _ => do
         for f in fields do
-          if ← isEmptyInductive (← inferType f) then
+          if ← isEmptyType (← inferType f) semanticProbe heartbeats (fuel - 1) then
             return none
         for f in fields do
           if fuel == 0 then
             return some false
-          unless ← inductiveAtMostOne (← inferType f) (fuel - 1) do
+          unless ← inductiveAtMostOne (← inferType f) semanticProbe heartbeats
+              (fuel - 1) do
             return some false
         return some true
       match verdict? with
@@ -2957,8 +3226,9 @@ partial def inductiveAtMostOne (α : Expr) (fuel : Nat := 3) : MetaM Bool :=
     return live ≤ 1) false
 
 /--
-Whether `α` has at most one inhabitant (`Subsingleton α`, proof irrelevance, or
-— when `semanticProbe` is enabled — a direct proof of `∀ a b : α, a = b`).
+Whether `α` has at most one inhabitant (`Subsingleton α`, proof irrelevance,
+structural `inductiveAtMostOne`, or — when `semanticProbe` is enabled — a direct
+proof of `∀ a b : α, a = b`).
 -/
 def typeSubsingleton (α : Expr) (semanticProbe : Bool) (heartbeats : Nat) :
     MetaM Bool := do
@@ -2966,7 +3236,7 @@ def typeSubsingleton (α : Expr) (semanticProbe : Bool) (heartbeats : Nat) :
     return true
   if ← knownTwoInhabitants α then
     return false
-  if ← inductiveAtMostOne α then
+  if ← inductiveAtMostOne α semanticProbe heartbeats then
     return true
   let hasInst ← safely (do
     let u ← getLevel α
@@ -2981,24 +3251,16 @@ def typeSubsingleton (α : Expr) (semanticProbe : Bool) (heartbeats : Nat) :
   return false
 
 /-- Whether `ty` is provably empty (`∀ x : ty, False`). -/
-def isEmptyDomain (ty : Expr) (heartbeats : Nat) : MetaM Bool := do
-  let tyn ← safely (whnfR ty) ty
-  if isKnownNonempty tyn then
-    return false
-  if ← safely (do
-      let u ← getLevel tyn
-      return (← synthInstance? (mkApp (mkConst ``Nonempty [u]) tyn)).isSome) false then
-    return false
-  let notInhab := mkForall `x .default tyn (mkConst ``False)
-  let tac ← `(tactic|
-    first | (intro x; cases x) | (intros; omega) | (simp +arith; done))
-  runTacticClosed notInhab heartbeats tac
+def isEmptyDomain (ty : Expr) (heartbeats : Nat) : MetaM Bool :=
+  isEmptyType ty true heartbeats
 
 /--
 Whether `e` is a bare equation or disequation `o = t`, `t = o`, `¬(o = t)`, or
-`¬(t = o)` for a designated output `o` of a known multi-inhabitant type with
-`o` not free in `t`. Such a formula can never be universally true, universally
-false, or output-insensitive on any satisfiable precondition.
+`¬(t = o)` for a designated output `o` of a known multi-inhabitant type where
+`t` mentions **no** designated output at all. Requiring `t` to be free of every
+designated output ensures multi-output clauses such as
+`mem' = { mem with nextTag := f ret - f ret }` still run insensitivity checks
+on `ret`.
 -/
 def isBareOutputEq (outputs : Array Expr) (e : Expr) : MetaM Bool := do
   let core :=
@@ -3007,9 +3269,11 @@ def isBareOutputEq (outputs : Array Expr) (e : Expr) : MetaM Bool := do
     | _ => e
   let (``Eq, #[α, l, r]) := core.getAppFnArgs | return false
   let isOut (x : Expr) : Bool := x.isFVar && outputs.any (· == x)
+  let mentionsAny (x : Expr) : Bool :=
+    x.hasAnyFVar fun fv => outputs.any fun o => o.fvarId! == fv
   let matched :=
-    (isOut l && !r.containsFVar l.fvarId!) ||
-    (isOut r && !l.containsFVar r.fvarId!)
+    (isOut l && !mentionsAny r) ||
+    (isOut r && !mentionsAny l)
   if !matched then
     return false
   let αn ← safely (whnfR α) α
@@ -3167,6 +3431,15 @@ partial def replaceBoilerplateAtoms (atoms : Array Expr) (mask : Nat)
       else
         return .forallE n (← replaceBoilerplateAtoms atoms mask d)
           (← replaceBoilerplateAtoms atoms mask b) bi
+    | .lam n d b bi =>
+      -- All atoms in `atoms` are closed (`!hasLooseBVars`), so replacing inside
+      -- lambda bodies (such as `match`/`casesOn` alternatives) is
+      -- binder-depth-invariant.
+      return .lam n d (← replaceBoilerplateAtoms atoms mask b) bi
+    | .letE n t v b nd =>
+      return .letE n t v (← replaceBoilerplateAtoms atoms mask b) nd
+    | .mdata d b =>
+      return .mdata d (← replaceBoilerplateAtoms atoms mask b)
     | .app .. =>
       let args := e.getAppArgs
       let mut args' := args
@@ -3178,7 +3451,11 @@ partial def replaceBoilerplateAtoms (atoms : Array Expr) (mask : Nat)
           changed := true
       if changed then
         let cand := mkAppN e.getAppFn args'
-        if e.isAppOfArity ``Eq 3 || e.isAppOfArity ``Ne 3 then
+        let isMatchHead : Bool ←
+          match e.getAppFn with
+          | .const fn _ => pure ((← isMatcher fn) || isCasesOnRecursor (← getEnv) fn)
+          | _ => pure false
+        if e.isAppOfArity ``Eq 3 || e.isAppOfArity ``Ne 3 || isMatchHead then
           return cand
         if !cand.hasLooseBVars && (← safely (do check cand; return true) false) then
           return cand
@@ -4089,7 +4366,8 @@ where
       let ctor := mkAppN (mkConst ctorName lvls) ty.getAppArgs
       let some ctorTy ← safely (do return some (← inferType ctor)) none
         | return none
-      if (← ctorFieldInfo ctor).1 then
+      let cfg := (← read).cfg
+      if (← ctorFieldInfo ctor cfg.semanticProbe cfg.probeHeartbeats).1 then
         continue
       let r? ← forallTelescopeReducing ctorTy fun fields _ => do
         let inst := e.replace fun sub =>
@@ -4395,7 +4673,7 @@ def caseSplitOutput (cfg : EnsuresCheckConfig)
     for ctorName in ind.ctors do
       let ctor := mkAppN (mkConst ctorName lvls) ty.getAppArgs
       -- A constructor with a field of an empty type builds no output.
-      if (← ctorFieldInfo ctor).1 then
+      if (← ctorFieldInfo ctor cfg.semanticProbe cfg.probeHeartbeats).1 then
         continue
       let r? ← forallTelescopeReducing (← inferType ctor) fun fields _ => do
         let inst := body.replaceFVar o (mkAppN ctor fields)
@@ -4517,9 +4795,11 @@ def analyzeBody (cfg : EnsuresCheckConfig)
               insensitive := true
   -- Relative to the precondition: `PostconditionDichotomy pre post` ranges over
   -- admissible inputs only, so what is still bound is re-examined under the
-  -- (normalised) precondition `hyp`. Its existentials are opened, its equations
-  -- rewrite the residual (with kernel typechecking), constructor case splitting
-  -- is re-run on the rewritten residual, and remaining facts feed proof search.
+  -- (normalised) precondition `hyp`. Top-level disjunctions are split
+  -- (`postconditionDichotomy_or_pre_iff`), existentials are opened, equations
+  -- rewrite the residual (and implication guards rewrite precondition facts)
+  -- with kernel typechecking, constructor case splitting is re-run on the
+  -- rewritten residual, and remaining facts feed both `grind` and witness search.
   let mut requiresReason? : Option EnsuresVacuityReason := none
   if let some hyp := hyp? then
     if cfg.semanticProbe && cfg.useRequires && bound.any id && small res &&
@@ -4527,82 +4807,148 @@ def analyzeBody (cfg : EnsuresCheckConfig)
       let hb := cfg.probeHeartbeats
       let boundNow := bound
       let resNow := res
-      let (reason?, bound', decided?) ← openHyps [hyp] #[] #[] fun ws facts => do
-        let mut rewritten := resNow
-        let mut facts := facts
-        for idx in [0:facts.size] do
-          if let some (lhs, rhs) ← rewriteRule? facts[idx]! then
-            let rw (e : Expr) : MetaM Expr := do
-              let cand := e.replace fun sub => if sub == lhs then some rhs else none
-              if cand == e then
+      let rawDisjs := disjuncts hyp
+      let branches := if rawDisjs.size ≤ 4 then rawDisjs else #[hyp]
+      let evalBranch (hBranch : Expr) :
+          MetaM (Option EnsuresVacuityReason × Array Bool × Option Expr) :=
+        openHyps [hBranch] #[] #[] fun ws facts => do
+          let mut rewritten := resNow
+          let mut facts := facts
+          for idx in [0:facts.size] do
+            if let some (lhs, rhs) ← rewriteRule? facts[idx]! then
+              let rw (e : Expr) : MetaM Expr := do
+                let cand := e.replace fun sub => if sub == lhs then some rhs else none
+                if cand == e then
+                  return e
+                if ← safely (do check cand; return true) false then
+                  return cand
                 return e
-              if ← safely (do check cand; return true) false then
-                return cand
-              return e
-            rewritten ← rw rewritten
-            let mut facts' := facts
-            for j in [0:facts.size] do
-              if j != idx then
-                facts' := facts'.set! j (← rw facts[j]!)
-            facts := facts'
-        let resUnder ←
-          if rewritten == resNow then
-            pure resNow
-          else
-            let (r, _) ← ((do propSimplify (← simpProp rewritten)).run ctx).run {}
-            pure r
-        let wrap (g : Expr) : MetaM Expr :=
-          mkForallFVars ws (facts.foldr (fun f acc => mkForall `h .default f acc) g)
-        let prove (g : Expr) : MetaM Bool := do
-          if ← tryProveFast (← wrap g) hb then
-            return true
-          match g.getAppFnArgs with
-          | (``Iff, #[a, b]) =>
-            if (← tryProveFast (← wrap (mkForall `h .default a b)) hb) &&
-                (← tryProveFast (← wrap (mkForall `h .default b a)) hb) then
-              return true
-            tryProveGrind (← wrap g) hb
-          | _ => tryProveGrind (← wrap g) hb
-        let none' := Array.replicate outputs.size false
-        if isTrueConst resUnder || (← prove resUnder) then
-          return (some EnsuresVacuityReason.vacuousUnderRequires, none',
-            some (mkConst ``True))
-        if isFalseConst resUnder || (← prove (mkNot resUnder)) then
-          return (some EnsuresVacuityReason.unrealizableUnderRequires, none',
-            some (mkConst ``False))
-        let mut bound' := boundNow
-        let mut reason? : Option EnsuresVacuityReason := none
-        for i in [0:outputs.size] do
-          if bound'[i]! then
-            let o := outputs[i]!
-            if !resUnder.containsFVar o.fvarId! then
-              bound' := bound'.set! i false
-              reason? := some .vacuousUnderRequires
+              rewritten ← rw rewritten
+              let mut facts' := facts
+              for j in [0:facts.size] do
+                if j != idx then
+                  facts' := facts'.set! j (← rw facts[j]!)
+              facts := facts'
+          let resUnder ←
+            if rewritten == resNow then
+              pure resNow
             else
-              let mut splitHit := false
-              if resUnder != resNow then
-                if let some p ← caseSplitOutput cfg outputs i resUnder then
-                  if isTrueConst p then
-                    return (some EnsuresVacuityReason.vacuousUnderRequires, none',
-                      some (mkConst ``True))
-                  if isFalseConst p then
-                    return (some EnsuresVacuityReason.unrealizableUnderRequires, none',
-                      some (mkConst ``False))
-                  bound' := bound'.set! i false
-                  reason? := some .vacuousUnderRequires
-                  splitHit := true
-              if !splitHit then
-                let unbound ← withLocalDeclD `o' (← inferType o) fun o' =>
-                  prove (mkApp2 (mkConst ``Iff) resUnder
-                    (resUnder.replaceFVar o o'))
-                if unbound then
-                  bound' := bound'.set! i false
-                  reason? := some .vacuousUnderRequires
-        return (reason?, bound', none)
-      requiresReason? := reason?
-      bound := bound'
-      if let some decided := decided? then
-        res := decided
+              let (r, _) ← ((do propSimplify (← simpProp rewritten)).run ctx).run {}
+              pure r
+          let none' := Array.replicate outputs.size false
+          -- If `resUnder` is a non-dependent implication `ante → cons`, check
+          -- whether `ante`'s equations refute any precondition fact (such as a
+          -- `match` in `pre` whose scrutinee is pinned by `ante`).
+          if let .forallE _ ante cons _ := resUnder then
+            if !cons.hasLooseBVars && !facts.isEmpty then
+              let mut anteRules : Array (Expr × Expr) := #[]
+              for c in conjuncts ante do
+                if let some rule ← rewriteRule? c then
+                  anteRules := anteRules.push rule
+              if !anteRules.isEmpty then
+                let mut contradicted := false
+                for f in facts do
+                  let mut fRw := f
+                  for (lhs, rhs) in anteRules do
+                    let cand := fRw.replace fun sub =>
+                      if sub == lhs then some rhs else none
+                    if cand != fRw &&
+                        (← safely (do check cand; return true) false) then
+                      fRw := cand
+                  if fRw != f then
+                    let (fSimp, _) ← ((do propSimplify (← simpProp fRw)).run ctx).run {}
+                    if isFalseConst fSimp then
+                      contradicted := true
+                      break
+                if contradicted then
+                  return (some EnsuresVacuityReason.vacuousUnderRequires, none',
+                    some (mkConst ``True))
+          let wrap (g : Expr) : MetaM Expr :=
+            mkForallFVars ws (facts.foldr (fun f acc => mkForall `h .default f acc) g)
+          let hasEx (e : Expr) : Bool := (e.find? (·.isAppOf ``Exists)).isSome
+          let prove (g : Expr) : MetaM Bool := do
+            if ← tryProveFast (← wrap g) hb then
+              return true
+            match g.getAppFnArgs with
+            | (``Iff, #[a, b]) =>
+              if (← tryProveFast (← wrap (mkForall `h .default a b)) hb) &&
+                  (← tryProveFast (← wrap (mkForall `h .default b a)) hb) then
+                return true
+              if ← tryProveGrind (← wrap g) hb then
+                return true
+              if hasEx g then
+                return (← tryProve (← wrap (← underHyp a b)) hb false 1) &&
+                  (← tryProve (← wrap (← underHyp b a)) hb false 1)
+              return false
+            | _ =>
+              if ← tryProveGrind (← wrap g) hb then
+                return true
+              if hasEx g then
+                return ← tryProve (← wrap g) hb false 1
+              return false
+          if isTrueConst resUnder || (← prove resUnder) then
+            return (some EnsuresVacuityReason.vacuousUnderRequires, none',
+              some (mkConst ``True))
+          if isFalseConst resUnder || (← prove (mkNot resUnder)) then
+            return (some EnsuresVacuityReason.unrealizableUnderRequires, none',
+              some (mkConst ``False))
+          let mut bound' := boundNow
+          let mut reason? : Option EnsuresVacuityReason := none
+          for i in [0:outputs.size] do
+            if bound'[i]! then
+              let o := outputs[i]!
+              if !resUnder.containsFVar o.fvarId! then
+                bound' := bound'.set! i false
+                reason? := some .vacuousUnderRequires
+              else
+                let mut splitHit := false
+                if resUnder != resNow then
+                  if let some p ← caseSplitOutput cfg outputs i resUnder then
+                    if isTrueConst p then
+                      return (some EnsuresVacuityReason.vacuousUnderRequires, none',
+                        some (mkConst ``True))
+                    if isFalseConst p then
+                      return (some EnsuresVacuityReason.unrealizableUnderRequires, none',
+                        some (mkConst ``False))
+                    bound' := bound'.set! i false
+                    reason? := some .vacuousUnderRequires
+                    splitHit := true
+                if !splitHit then
+                  let unbound ← withLocalDeclD `o' (← inferType o) fun o' =>
+                    prove (mkApp2 (mkConst ``Iff) resUnder
+                      (resUnder.replaceFVar o o'))
+                  if unbound then
+                    bound' := bound'.set! i false
+                    reason? := some .vacuousUnderRequires
+          return (reason?, bound', none)
+      let mut boundAcc := Array.replicate outputs.size false
+      let mut allUnrealizable := true
+      let mut allDecidedTrue := true
+      let mut anyReason? : Option EnsuresVacuityReason := none
+      for hBranch in branches do
+        let (r?, b', dec?) ← evalBranch hBranch
+        for i in [0:outputs.size] do
+          if b'[i]! then
+            boundAcc := boundAcc.set! i true
+        if r? != some .unrealizableUnderRequires then
+          allUnrealizable := false
+        if !(dec?.map isTrueConst |>.getD false) then
+          allDecidedTrue := false
+        if anyReason?.isNone && r?.isSome then
+          anyReason? := r?
+        if boundAcc == boundNow then
+          break
+      bound := boundAcc
+      if !boundAcc.any id then
+        if allUnrealizable then
+          requiresReason? := some .unrealizableUnderRequires
+          res := mkConst ``False
+        else
+          requiresReason? := some .vacuousUnderRequires
+          if allDecidedTrue then
+            res := mkConst ``True
+      else if boundAcc != boundNow then
+        requiresReason? := anyReason?
   return {
     residual := res, bound, state := st, provedInsensitive := insensitive
     requiresReason? }
@@ -4632,13 +4978,40 @@ def maxCofactorAtoms : Nat := 8
 def maxCofactorAnalyses : Nat := 64
 
 /--
+Determine whether a closed boilerplate atom `a` is provably constant (`True` or
+`False`), meaning the opposite fibre is empty and can be skipped safely during
+cofactoring (`not_dichotomyModuloObservation_of_inhabited_cofactors_insensitive`).
+-/
+def atomFixedTruth? (cfg : EnsuresCheckConfig) (a : Expr) : MetaM (Option Bool) := do
+  if let (``callFramePreserved, #[m₁, m₂]) := a.getAppFnArgs then
+    if m₁ == m₂ ||
+        (← safely (withNewMCtxDepth <| withReducible <| isDefEq m₁ m₂) false) then
+      return some true
+  let ctx : Context := { cfg, outputs := #[], stripBoilerplate := false }
+  let (unfolded, _) ← ((do propSimplify (← simpProp a)).run ctx).run {}
+  if isTrueConst unfolded then
+    return some true
+  if isFalseConst unfolded then
+    return some false
+  if cfg.semanticProbe &&
+      sizeUpTo (cfg.probeMaxSize + 1) unfolded ≤ cfg.probeMaxSize then
+    if ← tryProveFast unfolded cfg.probeHeartbeats then
+      return some true
+    if ← tryProveFast (mkNot unfolded) cfg.probeHeartbeats then
+      return some false
+  return none
+
+/--
 Determine which outputs are constrained *beyond* the predicates in
 `cfg.boilerplate`, by exact cofactoring: normalise with boilerplate kept
-opaque, enumerate **every** truth assignment `{True, False}^k` to the distinct
-closed boilerplate atoms occurring in the residual, and OR per-output binding
-across cofactors. This decides `DichotomyModuloObservation` for the observation
-"truth values of those atoms", which for one atom is `DichotomyBeyondPredicate`
-(soundness: `not_dichotomyModuloObservation_of_cofactors_insensitive`).
+opaque, enumerate **every** feasible truth assignment `{True, False}^k` to the
+distinct closed boilerplate atoms occurring in the residual (skipping empty
+fibres where an atom is provably constant, such as `callFramePreserved m m`),
+and OR per-output binding across cofactors clamped by `full.bound` (preserving
+monotonicity: `user.bound[i] → full.bound[i]`). This decides
+`DichotomyModuloObservation` for the observation "truth values of those atoms",
+which for one atom is `DichotomyBeyondPredicate` (soundness:
+`not_dichotomyModuloObservation_of_inhabited_cofactors_insensitive`).
 
 The enumeration is never sampled: a dichotomy modulo the observation lives in
 exactly one cofactor (`DichotomyModuloObservation.exists_cofactor_dichotomy`),
@@ -4668,6 +5041,7 @@ def analyzeUserBeyondBoilerplate (cfg : EnsuresCheckConfig)
   let k := atoms.size
   if k > maxCofactorAtoms then
     return { full with cofactorIncomplete := true }
+  let fixed ← atoms.mapM (atomFixedTruth? cfg)
   let mentions (e : Expr) : Bool :=
     e.hasAnyFVar fun fv => outputs.any fun o => o.fvarId! == fv
   let mut boundAcc := Array.replicate outputs.size false
@@ -4676,6 +5050,14 @@ def analyzeUserBeyondBoilerplate (cfg : EnsuresCheckConfig)
   let mut analyses := 0
   -- All-true first: the cofactor a well-formed external spec lives in.
   for mask in (Array.range (1 <<< k)).reverse do
+    let mut feasible := true
+    for i in [0:k] do
+      if let some b := fixed[i]! then
+        if (((mask >>> i) &&& 1) == 1) != b then
+          feasible := false
+          break
+    if !feasible then
+      continue
     let cand ← replaceBoilerplateAtoms atoms mask bpRes
     unless ← safely (do check cand; return true) false do
       return { full with cofactorIncomplete := true }
@@ -4693,14 +5075,15 @@ def analyzeUserBeyondBoilerplate (cfg : EnsuresCheckConfig)
     let a ← analyzeBodySplit cfg outputs cand hyp?
     if first?.isNone then
       first? := some a
-    if a.anyBound then
-      if best?.isNone then
-        best? := some a
-      for i in [0:outputs.size] do
-        if a.bound[i]! then
-          boundAcc := boundAcc.set! i true
-      if boundAcc == full.bound then
-        break
+    let mut anyReal := false
+    for i in [0:outputs.size] do
+      if a.bound[i]! && full.bound[i]! then
+        boundAcc := boundAcc.set! i true
+        anyReal := true
+    if anyReal && best?.isNone then
+      best? := some a
+    if boundAcc == full.bound then
+      break
   let chosen := best?.getD (first?.getD full)
   return { chosen with
     bound := boundAcc

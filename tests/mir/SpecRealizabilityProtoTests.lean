@@ -3559,6 +3559,478 @@ genuine_case existsInHypothesis :=
 
 end HardeningA2
 
+/-! ## Adversarial hardening regressions (Pass B3) -/
+
+namespace HardeningB3
+
+/-! ### Boilerplate monotonicity, empty fibres, and `.lam` (`match`) substitution -/
+
+/--
+Monotonicity regression: `callFramePreserved memAfter memAfter` is always `True`
+(`callFramePreserved_refl`), so the guard is dead and `retVal` is unconstrained.
+Without empty-fibre elimination and `full.bound` clamping, cofactoring the
+impossible `False` assignment falsely reported `retVal` bound under
+`userEnsuresOnly := true, strictReturnValue := true` even though plain
+`strictReturnValue := true` rejected it.
+-/
+def tautologicalFrameAtomGuard : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned retVal memAfter =>
+      callFramePreserved req.memory memAfter ∧
+        (¬ callFramePreserved memAfter memAfter → retVal = u32Arg 1)
+    | .panicked _ => False
+    | .aborted => True
+
+theorem tautologicalFrameAtomGuard_not_returnValueDichotomy :
+    ¬ MirCallContractReturnValueDichotomy tautologicalFrameAtomGuard :=
+  not_mirCallContractReturnValueDichotomy_of_value_blind fun _ _ _ m _ =>
+    ⟨fun ⟨hf, _⟩ => ⟨hf, fun h => absurd (callFramePreserved_refl m) h⟩,
+      fun ⟨hf, _⟩ => ⟨hf, fun h => absurd (callFramePreserved_refl m) h⟩⟩
+
+/--
+Empty-fibre soundness in Part I: the `(b₁, False)` fibres of
+`(callFramePreserved req.memory memAfter, callFramePreserved memAfter memAfter)`
+are uninhabited, so output-insensitivity on inhabited fibres refutes dichotomy.
+-/
+theorem tautologicalFrameAtomGuard_not_dichotomyModuloObs :
+    ¬ DichotomyModuloObservation
+        (fun req (out : Value × Memory) =>
+          (callFramePreserved req.memory out.2,
+            callFramePreserved out.2 out.2))
+        tautologicalFrameAtomGuard.pre
+        (mirCallNormalPost tautologicalFrameAtomGuard) :=
+  not_dichotomyModuloObservation_of_inhabited_cofactors_insensitive
+    (fun b _ out => b.1 ∧ (¬ b.2 → out.1 = u32Arg 1))
+    (fun _ _ _ => Iff.rfl)
+    (fun b ⟨_, out, _, heq⟩ _ _ _ _ ⟨hb1, _⟩ => by
+      have hb2 : b.2 := (congrArg Prod.snd heq) ▸ callFramePreserved_refl out.2
+      exact ⟨hb1, fun hnb => absurd hb2 hnb⟩)
+
+/-- Impossible-fibre disguise inside `externalSpecCallContract`. -/
+def tautologicalFrameAtomGuardExtSpec (target : DefPath) (sidecar : CapturedMir) :
+    MirCallContract :=
+  externalSpecCallContract target sidecar (fun _ => True)
+    (fun _ retVal =>
+      ¬ callFramePreserved emptyMemory emptyMemory → retVal = u32Arg 1)
+
+theorem tautologicalFrameAtomGuardExtSpec_not_ensuresDichotomy
+    (target : DefPath) (sidecar : CapturedMir) :
+    ¬ ExternalSpecEnsuresDichotomy target sidecar (fun _ => True)
+        (fun _ retVal =>
+          ¬ callFramePreserved emptyMemory emptyMemory → retVal = u32Arg 1) :=
+  not_externalSpecEnsuresDichotomy_of_return_blind target sidecar _ _
+    fun _ _ _ _ =>
+      ⟨fun _ h => absurd (callFramePreserved_refl emptyMemory) h,
+        fun _ h => absurd (callFramePreserved_refl emptyMemory) h⟩
+
+section ClassicalB3
+
+open Classical
+
+/-- Impossible `else` branch guarded by `callFramePreserved memAfter memAfter`. -/
+def impossibleFrameIte : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned retVal memAfter =>
+      callFramePreserved req.memory memAfter ∧
+        (if callFramePreserved memAfter memAfter then True else retVal = u32Arg 1)
+    | .panicked _ => False
+    | .aborted => True
+
+theorem impossibleFrameIte_not_returnValueDichotomy :
+    ¬ MirCallContractReturnValueDichotomy impossibleFrameIte :=
+  not_mirCallContractReturnValueDichotomy_of_value_blind fun _ _ _ m _ =>
+    ⟨fun ⟨hf, _⟩ => ⟨hf, by
+        split <;> first | trivial | exact absurd (callFramePreserved_refl m) ‹_›⟩,
+      fun ⟨hf, _⟩ => ⟨hf, by
+        split <;> first | trivial | exact absurd (callFramePreserved_refl m) ‹_›⟩⟩
+
+end ClassicalB3
+
+/-- Pure boilerplate inside a `match` alternative (`.lam` binder in `List.casesOn`). -/
+def matchOnArgsPureBoilerplate : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned _ memAfter =>
+      match req.args with
+      | [] => True
+      | _ :: _ => callFramePreserved req.memory memAfter
+    | .panicked _ => False
+    | .aborted => True
+
+theorem matchOnArgsPureBoilerplate_not_returnValueDichotomy :
+    ¬ MirCallContractReturnValueDichotomy matchOnArgsPureBoilerplate :=
+  not_mirCallContractReturnValueDichotomy_of_value_blind fun _ _ _ _ _ => Iff.rfl
+
+/-- Two boilerplate predicates split across `match` alternatives. -/
+def matchOnArgsBothBoilerplate (sidecar : CapturedMir) : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned retVal memAfter =>
+      match req.args with
+      | [] => callFramePreserved req.memory memAfter
+      | _ :: _ => retMatchesCalleeReturnTy sidecar retVal
+    | .panicked _ => False
+    | .aborted => True
+
+theorem matchOnArgsBothBoilerplate_not_dichotomyModuloBoilerplate
+    (sidecar : CapturedMir) :
+    ¬ DichotomyModuloObservation (externalSpecBoilerplateObs sidecar)
+        (matchOnArgsBothBoilerplate sidecar).pre
+        (mirCallNormalPost (matchOnArgsBothBoilerplate sidecar)) :=
+  not_dichotomyModuloObservation_of_factors
+    (fun req b => match req.args with | [] => b.1 | _ :: _ => b.2)
+    fun req _ _ => by
+      cases h : req.args <;>
+        simp [matchOnArgsBothBoilerplate, mirCallNormalPost,
+          externalSpecBoilerplateObs, h]
+
+/-- Genuine sibling: one `match` arm binds `retVal` beyond boilerplate. -/
+def matchOnArgsMixedBoilerplate : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned retVal memAfter =>
+      match req.args with
+      | [] => callFramePreserved req.memory memAfter
+      | _ :: _ => callFramePreserved req.memory memAfter → retVal = u32Arg 1
+    | .panicked _ => False
+    | .aborted => False
+
+theorem matchOnArgsMixedBoilerplate_returnValueDichotomy :
+    MirCallContractReturnValueDichotomy matchOnArgsMixedBoilerplate :=
+  ⟨{ defPath := "", args := [.unit], memory := emptyMemory },
+    u32Arg 1, u32Arg 0, emptyMemory, trivial, fun _ => rfl,
+    fun h => absurd (u32Arg_inj (h (callFramePreserved_refl _))) (by decide)⟩
+
+/-- Strengthening preserves `DichotomyModuloObservation` (Part I theorem test). -/
+theorem strengthening_moduloObservation :
+    DichotomyModuloObservation (fun (_ _ : Nat) => ())
+      Refinement.incPre Refinement.incSpec :=
+  dichotomyModuloObservation_preserved_under_strengthening
+    (post := Refinement.geSpec)
+    (fun x r _ (h : r = x + 1) => show x ≤ r by omega)
+    ⟨5, 6, 4, Refinement.incPre_five, rfl, rfl, show ¬ (5 ≤ 4) by omega⟩
+
+run_meta do
+  let user : EnsuresCheckConfig := { userEnsuresOnly := true }
+  let strict : EnsuresCheckConfig := { strictReturnValue := true }
+  let strictUser : EnsuresCheckConfig :=
+    { userEnsuresOnly := true, strictReturnValue := true }
+  -- Monotonicity: strict fails, user fails, and strict+user fails alike.
+  let r1 ← reportOf ``tautologicalFrameAtomGuard
+  unless r1.bindsOutput && !r1.bindsBeyondBoilerplate do
+    throwError "tautologicalFrameAtomGuard: expected boilerplate-only\n{r1.describe}"
+  expectReason ``tautologicalFrameAtomGuard .returnValueUnconstrained (cfg := strict)
+  expectReason ``tautologicalFrameAtomGuard .boilerplateOnly (cfg := user)
+  expectReason ``tautologicalFrameAtomGuard .boilerplateOnly (cfg := strictUser)
+  for n in #[``tautologicalFrameAtomGuardExtSpec, ``impossibleFrameIte,
+      ``matchOnArgsPureBoilerplate, ``matchOnArgsBothBoilerplate] do
+    let r ← reportOf n
+    unless r.bindsOutput && !r.bindsBeyondBoilerplate do
+      throwError "{n}: expected boilerplate-only binding\n{r.describe}"
+    expectReason n .boilerplateOnly (cfg := user)
+  -- Genuine match arm with boilerplate still passes every mode.
+  let rMix ← reportOf ``matchOnArgsMixedBoilerplate
+  unless rMix.bindsOutput && rMix.bindsBeyondBoilerplate do
+    throwError "matchOnArgsMixedBoilerplate: expected beyond-boilerplate\n{rMix.describe}"
+  assertEnsuresBindsOutput ``matchOnArgsMixedBoilerplate (cfg := user)
+  assertEnsuresBindsOutput ``matchOnArgsMixedBoilerplate (cfg := strictUser)
+
+/-! ### Multi-output `isBareOutputEq` soundness (`strictReturnValue`) -/
+
+def retBits : Value → Nat
+  | .scalar s => s.bits
+  | _ => 0
+
+/--
+`mem' = { mem with nextTag := retBits ret - retBits ret }` pins `mem'` while
+leaving `ret` completely unconstrained (`retBits ret - retBits ret = 0`).
+-/
+def statefulStrictBypass (body : CapturedMir) : StatefulClaim where
+  body := body
+  pre _ _ := True
+  post _ mem ret mem' := mem' = { mem with nextTag := retBits ret - retBits ret }
+
+theorem statefulStrictBypass_not_returnDichotomy (body : CapturedMir) :
+    ¬ StatefulClaimReturnDichotomy (statefulStrictBypass body) :=
+  not_statefulClaimReturnDichotomy_of_return_blind fun _ mem r₁ r₂ mem' _ => by
+    show (mem' = { mem with nextTag := retBits r₁ - retBits r₁ }) ↔
+      (mem' = { mem with nextTag := retBits r₂ - retBits r₂ })
+    simp
+
+run_meta do
+  let r ← reportOf ``statefulStrictBypass
+  unless r.bindsOutput && r.boundOutputIdxs == #[3] do
+    throwError "statefulStrictBypass: expected only mem' (idx 3) bound\n{r.describe}"
+  expectReason ``statefulStrictBypass .returnValueUnconstrained
+    (cfg := { strictReturnValue := true })
+
+/-! ### Recursive emptiness and single-inhabitant outputs -/
+
+def optEmptyProd : Nat → Option (Empty × Nat) → Prop := fun _ r => r = none
+def listEmptyProd : Nat → List (Empty × Nat) → Prop := fun _ r => r = []
+def optSumEmpty : Nat → Option (Sum Empty Empty) → Prop := fun _ r => r = none
+def optFin0 : Nat → Option (Fin 0) → Prop := fun _ r => r = none
+def listFin0 : Nat → List (Fin 0) → Prop := fun _ r => r = []
+def optUnsatSub : Nat → Option { n : Nat // n < 0 } → Prop := fun _ r => r = none
+def sumEmptyProdInr : Nat → Sum (Empty × Nat) Nat → Prop :=
+  fun _ r => ∃ n, r = Sum.inr n
+def sumFin0Inr : Nat → Sum (Fin 0) Nat → Prop := fun _ r => ∃ n, r = Sum.inr n
+def optUnitToEmpty : Nat → Option (Unit → Empty) → Prop := fun _ r => r = none
+
+theorem optEmptyProd_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre optEmptyProd :=
+  not_dichotomy_of_option_empty fun p => p.1.elim
+
+theorem listEmptyProd_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre listEmptyProd :=
+  not_dichotomy_of_list_empty fun p => p.1.elim
+
+theorem optSumEmpty_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre optSumEmpty :=
+  not_dichotomy_of_option_empty fun s => s.elim Empty.elim Empty.elim
+
+theorem optFin0_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre optFin0 :=
+  not_dichotomy_of_option_empty Fin.elim0
+
+theorem listFin0_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre listFin0 :=
+  not_dichotomy_of_list_empty Fin.elim0
+
+theorem optUnsatSub_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre optUnsatSub :=
+  not_dichotomy_of_option_empty fun ⟨_, h⟩ => Nat.not_lt_zero _ h
+
+theorem sumEmptyProdInr_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre sumEmptyProdInr :=
+  not_dichotomy_of_sum_empty_left (fun p => p.1.elim)
+    fun _ b₁ b₂ _ => ⟨fun _ => ⟨b₂, rfl⟩, fun _ => ⟨b₁, rfl⟩⟩
+
+theorem sumFin0Inr_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre sumFin0Inr :=
+  not_dichotomy_of_sum_empty_left Fin.elim0
+    fun _ b₁ b₂ _ => ⟨fun _ => ⟨b₂, rfl⟩, fun _ => ⟨b₁, rfl⟩⟩
+
+theorem optUnitToEmpty_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre optUnitToEmpty :=
+  not_dichotomy_of_option_empty fun f => (f ()).elim
+
+/-- Soundness guards: genuine two-inhabitant wrappers must still bind. -/
+structure PropBox where
+  p : Prop
+
+def propBoxTrue : Nat → PropBox → Prop := fun _ r => r = ⟨True⟩
+def optFin1 : Nat → Option (Fin 1) → Prop := fun _ r => r = none
+def listFin1 : Nat → List (Fin 1) → Prop := fun _ r => r = []
+
+theorem propBoxTrue_dichotomy :
+    PostconditionDichotomy (fun _ => True) propBoxTrue :=
+  ⟨0, ⟨True⟩, ⟨False⟩, trivial, rfl, fun h =>
+    have htf : False = True := congrArg PropBox.p h
+    htf.mpr trivial⟩
+
+theorem optFin1_dichotomy : PostconditionDichotomy (fun _ => True) optFin1 :=
+  ⟨0, none, some ⟨0, by decide⟩, trivial, rfl, fun h => nomatch h⟩
+
+theorem listFin1_dichotomy : PostconditionDichotomy (fun _ => True) listFin1 :=
+  ⟨0, [], [⟨0, by decide⟩], trivial, rfl, fun h => nomatch h⟩
+
+#expect_vacuous optEmptyProd reflexiveTautology
+#expect_vacuous listEmptyProd reflexiveTautology
+#expect_vacuous optSumEmpty reflexiveTautology
+#expect_vacuous optFin0 semanticallyInsensitive
+#expect_vacuous listFin0 semanticallyInsensitive
+#expect_vacuous optUnsatSub semanticallyInsensitive
+#expect_vacuous sumEmptyProdInr semanticallyInsensitive
+#expect_vacuous sumFin0Inr reflexiveTautology
+#expect_vacuous optUnitToEmpty reflexiveTautology
+#expect_binds propBoxTrue
+#expect_binds optFin1
+#expect_binds listFin1
+
+run_meta do
+  -- Purely structural emptiness needs no semantic probe.
+  let noProbe : EnsuresCheckConfig := { semanticProbe := false }
+  for n in #[``optEmptyProd, ``listEmptyProd, ``optSumEmpty,
+      ``optUnitToEmpty] do
+    assertEnsuresVacuous n (some .reflexiveTautology) (cfg := noProbe)
+
+/-! ### `Int` existentials, `Iff` insensitivity, and disjunctive/`match` `requires` -/
+
+def existsIntSucc (_x r : Int) : Prop := ∃ y : Int, r = y + 1
+def existsIntGt (_x r : Int) : Prop := ∃ y : Int, r < y
+def existsIntParity (_x r : Int) : Prop := ∃ y : Int, r = 2 * y ∨ r = 2 * y + 1
+def existsIntEvenOrOdd (_x r : Int) : Prop :=
+  (∃ k : Int, r = 2 * k) ∨ (∃ k : Int, r = 2 * k + 1)
+def existsIntNonneg (_x r : Int) : Prop := ∃ y : Int, y ≥ 0 ∧ r = y
+
+theorem existsIntSucc_not_dichotomy (pre : Int → Prop) :
+    ¬ PostconditionDichotomy pre existsIntSucc :=
+  not_dichotomy_of_universal_post fun _ r _ => ⟨r - 1, by omega⟩
+
+theorem existsIntGt_not_dichotomy (pre : Int → Prop) :
+    ¬ PostconditionDichotomy pre existsIntGt :=
+  not_dichotomy_of_universal_post fun _ r _ => ⟨r + 1, by omega⟩
+
+theorem existsIntParity_not_dichotomy (pre : Int → Prop) :
+    ¬ PostconditionDichotomy pre existsIntParity :=
+  not_dichotomy_of_universal_post fun _ r _ => ⟨r / 2, by omega⟩
+
+theorem existsIntEvenOrOdd_not_dichotomy (pre : Int → Prop) :
+    ¬ PostconditionDichotomy pre existsIntEvenOrOdd :=
+  not_dichotomy_of_universal_post fun _ r _ => by
+    by_cases h : r = 2 * (r / 2)
+    · exact .inl ⟨r / 2, h⟩
+    · exact .inr ⟨r / 2, by omega⟩
+
+theorem existsIntNonneg_dichotomy :
+    PostconditionDichotomy (fun _ => True) existsIntNonneg :=
+  ⟨0, 0, -1, trivial, ⟨0, by omega, rfl⟩, fun ⟨_, hy, h⟩ => by omega⟩
+
+#expect_vacuous existsIntSucc semanticallyInsensitive
+#expect_vacuous existsIntGt semanticallyInsensitive
+#expect_vacuous existsIntParity semanticallyInsensitive
+#expect_vacuous existsIntEvenOrOdd semanticallyInsensitive
+#expect_binds existsIntNonneg
+
+-- Existentials equivalent to an input-only predicate (`Iff` witness search).
+vacuous_case existsArithEquivInput semanticallyInsensitive :=
+  fun x r => ∃ y : Nat, y ≥ r ∧ x < 5
+  by
+    intro x r₁ r₂
+    exact ⟨fun ⟨_, _, hx⟩ => ⟨r₂, Nat.le_refl _, hx⟩,
+      fun ⟨_, _, hx⟩ => ⟨r₁, Nat.le_refl _, hx⟩⟩
+
+vacuous_case existsSubEquivInput semanticallyInsensitive :=
+  fun x r => ∃ y : Nat, y + x ≥ r ∧ x < 5
+  by
+    intro x r₁ r₂
+    exact ⟨fun ⟨_, _, hx⟩ => ⟨r₂, by omega, hx⟩,
+      fun ⟨_, _, hx⟩ => ⟨r₁, by omega, hx⟩⟩
+
+-- Existentials that become vacuous only under `requires`.
+def existsVacuousUnderPre (x r : Nat) : Prop :=
+  (r = 0 ∧ x ≥ 10) ∨ ∃ y : Nat, r ≤ y ∧ x < 10
+
+theorem existsVacuousUnderPre_dichotomy :
+    PostconditionDichotomy (fun _ => True) existsVacuousUnderPre :=
+  ⟨10, 0, 1, trivial, .inl ⟨rfl, Nat.le_refl _⟩, by
+    rintro (⟨h, _⟩ | ⟨_, _, h⟩) <;> omega⟩
+
+theorem existsVacuousUnderPre_not_dichotomy_under_pre :
+    ¬ PostconditionDichotomy HardeningA1.smallPre existsVacuousUnderPre :=
+  not_dichotomy_of_universal_post fun _ r hx => .inr ⟨r, Nat.le_refl _, hx⟩
+
+def tenPre (x : Nat) : Prop := x = 10
+def existsGapUnderPre (x r : Nat) : Prop := r < 10 ∨ ∃ y : Nat, r = y + x
+
+theorem existsGapUnderPre_dichotomy :
+    PostconditionDichotomy (fun _ => True) existsGapUnderPre :=
+  ⟨100, 0, 50, trivial, .inl (by decide), by
+    rintro (h | ⟨y, h⟩) <;> omega⟩
+
+theorem existsGapUnderPre_not_dichotomy_under_pre :
+    ¬ PostconditionDichotomy tenPre existsGapUnderPre :=
+  not_dichotomy_of_universal_post fun _ r (hx : _ = 10) => by
+    by_cases h : r < 10
+    · exact .inl h
+    · exact .inr ⟨r - 10, by omega⟩
+
+/-- Disjunctive `requires`: both disjuncts contradict the guard in `post`. -/
+def disjPreContract : MirCallContract where
+  pre req := req.args = [u32Arg 0] ∨ req.args = [u32Arg 1]
+  post req ans :=
+    match ans with
+    | .returned r _ => req.args = [u32Arg 2] → r = u32Arg 0
+    | .panicked _ => False
+    | .aborted => False
+
+theorem disjPreContract_not_normalDichotomy :
+    ¬ MirCallContractNormalDichotomy disjPreContract := by
+  have h0 : ¬ PostconditionDichotomy (fun req : MirCallReq => req.args = [u32Arg 0])
+      (mirCallNormalPost disjPreContract) :=
+    not_dichotomy_of_universal_post fun _ _ h h2 =>
+      absurd (u32Single_inj h h2) (by decide)
+  have h1 : ¬ PostconditionDichotomy (fun req : MirCallReq => req.args = [u32Arg 1])
+      (mirCallNormalPost disjPreContract) :=
+    not_dichotomy_of_universal_post fun _ _ h h2 =>
+      absurd (u32Single_inj h h2) (by decide)
+  exact fun h =>
+    ((postconditionDichotomy_or_pre_iff).mp
+      (mirCallContractNormalDichotomy_iff.mp h)).elim h0 h1
+
+/-- Genuine disjunctive `requires`: the second disjunct satisfies the guard. -/
+def disjPreGenuineContract : MirCallContract where
+  pre req := req.args = [u32Arg 0] ∨ req.args = [u32Arg 2]
+  post req ans :=
+    match ans with
+    | .returned r _ => req.args = [u32Arg 2] → r = u32Arg 0
+    | .panicked _ => False
+    | .aborted => False
+
+theorem disjPreGenuineContract_returnValueDichotomy :
+    MirCallContractReturnValueDichotomy disjPreGenuineContract :=
+  ⟨{ defPath := "", args := [u32Arg 2], memory := emptyMemory },
+    u32Arg 0, u32Arg 1, emptyMemory, .inr rfl, fun _ => rfl,
+    fun h => absurd (u32Arg_inj (h rfl)) (by decide)⟩
+
+/-- `match`-shaped `requires` whose pattern contradicts the implication guard. -/
+def matchPreContract : MirCallContract where
+  pre req :=
+    match req.args with
+    | [v] => v = u32Arg 0
+    | _ => False
+  post req ans :=
+    match ans with
+    | .returned r _ => req.args = [u32Arg 1] → r = u32Arg 0
+    | .panicked _ => False
+    | .aborted => False
+
+theorem matchPreContract_not_normalDichotomy :
+    ¬ MirCallContractNormalDichotomy matchPreContract :=
+  not_mirCallContractNormalDichotomy_of_return_blind fun req _ _ _ _ hpre =>
+    ⟨fun _ h1 => by
+        dsimp only [matchPreContract] at hpre
+        rw [h1] at hpre
+        exact absurd (u32Arg_inj hpre) (by decide),
+      fun _ h1 => by
+        dsimp only [matchPreContract] at hpre
+        rw [h1] at hpre
+        exact absurd (u32Arg_inj hpre) (by decide)⟩
+
+/-- Disjunctive realizability & modulo-observation distribution (Part I tests). -/
+theorem disj_realizable_test :
+    ContractRealizable (fun x : Nat => x < 10 ∨ x > 20)
+      (fun x r => r = x + 1) :=
+  (contractRealizable_or_pre_iff).mpr <| .inl ⟨0, 1, by decide, rfl⟩
+
+theorem disj_moduloObservation_test :
+    DichotomyModuloObservation (fun (_ _ : Nat) => ())
+      (fun x : Nat => x < 10 ∨ x > 20) (fun x r => r = x + 1) :=
+  (dichotomyModuloObservation_or_pre_iff).mpr <|
+    .inl ⟨0, 1, 2, by decide, rfl, rfl, by decide⟩
+
+#expect_vacuous disjPreContract vacuousUnderRequires
+#expect_binds disjPreGenuineContract
+#expect_vacuous matchPreContract vacuousUnderRequires
+
+run_meta do
+  assertEnsuresBindsOutput ``existsVacuousUnderPre
+  assertEnsuresVacuous ``existsVacuousUnderPre (some .vacuousUnderRequires)
+    (preDecl? := some ``HardeningA1.smallPre)
+  assertEnsuresBindsOutput ``existsGapUnderPre
+  assertEnsuresVacuous ``existsGapUnderPre (some .vacuousUnderRequires)
+    (preDecl? := some ``tenPre)
+
+end HardeningB3
+
 /-! ## Axiom and soundness audit -/
 
 namespace Audit
