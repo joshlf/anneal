@@ -624,4 +624,89 @@ theorem variant_bundle_claims (v : NullaryPtrVariant)
    (variantBundleOf v lmAuth hLM).lmFlip.faultA,
    (variantBundleOf v lmAuth hLM).lmFlip.faultR⟩
 
+/-- **Constructive Per-Variant Outcome Distinctness & Non-Degeneracy**:
+for EVERY one of the 4 MIR variants (`nullaryOp`, `pointerCoercion`,
+`fnPtrToPtr`, `unwrapUnsafeBinder`):
+1. `okPrimary` and `okSecondary` return strictly distinct observable values
+   (`a ≠ b`) with strictly distinct `npEncode` wire encodings
+   (`npEncode a ≠ npEncode b`) on BOTH Trusted Anneal (`npAnnealEval`) and
+   MiniRust (`mrAuthority`);
+2. `ubFault` produces `.undefinedBehavior` distinct from both normal return
+   verdicts on both authorities;
+3. on `unwrapUnsafeBinder.modeCase`, `basic` and `protectedTB` produce strictly
+   distinct verdicts on BOTH Trusted Anneal and MiniRust.
+Proof is strictly constructive (`[propext, Quot.sound]` only, zero
+`Classical.choice`). -/
+theorem np_variant_outcomes_distinct (v : NullaryPtrVariant) :
+    (∃ a b,
+      npAnnealEval .basic v .okPrimary () = some (.returns a) ∧
+      npAnnealEval .basic v .okSecondary () = some (.returns b) ∧
+      mrAuthority.verdict (.basic, v, .okPrimary) = some (.returns a) ∧
+      mrAuthority.verdict (.basic, v, .okSecondary) = some (.returns b) ∧
+      a ≠ b ∧
+      npEncode a ≠ npEncode b) ∧
+    npAnnealEval .basic v .okPrimary () ≠ npAnnealEval .basic v .ubFault () ∧
+    npAnnealEval .basic v .okSecondary () ≠ npAnnealEval .basic v .ubFault () ∧
+    mrAuthority.verdict (.basic, v, .okPrimary) ≠ mrAuthority.verdict (.basic, v, .ubFault) ∧
+    mrAuthority.verdict (.basic, v, .okSecondary) ≠ mrAuthority.verdict (.basic, v, .ubFault) ∧
+    npAnnealEval .basic .unwrapUnsafeBinder .modeCase () ≠
+      npAnnealEval .protectedTB .unwrapUnsafeBinder .modeCase () ∧
+    mrAuthority.verdict (.basic, .unwrapUnsafeBinder, .modeCase) ≠
+      mrAuthority.verdict (.protectedTB, .unwrapUnsafeBinder, .modeCase) := by
+  have hModeA :
+      npAnnealEval .basic .unwrapUnsafeBinder .modeCase () ≠
+        npAnnealEval .protectedTB .unwrapUnsafeBinder .modeCase () := by
+    rw [npAnnealEval_eq, npAnnealEval_eq]
+    intro h
+    dsimp only [npExpectedVerdict] at h
+    cases h
+  have hModeM :
+      mrAuthority.verdict (.basic, .unwrapUnsafeBinder, .modeCase) ≠
+        mrAuthority.verdict (.protectedTB, .unwrapUnsafeBinder, .modeCase) := by
+    rw [mrAuthority_verdict_eq, mrAuthority_verdict_eq]
+    intro h
+    dsimp only [npExpectedVerdict] at h
+    cases h
+  cases v with
+  | nullaryOp =>
+    refine ⟨⟨.usizeVal 36, .u8Val 1,
+        npAnnealEval_eq _ _ _ _, npAnnealEval_eq _ _ _ _,
+        mrAuthority_verdict_eq _ _ _, mrAuthority_verdict_eq _ _ _,
+        by decide, by decide⟩,
+      ?_, ?_, ?_, ?_, hModeA, hModeM⟩
+    · rw [npAnnealEval_eq, npAnnealEval_eq]; intro h; dsimp only [npExpectedVerdict] at h; cases h
+    · rw [npAnnealEval_eq, npAnnealEval_eq]; intro h; dsimp only [npExpectedVerdict] at h; cases h
+    · rw [mrAuthority_verdict_eq, mrAuthority_verdict_eq]; intro h; dsimp only [npExpectedVerdict] at h; cases h
+    · rw [mrAuthority_verdict_eq, mrAuthority_verdict_eq]; intro h; dsimp only [npExpectedVerdict] at h; cases h
+  | pointerCoercion =>
+    refine ⟨⟨.ptrAlloc 65536, .usizeVal 3,
+        npAnnealEval_eq _ _ _ _, npAnnealEval_eq _ _ _ _,
+        mrAuthority_verdict_eq _ _ _, mrAuthority_verdict_eq _ _ _,
+        by decide, by decide⟩,
+      ?_, ?_, ?_, ?_, hModeA, hModeM⟩
+    · rw [npAnnealEval_eq, npAnnealEval_eq]; intro h; dsimp only [npExpectedVerdict] at h; cases h
+    · rw [npAnnealEval_eq, npAnnealEval_eq]; intro h; dsimp only [npExpectedVerdict] at h; cases h
+    · rw [mrAuthority_verdict_eq, mrAuthority_verdict_eq]; intro h; dsimp only [npExpectedVerdict] at h; cases h
+    · rw [mrAuthority_verdict_eq, mrAuthority_verdict_eq]; intro h; dsimp only [npExpectedVerdict] at h; cases h
+  | fnPtrToPtr =>
+    refine ⟨⟨.ptrAlloc 65536, .ptrAlloc 65537,
+        npAnnealEval_eq _ _ _ _, npAnnealEval_eq _ _ _ _,
+        mrAuthority_verdict_eq _ _ _, mrAuthority_verdict_eq _ _ _,
+        by decide, by decide⟩,
+      ?_, ?_, ?_, ?_, hModeA, hModeM⟩
+    · rw [npAnnealEval_eq, npAnnealEval_eq]; intro h; dsimp only [npExpectedVerdict] at h; cases h
+    · rw [npAnnealEval_eq, npAnnealEval_eq]; intro h; dsimp only [npExpectedVerdict] at h; cases h
+    · rw [mrAuthority_verdict_eq, mrAuthority_verdict_eq]; intro h; dsimp only [npExpectedVerdict] at h; cases h
+    · rw [mrAuthority_verdict_eq, mrAuthority_verdict_eq]; intro h; dsimp only [npExpectedVerdict] at h; cases h
+  | unwrapUnsafeBinder =>
+    refine ⟨⟨.u32Val 73, .u8Val 7,
+        npAnnealEval_eq _ _ _ _, npAnnealEval_eq _ _ _ _,
+        mrAuthority_verdict_eq _ _ _, mrAuthority_verdict_eq _ _ _,
+        by decide, by decide⟩,
+      ?_, ?_, ?_, ?_, hModeA, hModeM⟩
+    · rw [npAnnealEval_eq, npAnnealEval_eq]; intro h; dsimp only [npExpectedVerdict] at h; cases h
+    · rw [npAnnealEval_eq, npAnnealEval_eq]; intro h; dsimp only [npExpectedVerdict] at h; cases h
+    · rw [mrAuthority_verdict_eq, mrAuthority_verdict_eq]; intro h; dsimp only [npExpectedVerdict] at h; cases h
+    · rw [mrAuthority_verdict_eq, mrAuthority_verdict_eq]; intro h; dsimp only [npExpectedVerdict] at h; cases h
+
 end Anneal.Mir.NullaryAndPtrCoercionBundle

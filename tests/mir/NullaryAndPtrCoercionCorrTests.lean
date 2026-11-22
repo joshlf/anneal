@@ -173,6 +173,7 @@ theorem np_mr_deep_theorems_used :
   have _ := @np_v1_nullaryOp_coupled_step_sim_all_four
   have _ := @np_v1_nullaryOp_dead_dst_ub_lockstep
   have _ := @np_v1_nullaryOp_three_way_witness
+  have _ := @np_v1_nullaryOp_frame_inhabitation_and_nonvacuity
   have _ := @np_v2_pointerCoercion_dispatch
   have _ := @np_v2_reify_and_closure_fnPointer_lockstep
   have _ := @np_v2_unsafeFnPointer_ground_truth_and_divergences
@@ -201,6 +202,8 @@ theorem np_mr_deep_theorems_used :
   have _ := @np_v4_unwrapUnsafeBinder_assign_coupled_lockstep_and_wfLive
   have _ := @np_v4_wrapUnsafeBinder_universal_sim
   have _ := @np_v4_unwrapUnsafeBinder_three_way_witness
+  have _ := @np_storage_lifecycle_three_way_witness
+  have _ := @np_variant_outcomes_distinct
   have _ := @npTrustedObserve_table
   have _ := @npMrObserveClass_table
   exact ⟨npMrObserve_unwrap_mode_sensitivity.1, npMrObserve_unwrap_mode_sensitivity.2,
@@ -488,12 +491,19 @@ run_cmd do
         unless isStdAx a do
           throwError "cross-root: {n} depends on non-standard axiom {a}"
         crAxioms := crAxioms.insert a
-    -- Verify new LM B1 fidelity & Tree Borrows theorems are present, non-trivial, and axiom-clean.
+    -- Verify LM fidelity, Tree Borrows, ZST boundary, & lifecycle theorems are present,
+    -- non-trivial, and axiom-clean.
     let lmDeepThms : List Name :=
       [ lmNs ++ `npUnsizeArraySpec?_snd_eq_unsizeArrayLen?,
+        lmNs ++ `npUnsizeArraySpec?_snd_eq_unsizeArrayToSliceSpec?_of_lt,
         lmNs ++ `np_v2_unsize_spec_laws,
+        lmNs ++ `npUnsizeTreeBorrowsPermCheck_eq_trusted_universal,
+        lmNs ++ `npApplyTreeBorrowsWriteAt_zst_noop,
         lmNs ++ `lm_np_v2_unsize_fidelity_and_negative_witness,
-        lmNs ++ `lm_np_v4_deref_and_subplace_unwrap_tb_witness ]
+        lmNs ++ `lm_np_v2_unsize_tb_perm_agreement_and_mode_sensitivity_witness,
+        lmNs ++ `lm_np_v4_deref_and_subplace_unwrap_tb_witness,
+        lmNs ++ `lm_np_v4_zst_unwrap_write_boundary_witness,
+        lmNs ++ `lm_np_storage_lifecycle_witness ]
     for n in lmDeepThms do
       let some (.thmInfo v) := env.find? n
         | throwError "cross-root: required LM theorem {n} missing"
@@ -529,6 +539,7 @@ run_cmd do
       [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
         `Trusted.Rustc.V2026_06_01.MirSemantics.evalNullaryOp,
         `Trusted.Rustc.V2026_06_01.MirSemantics.evalReifyFnPointer,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.evalUnsizeCoercion,
         `Trusted.Rustc.V2026_06_01.MirSemantics.evalFnPtrToPtr,
         `MiniRustSpec.Interp.steps,
         `MiniRustSpec.Interp.stepsTB,
@@ -537,7 +548,8 @@ run_cmd do
         `MiniRustSpec.NullaryAndPtrCoercionMR.npTrustedObserve_table,
         `MiniRustSpec.NullaryAndPtrCoercionMR.npMrObserveClass_table,
         `Miri.Interpreter.Step.step,
-        `LeanMiriSpec.NullaryAndPtrCoercionLM.npLmObserve ]
+        `LeanMiriSpec.NullaryAndPtrCoercionLM.npLmObserve,
+        `LeanMiriSpec.NullaryAndPtrCoercionLM.npUnsizeTreeBorrowsPermCheck ]
     for req in requiredReach do
       unless reach.contains req do
         throwError "cross-root reachability failure: unifiedDualBundle does not reach {req}"
@@ -576,7 +588,8 @@ run_cmd do
       ``Anneal.Mir.NullaryAndPtrCoercionBundle.exactBehaviorEq_both,
       ``Anneal.Mir.NullaryAndPtrCoercionBundle.mr_modeSensitivity_present,
       ``Anneal.Mir.NullaryAndPtrCoercionBundle.lm_modeSensitivity_present,
-      ``Anneal.Mir.NullaryAndPtrCoercionBundle.variant_bundle_claims ]
+      ``Anneal.Mir.NullaryAndPtrCoercionBundle.variant_bundle_claims,
+      ``Anneal.Mir.NullaryAndPtrCoercionBundle.np_variant_outcomes_distinct ]
   for d in constructiveDecls do
     let axs ← liftCoreM <| Lean.collectAxioms d
     for a in axs do

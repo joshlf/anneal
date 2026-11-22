@@ -1339,6 +1339,416 @@ theorem np_v1_nullaryOp_three_way_witness :
    by decide +kernel,
    ok_of_map_toOption (by decide +kernel), ok_stepTB_wfLive (by decide +kernel)⟩
 
+/-! ### `V1` Kernel-Checked Inhabitation & Non-Vacuity of `NpMrAssignFrame` / `NpMrDeadAssignFrame` -/
+
+private theorem np_evalPlaceM_local_of_ok {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m : Machine M) (mrDst : Gen.LocalName) (fr : StackFrame M) (dstTy : Gen.Type)
+    (ptr : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (hCur : curFrameM m = .ok fr)
+    (hDecl : mapIndex fr.func.locals mrDst "self.cur_frame().func.locals[name]" = .ok dstTy)
+    (hLive : mapGet fr.locals mrDst = some ptr) :
+    evalPlaceM m (.Local mrDst) =
+      .ok (({ ptr := ThinPointer.widen ptr none, aligned := true }, dstTy), m) := by
+  unfold evalPlaceM
+  simp only [hCur, hDecl, hLive, bind, Except.bind, pure, Except.pure]
+
+/-- Pure `Bool` checker for the frame, live-local, memory-store, PC-increment,
+and data-race side-conditions of `NpMrAssignFrame` (decidable with zero
+`DecidableEq` on `Statement`/`Type`). -/
+private def npCheckAssignStepSideOk {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m : Machine M) (mrDst : Gen.LocalName) (mv : Gen.Value M) (dstTy : Gen.Type) : Bool :=
+  let m0 : Machine M := { m with mem := { m.mem with accesses := [] } }
+  match m.threads.any (fun th => decide (th.state = .Enabled)) with
+  | false => false
+  | true =>
+    match pickActiveThreadM m0 with
+    | .error _ => false
+    | .ok tid =>
+      match decide (tid = m.active_thread) with
+      | false => false
+      | true =>
+        match curFrameM m0 with
+        | .error _ => false
+        | .ok fr =>
+          match mapIndex fr.func.blocks fr.next_block "frame.func.blocks[frame.next_block]" with
+          | .error _ => false
+          | .ok blk =>
+            match decide (fr.next_stmt = (blk.statements.length : Int)) with
+            | true => false
+            | false =>
+              match mapGet fr.locals mrDst with
+              | none => false
+              | some ptr =>
+                let pl : Gen.Place M := { ptr := ThinPointer.widen ptr none, aligned := true }
+                match placeStoreM m0 pl mv dstTy with
+                | .error _ => false
+                | .ok m1 =>
+                  match mutateCurFrameM m1 (fun f => { f with next_stmt := f.next_stmt + 1 }) with
+                  | .error _ => false
+                  | .ok mAfter =>
+                    match ConcurrentMemory.check_data_races mAfter.mem mAfter.active_thread
+                        (setInsert m.synchronized_threads m.active_thread, m.mem.accesses) with
+                    | .ok () => true
+                    | .error _ => false
+
+private theorem np_assign_frame_of_check {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m : Machine M) (mrDst : Gen.LocalName) (mrSrc : Gen.ValueExpr)
+    (mv : Gen.Value M) (dstTy : Gen.Type)
+    (hOk : npCheckAssignStepSideOk m mrDst mv dstTy = true)
+    (hStmt : (do
+      let fr ← curFrameM { m with mem := { m.mem with accesses := [] } }
+      let blk ← mapIndex fr.func.blocks fr.next_block "frame.func.blocks[frame.next_block]"
+      listIndex blk.statements fr.next_stmt "block.statements[frame.next_stmt]") =
+      .ok (.Assign (.Local mrDst) mrSrc))
+    (hDecl : (do
+      let fr ← curFrameM { m with mem := { m.mem with accesses := [] } }
+      mapIndex fr.func.locals mrDst "self.cur_frame().func.locals[name]") = .ok dstTy) :
+    ∃ m1 mAfter, Nonempty (NpMrAssignFrame m m1 mAfter mrDst mrSrc mv dstTy) := by
+  unfold npCheckAssignStepSideOk at hOk
+  dsimp only at hOk
+  cases hEn : m.threads.any (fun th => decide (th.state = .Enabled)) with
+  | false => simp [hEn] at hOk
+  | true =>
+    simp only [hEn] at hOk
+    cases hPick : pickActiveThreadM { m with mem := { m.mem with accesses := [] } } with
+    | error _ => simp [hPick] at hOk
+    | ok tid =>
+      simp only [hPick] at hOk
+      cases hTid : decide (tid = m.active_thread) with
+      | false => simp [hTid] at hOk
+      | true =>
+        simp only [hTid] at hOk
+        have hTidEq : tid = m.active_thread := of_decide_eq_true hTid
+        subst hTidEq
+        cases hCur : curFrameM { m with mem := { m.mem with accesses := [] } } with
+        | error _ => simp [hCur] at hOk
+        | ok fr =>
+          simp only [hCur] at hOk
+          cases hBlk : mapIndex fr.func.blocks fr.next_block "frame.func.blocks[frame.next_block]" with
+          | error _ => simp [hBlk] at hOk
+          | ok blk =>
+            simp only [hBlk] at hOk
+            cases hEqLen : decide (fr.next_stmt = (blk.statements.length : Int)) with
+            | true => simp [hEqLen] at hOk
+            | false =>
+              simp only [hEqLen] at hOk
+              have hNe : fr.next_stmt ≠ (blk.statements.length : Int) := of_decide_eq_false hEqLen
+              cases hPtr : mapGet fr.locals mrDst with
+              | none => simp [hPtr] at hOk
+              | some ptr =>
+                simp only [hPtr] at hOk
+                cases hSt : placeStoreM { m with mem := { m.mem with accesses := [] } }
+                    { ptr := ThinPointer.widen ptr none, aligned := true } mv dstTy with
+                | error _ => simp [hSt] at hOk
+                | ok m1 =>
+                  simp only [hSt] at hOk
+                  cases hMut : mutateCurFrameM m1 (fun f => { f with next_stmt := f.next_stmt + 1 }) with
+                  | error _ => simp [hMut] at hOk
+                  | ok mAfter =>
+                    simp only [hMut] at hOk
+                    cases hRace : ConcurrentMemory.check_data_races mAfter.mem mAfter.active_thread
+                        (setInsert m.synchronized_threads m.active_thread, m.mem.accesses) with
+                    | error _ => simp [hRace] at hOk
+                    | ok u =>
+                      cases u
+                      simp only [hCur, hBlk, bind, Except.bind] at hStmt
+                      simp only [hCur, bind, Except.bind] at hDecl
+                      exact ⟨m1, mAfter, ⟨{
+                        fr := fr, blk := blk,
+                        place := { ptr := ThinPointer.widen ptr none, aligned := true },
+                        hEn := hEn, hPick := hPick, hCur := hCur, hBlk := hBlk,
+                        hNe := hNe, hStmt := hStmt,
+                        hp := np_evalPlaceM_local_of_ok _ mrDst fr dstTy ptr hCur hDecl hPtr,
+                        hst := hSt, hMut := hMut, hRace := hRace }⟩⟩
+
+/-- Pure `Bool` checker for the frame and dead-local side-conditions of
+`NpMrDeadAssignFrame`. -/
+private def npCheckDeadAssignSideOk {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m : Machine M) (mrDst : Gen.LocalName) : Bool :=
+  let m0 : Machine M := { m with mem := { m.mem with accesses := [] } }
+  match m.threads.any (fun th => decide (th.state = .Enabled)) with
+  | false => false
+  | true =>
+    match pickActiveThreadM m0 with
+    | .error _ => false
+    | .ok tid =>
+      match decide (tid = m.active_thread) with
+      | false => false
+      | true =>
+        match curFrameM m0 with
+        | .error _ => false
+        | .ok fr =>
+          match mapIndex fr.func.blocks fr.next_block "frame.func.blocks[frame.next_block]" with
+          | .error _ => false
+          | .ok blk =>
+            match decide (fr.next_stmt = (blk.statements.length : Int)) with
+            | true => false
+            | false =>
+              match mapGet fr.locals mrDst with
+              | none => true
+              | some _ => false
+
+private theorem np_dead_assign_frame_of_check {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m : Machine M) (mrDst : Gen.LocalName) (mrSrc : Gen.ValueExpr) (dstTy : Gen.Type)
+    (hOk : npCheckDeadAssignSideOk m mrDst = true)
+    (hStmt : (do
+      let fr ← curFrameM { m with mem := { m.mem with accesses := [] } }
+      let blk ← mapIndex fr.func.blocks fr.next_block "frame.func.blocks[frame.next_block]"
+      listIndex blk.statements fr.next_stmt "block.statements[frame.next_stmt]") =
+      .ok (.Assign (.Local mrDst) mrSrc))
+    (hDecl : (do
+      let fr ← curFrameM { m with mem := { m.mem with accesses := [] } }
+      mapIndex fr.func.locals mrDst "self.cur_frame().func.locals[name]") = .ok dstTy) :
+    Nonempty (NpMrDeadAssignFrame m mrDst mrSrc) := by
+  unfold npCheckDeadAssignSideOk at hOk
+  dsimp only at hOk
+  cases hEn : m.threads.any (fun th => decide (th.state = .Enabled)) with
+  | false => simp [hEn] at hOk
+  | true =>
+    simp only [hEn] at hOk
+    cases hPick : pickActiveThreadM { m with mem := { m.mem with accesses := [] } } with
+    | error _ => simp [hPick] at hOk
+    | ok tid =>
+      simp only [hPick] at hOk
+      cases hTid : decide (tid = m.active_thread) with
+      | false => simp [hTid] at hOk
+      | true =>
+        simp only [hTid] at hOk
+        have hTidEq : tid = m.active_thread := of_decide_eq_true hTid
+        subst hTidEq
+        cases hCur : curFrameM { m with mem := { m.mem with accesses := [] } } with
+        | error _ => simp [hCur] at hOk
+        | ok fr =>
+          simp only [hCur] at hOk
+          cases hBlk : mapIndex fr.func.blocks fr.next_block "frame.func.blocks[frame.next_block]" with
+          | error _ => simp [hBlk] at hOk
+          | ok blk =>
+            simp only [hBlk] at hOk
+            cases hEqLen : decide (fr.next_stmt = (blk.statements.length : Int)) with
+            | true => simp [hEqLen] at hOk
+            | false =>
+              simp only [hEqLen] at hOk
+              have hNe : fr.next_stmt ≠ (blk.statements.length : Int) := of_decide_eq_false hEqLen
+              cases hDead : mapGet fr.locals mrDst with
+              | some _ => simp [hDead] at hOk
+              | none =>
+                simp only [hCur, hBlk, bind, Except.bind] at hStmt
+                simp only [hCur, bind, Except.bind] at hDecl
+                exact ⟨{
+                  fr := fr, blk := blk, dstTy := dstTy,
+                  hEn := hEn, hPick := hPick, hCur := hCur, hBlk := hBlk,
+                  hNe := hNe, hStmt := hStmt, hDecl := hDecl, hDead := hDead }⟩
+
+/-- Standalone `align_of` MIR fixture (stmt 0 is `.nullaryOp .alignOf npTuple16MirTy`)
+for direct `NpMrAssignFrame` inhabitation. -/
+def v1AlignOfOnlyMir : CapturedMir :=
+  mkMirBody "np::v1_align_of_only" [mkDecl usizeMirTy] 0
+    [mkBb [mkSt (.assign (locPlace 0) (.nullaryOp .alignOf npTuple16MirTy))] .return_]
+
+/-- MiniRust machine for `v1AlignOfOnlyMir`. -/
+def v1AlignOfOnlyMach : Mach :=
+  let fn := mkMrFn [(localName 0, usizeMrTy)] [] (localName 0)
+    [(bbName 0, ⟨[.Assign (.Local (localName 0))
+        (.UnOp (.ComputeAlign npTuple16MrTy) (.Tuple [] unitType))],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)]) [mkStackAlloc 128 (List.replicate 8 .Uninit) 8]
+    [mkRootFrame fn [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) })]]
+
+/-- Dead-destination `nullaryOp` MIR fixture (initialized via standard
+`initMachineState`, where non-argument local `_1` begins `.dead`) for direct
+`NpMrDeadAssignFrame` inhabitation. -/
+def v1DeadDstMir : CapturedMir :=
+  mkMirBody "np::v1_dead_dst" [mkDecl usizeMirTy, mkDecl usizeMirTy] 0
+    [mkBb [mkSt (.assign (locPlace 1) (.nullaryOp .sizeOf npTuple16MirTy))] .return_]
+
+/-- MiniRust machine for `v1DeadDstMir` (`localName 1` is declared in `fn.locals`
+as `usizeMrTy` but absent from `fr.locals`). -/
+def v1DeadDstMach : Mach :=
+  let fn := mkMrFn [(localName 0, usizeMrTy), (localName 1, usizeMrTy)] [] (localName 0)
+    [(bbName 0, ⟨[.Assign (.Local (localName 1))
+        (.UnOp (.ComputeSize npTuple16MrTy) (.Tuple [] unitType))],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)]) [mkStackAlloc 128 (List.replicate 8 .Uninit) 8]
+    [mkRootFrame fn [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) })]]
+
+/-- **Kernel-Checked Inhabitation & Non-Vacuity of `NpMrAssignFrame` and
+`NpMrDeadAssignFrame` (Instantiating `np_v1_nullaryOp_coupled_step_sim_all_four`
+and `np_v1_nullaryOp_dead_dst_ub_lockstep` on BOTH `Mach` and `MachTB`)**:
+explicitly constructs `NpMrAssignFrame` inhabitants on BOTH `Mach` and `MachTB`
+for all 5 arms of `np_v1_nullaryOp_coupled_step_sim_all_four` (`.sizeOf`,
+`.alignOf`, `.offsetOf`, `.ubChecks` via `u8` `Switch` lowering, and `.ubChecks`
+via native `.Bool` lowering) plus `NpMrDeadAssignFrame` inhabitants on BOTH
+`Mach` and `MachTB` for `np_v1_nullaryOp_dead_dst_ub_lockstep`, and derives
+every single operational step, `MachTB.wfLive` preservation, `Ep2ValRel`
+agreement, and dead-local UB lockstep directly by instantiating those two
+universal theorems. -/
+theorem np_v1_nullaryOp_frame_inhabitation_and_nonvacuity :
+    -- 1. `.sizeOf` on `v1NullaryTupleMir` / `v1NullaryTupleMach` (Mach & MachTB)
+    ((∃ s', stepMirFn v1NullaryTupleMir (npInitLiveState v1NullaryTupleMir []) = .tau (.running s') ∧
+        get? s'.frame.locals 1 = some (.init (.scalar ⟨16, 8⟩))) ∧
+      (∃ mBMf, Interp.step v1NullaryTupleMach = .ok mBMf) ∧
+      (∃ mTBf, Interp.stepTB (liftMachToTB v1NullaryTupleMach) = .ok mTBf ∧ MachTB.wfLive mTBf) ∧
+      Ep2ValRel (M := BM) (fun _ => 0) (fun _ => 0) (.scalar ⟨16, 8⟩) (.Int (Int.ofNat 16))) ∧
+    -- 2. `.alignOf` on `v1AlignOfOnlyMir` / `v1AlignOfOnlyMach` (Mach & MachTB)
+    ((∃ s', stepMirFn v1AlignOfOnlyMir (npInitLiveState v1AlignOfOnlyMir []) = .tau (.running s') ∧
+        get? s'.frame.locals 0 = some (.init (.scalar ⟨8, 8⟩))) ∧
+      (∃ mBMf, Interp.step v1AlignOfOnlyMach = .ok mBMf) ∧
+      (∃ mTBf, Interp.stepTB (liftMachToTB v1AlignOfOnlyMach) = .ok mTBf ∧ MachTB.wfLive mTBf) ∧
+      Ep2ValRel (M := BM) (fun _ => 0) (fun _ => 0) (.scalar ⟨8, 8⟩) (.Int (Int.ofNat 8))) ∧
+    -- 3. `.offsetOf [(0, 1)]` on `v1NullaryPaddedOffsetMir` / `v1NullaryPaddedOffsetMach`
+    ((∃ s', stepMirFn v1NullaryPaddedOffsetMir (npInitLiveState v1NullaryPaddedOffsetMir []) =
+        .tau (.running s') ∧
+        get? s'.frame.locals 0 = some (.init (.scalar ⟨4, 8⟩))) ∧
+      (∃ mBMf, Interp.step v1NullaryPaddedOffsetMach = .ok mBMf) ∧
+      (∃ mTBf, Interp.stepTB (liftMachToTB v1NullaryPaddedOffsetMach) = .ok mTBf ∧
+        MachTB.wfLive mTBf) ∧
+      Ep2ValRel (M := BM) (fun _ => 0) (fun _ => 0) (.scalar ⟨4, 8⟩) (.Int (Int.ofNat 4))) ∧
+    -- 4a. `.ubChecks` (`u8` lowering) on `v1NullaryUbBranchMir` / `v1NullaryUbBranchMach`
+    ((∃ s', stepMirFn v1NullaryUbBranchMir (npInitLiveState v1NullaryUbBranchMir []) =
+        .tau (.running s') ∧
+        get? s'.frame.locals 1 = some (.init (.scalar (boolToScalar true)))) ∧
+      (∃ mBMf, Interp.step v1NullaryUbBranchMach = .ok mBMf) ∧
+      (∃ mTBf, Interp.stepTB (liftMachToTB v1NullaryUbBranchMach) = .ok mTBf ∧
+        MachTB.wfLive mTBf) ∧
+      Ep2ValRel (M := BM) (fun _ => 0) (fun _ => 0) (.scalar (boolToScalar true)) (.Int 1)) ∧
+    -- 4b. `.ubChecks` (native `.Bool` lowering) on `v1NullaryUbChecksMir` / `v1NullaryUbChecksMach`
+    ((∃ s', stepMirFn v1NullaryUbChecksMir (npInitLiveState v1NullaryUbChecksMir []) =
+        .tau (.running s') ∧
+        get? s'.frame.locals 0 = some (.init (.scalar (boolToScalar true)))) ∧
+      (∃ mBMf, Interp.step v1NullaryUbChecksMach = .ok mBMf) ∧
+      (∃ mTBf, Interp.stepTB (liftMachToTB v1NullaryUbChecksMach) = .ok mTBf ∧
+        MachTB.wfLive mTBf) ∧
+      Type.encodeM (M := BM) .Bool (.Bool true) = .ok [.Init 1 none]) ∧
+    -- 5. Dead-destination UB lockstep via `NpMrDeadAssignFrame` on `v1DeadDstMir` / `v1DeadDstMach`
+    (stepMirFn v1DeadDstMir (initMachineState v1DeadDstMir []) = MirStepNode.fail .ub ∧
+      Interp.step v1DeadDstMach = .error (.ub "access to a dead local") ∧
+      Interp.stepTB (liftMachToTB v1DeadDstMach) = .error (.ub "access to a dead local")) := by
+  have hNeDead : LocalSlot.uninit ≠ .dead := fun h => nomatch h
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+  · -- 1. `.sizeOf`
+    obtain ⟨mBM1, mBMf, ⟨wBM⟩⟩ := np_assign_frame_of_check (M := BM) v1NullaryTupleMach (localName 1)
+      (.UnOp (.ComputeSize npTuple16MrTy) (.Tuple [] unitType)) (.Int (Int.ofNat 16)) usizeMrTy
+      (by decide +kernel) rfl rfl
+    obtain ⟨mTB1, mTBf, ⟨wTB⟩⟩ := np_assign_frame_of_check (M := TBM)
+      (liftMachToTB v1NullaryTupleMach) (localName 1)
+      (.UnOp (.ComputeSize npTuple16MrTy) (.Tuple [] unitType)) (.Int (Int.ofNat 16)) usizeMrTy
+      (by decide +kernel) rfl rfl
+    have hSim := (np_v1_nullaryOp_coupled_step_sim_all_four
+      (fun _ => 0) (fun _ => 0) (fun _ => 0) (fun _ => 0)
+      v1NullaryTupleMir ((get? v1NullaryTupleMir.basicBlocks 0).getD (mkBb [] .return_))
+      (npInitLiveState v1NullaryTupleMir []) 1 dummySpan .uninit (localName 1)
+      rfl rfl rfl hNeDead rfl rfl).1
+      npTuple16MirTy npTuple16MrTy 16 ⟨8⟩
+      ((set? (npInitLiveState v1NullaryTupleMir []).frame.locals 1 (.init (.scalar ⟨16, 8⟩))).getD [])
+      v1NullaryTupleMach mBM1 mBMf (liftMachToTB v1NullaryTupleMach) mTB1 mTBf
+      rfl (by decide +kernel) (by decide +kernel) rfl
+      rfl np_v1_minirust_layout_and_offset_agreement.1 wBM (liftMachToTB_wfLive v1NullaryTupleMach) wTB
+    exact ⟨⟨_, hSim.2.1, hSim.2.2.1⟩, ⟨mBMf, hSim.2.2.2.2.1⟩,
+      ⟨mTBf, hSim.2.2.2.2.2.2.1, hSim.2.2.2.2.2.2.2.1⟩, hSim.2.2.2.2.2.2.2.2.1⟩
+  · -- 2. `.alignOf`
+    obtain ⟨mBM1, mBMf, ⟨wBM⟩⟩ := np_assign_frame_of_check (M := BM) v1AlignOfOnlyMach (localName 0)
+      (.UnOp (.ComputeAlign npTuple16MrTy) (.Tuple [] unitType)) (.Int (Int.ofNat 8)) usizeMrTy
+      (by decide +kernel) rfl rfl
+    obtain ⟨mTB1, mTBf, ⟨wTB⟩⟩ := np_assign_frame_of_check (M := TBM)
+      (liftMachToTB v1AlignOfOnlyMach) (localName 0)
+      (.UnOp (.ComputeAlign npTuple16MrTy) (.Tuple [] unitType)) (.Int (Int.ofNat 8)) usizeMrTy
+      (by decide +kernel) rfl rfl
+    have hSim := (np_v1_nullaryOp_coupled_step_sim_all_four
+      (fun _ => 0) (fun _ => 0) (fun _ => 0) (fun _ => 0)
+      v1AlignOfOnlyMir ((get? v1AlignOfOnlyMir.basicBlocks 0).getD (mkBb [] .return_))
+      (npInitLiveState v1AlignOfOnlyMir []) 0 dummySpan .uninit (localName 0)
+      rfl rfl rfl hNeDead rfl rfl).2.1
+      npTuple16MirTy npTuple16MrTy 16 8 ⟨16⟩
+      ((set? (npInitLiveState v1AlignOfOnlyMir []).frame.locals 0 (.init (.scalar ⟨8, 8⟩))).getD [])
+      v1AlignOfOnlyMach mBM1 mBMf (liftMachToTB v1AlignOfOnlyMach) mTB1 mTBf
+      rfl (by decide +kernel) (by decide +kernel) (by decide +kernel) rfl
+      rfl np_v1_minirust_layout_and_offset_agreement.1 wBM (liftMachToTB_wfLive v1AlignOfOnlyMach) wTB
+    exact ⟨⟨_, hSim.2.1, hSim.2.2.1⟩, ⟨mBMf, hSim.2.2.2.2.1⟩,
+      ⟨mTBf, hSim.2.2.2.2.2.2.1, hSim.2.2.2.2.2.2.2.1⟩, hSim.2.2.2.2.2.2.2.2.1⟩
+  · -- 3. `.offsetOf [(0, 1)]`
+    obtain ⟨mBM1, mBMf, ⟨wBM⟩⟩ := np_assign_frame_of_check (M := BM) v1NullaryPaddedOffsetMach (localName 0)
+      (.Constant (.Int (Int.ofNat 4)) usizeMrTy) (.Int (Int.ofNat 4)) usizeMrTy
+      (by decide +kernel) rfl rfl
+    obtain ⟨mTB1, mTBf, ⟨wTB⟩⟩ := np_assign_frame_of_check (M := TBM)
+      (liftMachToTB v1NullaryPaddedOffsetMach) (localName 0)
+      (.Constant (.Int (Int.ofNat 4)) usizeMrTy) (.Int (Int.ofNat 4)) usizeMrTy
+      (by decide +kernel) rfl rfl
+    have hSim := (np_v1_nullaryOp_coupled_step_sim_all_four
+      (fun _ => 0) (fun _ => 0) (fun _ => 0) (fun _ => 0)
+      v1NullaryPaddedOffsetMir ((get? v1NullaryPaddedOffsetMir.basicBlocks 0).getD (mkBb [] .return_))
+      (npInitLiveState v1NullaryPaddedOffsetMir []) 0 dummySpan .uninit (localName 0)
+      rfl rfl rfl hNeDead rfl rfl).2.2.1
+      npPaddedMirTy [(0, 1)] 8 4
+      ((set? (npInitLiveState v1NullaryPaddedOffsetMir []).frame.locals 0 (.init (.scalar ⟨4, 8⟩))).getD [])
+      v1NullaryPaddedOffsetMach mBM1 mBMf (liftMachToTB v1NullaryPaddedOffsetMach) mTB1 mTBf
+      rfl (by decide +kernel) (by decide +kernel) (by decide +kernel) rfl
+      wBM (liftMachToTB_wfLive v1NullaryPaddedOffsetMach) wTB
+    exact ⟨⟨_, hSim.2.1, hSim.2.2.1⟩, ⟨mBMf, hSim.2.2.2.2.1⟩,
+      ⟨mTBf, hSim.2.2.2.2.2.2.1, hSim.2.2.2.2.2.2.2.1⟩, hSim.2.2.2.2.2.2.2.2.1⟩
+  · -- 4a. `.ubChecks` (`u8` `Switch` lowering)
+    obtain ⟨mBM1, mBMf, ⟨wBM⟩⟩ := np_assign_frame_of_check (M := BM) v1NullaryUbBranchMach (localName 1)
+      (.Constant (.Int 1) u8MrTy) (.Int 1) u8MrTy
+      (by decide +kernel) rfl rfl
+    obtain ⟨mTB1, mTBf, ⟨wTB⟩⟩ := np_assign_frame_of_check (M := TBM)
+      (liftMachToTB v1NullaryUbBranchMach) (localName 1)
+      (.Constant (.Int 1) u8MrTy) (.Int 1) u8MrTy
+      (by decide +kernel) rfl rfl
+    have hSim := (np_v1_nullaryOp_coupled_step_sim_all_four
+      (fun _ => 0) (fun _ => 0) (fun _ => 0) (fun _ => 0)
+      v1NullaryUbBranchMir ((get? v1NullaryUbBranchMir.basicBlocks 0).getD (mkBb [] .return_))
+      (npInitLiveState v1NullaryUbBranchMir []) 1 dummySpan .uninit (localName 1)
+      rfl rfl rfl hNeDead rfl rfl).2.2.2.1
+      0 ((set? (npInitLiveState v1NullaryUbBranchMir []).frame.locals 1
+          (.init (.scalar (boolToScalar true)))).getD [])
+      v1NullaryUbBranchMach mBM1 mBMf (liftMachToTB v1NullaryUbBranchMach) mTB1 mTBf
+      rfl rfl wBM (liftMachToTB_wfLive v1NullaryUbBranchMach) wTB
+    exact ⟨⟨_, hSim.2.1, hSim.2.2.1⟩, ⟨mBMf, hSim.2.2.2.2.1⟩,
+      ⟨mTBf, hSim.2.2.2.2.2.2.1, hSim.2.2.2.2.2.2.2.1⟩, hSim.2.2.2.2.2.2.2.2.1⟩
+  · -- 4b. `.ubChecks` (native `.Bool` lowering)
+    obtain ⟨mBM1, mBMf, ⟨wBM⟩⟩ := np_assign_frame_of_check (M := BM) v1NullaryUbChecksMach (localName 0)
+      (.Constant (.Bool true) .Bool) (.Bool true) .Bool
+      (by decide +kernel) rfl rfl
+    obtain ⟨mTB1, mTBf, ⟨wTB⟩⟩ := np_assign_frame_of_check (M := TBM)
+      (liftMachToTB v1NullaryUbChecksMach) (localName 0)
+      (.Constant (.Bool true) .Bool) (.Bool true) .Bool
+      (by decide +kernel) rfl rfl
+    have hSim := (np_v1_nullaryOp_coupled_step_sim_all_four
+      (fun _ => 0) (fun _ => 0) (fun _ => 0) (fun _ => 0)
+      v1NullaryUbChecksMir ((get? v1NullaryUbChecksMir.basicBlocks 0).getD (mkBb [] .return_))
+      (npInitLiveState v1NullaryUbChecksMir []) 0 dummySpan .uninit (localName 0)
+      rfl rfl rfl hNeDead rfl rfl).2.2.2.2
+      0 ((set? (npInitLiveState v1NullaryUbChecksMir []).frame.locals 0
+          (.init (.scalar (boolToScalar true)))).getD [])
+      v1NullaryUbChecksMach mBM1 mBMf (liftMachToTB v1NullaryUbChecksMach) mTB1 mTBf
+      rfl rfl wBM (liftMachToTB_wfLive v1NullaryUbChecksMach) wTB
+    exact ⟨⟨_, hSim.2.1, hSim.2.2.1⟩, ⟨mBMf, hSim.2.2.2.2.1⟩,
+      ⟨mTBf, hSim.2.2.2.2.2.2.1, hSim.2.2.2.2.2.2.2.1⟩, hSim.2.2.2.2.2.2.2.2.1⟩
+  · -- 5. Dead-destination UB lockstep (`NpMrDeadAssignFrame`)
+    obtain ⟨wDeadBM⟩ := np_dead_assign_frame_of_check (M := BM) v1DeadDstMach (localName 1)
+      (.UnOp (.ComputeSize npTuple16MrTy) (.Tuple [] unitType)) usizeMrTy
+      (by decide +kernel) rfl rfl
+    obtain ⟨wDeadTB⟩ := np_dead_assign_frame_of_check (M := TBM)
+      (liftMachToTB v1DeadDstMach) (localName 1)
+      (.UnOp (.ComputeSize npTuple16MrTy) (.Tuple [] unitType)) usizeMrTy
+      (by decide +kernel) rfl rfl
+    have hNull : evalNullaryOp (initMachineState v1DeadDstMir []).frame.locals .sizeOf
+        npTuple16MirTy (initMachineState v1DeadDstMir []).memory
+        ((initMachineState v1DeadDstMir []).memory.activeCallee.getD v1DeadDstMir).localDecls
+        ((initMachineState v1DeadDstMir []).memory.activeCallee.getD v1DeadDstMir).layouts =
+        .ok (.scalar ⟨16, 8⟩) (initMachineState v1DeadDstMir []).frame.locals
+          (initMachineState v1DeadDstMir []).memory :=
+      np_v1_nullary_sizeOf_of_intrinsic (initMachineState v1DeadDstMir []).frame.locals
+        npTuple16MirTy (initMachineState v1DeadDstMir []).memory
+        v1DeadDstMir.localDecls v1DeadDstMir.layouts 16 (by decide +kernel) (by decide +kernel)
+    have hDead := np_v1_nullaryOp_dead_dst_ub_lockstep v1DeadDstMir
+      ((get? v1DeadDstMir.basicBlocks 0).getD (mkBb [] .return_))
+      (initMachineState v1DeadDstMir []) 1 .sizeOf npTuple16MirTy dummySpan
+      (.scalar ⟨16, 8⟩) (localName 1)
+      (.UnOp (.ComputeSize npTuple16MrTy) (.Tuple [] unitType))
+      v1DeadDstMach (liftMachToTB v1DeadDstMach)
+      rfl rfl rfl hNull rfl wDeadBM wDeadTB
+    exact ⟨hDead.2.1, hDead.2.2.2.1, hDead.2.2.2.2.2⟩
+
 /-! ## §3 (`V2`): `CastKind.pointerCoercion` — all 6 coercions (`Mach` & `MachTB`) -/
 
 /-- **V2 Universal Dispatch Law**: `evalRvalue` evaluates every
@@ -1744,22 +2154,35 @@ abbrev np_v2_dyn_checkPtr_traitObject_zst_ok_mach := @checkPtr_traitObject_zst_o
 counterpart of `np_v2_dyn_checkPtr_traitObject_zst_ok_mach`. -/
 abbrev np_v2_dyn_checkPtrM_traitObject_zst_ok_tb := @checkPtrM_traitObject_zst_tb_ok
 
-/-- **Non-Vacuity of `np_v2_dyn_wide_ptr_vtable_ops_universal_M`**: its four
-hypotheses hold on the concrete machine `npDynUnsizeMach` (vtable of trait `0`
-registered at `8192`), where the universal theorem resolves the vtable pointer
-to `dynDispatchVTable`. -/
+/-- **Non-Vacuity of `np_v2_dyn_wide_ptr_vtable_ops_universal_M` (`Mach` &
+`MachTB`)**: its four hypotheses hold on BOTH `npDynUnsizeMach` (`M = BM`) AND
+`liftMachToTB npDynUnsizeMach` (`M = TBM`, with `MachTB.wfLive`), where the
+universal theorem resolves the trait-`0` vtable pointer at `8192` to
+`dynDispatchVTable` on both memory models. -/
 theorem np_v2_dyn_wide_ptr_vtable_ops_universal_M_nonvacuous :
-    vtableFromPtrM npDynUnsizeMach ({ addr := 8192, provenance := some (⟨3⟩, ()) } : Ptr) =
-      .ok dynDispatchVTable ∧
-    vtableLookupM npDynUnsizeMach ({ addr := 8192, provenance := some (⟨3⟩, ()) } : Ptr) =
-      .ok dynDispatchVTable :=
-  have h := np_v2_dyn_wide_ptr_vtable_ops_universal_M (M := BM) npDynUnsizeMach (traitNameOf 0)
+    let vtBM : Ptr := { addr := 8192, provenance := some (⟨3⟩, ()) }
+    let mTB : MachTB := liftMachToTB npDynUnsizeMach
+    let vtTB : Gen.ThinPointer (Gen.Memory.Provenance TBM) := liftThinPtrTB vtBM
+    vtableFromPtrM npDynUnsizeMach vtBM = .ok dynDispatchVTable ∧
+    vtableLookupM npDynUnsizeMach vtBM = .ok dynDispatchVTable ∧
+    MachTB.wfLive mTB ∧
+    vtableFromPtrM mTB vtTB = .ok dynDispatchVTable ∧
+    vtableLookupM mTB vtTB = .ok dynDispatchVTable :=
+  have hBM := np_v2_dyn_wide_ptr_vtable_ops_universal_M (M := BM) npDynUnsizeMach (traitNameOf 0)
     dynDispatchVTable ⟨⟨0⟩⟩ ({ addr := 640, provenance := some (⟨4⟩, ()) } : Ptr)
     ({ addr := 8192, provenance := some (⟨3⟩, ()) } : Ptr)
     ({ addr := 8192, provenance := some (⟨3⟩, ()) } : Ptr)
     (by first | rfl | decide +kernel) (by first | rfl | decide +kernel)
     (by first | rfl | decide +kernel) (by first | rfl | decide +kernel)
-  ⟨h.1, h.2.1⟩
+  have hTB := np_v2_dyn_wide_ptr_vtable_ops_universal_M (M := TBM)
+    (liftMachToTB npDynUnsizeMach) (traitNameOf 0)
+    dynDispatchVTable ⟨⟨0⟩⟩
+    (liftThinPtrTB ({ addr := 640, provenance := some (⟨4⟩, ()) } : Ptr))
+    (liftThinPtrTB ({ addr := 8192, provenance := some (⟨3⟩, ()) } : Ptr))
+    (liftThinPtrTB ({ addr := 8192, provenance := some (⟨3⟩, ()) } : Ptr))
+    (by first | rfl | decide +kernel) (by first | rfl | decide +kernel)
+    (by first | rfl | decide +kernel) (by first | rfl | decide +kernel)
+  ⟨hBM.1, hBM.2.1, liftMachToTB_wfLive npDynUnsizeMach, hTB.1, hTB.2.1⟩
 
 /-! ## §4 (`V3`): `CastKind.fnPtrToPtr` (`Mach` & `MachTB`) -/
 
@@ -2077,6 +2500,175 @@ theorem np_v4_unwrapUnsafeBinder_three_way_witness :
    by decide +kernel, by decide +kernel,
    ok_of_map_toOption (by decide +kernel),
    by decide +kernel⟩
+
+/-! ### Explicit `StorageLive` -> `Assign` -> `StorageDead` Post-Cleanup Lifecycle Fixtures -/
+
+/-- `V1` (`size_of`) post-cleanup MIR fixture with explicit `StorageLive _1` /
+`StorageDead _1`, executed from standard `initMachineState` (where non-argument
+local `_1` starts `.dead`). -/
+def npV1StorageLifecycleMir : CapturedMir :=
+  mkMirBody "np::w_v1_storage_lifecycle" [mkDecl usizeMirTy, mkDecl usizeMirTy] 0
+    [mkBb [mkSt (.storageLive 1),
+           mkSt (.assign (locPlace 1) (.nullaryOp .sizeOf npTuple16MirTy)),
+           mkSt (.assign (locPlace 0) (.use (.copy (locPlace 1)))),
+           mkSt (.storageDead 1)]
+      .return_]
+
+/-- `V1` post-`StorageDead` UB fixture: reads `_1` after `StorageDead _1`. -/
+def npV1PostStorageDeadUbMir : CapturedMir :=
+  mkMirBody "np::w_v1_post_storage_dead_ub" [mkDecl usizeMirTy, mkDecl usizeMirTy] 0
+    [mkBb [mkSt (.storageLive 1),
+           mkSt (.assign (locPlace 1) (.nullaryOp .sizeOf npTuple16MirTy)),
+           mkSt (.storageDead 1),
+           mkSt (.assign (locPlace 0) (.use (.copy (locPlace 1))))]
+      .return_]
+
+/-- MiniRust machine for `npV1StorageLifecycleMir`: `localName 1` starts dead
+(omitted from `fr.locals`), is allocated by `StorageLive`, receives
+`ComputeSize npTuple16MrTy = 16`, is copied into `_0`, and is deallocated by
+`StorageDead`. -/
+def npV1StorageLifecycleMach : Mach :=
+  let fn := mkMrFn [(localName 0, usizeMrTy), (localName 1, usizeMrTy)] [] (localName 0)
+    [(bbName 0, ⟨[
+        .StorageLive (localName 1),
+        .Assign (.Local (localName 1)) (.UnOp (.ComputeSize npTuple16MrTy) (.Tuple [] unitType)),
+        .Assign (.Local (localName 0)) (.Load (.Local (localName 1))),
+        .StorageDead (localName 1)],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 8 .Uninit) 8]
+    [mkRootFrame fn [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) })]]
+
+/-- MiniRust machine for `npV1PostStorageDeadUbMir`: loads `localName 1` after
+`StorageDead (localName 1)`. -/
+def npV1PostStorageDeadUbMach : Mach :=
+  let fn := mkMrFn [(localName 0, usizeMrTy), (localName 1, usizeMrTy)] [] (localName 0)
+    [(bbName 0, ⟨[
+        .StorageLive (localName 1),
+        .Assign (.Local (localName 1)) (.UnOp (.ComputeSize npTuple16MrTy) (.Tuple [] unitType)),
+        .StorageDead (localName 1),
+        .Assign (.Local (localName 0)) (.Load (.Local (localName 1)))],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 8 .Uninit) 8]
+    [mkRootFrame fn [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) })]]
+
+/-- `V4` (`wrapUnsafeBinder` / `unwrapUnsafeBinder`) post-cleanup MIR fixture
+with explicit `StorageLive _2` / `StorageDead _2`, executed from standard
+`initMachineState` (where `_2` starts `.dead`). -/
+def npV4StorageLifecycleMir : CapturedMir :=
+  mkMirBody "np::w_v4_storage_lifecycle"
+    [mkDecl u32MirTy, mkDecl u32MirTy, mkDecl npBinderU32MirTy] 1
+    [mkBb [mkSt (.storageLive 2),
+           mkSt (.assign (locPlace 2) (.wrapUnsafeBinder (.copy (locPlace 1)) npBinderU32MirTy)),
+           mkSt (.assign (locPlace 2 [.unwrapUnsafeBinder u32MirTy]) (.use (constU32 73))),
+           mkSt (.assign (locPlace 0) (.use (.copy (locPlace 2 [.unwrapUnsafeBinder u32MirTy])))),
+           mkSt (.storageDead 2)]
+      .return_]
+    npLayouts
+
+/-- `V4` post-`StorageDead` UB fixture: reads `_2.unwrapUnsafeBinder` after
+`StorageDead _2`. -/
+def npV4PostStorageDeadUbMir : CapturedMir :=
+  mkMirBody "np::w_v4_post_storage_dead_ub"
+    [mkDecl u32MirTy, mkDecl u32MirTy, mkDecl npBinderU32MirTy] 1
+    [mkBb [mkSt (.storageLive 2),
+           mkSt (.assign (locPlace 2) (.wrapUnsafeBinder (.copy (locPlace 1)) npBinderU32MirTy)),
+           mkSt (.assign (locPlace 2 [.unwrapUnsafeBinder u32MirTy]) (.use (constU32 73))),
+           mkSt (.storageDead 2),
+           mkSt (.assign (locPlace 0) (.use (.copy (locPlace 2 [.unwrapUnsafeBinder u32MirTy]))))]
+      .return_]
+    npLayouts
+
+/-- MiniRust machine for `npV4StorageLifecycleMir`: `localName 2` starts dead
+(omitted from `fr.locals`). -/
+def npV4StorageLifecycleMach : Mach :=
+  let wrapTy := mrBinderWrapperTy u32MrTy ⟨4⟩ ⟨4⟩
+  let fn := mkMrFn [(localName 0, u32MrTy), (localName 1, u32MrTy), (localName 2, wrapTy)]
+    [localName 1] (localName 0)
+    [(bbName 0, ⟨[
+        .StorageLive (localName 2),
+        .Assign (.Local (localName 2)) (.Tuple [.Load (.Local (localName 1))] wrapTy),
+        .Assign (.Field (.Local (localName 2)) 0) (.Constant (.Int 73) u32MrTy),
+        .Assign (.Local (localName 0)) (.Load (.Field (.Local (localName 2)) 0)),
+        .StorageDead (localName 2)],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (scalarBytes u32 10) 4]
+    [mkRootFrame fn
+      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) })]]
+
+/-- MiniRust machine for `npV4PostStorageDeadUbMir`. -/
+def npV4PostStorageDeadUbMach : Mach :=
+  let wrapTy := mrBinderWrapperTy u32MrTy ⟨4⟩ ⟨4⟩
+  let fn := mkMrFn [(localName 0, u32MrTy), (localName 1, u32MrTy), (localName 2, wrapTy)]
+    [localName 1] (localName 0)
+    [(bbName 0, ⟨[
+        .StorageLive (localName 2),
+        .Assign (.Local (localName 2)) (.Tuple [.Load (.Local (localName 1))] wrapTy),
+        .Assign (.Field (.Local (localName 2)) 0) (.Constant (.Int 73) u32MrTy),
+        .StorageDead (localName 2),
+        .Assign (.Local (localName 0)) (.Load (.Field (.Local (localName 2)) 0))],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (scalarBytes u32 10) 4]
+    [mkRootFrame fn
+      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) })]]
+
+/-- **Explicit `StorageLive` -> `Assign` -> `StorageDead` Post-Cleanup MIR
+Lifecycle Three-Way Witness (Trusted `initMachineState`, `Mach`, and `MachTB`
+with `MachTB.wfLive`)**:
+starting from standard `initMachineState` (non-argument temporaries begin
+`.dead`, never pre-livened via `npInitLiveState`):
+1. `V1` (`size_of`): `StorageLive _1 -> _1 = size_of(Tuple16) -> _0 = _1 -> StorageDead _1`
+   returns `16` across Trusted, `Mach`, and `MachTB` (preserving `MachTB.wfLive`),
+   and reading `_1` after `StorageDead _1` faults UB across all three;
+2. `V4` (`wrapUnsafeBinder` / `unwrapUnsafeBinder`): `StorageLive _2 -> wrap -> write 73 -> read 73 -> StorageDead _2`
+   returns `73` across Trusted, `Mach`, and `MachTB` (preserving `MachTB.wfLive`),
+   and reading `_2.unwrapUnsafeBinder` after `StorageDead _2` faults UB across
+   all three. -/
+theorem np_storage_lifecycle_three_way_witness :
+    -- 1. V1 StorageLive -> nullaryOp -> StorageDead
+    npRunTrusted npV1StorageLifecycleMir 16 (initMachineState npV1StorageLifecycleMir []) =
+      .usizeVal 16 ∧
+    (∃ m4, Interp.steps 4 npV1StorageLifecycleMach = .ok m4 ∧
+      (m4.mem.memory.allocations[0]?.map (·.data), m4.mem.memory.allocations[1]?.map (·.live)) =
+        (some (scalarBytes IntType.usize_ty 16), some false)) ∧
+    (∃ m4, Interp.stepsTB 4 (liftMachToTB npV1StorageLifecycleMach) = .ok m4 ∧ MachTB.wfLive m4 ∧
+      (m4.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB),
+       m4.mem.memory.mem.allocations[1]?.map (·.live)) =
+        (some ((scalarBytes IntType.usize_ty 16).map (projByteTB ∘ liftByteTB)), some false)) ∧
+    npRunTrusted npV1PostStorageDeadUbMir 16 (initMachineState npV1PostStorageDeadUbMir []) = .ub ∧
+    Interp.steps 4 npV1PostStorageDeadUbMach = .error (.ub "access to a dead local") ∧
+    Interp.stepsTB 4 (liftMachToTB npV1PostStorageDeadUbMach) =
+      .error (.ub "access to a dead local") ∧
+    -- 2. V4 StorageLive -> wrap/unwrap -> StorageDead
+    npRunTrusted npV4StorageLifecycleMir 16
+      (initMachineState npV4StorageLifecycleMir [.scalar ⟨10, 4⟩]) = .u32Val 73 ∧
+    (∃ m5, Interp.steps 5 npV4StorageLifecycleMach = .ok m5 ∧
+      (m5.mem.memory.allocations[0]?.map (·.data), m5.mem.memory.allocations[2]?.map (·.live)) =
+        (some (scalarBytes u32 73), some false)) ∧
+    (∃ m5, Interp.stepsTB 5 (liftMachToTB npV4StorageLifecycleMach) = .ok m5 ∧ MachTB.wfLive m5 ∧
+      (m5.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB),
+       m5.mem.memory.mem.allocations[2]?.map (·.live)) =
+        (some ((scalarBytes u32 73).map (projByteTB ∘ liftByteTB)), some false)) ∧
+    npRunTrusted npV4PostStorageDeadUbMir 16
+      (initMachineState npV4PostStorageDeadUbMir [.scalar ⟨10, 4⟩]) = .ub ∧
+    Interp.steps 5 npV4PostStorageDeadUbMach = .error (.ub "access to a dead local") ∧
+    Interp.stepsTB 5 (liftMachToTB npV4PostStorageDeadUbMach) =
+      .error (.ub "access to a dead local") :=
+  ⟨by decide +kernel,
+   ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   by decide +kernel,
+   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel),
+   by decide +kernel,
+   ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   by decide +kernel,
+   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
 
 /-! ## §6. Canonical Executable MiniRust Corpus Observation Interface
 
