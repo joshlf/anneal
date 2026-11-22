@@ -1462,7 +1462,8 @@ impl<T: ReturnMutants + Clone, const N: usize> ReturnMutants for [T; N] {
         };
 
         let mut pos_muts: [[Option<T>; 4]; 4] = array::from_fn(|_| array::from_fn(|_| None));
-        let mut first_front_mut: Option<T> = None;
+        let mut front_mut: Option<T> = None;
+        let mut back_mut: Option<T> = None;
         for (slot, maybe_pos) in indices.iter().enumerate() {
             let Some(pos) = *maybe_pos else {
                 continue;
@@ -1470,8 +1471,11 @@ impl<T: ReturnMutants + Clone, const N: usize> ReturnMutants for [T; N] {
             let mut collected = 0usize;
             self[pos].visit_mutants(rng, |elem_mut| {
                 if collected < per_pos_cap {
-                    if pos == 0 && first_front_mut.is_none() {
-                        first_front_mut = Some(elem_mut.clone());
+                    if pos == 0 && front_mut.is_none() {
+                        front_mut = Some(elem_mut.clone());
+                    }
+                    if pos == last && back_mut.is_none() {
+                        back_mut = Some(elem_mut.clone());
                     }
                     pos_muts[slot][collected] = Some(elem_mut);
                     collected += 1;
@@ -1497,7 +1501,7 @@ impl<T: ReturnMutants + Clone, const N: usize> ReturnMutants for [T; N] {
                 // For `N == 2`, `swap(0, 1)`, `reverse()`, and `rotate_left(1)`
                 // coincide; for `N == 3`, `swap(0, 2)` and `reverse()` coincide.
                 let mut swapped = self.clone();
-                swapped.swap(0, N - 1);
+                swapped.swap(0, last);
                 emit(swapped);
 
                 if N >= 3 {
@@ -1512,10 +1516,12 @@ impl<T: ReturnMutants + Clone, const N: usize> ReturnMutants for [T; N] {
                     emit(reversed);
                 }
 
-                if let Some(m0) = first_front_mut.as_ref() {
+                // Perturb both ends using each end's own first mutant so `both_ends`
+                // never degenerates to a single-element mutant when `m0 == self[last]`.
+                if let (Some(m0), Some(mlast)) = (front_mut.as_ref(), back_mut.as_ref()) {
                     let mut both_ends = self.clone();
                     both_ends[0] = m0.clone();
-                    both_ends[N - 1] = m0.clone();
+                    both_ends[last] = mlast.clone();
                     emit(both_ends);
                 }
             }

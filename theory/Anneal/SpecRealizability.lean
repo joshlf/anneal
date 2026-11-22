@@ -1607,8 +1607,9 @@ private def normalizeGoalArith (budget : ProbeBudget) (goalTy : Expr) : MetaM Ex
   let passCap := min cap closedNatFoldHeartbeats
   let now ← IO.getNumHeartbeats
   let passEnd := now + passCap
-  let folded? ← withBoundedHeartbeats passCap
-    (foldClosedArith passEnd 96 goalTy)
+  let savedMsgs := (← getThe Core.State).messages
+  let folded? ← withBoundedHeartbeats passCap (foldClosedArith passEnd 96 goalTy)
+  modifyThe Core.State fun s => { s with messages := savedMsgs }
   return folded?.getD goalTy
 
 /-- Budget-aware variant of `tryProve`: re-derives a strictly positive heartbeat cap
@@ -1623,6 +1624,10 @@ private def normalizeGoalArith (budget : ProbeBudget) (goalTy : Expr) : MetaM Ex
     set to `true` if any snippet hits a heartbeat/recursion cap or budget exhaustion. -/
 private def tryProveWithin (budget : ProbeBudget) (goalTy : Expr)
     (cutOffRef? : Option (IO.Ref Bool) := none) : MetaM Bool := do
+  if (← budget.nextCap?).isNone then
+    if let some ref := cutOffRef? then
+      ref.set true
+    return false
   let goalTy ← normalizeGoalArith budget (← instantiateMVars goalTy)
   for tac in (← proverSnippets) do
     match ← budget.nextCap? with
@@ -1867,7 +1872,7 @@ def detectSyntacticTautology : Nat → List Expr → Expr → Option EnsuresVacu
       some .tautologicalImplication
     else if e.isAppOfArity ``Eq 3 then
       let args := e.getAppArgs
-      if args[1]! == args[2]! then some .reflexiveEquality else none
+      if args[1]!.consumeMData == args[2]!.consumeMData then some .reflexiveEquality else none
     else if e.isAppOfArity ``Iff 2 then
       let args := e.getAppArgs
       let lhs := args[0]!.consumeMData
@@ -1903,7 +1908,7 @@ def detectSyntacticTautology : Nat → List Expr → Expr → Option EnsuresVacu
         some .trivialConstantTrue
       else if inner.isAppOfArity ``Ne 3 then
         let args := inner.getAppArgs
-        if args[1]! == args[2]! then some .reflexiveEquality else none
+        if args[1]!.consumeMData == args[2]!.consumeMData then some .reflexiveEquality else none
       else if inner.isAppOfArity ``Not 1 then
         match detectSyntacticTautology fuel hyps inner.appArg! with
         | some r => some r
@@ -2499,20 +2504,32 @@ private def analyzeNormalizedSpec
 
   -- `∀ allVars, (cfpRefl →) goal`.
   let proveClosed (goal : Expr) : MetaM Bool := do
+    if (← budget.nextCap?).isNone then
+      probeCutOffRef.set true
+      return false
     tryProveWithin budget (← mkForallFVars allVars (← withCfpRefl goal)) cutOffOpt
   -- `∀ preInputs (h_pre : requires) fixedVars outVars, (cfpRefl →) goal`.
-  let proveUnderRequires (preNorm goal : Expr) : MetaM Bool :=
+  let proveUnderRequires (preNorm goal : Expr) : MetaM Bool := do
+    if (← budget.nextCap?).isNone then
+      probeCutOffRef.set true
+      return false
     withLocalDeclD `h_pre preNorm fun hPre => do
       tryProveWithin budget
         (← mkForallFVars (preInputs ++ #[hPre] ++ fixedVars ++ outVars) (← withCfpRefl goal))
         cutOffOpt
   -- `∀ allVars outs', (cfpRefl →) body → body[outs := outs']`.
   let proveInsensitive (body : Expr) : MetaM Bool := do
+    if (← budget.nextCap?).isNone then
+      probeCutOffRef.set true
+      return false
     match ← mkOutputInsensitivityGoal? allVars outVars body cfpReflTy? with
     | some goal => tryProveWithin budget goal cutOffOpt
     | none => return false
   -- The same goal with `h_pre : requires` in scope.
-  let proveInsensitiveUnderRequires (preNorm body : Expr) : MetaM Bool :=
+  let proveInsensitiveUnderRequires (preNorm body : Expr) : MetaM Bool := do
+    if (← budget.nextCap?).isNone then
+      probeCutOffRef.set true
+      return false
     withLocalDeclD `h_pre preNorm fun hPre => do
       let scopedVars := preInputs ++ #[hPre] ++ fixedVars ++ outVars
       match ← mkOutputInsensitivityGoal? scopedVars outVars body cfpReflTy? with
@@ -2552,7 +2569,6 @@ private def analyzeNormalizedSpec
     | none => none
 
   let mut notes : List String := []
-  let mut budgetExhaustedNoteAdded := false
 
   -- Phase 1: Subsingleton or empty output type (`UnboundReturnOutput`).
   -- Deciding emptiness can evaluate a type index (`Fin n`) and run instance synthesis,
@@ -2566,13 +2582,18 @@ private def analyzeNormalizedSpec
     let mut allSubsingleton := true
     for ov in outVars do
       let ovTy ← inferType ov
-      let isSub? ← withBoundedHeartbeats typeCap (isSubsingletonOrEmptyType 16 ovTy)
-      match isSub? with
-      | some true => pure ()
-      | some false =>
+      let savedMsgs := (← getThe Core.State).messages
+      let subOutcome ← withBoundedHeartbeatsOutcome typeCap (isSubsingletonOrEmptyType 16 ovTy)
+      modifyThe Core.State fun s => { s with messages := savedMsgs }
+      match subOutcome with
+      | .done true => pure ()
+      | .done false =>
         allSubsingleton := false
         break
-      | none =>
+      | .failed =>
+        allSubsingleton := false
+        break
+      | .cutOff =>
         notes := notes ++
           ["output-type subsingleton/emptiness check exceeded heartbeat/recursion cap; skipped conservatively"]
         allSubsingleton := false
@@ -2648,11 +2669,17 @@ private def analyzeNormalizedSpec
     else if !atoms.isEmpty then
       let cfpReflTy ← inferType (mkConst ``callFramePreserved_refl)
       let proveFibreContra (fibreAssump res : Expr) : MetaM Bool := do
+        if (← budget.nextCap?).isNone then
+          probeCutOffRef.set true
+          return false
         let body ←
           if res.isConstOf ``True then pure (negate fibreAssump)
           else mkArrow fibreAssump (negate res)
         tryProveWithin budget (← mkForallFVars allVars (← mkArrow cfpReflTy body)) cutOffOpt
-      let proveFibreContraUnderRequires (preNorm fibreAssump res : Expr) : MetaM Bool :=
+      let proveFibreContraUnderRequires (preNorm fibreAssump res : Expr) : MetaM Bool := do
+        if (← budget.nextCap?).isNone then
+          probeCutOffRef.set true
+          return false
         withLocalDeclD `h_pre preNorm fun hPre => do
           let scopedVars := preInputs ++ #[hPre] ++ fixedVars ++ outVars
           let body ←
@@ -2660,10 +2687,16 @@ private def analyzeNormalizedSpec
             else mkArrow fibreAssump (negate res)
           tryProveWithin budget (← mkForallFVars scopedVars (← mkArrow cfpReflTy body)) cutOffOpt
       let proveFibreInsensitive (fibreAssump res : Expr) : MetaM Bool := do
+        if (← budget.nextCap?).isNone then
+          probeCutOffRef.set true
+          return false
         match ← mkFibreInsensitivityGoal? allVars outVars cfpReflTy fibreAssump res with
         | some goal => tryProveWithin budget goal cutOffOpt
         | none => return false
-      let proveFibreInsensitiveUnderRequires (preNorm fibreAssump res : Expr) : MetaM Bool :=
+      let proveFibreInsensitiveUnderRequires (preNorm fibreAssump res : Expr) : MetaM Bool := do
+        if (← budget.nextCap?).isNone then
+          probeCutOffRef.set true
+          return false
         withLocalDeclD `h_pre preNorm fun hPre => do
           let scopedVars := preInputs ++ #[hPre] ++ fixedVars ++ outVars
           match ← mkFibreInsensitivityGoal? scopedVars outVars cfpReflTy fibreAssump res with
@@ -2723,6 +2756,7 @@ private def analyzeNormalizedSpec
       let mut allLiveTrue := true
       let mut anyInsensitive := false
       let mut firstTautReason? : Option EnsuresVacuityReason := none
+      let mut phase3BudgetExhausted := false
       for mask in [:numMasks] do
         let mut maskFeasible := true
         for i in [:atoms.size] do
@@ -2732,19 +2766,21 @@ private def analyzeNormalizedSpec
               break
         if !maskFeasible then
           continue
-        let remCap? ← budget.nextCap?
-        if remCap?.isNone then
-          notes := notes ++
-            ["probe heartbeat budget exhausted during boilerplate cofactoring; remaining fibres degraded conservatively"]
-          budgetExhaustedNoteAdded := true
-          fibreGenuine := true
-          break
-        let remCap := remCap?.getD 1000
         feasibleMasks := feasibleMasks + 1
         let fibreAssump := mkFibreAssumption atoms mask
         let rawRes := cofactorBoilerplate 64 atoms mask workBody
-        let res? ← withBoundedHeartbeats remCap (unfoldUserConnectives 8 rawRes)
-        let res := res?.getD rawRes
+        -- Even once the prover heartbeat budget is exhausted, pure boilerplate
+        -- cofactoring and syntactic fibre checks (`False`, `True`, `!mentionsOutput`,
+        -- `detectSyntacticTautology`) still run at zero heartbeat cost while every
+        -- semantic probe degrades conservatively to `false`.
+        let mut res := rawRes
+        match ← budget.nextCap? with
+        | some remCap =>
+          let unfolded? ← withBoundedHeartbeats remCap (unfoldUserConnectives 8 rawRes)
+          res := unfolded?.getD rawRes
+        | none =>
+          phase3BudgetExhausted := true
+          probeCutOffRef.set true
         match ← classifyFibre fibreAssump res with
         | .contradictory => pure ()
         | .tautological tautReason =>
@@ -2763,6 +2799,9 @@ private def analyzeNormalizedSpec
         -- One genuine fibre settles Phase 3; skip the remaining fibres.
         if fibreGenuine then break
       if !fibreGenuine then
+        if phase3BudgetExhausted then
+          notes := notes ++
+            ["probe heartbeat budget exhausted during boilerplate cofactoring; remaining fibres classified syntactically"]
         if liveFibres == 0 then
           return .vacuous .unrealizableUnderRequires
             (notes ++ ["every boilerplate fibre is contradictory"])
@@ -2820,10 +2859,10 @@ private def analyzeNormalizedSpec
 
   let probeCutOff ← probeCutOffRef.get
   let budgetExhausted := (← budget.nextCap?).isNone
-  if !budgetExhaustedNoteAdded && budgetExhausted then
+  if budgetExhausted then
     notes := notes ++
       ["probe heartbeat budget exhausted; remaining semantic vacuity checks degraded conservatively"]
-  else if !budgetExhaustedNoteAdded && probeCutOff then
+  else if probeCutOff then
     notes := notes ++
       ["one or more semantic vacuity probes exceeded their heartbeat/recursion cap; degraded conservatively"]
 

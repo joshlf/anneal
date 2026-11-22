@@ -34,8 +34,9 @@ Exercises:
    tautologies, contradictory and `requires`-vacuous boilerplate fibres,
    type-checked substituted goals, degradation notes that tell a probe the tactics
    failed to prove apart from one a heartbeat or recursion cap cut off,
-   `TotalClaim` / `ModularClaim` declarations, and the literal cross-language
-   `VacuityClass` wire names.
+   starved-budget syntactic fibre classification, native `Option`/`Except`/`BinTree`
+   negative controls, `TotalClaim` / `ModularClaim` declarations, and the literal
+   cross-language `VacuityClass` wire names.
 4. **Compile-Time Kernel Axiom Audit (EOF)**: Audits every constant defined by the
    `Anneal.SpecRealizability` module and by this file (selected by defining module, not
    by name prefix), of every kind (theorems, definitions, instances), for
@@ -1948,18 +1949,23 @@ private theorem scalarModulus_pos (k : Nat) : 0 < scalarModulus k := by
     show 0 < Nat.mul 256 (scalarModulus n)
     exact Nat.mul_pos (by decide) ih
 
+/-- Polymorphic-exponent dichotomy helper: keeping `e` abstract avoids kernel
+    reduction of large literal exponents (`2 ^ 1000000`) during elaboration. -/
+private theorem lt_pow_and_modulus_dichotomy (e k : Nat) :
+    PostconditionDichotomy (fun _ : Nat => True)
+      (fun _ ret : Nat => ret < 2 ^ e ∧ ret < scalarModulus k) := by
+  refine ⟨0, trivial, ⟨0, Nat.pow_pos Nat.zero_lt_two, scalarModulus_pos k⟩, ⟨2 ^ e, ?_⟩⟩
+  rintro ⟨hLt, _⟩
+  exact Nat.lt_irrefl (2 ^ e) hLt
+
 /-- Genuine postcondition mentioning an oversized closed power (`2 ^ 1000000`) and
     large `scalarModulus 1000`: both must stay symbolic without bignum stalls. -/
 def oversizedExpPost (_x ret : Nat) : Prop :=
   ret < 2 ^ 1000000 ∧ ret < scalarModulus 1000
 
 theorem oversizedExpPost_dichotomy :
-    PostconditionDichotomy (fun _ : Nat => True) oversizedExpPost := by
-  refine ⟨0, trivial, ⟨0, ?_, ?_⟩, ⟨2 ^ 1000000, ?_⟩⟩
-  · exact Nat.pow_pos Nat.zero_lt_two
-  · exact scalarModulus_pos 1000
-  · rintro ⟨hLt, _⟩
-    exact Nat.lt_irrefl _ hLt
+    PostconditionDichotomy (fun _ : Nat => True) oversizedExpPost :=
+  lt_pow_and_modulus_dichotomy 1000000 1000
 
 /-- Precondition over a recursion-deep type index: `checkRequiresSatisfiable` must
     contain typeclass and witness timeouts instead of throwing a runtime exception. -/
@@ -2100,20 +2106,29 @@ theorem succExactPost_dichotomy :
 #eval show Lean.Meta.MetaM Unit from do
   -- An ordinary exception (what a tactic that cannot close its goal throws) is a
   -- failure, not a cutoff; only heartbeat or recursion exhaustion is a cutoff.
-  let failed ← withBoundedHeartbeatsOutcome 1000000
+  let errOutcome ← withBoundedHeartbeatsOutcome 1000000
     (throwError "ordinary probe failure" : Lean.Meta.MetaM Nat)
-  unless failed.isFailed && !failed.isCutOff && failed.toOption.isNone do
+  match errOutcome with
+  | .failed => pure ()
+  | _ => throwError "expected .failed constructor for ordinary exception"
+  unless errOutcome.isFailed && !errOutcome.isCutOff && errOutcome.toOption.isNone do
     throwError "expected an ordinary exception to be classified as failed, not cut off"
-  let finished ← withBoundedHeartbeatsOutcome 1000000 (pure 7 : Lean.Meta.MetaM Nat)
-  unless finished.toOption == some 7 && !finished.isFailed && !finished.isCutOff do
+  let doneOutcome ← withBoundedHeartbeatsOutcome 1000000 (pure 7 : Lean.Meta.MetaM Nat)
+  match doneOutcome with
+  | .done 7 => pure ()
+  | _ => throwError "expected .done 7 constructor for normal return"
+  unless doneOutcome.toOption == some 7 && !doneOutcome.isFailed && !doneOutcome.isCutOff do
     throwError "expected a normal return to be classified as done"
-  let cutOff ← withBoundedHeartbeatsOutcome 1000 do
+  let cutOffOutcome ← withBoundedHeartbeatsOutcome 1000 do
     let mut acc := Lean.mkNatLit 0
     for i in [0:20000] do
       acc ← Lean.Meta.whnf (Lean.mkNatAdd acc (Lean.mkNatLit i))
       Lean.Core.checkSystem "SpecRealizabilityTests cutoff classification probe"
     return acc
-  unless cutOff.isCutOff && !cutOff.isFailed && cutOff.toOption.isNone do
+  match cutOffOutcome with
+  | .cutOff => pure ()
+  | _ => throwError "expected .cutOff constructor for heartbeat exhaustion"
+  unless cutOffOutcome.isCutOff && !cutOffOutcome.isFailed && cutOffOutcome.toOption.isNone do
     throwError "expected heartbeat exhaustion to be classified as cut off"
   -- A genuine postcondition under the default budget is accepted with no note at
   -- all: its probes are refuted by failing tactics, and a failed tactic must not be
@@ -2218,6 +2233,97 @@ example : VacuityClass.specViolation.canonicalName = "SpecViolation" := rfl
 example : VacuityClass.trivialPostcondition.canonicalName = "TrivialPostcondition" := rfl
 example : VacuityClass.unboundReturnOutput.canonicalName = "UnboundReturnOutput" := rfl
 example : VacuityClass.survivedAllMutants.canonicalName = "SurvivedAllMutants" := rfl
+
+/-! ### 3.19 Starved-Budget Syntactic Fibres & Final Negative Controls -/
+
+/-- Polymorphic-exponent dichotomy helper for a single upper-bound postcondition. -/
+private theorem lt_pow_dichotomy (e : Nat) :
+    PostconditionDichotomy (fun _ : Nat => True) (fun _ ret : Nat => ret < 2 ^ e) := by
+  refine ⟨0, trivial, ⟨0, Nat.pow_pos Nat.zero_lt_two⟩, ⟨2 ^ e, ?_⟩⟩
+  intro hLt
+  exact Nat.lt_irrefl (2 ^ e) hLt
+
+/-- Genuine postcondition with a closed power between Lean's exponentiation warning
+    threshold (`256`) and `closedNatFoldBound` (`512`): `normalizeGoalArith` must
+    isolate `Core.State.messages` so folding `2 ^ 300` never leaks a warning. -/
+def midExpPost (_x ret : Nat) : Prop :=
+  ret < 2 ^ 300
+
+theorem midExpPost_dichotomy :
+    PostconditionDichotomy (fun _ : Nat => True) midExpPost :=
+  lt_pow_dichotomy 300
+
+/-- Multi-branch native `Option Nat` postcondition: `some (a - b)` when `b ≤ a`,
+    `none` when `a < b`. -/
+def checkedSubOptionPost (a b : Nat) (ret : Option Nat) : Prop :=
+  match ret with
+  | some v => b ≤ a ∧ v + b = a
+  | none => a < b
+
+theorem checkedSubOptionPost_dichotomy :
+    PostconditionDichotomy (fun _ : Nat × Nat => True)
+      (fun p ret => checkedSubOptionPost p.1 p.2 ret) := by
+  refine ⟨(5, 2), trivial, ⟨some 3, ⟨by decide, rfl⟩⟩, ⟨none, ?_⟩⟩
+  intro hLt
+  dsimp [checkedSubOptionPost] at hLt
+  omega
+
+/-- Multi-branch native `Except Nat Nat` (Lean `Result` analog) postcondition:
+    `ok` carries an in-range quotient when `b ≠ 0`, `error` echoes `a` when `b = 0`. -/
+def checkedDivExceptPost (a b : Nat) (ret : Except Nat Nat) : Prop :=
+  match ret with
+  | .ok q => b ≠ 0 ∧ q * b ≤ a
+  | .error e => b = 0 ∧ e = a
+
+theorem checkedDivExceptPost_dichotomy :
+    PostconditionDichotomy (fun _ : Nat × Nat => True)
+      (fun p ret => checkedDivExceptPost p.1 p.2 ret) := by
+  refine ⟨(6, 2), trivial, ⟨.ok 3, ⟨by decide, by decide⟩⟩, ⟨.error 6, ?_⟩⟩
+  intro hBad
+  dsimp [checkedDivExceptPost] at hBad
+  exact Nat.succ_ne_zero 1 hBad.1
+
+/-- Inhabited multi-constructor binary tree inductive: negative control confirming
+    inhabited recursive types are never false-flagged as empty or subsingleton. -/
+inductive BinTree : Type where
+  | leaf : Nat → BinTree
+  | branch : BinTree → BinTree → BinTree
+
+def binTreeLeafPost (x : Nat) (ret : BinTree) : Prop :=
+  ret = .leaf x
+
+theorem binTreeLeafPost_dichotomy :
+    PostconditionDichotomy (fun _ : Nat => True) binTreeLeafPost := by
+  refine ⟨0, trivial, ⟨.leaf 0, rfl⟩, ⟨.leaf 1, ?_⟩⟩
+  intro hEq
+  have hVal : (1 : Nat) = 0 := BinTree.leaf.inj hEq
+  exact Nat.succ_ne_zero 0 hVal
+
+-- Mid-range closed power (`2 ^ 300`), multi-branch `Option`/`Except`, and binary-tree
+-- negative controls must all pass cleanly without false-flagging or leaking warnings.
+#eval assertEnsuresBindsOutput (Lean.mkConst ``midExpPost)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``checkedSubOptionPost)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``checkedDivExceptPost)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``binTreeLeafPost)
+
+-- Even once `ProbeBudget` is exhausted before or during Phase 3, pure boilerplate
+-- cofactoring and syntactic fibre checks still catch syntactically vacuous
+-- `MirCallContract`s while genuine external-spec contracts degrade conservatively.
+#eval assertDeclEnsuresVacuous ``boilerplateOnlyExtContract (some .unboundReturnOutput)
+  { stepHeartbeats := 1, totalHeartbeats := 1 }
+#eval assertDeclEnsuresVacuous ``boilerplateIffContract (some .unboundReturnOutput)
+  { stepHeartbeats := 1, totalHeartbeats := 1 }
+#eval assertDeclEnsuresVacuous ``boilerplateExcludedMiddleContract (some .trivialPostcondition)
+  { stepHeartbeats := 1, totalHeartbeats := 1 }
+#eval assertDeclEnsuresVacuous ``trap1FalsePostContract (some .specViolation)
+  { stepHeartbeats := 1, totalHeartbeats := 1 }
+#eval assertDeclEnsuresVacuous ``tautInputOnlyBoilerplateContract (some .trivialPostcondition)
+  { stepHeartbeats := 1, totalHeartbeats := 1 }
+#eval show Lean.Meta.MetaM Unit from do
+  let starvedExt ← checkDeclEnsuresBindsOutput ``sliceIsEmptyExtContract
+    { stepHeartbeats := 1, totalHeartbeats := 1 }
+  unless starvedExt.bindsOutput && !starvedExt.notes.isEmpty do
+    throwError "expected starved sliceIsEmptyExtContract accepted with degradation note, got {repr starvedExt}"
 
 /-! ## 4. Mandatory Compile-Time Kernel Axiom Audit -/
 

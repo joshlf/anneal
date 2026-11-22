@@ -3101,3 +3101,96 @@ fn quad_joint_mutants_span_non_adjacent_axes_around_subsingleton_components() {
     );
     assert!(matches!(ignores_output, SpecCheckOutcome::Failed(_)));
 }
+
+// ---------------------------------------------------------------------------
+// Final negative controls & false-positive guards (Episode 1 closeout)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn array_both_ends_joint_mutant_and_false_positive_guards() {
+    // `[0, 1]` has `m0 = 1 == self[1]`, so `both_ends` must use each end's own
+    // first mutant (`[1, 2]`) rather than collapsing to a single-element mutant.
+    let mut saw_distinct_ends_2 = false;
+    [0u8, 1u8].visit_mutants(&mut SplitMix64::new(11), |m| {
+        if m[0] != 0 && m[1] != 1 && m != [1, 0] {
+            saw_distinct_ends_2 = true;
+        }
+    });
+    assert!(saw_distinct_ends_2);
+
+    let mut saw_distinct_ends_3 = false;
+    [0u8, 5u8, 1u8].visit_mutants(&mut SplitMix64::new(11), |m| {
+        if m[0] != 0 && m[1] == 5 && m[2] != 1 && m != [1, 5, 0] {
+            saw_distinct_ends_3 = true;
+        }
+    });
+    assert!(saw_distinct_ends_3);
+
+    // Genuine disjunctive array postcondition over both ends must pass even
+    // when `orig[last] == orig[0].wrapping_add(1)`.
+    let array_disj = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |_a: &u8| true,
+        |&a| [a, 5u8, a.wrapping_add(1)],
+        |&a, r: &[u8; 3]| r[0] == a || r[2] == a.wrapping_add(1),
+    );
+    assert!(array_disj.mutants_killed > 0);
+
+    // Negative controls: genuine multi-branch `Option<()>` and `Result<(), u8>`
+    // contracts (where one variant carries a subsingleton payload) must never
+    // be false-flagged.
+    let opt_unit = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |_x: &u8| true,
+        |&x| if x % 2 == 0 { Some(()) } else { None },
+        |&x, r: &Option<()>| match r {
+            Some(()) => x % 2 == 0,
+            None => x % 2 != 0,
+        },
+    );
+    assert!(opt_unit.is_pointwise_strong());
+
+    let res_unit_err = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |_x: &u8| true,
+        |&x| if x < 100 { Ok(()) } else { Err(x - 100) },
+        |&x, r: &Result<(), u8>| match r {
+            Ok(()) => x < 100,
+            Err(excess) => x >= 100 && *excess == x - 100,
+        },
+    );
+    assert!(res_unit_err.is_pointwise_strong());
+
+    // Negative control: genuine asymmetric multi-branch `Result<u16, u8>` where
+    // the `Ok` branch only enforces a loose bound and the `Err` branch pins the
+    // error code.
+    let asym_res = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |_p: &(u16, u16)| true,
+        |&(a, b)| if b == 0 { Err(1u8) } else { Ok(a / b) },
+        |&(a, b), r: &Result<u16, u8>| match r {
+            Ok(q) => b != 0 && *q <= a,
+            Err(code) => b == 0 && *code == 1,
+        },
+    );
+    assert!(asym_res.is_pointwise_strong());
+
+    // Negative control: genuine conditional frame-dependent stateful contract
+    // (frame unchanged when `flag == false`, incremented when `flag == true`).
+    let cond_stateful = assert_stateful_contract_strong(
+        SpecCheckConfig::default(),
+        |_old: &u16, _flag: &bool| true,
+        |state: &mut u16, &flag: &bool| {
+            let prev = *state;
+            if flag {
+                *state = state.wrapping_add(1);
+            }
+            (prev, flag)
+        },
+        |old: &u16, &flag: &bool, new: &u16, &(ret_prev, ret_flag): &(u16, bool)| {
+            let expected = if flag { old.wrapping_add(1) } else { *old };
+            ret_prev == *old && ret_flag == flag && *new == expected
+        },
+    );
+    assert!(cond_stateful.is_pointwise_strong());
+}
